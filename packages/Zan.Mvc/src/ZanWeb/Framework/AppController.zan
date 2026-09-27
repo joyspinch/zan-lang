@@ -13,6 +13,10 @@ class AppController : Controller {
     IDbConnection lease;
     IDbConnection readLease;
     bool inTx;
+    bool readOnlyIntent;
+    bool leaseIsRead;
+
+    override void __UseReadOnly() { this.readOnlyIntent = true; }
 
     /* 注入的数据库上下文（AppServices.Use 前为 null）。私有：控制器经
      * Conn()/Held()/ReadConn() 拿请求连接，不直接触碰借还协议——曾经
@@ -35,7 +39,12 @@ class AppController : Controller {
         if (this.lease != null) { return this.lease; }
         DbContext ctx = this.Db();
         if (ctx == null) { return null; }
-        this.lease = await ctx.Acquire();
+        if (this.readOnlyIntent) {
+            this.lease = await ctx.AcquireRead();
+            this.leaseIsRead = this.lease != null;
+        } else {
+            this.lease = await ctx.Acquire();
+        }
         return this.lease;
     }
 
@@ -44,11 +53,12 @@ class AppController : Controller {
         return this.lease;
     }
 
-    /* 借出只读连接：用于高并发纯查询（如文章列表、报表展示）。未配置从库时自动借主库（零区别）；若当前请求处于 [Tx] 事务中，强制借出主库连接（防主从同步延迟）。*/
+    /* 请求已有租约时复用同一连接，不嵌套借用；没有租约时借只读池。
+       [ReadOnly] 动作在 OnBeforeAsync 已持只读租约，普通动作复用主库；
+       事务强制主库，读后写一致性由不标注 [ReadOnly] 保证。 */
     protected async IDbConnection ReadConn() {
-        if (this.inTx) {
-            return await this.Conn();
-        }
+        if (this.lease != null) { return this.lease; }
+        if (this.inTx) { return await this.Conn(); }
         if (this.readLease != null) { return this.readLease; }
         DbContext ctx = this.Db();
         if (ctx == null) { return null; }
@@ -56,10 +66,10 @@ class AppController : Controller {
         return this.readLease;
     }
 
-    /* 本次请求已借出的只读连接（未借出则回退到主库连接）。*/
+    /* 本次请求已借出的只读连接（未借出则回退到请求连接）。*/
     protected IDbConnection HeldRead() {
-        if (this.readLease != null) { return this.readLease; }
-        return this.lease;
+        if (this.lease != null) { return this.lease; }
+        return this.readLease;
     }
 
     /* 表访问器运行其上的连接：this.SysUser、this.Post 编译为在此连接上的类型化查询，故租约需在 OnBeforeAsync() 取得（访问器是普通成员，无法 await）。不构造 DAO、不借还、字段名在编译期校验。
@@ -83,28 +93,57 @@ class AppController : Controller {
         return this.lease != null;
     }
 
-    /* 在本次请求连接上开启事务；false 表示数据库不可用且未开启任何事务。 */
+    /* 弃用未知事务状态的主库租约，清理异常不能覆盖原事务失败。
+       先清请求字段，确保之后的收尾不会再次归还或操作此连接。 */
+    private void DiscardLease() {
+        IDbConnection db = this.lease;
+        this.lease = null;
+        this.leaseIsRead = false;
+        this.inTx = false;
+        if (db == null) { return; }
+        try {
+            DbContext ctx = this.Db();
+            if (ctx != null) { ctx.Discard(db); }
+            else { db.Close(); }
+        } catch (Exception cleanupError) { }
+    }
+
+    /* false 表示未确认事务开启；BEGIN 失败的连接状态不明，必须弃用。 */
     protected async bool Begin() {
+        if (this.readOnlyIntent) { return false; }
         IDbConnection db = await this.Conn();
         if (db == null) { return false; }
         if (this.inTx) { return true; }
-        await db.BeginTransactionAsync();
+        bool begun = false;
+        try { begun = await db.BeginTransactionAsync(); }
+        catch (Exception beginError) {
+            this.DiscardLease();
+            throw beginError;
+        }
+        if (!begun) {
+            this.DiscardLease();
+            return false;
+        }
         this.inTx = true;
         return true;
     }
 
-    /* 提交本次请求事务；无事务时为 no-op。 */
+    /* 提交失败（包括 false）保留 inTx，供失败路径回滚。 */
     protected async void Commit() {
         if (!this.inTx) { return; }
+        if (!await this.lease.CommitAsync()) {
+            throw new Exception("commit failed");
+        }
         this.inTx = false;
-        await this.lease.CommitAsync();
     }
 
-    /* 回滚本次请求事务；无事务时为 no-op，可在 Commit() 之后的错误路径重复调用。 */
+    /* 回滚失败（包括 false）保留 inTx，使收尾可重试或弃用脏连接。 */
     protected async void Rollback() {
         if (!this.inTx) { return; }
+        if (!await this.lease.RollbackAsync()) {
+            throw new Exception("rollback failed");
+        }
         this.inTx = false;
-        await this.lease.RollbackAsync();
     }
 
     /* [Tx] 蹦床钩子：声明属性即完成事务，动作体内不再出现 Begin/Commit/Rollback 阶梯。 */
@@ -118,20 +157,47 @@ class AppController : Controller {
     /* 任何失败路径回滚；可重复调用、可在提交后调用。 */
     override async void __TxRollback() { await this.Rollback(); }
 
-    /* 释放请求连接（在协程上），以便未完成的务事先回滚；事务中途归还会把持着别人锁的会话交还下一个请求，回滚本身也是往返。 */
+    /* 未完成事务先回滚；失败时先摘除池租约，再尝试关闭脏连接。
+       各清理步骤都必须执行，后续清理异常不能覆盖最初的失败。 */
     override async void OnAfterAsync() {
-        if (this.lease != null) {
-            await this.Rollback();
-            DbContext ctx = this.Db();
-            if (ctx != null) { ctx.Release(this.lease); }
-            this.lease = null;
+        Exception failure = null;
+        if (this.lease != null && this.inTx) {
+            try { await this.Rollback(); }
+            catch (Exception rollbackError) {
+                failure = rollbackError;
+                this.DiscardLease();
+            }
         }
-        if (this.readLease != null) {
-            DbContext ctx = this.Db();
-            if (ctx != null) { ctx.ReleaseRead(this.readLease); }
+        try {
+            if (this.lease != null) {
+                DbContext ctx = this.Db();
+                if (ctx != null) {
+                    if (this.leaseIsRead) { ctx.ReleaseRead(this.lease); }
+                    else { ctx.Release(this.lease); }
+                }
+            }
+        } catch (Exception releaseError) {
+            if (failure == null) { failure = releaseError; }
+        } finally {
+            this.lease = null;
+            this.leaseIsRead = false;
+            this.inTx = false;
+        }
+        try {
+            if (this.readLease != null) {
+                DbContext ctx = this.Db();
+                if (ctx != null) { ctx.ReleaseRead(this.readLease); }
+            }
+        } catch (Exception readError) {
+            if (failure == null) { failure = readError; }
+        } finally {
             this.readLease = null;
         }
-        this.OnDone();
+        try { this.OnDone(); }
+        catch (Exception doneError) {
+            if (failure == null) { failure = doneError; }
+        }
+        if (failure != null) { throw failure; }
     }
 
     /* 供子类做每请求清理；覆盖此而非 OnAfterAsync()，后者负责释放连接。 */

@@ -137,6 +137,14 @@ bool zan_pkg_global_store(char *out, size_t out_size);
 int zan_pkg_find_namespace(const char *project_dir, const char *namespace_path,
                            char (*out_dirs)[1024], int max_dirs);
 
+/* Visit installed package files by declared namespace, regardless of their
+ * physical directories. Paths refer to original sources, never copies. */
+typedef void (*zan_pkg_source_visitor_t)(const char *path, void *context);
+typedef int (*zan_pkg_namespace_probe_t)(const char *path, char *out_ns, size_t cap);
+int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
+                            zan_pkg_namespace_probe_t probe,
+                            zan_pkg_source_visitor_t visitor, void *context);
+
 /* Secure local-directory install foundation. The source must contain a valid
  * zan.pkg whose name matches package_name. Symlinks/reparse points and unsafe
  * names are rejected; installation is staged then atomically renamed. */

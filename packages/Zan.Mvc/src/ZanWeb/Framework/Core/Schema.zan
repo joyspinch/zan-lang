@@ -36,15 +36,31 @@ class Schema {
         }
     }
 
-    /* 空库创建 bootstrap 账号；密码为开发用，部署前必须修改。*/
+    /* 空库仅在明确配置强口令时创建引导账号；无配置则拒绝启动。*/
     static async bool SeedAdmin(IDbConnection db) {
         SysUserDao users = new SysUserDao(db);
         int have = await users.Count();
-        if (have > 0) { return true; }
+        string password = Cfg.Auth.bootstrapPassword;
+        if (have > 0) {
+            /* 旧部署若仍使用公开的初始密码，必须更换后才能继续服务。*/
+            SysUser legacy = await users.ByUsername("admin");
+            if (legacy != null && legacy.isSuper == 1 &&
+                AuthUser.Verify("admin1234", legacy.passwordSalt, legacy.passwordHash)) {
+                if (password == null || password.Length < 12 || password == "admin1234") {
+                    throw new Exception("legacy admin password must be rotated with auth.bootstrapPassword or ZAN_BOOTSTRAP_ADMIN_PASSWORD");
+                }
+                int changed = await users.ResetPassword(legacy.id, "", AuthUser.NewHash(password), WebApp.NowSeconds());
+                if (changed < 1) { throw new Exception("legacy admin password rotation failed"); }
+            }
+            return true;
+        }
+        if (password == null || password.Length < 12) {
+            throw new Exception("empty database requires auth.bootstrapPassword (or ZAN_BOOTSTRAP_ADMIN_PASSWORD), at least 12 characters");
+        }
         SysUser admin = new SysUser();
         admin.username = "admin";
         admin.passwordSalt = "";
-        admin.passwordHash = AuthUser.NewHash("admin1234");
+        admin.passwordHash = AuthUser.NewHash(password);
         admin.nickname = "系统管理员";
         admin.status = AuthUser.Active;
         admin.isSuper = 1;

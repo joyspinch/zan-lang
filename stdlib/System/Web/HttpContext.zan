@@ -574,8 +574,18 @@ class HttpContext {
     /// header block and then <c>bodyBytes</c> by count.</summary>
     bool IsBinary() { return this.bodyBytes != null; }
 
-    /// <summary>Response body size in bytes, whichever form it takes.</summary>
+    /// <summary>Statuses whose response ends at the header terminator,
+    /// regardless of any body the handler prepared (RFC 9112 §6.3).</summary>
+    bool StatusForbidsBody() {
+        return (this.status >= 100 && this.status < 200)
+            || this.status == 204 || this.status == 304;
+    }
+
+    /// <summary>Response body size in bytes. HEAD retains the corresponding
+    /// GET length; bodyless statuses return zero so the separate binary send
+    /// path cannot put forbidden bytes after the header block.</summary>
     int BodyLength() {
+        if (this.StatusForbidsBody()) { return 0; }
         if (this.bodyBytes != null) { return this.bodyBytesLen; }
         return this.body.Length;
     }
@@ -862,7 +872,12 @@ class HttpContext {
         // 但正文一律不发送（RFC 9110 §9.3.2）。不剥离的话 keep-alive
         // 连接上正文会被当作下一个请求解析——请求走私；非 keep-alive
         // 的客户端则可能收到与声明不符的额外字节。
-        bool omitBody = this.method == "HEAD" && this.bodyBytes == null;
+        bool statusBodyless = this.StatusForbidsBody();
+        bool omitBody = this.method == "HEAD" || statusBodyless;
+        // 1xx/204 forbid Content-Length and Transfer-Encoding altogether.
+        // 304 may carry explicit representation metadata, but its absent
+        // payload says nothing about the selected 200 representation's size.
+        bool forbidFraming = statusBodyless && this.status != 304;
         StringBuilder sb = new StringBuilder();
         sb.Append("HTTP/1.1 ");
         sb.Append(HttpContext.Itoa(this.status));
@@ -870,16 +885,29 @@ class HttpContext {
         sb.Append(this.statusText);
         sb.Append("\r\nContent-Type: ");
         sb.Append(this.contentType);
-        sb.Append("\r\nContent-Length: ");
-        sb.Append(HttpContext.Itoa(this.BodyLength()));
+        if (!statusBodyless) {
+            sb.Append("\r\nContent-Length: ");
+            sb.Append(HttpContext.Itoa(this.BodyLength()));
+        }
         if (keepAlive) { sb.Append("\r\nConnection: keep-alive"); }
         else { sb.Append("\r\nConnection: close"); }
         sb.Append("\r\nServer: ZanWeb/0.1");
         int hn = 0;
         if (this.headers != null) { hn = this.headers.Count; }
         for (int i = 0; i < hn; i = i + 1) {
+            string header = this.headers[i];
+            if (forbidFraming) {
+                int colon = header.IndexOf(":");
+                if (colon >= 0) {
+                    string name = header.Substring(0, colon).Trim();
+                    if (HttpContext.AsciiEq(name, "Content-Length")
+                        || HttpContext.AsciiEq(name, "Transfer-Encoding")) {
+                        continue;
+                    }
+                }
+            }
             sb.Append("\r\n");
-            sb.Append(this.headers[i]);
+            sb.Append(header);
         }
         sb.Append("\r\n\r\n");
         // A byte body is NOT appended: it would be cut at its first NUL. The

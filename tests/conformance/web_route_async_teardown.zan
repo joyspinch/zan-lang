@@ -1,0 +1,188 @@
+// Generated instance-route lifecycle: awaited teardown on every exit,
+// including short circuit, typed binding, transaction and exception paths.
+using System;
+using System.Net.Http;
+using System.Web;
+
+class RouteBoom : Exception {
+    public RouteBoom(string message) : base(message) { }
+}
+
+class RouteTrace {
+    static string events = "";
+    static string mode = "";
+    static bool afterFails;
+    static bool rollbackFails;
+    static int failures;
+
+    static void Add(string item) {
+        if (RouteTrace.events.Length > 0) { RouteTrace.events = RouteTrace.events + ","; }
+        RouteTrace.events = RouteTrace.events + item;
+    }
+
+    static void Reset(string mode, bool afterFails, bool rollbackFails) {
+        RouteTrace.events = "";
+        RouteTrace.mode = mode;
+        RouteTrace.afterFails = afterFails;
+        RouteTrace.rollbackFails = rollbackFails;
+    }
+
+    static void Check(bool ok, string label) {
+        if (!ok) {
+            RouteTrace.failures = RouteTrace.failures + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+}
+
+[Route("/teardown")]
+class TeardownController : Controller {
+    override async bool OnBeforeAsync() {
+        RouteTrace.Add("before");
+        await Task.Delay(1);
+        if (RouteTrace.mode == "before-api") {
+            throw new ApiError(403, "0403", "before denied");
+        }
+        if (RouteTrace.mode == "before-boom") { throw new RouteBoom("before boom"); }
+        return RouteTrace.mode != "reject";
+    }
+
+    override async void OnAfterAsync() {
+        await Task.Delay(1);
+        RouteTrace.Add("after");
+        if (RouteTrace.afterFails) { throw new RouteBoom("after boom"); }
+    }
+
+    override async bool __TxBegin() {
+        RouteTrace.Add("begin");
+        await Task.Delay(1);
+        if (RouteTrace.mode == "begin-boom") { throw new RouteBoom("begin boom"); }
+        return RouteTrace.mode != "begin-false";
+    }
+
+    override async void __TxCommit() {
+        RouteTrace.Add("commit");
+        await Task.Delay(1);
+        if (RouteTrace.mode == "commit-api") {
+            throw new ApiError(409, "0409", "commit denied");
+        }
+        if (RouteTrace.mode == "commit-boom") { throw new RouteBoom("commit boom"); }
+    }
+
+    override async void __TxRollback() {
+        RouteTrace.Add("rollback");
+        await Task.Delay(1);
+        if (RouteTrace.rollbackFails) { throw new RouteBoom("rollback boom"); }
+    }
+
+    [HttpGet]
+    void Plain() {
+        RouteTrace.Add("action");
+        if (RouteTrace.mode == "action-api") {
+            throw new ApiError(422, "0422", "action denied");
+        }
+        if (RouteTrace.mode == "action-boom") { throw new RouteBoom("action boom"); }
+        this.Ok("null");
+    }
+
+    [HttpPost]
+    [Tx]
+    async void Save(int count) {
+        await Task.Delay(1);
+        RouteTrace.Add("action");
+        if (RouteTrace.mode == "action-api") {
+            throw new ApiError(422, "0422", "action denied");
+        }
+        if (RouteTrace.mode == "action-boom") { throw new RouteBoom("action boom"); }
+        this.Ok("null");
+    }
+}
+
+class Program {
+    static HttpContext Ctx(string method, string path) {
+        HttpRequest req = HttpRequest.Parse(method + " " + path + " HTTP/1.1\r\nHost: t\r\n\r\n");
+        return new HttpContext(req, "127.0.0.1");
+    }
+
+    static async void Call(HttpContext ctx, bool tx) {
+        if (tx) { await __AttrRoutes.__h_TeardownController_Save(ctx); }
+        else { await __AttrRoutes.__h_TeardownController_Plain(ctx); }
+    }
+
+    static async void Case(string label, string mode, bool tx, bool afterFails,
+                           bool rollbackFails, string expectedEvents, string expectedResponse,
+                           string expectedException) {
+        RouteTrace.Reset(mode, afterFails, rollbackFails);
+        string path = tx ? "/teardown/save?count=3" : "/teardown/plain";
+        if (mode == "binding") { path = "/teardown/save"; }
+        HttpContext ctx = Program.Ctx(tx ? "POST" : "GET", path);
+        string thrown = "";
+        try {
+            await Program.Call(ctx, tx);
+        } catch (RouteBoom e) {
+            thrown = e.Message;
+        }
+        RouteTrace.Check(RouteTrace.events == expectedEvents,
+            label + " order (" + RouteTrace.events + ")");
+        RouteTrace.Check(thrown == expectedException, label + " exception (" + thrown + ")");
+        if (expectedResponse.Length > 0) {
+            string response = ctx.BuildResponse(true);
+            RouteTrace.Check(response.IndexOf(expectedResponse) >= 0,
+                label + " response code");
+            if (mode == "before-api") {
+                RouteTrace.Check(response.IndexOf("403 Forbidden") >= 0
+                    && response.IndexOf("before denied") >= 0, label + " original api");
+            }
+            if (mode == "action-api") {
+                RouteTrace.Check(response.IndexOf("422 Unprocessable Entity") >= 0
+                    && response.IndexOf("action denied") >= 0, label + " original api");
+            }
+            if (mode == "commit-api") {
+                RouteTrace.Check(response.IndexOf("409 Conflict") >= 0
+                    && response.IndexOf("commit denied") >= 0, label + " original api");
+            }
+        }
+    }
+
+    static async void Main() {
+        await Program.Case("plain success", "ok", false, false, false,
+            "before,action,after", "200 OK", "");
+        await Program.Case("before false", "reject", false, false, false,
+            "before,after", "", "");
+        await Program.Case("before api", "before-api", false, true, false,
+            "before,after", "\"0403\"", "");
+        await Program.Case("before exception", "before-boom", false, true, false,
+            "before,after", "", "before boom");
+        await Program.Case("plain api", "action-api", false, true, false,
+            "before,action,after", "\"0422\"", "");
+        await Program.Case("plain exception", "action-boom", false, true, false,
+            "before,action,after", "", "action boom");
+        await Program.Case("plain cleanup exception", "ok", false, true, false,
+            "before,action,after", "", "after boom");
+        await Program.Case("before false cleanup exception", "reject", false, true, false,
+            "before,after", "", "after boom");
+        await Program.Case("tx success", "ok", true, false, false,
+            "before,begin,action,commit,after", "200 OK", "");
+        await Program.Case("tx before false", "reject", true, false, false,
+            "before,after", "", "");
+        await Program.Case("tx begin false", "begin-false", true, true, false,
+            "before,begin,after", "\"0503\"", "");
+        await Program.Case("tx begin exception", "begin-boom", true, true, false,
+            "before,begin,after", "", "begin boom");
+        await Program.Case("tx typed binding", "binding", true, false, false,
+            "before,begin,rollback,after", "\"0003\"", "");
+        await Program.Case("tx api rollback", "action-api", true, false, false,
+            "before,begin,action,rollback,after", "\"0422\"", "");
+        await Program.Case("tx exception rollback", "action-boom", true, false, false,
+            "before,begin,action,rollback,after", "", "action boom");
+        await Program.Case("tx api rollback fails", "action-api", true, true, true,
+            "before,begin,action,rollback,after", "\"0422\"", "");
+        await Program.Case("tx exception rollback fails", "action-boom", true, true, true,
+            "before,begin,action,rollback,after", "", "action boom");
+        await Program.Case("tx commit api rollback fails", "commit-api", true, true, true,
+            "before,begin,action,commit,rollback,after", "\"0409\"", "");
+        await Program.Case("tx commit exception rollback fails", "commit-boom", true, true, true,
+            "before,begin,action,commit,rollback,after", "", "commit boom");
+        Console.WriteLine("failures=" + Convert.ToString(RouteTrace.failures));
+    }
+}

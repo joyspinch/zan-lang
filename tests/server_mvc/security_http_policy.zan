@@ -1,0 +1,102 @@
+// Compile with packages/Zan.Mvc/src/**/*.zan and --auto-stdlib.
+using System;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Services;
+using ZanWeb.Web;
+
+class Program {
+    static int failures;
+    static void Check(bool ok, string label) {
+        if (!ok) { Program.failures = Program.failures + 1; Console.WriteLine("FAIL " + label); }
+    }
+    static HttpContext Ctx(string method, string headers) {
+        return new HttpContext(HttpRequest.Parse(method + " / HTTP/1.1\r\nHost: blog.test\r\n"
+            + headers + "\r\n"), "127.0.0.1");
+    }
+    static async void Main() {
+        Cfg.Cors = CorsCfg.Defaults();
+        HttpContext pre = Program.Ctx("OPTIONS", "Origin: https://client.test\r\n");
+        Program.Check(!Boot.CorsFilter(pre) && pre.ended && pre.BodyLength() == 0,
+            "preflight ends with initialized empty body");
+        string wire = pre.BuildResponse(true);
+        Program.Check(wire.StartsWith("HTTP/1.1 204 No Content\r\n")
+            && wire.EndsWith("\r\n\r\n") && !wire.Contains("Content-Length:")
+            && !wire.Contains("Transfer-Encoding:"), "204 has no body framing");
+        Cfg.Cors.allowCredentials = true;
+        Program.Check(!Boot.ValidCorsOrigin(), "wildcard credentials forbidden");
+        Cfg.Cors.allowOrigin = "https://client.test";
+        Program.Check(Boot.ValidCorsOrigin(), "explicit credentialed origin valid");
+        Cfg.Cors.allowOrigin = "https://[::1]:8443";
+        Program.Check(Boot.ValidCorsOrigin(), "IPv6 explicit origin accepted");
+        Cfg.Cors.allowOrigin = "https://client.test:99999";
+        Program.Check(!Boot.ValidCorsOrigin(), "out-of-range port rejected");
+        Cfg.Cors.allowOrigin = "https://client.test:invalid";
+        Program.Check(!Boot.ValidCorsOrigin(), "nonnumeric port rejected");
+        Cfg.Cors.allowOrigin = "https://client.test\r\nX-Evil: yes";
+        Program.Check(!Boot.ValidCorsOrigin(), "injected origin rejected");
+        Cfg.Cors.allowOrigin = "null";
+        Program.Check(!Boot.ValidCorsOrigin(), "opaque origin rejected");
+        Cfg.Cors.allowOrigin = "https://a.test,https://b.test";
+        Program.Check(!Boot.ValidCorsOrigin(), "origin lists rejected");
+        Cfg.Cors.allowOrigin = "https://a.test/path";
+        Program.Check(!Boot.ValidCorsOrigin(), "origin path rejected");
+        HttpContext invalid = Program.Ctx("GET", "");
+        Program.Check(Boot.CorsFilter(invalid), "invalid CORS does not break same-origin routes");
+        invalid.Text("ok");
+        Program.Check(!invalid.BuildResponse(false).Contains("Access-Control-Allow-Origin:"),
+            "invalid CORS grants no access");
+        Cfg.Cors = CorsCfg.Defaults();
+        Program.Check(Boot.OriginGuard(Program.Ctx("POST", "")), "cookie-free API needs no origin");
+        Program.Check(Boot.OriginGuard(Program.Ctx("POST", "Authorization: Bearer token\r\nOrigin: https://client.test\r\nSec-Fetch-Site: cross-site\r\n")),
+            "wildcard CORS explicit bearer client accepted");
+        string cookie = "Cookie: zsession=session\r\n";
+        HttpContext absent = Program.Ctx("POST", cookie);
+        Program.Check(!Boot.OriginGuard(absent) && absent.status == 403 && absent.ended,
+            "cookie write requires origin evidence");
+        Program.Check(Boot.OriginGuard(Program.Ctx("GET", cookie)), "public reads unaffected");
+        Program.Check(Boot.OriginGuard(Program.Ctx("POST", cookie + "Authorization: Bearer token\r\n")),
+            "explicit bearer takes precedence over ambient cookie");
+        Program.Check(Boot.OriginGuard(Program.Ctx("POST", cookie + "Origin: https://blog.test\r\n")),
+            "same-origin form accepted");
+        Program.Check(Boot.OriginGuard(Program.Ctx("POST", cookie + "Referer: https://blog.test/editor?q=x\r\n")),
+            "legacy same-origin referer accepted");
+        Program.Check(Boot.OriginGuard(Program.Ctx("POST", cookie + "Sec-Fetch-Site: same-origin\r\n")),
+            "same-origin fetch evidence accepted");
+        Program.Check(!Boot.OriginGuard(Program.Ctx("POST", cookie + "Sec-Fetch-Site: same-site\r\n")),
+            "same-site is not same-origin proof");
+        Program.Check(!Boot.OriginGuard(Program.Ctx("POST", cookie + "Origin: null\r\n")), "opaque cookie origin denied");
+        Program.Check(!Boot.OriginGuard(Program.Ctx("POST", cookie + "Referer: https://evil.test/x\r\n")),
+            "foreign referer denied");
+        Program.Check(!Boot.OriginGuard(Program.Ctx("POST", cookie + "Origin: https://blog.test\r\nSec-Fetch-Site: cross-site\r\n")),
+            "conflicting cross-site evidence denied");
+        Program.Check(Boot.SameOriginHost("https://blog.test:443", "BLOG.TEST:443")
+            && Boot.SameOriginHost("http://blog.test:80", "blog.test")
+            && !Boot.SameOriginHost("https://blog.test:444", "blog.test"), "origin default ports normalized");
+        Cfg.Cors.allowOrigin = "https://client.test";
+        Program.Check(Boot.OriginGuard(Program.Ctx("POST", "Origin: https://client.test\r\nSec-Fetch-Site: cross-site\r\nAuthorization: Bearer token\r\n")),
+            "explicit CORS API client accepted");
+        Program.Check(!Boot.OriginGuard(Program.Ctx("POST", cookie + "Origin: https://client.test\r\n")),
+            "CORS is not permission to write with ambient cookies");
+        Program.Check(ServerCfg.Defaults().globalLimitPerSec == 0, "global opt-out preserved for public clients");
+
+        Program.Check(ZanWeb.Blog.PostsController.CanonicalUrl("https://blog.test/base///") == "https://blog.test/base",
+            "canonical prefix retained and trailing slash trimmed");
+        Program.Check(ZanWeb.Blog.PostsController.CanonicalUrl("javascript:evil") == ""
+            && ZanWeb.Blog.PostsController.CanonicalUrl("https://user@evil.test") == ""
+            && ZanWeb.Blog.PostsController.CanonicalUrl("https://blog.test\nSitemap: evil") == ""
+            && ZanWeb.Blog.PostsController.CanonicalUrl("https://blog.test/?q=x") == "", "invalid canonical URLs rejected");
+        AppServices.Use(null);
+        Settings.Forget();
+        HttpContext poison = new HttpContext(HttpRequest.Parse("GET /robots.txt HTTP/1.1\r\nHost: attacker.test\r\nX-Forwarded-Host: evil.test\r\n\r\n"), "127.0.0.1");
+        Program.Check(await ZanWeb.Blog.PostsController.BaseUrl(poison) == "", "unconfigured canonical never trusts Host");
+        ZanWeb.Blog.PostsController blog = new ZanWeb.Blog.PostsController();
+        blog.__Bind(poison);
+        await blog.Robots();
+        string robots = poison.BuildResponse(false);
+        Program.Check(robots.Contains("Allow: /\n") && !robots.Contains("attacker.test")
+            && !robots.Contains("evil.test") && !robots.Contains("Sitemap:"), "robots remains public without poisoned discovery link");
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        if (Program.failures != 0) { throw new Exception("HTTP policy regression"); }
+    }
+}

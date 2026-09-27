@@ -245,7 +245,7 @@ class PostsController : AppController {
     }
 
     /* ---- 公开站点的可发现性：feed、站点地图、爬虫协议 ----
-       内容全部来自已发布文章；未配置 site.url 时按请求 Host 推导绝对链接。 */
+       内容全部来自已发布文章；绝对链接只来自受信任的 site.url 设置。 */
 
     /* RSS 2.0：最新 20 篇已发布文章，pubDate 按站点时区。 */
     [HttpGet]
@@ -256,6 +256,7 @@ class PostsController : AppController {
             this.Fail(503, "2001", "服务暂时不可用，请稍后再试");
         }
         string root = await PostsController.BaseUrl(this.Ctx());
+        if (root.Length == 0) { this.Fail(503, "0503", "站点尚未配置公开地址"); }
         CategoryDao categoryDao = new CategoryDao(this);
         List<Category> cats = await categoryDao.All();
         PostDao postDao = new PostDao(this);
@@ -308,6 +309,7 @@ class PostsController : AppController {
             this.Fail(503, "2001", "服务暂时不可用，请稍后再试");
         }
         string root = await PostsController.BaseUrl(this.Ctx());
+        if (root.Length == 0) { this.Fail(503, "0503", "站点尚未配置公开地址"); }
         List<Post> rows = await this.Post
             .Where(a => a.published == 1)
             .OrderByDescending(a => a.top).OrderByDescending(a => a.id)
@@ -339,37 +341,25 @@ class PostsController : AppController {
         sb.Append("User-agent: *\n");
         sb.Append("Allow: /\n");
         sb.Append("Disallow: /admin/\n");
-        sb.Append("Sitemap: " + root + "/sitemap.xml\n");
+        if (root.Length > 0) { sb.Append("Sitemap: " + root + "/sitemap.xml\n"); }
         this.Ctx().Text(sb.ToString());
     }
 
-    /* 站点绝对地址：site.url 设置优先（反代与自定义域名下唯一可靠），
-       未配置时用请求 Host 头推导；Host 来自客户端，只保留 URL 合法字符。 */
+    /* Host/Forwarded headers are client-controlled, even when syntactically
+       valid. Pages keep relative links without site.url; discovery documents
+       that require absolute URLs explicitly report the missing setting. */
     static async string BaseUrl(HttpContext ctx) {
-        string configured = (await Settings.Get(SettingKeys.SiteUrl, "")).Trim();
-        if (configured.Length > 0) {
-            while (configured.Length > 0
-                    && (configured[configured.Length - 1] & 255) == 47) {
-                configured = configured.Substring(0, configured.Length - 1);
-            }
-            if (configured.Length > 0) { return configured; }
-        }
-        string host = PostsController.UrlClean(ctx.Header("Host"));
-        if (host.Length == 0) { host = "localhost"; }
-        return "http://" + host;
+        return PostsController.CanonicalUrl(await Settings.Get(SettingKeys.SiteUrl, ""));
     }
 
-    /* 只留 scheme/host/port/path 合法字符，挡掉注入头与杂质的 Host。 */
-    static string UrlClean(string s) {
-        StringBuilder outp = new StringBuilder();
-        for (int i = 0; i < s.Length; i = i + 1) {
-            int c = s[i] & 255;
-            bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
-                || (c >= 97 && c <= 122) || c == 46 || c == 45 || c == 58
-                || c == 91 || c == 93;
-            if (ok) { outp.Append(s.Substring(i, 1)); }
+    static string CanonicalUrl(string configured) {
+        configured = configured.Trim();
+        if (Boot.HttpOrigin(configured).Length == 0
+                || configured.Contains("?") || configured.Contains("#")) { return ""; }
+        while (configured.Length > 0 && configured.EndsWith("/")) {
+            configured = configured.Substring(0, configured.Length - 1);
         }
-        return outp.ToString();
+        return configured;
     }
 
     /* 相对路径补绝对前缀，已是绝对的原样返回。 */

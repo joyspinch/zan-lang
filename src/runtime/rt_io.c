@@ -3964,6 +3964,9 @@ typedef struct {
 } zan_co_worker_t;
 
 static CRITICAL_SECTION g_co_lock;
+/* A queued task stays outstanding until its step returns. Queue length and
+ * g_co_running alone miss the dequeue -> running handoff. */
+static volatile LONG    g_co_outstanding;
 static volatile LONG    g_co_running;    /* workers inside a step or a pump */
 static volatile LONG    g_co_parked;     /* workers blocked on the port */
 static volatile LONG    g_co_searching;  /* workers hunting for work */
@@ -4236,6 +4239,7 @@ static void co_trace_dump(long long live) {
 static void co_submit(void *frame, zan_co_step_t step) {
     zan_co_task t;
     t.frame = frame; t.step = step;
+    InterlockedIncrement(&g_co_outstanding);
     InterlockedIncrement(&g_co_activity);
     zan_co_worker_t *w = co_self();
     if (!w) {
@@ -4371,6 +4375,7 @@ void zan_co_sched_init(void) {
     zan_timer_runtime_reset();
     zan_timer_set_ready_hook(zan_co_ready);
     g_co_running = 0;
+    g_co_outstanding = 0;
     g_co_parked = 0;
     g_co_searching = 0;
     g_co_wake = 0;
@@ -4495,6 +4500,8 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
         if (s & CO_DEAD) {
             /* Released while it sat in a queue: drop the stale task. */
             free(t->frame);
+            InterlockedIncrement(&g_co_activity);
+            InterlockedDecrement(&g_co_outstanding);
             return;
         }
         long long n = (s & ~(CO_QUEUED | CO_NOTIFIED)) | CO_RUNNING;
@@ -4523,6 +4530,8 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
             break;
     }
     InterlockedDecrement(&g_co_running);
+    InterlockedIncrement(&g_co_activity);
+    InterlockedDecrement(&g_co_outstanding);
 }
 
 /* Dispatch due Delay and public timers; return ms until the next deadline.
@@ -4670,13 +4679,14 @@ static int co_all_idle(void) {
     /* Cheap unlocked reject first: this runs on the empty-queue path of every
      * worker, and a live server almost always has IO in flight or a timer
      * pending. */
-    if (g_co_running != 0 || g_io_count != 0 || g_blocking_inflight != 0 ||
-        zan_timer_pending() != 0)
+    if (g_co_outstanding != 0 || g_co_running != 0 ||
+        g_io_count != 0 || g_blocking_inflight != 0 || zan_timer_pending() != 0)
         return 0;
     int idle;
     EnterCriticalSection(&g_co_lock);
-    idle = !(zan_timer_pending() != 0 || g_co_running != 0 ||
-             g_io_count != 0 || g_blocking_inflight != 0 || co_has_runnable());
+    idle = !(zan_timer_pending() != 0 || g_co_outstanding != 0 ||
+             g_co_running != 0 || g_io_count != 0 ||
+             g_blocking_inflight != 0 || co_has_runnable());
     LeaveCriticalSection(&g_co_lock);
     return idle;
 }
@@ -4898,8 +4908,16 @@ void zan_co_sched_run(void) {
          * live_count never reaches 0 while a result is pending -- waiting on
          * it here deadlocked the very Wait/Result pump that should reap it
          * (cs_b15_task, 2026-09-23). */
-        while (zan_co_pending() > 0 || zan_io_has_pending() ||
-               zan_timer_pending() > 0 || g_co_running > 0) {
+        for (;;) {
+            /* Take an epoch-stable snapshot. A worker can dequeue before it
+             * enters co_run, and a timer can pop before its ready is published.
+             * Outstanding tasks bridge the first gap; activity changes across
+             * the sampling window reject the second. */
+            LONG activity = InterlockedCompareExchange(&g_co_activity, 0, 0);
+            int busy = zan_io_has_pending() || zan_timer_pending() > 0 ||
+                InterlockedCompareExchange(&g_co_running, 0, 0) > 0 ||
+                InterlockedCompareExchange(&g_co_outstanding, 0, 0) > 0;
+            if (!busy && activity == InterlockedCompareExchange(&g_co_activity, 0, 0)) break;
             Sleep(1);
             static DWORD stuck_since = 0;
             DWORD nowk = GetTickCount();

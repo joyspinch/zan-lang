@@ -1,0 +1,52 @@
+// Compile with explicit packages/Zan.Mvc/src/**/*.zan sources and --auto-stdlib.
+// Simultaneous accepts must consume at most once; an unavailable shared cache denies.
+using System;
+using System.Data.Redis;
+using System.Threading;
+using ZanWeb.Security;
+using ZanWeb.Services;
+using ZanWeb.Web;
+
+class Program {
+    static int failures;
+    static int accepted;
+    static void Check(bool ok, string label) {
+        if (!ok) { Program.failures = Program.failures + 1; Console.WriteLine("FAIL " + label); }
+    }
+    static async void Attempt(string code) {
+        if (await VerifyCode.Accept("register", "CASE@example.test", code)) {
+            Program.accepted = Program.accepted + 1;
+        }
+    }
+    static async void Main() {
+        CacheContext local = CacheContext.Of(null);
+        AppServices.Use(new AppServices(null, local));
+        string code = await VerifyCode.Issue("register", "Case@Example.Test");
+        Program.Check(code.Length == 6 && await VerifyCode.TooSoon("register", "case@example.test"),
+            "issued code and normalized cooldown");
+        Program.Check(!await VerifyCode.Accept("register", "CASE@example.test", "000000x"),
+            "wrong code cannot consume issued code");
+        Program.accepted = 0;
+        List<long> attempts = new List<long>();
+        for (int i = 0; i < 32; i = i + 1) {
+            attempts.Add(Task.Spawn(Program.Attempt(code)));
+        }
+        await Task.WhenAll(attempts);
+        Program.Check(Program.accepted == 1, "concurrent verification accepts exactly once");
+        Program.Check(!await VerifyCode.Accept("register", "case@example.test", code),
+            "consumed code cannot be replayed");
+        Program.Check(!await VerifyCode.Accept("reset", "case@example.test", code),
+            "different purpose cannot reuse code");
+        RedisPool offline = new RedisPool("127.0.0.1", 1, 1, 100);
+        offline.Close();
+        CacheContext shared = CacheContext.Of(offline);
+        AppServices.Use(new AppServices(null, shared));
+        Program.Check(await VerifyCode.Issue("reset", "case@example.test") == "",
+            "unavailable Redis refuses issuance");
+        Program.Check(!await VerifyCode.Accept("register", "case@example.test", code),
+            "unavailable Redis rejects verification, never uses local fallback");
+        AppServices.Use(null);
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        if (Program.failures != 0) { throw new Exception("verify-code security regression"); }
+    }
+}

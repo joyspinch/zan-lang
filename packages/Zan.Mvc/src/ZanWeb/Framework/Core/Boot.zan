@@ -90,10 +90,9 @@ class Boot {
         app.AuthResolver(AuthToken.Resolve);
         app.PermissionResolver(AuthUser.Allow);
         app.LoginPath(Routes.Login);
-        /* CSRF 前哨：不安全方法按浏览器自动附带的 Origin/Sec-Fetch-Site
-           拒跨站（免客户端配合）。double-submit token 版（Csrf.Guard）
-           仍由应用按需自行升级注册。 */
-        app.Before(Csrf.OriginGuard);
+        /* Cookie 写入必须有同源证据；不要求无 cookie 的 API 客户端
+           伪造浏览器头。double-submit token 仍可按需升级注册。 */
+        app.Before(Boot.OriginGuard);
         /* 运行模式判断：mode=api 时跳过 HTML 视图载入与静态目录挂载（纯 API 轻量模式） */
         if (Cfg.Server.mode != "api") {
             /* 视图从磁盘读取一次，之后从内存渲染 */
@@ -182,7 +181,11 @@ class Boot {
         ApiDocs.Title(Cfg.Server.name);
         ApiDocs.MountSpec(app, "/api/docs");
 
-        /* 启动服务器，支持 start/stop/restart/reload/status */
+        /* RunCommand 的返回不是 worker 停服边界：start 的 master/worker 在
+           Worker 内直接 exit；stop/reload/status 返回的只是命令发送进程，
+           reload 应答时旧 worker 仍可能处理请求。不要在这里或 finally 中
+           关闭池/缓存或重置静态服务；真正清理须由 Worker 排空请求后的可等待
+           钩子触发，并先停止、等待 job/metrics/cluster 后台任务再关依赖。 */
         int r = await WebServer.RunCommand(app, Cfg.Worker.count,
             Cfg.Worker.daemon);
         return r;
@@ -200,9 +203,114 @@ class Boot {
         }
     }
 
-    /* 跨域资源共享（CORS）与预检阻断中间件 */
+    /* Cookie writes need browser-origin evidence; bearer and cookie-free API
+       clients do not rely on ambient credentials and need no browser headers. */
+    static bool OriginGuard(HttpContext ctx) {
+        if (ctx.method == "GET" || ctx.method == "HEAD" || ctx.method == "OPTIONS") {
+            return true;
+        }
+        string origin = ctx.Header("Origin");
+        bool bearer = ctx.Header("Authorization").StartsWith("Bearer ");
+        bool cookie = !bearer && ctx.Cookie("zsession").Length > 0;
+        if (!cookie) {
+            if (origin.Length > 0 && Cfg.Cors.enabled && Boot.ValidCorsOrigin()
+                    && (origin == Cfg.Cors.allowOrigin
+                        || (bearer && Cfg.Cors.allowOrigin == "*"
+                            && Boot.HttpOrigin(origin) == origin))) {
+                return true;
+            }
+            return Csrf.OriginGuard(ctx);
+        }
+        string site = ctx.Header("Sec-Fetch-Site");
+        bool same = site != "cross-site";
+        if (origin.Length > 0) {
+            same = same && Boot.HttpOrigin(origin) == origin
+                && Boot.SameOriginHost(origin, ctx.Header("Host"));
+        } else {
+            string referer = ctx.Header("Referer");
+            if (referer.Length > 0) {
+                string refOrigin = Boot.HttpOrigin(referer);
+                same = same && refOrigin.Length > 0
+                    && Boot.SameOriginHost(refOrigin, ctx.Header("Host"));
+            } else {
+                same = same && site == "same-origin";
+            }
+        }
+        if (same) { return true; }
+        ctx.Status(403, "Forbidden");
+        ctx.Text("request origin missing or invalid");
+        return false;
+    }
+
+    /* HTTP(S) origin only, rejecting opaque origins, userinfo and delimiters
+       rather than sanitizing attacker input into a different authority. */
+    static string HttpOrigin(string url) {
+        int start = 0;
+        if (url.StartsWith("https://")) { start = 8; }
+        else if (url.StartsWith("http://")) { start = 7; }
+        else { return ""; }
+        for (int i = 0; i < url.Length; i = i + 1) {
+            int c = url[i] & 255;
+            if (c <= 32 || c == 127 || c == 92) { return ""; }
+        }
+        int end = url.Length;
+        int slash = url.IndexOf("/", start);
+        int query = url.IndexOf("?", start);
+        int hash = url.IndexOf("#", start);
+        if (slash >= 0 && slash < end) { end = slash; }
+        if (query >= 0 && query < end) { end = query; }
+        if (hash >= 0 && hash < end) { end = hash; }
+        if (end <= start) { return ""; }
+        string auth = url.Substring(start, end - start);
+        for (int i = 0; i < auth.Length; i = i + 1) {
+            int c = auth[i] & 255;
+            bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122) || c == 46 || c == 45
+                || c == 58 || c == 91 || c == 93;
+            if (!ok) { return ""; }
+        }
+        int portAt = auth.IndexOf(":");
+        if (auth.StartsWith("[")) {
+            int close = auth.IndexOf("]");
+            if (close <= 2 || !auth.Substring(1, close - 1).Contains(":")) { return ""; }
+            portAt = close + 1;
+            if (portAt == auth.Length) { portAt = -1; }
+            else if ((auth[portAt] & 255) != 58) { return ""; }
+        } else {
+            if (auth.Contains("[") || auth.Contains("]") || portAt == 0) { return ""; }
+        }
+        if (portAt >= 0) {
+            string port = auth.Substring(portAt + 1);
+            if (port.Length == 0 || port.Length > 5) { return ""; }
+            int number = 0;
+            for (int i = 0; i < port.Length; i = i + 1) {
+                int digit = (port[i] & 255) - 48;
+                if (digit < 0 || digit > 9) { return ""; }
+                number = number * 10 + digit;
+            }
+            if (number > 65535) { return ""; }
+        }
+        return url.Substring(0, end);
+    }
+
+    static bool SameOriginHost(string origin, string host) {
+        if (host.Length == 0) { return false; }
+        bool tls = origin.StartsWith("https://");
+        int start = tls ? 8 : 7;
+        return Csrf.TrimDefaultPort(origin.Substring(start).ToLower(), tls)
+            == Csrf.TrimDefaultPort(host.ToLower(), tls);
+    }
+
+    static bool ValidCorsOrigin() {
+        string origin = Cfg.Cors.allowOrigin;
+        if (origin == "*") { return !Cfg.Cors.allowCredentials; }
+        return origin.Length > 0 && Boot.HttpOrigin(origin) == origin;
+    }
+
+    /* Invalid CORS configuration grants no cross-origin access, without
+       disabling same-origin pages or non-browser API clients. */
     static bool CorsFilter(HttpContext ctx) {
-        if (!Cfg.Cors.enabled) { return true; }
+        if (!Cfg.Cors.enabled || !Boot.ValidCorsOrigin()) { return true; }
         ctx.SetHeader("Access-Control-Allow-Origin", Cfg.Cors.allowOrigin);
         ctx.SetHeader("Access-Control-Allow-Methods", Cfg.Cors.allowMethods);
         ctx.SetHeader("Access-Control-Allow-Headers", Cfg.Cors.allowHeaders);
@@ -213,6 +321,7 @@ class Boot {
 
         if (ctx.method == "OPTIONS") {
             ctx.Status(204, "No Content");
+            ctx.Text("");
             return false;
         }
         return true;

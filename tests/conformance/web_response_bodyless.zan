@@ -1,0 +1,111 @@
+// RFC 9110 8.6 / RFC 9112 6.3: bodyless statuses are not empty 200s.
+// HEAD still advertises the GET representation length, including binary data.
+using System;
+using System.Net.Http;
+using System.Web;
+
+class Program {
+    static int bad = 0;
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); Program.bad = Program.bad + 1; }
+    }
+    static HttpContext Ctx(string method) {
+        return new HttpContext(HttpRequest.Parse(method
+            + " / HTTP/1.1\r\nHost: test\r\n\r\n"), "127.0.0.1");
+    }
+    static bool HeadersOnly(string response) {
+        int end = response.IndexOf("\r\n\r\n");
+        return end >= 0 && response.Length == end + 4;
+    }
+    static void Bodyless(int status, string method, bool binary, bool keepAlive) {
+        HttpContext ctx = Program.Ctx(method);
+        ctx.Status(status, "Test");
+        if (binary) {
+            byte[] bytes = new byte[3];
+            bytes[0] = 65; bytes[1] = 0; bytes[2] = 66;
+            ctx.Binary("application/octet-stream", bytes, 3);
+        } else {
+            ctx.Text("must not reach the wire");
+        }
+        ctx.SetHeader("X-Keep", "yes");
+        string response = ctx.BuildResponse(keepAlive);
+        Program.Check(Program.HeadersOnly(response), "bodyless text/header block");
+        Program.Check(ctx.BodyLength() == 0, "bodyless binary send length");
+        Program.Check(!response.Contains("Content-Length:"), "no fabricated length");
+        Program.Check(response.Contains("X-Keep: yes\r\n"), "unrelated header survives");
+        Program.Check(response.Contains(keepAlive ? "Connection: keep-alive\r\n"
+            : "Connection: close\r\n"), "connection preserved");
+        // The serializer must not consume/mutate a prepared representation.
+        Program.Check(response == ctx.BuildResponse(keepAlive), "repeat serialization");
+        if (status != 304) {
+            ctx.SetHeader("cOnTeNt-LeNgTh", "999");
+            ctx.SetHeader("TRANSFER-ENCODING", "chunked");
+            ctx.SetHeader("Content-Length", "0");
+            response = ctx.BuildResponse(keepAlive);
+            Program.Check(!response.Contains("cOnTeNt-LeNgTh")
+                && !response.Contains("TRANSFER-ENCODING")
+                && !response.Contains("Content-Length"), "forbidden custom framing");
+            Program.Check(Program.HeadersOnly(response), "no chunk terminator/body");
+        }
+    }
+    static void Main() {
+        // Exercise the entire informational range, not only 100/101/103.
+        for (int status = 100; status < 200; status = status + 1) {
+            Program.Bodyless(status, "GET", false, true);
+            Program.Bodyless(status, "HEAD", true, false);
+        }
+        for (int i = 0; i < 2; i = i + 1) {
+            string method = i == 0 ? "GET" : "HEAD";
+            Program.Bodyless(204, method, false, true);
+            Program.Bodyless(204, method, true, false);
+            Program.Bodyless(304, method, false, true);
+            Program.Bodyless(304, method, true, false);
+        }
+        HttpContext empty = Program.Ctx("GET");
+        empty.Status(204, "No Content");
+        Program.Check(!empty.BuildResponse(true).Contains("Content-Length:"), "empty 204 no length");
+        empty.Status(304, "Not Modified");
+        Program.Check(!empty.BuildResponse(true).Contains("Content-Length:"), "empty 304 no invented zero");
+        // A caller that knows the selected representation can supply 304 metadata.
+        empty.SetHeader("Content-Length", "123");
+        empty.SetHeader("ETag", "\"version\"");
+        string cached = empty.BuildResponse(true);
+        Program.Check(cached.Contains("Content-Length: 123\r\n")
+            && !cached.Contains("Content-Length: 0\r\n")
+            && cached.Contains("ETag: \"version\"\r\n")
+            && Program.HeadersOnly(cached), "304 explicit metadata");
+
+        HttpContext text = Program.Ctx("GET");
+        text.Text("hello");
+        string textGet = text.BuildResponse(true);
+        Program.Check(textGet.Contains("Content-Length: 5\r\n")
+            && textGet.EndsWith("\r\n\r\nhello"), "ordinary GET text");
+        text.method = "HEAD";
+        string head = text.BuildResponse(true);
+        Program.Check(head == textGet.Substring(0, textGet.Length - 5)
+            && text.BodyLength() == 5, "HEAD preserves GET headers and length");
+        text.Text("你好");
+        Program.Check(text.BuildResponse(false).Contains("Content-Length: 6\r\n")
+            && Program.HeadersOnly(text.BuildResponse(false)), "HEAD UTF-8 bytes");
+
+        HttpContext bin = Program.Ctx("GET");
+        byte[] bytes = new byte[3];
+        bytes[0] = 65; bytes[1] = 0; bytes[2] = 66;
+        bin.Binary("application/octet-stream", bytes, 3);
+        string binaryGet = bin.BuildResponse(true);
+        Program.Check(bin.IsBinary() && bin.BodyLength() == 3
+            && binaryGet.Contains("Content-Length: 3\r\n")
+            && Program.HeadersOnly(binaryGet), "ordinary binary send contract");
+        bin.method = "HEAD";
+        Program.Check(bin.BuildResponse(true) == binaryGet && bin.BodyLength() == 3,
+            "HEAD binary representation length");
+        // Static HEAD responses may retain only the length, not the file bytes.
+        bin.Binary("application/octet-stream", new byte[0], 4096);
+        Program.Check(bin.BuildResponse(true).Contains("Content-Length: 4096\r\n")
+            && bin.BodyLength() == 4096, "HEAD metadata-only binary");
+        HttpContext zero = Program.Ctx("GET");
+        Program.Check(zero.BuildResponse(false).Contains("Content-Length: 0\r\n")
+            && Program.HeadersOnly(zero.BuildResponse(false)), "ordinary empty 200");
+        Console.WriteLine("bodyless framing failures=" + Convert.ToString(Program.bad));
+    }
+}

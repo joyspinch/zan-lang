@@ -1,0 +1,246 @@
+// Private runner: compile with packages/Zan.Mvc/src/**/*.zan, no CMake registration.
+// Optional ZAN_TEST_REDIS_PORT selects an isolated Redis instance; never use production Redis.
+using System;
+using System.Data.Redis;
+using System.Json;
+using ZanWeb.Account;
+using System.Threading;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Security;
+using ZanWeb.Services;
+using ZanWeb.Web;
+
+class Program {
+    static int failures;
+    static int admitted;
+    static int rejected;
+    static string winner = "";
+    static StrMap results = new StrMap();
+    static CacheContext first;
+    static CacheContext second;
+    static void Check(bool ok, string label) {
+        if (!ok) { Program.failures = Program.failures + 1; Console.WriteLine("FAIL " + label); }
+    }
+    static async void Race(int i, bool rotate) {
+        CacheContext c = Program.first;
+        if (i % 2 == 1) { c = Program.second; }
+        string address = "same";
+        if (rotate) { address = Convert.ToString(i); }
+        string prefix = "issuance-test:race:" + Convert.ToString(rotate);
+        string candidate = Convert.ToString(i);
+        int status = await c.IssueCodeAsync(prefix + ":code:" + address,
+            prefix + ":sent:" + address, prefix + ":ip", candidate, 60, 30, 60, 5);
+        lock (Program.results) {
+            if (status == 1) { Program.admitted = Program.admitted + 1; Program.winner = candidate; }
+            else if (status == 0) { Program.rejected = Program.rejected + 1; }
+            else { Program.failures = Program.failures + 1; }
+        }
+    }
+    static async void RunRace(bool rotate, int expected) {
+        Program.admitted = 0;
+        Program.rejected = 0;
+        List<long> tasks = new List<long>();
+        for (int i = 0; i < 32; i = i + 1) { tasks.Add(Task.Spawn(Program.Race(i, rotate))); }
+        await Task.WhenAll(tasks);
+        Program.Check(Program.admitted == expected && Program.rejected == 32 - expected,
+            "atomic concurrent admission " + Convert.ToString(rotate));
+        if (!rotate) {
+            string prefix = "issuance-test:race:" + Convert.ToString(false);
+            string saved = await Program.first.GetAsync(prefix + ":code:same");
+            Program.Check(saved == Program.winner, "losing issuers cannot overwrite winner");
+        }
+    }
+    static async void ControllerDenied(bool reset, int expected, string peer = "192.0.2.10", string headers = "") {
+        HttpContext ctx = new HttpContext(HttpRequest.Parse("POST / HTTP/1.1\r\nHost: example.test\r\n" + headers + "\r\n"), peer);
+        ctx.form.Set("email", "denied@example.test");
+        int status = 0;
+        try {
+            if (reset) {
+                ZanWeb.Account.ForgotController c = new ZanWeb.Account.ForgotController();
+                c.__Bind(ctx);
+                await c.Code();
+            } else {
+                ZanWeb.Account.RegisterController c = new ZanWeb.Account.RegisterController();
+                c.__Bind(ctx);
+                await c.Code();
+            }
+        } catch (ApiError e) { status = e.Status(); }
+        Program.Check(status == expected, "controller denies before SMTP " + Convert.ToString(reset));
+    }
+    static string ResolveIp(string peer, string headers) {
+        HttpContext ctx = new HttpContext(HttpRequest.Parse("POST /register/code HTTP/1.1\r\nHost: example.test\r\n"
+            + headers + "\r\n"), peer);
+        return RegisterController.IssuanceIp(ctx);
+    }
+    static void ProxyResolver() {
+        Program.Check(Cfg.Server.trustedProxies == "", "proxy trust defaults off");
+        Program.Check(Program.ResolveIp("192.0.2.40", "X-Forwarded-For: 198.51.100.1\r\n") == "192.0.2.40", "default ignores XFF");
+        JsonValue root = JsonValue.NewObject();
+        JsonValue server = JsonValue.NewObject();
+        server.PutStr("trustedProxies", "192.0.2.40, 192.0.2.41, ::1");
+        root.Put("server", server);
+        Cfg.Apply(root);
+        Program.Check(Cfg.Server.trustedProxies == "192.0.2.40, 192.0.2.41, ::1", "trusted proxy config loads");
+        Program.Check(Program.ResolveIp("192.0.2.42", "X-Forwarded-For: 198.51.100.1\r\n") == "192.0.2.42", "untrusted peer ignores XFF");
+        Program.Check(Program.ResolveIp("192.0.2.40", "X-Forwarded-For: 198.51.100.1\r\n") == "198.51.100.1", "trusted proxy client");
+        Program.Check(Program.ResolveIp("192.0.2.40", "X-Forwarded-For: 203.0.113.99, 198.51.100.1\r\n") == "198.51.100.1", "spoofed leftmost ignored");
+        Program.Check(Program.ResolveIp("192.0.2.40", "X-Forwarded-For: 203.0.113.99, 198.51.100.1, 192.0.2.41\r\n") == "198.51.100.1", "trusted multi-hop suffix");
+        Program.Check(Program.ResolveIp("192.0.2.40", "X-Forwarded-For: 198.51.100.1, 192.0.2.42\r\n") == "192.0.2.42", "stop at untrusted intermediate proxy");
+        Program.Check(Program.ResolveIp("192.0.2.40", "X-Real-IP: 198.51.100.1\r\nForwarded: for=198.51.100.2\r\n") == "192.0.2.40", "no alternate forwarding headers");
+        Program.Check(Program.ResolveIp("192.0.2.40", "X-Forwarded-For: 198.51.100.1\r\nx-forwarded-for: 198.51.100.2\r\n") == "192.0.2.40", "duplicate XFF rejected");
+        Program.Check(Program.ResolveIp("", "X-Forwarded-For: 198.51.100.1\r\n") == "unknown", "missing peer has fixed bucket");
+        List<string> bad = new List<string>();
+        bad.Add(""); bad.Add("unknown"); bad.Add("example.test"); bad.Add("256.1.2.3");
+        bad.Add("01.2.3.4"); bad.Add("1.2.3"); bad.Add("1..2.3"); bad.Add("127.1");
+        bad.Add("0x7f000001"); bad.Add("2130706433"); bad.Add("198.51.100.1:80");
+        bad.Add("\"198.51.100.1\""); bad.Add("198.51.100.1,"); bad.Add(",198.51.100.1");
+        bad.Add("198.51.100.1,,192.0.2.41"); bad.Add("garbage, 198.51.100.1");
+        bad.Add("2001:db8:::1"); bad.Add("1:2:3:4:5:6:7"); bad.Add("1:2:3:4:5:6:7:8:9");
+        bad.Add("1:2:3:4:5:6:7:8::"); bad.Add("1::2::3"); bad.Add("[::1]");
+        bad.Add("fe80::1%eth0"); bad.Add("::ffff:01.2.3.4"); bad.Add("2001:db8::g");
+        bad.Add("198.51.\t100.1"); bad.Add("198.51.100.1\r\n 198.51.100.2");
+        for (int i = 0; i < bad.Count; i = i + 1) {
+            Program.Check(Program.ResolveIp("192.0.2.40", "X-Forwarded-For: " + bad[i] + "\r\n") == "192.0.2.40",
+                "malformed forwarding rejected " + Convert.ToString(i));
+        }
+        string tooMany = "198.51.100.1";
+        for (int i = 0; i < 32; i = i + 1) { tooMany = tooMany + ",192.0.2.41"; }
+        Program.Check(Program.ResolveIp("192.0.2.40", "X-Forwarded-For: " + tooMany + "\r\n") == "192.0.2.40", "hop cap");
+        string tooLong = "198.51.100.1";
+        for (int i = 0; i < 2048; i = i + 1) { tooLong = tooLong + " "; }
+        tooLong = tooLong + ",192.0.2.41";
+        Program.Check(Program.ResolveIp("192.0.2.40", "X-Forwarded-For: " + tooLong + "\r\n") == "192.0.2.40", "header length cap");
+        Program.Check(Program.ResolveIp("0:0:0:0:0:0:0:1", "X-Forwarded-For: 2001:DB8::a\r\n") == "2001:0db8:0000:0000:0000:0000:0000:000a", "IPv6 trusted peer and canonical client");
+        Program.Check(RegisterController.CanonicalIp("2001:db8:0:0:0:0:0:a") == RegisterController.CanonicalIp("2001:DB8::000a"), "IPv6 aliases share identity");
+        Program.Check(RegisterController.CanonicalIp("::ffff:c633:6401") == "198.51.100.1", "mapped hexadecimal IPv4 canonicalized");
+        Program.Check(Program.ResolveIp("::ffff:192.0.2.40", "X-Forwarded-For: ::ffff:198.51.100.1\r\n") == "198.51.100.1", "mapped IPv4 canonicalized");
+        Program.Check(RegisterController.CanonicalIp("2001:db8::") == "2001:0db8:0000:0000:0000:0000:0000:0000", "trailing IPv6 compression");
+        Cfg.Server.trustedProxies = "192.0.2.40,*";
+        Program.Check(Program.ResolveIp("192.0.2.40", "X-Forwarded-For: 198.51.100.1\r\n") == "192.0.2.40", "invalid config disables trust");
+        Cfg.Server.trustedProxies = "192.0.2.0/24";
+        Program.Check(Program.ResolveIp("192.0.2.40", "X-Forwarded-For: 198.51.100.1\r\n") == "192.0.2.40", "CIDR not implicitly trusted");
+        Cfg.Server.trustedProxies = "";
+    }
+    static async void ProxyQuota() {
+        Cfg.Server.trustedProxies = "192.0.2.40";
+        for (int client = 1; client <= 2; client = client + 1) {
+            for (int i = 0; i < 6; i = i + 1) {
+                string ip = Program.ResolveIp("192.0.2.40", "X-Forwarded-For: 203.0.113." + Convert.ToString(i)
+                    + ", 198.51.100." + Convert.ToString(client) + "\r\n");
+                VerifyCodeIssue issued = await VerifyCode.IssueForIp("register", "proxy-" + Convert.ToString(client)
+                    + "-" + Convert.ToString(i) + "@example.test", ip);
+                Program.Check(issued.status == (i < 5 ? 1 : 0), "proxy clients have separate quotas despite spoofed prefix");
+            }
+        }
+        Cfg.Server.trustedProxies = "";
+    }
+    static async void Main() {
+        int port = Filter.ToInt(ProcessHost.Env("ZAN_TEST_REDIS_PORT"), 0);
+        if (port > 0) {
+            Program.first = CacheContext.Of(new RedisPool("127.0.0.1", port, 8, 1000));
+            Program.second = CacheContext.Of(new RedisPool("127.0.0.1", port, 8, 1000));
+        } else {
+            Program.first = CacheContext.Of(null);
+            Program.second = Program.first;
+        }
+        if (ProcessHost.Env("ZAN_TEST_ISSUE_WORKER") == "1") {
+            string address = ProcessHost.Env("ZAN_TEST_WORKER_ADDRESS");
+            int result = await Program.first.IssueCodeAsync("workers:code:" + address, "workers:sent:" + address,
+                "workers:ip", "worker", 60, 30, 60, 5);
+            Console.WriteLine("worker=" + Convert.ToString(result));
+            Program.first.Close(); Program.second.Close();
+            return;
+        }
+        AppServices.Use(new AppServices(null, Program.first));
+        Program.ProxyResolver();
+        await Program.ProxyQuota();
+        await Program.RunRace(false, 1);
+        await Program.RunRace(true, 5);
+        VerifyCodeIssue issued = await VerifyCode.IssueForIp("register", " Case@Example.test ", "192.0.2.1");
+        Program.Check(issued.status == 1 && issued.code.Length == 6, "first issuance succeeds");
+        VerifyCodeIssue blocked = await VerifyCode.IssueForIp("reset", "case@example.TEST", "192.0.2.2");
+        Program.Check(blocked.status == 0 && blocked.code == "", "normalized cross-purpose address cooldown");
+        Program.Check(!await VerifyCode.Accept("reset", "case@example.test", issued.code), "purpose separation");
+        Program.Check(await VerifyCode.Accept("register", "case@example.test", issued.code), "winner usable");
+        Program.Check(!await VerifyCode.Accept("register", "case@example.test", issued.code), "one-time consumption");
+        blocked = await VerifyCode.IssueForIp("register", "case@example.test", "192.0.2.3");
+        Program.Check(blocked.status == 0, "consumption does not clear cooldown");
+        for (int i = 0; i < 6; i = i + 1) {
+            string purpose = "register";
+            if (i % 2 == 1) { purpose = "reset"; }
+            HttpContext ctx = new HttpContext(HttpRequest.Parse("POST /forgot/code HTTP/1.1\r\n"
+                + "Host: example.test\r\nX-Forwarded-For: 198.51.100." + Convert.ToString(i)
+                + "\r\nX-Real-IP: 203.0.113." + Convert.ToString(i) + "\r\n\r\n"), "192.0.2.10");
+            VerifyCodeIssue r = await VerifyCode.IssueForIp(purpose, "rotate" + Convert.ToString(i)
+                + "@example.test", RegisterController.IssuanceIp(ctx));
+            Program.Check(r.status == (i < 5 ? 1 : 0), "rotating address/purpose/forwarded header shares IP quota");
+        }
+        Settings.values = new StrMap();
+        Settings.expires = WebApp.NowSeconds() + 600;
+        Settings.values.Set(SettingKeys.RegisterEnabled, "1");
+        Settings.values.Set(SettingKeys.ResetEnabled, "1");
+        Settings.values.Set(SettingKeys.MailHost, "127.0.0.1");
+        Settings.values.Set(SettingKeys.MailPort, "1");
+        Settings.values.Set(SettingKeys.MailFrom, "test@example.test");
+        Settings.values.Set(SettingKeys.MailSsl, "0");
+        await Program.ControllerDenied(false, 429);
+        await Program.ControllerDenied(true, 429);
+        Cfg.Server.trustedProxies = "192.0.2.40";
+        await Program.ControllerDenied(false, 429, "192.0.2.40", "X-Forwarded-For: 203.0.113.88, 198.51.100.1\r\n");
+        await Program.ControllerDenied(true, 429, "192.0.2.40", "X-Forwarded-For: 203.0.113.89, 198.51.100.2\r\n");
+        Cfg.Server.trustedProxies = "";
+        if (port > 0) {
+            await Program.first.SetAsync("fault:ip", "not-an-integer");
+            int fault = await Program.first.IssueCodeAsync("fault:code", "fault:sent", "fault:ip", "bad", 60, 60, 60, 5);
+            Program.Check(fault == -1 && await Program.first.GetAsync("fault:code") == "", "malformed quota fails closed");
+            RedisPool pool = new RedisPool("127.0.0.1", port, 1);
+            RedisClient client = await pool.AcquireAsync();
+            if (client != null) {
+                RedisReply reply = await client.CommandAsync3("LPUSH", "wrongtype:ip", "x");
+                Program.Check(!reply.IsError(), "prepare Redis wrong-type key");
+                pool.Release(client);
+            }
+            pool.Close();
+            fault = await Program.first.IssueCodeAsync("wrongtype:code", "wrongtype:sent", "wrongtype:ip", "bad", 60, 60, 60, 5);
+            Program.Check(fault == -1 && await Program.first.GetAsync("wrongtype:code") == "", "Redis script error fails closed");
+        }
+        int one = await Program.first.IssueCodeAsync("expiry:code", "expiry:sent", "expiry:ip", "old", 1, 1, 1, 1);
+        Program.Check(one == 1, "short TTL issuance");
+        await Task.Delay(2100);
+        Program.Check(!await Program.first.ConsumeCodeAsync("expiry:code", "old"), "code expires");
+        one = await Program.second.IssueCodeAsync("expiry:code", "expiry:sent", "expiry:ip", "new", 5, 5, 5, 1);
+        Program.Check(one == 1, "window and cooldown reopen after TTL");
+        int invalid = await Program.first.IssueCodeAsync("bad:code", "bad:sent", "bad:ip", "bad", 0, 1, 1, 1);
+        Program.Check(invalid == -1 && await Program.first.GetAsync("bad:code") == "", "invalid TTL fails before writing");
+        int fixedFirst = await Program.first.IssueCodeAsync("fixed:a", "fixed:sent:a", "fixed:ip", "a", 10, 10, 2, 2);
+        await Task.Delay(1100);
+        int fixedSecond = await Program.first.IssueCodeAsync("fixed:b", "fixed:sent:b", "fixed:ip", "b", 10, 10, 2, 2);
+        await Task.Delay(1100);
+        int fixedThird = await Program.first.IssueCodeAsync("fixed:c", "fixed:sent:c", "fixed:ip", "c", 10, 10, 2, 2);
+        Program.Check(fixedFirst == 1 && fixedSecond == 1 && fixedThird == 1, "later admissions do not extend fixed window");
+        if (port == 0) {
+            Cfg.Cache.driver = "redis";
+            VerifyCodeIssue missingPool = await VerifyCode.IssueForIp("register", "pool@example.test", "192.0.2.21");
+            Program.Check(missingPool.status == -1 && missingPool.code == "", "configured Redis missing pool cannot fall back");
+            Cfg.Cache.driver = "memory";
+            Cfg.Worker.count = 2;
+            VerifyCodeIssue multi = await VerifyCode.IssueForIp("register", "multi@example.test", "192.0.2.20");
+            Program.Check(multi.status == -1 && multi.code == "", "multi-worker memory fails closed");
+            Cfg.Worker.count = 1;
+        }
+        RedisPool offline = new RedisPool("127.0.0.1", 1, 1, 50);
+        offline.Close();
+        AppServices.Use(new AppServices(null, CacheContext.Of(offline)));
+        VerifyCodeIssue failed = await VerifyCode.IssueForIp("register", "offline@example.test", "192.0.2.30");
+        Program.Check(failed.status == -1 && failed.code == "", "cache failure exposes no sendable code");
+        await Program.ControllerDenied(false, 503);
+        await Program.ControllerDenied(true, 503);
+        AppServices.Use(null);
+        failed = await VerifyCode.IssueForIp("reset", "absent@example.test", "192.0.2.30");
+        Program.Check(failed.status == -1 && failed.code == "", "missing cache fails closed");
+        Program.first.Close(); Program.second.Close();
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        if (Program.failures != 0) { throw new Exception("issuance regression"); }
+    }
+}

@@ -1,0 +1,89 @@
+// Compile with explicit packages/Zan.Mvc/src/**/*.zan sources and --auto-stdlib.
+// Bootstrap must reject missing/weak credentials; legacy public admin must rotate.
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+using ZanWeb.Core;
+using ZanWeb.Dao;
+using ZanWeb.Model;
+using ZanWeb.Security;
+
+class Program {
+    static int failures;
+    static void Check(bool ok, string label) {
+        if (!ok) { Program.failures = Program.failures + 1; Console.WriteLine("FAIL " + label); }
+    }
+
+    static async void Main() {
+        Directory.CreateDirectoryRecursive("_scratch/server-mvc-security");
+        string path = "_scratch/server-mvc-security/bootstrap.db";
+        File.Delete(path);
+        Cfg.Auth.iter = 1000;
+        SqliteConnection db = SqliteConnection.Open(path);
+        await db.SyncStructureAllAsync();
+        SysUserDao users = new SysUserDao(db);
+        Cfg.Auth.bootstrapPassword = "";
+        bool refused = false;
+        try { bool ok = await Schema.SeedAdmin(db); }
+        catch (Exception ex) { refused = ex.Message.Contains("bootstrapPassword"); }
+        Program.Check(refused && await users.Count() == 0, "empty database refuses missing password");
+        Cfg.Auth.bootstrapPassword = "admin1234";
+        refused = false;
+        try { bool ok = await Schema.SeedAdmin(db); }
+        catch (Exception ex) { refused = ex.Message.Contains("bootstrapPassword"); }
+        Program.Check(refused && await users.Count() == 0, "empty database refuses public default");
+        Cfg.Auth.bootstrapPassword = "too-short";
+        refused = false;
+        try { bool ok = await Schema.SeedAdmin(db); }
+        catch (Exception ex) { refused = ex.Message.Contains("bootstrapPassword"); }
+        Program.Check(refused && await users.Count() == 0, "empty database refuses short password");
+
+        Cfg.Auth.bootstrapPassword = "temporary-strong-bootstrap-password";
+        Program.Check(await Schema.SeedAdmin(db), "strong password bootstraps");
+        SysUser admin = await users.ByUsername("admin");
+        Program.Check(admin != null && admin.isSuper == 1
+            && AuthUser.Verify("temporary-strong-bootstrap-password", admin.passwordSalt, admin.passwordHash)
+            && !AuthUser.Verify("admin1234", admin.passwordSalt, admin.passwordHash),
+            "bootstrap password is not public default");
+        int originalCount = await users.Count();
+        Program.Check(await Schema.SeedAdmin(db) && await users.Count() == originalCount,
+            "bootstrap is idempotent");
+
+        // Restore the leaked legacy password as if upgrading an existing deployment.
+        int legacyId = admin.id;
+        int beforeVersion = admin.tokenVersion;
+        int n = await users.ResetPassword(legacyId, "", AuthUser.NewHash("admin1234"), 1);
+        Program.Check(n == 1, "legacy fixture installed");
+        Cfg.Auth.bootstrapPassword = "";
+        refused = false;
+        try { bool ok = await Schema.SeedAdmin(db); }
+        catch (Exception ex) { refused = ex.Message.Contains("rotated"); }
+        SysUser legacy = await users.ByUsername("admin");
+        Program.Check(refused && AuthUser.Verify("admin1234", legacy.passwordSalt, legacy.passwordHash),
+            "legacy public password blocks startup without rotation");
+        Cfg.Auth.bootstrapPassword = "weak";
+        refused = false;
+        try { bool ok = await Schema.SeedAdmin(db); }
+        catch (Exception ex) { refused = ex.Message.Contains("rotated"); }
+        legacy = await users.ByUsername("admin");
+        Program.Check(refused && AuthUser.Verify("admin1234", legacy.passwordSalt, legacy.passwordHash),
+            "legacy public password blocks weak rotation");
+        Cfg.Auth.bootstrapPassword = "rotated-admin-password-long";
+        Program.Check(await Schema.SeedAdmin(db), "legacy password rotates");
+        SysUser rotated = await users.ByUsername("admin");
+        Program.Check(rotated.passwordHash.IndexOf("pbkdf2$") == 0
+            && AuthUser.Verify("rotated-admin-password-long", rotated.passwordSalt, rotated.passwordHash)
+            && !AuthUser.Verify("admin1234", rotated.passwordSalt, rotated.passwordHash)
+            && rotated.tokenVersion > beforeVersion + 1,
+            "rotation invalidates public credential and old tokens");
+        Cfg.Auth.bootstrapPassword = "";
+        Program.Check(await Schema.SeedAdmin(db) && await users.Count() == originalCount,
+            "rotated deployment does not require bootstrap password again");
+        db.Close();
+        File.Delete(path);
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        if (Program.failures != 0) { throw new Exception("bootstrap security regression"); }
+    }
+}

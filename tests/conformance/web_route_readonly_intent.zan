@@ -1,0 +1,54 @@
+using System;
+using System.Web;
+
+class LeaseTrace {
+    static string events = "";
+    static int failures;
+    static void Add(string value) { LeaseTrace.events = LeaseTrace.events + value; }
+    static void Check(string label, string expected) {
+        if (LeaseTrace.events != expected) {
+            LeaseTrace.failures = LeaseTrace.failures + 1;
+            Console.WriteLine("FAIL " + label + " " + LeaseTrace.events);
+        }
+        LeaseTrace.events = "";
+    }
+}
+
+[Route("/intent")]
+class IntentController : Controller {
+    bool readOnly;
+    override void __UseReadOnly() { LeaseTrace.Add("intent,"); this.readOnly = true; }
+    override async bool OnBeforeAsync() {
+        LeaseTrace.Add(this.readOnly ? "read," : "write,");
+        return true;
+    }
+    override async void OnAfterAsync() { LeaseTrace.Add("release,"); }
+
+    [HttpGet]
+    [ReadOnly]
+    void List() { LeaseTrace.Add("list,"); }
+
+    // GET alone does not imply replica: this action may write.
+    [HttpGet]
+    void MutatingGet() { LeaseTrace.Add("mutating,"); }
+
+    [HttpPost]
+    [Tx]
+    void Save() { LeaseTrace.Add("save,"); }
+}
+
+class Program {
+    static HttpContext Ctx(string method, string path) {
+        HttpRequest req = HttpRequest.Parse(method + " " + path + " HTTP/1.1\r\nHost: test\r\n\r\n");
+        return new HttpContext(req, "127.0.0.1");
+    }
+    static async void Main() {
+        await __AttrRoutes.__h_IntentController_List(Program.Ctx("GET", "/intent/list"));
+        LeaseTrace.Check("read before lease", "intent,read,list,release,");
+        await __AttrRoutes.__h_IntentController_MutatingGet(Program.Ctx("GET", "/intent/mutatingget"));
+        LeaseTrace.Check("GET stays primary", "write,mutating,release,");
+        await __AttrRoutes.__h_IntentController_Save(Program.Ctx("POST", "/intent/save"));
+        LeaseTrace.Check("transaction stays primary", "write,save,release,");
+        Console.WriteLine("failures=" + Convert.ToString(LeaseTrace.failures));
+    }
+}

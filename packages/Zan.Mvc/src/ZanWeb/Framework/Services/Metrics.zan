@@ -94,6 +94,12 @@ class MetricsStore {
     static List<MetricError> errors = new List<MetricError>();
     /* 待写入的 SQL 模板聚合（按模板聚合，每个慢查询只累加一次）。 */
     static List<MetricSql> sqlBuckets = new List<MetricSql>();
+    /* 已摘取但尚未提交的批次独立保留；新到记录仍写入上面的活动队列。 */
+    static List<MinuteBucket> retryBuckets = new List<MinuteBucket>();
+    static List<MetricError> retryErrors = new List<MetricError>();
+    static List<MetricSql> retrySqlBuckets = new List<MetricSql>();
+    static object batchLock = new object();
+    static bool flushActive = false;
     /* 未刷新桶数上限，超出则丢弃最旧记录。 */
     static int MaxBuckets = 8192;
     static int MaxErrors = 4096;
@@ -212,52 +218,67 @@ class MetricsStore {
     /* 记录一次请求完成（含状态码与耗时）。 */
     static void Record(string method, string path, int status, long us) {
         if (!Cfg.Metrics.enabled) { return; }
-        MinuteBucket b = MetricsStore.Bucket(method, path);
-        b.row.calls = b.row.calls + 1;
-        b.row.totalUs = b.row.totalUs + us;
-        if (us > b.row.maxUs) { b.row.maxUs = us; }
-        if (status >= 500) { b.row.errors = b.row.errors + 1; }
-        int bin = ServerMetrics.HistBin(us);
-        b.hist[bin] = b.hist[bin] + 1;
+        lock (MetricsStore.batchLock) {
+            MinuteBucket b = MetricsStore.Bucket(method, path);
+            b.row.calls = b.row.calls + 1;
+            b.row.totalUs = b.row.totalUs + us;
+            if (us > b.row.maxUs) { b.row.maxUs = us; }
+            if (status >= 500) { b.row.errors = b.row.errors + 1; }
+            int bin = ServerMetrics.HistBin(us);
+            b.hist[bin] = b.hist[bin] + 1;
+        }
     }
 
     /* 长连接以推送帧数/字节计量，不计耗时。 */
     static void Pushed(string method, string path, long frames, long bytes) {
         if (!Cfg.Metrics.enabled) { return; }
-        MinuteBucket b = MetricsStore.Bucket(method, path);
-        b.row.frames = b.row.frames + frames;
-        b.row.bytes = b.row.bytes + bytes;
+        lock (MetricsStore.batchLock) {
+            MinuteBucket b = MetricsStore.Bucket(method, path);
+            b.row.frames = b.row.frames + frames;
+            b.row.bytes = b.row.bytes + bytes;
+        }
     }
 
     /* 记录一条 SQL 执行结果，累加到当天模板聚合中。SQL 已规范化，耗时单位微秒。 */
     static void RecordSql(string norm, long us, bool slow) {
         if (!Cfg.Metrics.enabled) { return; }
-        MetricsStore.Arm();
-        MetricSql e = MetricsStore.SqlEntry(norm);
-        e.calls = e.calls + 1;
-        e.totalUs = e.totalUs + us;
-        if (us > e.maxUs) { e.maxUs = us; }
-        if (slow) { e.slow = e.slow + 1; }
+        lock (MetricsStore.batchLock) {
+            MetricsStore.Arm();
+            MetricSql e = MetricsStore.SqlEntry(norm);
+            e.calls = e.calls + 1;
+            e.totalUs = e.totalUs + us;
+            if (us > e.maxUs) { e.maxUs = us; }
+            if (slow) { e.slow = e.slow + 1; }
+        }
     }
 
     /* 获取今日 SQL 模板聚合项，上限超出则折叠为"其他语句"。 */
     static MetricSql SqlEntry(string norm) {
         long d = MetricsStore.Day((long)WebApp.NowSeconds());
-        for (int i = MetricsStore.sqlBuckets.Count - 1; i >= 0; i = i - 1) {
-            MetricSql e = MetricsStore.sqlBuckets[i];
-            if (e.day == d && e.sql == norm) { return e; }
+        return MetricsStore.SqlEntryIn(MetricsStore.sqlBuckets, d, norm);
+    }
+
+    /* 活动与重试队列使用同一容量策略；额外一个槽位留给 OtherSql。
+       跨天时不能混合主键，淘汰最旧项，避免每天新增一个溢出桶。 */
+    static MetricSql SqlEntryIn(List<MetricSql> rows, long day, string norm) {
+        for (int i = rows.Count - 1; i >= 0; i = i - 1) {
+            MetricSql e = rows[i];
+            if (e.day == day && e.sql == norm) { return e; }
         }
-        if (MetricsStore.sqlBuckets.Count >= MetricsStore.MaxSqlShapes) {
-            for (int i = 0; i < MetricsStore.sqlBuckets.Count; i = i + 1) {
-                MetricSql o = MetricsStore.sqlBuckets[i];
-                if (o.day == d && o.sql == MetricsStore.OtherSql) { return o; }
+        if (rows.Count >= MetricsStore.MaxSqlShapes) {
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                MetricSql o = rows[i];
+                if (o.day == day && o.sql == MetricsStore.OtherSql) { return o; }
             }
             norm = MetricsStore.OtherSql;
         }
         MetricSql n = new MetricSql();
-        n.day = d;
+        n.day = day;
         n.sql = norm;
-        MetricsStore.sqlBuckets.Add(n);
+        rows.Add(n);
+        while (rows.Count > MetricsStore.MaxSqlShapes + 1) {
+            rows.RemoveAt(0);
+        }
         return n;
     }
 
@@ -268,9 +289,11 @@ class MetricsStore {
         e.ts = ts;
         e.origin = origin;
         e.detail = detail;
-        MetricsStore.errors.Add(e);
-        while (MetricsStore.errors.Count > MetricsStore.MaxErrors) {
-            MetricsStore.errors.RemoveAt(0);
+        lock (MetricsStore.batchLock) {
+            MetricsStore.errors.Add(e);
+            while (MetricsStore.errors.Count > MetricsStore.MaxErrors) {
+                MetricsStore.errors.RemoveAt(0);
+            }
         }
     }
 
@@ -299,76 +322,180 @@ class MetricsStore {
             await Task.Delay(1000);
             waited = waited + 1;
             bool due = waited >= Cfg.Metrics.flushSeconds;
-            bool full = MetricsStore.buckets.Count >= Cfg.Metrics.flushRows
-                || MetricsStore.errors.Count >= Cfg.Metrics.flushRows
-                || MetricsStore.sqlBuckets.Count >= Cfg.Metrics.flushRows;
+            bool full = false;
+            lock (MetricsStore.batchLock) {
+                full = MetricsStore.buckets.Count >= Cfg.Metrics.flushRows
+                    || MetricsStore.errors.Count >= Cfg.Metrics.flushRows
+                    || MetricsStore.sqlBuckets.Count >= Cfg.Metrics.flushRows;
+            }
             if (!due && !full) { continue; }
             waited = 0;
             await MetricsStore.Flush();
         }
     }
 
+    /* 在 batchLock 内、开始任何 await 之前合并；重试期间同键只留一行。
+       P95 与数据库冲突更新一致，取各摘取批次的最大值，而非重算分位数。
+       容量按每个队列限制，活动队列仍独立接收刷新期间的新记录。 */
+    static void MergeRetry() {
+        for (int i = 0; i < MetricsStore.buckets.Count; i = i + 1) {
+            MinuteBucket add = MetricsStore.buckets[i];
+            add.row.p95Us = MetricsStore.HistP95(add.hist, add.row.calls,
+                add.row.maxUs);
+            MinuteBucket hit = null;
+            for (int j = 0; j < MetricsStore.retryBuckets.Count; j = j + 1) {
+                MinuteBucket b = MetricsStore.retryBuckets[j];
+                if (b.row.minute == add.row.minute
+                    && b.row.method == add.row.method && b.row.path == add.row.path) {
+                    hit = b;
+                    break;
+                }
+            }
+            if (hit == null) {
+                MetricsStore.retryBuckets.Add(add);
+            } else {
+                hit.row.calls = hit.row.calls + add.row.calls;
+                hit.row.errors = hit.row.errors + add.row.errors;
+                hit.row.totalUs = hit.row.totalUs + add.row.totalUs;
+                hit.row.frames = hit.row.frames + add.row.frames;
+                hit.row.bytes = hit.row.bytes + add.row.bytes;
+                if (add.row.maxUs > hit.row.maxUs) { hit.row.maxUs = add.row.maxUs; }
+                if (add.row.p95Us > hit.row.p95Us) { hit.row.p95Us = add.row.p95Us; }
+                for (int bin = 0; bin < ServerMetrics.HIST_BINS; bin = bin + 1) {
+                    hit.hist[bin] = hit.hist[bin] + add.hist[bin];
+                }
+            }
+        }
+        while (MetricsStore.retryBuckets.Count > MetricsStore.MaxBuckets) {
+            MetricsStore.retryBuckets.RemoveAt(0);
+        }
+        for (int i = 0; i < MetricsStore.sqlBuckets.Count; i = i + 1) {
+            MetricSql add = MetricsStore.sqlBuckets[i];
+            MetricSql hit = MetricsStore.SqlEntryIn(MetricsStore.retrySqlBuckets,
+                add.day, add.sql);
+            hit.calls = hit.calls + add.calls;
+            hit.slow = hit.slow + add.slow;
+            hit.totalUs = hit.totalUs + add.totalUs;
+            if (add.maxUs > hit.maxUs) { hit.maxUs = add.maxUs; }
+        }
+        MetricsStore.retryErrors.AddRange(MetricsStore.errors);
+        while (MetricsStore.retryErrors.Count > MetricsStore.MaxErrors) {
+            MetricsStore.retryErrors.RemoveAt(0);
+        }
+    }
+
     /* 事务性刷新所有缓冲数据，当前分钟也写入以防进程退出丢失。 */
     static async int Flush() {
         if (!MetricsStore.ready) { return 0; }
-        if (MetricsStore.buckets.Count == 0 && MetricsStore.errors.Count == 0
-            && MetricsStore.sqlBuckets.Count == 0) {
-            return 0;
+        lock (MetricsStore.batchLock) {
+            if (MetricsStore.flushActive) { return 0; }
+            if (MetricsStore.buckets.Count == 0 && MetricsStore.errors.Count == 0
+                && MetricsStore.sqlBuckets.Count == 0
+                && MetricsStore.retryBuckets.Count == 0
+                && MetricsStore.retryErrors.Count == 0
+                && MetricsStore.retrySqlBuckets.Count == 0) {
+                return 0;
+            }
+            MetricsStore.flushActive = true;
+            /* 先挂到重试批次，再腾出活动队列；任意 await 期间的新数据
+               都落在活动队列里，不会被成功提交或失败回收误删。 */
+            MetricsStore.MergeRetry();
+            MetricsStore.buckets = new List<MinuteBucket>();
+            MetricsStore.errors = new List<MetricError>();
+            MetricsStore.sqlBuckets = new List<MetricSql>();
         }
-        List<MetricMinute> mine = new List<MetricMinute>();
-        for (int i = 0; i < MetricsStore.buckets.Count; i = i + 1) {
-            MinuteBucket b = MetricsStore.buckets[i];
-            b.row.p95Us = MetricsStore.HistP95(b.hist, b.row.calls,
-                b.row.maxUs);
-            mine.Add(b.row);
-        }
-        List<MetricError> errs = MetricsStore.errors;
-        List<MetricSql> sqls = MetricsStore.sqlBuckets;
-        MetricsStore.buckets = new List<MinuteBucket>();
-        MetricsStore.errors = new List<MetricError>();
-        MetricsStore.sqlBuckets = new List<MetricSql>();
-
-        IDbConnection db = await MetricsStore.Lease();
-        if (db == null) { return 0; }
+        IDbConnection db = null;
+        DbPool leasedPool = MetricsStore.pool;
+        bool discard = false;
         int written = 0;
         try {
-            await db.BeginTransactionAsync();
-            /* 写入时按复合键合并：冲突时累加计数器、取最大 maxUs，最终每桶一行。 */
-            if (mine.Count > 0) {
-                written = written + await db.Insert<MetricMinute>(mine)
-                    .OnConflict(a => new { a.minute, a.method, a.path })
-                    .SetIncr(a => a.calls)
-                    .SetIncr(a => a.errors)
-                    .SetIncr(a => a.totalUs)
-                    .SetMax(a => a.maxUs)
-                    .SetMax(a => a.p95Us)
-                    .SetIncr(a => a.frames)
-                    .SetIncr(a => a.bytes)
-                    .ExecuteAffrowsAsync();
+            List<MetricMinute> mine = new List<MetricMinute>();
+            for (int i = 0; i < MetricsStore.retryBuckets.Count; i = i + 1) {
+                MinuteBucket b = MetricsStore.retryBuckets[i];
+                mine.Add(b.row);
             }
-            /* 按 (day, sql) 合并，所有工作进程累积到同一行。 */
-            if (sqls.Count > 0) {
-                written = written + await db.Insert<MetricSql>(sqls)
-                    .OnConflict(a => new { a.day, a.sql })
-                    .SetIncr(a => a.calls)
-                    .SetIncr(a => a.slow)
-                    .SetIncr(a => a.totalUs)
-                    .SetMax(a => a.maxUs)
-                    .ExecuteAffrowsAsync();
+            db = await MetricsStore.Lease();
+            if (db != null) {
+                if (!await db.BeginTransactionAsync()) {
+                    throw new Exception("begin transaction failed");
+                }
+                /* 写入时按复合键合并：冲突时累加计数器、取最大 maxUs，最终每桶一行。 */
+                if (mine.Count > 0) {
+                    written = written + await db.Insert<MetricMinute>(mine)
+                        .OnConflict(a => new { a.minute, a.method, a.path })
+                        .SetIncr(a => a.calls)
+                        .SetIncr(a => a.errors)
+                        .SetIncr(a => a.totalUs)
+                        .SetMax(a => a.maxUs)
+                        .SetMax(a => a.p95Us)
+                        .SetIncr(a => a.frames)
+                        .SetIncr(a => a.bytes)
+                        .ExecuteAffrowsAsync();
+                }
+                /* 按 (day, sql) 合并，所有工作进程累积到同一行。 */
+                if (MetricsStore.retrySqlBuckets.Count > 0) {
+                    written = written + await db.Insert<MetricSql>(MetricsStore.retrySqlBuckets)
+                        .OnConflict(a => new { a.day, a.sql })
+                        .SetIncr(a => a.calls)
+                        .SetIncr(a => a.slow)
+                        .SetIncr(a => a.totalUs)
+                        .SetMax(a => a.maxUs)
+                        .ExecuteAffrowsAsync();
+                }
+                /* 错误为事件记录，每条独立一行。 */
+                if (MetricsStore.retryErrors.Count > 0) {
+                    written = written + await db.Insert<MetricError>(MetricsStore.retryErrors)
+                        .ExecuteAffrowsAsync();
+                }
+                if (!await db.CommitAsync()) {
+                    throw new Exception("commit failed");
+                }
+                /* 只有确认提交成功才丢弃批次；清理过期行失败不能重放已提交数据。 */
+                lock (MetricsStore.batchLock) {
+                    MetricsStore.retryBuckets = new List<MinuteBucket>();
+                    MetricsStore.retryErrors = new List<MetricError>();
+                    MetricsStore.retrySqlBuckets = new List<MetricSql>();
+                }
+                try {
+                    await MetricsStore.Sweep(db);
+                } catch (Exception sweepEx) {
+                    Console.WriteLine("[metrics] sweep failed: " + sweepEx.Message);
+                }
             }
-            /* 错误为事件记录，每条独立一行。 */
-            if (errs.Count > 0) {
-                written = written + await db.Insert<MetricError>(errs)
-                    .ExecuteAffrowsAsync();
-            }
-            await db.CommitAsync();
-            await MetricsStore.Sweep(db);
         } catch (Exception ex) {
-            await db.RollbackAsync();
-            /* 刷新失败不回滚请求，且错误记录器自身不递归。 */
+            if (db != null) {
+                try {
+                    if (!await db.RollbackAsync()) {
+                        throw new Exception("rollback failed");
+                    }
+                } catch (Exception rollbackEx) {
+                    /* 先摘除池内租约并释放槽位；Close 自身抛错也不能
+                       把未知事务状态的连接回池或永久占住唯一槽位。 */
+                    discard = true;
+                    leasedPool.core.Drop(db);
+                    Console.WriteLine("[metrics] rollback failed: "
+                        + rollbackEx.Message);
+                    try {
+                        db.Close();
+                    } catch (Exception closeEx) {
+                        Console.WriteLine("[metrics] close failed: "
+                            + closeEx.Message);
+                    }
+                }
+            }
+            /* 未提交批次保持原样；下次 Flush 连同新到的批次重试。 */
             Console.WriteLine("[metrics] flush failed: " + ex.Message);
+            written = 0;
         } finally {
-            MetricsStore.Give(db);
+            try {
+                if (!discard && db != null && leasedPool != null) {
+                    leasedPool.Release(db);
+                }
+            } finally {
+                lock (MetricsStore.batchLock) {
+                    MetricsStore.flushActive = false;
+                }
+            }
         }
         return written;
     }

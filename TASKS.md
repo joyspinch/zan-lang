@@ -163,6 +163,7 @@
   复现：见 _scratch/ide_input_list.txt 生成法（build_ide.ps1 的输入清单 +
   `build/zanc.exe -g <清单> --no-arc-guard --no-check-leaks -o x.exe --subsystem
   windows`）。
+- [x] **B-ID16** 属性路由异步异常后的双重释放：catch 入口已将 +1 转入 handler-owned 槽，匹配 catch 的收尾却再读可被嵌套异常覆盖的 TLS owned 标志并释放同一对象；改为仅按 handler-owned 槽释放。`async_catch_ownership_route` 最小双请求回归，旧编译器 6/80 次 AV、修复后 240/240 通过；后台调度排空另以 outstanding 记账消除漏等。
 - [x] **B-ID15** standard 档三条既有红定责与处置（2026-09-27，均先于 B-ID13
   修复存在、与其无关）：① policy_gallery_coverage——gallery 种子第 25 项引用
   已迁走的 `templates/server/server-mvc`（3959170f 整体迁为 packages/Zan.Mvc），

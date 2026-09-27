@@ -555,21 +555,25 @@ static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
     return *count > before;
 }
 
+typedef struct {
+    const char ***files;
+    int *count;
+    int *cap;
+} pkg_auto_include_t;
+
+static void package_add_input(const char *path, void *context) {
+    pkg_auto_include_t *a = (pkg_auto_include_t *)context;
+    add_stdlib_input(a->files, a->count, a->cap, path);
+}
+
 static int auto_include_namespace(const char *stdlib_root, const char *subdir,
                                   const char ***files, int *count, int *cap) {
     int found = glob_stdlib_dir(stdlib_root, subdir, files, count, cap);
-    char package_dirs[128][1024];
-    int package_count = zan_pkg_find_namespace(package_project_root, subdir,
-                                                   package_dirs, 128);
-    if (package_count >= 128)
-        fprintf(stderr, "warning: namespace '%s' is provided by 128 or more "
-                        "installed packages; only the first 128 are compiled\n",
-                subdir);
-    for (int i = 0; i < package_count; i++) {
-        int before = *count;
-        glob_stdlib_dir(package_dirs[i], "", files, count, cap);
-        found = found || *count != before;
-    }
+    pkg_auto_include_t args = { files, count, cap };
+    int package_count = zan_pkg_visit_namespace(package_project_root, subdir,
+                                                  probe_file_namespace,
+                                                  package_add_input, &args);
+    found = found || package_count > 0;
     /* `using System;` imports compiler/runtime core names rather than a
      * marketplace namespace; it must never become an install suggestion. */
     if (!found && strcmp(subdir, "System") != 0 &&
@@ -2052,29 +2056,22 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
     }
 }
 
-/* Glob a reached directory (stdlib root + any package providing the
- * namespace) and metadata-scan every file once. Bookkeeping mirrors
- * auto_include_namespace so --list-missing and the install suggestion keep
- * working: a namespace found nowhere is reported exactly as before. */
+static void pi_add_package_source(const char *path, void *context) {
+    pi_add_file((pi_dir_t *)context, path);
+}
+
+/* Scan stdlib candidates and matching declared-namespace package sources.
+ * A missing namespace is still reported through the existing suggestion path. */
 static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
     if (d->reached) return;
     d->reached = 1;
-    int found = 0;
     int before = d->file_count;
     pi_glob_into(d, stdlib_root, d->subdir);
-    if (d->file_count != before) found = 1;
-    char package_dirs[128][1024];
-    int package_count = zan_pkg_find_namespace(package_project_root, d->subdir,
-                                               package_dirs, 128);
-    if (package_count >= 128)
-        fprintf(stderr, "warning: namespace '%s' is provided by 128 or more "
-                        "installed packages; only the first 128 are compiled\n",
-                d->subdir);
-    for (int i = 0; i < package_count; i++) {
-        before = d->file_count;
-        pi_glob_into(d, package_dirs[i], "");
-        if (d->file_count != before) found = 1;
-    }
+    int found = d->file_count != before;
+    int package_count = zan_pkg_visit_namespace(package_project_root, d->subdir,
+                                                 probe_file_namespace,
+                                                 pi_add_package_source, d);
+    found = found || package_count > 0;
     /* `using System;` imports compiler/runtime core names rather than a
      * marketplace namespace; it must never become an install suggestion. */
     if (!found && strcmp(d->subdir, "System") != 0 &&

@@ -1,0 +1,53 @@
+using System;
+using System.Net.Http;
+using System.Web;
+
+class RouteBoom : Exception {
+    public RouteBoom(string message) : base(message) { }
+}
+class Trace {
+    static string mode = "";
+    static int bad = 0;
+}
+[Route("/teardown")]
+class TeardownController : Controller {
+    override async bool OnBeforeAsync() {
+        await Task.Delay(1);
+        return true;
+    }
+    override async void OnAfterAsync() { await Task.Delay(1); }
+    override async bool __TxBegin() {
+        await Task.Delay(1);
+        if (Trace.mode == "begin-boom") { throw new RouteBoom("begin boom"); }
+        return true;
+    }
+    override async void __TxCommit() { await Task.Delay(1); }
+    override async void __TxRollback() { await Task.Delay(1); }
+    [HttpPost]
+    [Tx]
+    async void Save(int count) {
+        await Task.Delay(1);
+        this.Ok("null");
+    }
+}
+class Program {
+    static async void Call(string mode, bool check) {
+        Trace.mode = mode;
+        HttpRequest req = HttpRequest.Parse("POST /teardown/save" +
+            (mode == "binding" ? "" : "?count=3") + " HTTP/1.1\r\nHost: t\r\n\r\n");
+        HttpContext ctx = new HttpContext(req, "127.0.0.1");
+        string thrown = "";
+        try { await __AttrRoutes.__h_TeardownController_Save(ctx); }
+        catch (RouteBoom e) { thrown = e.Message; }
+        if (check) {
+            if (thrown != "" || ctx.BuildResponse(true).IndexOf("\"0003\"") < 0) {
+                Trace.bad = Trace.bad + 1;
+            }
+        } else if (thrown != "begin boom") { Trace.bad = Trace.bad + 1; }
+    }
+    static async void Main() {
+        await Program.Call("begin-boom", false);
+        await Program.Call("binding", true);
+        Console.WriteLine("bad=" + Convert.ToString(Trace.bad));
+    }
+}

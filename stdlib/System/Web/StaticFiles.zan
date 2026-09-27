@@ -21,23 +21,21 @@ namespace System.Web;
 /// rejected unless every byte is an unreserved file character, so "..", "//",
 /// backslashes, NUL and query-smuggled separators cannot walk out of the root.
 ///
-/// Bodies are cached per worker after the first hit (assets are immutable in a
-/// deployment; restart or bump the file name to publish a new one) and served
-/// with a long max-age. Files are read as bytes and written back untouched, so
-/// images and fonts survive the trip.
+/// Bodies are not cached in workers: a public upload directory can contain an
+/// unbounded number of files. HttpContext supports buffered binary responses,
+/// not file streaming, so files above MaxFileBytes (4 MiB) return 413, including
+/// HEAD. Larger downloads need a streaming file server. Upload acceptance is
+/// separate and is not changed by this limit. Each in-flight GET owns at most
+/// one bounded body; total memory still depends on connection concurrency.
+/// Browser caching follows MaxAge. Binary bytes, including NUL, are preserved.
+/// Trusted build-time embedded resources retain the runtime's own lazy decode
+/// cache; this limit bounds their response copy, not runtime decompression.
 /// </summary>
 class StaticFiles {
     static string prefix = "";
     static string root = "";
     static int maxAge = 86400;
-    // Per-worker asset cache, parallel by index: an asset is read once and
-    // then served straight from these. Bodies are byte arrays with an explicit
-    // length -- a string body would end at the first NUL, which is how a PNG
-    // or a woff2 arrives truncated.
-    static List<string> paths = null;
-    static List<byte[]> blobs = null;
-    static List<int> sizes = null;
-    static List<string> types = null;
+    static const int MaxFileBytes = 4 * 1024 * 1024;
 
     /// <summary>Mounts `dir` under `urlPrefix` and registers the hook on the
     /// app. `urlPrefix` is matched literally ("/static" answers
@@ -46,16 +44,11 @@ class StaticFiles {
     static void Mount(WebApp app, string urlPrefix, string dir) {
         StaticFiles.prefix = urlPrefix;
         StaticFiles.root = dir;
-        StaticFiles.paths = new List<string>();
-        StaticFiles.blobs = new List<byte[]>();
-        StaticFiles.sizes = new List<int>();
-        StaticFiles.types = new List<string>();
         app.Before(StaticFiles.Serve);
     }
 
     /// <summary>How long browsers may cache an asset (seconds). Set it to 0
-    /// while developing so an edited file is picked up by a reload -- the
-    /// per-worker body cache still needs a restart.</summary>
+    /// while developing so an edited file is picked up by a reload.</summary>
     static void MaxAge(int seconds) {
         StaticFiles.maxAge = seconds;
     }
@@ -71,48 +64,96 @@ class StaticFiles {
             ctx.Status(404, "Not Found").Text("not found");
             return false;
         }
-        int hit = StaticFiles.Cached(rel);
-        if (hit < 0) {
-            string full = StaticFiles.root + "/" + rel;
-            if (!File.Exists(full)) {
-                ctx.Status(404, "Not Found").Text("not found");
-                return false;
-            }
-            int size = File.GetSize(full);
-            if (size < 0) {
-                ctx.Status(404, "Not Found").Text("not found");
-                return false;
-            }
-            StaticFiles.paths.Add(rel);
-            StaticFiles.blobs.Add(File.ReadAllBytes(full));
-            StaticFiles.sizes.Add(size);
-            StaticFiles.types.Add(StaticFiles.ContentType(rel));
-            hit = StaticFiles.paths.Count - 1;
+        string full = Directory.ReadPath(StaticFiles.root + "/" + rel);
+        if (!File.Exists(full)) {
+            ctx.Status(404, "Not Found").Text("not found");
+            return false;
         }
-        // An asset that exists on disk is a served interface, so it names
-        // itself for the metrics ("GET /static/js/app.js"). The key is built
-        // from the mount prefix and the validated relative path, never from the
-        // raw URL: a request for a file that is not there 404s above and stays
-        // out of the counters entirely, so a scanner cannot add rows.
-        ctx.routePattern = StaticFiles.prefix + "/" + StaticFiles.paths[hit];
-        ctx.SetHeader("Cache-Control", "public, max-age="
-            + Convert.ToString(StaticFiles.maxAge));
-        // HEAD answers the same headers, Content-Length included, with the
-        // body suppressed by the server rather than by a shortened length.
-        ctx.Binary(StaticFiles.types[hit], StaticFiles.blobs[hit],
-            StaticFiles.sizes[hit]);
+        FileStream file = null;
+        try {
+            file = FileStream.OpenRead(full);
+        } catch (FileNotFoundException ex) {
+            // Embedded assets have no file handle. Their immutable length is
+            // checked before copying, rather than using ReadAllBytes.
+            if (!File.EmbedExists(full)) {
+                ctx.Status(404, "Not Found").Text("not found");
+                return false;
+            }
+            byte[] lengthBytes = new byte[8];
+            nint src = File.zan_embed_bytes(File.EmbedName(full), lengthBytes);
+            int length = (int)lengthBytes[0] + (int)lengthBytes[1] * 256
+                + (int)lengthBytes[2] * 65536 + (int)lengthBytes[3] * 16777216;
+            if (src == 0 || length < 0) {
+                ctx.Status(404, "Not Found").Text("not found");
+                return false;
+            }
+            if (StaticFiles.TooLarge(ctx, length)) { return false; }
+            byte[] embedded = new byte[0];
+            if (ctx.method != "HEAD") {
+                embedded = new byte[length];
+                if (length > 0) { File.EmbedCopyIn(embedded, src, length); }
+            }
+            StaticFiles.Answer(ctx, rel, embedded, length);
+            return false;
+        }
+        try {
+            // Measure and read the SAME handle, in 64 bits. A pathname size
+            // check followed by ReadAllBytes can race replacement/growth.
+            StaticFiles.ServeStream(ctx, rel, file);
+        } finally {
+            file.Close();
+        }
         return false;
     }
 
-    /// <summary>Index of an already-read asset, or -1. The table holds one
-    /// entry per file served since start-up, so the scan is over a handful of
-    /// deployed assets, not over anything a request can grow.</summary>
-    static int Cached(string rel) {
-        if (StaticFiles.paths == null) { return -1; }
-        for (int i = 0; i < StaticFiles.paths.Count; i = i + 1) {
-            if (StaticFiles.paths[i] == rel) { return i; }
+    /// <summary>Buffered static response from an opened stream. The caller
+    /// owns the stream. Reads use the checked length plus a one-byte EOF probe.</summary>
+    static void ServeStream(HttpContext ctx, string rel, Stream file) {
+        long length = file.Length();
+        if (length < 0 || file.Seek(0, 0) != 0) {
+            ctx.Status(404, "Not Found").Text("not found");
+            return;
         }
-        return -1;
+        if (StaticFiles.TooLarge(ctx, length)) { return; }
+        int size = (int)length;
+        if (ctx.method == "HEAD") {
+            // Binary's non-null marker carries Content-Length; WebApp never
+            // sends its bytes for HEAD. Do not allocate/read the file body.
+            StaticFiles.Answer(ctx, rel, new byte[0], size);
+            return;
+        }
+        byte[] data = new byte[size];
+        int have = 0;
+        while (have < size) {
+            int got = file.ReadInto((nint)data + (nint)have, size - have);
+            if (got <= 0 || got > size - have) {
+                ctx.Status(503, "Service Unavailable").Text("static file changed or unreadable");
+                return;
+            }
+            have = have + got;
+        }
+        // Reject growth rather than cache/serve a silently truncated success.
+        // Even a continuously growing file costs only this one extra byte.
+        byte[] extra = new byte[1];
+        int more = file.ReadInto((nint)extra, 1);
+        if (more != 0 || file.Length() != length) {
+            ctx.Status(503, "Service Unavailable").Text("static file changed or unreadable");
+            return;
+        }
+        StaticFiles.Answer(ctx, rel, data, size);
+    }
+
+    static bool TooLarge(HttpContext ctx, long length) {
+        if (length <= StaticFiles.MaxFileBytes) { return false; }
+        ctx.Status(413, "Content Too Large").Text("static file exceeds 4 MiB limit");
+        return true;
+    }
+
+    static void Answer(HttpContext ctx, string rel, byte[] data, int size) {
+        ctx.routePattern = StaticFiles.prefix + "/" + rel;
+        ctx.SetHeader("Cache-Control", "public, max-age="
+            + Convert.ToString(StaticFiles.maxAge));
+        ctx.Binary(StaticFiles.ContentType(rel), data, size);
     }
 
     /// <summary>The path below the mount point, or null when the request is not

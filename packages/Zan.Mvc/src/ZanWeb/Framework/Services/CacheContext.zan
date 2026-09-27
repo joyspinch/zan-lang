@@ -114,6 +114,98 @@ class CacheContext {
         }
     }
 
+    /* Admission and storage are one operation: 1 issued, 0 throttled, -1 unavailable.
+       The IP window starts on the first admitted send; subsequent sends never extend it.
+       A rejected send must not replace an existing code or consume another IP's quota. */
+    async int IssueCodeAsync(string key, string cooldownKey, string ipKey, string code,
+                            int seconds, int cooldownSeconds, int windowSeconds, int maxSends) {
+        if (seconds <= 0 || cooldownSeconds <= 0 || windowSeconds <= 0 || maxSends <= 0
+            || code.Length == 0) { return -1; }
+        if (this.redis == null) {
+            /* Process-local admission cannot enforce a deployment-wide quota. */
+            if (Cfg.Worker.count != 1 || Cfg.Cluster.enabled || Cfg.Cache.driver == "redis") { return -1; }
+            lock (this.store) {
+                if (this.LocalGet(cooldownKey).Length > 0) { return 0; }
+                int count = Filter.ToInt(this.LocalGet(ipKey), 0);
+                if (count >= maxSends) { return 0; }
+                if (count == 0) {
+                    this.LocalSetTtl(ipKey, "1", windowSeconds);
+                } else {
+                    this.store.Set(ipKey, Convert.ToString(count + 1));
+                }
+                this.LocalSetTtl(cooldownKey, "1", cooldownSeconds);
+                this.LocalSetTtl(key, code, seconds);
+                return 1;
+            }
+        }
+        RedisClient client = await this.redis.AcquireAsync();
+        if (client == null) { return -1; }
+        try {
+            List<string> args = new List<string>();
+            args.Add("EVAL");
+            args.Add("if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end "
+                + "local n = tonumber(redis.call('GET', KEYS[3]) or '0') "
+                + "if not n or n < 0 then return -1 end "
+                + "if n >= tonumber(ARGV[5]) then return 0 end "
+                + "if n == 0 then redis.call('SET', KEYS[3], '1', 'EX', ARGV[4]) "
+                + "else redis.call('INCR', KEYS[3]) end "
+                + "redis.call('SET', KEYS[2], '1', 'EX', ARGV[3]) "
+                + "redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2]) return 1");
+            args.Add("3"); args.Add(key); args.Add(cooldownKey); args.Add(ipKey);
+            args.Add(code); args.Add(Convert.ToString(seconds));
+            args.Add(Convert.ToString(cooldownSeconds));
+            args.Add(Convert.ToString(windowSeconds)); args.Add(Convert.ToString(maxSends));
+            RedisReply reply = await client.CommandAsync(args);
+            if (reply == null || reply.kind != RedisReply.INT) { return -1; }
+            int result = reply.AsInt();
+            if (result == 0 || result == 1) { return result; }
+            return -1;
+        } catch {
+            /* An ambiguous outcome is never permission to send or retry locally. */
+            return -1;
+        } finally { this.redis.Release(client); }
+    }
+
+    /* 验证码写入须一次性带 TTL；Redis 不可达时不发出不可验证的码。*/
+    async bool SetCodeAsync(string key, string code, int seconds) {
+        if (this.redis == null) {
+            lock (this.store) { this.LocalSetTtl(key, code, seconds); }
+            return true;
+        }
+        RedisClient client = await this.redis.AcquireAsync();
+        if (client == null) { return false; }
+        try {
+            List<string> args = new List<string>();
+            args.Add("SET"); args.Add(key); args.Add(code);
+            args.Add("EX"); args.Add(Convert.ToString(seconds));
+            RedisReply reply = await client.CommandAsync(args);
+            return reply != null && reply.AsString() == "OK";
+        } finally { this.redis.Release(client); }
+    }
+
+    /* 比对与删除在 Redis 单个脚本中执行；本地内存同一把锁保护。
+       错误、过期、重复使用以及缓存故障一律拒绝。 */
+    async bool ConsumeCodeAsync(string key, string code) {
+        if (this.redis == null) {
+            lock (this.store) {
+                string saved = this.LocalGet(key);
+                if (saved.Length == 0 || saved != code) { return false; }
+                this.LocalDel(key);
+                return true;
+            }
+        }
+        RedisClient client = await this.redis.AcquireAsync();
+        if (client == null) { return false; }
+        try {
+            List<string> args = new List<string>();
+            args.Add("EVAL");
+            args.Add("if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end");
+            args.Add("1"); args.Add(key); args.Add(code);
+            RedisReply reply = await client.CommandAsync(args);
+            return reply != null && !reply.IsError() && reply.AsInt() == 1;
+        } finally { this.redis.Release(client); }
+    }
+
     /* 预热一条连接以免首次请求支付建连成本，返回 Redis 是否应答。*/
     async bool Warmup() {
         if (this.redis == null) { return false; }

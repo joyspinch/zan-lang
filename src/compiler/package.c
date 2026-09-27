@@ -557,6 +557,184 @@ static int pkg_scan_store(const char *store, const char *namespace_path,
     return count;
 }
 
+/* Walk package source roots without mapping namespace names onto directory names.
+ * MVC deliberately keeps Framework/ and Modules/ in its original source tree,
+ * while its declarations use e.g. ZanWeb.Ai and ZanWeb.Web. Selecting individual
+ * original files avoids aliases, duplicate compilation and source-tree changes. */
+static int pkg_visit_source_tree(const char *dir, const char *target_ns,
+                                 zan_pkg_namespace_probe_t probe,
+                                 zan_pkg_source_visitor_t visitor, void *context,
+                                 int depth) {
+    if (depth > 64) return 0;
+    int found = 0;
+#ifdef _WIN32
+    char pattern[1024]; WIN32_FIND_DATAA fd;
+    if (snprintf(pattern, sizeof(pattern), "%s\\*", dir) >= (int)sizeof(pattern)) return 0;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!pkg_safe_component(fd.cFileName) ||
+            (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        char path[1024];
+        if (snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName) >= (int)sizeof(path)) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            found += pkg_visit_source_tree(path, target_ns, probe, visitor, context, depth + 1);
+        } else {
+            size_t n = strlen(fd.cFileName);
+            if (n < 5 || strcmp(fd.cFileName + n - 4, ".zan") != 0) continue;
+            char declared[256] = {0};
+            if (probe(path, declared, sizeof(declared)) && strcmp(declared, target_ns) == 0) {
+                visitor(path, context);
+                found++;
+            }
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (!pkg_safe_component(e->d_name)) continue;
+        char path[1024]; struct stat st;
+        if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= (int)sizeof(path) ||
+            lstat(path, &st) != 0 || S_ISLNK(st.st_mode)) continue;
+        if (S_ISDIR(st.st_mode)) {
+            found += pkg_visit_source_tree(path, target_ns, probe, visitor, context, depth + 1);
+        } else if (S_ISREG(st.st_mode)) {
+            size_t n = strlen(e->d_name);
+            if (n < 5 || strcmp(e->d_name + n - 4, ".zan") != 0) continue;
+            char declared[256] = {0};
+            if (probe(path, declared, sizeof(declared)) && strcmp(declared, target_ns) == 0) {
+                visitor(path, context);
+                found++;
+            }
+        }
+    }
+    closedir(d);
+#endif
+    return found;
+}
+
+typedef struct {
+    char **names;
+    int count;
+    int capacity;
+} pkg_seen_names_t;
+
+/* One package can be present in project/packages and the installed cache (or
+ * in the SDK/global store). The first store wins; scanning both would compile
+ * identical declarations from two different absolute paths. */
+static bool pkg_mark_seen(pkg_seen_names_t *seen, const char *name) {
+    for (int i = 0; i < seen->count; i++)
+        if (strcmp(seen->names[i], name) == 0) return false;
+    if (seen->count == seen->capacity) {
+        int cap = seen->capacity ? seen->capacity * 2 : 16;
+        seen->names = (char **)realloc(seen->names, (size_t)cap * sizeof(*seen->names));
+        seen->capacity = cap;
+    }
+    seen->names[seen->count++] = strdup(name);
+    return true;
+}
+
+static int pkg_visit_store(const char *store, const char *target_ns,
+                           zan_pkg_namespace_probe_t probe,
+                           zan_pkg_source_visitor_t visitor, void *context,
+                           pkg_seen_names_t *seen) {
+    if (!pkg_is_dir(store)) return 0;
+    int found = 0;
+#ifdef _WIN32
+    char pattern[1024]; WIN32_FIND_DATAA fd;
+    if (snprintf(pattern, sizeof(pattern), "%s\\*", store) >= (int)sizeof(pattern)) return 0;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+            (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+            !pkg_safe_component(fd.cFileName)) continue;
+        char root[1024], source[1024];
+        if (snprintf(root, sizeof(root), "%s\\%s", store, fd.cFileName) >= (int)sizeof(root)) continue;
+        if (snprintf(source, sizeof(source), "%s\\src", root) >= (int)sizeof(source)) continue;
+        if (!pkg_is_dir(source)) {
+            if (snprintf(source, sizeof(source), "%s\\stdlib", root) >= (int)sizeof(source)) continue;
+            if (!pkg_is_dir(source)) snprintf(source, sizeof(source), "%s", root);
+        }
+        if (!pkg_mark_seen(seen, fd.cFileName)) continue;
+        int hits = pkg_visit_source_tree(source, target_ns, probe, visitor, context, 0);
+        if (hits) zan_pkg_note_usage(store, fd.cFileName);
+        found += hits;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(store);
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (!pkg_safe_component(e->d_name)) continue;
+        char root[1024], source[1024]; struct stat st;
+        if (snprintf(root, sizeof(root), "%s/%s", store, e->d_name) >= (int)sizeof(root) ||
+            lstat(root, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (snprintf(source, sizeof(source), "%s/src", root) >= (int)sizeof(source)) continue;
+        if (!pkg_is_dir(source)) {
+            if (snprintf(source, sizeof(source), "%s/stdlib", root) >= (int)sizeof(source)) continue;
+            if (!pkg_is_dir(source)) snprintf(source, sizeof(source), "%s", root);
+        }
+        if (!pkg_mark_seen(seen, e->d_name)) continue;
+        int hits = pkg_visit_source_tree(source, target_ns, probe, visitor, context, 0);
+        if (hits) zan_pkg_note_usage(store, e->d_name);
+        found += hits;
+    }
+    closedir(d);
+#endif
+    return found;
+}
+
+int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
+                            zan_pkg_namespace_probe_t probe,
+                            zan_pkg_source_visitor_t visitor, void *context) {
+    if (!project_dir || !pkg_safe_namespace_path(namespace_path) || !probe || !visitor) return 0;
+    char target_ns[256]; size_t n = strlen(namespace_path);
+    if (n >= sizeof(target_ns)) return 0;
+    for (size_t i = 0; i <= n; i++)
+        target_ns[i] = (namespace_path[i] == '/' || namespace_path[i] == '\\') ? '.' : namespace_path[i];
+    char store[1024]; int found = 0;
+    pkg_seen_names_t seen = {0};
+    snprintf(store, sizeof(store), "%s" PATH_SEP "packages", project_dir);
+    found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen);
+    snprintf(store, sizeof(store), "%s" PATH_SEP ".zan-packages", project_dir);
+    found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen);
+    char exe_dir[1024] = {0};
+#ifdef _WIN32
+    if (GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir))) {
+        char *sep = strrchr(exe_dir, '\\'); if (sep) *sep = 0;
+        snprintf(store, sizeof(store), "%s\\..\\packages", exe_dir);
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen);
+        snprintf(store, sizeof(store), "%s\\packages", exe_dir);
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen);
+    }
+#elif defined(__APPLE__)
+    uint32_t size = sizeof(exe_dir);
+    if (_NSGetExecutablePath(exe_dir, &size) == 0) {
+        char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
+        snprintf(store, sizeof(store), "%s/../packages", exe_dir);
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen);
+    }
+#else
+    ssize_t len = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
+    if (len > 0) {
+        exe_dir[len] = 0;
+        char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
+        snprintf(store, sizeof(store), "%s/../packages", exe_dir);
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen);
+    }
+#endif
+    if (zan_pkg_global_store(store, sizeof(store)))
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen);
+    for (int i = 0; i < seen.count; i++) free(seen.names[i]);
+    free(seen.names);
+    return found;
+}
+
 int zan_pkg_find_namespace(const char *project_dir, const char *namespace_path,
                            char (*out_dirs)[1024], int max_dirs) {
     if (!project_dir || !pkg_safe_namespace_path(namespace_path) ||
@@ -723,12 +901,14 @@ bool zan_pkg_install_local(const char *source_dir, const char *package_name,
         zan_pkg_destroy(&pkg);
         return false;
     }
-    /* The compiler only discovers installed packages through their
-     * stdlib/<namespace>/ layout, so a package without it would install
-     * silently and never resolve. */
-    char pkg_stdlib[1024];
+    /* Namespace discovery accepts src/<namespace> (preferred),
+     * stdlib/<namespace> (legacy), or a flat <namespace> directory.
+     * A flat layout cannot be distinguished from unrelated package assets
+     * here; require one of the two explicit source roots. */
+    char pkg_src[1024], pkg_stdlib[1024];
+    snprintf(pkg_src, sizeof(pkg_src), "%s" PATH_SEP "src", source_dir);
     snprintf(pkg_stdlib, sizeof(pkg_stdlib), "%s" PATH_SEP "stdlib", source_dir);
-    if (!pkg_is_dir(pkg_stdlib)) {
+    if (!pkg_is_dir(pkg_src) && !pkg_is_dir(pkg_stdlib)) {
         snprintf(status, status_size, "ZANPKG_STATUS action=install status=no_stdlib_layout package=%s", package_name);
         zan_pkg_destroy(&pkg);
         return false;

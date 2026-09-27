@@ -1,10 +1,17 @@
 using System;
 using System.Security.Cryptography;
 using System.Web;
+using ZanWeb.Core;
 using ZanWeb.Services;
 using ZanWeb.Web;
 
 namespace ZanWeb.Security;
+
+/* Only a successful atomic cache operation exposes a code to the mail sender. */
+class VerifyCodeIssue {
+    int status = -1;
+    string code = "";
+}
 
 /* 注册与重置密码使用的 6 位验证码：缓存存储并设置 TTL，发送间隔限制，验证后一次性消费。 */
 class VerifyCode {
@@ -12,7 +19,7 @@ class VerifyCode {
     static int ResendSeconds = 60;
 
     static string Key(string purpose, string address) {
-        return "code:" + purpose + ":" + address.ToLower();
+        return "code:" + purpose + ":" + address.Trim().ToLower();
     }
 
     static CacheContext Cache() {
@@ -21,23 +28,40 @@ class VerifyCode {
         return s.Cache();
     }
 
-    /* 判断该地址是否处于发送冷却期。 */
+    /* Informational only; IssueForIp makes the actual atomic admission decision. */
     static async bool TooSoon(string purpose, string address) {
         CacheContext c = VerifyCode.Cache();
-        if (c == null) { return false; }
-        string hit = await c.GetAsync(VerifyCode.Key(purpose, address) + ":sent");
+        if (c == null) { return true; }
+        string hit = await c.GetAsync(VerifyCode.CooldownKey(address));
         return hit.Length > 0;
     }
 
-    /* 生成验证码并缓存 10 分钟，同时记录发送时间以限流。 */
+    static string CooldownKey(string address) {
+        return "code:sent:" + address.Trim().ToLower();
+    }
+
+    /* Legacy callers without request context share one conservative quota, not a bypass. */
     static async string Issue(string purpose, string address) {
-        string code = VerifyCode.Digits(6);
+        VerifyCodeIssue issued = await VerifyCode.IssueForIp(purpose, address, "unknown");
+        return issued.code;
+    }
+
+    /* Register/reset share both quotas, while their codes remain purpose-bound.
+       SMTP failures deliberately keep the reservation: retries must not bypass admission. */
+    static async VerifyCodeIssue IssueForIp(string purpose, string address, string ip) {
+        VerifyCodeIssue issued = new VerifyCodeIssue();
         CacheContext c = VerifyCode.Cache();
-        if (c == null) { return code; }
-        await c.SetTtlAsync(VerifyCode.Key(purpose, address), code, VerifyCode.TtlSeconds);
-        await c.SetTtlAsync(VerifyCode.Key(purpose, address) + ":sent", "1",
-            VerifyCode.ResendSeconds);
-        return code;
+        if (c == null) { return issued; }
+        string peer = ip.Trim().ToLower();
+        if (peer.Length == 0) { peer = "unknown"; }
+        int windowSeconds = Cfg.EnvInt("ZAN_VERIFY_IP_WINDOW_SECONDS", 600);
+        int maxSends = Cfg.EnvInt("ZAN_VERIFY_IP_MAX_SENDS", 5);
+        string code = VerifyCode.Digits(6);
+        issued.status = await c.IssueCodeAsync(VerifyCode.Key(purpose, address),
+            VerifyCode.CooldownKey(address), "code:ip:" + peer, code,
+            VerifyCode.TtlSeconds, VerifyCode.ResendSeconds, windowSeconds, maxSends);
+        if (issued.status == 1) { issued.code = code; }
+        return issued;
     }
 
     /* 校验并消费验证码，错误/过期/已用均返回 false。 */
@@ -45,11 +69,7 @@ class VerifyCode {
         if (code.Length == 0) { return false; }
         CacheContext c = VerifyCode.Cache();
         if (c == null) { return false; }
-        string key = VerifyCode.Key(purpose, address);
-        string want = await c.GetAsync(key);
-        if (want.Length == 0 || want != code) { return false; }
-        await c.DelAsync(key);
-        return true;
+        return await c.ConsumeCodeAsync(VerifyCode.Key(purpose, address), code);
     }
 
     static string Digits(int n) {

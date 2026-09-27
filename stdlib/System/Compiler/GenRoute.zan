@@ -209,7 +209,7 @@ class GenRoute {
     static bool AttrIsStructural(string n) {
         if (GenRoute.AttrHttpVerb(n).Length > 0) { return true; }
         if (n == "Route" || n == "ApiController" || n == "NonAction" ||
-            n == "Tx" || n == "Opt" ||
+            n == "Tx" || n == "Opt" || n == "ReadOnly" ||
             n == "Description" || n == "AttributeUsage" ||
             n == "DllImport" || n == "StructLayout" || n == "Obsolete") {
             return true;
@@ -1242,6 +1242,13 @@ class GenRoute {
             string arg = ctxParam ? "ctx" : "";
             bool tx = !isStatic && (GenRoute.AttrNamed(m, "Tx") ||
                                     GenRoute.AttrNamed(cls, "Tx"));
+            /* ReadOnly is deliberately method-only: GET and controller-level
+             * defaults cannot assert an action has no writes/read-after-write. */
+            bool readOnly = !isStatic && GenRoute.AttrNamed(m, "ReadOnly");
+            if (readOnly && tx) {
+                GenCommon.Fail(GenRoute.Reply, "[ReadOnly] and [Tx] cannot share an action: " + cname + "." + mname);
+                continue;
+            }
             /* 签名参数绑定:类型化 action 的实参在蹦床里生成,缺失或
              * 非法都在进 action 前以统一的 ApiError(400) 应答;
              * [Opt("名=默认")] 点名的参数改为缺省读,类参数按字段
@@ -1312,18 +1319,20 @@ class GenRoute {
                 handlers.Append("        " + cname + " __c = new " + cname +
                                 "();\n");
                 handlers.Append("        __c.__Bind(ctx);\n");
+                if (readOnly) {
+                    handlers.Append("        __c.__UseReadOnly();\n");
+                }
                 /* 视图键 = action 名:同一个控制器半段,视图与权限不会分叉 */
                 handlers.Append("        __c.__SetView(\"" + cact + "." +
                                 mname + "\");\n");
-                /* 必填参数以抛 ApiError 中止;在这里捕获,`this.Need(...)`
-                 * 才能读作一个表达式而非每个 action 里的守卫子句。
-                 * [Tx] 动作再包一层事务作用域:Begin 失败以 503 应答,
-                 * 提交在 action 之后,任何失败路径先回滚再走原处理。 */
-                handlers.Append("        if (await __c.__BeforeAsync()) {\n");
+                /* 必填参数以抛 ApiError 中止;在这里捕获,`this.Need(...)`。
+                 * 从 Before 起进入 finally；失败时回滚/收尾不得覆盖原始错误。 */
+                handlers.Append("        bool __failed = false;\n");
                 if (tx) {
-                    handlers.Append("            bool __tx = false;\n");
+                    handlers.Append("        bool __tx = false;\n");
                 }
-                handlers.Append("            try {\n");
+                handlers.Append("        try {\n");
+                handlers.Append("            if (await __c.__BeforeAsync()) {\n");
                 if (tx) {
                     handlers.Append("                __tx = await __c.__TxBegin();\n");
                     handlers.Append("                if (!__tx) { throw new ApiError(503, \"0503\", \"服务不可用\"); }\n");
@@ -1336,19 +1345,27 @@ class GenRoute {
                 if (tx) {
                     handlers.Append("                await __c.__TxCommit();\n");
                 }
-                handlers.Append("            } catch (ApiError __e) {\n");
-                if (tx) {
-                    handlers.Append("                if (__tx) { await __c.__TxRollback(); }\n");
-                }
-                handlers.Append("                ctx.Status(__e.Status(), ApiError.Reason(__e.Status()));\n");
-                handlers.Append("                ctx.Api(__e.Code(), __e.Message, \"null\");\n");
-                if (tx) {
-                    handlers.Append("            } catch (Exception __x) {\n");
-                    handlers.Append("                if (__tx) { await __c.__TxRollback(); }\n");
-                    handlers.Append("                throw;\n");
-                }
                 handlers.Append("            }\n");
-                handlers.Append("            await __c.__AfterAsync();\n");
+                handlers.Append("        } catch (ApiError __e) {\n");
+                handlers.Append("            __failed = true;\n");
+                if (tx) {
+                    handlers.Append("            if (__tx) {\n");
+                    handlers.Append("                try { await __c.__TxRollback(); } catch (Exception __rollback) { }\n");
+                    handlers.Append("            }\n");
+                }
+                handlers.Append("            ctx.Status(__e.Status(), ApiError.Reason(__e.Status()));\n");
+                handlers.Append("            ctx.Api(__e.Code(), __e.Message, \"null\");\n");
+                handlers.Append("        } catch (Exception __x) {\n");
+                handlers.Append("            __failed = true;\n");
+                if (tx) {
+                    handlers.Append("            if (__tx) {\n");
+                    handlers.Append("                try { await __c.__TxRollback(); } catch (Exception __rollback) { }\n");
+                    handlers.Append("            }\n");
+                }
+                handlers.Append("            throw;\n");
+                handlers.Append("        } finally {\n");
+                handlers.Append("            try { await __c.__AfterAsync(); }\n");
+                handlers.Append("            catch (Exception __cleanup) { if (!__failed) { throw; } }\n");
                 handlers.Append("        }\n");
             }
             handlers.Append("    }\n");

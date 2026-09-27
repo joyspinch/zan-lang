@@ -1,0 +1,141 @@
+// Compile with explicit packages/Zan.Mvc/src/**/*.zan sources and --auto-stdlib.
+// API trace strings must be JSON-escaped; health never returns driver errors;
+// the old account-disabling TxProbe endpoint must not exist in generated routes.
+using System;
+using System.Data;
+using System.Json;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Health;
+using ZanWeb.Web;
+
+class ApiProbe : ApiController {
+    void Success() { this.Ok("{\"answer\":42}"); }
+    void Reject() { this.Fail(401, "bad \"input\" \\ path"); }
+    void Broken() { this.ServerError(""); }
+}
+
+class ProbeConnection : IDbConnection {
+    bool live = true;
+    DbResult Query(string sql) { throw new Exception("SECRET: db credentials"); }
+    DbResult Query(string sql, DbParams p) { throw new Exception("SECRET: db credentials"); }
+    int Execute(string sql) { return 0; }
+    int Execute(string sql, DbParams p) { return 0; }
+    string ExecuteScalar(string sql) { return ""; }
+    string ExecuteScalar(string sql, DbParams p) { return ""; }
+    async DbResult QueryAsync(string sql) { throw new Exception("SECRET: db credentials"); }
+    async DbResult QueryAsync(string sql, DbParams p) { throw new Exception("SECRET: db credentials"); }
+    async int ExecuteAsync(string sql) { return 0; }
+    async int ExecuteAsync(string sql, DbParams p) { return 0; }
+    async string ExecuteScalarAsync(string sql) { return ""; }
+    async string ExecuteScalarAsync(string sql, DbParams p) { return ""; }
+    void BeginTransaction() { }
+    void Commit() { }
+    void Rollback() { }
+    async bool BeginTransactionAsync() { return true; }
+    async bool CommitAsync() { return true; }
+    async bool RollbackAsync() { return true; }
+    bool IsConnected() { return this.live; }
+    void Close() { this.live = false; }
+    void Dispose() { this.Close(); }
+    int GetProvider() { return DbProvider.SQLite; }
+}
+
+class ProbeConnector : IDbConnector {
+    async IDbConnection ConnectAsync() { return new ProbeConnection(); }
+    int GetProvider() { return DbProvider.SQLite; }
+}
+
+class Program {
+    static int failures;
+    static void Check(bool ok, string label) {
+        if (!ok) { Program.failures = Program.failures + 1; Console.WriteLine("FAIL " + label); }
+    }
+    static HttpContext Ctx(string target, string header) {
+        HttpRequest req = HttpRequest.Parse("GET " + target + " HTTP/1.1\r\nHost: test\r\n"
+            + header + "\r\n");
+        return new HttpContext(req, "127.0.0.1");
+    }
+    static JsonValue Body(HttpContext ctx) {
+        string response = ctx.BuildResponse(false);
+        int split = response.IndexOf("\r\n\r\n");
+        if (split < 0) { return null; }
+        return JsonValue.ParseLenient(response.Substring(split + 4));
+    }
+    static async void Main() {
+        string trace = "tr-\"quoted\\path";
+        string header = "X-Request-Id: " + trace + "\r\n";
+        HttpContext success = Program.Ctx("/api/probe", header);
+        ApiProbe api = new ApiProbe();
+        api.__Bind(success);
+        api.Success();
+        JsonValue ok = Program.Body(success);
+        JsonValue data = ok != null ? ok.Get("data") : null;
+        Program.Check(ok != null && ok.Int("code", -1) == 0 && ok.Str("traceId", "") == trace
+            && data != null && data.Int("answer", -1) == 42,
+            "success envelope escapes trace as valid JSON");
+        HttpContext failure = Program.Ctx("/api/probe", header);
+        api = new ApiProbe(); api.__Bind(failure); api.Reject();
+        JsonValue bad = Program.Body(failure);
+        Program.Check(bad != null && bad.Int("code", -1) == 401
+            && bad.Str("traceId", "") == trace && bad.Str("msg", "") == "bad \"input\" \\ path",
+            "failure envelope escapes trace and message");
+        HttpContext error = Program.Ctx("/api/probe", header);
+        api = new ApiProbe(); api.__Bind(error); api.Broken();
+        JsonValue internalError = Program.Body(error);
+        Program.Check(error.BuildResponse(false).Contains("500 Internal Server Error")
+            && internalError != null && internalError.Int("code", -1) == 500
+            && internalError.Str("traceId", "") == trace,
+            "server error returns JSON trace without internal detail");
+        HttpContext noTrace = Program.Ctx("/api/probe", "");
+        api = new ApiProbe(); api.__Bind(noTrace); api.Success();
+        JsonValue plain = Program.Body(noTrace);
+        Program.Check(plain != null && plain.Get("traceId") == null
+            && plain.Int("code", -1) == 0, "trace omitted when header absent");
+        AppServices.Use(null);
+        HttpContext unavailable = Program.Ctx("/health?deep=1", "");
+        await __AttrRoutes.__h_HealthController_Index(unavailable);
+        JsonValue unavailableBody = Program.Body(unavailable);
+        Program.Check(unavailable.BuildResponse(false).Contains("503 Service Unavailable")
+            && unavailableBody != null && unavailableBody.Str("status", "") == "down"
+            && unavailableBody.Str("db", "") == "pool not ready"
+            && !unavailable.BuildResponse(false).Contains("\"status\":\"ok\""),
+            "deep health reports unavailable pool as down");
+
+        DbPool pool = new DbPool(new ProbeConnector(), 1);
+        AppServices.Use(new AppServices(DbContext.Of(pool, null), null));
+        HttpContext deep = Program.Ctx("/health?deep=1", "");
+        await __AttrRoutes.__h_HealthController_Index(deep);
+        JsonValue deepBody = Program.Body(deep);
+        Program.Check(deep.BuildResponse(false).Contains("503 Service Unavailable")
+            && deepBody != null && deepBody.Str("status", "") == "down"
+            && deepBody.Str("db", "") == "unreachable"
+            && !deep.BuildResponse(false).Contains("SECRET")
+            && !deep.BuildResponse(false).Contains("\"status\":\"ok\""),
+            "deep health redacts driver message");
+        HttpContext ready = Program.Ctx("/healthz/ready", "");
+        await __AttrRoutes.__h_HealthController_Ready(ready);
+        JsonValue readyBody = Program.Body(ready);
+        Program.Check(ready.BuildResponse(false).Contains("503 Service Unavailable")
+            && readyBody != null && readyBody.Str("status", "") == "down"
+            && readyBody.Str("db", "") == "unreachable"
+            && !ready.BuildResponse(false).Contains("SECRET"), "readiness redacts driver message");
+        pool.Close();
+        AppServices.Use(null);
+
+        WebApp app = new WebApp("127.0.0.1", 0);
+        __AttrRoutes.Register(app);
+        List<Route> routes = app.router.All();
+        bool hasSum = false;
+        bool hasDisable = false;
+        for (int i = 0; i < routes.Count; i = i + 1) {
+            Route r = routes[i];
+            if (r.pattern == "/admin/dev/txprobe/sum") { hasSum = true; }
+            if (r.pattern == "/admin/dev/txprobe/disable"
+                || r.action == "TxProbe.Disable") { hasDisable = true; }
+        }
+        Program.Check(hasSum && !hasDisable, "only harmless TxProbe route generated");
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        if (Program.failures != 0) { throw new Exception("route security regression"); }
+    }
+}

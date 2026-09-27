@@ -1,0 +1,305 @@
+// Compile with all packages/Zan.Mvc/src/*.zan sources, --auto-stdlib.
+// Two isolated SQLite pools prove annotated actions borrow exactly the replica
+// lease, plain GET and transactions stay on primary, and teardown returns it.
+using System;
+using System.Data;
+using System.Data.Sqlite;
+using System.IO;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Web;
+
+[Route("/lease")]
+class LeaseActionController : AppController {
+    static string observed = "";
+    static bool reused;
+
+    [HttpGet]
+    [ReadOnly]
+    async void List() {
+        IDbConnection held = this.Held();
+        IDbConnection read = await this.ReadConn();
+        IDbConnection same = await this.Conn();
+        LeaseActionController.reused = held != null && held == read && held == same
+            && this.__Conn() == held && this.DbReady();
+        DbResult result = await held.QueryAsync("SELECT name FROM marker");
+        LeaseActionController.observed = result.GetByName(0, "name");
+    }
+
+    [HttpGet]
+    async void MutatingGet() {
+        int n = await this.Held().ExecuteAsync("UPDATE marker SET name='from-get'");
+        DbResult result = await this.Held().QueryAsync("SELECT name FROM marker");
+        LeaseActionController.observed = result.GetByName(0, "name");
+    }
+
+    [HttpPost]
+    [Tx]
+    async void Save() {
+        int n = await this.Held().ExecuteAsync("UPDATE marker SET name='updated'");
+        LeaseActionController.observed = Convert.ToString(n);
+    }
+}
+
+// Failure injection deliberately leaves IsConnected true when Close throws.
+class LeaseFaultConnection : IDbConnection {
+    bool alive = true;
+    int beginMode;
+    int commitMode;
+    int rollbackMode;
+    bool failClose;
+    int begins;
+    int commits;
+    int rollbacks;
+    int closes;
+
+    DbResult Query(string sql) { return new DbResult(); }
+    DbResult Query(string sql, DbParams p) { return this.Query(sql); }
+    int Execute(string sql) { return 1; }
+    int Execute(string sql, DbParams p) { return this.Execute(sql); }
+    string ExecuteScalar(string sql) { return ""; }
+    string ExecuteScalar(string sql, DbParams p) { return this.ExecuteScalar(sql); }
+    async DbResult QueryAsync(string sql) { return this.Query(sql); }
+    async DbResult QueryAsync(string sql, DbParams p) { return this.Query(sql, p); }
+    async int ExecuteAsync(string sql) { return this.Execute(sql); }
+    async int ExecuteAsync(string sql, DbParams p) { return this.Execute(sql, p); }
+    async string ExecuteScalarAsync(string sql) { return this.ExecuteScalar(sql); }
+    async string ExecuteScalarAsync(string sql, DbParams p) { return this.ExecuteScalar(sql, p); }
+    void BeginTransaction() { }
+    void Commit() { }
+    void Rollback() { }
+    async bool BeginTransactionAsync() {
+        this.begins = this.begins + 1;
+        if (this.beginMode == 2) { throw new Exception("injected begin failure"); }
+        return this.beginMode == 0;
+    }
+    async bool CommitAsync() {
+        this.commits = this.commits + 1;
+        if (this.commitMode == 2) { throw new Exception("injected commit failure"); }
+        return this.commitMode == 0;
+    }
+    async bool RollbackAsync() {
+        this.rollbacks = this.rollbacks + 1;
+        if (this.rollbackMode == 2) { throw new Exception("injected rollback failure"); }
+        return this.rollbackMode == 0;
+    }
+    bool IsConnected() { return this.alive; }
+    void Close() {
+        this.closes = this.closes + 1;
+        if (this.failClose) { throw new Exception("injected close failure"); }
+        this.alive = false;
+    }
+    void Dispose() { this.Close(); }
+    int GetProvider() { return DbProvider.SQLite; }
+}
+
+class LeaseFaultConnector : IDbConnector {
+    LeaseFaultConnection last;
+    int opened;
+    async IDbConnection ConnectAsync() {
+        this.opened = this.opened + 1;
+        this.last = new LeaseFaultConnection();
+        return this.last;
+    }
+    int GetProvider() { return DbProvider.SQLite; }
+}
+
+class LeaseFaultController : AppController {
+    int done;
+    bool failDone;
+    async IDbConnection BorrowRead() { return await this.ReadConn(); }
+    override void OnDone() {
+        this.done = this.done + 1;
+        if (this.failDone) { throw new Exception("injected done failure"); }
+    }
+}
+
+class Program {
+    static int failures;
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); Program.failures = Program.failures + 1; }
+    }
+    static HttpContext Ctx(string method, string path) {
+        HttpRequest req = HttpRequest.Parse(method + " " + path + " HTTP/1.1\r\nHost: test\r\n\r\n");
+        return new HttpContext(req, "127.0.0.1");
+    }
+    static void Seed(string path, string name) {
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+        db.Execute("CREATE TABLE marker (name TEXT)");
+        DbParams p = new DbParams();
+        p.Add(name);
+        db.Execute("INSERT INTO marker (name) VALUES (?)", p);
+        db.Close();
+    }
+    static void Trace(string sql, long us) { }
+
+    static async void TransactionFailures() {
+        // Exercise the actual tracing wrapper: Drop must see the pooled raw object.
+        DbTrace.Sink(Program.Trace);
+        for (int mode = 1; mode <= 2; mode = mode + 1) {
+            LeaseFaultConnector connector = new LeaseFaultConnector();
+            DbPool pool = new DbPool(connector, 1);
+            DbContext context = DbContext.Of(pool);
+            AppServices.Use(new AppServices(context, null));
+            LeaseFaultController ctrl = new LeaseFaultController();
+            await ctrl.OnBeforeAsync();
+            Program.Check(ctrl.__Conn() is TracedDbConnection, "failure lease is traced");
+            LeaseFaultConnection raw = connector.last;
+            raw.beginMode = mode;
+            raw.failClose = true;
+            bool begun = true;
+            string error = "";
+            try { begun = await ctrl.__TxBegin(); }
+            catch (Exception ex) { error = ex.Message; }
+            if (mode == 1) {
+                Program.Check(!begun && error == "", "begin false remains false despite close failure");
+            } else {
+                Program.Check(error == "injected begin failure", "begin exception survives close failure");
+            }
+            Program.Check(ctrl.__Conn() == null && raw.begins == 1
+                && raw.closes == 1 && raw.IsConnected(), "failed begin quarantined");
+            Program.Check(pool.LiveCount() == 0 && pool.IdleCount() == 0,
+                "failed begin frees pool slot");
+            await ctrl.__TxCommit();
+            await ctrl.__TxRollback();
+            await ctrl.OnAfterAsync();
+            Program.Check(raw.commits == 0 && raw.rollbacks == 0 && raw.closes == 1
+                && ctrl.done == 1, "failed begin has no phantom transaction or double release");
+            // Do not hang for a pool timeout if the slot regression reappears.
+            if (pool.LiveCount() == 0) {
+                IDbConnection replacement = await context.Acquire();
+                Program.Check(replacement != null && connector.opened == 2
+                    && TracedDbConnection.Unwrap(replacement) != raw, "begin failure permits fresh connection");
+                context.Release(replacement);
+            }
+            raw.failClose = false;
+            raw.Close();
+            pool.Close();
+        }
+
+        for (int mode = 1; mode <= 2; mode = mode + 1) {
+            LeaseFaultConnector connector = new LeaseFaultConnector();
+            DbPool pool = new DbPool(connector, 1);
+            AppServices.Use(new AppServices(DbContext.Of(pool), null));
+            LeaseFaultController ctrl = new LeaseFaultController();
+            Program.Check(await ctrl.__TxBegin(), "commit failure transaction began");
+            LeaseFaultConnection raw = connector.last;
+            Program.Check(await ctrl.__TxBegin(), "begin is idempotent");
+            raw.commitMode = mode;
+            string error = "";
+            try { await ctrl.__TxCommit(); }
+            catch (Exception ex) { error = ex.Message; }
+            string expected = mode == 1 ? "commit failed" : "injected commit failure";
+            Program.Check(error == expected && raw.commits == 1 && raw.begins == 1,
+                "commit failure propagated");
+            await ctrl.OnAfterAsync();
+            Program.Check(raw.rollbacks == 1 && raw.closes == 0 && ctrl.done == 1
+                && pool.LiveCount() == 1 && pool.IdleCount() == 1,
+                "failed commit keeps transaction for teardown rollback");
+            await ctrl.__TxCommit();
+            await ctrl.__TxRollback();
+            Program.Check(raw.commits == 1 && raw.rollbacks == 1, "finished transaction hooks are no-op");
+            pool.Close();
+        }
+
+        for (int mode = 1; mode <= 2; mode = mode + 1) {
+            for (int closeMode = 0; closeMode <= 1; closeMode = closeMode + 1) {
+                LeaseFaultConnector writeConnector = new LeaseFaultConnector();
+                LeaseFaultConnector readConnector = new LeaseFaultConnector();
+                DbPool write = new DbPool(writeConnector, 1);
+                DbPool read = new DbPool(readConnector, 1);
+                DbContext context = DbContext.Of(write, read);
+                AppServices.Use(new AppServices(context, null));
+                LeaseFaultController ctrl = new LeaseFaultController();
+                // Borrow separately before Begin so teardown must also return a read lease.
+                IDbConnection readLease = await ctrl.BorrowRead();
+                Program.Check(readLease != null, "secondary lease borrowed");
+                Program.Check(await ctrl.__TxBegin(), "rollback failure transaction began");
+                LeaseFaultConnection raw = writeConnector.last;
+                raw.rollbackMode = mode;
+                raw.failClose = closeMode == 1;
+                ctrl.failDone = true;
+                string expected = mode == 1 ? "rollback failed" : "injected rollback failure";
+                string error = "";
+                try { await ctrl.__TxRollback(); }
+                catch (Exception ex) { error = ex.Message; }
+                Program.Check(error == expected && raw.rollbacks == 1,
+                    "explicit rollback failure propagated");
+                error = "";
+                try { await ctrl.OnAfterAsync(); }
+                catch (Exception ex) { error = ex.Message; }
+                Program.Check(error == expected, "rollback error survives close and OnDone failures");
+                Program.Check(raw.rollbacks == 2 && raw.closes == 1 && ctrl.done == 1
+                    && ctrl.__Conn() == null, "teardown retries rollback and clears lease");
+                Program.Check(write.LiveCount() == 0 && write.IdleCount() == 0,
+                    "dirty connection removed even when close throws");
+                Program.Check(read.LiveCount() == 1 && read.IdleCount() == 1,
+                    "secondary lease returned despite rollback failure");
+                if (closeMode == 1) { Program.Check(raw.IsConnected(), "close throws before disconnect"); }
+                ctrl.failDone = false;
+                await ctrl.OnAfterAsync();
+                await ctrl.__TxCommit();
+                await ctrl.__TxRollback();
+                Program.Check(raw.rollbacks == 2 && raw.closes == 1 && raw.commits == 0,
+                    "repeated teardown does not touch discarded lease");
+                if (write.LiveCount() == 0) {
+                    IDbConnection replacement = await context.Acquire();
+                    Program.Check(replacement != null && writeConnector.opened == 2
+                        && TracedDbConnection.Unwrap(replacement) != raw,
+                        "rollback failure permits fresh connection");
+                    context.Release(replacement);
+                    Program.Check(write.LiveCount() == 1 && write.IdleCount() == 1,
+                        "replacement slot accounted once");
+                }
+                raw.failClose = false;
+                raw.Close();
+                write.Close(); read.Close();
+            }
+        }
+        DbTrace.Sink(null);
+        AppServices.Use(null);
+        Console.WriteLine("transaction failure cases=8");
+    }
+
+    static async void Main() {
+        Directory.CreateDirectoryRecursive("_scratch/readonly-action-lease");
+        string writePath = "_scratch/readonly-action-lease/write.db";
+        string readPath = "_scratch/readonly-action-lease/read.db";
+        Program.Seed(writePath, "primary");
+        Program.Seed(readPath, "replica");
+        DbPool write = SqliteConnector.Pool(writePath, 1);
+        DbPool read = SqliteConnector.Pool(readPath, 1);
+        AppServices.Use(new AppServices(DbContext.Of(write, read), null));
+        await __AttrRoutes.__h_LeaseActionController_List(Program.Ctx("GET", "/lease/list"));
+        Program.Check(LeaseActionController.observed == "replica", "replica selected before action");
+        Program.Check(LeaseActionController.reused, "same request lease for accessor and read");
+        Program.Check(read.LiveCount() == 1 && read.IdleCount() == 1
+            && write.LiveCount() == 0, "one replica lease returned, no primary lease");
+        await __AttrRoutes.__h_LeaseActionController_MutatingGet(Program.Ctx("GET", "/lease/mutatingget"));
+        Program.Check(LeaseActionController.observed == "from-get", "mutating GET reads its primary write");
+        Program.Check(write.IdleCount() == 1 && read.IdleCount() == 1,
+            "plain GET primary returned");
+        await __AttrRoutes.__h_LeaseActionController_Save(Program.Ctx("POST", "/lease/save"));
+        Program.Check(LeaseActionController.observed == "1", "transaction wrote primary");
+        Program.Check(write.IdleCount() == 1 && read.IdleCount() == 1,
+            "transaction primary returned");
+        AppServices.Use(new AppServices(DbContext.Of(write, null), null));
+        await __AttrRoutes.__h_LeaseActionController_List(Program.Ctx("GET", "/lease/list"));
+        Program.Check(LeaseActionController.observed == "updated", "no-replica fallback to primary");
+        Program.Check(write.LiveCount() == 1 && write.IdleCount() == 1
+            && read.LiveCount() == 1 && read.IdleCount() == 1,
+            "fallback reuses and returns one primary lease");
+        SqliteConnection primary = SqliteConnection.Open(writePath);
+        SqliteConnection replica = SqliteConnection.Open(readPath);
+        Program.Check(primary.ExecuteScalar("SELECT name FROM marker") == "updated"
+            && replica.ExecuteScalar("SELECT name FROM marker") == "replica",
+            "write did not reach replica");
+        primary.Close(); replica.Close();
+        write.Close(); read.Close();
+        AppServices.Use(null);
+        File.Delete(writePath); File.Delete(readPath);
+        await Program.TransactionFailures();
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+    }
+}

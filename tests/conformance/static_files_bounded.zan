@@ -1,0 +1,150 @@
+// Bounded static bodies: no persistent worker cache, no whole-file read,
+// no body allocation for HEAD, and deterministic growth/short-read coverage.
+using System;
+using System.IO;
+using System.Net.Http;
+using System.Web;
+
+class StaticProbeStream : Stream {
+    long declared;
+    int actual;
+    int pos;
+    int reads;
+    int largestRead;
+    StaticProbeStream(long declared, int actual) {
+        this.declared = declared;
+        this.actual = actual;
+    }
+    override long Length() { return this.declared; }
+    override long Seek(long offset, int origin) { this.pos = (int)offset; return offset; }
+    override int ReadInto(nint buf, int count) {
+        this.reads = this.reads + 1;
+        if (count > this.largestRead) { this.largestRead = count; }
+        int n = this.actual - this.pos;
+        if (n > count) { n = count; }
+        if (n > 2) { n = 2; } // Force partial reads.
+        Span<byte> dst = new Span<byte>(buf, count);
+        for (int i = 0; i < n; i = i + 1) {
+            dst[i] = (byte)((this.pos + i) % 256);
+        }
+        this.pos = this.pos + n;
+        return n;
+    }
+}
+
+class Program {
+    static int bad = 0;
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); Program.bad = Program.bad + 1; }
+    }
+    static HttpContext Ctx(string method, string path) {
+        return new HttpContext(HttpRequest.Parse(method + " " + path
+            + " HTTP/1.1\r\nHost: test\r\n\r\n"), "127.0.0.1");
+    }
+    static HttpContext Get(string name) {
+        HttpContext ctx = Program.Ctx("GET", "/static/" + name);
+        Program.Check(!StaticFiles.Serve(ctx), "claimed " + name);
+        return ctx;
+    }
+    static void Main() {
+        Directory.CreateDirectory("_scratch");
+        string root = "_scratch/static-files-bounded";
+        Directory.CreateDirectory(root);
+        WebApp app = new WebApp("127.0.0.1", 0);
+        StaticFiles.Mount(app, "/static", root);
+        StaticFiles.MaxAge(17);
+        byte[] bytes = new byte[4];
+        bytes[0] = 137; bytes[1] = 0; bytes[2] = 255; bytes[3] = 42;
+        File.WriteAllBytes(root + "/image.PNG", bytes);
+        HttpContext first = Program.Get("image.PNG");
+        Program.Check(first.status == 200 && first.BodyLength() == 4
+            && first.bodyBytes[1] == 0 && first.bodyBytes[2] == 255, "binary intact");
+        Program.Check(first.contentType == "image/png"
+            && first.routePattern == "/static/image.PNG", "type and metrics");
+        Program.Check(first.BuildResponse(true).Contains("Cache-Control: public, max-age=17"), "browser cache");
+        HttpContext head = Program.Ctx("HEAD", "/static/image.PNG");
+        StaticFiles.Serve(head);
+        Program.Check(head.status == 200 && head.BodyLength() == 4
+            && head.bodyBytes.Length == 0
+            && head.BuildResponse(true).Contains("Content-Length: 4\r\n"), "HEAD without body");
+        File.WriteAllText(root + "/image.PNG", "new");
+        HttpContext changed = Program.Get("image.PNG");
+        Program.Check(changed.BodyLength() == 3 && changed.bodyBytes[0] == 110, "no stale cache");
+        Program.Check(first.bodyBytes[0] == 137, "independent live response");
+        File.Delete(root + "/image.PNG");
+        Program.Check(Program.Get("image.PNG").status == 404, "deleted file not cached");
+        File.WriteAllText(root + "/empty", "");
+        HttpContext empty = Program.Get("empty");
+        Program.Check(empty.status == 200 && empty.BodyLength() == 0 && empty.IsBinary(), "empty file");
+        File.Delete(root + "/empty");
+        // More unique assets than a plausible entry cap: all are reread and
+        // none survives deletion. This also tests uncached miss handling.
+        for (int i = 0; i < 140; i = i + 1) {
+            string name = "item" + Convert.ToString(i) + ".txt";
+            File.WriteAllText(root + "/" + name, "x");
+            Program.Check(Program.Get(name).BodyLength() == 1, "many files");
+            File.Delete(root + "/" + name);
+            Program.Check(Program.Get(name).status == 404, "no retained asset");
+        }
+        byte[] limit = new byte[StaticFiles.MaxFileBytes];
+        limit[StaticFiles.MaxFileBytes - 1] = 91;
+        File.WriteAllBytes(root + "/limit.bin", limit);
+        HttpContext exact = Program.Get("limit.bin");
+        Program.Check(exact.status == 200 && exact.BodyLength() == StaticFiles.MaxFileBytes
+            && exact.bodyBytes[StaticFiles.MaxFileBytes - 1] == 91, "exact limit");
+        File.AppendAllText(root + "/limit.bin", "x");
+        HttpContext large = Program.Get("limit.bin");
+        Program.Check(large.status == 413 && !large.IsBinary()
+            && large.routePattern == "", "over limit and no cached bypass");
+        HttpContext largeHead = Program.Ctx("HEAD", "/static/limit.bin");
+        StaticFiles.Serve(largeHead);
+        Program.Check(largeHead.status == 413 && !largeHead.IsBinary(), "large HEAD rejected");
+        File.Delete(root + "/limit.bin");
+        HttpContext missing = Program.Get("missing");
+        Program.Check(missing.status == 404 && missing.routePattern == "", "missing file");
+        Program.Check(Program.Get("../secret").status == 404, "traversal");
+        Program.Check(Program.Get("sub/").status == 404, "directory path");
+        Program.Check(StaticFiles.Serve(Program.Ctx("POST", "/static/x")), "method passthrough");
+        Program.Check(StaticFiles.Serve(Program.Ctx("GET", "/other/x")), "mount passthrough");
+
+        StaticProbeStream huge = new StaticProbeStream(4294967297, 0);
+        HttpContext hugeCtx = Program.Ctx("GET", "/static/huge");
+        StaticFiles.ServeStream(hugeCtx, "huge", huge);
+        Program.Check(hugeCtx.status == 413 && huge.reads == 0, "64-bit size before read");
+        StaticProbeStream partial = new StaticProbeStream(5, 5);
+        HttpContext partialCtx = Program.Ctx("GET", "/static/partial");
+        StaticFiles.ServeStream(partialCtx, "partial", partial);
+        Program.Check(partialCtx.status == 200 && partialCtx.BodyLength() == 5
+            && partialCtx.bodyBytes[0] == 0 && partialCtx.bodyBytes[4] == 4, "partial reads");
+        StaticProbeStream growth = new StaticProbeStream(3, 100);
+        HttpContext growthCtx = Program.Ctx("GET", "/static/growth");
+        StaticFiles.ServeStream(growthCtx, "growth", growth);
+        Program.Check(growthCtx.status == 503 && !growthCtx.IsBinary()
+            && growth.pos == 4 && growth.largestRead == 3, "growth bounded and rejected");
+        StaticProbeStream shortFile = new StaticProbeStream(5, 2);
+        HttpContext shortCtx = Program.Ctx("GET", "/static/short");
+        StaticFiles.ServeStream(shortCtx, "short", shortFile);
+        Program.Check(shortCtx.status == 503 && !shortCtx.IsBinary(), "short read rejected");
+        StaticProbeStream noRead = new StaticProbeStream(StaticFiles.MaxFileBytes, 0);
+        HttpContext noReadCtx = Program.Ctx("HEAD", "/static/head");
+        StaticFiles.ServeStream(noReadCtx, "head", noRead);
+        Program.Check(noReadCtx.status == 200 && noRead.reads == 0
+            && noReadCtx.BodyLength() == StaticFiles.MaxFileBytes
+            && noReadCtx.bodyBytes.Length == 0, "HEAD never reads");
+        Directory.Delete(root);
+        // Optional second invocation with --embed embed_assets=assets checks
+        // the immutable-resource fallback without requiring CMake changes.
+        if (File.EmbedExists("assets/blob.bin")) {
+            StaticFiles.Mount(new WebApp("127.0.0.1", 0), "/static", "assets");
+            HttpContext embedded = Program.Get("blob.bin");
+            Program.Check(embedded.status == 200 && embedded.BodyLength() == 25
+                && embedded.bodyBytes[20] == 0 && embedded.bodyBytes[23] == 255,
+                "embedded binary");
+            HttpContext embeddedHead = Program.Ctx("HEAD", "/static/blob.bin");
+            StaticFiles.Serve(embeddedHead);
+            Program.Check(embeddedHead.status == 200 && embeddedHead.BodyLength() == 25
+                && embeddedHead.bodyBytes.Length == 0, "embedded HEAD");
+        }
+        Console.WriteLine("static-files-bounded-ok: " + Convert.ToString(Program.bad == 0 ? 1 : 0));
+    }
+}

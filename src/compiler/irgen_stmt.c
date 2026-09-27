@@ -2708,29 +2708,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
         locals->count = catch_start;
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
-            /* drop the throw-site +1 on the caught exception (every
-             * RC-managed throw -- class, string, array, delegate -- sets
-             * __zan_eh_exc_owned; only non-managed values leave it 0) */
-            LLVMValueRef owned_g = get_eh_exc_owned_global(g);
-            LLVMValueRef ofl = LLVMBuildLoad2(g->builder, i32t, owned_g, "exc.owned");
-            LLVMValueRef is_owned = zan_icmp(g->builder, LLVMIntNE, ofl,
-                LLVMConstInt(i32t, 0, 0), "exc.isown");
+            /* Every path into done_bb matched a catch clause: its entry moved
+             * the thrown +1 from the thread-global flag into exc_owned_slot.
+             * The globals are NOT this handler's ownership ledger. A nested
+             * catch/await can overwrite them with a different exception while
+             * this handler is suspended, so consulting the global here can
+             * release the original catch object twice (or release a stranger).
+             * Only the handler's frame-resident owned slot owns this +1. */
             LLVMValueRef cfn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
-            LLVMBasicBlockRef rel_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "exc.rel");
-            LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "exc.cont");
-            LLVMBuildCondBr(g->builder, is_owned, rel_bb, cont_bb);
-            LLVMPositionBuilderAtEnd(g->builder, rel_bb);
-            LLVMValueRef ev = LLVMBuildLoad2(g->builder, i8ptr, exc_slot, "exc.re");
-            zan_call2(g->builder,
-                LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
-                g->rt_release_dyn, &ev, 1, "");
-            zan_store_fit(g, LLVMConstInt(i32t, 0, 0), owned_g);
-            zan_store_fit(g, LLVMConstNull(i8ptr), exc_g);
-            LLVMBuildBr(g->builder, cont_bb);
-            LLVMPositionBuilderAtEnd(g->builder, cont_bb);
-            /* handler-owned release: a matched catch body transferred the
-             * in-flight +1 to itself (owned flag in exc_owned_slot, object
-             * stacked as an EH temp) -- pop the temp and release it now */
             LLVMValueRef hofl = LLVMBuildLoad2(g->builder, i32t, exc_owned_slot,
                 "exc.hown");
             LLVMValueRef h_owned = zan_icmp(g->builder, LLVMIntNE, hofl,

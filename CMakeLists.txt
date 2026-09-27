@@ -1465,6 +1465,58 @@ add_test(NAME policy_server_mvc_ai_endpoint
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(policy_server_mvc_ai_endpoint PROPERTIES TIMEOUT 120)
 
+# Read-only action intent must select and release exactly one replica lease,
+# while a plain GET or [Tx] remains on the primary. Compile with the MVC package.
+file(GLOB_RECURSE _mvc_readonly_sources
+  ${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/*.zan)
+add_test(NAME server_mvc_readonly_action_lease
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/readonly_action_lease.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/readonly_action_lease.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/server_mvc_readonly_action_lease${_exe_ext}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    "-DZANC_ARGS=${_mvc_readonly_sources};--auto-stdlib"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(server_mvc_readonly_action_lease PROPERTIES TIMEOUT 180
+  LABELS "full;standard;smoke")
+
+foreach(_mvc_case security_bootstrap security_verify_code security_routes
+                  security_http_policy verify_code_issuance)
+  add_test(NAME server_mvc_${_mvc_case}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/${_mvc_case}.zan
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/${_mvc_case}.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/server_mvc_${_mvc_case}${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      "-DZANC_ARGS=${_mvc_readonly_sources};--auto-stdlib"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(server_mvc_${_mvc_case} PROPERTIES TIMEOUT 180
+    LABELS "full;standard;smoke")
+endforeach()
+
+add_test(NAME server_mvc_metrics_flush_retry
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/metrics_flush_retry.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/metrics_flush_retry.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/server_mvc_metrics_flush_retry${_exe_ext}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    "-DZANC_ARGS=${_mvc_readonly_sources};--auto-stdlib"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(server_mvc_metrics_flush_retry PROPERTIES TIMEOUT 180
+  LABELS "full;standard;smoke")
+
+add_test(NAME package_install_mvc
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/packages/Zan.Mvc
+    -DWORK=${CMAKE_BINARY_DIR}/package_install_mvc
+    -P ${CMAKE_SOURCE_DIR}/tests/run_package_install_mvc.cmake)
+set_tests_properties(package_install_mvc PROPERTIES TIMEOUT 180
+  LABELS "full;standard;smoke")
+
 add_test(NAME policy_external_target
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
