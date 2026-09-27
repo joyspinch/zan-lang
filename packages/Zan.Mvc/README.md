@@ -608,8 +608,9 @@ The request lifecycle and database queries are instrumented into the shared
   recorded for every request; database query throughput/latency and the last
   32 **slow queries** are recorded around model DB calls. Adjust thresholds via
   `ServerMetrics.Global().SlowRequestMs(...)` / `.SlowQueryMs(...)`.
-- **Security:** `/admin/stats` leaks internal timing/paths. Guard it with
-  `.Auth()`, an IP allow-list, or a separate admin bind before exposing it.
+- **Security:** `/admin/stats` leaks internal timing/paths. In this package
+  it sits behind the admin session (Grant authorization + View permission);
+  add an IP allow-list or a separate admin bind before exposing it publicly.
 
 ## Monitoring screens (`/admin/monitor/*`)
 
