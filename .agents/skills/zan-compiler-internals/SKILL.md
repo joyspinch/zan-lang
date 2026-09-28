@@ -2214,3 +2214,27 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   断言 exe 里资源**内容**明文零命中（资源**名**如 `skins/base/skin.css`
   是查找键，明文属设计）。字符数≠字节数：UTF-8 资产用 Python 写入时
   `len(str)` 是字符数，golden 长度断言要按字节重算。
+
+## 编译器性能 A/B 的定式（pull-in 缓存 + parse-once 实测，2026-09-28）
+
+- **跨编译器版本比 scan 阶段耗时，双方各跑两遍取暖跑**：metadata cache 的
+  key 含编译器 exe 全字节 hash（防旧编译器误读新缓存），所以每个编译器对
+  同一输入首跑必冷（全 miss+write，IDE 全量输入 scan 12s vs 暖 0.6s），拿
+  冷值横比会得出假回归/假加速。worktree 里的旧 zanc 不必担心 stdlib root：
+  exe 相对 root 不存在时回退 CWD/stdlib，照样能在主仓跑。
+- **阶段边界随重构移动，横比单阶段是假账**：parse-once 把 pi 闭包工作从
+  scan 挪进 parse——旧版"scan 11.9s+parse 0.8s"与新版"scan 0.6s+parse
+  15.7s"前段总和都是 12-16s，单看 parse 会误判 20 倍回归。比较只看
+  scan+parse 总和或全流程总时长。另：IR stats/Scale stats/phase 行全由
+  `--time` 门控，漏传则安静无输出；PowerShell 里 `2>&1` 捕不全 zanc 的
+  stderr，要用 Start-Process -RedirectStandardError 落文件再读。
+- **顺序敏感的歧义红先在旧提交复现再定责**：nsresolve 冲突改名对输入顺序
+  敏感——同一 418 输入的 IDE 全量构建，`sort` 序 101 个 ambiguous、
+  Get-ChildItem 序 418 个、parse-once 交错 append 序 0 个；a861fb2c（全部
+  优化提交之前）同样 418 错，证明是既有缺陷、新顺序只是避开。归因"我的
+  提交引入回归"前，先在更早提交上用同输入同序复现。
+- **仓库内大输入 A/B 基准**：OnePlus 402 输入不在仓库，用 IDE 全量构建
+  （build_ide.ps1 形状：入口 html 第一 + GCI 序 + 整串 `--link-lib`，缺
+  ole32 链接必炸 `CoInitializeEx`；无 `--auto-stdlib`）——~420 显式输入、
+  906 闭包、3.2M IR 指令、峰值 ~1.2GB、`--publish` 后可做
+  IDE_RUNNING_OK 启动冒烟，是阶段 3-5 分片/manifest 工作的现成验收器。
