@@ -1,0 +1,296 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>NIST P-256（secp256r1，RFC 5480）上的 ECDSA，构建于 BigInt
+/// 之上，点运算与 SM2 共用同一套 Jacobian 公式（两条曲线均满足
+/// a ≡ -3 mod p）。验签按 FIPS 186-4：e 为 SHA-256 摘要的 256 位整数，
+/// R = u1*G + u2*Q，比较 v = x_R mod n 与 r。签名为 RFC 6979 确定性
+/// k（HMAC-SHA256），不依赖随机源，避免弱 nonce 重放私钥。签名以
+/// DER SEQUENCE{r INTEGER, s INTEGER} 传输（RFC 5480 / TLS 语义），
+/// 解析严格：长度必须精确耗尽、INTEGER 定长、1 ≤ r,s < n。</summary>
+class Ecdsa {
+
+    static string PHEX  = "FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF";
+    static string BHEX  = "5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B";
+    static string NHEX  = "FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551";
+    static string GXHEX = "6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296";
+    static string GYHEX = "4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5";
+
+    static BigInt P;
+    static BigInt N;
+    static BigInt GX;
+    static BigInt GY;
+    static bool ready = false;
+
+    /// 十六进制串 -> 大端字节 -> BigInt。
+    static BigInt hb(string h) { return BigInt.FromBytesBE(Hex.Decode(h), h.Length / 2); }
+
+    /// 惰性装载 P-256 曲线参数（幂等）。
+    static void init() {
+        if (ready) { return; }
+        P = hb(PHEX); N = hb(NHEX); GX = hb(GXHEX); GY = hb(GYHEX);
+        ready = true;
+    }
+
+    /// 小整数 -> BigInt（大端 4 字节）。
+    static BigInt fromInt(int v) {
+        byte[] b = new byte[4];
+        b[0] = (v >> 24) & 255; b[1] = (v >> 16) & 255; b[2] = (v >> 8) & 255; b[3] = v & 255;
+        return BigInt.FromBytesBE(b, 4);
+    }
+
+    /// 从 src 的 off 起取 len 字节切片并按大端读入 BigInt。
+    static BigInt sliceBE(byte[] src, int off, int len) {
+        byte[] b = new byte[len];
+        for (int i = 0; i < len; i = i + 1) { b[i] = src[off + i] & 255; }
+        return BigInt.FromBytesBE(b, len);
+    }
+
+    // 域运算，模 P
+    static BigInt fadd(BigInt x, BigInt y) { return BigInt.mod(BigInt.add(x, y), P); }
+    static BigInt fsub(BigInt x, BigInt y) { return BigInt.mod(BigInt.add(x, BigInt.sub(P, y)), P); }
+    static BigInt fmul(BigInt x, BigInt y) { return BigInt.mod(BigInt.mul(x, y), P); }
+    static BigInt fsqr(BigInt x) { return fmul(x, x); }
+    static BigInt finv(BigInt x) { return BigInt.ModInverse(x, P); }
+
+    // 标量运算，模 N
+    static BigInt nmod(BigInt x) { return BigInt.mod(x, N); }
+    static BigInt nmul(BigInt x, BigInt y) { return BigInt.mod(BigInt.mul(x, y), N); }
+    static BigInt ninv(BigInt x) { return BigInt.ModInverse(x, N); }
+
+    // Jacobian 点 [X, Y, Z]；无穷远点的 Z == 0
+    static List<BigInt> pt(BigInt x, BigInt y, BigInt z) { List<BigInt> r = new List<BigInt>(); r.Add(x); r.Add(y); r.Add(z); return r; }
+    static List<BigInt> inf() { return pt(BigInt.one(), BigInt.one(), BigInt.zero()); }
+    static bool isInf(List<BigInt> Pt) { return Pt[2].isZero(); }
+
+    /// Jacobian 倍点（a ≡ -3 (mod P) 的倍点公式，P-256 适用）。
+    static List<BigInt> jdouble(List<BigInt> Pt) {
+        if (isInf(Pt)) { return Pt; }
+        BigInt X1 = Pt[0]; BigInt Y1 = Pt[1]; BigInt Z1 = Pt[2];
+        BigInt delta = fsqr(Z1);
+        BigInt gamma = fsqr(Y1);
+        BigInt beta = fmul(X1, gamma);
+        BigInt alpha = fmul(fromInt(3), fmul(fsub(X1, delta), fadd(X1, delta)));
+        BigInt X3 = fsub(fsqr(alpha), fmul(fromInt(8), beta));
+        BigInt Z3 = fsub(fsub(fsqr(fadd(Y1, Z1)), gamma), delta);
+        BigInt Y3 = fsub(fmul(alpha, fsub(fmul(fromInt(4), beta), X3)), fmul(fromInt(8), fsqr(gamma)));
+        return pt(X3, Y3, Z3);
+    }
+
+    /// Jacobian 点加；退化情形回退倍点或无穷远点。
+    static List<BigInt> jadd(List<BigInt> Pa, List<BigInt> Qa) {
+        if (isInf(Pa)) { return Qa; }
+        if (isInf(Qa)) { return Pa; }
+        BigInt X1 = Pa[0]; BigInt Y1 = Pa[1]; BigInt Z1 = Pa[2];
+        BigInt X2 = Qa[0]; BigInt Y2 = Qa[1]; BigInt Z2 = Qa[2];
+        BigInt Z1Z1 = fsqr(Z1); BigInt Z2Z2 = fsqr(Z2);
+        BigInt U1 = fmul(X1, Z2Z2); BigInt U2 = fmul(X2, Z1Z1);
+        BigInt S1 = fmul(Y1, fmul(Z2, Z2Z2)); BigInt S2 = fmul(Y2, fmul(Z1, Z1Z1));
+        BigInt H = fsub(U2, U1); BigInt r = fsub(S2, S1);
+        if (H.isZero()) {
+            if (r.isZero()) { return jdouble(Pa); }
+            return inf();
+        }
+        BigInt HH = fsqr(H); BigInt HHH = fmul(H, HH); BigInt V = fmul(U1, HH);
+        BigInt X3 = fsub(fsub(fsqr(r), HHH), fmul(fromInt(2), V));
+        BigInt Y3 = fsub(fmul(r, fsub(V, X3)), fmul(S1, HHH));
+        BigInt Z3 = fmul(fmul(Z1, Z2), H);
+        return pt(X3, Y3, Z3);
+    }
+
+    /// 二进制阶梯标量乘 k*Pt（高位在前）。
+    static List<BigInt> scalarMul(BigInt k, List<BigInt> Pt) {
+        List<BigInt> R = inf();
+        int i = k.bitLength() - 1;
+        while (i >= 0) {
+            R = jdouble(R);
+            if (k.getBit(i) == 1) { R = jadd(R, Pt); }
+            i = i - 1;
+        }
+        return R;
+    }
+
+    /// 返回仿射坐标 [x, y, 1]。
+    static List<BigInt> toAffine(List<BigInt> Pt) {
+        if (isInf(Pt)) { return pt(BigInt.zero(), BigInt.zero(), BigInt.zero()); }
+        BigInt zinv = finv(Pt[2]);
+        BigInt zinv2 = fsqr(zinv);
+        BigInt x = fmul(Pt[0], zinv2);
+        BigInt y = fmul(Pt[1], fmul(zinv2, zinv));
+        return pt(x, y, BigInt.one());
+    }
+
+    static List<BigInt> gPoint() { return pt(GX, GY, BigInt.one()); }
+
+    /// 从 32 字节大端私钥标量派生非压缩公钥 0x04||X||Y（65 字节）。
+    /// 标量不在 [1, n-1] 时返回 null。
+    static byte[] PublicKeyOf(byte[] d32) {
+        init();
+        if (d32 == null || d32.Length != 32) { return null; }
+        BigInt d = BigInt.FromBytesBE(d32, 32);
+        if (BigInt.cmp(d, BigInt.one()) < 0 || BigInt.cmp(d, N) >= 0) { return null; }
+        List<BigInt> aff = toAffine(scalarMul(d, gPoint()));
+        if (isInf(aff)) { return null; }
+        byte[] outb = new byte[65];
+        outb[0] = 4;
+        byte[] xb = aff[0].ToBytesBE(32);
+        byte[] yb = aff[1].ToBytesBE(32);
+        for (int i = 0; i < 32; i = i + 1) { outb[1 + i] = xb[i] & 255; outb[33 + i] = yb[i] & 255; }
+        return outb;
+    }
+
+    /// 校验非压缩公钥点 0x04||X||Y 确实落在曲线上（y² ≡ x³ - 3x + b
+    /// (mod p)）且坐标 < p。错误格式、无穷远点一律拒绝。
+    static bool ValidPublicKey(byte[] point, int len) {
+        init();
+        if (point == null || len != 65 || (point[0] & 255) != 4) { return false; }
+        BigInt x = sliceBE(point, 1, 32);
+        BigInt y = sliceBE(point, 33, 32);
+        if (BigInt.cmp(x, P) >= 0 || BigInt.cmp(y, P) >= 0) { return false; }
+        BigInt lhs = fmul(y, y);
+        BigInt rhs = fadd(fsub(fmul(x, fmul(x, x)), fmul(fromInt(3), x)), hb(BHEX));
+        return BigInt.cmp(lhs, rhs) == 0;
+    }
+
+    /// <summary>严格解析 DER ECDSA 签名 SEQUENCE{r INTEGER, s INTEGER}：
+    /// 长度精确耗尽、INTEGER 至少 1 字节且不超过 33 字节（32 字节值最多
+    /// 一个补符号零）、1 ≤ r,s &lt; n。成功时 r/s 追加到 outRs。</summary>
+    static bool ParseSigDer(byte[] sig, int sigLen, List<BigInt> outRs) {
+        init();
+        if (sig == null || sigLen < 8 || sigLen > 72) { return false; }
+        if ((sig[0] & 255) != 48) { return false; }
+        int seqLen = sig[1] & 255;
+        if (seqLen != sigLen - 2) { return false; }
+        int pos = 2;
+        if ((sig[pos] & 255) != 2) { return false; }
+        int rLen = sig[pos + 1] & 255;
+        if (rLen < 1 || rLen > 33 || 2 + rLen + 2 > sigLen) { return false; }
+        BigInt r = sliceBE(sig, pos + 2, rLen);
+        pos = pos + 2 + rLen;
+        if ((sig[pos] & 255) != 2) { return false; }
+        int sLen = sig[pos + 1] & 255;
+        if (sLen < 1 || sLen > 33 || pos + 2 + sLen != sigLen) { return false; }
+        BigInt s = sliceBE(sig, pos + 2, sLen);
+        if (BigInt.cmp(r, BigInt.one()) < 0 || BigInt.cmp(r, N) >= 0) { return false; }
+        if (BigInt.cmp(s, BigInt.one()) < 0 || BigInt.cmp(s, N) >= 0) { return false; }
+        outRs.Add(r);
+        outRs.Add(s);
+        return true;
+    }
+
+    /// 最小长度 DER INTEGER 编码（ECDSA r/s 恒正），高位为 1 时补 0x00，
+    /// 写入 outb 的 off 偏移，返回写入的字节数。
+    static int writeInt(byte[] outb, int off, BigInt v) {
+        int bits = v.bitLength();
+        int len = bits == 0 ? 1 : (bits + 7) / 8;
+        byte[] be = v.ToBytesBE(len);
+        int pad = (len > 0 && (be[0] & 255) >= 128) ? 1 : 0;
+        outb[off] = 2;
+        outb[off + 1] = (byte)(len + pad);
+        if (pad == 1) { outb[off + 2] = 0; }
+        for (int i = 0; i < len; i = i + 1) { outb[off + 2 + pad + i] = be[i] & 255; }
+        return 2 + pad + len;
+    }
+
+    /// r/s BigInt 编码为 DER SEQUENCE 签名（调用方已保证 1 ≤ r,s < n）。
+    static byte[] EncodeSigDer(BigInt r, BigInt s, List<int> outLen) {
+        byte[] tmp = new byte[2 * (2 + 33)];
+        int a = writeInt(tmp, 0, r);
+        int b = writeInt(tmp, a, s);
+        int bodyLen = a + b;
+        int total = 2 + bodyLen;
+        byte[] outb = new byte[total];
+        outb[0] = 48;
+        outb[1] = (byte)bodyLen;
+        for (int i = 0; i < bodyLen; i = i + 1) { outb[2 + i] = tmp[i] & 255; }
+        outLen[0] = total;
+        return outb;
+    }
+
+    /// HMAC-SHA256 的 byte[] 便捷封装（消息为若干段一次性拼接）。
+    static byte[] hmac256(byte[] key, byte[] p1, byte[] p2, byte[] p3, byte[] p4) {
+        int total = p1.Length + (p2 == null ? 0 : p2.Length) + (p3 == null ? 0 : p3.Length) + (p4 == null ? 0 : p4.Length);
+        byte[] msg = new byte[total];
+        int pos = 0;
+        for (int i = 0; i < p1.Length; i = i + 1) { msg[pos] = p1[i] & 255; pos = pos + 1; }
+        if (p2 != null) { for (int i = 0; i < p2.Length; i = i + 1) { msg[pos] = p2[i] & 255; pos = pos + 1; } }
+        if (p3 != null) { for (int i = 0; i < p3.Length; i = i + 1) { msg[pos] = p3[i] & 255; pos = pos + 1; } }
+        if (p4 != null) { for (int i = 0; i < p4.Length; i = i + 1) { msg[pos] = p4[i] & 255; pos = pos + 1; } }
+        return Hmac.Compute(Hmac.SHA256, key.ToStr(0, key.Length), key.Length, msg.ToStr(0, total), total);
+    }
+
+    /// RFC 6979（HMAC-SHA256）确定性 nonce 直接完成 ECDSA-P256-SHA256
+    /// 签名。msg 为待签数据，d32 为 32 字节大端私钥标量。返回 DER 签名，
+    /// outLen[0] 接收长度。私钥越界返回 null。
+    static byte[] SignSha256Det(string msg, int msgLen, byte[] d32, List<int> outLen) {
+        init();
+        if (d32 == null || d32.Length != 32) { return null; }
+        BigInt dv = BigInt.FromBytesBE(d32, 32);
+        if (BigInt.cmp(dv, BigInt.one()) < 0 || BigInt.cmp(dv, N) >= 0) { return null; }
+        byte[] h1 = Sha256.Hash(msg, msgLen);
+        // bits2octets(h1)：h1 恰为 32 字节 = qlen，故 bits2int 后 mod n
+        byte[] h1m = nmod(BigInt.FromBytesBE(h1, 32)).ToBytesBE(32);
+        byte[] v = new byte[32];
+        byte[] k = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { v[i] = 1; k[i] = 0; }
+        byte[] zero = new byte[1];
+        byte[] oneb = new byte[1]; oneb[0] = 1;
+        // h: K = HMAC_K(V || 0x00 || int2octets(x) || bits2octets(h1))
+        k = hmac256(k, v, zero, d32, h1m);
+        byte[] t = hmac256(k, v, null, null, null);
+        for (int i = 0; i < 32; i = i + 1) { v[i] = t[i] & 255; }
+        // j: K = HMAC_K(V || 0x01 || int2octets(x) || bits2octets(h1))
+        k = hmac256(k, v, oneb, d32, h1m);
+        t = hmac256(k, v, null, null, null);
+        for (int i = 0; i < 32; i = i + 1) { v[i] = t[i] & 255; }
+        while (true) {
+            t = hmac256(k, v, null, null, null);
+            for (int i = 0; i < 32; i = i + 1) { v[i] = t[i] & 255; }
+            BigInt kb = BigInt.FromBytesBE(v, 32);
+            if (BigInt.cmp(kb, BigInt.one()) >= 0 && BigInt.cmp(kb, N) < 0) {
+                List<BigInt> aff = toAffine(scalarMul(kb, gPoint()));
+                if (!isInf(aff)) {
+                    BigInt r = nmod(aff[0]);
+                    if (!r.isZero()) {
+                        BigInt ei = BigInt.FromBytesBE(h1, 32);
+                        // s = k⁻¹(e + r·d) mod n
+                        BigInt s = nmul(ninv(kb), nmod(BigInt.add(ei, nmul(r, dv))));
+                        if (!s.isZero()) {
+                            return EncodeSigDer(r, s, outLen);
+                        }
+                    }
+                }
+            }
+            k = hmac256(k, v, zero, null, null);
+            t = hmac256(k, v, null, null, null);
+            for (int i = 0; i < 32; i = i + 1) { v[i] = t[i] & 255; }
+        }
+    }
+
+    /// <summary>用 P-256 公钥（px32/py32，各 32 字节大端）校验消息的
+    /// DER ECDSA-SHA256 签名。任何格式错误都按无效处理。</summary>
+    static bool VerifySha256(string msg, int msgLen, byte[] sig, int sigLen, byte[] px32, byte[] py32) {
+        init();
+        if (px32 == null || py32 == null || px32.Length != 32 || py32.Length != 32) { return false; }
+        byte[] point = new byte[65];
+        point[0] = 4;
+        for (int i = 0; i < 32; i = i + 1) { point[1 + i] = px32[i] & 255; point[33 + i] = py32[i] & 255; }
+        if (!ValidPublicKey(point, 65)) { return false; }
+        List<BigInt> rs = new List<BigInt>();
+        if (!ParseSigDer(sig, sigLen, rs)) { return false; }
+        BigInt r = rs[0];
+        BigInt s = rs[1];
+        byte[] h = Sha256.Hash(msg, msgLen);
+        BigInt e = BigInt.FromBytesBE(h, 32);
+        BigInt w = ninv(s);
+        BigInt u1 = nmul(e, w);
+        BigInt u2 = nmul(r, w);
+        List<BigInt> pub = pt(sliceBE(px32, 0, 32), sliceBE(py32, 0, 32), BigInt.one());
+        List<BigInt> R = jadd(scalarMul(u1, gPoint()), scalarMul(u2, pub));
+        if (isInf(R)) { return false; }
+        List<BigInt> aff = toAffine(R);
+        BigInt v = nmod(aff[0]);
+        return BigInt.cmp(v, r) == 0;
+    }
+}

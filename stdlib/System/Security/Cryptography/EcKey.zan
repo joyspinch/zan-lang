@@ -1,0 +1,120 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>P-256 EC 私钥（TLS 服务端签名用）：持有 32 字节大端标量 d。
+/// PEM 支持 PKCS#8（BEGIN PRIVATE KEY，AlgorithmIdentifier 为
+/// id-ecPublicKey + prime256v1 命名曲线）与 SEC1（BEGIN EC PRIVATE KEY）。
+/// 其他曲线或结构一律拒绝，解析失败返回 null。</summary>
+class EcKey {
+
+    byte[] d;
+
+    /// 32 字节私钥标量（拷贝）；未加载返回 null。
+    byte[] Scalar32() {
+        if (this.d == null) { return null; }
+        byte[] out1 = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { out1[i] = this.d[i] & 255; }
+        return out1;
+    }
+
+    /// <summary>DER ECDSA-SHA256 签名（RFC 6979 确定性 nonce）。
+    /// 无私钥或输入非法返回 null。</summary>
+    byte[] SignSha256Det(string msg, int msgLen) {
+        byte[] s = this.Scalar32();
+        if (s == null || msg == null || msgLen < 0) { return null; }
+        List<int> outLen = new List<int>(); outLen.Add(0);
+        return Ecdsa.SignSha256Det(msg, msgLen, s, outLen);
+    }
+
+    /// 派生非压缩公钥点 0x04||X||Y（65 字节）；无私钥返回 null。
+    byte[] PublicKey() {
+        byte[] s = this.Scalar32();
+        if (s == null) { return null; }
+        return Ecdsa.PublicKeyOf(s);
+    }
+
+    static int ReadLen(string d, List<int> c) {
+        int at = c[0];
+        if (at < 0 || at + 1 > d.Length) { return -1; }
+        int first = d[at] & 255;
+        c[0] = at + 1;
+        if (first < 128) { return first; }
+        int n = first - 128;
+        if (n == 0 || n > 4) { return -1; }
+        int len = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            if (c[0] >= d.Length) { return -1; }
+            len = len * 256 + (d[c[0]] & 255);
+            c[0] = c[0] + 1;
+        }
+        if (len < 128) { return -1; }
+        return len;
+    }
+
+    static int Enter(string d, List<int> c, int tag) {
+        if (c[0] < 0 || c[0] >= d.Length || (d[c[0]] & 255) != tag) { return -1; }
+        c[0] = c[0] + 1;
+        int len = EcKey.ReadLen(d, c);
+        if (len < 0) { return -1; }
+        int end = c[0] + len;
+        if (end > d.Length) { return -1; }
+        return end;
+    }
+
+    /// RFC 5915 ECPrivateKey：SEQUENCE { INTEGER 1, OCTET STRING 私钥,
+    /// [1] 公钥可选 }。仅接受 1 ≤ 私钥 ≤ 32 字节（左侧补零到 32）。
+    static EcKey ParseEcPrivateKey(string der, int offset) {
+        List<int> c = new List<int>(); c.Add(offset);
+        List<int> vLen = new List<int>(); vLen.Add(0);
+        if (EcKey.Enter(der, c, 48) < 0) { return null; }
+        byte[] version = RsaKey.ReadIntegerSafe(der, c, vLen);
+        if (version == null || vLen[0] != 1 || (version[0] & 255) != 1) { return null; }
+        if (c[0] >= der.Length || (der[c[0]] & 255) != 4) { return null; }
+        c[0] = c[0] + 1;
+        int keyLen = EcKey.ReadLen(der, c);
+        if (keyLen < 1 || keyLen > 32 || c[0] + keyLen > der.Length) { return null; }
+        EcKey key = new EcKey();
+        key.d = new byte[32];
+        for (int i = 0; i < keyLen; i = i + 1) { key.d[32 - keyLen + i] = der[c[0] + i] & 255; }
+        return key;
+    }
+
+    /// <summary>从 PEM 私钥加载 P-256：PKCS#8 与 SEC1。非 EC 密钥、
+    /// 非 prime256v1 命名曲线或任何结构不符一律返回 null。</summary>
+    static EcKey FromPrivatePem(string pem) {
+        List<int> derLen = new List<int>(); derLen.Add(0);
+        byte[] raw = RsaKey.PemToDer(pem, derLen);
+        if (raw == null || derLen[0] < 8) { return null; }
+        string der = raw.ToStr(0, derLen[0]);
+        List<int> c = new List<int>(); c.Add(0);
+        if (EcKey.Enter(der, c, 48) < 0) { return null; }
+        List<int> tmp = new List<int>(); tmp.Add(0);
+        byte[] version = RsaKey.ReadIntegerSafe(der, c, tmp);
+        if (version == null) { return null; }
+        if ((der[c[0]] & 255) == 4) {
+            // SEC1：整体就是 ECPrivateKey。
+            return EcKey.ParseEcPrivateKey(der, 0);
+        }
+        // PKCS#8：version 0, AlgorithmIdentifier, OCTET STRING(ECPrivateKey)。
+        if (tmp[0] != 1 || (version[0] & 255) != 0) { return null; }
+        if ((der[c[0]] & 255) != 48) { return null; }
+        int algEnd = EcKey.Enter(der, c, 48);
+        if (algEnd < 0) { return null; }
+        byte[] ecOid = new byte[] { 42, 134, 72, 206, 61, 2, 1 };
+        byte[] p256 = new byte[] { 42, 134, 72, 206, 61, 3, 1, 7 };
+        int oidEnd = EcKey.Enter(der, c, 6);
+        if (oidEnd < 0 || oidEnd - c[0] != 7) { return null; }
+        for (int i = 0; i < 7; i = i + 1) { if ((der[c[0] + i] & 255) != (ecOid[i] & 255)) { return null; } }
+        c[0] = oidEnd;
+        int curveEnd = EcKey.Enter(der, c, 6);
+        if (curveEnd != algEnd || curveEnd - c[0] != 8) { return null; }
+        for (int i = 0; i < 8; i = i + 1) { if ((der[c[0] + i] & 255) != (p256[i] & 255)) { return null; } }
+        c[0] = algEnd;
+        if (c[0] >= der.Length || (der[c[0]] & 255) != 4) { return null; }
+        c[0] = c[0] + 1;
+        int innerLen = EcKey.ReadLen(der, c);
+        if (innerLen < 8 || c[0] + innerLen > der.Length) { return null; }
+        return EcKey.ParseEcPrivateKey(der, c[0]);
+    }
+}

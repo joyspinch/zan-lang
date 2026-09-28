@@ -1,0 +1,268 @@
+// Conformance: ECDSA (P-256) support across the X.509 verifier and TLS.
+// The chain verifier must parse prime256v1 public keys and ecdsa-with-SHA256
+// signatures, keep Ed25519 fail-closed (parse refusal), enforce cross-key-type
+// signature refusal in both directions, and TLS must bind the signature
+// scheme and cipher suite to the server certificate's leaf key type:
+// EC key -> ecdsa_sha256 (0x0403 preferred, 0x0805 fallback) and
+// ECDHE_ECDSA (0xc02b); RSA key -> rsa_pss_rsae_sha256 (0x0804) and
+// ECDHE_RSA (0xc02f). A hybrid leaf (EC key issued by an RSA root, or an
+// RSA key issued by an EC root) must verify and negotiate by its KEY type.
+// Fixtures generated with OpenSSL, valid 2026-09-28 through 2126-09-04;
+// EC leaves SAN DNS:ec.localhost, IP:127.0.0.1.
+using System;
+using System.IO;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System.Security.Cryptography;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        if (ok) { Console.WriteLine("ok " + name); }
+        else { Console.WriteLine("FAIL " + name); failures = failures + 1; }
+    }
+
+    static string ECROOT_B64 = "MIIBazCCARKgAwIBAgIUHAsyLg2oVSVIKin6pcfBa6UYkNYwCgYIKoZIzj0EAwIwEzERMA8GA1UEAwwIRWNSb290IEEwIBcNMjYwOTI4MTkwOTIxWhgPMjEyNjA5MDQxOTA5MjFaMBMxETAPBgNVBAMMCEVjUm9vdCBBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc41dxWGwGOOGjcATYpFRPExk51P2gG2QMGtZ24mreTIgskeEkjjhDyE1aYNUUptmSpvIcOtHj9l4iEvzKyCLnqNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFBT9PC1I+1uzHe3m+vALdXo7NdclMAoGCCqGSM49BAMCA0cAMEQCIHu7cuX7tS5SJeiR2/W8qb7PJNSZFjIyg1T9nIWNYjSpAiBiQOmggMVw3+2uwWU+/gD/VOsv8zoe+AUFZc9jRtQ/zA==";
+    static string ECROOTPL_B64 = "MIIBdDCCARmgAwIBAgIUCQRfvhxhzYHAIFy4gE91BGhHHJUwCgYIKoZIzj0EAwIwFTETMBEGA1UEAwwKRWNSb290IFBMMDAgFw0yNjA5MjgxOTA5MjFaGA8yMTI2MDkwNDE5MDkyMVowFTETMBEGA1UEAwwKRWNSb290IFBMMDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABN7bS6miL2Izs4dBvb8a/k60TDOgc+g+oQcgjg7GLOA8YBWpL+LzMz5DRjwDeZ3PsvMbb/S/rsxnCMpRdhi8DSSjRTBDMBIGA1UdEwEB/wQIMAYBAf8CAQAwDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBSQmCDB24Lleczhqu30o29APoUV9jAKBggqhkjOPQQDAgNJADBGAiEAt7lVKsMAg5tmtKGWcgc1lGLpuNoKOVmbxazpFX7Zi4ICIQCmHHOBPgqsKiZUHGM6eatpxJbyn65dslLB6lqSx8ks2g==";
+    static string RSAROOT_B64 = "MIIC+jCCAeKgAwIBAgIUXdgzOgX1qYv+rBLBLWUkhQ9kYgwwDQYJKoZIhvcNAQELBQAwFDESMBAGA1UEAwwJUnNhUm9vdCBFMCAXDTI2MDkyODE5MDkyMVoYDzIxMjYwOTA0MTkwOTIxWjAUMRIwEAYDVQQDDAlSc2FSb290IEUwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCHekSKundAOvABxTh60Di9xgon0KDoNiCZsSVvPczAryJPNMlunY0PnngqI0Y1wRP6IkbSQUeEQkep7KJbPQ2gzRKfBdl61UaKKlsucHqQKv9C4Jit3NrYoEonvmQzhHmJCitlLZvRVuFOseMfIEdbX/FMlCKeaxxiBdcMqrEAuqod8c1aiAH3Omut2mmstZoa6X5oIRFFjXaz2QrvlbplPrLZBifNCV5rCUuTQ9uMGomxT14REtdn1HFErLPw3Uls5vO//G7oWAkRCEo3P3RoK3knHMUDxBvo1rhQA3JBfMNrrCUMRdr8dyDe86xW7C0ln5mFP9O/f0dfc/kW6pANAgMBAAGjQjBAMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBRW8+ADUOquzG0Q2OFr64ZqiwoWyjANBgkqhkiG9w0BAQsFAAOCAQEAQlE9eAAkdTR/H2p36cx44+k3wnafzOUtvTDkKssEnAhEt1wkHnzdUihilm30WJisA4TAXcJi6RWvRtx0Kn1lu9z0ioT59uHx6ixy67vtQVlxoJ2cW7GAIYnXu4SPqeAtNIua43+5aQvUpqas3n3vu49pWeei5cDVtVBnzMikV4jop9mqyp+rVQEa15ZeatO0OD2PGiSfx6Ocg3J31dXzHofEzoi1/VFjdMTHTZa+OxKcxjL3+CHmjza2UYkyJ68zQVIb6pnzxZuJS6BZI52Ui2NEIMxwvDBqchdDpayH+Lo1caHOMIbi9oLsgIUCxU3AXx0DVS+gl4je3cCP7LEhOQ==";
+    static string RSASAME_B64 = "MIIC+DCCAeCgAwIBAgIUAaRBCxzKRaBW4x82udGb6iVUrugwDQYJKoZIhvcNAQELBQAwEzERMA8GA1UEAwwIRWNSb290IEEwIBcNMjYwOTI4MTkxMTE1WhgPMjEyNjA5MDQxOTExMTVaMBMxETAPBgNVBAMMCEVjUm9vdCBBMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjF7RQXeyb0aooctw3EiOyirGxZrqiVGUKkP5n8G0L3nsqo6+1wCmpo2r1kbtsz8IPn0tf85u/Hftnxll5wiE5iRP9dws6EVIRtyH1bNa9Ysa29oGgx8N/9E7hEQpJpuiKcxPvBZRWOvg4irL/a032i/7Hs9EHQEVagP/ZvR/FUasT1kjX4KHj9UwceynmIKDDY91a2FM0shunz8CbZaYX/ut5OPXYPtLCKm3/Rzc7jFZoeqOes58tJp+b+X+DYhN/zX7iayj3lkMD8wojIJy9BuJVvu4S759+bwowWiO32vT8fmVW73kO7C5ZHDnJSSNJg0Tg/ncHfg5AX8r0Nu2pwIDAQABo0IwQDAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQUN6YgMjFNNL5H3wb53zFjHZLSmKAwDQYJKoZIhvcNAQELBQADggEBAFfvhTDpYWADglJuS70WsN/Rpgf1ePFu5qSXoM0kuk7LGLc8ymDg2G4BZEgNjRfWqPunhMLJ0PPuV4d6lQ98kOMImOSjawDe/a7FcVTzf/wmVvfXY+UpyP/2tCYpsXNRX2+CO26kI+iwtdqHFKEAMOKLMZF5io+HDRi6XJtKHGatKhUboLf4gNTYYYMMQjJ5eOeKx6uheVIcd7BBIzGpHOW+a7G+iR4aBsVYmrnOofwKoUTAtCdXoBaMBLtyK5g4Q0hOuk2qryNMbh9yQrhUak4uYXYF+A7NGFj/a+ERX9G20bymprshmFUEl8jaUiXf3oUJaiqqhD+DiGIiY+SXGjQ=";
+    static string ECSUB_B64 = "MIIBfTCCASOgAwIBAgICB9UwCgYIKoZIzj0EAwIwFTETMBEGA1UEAwwKRWNSb290IFBMMDAgFw0yNjA5MjgxOTA5MjJaGA8yMTI2MDkwNDE5MDkyMlowEDEOMAwGA1UEAwwFRWNTdWIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATrHbxMOlePI54gEnJp3OGnKWQuaQR/J28c8xZ7ooCOn6GWv8bGzxIgb/qlD5dZb/vQNNHpQh6qbPNVa/abUm+2o2YwZDASBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQUATkKVQSbP22CGbaHiczQFTdDuSEwHwYDVR0jBBgwFoAUkJggwduC5XnM4art9KNvQD6FFfYwCgYIKoZIzj0EAwIDSAAwRQIhAKxyLPMSAmUJpoFZpoF6+ypc94hg03e5qeTWsoOlMv5AAiBrYZgV1XGht0lRyIyMpBFONgoAl1xwbbweSUlPGw240A==";
+    static string ECLEAF_B64 = "MIIBrTCCAVOgAwIBAgICB9EwCgYIKoZIzj0EAwIwEzERMA8GA1UEAwwIRWNSb290IEEwIBcNMjYwOTI4MTkwOTIxWhgPMjEyNjA5MDQxOTA5MjFaMBIxEDAOBgNVBAMMB2VjLWxlYWYwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASlcwHKEC3WEcRa1qcID9QHExXjf5h1rzMxah9wbKuHEWy0BXxZNKDkjbyvDko1Z/jhAvdYkdZe6pUj1wKeuQqzo4GVMIGSMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdEQQWMBSCDGVjLmxvY2FsaG9zdIcEfwAAATAdBgNVHQ4EFgQUClZvu/77ZhlpSXo5Ky6Ope/M/H4wHwYDVR0jBBgwFoAUFP08LUj7W7Md7eb68At1ejs11yUwCgYIKoZIzj0EAwIDSAAwRQIgNhJYzn3FDkn6vzLYNP+/6HJbgiP1bpkv+U8EUxlwKrICIQCkDMyiB81M1tsgqmU/UaQe1Bq/r5rbcWOARVv/NGEI+Q==";
+    static string RSALEAF_B64 = "MIIChzCCAi6gAwIBAgICB9IwCgYIKoZIzj0EAwIwEzERMA8GA1UEAwwIRWNSb290IEEwIBcNMjYwOTI4MTkwOTIxWhgPMjEyNjA5MDQxOTA5MjFaMBMxETAPBgNVBAMMCHJzYS1sZWFmMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApjabEBt33/T5u+2rrWA2DP638zgsd2iafQdzwq3MTAxiRzETo/7zusGn0gun9TW/zWkXQryWgZ48Pt987L4Y8uxWRi6mgRMDCRHrS3vz77a7uU/7m2hnjOH0rRtR9H/UVRFPr+GTzm6gWifcYzlFVeQ9TFyApAxLI2ByoLOc2njHGcdbbLR0bQsuhOv/qV6VwoCSzCfamChkmMiMVfPb38nJadGqFR8E3h/BmpQdPPqOplE3BGSuEoKMl1/mLuF5gCQpkFHqUtj05lDDIBSM6nLGGeOegURVeC5CKHJGE7k0fmHYi+eWPVM3sE+xlt2YC/WL4inzjkLRMoBtiCRsowIDAQABo4GkMIGhMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMCwGA1UdEQQlMCOCCWxvY2FsaG9zdIcEfwAAAYcQAAAAAAAAAAAAAAAAAAAAATAdBgNVHQ4EFgQUOgS55D+ajT+YyaQ/1M5l1pyXR3QwHwYDVR0jBBgwFoAUFP08LUj7W7Md7eb68At1ejs11yUwCgYIKoZIzj0EAwIDRwAwRAIgAXscOT+Edho7PHM+WSz666cz3An4hfbwxHTWxrLM9aECIGfGvS4w8jv97hu+pP3PvP1mkWW+wy9n3kAJOghRudAH";
+    static string ECLEAFR_B64 = "MIICcTCCAVmgAwIBAgICB9MwDQYJKoZIhvcNAQELBQAwFDESMBAGA1UEAwwJUnNhUm9vdCBFMCAXDTI2MDkyODE5MDkyMloYDzIxMjYwOTA0MTkwOTIyWjAUMRIwEAYDVQQDDAllYy1sZWFmLXIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATuUGrIhe+2tNVCr82afhgpas1qfzlczkAw4aCZ3Xt7VtujflM7c1sZO4ZWunu3y/f+upj3dsLFKoBaVe4f1UXMo4GVMIGSMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdEQQWMBSCDGVjLmxvY2FsaG9zdIcEfwAAATAdBgNVHQ4EFgQUqGnqhYzJrcRKcZ+KgXDvGyfh62MwHwYDVR0jBBgwFoAUVvPgA1DqrsxtENjha+uGaosKFsowDQYJKoZIhvcNAQELBQADggEBAEBwbzLACrss7X8miCRqBjpG0xHaGSGcGVJliLf6zIVeCsjcnykAwZdFWRP7aFW9g2ALYS2ZXTqaDK3145mYgG9kr/m6FUvH430s2yduPDDd0B6ln7Advb/nPzoGjKju6YxGeOHaVM2fKcb7wJoyjZc7908AswwQMK/Yv8x9pJjfjz3pl3KvYZDsjCpv5K66eL8wtwbcj0vFfIYtFy7pNZHwegBh9H68S4fk0QV9AaeYzvXLN8CI7bDR//CZfn6RduWIYYddbYLATH5DdshRPY1SUT9xJhTtPXemPZqc7gTBDNwrOPDI9EW6+GdoA8e6FKd0zAwyWTNAOW3EUqLwfpg=";
+    static string ECLEAFPL_B64 = "MIIBsjCCAVmgAwIBAgICB9QwCgYIKoZIzj0EAwIwFTETMBEGA1UEAwwKRWNSb290IFBMMDAgFw0yNjA5MjgxOTA5MjJaGA8yMTI2MDkwNDE5MDkyMlowFjEUMBIGA1UEAwwLZWMtbGVhZi1wbDAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAROBbKPQ6kvyFJvNqeAxd/OxGAwNDR6YpXuMVWp7QgvitEIGUzu11Wh98NV47QxzU9DcBiBySguLXCM756EAKSno4GVMIGSMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdEQQWMBSCDGVjLmxvY2FsaG9zdIcEfwAAATAdBgNVHQ4EFgQUE1eUD2Ct3wosexmeQyc1FwycuvswHwYDVR0jBBgwFoAUkJggwduC5XnM4art9KNvQD6FFfYwCgYIKoZIzj0EAwIDRwAwRAIgPGRTx5qwNNPBOqkE9mM82ITrJ63xZAnU+0r0O2ZNXmcCIDfF5siR5QWvxcuVjbiTfQn0EdZmIdM7Y/wYUc8X4cJi";
+    static string ECLEAFDEEP_B64 = "MIIBrjCCAVWgAwIBAgICB9YwCgYIKoZIzj0EAwIwEDEOMAwGA1UEAwwFRWNTdWIwIBcNMjYwOTI4MTkxMTE1WhgPMjEyNjA5MDQxOTExMTVaMBcxFTATBgNVBAMMDGVjLWxlYWYtZGVlcDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABFHDfCTYlg1jGGMhzM61zmLoN2RtUdpVz1uapdz2qoxlwK7FSPz5n4/x4hEvEGNl8WNQ4D5Z73oAPbkx3eosKDOjgZUwgZIwDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwHQYDVR0RBBYwFIIMZWMubG9jYWxob3N0hwR/AAABMB0GA1UdDgQWBBS343yQWkOVHNOyKOavyP03jKNqvDAfBgNVHSMEGDAWgBQBOQpVBJs/bYIZtoeJzNAVN0O5ITAKBggqhkjOPQQDAgNHADBEAiBPAPJucRH8p35JvZ9Cw9IYlZjCH8QBEiTRbBjJnP2JhAIgA1gwghT90Ph+DIqGxuBvZ5LyY0GrkT7ayR33gVctoWE=";
+    static string ECLEAF_TAMPERED_B64 = "MIIBrTCCAVOgAwIBAgICB9EwCgYIKoZIzj0EAwIwEzERMA8GA1UEAwwIRWNSb290IEEwIBcNMjYwOTI4MTkwOTIxWhgPMjEyNjA5MDQxOTA5MjFaMBIxEDAOBgNVBAMMB2VjLWxlYWYwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASlcwHKEC3WEcRa1qcID9QHExXjf5h1rzMxah9wbKuHEWy0BXxZNKDkjbyvDko1Z/jhAvdYkdZe6pUj1wKeuQqzo4GVMIGSMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdEQQWMBSCDGVjLmxvY2FsaG9zdIcEfwAAATAdBgNVHQ4EFgQUClZvu/77ZhlpSXo5Ky6Ope/M/H4wHwYDVR0jBBgwFoAUFP08LUj7W7Md7eb68At1ejs11yUwCgYIKoZIzj0EAwIDSAAwRQIgNhJYzn3FDkn6vzLYNP+/6HJbgiP1bpkv+U8EUxlwKrICIQCkDMyiB81M1tsgqmU/UaQe1Bq/r5rbcWOBRVv/NGEI+Q==";
+    static string EDROOT_B64 = "MIIBODCB66ADAgECAhQ3N8TcZctPCtpO5wQFvsLsq8WKrDAFBgMrZXAwETEPMA0GA1UEAwwGRWRSb290MCAXDTI2MDkyODE5MDkyMloYDzIxMjYwOTA0MTkwOTIyWjARMQ8wDQYDVQQDDAZFZFJvb3QwKjAFBgMrZXADIQD8VQvQ75bNTOtL+wRJHHQjipYxyhF7wPge1J29uhq1j6NTMFEwHQYDVR0OBBYEFPKGg+Qexg0jnDSdenq5vHkS1lzRMB8GA1UdIwQYMBaAFPKGg+Qexg0jnDSdenq5vHkS1lzRMA8GA1UdEwEB/wQFMAMBAf8wBQYDK2VwA0EACu98TFu0L4eAewMr2grC8dqn2GlSQ9d2vqBfdNP8qpTpT9ogV8gyiXVVJiF45JDU18lVdSPn4USrYpmTNTofBw==";
+    static string EC_LEAF_KEY = "-----BEGIN PRIVATE KEY-----\n"
+    + "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgilkp0dhuJGt1AP78\n"
+    + "rJwUU8xxHLE33EIoydXvba9+SZOhRANCAASlcwHKEC3WEcRa1qcID9QHExXjf5h1\n"
+    + "rzMxah9wbKuHEWy0BXxZNKDkjbyvDko1Z/jhAvdYkdZe6pUj1wKeuQqz\n"
+    + "-----END PRIVATE KEY-----\n";
+    static string EC_LEAFR_KEY = "-----BEGIN PRIVATE KEY-----\n"
+    + "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcTZN1RLIwASjER7X\n"
+    + "oUkOLSP6F/5xQyHqmJmpKpBBT7GhRANCAATuUGrIhe+2tNVCr82afhgpas1qfzlc\n"
+    + "zkAw4aCZ3Xt7VtujflM7c1sZO4ZWunu3y/f+upj3dsLFKoBaVe4f1UXM\n"
+    + "-----END PRIVATE KEY-----\n";
+    static string EC_LEAFDEEP_KEY = "-----BEGIN PRIVATE KEY-----\n"
+    + "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgXtZ5XKq6bHIGxxsW\n"
+    + "R6tZQiokswKbAcI+mX4dwjwX4V2hRANCAARRw3wk2JYNYxhjIczOtc5i6DdkbVHa\n"
+    + "Vc9bmqXc9qqMZcCuxUj8+Z+P8eIRLxBjZfFjUOA+We96AD25Md3qLCgz\n"
+    + "-----END PRIVATE KEY-----\n";
+    static string RSA_LEAF_KEY = "-----BEGIN PRIVATE KEY-----\n"
+    + "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCmNpsQG3ff9Pm7\n"
+    + "7autYDYM/rfzOCx3aJp9B3PCrcxMDGJHMROj/vO6wafSC6f1Nb/NaRdCvJaBnjw+\n"
+    + "33zsvhjy7FZGLqaBEwMJEetLe/Pvtru5T/ubaGeM4fStG1H0f9RVEU+v4ZPObqBa\n"
+    + "J9xjOUVV5D1MXICkDEsjYHKgs5zaeMcZx1tstHRtCy6E6/+pXpXCgJLMJ9qYKGSY\n"
+    + "yIxV89vfyclp0aoVHwTeH8GalB08+o6mUTcEZK4SgoyXX+Yu4XmAJCmQUepS2PTm\n"
+    + "UMMgFIzqcsYZ456BRFV4LkIockYTuTR+YdiL55Y9UzewT7GW3ZgL9YviKfOOQtEy\n"
+    + "gG2IJGyjAgMBAAECggEADO0slGKb09+LTTRtMxUgmanKUuXjU2q1BRSUyfxWlJ2B\n"
+    + "Rn8dw2slt7hYMwuJWuvSCF7Bb9psgWp1zf/3M7mPBX7K24zE5z88Gl2kj8t1NlyJ\n"
+    + "mfO1936gUFfBqHV6TgpjpYqsngWW8f7ZhVlvQt+RMbOymWM3n/UoIiQIliXnL3ha\n"
+    + "p+T0+1GR5SkcQf0f+UJJZCIvevEsFjTbJbnG1SKFtIM+AKFkHlnbHM9jblQ+HDvZ\n"
+    + "aIf7+Ajmejlms5LuK/GPfCAW1LV3XqO0yd/GfCGJfHXWNKbdt1ZdyBJ6fJBYebhr\n"
+    + "RB9epjuN2T0RNJ3pJO2EsKNn76GCz9DRDSS2vhp5mQKBgQDdbMyqZz7m+bANiehU\n"
+    + "TvZ7T1W4+G2EIOHtUJIJKrbjTwbxG20HNDkHC9sRVTJcgauRmAv4ylgbsImI/Ygt\n"
+    + "mBiwSxFvZcHsLZJ74byQoLctDeNEAjOnyODG6XyCkQadzHin5totbl0eq/bHFMvI\n"
+    + "RpJLH8u5L70EQQ4X6QqRufHriQKBgQDAKsjWumigAaH+x3ZBoW6CFMLqpZP/BJnV\n"
+    + "dD/TnMAuVP5JxIQoeItO2KnzjEKy3sEZA2KK1KwEhJXcXcft0coplYfo3NZslw2P\n"
+    + "e3BCI7/FrCASFhfdkBxg/NRk1knTyd+aVdnaB+hnmyBLp/UaJqoQpnoB0zW4nOBu\n"
+    + "r0qNO+yvywKBgQDBDSHoE/pIwTtYons4PlwyKHpRue8p+s1f7hZU/bPUvUsNHd9S\n"
+    + "H5r05MZL917gPoIKf2k4sZpeEe3nzTxUnD4yPlDmMe8Abr8/WRHheu4Zzvjti4nj\n"
+    + "6ITpiBpxb+Y34FT19pUUdRulKUMQUbZWWAkmjIM/YzrGIb4a5Ki9Y0RkGQKBgErS\n"
+    + "3eyuHHrg5+C6bZNUdiD0UIjo+906P2PbpdaRnEruES1L9WGEvklvF42bOYVIMsu4\n"
+    + "g7Am6uu/bFKnuWciXqMedBL5mgwiLMeHeshl/w/K25nvPE+rA0HIcDLrNUffvM7t\n"
+    + "SqwYlCdzQXnz5f3OvD1LdQos4SgG/WRboJ2pjZlNAoGAKClTP6YodoBYU1FyLabm\n"
+    + "VXXri73C6E2Rr3sUAZZy17CHSKSkgE9mesDhAAB8v59Npi3crW9WkGdZNSAaehkj\n"
+    + "tFA+XV6CyqoQSbxqUPY91CIwzu7P5JuTMzYiCclpuRFGUUnU1yo69TOaw/35XFMF\n"
+    + "syR6vXR7oteG2bGuljcqru8=\n"
+    + "-----END PRIVATE KEY-----\n";
+
+    static string Pem(string b64) {
+        string out1 = "-----BEGIN CERTIFICATE-----\n";
+        int pos = 0;
+        while (pos < b64.Length) {
+            int take = 64;
+            if (pos + take > b64.Length) { take = b64.Length - pos; }
+            out1 = out1 + b64.Substring(pos, take) + "\n";
+            pos = pos + take;
+        }
+        return out1 + "-----END CERTIFICATE-----\n";
+    }
+
+    static void TestParseKeyTypes() {
+        X509Certificate ecroot = X509Certificate.FromPem(Pem(ECROOT_B64));
+        Check(ecroot != null && ecroot.HasEcKey() && ecroot.SigIsEcdsa(), "ecroot parses as EC with ECDSA sig");
+        X509Certificate ecleaf = X509Certificate.FromPem(Pem(ECLEAF_B64));
+        Check(ecleaf != null && ecleaf.HasEcKey() && ecleaf.SigIsEcdsa(), "ecleaf parses as EC with ECDSA sig");
+        X509Certificate rsaleaf = X509Certificate.FromPem(Pem(RSALEAF_B64));
+        Check(rsaleaf != null && !rsaleaf.HasEcKey() && rsaleaf.SigIsEcdsa(), "RSA-key leaf issued by EC root: RSA key with ECDSA sig");
+        // 混合型：EC 公钥 + RSA 根签发（签名算法 RSA）。两个判定必须解耦。
+        X509Certificate ecleafR = X509Certificate.FromPem(Pem(ECLEAFR_B64));
+        Check(ecleafR != null && ecleafR.HasEcKey() && !ecleafR.SigIsEcdsa(), "hybrid EC-key/RSA-sig leaf keeps both fields");
+        X509Certificate ed = X509Certificate.FromPem(Pem(EDROOT_B64));
+        Check(ed == null, "Ed25519 certificate fails closed on parse");
+    }
+
+    static void TestVerifyMatrix() {
+        X509Certificate ecroot = X509Certificate.FromPem(Pem(ECROOT_B64));
+        X509Certificate ecrootpl = X509Certificate.FromPem(Pem(ECROOTPL_B64));
+        X509Certificate rsaroot = X509Certificate.FromPem(Pem(RSAROOT_B64));
+        X509Certificate rsasame = X509Certificate.FromPem(Pem(RSASAME_B64));
+        X509Certificate ecsub = X509Certificate.FromPem(Pem(ECSUB_B64));
+        X509Certificate ecleaf = X509Certificate.FromPem(Pem(ECLEAF_B64));
+        X509Certificate ecleafR = X509Certificate.FromPem(Pem(ECLEAFR_B64));
+        X509Certificate ecleafpl = X509Certificate.FromPem(Pem(ECLEAFPL_B64));
+        X509Certificate ecleafdeep = X509Certificate.FromPem(Pem(ECLEAFDEEP_B64));
+        if (ecroot == null || ecrootpl == null || rsaroot == null || rsasame == null || ecsub == null
+            || ecleaf == null || ecleafR == null || ecleafpl == null || ecleafdeep == null) {
+            Check(false, "verify matrix fixtures parse");
+            return;
+        }
+        Check(ecleaf.VerifySignedBy(ecroot), "EC leaf verifies under EC root");
+        Check(ecleafpl.VerifySignedBy(ecrootpl), "EC leaf direct under pathlen-0 root verifies");
+        Check(ecleafR.VerifySignedBy(rsaroot), "EC-key leaf with RSA sig verifies under RSA root");
+        Check(ecleafdeep.VerifySignedBy(ecsub), "deep EC leaf verifies against its direct issuer");
+        Check(!ecleaf.VerifySignedBy(rsasame), "same-CN RSA root refuses ECDSA-signed leaf");
+        Check(!ecleafR.VerifySignedBy(ecroot), "RSA-signed leaf refuses EC issuer key");
+        // 篡改签名位：ECDSA 数学本身必须拒绝（不止密钥类型/查找层）。
+        // 常量为 ecleaf DER 翻倒数第 8 字节（签名 s 整数中段，DER 结构不变）。
+        X509Certificate tamperedCert = X509Certificate.FromPem(Pem(ECLEAF_TAMPERED_B64));
+        Check(tamperedCert != null, "tampered signature still parses");
+        Check(tamperedCert == null || !tamperedCert.VerifySignedBy(ecroot), "tampered ECDSA signature refused under correct root");
+    }
+
+    static async void EcServerLoop(TlsContext tls, int port, int conns) {
+        TcpListener l = new TcpListener("127.0.0.1", port);
+        l.Start();
+        for (int n = 0; n < conns; n = n + 1) {
+            nint sock = await l.AcceptAsync();
+            if (sock < 0) { break; }
+            await HandleEcConn(tls, sock);
+            Socket.Close(sock);
+        }
+        l.Stop();
+    }
+
+    static async void HandleEcConn(TlsContext tls, nint sock) {
+        TlsStream s = await TlsStream.AcceptAsync(tls, sock, 10000);
+        if (s == null) {
+            return;
+        }
+        string got = await s.RecvAsync(256);
+        int _w = await s.SendStringAsync("pong:" + got);
+        s.Close();
+    }
+
+    static bool exOk;
+    static int exChain;
+    static string exReply;
+
+    static async void EcExchange(TlsContext ctx, int port, string host, string ping) {
+        Program.exOk = false;
+        Program.exChain = 0;
+        Program.exReply = "";
+        nint sock = Socket.CreateTcp();
+        Socket.SetNonBlocking(sock);
+        int rc = await Socket.ConnectAsync(sock, "127.0.0.1", port, 5000);
+        if (rc != 0) {
+            Socket.Close(sock);
+            return;
+        }
+        TlsStream s = await TlsStream.ConnectAsync(ctx, sock, host, 10000);
+        if (s == null) {
+            Socket.Close(sock);
+            return;
+        }
+        Program.exOk = true;
+        Program.exChain = s.engine.peerChain.Count;
+        int _s = await s.SendStringAsync(ping);
+        Program.exReply = await s.RecvAsync(256);
+        s.Close();
+        Socket.Close(sock);
+    }
+
+    static async int Run() {
+        TestParseKeyTypes();
+        TestVerifyMatrix();
+
+        Directory.CreateDirectory("_scratch");
+        File.WriteAllText("_scratch/x509e_ecroot.pem", Pem(ECROOT_B64));
+        File.WriteAllText("_scratch/x509e_ecrootpl.pem", Pem(ECROOTPL_B64));
+        File.WriteAllText("_scratch/x509e_rsaroot.pem", Pem(RSAROOT_B64));
+        File.WriteAllText("_scratch/x509e_rsasame.pem", Pem(RSASAME_B64));
+        File.WriteAllText("_scratch/x509e_srv_ec.pem", Pem(ECLEAF_B64));
+        File.WriteAllText("_scratch/x509e_srv_ecR.pem", Pem(ECLEAFR_B64));
+        File.WriteAllText("_scratch/x509e_srv_rsa.pem", Pem(RSALEAF_B64));
+        File.WriteAllText("_scratch/x509e_srv_deep.pem", Pem(ECLEAFDEEP_B64) + Pem(ECSUB_B64));
+        File.WriteAllText("_scratch/x509e_ecleaf.key", EC_LEAF_KEY);
+        File.WriteAllText("_scratch/x509e_ecleafR.key", EC_LEAFR_KEY);
+        File.WriteAllText("_scratch/x509e_ecleafdeep.key", EC_LEAFDEEP_KEY);
+        File.WriteAllText("_scratch/x509e_rsaleaf.key", RSA_LEAF_KEY);
+
+        TlsContext s13 = TlsContext.CreateServer("_scratch/x509e_srv_ec.pem", "_scratch/x509e_ecleaf.key");
+        TlsContext s12 = TlsContext.CreateServer("_scratch/x509e_srv_ec.pem", "_scratch/x509e_ecleaf.key");
+        TlsContext sHybridEc = TlsContext.CreateServer("_scratch/x509e_srv_ecR.pem", "_scratch/x509e_ecleafR.key");
+        TlsContext sHybridRsa = TlsContext.CreateServer("_scratch/x509e_srv_rsa.pem", "_scratch/x509e_rsaleaf.key");
+        TlsContext sDeep = TlsContext.CreateServer("_scratch/x509e_srv_deep.pem", "_scratch/x509e_ecleafdeep.key");
+        Check(s13 != null && s12 != null && sHybridEc != null && sHybridRsa != null && sDeep != null,
+            "all EC server bundles parsed");
+        if (s13 == null || s12 == null || sHybridEc == null || sHybridRsa == null || sDeep == null) {
+            Console.WriteLine("failures=" + Convert.ToString(failures));
+            return 0;
+        }
+        Task.Spawn(EcServerLoop(s13, 9608, 3));
+        Task.Spawn(EcServerLoop(s12, 9609, 1));
+        Task.Spawn(EcServerLoop(sHybridEc, 9610, 1));
+        Task.Spawn(EcServerLoop(sHybridRsa, 9611, 1));
+        Task.Spawn(EcServerLoop(sDeep, 9612, 1));
+        await Task.Delay(150);
+
+        TlsContext cEc = TlsContext.CreateClient();
+        Check(cEc.AddTrustedCert("_scratch/x509e_ecroot.pem"), "ecroot anchor loaded");
+        TlsContext cSameName = TlsContext.CreateClient();
+        Check(cSameName.AddTrustedCert("_scratch/x509e_rsasame.pem"), "same-CN RSA anchor loaded");
+        TlsContext cRsa = TlsContext.CreateClient();
+        Check(cRsa.AddTrustedCert("_scratch/x509e_rsaroot.pem"), "RSA anchor loaded");
+        TlsContext cEcPl = TlsContext.CreateClient();
+        Check(cEcPl.AddTrustedCert("_scratch/x509e_ecrootpl.pem"), "pathlen-0 EC anchor loaded");
+
+        await EcExchange(cEc, 9608, "ec.localhost", "e1");
+        Check(Program.exOk, "tls13 EC server connects with EC anchor");
+        Check(Program.exChain == 1, "single-cert EC chain length 1");
+        Check(Program.exReply == "pong:e1", "tls13 EC app data roundtrip");
+
+        await EcExchange(cSameName, 9608, "ec.localhost", "e2");
+        Check(!Program.exOk, "same-CN RSA anchor refused on EC server");
+
+        await EcExchange(cRsa, 9608, "ec.localhost", "e3");
+        Check(!Program.exOk, "unrelated RSA anchor refused on EC server");
+
+        TlsContext c12 = TlsContext.CreateClient();
+        c12.AddTrustedCert("_scratch/x509e_ecroot.pem");
+        c12.DisableTls13();
+        await EcExchange(c12, 9609, "ec.localhost", "e4");
+        Check(Program.exOk, "tls12 EC server (ECDHE_ECDSA) connects");
+        Check(Program.exReply == "pong:e4", "tls12 EC app data roundtrip");
+
+        await EcExchange(cRsa, 9610, "ec.localhost", "e5");
+        Check(Program.exOk, "tls13 EC-key leaf under RSA root negotiates by key type");
+
+        TlsContext cEcLocal = TlsContext.CreateClient();
+        cEcLocal.AddTrustedCert("_scratch/x509e_ecroot.pem");
+        await EcExchange(cEcLocal, 9611, "localhost", "e6");
+        Check(Program.exOk, "tls13 RSA-key leaf under EC root negotiates by key type");
+
+        await EcExchange(cEcPl, 9612, "ec.localhost", "e7");
+        Check(!Program.exOk, "deep chain violating pathlen-0 EC root refused");
+
+        Socket.Cleanup();
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

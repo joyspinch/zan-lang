@@ -1,0 +1,94 @@
+// Conformance: restricted DNS hostname canonicalization at the IDNA boundary.
+// VerifyHost must accept only LDH+dot ASCII names: exact and case-insensitive
+// matches, the trailing root dot ("example.com.") on either the host or the
+// SAN pattern, A-label (xn--) exact matches, and the RFC 6125 leftmost
+// single-label wildcard. It must refuse: Unicode (U-label) hosts outright —
+// this stack performs no Unicode normalization or homoglyph protection, so
+// applications must to-ASCII before calling —, empty labels, double dots,
+// lone dots, non-LDH characters, wildcard matching of A-label host names,
+// cross-label wildcards, single-label wildcard parents, and "*" in a host.
+// Fixtures generated with OpenSSL ECDSA P-256; SAN covers exact, wildcard,
+// A-label, single-label-parent and trailing-dot patterns.
+using System;
+using System.Security.Cryptography;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        if (ok) { Console.WriteLine("ok " + name); }
+        else { Console.WriteLine("FAIL " + name); failures = failures + 1; }
+    }
+
+    static string ECROOT_B64 = "MIIBazCCARKgAwIBAgIUHAsyLg2oVSVIKin6pcfBa6UYkNYwCgYIKoZIzj0EAwIwEzERMA8GA1UEAwwIRWNSb290IEEwIBcNMjYwOTI4MTkwOTIxWhgPMjEyNjA5MDQxOTA5MjFaMBMxETAPBgNVBAMMCEVjUm9vdCBBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc41dxWGwGOOGjcATYpFRPExk51P2gG2QMGtZ24mreTIgskeEkjjhDyE1aYNUUptmSpvIcOtHj9l4iEvzKyCLnqNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFBT9PC1I+1uzHe3m+vALdXo7NdclMAoGCCqGSM49BAMCA0cAMEQCIHu7cuX7tS5SJeiR2/W8qb7PJNSZFjIyg1T9nIWNYjSpAiBiQOmggMVw3+2uwWU+/gD/VOsv8zoe+AUFZc9jRtQ/zA==";
+    static string IDNA_B64 = "MIIB1jCCAXugAwIBAgIDBnkyMAoGCCqGSM49BAMCMBMxETAPBgNVBAMMCEVjUm9vdCBBMB4XDTI2MDkyODIxMDg0MVoXDTM2MDkyNTIxMDg0MVowDzENMAsGA1UEAwwEaWRuYTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABOgqI/dXVqa/S1mr1K87lkV61xyG5xSDyjBqCg1FyHMEvmknW+BPsxoLckM/yMlqf+S2kNFlSBWhn9EGSwGy3kWjgcEwgb4wVwYDVR0RBFAwToIMZWMubG9jYWxob3N0gg4qLndpbGQuZXhhbXBsZYIReG4tLWU4YjRmLmV4YW1wbGWCCCouc2luZ2xlghF0cmFpbGluZy5leGFtcGxlLjATBgNVHSUEDDAKBggrBgEFBQcDATAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0OBBYEFDWDND0LdKDpzJp19uij+JmoIMZsMB8GA1UdIwQYMBaAFBT9PC1I+1uzHe3m+vALdXo7NdclMAoGCCqGSM49BAMCA0kAMEYCIQDu8QXDAPzjSgLtfd96x2g3pz7nc7XhPbR4DYlXI0W2IQIhAJmqt5WMEfRuNw4xvLPl0Uv4FpbD2F9yyKreZKMf2/tV";
+
+    static string Pem(string b64) {
+        string out1 = "-----BEGIN CERTIFICATE-----\n";
+        int pos = 0;
+        while (pos < b64.Length) {
+            int take = 64;
+            if (pos + take > b64.Length) { take = b64.Length - pos; }
+            out1 = out1 + b64.Substring(pos, take) + "\n";
+            pos = pos + take;
+        }
+        return out1 + "-----END CERTIFICATE-----\n";
+    }
+
+    static async int Run() {
+        X509Certificate cert = X509Certificate.FromPem(Pem(IDNA_B64));
+        Check(cert != null, "idna leaf parses");
+        if (cert == null) {
+            Console.WriteLine("failures=" + Convert.ToString(failures));
+            return 0;
+        }
+
+        // 接受：精确、大小写、尾随根点、A-label 精确、最左单标签通配。
+        Check(cert.VerifyHost("ec.localhost"), "exact san matches");
+        Check(cert.VerifyHost("EC.Localhost"), "case-insensitive match");
+        Check(cert.VerifyHost("ec.localhost."), "trailing root dot on host accepted");
+        Check(cert.VerifyHost("xn--e8b4f.example"), "A-label exact match accepted");
+        Check(cert.VerifyHost("a.wild.example"), "leftmost wildcard matches");
+        Check(cert.VerifyHost("B.WILD.EXAMPLE"), "wildcard case-insensitive");
+        Check(cert.VerifyHost("trailing.example"), "trailing dot on san pattern accepted");
+        Check(cert.VerifyHost("a.wild.example."), "trailing dot with wildcard accepted");
+
+        // 拒绝：空标签 / 连续点 / 孤立点 / 双尾点。
+        Check(!cert.VerifyHost("ec..localhost"), "empty label refused");
+        Check(!cert.VerifyHost(".ec.localhost"), "leading dot refused");
+        Check(!cert.VerifyHost("."), "lone dot refused");
+        Check(!cert.VerifyHost("ec.localhost.."), "double trailing dot refused");
+        Check(!cert.VerifyHost(""), "empty host refused");
+
+        // 拒绝：非 ASCII（U-label）主机——本栈不做 Unicode 归一与同形字
+        // 防护，应用层必须先 to-ASCII；任何非 ASCII 输入一律失败关闭。
+        Check(!cert.VerifyHost("例え.example"), "unicode host refused");
+        Check(!cert.VerifyHost("пример.example"), "cyrillic host refused");
+
+        // 拒绝：LDH 之外字符。
+        Check(!cert.VerifyHost("foo_bar.example"), "underscore refused");
+        Check(!cert.VerifyHost("foo bar.example"), "space refused");
+        Check(!cert.VerifyHost("*.wild.example"), "star in host refused");
+
+        // 拒绝：通配越界（跨标签、A-label 首标签、单标签父域）。
+        Check(!cert.VerifyHost("a.b.wild.example"), "cross-label wildcard refused");
+        Check(!cert.VerifyHost("xn--80ak6aa92e.wild.example"), "wildcard vs A-label refused");
+        Check(!cert.VerifyHost("x.single"), "single-label wildcard parent refused");
+
+        // 拒绝：超长主机名（>255）。
+        string longHost = "";
+        for (int i = 0; i < 30; i = i + 1) { longHost = longHost + "abcdefghij."; }
+        Check(!cert.VerifyHost(longHost), "overlong host refused");
+
+        // 锚点自身仍可正常解析（健全性）。
+        X509Certificate root = X509Certificate.FromPem(Pem(ECROOT_B64));
+        Check(root != null && root.HasEcKey(), "ecroot anchor parses");
+
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

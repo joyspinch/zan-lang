@@ -239,6 +239,9 @@ class TlsEngine {
     X509Certificate cachedCert;
     List<X509Certificate> certChain;
     RsaKey cachedKey;
+    EcKey cachedEcKey;
+    bool clientAdvertised0805;
+    bool clientAdvertised0403;
     static int MaxServerChainCerts = 8;
     static int MaxServerChainDerBytes = 131072;
 
@@ -307,7 +310,9 @@ class TlsEngine {
         this.cachedCert = null;
         this.certChain = null;
         this.cachedKey = null;
-
+        this.cachedEcKey = null;
+        this.clientAdvertised0805 = false;
+        this.clientAdvertised0403 = false;
         this.state = StateInitial;
         this.lastError = "";
         this.verifyResult = 0;
@@ -335,9 +340,10 @@ class TlsEngine {
         this.recType.Add(0);
     }
 
-    void SetCredentials(X509Certificate cert, RsaKey key) {
+    void SetCredentials(X509Certificate cert, RsaKey key, EcKey ecKey) {
         this.cachedCert = cert;
         this.cachedKey = key;
+        this.cachedEcKey = ecKey;
     }
 
     /// <summary>服务端证书链：叶子在前、中间证书随后。链中每张 DER 都
@@ -679,11 +685,29 @@ class TlsEngine {
                 int kind = extensions.ReadU16();
                 int size = extensions.ReadU16();
                 if (!extensions.Has(size) || seen.Contains(kind)
-                    || kind != 0 || size != 0 || this.host == null || this.host.Length == 0) {
+                    || this.host == null || this.host.Length == 0) {
                     this.Fail("EncryptedExtensions 无效或未请求的扩展"); return -1;
                 }
+                if (kind == 0) {
+                    // server_name 确认：必须为空。
+                    if (size != 0) { this.Fail("EncryptedExtensions server_name 非空"); return -1; }
+                    extensions.Skip(size);
+                } else if (kind == 10) {
+                    // supported_groups：RFC 8446 允许服务端在 EE 中回送
+                    //（openssl 3.2+ 默认发送）。仅校验结构并忽略内容——
+                    // 本栈只支持 X25519，协商已在 ServerHello 完成。
+                    if (size < 4 || (size & 1) != 0) {
+                        this.Fail("EncryptedExtensions supported_groups 非法"); return -1;
+                    }
+                    int n = extensions.ReadU16();
+                    if (n + 2 != size || (n & 1) != 0) {
+                        this.Fail("EncryptedExtensions supported_groups 非法"); return -1;
+                    }
+                    for (int gi = 0; gi < n; gi = gi + 2) { extensions.ReadU16(); }
+                } else {
+                    this.Fail("EncryptedExtensions 含未支持扩展: " + kind); return -1;
+                }
                 seen.Add(kind);
-                extensions.Skip(size);
             }
             this.receivedEncryptedExtensions = true;
             this.transcript.Update(fullMsg);
@@ -780,7 +804,8 @@ class TlsEngine {
         if (this.isServer || this.state != StateClientHelloSent || comp != 0
             || (selectedVersion != TlsRecord.VersionTls12 && selectedVersion != TlsRecord.VersionTls13)
             || (selectedVersion == TlsRecord.VersionTls13 && (this.disableTls13 || this.negotiatedCipherSuite != 0x1301))
-            || (selectedVersion == TlsRecord.VersionTls12 && this.negotiatedCipherSuite != 0xc02f)) {
+            || (selectedVersion == TlsRecord.VersionTls12
+                && this.negotiatedCipherSuite != 0xc02f && this.negotiatedCipherSuite != 0xc02b)) {
             this.Fail("不支持的 TLS 服务器版本或密码套件"); return -1;
         }
         this.transcript.Update(fullMsg);
@@ -997,7 +1022,13 @@ class TlsEngine {
         int scheme = r.ReadU16();
         int sigLen = r.ReadU16();
         if (sigLen < 1 || sigLen != r.Remaining()) { this.Fail("CertificateVerify 签名长度非法"); return -1; }
-        if (scheme != 0x0804) { this.Fail("不支持 TLS 1.3 CertificateVerify 签名方案: " + scheme); return -1; }
+        // 0x0804=rsa_pss_rsae_sha256；0x0805=ecdsa_secp256r1_sha256（显式曲线
+        // 绑定）、0x0403=ecdsa_sha256（曲线由证书密钥决定，RFC 8446 §4.2.3，
+        // OpenSSL 对 EC 证书自身默认即选 0x0403）。两种 EC 方案均为
+        // ECDSA-SHA256，验证语义相同。
+        if (scheme != 0x0804 && scheme != 0x0805 && scheme != 0x0403) {
+            this.Fail("不支持 TLS 1.3 CertificateVerify 签名方案: " + scheme); return -1;
+        }
         byte[] signature = r.ReadBytes(sigLen);
         byte[] hash = this.transcript.CurrentHash();
         byte[] signed = new byte[130];
@@ -1006,7 +1037,19 @@ class TlsEngine {
         for (int i = 0; i < 33; i = i + 1) { signed[64 + i] = (byte)(context[i] & 255); }
         signed[97] = 0;
         NativeMemory.Copy((nint)signed + 98, hash, 32);
-        if (!this.peerCert.VerifyPssSha256(signed, signature)) {
+        // 方案与服务器证书密钥类型必须一致：EC 方案只能由 EC SPKI 验证、
+        // RSA 方案只能由 RSA 证书验证，交叉一律失败关闭。
+        bool ecScheme = scheme == 0x0805 || scheme == 0x0403;
+        if (ecScheme != this.peerCert.HasEcKey()) {
+            this.Fail("CertificateVerify 签名方案与服务器证书密钥类型不符"); return -1;
+        }
+        bool sigOk = false;
+        if (ecScheme) {
+            sigOk = this.peerCert.VerifyEcdsaSha256(signed, signature);
+        } else {
+            sigOk = this.peerCert.VerifyPssSha256(signed, signature);
+        }
+        if (!sigOk) {
             this.Fail("TLS 1.3 CertificateVerify 签名校验失败"); return -1;
         }
         this.handshakeSignatureVerified = true;
@@ -1102,7 +1145,8 @@ class TlsEngine {
         int scheme = r.ReadU16();
         int sigLen = r.ReadU16();
         if (this.isServer || this.negotiatedVersion != TlsRecord.VersionTls12 || this.peerCert == null
-            || this.handshakeSignatureVerified || curveType != 3 || namedCurve != 29 || scheme != 0x0401
+            || this.handshakeSignatureVerified || curveType != 3 || namedCurve != 29
+            || (scheme != 0x0401 && scheme != 0x0403)
             || sigLen <= 0 || sigLen != r.Remaining() || this.clientRandom == null || this.serverRandom == null) {
             this.Fail("ServerKeyExchange 参数或签名算法不受支持"); return -1;
         }
@@ -1111,7 +1155,18 @@ class TlsEngine {
         NativeMemory.Copy(signed, this.clientRandom, 32);
         NativeMemory.Copy((nint)signed + 32, this.serverRandom, 32);
         NativeMemory.Copy((nint)signed + 64, body, 36);
-        if (!this.peerCert.VerifyHandshakeSignature(signed, signature)) {
+        // 方案与服务器证书密钥类型必须一致：0x0403 只能由 EC SPKI 验证、
+        // 0x0401 只能由 RSA 证书验证，交叉一律失败关闭。
+        if ((scheme == 0x0403) != this.peerCert.HasEcKey()) {
+            this.Fail("ServerKeyExchange 签名方案与服务器证书密钥类型不符"); return -1;
+        }
+        bool sigOk = false;
+        if (scheme == 0x0403) {
+            sigOk = this.peerCert.VerifyEcdsaSha256(signed, signature);
+        } else {
+            sigOk = this.peerCert.VerifyHandshakeSignature(signed, signature);
+        }
+        if (!sigOk) {
             this.Fail("TLS 1.2 ServerKeyExchange 签名校验失败"); return -1;
         }
         this.handshakeSignatureVerified = true;
@@ -1245,7 +1300,7 @@ class TlsEngine {
         for (int i = 0; i < csLen; i = i + 2) {
             int suite = r.ReadU16();
             if (suite == 0x1301) { suite13 = true; }
-            if (suite == 0xc02f) { suite12 = true; }
+            if (suite == 0xc02f || suite == 0xc02b) { suite12 = true; }
         }
         int compLen = r.ReadU8();
         if (compLen != 1 || !r.Has(1) || r.ReadU8() != 0) {
@@ -1259,7 +1314,9 @@ class TlsEngine {
         bool hasSigAlgs = false;
         bool hasGroups = false;
         bool sig13 = false;
+        bool sig13Ec = false;
         bool sig12 = false;
+        bool sig12Ec = false;
         bool groupX25519 = false;
         byte[] clientShare = null;
         List<int> seenExtensions = new List<int>();
@@ -1293,7 +1350,9 @@ class TlsEngine {
                     for (int i = 0; i < n; i = i + 2) {
                         int scheme = r.ReadU16();
                         if (scheme == 0x0804) { sig13 = true; }
+                        if (scheme == 0x0805) { sig13Ec = true; this.clientAdvertised0805 = true; }
                         if (scheme == 0x0401) { sig12 = true; }
+                        if (scheme == 0x0403) { sig12Ec = true; this.clientAdvertised0403 = true; }
                     }
                 } else if (extType == 10) { // supported_groups
                     if (hasGroups || extLen < 4) { this.Fail("supported_groups 非法"); return -1; }
@@ -1323,11 +1382,20 @@ class TlsEngine {
         }
         if (!hasVersions) { offered12 = clientVer == TlsRecord.VersionTls12; }
         if (clientVer != TlsRecord.VersionTls12) { this.Fail("ClientHello legacy_version 不受支持"); return -1; }
+        // 服务端按自身证书叶子公钥类型挑客户端广告过的方案：EC 公钥只认
+        // ECDSA 方案（TLS 1.3 的 0x0805/0x0403 均可，TLS 1.2 仅 0x0403），
+        // RSA 公钥只认 RSA 方案；不匹配按无共同算法拒绝。
+        bool srvSig13 = sig13;
+        bool srvSig12 = sig12;
+        if (this.cachedCert != null && this.cachedCert.HasEcKey()) {
+            srvSig13 = sig13Ec || sig12Ec;
+            srvSig12 = sig12Ec;
+        }
         this.transcript.Update(fullMsg);
-        if (!this.disableTls13 && offered13 && suite13 && sig13 && groupX25519 && clientShare != null) {
+        if (!this.disableTls13 && offered13 && suite13 && srvSig13 && groupX25519 && clientShare != null) {
             return this.ServerStartTls13(clientShare);
         }
-        if (offered12 && suite12 && sig12 && groupX25519) { return this.ServerStartTls12(); }
+        if (offered12 && suite12 && srvSig12 && groupX25519) { return this.ServerStartTls12(); }
         this.Fail("ClientHello 无共同 TLS 版本、套件、X25519 或签名算法");
         return -1;
     }
@@ -1479,31 +1547,60 @@ class TlsEngine {
         if (cvHash == null || cvHash.Length != 32) { this.Fail("CertificateVerify transcript 摘要失败"); return -1; }
         NativeMemory.Copy((nint)cvInput + 98, cvHash, 32);
 
-        RsaKey rsaKey = this.cachedKey;
-        if (rsaKey == null) {
-            string privKeyPem = "";
-            if (this.keyFile != null && File.Exists(this.keyFile)) { privKeyPem = File.ReadAllText(this.keyFile); }
-            rsaKey = RsaKey.FromPrivatePem(privKeyPem);
+        // 服务端按自身证书叶子公钥类型选方案（CV 用叶子私钥签名，与证书
+        // 的 issuer 签名算法无关）：EC 公钥选 ECDSA-SHA256 方案（RFC
+        // 8446 §4.2.3 要求用客户端广告过的方案：优先 0x0403=ecdsa_sha256，
+        // 未广告时回落 0x0805=ecdsa_secp256r1_sha256），RSA 公钥
+        // rsa_pss_rsae_sha256；无对应私钥一律失败。
+        bool ecCert = this.cachedCert != null && this.cachedCert.HasEcKey();
+        byte[] sigBytes = null;
+        int cvScheme = 0;
+        if (ecCert) {
+            if (this.clientAdvertised0403) {
+                cvScheme = 0x0403;
+            } else if (this.clientAdvertised0805) {
+                cvScheme = 0x0805;
+            } else {
+                this.Fail("客户端未广告任何 ECDSA 签名方案");
+                return -1;
+            }
+            EcKey ecKey = this.cachedEcKey;
+            if (ecKey == null) {
+                string privKeyPem = "";
+                if (this.keyFile != null && File.Exists(this.keyFile)) { privKeyPem = File.ReadAllText(this.keyFile); }
+                ecKey = EcKey.FromPrivatePem(privKeyPem);
+            }
+            if (ecKey == null) {
+                this.Fail("服务端 EC 私钥加载失败: " + this.keyFile);
+                return -1;
+            }
+            sigBytes = ecKey.SignSha256Det(cvInput.ToStr(0, 130), 130);
+        } else {
+            RsaKey rsaKey = this.cachedKey;
+            if (rsaKey == null) {
+                string privKeyPem = "";
+                if (this.keyFile != null && File.Exists(this.keyFile)) { privKeyPem = File.ReadAllText(this.keyFile); }
+                rsaKey = RsaKey.FromPrivatePem(privKeyPem);
+            }
+            if (rsaKey == null || !rsaKey.HasPrivateKey()) {
+                this.Fail("服务端私钥加载失败: " + this.keyFile);
+                return -1;
+            }
+            sigBytes = rsaKey.SignPssSha256Raw(cvInput, 130);
+            cvScheme = 0x0804;
         }
-        if (rsaKey == null || !rsaKey.HasPrivateKey()) {
-            this.Fail("服务端私钥加载失败: " + this.keyFile);
-            return -1;
-        }
-
-        byte[] sigBytes = rsaKey.SignPssSha256Raw(cvInput, 130);
-        if (sigBytes == null || sigBytes.Length != rsaKey.ModulusLength()) {
-            this.Fail("RSA-PSS CertificateVerify 签名失败");
+        if (sigBytes == null) {
+            this.Fail("CertificateVerify 签名失败");
             return -1;
         }
 
         TlsByteWriter cvMsg = new TlsByteWriter();
         cvMsg.WriteU8(TlsRecord.HandshakeCertificateVerify);
         cvMsg.WriteU24(4 + sigBytes.Length);
-        cvMsg.WriteU16(0x0804); // rsa_pss_rsae_sha256
+        cvMsg.WriteU16(cvScheme);
         cvMsg.WriteU16(sigBytes.Length);
         cvMsg.WriteBytes(sigBytes);
         byte[] cvBytes = cvMsg.ToArray();
-
         this.transcript.Update(cvBytes);
         byte[] recCV = this.writeCipher.Encrypt(TlsRecord.ContentTypeHandshake, cvBytes, 0, cvBytes.Length);
         this.outNet.WriteBytes(recCV);
@@ -1545,7 +1642,14 @@ class TlsEngine {
 
     int ServerStartTls12() {
         this.negotiatedVersion = TlsRecord.VersionTls12;
-        this.negotiatedCipherSuite = 0xc02f; // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        // 套件与证书叶子公钥类型绑定：EC 公钥 ECDHE_ECDSA(0xc02b)，
+        // RSA 公钥 ECDHE_RSA(0xc02f)。
+        bool tls12EcCert = this.cachedCert != null && this.cachedCert.HasEcKey();
+        if (tls12EcCert) {
+            this.negotiatedCipherSuite = 0xc02b; // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        } else {
+            this.negotiatedCipherSuite = 0xc02f; // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        }
         this.serverRandom = RandomBytes(32);
         if (this.serverRandom == null) { this.Fail("TLS 1.2 随机数生成失败"); return -1; }
 
@@ -1621,18 +1725,38 @@ class TlsEngine {
         for (int i = 0; i < 32; i = i + 1) { toSign[32 + i] = this.serverRandom[i]; }
         for (int i = 0; i < 36; i = i + 1) { toSign[64 + i] = paramsBytes[i]; }
 
-        RsaKey rsaKey = this.cachedKey;
-        if (rsaKey == null) {
-            string privKeyPem = "";
-            if (this.keyFile != null && File.Exists(this.keyFile)) { privKeyPem = File.ReadAllText(this.keyFile); }
-            rsaKey = RsaKey.FromPrivatePem(privKeyPem);
+        // 与 TLS 1.3 同一分派：EC 证书 ecdsa_sha256(0x0403)，RSA 证书
+        // rsa_pkcs1_sha256(0x0401)；无对应私钥一律失败。
+        bool ecCert = this.cachedCert != null && this.cachedCert.SigIsEcdsa();
+        byte[] sigBytes = null;
+        int skeScheme = 0;
+        if (ecCert) {
+            EcKey ecKey = this.cachedEcKey;
+            if (ecKey == null) {
+                string privKeyPem = "";
+                if (this.keyFile != null && File.Exists(this.keyFile)) { privKeyPem = File.ReadAllText(this.keyFile); }
+                ecKey = EcKey.FromPrivatePem(privKeyPem);
+            }
+            if (ecKey == null) {
+                this.Fail("服务端 EC 私钥加载失败: " + this.keyFile);
+                return -1;
+            }
+            sigBytes = ecKey.SignSha256Det(toSign.ToStr(0, 100), 100);
+            skeScheme = 0x0403;
+        } else {
+            RsaKey rsaKey = this.cachedKey;
+            if (rsaKey == null) {
+                string privKeyPem = "";
+                if (this.keyFile != null && File.Exists(this.keyFile)) { privKeyPem = File.ReadAllText(this.keyFile); }
+                rsaKey = RsaKey.FromPrivatePem(privKeyPem);
+            }
+            if (rsaKey == null || !rsaKey.HasPrivateKey()) {
+                this.Fail("服务端私钥加载失败: " + this.keyFile);
+                return -1;
+            }
+            sigBytes = rsaKey.SignSha256Raw(toSign.ToStr(0, 100), 100);
+            skeScheme = 0x0401;
         }
-        if (rsaKey == null || !rsaKey.HasPrivateKey()) {
-            this.Fail("服务端私钥加载失败: " + this.keyFile);
-            return -1;
-        }
-
-        byte[] sigBytes = rsaKey.SignSha256Raw(toSign.ToStr(0, 100), 100);
         if (sigBytes == null) {
             this.Fail("ServerKeyExchange 签名失败");
             return -1;
@@ -1642,7 +1766,7 @@ class TlsEngine {
         skeMsg.WriteU8(TlsRecord.HandshakeServerKeyExchange);
         skeMsg.WriteU24(36 + 4 + sigBytes.Length);
         skeMsg.WriteBytes(paramsBytes);
-        skeMsg.WriteU16(0x0401); // rsa_pkcs1_sha256
+        skeMsg.WriteU16(skeScheme);
         skeMsg.WriteU16(sigBytes.Length);
         skeMsg.WriteBytes(sigBytes);
         byte[] skeBytes = skeMsg.ToArray();
@@ -1881,12 +2005,14 @@ class TlsEngine {
 
         // 5. cipher_suites
         if (this.disableTls13) {
-            w.WriteU16(2);
-            w.WriteU16(0xc02f); // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-        } else {
             w.WriteU16(4);
+            w.WriteU16(0xc02f); // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+            w.WriteU16(0xc02b); // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        } else {
+            w.WriteU16(6);
             w.WriteU16(0x1301); // TLS_AES_128_GCM_SHA256
             w.WriteU16(0xc02f); // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+            w.WriteU16(0xc02b); // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
         }
 
         // 6. legacy_compression_methods (0x01, 0x00)
@@ -1924,10 +2050,12 @@ class TlsEngine {
 
         // 7.4 signature_algorithms (0x000d)
         extWriter.WriteU16(13);
-        extWriter.WriteU16(6);
-        extWriter.WriteU16(4);
+        extWriter.WriteU16(10);
+        extWriter.WriteU16(8);
         extWriter.WriteU16(0x0804); // rsa_pss_rsae_sha256
+        extWriter.WriteU16(0x0805); // ecdsa_secp256r1_sha256
         extWriter.WriteU16(0x0401); // rsa_pkcs1_sha256 (TLS 1.2 only)
+        extWriter.WriteU16(0x0403); // ecdsa_sha256 (TLS 1.2 与 TLS 1.3 均可)
 
         // 7.5 TLS 1.3 专属扩展: supported_versions (0x002b) + key_share (0x0033)
         if (!this.disableTls13) {
