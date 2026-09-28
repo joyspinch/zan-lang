@@ -1105,12 +1105,13 @@
       top.innerHTML = ts.length
         ? ts.map(function (s) {
             return '<tr><td class="ellip mono" title="' + esc(s.sql) + '">' +
-                   esc(s.sql) + '</td><td class="num">' + (s.count || 0) +
+                   esc(s.sql) + '</td><td class="ops"><button class="link-btn" type="button" data-sql-preview="' +
+                   esc(s.sql) + '">查看 SQL</button></td><td class="num">' + (s.count || 0) +
                    '</td><td class="num">' + dur(s.avg_us) +
                    '</td><td class="num">' + dur(s.max_us) +
                    '</td><td class="num">' + dur(s.total_us) + '</td></tr>';
           }).join('')
-        : '<tr><td colspan="5" class="muted">暂无 SQL 记录</td></tr>';
+        : '<tr><td colspan="6" class="muted">暂无 SQL 记录</td></tr>';
     }
   }
 
@@ -1241,8 +1242,15 @@
         var tip = monTip();
         tip.innerHTML = html;
         tip.style.display = 'block';
-        tip.style.left = (ev.clientX + 12) + 'px';
-        tip.style.top = (ev.clientY + 12) + 'px';
+        var gap = 12;
+        var x = ev.clientX + gap;
+        var y = ev.clientY + gap;
+        var tw = tip.offsetWidth;
+        var th = tip.offsetHeight;
+        if (x + tw > window.innerWidth - 8) { x = ev.clientX - tw - gap; }
+        if (y + th > window.innerHeight - 8) { y = ev.clientY - th - gap; }
+        tip.style.left = Math.max(8, x) + 'px';
+        tip.style.top = Math.max(8, y) + 'px';
       });
       c.addEventListener('mouseleave', function () {
         c._render(-1);
@@ -1478,6 +1486,17 @@
       }
       var path = href.charAt(0) === '?' ? base(state.active) + href : href;
       open(path, l.getAttribute('data-title') || l.textContent.trim());
+      return;
+    }
+    var preview = ev.target.closest('[data-sql-preview], [data-text-preview]');
+    if (preview) {
+      ev.preventDefault();
+      var text = preview.getAttribute('data-sql-preview') ||
+                 preview.getAttribute('data-text-preview') || '';
+      var content = '<div class="text-preview"><pre class="sql-detail-code mono">' +
+                    esc(text) + '</pre><p class="hint">内容仅来自当前已脱敏的监控快照，不含请求参数。</p></div>';
+      Layer.open({ title: preview.hasAttribute('data-text-preview') ? '错误详情' : 'SQL 模板详情',
+                   content: content, wide: true });
       return;
     }
     var d = ev.target.closest('[data-dialog]');
