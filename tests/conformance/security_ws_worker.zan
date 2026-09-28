@@ -1,0 +1,73 @@
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+using System.Threading;
+
+class Program {
+    static int PORT = 29417;
+    static string key = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+    static string valid = "GET / HTTP/1.1\r\nHost: local\r\nUpgrade: WebSocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Version: 13\r\n" + key + "\r\n";
+
+    static async string Exchange(string request) {
+        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT);
+        if (c == null) { return ""; }
+        int _s = await c.SendAsync(request);
+        string reply = await c.RecvAsync(4096, 2000);
+        c.Close();
+        return reply;
+    }
+
+    static string Status(string request) {
+        return request.Length >= 12 ? request.Substring(9, 3) : "short";
+    }
+
+    static async string FrameResult(byte firstByte) {
+        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT);
+        if (c == null) { return "connect"; }
+        int _s = await c.SendAsync(valid);
+        string head = await c.RecvAsync(4096, 2000);
+        if (Status(head) != "101") { c.Close(); return "handshake"; }
+        byte[] frame = new byte[] { firstByte, 129, 1, 2, 3, 4, 112 };
+        int _f = await c.SendBytesAsync(frame, 7);
+        byte[] response = new byte[32];
+        int n = await Socket.RecvBytesAsync(c.GetSocket(), response, 32);
+        string outcome = n >= 4 && (response[0] & 255) == 136
+            && (response[1] & 255) == 2 && (response[2] & 255) == 3
+            && (response[3] & 255) == 234 ? "1002" : "FAIL";
+        c.Close();
+        return outcome;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Worker ws = new Worker("websocket", "127.0.0.1", PORT);
+        WorkerWs.Install();
+        nint listenSock = ws.BindSocket(false);
+        if (listenSock < 0) { Console.WriteLine("listen=FAIL"); WorkerWs.Uninstall(); return 0; }
+        List<nint> socks = new List<nint>();
+        socks.Add(listenSock);
+        Task.Spawn(Worker.RunAllLoopsOnSockets(socks));
+        string yes = await Exchange(valid);
+        Console.WriteLine("valid=" + (Status(yes) == "101" ? "ok" : "FAIL"));
+        string badMethod = await Exchange(valid.Replace("GET /", "POST /"));
+        Console.WriteLine("method=" + (Status(badMethod) == "400" ? "ok" : "FAIL"));
+        string badVersion = await Exchange(valid.Replace("Version: 13", "Version: 12"));
+        Console.WriteLine("version=" + (Status(badVersion) == "400" ? "ok" : "FAIL"));
+        string badKey = await Exchange(valid.Replace("dGhlIHNhbXBsZSBub25jZQ==", "YWJj"));
+        Console.WriteLine("key=" + (Status(badKey) == "400" ? "ok" : "FAIL"));
+        string plain = await Exchange("GET /plain HTTP/1.1\r\nHost: local\r\n\r\n");
+        Console.WriteLine("plain=" + (Status(plain) == "200" ? "ok" : "FAIL"));
+        Console.WriteLine("rsv=" + (await FrameResult((byte)193)));
+        Console.WriteLine("control_fin=" + (await FrameResult((byte)9)));
+        ws.Stop();
+        Socket.Close(listenSock);
+        WorkerWs.Uninstall();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return 0;
+    }
+
+    static void Main() {
+        int _r = await Run();
+    }
+}

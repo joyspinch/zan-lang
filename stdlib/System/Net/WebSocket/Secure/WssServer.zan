@@ -108,23 +108,6 @@ class WssServer {
         }
     }
 
-    /// Upgrade 头是否为 "websocket"（RFC 7230 令牌比较：大小写
-    /// 不敏感、容忍尾部空白）。
-    static bool IsUpgradeToken(string value) {
-        // 大小写不敏感并容忍尾部空白（RFC 7230 令牌比较）；
-        // 此前只认 "websocket"/"Websocket" 两种拼写。
-        int end = value.Length;
-        while (end > 0 && (value[end - 1] & 255) == 32) { end = end - 1; }
-        if (end != 9) { return false; }
-        const string want = "websocket";
-        for (int i = 0; i < 9; i = i + 1) {
-            int x = value[i] & 255;
-            if (x >= 65 && x <= 90) { x = x + 32; }
-            if (x != (want[i] & 255)) { return false; }
-        }
-        return true;
-    }
-
     /// 单条连接的生命周期：TLS 握手 → WebSocket Upgrade（缺 Upgrade
     /// 或 Sec-WebSocket-Key 时回 400）→ 帧循环（Ping→Pong、Close 应答
     /// 并断开、协议违规回 1002/1009 关闭帧）；每条消息交
@@ -172,29 +155,16 @@ class WssServer {
             }
             if (!alive) { return; }
 
-            string head = reader.Slice(headerEnd);
+            string head = reader.Slice(headerEnd + 4);
             if (HttpDeadline.Expired(watch)) { return; }
             HttpRequest req = HttpRequest.Parse(head);
 
-            string upgrade = req.GetHeader("Upgrade");
-            if (!WssServer.IsUpgradeToken(upgrade)) {
-                HttpResponse resp = HttpResponse.WithStatus(400, "Bad Request", "Expected WebSocket upgrade");
-                string data = resp.Build();
-                int _b = await stream.SendAsync(data, data.Length);
-                stream.Close();
-                Socket.Close(clientSock);
-                return;
-            }
-
-            string wsKey = req.GetHeader("Sec-WebSocket-Key");
-            if (wsKey == null || wsKey.Length < 16) {
-                HttpResponse bad = HttpResponse.WithStatus(400, "Bad Request", "missing Sec-WebSocket-Key");
-                string badData = bad.Build();
+            if (!WsHandshake.Valid(req)) {
+                string badData = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                 int _e = await stream.SendAsync(badData, badData.Length);
-                stream.Close();
-                Socket.Close(clientSock);
                 return;
             }
+            string wsKey = req.GetHeader("Sec-WebSocket-Key");
             string acceptKey = Encoding.WebSocketAccept(wsKey);
 
             StringBuilder sb = new StringBuilder();
@@ -240,9 +210,10 @@ class WssServer {
 
                 // RFC 6455 入站帧门禁（与 Worker 同一契约）：保留
                 // opcode、控制帧载荷 >125、未掩码客户端帧 → 1002 断开。
-                bool protoErr = frame.opcode >= 3 && frame.opcode <= 7
+                bool protoErr = frame.rsv != 0
+                    || frame.opcode >= 3 && frame.opcode <= 7
                     || frame.opcode >= 11 && frame.opcode <= 15
-                    || frame.opcode >= 8 && frame.payloadLen > 125
+                    || frame.opcode >= 8 && (!frame.fin || frame.payloadLen > 125)
                     || !frame.masked;
                 if (protoErr) {
                     byte[] enc = WsFrame.CloseFrameWithCode(1002).Encode();

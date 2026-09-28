@@ -1,0 +1,47 @@
+using System;
+using System.Net.Http;
+using System.Net.WebSocket;
+using System.Net.Sockets;
+
+class Program {
+    static string headers = "Host: example.test\r\nUpgrade: WebSocket\r\nConnection: keep-alive, UpGrAdE\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+
+    static void Check(string label, string request, bool expected) {
+        bool valid = WsHandshake.Valid(HttpRequest.Parse(request));
+        Console.WriteLine(label + "=" + (valid == expected ? "ok" : "FAIL"));
+    }
+
+    static async int Run() {
+        string good = "GET /socket HTTP/1.1\r\n" + headers + "\r\n";
+        Check("valid", good, true);
+        Check("post", "POST /socket HTTP/1.1\r\n" + headers + "\r\n", false);
+        Check("http10", "GET /socket HTTP/1.0\r\n" + headers + "\r\n", false);
+        Check("bad_request", "GET  HTTP/1.1\r\n" + headers + "\r\n", false);
+        Check("bad_header", "GET / HTTP/1.1\r\n" + headers + "broken-header\r\n\r\n", false);
+        Check("duplicate_host", "GET / HTTP/1.1\r\n" + headers + "Host: second.test\r\n\r\n", false);
+        Check("missing_host", "GET / HTTP/1.1\r\n" + headers.Replace("Host: example.test\r\n", "") + "\r\n", false);
+        Check("missing_upgrade", "GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", false);
+        Check("fake_upgrade", "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocketeer\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", false);
+        Check("missing_connection", "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", false);
+        Check("fake_connection", "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: upgraded\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", false);
+        Check("bad_version", "GET / HTTP/1.1\r\n" + headers.Replace("Sec-WebSocket-Version: 13", "Sec-WebSocket-Version: 12") + "\r\n", false);
+        Check("short_key", "GET / HTTP/1.1\r\n" + headers.Replace("dGhlIHNhbXBsZSBub25jZQ==", "YWJj") + "\r\n", false);
+        Check("bad_base64", "GET / HTTP/1.1\r\n" + headers.Replace("dGhlIHNhbXBsZSBub25jZQ==", "!!!!!!!!!!!!!!!!!!!!!!!!") + "\r\n", false);
+        Check("bad_padding", "GET / HTTP/1.1\r\n" + headers.Replace("dGhlIHNhbXBsZSBub25jZQ==", "dGhlIHNhbXBsZSBub25jZQ=A") + "\r\n", false);
+        Check("bad_framing", "GET / HTTP/1.1\r\n" + headers + "Content-Length: 3\r\nContent-Length: 4\r\n\r\n", false);
+        // Unresolvable host must fail rather than dereference a null sockaddr.
+        Socket.Initialize();
+        nint udp = Socket.CreateUdp();
+        if (udp >= 0) {
+            Socket.SetNonBlocking(udp);
+            int sent = await Socket.SendToAsync(udp, "x", 1, "", 53);
+            Console.WriteLine("udp_dns_failure=" + (sent == -1 ? "ok" : "FAIL"));
+            Socket.Close(udp);
+        } else { Console.WriteLine("udp_dns_failure=FAIL"); }
+        return 0;
+    }
+
+    static void Main() {
+        int _r = await Run();
+    }
+}

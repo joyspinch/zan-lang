@@ -374,13 +374,22 @@ class WorkerWs {
         }
         HttpRequest req = HttpRequest.Parse(framer.Head(headerEnd), headerEnd);
         string wsKey = req.GetHeader("Sec-WebSocket-Key");
+        bool wantsUpgrade = wsKey.Length > 0
+            || req.GetHeader("Upgrade").Length > 0
+            || req.GetHeader("Sec-WebSocket-Version").Length > 0
+            || WsHandshake.HasToken(req.GetHeader("Connection"), "upgrade");
 
-        if (wsKey.Length == 0) {
-            // Plain HTTP on the same port. The framer already holds the head
-            // (and whatever followed it), so it is handed to the HTTP loop
-            // as-is rather than re-read or converted back to a string.
+        if (!wantsUpgrade && req.parseStatus == 0) {
+            // Plain HTTP on the same port keeps the framer's buffered bytes.
             await HttpServer.ServeFramed(clientSock, w.RequestHandler(), framer,
                 w.maxHeaderBytes, w.maxRequestBytes, w.requestTimeout);
+            w.DropConn();
+            return;
+        }
+        if (!WsHandshake.Valid(req)) {
+            int _bad = await client.SendAsync("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            framer.Dispose();
+            client.Close();
             w.DropConn();
             return;
         }
@@ -453,9 +462,10 @@ class WorkerWs {
             // RFC 6455 入站帧门禁：§5.2 保留 opcode（3-7 数据、11-15
             // 控制）、§5.5 控制帧载荷 ≤125、§5.1 客户端帧必须掩码。
             // 此前非法 opcode 落进数据帧路径被原样回显给对端。
-            bool protoErr = frame.opcode >= 3 && frame.opcode <= 7
+            bool protoErr = frame.rsv != 0
+                || frame.opcode >= 3 && frame.opcode <= 7
                 || frame.opcode >= 11 && frame.opcode <= 15
-                || frame.opcode >= 8 && frame.payloadLen > 125
+                || frame.opcode >= 8 && (!frame.fin || frame.payloadLen > 125)
                 || !frame.masked;
             if (protoErr) {
                 byte[] enc = WsFrame.CloseFrameWithCode(1002).Encode();
