@@ -525,6 +525,7 @@ static void resolve_qualified_receiver(nr_ctx_t *c, zan_ast_node_t *recv) {
     }
     recv->kind = AST_IDENTIFIER;
     recv->ident.name = t->final;
+    recv->ident.inst_type_ref = NULL;
     if (c->refs) zan_refs_add(c->refs, t->final, c->arena);
 }
 

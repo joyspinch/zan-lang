@@ -181,6 +181,10 @@
   并行跑时有 4 测偶红（async_try_exit_depth/mqtt_loopback/win_tray_screen_smoke/
   gui_datatable_ctxmenu_selection），单测复跑双配置均绿，判并行资源抖动非回归。
 
+## 编译内存后续（2026-09-28）
+
+- [ ] **A-MEM1** 大型发布 IRGen 与前端 AST 仍同时存活，且单模块建出大量未用方法体：冻结的 OnePlus 输入产生约 285 万 AST 节点、18,628 个 IR 定义和 402 万条指令；压紧节点并在 IRGen 后释放前端使峰值 Commit 2,022→1,530 MB，但 1,530 MB 仍发生在 IRGen。后续按声明/具体泛型实例做保守的体可达固定点，保护 Main、静态初始化、构造链、委托、虚表、反射和库导出；若仍由单模块主导，再设计可销毁的 LLVM 分片与对象归属。复测时重新冻结 OnePlus 源/设计文件清单与哈希，在相同参数及工具链下 A/B，补不可达体压力用例；不能拿 LLVM GlobalDCE 冒充生成前裁剪。
+
 ## 通讯安全余量（2026-09-28）
 
 - [ ] **B-NET1** Windows/macOS 的默认 HTTPS/WSS 客户端缺系统链策略桥接，当前无显式 `AddTrustedCert` 会失败关闭。不能仅枚举 ROOT/keychain：那会丢弃系统拒绝列表、用途与吊销策略。需以收到的原始 DER 链和预期主机名调用 Crypt32 SSL 链策略 / macOS SecTrust，并保留 TLS 握手签名、Finished 与 pin 校验；回归覆盖受信任、错误主机、受禁根、过期和平台 API 不可用。

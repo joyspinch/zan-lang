@@ -5,8 +5,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+_Static_assert(sizeof(zan_ast_node_t) <= 224, "AST node layout regressed");
+
+static size_t g_ast_node_count;
+
+size_t zan_ast_node_count(void) { return g_ast_node_count; }
+
 zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t loc) {
     zan_ast_node_t *node = (zan_ast_node_t *)zan_arena_alloc(arena, sizeof(zan_ast_node_t));
+    g_ast_node_count++;
     node->kind = kind;
     node->loc = loc;
     node->lit_suffix = 0;
@@ -23,9 +30,6 @@ zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t l
     node->ns_name.str = NULL; node->ns_name.len = 0;
     node->orig_name.str = NULL; node->orig_name.len = 0;
     node->ns_usings = NULL;
-    node->inst_type_ref = NULL;
-    node->rt_type = NULL;
-    node->rt_scope = NULL;
     return node;
 }
 

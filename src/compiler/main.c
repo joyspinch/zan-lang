@@ -1940,7 +1940,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
         /* a bare identifier expression is a variable/delegate call, never
          * a type mention; a generic type in expression position carries
          * the type in inst_type_ref */
-        pi_seed_ast(n->inst_type_ref);
+        pi_seed_ast(n->ident.inst_type_ref);
         return;
     case AST_BINARY:
     case AST_ASSIGNMENT:
@@ -4347,6 +4347,7 @@ int main(int argc, char **argv) {
     if (zan_diag_has_errors(diag)) {
         fprintf(stderr, "\n%d error(s), %d warning(s)\n",
                 diag->error_count, diag->warning_count);
+        zan_diag_free_buffers(diag);
         zan_arena_free(arena);
         free(source);
         return 1;
@@ -4375,6 +4376,7 @@ int main(int argc, char **argv) {
     if (zan_diag_has_errors(diag)) {
         fprintf(stderr, "\n%d error(s) after type checking\n",
                 diag->error_count);
+        zan_diag_free_buffers(diag);
         zan_arena_free(arena);
         free(source);
         return 1;
@@ -4472,12 +4474,22 @@ int main(int argc, char **argv) {
      * --arc-guard trap supersedes it; an explicit --no-arc-guard is the
      * perf-paranoid escape hatch that turns the net off too. */
     bool arc_net = publish_mode && arc_guard_opt != 1 && arc_guard_opt != 0;
-    if (zan_irgen_init(&irgen, arena, diag, &binder, input_file,
+    zan_arena_t *ir_arena = zan_arena_new();
+    if (!ir_arena) {
+        fprintf(stderr, "error: failed to allocate code-generation arena\n");
+        zan_diag_free_buffers(diag);
+        zan_arena_free(arena);
+        free(source);
+        return 1;
+    }
+    if (zan_irgen_init(&irgen, ir_arena, diag, &binder, input_file,
                        irgen_triple,
                        target.os == ZAN_OS_WINDOWS, external_async_executor,
                        check_leaks, runtime_checks, arc_guard,
                        arc_net) != ZAN_OK) {
         fprintf(stderr, "error: failed to initialize code generator\n");
+        zan_diag_free_buffers(diag);
+        zan_arena_free(ir_arena);
         zan_arena_free(arena);
         free(source);
         return 1;
@@ -4502,14 +4514,64 @@ int main(int argc, char **argv) {
 
     if (zan_irgen_emit(&irgen, ast) != ZAN_OK) {
         fprintf(stderr, "error: code generation failed\n");
+        zan_diag_free_buffers(irgen.diag);
         zan_irgen_destroy(&irgen);
+        zan_arena_free(ir_arena);
         zan_arena_free(arena);
         free(source);
         return 1;
     }
 
     phase("irgen");
-    if (g_time_phases) zan_arena_dump_stats();
+    if (g_time_phases) {
+        size_t definitions = 0, declarations = 0, blocks = 0, instructions = 0;
+        for (LLVMValueRef fn = LLVMGetFirstFunction(irgen.mod); fn;
+             fn = LLVMGetNextFunction(fn)) {
+            LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
+            if (!bb) { declarations++; continue; }
+            definitions++;
+            for (; bb; bb = LLVMGetNextBasicBlock(bb)) {
+                blocks++;
+                for (LLVMValueRef inst = LLVMGetFirstInstruction(bb); inst;
+                     inst = LLVMGetNextInstruction(inst)) instructions++;
+            }
+        }
+        fprintf(stderr, "IR stats: %zu AST nodes created; %zu defined functions, "
+                "%zu declarations, %zu blocks, %zu instructions\n",
+                zan_ast_node_count(), definitions, declarations, blocks, instructions);
+        zan_arena_dump_stats();
+    }
+
+    /* The AST, binder and source excerpts are no longer needed by LLVM passes.
+     * Keep the few DllImport names read by linker preflight and late pruning in
+     * the code-generation arena before releasing the entire frontend graph. */
+    for (int i = 0; i < irgen.extern_lib_count; i++) {
+        zan_istr_t *lib = &irgen.extern_libs[i];
+        lib->str = zan_arena_strdup(ir_arena, lib->str, lib->len);
+    }
+    for (int i = 0; i < irgen.extern_fn_count; i++) {
+        zan_istr_t *lib = &irgen.extern_fns[i].lib;
+        zan_istr_t *name = &irgen.extern_fns[i].name;
+        lib->str = zan_arena_strdup(ir_arena, lib->str, lib->len);
+        name->str = zan_arena_strdup(ir_arena, name->str, name->len);
+    }
+    zan_diag_t *ir_diag = (zan_diag_t *)zan_arena_alloc(ir_arena, sizeof(*ir_diag));
+    *ir_diag = *diag;
+    ir_diag->file_sources = NULL;
+    const char **ir_file_names = (const char **)malloc(
+        (size_t)ir_diag->file_count * sizeof(*ir_file_names));
+    for (int i = 0; i < ir_diag->file_count; i++)
+        ir_file_names[i] = zan_arena_strdup(ir_arena,
+            ir_diag->file_names[i], strlen(ir_diag->file_names[i]));
+    ir_diag->file_names = ir_file_names;
+    ir_diag->entries = NULL;
+    ir_diag->entry_count = ir_diag->entry_cap = 0;
+    irgen.diag = ir_diag;
+    zan_diag_free_buffers(diag);
+    zan_arena_free(arena);
+    arena = NULL;
+    g_main_arena = ir_arena;
+    irgen.binder = NULL;
 
     /* ---- optimize ---- */
     zan_opt_level_t effective_opt = ZAN_OPT_NONE;
@@ -4535,7 +4597,7 @@ int main(int argc, char **argv) {
      * literal table then read NULLs on rv32, whose real layout is 32-bit). */
     zan_irgen_bind_target(&irgen);
     if (effective_opt > ZAN_OPT_NONE) {
-        zan_opt_report_t opt_report = zan_optimize(&irgen, &binder, effective_opt);
+        zan_opt_report_t opt_report = zan_optimize(&irgen, NULL, effective_opt);
         zan_opt_report_print(&opt_report);
         zan_irgen_prune_extern_libs(&irgen);
     } else {
@@ -4565,7 +4627,9 @@ int main(int argc, char **argv) {
     if (do_emit_ir) {
         if (zan_irgen_write_ir(&irgen, NULL) != ZAN_OK) {
             fprintf(stderr, "error: failed to write LLVM IR\n");
+            zan_diag_free_buffers(irgen.diag);
             zan_irgen_destroy(&irgen);
+            zan_arena_free(ir_arena);
             zan_arena_free(arena);
             free(source);
             return 1;
@@ -5428,7 +5492,9 @@ int main(int argc, char **argv) {
             int nres = zan_embed_emit_specs_filtered(&irgen, embed_specs,
                 embed_spec_count, skin_filter, skin_filter_count);
             if (nres < 0) {
+                zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
+                zan_arena_free(ir_arena);
                 zan_arena_free(arena);
                 free(source);
                 return 1;
@@ -5441,7 +5507,9 @@ int main(int argc, char **argv) {
         phase("optimize");
         if (zan_irgen_write_obj(&irgen, obj_tmp) != ZAN_OK) {
             fprintf(stderr, "error: failed to emit object file\n");
+            zan_diag_free_buffers(irgen.diag);
             zan_irgen_destroy(&irgen);
+            zan_arena_free(ir_arena);
             zan_arena_free(arena);
             free(source);
             return 1;
@@ -5634,7 +5702,9 @@ int main(int argc, char **argv) {
                             "(see scripts/build_*_rt.sh)\n",
                             tsub, rt_timer_buf, tsub);
                     remove(obj_tmp);
+                    zan_diag_free_buffers(irgen.diag);
                     zan_irgen_destroy(&irgen);
+                    zan_arena_free(ir_arena);
                     zan_arena_free(arena);
                     free(source);
                     return 1;
@@ -5689,7 +5759,9 @@ int main(int argc, char **argv) {
                         "error: AtomicInt and SharedTable are not available for "
                         "this cross-compilation target yet\n");
                 remove(obj_tmp);
+                zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
+                zan_arena_free(ir_arena);
                 zan_arena_free(arena);
                 free(source);
                 return 1;
@@ -5933,7 +6005,9 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "error: failed to write static library '%s'\n",
                             obj_path);
                     remove(obj_tmp);
+                    zan_diag_free_buffers(irgen.diag);
                     zan_irgen_destroy(&irgen);
+                    zan_arena_free(ir_arena);
                     zan_arena_free(arena);
                     free(source);
                     return 1;
@@ -5949,7 +6023,9 @@ int main(int argc, char **argv) {
                                 "cross-compilation target; link a static "
                                 "library instead\n");
                         remove(obj_tmp);
+                        zan_diag_free_buffers(irgen.diag);
                         zan_irgen_destroy(&irgen);
+                        zan_arena_free(ir_arena);
                         zan_arena_free(arena);
                         free(source);
                         return 1;
@@ -5998,7 +6074,9 @@ int main(int argc, char **argv) {
                                 "scripts/build_*_rt.sh)\n",
                                 target_rt_sub, missing, target_rt_sub);
                         remove(obj_tmp);
+                        zan_diag_free_buffers(irgen.diag);
                         zan_irgen_destroy(&irgen);
+                        zan_arena_free(ir_arena);
                         zan_arena_free(arena);
                         free(source);
                         return 1;
@@ -6287,7 +6365,9 @@ int main(int argc, char **argv) {
                                 "at '%s'; reinstall zan or rebuild with "
                                 "toolchain/macos present\n", tbd);
                         remove(obj_tmp);
+                        zan_diag_free_buffers(irgen.diag);
                         zan_irgen_destroy(&irgen);
+                        zan_arena_free(ir_arena);
                         zan_arena_free(arena);
                         free(source);
                         return 1;
@@ -6357,7 +6437,9 @@ int main(int argc, char **argv) {
                                 "toolchain/%s present\n",
                                 asub3, sys3, asub3);
                         remove(obj_tmp);
+                        zan_diag_free_buffers(irgen.diag);
                         zan_irgen_destroy(&irgen);
+                        zan_arena_free(ir_arena);
                         zan_arena_free(arena);
                         free(source);
                         return 1;
@@ -6476,7 +6558,9 @@ int main(int argc, char **argv) {
                                 "toolchain/%s present\n",
                                 osub, sys4, osub);
                         remove(obj_tmp);
+                        zan_diag_free_buffers(irgen.diag);
                         zan_irgen_destroy(&irgen);
+                        zan_arena_free(ir_arena);
                         zan_arena_free(arena);
                         free(source);
                         return 1;
@@ -6535,7 +6619,9 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "error: shared libraries are not supported "
                             "for this target yet\n");
                     remove(obj_tmp);
+                    zan_diag_free_buffers(irgen.diag);
                     zan_irgen_destroy(&irgen);
+                    zan_arena_free(ir_arena);
                     zan_arena_free(arena);
                     free(source);
                     return 1;
@@ -6724,7 +6810,9 @@ int main(int argc, char **argv) {
                         "'%s'; reinstall zan or rebuild with toolchain/%s "
                         "present\n", osub, sys, osub);
                 remove(obj_tmp);
+                zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
+                zan_arena_free(ir_arena);
                 zan_arena_free(arena);
                 free(source);
                 return 1;
@@ -6965,7 +7053,9 @@ int main(int argc, char **argv) {
                         "reinstall zan or rebuild with toolchain/%s present\n",
                         wsub, syslib, wsub);
                 remove(obj_tmp);
+                zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
+                zan_arena_free(ir_arena);
                 zan_arena_free(arena);
                 free(source);
                 return 1;
@@ -7005,7 +7095,9 @@ int main(int argc, char **argv) {
                         "present (see scripts/build_win_rt.sh)\n",
                         wsub, exe_dir2, wsub, wsub);
                 remove(obj_tmp);
+                zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
+                zan_arena_free(ir_arena);
                 zan_arena_free(arena);
                 free(source);
                 return 1;
@@ -7118,7 +7210,9 @@ int main(int argc, char **argv) {
                         "'%s'; reinstall zan or rebuild with "
                         "toolchain/wasm32 present\n", sys);
                 remove(obj_tmp);
+                zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
+                zan_arena_free(ir_arena);
                 zan_arena_free(arena);
                 free(source);
                 return 1;
@@ -7145,7 +7239,9 @@ int main(int argc, char **argv) {
                             "error: socket-async programs are not available for "
                             "the wasm32 target\n");
                     remove(obj_tmp);
+                    zan_diag_free_buffers(irgen.diag);
                     zan_irgen_destroy(&irgen);
+                    zan_arena_free(ir_arena);
                     zan_arena_free(arena);
                     free(source);
                     return 1;
@@ -7217,7 +7313,9 @@ int main(int argc, char **argv) {
                                 "runtime object at '%s'; rebuild it with "
                                 "scripts\\build_cross_rt.cmd\n", guiobj);
                         remove(obj_tmp);
+                        zan_diag_free_buffers(irgen.diag);
                         zan_irgen_destroy(&irgen);
+                        zan_arena_free(ir_arena);
                         zan_arena_free(arena);
                         free(source);
                         return 1;
@@ -7298,7 +7396,9 @@ int main(int argc, char **argv) {
                         tbd,
                         (target.os == ZAN_OS_IOS) ? "ios" : "macos");
                 remove(obj_tmp);
+                zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
+                zan_arena_free(ir_arena);
                 zan_arena_free(arena);
                 free(source);
                 return 1;
@@ -7351,7 +7451,9 @@ int main(int argc, char **argv) {
                         (target.os == ZAN_OS_IOS) ? "ios" : "macos",
                         (target.os == ZAN_OS_IOS) ? "ios" : "macos");
                 remove(obj_tmp);
+                zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
+                zan_arena_free(ir_arena);
                 zan_arena_free(arena);
                 free(source);
                 return 1;
@@ -7451,7 +7553,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "error: cannot write object '%s'\n",
                         obj_path);
                 remove(obj_tmp);
+                zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
+                zan_arena_free(ir_arena);
                 zan_arena_free(arena);
                 free(source);
                 return 1;
@@ -7463,7 +7567,9 @@ int main(int argc, char **argv) {
                     "(see --list-targets)\n",
                     target.triple);
             remove(obj_tmp);
+            zan_diag_free_buffers(irgen.diag);
             zan_irgen_destroy(&irgen);
+            zan_arena_free(ir_arena);
             zan_arena_free(arena);
             free(source);
             return 1;
@@ -7854,7 +7960,9 @@ int main(int argc, char **argv) {
 
         if (link_ret != 0) {
             fprintf(stderr, "error: linking failed\n");
+            zan_diag_free_buffers(irgen.diag);
             zan_irgen_destroy(&irgen);
+            zan_arena_free(ir_arena);
             zan_arena_free(arena);
             free(source);
             return 1;
@@ -8078,7 +8186,9 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "error: --apk-package exceeds %zu bytes\n",
                             sizeof(pkg) - 1);
                     remove(obj_path);
+                    zan_diag_free_buffers(irgen.diag);
                     zan_irgen_destroy(&irgen);
+                    zan_arena_free(ir_arena);
                     zan_arena_free(arena);
                     free(source);
                     return 1;
@@ -8105,7 +8215,9 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "error: --apk-label exceeds %zu bytes\n",
                             sizeof(lbl) - 1);
                     remove(obj_path);
+                    zan_diag_free_buffers(irgen.diag);
                     zan_irgen_destroy(&irgen);
+                    zan_arena_free(ir_arena);
                     zan_arena_free(arena);
                     free(source);
                     return 1;
@@ -8167,7 +8279,9 @@ int main(int argc, char **argv) {
                               extras, nextra,
                               proj_android_perm_count, proj_android_perms) != 0) {
                 remove(obj_path);
+                zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
+                zan_arena_free(ir_arena);
                 zan_arena_free(arena);
                 free(source);
                 return 1;
@@ -8197,7 +8311,9 @@ int main(int argc, char **argv) {
             }
             if (zan_ipa_build(ipa_path, obj_path, app_name, bundle_id, app_name, "1.0.0") != 0) {
                 remove(obj_path);
+                zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
+                zan_arena_free(ir_arena);
                 zan_arena_free(arena);
                 free(source);
                 return 1;
@@ -8215,7 +8331,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    zan_diag_free_buffers(irgen.diag);
+
     zan_irgen_destroy(&irgen);
+    zan_arena_free(ir_arena);
     zan_arena_free(arena);
     free(source);
     /* LLVM statics registered in the CRT exit table (an LLVMContext teardown

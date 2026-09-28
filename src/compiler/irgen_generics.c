@@ -71,7 +71,7 @@ static void collect_inst_expr(zan_irgen_t *g, zan_ast_node_t *e) {
         break;
     case AST_IDENTIFIER:
         /* `Box<int>` naming a constructed type in expression position */
-        collect_inst_typeref(g, e->inst_type_ref);
+        collect_inst_typeref(g, e->ident.inst_type_ref);
         break;
     case AST_INDEX:
         collect_inst_expr(g, e->index.object);
@@ -234,8 +234,8 @@ static void discover_generic_insts(zan_irgen_t *g, zan_ast_node_t *unit) {
 /* The instantiation an identifier names when it is a constructed generic type
  * in expression position (`Box<int>.Create(x)`); NULL for a plain identifier. */
 static zan_type_t *ident_inst_type(zan_irgen_t *g, zan_ast_node_t *e) {
-    if (!e || e->kind != AST_IDENTIFIER || !e->inst_type_ref) return NULL;
-    return zan_binder_resolve_type(g->binder, e->inst_type_ref);
+    if (!e || e->kind != AST_IDENTIFIER || !e->ident.inst_type_ref) return NULL;
+    return zan_binder_resolve_type(g->binder, e->ident.inst_type_ref);
 }
 
 /* Coerce a call result from the erased opaque pointer back to the concrete

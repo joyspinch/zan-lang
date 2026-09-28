@@ -609,9 +609,9 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
      * an expression's type, so without this memo a deeply nested expression
      * grows the arena without bound -- large single-file programs ran the host
      * out of memory. */
-    if (b->binding_done && type_ref->rt_type &&
-        type_ref->rt_scope == (void *)b->current_scope)
-        return (zan_type_t *)type_ref->rt_type;
+    if (b->binding_done && type_ref->type_ref.rt_type &&
+        type_ref->type_ref.rt_scope == (void *)b->current_scope)
+        return (zan_type_t *)type_ref->type_ref.rt_type;
 
     zan_istr_t name = type_ref->type_ref.name;
 
@@ -838,8 +838,8 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         resolved = arr;
     }
     if (b->binding_done && resolved && resolved != b->type_error) {
-        type_ref->rt_type = resolved;
-        type_ref->rt_scope = (void *)b->current_scope;
+        type_ref->type_ref.rt_type = resolved;
+        type_ref->type_ref.rt_scope = (void *)b->current_scope;
     }
     return resolved;
 }

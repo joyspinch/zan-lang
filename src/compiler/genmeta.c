@@ -1398,7 +1398,7 @@ zan_ast_node_t *zan_genmeta_expr_from_json(json_value *j, zan_arena_t *arena) {
                 zan_ast_list_push(&tr->type_ref.type_args,
                                   gm_type_ref_from(targ, arena, loc), arena);
             }
-            n->inst_type_ref = tr;
+            n->ident.inst_type_ref = tr;
         }
         return n;
     }

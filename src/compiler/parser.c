@@ -1492,9 +1492,9 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
              * (`List<int> { 1, 2 }`): the instantiation was captured on the
              * identifier by the `<...>` branch below, so the new-expression's
              * type IS that instantiation and the braces hold member-writes. */
-            if (expr->kind == AST_IDENTIFIER && expr->inst_type_ref) {
+            if (expr->kind == AST_IDENTIFIER && expr->ident.inst_type_ref) {
                 zan_ast_node_t *n = zan_ast_new(p->arena, AST_NEW_EXPR, loc);
-                n->new_expr.type = expr->inst_type_ref;
+                n->new_expr.type = expr->ident.inst_type_ref;
                 zan_ast_list_init(&n->new_expr.args);
                 zan_ast_list_init(&n->new_expr.arg_inits);
                 parser_advance(p); /* { */
@@ -1698,7 +1698,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             parser_expect(p, TK_RPAREN);
             expr = n;
         } else if (parser_check(p, TK_LESS) && expr->kind == AST_IDENTIFIER &&
-                   !expr->inst_type_ref &&
+                   !expr->ident.inst_type_ref &&
                    (looks_like_type_args_before_dot(p) ||
                     looks_like_type_args_before_brace(p))) {
             /* static access on a constructed generic type: Box<int>.Create(7).
@@ -1717,7 +1717,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                 if (!parser_match(p, TK_COMMA)) break;
             }
             parser_expect_gt(p);
-            expr->inst_type_ref = tref;
+            expr->ident.inst_type_ref = tref;
         } else if (parser_match(p, TK_LBRACKET)) {
             /* indexing; a rank-2+ array takes several indices: m[i, j] */
             zan_ast_node_t *idx = parse_expression(p);

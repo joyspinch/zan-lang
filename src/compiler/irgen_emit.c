@@ -3119,6 +3119,7 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
      * struct-carrying externs at declaration time; a real call is the
      * reportable offense. No-op on classified targets. */
     abi_pending_report(g);
+    if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
     /* wasm32 / riscv32: libc size_t/long are 32-bit but the IR declares these
      * libc functions with i64 sizes (Zan int). Redirect the declarations to
      * per-call-site adapters that truncate/extend and forward to the real

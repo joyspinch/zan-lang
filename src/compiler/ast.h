@@ -136,13 +136,15 @@ struct zan_ast_node {
 
     /* Integer literal suffix (AST_INT_LITERAL only): 0=none, 1=L/l (long),
      * 2=U/u (uint), 3=UL/LU in either case (ulong). */
-    int lit_suffix;
+    uint8_t lit_suffix;
 
     /* Integer literal radix (AST_INT_LITERAL only): 2/8/10/16. Non-decimal
      * unsuffixed literals up to 0xFFFFFFFF type as int (two's-complement
      * wrap), so `0xFFRRGGBB` ARGB colors compare equal to the wrapped int
      * field values they assign to. */
-    int lit_radix;
+    uint8_t lit_radix;
+    /* True for declarations supplied by the auto-included standard library. */
+    unsigned char from_stdlib;
 
     /* [Attr(...)] usages attached to a declaration; empty list if none. */
     zan_ast_list_t attributes;
@@ -153,23 +155,6 @@ struct zan_ast_node {
     zan_istr_t ns_name;         /* enclosing namespace, dotted ("A.B") */
     zan_istr_t orig_name;       /* pre-mangling simple name, if renamed */
     zan_ast_list_t *ns_usings;  /* the file's `using` decls; NULL if none */
-    /* Set for declarations parsed from auto-included stdlib files (main.c).
-     * The reachability prune (nsresolve.c) treats these as droppable when
-     * nothing the program itself declares can reach them. */
-    unsigned char from_stdlib;
-
-    /* On an AST_IDENTIFIER naming a generic type in expression position
-     * (`Box<int>.Create(x)`): the `Box<int>` type reference. The identifier
-     * keeps the simple name, so every consumer that only reads the name is
-     * unaffected, while a static call can route to the instantiation's
-     * specialization. NULL on every other node. */
-    zan_ast_node_t *inst_type_ref;
-
-    /* Memo for zan_binder_resolve_type on AST_TYPE_REF nodes: the type it
-     * resolved to and the scope that resolution ran in (a type reference can
-     * mean different things in different scopes, e.g. a type parameter). */
-    void *rt_type;
-    void *rt_scope;
 
     union {
         /* literals */
@@ -181,6 +166,8 @@ struct zan_ast_node {
         /* identifier / name */
         struct {
             zan_istr_t name;
+            /* Generic type used in expression position, AST_IDENTIFIER only. */
+            zan_ast_node_t *inst_type_ref;
         } ident;
 
         /* binary / assignment */
@@ -590,6 +577,9 @@ struct zan_ast_node {
              * itself is the element (plain `int[]` / `int[,]`). */
             int array_rank;
             zan_ast_node_t *array_element;
+            /* Scope-sensitive binder memo; AST_TYPE_REF only. */
+            void *rt_type;
+            void *rt_scope;
         } type_ref;
 
         /* qualified name: a.b.c */
@@ -654,6 +644,7 @@ struct zan_ast_node {
 /* ---- utility functions ---- */
 
 zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t loc);
+size_t zan_ast_node_count(void);
 bool zan_ast_has_attr(const zan_ast_node_t *decl, const char *name);
 void zan_ast_list_init(zan_ast_list_t *list);
 void zan_ast_list_push(zan_ast_list_t *list, zan_ast_node_t *node, zan_arena_t *arena);
