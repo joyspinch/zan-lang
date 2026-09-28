@@ -161,7 +161,7 @@ static zan_ast_node_t *parse_delegate_decl(zan_parser_t *p, uint32_t mods) {
     ddecl->method_decl.body = NULL;
     ddecl->method_decl.modifiers = mods;
     ddecl->method_decl.extern_lib = (zan_istr_t){NULL, 0};
-    ddecl->method_decl.entry_point = (zan_istr_t){NULL, 0};
+    ddecl->method_decl.entry_point = NULL;
     return ddecl;
 }
 
@@ -3303,7 +3303,7 @@ static zan_ast_node_t *parse_local_func(zan_parser_t *p) {
     n->method_decl.body = body;
     n->method_decl.modifiers = MOD_PRIVATE | MOD_STATIC;
     n->method_decl.extern_lib = (zan_istr_t){NULL, 0};
-    n->method_decl.entry_point = (zan_istr_t){NULL, 0};
+    n->method_decl.entry_point = NULL;
     n->method_decl.has_base_init = false;
     n->method_decl.has_this_init = false;
     zan_ast_list_push(&p->pending_members, n, p->arena);
@@ -4132,7 +4132,7 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         cn->method_decl.body = conv_body;
         cn->method_decl.modifiers = mods | MOD_STATIC;
         cn->method_decl.extern_lib = (zan_istr_t){NULL, 0};
-        cn->method_decl.entry_point = (zan_istr_t){NULL, 0};
+        cn->method_decl.entry_point = NULL;
         return cn;
     }
 ordinary_member:
@@ -4227,7 +4227,7 @@ ordinary_member:
         n->method_decl.body = body;
         n->method_decl.modifiers = mods | MOD_STATIC;
         n->method_decl.extern_lib = (zan_istr_t){NULL, 0};
-        n->method_decl.entry_point = (zan_istr_t){NULL, 0};
+        n->method_decl.entry_point = NULL;
         return n;
     }
 
@@ -4342,7 +4342,7 @@ ordinary_member:
             g->method_decl.body = getter_body;
             g->method_decl.modifiers = mods; /* instance, receiver is `this` */
             g->method_decl.extern_lib = (zan_istr_t){NULL, 0};
-            g->method_decl.entry_point = (zan_istr_t){NULL, 0};
+            g->method_decl.entry_point = NULL;
             zan_ast_list_push(&p->pending_members, g, p->arena);
         }
         if (setter_body) {
@@ -4362,7 +4362,7 @@ ordinary_member:
             s->method_decl.body = setter_body;
             s->method_decl.modifiers = mods;
             s->method_decl.extern_lib = (zan_istr_t){NULL, 0};
-            s->method_decl.entry_point = (zan_istr_t){NULL, 0};
+            s->method_decl.entry_point = NULL;
             zan_ast_list_push(&p->pending_members, s, p->arena);
         }
         return n;
@@ -4459,7 +4459,11 @@ ordinary_member:
         n->method_decl.body = body;
         n->method_decl.modifiers = mods;
         n->method_decl.extern_lib = dll_import_lib;
-        n->method_decl.entry_point = dll_entry_point;
+        if (dll_entry_point.str) {
+            n->method_decl.entry_point = (zan_istr_t *)zan_arena_alloc(
+                p->arena, sizeof(zan_istr_t));
+            *n->method_decl.entry_point = dll_entry_point;
+        }
         n->method_decl.is_variadic = dll_variadic;
         n->method_decl.where_clauses = wheres;
         desugar_yield_method(p, n);

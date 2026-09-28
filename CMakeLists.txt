@@ -397,10 +397,13 @@ if(WIN32)
         "MinGW-w64 root used to assemble the bundled linking toolchain")
     option(ZAN_BUNDLE_TOOLCHAIN "Bundle GNU ld + MinGW runtime next to zanc" ON)
     if(ZAN_BUNDLE_TOOLCHAIN)
+        find_program(ZAN_LLD_EXECUTABLE NAMES ld.lld.exe ld.lld lld.exe lld
+            HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
         add_custom_command(TARGET zanc POST_BUILD
             COMMAND ${CMAKE_COMMAND}
                     -DMINGW_ROOT=${ZAN_MINGW_ROOT}
                     -DDEST=$<TARGET_FILE_DIR:zanc>
+                    -DLLD_EXECUTABLE=${ZAN_LLD_EXECUTABLE}
                     -P ${CMAKE_SOURCE_DIR}/cmake/bundle_toolchain.cmake
             COMMENT "Assembling self-contained MinGW linking toolchain"
             VERBATIM)
@@ -956,13 +959,13 @@ set_tests_properties(diag_ctor_arg_count PROPERTIES TIMEOUT 60)
 # Regression (A277): the bare-name extern call path overflowed a 16-entry
 # parameter-type array with 17+ parameters, surfacing as a bogus LLVM
 # verification error. It must now reach the linker (which reports the missing
-# C symbol) instead.
+# C symbol) instead, whether GNU ld or LLD supplies the diagnostic.
 add_test(NAME diag_extern_many_params
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/extern_many_params.zan
     -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_extern_many_params${_exe_ext}
-    "-DEXPECT_REGEX=undefined reference to .big17."
+    "-DEXPECT_REGEX=undefined (reference to|symbol:).*big17"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_extern_many_params PROPERTIES TIMEOUT 60)
 
@@ -4104,6 +4107,17 @@ foreach(_obf_case linux-x64:init_array linux-arm64:init_array
     -P ${CMAKE_SOURCE_DIR}/tests/run_publish_obf_ctor.cmake)
   set_tests_properties(publish_obf_ctor_${_obf_target} PROPERTIES TIMEOUT 180)
 endforeach()
+
+if(WIN32)
+  add_test(NAME conformance_publish_main_args COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/main_args.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/main_args.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_publish_main_args${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_publish_main_args.cmake)
+  set_tests_properties(conformance_publish_main_args PROPERTIES TIMEOUT 120
+    LABELS "smoke;standard;full")
+endif()
 
 # ---- --publish over-release net (A52-5) ----
 # --publish keeps the rc<=0 check of the ARC guard as a fail-soft net: the

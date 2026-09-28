@@ -4026,7 +4026,7 @@ static int get_virtual_method_index(zan_symbol_t *type_sym,
 
 /* ---- local variables (simple stack-based storage) ---- */
 
-#define MAX_LOCALS 256
+#define INITIAL_LOCALS 16
 
 typedef struct {
     zan_istr_t name;
@@ -4120,13 +4120,12 @@ typedef struct {
 
 static void local_scope_init(local_scope_t *s, zan_arena_t *arena) {
     s->count = 0;
-    s->cap = MAX_LOCALS;
+    s->cap = INITIAL_LOCALS;
     s->arena = arena;
     s->vars = (local_var_t *)zan_arena_alloc(arena, sizeof(local_var_t) * (size_t)s->cap);
     s->pattern_count = 0;
-    s->pattern_cap = 16;
-    s->patterns = (pattern_binding_t *)zan_arena_alloc(
-        arena, sizeof(pattern_binding_t) * (size_t)s->pattern_cap);
+    s->pattern_cap = 0;
+    s->patterns = NULL;
 }
 
 static local_scope_t *local_scope_new(zan_arena_t *arena) {
@@ -4151,7 +4150,7 @@ static unsigned g_local_gen;
 static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca, zan_type_t *type) {
     g_local_gen++;
     if (scope->count >= scope->cap) {
-        int new_cap = scope->cap > 0 ? scope->cap * 2 : MAX_LOCALS;
+        int new_cap = scope->cap > 0 ? scope->cap * 2 : INITIAL_LOCALS;
         local_var_t *grown = (local_var_t *)zan_arena_alloc(scope->arena,
             sizeof(local_var_t) * (size_t)new_cap);
         if (scope->count > 0 && scope->vars) {

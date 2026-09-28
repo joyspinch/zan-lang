@@ -93,6 +93,7 @@ foreach ($exe in @("zanc.exe", "zan-lsp.exe", "zan-dap.exe",
 
 # bundled linker: ld.exe alone is useless without the MinGW-w64 runtime beside it
 if (Stage-File (Join-Path $Build "ld.exe") "ld.exe") {
+    if (-not (Stage-File (Join-Path $Build "ld.lld.exe") "ld.lld.exe")) { $missing += "ld.lld.exe" }
     if (-not (Stage-Dir (Join-Path $Build "mingw") "mingw")) { $missing += "mingw\" }
 } else {
     $missing += "ld.exe"

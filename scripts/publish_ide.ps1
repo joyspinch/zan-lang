@@ -199,6 +199,9 @@ foreach ($cli in @('zan-lsp.exe', 'zan-dap.exe',
 $ld = Join-Path $b 'ld.exe'
 if (Test-Path $ld) {
     Copy-Item $ld (Join-Path $distTc 'ld.exe')
+    $lld = Join-Path $b 'ld.lld.exe'
+    if (Test-Path $lld) { Copy-Item $lld (Join-Path $distTc 'ld.lld.exe') }
+    else { Write-Output "PUBLISH_WARN: build\ld.lld.exe missing; large Windows programs may fail to link" }
     Copy-Item (Join-Path $b 'mingw') (Join-Path $distTc 'mingw') -Recurse
 } else {
     Write-Output "PUBLISH_WARN: build\ld.exe missing; dist zanc will need a system LLVM/clang on PATH"

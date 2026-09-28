@@ -42,6 +42,11 @@ Remove-Item build\CMakeFiles -Recurse -Force
   所以给 IDE 编译的原生运行时也用
   `clang --target=x86_64-w64-windows-gnu`（见 `scripts\build_ide.ps1`），
   这跟上面构建 zanc 用的 MSVC ABI 是两条独立的链，不要混用。
+- Windows 开发/发布工具链同时分发 `ld.lld.exe`、`ld.exe` 和 `mingw/`；原生链接
+  优先 LLVM 的 MinGW/PE 链接器 `ld.lld.exe`，缺少时才回退 GNU `ld.exe`。
+  GNU ld 对包含数万独立 COFF 节的发布对象可能同时报 `IMAGE_REL_AMD64_REL32`
+  溢出和对象内已定义符号的 `undefined reference`。升级编译器时需连同链接器
+  一起更新，只有新的 zanc.exe 而沿用旧工具链并不能修复这类链接失败。
 
 ## Linux / macOS
 

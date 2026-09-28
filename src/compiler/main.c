@@ -103,18 +103,19 @@ static zan_arena_t *g_main_arena = NULL;
 static void phase(const char *name) {
     if (!g_time_phases) return;
     double t = now_ms();
-    size_t mem_mb = 0, ws_mb = 0;
+    size_t mem_mb = 0, ws_mb = 0, peak_mb = 0;
 #ifdef _WIN32
     PROCESS_MEMORY_COUNTERS pmc;
     if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
         mem_mb = pmc.PagefileUsage / (1024 * 1024);
         ws_mb = pmc.WorkingSetSize / (1024 * 1024);
+        peak_mb = pmc.PeakPagefileUsage / (1024 * 1024);
     }
 #endif
     size_t ar_mb = g_main_arena ? (zan_arena_total_bytes(g_main_arena) / (1024 * 1024)) : 0;
     if (g_phase_start > 0.0)
-        fprintf(stderr, "%10.1f ms  [Commit: %4zu MB, WS: %4zu MB, Arena: %4zu MB]  %s\n",
-                t - g_phase_start, mem_mb, ws_mb, ar_mb, name);
+        fprintf(stderr, "%10.1f ms  [Commit: %4zu MB, Peak: %4zu MB, WS: %4zu MB, Arena: %4zu MB]  %s\n",
+                t - g_phase_start, mem_mb, peak_mb, ws_mb, ar_mb, name);
     g_phase_start = t;
 }
 
@@ -4296,6 +4297,12 @@ int main(int argc, char **argv) {
                                       unit->comp_unit.decls.items[k], arena);
             }
         }
+        if (pi_arena) {
+            zan_arena_free(pi_arena);
+            pi_arena = NULL;
+            memset(pi_table, 0, sizeof(pi_table));
+            pi_dirs_head = pi_dirs_tail = NULL;
+        }
         /* Generators merged their generated classes into the unit above; run
          * nsresolve again so the new declarations' type references (Expr<T>,
          * OrmMeta, DbValues, ... from the generated file's own usings) resolve
@@ -7463,7 +7470,7 @@ int main(int argc, char **argv) {
         } else {
 #ifdef _WIN32
         /* Self-contained linking: prefer the bundled ld.lld + MinGW-w64 runtime
-         * shipped next to zanc (in <zanc_dir>/toolchain), so producing an .exe
+         * shipped next to zanc, so producing an .exe
          * needs only zan - no external clang / MSVC / Windows SDK. Objects are
          * emitted with the x86_64-w64-windows-gnu ABI (see zan_irgen_write_obj).
          * If the bundle is absent we fall back to a system clang targeting the
@@ -7488,9 +7495,10 @@ int main(int argc, char **argv) {
             snprintf(crtend, sizeof(crtend), "%s\\crtend.o", syslib);
             snprintf(lflag,  sizeof(lflag),  "-L%s", syslib);
 
-            /* Invoke the bundled GNU ld (mingw binutils) directly. The system
-             * import/static libs have circular references, so wrap them in
-             * --start-group/--end-group for ld's single-pass resolver. */
+            /* Use the bundled LLD for large PE/COFF objects: GNU ld mishandles
+             * large sets of input sections and can report REL32 overflows and
+             * undefined references to globals defined in the same object.
+             * The MinGW import/static libs need --start-group/--end-group. */
             const char *argv[ZAN_LINK_MAX_ARGV];
             int a = 0;
             argv[a++] = ld_path;
@@ -7586,7 +7594,12 @@ int main(int argc, char **argv) {
             argv[a++] = "--end-group";
             argv[a++] = crtend;
             argv[a] = NULL;
-            link_ret = (int)zan_utf8_spawnv(_P_WAIT, ld_path, argv);
+            char lld_path[1200];
+            snprintf(lld_path, sizeof(lld_path), "%s\\ld.lld.exe", exe_dir);
+            const char *linker = zan_utf8_get_file_attributes(lld_path) != INVALID_FILE_ATTRIBUTES
+                                     ? lld_path : ld_path;
+            argv[0] = linker;
+            link_ret = (int)zan_utf8_spawnv(_P_WAIT, linker, argv);
         } else {
             char link_cmd[4096];
             /* 256 MB stack: the self-hosted compiler recurses deeply. Mirrors
@@ -7833,8 +7846,10 @@ int main(int argc, char **argv) {
 
         phase("link");
 
-        /* clean up object file */
-        remove(obj_tmp);
+        if (link_ret != 0 && getenv("ZAN_KEEP_FAILED_OBJ"))
+            fprintf(stderr, "note: failed-link object retained at '%s'\n", obj_tmp);
+        else
+            remove(obj_tmp);
         if (icon_obj[0]) remove(icon_obj);
 
         if (link_ret != 0) {

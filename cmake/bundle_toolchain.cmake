@@ -1,7 +1,7 @@
 # Assemble a self-contained MinGW linking toolchain next to zanc so that
 # compiling  zanc app.zan -o app.exe  needs only zan: no external clang / gcc /
 # MSVC / Windows SDK. zanc emits x86_64-w64-windows-gnu objects and links them
-# in-process with the GNU ld + MinGW-w64 runtime placed here (see main.c).
+# using LLVM's ld.lld (GNU ld fallback) + the MinGW-w64 runtime placed here.
 #
 # Invoked from CMake as:
 #   cmake -DMINGW_ROOT=<root> -DDEST=<dir> -P bundle_toolchain.cmake
@@ -14,6 +14,10 @@ if(NOT MINGW_ROOT)
 endif()
 
 set(LIBDST "${DEST}/mingw/lib")
+
+if(LLD_EXECUTABLE AND EXISTS "${LLD_EXECUTABLE}")
+    configure_file("${LLD_EXECUTABLE}" "${DEST}/ld.lld.exe" COPYONLY)
+endif()
 
 if(EXISTS "${DEST}/ld.exe" AND EXISTS "${LIBDST}/crt2.o" AND EXISTS "${LIBDST}/libgcc.a")
     message(STATUS "toolchain bundle already present at ${DEST}; skipping")

@@ -65,6 +65,26 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
 - **SwissTable 16 字节控制组并发探测（`MatchGroup16`）**：`Vector128.Equals` 配合 `ExtractMostSignificantBits` 与 `BitOperations.TrailingZeroCount`，一条指令完成 16 个哈希槽位并发探测，单核达到 1.2 亿次/秒探针吞吐。
 - **LLVM x86 硬件指令集特性开关（`tm_features` 独立命名）**：使用 `llvm.x86.sse42.crc32.*` 机器指令时，仅仅开启 `+sse4.2` 不足以在 SelectionDAG 中完成指令选择，会导致 `LLVM ERROR: Cannot select: intrinsic %llvm.x86.sse42.crc32.*` 致命报错。这是因为 LLVM 将 CRC32 拆分在单独的 `+crc32` 子特性下。同理，FMA 融和乘加需要 `+fma`，单周期硬件位操作需要 `+bmi`。在 TargetMachine 的特性串中，必须显式传递 `+sse4.2,+crc32,+fma,+bmi`。
 
+## 大型 Windows 发布的链接与编译内存（2026-09-28）
+
+- 数万节的单一 COFF 对象（OnePlus 实测 47,411 节）交给捆绑 GNU ld 会报
+  `IMAGE_REL_AMD64_REL32` 溢出，并把对象内已定义的 `__zan_argc/__zan_argv`
+  错报为 undefined；先保留失败 `.o`，用 `llvm-nm` 核实定义，再用同一对象
+  换 `ld.lld.exe` 做 A/B，别盲目补运行时或改入口。LLD 成功后要连同 zanc
+  分发，只有开发机装了 LLD 不算修复；链接失败时可设
+  `ZAN_KEEP_FAILED_OBJ=1` 留下中间对象。诊断用例的 linker 文案需同时容纳
+  GNU ld 的 `undefined reference to` 和 LLD 的 `undefined symbol:`。
+- `--time` 的 Commit/WS 是阶段边界采样，不是峰值；Windows 读
+  `PeakPagefileUsage` 才能看到累计提交峰值。一次大型发布实测：IRGen
+  后 Commit 1,567 MB、Arena 540 MB，整进程峰值 2,029 MB；不应把它与
+  旧版仅有的边界采样误报为峰值降幅。全量 AST 存续和单一 LLVM module
+  仍是主要结构成本，局部数组初始容量按需缩小只能减负，不能宣称已根治。
+- 解析用的 pull-in arena 要等生成器二次拉入完成后再释放，否则增量
+  生成的源文件丢失；每函数局部表从大容量预分配改为小容量倍增、pattern
+  表首次用到才分配，避免成千函数为未用槽预留空间。AST 节点含最大 union
+  arm，少用的 DllImport EntryPoint 从内联值变可选指针，实测节点 272→264
+  字节；约 283 万节点使这 8 字节成为有意义但非根本性的节省。
+
 ## 发布体积：数据逐符号分节与链接器 GC 的边界（2026-09-15）
 
 irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名>` /

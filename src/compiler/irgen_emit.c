@@ -1291,10 +1291,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     member->method_decl.is_variadic ? 1 : 0);
                 /* use entry_point if specified, otherwise method name */
                 char ext_name[256];
-                if (member->method_decl.entry_point.str) {
+                if (member->method_decl.entry_point) {
                     snprintf(ext_name, sizeof(ext_name), "%.*s",
-                             (int)member->method_decl.entry_point.len,
-                             member->method_decl.entry_point.str);
+                             (int)member->method_decl.entry_point->len,
+                             member->method_decl.entry_point->str);
                 } else {
                     snprintf(ext_name, sizeof(ext_name), "%.*s",
                              (int)member->method_decl.name.len,
@@ -1396,8 +1396,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 /* record (lib, fn) so an unresolvable lib can be stubbed when
                  * cross-linking a static Linux binary */
                 if (member->method_decl.extern_lib.str) {
-                    zan_istr_t sym = member->method_decl.entry_point.str
-                        ? member->method_decl.entry_point
+                    zan_istr_t sym = member->method_decl.entry_point
+                        ? *member->method_decl.entry_point
                         : member->method_decl.name;
                     bool seen = false;
                     for (int fi = 0; fi < g->extern_fn_count; fi++) {

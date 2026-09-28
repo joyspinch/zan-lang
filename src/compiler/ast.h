@@ -449,7 +449,7 @@ struct zan_ast_node {
             zan_ast_node_t *body;
             uint32_t modifiers;
             zan_istr_t extern_lib;   /* DllImport library name, {NULL,0} if none */
-            zan_istr_t entry_point;  /* DllImport entry point override, {NULL,0} if none */
+            zan_istr_t *entry_point; /* DllImport entry point override, NULL if none */
             bool is_variadic;        /* [DllImport(..., Variadic = true)]: the C
                                       * callee is varargs, so a call may pass more
                                       * arguments than the declared parameters */
