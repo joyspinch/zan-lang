@@ -82,13 +82,18 @@ class X509Certificate {
 
     static bool MatchPattern(string pattern, string host) {
         if (pattern == null || host == null) { return false; }
+        for (int j = 0; j < pattern.Length; j = j + 1) { if ((pattern[j] & 255) == 0) { return false; } }
+        for (int j = 0; j < host.Length; j = j + 1) { if ((host[j] & 255) == 0) { return false; } }
+        int star = pattern.IndexOf("*");
+        if (star > 0 || (star == 0 && !pattern.StartsWith("*."))) { return false; }
         if (StrEqualsIgnoreCase(pattern, host)) { return true; }
         // 通配符匹配：必须是 *. 开头（RFC 6125 最左侧单 label 通配）
         if (pattern.Length > 2 && (pattern[0] & 255) == 42 && (pattern[1] & 255) == 46) {
             string suffix = pattern.Substring(1, pattern.Length - 1); // 包含 .xxx
             int dotIdx = host.IndexOf(".");
-            if (dotIdx <= 0) { return false; } // 无子域名或以 . 开头，通配符不匹配单段
+            if (dotIdx <= 0 || suffix.IndexOf(".", 1) < 0) { return false; }
             string hostFirstLabel = host.Substring(0, dotIdx);
+            if (hostFirstLabel.Length >= 4 && StrEqualsIgnoreCase(hostFirstLabel.Substring(0, 4), "xn--")) { return false; }
             string hostSuffix = host.Substring(dotIdx, host.Length - dotIdx);
             if (StrEqualsIgnoreCase(suffix, hostSuffix)) {
                 return true;
@@ -103,6 +108,7 @@ class X509Certificate {
     /// </summary>
     bool VerifyHost(string host) {
         if (host == null || host.Length == 0) { return false; }
+        for (int j = 0; j < host.Length; j = j + 1) { if ((host[j] & 255) == 0) { return false; } }
         // 判断是否是 IP 字面量（简易判断：纯数字加点或含冒号）
         bool isIp = false;
         if (host.IndexOf(":") >= 0) {
@@ -129,12 +135,12 @@ class X509Certificate {
                 }
                 return false;
             }
-            // 无 IP SAN 时降级匹配 CN
-            return StrEqualsIgnoreCase(this.subjectCN, host);
+            // IP literals require iPAddress SAN; CN and DNS SAN do not identify IP endpoints.
+            return false;
         }
 
         // 域名匹配：RFC 6125 规定若证书存在 SAN dNSName，禁止降级回退到 CN
-        if (this.dnsNames != null && this.dnsNames.Count > 0) {
+        if (this.hasSan || (this.dnsNames != null && this.dnsNames.Count > 0)) {
             for (int i = 0; i < this.dnsNames.Count; i = i + 1) {
                 if (MatchPattern(this.dnsNames[i], host)) { return true; }
             }
@@ -223,8 +229,343 @@ class X509Certificate {
         return oneline.ToString();
     }
 
+    // Authenticated TLS path uses bounded DER traversal. The display parser below is not a verifier.
+    byte[] tbs;
+    byte[] signature;
+    byte[] rsaN;
+    byte[] rsaE;
+    int rsaNLen;
+    int rsaELen;
+    int issuerNameStart;
+    int issuerNameLen;
+    int subjectNameStart;
+    int subjectNameLen;
+    bool isCa;
+    bool keyCertSign;
+    bool digitalSignature;
+    bool serverAuth;
+    bool hasKeyUsage;
+    bool hasEku;
+    bool hasSan;
+    long notBefore;
+    long notAfter;
+
+    static int Tlv(byte[] d, int bound, List<int> p, int tag) {
+        int at = p[0];
+        if (at < 0 || at + 2 > bound || (d[at] & 255) != tag) { return -1; }
+        int first = d[at + 1] & 255;
+        int len = first;
+        int start = at + 2;
+        if (first >= 128) {
+            int count = first - 128;
+            if (count == 0 || count > 4 || start + count > bound || (d[start] & 255) == 0) { return -1; }
+            len = 0;
+            for (int i = 0; i < count; i = i + 1) {
+                if (len > 2147483647 / 256) { return -1; }
+                len = len * 256 + (d[start + i] & 255);
+            }
+            if (len < 128) { return -1; }
+            start = start + count;
+        }
+        if (len < 0 || len > bound - start) { return -1; }
+        p[0] = start;
+        return start + len;
+    }
+
+    static int Digits(byte[] d, int p, int count) {
+        int value = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            int c = d[p + i] & 255;
+            if (c < 48 || c > 57) { return -1; }
+            value = value * 10 + c - 48;
+        }
+        return value;
+    }
+
+    static long TimeValue(byte[] d, int bound, List<int> p) {
+        if (p[0] >= bound) { return -1; }
+        int tag = d[p[0]] & 255;
+        int end = Tlv(d, bound, p, tag);
+        if (end < 0) { return -1; }
+        int size = end - p[0];
+        if ((tag != 23 || size != 13) && (tag != 24 || size != 15)) { return -1; }
+        if ((d[end - 1] & 255) != 90) { return -1; }
+        int i = p[0];
+        int year = Digits(d, i, tag == 23 ? 2 : 4);
+        if (year < 0) { return -1; }
+        if (tag == 23) { year = year >= 50 ? year + 1900 : year + 2000; i = i + 2; }
+        else { i = i + 4; }
+        int month = Digits(d, i, 2); int day = Digits(d, i + 2, 2);
+        int hour = Digits(d, i + 4, 2); int minute = Digits(d, i + 6, 2);
+        int second = Digits(d, i + 8, 2);
+        if (year < 1970 || month < 1 || month > 12 || day < 1 || day > DateTime.DaysInMonth(year, month)
+            || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) { return -1; }
+        p[0] = end;
+        return DateTime.FromParts(year, month, day, hour, minute, second).ToUnixSeconds();
+    }
+
+    static bool Oid(byte[] d, int start, int len, int a, int b, int c) {
+        return len == 3 && (d[start] & 255) == a && (d[start + 1] & 255) == b && (d[start + 2] & 255) == c;
+    }
+
+    // RSA PKCS#1 v1.5 SHA-256 only; unsupported algorithms cannot authenticate a peer.
+    static bool RsaSha256Algorithm(byte[] d, int bound, List<int> p) {
+        int end = Tlv(d, bound, p, 48);
+        if (end < 0) { return false; }
+        int oidEnd = Tlv(d, end, p, 6);
+        if (oidEnd < 0 || oidEnd - p[0] != 9) { return false; }
+        byte[] oid = new byte[] { 42, 134, 72, 134, 247, 13, 1, 1, 11 };
+        for (int i = 0; i < 9; i = i + 1) {
+            if ((d[p[0] + i] & 255) != (oid[i] & 255)) { return false; }
+        }
+        p[0] = oidEnd;
+        int nullEnd = Tlv(d, end, p, 5);
+        if (nullEnd != end || nullEnd != p[0]) { return false; }
+        p[0] = end;
+        return true;
+    }
+
+    static X509Certificate ParseForTls(byte[] der, int len) {
+        if (der == null || len < 32 || len > der.Length) { return null; }
+        List<int> p = new List<int>(); p.Add(0);
+        int certEnd = Tlv(der, len, p, 48);
+        if (certEnd != len) { return null; }
+        int tbsStart = p[0];
+        int tbsEnd = Tlv(der, certEnd, p, 48);
+        if (tbsEnd < 0) { return null; }
+        X509Certificate cert = new X509Certificate();
+        cert.rawDer = der; cert.rawDerLen = len;
+        cert.tbs = new byte[tbsEnd - tbsStart];
+        NativeMemory.Copy(cert.tbs, (nint)der + (nint)tbsStart, cert.tbs.Length);
+        int versionEnd = Tlv(der, tbsEnd, p, 160);
+        if (versionEnd < 0) { return null; }
+        int verIntEnd = Tlv(der, versionEnd, p, 2);
+        if (verIntEnd != versionEnd || verIntEnd - p[0] != 1 || (der[p[0]] & 255) != 2) { return null; }
+        p[0] = versionEnd;
+        int serialEnd = Tlv(der, tbsEnd, p, 2);
+        if (serialEnd < 0) { return null; }
+        p[0] = serialEnd;
+        if (!RsaSha256Algorithm(der, tbsEnd, p)) { return null; }
+        cert.issuerNameStart = p[0];
+        int nameEnd = Tlv(der, tbsEnd, p, 48);
+        if (nameEnd < 0) { return null; }
+        cert.issuerNameLen = nameEnd - cert.issuerNameStart;
+        p[0] = nameEnd;
+        int validityEnd = Tlv(der, tbsEnd, p, 48);
+        if (validityEnd < 0) { return null; }
+        cert.notBefore = TimeValue(der, validityEnd, p);
+        cert.notAfter = TimeValue(der, validityEnd, p);
+        if (cert.notBefore < 0 || cert.notAfter < cert.notBefore || p[0] != validityEnd) { return null; }
+        cert.subjectNameStart = p[0];
+        nameEnd = Tlv(der, tbsEnd, p, 48);
+        if (nameEnd < 0) { return null; }
+        cert.subjectNameLen = nameEnd - cert.subjectNameStart;
+        p[0] = nameEnd;
+        int spkiStart = p[0];
+        int spkiEnd = Tlv(der, tbsEnd, p, 48);
+        if (spkiEnd < 0) { return null; }
+        cert.spkiLen = spkiEnd - spkiStart;
+        cert.spki = new byte[cert.spkiLen];
+        NativeMemory.Copy(cert.spki, (nint)der + (nint)spkiStart, cert.spkiLen);
+        int algEnd = Tlv(der, spkiEnd, p, 48);
+        if (algEnd < 0) { return null; }
+        int algOidEnd = Tlv(der, algEnd, p, 6);
+        byte[] rsaOid = new byte[] { 42, 134, 72, 134, 247, 13, 1, 1, 1 };
+        if (algOidEnd < 0 || algOidEnd - p[0] != 9) { return null; }
+        for (int i = 0; i < 9; i = i + 1) { if ((der[p[0] + i] & 255) != (rsaOid[i] & 255)) { return null; } }
+        p[0] = algOidEnd;
+        int nullEnd = Tlv(der, algEnd, p, 5);
+        if (nullEnd != algEnd || nullEnd != p[0]) { return null; }
+        p[0] = algEnd;
+        int bitsEnd = Tlv(der, spkiEnd, p, 3);
+        if (bitsEnd != spkiEnd || bitsEnd < 0 || (der[p[0]] & 255) != 0) { return null; }
+        p[0] = p[0] + 1;
+        int keyEnd = Tlv(der, bitsEnd, p, 48);
+        if (keyEnd != bitsEnd) { return null; }
+        int nEnd = Tlv(der, keyEnd, p, 2);
+        if (nEnd < 0) { return null; }
+        int nStart = p[0];
+        if (nEnd - nStart > 1 && (der[nStart] & 255) == 0) { nStart = nStart + 1; }
+        cert.rsaNLen = nEnd - nStart;
+        if (cert.rsaNLen < 64 || cert.rsaNLen > 512) { return null; }
+        cert.rsaN = new byte[cert.rsaNLen];
+        NativeMemory.Copy(cert.rsaN, (nint)der + (nint)nStart, cert.rsaNLen);
+        p[0] = nEnd;
+        int eEnd = Tlv(der, keyEnd, p, 2);
+        if (eEnd != keyEnd) { return null; }
+        cert.rsaELen = eEnd - p[0];
+        if (cert.rsaELen < 1 || cert.rsaELen > 8) { return null; }
+        cert.rsaE = new byte[cert.rsaELen];
+        NativeMemory.Copy(cert.rsaE, (nint)der + (nint)p[0], cert.rsaELen);
+        p[0] = spkiEnd;
+        // Only v3 extensions are supported; refuse unparsed unique IDs or trailing fields.
+        int exEnd = Tlv(der, tbsEnd, p, 163);
+        if (exEnd < 0 || exEnd != tbsEnd) { return null; }
+        int seqEnd = Tlv(der, exEnd, p, 48);
+        if (seqEnd != exEnd) { return null; }
+        while (p[0] < seqEnd) {
+            int itemEnd = Tlv(der, seqEnd, p, 48);
+            if (itemEnd < 0) { return null; }
+            int oidEnd = Tlv(der, itemEnd, p, 6);
+            if (oidEnd < 0) { return null; }
+            int oidAt = p[0]; int oidLen = oidEnd - oidAt;
+            p[0] = oidEnd;
+            bool critical = false;
+            if (p[0] < itemEnd && (der[p[0]] & 255) == 1) {
+                int boolEnd = Tlv(der, itemEnd, p, 1);
+                if (boolEnd - p[0] != 1) { return null; }
+                critical = (der[p[0]] & 255) != 0;
+                p[0] = boolEnd;
+            }
+            int octEnd = Tlv(der, itemEnd, p, 4);
+            if (octEnd != itemEnd) { return null; }
+            int innerStart = p[0];
+            if (Oid(der, oidAt, oidLen, 85, 29, 19)) {
+                int basicEnd = Tlv(der, octEnd, p, 48);
+                if (basicEnd != octEnd) { return null; }
+                if (p[0] < basicEnd && (der[p[0]] & 255) == 1) {
+                    int be = Tlv(der, basicEnd, p, 1);
+                    if (be - p[0] != 1) { return null; }
+                    cert.isCa = (der[p[0]] & 255) != 0;
+                    p[0] = be;
+                }
+                if (p[0] < basicEnd) {
+                    int pathEnd = Tlv(der, basicEnd, p, 2);
+                    if (pathEnd < 0) { return null; }
+                    // Path length constraints require full path processing; refuse rather than omit them.
+                    return null;
+                }
+            } else if (Oid(der, oidAt, oidLen, 85, 29, 15)) {
+                cert.hasKeyUsage = true;
+                int be = Tlv(der, octEnd, p, 3);
+                if (be != octEnd || be - p[0] < 2) { return null; }
+                int flags = der[p[0] + 1] & 255;
+                cert.digitalSignature = (flags & 128) != 0;
+                cert.keyCertSign = (flags & 4) != 0;
+            } else if (Oid(der, oidAt, oidLen, 85, 29, 17)) {
+                cert.hasSan = true;
+                int generalEnd = Tlv(der, octEnd, p, 48);
+                if (generalEnd != octEnd) { return null; }
+                while (p[0] < generalEnd) {
+                    int type = der[p[0]] & 255;
+                    int ge = Tlv(der, generalEnd, p, type);
+                    if (ge < 0) { return null; }
+                    if (type == 130) { cert.dnsNames.Add(ReadString(der, p[0], ge - p[0])); }
+                    if (type == 135 && ge - p[0] == 4) {
+                        cert.ipAddresses.Add(Convert.ToString(der[p[0]] & 255) + "." + Convert.ToString(der[p[0] + 1] & 255)
+                            + "." + Convert.ToString(der[p[0] + 2] & 255) + "." + Convert.ToString(der[p[0] + 3] & 255));
+                    }
+                    p[0] = ge;
+                }
+            } else if (oidLen == 3 && (der[oidAt] & 255) == 85 && (der[oidAt + 1] & 255) == 29 && (der[oidAt + 2] & 255) == 37) {
+                cert.hasEku = true;
+                int ekuEnd = Tlv(der, octEnd, p, 48);
+                if (ekuEnd != octEnd) { return null; }
+                while (p[0] < ekuEnd) {
+                    int oe = Tlv(der, ekuEnd, p, 6);
+                    if (oe < 0) { return null; }
+                    byte[] serverOid = new byte[] { 43, 6, 1, 5, 5, 7, 3, 1 };
+                    if (oe - p[0] == 8) {
+                        bool eq = true;
+                        for (int j = 0; j < 8; j = j + 1) { if ((der[p[0] + j] & 255) != (serverOid[j] & 255)) { eq = false; } }
+                        if (eq) { cert.serverAuth = true; }
+                    }
+                    p[0] = oe;
+                }
+            } else if (critical) { return null; }
+            p[0] = itemEnd;
+        }
+        p[0] = tbsEnd;
+        if (!RsaSha256Algorithm(der, certEnd, p)) { return null; }
+        int sigEnd = Tlv(der, certEnd, p, 3);
+        if (sigEnd != certEnd || sigEnd - p[0] < 2 || (der[p[0]] & 255) != 0) { return null; }
+        cert.signature = new byte[sigEnd - p[0] - 1];
+        NativeMemory.Copy(cert.signature, (nint)der + (nint)(p[0] + 1), cert.signature.Length);
+        cert.issuerCN = SafeCommonName(der, cert.issuerNameStart, cert.issuerNameLen);
+        cert.subjectCN = SafeCommonName(der, cert.subjectNameStart, cert.subjectNameLen);
+        cert.issuer = "/CN=" + cert.issuerCN;
+        cert.subject = "/CN=" + cert.subjectCN;
+        return cert;
+    }
+
+    static string SafeCommonName(byte[] d, int start, int len) {
+        List<int> p = new List<int>(); p.Add(start);
+        int end = Tlv(d, start + len, p, 48);
+        if (end != start + len) { return ""; }
+        string cn = "";
+        while (p[0] < end) {
+            int setEnd = Tlv(d, end, p, 49);
+            if (setEnd < 0) { return ""; }
+            while (p[0] < setEnd) {
+                int seqEnd = Tlv(d, setEnd, p, 48);
+                if (seqEnd < 0) { return ""; }
+                int oidEnd = Tlv(d, seqEnd, p, 6);
+                if (oidEnd < 0) { return ""; }
+                bool common = Oid(d, p[0], oidEnd - p[0], 85, 4, 3);
+                p[0] = oidEnd;
+                if (p[0] >= seqEnd) { return ""; }
+                int tag = d[p[0]] & 255;
+                int valEnd = Tlv(d, seqEnd, p, tag);
+                if (valEnd != seqEnd) { return ""; }
+                if (common) { cn = ReadString(d, p[0], valEnd - p[0]); }
+                p[0] = seqEnd;
+            }
+            p[0] = setEnd;
+        }
+        return cn;
+    }
+
+    bool VerifySignedBy(X509Certificate issuerCert) {
+        if (issuerCert == null || issuerCert.rsaN == null || this.tbs == null || this.signature == null
+            || this.signature.Length != issuerCert.rsaNLen || this.issuerNameLen != issuerCert.subjectNameLen) { return false; }
+        for (int i = 0; i < this.issuerNameLen; i = i + 1) {
+            if ((this.rawDer[this.issuerNameStart + i] & 255) != (issuerCert.rawDer[issuerCert.subjectNameStart + i] & 255)) { return false; }
+        }
+        return Rsa.VerifyPkcs1Sha256(this.tbs, this.tbs.Length, this.signature,
+            issuerCert.rsaN, issuerCert.rsaNLen, issuerCert.rsaE, issuerCert.rsaELen);
+    }
+
+    bool VerifyHandshakeSignature(byte[] data, byte[] sig) {
+        if (data == null || sig == null || this.rsaN == null || sig.Length != this.rsaNLen) { return false; }
+        return Rsa.VerifyPkcs1Sha256(data, data.Length, sig, this.rsaN, this.rsaNLen, this.rsaE, this.rsaELen);
+    }
+
+    // RFC 8017 EMSA-PSS-VERIFY, SHA-256/MGF1-SHA256 and 32-byte salt (TLS 1.3 rsa_pss_rsae_sha256).
+    bool VerifyPssSha256(byte[] data, byte[] sig) {
+        if (data == null || sig == null || this.rsaN == null || sig.Length != this.rsaNLen || this.rsaNLen < 66
+            || (this.rsaN[0] & 255) < 128) { return false; }
+        byte[] em = Rsa.ModExp(sig, sig.Length, this.rsaN, this.rsaNLen, this.rsaE, this.rsaELen);
+        int dbLen = em.Length - 33;
+        if (dbLen < 33 || (em[em.Length - 1] & 255) != 188 || (em[0] & 128) != 0) { return false; }
+        byte[] h = new byte[32];
+        NativeMemory.Copy(h, (nint)em + (nint)dbLen, 32);
+        byte[] mask = Rsa.mgf1(h, 32, dbLen, 0);
+        byte[] db = new byte[dbLen];
+        for (int i = 0; i < dbLen; i = i + 1) { db[i] = (byte)((em[i] & 255) ^ (mask[i] & 255)); }
+        db[0] = (byte)(db[0] & 127);
+        int diff = (db[dbLen - 33] & 255) ^ 1;
+        for (int i = 0; i < dbLen - 33; i = i + 1) { diff = diff | (db[i] & 255); }
+        byte[] mhash = Sha256.Hash(data, data.Length);
+        byte[] mprime = new byte[72];
+        NativeMemory.Copy((nint)mprime + 8, mhash, 32);
+        NativeMemory.Copy((nint)mprime + 40, (nint)db + (nint)(dbLen - 32), 32);
+        byte[] expected = Sha256.Hash(mprime, 72);
+        for (int i = 0; i < 32; i = i + 1) { diff = diff | ((expected[i] & 255) ^ (h[i] & 255)); }
+        return diff == 0;
+    }
+
+    bool ValidNow() {
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        return this.tbs != null && now >= this.notBefore && now <= this.notAfter;
+    }
+
+    bool CanSignCertificates() { return this.isCa && (!this.hasKeyUsage || this.keyCertSign) && (!this.hasEku || this.serverAuth); }
+    bool CanServeTls() { return (!this.hasKeyUsage || this.digitalSignature) && (!this.hasEku || this.serverAuth); }
+
     /// <summary>从 DER 字节数组解析 X.509 证书。</summary>
-    static X509Certificate Parse(byte[] der, int len) {
+    static X509Certificate Parse(byte[] der, int len) { return ParseForTls(der, len); }
+
+    static X509Certificate ParseDisplay(byte[] der, int len) {
         if (der == null || len <= 0) { return null; }
         X509Certificate cert = new X509Certificate();
         cert.rawDer = new byte[len];
