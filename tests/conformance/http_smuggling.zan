@@ -156,6 +156,40 @@ class Program {
             Check(st == 400, "header leading colon rejected 400");
         }
 
+        // 11. HttpFramer trailer 累计预算：每行都短于单行 8KB 上限，
+        //     但数百行累加后必须拒绝，不能只检查单行长度。
+        //     Prime 直接注入完整线路字节，避免网络分片/超时影响断言。
+        {
+            string head = "POST /add HTTP/1.1\r\nHost: t\r\n"
+                + "Transfer-Encoding: chunked\r\n\r\n";
+            HttpFramer good = HttpFramer.Create(-1);
+            string shortWire = head + "0\r\nX-One: a\r\nX-Two: b\r\n\r\n";
+            good.Prime(shortWire, shortWire.Length);
+            int goodHe = await good.ReadHead(8192);
+            HttpRequest goodReq = HttpRequest.Parse(good.Head(goodHe), goodHe);
+            int goodSt = await good.ReadBody(goodReq, 1024);
+            Check(goodSt == 0 && goodReq.bodyLength == 0
+                && good.RequestBytes() == shortWire.Length,
+                "small chunk trailer accepted");
+            good.Dispose();
+
+            string longWire = head + "0\r\n";
+            string field = "X-Pad: ";
+            for (int j = 0; j < 700; j = j + 1) { field = field + "a"; }
+            field = field + "\r\n";
+            for (int i = 0; i < 100; i = i + 1) {
+                longWire = longWire + field;
+            }
+            longWire = longWire + "\r\n";
+            HttpFramer big = HttpFramer.Create(-1);
+            big.Prime(longWire, longWire.Length);
+            int bigHe = await big.ReadHead(8192);
+            HttpRequest bigReq = HttpRequest.Parse(big.Head(bigHe), bigHe);
+            int bigSt = await big.ReadBody(bigReq, 1024);
+            Check(bigSt == 400, "cumulative chunk trailer rejected 400");
+            big.Dispose();
+        }
+
         server.Stop();
         Console.WriteLine("failures=" + Convert.ToString(failures));
         // 停服后留几个泵转：accept 协程以 -1 复位并退出，退出时的

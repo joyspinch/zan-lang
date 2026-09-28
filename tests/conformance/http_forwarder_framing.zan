@@ -1,0 +1,180 @@
+// Exercise HttpForwarder framing over raw TCP: accepted chunked requests
+// reach the upstream intact; ambiguous or overflowing frames are rejected.
+using System;
+using System.Net.Sockets;
+using System.Net.Http.Proxy;
+
+namespace Conf;
+
+class Prog {
+    static int UP_PORT = 9641;
+    static int FWD_PORT = 9642;
+    static TcpListener listener;
+    static int upstreamRequests;
+    static string upstreamHead;
+    static string upstreamBody;
+
+    static int Find(string hay, string needle) {
+        for (int i = 0; i + needle.Length <= hay.Length; i = i + 1) {
+            int j = 0;
+            while (j < needle.Length && hay[i + j] == needle[j]) { j = j + 1; }
+            if (j == needle.Length) { return i; }
+        }
+        return -1;
+    }
+
+    static async void Upstream() {
+        Prog.listener = new TcpListener("127.0.0.1", Prog.UP_PORT);
+        Prog.listener.Start();
+        while (true) {
+            nint sock = await Prog.listener.AcceptAsync();
+            if (sock < 0) { break; }
+            Task.Spawn(Prog.ServeUpstream(sock));
+        }
+        Prog.listener.Stop();
+    }
+
+    static async void ServeUpstream(nint sock) {
+        string wire = "";
+        int end = -1;
+        while (end < 0) {
+            string piece = await Socket.RecvAsync(sock, 8192);
+            if (piece.Length == 0) { Socket.Close(sock); return; }
+            wire = wire + piece;
+            end = Prog.Find(wire, "\r\n\r\n");
+        }
+        string head = wire.Substring(0, end + 4);
+        if (Prog.Find(head, "POST /chunk ") >= 0) {
+            while (Prog.Find(wire, "0\r\n\r\n") < 0) {
+                string piece = await Socket.RecvAsync(sock, 8192);
+                if (piece.Length == 0) { Socket.Close(sock); return; }
+                wire = wire + piece;
+            }
+            Prog.upstreamHead = head;
+            Prog.upstreamBody = wire.Substring(end + 4, wire.Length - end - 4);
+            Prog.upstreamRequests = Prog.upstreamRequests + 1;
+            int _ok = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                + "Connection: close\r\n\r\nok");
+        } else if (Prog.Find(head, "GET /conflict ") >= 0) {
+            Prog.upstreamRequests = Prog.upstreamRequests + 1;
+            int _bad = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                + "Content-Length: 5\r\nConnection: close\r\n\r\n"
+                + "2\r\nok\r\n0\r\n\r\n");
+        } else if (Prog.Find(head, "GET /trailer ") >= 0) {
+            Prog.upstreamRequests = Prog.upstreamRequests + 1;
+            int _h = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                + "1\r\nx\r\n0\r\n");
+            string pad = "X-Pad: ";
+            for (int j = 0; j < 100; j = j + 1) { pad = pad + "a"; }
+            pad = pad + "\r\n";
+            for (int i = 0; i < 90; i = i + 1) {
+                int _t = await Socket.SendStringAsync(sock, pad);
+                if (_t < pad.Length) { break; }
+            }
+            int _end = await Socket.SendStringAsync(sock, "\r\n");
+        } else {
+            Prog.upstreamRequests = Prog.upstreamRequests + 1;
+            int _other = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n"
+                + "Connection: close\r\n\r\n");
+        }
+        Socket.Close(sock);
+    }
+
+    static async string Ask(string raw) {
+        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", Prog.FWD_PORT, 3000);
+        if (c == null) { return ""; }
+        int _send = await c.SendAsync(raw);
+        string result = "";
+        while (true) {
+            string piece = await c.RecvAsync(8192, 3000);
+            if (piece.Length == 0) { break; }
+            result = result + piece;
+        }
+        c.Close();
+        return result;
+    }
+
+    static void Check(bool cond, string name) {
+        Console.WriteLine((cond ? "ok " : "FAIL ") + name);
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Prog.upstreamRequests = 0;
+        Task.Spawn(Prog.Upstream());
+        HttpForwarder fwd = new HttpForwarder("127.0.0.1", Prog.FWD_PORT,
+            "http://127.0.0.1:" + Convert.ToString(Prog.UP_PORT));
+        fwd.SetTimeout(3000);
+        Task.Spawn(fwd.Start());
+        await Task.Delay(120);
+
+        string chunk = await Prog.Ask("POST /chunk HTTP/1.1\r\nHost: front\r\n"
+            + "X-Forwarded-For: forged.example\r\n"
+            + "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+        Prog.Check(Prog.Find(chunk, "200 OK") >= 0
+            && Prog.Find(chunk, "\r\n\r\nok") >= 0
+            && Prog.Find(Prog.upstreamHead, "Transfer-Encoding: chunked\r\n") >= 0
+            && Prog.Find(Prog.upstreamHead, "Content-Length:") < 0
+            && Prog.upstreamBody == "5\r\nhello\r\n0\r\n\r\n",
+            "chunked request forwarded with framing and body");
+        Prog.Check(Prog.Find(Prog.upstreamHead, "forged.example") < 0
+            && Prog.Find(Prog.upstreamHead, "X-Forwarded-For: 127.0.0.1\r\n") >= 0,
+            "spoofed XFF replaced with client address");
+
+        int before = Prog.upstreamRequests;
+        List<string> rejected = new List<string>();
+        List<string> names = new List<string>();
+        rejected.Add("Transfer-Encoding: chunked, chunked\r\n");
+        names.Add("duplicate chunked in one TE list");
+        rejected.Add("Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n");
+        names.Add("duplicate TE lines");
+        rejected.Add("Transfer-Encoding: , chunked\r\n");
+        names.Add("empty first TE member");
+        rejected.Add("Transfer-Encoding: chunked,\r\n");
+        names.Add("empty last TE member");
+        rejected.Add("Transfer-Encoding: \r\n");
+        names.Add("empty TE value");
+        rejected.Add("Content-Length: 9223372036854775808\r\n");
+        names.Add("CL greater than int64 max");
+        rejected.Add("Content-Length: \r\n");
+        names.Add("empty Content-Length value");
+        rejected.Add("Transfer-Encoding: chunked\r\nContent-Length: 5\r\n");
+        names.Add("request TE+CL conflict");
+        for (int i = 0; i < rejected.Count; i = i + 1) {
+            string resp = await Prog.Ask("POST /reject HTTP/1.1\r\nHost: front\r\n"
+                + rejected[i] + "\r\n");
+            Prog.Check(Prog.Find(resp, "400 Bad Request") >= 0
+                && Prog.upstreamRequests == before, names[i] + " rejected before forwarding");
+        }
+
+        string response = await Prog.Ask("GET /conflict HTTP/1.1\r\nHost: front\r\n\r\n");
+        Prog.Check(Prog.Find(response, "502 Bad Gateway") >= 0
+            && Prog.Find(response, "Transfer-Encoding:") < 0
+            && Prog.Find(response, "200 OK") < 0,
+            "upstream TE+CL response rejected before downstream relay");
+
+        // Each trailer line is below 8KB, but the combined size is above
+        // 8KB. The proxy must close the downstream response and retire the
+        // upstream connection, rather than reuse a half-consumed frame.
+        string trailer = await Prog.Ask("GET /trailer HTTP/1.1\r\nHost: front\r\n\r\n");
+        Prog.Check(Prog.Find(trailer, "200 OK") >= 0
+            && Prog.Find(trailer, "1\r\nx\r\n0\r\n") >= 0
+            && Prog.Find(trailer, "0\r\n\r\n") < 0,
+            "oversized upstream trailer closes incomplete response");
+        Prog.Check(fwd.UpstreamPool().IdleCount() == 0,
+            "oversized upstream trailer not pooled");
+
+        fwd.Stop();
+        if (Prog.listener != null) { Prog.listener.Stop(); }
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Prog.Run();
+    }
+}

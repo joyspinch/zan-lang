@@ -1,0 +1,55 @@
+// Many short fragments cross multiple capacity doublings. Check explicit lengths,
+// NUL preservation, empty completion and reuse after Complete without timing gates.
+using System;
+using System.Net.WebSocket;
+
+class Program {
+    static WsFrame Frame(int opcode, bool fin, byte[] payload, int len) {
+        byte[] wire = new byte[len + 7];
+        wire[0] = (byte)((fin ? 128 : 0) | opcode);
+        wire[1] = (byte)(128 | len);
+        // Zero masking key: exercise the masked decoder without changing payload.
+        for (int i = 0; i < len; i = i + 1) { wire[6 + i] = payload[i]; }
+        return WsFrame.DecodeAt(wire.ToStr(0, len + 6), 0, len + 6);
+    }
+
+    static int Main() {
+        WsAssembler asm = new WsAssembler(100000);
+        byte[] fragment = new byte[97];
+        for (int i = 0; i < 97; i = i + 1) { fragment[i] = (byte)(65 + i % 26); }
+        fragment[17] = 0;
+        bool feeding = true;
+        for (int i = 0; i < 1024; i = i + 1) {
+            int opcode = i == 0 ? WsOpcode.Binary : WsOpcode.Continuation;
+            int status = asm.Feed(Program.Frame(opcode, i == 1023, fragment, 97));
+            if (status != (i == 1023 ? 1 : 0)) { feeding = false; }
+        }
+        Console.WriteLine("feed=" + (feeding ? "1" : "0"));
+        Console.WriteLine("length=" + (asm.MessageLen() == 1024 * 97 ? "1" : "0"));
+        Console.WriteLine("opcode=" + (asm.MessageOpcode() == WsOpcode.Binary ? "1" : "0"));
+        string msg = asm.Complete();
+        bool bytesOk = msg[0] == 65 && msg[17] == 0 && msg[18] == fragment[18]
+            && msg[97 + 17] == 0 && msg[1023 * 97 + 17] == 0
+            && msg[1023 * 97 + 96] == fragment[96];
+        Console.WriteLine("nul=" + (bytesOk ? "1" : "0"));
+        Console.WriteLine("reset=" + (asm.MessageLen() == 0 && asm.MessageOpcode() < 0 ? "1" : "0"));
+
+        byte[] next = new byte[4];
+        next[0] = 88; next[1] = 0; next[2] = 89;
+        int second = asm.Feed(Program.Frame(WsOpcode.Text, true, next, 3));
+        string reuse = asm.Complete();
+        Console.WriteLine("reuse=" + (second == 1 && reuse[0] == 88 && reuse[1] == 0
+            && reuse[2] == 89 && asm.MessageLen() == 0 ? "1" : "0"));
+
+        int empty = asm.Feed(Program.Frame(WsOpcode.Text, true, next, 0));
+        string emptyMsg = asm.Complete();
+        Console.WriteLine("empty=" + (empty == 1 && emptyMsg == "" && asm.MessageLen() == 0 ? "1" : "0"));
+        Console.WriteLine("orphan=" + (asm.Feed(Program.Frame(WsOpcode.Continuation, true, next, 1)) == -1 ? "1" : "0"));
+
+        WsAssembler limit = new WsAssembler(100);
+        int first = limit.Feed(Program.Frame(WsOpcode.Binary, false, fragment, 97));
+        int overflow = limit.Feed(Program.Frame(WsOpcode.Continuation, true, next, 4));
+        Console.WriteLine("limit=" + (first == 0 && overflow == -2 && limit.MessageLen() == 97 ? "1" : "0"));
+        return 0;
+    }
+}

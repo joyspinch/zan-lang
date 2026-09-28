@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.Tls;
@@ -74,6 +75,45 @@ class FwdChannel {
                 n = await this.tls.SendAsync(rest, rest.Length);
             } else {
                 n = await Socket.SendAsync(this.sock, rest, rest.Length);
+            }
+            if (n <= 0) { return sent; }
+            sent = sent + n;
+        }
+        return sent;
+    }
+
+    /// <summary>接收原始字节到 data，返回真实字节数；0 表示关闭或失败。
+    /// 不经 string.Length/strlen，正文中的 NUL 不会被当成 EOF。</summary>
+    async int RecvBytesAsync(byte[] data, int max) {
+        if (this.closed || data == null || max <= 0) { return 0; }
+        int want = max;
+        if (want > data.Length) { want = data.Length; }
+        HttpDeadlineToken watch = HttpDeadline.Arm(this.sock, this.idleMs);
+        try {
+            int n;
+            if (this.tls != null) {
+                n = await this.tls.RecvBytesAsync(data, 0, want);
+            } else {
+                n = await Socket.RecvBytesAsync(this.sock, data, want);
+            }
+            if (HttpDeadline.Expired(watch)) { return 0; }
+            return n > 0 ? n : 0;
+        } finally {
+            HttpDeadline.Disarm(watch);
+        }
+    }
+
+    /// <summary>发送字节数组切片，部分写入时继续发送；返回实际发送数。</summary>
+    async int SendAllBytesAsync(byte[] data, int offset, int len) {
+        if (this.closed || data == null || offset < 0 || len <= 0
+            || offset > data.Length || len > data.Length - offset) { return 0; }
+        int sent = 0;
+        while (sent < len) {
+            int n;
+            if (this.tls != null) {
+                n = await this.tls.SendBytesAsync(data, offset + sent, len - sent);
+            } else {
+                n = await Socket.SendBytesAsync(this.sock, data, offset + sent, len - sent);
             }
             if (n <= 0) { return sent; }
             sent = sent + n;
@@ -239,108 +279,124 @@ class FwdPool {
 }
 
 /// <summary>
-/// 带前瞻缓冲的链路读取器。转发要按行/按定长切出协议帧
-/// （请求头块、分块长度行），又不能吞掉属于下一帧的字节，
-/// 因此多读到的部分留在缓冲里，由 <see cref="TakeBuffered"/>
-/// 交给下一段直接转发——这是"边收边转"不丢字节的关键。
+/// 带前瞻缓冲的链路读取器：协议头按文本读，正文按真实字节数读。
+/// 同包到达的正文留在 ByteBuffer 中，不能用 strlen 截断 NUL。
 /// </summary>
 class FwdReader {
     FwdChannel ch;
-    string buf;
+    ByteBuffer buf;
+    byte[] recv;
     bool eof;
     int chunkBytes;
 
     /// <summary><paramref name="chunkBytes"/> 为单批读取与转发的块大小（字节）。</summary>
     FwdReader(FwdChannel ch, int chunkBytes) {
         this.ch = ch;
-        this.buf = "";
+        this.buf = ByteBuffer.Alloc(chunkBytes);
+        this.recv = new byte[chunkBytes];
         this.eof = false;
         this.chunkBytes = chunkBytes;
+    }
+
+    ~FwdReader() {
+        this.buf.Free();
     }
 
     /// <summary>再读一批到缓冲；对端关闭时返回 false。</summary>
     async bool FillAsync() {
         if (this.eof) { return false; }
-        string c = await this.ch.RecvAsync(this.chunkBytes);
-        if (c.Length == 0) {
+        int n = await this.ch.RecvBytesAsync(this.recv, this.chunkBytes);
+        if (n <= 0) {
             this.eof = true;
             return false;
         }
-        this.buf = this.buf + c;
+        this.buf.WriteBytes((nint)this.recv, n);
         return true;
     }
 
-    /// <summary>读到请求/响应头块结束（含空行），最多 `cap` 字节；
-    /// 未见结束空行就断开或超过上限时返回空串。多读的正文字节
-    /// 留在缓冲中。</summary>
+    /// <summary>读到头块结束（含空行），正文仍留在原始字节缓冲中。</summary>
     async string ReadHeadAsync(int cap) {
         int scan = 0;
         while (true) {
-            int idx = HttpForwarder.IndexOf(this.buf, "\r\n\r\n", scan);
-            if (idx >= 0) {
-                string head = this.buf.Substring(0, idx + 4);
-                this.buf = this.buf.Substring(idx + 4, this.buf.Length - idx - 4);
-                return head;
+            int len = this.buf.Length();
+            int idx = this.buf.IndexOfByte(scan, 13);
+            while (idx >= 0 && idx + 3 < len) {
+                if (this.buf.ByteAt(idx + 1) == 10
+                    && this.buf.ByteAt(idx + 2) == 13
+                    && this.buf.ByteAt(idx + 3) == 10) {
+                    int nul = this.buf.IndexOfByte(0, 0);
+                    if (idx + 4 > cap || (nul >= 0 && nul < idx + 4)) {
+                        return "";
+                    }
+                    string head = this.buf.Str(0, idx + 4);
+                    this.buf.Discard(idx + 4);
+                    return head;
+                }
+                idx = this.buf.IndexOfByte(idx + 1, 13);
             }
-            if (this.buf.Length >= cap) { return ""; }
-            scan = this.buf.Length - 3;
+            if (len >= cap) { return ""; }
+            scan = len - 3;
             if (scan < 0) { scan = 0; }
-            bool more = await this.FillAsync();
-            if (!more) { return ""; }
+            if (!await this.FillAsync()) { return ""; }
         }
         return "";
     }
 
-    /// <summary>读到行尾（含 CRLF），最多 `cap` 字节；行不完整就
-    /// 断开时返回空串。分块编码的长度行/尾部用它。</summary>
+    /// <summary>读到行尾（含 CRLF），正文原样保留在缓冲中。</summary>
     async string ReadLineAsync(int cap) {
         int scan = 0;
         while (true) {
-            int idx = HttpForwarder.IndexOf(this.buf, "\r\n", scan);
-            if (idx >= 0) {
-                string line = this.buf.Substring(0, idx + 2);
-                this.buf = this.buf.Substring(idx + 2, this.buf.Length - idx - 2);
-                return line;
+            int len = this.buf.Length();
+            int idx = this.buf.IndexOfByte(scan, 13);
+            while (idx >= 0 && idx + 1 < len) {
+                if (this.buf.ByteAt(idx + 1) == 10) {
+                    int nul = this.buf.IndexOfByte(0, 0);
+                    if (idx + 2 > cap || (nul >= 0 && nul < idx + 2)) {
+                        return "";
+                    }
+                    string line = this.buf.Str(0, idx + 2);
+                    this.buf.Discard(idx + 2);
+                    return line;
+                }
+                idx = this.buf.IndexOfByte(idx + 1, 13);
             }
-            if (this.buf.Length >= cap) { return ""; }
-            scan = this.buf.Length - 1;
+            if (len >= cap) { return ""; }
+            scan = len - 1;
             if (scan < 0) { scan = 0; }
-            bool more = await this.FillAsync();
-            if (!more) { return ""; }
+            if (!await this.FillAsync()) { return ""; }
         }
         return "";
     }
 
-    /// <summary>取出当前已缓冲的字节（可能为空），最多 `max` 个；
-    /// 缓冲为空时先读一批。对端关闭且无缓冲时返回空串。</summary>
-    async string ReadSomeAsync(int max) {
-        if (this.buf.Length == 0) {
-            bool more = await this.FillAsync();
-            if (!more) { return ""; }
+    /// <summary>取至多 max 个原始字节，返回真实字节数；0 表示 EOF。</summary>
+    async int ReadSomeBytesAsync(byte[] data, int max) {
+        if (data == null || max <= 0) { return 0; }
+        if (this.buf.Length() == 0) {
+            if (!await this.FillAsync()) { return 0; }
         }
-        int n = this.buf.Length;
-        if (n > max) { n = max; }
-        string piece = this.buf.Substring(0, n);
-        this.buf = this.buf.Substring(n, this.buf.Length - n);
-        return piece;
+        return this.TakeBufferedBytes(data, max);
     }
 
-    /// <summary>取走并清空缓冲（不再读取）。</summary>
-    string TakeBuffered() {
-        string b = this.buf;
-        this.buf = "";
-        return b;
+    /// <summary>仅取缓冲中已有字节，不读套接字。可循环取至返回 0。</summary>
+    int TakeBufferedBytes(byte[] data, int max) {
+        if (data == null || max <= 0) { return 0; }
+        int n = this.buf.Length();
+        if (n > max) { n = max; }
+        if (n > data.Length) { n = data.Length; }
+        if (n <= 0) { return 0; }
+        NativeMemory.Copy((nint)data, this.buf.Raw(), n);
+        this.buf.Discard(n);
+        return n;
     }
 
     /// <summary>对端已关闭且缓冲取尽——链路已读到 EOF，不可再复用。</summary>
     bool AtEof() {
-        return this.eof && this.buf.Length == 0;
+        return this.eof && this.buf.Length() == 0;
     }
 
-    /// <summary>缓冲已空且对端未关闭——即这条链路正好停在一帧的
-    /// 边界上，可以安全地留给下一个请求。</summary>
+    /// <summary>缓冲已空且对端未关闭——正好停在帧边界。</summary>
     bool Drained() {
-        return this.buf.Length == 0 && !this.eof;
+        return this.buf.Length() == 0 && !this.eof;
     }
 }
 
@@ -682,6 +738,14 @@ class HttpForwarder {
             client.Close();
             return;
         }
+        if (!HttpForwarder.IsBodyFramingValid(rhead, false)) {
+            int _badResponse = await client.SendAllAsync(
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n"
+                + "Connection: close\r\n\r\n");
+            up.Close();
+            client.Close();
+            return;
+        }
         // 响应头立刻回传：下游据此开始渲染（SSE 客户端要拿到
         // Content-Type: text/event-stream 才会进入事件循环）。
         string downHead = HttpForwarder.RewriteResponseHead(rhead);
@@ -796,36 +860,22 @@ class HttpForwarder {
             || (!this.upTls && this.upPort != 80)) {
             hostValue = this.upHost + ":" + Convert.ToString(this.upPort);
         }
-        string fwd = "";
         bool chunked = HttpForwarder.HeadIsChunked(head);
         for (int i = 0; i < lines.Count; i = i + 1) {
             string line = lines[i];
             if (i == 0) { outHead = outHead + line + "\r\n"; continue; }
             string name = HttpForwarder.LowerName(line);
             if (name == "host") { continue; }
-            // Transfer-Encoding: chunked 需要原样透传，否则上游会
-            // 按无正文解析，而实际 chunk 数据仍在继续转发。
-            if (name == "transfer-encoding") {
-                if (chunked && HttpForwarder.Trim(HttpForwarder.Lower(
-                        HttpForwarder.HeaderValueOfLine(line))) == "chunked") {
-                    outHead = outHead + line + "\r\n";
-                }
+            if (name == "transfer-encoding" || name == "x-forwarded-for") {
                 continue;
             }
             if (HttpForwarder.IsHopByHop(name)) { continue; }
-            if (name == "x-forwarded-for") {
-                fwd = HttpForwarder.HeaderValueOfLine(line);
-                continue;
-            }
             outHead = outHead + line + "\r\n";
         }
         outHead = outHead + "Host: " + hostValue + "\r\n";
+        if (chunked) { outHead = outHead + "Transfer-Encoding: chunked\r\n"; }
         if (peer.Length > 0) {
-            if (fwd.Length > 0) { fwd = fwd + ", " + peer; }
-            else { fwd = peer; }
-        }
-        if (fwd.Length > 0) {
-            outHead = outHead + "X-Forwarded-For: " + fwd + "\r\n";
+            outHead = outHead + "X-Forwarded-For: " + peer + "\r\n";
         }
         if (this.pool != null) {
             outHead = outHead + "Connection: keep-alive\r\n\r\n";
@@ -918,14 +968,15 @@ class HttpForwarder {
     static async long PumpExact(FwdReader src, FwdChannel dst, long n,
             int chunkBytes) {
         long left = n;
+        byte[] data = new byte[chunkBytes];
         while (left > 0) {
             int want = chunkBytes;
             if (left < (long)want) { want = (int)left; }
-            string piece = await src.ReadSomeAsync(want);
-            if (piece.Length == 0) { return n - left; }
-            int w = await dst.SendAllAsync(piece);
-            if (w < piece.Length) { return n - left; }
-            left = left - (long)piece.Length;
+            int got = await src.ReadSomeBytesAsync(data, want);
+            if (got <= 0) { return n - left; }
+            int w = await dst.SendAllBytesAsync(data, 0, got);
+            if (w < got) { return n - left; }
+            left = left - (long)got;
         }
         return n;
     }
@@ -933,12 +984,13 @@ class HttpForwarder {
     /// <summary>一直搬运到源端关闭（无 Content-Length 的流式响应）。</summary>
     static async long PumpToEof(FwdReader src, FwdChannel dst, int chunkBytes) {
         long total = 0;
+        byte[] data = new byte[chunkBytes];
         while (true) {
-            string piece = await src.ReadSomeAsync(chunkBytes);
-            if (piece.Length == 0) { return total; }
-            int w = await dst.SendAllAsync(piece);
-            if (w < piece.Length) { return total; }
-            total = total + (long)piece.Length;
+            int got = await src.ReadSomeBytesAsync(data, chunkBytes);
+            if (got <= 0) { return total; }
+            int w = await dst.SendAllBytesAsync(data, 0, got);
+            if (w < got) { return total; }
+            total = total + (long)got;
         }
         return total;
     }
@@ -961,10 +1013,14 @@ class HttpForwarder {
             long size = HttpForwarder.ParseChunkSize(sizeLine);
             if (size < 0) { return -1; }
             if (size == 0) {
-                // 尾部头部（可能为空）以空行结束。
+                // trailer 不计入正文长度，单行及总量都必须单独限额。
+                int trailerBytes = 0;
                 while (true) {
-                    string trailer = await src.ReadLineAsync(chunkBytes);
-                    if (trailer.Length == 0) { return -1; }
+                    string trailer = await src.ReadLineAsync(8192);
+                    if (trailer.Length == 0 || trailerBytes + trailer.Length > 8192) {
+                        return -1;
+                    }
+                    trailerBytes = trailerBytes + trailer.Length;
                     int tw = await dst.SendAllAsync(trailer);
                     if (tw < trailer.Length) { return -1; }
                     if (trailer == "\r\n") { return total; }
@@ -991,13 +1047,18 @@ class HttpForwarder {
         // 操作，teardown 的 CancelIoEx 能把它以 0 字节（EOF）唤醒。
         a.SetIdleMs(0);
         b.SetIdleMs(0);
-        string pendingA = ar.TakeBuffered();
-        if (pendingA.Length > 0) {
-            int _wa = await b.SendAllAsync(pendingA);
+        byte[] pending = new byte[chunkBytes];
+        int count = ar.TakeBufferedBytes(pending, chunkBytes);
+        while (count > 0) {
+            int written = await b.SendAllBytesAsync(pending, 0, count);
+            if (written < count) { a.Close(); b.Close(); return; }
+            count = ar.TakeBufferedBytes(pending, chunkBytes);
         }
-        string pendingB = br.TakeBuffered();
-        if (pendingB.Length > 0) {
-            int _wb = await a.SendAllAsync(pendingB);
+        count = br.TakeBufferedBytes(pending, chunkBytes);
+        while (count > 0) {
+            int written = await a.SendAllBytesAsync(pending, 0, count);
+            if (written < count) { a.Close(); b.Close(); return; }
+            count = br.TakeBufferedBytes(pending, chunkBytes);
         }
         List<long> tasks = new List<long>();
         tasks.Add(Task.Spawn(HttpForwarder.PumpUntilClose(a, b, chunkBytes)));
@@ -1009,11 +1070,12 @@ class HttpForwarder {
     /// 让另一方向也随之收到 EOF。</summary>
     static async void PumpUntilClose(FwdChannel src, FwdChannel dst,
             int chunkBytes) {
+        byte[] data = new byte[chunkBytes];
         while (true) {
-            string piece = await src.RecvAsync(chunkBytes);
-            if (piece.Length == 0) { break; }
-            int w = await dst.SendAllAsync(piece);
-            if (w < piece.Length) { break; }
+            int got = await src.RecvBytesAsync(data, chunkBytes);
+            if (got <= 0) { break; }
+            int w = await dst.SendAllBytesAsync(data, 0, got);
+            if (w < got) { break; }
         }
         // 自己这一侧完整关闭；对端方向只 shutdown——它可能还挂在
         // dst 的读上（轮询式带超时接收对已关闭的 fd 永远探不到
@@ -1138,7 +1200,8 @@ class HttpForwarder {
             int b = v[i] & 255;
             if (b < 48 || b > 57) { return -2; }
             // 检查溢出：n > (LLONG_MAX - digit) / 10
-            if (n > 922337203685477580L) { return -2; }
+            if (n > 922337203685477580L
+                || (n == 922337203685477580L && b > 55)) { return -2; }
             n = n * 10 + (long)(b - 48);
         }
         return n;
@@ -1151,9 +1214,8 @@ class HttpForwarder {
     static bool IsBodyFramingValid(string head, bool isRequest) {
         List<string> lines = HttpForwarder.HeadLines(head);
         int clCount = 0;
-        string clValue = "";
+        int teCount = 0;
         string combinedTe = "";
-        bool hasTe = false;
         for (int i = 1; i < lines.Count; i = i + 1) {
             string line = lines[i];
             int colon = HttpForwarder.IndexOf(line, ":", 0);
@@ -1170,47 +1232,26 @@ class HttpForwarder {
             string name = HttpForwarder.Lower(line.Substring(0, colon));
             if (name == "content-length") {
                 clCount = clCount + 1;
-                clValue = HttpForwarder.Trim(
-                    line.Substring(colon + 1, line.Length - colon - 1));
             } else if (name == "transfer-encoding") {
-                hasTe = true;
-                string v = HttpForwarder.Trim(
+                teCount = teCount + 1;
+                combinedTe = HttpForwarder.Trim(
                     line.Substring(colon + 1, line.Length - colon - 1));
-                if (combinedTe.Length > 0) {
-                    combinedTe = combinedTe + ", " + v;
-                } else {
-                    combinedTe = v;
-                }
             }
         }
         // 多个 Content-Length 行：即使值相同也拒绝（RFC 允许合并，
         // 但转发器选择 fail-closed——上游与我们对合并语义的理解
         // 一旦分歧就是请求走私）。
-        if (clCount > 1) { return false; }
+        if (clCount > 1 || teCount > 1) { return false; }
 
         bool hasCl = clCount == 1;
-        if (hasTe && hasCl) { return false; }
-        if (hasTe) {
-            string teValue = HttpForwarder.Lower(combinedTe);
-            List<string> parts = HttpForwarder.SplitCsv(teValue);
-            for (int i = 0; i < parts.Count; i = i + 1) {
-                string enc = HttpForwarder.Trim(parts[i]);
-                // 只有 chunked 作为最后一项才合法；其他编码
-                // （如 gzip）应由应用层处理，转发器不支持。
-                if (enc == "chunked") {
-                    if (i != parts.Count - 1) { return false; }
-                } else if (enc == "identity") {
-                    // identity 不应出现在 TE 中（默认即 identity）
-                    if (isRequest) { return false; }
-                } else {
-                    // 未知的 transfer-coding 拒绝转发，避免走私
-                    return false;
-                }
-            }
-            if (parts.Count == 0) { return false; }
+        if (teCount > 0 && hasCl) { return false; }
+        if (teCount > 0) {
+            // 只支持单一 chunked；空项、重复编码及其他编码必须拒绝，
+            // 否则解析出的正文边界可能与转发给下一跳的头部不一致。
+            if (HttpForwarder.Lower(combinedTe) != "chunked") { return false; }
         }
         long cl = HttpForwarder.ContentLengthOf(head);
-        if (cl == -2) { return false; }
+        if (cl == -2 || (hasCl && cl < 0)) { return false; }
         return true;
     }
 

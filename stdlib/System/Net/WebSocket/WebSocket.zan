@@ -703,10 +703,9 @@ class WsWriter {
 /// </summary>
 class WsAssembler {
     int opcode;      // -1 = 无分片进行中
-    string data;
     int dataLen;
     int maxLen;
-    // 双倍增量的累积缓冲（显式容量），避免每帧按全长重新分配。
+    // 双倍增量的累积缓冲（显式长度/容量），交付时才转换为 string。
     byte[] dataBuf;
     int bufCap;
 
@@ -714,7 +713,6 @@ class WsAssembler {
     /// / 服务器各路径使用。
     WsAssembler(int maxLen) {
         this.opcode = 0 - 1;
-        this.data = "";
         this.dataLen = 0;
         this.maxLen = maxLen;
         this.dataBuf = null;
@@ -737,9 +735,7 @@ class WsAssembler {
         int newLen = this.dataLen + frame.payloadLen;
         if (newLen > this.maxLen) { return 0 - 2; }
         if (frame.payloadLen > 0) {
-            // 双倍增量的显式长度缓冲：整条消息只在交付时转换一次。
-            // 此前每帧都按 newLen 新分配并整体拷贝前缀，一条 16MiB
-            // 消息用 125 字节帧发送就是 ~13 万次 Feed、~1TB 的拷贝。
+            // 翻倍扩容只搬移旧字节；不在每帧转换整条消息。
             int cap = this.bufCap > 0 ? this.bufCap : 1024;
             if (newLen > cap) {
                 while (cap < newLen) { cap = cap * 2; }
@@ -747,28 +743,23 @@ class WsAssembler {
             if (cap != this.bufCap) {
                 byte[] nb = new byte[cap + 1];
                 if (this.dataLen > 0) {
-                    NativeMemory.PutString((nint)nb, 0, this.data, this.dataLen);
+                    NativeMemory.Copy((nint)nb, (nint)this.dataBuf, this.dataLen);
                 }
                 this.dataBuf = nb;
                 this.bufCap = cap;
             }
-            if (frame.payloadLen > 0) {
-                NativeMemory.PutString((nint)this.dataBuf, this.dataLen, frame.payload, frame.payloadLen);
-            }
-            // 显式长度转换：`+` 按 strlen 定长，会在第一个 NUL 处截断
-            // 二进制负载；ToStr 按字节计数，NUL 原样保留。
-            this.data = this.dataBuf.ToStr(0, newLen);
+            NativeMemory.PutString((nint)this.dataBuf, this.dataLen, frame.payload, frame.payloadLen);
         }
         this.dataLen = newLen;
         if (frame.fin) { return 1; }
         return 0;
     }
 
-    /// <summary>取出重组完成的消息并复位状态。</summary>
+    /// <summary>取出重组完成的消息并复位状态。按显式长度一次转换，
+    /// 内嵌 NUL 仍是消息的一部分；保留缓冲容量供下一条消息复用。</summary>
     string Complete() {
-        string m = this.data;
+        string m = this.dataLen > 0 ? this.dataBuf.ToStr(0, this.dataLen) : "";
         this.opcode = 0 - 1;
-        this.data = "";
         this.dataLen = 0;
         return m;
     }

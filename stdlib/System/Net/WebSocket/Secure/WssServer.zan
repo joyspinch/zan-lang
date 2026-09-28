@@ -29,6 +29,7 @@ class WssServer {
     bool running;
     int activeConnections;
     int maxConnections;
+    int requestTimeoutMs;
     WssMessageHandler messageHandler;
 
     /// 内部构造：无 TLS 上下文；经 Create 使用。
@@ -38,6 +39,7 @@ class WssServer {
         this.running = false;
         this.activeConnections = 0;
         this.maxConnections = 10000;
+        this.requestTimeoutMs = 30000;
         this.messageHandler = null;
         this.tls = null;
     }
@@ -66,6 +68,13 @@ class WssServer {
     /// SSL/BIO 与缓冲，必须设闸）。</summary>
     WssServer SetMaxConnections(int max) {
         this.maxConnections = max;
+        return this;
+    }
+
+    /// <summary>设置 TLS 握手及 Upgrade 头的超时（毫秒）。默认 30 秒；
+    /// 非正值禁用超时，建立连接后的帧循环不受此限制。</summary>
+    WssServer SetTimeout(int ms) {
+        this.requestTimeoutMs = ms;
         return this;
     }
 
@@ -134,12 +143,15 @@ class WssServer {
     /// HandleConnection 的服务体；计数归还见 HandleConnection 的 finally。
     async void HandleConnectionInner(nint clientSock) {
         Socket.SetNonBlocking(clientSock);
-        TlsStream stream = await TlsStream.AcceptAsync(this.tls, clientSock);
+        // TLS 协商也必须受配置的时限约束，不能只给 Upgrade 头设限。
+        TlsStream stream = await TlsStream.AcceptAsync(this.tls, clientSock,
+            this.requestTimeoutMs);
         if (stream == null) {
             Socket.Close(clientSock);
             return;
         }
 
+        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
         try {
             // 握手与后续帧共用一个 WsReader（TLS 字节源）：握手可能被
             // TLS 记录边界拆开，而与握手同批到达的首帧字节可能含 NUL
@@ -149,18 +161,19 @@ class WssServer {
             bool alive = true;
             while (alive) {
                 headerEnd = reader.FindHeaderEnd();
+                if (HttpDeadline.Expired(watch)) { alive = false; break; }
                 if (headerEnd >= 0) { break; }
-                if (reader.Buffered() > 65536) { alive = false; break; }
+                if (reader.Buffered() > 65536) {
+                    alive = false;
+                    break;
+                }
                 int n = await reader.FillMore();
-                if (n == 0) { alive = false; }
+                if (n <= 0 || HttpDeadline.Expired(watch)) { alive = false; }
             }
-            if (!alive) {
-                stream.Close();
-                Socket.Close(clientSock);
-                return;
-            }
+            if (!alive) { return; }
 
             string head = reader.Slice(headerEnd);
+            if (HttpDeadline.Expired(watch)) { return; }
             HttpRequest req = HttpRequest.Parse(head);
 
             string upgrade = req.GetHeader("Upgrade");
@@ -192,7 +205,12 @@ class WssServer {
             sb.Append(acceptKey);
             sb.Append("\r\n\r\n");
             string hs = sb.ToString();
+            if (HttpDeadline.Expired(watch)) { return; }
             int _h = await stream.SendAsync(hs, hs.Length);
+            bool timedOut = HttpDeadline.Expired(watch);
+            HttpDeadline.Disarm(watch);
+            watch = null;
+            if (_h < 0 || timedOut) { return; }
 
             // 与升级请求同批到达的首批帧已留在 reader 里，跳过握手
             // 字节继续使用即可。
@@ -272,6 +290,7 @@ class WssServer {
             stream.Close();
             Socket.Close(clientSock);
         } finally {
+            HttpDeadline.Disarm(watch);
             // 异常路径兜底：上面的正常关闭是幂等关闭（Close 幂等），
             // 异常时由这里保证 fd/SSL 一定释放。
             stream.Close();

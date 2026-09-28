@@ -1,0 +1,105 @@
+// A request and response with embedded NUL bytes, including body bytes
+// arriving in the same receive as the HTTP head, must round-trip unchanged.
+using System;
+using System.Net.Sockets;
+using System.Net.Http.Proxy;
+
+namespace Conf;
+
+class Prog {
+    static int UP_PORT = 9633;
+    static int FWD_PORT = 9634;
+    static bool requestOk;
+
+    static void WriteBody(byte[] bytes, int offset) {
+        bytes[offset] = 65;
+        bytes[offset + 1] = 0;
+        bytes[offset + 2] = 66;
+        bytes[offset + 3] = 0;
+        bytes[offset + 4] = 67;
+    }
+
+    static bool BodyEquals(byte[] bytes, int offset, int received) {
+        return offset >= 0 && offset + 5 <= received
+            && bytes[offset] == 65 && bytes[offset + 1] == 0
+            && bytes[offset + 2] == 66 && bytes[offset + 3] == 0
+            && bytes[offset + 4] == 67;
+    }
+
+    static int HeadEnd(byte[] bytes, int n) {
+        for (int i = 0; i + 3 < n; i = i + 1) {
+            if (bytes[i] == 13 && bytes[i + 1] == 10
+                && bytes[i + 2] == 13 && bytes[i + 3] == 10) {
+                return i + 4;
+            }
+        }
+        return -1;
+    }
+
+    static async void Upstream() {
+        TcpListener listener = new TcpListener("127.0.0.1", Prog.UP_PORT);
+        listener.Start();
+        nint c = await listener.AcceptAsync();
+        if (c >= 0) {
+            byte[] request = new byte[1024];
+            int received = 0;
+            int bodyAt = -1;
+            while (received < request.Length) {
+                byte[] piece = new byte[1024];
+                int n = await Socket.RecvBytesAsync(c, piece, piece.Length);
+                if (n <= 0) { break; }
+                NativeMemory.Copy((nint)request + received, (nint)piece, n);
+                received = received + n;
+                bodyAt = Prog.HeadEnd(request, received);
+                if (bodyAt >= 0 && received >= bodyAt + 5) { break; }
+            }
+            Prog.requestOk = Prog.BodyEquals(request, bodyAt, received);
+            string head = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n";
+            byte[] response = new byte[head.Length + 5];
+            NativeMemory.PutString((nint)response, 0, head, head.Length);
+            Prog.WriteBody(response, head.Length);
+            int _sent = await Socket.SendAsync(c, response, response.Length);
+            Socket.Close(c);
+        }
+        listener.Stop();
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Task.Spawn(Prog.Upstream());
+        HttpForwarder proxy = new HttpForwarder("127.0.0.1", Prog.FWD_PORT,
+            "http://127.0.0.1:" + Convert.ToString(Prog.UP_PORT));
+        proxy.SetTimeout(10000);
+        Task.Spawn(proxy.Start());
+        await Task.Delay(120);
+        TcpClient client = await TcpClient.ConnectAsync("127.0.0.1", Prog.FWD_PORT, 5000);
+        if (client == null) { Console.WriteLine("connect failed"); proxy.Stop(); return 1; }
+        string head = "POST /nul HTTP/1.1\r\nHost: front\r\nContent-Length: 5\r\n\r\n";
+        byte[] request = new byte[head.Length + 5];
+        NativeMemory.PutString((nint)request, 0, head, head.Length);
+        Prog.WriteBody(request, head.Length);
+        int _sent = await Socket.SendAsync(client.Sock(), request, request.Length);
+
+        byte[] response = new byte[1024];
+        int received = 0;
+        while (received < response.Length) {
+            byte[] piece = new byte[1024];
+            int n = await Socket.RecvBytesAsync(client.Sock(), piece, piece.Length);
+            if (n <= 0) { break; }
+            NativeMemory.Copy((nint)response + received, (nint)piece, n);
+            received = received + n;
+        }
+        int bodyAt = Prog.HeadEnd(response, received);
+        Console.WriteLine("request-binary: " + Convert.ToString(Prog.requestOk ? 1 : 0));
+        Console.WriteLine("response-binary: "
+            + Convert.ToString(Prog.BodyEquals(response, bodyAt, received) ? 1 : 0));
+        client.Close();
+        proxy.Stop();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return 0;
+    }
+
+    static void Main() {
+        int result = await Prog.Run();
+    }
+}

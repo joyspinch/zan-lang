@@ -3,8 +3,8 @@ using System;
 namespace System.Net.Http.Client;
 
 /// <summary>
-/// 一条已存储的 cookie。<c>hostOnly</c> 区分 Set-Cookie 是否带了
-/// Domain 属性：不带时只回给设置它的那台主机，带时连子域一起匹配。
+/// 一条已存储的 cookie。缺少 PSL 时显式 Domain 也只回给响应主机；
+/// <c>hostOnly</c> 控制回放时是否允许匹配子域。
 /// <c>expires</c> 为 0 表示会话 cookie（进程内一直有效）。
 /// </summary>
 class Cookie {
@@ -135,15 +135,16 @@ class CookieJar {
             } else if (lower == "domain" && aval.Length > 0) {
                 string d = CookieJar.Lower(aval);
                 if ((d[0] & 255) == 46) { d = d.Substring(1, d.Length - 1); }
-                // RFC 6265 §5.3 第 6 步：Domain 与发起响应的请求主机
-                // 不域匹配就整条忽略（不是退回 host-only）。缺这一步时
-                // 攻击者可控的主机/子域可为主域或他域种 cookie——
-                // 会话固定、cookie 污染、超级 cookie。
+                // 没有可维护的 PSL 时无法判定 co.uk 等多标签公共后缀。
+                // 只接受与响应主机完全相同的 Domain；父域一律拒绝，
+                // 而不是用不完整的后缀硬编码名单放行跨主机种植。
                 if (!CookieJar.DomainAttributeOk(CookieJar.Lower(host), d)) {
                     return;
                 }
+                // 也不把完全相同的 Domain 扩展到子域：响应主机本身
+                // 可能就是公共后缀，缺少 PSL 时不能安全地识别例外。
                 c.domain = d;
-                c.hostOnly = false;
+                c.hostOnly = true;
             } else if (lower == "secure") {
                 c.secure = true;
             } else if (lower == "max-age") {
@@ -253,17 +254,14 @@ class CookieJar {
         return (host[hl - dl - 1] & 255) == 46;
     }
 
-    /// RFC 6265 §5.3 第 6 步：带 Domain 属性的 Set-Cookie 仅当请求主机
-    /// 域匹配该属性时才可接受。在 DomainMatches（相等或父域）之上再要求
-    /// domain 不是单标签顶层域，并对 IP 主机一律拒绝——否则攻击者可控的
-    /// 主机/子域就能为主域或他域种 cookie（会话固定、cookie 污染、
-    /// 超级 cookie）。
+    /// 没有 PSL 就无法分辨任意公共后缀与可注册域。Domain 属性
+    /// 只接受响应主机的完全相同拼写，且按 host-only 存储；这是
+    /// 保守的安全子集，不提供 RFC 6265 的跨子域 Domain 语义。
     static bool DomainAttributeOk(string host, string domain) {
         if (domain.Length == 0 || host.Length == 0) { return false; }
-        // RFC 6265 §5.3：请求主机是 IP 字面量时，Domain 属性一律忽略。
         if (CookieJar.IsIpHost(host)) { return false; }
-        if (!CookieJar.DomainMatches(host, domain, false)) { return false; }
-        // domain 至少要有一个点：拒绝 "com" 这类顶层域被当成可种域。
+        if (host != domain) { return false; }
+        // 单标签顶层域也不能借 Domain 属性种 cookie。
         for (int i = 0; i < domain.Length; i = i + 1) {
             if ((domain[i] & 255) == 46) { return true; }
         }
