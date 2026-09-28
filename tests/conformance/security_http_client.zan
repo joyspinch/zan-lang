@@ -1,0 +1,115 @@
+using System;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.Sockets;
+using System.Net.External;
+using System.Threading;
+
+class Program {
+    static int port = 9738;
+    static TcpListener listener;
+    static int postCount;
+    static int accepts;
+    static int failures;
+
+    static void Check(bool good, string name) {
+        if (!good) { Program.failures = Program.failures + 1; }
+        Console.WriteLine((good ? "ok " : "FAIL ") + name);
+    }
+
+    static async void ServeOne(nint sock) {
+        string req = "";
+        while (req.IndexOf("\r\n\r\n") < 0) {
+            string part = await Socket.RecvAsync(sock, 8192);
+            if (part.Length == 0) { Socket.Close(sock); return; }
+            req = req + part;
+        }
+        if (req.IndexOf("GET /warm ") == 0) {
+            int _warm = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            // Read the next request, then simulate an upstream that executed it
+            // but failed before sending its response.
+            req = "";
+            while (req.IndexOf("\r\n\r\n") < 0) {
+                string part2 = await Socket.RecvAsync(sock, 8192);
+                if (part2.Length == 0) { Socket.Close(sock); return; }
+                req = req + part2;
+            }
+            if (req.IndexOf("POST /pay ") == 0) {
+                Program.postCount = Program.postCount + 1;
+            }
+            Socket.Close(sock);
+            return;
+        }
+        if (req.IndexOf("POST /pay ") == 0) {
+            Program.postCount = Program.postCount + 1;
+        }
+        if (req.IndexOf("GET /short ") == 0) {
+            int _short = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc");
+        } else if (req.IndexOf("GET /good ") == 0) {
+            int _good = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        }
+        Socket.Close(sock);
+    }
+
+    static async void Serve() {
+        Program.listener = new TcpListener("127.0.0.1", Program.port);
+        Program.listener.Start();
+        while (true) {
+            nint sock = await Program.listener.AcceptAsync();
+            if (sock < 0) { break; }
+            Program.accepts = Program.accepts + 1;
+            Task.Spawn(Program.ServeOne(sock));
+        }
+        Program.listener.Stop();
+        Program.listener = null;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Task.Spawn(Program.Serve());
+        await Task.Delay(80);
+        HttpClient c = new HttpClient("127.0.0.1", Program.port);
+        c.SetTimeout(5000);
+        Program.Check(await c.GetAsync("/warm") == "ok", "pooled warm request");
+        bool refused = false;
+        try {
+            string _p = await c.PostAsync("/pay", "side-effect=yes");
+        } catch (HttpRequestException e) {
+            refused = true;
+        }
+        Program.Check(refused && Program.postCount == 1,
+            "pooled EOF never replays POST");
+        c.Close();
+        HttpClient one = new HttpClient("127.0.0.1", Program.port);
+        one.DisableKeepAlive();
+        bool empty = false;
+        try { string _e = await one.GetAsync("/empty"); }
+        catch (HttpRequestException e) { empty = true; }
+        Program.Check(empty, "empty text response rejected");
+        bool shortBody = false;
+        try { string _s = await one.GetAsync("/short"); }
+        catch (HttpRequestException e) { shortBody = true; }
+        Program.Check(shortBody, "truncated text response rejected");
+        HttpClient policy = new HttpClient("127.0.0.1", Program.port);
+        policy.SetCallPolicy(ExternalCallPolicy.Default().AllowLocalHttp()
+            .TotalTimeout(2000));
+        string first = await policy.GetAsync("/good");
+        await Task.Delay(2400);
+        string second = await policy.GetAsync("/good");
+        Program.Check(first == "ok" && second == "ok",
+            "independent policy request gets fresh deadline");
+        c.Close();
+        policy.Close();
+        Program.listener.Stop();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        return 0;
+    }
+
+    static void Main() {
+        int _r = await Program.Run();
+    }
+}

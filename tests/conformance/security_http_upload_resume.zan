@@ -1,0 +1,90 @@
+using System;
+using System.IO;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.External;
+using System.Net.Sockets;
+using System.Threading;
+
+class Program {
+    static int port = 9743;
+    static int failures;
+    static int uploaded;
+    static HttpServer server;
+    static string local = "security_http_upload_resume.bin";
+    static string progress = "security_http_upload_resume.progress";
+
+    static void Check(bool ok, string name) {
+        if (!ok) { Program.failures = Program.failures + 1; }
+        Console.WriteLine((ok ? "ok " : "FAIL ") + name);
+    }
+
+    static async HttpResponse Handle(HttpRequest req) {
+        if (req.path == "/upload") {
+            Program.uploaded = req.bodyLength;
+            return HttpResponse.Text("uploaded");
+        }
+        if (req.path == "/wrong") {
+            HttpResponse r = HttpResponse.WithStatus(416, "Range Not Satisfiable", "");
+            r.SetHeader("Content-Range", "bytes */9");
+            return r;
+        }
+        if (req.path == "/missing") {
+            return HttpResponse.WithStatus(416, "Range Not Satisfiable", "");
+        }
+        if (req.path == "/right") {
+            HttpResponse r = HttpResponse.WithStatus(416, "Range Not Satisfiable", "");
+            r.SetHeader("Content-Range", "bytes */3");
+            return r;
+        }
+        return HttpResponse.NotFound();
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Program.server = new HttpServer("127.0.0.1", Program.port);
+        Program.server.OnRequest(Program.Handle);
+        Task.Spawn(Program.server.Start());
+        await Task.Delay(80);
+        byte[] data = new byte[3];
+        data[0] = 97;
+        data[1] = 0;
+        data[2] = 98;
+        File.WriteAllBytes(Program.local, data);
+        HttpClient client = new HttpClient("127.0.0.1", Program.port);
+        client.SetCallPolicy(ExternalCallPolicy.Default().AllowLocalHttp().Redirects(1));
+        HttpResponse uploaded = await client.UploadFileBytesAsync("/upload", "file",
+            Program.local, "data.bin");
+        Program.Check(uploaded.statusCode == 200 && uploaded.body == "uploaded"
+            && Program.uploaded > 3,
+            "redirect-enabled upload sends multipart on first hop");
+        long wrong = await client.DownloadBinaryToFileAsync("/wrong", Program.local,
+            Program.progress);
+        Program.Check(wrong == -1 && File.GetSize(Program.local) == 3,
+            "binary resume rejects mismatched 416 total");
+        long missing = await client.DownloadBinaryToFileAsync("/missing", Program.local,
+            Program.progress);
+        Program.Check(missing == -1, "binary resume rejects bare 416");
+        long right = await client.DownloadBinaryToFileAsync("/right", Program.local,
+            Program.progress);
+        Program.Check(right == 3, "binary resume accepts matching 416 total");
+        int textWrong = await client.DownloadRangeToFileAsync("/wrong", Program.local,
+            Program.progress);
+        Program.Check(textWrong == -1, "text resume rejects mismatched 416 total");
+        int textRight = await client.DownloadRangeToFileAsync("/right", Program.local,
+            Program.progress);
+        Program.Check(textRight == 3, "text resume accepts matching 416 total");
+        client.Close();
+        File.Delete(Program.local);
+        File.Delete(Program.progress);
+        Program.server.Stop();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        Program.server = null;
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        return 0;
+    }
+
+    static void Main() {
+        int _r = await Program.Run();
+    }
+}

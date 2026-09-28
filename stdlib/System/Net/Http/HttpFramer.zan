@@ -108,6 +108,22 @@ class HttpFramer {
         return n;
     }
 
+    /// <summary>分块元数据/正文的受限接收；不能用 Fill 的固定 64KB
+    /// 读取无终止符的长度行，也不能让小块的线缆开销无限驻留。</summary>
+    async int FillTo(int maxPending) {
+        int room = maxPending - this.pend.Length();
+        if (room <= 0) { return -1; }
+        int want = this.bufCap;
+        if (want > room) { want = room; }
+        int n = this.recv != null
+            ? await this.recv(this.buf, want)
+            : await Socket.RecvIntoAsync(this.sock, this.buf, want);
+        if (n <= 0) { this.closed = true; return 0; }
+        if (n > room) { return -1; }
+        this.pend.WriteRaw(this.buf, n);
+        return n;
+    }
+
     /// <summary>头部结束空行之后的下标（即正文首字节的位置），
     /// 空行尚未到达时返回 -1。同时识别 CRLF 与单独 LF 分隔。</summary>
     int HeaderEnd() {
@@ -200,7 +216,7 @@ class HttpFramer {
     async int ReadBody(HttpRequest req, int maxBodyBytes) {
         int he = req.bodyStart;
         if (req.chunked) {
-            int st = await this.ReadChunked(req, he, maxBodyBytes);
+            int st = await this.ReadChunkedBody(req, null, he, maxBodyBytes);
             return st;
         }
         int total = req.contentLength;
@@ -220,6 +236,27 @@ class HttpFramer {
         req.body = this.pend.Str(he, total);
         req.bodyLength = total;
         this.wireBytes = he + total;
+        return 0;
+    }
+
+    /// <summary>响应体定界使用响应解析器，不能把状态行交给要求
+    /// request-target 与 Host 的 HttpRequest.Parse。ReadChunked 只借用
+    /// req 作为解码结果容器，不重新解析响应头。</summary>
+    async int ReadResponseBody(HttpResponse response, int headerLen,
+            int maxBodyBytes) {
+        if (response.framingChunked) {
+            return await this.ReadChunkedBody(null, response, headerLen,
+                maxBodyBytes);
+        }
+        int total = response.framingLength;
+        if (total > maxBodyBytes) { return 413; }
+        while (this.pend.Length() - headerLen < total) {
+            int n = await this.FillTo(headerLen + total);
+            if (n <= 0) { return -1; }
+        }
+        response.body = this.pend.Str(headerLen, total);
+        response.bodyBytesLen = total;
+        this.wireBytes = headerLen + total;
         return 0;
     }
 
@@ -295,22 +332,25 @@ class HttpFramer {
     /// 剩余字节当成下一条请求（走私）。等待 LF 的字节同样有上限
     /// （8KB）：一条不终止的"长度行"不计入正文限额，若无上限，
     /// 单条连接就能把待处理缓冲喂到任意大小。</summary>
-    async int ReadChunked(HttpRequest req, int he, int maxBodyBytes) {
+    async int ReadChunkedBody(HttpRequest req, HttpResponse response, int he,
+            int maxBodyBytes) {
         ByteBuffer acc = ByteBuffer.Alloc(4096);
         int pos = he;              // 线路上的读游标
         int decoded = 0;
         while (true) {
             // 长度行：至少要有一个 LF 才能确定它已完整到达。行内字节
             // （含扩展）超过 8KB 视为畸形——合法长度行远短于此。
-            int lf = this.IndexOfLf(pos);
+            int scan = pos;
+            int lf = this.IndexOfLf(scan);
             while (lf < 0) {
-                int n = await this.Fill();
-                if (n == 0) { acc.Free(); return -1; }
-                lf = this.IndexOfLf(pos);
-                if (lf < 0 && this.pend.Length() - pos > 8192) {
-                    acc.Free();
-                    return 400;
+                if (this.pend.Length() - pos >= 8193) {
+                    acc.Free(); return 400;
                 }
+                scan = this.pend.Length();
+                int n = await this.FillTo(pos + 8194);
+                if (n < 0) { acc.Free(); return 400; }
+                if (n == 0) { acc.Free(); return -1; }
+                lf = this.IndexOfLf(scan);
             }
             if (lf - pos > 8192) {
                 acc.Free();
@@ -344,9 +384,12 @@ class HttpFramer {
                 pos = end;
                 break;
             }
-            if (decoded + size > maxBodyBytes) { acc.Free(); return 413; }
+            if (size > (long)maxBodyBytes - decoded) { acc.Free(); return 413; }
+            // 仅保留当前块和紧随其后的分隔符；完整块消费后
+            // Discard 已解码线路前缀，不能让大量微小块把 pend 撑大。
             while (this.pend.Length() - pos < size + 2) {
-                int n = await this.Fill();
+                int n = await this.FillTo(pos + (int)size + 2);
+                if (n < 0) { acc.Free(); return 400; }
                 if (n == 0) { acc.Free(); return -1; }
             }
             // size 已由上面的 maxBodyBytes 判定钳在 int 范围内。
@@ -365,13 +408,23 @@ class HttpFramer {
                 acc.Free();
                 return 400;
             }
+            this.pend.Discard(pos);
+            pos = 0;
+            this.scanned = 0;
         }
-        req.body = acc.Str(0, decoded);
-        req.bodyLength = decoded;
-        // 解码后的正文自定界，处理器看到的与固定长度请求一致。
-        req.contentLength = decoded;
+        string decodedBody = acc.Str(0, decoded);
+        if (req != null) {
+            req.body = decodedBody;
+            req.bodyLength = decoded;
+            req.contentLength = decoded;
+        } else {
+            response.body = decodedBody;
+            response.bodyBytesLen = decoded;
+        }
         acc.Free();
-        this.wireBytes = pos;
+        this.pend.Discard(pos);
+        this.scanned = 0;
+        this.wireBytes = 0;
         return 0;
     }
 
@@ -380,12 +433,15 @@ class HttpFramer {
     async int SkipTrailer(int from) {
         int pos = from;
         while (true) {
-            int lf = this.IndexOfLf(pos);
+            int scan = pos;
+            int lf = this.IndexOfLf(scan);
             while (lf < 0) {
-                if (this.pend.Length() - from > 8192) { return -2; }
-                int n = await this.Fill();
+                if (this.pend.Length() - from >= 8193) { return -2; }
+                scan = this.pend.Length();
+                int n = await this.FillTo(from + 8194);
+                if (n < 0) { return -2; }
                 if (n == 0) { return -1; }
-                lf = this.IndexOfLf(pos);
+                lf = this.IndexOfLf(scan);
             }
             if (lf + 1 - from > 8192) { return -2; }
             int stop = lf;

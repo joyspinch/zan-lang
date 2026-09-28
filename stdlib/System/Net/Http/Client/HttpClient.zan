@@ -299,6 +299,11 @@ class HttpClient {
     /// 第二个头字段）时不添加——与 HttpResponse.SetHeader 同一防线。</summary>
     HttpClient SetHeader(string name, string headerValue) {
         if (!HttpResponse.IsValidHeader(name, headerValue)) { return this; }
+        string lower = name.ToLower();
+        // Framing and connection mode are emitted by BuildRequestHead and
+        // the download paths; caller overrides would create conflicting lines.
+        if (lower == "content-length" || lower == "transfer-encoding"
+            || lower == "connection" || lower == "host") { return this; }
         this.defaultHeaders.Add(name + ": " + headerValue);
         return this;
     }
@@ -435,6 +440,12 @@ class HttpClient {
         this.totalDeadlineUs = total > 0
             ? Socket.NativeMonotonicUs() + total * 1000L
             : 0;
+    }
+
+    /// 每个公共入口重新武装；只有内部重定向跳数继承已有截止时间。
+    void ResetTotalBudget() {
+        this.totalDeadlineUs = 0;
+        this.ArmTotalBudget();
     }
 
     /// <summary>关闭复用的 keep-alive 连接（若在）。客户端仍可继续
@@ -624,7 +635,7 @@ class HttpClient {
     /// 动作改写/下一跳派生）与字节通道共用同一组 helper
     /// （RedirectWanted/RedirectReplay/RedirectNextClient）。</summary>
     async string RequestAsync(string method, string path, string body) {
-        this.ArmTotalBudget();
+        this.ResetTotalBudget();
         string raw = await this.RequestOnceAsync(method, path, body);
         if (this.callPolicy == null || this.callPolicy.MaxRedirects() <= 0) {
             return raw;
@@ -814,6 +825,13 @@ class HttpClient {
             string body, HttpBytesDriver driver) {
         this.ArmTotalBudget();
         HttpResponse resp = await driver(this, method, path, body);
+        return await this.FollowBytesFromResponse(method, path, body, driver, resp);
+    }
+
+    /// Uploads send their multipart body first; only subsequent rewritten GET
+    /// hops use the bodyless redirect driver.
+    async HttpResponse FollowBytesFromResponse(string method, string path,
+            string body, HttpBytesDriver driver, HttpResponse resp) {
         if (!this.RedirectWanted(resp, 0)) { return resp; }
         List<string> visited = new List<string>();
         string initial = this.CanonicalRequestTarget(path);
@@ -871,6 +889,30 @@ class HttpClient {
     /// 默认走 keep-alive 复用通道（同一客户端同时只允许一个在途
     /// 请求）；已有请求在途时，并发调用退回一次性 Connection: close
     /// 通道，各自读到对端关闭为止。</summary>
+    /// Reject absent or incomplete fixed-length text responses instead of
+    /// letting HttpResponse.Parse manufacture a successful empty 200.
+    void ValidateTextResponse(string raw, string method) {
+        int end = HttpClient.IndexOf(raw, "\r\n\r\n", 0);
+        if (end < 0) {
+            throw new HttpRequestException("connection closed before a response arrived");
+        }
+        string head = raw.Substring(0, end + 4);
+        int code = HttpClient.HeadStatus(head);
+        if (code < 100) {
+            throw new HttpRequestException("invalid response status line");
+        }
+        HttpResponse frame = HttpResponse.Parse(head);
+        if (!frame.ParseFraming()) {
+            throw new HttpRequestException("response framing malformed");
+        }
+        if (method == "HEAD" || code == 204 || code == 304) { return; }
+        if (frame.framingHasLength
+            && raw.Length - head.Length < frame.framingLength) {
+            throw new HttpRequestException(
+                "connection closed in the middle of the response body");
+        }
+    }
+
     async string RequestOnceAsync(string method, string path, string body) {
         this.CheckRequestLimit(body.Length);
         this.CheckTargetPolicy();
@@ -948,6 +990,7 @@ class HttpClient {
             body = "";
             FailTimeout();
         }
+        this.ValidateTextResponse(result, method);
         this.AbsorbCookies(path, result);
         return result;
     }
@@ -1054,6 +1097,7 @@ class HttpClient {
             body = "";
             FailTimeout();
         }
+        this.ValidateTextResponse(result, method);
         this.AbsorbCookies(path, result);
         return result;
     }
@@ -1132,8 +1176,10 @@ class HttpClient {
             string head = "";
             while (true) {
                 he = await this.ka.ReadHead(65536);
-                if (he == 0 && reused && attempt == 1) {
-                    // 空闲连接已被对端回收，请求未被处理：换新连接重试。
+                if (he == 0 && reused && attempt == 1
+                    && (method == "GET" || method == "HEAD")) {
+                    // EOF after a complete write cannot prove the server did not
+                    // execute it. Only safe methods may be replayed transparently.
                     HttpDeadline.Disarm(watch);
                     this.DropAlive();
                     break;
@@ -1169,17 +1215,15 @@ class HttpClient {
                 }
                 break;
             }
-            if (he == 0 && reused && attempt == 1) { continue; }
-            HttpRequest hp = HttpRequest.Parse(head, he);
-            if (hp.parseStatus != 0) {
+            if (he == 0 && reused && attempt == 1
+                && (method == "GET" || method == "HEAD")) { continue; }
+            HttpResponse probe = HttpResponse.Parse(head);
+            if (!probe.ParseFraming()) {
                 HttpDeadline.Disarm(watch);
                 this.DropAlive();
                 req = "";
-                throw new HttpRequestException(
-                    "response framing malformed: parse status "
-                    + Convert.ToString(hp.parseStatus));
+                throw new HttpRequestException("response framing malformed");
             }
-            HttpResponse probe = HttpResponse.Parse(head);
             bool serverClose = HttpClient.HeadSaysClose(head);
             // 204/304 与 HEAD 的响应没有正文，不能按 Content-Length
             // 或 EOF 去等。
@@ -1190,10 +1234,11 @@ class HttpClient {
             if (noBody) {
                 this.ka.Consume(he);
                 keep = !serverClose;
-            } else if (hp.chunked || HttpClient.HeadHasContentLength(head)) {
-                int st = await this.ka.ReadBody(hp, this.ResponseLimit());
+            } else if (probe.framingChunked || probe.framingHasLength) {
+                int st = await this.ka.ReadResponseBody(probe, he,
+                    this.ResponseLimit());
                 if (st == 0) {
-                    bodyOut = hp.body;
+                    bodyOut = probe.body;
                     this.ka.Consume(this.ka.RequestBytes());
                     keep = !serverClose;
                 } else if (st == -1) {
@@ -1280,6 +1325,7 @@ class HttpClient {
             rsb.Append(head);
             rsb.Append(bodyOut);
             string result = rsb.ToString();
+            this.ValidateTextResponse(result, method);
             this.AbsorbCookies(path, result);
             return result;
         }
@@ -1368,6 +1414,7 @@ class HttpClient {
     /// 字体等二进制资源的下载与上传；文本响应照常可用 body 读取。
     /// 绑定 policy 时按同一规则跟随重定向（3xx 原样返回仍是默认）。</summary>
     async HttpResponse SendBytesAsync(string method, string path, string body) {
+        this.ResetTotalBudget();
         this.CheckRequestLimit(body.Length);
         this.CheckTargetPolicy();
         if (this.callPolicy == null || this.callPolicy.MaxRedirects() <= 0) {
@@ -1447,19 +1494,17 @@ class HttpClient {
             break;
         }
         HttpResponse resp = HttpResponse.Parse(head);
-        HttpRequest hp = HttpRequest.Parse(head, he);
-        if (hp.parseStatus != 0) {
+        if (!resp.ParseFraming()) {
             HttpDeadline.Disarm(watch);
             this.CloseChannel(conn, fr, stream, ctx);
-            throw new HttpRequestException(
-                "response framing malformed: parse status "
-                + Convert.ToString(hp.parseStatus));
+            throw new HttpRequestException("response framing malformed");
         }
         bool noBody = resp.statusCode == 204 || resp.statusCode == 304
             || method == "HEAD";
         if (!noBody) {
-            if (hp.chunked || HttpClient.HeadHasContentLength(head)) {
-                int st = await fr.ReadBody(hp, this.ResponseLimit());
+            if (resp.framingChunked || resp.framingHasLength) {
+                int st = await fr.ReadResponseBody(resp, he,
+                    this.ResponseLimit());
                 if (st == -1) {
                     bool lateBody = HttpDeadline.Expired(watch);
                     HttpDeadline.Disarm(watch);
@@ -1481,18 +1526,14 @@ class HttpClient {
                     throw new HttpRequestException(
                         "malformed chunked response body");
                 }
-                // ReadBody 按精确字节数把正文放进 hp.body，内嵌 NUL
-                // 原样保留；按下标显式复制，绝不过 strlen。
-                int n = hp.bodyLength;
+                // ReadResponseBody stores the exact byte count separately:
+                // string.Length stops at embedded NUL for binary payloads.
+                int n = resp.bodyBytesLen;
                 byte[] outb = new byte[n + 1];
                 for (int i = 0; i < n; i = i + 1) {
-                    outb[i] = (byte)(hp.body[i] & 255);
+                    outb[i] = (byte)(resp.body[i] & 255);
                 }
                 resp.bodyBytes = outb;
-                resp.bodyBytesLen = n;
-                // 文本调用方继续走 body：NUL 保留在缓冲里，strlen 只在
-                // 二进制正文上会变短，而那类正文以 bodyBytes 为准。
-                resp.body = hp.body;
             } else {
                 // 没有 Content-Length 也没有分块：EOF 定界，读到对端
                 // 关闭为止，按字节累积。
@@ -1625,10 +1666,6 @@ class HttpClient {
             int total) {
         this.CheckRequestLimit(total);
         this.CheckTargetPolicy();
-        if (this.callPolicy != null && this.callPolicy.MaxRedirects() > 0) {
-            return await this.FollowBytesRedirects(method, path, "",
-                HttpClient.UploadBytesOnceAsync);
-        }
         TcpClient conn = await this.ConnectTarget();
         if (conn == null) { FailConnect(); }
         HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
@@ -1711,10 +1748,6 @@ class HttpClient {
         this.CheckRequestLimit(total);
         this.CheckTargetPolicy();
         Socket.Initialize();
-        if (this.callPolicy != null && this.callPolicy.MaxRedirects() > 0) {
-            return await this.FollowBytesRedirects(method, path, "",
-                HttpClient.UploadBytesOnceAsync);
-        }
         TcpClient conn = await this.ConnectTarget();
         if (conn == null) { FailConnect(); }
         TlsContext ctx;
@@ -2006,6 +2039,7 @@ class HttpClient {
     /// 从 sink 中取走数据，无需临时文件，也无需辅助进程。
     /// </summary>
     async int PostSseToSinkAsync(string path, string body, SseSink sink) {
+        this.ResetTotalBudget();
         sink.Begin();
         if (this.callPolicy != null) {
             bool targetOk = ExternalTargetPolicy.IsClientAllowed(this.host,
@@ -2427,6 +2461,7 @@ class HttpClient {
         int nl = lowerName.Length;
         for (int i = 0; i + nl <= n; i = i + 1) {
             if ((i == 0 || (head[i - 1] & 255) == 10)
+                && i + nl < n && (head[i + nl] & 255) == 58
                 && HttpClient.AsciiNameEquals(head.Substring(i, nl), lowerName, nl)) {
                 int j = i + nl;
                 while (j < n && ((head[j] & 255) == 32 || (head[j] & 255) == 58)) {
@@ -2449,6 +2484,7 @@ class HttpClient {
         int nl = lowerName.Length;
         for (int i = 0; i + nl <= n; i = i + 1) {
             if ((i == 0 || (head[i - 1] & 255) == 10)
+                && i + nl < n && (head[i + nl] & 255) == 58
                 && HttpClient.AsciiNameEquals(head.Substring(i, nl), lowerName, nl)) {
                 int j = i + nl;
                 while (j < n && ((head[j] & 255) == 32 || (head[j] & 255) == 58)) {
@@ -2497,6 +2533,23 @@ class HttpClient {
         }
         if (any) { return v; }
         return 0;
+    }
+
+    /// A 416 proves completion only when the server supplies an unsatisfied
+    /// Content-Range with a known total matching the local file size.
+    static bool RangeAlreadyComplete(string head, int have) {
+        string range = HttpClient.HeadHeader(head, "content-range").Trim();
+        if (!range.StartsWith("bytes */")) { return false; }
+        string digits = range.Substring(8);
+        if (digits.Length == 0) { return false; }
+        long total = 0;
+        for (int i = 0; i < digits.Length; i = i + 1) {
+            int d = digits[i] & 255;
+            if (d < 48 || d > 57) { return false; }
+            total = total * 10 + d - 48;
+            if (total > 2147483647) { return false; }
+        }
+        return have > 0 && total == have;
     }
 
     /// <summary>将本地文件作为 multipart/form-data 的单个字段上传到
@@ -2563,7 +2616,7 @@ class HttpClient {
             throw new FileNotFoundException("Could not open file: "
                 + localPath);
         }
-        this.ArmTotalBudget();
+        this.ResetTotalBudget();
         HttpClient.ValidateMultipartToken("field name", field);
         HttpClient.ValidateMultipartToken("file name", fileName);
         string boundary = "----ZanFormBoundary"
@@ -2580,9 +2633,7 @@ class HttpClient {
             this.SetHeader("Content-Type",
                 "multipart/form-data; boundary=" + boundary);
         }
-        // 重定向跟随由各 SendBytesBody* 通道内部接入：3xx 拿到后按
-        // policy 跟随（改写动作不重放 multipart 实体），随后每跳共享
-        // 本入口武装的 totalDeadlineUs。
+        // 先完整发送 multipart 首跳，再仅对安全改写的 GET 跟随重定向。
         HttpResponse resp;
         if (this.useTls) {
             resp = await this.SendBytesBodyTlsAsync("POST", path, head,
@@ -2592,6 +2643,10 @@ class HttpClient {
             resp = await this.SendBytesBodyAsync("POST", path, head,
                                                  localPath, fileLen,
                                                  tail, total);
+        }
+        if (this.callPolicy != null && this.callPolicy.MaxRedirects() > 0) {
+            return await this.FollowBytesFromResponse("POST", path, "",
+                HttpClient.UploadBytesOnceAsync, resp);
         }
         return resp;
     }
@@ -2612,7 +2667,7 @@ class HttpClient {
     async int DownloadRangeToFileAsync(string path, string localPath,
             string progressFile) {
         this.SetDownloadError("");
-        this.ArmTotalBudget();
+        this.ResetTotalBudget();
         List<string> visited = new List<string>();
         string initial = this.CanonicalRequestTarget(path);
         if (initial.Length > 0) { visited.Add(initial); }
@@ -2750,11 +2805,16 @@ class HttpClient {
         // 下面的 Range 解析仍需要头部文本。
         head = headOnly;
 
-        // 416 Range Not Satisfiable：文件已全部下载完毕。
+        // 416 alone does not establish that the existing file is complete.
         if (status == 416) {
+            bool complete = HttpClient.RangeAlreadyComplete(head, have);
             HttpDeadline.Disarm(watch);
             if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
             else { conn.Close(); }
+            if (!complete) {
+                this.SetDownloadError("416 Content-Range does not match local file");
+                return 0 - 1;
+            }
             File.WriteAllText(progressFile,
                 Convert.ToString(have) + "/" + Convert.ToString(have));
             return have;
@@ -2967,7 +3027,7 @@ class HttpClient {
     async long DownloadBinaryToFileAsync(string path, string localPath,
             string progressFile) {
         this.SetDownloadError("");
-        this.ArmTotalBudget();
+        this.ResetTotalBudget();
         List<string> visited = new List<string>();
         string initial = this.CanonicalRequestTarget(path);
         if (initial.Length > 0) { visited.Add(initial); }
@@ -3133,11 +3193,16 @@ class HttpClient {
             return 0 - 1;
         }
 
-        // 416 Range Not Satisfiable：本地文件已经是完整的了。
+        // A bare 416 is not evidence that the local archive is complete.
         if (status == 416) {
+            bool complete = HttpClient.RangeAlreadyComplete(headText, have);
             HttpDeadline.Disarm(watch);
             if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
             else { conn.Close(); }
+            if (!complete) {
+                this.SetDownloadError("416 Content-Range does not match local file");
+                return 0 - 1;
+            }
             File.WriteAllText(progressFile,
                 Convert.ToString(have) + "/" + Convert.ToString(have));
             return have;

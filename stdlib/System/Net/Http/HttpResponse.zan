@@ -16,6 +16,9 @@ class HttpResponse {
     string contentType;
     List<string> headers;
     bool keepAlive;
+    int framingLength;
+    bool framingHasLength;
+    bool framingChunked;
 
     /// <summary>私有构造：200 / keep-alive 的默认状态，由各静态工厂使用。</summary>
     HttpResponse() {
@@ -27,6 +30,9 @@ class HttpResponse {
         this.contentType = "text/html";
         this.headers = new List<string>();
         this.keepAlive = true;
+        this.framingLength = 0;
+        this.framingHasLength = false;
+        this.framingChunked = false;
     }
 
     /// <summary>用给定正文创建 200 OK 响应。</summary>
@@ -85,7 +91,14 @@ class HttpResponse {
         for (int i = 0; i < s.Length; i = i + 1) {
             int ch = s[i] & 255;
             if (ch == 0 || ch == 10 || ch == 13 || ch == 127) { return false; }
-            if (isName && ch == 58) { return false; }
+            // Header names are HTTP tokens. Whitespace before ':' could turn
+            // an apparently ordinary name into a framing header downstream.
+            if (isName && !((ch >= 48 && ch <= 57)
+                || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122)
+                || ch == 33 || ch == 35 || ch == 36 || ch == 37
+                || ch == 38 || ch == 39 || ch == 42 || ch == 43
+                || ch == 45 || ch == 46 || ch == 94 || ch == 95
+                || ch == 96 || ch == 124 || ch == 126)) { return false; }
         }
         return true;
     }
@@ -179,12 +192,15 @@ class HttpResponse {
         this.bodyBytesLen = 0;
     }
 
-    /// <summary>设置响应头。名称和值均禁止 CR/LF，避免注入
-    /// 额外字段或响应体；非法输入保持响应可序列化但不添加该头。</summary>
+    /// <summary>设置响应头。定界与连接模式由 BuildHeadersSb 唯一生成；
+    /// 拒绝这些保留字段，避免客户端看到相互矛盾的长度或分块边界。</summary>
     HttpResponse SetHeader(string name, string headerValue) {
         if (!HttpResponse.IsValidHeader(name, headerValue)) {
             return this;
         }
+        string lower = name.ToLower();
+        if (lower == "content-length" || lower == "transfer-encoding"
+            || lower == "connection") { return this; }
         this.headers.Add(name + ": " + headerValue);
         return this;
     }
@@ -297,6 +313,44 @@ class HttpResponse {
             stop = stop - 1;
         }
         return stop;
+    }
+
+    /// <summary>Parse response framing independently from the strict request
+    /// parser. Conflicting/invalid lengths and unsupported transfer codings
+    /// fail closed before any body is read.</summary>
+    bool ParseFraming() {
+        bool sawTe = false;
+        string encoding = "";
+        for (int i = 0; i < this.headers.Count; i = i + 1) {
+            string line = this.headers[i];
+            int colon = line.IndexOf(":");
+            if (colon <= 0) { continue; }
+            string name = line.Substring(0, colon).ToLower();
+            string value = line.Substring(colon + 1).Trim();
+            if (name == "content-length") {
+                if (value.Length == 0) { return false; }
+                long length = 0;
+                for (int j = 0; j < value.Length; j = j + 1) {
+                    int digit = value[j] & 255;
+                    if (digit < 48 || digit > 57) { return false; }
+                    length = length * 10 + digit - 48;
+                    if (length > 2147483647) { return false; }
+                }
+                if (this.framingHasLength && this.framingLength != (int)length) {
+                    return false;
+                }
+                this.framingHasLength = true;
+                this.framingLength = (int)length;
+            } else if (name == "transfer-encoding") {
+                if (sawTe || value.Length == 0) { return false; }
+                sawTe = true;
+                encoding = value.ToLower();
+            }
+        }
+        if (sawTe && this.framingHasLength) { return false; }
+        if (sawTe && encoding != "chunked") { return false; }
+        this.framingChunked = sawTe;
+        return true;
     }
 
     /// <summary>解析原始 HTTP 响应（客户端用法）。</summary>
