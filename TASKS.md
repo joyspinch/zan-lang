@@ -43,7 +43,7 @@
 
 ## 未完成 · 编译内存
 
-- [~] **A-MEM1** 大型发布已落地保守生成前裁剪：声明先行、Main/初始化/构造/委托/虚表/反射/库导出按固定点保活；非发布与 `--emit-ir` 保留用户体以免吞掉降层诊断，发布仅裁剪 stdlib 体，未用声明留一块 `unreachable` 以满足 LLVM。冻结 OnePlus 402 输入重测：IR 定义 18,628→18,488、指令 4,022,035→3,545,750，峰值 Commit 1,530→1,414 MB（仍由 IRGen 主导，未彻底闭账）。`dead_method_pre_ir` 行为+IR 回归、smoke 313/313、standard 可执行集 999 项中仅并行 `zandb_p3` 偶发红且串行通过；阶段一 `12d7e911` 仅建立 generated-object 向量，明确无内存收益声明。独立 LLVM 生命周期探针在同一 context 串行生成/写出/销毁 8 个高负载 module（每片 128 函数×256 算术指令）通过，PrivateUsage 首片后不随 module 数线性增长；因此当前主要阻碍不是 module dispose 泄漏，而是 Zan IRGen 普遍持有 module-local LLVM handles、internal linkage 和全局辅助/类型状态，尚无可安全拆分的闭合函数族；继续保留单模块 fallback，后续需重构 ABI/声明重建后再评估分片。
+- [~] **A-MEM1** 大型发布已落地保守生成前裁剪：声明先行、Main/初始化/构造/委托/虚表/反射/库导出按固定点保活；非发布与 `--emit-ir` 保留用户体以免吞掉降层诊断，发布仅裁剪 stdlib 体，未用声明留一块 `unreachable` 以满足 LLVM。冻结 OnePlus 402 输入重测：IR 定义 18,628→18,488、指令 4,022,035→3,545,750，峰值 Commit 1,530→1,414 MB（仍由 IRGen 主导，未彻底闭账）。`dead_method_pre_ir` 行为+IR 回归、smoke 313/313、standard 可执行集 999 项中仅并行 `zandb_p3` 偶发红且串行通过；阶段一 `12d7e911` 仅建立 generated-object 向量，明确无内存收益声明。独立 LLVM 生命周期探针在同一 context 串行生成/写出/销毁 8 个高负载 module（每片 128 函数×256 算术指令）通过，PrivateUsage 首片后不随 module 数线性增长；因此当前主要阻碍不是 module dispose 泄漏，而是 Zan IRGen 普遍持有 module-local LLVM handles、internal linkage 和全局辅助/类型状态，尚无可安全拆分的闭合函数族；继续保留单模块 fallback，后续需重构 ABI/声明重建后再评估分片。问题边界扩大到所有大型项目后，补做四处项目无关的规模化热点优化（2026-09-28）：输入去重 O(K²)→FNV-1a 开放寻址（含 POSIX dev/ino 索引）；binder 成员冲突检查 O(M²)→按类型成员名索引，索引异常或同名候选超过 64 时回退原全量扫描并保持诊断顺序；tuple 类型缓存线性查找→规范化签名哈希；IRGen `body_has_live_use` O(W²)→LLVM 函数指针索引，未知父函数保守视为存活。6000 成员、401 输入、七类诊断和 publish 定向探针通过。smoke 313 项两例并行负载抖动均隔离通过；standard 1003 项并行运行出现 62 个负载/环境红，代表性串行复跑 6/7 通过，唯一稳定红为需要交互桌面的 `win_tray_screen_smoke`，未发现本轮编译器回归。
 
 ## 已闭账 · 通讯协议加固（2026-09-28）
 
