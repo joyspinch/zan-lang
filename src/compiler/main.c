@@ -72,6 +72,77 @@
  * it (terminator, --end-group, the final inputs). */
 #define ZAN_LINK_ARGV_TAIL        32
 
+/* Phase 1 generated-object boundary. The compiler still emits one object,
+ * but native Windows x64 executable linking consumes this as a vector so real
+ * sharding can be added without changing linker ownership or cleanup again.
+ * Other output modes deliberately use the single-object fallback below. */
+typedef struct {
+    char **paths;
+    int count;
+    int capacity;
+} generated_object_vec_t;
+
+static void generated_object_vec_add(generated_object_vec_t *objects,
+                                     const char *path) {
+    if (objects->count == objects->capacity) {
+        int next = objects->capacity ? objects->capacity * 2 : 4;
+        char **grown = (char **)realloc(objects->paths,
+                                        (size_t)next * sizeof(*grown));
+        if (!grown) {
+            fprintf(stderr, "error: out of memory tracking generated objects\n");
+            exit(1);
+        }
+        objects->paths = grown;
+        objects->capacity = next;
+    }
+    size_t len = strlen(path);
+    objects->paths[objects->count] = (char *)malloc(len + 1);
+    if (!objects->paths[objects->count]) {
+        fprintf(stderr, "error: out of memory tracking generated object path\n");
+        exit(1);
+    }
+    memcpy(objects->paths[objects->count], path, len + 1);
+    objects->count++;
+}
+
+static void generated_object_vec_release(generated_object_vec_t *objects) {
+    for (int i = 0; i < objects->count; i++)
+        free(objects->paths[i]);
+    free(objects->paths);
+    objects->paths = NULL;
+    objects->count = 0;
+    objects->capacity = 0;
+}
+
+static void generated_object_vec_remove(generated_object_vec_t *objects,
+                                        const char *single_fallback) {
+    if (objects->count == 0) {
+        remove(single_fallback);
+    } else {
+        for (int i = 0; i < objects->count; i++)
+            remove(objects->paths[i]);
+    }
+    generated_object_vec_release(objects);
+}
+
+static void generated_object_vec_keep_or_remove(generated_object_vec_t *objects,
+                                                const char *single_fallback,
+                                                bool keep) {
+    if (keep) {
+        if (objects->count == 0) {
+            fprintf(stderr, "note: failed-link object retained at '%s'\n",
+                    single_fallback);
+        } else {
+            for (int i = 0; i < objects->count; i++)
+                fprintf(stderr, "note: failed-link object retained at '%s'\n",
+                        objects->paths[i]);
+        }
+        generated_object_vec_release(objects);
+    } else {
+        generated_object_vec_remove(objects, single_fallback);
+    }
+}
+
 static void link_cap_exceeded(const char *what, int cap) {
     fprintf(stderr,
             "zanc: too many %s for one link (limit %d) -- raise the matching"
@@ -3304,6 +3375,14 @@ static int wasm_obj_refs_any(const char *obj, const char *const *prefixes) {
     return found;
 }
 
+static int wasm_obj_vec_refs_any(const generated_object_vec_t *objects,
+                                 const char *const *prefixes) {
+    for (int i = 0; i < objects->count; i++) {
+        if (wasm_obj_refs_any(objects->paths[i], prefixes)) return 1;
+    }
+    return 0;
+}
+
 /* Write a single-member ar archive (a static library) containing `obj`.
  * The ar format is trivial: the "!<arch>\n" magic, then one 60-byte member
  * header followed by the member data (padded to even length with '\n').
@@ -5503,6 +5582,7 @@ int main(int argc, char **argv) {
 
         /* emit object file */
         char obj_tmp[1024];
+        generated_object_vec_t generated_objects = {0};
         snprintf(obj_tmp, sizeof(obj_tmp), "%s.o", obj_path);
         phase("optimize");
         if (zan_irgen_write_obj(&irgen, obj_tmp) != ZAN_OK) {
@@ -5514,6 +5594,8 @@ int main(int argc, char **argv) {
             free(source);
             return 1;
         }
+
+        generated_object_vec_add(&generated_objects, obj_tmp);
 
         /* An icon is just another link input: compile the .ico into a .rsrc
          * object here (no windres needed) and hand it to whichever linker
@@ -5701,7 +5783,7 @@ int main(int argc, char **argv) {
                             "reinstall zan or rebuild with toolchain/%s present "
                             "(see scripts/build_*_rt.sh)\n",
                             tsub, rt_timer_buf, tsub);
-                    remove(obj_tmp);
+                    generated_object_vec_remove(&generated_objects, obj_tmp);
                     zan_diag_free_buffers(irgen.diag);
                     zan_irgen_destroy(&irgen);
                     zan_arena_free(ir_arena);
@@ -5749,16 +5831,16 @@ int main(int argc, char **argv) {
                  * matter get silently-wrong behavior from these stubs --
                  * the honest answers stay ZAN_OS_WASI exclusions (see the
                  * NetworkInterface/Ping rejection via zan_plat_). */
-                int has_disp = wasm_obj_refs_any(obj_tmp, disp_pre);
-                int has_other = wasm_obj_refs_any(obj_tmp, other_sync_pre);
+                int has_disp = wasm_obj_vec_refs_any(&generated_objects, disp_pre);
+                int has_other = wasm_obj_vec_refs_any(&generated_objects, other_sync_pre);
                 needs_sync = (has_other || has_disp)
-                    && !wasm_obj_refs_any(obj_tmp, gui_pre);
+                    && !wasm_obj_vec_refs_any(&generated_objects, gui_pre);
             }
             if (needs_sync) {
                 fprintf(stderr,
                         "error: AtomicInt and SharedTable are not available for "
                         "this cross-compilation target yet\n");
-                remove(obj_tmp);
+                generated_object_vec_remove(&generated_objects, obj_tmp);
                 zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
                 zan_arena_free(ir_arena);
@@ -5983,6 +6065,9 @@ int main(int argc, char **argv) {
 
 
         if (emit_lib) {
+            /* Phase 1 keeps static/shared libraries on the original
+             * single-object path; the generated-object vector is consumed
+             * only by the native Windows x64 executable link below. */
             /* ---- library output ----------------------------------------
              * A library is the same object file, linked WITHOUT the CRT
              * startup objects and entry point. Static (.a/.lib) is just an
@@ -6004,7 +6089,7 @@ int main(int argc, char **argv) {
                 if (zan_write_static_lib(obj_tmp, obj_path) != 0) {
                     fprintf(stderr, "error: failed to write static library '%s'\n",
                             obj_path);
-                    remove(obj_tmp);
+                    generated_object_vec_remove(&generated_objects, obj_tmp);
                     zan_diag_free_buffers(irgen.diag);
                     zan_irgen_destroy(&irgen);
                     zan_arena_free(ir_arena);
@@ -6022,7 +6107,7 @@ int main(int argc, char **argv) {
                                 "error: no bundled runtime objects for this "
                                 "cross-compilation target; link a static "
                                 "library instead\n");
-                        remove(obj_tmp);
+                        generated_object_vec_remove(&generated_objects, obj_tmp);
                         zan_diag_free_buffers(irgen.diag);
                         zan_irgen_destroy(&irgen);
                         zan_arena_free(ir_arena);
@@ -6073,7 +6158,7 @@ int main(int argc, char **argv) {
                                 "toolchain/%s present (see "
                                 "scripts/build_*_rt.sh)\n",
                                 target_rt_sub, missing, target_rt_sub);
-                        remove(obj_tmp);
+                        generated_object_vec_remove(&generated_objects, obj_tmp);
                         zan_diag_free_buffers(irgen.diag);
                         zan_irgen_destroy(&irgen);
                         zan_arena_free(ir_arena);
@@ -6364,7 +6449,7 @@ int main(int argc, char **argv) {
                                 "error: bundled macOS libSystem stub not found "
                                 "at '%s'; reinstall zan or rebuild with "
                                 "toolchain/macos present\n", tbd);
-                        remove(obj_tmp);
+                        generated_object_vec_remove(&generated_objects, obj_tmp);
                         zan_diag_free_buffers(irgen.diag);
                         zan_irgen_destroy(&irgen);
                         zan_arena_free(ir_arena);
@@ -6436,7 +6521,7 @@ int main(int argc, char **argv) {
                                 "at '%s'; reinstall zan or rebuild with "
                                 "toolchain/%s present\n",
                                 asub3, sys3, asub3);
-                        remove(obj_tmp);
+                        generated_object_vec_remove(&generated_objects, obj_tmp);
                         zan_diag_free_buffers(irgen.diag);
                         zan_irgen_destroy(&irgen);
                         zan_arena_free(ir_arena);
@@ -6557,7 +6642,7 @@ int main(int argc, char **argv) {
                                 "at '%s'; reinstall zan or rebuild with "
                                 "toolchain/%s present\n",
                                 osub, sys4, osub);
-                        remove(obj_tmp);
+                        generated_object_vec_remove(&generated_objects, obj_tmp);
                         zan_diag_free_buffers(irgen.diag);
                         zan_irgen_destroy(&irgen);
                         zan_arena_free(ir_arena);
@@ -6618,7 +6703,7 @@ int main(int argc, char **argv) {
                 } else {
                     fprintf(stderr, "error: shared libraries are not supported "
                             "for this target yet\n");
-                    remove(obj_tmp);
+                    generated_object_vec_remove(&generated_objects, obj_tmp);
                     zan_diag_free_buffers(irgen.diag);
                     zan_irgen_destroy(&irgen);
                     zan_arena_free(ir_arena);
@@ -6809,7 +6894,7 @@ int main(int argc, char **argv) {
                         "error: bundled %s OHOS sysroot subset not found at "
                         "'%s'; reinstall zan or rebuild with toolchain/%s "
                         "present\n", osub, sys, osub);
-                remove(obj_tmp);
+                generated_object_vec_remove(&generated_objects, obj_tmp);
                 zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
                 zan_arena_free(ir_arena);
@@ -7052,7 +7137,7 @@ int main(int argc, char **argv) {
                         "error: bundled %s mingw runtime not found at '%s'; "
                         "reinstall zan or rebuild with toolchain/%s present\n",
                         wsub, syslib, wsub);
-                remove(obj_tmp);
+                generated_object_vec_remove(&generated_objects, obj_tmp);
                 zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
                 zan_arena_free(ir_arena);
@@ -7094,7 +7179,7 @@ int main(int argc, char **argv) {
                         "'%s/%s'; reinstall zan or rebuild with toolchain/%s "
                         "present (see scripts/build_win_rt.sh)\n",
                         wsub, exe_dir2, wsub, wsub);
-                remove(obj_tmp);
+                generated_object_vec_remove(&generated_objects, obj_tmp);
                 zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
                 zan_arena_free(ir_arena);
@@ -7209,7 +7294,7 @@ int main(int argc, char **argv) {
                         "error: bundled wasm32 wasi sysroot not found at "
                         "'%s'; reinstall zan or rebuild with "
                         "toolchain/wasm32 present\n", sys);
-                remove(obj_tmp);
+                generated_object_vec_remove(&generated_objects, obj_tmp);
                 zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
                 zan_arena_free(ir_arena);
@@ -7233,12 +7318,12 @@ int main(int argc, char **argv) {
                     NULL
                 };
                 static const char *const gui_pre2[] = { "zan_gui_", NULL };
-                if (wasm_obj_refs_any(obj_tmp, sock_pre)
-                    && !wasm_obj_refs_any(obj_tmp, gui_pre2)) {
+                if (wasm_obj_vec_refs_any(&generated_objects, sock_pre)
+                    && !wasm_obj_vec_refs_any(&generated_objects, gui_pre2)) {
                     fprintf(stderr,
                             "error: socket-async programs are not available for "
                             "the wasm32 target\n");
-                    remove(obj_tmp);
+                    generated_object_vec_remove(&generated_objects, obj_tmp);
                     zan_diag_free_buffers(irgen.diag);
                     zan_irgen_destroy(&irgen);
                     zan_arena_free(ir_arena);
@@ -7304,7 +7389,7 @@ int main(int argc, char **argv) {
                  * zan_gui_wasm_feed is exported because the JS host's event
                  * pump calls it to hand input to the C ring. */
                 static const char *const gui_pre[] = { "zan_gui_", NULL };
-                if (wasm_obj_refs_any(obj_tmp, gui_pre)) {
+                if (wasm_obj_vec_refs_any(&generated_objects, gui_pre)) {
                     char guiobj[1300];
                     snprintf(guiobj, sizeof(guiobj), "%s/zanrt_gui.o", sys);
                     if (!zan_file_exists(guiobj)) {
@@ -7312,7 +7397,7 @@ int main(int argc, char **argv) {
                                 "error: GUI programs for wasm32 need the gui "
                                 "runtime object at '%s'; rebuild it with "
                                 "scripts\\build_cross_rt.cmd\n", guiobj);
-                        remove(obj_tmp);
+                        generated_object_vec_remove(&generated_objects, obj_tmp);
                         zan_diag_free_buffers(irgen.diag);
                         zan_irgen_destroy(&irgen);
                         zan_arena_free(ir_arena);
@@ -7395,7 +7480,7 @@ int main(int argc, char **argv) {
                         (target.os == ZAN_OS_IOS) ? "iOS" : "macOS",
                         tbd,
                         (target.os == ZAN_OS_IOS) ? "ios" : "macos");
-                remove(obj_tmp);
+                generated_object_vec_remove(&generated_objects, obj_tmp);
                 zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
                 zan_arena_free(ir_arena);
@@ -7450,7 +7535,7 @@ int main(int argc, char **argv) {
                         macrt,
                         (target.os == ZAN_OS_IOS) ? "ios" : "macos",
                         (target.os == ZAN_OS_IOS) ? "ios" : "macos");
-                remove(obj_tmp);
+                generated_object_vec_remove(&generated_objects, obj_tmp);
                 zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
                 zan_arena_free(ir_arena);
@@ -7543,6 +7628,8 @@ int main(int argc, char **argv) {
               snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", tbd); }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_FREESTANDING) {
+            /* Cross/freestanding output remains the single-object fallback;
+             * phase 1 does not introduce sharded objects here. */
             /* Bare-metal freestanding target (riscv32 for ESP32-C3/C6): no
              * CRT, no sysroot, no bundled linker. The compiler's object file
              * is the product -- the target SDK (ESP-IDF) owns startup code,
@@ -7552,7 +7639,7 @@ int main(int argc, char **argv) {
             if (rename(obj_tmp, obj_path) != 0) {
                 fprintf(stderr, "error: cannot write object '%s'\n",
                         obj_path);
-                remove(obj_tmp);
+                generated_object_vec_remove(&generated_objects, obj_tmp);
                 zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
                 zan_arena_free(ir_arena);
@@ -7562,11 +7649,12 @@ int main(int argc, char **argv) {
             }
             link_ret = 0;
         } else if (cross_compiling) {
+            /* Cross targets remain on the original single-object fallback. */
             fprintf(stderr,
                     "error: cross-compilation to '%s' is not supported yet "
                     "(see --list-targets)\n",
                     target.triple);
-            remove(obj_tmp);
+            generated_object_vec_remove(&generated_objects, obj_tmp);
             zan_diag_free_buffers(irgen.diag);
             zan_irgen_destroy(&irgen);
             zan_arena_free(ir_arena);
@@ -7644,7 +7732,11 @@ int main(int argc, char **argv) {
                 snprintf(elpbufs[di], sizeof(elpbufs[di]), "-L%s", extra_lib_paths[di]);
                 argv[a++] = elpbufs[di];
             }
-            argv[a++] = obj_tmp;
+            for (int oi = 0; oi < generated_objects.count; oi++) {
+                if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                    link_cap_exceeded("generated objects", ZAN_LINK_MAX_ARGV);
+                argv[a++] = generated_objects.paths[oi];
+            }
             if (rt_io_obj) argv[a++] = rt_io_obj;
             if (rt_sync_obj) argv[a++] = rt_sync_obj;
             if (rt_file_obj) argv[a++] = rt_file_obj;
@@ -7714,7 +7806,13 @@ int main(int argc, char **argv) {
             snprintf(link_cmd, sizeof(link_cmd),
                      "clang --target=x86_64-w64-windows-gnu \"%s\" -o \"%s\" "
                      "-Wl,--stack,268435456%s",
-                     obj_tmp, obj_path, publish_mode ? " -O2 -s" : "");
+                     generated_objects.paths[0], obj_path,
+                     publish_mode ? " -O2 -s" : "");
+            for (int oi = 1; oi < generated_objects.count; oi++) {
+                size_t cur = strlen(link_cmd);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"",
+                         generated_objects.paths[oi]);
+            }
             if (rt_io_obj) {
                 size_t cur = strlen(link_cmd);
                 snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\" -lws2_32", rt_io_obj);
@@ -7952,10 +8050,9 @@ int main(int argc, char **argv) {
 
         phase("link");
 
-        if (link_ret != 0 && getenv("ZAN_KEEP_FAILED_OBJ"))
-            fprintf(stderr, "note: failed-link object retained at '%s'\n", obj_tmp);
-        else
-            remove(obj_tmp);
+        generated_object_vec_keep_or_remove(&generated_objects, obj_tmp,
+                                            link_ret != 0 &&
+                                            getenv("ZAN_KEEP_FAILED_OBJ") != NULL);
         if (icon_obj[0]) remove(icon_obj);
 
         if (link_ret != 0) {
