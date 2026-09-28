@@ -85,37 +85,6 @@ class HttpRequest {
         return stop;
     }
 
-    /// <summary>Transfer-Encoding 是逗号分隔的 token 列表；只有最后一个
-    /// token 为 chunked 时才可由 HttpFramer 解码。token 之间的 OWS 合法，
-    /// 其它编码不被静默忽略，避免把未定界的字节当成下一条请求。</summary>
-    static bool FinalTransferChunked(string raw, int start, int stop) {
-        int p = start;
-        bool any = false;
-        bool finalChunked = false;
-        while (p < stop) {
-            p = HttpRequest.TrimOwsStart(raw, p, stop);
-            if (p >= stop) { return false; }
-            int e = p;
-            while (e < stop && (raw[e] & 255) != 44) { e = e + 1; }
-            int t = HttpRequest.TrimOwsStop(raw, p, e);
-            if (t <= p) { return false; }
-            int semi = p;
-            while (semi < t && (raw[semi] & 255) != 59) { semi = semi + 1; }
-            // transfer-coding parameters are allowed after ';'; the coding
-            // token itself must still be a valid non-empty token.
-            int codingStop = HttpRequest.TrimOwsStop(raw, p, semi);
-            if (codingStop <= p) { return false; }
-            bool isChunked = HttpRequest.RegionIs(raw, p, codingStop, "chunked");
-            finalChunked = isChunked;
-            any = true;
-            p = e + 1;
-            // 逗号后必须还有下一个 coding token；尾随逗号不能
-            // 被当成合法的最终 chunked。
-            if (e < stop && p >= stop) { return false; }
-        }
-        return any && finalChunked;
-    }
-
     /// <summary>把原始 HTTP 请求字符串解析为 HttpRequest。
     ///
     /// 按字节下标扫描（<c>raw[i] &amp; 255</c>），而不是
@@ -141,8 +110,18 @@ class HttpRequest {
         int lineEnd = 0;
         for (; lineEnd < len && (raw[lineEnd] & 255) != 10; lineEnd = lineEnd + 1) {
         }
-        int rlEnd = lineEnd;
-        if (rlEnd > 0 && (raw[rlEnd - 1] & 255) == 13) { rlEnd = rlEnd - 1; }
+        if (lineEnd >= len || lineEnd == 0 || (raw[lineEnd - 1] & 255) != 13) {
+            req.parseStatus = 400;
+            return req;
+        }
+        int rlEnd = lineEnd - 1;
+        for (int ri = 0; ri < rlEnd; ri = ri + 1) {
+            int b = raw[ri] & 255;
+            if (b < 32 && b != 9 || b == 127) {
+                req.parseStatus = 400;
+                return req;
+            }
+        }
 
         // 解析：METHOD 1*(SP/HTAB) request-target 1*(SP/HTAB) VERSION。
         int sp1 = 0;
@@ -190,6 +169,7 @@ class HttpRequest {
         int pos = lineEnd + 1;
         int headersStart = pos;
         int headersStop = pos;
+        bool headersEnded = false;
         // 定界状态：Content-Length 用 64 位累加并检查溢出，
         // 重复出现必须一致，Transfer-Encoding 绝不静默忽略
         //（见各分支）——这三者是请求走私（RFC 7230 §3.3.2/§3.3.3）
@@ -198,6 +178,7 @@ class HttpRequest {
         bool clSeen = false;
         long firstCl = 0;
         bool teSeen = false;
+        int hostCount = 0;
         // Connection, as sent: HTTP/1.0 defaults to close and HTTP/1.1 to
         // keep-alive, so the header is only an override and the version has
         // to be read before the default is applied.
@@ -208,15 +189,27 @@ class HttpRequest {
             while (hEnd < len && (raw[hEnd] & 255) != 10) {
                 hEnd = hEnd + 1;
             }
-            int lineStop = hEnd;
-            if (lineStop > pos && (raw[lineStop - 1] & 255) == 13) { lineStop = lineStop - 1; }
+            if (hEnd >= len || hEnd == pos || (raw[hEnd - 1] & 255) != 13) {
+                req.parseStatus = 400;
+                return req;
+            }
+            int lineStop = hEnd - 1;
             if (lineStop == pos) {
                 // 空行 = 头部结束
                 pos = hEnd + 1;
+                headersEnded = true;
                 break;
             }
             headersStop = lineStop;
 
+            // A line break inside a field value is never a continuation line.
+            for (int hi = pos; hi < lineStop; hi = hi + 1) {
+                int hb = raw[hi] & 255;
+                if ((hb < 32 && hb != 9) || hb == 127) {
+                    req.parseStatus = 400;
+                    return req;
+                }
+            }
             // 解析常见头部
             int colonPos = pos;
             while (colonPos < lineStop && (raw[colonPos] & 255) != 58) {
@@ -236,7 +229,13 @@ class HttpRequest {
                 bool obfuscated = false;
                 for (int si = pos; si < colonPos; si = si + 1) {
                     int sc = raw[si] & 255;
-                    if (sc == 32 || sc == 9) { obfuscated = true; break; }
+                    bool token = (sc >= 48 && sc <= 57)
+                        || (sc >= 65 && sc <= 90) || (sc >= 97 && sc <= 122)
+                        || sc == 33 || sc == 35 || sc == 36 || sc == 37
+                        || sc == 38 || sc == 39 || sc == 42 || sc == 43
+                        || sc == 45 || sc == 46 || sc == 94 || sc == 95
+                        || sc == 96 || sc == 124 || sc == 126;
+                    if (!token) { obfuscated = true; break; }
                 }
                 if (obfuscated) {
                     req.parseStatus = 400;
@@ -251,6 +250,8 @@ class HttpRequest {
                 // 全量 strlen 一遍——实测每请求 36 次比较、36 次 strlen。
                 int nameLen = colonPos - pos;
                 if (nameLen == 4 && RegionIs(raw, pos, colonPos, "host")) {
+                    hostCount = hostCount + 1;
+                    if (hostCount > 1 || vStart == vStop) { req.parseStatus = 400; }
                     req.host = raw.Substring(vStart, vStop - vStart);
                 } else if (nameLen == 12
                            && RegionIs(raw, pos, colonPos, "content-type")) {
@@ -278,7 +279,7 @@ class HttpRequest {
                     // 任何非数字字符、或超出 int 上限的值都置 413/400，
                     // 绝不静默截断。
                     clAcc = 0;
-                    bool bad = false;
+                    bool bad = vStart == vStop;
                     int di = vStart;
                     while (di < vStop) {
                         int d = raw[di] & 255;
@@ -290,7 +291,7 @@ class HttpRequest {
                     if (bad) {
                         // 非数字 = 畸形头部；溢出 = 超限。区分以便给
                         // 更精确的状态码，但两者都禁止继续信任该值。
-                        bool overflow = true;
+                        bool overflow = vStart != vStop;
                         int ci = vStart;
                         while (ci < vStop) {
                             int dd = raw[ci] & 255;
@@ -316,10 +317,10 @@ class HttpRequest {
                     // 只有值恰好是 chunked 时正文才自定界
                     // （RFC 7230 §3.3.3）。其它编码（gzip 等）或
                     // 叠加编码无法据此找到正文结尾，仍按未实现处理。
-                    // 多个 Transfer-Encoding 字段合并为一个列表；后一个
-                    // 字段不能把前一个非最终编码覆盖成 chunked，反之亦然。
-                    req.chunked = HttpRequest.FinalTransferChunked(raw,
-                        vStart, vStop);
+                    // 解码器只实现单个 chunked；重复字段和编码列表
+                    // 必须拒绝，不能选择性忽略与下一跳不一致的编码。
+                    req.chunked = !teSeen && HttpRequest.RegionIs(raw,
+                        vStart, vStop, "chunked");
                     // 服务器不实现 chunked 解码，绝不能忽略
                     // Transfer-Encoding——否则按 Content-Length（或无）
                     // 切分正文，而真实正文是分块编码，剩余 chunk 就被
@@ -350,6 +351,10 @@ class HttpRequest {
             }
             pos = hEnd + 1;
         }
+        if (!headersEnded) {
+            req.parseStatus = 400;
+            return req;
+        }
         // Transfer-Encoding 与 Content-Length 的共存裁决
         //（RFC 7230 §3.3.3）：两者同时出现是走私特征 → 400；
         // 只有 TE（chunked，未实现）→ 501。
@@ -370,6 +375,12 @@ class HttpRequest {
             } else if (!req.chunked) {
                 req.parseStatus = 501;
             }
+        }
+        if (req.version != "HTTP/1.1" && req.version != "HTTP/1.0") {
+            req.parseStatus = 400;
+        }
+        if (req.version == "HTTP/1.1" && hostCount != 1) {
+            req.parseStatus = 400;
         }
         if (headersStop > headersStart) {
             req.rawHeaders = raw.Substring(headersStart, headersStop - headersStart);
