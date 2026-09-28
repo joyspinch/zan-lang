@@ -114,16 +114,18 @@ class WsSession {
 
             WsFrame frame = this.reader.TakeFrame(total);
 
-            if (frame.opcode >= 3 && frame.opcode <= 7
-                || frame.opcode >= 11 && frame.opcode <= 15) {
-                // RFC 6455 §5.2：保留 opcode 不能进数据/控制帧路径，
-                // 协议错误回 1002 断开（与 Worker/WSS 同一契约）。
+            if (!WsFrame.ValidInbound(frame, true)) {
+                // RFC 6455：MVC 与 Worker/WSS 共用客户端帧门禁，避免
+                // 某一入口放过未掩码、RSV 或非法 Close 控制帧。
                 await this.Close(1002);
                 return null;
             }
             if (frame.opcode == WsOpcode.Ping) {
-                byte[] encoded = WsFrame.PongFrame().Encode();
-                this.writer.Append(encoded, 2);
+                WsFrame pong = WsFrame.RawFrame(
+                    WsOpcode.Pong, frame.payload, frame.payloadLen);
+                byte[] encoded = pong.Encode();
+                this.writer.Append(encoded,
+                    WsFrame.HeaderLen(frame.payloadLen) + frame.payloadLen);
                 continue;
             }
             if (frame.opcode == WsOpcode.Pong) { continue; }
@@ -154,7 +156,9 @@ class WsSession {
     /// <summary>Pushes one text message. false = the peer is gone; stop the
     /// loop (Open() is now false too).</summary>
     async bool SendText(string message) {
-        if (!this.open) { return false; }
+        if (!this.open || message == null || message.Length > 16777216) {
+            return false;
+        }
         WsFrame frame = WsFrame.TextFrame(message);
         byte[] encoded = frame.Encode();
         this.writer.Append(encoded,
@@ -170,7 +174,8 @@ class WsSession {
     /// <summary>Pushes one binary message. `data` is a byte string that may
     /// contain NUL bytes; `len` is its exact length (never strlen).</summary>
     async bool SendBinary(string data, int len) {
-        if (!this.open) { return false; }
+        if (!this.open || data == null || len < 0
+            || len > 16777216 || len > data.Length) { return false; }
         WsFrame frame = WsFrame.BinaryFrame(data, len);
         byte[] encoded = frame.Encode();
         this.writer.Append(encoded, WsFrame.HeaderLen(len) + len);

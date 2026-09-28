@@ -459,15 +459,9 @@ class WorkerWs {
 
             WsFrame frame = reader.TakeFrame(total);
 
-            // RFC 6455 入站帧门禁：§5.2 保留 opcode（3-7 数据、11-15
-            // 控制）、§5.5 控制帧载荷 ≤125、§5.1 客户端帧必须掩码。
-            // 此前非法 opcode 落进数据帧路径被原样回显给对端。
-            bool protoErr = frame.rsv != 0
-                || frame.opcode >= 3 && frame.opcode <= 7
-                || frame.opcode >= 11 && frame.opcode <= 15
-                || frame.opcode >= 8 && (!frame.fin || frame.payloadLen > 125)
-                || !frame.masked;
-            if (protoErr) {
+            // RFC 6455 入站帧门禁：统一复用公共校验，包含 RSV、掩码、
+            // 控制帧边界、保留 opcode 与 Close code/reason UTF-8。
+            if (!WsFrame.ValidInbound(frame, true)) {
                 byte[] enc = WsFrame.CloseFrameWithCode(1002).Encode();
                 writer.Append(enc, 4);
                 int _b = await writer.Flush(client);
@@ -537,6 +531,13 @@ class WorkerWs {
             // is stable across calls and matches the truncation contract the
             // old server had (a NUL-payload echo re-delivers up to the NUL).
             int respLen = (int)strlen(response);
+            if (respLen > 16777216) {
+                byte[] encBig = WsFrame.CloseFrameWithCode(1009).Encode();
+                writer.Append(encBig, 4);
+                int _big = await writer.Flush(client);
+                active = false;
+                break;
+            }
             if (respLen > 0) {
                 WsFrame respFrame = WsFrame.RawFrame(msgOpcode, response, respLen);
                 byte[] encoded = respFrame.Encode();

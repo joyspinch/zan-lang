@@ -208,14 +208,9 @@ class WssServer {
 
                 WsFrame frame = reader.TakeFrame(total);
 
-                // RFC 6455 入站帧门禁（与 Worker 同一契约）：保留
-                // opcode、控制帧载荷 >125、未掩码客户端帧 → 1002 断开。
-                bool protoErr = frame.rsv != 0
-                    || frame.opcode >= 3 && frame.opcode <= 7
-                    || frame.opcode >= 11 && frame.opcode <= 15
-                    || frame.opcode >= 8 && (!frame.fin || frame.payloadLen > 125)
-                    || !frame.masked;
-                if (protoErr) {
+                // RFC 6455 入站帧门禁：统一复用公共校验，包含 RSV、掩码、
+                // 控制帧边界、保留 opcode 与 Close code/reason UTF-8。
+                if (!WsFrame.ValidInbound(frame, true)) {
                     byte[] enc = WsFrame.CloseFrameWithCode(1002).Encode();
                     int _v = await stream.SendAsync(enc, 4);
                     connected = false;
@@ -256,6 +251,13 @@ class WssServer {
                 int msgOpcode = asm.MessageOpcode();
                 string message = asm.Complete();
                 string response = await OnMessageInternal(message);
+                if (response == null) { response = ""; }
+                if (response.Length > 16777216) {
+                    byte[] encBig = WsFrame.CloseFrameWithCode(1009).Encode();
+                    int _big = await stream.SendAsync(encBig, 4);
+                    connected = false;
+                    break;
+                }
                 int respLen = response.Length;
                 WsFrame respFrame = WsFrame.BinaryFrame(response, respLen);
                 respFrame.opcode = msgOpcode;
