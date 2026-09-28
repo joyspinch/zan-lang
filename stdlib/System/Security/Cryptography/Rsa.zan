@@ -228,6 +228,69 @@ class Rsa {
         return ModExp(em, k, n, k, d, dLen);
     }
 
+    /// RFC 8017 §9.1.1 EMSA-PSS-ENCODE with SHA-256, MGF1-SHA256 and sLen=32.
+    /// emBits is the actual modulus bit length minus one.
+    static byte[] EmsaPssSha256(string msg, int mLen, string n, int k, byte[] salt) {
+        if (msg == null || mLen < 0 || k < 66 || k > 512 || n == null || salt == null || salt.Length != 32) { return null; }
+        int first = n[0] & 255;
+        if (first == 0) { return null; }
+        int bitLen = 0;
+        while (first > 0) { bitLen = bitLen + 1; first = first >> 1; }
+        int emBits = (k - 1) * 8 + bitLen - 1;
+        int emLen = (emBits + 7) / 8;
+        if (emLen < 66 || emLen > k) { return null; }
+        int dbLen = emLen - 33;
+        byte[] mHash = Sha256.Hash(msg, mLen);
+        if (mHash == null || mHash.Length < 32) { return null; }
+        byte[] mPrime = new byte[72];
+        NativeMemory.Copy((nint)mPrime + 8, mHash, 32);
+        NativeMemory.Copy((nint)mPrime + 40, salt, 32);
+        byte[] h = Sha256.Hash(mPrime, 72);
+        if (h == null || h.Length < 32) { return null; }
+        byte[] mask = mgf1(h, 32, dbLen, 0);
+        if (mask == null || mask.Length != dbLen) { return null; }
+        byte[] em = new byte[k];
+        int off = k - emLen;
+        // DB = PS (all zeros) || 0x01 || salt; XOR with dbMask.
+        for (int i = 0; i < dbLen; i = i + 1) { em[off + i] = mask[i]; }
+        em[off + dbLen - 33] = (byte)((em[off + dbLen - 33] & 255) ^ 1);
+        for (int i = 0; i < 32; i = i + 1) {
+            em[off + dbLen - 32 + i] = (byte)((em[off + dbLen - 32 + i] & 255) ^ (salt[i] & 255));
+        }
+        em[off] = (byte)(em[off] & (255 >> (8 * emLen - emBits)));
+        NativeMemory.Copy((nint)em + (nint)(off + dbLen), h, 32);
+        em[k - 1] = 188;
+        return em;
+    }
+
+    /// RSASSA-PSS signing with a fresh 32-byte CSPRNG salt; null on RNG/key failure.
+    static byte[] SignPssSha256(string msg, int mLen, string n, int k, string d, int dLen,
+                                string p, int pLen, string q, int qLen,
+                                string dp, int dpLen, string dq, int dqLen,
+                                string qinv, int qinvLen, string e, int eLen) {
+        if (d == null || dLen <= 0 || e == null || eLen <= 0 || k < 66) { return null; }
+        byte[] salt = new byte[32];
+        if (RandomNumberGenerator.Fill(salt, 32) != 32) { return null; }
+        byte[] em = EmsaPssSha256(msg, mLen, n, k, salt);
+        if (em == null) { return null; }
+        byte[] sig = null;
+        if (p != null && q != null && dp != null && dq != null && qinv != null
+            && pLen > 0 && qLen > 0 && dpLen > 0 && dqLen > 0 && qinvLen > 0) {
+            byte[] crt = new byte[k];
+            if (NativeMemory.RsaCrtModPow(em, (long)k,
+                p, (long)pLen, q, (long)qLen, dp, (long)dpLen,
+                dq, (long)dqLen, qinv, (long)qinvLen, crt, (long)k) == 0) { sig = crt; }
+        }
+        if (sig == null) { sig = ModExp(em, k, n, k, d, dLen); }
+        if (sig == null || sig.Length != k) { return null; }
+        // Catch CRT or key mismatches before any signature goes onto the wire.
+        byte[] check = ModExp(sig, k, n, k, e, eLen);
+        if (check == null || check.Length != k) { return null; }
+        int diff = 0;
+        for (int i = 0; i < k; i = i + 1) { diff = diff | ((check[i] & 255) ^ (em[i] & 255)); }
+        return diff == 0 ? sig : null;
+    }
+
     /// <summary>校验 RSASSA-PKCS1-v1_5 SHA-256 签名。</summary>
     static bool VerifyPkcs1Sha256(string msg, int mLen, string sig, string n, int k, string e, int eLen) {
         byte[] em2 = ModExp(sig, k, n, k, e, eLen);

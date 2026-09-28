@@ -335,8 +335,18 @@ class TlsEngine {
 
     static byte[] RandomBytes(int n) {
         byte[] b = new byte[n];
-        RandomNumberGenerator.Fill(b, n);
+        if (RandomNumberGenerator.Fill(b, n) != n) { return null; }
         return b;
+    }
+
+    static byte[] GenerateX25519(out byte[] publicKey) {
+        publicKey = null;
+        byte[] priv = RandomBytes(32);
+        if (priv == null) { return null; }
+        priv[0] = (byte)(priv[0] & 248);
+        priv[31] = (byte)((priv[31] & 127) | 64);
+        publicKey = Curve25519.GetPublicKey(priv);
+        return publicKey == null ? null : priv;
     }
 
     /// <summary>启动 TLS 握手。客户端产出 ClientHello 记录，服务端置待接收状态。</summary>
@@ -351,8 +361,11 @@ class TlsEngine {
         this.clientRandom = RandomBytes(32);
         this.sessionId = RandomBytes(32);
         byte[] pubKey = null;
-        this.clientX25519Priv = Curve25519.GenerateKeyPair(out pubKey);
+        this.clientX25519Priv = GenerateX25519(out pubKey);
         this.clientX25519Pub = pubKey;
+        if (this.clientRandom == null || this.sessionId == null || this.clientX25519Priv == null || pubKey == null) {
+            this.Fail("TLS 随机数或 X25519 密钥生成失败"); return;
+        }
 
         byte[] chPayload = this.BuildClientHello();
         if (chPayload == null) {
@@ -745,7 +758,7 @@ class TlsEngine {
         if (scheme != 0x0804) { this.Fail("不支持 TLS 1.3 CertificateVerify 签名方案: " + scheme); return -1; }
         byte[] signature = r.ReadBytes(sigLen);
         byte[] hash = this.transcript.CurrentHash();
-        byte[] signed = new byte[64 + 33 + 1 + 32];
+        byte[] signed = new byte[130];
         for (int i = 0; i < 64; i = i + 1) { signed[i] = 32; }
         string context = "TLS 1.3, server CertificateVerify";
         for (int i = 0; i < 33; i = i + 1) { signed[64 + i] = (byte)(context[i] & 255); }
@@ -966,72 +979,109 @@ class TlsEngine {
     /* ---- 服务端握手实现 ---- */
 
     int HandleClientHello(byte[] fullMsg, byte[] body) {
+        if (!this.isServer || this.state != StateServerWaitingClientHello) {
+            this.Fail("意外的 ClientHello"); return -1;
+        }
         TlsByteReader r = new TlsByteReader(body, 0, body.Length);
-        if (r.Remaining() < 34) { this.Fail("ClientHello 过短"); return -1; }
+        if (!r.Has(35)) { this.Fail("ClientHello 过短"); return -1; }
         int clientVer = r.ReadU16();
         this.clientRandom = r.ReadBytes(32);
         int sidLen = r.ReadU8();
-        if (sidLen > 0) { this.sessionId = r.ReadBytes(sidLen); }
-        else { this.sessionId = new byte[0]; }
+        if (sidLen > 32 || !r.Has(sidLen + 2)) { this.Fail("ClientHello session_id 非法"); return -1; }
+        this.sessionId = r.ReadBytes(sidLen);
 
         int csLen = r.ReadU16();
-        List<int> suites = new List<int>();
-        for (int i = 0; i < csLen; i = i + 2) {
-            suites.Add(r.ReadU16());
+        if (csLen < 2 || (csLen & 1) != 0 || !r.Has(csLen + 1)) {
+            this.Fail("ClientHello cipher_suites 非法"); return -1;
         }
-
+        bool suite13 = false;
+        bool suite12 = false;
+        for (int i = 0; i < csLen; i = i + 2) {
+            int suite = r.ReadU16();
+            if (suite == 0x1301) { suite13 = true; }
+            if (suite == 0xc02f) { suite12 = true; }
+        }
         int compLen = r.ReadU8();
-        r.Skip(compLen);
+        if (compLen < 1 || !r.Has(compLen) || r.ReadU8() != 0) {
+            this.Fail("ClientHello compression_methods 非法"); return -1;
+        }
+        r.Skip(compLen - 1);
 
-        bool clientOffersTls13 = false;
+        bool offered13 = false;
+        bool offered12 = false;
+        bool hasVersions = false;
+        bool hasShares = false;
+        bool hasSigAlgs = false;
+        bool hasGroups = false;
+        bool sig13 = false;
+        bool sig12 = false;
+        bool groupX25519 = false;
         byte[] clientShare = null;
-        string sni = "";
-
-        if (r.Remaining() >= 2) {
+        if (r.Remaining() > 0) {
+            if (!r.Has(2)) { this.Fail("ClientHello extensions 长度非法"); return -1; }
             int extTotal = r.ReadU16();
-            while (r.Remaining() >= 4) {
+            if (extTotal != r.Remaining()) { this.Fail("ClientHello extensions 长度不匹配"); return -1; }
+            while (r.Remaining() > 0) {
+                if (!r.Has(4)) { this.Fail("ClientHello extension 截断"); return -1; }
                 int extType = r.ReadU16();
                 int extLen = r.ReadU16();
-                if (r.Remaining() < extLen) { break; }
-                if (extType == 0) { // server_name (SNI)
-                    if (extLen >= 5) {
-                        int listLen = r.ReadU16();
-                        int nameType = r.ReadU8();
-                        int nameLen = r.ReadU16();
-                        byte[] nb = r.ReadBytes(nameLen);
-                        if (nb != null) { sni = nb.ToStr(0, nameLen); }
-                        extLen = extLen - 5 - nameLen;
-                    }
-                } else if (extType == 43) { // supported_versions
-                    int svLen = r.ReadU8();
-                    for (int k = 0; k < svLen; k = k + 2) {
+                if (!r.Has(extLen)) { this.Fail("ClientHello extension 长度非法"); return -1; }
+                int extEnd = r.Offset() + extLen;
+                if (extType == 43) { // supported_versions
+                    if (hasVersions || extLen < 3) { this.Fail("supported_versions 非法"); return -1; }
+                    hasVersions = true;
+                    int n = r.ReadU8();
+                    if (n < 2 || (n & 1) != 0 || n + 1 != extLen) { this.Fail("supported_versions 列表非法"); return -1; }
+                    for (int i = 0; i < n; i = i + 2) {
                         int v = r.ReadU16();
-                        if (v == TlsRecord.VersionTls13) { clientOffersTls13 = true; }
+                        if (v == TlsRecord.VersionTls13) { offered13 = true; }
+                        if (v == TlsRecord.VersionTls12) { offered12 = true; }
                     }
-                    extLen = extLen - 1 - svLen;
+                } else if (extType == 13) { // signature_algorithms
+                    if (hasSigAlgs || extLen < 4) { this.Fail("signature_algorithms 非法"); return -1; }
+                    hasSigAlgs = true;
+                    int n = r.ReadU16();
+                    if (n < 2 || (n & 1) != 0 || n + 2 != extLen) { this.Fail("signature_algorithms 列表非法"); return -1; }
+                    for (int i = 0; i < n; i = i + 2) {
+                        int scheme = r.ReadU16();
+                        if (scheme == 0x0804) { sig13 = true; }
+                        if (scheme == 0x0401) { sig12 = true; }
+                    }
+                } else if (extType == 10) { // supported_groups
+                    if (hasGroups || extLen < 4) { this.Fail("supported_groups 非法"); return -1; }
+                    hasGroups = true;
+                    int n = r.ReadU16();
+                    if (n < 2 || (n & 1) != 0 || n + 2 != extLen) { this.Fail("supported_groups 列表非法"); return -1; }
+                    for (int i = 0; i < n; i = i + 2) { if (r.ReadU16() == 0x001d) { groupX25519 = true; } }
                 } else if (extType == 51) { // key_share
-                    int ksListLen = r.ReadU16();
-                    int ksEnd = r.Offset() + ksListLen;
-                    while (r.Offset() < ksEnd && r.Remaining() >= 4) {
+                    if (hasShares || extLen < 2) { this.Fail("key_share 非法"); return -1; }
+                    hasShares = true;
+                    int n = r.ReadU16();
+                    if (n + 2 != extLen) { this.Fail("key_share 列表非法"); return -1; }
+                    while (r.Offset() < extEnd) {
+                        if (extEnd - r.Offset() < 4) { this.Fail("key_share 条目截断"); return -1; }
                         int group = r.ReadU16();
                         int klen = r.ReadU16();
-                        byte[] shareBytes = r.ReadBytes(klen);
-                        if (group == 0x001d && klen == 32) { // X25519
-                            clientShare = shareBytes;
-                        }
+                        if (klen > extEnd - r.Offset()) { this.Fail("key_share 长度非法"); return -1; }
+                        if (group == 0x001d) {
+                            if (clientShare != null || klen != 32) { this.Fail("X25519 key_share 非法"); return -1; }
+                            clientShare = r.ReadBytes(klen);
+                        } else { r.Skip(klen); }
                     }
-                    extLen = extLen - 2 - ksListLen;
                 }
-                if (extLen > 0) { r.Skip(extLen); }
+                if (r.Offset() > extEnd) { this.Fail("ClientHello extension 越界"); return -1; }
+                r.Skip(extEnd - r.Offset());
             }
         }
-
+        if (!hasVersions) { offered12 = clientVer == TlsRecord.VersionTls12; }
+        if (clientVer != TlsRecord.VersionTls12) { this.Fail("ClientHello legacy_version 不受支持"); return -1; }
         this.transcript.Update(fullMsg);
-
-        // 版本协商
-        // TLS 1.3 requires RSA-PSS CertificateVerify. The server signer only
-        // produces PKCS#1 v1.5, forbidden by RFC 8446; negotiate TLS 1.2 instead.
-        return this.ServerStartTls12();
+        if (!this.disableTls13 && offered13 && suite13 && sig13 && groupX25519 && clientShare != null) {
+            return this.ServerStartTls13(clientShare);
+        }
+        if (offered12 && suite12 && sig12 && groupX25519) { return this.ServerStartTls12(); }
+        this.Fail("ClientHello 无共同 TLS 版本、套件、X25519 或签名算法");
+        return -1;
     }
 
     int ServerStartTls13(byte[] clientShare) {
@@ -1041,9 +1091,12 @@ class TlsEngine {
 
         // 生成服务端 X25519 临时密钥
         byte[] serverPub = null;
-        this.clientX25519Priv = Curve25519.GenerateKeyPair(out serverPub);
+        this.clientX25519Priv = GenerateX25519(out serverPub);
         this.serverX25519Pub = serverPub;
         this.serverRandom = RandomBytes(32);
+        if (this.clientX25519Priv == null || serverPub == null || this.serverRandom == null) {
+            this.Fail("TLS 1.3 随机数或 X25519 密钥生成失败"); return -1;
+        }
 
         // 构造 ServerHello
         TlsByteWriter sh = new TlsByteWriter();
@@ -1092,6 +1145,12 @@ class TlsEngine {
 
         // 计算 X25519 共享密钥
         byte[] sharedSecret = Curve25519.ScalarMult(this.clientX25519Priv, this.clientX25519Pub);
+        if (sharedSecret == null || sharedSecret.Length != 32) {
+            this.Fail("TLS 1.3 X25519 密钥协商失败"); return -1;
+        }
+        int sharedNonzero = 0;
+        for (int i = 0; i < 32; i = i + 1) { sharedNonzero = sharedNonzero | (sharedSecret[i] & 255); }
+        if (sharedNonzero == 0) { this.Fail("TLS 1.3 X25519 共享密钥为零"); return -1; }
 
         // 派生 TLS 1.3 握手流量密钥
         byte[] zeros32 = new byte[32];
@@ -1113,11 +1172,12 @@ class TlsEngine {
         this.readCipher = new TlsCipherState(TlsRecord.VersionTls13, clientHsKey, clientHsIv);
 
         // 构造并发送 EncryptedExtensions (0x08)
-        byte[] eeMsg = new byte[4];
+        byte[] eeMsg = new byte[6];
         eeMsg[0] = (byte)TlsRecord.HandshakeEncryptedExtensions;
-        eeMsg[1] = 0; eeMsg[2] = 0; eeMsg[3] = 0;
+        eeMsg[1] = 0; eeMsg[2] = 0; eeMsg[3] = 2;
+        eeMsg[4] = 0; eeMsg[5] = 0; // extensions vector length
         this.transcript.Update(eeMsg);
-        byte[] recEE = this.writeCipher.Encrypt(TlsRecord.ContentTypeHandshake, eeMsg, 0, 4);
+        byte[] recEE = this.writeCipher.Encrypt(TlsRecord.ContentTypeHandshake, eeMsg, 0, eeMsg.Length);
         this.outNet.WriteBytes(recEE);
 
         // 读取证书
@@ -1151,12 +1211,15 @@ class TlsEngine {
         byte[] recCert = this.writeCipher.Encrypt(TlsRecord.ContentTypeHandshake, certBytes, 0, certBytes.Length);
         this.outNet.WriteBytes(recCert);
 
-        // 构造 CertificateVerify
-        StringBuilder cvContext = new StringBuilder();
-        for (int sp = 0; sp < 64; sp = sp + 1) { cvContext.Append(" "); }
-        cvContext.Append("TLS 1.3, server CertificateVerify\0");
+        // RFC 8446 §4.4.3: 64 spaces || context (33 ASCII bytes) || 0 || transcript SHA-256.
+        byte[] cvInput = new byte[130];
+        for (int sp = 0; sp < 64; sp = sp + 1) { cvInput[sp] = 32; }
+        string cvLabel = "TLS 1.3, server CertificateVerify";
+        for (int i = 0; i < 33; i = i + 1) { cvInput[64 + i] = (byte)(cvLabel[i] & 255); }
+        cvInput[97] = 0;
         byte[] cvHash = this.transcript.CurrentHash();
-        for (int h = 0; h < 32; h = h + 1) { cvContext.Append((char)(cvHash[h] & 255)); }
+        if (cvHash == null || cvHash.Length != 32) { this.Fail("CertificateVerify transcript 摘要失败"); return -1; }
+        NativeMemory.Copy((nint)cvInput + 98, cvHash, 32);
 
         RsaKey rsaKey = this.cachedKey;
         if (rsaKey == null) {
@@ -1169,16 +1232,16 @@ class TlsEngine {
             return -1;
         }
 
-        byte[] sigBytes = rsaKey.SignSha256Raw(cvContext.ToString());
-        if (sigBytes == null) {
-            this.Fail("RSA CertificateVerify 签名失败");
+        byte[] sigBytes = rsaKey.SignPssSha256Raw(cvInput, 130);
+        if (sigBytes == null || sigBytes.Length != rsaKey.ModulusLength()) {
+            this.Fail("RSA-PSS CertificateVerify 签名失败");
             return -1;
         }
 
         TlsByteWriter cvMsg = new TlsByteWriter();
         cvMsg.WriteU8(TlsRecord.HandshakeCertificateVerify);
         cvMsg.WriteU24(4 + sigBytes.Length);
-        cvMsg.WriteU16(0x0401); // rsa_pkcs1_sha256
+        cvMsg.WriteU16(0x0804); // rsa_pss_rsae_sha256
         cvMsg.WriteU16(sigBytes.Length);
         cvMsg.WriteBytes(sigBytes);
         byte[] cvBytes = cvMsg.ToArray();
@@ -1226,6 +1289,7 @@ class TlsEngine {
         this.negotiatedVersion = TlsRecord.VersionTls12;
         this.negotiatedCipherSuite = 0xc02f; // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
         this.serverRandom = RandomBytes(32);
+        if (this.serverRandom == null) { this.Fail("TLS 1.2 随机数生成失败"); return -1; }
 
         // 1. ServerHello
         TlsByteWriter sh = new TlsByteWriter();
@@ -1266,8 +1330,11 @@ class TlsEngine {
 
         // 3. ServerKeyExchange (X25519)
         byte[] serverPub = null;
-        this.clientX25519Priv = Curve25519.GenerateKeyPair(out serverPub);
+        this.clientX25519Priv = GenerateX25519(out serverPub);
         this.serverX25519Pub = serverPub;
+        if (this.clientX25519Priv == null || serverPub == null) {
+            this.Fail("TLS 1.2 X25519 密钥生成失败"); return -1;
+        }
 
         byte[] paramsBytes = new byte[36];
         paramsBytes[0] = 3; // named_curve

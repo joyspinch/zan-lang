@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Net.Sockets;
 using System.Net.Tls;
+using System.Security.Cryptography;
 
 class Program {
     static int failures = 0;
@@ -85,6 +86,32 @@ class Program {
         + "-----END PRIVATE KEY-----\n";
 
     static int PORT = 9528;
+    static int server13Version = 0;
+    static int server12Version = 0;
+
+    static void TestPssSigning() {
+        RsaKey key = RsaKey.FromPrivatePem(SERVER_KEY);
+        X509Certificate pub = X509Certificate.FromPemFile("_scratch/tls_srv_cert.pem");
+        Check(key != null && pub != null && key.HasPrivateKey(), "pss rsa key parsed");
+        if (key == null || pub == null || !key.HasPrivateKey()) { return; }
+        byte[] message = new byte[130];
+        for (int i = 0; i < 64; i = i + 1) { message[i] = 32; }
+        string context = "TLS 1.3, server CertificateVerify";
+        for (int i = 0; i < 33; i = i + 1) { message[64 + i] = (byte)(context[i] & 255); }
+        byte[] digest = Sha256.Hash("tls13 signing vector", 20);
+        for (int i = 0; i < 32; i = i + 1) { message[98 + i] = digest[i]; }
+        byte[] first = key.SignPssSha256Raw(message, 130);
+        byte[] second = key.SignPssSha256Raw(message, 130);
+        Check(first != null && first.Length == key.ModulusLength(), "pss signature length");
+        Check(first != null && second != null && pub.VerifyPssSha256(message, first)
+            && pub.VerifyPssSha256(message, second), "pss signatures verify");
+        if (first == null || second == null) { return; }
+        int diff = 0;
+        for (int i = 0; i < first.Length; i = i + 1) { diff = diff | ((first[i] & 255) ^ (second[i] & 255)); }
+        Check(diff != 0, "pss fresh random salt");
+        message[129] = (byte)((message[129] & 255) ^ 1);
+        Check(!pub.VerifyPssSha256(message, first), "pss rejects changed transcript");
+    }
 
     static void TestRecordLayer() {
         byte[] key = new byte[16];
@@ -130,6 +157,8 @@ class Program {
             if (sock < 0) { break; }
             TlsStream s = await TlsStream.AcceptAsync(tls, sock);
             if (s != null) {
+                if (n == 0) { server13Version = s.engine.NegotiatedVersion(); }
+                else { server12Version = s.engine.NegotiatedVersion(); }
                 string req = await s.RecvAsync(128);
                 if (req == "ping tls13") {
                     await s.SendStringAsync("pong tls13");
@@ -150,6 +179,8 @@ class Program {
         Directory.CreateDirectory("_scratch");
         File.WriteAllText("_scratch/tls_srv_cert.pem", SERVER_CERT);
         File.WriteAllText("_scratch/tls_srv_key.pem", SERVER_KEY);
+        File.WriteAllText("_scratch/tls_ca_cert.pem", CA_CERT);
+        TestPssSigning();
 
         TlsContext serverTls = TlsContext.CreateServer("_scratch/tls_srv_cert.pem", "_scratch/tls_srv_key.pem");
         Check(serverTls != null, "server tls ctx ok");
@@ -158,13 +189,15 @@ class Program {
 
         // 1. Loopback TLS 1.3
         TlsContext c13 = TlsContext.CreateClient();
-        c13.DisableVerify();
+        Check(c13.AddTrustedCert("_scratch/tls_ca_cert.pem"), "tls13 test ca loaded");
         nint sock1 = Socket.CreateTcp();
         Socket.SetNonBlocking(sock1);
         await Socket.ConnectAsync(sock1, "127.0.0.1", PORT, 5000);
         TlsStream s1 = await TlsStream.ConnectAsync(c13, sock1, "wrong.example");
         Check(s1 != null, "tls13 client connect ok");
         if (s1 != null) {
+            Check(s1.engine.NegotiatedVersion() == TlsRecord.VersionTls13, "tls13 client negotiated");
+            Check(s1.engine.VerifyResult() == 0, "tls13 trusted host verified");
             await s1.SendStringAsync("ping tls13");
             string resp = await s1.RecvAsync(128);
             Check(resp == "pong tls13", "tls13 ping pong ok");
@@ -172,17 +205,20 @@ class Program {
         }
         Socket.Close(sock1);
         c13.Free();
+        Check(server13Version == TlsRecord.VersionTls13, "tls13 server negotiated");
 
         // 2. Loopback TLS 1.2
         TlsContext c12 = TlsContext.CreateClient();
         c12.DisableTls13();
-        c12.DisableVerify();
+        Check(c12.AddTrustedCert("_scratch/tls_ca_cert.pem"), "tls12 test ca loaded");
         nint sock2 = Socket.CreateTcp();
         Socket.SetNonBlocking(sock2);
         await Socket.ConnectAsync(sock2, "127.0.0.1", PORT, 5000);
         TlsStream s2 = await TlsStream.ConnectAsync(c12, sock2, "wrong.example");
         Check(s2 != null, "tls12 client connect ok");
         if (s2 != null) {
+            Check(s2.engine.NegotiatedVersion() == TlsRecord.VersionTls12, "tls12 client negotiated");
+            Check(s2.engine.VerifyResult() == 0, "tls12 trusted host verified");
             await s2.SendStringAsync("ping tls12");
             string resp2 = await s2.RecvAsync(128);
             Check(resp2 == "pong tls12", "tls12 ping pong ok");
@@ -190,6 +226,7 @@ class Program {
         }
         Socket.Close(sock2);
         c12.Free();
+        Check(server12Version == TlsRecord.VersionTls12, "tls12 server negotiated");
 
         serverTls.Free();
         Socket.Cleanup();
