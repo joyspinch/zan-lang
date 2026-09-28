@@ -1,0 +1,335 @@
+// Conformance: 转发器状态行/头部/trailer 门禁 + upstream authority 严格解析
+// + 配置边界。历次缺陷各钉一条：
+// 1. 上游状态行畸形（版本后缀 HTTP/1.1x、缺 OWS、4 位状态码、6xx）：
+//    旧 StatusOf 按"第一个空格后的数字前缀"解析，HTTP/1.1x 200 会被
+//    当成 200 转发——响应错位的起点。现在必须 502。
+// 2. 响应头行无冒号 / 冒号前空白 / 值含控制字符：旧解析静默跳过或
+//    原样转发，宽容下游会按不同切分方式解释。现在必须 502。
+// 3. 响应 TE+CL 冲突必须 502（fail-closed 既有口径的网络级钉子）。
+// 4. trailer 中被响应 Connection 提名的字段（RFC 7230 §4.1.2）不得
+//    转发——宽容下游会把它当普通头解释（走私向量）；合法 trailer
+//    照常透传。
+// 5. upstream authority：[IPv6]:port 必须可用且 Host 头还原方括号；
+//    裸 IPv6（"::1:port" 与 LastIndexOf 切分天然歧义）、未闭合括号、
+//    非法端口（80junk）必须整体拒绝（每请求 502），不得猜测修正。
+// 6. setter 极端值（chunk/head/connections 传 0 或负数）被钳界后
+//    转发器必须仍然可用，而不是全拒绝或每连接无界分配。
+// 7. 客户端 method 注入守卫：请求头构建在连接之后、发送之前，
+//    method 带 CR/LF 必须抛异常且服务器收不到任何请求字节；
+//    下载路径的旁路构建必须走同一守卫（LastDownloadError 可见）。
+using System;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.Sockets;
+using System.Net.Http.Proxy;
+
+namespace Conf;
+
+class Prog {
+    static int UP = 9683;         // 上游（含畸形响应路由）
+    static int FRONT = 9684;      // 正常转发器
+    static int V6UP = 9685;       // IPv6 回环上游
+    static int V6FRONT = 9686;    // upstream = [::1]:V6UP 的转发器
+    static int GUARD = 9687;      // method 注入守卫用的计数服务器
+    static int JUNK = 9688;       // upstream 端口非法的转发器
+    static int UNCLOSED = 9689;   // upstream 括号未闭合
+    static int BAREV6 = 9690;     // upstream 裸 IPv6
+    static int CLAMP = 9691;      // 极端 setter 的转发器
+    static TcpListener upListener;
+    static TcpListener v6Listener;
+    static TcpListener guardListener;
+    static int guardConns;
+    static int guardReqs;
+    static string v6LastHead;
+    static bool failed;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Prog.failed = true; }
+        Console.WriteLine((ok ? "ok " : "FAIL ") + label);
+    }
+
+    static async string Head(nint sock) {
+        string wire = "";
+        while (wire.IndexOf("\r\n\r\n") < 0) {
+            string part = await Socket.RecvAsync(sock, 8192, 3000);
+            if (part.Length == 0) { return ""; }
+            wire = wire + part;
+        }
+        return wire;
+    }
+
+    static async void Rogue() {
+        Prog.upListener = new TcpListener("127.0.0.1", Prog.UP);
+        Prog.upListener.Start();
+        while (true) {
+            nint sock = await Prog.upListener.AcceptAsync();
+            if (sock < 0) { break; }
+            Task.Spawn(Prog.RogueServe(sock));
+        }
+        Prog.upListener.Stop();
+    }
+
+    static async void RogueServe(nint sock) {
+        string wire = await Prog.Head(sock);
+        int boundary = wire.IndexOf("\r\n\r\n");
+        string head = boundary >= 0 ? wire.Substring(0, boundary + 4) : wire;
+        if (head.IndexOf("/badsuffix ") >= 0) {
+            int _a = await Socket.SendStringAsync(sock,
+                "HTTP/1.1x 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        } else if (head.IndexOf("/nospace ") >= 0) {
+            int _b = await Socket.SendStringAsync(sock,
+                "HTTP/1.1200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        } else if (head.IndexOf("/fourdigit ") >= 0) {
+            int _c = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 2000 OK\r\nContent-Length: 5\r\n\r\nhello");
+        } else if (head.IndexOf("/highcode ") >= 0) {
+            int _d = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 610 X\r\nContent-Length: 0\r\n\r\n");
+        } else if (head.IndexOf("/nocolon ") >= 0) {
+            int _e = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nNoColonHere\r\n\r\n");
+        } else if (head.IndexOf("/ospace ") >= 0) {
+            int _f = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nX-Test : v\r\n\r\n");
+        } else if (head.IndexOf("/ctrlval ") >= 0) {
+            string ctrl = "" + (char)1;
+            int _g = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nX-Bad: a" + ctrl + "b\r\n\r\n");
+        } else if (head.IndexOf("/tecl ") >= 0) {
+            int _h = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+                + "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+        } else if (head.IndexOf("/noterm ") >= 0) {
+            int _i = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nX-A: 1\r\n");
+            Socket.Close(sock); return;
+        } else if (head.IndexOf("/nomtrail ") >= 0) {
+            int _j = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                + "Connection: X-Evil\r\n\r\n5\r\nhello\r\n"
+                + "0\r\nX-Evil: 1\r\n\r\n");
+            Socket.Close(sock); return;
+        } else if (head.IndexOf("/oktrail ") >= 0) {
+            int _k = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                + "2\r\nhi\r\n0\r\nX-Trace: fine\r\n\r\n");
+        } else {
+            int _z = await Socket.SendStringAsync(sock,
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        }
+        Socket.Close(sock);
+    }
+
+    static async void V6Upstream() {
+        Prog.v6Listener = new TcpListener("::1", Prog.V6UP);
+        Prog.v6Listener.Start();
+        while (true) {
+            nint sock = await Prog.v6Listener.AcceptAsync();
+            if (sock < 0) { break; }
+            Task.Spawn(Prog.V6Serve(sock));
+        }
+        Prog.v6Listener.Stop();
+    }
+
+    static async void V6Serve(nint sock) {
+        string wire = await Prog.Head(sock);
+        if (wire.Length == 0) { Socket.Close(sock); return; }
+        Prog.v6LastHead = wire;
+        int _n = await Socket.SendStringAsync(sock,
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nv6ok");
+        Socket.Close(sock);
+    }
+
+    static async void GuardServer() {
+        Prog.guardListener = new TcpListener("127.0.0.1", Prog.GUARD);
+        Prog.guardListener.Start();
+        while (true) {
+            nint sock = await Prog.guardListener.AcceptAsync();
+            if (sock < 0) { break; }
+            Prog.guardConns = Prog.guardConns + 1;
+            Task.Spawn(Prog.GuardServe(sock));
+        }
+        Prog.guardListener.Stop();
+    }
+
+    static async void GuardServe(nint sock) {
+        string wire = await Prog.Head(sock);
+        if (wire.Length == 0) { Socket.Close(sock); return; }
+        Prog.guardReqs = Prog.guardReqs + 1;
+        int _n = await Socket.SendStringAsync(sock,
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        Socket.Close(sock);
+    }
+
+    static async string Ask(int port, string request) {
+        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", port, 3000);
+        if (c == null) { return ""; }
+        int _sent = await c.SendAsync(request);
+        string result = "";
+        while (true) {
+            string part = await c.RecvAsync(8192, 3000);
+            if (part.Length == 0) { break; }
+            result = result + part;
+        }
+        c.Close();
+        return result;
+    }
+
+    static HttpForwarder FrontOn(int port, string upstream) {
+        HttpForwarder fwd = new HttpForwarder("127.0.0.1", port, upstream);
+        fwd.SetTimeout(3000);
+        Task.Spawn(fwd.Start());
+        return fwd;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Task.Spawn(Prog.Rogue());
+        Task.Spawn(Prog.V6Upstream());
+        Task.Spawn(Prog.GuardServer());
+        HttpForwarder fwd = Prog.FrontOn(Prog.FRONT,
+            "http://127.0.0.1:" + Convert.ToString(Prog.UP));
+        HttpForwarder v6fwd = Prog.FrontOn(Prog.V6FRONT,
+            "[::1]:" + Convert.ToString(Prog.V6UP));
+        HttpForwarder junkFwd = Prog.FrontOn(Prog.JUNK,
+            "http://127.0.0.1:9x99");
+        HttpForwarder unclosedFwd = Prog.FrontOn(Prog.UNCLOSED,
+            "http://[::1");
+        HttpForwarder bareV6Fwd = Prog.FrontOn(Prog.BAREV6,
+            "http://::1:" + Convert.ToString(Prog.V6UP));
+        await Task.Delay(150);
+
+        // 基线：门禁不得误伤合法响应。
+        string ok = await Prog.Ask(Prog.FRONT,
+            "GET /normal HTTP/1.1\r\nHost: front\r\n\r\n");
+        Prog.Check(ok.IndexOf("200 OK") >= 0 && ok.IndexOf("\r\nok") >= 0,
+            "baseline response relayed");
+
+        // 1. 畸形状态行 → 502，上游字节不得透传。
+        string[] badStatus = new string[] { "/badsuffix", "/nospace",
+            "/fourdigit", "/highcode" };
+        for (int i = 0; i < badStatus.Length; i = i + 1) {
+            string r = await Prog.Ask(Prog.FRONT, "GET " + badStatus[i]
+                + " HTTP/1.1\r\nHost: front\r\n\r\n");
+            Prog.Check(r.IndexOf("502 Bad Gateway") >= 0
+                && r.IndexOf("hello") < 0,
+                "malformed status line rejected " + Convert.ToString(i));
+        }
+
+        // 2. 畸形头部行 → 502。
+        string[] badHead = new string[] { "/nocolon", "/ospace", "/ctrlval" };
+        for (int i = 0; i < badHead.Length; i = i + 1) {
+            string r = await Prog.Ask(Prog.FRONT, "GET " + badHead[i]
+                + " HTTP/1.1\r\nHost: front\r\n\r\n");
+            Prog.Check(r.IndexOf("502 Bad Gateway") >= 0,
+                "malformed response header rejected " + Convert.ToString(i));
+        }
+
+        // 3. 响应 TE+CL 冲突 → 502；头部不终止 → 502。
+        string tecl = await Prog.Ask(Prog.FRONT,
+            "GET /tecl HTTP/1.1\r\nHost: front\r\n\r\n");
+        Prog.Check(tecl.IndexOf("502 Bad Gateway") >= 0,
+            "response TE+CL conflict rejected");
+        string noterm = await Prog.Ask(Prog.FRONT,
+            "GET /noterm HTTP/1.1\r\nHost: front\r\n\r\n");
+        Prog.Check(noterm.IndexOf("502 Bad Gateway") >= 0
+            && noterm.IndexOf("X-A: 1") < 0,
+            "unterminated upstream head rejected");
+
+        // 4. trailer：被 Connection 提名的字段不得转发且连接不入池；
+        //    合法 trailer 透传。
+        string nom = await Prog.Ask(Prog.FRONT,
+            "GET /nomtrail HTTP/1.1\r\nHost: front\r\n\r\n");
+        Prog.Check(nom.IndexOf("hello") >= 0 && nom.IndexOf("X-Evil") < 0
+            && fwd.UpstreamPool().IdleCount() == 0,
+            "connection-nominated trailer not forwarded");
+        string oktr = await Prog.Ask(Prog.FRONT,
+            "GET /oktrail HTTP/1.1\r\nHost: front\r\n\r\n");
+        Prog.Check(oktr.IndexOf("X-Trace: fine") >= 0,
+            "valid trailer forwarded");
+
+        // 5. 方括号 IPv6 authority：转发可达，Host 头还原方括号形态。
+        string v6 = await Prog.Ask(Prog.V6FRONT,
+            "GET / HTTP/1.1\r\nHost: front\r\n\r\n");
+        Prog.Check(v6.IndexOf("v6ok") >= 0
+            && Prog.v6LastHead.IndexOf("Host: [::1]:") >= 0,
+            "bracketed IPv6 upstream works");
+
+        // 非法 authority：整体拒绝（每请求 502），不得猜测修正。
+        string junk = await Prog.Ask(Prog.JUNK,
+            "GET / HTTP/1.1\r\nHost: front\r\n\r\n");
+        Prog.Check(junk.IndexOf("502 Bad Gateway") >= 0,
+            "junk upstream port rejected");
+        string unclosed = await Prog.Ask(Prog.UNCLOSED,
+            "GET / HTTP/1.1\r\nHost: front\r\n\r\n");
+        Prog.Check(unclosed.IndexOf("502 Bad Gateway") >= 0,
+            "unclosed bracket upstream rejected");
+        string bare = await Prog.Ask(Prog.BAREV6,
+            "GET / HTTP/1.1\r\nHost: front\r\n\r\n");
+        Prog.Check(bare.IndexOf("502 Bad Gateway") >= 0,
+            "bare IPv6 upstream rejected");
+
+        // 6. setter 极端值钳界后转发器仍可用。
+        HttpForwarder clampFwd = new HttpForwarder("127.0.0.1", Prog.CLAMP,
+            "http://127.0.0.1:" + Convert.ToString(Prog.UP));
+        clampFwd.SetChunkBytes(0).SetMaxHeadBytes(-5).SetMaxConnections(0)
+            .SetTimeout(3000);
+        Task.Spawn(clampFwd.Start());
+        await Task.Delay(120);
+        string clamped = await Prog.Ask(Prog.CLAMP,
+            "GET /normal HTTP/1.1\r\nHost: front\r\n\r\n");
+        Prog.Check(clamped.IndexOf("200 OK") >= 0 && clamped.IndexOf("\r\nok") >= 0,
+            "clamped setters keep forwarder usable");
+
+        // 7. 客户端 method 注入守卫：请求未上线，服务器收不到请求。
+        bool methodCaught = false;
+        string methodErr = "";
+        try {
+            HttpClient bad = new HttpClient("127.0.0.1", Prog.GUARD);
+            bad.SetTimeout(3000);
+            HttpResponse _r = await bad.SendAsync("GE\r\nT", "/", "");
+        } catch (HttpRequestException e) {
+            methodCaught = e.Message.Length > 0;
+            methodErr = e.Message;
+        }
+        Prog.Check(methodCaught && methodErr.Length > 0 && Prog.guardReqs == 0,
+            "method injection rejected before send");
+        string good = "";
+        string goodErr = "";
+        try {
+            HttpClient cli = new HttpClient("127.0.0.1", Prog.GUARD);
+            cli.SetTimeout(3000);
+            good = await cli.GetAsync("/");
+        } catch (HttpRequestException e) {
+            goodErr = e.Message;
+        }
+        Prog.Check(good == "ok" && goodErr == "" && Prog.guardReqs == 1,
+            "normal client request unaffected");
+
+        // 下载路径的旁路构建走同一守卫。
+        string tmp = "_scratch/forwarder_status_dl.bin";
+        string prog = "_scratch/forwarder_status_dl.prog";
+        File.Delete(tmp);
+        File.Delete(prog);
+        HttpClient dl = new HttpClient("127.0.0.1", Prog.GUARD);
+        dl.SetTimeout(3000);
+        int rc = await dl.DownloadRangeToFileAsync("/x\r\nX-Evil: 1", tmp, prog);
+        Prog.Check(rc == -1 && dl.LastDownloadError()
+                .IndexOf("invalid HTTP method") >= 0,
+            "download path guarded");
+        int dlOk = await dl.DownloadRangeToFileAsync("/normal", tmp, prog);
+        Prog.Check(dlOk == 2 && dl.LastDownloadError() == "",
+            "download path normal request works");
+
+        fwd.Stop(); v6fwd.Stop(); junkFwd.Stop(); unclosedFwd.Stop();
+        bareV6Fwd.Stop(); clampFwd.Stop();
+        Prog.upListener.Stop(); Prog.v6Listener.Stop(); Prog.guardListener.Stop();
+        File.Delete(tmp);
+        File.Delete(prog);
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return Prog.failed ? 1 : 0;
+    }
+
+    static void Main() { int result = await Prog.Run(); }
+}

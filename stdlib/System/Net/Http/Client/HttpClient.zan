@@ -518,9 +518,24 @@ class HttpClient {
     /// 多个 token。SetHeader 有同一防线；请求行是调用方字符串进入
     /// 报文的另一入口，不能漏。
     static bool IsRequestTargetSafe(string path) {
+        if (path == null || path.Length == 0) { return false; }
         for (int i = 0; i < path.Length; i = i + 1) {
             int c = path[i] & 255;
-            if (c == 0 || c == 10 || c == 13 || c == 127 || c == 32) {
+            if (c <= 32 || c >= 127) { return false; }
+        }
+        return true;
+    }
+
+    static bool IsMethodSafe(string method) {
+        if (method == null || method.Length == 0) { return false; }
+        return HttpResponse.HeaderFramingSafe(true, method);
+    }
+
+    static bool IsHostSafe(string host) {
+        if (host == null || host.Length == 0) { return false; }
+        for (int i = 0; i < host.Length; i = i + 1) {
+            int c = host[i] & 255;
+            if (c <= 32 || c >= 127 || c == 47 || c == 92 || c == 64) {
                 return false;
             }
         }
@@ -530,9 +545,9 @@ class HttpClient {
     /// 构建请求头部半区；bodyLen<=0 时不写 Content-Length。
     string BuildRequestHead(string method, string path, int bodyLen,
                             bool close) {
-        if (!HttpClient.IsRequestTargetSafe(path)) {
-            throw new HttpRequestException(
-                "request target contains framing characters (CR/LF/space)");
+        if (!HttpClient.IsMethodSafe(method) || !HttpClient.IsHostSafe(this.host)
+            || !HttpClient.IsRequestTargetSafe(path)) {
+            throw new HttpRequestException("invalid HTTP method, host or request target");
         }
         StringBuilder sb = new StringBuilder();
         sb.Append(method);
@@ -584,6 +599,16 @@ class HttpClient {
             return head + body;
         }
         return head;
+    }
+
+    /// 下载请求沿用统一 method/host/path/header 注入校验，只额外插入
+    /// Range 字段；Range 不从调用方原文拼接进请求行。
+    string BuildDownloadRequest(string path, int have) {
+        string head = this.BuildRequestHead("GET", path, 0, true);
+        if (have <= 0) { return head; }
+        int end = head.Length - 2;
+        return head.Substring(0, end) + "Range: bytes="
+            + Convert.ToString(have) + "-\r\n\r\n";
     }
 
     /// 把响应里的 Set-Cookie 交给存储。未启用 cookie 时什么都不做，
@@ -902,7 +927,7 @@ class HttpClient {
             throw new HttpRequestException("invalid response status line");
         }
         HttpResponse frame = HttpResponse.Parse(head);
-        if (!frame.ParseFraming()) {
+        if (frame.statusCode < 100 || !frame.ParseFraming()) {
             throw new HttpRequestException("response framing malformed");
         }
         if (method == "HEAD" || code == 204 || code == 304) { return; }
@@ -1218,7 +1243,7 @@ class HttpClient {
             if (he == 0 && reused && attempt == 1
                 && (method == "GET" || method == "HEAD")) { continue; }
             HttpResponse probe = HttpResponse.Parse(head);
-            if (!probe.ParseFraming()) {
+            if (probe.statusCode < 100 || !probe.ParseFraming()) {
                 HttpDeadline.Disarm(watch);
                 this.DropAlive();
                 req = "";
@@ -1519,7 +1544,7 @@ class HttpClient {
             break;
         }
         HttpResponse resp = HttpResponse.Parse(head);
-        if (!resp.ParseFraming()) {
+        if (resp.statusCode < 100 || !resp.ParseFraming()) {
             HttpDeadline.Disarm(watch);
             this.CloseChannel(conn, fr, stream, ctx);
             throw new HttpRequestException("response framing malformed");
@@ -2029,15 +2054,29 @@ class HttpClient {
         return sawTe && finalChunked;
     }
 
-    /// 从 "HTTP/1.1 200 OK" 中解析出数字状态码。
+    /// 从状态行解析数字状态码；不是严格的 "HTTP/1.0|1.1 OWS 3DIGIT"
+    /// （版本后缀、缺 OWS、非数字、第 4 位数字）时返回 0，与
+    /// HttpResponse.Parse 的拒收口径一致——下载/SSE 路径按 <100
+    /// 拒收，不按数字前缀猜。
     static int HeadStatus(string head) {
-        int sp = HttpClient.IndexOf(head, " ", 0);
-        if (sp < 0) { return 0; }
+        if (head.Length < 12) { return 0; }
+        string ver = head.Substring(0, 8);
+        if (ver != "HTTP/1.0" && ver != "HTTP/1.1") { return 0; }
+        int c8 = head[8] & 255;
+        if (c8 != 32 && c8 != 9) { return 0; }
+        int i = 8;
+        while (i < head.Length && ((head[i] & 255) == 32
+            || (head[i] & 255) == 9)) { i = i + 1; }
+        if (i + 3 > head.Length) { return 0; }
         int code = 0;
-        int i = sp + 1;
-        while (i < head.Length && (head[i] & 255) >= 48 && (head[i] & 255) <= 57) {
-            code = code * 10 + ((head[i] & 255) - 48);
-            i = i + 1;
+        for (int k = 0; k < 3; k = k + 1) {
+            int b = head[i + k] & 255;
+            if (b < 48 || b > 57) { return 0; }
+            code = code * 10 + (b - 48);
+        }
+        if (i + 3 < head.Length) {
+            int b4 = head[i + 3] & 255;
+            if (b4 >= 48 && b4 <= 57) { return 0; }
         }
         return code;
     }
@@ -2764,31 +2803,16 @@ class HttpClient {
         }
 
         HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
-        if (!HttpClient.IsRequestTargetSafe(path)) {
-            this.SetDownloadError("request target contains framing characters (CR/LF/space)");
+        string req;
+        try {
+            req = this.BuildDownloadRequest(path, have);
+        } catch (HttpRequestException e) {
+            this.SetDownloadError(e.Message);
             HttpDeadline.Disarm(watch);
             if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
             else { conn.Close(); }
             return 0 - 1;
         }
-        StringBuilder sb = new StringBuilder();
-        sb.Append("GET ");
-        sb.Append(path);
-        sb.Append(" HTTP/1.1\r\n");
-        sb.Append("Host: ");
-        sb.Append(this.host);
-        sb.Append("\r\n");
-        for (int hi = 0; hi < this.defaultHeaders.Count; hi = hi + 1) {
-            sb.Append(this.defaultHeaders[hi]);
-            sb.Append("\r\n");
-        }
-        if (have > 0) {
-            sb.Append("Range: bytes=");
-            sb.Append(Convert.ToString(have));
-            sb.Append("-\r\n");
-        }
-        sb.Append("Connection: close\r\n\r\n");
-        string req = sb.ToString();
         int sentReq = 0;
         if (this.useTls) { sentReq = await stream.SendAsync(req, req.Length); }
         else { sentReq = await conn.SendAsync(req); }
@@ -3132,31 +3156,16 @@ class HttpClient {
         }
 
         HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
-        if (!HttpClient.IsRequestTargetSafe(path)) {
-            this.SetDownloadError("request target contains framing characters (CR/LF/space)");
+        string req;
+        try {
+            req = this.BuildDownloadRequest(path, have);
+        } catch (HttpRequestException e) {
+            this.SetDownloadError(e.Message);
             HttpDeadline.Disarm(watch);
             if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
             else { conn.Close(); }
             return 0 - 1;
         }
-        StringBuilder sb = new StringBuilder();
-        sb.Append("GET ");
-        sb.Append(path);
-        sb.Append(" HTTP/1.1\r\n");
-        sb.Append("Host: ");
-        sb.Append(this.host);
-        sb.Append("\r\n");
-        for (int hi = 0; hi < this.defaultHeaders.Count; hi = hi + 1) {
-            sb.Append(this.defaultHeaders[hi]);
-            sb.Append("\r\n");
-        }
-        if (have > 0) {
-            sb.Append("Range: bytes=");
-            sb.Append(Convert.ToString(have));
-            sb.Append("-\r\n");
-        }
-        sb.Append("Connection: close\r\n\r\n");
-        string req = sb.ToString();
         int sentReq = 0;
         if (this.useTls) { sentReq = await stream.SendAsync(req, req.Length); }
         else { sentReq = await conn.SendAsync(req); }

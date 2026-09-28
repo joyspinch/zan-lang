@@ -53,6 +53,7 @@
 - [x] **B-NET4d** TLS 公钥 pin 不受 `disableVerify` 绕过、证书链与主机名策略错误分离；用例 `tls_auth_chain`。
 - [x] **B-NET4f** TLS 接收缓冲区范围 fail-closed、X25519 低阶/全零共享密钥拒绝、TLS 1.2 ClientKeyExchange 尾随字节拒绝；用例 `security_tls_receive_bounds`、`tls_auth_chain`。
 - [x] **B-NET4e** HttpClient Connection token 按逗号/OWS/大小写解析，Proxy TLS 上游握手使用配置 timeout；用例 `http_client_keepalive`、`security_forwarder_wire`、`http_forwarder_keepalive`。
+- [x] **B-NET4g** HTTP/Proxy 报文边界与 IPv6 链路（2026-09-28）：`HttpResponse.Parse` 严格状态行（HTTP/1.0|1.1 + OWS + 恰三位 1xx-5xx 码 + 第 4 位非数字）与头部逐行校验（token 名、冒号前无空白、值禁控制字符 HTAB 除外），TE+CL 冲突与头块未终止拒收，全部以 statusCode=0 fail-closed（不返回 null，12 个调用点语义不变）；`HttpClient.BuildRequestHead` 统一 method token/host/path 校验（守卫在连接后发送前抛 HttpRequestException），两处下载旁路统一走 `BuildDownloadRequest`（Range 行由构建器插入）；`HttpServer`/`HttpForwarder` setter 钳界（timeout 1ms-24h、chunk/head 1KiB-1MiB、连接 1-1e6、idle 1-4096/24h），异常配置不再全拒绝或无界分配；`HttpForwarder.ParseUpstream` bracket-aware 严格解析（`[IPv6]:port` 支持、junk 端口/未闭合括号/裸 IPv6 每请求 502），响应状态行/头部严格验证（StatusOf/IsResponseHeadValid），trailer 禁止响应 Connection/Proxy-Connection 动态提名字段；IPv6 三处根因：`TcpListener` 按主机含 ':' 选 CreateTcp6、代理 `ConnectUpstream`/`ServeConnect` 改 `TcpClient.ConnectAsync` 按解析地址族逐条建连、`ExternalTarget.ValidIPv6` 修正前导/尾随 `::` 压缩误杀。用例 `security_forwarder_status`（21 项：4 畸形状态行/3 畸形头部/TE+CL/未终止→502 不透传、Connection 提名 trailer 拒转发、bracketed IPv6 端到端 + Host 头方括号还原、junk/裸 IPv6 upstream→502、极端 setter 后可用、method 注入守卫、下载路径守卫）、`http_parser_hardening`（26 项：10 条畸形 wire statusCode=0）。边界：`ValidIPv6` 不接受内嵌 IPv4 尾段与 %zone（严格拒绝），纯 AAAA 上游可通。
 
 ## 未完成 · 通讯与 TLS
 
@@ -63,5 +64,6 @@
 
 ## 最近验证
 
-- `ctest --test-dir build --output-on-failure -R 'conformance_(security_|tls_|http_|jwt_rs256|ws_)'`：通讯与密码学定向集 **37/37** 通过。
-- 完整 `standard` / `full` 档未在本轮完整跑完，不在此清单中宣称通过。
+- `standard` 档 1003 项：**1002 通过**；唯一失败 `conformance_win_tray_screen_smoke`（托盘/屏幕交互冒烟）单独复跑 4 个变体全过，属并行负载下的环境敏感毛刺，不在通讯改动面上。
+- 新增/受影响面直编直跑全绿且 `.out` 金样吻合：`security_forwarder_status` 21/21、`http_parser_hardening` 26/26、`security_forwarder_wire` 15/15、`http_forwarder_framing/keepalive/stream/tunnel`、`http_client_keepalive/binary/redirect/timeout`、`security_http_client`、`ipv6`；ctest 中 `security_forwarder_wire`、`http_forwarder_framing`、`proxy_binary_body`、`security_tls_*`、`x509_certificate` 均通过。
+- 首轮 standard 因会话后台任务被终止连坐（无关测试成批 0xc000026b 瞬死）的 7 项（mqtt_lwt_retain、game_idle、sdk_jd_modules、chart_axis_scale_extent、arpg_database、dap_integration、package_install_mvc）单独复跑全部通过，非代码回归。

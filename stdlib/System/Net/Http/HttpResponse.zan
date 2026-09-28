@@ -84,21 +84,25 @@ class HttpResponse {
         return s.IndexOf("\r") >= 0 || s.IndexOf("\n") >= 0;
     }
 
-    /// <summary>头部名/值是否不含会破坏报文分帧的字符：NUL、CR、LF、
-    /// DEL。名字另禁冒号——否则可夹带出第二个头字段（头注入）。
+    /// <summary>头部名/值是否不含会破坏报文分帧或被下游误读的字符：
+    /// 值禁所有控制字符（HTAB 除外）与 DEL——只禁 NUL/CR/LF 会让
+    /// 0x01 这类 CTL 溜进报文，宽容下游可能按不同规则切分；名字另禁
+    /// 冒号——否则可夹带出第二个头字段（头注入）。名字按 HTTP token
+    /// 字符集判定。
     /// <paramref name="isName"/> 为 true 时按名字判定。</summary>
     static bool HeaderFramingSafe(bool isName, string s) {
         for (int i = 0; i < s.Length; i = i + 1) {
             int ch = s[i] & 255;
-            if (ch == 0 || ch == 10 || ch == 13 || ch == 127) { return false; }
-            // Header names are HTTP tokens. Whitespace before ':' could turn
-            // an apparently ordinary name into a framing header downstream.
-            if (isName && !((ch >= 48 && ch <= 57)
-                || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122)
-                || ch == 33 || ch == 35 || ch == 36 || ch == 37
-                || ch == 38 || ch == 39 || ch == 42 || ch == 43
-                || ch == 45 || ch == 46 || ch == 94 || ch == 95
-                || ch == 96 || ch == 124 || ch == 126)) { return false; }
+            if (isName) {
+                if (!((ch >= 48 && ch <= 57)
+                    || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122)
+                    || ch == 33 || ch == 35 || ch == 36 || ch == 37
+                    || ch == 38 || ch == 39 || ch == 42 || ch == 43
+                    || ch == 45 || ch == 46 || ch == 94 || ch == 95
+                    || ch == 96 || ch == 124 || ch == 126)) { return false; }
+            } else {
+                if (ch == 127 || (ch < 32 && ch != 9)) { return false; }
+            }
         }
         return true;
     }
@@ -354,84 +358,100 @@ class HttpResponse {
         return true;
     }
 
-    /// <summary>解析原始 HTTP 响应（客户端用法）。</summary>
+    /// <summary>状态行严格校验：HTTP/1.0|HTTP/1.1 + 至少一个 OWS +
+    /// 三位状态码（1xx-5xx）+ 可选 OWS reason（不含控制字符，HTAB
+    /// 除外）。版本与状态码间缺 OWS、状态码带后缀（"HTTP/1.1x 200"）
+    /// 或 600+ 一律拒绝——否则状态码可被下游按不同切分方式读出。</summary>
+    static bool ValidStatusLine(string line) {
+        if (line.Length < 12) { return false; }
+        string ver = line.Substring(0, 8);
+        if (ver != "HTTP/1.0" && ver != "HTTP/1.1") { return false; }
+        if (!HttpResponse.IsOws(line[8] & 255)) { return false; }
+        int codeStart = HttpResponse.TrimOwsStart(line, 8, line.Length);
+        if (codeStart + 3 > line.Length) { return false; }
+        int first = (line[codeStart] & 255) - 48;
+        if (first < 1 || first > 5) { return false; }
+        for (int i = codeStart; i < codeStart + 3; i = i + 1) {
+            int c = line[i] & 255;
+            if (c < 48 || c > 57) { return false; }
+        }
+        if (codeStart + 3 < line.Length) {
+            int c4 = line[codeStart + 3] & 255;
+            if (c4 >= 48 && c4 <= 57) { return false; }
+        }
+        for (int i = codeStart + 3; i < line.Length; i = i + 1) {
+            int c = line[i] & 255;
+            if ((c < 32 && c != 9) || c == 127) { return false; }
+        }
+        return true;
+    }
+
+    /// <summary>解析原始 HTTP 响应（客户端用法）。状态行、字段行或
+    /// 分帧不合法时返回 statusCode=0 的空响应——合法状态码恒 >= 100，
+    /// 调用方以 <100 判定拒收并断开链路；绝不把畸形报文解释成
+    /// "200 空响应"（响应错位的起点）。</summary>
     static HttpResponse Parse(string raw) {
         HttpResponse resp = new HttpResponse();
+        if (raw == null) { resp.statusCode = 0; return resp; }
         int len = raw.Length;
-        if (len == 0) { return resp; }
-
-        // 状态行：HTTP/1.1 200 OK
-        int lineEnd = 0;
-        for (; lineEnd < len && (raw[lineEnd] & 255) != 10; lineEnd = lineEnd + 1) {
-        }
+        int lineEnd = raw.IndexOf("\r\n");
+        if (lineEnd < 0) { resp.statusCode = 0; return resp; }
         string statusLine = raw.Substring(0, lineEnd);
-        if (statusLine.Length > 0 && (statusLine[statusLine.Length - 1] & 255) == 13) {
-            statusLine = statusLine.Substring(0, statusLine.Length - 1);
+        if (!HttpResponse.ValidStatusLine(statusLine)) {
+            resp.statusCode = 0;
+            return resp;
+        }
+        int codeStart = HttpResponse.TrimOwsStart(statusLine, 8,
+            statusLine.Length);
+        resp.statusCode = ((statusLine[codeStart] & 255) - 48) * 100
+            + ((statusLine[codeStart + 1] & 255) - 48) * 10
+            + ((statusLine[codeStart + 2] & 255) - 48);
+        if (codeStart + 3 < statusLine.Length) {
+            int rs = HttpResponse.TrimOwsStart(statusLine, codeStart + 3,
+                statusLine.Length);
+            int rstop = HttpResponse.TrimOwsStop(statusLine, rs,
+                statusLine.Length);
+            resp.statusText = rs < rstop
+                ? statusLine.Substring(rs, rstop - rs) : "";
+        } else {
+            resp.statusText = "";
         }
 
-        // 解析状态码：HTTP-version 后必须至少一个 SP/HTAB；
-        // reason-phrase 前的 OWS 同样允许 HTAB。
-        int sp1 = 0;
-        while (sp1 < statusLine.Length
-                && !HttpResponse.IsOws(statusLine[sp1] & 255)) {
-            sp1 = sp1 + 1;
-        }
-        int codeStart = HttpResponse.TrimOwsStart(statusLine, sp1,
-            statusLine.Length);
-        int sp2 = codeStart;
-        while (sp2 < statusLine.Length
-                && !HttpResponse.IsOws(statusLine[sp2] & 255)) {
-            sp2 = sp2 + 1;
-        }
-        if (sp2 > codeStart) {
-            resp.statusCode = Convert.ToInt(statusLine.Substring(codeStart,
-                sp2 - codeStart));
-        }
-        int reasonStart = HttpResponse.TrimOwsStart(statusLine, sp2,
-            statusLine.Length);
-        int reasonStop = HttpResponse.TrimOwsStop(statusLine, reasonStart,
-            statusLine.Length);
-        if (reasonStart < reasonStop) {
-            resp.statusText = statusLine.Substring(reasonStart,
-                reasonStop - reasonStart);
-        }
-
-        // 解析头部直到空行
-        int pos = lineEnd + 1;
-        int bodyStart = pos;
+        // 头部逐行到空行；无冒号、冒号前空白、含控制字符的行整体拒收，
+        // 不再静默跳过（跳过正是走私头存活的缝隙）。
+        int pos = lineEnd + 2;
+        bool ended = false;
         while (pos < len) {
-            int hEnd = pos;
-            while (hEnd < len && (raw[hEnd] & 255) != 10) {
-                hEnd = hEnd + 1;
-            }
+            int hEnd = raw.IndexOf("\r\n", pos);
+            if (hEnd < 0) { resp.statusCode = 0; return resp; }
+            if (hEnd == pos) { pos = hEnd + 2; ended = true; break; }
             string headerLine = raw.Substring(pos, hEnd - pos);
-            if (headerLine.Length > 0 && (headerLine[headerLine.Length - 1] & 255) == 13) {
-                headerLine = headerLine.Substring(0, headerLine.Length - 1);
-            }
-            if (headerLine.Length == 0) {
-                bodyStart = hEnd + 1;
-                break;
-            }
             int colon = headerLine.IndexOf(":");
-            if (colon > 0) {
-                resp.headers.Add(headerLine);
-                string name = headerLine.Substring(0, colon).ToLower();
-                if (name == "content-type") {
-                    int valueStart = HttpResponse.TrimOwsStart(headerLine,
-                        colon + 1, headerLine.Length);
-                    int valueStop = HttpResponse.TrimOwsStop(headerLine,
-                        valueStart, headerLine.Length);
-                    resp.contentType = headerLine.Substring(valueStart,
-                        valueStop - valueStart);
-                }
+            if (colon <= 0
+                || !HttpResponse.HeaderFramingSafe(true,
+                    headerLine.Substring(0, colon))
+                || !HttpResponse.HeaderFramingSafe(false,
+                    headerLine.Substring(colon + 1))) {
+                resp.statusCode = 0;
+                return resp;
             }
-            pos = hEnd + 1;
+            resp.headers.Add(headerLine);
+            string name = headerLine.Substring(0, colon).ToLower();
+            if (name == "content-type") {
+                int valueStart = HttpResponse.TrimOwsStart(headerLine,
+                    colon + 1, headerLine.Length);
+                int valueStop = HttpResponse.TrimOwsStop(headerLine,
+                    valueStart, headerLine.Length);
+                resp.contentType = headerLine.Substring(valueStart,
+                    valueStop - valueStart);
+            }
+            pos = hEnd + 2;
         }
-
-        if (bodyStart < len) {
-            resp.body = raw.Substring(bodyStart);
+        if (!ended || !resp.ParseFraming()) {
+            resp.statusCode = 0;
+            return resp;
         }
-
+        if (pos < len) { resp.body = raw.Substring(pos); }
         return resp;
     }
 }

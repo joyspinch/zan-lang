@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Net;
+using System.Net.External;
 using System.Net.Sockets;
 using System.Net.Tls;
 using System.Threading;
@@ -499,8 +500,12 @@ class HttpForwarder {
         this.ParseUpstream(upstream);
     }
 
-    /// <summary>解析 upstream 字符串为上游 host、port 与 TLS 标志
-    /// （协议前缀与显式端口优先，缺省按构造器文档）。</summary>
+    /// <summary>解析 upstream 字符串为上游 host、port 与 TLS 标志。
+    /// authority 用 bracket-aware 严格解析（复用 ExternalTarget 的
+    /// 端口/IPv6 校验形状）：支持 [IPv6]:port，拒绝未闭合括号、
+    /// 非数字端口、0、大于 65535 与 host:80junk 这类前缀数字——
+    /// 旧 ParseInt 按"数字前缀即端口"接受畸形值，端口可能静默
+    /// 变成另一个目标。</summary>
     void ParseUpstream(string upstream) {
         string rest = upstream;
         if (HttpForwarder.StartsWith(rest, "https://")) {
@@ -514,51 +519,132 @@ class HttpForwarder {
         }
         int slash = HttpForwarder.IndexOf(rest, "/", 0);
         if (slash >= 0) { rest = rest.Substring(0, slash); }
-        int colon = HttpForwarder.LastIndexOf(rest, ":");
-        if (colon > 0) {
-            string p = rest.Substring(colon + 1, rest.Length - colon - 1);
-            int v = HttpForwarder.ParseInt(p);
-            if (v > 0) {
-                this.upPort = v;
-                rest = rest.Substring(0, colon);
+        if (rest.Length == 0) { return; }
+        string host = rest;
+        if (HttpForwarder.StartsWith(rest, "[")) {
+            int close = HttpForwarder.IndexOf(rest, "]", 0);
+            if (close < 0) { return; }
+            string inner = rest.Substring(1, close - 1);
+            // 方括号形式按 RFC 3986 只承载 IPv6 字面量，直接复用
+            // ExternalTarget 的严格校验；非法 IPv6 拒绝整个 upstream。
+            if (!ExternalTarget.ValidIPv6(inner)) { return; }
+            host = inner;
+            if (close + 1 < rest.Length) {
+                int port = HttpForwarder.PortOf(rest, close + 1);
+                if (port > 0) {
+                    this.upPort = port;
+                } else if (port < 0) {
+                    return;
+                }
+            }
+        } else {
+            if (rest.IndexOf("[") >= 0 || rest.IndexOf("]") >= 0) { return; }
+            int colon = HttpForwarder.LastIndexOf(rest, ":");
+            if (colon > 0) {
+                int port = HttpForwarder.PortOf(rest, colon);
+                if (port > 0) {
+                    this.upPort = port;
+                    host = rest.Substring(0, colon);
+                } else if (port < 0) {
+                    return;
+                }
+            } else if (colon == 0) {
+                return;
+            }
+            // 裸 IPv6（"::1"）与 LastIndexOf 切分天然歧义，一律要求
+            // 方括号形式——冒号进 host 就是拒绝信号。
+            if (host.Length == 0 || host.IndexOf(":") >= 0
+                || !HttpForwarder.IsAuthorityByte(host)) {
+                return;
             }
         }
-        this.upHost = rest;
+        this.upHost = host;
+    }
+
+    /// authority 主机部分（无方括号形态）只允许 DNS 名与 IPv4 字面量
+    /// 字节：空格、控制字符、user@、路径分隔符都会被 Socket.ConnectAsync
+    /// 或 Host 改写解释成别的目标。IPv6 一律走方括号 + ValidIPv6；
+    /// IDN 必须先转 punycode。
+    static bool IsAuthorityByte(string h) {
+        for (int i = 0; i < h.Length; i = i + 1) {
+            int c = h[i] & 255;
+            if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122) || c == 45 || c == 46)) {
+                return false;
+            }
+        }
+        return h.Length > 0;
+    }
+
+    /// upstream 的 ":端口" 解析：1-65535 返回端口，未写返回 0，
+    /// 畸形（非数字、0、>65535、>5 位）返回 -1——调用方按 -1 拒绝
+    /// 整个 upstream，不再按数字前缀猜。
+    static int PortOf(string authority, int at) {
+        if (at >= authority.Length) { return 0; }
+        if (authority[at] != ':') { return -1; }
+        string p = authority.Substring(at + 1, authority.Length - at - 1);
+        if (p.Length == 0 || p.Length > 5) { return -1; }
+        int n = 0;
+        for (int i = 0; i < p.Length; i = i + 1) {
+            int c = p[i] & 255;
+            if (c < 48 || c > 57) { return -1; }
+            n = n * 10 + c - 48;
+        }
+        if (n < 1 || n > 65535) { return -1; }
+        return n;
     }
 
     /// <summary>空闲超时（毫秒）：两个方向都这么久没有字节
     /// 才判定链路失效。流式响应之间的静默间隔可能很长，
     /// 因此默认 5 分钟。同时更新明文链路的接收截止——
     /// 此前该值只作用于连接建立，注释承诺的空闲判定从未生效，
-    /// 慢速客户端/卡死上游会永久占用协程与套接字。</summary>
+    /// 慢速客户端/卡死上游会永久占用协程与套接字。
+    /// 钳在 1ms-24h：0/负数会让空闲判定失效（协程永久挂起），
+    /// 过大的值同样不可恢复。</summary>
     HttpForwarder SetTimeout(int ms) {
+        if (ms < 1) { ms = 1; }
+        if (ms > 86400000) { ms = 86400000; }
         this.timeoutMs = ms;
         this.recvIdleMs = ms;
         return this;
     }
 
-    /// <summary>单次搬运的块大小（字节）。</summary>
+    /// <summary>单次搬运的块大小（字节）。钳在 1KiB-1MiB：过小是
+    /// 每块一次系统调用的放大器，过大则每连接白白占住一块缓冲。</summary>
     HttpForwarder SetChunkBytes(int bytes) {
+        if (bytes < 1024) { bytes = 1024; }
+        if (bytes > 1048576) { bytes = 1048576; }
         this.chunkBytes = bytes;
         return this;
     }
 
-    /// <summary>请求/响应头块的上限（字节）。</summary>
+    /// <summary>请求/响应头块的上限（字节）。钳在 1KiB-1MiB：
+    /// 下限防 0/负数让所有请求立即失败，上限防每连接无界缓冲。</summary>
     HttpForwarder SetMaxHeadBytes(int bytes) {
+        if (bytes < 1024) { bytes = 1024; }
+        if (bytes > 1048576) { bytes = 1048576; }
         this.maxHeadBytes = bytes;
         return this;
     }
 
-    /// <summary>最大并发连接数。</summary>
+    /// <summary>最大并发连接数。钳在 1-1000000：0/负数会拒绝所有
+    /// 连接（拒绝路径本身不递减计数，等于永久自锁）。</summary>
     HttpForwarder SetMaxConnections(int max) {
+        if (max < 1) { max = 1; }
+        if (max > 1000000) { max = 1000000; }
         this.maxConnections = max;
         return this;
     }
 
     /// <summary>上游空闲链路上限与空闲存活时长（毫秒）。
     /// 存活时长应短于上游自己的 keep-alive 超时，否则每次复用
-    /// 都要先碰一下已被对端关掉的链路。</summary>
+    /// 都要先碰一下已被对端关掉的链路。两值都钳界：
+    /// maxIdle 1-4096、idleMs 1-86400000。</summary>
     HttpForwarder SetUpstreamKeepAlive(int maxIdle, int idleMs) {
+        if (maxIdle < 1) { maxIdle = 1; }
+        if (maxIdle > 4096) { maxIdle = 4096; }
+        if (idleMs < 1) { idleMs = 1; }
+        if (idleMs > 86400000) { idleMs = 86400000; }
         this.maxIdleUp = maxIdle;
         this.idleUpMs = idleMs;
         if (this.pool != null) { this.pool.CloseAll(); }
@@ -735,7 +821,7 @@ class HttpForwarder {
             while (rhead.Length > 0 && HttpForwarder.StatusOf(rhead) >= 100
                 && HttpForwarder.StatusOf(rhead) < 200
                 && HttpForwarder.StatusOf(rhead) != 101) {
-                if (!HttpForwarder.IsHeadSyntaxValid(rhead)
+                if (!HttpForwarder.IsResponseHeadValid(rhead)
                     || !HttpForwarder.IsBodyFramingValid(rhead, false)) { break; }
                 int interim = await client.SendAllAsync(HttpForwarder.RewriteResponseHead(rhead, false));
                 if (interim <= 0) { up.Close(); client.Close(); return; }
@@ -759,7 +845,7 @@ class HttpForwarder {
         while (rhead.Length > 0 && HttpForwarder.StatusOf(rhead) >= 100
             && HttpForwarder.StatusOf(rhead) < 200
             && HttpForwarder.StatusOf(rhead) != 101) {
-            if (!HttpForwarder.IsHeadSyntaxValid(rhead)
+            if (!HttpForwarder.IsResponseHeadValid(rhead)
                 || !HttpForwarder.IsBodyFramingValid(rhead, false)) { break; }
             int interim = await client.SendAllAsync(HttpForwarder.RewriteResponseHead(rhead, false));
             if (interim <= 0) { up.Close(); client.Close(); return; }
@@ -790,7 +876,7 @@ class HttpForwarder {
             client.Close();
             return;
         }
-        if (!HttpForwarder.IsHeadSyntaxValid(rhead)
+        if (!HttpForwarder.IsResponseHeadValid(rhead)
             || HttpForwarder.StatusOf(rhead) < 100
             || !HttpForwarder.IsBodyFramingValid(rhead, false)
             || !HttpForwarder.AreConnectionTokensValid(rhead)) {
@@ -866,18 +952,16 @@ class HttpForwarder {
     /// <summary>CONNECT：连上游后回 200，然后双向裸字节对拷
     /// （TLS 直通，转发器不解密）。</summary>
     async void ServeConnect(FwdChannel client, FwdReader creader) {
-        nint sock = Socket.CreateTcp();
-        Socket.SetNonBlocking(sock);
-        int rc = await Socket.ConnectAsync(sock, this.upHost, this.upPort,
-                                           this.timeoutMs);
-        if (rc != 0) {
-            Socket.Close(sock);
+        TcpClient conn = await TcpClient.ConnectAsync(this.upHost, this.upPort,
+                                                      this.timeoutMs);
+        if (conn == null) {
             int _b = await client.SendAllAsync(
                 "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n"
                 + "Connection: close\r\n\r\n");
             client.Close();
             return;
         }
+        nint sock = conn.Sock();
         Socket.SetNoDelay(sock);
         FwdChannel up = FwdChannel.OfSocket(sock, this.recvIdleMs);
         int _o = await client.SendAllAsync(
@@ -887,16 +971,15 @@ class HttpForwarder {
                                    this.chunkBytes);
     }
 
-    /// <summary>建立上游连接（必要时完成 TLS 握手）。</summary>
+    /// <summary>建立上游连接（必要时完成 TLS 握手）。连接走
+    /// TcpClient.ConnectAsync：按解析结果的地址族逐条建连——
+    /// 此前裸 AF_INET 套接字连 IPv6 上游（[::1]）恒失败；
+    /// 上游是运营者配置的目标，回环上游（本地 sidecar/测试）合法。</summary>
     async FwdChannel ConnectUpstream() {
-        nint sock = Socket.CreateTcp();
-        Socket.SetNonBlocking(sock);
-        int rc = await Socket.ConnectAsync(sock, this.upHost, this.upPort,
-                                           this.timeoutMs);
-        if (rc != 0) {
-            Socket.Close(sock);
-            return null;
-        }
+        TcpClient conn = await TcpClient.ConnectAsync(this.upHost, this.upPort,
+                                                      this.timeoutMs);
+        if (conn == null) { return null; }
+        nint sock = conn.Sock();
         Socket.SetNoDelay(sock);
         if (!this.upTls) {
             return FwdChannel.OfSocket(sock, this.recvIdleMs);
@@ -924,9 +1007,12 @@ class HttpForwarder {
         List<string> lines = HttpForwarder.HeadLines(head);
         string outHead = "";
         string hostValue = this.upHost;
+        // IPv6 字面量在 Host 头里必须带方括号（RFC 3986）；upHost
+        // 存的是去括号形式，改写时还原。
+        if (hostValue.IndexOf(":") >= 0) { hostValue = "[" + hostValue + "]"; }
         if ((this.upTls && this.upPort != 443)
             || (!this.upTls && this.upPort != 80)) {
-            hostValue = this.upHost + ":" + Convert.ToString(this.upPort);
+            hostValue = hostValue + ":" + Convert.ToString(this.upPort);
         }
         bool chunked = HttpForwarder.HeadIsChunked(head);
         bool upgrade = HttpForwarder.HasHeaderToken(head, "connection", "upgrade")
@@ -1034,7 +1120,7 @@ class HttpForwarder {
     static async long PumpBody(FwdReader src, FwdChannel dst, string head,
             bool isRequest, int chunkBytes) {
         if (HttpForwarder.HeadIsChunked(head)) {
-            return await HttpForwarder.PumpChunked(src, dst, chunkBytes);
+            return await HttpForwarder.PumpChunked(src, dst, head, chunkBytes);
         }
         long len = HttpForwarder.ContentLengthOf(head);
         // 非法 Content-Length：不应到达这里，作为防御按无正文处理
@@ -1085,7 +1171,7 @@ class HttpForwarder {
     /// 返回搬运的数据字节数；未读到终结块就中断（对端先关、分块头
     /// 非法、下游写失败）时返回 -1：这条链路停在了帧中间，不能再
     /// 留给下一个请求用。</summary>
-    static async long PumpChunked(FwdReader src, FwdChannel dst,
+    static async long PumpChunked(FwdReader src, FwdChannel dst, string head,
             int chunkBytes) {
         long total = 0;
         while (true) {
@@ -1103,7 +1189,7 @@ class HttpForwarder {
                     if (trailer.Length == 0 || trailerBytes + trailer.Length > 8192) {
                         return -1;
                     }
-                    if (trailer != "\r\n" && !HttpForwarder.IsTrailerLineValid(trailer)) {
+                    if (trailer != "\r\n" && !HttpForwarder.IsTrailerLineValid(trailer, head)) {
                         return -1;
                     }
                     trailerBytes = trailerBytes + trailer.Length;
@@ -1205,19 +1291,46 @@ class HttpForwarder {
         return "";
     }
 
-    /// <summary>状态行的状态码，无法解析时返回 0。</summary>
+    /// <summary>状态行的状态码；状态行不是严格的
+    /// "HTTP/1.0|1.1 SP 3DIGIT [SP reason]"（版本后缀如 HTTP/1.1x、
+    /// 缺空格、非数字）时返回 0——调用方按 <100 拒收，不按
+    /// 数字前缀猜。</summary>
     static int StatusOf(string head) {
-        int sp = HttpForwarder.IndexOf(head, " ", 0);
-        if (sp < 0) { return 0; }
-        int start = sp + 1;
-        int end = start;
-        while (end < head.Length) {
-            int b = head[end] & 255;
-            if (b < 48 || b > 57) { break; }
-            end = end + 1;
+        if (head.Length < 12) { return 0; }
+        string ver = head.Substring(0, 9);
+        if (ver != "HTTP/1.0 " && ver != "HTTP/1.1 ") { return 0; }
+        int code = 0;
+        for (int i = 9; i < 12; i = i + 1) {
+            int b = head[i] & 255;
+            if (b < 48 || b > 57) { return 0; }
+            code = code * 10 + (b - 48);
         }
-        if (end == start) { return 0; }
-        return HttpForwarder.ParseInt(head.Substring(start, end - start));
+        if (head.Length > 12 && (head[12] & 255) != 32) { return 0; }
+        return code;
+    }
+
+    /// <summary>响应头块语法（含严格状态行）。IsHeadSyntaxValid 不校验
+    /// 首行（请求/响应共用），响应侧在它之上加 IsStatusLineValid。</summary>
+    static bool IsResponseHeadValid(string head) {
+        List<string> lines = HttpForwarder.HeadLines(head);
+        if (lines.Count == 0) { return false; }
+        string line = lines[0];
+        if (line.Length < 12) { return false; }
+        string ver = line.Substring(0, 9);
+        if (ver != "HTTP/1.0 " && ver != "HTTP/1.1 ") { return false; }
+        for (int i = 9; i < 12; i = i + 1) {
+            int b = line[i] & 255;
+            if (b < 48 || b > 57) { return false; }
+        }
+        if (((line[9] & 255) - 48) < 1 || ((line[9] & 255) - 48) > 5) {
+            return false;
+        }
+        if (line.Length > 12 && (line[12] & 255) != 32) { return false; }
+        for (int i = 13; i < line.Length; i = i + 1) {
+            int b = line[i] & 255;
+            if ((b < 32 && b != 9) || b == 127) { return false; }
+        }
+        return HttpForwarder.IsHeadSyntaxValid(head);
     }
 
     /// <summary>头部行的字段名（小写）；不是头部行时返回空串。
@@ -1283,15 +1396,24 @@ class HttpForwarder {
         return true;
     }
 
-    static bool IsTrailerLineValid(string line) {
+    /// <summary>trailer 字段行校验。除固定禁区（Content-Length/TE/Host/
+    /// 逐跳）外，还拒绝响应 Connection 头动态提名的字段——RFC 7230 §4.1.2：
+    /// "Connection: X-Foo" 把 X-Foo 降为逐跳语义，出现在 trailer 里再
+    /// 被原样转发，宽容的下游会把它当普通头解释（走私向量）。</summary>
+    static bool IsTrailerLineValid(string line, string head) {
         if (line.Length < 4 || line.Substring(line.Length - 2, 2) != "\r\n") {
             return false;
         }
         string field = line.Substring(0, line.Length - 2);
         if (!HttpForwarder.IsHeaderLineValid(field)) { return false; }
         string name = HttpForwarder.LowerName(field);
-        return name != "content-length" && name != "transfer-encoding"
-            && name != "host" && !HttpForwarder.IsHopByHop(name);
+        if (name.Length == 0) { return false; }
+        if (name == "content-length" || name == "transfer-encoding"
+            || name == "host" || HttpForwarder.IsHopByHop(name)) {
+            return false;
+        }
+        return !HttpForwarder.HasHeaderToken(head, "connection", name)
+            && !HttpForwarder.HasHeaderToken(head, "proxy-connection", name);
     }
 
     static bool IsHeadSyntaxValid(string head) {
@@ -1552,20 +1674,6 @@ class HttpForwarder {
                 }
             }
         }
-        return n;
-    }
-
-    /// <summary>解析前导十进制数字（ParseUpstream 的端口用）；无数字时为 0。</summary>
-    static int ParseInt(string s) {
-        int n = 0;
-        bool any = false;
-        for (int i = 0; i < s.Length; i = i + 1) {
-            int b = s[i] & 255;
-            if (b < 48 || b > 57) { break; }
-            n = n * 10 + (b - 48);
-            any = true;
-        }
-        if (!any) { return 0; }
         return n;
     }
 
