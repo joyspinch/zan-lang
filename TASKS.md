@@ -43,7 +43,7 @@
 
 ## 未完成 · 编译内存
 
-- [~] **A-MEM1** 大型发布已落地保守生成前裁剪：声明先行、Main/初始化/构造/委托/虚表/反射/库导出按固定点保活；非发布与 `--emit-ir` 保留用户体以免吞掉降层诊断，发布仅裁剪 stdlib 体，未用声明留一块 `unreachable` 以满足 LLVM。冻结 OnePlus 402 输入重测：IR 定义 18,628→18,488、指令 4,022,035→3,545,750，峰值 Commit 1,530→1,414 MB（仍由 IRGen 主导，未彻底闭账）。`dead_method_pre_ir` 行为+IR 回归、smoke 313/313、standard 可执行集 999 项中仅并行 `zandb_p3` 偶发红且串行通过；后续仍需更强的 stdlib 压力与后端分片评估。
+- [~] **A-MEM1** 大型发布已落地保守生成前裁剪：声明先行、Main/初始化/构造/委托/虚表/反射/库导出按固定点保活；非发布与 `--emit-ir` 保留用户体以免吞掉降层诊断，发布仅裁剪 stdlib 体，未用声明留一块 `unreachable` 以满足 LLVM。冻结 OnePlus 402 输入重测：IR 定义 18,628→18,488、指令 4,022,035→3,545,750，峰值 Commit 1,530→1,414 MB（仍由 IRGen 主导，未彻底闭账）。`dead_method_pre_ir` 行为+IR 回归、smoke 313/313、standard 可执行集 999 项中仅并行 `zandb_p3` 偶发红且串行通过；阶段一 `12d7e911` 仅建立 generated-object 向量，明确无内存收益声明。独立 LLVM 生命周期探针在同一 context 串行生成/写出/销毁 8 个高负载 module（每片 128 函数×256 算术指令）通过，PrivateUsage 首片后不随 module 数线性增长；因此当前主要阻碍不是 module dispose 泄漏，而是 Zan IRGen 普遍持有 module-local LLVM handles、internal linkage 和全局辅助/类型状态，尚无可安全拆分的闭合函数族；继续保留单模块 fallback，后续需重构 ABI/声明重建后再评估分片。
 
 ## 已闭账 · 通讯协议加固（2026-09-28）
 

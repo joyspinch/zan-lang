@@ -3249,6 +3249,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
 void zan_irgen_destroy(zan_irgen_t *g) {
     if (s_current_irgen == g) s_current_irgen = NULL;
+    if (g_di_emit_ctx == g) g_di_emit_ctx = NULL;
     free(g->catch_cleanups);
     g->catch_cleanups = NULL;
     g->catch_cleanup_count = g->catch_cleanup_cap = 0;
