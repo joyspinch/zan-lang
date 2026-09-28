@@ -1,0 +1,198 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http.Proxy;
+
+namespace Conf;
+
+class Prog {
+    static int UP = 9651;
+    static int FRONT = 9652;
+    static TcpListener listener;
+    static int accepted;
+    static int requests;
+    static string lastHead;
+    static bool failed;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Prog.failed = true; }
+        Console.WriteLine((ok ? "ok " : "FAIL ") + label);
+    }
+
+    static async string Head(nint sock) {
+        string wire = "";
+        while (wire.IndexOf("\r\n\r\n") < 0) {
+            string part = await Socket.RecvAsync(sock, 8192, 3000);
+            if (part.Length == 0) { return ""; }
+            wire = wire + part;
+        }
+        return wire;
+    }
+
+    static async void Upstream() {
+        Prog.listener = new TcpListener("127.0.0.1", Prog.UP);
+        Prog.listener.Start();
+        while (true) {
+            nint sock = await Prog.listener.AcceptAsync();
+            if (sock < 0) { break; }
+            Prog.accepted = Prog.accepted + 1;
+            Task.Spawn(Prog.Serve(sock));
+        }
+        Prog.listener.Stop();
+    }
+
+    static async void Serve(nint sock) {
+        string wire = await Prog.Head(sock);
+        while (wire.Length > 0) {
+            int boundary = wire.IndexOf("\r\n\r\n");
+            if (boundary < 0) { break; }
+            string head = wire.Substring(0, boundary + 4);
+            wire = wire.Substring(boundary + 4);
+            Prog.lastHead = head;
+            Prog.requests = Prog.requests + 1;
+            if (head.IndexOf("/expect ") >= 0) {
+                int _cont = await Socket.SendStringAsync(sock,
+                    "HTTP/1.1 100 Continue\r\n\r\n");
+                while (wire.Length < 4) {
+                    string part = await Socket.RecvAsync(sock, 8192, 3000);
+                    if (part.Length == 0) { Socket.Close(sock); return; }
+                    wire = wire + part;
+                }
+                wire = wire.Substring(4);
+                int _done = await Socket.SendStringAsync(sock,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            } else if (head.IndexOf("/reject ") >= 0) {
+                int _reject = await Socket.SendStringAsync(sock,
+                    "HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n");
+            } else if (head.IndexOf("/wrong-upgrade ") >= 0) {
+                int _wrong = await Socket.SendStringAsync(sock,
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n"
+                    + "Connection: Upgrade\r\n\r\n");
+                Socket.Close(sock); return;
+            } else if (head.IndexOf("/upgrade ") >= 0) {
+                int _switch = await Socket.SendStringAsync(sock,
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                    + "Connection: Upgrade, X-Secret\r\nX-Secret: bad\r\n\r\n");
+                string frame = await Socket.RecvAsync(sock, 8192, 3000);
+                if (frame.Length > 0) { int _echo = await Socket.SendStringAsync(sock, frame); }
+                Socket.Close(sock); return;
+            } else if (head.IndexOf("/badcrlf ") >= 0) {
+                int _bad = await Socket.SendStringAsync(sock,
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    + "2\r\nokXX0\r\n\r\n");
+                Socket.Close(sock); return;
+            } else if (head.IndexOf("/badsize ") >= 0) {
+                int _bad = await Socket.SendStringAsync(sock,
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    + "2oops\r\nok\r\n0\r\n\r\n");
+                Socket.Close(sock); return;
+            } else {
+                int _ok = await Socket.SendStringAsync(sock,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                    + "Connection: X-Secret\r\nX-Secret: bad\r\n"
+                    + "Proxy-Connection: X-Other\r\nX-Other: bad\r\n"
+                    + "Keep-Alive: timeout=5\r\n\r\nok");
+            }
+            if (wire.Length == 0) {
+                wire = await Prog.Head(sock);
+            }
+        }
+        Socket.Close(sock);
+    }
+
+    static async string Ask(string request) {
+        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", Prog.FRONT, 3000);
+        if (c == null) { return ""; }
+        int _sent = await c.SendAsync(request);
+        string result = "";
+        while (true) {
+            string part = await c.RecvAsync(8192, 3000);
+            if (part.Length == 0) { break; }
+            result = result + part;
+        }
+        c.Close();
+        return result;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Prog.accepted = 0; Prog.requests = 0; Prog.failed = false;
+        Task.Spawn(Prog.Upstream());
+        HttpForwarder fwd = new HttpForwarder("127.0.0.1", Prog.FRONT,
+            "http://127.0.0.1:" + Convert.ToString(Prog.UP));
+        fwd.SetTimeout(3000);
+        Task.Spawn(fwd.Start());
+        await Task.Delay(120);
+        string reply = await Prog.Ask("GET /normal HTTP/1.1\r\nHost: front\r\n"
+            + "Connection: X-Private\r\nX-Private: secret\r\n"
+            + "Proxy-Connection: X-Proxy\r\nX-Proxy: secret\r\n\r\n");
+        Prog.Check(reply.IndexOf("200 OK") >= 0 && reply.IndexOf("X-Secret:") < 0
+            && reply.IndexOf("X-Other:") < 0 && reply.IndexOf("Keep-Alive:") < 0,
+            "response hop-by-hop and nominated headers stripped");
+        Prog.Check(Prog.lastHead.IndexOf("X-Private:") < 0
+            && Prog.lastHead.IndexOf("X-Proxy:") < 0,
+            "request connection-nominated headers stripped");
+        int before = Prog.accepted;
+        string[] invalid = new string[] {
+            "GET / HTTP/1.1\r\nHost: front\r\nContent-Length: 1\r\nConnection: Content-Length\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: front\r\nHost: duplicate\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: front\r\nInvalid Name: x\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: front\r\nConnection: bad@token\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: front\r\nTransfer-Encoding: gzip\r\n\r\n"
+        };
+        for (int i = 0; i < invalid.Length; i = i + 1) {
+            string bad = await Prog.Ask(invalid[i]);
+            Prog.Check(bad.IndexOf("400 Bad Request") >= 0 && Prog.accepted == before,
+                "invalid request rejected before upstream " + Convert.ToString(i));
+        }
+        string badsize = await Prog.Ask("GET /badsize HTTP/1.1\r\nHost: front\r\n\r\n");
+        Prog.Check(badsize.IndexOf("2oops\r\n") < 0 && fwd.UpstreamPool().IdleCount() == 0,
+            "invalid chunk-size rejected, no pooling");
+        string badcrlf = await Prog.Ask("GET /badcrlf HTTP/1.1\r\nHost: front\r\n\r\n");
+        Prog.Check(badcrlf.IndexOf("2\r\nok") >= 0
+            && badcrlf.IndexOf("okXX") < 0 && fwd.UpstreamPool().IdleCount() == 0,
+            "missing data CRLF retires upstream");
+
+        TcpClient expect = await TcpClient.ConnectAsync("127.0.0.1", Prog.FRONT, 3000);
+        if (expect != null) {
+            int _h = await expect.SendAsync("POST /expect HTTP/1.1\r\nHost: front\r\n"
+                + "Expect: 100-continue\r\nContent-Length: 4\r\n\r\n");
+            string interim = await expect.RecvAsync(8192, 3000);
+            Prog.Check(interim.IndexOf("100 Continue") >= 0, "100 relayed before body");
+            int _b = await expect.SendAsync("data");
+            string final = await expect.RecvAsync(8192, 3000);
+            Prog.Check(final.IndexOf("200 OK") >= 0, "100 followed by final response");
+            expect.Close();
+        } else { Prog.Check(false, "expect connect"); }
+        string denied = await Prog.Ask("POST /reject HTTP/1.1\r\nHost: front\r\n"
+            + "Expect: 100-continue\r\nContent-Length: 4\r\n\r\n");
+        Prog.Check(denied.IndexOf("417 Expectation Failed") >= 0,
+            "upstream final without upload forwarded");
+
+        string mismatched = await Prog.Ask("GET /wrong-upgrade HTTP/1.1\r\nHost: front\r\n"
+            + "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+        Prog.Check(mismatched.IndexOf("502 Bad Gateway") >= 0
+            && mismatched.IndexOf("101 Switching Protocols") < 0,
+            "mismatched Upgrade protocol rejected");
+
+        TcpClient upgrade = await TcpClient.ConnectAsync("127.0.0.1", Prog.FRONT, 3000);
+        if (upgrade != null) {
+            int _u = await upgrade.SendAsync("GET /upgrade HTTP/1.1\r\nHost: front\r\n"
+                + "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+            string switched = await upgrade.RecvAsync(8192, 3000);
+            Prog.Check(switched.IndexOf("101 Switching Protocols") >= 0
+                && switched.IndexOf("Connection: Upgrade") >= 0
+                && switched.IndexOf("Upgrade: websocket") >= 0
+                && switched.IndexOf("X-Secret:") < 0,
+                "101 handshake kept, nominated field stripped");
+            int _frame = await upgrade.SendAsync("ping");
+            string echoed = await upgrade.RecvAsync(8192, 3000);
+            Prog.Check(echoed.IndexOf("ping") >= 0, "101 raw tunnel");
+            upgrade.Close();
+        } else { Prog.Check(false, "upgrade connect"); }
+        fwd.Stop(); Prog.listener.Stop();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return Prog.failed ? 1 : 0;
+    }
+
+    static void Main() { int result = await Prog.Run(); }
+}

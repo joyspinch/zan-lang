@@ -68,18 +68,24 @@ class FwdChannel {
         if (total == 0) { return 0; }
         if (this.closed) { return 0; }
         int sent = 0;
-        while (sent < total) {
-            string rest = data.Substring(sent, total - sent);
-            int n;
-            if (this.tls != null) {
-                n = await this.tls.SendAsync(rest, rest.Length);
-            } else {
-                n = await Socket.SendAsync(this.sock, rest, rest.Length);
+        HttpDeadlineToken watch = HttpDeadline.Arm(this.sock, this.idleMs);
+        try {
+            while (sent < total) {
+                string rest = data.Substring(sent, total - sent);
+                int n;
+                if (this.tls != null) {
+                    n = await this.tls.SendAsync(rest, rest.Length);
+                } else {
+                    n = await Socket.SendAsync(this.sock, rest, rest.Length);
+                }
+                if (HttpDeadline.Expired(watch) || n <= 0) { return sent; }
+                sent = sent + n;
+                HttpDeadline.Touch(watch, this.idleMs);
             }
-            if (n <= 0) { return sent; }
-            sent = sent + n;
+            return sent;
+        } finally {
+            HttpDeadline.Disarm(watch);
         }
-        return sent;
     }
 
     /// <summary>接收原始字节到 data，返回真实字节数；0 表示关闭或失败。
@@ -108,17 +114,23 @@ class FwdChannel {
         if (this.closed || data == null || offset < 0 || len <= 0
             || offset > data.Length || len > data.Length - offset) { return 0; }
         int sent = 0;
-        while (sent < len) {
-            int n;
-            if (this.tls != null) {
-                n = await this.tls.SendBytesAsync(data, offset + sent, len - sent);
-            } else {
-                n = await Socket.SendBytesAsync(this.sock, data, offset + sent, len - sent);
+        HttpDeadlineToken watch = HttpDeadline.Arm(this.sock, this.idleMs);
+        try {
+            while (sent < len) {
+                int n;
+                if (this.tls != null) {
+                    n = await this.tls.SendBytesAsync(data, offset + sent, len - sent);
+                } else {
+                    n = await Socket.SendBytesAsync(this.sock, data, offset + sent, len - sent);
+                }
+                if (HttpDeadline.Expired(watch) || n <= 0) { return sent; }
+                sent = sent + n;
+                HttpDeadline.Touch(watch, this.idleMs);
             }
-            if (n <= 0) { return sent; }
-            sent = sent + n;
+            return sent;
+        } finally {
+            HttpDeadline.Disarm(watch);
         }
-        return sent;
     }
 
     /// <summary>关闭链路（幂等）。TLS 链路同时释放流与上下文。</summary>
@@ -394,6 +406,14 @@ class FwdReader {
         return this.eof && this.buf.Length() == 0;
     }
 
+    /// <summary>从缓冲取一个字节，必要时从套接字补充。</summary>
+    async int ReadByteAsync() {
+        if (this.buf.Length() == 0 && !await this.FillAsync()) { return -1; }
+        int b = this.buf.ByteAt(0);
+        this.buf.Discard(1);
+        return b;
+    }
+
     /// <summary>缓冲已空且对端未关闭——正好停在帧边界。</summary>
     bool Drained() {
         return this.buf.Length() == 0 && !this.eof;
@@ -621,8 +641,11 @@ class HttpForwarder {
 
     /// <summary>单条下游连接的生命周期：转发一次后递减并发计数。</summary>
     async void Serve(nint clientSock) {
-        await this.ServeOnce(clientSock);
-        this.active = this.active - 1;
+        try {
+            await this.ServeOnce(clientSock);
+        } finally {
+            this.active = this.active - 1;
+        }
     }
 
     /// <summary>转发一个下游连接：读请求头 → 连上游 → 边收边转
@@ -636,6 +659,15 @@ class HttpForwarder {
             return;
         }
         string method = HttpForwarder.MethodOf(head);
+        if (!HttpForwarder.IsRequestValid(head)
+            || (HttpForwarder.HeaderValue(head, "expect").Length > 0
+                && !HttpForwarder.HasHeaderToken(head, "expect", "100-continue"))) {
+            int _bad = await client.SendAllAsync(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"
+                + "Connection: close\r\n\r\n");
+            client.Close();
+            return;
+        }
         if (method == "CONNECT") {
             if (!this.allowConnect) {
                 int _d = await client.SendAllAsync(
@@ -665,14 +697,6 @@ class HttpForwarder {
         }
 
         string peer = Socket.RemoteIp(clientSock);
-        if (!HttpForwarder.IsBodyFramingValid(head, true)) {
-            int _bad = await client.SendAllAsync(
-                "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"
-                + "Connection: close\r\n\r\n");
-            up.Close();
-            client.Close();
-            return;
-        }
         string upHead = this.RewriteRequestHead(head, peer);
         // 无正文的请求可以原样重发：复用链路在"存活检查"与"真正
         // 发送"之间被上游关掉是 keep-alive 固有的竞态，换条新链路
@@ -700,19 +724,47 @@ class HttpForwarder {
             }
         }
 
-        // 请求体：Content-Length 精确搬运，chunked 逐块搬运，
-        // 都不等整体到齐（上传大文件/流式请求同样是流式的）。
-        long reqBodyMoved = await HttpForwarder.PumpBody(creader, up, head, true, this.chunkBytes);
-        bool reqComplete = true;
-        if (HttpForwarder.HeadIsChunked(head)) {
-            if (reqBodyMoved < 0) { reqComplete = false; }
-        } else {
-            long reqCl = HttpForwarder.ContentLengthOf(head);
-            if (reqCl > 0 && reqBodyMoved != reqCl) { reqComplete = false; }
-        }
-
         FwdReader ureader = new FwdReader(up, this.chunkBytes);
-        string rhead = await ureader.ReadHeadAsync(this.maxHeadBytes);
+        string rhead = "";
+        bool expectContinue = HttpForwarder.HasHeaderToken(head, "expect", "100-continue")
+            && HttpForwarder.HasRequestBody(head);
+        if (expectContinue) {
+            // Do not wait for a body that the client is withholding until 100.
+            // A final response (e.g. 417) ends the exchange without an upload.
+            rhead = await ureader.ReadHeadAsync(this.maxHeadBytes);
+            while (rhead.Length > 0 && HttpForwarder.StatusOf(rhead) >= 100
+                && HttpForwarder.StatusOf(rhead) < 200
+                && HttpForwarder.StatusOf(rhead) != 101) {
+                if (!HttpForwarder.IsHeadSyntaxValid(rhead)
+                    || !HttpForwarder.IsBodyFramingValid(rhead, false)) { break; }
+                int interim = await client.SendAllAsync(HttpForwarder.RewriteResponseHead(rhead, false));
+                if (interim <= 0) { up.Close(); client.Close(); return; }
+                if (HttpForwarder.StatusOf(rhead) == 100) { rhead = ""; break; }
+                rhead = await ureader.ReadHeadAsync(this.maxHeadBytes);
+            }
+        }
+        bool reqComplete = !expectContinue || rhead.Length == 0;
+        if (rhead.Length == 0) {
+            // Content-Length or chunked: stream the upload only after 100 (or
+            // immediately for an ordinary request).
+            long reqBodyMoved = await HttpForwarder.PumpBody(creader, up, head, true, this.chunkBytes);
+            if (HttpForwarder.HeadIsChunked(head)) {
+                if (reqBodyMoved < 0) { reqComplete = false; }
+            } else {
+                long reqCl = HttpForwarder.ContentLengthOf(head);
+                if (reqCl > 0 && reqBodyMoved != reqCl) { reqComplete = false; }
+            }
+            rhead = await ureader.ReadHeadAsync(this.maxHeadBytes);
+        }
+        while (rhead.Length > 0 && HttpForwarder.StatusOf(rhead) >= 100
+            && HttpForwarder.StatusOf(rhead) < 200
+            && HttpForwarder.StatusOf(rhead) != 101) {
+            if (!HttpForwarder.IsHeadSyntaxValid(rhead)
+                || !HttpForwarder.IsBodyFramingValid(rhead, false)) { break; }
+            int interim = await client.SendAllAsync(HttpForwarder.RewriteResponseHead(rhead, false));
+            if (interim <= 0) { up.Close(); client.Close(); return; }
+            rhead = await ureader.ReadHeadAsync(this.maxHeadBytes);
+        }
         if (rhead.Length == 0 && replayable) {
             // 同一个竞态的另一种表现：头部写进了内核缓冲区，但对端
             // 其实已经在关连接，于是读到的是 EOF 而不是响应。
@@ -738,7 +790,10 @@ class HttpForwarder {
             client.Close();
             return;
         }
-        if (!HttpForwarder.IsBodyFramingValid(rhead, false)) {
+        if (!HttpForwarder.IsHeadSyntaxValid(rhead)
+            || HttpForwarder.StatusOf(rhead) < 100
+            || !HttpForwarder.IsBodyFramingValid(rhead, false)
+            || !HttpForwarder.AreConnectionTokensValid(rhead)) {
             int _badResponse = await client.SendAllAsync(
                 "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n"
                 + "Connection: close\r\n\r\n");
@@ -748,7 +803,21 @@ class HttpForwarder {
         }
         // 响应头立刻回传：下游据此开始渲染（SSE 客户端要拿到
         // Content-Type: text/event-stream 才会进入事件循环）。
-        string downHead = HttpForwarder.RewriteResponseHead(rhead);
+        int status = HttpForwarder.StatusOf(rhead);
+        string requestedUpgrade = HttpForwarder.Lower(
+            HttpForwarder.HeaderValue(head, "upgrade"));
+        bool switched = status == 101 && HttpForwarder.HasHeaderToken(head, "connection", "upgrade")
+            && HttpForwarder.IsToken(requestedUpgrade)
+            && HttpForwarder.HasHeaderToken(rhead, "connection", "upgrade")
+            && HttpForwarder.Lower(HttpForwarder.HeaderValue(rhead, "upgrade"))
+                == requestedUpgrade;
+        if (status == 101 && !switched) {
+            int _invalidSwitch = await client.SendAllAsync(
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n"
+                + "Connection: close\r\n\r\n");
+            up.Close(); client.Close(); return;
+        }
+        string downHead = HttpForwarder.RewriteResponseHead(rhead, switched);
         int hs = await client.SendAllAsync(downHead);
         if (hs < downHead.Length) {
             up.Close();
@@ -756,8 +825,7 @@ class HttpForwarder {
             return;
         }
 
-        int status = HttpForwarder.StatusOf(rhead);
-        if (status == 101) {
+        if (switched) {
             // 协议已切换（WebSocket）：之后是双向裸字节。
             await HttpForwarder.Tunnel(client, creader, up, ureader,
                                        this.chunkBytes);
@@ -861,15 +929,17 @@ class HttpForwarder {
             hostValue = this.upHost + ":" + Convert.ToString(this.upPort);
         }
         bool chunked = HttpForwarder.HeadIsChunked(head);
+        bool upgrade = HttpForwarder.HasHeaderToken(head, "connection", "upgrade")
+            && HttpForwarder.HeaderValue(head, "upgrade").Length > 0;
         for (int i = 0; i < lines.Count; i = i + 1) {
             string line = lines[i];
             if (i == 0) { outHead = outHead + line + "\r\n"; continue; }
             string name = HttpForwarder.LowerName(line);
-            if (name == "host") { continue; }
-            if (name == "transfer-encoding" || name == "x-forwarded-for") {
-                continue;
-            }
-            if (HttpForwarder.IsHopByHop(name)) { continue; }
+            if (name == "host" || name == "transfer-encoding"
+                || name == "x-forwarded-for") { continue; }
+            if (HttpForwarder.IsHopByHop(name)
+                || HttpForwarder.HasHeaderToken(head, "connection", name)
+                || HttpForwarder.HasHeaderToken(head, "proxy-connection", name)) { continue; }
             outHead = outHead + line + "\r\n";
         }
         outHead = outHead + "Host: " + hostValue + "\r\n";
@@ -877,7 +947,10 @@ class HttpForwarder {
         if (peer.Length > 0) {
             outHead = outHead + "X-Forwarded-For: " + peer + "\r\n";
         }
-        if (this.pool != null) {
+        if (upgrade) {
+            outHead = outHead + "Upgrade: " + HttpForwarder.HeaderValue(head, "upgrade")
+                + "\r\nConnection: Upgrade\r\n\r\n";
+        } else if (this.pool != null) {
             outHead = outHead + "Connection: keep-alive\r\n\r\n";
         } else {
             outHead = outHead + "Connection: close\r\n\r\n";
@@ -922,20 +995,30 @@ class HttpForwarder {
 
     /// <summary>改写响应头：剥离逐跳头部并标明连接将关闭。
     /// Transfer-Encoding 保留（分块帧原样透传给下游）。</summary>
-    static string RewriteResponseHead(string head) {
+    static string RewriteResponseHead(string head, bool switched) {
         List<string> lines = HttpForwarder.HeadLines(head);
         string outHead = "";
         for (int i = 0; i < lines.Count; i = i + 1) {
             string line = lines[i];
             if (i == 0) { outHead = outHead + line + "\r\n"; continue; }
             string name = HttpForwarder.LowerName(line);
-            if (name == "connection" || name == "keep-alive"
-                || name == "proxy-connection") {
-                continue;
-            }
+            if (HttpForwarder.IsHopByHop(name)
+                || HttpForwarder.HasHeaderToken(head, "connection", name)
+                || HttpForwarder.HasHeaderToken(head, "proxy-connection", name)) { continue; }
             outHead = outHead + line + "\r\n";
         }
-        outHead = outHead + "Connection: close\r\n\r\n";
+        if (HttpForwarder.HeadIsChunked(head)) {
+            outHead = outHead + "Transfer-Encoding: chunked\r\n";
+        }
+        if (switched) {
+            outHead = outHead + "Upgrade: " + HttpForwarder.HeaderValue(head, "upgrade")
+                + "\r\nConnection: Upgrade\r\n\r\n";
+        } else if (HttpForwarder.StatusOf(head) >= 100
+            && HttpForwarder.StatusOf(head) < 200) {
+            outHead = outHead + "\r\n";
+        } else {
+            outHead = outHead + "Connection: close\r\n\r\n";
+        }
         return outHead;
     }
 
@@ -1008,10 +1091,10 @@ class HttpForwarder {
         while (true) {
             string sizeLine = await src.ReadLineAsync(chunkBytes);
             if (sizeLine.Length == 0) { return -1; }
-            int w = await dst.SendAllAsync(sizeLine);
-            if (w < sizeLine.Length) { return -1; }
             long size = HttpForwarder.ParseChunkSize(sizeLine);
             if (size < 0) { return -1; }
+            int w = await dst.SendAllAsync(sizeLine);
+            if (w < sizeLine.Length) { return -1; }
             if (size == 0) {
                 // trailer 不计入正文长度，单行及总量都必须单独限额。
                 int trailerBytes = 0;
@@ -1020,15 +1103,22 @@ class HttpForwarder {
                     if (trailer.Length == 0 || trailerBytes + trailer.Length > 8192) {
                         return -1;
                     }
+                    if (trailer != "\r\n" && !HttpForwarder.IsTrailerLineValid(trailer)) {
+                        return -1;
+                    }
                     trailerBytes = trailerBytes + trailer.Length;
                     int tw = await dst.SendAllAsync(trailer);
                     if (tw < trailer.Length) { return -1; }
                     if (trailer == "\r\n") { return total; }
                 }
             }
-            long moved = await HttpForwarder.PumpExact(src, dst, size + 2L,
-                                                       chunkBytes);
-            if (moved < size + 2L) { return -1; }
+            long moved = await HttpForwarder.PumpExact(src, dst, size, chunkBytes);
+            if (moved < size) { return -1; }
+            int cr = await src.ReadByteAsync();
+            if (cr != 13) { return -1; }
+            int lf = await src.ReadByteAsync();
+            if (lf != 10) { return -1; }
+            if (await dst.SendAllAsync("\r\n") < 2) { return -1; }
             total = total + moved;
         }
         return total;
@@ -1163,6 +1253,138 @@ class HttpForwarder {
         return "";
     }
 
+    /// <summary>HTTP token 字节（字段名、方法、Connection 成员）。</summary>
+    static bool IsTokenByte(int b) {
+        return (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+            || (b >= 48 && b <= 57) || b == 33 || b == 35
+            || b == 36 || b == 37 || b == 38 || b == 39
+            || b == 42 || b == 43 || b == 45 || b == 46
+            || b == 94 || b == 95 || b == 96 || b == 124 || b == 126;
+    }
+
+    static bool IsToken(string s) {
+        if (s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if (!HttpForwarder.IsTokenByte(s[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    /// <summary>检查字段行及裸 CR/LF，拒绝上游与代理不同的解析结果。</summary>
+    static bool IsHeaderLineValid(string line) {
+        int colon = HttpForwarder.IndexOf(line, ":", 0);
+        if (colon <= 0 || !HttpForwarder.IsToken(line.Substring(0, colon))) {
+            return false;
+        }
+        for (int i = colon + 1; i < line.Length; i = i + 1) {
+            int b = line[i] & 255;
+            if ((b < 32 && b != 9) || b == 127) { return false; }
+        }
+        return true;
+    }
+
+    static bool IsTrailerLineValid(string line) {
+        if (line.Length < 4 || line.Substring(line.Length - 2, 2) != "\r\n") {
+            return false;
+        }
+        string field = line.Substring(0, line.Length - 2);
+        if (!HttpForwarder.IsHeaderLineValid(field)) { return false; }
+        string name = HttpForwarder.LowerName(field);
+        return name != "content-length" && name != "transfer-encoding"
+            && name != "host" && !HttpForwarder.IsHopByHop(name);
+    }
+
+    static bool IsHeadSyntaxValid(string head) {
+        if (head.Length < 4 || head.Substring(head.Length - 4, 4) != "\r\n\r\n") {
+            return false;
+        }
+        for (int i = 0; i < head.Length; i = i + 1) {
+            int b = head[i] & 255;
+            if (b == 0 || b == 127) { return false; }
+            if (b == 13 && (i + 1 >= head.Length || (head[i + 1] & 255) != 10)) {
+                return false;
+            }
+            if (b == 10 && (i == 0 || (head[i - 1] & 255) != 13)) {
+                return false;
+            }
+            if (i + 3 < head.Length && head.Substring(i, 4) == "\r\n\r\n"
+                && i != head.Length - 4) { return false; }
+            if ((b < 32 && b != 9 && b != 13 && b != 10)) { return false; }
+        }
+        List<string> lines = HttpForwarder.HeadLines(head);
+        if (lines.Count == 0) { return false; }
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            if (!HttpForwarder.IsHeaderLineValid(lines[i])) { return false; }
+        }
+        return true;
+    }
+
+    static bool HasHeaderToken(string head, string field, string token) {
+        List<string> lines = HttpForwarder.HeadLines(head);
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            if (HttpForwarder.LowerName(lines[i]) != field) { continue; }
+            List<string> parts = HttpForwarder.SplitCsv(
+                HttpForwarder.Lower(HttpForwarder.HeaderValueOfLine(lines[i])));
+            for (int j = 0; j < parts.Count; j = j + 1) {
+                if (parts[j] == token) { return true; }
+            }
+        }
+        return false;
+    }
+
+    static bool AreConnectionTokensValid(string head) {
+        List<string> lines = HttpForwarder.HeadLines(head);
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            string name = HttpForwarder.LowerName(lines[i]);
+            if (name != "connection" && name != "proxy-connection") { continue; }
+            List<string> parts = HttpForwarder.SplitCsv(
+                HttpForwarder.HeaderValueOfLine(lines[i]));
+            if (parts.Count == 0) { return false; }
+            for (int j = 0; j < parts.Count; j = j + 1) {
+                if (!HttpForwarder.IsToken(parts[j])) { return false; }
+                string nominated = HttpForwarder.Lower(parts[j]);
+                if (nominated == "content-length" || nominated == "transfer-encoding") {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    static bool IsRequestValid(string head) {
+        if (!HttpForwarder.IsHeadSyntaxValid(head)
+            || !HttpForwarder.IsBodyFramingValid(head, true)
+            || !HttpForwarder.AreConnectionTokensValid(head)) { return false; }
+        List<string> lines = HttpForwarder.HeadLines(head);
+        string requestLine = lines[0];
+        int first = HttpForwarder.IndexOf(requestLine, " ", 0);
+        if (first <= 0 || !HttpForwarder.IsToken(requestLine.Substring(0, first))) {
+            return false;
+        }
+        int second = HttpForwarder.IndexOf(requestLine, " ", first + 1);
+        if (second <= first + 1 || (second + 1 < requestLine.Length
+            && HttpForwarder.IndexOf(requestLine, " ", second + 1) >= 0)) {
+            return false;
+        }
+        string version = requestLine.Substring(second + 1);
+        if (version != "HTTP/1.1" && version != "HTTP/1.0") { return false; }
+        for (int i = first + 1; i < second; i = i + 1) {
+            int b = requestLine[i] & 255;
+            if (b <= 32 || b >= 127) { return false; }
+        }
+        int hosts = 0;
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            string name = HttpForwarder.LowerName(lines[i]);
+            if (name == "host") {
+                hosts = hosts + 1;
+                if (HttpForwarder.HeaderValueOfLine(lines[i]).Length == 0) { return false; }
+            }
+            if ((name == "connection" || name == "proxy-connection")
+                && HttpForwarder.HasHeaderToken(head, name, "expect")) { return false; }
+        }
+        return hosts <= 1 && (version == "HTTP/1.0" || hosts == 1);
+    }
+
     /// <summary>逐跳头部（RFC 7230 6.1）：只对单段连接有意义，
     /// 不应转发给上游。</summary>
     static bool IsHopByHop(string name) {
@@ -1246,9 +1468,10 @@ class HttpForwarder {
         bool hasCl = clCount == 1;
         if (teCount > 0 && hasCl) { return false; }
         if (teCount > 0) {
-            // 只支持单一 chunked；空项、重复编码及其他编码必须拒绝，
-            // 否则解析出的正文边界可能与转发给下一跳的头部不一致。
-            if (HttpForwarder.Lower(combinedTe) != "chunked") { return false; }
+            // 只支持单一 chunked；周围的 OWS 是合法的。
+            if (HttpForwarder.Lower(HttpForwarder.Trim(combinedTe)) != "chunked") {
+                return false;
+            }
         }
         long cl = HttpForwarder.ContentLengthOf(head);
         if (cl == -2 || (hasCl && cl < 0)) { return false; }
@@ -1276,7 +1499,12 @@ class HttpForwarder {
         long n = 0;
         bool any = false;
         int digits = 0;
-        for (int i = 0; i < line.Length; i = i + 1) {
+        if (line.Length < 3 || line.Substring(line.Length - 2, 2) != "\r\n") {
+            return -1;
+        }
+        int end = line.Length - 2;
+        int i = 0;
+        while (i < end) {
             int b = line[i] & 255;
             int d = -1;
             if (b >= 48 && b <= 57) { d = b - 48; }
@@ -1287,8 +1515,43 @@ class HttpForwarder {
             if (digits > 13) { return -1; }
             n = n * 16 + (long)d;
             any = true;
+            i = i + 1;
         }
         if (!any) { return -1; }
+        while (i < end) {
+            if ((line[i] & 255) != 59) { return -1; }
+            i = i + 1;
+            int start = i;
+            while (i < end && HttpForwarder.IsTokenByte(line[i] & 255)) {
+                i = i + 1;
+            }
+            if (i == start) { return -1; }
+            if (i < end && (line[i] & 255) == 61) {
+                i = i + 1;
+                if (i < end && (line[i] & 255) == 34) {
+                    i = i + 1;
+                    bool closed = false;
+                    while (i < end) {
+                        int b = line[i] & 255;
+                        i = i + 1;
+                        if (b == 34) { closed = true; break; }
+                        if (b == 92) {
+                            if (i == end) { return -1; }
+                            b = line[i] & 255;
+                            i = i + 1;
+                            if (b < 32 || b == 127) { return -1; }
+                        } else if (b < 32 || b == 127) { return -1; }
+                    }
+                    if (!closed) { return -1; }
+                } else {
+                    start = i;
+                    while (i < end && HttpForwarder.IsTokenByte(line[i] & 255)) {
+                        i = i + 1;
+                    }
+                    if (i == start) { return -1; }
+                }
+            }
+        }
         return n;
     }
 
