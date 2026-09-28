@@ -1060,11 +1060,9 @@ static zan_type_t *promote_numeric(zan_binder_t *b, zan_type_t *a, zan_type_t *b
 }
 
 /* ---- conditional branch type merging (D1) ---------------------------------
- * `cond ? then : else` used to be typed as the then branch alone, so a class
- * and a primitive could mix (`cond ? new A() : 123`) and only fail later as
- * an LLVM verification error naming no source line. Merge the branch types
- * like C#: identical types win, numerics promote, a subtype converts to its
- * base, a common base class is used, otherwise the conditional is an error. */
+ * Merge the branch types of `cond ? then : else` following C# semantics:
+ * identical types win, numerics promote, a subtype converts to its base,
+ * a common base class is used, otherwise the conditional is an error. */
 
 /* Structural equality at the level the checker can see: same kind, same name
  * (generic arguments included). Arrays and nullable compare their element
@@ -1581,9 +1579,7 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
     }
     if (target == c->binder->type_error || value == c->binder->type_error)
         return;
-    /* A void call used as a value used to slip through silently and reach
-     * irgen as a `void` SSA operand (invalid IR, verifier failure). C#
-     * rejects it at the same sites. */
+    /* A void call used as a value is invalid; reject with diagnostic. */
     if (value == c->binder->type_void && target != c->binder->type_void) {
         zan_diag_emit(c->diag, DIAG_ERROR, loc,
                       "cannot convert 'void' to '%s' in %s: no implicit "
@@ -1956,8 +1952,7 @@ static zan_symbol_t *unique_named_method(zan_symbol_t *type_sym,
  * tail or an extension receiver (the declaration has a parameter the call has
  * no argument for), and named or `ref`/`out` arguments (reordered or passed by
  * reference). Both call shapes are judged: `recv.M(a)` and a bare `M(a)` on
- * the enclosing type, which is where the implicit-this path used to slip past
- * every argument check. */
+ * the enclosing type. */
 static zan_symbol_t *call_arg_signature(zan_checker_t *c, zan_ast_node_t *call,
                                         zan_type_t *recv) {
     zan_ast_node_t *callee = call->call.callee;
@@ -2161,9 +2156,8 @@ static void check_ctor_call_arguments(zan_checker_t *c, zan_type_t *type,
  * a method group. */
 /* Operand kinds irgen's string concat/interpolation lowering can turn into
  * text (emit_to_cstr_of): strings pass through, numerics/chars are formatted,
- * enums and bools ride their integer carrier, null concats as "". Anything
- * else -- a class/struct/array/delegate reference -- used to be handed to
- * strlen over the object's raw bytes and rendered as mojibake; reject it. */
+ * enums and bools ride their integer carrier, null concats as "". Non-string
+ * reference types (class/struct/array/delegate) are rejected. */
 static bool type_is_concatable(zan_type_t *t) {
     /* int?/double?/bool? concatenate like their element: Nullable<T> is a
      * value type in C# ("a=" + a is legal, null concatenates as "") and the
@@ -4133,9 +4127,7 @@ static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr)
 
 /* True when the receiver of a member access is a value (a local, parameter,
  * field, call result, ...) rather than a type name. `Type.StaticField` is the
- * only valid way to reach a static field; through a value it used to lower to
- * the constant 0, which then either compared an int against a pointer (invalid
- * IR) or was dereferenced as an object. */
+ * only valid way to reach a static field; access through an instance is rejected. */
 static bool receiver_is_value_expr(zan_checker_t *c, zan_ast_node_t *obj) {
     switch (obj->kind) {
     case AST_IDENTIFIER: {
@@ -4164,11 +4156,8 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
         }
     }
     /* Static enum member access: EnumType.Member must be a declared member.
-     * A miss used to fall through to irgen, which silently folded the
-     * access to the constant 0 (masking stale references, e.g. a removed
-     * enum member). A member access on an enum *value* (`t.ToString()`) is
-     * a compiler-lowered method call resolved in irgen, so it is not
-     * validated here. */
+     * A member access on an enum *value* (`t.ToString()`) is a compiler-lowered
+     * method call resolved in irgen, so it is not validated here. */
     if (obj_type && obj_type->kind == TYPE_ENUM && obj_type->sym &&
         expr->member.object->kind == AST_IDENTIFIER) {
         zan_symbol_t *os = zan_binder_lookup(c->binder,
@@ -4288,9 +4277,7 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
     }
     /* Builtin scalar types (string, int, ...) declare no fields; the only
      * member they carry is the string.Length property (lowered by irgen).
-     * Anything else is a typo: it used to fall through to irgen, which
-     * silently lowered it to the constant 0 — a crash at runtime when the
-     * zero was used as a pointer (e.g. `tabs[i].path.path`). */
+     * Any other member access is an error. */
     if (obj_type && type_is_scalar_primitive(obj_type)) {
         if (obj_type->kind == TYPE_STRING && expr->member.name.len == 6 &&
             memcmp(expr->member.name.str, "Length", 6) == 0) {

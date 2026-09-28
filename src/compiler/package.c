@@ -901,10 +901,8 @@ bool zan_pkg_install_local(const char *source_dir, const char *package_name,
         zan_pkg_destroy(&pkg);
         return false;
     }
-    /* Namespace discovery accepts src/<namespace> (preferred),
-     * stdlib/<namespace> (legacy), or a flat <namespace> directory.
-     * A flat layout cannot be distinguished from unrelated package assets
-     * here; require one of the two explicit source roots. */
+    /* Namespace discovery accepts src/<namespace> (preferred) or
+     * stdlib/<namespace>; require one of the two explicit source roots. */
     char pkg_src[1024], pkg_stdlib[1024];
     snprintf(pkg_src, sizeof(pkg_src), "%s" PATH_SEP "src", source_dir);
     snprintf(pkg_stdlib, sizeof(pkg_stdlib), "%s" PATH_SEP "stdlib", source_dir);

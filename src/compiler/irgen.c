@@ -166,9 +166,7 @@ static void di_ensure(zan_irgen_t *g) {
 
 static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id) {
     if (!g->emit_debug) return NULL;
-    /* Grows with the file table: capping it used to fold every file past the
-     * limit onto file 0, silently attributing their line numbers to the first
-     * source file (a stdlib-sized build has well over a few hundred). */
+    /* Grows with the file table dynamically. */
     if (!zan_tab_reserve((void **)&g->di_files, &g->di_file_cap,
                          sizeof(*g->di_files), (int)file_id, 64))
         return NULL;
@@ -1438,12 +1436,10 @@ static void irgen_register_function(zan_irgen_t *g, zan_symbol_t *sym,
 
 /* ---- per-class member index ------------------------------------------------
  * Member lookup by name (get_method_sym, resolve_overload, get_field_sym) and
- * by declaration node (method_sym_for_decl) used to scan a class's whole member
- * list, so a class with N methods called from N sites cost O(N^2) comparisons
- * and dominated irgen for large programs. Each class gets a lazily built hash
- * index of its members instead. Buckets chain in declaration order, so the
- * "first match wins" behaviour of the scans is preserved, and an index is
- * rebuilt when its class gained members (specialization appends members while
+ * by declaration node (method_sym_for_decl): each class gets a lazily built hash
+ * index of its members. Buckets chain in declaration order, so the
+ * "first match wins" behaviour is preserved, and an index is
+ * rebuilt when its class gains members (specialization appends members while
  * irgen runs). The table is file-static because the lookups are leaf helpers
  * without access to the irgen state; zan_irgen_init/destroy reset it. */
 
@@ -4097,9 +4093,7 @@ typedef struct {
 } local_var_t;
 
 /* A function's locals live in a single flat scope. The backing array grows
- * on demand: a fixed cap used to silently drop overflow locals, which turned
- * an over-large function into miscompiled code (unregistered locals resolved
- * to bogus storage, corrupting memory). Growth keeps large functions correct. */
+ * on demand to support functions with arbitrary numbers of locals. */
 typedef struct {
     zan_ast_node_t *decl;
     LLVMValueRef cell;
@@ -4292,9 +4286,7 @@ static int is_builtin_collection_type(zan_type_t *t) {
 
 /* List, Dict and StringBuilder are refcounted collections: they carry the rc
  * header and are freed (backing buffers + struct) via a per-site collection
- * destructor. Dict used to be header-less, which left ownership of a dict
- * undecidable -- returning one from a method either released its occupants
- * while the caller still held them, or leaked them. */
+ * destructor. */
 static int is_rc_collection_type(zan_type_t *t) {
     if (!t || t->kind != TYPE_CLASS) return 0;
     zan_istr_t n = t->name;
@@ -4393,7 +4385,7 @@ static unsigned llvm_scalar_size(LLVMTypeRef t) {
 /* A List element occupies a whole number of 8-byte words in the data buffer.
  * Everything the language can put in a collection is one word wide except a
  * value struct, which lives inline across ceil(size/8) words; capacity math
- * and every slot address scale by that stride (A15-4). */
+ * and every slot address scale by that stride. */
 static unsigned elem_slot_words(zan_irgen_t *g, zan_type_t *elem) {
     if (!elem || elem->kind != TYPE_STRUCT) return 1;
     LLVMTypeRef st = map_type(g, elem);
@@ -4535,10 +4527,7 @@ static int eh_slot_kind_of(zan_type_t *t) {
 
 /* i64 __zan_itoa64(i8 *buf, i64 v, i32 uns): write `v` in decimal into `buf`
  * (at least 21 bytes), NUL-terminate it and return the digit count; `uns` != 0
- * formats the value as unsigned. Integer formatting used to go through
- * snprintf("%lld"), whose vfprintf machinery dominated JSON serialization
- * (25% of the instructions of a response built from numbers) while the actual
- * work is a division loop. Built once per module on first use. */
+ * formats the value as unsigned. Built once per module on first use. */
 static LLVMValueRef get_itoa64_fn(zan_irgen_t *g) {
     if (g->fn_itoa64) return g->fn_itoa64;
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);

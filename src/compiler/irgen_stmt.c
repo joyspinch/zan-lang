@@ -526,8 +526,8 @@ static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
     return 1;
 }
 
-/* A43-B22①: emit a 0-arg method call on a receiver value already in hand --
- * the foreach iteration protocol calls GetEnumerator/MoveNext/Current on
+/* Emit a 0-arg method call on a receiver value already in hand.
+ * The foreach iteration protocol calls GetEnumerator/MoveNext/Current on
  * objects the loop itself materialized, so there is no AST call node to run
  * through the normal member-access path. Static methods drop the receiver. */
 static LLVMValueRef emit_foreach_call0(zan_irgen_t *g, zan_type_t *recv_ty,
@@ -1242,13 +1242,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             if (type && type->kind == TYPE_DELEGATE &&
                 stmt->var_decl.initializer->kind != AST_LAMBDA)
                 check_delegate_async_match(g, stmt->var_decl.initializer, type, locals);
-            /* `Binding<T> b = <T expr>` is the same sugar as a plain
-             * assignment (`comp.prop = user.name`): wrap the value in a
-             * binding object instead of storing a raw T where the slot's
-             * readers expect a Binding (a raw store segfaults on the first
-             * Get/Set -- probed 2026-09-12). The assignment path in
-             * irgen_expr.c has always lowered this; the declaration path
-             * here never did. */
+            /* `Binding<T> b = <T expr>`: wrap the value in a binding object
+             * so slot readers receive a Binding<T> rather than a raw T. */
             LLVMValueRef init_val = NULL;
             int init_owned = 0;
             if (type && type_is_binding(type) &&
@@ -1646,9 +1641,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                            LLVMGetTypeKind(val_t) == LLVMPointerTypeKind) {
                     /* A value struct returns by value: `new Pair(3,4)` is a
                      * stack slot behind a pointer, but the function signature
-                     * returns the aggregate. Loading it here makes
-                     * `return new Pair(...)` verifiable (it used to `ret ptr`
-                     * into a `%struct.Pair` function and fail verification).
+                     * returns the aggregate. Loading it here produces the aggregate value.
                      * Must precede the pointer-coercion branches below, since
                      * the stack slot is itself a pointer. */
                     val = LLVMBuildLoad2(g->builder, fn_ret, val, "ret.struct");
@@ -2781,10 +2774,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         /* evaluate collection */
         LLVMValueRef collection = emit_expr(g, stmt->foreach_stmt.collection, locals);
 
-        /* A43-B22①: user iteration protocol. A collection whose type declares
+        /* User iteration protocol: a collection whose type declares
          * GetEnumerator() iterating an enumerator with MoveNext()/Current is
-         * driven through that protocol instead of being mis-read as a List
-         * (the legacy fallback below). The predicate lives in irgen_async.c
+         * driven through that protocol. The predicate lives in irgen_async.c
          * next to the frame scan so both passes agree on which loops carry a
          * $fe.e enumerator slot. */
         zan_type_t *col_type0 = infer_expr_type(g, stmt->foreach_stmt.collection,
@@ -2841,12 +2833,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (!elem_type) elem_type = g->binder->type_int;
         LLVMTypeRef elem_llvm = map_type(g, elem_type);
 
-        /* How the collection is laid out. A List has a count and a data
-         * pointer; an array is a bare buffer whose length was captured where
-         * it was declared; a string is NUL-terminated bytes. foreach used to
-         * read every one of them as a List, so iterating an array or a string
-         * loaded a count and a data pointer out of unrelated memory and the
-         * program died on the first element. */
+        /* How the collection is laid out: List has a count and data pointer;
+         * an array is a bare buffer with length captured at declaration;
+         * a string is NUL-terminated bytes. */
         zan_type_t *col_type = col_type0;
         bool fe_array = col_type && col_type->kind == TYPE_ARRAY;
         bool fe_string = col_type && col_type->kind == TYPE_STRING;
@@ -3192,10 +3181,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             obj = LLVMBuildIntToPtr(g->builder, obj, i8ptr, "lockp");
         else if (LLVMGetTypeKind(ot) == LLVMPointerTypeKind && ot != i8ptr)
             obj = LLVMBuildBitCast(g->builder, obj, i8ptr, "lockp");
-        /* C# lowers `lock` to try/finally, and so does this: a `return`,
-         * `break` or throw out of the body used to walk off with the monitor
-         * still held, which wedges every other thread for good. The object
-         * goes in an alloca so those exit paths can reload it. */
+        /* Lowers `lock` to try/finally semantics so return/break/throw
+         * paths reliably release the held monitor. The object goes in
+         * an alloca so exit paths can reload it. */
         LLVMValueRef obj_slot = emit_entry_alloca(g, i8ptr, "lock.slot");
         zan_store_fit(g, obj, obj_slot);
         zan_call2(g->builder, mon_ty, enter_fn, &obj, 1, "");
@@ -3323,10 +3311,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                      * every RC-managed throw -- class, string, array or
                      * delegate. Retain borrowed values here; the catch (and
                      * the propagate path) release through rt_release_dyn,
-                     * which dispatches on the header tag. Leaving strings and
-                     * arrays unowned used to let the pre-longjmp unwind
-                     * release the local's last reference while __zan_eh_exc
-                     * still pointed at it: the handler read freed memory. */
+                     * which dispatches on the header tag. This ensures
+                     * __zan_eh_exc holds an owned reference during unwinding. */
                     if (!expr_yields_owned_rc_value(g, stmt->throw_stmt.value, locals))
                         /* type-aware: a string retain must go through the
                          * sentinel-tolerant helper -- interned literals sit in

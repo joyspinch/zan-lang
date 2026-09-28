@@ -888,9 +888,8 @@ typedef void (*zan_thread_body_fn)(void);
 /* A delegate value has one of two shapes (zan_abi.h): a bare function
  * pointer -- a static method or non-capturing lambda -- or a tagged heap
  * closure record -- an instance method group or a capturing lambda -- whose
- * thunk sits at record slot 0 and is invoked rec-first, fn(record). Calling a
- * record's bare pointer used to jump straight at the thunk with a garbage
- * receiver. Run whichever shape arrived: the record also owns the bound
+ * thunk sits at record slot 0 and is invoked rec-first, fn(record).
+ * Run whichever shape arrived: the record also owns the bound
  * target and the captures, and the worker outlives the Thread.Start call, so
  * the thread holds its own reference (retain before spawn, release after the
  * body). The helpers are shared with the UI dispatch queue below, which keeps
@@ -1092,11 +1091,8 @@ void zan_monitor_exit(void *obj) {
  * the one exception, and it happens only once per doubling. */
 
 /* The ring starts in static storage -- the common case never allocates -- and
- * doubles onto the heap when a burst fills it. It used to be a fixed 1024
- * entries whose overflow returned 0, and both Zan callers (`App.Post`,
- * `UiEvent.Post`) drop that answer: a full queue silently meant "this click
- * handler never ran". Growth is bounded so a runaway producer cannot eat the
- * address space; at the ceiling the post is still refused, but loudly. */
+ * doubles onto the heap when a burst fills it. Growth is bounded so a runaway
+ * producer cannot eat the address space; at the ceiling the post is refused. */
 /* A 64-entry static ring is only the seed: growth below doubles it on demand
  * (bounded), so an idle program pays 512 B of bss instead of 8 KB. */
 #define ZAN_DISPATCH_CAP0 64
@@ -1381,12 +1377,8 @@ static int zan_table_layout_of(
     return 1;
 }
 
-/* Re-derive the geometry a header claims from its own fields. open/attach
- * validate magic/version/ready but used to trust capacity, row_stride,
- * key_size and column_count blindly afterwards -- and every operation
- * derives addresses from them. One stray write to a shared header (buggy
- * writer, torn multi-word update, hostile co-process mapping the same name)
- * then sent zan_row_at or zan_find_column far outside the mapping. */
+/* Re-derive and validate the geometry a header claims from its own fields
+ * before deriving addresses from them. */
 static int zan_header_geometry_ok(const zan_shared_header *header) {
     if (header->capacity == 0 ||
         header->capacity > ZAN_TABLE_MAX_CAPACITY ||
@@ -2843,7 +2835,7 @@ long long zan_mmap_unlink(const char *name) {
 /* ========================================================================
  * POSIX platform services (zan_plat_*)
  *
- * Native backends for the stdlib classes that used to be Windows-only:
+ * Native backends for POSIX platforms:
  * adapter enumeration (System.Net.NetworkInterface) and ICMP echo
  * (System.Net.Ping). Windows keeps its own iphlpapi path in Zan, so these
  * are POSIX-only; the Windows builds compile to explicit failures rather

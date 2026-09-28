@@ -152,10 +152,9 @@ typedef struct {
 
 /* Chained hash indexes over the declared-type table. Two views of the same
  * items array: by_full serves find_full (the per-reference lookup), by_simple
- * groups same-simple-name declarations for conflict detection and
- * count_simple -- both used to be linear scans. Semantics are preserved:
- * find_full still returns the earliest-declared match; group walks compare
- * keys explicitly, so hash collisions never merge distinct names. */
+ * groups same-simple-name declarations for conflict detection and count_simple.
+ * Semantics are preserved: find_full returns the earliest-declared match;
+ * group walks compare keys explicitly, so hash collisions never merge distinct names. */
 typedef struct nr_chain {
     int idx;            /* index into ctx->items */
     int next;           /* next node in the bucket chain, -1 ends */

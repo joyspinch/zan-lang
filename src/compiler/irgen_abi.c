@@ -438,10 +438,7 @@ static void abi_pending_report(zan_irgen_t *g) {
 static LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
                                      LLVMTypeRef zan_ft) {
     unsigned pc = LLVMCountParamTypes(zan_ft);
-    /* Sized by the actual parameter count: a fixed cap here used to bail out
-     * for wide signatures, and the caller then declared the extern with the
-     * Zan-level signature -- passing structs by the wrong ABI instead of
-     * reporting anything. */
+    /* Sized by the actual parameter count to support arbitrary signature widths. */
     LLVMTypeRef *zan_params =
         (LLVMTypeRef *)calloc(pc ? pc : 1, sizeof(LLVMTypeRef));
     if (!zan_params) return NULL;

@@ -1,11 +1,9 @@
 /* symbols.h -- `zanc --emit-symbols`: the API surface of a compilation as a
  * flat text index.
  *
- * The IDE's completion engine and the language server used to carry their own
- * hand-written copy of what the standard library offers, which drifted from the
- * compiler (offering File.OpenRead(), Math.Clamp(), string.PadLeft() -- none of
- * which existed). This dumps the real thing: every type and member the parser
- * saw, plus the built-in types from builtin_api.c.
+ * Dumps the real API surface: every type and member the parser saw, plus
+ * the built-in types from builtin_api.c, providing a single source of truth
+ * for the IDE completion engine and language server.
  *
  * The format is one record per line, TAB-separated, so consumers need no JSON
  * parser:

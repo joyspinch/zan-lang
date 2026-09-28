@@ -56,9 +56,7 @@ static LLVMValueRef emit_detach_async_call(zan_irgen_t *g, LLVMValueRef sub,
  * shadows a type of the same name wherever a receiver is resolved. Statics
  * count too, and in a static method they are the only fields in reach: a
  * designed form holds its controls in statics, so a control named after a
- * widget class (`static DataTable DataGrid;`) used to resolve to the type and
- * the call was emitted against the wrong (instance) signature -- invalid IR
- * rather than a diagnostic. */
+ * widget class (`static DataTable DataGrid;`) must resolve to the field. */
 static bool ident_names_own_field(zan_irgen_t *g, zan_ast_node_t *e) {
     if (!e || e->kind != AST_IDENTIFIER) return false;
     if (!g->current_type_sym) return false;
@@ -5533,15 +5531,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 return result;
             }
 
-            /* Robustness (A43-A15): an unqualified call that resolves to
-             * neither a class method nor a global function used to fall
-             * through every path and silently lower to an empty/zero
-             * result -- the QueryBuilder BuildSelect incident. The
-             * qualified form below already errors when the receiver type
-             * lacks the member entirely; give the implicit-this form the
-             * same contract. Name-only scan (arity ignored) so a genuine
-             * overload/arity mismatch keeps reaching its own diagnostics,
-             * and a local delegate/alias invocation stays exempt. */
+            /* Robustness: an unqualified call that resolves to neither a class
+             * method nor a global function must error out instead of silently
+             * lowering to zero. Name-only scan (arity ignored) so an overload or
+             * arity mismatch keeps reaching its own diagnostic, and local
+             * delegate/alias invocations stay exempt. */
             if (g->current_type_sym &&
                 (g->current_type_sym->kind == SYM_CLASS ||
                  g->current_type_sym->kind == SYM_STRUCT)) {
@@ -5710,10 +5704,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     "'%s' has no member '%.*s'",
                     bt ? bt->display : brecv, (int)bmn.len, bmn.str);
             }
-            /* A property spelled with parentheses (`items.Count()`) parses and
-             * type-checks, but no lowering claims it, so it used to fall
-             * through to the constant 0 below -- a loop bounded by
-             * `l.Count()` then silently did nothing. */
+            /* A property spelled with parentheses (`items.Count()`) must be
+             * diagnosed as an error rather than silently lowering to zero. */
             else if (brecv &&
                      zan_builtin_member_kind(brecv, bmn.str, (int)bmn.len) == 'P') {
                 const zan_builtin_type_t *bt = zan_builtin_find(brecv);

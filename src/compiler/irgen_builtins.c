@@ -1387,14 +1387,8 @@ static void emit_eh_oom_abort(zan_irgen_t *g, const char *msg) {
 }
 
 /* void __zan_eh_release(): drop the calling thread's EH state block.
- *
- * Blocks used to be kept forever, so every OS thread that ever entered a try
- * consumed a table slot for the life of the process and running out was fatal
- * ("too many live threads..."). A program holding 1200 threads that each throw
- * once aborted, and a long-lived one leaked a block plus its chunks per thread
- * even when ids were recycled. Releasing marks the slot with a tombstone --
- * claimable again, still transparent to a probe -- and frees the block and
- * every chunk it brought into existence.
+ * Releasing marks the slot with a tombstone so it can be reclaimed,
+ * and frees the block and its chunks.
  *
  * Called from the thread trampoline once the body has returned, and exported
  * so a foreign thread (an X11 / SDL / Cocoa callback that ran Zan code) can
@@ -3173,10 +3167,8 @@ static void reorder_named_args_impl(zan_irgen_t *g, zan_ast_list_t *args,
      * move to their slot. The result list keeps the original length.
      * The rewrite is only meaningful when the bound parameter slots are
      * exactly 0..n-1 (the dense positional prefix downstream expects); any
-     * other shape -- an unknown or duplicate name diagnosed above, or a
-     * skipped defaulted parameter ahead of a bound one -- used to punch
-     * NULL holes into the AST here and crash later phases. Restore the
-     * original argument order instead and let the diagnostics stand. */
+     * other shape (unknown/duplicate name or holes) restores the original
+     * argument order so diagnostics can stand without crashing later phases. */
     zan_ast_node_t **reb = (zan_ast_node_t **)malloc(sizeof(zan_ast_node_t *) *
                                                      (size_t)n);
     if (!reb) { free(slot); free(used_name); return; }

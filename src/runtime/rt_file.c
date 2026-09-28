@@ -477,12 +477,11 @@ long long zan_file_set_time(const char *path, int which, long long unix_sec) {
  * Table access is serialized; the captured FILE* is used outside the lock so
  * blocking I/O never holds it.
  *
- * Because the FILE* is used outside the lock, resolving it is not enough: a
- * concurrent Close on the same handle used to fclose it while a reader was
- * inside fread (A284). Every operation therefore *pins* its slot under the
- * lock (inuse++), so Close hands the FILE* to the slot's `dying` field
- * instead of closing it, and the last unpin performs the fclose. A slot with
- * a dying FILE* is not claimable by a new open until then.
+ * Because the FILE* is used outside the lock, resolving it is not enough:
+ * every operation therefore *pins* its slot under the lock (inuse++),
+ * so Close hands the FILE* to the slot's `dying` field instead of closing it,
+ * and the last unpin performs the fclose. A slot with a dying FILE* is not
+ * claimable by a new open until then.
  */
 
 /* The table starts at ZAN_FH_CAP0 slots and doubles on demand up to

@@ -725,8 +725,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
                     break;
                 }
             }
-            /* A prefix with no digits must not silently become 0: `0x;`
-             * used to lex as INT_LIT(0) and `0o8` split into `0` `8`. */
+            /* A prefix with no digits must not silently become 0. */
             if (!digit_seen) {
                 zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                               "hexadecimal literal requires at least one digit after '0x'");
@@ -1086,12 +1085,9 @@ static char lexer_escape_char(zan_lexer_t *lex) {
     (void)n;
 }
 
-/* Growable accumulator for string-literal bodies. The fixed 4 KiB stack
- * buffers these paths used to sit on turned any larger literal into a hard
- * compile error (GenForm EmitSetProp had to chunk its large data URIs around
- * it); big literals are rare, so growth starts at one 4 KiB block and doubles
- * from there. OOM degrades to a truncated literal plus a diagnostic -- the
- * token stays terminated and lexing continues. */
+/* Growable accumulator for string-literal bodies. Growth starts at one
+ * 4 KiB block and doubles from there. OOM degrades to a truncated literal
+ * plus a diagnostic -- the token stays terminated and lexing continues. */
 typedef struct {
     char *buf;
     size_t len;

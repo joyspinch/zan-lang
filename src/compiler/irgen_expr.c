@@ -3477,18 +3477,11 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
                     if (op_sym) {
                         for (int fi = irgen_find_function(g, op_sym); fi >= 0; fi = -1) {
                             if (g->functions[fi].sym == op_sym) {
-                                /* Fit the operands to the declared parameter
-                                 * types before the call. Every literal and
-                                 * arithmetic result is emitted as 64-bit, so an
-                                 * operator taking `int` (`v + 5`) used to hand
-                                 * the callee an i64 5 against an i32 parameter
-                                 * -- LLVM verification failure instead of a
-                                 * call. coerce_int_to narrows/widens/rounds a
-                                 * value already emitted, so a complex right
-                                 * operand is evaluated exactly once. A struct
-                                 * receiver that arrived by value has no
-                                 * address; `self` is passed by pointer, so
-                                 * spill it like the op_call path does. */
+                                /* Fit operands to declared parameter types before the call.
+                                 * coerce_int_to narrows/widens/rounds a value already
+                                 * emitted to match parameter width. A struct receiver
+                                 * that arrived by value has no address; `self` is passed
+                                 * by pointer, so spill it like the op_call path does. */
                                 LLVMValueRef cargs[2] = { left, right };
                                 /* Only a non-static operator has a receiver
                                  * (`self`) passed by pointer. A static operator
@@ -5365,9 +5358,7 @@ binding_lowered:
                                 if (val_k == LLVMPointerTypeKind) {
                                     stored = LLVMBuildPtrToInt(g->builder, stored, elem_llvm, "slot.pi");
                                 } else if (val_k == LLVMIntegerTypeKind) {
-                                    /* fit the value to the element width in
-                                     * both directions: an i64 into a byte
-                                     * slot used to write over its neighbours */
+                                    /* Fit the value to the element width in both directions. */
                                     stored = coerce_int_to(g, stored, elem_llvm);
                                 }
                             }
@@ -5493,9 +5484,7 @@ binding_lowered:
                                 if (val_k == LLVMPointerTypeKind) {
                                     stored = LLVMBuildPtrToInt(g->builder, stored, elem_llvm, "slot.pi");
                                 } else if (val_k == LLVMIntegerTypeKind) {
-                                    /* fit the value to the element width in
-                                     * both directions: an i64 into a byte
-                                     * slot used to write over its neighbours */
+                                    /* Fit the value to the element width in both directions. */
                                     stored = coerce_int_to(g, stored, elem_llvm);
                                 }
                             } else if (et && et->kind == TYPE_NULLABLE) {
@@ -5626,9 +5615,7 @@ binding_lowered:
                                 if (val_k == LLVMPointerTypeKind) {
                                     stored = LLVMBuildPtrToInt(g->builder, stored, elem_llvm, "slot.pi");
                                 } else if (val_k == LLVMIntegerTypeKind) {
-                                    /* fit the value to the element width in
-                                     * both directions: an i64 into a byte
-                                     * slot used to write over its neighbours */
+                                    /* Fit the value to the element width in both directions. */
                                     stored = coerce_int_to(g, stored, elem_llvm);
                                 }
                             }
@@ -6870,10 +6857,8 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
         /* array .Length: read the element count from the array header. A null
          * array value would fault on the obj-16 GEP before any bounds check
          * sees it, so the receiver gets the same null guard as members. */
-        /* array .Count is the same header read, aliased to .Length: the
-         * params bundle is a plain array, so a callee that reads
-         * `kindIds.Count` (List spelling) used to fall through to the
-         * constant-0 fallback and report an empty bundle. */
+        /* Array .Count is aliased to .Length: the params bundle is a plain
+         * array, so reading .Count on it reads the array length. */
         if (expr->member.name.len == 5 &&
             memcmp(expr->member.name.str, "Count", 5) == 0) {
             zan_type_t *at = infer_expr_type(g, expr->member.object, locals);
@@ -7244,9 +7229,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                     (int)rcls->name.len, rcls->name.str,
                     (int)expr->member.name.len, expr->member.name.str);
             } else if (!rcls) {
-                /* Same for a builtin collection: its members are all handled
-                 * above, so anything reaching here is a member it does not
-                 * have (`list.Length`) and used to read as the 0 below. */
+                /* Builtin collection: report an error when accessing an unknown member. */
                 zan_type_t *rt = infer_expr_type(g, expr->member.object, locals);
                 if (rt && is_builtin_collection_type(rt))
                     zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
@@ -8110,14 +8093,8 @@ static void query_materialize_join(zan_irgen_t *g, zan_ast_node_t *expr,
         }
     }
 
-    /* Left key, once per outer row -- and it has to be emitted *here*: the
-     * row's fields (and any `let`) only come into scope inside this loop, via
-     * query_register_iter above. It used to be emitted before the loop, where
-     * the range variable was out of scope, so `on p.dept equals d.id` read the
-     * undeclared `p` and fell back to constant 0: the key never matched, the
-     * row list came out empty, and every `join` followed by an `orderby` or a
-     * `group` silently produced zero results. (query_do_group has the right
-     * shape: open the loop, register the variables, then emit the key.) */
+    /* Left key, once per outer row: emitted here because the row's fields
+     * (and any `let`) come into scope inside this loop via query_register_iter. */
     LLVMValueRef lkv = emit_expr(g, jc->query_clause.left_key, locals);
     zan_type_t *lkt = infer_expr_type(g, jc->query_clause.left_key, locals);
     if (!lkt) lkt = g->binder->type_int;
@@ -9421,15 +9398,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                         }
                         free(call_args);
                     } else {
-                        /* Arguments were supplied but no constructor accepts
-                         * them: the object used to be built with its fields at
-                         * their initializers and no constructor run at all, so
-                         * it came back half-formed. `new C()` keeps falling
-                         * back to the field initializers, which is how a class
-                         * with only a parameterised constructor is built from
-                         * an object initializer. Gating this on "the class has
-                         * at least one ctor" let `new C(5, 6)` on a class with
-                         * NO ctor drop the arguments silently. */
+                        /* Arguments were supplied but no constructor accepts them. */
                         if (sym->type->kind == TYPE_CLASS &&
                             ctor_arg_list.count > 0)
                             zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
@@ -13372,8 +13341,7 @@ static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
     if (v && ptype && atype)
         v = emit_user_conversion(g, atype, ptype, "op_implicit", v, arg, locals);
     /* An integer meeting a float/double parameter is converted, not passed as
-     * its bit pattern: `D(2)` against `double D(double)` used to fail LLVM
-     * verification at the call site. */
+     * its bit pattern. */
     if (v && ptype && (ptype->kind == TYPE_DOUBLE || ptype->kind == TYPE_FLOAT) &&
         LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind &&
         LLVMGetIntTypeWidth(LLVMTypeOf(v)) > 1)
@@ -13388,11 +13356,8 @@ static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
  * storage slot. An inline `out T x` declares a fresh zero-initialised local
  * in the caller's scope first.
  *
- * The target may also be a *place* rather than a bare name -- `out b.field`,
- * `out arr[i]`, `out lst[i]`. Those used to fall through to `emit_expr`, which
- * yields the stored VALUE; the callee then wrote through that value as if it
- * were an address and the program faulted on the first store (an `int` field
- * holding 7 became the pointer 0x7). Resolve a real address instead. */
+ * The target may also be a place rather than a bare name -- `out b.field`,
+ * `out arr[i]`, `out lst[i]`. Resolve a real address instead of its stored value. */
 static LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
                                         local_scope_t *locals) {
     if (!tgt) return NULL;

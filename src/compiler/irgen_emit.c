@@ -162,13 +162,9 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                        &g->fn_report_leaks, 1, "");
     }
 
-    /* Initialize the coroutine scheduler exactly once, before the body runs.
-     * Task.Spawn appends onto the ready queue; a root-level `await` used to call
-     * zan_co_sched_init itself, which resets the queue and would discard any
-     * coroutine spawned before that await. Doing it once here (dominating every
-     * Task.Spawn and every root await) fixes concurrent client/server programs
-     * where the server is spawned and a client is awaited. Harmless for
-     * non-async programs (it just nulls an already-empty queue). */
+    /* Initialize the coroutine scheduler exactly once, before the body runs,
+     * so coroutines spawned before any root-level await remain enqueued.
+     * Harmless for non-async programs (it just nulls an already-empty queue). */
     zan_call2(g->builder, g->rt_co_sched_init_type, g->rt_co_sched_init, NULL, 0, "");
 
     /* The static-field initializers below emit calls into Main's entry block.
@@ -324,13 +320,8 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
 
     local_scope_t *locals = local_scope_new(g->arena);
 
-    /* `static void Main(string[] args)`: the declared parameter used to be
-     * ignored (reads compiled against an unbound identifier or resolved to a
-     * field of the same name), so args.Count was always 0 while the real
-     * command line sat in __zan_argc/__zan_argv for the Environment builtins.
-     * Build the array here, at entry, from those same globals: element i is
-     * an owned copy of argv[i+1] (slot 0 is the program name, matching the
-     * 0-based user args Environment.ArgAt reports). */
+    /* `static void Main(string[] args)`: build the parameter array from
+     * __zan_argc/__zan_argv: element i is an owned copy of argv[i+1]. */
     if (method->method_decl.params.count == 1) {
         zan_ast_node_t *param = method->method_decl.params.items[0];
         zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
@@ -1238,12 +1229,9 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
             zan_ast_node_t *member = decl->type_decl.members.items[j];
             bool is_ctor = (member->kind == AST_CONSTRUCTOR_DECL);
             if (member->kind != AST_METHOD_DECL && !is_ctor) continue;
-            /* `static T()` is a type initializer, not a constructor: it takes
-             * no `this`, is never selected by `new T(...)`, and runs once at
-             * program entry (emit_main_method calls T_cctor). It used to be
-             * registered as a zero-argument constructor, so its body ran only
-             * when the type was first instantiated -- a program that merely
-             * read a static field saw the uninitialized value. */
+            /* `static T()` is a type initializer (cctor), not an instance
+             * constructor: it takes no `this`, is never selected by `new T(...)`,
+             * and runs once at program entry (emit_main_method calls T_cctor). */
             bool is_type_init = is_ctor &&
                 (member->method_decl.modifiers & MOD_STATIC) != 0;
             /* A generic type's initializer is emitted once, off the erased
@@ -1312,12 +1300,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                 }
                 /* Every symbol family rt_sync.c exports, so a program that
                  * declares one links the object. The list must stay in sync
-                 * with rt_sync.c's exports: a missing family links only by
-                 * luck -- `zan_mmap_*` (System.IO.MemoryMappedFile) used to be
-                 * absent here and resolved solely because `using System` also
-                 * dragged in System.Threading, so the day that pull was removed
-                 * every memory-mapped-file program failed at link time with
-                 * "undefined reference to zan_mmap_create". */
+                 * with rt_sync.c's exports. */
                 if (strncmp(ext_name, "zan_atomic_int_", 15) == 0 ||
                     strncmp(ext_name, "zan_shared_", 11) == 0 ||
                     strncmp(ext_name, "zan_thread_", 11) == 0 ||
@@ -1629,10 +1612,8 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
 }
 
 /* Pointer-keyed open-addressing map LLVMValueRef -> index into the method
- * work list. The live-use sweep used to locate each use's parent by scanning
- * the whole work list, making a publish build with W method bodies cost
- * ~O(W^2) pointer compares across the reachability fixpoint. Built once
- * before the fixpoint starts; the work list is fixed by then. */
+ * work list, providing O(1) parent lookup during the live-use reachability sweep.
+ * Built once before the fixpoint starts; the work list is fixed by then. */
 typedef struct {
     LLVMValueRef key; /* NULL = empty slot */
     int idx;

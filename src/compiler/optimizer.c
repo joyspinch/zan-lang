@@ -395,23 +395,10 @@ zan_dce_stats_t zan_opt_dce(zan_irgen_t *g) {
 zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level) {
     (void)g;
     (void)level;
-    /* No force, no hint. Every inline attribute this pass used to add
-     * (alwaysinline for small bodies, inlinehint for medium ones) rewired
-     * ARC ownership across the inline boundary: inlining a factory like
-     * HttpClient.CreateHttps into its caller let the caller's call-temp
-     * release free an object a still-registered EH variable slot guarded,
-     * so the handler's catch-entry unwind released freed memory -- the A318
-     * IDE crash. Bisection: with the attribute marking off, the -Os and
-     * --publish repro runs green; inlinehint alone still crashed (LLVM's
-     * cost model inlines hinted functions anyway, and its always-inliner
-     * ignores noinline when paired with alwaysinline, so gating per
-     * function is not airtight either). LLVM's own size-tier cost model
-     * keeps profitable inlining; revisiting needs an EH-ownership-aware
-     * policy (TASKS.md A318 follow-up). This also retires the old
-     * interposable-linkage carve-out: nothing is forced at all anymore, so
-     * weak/linkonce fallbacks (e.g. the zan_io_pump_timeout stub the real
-     * reactor pump overrides at link time) are simply left to LLVM, which
-     * honors interposition. */
+    /* No force, no hint: ARC ownership transfer across inline boundaries
+     * requires EH-ownership-aware lifetime tracking, so automatic inlining
+     * attributes are omitted here. LLVM's standard size-tier cost model
+     * handles inlining decisions during pass execution. */
     zan_inline_stats_t stats = {0, 0};
     return stats;
 }
@@ -488,14 +475,12 @@ void zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
 }
 
 /* Delete every function and global no live code refers to, without running any
- * other transform. A whole program is one module here, so a `using` that globs
- * in a directory of stdlib widgets leaves hundreds of complete-but-uncalled
- * definitions behind; at -O0 no pass pipeline runs at all, so they used to be
- * emitted and linked in full. GlobalDCE is a pure reachability sweep over the
- * module's reference graph (cheap, no codegen changes to surviving functions),
- * which keeps unoptimized builds debuggable and fast to produce while dropping
- * the dead weight. Only internal-linkage definitions can be removed, which is
- * why irgen marks everything but `main` internal. */
+ * other transform. A whole program is one module here, so a `using` that pulls
+ * in a directory of stdlib widgets leaves uncalled definitions behind.
+ * GlobalDCE is a pure reachability sweep over the module's reference graph,
+ * which keeps unoptimized builds fast while dropping dead weight. Only
+ * internal-linkage definitions can be removed, which is why irgen marks
+ * everything but `main` internal. */
 void zan_opt_strip_unused(zan_irgen_t *g) {
     LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
     LLVMPassBuilderOptionsSetVerifyEach(opts, 0);

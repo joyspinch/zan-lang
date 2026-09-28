@@ -2876,12 +2876,9 @@ static zan_ast_node_t *parse_for_stmt(zan_parser_t *p) {
             goto parse_cond;
         } else {
             /* `for (r = 0; ...)` reusing an outer local: the init is a bare
-             * expression. Wrap it in EXPR_STMT like a standalone statement —
-             * emit_stmt's default case silently drops bare expression nodes,
-             * which used to discard the init assignment entirely (the loop
-             * then tested the stale slot and never ran). This also gives a
-             * fluent-call init the same async-detach/ARC-drop semantics as
-             * a normal expression statement. */
+             * expression. Wrap it in EXPR_STMT like a standalone statement so
+             * it lowers properly. This also gives a fluent-call init the same
+             * async-detach/ARC-drop semantics as a normal expression statement. */
             zan_loc_t eloc = p->current.loc;
             zan_ast_node_t *expr = parse_expression(p);
             parser_expect(p, TK_SEMICOLON);
@@ -3674,11 +3671,9 @@ static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
         is_this = 1;
     }
 
-    /* contextual `params` modifier: `params T[] rest`. The declared type stays
-     * `T[]` as written, like C#: the bundle is an array, the callee reads
-     * `rest.Length` and can hand it on to any `T[]` parameter. (It used to be
-     * rewritten to List<T> because array parameters carried no length; that
-     * gap is gone, and the rewrite left every params callee reading `.Count`.) */
+    /* Contextual `params` modifier: `params T[] rest`. The declared type stays
+     * `T[]` as written, like C#: the bundle is an array, and the callee reads
+     * `rest.Length`. */
     int is_params = 0;
     if (parser_check(p, TK_IDENT) && p->current.str_val.len == 6 &&
         memcmp(p->current.str_val.str, "params", 6) == 0) {
@@ -4821,8 +4816,7 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
         if (!parse_top_level_decl(p, unit))
             parser_advance(p); /* skip to recover */
         if (parser_check(p, TK_RBRACE)) {
-            /* A stray `}` at top level used to silently end the unit loop
-             * and drop every declaration after it; diagnose and skip it so
+            /* A stray `}` at top level: diagnose and skip it so
              * following decls still parse. */
             zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
                           "unexpected '}' at top level");
@@ -5207,9 +5201,7 @@ void zan_parser_flatten_nested_types(zan_ast_node_t *unit, zan_arena_t *arena,
 void zan_parser_desugar_events(zan_ast_node_t *unit, zan_arena_t *arena,
                                zan_diag_t *diag) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
-    /* Holder classes generated so far, grown on demand: a fixed cap used to
-     * stop generating them silently, and every later `event` of a new
-     * delegate type then referenced a class that was never emitted. */
+    /* Holder classes generated so far, grown on demand. */
     const char **generated = NULL;
     int generated_count = 0;
     int generated_cap = 0;

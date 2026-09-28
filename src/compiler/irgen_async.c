@@ -1656,7 +1656,7 @@ static void emit_eh_rethrow_current(zan_irgen_t *g) {
                 LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.plain");
             LLVMBasicBlockRef done_bb =
                 LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.done");
-            /* nothing in flight: legacy bare line */
+            /* Fallback when no exception payload is in flight. */
             LLVMBuildCondBr(g->builder, hasExc, str_bb, plain_bb);
             LLVMPositionBuilderAtEnd(g->builder, plain_bb);
             {

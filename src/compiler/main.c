@@ -61,11 +61,8 @@
 
 #include "../common/host_oom.h"
 
-/* Capacities of the link invocation the driver builds. Overflowing any of them
- * used to drop the entry that did not fit -- a lost `-l`, a driver never
- * linked, a `-L` the linker never sees -- and the build then failed with an
- * unresolved symbol far from the cause. They are sized for real projects and
- * every site reports instead of truncating (see link_cap_exceeded). */
+/* Capacities of the link invocation the driver builds. Sized for real projects
+ * and every site reports on overflow instead of truncating (see link_cap_exceeded). */
 #define ZAN_LINK_MAX_ARGV        8192
 #define ZAN_LINK_MAX_LIBS        2048
 #define ZAN_LINK_MAX_DIRS        1024
@@ -4312,9 +4309,7 @@ int main(int argc, char **argv) {
     for (int fi = 0; fi < input_count; fi++) {
         /* Design docs / saved components are generator data, not Zan
          * source: their raw text is only meaningful to the generator, and
-         * lexing it here would surface lexer errors (every Chinese char
-         * in an .html used to spam "unexpected character" from a diag
-         * that has no file registered, rendering as "<unknown>"). */
+         * lexing it here would surface lexer errors. */
         if (zan_is_design_path(input_files[fi]) ||
             zan_is_zcomp_path(input_files[fi])) continue;
         size_t nlen = 0;
@@ -4484,8 +4479,7 @@ int main(int argc, char **argv) {
         } else {
         /* Each file's `using` set never changes, so scan every file exactly
          * once: new files land at the end of the list and the next round picks
-         * them up. Re-reading the whole list per round used to dominate
-         * start-up for stdlib-heavy programs. */
+         * them up. */
         int scanned = 0;
         while (scanned < input_count) {
             int round_end = input_count;
@@ -8588,11 +8582,9 @@ int main(int argc, char **argv) {
                 snprintf(drv, sizeof(drv), "%.*s",
                          used_driver_len[d], used_drivers[d]);
 
-                /* candidate runtime file names for this driver: one entry per
+                /* Candidate runtime file names for this driver: one entry per
                  * file in its dependency closure (e.g. libpq ships libpq plus
-                 * its OpenSSL and Kerberos dylibs -> 8 files). Dropping the
-                 * tail used to ship an incomplete bundle that only failed
-                 * once the program loaded the driver. */
+                 * its OpenSSL and Kerberos dylibs -> 8 files). */
                 char cands[64][128]; int ncand = 0;
                 char manifest[1200];
                 snprintf(manifest, sizeof(manifest), "%s/%s.bundle", driver_dir, drv);

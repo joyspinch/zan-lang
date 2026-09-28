@@ -205,8 +205,7 @@ static bool binder_type_equiv(const zan_type_t *a, const zan_type_t *b) {
 
 /* Full parameter-list identity: count plus each parameter's declared type.
  * Methods differing only in parameter types are legal overloads; methods
- * with identical lists are the A43-A16 duplicate that used to compile with
- * first-wins semantics. */
+ * with identical lists are duplicate declarations that must be rejected. */
 static bool binder_params_equiv(zan_symbol_t *a, zan_symbol_t *b) {
     if (a->member_count != b->member_count) return false;
     for (int i = 0; i < a->member_count; i++) {
@@ -374,11 +373,9 @@ static bool member_clash_one(zan_binder_t *b, zan_symbol_t *type_sym,
                       type_sym->name.len, type_sym->name.str);
         return true;
     }
-    /* A43-A16: two members of the same kind with the same name used to
-     * be accepted silently and every lookup picked whichever came
-     * first -- a semantics swap with zero diagnostics. Fields collide
-     * on name alone (C# CS0102); methods and constructors collide only
-     * when the full parameter list matches too (C# CS0111, overloads
+    /* Two members of the same kind with the same name cannot coexist.
+     * Fields collide on name alone (C# CS0102); methods and constructors
+     * collide when the full parameter list matches (C# CS0111, overloads
      * stay legal); enum members collide on name alone. */
     if (m_is_data && a_is_data) {
         /* Every indexer property is named "Item" by construction, and C#

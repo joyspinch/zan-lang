@@ -1,8 +1,7 @@
-/* Module-local weak-reference registry.  The registry is emitted into each
+/* Module-local weak-reference registry. The registry is emitted into each
  * generated module so targets do not need an additional runtime object. The
- * 64 KB bucket array used to be a .bss global in every program whether it
- * used weak references or not; it is now a NULL global that weak_buckets_ensure
- * calloc's on first use, under the weak spinlock both bodies already hold. */
+ * bucket array is lazily allocated on first use by weak_buckets_ensure under
+ * the weak spinlock. */
 
 #define ZAN_WEAK_BUCKET_COUNT 8192
 
