@@ -1628,14 +1628,69 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
     return work;
 }
 
+/* Pointer-keyed open-addressing map LLVMValueRef -> index into the method
+ * work list. The live-use sweep used to locate each use's parent by scanning
+ * the whole work list, making a publish build with W method bodies cost
+ * ~O(W^2) pointer compares across the reachability fixpoint. Built once
+ * before the fixpoint starts; the work list is fixed by then. */
+typedef struct {
+    LLVMValueRef key; /* NULL = empty slot */
+    int idx;
+} work_fn_slot_t;
+
+typedef struct {
+    work_fn_slot_t *slots;
+    int cap; /* power of two, 0 = not built */
+} work_fn_index_t;
+
+static uint64_t work_fn_hash(LLVMValueRef fn) {
+    uint64_t h = (uint64_t)(uintptr_t)fn;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 29;
+    return h;
+}
+
+static void work_fn_index_build(work_fn_index_t *ix,
+                                method_body_work_t *work, int work_count) {
+    int cap = 16;
+    while (cap < work_count * 4) cap *= 2;
+    ix->slots = (work_fn_slot_t *)calloc((size_t)cap, sizeof(*ix->slots));
+    if (!ix->slots) return; /* cap stays 0; lookups report "unknown parent" */
+    ix->cap = cap;
+    for (int w = 0; w < work_count; w++) {
+        for (int which = 0; which < 2; which++) {
+            LLVMValueRef key = which == 0 ? work[w].fn : work[w].resume_fn;
+            if (!key) continue;
+            size_t j = (size_t)work_fn_hash(key) & (size_t)(cap - 1);
+            while (ix->slots[j].key && ix->slots[j].key != key)
+                j = (j + 1) & (size_t)(cap - 1);
+            if (!ix->slots[j].key) {
+                ix->slots[j].key = key;
+                ix->slots[j].idx = w;
+            }
+        }
+    }
+}
+
+static int work_fn_index_lookup(const work_fn_index_t *ix, LLVMValueRef key) {
+    if (!ix->cap) return -1;
+    size_t j = (size_t)work_fn_hash(key) & (size_t)(ix->cap - 1);
+    while (ix->slots[j].key) {
+        if (ix->slots[j].key == key) return ix->slots[j].idx;
+        j = (j + 1) & (size_t)(ix->cap - 1);
+    }
+    return -1;
+}
+
 /* LLVM use edges give a conservative pre-body reachability graph: all call
  * targets, method groups, constructor references and vtables are registered
  * before this pass. A declaration used by a live function must have its body
  * emitted; inspecting users of dead functions would bring the whole module
  * back. Globals (reflection tables, static delegates, vtables) can reference
  * functions indirectly, so their edges are always treated as live. */
-static bool body_has_live_use(LLVMValueRef fn, method_body_work_t *work,
-                              const unsigned char *live, int work_count) {
+static bool body_has_live_use(LLVMValueRef fn, const unsigned char *live,
+                              const work_fn_index_t *ix) {
     for (LLVMUseRef u = LLVMGetFirstUse(fn); u; u = LLVMGetNextUse(u)) {
         LLVMValueRef user = LLVMGetUser(u);
         /* A constant expression/aggregate may sit between the function and
@@ -1646,10 +1701,10 @@ static bool body_has_live_use(LLVMValueRef fn, method_body_work_t *work,
         LLVMValueRef parent = LLVMIsAInstruction(user)
             ? LLVMGetBasicBlockParent(LLVMGetInstructionParent(user)) : NULL;
         if (!parent) return true;
-        int i = 0;
-        for (; i < work_count; i++)
-            if (work[i].fn == parent || work[i].resume_fn == parent) break;
-        if (i == work_count || live[i] == 2) return true;
+        /* Functions outside the work list (Main, cctors, late generic
+         * specializations) are roots: an unknown parent stays live. */
+        int i = work_fn_index_lookup(ix, parent);
+        if (i < 0 || live[i] == 2) return true;
     }
     return false;
 }
@@ -2706,6 +2761,8 @@ done:
      * call instruction names their implementation. Register these edges now,
      * before asking which stdlib bodies can safely be omitted. */
     if (prune_stdlib_bodies) emit_vtables(g);
+    work_fn_index_t work_ix = { NULL, 0 };
+    work_fn_index_build(&work_ix, work, work_count);
     int pending;
     do {
         pending = 0;
@@ -2721,7 +2778,7 @@ done:
                           member->kind == AST_CONSTRUCTOR_DECL)) ||
                         g->refl_used;
             if (!root)
-                root = body_has_live_use(work[w].fn, work, live, work_count);
+                root = body_has_live_use(work[w].fn, live, &work_ix);
             if (root) { live[w] = 1; pending++; }
         }
         if (pending) {
@@ -2730,6 +2787,7 @@ done:
             if (zan_diag_has_errors(g->diag)) break;
         }
     } while (pending);
+    free(work_ix.slots);
     for (int w = 0; w < work_count; w++) {
         if (live[w]) continue;
         free(work[w].param_types);
