@@ -839,7 +839,18 @@
       try { paintSeries(JSON.parse(ev.data)); } catch (e) { toast('实时序列格式错误', 'bad'); }
     });
     stream.onerror = function () {
-      if (gen === streamGen) { host.setAttribute('data-stream-status', 'disconnected'); }
+      if (gen !== streamGen) { return; }
+      host.setAttribute('data-stream-status', 'disconnected');
+      // EventSource retries on its own while CONNECTING; a hidden webview can
+      // freeze the tab hard enough that it gives up (readyState CLOSED) and
+      // never comes back, so rebuild the stream after a grace period.
+      setTimeout(function () {
+        if (gen !== streamGen || !stream) { return; }
+        if (stream.readyState === 2) {
+          try { stream.close(); } catch (e) { /* already closed */ }
+          startStream();
+        }
+      }, 4000);
     };
     wireTopSort();
     startDay(host.getAttribute('data-day'), gen);
