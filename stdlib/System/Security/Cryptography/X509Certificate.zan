@@ -403,12 +403,26 @@ class X509Certificate {
         if (exEnd < 0 || exEnd != tbsEnd) { return null; }
         int seqEnd = Tlv(der, exEnd, p, 48);
         if (seqEnd != exEnd) { return null; }
+        // RFC 5280 requires unique extension OIDs. A later duplicate must not relax
+        // key usage, EKU or any other restriction parsed from an earlier entry.
+        List<int> seenOidStarts = new List<int>();
+        List<int> seenOidLens = new List<int>();
         while (p[0] < seqEnd) {
             int itemEnd = Tlv(der, seqEnd, p, 48);
             if (itemEnd < 0) { return null; }
             int oidEnd = Tlv(der, itemEnd, p, 6);
             if (oidEnd < 0) { return null; }
             int oidAt = p[0]; int oidLen = oidEnd - oidAt;
+            for (int i = 0; i < seenOidStarts.Count; i = i + 1) {
+                if (seenOidLens[i] != oidLen) { continue; }
+                bool same = true;
+                for (int j = 0; j < oidLen; j = j + 1) {
+                    if ((der[seenOidStarts[i] + j] & 255) != (der[oidAt + j] & 255)) { same = false; break; }
+                }
+                if (same) { return null; }
+            }
+            seenOidStarts.Add(oidAt);
+            seenOidLens.Add(oidLen);
             p[0] = oidEnd;
             bool critical = false;
             if (p[0] < itemEnd && (der[p[0]] & 255) == 1) {
@@ -472,7 +486,11 @@ class X509Certificate {
                     }
                     p[0] = oe;
                 }
-            } else if (critical) { return null; }
+            } else if (Oid(der, oidAt, oidLen, 85, 29, 30) || critical) {
+                // nameConstraints must be enforced for any CA that carries them,
+                // even when incorrectly marked noncritical. No evaluator exists yet.
+                return null;
+            }
             p[0] = itemEnd;
         }
         p[0] = tbsEnd;
