@@ -29,11 +29,13 @@ class TlsContext {
     bool pinRequired;
     CertPolicyFn certPolicy;
     List<X509Certificate> trustedCerts;
+    List<X509Certificate> cachedChain;
     X509Certificate cachedCert;
     RsaKey cachedKey;
     static int MAX_TRUST_BUNDLE_BYTES = 4194304;
     static int MAX_TRUST_CERT_BYTES = 32768;
     static int MAX_TRUST_CERTS = 2048;
+    static int MAX_CHAIN_DER_BYTES = 131072;
     static string PEM_BEGIN = "-----BEGIN CERTIFICATE-----";
     static string PEM_END = "-----END CERTIFICATE-----";
 
@@ -49,6 +51,7 @@ class TlsContext {
         this.pinRequired = false;
         this.certPolicy = null;
         this.trustedCerts = null;
+        this.cachedChain = null;
         this.cachedCert = null;
         this.cachedKey = null;
     }
@@ -95,6 +98,57 @@ class TlsContext {
         }
     }
 
+    /// <summary>解析服务端证书 PEM 链束：全部证书按出现顺序保留（叶子在
+    /// 前），数量与 DER 总长受限；任何一张无法解析即整体拒绝。</summary>
+    static List<X509Certificate> ParseCertChain(string pem) {
+        if (pem == null || pem.Length == 0 || pem.Length > MAX_TRUST_BUNDLE_BYTES) { return null; }
+        List<X509Certificate> chain = new List<X509Certificate>();
+        int pos = 0;
+        int totalDer = 0;
+        while (pos < pem.Length) {
+            int begin = pem.IndexOf(PEM_BEGIN, pos);
+            if (begin < 0) { break; }
+            int body = begin + PEM_BEGIN.Length;
+            int end = pem.IndexOf(PEM_END, body);
+            if (end < 0 || end - body > MAX_TRUST_CERT_BYTES
+                || chain.Count >= MAX_TRUST_CERTS) { return null; }
+            int next = end + PEM_END.Length;
+            X509Certificate cert = X509Certificate.FromPem(pem.Substring(begin, next - begin));
+            if (cert == null || cert.RawDer() == null) { return null; }
+            totalDer = totalDer + cert.RawDerLen();
+            if (totalDer > MAX_CHAIN_DER_BYTES) { return null; }
+            chain.Add(cert);
+            pos = next;
+        }
+        return chain.Count > 0 ? chain : null;
+    }
+
+    static List<X509Certificate> ReadCertChainFile(string path) {
+        if (path == null || !File.Exists(path)) { return null; }
+        try {
+            int size = File.GetSize(path);
+            if (size < 1 || size > MAX_TRUST_BUNDLE_BYTES) { return null; }
+            byte[] raw = File.ReadBytes(path, 0, size + 1);
+            if (raw == null || raw.Length != size) { return null; }
+            return TlsContext.ParseCertChain(raw.ToStr(0, raw.Length));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /// <summary>按顺序尝试每个候选 bundle 路径：存在但损坏/不可解析的
+    /// 候选只被跳过，不阻断后续候选；全部候选都不可用才返回 null
+    /// （调用方随之 fail-closed）。</summary>
+    static List<X509Certificate> TrustFromCandidates(string[] paths) {
+        if (paths == null) { return null; }
+        for (int i = 0; i < paths.Length; i = i + 1) {
+            if (!File.Exists(paths[i])) { continue; }
+            List<X509Certificate> roots = TlsContext.ReadTrustBundle(paths[i], false);
+            if (roots != null && roots.Count > 0) { return roots; }
+        }
+        return null;
+    }
+
     /// <summary>Add every supported CA certificate in a bounded PEM bundle, in addition to defaults.</summary>
     bool AddTrustedCert(string pemFile) {
         List<X509Certificate> certs = TlsContext.ReadTrustBundle(pemFile, true);
@@ -108,15 +162,15 @@ class TlsContext {
         #if LINUX
         // Linux distributions publish curated trust as a CA bundle; do not crawl
         // /etc/ssl/certs, which can also contain untrusted local certificates.
+        // A damaged first candidate must not block later ones, and nothing
+        // parsed means fail closed.
         string[] paths = new string[] {
             "/etc/ssl/certs/ca-certificates.crt",
             "/etc/pki/tls/certs/ca-bundle.crt",
             "/etc/ssl/ca-bundle.pem",
             "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
         };
-        for (int i = 0; i < paths.Length; i = i + 1) {
-            if (File.Exists(paths[i])) { return TlsContext.ReadTrustBundle(paths[i], false); }
-        }
+        return TlsContext.TrustFromCandidates(paths);
         #endif
         // Windows ROOT enumeration does not apply disallowed-store, revocation,
         // or chain policy; macOS keychain enumeration likewise is not SecTrust.
@@ -150,14 +204,21 @@ class TlsContext {
         return false;
     }
 
-    /// <summary>创建服务器端 TLS 上下文。</summary>
+    /// <summary>创建服务器端 TLS 上下文。证书文件可以是 PEM 链束
+    /// （叶子在前，其后为中间证书）；单证书文件行为不变。链束任何一环
+    /// 无法解析即整体拒绝，不得静默降级为只发叶子。</summary>
     static TlsContext CreateServer(string certFile, string keyFile) {
         TlsContext c = new TlsContext();
         c.server = true;
         c.certFile = certFile;
         c.keyFile = keyFile;
         if (certFile != null && File.Exists(certFile)) {
-            c.cachedCert = X509Certificate.FromPemFile(certFile);
+            c.cachedChain = TlsContext.ReadCertChainFile(certFile);
+            if (c.cachedChain != null && c.cachedChain.Count > 0) {
+                c.cachedCert = c.cachedChain[0];
+            } else {
+                c.cachedCert = X509Certificate.FromPemFile(certFile);
+            }
         }
         if (keyFile != null && File.Exists(keyFile)) {
             string privKeyPem = File.ReadAllText(keyFile);
@@ -266,6 +327,7 @@ class TlsStream {
         TlsStream s = new TlsStream();
         s.engine = new TlsEngine(host, !ctx.verify, ctx.disableTls13, ctx.pins, ctx.pinRequired, ctx.certPolicy, ctx.trustedCerts, ctx.server, ctx.certFile, ctx.keyFile);
         s.engine.SetCredentials(ctx.cachedCert, ctx.cachedKey);
+        s.engine.SetCertChain(ctx.cachedChain);
         s.sock = sock;
         s.scratch = new byte[SCRATCH + 1];
         s.open = true;

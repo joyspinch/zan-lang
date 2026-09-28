@@ -1,0 +1,373 @@
+// Conformance: TLS record-layer fail-closed bounds — Alert must be exactly
+// 2 bytes, CCS exactly 1 byte of value 1 and only in a matching state, TLS 1.3
+// KeyUpdate rejected instead of silently ignored, oversized records rejected —
+// plus server PEM chain-bundle sending (leaf first, intermediate second) and
+// trust-bundle candidate traversal (a damaged first path must not block later
+// ones). Root/intermediate/leaf generated with OpenSSL RSA-SHA256, valid
+// 2026-09-28 through 2036-09-25; leaf SAN chain.example.
+using System;
+using System.IO;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System.Security.Cryptography;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        if (ok) { Console.WriteLine("ok " + name); }
+        else { Console.WriteLine("FAIL " + name); failures = failures + 1; }
+    }
+
+    static string ROOT_B64 = "MIIDIzCCAgugAwIBAgIUcm3wGvB+q7I2i6OOuQnxud5KHWowDQYJKoZIhvcNAQELBQAwGTEXMBUGA1UEAwwOWmFuIENoYWluIFJvb3QwHhcNMjYwOTI4MTEwMjM4WhcNMzYwOTI1MTEwMjM4WjAZMRcwFQYDVQQDDA5aYW4gQ2hhaW4gUm9vdDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALV5oLXltDosIZ9u+AXAV148m82HEXtsbqf5OltMEzV9ncyuEQn5QOor+0mYOwmGvf6BNqE9c+K+L6MVOA9GlRHR34krCGU1M+6kXSTXWT86iYAm/7p/gMcBn6mos4izoU5Wjz67BOjgsXIFfpbR4NxMEUqyzDIiGObIDreM2tmiUx1/q4ITUDnfwfA2DTZEqfrCxP/TSJFS6hhA73hEhwd+XfmGpYNx0E/Kk9Pujs0xNt+j1nPj4nf8mVQ056lW3CzVg53Bd807EX6NA3FHiZoo9ng7Bj3O279m65RbH2T6FQy6X8+iehDIFwMkuKmgKb5S8NNCuirHPX7sY0jv4lMCAwEAAaNjMGEwHQYDVR0OBBYEFB+GPyN6nsPQdBYf2N77dU87zYQxMB8GA1UdIwQYMBaAFB+GPyN6nsPQdBYf2N77dU87zYQxMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMA0GCSqGSIb3DQEBCwUAA4IBAQBzqJ3yTcUlZFPjCTtRA50VSFfYQKn4uwalJ4Wz99rM7jInzMpWJsNmot1zH3s7nF1g5XdTx9i+7kZXZhKZxDnrz0m7RFCdLc/695t7Z6ABCnXkU7CUkpeRINBnJIu3wc8cE9duO8d14qpsEivGTDXdWmkVnPCJzzJSjiY4ke6s9+Sp5HnY2bcHSHlNrFIjTeE9Edd7wlXN00Z4HynlBQ19puqGvH3UseHUP/GtOzv5A1O74uJjGYu0Nf4RLTSHKthw9F945MPfNOCNU7qQ6+atYqT9ODonpyIunZfGEqnTeedwiOFmT9ZuGivtx04HeSwx/8A5835sCfOcv4CUV4IB";
+    static string INTER_B64 = "MIIDGTCCAgGgAwIBAgICA+kwDQYJKoZIhvcNAQELBQAwGTEXMBUGA1UEAwwOWmFuIENoYWluIFJvb3QwHhcNMjYwOTI4MTEwMjM4WhcNMzYwOTI1MTEwMjM4WjAhMR8wHQYDVQQDDBZaYW4gQ2hhaW4gSW50ZXJtZWRpYXRlMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmwNT7yoryuUXvVHCNAkTnEPTpV8nCaOGC7AqLqY6/rLXodjHVCMt2OX0LrytBoJrm9Hv6fqor4ji/f/gh51N/XB5nsO/EAq4IopfwrBzTH33YoM7M5HeEgyKwWn8LNZkBGe4dtXgPVrZSnpqpaeSA7eaYzKP9p81vPX3e1KMnvnH1YU9hJNwkWN/tgIZvhuIXVs+D8fOdBZ6AmI59XGUCtxxlgSf7ZLKb3kAFOs2/jXbYyMLWUKIJ/h9TZYNgbgCRQLaFjkaLTA91zgH+6yKt2PIwTym9iuC7cOf+fkbxgXl9yu+ZTsHlDUOLQ0kNxLlhK5UbkVgVSpxfQnV63cdNQIDAQABo2MwYTAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQUcMs7NOGbAZgoWLiO0G48Ud04fh0wHwYDVR0jBBgwFoAUH4Y/I3qew9B0Fh/Y3vt1TzvNhDEwDQYJKoZIhvcNAQELBQADggEBAEsYZfJeI7Tw1DjaaQUhOeeCI2apQThpV+giqaRN5YtqP1P94l8d46glfXeKf7dwGgm1b965yVr/1AZUpPPiW/ZK2+qej7rqfSpV8bz9OoNlu2PzZARZFaXAX2hWDAm0fMtFeCi/rvO7pl5jv/DnzkyHM0wfK64glyV3Y4TQn3zWRrSP9wFuoki5mdbY1BrLShs6y45AcPjiO+gbgdWcbg2VNpSr3xunmaJ5gXRZ7+zdCkKyL9v/BxnMm2sbNKV9frmphLj383oijhQIAm+svTwjIhA4xV+YpKQ+er//yeiDmau/KHhJEHh61kVTL7mmUaBZdY/IfhYZ8hi4ukrjhcY=";
+    static string LEAF_B64 = "MIIDQDCCAiigAwIBAgICB9EwDQYJKoZIhvcNAQELBQAwITEfMB0GA1UEAwwWWmFuIENoYWluIEludGVybWVkaWF0ZTAeFw0yNjA5MjgxMTAyMzlaFw0zNjA5MjUxMTAyMzlaMBgxFjAUBgNVBAMMDWNoYWluLmV4YW1wbGUwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCQD4We4DY7v9b6N0CHhVtO0ejLjWzgmfllDsRFa5ukWg6jSAzigj3hK6Ia6tvaNaVCUlwjM9/PnBQ6k6osOyenaw5WSrAbCYYxnfyHHE5WuDNM3Uuxtx2geQH9g5xm+R3NR4B4pi6PJceo8K5SQ6deWu+hoJvhwt/d8UPWrdQdX5qUefbXzYTBxgw7qkyNcSXStAVSNhy3G0CMjf1TEVGXwC2Q2ePxozZ1RAGVJtEWGTv8jq5mb88McBVx+SqfmtIqNuw2t1ZQ0IUMdpQggMnQipy2inTLXY03H6Yy957K2iuKx/Dy9XGEzMR6QtaQI6KtRMOIzLuwzhUonnOKsSxPAgMBAAGjgYowgYcwCQYDVR0TBAIwADALBgNVHQ8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwGAYDVR0RBBEwD4INY2hhaW4uZXhhbXBsZTAdBgNVHQ4EFgQUbjuRgjcX7FXknOqMPLCCYcsOHOcwHwYDVR0jBBgwFoAUcMs7NOGbAZgoWLiO0G48Ud04fh0wDQYJKoZIhvcNAQELBQADggEBABE6f1zTdD7EglntzaSOe6Eil4FW3z2Zv3jq+Q4+Ez50VcjuaQYCXzqHcCfy0IP3rdzowI+exmqITvRUPLWjoOBQ+iHOU9a6LzlTYmPfDSn1cdjqWAgmECNv1nj7IyQbX89KuMbxCMXULoH/4HF+lUHZdibzAinM2mKhIafSou+R1Z/CkYUfPt70rpvbJPYFPRqn4EykOdbpb+Bp10XnBImgpW29rJJigvd7tVEIRksHuH+HHG8xX/8hP3CS/Nu9v3QN5QFSMdx+jH9jF5Hg2FgAXlP6+cJI+I41A1uW+kh40U8qmFhwClMygM1MN1JoKn9mKIgwZygpxuXgShD/AAs=";
+    static string LEAF_KEY = "-----BEGIN PRIVATE KEY-----\n"
+        + "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCQD4We4DY7v9b6\n"
+        + "N0CHhVtO0ejLjWzgmfllDsRFa5ukWg6jSAzigj3hK6Ia6tvaNaVCUlwjM9/PnBQ6\n"
+        + "k6osOyenaw5WSrAbCYYxnfyHHE5WuDNM3Uuxtx2geQH9g5xm+R3NR4B4pi6PJceo\n"
+        + "8K5SQ6deWu+hoJvhwt/d8UPWrdQdX5qUefbXzYTBxgw7qkyNcSXStAVSNhy3G0CM\n"
+        + "jf1TEVGXwC2Q2ePxozZ1RAGVJtEWGTv8jq5mb88McBVx+SqfmtIqNuw2t1ZQ0IUM\n"
+        + "dpQggMnQipy2inTLXY03H6Yy957K2iuKx/Dy9XGEzMR6QtaQI6KtRMOIzLuwzhUo\n"
+        + "nnOKsSxPAgMBAAECggEANpXzEwKw+g3URuYlqNQih2ipNWvGnAorwhuIyiceh/Vp\n"
+        + "w3vbCf7AtK/EUj+4g2O9VTaA3APdY7ynu5RVMEJP4bOCcLcHKI+Azg8nbwiONHTC\n"
+        + "V3copdOVQcdoNiem3Su6m5xitRR+4tW1ZDGiU+B3rBx33T3OowokqmOvSUp/a4tL\n"
+        + "A40hkUE10uytODEH0DbrC4xeU9QJjrqqWjLWoQJgMu/r3aFZBe1dYiJ5aTauIjN/\n"
+        + "a7Vt1HSnB/rpvl0SZwK10onATq9BwyuUqhEw6fugO8xNhTopJSTeyHRZJST8smJ2\n"
+        + "/ugvcal+z6UjBABvMHsAu5VLwlYSt4h0lU16TSuA5QKBgQDJcvLHmy2eW1/sroPB\n"
+        + "4LaqyAvZcYtU9PPiLIeKdRSW6uD7Ah8dvo44N3qM8xqZazyLCp4xpZy6ADItmbz5\n"
+        + "Yog/FwQ9zJgy6QT2eiT6UJbgLHE72Nkj6w/2OU7V/cLyF+9aPlRXH9yZfTo/6q9i\n"
+        + "s7aqKGLHxPFPVLTshGUsBgIYYwKBgQC3Ejz715UhoR6PtIIM1FFrEBss7qhtBTeW\n"
+        + "0ZPgHnxiX/cHaIw41rbBNN2r1Ls4fPxAS7UKJ1Prgt5uWCGg1qvglMhAhpGgUOke\n"
+        + "sNsP6o6eUt+jnz+s2b8RUhnt6yzKMHbwj+1/MqW1EJ58KFN1AZfRd6k70F/CoU/F\n"
+        + "FYpZTMeiJQKBgQC+4mESqwQrDcJzb1oCGIB+i1hPDrxMIGAIbNFybUa5So8syfHa\n"
+        + "KXpx4oAJl0IZJfgUeFc2DAvaY90oQIlEdg1MWu718Cw38X12YH8xgbO1b+dMIkp/\n"
+        + "MnnJgrwlIXPcGrn+9RjOBa7u8i6D6kmOaWQpEGOpkABof4eApmOHt5m8qQKBgH76\n"
+        + "F3JWRQneRuRFvy5G1XH86dxwbEGxrKzfEEIS4xMYnK52xUtnIbtAf7/+/RxhFFVE\n"
+        + "LX2taXegfcbrOefk/bH3gC3BKKCZfhfbcxXHCsSllphWjEPHg87vsyxiQd67XsPc\n"
+        + "EE55QpYjwMk87yXoxPR0mtzx2nmUiU+ZcSwfJRhBAoGBALDg8gl1gOJrbX+oTFxb\n"
+        + "WgGP0dKBFmHRJL3jxgKMk/KEAmgBxhEkJanS9R5z1sadiSvfalGvUqWCibdQZI8i\n"
+        + "MCLOE/Pk2JJdFu6NXyLDazlH4h3YVwb3c8VPp7SLc0N5vXEQAGgfND4HDiZgxc7n\n"
+        + "p0kXue/OHdA7BxLEpOkD7rqY\n"
+        + "-----END PRIVATE KEY-----\n";
+
+    static int PORT = 9601;
+
+    static string Pem(string b64) {
+        string out1 = "-----BEGIN CERTIFICATE-----\n";
+        int pos = 0;
+        while (pos < b64.Length) {
+            int take = 64;
+            if (pos + take > b64.Length) { take = b64.Length - pos; }
+            out1 = out1 + b64.Substring(pos, take) + "\n";
+            pos = pos + take;
+        }
+        return out1 + "-----END CERTIFICATE-----\n";
+    }
+
+    static byte[] Bytes1(int a) {
+        byte[] r = new byte[1]; r[0] = (byte)a; return r;
+    }
+    static byte[] Bytes2(int a, int b) {
+        byte[] r = new byte[2]; r[0] = (byte)a; r[1] = (byte)b; return r;
+    }
+    static byte[] Bytes3(int a, int b, int c) {
+        byte[] r = new byte[3]; r[0] = (byte)a; r[1] = (byte)b; r[2] = (byte)c; return r;
+    }
+    static byte[] Bytes5(int a, int b, int c, int d, int e) {
+        byte[] r = new byte[5]; r[0] = (byte)a; r[1] = (byte)b; r[2] = (byte)c;
+        r[3] = (byte)d; r[4] = (byte)e; return r;
+    }
+
+    static byte[] Record(int ctype, byte[] payload) {
+        byte[] rec = new byte[5 + payload.Length];
+        rec[0] = (byte)ctype;
+        rec[1] = 3;
+        rec[2] = 3;
+        rec[3] = (byte)((payload.Length >> 8) & 255);
+        rec[4] = (byte)(payload.Length & 255);
+        for (int i = 0; i < payload.Length; i = i + 1) { rec[5 + i] = payload[i]; }
+        return rec;
+    }
+
+    static void Feed(TlsEngine e, byte[] rec) {
+        e.FeedNetwork(rec, 0, rec.Length);
+    }
+
+    static TlsEngine ClientEngine() {
+        return new TlsEngine("chain.example", true, true, null, false,
+            null, null, false, "", "");
+    }
+
+    static TlsEngine ServerEngine() {
+        return new TlsEngine("", true, true, null, false,
+            null, null, true, "", "");
+    }
+
+    // 造包与引擎读侧必须是两个 seq=0 的全新密码状态：复用同一对象会让
+    // Encrypt 推进 seq，引擎解密从 seq=1 起算，AEAD 必然失败。
+    static TlsCipherState craftState;
+
+    static TlsCipherState ArmedCipher(TlsEngine e) {
+        byte[] key = new byte[16];
+        byte[] iv = new byte[12];
+        for (int i = 0; i < 16; i = i + 1) { key[i] = (byte)(i + 1); }
+        for (int i = 0; i < 12; i = i + 1) { iv[i] = (byte)(i + 3); }
+        Program.craftState = new TlsCipherState(TlsRecord.VersionTls13, key, iv);
+        TlsCipherState cs = new TlsCipherState(TlsRecord.VersionTls13, key, iv);
+        e.readCipher = cs;
+        return Program.craftState;
+    }
+
+    static void ArmTls13State(TlsEngine e, int state) {
+        e.Step();
+        e.negotiatedVersion = TlsRecord.VersionTls13;
+        e.state = state;
+        e.peerAuthenticated = true;
+    }
+
+    static async void ChainServerLoop(TlsContext tls) {
+        TcpListener l = new TcpListener("127.0.0.1", Program.PORT);
+        l.Start();
+        // 五个连接：tls13 链、tls12 链、显式中间锚、无锚拒绝、错误主机拒绝。
+        for (int n = 0; n < 5; n = n + 1) {
+            nint sock = await l.AcceptAsync();
+            if (sock < 0) { break; }
+            await HandleChainConn(tls, sock);
+            Socket.Close(sock);
+        }
+        l.Stop();
+    }
+
+    static async void HandleChainConn(TlsContext tls, nint sock) {
+        TlsStream s = await TlsStream.AcceptAsync(tls, sock, 10000);
+        if (s == null) {
+            return;
+        }
+        string got = await s.RecvAsync(256);
+        int _w = await s.SendStringAsync("pong:" + got);
+        s.Close();
+    }
+
+    static bool exOk;
+    static int exVersion;
+    static int exChain;
+    static string exReply;
+
+    static async void ChainExchange(TlsContext ctx, string host, string ping) {
+        Program.exOk = false;
+        Program.exVersion = 0;
+        Program.exChain = 0;
+        Program.exReply = "";
+        nint sock = Socket.CreateTcp();
+        Socket.SetNonBlocking(sock);
+        int rc = await Socket.ConnectAsync(sock, "127.0.0.1", Program.PORT, 5000);
+        if (rc != 0) {
+            Socket.Close(sock);
+            return;
+        }
+        TlsStream s = await TlsStream.ConnectAsync(ctx, sock, host, 10000);
+        if (s == null) {
+            Socket.Close(sock);
+            return;
+        }
+        Program.exOk = true;
+        Program.exVersion = s.engine.NegotiatedVersion();
+        Program.exChain = s.engine.peerChain.Count;
+        int _s = await s.SendStringAsync(ping);
+        Program.exReply = await s.RecvAsync(256);
+        s.Close();
+        Socket.Close(sock);
+    }
+
+    static void TestPlaintextRecords() {
+        // 1-byte alert: previously fell through every branch and was ignored.
+        TlsEngine shortAlert = ClientEngine();
+        shortAlert.Step();
+        Feed(shortAlert, Record(TlsRecord.ContentTypeAlert, Bytes1(0)));
+        Check(shortAlert.Step() < 0 && shortAlert.IsClosed(), "1-byte plaintext alert rejected");
+
+        TlsEngine longAlert = ClientEngine();
+        longAlert.Step();
+        Feed(longAlert, Record(TlsRecord.ContentTypeAlert, Bytes3(2, 10, 7)));
+        Check(longAlert.Step() < 0 && longAlert.IsClosed(), "3-byte plaintext alert rejected");
+
+        TlsEngine closeNotify = ClientEngine();
+        closeNotify.Step();
+        Feed(closeNotify, Record(TlsRecord.ContentTypeAlert, Bytes2(1, 0)));
+        closeNotify.Step();
+        Check(closeNotify.IsClosed() && closeNotify.LastError() == "", "2-byte close notify closes cleanly");
+
+        TlsEngine fatal = ClientEngine();
+        fatal.Step();
+        Feed(fatal, Record(TlsRecord.ContentTypeAlert, Bytes2(2, 40)));
+        Check(fatal.Step() < 0 && fatal.IsClosed(), "fatal plaintext alert rejected");
+
+        TlsEngine emptyCcs = ClientEngine();
+        emptyCcs.Step();
+        Feed(emptyCcs, Record(TlsRecord.ContentTypeChangeCipherSpec, new byte[0]));
+        Check(emptyCcs.Step() < 0 && emptyCcs.IsClosed(), "empty ccs rejected");
+
+        TlsEngine twoCcs = ClientEngine();
+        twoCcs.Step();
+        Feed(twoCcs, Record(TlsRecord.ContentTypeChangeCipherSpec, Bytes2(1, 1)));
+        Check(twoCcs.Step() < 0 && twoCcs.IsClosed(), "2-byte ccs rejected");
+
+        TlsEngine valCcs = ClientEngine();
+        valCcs.Step();
+        Feed(valCcs, Record(TlsRecord.ContentTypeChangeCipherSpec, Bytes1(2)));
+        Check(valCcs.Step() < 0 && valCcs.IsClosed(), "ccs with value 2 rejected");
+
+        TlsEngine compat = ClientEngine();
+        compat.Step();
+        Feed(compat, Record(TlsRecord.ContentTypeChangeCipherSpec, Bytes1(1)));
+        compat.Step();
+        Check(!compat.IsClosed() && compat.LastError() == "", "tls13 compat ccs ignored");
+
+        TlsEngine srvCcs = ServerEngine();
+        srvCcs.Step();
+        Feed(srvCcs, Record(TlsRecord.ContentTypeChangeCipherSpec, Bytes1(1)));
+        Check(srvCcs.Step() < 0 && srvCcs.IsClosed(), "ccs before client hello rejected");
+
+        TlsEngine arm = ClientEngine();
+        arm.Step();
+        arm.negotiatedVersion = TlsRecord.VersionTls12;
+        arm.state = TlsEngine.StateTls12WaitingFinished;
+        arm.tls12ServerWriteKey = new byte[16];
+        arm.tls12ServerWriteIv = new byte[12];
+        Feed(arm, Record(TlsRecord.ContentTypeChangeCipherSpec, Bytes1(1)));
+        arm.Step();
+        Check(arm.readCipher != null && !arm.IsClosed(), "tls1.2 ccs arms read cipher");
+        Feed(arm, Record(TlsRecord.ContentTypeChangeCipherSpec, Bytes1(1)));
+        Check(arm.Step() < 0 && arm.IsClosed(), "duplicate ccs rejected");
+
+        TlsEngine noKeys = ClientEngine();
+        noKeys.Step();
+        noKeys.negotiatedVersion = TlsRecord.VersionTls12;
+        noKeys.state = TlsEngine.StateTls12WaitingFinished;
+        Feed(noKeys, Record(TlsRecord.ContentTypeChangeCipherSpec, Bytes1(1)));
+        Check(noKeys.Step() < 0 && noKeys.IsClosed(), "ccs before keys ready rejected");
+
+        TlsEngine keyUpdate = ClientEngine();
+        keyUpdate.Step();
+        keyUpdate.negotiatedVersion = TlsRecord.VersionTls13;
+        keyUpdate.state = TlsEngine.StateTls13Handshake;
+        Feed(keyUpdate, Record(TlsRecord.ContentTypeHandshake, Bytes5(24, 0, 0, 1, 0)));
+        Check(keyUpdate.Step() < 0 && keyUpdate.IsClosed(), "plaintext KeyUpdate rejected");
+
+        TlsEngine big = ClientEngine();
+        big.Step();
+        Feed(big, Bytes5(22, 3, 3, 0x4e, 0x21));
+        Check(big.Step() < 0 && big.IsClosed(), "oversized record length rejected");
+    }
+
+    static void TestEncryptedRecords() {
+        // A 3-byte encrypted alert [1,0,0] used to match the >= 2 close_notify
+        // check and silently close; it must fail closed like any other size.
+        TlsEngine padded = ServerEngine();
+        ArmTls13State(padded, TlsEngine.StateTls13Handshake);
+        TlsCipherState pcs = ArmedCipher(padded);
+        Feed(padded, pcs.Encrypt(TlsRecord.ContentTypeAlert, Bytes3(1, 0, 0), 0, 3));
+        Check(padded.Step() < 0 && padded.IsClosed(), "3-byte encrypted alert rejected");
+
+        TlsEngine fatalEnc = ServerEngine();
+        ArmTls13State(fatalEnc, TlsEngine.StateTls13Handshake);
+        TlsCipherState fcs = ArmedCipher(fatalEnc);
+        Feed(fatalEnc, fcs.Encrypt(TlsRecord.ContentTypeAlert, Bytes2(2, 40), 0, 2));
+        Check(fatalEnc.Step() < 0 && fatalEnc.IsClosed(), "encrypted fatal alert rejected");
+
+        TlsEngine closeEnc = ServerEngine();
+        ArmTls13State(closeEnc, TlsEngine.StateTls13Handshake);
+        TlsCipherState ccs2 = ArmedCipher(closeEnc);
+        Feed(closeEnc, ccs2.Encrypt(TlsRecord.ContentTypeAlert, Bytes2(1, 0), 0, 2));
+        closeEnc.Step();
+        Check(closeEnc.IsClosed() && closeEnc.LastError() == "", "encrypted close notify closes cleanly");
+
+        // Post-auth KeyUpdate: the sender would roll its traffic keys while an
+        // implementation that ignores it keeps the old read keys, so every
+        // later record would fail AEAD. It must be rejected, not skipped.
+        TlsEngine keyUpdate = ServerEngine();
+        ArmTls13State(keyUpdate, TlsEngine.StateConnected);
+        TlsCipherState kcs = ArmedCipher(keyUpdate);
+        byte[] kuMsg = Bytes5(24, 0, 0, 1, 0);
+        Feed(keyUpdate, kcs.Encrypt(TlsRecord.ContentTypeHandshake, kuMsg, 0, 5));
+        Check(keyUpdate.Step() < 0 && keyUpdate.IsClosed(), "post-auth KeyUpdate rejected");
+    }
+
+    static void TestTrustCandidates() {
+        Directory.CreateDirectory("_scratch");
+        File.WriteAllText("_scratch/tb_bad.pem", "this is not a pem bundle");
+        File.WriteAllText("_scratch/tb_broken.pem", "-----BEGIN CERTIFICATE-----\n@@@@\n-----END CERTIFICATE-----\n");
+        File.WriteAllText("_scratch/tb_root.pem", Pem(ROOT_B64));
+        Check(TlsContext.TrustFromCandidates(new string[] { "_scratch/tb_root.pem" }) != null, "valid candidate loads");
+        Check(TlsContext.TrustFromCandidates(new string[] { "_scratch/tb_missing.pem", "_scratch/tb_root.pem" }) != null, "missing candidate skipped");
+        Check(TlsContext.TrustFromCandidates(new string[] { "_scratch/tb_bad.pem", "_scratch/tb_root.pem" }) != null, "corrupt candidate does not block later");
+        Check(TlsContext.TrustFromCandidates(new string[] { "_scratch/tb_broken.pem", "_scratch/tb_root.pem" }) != null, "broken pem does not block later");
+        Check(TlsContext.TrustFromCandidates(new string[] { "_scratch/tb_bad.pem", "_scratch/tb_broken.pem" }) == null, "no usable candidate fails closed");
+        Check(TlsContext.TrustFromCandidates(null) == null, "null candidates fail closed");
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        TestPlaintextRecords();
+        TestEncryptedRecords();
+        TestTrustCandidates();
+
+        Directory.CreateDirectory("_scratch");
+        File.WriteAllText("_scratch/chain_leaf.pem", Pem(LEAF_B64));
+        File.WriteAllText("_scratch/chain_bundle.pem", Pem(LEAF_B64) + Pem(INTER_B64));
+        File.WriteAllText("_scratch/chain_inter.pem", Pem(INTER_B64));
+        File.WriteAllText("_scratch/chain_root.pem", Pem(ROOT_B64));
+        File.WriteAllText("_scratch/chain_key.pem", LEAF_KEY);
+
+        TlsContext chainSrv = TlsContext.CreateServer("_scratch/chain_bundle.pem", "_scratch/chain_key.pem");
+        Check(chainSrv != null && chainSrv.cachedChain != null && chainSrv.cachedChain.Count == 2, "pem chain bundle parsed");
+        if (chainSrv == null || chainSrv.cachedChain == null || chainSrv.cachedChain.Count != 2) {
+            Console.WriteLine("failures=" + Convert.ToString(failures));
+            return;
+        }
+        Check(chainSrv.cachedCert.Subject().IndexOf("chain.example") >= 0, "bundle leaf comes first");
+        Check(!chainSrv.AddTrustedCert("_scratch/chain_bundle.pem"), "leaf cannot become trust anchor");
+        Task.Spawn(ChainServerLoop(chainSrv));
+        await Task.Delay(80);
+
+        TlsContext c13 = TlsContext.CreateClient();
+        Check(c13.AddTrustedCert("_scratch/chain_root.pem"), "chain root loaded");
+        await ChainExchange(c13, "chain.example", "ping13");
+        Check(Program.exOk, "tls13 chain connect ok");
+        Check(Program.exVersion == TlsRecord.VersionTls13, "tls13 chain negotiated");
+        Check(Program.exChain == 2, "server sent leaf and intermediate");
+        Check(Program.exReply == "pong:ping13", "tls13 chain app data roundtrip");
+
+        TlsContext c12 = TlsContext.CreateClient();
+        c12.DisableTls13();
+        Check(c12.AddTrustedCert("_scratch/chain_root.pem"), "chain root loaded for tls12");
+        await ChainExchange(c12, "chain.example", "ping12");
+        Check(Program.exOk, "tls12 chain connect ok");
+        Check(Program.exVersion == TlsRecord.VersionTls12, "tls12 chain negotiated");
+        Check(Program.exChain == 2, "tls12 server sent full chain");
+        Check(Program.exReply == "pong:ping12", "tls12 chain app data roundtrip");
+
+        TlsContext cInter = TlsContext.CreateClient();
+        Check(cInter.AddTrustedCert("_scratch/chain_inter.pem"), "intermediate loaded");
+        await ChainExchange(cInter, "chain.example", "pinginter");
+        Check(Program.exOk, "explicit intermediate anchor accepts chain");
+
+        TlsContext cNone = TlsContext.CreateClient();
+        await ChainExchange(cNone, "chain.example", "pingnone");
+        Check(!Program.exOk, "no explicit anchor refused");
+
+        TlsContext cHost = TlsContext.CreateClient();
+        Check(cHost.AddTrustedCert("_scratch/chain_root.pem"), "root loaded for host check");
+        await ChainExchange(cHost, "other.example", "pinghost");
+        Check(!Program.exOk, "chain with wrong host refused");
+
+        Socket.Cleanup();
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}
