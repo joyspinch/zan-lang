@@ -2587,26 +2587,20 @@ static int pi_close_once(const char *stdlib_root) {
  * parse failure, fall back to the lexical seeding of the same source: the
  * closure must not shrink silently, and the main parse loop reports the
  * error exactly as before. */
-static void pi_parse_and_seed(const char *src, size_t len, int is_entry) {
-    g_scale_stats.throwaway_parses++;
-    zan_arena_t *arena = zan_arena_new();
-    zan_diag_t *diag = zan_diag_new(arena);
-    zan_lexer_t lex;
-    zan_lexer_init(&lex, src, len, 0, arena, diag);
-    zan_apply_lex_defines(&lex, pi_target, pi_pp_defines, pi_pp_define_count,
-                          pi_publish_mode);
-    zan_parser_t p;
-    zan_parser_init(&p, &lex, arena, diag);
-    zan_ast_node_t *unit = zan_parser_parse(&p);
-    int errors = diag ? diag->error_count : 0;
-    zan_diag_free_buffers(diag);
-    if (!unit || errors > 0) {
-        g_scale_stats.throwaway_parse_fallbacks++;
-        pi_seed_source(src, len);
-    } else {
-        /* entry-file usings reach their directories (stdlib files' usings
-         * are reached by the metadata scan); a static using imports a
-         * TYPE's members, so its trailing segment is a type mention */
+/* Seed the live-name worklist and the reached-directory set from one
+ * fully-parsed source (user file, design translation or generator output).
+ * Identifiers become live, with one carve-out: a top-level type declared by
+ * an input file shadows its own name for every unqualified use in user
+ * code, so those mentions do not pull a same-named stdlib file -- otherwise
+ * the customary `class App` template drags in the whole Gui framework via
+ * stdlib Gui.App. Qualified (dotted) mentions still seed, preserving the
+ * rare `Gui.App`-style escapes to the shadowed type.
+ *
+ * The unit is owned by the compiler's main arena (the parse loop ran it);
+ * this only reads it. A file whose parse failed is seeded lexically instead
+ * by the caller (pi_seed_source): the closure must not shrink silently. */
+static void pi_seed_parsed_unit(zan_ast_node_t *unit, int is_entry) {
+    {
         /* Every segment of a `using` directive or the file's own namespace
          * is a namespace root: expression chains rooted at one
          * (`Gui.App.ISqrt`) are qualified mentions and escape a user-declared
@@ -2690,37 +2684,36 @@ static void pi_parse_and_seed(const char *src, size_t len, int is_entry) {
         }
         pi_seed_ast(unit);
     }
-    zan_arena_free(arena);
 }
 
-static void pi_close_all(const char *stdlib_root) {
+static void pi_debug_dump(void) {
+    if (getenv("ZAN_PULLIN_DEBUG") == NULL) return;
+    for (pi_dir_t *d = pi_dirs_head; d; d = d->next)
+        for (int i = 0; i < d->file_count; i++)
+            fprintf(stderr, "[pullin] %s %s (top=%d, idents=%d)\n",
+                    d->files[i].included ? "INCL" : "skip",
+                    d->files[i].path ? d->files[i].path : "(null)",
+                    d->files[i].top_count, d->files[i].ident_count);
+}
+
+static int pi_append_included(const char ***files, int *count, int *cap);
+
+/* Run closure rounds until nothing new is included or reached, appending
+ * every included file to the input list. Parsing happens in the main parse
+ * loop (each file parsed exactly once, with its final input-list index);
+ * this only drives the metadata side. Returns how many files were appended
+ * in total. */
+static int pi_close_converged(const char *stdlib_root, const char ***files,
+                              int *count, int *cap) {
+    int appended = 0;
     for (;;) {
         int changed = pi_close_once(stdlib_root);
-        int seeded = 0;
-        for (pi_dir_t *d = pi_dirs_head; d; d = d->next) {
-            if (!d->reached) pi_process_dir(d, stdlib_root);
-            for (int i = 0; i < d->file_count; i++) {
-                pi_file_t *f = &d->files[i];
-                if (!f->included || f->seeded || !f->path) continue;
-                f->seeded = 1;
-                size_t len = 0;
-                char *src = read_file(f->path, &len);
-                if (!src) continue;
-                pi_parse_and_seed(src, len, 0);
-                free(src);
-                seeded++;
-            }
-        }
-        if (!changed && !seeded) break;
+        int fresh = pi_append_included(files, count, cap);
+        appended += fresh;
+        if (!changed && !fresh) break;
     }
-    if (getenv("ZAN_PULLIN_DEBUG") != NULL) {
-        for (pi_dir_t *d = pi_dirs_head; d; d = d->next)
-            for (int i = 0; i < d->file_count; i++)
-                fprintf(stderr, "[pullin] %s %s (top=%d, idents=%d)\n",
-                        d->files[i].included ? "INCL" : "skip",
-                        d->files[i].path ? d->files[i].path : "(null)",
-                        d->files[i].top_count, d->files[i].ident_count);
-    }
+    pi_debug_dump();
+    return appended;
 }
 
 /* Append every included-but-unparsed file to the compiler's input list.
@@ -2834,6 +2827,14 @@ static zan_ast_node_t *parse_secondary_unit(const char *path,
     size_t slen = 0;
     char *src = read_file(path, &slen);
     if (!src) return NULL;
+    /* zan_diag_add_file() keeps the pointer to render source snippets in
+     * later diagnostics, so the text must outlive this function: copy it
+     * into the arena (reclaimed with zan_arena_free on every exit path)
+     * instead of freeing the heap buffer out from under the diag. */
+    char *heap_src = src;
+    src = zan_arena_strdup(arena, heap_src, slen);
+    free(heap_src);
+    if (!src) return NULL;
     int file_id = diag->file_count;
     zan_diag_add_file(diag, path, src);
     zan_lexer_t lex;
@@ -2843,7 +2844,6 @@ static zan_ast_node_t *parse_secondary_unit(const char *path,
     zan_parser_t parser;
     zan_parser_init(&parser, &lex, arena, diag);
     zan_ast_node_t *unit = zan_parser_parse(&parser);
-    free(src);
     return unit;
 }
 
@@ -4028,6 +4028,10 @@ int main(int argc, char **argv) {
     const char **input_files = NULL;
     int input_count = 0;
     int input_cap = 0;
+    /* Inputs present before the pull-in closure appends stdlib files; they
+     * get the entry-flavored seeding (usings reach directories, static
+     * usings flag their type, top-level types shadow stdlib names). */
+    int explicit_input_count = 0;
     const char *output_file = NULL;
     bool do_dump_tokens = false;
     bool do_dump_ast = false;
@@ -4455,6 +4459,7 @@ int main(int argc, char **argv) {
             (size_t)input_count);
         if (!design_outs) return 1;
         design_count = (size_t)input_count;
+        explicit_input_count = input_count;
 
         /* The IDE symbol index must describe the whole stdlib (a completion
          * suggestion has to exist before any program references it), and
@@ -4470,32 +4475,12 @@ int main(int argc, char **argv) {
             pi_pp_define_count = pp_define_count;
             pi_publish_mode = publish_mode;
             pi_stdlib_root_buf = stdlib_root;
-            for (int fi = 0; fi < input_count; fi++) {
-                /* A saved user component is generator data (consumed inside
-                 * zan_gen_design); its JSON has no identifiers to seed. */
-                if (zan_is_zcomp_path(input_files[fi])) continue;
-                pi_seed_stdlib_input = pi_reach_input_dir(input_files[fi]);
-                size_t slen3 = 0;
-                char *src3 = read_file(input_files[fi], &slen3);
-                if (!src3) continue;
-                char *owned = NULL;
-                if ((size_t)fi < design_count && design_outs[fi]) {
-                    free(src3);
-                    src3 = strdup(design_outs[fi]);
-                    owned = src3;
-                    if (!src3) { fprintf(stderr, "error: out of memory\n"); return 1; }
-                    /* The generated text differs in length from the .html
-                     * that produced it; like the real parse loop, the length
-                     * must track the buffer actually handed to the lexer
-                     * (a stale raw-file length silently truncates). */
-                    slen3 = strlen(src3);
-                }
-                pi_parse_and_seed(src3, slen3, 1);
-                free(owned ? owned : src3);
-            }
-            pi_seed_stdlib_input = 0;
-            pi_close_all(stdlib_root);
-            pi_append_included(&input_files, &input_count, &input_cap);
+            /* Seeding happens in the main parse loop below, right after each
+             * file is parsed (parse-once: the old separate throwaway pass
+             * parsed every included file twice). The closure itself is
+             * interleaved with that loop: each round parses the files
+             * appended so far, then the metadata closure runs and appends
+             * the next batch. */
         } else {
         /* Each file's `using` set never changes, so scan every file exactly
          * once: new files land at the end of the list and the next round picks
@@ -4566,9 +4551,20 @@ int main(int argc, char **argv) {
      * design doc) is a visual
      * design document: it is translated first (formgen) to a synthetic
      * `partial class` -- typed widget fields, __BuildForm, __WireForm and
-     * Main -- which is then parsed and merged exactly like a source file. */
+     * Main -- which is then parsed and merged exactly like a source file.
+     *
+     * With the pull-in filter active this loop is interleaved with the
+     * metadata closure: each round parses the files appended so far and
+     * seeds the live-name worklist from their ASTs, then the closure marks
+     * the next batch of included files and appends them to the input list.
+     * Every file is parsed exactly once, with its final input-list index
+     * (the old design parsed each one twice -- a throwaway pass for
+     * seeding, then again in this loop). */
     zan_ast_node_t *ast = NULL;
-    for (int fi = 0; fi < input_count; fi++) {
+    int scanned = 0;
+    for (;;) {
+        int round_end = input_count;
+    for (int fi = scanned; fi < round_end; fi++) {
         /* A saved user component (.zcomp) is generator data consumed inside
          * zan_gen_design; it projects no Zan declarations of its own. */
         if (fi > 0 && zan_is_zcomp_path(input_files[fi])) continue;
@@ -4643,9 +4639,28 @@ int main(int argc, char **argv) {
         zan_parser_t parser;
         zan_parser_init(&parser, &lex, arena, diag);
 
+        int errors_before = diag->error_count;
         zan_ast_node_t *unit = zan_parser_parse(&parser);
         g_scale_stats.real_parses++;
+        int parse_failed = !unit || diag->error_count > errors_before;
         zan_nsresolve_stamp(unit, arena);
+        /* Seed the live-name worklist from this file's AST (parse-once). A
+         * file whose parse failed is seeded lexically instead: the closure
+         * must not shrink silently, and the error itself is already on the
+         * main diag (reported once, below). */
+        if (pi_filter_active) {
+            int seed_entry = fi < explicit_input_count &&
+                             !zan_is_zcomp_path(input_files[fi]);
+            pi_seed_stdlib_input =
+                seed_entry ? pi_reach_input_dir(input_files[fi]) : 0;
+            if (parse_failed) {
+                g_scale_stats.throwaway_parse_fallbacks++;
+                pi_seed_source(src, slen);
+            } else {
+                pi_seed_parsed_unit(unit, seed_entry);
+            }
+            pi_seed_stdlib_input = 0;
+        }
         /* Mark stdlib-authored declarations so the reachability prune can
          * drop the ones nothing references (see nsresolve.c). A file counts
          * as stdlib when it was auto-included from the stdlib root, not
@@ -4671,6 +4686,23 @@ int main(int argc, char **argv) {
                 zan_ast_list_push(&ast->comp_unit.decls,
                                   unit->comp_unit.decls.items[k], arena);
             if (!ast->comp_unit.ns) ast->comp_unit.ns = unit->comp_unit.ns;
+        }
+    }
+        scanned = round_end;
+        if (pi_filter_active) {
+            /* Metadata closure round: newly seeded names mark more files
+             * for inclusion; their usings reach further directories. The
+             * loop ends when a round neither includes nor appends anything
+             * (everything appended so far has been parsed above). */
+            int changed = pi_close_once(resolved_stdlib_root);
+            int fresh = pi_append_included(&input_files, &input_count,
+                                           &input_cap);
+            if (!changed && !fresh) {
+                pi_debug_dump();
+                break;
+            }
+        } else if (scanned >= input_count) {
+            break;
         }
     }
     free(design_outs); /* entries were moved into `source`/the arena */
@@ -4750,33 +4782,58 @@ int main(int argc, char **argv) {
                 free(gen_texts[gi]);
             }
             free(gen_texts);
-            pi_close_all(resolved_stdlib_root);
-            int fresh = pi_append_included(&input_files, &input_count,
-                                           &input_cap);
-            for (int fi = input_count - fresh; fi < input_count; fi++) {
-                zan_ast_node_t *unit = parse_secondary_unit(
-                    input_files[fi], target, pp_defines, pp_define_count,
-                    publish_mode, arena, diag);
-                if (!unit) {
-                    fprintf(stderr, "error: cannot read '%s'\n",
-                            input_files[fi]);
-                    zan_arena_free(arena);
-                    free(source);
-                    return 1;
+            /* Closure rounds with parse-once seeding: each round parses and
+             * seeds the files it appended (their ASTs may reference further
+             * stdlib files), so the metadata side converges on real
+             * references instead of trusting the generator texts alone. */
+            for (;;) {
+                int changed = pi_close_once(resolved_stdlib_root);
+                int fresh = pi_append_included(&input_files, &input_count,
+                                               &input_cap);
+                if (!changed && !fresh) {
+                    pi_debug_dump();
+                    break;
                 }
-                zan_nsresolve_stamp(unit, arena);
-                if (auto_stdlib && resolved_stdlib_root[0] &&
-                    zan_path_is_under(input_files[fi], resolved_stdlib_root)) {
+                for (int fi = input_count - fresh;
+                     fresh > 0 && fi < input_count; fi++) {
+                    int errors_before = diag->error_count;
+                    zan_ast_node_t *unit = parse_secondary_unit(
+                        input_files[fi], target, pp_defines, pp_define_count,
+                        publish_mode, arena, diag);
+                    if (!unit) {
+                        fprintf(stderr, "error: cannot read '%s'\n",
+                                input_files[fi]);
+                        zan_arena_free(arena);
+                        free(source);
+                        return 1;
+                    }
+                    zan_nsresolve_stamp(unit, arena);
+                    if (diag->error_count > errors_before) {
+                        /* Lexical fallback keeps the closure from shrinking;
+                         * the parse error is already on the main diag. */
+                        g_scale_stats.throwaway_parse_fallbacks++;
+                        size_t flen = 0;
+                        char *fsrc = read_file(input_files[fi], &flen);
+                        if (fsrc) {
+                            pi_seed_source(fsrc, flen);
+                            free(fsrc);
+                        }
+                    } else {
+                        pi_seed_parsed_unit(unit, 0);
+                    }
+                    if (auto_stdlib && resolved_stdlib_root[0] &&
+                        zan_path_is_under(input_files[fi], resolved_stdlib_root)) {
+                        for (int k = 0; k < unit->comp_unit.decls.count; k++)
+                            if (unit->comp_unit.decls.items[k])
+                                unit->comp_unit.decls.items[k]->from_stdlib = 1;
+                    }
+                    for (int k = 0; k < unit->comp_unit.usings.count; k++)
+                        zan_ast_list_push(&ast->comp_unit.usings,
+                                          unit->comp_unit.usings.items[k], arena);
                     for (int k = 0; k < unit->comp_unit.decls.count; k++)
-                        if (unit->comp_unit.decls.items[k])
-                            unit->comp_unit.decls.items[k]->from_stdlib = 1;
+                        zan_ast_list_push(&ast->comp_unit.decls,
+                                          unit->comp_unit.decls.items[k], arena);
                 }
-                for (int k = 0; k < unit->comp_unit.usings.count; k++)
-                    zan_ast_list_push(&ast->comp_unit.usings,
-                                      unit->comp_unit.usings.items[k], arena);
-                for (int k = 0; k < unit->comp_unit.decls.count; k++)
-                    zan_ast_list_push(&ast->comp_unit.decls,
-                                      unit->comp_unit.decls.items[k], arena);
             }
         }
         if (pi_arena) {
