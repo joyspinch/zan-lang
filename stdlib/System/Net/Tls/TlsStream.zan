@@ -31,6 +31,11 @@ class TlsContext {
     List<X509Certificate> trustedCerts;
     X509Certificate cachedCert;
     RsaKey cachedKey;
+    static int MAX_TRUST_BUNDLE_BYTES = 4194304;
+    static int MAX_TRUST_CERT_BYTES = 32768;
+    static int MAX_TRUST_CERTS = 2048;
+    static string PEM_BEGIN = "-----BEGIN CERTIFICATE-----";
+    static string PEM_END = "-----END CERTIFICATE-----";
 
     TlsContext() {
         this.server = false;
@@ -48,15 +53,74 @@ class TlsContext {
         this.cachedKey = null;
     }
 
-    /// <summary>添加信任的 CA 证书（PEM 格式文件）。</summary>
-    bool AddTrustedCert(string pemFile) {
-        X509Certificate cert = X509Certificate.FromPemFile(pemFile);
-        if (cert == null) { return false; }
-        if (this.trustedCerts == null) {
-            this.trustedCerts = new List<X509Certificate>();
+    // Parse the entire bundle before changing the trust list. An invalid or oversized
+    // input must not leave a partly installed set of additional trust anchors.
+    static List<X509Certificate> ParseTrustBundle(string pem, bool strict) {
+        if (pem == null || pem.Length == 0 || pem.Length > MAX_TRUST_BUNDLE_BYTES) { return null; }
+        List<X509Certificate> certs = new List<X509Certificate>();
+        int pos = 0;
+        int seen = 0;
+        while (pos < pem.Length) {
+            int begin = pem.IndexOf(PEM_BEGIN, pos);
+            int anyBegin = pem.IndexOf("-----BEGIN ", pos);
+            if (strict && anyBegin >= 0 && (begin < 0 || anyBegin < begin)) { return null; }
+            if (begin < 0) { break; }
+            seen = seen + 1;
+            int body = begin + PEM_BEGIN.Length;
+            int end = pem.IndexOf(PEM_END, body);
+            int nested = pem.IndexOf("-----BEGIN ", body);
+            if (end < 0 || end - body > MAX_TRUST_CERT_BYTES || seen > MAX_TRUST_CERTS
+                || (nested >= 0 && nested < end)) { return null; }
+            int next = end + PEM_END.Length;
+            // The existing PEM parser accepts any BEGIN/END label. Exact markers above
+            // ensure only certificates reach it; unsupported algorithms are not anchors.
+            X509Certificate cert = X509Certificate.FromPem(pem.Substring(begin, next - begin));
+            if (cert != null && cert.CanSignCertificates()) { certs.Add(cert); }
+            else if (strict) { return null; }
+            pos = next;
         }
-        this.trustedCerts.Add(cert);
+        return certs.Count > 0 ? certs : null;
+    }
+
+    static List<X509Certificate> ReadTrustBundle(string path, bool strict) {
+        if (path == null || !File.Exists(path)) { return null; }
+        try {
+            int size = File.GetSize(path);
+            if (size < 1 || size > MAX_TRUST_BUNDLE_BYTES) { return null; }
+            byte[] raw = File.ReadBytes(path, 0, size + 1);
+            if (raw == null || raw.Length != size) { return null; }
+            return TlsContext.ParseTrustBundle(raw.ToStr(0, raw.Length), strict);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /// <summary>Add every supported CA certificate in a bounded PEM bundle, in addition to defaults.</summary>
+    bool AddTrustedCert(string pemFile) {
+        List<X509Certificate> certs = TlsContext.ReadTrustBundle(pemFile, true);
+        if (certs == null) { return false; }
+        if (this.trustedCerts == null) { this.trustedCerts = new List<X509Certificate>(); }
+        for (int i = 0; i < certs.Count; i = i + 1) { this.trustedCerts.Add(certs[i]); }
         return true;
+    }
+
+    static List<X509Certificate> SystemTrustRoots() {
+        #if LINUX
+        // Linux distributions publish curated trust as a CA bundle; do not crawl
+        // /etc/ssl/certs, which can also contain untrusted local certificates.
+        string[] paths = new string[] {
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/ca-bundle.pem",
+            "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+        };
+        for (int i = 0; i < paths.Length; i = i + 1) {
+            if (File.Exists(paths[i])) { return TlsContext.ReadTrustBundle(paths[i], false); }
+        }
+        #endif
+        // Windows ROOT enumeration does not apply disallowed-store, revocation,
+        // or chain policy; macOS keychain enumeration likewise is not SecTrust.
+        return null;
     }
 
     void SetCertPolicy(CertPolicyFn fn) {
@@ -102,17 +166,16 @@ class TlsContext {
         return c;
     }
 
-    /// <summary>创建客户端 TLS 上下文。默认启用证书与主机名校验。</summary>
+    /// <summary>创建客户端 TLS 上下文；Linux 使用发行版 CA bundle，其他平台需显式添加 CA。</summary>
     static TlsContext CreateClient() {
         TlsContext c = new TlsContext();
-        c.server = false;
+        c.trustedCerts = TlsContext.SystemTrustRoots();
         return c;
     }
 
     /// <summary>创建带客户端证书与私钥的 TLS 上下文（双向认证）。</summary>
     static TlsContext CreateClientWithCertificate(string certFile, string keyFile) {
-        TlsContext c = new TlsContext();
-        c.server = false;
+        TlsContext c = TlsContext.CreateClient();
         c.certFile = certFile;
         c.keyFile = keyFile;
         return c;
@@ -188,6 +251,12 @@ class TlsStream {
     }
 
     static TlsStream Setup(TlsContext ctx, nint sock, string host) {
+        if (ctx == null) { TlsStream.SetLastError("TLS 上下文缺失"); return null; }
+        if (!ctx.server && ctx.verify && ctx.certPolicy == null
+            && (ctx.trustedCerts == null || ctx.trustedCerts.Count == 0)) {
+            TlsStream.SetLastError("TLS 系统信任根不可用；需显式 AddTrustedCert 配置 CA");
+            return null;
+        }
         TlsStream s = new TlsStream();
         s.engine = new TlsEngine(host, !ctx.verify, ctx.disableTls13, ctx.pins, ctx.pinRequired, ctx.certPolicy, ctx.trustedCerts, ctx.server, ctx.certFile, ctx.keyFile);
         s.engine.SetCredentials(ctx.cachedCert, ctx.cachedKey);
@@ -222,7 +291,7 @@ class TlsStream {
         TlsStream.SetLastError("");
         TlsStream s = Setup(ctx, sock, host);
         if (s == null) {
-            TlsStream.SetLastError("TLS 引擎初始化失败");
+            if (TlsStream.LastError() == "") { TlsStream.SetLastError("TLS 引擎初始化失败"); }
             return null;
         }
 
@@ -246,7 +315,7 @@ class TlsStream {
         TlsStream.SetLastError("");
         TlsStream s = TlsStream.SetupStepped(ctx, sock, host);
         if (s == null) {
-            TlsStream.SetLastError("TLS 引擎初始化失败");
+            if (TlsStream.LastError() == "") { TlsStream.SetLastError("TLS 引擎初始化失败"); }
             return null;
         }
         s.engine.StartHandshake();
@@ -257,7 +326,7 @@ class TlsStream {
         TlsStream.SetLastError("");
         TlsStream s = TlsStream.SetupStepped(ctx, sock, "");
         if (s == null) {
-            TlsStream.SetLastError("TLS 引擎初始化失败");
+            if (TlsStream.LastError() == "") { TlsStream.SetLastError("TLS 引擎初始化失败"); }
             return null;
         }
         return s;

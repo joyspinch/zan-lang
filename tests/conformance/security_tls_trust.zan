@@ -1,0 +1,66 @@
+using System;
+using System.IO;
+using System.Net.Tls;
+using System.Security.Cryptography;
+
+class Program {
+    static int failures = 0;
+    static string CA = "-----BEGIN CERTIFICATE-----\n"
+        + "MIIDDTCCAfWgAwIBAgIUb/bsPNHjOsVxStVQV+eCJLvKtSEwDQYJKoZIhvcNAQEL\n"
+        + "BQAwFjEUMBIGA1UEAwwLWmFuIFRlc3QgQ0EwHhcNMjYwODA2MTcxMTI0WhcNMzYw\n"
+        + "ODAzMTcxMTI0WjAWMRQwEgYDVQQDDAtaYW4gVGVzdCBDQTCCASIwDQYJKoZIhvcN\n"
+        + "AQEBBQADggEPADCCAQoCggEBAK0xBdnDn6QVIaiCyPqPM3TDnomvnz3XrwUG54Kj\n"
+        + "13vQfAbuxcg/0zkrr/yxOxJRcnkh4TPzm6i98ITem6kqw7ApO7XPXBOhe/Z5OdOp\n"
+        + "ouBnQMcxgo9CqOKSqfJ9YoYdOrTxve/SiO0AHjEKaDLph8GsPynGEHftr9uRZm9H\n"
+        + "qn08QjJDxtDiyn9xil+7ZMj1eNQuvKMDRTIgO4f37+JbIFRYoaZ8Zu2aRyf05Can\n"
+        + "SyC6/g912iOgr3NS1JQuAQAe5+lAZrLgi3EAW3S4mjFJCfJpBngzC+wIuzJTFxCA\n"
+        + "wsA+PmQtPE1g8c+L24cZxfPzT0BedYH1jbu+HSz2VbUTbVUCAwEAAaNTMFEwHQYD\n"
+        + "VR0OBBYEFJ4qKfHGlmX+d/aJQBMFLs6jiEWUMB8GA1UdIwQYMBaAFJ4qKfHGlmX+\n"
+        + "d/aJQBMFLs6jiEWUMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEB\n"
+        + "AAwPQAF56rKoGJ1d5bdAP/IqpNoRwKcUL/tbNMDxaLCV29/RvXTK5pneOB2YnyHd\n"
+        + "RSUu+OBqc/KOl8f2WMmGWU+XpIHunBO9sikazAEy4TZQTob47nlI7s4x9Q3OETRm\n"
+        + "S1FGeF2lLwcjD5qXrWNLKxP5ZLz7dmlk2qii6pEym1huaQy4352UY5WheS9ofTl0\n"
+        + "JA4PFXhJqJLMFSrbz5IY00N3QPou99EWh9AFcaxksCOajtp7drG/VZEegDhhAGWa\n"
+        + "iJHZaakLuy1uXinh9EpHxOuJ43+TmW+JN7ktlPXML0PFl+DubwDtmnux6fOdRM89\n"
+        + "XyzocGB8jnk9l+9BX6qY1rU=\n"
+        + "-----END CERTIFICATE-----\n";
+
+    static void Check(bool ok, string label) {
+        if (ok) { Console.WriteLine("ok " + label); }
+        else { Console.WriteLine("FAIL " + label); failures = failures + 1; }
+    }
+
+    static void Main() {
+        X509Certificate cert = X509Certificate.FromPem(CA);
+        Check(cert != null && cert.CanSignCertificates(), "test CA valid");
+        TlsContext ctx = TlsContext.CreateClient();
+        Check(ctx.verify && !ctx.server, "verified client defaults");
+        #if WINDOWS
+        Check(ctx.trustedCerts == null, "Windows has no unsafe ROOT-store fallback");
+        #endif
+        #if MACOS
+        Check(ctx.trustedCerts == null, "macOS has no unsafe keychain fallback");
+        #endif
+        Directory.CreateDirectory("_scratch");
+        string path = "_scratch/security_tls_trust.pem";
+        File.WriteAllText(path, CA + CA);
+        int before = ctx.trustedCerts == null ? 0 : ctx.trustedCerts.Count;
+        Check(ctx.AddTrustedCert(path) && ctx.trustedCerts.Count == before + 2,
+            "multi-PEM adds both CA certificates to existing roots");
+        File.WriteAllText(path, CA + "-----BEGIN CERTIFICATE-----\nBAD\n-----END CERTIFICATE-----\n");
+        Check(!ctx.AddTrustedCert(path) && ctx.trustedCerts.Count == before + 2,
+            "malformed explicit PEM bundle is atomic");
+        File.WriteAllText(path, CA + "-----BEGIN CERTIFICATE-----\n" + CA);
+        Check(!ctx.AddTrustedCert(path) && ctx.trustedCerts.Count == before + 2,
+            "nested PEM is rejected");
+        File.WriteAllText(path, CA + "-----BEGIN PRIVATE KEY-----\nBAD\n-----END PRIVATE KEY-----\n");
+        Check(!ctx.AddTrustedCert(path) && ctx.trustedCerts.Count == before + 2,
+            "explicit PEM rejects other key types");
+        byte[] oversized = new byte[4200000];
+        File.WriteAllBytes(path, oversized);
+        Check(!ctx.AddTrustedCert(path) && ctx.trustedCerts.Count == before + 2,
+            "oversize PEM rejected before allocation");
+        File.Delete(path);
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+    }
+}
