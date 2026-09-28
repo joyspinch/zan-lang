@@ -1728,6 +1728,59 @@ static zan_symbol_t *checker_find_method_argc(zan_symbol_t *type_sym,
     return fallback;
 }
 
+/* Match concrete argument types after checking each argument once. Irgen
+ * ranks same-arity overloads by argument type, while the arity-only lookup
+ * above is still needed as a fallback for unresolved/generic expressions.
+ * Keep declaration order on ties, with non-params methods preferred. */
+static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
+                                                zan_symbol_t *type_sym,
+                                                zan_istr_t name,
+                                                zan_ast_node_t *call,
+                                                zan_type_t **args) {
+    zan_symbol_t *best = NULL;
+    int best_score = -1;
+    int argc = call->call.args.count;
+    for (zan_symbol_t *s = type_sym; s;
+         s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
+        for (int i = 0; i < s->member_count; i++) {
+            zan_symbol_t *m = s->members[i];
+            if (!m || m->kind != SYM_METHOD || m->name.len != name.len ||
+                memcmp(m->name.str, name.str, (size_t)name.len) != 0 ||
+                !method_accepts_argc(m, argc)) continue;
+            zan_ast_list_t *ps = &m->decl->method_decl.params;
+            int score = 0;
+            bool compatible = true;
+            for (int j = 0; j < argc && j < ps->count; j++) {
+                zan_ast_node_t *arg = call->call.args.items[j];
+                if (!arg || arg->kind == AST_NAMED_ARG ||
+                    arg->kind == AST_REF_ARG) continue;
+                zan_ast_node_t *param = ps->items[j];
+                if (!param || param->kind != AST_PARAM) continue;
+                zan_type_t *pt = zan_binder_resolve_type(c->binder, param->param.type);
+                if (param->param.is_params && pt && pt->kind == TYPE_ARRAY)
+                    pt = pt->element_type;
+                zan_type_t *at = args[j];
+                if (!pt || !at || pt->kind == TYPE_ERROR ||
+                    at->kind == TYPE_ERROR || pt->kind == TYPE_TYPE_PARAM ||
+                    at->kind == TYPE_TYPE_PARAM) continue;
+                if (checker_type_equal(pt, at)) { score += 4; continue; }
+                if (checker_type_assignable(pt, at)) { score += 1; continue; }
+                if (checker_has_user_conversion(c, pt, at)) continue;
+                compatible = false;
+                break;
+            }
+            if (!compatible) continue;
+            if (score > best_score ||
+                (score == best_score && best &&
+                 method_is_params_tail(best) && !method_is_params_tail(m))) {
+                best = m;
+                best_score = score;
+            }
+        }
+    }
+    return best ? best : checker_find_method_argc(type_sym, name, argc);
+}
+
 /* Reject a call that passes the wrong number of arguments. Without this the
  * mismatch survived every source-level phase and only turned up as an LLVM
  * verifier failure ("Incorrect number of arguments passed to called
@@ -2672,7 +2725,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
          * the delegate's return type. The member-access case is resolved here
          * so the two are not conflated. */
         int callee_is_method = 0;
+        bool typed_overload_changed = false;
         zan_symbol_t *called_sym = NULL;
+        int argc = expr->call.args.count;
+        zan_type_t **arg_types = argc > 0 ? (zan_type_t **)zan_arena_alloc(
+            c->arena, (size_t)argc * sizeof(zan_type_t *)) : NULL;
         /* EnumType.TryParse(text, out value): a compiler-lowered static over
          * the enum's declaration-order name table. The enum carries no method
          * symbol for the generic member path to find, so resolve it here and
@@ -2723,6 +2780,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             zan_ast_node_t *arg = expr->call.args.items[i];
             if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
             zan_type_t *arg_type = zan_checker_check_expr(c, arg);
+            arg_types[i] = arg_type;
             /* An async call passed as an argument is the spawn idiom
              * (Task.Spawn(Work(n))): the Task.Spawn/Task.Run builtins lower
              * a void call arg to a coroutine, so they are the one legal
@@ -2741,30 +2799,35 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (arg_sig && arg)
                 check_call_arg_type(c, arg_sig, i, arg, arg_type);
         }
+        /* Resolve same-arity overloads from the checked argument types too:
+         * the arity-only candidate above can have a different return type. */
+        if (callee_is_method && recv && recv->sym) {
+            zan_symbol_t *typed = checker_find_method_typed(c, recv->sym,
+                expr->call.callee->member.name, expr, arg_types);
+            if (typed && typed != called_sym) {
+                if (!access_member_allowed(c, typed)) {
+                    report_inaccessible(c, typed, expr->call.callee->loc);
+                    return c->binder->type_error;
+                }
+                called_sym = typed;
+                typed_overload_changed = true;
+                callee_type = typed->type ? typed->type : c->binder->type_error;
+            }
+        }
         /* Published after the arguments are checked (they are calls too), so a
          * member access on this call reads *this* call's callee. */
         if (!called_sym && expr->call.callee &&
             expr->call.callee->kind == AST_IDENTIFIER)
             called_sym = zan_binder_lookup(c->binder, expr->call.callee->ident.name);
-        /* A same-class call by bare name, on an overloaded method. The scope
-         * lookup (and checker_find_method below it) hands back the
-         * first-declared method of that name whatever the argument count, so a
-         * call that cannot possibly invoke it is re-resolved by arity against
-         * the enclosing type -- otherwise the call is typed by an overload the
-         * emitted code does not call (`Label StatCell(row, kw, cls, v, left)`
-         * rejected because the first-declared `Panel StatCell(label, value,
-         * cls)` does not take five arguments). A symbol the lookup found that
-         * does accept the count, or one that is not a method at all (a
-         * delegate-typed local shadowing the name), is left alone, and the
-         * re-resolution only overwrites when it actually found something. */
+        /* A bare call binds a local/delegate first, otherwise use the same
+         * typed overload selection as an explicit receiver. Scope lookup by
+         * name or arity alone can give a different return type from irgen. */
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER &&
             c->current_type_sym &&
-            (!called_sym || (called_sym->kind == SYM_METHOD &&
-                             !method_accepts_argc(called_sym,
-                                                  expr->call.args.count)))) {
-            zan_symbol_t *resolved = checker_find_method_argc(
+            (!called_sym || called_sym->kind == SYM_METHOD)) {
+            zan_symbol_t *resolved = checker_find_method_typed(c,
                 c->current_type_sym, expr->call.callee->ident.name,
-                expr->call.args.count);
+                expr, arg_types);
             if (resolved) called_sym = resolved;
         }
         c->last_call_node = expr;
@@ -2822,6 +2885,17 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 }
                 return c->binder->type_void; /* explicit void return */
             }
+        }
+        /* The overload chosen from concrete arguments has a known return type,
+         * even when the name is shared with another same-arity method. */
+        if (typed_overload_changed && called_sym && called_sym->decl &&
+            called_sym->decl->kind == AST_METHOD_DECL) {
+            zan_ast_node_t *m = called_sym->decl;
+            zan_type_t *ret = m->method_decl.return_type
+                ? zan_binder_resolve_type(c->binder, m->method_decl.return_type)
+                : c->binder->type_void;
+            no_runtime_warn_arc_return(c, expr, ret);
+            return ret;
         }
         /* Resolved call of a uniquely-named method (`obj.M(...)`,
          * `Type.S(...)`, or a same-class call by bare name): typed by the

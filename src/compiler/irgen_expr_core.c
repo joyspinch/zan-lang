@@ -2160,7 +2160,13 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
              * that fluent chains a.M1().M2().M3() infer at any depth. */
             zan_type_t *rt = infer_expr_type(g, obj, locals);
             if (rt && rt->sym) {
-                zan_symbol_t *m = get_method_sym(rt->sym, callee->member.name);
+                /* Lowering resolves same-arity methods by argument types.
+                 * Inferring a call from the first method with this name gives
+                 * await/ARC the wrong carrier (a class pointer instead of the
+                 * selected async string), even if the checker types it right. */
+                zan_symbol_t *m = resolve_overload_typed(g, rt->sym,
+                    callee->member.name, e, locals);
+                if (!m) m = get_method_sym(rt->sym, callee->member.name);
                 if (m) {
                     /* a method returning a type parameter returns the
                      * receiver's type argument: Acc<Node>.Get() is a Node, so
