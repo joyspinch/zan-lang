@@ -11,12 +11,14 @@ class Program {
     static void Check(bool ok, string name) {
         if (!ok) { Program.failures = Program.failures + 1; Console.WriteLine("FAIL " + name); }
     }
-    /* 设计器行来自非空字符串列，夹具同构：未配置的 dict/rel 字段是空串不是 null。 */
+    /* 设计器行来自非空字符串列，夹具同构：未配置的文本字段是空串不是 null。 */
     static SysGenColumn Blank(SysGenColumn c) {
         c.dictType = "";
         c.relTable = "";
         c.relValue = "";
         c.relLabel = "";
+        c.filterOp = "";
+        c.listWidth = "";
         c.defValue = "";
         return c;
     }
@@ -31,6 +33,9 @@ class Program {
         t.title = "Quoted \"title\" & <script>\nsecond";
         t.orderColumn = "name";
         t.orderDesc = 0;
+        t.pageSize = 50;
+        t.frontEnabled = 1;
+        t.apiEnabled = 0;
         List<SysGenColumn> cols = new List<SysGenColumn>();
         SysGenColumn name = Program.Blank(new SysGenColumn());
         name.name = "name";
@@ -43,15 +48,17 @@ class Program {
         name.inCreate = 1;
         name.required = 1;
         cols.Add(name);
-        SysGenColumn enabled = Program.Blank(new SysGenColumn());
-        enabled.name = "enabled";
-        enabled.kind = "bool";
-        enabled.widget = "switch";
-        enabled.label = "On & Off";
-        enabled.inList = 1;
-        enabled.inFilter = 1;
-        enabled.inEdit = 1;
-        cols.Add(enabled);
+        SysGenColumn code = Program.Blank(new SysGenColumn());
+        code.name = "code";
+        code.kind = "string";
+        code.size = 40;
+        code.label = "Code";
+        code.widget = "text";
+        code.filterOp = "eq";
+        code.listWidth = "120px";
+        code.inList = 1;
+        code.inFilter = 1;
+        cols.Add(code);
         /* 字符串且可编辑：表单回填走 d.Set("x", e.x) 发射支路（曾多发一个引号）。 */
         SysGenColumn remark = Program.Blank(new SysGenColumn());
         remark.name = "remark";
@@ -92,43 +99,57 @@ class Program {
         otherId.inEdit = 1;
         otherId.inFilter = 1;
         cols.Add(otherId);
+        /* enabled 排在 inList 第四，让 meta 前三是 name/code/otherId；bool
+           名命中发布过滤列（published/status/enabled）。 */
+        SysGenColumn enabled = Program.Blank(new SysGenColumn());
+        enabled.name = "enabled";
+        enabled.kind = "bool";
+        enabled.widget = "switch";
+        enabled.label = "On & Off";
+        enabled.inList = 1;
+        enabled.inFilter = 1;
+        enabled.inEdit = 1;
+        cols.Add(enabled);
         SysGenColumn qty = Program.Blank(new SysGenColumn());
         qty.name = "qty";
         qty.kind = "int";
         qty.label = "Qty";
         qty.widget = "number";
+        qty.filterOp = "range";
+        qty.inFilter = 1;
         qty.inEdit = 1;
         qty.required = 1;
         cols.Add(qty);
         Program.Check(Gen.Valid(t, cols), "valid sample");
-        List<string> designed = new List<string>();
-        designed.Add("gen_other");
-        List<string> paths = new List<string>();
-        paths.Add(root + "/GenSample.zan");
-        paths.Add(root + "/GenSampleController.zan");
-        paths.Add(root + "/GenSampleDao.zan");
-        paths.Add(root + "/GenSampleController.Index.html");
-        paths.Add(root + "/GenSampleController.Form.html");
-        paths.Add(root + "/GenSampleFrontController.zan");
-        paths.Add(root + "/GenSampleFrontController.Index.html");
-        paths.Add(root + "/GenSampleFrontController.Show.html");
+        /* TargetPaths 的目录布局（WriteSources 要往里写文件）。 */
+        Directory.CreateDirectoryRecursive(root + "/src/Model/Gen");
+        Directory.CreateDirectoryRecursive(root + "/src/Controller/Admin");
+        Directory.CreateDirectoryRecursive(root + "/src/Controller/Api");
+        Directory.CreateDirectoryRecursive(root + "/src/Controller/Front");
+        Directory.CreateDirectoryRecursive(root + "/src/Dao/Gen");
+        Directory.CreateDirectoryRecursive(root + "/views/Admin");
+        Directory.CreateDirectoryRecursive(root + "/views/Front");
+        /* designed 是设计行本身：Pick 需要关联表的路由（section/tableName）。 */
+        List<SysGenTable> designed = new List<SysGenTable>();
+        SysGenTable other = new SysGenTable();
+        other.tableName = "gen_other";
+        other.entityName = "GenOther";
+        other.section = "content";
+        other.title = "Other";
+        designed.Add(other);
+        designed.Add(t);
+        List<string> paths = CoderController.TargetPaths(t, root);
+        Program.Check(paths.Count == 8, "default 8 targets");
         for (int i = 0; i < paths.Count; i = i + 1) {
             if (File.Exists(paths[i])) { File.Delete(paths[i]); }
         }
-        List<string> sources = new List<string>();
-        sources.Add(Gen.ModelSource(t, cols));
-        sources.Add(Gen.ControllerSource(t, cols, designed));
-        sources.Add(Gen.DaoSource(t, cols));
-        sources.Add(Gen.ListViewSource(t, cols));
-        sources.Add(Gen.FormViewSource(t, cols, designed));
-        sources.Add(Gen.FrontControllerSource(t, cols));
-        sources.Add(Gen.FrontListViewSource(t, cols));
-        sources.Add(Gen.FrontShowViewSource(t, cols));
+        List<string> sources = CoderController.SourceList(t, cols, designed);
+        Program.Check(sources.Count == 8, "default 8 sources");
         Program.Check(sources[0].Contains("&lt;/summary&gt; private void Hack()"), "comment single line");
         Program.Check(sources[1].Contains("Quoted \\\"title\\\""), "string literal escaped");
         Program.Check(sources[1].Contains("if (id == 0) {"), "create-only input guarded");
         Program.Check(sources[1].Contains("if (id > 0) {"), "edit-only input guarded");
-        Program.Check(sources[1].Contains(".EditFields(\"enabled:text,remark:text,qty:int\")")
+        Program.Check(sources[1].Contains(".EditFields(\"remark:text,enabled:text,qty:int\")")
             && !sources[1].Contains(".EditFields(\"name:"), "create-only field not editable");
         Program.Check(!sources[1].Contains(".EditFields(\"day:")
             && !sources[1].Contains(".EditFields(\"state:")
@@ -141,17 +162,18 @@ class Program {
         Program.Check(sources[2].Contains("db.Select<GenSample>()")
             && sources[2].Contains("ExecuteIdentityAsync()"), "dao uses ORM API surface");
         Program.Check(sources[5].Contains("WhereIf(kw.Length > 0")
-            && sources[5].Contains(".Read(id)"), "front controller keeps ORM lowering shapes");
+            && sources[5].Contains(".FirstAsync()"), "front controller keeps ORM lowering shapes");
         Program.Check(sources[1].Contains("d.Set(\"remark\", e.remark);")
             && !sources[1].Contains("e.remark\""),
             "string edit form fill emits valid call");
         Program.Check(sources[5].Contains("d.Set(\"remark\", e.remark);"),
             "front show emits valid member call");
-        /* 设计器排序配置落地：Paged 默认列 + 两条查询链的 OrderBy 方向。 */
-        Program.Check(sources[1].Contains("this.Paged(\"name\", 20)")
-            && sources[1].Contains(".OrderBy(a => a.name)"), "admin order from design");
+        /* 设计器排序/页大小配置落地：Paged 列与页大小 + 两条查询链的 OrderBy 方向。 */
+        Program.Check(sources[1].Contains("this.Paged(\"name\", 50)")
+            && sources[1].Contains(".OrderBy(a => a.name)"), "admin order and page size from design");
         Program.Check(sources[5].Contains(".OrderBy(a => a.name)"), "front order from design");
-        /* inFilter 接线：Screen 声明筛选原语，Index 发射对齐 Collect 语义的 WhereIf。 */
+        /* inFilter 接线：Screen 声明筛选原语，Index 发射对齐 Collect 语义的 WhereIf；
+           filterOp 消费——auto(文本 LIKE)、eq(精确)、range(数值区间)。 */
         Program.Check(sources[1].Contains("async ListPage Screen()")
             && sources[1].Contains("ListPage lp = await this.Screen();")
             && sources[1].Contains("lp.Collect(this)"), "screen is instance-fed");
@@ -159,6 +181,16 @@ class Program {
             "string filter primitive");
         Program.Check(sources[1].Contains(".Time(\"Day\""), "datetime filter primitive");
         Program.Check(sources[1].Contains(".Select(\""), "select filter primitive");
+        Program.Check(sources[1].Contains(".Text(\"Code\", \"code\", \"code\", \"Code 精确值\")"),
+            "eq filter primitive");
+        Program.Check(sources[1].Contains("WhereIf(fcode.Length > 0, a => a.code == fcode)"),
+            "eq filter where");
+        Program.Check(sources[1].Contains(".Text(\"Qty 从\", \"qtyFrom\", \"qty\", \"Qty 下限\")")
+            && sources[1].Contains(".Text(\"Qty 到\", \"qtyTo\", \"qty\", \"Qty 上限\")"),
+            "range filter primitives");
+        Program.Check(sources[1].Contains("WhereIf(fqtyFR.Length > 0, a => a.qty >= fqtyF)")
+            && sources[1].Contains("WhereIf(fqtyTR.Length > 0, a => a.qty <= fqtyT)"),
+            "range filter where");
         Program.Check(sources[1].Contains("Fmt.ParseDay(this.InAny(\"dayFrom\")"),
             "datetime filter locals");
         Program.Check(sources[1].Contains("WhereIf(fname.Length > 0, a => a.name.Contains(fname))"),
@@ -172,6 +204,21 @@ class Program {
             "dict filter where");
         Program.Check(sources[1].Contains("WhereIf(fotherIdN >= 0, a => a.otherId == fotherIdN)"),
             "rel filter where");
+        /* 每表 options 端点（data-pick 契约）+ 关联筛选升级为远程搜索。 */
+        Program.Check(sources[1].Contains("async void Options()")
+            && sources[1].Contains("WhereContains(\"name\", kw)")
+            && sources[1].Contains(".OrderBy(\"name\").Limit(20)")
+            && sources[1].Contains("this.Ctx().Api(Codes.Ok, \"ok\", arr.ToJson())"),
+            "options endpoint contract");
+        Program.Check(sources[1].Contains(".Pick(\"Other\", \"otherId\", \"otherId\", \"/admin/content/genother/options\")"),
+            "rel filter is remote pick");
+        Program.Check(!sources[1].Contains(".Select(\"Other\", \"otherId\""),
+            "rel filter no longer a fed select");
+        /* 列宽配置：显式 120px 生效，未配置的按类型默认。 */
+        Program.Check(sources[1].Contains(".Col(\"code\", \"Code\", \"text\", \"120px\")"),
+            "list width from design");
+        Program.Check(sources[1].Contains(".Col(\"otherIdName\", \"Other\", \"text\", \"90px\")"),
+            "list width default kept");
         /* 字典/关联：运行时选项预载、保存校验、关联标签投影。 */
         Program.Check(sources[1].Contains("ByTypeCodeActive(\"gen_state\")"),
             "dict options loaded at runtime");
@@ -202,6 +249,23 @@ class Program {
             && sources[4].Contains("{{#if stateNone}}"), "select view consumes fed options");
         Program.Check(sources[4].Contains("type=\"date\" name=\"day\""), "datetime widget is date input");
         Program.Check(sources[4].Contains("{{#each otherIdOpts}}"), "rel select view consumes fed options");
+        /* 生成时间戳：可辨识产物新旧。 */
+        Program.Check(sources[0].StartsWith("/* 由表设计器生成于 ")
+            && sources[3].StartsWith("<!-- 由表设计器生成于 "), "generation timestamp headers");
+        /* 前台加富：发布过滤（enabled 命中）、SEO meta、关联标签进列表与详情。 */
+        Program.Check(sources[5].Contains(".Where(a => a.enabled == 1)"),
+            "front publish filter");
+        Program.Check(sources[5].Contains(".Where(a => a.id == id).Where(a => a.enabled == 1).FirstAsync()"),
+            "front show hides unpublished");
+        Program.Check(sources[5].Contains("d.Set(\"ogTitle\", e.name);")
+            && sources[5].Contains("d.Set(\"ogUrl\", siteUrl + \"/gen_sample/\""),
+            "front show SEO meta");
+        Program.Check(sources[5].Contains("items[i].Set(\"otherIdName\","),
+            "front list rel label projection");
+        Program.Check(sources[6].Contains("{{#if otherIdName}}<span>{{otherIdName}}</span>{{/if}}"),
+            "front list meta shows rel label");
+        Program.Check(sources[7].Contains("{{#if otherIdName}}<div class=\"gen-fact\">"),
+            "front show facts show rel label");
         CoderController.WriteSources(paths, sources, false);
         for (int i = 0; i < paths.Count; i = i + 1) {
             Program.Check(File.Exists(paths[i]) && File.ReadAllText(paths[i]) == sources[i], "published " + Convert.ToString(i));
@@ -215,6 +279,38 @@ class Program {
         }
         CoderController.WriteSources(paths, replaced, true);
         Program.Check(File.ReadAllText(paths[0]) == replaced[0], "force overwrite publishes");
+        /* apiEnabled=1：第 9 文件 JSON 接口（Grant+View，Query 同款筛选 + Detail）。 */
+        t.apiEnabled = 1;
+        List<string> apiPaths = CoderController.TargetPaths(t, root);
+        List<string> apiSources = CoderController.SourceList(t, cols, designed);
+        Program.Check(apiPaths.Count == 9 && apiSources.Count == 9, "api adds ninth file");
+        Program.Check(apiPaths[5] == root + "/src/Controller/Api/GenSampleApiController.zan",
+            "api file path");
+        string api = apiSources[5];
+        Program.Check(api.Contains("class GenSampleApiController : ApiController")
+            && api.Contains("[Route(\"api/gen/gensample/[action]\")]")
+            && api.Contains("CustomAuthorization.Grant")
+            && api.Contains("[Custom(Perm = PermBit.View)]"), "api controller shape");
+        Program.Check(api.Contains("async void Query()") && api.Contains("async void Detail()"),
+            "api query and detail");
+        Program.Check(api.Contains("WhereIf(fcode.Length > 0, a => a.code == fcode)")
+            && api.Contains("WhereIf(fqtyFR.Length > 0, a => a.qty >= fqtyF)"),
+            "api query carries same filters");
+        Program.Check(api.Contains("this.Fail(404, \"0404\", \"记录不存在\")")
+            && api.Contains("outp.Put(\"total\", JsonValue.NewNum(Convert.ToString(total)))")
+            && api.Contains("o.Put(\"name\", JsonValue.NewStr(rows[i].name))")
+            && api.Contains("o.Put(\"qty\", JsonValue.NewNum(Convert.ToString(rows[i].qty)))")
+            && api.Contains("this.Ok(outp.ToJson())"), "api json projection");
+        Program.Check(api.Contains(".Skip((page - 1) * 50).Take(50)"), "api page size clamped from design");
+        /* frontEnabled=0：前台三件退出，apiEnabled=0 时只剩 5 件。 */
+        t.frontEnabled = 0;
+        Program.Check(CoderController.TargetPaths(t, root).Count == 6
+            && CoderController.SourceList(t, cols, designed).Count == 6, "front off drops three files");
+        t.apiEnabled = 0;
+        Program.Check(CoderController.TargetPaths(t, root).Count == 5
+            && CoderController.SourceList(t, cols, designed).Count == 5, "both off leaves five files");
+        t.apiEnabled = 1;
+        t.frontEnabled = 1;
         List<string> blocked = new List<string>();
         blocked.Add(root + "/rollback-first.zan");
         blocked.Add(paths[0]);
@@ -234,6 +330,6 @@ class Program {
             if (File.Exists(paths[i])) { File.Delete(paths[i]); }
         }
         if (Program.failures != 0) { Environment.Exit(1); }
-        Console.WriteLine("PASS generator sources (8 files)");
+        Console.WriteLine("PASS generator sources");
     }
 }

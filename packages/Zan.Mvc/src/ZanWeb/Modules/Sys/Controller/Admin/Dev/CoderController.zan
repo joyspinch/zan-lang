@@ -53,6 +53,8 @@ class CoderController : AdminController {
         d.Set("dialogTitle", "新建数据表");
         d.Set("section", "content");
         d.Set("apiChecked", "checked");
+        d.Set("pageSize", "20");
+        d.Set("frontValue", "1");
         if (id > 0) {
             SysGenTable t = await this.SysGenTable.ById(id);
             if (t == null) { this.Fail(404, "0404", "设计不存在"); }
@@ -63,6 +65,9 @@ class CoderController : AdminController {
             d.Set("section", t.section);
             d.Set("apiChecked", "");
             if (t.apiEnabled == 1) { d.Set("apiChecked", "checked"); }
+            d.Set("pageSize", Convert.ToString(t.pageSize > 0 ? t.pageSize : 20));
+            d.Set("frontValue", t.frontEnabled != 0 ? "1" : "0");
+            d.Set("labelColumn", t.labelColumn);
         }
         this.Dialog(d);
     }
@@ -95,6 +100,15 @@ class CoderController : AdminController {
         if (!Gen.Safe(section)) { section = "content"; }
         int api = 0;
         if (this.In("apiEnabled") == "1") { api = 1; }
+        /* 下拉显式二值，避免「缺省=关」歧义；页大小在保存与生成两处都钳。 */
+        int front = this.In("frontEnabled") == "0" ? 0 : 1;
+        int pageSize = this.InInt("pageSize", 20);
+        if (pageSize <= 0) { pageSize = 20; }
+        if (pageSize > 200) { pageSize = 200; }
+        string labelColumn = this.In("labelColumn").Trim();
+        if (labelColumn.Length > 0 && !Gen.SafeCode(labelColumn)) {
+            this.Fail(400, "0004", "标签列不是安全的字段名");
+        }
 
         SysGenTable clash = await this.SysGenTable
             .Where(a => a.tableName == tableName).FirstAsync();
@@ -112,6 +126,9 @@ class CoderController : AdminController {
                 .Set(a => a.entityName, entityName)
                 .Set(a => a.title, title)
                 .Set(a => a.section, section)
+                .Set(a => a.pageSize, pageSize)
+                .Set(a => a.frontEnabled, front)
+                .Set(a => a.labelColumn, labelColumn)
                 .Set(a => a.apiEnabled, api)
                 .Set(a => a.updatedAt, WebApp.NowSeconds())
                 .Where(a => a.id == id).ExecuteAffrowsAsync();
@@ -126,6 +143,9 @@ class CoderController : AdminController {
         t.section = section;
         t.orderColumn = "id";
         t.orderDesc = 1;
+        t.pageSize = pageSize;
+        t.frontEnabled = front;
+        t.labelColumn = labelColumn;
         t.apiEnabled = api;
         t.migrated = 0;
         t.createdAt = WebApp.NowSeconds();
@@ -205,6 +225,7 @@ class CoderController : AdminController {
         d.Set("dialogTitle", "新增字段");
         d.Set("size", "255");
         d.Set("sortOrder", "10");
+        d.Set("filterOpValue", "auto");
         d.Set("inListChecked", "checked");
         d.Set("inCreateChecked", "checked");
         d.Set("inEditChecked", "checked");
@@ -223,6 +244,8 @@ class CoderController : AdminController {
             d.Set("relTable", c.relTable);
             d.Set("relValue", c.relValue);
             d.Set("relLabel", c.relLabel);
+            d.Set("filterOpValue", c.filterOp.Length > 0 ? c.filterOp : "auto");
+            d.Set("listWidth", c.listWidth);
             d.Set("sortOrder", Convert.ToString(c.sortOrder));
             d.Set("inListChecked", CoderController.Checked(c.inList));
             d.Set("inFilterChecked", CoderController.Checked(c.inFilter));
@@ -278,6 +301,15 @@ class CoderController : AdminController {
                 this.Fail(400, "0004", "关联字段名不合法");
             }
         }
+        string filterOp = this.In("filterOp");
+        if (filterOp.Length == 0) { filterOp = "auto"; }
+        if (!CoderController.InList(filterOp, "auto,like,eq,select,range")) {
+            this.Fail(400, "0004", "不支持的筛选算子");
+        }
+        string listWidth = CoderController.Clip(this.In("listWidth").Trim(), 16);
+        if (listWidth.Length > 0 && Gen.WidthOf(listWidth).Length == 0) {
+            this.Fail(400, "0004", "列宽只支持「数字+px/em/%」形态（如 140px）");
+        }
 
         SysGenColumn c = new SysGenColumn();
         if (id > 0) {
@@ -304,6 +336,8 @@ class CoderController : AdminController {
         c.relTable = relTable;
         c.relValue = relValue;
         c.relLabel = relLabel;
+        c.filterOp = filterOp;
+        c.listWidth = listWidth;
         c.sortOrder = this.InInt("sortOrder", 10);
         c.nullable = CoderController.Flag(this.In("nullable"));
         c.inList = CoderController.Flag(this.In("inList"));
@@ -324,6 +358,8 @@ class CoderController : AdminController {
                 .Set(a => a.relTable, c.relTable)
                 .Set(a => a.relValue, c.relValue)
                 .Set(a => a.relLabel, c.relLabel)
+                .Set(a => a.filterOp, c.filterOp)
+                .Set(a => a.listWidth, c.listWidth)
                 .Set(a => a.sortOrder, c.sortOrder)
                 .Set(a => a.nullable, c.nullable)
                 .Set(a => a.inList, c.inList)
@@ -411,6 +447,17 @@ class CoderController : AdminController {
                 .Set(a => a.widget, value)
                 .Where(a => a.id == id).ExecuteAffrowsAsync();
             await this.Note("编辑字段", c.name, n > 0, "widget=" + value);
+            this.Ok("{}");
+            return;
+        }
+        if (field == "filterOp") {
+            if (!CoderController.InList(value, "auto,like,eq,select,range")) {
+                this.Fail(400, "0004", "不支持的筛选算子");
+            }
+            int n = await this.SysGenColumn.Update()
+                .Set(a => a.filterOp, value)
+                .Where(a => a.id == id).ExecuteAffrowsAsync();
+            await this.Note("编辑字段", c.name, n > 0, "filterOp=" + value);
             this.Ok("{}");
             return;
         }
@@ -804,12 +851,9 @@ class CoderController : AdminController {
             .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
         if (cols.Count == 0) { this.Fail(400, "0004", "先添加字段"); }
         if (!Gen.Valid(t, cols)) { this.Fail(400, "0004", "表或字段设计不合法"); }
-        /* 关联下拉只对设计器里真实存在的表喂数。 */
+        /* 关联下拉/远程筛选只对设计器里真实存在的表喂数；把设计行原样传给
+           生成器（Pick 需要关联表的路由）。 */
         List<SysGenTable> tabs = await this.SysGenTable.OrderBy(a => a.id).ToListAsync();
-        List<string> designed = new List<string>();
-        for (int i = 0; i < tabs.Count; i = i + 1) {
-            if (Gen.Safe(tabs[i].tableName)) { designed.Add(tabs[i].tableName); }
-        }
 
         /* gen.root 相对当前服务工作目录解释（开发时从 build/ 运行，".." 即项目根）；
            生产发布目录没有 src/views 布局，必须在站点设置里配置真实源码根目录。 */
@@ -827,10 +871,13 @@ class CoderController : AdminController {
         try {
             Directory.CreateDirectoryRecursive(root + "/src/Model/Gen");
             Directory.CreateDirectoryRecursive(root + "/src/Controller/Admin");
-            Directory.CreateDirectoryRecursive(root + "/src/Controller/Front");
+            if (t.apiEnabled == 1) { Directory.CreateDirectoryRecursive(root + "/src/Controller/Api"); }
+            if (t.frontEnabled != 0) {
+                Directory.CreateDirectoryRecursive(root + "/src/Controller/Front");
+                Directory.CreateDirectoryRecursive(root + "/views/Front");
+            }
             Directory.CreateDirectoryRecursive(root + "/src/Dao/Gen");
             Directory.CreateDirectoryRecursive(root + "/views/Admin");
-            Directory.CreateDirectoryRecursive(root + "/views/Front");
         } catch (Exception ex) {
             this.Fail(500, "2001", "无法创建源码目录（gen.root=" + root + "）：" + ex.Message);
             return;
@@ -843,15 +890,7 @@ class CoderController : AdminController {
                 return;
             }
         }
-        List<string> sources = new List<string>();
-        sources.Add(Gen.ModelSource(t, cols));
-        sources.Add(Gen.ControllerSource(t, cols, designed));
-        sources.Add(Gen.DaoSource(t, cols));
-        sources.Add(Gen.ListViewSource(t, cols));
-        sources.Add(Gen.FormViewSource(t, cols, designed));
-        sources.Add(Gen.FrontControllerSource(t, cols));
-        sources.Add(Gen.FrontListViewSource(t, cols));
-        sources.Add(Gen.FrontShowViewSource(t, cols));
+        List<string> sources = CoderController.SourceList(t, cols, tabs);
         try {
             CoderController.WriteSources(paths, sources, force == 1);
         } catch (Exception ex) {
@@ -861,9 +900,36 @@ class CoderController : AdminController {
 
         /* 生成文件尚未编译部署，通用数据入口仍须保留。 */
         await this.Note("生成代码", t.tableName, true, paths[1]);
-        this.Saved("已生成 8 个文件到 " + root
-            + "（模型/后台控制器/Dao/后台视图×2/前台控制器/前台视图×2），"
+        this.Saved("已生成 " + Convert.ToString(paths.Count) + " 个文件到 " + root
+            + "（" + CoderController.FileMix(t) + "），"
             + "请将源码纳入工程并重新编译后生效");
+    }
+
+    /* 生成源码清单，顺序与 TargetPaths 一一对应：模型/后台控制器/Dao/后台
+       视图×2 恒有；apiEnabled=1 加 JSON 接口；frontEnabled≠0 加前台三件。 */
+    static List<string> SourceList(SysGenTable t, List<SysGenColumn> cols,
+        List<SysGenTable> designed) {
+        List<string> sources = new List<string>();
+        sources.Add(Gen.ModelSource(t, cols));
+        sources.Add(Gen.ControllerSource(t, cols, designed));
+        sources.Add(Gen.DaoSource(t, cols));
+        sources.Add(Gen.ListViewSource(t, cols));
+        sources.Add(Gen.FormViewSource(t, cols, designed));
+        if (t.apiEnabled == 1) { sources.Add(Gen.ApiSource(t, cols, designed)); }
+        if (t.frontEnabled != 0) {
+            sources.Add(Gen.FrontControllerSource(t, cols, designed));
+            sources.Add(Gen.FrontListViewSource(t, cols, designed));
+            sources.Add(Gen.FrontShowViewSource(t, cols, designed));
+        }
+        return sources;
+    }
+
+    /* 文件构成说明（保存消息用）。 */
+    static string FileMix(SysGenTable t) {
+        string mix = "模型/后台控制器/Dao/后台视图×2";
+        if (t.apiEnabled == 1) { mix = mix + "/JSON接口"; }
+        if (t.frontEnabled != 0) { mix = mix + "/前台控制器/前台视图×2"; }
+        return mix;
     }
 
     /* Directory=URL 前缀，file=class+Controller=route 段落=view 键段，生成表与手写表同构。 */
@@ -874,9 +940,14 @@ class CoderController : AdminController {
         paths.Add(root + "/src/Dao/Gen/" + t.entityName + "Dao.zan");
         paths.Add(root + "/views/Admin/" + t.entityName + "Controller.Index.html");
         paths.Add(root + "/views/Admin/" + t.entityName + "Controller.Form.html");
-        paths.Add(root + "/src/Controller/Front/" + t.entityName + "FrontController.zan");
-        paths.Add(root + "/views/Front/" + t.entityName + "FrontController.Index.html");
-        paths.Add(root + "/views/Front/" + t.entityName + "FrontController.Show.html");
+        if (t.apiEnabled == 1) {
+            paths.Add(root + "/src/Controller/Api/" + t.entityName + "ApiController.zan");
+        }
+        if (t.frontEnabled != 0) {
+            paths.Add(root + "/src/Controller/Front/" + t.entityName + "FrontController.zan");
+            paths.Add(root + "/views/Front/" + t.entityName + "FrontController.Index.html");
+            paths.Add(root + "/views/Front/" + t.entityName + "FrontController.Show.html");
+        }
         return paths;
     }
 
@@ -930,20 +1001,21 @@ class CoderController : AdminController {
         List<SysGenColumn> cols = await this.SysGenColumn
             .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
         List<SysGenTable> tabs = await this.SysGenTable.OrderBy(a => a.id).ToListAsync();
-        List<string> designed = new List<string>();
-        for (int i = 0; i < tabs.Count; i = i + 1) {
-            if (Gen.Safe(tabs[i].tableName)) { designed.Add(tabs[i].tableName); }
-        }
+        List<string> sources = CoderController.SourceList(t, cols, tabs);
         ViewData d = new ViewData();
         d.Set("dialogTitle", t.tableName + " 生成预览");
-        d.Set("model", Gen.ModelSource(t, cols));
-        d.Set("controller", Gen.ControllerSource(t, cols, designed));
-        d.Set("dao", Gen.DaoSource(t, cols));
-        d.Set("list", Gen.ListViewSource(t, cols));
-        d.Set("form", Gen.FormViewSource(t, cols, designed));
-        d.Set("frontController", Gen.FrontControllerSource(t, cols));
-        d.Set("frontList", Gen.FrontListViewSource(t, cols));
-        d.Set("frontShow", Gen.FrontShowViewSource(t, cols));
+        d.Set("model", sources[0]);
+        d.Set("controller", sources[1]);
+        d.Set("dao", sources[2]);
+        d.Set("list", sources[3]);
+        d.Set("form", sources[4]);
+        if (t.apiEnabled == 1 && sources.Count > 5) { d.Set("api", sources[5]); }
+        if (t.frontEnabled != 0) {
+            int f = t.apiEnabled == 1 ? 6 : 5;
+            d.Set("frontController", sources[f]);
+            d.Set("frontList", sources[f + 1]);
+            d.Set("frontShow", sources[f + 2]);
+        }
         string root = (await Settings.Get(SettingKeys.GenRoot, "..")).Trim();
         if (root.Length > 0 && Directory.ExistsOnDisk(root + "/src")
             && Directory.ExistsOnDisk(root + "/views")) {
@@ -953,8 +1025,9 @@ class CoderController : AdminController {
                 if (File.Exists(paths[i])) { existN = existN + 1; }
             }
             if (existN > 0) {
-                d.Set("existsNote", "已有 " + Convert.ToString(existN)
-                    + "/8 个目标文件存在；默认拒绝覆盖，可在字段设计页用「覆盖重新生成」");
+                d.Set("existsNote", "已有 " + Convert.ToString(existN) + "/"
+                    + Convert.ToString(paths.Count)
+                    + " 个目标文件存在；默认拒绝覆盖，可在字段设计页用「覆盖重新生成」");
             }
         }
         this.Dialog(d);

@@ -113,6 +113,7 @@ class Gen {
     /* 生成实体类源码。 */
     static string ModelSource(SysGenTable t, List<SysGenColumn> cols) {
         StringBuilder b = new StringBuilder();
+        b.Append(Gen.ZanHeader());
         b.Append("using System;\nusing System.Data.Orm;\nusing ZanWeb.Web;\n\nnamespace ZanWeb.Model.Gen;\n\n");
         b.Append("/// <summary>" + Gen.Comment(t.title) + "。由表设计器生成，可直接修改。</summary>\n");
         b.Append("[Table(Name = \"" + t.tableName + "\")]\n");
@@ -203,13 +204,101 @@ class Gen {
 
     /* 关联下拉只在 relTable 是本设计器里的一张表时才服务端喂数；
        指向陌生表时没有可靠的标签列，退回普通输入框。 */
-    static bool RelDesigned(SysGenColumn c, List<string> designed) {
-        return c.relTable.Length > 0 && Gen.Safe(c.relTable)
-            && designed.Contains(c.relTable);
+    static bool RelDesigned(SysGenColumn c, List<SysGenTable> designed) {
+        if (c.relTable.Length == 0 || !Gen.Safe(c.relTable)) { return false; }
+        return Gen.DesignedOf(designed, c.relTable) != null;
+    }
+
+    /* 按表名找设计行；designed 传本设计器的全部表（Pick 需要对方的路由）。 */
+    static SysGenTable DesignedOf(List<SysGenTable> designed, string tableName) {
+        for (int i = 0; i < designed.Count; i = i + 1) {
+            if (designed[i].tableName == tableName) { return designed[i]; }
+        }
+        return null;
+    }
+
+    /* 选项端点与关联下拉的标签列：显式 labelColumn 必须是设计里真实存在的
+       string 列；否则按 name→title→首个 string 列探测，全无则回落 id。 */
+    static string LabelCol(SysGenTable t, List<SysGenColumn> cols) {
+        if (Gen.SafeCode(t.labelColumn) && Gen.HasStringCol(cols, t.labelColumn)) {
+            return t.labelColumn;
+        }
+        if (Gen.HasStringCol(cols, "name")) { return "name"; }
+        if (Gen.HasStringCol(cols, "title")) { return "title"; }
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (cols[i].name != "id" && cols[i].kind == "string") { return cols[i].name; }
+        }
+        return "id";
+    }
+
+    static bool HasStringCol(List<SysGenColumn> cols, string name) {
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (cols[i].name == name && cols[i].kind == "string") { return true; }
+        }
+        return false;
+    }
+
+    /* 筛选算子的生效值：有选项源的列（关联/字典/布尔）一律下拉或远程搜索，
+       时间列恒为区间选择；其余按 filterOp（like/eq/range），不合法值与 auto
+       时按类型回落——文本模糊、数值精确。select 无选项源时没有意义，同样回落。 */
+    static string FilterOpOf(SysGenColumn c, List<SysGenTable> designed) {
+        if (Gen.RelDesigned(c, designed)) { return "pick"; }
+        if (c.dictType.Length > 0 && Gen.Safe(c.dictType)) { return "select"; }
+        if (c.kind == "bool") { return "select"; }
+        if (c.kind == "datetime") { return "time"; }
+        string op = c.filterOp == null ? "" : c.filterOp;
+        if (op != "like" && op != "eq" && op != "select" && op != "range") { op = ""; }
+        if (op == "select") { op = ""; }
+        if (op.Length == 0) { op = Gen.ZanType(c.kind) == "string" ? "like" : "eq"; }
+        if (op == "like" && Gen.ZanType(c.kind) != "string") { op = "eq"; }
+        if (op == "range" && Gen.ZanType(c.kind) == "string") { op = "like"; }
+        return op;
+    }
+
+    /* 列表列宽只放行「纯数字+px/em/%」的紧凑形态（≤16 字符），其余按类型默认。 */
+    static string ColWidth(SysGenColumn c) {
+        return Gen.WidthOf(c.listWidth == null ? "" : c.listWidth);
+    }
+
+    static string WidthOf(string w) {
+        if (w.Length == 0 || w.Length > 16) { return ""; }
+        int n = 0;
+        while (n < w.Length) {
+            string ch = w.Substring(n, 1);
+            if (ch < "0" || ch > "9") { break; }
+            n = n + 1;
+        }
+        if (n == 0) { return ""; }
+        string unit = w.Substring(n);
+        if (unit != "px" && unit != "em" && unit != "%") { return ""; }
+        return w;
+    }
+
+    /* 页大小钳到 1~200；未配置（≤0）视为缺省 20。 */
+    static int PageSizeOf(SysGenTable t) {
+        int n = t.pageSize;
+        if (n <= 0) { return 20; }
+        if (n > 200) { return 200; }
+        return n;
+    }
+
+    /* 生成时间戳：可辨识产物新旧（adminUI 经验——怀疑配置与产物漂移时先看它）。 */
+    static string Stamp() {
+        return Fmt.Stamp(WebApp.NowSeconds());
+    }
+
+    static string ZanHeader() {
+        return "/* 由表设计器生成于 " + Gen.Stamp()
+            + "，重新生成会覆盖本文件；可直接修改。 */\n";
+    }
+
+    static string HtmlHeader() {
+        return "<!-- 由表设计器生成于 " + Gen.Stamp()
+            + "；可直接修改，重新生成会覆盖本文件。 -->\n";
     }
 
     static string ControllerSource(SysGenTable t, List<SysGenColumn> cols,
-        List<string> designed) {
+        List<SysGenTable> designed) {
         string cls = t.entityName + "Controller";
         string mdl = "ZanWeb.Model.Gen." + t.entityName;
         string route = Gen.Route(t);
@@ -225,7 +314,9 @@ class Gen {
             if (Gen.RelDesigned(c, designed)) { hasRelLabel = true; }
         }
         StringBuilder b = new StringBuilder();
+        b.Append(Gen.ZanHeader());
         b.Append("using System;\nusing System.Data;\nusing System.Data.Orm;\n");
+        b.Append("using System.Json;\n");
         b.Append("using System.Web;\nusing ZanWeb.Core;\n");
         b.Append("using ZanWeb.Dao;\nusing ZanWeb.Model;\n");
         b.Append("using ZanWeb.Security;\nusing ZanWeb.Web;\nusing ZanWeb.Services;\n\n");
@@ -244,6 +335,8 @@ class Gen {
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
             if (c.name == "id" || (c.inList != 1 && c.inFilter != 1)) { continue; }
+            /* 字典列的选项是运行时数据（列表 Tag 与筛选 Select 都吃它），按请求
+               查好拼进声明；关联筛选走 options 端点远程搜索（Pick），不预载。 */
             if (c.dictType.Length > 0 && Gen.Safe(c.dictType)) {
                 b.Append("        string " + c.name + "Opts = \"\";\n");
                 b.Append("        List<SysDictItem> " + c.name
@@ -256,28 +349,6 @@ class Gen {
                 b.Append("            " + c.name + "Opts = " + c.name + "Opts + " + c.name
                     + "Items[i].value + \"=\" + " + c.name + "Items[i].label;\n");
                 b.Append("        }\n");
-            } else if (Gen.RelDesigned(c, designed)) {
-                b.Append("        string " + c.name + "Opts = \"\";\n");
-                b.Append("        DbResult " + c.name + "Rows = await DbTable.Of(this.Held(), \""
-                    + c.relTable + "\").Query()\n");
-                b.Append("            .OrderBy(\"" + Gen.RelLabel(c)
-                    + "\").Limit(100).ToResultAsync();\n");
-                b.Append("        if (" + c.name + "Rows != null) {\n");
-                b.Append("            int " + c.name + "V = " + c.name
-                    + "Rows.GetColumnIndex(\"" + Gen.RelValue(c) + "\");\n");
-                b.Append("            int " + c.name + "L = " + c.name
-                    + "Rows.GetColumnIndex(\"" + Gen.RelLabel(c) + "\");\n");
-                b.Append("            if (" + c.name + "V >= 0 && " + c.name + "L >= 0) {\n");
-                b.Append("                for (int i = 0; i < " + c.name
-                    + "Rows.RowCount(); i = i + 1) {\n");
-                b.Append("                    if (" + c.name
-                    + "Opts.Length > 0) { " + c.name + "Opts = " + c.name + "Opts + \",\"; }\n");
-                b.Append("                    " + c.name + "Opts = " + c.name + "Opts + " + c.name
-                    + "Rows.GetString(i, " + c.name + "V) + \"=\" + " + c.name
-                    + "Rows.GetString(i, " + c.name + "L);\n");
-                b.Append("                }\n");
-                b.Append("            }\n");
-                b.Append("        }\n");
             }
         }
         b.Append("        return ListPage.Of()\n");
@@ -285,9 +356,11 @@ class Gen {
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
             if (c.name == "id" || c.inList != 1) { continue; }
-            string width = "";
-            if (Gen.ColKind(c.kind) == "num") { width = "90px"; }
-            if (c.kind == "datetime") { width = "130px"; }
+            string width = Gen.ColWidth(c);
+            if (width.Length == 0) {
+                if (Gen.ColKind(c.kind) == "num") { width = "90px"; }
+                if (c.kind == "datetime") { width = "130px"; }
+            }
             string label = Gen.Literal(Gen.LabelOf(c));
             bool dictFed = c.dictType.Length > 0 && Gen.Safe(c.dictType);
             bool relFed = Gen.RelDesigned(c, designed);
@@ -310,22 +383,29 @@ class Gen {
             if (c.name == "id" || c.inFilter != 1) { continue; }
             string label = Gen.Literal(Gen.LabelOf(c));
             bool dictFed = c.dictType.Length > 0 && Gen.Safe(c.dictType);
-            bool relFed = Gen.RelDesigned(c, designed);
-            if (c.kind == "bool") {
+            string op = Gen.FilterOpOf(c, designed);
+            if (op == "pick") {
+                SysGenTable rel = Gen.DesignedOf(designed, c.relTable);
+                b.Append("            .Pick(\"" + label + "\", \"" + c.name + "\", \""
+                    + c.name + "\", \"/admin/" + Gen.Route(rel) + "/options\")\n");
+            } else if (op == "select") {
+                string opts = c.kind == "bool" ? "\"1=是,0=否\"" : c.name + "Opts";
                 b.Append("            .Select(\"" + label + "\", \"" + c.name + "\", \""
-                    + c.name + "\", \"1=是,0=否\")\n");
-            } else if (dictFed || relFed) {
-                b.Append("            .Select(\"" + label + "\", \"" + c.name + "\", \""
-                    + c.name + "\", " + c.name + "Opts)\n");
-            } else if (c.kind == "datetime") {
+                    + c.name + "\", " + opts + ")\n");
+            } else if (op == "time") {
                 b.Append("            .Time(\"" + label + "\", \"" + c.name + "\", \""
                     + c.name + "\")\n");
-            } else if (Gen.ZanType(c.kind) == "string") {
-                b.Append("            .Text(\"" + label + "\", \"" + c.name + "\", \""
-                    + c.name + "\", \"" + label + " 模糊搜索\")\n");
-            } else {
+            } else if (op == "range") {
+                b.Append("            .Text(\"" + label + " 从\", \"" + c.name
+                    + "From\", \"" + c.name + "\", \"" + label + " 下限\")\n");
+                b.Append("            .Text(\"" + label + " 到\", \"" + c.name
+                    + "To\", \"" + c.name + "\", \"" + label + " 上限\")\n");
+            } else if (op == "eq") {
                 b.Append("            .Text(\"" + label + "\", \"" + c.name + "\", \""
                     + c.name + "\", \"" + label + " 精确值\")\n");
+            } else {
+                b.Append("            .Text(\"" + label + "\", \"" + c.name + "\", \""
+                    + c.name + "\", \"" + label + " 模糊搜索\")\n");
             }
         }
         b.Append("            .OpsEdit(\"/admin/" + route + "/form\")\n");
@@ -347,6 +427,44 @@ class Gen {
         b.Append(edits + "\")\n");
         b.Append("            ;\n    }\n");
 
+        /* 选项端点（data-pick 契约）：?id= 单条回显、?kw= 标签包含匹配，
+           最多 20 条；标签列按 labelColumn 或探测列。关联筛选的远程搜索打这里。 */
+        string labelCol = Gen.LabelCol(t, cols);
+        b.Append("\n    [HttpGet]\n    [Custom(Perm = PermBit.View)]\n");
+        b.Append("    [Description(\"" + Gen.Literal(t.title) + "选项\")]\n");
+        b.Append("    async void Options() {\n");
+        b.Append("        string kw = this.In(\"kw\").Trim();\n");
+        b.Append("        string idv = this.In(\"id\").Trim();\n");
+        b.Append("        DbTable t = DbTable.Of(this.Held(), \"" + t.tableName + "\");\n");
+        b.Append("        if (idv.Length > 0) {\n");
+        b.Append("            DbResult one = await t.Query().WhereEq(\"id\", Filter.ToLong(idv, 0))\n");
+        b.Append("                .Limit(1).ToResultAsync();\n");
+        b.Append("            JsonValue row = JsonValue.NewObject();\n");
+        b.Append("            if (one != null && one.RowCount() > 0) {\n");
+        b.Append("                row.Set(\"id\", JsonValue.NewInt(Filter.ToInt(idv, 0)));\n");
+        b.Append("                row.Set(\"label\", JsonValue.NewStr(one.GetString(0, one.GetColumnIndex(\""
+            + labelCol + "\"))));\n");
+        b.Append("            }\n");
+        b.Append("            this.Ctx().Api(Codes.Ok, \"ok\", row.ToJson());\n");
+        b.Append("            return;\n        }\n");
+        b.Append("        DbTableQuery q = t.Query();\n");
+        b.Append("        if (kw.Length > 0) { q = q.WhereContains(\"" + labelCol + "\", kw); }\n");
+        b.Append("        DbResult rows = await q.OrderBy(\"" + labelCol
+            + "\").Limit(20).ToResultAsync();\n");
+        b.Append("        JsonValue arr = JsonValue.NewArray();\n");
+        b.Append("        if (rows != null) {\n");
+        b.Append("            int idc = rows.GetColumnIndex(\"id\");\n");
+        b.Append("            int lbc = rows.GetColumnIndex(\"" + labelCol + "\");\n");
+        b.Append("            for (int i = 0; i < rows.RowCount(); i = i + 1) {\n");
+        b.Append("                JsonValue o = JsonValue.NewObject();\n");
+        b.Append("                o.Set(\"id\", JsonValue.NewInt(rows.GetInt(i, idc)));\n");
+        b.Append("                o.Set(\"label\", JsonValue.NewStr(rows.GetString(i, lbc)));\n");
+        b.Append("                arr.Append(o);\n");
+        b.Append("            }\n");
+        b.Append("        }\n");
+        b.Append("        this.Ctx().Api(Codes.Ok, \"ok\", arr.ToJson());\n");
+        b.Append("    }\n");
+
         if (hasDict) {
             b.Append("\n    /* 字典值合法性：空值看必填，非空必须命中该字典类型的活动项。 */\n");
             b.Append("    async string CheckDict(string typeCode, string label, string value, bool required) {\n");
@@ -367,69 +485,10 @@ class Gen {
         b.Append("        if (!this.DbReady()) { d.Set(\"dbDown\", \"1\"); this.Page(d); return; }\n");
         b.Append("        ListPage lp = await this.Screen();\n");
         b.Append("        List<OrmCond> conds = lp.Collect(this);\n");
-        b.Append("        ListQuery q = this.Paged(\"" + orderCol + "\", 20);\n");
-        /* 筛选局部变量：语义与 ListPage.Collect 逐条对齐（文本非空 LIKE、下拉跳过
-           空串与 -1、时间走 ParseDay 的 From/To），查询侧用发射的 WhereIf。 */
-        string whereLines = "";
-        for (int i = 0; i < cols.Count; i = i + 1) {
-            SysGenColumn c = cols[i];
-            if (c.name == "id" || c.inFilter != 1) { continue; }
-            bool fed = (c.dictType.Length > 0 && Gen.Safe(c.dictType))
-                || Gen.RelDesigned(c, designed);
-            if (c.kind == "datetime") {
-                b.Append("        long f" + c.name + "F = Fmt.ParseDay(this.InAny(\""
-                    + c.name + "From\").Trim());\n");
-                b.Append("        long f" + c.name + "T = Fmt.ParseDay(this.InAny(\""
-                    + c.name + "To\").Trim());\n");
-                whereLines = whereLines + "            .WhereIf(f" + c.name
-                    + "F > 0, a => a." + c.name + " >= f" + c.name + "F)\n";
-                whereLines = whereLines + "            .WhereIf(f" + c.name
-                    + "T > 0, a => a." + c.name + " <= f" + c.name + "T + 86399)\n";
-            } else if (Gen.ZanType(c.kind) == "string") {
-                b.Append("        string f" + c.name + " = this.InAny(\"" + c.name
-                    + "\").Trim();\n");
-                if (fed) {
-                    whereLines = whereLines + "            .WhereIf(f" + c.name
-                        + ".Length > 0 && f" + c.name + " != \"-1\", a => a." + c.name
-                        + " == f" + c.name + ")\n";
-                } else {
-                    whereLines = whereLines + "            .WhereIf(f" + c.name
-                        + ".Length > 0, a => a." + c.name + ".Contains(f" + c.name + "))\n";
-                }
-            } else if (c.kind == "bool") {
-                b.Append("        int f" + c.name + "N = Filter.ToInt(this.InAny(\"" + c.name
-                    + "\").Trim(), -1);\n");
-                whereLines = whereLines + "            .WhereIf(f" + c.name
-                    + "N >= 0, a => a." + c.name + " == f" + c.name + "N)\n";
-            } else if (c.kind == "int" || c.kind == "long") {
-                if (fed) {
-                    /* 下拉语义对齐 Collect：空串与 -1 跳过，0 是合法字典值。 */
-                    if (c.kind == "int") {
-                        b.Append("        int f" + c.name + "N = Filter.ToInt(this.InAny(\""
-                            + c.name + "\").Trim(), -1);\n");
-                    } else {
-                        b.Append("        long f" + c.name + "N = Filter.ToLong(this.InAny(\""
-                            + c.name + "\").Trim(), -1);\n");
-                    }
-                    whereLines = whereLines + "            .WhereIf(f" + c.name
-                        + "N >= 0, a => a." + c.name + " == f" + c.name + "N)\n";
-                } else {
-                    b.Append("        string f" + c.name + "R = this.InAny(\"" + c.name
-                        + "\").Trim();\n");
-                    b.Append("        long f" + c.name + "N = Filter.ToLong(f" + c.name
-                        + "R, 0);\n");
-                    whereLines = whereLines + "            .WhereIf(f" + c.name
-                        + "R.Length > 0, a => a." + c.name + " == f" + c.name + "N)\n";
-                }
-            } else if (Gen.ZanType(c.kind) == "double") {
-                b.Append("        string f" + c.name + "R = this.InAny(\"" + c.name
-                    + "\").Trim();\n");
-                b.Append("        double f" + c.name + "N = f" + c.name
-                    + "R.Length > 0 ? Filter.ToDouble(f" + c.name + "R, 0.0) : 0.0;\n");
-                whereLines = whereLines + "            .WhereIf(f" + c.name
-                    + "R.Length > 0, a => a." + c.name + " == f" + c.name + "N)\n";
-            }
-        }
+        b.Append("        ListQuery q = this.Paged(\"" + orderCol + "\", "
+            + Convert.ToString(Gen.PageSizeOf(t)) + ");\n");
+        /* 筛选局部变量 + WhereIf：与 ListPage.Collect 语义逐条对齐，共享发射。 */
+        string whereLines = Gen.FilterEmit(b, cols, designed);
         b.Append("        int total = await this." + t.entityName + "\n");
         b.Append(whereLines);
         b.Append("            .CountAsync();\n");
@@ -725,6 +784,7 @@ class Gen {
     /* 生成列表视图源码：表格由 ListPage.Screen 整段产出，视图只剩壳。 */
     static string ListViewSource(SysGenTable t, List<SysGenColumn> cols) {
         StringBuilder b = new StringBuilder();
+        b.Append(Gen.HtmlHeader());
         b.Append("<div class=\"card\">\n  {{{screenHtml}}}\n</div>\n");
         return b.ToString();
     }
@@ -732,9 +792,10 @@ class Gen {
     /* 生成表单视图源码。下拉由服务端喂数（Form 动作构建 {value,label,selected}
        选项行），date/richtext/upload 不再掉进 number/兜底分支。 */
     static string FormViewSource(SysGenTable t, List<SysGenColumn> cols,
-        List<string> designed) {
+        List<SysGenTable> designed) {
         string route = Gen.Route(t);
         StringBuilder b = new StringBuilder();
+        b.Append(Gen.HtmlHeader());
         b.Append("<form data-submit action=\"/admin/" + route + "/save\">\n");
         b.Append("  <input type=\"hidden\" name=\"id\" value=\"{{id}}\">\n");
         b.Append("  <div class=\"form\">\n");
@@ -787,6 +848,7 @@ class Gen {
     static string DaoSource(SysGenTable t, List<SysGenColumn> cols) {
         string ent = t.entityName;
         StringBuilder b = new StringBuilder();
+        b.Append(Gen.ZanHeader());
         b.Append("using System;\nusing System.Data;\nusing System.Data.Orm;\n");
         b.Append("using ZanWeb.Model.Gen;\n\n");
         b.Append("namespace ZanWeb.Dao.Gen;\n\n");
@@ -855,9 +917,192 @@ class Gen {
             || kind == "datetime";
     }
 
+    /* 前台发布过滤列：名为 published/status/enabled 的 bool 列，没有则 ""。 */
+    static string PublishCol(List<SysGenColumn> cols) {
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.kind == "bool" && (c.name == "published" || c.name == "status"
+                || c.name == "enabled")) { return c.name; }
+        }
+        return "";
+    }
+
+    /* 筛选局部变量 + WhereIf 链的共享发射（后台 Index 与 JSON Query 同款）：
+       语义与 ListPage.Collect 逐条对齐（文本非空才拼条件、下拉跳过空串与 -1、
+       时间/数值区间走 From/To 两端）；区间端点的守卫看原文长度，0 是合法边界。 */
+    static string FilterEmit(StringBuilder b, List<SysGenColumn> cols,
+        List<SysGenTable> designed) {
+        string whereLines = "";
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.name == "id" || c.inFilter != 1) { continue; }
+            string op = Gen.FilterOpOf(c, designed);
+            if (op == "time") {
+                b.Append("        long f" + c.name + "F = Fmt.ParseDay(this.InAny(\""
+                    + c.name + "From\").Trim());\n");
+                b.Append("        long f" + c.name + "T = Fmt.ParseDay(this.InAny(\""
+                    + c.name + "To\").Trim());\n");
+                whereLines = whereLines + "            .WhereIf(f" + c.name
+                    + "F > 0, a => a." + c.name + " >= f" + c.name + "F)\n";
+                whereLines = whereLines + "            .WhereIf(f" + c.name
+                    + "T > 0, a => a." + c.name + " <= f" + c.name + "T + 86399)\n";
+            } else if (op == "select" || op == "pick") {
+                /* 下拉/远程搜索语义对齐 Collect：空串与 -1 跳过，0 是合法选项值。 */
+                if (Gen.ZanType(c.kind) == "string") {
+                    b.Append("        string f" + c.name + " = this.InAny(\"" + c.name
+                        + "\").Trim();\n");
+                    whereLines = whereLines + "            .WhereIf(f" + c.name
+                        + ".Length > 0 && f" + c.name + " != \"-1\", a => a." + c.name
+                        + " == f" + c.name + ")\n";
+                } else if (c.kind == "long") {
+                    b.Append("        long f" + c.name + "N = Filter.ToLong(this.InAny(\""
+                        + c.name + "\").Trim(), -1);\n");
+                    whereLines = whereLines + "            .WhereIf(f" + c.name
+                        + "N >= 0, a => a." + c.name + " == f" + c.name + "N)\n";
+                } else {
+                    b.Append("        int f" + c.name + "N = Filter.ToInt(this.InAny(\""
+                        + c.name + "\").Trim(), -1);\n");
+                    whereLines = whereLines + "            .WhereIf(f" + c.name
+                        + "N >= 0, a => a." + c.name + " == f" + c.name + "N)\n";
+                }
+            } else if (op == "range") {
+                string ft = c.kind == "decimal" ? "double"
+                    : (c.kind == "long" ? "long" : "int");
+                string parse = c.kind == "decimal" ? "ToDouble"
+                    : (c.kind == "long" ? "ToLong" : "ToInt");
+                string zero = c.kind == "decimal" ? "0.0" : "0";
+                b.Append("        string f" + c.name + "FR = this.InAny(\"" + c.name
+                    + "From\").Trim();\n");
+                b.Append("        string f" + c.name + "TR = this.InAny(\"" + c.name
+                    + "To\").Trim();\n");
+                b.Append("        " + ft + " f" + c.name + "F = Filter." + parse
+                    + "(f" + c.name + "FR, " + zero + ");\n");
+                b.Append("        " + ft + " f" + c.name + "T = Filter." + parse
+                    + "(f" + c.name + "TR, " + zero + ");\n");
+                whereLines = whereLines + "            .WhereIf(f" + c.name
+                    + "FR.Length > 0, a => a." + c.name + " >= f" + c.name + "F)\n";
+                whereLines = whereLines + "            .WhereIf(f" + c.name
+                    + "TR.Length > 0, a => a." + c.name + " <= f" + c.name + "T)\n";
+            } else if (Gen.ZanType(c.kind) == "string") {
+                b.Append("        string f" + c.name + " = this.InAny(\"" + c.name
+                    + "\").Trim();\n");
+                if (op == "eq") {
+                    whereLines = whereLines + "            .WhereIf(f" + c.name
+                        + ".Length > 0, a => a." + c.name + " == f" + c.name + ")\n";
+                } else {
+                    whereLines = whereLines + "            .WhereIf(f" + c.name
+                        + ".Length > 0, a => a." + c.name + ".Contains(f" + c.name + "))\n";
+                }
+            } else {
+                /* 数值精确值：int/long/double 各回本型比较，避免跨型等值。 */
+                b.Append("        string f" + c.name + "R = this.InAny(\"" + c.name
+                    + "\").Trim();\n");
+                if (Gen.ZanType(c.kind) == "double") {
+                    b.Append("        double f" + c.name + "N = f" + c.name
+                        + "R.Length > 0 ? Filter.ToDouble(f" + c.name + "R, 0.0) : 0.0;\n");
+                } else if (c.kind == "long") {
+                    b.Append("        long f" + c.name + "N = Filter.ToLong(f" + c.name
+                        + "R, 0);\n");
+                } else {
+                    b.Append("        int f" + c.name + "N = Filter.ToInt(f" + c.name
+                        + "R, 0);\n");
+                }
+                whereLines = whereLines + "            .WhereIf(f" + c.name
+                    + "R.Length > 0, a => a." + c.name + " == f" + c.name + "N)\n";
+            }
+        }
+        return whereLines;
+    }
+
+    /* 生成 JSON 接口控制器（apiEnabled=1 时的附加文件）：会话鉴权（Grant +
+       PermBit.View，权限同后台查看，不另起 API Key 机制）；Query 分页列表带
+       同款筛选，Detail 单条详情。方法名避开 List/Get 等类型与保留名。 */
+    static string ApiSource(SysGenTable t, List<SysGenColumn> cols,
+        List<SysGenTable> designed) {
+        string mdl = "ZanWeb.Model.Gen." + t.entityName;
+        string route = "api/gen/" + t.tableName.Replace("_", "");
+        string orderCol = Gen.OrderCol(t, cols);
+        string orderCall = t.orderDesc == 1
+            ? "OrderByDescending(a => a." + orderCol + ")"
+            : "OrderBy(a => a." + orderCol + ")";
+        string title = Gen.Literal(t.title);
+        int pageSize = Gen.PageSizeOf(t);
+        StringBuilder b = new StringBuilder();
+        b.Append(Gen.ZanHeader());
+        b.Append("using System;\nusing System.Json;\nusing System.Web;\n");
+        b.Append("using ZanWeb.Core;\nusing ZanWeb.Security;\nusing ZanWeb.Web;\n\n");
+        b.Append("namespace ZanWeb.Api.Gen;\n\n");
+        b.Append("/// <summary>" + Gen.Comment(t.title)
+            + " JSON 接口。由表设计器生成，可直接修改。</summary>\n");
+        b.Append("[Route(\"" + route + "/[action]\")]\n");
+        b.Append("[Custom(Authorization = CustomAuthorization.Grant)]\n");
+        b.Append("[Description(\"" + title + "接口\")]\n");
+        b.Append("class " + t.entityName + "ApiController : ApiController {\n\n");
+        b.Append("    [HttpGet]\n    [Custom(Perm = PermBit.View)]\n");
+        b.Append("    [Description(\"" + title + "分页列表\")]\n");
+        b.Append("    async void Query() {\n");
+        b.Append("        int page = this.InInt(\"page\", 1);\n");
+        b.Append("        if (page < 1) { page = 1; }\n");
+        string whereLines = Gen.FilterEmit(b, cols, designed);
+        b.Append("        int total = await this." + t.entityName + "\n");
+        b.Append(whereLines);
+        b.Append("            .CountAsync();\n");
+        b.Append("        List<" + mdl + "> rows = await this." + t.entityName + "\n");
+        b.Append(whereLines);
+        b.Append("            ." + orderCall + "\n");
+        b.Append("            .Skip((page - 1) * " + Convert.ToString(pageSize)
+            + ").Take(" + Convert.ToString(pageSize) + ").ToListAsync();\n");
+        b.Append("        JsonValue arr = JsonValue.NewArray();\n");
+        b.Append("        for (int i = 0; i < rows.Count; i = i + 1) {\n");
+        b.Append("            JsonValue o = JsonValue.NewObject();\n");
+        b.Append("            o.Put(\"id\", JsonValue.NewInt(rows[i].id));\n");
+        Gen.ApiPuts(b, cols, "rows[i]", "            ");
+        b.Append("            arr.Append(o);\n");
+        b.Append("        }\n");
+        b.Append("        JsonValue outp = JsonValue.NewObject();\n");
+        b.Append("        outp.Put(\"total\", JsonValue.NewNum(Convert.ToString(total)));\n");
+        b.Append("        outp.Put(\"rows\", arr);\n");
+        b.Append("        this.Ok(outp.ToJson());\n");
+        b.Append("    }\n\n");
+        b.Append("    [HttpGet]\n    [Custom(Perm = PermBit.View)]\n");
+        b.Append("    [Description(\"" + title + "详情\")]\n");
+        b.Append("    async void Detail() {\n");
+        b.Append("        int id = this.InInt(\"id\", 0);\n");
+        b.Append("        " + mdl + " e = null;\n");
+        b.Append("        if (id > 0) { e = await this." + t.entityName + ".Read(id); }\n");
+        b.Append("        if (e == null) { this.Fail(404, \"0404\", \"记录不存在\"); }\n");
+        b.Append("        JsonValue o = JsonValue.NewObject();\n");
+        b.Append("        o.Put(\"id\", JsonValue.NewInt(e.id));\n");
+        Gen.ApiPuts(b, cols, "e", "        ");
+        b.Append("        this.Ok(o.ToJson());\n");
+        b.Append("    }\n}\n");
+        return b.ToString();
+    }
+
+    /* JSON 字段投影：字符串出 NewStr，其余出数值（datetime 保持 epoch 秒，
+       交给客户端格式化）；调用方是生成的实体行或列表元素。 */
+    static void ApiPuts(StringBuilder b, List<SysGenColumn> cols, string target,
+        string pad) {
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.name == "id") { continue; }
+            string v = target + "." + c.name;
+            if (Gen.ZanType(c.kind) == "string") {
+                b.Append(pad + "o.Put(\"" + c.name + "\", JsonValue.NewStr("
+                    + v + "));\n");
+            } else {
+                b.Append(pad + "o.Put(\"" + c.name + "\", JsonValue.NewNum(Convert.ToString("
+                    + v + ")));\n");
+            }
+        }
+    }
+
     /* 生成前台公开控制器源码：/「section」列表 + /「section」/{id} 详情，
-       匿名可读、无写动作——写永远留在后台（参照 Blog.Posts 的形状）。 */
-    static string FrontControllerSource(SysGenTable t, List<SysGenColumn> cols) {
+       匿名可读、无写动作——写永远留在后台（参照 Blog.Posts 的形状）。
+       名为 published/status/enabled 的 bool 列作发布过滤：列表只出已发布的，
+       详情对未发布直接 404；没有这样的列则全量可见。 */
+    static string FrontControllerSource(SysGenTable t, List<SysGenColumn> cols,
+        List<SysGenTable> designed) {
         string cls = t.entityName + "FrontController";
         string mdl = "ZanWeb.Model.Gen." + t.entityName;
         string path = Gen.FrontPath(t);
@@ -866,7 +1111,11 @@ class Gen {
             ? "OrderByDescending(a => a." + orderCol + ")"
             : "OrderBy(a => a." + orderCol + ")";
         string title = Gen.Literal(t.title);
+        string pubCol = Gen.PublishCol(cols);
+        string pubWhere = pubCol.Length > 0
+            ? "            .Where(a => a." + pubCol + " == 1)\n" : "";
         StringBuilder b = new StringBuilder();
+        b.Append(Gen.ZanHeader());
         b.Append("using System;\nusing System.Data;\nusing System.Data.Orm;\n");
         b.Append("using System.Web;\nusing System.Text;\nusing ZanWeb.Core;\nusing ZanWeb.Security;\nusing ZanWeb.Web;\nusing ZanWeb.Services;\nusing ZanWeb.Model.Gen;\n\n");
         b.Append("namespace ZanWeb.Front;\n\n");
@@ -900,16 +1149,20 @@ class Gen {
             b.Append("        int total = await this." + t.entityName + "\n");
             b.Append("            .WhereIf(kw.Length > 0, a => a." + first.name
                 + ".Contains(kw))\n");
+            b.Append(pubWhere);
             b.Append("            .CountAsync();\n");
             b.Append("        List<" + mdl + "> rows = await this."
                 + t.entityName + "\n");
             b.Append("            .WhereIf(kw.Length > 0, a => a." + first.name
                 + ".Contains(kw))\n");
+            b.Append(pubWhere);
         } else {
-            b.Append("        int total = await this." + t.entityName
-                + ".CountAsync();\n");
+            b.Append("        int total = await this." + t.entityName + "\n");
+            b.Append(pubWhere);
+            b.Append("            .CountAsync();\n");
             b.Append("        List<" + mdl + "> rows = await this."
                 + t.entityName + "\n");
+            b.Append(pubWhere);
         }
         b.Append("            ." + orderCall + "\n");
         b.Append("            .Skip((page - 1) * " + cls
@@ -923,6 +1176,34 @@ class Gen {
         b.Append("        d.Set(\"total\", Convert.ToString(total));\n");
         b.Append("        List<StrMap> items = d.AddList(\"rows\");\n");
         b.Append("        Rows.Project(rows, items);\n");
+        /* 关联标签投影：meta 行与详情页显示人话标签而非裸 id。 */
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.name == "id" || !Gen.RelDesigned(c, designed)) { continue; }
+            b.Append("        StrMap " + c.name + "Names = new StrMap();\n");
+            b.Append("        DbResult " + c.name + "Rows = await DbTable.Of(this.Held(), \""
+                + c.relTable + "\").Query()\n");
+            b.Append("            .OrderBy(\"" + Gen.RelLabel(c)
+                + "\").Limit(500).ToResultAsync();\n");
+            b.Append("        if (" + c.name + "Rows != null) {\n");
+            b.Append("            int " + c.name + "V = " + c.name
+                + "Rows.GetColumnIndex(\"" + Gen.RelValue(c) + "\");\n");
+            b.Append("            int " + c.name + "L = " + c.name
+                + "Rows.GetColumnIndex(\"" + Gen.RelLabel(c) + "\");\n");
+            b.Append("            if (" + c.name + "V >= 0 && " + c.name + "L >= 0) {\n");
+            b.Append("                for (int i = 0; i < " + c.name
+                + "Rows.RowCount(); i = i + 1) {\n");
+            b.Append("                    " + c.name + "Names.Set(" + c.name
+                + "Rows.GetString(i, " + c.name + "V), " + c.name + "Rows.GetString(i, "
+                + c.name + "L));\n");
+            b.Append("                }\n");
+            b.Append("            }\n");
+            b.Append("        }\n");
+            b.Append("        for (int i = 0; i < items.Count; i = i + 1) {\n");
+            b.Append("            items[i].Set(\"" + c.name + "Name\", " + c.name
+                + "Names.Get(items[i].Get(\"" + c.name + "\")));\n");
+            b.Append("        }\n");
+        }
         b.Append("        if (rows.Count == 0) { d.Set(\"empty\", \"1\"); }\n");
         b.Append("        int pages = (total + " + cls
             + ".PageSize - 1) / " + cls + ".PageSize;\n");
@@ -943,17 +1224,40 @@ class Gen {
         b.Append("        if (id <= 0 || !this.DbReady()) {\n");
         b.Append("            this.Fail(404, \"2004\", \"记录不存在\");\n");
         b.Append("        }\n");
-        b.Append("        " + mdl + " e = await this." + t.entityName
-            + ".Read(id);\n");
+        if (pubCol.Length > 0) {
+            /* 未发布的记录对外不存在：列表过滤之外，直链详情同样 404。 */
+            b.Append("        " + mdl + " e = await this." + t.entityName
+                + ".Where(a => a.id == id).Where(a => a." + pubCol
+                + " == 1).FirstAsync();\n");
+        } else {
+            b.Append("        " + mdl + " e = await this." + t.entityName
+                + ".Read(id);\n");
+        }
         b.Append("        if (e == null) { this.Fail(404, \"2004\", \"记录不存在\"); }\n");
         b.Append("        ViewData d = new ViewData();\n");
         b.Append("        await Settings.Apply(d);\n");
         b.Append("        d.Set(\"title\", \"" + title + "\");\n");
         b.Append("        d.Set(\"id\", Convert.ToString(id));\n");
         b.Append("        d.Set(\"heading\", \"" + title + "详情\");\n");
+        /* SEO/OG：描述取第一个 text 列摘要，标题取标签列，链接用站点 URL 拼绝对地址。 */
+        string metaCol = Gen.LabelCol(t, cols);
+        if (metaCol != "id") {
+            b.Append("        d.Set(\"ogTitle\", e." + metaCol + ");\n");
+        }
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
-            if (c.name == "id" || !Gen.FrontTextual(c.kind)) { continue; }
+            if (c.name == "id" || c.kind != "text") { continue; }
+            b.Append("        d.Set(\"pageDescription\", Prose.Excerpt(e." + c.name
+                + ", 160));\n");
+            break;
+        }
+        b.Append("        string siteUrl = (await Settings.Get(SettingKeys.SiteUrl, \"\")).Trim();\n");
+        b.Append("        if (siteUrl.Length > 0) { d.Set(\"ogUrl\", siteUrl + \"/" + path
+            + "/\" + Convert.ToString(id)); }\n");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.name == "id" || !Gen.FrontTextual(c.kind)
+                || Gen.RelDesigned(c, designed)) { continue; }
             if (c.kind == "datetime") {
                 b.Append("        d.Set(\"" + c.name + "\", Fmt.Day(e."
                     + c.name + "));\n");
@@ -967,6 +1271,32 @@ class Gen {
                 b.Append("        d.Set(\"" + c.name
                     + "\", Convert.ToString(e." + c.name + "));\n");
             }
+        }
+        /* 关联列显示人话标签：查一次关联表建映射，视图用 {name}Name。 */
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.name == "id" || !Gen.RelDesigned(c, designed)) { continue; }
+            b.Append("        StrMap " + c.name + "Names = new StrMap();\n");
+            b.Append("        DbResult " + c.name + "Rows = await DbTable.Of(this.Held(), \""
+                + c.relTable + "\").Query()\n");
+            b.Append("            .OrderBy(\"" + Gen.RelLabel(c)
+                + "\").Limit(500).ToResultAsync();\n");
+            b.Append("        if (" + c.name + "Rows != null) {\n");
+            b.Append("            int " + c.name + "V = " + c.name
+                + "Rows.GetColumnIndex(\"" + Gen.RelValue(c) + "\");\n");
+            b.Append("            int " + c.name + "L = " + c.name
+                + "Rows.GetColumnIndex(\"" + Gen.RelLabel(c) + "\");\n");
+            b.Append("            if (" + c.name + "V >= 0 && " + c.name + "L >= 0) {\n");
+            b.Append("                for (int i = 0; i < " + c.name
+                + "Rows.RowCount(); i = i + 1) {\n");
+            b.Append("                    " + c.name + "Names.Set(" + c.name
+                + "Rows.GetString(i, " + c.name + "V), " + c.name + "Rows.GetString(i, "
+                + c.name + "L));\n");
+            b.Append("                }\n");
+            b.Append("            }\n");
+            b.Append("        }\n");
+            b.Append("        d.Set(\"" + c.name + "Name\", " + c.name
+                + "Names.Get(Convert.ToString(e." + c.name + ")));\n");
         }
         /* 第一个 text 列切段落渲染正文。 */
         for (int i = 0; i < cols.Count; i = i + 1) {
@@ -988,9 +1318,11 @@ class Gen {
     }
 
     /* 生成前台列表视图源码。 */
-    static string FrontListViewSource(SysGenTable t, List<SysGenColumn> cols) {
+    static string FrontListViewSource(SysGenTable t, List<SysGenColumn> cols,
+        List<SysGenTable> designed) {
         string path = Gen.FrontPath(t);
         StringBuilder b = new StringBuilder();
+        b.Append(Gen.HtmlHeader());
         b.Append("<section class=\"gen-head\">\n");
         b.Append("  <h1>{{heading}}</h1>\n");
         b.Append("  <form class=\"blog-search\" method=\"get\" action=\"/" + path + "\">\n");
@@ -1011,6 +1343,9 @@ class Gen {
             if (c.kind == "bool") {
                 b.Append("{{#if " + c.name + "}}<span>"
                     + Gen.Html(Gen.LabelOf(c)) + "</span>{{/if}}");
+            } else if (Gen.RelDesigned(c, designed)) {
+                b.Append("{{#if " + c.name + "Name}}<span>{{" + c.name
+                    + "Name}}</span>{{/if}}");
             } else {
                 b.Append("<span>{{" + c.name + "}}</span>");
             }
@@ -1045,8 +1380,10 @@ class Gen {
     }
 
     /* 生成前台详情视图源码。 */
-    static string FrontShowViewSource(SysGenTable t, List<SysGenColumn> cols) {
+    static string FrontShowViewSource(SysGenTable t, List<SysGenColumn> cols,
+        List<SysGenTable> designed) {
         StringBuilder b = new StringBuilder();
+        b.Append(Gen.HtmlHeader());
         b.Append("<article class=\"article\">\n");
         b.Append("  <header class=\"article-head\">\n");
         b.Append("    <h1>{{heading}}</h1>\n");
@@ -1055,7 +1392,11 @@ class Gen {
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
             if (c.name == "id" || !Gen.FrontTextual(c.kind)) { continue; }
-            if (c.kind == "bool") {
+            if (Gen.RelDesigned(c, designed)) {
+                b.Append("  {{#if " + c.name + "Name}}<div class=\"gen-fact\"><dt>"
+                    + Gen.Html(Gen.LabelOf(c)) + "</dt><dd>{{" + c.name
+                    + "Name}}</dd></div>{{/if}}\n");
+            } else if (c.kind == "bool") {
                 b.Append("  {{#if " + c.name + "}}<div class=\"gen-fact\"><dt>"
                     + Gen.Html(Gen.LabelOf(c)) + "</dt><dd>是</dd></div>{{/if}}\n");
             } else {
