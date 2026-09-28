@@ -155,6 +155,22 @@ static void link_cap_exceeded(const char *what, int cap) {
 static bool g_time_phases = false;
 static double g_phase_start = 0.0;
 
+/* Phase-0 scale counters. They are deliberately independent of the compiler
+ * decisions: --time must show repeated frontend work without changing it. */
+typedef struct {
+    size_t file_reads;
+    size_t bytes_read;
+    size_t metadata_scans;
+    size_t seed_sources;
+    size_t seed_lex_passes;
+    size_t throwaway_parses;
+    size_t throwaway_parse_fallbacks;
+    size_t real_parses;
+    size_t secondary_parses;
+} zan_scale_stats_t;
+
+static zan_scale_stats_t g_scale_stats;
+
 static double now_ms(void) {
 #ifdef _WIN32
     LARGE_INTEGER f, c;
@@ -226,6 +242,8 @@ static char *read_file(const char *path, size_t *out_len) {
     size_t read = fread(buf, 1, (size_t)len, f);
     buf[read] = '\0';
     fclose(f);
+    g_scale_stats.file_reads++;
+    g_scale_stats.bytes_read += read;
     if (out_len) *out_len = read;
     return buf;
 }
@@ -1427,6 +1445,7 @@ static void pi_flag_ident(pi_file_t *f, const char *s, size_t len) {
  * below keeps the generic-constraint spelling (`where T : class`) from
  * minting bogus candidates. */
 static void pi_scan_file(pi_file_t *f) {
+    g_scale_stats.metadata_scans++;
     size_t len = 0;
     char *src = read_file(f->path, &len);
     if (!src) {
@@ -1609,6 +1628,7 @@ static int pi_typeish(zan_token_kind_t k) {
 }
 
 static void pi_seed_source(const char *source, size_t len) {
+    g_scale_stats.seed_sources++;
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
     zan_lexer_t lex;
@@ -1621,6 +1641,7 @@ static void pi_seed_source(const char *source, size_t len) {
      * share one lexer config, and usings conventionally sit at the top of
      * the file, but a second lex keeps the order irrelevant. */
     for (int pass = 0; pass < 2; pass++) {
+        g_scale_stats.seed_lex_passes++;
         zan_lexer_init(&lex, source, len, 0, arena, diag);
         zan_apply_lex_defines(&lex, pi_target, pi_pp_defines,
                               pi_pp_define_count, pi_publish_mode);
@@ -2284,6 +2305,7 @@ static int pi_close_once(const char *stdlib_root) {
  * closure must not shrink silently, and the main parse loop reports the
  * error exactly as before. */
 static void pi_parse_and_seed(const char *src, size_t len, int is_entry) {
+    g_scale_stats.throwaway_parses++;
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
     zan_lexer_t lex;
@@ -2296,6 +2318,7 @@ static void pi_parse_and_seed(const char *src, size_t len, int is_entry) {
     int errors = diag ? diag->error_count : 0;
     zan_diag_free_buffers(diag);
     if (!unit || errors > 0) {
+        g_scale_stats.throwaway_parse_fallbacks++;
         pi_seed_source(src, len);
     } else {
         /* entry-file usings reach their directories (stdlib files' usings
@@ -2524,6 +2547,7 @@ static zan_ast_node_t *parse_secondary_unit(const char *path,
                                             bool is_publish,
                                             zan_arena_t *arena,
                                             zan_diag_t *diag) {
+    g_scale_stats.secondary_parses++;
     size_t slen = 0;
     char *src = read_file(path, &slen);
     if (!src) return NULL;
@@ -4337,6 +4361,7 @@ int main(int argc, char **argv) {
         zan_parser_init(&parser, &lex, arena, diag);
 
         zan_ast_node_t *unit = zan_parser_parse(&parser);
+        g_scale_stats.real_parses++;
         zan_nsresolve_stamp(unit, arena);
         /* Mark stdlib-authored declarations so the reachability prune can
          * drop the ones nothing references (see nsresolve.c). A file counts
@@ -4713,6 +4738,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "IR stats: %zu AST nodes created; %zu defined functions, "
                 "%zu declarations, %zu blocks, %zu instructions\n",
                 zan_ast_node_count(), definitions, declarations, blocks, instructions);
+        fprintf(stderr, "Scale stats: %zu file reads (%zu MB), %zu metadata scans, "
+                "%zu seed sources/%zu lexer passes, %zu throwaway parses "
+                "(%zu fallback), %zu real parses, %zu secondary parses\n",
+                g_scale_stats.file_reads,
+                g_scale_stats.bytes_read / (1024 * 1024),
+                g_scale_stats.metadata_scans,
+                g_scale_stats.seed_sources,
+                g_scale_stats.seed_lex_passes,
+                g_scale_stats.throwaway_parses,
+                g_scale_stats.throwaway_parse_fallbacks,
+                g_scale_stats.real_parses,
+                g_scale_stats.secondary_parses);
         zan_arena_dump_stats();
     }
 
