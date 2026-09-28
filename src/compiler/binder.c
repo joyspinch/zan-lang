@@ -11,6 +11,7 @@
 #include "arena.h"
 #include "diag.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---- helpers ---- */
@@ -218,80 +219,271 @@ static bool binder_params_equiv(zan_symbol_t *a, zan_symbol_t *b) {
     return true;
 }
 
-static void check_member_name_clash(zan_binder_t *b, zan_symbol_t *type_sym,
-                                    zan_symbol_t *added) {
+/* ---- per-type member-name index (struct zan_binder.member_idx) ---- */
+
+typedef struct {
+    int member_idx; /* index into the type symbol's members[] */
+    int next;       /* next node in the bucket chain, -1 = end */
+} member_name_node_t;
+
+struct zan_member_name_index {
+    int *buckets; /* head node per bucket, -1 = empty */
+    int bucket_cap;
+    member_name_node_t *nodes;
+    int node_count;
+    int node_cap;
+};
+
+static uint64_t member_name_hash(zan_istr_t name) {
+    uint64_t h = 1469598103934665603ULL;
+    for (uint32_t i = 0; i < name.len; i++) {
+        h ^= (unsigned char)name.str[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static void midx_buckets_rehash(zan_symbol_t *type,
+                                struct zan_member_name_index *ix, int ncap) {
+    int *grown = (int *)malloc((size_t)ncap * sizeof(*grown));
+    if (!grown) {
+        fprintf(stderr, "error: out of memory tracking member names\n");
+        exit(1);
+    }
+    for (int i = 0; i < ncap; i++) grown[i] = -1;
+    for (int n = 0; n < ix->node_count; n++) {
+        zan_symbol_t *m = type->members[ix->nodes[n].member_idx];
+        size_t j = (size_t)member_name_hash(m->name) & (size_t)(ncap - 1);
+        while (grown[j] >= 0) j = (j + 1) & (size_t)(ncap - 1);
+        grown[j] = n;
+    }
+    free(ix->buckets);
+    ix->buckets = grown;
+    ix->bucket_cap = ncap;
+}
+
+/* Insert every member not yet indexed (the checked one, plus any members
+ * added without a clash check -- type params, hoisted nested types). */
+static void midx_catch_up(zan_symbol_t *type,
+                          struct zan_member_name_index *ix) {
+    while (ix->node_count < type->member_count) {
+        if ((ix->node_count + 1) * 2 > ix->bucket_cap)
+            midx_buckets_rehash(type, ix, ix->bucket_cap * 2);
+        int n = ix->node_count;
+        if (n == ix->node_cap) {
+            int ncap = ix->node_cap ? ix->node_cap * 2 : 16;
+            member_name_node_t *grown = (member_name_node_t *)realloc(
+                ix->nodes, (size_t)ncap * sizeof(*grown));
+            if (!grown) {
+                fprintf(stderr, "error: out of memory tracking member names\n");
+                exit(1);
+            }
+            ix->nodes = grown;
+            ix->node_cap = ncap;
+        }
+        zan_symbol_t *m = type->members[n];
+        size_t j = (size_t)member_name_hash(m->name) & (size_t)(ix->bucket_cap - 1);
+        ix->nodes[n].member_idx = n;
+        ix->nodes[n].next = ix->buckets[j];
+        ix->buckets[j] = n;
+        ix->node_count++;
+    }
+}
+
+static uint64_t member_type_ptr_hash(const void *p) {
+    uint64_t h = (uint64_t)(uintptr_t)p;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 29;
+    return h;
+}
+
+static struct zan_member_name_index *midx_for(zan_binder_t *b,
+                                              zan_symbol_t *type_sym) {
+    if (b->member_idx_cap == 0) {
+        int ncap = 64;
+        b->member_idx = (struct zan_member_idx_slot *)calloc(
+            (size_t)ncap, sizeof(*b->member_idx));
+        if (!b->member_idx) {
+            fprintf(stderr, "error: out of memory tracking member names\n");
+            exit(1);
+        }
+        b->member_idx_cap = ncap;
+        b->member_idx_count = 0;
+    } else if ((b->member_idx_count + 1) * 2 >= b->member_idx_cap) {
+        int ncap = b->member_idx_cap * 2;
+        struct zan_member_idx_slot *grown =
+            (struct zan_member_idx_slot *)calloc((size_t)ncap,
+                                                 sizeof(*grown));
+        if (!grown) {
+            fprintf(stderr, "error: out of memory tracking member names\n");
+            exit(1);
+        }
+        for (int i = 0; i < b->member_idx_cap; i++) {
+            if (!b->member_idx[i].type) continue;
+            size_t j = (size_t)member_type_ptr_hash(b->member_idx[i].type)
+                       & (size_t)(ncap - 1);
+            while (grown[j].type) j = (j + 1) & (size_t)(ncap - 1);
+            grown[j] = b->member_idx[i];
+        }
+        free(b->member_idx);
+        b->member_idx = grown;
+        b->member_idx_cap = ncap;
+    }
+    size_t j = (size_t)member_type_ptr_hash(type_sym)
+               & (size_t)(b->member_idx_cap - 1);
+    while (b->member_idx[j].type) {
+        if (b->member_idx[j].type == type_sym) return b->member_idx[j].idx;
+        j = (j + 1) & (size_t)(b->member_idx_cap - 1);
+    }
+    struct zan_member_name_index *ix =
+        (struct zan_member_name_index *)calloc(1, sizeof(*ix));
+    if (!ix) {
+        fprintf(stderr, "error: out of memory tracking member names\n");
+        exit(1);
+    }
+    ix->bucket_cap = 16;
+    ix->buckets = (int *)malloc((size_t)ix->bucket_cap * sizeof(*ix->buckets));
+    if (!ix->buckets) {
+        fprintf(stderr, "error: out of memory tracking member names\n");
+        exit(1);
+    }
+    for (int i = 0; i < ix->bucket_cap; i++) ix->buckets[i] = -1;
+    b->member_idx[j].type = type_sym;
+    b->member_idx[j].idx = ix;
+    b->member_idx_count++;
+    midx_catch_up(type_sym, ix);
+    return ix;
+}
+
+/* One same-name candidate against `added`; true when a diagnostic fired and
+ * the scan must stop. Name equality is established by the caller. */
+static bool member_clash_one(zan_binder_t *b, zan_symbol_t *type_sym,
+                             zan_symbol_t *added, zan_symbol_t *m) {
+    bool m_is_code = m->kind == SYM_METHOD;
+    bool a_is_code = added->kind == SYM_METHOD;
+    bool m_is_data = m->kind == SYM_FIELD || m->kind == SYM_PROPERTY;
+    bool a_is_data = added->kind == SYM_FIELD || added->kind == SYM_PROPERTY;
+    if ((m_is_code && a_is_data) || (m_is_data && a_is_code)) {
+        zan_symbol_t *data = a_is_data ? added : m;
+        zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+                      "'%.*s' is declared both as a %s and as a method in "
+                      "'%.*s'; give one of them a different name",
+                      added->name.len, added->name.str,
+                      data->kind == SYM_PROPERTY ? "property" : "field",
+                      type_sym->name.len, type_sym->name.str);
+        return true;
+    }
+    /* A43-A16: two members of the same kind with the same name used to
+     * be accepted silently and every lookup picked whichever came
+     * first -- a semantics swap with zero diagnostics. Fields collide
+     * on name alone (C# CS0102); methods and constructors collide only
+     * when the full parameter list matches too (C# CS0111, overloads
+     * stay legal); enum members collide on name alone. */
+    if (m_is_data && a_is_data) {
+        /* Every indexer property is named "Item" by construction, and C#
+         * overloads them by index signature — exempt indexer/indexer
+         * pairs here; a true duplicate (same index types) is still
+         * rejected when the synthesized op_index methods collide on
+         * name + parameter types below. */
+        zan_ast_node_t *ad = added->decl;
+        zan_ast_node_t *md = m->decl;
+        if (ad && ad->kind == AST_PROPERTY_DECL &&
+            ad->field_decl.indexer_params &&
+            md && md->kind == AST_PROPERTY_DECL &&
+            md->field_decl.indexer_params) {
+            return false;
+        }
+        zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+                      "duplicate '%.*s' in '%.*s': a %s with this name "
+                      "is already declared",
+                      added->name.len, added->name.str,
+                      type_sym->name.len, type_sym->name.str,
+                      added->kind == SYM_PROPERTY ? "property" : "field");
+        return true;
+    }
+    if (m->kind == SYM_ENUM_MEMBER && added->kind == SYM_ENUM_MEMBER) {
+        zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+                      "duplicate enum member '%.*s' in '%.*s'",
+                      added->name.len, added->name.str,
+                      type_sym->name.len, type_sym->name.str);
+        return true;
+    }
+    if ((m_is_code && a_is_code) &&
+        binder_params_equiv(m, added)) {
+        zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+                      "duplicate method '%.*s' in '%.*s': a method with "
+                      "the same parameter types is already declared",
+                      added->name.len, added->name.str,
+                      type_sym->name.len, type_sym->name.str);
+        return true;
+    }
+    if (m->kind == SYM_CONSTRUCTOR && added->kind == SYM_CONSTRUCTOR &&
+        binder_params_equiv(m, added)) {
+        zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+                      "duplicate constructor in '%.*s': a constructor "
+                      "with the same parameter types is already declared",
+                      type_sym->name.len, type_sym->name.str);
+        return true;
+    }
+    return false;
+}
+
+/* Original full scan, kept as the fallback when the same-name candidate
+ * count overflows the fast path's fixed buffer (more than 64 overloads of
+ * one name) or when the index could not be built. */
+static void clash_scan_full(zan_binder_t *b, zan_symbol_t *type_sym,
+                            zan_symbol_t *added) {
     for (int i = 0; i < type_sym->member_count; i++) {
         zan_symbol_t *m = type_sym->members[i];
         if (m == added) continue;
         if (m->name.len != added->name.len ||
             memcmp(m->name.str, added->name.str, (size_t)added->name.len) != 0)
             continue;
-        bool m_is_code = m->kind == SYM_METHOD;
-        bool a_is_code = added->kind == SYM_METHOD;
-        bool m_is_data = m->kind == SYM_FIELD || m->kind == SYM_PROPERTY;
-        bool a_is_data = added->kind == SYM_FIELD || added->kind == SYM_PROPERTY;
-        if ((m_is_code && a_is_data) || (m_is_data && a_is_code)) {
-            zan_symbol_t *data = a_is_data ? added : m;
-            zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
-                          "'%.*s' is declared both as a %s and as a method in "
-                          "'%.*s'; give one of them a different name",
-                          added->name.len, added->name.str,
-                          data->kind == SYM_PROPERTY ? "property" : "field",
-                          type_sym->name.len, type_sym->name.str);
-            return;
+        if (member_clash_one(b, type_sym, added, m)) return;
+    }
+}
+
+static void check_member_name_clash(zan_binder_t *b, zan_symbol_t *type_sym,
+                                    zan_symbol_t *added) {
+    struct zan_member_name_index *ix = midx_for(b, type_sym);
+    if (!ix) { clash_scan_full(b, type_sym, added); return; }
+    midx_catch_up(type_sym, ix);
+    /* every caller appends `added` right before checking; verify instead of
+     * assuming, so a future caller that checks first cannot self-collide */
+    int added_idx = type_sym->member_count - 1;
+    if (added_idx < 0 || type_sym->members[added_idx] != added) {
+        clash_scan_full(b, type_sym, added);
+        return;
+    }
+    int matches[64];
+    int nmatch = 0;
+    bool overflow = false;
+    size_t j = (size_t)member_name_hash(added->name)
+               & (size_t)(ix->bucket_cap - 1);
+    for (int n = ix->buckets[j]; n >= 0; n = ix->nodes[n].next) {
+        int mi = ix->nodes[n].member_idx;
+        if (mi == added_idx) continue;
+        zan_symbol_t *m = type_sym->members[mi];
+        if (m->name.len == added->name.len &&
+            memcmp(m->name.str, added->name.str, (size_t)added->name.len) == 0) {
+            if (nmatch < (int)(sizeof(matches) / sizeof(matches[0])))
+                matches[nmatch++] = mi;
+            else { overflow = true; break; }
         }
-        /* A43-A16: two members of the same kind with the same name used to
-         * be accepted silently and every lookup picked whichever came
-         * first -- a semantics swap with zero diagnostics. Fields collide
-         * on name alone (C# CS0102); methods and constructors collide only
-         * when the full parameter list matches too (C# CS0111, overloads
-         * stay legal); enum members collide on name alone. */
-        if (m_is_data && a_is_data) {
-            /* Every indexer property is named "Item" by construction, and C#
-             * overloads them by index signature — exempt indexer/indexer
-             * pairs here; a true duplicate (same index types) is still
-             * rejected when the synthesized op_index methods collide on
-             * name + parameter types below. */
-            zan_ast_node_t *ad = added->decl;
-            zan_ast_node_t *md = m->decl;
-            if (ad && ad->kind == AST_PROPERTY_DECL &&
-                ad->field_decl.indexer_params &&
-                md && md->kind == AST_PROPERTY_DECL &&
-                md->field_decl.indexer_params) {
-                continue;
-            }
-            zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
-                          "duplicate '%.*s' in '%.*s': a %s with this name "
-                          "is already declared",
-                          added->name.len, added->name.str,
-                          type_sym->name.len, type_sym->name.str,
-                          added->kind == SYM_PROPERTY ? "property" : "field");
+    }
+    if (overflow) { clash_scan_full(b, type_sym, added); return; }
+    /* bucket chains are reverse-declaration order; the flat scan reported
+     * the first (lowest-index) conflict, so restore ascending order */
+    for (int i = 1; i < nmatch; i++) {
+        int v = matches[i];
+        int k = i - 1;
+        while (k >= 0 && matches[k] > v) { matches[k + 1] = matches[k]; k--; }
+        matches[k + 1] = v;
+    }
+    for (int i = 0; i < nmatch; i++) {
+        if (member_clash_one(b, type_sym, added, type_sym->members[matches[i]]))
             return;
-        }
-        if (m->kind == SYM_ENUM_MEMBER && added->kind == SYM_ENUM_MEMBER) {
-            zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
-                          "duplicate enum member '%.*s' in '%.*s'",
-                          added->name.len, added->name.str,
-                          type_sym->name.len, type_sym->name.str);
-            return;
-        }
-        if ((m_is_code && a_is_code) &&
-            binder_params_equiv(m, added)) {
-            zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
-                          "duplicate method '%.*s' in '%.*s': a method with "
-                          "the same parameter types is already declared",
-                          added->name.len, added->name.str,
-                          type_sym->name.len, type_sym->name.str);
-            return;
-        }
-        if (m->kind == SYM_CONSTRUCTOR && added->kind == SYM_CONSTRUCTOR &&
-            binder_params_equiv(m, added)) {
-            zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
-                          "duplicate constructor in '%.*s': a constructor "
-                          "with the same parameter types is already declared",
-                          type_sym->name.len, type_sym->name.str);
-            return;
-        }
     }
 }
 
@@ -427,6 +619,17 @@ static uint64_t tuple_type_hash(zan_type_t *t) {
     return h;
 }
 
+/* FNV-1a over the canonical tuple signature string: the cache index keys on
+ * this string, and equal signatures hash equally by construction. */
+static uint64_t tuple_sig_hash(const char *s, int len) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (int i = 0; i < len; i++) {
+        h ^= (unsigned char)s[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
 /* C# tuples `(T1, T2, ...)` lower to a canonical anonymous struct whose symbol
  * carries Item1..ItemN field members (ItemN for the N-th element, matching C#'s
  * naming). The type is cached per element signature so a tuple return type and
@@ -470,12 +673,20 @@ zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,
     }
     zan_istr_t sig_istr = { (char *)sig, (uint32_t)strlen(sig) };
 
-    /* cache hit: structurally-identical tuple types are one struct */
-    for (int i = 0; i < b->tuple_type_count; i++) {
-        zan_type_t *t = b->tuple_types[i];
-        if (t && t->name.len == sig_istr.len &&
-            memcmp(t->name.str, sig_istr.str, (size_t)sig_istr.len) == 0)
-            return t;
+    /* cache hit: structurally-identical tuple types are one struct. Probed
+     * through tuple_hash (see below); the flat scan compared the new
+     * signature against every cached one, which was O(N^2) across a
+     * project with many distinct tuple shapes. */
+    if (b->tuple_hash_cap) {
+        size_t j = (size_t)tuple_sig_hash(sig_istr.str, (int)sig_istr.len)
+                   & (size_t)(b->tuple_hash_cap - 1);
+        while (b->tuple_hash[j]) {
+            zan_type_t *t = b->tuple_hash[j];
+            if (t->name.len == sig_istr.len &&
+                memcmp(t->name.str, sig_istr.str, (size_t)sig_istr.len) == 0)
+                return t;
+            j = (j + 1) & (size_t)(b->tuple_hash_cap - 1);
+        }
     }
 
     /* synthesize the anonymous struct */
@@ -509,7 +720,26 @@ zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,
         b->tuple_types = grown;
         b->tuple_type_cap = new_cap;
     }
+    if ((b->tuple_type_count + 1) * 2 >= b->tuple_hash_cap) {
+        int ncap = b->tuple_hash_cap ? b->tuple_hash_cap * 2 : 64;
+        zan_type_t **grown = (zan_type_t **)zan_arena_alloc(
+            b->arena, sizeof(zan_type_t *) * (size_t)ncap);
+        memset(grown, 0, sizeof(zan_type_t *) * (size_t)ncap);
+        for (int i = 0; i < b->tuple_type_count; i++) {
+            zan_type_t *e = b->tuple_types[i];
+            size_t j = (size_t)tuple_sig_hash(e->name.str, (int)e->name.len)
+                       & (size_t)(ncap - 1);
+            while (grown[j]) j = (j + 1) & (size_t)(ncap - 1);
+            grown[j] = e;
+        }
+        b->tuple_hash = grown;
+        b->tuple_hash_cap = ncap;
+    }
     b->tuple_types[b->tuple_type_count++] = t;
+    size_t j = (size_t)tuple_sig_hash(sig_istr.str, (int)sig_istr.len)
+               & (size_t)(b->tuple_hash_cap - 1);
+    while (b->tuple_hash[j]) j = (j + 1) & (size_t)(b->tuple_hash_cap - 1);
+    b->tuple_hash[j] = t;
     return t;
 }
 

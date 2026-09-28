@@ -159,6 +159,22 @@ struct zan_binder {
     zan_type_t **tuple_types;
     int tuple_type_count;
     int tuple_type_cap;
+    /* Hash index over tuple_types keyed on the canonical signature string
+     * (open addressing, NULL = empty): the flat scan made every new tuple
+     * signature compare against every cached one -- O(N^2) memcmps on
+     * projects with many distinct tuple shapes. */
+    zan_type_t **tuple_hash;
+    int tuple_hash_cap; /* power of two, 0 = not built */
+    /* Per-type member-name index for check_member_name_clash: open
+     * addressing over type symbols, value owned by binder.c. The flat
+     * per-member scan made a type with M members cost O(M^2) name compares
+     * while binding. */
+    struct zan_member_idx_slot {
+        zan_symbol_t *type; /* NULL = empty slot */
+        struct zan_member_name_index *idx;
+    } *member_idx;
+    int member_idx_cap;   /* power of two, 0 = not built */
+    int member_idx_count;
 };
 
 void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag);
