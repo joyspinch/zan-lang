@@ -101,6 +101,25 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   应区分 AST 真节点数、节点字节数、累计 arena 请求、各阶段当前 Commit
   与进程峰值：释放前端能降优化期峰值，但 IRGen 时单模块与 AST 并存，
   仍需单独衡量生成的函数及指令数，不把晚期释放冒充 IRGen 峰值治理。
+- **pi_scan_file 词法 metadata 落盘缓存（2026-09-28 落地，提交 13584165）**：
+  按内容寻址缓存 top 声明名/标识符全集/using/ext（暖跑 35/35 命中）。
+  五条定式：① key 必须用**显式字段**（arch/os/abi/triple/cpu/features/
+  pointer_size/pic/publish/-D/源内容/路径）——hash `zan_target_t` 原始
+  结构会让 padding 与未来布局改动进 key；② key 必须含**编译器 exe 全
+  字节 hash**（读不到就整个禁用缓存）——scan 规则随编译器演进，只靠
+  schema 版本号挡不住"同版本改逻辑"；③ 缓存要连 **idents 一起存**并
+  **按文件顺序回放 usings**——`pi_reach` 顺序就是 `pi_append_included`
+  的输入文件顺序，nsresolve 冲突集依赖它；idents 漏存会让
+  ZAN_PULLIN_DEBUG 两态 ident_count 失真、缓存问题无从归因；④ 缓存
+  **半读必须回滚 reached 目录快照**（保存 pi_dirs_head/tail 恢复）——
+  半读 reach 出的伪造命名空间会以 ZANPKG_MISSING 污染诊断输出；⑤ 验证
+  定式：`ZAN_META_CACHE_DIR` 指向 _scratch 隔离 → 冷跑 miss=扫描数、
+  暖跑 hit=扫描数 → `--time` Scale stats 的 hit/miss/written 三计数 +
+  IR stats 逐字节比对 → `-D`/`--publish`/源内容修改各看独立批次或单
+  文件 miss → 截断一个缓存文件验安全回退 → pull-in 四语义用例 +
+  `ZAN_PULLIN_DEBUG` 两态 diff。注意 `-DFOO=1` 第二跑 hit 是命中同 key
+  自己写的缓存（正确），别误读成"define 没进 key"——看缓存目录文件
+  总数是否按批次增长。
 
 ## 发布体积：数据逐符号分节与链接器 GC 的边界（2026-09-15）
 
