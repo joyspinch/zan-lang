@@ -1,0 +1,100 @@
+// Compile with explicit packages/Zan.Mvc/src/**/*.zan sources and --auto-stdlib.
+// Run with one scratch directory argument; compile its generated *.zan with the same package sources.
+using System;
+using System.IO;
+using ZanWeb.Core;
+using ZanWeb.Admin.Dev;
+using ZanWeb.Model;
+
+class Program {
+    static int failures;
+    static void Check(bool ok, string name) {
+        if (!ok) { Program.failures = Program.failures + 1; Console.WriteLine("FAIL " + name); }
+    }
+    static void Main(string[] args) {
+        if (args.Length != 1) { Console.WriteLine("FAIL scratch argument"); Environment.Exit(1); }
+        string root = args[0] + "/gen_sample_regression";
+        Directory.CreateDirectoryRecursive(root);
+        SysGenTable t = new SysGenTable();
+        t.tableName = "gen_sample";
+        t.entityName = "GenSample";
+        t.section = "content";
+        t.title = "Quoted \"title\" & <script>\nsecond";
+        List<SysGenColumn> cols = new List<SysGenColumn>();
+        SysGenColumn name = new SysGenColumn();
+        name.name = "name";
+        name.kind = "string";
+        name.size = 80;
+        name.label = "Name \"X\" </summary>\nprivate void Hack() {}";
+        name.widget = "text";
+        name.inList = 1;
+        name.inCreate = 1;
+        name.required = 1;
+        cols.Add(name);
+        SysGenColumn enabled = new SysGenColumn();
+        enabled.name = "enabled";
+        enabled.kind = "bool";
+        enabled.widget = "switch";
+        enabled.label = "On & Off";
+        enabled.inList = 1;
+        enabled.inEdit = 1;
+        cols.Add(enabled);
+        Program.Check(Gen.Valid(t, cols), "valid sample");
+        List<string> paths = new List<string>();
+        paths.Add(root + "/GenSample.zan");
+        paths.Add(root + "/GenSampleController.zan");
+        paths.Add(root + "/GenSampleDao.zan");
+        paths.Add(root + "/GenSampleController.Index.html");
+        paths.Add(root + "/GenSampleController.Form.html");
+        paths.Add(root + "/GenSampleFrontController.zan");
+        paths.Add(root + "/GenSampleFrontController.Index.html");
+        paths.Add(root + "/GenSampleFrontController.Show.html");
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            if (File.Exists(paths[i])) { File.Delete(paths[i]); }
+        }
+        List<string> sources = new List<string>();
+        sources.Add(Gen.ModelSource(t, cols));
+        sources.Add(Gen.ControllerSource(t, cols));
+        sources.Add(Gen.DaoSource(t, cols));
+        sources.Add(Gen.ListViewSource(t, cols));
+        sources.Add(Gen.FormViewSource(t, cols));
+        sources.Add(Gen.FrontControllerSource(t, cols));
+        sources.Add(Gen.FrontListViewSource(t, cols));
+        sources.Add(Gen.FrontShowViewSource(t, cols));
+        Program.Check(sources[0].Contains("&lt;/summary&gt; private void Hack()"), "comment single line");
+        Program.Check(sources[1].Contains("Quoted \\\"title\\\""), "string literal escaped");
+        Program.Check(sources[1].Contains("if (id == 0) {"), "create-only input guarded");
+        Program.Check(sources[1].Contains("if (id > 0) {"), "edit-only input guarded");
+        Program.Check(sources[1].Contains(".EditFields(\"enabled:text\")")
+            && !sources[1].Contains(".EditFields(\"name:"), "create-only field not editable");
+        Program.Check(sources[4].Contains("{{#if editing}}") && sources[4].Contains("{{#if creating}}"), "form roles");
+        Program.Check(sources[4].Contains("selected hidden") && sources[4].Contains("On &amp; Off"), "bool edit and html escape");
+        CoderController.WriteSources(paths, sources);
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            Program.Check(File.Exists(paths[i]) && File.ReadAllText(paths[i]) == sources[i], "published " + Convert.ToString(i));
+        }
+        bool rejected = false;
+        try { CoderController.WriteSources(paths, sources); } catch (Exception ex) { rejected = true; }
+        Program.Check(rejected && File.ReadAllText(paths[0]) == sources[0], "no overwrite");
+        List<string> blocked = new List<string>();
+        blocked.Add(root + "/rollback-first.zan");
+        blocked.Add(paths[0]);
+        List<string> pair = new List<string>();
+        pair.Add("new first");
+        pair.Add("new second");
+        rejected = false;
+        try { CoderController.WriteSources(blocked, pair); } catch (Exception ex) { rejected = true; }
+        Program.Check(rejected && !File.Exists(blocked[0])
+            && File.ReadAllText(paths[0]) == sources[0], "staged failure leaves no output");
+        SysGenColumn bad = new SysGenColumn();
+        bad.name = "class";
+        bad.kind = "string";
+        cols.Add(bad);
+        Program.Check(!Gen.Valid(t, cols), "reserved identifier");
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            if (File.Exists(paths[i])) { File.Delete(paths[i]); }
+        }
+        if (Program.failures != 0) { Environment.Exit(1); }
+        Console.WriteLine("PASS generator sources (8 files)");
+    }
+}

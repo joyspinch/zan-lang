@@ -63,23 +63,23 @@
     // opened from outside the admin space (e.g. /static/...) would otherwise
     // sit in localStorage and resurrect as a dead tab on every reload.
     state.tabs = state.tabs.filter(function (t) {
-      return base(t.path).indexOf('/admin') === 0;
+      return base(t.path).indexOf('/admin') === 0 &&
+        normalize(t.path) !== '/admin/monitor/data';
     });
-    // One tab per screen, matching open(): variants that differ only in
-    // query (?page=1 vs ?page=2) collapse onto the variant seen last.
-    var byBase = {};
+    // Page and filter variants share a tab; designed tables have separate tabs.
+    var byScreen = {};
     var merged = [];
     for (var i = 0; i < state.tabs.length; i++) {
-      var b = base(state.tabs[i].path);
-      if (!byBase[b]) { merged.push(byBase[b] = state.tabs[i]); }
-      else { byBase[b].path = state.tabs[i].path; }
+      var key = tabKey(state.tabs[i].path);
+      if (!byScreen[key]) { merged.push(byScreen[key] = state.tabs[i]); }
+      else { byScreen[key].path = state.tabs[i].path; }
     }
     state.tabs = merged;
     state.active = state.active ? normalize(state.active) : '';
     if (state.active && find(state.active) < 0) {
-      var ab = base(state.active);
+      var activeKey = tabKey(state.active);
       for (var j = 0; j < state.tabs.length; j++) {
-        if (base(state.tabs[j].path) === ab) { state.active = state.tabs[j].path; break; }
+        if (tabKey(state.tabs[j].path) === activeKey) { state.active = state.tabs[j].path; break; }
       }
     }
     if (find(state.active) < 0) { state.active = ''; }
@@ -120,7 +120,8 @@
       tabs.appendChild(b);
     });
     document.querySelectorAll('.ad-side a.mi').forEach(function (a) {
-      a.classList.toggle('active', a.getAttribute('href') === base(state.active));
+      var href = a.getAttribute('href');
+      a.classList.toggle('active', tabKey(href) === tabKey(state.active));
     });
     if (window._ensureActiveMenuGroupOpen) { window._ensureActiveMenuGroupOpen(); }
     save();
@@ -154,6 +155,12 @@
   function base(path) {
     var u = new URL(path || '/admin', location.origin);
     return u.pathname;
+  }
+
+  function tabKey(path) {
+    var u = new URL(path || '/admin', location.origin);
+    return u.pathname === '/admin/monitor/data'
+      ? u.pathname + '?t=' + (u.searchParams.get('t') || '') : u.pathname;
   }
 
   // Right-click on a tab: the usual workspace menu. Closing is deliberate --
@@ -230,12 +237,11 @@
     var same = state.active === path;
     var i = find(path);
     if (i < 0) {
-      /* Same screen, different query (pager / filter / detail link) reuses
-         its tab in place: the tab strip stays one-per-screen and the URL
-         still tracks what the panel shows. */
-      var root = base(path);
+      /* Pager and filter changes reuse their screen's tab. Designed tables
+         keep distinct tabs because each table is a separate menu entry. */
+      var root = tabKey(path);
       for (var j = 0; j < state.tabs.length; j++) {
-        if (base(state.tabs[j].path) === root) {
+        if (tabKey(state.tabs[j].path) === root) {
           i = j;
           state.tabs[j].path = path;
           if (title) { state.tabs[j].title = title; }

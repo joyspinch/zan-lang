@@ -3,6 +3,7 @@ using System.Data;
 using System.Data.Orm;
 using System.IO;
 using System.Json;
+using System.Security.Cryptography;
 using System.Text;
 using System.Web;
 using ZanWeb.Ai;
@@ -44,6 +45,9 @@ class CoderController : AdminController {
     [Description("表信息表单")]
     async void TableForm() {
         int id = this.InInt("id", 0);
+        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {
+            this.Fail(403, "0403", "无操作权限"); return;
+        }
         ViewData d = new ViewData();
         d.Set("id", Convert.ToString(id));
         d.Set("dialogTitle", "新建数据表");
@@ -68,13 +72,24 @@ class CoderController : AdminController {
     [Description("保存表信息")]
     async void TableSave() {
         int id = this.InInt("id", 0);
+        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {
+            this.Fail(403, "0403", "无操作权限"); return;
+        }
         string tableName = this.Need("tableName", "表名");
         string title = this.Need("title", "名称");
         if (!Gen.Safe(tableName)) {
             this.Fail(400, "0004", "表名只能用小写字母、数字和下划线，且以字母开头");
         }
+        if (tableName.ToLower().StartsWith("sys_")) {
+            this.Fail(400, "0004", "不能设计系统表");
+        }
         string entityName = this.In("entityName");
         if (entityName.Length == 0) { entityName = CoderController.Pascal(tableName); }
+        if (!Gen.SafeCode(entityName) || entityName == "RowView"
+            || entityName == "AdminController" || entityName == "AppController"
+            || entityName == "Gen") {
+            this.Fail(400, "0004", "实体名不是安全的 Zan 类型名");
+        }
         /* URL 段落而非标签：侧边栏分区由此派生。 */
         string section = this.In("section");
         if (!Gen.Safe(section)) { section = "content"; }
@@ -87,6 +102,11 @@ class CoderController : AdminController {
             this.Fail(400, "0004", "表 " + tableName + " 已经设计过了");
         }
         if (id > 0) {
+            SysGenTable current = await this.SysGenTable.ById(id);
+            if (current == null) { this.Fail(404, "0404", "设计不存在"); }
+            if (current.migrated == 1 && current.tableName != tableName) {
+                this.Fail(409, "0004", "已建表不能更改表名");
+            }
             int n = await this.SysGenTable.Update()
                 .Set(a => a.tableName, tableName)
                 .Set(a => a.entityName, entityName)
@@ -175,6 +195,9 @@ class CoderController : AdminController {
     [Description("字段表单")]
     async void ColumnForm() {
         int id = this.InInt("id", 0);
+        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {
+            this.Fail(403, "0403", "无操作权限"); return;
+        }
         int tableId = this.InInt("tableId", 0);
         ViewData d = new ViewData();
         d.Set("id", Convert.ToString(id));
@@ -221,13 +244,22 @@ class CoderController : AdminController {
     [Description("保存字段")]
     async void ColumnSave() {
         int id = this.InInt("id", 0);
+        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {
+            this.Fail(403, "0403", "无操作权限"); return;
+        }
         int tableId = this.InInt("tableId", 0);
         string name = this.Need("name", "字段名");
-        if (!Gen.Safe(name) || name == "id") {
-            this.Fail(400, "0004", "字段名只能用小写字母、数字和下划线，且不能是 id");
+        if (!Gen.SafeCode(name)) {
+            this.Fail(400, "0004", "字段名不是安全的 Zan 字段名");
         }
         string kind = this.In("kind");
         if (kind.Length == 0) { kind = "string"; }
+        if (!CoderController.InList(kind, "string,text,int,long,decimal,bool,datetime")) {
+            this.Fail(400, "0004", "不支持的存储类型");
+        }
+        if (tableId <= 0 || await this.SysGenTable.ById(tableId) == null) {
+            this.Fail(404, "0404", "设计不存在");
+        }
         SysGenColumn clash = await this.SysGenColumn
             .Where(a => a.tableId == tableId).Where(a => a.name == name).FirstAsync();
         if (clash != null && clash.id != id) {
@@ -250,17 +282,24 @@ class CoderController : AdminController {
         SysGenColumn c = new SysGenColumn();
         if (id > 0) {
             SysGenColumn cur = await this.SysGenColumn.ById(id);
-            if (cur == null) { this.Fail(404, "0404", "字段不存在"); }
+            if (cur == null || cur.tableId != tableId) {
+                this.Fail(404, "0404", "字段不存在");
+            }
             c = cur;
         }
         c.tableId = tableId;
         c.name = name;
         c.kind = kind;
         c.size = this.InInt("size", 255);
+        if (c.size < 0 || c.size > 4000) { this.Fail(400, "0004", "字段长度不合法"); }
         c.defValue = this.In("defValue");
         c.label = this.In("label");
         c.widget = this.In("widget");
         if (c.widget.Length == 0) { c.widget = "text"; }
+        if (!CoderController.InList(c.widget,
+                "text,textarea,number,select,switch,date,richtext,upload")) {
+            this.Fail(400, "0004", "不支持的控件");
+        }
         c.dictType = this.In("dictType");
         c.relTable = relTable;
         c.relValue = relValue;
@@ -611,7 +650,7 @@ class CoderController : AdminController {
             JsonValue o = arr.At(i);
             if (o == null || !o.IsObject()) { outp.dropped = outp.dropped + 1; continue; }
             string name = o.Str("name", "").Trim();
-            if (!Gen.Safe(name) || name == "id" || taken.Contains(name)) {
+            if (!Gen.SafeCode(name) || taken.Contains(name)) {
                 outp.dropped = outp.dropped + 1;
                 continue;
             }
@@ -733,8 +772,13 @@ class CoderController : AdminController {
         List<SysGenColumn> cols = await this.SysGenColumn
             .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
         if (cols.Count == 0) { this.Fail(400, "0004", "先添加字段"); }
+        if (!Gen.Valid(t, cols)) { this.Fail(400, "0004", "表或字段设计不合法"); }
         IDbConnection db = await this.Conn();
         if (db == null) { this.Fail(503, "2001", "数据库不可用"); }
+        /* A fresh design must never adopt or alter an unrelated existing table. */
+        if (t.migrated != 1 && await DbSchema.TableExistsAsync(db, t.tableName)) {
+            this.Fail(409, "0004", "数据库中已存在同名表，不能由设计器接管");
+        }
 
         int changed = await Gen.Migrate(db, t, cols);
         int _u = await this.SysGenTable.Update()
@@ -757,6 +801,7 @@ class CoderController : AdminController {
         List<SysGenColumn> cols = await this.SysGenColumn
             .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
         if (cols.Count == 0) { this.Fail(400, "0004", "先添加字段"); }
+        if (!Gen.Valid(t, cols)) { this.Fail(400, "0004", "表或字段设计不合法"); }
 
         /* 服务器从 build/ 运行，待重建源码在其上一级；gen.root 说明不同部署布局下的路径。 */
         string root = await Settings.Get(SettingKeys.GenRoot, "..");
@@ -779,21 +824,71 @@ class CoderController : AdminController {
             + "FrontController.Index.html";
         string frontShowPath = root + "/views/Front/" + t.entityName
             + "FrontController.Show.html";
-        File.WriteAllText(modelPath, Gen.ModelSource(t, cols));
-        File.WriteAllText(ctlPath, Gen.ControllerSource(t, cols));
-        File.WriteAllText(daoPath, Gen.DaoSource(t, cols));
-        File.WriteAllText(listPath, Gen.ListViewSource(t, cols));
-        File.WriteAllText(formPath, Gen.FormViewSource(t, cols));
-        File.WriteAllText(frontCtlPath, Gen.FrontControllerSource(t, cols));
-        File.WriteAllText(frontListPath, Gen.FrontListViewSource(t, cols));
-        File.WriteAllText(frontShowPath, Gen.FrontShowViewSource(t, cols));
+        List<string> paths = new List<string>();
+        paths.Add(modelPath); paths.Add(ctlPath); paths.Add(daoPath);
+        paths.Add(listPath); paths.Add(formPath); paths.Add(frontCtlPath);
+        paths.Add(frontListPath); paths.Add(frontShowPath);
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            if (File.Exists(paths[i]) || Directory.ExistsOnDisk(paths[i])) {
+                this.Fail(409, "0004", "生成目标已存在，拒绝覆盖：" + paths[i]);
+            }
+        }
+        List<string> sources = new List<string>();
+        sources.Add(Gen.ModelSource(t, cols));
+        sources.Add(Gen.ControllerSource(t, cols));
+        sources.Add(Gen.DaoSource(t, cols));
+        sources.Add(Gen.ListViewSource(t, cols));
+        sources.Add(Gen.FormViewSource(t, cols));
+        sources.Add(Gen.FrontControllerSource(t, cols));
+        sources.Add(Gen.FrontListViewSource(t, cols));
+        sources.Add(Gen.FrontShowViewSource(t, cols));
+        try {
+            CoderController.WriteSources(paths, sources);
+        } catch (Exception ex) {
+            this.Fail(500, "2001", "生成文件失败：" + ex.Message);
+        }
 
-        int _u = await this.SysGenTable.Update()
-            .Set(a => a.generatedAt, WebApp.NowSeconds())
-            .Where(a => a.id == id).ExecuteAffrowsAsync();
+        /* Do not hide the generic data screen until the generated route is deployed. */
         await this.Note("生成代码", t.tableName, true, ctlPath);
         this.Saved("已生成 8 个文件（模型/后台控制器/Dao/后台视图×2"
             + "/前台控制器/前台视图×2），重新编译后生效");
+    }
+
+    /* 先将全部内容写到同目录随机临时文件，再以硬链接独占发布。
+       硬链接创建在目标已存在时失败，且目标只会看到写完的内容。 */
+    static void WriteSources(List<string> paths, List<string> sources) {
+        if (paths.Count != sources.Count) { throw new Exception("生成文件数不一致"); }
+        string token = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+        List<string> staged = new List<string>();
+        List<string> published = new List<string>();
+        try {
+            for (int i = 0; i < paths.Count; i = i + 1) {
+                if (File.Exists(paths[i]) || Directory.ExistsOnDisk(paths[i])) {
+                    throw new Exception("生成目标已存在：" + paths[i]);
+                }
+                string tmp = paths[i] + "." + token + ".tmp";
+                staged.Add(tmp);
+                File.WriteAllText(tmp, sources[i]);
+            }
+            for (int i = 0; i < paths.Count; i = i + 1) {
+                if (File.Exists(paths[i]) || Directory.ExistsOnDisk(paths[i])) {
+                    throw new Exception("生成目标已存在：" + paths[i]);
+                }
+                if (!File.CreateHardLink(paths[i], staged[i])) {
+                    throw new Exception("目标已存在或发布生成文件失败：" + paths[i]);
+                }
+                published.Add(paths[i]);
+                File.Delete(staged[i]);
+            }
+        } catch (Exception ex) {
+            for (int i = 0; i < staged.Count; i = i + 1) {
+                if (File.Exists(staged[i])) { File.Delete(staged[i]); }
+            }
+            for (int i = 0; i < published.Count; i = i + 1) {
+                if (File.Exists(published[i])) { File.Delete(published[i]); }
+            }
+            throw ex;
+        }
     }
 
     /* 写出前预览设计将产生的源码。 */

@@ -55,10 +55,11 @@ class CrudScreenController : AdminController {
         List<StrMap> rows = await this.LoadRows(conf, conds, q);
 
         int mask = await this.Mask();
+        bool canCreate = (mask & (int)PermBit.Create) != 0;
         bool canUpdate = (mask & (int)PermBit.Update) != 0;
         bool canDelete = (mask & (int)PermBit.Delete) != 0;
         lp.Screen(this, d, "/" + conf.path, "/" + conf.path,
-            conds, q, (int)total, rows, canUpdate, canDelete);
+            conds, q, (int)total, rows, canCreate, canUpdate, canDelete);
         this.CrudPage(d);
     }
 
@@ -161,6 +162,9 @@ class CrudScreenController : AdminController {
         CrudConf conf = this.Def();
         int id = this.InAnyInt("id");
         bool isEdit = id > 0;
+        if (!await this.Can(isEdit ? (int)PermBit.Update : (int)PermBit.Create)) {
+            this.Fail(403, "0403", "无操作权限"); return;
+        }
         FormPage fp = conf.ToFormPage(isEdit ? Convert.ToString(id) : "0");
         ViewData d = new ViewData();
         d.Set("dialogTitle", (isEdit ? Lang.T("编辑") : Lang.T("新增")) + Lang.T(conf.title));
@@ -185,6 +189,9 @@ class CrudScreenController : AdminController {
         CrudConf conf = this.Def();
         int id = this.InAnyInt("id");
         bool isNew = id <= 0;
+        if (!await this.Can(isNew ? (int)PermBit.Create : (int)PermBit.Update)) {
+            this.Fail(403, "0403", "无操作权限"); return;
+        }
         ListPage lp = conf.Build(false);
         FormPage fp = conf.ToFormPage(isNew ? "0" : Convert.ToString(id));
         string err = fp.Validate(this);
@@ -251,16 +258,35 @@ class CrudScreenController : AdminController {
     }
 
     /* 批量：value 为空 → 批量删除；否则写 toggleField（批量启停等
-       "同一列一个值"）。批量删除是表级清选，不走行级 OnDeleting 占用
-       钩子——有子记录的表不应声明批量删（如 Categories），占用约束
-       由行删端点保证。ids 上限与逐占位符由 CrudOps 网关与 Ids() 保证。 */
+       "同一列一个值"）。删除前逐行核对存在性和占用，删除后逐行触发
+       子表/缓存副作用；权限按实际分支复核。 */
     virtual async Task DoBatch() {
         CrudConf conf = this.Def();
-        List<int> ids = this.IdsAny();
         string value = this.InAny("value");
+        if (!await this.Can(value.Length == 0 ? (int)PermBit.Delete : (int)PermBit.Update)) {
+            this.Fail(403, "0403", "无操作权限"); return;
+        }
+        List<int> ids = this.IdsAny();
         ListPage lp = conf.Build(true);
         if (value.Length == 0) {
-            await CrudOps.Delete(this, lp, ids, conf.title + "·批量删除");
+            if (ids.Count == 0) { this.Fail(400, "0004", "未选择记录"); return; }
+            DbTable t = DbTable.Of(this.Held(), conf.table);
+            List<int> checkedIds = new List<int>();
+            for (int i = 0; i < ids.Count; i = i + 1) {
+                int id = ids[i];
+                if (checkedIds.Contains(id)) { continue; }
+                DbResult r = await t.ReadAsync("id", id);
+                if (r == null || r.RowCount() == 0) {
+                    this.Fail(404, "0404", "记录不存在"); return;
+                }
+                string why = await this.OnDeleting(id);
+                if (why.Length > 0) { this.Fail(400, "0004", why); return; }
+                checkedIds.Add(id);
+            }
+            await CrudOps.Delete(this, lp, checkedIds, conf.title + "·批量删除");
+            for (int i = 0; i < checkedIds.Count; i = i + 1) {
+                await this.OnDeleted(checkedIds[i]);
+            }
             return;
         }
         string bad = this.CheckValue(conf, conf.toggleField, value);
@@ -354,8 +380,7 @@ class CrudScreenController : AdminController {
     /* 行内单字段写后副作用（镜像重读、公开缓存失效）。 */
     virtual async Task OnFielded(string field, long id) { }
 
-    /* 批量启停写后副作用（OnFielded 的批量版；批量删除是表级清选，
-       不逐行走 OnDeleted——有子记录的表不应声明批量删）。 */
+    /* 批量启停写后副作用（OnFielded 的批量版）。 */
     virtual async Task OnBatched(string field, string value, List<int> ids) { }
 
     /* 单行删除后副作用（子表级联、镜像重读；占用检查在 OnDeleting）。 */

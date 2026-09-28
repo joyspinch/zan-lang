@@ -1485,7 +1485,7 @@ set_tests_properties(server_mvc_readonly_action_lease PROPERTIES TIMEOUT 180
   LABELS "full;standard;smoke")
 
 foreach(_mvc_case security_bootstrap security_verify_code security_routes
-                  security_http_policy verify_code_issuance)
+                  security_http_policy verify_code_issuance permission_branches)
   add_test(NAME server_mvc_${_mvc_case}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -1498,6 +1498,19 @@ foreach(_mvc_case security_bootstrap security_verify_code security_routes
   set_tests_properties(server_mvc_${_mvc_case} PROPERTIES TIMEOUT 180
     LABELS "full;standard;smoke")
 endforeach()
+
+add_test(NAME server_mvc_generator_sources
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/generator_sources.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/generator_sources.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/server_mvc_generator_sources${_exe_ext}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    "-DZANC_ARGS=${_mvc_readonly_sources};--auto-stdlib"
+    -DRUN_ARGS=${CMAKE_BINARY_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(server_mvc_generator_sources PROPERTIES TIMEOUT 180
+  LABELS "full;standard;smoke")
 
 add_test(NAME server_mvc_metrics_flush_retry
   COMMAND ${CMAKE_COMMAND}

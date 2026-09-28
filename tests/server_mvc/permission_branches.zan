@@ -1,0 +1,154 @@
+// Compile with all packages/Zan.Mvc/src/*.zan sources and --auto-stdlib.
+// Exercise the real CRUD branch guards with one-bit roles, not just route metadata.
+using System;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb.Admin;
+using ZanWeb.Admin.Monitor;
+using ZanWeb.Model;
+using ZanWeb.Security;
+using ZanWeb.Web;
+
+[Route("/permission-branch/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+class PermissionBranchController : CrudScreenController {
+    protected override CrudConf Def() {
+        return CrudConf.Of("permission_probe", "permission probe", "permission-branch")
+            .Col("name", "Name").Req()
+            .Col("enabled", "Enabled").Int().Inline().Toggle("enabled");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    async void Save() { await this.DoSave(); }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update | PermBit.Delete)]
+    async void Batch() { await this.DoBatch(); }
+}
+
+class Program {
+    static int failures;
+    static void Check(bool ok, string label) {
+        if (!ok) { Program.failures = Program.failures + 1; Console.WriteLine("FAIL " + label); }
+    }
+
+    static HttpContext Ctx(string action, string query) {
+        HttpRequest req = HttpRequest.Parse("POST /permission-branch/" + action + "?" + query
+            + " HTTP/1.1\r\nHost: test\r\n\r\n");
+        HttpContext ctx = new HttpContext(req, "127.0.0.1");
+        ctx.uid = "42";
+        ctx.routeAction = "PermissionBranchController." + action;
+        return ctx;
+    }
+
+    static async void RoleFor(int mask, string screen) {
+        SysRole r = new SysRole();
+        r.id = 7;
+        r.status = 1;
+        SysRoleGrant g = new SysRoleGrant();
+        g.roleId = 7;
+        g.action = screen;
+        g.mask = mask;
+        List<SysRole> roles = new List<SysRole>();
+        roles.Add(r);
+        List<SysRoleGrant> grants = new List<SysRoleGrant>();
+        grants.Add(g);
+        await PermTable.LoadRoles(roles, grants);
+        PermTable.SetUser("42", false, ",7,");
+    }
+
+    static async void Role(int mask) {
+        await Program.RoleFor(mask, "PermissionBranchController");
+    }
+
+    static async int SaveStatus(int mask, string query) {
+        await Program.Role(mask);
+        HttpContext ctx = Program.Ctx("Save", query);
+        PermissionBranchController ctrl = new PermissionBranchController();
+        ctrl.__Bind(ctx);
+        try { await ctrl.Save(); }
+        catch (ApiError e) { return e.Status(); }
+        return 200;
+    }
+
+    static async int BatchStatus(int mask, string query) {
+        await Program.Role(mask);
+        HttpContext ctx = Program.Ctx("Batch", query);
+        PermissionBranchController ctrl = new PermissionBranchController();
+        ctrl.__Bind(ctx);
+        try { await ctrl.Batch(); }
+        catch (ApiError e) { return e.Status(); }
+        return 200;
+    }
+
+    static async int DataStatus(int mask, string action, string query) {
+        await Program.RoleFor(mask, "DataController");
+        HttpContext ctx = Program.Ctx(action, query);
+        ctx.routeAction = "DataController." + action;
+        DataController ctrl = new DataController();
+        ctrl.__Bind(ctx);
+        try {
+            if (action == "Form") { await ctrl.Form(); }
+            else { await ctrl.Save(); }
+        } catch (ApiError e) { return e.Status(); }
+        return 200;
+    }
+
+    static async void Main() {
+        WebApp app = new WebApp("127.0.0.1", 0);
+        __AttrRoutes.Register(app);
+        Perm.Index(app);
+        Program.Check(PermTable.Open(), "permission table opened");
+        Program.Check(Perm.BitOf("PermissionBranchController.Save") == ((int)PermBit.Create | (int)PermBit.Update)
+            && Perm.BitOf("PermissionBranchController.Batch") == ((int)PermBit.Update | (int)PermBit.Delete),
+            "both route bits indexed");
+        await Program.Role((int)PermBit.Create);
+        Program.Check(await AuthUser.Allow("42", "PermissionBranchController.Save"),
+            "create-only role passes Save route gate");
+        await Program.Role((int)PermBit.Update);
+        Program.Check(await AuthUser.Allow("42", "PermissionBranchController.Save")
+            && await AuthUser.Allow("42", "PermissionBranchController.Batch"),
+            "update-only role passes both route gates");
+        await Program.Role((int)PermBit.Delete);
+        Program.Check(await AuthUser.Allow("42", "PermissionBranchController.Batch"),
+            "delete-only role passes Batch route gate");
+        // Allowed paths stop at missing required input/empty IDs (400), before DB access.
+        Program.Check(await Program.SaveStatus((int)PermBit.Create, "id=0") == 400,
+            "create-only role reaches create branch");
+        Program.Check(await Program.SaveStatus((int)PermBit.Create, "id=3") == 403,
+            "create-only role cannot update");
+        Program.Check(await Program.SaveStatus((int)PermBit.Update, "id=0") == 403,
+            "update-only role cannot create");
+        Program.Check(await Program.SaveStatus((int)PermBit.Update, "id=3") == 400,
+            "update-only role reaches update branch");
+        Program.Check(await Program.BatchStatus((int)PermBit.Delete, "value=") == 400,
+            "delete-only role reaches delete branch");
+        Program.Check(await Program.BatchStatus((int)PermBit.Delete, "value=1") == 403,
+            "delete-only role cannot batch update");
+        Program.Check(await Program.BatchStatus((int)PermBit.Update, "value=") == 403,
+            "update-only role cannot batch delete");
+        Program.Check(await Program.BatchStatus((int)PermBit.Update, "value=1") == 400,
+            "update-only role reaches batch update branch");
+        Program.Check(await Program.DataStatus((int)PermBit.Create, "Form", "id=3") == 403
+            && await Program.DataStatus((int)PermBit.Create, "Save", "id=3") == 403,
+            "data manager create-only role cannot edit");
+        Program.Check(await Program.DataStatus((int)PermBit.Update, "Form", "id=0") == 403
+            && await Program.DataStatus((int)PermBit.Update, "Save", "id=0") == 403,
+            "data manager update-only role cannot create");
+        ListPage toolbar = ListPage.Of().TbarAdd("新增", "/new")
+            .TbarBatch("启用", "/batch", "1", "")
+            .TbarDelete("/batch");
+        string creator = toolbar.Toolbar(new ViewData(), true, false, false);
+        string updater = toolbar.Toolbar(new ViewData(), false, true, false);
+        string deleter = toolbar.Toolbar(new ViewData(), false, false, true);
+        Program.Check(creator.Contains("/new") && !creator.Contains("data-batch")
+            && updater.Contains("data-value=\"1\"") && !updater.Contains("/new")
+            && !updater.Contains("删除")
+            && deleter.Contains("data-batch") && !deleter.Contains("/new")
+            && !deleter.Contains("data-value=\"1\""),
+            "toolbar only shows actions with matching permission");
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        if (Program.failures != 0) { throw new Exception("branch permission regression"); }
+    }
+}
