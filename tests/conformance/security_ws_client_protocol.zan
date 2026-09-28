@@ -1,0 +1,50 @@
+using System;
+using System.Net.WebSocket;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        if (ok) { Console.WriteLine("ok " + name); }
+        else { Console.WriteLine("FAIL " + name); failures = failures + 1; }
+    }
+
+    static void Main() {
+        string accept = "expected-accept";
+        string good = "HTTP/1.1 101 Switching Protocols\r\n"
+            + "Upgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n"
+            + "Sec-WebSocket-Accept: " + accept + "\r\n";
+        Check(WsHandshake.ValidResponse(good, accept), "strict 101 response accepted");
+        Check(!WsHandshake.ValidResponse(
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            + "Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n",
+            accept), "missing upgrade rejected");
+        Check(!WsHandshake.ValidResponse(
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            + "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            + "X-Note: " + accept + "suffix\r\n", accept), "accept in unrelated header rejected");
+        Check(!WsHandshake.ValidResponse(
+            good + "Sec-WebSocket-Accept: " + accept + "\r\n", accept),
+            "duplicate accept rejected");
+
+        WsFrame serverText = WsFrame.TextFrame("ok");
+        Check(WsFrame.ValidInbound(serverText, false), "unmasked server data accepted");
+        serverText.masked = true;
+        Check(!WsFrame.ValidInbound(serverText, false), "masked server data rejected");
+        serverText.masked = false;
+        serverText.rsv = 16;
+        Check(!WsFrame.ValidInbound(serverText, false), "server RSV rejected");
+
+        WsFrame badClose = WsFrame.RawFrame(WsOpcode.Close, "\x03\xED", 2);
+        Check(!WsFrame.ValidInbound(badClose, false), "reserved close code rejected");
+        WsFrame oneClose = WsFrame.RawFrame(WsOpcode.Close, "\x00", 1);
+        Check(!WsFrame.ValidInbound(oneClose, false), "one-byte close rejected");
+        byte[] badUtf8 = new byte[2];
+        badUtf8[0] = (byte)0xc0; badUtf8[1] = (byte)0x80;
+        WsFrame badText = WsFrame.RawFrame(WsOpcode.Text, badUtf8.ToStr(0, 2), 2);
+        Check(!WsFrame.ValidUtf8(badText.payload, badText.payloadLen), "invalid UTF-8 rejected");
+        WsFrame goodText = WsFrame.TextFrame("hello");
+        Check(WsFrame.ValidUtf8(goodText.payload, goodText.payloadLen), "valid UTF-8 accepted");
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+    }
+}

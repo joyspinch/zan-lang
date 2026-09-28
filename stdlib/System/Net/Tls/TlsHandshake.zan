@@ -283,6 +283,7 @@ class TlsEngine {
     TlsByteWriter inNet;      // 接收到的网络原始密文
     TlsByteWriter outNet;     // 待发送到网络的密文记录
     TlsByteWriter appReadBuf; // 已解密的应用层明文
+    TlsByteWriter handshakeBuf; // 可跨 TLS record 的握手消息缓冲
     byte[] recHeader;
     List<int> recType;
 
@@ -320,6 +321,7 @@ class TlsEngine {
         this.inNet = new TlsByteWriter();
         this.outNet = new TlsByteWriter();
         this.appReadBuf = new TlsByteWriter();
+        this.handshakeBuf = new TlsByteWriter();
         this.recHeader = new byte[5];
         this.recType = new List<int>();
         this.recType.Add(0);
@@ -427,6 +429,17 @@ class TlsEngine {
             int rver = this.inNet.PeekU16(1);
             int rlen = this.inNet.PeekU16(3);
 
+            if (rver < TlsRecord.VersionTls10 || rver > TlsRecord.VersionTls12) {
+                this.Fail("不支持的 TLS 记录版本");
+                return -1;
+            }
+            if (ctype != TlsRecord.ContentTypeChangeCipherSpec
+                && ctype != TlsRecord.ContentTypeAlert
+                && ctype != TlsRecord.ContentTypeHandshake
+                && ctype != TlsRecord.ContentTypeApplicationData) {
+                this.Fail("不支持的 TLS 记录类型");
+                return -1;
+            }
             if (rlen < 0 || rlen > 20000) {
                 this.Fail("非法 TLS 记录长度: " + rlen);
                 return -1;
@@ -519,7 +532,8 @@ class TlsEngine {
             } else if (innerType == TlsRecord.ContentTypeHandshake) {
                 return this.ProcessHandshakePayload(pt);
             }
-            return 0;
+            this.Fail("TLS 加密记录类型非法");
+            return -1;
         }
 
         // 4. 明文 Handshake 记录
@@ -535,30 +549,31 @@ class TlsEngine {
     }
 
     int ProcessHandshakePayload(byte[] data) {
-        TlsByteReader reader = new TlsByteReader(data, 0, data.Length);
-        while (reader.Remaining() >= 4) {
-            int msgType = reader.ReadU8();
-            int msgLen = reader.ReadU24();
-            if (msgLen < 0 || reader.Remaining() < msgLen) {
-                this.Fail("非法握手消息体长度");
-                return -1;
-            }
-            if (this.state != StateConnected && (msgLen > MaxPreAuthHandshakeBytes - 4
-                || this.preAuthHandshakeBytes > MaxPreAuthHandshakeBytes - 4 - msgLen)) {
+        if (data == null || data.Length == 0) { return 0; }
+        if (this.state != StateConnected) {
+            if (this.preAuthHandshakeBytes > MaxPreAuthHandshakeBytes - data.Length) {
                 this.Fail("TLS 认证前握手消息超出大小上限");
                 return -1;
             }
-            if (this.state != StateConnected) { this.preAuthHandshakeBytes = this.preAuthHandshakeBytes + 4 + msgLen; }
-
-            byte[] msgBody = reader.ReadBytes(msgLen);
-            byte[] fullMsg = new byte[4 + msgLen];
-            fullMsg[0] = (byte)(msgType & 255);
-            fullMsg[1] = (byte)((msgLen >> 16) & 255);
-            fullMsg[2] = (byte)((msgLen >> 8) & 255);
-            fullMsg[3] = (byte)(msgLen & 255);
-            for (int i = 0; i < msgLen; i = i + 1) { fullMsg[4 + i] = msgBody[i]; }
-
-            int r = this.ProcessOneHandshakeMessage(msgType, fullMsg, msgBody);
+            this.preAuthHandshakeBytes = this.preAuthHandshakeBytes + data.Length;
+        }
+        this.handshakeBuf.WriteBytes(data);
+        while (this.handshakeBuf.Length() >= 4) {
+            int msgLen = this.handshakeBuf.PeekU8(1) * 65536
+                + this.handshakeBuf.PeekU8(2) * 256
+                + this.handshakeBuf.PeekU8(3);
+            if (msgLen < 0 || msgLen > MaxPreAuthHandshakeBytes - 4) {
+                this.Fail("非法握手消息体长度");
+                return -1;
+            }
+            int total = 4 + msgLen;
+            if (this.handshakeBuf.Length() < total) { return 0; }
+            byte[] fullMsg = new byte[total];
+            NativeMemory.Copy(fullMsg, (nint)this.handshakeBuf.Buffer() + (nint)this.handshakeBuf.Head(), total);
+            this.handshakeBuf.RemovePrefix(total);
+            byte[] msgBody = new byte[msgLen];
+            if (msgLen > 0) { NativeMemory.Copy(msgBody, (nint)fullMsg + 4, msgLen); }
+            int r = this.ProcessOneHandshakeMessage(fullMsg[0] & 255, fullMsg, msgBody);
             if (r < 0) { return -1; }
         }
         return 0;
@@ -635,24 +650,45 @@ class TlsEngine {
 
         if (r.Remaining() >= 2) {
             int extTotal = r.ReadU16();
-            while (r.Remaining() >= 4) {
+            if (extTotal != r.Remaining()) {
+                this.Fail("ServerHello extensions 长度不匹配"); return -1;
+            }
+            int extEnd = r.Offset() + extTotal;
+            List<int> seenExtensions = new List<int>();
+            while (r.Offset() < extEnd) {
+                if (extEnd - r.Offset() < 4) {
+                    this.Fail("ServerHello extension 截断"); return -1;
+                }
                 int extType = r.ReadU16();
                 int extLen = r.ReadU16();
-                if (r.Remaining() < extLen) { break; }
-                if (extType == 43) { // supported_versions (0x002b)
-                    if (extLen >= 2) {
-                        selectedVersion = r.ReadU16();
-                        extLen = extLen - 2;
-                    }
-                } else if (extType == 51) { // key_share (0x0033)
-                    if (extLen >= 4) {
-                        int group = r.ReadU16();
-                        int klen = r.ReadU16();
-                        serverShare = r.ReadBytes(klen);
-                        extLen = extLen - 4 - klen;
-                    }
+                if (extLen > extEnd - r.Offset() || seenExtensions.Contains(extType)) {
+                    this.Fail("ServerHello extension 长度或重复非法"); return -1;
                 }
-                if (extLen > 0) { r.Skip(extLen); }
+                seenExtensions.Add(extType);
+                if (extType == 43) { // supported_versions (0x002b)
+                    if (extLen != 2) {
+                        this.Fail("ServerHello supported_versions 非法"); return -1;
+                    }
+                    selectedVersion = r.ReadU16();
+                } else if (extType == 51) { // key_share (0x0033)
+                    if (extLen != 36) {
+                        this.Fail("ServerHello X25519 key_share 非法"); return -1;
+                    }
+                    int group = r.ReadU16();
+                    int keyLen = r.ReadU16();
+                    if (group != 0x001d || keyLen != 32) {
+                        this.Fail("ServerHello X25519 key_share 非法"); return -1;
+                    }
+                    serverShare = r.ReadBytes(32);
+                    if (serverShare == null) {
+                        this.Fail("ServerHello X25519 key_share 截断"); return -1;
+                    }
+                } else {
+                    r.Skip(extLen);
+                }
+            }
+            if (r.Offset() != extEnd) {
+                this.Fail("ServerHello extensions 越界"); return -1;
             }
         }
 
@@ -767,7 +803,22 @@ class TlsEngine {
     #endif
 
     int VerifyCertificate() {
-        if (this.disableVerify) { this.verifyResult = 0; return 0; }
+        if (this.disableVerify) {
+            if (this.pinRequired && (this.pins == null || this.pins.Count == 0)) {
+                this.verifyResult = 63; this.Fail("TLS 已要求公钥固定但未配置 pin"); return -1;
+            }
+            if (this.pins != null && this.pins.Count > 0) {
+                if (this.peerCert == null) { this.verifyResult = 63; this.Fail("TLS 公钥固定缺少对端证书"); return -1; }
+                string disabledPin = this.peerCert.SpkiSha256Pin();
+                bool disabledPinMatched = false;
+                for (int i = 0; i < this.pins.Count; i = i + 1) {
+                    if (this.pins[i] == disabledPin) { disabledPinMatched = true; break; }
+                }
+                if (!disabledPinMatched) { this.verifyResult = 63; this.Fail("TLS 公钥固定校验失败"); return -1; }
+            }
+            this.verifyResult = 0;
+            return 0;
+        }
         this.verifyResult = 1;
         if (this.peerCert == null || this.host == null || this.host.Length == 0
             || !this.peerCert.ValidNow() || !this.peerCert.CanServeTls()) {
@@ -799,10 +850,16 @@ class TlsEngine {
                 current = issuerCert;
             }
         }
-        if ((!anchored && !osTrusted) || !hostMatches) {
-            this.verifyResult = !hostMatches ? 62 : 19;
+        if (!anchored && !osTrusted) {
+            this.verifyResult = 19;
             if (this.certPolicy == null || !this.certPolicy((long)this.verifyResult, this.peerCertText)) {
-                this.Fail(!hostMatches ? "TLS 证书主机名不匹配" : "TLS 证书链无受信任签名锚"); return -1;
+                this.Fail("TLS 证书链无受信任签名锚"); return -1;
+            }
+        }
+        if (!hostMatches) {
+            this.verifyResult = 62;
+            if (this.certPolicy == null || !this.certPolicy((long)this.verifyResult, this.peerCertText)) {
+                this.Fail("TLS 证书主机名不匹配"); return -1;
             }
         }
         if (this.pinRequired && (this.pins == null || this.pins.Count == 0)) {

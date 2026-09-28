@@ -40,6 +40,8 @@ class WssClient {
         WssClient client = new WssClient();
         client.host = host;
         client.path = path;
+        if (!WsHandshake.SafeRequestPart(host, false)
+            || !WsHandshake.SafeRequestPart(path, false)) { return client; }
         client.conn = await TcpClient.ConnectAsync(host, port);
         if (client.conn == null) { return client; }
         client.context = TlsContext.CreateClient();
@@ -88,15 +90,10 @@ class WssClient {
         }
         HttpDeadline.Disarm(watch);
         string head = client.reader.Slice(headerEnd);
-        if (head.Length < 12 || head.Substring(9, 3) != "101") {
-            client.CloseNow();
-            return client;
-        }
         string acceptSource = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
         string expectedAccept = Base64.Encode(
             Sha1.Hash(acceptSource, acceptSource.Length), 20);
-        string actualAccept = WssClient.Header(head, "Sec-WebSocket-Accept");
-        if (actualAccept != expectedAccept) {
+        if (!WsHandshake.ValidResponse(head, expectedAccept)) {
             client.CloseNow();
             return client;
         }
@@ -134,9 +131,9 @@ class WssClient {
                 total = this.reader.FrameSize();
             }
             WsFrame frame = this.reader.TakeFrame(total);
-            if (frame.opcode >= 3 && frame.opcode <= 7
-                || frame.opcode >= 11 && frame.opcode <= 15) {
-                // RFC 6455 §5.2：保留 opcode 直接断开（与明文客户端同一契约）。
+            if (!WsFrame.ValidInbound(frame, false)) {
+                // RFC 6455：客户端收到的服务端帧不得掩码，且 RSV、控制帧
+                // 和关闭负载必须满足协议约束。
                 this.CloseNow();
                 return "";
             }
@@ -154,6 +151,7 @@ class WssClient {
             int feed = this.asm.Feed(frame);
             if (feed < 0) { this.CloseNow(); return ""; }
             if (feed == 0) { continue; }
+            if (!this.asm.ValidComplete()) { this.CloseNow(); return ""; }
             return this.asm.Complete();
         }
         return "";
@@ -171,7 +169,10 @@ class WssClient {
     /// 客户端发送入口：RFC 6455 要求客户端帧必须掩码（每帧 CSPRNG
     /// 掩码键）+ 正确的扩展长度编码。发送失败（<= 0）就地断开。
     async void SendFrame(int opcode, string payload, int payloadLen) {
-        if (!this.connected) { return; }
+        if (!this.connected || payload == null || payloadLen < 0
+            || payloadLen > 16777216
+            || opcode < 0 || opcode > WsOpcode.Pong
+            || (opcode >= 8 && payloadLen > 125)) { return; }
         int ext = 0;
         if (payloadLen > 65535) { ext = 8; }
         else if (payloadLen > 125) { ext = 2; }

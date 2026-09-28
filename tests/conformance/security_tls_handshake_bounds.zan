@@ -40,8 +40,35 @@ class Program {
         return w.ToArray();
     }
 
+    static byte[] Slice(byte[] source, int start, int count) {
+        byte[] part = new byte[count];
+        NativeMemory.Copy(part, (nint)source + (nint)start, count);
+        return part;
+    }
+
     static void Main() {
         byte[] ee = Message(TlsRecord.HandshakeEncryptedExtensions, new byte[] { 0, 0 });
+        for (int split = 1; split <= 5; split = split + 1) {
+            TlsEngine fragmented = Engine(false);
+            fragmented.state = 2;
+            fragmented.negotiatedVersion = TlsRecord.VersionTls13;
+            Check(fragmented.ProcessHandshakePayload(Slice(ee, 0, split)) == 0
+                && !fragmented.receivedEncryptedExtensions
+                && fragmented.ProcessHandshakePayload(Slice(ee, split, ee.Length - split)) == 0
+                && fragmented.receivedEncryptedExtensions,
+                "handshake record split " + Convert.ToString(split));
+        }
+        TlsEngine combined = Engine(false);
+        combined.state = 2;
+        combined.negotiatedVersion = TlsRecord.VersionTls13;
+        byte[] unknown = Message(254, new byte[] { 1, 2, 3 });
+        TlsByteWriter joined = new TlsByteWriter();
+        joined.WriteBytes(unknown);
+        joined.WriteBytes(ee);
+        byte[] both = joined.ToArray();
+        Check(combined.ProcessHandshakePayload(Slice(both, 0, 3)) == 0
+            && combined.ProcessHandshakePayload(Slice(both, 3, both.Length - 3)) == 0
+            && combined.receivedEncryptedExtensions, "multiple handshake messages across records");
         TlsEngine initial = Engine(false);
         Check(initial.ProcessHandshakePayload(ee) == -1 && initial.IsClosed(), "early encrypted extensions rejected");
 

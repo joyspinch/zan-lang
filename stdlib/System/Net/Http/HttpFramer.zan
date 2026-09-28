@@ -352,7 +352,7 @@ class HttpFramer {
                 if (n == 0) { acc.Free(); return -1; }
                 lf = this.IndexOfLf(scan);
             }
-            if (lf - pos > 8192) {
+            if (lf - pos > 8192 || lf == pos || this.pend.ByteAt(lf - 1) != 13) {
                 acc.Free();
                 return 400;
             }
@@ -366,16 +366,25 @@ class HttpFramer {
             bool bad = false;
             while (i < lf) {
                 int c = this.pend.ByteAt(i);
-                if (c == 13) { break; }
+                if (c == 13) {
+                    if (i == lf - 1) { break; }
+                    bad = true; break;
+                }
                 if (c == 59) { break; }          // ';' 块扩展，忽略其内容
                 int d = HttpFramer.HexVal(c);
                 if (d < 0) { bad = true; break; }
+                if (size > ((long)maxBodyBytes - (long)d) / 16) { acc.Free(); return 413; }
                 size = size * 16 + (long)d;
-                if (size > (long)maxBodyBytes) { acc.Free(); return 413; }
                 any = true;
                 i = i + 1;
             }
             if (bad || !any) { acc.Free(); return 400; }
+            for (int j = i; j < lf - 1; j = j + 1) {
+                int extByte = this.pend.ByteAt(j);
+                if (extByte == 13 || extByte == 10 || extByte == 0 || extByte == 127) {
+                    acc.Free(); return 400;
+                }
+            }
             pos = lf + 1;
             if (size == 0) {
                 // 结束块之后是可选的 trailer，以一个空行收尾。
@@ -400,14 +409,13 @@ class HttpFramer {
             // 块数据后必须紧跟 CRLF；缺失说明长度撒了谎。
             int c1 = this.pend.ByteAt(pos);
             int c2 = this.pend.ByteAt(pos + 1);
-            if (c1 == 13 && c2 == 10) {
-                pos = pos + 2;
-            } else if (c1 == 10) {
-                pos = pos + 1;
-            } else {
+            if (c1 != 13 || c2 != 10) {
+                // RFC 9112 chunk-data 必须以 CRLF 结束；裸 LF 会让
+                // 前置代理与后端对请求边界产生不同解释。
                 acc.Free();
                 return 400;
             }
+            pos = pos + 2;
             this.pend.Discard(pos);
             pos = 0;
             this.scanned = 0;
@@ -443,10 +451,8 @@ class HttpFramer {
                 if (n == 0) { return -1; }
                 lf = this.IndexOfLf(scan);
             }
-            if (lf + 1 - from > 8192) { return -2; }
-            int stop = lf;
-            if (stop > pos && this.pend.ByteAt(stop - 1) == 13) { stop = stop - 1; }
-            bool blank = stop == pos;
+            if (lf + 1 - from > 8192 || lf == pos || this.pend.ByteAt(lf - 1) != 13) { return -2; }
+            bool blank = lf - 1 == pos;
             pos = lf + 1;
             if (blank) { return pos; }
         }

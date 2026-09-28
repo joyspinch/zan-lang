@@ -56,8 +56,8 @@ class WsHandshake {
 
     static bool Valid(HttpRequest req) {
         if (req == null || req.parseStatus != 0 || req.method != "GET"
-            || req.version != "HTTP/1.1" || req.path.Length == 0
-            || req.GetHeader("Host").Length == 0
+            || req.version != "HTTP/1.1" || !WsHandshake.SafeRequestPart(req.path, true)
+            || !WsHandshake.SafeRequestPart(req.GetHeader("Host"), false)
             || !WsHandshake.HasToken(req.GetHeader("Upgrade"), "websocket")
             || !WsHandshake.HasToken(req.GetHeader("Connection"), "upgrade")
             || req.GetHeader("Sec-WebSocket-Version") != "13") { return false; }
@@ -68,6 +68,61 @@ class WsHandshake {
         byte[] decoded = Base64.Decode(key, decodedLen);
         return decoded != null && decodedLen[0] == 16
             && Base64.Encode(decoded, 16) == key;
+    }
+
+    static bool SafeRequestPart(string value, bool allowEmpty) {
+        if (value == null || value.Length == 0) { return false; }
+        for (int i = 0; i < value.Length; i = i + 1) {
+            int c = value[i] & 255;
+            if (c <= 32 || c == 127 || c == 0) { return false; }
+        }
+        return true;
+    }
+
+    static bool ValidResponse(string head, string expectedAccept) {
+        if (head == null || expectedAccept == null) { return false; }
+        int firstEnd = head.IndexOf("\r\n", 0);
+        if (firstEnd < 12 || head.Substring(0, 12) != "HTTP/1.1 101") { return false; }
+        if (firstEnd > 12 && (head[12] & 255) != 32) { return false; }
+        int upgradeCount = 0;
+        int connectionCount = 0;
+        int acceptCount = 0;
+        string upgrade = "";
+        string connection = "";
+        string accept = "";
+        int pos = firstEnd + 2;
+        while (pos < head.Length) {
+            int end = head.IndexOf("\r\n", pos);
+            if (end < 0) { end = head.Length; }
+            if (end == pos) { break; }
+            int colon = head.IndexOf(":", pos);
+            if (colon <= pos || colon >= end) { return false; }
+            for (int i = pos; i < colon; i = i + 1) {
+                int c = head[i] & 255;
+                if (c <= 32 || c >= 127 || c == 58) { return false; }
+            }
+            int start = colon + 1;
+            while (start < end && ((head[start] & 255) == 32 || (head[start] & 255) == 9)) { start = start + 1; }
+            string name = head.Substring(pos, colon - pos);
+            string value = head.Substring(start, end - start);
+            if (WsHandshake.HasToken(name, "upgrade")) {
+                upgradeCount = upgradeCount + 1; upgrade = value;
+            } else if (WsHandshake.HasToken(name, "connection")) {
+                connectionCount = connectionCount + 1; connection = value;
+            } else if (WsHandshake.HasToken(name, "sec-websocket-accept")) {
+                acceptCount = acceptCount + 1; accept = value;
+            }
+            for (int i = 0; i < value.Length; i = i + 1) {
+                int c = value[i] & 255;
+                if (c == 0 || c == 10 || c == 13 || c == 127) { return false; }
+            }
+            if (end >= head.Length) { break; }
+            pos = end + 2;
+        }
+        return upgradeCount == 1 && connectionCount == 1 && acceptCount == 1
+            && WsHandshake.HasToken(upgrade, "websocket")
+            && WsHandshake.HasToken(connection, "upgrade")
+            && accept == expectedAccept;
     }
 }
 
@@ -404,6 +459,74 @@ class WsFrame {
         }
 
         return f;
+    }
+
+    /// RFC 6455 入站帧门禁。服务端要求客户端帧带掩码；客户端要求
+    /// 服务端帧不带掩码。未协商扩展时 RSV 必须为零，控制帧必须完整
+    /// 且不超过 125 字节。
+    static bool ValidInbound(WsFrame frame, bool requireMasked) {
+        if (frame == null) { return false; }
+        if (frame.rsv != 0 || frame.masked != requireMasked) { return false; }
+        if ((frame.opcode >= 3 && frame.opcode <= 7)
+            || (frame.opcode >= 11 && frame.opcode <= 15)) { return false; }
+        if (frame.opcode >= 8
+            && (!frame.fin || frame.payloadLen > 125 || !WsFrame.ValidControlPayload(frame))) {
+            return false;
+        }
+        return true;
+    }
+
+    static bool ValidControlPayload(WsFrame frame) {
+        if (frame.opcode != WsOpcode.Close) { return true; }
+        if (frame.payloadLen == 1) { return false; }
+        if (frame.payloadLen == 0) { return true; }
+        if (frame.payload == null || frame.payloadLen < 2) { return false; }
+        int code = ((frame.payload[0] & 255) << 8) | (frame.payload[1] & 255);
+        if (!((code >= 1000 && code <= 1003)
+            || (code >= 1007 && code <= 1011)
+            || (code >= 3000 && code <= 4999))) { return false; }
+        if (frame.payloadLen > 2) {
+            return WsFrame.ValidUtf8(frame.payload.Substring(2), frame.payloadLen - 2);
+        }
+        return true;
+    }
+
+    /// 严格校验一段显式长度的 UTF-8。过短、过长、代理项和超范围码点
+    /// 均拒绝；调用方只在完整消息/关闭原因上调用，避免拆分码点被误判。
+    static bool ValidUtf8(string text, int len) {
+        if (text == null || len < 0) { return false; }
+        int i = 0;
+        while (i < len) {
+            int b0 = text[i] & 255;
+            if (b0 <= 0x7f) { i = i + 1; continue; }
+            if (b0 >= 0xc2 && b0 <= 0xdf) {
+                if (i + 1 >= len) { return false; }
+                int b1 = text[i + 1] & 255;
+                if (b1 < 0x80 || b1 > 0xbf) { return false; }
+                i = i + 2; continue;
+            }
+            if (b0 >= 0xe0 && b0 <= 0xef) {
+                if (i + 2 >= len) { return false; }
+                int b1 = text[i + 1] & 255; int b2 = text[i + 2] & 255;
+                if (b2 < 0x80 || b2 > 0xbf
+                    || (b0 == 0xe0 && b1 < 0xa0)
+                    || (b0 == 0xed && b1 > 0x9f)
+                    || b1 < 0x80 || b1 > 0xbf) { return false; }
+                i = i + 3; continue;
+            }
+            if (b0 >= 0xf0 && b0 <= 0xf4) {
+                if (i + 3 >= len) { return false; }
+                int b1 = text[i + 1] & 255; int b2 = text[i + 2] & 255;
+                int b3 = text[i + 3] & 255;
+                if (b2 < 0x80 || b2 > 0xbf || b3 < 0x80 || b3 > 0xbf
+                    || (b0 == 0xf0 && b1 < 0x90)
+                    || (b0 == 0xf4 && b1 > 0x8f)
+                    || b1 < 0x80 || b1 > 0xbf) { return false; }
+                i = i + 4; continue;
+            }
+            return false;
+        }
+        return true;
     }
 }
 
@@ -803,6 +926,13 @@ class WsAssembler {
         return 0;
     }
 
+    /// <summary>完成消息前校验文本消息的 UTF-8；二进制消息不做编码约束。</summary>
+    bool ValidComplete() {
+        if (this.opcode != WsOpcode.Text) { return true; }
+        string m = this.dataLen > 0 ? this.dataBuf.ToStr(0, this.dataLen) : "";
+        return WsFrame.ValidUtf8(m, this.dataLen);
+    }
+
     /// <summary>取出重组完成的消息并复位状态。按显式长度一次转换，
     /// 内嵌 NUL 仍是消息的一部分；保留缓冲容量供下一条消息复用。</summary>
     string Complete() {
@@ -866,6 +996,8 @@ class WebSocketClient {
         ws.port = port;
         ws.path = path;
 
+        if (!WsHandshake.SafeRequestPart(host, false)
+            || !WsHandshake.SafeRequestPart(path, false)) { return ws; }
         ws.conn = await TcpClient.ConnectAsync(host, port);
         // 连接失败/超时按文档返回 null：解引用是空对象虚调用，进程
         // SIGSEGV。保持 connected=false 由 IsConnected() 检查。
@@ -939,15 +1071,10 @@ class WebSocketClient {
         }
         HttpDeadline.Disarm(watch);
         string head = ws.reader.Slice(headerEnd);
-        if (head.Length < 12 || head.Substring(9, 3) != "101") {
-            ws.conn.Close();
-            return ws;
-        }
-        // 验证 Sec-WebSocket-Accept，防握手降级/伪造 101。
         string acceptSource = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
         string expectedAccept = Base64.Encode(
             Sha1.Hash(acceptSource, acceptSource.Length), 20);
-        if (head.IndexOf(expectedAccept, 0) < 0) {
+        if (!WsHandshake.ValidResponse(head, expectedAccept)) {
             ws.conn.Close();
             return ws;
         }
@@ -960,7 +1087,10 @@ class WebSocketClient {
     /// <summary>客户端方向统一发送入口：掩码 + 正确的帧长。
     /// 返回 false 表示连接已不可用。</summary>
     async bool SendFrame(int opcode, string payload, int payloadLen) {
-        if (!this.connected || this.conn == null) { return false; }
+        if (!this.connected || this.conn == null || payload == null || payloadLen < 0
+            || payloadLen > 16777216
+            || (opcode >= 8 && (payloadLen > 125 || opcode > WsOpcode.Pong))
+            || (opcode < 0 || opcode > WsOpcode.Pong)) { return false; }
         WsFrame frame = WsFrame.RawFrame(opcode, payload, payloadLen);
         byte[] encoded = frame.EncodeMasked();
         int total = WsFrame.HeaderLen(payloadLen) + 4 + payloadLen;
@@ -1009,10 +1139,9 @@ class WebSocketClient {
                 total = this.reader.FrameSize();
             }
             WsFrame frame = this.reader.TakeFrame(total);
-            if (frame.opcode >= 3 && frame.opcode <= 7
-                || frame.opcode >= 11 && frame.opcode <= 15) {
-                // RFC 6455 §5.2：保留 opcode 直接断开（服务器侧路径会
-                // 回 1002；客户端无回写通道，只关连接）。
+            if (!WsFrame.ValidInbound(frame, false)) {
+                // RFC 6455：客户端收到的服务端帧不得掩码，且 RSV、控制帧
+                // 和关闭负载必须满足协议约束。
                 this.CloseNow();
                 return "";
             }
@@ -1030,6 +1159,10 @@ class WebSocketClient {
             int feed = this.asm.Feed(frame);
             if (feed < 0) { this.CloseNow(); return ""; }
             if (feed == 0) { continue; }
+            if (!this.asm.ValidComplete()) {
+                this.CloseNow();
+                return "";
+            }
             return this.asm.Complete();
         }
         return "";

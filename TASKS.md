@@ -45,6 +45,14 @@
 
 - [~] **A-MEM1** 大型发布已落地保守生成前裁剪：声明先行、Main/初始化/构造/委托/虚表/反射/库导出按固定点保活；非发布与 `--emit-ir` 保留用户体以免吞掉降层诊断，发布仅裁剪 stdlib 体，未用声明留一块 `unreachable` 以满足 LLVM。冻结 OnePlus 402 输入重测：IR 定义 18,628→18,488、指令 4,022,035→3,545,750，峰值 Commit 1,530→1,414 MB（仍由 IRGen 主导，未彻底闭账）。`dead_method_pre_ir` 行为+IR 回归、smoke 313/313、standard 可执行集 999 项中仅并行 `zandb_p3` 偶发红且串行通过；后续仍需更强的 stdlib 压力与后端分片评估。
 
+## 已闭账 · 通讯协议加固（2026-09-28）
+
+- [x] **B-NET4a** TLS 跨 record 握手重组、ServerHello 扩展边界、记录类型/版本 fail-closed 与认证前预算；用例 `security_tls_handshake_bounds`。
+- [x] **B-NET4b** Content-Length/chunk-size 乘加溢出、chunk 数据/长度行严格 CRLF；用例 `http_chunk_len_overflow`、`http_client_keepalive`、`security_forwarder_wire`。
+- [x] **B-NET4c** MVC/WS/WSS 升级响应、帧掩码/RSV/控制帧/Close/UTF-8 门禁与请求目标注入；用例 `security_ws_client_protocol`、`security_ws_handshake`、`security_ws_worker`、`ws_protocol_gate`、`ws_loopback`。
+- [x] **B-NET4d** TLS 公钥 pin 不受 `disableVerify` 绕过、证书链与主机名策略错误分离；用例 `tls_auth_chain`。
+- [x] **B-NET4e** HttpClient Connection token 按逗号/OWS/大小写解析，Proxy TLS 上游握手使用配置 timeout；用例 `http_client_keepalive`、`security_forwarder_wire`、`http_forwarder_keepalive`。
+
 ## 未完成 · 通讯与 TLS
 
 - [ ] **B-NET1** Windows 已接入收到的 DER 链与主机名的 Crypt32 链构建/SSL 策略验证；离线缓存吊销未知或错误失败关闭，显式 `AddTrustedCert` 走独立签名链。`security_tls_windows_policy` 已覆盖不受信任、错误主机、畸形输入和显式 CA 正例，但缺少带缓存 CRL 的系统受信任正例、受禁根、过期和 API 不可用回归；缓存缺失可能拒绝有效公网站点。macOS 仍无 SecTrust 桥接，默认无显式 CA 时失败关闭。
