@@ -51,6 +51,9 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <strings.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -167,6 +170,9 @@ typedef struct {
     size_t throwaway_parse_fallbacks;
     size_t real_parses;
     size_t secondary_parses;
+    size_t metadata_cache_hits;
+    size_t metadata_cache_misses;
+    size_t metadata_cache_writes;
 } zan_scale_stats_t;
 
 static zan_scale_stats_t g_scale_stats;
@@ -1444,6 +1450,277 @@ static void pi_flag_ident(pi_file_t *f, const char *s, size_t len) {
  * need to be: missed names would only ever under-include, and the guard
  * below keeps the generic-constraint spelling (`where T : class`) from
  * minting bogus candidates. */
+static uint64_t pi_meta_hash_bytes(uint64_t h, const void *data, size_t len) {
+    const unsigned char *p = (const unsigned char *)data;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static uint64_t pi_meta_hash_u32(uint64_t h, uint32_t value) {
+    return pi_meta_hash_bytes(h, &value, sizeof(value));
+}
+
+static uint64_t pi_meta_hash_text(uint64_t h, const char *text) {
+    size_t len = text ? strlen(text) : 0;
+    h = pi_meta_hash_u32(h, (uint32_t)len);
+    return pi_meta_hash_bytes(h, text, len);
+}
+
+static uint64_t pi_meta_compiler_hash(void) {
+    static uint64_t identity;
+    static int checked;
+    if (checked) return identity;
+    checked = 1;
+    char exe[4096];
+#ifdef _WIN32
+    DWORD n = GetModuleFileNameA(NULL, exe, sizeof(exe));
+    if (!n || n >= sizeof(exe)) return 0;
+#elif defined(__APPLE__)
+    uint32_t sz = sizeof(exe);
+    if (_NSGetExecutablePath(exe, &sz) != 0) return 0;
+#else
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return 0;
+    exe[n] = 0;
+#endif
+    /* Failure leaves identity 0: the caller disables the cache entirely
+     * rather than keying it without the compiler's identity (a new compiler
+     * that changed the scan rules must never hit an old cache). */
+    FILE *in = fopen(exe, "rb");
+    if (!in) return 0;
+    uint64_t h = UINT64_C(1469598103934665603);
+    unsigned char buf[65536];
+    size_t nread;
+    while ((nread = fread(buf, 1, sizeof(buf), in)) != 0)
+        h = pi_meta_hash_bytes(h, buf, nread);
+    int ok = !ferror(in);
+    fclose(in);
+    if (ok) identity = h ? h : 1;
+    return identity;
+}
+
+static uint64_t pi_meta_file_hash(const char *path, const char *src, size_t len) {
+    uint64_t compiler = pi_meta_compiler_hash();
+    if (!compiler) return 0;
+    uint64_t h = UINT64_C(1469598103934665603);
+    /* Keep this key made of explicit, stable fields. Hashing zan_target_t as a
+     * raw struct made padding bytes and future layout changes part of the
+     * cache identity. */
+    h = pi_meta_hash_text(h, "zan-pullin-meta-v2");
+    h = pi_meta_hash_text(h, ZAN_VERSION);
+    h = pi_meta_hash_bytes(h, &compiler, sizeof(compiler));
+    h = pi_meta_hash_text(h, path);
+    h = pi_meta_hash_u32(h, (uint32_t)pi_target.arch);
+    h = pi_meta_hash_u32(h, (uint32_t)pi_target.os);
+    h = pi_meta_hash_u32(h, (uint32_t)pi_target.abi);
+    h = pi_meta_hash_text(h, pi_target.triple);
+    h = pi_meta_hash_text(h, pi_target.cpu);
+    h = pi_meta_hash_text(h, pi_target.features);
+    h = pi_meta_hash_u32(h, (uint32_t)pi_target.pointer_size);
+    h = pi_meta_hash_u32(h, pi_target.pic ? 1u : 0u);
+    h = pi_meta_hash_u32(h, pi_publish_mode ? 1u : 0u);
+    h = pi_meta_hash_u32(h, (uint32_t)pi_pp_define_count);
+    for (int i = 0; i < pi_pp_define_count; i++)
+        h = pi_meta_hash_text(h, pi_pp_defines[i]);
+    h = pi_meta_hash_u32(h, (uint32_t)len);
+    return pi_meta_hash_bytes(h, src, len);
+}
+
+static void pi_meta_cache_path(uint64_t key, char *out, size_t out_sz) {
+    out[0] = 0;
+    if (!key) return;
+    /* ZAN_META_CACHE_DIR overrides the per-user cache location (tests set it
+     * to a scratch dir so runs are isolated and inspectable). */
+    const char *override = getenv("ZAN_META_CACHE_DIR");
+    if (override && *override) {
+#ifdef _WIN32
+        snprintf(out, out_sz, "%s\\pullin-meta-%016llx.bin", override,
+                 (unsigned long long)key);
+#else
+        snprintf(out, out_sz, "%s/pullin-meta-%016llx.bin", override,
+                 (unsigned long long)key);
+#endif
+        return;
+    }
+#ifdef _WIN32
+    const char *base = getenv("LOCALAPPDATA");
+    if (base && *base)
+        snprintf(out, out_sz, "%s\\Zan\\pullin-meta-%016llx.bin", base,
+                 (unsigned long long)key);
+#else
+    const char *base = getenv("XDG_CACHE_HOME");
+    if (!base || !*base) base = getenv("HOME");
+    if (base && *base) {
+        if (getenv("XDG_CACHE_HOME"))
+            snprintf(out, out_sz, "%s/zan/pullin-meta-%016llx.bin", base,
+                     (unsigned long long)key);
+        else
+            snprintf(out, out_sz, "%s/.cache/zan/pullin-meta-%016llx.bin", base,
+                     (unsigned long long)key);
+    }
+#endif
+}
+
+/* Cache file format: magic "ZPM2", version, the three name-list counts, the
+ * extension flag, then the lists as (u16 length, bytes) records in file
+ * order. Identifier order matters: pi_append_included walks the pi_dir list,
+ * and replaying usings/idents in a different order would reorder the input
+ * list nsresolve sees. */
+#define PI_META_MAGIC UINT32_C(0x5a504d32)
+#define PI_META_VERSION UINT32_C(2)
+#define PI_META_MAX_NAMES 100000u
+
+static int pi_meta_cache_load(pi_file_t *f, const char *src, size_t len) {
+    if (!f || !f->path) return 0;
+    uint64_t key = pi_meta_file_hash(f->path, src, len);
+    char cache[1024];
+    pi_meta_cache_path(key, cache, sizeof(cache));
+    if (!cache[0]) return 0;
+    FILE *in = fopen(cache, "rb");
+    if (!in) return 0;
+    /* Failure must leave no trace beyond interned names (harmless: unflagged
+     * names pull nothing): the reached-directory list is rolled back so a
+     * half-read cache cannot reach bogus namespaces (pi_process_dir would
+     * report them as ZANPKG_MISSING). */
+    pi_dir_t *saved_head = pi_dirs_head, *saved_tail = pi_dirs_tail;
+    uint32_t magic = 0, version = 0, top = 0, idents = 0, usings = 0;
+    unsigned char ext = 0;
+    int ok = fread(&magic, sizeof(magic), 1, in) == 1 &&
+             fread(&version, sizeof(version), 1, in) == 1 &&
+             fread(&top, sizeof(top), 1, in) == 1 &&
+             fread(&idents, sizeof(idents), 1, in) == 1 &&
+             fread(&usings, sizeof(usings), 1, in) == 1 &&
+             fread(&ext, sizeof(ext), 1, in) == 1 &&
+             magic == PI_META_MAGIC && version == PI_META_VERSION &&
+             top <= PI_META_MAX_NAMES && idents <= PI_META_MAX_NAMES &&
+             usings <= PI_META_MAX_NAMES;
+    for (uint32_t i = 0; ok && i < top; i++) {
+        uint16_t n = 0;
+        char buf[1024];
+        ok = fread(&n, sizeof(n), 1, in) == 1 && n < sizeof(buf) &&
+             fread(buf, 1, n, in) == n;
+        if (!ok) break;
+        buf[n] = 0;
+        pi_name_t *name = pi_intern(buf, n);
+        ok = name && pi_reserve((void *)&f->top, f->top_count,
+                                &f->top_cap, sizeof(pi_name_t *));
+        if (ok) f->top[f->top_count++] = name;
+    }
+    for (uint32_t i = 0; ok && i < idents; i++) {
+        uint16_t n = 0;
+        char buf[1024];
+        ok = fread(&n, sizeof(n), 1, in) == 1 && n < sizeof(buf) &&
+             fread(buf, 1, n, in) == n;
+        if (!ok) break;
+        pi_flag_ident(f, buf, n);
+    }
+    for (uint32_t i = 0; ok && i < usings; i++) {
+        uint16_t n = 0;
+        char buf[1024];
+        ok = fread(&n, sizeof(n), 1, in) == 1 && n < sizeof(buf) &&
+             fread(buf, 1, n, in) == n;
+        if (!ok) break;
+        buf[n] = 0;
+        ok = pi_reserve((void *)&f->usings, f->using_count,
+                        &f->using_cap, sizeof(char *));
+        if (ok) {
+            char *dup = (char *)zan_arena_alloc(pi_arena, n + 1);
+            ok = dup != NULL;
+            if (ok) {
+                memcpy(dup, buf, n + 1);
+                f->usings[f->using_count++] = dup;
+                pi_reach(dup);
+            }
+        }
+    }
+    fclose(in);
+    if (!ok) {
+        f->top = NULL; f->top_count = f->top_cap = 0;
+        f->usings = NULL; f->using_count = f->using_cap = 0;
+        pi_dirs_head = saved_head;
+        pi_dirs_tail = saved_tail;
+        return 0;
+    }
+    f->has_ext = ext != 0;
+    g_scale_stats.metadata_cache_hits++;
+    return 1;
+}
+
+static void pi_meta_cache_write(const pi_file_t *f, const char *src, size_t len) {
+    if (!f || !f->path) return;
+    uint64_t key = pi_meta_file_hash(f->path, src, len);
+    char cache[1024], tmp[1060];
+    pi_meta_cache_path(key, cache, sizeof(cache));
+    if (!cache[0]) return;
+    /* Create the cache directory (one level deep is enough for both the
+     * default locations and the ZAN_META_CACHE_DIR override). */
+    {
+        char dir[1024];
+        size_t dl = strlen(cache);
+        size_t cut = dl;
+        while (cut > 0 && cache[cut - 1] != '/' && cache[cut - 1] != '\\') cut--;
+        if (cut == 0 || cut >= sizeof(dir)) return;
+        memcpy(dir, cache, cut - 1);
+        dir[cut - 1] = 0;
+#ifdef _WIN32
+        CreateDirectoryA(dir, NULL);
+#else
+        mkdir(dir, 0755);
+#endif
+    }
+#ifdef _WIN32
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%lu", cache, (unsigned long)GetCurrentProcessId());
+#else
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", cache, (long)getpid());
+#endif
+    FILE *out = fopen(tmp, "wb");
+    if (!out) return;
+    uint32_t magic = PI_META_MAGIC, version = PI_META_VERSION;
+    uint32_t top = (uint32_t)f->top_count;
+    uint32_t idents = (uint32_t)f->ident_count;
+    uint32_t usings = (uint32_t)f->using_count;
+    unsigned char ext = (unsigned char)(f->has_ext != 0);
+    int ok = fwrite(&magic, sizeof(magic), 1, out) == 1 &&
+             fwrite(&version, sizeof(version), 1, out) == 1 &&
+             fwrite(&top, sizeof(top), 1, out) == 1 &&
+             fwrite(&idents, sizeof(idents), 1, out) == 1 &&
+             fwrite(&usings, sizeof(usings), 1, out) == 1 &&
+             fwrite(&ext, sizeof(ext), 1, out) == 1;
+    for (uint32_t i = 0; ok && i < top; i++) {
+        const pi_name_t *n = f->top[i];
+        uint16_t len16 = n->len > UINT16_MAX ? 0 : (uint16_t)n->len;
+        ok = len16 != 0 || n->len == 0;
+        ok = ok && fwrite(&len16, sizeof(len16), 1, out) == 1 &&
+             fwrite(n->str, 1, len16, out) == len16;
+    }
+    for (uint32_t i = 0; ok && i < idents; i++) {
+        const pi_name_t *n = f->idents[i];
+        uint16_t len16 = n->len > UINT16_MAX ? 0 : (uint16_t)n->len;
+        ok = len16 != 0 || n->len == 0;
+        ok = ok && fwrite(&len16, sizeof(len16), 1, out) == 1 &&
+             fwrite(n->str, 1, len16, out) == len16;
+    }
+    for (uint32_t i = 0; ok && i < usings; i++) {
+        size_t nlen = strlen(f->usings[i]);
+        uint16_t len16 = nlen > UINT16_MAX ? 0 : (uint16_t)nlen;
+        ok = nlen <= UINT16_MAX && fwrite(&len16, sizeof(len16), 1, out) == 1 &&
+             fwrite(f->usings[i], 1, len16, out) == len16;
+    }
+    if (fclose(out) != 0) ok = 0;
+    if (ok) {
+#ifdef _WIN32
+        ok = MoveFileExA(tmp, cache, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+        ok = rename(tmp, cache) == 0;
+#endif
+        if (ok) g_scale_stats.metadata_cache_writes++;
+        else remove(tmp);
+    } else remove(tmp);
+}
+
 static void pi_scan_file(pi_file_t *f) {
     g_scale_stats.metadata_scans++;
     size_t len = 0;
@@ -1454,6 +1731,11 @@ static void pi_scan_file(pi_file_t *f) {
         f->included = 1;
         return;
     }
+    if (pi_meta_cache_load(f, src, len)) {
+        free(src);
+        return;
+    }
+    g_scale_stats.metadata_cache_misses++;
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
     /* Heuristic scan: lexer errors on foreign text are false alarms, not
@@ -1606,6 +1888,7 @@ static void pi_scan_file(pi_file_t *f) {
     }
     zan_diag_free_buffers(diag);
     zan_arena_free(arena);
+    pi_meta_cache_write(f, src, len);
     free(src);
 }
 
@@ -4739,11 +5022,15 @@ int main(int argc, char **argv) {
                 "%zu declarations, %zu blocks, %zu instructions\n",
                 zan_ast_node_count(), definitions, declarations, blocks, instructions);
         fprintf(stderr, "Scale stats: %zu file reads (%zu MB), %zu metadata scans, "
+                "%zu meta-cache hit/%zu miss/%zu written, "
                 "%zu seed sources/%zu lexer passes, %zu throwaway parses "
                 "(%zu fallback), %zu real parses, %zu secondary parses\n",
                 g_scale_stats.file_reads,
                 g_scale_stats.bytes_read / (1024 * 1024),
                 g_scale_stats.metadata_scans,
+                g_scale_stats.metadata_cache_hits,
+                g_scale_stats.metadata_cache_misses,
+                g_scale_stats.metadata_cache_writes,
                 g_scale_stats.seed_sources,
                 g_scale_stats.seed_lex_passes,
                 g_scale_stats.throwaway_parses,
