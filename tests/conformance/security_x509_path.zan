@@ -1,0 +1,288 @@
+// Conformance: X.509 path building, pathLenConstraint evaluation and IPv6
+// iPAddress SAN matching. The chain verifier must construct a bounded
+// candidate path (issuers may appear anywhere in the received chain or in the
+// trust store), enforce pathLenConstraint of every CA on the built path, and
+// match IPv6 hosts against 16-byte SAN entries through one canonical form
+// (RFC 5952 lowercase compressed) with strict fail-closed parsing.
+// Fixtures generated with OpenSSL RSA-SHA256, valid 2026-09-28 through
+// 2036-09-25; leaf SAN IP:::1, IP:2001:db8::1, IP:127.0.0.1, DNS:loop6.example.
+using System;
+using System.IO;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System.Security.Cryptography;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        if (ok) { Console.WriteLine("ok " + name); }
+        else { Console.WriteLine("FAIL " + name); failures = failures + 1; }
+    }
+
+    static string ROOTA_B64 = "MIIDFDCCAfygAwIBAgIUSGAGnkwlnjOauJ3VHyBTd5k60ZYwDQYJKoZIhvcNAQELBQAwEDEOMAwGA1UEAwwFcm9vdEEwHhcNMjYwOTI4MTIyNjIzWhcNMzYwOTI1MTIyNjIzWjAQMQ4wDAYDVQQDDAVyb290QTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMsk41wNFCJdhxni5hv+o0ZGwpzDtljgfeZa3JDC0vq7yDoAg27zSUKLH9C9eLGYr1LubP1RYw7JbkMED6Br3jIO46ANmkiQWKOIvtJgG3N6R5cSrA6cRc1naKN1V/GEsviGeyIpcn6/yZfxRo/9jMrcnfextecAQcrJ6UKLrEgho7MC0n/JQLnkBZJIVmP+HXhSEe86zA9PsLrT5Wj4CJMQPzGocIGn8EZsGX7gFgJ99OjYrd+fl5x/Dtkc1E8vLN8f5oY9yjCkXb2D0dl1KJGQW3+aP/JJu2qnLlgA/XtWkGAEFZl4bK3q2PEKikUwANZk0SSMyN04IpvEGeweL30CAwEAAaNmMGQwHQYDVR0OBBYEFDDJuQhjIzLSyLgpfa5zZ+ufuCi8MB8GA1UdIwQYMBaAFDDJuQhjIzLSyLgpfa5zZ+ufuCi8MBIGA1UdEwEB/wQIMAYBAf8CAQIwDgYDVR0PAQH/BAQDAgEGMA0GCSqGSIb3DQEBCwUAA4IBAQBbdu/xUAXbhKye4BgWwNn/qWHJUOdtj9ieuqqCQMARkynu+NPfn5+4cvYW8IDdA2pPVWl4u0SO9DDlcgnrxL+vrbz4pInAvQ6lRUJ8qjLI4DTVuIyhZGiEq/eCXR8gIW16pJSWXnbwmgJnS5v6g5Xapi4zpWpyp2P/v5JNMUXowP7RgZo/hokFHvT1A0Bn04lfMbKDH4T9bqlpzxvcZyhcvhLxvDCRxwQdrS3kXO/hk5JPKJhzY4oJG97252jvJ+7BOAppWKRyRKFe0GiixEnM3XqnoAqmgXusU56t7bu5eZPdmjCeInZClRZj2aV/4jVn+mEiDQ7I2HPqFUDQ6LQb";
+    static string ROOTB_B64 = "MIIDFDCCAfygAwIBAgIUWMK3B0Y8g69j0YHFGXTcLAsBntUwDQYJKoZIhvcNAQELBQAwEDEOMAwGA1UEAwwFcm9vdEIwHhcNMjYwOTI4MTIyNjIzWhcNMzYwOTI1MTIyNjIzWjAQMQ4wDAYDVQQDDAVyb290QjCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALEGaJkIBYbf1lpSqflG/df5JHV5T6+urdfu9uAl7VVOa25xMs/Ob/p+kHhvzNT8B7nokm7PMLRYYT1wgK6AlwS+yGB54MQWLvBOU4MQAMpf0qqmlTphvGMVG5W4TeCBlCaEHwJObWUY8TqEu9SmMjJ8+naLcnTvIzZ8eiToYgyCEkdT42sQxCdWJ1tNu0QvAx2W7wlyg06QDroJgPqjjUxYO4eYy0aJNoC4G4sLzEYqM5Lqur38VdPdqUzT+jdRvUEUJsEB8up5H8L23J/FN5YNghX4UMoIu8Mz8PSNGsaIRtZx7cKwW4aCnReniGA5ksdR73kVBLZxPSNo6wiT+/MCAwEAAaNmMGQwHQYDVR0OBBYEFAteOrh4XefN+LJenlsBdk0IGzunMB8GA1UdIwQYMBaAFAteOrh4XefN+LJenlsBdk0IGzunMBIGA1UdEwEB/wQIMAYBAf8CAQAwDgYDVR0PAQH/BAQDAgEGMA0GCSqGSIb3DQEBCwUAA4IBAQCUWOOYFzG3qzo+xp9vtG87CTyejQuUaehnTPMzXvG/KG3oOI/4Wu2UHSgSC+Fv4lJGTZK/0R+FTmB3TVRd9lb8oqNyTVo5GR2PdgPClLwQFXG6og4ysczqKlX6YChN9zXAXks32HHGgXqqNXe1TEgMjN9LrLHKvnd4pc/pQpuXsK4haIC2Llbi4DirL/TGEo53eCpA6LWKo0TXgcb9h5yTGoEXdwzWVuuP7K7mpkgLJ6I8/oTy0fAhFogfsBokdIYkTAkhcod8RGZUTZ8x3aaGThvXyGEZczs+EEWDwjmMSJxeGmkYuEoAuioALew16GxGYcnMj0wE2LnwBYwGKHFn";
+    static string ROOTC_B64 = "MIIDFDCCAfygAwIBAgIUL5Vvp+Fct5JFobtEgytGBPVUN0kwDQYJKoZIhvcNAQELBQAwEDEOMAwGA1UEAwwFcm9vdEMwHhcNMjYwOTI4MTIyNjIzWhcNMzYwOTI1MTIyNjIzWjAQMQ4wDAYDVQQDDAVyb290QzCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALsVvdU9kB+7FOBY25w/Gsgb1zuS5zsMYgsmIIdO4h+k+IaXA62FRr6Ash3K8K6z7yFxgd4g21ngDQtVeb+h1Jvbx9ms2jLnaSRWV+1WAB9TLJCvETeXpGx2qkhEyHOe20eLSFNioQxvGdbtjRKGdmPwfTJWevG9YS1SzrExLwLqXmbLYegbo7b8p6O6uTog3Es9bddaISYwUg+e8Mdud5lXkO5qh78AGDLaYFjpjZfFOsGzf7D3yzuDYcykvjltwFhfcKD7ux1sUKYfkdB7RibGaU3Z8xfVPrip8oUUeytNPWIqYElLQ6PvfmOTEVpuFHBgaeqBaFL/CAsLGruDBP8CAwEAAaNmMGQwHQYDVR0OBBYEFMYN3WLPlfch3yO12SZXdwOuDX2VMB8GA1UdIwQYMBaAFMYN3WLPlfch3yO12SZXdwOuDX2VMBIGA1UdEwEB/wQIMAYBAf8CAQEwDgYDVR0PAQH/BAQDAgEGMA0GCSqGSIb3DQEBCwUAA4IBAQCWD2BcFrdnjbvF/TPadt+YtlX7WlHYT+FpxTRYKsi45DgkxGFgM/6zAYYJ30XmSA/foqQTuOADwo16pcZhsadNFxdFE19pKE1X+kqPnyiPqQiH5RsNCMjYe83v2KcpLTS3Y1k8jC8w0YqiZluoeSTFm1KSUET1fQN26pnFml1C4F0SAYMwBgruKDHVCHR84OUEcbttL48SkpmgrULi1z99FmwAjUKi7C7fXwRgXUuL6MREJjpA+vTkLGVV5gbp/dkEPI2mfMA6mMuRzxw9y/QEENV9k+ZVrgVpgggn7oqyvbBdN5zTW6QdB3PvI6FsofzgY2i8wUjbe334V6lP8/39";
+    static string ROOTD_B64 = "MIIDFDCCAfygAwIBAgIUB/xznJl0VsePpIQOgwuMY/+CghkwDQYJKoZIhvcNAQELBQAwEDEOMAwGA1UEAwwFcm9vdEQwHhcNMjYwOTI4MTIyNjIzWhcNMzYwOTI1MTIyNjIzWjAQMQ4wDAYDVQQDDAVyb290RDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALUUe6sQz12G0jxq6VEu86lVLx0v5r34kQ/M4mnZPd2z5+xBjQRK3OCyu7hqJVzwJ7VYlkkzTdKnxIqUg/677p63jmMAzn9RVUIqQ8vs+KfyzTsB5ATu5W5ZpWWrl6Cl022ogfm/fxUROiuqGcEpOmuCTHXUzlzwc69qkW5oUfz/jhK7qpabu/zbPkSTqxX2ajr8dStcMrvCYGvhKdeIfFS4Gx+fSduTsyvHTCcpyKd8ssu474UDtBgwgVyIji9ku99vNNVwUa0Vz1t8OFkCgAyemuOv+edD3oe81BxV+PKnVX1Ex7YOhkPqk274EFj/iK3mMb8bYaXmKP6n+C3MKjcCAwEAAaNmMGQwHQYDVR0OBBYEFLPRPMoKLvvI8qlFWE9cm+O6mtFeMB8GA1UdIwQYMBaAFLPRPMoKLvvI8qlFWE9cm+O6mtFeMBIGA1UdEwEB/wQIMAYBAf8CAQAwDgYDVR0PAQH/BAQDAgEGMA0GCSqGSIb3DQEBCwUAA4IBAQB84SzpZZ1k4i1FnSb1jALJPidpO7rhWj7Hk+v+X9CIg2up1N2QOElHRZy5DLNBXIY3Vw9ctJRRjRgRrEsbrs/N1pz1sNcH643LNN+f+95kI9n4ed1kTL4QuWgoejUbUfuejk7tnA/Nqe+jOCOVnZiGVGP/5d1Z47/30kf8nQIf5vmS2r+IoSo/4quUZNQXJPtJq27ynyq8PJI23RqZndTphb7MhJkPzO7NJix/Vi3zRc86iZIexyiWVA67fsboArXM+RdrgJrfJqM6MT0FQRlfyrullILcfiMlpaTNtmkP0DaI/z1rE5E0vUuVrVf1WZYd70Y8cDM0v3YzV4loR7Mx";
+    static string I1_B64 = "MIIDETCCAfmgAwIBAgIUQW7mpHLAtdpc+uc5eVRFMhC1P+gwDQYJKoZIhvcNAQELBQAwEDEOMAwGA1UEAwwFcm9vdEEwHhcNMjYwOTI4MTIyNjIzWhcNMzYwOTI1MTIyNjIzWjANMQswCQYDVQQDDAJpMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAOIDiFFOv6dr8yAFkJaRs53N3WkK3GsrhcSdeE6JCmqYqz4T3110W7XbvpDR95mrO54Qb9wbBrGO2EBO03G+jdN6PkaKVdBawM87DRlbKCYE1sO0qjo0JYhP50mvvMo5+rtpBKh24qZEaMlzBjO3880GkCzpxhnGzG5Y6/FFs46O8VRvGeqtJG/bIYYCjjkdt9UDjTbefzaxciSRDmf9+gmIBVYMiR/umXD3bbYIfA5fIkQbEV30p6Rl/hjh0KTPQT9xy5ia18AADD2zH6emEZT1NVI20p8lkLE1jpZgyb6yaZh4cJJAa9vPUJH2r4mYyvaEFIF71BCE9nmaRmdOTWcCAwEAAaNmMGQwEgYDVR0TAQH/BAgwBgEB/wIBATAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFDSm76E3JcWMls3wm4HWiDdF8FlRMB8GA1UdIwQYMBaAFDDJuQhjIzLSyLgpfa5zZ+ufuCi8MA0GCSqGSIb3DQEBCwUAA4IBAQAb71AAjXS+P5htZMNUwlZe25sCw2ZQ/DUL//iUYbqQtM8+ACEbwZ2Gs0VZaXDCXABE2naIJS/djX+/UCy8K/BchliGU9OuU5OmPo66ytyz7C2ka5PHwxDbbvTFFaBQhBVoDcFSdKGEdBUgsbYIpdNsVGx8WgcuwWxLolGSS10kpj/mNAAD/LOeOlgZCM+k2JOkfcrPY6NeCtubPEhk3dEqVgiA/PpUoQQWpQX/8TLCRYa2tYhRqciwZXbf6Q3RDq3n30tPPmz8gHEVxNDfS1ghRD9yHrETJtMBVohsolJtxzbiwTT1nBymjHfZlBCqJLaSBuqBZ9Ir0rD/nShzaWEN";
+    static string I0_B64 = "MIIDETCCAfmgAwIBAgIUQW7mpHLAtdpc+uc5eVRFMhC1P+kwDQYJKoZIhvcNAQELBQAwEDEOMAwGA1UEAwwFcm9vdEEwHhcNMjYwOTI4MTIyNjIzWhcNMzYwOTI1MTIyNjIzWjANMQswCQYDVQQDDAJpMDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBANhM0AWBUs7jjUCAf2q7839MTB22SOzKFcoBYKvrWYtdAuU8xVobOIVe1KbKOAmdBhkNpQ3Dr7D9jjMTlmzBIhyIZW0TjC8EaRQka0zIr1H9l4s461+mYgZiLSLKnado25MIJdM+SwSVFRfFcIvMvr3xWFXW4z0RCegzjGYoPUJXAOtICM9WP/FRO3GEC0P0Xo1Xazg0IMQ6zZIZ7k8bcUVPJDoR6vE0pkWM6ZTZxaVlrGJPOKoDsYB7DZGJW0WerYEKuWGgYyLc2Aa5BaZWRdsT31eQ49Hegy1KBI+cAP4JBwdN4DrBuXuFMZDLnCvldJu38KNwAs36kaEmAMlNs6UCAwEAAaNmMGQwEgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFDBajR8ZCdQlqXyg17/i9yfq9QS9MB8GA1UdIwQYMBaAFDDJuQhjIzLSyLgpfa5zZ+ufuCi8MA0GCSqGSIb3DQEBCwUAA4IBAQCKN4yeQehjGNyWDeewKCi5JCFoJbFJddYTXuX92stOZWJSkWeiLkYaOBYEYhI7fGMgH4Nw8lVla8ywlCsy57riTLzX+dAmJHayOYay3GYtvKnTg5ko6ORs/IbD3L1GpeDPP0azrdAttWL/oPOH7juZlCpk/6nuVhQQRv+KK0mbvsqojP/SJGzSGa6OD6SGVb9uc45D5Z14SBJShnR9G5iUMqahIC9DXam1C42Igwb2Jm/2zRmVCZjPlCVgYCcov2YZHidNcSTxm+yU5+S/YLNlmDXBl7ieulbNstjUDBDbtRMaohFNrrrxE25HDllcq4j3zrBt6liyrnE/fPlmFSbK";
+    static string I1X_B64 = "MIIDDzCCAfegAwIBAgIUeShwh6vxIGH67INwLEuyjPVlrRwwDQYJKoZIhvcNAQELBQAwDTELMAkGA1UEAwwCaTAwHhcNMjYwOTI4MTIyNjI0WhcNMzYwOTI1MTIyNjI0WjAOMQwwCgYDVQQDDANpMXgwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC/lvKUMPFjCE/fJpjHLW4j9sOnq52zfSfyTyMnOB1Ub7Jqp+Edts9ziOelrIJUPYsbN4diaVWjak56KZjkQkk/AabC8TJ9qhd9fmPTIMbbfHCkwBxnmMxLuL4bCax7JbrXUHc0t2q+M85HivBkFqtecU3fU4trfsGI1qdL5zx8fam+/u1LH1TECbfeQDk/TQnxtFQnXsw8dNO7sRAocGj1rwFUit5+1eZUsiWTW08xlAnk43UPOBA4obdxwxAmMB593c5uhKpXLZIgyUercWPzLKEJeHCcYGZy2bWY/LKxKtULoAQVgr/4xVk4hQh9zsLEOA13ZLx61/6coxuznhENAgMBAAGjZjBkMBIGA1UdEwEB/wQIMAYBAf8CAQAwDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBRgza/kblpXZFIvXLQJ3sFcbUQJSjAfBgNVHSMEGDAWgBQwWo0fGQnUJal8oNe/4vcn6vUEvTANBgkqhkiG9w0BAQsFAAOCAQEAWYqkg1YDJ+FTJNmB9+NAPwv/DMBQo0FOHKsiuzLZAKhAPetzpCQYMX3WXQvrcfeZ3n+mzrWNCo6n5rK7E1+qItEpyRRNTMrce73VHSuGW/2sgwnvriYvR9PYvS55+j5ROaUV2tF+pMjadqfMq6j95u893qC2M/zyDVENchsk+mQLowxxQvSjFTr9nIynhs+NMBn2AP7uhSNEdz0HVH6AvwJ3tdTrjy9gCxlqTGCQbxBK6j9Kp3IYqkB/3zILXUIpxZ7z7WRBzYT85oglghfyIFOmKzPB/uMZgjjiuTbZZ+YGj5DqGbFdYaxtAPJiSzW4Sl3tQb6IrGz6RITkE8yQ+w==";
+    static string I2C_B64 = "MIIDDzCCAfegAwIBAgIUMNJqUQEjllMmsDW5EobqpbxCGE8wDQYJKoZIhvcNAQELBQAwEDEOMAwGA1UEAwwFcm9vdEMwHhcNMjYwOTI4MTIyNjI0WhcNMzYwOTI1MTIyNjI0WjAOMQwwCgYDVQQDDANpMmMwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCqJgV57JYaytwJ0RPHDoY0GdYk4WKBXacYqqEAFodzPobPBcDO66cJRcVwizGWjZTSz8PVqg0E6xqiEPIsOACcEzpdfrMxwdr/IZSc9xSQUPBqhLyVbLgthT9NWSaysnHw9kRaPQewZWXPOU/mCXcm5aMnnTzW5lxAinhWBghiXHT/EW6Oo9ZMD5sRG3sEiZ3PqL67Hu4MRVZkPSQwDn3WDEkVgj1gVP6T++LT+vcd90XbL3K8xgnQlW+e/TnBrDAQAo30S9PDorOTI8fgl6SErJiMR3EsLHizwkRWGp0mrmMKBXKe+TZbFm5RRL3AnXIDaflipMJg5wp8mdA6/h0ZAgMBAAGjYzBhMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBR73Kzkz81/fR1S4Uobw61yYajIgTAfBgNVHSMEGDAWgBTGDd1iz5X3Id8jtdkmV3cDrg19lTANBgkqhkiG9w0BAQsFAAOCAQEAq8udyp7m3yNIm68coXtzZUTQ9rBjaHrrVSbNsCPDGqHhs9xu4ofa7ZHA9x5M5hqZS2qZPKLl7T6MULqMI6cqaDE2za3gZjYAUlKLnOSAe02p4AURFsNUsgbFZK+bijPS1YI/lDAlqm0Q3R8oxsNz/PTNBwhxMZ3gJNw3r4Exmf3dD5Q9bb46uEgyoj1W8ngopKZJtHF6ybCMin+yjo2QnPK2RVzaFIg2ZwekPAqFGxTwLDzxlDxUqm24ffUCwCrLD5kld6wK1Pu3v4DLMtTpcZdJaxOJwAtSFi4KEqQaqooKbaaJkHCS1X5S8yeCIdSTbHVxyiKTJDpqJ+4wbPWuDA==";
+    static string LEAF6_B64 = "MIIDaDCCAlCgAwIBAgIUU9sShIwDFsLf5ES/+M9oddcOL/QwDQYJKoZIhvcNAQELBQAwDTELMAkGA1UEAwwCaTEwHhcNMjYwOTI4MTIyNjI0WhcNMzYwOTI1MTIyNjI0WjAYMRYwFAYDVQQDDA1sb29wNi5leGFtcGxlMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqdVtQ3KbcZ9PpNHIw6Z9QmHly5B/QzmpJHrz/ohiQyruoeDAnRup4AT2HhDbmBcyzva7efxyXxcN8unCsnYTA3KDmIPRsgCmvKc8YS41WIquc5+aOZa9PIhOtzs2gxlXf9pARR2/azC0YDqznM/qzr3IRBODdUd+9tKlXlUVdZbzIjXwTgYpkvohtrng8/zejMT1YMH7mw1UvpLhyiDJyUNpaCDkV8flbDRoEKfvjZLEeClTY4yZt2ldPoC8i/jxbatV4ARJY6Yld5mMqY7htk3x03+edbx9+SLLbRVuM8yObN9708QmJWJLN2m0epRuTWyG8nvKiMV2AlpyK+u81QIDAQABo4G0MIGxMAkGA1UdEwQCMAAwCwYDVR0PBAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMEIGA1UdEQQ7MDmHEAAAAAAAAAAAAAAAAAAAAAGHECABDbgAAAAAAAAAAAAAAAGHBH8AAAGCDWxvb3A2LmV4YW1wbGUwHQYDVR0OBBYEFG4zlfdPmGDn4fwWUfLig0rjyjaOMB8GA1UdIwQYMBaAFDSm76E3JcWMls3wm4HWiDdF8FlRMA0GCSqGSIb3DQEBCwUAA4IBAQCWlZCzgTSk3jjCQ3xHIfWK1nvlgSamvewVd24y3VKlnKxye1ys18QdEASZGiRNh8u/7Bc4GpErI1x6y1rMsoE0kippGMEp93h6UCpZbNDb1C18eZe2qZSD6ExoGWVjpWjwOSAF/zs+STaNMCuwjrcQop9KGKy0nFxfE9hRiMbTU1BMXW//oj8PeWc6Nke27uq3PB3z6Sl6ePtIYe4uykSp0umN3mUXv3QyZLFWSW+UttBszco5EBqSA5m+BWZCuy0VKYmrBUaBQqRQhBaU4CtP/xVLKdCZ9baq1whnH6eRbRPYfvH1LRv/mykDDfeJFUBIsRUkazGx0zZWX+blHOR/";
+    static string LEAF6I0_B64 = "MIIDaDCCAlCgAwIBAgIUeShwh6vxIGH67INwLEuyjPVlrR0wDQYJKoZIhvcNAQELBQAwDTELMAkGA1UEAwwCaTAwHhcNMjYwOTI4MTIyNjI0WhcNMzYwOTI1MTIyNjI0WjAYMRYwFAYDVQQDDA1sb29wNi5leGFtcGxlMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqdVtQ3KbcZ9PpNHIw6Z9QmHly5B/QzmpJHrz/ohiQyruoeDAnRup4AT2HhDbmBcyzva7efxyXxcN8unCsnYTA3KDmIPRsgCmvKc8YS41WIquc5+aOZa9PIhOtzs2gxlXf9pARR2/azC0YDqznM/qzr3IRBODdUd+9tKlXlUVdZbzIjXwTgYpkvohtrng8/zejMT1YMH7mw1UvpLhyiDJyUNpaCDkV8flbDRoEKfvjZLEeClTY4yZt2ldPoC8i/jxbatV4ARJY6Yld5mMqY7htk3x03+edbx9+SLLbRVuM8yObN9708QmJWJLN2m0epRuTWyG8nvKiMV2AlpyK+u81QIDAQABo4G0MIGxMAkGA1UdEwQCMAAwCwYDVR0PBAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMEIGA1UdEQQ7MDmHEAAAAAAAAAAAAAAAAAAAAAGHECABDbgAAAAAAAAAAAAAAAGHBH8AAAGCDWxvb3A2LmV4YW1wbGUwHQYDVR0OBBYEFG4zlfdPmGDn4fwWUfLig0rjyjaOMB8GA1UdIwQYMBaAFDBajR8ZCdQlqXyg17/i9yfq9QS9MA0GCSqGSIb3DQEBCwUAA4IBAQB3p7H/K9KvYuR/xUIFJ4OPNuf5+o+SgPiqgKzlRKkZVoNr6dZJpb0mEdxV/Wwq5aVTwp3cC3PziEWebcNTaWoB1uiOp5s3T5mxwY/4NgdTQkTmlY5rsW5c+UP9xngCLv5pCRh7Kk9VCZzk7jvKfRcvXDrn6wDVtqA8fplXD5+rsZD2hCZCy9rmgjEaO2n1phcwg9EFLXlDL3LQ74dpErM+I72s4SNosEX2Ni8WCxm0WTCyFw2OB/G5FvKfLRqo8tFXdIqmMd9aixgScRhWzWDAppjQFkFpEWxnjMf+4Qh0No/QjsW3r6aFHv6RaYz62xJgy3WPsO6gYzAN7qQ1vSPI";
+    static string LEAF6X_B64 = "MIIDaTCCAlGgAwIBAgIUAPVCjnblEP5N0dNFjT1wUfnF2dgwDQYJKoZIhvcNAQELBQAwDjEMMAoGA1UEAwwDaTF4MB4XDTI2MDkyODEyMjYyNFoXDTM2MDkyNTEyMjYyNFowGDEWMBQGA1UEAwwNbG9vcDYuZXhhbXBsZTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKnVbUNym3GfT6TRyMOmfUJh5cuQf0M5qSR68/6IYkMq7qHgwJ0bqeAE9h4Q25gXMs72u3n8cl8XDfLpwrJ2EwNyg5iD0bIAprynPGEuNViKrnOfmjmWvTyITrc7NoMZV3/aQEUdv2swtGA6s5zP6s69yEQTg3VHfvbSpV5VFXWW8yI18E4GKZL6Iba54PP83ozE9WDB+5sNVL6S4cogyclDaWgg5FfH5Ww0aBCn742SxHgpU2OMmbdpXT6AvIv48W2rVeAESWOmJXeZjKmO4bZN8dN/nnW8ffkiy20VbjPMjmzfe9PEJiViSzdptHqUbk1shvJ7yojFdgJacivrvNUCAwEAAaOBtDCBsTAJBgNVHRMEAjAAMAsGA1UdDwQEAwIFoDATBgNVHSUEDDAKBggrBgEFBQcDATBCBgNVHREEOzA5hxAAAAAAAAAAAAAAAAAAAAABhxAgAQ24AAAAAAAAAAAAAAABhwR/AAABgg1sb29wNi5leGFtcGxlMB0GA1UdDgQWBBRuM5X3T5hg5+H8FlHy4oNK48o2jjAfBgNVHSMEGDAWgBRgza/kblpXZFIvXLQJ3sFcbUQJSjANBgkqhkiG9w0BAQsFAAOCAQEArHNMWTfHJEkHrwPBqJD6wEhA8rsYdP513I0SkrGr5e2ge6Wms9Tu63MHbLJszUUQGBIMrYsuoB3FD/SSpE2tryV42aWZ0fp/fmSUJVtV+aNEcZEnmhdJ89hog+U/b5zXx9v8MSN4VwgoIxlfn+SPzbKg+fjleS/bi/yatMe1Bd21GL4iUX8rr5OMTHSCD7jfs23qhM3zQc54qiZ2DSmZJ7221H6e9SFK9qIPXvT0JCe5ySj2hcvsn+AnrL1NgiKqSOymTrz7JO4bn7c6L7SS9ddZ49HluCvR99xT1O7olCHqOuCJ0ahhnkynldMKGGfQszSqJDgA4G5JP1hN38Ttxw==";
+    static string LEAF6C_B64 = "MIIDaTCCAlGgAwIBAgIUJLc9eAqEzQjz4mqaZq4mm8OGb+4wDQYJKoZIhvcNAQELBQAwDjEMMAoGA1UEAwwDaTJjMB4XDTI2MDkyODEyMjYyNFoXDTM2MDkyNTEyMjYyNFowGDEWMBQGA1UEAwwNbG9vcDYuZXhhbXBsZTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKnVbUNym3GfT6TRyMOmfUJh5cuQf0M5qSR68/6IYkMq7qHgwJ0bqeAE9h4Q25gXMs72u3n8cl8XDfLpwrJ2EwNyg5iD0bIAprynPGEuNViKrnOfmjmWvTyITrc7NoMZV3/aQEUdv2swtGA6s5zP6s69yEQTg3VHfvbSpV5VFXWW8yI18E4GKZL6Iba54PP83ozE9WDB+5sNVL6S4cogyclDaWgg5FfH5Ww0aBCn742SxHgpU2OMmbdpXT6AvIv48W2rVeAESWOmJXeZjKmO4bZN8dN/nnW8ffkiy20VbjPMjmzfe9PEJiViSzdptHqUbk1shvJ7yojFdgJacivrvNUCAwEAAaOBtDCBsTAJBgNVHRMEAjAAMAsGA1UdDwQEAwIFoDATBgNVHSUEDDAKBggrBgEFBQcDATBCBgNVHREEOzA5hxAAAAAAAAAAAAAAAAAAAAABhxAgAQ24AAAAAAAAAAAAAAABhwR/AAABgg1sb29wNi5leGFtcGxlMB0GA1UdDgQWBBRuM5X3T5hg5+H8FlHy4oNK48o2jjAfBgNVHSMEGDAWgBR73Kzkz81/fR1S4Uobw61yYajIgTANBgkqhkiG9w0BAQsFAAOCAQEACIrDJwE/wdWRUyT6EOCtVSR6O1s6ksbWLS4tHJ3ju+NQOGDlG43GSGDYLYFXd0pK+qEkKRJ4Jq2pgzJEMrLJTVXD1EswAPNMyn+Q2ohmmRysLinOVzHDuegO8CfrsOZ88rsMyk3NuTArqe8ONl/1byyqHLSE/89YyGCs3VMHw6tj6Lx79HSjIc8zM9pAtfeAJxUQj8Asu0p06zV4vWH18jGDwQ+ntb8c8ig0STjVHg4er+EZB0FwO5P5XQWHoRNW3gbMKdc4ZHlcZWgWpdLc25yLKFpJgajaIQpDFvUbXpVVy04aKHOVgWhkokrQXP/SA0h3eOMIR7v2Ni9IDWFKyQ==";
+    static string LEAF6D_B64 = "MIIDazCCAlOgAwIBAgIUD8/VwXJ/oWAyAo3gXQ2eb6AZF2wwDQYJKoZIhvcNAQELBQAwEDEOMAwGA1UEAwwFcm9vdEQwHhcNMjYwOTI4MTIyNjI0WhcNMzYwOTI1MTIyNjI0WjAYMRYwFAYDVQQDDA1sb29wNi5leGFtcGxlMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqdVtQ3KbcZ9PpNHIw6Z9QmHly5B/QzmpJHrz/ohiQyruoeDAnRup4AT2HhDbmBcyzva7efxyXxcN8unCsnYTA3KDmIPRsgCmvKc8YS41WIquc5+aOZa9PIhOtzs2gxlXf9pARR2/azC0YDqznM/qzr3IRBODdUd+9tKlXlUVdZbzIjXwTgYpkvohtrng8/zejMT1YMH7mw1UvpLhyiDJyUNpaCDkV8flbDRoEKfvjZLEeClTY4yZt2ldPoC8i/jxbatV4ARJY6Yld5mMqY7htk3x03+edbx9+SLLbRVuM8yObN9708QmJWJLN2m0epRuTWyG8nvKiMV2AlpyK+u81QIDAQABo4G0MIGxMAkGA1UdEwQCMAAwCwYDVR0PBAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMEIGA1UdEQQ7MDmHEAAAAAAAAAAAAAAAAAAAAAGHECABDbgAAAAAAAAAAAAAAAGHBH8AAAGCDWxvb3A2LmV4YW1wbGUwHQYDVR0OBBYEFG4zlfdPmGDn4fwWUfLig0rjyjaOMB8GA1UdIwQYMBaAFLPRPMoKLvvI8qlFWE9cm+O6mtFeMA0GCSqGSIb3DQEBCwUAA4IBAQBfhKbyiy6c/ylxLwz3MLIUrK4Wp88Z8bB13ojKJJkLhWXCU1TToKjCpPLq/ijyGEnJTkemTY+ooYrrhVXVLQfyFOsDT8WrwnKA/vwg+RTiqhuX2JYUswMKroFTgh0L4BlBlDjYb79MNhc0tQz37blTdrKc08P5RqRElLvW88qtXx5/QsyO/VICQUcd9ljabh63te5zX3lqB0OsdYBQoXZCVDBnRgFUFNllOAEJ63apaZYNITMbLEdw2L/L6EwfF5OelfcnRM/cNAkHAI16au4P76J27Ml4spZMuX7FsZXWb+HmsnypCWoU3ytjc82ICDqSfTXWg2BpYFs47LWubY51";
+    static string LEAF_KEY = "-----BEGIN PRIVATE KEY-----\n"
+    + "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCp1W1Dcptxn0+k\n"
+    + "0cjDpn1CYeXLkH9DOakkevP+iGJDKu6h4MCdG6ngBPYeENuYFzLO9rt5/HJfFw3y\n"
+    + "6cKydhMDcoOYg9GyAKa8pzxhLjVYiq5zn5o5lr08iE63OzaDGVd/2kBFHb9rMLRg\n"
+    + "OrOcz+rOvchEE4N1R3720qVeVRV1lvMiNfBOBimS+iG2ueDz/N6MxPVgwfubDVS+\n"
+    + "kuHKIMnJQ2loIORXx+VsNGgQp++NksR4KVNjjJm3aV0+gLyL+PFtq1XgBEljpiV3\n"
+    + "mYypjuG2TfHTf551vH35IsttFW4zzI5s33vTxCYlYks3abR6lG5NbIbye8qIxXYC\n"
+    + "WnIr67zVAgMBAAECggEAOM1084OgAPMvQKmXs/R53Zt/r8OfBP2CmHx1IhM8hkmU\n"
+    + "MdlJouJvQUl3hdvOjoJn0HgOgUDRggNke3P61hSOzG7fG8Iu/xGfsuZeWASL/Ba6\n"
+    + "PVrKyusjVN0kMr2fwF5X+R+mslc+QBw0oCDSFScnWkl4c2hxZebpTKVsgO4FNOQh\n"
+    + "km8JB3fZRn7JZ8aZKD9R4h9Be2O3QjWG9Hym3tUKa4df5h3fY8GwtKdE/VSZX+BL\n"
+    + "mcb7qUypOqb5zIjpcx7yuNY9ZSs8IovxGLwZpBHY7czdBVAjaV5FC/qx9d8NbBP6\n"
+    + "KA0Q18Em8IqfM6KLg2wiwSx9UxFRBBKFBXPBf1UT+wKBgQDfb4GMA1za1W0GxohU\n"
+    + "lbwamJC/aQ5UAZm7pPm5tUqzi+6R+IqzAh2yPZIRem1ewolwPns/VpTSWyUAbjJt\n"
+    + "8le74sEelZpue4YwtMMPddSGerlC+rlKGL2tJyZXa70a7B7yGIGfmqWWWNfeQBjV\n"
+    + "SPXjtevCJ3ykgSUDOuksEjyV5wKBgQDClgIC8MNO6V7Vc+YRLEpCT45lRabP0TjE\n"
+    + "vSC0sqssx4hXZGaZrhYcAb7tT23Vnkq1eHFHFET3MEH/g90dBx3bLZlvTgDYQ5O9\n"
+    + "sqp0WOoSRA5wj2GkM5XDYWuQHbahb1vsn37lVD6AdMuBLHtsRBsG3ZAk70O0MeYZ\n"
+    + "9bk3uOqH4wKBgQCFbFGgqVVme/IqDJ3WXL/B5f7xvitHMNl7eu2A3uhnxRTGZ/Nz\n"
+    + "J71R9YBnHYN4BZUKyNTSIsKlxrWWxzcn/oIzeRm3SMC6Xtrn9NlSPxuU3m4IuC2z\n"
+    + "OIjzgCBeLcDz9bIZAVdOVouw9waY+g+aNYJX4weQngHJPjE694/LuGwjWwKBgGZR\n"
+    + "dLtRGJH8+sXozJhJHr8hkDHGX0G1tVEWVgVOUd4ZCaNSgvTaanvNmzSz6IBEXOpx\n"
+    + "a7dBfEYylPGjx/gEjvl6T80MSjttxVkhgqntOx/hs2oSqvgpu91h86pzRV477S1O\n"
+    + "bO5vzvHC+GNzHW8/nKqOhMY3HfW5q1IJOJyJWqGbAoGAHv+YGEn6S6t6v7PqUzgl\n"
+    + "MmG0hRpR0k3HMxxfhS7rLd3O4fOjJBmx2pfs3/pqBo4uKfInAVxpfpKUFlh+5Tez\n"
+    + "7vVahAyGvv/fpVU58qk/rXQQJSCjnYhUYSrqXze3+tUmNtG8/GDVZxp6ijMcHRfG\n"
+    + "M6y0cuQlYQgORoOP1oGLz/c=\n"
+    + "-----END PRIVATE KEY-----\n";
+
+    static string Pem(string b64) {
+        string out1 = "-----BEGIN CERTIFICATE-----\n";
+        int pos = 0;
+        while (pos < b64.Length) {
+            int take = 64;
+            if (pos + take > b64.Length) { take = b64.Length - pos; }
+            out1 = out1 + b64.Substring(pos, take) + "\n";
+            pos = pos + take;
+        }
+        return out1 + "-----END CERTIFICATE-----\n";
+    }
+
+    static bool ListHas(List<string> l, string v) {
+        if (l == null) { return false; }
+        for (int i = 0; i < l.Count; i = i + 1) { if (l[i] == v) { return true; } }
+        return false;
+    }
+
+    static void TestParsePathLen() {
+        X509Certificate rootA = X509Certificate.FromPem(Pem(ROOTA_B64));
+        Check(rootA != null, "rootA parses");
+        Check(rootA != null && rootA.HasPathLen() && rootA.PathLenConstraint() == 2, "rootA pathlen 2");
+        X509Certificate rootB = X509Certificate.FromPem(Pem(ROOTB_B64));
+        Check(rootB != null && rootB.HasPathLen() && rootB.PathLenConstraint() == 0, "rootB pathlen 0");
+        X509Certificate rootC = X509Certificate.FromPem(Pem(ROOTC_B64));
+        Check(rootC != null && rootC.HasPathLen() && rootC.PathLenConstraint() == 1, "rootC pathlen 1");
+        X509Certificate rootD = X509Certificate.FromPem(Pem(ROOTD_B64));
+        Check(rootD != null && rootD.HasPathLen() && rootD.PathLenConstraint() == 0, "rootD pathlen 0");
+        X509Certificate i1 = X509Certificate.FromPem(Pem(I1_B64));
+        Check(i1 != null && i1.HasPathLen() && i1.PathLenConstraint() == 1, "i1 pathlen 1");
+        X509Certificate i0 = X509Certificate.FromPem(Pem(I0_B64));
+        Check(i0 != null && i0.HasPathLen() && i0.PathLenConstraint() == 0, "i0 pathlen 0");
+        X509Certificate i1x = X509Certificate.FromPem(Pem(I1X_B64));
+        Check(i1x != null && i1x.HasPathLen() && i1x.PathLenConstraint() == 0, "i1x pathlen 0");
+        X509Certificate i2c = X509Certificate.FromPem(Pem(I2C_B64));
+        Check(i2c != null && !i2c.HasPathLen(), "i2c has no pathlen");
+        X509Certificate leaf6 = X509Certificate.FromPem(Pem(LEAF6_B64));
+        Check(leaf6 != null && !leaf6.HasPathLen(), "leaf has no pathlen");
+        Check(i1 != null && i1.CanSignCertificates() && leaf6 != null && leaf6.CanServeTls(), "key usage gates hold");
+    }
+
+    static void TestSanStorage() {
+        X509Certificate leaf6 = X509Certificate.FromPem(Pem(LEAF6_B64));
+        if (leaf6 == null) { Check(false, "leaf6 parses for san"); return; }
+        Check(ListHas(leaf6.IpAddresses(), "::1"), "san ::1 stored canonical");
+        Check(ListHas(leaf6.IpAddresses(), "2001:db8::1"), "san 2001:db8::1 stored canonical");
+        Check(ListHas(leaf6.IpAddresses(), "127.0.0.1"), "san 127.0.0.1 stored");
+        Check(ListHas(leaf6.DnsNames(), "loop6.example"), "san dns stored");
+        Check(leaf6.IpAddresses().Count == 3, "exactly three ip sans");
+    }
+
+    static void TestVerifyHost() {
+        X509Certificate leaf6 = X509Certificate.FromPem(Pem(LEAF6_B64));
+        if (leaf6 == null) { Check(false, "leaf6 parses for host"); return; }
+        Check(leaf6.VerifyHost("::1"), "host ::1 matches");
+        Check(leaf6.VerifyHost("0:0:0:0:0:0:0:1"), "host long-form ::1 matches");
+        Check(leaf6.VerifyHost("[::1]"), "host [::1] matches");
+        Check(leaf6.VerifyHost("2001:db8::1"), "host 2001:db8::1 matches");
+        Check(leaf6.VerifyHost("2001:0db8:0000::1"), "host padded v6 matches");
+        Check(leaf6.VerifyHost("2001:DB8::1"), "host uppercase v6 matches");
+        Check(leaf6.VerifyHost("127.0.0.1"), "host v4 matches");
+        Check(!leaf6.VerifyHost("::2"), "wrong v6 refused");
+        Check(!leaf6.VerifyHost("::ffff:127.0.0.1"), "v6 form refuses v4-only san");
+        Check(!leaf6.VerifyHost("::1%1"), "zone host refused");
+        Check(!leaf6.VerifyHost("1::2::3"), "double compression refused");
+        Check(!leaf6.VerifyHost("1.2.3"), "3-octet host refused");
+        Check(!leaf6.VerifyHost("256.1.1.1"), "octet overflow refused");
+        Check(!leaf6.VerifyHost("999.1.1.1"), "octet 999 refused");
+        Check(!leaf6.VerifyHost("1.2.3.4.5"), "5-octet host refused");
+        Check(!leaf6.VerifyHost("01.2.3.4"), "leading-zero v4 refused");
+        Check(!leaf6.VerifyHost("8.8.8.8"), "unmatched ip does not fall back to dns or cn");
+        Check(!leaf6.VerifyHost("[::1"), "unclosed bracket refused");
+        Check(!leaf6.VerifyHost("2001:db8::1:1:1:1:1:1:1"), "overlong compressed v6 refused");
+        Check(!leaf6.VerifyHost("1:2:3:4:5:6:7:8:9"), "nine-group v6 refused");
+        Check(leaf6.VerifyHost("loop6.example"), "dns host still matches");
+    }
+
+    static async void PathServerLoop(TlsContext tls, int port, int conns) {
+        TcpListener l = new TcpListener("127.0.0.1", port);
+        l.Start();
+        for (int n = 0; n < conns; n = n + 1) {
+            nint sock = await l.AcceptAsync();
+            if (sock < 0) { break; }
+            await HandlePathConn(tls, sock);
+            Socket.Close(sock);
+        }
+        l.Stop();
+    }
+
+    static async void HandlePathConn(TlsContext tls, nint sock) {
+        TlsStream s = await TlsStream.AcceptAsync(tls, sock, 10000);
+        if (s == null) {
+            return;
+        }
+        string got = await s.RecvAsync(256);
+        int _w = await s.SendStringAsync("pong:" + got);
+        s.Close();
+    }
+
+    static bool exOk;
+    static int exChain;
+    static string exReply;
+
+    static async void PathExchange(TlsContext ctx, int port, string host, string ping) {
+        Program.exOk = false;
+        Program.exChain = 0;
+        Program.exReply = "";
+        nint sock = Socket.CreateTcp();
+        Socket.SetNonBlocking(sock);
+        int rc = await Socket.ConnectAsync(sock, "127.0.0.1", port, 5000);
+        if (rc != 0) {
+            Socket.Close(sock);
+            return;
+        }
+        TlsStream s = await TlsStream.ConnectAsync(ctx, sock, host, 10000);
+        if (s == null) {
+            Socket.Close(sock);
+            return;
+        }
+        Program.exOk = true;
+        Program.exChain = s.engine.peerChain.Count;
+        int _s = await s.SendStringAsync(ping);
+        Program.exReply = await s.RecvAsync(256);
+        s.Close();
+        Socket.Close(sock);
+    }
+
+    static async int Run() {
+        TestParsePathLen();
+        TestSanStorage();
+        TestVerifyHost();
+
+        Directory.CreateDirectory("_scratch");
+        File.WriteAllText("_scratch/x509p_leaf6.key", LEAF_KEY);
+        File.WriteAllText("_scratch/x509p_rootA.pem", Pem(ROOTA_B64));
+        File.WriteAllText("_scratch/x509p_rootB.pem", Pem(ROOTB_B64));
+        File.WriteAllText("_scratch/x509p_rootC.pem", Pem(ROOTC_B64));
+        File.WriteAllText("_scratch/x509p_rootD.pem", Pem(ROOTD_B64));
+        File.WriteAllText("_scratch/x509p_i1.pem", Pem(I1_B64));
+        File.WriteAllText("_scratch/x509p_srv1.pem", Pem(LEAF6_B64) + Pem(I1_B64));
+        File.WriteAllText("_scratch/x509p_srv6.pem", Pem(LEAF6_B64) + Pem(ROOTA_B64) + Pem(I1_B64));
+        File.WriteAllText("_scratch/x509p_srv2.pem", Pem(LEAF6I0_B64) + Pem(I0_B64));
+        File.WriteAllText("_scratch/x509p_srv3.pem", Pem(LEAF6X_B64) + Pem(I1X_B64) + Pem(I0_B64));
+        File.WriteAllText("_scratch/x509p_srv4.pem", Pem(LEAF6C_B64) + Pem(I2C_B64));
+        File.WriteAllText("_scratch/x509p_srv5.pem", Pem(LEAF6D_B64));
+
+        TlsContext s1 = TlsContext.CreateServer("_scratch/x509p_srv1.pem", "_scratch/x509p_leaf6.key");
+        TlsContext s6 = TlsContext.CreateServer("_scratch/x509p_srv6.pem", "_scratch/x509p_leaf6.key");
+        TlsContext s2 = TlsContext.CreateServer("_scratch/x509p_srv2.pem", "_scratch/x509p_leaf6.key");
+        TlsContext s3 = TlsContext.CreateServer("_scratch/x509p_srv3.pem", "_scratch/x509p_leaf6.key");
+        TlsContext s4 = TlsContext.CreateServer("_scratch/x509p_srv4.pem", "_scratch/x509p_leaf6.key");
+        TlsContext s5 = TlsContext.CreateServer("_scratch/x509p_srv5.pem", "_scratch/x509p_leaf6.key");
+        Check(s1 != null && s6 != null && s2 != null && s3 != null && s4 != null && s5 != null,
+            "all server bundles parsed");
+        if (s1 == null || s6 == null || s2 == null || s3 == null || s4 == null || s5 == null) {
+            Console.WriteLine("failures=" + Convert.ToString(failures));
+            return 0;
+        }
+        Task.Spawn(PathServerLoop(s1, 9602, 8));
+        Task.Spawn(PathServerLoop(s6, 9603, 1));
+        Task.Spawn(PathServerLoop(s2, 9604, 1));
+        Task.Spawn(PathServerLoop(s3, 9605, 1));
+        Task.Spawn(PathServerLoop(s4, 9606, 2));
+        Task.Spawn(PathServerLoop(s5, 9607, 1));
+        await Task.Delay(150);
+
+        TlsContext cRootA = TlsContext.CreateClient();
+        Check(cRootA.AddTrustedCert("_scratch/x509p_rootA.pem"), "rootA anchor loaded");
+        TlsContext cRootB = TlsContext.CreateClient();
+        Check(cRootB.AddTrustedCert("_scratch/x509p_rootB.pem"), "rootB anchor loaded");
+        TlsContext cRootC = TlsContext.CreateClient();
+        Check(cRootC.AddTrustedCert("_scratch/x509p_rootC.pem"), "rootC anchor loaded");
+        TlsContext cRootD = TlsContext.CreateClient();
+        Check(cRootD.AddTrustedCert("_scratch/x509p_rootD.pem"), "rootD anchor loaded");
+        TlsContext cInter = TlsContext.CreateClient();
+        Check(cInter.AddTrustedCert("_scratch/x509p_i1.pem"), "intermediate anchor loaded");
+        TlsContext cNone = TlsContext.CreateClient();
+
+        await PathExchange(cRootA, 9602, "loop6.example", "p1");
+        Check(Program.exOk, "tls13 path connect with root anchor");
+        Check(Program.exChain == 2, "server sent leaf plus intermediate");
+        await PathExchange(cInter, 9602, "loop6.example", "p2");
+        Check(Program.exOk, "explicit intermediate anchor accepted");
+        await PathExchange(cRootC, 9602, "loop6.example", "p3");
+        Check(!Program.exOk, "unrelated root refused");
+        await PathExchange(cRootB, 9602, "loop6.example", "p4");
+        Check(!Program.exOk, "pathlen-0 unrelated root refused");
+        await PathExchange(cNone, 9602, "loop6.example", "p5");
+        Check(!Program.exOk, "no anchor refused");
+        await PathExchange(cRootA, 9602, "[::1]", "p6");
+        Check(Program.exOk, "bracketed ipv6 host accepted over tls");
+        await PathExchange(cRootA, 9602, "0:0:0:0:0:0:0:1", "p7");
+        Check(Program.exOk, "long-form ipv6 host accepted over tls");
+        await PathExchange(cRootA, 9602, "other.example", "p8");
+        Check(!Program.exOk, "wrong host refused over tls");
+
+        await PathExchange(cRootA, 9603, "loop6.example", "p9");
+        Check(Program.exOk, "out-of-order chain accepted");
+        Check(Program.exChain == 3, "out-of-order chain length 3");
+
+        await PathExchange(cRootA, 9604, "loop6.example", "p10");
+        Check(Program.exOk, "pathlen-0 intermediate may issue leaf");
+
+        await PathExchange(cRootA, 9605, "loop6.example", "p11");
+        Check(!Program.exOk, "deep pathlen-0 violation refused");
+
+        await PathExchange(cRootC, 9606, "loop6.example", "p12");
+        Check(Program.exOk, "pathlen-1 anchor with one intermediate accepted");
+        await PathExchange(cRootD, 9606, "loop6.example", "p13");
+        Check(!Program.exOk, "pathlen-0 anchor with intermediate refused");
+
+        await PathExchange(cRootD, 9607, "loop6.example", "p14");
+        Check(Program.exOk, "pathlen-0 anchor with direct leaf accepted");
+        Check(Program.exReply == "pong:p14", "tls13 app data roundtrip");
+
+        Socket.Cleanup();
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

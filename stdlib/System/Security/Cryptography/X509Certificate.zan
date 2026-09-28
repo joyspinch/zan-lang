@@ -102,6 +102,247 @@ class X509Certificate {
         return false;
     }
 
+    /// iPAddress SAN 条目转规范文本：IPv4 点分十进制，IPv6 采用 RFC 5952
+    /// 式压缩小写十六进制。两侧（证书 SAN 与主机字面量）比较前都走同一
+    /// 规范形，文本相等即地址字节相等，压缩/大小写/前导零差异不再误判。
+    static string IpSanText(byte[] der, int off, int len) {
+        if (len == 4) {
+            return Convert.ToString(der[off] & 255) + "." + Convert.ToString(der[off + 1] & 255)
+                + "." + Convert.ToString(der[off + 2] & 255) + "." + Convert.ToString(der[off + 3] & 255);
+        }
+        if (len == 16) {
+            return X509Certificate.FormatIPv6Canonical(der, off);
+        }
+        return "";
+    }
+
+    static string HexGroup(int v) {
+        string digits = "0123456789abcdef";
+        int hi = (v >> 8) & 255;
+        int lo = v & 255;
+        string s = "";
+        if (hi >= 16) {
+            s = s + digits.Substring((hi >> 4) & 15, 1) + digits.Substring(hi & 15, 1);
+        } else if (hi > 0) {
+            s = s + digits.Substring(hi, 1);
+        }
+        if (hi > 0 || lo >= 16) {
+            s = s + digits.Substring((lo >> 4) & 15, 1);
+        }
+        return s + digits.Substring(lo & 15, 1);
+    }
+
+    /// 16 字节 IPv6 转 RFC 5952 式规范文本：小写十六进制、前导零抑制、
+    /// 最长零串压缩（≥2 组才压，并列取最左）。IPv4-mapped 地址同样输出
+    /// 纯十六进制形态——与 v4 SAN（点分形态）不会跨族碰撞。
+    static string FormatIPv6Canonical(byte[] b, int off) {
+        int[] groups = new int[8];
+        for (int g = 0; g < 8; g = g + 1) {
+            groups[g] = ((b[off + g * 2] & 255) << 8) | (b[off + g * 2 + 1] & 255);
+        }
+        int runStart = -1;
+        int runLen = 0;
+        int bestStart = -1;
+        int bestLen = 0;
+        for (int g = 0; g < 8; g = g + 1) {
+            if (groups[g] == 0) {
+                if (runStart < 0) { runStart = g; runLen = 1; } else { runLen = runLen + 1; }
+                if (runLen > bestLen) { bestLen = runLen; bestStart = runStart; }
+            } else {
+                runStart = -1;
+                runLen = 0;
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        bool needColon = false;
+        while (i < 8) {
+            if (bestLen >= 2 && i == bestStart) {
+                // "::" 无条件双冒号：其第一个冒号兼作前一组的分隔，
+                // 其后不再补分隔（needColon 复位）
+                sb.Append("::");
+                needColon = false;
+                i = i + bestLen;
+                continue;
+            }
+            if (needColon) { sb.Append(":"); }
+            sb.Append(HexGroup(groups[i]));
+            needColon = true;
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// 解析 [start, start+len) 的点分 IPv4（恰 4 段、每段 1-3 位十进制
+    /// 0-255）到 out4。越界、空段、多余段一律拒绝。
+    static bool ParseIPv4Into(string h, int start, int len, byte[] out4) {
+        if (len < 7 || len > 15) { return false; }
+        int part = 0;
+        int val = 0;
+        int digits = 0;
+        for (int k = 0; k < len; k = k + 1) {
+            int c = h[start + k] & 255;
+            if (c >= 48 && c <= 57) {
+                // 严格十进制：拒绝前导零（不同系统按八进制解释 010 会造成
+                // 主机歧义），单零段除外
+                if (digits == 1 && val == 0) { return false; }
+                digits = digits + 1;
+                if (digits > 3) { return false; }
+                val = val * 10 + (c - 48);
+                if (val > 255) { return false; }
+            } else if (c == 46) {
+                if (digits == 0) { return false; }
+                out4[part] = (byte)val;
+                part = part + 1;
+                val = 0;
+                digits = 0;
+                if (part > 3) { return false; }
+            } else {
+                return false;
+            }
+        }
+        if (part != 3 || digits == 0) { return false; }
+        out4[3] = (byte)val;
+        return true;
+    }
+
+    /// 严格解析 IPv6 文本为 16 字节：支持一处 :: 压缩与末尾嵌入点分
+    /// IPv4；拒绝 %zone、三冒号、多个压缩点、空 group、越界段与组数
+    /// 溢出。
+    static bool ParseIPv6ToBytes(string h, byte[] out16) {
+        for (int i = 0; i < 16; i = i + 1) { out16[i] = 0; }
+        int len = h.Length;
+        if (len < 2 || len > 45) { return false; }
+        if (h.IndexOf(":::") >= 0) { return false; }
+        int dbl = h.IndexOf("::");
+        if (dbl >= 0 && h.IndexOf("::", dbl + 2) >= 0) { return false; }
+        int[] head = new int[8];
+        int headCount = 0;
+        int[] tail = new int[8];
+        int tailCount = 0;
+        bool compressed = false;
+        int i = 0;
+        while (i < len) {
+            int c = h[i] & 255;
+            if (c == 58) {
+                // 组间冒号在组结算处消费；走到这里只可能是压缩点
+                if (i != dbl || compressed) { return false; }
+                compressed = true;
+                i = i + 2;
+                continue;
+            }
+            int start = i;
+            bool isV4 = false;
+            while (i < len) {
+                int cc = h[i] & 255;
+                if (cc == 58) { break; }
+                if (cc == 46) { isV4 = true; }
+                i = i + 1;
+            }
+            int val1 = 0;
+            int val2 = -1;
+            if (isV4) {
+                // 嵌入 IPv4 只能是最后一组
+                if (i != len) { return false; }
+                byte[] v4 = new byte[4];
+                if (!X509Certificate.ParseIPv4Into(h, start, i - start, v4)) { return false; }
+                val1 = v4[0] * 256 + v4[1];
+                val2 = v4[2] * 256 + v4[3];
+            } else {
+                int glen = i - start;
+                if (glen < 1 || glen > 4) { return false; }
+                int val = 0;
+                for (int k = start; k < i; k = k + 1) {
+                    int cc2 = h[k] & 255;
+                    int d;
+                    if (cc2 >= 48 && cc2 <= 57) { d = cc2 - 48; }
+                    else if (cc2 >= 97 && cc2 <= 102) { d = cc2 - 87; }
+                    else if (cc2 >= 65 && cc2 <= 70) { d = cc2 - 55; }
+                    else { return false; }
+                    val = val * 16 + d;
+                }
+                val1 = val;
+            }
+            if (compressed) {
+                if (tailCount >= 8) { return false; }
+                tail[tailCount] = val1;
+                tailCount = tailCount + 1;
+                if (val2 >= 0) {
+                    if (tailCount >= 8) { return false; }
+                    tail[tailCount] = val2;
+                    tailCount = tailCount + 1;
+                }
+            } else {
+                if (headCount >= 8) { return false; }
+                head[headCount] = val1;
+                headCount = headCount + 1;
+                if (val2 >= 0) {
+                    if (headCount >= 8) { return false; }
+                    head[headCount] = val2;
+                    headCount = headCount + 1;
+                }
+            }
+            if (i < len) {
+                if ((h[i] & 255) != 58) { return false; }
+                if (i == dbl) { continue; }
+                i = i + 1;
+            }
+        }
+        if (compressed) {
+            if (headCount + tailCount > 8) { return false; }
+        } else {
+            if (headCount != 8) { return false; }
+        }
+        int w = 0;
+        for (int g = 0; g < headCount; g = g + 1) {
+            out16[w] = (byte)((head[g] >> 8) & 255);
+            out16[w + 1] = (byte)(head[g] & 255);
+            w = w + 2;
+        }
+        if (compressed) {
+            w = w + 2 * (8 - headCount - tailCount);
+        }
+        for (int g = 0; g < tailCount; g = g + 1) {
+            out16[w] = (byte)((tail[g] >> 8) & 255);
+            out16[w + 1] = (byte)(tail[g] & 255);
+            w = w + 2;
+        }
+        return w == 16;
+    }
+
+    /// 把主机名形态的 IP 字面量转成与 SAN 存储一致的规范文本；不是合法
+    /// IP 字面量（含 %zone、畸形 v6、越界 v4）返回 null，调用方按不匹配
+    /// 处理（fail-closed）。
+    static string CanonicalizeHostIp(string host) {
+        string h = host;
+        // [IPv6] 方括号形态
+        if (h.Length >= 2 && (h[0] & 255) == 91 && (h[h.Length - 1] & 255) == 93) {
+            h = h.Substring(1, h.Length - 2);
+        }
+        if (h.IndexOf("%") >= 0) { return null; }
+        bool maybeV6 = h.IndexOf(":") >= 0;
+        bool maybeV4 = true;
+        int dotCount = 0;
+        for (int k = 0; k < h.Length; k = k + 1) {
+            int ch = h[k] & 255;
+            if (ch == 46) {
+                dotCount = dotCount + 1;
+            } else if (ch < 48 || ch > 57) {
+                maybeV4 = false;
+            }
+        }
+        if (!maybeV6 && !maybeV4) { return null; }
+        if (maybeV6) {
+            byte[] v6 = new byte[16];
+            if (!X509Certificate.ParseIPv6ToBytes(h, v6)) { return null; }
+            return X509Certificate.FormatIPv6Canonical(v6, 0);
+        }
+        if (dotCount != 3) { return null; }
+        byte[] v4 = new byte[4];
+        if (!X509Certificate.ParseIPv4Into(h, 0, h.Length, v4)) { return null; }
+        return X509Certificate.IpSanText(v4, 0, 4);
+    }
+
     /// <summary>
     /// 依据 RFC 6125 标准验证给定的主机名（域名或 IP 字面量）是否匹配该证书。
     /// 优先匹配 SAN（dNSName / iPAddress）；若无 SAN 则回退至 Subject CN。
@@ -129,9 +370,14 @@ class X509Certificate {
         }
 
         if (isIp) {
+            // 规范形比较：压缩/大小写/方括号形态归一后再比，跨族（v4/v6）
+            // 文本不同天然不匹配；畸形 IP 字面量直接不匹配（fail-closed）。
+            string canon = X509Certificate.CanonicalizeHostIp(host);
+            if (canon == null) { return false; }
             if (this.ipAddresses != null && this.ipAddresses.Count > 0) {
                 for (int i = 0; i < this.ipAddresses.Count; i = i + 1) {
-                    if (StrEqualsIgnoreCase(this.ipAddresses[i], host)) { return true; }
+                    string san = X509Certificate.CanonicalizeHostIp(this.ipAddresses[i]);
+                    if (san != null && StrEqualsIgnoreCase(san, canon)) { return true; }
                 }
                 return false;
             }
@@ -241,6 +487,8 @@ class X509Certificate {
     int subjectNameStart;
     int subjectNameLen;
     bool isCa;
+    bool hasPathLen;
+    int pathLenConstraint;
     bool keyCertSign;
     bool digitalSignature;
     bool serverAuth;
@@ -446,8 +694,21 @@ class X509Certificate {
                 if (p[0] < basicEnd) {
                     int pathEnd = Tlv(der, basicEnd, p, 2);
                     if (pathEnd < 0) { return null; }
-                    // Path length constraints require full path processing; refuse rather than omit them.
-                    return null;
+                    // pathLenConstraint：非负 INTEGER。真实路径深度远小于
+                    // 255；负值、超界或非最短编码一律按畸形拒绝。
+                    int plenStart = p[0];
+                    int plenLen = pathEnd - plenStart;
+                    int plen = 0;
+                    if (plenLen == 1) {
+                        plen = der[plenStart] & 255;
+                    } else if (plenLen == 2 && (der[plenStart] & 255) == 0 && (der[plenStart + 1] & 255) >= 128) {
+                        plen = der[plenStart + 1] & 255;
+                    } else {
+                        return null;
+                    }
+                    cert.hasPathLen = true;
+                    cert.pathLenConstraint = plen;
+                    p[0] = pathEnd;
                 }
             } else if (Oid(der, oidAt, oidLen, 85, 29, 15)) {
                 cert.hasKeyUsage = true;
@@ -465,9 +726,8 @@ class X509Certificate {
                     int ge = Tlv(der, generalEnd, p, type);
                     if (ge < 0) { return null; }
                     if (type == 130) { cert.dnsNames.Add(ReadString(der, p[0], ge - p[0])); }
-                    if (type == 135 && ge - p[0] == 4) {
-                        cert.ipAddresses.Add(Convert.ToString(der[p[0]] & 255) + "." + Convert.ToString(der[p[0] + 1] & 255)
-                            + "." + Convert.ToString(der[p[0] + 2] & 255) + "." + Convert.ToString(der[p[0] + 3] & 255));
+                    if (type == 135 && (ge - p[0] == 4 || ge - p[0] == 16)) {
+                        cert.ipAddresses.Add(X509Certificate.IpSanText(der, p[0], ge - p[0]));
                     }
                     p[0] = ge;
                 }
@@ -579,6 +839,10 @@ class X509Certificate {
 
     bool CanSignCertificates() { return this.isCa && (!this.hasKeyUsage || this.keyCertSign) && (!this.hasEku || this.serverAuth); }
     bool CanServeTls() { return (!this.hasKeyUsage || this.digitalSignature) && (!this.hasEku || this.serverAuth); }
+    /// basicConstraints 是否携带 pathLenConstraint（路径构建时求值）
+    bool HasPathLen() { return this.hasPathLen; }
+    /// pathLenConstraint 值：该 CA 下方的非自签发中间 CA 数上限
+    int PathLenConstraint() { return this.pathLenConstraint; }
 
     /// <summary>从 DER 字节数组解析 X.509 证书。</summary>
     static X509Certificate Parse(byte[] der, int len) { return ParseForTls(der, len); }
@@ -658,12 +922,8 @@ class X509Certificate {
                                     string dns = ReadString(der, cur[0], gnLen);
                                     cert.dnsNames.Add(dns);
                                 } else if (gnTag == 135) { // iPAddress [7]
-                                    if (gnLen == 4) {
-                                        string ipStr = Convert.ToString(der[cur[0]] & 255) + "."
-                                            + Convert.ToString(der[cur[0]+1] & 255) + "."
-                                            + Convert.ToString(der[cur[0]+2] & 255) + "."
-                                            + Convert.ToString(der[cur[0]+3] & 255);
-                                        cert.ipAddresses.Add(ipStr);
+                                    if (gnLen == 4 || gnLen == 16) {
+                                        cert.ipAddresses.Add(X509Certificate.IpSanText(der, cur[0], gnLen));
                                     }
                                 }
                                 cur[0] = cur[0] + gnLen;

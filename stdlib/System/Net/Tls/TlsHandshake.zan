@@ -918,20 +918,41 @@ class TlsEngine {
         bool osTrusted = false;
         #endif
         // Every untrusted link needs a valid issuer signature and a CA that may sign certificates.
+        // 有界候选路径构建：签发者可在信任锚或对端链的任意未用位置选取
+        // （乱序链可接受，但约束按实际构建的路径求值）。每选中一个非锚
+        // 中间 CA 即 hops+1；选中 issuer（含锚）时校验其 pathLenConstraint
+        // 覆盖已消耗的中间 CA 数（RFC 5280 §4.15.1.1 语义）。签名与完整
+        // Name 比较仍由 VerifySignedBy 强制，任何一步失败即整体拒绝。
         X509Certificate current = this.peerCert;
-        for (int depth = 0; depth < this.peerChain.Count && !anchored && !osTrusted; depth = depth + 1) {
+        bool[] used = new bool[this.peerChain.Count];
+        int hops = 0;
+        int maxSteps = this.peerChain.Count + 1;
+        for (int step = 0; step < maxSteps && !anchored && !osTrusted; step = step + 1) {
             if (this.trustedCerts != null) {
                 for (int i = 0; i < this.trustedCerts.Count; i = i + 1) {
                     X509Certificate anchor = this.trustedCerts[i];
-                    if (anchor != null && anchor.ValidNow() && anchor.CanSignCertificates()
-                        && current.VerifySignedBy(anchor)) { anchored = true; break; }
+                    if (anchor == null || !anchor.ValidNow() || !anchor.CanSignCertificates()) { continue; }
+                    if (!current.VerifySignedBy(anchor)) { continue; }
+                    if (anchor.HasPathLen() && hops > anchor.PathLenConstraint()) { continue; }
+                    anchored = true;
+                    break;
                 }
             }
-            if (!anchored && depth + 1 < this.peerChain.Count) {
-                X509Certificate issuerCert = this.peerChain[depth + 1];
-                if (!issuerCert.ValidNow() || !issuerCert.CanSignCertificates() || !current.VerifySignedBy(issuerCert)) { break; }
-                current = issuerCert;
+            if (anchored || osTrusted) { break; }
+            X509Certificate next = null;
+            for (int j = 0; j < this.peerChain.Count; j = j + 1) {
+                if (used[j]) { continue; }
+                X509Certificate issuerCert = this.peerChain[j];
+                if (issuerCert == null || !issuerCert.ValidNow() || !issuerCert.CanSignCertificates()) { continue; }
+                if (!current.VerifySignedBy(issuerCert)) { continue; }
+                if (issuerCert.HasPathLen() && hops > issuerCert.PathLenConstraint()) { continue; }
+                next = issuerCert;
+                used[j] = true;
+                break;
             }
+            if (next == null) { break; }
+            current = next;
+            hops = hops + 1;
         }
         if (!anchored && !osTrusted) {
             this.verifyResult = 19;
