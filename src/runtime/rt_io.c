@@ -802,7 +802,21 @@ const unsigned char *zan_crypto_cert_encoded(const void *cert, int *out_len) {
 
 /* Resolve Crypt32 at the call site: only Windows TLS clients need it, and
  * rt_io is linked into programs that never use TLS. The temporary store holds
- * exactly the peer's DER objects as untrusted intermediates, never as roots. */
+ * exactly the peer's DER objects as untrusted intermediates, never as roots.
+ *
+ * Diagnostic seam (fail-closed: only 1 means trusted):
+ *   1   OS trust engine accepted the full chain for this host
+ *   0   malformed input or transient environment failure — never trust
+ *  -1   crypt32.dll unavailable or a required entry point missing
+ *  -2   chain build failed (CertGetCertificateChain returned no chain)
+ *  -3   trust status: partial chain (no system anchor reachable)
+ *  -4   trust status: untrusted root
+ *  -5   trust status: not time valid
+ *  -6   trust status: revocation status unknown (offline cache miss)
+ *  -7   trust status: any other error bit
+ *  -8   SSL policy: name mismatch
+ *  -9   SSL policy: any other error
+ * -10   trust status: certificate revoked (cached CRL hit) */
 int32_t zan_io_crypto_windows_ssl_policy(const unsigned char *certs, int32_t total_len,
                                        int32_t count, const char *host, int32_t host_len) {
     typedef PCCERT_CONTEXT (WINAPI *create_cert_fn)(DWORD, const BYTE *, DWORD);
@@ -840,7 +854,7 @@ int32_t zan_io_crypto_windows_ssl_policy(const unsigned char *certs, int32_t tot
     wide_host[host_len] = 0;
 
     lib = LoadLibraryW(L"crypt32.dll");
-    if (!lib) return 0;
+    if (!lib) return -1;
     create_cert = (create_cert_fn)GetProcAddress(lib, "CertCreateCertificateContext");
     open_store = (open_store_fn)GetProcAddress(lib, "CertOpenStore");
     add_cert = (add_cert_fn)GetProcAddress(lib, "CertAddEncodedCertificateToStore");
@@ -850,7 +864,7 @@ int32_t zan_io_crypto_windows_ssl_policy(const unsigned char *certs, int32_t tot
     free_cert = (free_cert_fn)GetProcAddress(lib, "CertFreeCertificateContext");
     free_chain = (free_chain_fn)GetProcAddress(lib, "CertFreeCertificateChain");
     if (!create_cert || !open_store || !add_cert || !get_chain || !verify_policy ||
-        !close_store || !free_cert || !free_chain) goto cleanup;
+        !close_store || !free_cert || !free_chain) { FreeLibrary(lib); return -1; }
 
     store = open_store(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
     if (!store) goto cleanup;
@@ -882,7 +896,22 @@ int32_t zan_io_crypto_windows_ssl_policy(const unsigned char *certs, int32_t tot
     if (!get_chain(NULL, leaf, NULL, store, &chain_para,
                    CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT |
                    CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL | CERT_CHAIN_DISABLE_AIA,
-                   NULL, &chain) || !chain || chain->TrustStatus.dwErrorStatus != 0) goto cleanup;
+                   NULL, &chain) || !chain) { result = -2; goto cleanup; }
+    {
+        /* Every trust-status bit is a rejection; classify it for callers that
+         * surface the reason. Revocation unknown (cache miss / AIA off) stays
+         * a rejection — offline must never read as trusted. */
+        uint32_t trust_err = chain->TrustStatus.dwErrorStatus;
+        if (trust_err != 0) {
+            if (trust_err & CERT_TRUST_IS_PARTIAL_CHAIN) result = -3;
+            else if (trust_err & CERT_TRUST_IS_UNTRUSTED_ROOT) result = -4;
+            else if (trust_err & CERT_TRUST_IS_REVOKED) result = -10;
+            else if (trust_err & CERT_TRUST_IS_NOT_TIME_VALID) result = -5;
+            else if (trust_err & CERT_TRUST_REVOCATION_STATUS_UNKNOWN) result = -6;
+            else result = -7;
+            goto cleanup;
+        }
+    }
 
     SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl;
     memset(&ssl, 0, sizeof(ssl));
@@ -896,8 +925,12 @@ int32_t zan_io_crypto_windows_ssl_policy(const unsigned char *certs, int32_t tot
     CERT_CHAIN_POLICY_STATUS status;
     memset(&status, 0, sizeof(status));
     status.cbSize = sizeof(status);
-    if (verify_policy(CERT_CHAIN_POLICY_SSL, chain, &policy, &status) && status.dwError == 0)
-        result = 1;
+    if (!verify_policy(CERT_CHAIN_POLICY_SSL, chain, &policy, &status)) { result = -9; goto cleanup; }
+    if (status.dwError != 0) {
+        result = (status.dwError == CERT_E_CN_NO_MATCH) ? -8 : -9;
+        goto cleanup;
+    }
+    result = 1;
 cleanup:
     if (chain) free_chain(chain);
     if (leaf) free_cert(leaf);

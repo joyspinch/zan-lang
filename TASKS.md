@@ -59,7 +59,7 @@
 
 ## 未完成 · 通讯与 TLS
 
-- [ ] **B-NET1** Windows 已接入收到的 DER 链与主机名的 Crypt32 链构建/SSL 策略验证；离线缓存吊销未知或错误失败关闭，显式 `AddTrustedCert` 走独立签名链。`security_tls_windows_policy` 已覆盖不受信任、错误主机、畸形输入和显式 CA 正例，但缺少带缓存 CRL 的系统受信任正例、受禁根、过期和 API 不可用回归；缓存缺失可能拒绝有效公网站点。macOS 仍无 SecTrust 桥接，默认无显式 CA 时失败关闭。
+- [ ] **B-NET1** Windows 已接入收到的 DER 链与主机名的 Crypt32 链构建/SSL 策略验证；离线缓存吊销未知或错误失败关闭，显式 `AddTrustedCert` 走独立签名链。**批次 E（2026-09-29）**：`zan_io_crypto_windows_ssl_policy` 升级为诊断 seam（仅 1=信任；0=输入/环境拒绝；-1=Crypt32/API 缺失、-2=链构建失败、-3=部分链、-4=不受信根、-5=过期、-6=吊销未知（CACHE_ONLY+AIA 关闭下缓存缺失仍拒绝）、-7=其他信任位、-8=主机名不匹配、-9=其他策略错、-10=缓存 CRL 命中吊销），`TlsEngine` 新增 `OsTrustDiag()` 透出（非 Windows 恒 0）；`security_tls_windows_policy` 扩至 17 项：新增零证书链/含分隔符主机/超长主机恰 0 拒收、不受信链负码带断言、engine 诊断码一致性、OpenSSL `ca` 历史日期过期 fixture（`ValidNow` 拒绝 + 显式锚不可绕过过期）。桥接内部 -5（过期信任位）与 -8（策略主机名）分支需系统信任链才能到达，离线测试不可构造，仅代码评审覆盖；带缓存 CRL 的系统受信任正例、受禁根（Disallowed store 系统状态）、API 不可用（无法卸载系统 DLL）无法在测试内构造，保持 fail-closed 语义不变。Linux 系统 CA 候选路径遍历已在批次 C 加固（`TrustFromCandidates`，损坏候选跳过不阻断）。macOS/iOS 无 SecTrust 桥接，`osTrusted` 恒 false 严格失败关闭，新增桥接需 macOS 工具链编译验证——本仓库开发环境为 Windows，无法验证 Apple 平台代码，不盲发安全关键代码；如需补齐须在 macOS 环境实现并验证后闭账。
 - [ ] **B-NET2** 自研 X.509 尚无完整 RFC 5280 路径构建、CRL/OCSP、pathLenConstraint 和名称约束求值；重复扩展与未实现的 `nameConstraints` 已失败关闭。需补中间 CA、撤销/未知状态、路径长度和离线/网络超时策略用例。
 - [ ] **B-NET3** 对端证书和握手目前主要支持 RSA/SHA-256；ECDSA/EdDSA、IPv6 `iPAddress` SAN、完整 IDNA 规范化尚未覆盖，不能靠关闭验证解决互通。
 - [x] **B-NET4** TLS 认证前握手累计大小、重复/乱序 `EncryptedExtensions`、畸形扩展向量、ClientHello 压缩方法和重复扩展已限制；Windows Crypt32 函数指针漏参导致的调用崩溃已修。用例 `security_tls_handshake_bounds`、`security_tls_windows_policy`，提交 `a6fbc562`。
