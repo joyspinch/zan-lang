@@ -79,6 +79,12 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   后 Commit 1,567 MB、Arena 540 MB，整进程峰值 2,029 MB；不应把它与
   旧版仅有的边界采样误报为峰值降幅。全量 AST 存续和单一 LLVM module
   仍是主要结构成本，局部数组初始容量按需缩小只能减负，不能宣称已根治。
+- LLVM module 生命周期探针（同一 context 串行生成/写出/销毁 8 个高负载 module，
+  每片 128 函数×256 算术指令）显示 `LLVMDisposeModule` 后 PrivateUsage 在首片
+  建立后不随片数线性增长；working set 的小幅回升不能当作泄漏证据。真正做 Zan
+  后端分片前，必须重建跨 module 的函数声明/ABI，并清理 `g_di_emit_ctx`、
+  `s_current_irgen` 等全局状态；普通 emitter 保存的 module-local handles、internal
+  linkage 和全局辅助/类型状态无法靠移动少数函数安全拆分，无法闭合就保留单模块 fallback。
 - 解析用的 pull-in arena 要等生成器二次拉入完成后再释放，否则增量
   生成的源文件丢失；每函数局部表从大容量预分配改为小容量倍增、pattern
   表首次用到才分配，避免成千函数为未用槽预留空间。AST 节点含最大 union
