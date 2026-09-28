@@ -11,6 +11,15 @@ class Program {
     static void Check(bool ok, string name) {
         if (!ok) { Program.failures = Program.failures + 1; Console.WriteLine("FAIL " + name); }
     }
+    /* 设计器行来自非空字符串列，夹具同构：未配置的 dict/rel 字段是空串不是 null。 */
+    static SysGenColumn Blank(SysGenColumn c) {
+        c.dictType = "";
+        c.relTable = "";
+        c.relValue = "";
+        c.relLabel = "";
+        c.defValue = "";
+        return c;
+    }
     static void Main(string[] args) {
         if (args.Length != 1) { Console.WriteLine("FAIL scratch argument"); Environment.Exit(1); }
         string root = args[0] + "/gen_sample_regression";
@@ -20,27 +29,31 @@ class Program {
         t.entityName = "GenSample";
         t.section = "content";
         t.title = "Quoted \"title\" & <script>\nsecond";
+        t.orderColumn = "name";
+        t.orderDesc = 0;
         List<SysGenColumn> cols = new List<SysGenColumn>();
-        SysGenColumn name = new SysGenColumn();
+        SysGenColumn name = Program.Blank(new SysGenColumn());
         name.name = "name";
         name.kind = "string";
         name.size = 80;
         name.label = "Name \"X\" </summary>\nprivate void Hack() {}";
         name.widget = "text";
         name.inList = 1;
+        name.inFilter = 1;
         name.inCreate = 1;
         name.required = 1;
         cols.Add(name);
-        SysGenColumn enabled = new SysGenColumn();
+        SysGenColumn enabled = Program.Blank(new SysGenColumn());
         enabled.name = "enabled";
         enabled.kind = "bool";
         enabled.widget = "switch";
         enabled.label = "On & Off";
         enabled.inList = 1;
+        enabled.inFilter = 1;
         enabled.inEdit = 1;
         cols.Add(enabled);
         /* 字符串且可编辑：表单回填走 d.Set("x", e.x) 发射支路（曾多发一个引号）。 */
-        SysGenColumn remark = new SysGenColumn();
+        SysGenColumn remark = Program.Blank(new SysGenColumn());
         remark.name = "remark";
         remark.kind = "string";
         remark.size = 200;
@@ -48,7 +61,48 @@ class Program {
         remark.widget = "text";
         remark.inEdit = 1;
         cols.Add(remark);
+        SysGenColumn day = Program.Blank(new SysGenColumn());
+        day.name = "day";
+        day.kind = "datetime";
+        day.label = "Day";
+        day.widget = "date";
+        day.inEdit = 1;
+        day.inFilter = 1;
+        cols.Add(day);
+        SysGenColumn state = Program.Blank(new SysGenColumn());
+        state.name = "state";
+        state.kind = "int";
+        state.label = "State";
+        state.widget = "select";
+        state.dictType = "gen_state";
+        state.inCreate = 1;
+        state.inEdit = 1;
+        state.inFilter = 1;
+        state.required = 1;
+        cols.Add(state);
+        SysGenColumn otherId = Program.Blank(new SysGenColumn());
+        otherId.name = "otherId";
+        otherId.kind = "long";
+        otherId.label = "Other";
+        otherId.widget = "select";
+        otherId.relTable = "gen_other";
+        otherId.relValue = "id";
+        otherId.relLabel = "name";
+        otherId.inList = 1;
+        otherId.inEdit = 1;
+        otherId.inFilter = 1;
+        cols.Add(otherId);
+        SysGenColumn qty = Program.Blank(new SysGenColumn());
+        qty.name = "qty";
+        qty.kind = "int";
+        qty.label = "Qty";
+        qty.widget = "number";
+        qty.inEdit = 1;
+        qty.required = 1;
+        cols.Add(qty);
         Program.Check(Gen.Valid(t, cols), "valid sample");
+        List<string> designed = new List<string>();
+        designed.Add("gen_other");
         List<string> paths = new List<string>();
         paths.Add(root + "/GenSample.zan");
         paths.Add(root + "/GenSampleController.zan");
@@ -63,10 +117,10 @@ class Program {
         }
         List<string> sources = new List<string>();
         sources.Add(Gen.ModelSource(t, cols));
-        sources.Add(Gen.ControllerSource(t, cols));
+        sources.Add(Gen.ControllerSource(t, cols, designed));
         sources.Add(Gen.DaoSource(t, cols));
         sources.Add(Gen.ListViewSource(t, cols));
-        sources.Add(Gen.FormViewSource(t, cols));
+        sources.Add(Gen.FormViewSource(t, cols, designed));
         sources.Add(Gen.FrontControllerSource(t, cols));
         sources.Add(Gen.FrontListViewSource(t, cols));
         sources.Add(Gen.FrontShowViewSource(t, cols));
@@ -74,10 +128,12 @@ class Program {
         Program.Check(sources[1].Contains("Quoted \\\"title\\\""), "string literal escaped");
         Program.Check(sources[1].Contains("if (id == 0) {"), "create-only input guarded");
         Program.Check(sources[1].Contains("if (id > 0) {"), "edit-only input guarded");
-        Program.Check(sources[1].Contains(".EditFields(\"enabled:text,remark:text\")")
+        Program.Check(sources[1].Contains(".EditFields(\"enabled:text,remark:text,qty:int\")")
             && !sources[1].Contains(".EditFields(\"name:"), "create-only field not editable");
-        Program.Check(sources[4].Contains("{{#if editing}}") && sources[4].Contains("{{#if creating}}"), "form roles");
-        Program.Check(sources[4].Contains("selected hidden") && sources[4].Contains("On &amp; Off"), "bool edit and html escape");
+        Program.Check(!sources[1].Contains(".EditFields(\"day:")
+            && !sources[1].Contains(".EditFields(\"state:")
+            && !sources[1].Contains(".EditFields(\"otherId:"),
+            "datetime/dict/rel excluded from inline edit");
         /* ORM 编译器 lowering 依赖这些调用形态（GenDb 重写 Read/Insert/Update/Delete/WhereIf）；
            改动 Gen.zan 时必须保持原样，否则生成代码在完整 MVC 编译链下失效。 */
         Program.Check(sources[1].Contains(".Read(id)") && sources[1].Contains("CrudOps."),
@@ -91,13 +147,74 @@ class Program {
             "string edit form fill emits valid call");
         Program.Check(sources[5].Contains("d.Set(\"remark\", e.remark);"),
             "front show emits valid member call");
-        CoderController.WriteSources(paths, sources);
+        /* 设计器排序配置落地：Paged 默认列 + 两条查询链的 OrderBy 方向。 */
+        Program.Check(sources[1].Contains("this.Paged(\"name\", 20)")
+            && sources[1].Contains(".OrderBy(a => a.name)"), "admin order from design");
+        Program.Check(sources[5].Contains(".OrderBy(a => a.name)"), "front order from design");
+        /* inFilter 接线：Screen 声明筛选原语，Index 发射对齐 Collect 语义的 WhereIf。 */
+        Program.Check(sources[1].Contains("async ListPage Screen()")
+            && sources[1].Contains("ListPage lp = await this.Screen();")
+            && sources[1].Contains("lp.Collect(this)"), "screen is instance-fed");
+        Program.Check(sources[1].Contains(".Text(\"") && sources[1].Contains("模糊搜索"),
+            "string filter primitive");
+        Program.Check(sources[1].Contains(".Time(\"Day\""), "datetime filter primitive");
+        Program.Check(sources[1].Contains(".Select(\""), "select filter primitive");
+        Program.Check(sources[1].Contains("Fmt.ParseDay(this.InAny(\"dayFrom\")"),
+            "datetime filter locals");
+        Program.Check(sources[1].Contains("WhereIf(fname.Length > 0, a => a.name.Contains(fname))"),
+            "string filter where");
+        Program.Check(sources[1].Contains("WhereIf(fenabledN >= 0, a => a.enabled == fenabledN)"),
+            "bool filter where");
+        Program.Check(sources[1].Contains("WhereIf(fdayF > 0, a => a.day >= fdayF)")
+            && sources[1].Contains("WhereIf(fdayT > 0, a => a.day <= fdayT + 86399)"),
+            "datetime filter where");
+        Program.Check(sources[1].Contains("WhereIf(fstateN >= 0, a => a.state == fstateN)"),
+            "dict filter where");
+        Program.Check(sources[1].Contains("WhereIf(fotherIdN >= 0, a => a.otherId == fotherIdN)"),
+            "rel filter where");
+        /* 字典/关联：运行时选项预载、保存校验、关联标签投影。 */
+        Program.Check(sources[1].Contains("ByTypeCodeActive(\"gen_state\")"),
+            "dict options loaded at runtime");
+        Program.Check(sources[1].Contains("DbTable.Of(this.Held(), \"gen_other\")"),
+            "rel options from designed table");
+        Program.Check(sources[1].Contains("async string CheckDict(string typeCode"),
+            "dict validation helper");
+        Program.Check(sources[1].Contains(
+                "this.CheckDict(\"gen_state\", \"State\", Convert.ToString(e.state), true)"),
+            "dict save validation");
+        Program.Check(sources[1].Contains("long otherIdId = e.otherId;")
+            && sources[1].Contains(".WhereEq(\"id\", otherIdId)")
+            && sources[1].Contains("Other 所选记录不存在"), "rel existence check");
+        Program.Check(sources[1].Contains("items[i].Set(\"otherIdName\", otherIdNames.Get(items[i].Get(\"otherId\")))"),
+            "rel label projected into list rows");
+        /* 表单：datetime 走 date 控件与 ParseDay/DayInput，字典/关联服务端喂数。 */
+        Program.Check(sources[1].Contains("e.day = Fmt.ParseDay(dayRaw);")
+            && sources[1].Contains("Day 格式应为 YYYY-MM-DD"), "datetime save parses day");
+        Program.Check(sources[1].Contains("Fmt.DayInput(e.day)"), "datetime edit backfill");
+        Program.Check(sources[1].Contains("if (e.qty == 0) { this.Fail(400, \"0400\", \"请填写Qty\"); return; }"),
+            "numeric required check");
+        Program.Check(sources[1].Contains("d.AddList(\"stateOpts\")")
+            && sources[1].Contains("o.Set(\"selected\", \"1\")")
+            && sources[1].Contains("d.Set(\"stateNone\", \"1\")"), "form feeds select options");
+        Program.Check(sources[4].Contains("{{#if editing}}") && sources[4].Contains("{{#if creating}}"), "form roles");
+        Program.Check(sources[4].Contains("selected hidden") && sources[4].Contains("On &amp; Off"), "bool edit and html escape");
+        Program.Check(sources[4].Contains("{{#each stateOpts}}<option value=\"{{value}}\"")
+            && sources[4].Contains("{{#if stateNone}}"), "select view consumes fed options");
+        Program.Check(sources[4].Contains("type=\"date\" name=\"day\""), "datetime widget is date input");
+        Program.Check(sources[4].Contains("{{#each otherIdOpts}}"), "rel select view consumes fed options");
+        CoderController.WriteSources(paths, sources, false);
         for (int i = 0; i < paths.Count; i = i + 1) {
             Program.Check(File.Exists(paths[i]) && File.ReadAllText(paths[i]) == sources[i], "published " + Convert.ToString(i));
         }
         bool rejected = false;
-        try { CoderController.WriteSources(paths, sources); } catch (Exception ex) { rejected = true; }
+        try { CoderController.WriteSources(paths, sources, false); } catch (Exception ex) { rejected = true; }
         Program.Check(rejected && File.ReadAllText(paths[0]) == sources[0], "no overwrite");
+        List<string> replaced = new List<string>();
+        for (int i = 0; i < sources.Count; i = i + 1) {
+            replaced.Add(sources[i] + "\n/* regenerated */\n");
+        }
+        CoderController.WriteSources(paths, replaced, true);
+        Program.Check(File.ReadAllText(paths[0]) == replaced[0], "force overwrite publishes");
         List<string> blocked = new List<string>();
         blocked.Add(root + "/rollback-first.zan");
         blocked.Add(paths[0]);
@@ -105,10 +222,10 @@ class Program {
         pair.Add("new first");
         pair.Add("new second");
         rejected = false;
-        try { CoderController.WriteSources(blocked, pair); } catch (Exception ex) { rejected = true; }
+        try { CoderController.WriteSources(blocked, pair, false); } catch (Exception ex) { rejected = true; }
         Program.Check(rejected && !File.Exists(blocked[0])
-            && File.ReadAllText(paths[0]) == sources[0], "staged failure leaves no output");
-        SysGenColumn bad = new SysGenColumn();
+            && File.ReadAllText(paths[0]) == replaced[0], "staged failure leaves no output");
+        SysGenColumn bad = Program.Blank(new SysGenColumn());
         bad.name = "class";
         bad.kind = "string";
         cols.Add(bad);

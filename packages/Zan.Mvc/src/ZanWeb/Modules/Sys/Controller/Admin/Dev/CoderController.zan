@@ -790,18 +790,26 @@ class CoderController : AdminController {
         this.Saved("已同步到数据库，可以在「数据管理」里维护数据了");
     }
 
-    /* 写出生成源码；须重建后生效，消息直接说明而非暗示已在运行中变更。 */
+    /* 写出生成源码；须重建后生效，消息直接说明而非暗示已在运行中变更。
+       force=1 时覆盖既有目标（仅 Design 页「覆盖重新生成」按钮显式确认后走）。 */
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
     [Description("生成代码")]
     async void Build() {
         int id = this.InInt("id", 0);
+        int force = this.InInt("force", 0);
         SysGenTable t = await this.SysGenTable.ById(id);
         if (t == null) { this.Fail(404, "0404", "设计不存在"); }
         List<SysGenColumn> cols = await this.SysGenColumn
             .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
         if (cols.Count == 0) { this.Fail(400, "0004", "先添加字段"); }
         if (!Gen.Valid(t, cols)) { this.Fail(400, "0004", "表或字段设计不合法"); }
+        /* 关联下拉只对设计器里真实存在的表喂数。 */
+        List<SysGenTable> tabs = await this.SysGenTable.OrderBy(a => a.id).ToListAsync();
+        List<string> designed = new List<string>();
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            if (Gen.Safe(tabs[i].tableName)) { designed.Add(tabs[i].tableName); }
+        }
 
         /* gen.root 相对当前服务工作目录解释（开发时从 build/ 运行，".." 即项目根）；
            生产发布目录没有 src/views 布局，必须在站点设置里配置真实源码根目录。 */
@@ -816,77 +824,73 @@ class CoderController : AdminController {
                 + root + "；请在站点设置的「开发」中配置");
             return;
         }
-        string modelDir = root + "/src/Model/Gen";
-        string adminDir = root + "/src/Controller/Admin";
-        string frontDir = root + "/src/Controller/Front";
-        string daoDir = root + "/src/Dao/Gen";
-        string adminViewDir = root + "/views/Admin";
-        string frontViewDir = root + "/views/Front";
         try {
-            Directory.CreateDirectoryRecursive(modelDir);
-            Directory.CreateDirectoryRecursive(adminDir);
-            Directory.CreateDirectoryRecursive(frontDir);
-            Directory.CreateDirectoryRecursive(daoDir);
-            Directory.CreateDirectoryRecursive(adminViewDir);
-            Directory.CreateDirectoryRecursive(frontViewDir);
+            Directory.CreateDirectoryRecursive(root + "/src/Model/Gen");
+            Directory.CreateDirectoryRecursive(root + "/src/Controller/Admin");
+            Directory.CreateDirectoryRecursive(root + "/src/Controller/Front");
+            Directory.CreateDirectoryRecursive(root + "/src/Dao/Gen");
+            Directory.CreateDirectoryRecursive(root + "/views/Admin");
+            Directory.CreateDirectoryRecursive(root + "/views/Front");
         } catch (Exception ex) {
             this.Fail(500, "2001", "无法创建源码目录（gen.root=" + root + "）：" + ex.Message);
             return;
         }
-        /* Directory=URL 前缀，file=class+Controller=route 段落=view 键段，生成表与手写表同构。 */
-        string modelPath = modelDir + "/" + t.entityName + ".zan";
-        string ctlPath = adminDir + "/" + t.entityName + "Controller.zan";
-        string daoPath = daoDir + "/" + t.entityName + "Dao.zan";
-        string listPath = adminViewDir + "/" + t.entityName + "Controller.Index.html";
-        string formPath = adminViewDir + "/" + t.entityName + "Controller.Form.html";
-        string frontCtlPath = frontDir + "/" + t.entityName + "FrontController.zan";
-        string frontListPath = frontViewDir + "/" + t.entityName
-            + "FrontController.Index.html";
-        string frontShowPath = frontViewDir + "/" + t.entityName
-            + "FrontController.Show.html";
-        List<string> paths = new List<string>();
-        paths.Add(modelPath); paths.Add(ctlPath); paths.Add(daoPath);
-        paths.Add(listPath); paths.Add(formPath); paths.Add(frontCtlPath);
-        paths.Add(frontListPath); paths.Add(frontShowPath);
+        List<string> paths = CoderController.TargetPaths(t, root);
         for (int i = 0; i < paths.Count; i = i + 1) {
-            if (File.Exists(paths[i]) || Directory.ExistsOnDisk(paths[i])) {
-                this.Fail(409, "0004", "生成目标已存在，拒绝覆盖：" + paths[i]);
+            if (!force && (File.Exists(paths[i]) || Directory.ExistsOnDisk(paths[i]))) {
+                this.Fail(409, "0004", "生成目标已存在：" + paths[i]
+                    + "；如需覆盖请在字段设计页用「覆盖重新生成」");
                 return;
             }
         }
         List<string> sources = new List<string>();
         sources.Add(Gen.ModelSource(t, cols));
-        sources.Add(Gen.ControllerSource(t, cols));
+        sources.Add(Gen.ControllerSource(t, cols, designed));
         sources.Add(Gen.DaoSource(t, cols));
         sources.Add(Gen.ListViewSource(t, cols));
-        sources.Add(Gen.FormViewSource(t, cols));
+        sources.Add(Gen.FormViewSource(t, cols, designed));
         sources.Add(Gen.FrontControllerSource(t, cols));
         sources.Add(Gen.FrontListViewSource(t, cols));
         sources.Add(Gen.FrontShowViewSource(t, cols));
         try {
-            CoderController.WriteSources(paths, sources);
+            CoderController.WriteSources(paths, sources, force == 1);
         } catch (Exception ex) {
             this.Fail(500, "2001", "生成文件失败（gen.root=" + root + "）：" + ex.Message);
             return;
         }
 
         /* 生成文件尚未编译部署，通用数据入口仍须保留。 */
-        await this.Note("生成代码", t.tableName, true, ctlPath);
+        await this.Note("生成代码", t.tableName, true, paths[1]);
         this.Saved("已生成 8 个文件到 " + root
             + "（模型/后台控制器/Dao/后台视图×2/前台控制器/前台视图×2），"
             + "请将源码纳入工程并重新编译后生效");
     }
 
+    /* Directory=URL 前缀，file=class+Controller=route 段落=view 键段，生成表与手写表同构。 */
+    static List<string> TargetPaths(SysGenTable t, string root) {
+        List<string> paths = new List<string>();
+        paths.Add(root + "/src/Model/Gen/" + t.entityName + ".zan");
+        paths.Add(root + "/src/Controller/Admin/" + t.entityName + "Controller.zan");
+        paths.Add(root + "/src/Dao/Gen/" + t.entityName + "Dao.zan");
+        paths.Add(root + "/views/Admin/" + t.entityName + "Controller.Index.html");
+        paths.Add(root + "/views/Admin/" + t.entityName + "Controller.Form.html");
+        paths.Add(root + "/src/Controller/Front/" + t.entityName + "FrontController.zan");
+        paths.Add(root + "/views/Front/" + t.entityName + "FrontController.Index.html");
+        paths.Add(root + "/views/Front/" + t.entityName + "FrontController.Show.html");
+        return paths;
+    }
+
     /* 先写同目录临时文件，再用硬链接独占发布；普通 rename 在部分平台
-       会覆盖并发创建的目标，不能用于这里的拒绝覆盖契约。 */
-    static void WriteSources(List<string> paths, List<string> sources) {
+       会覆盖并发创建的目标，不能用于这里的拒绝覆盖契约。force 时目标
+       先删后链——「覆盖重新生成」是显式确认过的人工动作，可接受窗口期。 */
+    static void WriteSources(List<string> paths, List<string> sources, bool force) {
         if (paths.Count != sources.Count) { throw new Exception("生成文件数不一致"); }
         string token = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
         List<string> staged = new List<string>();
         List<string> published = new List<string>();
         try {
             for (int i = 0; i < paths.Count; i = i + 1) {
-                if (File.Exists(paths[i]) || Directory.ExistsOnDisk(paths[i])) {
+                if (!force && (File.Exists(paths[i]) || Directory.ExistsOnDisk(paths[i]))) {
                     throw new Exception("生成目标已存在：" + paths[i]);
                 }
                 string tmp = paths[i] + "." + token + ".tmp";
@@ -894,9 +898,10 @@ class CoderController : AdminController {
                 File.WriteAllText(tmp, sources[i]);
             }
             for (int i = 0; i < paths.Count; i = i + 1) {
-                if (File.Exists(paths[i]) || Directory.ExistsOnDisk(paths[i])) {
+                if (!force && (File.Exists(paths[i]) || Directory.ExistsOnDisk(paths[i]))) {
                     throw new Exception("生成目标已存在：" + paths[i]);
                 }
+                if (force && File.Exists(paths[i])) { File.Delete(paths[i]); }
                 if (!File.CreateHardLink(paths[i], staged[i])) {
                     throw new Exception("目标已存在或发布生成文件失败：" + paths[i]);
                 }
@@ -924,17 +929,54 @@ class CoderController : AdminController {
         if (t == null) { this.Fail(404, "0404", "设计不存在"); }
         List<SysGenColumn> cols = await this.SysGenColumn
             .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
+        List<SysGenTable> tabs = await this.SysGenTable.OrderBy(a => a.id).ToListAsync();
+        List<string> designed = new List<string>();
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            if (Gen.Safe(tabs[i].tableName)) { designed.Add(tabs[i].tableName); }
+        }
         ViewData d = new ViewData();
         d.Set("dialogTitle", t.tableName + " 生成预览");
         d.Set("model", Gen.ModelSource(t, cols));
-        d.Set("controller", Gen.ControllerSource(t, cols));
+        d.Set("controller", Gen.ControllerSource(t, cols, designed));
         d.Set("dao", Gen.DaoSource(t, cols));
         d.Set("list", Gen.ListViewSource(t, cols));
-        d.Set("form", Gen.FormViewSource(t, cols));
+        d.Set("form", Gen.FormViewSource(t, cols, designed));
         d.Set("frontController", Gen.FrontControllerSource(t, cols));
         d.Set("frontList", Gen.FrontListViewSource(t, cols));
         d.Set("frontShow", Gen.FrontShowViewSource(t, cols));
+        string root = (await Settings.Get(SettingKeys.GenRoot, "..")).Trim();
+        if (root.Length > 0 && Directory.ExistsOnDisk(root + "/src")
+            && Directory.ExistsOnDisk(root + "/views")) {
+            List<string> paths = CoderController.TargetPaths(t, root);
+            int existN = 0;
+            for (int i = 0; i < paths.Count; i = i + 1) {
+                if (File.Exists(paths[i])) { existN = existN + 1; }
+            }
+            if (existN > 0) {
+                d.Set("existsNote", "已有 " + Convert.ToString(existN)
+                    + "/8 个目标文件存在；默认拒绝覆盖，可在字段设计页用「覆盖重新生成」");
+            }
+        }
         this.Dialog(d);
+    }
+
+    /* 人工确认生成模块已编译部署后置位 generatedAt：通用数据入口随 IsMenu
+       隐藏；再点一次恢复。生成≠部署，所以不由 Build 自动写。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("标记生成模块接管")]
+    async void Own() {
+        int id = this.InInt("id", 0);
+        SysGenTable t = await this.SysGenTable.ById(id);
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+        int next = t.generatedAt > 0 ? 0 : WebApp.NowSeconds();
+        await this.SysGenTable.Update()
+            .Set(a => a.generatedAt, next)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id).ExecuteAffrowsAsync();
+        await this.Note(next > 0 ? "标记生成模块已接管" : "取消接管生成模块",
+            t.tableName, true, "");
+        this.Saved(next > 0 ? "已标记接管，通用数据入口将隐藏" : "已恢复通用数据入口");
     }
 
     static int Flag(string v) {
