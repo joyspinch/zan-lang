@@ -799,6 +799,112 @@ const unsigned char *zan_crypto_cert_encoded(const void *cert, int *out_len) {
     *out_len = (int)ctx->cbCertEncoded;
     return ctx->pbCertEncoded;
 }
+
+/* Resolve Crypt32 at the call site: only Windows TLS clients need it, and
+ * rt_io is linked into programs that never use TLS. The temporary store holds
+ * exactly the peer's DER objects as untrusted intermediates, never as roots. */
+int32_t zan_io_crypto_windows_ssl_policy(const unsigned char *certs, int32_t total_len,
+                                       int32_t count, const char *host, int32_t host_len) {
+    typedef PCCERT_CONTEXT (WINAPI *create_cert_fn)(DWORD, const BYTE *, DWORD);
+    typedef HCERTSTORE (WINAPI *open_store_fn)(LPCSTR, DWORD, HCRYPTPROV_LEGACY, DWORD, const void *);
+    typedef BOOL (WINAPI *add_cert_fn)(HCERTSTORE, DWORD, const BYTE *, DWORD, DWORD, PCCERT_CONTEXT *);
+    typedef BOOL (WINAPI *get_chain_fn)(HCERTCHAINENGINE, PCCERT_CONTEXT, LPFILETIME,
+                                        HCERTSTORE, PCERT_CHAIN_PARA, DWORD, LPVOID, PCCERT_CHAIN_CONTEXT *);
+    typedef BOOL (WINAPI *verify_policy_fn)(LPCSTR, PCCERT_CHAIN_CONTEXT,
+                                            PCERT_CHAIN_POLICY_PARA, PCERT_CHAIN_POLICY_STATUS);
+    typedef BOOL (WINAPI *close_store_fn)(HCERTSTORE, DWORD);
+    typedef BOOL (WINAPI *free_cert_fn)(PCCERT_CONTEXT);
+    typedef void (WINAPI *free_chain_fn)(PCCERT_CHAIN_CONTEXT);
+    HMODULE lib = NULL;
+    HCERTSTORE store = NULL;
+    PCCERT_CONTEXT leaf = NULL;
+    PCCERT_CHAIN_CONTEXT chain = NULL;
+    int32_t result = 0;
+    WCHAR wide_host[254];
+    create_cert_fn create_cert;
+    open_store_fn open_store;
+    add_cert_fn add_cert;
+    get_chain_fn get_chain;
+    verify_policy_fn verify_policy;
+    close_store_fn close_store;
+    free_cert_fn free_cert;
+    free_chain_fn free_chain;
+
+    if (!certs || !host || total_len < 5 || total_len > 524288 ||
+        count < 1 || count > 8 || host_len < 1 || host_len > 253) return 0;
+    for (int32_t i = 0; i < host_len; ++i) {
+        unsigned char ch = (unsigned char)host[i];
+        if (ch <= 32 || ch >= 127 || ch == '/' || ch == '\\' || ch == ':') return 0;
+        wide_host[i] = (WCHAR)ch;
+    }
+    wide_host[host_len] = 0;
+
+    lib = LoadLibraryW(L"crypt32.dll");
+    if (!lib) return 0;
+    create_cert = (create_cert_fn)GetProcAddress(lib, "CertCreateCertificateContext");
+    open_store = (open_store_fn)GetProcAddress(lib, "CertOpenStore");
+    add_cert = (add_cert_fn)GetProcAddress(lib, "CertAddEncodedCertificateToStore");
+    get_chain = (get_chain_fn)GetProcAddress(lib, "CertGetCertificateChain");
+    verify_policy = (verify_policy_fn)GetProcAddress(lib, "CertVerifyCertificateChainPolicy");
+    close_store = (close_store_fn)GetProcAddress(lib, "CertCloseStore");
+    free_cert = (free_cert_fn)GetProcAddress(lib, "CertFreeCertificateContext");
+    free_chain = (free_chain_fn)GetProcAddress(lib, "CertFreeCertificateChain");
+    if (!create_cert || !open_store || !add_cert || !get_chain || !verify_policy ||
+        !close_store || !free_cert || !free_chain) goto cleanup;
+
+    store = open_store(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
+    if (!store) goto cleanup;
+    int32_t pos = 0;
+    for (int32_t i = 0; i < count; ++i) {
+        if (total_len - pos < 4) goto cleanup;
+        uint32_t n = (uint32_t)certs[pos] | ((uint32_t)certs[pos+1] << 8) |
+                     ((uint32_t)certs[pos+2] << 16) | ((uint32_t)certs[pos+3] << 24);
+        pos += 4;
+        if (n < 1 || n > 65536 || n > (uint32_t)(total_len - pos)) goto cleanup;
+        if (i == 0) {
+            leaf = create_cert(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, certs + pos, n);
+            if (!leaf) goto cleanup;
+        } else if (!add_cert(store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                             certs + pos, n, CERT_STORE_ADD_ALWAYS, NULL)) {
+            goto cleanup;
+        }
+        pos += (int32_t)n;
+    }
+    if (pos != total_len) goto cleanup;
+
+    CERT_CHAIN_PARA chain_para;
+    memset(&chain_para, 0, sizeof(chain_para));
+    chain_para.cbSize = sizeof(chain_para);
+    LPSTR server_auth_oid = szOID_PKIX_KP_SERVER_AUTH;
+    chain_para.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
+    chain_para.RequestedUsage.Usage.cUsageIdentifier = 1;
+    chain_para.RequestedUsage.Usage.rgpszUsageIdentifier = &server_auth_oid;
+    if (!get_chain(NULL, leaf, NULL, store, &chain_para,
+                   CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT |
+                   CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL | CERT_CHAIN_DISABLE_AIA,
+                   NULL, &chain) || !chain || chain->TrustStatus.dwErrorStatus != 0) goto cleanup;
+
+    SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl;
+    memset(&ssl, 0, sizeof(ssl));
+    ssl.cbSize = sizeof(ssl);
+    ssl.dwAuthType = AUTHTYPE_SERVER;
+    ssl.pwszServerName = wide_host;
+    CERT_CHAIN_POLICY_PARA policy;
+    memset(&policy, 0, sizeof(policy));
+    policy.cbSize = sizeof(policy);
+    policy.pvExtraPolicyPara = &ssl;
+    CERT_CHAIN_POLICY_STATUS status;
+    memset(&status, 0, sizeof(status));
+    status.cbSize = sizeof(status);
+    if (verify_policy(CERT_CHAIN_POLICY_SSL, chain, &policy, &status) && status.dwError == 0)
+        result = 1;
+cleanup:
+    if (chain) free_chain(chain);
+    if (leaf) free_cert(leaf);
+    if (store) close_store(store, 0);
+    FreeLibrary(lib);
+    return result;
+}
 #endif
 
 int32_t zan_io_socket_ready(intptr_t fd, int32_t write_ready) {

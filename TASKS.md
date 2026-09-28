@@ -187,6 +187,6 @@
 
 ## 通讯安全余量（2026-09-28）
 
-- [ ] **B-NET1** Windows/macOS 的默认 HTTPS/WSS 客户端缺系统链策略桥接，当前无显式 `AddTrustedCert` 会失败关闭。不能仅枚举 ROOT/keychain：那会丢弃系统拒绝列表、用途与吊销策略。需以收到的原始 DER 链和预期主机名调用 Crypt32 SSL 链策略 / macOS SecTrust，并保留 TLS 握手签名、Finished 与 pin 校验；回归覆盖受信任、错误主机、受禁根、过期和平台 API 不可用。
+- [ ] **B-NET1** Windows 已接入收到的 DER 链与预期主机名的 Crypt32 链构建和 SSL 策略验证；离线缓存吊销未知/错误失败关闭，显式 `AddTrustedCert` 仍走独立的签名链验证。`security_tls_windows_policy` 目前只实测不受信任/错误主机/畸形输入与显式 CA 接受，尚缺有缓存 CRL 的系统受信任正例、受禁根/过期/平台 API 不可用回归；缓存缺失会拒绝原本有效的公网站点。macOS 默认客户端仍无 SecTrust 桥接、无显式 CA 时失败关闭。补齐跨平台正负策略用例前不得声称默认系统信任全面可用。
 - [ ] **B-NET2** 自研 X.509 链验证尚无吊销检查或完整 RFC 5280 路径构建；非关键 nameConstraints 与重复扩展已拒绝，带 pathLenConstraint 的 CA 仍被解析器失败关闭。`security_x509_extensions` 与 `tls_auth_chain` 仅覆盖所支持链形；需定义 CRL/OCSP 的离线及网络超时策略、路径约束处理，增加中间 CA、撤销/未知状态和路径长度回归，在此之前不得声称完整 PKIX 验证。
 - [ ] **B-NET3** TLS 对端证书目前仅支持 RSA/SHA-256，ECDSA/EdDSA 与其他证书签名方案失败关闭；IPv6 iPAddress SAN、IDNA 规范化亦未覆盖。按目标平台扩展证书与握手签名算法、规范化主机名并做跨实现握手与 SAN 用例，不能靠关闭验证解决互通。

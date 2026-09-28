@@ -15,7 +15,7 @@ delegate bool CertPolicyFn(long verifyResult, string certText);
 
 /// <summary>
 /// 纯 Zan 原生 TLS 上下文。
-/// 零 C 语言与零 OpenSSL 依赖，管理客户端与服务器配置、证书策略与公钥固定 (Pinning)。
+/// 记录与握手无 OpenSSL 依赖；Windows 客户端系统信任经 Crypt32 SSL 链策略验证。
 /// </summary>
 class TlsContext {
     bool server;
@@ -166,7 +166,7 @@ class TlsContext {
         return c;
     }
 
-    /// <summary>创建客户端 TLS 上下文；Linux 使用发行版 CA bundle，其他平台需显式添加 CA。</summary>
+    /// <summary>创建客户端 TLS 上下文；Windows 使用系统 SSL 链策略，Linux 使用发行版 CA bundle。</summary>
     static TlsContext CreateClient() {
         TlsContext c = new TlsContext();
         c.trustedCerts = TlsContext.SystemTrustRoots();
@@ -209,8 +209,7 @@ class TlsContext {
 
 /// <summary>
 /// 非阻塞套接字上的纯 Zan 原生 TLS 1.2 / TLS 1.3 流。
-/// 彻底去除 OpenSSL (libssl/libcrypto) 与 Windows crypt32.dll 外部依赖，
-/// 由原生 AES-128-GCM、X25519、HKDF 与 X.509 解析器直接驱动。
+/// 原生 AES-128-GCM、X25519、HKDF 与 X.509 握手；Windows 客户端另用 Crypt32 SSL 链策略。
 /// </summary>
 class TlsStream {
     [DllImport("crt", EntryPoint = "zan_monotonic_us")]
@@ -252,11 +251,13 @@ class TlsStream {
 
     static TlsStream Setup(TlsContext ctx, nint sock, string host) {
         if (ctx == null) { TlsStream.SetLastError("TLS 上下文缺失"); return null; }
+        #if !WINDOWS
         if (!ctx.server && ctx.verify && ctx.certPolicy == null
             && (ctx.trustedCerts == null || ctx.trustedCerts.Count == 0)) {
             TlsStream.SetLastError("TLS 系统信任根不可用；需显式 AddTrustedCert 配置 CA");
             return null;
         }
+        #endif
         TlsStream s = new TlsStream();
         s.engine = new TlsEngine(host, !ctx.verify, ctx.disableTls13, ctx.pins, ctx.pinRequired, ctx.certPolicy, ctx.trustedCerts, ctx.server, ctx.certFile, ctx.keyFile);
         s.engine.SetCredentials(ctx.cachedCert, ctx.cachedKey);

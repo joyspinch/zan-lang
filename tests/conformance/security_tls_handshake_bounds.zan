@@ -1,0 +1,86 @@
+using System;
+using System.Net.Tls;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        if (ok) { Console.WriteLine("ok " + name); }
+        else { Console.WriteLine("FAIL " + name); failures = failures + 1; }
+    }
+
+    static TlsEngine Engine(bool server) {
+        TlsEngine e = new TlsEngine("example.test", true, false, null, false, null, null, server, "", "");
+        e.StartHandshake();
+        return e;
+    }
+
+    static byte[] Message(int type, byte[] body) {
+        TlsByteWriter w = new TlsByteWriter();
+        w.WriteU8(type);
+        w.WriteU24(body.Length);
+        w.WriteBytes(body);
+        return w.ToArray();
+    }
+
+    static byte[] ClientHello(int compressionCount, bool duplicateUnknown) {
+        TlsByteWriter w = new TlsByteWriter();
+        w.WriteU16(TlsRecord.VersionTls12);
+        w.WriteBytes(new byte[32]);
+        w.WriteU8(0);
+        w.WriteU16(2);
+        w.WriteU16(0x1301);
+        w.WriteU8(compressionCount);
+        w.WriteU8(0);
+        if (compressionCount > 1) { w.WriteU8(1); }
+        w.WriteU16(duplicateUnknown ? 8 : 4);
+        w.WriteU16(0xff00);
+        w.WriteU16(0);
+        if (duplicateUnknown) { w.WriteU16(0xff00); w.WriteU16(0); }
+        return w.ToArray();
+    }
+
+    static void Main() {
+        byte[] ee = Message(TlsRecord.HandshakeEncryptedExtensions, new byte[] { 0, 0 });
+        TlsEngine initial = Engine(false);
+        Check(initial.ProcessHandshakePayload(ee) == -1 && initial.IsClosed(), "early encrypted extensions rejected");
+
+        TlsEngine valid = Engine(false);
+        valid.state = 2;
+        valid.negotiatedVersion = TlsRecord.VersionTls13;
+        Check(valid.ProcessHandshakePayload(ee) == 0, "first encrypted extensions accepted in tls13 state");
+        Check(valid.ProcessHandshakePayload(ee) == -1 && valid.IsClosed(), "repeated encrypted extensions rejected");
+        TlsEngine sni = Engine(false);
+        sni.state = 2;
+        sni.negotiatedVersion = TlsRecord.VersionTls13;
+        Check(sni.ProcessHandshakePayload(Message(TlsRecord.HandshakeEncryptedExtensions,
+            new byte[] { 0, 4, 0, 0, 0, 0 })) == 0, "sni acknowledgement accepted");
+        TlsEngine unexpected = Engine(false);
+        unexpected.state = 2;
+        Check(unexpected.ProcessHandshakePayload(Message(TlsRecord.HandshakeEncryptedExtensions,
+            new byte[] { 0, 4, 0, 16, 0, 0 })) == -1, "unsolicited extension rejected");
+        TlsEngine malformed = Engine(false);
+        malformed.state = 2;
+        Check(malformed.ProcessHandshakePayload(Message(TlsRecord.HandshakeEncryptedExtensions,
+            new byte[] { 0, 5, 0, 0, 0, 0 })) == -1, "bad extension vector rejected");
+
+        TlsEngine server = Engine(true);
+        Check(server.ProcessHandshakePayload(ee) == -1, "server rejects peer encrypted extensions");
+        Check(Engine(true).ProcessHandshakePayload(Message(TlsRecord.HandshakeClientHello, ClientHello(2, false))) == -1,
+            "extra compression method rejected");
+        TlsEngine duplicate = Engine(true);
+        Check(duplicate.ProcessHandshakePayload(Message(TlsRecord.HandshakeClientHello, ClientHello(1, true))) == -1
+            && duplicate.LastError() == "ClientHello extension 重复", "duplicate unknown extension rejected");
+        TlsEngine single = Engine(true);
+        Check(single.ProcessHandshakePayload(Message(TlsRecord.HandshakeClientHello, ClientHello(1, false))) == -1
+            && single.LastError() != "ClientHello extension 重复", "single unknown extension parsed");
+
+        TlsEngine budget = Engine(true);
+        byte[] chunk = Message(254, new byte[16380]);
+        for (int i = 0; i < 16; i = i + 1) {
+            Check(budget.ProcessHandshakePayload(chunk) == 0, "pre-auth bounded chunk " + Convert.ToString(i));
+        }
+        Check(budget.ProcessHandshakePayload(chunk) == -1 && budget.IsClosed(), "pre-auth handshake budget enforced");
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+    }
+}

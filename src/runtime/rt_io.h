@@ -124,6 +124,13 @@ void zan_io_resolve_sa_co(const char *name, int32_t port, void *buf,
 /* Read the encoded DER pointer/length from a Windows PCCERT_CONTEXT.
  * Keeps the CERT_CONTEXT layout out of the Zan standard library. */
 const unsigned char *zan_crypto_cert_encoded(const void *cert, int *out_len);
+/* Verify the exact TLS peer DER sequence against Windows chain + SSL policy.
+ * certs is count repetitions of [uint32 little-endian length][DER], with
+ * total_len bounding all reads. host is an ASCII DNS name with explicit length.
+ * Returns 1 only if the chain, revocation and hostname all pass; 0 otherwise.
+ * The OS trust store is consulted as policy, never enumerated as loose anchors. */
+int32_t zan_io_crypto_windows_ssl_policy(const unsigned char *certs, int32_t total_len,
+                                       int32_t count, const char *host, int32_t host_len);
 #endif
 
 /* ---- stackless (CPS state-machine) ABI ----

@@ -202,9 +202,14 @@ class TlsTranscript {
 
 /// <summary>
 /// 纯 Zan 原生 TLS 1.2 / TLS 1.3 客户端与服务端流引擎。
-/// 彻底去除 OpenSSL 与系统 crypt32/Schannel 动态依赖，零 C 接口依赖。
+/// TLS 记录与握手为原生 Zan；Windows 客户端证书链使用系统 Crypt32 SSL 策略。
 /// </summary>
 class TlsEngine {
+    #if WINDOWS
+    [DllImport("crt", EntryPoint = "zan_io_crypto_windows_ssl_policy")]
+    static extern int WindowsSslPolicy(nint certs, int totalLen, int count, nint host, int hostLen);
+    #endif
+
     // 状态常量
     static int StateInitial = 0;
     static int StateClientHelloSent = 1;
@@ -218,6 +223,7 @@ class TlsEngine {
     static int StateConnected = 9;
     static int StateClosed = 10;
     static int StateFailed = 11;
+    static int MaxPreAuthHandshakeBytes = 262144;
 
     string host;
     bool disableVerify;
@@ -241,6 +247,8 @@ class TlsEngine {
     List<X509Certificate> peerChain;
     bool peerAuthenticated;
     bool handshakeSignatureVerified;
+    bool receivedEncryptedExtensions;
+    int preAuthHandshakeBytes;
 
     int negotiatedVersion;
     int negotiatedCipherSuite;
@@ -300,6 +308,8 @@ class TlsEngine {
         this.peerChain = new List<X509Certificate>();
         this.peerAuthenticated = false;
         this.handshakeSignatureVerified = false;
+        this.receivedEncryptedExtensions = false;
+        this.preAuthHandshakeBytes = 0;
 
         this.negotiatedVersion = 0;
         this.negotiatedCipherSuite = 0;
@@ -373,6 +383,7 @@ class TlsEngine {
             return;
         }
 
+        this.preAuthHandshakeBytes = chPayload.Length;
         this.transcript.Update(chPayload);
 
         // 外部记录头采用 TLS 1.0 (0x0301) 保证旧中间盒兼容性 (RFC 8446 D.4)
@@ -532,6 +543,12 @@ class TlsEngine {
                 this.Fail("非法握手消息体长度");
                 return -1;
             }
+            if (this.state != StateConnected && (msgLen > MaxPreAuthHandshakeBytes - 4
+                || this.preAuthHandshakeBytes > MaxPreAuthHandshakeBytes - 4 - msgLen)) {
+                this.Fail("TLS 认证前握手消息超出大小上限");
+                return -1;
+            }
+            if (this.state != StateConnected) { this.preAuthHandshakeBytes = this.preAuthHandshakeBytes + 4 + msgLen; }
 
             byte[] msgBody = reader.ReadBytes(msgLen);
             byte[] fullMsg = new byte[4 + msgLen];
@@ -553,9 +570,34 @@ class TlsEngine {
         } else if (msgType == TlsRecord.HandshakeServerHello) {
             return this.HandleServerHello(fullMsg, body);
         } else if (msgType == TlsRecord.HandshakeEncryptedExtensions) {
+            if (this.isServer || this.state != StateTls13Handshake || this.receivedEncryptedExtensions
+                || this.peerCert != null || body.Length < 2) {
+                this.Fail("意外的 TLS 1.3 EncryptedExtensions");
+                return -1;
+            }
+            TlsByteReader extensions = new TlsByteReader(body, 0, body.Length);
+            if (extensions.ReadU16() != extensions.Remaining()) {
+                this.Fail("EncryptedExtensions 长度不匹配"); return -1;
+            }
+            List<int> seen = new List<int>();
+            while (extensions.Remaining() > 0) {
+                if (!extensions.Has(4)) { this.Fail("EncryptedExtensions 截断"); return -1; }
+                int kind = extensions.ReadU16();
+                int size = extensions.ReadU16();
+                if (!extensions.Has(size) || seen.Contains(kind)
+                    || kind != 0 || size != 0 || this.host == null || this.host.Length == 0) {
+                    this.Fail("EncryptedExtensions 无效或未请求的扩展"); return -1;
+                }
+                seen.Add(kind);
+                extensions.Skip(size);
+            }
+            this.receivedEncryptedExtensions = true;
             this.transcript.Update(fullMsg);
             return 0;
         } else if (msgType == TlsRecord.HandshakeCertificate) {
+            if (!this.isServer && this.negotiatedVersion == TlsRecord.VersionTls13 && !this.receivedEncryptedExtensions) {
+                this.Fail("TLS 1.3 Certificate 早于 EncryptedExtensions"); return -1;
+            }
             return this.HandleCertificate(fullMsg, body);
         } else if (msgType == TlsRecord.HandshakeCertificateVerify) {
             return this.HandleCertificateVerify(fullMsg, body);
@@ -700,6 +742,30 @@ class TlsEngine {
         return this.VerifyCertificate();
     }
 
+    #if WINDOWS
+    bool WindowsTrustedPeer() {
+        if (this.peerChain == null || this.peerChain.Count == 0 || this.host == null
+            || this.host.Length == 0 || this.host.Length > 253) { return false; }
+        TlsByteWriter derChain = new TlsByteWriter();
+        for (int i = 0; i < this.peerChain.Count; i = i + 1) {
+            X509Certificate cert = this.peerChain[i];
+            if (cert == null) { return false; }
+            byte[] der = cert.RawDer();
+            int size = cert.RawDerLen();
+            if (der == null || size < 1 || size > 65536 || size > der.Length
+                || derChain.Length() + 4 + size > 524288) { return false; }
+            derChain.WriteU8(size & 255);
+            derChain.WriteU8((size >> 8) & 255);
+            derChain.WriteU8((size >> 16) & 255);
+            derChain.WriteU8((size >> 24) & 255);
+            derChain.WriteBytes(der, 0, size);
+        }
+        byte[] packed = derChain.ToArray();
+        return WindowsSslPolicy((nint)packed, packed.Length, this.peerChain.Count,
+            (nint)this.host, this.host.Length) == 1;
+    }
+    #endif
+
     int VerifyCertificate() {
         if (this.disableVerify) { this.verifyResult = 0; return 0; }
         this.verifyResult = 1;
@@ -708,10 +774,18 @@ class TlsEngine {
             this.Fail("对端证书缺失、过期或不允许用于 TLS 服务端"); return -1;
         }
         bool hostMatches = this.peerCert.VerifyHost(this.host);
+        bool anchored = false;
+        #if WINDOWS
+        // Windows evaluates its own disallowed store, SSL hostname policy and
+        // revocation (including unknown/offline) on the received DER chain.
+        // Explicit CA certificates are a separate, additive trust path below.
+        bool osTrusted = this.WindowsTrustedPeer();
+        #else
+        bool osTrusted = false;
+        #endif
         // Every untrusted link needs a valid issuer signature and a CA that may sign certificates.
         X509Certificate current = this.peerCert;
-        bool anchored = false;
-        for (int depth = 0; depth < this.peerChain.Count && !anchored; depth = depth + 1) {
+        for (int depth = 0; depth < this.peerChain.Count && !anchored && !osTrusted; depth = depth + 1) {
             if (this.trustedCerts != null) {
                 for (int i = 0; i < this.trustedCerts.Count; i = i + 1) {
                     X509Certificate anchor = this.trustedCerts[i];
@@ -725,7 +799,7 @@ class TlsEngine {
                 current = issuerCert;
             }
         }
-        if (!anchored || !hostMatches) {
+        if ((!anchored && !osTrusted) || !hostMatches) {
             this.verifyResult = !hostMatches ? 62 : 19;
             if (this.certPolicy == null || !this.certPolicy((long)this.verifyResult, this.peerCertText)) {
                 this.Fail(!hostMatches ? "TLS 证书主机名不匹配" : "TLS 证书链无受信任签名锚"); return -1;
@@ -1002,10 +1076,9 @@ class TlsEngine {
             if (suite == 0xc02f) { suite12 = true; }
         }
         int compLen = r.ReadU8();
-        if (compLen < 1 || !r.Has(compLen) || r.ReadU8() != 0) {
+        if (compLen != 1 || !r.Has(1) || r.ReadU8() != 0) {
             this.Fail("ClientHello compression_methods 非法"); return -1;
         }
-        r.Skip(compLen - 1);
 
         bool offered13 = false;
         bool offered12 = false;
@@ -1017,6 +1090,7 @@ class TlsEngine {
         bool sig12 = false;
         bool groupX25519 = false;
         byte[] clientShare = null;
+        List<int> seenExtensions = new List<int>();
         if (r.Remaining() > 0) {
             if (!r.Has(2)) { this.Fail("ClientHello extensions 长度非法"); return -1; }
             int extTotal = r.ReadU16();
@@ -1026,6 +1100,8 @@ class TlsEngine {
                 int extType = r.ReadU16();
                 int extLen = r.ReadU16();
                 if (!r.Has(extLen)) { this.Fail("ClientHello extension 长度非法"); return -1; }
+                if (seenExtensions.Contains(extType)) { this.Fail("ClientHello extension 重复"); return -1; }
+                seenExtensions.Add(extType);
                 int extEnd = r.Offset() + extLen;
                 if (extType == 43) { // supported_versions
                     if (hasVersions || extLen < 3) { this.Fail("supported_versions 非法"); return -1; }
