@@ -1,0 +1,56 @@
+// Conformance: TLS receive APIs reject invalid caller ranges before any socket wait.
+// Also pins TLS 1.2 ClientKeyExchange exact framing and X25519 low-order output.
+using System;
+using System.Net.Tls;
+using System.Security.Cryptography;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        if (ok) { Console.WriteLine("ok " + name); }
+        else { Console.WriteLine("FAIL " + name); failures = failures + 1; }
+    }
+
+    static TlsEngine Engine(bool server) {
+        return new TlsEngine("example.test", true, true, null, false,
+            null, null, server, "", "");
+    }
+
+    static byte[] ClientKeyExchange(int extra) {
+        byte[] body = new byte[33 + extra];
+        body[0] = 32;
+        for (int i = 0; i < 32; i = i + 1) { body[1 + i] = 9; }
+        for (int i = 0; i < extra; i = i + 1) { body[33 + i] = 1; }
+        return body;
+    }
+
+    static void Main() {
+        Check(TlsStream.ValidReceiveRange(16, 0, 0), "zero receive range accepted");
+        Check(TlsStream.ValidReceiveRange(16, 4, 12), "exact receive range accepted");
+        Check(!TlsStream.ValidReceiveRange(16, -1, 1), "negative offset rejected");
+        Check(!TlsStream.ValidReceiveRange(16, 0, -1), "negative length rejected");
+        Check(!TlsStream.ValidReceiveRange(16, 17, 0), "offset past buffer rejected");
+        Check(!TlsStream.ValidReceiveRange(16, 8, 9), "range past buffer rejected");
+        Check(!TlsStream.ValidReceiveRange(16, 2147483647, 1), "integer overflow range rejected");
+
+        TlsEngine low = Program.Engine(true);
+        low.state = 7;
+        low.clientX25519Priv = new byte[32];
+        low.clientRandom = new byte[32];
+        low.serverRandom = new byte[32];
+        byte[] lowBody = new byte[33];
+        lowBody[0] = 32;
+        Check(low.HandleClientKeyExchange(new byte[0], lowBody) < 0,
+            "TLS 1.2 low-order point rejected");
+
+        TlsEngine trailing = Program.Engine(true);
+        trailing.state = 7;
+        trailing.clientX25519Priv = Curve25519.GetPublicKey(new byte[32]);
+        trailing.clientRandom = new byte[32];
+        trailing.serverRandom = new byte[32];
+        Check(trailing.HandleClientKeyExchange(new byte[0], Program.ClientKeyExchange(1)) < 0,
+            "TLS 1.2 ClientKeyExchange trailing bytes rejected");
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+    }
+}

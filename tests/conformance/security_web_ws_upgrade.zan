@@ -1,0 +1,60 @@
+// Conformance: MVC WebWs.Upgrade must reject malformed handshakes before touching
+// the connection. The valid request is checked through the shared gate; invalid
+// requests call the actual upgrade entry with no connection and must return null.
+using System;
+using System.Net.Http;
+using System.Net.WebSocket;
+using System.Web;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        if (ok) { Console.WriteLine("ok " + name); }
+        else { Console.WriteLine("FAIL " + name); failures = failures + 1; }
+    }
+
+    static string Headers() {
+        return "Host: example.test\r\n"
+            + "Upgrade: websocket\r\n"
+            + "Connection: Upgrade\r\n"
+            + "Sec-WebSocket-Version: 13\r\n"
+            + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+    }
+
+    static async bool UpgradeRejects(string raw) {
+        HttpContext ctx = new HttpContext(HttpRequest.Parse(raw), "127.0.0.1");
+        WsSession ws = await WebWs.Upgrade(ctx);
+        return ws == null;
+    }
+
+    static async void Main() {
+        string good = "GET /socket HTTP/1.1\r\n" + Program.Headers() + "\r\n";
+        Check(WsHandshake.Valid(HttpRequest.Parse(good)), "valid MVC gate");
+        Check(await UpgradeRejects("POST /socket HTTP/1.1\r\n" + Program.Headers() + "\r\n"), "POST rejected");
+        Check(await UpgradeRejects("GET /socket HTTP/1.0\r\n" + Program.Headers() + "\r\n"), "HTTP/1.0 rejected");
+        Check(await UpgradeRejects("GET /socket HTTP/1.1\r\n"
+            + "Host: example.test\r\nUpgrade: websocket\r\n"
+            + "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"),
+            "missing Connection rejected");
+        Check(await UpgradeRejects("GET /socket HTTP/1.1\r\n"
+            + "Host: example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"),
+            "missing Version rejected");
+        Check(await UpgradeRejects("GET /socket HTTP/1.1\r\n"
+            + Program.Headers().Replace("dGhlIHNhbXBsZSBub25jZQ==", "YWJj") + "\r\n"),
+            "short key rejected");
+        Check(await UpgradeRejects("GET /socket HTTP/1.1\r\n"
+            + Program.Headers().Replace("dGhlIHNhbXBsZSBub25jZQ==", "!!!!!!!!!!!!!!!!!!!!!!!!") + "\r\n"),
+            "invalid Base64 rejected");
+        Check(await UpgradeRejects("GET /socket HTTP/1.1\r\n"
+            + Program.Headers().Replace("Upgrade: websocket", "Upgrade: websocketeer") + "\r\n"),
+            "wrong Upgrade token rejected");
+        Check(await UpgradeRejects("GET /socket HTTP/1.1\r\n"
+            + Program.Headers() + "Host: second.test\r\n\r\n"),
+            "duplicate Host rejected");
+        Check(await UpgradeRejects("GET /sock et HTTP/1.1\r\n" + Program.Headers() + "\r\n"),
+            "unsafe target rejected");
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+    }
+}

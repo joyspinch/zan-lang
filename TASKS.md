@@ -49,8 +49,9 @@
 
 - [x] **B-NET4a** TLS 跨 record 握手重组、ServerHello 扩展边界、记录类型/版本 fail-closed 与认证前预算；用例 `security_tls_handshake_bounds`。
 - [x] **B-NET4b** Content-Length/chunk-size 乘加溢出、chunk 数据/长度行严格 CRLF；用例 `http_chunk_len_overflow`、`http_client_keepalive`、`security_forwarder_wire`。
-- [x] **B-NET4c** MVC/WS/WSS 升级响应、帧掩码/RSV/控制帧/Close/UTF-8 门禁与请求目标注入；用例 `security_ws_client_protocol`、`security_ws_handshake`、`security_ws_worker`、`ws_protocol_gate`、`ws_loopback`。
+- [x] **B-NET4c** MVC/WS/WSS 升级响应、帧掩码/RSV/控制帧/Close/UTF-8 门禁与请求目标注入；用例 `security_web_ws_upgrade`、`security_ws_client_protocol`、`security_ws_handshake`、`security_ws_worker`、`ws_protocol_gate`、`ws_loopback`。
 - [x] **B-NET4d** TLS 公钥 pin 不受 `disableVerify` 绕过、证书链与主机名策略错误分离；用例 `tls_auth_chain`。
+- [x] **B-NET4f** TLS 接收缓冲区范围 fail-closed、X25519 低阶/全零共享密钥拒绝、TLS 1.2 ClientKeyExchange 尾随字节拒绝；用例 `security_tls_receive_bounds`、`tls_auth_chain`。
 - [x] **B-NET4e** HttpClient Connection token 按逗号/OWS/大小写解析，Proxy TLS 上游握手使用配置 timeout；用例 `http_client_keepalive`、`security_forwarder_wire`、`http_forwarder_keepalive`。
 
 ## 未完成 · 通讯与 TLS

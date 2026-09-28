@@ -351,6 +351,23 @@ class TlsEngine {
         return b;
     }
 
+    byte[] DeriveX25519Shared(byte[] privateKey, byte[] peerPublic, string error) {
+        byte[] shared = Curve25519.ScalarMult(privateKey, peerPublic);
+        if (shared == null || shared.Length != 32) {
+            this.Fail(error);
+            return null;
+        }
+        int nonzero = 0;
+        for (int i = 0; i < 32; i = i + 1) {
+            nonzero = nonzero | (shared[i] & 255);
+        }
+        if (nonzero == 0) {
+            this.Fail(error);
+            return null;
+        }
+        return shared;
+    }
+
     static byte[] GenerateX25519(out byte[] publicKey) {
         publicKey = null;
         byte[] priv = RandomBytes(32);
@@ -708,8 +725,12 @@ class TlsEngine {
             }
             this.serverX25519Pub = serverShare;
 
-            // 计算 X25519 共享密钥
-            byte[] sharedSecret = Curve25519.ScalarMult(this.clientX25519Priv, this.serverX25519Pub);
+            // 计算 X25519 共享密钥；全零结果表示低阶点，必须失败关闭。
+            byte[] sharedSecret = this.DeriveX25519Shared(
+                this.clientX25519Priv,
+                this.serverX25519Pub,
+                "TLS 1.3 X25519 密钥协商失败");
+            if (sharedSecret == null) { return -1; }
 
             // TLS 1.3 Key Schedule (RFC 8446 §7.1)
             byte[] zeros32 = new byte[32];
@@ -1019,8 +1040,12 @@ class TlsEngine {
             return -1;
         }
 
-        // 1. 计算 Premaster Secret
-        byte[] pms = Curve25519.ScalarMult(this.clientX25519Priv, this.serverX25519Pub);
+        // 1. 计算 Premaster Secret；低阶点产生的全零结果必须拒绝。
+        byte[] pms = this.DeriveX25519Shared(
+            this.clientX25519Priv,
+            this.serverX25519Pub,
+            "TLS 1.2 X25519 密钥协商失败");
+        if (pms == null) { return -1; }
 
         // 2. 发送 ClientKeyExchange (含客户端 32 字节 X25519 临时公钥)
         byte[] cke = new byte[4 + 1 + 32];
@@ -1276,14 +1301,12 @@ class TlsEngine {
         byte[] recCCS = TlsRecord.FormatPlaintext(TlsRecord.ContentTypeChangeCipherSpec, TlsRecord.VersionTls12, dummyCcs, 0, 1);
         this.outNet.WriteBytes(recCCS);
 
-        // 计算 X25519 共享密钥
-        byte[] sharedSecret = Curve25519.ScalarMult(this.clientX25519Priv, this.clientX25519Pub);
-        if (sharedSecret == null || sharedSecret.Length != 32) {
-            this.Fail("TLS 1.3 X25519 密钥协商失败"); return -1;
-        }
-        int sharedNonzero = 0;
-        for (int i = 0; i < 32; i = i + 1) { sharedNonzero = sharedNonzero | (sharedSecret[i] & 255); }
-        if (sharedNonzero == 0) { this.Fail("TLS 1.3 X25519 共享密钥为零"); return -1; }
+        // 计算 X25519 共享密钥；低阶点产生的全零结果必须拒绝。
+        byte[] sharedSecret = this.DeriveX25519Shared(
+            this.clientX25519Priv,
+            this.clientX25519Pub,
+            "TLS 1.3 X25519 密钥协商失败");
+        if (sharedSecret == null) { return -1; }
 
         // 派生 TLS 1.3 握手流量密钥
         byte[] zeros32 = new byte[32];
@@ -1525,15 +1548,19 @@ class TlsEngine {
         if (this.state != StateServerTls12WaitingClientKeyExchange) { return 0; }
         TlsByteReader r = new TlsByteReader(body, 0, body.Length);
         int klen = r.ReadU8();
-        if (klen != 32 || r.Remaining() < 32) {
+        if (klen != 32 || r.Remaining() != 32) {
             this.Fail("非法 ClientKeyExchange X25519 密钥长度");
             return -1;
         }
         this.clientX25519Pub = r.ReadBytes(32);
         this.transcript.Update(fullMsg);
 
-        // 计算 PreMasterSecret
-        byte[] pms = Curve25519.ScalarMult(this.clientX25519Priv, this.clientX25519Pub);
+        // 计算 PreMasterSecret；低阶点产生的全零结果必须拒绝。
+        byte[] pms = this.DeriveX25519Shared(
+            this.clientX25519Priv,
+            this.clientX25519Pub,
+            "TLS 1.2 X25519 密钥协商失败");
+        if (pms == null) { return -1; }
 
         // 派生 TLS 1.2 MasterSecret (48 bytes)
         byte[] seed = new byte[64];
