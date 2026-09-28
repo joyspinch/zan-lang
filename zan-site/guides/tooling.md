@@ -97,10 +97,13 @@ zanc @args.txt                                                # 响应文件（�
 ## 四、测试分层（只跑相关的一层）
 
 ```bash
-scripts/test.ps1 smoke          # 75 个用例 ~5s：goldens/诊断/ABI/runtime/GUI——每次编辑必跑
-scripts/test.ps1 standard       # smoke + 全 conformance + 库发射 ~1min——提交前
-scripts/test.ps1 full           # + 确定性/leakcheck 孪生 + 自举——发布前
-ctest -L standard -R "generic"  # 按标签/名称缩小
+# 日常开发：单用例定向验证（秒级）
+ctest -R <用例名称> --output-on-failure
+scripts/test.ps1 smoke -Match <regex>
+
+# 发布门禁：全量用例回归（数十分钟，仅在版本发布/打 Tag 时跑）
+scripts/test.ps1 standard -ReleaseGate       # 全 conformance 集
+scripts/test.ps1 full -ReleaseGate           # + 确定性/leakcheck 孪生 + 自举
 ```
 
 **并发纪律**：所有测试用例共享 `build\zanc.exe` 与 stdlib 戳记，测试期间不得

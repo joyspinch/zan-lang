@@ -1,9 +1,14 @@
 # Runs one tier of the test suite (see the "Test tiers" block in CMakeLists).
 #
-#   scripts\test.ps1                 # smoke: compiler gates, seconds
-#   scripts\test.ps1 standard        # + every conformance program, pre-commit
-#   scripts\test.ps1 full            # + determinism / leakcheck / self-host
-#   scripts\test.ps1 smoke -Match gui   # only tests matching a regex
+#   scripts\test.ps1                 # smoke: compiler gates only (~300 cases)
+#   scripts\test.ps1 standard -ReleaseGate  # RELEASE GATE ONLY: 1000+ full programs
+#   scripts\test.ps1 full -ReleaseGate      # RELEASE GATE ONLY: + determinism / leakcheck / self-host
+#   scripts\test.ps1 smoke -Match gui       # targeted: only tests matching a regex
+#
+# IMPORTANT: Per AGENTS.md Rule 8, full tier runs (standard / full without -Match)
+# are RELEASE GATES ONLY. Do NOT run them as routine or pre-commit checks.
+# Routine verification must be targeted: build a probe or run:
+#   ctest -R <test_name> --output-on-failure
 #
 # Nothing else may compile while this runs: the cases share build\zanc.exe and
 # the stdlib stamp, so a concurrent build makes unrelated cases fail.
@@ -11,12 +16,28 @@ param(
     [ValidateSet('smoke', 'standard', 'full')]
     [string]$Tier = 'smoke',
     [string]$Match = '',
-    [int]$Jobs = 0
+    [int]$Jobs = 0,
+    [switch]$ReleaseGate,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 if ($Jobs -le 0) { $Jobs = [Environment]::ProcessorCount }
+
+# Guard: Full tier runs (standard / full) fan out across every CPU core, compile 1000+
+# programs, and take tens of minutes. Per AGENTS.md Rule 8, these tiers are release gates only,
+# never routine or pre-commit verification. Targeted runs with -Match (or smoke) are allowed.
+if (($Tier -eq 'standard' -or $Tier -eq 'full') -and $Match -eq '' -and -not $ReleaseGate -and -not $Force -and -not $env:CI -and -not $env:ZAN_RELEASE_GATE) {
+    Write-Host "[test] REJECTED: Running '$Tier' tier without -Match compiles 1000+ full programs and saturates all CPU cores." -ForegroundColor Red
+    Write-Host "[test] Per AGENTS.md Rule 8, full-tier runs are RELEASE GATES ONLY, NEVER routine development verification." -ForegroundColor Yellow
+    Write-Host "[test] - For routine/iterative verification, run the single affected test or probe:" -ForegroundColor Cyan
+    Write-Host "    ctest -R <name> --output-on-failure"
+    Write-Host "    scripts\test.ps1 $Tier -Match <name>"
+    Write-Host "[test] - If this is an intentional release gate run, add -ReleaseGate:" -ForegroundColor Cyan
+    Write-Host "    scripts\test.ps1 $Tier -ReleaseGate"
+    exit 1
+}
 
 $args = @('--test-dir', (Join-Path $root 'build'), '-C', 'Release',
           '-j', $Jobs, '--output-on-failure', '-L', $Tier)

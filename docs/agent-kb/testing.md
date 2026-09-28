@@ -1,27 +1,32 @@
 # 测试：选层级、避互斥、加回归
 
-## 三个层级
+## 测试层级与使用场景
 
 ```powershell
-scripts\test.ps1            # smoke   ≈75 个，编译器闸门，秒级
-scripts\test.ps1 standard   # ≈400 个，全部 conformance 程序，提交前基线
-scripts\test.ps1 full       # ≈1035 个，加确定性/泄漏/自举
-scripts\test.ps1 smoke -Match gui    # 按正则挑用例
+# --- 日常开发与修改验证（秒级完成，禁止跑全量）---
+build\zanc.exe _scratch\probe.zan --auto-stdlib -o _scratch\probe.exe  # 探针编译运行（最快）
+ctest --test-dir build -R <用例名称> --output-on-failure              # 单用例定向验证（推荐）
+scripts\test.ps1 smoke -Match <regex>                                # 局部定向匹配
+
+# --- 版本发布与打 Tag 门禁（1000+ 用例全量编译，数十分钟，仅限发布关卡）---
+scripts\test.ps1 standard -ReleaseGate  # 完整 conformance 集（发布关卡）
+scripts\test.ps1 full -ReleaseGate      # 完整集 + 确定性/泄漏/自举（终验发布门禁）
 ```
 
 底层就是 `ctest --test-dir build -C Release -L <tier>`；层级标签在 `CMakeLists.txt` 的
 "Test tiers" 段落里定义。
 
-**选层级的规矩**（`AGENTS.md`：小改动不要跑 1035 个）：
+**验证纪律（`AGENTS.md` 规则 8：严禁动辄跑全量）**：
 
-| 改动 | 至少跑 |
-| --- | --- |
-| 文档、注释 | 不用跑 |
-| IDE/模板（不动标准库、不动编译器） | `smoke` + 编 IDE（`scripts\build_ide.ps1`） |
-| 标准库（非 GUI） | `standard` |
-| 标准库 GUI/主题/控件 | `standard` + `scripts\build_gallery.ps1` + 真实窗口看一眼 |
-| 编译器任何一层 | `standard`；动了 ARC/async/泛型/发射再加 `full` |
-| 新增诊断 | `standard` **必跑**：新诊断会炸出既有真实错误（见 debugging-playbook 第 3 节） |
+| 改动类型 | 日常验证方式（秒级） | 发布门禁（Release Only） |
+| --- | --- | --- |
+| 文档、注释 | 无需测试 | — |
+| 编译器某层修复/特性 | 写/跑单用例 `ctest -R conformance_<name>` 或 `_scratch` 探针 | `standard -ReleaseGate` |
+| 标准库（非 GUI） | 跑对应模块用例 `ctest -R <name>` | `standard -ReleaseGate` |
+| 标准库 GUI/控件 | 跑对应 GUI 测试或编 gallery 看效果 | `standard -ReleaseGate` |
+| IDE / 模板 | 编 IDE / `scripts\e2e_pipeline.ps1` | `standard -ReleaseGate` |
+
+> **核心原则**：日常单次代码修改后，**绝不允许**跑未限定 `-Match` 的 `standard` 或 `full`。全量 1000+ 用例编译会打满多核数十 CPU 分钟，只在版本发布打 Tag 或重大基线验收时运行。
 
 ## 互斥：什么不能同时跑
 

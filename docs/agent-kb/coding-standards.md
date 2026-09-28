@@ -260,13 +260,16 @@ class Program {
 
 ### 4.4 Running Tests
 
-测试分三档(`scripts\test.ps1 <tier>` 或 `ctest -L <tier>`,详见 `AGENTS.md`):
+测试分三档(`scripts\test.ps1 <tier>` 或 `ctest -L <tier>`,详见 `AGENTS.md` 规则 8):
 
 ```bash
-scripts\test.ps1 smoke      # 快速档：goldens、诊断、ABI、runtimes、工具、GUI（每次编辑后跑）
-scripts\test.ps1 standard   # 提交门禁：smoke + 全部 conformance 程序与库发射（~1 min）
-scripts\test.ps1 full       # 发布门禁：加 determinism/leakcheck twins 与自举（数十分钟）
-ctest -R "generic|leak"     # 按名称过滤
+# 日常开发：探针或定向用例验证（秒级）
+ctest -R <用例名称> --output-on-failure
+scripts\test.ps1 smoke -Match <regex>
+
+# 发布门禁：全量用例回归（数十分钟，仅在版本发布/打 Tag 节点运行）
+scripts\test.ps1 standard -ReleaseGate   # 1000+ conformance 用例全量回归
+scripts\test.ps1 full -ReleaseGate       # 全量 + 确定性/leakcheck twins 与自举
 ```
 
 用例布局:`tests/conformance/<name>.zan` + `<name>.out`(stdout golden 对)、
@@ -279,8 +282,7 @@ ctest -R "generic|leak"     # 按名称过滤
 ### 5.1 Branch Strategy
 
 **不建分支**（`AGENTS.md` 硬规则 9）：所有改动直接提交 `main` 并推送。
-`main` 保持稳定——每次提交必须编译通过、对应档位测试通过（改动小跑 smoke，
-改动大跑 standard）。
+`main` 保持稳定——日常改动通过定向探针或单一用例验证即可提交，禁止因日常改动而跑全量测试阻塞机器。
 
 ### 5.2 Commit Messages
 

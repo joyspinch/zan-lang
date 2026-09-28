@@ -4328,11 +4328,11 @@ add_test(NAME tool_zandoc
 # label so a run can be scoped to the work at hand:
 #
 #   ctest -L smoke      compiler gates only: goldens, diagnostics, ABI,
-#                       runtimes, tools, GUI cases -- seconds, run it always
+#                       runtimes, tools, GUI cases -- opt-in sanity check
 #   ctest -L standard   smoke + every conformance program + library emission
-#                       -- the pre-commit gate
+#                       -- release gate / CI only (1000+ tests; do NOT run during routine dev)
 #   ctest -L full       everything, including the determinism and leakcheck
-#                       twins and self-hosting -- release / CI
+#                       twins and self-hosting -- final release gate / CI only
 #
 # Labels are derived from the test names so new tests are classified the moment
 # they are added, without touching the add_test() calls above.
