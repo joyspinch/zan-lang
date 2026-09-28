@@ -84,28 +84,28 @@ positive, stated in the commit message.
 7. **Every task ends clean — and ends with a commit.** Run `git status` before
    finishing; there should be no stray untracked files. Review
    `git diff --stat` and commit only what the task requires. Never
-   `git add .` / `git add -A` blindly. Once the relevant test tier passes,
+   `git add .` / `git add -A` blindly. Once the change is verified (rule 8),
    **commit on your own**: do not ask for permission and do not leave verified
    work uncommitted. If `git push` fails (e.g. network), leave the commit on
    local `main` and say so. Hold the commit only when verification failed or
    the working tree mixes in unrelated in-flight changes you must not touch.
-8. **ctest is NOT the default verification step — never run it casually.**
-   Running ctest "to be safe" after every edit is forbidden: it burns tens of
-   minutes on this machine and relinking `zanc` invalidates every test
-   artifact. Verify a change directly instead: compile and run the affected
-   program/probe (`build\zanc.exe <file.zan> --auto-stdlib -o
-   _scratch\out.exe`), or diff the one affected golden/diagnostic. Reach for
-   ctest only at a real checkpoint, and then always the narrowest tier
-   (`scripts\test.ps1 <tier>`, or `ctest -L <tier>`): `smoke` (75 tests) only
-   when the compiler/runtime/stdlib itself changed; `standard` (399) only
-   before committing compiler/stdlib/runtime work; `full` (1035 —
-   determinism/leakcheck twins + self-hosting) release gate only, tens of
-   minutes — never casually. A compiler/runtime/stdlib change is exactly such
-   a checkpoint (see rule 10): fixing a compiler defect or design flaw MUST be
-   backed by ctest — at least the affected `smoke` cases, `standard` before the
-   fix is committed; a hand-run probe alone does not verify a compiler fix.
-   Narrow further with `-Match`/`-R` when a change
-   is local (a generics/ARC change: `-R "generic|leakcheck_generic"`).
+8. **ctest tiers are opt-in, never a reflex — do not saturate the machine.**
+   A tier run fans out across every core for tens of minutes and maxes the
+   CPU, and relinking `zanc` invalidates every test artifact — so tiers are
+   NOT the default verification step, **including for compiler/runtime/
+   stdlib changes**. Default verification is direct and cheap: compile and
+   run the affected program/probe (`build\zanc.exe <file.zan> --auto-stdlib
+   -o _scratch\out.exe`), diff the one affected golden/diagnostic, and run
+   the single affected test case when one exists (`ctest -R
+   conformance_<name>` — seconds, vs tens of minutes for a tier; narrow
+   further with `-Match`/`-R` when the change is local, e.g. a generics/ARC
+   change: `-R "generic|leakcheck_generic"`). Do NOT run `smoke`/`standard`/
+   `full` tiers (`scripts\test.ps1 <tier>`, or `ctest -L <tier>`) as a
+   pre-commit step, and do not re-run a tier after small follow-up edits:
+   run a tier only when the user explicitly asks for it, or at an agreed
+   release gate (`full` — determinism/leakcheck twins + self-hosting — is a
+   release gate only). A hand-run probe plus the affected single case is a
+   complete verification; it does not need to be "upgraded" to a tier run.
    **Nothing else may build while tests run**: the cases share
    `build\zanc.exe` and the stdlib stamp, so a concurrent
    `build_gallery`/`build_ide` makes unrelated cases fail en masse.
@@ -130,9 +130,9 @@ positive, stated in the commit message.
     hides the root cause and spreads through the standard library.
     Procedure: reduce it to a minimal probe in `_scratch/`, find the root cause
     in `src/compiler/` or `src/runtime/`, fix it, add a `tests/conformance/`
-    case, run the affected ctest tier (rule 8 — a compiler/runtime fix counts
-    as verified only once its tier passes), and only then write the natural Zan
-    code. If the fix is genuinely out
+    case and run just that case (rule 8 — the probe plus the new conformance
+    case IS the verification; a tier run is not required and must not be run
+    by reflex), and only then write the natural Zan code. If the fix is genuinely out
     of scope for the current task, do not silently work around it: record it in
     `TASKS.md` with the probe and the root cause, say so explicitly, and get
     agreement before shipping any temporary shape.
@@ -141,7 +141,7 @@ positive, stated in the commit message.
     tree or index across steps: another session's `git stash pop`, `git reset`,
     or broad `git checkout` can silently overwrite them, which reads as a
     mass-revert of committed features. Commit (and push) each coherent change
-    as soon as its test tier passes. Stash discipline: before any
+    as soon as it is verified (rule 8). Stash discipline: before any
     `git stash`/`push`/`pop`/`apply`, run `git status` — if the tree holds
     another session's in-flight edits or untracked files, isolate your own work
     with a targeted path spec (`git stash push -- <paths>`) or use a separate
@@ -151,8 +151,9 @@ positive, stated in the commit message.
     lines of work must be **merged by hand**: for each conflicted file compare
     both sides (`git show :2:<file>` = committed/HEAD side, `:3:<file>` =
     in-flight side) against HEAD, keep committed features unconditionally, fold
-    in genuinely new work from the other side, verify with the affected test
-    tier, resolve **every** UU entry, and commit. Making the conflict "go away"
+    in genuinely new work from the other side, verify with the narrowest check
+    (rule 8 — probe/single case, not a tier), resolve **every** UU entry, and
+    commit. Making the conflict "go away"
     is forbidden — no bulk one-sided resolves (`git checkout --ours/--theirs .`,
     `git checkout .`), no `git reset --hard`, no deleting the file or copying an
     older version over it: all of those silently revert committed features and

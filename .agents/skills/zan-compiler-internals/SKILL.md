@@ -868,7 +868,10 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - 门控：`--emit-symbols` 恒全量（IDE 索引要完整 stdlib），`ZAN_NO_PULLIN_FILTER=1`
   回退旧行为，`ZAN_PULLIN_DEBUG=1` 打印每个文件的拉入原因（含命中名）。
 - 语义等价验证定式：同一程序 `ZAN_NO_PULLIN_FILTER=1` 开关两态编译运行
-  diff 输出；改拉入逻辑必须补 conformance 用例并跑 smoke+standard。
+  diff 输出；改拉入逻辑必须补 conformance 用例并**单跑该用例**（`ctest -R
+  conformance_<name>`，秒级）。整档 smoke/standard 会把 CPU 打满几十分钟，
+  仅在用户明确要求或发布门槛时跑（AGENTS.md 规则 8），平时探针+单用例即为
+  验证完成，不要默认复读整档。
 - 顺带的实证：**prune 已保证未用代码不进二进制**（关 prune 只多 7KB），
   "using Gui 导致 exe 10MB"是错觉——Gui 窗口 exe 的 1.6MB .text 是
   GuiHost→App/Style/Fx 的活代码闭包 + Zan 运行时，与 unused 无关。

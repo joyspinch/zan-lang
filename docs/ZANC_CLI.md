@@ -200,15 +200,17 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 
 | 层级 | 命令 | 规模/时机 |
 |---|---|---|
-| 单例 | `cd build && ctest -R <name>` | 最窄验证；新增/受影响用例必跑 |
+| 单例 | `cd build && ctest -R <name>` | 最窄验证，秒级；新增/受影响用例必跑 |
 | 按模式 | `scripts/test.ps1 <tier> -Match "<regex>"` | 再收窄一层 |
-| smoke | `scripts/test.ps1 smoke`（75 例） | 编译器/runtime/stdlib 变了才跑 |
-| standard | `scripts/test.ps1 standard`（399 例） | 提交编译器/stdlib/runtime 工作前必须过 |
+| smoke | `scripts/test.ps1 smoke`（75 例） | 仅用户明确要求或发布门槛时跑 |
+| standard | `scripts/test.ps1 standard`（399 例） | 仅用户明确要求时跑 |
 | full | `scripts/test.ps1 full`（1035 例） | 发布门，几十分钟，绝不顺手跑 |
 | 模板门 | `cd build && ctest -R templates_build` | 脚手架全部模板逐一编译 |
 
 纪律（AGENTS.md 规则 8 的命令面）：ctest 不是默认验证步骤——平时直接编
-受影响程序；**测试运行期间不得并行任何构建**（用例共享 build\zanc.exe
+受影响程序、单跑受影响用例（`ctest -R <name>`，秒级）；整档 smoke/standard/
+full 会把 CPU 打满几十分钟，**只在用户明确要求或发布门槛时跑**，小改之后
+不要复读整档。**测试运行期间不得并行任何构建**（用例共享 build\zanc.exe
 与 stdlib stamp，并发构建会让无关用例成批假红）。
 
 ### 新增 conformance 用例的最短路径
