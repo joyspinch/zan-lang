@@ -5097,6 +5097,25 @@ int main(int argc, char **argv) {
         zan_arena_dump_stats();
     }
 
+    /* Codegen manifest: semantic snapshot of the finished module (all
+     * irgen fixpoints complete, optimizer not yet run), opt-in via env so
+     * ordinary builds pay nothing. Stage 3 of the compiler-scale plan:
+     * shard-eligibility audit + deterministic JSON, still one LLVM module. */
+    const char *mf_json_path = getenv("ZAN_CODEGEN_MANIFEST_JSON");
+    if (getenv("ZAN_CODEGEN_MANIFEST") || mf_json_path) {
+        phase("manifest");
+        zan_cg_manifest_t mf;
+        bool mf_native = target.arch == ZAN_ARCH_X86_64 ||
+                         target.arch == ZAN_ARCH_AARCH64;
+        zan_irgen_manifest_build(&irgen, &mf, mf_native);
+        zan_irgen_manifest_report(&irgen, &mf);
+        if (mf_json_path &&
+            zan_irgen_manifest_write_json(&irgen, &mf, mf_json_path) != ZAN_OK)
+            fprintf(stderr, "warning: cannot write codegen manifest '%s'\n",
+                    mf_json_path);
+        zan_irgen_manifest_free(&mf);
+    }
+
     /* The AST, binder and source excerpts are no longer needed by LLVM passes.
      * Keep the few DllImport names read by linker preflight and late pruning in
      * the code-generation arena before releasing the entire frontend graph. */

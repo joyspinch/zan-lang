@@ -753,6 +753,9 @@ struct zan_irgen {
     bool external_async_executor; /* target/runtime capability: omit the inline
                                    * coroutine driver and link the external
                                    * executor object instead. */
+    bool mf_native;           /* codegen-manifest policy: the target is a
+                               * native host (not wasm32/RV32 cross) — set by
+                               * zan_irgen_manifest_build from the driver. */
 
     /* DWARF debug info (opt-in via `zanc -g`). When emit_debug is false these
      * remain NULL and no debug metadata is produced (default/--publish builds
@@ -831,6 +834,49 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit);
 void zan_irgen_emit_string_deobf(zan_irgen_t *g);
 zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path);
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path);
+
+/* ---- codegen manifest (post-fixpoint semantic snapshot) ------------------
+ * Built AFTER zan_irgen_emit (every fixpoint complete) and BEFORE the
+ * optimizer. Read-only over the finished module; carries names and integer
+ * facts only — never a module-local LLVM handle — so a future coordinator
+ * can audit what may leave the single module without extending its
+ * lifetime. The audit applies the stage-4 sharding allowlist and reports
+ * how much defined body would be shard-eligible and how many functions are
+ * "clean roots" (their transitive direct-call closure stays inside
+ * eligible bodies + ARC release helpers). */
+typedef struct zan_mf_fn {
+    const char *name;      /* module-owned LLVM name (alive while g lives) */
+    unsigned    blocks, insns;
+    unsigned char defined, internal_linkage, varargs;
+    unsigned char indirect_call, addr_taken;
+    /* registry facts (kind == user, defined) */
+    unsigned char is_async, is_spec, virtual_dispatch, simple_abi;
+    unsigned char eligible, clean_root;
+    unsigned char kind;    /* ZAN_MF_* from irgen_manifest.c */
+    int reg_idx;           /* index into zan_irgen.functions, or -1 */
+    /* direct-call edges: manifest indices of defined callees; external
+     * callee names and referenced global names (deduped, unsorted) */
+    int        *calls;     int call_cnt, call_cap;
+    const char **exts;     int ext_cnt,  ext_cap;
+    const char **globs;    int glob_cnt, glob_cap;
+} zan_mf_fn;
+
+typedef struct zan_cg_manifest {
+    zan_mf_fn *fns;
+    int fn_count;
+    unsigned long long total_insns;
+    int defined_count, extern_count, global_count;
+} zan_cg_manifest_t;
+
+/* `native` = true when the target is a native host (x64/arm64 Windows,
+ * Linux or macOS), false for wasm32/RV32 cross targets: the allowlist only
+ * admits native-host builds. */
+void zan_irgen_manifest_build(zan_irgen_t *g, zan_cg_manifest_t *m,
+                              bool native);
+void zan_irgen_manifest_report(zan_irgen_t *g, const zan_cg_manifest_t *m);
+int  zan_irgen_manifest_write_json(zan_irgen_t *g, zan_cg_manifest_t *m,
+                                   const char *path);
+void zan_irgen_manifest_free(zan_cg_manifest_t *m);
 
 /* Binds the target triple + data layout to the module early. --publish must
  * call this BEFORE the optimizer runs: with the layout still unset LLVM
