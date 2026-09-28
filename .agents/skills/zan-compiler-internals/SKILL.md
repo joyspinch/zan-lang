@@ -2238,3 +2238,36 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   ole32 链接必炸 `CoInitializeEx`；无 `--auto-stdlib`）——~420 显式输入、
   906 闭包、3.2M IR 指令、峰值 ~1.2GB、`--publish` 后可做
   IDE_RUNNING_OK 启动冒烟，是阶段 3-5 分片/manifest 工作的现成验收器。
+
+## LLVM 文本往返分片的坑：GetValueName 悬垂、平方级打印与元数据门（阶段 4，2026-09-28）
+
+- **LLVMGetValueName 返回的指针在改名瞬间失效**：`LLVMSetValueName2(v, new)`
+  会释放旧名字符串存储，改名后继续用旧 `const char*` 读到的是新名。坑的
+  形状：move 循环先 `GetValueName(orig)` 存下 oname、改名、再
+  `LLVMAddFunction(mod, oname)`——实际传入的是刚写入的 `X.zsh$#N`，撞上
+  已改名的原体被 ValueSymbolTable 自动 unique 成 `X.zsh$#N.NNNN`；之后按
+  干净名 `GetNamedFunction` 永远落空，引用悬垂到链接期才炸 undefined。
+  规则：改名前先 memcpy 进本地缓冲；凡"改 A 的名→用 A 的旧名建 B"都重构
+  为先建 B（验证空闲的一次性名）→RAUW→A 挪临时名→B 才取干净名，每步
+  名字即时核对。
+- **LLVMPrintValueToString 是平方级的**：每次调用为整个 module 构建一遍
+  SlotTracker，逐函数打印 N 个体 = O(成员×模块大小)——IDE 全量（7477 体
+  /211 万指令）逐体打印 331s，占分片总时长 84%。一次性
+  `LLVMPrintModuleToString` 后按 `define` 块切片组装 fragment：331s→5s。
+- **-O2 的 define 头部可以有先于 '@' 的 '('**：优化器给返回类型挂
+  `range(i32 0, N)` 属性，`strchr(line,'(')` 取到属性括号、`@` 在其后，
+  `at < lp` 前置条件把整个 define 毙掉（"body missing from module text"）。
+  先取 `@` 再从其后找 `(`。名字按裸名/引号名分支解析；引号名含转义时查找
+  失败→确定性回退，别硬解转义。
+- **文本往返必须给指令级元数据设门**：-O2 向量化给 load/store/branch 挂
+  `!llvm.loop`/`!llvm.access.group`，fragment 只含体文本不含元数据定义，
+  parse 报 `use of undefined metadata '!0'`。用 `LLVMHasMetadata` 逐体+
+  逐指令检查（IDE 2817 个体被门留在 coordinator），带元数据全局判 BLOCK。
+- **指针键哈希表的迭代序不可再现**：以 LLVMValueRef 指针为键的 decl/travel
+  集合，桶序随堆地址漂移——fragment 里 extern 声明顺序两次运行不同，对象
+  文件不可再现。所有按 map 收集的发射（声明、travel 全局）先收集到数组
+  qsort 按名排序再发射。exe 哈希不可作确定性证据（COFF 时间戳每次不同），
+  比 fragment 文本。
+- **峰值账要记全共存项**：分片窗口峰值=coordinator（原体未删）+shard 解析
+  出的新 module+fragment 文本三者共存，文本往返让峰值 1278MB→2207MB。
+  把内存从一相挪到另一相不算省，验收只看全进程 PeakPagefileUsage。
