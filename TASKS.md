@@ -180,3 +180,9 @@
   同红；桌面会话不受影响）；不改测试语义让它无桌面假绿。另 standard 全量
   并行跑时有 4 测偶红（async_try_exit_depth/mqtt_loopback/win_tray_screen_smoke/
   gui_datatable_ctxmenu_selection），单测复跑双配置均绿，判并行资源抖动非回归。
+
+## 通讯安全余量（2026-09-28）
+
+- [ ] **B-NET1** Windows/macOS 的默认 HTTPS/WSS 客户端缺系统链策略桥接，当前无显式 `AddTrustedCert` 会失败关闭。不能仅枚举 ROOT/keychain：那会丢弃系统拒绝列表、用途与吊销策略。需以收到的原始 DER 链和预期主机名调用 Crypt32 SSL 链策略 / macOS SecTrust，并保留 TLS 握手签名、Finished 与 pin 校验；回归覆盖受信任、错误主机、受禁根、过期和平台 API 不可用。
+- [ ] **B-NET2** 自研 X.509 链验证尚无吊销检查或完整 RFC 5280 路径构建；非关键 nameConstraints 与重复扩展已拒绝，带 pathLenConstraint 的 CA 仍被解析器失败关闭。`security_x509_extensions` 与 `tls_auth_chain` 仅覆盖所支持链形；需定义 CRL/OCSP 的离线及网络超时策略、路径约束处理，增加中间 CA、撤销/未知状态和路径长度回归，在此之前不得声称完整 PKIX 验证。
+- [ ] **B-NET3** TLS 对端证书目前仅支持 RSA/SHA-256，ECDSA/EdDSA 与其他证书签名方案失败关闭；IPv6 iPAddress SAN、IDNA 规范化亦未覆盖。按目标平台扩展证书与握手签名算法、规范化主机名并做跨实现握手与 SAN 用例，不能靠关闭验证解决互通。
