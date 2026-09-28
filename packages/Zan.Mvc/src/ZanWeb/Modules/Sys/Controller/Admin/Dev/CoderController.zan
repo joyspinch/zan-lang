@@ -803,26 +803,46 @@ class CoderController : AdminController {
         if (cols.Count == 0) { this.Fail(400, "0004", "先添加字段"); }
         if (!Gen.Valid(t, cols)) { this.Fail(400, "0004", "表或字段设计不合法"); }
 
-        /* 服务器从 build/ 运行，待重建源码在其上一级；gen.root 说明不同部署布局下的路径。 */
-        string root = await Settings.Get(SettingKeys.GenRoot, "..");
-        /* gen.root 下层级全部不存在也要能建出来（CreateDirectory 只建一层）。 */
-        Directory.CreateDirectoryRecursive(root + "/src/Model/Gen");
-        Directory.CreateDirectoryRecursive(root + "/src/Controller/Admin");
-        Directory.CreateDirectoryRecursive(root + "/src/Controller/Front");
-        Directory.CreateDirectoryRecursive(root + "/src/Dao/Gen");
-        Directory.CreateDirectoryRecursive(root + "/views/Admin");
-        Directory.CreateDirectoryRecursive(root + "/views/Front");
+        /* gen.root 相对当前服务工作目录解释（开发时从 build/ 运行，".." 即项目根）；
+           生产发布目录没有 src/views 布局，必须在站点设置里配置真实源码根目录。 */
+        string root = (await Settings.Get(SettingKeys.GenRoot, "..")).Trim();
+        if (root.Length == 0) {
+            this.Fail(400, "0004", "未配置源码目录，请在站点设置的「开发」中填写 gen.root");
+            return;
+        }
+        if (!Directory.ExistsOnDisk(root + "/src")
+            || !Directory.ExistsOnDisk(root + "/views")) {
+            this.Fail(400, "0004", "gen.root 不是应用源码根目录（需要已有 src 和 views）："
+                + root + "；请在站点设置的「开发」中配置");
+            return;
+        }
+        string modelDir = root + "/src/Model/Gen";
+        string adminDir = root + "/src/Controller/Admin";
+        string frontDir = root + "/src/Controller/Front";
+        string daoDir = root + "/src/Dao/Gen";
+        string adminViewDir = root + "/views/Admin";
+        string frontViewDir = root + "/views/Front";
+        try {
+            Directory.CreateDirectoryRecursive(modelDir);
+            Directory.CreateDirectoryRecursive(adminDir);
+            Directory.CreateDirectoryRecursive(frontDir);
+            Directory.CreateDirectoryRecursive(daoDir);
+            Directory.CreateDirectoryRecursive(adminViewDir);
+            Directory.CreateDirectoryRecursive(frontViewDir);
+        } catch (Exception ex) {
+            this.Fail(500, "2001", "无法创建源码目录（gen.root=" + root + "）：" + ex.Message);
+            return;
+        }
         /* Directory=URL 前缀，file=class+Controller=route 段落=view 键段，生成表与手写表同构。 */
-        string modelPath = root + "/src/Model/Gen/" + t.entityName + ".zan";
-        string ctlPath = root + "/src/Controller/Admin/" + t.entityName + "Controller.zan";
-        string daoPath = root + "/src/Dao/Gen/" + t.entityName + "Dao.zan";
-        string listPath = root + "/views/Admin/" + t.entityName + "Controller.Index.html";
-        string formPath = root + "/views/Admin/" + t.entityName + "Controller.Form.html";
-        string frontCtlPath = root + "/src/Controller/Front/" + t.entityName
-            + "FrontController.zan";
-        string frontListPath = root + "/views/Front/" + t.entityName
+        string modelPath = modelDir + "/" + t.entityName + ".zan";
+        string ctlPath = adminDir + "/" + t.entityName + "Controller.zan";
+        string daoPath = daoDir + "/" + t.entityName + "Dao.zan";
+        string listPath = adminViewDir + "/" + t.entityName + "Controller.Index.html";
+        string formPath = adminViewDir + "/" + t.entityName + "Controller.Form.html";
+        string frontCtlPath = frontDir + "/" + t.entityName + "FrontController.zan";
+        string frontListPath = frontViewDir + "/" + t.entityName
             + "FrontController.Index.html";
-        string frontShowPath = root + "/views/Front/" + t.entityName
+        string frontShowPath = frontViewDir + "/" + t.entityName
             + "FrontController.Show.html";
         List<string> paths = new List<string>();
         paths.Add(modelPath); paths.Add(ctlPath); paths.Add(daoPath);
@@ -831,6 +851,7 @@ class CoderController : AdminController {
         for (int i = 0; i < paths.Count; i = i + 1) {
             if (File.Exists(paths[i]) || Directory.ExistsOnDisk(paths[i])) {
                 this.Fail(409, "0004", "生成目标已存在，拒绝覆盖：" + paths[i]);
+                return;
             }
         }
         List<string> sources = new List<string>();
@@ -845,17 +866,19 @@ class CoderController : AdminController {
         try {
             CoderController.WriteSources(paths, sources);
         } catch (Exception ex) {
-            this.Fail(500, "2001", "生成文件失败：" + ex.Message);
+            this.Fail(500, "2001", "生成文件失败（gen.root=" + root + "）：" + ex.Message);
+            return;
         }
 
-        /* Do not hide the generic data screen until the generated route is deployed. */
+        /* 生成文件尚未编译部署，通用数据入口仍须保留。 */
         await this.Note("生成代码", t.tableName, true, ctlPath);
-        this.Saved("已生成 8 个文件（模型/后台控制器/Dao/后台视图×2"
-            + "/前台控制器/前台视图×2），重新编译后生效");
+        this.Saved("已生成 8 个文件到 " + root
+            + "（模型/后台控制器/Dao/后台视图×2/前台控制器/前台视图×2），"
+            + "请将源码纳入工程并重新编译后生效");
     }
 
-    /* 先将全部内容写到同目录随机临时文件，再以硬链接独占发布。
-       硬链接创建在目标已存在时失败，且目标只会看到写完的内容。 */
+    /* 先写同目录临时文件，再用硬链接独占发布；普通 rename 在部分平台
+       会覆盖并发创建的目标，不能用于这里的拒绝覆盖契约。 */
     static void WriteSources(List<string> paths, List<string> sources) {
         if (paths.Count != sources.Count) { throw new Exception("生成文件数不一致"); }
         string token = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);

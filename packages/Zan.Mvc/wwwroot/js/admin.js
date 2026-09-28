@@ -734,7 +734,19 @@
       body: body || ''
     }).then(function (r) {
       if (r.status === 401) { location.href = '/admin/login'; return null; }
-      return r.json();
+      return r.text().then(function (raw) {
+        var j = null;
+        if (raw) {
+          try { j = JSON.parse(raw); } catch (e) { j = null; }
+        }
+        if (!r.ok) {
+          var detail = j && j.msg ? j.msg : (raw || '服务器未返回错误详情');
+          if (detail.length > 240) { detail = detail.slice(0, 240) + '…'; }
+          throw new Error('HTTP ' + r.status + '：' + detail);
+        }
+        if (!j) { throw new Error('服务器返回了无法解析的响应'); }
+        return j;
+      });
     });
   }
 
@@ -782,9 +794,9 @@
         return;
       }
       toast(j.msg || '保存失败', 'bad');
-    }).catch(function () {
+    }).catch(function (e) {
       if (btn) { btn.disabled = false; btn.textContent = originText || '保存'; }
-      toast('请求失败', 'bad');
+      toast(e && e.message ? e.message : '请求失败', 'bad');
     });
   }
 
@@ -1607,7 +1619,7 @@
             closeDialog();
             reload(true);
           })
-          .catch(function () { toast('请求失败', 'bad'); });
+          .catch(function (e) { toast(e && e.message ? e.message : '请求失败', 'bad'); });
       };
       var batchConfirm = bt.getAttribute('data-confirm');
       if (batchConfirm) { Layer.confirm(batchConfirm, runBatch); } else { runBatch(); }
@@ -1643,7 +1655,7 @@
             closeDialog();
             reload(true);
           })
-          .catch(function () { toast('请求失败', 'bad'); });
+          .catch(function (e) { toast(e && e.message ? e.message : '请求失败', 'bad'); });
       };
       var confirmText = p.getAttribute('data-confirm');
       if (confirmText) { Layer.confirm(confirmText, run); } else { run(); }
