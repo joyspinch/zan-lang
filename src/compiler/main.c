@@ -272,6 +272,77 @@ typedef struct {
 static input_key_t *input_keys = NULL;
 static int input_key_count = 0;
 static int input_key_cap = 0;
+/* Open-addressing index over input_keys (slots hold array indices, -1 =
+ * empty): the flat scan made every candidate's presence check linear in the
+ * accumulated input count, so a 1000-file stdlib pull-in cost ~O(K^2)
+ * canonical-key strcmp calls at start-up. Hash over the canonical key bytes
+ * is consistent with the strcmp equality used below. */
+static int *input_key_idx = NULL;
+static int input_key_idx_cap = 0; /* power of two, 0 = not built yet */
+#ifndef _WIN32
+/* Same lookup for the POSIX (dev,ino) duplicate fallback: a symlink or
+ * hardlink whose canonical path differs from an already-listed file. */
+static int *input_ino_idx = NULL;
+static int input_ino_idx_cap = 0;
+#endif
+
+static uint64_t input_hash_str(const char *s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (; *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+#ifndef _WIN32
+static uint64_t input_hash_ino(dev_t dev, ino_t ino) {
+    uint64_t h = (uint64_t)dev;
+    h = h * 0x9E3779B97F4A7C15ULL + (uint64_t)ino;
+    h ^= h >> 29;
+    h *= 0xBF58476D1CE4E5B9ULL;
+    h ^= h >> 32;
+    return h;
+}
+#endif
+
+static void input_key_idx_rehash(int ncap) {
+    int *grown = (int *)malloc((size_t)ncap * sizeof(*grown));
+    if (!grown) {
+        fprintf(stderr, "error: out of memory tracking input files\n");
+        exit(1);
+    }
+    for (int i = 0; i < ncap; i++) grown[i] = -1;
+    for (int i = 0; i < input_key_count; i++) {
+        size_t j = (size_t)input_hash_str(input_keys[i].key) & (size_t)(ncap - 1);
+        while (grown[j] >= 0) j = (j + 1) & (size_t)(ncap - 1);
+        grown[j] = i;
+    }
+    free(input_key_idx);
+    input_key_idx = grown;
+    input_key_idx_cap = ncap;
+}
+
+#ifndef _WIN32
+static void input_ino_idx_rehash(int ncap) {
+    int *grown = (int *)malloc((size_t)ncap * sizeof(*grown));
+    if (!grown) {
+        fprintf(stderr, "error: out of memory tracking input files\n");
+        exit(1);
+    }
+    for (int i = 0; i < ncap; i++) grown[i] = -1;
+    for (int i = 0; i < input_key_count; i++) {
+        if (!input_keys[i].have_stat) continue;
+        size_t j = (size_t)input_hash_ino(input_keys[i].dev,
+                                          input_keys[i].ino) & (size_t)(ncap - 1);
+        while (grown[j] >= 0) j = (j + 1) & (size_t)(ncap - 1);
+        grown[j] = i;
+    }
+    free(input_ino_idx);
+    input_ino_idx = grown;
+    input_ino_idx_cap = ncap;
+}
+#endif
 
 static void input_key_add(const char *path) {
     if (input_key_count == input_key_cap) {
@@ -299,23 +370,47 @@ static void input_key_add(const char *path) {
     e->have_stat = stat(path, &st) == 0;
     if (e->have_stat) { e->dev = st.st_dev; e->ino = st.st_ino; }
 #endif
+    if ((input_key_count + 1) * 2 >= input_key_idx_cap)
+        input_key_idx_rehash(input_key_idx_cap ? input_key_idx_cap * 2 : 64);
+    size_t j = (size_t)input_hash_str(e->key) & (size_t)(input_key_idx_cap - 1);
+    while (input_key_idx[j] >= 0) j = (j + 1) & (size_t)(input_key_idx_cap - 1);
+    input_key_idx[j] = input_key_count - 1;
+#ifndef _WIN32
+    if (e->have_stat) {
+        if ((input_key_count + 1) * 2 >= input_ino_idx_cap)
+            input_ino_idx_rehash(input_ino_idx_cap ? input_ino_idx_cap * 2 : 64);
+        size_t ij = (size_t)input_hash_ino(e->dev, e->ino)
+                    & (size_t)(input_ino_idx_cap - 1);
+        while (input_ino_idx[ij] >= 0) ij = (ij + 1) & (size_t)(input_ino_idx_cap - 1);
+        input_ino_idx[ij] = input_key_count - 1;
+    }
+#endif
 }
 
 static int input_file_present(const char *cand) {
     char ck[1024];
     canon_key(cand, ck, sizeof(ck));
+    if (input_key_idx_cap) {
+        size_t j = (size_t)input_hash_str(ck) & (size_t)(input_key_idx_cap - 1);
+        while (input_key_idx[j] >= 0) {
+            if (strcmp(ck, input_keys[input_key_idx[j]].key) == 0) return 1;
+            j = (j + 1) & (size_t)(input_key_idx_cap - 1);
+        }
+    }
 #ifndef _WIN32
     struct stat cand_stat;
     int have_cand_stat = stat(cand, &cand_stat) == 0;
-#endif
-    for (int i = 0; i < input_key_count; i++) {
-        if (strcmp(ck, input_keys[i].key) == 0) return 1;
-#ifndef _WIN32
-        if (have_cand_stat && input_keys[i].have_stat &&
-            cand_stat.st_dev == input_keys[i].dev &&
-            cand_stat.st_ino == input_keys[i].ino) return 1;
-#endif
+    if (have_cand_stat && input_ino_idx_cap) {
+        size_t j = (size_t)input_hash_ino(cand_stat.st_dev, cand_stat.st_ino)
+                   & (size_t)(input_ino_idx_cap - 1);
+        while (input_ino_idx[j] >= 0) {
+            input_key_t *e = &input_keys[input_ino_idx[j]];
+            if (e->have_stat && e->dev == cand_stat.st_dev &&
+                e->ino == cand_stat.st_ino) return 1;
+            j = (j + 1) & (size_t)(input_ino_idx_cap - 1);
+        }
     }
+#endif
     return 0;
 }
 
