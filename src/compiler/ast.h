@@ -435,16 +435,16 @@ struct zan_ast_node {
             zan_ast_list_t type_params;
             zan_ast_node_t *body;
             uint32_t modifiers;
-            zan_istr_t extern_lib;   /* DllImport library name, {NULL,0} if none */
-            zan_istr_t *entry_point; /* DllImport entry point override, NULL if none */
             bool is_variadic;        /* [DllImport(..., Variadic = true)]: the C
                                       * callee is varargs, so a call may pass more
                                       * arguments than the declared parameters */
+            bool has_base_init;     /* constructor declared a `: base(...)` initializer */
+            bool has_this_init;
+            bool is_task_return;    /* declared Task/Task<T>/ValueTask<T> before async desugaring */
+            zan_istr_t extern_lib;   /* DllImport library name, {NULL,0} if none */
+            zan_istr_t *entry_point; /* DllImport entry point override, NULL if none */
             zan_ast_list_t where_clauses; /* AST_WHERE_CLAUSE generic constraints */
             zan_ast_list_t base_args;  /* constructor `: base(...)` argument exprs */
-            bool has_base_init;        /* constructor declared a `: base(...)` initializer */
-            bool has_this_init;
-            bool is_task_return;       /* declared Task/Task<T>/ValueTask<T> before async desugaring */
         } method_decl;
 
         /* field */

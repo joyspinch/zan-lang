@@ -1169,7 +1169,9 @@ static void own_written_param(zan_irgen_t *g, local_scope_t *locals,
     arc_own_local(g, locals);
 }
 
-static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
+static method_body_work_t *declare_user_methods(zan_irgen_t *g,
+                                                 zan_ast_node_t *unit,
+                                                 int *out_work_count) {
     /* Discover every concrete instantiation of a user generic class up front so
      * Pass A can emit one specialized variant per instantiation (in addition to
      * the erased variant). */
@@ -1622,8 +1624,43 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         free(variants);
     }
 
-    /* Pass B: emit every deferred body now that all functions are declared. */
+    *out_work_count = work_count;
+    return work;
+}
+
+/* LLVM use edges give a conservative pre-body reachability graph: all call
+ * targets, method groups, constructor references and vtables are registered
+ * before this pass. A declaration used by a live function must have its body
+ * emitted; inspecting users of dead functions would bring the whole module
+ * back. Globals (reflection tables, static delegates, vtables) can reference
+ * functions indirectly, so their edges are always treated as live. */
+static bool body_has_live_use(LLVMValueRef fn, method_body_work_t *work,
+                              const unsigned char *live, int work_count) {
+    for (LLVMUseRef u = LLVMGetFirstUse(fn); u; u = LLVMGetNextUse(u)) {
+        LLVMValueRef user = LLVMGetUser(u);
+        /* A constant expression/aggregate may sit between the function and
+         * the instruction/global that ultimately consumes its address. Do not
+         * infer deadness from that intermediate node. */
+        if (LLVMIsAConstantExpr(user) || LLVMIsAConstantArray(user) ||
+            LLVMIsAConstantStruct(user)) return true;
+        LLVMValueRef parent = LLVMIsAInstruction(user)
+            ? LLVMGetBasicBlockParent(LLVMGetInstructionParent(user)) : NULL;
+        if (!parent) return true;
+        int i = 0;
+        for (; i < work_count; i++)
+            if (work[i].fn == parent || work[i].resume_fn == parent) break;
+        if (i == work_count || live[i] == 2) return true;
+    }
+    return false;
+}
+
+static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
+                                    int work_count, unsigned char *live) {
+    /* Pass B: emit the newly reachable bodies, then rescan their outgoing
+     * edges before beginning another batch. 2 means its IR now exists. */
     for (int w = 0; w < work_count; w++) {
+        if (live[w] != 1) continue;
+        live[w] = 2;
         zan_ast_node_t *member = work[w].member;
         zan_symbol_t *type_sym = work[w].type_sym;
         zan_compile_trace("emit %.*s.%.*s",
@@ -1903,8 +1940,6 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
     }
 
     g->cur_inst = NULL;
-    free(work);
-    emit_pending_method_specs(g);
 }
 
 /* ---- method-level monomorphization (bodies for zan_method_spec) ----
@@ -2577,15 +2612,32 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
         }
     }
 
-    /* Pass 2: emit user-defined methods */
-    emit_user_methods(g, unit);
+    /* Pass 2A: register every method/ctor before the entry and its static
+     * initializers emit calls. Only publish-mode stdlib bodies may wait for
+     * the resulting use graph; all other bodies are lowered immediately. */
+    int work_count = 0;
+    method_body_work_t *work = declare_user_methods(g, unit, &work_count);
+    if (zan_diag_has_errors(g->diag)) { free(work); return ZAN_ERROR; }
 
-    /* An error here already dooms the build (see the check before finalize), so
-     * stopping now cannot change the outcome -- it only avoids carrying a
-     * half-emitted body into the synthetic passes below. Those walk the module
-     * assuming every function, vtable slot and reflection record it references
-     * exists, so a failed body turns a reported error into a compiler crash. */
-    if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
+    /* Ordinary and IR-inspection builds must expose uncalled bodies too: some
+     * diagnostics are issued only during lowering. Keep user-authored bodies
+     * even in publish mode so dead user code cannot hide an error. The publish
+     * flag is set before emission; optimization level is chosen afterward. */
+    bool prune_stdlib_bodies = g->obfuscate_strings && !g->emit_debug;
+    unsigned char *live = (unsigned char *)calloc((size_t)work_count + 1, 1);
+    for (int w = 0; w < work_count; w++) {
+        zan_symbol_t *owner = work[w].type_sym;
+        if (!prune_stdlib_bodies || !owner || !owner->decl ||
+            !owner->decl->from_stdlib)
+            live[w] = 1;
+    }
+    emit_user_method_bodies(g, work, work_count, live);
+    emit_pending_method_specs(g);
+    if (zan_diag_has_errors(g->diag)) {
+        free(live);
+        free(work);
+        return ZAN_ERROR;
+    }
 
     /* Pass 3: find and emit static Main method. An explicit user Main wins
      * regardless of which input declared it; when no input has one, the
@@ -2641,8 +2693,65 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     }
 done:
     ;
-    /* Main may have created method specializations too. */
+    /* Main and static initializers can instantiate generic methods. Their
+     * specialized bodies contribute calls to ordinary methods as well. */
     emit_pending_method_specs(g);
+    if (zan_diag_has_errors(g->diag)) {
+        free(live);
+        free(work);
+        return ZAN_ERROR;
+    }
+
+    /* Vtable slots can be reached by indirect dispatch even when no direct
+     * call instruction names their implementation. Register these edges now,
+     * before asking which stdlib bodies can safely be omitted. */
+    if (prune_stdlib_bodies) emit_vtables(g);
+    int pending;
+    do {
+        pending = 0;
+        for (int w = 0; w < work_count; w++) {
+            if (live[w]) continue;
+            zan_ast_node_t *member = work[w].member;
+            /* A library's public methods are entry points for external
+             * clients. Reflection emits late-bound thunks for whole method
+             * tables: when any live code uses it, retain every method rather
+             * than rely on incomplete pre-finalization table edges. */
+            bool root = (g->emit_lib &&
+                         ((member->method_decl.modifiers & MOD_PUBLIC) ||
+                          member->kind == AST_CONSTRUCTOR_DECL)) ||
+                        g->refl_used;
+            if (!root)
+                root = body_has_live_use(work[w].fn, work, live, work_count);
+            if (root) { live[w] = 1; pending++; }
+        }
+        if (pending) {
+            emit_user_method_bodies(g, work, work_count, live);
+            emit_pending_method_specs(g);
+            if (zan_diag_has_errors(g->diag)) break;
+        }
+    } while (pending);
+    for (int w = 0; w < work_count; w++) {
+        if (live[w]) continue;
+        free(work[w].param_types);
+        /* LLVM rejects an internal declaration without a definition. Keep
+         * a one-block unreachable definition until GlobalDCE discards it;
+         * this allocates no body IR, and also leaves function registries
+         * pointing at valid values during reflection/ARC finalization. */
+        LLVMValueRef fn = work[w].fn;
+        if (LLVMIsDeclaration(fn)) {
+            LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "dead");
+            LLVMPositionBuilderAtEnd(g->builder, bb);
+            LLVMBuildUnreachable(g->builder);
+        }
+        fn = work[w].resume_fn;
+        if (fn && LLVMIsDeclaration(fn)) {
+            LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "dead");
+            LLVMPositionBuilderAtEnd(g->builder, bb);
+            LLVMBuildUnreachable(g->builder);
+        }
+    }
+    free(live);
+    free(work);
     if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
     /* Synthesise per-class release functions now that every class type has
      * been registered (Pass 1) and referenced (Passes 2/3). */
@@ -2654,7 +2763,7 @@ done:
     /* descriptor builds fill the per-shape records instead of the three
      * tables above (which no-op there); needs every destructor declared */
     zan_irgen_emit_arc_desc_init(g);
-    emit_vtables(g);
+    if (!prune_stdlib_bodies) emit_vtables(g);
     /* Reflected method/constructor tables: their records point at the real
      * functions and at thunks over them, so they can only be filled in once
      * every function, specialization and vtable above exists. */

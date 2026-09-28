@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-_Static_assert(sizeof(zan_ast_node_t) <= 224, "AST node layout regressed");
+_Static_assert(sizeof(zan_ast_node_t) <= 208, "AST node layout regressed");
 
 static size_t g_ast_node_count;
 

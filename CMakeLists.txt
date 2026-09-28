@@ -1835,6 +1835,16 @@ set_tests_properties(gen_cache_isolation PROPERTIES
   TIMEOUT 240
   LABELS "full;standard;smoke")
 
+add_test(NAME compiler_dead_method_pre_ir
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/dead_method_pre_ir.zan
+    -DWORKDIR=${CMAKE_SOURCE_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_dead_method_pre_ir.cmake)
+set_tests_properties(compiler_dead_method_pre_ir PROPERTIES
+  TIMEOUT 120
+  LABELS "full;standard;smoke")
+
 # ---- Leak detection: run each program under --check-leaks, fail on leaks ----
 # The --check-leaks build tracks rc-managed allocations and reports any object
 # still reachable at exit. Programs known to leak (rc objects owned by arrays,
