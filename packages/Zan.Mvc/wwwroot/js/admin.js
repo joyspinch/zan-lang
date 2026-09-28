@@ -100,17 +100,22 @@
       var b = document.createElement('span');
       b.className = 'ad-tab' + (t.path === state.active ? ' active' : '');
       b.title = t.path;
-      var label = document.createElement('span');
+      var label = document.createElement('button');
+      label.type = 'button';
+      label.className = 'ad-tab-label';
+      if (t.path === state.active) { label.setAttribute('aria-current', 'page'); }
       label.textContent = t.title || t.path;
       b.appendChild(label);
       if (state.tabs.length > 1) {
-        var x = document.createElement('span');
+        var x = document.createElement('button');
+        x.type = 'button';
         x.className = 'x';
         x.textContent = '×';
+        x.setAttribute('aria-label', '关闭 ' + (t.title || t.path));
         x.onclick = function (ev) { ev.stopPropagation(); close(t.path); };
         b.appendChild(x);
       }
-      b.onclick = function () { open(t.path, t.title); };
+      label.onclick = function () { open(t.path, t.title); };
       b.oncontextmenu = function (ev) { ev.preventDefault(); tabMenu(ev, t); };
       tabs.appendChild(b);
     });
@@ -279,7 +284,8 @@
         return r.text();
       })
       .then(function (html) {
-        if (html === '' || seq !== loadSeq) { return; }
+        if (seq !== loadSeq) { return; }
+        if (html === '') { throw new Error('empty fragment'); }
         panel.innerHTML = html;
         panel.removeAttribute('aria-busy');
         // A quiet refresh (after a dialog write) is in place: the list the
@@ -293,7 +299,10 @@
       .catch(function (err) {
         if (seq !== loadSeq || err.name === 'AbortError') { return; }
         panel.removeAttribute('aria-busy');
-        toast('页面加载失败', 'bad');
+        panel.innerHTML = '<div class="panel-error" role="alert"><h2>页面加载失败</h2>' +
+          '<p>当前页面暂时无法显示，请检查网络或稍后重试。</p>' +
+          '<button type="button" class="btn primary" data-refresh>重新加载</button></div>';
+        panel.scrollTop = 0;
       });
   }
 
@@ -313,6 +322,16 @@
       var s = document.createElement('script');
       s.textContent = old.textContent;
       old.replaceWith(s);
+    });
+    syncSettingExtras(root);
+  }
+
+  function syncSettingExtras(root) {
+    if (!root) { return; }
+    var active = root.querySelector('[data-setting-tabs] [data-pane].on');
+    if (!active) { return; }
+    root.querySelectorAll('[data-pane-extra]').forEach(function (card) {
+      card.hidden = card.getAttribute('data-pane-extra') !== active.getAttribute('data-pane');
     });
   }
 
@@ -417,8 +436,10 @@
       box.style.zIndex = ++zTop;
       mask.style.zIndex = zTop;
       if (opts.width && window.innerWidth > 768) {
-        var want = parseInt(opts.width, 10) || 0;
-        box.style.width = Math.min(want, window.innerWidth - 24) + 'px';
+        var want = String(opts.width).trim();
+        box.style.width = /^\d+(?:\.\d+)?px$/.test(want)
+          ? Math.min(parseFloat(want), window.innerWidth - 24) + 'px'
+          : want;
       }
 
       var head = node('header');
@@ -573,7 +594,9 @@
         var card = node('div', 'notice ' + (kind || 'ok'));
         card.appendChild(node('div', 'nt', title));
         if (text) { card.appendChild(node('div', 'nb', text)); }
-        var x = node('span', 'x', '×');
+        var x = node('button', 'x', '×');
+        x.type = 'button';
+        x.setAttribute('aria-label', '关闭通知');
         x.onclick = function () { card.remove(); };
         card.appendChild(x);
         host.appendChild(card);
@@ -784,16 +807,22 @@
     if (!host) { return; }
     var gen = ++streamGen;
     var url = host.getAttribute('data-stream');
+    host.setAttribute('data-stream-status', 'connecting');
     stream = new EventSource(url);
     stream.addEventListener('metrics', function (ev) {
       if (gen !== streamGen) { return; }
-      try { paintSnapshot(JSON.parse(ev.data)); } catch (e) { toast('实时数据格式错误', 'bad'); }
+      try {
+        paintSnapshot(JSON.parse(ev.data));
+        host.setAttribute('data-stream-status', 'connected');
+      } catch (e) { toast('实时数据格式错误', 'bad'); }
     });
     stream.addEventListener('series', function (ev) {
       if (gen !== streamGen) { return; }
       try { paintSeries(JSON.parse(ev.data)); } catch (e) { toast('实时序列格式错误', 'bad'); }
     });
-    stream.onerror = function () { /* EventSource retries by itself */ };
+    stream.onerror = function () {
+      if (gen === streamGen) { host.setAttribute('data-stream-status', 'disconnected'); }
+    };
     wireTopSort();
     startDay(host.getAttribute('data-day'), gen);
   }
@@ -812,9 +841,18 @@
     if (!url) { return; }
     var tick = function () {
       fetch(url, { credentials: 'same-origin' })
-        .then(function (r) { return r.ok ? r.json() : null; })
-        .then(function (j) { if (j && gen === streamGen) { paintDay(j); } })
-        .catch(function () { /* the next tick tries again */ });
+        .then(function (r) { if (!r.ok) { throw new Error('day metrics'); } return r.json(); })
+        .then(function (j) {
+          if (gen !== streamGen) { return; }
+          paintDay(j);
+          var host = panelEl() && panelEl().querySelector('[data-stream]');
+          if (host) { host.setAttribute('data-day-status', 'connected'); }
+        })
+        .catch(function () {
+          if (gen !== streamGen) { return; }
+          var host = panelEl() && panelEl().querySelector('[data-stream]');
+          if (host) { host.setAttribute('data-day-status', 'disconnected'); }
+        });
     };
     tick();
     dayTimer = setInterval(tick, 60000);
@@ -882,6 +920,11 @@
         th.setAttribute('data-label', th.textContent);
       }
       th.style.cursor = 'pointer';
+      th.setAttribute('role', 'button');
+      th.tabIndex = 0;
+      th.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); th.click(); }
+      });
       th.addEventListener('click', function () {
         var key = th.getAttribute('data-sort');
         // Same column again reverses it; a new column starts descending,
@@ -901,6 +944,7 @@
       var label = th.getAttribute('data-label') || th.textContent;
       var on = th.getAttribute('data-sort') === topSort.key;
       th.textContent = label + (on ? (topSort.dir < 0 ? ' \u2193' : ' \u2191') : '');
+      th.setAttribute('aria-sort', on ? (topSort.dir < 0 ? 'descending' : 'ascending') : 'none');
     });
   }
 
@@ -1229,18 +1273,16 @@
       if (el.getAttribute && el.getAttribute('data-quick-field')
           && ev.key === 'Enter') { el.blur(); }
     });
-    table.addEventListener('focusin', function (ev) {
-      var el = ev.target;
-      if (el.getAttribute && el.getAttribute('data-quick-field')
-          && el.type !== 'checkbox') {
-        el.setAttribute('data-prev', el.value);
-      }
-    });
     table.addEventListener('change', function (ev) {
       var el = ev.target;
       if (!el.getAttribute || !el.getAttribute('data-quick-field')
           || !el.getAttribute('data-id')) { return; }
+      if (el.disabled) { return; }
       var value = el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value;
+      var committed = el.getAttribute('data-prev');
+      if (committed === null) { committed = value; }
+      if (value === committed) { return; }
+      el.disabled = true;
       fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -1249,19 +1291,20 @@
           field: el.getAttribute('data-quick-field'),
           value: value
         }).toString()
-      }).then(function (r) { return r.json(); }).then(function (j) {
-        if (j.code === '0000') { el.setAttribute('data-prev', value); return; }
+      }).then(function (r) { if (!r.ok) { throw new Error('保存失败'); } return r.json(); }).then(function (j) {
+        if (j && j.code === '0000') { el.setAttribute('data-prev', value); return; }
         revertQuick(el);
-        Layer.msg(j.msg || '保存失败', 'bad');
+        Layer.msg((j && j.msg) || '保存失败', 'bad');
       }).catch(function () {
         revertQuick(el);
         Layer.msg('网络错误，修改未保存', 'bad');
-      });
+      }).then(function () { el.disabled = false; });
     });
   }
   function revertQuick(el) {
-    if (el.type === 'checkbox') { el.checked = !el.checked; return; }
-    el.value = el.getAttribute('data-prev') || el.value;
+    var prev = el.getAttribute('data-prev');
+    if (el.type === 'checkbox') { el.checked = prev === '1'; return; }
+    if (prev !== null) { el.value = prev; }
   }
 
   // A template cannot write `selected` on the right <option>, so a select that
@@ -1271,13 +1314,17 @@
     // 表格增强（排序/筛选/选择/密度）先跑：纯 DOM 重排，不动节点身份，
     // 后面的脚本重放与委托事件都不受影响。
     if (window.ZanTable) { ZanTable.wire(root); }
-    wireInlineEdit(root);
     wirePick(root);
     var sels = root.querySelectorAll('select[data-value]');
     for (var i = 0; i < sels.length; i++) {
       var v = sels[i].getAttribute('data-value');
       if (v) { sels[i].value = v; }
     }
+    root.querySelectorAll('table[data-quick] [data-quick-field]').forEach(function (control) {
+      control.setAttribute('data-prev', control.type === 'checkbox'
+        ? (control.checked ? '1' : '0') : control.value);
+    });
+    wireInlineEdit(root);
     var tabs = root.querySelectorAll('[data-code]');
     for (var t = 0; t < tabs.length; t++) {
       tabs[t].addEventListener('click', function () {
@@ -1316,6 +1363,7 @@
         menu.hidden = true;
         pick.appendChild(menu);
         var timer = null;
+        var querySeq = 0;
         function close() { menu.hidden = true; }
         function fetchUrl(params) {
           return url + (url.indexOf('?') >= 0 ? '&' : '?') + params;
@@ -1344,21 +1392,28 @@
           }
           menu.hidden = false;
         }
+        function showError() {
+          menu.innerHTML = '<div class="pick-none" role="status">加载失败，请重新输入搜索词重试</div>';
+          menu.hidden = false;
+        }
         function apply(j, many) {
-          if (!j || j.code !== '0000' || !j.data) { render([]); return; }
+          if (!j || j.code !== '0000') { showError(); return; }
           /* data 是真正的数组/对象；也兼容被序列化成字符串的旧契约。 */
           var parsed = j.data;
           if (typeof parsed === 'string') {
-            try { parsed = JSON.parse(parsed); } catch (e) { render([]); return; }
+            try { parsed = JSON.parse(parsed); } catch (e) { showError(); return; }
           }
           render(many ? (parsed || []) : (parsed && parsed.id ? [parsed] : []));
         }
         function query(kw) {
+          var seq = ++querySeq;
+          menu.innerHTML = '<div class="pick-none" role="status">加载中…</div>';
+          menu.hidden = false;
           fetch(fetchUrl('kw=' + encodeURIComponent(kw)),
                 { credentials: 'same-origin' })
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (j) { apply(j, true); })
-            .catch(function () { close(); });
+            .then(function (r) { if (!r.ok) { throw new Error('pick'); } return r.json(); })
+            .then(function (j) { if (seq === querySeq) { apply(j, true); } })
+            .catch(function () { if (seq === querySeq) { showError(); } });
         }
         box.addEventListener('input', function () {
           hidden.value = '';
@@ -1726,6 +1781,7 @@
     // runScripts()/applyFragmentWidgets only run on fetched fragments —
     // the server-rendered first panel needs its widget pass here.
     if (panel && window.applyFragmentWidgets) { applyFragmentWidgets(panel); }
+    syncSettingExtras(panel);
     startStream();
     wireModelPick(panel);
     wireBell();
