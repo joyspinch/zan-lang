@@ -122,11 +122,11 @@ static bool mf_is_async_ramp(zan_irgen_t *g, const char *name) {
 }
 
 static void mf_push(int **arr, int *cnt, int *cap, int v) {
-    if (*cnt < *cap) { (*arr)[*cnt++] = v; return; }
+    if (*cnt < *cap) { (*arr)[(*cnt)++] = v; return; }
     int ncap = *cap ? *cap * 2 : 8;
     int *n = (int *)realloc(*arr, (size_t)ncap * sizeof(int));
     if (!n) { *cnt = 0; return; } /* audit-only: drop edges rather than die */
-    *arr = n; *cap = ncap; (*arr)[*cnt++] = v;
+    *arr = n; *cap = ncap; (*arr)[(*cnt)++] = v;
 }
 
 static void mf_push_name(const char ***arr, int *cnt, int *cap, const char *v) {
@@ -156,15 +156,19 @@ static int mf_defined_lookup(const mf_name_map_t *map, int n, const char *name) 
     return hit ? hit->idx : -1;
 }
 
-/* Non-call instruction operand: a referenced defined function is
- * address-taken (bitcast into a table, stored, phi'd); anything else that is
- * a global value is a referenced global. */
-static void mf_scan_insn_operand(zan_mf_fn *F, const mf_name_map_t *map,
-                                 int map_n, LLVMValueRef op) {
+/* Non-call instruction operand: a referenced defined function has its
+ * address taken by this body (bitcast into a table, stored, passed as a
+ * callback) — the flag lands on the REFERENCED body, the one that must not
+ * move out from under the taker; anything else that is a global value is a
+ * referenced global. */
+static void mf_scan_insn_operand(zan_mf_fn *F, zan_mf_fn *fns,
+                                 const mf_name_map_t *map, int map_n,
+                                 LLVMValueRef op) {
     if (!op) return;
     if (LLVMIsAFunction(op)) {
         const char *nm = LLVMGetValueName(op);
-        if (mf_defined_lookup(map, map_n, nm) >= 0) F->addr_taken = 1;
+        int idx = mf_defined_lookup(map, map_n, nm);
+        if (idx >= 0) fns[idx].addr_taken = 1;
         mf_push_name(&F->exts, &F->ext_cnt, &F->ext_cap, nm);
         return;
     }
@@ -295,13 +299,13 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
                             mf_push_name(&F->exts, &F->ext_cnt, &F->ext_cap,
                                          nm);
                         for (unsigned k = 0; k + 1 < nop; k++)
-                            mf_scan_insn_operand(F, map, mi,
+                            mf_scan_insn_operand(F, fns, map, mi,
                                                  LLVMGetOperand(in, (int)k));
                         continue;
                     }
                     F->indirect_call = 1;
                     for (unsigned k = 0; k < nop; k++)
-                        mf_scan_insn_operand(F, map, mi,
+                        mf_scan_insn_operand(F, fns, map, mi,
                                              LLVMGetOperand(in, (int)k));
                     continue;
                 }
@@ -309,7 +313,7 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
                     continue; /* personality fn is not an address escape */
                 unsigned nop = LLVMGetNumOperands(in);
                 for (unsigned k = 0; k < nop; k++)
-                    mf_scan_insn_operand(F, map, mi,
+                    mf_scan_insn_operand(F, fns, map, mi,
                                          LLVMGetOperand(in, (int)k));
             }
         }

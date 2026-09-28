@@ -878,6 +878,16 @@ int  zan_irgen_manifest_write_json(zan_irgen_t *g, zan_cg_manifest_t *m,
                                    const char *path);
 void zan_irgen_manifest_free(zan_cg_manifest_t *m);
 
+/* Stage-4 opt-in object sharding (ZAN_SHARD=1, native non-debug targets):
+ * emits manifest-eligible bodies as separate object files
+ * `<obj_base>.shard<k>.o`, deletes them from the coordinator module, and
+ * hands the object paths to the caller (malloc'd strings, caller frees).
+ * Returns the object count (0 = clean fallback to the single module, e.g.
+ * nothing eligible or an unverifiable shard), -1 only on an internal error
+ * the caller must treat as fatal. */
+int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
+                        const char *obj_base, char ***out_objs);
+
 /* Binds the target triple + data layout to the module early. --publish must
  * call this BEFORE the optimizer runs: with the layout still unset LLVM
  * assumes its generic default (64-bit pointers) and bakes 8-byte pointer

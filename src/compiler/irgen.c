@@ -4671,3 +4671,4 @@ static void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap,
 #include "irgen_stmt.c"
 #include "irgen_emit.c"
 #include "irgen_manifest.c"
+#include "irgen_shard.c"

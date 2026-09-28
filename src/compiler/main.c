@@ -5094,20 +5094,29 @@ int main(int argc, char **argv) {
     /* Codegen manifest: semantic snapshot of the finished module (all
      * irgen fixpoints complete, optimizer not yet run), opt-in via env so
      * ordinary builds pay nothing. Stage 3 of the compiler-scale plan:
-     * shard-eligibility audit + deterministic JSON, still one LLVM module. */
+     * shard-eligibility audit + deterministic JSON, still one LLVM module.
+     * Stage 4 (ZAN_SHARD=1) consumes the same manifest to split eligible
+     * bodies into separate objects; the snapshot then stays alive until the
+     * shard pass below has run. */
     const char *mf_json_path = getenv("ZAN_CODEGEN_MANIFEST_JSON");
-    if (getenv("ZAN_CODEGEN_MANIFEST") || mf_json_path) {
+    const char *shard_env = getenv("ZAN_SHARD");
+    bool want_shard = shard_env && shard_env[0] == '1' &&
+                      (target.arch == ZAN_ARCH_X86_64 ||
+                       target.arch == ZAN_ARCH_AARCH64);
+    zan_cg_manifest_t mf;
+    bool mf_built = false;
+    if (getenv("ZAN_CODEGEN_MANIFEST") || mf_json_path || want_shard) {
         phase("manifest");
-        zan_cg_manifest_t mf;
         bool mf_native = target.arch == ZAN_ARCH_X86_64 ||
                          target.arch == ZAN_ARCH_AARCH64;
         zan_irgen_manifest_build(&irgen, &mf, mf_native);
-        zan_irgen_manifest_report(&irgen, &mf);
+        mf_built = true;
+        if (getenv("ZAN_CODEGEN_MANIFEST"))
+            zan_irgen_manifest_report(&irgen, &mf);
         if (mf_json_path &&
             zan_irgen_manifest_write_json(&irgen, &mf, mf_json_path) != ZAN_OK)
             fprintf(stderr, "warning: cannot write codegen manifest '%s'\n",
                     mf_json_path);
-        zan_irgen_manifest_free(&mf);
     }
 
     /* The AST, binder and source excerpts are no longer needed by LLVM passes.
@@ -6073,6 +6082,33 @@ int main(int argc, char **argv) {
         char obj_tmp[1024];
         generated_object_vec_t generated_objects = {0};
         snprintf(obj_tmp, sizeof(obj_tmp), "%s.o", obj_path);
+
+        /* Stage-4 opt-in object sharding: emit eligible bodies as separate
+         * objects first, then delete them from the coordinator module so
+         * the optimizing emit below sees the smaller module. Any failure
+         * inside falls back cleanly to this single-module path. */
+        if (want_shard && mf_built) {
+            phase("shard");
+            char **shard_objs = NULL;
+            int shard_n = zan_irgen_shard_run(&irgen, &mf, obj_path,
+                                              &shard_objs);
+            if (shard_n < 0) {
+                fprintf(stderr, "error: shard emission failed\n");
+                zan_diag_free_buffers(irgen.diag);
+                zan_irgen_destroy(&irgen);
+                zan_arena_free(ir_arena);
+                zan_arena_free(arena);
+                free(source);
+                return 1;
+            }
+            for (int i = 0; i < shard_n; i++) {
+                generated_object_vec_add(&generated_objects, shard_objs[i]);
+                free(shard_objs[i]);
+            }
+            free(shard_objs);
+        }
+        if (mf_built) zan_irgen_manifest_free(&mf);
+
         phase("optimize");
         if (zan_irgen_write_obj(&irgen, obj_tmp) != ZAN_OK) {
             fprintf(stderr, "error: failed to emit object file\n");
