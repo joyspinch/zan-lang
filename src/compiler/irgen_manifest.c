@@ -68,14 +68,13 @@ static unsigned char mf_classify(const char *name, int reg_idx) {
     return ZAN_MF_OTHER;
 }
 
-/* A registry symbol marks overridable dispatch when the declaration carries
+/* A registry symbol marks overridable dispatch when the method is
  * virtual/override/abstract: such bodies are reachable through vtable slots
- * even when no direct call names them. */
-static bool mf_is_virtual_dispatch(zan_symbol_t *sym) {
-    if (!sym || !sym->decl) return false;
-    if (sym->decl->kind != AST_METHOD_DECL) return false;
-    unsigned m = sym->decl->method_decl.modifiers;
-    return (m & (MOD_VIRTUAL | MOD_OVERRIDE | MOD_ABSTRACT)) != 0;
+ * even when no direct call names them. Reads the modifiers snapshot stored in
+ * the function registry at registration time, so this stays valid after the
+ * frontend arena (symbols + AST) has been freed. */
+static bool mf_is_virtual_dispatch(uint32_t modifiers) {
+    return (modifiers & (MOD_VIRTUAL | MOD_OVERRIDE | MOD_ABSTRACT)) != 0;
 }
 
 /* Stage-4 allowlist v1 admits scalar-ABI bodies only: no aggregate (struct /
@@ -261,7 +260,7 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
         if (F->kind != ZAN_MF_USER || !F->defined) continue;
         F->is_async = mf_is_async_ramp(g, F->name);
         F->is_spec = mf_is_spec(g, llfns[i]);
-        F->virtual_dispatch = mf_is_virtual_dispatch(g->functions[F->reg_idx].sym);
+        F->virtual_dispatch = mf_is_virtual_dispatch(g->functions[F->reg_idx].modifiers);
         F->simple_abi = mf_simple_abi(g->functions[F->reg_idx].fn_type);
     }
 

@@ -989,6 +989,12 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
     - **协程工作线程默认上限**：在 16/32/64 核高配机器上，`co_worker_count` 默认回退如果盲目使用 CPU 核数，会为每个工作线程创建 1MB 物理栈并产生数十个闲置线程，单是线程栈与锁竞争就膨胀数十兆内存。在无 `ZAN_CO_WORKERS` 显式配置时，协程工作线程应默认上限设为 `min(CPU, 4)`，兼顾吞吐与极低内存底噪。
   - **标准库命名空间规范**：Zan 语言的标准库 GUI 库命名空间为 `using Gui;`，不存在 `using Zan.Gui` 或 `using Zan.Core;`。若用户代码误写，auto-stdlib 会将其当作第三方扩展包拉取并在找不到时报告 `ZANPKG_MISSING namespace=Zan/Gui`，最终因命名空间未定义在语义检查阶段报错。
   - **跨分片调用与数据布局**：分片间调用通过标准 external declare 降阶，全局变量按只读可复制（TRAVEL）与外部声明（DECL）清晰判定，带引号的 LLVM 结构体名（`%"..."`）必须在分片中完整导出对应类型声明，避免 Parse 失败；最终由 `lld-link` 将各分片 `.o` 统一链接。
+  - **AST arena 早释放的收益边界与事实快照化（A-MEM5，2026-09-29）**：
+    - **峰值窗口铁律：峰值 = irgen 完成那一刻，不是 manifest**。732 文件 OnePlus 实测（`ZAN_PROBE_MEM` 逐阶段 Commit/Peak/Arena 采样）：irgen 结束时 Commit 1,101 MB / Peak 1,112 MB——此刻 LLVM module（~885 MB）与 AST arena（215 MB）**必然共存**（函数体边发射边消费 AST，arena 无法部分释放）；早释放只能削掉释放点之后的驻留，动不了共存窗口本身。
+    - **早释放的真实收益是后期驻留**：AST 释放上移到 manifest 之前后，manifest 阶段 Commit 1,111→895 MB（-216 MB），25 分钟 shard emit 窗口驻留 1,007~1,023→886~897 MB（约 -120 MB），全进程 Peak 1,117→1,112 MB（-5 MB，只是 manifest 自身超冲）。把释放点提前**不等于**峰值下降——峰值在释放点之前就已定型，验收别只盯 Peak 数字。
+    - **后期读者必须事实快照化**：arena 释放后所有悬空读者逐一排查过（shard/optimizer/write_obj/write_ir 零 AST 访问；`mf_is_spec` 只比 LLVMValueRef）。唯一回读点 `mf_is_virtual_dispatch` 读 `sym->decl->method_decl.modifiers`——symbol 本身也分配在 AST arena（`make_symbol(b->arena,...)`），整个指针都悬空。修法：`zan_fn_entry` 加 `uint32_t modifiers`，`irgen_register_function`（唯一注册点）在 emit 时快照 `sym->modifiers`（bind 时已从 AST 拷贝的位副本），manifest 改读快照。**泛型 spec 不走 functions[]**（走 `generic_fns[]`，manifest 用 `mf_is_spec` 按 LLVMValueRef 判定），快照面恰好闭合。
+    - **手工 A/B 编译器二进制时 exe 同目录发现面陷阱**：worktree zanc 的包发现/exe 兄弟目录规则与主树一致，跑 OnePlus 这类外部项目无碍；但 A/B 对比产物字节级 diff 时 COFF 时间戳每次不同，比尺寸+运行行为，别比字节。
+
 
 - 另一条常客：**端口/资源竞争与真 flaky**。判别法是把**同一个二进制**（不重编）
   连跑 5 次——通过/挂起交错就说明是被测代码里的竞争，单次的超时/失败不能当回归

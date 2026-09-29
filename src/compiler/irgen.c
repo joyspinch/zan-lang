@@ -1437,6 +1437,7 @@ static void irgen_register_function(zan_irgen_t *g, zan_symbol_t *sym,
     g->functions[g->function_count].sym = sym;
     g->functions[g->function_count].fn = fn;
     g->functions[g->function_count].fn_type = fn_type;
+    g->functions[g->function_count].modifiers = sym ? sym->modifiers : 0;
     /* Keep the index under 50% load so probe chains stay short. */
     if ((g->function_count + 1) * 2 >= g->fn_index_cap)
         fn_index_rehash(g, g->fn_index_cap ? g->fn_index_cap * 2 : 2048);

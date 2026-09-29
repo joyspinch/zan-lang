@@ -167,6 +167,10 @@ struct zan_irgen {
         zan_symbol_t *sym;
         LLVMValueRef fn;
         LLVMTypeRef fn_type;
+        /* method_decl.modifiers copied at registration: the codegen manifest
+         * needs the virtual/override/abstract fact after the frontend arena
+         * is freed (the symbol itself is arena memory). */
+        uint32_t modifiers;
     } *functions;
     int function_count;
     int function_cap;

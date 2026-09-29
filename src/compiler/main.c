@@ -209,6 +209,22 @@ static void phase(const char *name) {
     g_phase_start = t;
 }
 
+/* Per-phase memory attribution for the peak-memory investigation: unlike
+ * phase() this prints unconditionally when ZAN_PROBE_MEM=1 (phase() needs
+ * --time), tagging Commit/Peak plus the frontend arena share so the peak
+ * window can be pinned to a single phase. */
+static void probe_phase_mem(const char *name) {
+#ifdef _WIN32
+    if (!getenv("ZAN_PROBE_MEM")) return;
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return;
+    size_t ar_mb = g_main_arena ? (zan_arena_total_bytes(g_main_arena) / (1024 * 1024)) : 0;
+    fprintf(stderr, "    [phase %-14s Commit: %4zu MB, Peak: %4zu MB, Arena: %4zu MB]  %s\n",
+            "", pmc.PagefileUsage / (1024 * 1024),
+            pmc.PeakPagefileUsage / (1024 * 1024), ar_mb, name);
+#endif
+}
+
 /* ---- file reading ---- */
 
 static char *read_file(const char *path, size_t *out_len) {
@@ -4716,6 +4732,7 @@ int main(int argc, char **argv) {
     free(design_outs); /* entries were moved into `source`/the arena */
 
     phase("parse");
+    probe_phase_mem("parse");
     if (g_time_phases) zan_arena_dump_stats();
 
     if (!zan_diag_has_errors(diag)) {
@@ -4906,6 +4923,7 @@ int main(int argc, char **argv) {
     }
 
     phase("resolve");
+    probe_phase_mem("resolve");
 
     /* ---- bind ---- */
     zan_binder_t binder;
@@ -4914,6 +4932,7 @@ int main(int argc, char **argv) {
     zan_binder_bind(&binder, ast);
 
     phase("bind");
+    probe_phase_mem("bind");
 
     /* ---- type check ---- */
     zan_checker_t checker;
@@ -4935,6 +4954,7 @@ int main(int argc, char **argv) {
     }
 
     phase("check");
+    probe_phase_mem("check");
 
     /* ---- codegen ---- */
     zan_irgen_t irgen;
@@ -5095,6 +5115,7 @@ int main(int argc, char **argv) {
     }
 
     phase("irgen");
+    probe_phase_mem("irgen");
     if (g_time_phases) {
         size_t definitions = 0, declarations = 0, blocks = 0, instructions = 0;
         for (LLVMValueRef fn = LLVMGetFirstFunction(irgen.mod); fn;
@@ -5130,34 +5151,12 @@ int main(int argc, char **argv) {
         zan_arena_dump_stats();
     }
 
-    /* Codegen manifest: semantic snapshot of the finished module (all
-     * irgen fixpoints complete, optimizer not yet run), opt-in via env so
-     * ordinary builds pay nothing. Stage 3 of the compiler-scale plan:
-     * shard-eligibility audit + deterministic JSON, still one LLVM module.
-     * Stage 4 (ZAN_SHARD=1) consumes the same manifest to split eligible
-     * bodies into separate objects; the snapshot then stays alive until the
-     * shard pass below has run. */
-    const char *mf_json_path = getenv("ZAN_CODEGEN_MANIFEST_JSON");
-    zan_cg_manifest_t mf;
-    bool mf_built = false;
-    if (getenv("ZAN_CODEGEN_MANIFEST") || mf_json_path || want_shard) {
-        zan_opt_strip_unused(&irgen);
-        phase("manifest");
-        bool mf_native = target.arch == ZAN_ARCH_X86_64 ||
-                         target.arch == ZAN_ARCH_AARCH64;
-        zan_irgen_manifest_build(&irgen, &mf, mf_native);
-        mf_built = true;
-        if (getenv("ZAN_CODEGEN_MANIFEST"))
-            zan_irgen_manifest_report(&irgen, &mf);
-        if (mf_json_path &&
-            zan_irgen_manifest_write_json(&irgen, &mf, mf_json_path) != ZAN_OK)
-            fprintf(stderr, "warning: cannot write codegen manifest '%s'\n",
-                    mf_json_path);
-    }
-
-    /* Release frontend AST, binder and source excerpts now that manifest is built.
-     * LLVM sharding, optimization and emission passes only need irgen.mod;
-     * keeping the frontend graph during these heavy phases wastes 200MB+ memory. */
+    /* Release frontend AST, binder and source excerpts now that irgen is done.
+     * The codegen manifest reads only the modifiers snapshot captured into
+     * the function registry at emit time; LLVM sharding, optimization and
+     * emission passes only need irgen.mod. Freeing the arena before the
+     * manifest/shard/optimize/emit/link phases removes the frontend graph
+     * from the compiler's peak-memory window entirely. */
     if (arena) {
         for (int i = 0; i < irgen.extern_lib_count; i++) {
             zan_istr_t *lib = &irgen.extern_libs[i];
@@ -5187,7 +5186,34 @@ int main(int argc, char **argv) {
         g_main_arena = ir_arena;
         irgen.binder = NULL;
     }
+    probe_phase_mem("release ast");
     if (source) { free(source); source = NULL; }
+
+    /* Codegen manifest: semantic snapshot of the finished module (all
+     * irgen fixpoints complete, optimizer not yet run), opt-in via env so
+     * ordinary builds pay nothing. Stage 3 of the compiler-scale plan:
+     * shard-eligibility audit + deterministic JSON, still one LLVM module.
+     * Stage 4 (ZAN_SHARD=1) consumes the same manifest to split eligible
+     * bodies into separate objects; the snapshot then stays alive until the
+     * shard pass below has run. */
+    const char *mf_json_path = getenv("ZAN_CODEGEN_MANIFEST_JSON");
+    zan_cg_manifest_t mf;
+    bool mf_built = false;
+    if (getenv("ZAN_CODEGEN_MANIFEST") || mf_json_path || want_shard) {
+        zan_opt_strip_unused(&irgen);
+        phase("manifest");
+        probe_phase_mem("manifest");
+        bool mf_native = target.arch == ZAN_ARCH_X86_64 ||
+                         target.arch == ZAN_ARCH_AARCH64;
+        zan_irgen_manifest_build(&irgen, &mf, mf_native);
+        mf_built = true;
+        if (getenv("ZAN_CODEGEN_MANIFEST"))
+            zan_irgen_manifest_report(&irgen, &mf);
+        if (mf_json_path &&
+            zan_irgen_manifest_write_json(&irgen, &mf, mf_json_path) != ZAN_OK)
+            fprintf(stderr, "warning: cannot write codegen manifest '%s'\n",
+                    mf_json_path);
+    }
 
     /* ---- optimize ---- */
     zan_opt_level_t effective_opt = ZAN_OPT_NONE;
@@ -5268,6 +5294,7 @@ int main(int argc, char **argv) {
         }
     }
     if (shard_n > 0) phase("shard emit");
+    probe_phase_mem("shard emit");
     if (mf_built) {
         zan_irgen_manifest_free(&mf);
         mf_built = false;
@@ -5277,6 +5304,7 @@ int main(int argc, char **argv) {
         zan_opt_report_t opt_report = zan_optimize(&irgen, NULL, effective_opt);
         zan_opt_report_print(&opt_report);
         phase("optimize");
+        probe_phase_mem("optimize");
         if (shard_n == 0)
             zan_irgen_prune_extern_libs(&irgen);
     } else {
@@ -6182,6 +6210,7 @@ int main(int argc, char **argv) {
         }
 
         phase("emit obj");
+        probe_phase_mem("emit obj");
         if (zan_irgen_write_obj(&irgen, obj_tmp) != ZAN_OK) {
             fprintf(stderr, "error: failed to emit object file\n");
             zan_diag_free_buffers(irgen.diag);
@@ -8644,6 +8673,7 @@ int main(int argc, char **argv) {
         }
 
         phase("link");
+        probe_phase_mem("link");
 
         generated_object_vec_keep_or_remove(&generated_objects, obj_tmp,
                                             link_ret != 0 &&
