@@ -1,6 +1,6 @@
 ---
 name: zan-compiler-internals
-description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、限定名简单名回退（错命名空间的发射被用户同名类击穿）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑（AST 真引用闭包、stdlib 输入自我遮蔽、潜伏缺 using、重臂 Bootstrap 注册制）、LLVMIsConstant/llvm.global_ctors/PE 数据分节 $ 命名等发布体积分节陷阱、GNU ld PE 把 .pdata 当 GC 根、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden、追发布体积、动 stdlib 重组件目录或 ControlFactory/App 拉入面时使用；仓库内有同名项目级版本，会自动优先。
+description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、限定名简单名回退（错命名空间的发射被用户同名类击穿）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑（AST 真引用闭包、stdlib 输入自我遮蔽、潜伏缺 using、重臂 Bootstrap 注册制）、LLVMIsConstant/llvm.global_ctors/PE 数据分节 $ 命名等发布体积分节陷阱、GNU ld PE 把 .pdata 当 GC 根、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden、追发布体积、动 stdlib 重组件目录或 ControlFactory/App 拉入面时使用。
 ---
 
 # zanc 编译器内部定式与坑
@@ -152,18 +152,22 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - **PE 的真按需粒度 = 归档成员，不是 gc**（2026-09-27 落地）：既然
   .pdata/.xdata 钉死分节回收，PE 上想要"用到才导入"就把子系统拆成静态
   归档的独立成员——GNU ld 按符号需求拉成员，无需 gc。zan_audio（+
-  stb_vorbis，unity 尾部 `#include`）拆成 `libzan_gui.a` 独立成员后，不用
-  stdlib/System/Media 的程序静态发布实测 −103KB、vorbis/OggS 字符串
-  清零；音频程序（Audio.zan 引 zan_audio_*）成员照常拉入、WASAPI 实开
-  验证通过。共享 DLL 保持 unity。函数分节在 PE 上白给 BSS +133KB（每节
-  对齐垫），别顺手加。
+  stb_vorbis，unity 尾部 `#include`）经 `ZAN_GUI_AUDIO_SEPARATE` 拆成
+  `libzan_gui.a` 第三成员后，不用 stdlib/System/Media 的程序静态发布
+  实测 −103KB、vorbis/OggS 字符串清零；音频程序（Audio.zan 引
+  zan_audio_*）成员照常拉入、WASAPI 实开验证通过。共享 DLL 保持 unity
+  （CMake 目标不动）。函数分节在 PE 上白给 BSS +133KB（每节对齐垫），
+  别顺手加。
 - **发布档必须 `-DNDEBUG`（2026-09-27）**：vendored C 库（libwebp/stb）
-  的 `assert()` 把 `__FILE__` 编进 .rdata，每个发布 exe 泄漏几十处构建机
-  路径；NDEBUG 后字符串清零且无行为风险（运行时自身零 assert）。
+  的 `assert()` 把 `__FILE__` 编进 .rdata，每个发布 exe 泄漏 31 处构建机
+  路径（`D:\<repo>\src\runtime\libwebp/...`）；NDEBUG 后字符串清零且无
+  行为风险（gui_runtime.c/zan_audio.c 自身零 assert）。linux/android/
+  ohos 静态驱动脚本已同批加旗子，但它们的提交态归档要等各自平台重跑
+  脚本才换血。
 - **提交态归档会过期，重建时连环炸**：静态驱动归档落后源码时（如
-  dwrite TU 未入归档、`.libs` 清单落后人工补过的提交版），下一次重编
-  归档才爆 undefined reference；先 `git show HEAD:<归档路径>` 对比成员
-  与 `nm` 旧符号，再对齐脚本与提交态清单。
+  dwrite TU 未入归档、脚本里的 `.libs` 清单落后人工补过的提交版），
+  下一次重编归档才爆 undefined reference；先 `git show
+  HEAD:<归档路径>` 对比成员与 `nm` 旧符号，再对齐脚本与提交态清单。
 
 ## auto-stdlib 拉入的真实语义与重臂注册制（2026-09-16 落地）
 
@@ -416,7 +420,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   单元级**（宿主 AST members 里不再有 Inner），类型注册靠简单名。早期
   checker 对非标量接收者的成员 miss 只返回 type_error **不发诊断**，
   irgen 的限定名处理器按简单名接住发射，所以"碰巧绿"；后来 typo 守卫把
-  该诊断放宽到所有类/结构接收者（守卫本身是对的，未解析限定名的负例
+  该诊断放宽到所有类/结构接收者（守卫本身是对的，fully_qualified_unresolved
   靠它），合法的 `Outer.Inner` 一起被拒。
 - **修法**：提升时在 AST 节点盖宿主戳（`type_decl.nested_host` 存宿主**节点
   指针**），binder 注册完全部顶层类型后按节点指针找到宿主符号，
@@ -429,7 +433,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   成之后**做（深嵌套 A{B{C}} 提升顺序是 C、B 追加到 decls 尾部，B 注册在
   C 之后），宿主按节点指针找、不按名字，避免同名类错挂。③ 排查"旧版绿
   现在红"时先问：当年是不是**没有诊断的静默路径**在兜底——守卫收紧只是
-  让老病灶显形。回归锁：conformance 的 namespace_qualified_call 用例
+  让老病灶显形。回归锁：tests/conformance/namespace_qualified_call.zan
   （负例孪生 fully_qualified_unresolved 必须保持红）。
 
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
@@ -521,6 +525,13 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   `LLVM verification failed ... Call parameter type does not match function signature!`
   （第 16 参起仍是 i64 未被 coerce）。限定名 `A.big17(...)` 路径正常（探针
   `p17.zan` / `p60.zan` / `p17b.zan`）。
+
+## irgen_builtins 算术内联保宽：禁止对 8 位整型混用 zan_add 与 LLVMBuildSelect（2026-09-25）
+
+- **症状**：在编译器内置字符串方法生成（如 `__zan_str_to_upper` / `__zan_str_to_lower`）中，使用 SSA 计算 `%c8 = select i1 %in_rng, %conv, %c` 时，LLVM 校验直接报错 `Invalid operands for select instruction!`。
+- **根因**：编译器宏 `ZAN_IBIN(zan_add, LLVMBuildAdd)` 内部默认调用 `zan_ipair(b, &l, &r)`，遵循 C# 算术向 int/long 提升规则，若左右操作数为 i8 则会自动调用 `zan_iwiden` 零扩展为 `i64`。但后续 `LLVMBuildSelect` 接收的 `%c` 仍是原始加载的 `i8` 字符，导致 `select` 的 true 分支为 `i64`、false 分支为 `i8`，类型不匹配。
+- **纪律**：在生成 8 位或保宽标量 SSA 寄存器操作时，禁止随意混用通用整型二元运算包装宏（如 `zan_add`、`zan_sub`）；涉及 `select` 或定宽存储的逻辑，直接使用显式保宽的 `LLVMBuildAdd(g->builder, c, diff, "conv")` 或显式截断/强转，确保 LLVM 寄存器类型严格闭环。
+
 - **本类一个构造函数都没有时 `new C(args)` 静默丢实参**（`irgen_expr.c:7281-7287` 的
   诊断以 `type_has_ctor()` 为门，无 ctor 反而不报）→ 对象只用字段初始化器，args 不
   求值。探针 `_scratch/audit2/newargs.zan`。
@@ -541,13 +552,6 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   ② 「`irgen_emit.c` 的 `fields[32]/names[32]` 缓冲区溢出」不成立——`:1802-1803`、
   `:1983-1984` 都有 `< 32` 守卫，是**静默截断**（names 侧无可见症状；fields 侧只有
   「>32 个 T 型字段的泛型类」以 `unresolved call 'F32.ToString'` 暴露，见 TASKS A281）。
-
-## irgen_builtins 算术内联保宽：禁止对 8 位整型混用 zan_add 与 LLVMBuildSelect（2026-09-25）
-
-- **症状**：在编译器内置字符串方法生成（如 `__zan_str_to_upper` / `__zan_str_to_lower`）中，使用 SSA 计算 `%c8 = select i1 %in_rng, %conv, %c` 时，LLVM 校验直接报错 `Invalid operands for select instruction!`。
-- **根因**：编译器宏 `ZAN_IBIN(zan_add, LLVMBuildAdd)` 内部默认调用 `zan_ipair(b, &l, &r)`，遵循 C# 算术向 int/long 提升规则，若左右操作数为 i8 则会自动调用 `zan_iwiden` 零扩展为 `i64`。但后续 `LLVMBuildSelect` 接收的 `%c` 仍是原始加载的 `i8` 字符，导致 `select` 的 true 分支为 `i64`、false 分支为 `i8`，类型不匹配。
-- **纪律**：在生成 8 位或保宽标量 SSA 寄存器操作时，禁止随意混用通用整型二元运算包装宏（如 `zan_add`、`zan_sub`）；涉及 `select` 或定宽存储的逻辑，直接使用显式保宽的 `LLVMBuildAdd(g->builder, c, diff, "conv")` 或显式截断/强转，确保 LLVM 寄存器类型严格闭环。
-
   静态阅读/代理给的结论必须逐条最小探针复验再入账——错报会让人去修不存在的东西。
 
 ## parser：looks_like_var_decl 的分派契约
@@ -732,9 +736,19 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - 修法（irgen_expr.c，`array_init` 字面量与 `ninit` 定长两处循环同改）：
   逐元素 `is_rc_managed_type(elem_type) && !expr_yields_owned_rc_value(...)
   → emit_rc_retain_for_type`——与元素赋值路径（`arr[i] = x`）同一协议。
-  **新增任何"把表达式值写进容器槽位"的 irgen 路径（数组/列表/字典/字段）
+  **新增任何"把表达式值写进容器槽位"的 irgen路径（数组/列表/字典/字段）
   都必须复制这套判据**，判据散装手写会漏。conformance：
   tests/conformance/arr_lit_rc（存 two 元素字面量后再逐个比对）。
+
+## macOS 交叉编译与运行契约（ld64.lld / codesign / Cocoa 生命周期，2026-09-20）
+
+- **Apple Silicon 必须带 `-adhoc_codesign`**：macOS 11+ arm64 Mach-O 可执行文件若无 `LC_CODE_SIGNATURE`（即使未加开发者证书也必须有 ad-hoc 签名），XNU 内核在 `execve` 时会直接 `SIGKILL`（namespace `CODESIGNING`），现象为启动即闪退。`ld64.lld` 针对 macOS target 必须常开 `-adhoc_codesign`。
+- **GUI 兼容对象 `zanrt_gui.o` 仅在存在 GUI 驱动时链接**：CLI 程序不能无条件引入 `zanrt_gui.o`，否则会报 `_zan_gui_draw_text` / `_zan_gui_font_height` 等未定义符号错误。通过检查 `cross_dylibs` 是否包含 `zan_gui` 门控链接。
+- **macOS 退出事件与 Cocoa Delegate 契约**：Dock 右键 Quit / Cmd+Q 发送 `kAEQuitApplication` 走 AppKit `[NSApp terminate:]`。若 `NSApp.delegate` 为 nil 或未实现 `applicationShouldTerminate:`，AppKit 回退调用各窗口 `windowShouldClose:`；如果 `windowShouldClose:` 返回 `NO` 且未调用 `zan_gui_wake()`，终止过程被静默取消且事件泵继续挂起阻塞，造成“右键退出无法退出”。正确做法：
+  1. 为 `NSApp` 设置代理 `ZanDelegate`（实现 `applicationShouldTerminate:`），返回 `NSTerminateCancel` 并派发事件 8（Window Close）以及调用 `zan_gui_wake()`，让 Zan 运行时正常触发安全清理退出；
+  2. `windowShouldClose:` 中也必须调用 `zan_gui_wake()` 唤醒阻塞在 `nextEventMatchingMask:` 的事件泵；
+  3. `zanrt_gui.o` 在运行时通过 ObjC 运行时动态注入/挂载上述 delegate，确保即使动态链接旧版 `libzan_gui.dylib` 也能生效。
+- **多开外层跳板必须声明 `LSUIElement`**：多开跳板外层 App 仅用于执行脚本 `open -n AppCore.app`，其 `Info.plist` 必须包含 `<key>LSUIElement</key><true/>`（即 `isLauncher=true`），否则外层进程执行脚本完毕退出时 Dock 图标闪烁后消失，容易被误认为崩溃闪退。
 
 ## 字节串 ABI 契约（stdlib crypto EVP 换装踩坑，2026-09-10）
 
@@ -878,8 +892,8 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - 语义等价验证定式：同一程序 `ZAN_NO_PULLIN_FILTER=1` 开关两态编译运行
   diff 输出；改拉入逻辑必须补 conformance 用例并**单跑该用例**（`ctest -R
   conformance_<name>`，秒级）。整档 smoke/standard 会把 CPU 打满几十分钟，
-  仅在明确要求或发布门槛时跑，平时探针+单用例即为验证完成，不要默认复读
-  整档。
+  仅在用户明确要求或发布门槛时跑（AGENTS.md 规则 8），平时探针+单用例即为
+  验证完成，不要默认复读整档。
 - 顺带的实证：**prune 已保证未用代码不进二进制**（关 prune 只多 7KB），
   "using Gui 导致 exe 10MB"是错觉——Gui 窗口 exe 的 1.6MB .text 是
   GuiHost→App/Style/Fx 的活代码闭包 + Zan 运行时，与 unused 无关。
@@ -929,33 +943,10 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - **归因顺序（四步）**：单跑该用例 → 删 `build/conf_<name>.exe` 重编单跑 →
   手工 `zanc` 编译 + 直接跑 exe → 旧编译器快照（如 `_scratch/zanc_head.exe`）
   复现。四步都指向"不是我"再继续；否则停下来查自己。
-
-## macOS 交叉编译与运行契约（ld64.lld / codesign / Cocoa 生命周期，2026-09-20）
-
-- **Apple Silicon 必须带 `-adhoc_codesign`**：macOS 11+ arm64 Mach-O 可执行文件若无 `LC_CODE_SIGNATURE`（即使未加开发者证书也必须有 ad-hoc 签名），XNU 内核在 `execve` 时会直接 `SIGKILL`（namespace `CODESIGNING`），现象为启动即闪退。`ld64.lld` 针对 macOS target 必须常开 `-adhoc_codesign`。
-- **GUI 兼容对象 `zanrt_gui.o` 仅在存在 GUI 驱动时链接**：CLI 程序不能无条件引入 `zanrt_gui.o`，否则会报 `_zan_gui_draw_text` / `_zan_gui_font_height` 等未定义符号错误。通过检查 `cross_dylibs` 是否包含 `zan_gui` 门控链接。
-- **macOS 退出事件与 Cocoa Delegate 契约**：Dock 右键 Quit / Cmd+Q 发送 `kAEQuitApplication` 走 AppKit `[NSApp terminate:]`。若 `NSApp.delegate` 为 nil 或未实现 `applicationShouldTerminate:`，AppKit 回退调用各窗口 `windowShouldClose:`；如果 `windowShouldClose:` 返回 `NO` 且未调用 `zan_gui_wake()`，终止过程被静默取消且事件泵继续挂起阻塞，造成“右键退出无法退出”。正确做法：
-  1. 为 `NSApp` 设置代理 `ZanDelegate`（实现 `applicationShouldTerminate:`），返回 `NSTerminateCancel` 并派发事件 8（Window Close）以及调用 `zan_gui_wake()`，让 Zan 运行时正常触发安全清理退出；
-  2. `windowShouldClose:` 中也必须调用 `zan_gui_wake()` 唤醒阻塞在 `nextEventMatchingMask:` 的事件泵；
-  3. `zanrt_gui.o` 在运行时通过 ObjC 运行时动态注入/挂载上述 delegate，确保即使动态链接旧版 `libzan_gui.dylib` 也能生效。
-- **多开外层跳板必须声明 `LSUIElement`**：多开跳板外层 App 仅用于执行脚本 `open -n AppCore.app`，其 `Info.plist` 必须包含 `<key>LSUIElement</key><true/>`（即 `isLauncher=true`），否则外层进程执行脚本完毕退出时 Dock 图标闪烁后消失，容易被误认为崩溃闪退。
 - 另一条会一次打红**整档**的：并行会话重链 `build/zanc.exe`（
   而我这轮 ctest 是 07:20:58 起的）。编译器一换，所有 `conf_*.exe`/golden 产物
   全部过期，逐条归因毫无意义；判据是 `ls -l build/zanc.exe` 的 mtime 落在你的运行
   区间内 → 整档作废重跑。
-
-- 另一条常客：**端口/资源竞争与真 flaky**。判别法是把**同一个二进制**（不重编）
-  连跑 5 次——通过/挂起交错就说明是被测代码里的竞争，单次的超时/失败不能当回归
-  （本次 `conformance_gui_listview_scrollbar_drag` 同一 exe 3 过 2 挂，而它属
-  Gui 车道在途改动；`conformance_http_client_keepalive` 则是全量并行 120s 超时、
-  单跑 0.5s 过，属端口竞争）。并行档的超时值一律先单跑复核。
-
-- **两档 ctest 绝不能同时跑：它们共享同一批 `build/conf_*.exe`**（smoke 与 standard
-  的 label 大量重叠，`add_test` 的 `-DOUT_EXE` 是同一个路径）。本轮：我这轮
-  `-L standard -j 4` 起来后，另一会话的 `-L smoke -j 32` 也在跑，两条进程同时往同一个
-  `conf_*.exe` 写、又互相把它当「已是最新」复用，双方都开始冒出无法归因的红。**开工前
-  先查** `Get-CimInstance Win32_Process -Filter "Name='ctest.exe'"`，有别人的档就先等它
-  跑完（或另开 `git worktree` 用自己的 build 目录），别硬上。
 
 ## 编译期大型工程内存暴增治理（A-MEM1/2/3 经验定式，2026-09-29）
 
@@ -969,7 +960,25 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   - **字符串比对走栈缓冲区**：命名空间解析与 using 符号查找使用 512B 栈局部缓冲区或临时堆，禁止污染单向增长的主 Arena。
 - **IRGen 虚方法与反射保活治理（A-MEM1）**：
   - **反射保活收敛**：切断 `root = ... || g->refl_used` 全局暴力保活，仅对真正登记在反射元数据表（`refl_mtabs`）中的目标类型保活。
-  - **虚表按需感知**：常量聚合溯源归属全局变量，未实例化的类虚方法不判定为存活，生成为单条 `unreachable` 桩，切断数十万条未调用 stdlib 方法级联拉活。
+  - **虚表按需感知**：常量聚合溯源归属全局变量，未实例化的类虚方法不判定为存活，生成为单条 `unreachable`桩，切断数十万条未调用 stdlib 方法级联拉活。
+- **函数体 AST 发射后即刻丢弃与模块分片发射即刻销毁（A-MEM4）**：
+  - **AST Body 即刻卸载铁律**：普通非泛型方法在生成完 LLVM IR 后，立即将其语法树置空（`member->method_decl.body = NULL;`），使数百万表达式 AST 节点生命周期不再延续至后端结束；注意必须保留 `Main` / `__DesignMain` 直至入口包装完成，避免入口函数生成为空导致 `globaldce` 将整个工程当做死代码清空。**特别注意：泛型特化发射（emit_method_spec_body）决不能清空 `member->method_decl.body`**！同一个泛型模板（如 `List<T>.Find`）可能被特化多次，首次置空会导致后续特化解引用 NULL 空指针触发 `0xC0000005`（Access Violation 崩溃，退出码 `-1073741819`）。
+  - **分片自适应默认激活**：分片发射（Module Sharding）不应依赖隐藏的环境变量 `ZAN_SHARD=1`（用户在 IDE 界面点击发布或命令行默认构建时无此变量），应在 native 目标（x86_64 / aarch64）的 `--publish` 发布构建下自适应默认开启（支持 `ZAN_NO_SHARD=1` / `ZAN_SHARD=0` 关闭）。当函数规模较小、规划分片数 `<= 1` 时自动跳过保持单模块，小工程零额外开销；超大项目（如 730 文件 OnePlus、534 文件 ZanIDE）自动切分 40+ 分片并即刻销毁，全局优化从 35 秒降至 10 秒，链接时间缩短 75%，主模块 Commit 常驻大幅下降。
+  - **标准库命名空间规范**：Zan 语言的标准库 GUI 库命名空间为 `using Gui;`，不存在 `using Zan.Gui` 或 `using Zan.Core;`。若用户代码误写，auto-stdlib 会将其当作第三方扩展包拉取并在找不到时报告 `ZANPKG_MISSING namespace=Zan/Gui`，最终因命名空间未定义在语义检查阶段报错。
+  - **跨分片调用与数据布局**：分片间调用通过标准 external declare 降阶，全局变量按只读可复制（TRAVEL）与外部声明（DECL）清晰判定，带引号的 LLVM 结构体名（`%"..."`）必须在分片中完整导出对应类型声明，避免 Parse 失败；最终由 `lld-link` 将各分片 `.o` 统一链接。
+
+- 另一条常客：**端口/资源竞争与真 flaky**。判别法是把**同一个二进制**（不重编）
+  连跑 5 次——通过/挂起交错就说明是被测代码里的竞争，单次的超时/失败不能当回归
+  （本次 `conformance_gui_listview_scrollbar_drag` 同一 exe 3 过 2 挂，而它属
+  Gui 车道在途改动；`conformance_http_client_keepalive` 则是全量并行 120s 超时、
+  单跑 0.5s 过，属端口竞争）。并行档的超时值一律先单跑复核。
+
+- **两档 ctest 绝不能同时跑：它们共享同一批 `build/conf_*.exe`**（smoke 与 standard
+  的 label 大量重叠，`add_test` 的 `-DOUT_EXE` 是同一个路径）。本轮：我这轮
+  `-L standard -j 4` 起来后，另一会话的 `-L smoke -j 32` 也在跑，两条进程同时往同一个
+  `conf_*.exe` 写、又互相把它当「已是最新」复用，双方都开始冒出无法归因的红。**开工前
+  先查** `Get-CimInstance Win32_Process -Filter "Name='ctest.exe'"`，有别人的档就先等它
+  跑完（或另开 `git worktree` 用自己的 build 目录），别硬上。
 
 ## 编译器调试的 scratch 卫生（bisect / A-B 对照）
 
@@ -1173,6 +1182,20 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   文件按锚切片、原样拼进基线**（find 定位 + 下标切），零转义零风险；
   写完断言 count==1/块内标记存在，再 md5 前后对比。
 
+## Windows 路径通配符与 C++ COM 运行时解耦（2026-09-18）
+
+- **Win32 FindFirstFileW 遇到混合斜杠在通配符下报 ERROR_FILE_NOT_FOUND (2)**：
+  在 Windows 下拼接通配符路径（如 `D:\project\stdlib/Gui/icons\\*`）时，若路径前段含有正斜杠 `/`，
+  Win32 的 `FindFirstFileW` 无法正确解析混合斜杠的通配模式，直接返回 `INVALID_HANDLE_VALUE` (GetLastError=2)。
+  在 `src/compiler/embedres.c` 等涉及文件目录遍历的代码中，进入 Win32 API 之前必须无条件将所有 `/` 归一化为 `\`。
+- **C++ 辅助源文件（如 DirectWrite）在 C 静态库中的 pure COM 准则**：
+  Windows SDK 的 `dwrite.h` 必须以 C++ 编译，但若在源文件中使用 `<string>`、`std::wstring` 或默认编译选项，
+  会导致输出对象产生 `__cxa_begin_catch`、`std::terminate`、`__gxx_personality_seh0`、`vtable for __cxxabiv1` 等对 C++ 运行时（`libstdc++`）的硬引用，导致 C 静态库在纯 C 链接时大面积报未定义符号。
+  解法：
+  ① 彻底杜绝 C++ 标准库头文件与 STL 容器，使用 `wchar_t[]`、`wcsncpy`、`wcscmp` 等 C 原生字符串操作；
+  ② 编译参数必须强制带 `-fno-exceptions -fno-rtti`；
+  实现 100% 零 C++ 运行时依赖的 pure COM 胶水，无缝打包进 C/GNU 目标库。
+
 ## 解析器别丢 token 原文本：格式化输出 ≠ 无损（A295，2026-09-11 已修）
 
 - 场景：`JsonValue.ParseNumberToken` 为性能把「含 . / e 的数字」直接转 double 且不存原文本，
@@ -1314,20 +1337,6 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - Zan 的 leakcheck 对**仍可达**对象也报红（不区分丢失/仍被持有）。服务端对象
   （listener、连接、池）在 Stop() 后需要泵协程自然走完（accept 返回 -1、EOF 关链路）
   才不可达；测试里的固定排水（20x10ms）在负载下可能不够，`rc=0` 但 leakcheck 记红。
-
-## Windows 路径通配符与 C++ COM 运行时解耦（2026-09-18）
-
-- **Win32 FindFirstFileW 遇到混合斜杠在通配符下报 ERROR_FILE_NOT_FOUND (2)**：
-  在 Windows 下拼接通配符路径（如 `D:\project\stdlib/Gui/icons\\*`）时，若路径前段含有正斜杠 `/`，
-  Win32 的 `FindFirstFileW` 无法正确解析混合斜杠的通配模式，直接返回 `INVALID_HANDLE_VALUE` (GetLastError=2)。
-  在 `src/compiler/embedres.c` 等涉及文件目录遍历的代码中，进入 Win32 API 之前必须无条件将所有 `/` 归一化为 `\`。
-- **C++ 辅助源文件（如 DirectWrite）在 C 静态库中的 pure COM 准则**：
-  Windows SDK 的 `dwrite.h` 必须以 C++ 编译，但若在源文件中使用 `<string>`、`std::wstring` 或默认编译选项，
-  会导致输出对象产生 `__cxa_begin_catch`、`std::terminate`、`__gxx_personality_seh0`、`vtable for __cxxabiv1` 等对 C++ 运行时（`libstdc++`）的硬引用，导致 C 静态库在纯 C 链接时大面积报未定义符号。
-  解法：
-  ① 彻底杜绝 C++ 标准库头文件与 STL 容器，使用 `wchar_t[]`、`wcsncpy`、`wcscmp` 等 C 原生字符串操作；
-  ② 编译参数必须强制带 `-fno-exceptions -fno-rtti`；
-  实现 100% 零 C++ 运行时依赖的 pure COM 胶水，无缝打包进 C/GNU 目标库。
 - 判据：leak 行全指向服务端对象分配点、主输出全对 → 停服排水不足或 Stop 语义不
   可等待，不是真泄漏。修法方向：Stop 返回可等待句柄（服务端 join 自己的泵），
   而不是让每个用例猜排水时长。
@@ -1893,6 +1902,16 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   取的是最后一个分隔符——build.ps1 里 `Join-Path $project 'src/App.html'`
   这类混合分隔符路径会让截桶错位。诊断时先打印候选再怀疑逻辑。
 
+## 跨平台硬件加速 Crypto/TLS 微内核替换与 ABI 契约（2026-09-24）
+
+- **胖驱动瘦身与生命周期引用计数（X509 存储）**：
+  OpenSSL 历史多平台驱动体积达 5MB+，采用单 TU 原生微内核（AES-NI/PCLMULQDQ 硬件加速，几十 KB）替代时，必须精准遵循 OpenSSL 的所有权语义。例如 X509 证书同时被上层调用方句柄和 `SSL_CTX` 的 `cert_store` 引用；`X509_STORE_add_cert` 接管时必须递增 `ref_count`，`X509_free` 递减至 0 时才真正 free。若做浅拷贝或单侧硬析构，`SSL_CTX_free` 析构证书库时会触发严重的堆破坏与崩溃（`0xc0000374` @ `RtlFreeHeap`）。
+- **参数默认契约（X509_VERIFY_PARAM_set1_host len==0 语义）**：
+  在 OpenSSL C ABI 规范中，`X509_VERIFY_PARAM_set1_host(param, name, len)` 的 `len == 0` 并非清空期望主机名，而是指 `name` 为以 NUL 结尾的标准 C 字符串，长度由 `strlen(name)` 自动计算（`name == NULL` 才是重置清空）。微内核实现若凭直觉把 `len == 0` 当做空串清空，会导致上层（如 `TlsStream.zan` 传 0）失去主机名保护，测试判定域名不匹配反常通过或报失败。凡实现或复刻标准兼容层，必须严格对齐缺省参数语义。
+- **macOS 跨平台交叉链接的未解析符号**：
+  macOS 动态库在没有宿主完整 SDK 的情况下使用 lld 交叉链接时，动态运行时符号（`calloc`, `free`, `snprintf` 等）需要添加 `-fno-stack-protector "-Wl,-undefined,dynamic_lookup"`，否则 ld64.lld 会将 libc 符号报错为 undefined symbol；在 PowerShell 中执行时必须将包含逗号的链接器参数整体双引号引起来（`"-Wl,-undefined,dynamic_lookup"`），避免逗号被 PowerShell 语法解析为数组分割符。
+
+
 ## GenForm：带字 label 的字段名会被 text 的 syncName 吃掉（2026-09-17）
 
 - **PropSpec.Text 工厂自带 `syncName=true`**：`SetProp("text", …)` 会把
@@ -1935,24 +1954,25 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   的文件）重编基线 zanc 跑同用例。契约用例
   conformance/async_shadow_same_name_across_await 四形态绿为准。
 
-## 二进制格式补丁器（APK AXML 字符串池）：改解析先写 walk 探针（2026-09-23）
+## 二进制格式补丁器（APK AXML axml_patch）：改解析先写 walk 探针（2026-09-23）
 
 - **ResStringPool 两种池两种长度形式，别按单一形态写解析**：UTF-16 池
   条目=u16 长度前缀，≥0x8000 时扩成 32 位形式（低 15 位<<16 | 下一个
   u16）；UTF-8 池条目是**双前缀**（u16 单元数 + u8 字节数，各自 ≥128
   时扩为 16 位形式 `0x80|hi,lo`）——aapt2 产物真实如此，只认单前缀
-  要么显式拒绝长串、要么整体错位。重造条目必须按规范双前缀
-  （坑出处：APK manifest 补丁器见高位就拒绝，包名/标签 >127 构建
-  失败；配置侧 128 字节 snprintf 静默截断成错包名更糟，均改显式报错）。
+  要么 `return -1` 拒绝长串、要么整体错位。重造条目必须按规范双前缀
+  （坑出处：apk.c:293 见高位就拒绝，包名/标签 >127 直接构建失败；
+  zan.proj 侧 128 字节 snprintf 静默截断成错包名更糟，已同批改显式报错）。
 - **未触碰的池条目原样 memcpy 保留（前缀+数据+终结符），不要重编码**——
   重编码改偏移会牵连引用它的树块；只有替换目标用新编码。
 - **改二进制解析器前，先用独立脚本线性走查模板自洽（walk 探针）再动手，
   改完立刻跑探针**：把硬编码常量参数化重构时，分支里忘重置派生变量
-  （如 UTF-16 分支长度前缀字节数忘设 2）读侧整体错位 1 字节、占位符
-  全找不到——先建好的探针当场抓住，没让它流进提交。
-## 泛型 TP 按简单名全局注册：用户同名类击穿一切泛型方法调用（2026-09-23）
+  （如 UTF-16 分支 hl 忘设 2）读侧整体错位 1 字节、占位符全找不到——
+  先建好的探针当场抓住，没让它流进提交。
 
-- **症状**：用户声明 `class T` 后，泛型类的成员方法调用
+## 泛型 TP 按简单名全局注册：用户同名类击穿一切泛型方法调用（A350，2026-09-23）
+
+- **症状**：用户声明 `class T` 后，`Binding<T>`/自家泛型类的成员方法调用
   全线 `no overload of 'Binding.Set' matches argument type(s)`（checker
   沉默，irgen 打分拒绝）；`Get()` 正常（0 参不经过参数打分）。桌面/
   android 无差别，与拉入面无关——**同名类在哪，毒就在哪**。
@@ -1973,11 +1993,11 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   字段/参数全红，假象），真差异是**类名**（Program vs T）。改类名二分
   一击定位，比读打分代码快一个数量级。
 
-## 合成值进 store 必带 owned 信号：算了没用的 fval_owned = 半截线（2026-09-23）
+## 合成值进 store 必带 owned 信号：算了没用的 fval_owned = 半截线（A351，2026-09-23）
 
-- **症状**：leakcheck 门禁孪生红，退出恒剩 1 个 Binding 盒；探针二分
-  只有"对象初始化器写 Binding 字段"这一种形状漏（纯赋值、局部声明、
-  两次普通赋值全绿）。
+- **症状**：full 门禁档 leakcheck 孪生红，退出恒剩 1 个 Binding 盒；
+  探针二分只有"对象初始化器写 Binding 字段"这一种形状漏（纯赋值、
+  局部声明、两次普通赋值全绿）。
 - **根因**：`emit_binding_value` 交出 **+1 新盒**，但初始化器路径把
   **原始 RHS**（字面量/参数=借用）递给 `emit_rc_store_field`——所有权
   测试跑在 AST 节点上，判定借用再 retain 一次，盒 rc=2 落字段，出口
@@ -1992,7 +2012,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
 - **定位手法**：leakcheck 红先做**形状二分**（删构造器/删初始化器/
   换局部），一个维度一轮 30 秒；判 ownership 争议直接 `--emit-ir`
   数 retain/release，比读三层调用链快。
-## 服务端 stdlib 退出泄漏：静态根 + 永生协程帧，拆卸必须对称且先于泵等待（2026-09-24）
+## 服务端 stdlib 退出泄漏：静态根 + 永生协程帧，拆卸必须对称且先于泵等待（A352，2026-09-24）
 
 - **症状**：网络类 leakcheck 孪生（mqtt/ws/sse/webdav）测试逻辑全过、
   退出恒报"仍可达"：broker 的三个列表、静态共享总线、Worker 静态
@@ -2012,7 +2032,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
 - **定位手法**：泄漏计数对不上预期时，按"谁还可达"往根上追——
   报表给的是分配点，持有人要在类型图里找（static 槽 → 帧 → this
   → 字段列表）；改完先跑单测试再跑窄层，别拿泵等待时长硬凑。
-## 链式 owned 接收者在内建分支泄漏；泄漏报表的站点名会撒谎（2026-09-24）
+## 链式 owned 接收者在内建分支泄漏；泄漏报表的站点名会撒谎（A355，2026-09-24）
 
 - **症状**：webdav/HTTP 服务端 leakcheck 恒报漏 N 个
   `HttpClient.zan:1271` 的 StringBuilder，但**有体响应不漏、空体
@@ -2043,16 +2063,6 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   前提。**教训：leakcheck 报表的 file:line 只是同形状槽位的名字，
   不是持有人；先验证站点名，再顺着名字修**。
 
-## 跨平台硬件加速 Crypto/TLS 微内核替换与 ABI 契约（2026-09-24）
-
-- **胖驱动瘦身与生命周期引用计数（X509 存储）**：
-  OpenSSL 历史多平台驱动体积达 5MB+，采用单 TU 原生微内核（AES-NI/PCLMULQDQ 硬件加速，几十 KB）替代时，必须精准遵循 OpenSSL 的所有权语义。例如 X509 证书同时被上层调用方句柄和 `SSL_CTX` 的 `cert_store` 引用；`X509_STORE_add_cert` 接管时必须递增 `ref_count`，`X509_free` 递减至 0 时才真正 free。若做浅拷贝或单侧硬析构，`SSL_CTX_free` 析构证书库时会触发严重的堆破坏与崩溃（`0xc0000374` @ `RtlFreeHeap`）。
-- **参数默认契约（X509_VERIFY_PARAM_set1_host len==0 语义）**：
-  在 OpenSSL C ABI 规范中，`X509_VERIFY_PARAM_set1_host(param, name, len)` 的 `len == 0` 并非清空期望主机名，而是指 `name` 为以 NUL 结尾的标准 C 字符串，长度由 `strlen(name)` 自动计算（`name == NULL` 才是重置清空）。微内核实现若凭直觉把 `len == 0` 当做空串清空，会导致上层（如 `TlsStream.zan` 传 0）失去主机名保护，测试判定域名不匹配反常通过或报失败。凡实现或复刻标准兼容层，必须严格对齐缺省参数语义。
-- **macOS 跨平台交叉链接的未解析符号**：
-  macOS 动态库在没有宿主完整 SDK 的情况下使用 lld 交叉链接时，动态运行时符号（`calloc`, `free`, `snprintf` 等）需要添加 `-fno-stack-protector "-Wl,-undefined,dynamic_lookup"`，否则 ld64.lld 会将 libc 符号报错为 undefined symbol；在 PowerShell 中执行时必须将包含逗号的链接器参数整体双引号引起来（`"-Wl,-undefined,dynamic_lookup"`），避免逗号被 PowerShell 语法解析为数组分割符。
-
-
 ## 编译期生成器（GenRoute/GenDb）：合成源码的三类坑（2026-09-25）
 
 - **表单类绑定不得写静态字段**：GenRoute 对类参数逐字段生成
@@ -2076,12 +2086,12 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   会解析 `_scratch/wt_xxx/packages/`（快照提交态），仓库里**未提交**的包
   改动编不进去，症状是"改了包源码、产物行为照旧"。用快照二进制编当前
   工作区前，把在途的包文件同步进 worktree（`diff -q` 先验一遍）。
-- **编译器重 build 会使 ZanGen 自举缓存失效**（用户目录 `Zan/gen/`），
+- **编译器重 build 会使 ZanGen 自举缓存失效**（`AppData/Local/Zan/gen/`），
   首编重新拉起 codegen 自举编译——zanc WIP 的类型检查回归（如 string→nint
-  误报，探针 `NativeMemory.Compare(string, string, n)`，ByteBuffer.zan:399
+  误报，探针见 `NativeMemory.Compare(string, string, n)`，ByteBuffer.zan:399
   即此用法）会在这一步显形，别误判成自己代码的问题；最小探针 + 已知好
-  二进制对照即可定位，多文件项目编译时 e2e 套件预留 `ZANC=` 环境变量切换
-  二进制。
+  二进制（如 `_scratch/wt-fd20/build/zanc.exe`）对照即可定位，多文件项目
+  编译时 e2e 预留 `ZANC=` 环境变量切换二进制。
 
 ## expr_yields_owned_rc_value 成员访问与返回值 ARC 所有权判定（2026-09-25）
 
@@ -2130,6 +2140,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   4. **单周期掩码抽取**：比对发射 `vpcmpeqb`，掩码提取调用 `llvm.x86.avx2.pmovmskb` 直出 32 位通用寄存器掩码，32 字节单周期步长扫描吞吐突破 2.77 GB/s。
 - **内建方法名匹配陷阱**：在 `irgen_expr.c` 进行方法名长度比对时，`ExtractMostSignificantBits` 字符数严格为 26（非 27），长度计算偏差会导致内建短路失败回退至未解析外部符号。
 
+
 ## 硬件加速纵切：运行时只通能力、纯 Zan 承载实现（2026-09-26）
 
 - **架构定式（用户明确否决便携 C 参考实现）**：算法实现全部住在 stdlib
@@ -2162,18 +2173,6 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   诚实长度是 -16 计数字。emit_string_len_ex 有 array_count 形参，
   **所有调用点都要给 1**——旧代码 bounds 检查已经用 1 而 .Length 还
   用 0，两条路不一致正是 bug 藏身处：strlen 在首个 NUL 截断，十六
-  进制摘要（必然含 0x00 字节）恰好丢尾部。裸 FFI char* 无魔数，仍按
-  strlen 度量（正确的借用语义）。conformance：string_view_length。
-- **KAT 门控用公开常量向量，常量按 API 语义换算**：FIPS-197 C.1
-  （ECB）、SP800-38A F.2.1（CBC）/F.5.1（CTR）、FIPS 180-4
-  （SHA 族）、GB/T 32905（SM3）、RFC 4960（CRC32C）。CRC32C 的
-  更新函数是 continuation 语义（入参预反转、返回末反转），KAT 常量
-  必须按这个语义换算——拿标准表值直接取反手算，符号位一错就写成
-  0x1CF9637C 而正确是 0x1CF96D7C，且 KAT 永不通过时才暴露。
-- **逐步 KAT 才能抓域混用**：GHASH 的 x 块 BSWAP 进寄存器域而 y 累
-  加器裸加载，域混用只在 y≠0 的第二步起污染——y=0 的首块自我测试
-  掩住它。换装/仿写 SIMD 内核时，KAT 必须覆盖"累加器非零"的后续步，
-  单块自测不算通过。
   进制摘要（必然含 0x00 字节）恰好丢尾部。裸 FFI char* 无魔数，仍按
   strlen 度量（正确的借用语义）。conformance：string_view_length。
 - **KAT 门控用公开常量向量，常量按 API 语义换算**：FIPS-197 C.1
@@ -2259,24 +2258,24 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   同一输入首跑必冷（全 miss+write，IDE 全量输入 scan 12s vs 暖 0.6s），拿
   冷值横比会得出假回归/假加速。worktree 里的旧 zanc 不必担心 stdlib root：
   exe 相对 root 不存在时回退 CWD/stdlib，照样能在主仓跑。
-- **阶段边界随重构移动，横比单阶段是假账**：parse-once 把按需拉入的闭包
-  工作从 scan 挪进 parse——旧版"scan 11.9s+parse 0.8s"与新版"scan 0.6s+
-  parse 15.7s"前段总和都是 12-16s，单看 parse 会误判 20 倍回归。比较只看
+- **阶段边界随重构移动，横比单阶段是假账**：parse-once 把 pi 闭包工作从
+  scan 挪进 parse——旧版"scan 11.9s+parse 0.8s"与新版"scan 0.6s+parse
+  15.7s"前段总和都是 12-16s，单看 parse 会误判 20 倍回归。比较只看
   scan+parse 总和或全流程总时长。另：IR stats/Scale stats/phase 行全由
   `--time` 门控，漏传则安静无输出；PowerShell 里 `2>&1` 捕不全 zanc 的
   stderr，要用 Start-Process -RedirectStandardError 落文件再读。
 - **顺序敏感的歧义红先在旧提交复现再定责**：nsresolve 冲突改名对输入顺序
   敏感——同一 418 输入的 IDE 全量构建，`sort` 序 101 个 ambiguous、
-  Get-ChildItem 序 418 个、parse-once 交错 append 序 0 个；用全部优化提交
-  之前的基线编译器同样 418 错，证明是既有缺陷、新顺序只是避开。归因"我的
+  Get-ChildItem 序 418 个、parse-once 交错 append 序 0 个；a861fb2c（全部
+  优化提交之前）同样 418 错，证明是既有缺陷、新顺序只是避开。归因"我的
   提交引入回归"前，先在更早提交上用同输入同序复现。
-- **大输入 A/B 基准**：用 IDE 全量构建（build_ide.ps1 形状：入口 html 第一
-  + GCI 序 + 整串 `--link-lib`，缺 ole32 链接必炸 `CoInitializeEx`；无
-  `--auto-stdlib`）——~420 显式输入、906 闭包、3.2M IR 指令、峰值 ~1.2GB、
-  `--publish` 后可做 IDE 启动冒烟（启动后 10 秒仍存活再杀），是对象分片/
-  manifest 类工作的现成验收器。
+- **仓库内大输入 A/B 基准**：OnePlus 402 输入不在仓库，用 IDE 全量构建
+  （build_ide.ps1 形状：入口 html 第一 + GCI 序 + 整串 `--link-lib`，缺
+  ole32 链接必炸 `CoInitializeEx`；无 `--auto-stdlib`）——~420 显式输入、
+  906 闭包、3.2M IR 指令、峰值 ~1.2GB、`--publish` 后可做
+  IDE_RUNNING_OK 启动冒烟，是阶段 3-5 分片/manifest 工作的现成验收器。
 
-## LLVM 文本往返分片的坑：GetValueName 悬垂、平方级打印与元数据门（2026-09-28）
+## LLVM 文本往返分片的坑：GetValueName 悬垂、平方级打印与元数据门（阶段 4，2026-09-28）
 
 - **LLVMGetValueName 返回的指针在改名瞬间失效**：`LLVMSetValueName2(v, new)`
   会释放旧名字符串存储，改名后继续用旧 `const char*` 读到的是新名。坑的
@@ -2288,8 +2287,8 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   为先建 B（验证空闲的一次性名）→RAUW→A 挪临时名→B 才取干净名，每步
   名字即时核对。
 - **LLVMPrintValueToString 是平方级的**：每次调用为整个 module 构建一遍
-  SlotTracker，逐函数打印 N 个体 = O(成员×模块大小)——全量 GUI 构建
-  （7000+ 体/200 万指令级）逐体打印 331s，占分片总时长 84%。一次性
+  SlotTracker，逐函数打印 N 个体 = O(成员×模块大小)——IDE 全量（7477 体
+  /211 万指令）逐体打印 331s，占分片总时长 84%。一次性
   `LLVMPrintModuleToString` 后按 `define` 块切片组装 fragment：331s→5s。
 - **-O2 的 define 头部可以有先于 '@' 的 '('**：优化器给返回类型挂
   `range(i32 0, N)` 属性，`strchr(line,'(')` 取到属性括号、`@` 在其后，
@@ -2299,7 +2298,7 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
 - **文本往返必须给指令级元数据设门**：-O2 向量化给 load/store/branch 挂
   `!llvm.loop`/`!llvm.access.group`，fragment 只含体文本不含元数据定义，
   parse 报 `use of undefined metadata '!0'`。用 `LLVMHasMetadata` 逐体+
-  逐指令检查，带元数据的体和全局留在 coordinator 侧。
+  逐指令检查（IDE 2817 个体被门留在 coordinator），带元数据全局判 BLOCK。
 - **指针键哈希表的迭代序不可再现**：以 LLVMValueRef 指针为键的 decl/travel
   集合，桶序随堆地址漂移——fragment 里 extern 声明顺序两次运行不同，对象
   文件不可再现。所有按 map 收集的发射（声明、travel 全局）先收集到数组

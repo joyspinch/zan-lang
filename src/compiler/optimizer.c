@@ -429,24 +429,25 @@ static void zan_opt_mark_size(zan_irgen_t *g, bool min_size) {
 void zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
     if (level == ZAN_OPT_NONE) return;
 
-    LLVMModuleRef mod = g->mod;
-    const char *passes;
+#if ZAN_LLVM_MAJOR >= 23
+    if (level == ZAN_OPT_SIZE) {
+        zan_opt_mark_size(g, false);
+    } else if (level == ZAN_OPT_SIZE_MIN) {
+        zan_opt_mark_size(g, true);
+    }
+#endif
+
+    zan_opt_run_passes_on_module(g->mod, NULL, level);
+}
+
+void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level) {
+    if (!mod || level == ZAN_OPT_NONE) return;
+    const char *passes = NULL;
     switch (level) {
     case ZAN_OPT_BASIC: passes = "default<O1>"; break;
     case ZAN_OPT_FULL: passes = "default<O2>"; break;
-#if ZAN_LLVM_MAJOR >= 23
-    case ZAN_OPT_SIZE:
-        zan_opt_mark_size(g, false);
-        passes = "default<O2>";
-        break;
-    case ZAN_OPT_SIZE_MIN:
-        zan_opt_mark_size(g, true);
-        passes = "default<O2>";
-        break;
-#else
     case ZAN_OPT_SIZE: passes = "default<Os>"; break;
     case ZAN_OPT_SIZE_MIN: passes = "default<Oz>"; break;
-#endif
     case ZAN_OPT_AGGRESSIVE: passes = "default<O3>"; break;
     default: return;
     }
@@ -455,8 +456,6 @@ void zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
     LLVMPassBuilderOptionsSetVerifyEach(opts, 0);
     LLVMPassBuilderOptionsSetDebugLogging(opts, 0);
 
-    /* Vectorization/unrolling grow code; only the speed levels want them
-     * (Os/Oz optimize for size). */
     if (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE) {
         LLVMPassBuilderOptionsSetLoopInterleaving(opts, 1);
         LLVMPassBuilderOptionsSetLoopVectorization(opts, 1);
@@ -464,7 +463,7 @@ void zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
         LLVMPassBuilderOptionsSetLoopUnrolling(opts, 1);
     }
 
-    LLVMErrorRef err = LLVMRunPasses(mod, passes, NULL, opts);
+    LLVMErrorRef err = LLVMRunPasses(mod, passes, tm, opts);
     if (err) {
         char *msg = LLVMGetErrorMessage(err);
         fprintf(stderr, "warning: LLVM pass pipeline error: %s\n", msg);

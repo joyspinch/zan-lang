@@ -5114,12 +5114,17 @@ int main(int argc, char **argv) {
      * shard pass below has run. */
     const char *mf_json_path = getenv("ZAN_CODEGEN_MANIFEST_JSON");
     const char *shard_env = getenv("ZAN_SHARD");
-    bool want_shard = shard_env && shard_env[0] == '1' &&
-                      (target.arch == ZAN_ARCH_X86_64 ||
-                       target.arch == ZAN_ARCH_AARCH64);
+    const char *no_shard_env = getenv("ZAN_NO_SHARD");
+    bool native_arch = (target.arch == ZAN_ARCH_X86_64 ||
+                        target.arch == ZAN_ARCH_AARCH64);
+    bool shard_opt_out = (shard_env && shard_env[0] == '0') ||
+                         (no_shard_env && no_shard_env[0] == '1');
+    bool want_shard = native_arch && !shard_opt_out &&
+                      ((shard_env && shard_env[0] == '1') || publish_mode);
     zan_cg_manifest_t mf;
     bool mf_built = false;
     if (getenv("ZAN_CODEGEN_MANIFEST") || mf_json_path || want_shard) {
+        zan_opt_strip_unused(&irgen);
         phase("manifest");
         bool mf_native = target.arch == ZAN_ARCH_X86_64 ||
                          target.arch == ZAN_ARCH_AARCH64;
@@ -5222,6 +5227,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    if (shard_n > 0) phase("shard emit");
     if (mf_built) {
         zan_irgen_manifest_free(&mf);
         mf_built = false;
@@ -5230,7 +5236,9 @@ int main(int argc, char **argv) {
     if (effective_opt > ZAN_OPT_NONE) {
         zan_opt_report_t opt_report = zan_optimize(&irgen, NULL, effective_opt);
         zan_opt_report_print(&opt_report);
-        zan_irgen_prune_extern_libs(&irgen);
+        phase("optimize");
+        if (shard_n == 0)
+            zan_irgen_prune_extern_libs(&irgen);
     } else {
         /* Unoptimized build: also skip machine-level optimization, which is
          * the single most expensive phase (edit-compile-run turnaround in the
@@ -5251,7 +5259,8 @@ int main(int argc, char **argv) {
              * libraries too, or the link line keeps asking for native
              * libraries (openssl for a globbed-in TlsStream, ...) that this
              * program never calls. */
-            zan_irgen_prune_extern_libs(&irgen);
+            if (shard_n == 0)
+                zan_irgen_prune_extern_libs(&irgen);
         }
     }
 
@@ -6179,8 +6188,6 @@ int main(int argc, char **argv) {
                 link_cap_exceeded("link inputs", ZAN_MAX_LINK_INPUTS);
             }
         }
-
-        phase("emit obj");
 
         /* ---- link object ? executable ---- */
         int link_ret;

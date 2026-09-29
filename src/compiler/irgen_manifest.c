@@ -52,6 +52,7 @@ static bool mf_name_starts(const char *s, const char *prefix) {
 }
 
 static unsigned char mf_classify(const char *name, int reg_idx) {
+    if (mf_name_starts(name, "zan.abi.")) return ZAN_MF_ADAPTER;
     if (reg_idx >= 0) return ZAN_MF_USER;
     size_t len = strlen(name);
     if (len > 7 && !strcmp(name + len - 7, "$resume"))
@@ -341,16 +342,13 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
      * ordinary synchronous non-generic non-virtual scalar-ABI user bodies
      * whose address is never taken and which make no indirect calls. */
     bool policy_ok = native && !g->emit_debug && !g->check_leaks &&
-                     !g->arc_guard && !g->obfuscate_strings &&
-                     !g->refl_used && !g->emit_lib;
+                     !g->arc_guard && !g->emit_lib;
     for (int i = 0; i < m->fn_count; i++) {
         zan_mf_fn *F = &fns[i];
         if (!F->defined) continue;
         F->eligible = policy_ok &&
-                      F->kind == ZAN_MF_USER &&
-                      F->simple_abi &&
-                      !F->is_async && !F->is_spec && !F->virtual_dispatch &&
-                      !F->addr_taken && !F->indirect_call;
+                      (F->kind == ZAN_MF_USER || F->kind == ZAN_MF_RELEASE) &&
+                      !F->is_async;
     }
     /* clean roots: the transitive direct-call closure stays inside eligible
      * USER bodies + RELEASE helpers (per-class private ARC release bodies —

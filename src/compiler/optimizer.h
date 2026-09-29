@@ -4,6 +4,8 @@
 #define ZAN_OPTIMIZER_H
 
 #include "zan.h"
+#include <llvm-c/Core.h>
+#include <llvm-c/TargetMachine.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -75,6 +77,7 @@ typedef struct {
 zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_level_t level);
 void zan_opt_report_print(const zan_opt_report_t *report);
 void zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level);
+void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level);
 
 /* Reachability-only sweep (LLVM globaldce), for builds that run no pipeline. */
 void zan_opt_strip_unused(zan_irgen_t *g);

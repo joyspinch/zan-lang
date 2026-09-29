@@ -2047,6 +2047,23 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         g->current_fn_body = saved_fn_body;
         g->current_fn_no_runtime = false;
         free(param_types);
+
+        /* AST Body Discarding: Once a non-generic method's body IR has been
+         * emitted, its statement and expression syntax tree is never read again.
+         * Discard the body pointer immediately so subsequent passes and
+         * error contexts do not retain the syntax tree. (Preserve Main/__DesignMain
+         * until emit_main_method has wrapped the entry block). */
+        bool is_entry = (member->method_decl.name.len == 4 &&
+                         memcmp(member->method_decl.name.str, "Main", 4) == 0) ||
+                        (member->method_decl.name.len == 12 &&
+                         memcmp(member->method_decl.name.str, "__DesignMain", 12) == 0);
+        if (!is_entry &&
+            member->kind == AST_METHOD_DECL &&
+            member->method_decl.type_params.count == 0 &&
+            (!work[w].type_sym || !work[w].type_sym->decl ||
+             work[w].type_sym->decl->type_decl.type_params.count == 0)) {
+            member->method_decl.body = NULL;
+        }
     }
 
     g->cur_inst = NULL;

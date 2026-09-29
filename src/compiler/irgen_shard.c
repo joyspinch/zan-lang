@@ -27,6 +27,20 @@
 
 #include <llvm-c/IRReader.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#endif
+static void sh_probe_mem(const char *tag) {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        fprintf(stderr, "    [probe %-22s Commit: %4zu MB, Peak: %4zu MB]\n",
+                tag, pmc.PagefileUsage / (1024 * 1024),
+                pmc.PeakPagefileUsage / (1024 * 1024));
+    }
+#endif
+}
 
 enum {
     SH_F_DECL = 0,  /* referenced fn: safe to declare external */
@@ -67,7 +81,7 @@ static void sh_map_init(sh_map_t *m) {
 
 static void sh_map_free(sh_map_t *m) { free(m->keys); free(m->vals); }
 
-static int sh_map_get(sh_map_t *m, LLVMValueRef k) {
+static int sh_map_get(sh_map_t *m, void *k) {
     size_t i = sh_hash_ptr(k) & (size_t)m->mask;
     while (m->vals[i] >= 0) {
         if (m->keys[i] == k) return m->vals[i];
@@ -76,7 +90,7 @@ static int sh_map_get(sh_map_t *m, LLVMValueRef k) {
     return -1;
 }
 
-static bool sh_map_put(sh_map_t *m, LLVMValueRef k, int v) {
+static bool sh_map_put(sh_map_t *m, void *k, int v) {
     if (m->n * 2 >= m->mask + 1) {
         int ncap = (m->mask + 1) * 4, nmask = ncap - 1;
         void **nk = (void **)malloc((size_t)ncap *
@@ -618,20 +632,34 @@ static bool sh_ident_char(char c) {
 static void sh_harvest_types(sh_state_t *st, sh_sbuf_t *types, const char *text) {
     for (const char *p = text; *p; p++) {
         if (*p != '%') continue;
-        char c = p[1];
-        if (!sh_ident_char(c) || (c >= '0' && c <= '9')) continue;
+        bool quoted = false;
+        const char *s = p + 1;
+        if (*s == '"') {
+            quoted = true;
+            s++;
+        } else if (!sh_ident_char(*s) || (*s >= '0' && *s <= '9')) {
+            continue;
+        }
         char name[256];
         size_t n = 0;
-        const char *s = p + 1;
-        while (sh_ident_char(*s) && n < sizeof(name) - 1) name[n++] = *s++;
+        if (quoted) {
+            while (*s && *s != '"' && n < sizeof(name) - 1) name[n++] = *s++;
+            if (*s == '"') s++;
+        } else {
+            while (sh_ident_char(*s) && n < sizeof(name) - 1) name[n++] = *s++;
+        }
         name[n] = '\0';
         LLVMTypeRef ty = LLVMGetTypeByName2(st->g->ctx, name);
         if (!ty || sh_map_get(&st->type_done, ty) >= 0) continue;
         if (LLVMGetTypeKind(ty) != LLVMStructTypeKind) continue;
         sh_map_put(&st->type_done, ty, 1);
         if (LLVMIsOpaqueStruct(ty)) {
-            char line[300];
-            snprintf(line, sizeof(line), "%%%s = type opaque\n", name);
+            char line[512];
+            if (quoted) {
+                snprintf(line, sizeof(line), "%%\"%s\" = type opaque\n", name);
+            } else {
+                snprintf(line, sizeof(line), "%%%s = type opaque\n", name);
+            }
             sh_sb_puts(types, line);
             continue;
         }
@@ -649,9 +677,14 @@ static void sh_harvest_types(sh_state_t *st, sh_sbuf_t *types, const char *text)
                 LLVMDisposeMessage(es);
             }
         }
-        char line[64];
-        snprintf(line, sizeof(line), "%%%s = type %s{ ", name,
-                 LLVMIsPackedStruct(ty) ? "<" : "");
+        char line[512];
+        if (quoted) {
+            snprintf(line, sizeof(line), "%%\"%s\" = type %s{ ", name,
+                     LLVMIsPackedStruct(ty) ? "<" : "");
+        } else {
+            snprintf(line, sizeof(line), "%%%s = type %s{ ", name,
+                     LLVMIsPackedStruct(ty) ? "<" : "");
+        }
         sh_sb_puts(types, line);
         if (ne) {
             for (unsigned i = 0; i < ne; i++) {
@@ -760,6 +793,9 @@ static bool sh_emit_one(sh_state_t *st, sh_sbuf_t *frag, LLVMTargetMachineRef tm
         return false;
     }
     if (vmsg) LLVMDisposeMessage(vmsg);
+    if (g->obfuscate_strings || getenv("ZAN_SHARD_OPT")) {
+        zan_opt_run_passes_on_module(mod, tm, g->obfuscate_strings ? ZAN_OPT_SIZE : ZAN_OPT_FULL);
+    }
     char *eerr = NULL;
     SH_TRACE("shard emit: verify ok -> codegen\n");
     if (LLVMTargetMachineEmitToFile(tm, mod, path, LLVMObjectFile, &eerr)) {
@@ -830,7 +866,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     *out_objs = NULL;
     if (!m || m->fn_count == 0) return 0;
 
-    long long max_fn = 2000, max_insn = 2000000;
+    long long max_fn = 400, max_insn = 80000;
     const char *e;
     if ((e = getenv("ZAN_SHARD_MAX_FN")) && *e) max_fn = atoll(e);
     if ((e = getenv("ZAN_SHARD_MAX_INSN")) && *e) max_insn = atoll(e);
@@ -927,29 +963,12 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         }
     }
 
-    /* ---- union-find over member->member call edges ---- */
+    /* Direct bin-packing: do not union-find call edges into a single giant
+     * connected component that concentrates 90% of the project in shard 0.
+     * Inter-shard calls are safely lowered via external declarations. */
     for (int k = 0; k < nm; k++) {
         if (mem[k].comp < 0) continue;
-        const zan_mf_fn *F = &m->fns[mem[k].mf_i];
-        for (int c = 0; c < F->call_cnt; c++) {
-            LLVMValueRef cf = LLVMGetNamedFunction(g->mod, m->fns[F->calls[c]].name);
-            if (!cf) continue;
-            int s2 = sh_map_get(&mf2mem, cf);
-            if (s2 < 0 || mem[s2].comp < 0) continue;
-            /* find roots */
-            int a = k;
-            while (uf[a] != a) a = uf[a];
-            int b = s2;
-            while (uf[b] != b) b = uf[b];
-            if (a != b) uf[a] = b;
-        }
-    }
-    for (int k = 0; k < nm; k++) {
-        if (mem[k].comp < 0) continue;
-        int a = k;
-        while (uf[a] != a) a = uf[a];
-        uf[k] = a;
-        mem[k].comp = a;
+        mem[k].comp = k;
     }
 
     /* ---- components ---- */
@@ -1000,8 +1019,8 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             "(%d dropped as unshardable, %d metadata-attached), %d objects\n",
             nm + dropped + meta_skip, nm - dropped, mov_insns, dropped,
             meta_skip, nshard);
-    if (!nshard) {
-        /* everything dropped: nothing to do */
+    if (nshard <= 1) {
+        /* 0 or 1 shard: no benefit from splitting across files, keep single module */
         for (int c = 0; c < ncomp; c++) free(comps[c].idx);
         free(comps); free(shard_of_comp); free(mem);
         sh_map_free(&mf2mem);
@@ -1137,9 +1156,12 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     if (!objs) { snprintf(st.reason, sizeof(st.reason), "out of memory"); st.failed = true; }
 
     /* one whole-module print; member bodies are carved out of this text */
+    sh_probe_mem("before print_mod");
     char *modtxt = st.failed ? NULL : LLVMPrintModuleToString(g->mod);
+    sh_probe_mem("after print_mod");
     int nspans = 0;
     sh_span_t *spans = modtxt ? sh_index_module_text(modtxt, &nspans) : NULL;
+    sh_probe_mem("after index_spans");
     if (!spans) {
         snprintf(st.reason, sizeof(st.reason),
                  "module text index failed");
@@ -1166,7 +1188,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                 if (!sh_map_put(&local, mem[comps[c].idx[j]].fn, 1)) ok = false;
         }
 
-        /* bodies + reference scan */
+        /* reference scan + body assembly */
         for (int c = 0; c < ncomp && ok; c++) {
             if (shard_of_comp[c] != s) continue;
             LLVMValueRef *mbrs = (LLVMValueRef *)malloc(
@@ -1206,14 +1228,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                 const sh_span_t *span =
                     sh_span_find(spans, nspans, LLVMGetValueName(fn));
                 if (!span || !span->len) {
-                    const char *dump = getenv("ZAN_SHARD_DUMP");
-                    if (dump && *dump) {
-                        FILE *df = fopen(dump, "wb");
-                        if (df) {
-                            fwrite(modtxt, 1, strlen(modtxt), df);
-                            fclose(df);
-                        }
-                    }
                     sh_fail(&st, "body '%s' missing from module text",
                             LLVMGetValueName(fn));
                     ok = false;
@@ -1340,6 +1354,9 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             char path[1200];
             snprintf(path, sizeof(path), "%s.shard%d.o", obj_base, s);
             char errbuf[256];
+            char ptag[64];
+            snprintf(ptag, sizeof(ptag), "shard %d: before emit", s);
+            sh_probe_mem(ptag);
             if (sh_emit_one(&st, &frag, tm, path, errbuf, sizeof(errbuf))) {
                 objs[s] = (char *)malloc(strlen(path) + 1);
                 if (objs[s]) strcpy(objs[s], path);
@@ -1348,6 +1365,8 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                 sh_fail(&st, "shard %d: %s", s, errbuf);
                 remove(path);
             }
+            snprintf(ptag, sizeof(ptag), "shard %d: after emit", s);
+            sh_probe_mem(ptag);
         }
 
         sh_map_free(&local);
@@ -1362,7 +1381,10 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         for (int i = 0; i < nspans; i++) free(spans[i].name);
         free(spans);
     }
-    if (modtxt) LLVMDisposeMessage(modtxt);
+    if (modtxt) {
+        LLVMDisposeMessage(modtxt);
+        sh_probe_mem("after modtxt free");
+    }
 
     if (st.failed) {
         /* restore every linkage change, drop partial objects, fall back */
@@ -1515,6 +1537,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             LLVMDeleteFunction(orig);
         }
         free(moves);
+        sh_probe_mem("after delete all bodies");
 
         char *vmsg = NULL;
             if (LLVMVerifyModule(g->mod, LLVMReturnStatusAction, &vmsg)) {
