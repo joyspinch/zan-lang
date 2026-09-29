@@ -230,9 +230,32 @@
     /* 状态条插到表格元素之前（表格常直接躺在 .card 里，同级即视觉上位）；
        表格包在滚动容器里时锚滚动容器，否则状态条跟着横向滚动滚出视野。
        无包裹时必须锚表格本身——锚 parentNode 会把状态条插成卡的兄弟位，
-       卡若躺在 .grid 里就成了多余网格子项，把整页挤成错误自动流 */
+       卡若躺在 .grid 里就成了多余网格子项，把整页挤成错误自动流。
+       卡内已有标题/动作行（div.toolbar / header）时并入该行，不再自占一行：
+       筛选/列/紧凑与页面按钮同排，页顶按钮堆叠从三排降到两排以内。
+       不并进 form——表单里点按钮会触发提交语义。 */
     var barHost = table.closest('.table-scroll') || table;
-    barHost.parentNode.insertBefore(bar, barHost);
+    var mergeInto = barHost.previousElementSibling;
+    if (mergeInto && mergeInto.matches('div.toolbar, header')) {
+      mergeInto.appendChild(bar);
+      bar.classList.add('zt-merged');
+    } else {
+      barHost.parentNode.insertBefore(bar, barHost);
+    }
+
+    /* 横向滚动按需启用：容器一旦 overflow 非 visible 就成为滚动容器，
+       sticky 表头只能锚它（滚动容器陷阱）——表格不超宽时把容器放开成
+       visible，表头随页面滚动钉在面板顶；超宽时恢复 auto，钉住首列/
+       操作列与横向滚动照常。CSS 里的 auto 只是禁 JS 时的兜底。 */
+    var scrollHost = table.closest('.table-scroll');
+    function fitScrollX() {
+      if (!scrollHost) { return; }
+      var need = table.offsetWidth > scrollHost.clientWidth + 1;
+      scrollHost.style.overflowX = need ? 'auto' : 'visible';
+      scrollHost.style.overflowY = 'visible';
+    }
+    fitScrollX();
+    window.addEventListener('resize', fitScrollX);
 
     function setDensity(mode) {
       var compact = mode === 'compact';
