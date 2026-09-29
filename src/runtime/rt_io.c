@@ -4484,6 +4484,13 @@ static int co_worker_count(void) {
      * (see rt_co.h). */
     w = zan_async_cfg_workers();
     if (w <= 0) {
+#if defined(_WIN32)
+        char envbuf[32];
+        DWORD r = GetEnvironmentVariableA("ZAN_CO_WORKERS", envbuf, sizeof(envbuf));
+        if (r > 0 && r < sizeof(envbuf)) w = atoi(envbuf);
+#endif
+    }
+    if (w <= 0) {
         const char *e = getenv("ZAN_CO_WORKERS");
         if (e && *e) w = atoi(e);
     }
@@ -4496,6 +4503,11 @@ static int co_worker_count(void) {
         long n = sysconf(_SC_NPROCESSORS_ONLN);
         w = (n > 0) ? (int)n : 1;
 #endif
+        /* Default cap: on multi-core workstations (16/32/64 cores),
+         * defaulting to every core creates 32+ OS threads with 1MB stack each,
+         * inflating process memory by ~35MB and causing lock contention on idle.
+         * Cap default unconfigured workers to min(CPU count, 4). */
+        if (w > 4) w = 4;
     }
     if (w < 1) w = 1;
     if (w > ZAN_CO_MAXW) w = ZAN_CO_MAXW;

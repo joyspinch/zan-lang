@@ -454,6 +454,7 @@ struct zan_irgen {
     LLVMValueRef soft_scratch_slot; /* per-function entry alloca holding the
                                    * zan_rt_soft_scratch() page pointer */
     LLVMValueRef soft_scratch_fn;   /* the function soft_scratch_slot lives in */
+    bool         publish_mode;    /* --publish: release build without unused bodies */
     bool         strict_runtime;  /* --strict-runtime: main() marks the program
                                    * fail-fast at startup (equivalent to the
                                    * operator setting ZAN_RT_HARD=1), so soft

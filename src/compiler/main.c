@@ -5048,6 +5048,7 @@ int main(int argc, char **argv) {
     }
     irgen.emit_debug = debug_info;
     irgen.strict_runtime = strict_runtime;
+    irgen.publish_mode = publish_mode;
     /* Split guard reports (shared message globals + zan_rt_soft_note2) need
      * the runtime to actually export zan_rt_soft_note2. Host builds link the
      * runtime object built from source alongside zanc, so they always have
@@ -5081,8 +5082,7 @@ int main(int argc, char **argv) {
     bool shard_opt_out = (shard_env && shard_env[0] == '0') ||
                          (no_shard_env && no_shard_env[0] == '1');
     bool want_shard = native_arch && !shard_opt_out &&
-                      (shard_env && shard_env[0] == '1');
-    irgen.enable_streaming_shard = want_shard;
+                      ((shard_env && shard_env[0] == '1') || publish_mode);
 
     if (zan_irgen_emit(&irgen, ast) != ZAN_OK) {
         fprintf(stderr, "error: code generation failed\n");
@@ -5141,9 +5141,7 @@ int main(int argc, char **argv) {
     zan_cg_manifest_t mf;
     bool mf_built = false;
     if (getenv("ZAN_CODEGEN_MANIFEST") || mf_json_path || want_shard) {
-        if (!irgen.enable_streaming_shard) {
-            zan_opt_strip_unused(&irgen);
-        }
+        zan_opt_strip_unused(&irgen);
         phase("manifest");
         bool mf_native = target.arch == ZAN_ARCH_X86_64 ||
                          target.arch == ZAN_ARCH_AARCH64;

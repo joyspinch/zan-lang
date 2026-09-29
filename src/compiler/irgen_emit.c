@@ -1738,6 +1738,19 @@ static bool body_has_live_use(LLVMValueRef fn, const unsigned char *live,
          * by live code. For other globals/constants, keep conservative root. */
         if (LLVMIsAConstantExpr(user) || LLVMIsAConstantArray(user) ||
             LLVMIsAConstantStruct(user)) {
+            LLVMValueRef gv = find_owning_global(user, 0);
+            if (gv && LLVMIsAGlobalVariable(gv)) {
+                const char *gname = LLVMGetValueName(gv);
+                if (gname && strncmp(gname, "__zan_vtable_", 13) == 0) {
+                    const char *cname = gname + 13;
+                    if (class_ctor_is_live(ix, cname, live) ||
+                        vtable_has_live_use(gv, live, ix, 0)) {
+                        return true;
+                    }
+                    /* VTable for an uninstantiated class does not keep this method alive. */
+                    continue;
+                }
+            }
             return true;
         }
         LLVMValueRef parent = LLVMIsAInstruction(user)
@@ -2741,8 +2754,8 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
      * diagnostics are issued only during lowering. Keep user-authored bodies
      * even in publish mode so dead user code cannot hide an error. The publish
      * flag is set before emission; optimization level is chosen afterward. */
-    bool prune_stdlib_bodies = g->obfuscate_strings && !g->emit_debug;
-    bool prune_user = false;
+    bool prune_stdlib_bodies = (g->publish_mode || g->obfuscate_strings) && !g->emit_debug;
+    bool prune_user = prune_stdlib_bodies;
     unsigned char *live = (unsigned char *)calloc((size_t)work_count + 1, 1);
     for (int w = 0; w < work_count; w++) {
         zan_symbol_t *owner = work[w].type_sym;
@@ -2757,6 +2770,12 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
                 zan_ast_node_t *m = work[w].member;
                 bool is_cctor = (m->kind == AST_CONSTRUCTOR_DECL &&
                                  (m->method_decl.modifiers & MOD_STATIC) != 0);
+                bool is_entry = (m->kind == AST_METHOD_DECL &&
+                                 (m->method_decl.modifiers & MOD_STATIC) != 0 &&
+                                 ((m->method_decl.name.len == 4 &&
+                                   memcmp(m->method_decl.name.str, "Main", 4) == 0) ||
+                                  (m->method_decl.name.len == 12 &&
+                                   memcmp(m->method_decl.name.str, "__DesignMain", 12) == 0)));
                 bool is_lib_export = g->emit_lib &&
                     ((m->method_decl.modifiers & MOD_PUBLIC) ||
                      m->kind == AST_CONSTRUCTOR_DECL);
@@ -2780,7 +2799,7 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
                     }
                 }
                 bool has_attrs = (m->meta && m->meta->attributes.count > 0);
-                if (is_cctor || is_lib_export || is_refl_root || has_attrs) {
+                if (is_entry || is_cctor || is_lib_export || is_refl_root || has_attrs) {
                     live[w] = 1;
                 }
             }
@@ -2906,24 +2925,6 @@ done:
             if (zan_diag_has_errors(g->diag)) break;
         }
     } while (pending);
-    if (g->enable_streaming_shard) {
-        for (int w = 0; w < work_count; w++) {
-            if (!live[w]) continue;
-            if (work[w].fn) zan_irgen_shard_harvest_fn(g, work[w].fn);
-            if (work[w].resume_fn) zan_irgen_shard_harvest_fn(g, work[w].resume_fn);
-        }
-        for (int i = 0; i < g->method_spec_count; i++) {
-            if (g->method_specs[i].fn) {
-                zan_irgen_shard_harvest_fn(g, g->method_specs[i].fn);
-            }
-            if (g->method_specs[i].is_async && g->method_specs[i].async_ir) {
-                method_body_work_t *aw = (method_body_work_t *)g->method_specs[i].async_ir;
-                if (aw && aw->resume_fn) {
-                    zan_irgen_shard_harvest_fn(g, aw->resume_fn);
-                }
-            }
-        }
-    }
     free(work_ix.slots);
     for (int w = 0; w < work_count; w++) {
         if (live[w]) continue;
