@@ -818,6 +818,35 @@
   // startup-cached reference would go stale (or null) after the first swap.
   function panelEl() { return document.getElementById('ad-panel'); }
 
+  // ---- stream status strip --------------------------------------------------
+  // 连接状态不再用视口固定浮层：那会一直浮在内容上（滚动也不走），top 还得
+  // 写死顶栏高度。改为一条 sticky 条插在面板顶部，参与文档流、随滚动钉在
+  // 面板可视顶缘；connected 后整条移除零残留。常规断流保持"connecting"
+  // 无 UI（数秒内自愈，不值得内容跳动），只有超过宽限期仍未恢复的实时流
+  // 或今日历史不可用才亮条。
+  function syncStreamNote() {
+    var p = panelEl();
+    if (!p) { return; }
+    var host = p.querySelector('[data-stream]');
+    var s = host ? host.getAttribute('data-stream-status') : 'connected';
+    var d = host ? host.getAttribute('data-day-status') : '';
+    var note = p.querySelector('.stream-note');
+    var bad = s === 'disconnected' || d === 'disconnected';
+    if (!bad) {
+      if (note && s === 'connected') { note.remove(); }
+      return;
+    }
+    var lines = [];
+    if (s === 'disconnected') { lines.push('实时连接中断，正在重连；当前数据可能已过期'); }
+    if (d === 'disconnected') { lines.push('今日历史数据暂不可用，稍后自动重试'); }
+    if (!note) {
+      note = document.createElement('div');
+      note.className = 'stream-note';
+      p.insertBefore(note, p.firstChild);
+    }
+    note.textContent = lines.join('　');
+  }
+
   function startStream() {
     var p = panelEl();
     if (!p) { return; }
@@ -832,6 +861,7 @@
       try {
         paintSnapshot(JSON.parse(ev.data));
         host.setAttribute('data-stream-status', 'connected');
+        syncStreamNote();
       } catch (e) { toast('实时数据格式错误', 'bad'); }
     });
     stream.addEventListener('series', function (ev) {
@@ -854,6 +884,7 @@
           startStream();
         } else if (stream.readyState === 0) {
           host.setAttribute('data-stream-status', 'disconnected');
+          syncStreamNote();
         }
       }, 10000);
     };
@@ -881,11 +912,13 @@
           paintDay(j);
           var host = panelEl() && panelEl().querySelector('[data-stream]');
           if (host) { host.setAttribute('data-day-status', 'connected'); }
+          syncStreamNote();
         })
         .catch(function () {
           if (gen !== streamGen) { return; }
           var host = panelEl() && panelEl().querySelector('[data-stream]');
           if (host) { host.setAttribute('data-day-status', 'disconnected'); }
+          syncStreamNote();
         });
     };
     tick();
