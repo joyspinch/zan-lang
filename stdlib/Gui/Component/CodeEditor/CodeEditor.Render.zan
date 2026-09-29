@@ -467,15 +467,19 @@ partial class CodeEditor {
 
         // 认领以真溢出为前提：整个文档放得下一屏时不认领，滚轮穿透
         // 给外层容器/页面（maxScroll 为 0 时滚了也是原样钳回）。
+        // 折叠生效时按可见行数计滚动范围与溢出。
         int visLines = area.height / lineH;
         if (visLines < 1) { visLines = 1; }
         pageRows = visLines;
 
-        maxScrollY = (lines.Count - visLines) * lineH;
+        int docRows = lines.Count;
+        if (AnyFolded()) { docRows = FoldVisibleTotal(); }
+
+        maxScrollY = (docRows - visLines) * lineH;
         if (maxScrollY < 0) { maxScrollY = 0; }
 
         bool ownsWheel = false;
-        if (lines.Count > visLines) {
+        if (docRows > visLines) {
             ownsWheel = app.CaptureWheel(
                 area.x, area.y, area.width, area.height);
         }
@@ -570,21 +574,29 @@ partial class CodeEditor {
             app.NoteScrollDamage(area.x, area.y, area.width, area.height);
         }
 
+        // 光标/执行行落在隐藏区时先展开覆盖区间，再按可见行号
+        // 保持其在视野内（文档行 ≠ 可见行，二者都经折叠映射换算）。
+        if (AnyFolded()) {
+            UnfoldContaining(curLine);
+            if (execLine >= 0) { UnfoldContaining(execLine); }
+        }
+
         // 仅当本帧光标实际移动时才保持其在视野内；
         // 单纯的滚轮/滚动条滚动不改变光标行，不应把视图拉回光标处。
         if (curLine != ensuredCaretLine) {
+            int caretRow = FoldVisibleRowOf(curLine);
             int topL = scrollY / lineH;
-            if (curLine < topL) {
-                targetScrollY = curLine * lineH;
+            if (caretRow < topL) {
+                targetScrollY = caretRow * lineH;
                 scrollY = targetScrollY;
-                scrollLine = curLine;
+                scrollLine = caretRow;
                 lastScrollMs = app.nowMs;
                 lastHoverMoveMs = app.nowMs;
                 hoverTip = null;
-            } else if (curLine >= topL + visLines) {
-                targetScrollY = (curLine - visLines + 1) * lineH;
+            } else if (caretRow >= topL + visLines) {
+                targetScrollY = (caretRow - visLines + 1) * lineH;
                 scrollY = targetScrollY;
-                scrollLine = curLine - visLines + 1;
+                scrollLine = caretRow - visLines + 1;
                 lastScrollMs = app.nowMs;
                 lastHoverMoveMs = app.nowMs;
                 hoverTip = null;
@@ -911,7 +923,16 @@ partial class CodeEditor {
                 if (hit == id && app.mouseX < area.x + gutterW) {
                     int clicked = LineAtY(lineH, app.mouseY);
                     if (clicked >= lines.Count) { clicked = lines.Count - 1; }
-                    if (clicked >= 0) { ToggleBreakpoint(clicked); }
+                    // 槽位最右一列是折叠标记区：命中折叠起点时切换折叠，
+                    // 其余槽位点击仍是断点开关。
+                    int foldX = area.x + gutterW - app.Scale(18);
+                    if (clicked >= 0 && app.mouseX >= foldX
+                        && app.mouseX < area.x + gutterW - app.Scale(4)
+                        && FoldableAt(clicked)) {
+                        ToggleFold(clicked);
+                    } else if (clicked >= 0) {
+                        ToggleBreakpoint(clicked);
+                    }
                     app.RequestRedraw();
                 }
             }
@@ -1158,6 +1179,14 @@ partial class CodeEditor {
                 int numW = num.Length * digitW;
                 c.DrawText(area.x + gutterW - numW - app.Scale(8), textY, num,
                            lineNumberColor, fontSize);
+
+                // 折叠标记：有效折叠起点行在槽位最右列画箭头，
+                // 折叠中 ▸、展开 ▾；点击该列切换（见槽位点击处理）。
+                if (FoldableAt(ln)) {
+                    string chev = FoldedAt(ln) ? "▸" : "▾";
+                    c.DrawText(area.x + gutterW - app.Scale(16), textY, chev,
+                               lineNumberColor, fontSize);
+                }
 
                 string text = lines[ln];
 

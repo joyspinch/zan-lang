@@ -403,6 +403,15 @@ partial class CodeEditor {
     int lastHoverX;
     int lastHoverY;
 
+    // ---- 代码折叠 ----
+    // 区间来自宿主（LSP foldingRange）：0 起行号、闭区间 [start,end]，
+    // end 行保持可见；按 start 升序存放，与 foldEnd/foldFolded 平行。
+    // 文本一变（BumpTextVersion）即全部展开：行号已漂移的区间
+    // 不允许继续隐藏内容，宿主随后重新注入。
+    List<int> foldStart;
+    List<int> foldEnd;
+    List<bool> foldFolded;
+
     // 右键上下文菜单状态。
     bool ctxOpen;
     int ctxX;
@@ -648,8 +657,15 @@ partial class CodeEditor {
     }
 
     /// 标记文本已被修改，递增单调版本号。
+    /// 编辑会让折叠区间的行号漂移，因此顺带全部展开，
+    /// 由宿主在语义刷新后重新注入区间。
     void BumpTextVersion() {
         textVersion = textVersion + 1;
+        if (foldFolded != null) {
+            for (int i = 0; i < foldFolded.Count; i = i + 1) {
+                foldFolded[i] = false;
+            }
+        }
     }
 
     /// 载入整段文本（SetLines 的字符串版），同时清空 CodeLens、
@@ -1270,10 +1286,20 @@ partial class CodeEditor {
         }
         int ln = scrollY / lineH;
         if (ln < 0) { ln = 0; }
+        // 折叠生效时滚动位置按可见行号解释：先映射回文档行，
+        // 循环里再跳过被折叠区间隐藏的行（起点行保持可见）。
+        if (AnyFolded()) {
+            if (ln >= lines.Count) { ln = lines.Count - 1; }
+            ln = FoldDocLineOfRow(ln);
+        }
         int subOffset = scrollY % lineH;
         if (subOffset < 0) { subOffset = 0; }
         int y = area.y - subOffset;
         while (ln < lines.Count && y < bottom) {
+            if (AnyFolded() && FoldHides(ln)) {
+                ln = FoldNextVisible(ln);
+                continue;
+            }
             int ly = 0 - 1;
             string decl = "";
             string lnt = lines[ln];
