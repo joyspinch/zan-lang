@@ -1538,6 +1538,39 @@
                      width: dr.getAttribute('data-width') || '420px' });
       return;
     }
+    // 表单分组页签：纯前端切换 .form-pane，不改 URL 不发请求。
+    var ft = ev.target.closest('.form-tab');
+    if (ft) {
+      ev.preventDefault();
+      var fbox = ft.closest('form');
+      if (fbox) {
+        var ftabs = fbox.querySelectorAll('.form-tab');
+        for (var fi = 0; fi < ftabs.length; fi++) {
+          ftabs[fi].classList.toggle('active', ftabs[fi] === ft);
+        }
+        var fpanes = fbox.querySelectorAll('.form-pane');
+        for (var fp = 0; fp < fpanes.length; fp++) {
+          fpanes[fp].classList.toggle('active',
+            fpanes[fp].getAttribute('data-pane') === ft.getAttribute('data-pane'));
+        }
+      }
+      return;
+    }
+    // 列表状态页签：带着当前筛选参数切换该列的值并回第一页。
+    var gt = ev.target.closest('.gen-tab');
+    if (gt) {
+      ev.preventDefault();
+      var bar = gt.closest('.gen-tabbar');
+      var col = bar ? bar.getAttribute('data-tab-col') : '';
+      if (col) {
+        var u = new URL(state.active || location.href, location.origin);
+        var val = gt.getAttribute('data-tab-val') || '';
+        if (val) { u.searchParams.set(col, val); } else { u.searchParams.delete(col); }
+        u.searchParams.delete('page');
+        open(u.pathname + (u.search ? u.search : ''), gt.textContent.trim());
+      }
+      return;
+    }
     // Exports download in place: confirm (if asked), fetch to a blob so the
     // SPA shell never navigates away, then toast. No new tab, no reload.
     var x = ev.target.closest('[data-export]');
@@ -1760,6 +1793,7 @@
     'mdi:book-multiple': '<path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/>',
     'mdi:book-open': '<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>',
     'mdi:chart-line': '<path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/>',
+    'mdi:chart-bar': '<line x1="6" x2="6" y1="20" y2="14"/><line x1="12" x2="12" y1="20" y2="8"/><line x1="18" x2="18" y1="20" y2="4"/>',
     'mdi:chart-timeline-variant': '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
     'mdi:clock-outline': '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
     'mdi:cog': '<line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/>',

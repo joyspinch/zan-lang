@@ -19,6 +19,7 @@ class Program {
         c.relLabel = "";
         c.filterOp = "";
         c.listWidth = "";
+        c.tabGroup = "";
         c.defValue = "";
         return c;
     }
@@ -34,7 +35,9 @@ class Program {
         t.orderColumn = "name";
         t.orderDesc = 0;
         t.pageSize = 50;
-        t.frontEnabled = 1;
+        t.menuIcon = "mdi:chart-bar";
+        t.tabColumn = "state";
+        t.exportEnabled = 1;
         t.apiEnabled = 0;
         List<SysGenColumn> cols = new List<SysGenColumn>();
         SysGenColumn name = Program.Blank(new SysGenColumn());
@@ -73,15 +76,19 @@ class Program {
         day.kind = "datetime";
         day.label = "Day";
         day.widget = "date";
+        day.inList = 1;
         day.inEdit = 1;
         day.inFilter = 1;
         cols.Add(day);
+        /* state 是列表页签列（dict）：页签喂数走字典项，常规筛选让位给页签。 */
         SysGenColumn state = Program.Blank(new SysGenColumn());
         state.name = "state";
         state.kind = "int";
         state.label = "State";
         state.widget = "select";
         state.dictType = "gen_state";
+        state.tabGroup = "进度信息";
+        state.inList = 1;
         state.inCreate = 1;
         state.inEdit = 1;
         state.inFilter = 1;
@@ -99,8 +106,6 @@ class Program {
         otherId.inEdit = 1;
         otherId.inFilter = 1;
         cols.Add(otherId);
-        /* enabled 排在 inList 第四，让 meta 前三是 name/code/otherId；bool
-           名命中发布过滤列（published/status/enabled）。 */
         SysGenColumn enabled = Program.Blank(new SysGenColumn());
         enabled.name = "enabled";
         enabled.kind = "bool";
@@ -116,6 +121,7 @@ class Program {
         qty.label = "Qty";
         qty.widget = "number";
         qty.filterOp = "range";
+        qty.tabGroup = "进度信息";
         qty.inFilter = 1;
         qty.inEdit = 1;
         qty.required = 1;
@@ -125,10 +131,8 @@ class Program {
         Directory.CreateDirectoryRecursive(root + "/src/Model/Gen");
         Directory.CreateDirectoryRecursive(root + "/src/Controller/Admin");
         Directory.CreateDirectoryRecursive(root + "/src/Controller/Api");
-        Directory.CreateDirectoryRecursive(root + "/src/Controller/Front");
         Directory.CreateDirectoryRecursive(root + "/src/Dao/Gen");
         Directory.CreateDirectoryRecursive(root + "/views/Admin");
-        Directory.CreateDirectoryRecursive(root + "/views/Front");
         /* designed 是设计行本身：Pick 需要关联表的路由（section/tableName）。 */
         List<SysGenTable> designed = new List<SysGenTable>();
         SysGenTable other = new SysGenTable();
@@ -139,12 +143,12 @@ class Program {
         designed.Add(other);
         designed.Add(t);
         List<string> paths = CoderController.TargetPaths(t, root);
-        Program.Check(paths.Count == 8, "default 8 targets");
+        Program.Check(paths.Count == 5, "default 5 targets");
         for (int i = 0; i < paths.Count; i = i + 1) {
             if (File.Exists(paths[i])) { File.Delete(paths[i]); }
         }
         List<string> sources = CoderController.SourceList(t, cols, designed);
-        Program.Check(sources.Count == 8, "default 8 sources");
+        Program.Check(sources.Count == 5, "default 5 sources");
         Program.Check(sources[0].Contains("&lt;/summary&gt; private void Hack()"), "comment single line");
         Program.Check(sources[1].Contains("Quoted \\\"title\\\""), "string literal escaped");
         Program.Check(sources[1].Contains("if (id == 0) {"), "create-only input guarded");
@@ -161,17 +165,16 @@ class Program {
             "admin controller keeps ORM lowering shapes");
         Program.Check(sources[2].Contains("db.Select<GenSample>()")
             && sources[2].Contains("ExecuteIdentityAsync()"), "dao uses ORM API surface");
-        Program.Check(sources[5].Contains("WhereIf(kw.Length > 0")
-            && sources[5].Contains(".FirstAsync()"), "front controller keeps ORM lowering shapes");
         Program.Check(sources[1].Contains("d.Set(\"remark\", e.remark);")
             && !sources[1].Contains("e.remark\""),
             "string edit form fill emits valid call");
-        Program.Check(sources[5].Contains("d.Set(\"remark\", e.remark);"),
-            "front show emits valid member call");
         /* 设计器排序/页大小配置落地：Paged 列与页大小 + 两条查询链的 OrderBy 方向。 */
         Program.Check(sources[1].Contains("this.Paged(\"name\", 50)")
             && sources[1].Contains(".OrderBy(a => a.name)"), "admin order and page size from design");
-        Program.Check(sources[5].Contains(".OrderBy(a => a.name)"), "front order from design");
+        /* 菜单图标：发射进 Index 的 IsMenu 特性（layout 的 data-icon 槽消费）。 */
+        Program.Check(sources[1].Contains(
+                "[Custom(IsMenu = true, Perm = PermBit.View, Icon = \"mdi:chart-bar\")]"),
+            "menu icon emitted");
         /* inFilter 接线：Screen 声明筛选原语，Index 发射对齐 Collect 语义的 WhereIf；
            filterOp 消费——auto(文本 LIKE)、eq(精确)、range(数值区间)。 */
         Program.Check(sources[1].Contains("async ListPage Screen()")
@@ -200,10 +203,42 @@ class Program {
         Program.Check(sources[1].Contains("WhereIf(fdayF > 0, a => a.day >= fdayF)")
             && sources[1].Contains("WhereIf(fdayT > 0, a => a.day <= fdayT + 86399)"),
             "datetime filter where");
-        Program.Check(sources[1].Contains("WhereIf(fstateN >= 0, a => a.state == fstateN)"),
-            "dict filter where");
         Program.Check(sources[1].Contains("WhereIf(fotherIdN >= 0, a => a.otherId == fotherIdN)"),
             "rel filter where");
+        /* 列表状态页签：tabColumn 列强制精确值语义、Screen 不再发同列筛选，
+           Index 喂「全部」+ 选项行，视图发 gen-tabbar。 */
+        Program.Check(sources[1].Contains("List<StrMap> tabItems = d.AddList(\"tabItems\")")
+            && sources[1].Contains("d.Set(\"tabCol\", \"state\");")
+            && sources[1].Contains("tabAll.Set(\"value\", \"\")")
+            && sources[1].Contains("ByTypeCodeActive(\"gen_state\")"),
+            "tab items fed with all-option and dict options");
+        Program.Check(sources[1].Contains("WhereIf(fstateN >= 0, a => a.state == fstateN)"),
+            "tab column filters as eq");
+        Program.Check(!sources[1].Contains(".Select(\"State\", \"state\""),
+            "tab column removed from screen filters");
+        Program.Check(sources[3].Contains("gen-tabbar") && sources[3].Contains("data-tab-col=\"{{tabCol}}\"")
+            && sources[3].Contains("data-tab-val=\"{{value}}\""),
+            "list view renders tabbar");
+        /* CSV 导出：Export 动作（Export 权限位）+ 翻译/转义 helper + 视图按钮。 */
+        Program.Check(sources[1].Contains("[Custom(Perm = PermBit.Export)]")
+            && sources[1].Contains("async void Export()")
+            && sources[1].Contains(".Take(50000).ToListAsync()")
+            && sources[1].Contains("this.Ctx().Download(\"gen_sample.csv\", \"text/csv; charset=utf-8\", sb.ToString())"),
+            "export action shape");
+        Program.Check(sources[1].Contains("static string CsvCell(string v)")
+            && sources[1].Contains("if ((v[i] & 255) == 34)")
+            && sources[1].Contains("static string CsvDict(StrMap m, string raw)"),
+            "csv helpers emitted");
+        Program.Check(sources[1].Contains("head = head + CsvCell(\"ID\")")
+            && sources[1].Contains("CsvDict(otherIdNames, Convert.ToString(rows[i].otherId))")
+            && sources[1].Contains("CsvDict(stateMap, Convert.ToString(rows[i].state))")
+            && sources[1].Contains("(rows[i].enabled == 1 ? \"是\" : \"否\")")
+            && sources[1].Contains("(rows[i].day > 0 ? Fmt.DayInput(rows[i].day) : \"\")"),
+            "export columns translated");
+        Program.Check(sources[3].Contains("href=\"{{exportUrl}}\" data-export>导出CSV</a>"),
+            "list view exports button");
+        Program.Check(sources[1].Contains("d.Set(\"exportUrl\", \"/admin/content/gensample/export\");"),
+            "export url fed");
         /* 每表 options 端点（data-pick 契约）+ 关联筛选升级为远程搜索。 */
         Program.Check(sources[1].Contains("async void Options()")
             && sources[1].Contains("WhereContains(\"name\", kw)")
@@ -234,7 +269,8 @@ class Program {
             && sources[1].Contains("Other 所选记录不存在"), "rel existence check");
         Program.Check(sources[1].Contains("items[i].Set(\"otherIdName\", otherIdNames.Get(items[i].Get(\"otherId\")))"),
             "rel label projected into list rows");
-        /* 表单：datetime 走 date 控件与 ParseDay/DayInput，字典/关联服务端喂数。 */
+        /* 表单：datetime 走 date 控件与 ParseDay/DayInput，字典/关联服务端喂数；
+           tabGroup 分桶——多桶发页内页签，全部置空回落平铺。 */
         Program.Check(sources[1].Contains("e.day = Fmt.ParseDay(dayRaw);")
             && sources[1].Contains("Day 格式应为 YYYY-MM-DD"), "datetime save parses day");
         Program.Check(sources[1].Contains("Fmt.DayInput(e.day)"), "datetime edit backfill");
@@ -249,23 +285,23 @@ class Program {
             && sources[4].Contains("{{#if stateNone}}"), "select view consumes fed options");
         Program.Check(sources[4].Contains("type=\"date\" name=\"day\""), "datetime widget is date input");
         Program.Check(sources[4].Contains("{{#each otherIdOpts}}"), "rel select view consumes fed options");
+        Program.Check(sources[4].Contains("form-tabs") && sources[4].Contains("class=\"form-tab active\" data-pane=\"0\"")
+            && sources[4].Contains("class=\"form-pane active\" data-pane=\"0\"")
+            && sources[4].Contains("进度信息"), "form groups render as tabs");
+        Program.Check(sources[4].Contains("<footer class=\"lay-footer\">")
+            && sources[4].Contains("type=\"submit\">保存</button>")
+            && sources[4].Contains("data-close>取消</button>"), "form view carries save footer");
+        state.tabGroup = "";
+        qty.tabGroup = "";
+        string flatForm = Gen.FormViewSource(t, cols, designed);
+        Program.Check(!flatForm.Contains("form-tab") && flatForm.Contains("<div class=\"form\">")
+            && flatForm.Contains("<footer class=\"lay-footer\">"),
+            "single group stays flat");
+        state.tabGroup = "进度信息";
+        qty.tabGroup = "进度信息";
         /* 生成时间戳：可辨识产物新旧。 */
         Program.Check(sources[0].StartsWith("/* 由表设计器生成于 ")
             && sources[3].StartsWith("<!-- 由表设计器生成于 "), "generation timestamp headers");
-        /* 前台加富：发布过滤（enabled 命中）、SEO meta、关联标签进列表与详情。 */
-        Program.Check(sources[5].Contains(".Where(a => a.enabled == 1)"),
-            "front publish filter");
-        Program.Check(sources[5].Contains(".Where(a => a.id == id).Where(a => a.enabled == 1).FirstAsync()"),
-            "front show hides unpublished");
-        Program.Check(sources[5].Contains("d.Set(\"ogTitle\", e.name);")
-            && sources[5].Contains("d.Set(\"ogUrl\", siteUrl + \"/gen_sample/\""),
-            "front show SEO meta");
-        Program.Check(sources[5].Contains("items[i].Set(\"otherIdName\","),
-            "front list rel label projection");
-        Program.Check(sources[6].Contains("{{#if otherIdName}}<span>{{otherIdName}}</span>{{/if}}"),
-            "front list meta shows rel label");
-        Program.Check(sources[7].Contains("{{#if otherIdName}}<div class=\"gen-fact\">"),
-            "front show facts show rel label");
         CoderController.WriteSources(paths, sources, false);
         for (int i = 0; i < paths.Count; i = i + 1) {
             Program.Check(File.Exists(paths[i]) && File.ReadAllText(paths[i]) == sources[i], "published " + Convert.ToString(i));
@@ -279,11 +315,11 @@ class Program {
         }
         CoderController.WriteSources(paths, replaced, true);
         Program.Check(File.ReadAllText(paths[0]) == replaced[0], "force overwrite publishes");
-        /* apiEnabled=1：第 9 文件 JSON 接口（Grant+View，Query 同款筛选 + Detail）。 */
+        /* apiEnabled=1：第 6 文件 JSON 接口（Grant+View，Query 同款筛选 + Detail）。 */
         t.apiEnabled = 1;
         List<string> apiPaths = CoderController.TargetPaths(t, root);
         List<string> apiSources = CoderController.SourceList(t, cols, designed);
-        Program.Check(apiPaths.Count == 9 && apiSources.Count == 9, "api adds ninth file");
+        Program.Check(apiPaths.Count == 6 && apiSources.Count == 6, "api adds sixth file");
         Program.Check(apiPaths[5] == root + "/src/Controller/Api/GenSampleApiController.zan",
             "api file path");
         string api = apiSources[5];
@@ -296,21 +332,18 @@ class Program {
         Program.Check(api.Contains("WhereIf(fcode.Length > 0, a => a.code == fcode)")
             && api.Contains("WhereIf(fqtyFR.Length > 0, a => a.qty >= fqtyF)"),
             "api query carries same filters");
+        Program.Check(!api.Contains("tabItems"), "api has no tab wiring");
         Program.Check(api.Contains("this.Fail(404, \"0404\", \"记录不存在\")")
             && api.Contains("outp.Put(\"total\", JsonValue.NewNum(Convert.ToString(total)))")
             && api.Contains("o.Put(\"name\", JsonValue.NewStr(rows[i].name))")
             && api.Contains("o.Put(\"qty\", JsonValue.NewNum(Convert.ToString(rows[i].qty)))")
             && api.Contains("this.Ok(outp.ToJson())"), "api json projection");
         Program.Check(api.Contains(".Skip((page - 1) * 50).Take(50)"), "api page size clamped from design");
-        /* frontEnabled=0：前台三件退出，apiEnabled=0 时只剩 5 件。 */
-        t.frontEnabled = 0;
-        Program.Check(CoderController.TargetPaths(t, root).Count == 6
-            && CoderController.SourceList(t, cols, designed).Count == 6, "front off drops three files");
+        /* apiEnabled=0：只剩 5 件（前台三件已从生成器移除）。 */
         t.apiEnabled = 0;
         Program.Check(CoderController.TargetPaths(t, root).Count == 5
-            && CoderController.SourceList(t, cols, designed).Count == 5, "both off leaves five files");
+            && CoderController.SourceList(t, cols, designed).Count == 5, "api off leaves five files");
         t.apiEnabled = 1;
-        t.frontEnabled = 1;
         List<string> blocked = new List<string>();
         blocked.Add(root + "/rollback-first.zan");
         blocked.Add(paths[0]);

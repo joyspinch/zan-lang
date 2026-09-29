@@ -53,8 +53,12 @@ class CoderController : AdminController {
         d.Set("dialogTitle", "新建数据表");
         d.Set("section", "content");
         d.Set("apiChecked", "checked");
+        d.Set("exportChecked", "checked");
         d.Set("pageSize", "20");
-        d.Set("frontValue", "1");
+        d.Set("orderColumn", "id");
+        d.Set("orderDescValue", "1");
+        d.Set("descSel", "selected");
+        d.Set("ascSel", "");
         if (id > 0) {
             SysGenTable t = await this.SysGenTable.ById(id);
             if (t == null) { this.Fail(404, "0404", "设计不存在"); }
@@ -65,9 +69,47 @@ class CoderController : AdminController {
             d.Set("section", t.section);
             d.Set("apiChecked", "");
             if (t.apiEnabled == 1) { d.Set("apiChecked", "checked"); }
+            d.Set("exportChecked", "");
+            if (t.exportEnabled == 1) { d.Set("exportChecked", "checked"); }
             d.Set("pageSize", Convert.ToString(t.pageSize > 0 ? t.pageSize : 20));
-            d.Set("frontValue", t.frontEnabled != 0 ? "1" : "0");
-            d.Set("labelColumn", t.labelColumn);
+            d.Set("labelColumn", t.labelColumn == null ? "" : t.labelColumn);
+            d.Set("menuIcon", t.menuIcon == null ? "" : t.menuIcon);
+            d.Set("orderColumn", t.orderColumn != null && t.orderColumn.Length > 0
+                ? t.orderColumn : "id");
+            d.Set("orderDescValue", t.orderDesc == 1 ? "1" : "0");
+            d.Set("descSel", t.orderDesc == 1 ? "selected" : "");
+            d.Set("ascSel", t.orderDesc == 1 ? "" : "selected");
+            string orderColumn = t.orderColumn != null && t.orderColumn.Length > 0
+                ? t.orderColumn : "id";
+            string tabColumn = t.tabColumn == null ? "" : t.tabColumn;
+            /* 排序列/页签列下拉：排序列=全部列，页签列仅字典与布尔列可充当。 */
+            List<SysGenColumn> cols = await this.SysGenColumn
+                .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
+            List<StrMap> orderCols = d.AddList("orderCols");
+            StrMap oid = new StrMap();
+            oid.Set("v", "id"); oid.Set("label", "id");
+            if (orderColumn == "id") { oid.Set("selected", "1"); }
+            orderCols.Add(oid);
+            List<StrMap> tabCols = d.AddList("tabCols");
+            StrMap tnone = new StrMap();
+            tnone.Set("v", ""); tnone.Set("label", "不启用");
+            if (tabColumn.Length == 0) { tnone.Set("selected", "1"); }
+            tabCols.Add(tnone);
+            for (int i = 0; i < cols.Count; i = i + 1) {
+                StrMap o = new StrMap();
+                o.Set("v", cols[i].name);
+                o.Set("label", cols[i].name);
+                if (cols[i].name == orderColumn) { o.Set("selected", "1"); }
+                orderCols.Add(o);
+                if (cols[i].kind == "bool"
+                    || (cols[i].dictType.Length > 0 && Gen.Safe(cols[i].dictType))) {
+                    StrMap tb = new StrMap();
+                    tb.Set("v", cols[i].name);
+                    tb.Set("label", cols[i].label + "（" + cols[i].name + "）");
+                    if (cols[i].name == tabColumn) { tb.Set("selected", "1"); }
+                    tabCols.Add(tb);
+                }
+            }
         }
         this.Dialog(d);
     }
@@ -100,14 +142,58 @@ class CoderController : AdminController {
         if (!Gen.Safe(section)) { section = "content"; }
         int api = 0;
         if (this.In("apiEnabled") == "1") { api = 1; }
-        /* 下拉显式二值，避免「缺省=关」歧义；页大小在保存与生成两处都钳。 */
-        int front = this.In("frontEnabled") == "0" ? 0 : 1;
+        int export = 0;
+        if (this.In("exportEnabled") == "1") { export = 1; }
+        /* 页大小在保存与生成两处都钳。 */
         int pageSize = this.InInt("pageSize", 20);
         if (pageSize <= 0) { pageSize = 20; }
         if (pageSize > 200) { pageSize = 200; }
         string labelColumn = this.In("labelColumn").Trim();
         if (labelColumn.Length > 0 && !Gen.SafeCode(labelColumn)) {
             this.Fail(400, "0004", "标签列不是安全的字段名");
+        }
+        string orderColumn = this.In("orderColumn").Trim();
+        if (orderColumn.Length == 0) { orderColumn = "id"; }
+        /* "id" 是合法缺省排序列，不在标识符白名单内，单独放行。 */
+        if (orderColumn != "id" && !Gen.SafeCode(orderColumn)) {
+            this.Fail(400, "0004", "排序列不是安全的字段名");
+        }
+        int orderDesc = this.In("orderDesc") == "0" ? 0 : 1;
+        string tabColumn = this.In("tabColumn").Trim();
+        if (tabColumn.Length > 0 && !Gen.SafeCode(tabColumn)) {
+            this.Fail(400, "0004", "页签列不是安全的字段名");
+        }
+        string menuIcon = this.In("menuIcon").Trim();
+        for (int i = 0; i < menuIcon.Length; i = i + 1) {
+            string ch = menuIcon.Substring(i, 1);
+            if ((ch < "a" || ch > "z") && (ch < "0" || ch > "9")
+                && ch != "-" && ch != ":") {
+                this.Fail(400, "0004", "图标名只能用小写字母、数字、冒号和横线");
+            }
+        }
+        if (menuIcon.Length > 32) { menuIcon = menuIcon.Substring(0, 32); }
+        /* 编辑时排序列/页签列须真实存在于列清单（页签列限字典或布尔）。 */
+        if (id > 0 && (orderColumn != "id" || tabColumn.Length > 0)) {
+            List<SysGenColumn> cols = await this.SysGenColumn
+                .Where(a => a.tableId == id).ToListAsync();
+            if (orderColumn != "id") {
+                bool colOk = false;
+                for (int i = 0; i < cols.Count; i = i + 1) {
+                    if (cols[i].name == orderColumn) { colOk = true; }
+                }
+                if (!colOk) { this.Fail(400, "0004", "排序列不存在"); }
+            }
+            if (tabColumn.Length > 0) {
+                bool tabOk = false;
+                for (int i = 0; i < cols.Count; i = i + 1) {
+                    if (cols[i].name != tabColumn) { continue; }
+                    if (cols[i].kind == "bool"
+                        || (cols[i].dictType.Length > 0 && Gen.Safe(cols[i].dictType))) {
+                        tabOk = true;
+                    }
+                }
+                if (!tabOk) { this.Fail(400, "0004", "页签列须为字典列或布尔列"); }
+            }
         }
 
         SysGenTable clash = await this.SysGenTable
@@ -127,8 +213,12 @@ class CoderController : AdminController {
                 .Set(a => a.title, title)
                 .Set(a => a.section, section)
                 .Set(a => a.pageSize, pageSize)
-                .Set(a => a.frontEnabled, front)
+                .Set(a => a.orderColumn, orderColumn)
+                .Set(a => a.orderDesc, orderDesc)
                 .Set(a => a.labelColumn, labelColumn)
+                .Set(a => a.menuIcon, menuIcon)
+                .Set(a => a.tabColumn, tabColumn)
+                .Set(a => a.exportEnabled, export)
                 .Set(a => a.apiEnabled, api)
                 .Set(a => a.updatedAt, WebApp.NowSeconds())
                 .Where(a => a.id == id).ExecuteAffrowsAsync();
@@ -141,11 +231,13 @@ class CoderController : AdminController {
         t.entityName = entityName;
         t.title = title;
         t.section = section;
-        t.orderColumn = "id";
-        t.orderDesc = 1;
+        t.orderColumn = orderColumn;
+        t.orderDesc = orderDesc;
         t.pageSize = pageSize;
-        t.frontEnabled = front;
         t.labelColumn = labelColumn;
+        t.menuIcon = menuIcon;
+        t.tabColumn = tabColumn;
+        t.exportEnabled = export;
         t.apiEnabled = api;
         t.migrated = 0;
         t.createdAt = WebApp.NowSeconds();
@@ -245,7 +337,8 @@ class CoderController : AdminController {
             d.Set("relValue", c.relValue);
             d.Set("relLabel", c.relLabel);
             d.Set("filterOpValue", c.filterOp.Length > 0 ? c.filterOp : "auto");
-            d.Set("listWidth", c.listWidth);
+            d.Set("listWidth", c.listWidth == null ? "" : c.listWidth);
+            d.Set("tabGroup", c.tabGroup == null ? "" : c.tabGroup);
             d.Set("sortOrder", Convert.ToString(c.sortOrder));
             d.Set("inListChecked", CoderController.Checked(c.inList));
             d.Set("inFilterChecked", CoderController.Checked(c.inFilter));
@@ -310,6 +403,7 @@ class CoderController : AdminController {
         if (listWidth.Length > 0 && Gen.WidthOf(listWidth).Length == 0) {
             this.Fail(400, "0004", "列宽只支持「数字+px/em/%」形态（如 140px）");
         }
+        string tabGroup = CoderController.Clip(this.In("tabGroup").Trim(), 16);
 
         SysGenColumn c = new SysGenColumn();
         if (id > 0) {
@@ -338,6 +432,7 @@ class CoderController : AdminController {
         c.relLabel = relLabel;
         c.filterOp = filterOp;
         c.listWidth = listWidth;
+        c.tabGroup = tabGroup;
         c.sortOrder = this.InInt("sortOrder", 10);
         c.nullable = CoderController.Flag(this.In("nullable"));
         c.inList = CoderController.Flag(this.In("inList"));
@@ -360,6 +455,7 @@ class CoderController : AdminController {
                 .Set(a => a.relLabel, c.relLabel)
                 .Set(a => a.filterOp, c.filterOp)
                 .Set(a => a.listWidth, c.listWidth)
+                .Set(a => a.tabGroup, c.tabGroup)
                 .Set(a => a.sortOrder, c.sortOrder)
                 .Set(a => a.nullable, c.nullable)
                 .Set(a => a.inList, c.inList)
@@ -458,6 +554,15 @@ class CoderController : AdminController {
                 .Set(a => a.filterOp, value)
                 .Where(a => a.id == id).ExecuteAffrowsAsync();
             await this.Note("编辑字段", c.name, n > 0, "filterOp=" + value);
+            this.Ok("{}");
+            return;
+        }
+        if (field == "tabGroup") {
+            string g = CoderController.Clip(value.Trim(), 16);
+            int n = await this.SysGenColumn.Update()
+                .Set(a => a.tabGroup, g)
+                .Where(a => a.id == id).ExecuteAffrowsAsync();
+            await this.Note("编辑字段", c.name, n > 0, "tabGroup=" + g);
             this.Ok("{}");
             return;
         }
@@ -872,10 +977,6 @@ class CoderController : AdminController {
             Directory.CreateDirectoryRecursive(root + "/src/Model/Gen");
             Directory.CreateDirectoryRecursive(root + "/src/Controller/Admin");
             if (t.apiEnabled == 1) { Directory.CreateDirectoryRecursive(root + "/src/Controller/Api"); }
-            if (t.frontEnabled != 0) {
-                Directory.CreateDirectoryRecursive(root + "/src/Controller/Front");
-                Directory.CreateDirectoryRecursive(root + "/views/Front");
-            }
             Directory.CreateDirectoryRecursive(root + "/src/Dao/Gen");
             Directory.CreateDirectoryRecursive(root + "/views/Admin");
         } catch (Exception ex) {
@@ -906,7 +1007,7 @@ class CoderController : AdminController {
     }
 
     /* 生成源码清单，顺序与 TargetPaths 一一对应：模型/后台控制器/Dao/后台
-       视图×2 恒有；apiEnabled=1 加 JSON 接口；frontEnabled≠0 加前台三件。 */
+       视图×2 恒有；apiEnabled=1 加 JSON 接口。 */
     static List<string> SourceList(SysGenTable t, List<SysGenColumn> cols,
         List<SysGenTable> designed) {
         List<string> sources = new List<string>();
@@ -916,11 +1017,6 @@ class CoderController : AdminController {
         sources.Add(Gen.ListViewSource(t, cols));
         sources.Add(Gen.FormViewSource(t, cols, designed));
         if (t.apiEnabled == 1) { sources.Add(Gen.ApiSource(t, cols, designed)); }
-        if (t.frontEnabled != 0) {
-            sources.Add(Gen.FrontControllerSource(t, cols, designed));
-            sources.Add(Gen.FrontListViewSource(t, cols, designed));
-            sources.Add(Gen.FrontShowViewSource(t, cols, designed));
-        }
         return sources;
     }
 
@@ -928,7 +1024,6 @@ class CoderController : AdminController {
     static string FileMix(SysGenTable t) {
         string mix = "模型/后台控制器/Dao/后台视图×2";
         if (t.apiEnabled == 1) { mix = mix + "/JSON接口"; }
-        if (t.frontEnabled != 0) { mix = mix + "/前台控制器/前台视图×2"; }
         return mix;
     }
 
@@ -942,11 +1037,6 @@ class CoderController : AdminController {
         paths.Add(root + "/views/Admin/" + t.entityName + "Controller.Form.html");
         if (t.apiEnabled == 1) {
             paths.Add(root + "/src/Controller/Api/" + t.entityName + "ApiController.zan");
-        }
-        if (t.frontEnabled != 0) {
-            paths.Add(root + "/src/Controller/Front/" + t.entityName + "FrontController.zan");
-            paths.Add(root + "/views/Front/" + t.entityName + "FrontController.Index.html");
-            paths.Add(root + "/views/Front/" + t.entityName + "FrontController.Show.html");
         }
         return paths;
     }
@@ -1010,12 +1100,6 @@ class CoderController : AdminController {
         d.Set("list", sources[3]);
         d.Set("form", sources[4]);
         if (t.apiEnabled == 1 && sources.Count > 5) { d.Set("api", sources[5]); }
-        if (t.frontEnabled != 0) {
-            int f = t.apiEnabled == 1 ? 6 : 5;
-            d.Set("frontController", sources[f]);
-            d.Set("frontList", sources[f + 1]);
-            d.Set("frontShow", sources[f + 2]);
-        }
         string root = (await Settings.Get(SettingKeys.GenRoot, "..")).Trim();
         if (root.Length > 0 && Directory.ExistsOnDisk(root + "/src")
             && Directory.ExistsOnDisk(root + "/views")) {
