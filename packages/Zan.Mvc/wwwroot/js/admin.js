@@ -840,17 +840,22 @@
     });
     stream.onerror = function () {
       if (gen !== streamGen) { return; }
-      host.setAttribute('data-stream-status', 'disconnected');
-      // EventSource retries on its own while CONNECTING; a hidden webview can
-      // freeze the tab hard enough that it gives up (readyState CLOSED) and
-      // never comes back, so rebuild the stream after a grace period.
+      // The server rolls the stream every StreamSeconds and hidden tabs drop
+      // it too; EventSource reconnects on its own within seconds. A routine
+      // drop stays "connecting" (subtle) -- the loud stale-data banner is
+      // reserved for a stream that is still down after the grace period.
+      host.setAttribute('data-stream-status', 'connecting');
       setTimeout(function () {
         if (gen !== streamGen || !stream) { return; }
         if (stream.readyState === 2) {
+          // A hidden webview can freeze the tab hard enough that EventSource
+          // gives up (readyState CLOSED) and never comes back, so rebuild.
           try { stream.close(); } catch (e) { /* already closed */ }
           startStream();
+        } else if (stream.readyState === 0) {
+          host.setAttribute('data-stream-status', 'disconnected');
         }
-      }, 4000);
+      }, 10000);
     };
     wireTopSort();
     startDay(host.getAttribute('data-day'), gen);
