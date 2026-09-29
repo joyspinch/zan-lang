@@ -157,7 +157,7 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   LISTEN 但请求 000 超时（连接进 backlog 无人应答，两实例先后中招），
   刷视图/配置一律 stop+start；master+worker 常驻时 exe 被运行进程占用，
   zanc 链接 `app.exe` 报 Permission denied，先 stop 并 netstat 复核再编
-  （2026-09-29 SSE 30s 断流修复部署即踩）。
+  （2026-09-29 SSE 30s 断流修复部署即踩）；⑬ 浏览器整页截图连续超时（30s 连发）先 DOM 快照确认页面没坏再改 clip 小区域出图——是取帧层不稳，不是页面坏了（2026-09-29 仪表盘验收 3 连超时，裁剪即出图）；⑭ 路由按注册串精确匹配，Route("/admin") 不收 /admin/ 尾斜杠——goto 得 {"code":"404"} JSON 先核尾斜杠再怀疑服务挂了。
 - **共享工作树上的测试归责：先隔离再定责**。smoke/e2e 结果异常先查
   并发提交时间线（`git log --format="%h %ad %s" -3`）：共享树另一会话
   在途编辑 stdlib/编译器期间跑测试，产物混进 WIP 源，无关测试假挂假绿
