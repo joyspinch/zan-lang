@@ -181,6 +181,17 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   stdlib 输入，其**自身目录**也进候选集（pi_reach_input_dir，旧
   auto_include 输入命名空间 glob 的按需版）。实测 NewProject 2.6s/75 文件
   （旧 glob 3.2s），空窗 GUI 68 文件。改"谁被编译进"先看旗标链，再谈 using。
+- **包发现收紧后，包源必须豁免活名门（2026-09-29 回归）**：包内文件的
+  发现条件是"声明命名空间与 using 名精确相等"（`pkg_visit_source_tree`，
+  2e75673e 从整目录 glob 收紧而来），而按需拉入对包源与 stdlib 一视同仁地
+  过活名门。组合后果：包控制器这类只被生成代码/框架反射点名、从不被用户
+  代码活引用的文件**永不进解析集** → 路由 genmeta 为空、`__AttrRoutes`
+  不合成、整站 404（编译无告警）。修复语义：包匹配放宽为"精确或前缀+."
+  （pkg_ns_match），且包源文件无条件入解析集（pi_file_t.pkg_src，
+  pi_close_once 的 hit 并上 pkg_src）——"只被生成代码点名"的包文件必须
+  豁免活名门，否则任何 codegen 驱动的包（MVC 控制器、生成器宿主）都会
+  静默脱图。归因四步：无包探针 ROUTES=1 → 带包探针 __AttrRoutes 未合成 →
+  垃圾探针（编译必错）证明包文件未进解析 → 活引用探针 ROUTES=1。
 - **stdlib 输入自我遮蔽坑（2026-09-16，datatable 5 例红）**：显式传入的
   stdlib 文件在 entry 循环被打 `user_decl`（本意：用户文件遮蔽 stdlib
   同名类，防冲突改名），结果它自己写全的 `DataTable.CellTextRouted` 调用头

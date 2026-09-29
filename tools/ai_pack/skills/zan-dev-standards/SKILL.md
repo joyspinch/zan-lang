@@ -165,6 +165,18 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   `git worktree add _scratch/<名> HEAD` 后用主构建同款编译参数自建干净
   编译器验证自己的改动，用完 `git worktree remove`（2026-09-29 表格
   修复验证即此法）。
+  进程静默死亡（无日志、无 WER 事件）同样先怀疑并行会话清场：按映像名的
+  `taskkill /IM` 扫荡会波及同名的演示实例——重启同一二进制若稳定存活即坐实
+  外部干扰，别急着改代码；可预配 WER LocalDumps（DumpFolder/DumpType/
+  DumpCount 三注册表键）兜底，真崩溃会留转储，无转储+可复现存活就是环境账。
+- **探针先验证探针本身（阴性对照）**：用"必然失败"的探针（如语法垃圾文件）
+  确认检测通道真的会报错，再采信"探针没报错=无罪"——探针不炸只说明被测
+  代码根本没进检测路径（如包文件未进解析集），这类阴性结果才有信息量；
+  没做过阴性对照的"通过"不算证据。
+- **zanc 失败退出码恒 0**：编译出错也返回 0（自身崩溃除外），脚本判定
+  必须 grep 输出里的 "error"，不能只看 `$?`。另注意 stdlib 跟 zanc 的
+  exe 目录走、包跟 cwd 走（向上找 zan.proj）——换 zanc 做 A/B 时包解析
+  随 cwd 变，对照组必须钉住同一 cwd。
 - **PowerShell 合成点击四连坑（PrintWindow 抓窗 + mouse_event 注入流）**：
   ① 进程必须先 `SetProcessDpiAwarenessContext(-4)`——DPI 不感知时
   `GetWindowRect`/`SetCursorPos` 全在虚拟化坐标系，注入点整体漂 1.5 倍；

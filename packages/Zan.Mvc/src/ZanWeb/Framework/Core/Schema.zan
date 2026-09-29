@@ -22,6 +22,7 @@ class Schema {
             await DbSchema.UseWriteAheadLogAsync(db);
             /* 编译期已知所有 [Table] 类，一行调用覆盖全部，新模型无需补行。*/
             await db.SyncStructureAllAsync();
+            await Schema.BackfillGenFlags(db);
 
             if (!await Schema.SeedAdmin(db)) { return false; }
             if (!await Schema.SeedRoles(db)) { return false; }
@@ -34,6 +35,37 @@ class Schema {
         } finally {
             ctx.Release(db);
         }
+    }
+
+    /* 表设计器的动作/行内编辑标志后补列时，旧行是 NULL（ORM 读作 0）——
+       直接按 0 解释会把既有模块的新增/编辑/删除/菜单和所有列的行内编辑
+       全部关掉。只在仍为 NULL 时回填为开（inQuick 跟随该列的 inEdit，与
+       旧行为"行内编辑从 inEdit 推导"一致）；显式设 0 的行是 0 不是 NULL，
+       不受影响，重复启动 no-op。
+       CodeFirst 对启动库里已存在的表不补列（只建缺失的表），模型新增的
+       标志列必须在这里先补上 —— 否则下面的 UPDATE 撞缺失列，DbException
+       直接崩掉启动。 */
+    static async bool BackfillGenFlags(IDbConnection db) {
+        List<DbColumnDef> tableCols = new List<DbColumnDef>();
+        tableCols.Add(DbColumnDef.Of("hasCreate", "int"));
+        tableCols.Add(DbColumnDef.Of("hasEdit", "int"));
+        tableCols.Add(DbColumnDef.Of("hasDelete", "int"));
+        tableCols.Add(DbColumnDef.Of("menuEnabled", "int"));
+        int _t = await DbSchema.MigrateAsync(db, "sys_gen_table", tableCols);
+        List<DbColumnDef> columnCols = new List<DbColumnDef>();
+        columnCols.Add(DbColumnDef.Of("inQuick", "int"));
+        int _c = await DbSchema.MigrateAsync(db, "sys_gen_column", columnCols);
+        await db.ExecuteAsync(
+            "UPDATE sys_gen_table SET hasCreate = 1 WHERE hasCreate IS NULL");
+        await db.ExecuteAsync(
+            "UPDATE sys_gen_table SET hasEdit = 1 WHERE hasEdit IS NULL");
+        await db.ExecuteAsync(
+            "UPDATE sys_gen_table SET hasDelete = 1 WHERE hasDelete IS NULL");
+        await db.ExecuteAsync(
+            "UPDATE sys_gen_table SET menuEnabled = 1 WHERE menuEnabled IS NULL");
+        await db.ExecuteAsync(
+            "UPDATE sys_gen_column SET inQuick = inEdit WHERE inQuick IS NULL");
+        return true;
     }
 
     /* 空库仅在明确配置强口令时创建引导账号；无配置则拒绝启动。*/

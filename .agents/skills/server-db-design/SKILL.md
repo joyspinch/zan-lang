@@ -75,3 +75,16 @@ description: 服务端 DB 专属数据层细则——索引选择、两段式分
 2. 分页是两段式吗？深页反向了吗？COUNT 数的是索引列吗？
 3. 缓存是同步双写吗？键集中管理吗？
 4. 慢查询有指纹聚合统计吗？连接池化了吗？
+
+## 九、CodeFirst 只建缺表，不补缺列
+
+- `SyncStructureAllAsync`（CodeFirst 全量同步）**只创建缺失的表**，对已
+  存在的表不校验也不补列——模型加字段后启动即 `UPDATE 旧表.新列`，会撞
+  "no such column" 直接崩掉进程。补列必须显式
+  `DbSchema.MigrateAsync(db, table, List<DbColumnDef>)`
+  （`DbColumnDef.Of(name, kind)`），列落位后再做数据回填。
+- 迁移与回填都要幂等：这段代码每次启动都跑，重复执行必须是无害 no-op
+  （列已存在跳过；回填只更 `WHERE col IS NULL` 的行）。
+- SQLite 的 `PRAGMA journal_mode/synchronous` 是"赋值并回显新值"的语句，
+  `ExecuteAsync` 对返回行的语句会抛 "the statement returned rows"——
+  必须用 `QueryAsync` 读掉结果集。

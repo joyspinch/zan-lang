@@ -32,6 +32,8 @@ class DataController : AdminController {
 
         d.Set("t", t.tableName);
         d.Set("tableTitle", t.title);
+        /* 新增入口还看设计开关：关闭的表按钮不出现（Form/Save 端点再拦一道）。 */
+        if (t.hasCreate != 1) { d.Set("canCreate", ""); }
         /* 弹窗模式（?as=dialog）由「表设计与生成 · 管理数据」打开；视图分
            showDialogBody/normalBody 两支，pager 链接带 as=dialog 保持翻页在弹窗内。 */
         if (inDialog) { d.Set("showDialogBody", "1"); } else { d.Set("normalBody", "1"); }
@@ -40,7 +42,9 @@ class DataController : AdminController {
             d.Set("notMigrated", "1"); this.Page(d); return;
         }
 
-        ListQuery q = this.Paged("id", 20);
+        /* 分页与排序随设计：页大小、排序列、方向都在表信息里配置。 */
+        string orderCol = Gen.OrderCol(t, cols);
+        ListQuery q = this.Paged(orderCol, t.pageSize > 0 ? t.pageSize : 20);
         string kw = q.Kw();
 
         /* 筛选：仅设计标记可筛的列，数字按等值、文本按子串匹配。 */
@@ -75,7 +79,9 @@ class DataController : AdminController {
             shown.Add(cols[i]);
             names.Add(cols[i].name);
         }
-        DbResult res = await query.OrderByDesc("id")
+        if (t.orderDesc == 1) { query.OrderByDesc(orderCol); }
+        else { query.OrderBy(orderCol); }
+        DbResult res = await query
             .Page(q.Limit(), q.Skip()).ToResultAsync(names);
 
         /* 各表列不同，表格标记在此构造并原样插入；每个值入时都经 Esc()。 */
@@ -88,8 +94,8 @@ class DataController : AdminController {
         d.Set("headHtml", head.ToString());
 
         StringBuilder body = new StringBuilder();
-        bool mayEdit = await this.Can((int)PermBit.Update);
-        bool mayDelete = await this.Can((int)PermBit.Delete);
+        bool mayEdit = t.hasEdit == 1 && await this.Can((int)PermBit.Update);
+        bool mayDelete = t.hasDelete == 1 && await this.Can((int)PermBit.Delete);
         int n = 0;
         if (res != null) { n = res.RowCount(); }
         for (int i = 0; i < n; i = i + 1) {
@@ -139,6 +145,9 @@ class DataController : AdminController {
         string table = this.In("t");
         SysGenTable t = await this.Design(table);
         if (t == null) { return; }
+        /* 设计开关：半开的表另一侧动作直接拒绝（与生成控制器同一文案）。 */
+        if (id == 0 && t.hasCreate != 1) { this.Fail(404, "0404", "该表未开放新增"); }
+        if (id > 0 && t.hasEdit != 1) { this.Fail(404, "0404", "该表未开放编辑"); }
         List<SysGenColumn> cols = await this.Columns(t.id);
         IDbConnection db = await this.Conn();
         if (db == null) { this.Fail(503, "2001", "数据库不可用"); }
@@ -214,6 +223,8 @@ class DataController : AdminController {
         string table = this.In("t");
         SysGenTable t = await this.Design(table);
         if (t == null) { return; }
+        if (id == 0 && t.hasCreate != 1) { this.Fail(404, "0404", "该表未开放新增"); }
+        if (id > 0 && t.hasEdit != 1) { this.Fail(404, "0404", "该表未开放编辑"); }
         List<SysGenColumn> cols = await this.Columns(t.id);
         IDbConnection db = await this.Conn();
         if (db == null) { this.Fail(503, "2001", "数据库不可用"); }
@@ -261,6 +272,7 @@ class DataController : AdminController {
         string table = this.In("t");
         SysGenTable t = await this.Design(table);
         if (t == null) { return; }
+        if (t.hasDelete != 1) { this.Fail(403, "0403", "该表未开放删除"); }
         int id = this.InInt("id", 0);
         IDbConnection db = await this.Conn();
         if (db == null) { this.Fail(503, "2001", "数据库不可用"); }

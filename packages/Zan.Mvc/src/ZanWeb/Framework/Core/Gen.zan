@@ -333,6 +333,11 @@ class Gen {
         SysGenColumn tabC = Gen.TabColOf(t, cols);
         string tabCol = tabC == null ? "" : tabC.name;
         string menuIcon = t.menuIcon == null ? "" : t.menuIcon.Trim();
+        /* 动作开关：关闭的动作不生成端点，列表不出对应入口（增/改/删/菜单）。 */
+        bool hasCreate = t.hasCreate == 1;
+        bool hasEdit = t.hasEdit == 1;
+        bool hasDelete = t.hasDelete == 1;
+        bool inMenu = t.menuEnabled == 1;
         StringBuilder b = new StringBuilder();
         b.Append(Gen.ZanHeader());
         b.Append("using System;\nusing System.Data;\nusing System.Data.Orm;\n");
@@ -429,14 +434,26 @@ class Gen {
                     + c.name + "\", \"" + label + " 模糊搜索\")\n");
             }
         }
-        b.Append("            .OpsEdit(\"/admin/" + route + "/form\")\n");
-        b.Append("            .OpsDel(\"/admin/" + route + "/delete\", \"确定删除吗？\")\n");
+        if (hasCreate) {
+            b.Append("            .TbarAdd(\"新增\", \"/admin/" + route + "/form\")\n");
+        }
+        if (hasDelete) {
+            b.Append("            .TbarDelete(\"/admin/" + route + "/batchdelete\")\n");
+        }
+        if (hasEdit) {
+            b.Append("            .OpsEdit(\"/admin/" + route + "/form\")\n");
+        }
+        if (hasDelete) {
+            b.Append("            .OpsDel(\"/admin/" + route + "/delete\", \"确定删除吗？\")\n");
+        }
         b.Append("            .Table(\"" + t.tableName + "\")\n");
         b.Append("            .EditFields(\"");
         string edits = "";
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
-            if (c.name == "id" || c.inEdit != 1) { continue; }
+            /* 行内编辑是编辑的快捷通道：inEdit 且未显式关行内（inQuick），
+               字典/关联/时间列的语义行内控件表达不了，恒不进白名单。 */
+            if (c.name == "id" || c.inEdit != 1 || c.inQuick != 1) { continue; }
             bool fed = (c.dictType.Length > 0 && Gen.Safe(c.dictType))
                 || Gen.RelDesigned(c, designed);
             if (fed || c.kind == "datetime") { continue; }
@@ -499,7 +516,9 @@ class Gen {
         }
 
         b.Append("\n    [HttpGet]\n    [Route(\"/admin/" + route + "\")]\n");
-        if (menuIcon.Length > 0) {
+        if (!inMenu) {
+            b.Append("    [Custom(IsMenu = false, Perm = PermBit.View)]\n");
+        } else if (menuIcon.Length > 0) {
             b.Append("    [Custom(IsMenu = true, Perm = PermBit.View, Icon = \""
                 + Gen.Literal(menuIcon) + "\")]\n");
         } else {
@@ -700,27 +719,32 @@ class Gen {
         b.Append("        CrudOps.Conf(this, await this.Screen());\n");
         b.Append("    }\n\n");
 
-        b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Update)]\n");
-        b.Append("    [Description(\"编辑" + Gen.Literal(t.title) + "字段\")]\n");
-        b.Append("    async void Field() {\n");
-        b.Append("        int id = this.InInt(\"id\", 0);\n");
-        b.Append("        " + mdl + " cur = await this." + t.entityName + ".Read(id);\n");
-        b.Append("        List<int> allowed = new List<int>();\n");
-        b.Append("        if (cur != null) { allowed.Add(id); }\n");
-        b.Append("        await CrudOps.Field(this, await this.Screen(), \"" + Gen.Literal(t.title)
-            + "\", this.In(\"field\").Trim(), this.In(\"value\"), allowed);\n");
-        b.Append("    }\n\n");
+        if (hasEdit) {
+            b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Update)]\n");
+            b.Append("    [Description(\"编辑" + Gen.Literal(t.title) + "字段\")]\n");
+            b.Append("    async void Field() {\n");
+            b.Append("        int id = this.InInt(\"id\", 0);\n");
+            b.Append("        " + mdl + " cur = await this." + t.entityName + ".Read(id);\n");
+            b.Append("        List<int> allowed = new List<int>();\n");
+            b.Append("        if (cur != null) { allowed.Add(id); }\n");
+            b.Append("        await CrudOps.Field(this, await this.Screen(), \"" + Gen.Literal(t.title)
+                + "\", this.In(\"field\").Trim(), this.In(\"value\"), allowed);\n");
+            b.Append("    }\n\n");
+        }
 
-        b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Delete)]\n");
-        b.Append("    [Description(\"批量删除" + Gen.Literal(t.title) + "\")]\n");
-        b.Append("    async void BatchDelete() {\n");
-        b.Append("        await CrudOps.Delete(this, await this.Screen(),"
-            + " this.Ids(\"ids\"), \"批量删除" + Gen.Literal(t.title) + "\");\n");
-        b.Append("    }\n\n");
+        if (hasDelete) {
+            b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Delete)]\n");
+            b.Append("    [Description(\"批量删除" + Gen.Literal(t.title) + "\")]\n");
+            b.Append("    async void BatchDelete() {\n");
+            b.Append("        await CrudOps.Delete(this, await this.Screen(),"
+                + " this.Ids(\"ids\"), \"批量删除" + Gen.Literal(t.title) + "\");\n");
+            b.Append("    }\n\n");
+        }
 
-        b.Append("    [HttpGet]\n    [Custom(Perm = PermBit.Create | PermBit.Update)]\n");
-        b.Append("    [Description(\"" + Gen.Literal(t.title) + "表单\")]\n");
-        b.Append("    async void Form() {\n");
+        if (hasCreate || hasEdit) {
+            b.Append("    [HttpGet]\n    [Custom(Perm = PermBit.Create | PermBit.Update)]\n");
+            b.Append("    [Description(\"" + Gen.Literal(t.title) + "表单\")]\n");
+            b.Append("    async void Form() {\n");
         b.Append("        int id = this.InInt(\"id\", 0);\n");
         b.Append("        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {\n");
         b.Append("            this.Fail(403, \"0403\", \"权限不足\"); return;\n        }\n");
@@ -804,13 +828,22 @@ class Gen {
                 + "None\", \"1\"); }\n");
         }
         b.Append("        this.Dialog(d);\n    }\n\n");
+        }
 
-        b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Create | PermBit.Update)]\n");
-        b.Append("    [Description(\"保存" + Gen.Literal(t.title) + "\")]\n");
-        b.Append("    async void Save() {\n");
-        b.Append("        int id = this.InInt(\"id\", 0);\n");
-        b.Append("        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {\n");
-        b.Append("            this.Fail(403, \"0403\", \"权限不足\"); return;\n        }\n");
+        if (hasCreate || hasEdit) {
+            b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Create | PermBit.Update)]\n");
+            b.Append("    [Description(\"保存" + Gen.Literal(t.title) + "\")]\n");
+            b.Append("    async void Save() {\n");
+            b.Append("        int id = this.InInt(\"id\", 0);\n");
+            b.Append("        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {\n");
+            b.Append("            this.Fail(403, \"0403\", \"权限不足\"); return;\n        }\n");
+            /* 表级开关守卫：动作生成与否看组合，半开时另一侧请求在此拒绝。 */
+            if (!hasCreate) {
+                b.Append("        if (id == 0) { this.Fail(404, \"0404\", \"该表未开放新增\"); }\n");
+            }
+            if (!hasEdit) {
+                b.Append("        if (id > 0) { this.Fail(404, \"0404\", \"该表未开放编辑\"); }\n");
+            }
         b.Append("        " + mdl + " e = new " + mdl + "();\n");
         b.Append("        if (id > 0) {\n");
         b.Append("            " + mdl + " cur = await this." + t.entityName + ".Read(id);\n");
@@ -923,16 +956,20 @@ class Gen {
         b.Append("        await this.Note(\"新增" + Gen.Literal(t.title)
             + "\", Convert.ToString(newId), newId > 0, \"\");\n");
         b.Append("        this.Saved(\"已创建\");\n    }\n\n");
+        }
 
-        b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Delete)]\n");
-        b.Append("    [Description(\"删除" + Gen.Literal(t.title) + "\")]\n");
-        b.Append("    async void Delete() {\n");
-        b.Append("        int id = this.InInt(\"id\", 0);\n");
-        b.Append("        int n = await this." + t.entityName
-            + ".Delete().Where(a => a.id == id).ExecuteAffrowsAsync();\n");
-        b.Append("        await this.Note(\"删除" + Gen.Literal(t.title)
-            + "\", Convert.ToString(id), n > 0, \"\");\n");
-        b.Append("        this.Saved(\"已删除\");\n    }\n}\n");
+        if (hasDelete) {
+            b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Delete)]\n");
+            b.Append("    [Description(\"删除" + Gen.Literal(t.title) + "\")]\n");
+            b.Append("    async void Delete() {\n");
+            b.Append("        int id = this.InInt(\"id\", 0);\n");
+            b.Append("        int n = await this." + t.entityName
+                + ".Delete().Where(a => a.id == id).ExecuteAffrowsAsync();\n");
+            b.Append("        await this.Note(\"删除" + Gen.Literal(t.title)
+                + "\", Convert.ToString(id), n > 0, \"\");\n");
+            b.Append("        this.Saved(\"已删除\");\n    }\n");
+        }
+        b.Append("}\n");
         return b.ToString();
     }
 
