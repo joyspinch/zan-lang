@@ -8,8 +8,8 @@
 
 ## 未完成 · IDE / 编译器
 
-- [ ] **B-ID7** 设计器预览、直接运行、`--publish` 三路径行为仍不一致；事件缺 sender，需评估 API 破坏性变更后统一。
-- [ ] **B-ID14** IDE 全量输入加 `-g` 仍有两类问题：31 份设计触发 codegen 崩溃；`-g --publish` 可能触发 GNU ld `IMAGE_REL_AMD64_REL32`。复现清单在 `_scratch/ide_input_list.txt`，不得用换形输入绕过。
+- [ ] **B-ID7** 三路径统一评估（2026-09-29 完成评估，实现待选型确认后开工）。分歧点：① 设计器预览只渲染设计文档、不加载 code-behind——`Form.On` 注册者缺席，设计的 onClick 在预览中静默无效，绑定仅扫变量名不求值（预览画布 stdlib/Gui/Designer/Designer.Form.zan vs 真实接线 GenForm.zan SetHandler）；② dev 默认 check_leaks/arc_guard 开、publish 关且独有 arc_net over-release fail-soft，同一代码失败行为不同（main.c:5008-5023）；③ 资源路径分叉：dev 直读源树 assets，publish 复制到 publish/assets。事件缺 sender：回调全为无参 `Action`（stdlib/Gui/Core/Event.zan:10，Control.On*×20、HandlerRegistry、GenForm 发射器），加 sender 系破坏性变更——约 437 个注册点（stdlib 141 / templates 181 / examples 59 / ide_zan 56）+ 142 处 Action 存储传递。候选：A 新增平行 API `OnClicked(Action<Control>)` 等、旧 API 委托适配渐进迁移（不破坏，推荐）；B `UiEvent.CurrentSender` 静态当前事件源（零破坏但重入/异步下不精确）；C 直改签名为带 sender 委托（一次到位、437 处全动）。路径②③的统一属行为对齐，非 API 破坏，可先行。
+- [ ] **B-ID17** check-leaks（-g 默认开启）ARC 分配点表硬顶 4096：IDE 全量输入（534 文件）超限直接编译错误（reserve_arc_site 的 ZAN_MAX_LEAK_SITES 检查）；B-ID14 的复现以 `--no-check-leaks` 显式绕过。根治方向：五张 `[4096]` 静态表（site_live/names/dtors/tynames/meta）改为 finalize 期按真实站点数发射 + 指针全局间接访问（LLVM 全局类型创建期即固定，而站点数 finalize 才知道）；同步核查 irgen_expr.c 插桩的 4096 inrange 边界检查与全部 leakcheck conformance。
 
 ## 未完成 · 编译内存
 

@@ -5187,6 +5187,46 @@ int main(int argc, char **argv) {
      * 64-bit pointers and baked 8-byte pointer strides into the IR (deobf's
      * literal table then read NULLs on rv32, whose real layout is 32-bit). */
     zan_irgen_bind_target(&irgen);
+
+    /* Determine output path early for shard planning */
+    char obj_path[1024];
+    if (ipa_path) {
+        snprintf(obj_path, sizeof(obj_path), "%s.macho_tmp", ipa_path);
+    } else if (output_file) {
+        snprintf(obj_path, sizeof(obj_path), "%s", output_file);
+    } else {
+        size_t ilen = strlen(input_file);
+        if (ilen > 4 && strcmp(input_file + ilen - 4, ".zan") == 0) {
+            snprintf(obj_path, sizeof(obj_path), "%.*s", (int)(ilen - 4), input_file);
+        } else {
+            snprintf(obj_path, sizeof(obj_path), "%s.out", input_file);
+        }
+    }
+
+    /* Pre-optimization Module Sharding: split eligible bodies into separate
+     * objects, compile and immediately dispose their temporary LLVM modules,
+     * then delete moved bodies from the coordinator before the heavy global
+     * optimizer runs. This prevents the monolithic module peak memory spike. */
+    char **shard_objs = NULL;
+    int shard_n = 0;
+    if (!do_emit_ir && want_shard && mf_built) {
+        phase("shard");
+        shard_n = zan_irgen_shard_run(&irgen, &mf, obj_path, &shard_objs);
+        if (shard_n < 0) {
+            fprintf(stderr, "error: shard emission failed\n");
+            zan_diag_free_buffers(irgen.diag);
+            zan_irgen_destroy(&irgen);
+            zan_arena_free(ir_arena);
+            if (arena) zan_arena_free(arena);
+            free(source);
+            return 1;
+        }
+    }
+    if (mf_built) {
+        zan_irgen_manifest_free(&mf);
+        mf_built = false;
+    }
+
     if (effective_opt > ZAN_OPT_NONE) {
         zan_opt_report_t opt_report = zan_optimize(&irgen, NULL, effective_opt);
         zan_opt_report_print(&opt_report);
@@ -5226,21 +5266,6 @@ int main(int argc, char **argv) {
             return 1;
         }
     } else {
-        /* determine output path */
-        char obj_path[1024];
-        if (ipa_path) {
-            snprintf(obj_path, sizeof(obj_path), "%s.macho_tmp", ipa_path);
-        } else if (output_file) {
-            snprintf(obj_path, sizeof(obj_path), "%s", output_file);
-        } else {
-            /* input.zan ? input */
-            size_t ilen = strlen(input_file);
-            if (ilen > 4 && strcmp(input_file + ilen - 4, ".zan") == 0) {
-                snprintf(obj_path, sizeof(obj_path), "%.*s", (int)(ilen - 4), input_file);
-            } else {
-                snprintf(obj_path, sizeof(obj_path), "%s.out", input_file);
-            }
-        }
 
         /* Cross-linking to Linux is fully static against the bundled musl
          * sysroot, so a [DllImport] lib resolves only from a bundled static
@@ -6097,33 +6122,17 @@ int main(int argc, char **argv) {
         generated_object_vec_t generated_objects = {0};
         snprintf(obj_tmp, sizeof(obj_tmp), "%s.o", obj_path);
 
-        /* Stage-4 opt-in object sharding: emit eligible bodies as separate
-         * objects first, then delete them from the coordinator module so
-         * the optimizing emit below sees the smaller module. Any failure
-         * inside falls back cleanly to this single-module path. */
-        if (want_shard && mf_built) {
-            phase("shard");
-            char **shard_objs = NULL;
-            int shard_n = zan_irgen_shard_run(&irgen, &mf, obj_path,
-                                              &shard_objs);
-            if (shard_n < 0) {
-                fprintf(stderr, "error: shard emission failed\n");
-                zan_diag_free_buffers(irgen.diag);
-                zan_irgen_destroy(&irgen);
-                zan_arena_free(ir_arena);
-                zan_arena_free(arena);
-                free(source);
-                return 1;
-            }
+        if (shard_n > 0) {
             for (int i = 0; i < shard_n; i++) {
                 generated_object_vec_add(&generated_objects, shard_objs[i]);
                 free(shard_objs[i]);
             }
             free(shard_objs);
+            shard_objs = NULL;
+            shard_n = 0;
         }
-        if (mf_built) zan_irgen_manifest_free(&mf);
 
-        phase("optimize");
+        phase("emit obj");
         if (zan_irgen_write_obj(&irgen, obj_tmp) != ZAN_OK) {
             fprintf(stderr, "error: failed to emit object file\n");
             zan_diag_free_buffers(irgen.diag);

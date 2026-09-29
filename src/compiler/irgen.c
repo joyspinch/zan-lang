@@ -10,6 +10,7 @@
  */
 
 #include "irgen.h"
+#include "optimizer.h"
 #include "builtin_api.h"
 #include "reflect_api.h"
 #include "arena.h"
