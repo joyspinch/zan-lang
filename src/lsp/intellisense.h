@@ -14,6 +14,12 @@
 extern "C" {
 #endif
 
+/* Cooperative abort flag for the project index scan: the host (zan-lsp) sets
+ * it to 1 to make a running intel_index_project / intel_index_files bail out
+ * at its next file; the host clears it before starting the next scan.
+ * Defined in intellisense.c. */
+extern volatile int intel_cancel_flag;
+
 /* The symbol table and the indexed-file list grow on demand: a fixed 4096
  * symbols and 64 files silently truncated the index of any real project (the
  * standard library alone is several hundred files), so completion went quiet

@@ -26,6 +26,7 @@
 #else
 #  include <unistd.h>
 #  include <sys/types.h>
+#  include <sys/stat.h>
 #  include <sys/wait.h>
 #  include <fcntl.h>
 #  include <errno.h>
@@ -624,6 +625,205 @@ static int run_semantic_and_hint_checks(child_t *child) {
     return ext_fails ? 1 : 0;
 }
 
+/* --------- $/cancelRequest checks (B-ID6: reader/worker split) ---------
+ *
+ * A second server rooted at a generated workspace of ~300 files, so project
+ * indexing and the references file walk take seconds. The reader thread must
+ * stay unblocked while the worker executes, so a cancel lands while a
+ * request is queued or mid-walk: the cancelled request must answer -32800
+ * and the request behind it must still complete. */
+#define CANCEL_FILES 300
+#define CANCEL_FILLER_LINES 1200
+
+/* references at line 1 char 8 = the `cancelMe` field (a field, not a
+ * local, so the scope fast path does not shorten the walk). */
+static json_value *mk_refs_params(const char *doc_uri) {
+    json_value *td = json_new_obj();
+    json_obj_set(td, "uri", json_new_str(doc_uri));
+    json_value *pos = json_new_obj();
+    json_obj_set(pos, "line", json_new_num(1));
+    json_obj_set(pos, "character", json_new_num(8));
+    json_value *params = json_new_obj();
+    json_obj_set(params, "textDocument", td);
+    json_obj_set(params, "position", pos);
+    return params;
+}
+
+static int run_cancel_checks(const char *exe) {
+    int fails = 0;
+    char root[600];
+#ifdef _WIN32
+    char tmp[MAX_PATH];
+    GetTempPathA(sizeof(tmp), tmp);
+    snprintf(root, sizeof(root), "%szan_lsp_cancel_%lu", tmp,
+             (unsigned long)GetCurrentProcessId());
+#else
+    snprintf(root, sizeof(root), "/tmp/zan_lsp_cancel_%d", (int)getpid());
+#endif
+
+#ifdef _WIN32
+    CreateDirectoryA(root, NULL);
+#else
+    mkdir(root, 0755);
+#endif
+
+    /* Generated project: each file mentions `cancelMe` exactly once, so a
+     * full references walk reports one location per file. */
+    for (int i = 0; i < CANCEL_FILES; i++) {
+        char path[700];
+        snprintf(path, sizeof(path), "%s%cGen%d.zan", root,
+#ifdef _WIN32
+            '\\',
+#else
+            '/',
+#endif
+            i);
+        FILE *f = fopen(path, "wb");
+        if (!f) { fprintf(stderr, "FAIL: cannot create %s\n", path); return 1; }
+        fprintf(f, "class Gen%d {\n", i);
+        for (int l = 0; l < CANCEL_FILLER_LINES; l++)
+            fprintf(f, "    int pad%d = %d;\n", l, l);
+        fprintf(f, "    int cancelMe;\n}\n");
+        fclose(f);
+    }
+
+    child_t child;
+    if (!child_spawn(&child, exe)) {
+        fprintf(stderr, "FAIL: cannot spawn zan-lsp (cancel group)\n");
+        return 1;
+    }
+
+    char uri[700];
+    snprintf(uri, sizeof(uri), "file:///Gen0.zan");
+
+    /* initialize with the generated workspace as root */
+    {
+        json_value *params = json_new_obj();
+        char ruri[700];
+#ifdef _WIN32
+        /* the server only accepts file:/// URIs; backslashes become '/' */
+        snprintf(ruri, sizeof(ruri), "file:///");
+        char *wp = ruri + strlen(ruri);
+        for (const char *q = root; *q && wp < ruri + sizeof(ruri) - 1; q++)
+            *wp++ = (*q == '\\') ? '/' : *q;
+        *wp = '\0';
+#else
+        snprintf(ruri, sizeof(ruri), "file://%s", root);
+#endif
+        json_obj_set(params, "rootUri", json_new_str(ruri));
+        send_message(&child, mk_request(1, "initialize", params));
+        char *r = recv_until_id(&child, 1);
+        if (!r) {
+            fprintf(stderr, "FAIL: no initialize response (cancel group)\n");
+            child_close(&child);
+            return 1;
+        }
+        free(r);
+    }
+
+    /* didOpen: the worker starts the (slow) project index for this root. */
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(uri));
+        json_obj_set(td, "languageId", json_new_str("zan"));
+        json_obj_set(td, "version", json_new_num(1));
+        json_obj_set(td, "text", json_new_str(
+            "class Doc {\n    int cancelMe;\n}\n"));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        send_message(&child, mk_request(-1, "textDocument/didOpen", params));
+    }
+
+    /* All three rounds rely on the same slow path: indexing the generated
+     * workspace takes seconds, while the reader thread accepts a cancel in
+     * microseconds, so every cancel lands well inside the window.
+     *
+     * Round 1: didOpen started the cold index build inside the worker;
+     * refs(100) queues behind it, so the cancel slot is recorded long before
+     * refs(100) is dequeued and the worker refuses it without executing. */
+    send_message(&child, mk_request(100, "textDocument/references",
+                                    mk_refs_params(uri)));
+    {
+        json_value *cancel = json_new_obj();
+        json_obj_set(cancel, "jsonrpc", json_new_str("2.0"));
+        json_obj_set(cancel, "method", json_new_str("$/cancelRequest"));
+        json_value *cp = json_new_obj();
+        json_obj_set(cp, "id", json_new_num(100));
+        json_obj_set(cancel, "params", cp);
+        send_message(&child, cancel);
+    }
+    char *r100 = recv_until_id(&child, 100);
+    ext_check(r100 && strstr(r100, "-32800") != NULL
+              && strstr(r100, "\"error\"") != NULL,
+              "cancel: queued references request answers -32800");
+    free(r100);
+
+    /* Round 2: the cancelled build left the index cold, so refs(101) restarts
+     * the multi-second scan itself and the cancel hits its checkpoints
+     * mid-walk; the answer must be -32800, never a partial success. */
+    send_message(&child, mk_request(101, "textDocument/references",
+                                    mk_refs_params(uri)));
+    {
+        json_value *cancel = json_new_obj();
+        json_obj_set(cancel, "jsonrpc", json_new_str("2.0"));
+        json_obj_set(cancel, "method", json_new_str("$/cancelRequest"));
+        json_value *cp = json_new_obj();
+        json_obj_set(cp, "id", json_new_num(101));
+        json_obj_set(cancel, "params", cp);
+        send_message(&child, cancel);
+    }
+    char *r101 = recv_until_id(&child, 101);
+    ext_check(r101 && strstr(r101, "-32800") != NULL,
+              "cancel: in-flight references walk aborts with -32800");
+    free(r101);
+
+    /* Round 3: after two aborts the index is rebuilt from scratch; the
+     * pipeline must not be wedged and the walk must cover the project. */
+    send_message(&child, mk_request(102, "textDocument/references",
+                                    mk_refs_params(uri)));
+    char *r102 = recv_until_id(&child, 102);
+    ext_check(r102 && strstr(r102, "\"result\"") != NULL,
+              "cancel: pipeline still serves requests after cancellations");
+    ext_check(r102 && strstr(r102, "Gen1") != NULL,
+              "cancel: post-cancel walk still scans project files");
+    free(r102);
+
+    /* shutdown + exit */
+    send_message(&child, mk_request(199, "shutdown", json_new_obj()));
+    {
+        json_value *msg = json_new_obj();
+        json_obj_set(msg, "jsonrpc", json_new_str("2.0"));
+        json_obj_set(msg, "method", json_new_str("exit"));
+        send_message(&child, msg);
+    }
+    child_close(&child);
+
+    fails = ext_fails;
+    printf("\n%d cancel failure(s)\n", fails);
+
+    for (int i = 0; i < CANCEL_FILES; i++) {
+        char path[700];
+        snprintf(path, sizeof(path), "%s%cGen%d.zan", root,
+#ifdef _WIN32
+            '\\',
+#else
+            '/',
+#endif
+            i);
+#ifdef _WIN32
+        DeleteFileA(path);
+#else
+        unlink(path);
+#endif
+    }
+#ifdef _WIN32
+    RemoveDirectoryA(root);
+#else
+    rmdir(root);
+#endif
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: lsp_integration_test <zan-lsp>\n");
@@ -733,6 +933,10 @@ int main(int argc, char **argv) {
 
     if (rc == 0)
         rc = run_semantic_and_hint_checks(&child);
+
+    /* spawns its own second server rooted at a generated workspace */
+    if (rc == 0)
+        rc = run_cancel_checks(argv[1]);
 
     child_close(&child);
     return rc;

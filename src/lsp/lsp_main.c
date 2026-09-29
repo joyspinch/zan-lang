@@ -69,6 +69,13 @@ typedef int lsp_sock_t;
  * this long; keystrokes never wait on the front-end run. */
 #define LSP_DIAG_QUIET_MS 200
 
+/* One queued incoming message (request or notification), parsed by the
+ * reader thread. msg == NULL marks the shutdown sentinel. */
+typedef struct lsp_msg {
+    struct lsp_msg *next;
+    json_value *msg;
+} lsp_msg_t;
+
 typedef struct {
     char *uri;
     char *text;
@@ -102,6 +109,33 @@ typedef struct {
     bool diag_thread_valid;
 #endif
     volatile bool diag_stop;
+    /* ---- request worker: the reader thread only reads frames and
+     * enqueues; one worker thread executes them FIFO. Handlers keep their
+     * single-threaded assumptions (they run one at a time under doc_lock).
+     * The reader stays unblocked while a request executes, which is what
+     * makes $/cancelRequest usable: it is intercepted by the reader, since
+     * a cancel notice must land while the worker is mid-request. ---- */
+#ifdef _WIN32
+    CRITICAL_SECTION q_lock;
+    HANDLE worker_thread;
+#else
+    pthread_mutex_t q_lock;
+    pthread_t worker_thread;
+    bool worker_thread_valid;
+#endif
+    lsp_msg_t *q_head;          /* FIFO of parsed incoming messages */
+    lsp_msg_t *q_tail;
+    int q_len;
+    /* cancel slot: the most recent $/cancelRequest id (q_lock-guarded) */
+    bool cancel_valid;
+    bool cancel_is_str;
+    double cancel_num;
+    char cancel_str[80];
+    /* id of the request the worker is executing right now (q_lock) */
+    bool exec_valid;
+    bool exec_is_str;
+    double exec_num;
+    char exec_str[80];
 } lsp_server_t;
 
 /* ---- TCP transport (--port): same single-client server as zan-dap ---- */
@@ -208,9 +242,11 @@ static void lsp_locks_init(lsp_server_t *s) {
 #ifdef _WIN32
     InitializeCriticalSection(&s->doc_lock);
     InitializeCriticalSection(&s->write_lock);
+    InitializeCriticalSection(&s->q_lock);
 #else
     pthread_mutex_init(&s->doc_lock, NULL);
     pthread_mutex_init(&s->write_lock, NULL);
+    pthread_mutex_init(&s->q_lock, NULL);
 #endif
 }
 
@@ -218,9 +254,11 @@ static void lsp_locks_free(lsp_server_t *s) {
 #ifdef _WIN32
     DeleteCriticalSection(&s->doc_lock);
     DeleteCriticalSection(&s->write_lock);
+    DeleteCriticalSection(&s->q_lock);
 #else
     pthread_mutex_destroy(&s->doc_lock);
     pthread_mutex_destroy(&s->write_lock);
+    pthread_mutex_destroy(&s->q_lock);
 #endif
 }
 
@@ -794,6 +832,29 @@ static void send_response(lsp_server_t *s, json_value *id, json_value *result) {
     json_free(resp);
 }
 
+/* JSON-RPC error response (used for $/cancelRequest: -32800 RequestCancelled,
+ * and for requests dropped when the queue is saturated). */
+static void send_response_error(lsp_server_t *s, json_value *id, int code,
+                                const char *message) {
+    json_value *resp = json_new_obj();
+    json_obj_set(resp, "jsonrpc", json_new_str("2.0"));
+    if (id && id->type == JSON_NUM)
+        json_obj_set(resp, "id", json_new_num(id->as.num));
+    else if (id && id->type == JSON_STR)
+        json_obj_set(resp, "id", json_new_str(id->as.str));
+    else
+        json_obj_set(resp, "id", json_new_null());
+    json_value *err = json_new_obj();
+    json_obj_set(err, "code", json_new_num(code));
+    json_obj_set(err, "message", json_new_str(message));
+    json_obj_set(resp, "error", err);
+
+    char *payload = json_serialize(resp);
+    lsp_write(s, payload);
+    free(payload);
+    json_free(resp);
+}
+
 /* map intellisense kind to LSP CompletionItemKind */
 static int lsp_completion_kind(isym_kind_t k) {
     switch (k) {
@@ -1044,6 +1105,12 @@ static void ensure_project_indexed(lsp_server_t *s) {
         intel_init(g_project_intel);
     }
     intel_index_project(g_project_intel, s->workspace_root);
+    if (intel_cancel_flag) {
+        /* Aborted mid-scan by $/cancelRequest: retry from scratch on the
+         * next request rather than trusting a partial index. */
+        s->project_indexed = false;
+        return;
+    }
     ensure_stdlib_indexed();
 }
 
@@ -1630,11 +1697,14 @@ static int add_locations(json_value *arr, const char *uri,
  * includes unsaved edits) is authoritative. */
 typedef void (*project_file_fn)(void *ctx, const char *uri, const char *text);
 
+static bool lsp_cancel_hit(lsp_server_t *s);
+
 static void for_each_unopened_project_file(lsp_server_t *s, void *ctx,
                                            project_file_fn visit) {
     ensure_project_indexed(s);
     if (!g_project_intel) return;
     for (int f = 0; f < g_project_intel->indexed_file_count; f++) {
+        if (lsp_cancel_hit(s)) return;
         const char *fp = g_project_intel->indexed_files[f];
         if (!fp[0]) continue;
         char furi[600];
@@ -1688,10 +1758,20 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
     }
 
     json_value *arr = json_new_arr();
-    for (int d = 0; d < s->doc_count; d++)
+    for (int d = 0; d < s->doc_count; d++) {
+        if (lsp_cancel_hit(s)) break;
         add_locations(arr, s->docs[d].uri, s->docs[d].text, word, -1, -1);
-    refs_ctx_t rc; rc.arr = arr; rc.word = word;
-    for_each_unopened_project_file(s, &rc, refs_visit);
+    }
+    if (!lsp_cancel_hit(s)) {
+        refs_ctx_t rc; rc.arr = arr; rc.word = word;
+        for_each_unopened_project_file(s, &rc, refs_visit);
+    }
+    /* A cancelled request answers -32800, never a partial success. */
+    if (lsp_cancel_hit(s)) {
+        json_free(arr);
+        send_response_error(s, id, -32800, "Request cancelled");
+        return;
+    }
     send_response(s, id, arr);
 }
 
@@ -1889,16 +1969,26 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
     /* Every open document (their unsaved text wins) plus every indexed project
      * file on disk, so a rename also lands in files the editor never opened. */
     json_value *changes = json_new_obj();
-    for (int d = 0; d < s->doc_count; d++) {
+    bool cancelled = false;
+    for (int d = 0; d < s->doc_count && !cancelled; d++) {
+        if (lsp_cancel_hit(s)) { cancelled = true; break; }
         lsp_doc_t *dd = &s->docs[d];
         json_value *edits = rename_edits_for(dd->text, word, new_name, -1, -1);
         if (edits) json_obj_set(changes, dd->uri, edits);
     }
-    rename_ctx_t rctx;
-    rctx.changes = changes;
-    rctx.word = word;
-    rctx.new_name = new_name;
-    for_each_unopened_project_file(s, &rctx, rename_visit);
+    if (!cancelled) {
+        rename_ctx_t rctx;
+        rctx.changes = changes;
+        rctx.word = word;
+        rctx.new_name = new_name;
+        for_each_unopened_project_file(s, &rctx, rename_visit);
+        cancelled = lsp_cancel_hit(s);
+    }
+    if (cancelled) {
+        json_free(changes);
+        send_response_error(s, id, -32800, "Request cancelled");
+        return;
+    }
 
     json_value *we = json_new_obj();
     json_obj_set(we, "changes", changes);
@@ -2966,6 +3056,194 @@ static void dispatch(lsp_server_t *s, json_value *msg) {
     lsp_doc_unlock(s);
 }
 
+/* ---- request queue + $/cancelRequest (reader/worker split) ---- */
+
+#define LSP_Q_MAX 1024
+
+/* q_lock never nests inside a dispatched handler's doc_lock except from the
+ * worker's cancellation checkpoints (doc_lock -> q_lock, one direction only);
+ * the reader touches nothing but q_lock, so it never blocks on a request. */
+static void lsp_q_lock(lsp_server_t *s) {
+#ifdef _WIN32
+    EnterCriticalSection(&s->q_lock);
+#else
+    pthread_mutex_lock(&s->q_lock);
+#endif
+}
+
+static void lsp_q_unlock(lsp_server_t *s) {
+#ifdef _WIN32
+    LeaveCriticalSection(&s->q_lock);
+#else
+    pthread_mutex_unlock(&s->q_lock);
+#endif
+}
+
+/* Reader side: enqueue one parsed message. On overflow a request is refused
+ * (caller replies error and frees); the msg==NULL shutdown sentinel is always
+ * enqueued or the worker would never stop. Takes ownership only on success. */
+static bool q_push(lsp_server_t *s, json_value *msg) {
+    lsp_msg_t *n = (lsp_msg_t *)malloc(sizeof(*n));
+    if (!n) return false;
+    n->next = NULL;
+    n->msg = msg;
+    bool ok = true;
+    lsp_q_lock(s);
+    if (msg != NULL && s->q_len >= LSP_Q_MAX) {
+        ok = false;
+    } else {
+        if (s->q_tail) s->q_tail->next = n;
+        else s->q_head = n;
+        s->q_tail = n;
+        s->q_len++;
+    }
+    lsp_q_unlock(s);
+    if (!ok) free(n);
+    return ok;
+}
+
+/* Worker side: dequeue in FIFO order; blocks (poll) while empty. Returns
+ * nodes only; the shutdown sentinel is a node with msg == NULL. */
+static lsp_msg_t *q_pop(lsp_server_t *s) {
+    for (;;) {
+        lsp_msg_t *n = NULL;
+        lsp_q_lock(s);
+        if (s->q_head) {
+            n = s->q_head;
+            s->q_head = n->next;
+            if (!s->q_head) s->q_tail = NULL;
+            s->q_len--;
+        }
+        lsp_q_unlock(s);
+        if (n) return n;
+        lsp_sleep_ms(2);
+    }
+}
+
+static bool cancel_matches_locked(lsp_server_t *s);
+
+/* Reader side: record a $/cancelRequest id; if the cancelled request is the
+ * one executing right now, also raise the deep-scan abort flag so an
+ * in-flight project index walk bails at its next checkpoint. A queued target
+ * must NOT raise the flag -- that would abort whatever request is executing,
+ * so it is simply refused when dequeued. */
+static void q_set_cancel(lsp_server_t *s, json_value *id) {
+    if (!id) return;
+    lsp_q_lock(s);
+    if (id->type == JSON_NUM) {
+        s->cancel_valid = true;
+        s->cancel_is_str = false;
+        s->cancel_num = id->as.num;
+    } else if (id->type == JSON_STR && id->as.str &&
+               strlen(id->as.str) < sizeof(s->cancel_str)) {
+        s->cancel_valid = true;
+        s->cancel_is_str = true;
+        snprintf(s->cancel_str, sizeof(s->cancel_str), "%s", id->as.str);
+    }
+    if (cancel_matches_locked(s)) intel_cancel_flag = 1;
+    lsp_q_unlock(s);
+}
+
+static bool cancel_matches_locked(lsp_server_t *s) {
+    if (!s->cancel_valid || !s->exec_valid) return false;
+    if (s->cancel_is_str != s->exec_is_str) return false;
+    if (s->cancel_is_str)
+        return strcmp(s->cancel_str, s->exec_str) == 0;
+    return s->cancel_num == s->exec_num;
+}
+
+/* Checkpoint for long-running handlers (project file walks): true when the
+ * request currently being executed has been cancelled. */
+static bool lsp_cancel_hit(lsp_server_t *s) {
+    lsp_q_lock(s);
+    bool hit = cancel_matches_locked(s);
+    lsp_q_unlock(s);
+    if (hit) intel_cancel_flag = 1;
+    return hit;
+}
+
+/* Worker side, before dispatch: if the queued request is already cancelled,
+ * consume the cancel slot and report true (caller replies -32800). */
+static bool lsp_take_cancel(lsp_server_t *s, json_value *id) {
+    bool hit = false;
+    lsp_q_lock(s);
+    s->exec_valid = false;
+    if (id && id->type == JSON_NUM) {
+        s->exec_valid = true;
+        s->exec_is_str = false;
+        s->exec_num = id->as.num;
+    } else if (id && id->type == JSON_STR && id->as.str &&
+               strlen(id->as.str) < sizeof(s->exec_str)) {
+        s->exec_valid = true;
+        s->exec_is_str = true;
+        snprintf(s->exec_str, sizeof(s->exec_str), "%s", id->as.str);
+    }
+    if (cancel_matches_locked(s)) {
+        hit = true;
+        s->cancel_valid = false;
+    }
+    /* A non-matching slot stays recorded: its target may still be queued
+     * behind this request (the reader runs ahead of the worker), so it must
+     * be refused when dequeued. Ids are unique per session, so a lingering
+     * slot can never hit an unrelated request. */
+    lsp_q_unlock(s);
+    intel_cancel_flag = 0; /* flags are per-request; stale aborts must not
+                              kill the next request's project scan */
+    return hit;
+}
+
+/* Worker side, after dispatch: drop the exec record and the abort flag, but
+ * keep a pending cancel slot -- its target may still be queued behind this
+ * request and must be refused when dequeued. */
+static void lsp_clear_exec(lsp_server_t *s) {
+    lsp_q_lock(s);
+    s->exec_valid = false;
+    lsp_q_unlock(s);
+    intel_cancel_flag = 0;
+}
+
+static void lsp_worker_loop(lsp_server_t *s);
+
+#ifdef _WIN32
+static DWORD WINAPI lsp_worker_main(LPVOID arg) {
+    lsp_worker_loop((lsp_server_t *)arg);
+    return 0;
+}
+#else
+static void *lsp_worker_main(void *arg) {
+    lsp_worker_loop((lsp_server_t *)arg);
+    return NULL;
+}
+#endif
+
+/* Executes queued messages one at a time (FIFO, same ordering as the old
+ * serial read loop). The `exit` sentinel (msg == NULL) ends the loop. */
+static void lsp_worker_loop(lsp_server_t *s) {
+    for (;;) {
+        lsp_msg_t *m = q_pop(s);
+        if (!m) break; /* unreachable: q_pop only returns nodes; sentinel has
+                          msg == NULL and is handled below */
+        json_value *msg = m->msg;
+        free(m);
+        if (!msg) break; /* sentinel */
+        const char *method = json_get_str(json_obj_get(msg, "method"));
+        json_value *id = json_obj_get(msg, "id");
+        if (method && strcmp(method, "exit") == 0) {
+            json_free(msg);
+            break;
+        }
+        if (id && lsp_take_cancel(s, id)) {
+            send_response_error(s, id, -32800, "Request cancelled");
+            lsp_clear_exec(s);
+            json_free(msg);
+            continue;
+        }
+        dispatch(s, msg);
+        if (id) lsp_clear_exec(s);
+        json_free(msg);
+    }
+}
+
 int main(int argc, char **argv) {
     int port = 0;
     for (int i = 1; i < argc; i++) {
@@ -2984,6 +3262,12 @@ int main(int argc, char **argv) {
     server.diag_thread_valid =
         pthread_create(&server.diag_thread, NULL, diag_worker_main, &server) == 0;
 #endif
+#ifdef _WIN32
+    server.worker_thread = CreateThread(NULL, 0, lsp_worker_main, &server, 0, NULL);
+#else
+    server.worker_thread_valid =
+        pthread_create(&server.worker_thread, NULL, lsp_worker_main, &server) == 0;
+#endif
 
     if (port > 0) {
         server.sock = lsp_listen_accept(port);
@@ -3000,6 +3284,8 @@ int main(int argc, char **argv) {
 #endif
     }
 
+    /* Reader loop: parse frames and enqueue; never executes handlers, so a
+     * slow request cannot keep $/cancelRequest (or exit) from being read. */
     for (;;) {
         char *body = server.use_sock ? rpc_read_message_sock(server.sock)
                                      : rpc_read_message(stdin);
@@ -3010,13 +3296,36 @@ int main(int argc, char **argv) {
         if (!msg) continue;
 
         const char *method = json_get_str(json_obj_get(msg, "method"));
+        if (method && strcmp(method, "$/cancelRequest") == 0) {
+            q_set_cancel(&server, json_obj_get(json_obj_get(msg, "params"), "id"));
+            json_free(msg);
+            continue;
+        }
         bool is_exit = method && strcmp(method, "exit") == 0;
-
-        dispatch(&server, msg);
-        json_free(msg);
-
+        if (!q_push(&server, msg)) {
+            json_value *id = json_obj_get(msg, "id");
+            if (id)
+                send_response_error(&server, id, -32000,
+                                    "server queue full");
+            json_free(msg);
+        }
         if (is_exit) break;
     }
+
+    /* Tell the worker to drain what is queued and stop (the sentinel keeps
+     * FIFO order: requests read before exit/EOF still run). The sentinel
+     * bypasses the queue cap in q_push; only OOM can refuse it, so retry. */
+    while (!q_push(&server, NULL)) lsp_sleep_ms(10);
+
+#ifdef _WIN32
+    if (server.worker_thread) {
+        WaitForSingleObject(server.worker_thread, INFINITE);
+        CloseHandle(server.worker_thread);
+    }
+#else
+    if (server.worker_thread_valid)
+        pthread_join(server.worker_thread, NULL);
+#endif
 
     /* Stop the diagnostics worker before tearing the doc store down, and
      * flush any diagnostics still pending for open documents. */

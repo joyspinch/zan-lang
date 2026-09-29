@@ -8,7 +8,6 @@
 
 ## 未完成 · IDE / 编译器
 
-- [ ] **B-ID6** zan-lsp 请求处理仍单线程串行；诊断期间跳转/补全排队。需请求级并发或 `$/cancelRequest`。
 - [ ] **B-ID7** 设计器预览、直接运行、`--publish` 三路径行为仍不一致；事件缺 sender，需评估 API 破坏性变更后统一。
 - [ ] **B-ID14** IDE 全量输入加 `-g` 仍有两类问题：31 份设计触发 codegen 崩溃；`-g --publish` 可能触发 GNU ld `IMAGE_REL_AMD64_REL32`。复现清单在 `_scratch/ide_input_list.txt`，不得用换形输入绕过。
 

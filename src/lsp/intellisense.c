@@ -2027,9 +2027,14 @@ static bool index_skip_dir(const char *name) {
            strcmp(name, ".git") == 0;
 }
 
+/* Cooperative abort for the project index scan; the host clears it before
+ * the next scan (see intellisense.h). Checked per file / per directory. */
+volatile int intel_cancel_flag = 0;
+
 #ifdef _WIN32
 
 static void index_directory_recursive(intellisense_t *is, const char *dir_path) {
+    if (intel_cancel_flag) return;
     char search_path[1024];
     snprintf(search_path, sizeof(search_path), "%s\\*", dir_path);
 
@@ -2038,6 +2043,7 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
     if (hFind == INVALID_HANDLE_VALUE) return;
 
     do {
+        if (intel_cancel_flag) break;
         if (fd.cFileName[0] == '.') continue;
 
         char full_path[1024];
@@ -2059,7 +2065,7 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
                            strcmp(fd.cFileName + name_len - 5, ".html") == 0;
             bool is_htm = name_len > 4 &&
                           strcmp(fd.cFileName + name_len - 4, ".htm") == 0;
-            if (is_zan || is_zscene || is_html || is_htm) {
+            if ((is_zan || is_zscene || is_html || is_htm) && !intel_cancel_flag) {
                 /* read file and parse it */
                 HANDLE hFile = CreateFileA(full_path, GENERIC_READ, FILE_SHARE_READ,
                                           NULL, OPEN_EXISTING, 0, NULL);
@@ -2090,11 +2096,13 @@ void intel_index_project(intellisense_t *is, const char *project_root) {
 
 #else /* Non-Windows: use dirent.h */
 static void index_directory_recursive(intellisense_t *is, const char *dir_path) {
+    if (intel_cancel_flag) return;
     DIR *dir = opendir(dir_path);
     if (!dir) return;
 
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
+        if (intel_cancel_flag) break;
         if (entry->d_name[0] == '.') continue;
 
         char full_path[1024];
@@ -2117,7 +2125,7 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
                            strcmp(entry->d_name + name_len - 5, ".html") == 0;
             bool is_htm = name_len > 4 &&
                           strcmp(entry->d_name + name_len - 4, ".htm") == 0;
-            if (is_zan || is_zscene || is_html || is_htm) {
+            if ((is_zan || is_zscene || is_html || is_htm) && !intel_cancel_flag) {
                 FILE *f = fopen(full_path, "rb");
                 if (f) {
                     fseek(f, 0, SEEK_END);
@@ -2148,6 +2156,7 @@ void intel_index_project(intellisense_t *is, const char *project_root) {
 
 void intel_index_files(intellisense_t *is, const char **filepaths, int count) {
     for (int i = 0; i < count; i++) {
+        if (intel_cancel_flag) break;
         if (!filepaths[i]) continue;
 
         /* Read the file */
