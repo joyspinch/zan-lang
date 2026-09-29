@@ -10,6 +10,14 @@ namespace Gui;
 delegate void Action();
 
 /// <summary>
+/// sender 通道专用委托：处理器收到触发事件的控件。
+/// 独立命名而非复用 <c>Action&lt;Control&gt;</c>（后者住在
+/// System.Linq，且与 <see cref="Action"/> 同名，子命名空间下
+/// 名字解析歧义），也让注册点读起来明确是控件事件。
+/// </summary>
+delegate void ControlEvent(Control sender);
+
+/// <summary>
 /// 对运行时 UI 线程调度队列的轻量封装。后台线程
 /// 调用 <see cref="Post"/> 把委托交回 UI 线程；UI 线程
 /// 每帧清空一次队列（见 <c>App.Post</c> / <c>App.DrainPosts</c>）。
@@ -143,9 +151,15 @@ class EventHub {
 /// </summary>
 class UiEvent {
     List<Action> handlers;
+    /// 平行 sender 通道（S = Sender）：注册在这里的处理器在触发时
+    /// 收到触发事件的控件。与无参通道相互独立、可混用；同一事件
+    /// 内先无参后带 sender，各自保持注册顺序。编译器按名称解析
+    /// 调用（无重载），因此带 sender 通道是平行方法而非重载。
+    List<ControlEvent> senderHandlers;
 
     UiEvent() {
         this.handlers = new List<Action>();
+        this.senderHandlers = new List<ControlEvent>();
     }
 
     /// 支持 <c>event += handler</c> 的运算符（追加，多播）。
@@ -171,6 +185,30 @@ class UiEvent {
     /// 注册一个处理器（等同 <c>+=</c>）。
     void Add(Action handler) { handlers.Add(handler); }
 
+    /// ---- 平行 sender 通道（S = Sender）----
+    /// 注册带 sender 的处理器：触发时收到触发本事件的控件。
+    /// 等价旧通道的 <see cref="Add"/>，存进独立的表。
+    void AddS(ControlEvent h) { senderHandlers.Add(h); }
+
+    /// 移除 sender 通道最近的相同注册项；从未添加则为空操作。
+    void RemoveS(ControlEvent h) {
+        int i = senderHandlers.Count - 1;
+        while (i >= 0) {
+            if (senderHandlers[i] == h) {
+                senderHandlers.RemoveAt(i);
+                return;
+            }
+            i = i - 1;
+        }
+    }
+
+    /// sender 通道已注册的处理器数量。
+    int CountS() { return senderHandlers.Count; }
+
+    /// 两个通道的处理器合计数——"有没有人监听"类门控用它，
+    /// 只看 <see cref="Count"/> 会漏掉仅注册 sender 通道的控件。
+    int CountAll() { return handlers.Count + senderHandlers.Count; }
+
     /// 清空所有处理器。
     void Clear() { handlers = new List<Action>(); }
 
@@ -185,9 +223,29 @@ class UiEvent {
         }
     }
 
+    /// 全通道触发：先调用无参处理器，再把 <paramref name="sender"/>
+    /// 传给 sender 通道。这是控件事件每帧的标准触发路径；
+    /// <see cref="Raise"/> 只触发无参通道，供无 sender 语境的
+    /// 非控件 UiEvent（如 DataTable 的列宽事件）继续使用。
+    void RaiseS(Control sender) {
+        for (int i = 0; i < handlers.Count; i = i + 1) {
+            Action h = handlers[i];
+            h();
+        }
+        for (int i = 0; i < senderHandlers.Count; i = i + 1) {
+            ControlEvent h = senderHandlers[i];
+            h(sender);
+        }
+    }
+
     /// 仅当 <paramref name="fire"/> 为 true 时才调用处理器。
     void RaiseIf(bool fire) {
         if (fire) { this.Raise(); }
+    }
+
+    /// <see cref="RaiseIf"/> 的全通道形式。
+    void RaiseIfS(bool fire, Control sender) {
+        if (fire) { this.RaiseS(sender); }
     }
 
     /// 将所有处理器调度到 UI 线程的分发队列。可从
@@ -196,6 +254,19 @@ class UiEvent {
         for (int i = 0; i < handlers.Count; i = i + 1) {
             Action h = handlers[i];
             Dispatcher.Post(h);
+        }
+    }
+
+    /// <see cref="Post"/> 的全通道形式：sender 在入队时就地捕获，
+    /// 处理器稍后在 UI 线程上收到该控件。
+    void PostS(Control sender) {
+        for (int i = 0; i < handlers.Count; i = i + 1) {
+            Action h = handlers[i];
+            Dispatcher.Post(h);
+        }
+        for (int i = 0; i < senderHandlers.Count; i = i + 1) {
+            ControlEvent h = senderHandlers[i];
+            Dispatcher.Post(() => { h(sender); });
         }
     }
 }
@@ -291,62 +362,91 @@ class WidgetEvents {
         return false;
     }
 
+    /// <see cref="AddByName"/> 的 sender 通道形式：按事件名订阅，
+    /// 触发时处理器收到触发事件的控件（<see cref="Control.BindEventS"/>
+    /// 的基类路由）。
+    bool AddByNameS(string evt, ControlEvent a) {
+        if (evt == "Click") { Click.AddS(a); return true; }
+        if (evt == "DoubleClick") { DoubleClick.AddS(a); return true; }
+        if (evt == "RightClick") { RightClick.AddS(a); return true; }
+        if (evt == "MouseDown") { MouseDown.AddS(a); return true; }
+        if (evt == "MouseUp") { MouseUp.AddS(a); return true; }
+        if (evt == "Enter") { Enter.AddS(a); return true; }
+        if (evt == "Leave") { Leave.AddS(a); return true; }
+        if (evt == "Move") { Move.AddS(a); return true; }
+        if (evt == "Wheel") { Wheel.AddS(a); return true; }
+        if (evt == "Focus") { Focus.AddS(a); return true; }
+        if (evt == "Blur") { Blur.AddS(a); return true; }
+        if (evt == "KeyDown") { KeyDown.AddS(a); return true; }
+        if (evt == "KeyUp") { KeyUp.AddS(a); return true; }
+        if (evt == "KeyPress") { KeyPress.AddS(a); return true; }
+        if (evt == "Tap") { Tap.AddS(a); return true; }
+        if (evt == "LongPress") { LongPress.AddS(a); return true; }
+        if (evt == "Swipe") { Swipe.AddS(a); return true; }
+        if (evt == "DragStart") { DragStart.AddS(a); return true; }
+        if (evt == "Drag") { Drag.AddS(a); return true; }
+        if (evt == "Drop") { Drop.AddS(a); return true; }
+        return false;
+    }
+
     /// 当内置事件中至少有一个监听器时返回 true。允许
     /// 容器跳过命中区域的注册（从而不抢占
     /// 下方内容的指针），直到有人监听。
     bool Any() {
-        if (Click.Count() > 0) { return true; }
-        if (DoubleClick.Count() > 0) { return true; }
-        if (RightClick.Count() > 0) { return true; }
-        if (MouseDown.Count() > 0) { return true; }
-        if (MouseUp.Count() > 0) { return true; }
-        if (Enter.Count() > 0) { return true; }
-        if (Leave.Count() > 0) { return true; }
-        if (Move.Count() > 0) { return true; }
-        if (Wheel.Count() > 0) { return true; }
-        if (Focus.Count() > 0) { return true; }
-        if (Blur.Count() > 0) { return true; }
-        if (KeyDown.Count() > 0) { return true; }
-        if (KeyUp.Count() > 0) { return true; }
-        if (KeyPress.Count() > 0) { return true; }
-        if (Tap.Count() > 0) { return true; }
-        if (LongPress.Count() > 0) { return true; }
-        if (Swipe.Count() > 0) { return true; }
-        if (DragStart.Count() > 0) { return true; }
-        if (Drag.Count() > 0) { return true; }
-        if (Drop.Count() > 0) { return true; }
+        if (Click.CountAll() > 0) { return true; }
+        if (DoubleClick.CountAll() > 0) { return true; }
+        if (RightClick.CountAll() > 0) { return true; }
+        if (MouseDown.CountAll() > 0) { return true; }
+        if (MouseUp.CountAll() > 0) { return true; }
+        if (Enter.CountAll() > 0) { return true; }
+        if (Leave.CountAll() > 0) { return true; }
+        if (Move.CountAll() > 0) { return true; }
+        if (Wheel.CountAll() > 0) { return true; }
+        if (Focus.CountAll() > 0) { return true; }
+        if (Blur.CountAll() > 0) { return true; }
+        if (KeyDown.CountAll() > 0) { return true; }
+        if (KeyUp.CountAll() > 0) { return true; }
+        if (KeyPress.CountAll() > 0) { return true; }
+        if (Tap.CountAll() > 0) { return true; }
+        if (LongPress.CountAll() > 0) { return true; }
+        if (Swipe.CountAll() > 0) { return true; }
+        if (DragStart.CountAll() > 0) { return true; }
+        if (Drag.CountAll() > 0) { return true; }
+        if (Drop.CountAll() > 0) { return true; }
         return false;
     }
 
     /// 本帧对 `id` 满足条件的已注册处理器都会触发，
     /// 在控件注册命中区域后每帧调用一次。
+    /// <paramref name="sender"/> 是触发事件的控件（两通道都会收到，
+    /// 无参处理器忽略它）；自行接线的控件传 <c>this</c>。
     /// 低频/轮询驱动的事件（移动、滚轮、按键、手势、拖拽）以
     /// 有无监听器为门槛，空闲控件无需付出开销。
-    void Fire(App app, int id) {
-        Click.RaiseIf(Ui.Clicked(app, id));
-        DoubleClick.RaiseIf(Ui.DoubleClicked(app, id));
-        MouseDown.RaiseIf(Ui.PressedDown(app, id));
-        MouseUp.RaiseIf(Ui.MouseUpOn(app, id));
-        Enter.RaiseIf(Ui.Entered(app, id));
-        Leave.RaiseIf(Ui.Left(app, id));
-        Focus.RaiseIf(Ui.FocusGained(app, id));
-        Blur.RaiseIf(Ui.FocusLost(app, id));
-        Tap.RaiseIf(Ui.Tapped(app, id));
-        if (RightClick.Count() > 0) { RightClick.RaiseIf(Ui.RightClicked(app, id)); }
-        if (Move.Count() > 0) { Move.RaiseIf(Ui.MovedOver(app, id)); }
-        if (Wheel.Count() > 0) { Wheel.RaiseIf(Ui.Wheeled(app, id)); }
-        if (KeyDown.Count() > 0) { KeyDown.RaiseIf(Ui.KeyDownOn(app, id)); }
-        if (KeyUp.Count() > 0) { KeyUp.RaiseIf(Ui.KeyUpOn(app, id)); }
-        if (KeyPress.Count() > 0) { KeyPress.RaiseIf(Ui.KeyDownOn(app, id)); }
-        if (Swipe.Count() > 0) { Swipe.RaiseIf(Ui.SwipedAny(app, id)); }
-        if (DragStart.Count() > 0) { DragStart.RaiseIf(Ui.PressedDown(app, id)); }
-        if (Drag.Count() > 0) { Drag.RaiseIf(Ui.Dragging(app, id)); }
-        if (Drop.Count() > 0) { Drop.RaiseIf(Ui.Dropped(app, id)); }
+    void Fire(App app, int id, Control sender) {
+        Click.RaiseIfS(Ui.Clicked(app, id), sender);
+        DoubleClick.RaiseIfS(Ui.DoubleClicked(app, id), sender);
+        MouseDown.RaiseIfS(Ui.PressedDown(app, id), sender);
+        MouseUp.RaiseIfS(Ui.MouseUpOn(app, id), sender);
+        Enter.RaiseIfS(Ui.Entered(app, id), sender);
+        Leave.RaiseIfS(Ui.Left(app, id), sender);
+        Focus.RaiseIfS(Ui.FocusGained(app, id), sender);
+        Blur.RaiseIfS(Ui.FocusLost(app, id), sender);
+        Tap.RaiseIfS(Ui.Tapped(app, id), sender);
+        if (RightClick.CountAll() > 0) { RightClick.RaiseIfS(Ui.RightClicked(app, id), sender); }
+        if (Move.CountAll() > 0) { Move.RaiseIfS(Ui.MovedOver(app, id), sender); }
+        if (Wheel.CountAll() > 0) { Wheel.RaiseIfS(Ui.Wheeled(app, id), sender); }
+        if (KeyDown.CountAll() > 0) { KeyDown.RaiseIfS(Ui.KeyDownOn(app, id), sender); }
+        if (KeyUp.CountAll() > 0) { KeyUp.RaiseIfS(Ui.KeyUpOn(app, id), sender); }
+        if (KeyPress.CountAll() > 0) { KeyPress.RaiseIfS(Ui.KeyDownOn(app, id), sender); }
+        if (Swipe.CountAll() > 0) { Swipe.RaiseIfS(Ui.SwipedAny(app, id), sender); }
+        if (DragStart.CountAll() > 0) { DragStart.RaiseIfS(Ui.PressedDown(app, id), sender); }
+        if (Drag.CountAll() > 0) { Drag.RaiseIfS(Ui.Dragging(app, id), sender); }
+        if (Drop.CountAll() > 0) { Drop.RaiseIfS(Ui.Dropped(app, id), sender); }
         // 仅在有人监听时才轮询长按计时器：
         // 轮询会在按住期间调度低频率的后续帧，跳过它可保持
         // 不使用长按的控件在空闲/按压时零 CPU 开销。
-        if (LongPress.Count() > 0) {
-            LongPress.RaiseIf(Ui.LongPressed(app, id));
+        if (LongPress.CountAll() > 0) {
+            LongPress.RaiseIfS(Ui.LongPressed(app, id), sender);
         }
     }
 }
