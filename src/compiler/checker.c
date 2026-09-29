@@ -199,8 +199,8 @@ static bool access_same_module(zan_istr_t a, zan_istr_t b) {
  * member nesting); empty when unknown, which compares as no-module. */
 static zan_istr_t access_symbol_ns(zan_symbol_t *s) {
     while (s) {
-        if (s->decl && s->decl->ns_name.len)
-            return s->decl->ns_name;
+        if (s->decl && zan_ast_ns_name(s->decl).len)
+            return zan_ast_ns_name(s->decl);
         s = s->parent;
     }
     return (zan_istr_t){NULL, 0};
@@ -233,7 +233,8 @@ static void report_inaccessible(zan_checker_t *c, zan_symbol_t *m,
     else if (m->modifiers & MOD_INTERNAL) {
         zan_istr_t mod_ns = access_symbol_ns(m);
         zan_ast_node_t *cur = access_current_decl(c);
-        zan_istr_t cur_name = cur ? cur->ns_name : c->current_type_sym->name;
+        zan_istr_t cur_ns = cur ? zan_ast_ns_name(cur) : (zan_istr_t){0};
+        zan_istr_t cur_name = cur_ns.len ? cur_ns : c->current_type_sym->name;
         zan_diag_emit(c->diag, DIAG_ERROR, loc,
                       "'%.*s.%.*s' is internal to '%.*s' and cannot be "
                       "accessed from '%.*s'",
@@ -747,8 +748,9 @@ static void check_generic_constraints(zan_checker_t *c, zan_type_t *t,
         d->kind != AST_INTERFACE_DECL)
         return;
     if (!t->type_args || t->type_arg_count == 0) return;
-    for (int w = 0; w < d->type_decl.where_clauses.count; w++) {
-        zan_ast_node_t *wc = d->type_decl.where_clauses.items[w];
+    if (!d->type_decl.where_clauses) return;
+    for (int w = 0; w < d->type_decl.where_clauses->count; w++) {
+        zan_ast_node_t *wc = d->type_decl.where_clauses->items[w];
         int idx = -1;
         for (int i = 0; i < d->type_decl.type_params.count; i++) {
             zan_ast_node_t *tp = d->type_decl.type_params.items[i];
@@ -817,7 +819,7 @@ static bool checker_weak_target_is_arc_ref(zan_type_t *t) {
 * checker is the right gate: reject it at the declaration. */
 static void check_extern_static(zan_checker_t *c, zan_ast_node_t *member) {
     if (!c || !member || member->kind != AST_METHOD_DECL) return;
-    bool is_extern = member->method_decl.extern_lib.str != NULL ||
+    bool is_extern = zan_ast_method_extern_lib(member).str != NULL ||
                      (member->method_decl.modifiers & MOD_EXTERN) != 0;
     if (!is_extern) return;
     if (member->method_decl.modifiers & MOD_STATIC) return;

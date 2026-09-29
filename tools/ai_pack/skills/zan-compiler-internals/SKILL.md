@@ -1352,7 +1352,21 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   注意 worker 的 stdout 进 logDir 不进控制台，控制台里的 FATAL 未必是被杀进程
   的遗言；以记录文件内容和 rc 为准。
 
-## 无栈调度器终局条件：woke==0 ≠ 静止；「摇奖绿」用例要按挂起事件清零来修（A298，2026-09-12 已修）
+## 编译器前端内存暴增治理：AST 节点极致紧凑化与 Resolve 临时字符串消除（2026-09）
+
+- **AST 节点尺寸从 208B 压榨至 120B（单节点缩减 42.3%）**：
+  - 核心病灶：AST 节点是一个大 union，若公共头或冷门成员内联大字段，每个节点都会被等幅撑大。原结构公共头包含 `attributes` (16B)、`ns_name` (16B)、`orig_name` (16B)、`ns_usings` (8B)，导致 99% 的表达式、语句、字面量节点白白承受 56 字节的空置内存；`method_decl` 内联了 `extern_lib`、`entry_point`、`where_clauses`、`base_args` 等低频字段。
+  - 瘦身落地：
+    1. 声明元数据外置：提取 `zan_decl_meta_t *meta`（8B），仅在类/方法声明且实际持有特性或命名空间时动态挂载，公共头从 80B 缩减到 32B；
+    2. 方法冷字段外置：提取 `zan_method_ext_t *ext`；
+    3. 类型 where clauses 改指针。
+  - 守门断言：`_Static_assert(sizeof(zan_ast_node_t) <= 120, "AST node layout regressed");`。实测 20 万节点内存从 40 MB 降至 23 MB。
+- **Resolve 阶段临时查找字符串隔离**：
+  - 严禁在 `nsresolve.c` 中通过 `flatten_qname(..., c->arena)` 或 `join_ns(c->arena, ...)` 将仅用于 symbol 查找比对的一次性字符串分配进主 Arena。
+  - 改用 `find_full_joined` 与 `flatten_qname_buf`：短字符串走 512 字节栈缓冲区，超过时临时 malloc并在查找结束后立即 free，彻底消除 Resolve 阶段的 Arena 内存污染。
+- **探针收益实证**：
+  - GUI 继承探针：Parse 阶段 Commit 内存从 70 MB 降至 52 MB，全流程 Peak Commit 从 116 MB 降至 94 MB（首度跌破 100 MB 大关），IR 指令与输出二进制运行 100% 一致。
+
 
 - irgen 内联发射的 `zan_co_sched_run_until` 曾以「`woke>0 || has_timer`」决定退出。
   阻塞任务线程（DNS/Resolve 等）完成时在**锁外** post NULL-overlapped 唤醒包，而

@@ -811,11 +811,13 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
     case AST_CLASS_DECL:
     case AST_STRUCT_DECL:
     case AST_INTERFACE_DECL: {
+        zan_istr_t decl_ns = zan_ast_ns_name(decl);
+        zan_istr_t decl_orig = zan_ast_orig_name(decl);
         json_obj_set(o, "name", json_new_str(
             decl->type_decl.name.str ? (const char *)decl->type_decl.name.str
                                      : ""));
         json_obj_set(o, "ns", json_new_str(
-            decl->ns_name.str ? (const char *)decl->ns_name.str : ""));
+            decl_ns.str ? (const char *)decl_ns.str : ""));
         json_obj_set(o, "kind", json_new_str(
             decl->kind == AST_CLASS_DECL ? "class" :
             decl->kind == AST_STRUCT_DECL ? "struct" : "interface"));
@@ -823,9 +825,9 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
             (decl->type_decl.modifiers & MOD_ABSTRACT) != 0));
         json_obj_set(o, "generic", json_new_bool(
             decl->type_decl.type_params.count > 0));
-        if (decl->orig_name.len)
+        if (decl_orig.len)
             json_obj_set(o, "orig", json_new_str(
-                decl->orig_name.str ? (const char *)decl->orig_name.str : ""));
+                decl_orig.str ? (const char *)decl_orig.str : ""));
         json_obj_set(o, "file", json_new_num((double)decl->loc.file_id));
         json_obj_set(o, "line", json_new_num((double)decl->loc.line));
         json_value *bases = json_new_arr();
@@ -836,7 +838,7 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
         }
         json_obj_set(o, "bases", bases);
         json_value *attrs = json_new_arr();
-        gm_attrs_json(&decl->attributes, attrs);
+        gm_attrs_json(zan_ast_attributes(decl), attrs);
         json_obj_set(o, "attrs", attrs);
         json_value *fields = json_new_arr();
         json_value *methods = json_new_arr();
@@ -858,7 +860,7 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
                 gm_type_str(m->field_decl.type, t, sizeof(t));
                 json_obj_set(f, "type", json_new_str(t));
                 json_value *fa = json_new_arr();
-                gm_attrs_json(&m->attributes, fa);
+                gm_attrs_json(zan_ast_attributes(m), fa);
                 json_obj_set(f, "attrs", fa);
                 json_arr_add(fields, f);
             } else if (m->kind == AST_METHOD_DECL ||
@@ -897,7 +899,7 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
                 }
                 json_obj_set(mm, "params", ps);
                 json_value *ma = json_new_arr();
-                gm_attrs_json(&m->attributes, ma);
+                gm_attrs_json(zan_ast_attributes(m), ma);
                 json_obj_set(mm, "attrs", ma);
                 json_arr_add(methods, mm);
                 /* constructor: the `Prop = param;` assignments that map ctor
@@ -985,8 +987,9 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
         json_obj_set(o, "name", json_new_str(
             decl->type_decl.name.str ? (const char *)decl->type_decl.name.str
                                      : ""));
+        zan_istr_t decl_ns = zan_ast_ns_name(decl);
         json_obj_set(o, "ns", json_new_str(
-            decl->ns_name.str ? (const char *)decl->ns_name.str : ""));
+            decl_ns.str ? (const char *)decl_ns.str : ""));
         json_obj_set(o, "kind", json_new_str("enum"));
         json_value *members = json_new_arr();
         for (int i = 0; i < decl->type_decl.members.count; i++) {

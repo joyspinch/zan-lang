@@ -79,7 +79,7 @@ static void method_sig(const zan_ast_node_t *m, char *buf, int cap) {
  * to emit them as plain external declarations. */
 static int is_extern_decl(const zan_ast_node_t *m) {
     return m->kind == AST_METHOD_DECL && !m->method_decl.body &&
-           (m->method_decl.extern_lib.str != NULL ||
+           (zan_ast_method_extern_lib(m).str != NULL ||
             (m->method_decl.modifiers & MOD_EXTERN) != 0);
 }
 
@@ -112,8 +112,9 @@ static void emit_type(FILE *f, zan_ast_node_t *d) {
 
     zan_istr_t name = (d->kind == AST_ENUM_DECL) ? d->type_decl.name
                                                  : d->type_decl.name;
+    zan_istr_t ns = zan_ast_ns_name(d);
     fprintf(f, "T\t%s\t%.*s\t%.*s\t%s\n", kind,
-            (int)d->ns_name.len, d->ns_name.len ? d->ns_name.str : "",
+            (int)ns.len, ns.len ? ns.str : "",
             (int)name.len, name.str, bases);
 
     for (int i = 0; i < d->type_decl.members.count; i++) {

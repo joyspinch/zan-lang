@@ -9934,7 +9934,7 @@ static zan_symbol_t *direct_extern_method(zan_irgen_t *g, zan_ast_node_t *expr) 
         if (cls) sym = get_method_sym(cls, expr->call.callee->member.name);
     }
     if (!sym || !sym->decl || sym->decl->kind != AST_METHOD_DECL) return NULL;
-    if (!sym->decl->method_decl.extern_lib.str &&
+    if (!zan_ast_method_extern_lib(sym->decl).str &&
         !(sym->decl->method_decl.modifiers & MOD_EXTERN))
         return NULL;
     return sym;

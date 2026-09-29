@@ -130,6 +130,26 @@ typedef struct {
     int capacity;
 } zan_ast_list_t;
 
+/* Optional extension payload for cold method/ctor declaration attributes
+ * (DllImport, where generic constraints, constructor base args).
+ * Stored via pointer on AST_METHOD_DECL to keep common AST nodes small. */
+typedef struct {
+    zan_istr_t extern_lib;        /* DllImport library name, {NULL,0} if none */
+    zan_istr_t *entry_point;      /* DllImport entry point override, NULL if none */
+    zan_ast_list_t where_clauses; /* AST_WHERE_CLAUSE generic constraints */
+    zan_ast_list_t base_args;     /* constructor `: base(...)` argument exprs */
+} zan_method_ext_t;
+
+/* Declaration metadata (attributes, enclosing namespace, unmangled name,
+ * and file-level usings) attached via pointer to top-level/member declarations.
+ * 99% of AST nodes (expressions, statements, literals) keep this NULL. */
+typedef struct {
+    zan_ast_list_t attributes;
+    zan_istr_t ns_name;
+    zan_istr_t orig_name;
+    zan_ast_list_t *ns_usings;
+} zan_decl_meta_t;
+
 struct zan_ast_node {
     zan_ast_kind_t kind;
     zan_loc_t loc;
@@ -145,16 +165,10 @@ struct zan_ast_node {
     uint8_t lit_radix;
     /* True for declarations supplied by the auto-included standard library. */
     unsigned char from_stdlib;
+    uint8_t _pad;
 
-    /* [Attr(...)] usages attached to a declaration; empty list if none. */
-    zan_ast_list_t attributes;
-
-    /* Namespace context, stamped per top-level declaration before binding
-     * so namespace-aware resolution can tell apart same-named types in
-     * different namespaces (see nsresolve.c).  Empty/NULL for global. */
-    zan_istr_t ns_name;         /* enclosing namespace, dotted ("A.B") */
-    zan_istr_t orig_name;       /* pre-mangling simple name, if renamed */
-    zan_ast_list_t *ns_usings;  /* the file's `using` decls; NULL if none */
+    /* Optional declaration metadata for type/member declarations (NULL for exprs). */
+    zan_decl_meta_t *meta;
 
     union {
         /* literals */
@@ -418,7 +432,7 @@ struct zan_ast_node {
             bool is_c_layout;  /* [StructLayout(LayoutKind.Sequential)] for C ABI */
             bool is_explicit_layout; /* [StructLayout(LayoutKind.Explicit)]:
                                       * every field carries [FieldOffset(n)] */
-            zan_ast_list_t where_clauses; /* AST_WHERE_CLAUSE generic constraints */
+            zan_ast_list_t *where_clauses; /* AST_WHERE_CLAUSE generic constraints (NULL if none) */
             /* Set by hoist_nested_types: the type this declaration was nested
              * in before being lifted to unit level. The binder links the
              * symbol back into the host's member list so `Host.Nested`
@@ -441,10 +455,7 @@ struct zan_ast_node {
             bool has_base_init;     /* constructor declared a `: base(...)` initializer */
             bool has_this_init;
             bool is_task_return;    /* declared Task/Task<T>/ValueTask<T> before async desugaring */
-            zan_istr_t extern_lib;   /* DllImport library name, {NULL,0} if none */
-            zan_istr_t *entry_point; /* DllImport entry point override, NULL if none */
-            zan_ast_list_t where_clauses; /* AST_WHERE_CLAUSE generic constraints */
-            zan_ast_list_t base_args;  /* constructor `: base(...)` argument exprs */
+            zan_method_ext_t *ext;   /* DllImport, where_clauses, base_args (NULL if none) */
         } method_decl;
 
         /* field */
@@ -648,5 +659,63 @@ size_t zan_ast_node_count(void);
 bool zan_ast_has_attr(const zan_ast_node_t *decl, const char *name);
 void zan_ast_list_init(zan_ast_list_t *list);
 void zan_ast_list_push(zan_ast_list_t *list, zan_ast_node_t *node, zan_arena_t *arena);
+
+zan_method_ext_t *zan_ast_ensure_method_ext(zan_ast_node_t *n, zan_arena_t *arena);
+
+static inline zan_istr_t zan_ast_method_extern_lib(const zan_ast_node_t *n) {
+    static const zan_istr_t empty = {0};
+    return (n && (n->kind == AST_METHOD_DECL || n->kind == AST_CONSTRUCTOR_DECL) &&
+            n->method_decl.ext) ? n->method_decl.ext->extern_lib : empty;
+}
+
+static inline zan_istr_t *zan_ast_method_entry_point(const zan_ast_node_t *n) {
+    return (n && (n->kind == AST_METHOD_DECL || n->kind == AST_CONSTRUCTOR_DECL) &&
+            n->method_decl.ext) ? n->method_decl.ext->entry_point : NULL;
+}
+
+static inline zan_ast_list_t *zan_ast_method_where_clauses(zan_ast_node_t *n) {
+    static zan_ast_list_t empty = {0};
+    return (n && (n->kind == AST_METHOD_DECL || n->kind == AST_CONSTRUCTOR_DECL) &&
+            n->method_decl.ext) ? &n->method_decl.ext->where_clauses : &empty;
+}
+
+static inline zan_ast_list_t *zan_ast_method_base_args(zan_ast_node_t *n) {
+    static zan_ast_list_t empty = {0};
+    return (n && (n->kind == AST_METHOD_DECL || n->kind == AST_CONSTRUCTOR_DECL) &&
+            n->method_decl.ext) ? &n->method_decl.ext->base_args : &empty;
+}
+
+static inline zan_ast_list_t *zan_ast_type_where_clauses(zan_ast_node_t *n) {
+    static zan_ast_list_t empty = {0};
+    return (n && (n->kind == AST_CLASS_DECL || n->kind == AST_STRUCT_DECL ||
+                  n->kind == AST_INTERFACE_DECL) &&
+            n->type_decl.where_clauses) ? n->type_decl.where_clauses : &empty;
+}
+
+zan_decl_meta_t *zan_ast_ensure_decl_meta(zan_ast_node_t *n, zan_arena_t *arena);
+
+static inline zan_ast_list_t *zan_ast_attributes(zan_ast_node_t *n) {
+    static zan_ast_list_t empty = {0};
+    return (n && n->meta) ? &n->meta->attributes : &empty;
+}
+
+static inline const zan_ast_list_t *zan_ast_attributes_const(const zan_ast_node_t *n) {
+    static const zan_ast_list_t empty = {0};
+    return (n && n->meta) ? &n->meta->attributes : &empty;
+}
+
+static inline zan_istr_t zan_ast_ns_name(const zan_ast_node_t *n) {
+    static const zan_istr_t empty = {0};
+    return (n && n->meta) ? n->meta->ns_name : empty;
+}
+
+static inline zan_istr_t zan_ast_orig_name(const zan_ast_node_t *n) {
+    static const zan_istr_t empty = {0};
+    return (n && n->meta) ? n->meta->orig_name : empty;
+}
+
+static inline zan_ast_list_t *zan_ast_ns_usings(const zan_ast_node_t *n) {
+    return (n && n->meta) ? n->meta->ns_usings : NULL;
+}
 
 #endif /* ZAN_AST_H */

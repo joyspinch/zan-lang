@@ -108,14 +108,17 @@ static zan_istr_t flatten_qname(zan_ast_node_t *q, zan_arena_t *ar) {
 /* Nested declarations are hoisted only after the input units have been merged.
  * Stamp them now, while their source namespace/import list is still known. */
 static void stamp_decl_context(zan_ast_node_t *d, zan_istr_t ns,
-                               zan_ast_list_t *usings) {
+                               zan_ast_list_t *usings, zan_arena_t *arena) {
     if (!d) return;
-    d->ns_name = ns;
-    d->ns_usings = usings;
+    if (ns.len > 0 || (usings && usings->count > 0)) {
+        zan_decl_meta_t *m = zan_ast_ensure_decl_meta(d, arena);
+        m->ns_name = ns;
+        m->ns_usings = usings;
+    }
     if (d->kind == AST_CLASS_DECL || d->kind == AST_STRUCT_DECL ||
         d->kind == AST_INTERFACE_DECL || d->kind == AST_ENUM_DECL) {
         for (int i = 0; i < d->type_decl.members.count; i++)
-            stamp_decl_context(d->type_decl.members.items[i], ns, usings);
+            stamp_decl_context(d->type_decl.members.items[i], ns, usings, arena);
     }
 }
 
@@ -126,7 +129,7 @@ void zan_nsresolve_stamp(zan_ast_node_t *unit, zan_arena_t *arena) {
         ns = flatten_qname(unit->comp_unit.ns->namespace_decl.name, arena);
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *d = unit->comp_unit.decls.items[i];
-        stamp_decl_context(d, ns, &unit->comp_unit.usings);
+        stamp_decl_context(d, ns, &unit->comp_unit.usings, arena);
     }
 }
 
@@ -760,9 +763,9 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
      * spread over ~20 files and its ChartBarLayout.zan partial has no
      * `using Gui;`, so inheriting that file's imports left every `App`
      * parameter in the other partials unresolved. */
-    if (n->ns_usings) {
-        ns = n->ns_name;
-        usings = n->ns_usings;
+    if (zan_ast_ns_usings(n)) {
+        ns = zan_ast_ns_name(n);
+        usings = zan_ast_ns_usings(n);
     }
     switch (n->kind) {
     case AST_TYPE_REF:
@@ -781,7 +784,8 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
                 shadow_add(&c->fields, m->field_decl.name);
         }
         nr_walk_list(c, &n->type_decl.bases, ns, usings);
-        nr_walk_list(c, &n->type_decl.where_clauses, ns, usings);
+        if (n->type_decl.where_clauses)
+            nr_walk_list(c, n->type_decl.where_clauses, ns, usings);
         nr_walk_list(c, &n->type_decl.members, ns, usings);
         c->fields.count = saved_fields;
         break;
@@ -798,8 +802,10 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
         collect_shadows(c, n->method_decl.body);
         nr_walk(c, n->method_decl.return_type, ns, usings);
         nr_walk_list(c, &n->method_decl.params, ns, usings);
-        nr_walk_list(c, &n->method_decl.where_clauses, ns, usings);
-        nr_walk_list(c, &n->method_decl.base_args, ns, usings);
+        if (n->method_decl.ext) {
+            nr_walk_list(c, &n->method_decl.ext->where_clauses, ns, usings);
+            nr_walk_list(c, &n->method_decl.ext->base_args, ns, usings);
+        }
         nr_walk(c, n->method_decl.body, ns, usings);
         break;
 
@@ -1037,8 +1043,8 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
         nr_type_t *t = &c.items[c.count++];
         t->decl = d;
         t->simple = decl_simple_name(d);
-        t->ns = d->ns_name;
-        t->full = join_ns(arena, d->ns_name, t->simple);
+        t->ns = zan_ast_ns_name(d);
+        t->full = join_ns(arena, t->ns, t->simple);
         t->final = t->simple;
         t->conflicting = false;
     }
@@ -1067,8 +1073,8 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
         if (!c.items[i].conflicting) continue;
         zan_istr_t m = mangle(&c, c.items[i].full);
         c.items[i].final = m;
-        if (c.items[i].decl->orig_name.len == 0)
-            c.items[i].decl->orig_name = c.items[i].simple;
+        if (zan_ast_orig_name(c.items[i].decl).len == 0)
+            zan_ast_ensure_decl_meta(c.items[i].decl, arena)->orig_name = c.items[i].simple;
         decl_set_name(c.items[i].decl, m);
     }
 
@@ -1077,7 +1083,7 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
         zan_ast_node_t *d = decls->items[i];
         if (!d) continue;
         c.shadow.count = 0;
-        nr_walk(&c, d, d->ns_name, d->ns_usings);
+        nr_walk(&c, d, zan_ast_ns_name(d), zan_ast_ns_usings(d));
     }
     free(c.shadow.items);
 }
@@ -1108,8 +1114,8 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
         if (!d || !is_type_decl_kind(d->kind)) continue;
         items[n].decl = d;
         items[n].simple = decl_simple_name(d);
-        items[n].ns = d->ns_name;
-        items[n].full = join_ns(arena, d->ns_name, items[n].simple);
+        items[n].ns = zan_ast_ns_name(d);
+        items[n].full = join_ns(arena, items[n].ns, items[n].simple);
         items[n].final = items[n].simple;
         items[n].conflicting = false;
         n++;
@@ -1188,7 +1194,7 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
             zp_refs_t refs;
             memset(&refs, 0, sizeof(refs));
             c.refs = &refs;
-            nr_walk(&c, d, d->ns_name, d->ns_usings);
+            nr_walk(&c, d, zan_ast_ns_name(d), zan_ast_ns_usings(d));
             /* Recorded names are FINAL simple names (t->final), so resolve
              * them against the simple-name index: a by_full lookup would
              * miss every non-mangled reference ("App" vs "Gui.App"),
@@ -1210,7 +1216,7 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
         zan_ast_node_t *d = decls->items[i];
         if (d && is_type_decl_kind(d->kind)) {
             int j = nr_index_find(&by_full, items, 1,
-                                  join_ns(arena, d->ns_name, decl_simple_name(d)));
+                                  join_ns(arena, zan_ast_ns_name(d), decl_simple_name(d)));
             if (j >= 0 && !kept[j]) continue;
         }
         decls->items[w++] = d;

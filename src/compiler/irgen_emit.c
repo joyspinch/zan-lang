@@ -1251,7 +1251,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
              * variant declares them. */
             bool is_extern_decl =
                 member->kind == AST_METHOD_DECL && !member->method_decl.body &&
-                (member->method_decl.extern_lib.str ||
+                (zan_ast_method_extern_lib(member).str ||
                  (member->method_decl.modifiers & MOD_EXTERN) != 0);
             if (cur_variant && is_extern_decl)
                 continue;
@@ -1281,10 +1281,10 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                     member->method_decl.is_variadic ? 1 : 0);
                 /* use entry_point if specified, otherwise method name */
                 char ext_name[256];
-                if (member->method_decl.entry_point) {
+                zan_istr_t *ep = zan_ast_method_entry_point(member);
+                if (ep) {
                     snprintf(ext_name, sizeof(ext_name), "%.*s",
-                             (int)member->method_decl.entry_point->len,
-                             member->method_decl.entry_point->str);
+                             (int)ep->len, ep->str);
                 } else {
                     snprintf(ext_name, sizeof(ext_name), "%.*s",
                              (int)member->method_decl.name.len,
@@ -1362,12 +1362,13 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                     irgen_register_function(g, method_sym, efn, ft);
                 }
                 /* store lib name for linker */
-                if (member->method_decl.extern_lib.str) {
+                zan_istr_t ext_lib = zan_ast_method_extern_lib(member);
+                if (ext_lib.str) {
                     bool already = false;
                     for (int li = 0; li < g->extern_lib_count; li++) {
-                        if (g->extern_libs[li].len == member->method_decl.extern_lib.len &&
-                            memcmp(g->extern_libs[li].str, member->method_decl.extern_lib.str,
-                                   member->method_decl.extern_lib.len) == 0) {
+                        if (g->extern_libs[li].len == ext_lib.len &&
+                            memcmp(g->extern_libs[li].str, ext_lib.str,
+                                   ext_lib.len) == 0) {
                             already = true;
                             break;
                         }
@@ -1375,15 +1376,14 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                     if (!already &&
                         ZAN_TAB_ENSURE(g->extern_libs, g->extern_lib_count,
                                        g->extern_lib_cap, 16)) {
-                        g->extern_libs[g->extern_lib_count++] = member->method_decl.extern_lib;
+                        g->extern_libs[g->extern_lib_count++] = ext_lib;
                     }
                 }
                 /* record (lib, fn) so an unresolvable lib can be stubbed when
                  * cross-linking a static Linux binary */
-                if (member->method_decl.extern_lib.str) {
-                    zan_istr_t sym = member->method_decl.entry_point
-                        ? *member->method_decl.entry_point
-                        : member->method_decl.name;
+                if (ext_lib.str) {
+                    zan_istr_t *ep = zan_ast_method_entry_point(member);
+                    zan_istr_t sym = ep ? *ep : member->method_decl.name;
                     bool seen = false;
                     for (int fi = 0; fi < g->extern_fn_count; fi++) {
                         if (g->extern_fns[fi].name.len == sym.len &&
@@ -1395,7 +1395,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                     if (!seen &&
                         ZAN_TAB_ENSURE(g->extern_fns, g->extern_fn_count,
                                        g->extern_fn_cap, 128)) {
-                        g->extern_fns[g->extern_fn_count].lib = member->method_decl.extern_lib;
+                        g->extern_fns[g->extern_fn_count].lib = ext_lib;
                         g->extern_fns[g->extern_fn_count].name = sym;
                         g->extern_fn_count++;
                     }
@@ -1914,7 +1914,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
                 target_sym = type_sym->type->base_type->sym;
             }
             if (target_sym) {
-                zan_ast_list_t *init_args = &member->method_decl.base_args;
+                zan_ast_list_t *init_args = zan_ast_method_base_args(member);
                 struct zan_ctor_entry *target = find_ctor(
                     g, target_sym, init_args, locals, this_init ? member : NULL);
                 zan_ast_list_t init_args_filled;

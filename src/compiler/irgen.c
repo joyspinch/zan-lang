@@ -3793,8 +3793,9 @@ static bool decl_is_explicit_layout(zan_symbol_t *sym) {
  * at. Two fields may name the same offset, which is how a union is written. */
 static bool field_offset_attr(zan_symbol_t *field, unsigned long *out) {
     if (!field->decl) return false;
-    for (int i = 0; i < field->decl->attributes.count; i++) {
-        zan_ast_node_t *a = field->decl->attributes.items[i];
+    zan_ast_list_t *attrs = zan_ast_attributes(field->decl);
+    for (int i = 0; i < attrs->count; i++) {
+        zan_ast_node_t *a = attrs->items[i];
         if (a->kind != AST_ATTRIBUTE || !a->attribute.name) continue;
         zan_istr_t n = a->attribute.name->ident.name;
         if (!n.str || n.len != 11 || memcmp(n.str, "FieldOffset", 11) != 0) continue;

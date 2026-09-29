@@ -2080,7 +2080,7 @@ static void emit_string_len_set(zan_irgen_t *g, LLVMValueRef payload,
  * ([DllImport] lib name or the `extern` modifier), which is order-proof. */
 static bool sym_declares_extern(zan_symbol_t *sym) {
     if (!sym || !sym->decl || sym->decl->kind != AST_METHOD_DECL) return false;
-    return sym->decl->method_decl.extern_lib.str != NULL ||
+    return zan_ast_method_extern_lib(sym->decl).str != NULL ||
            (sym->decl->method_decl.modifiers & MOD_EXTERN) != 0;
 }
 

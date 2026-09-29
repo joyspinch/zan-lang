@@ -2205,7 +2205,8 @@ static int pi_is_ns_root(zan_istr_t name) {
 
 static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
     if (!n) return;
-    pi_seed_list(&n->attributes);
+    if (n->meta && n->meta->attributes.count > 0)
+        pi_seed_list(&n->meta->attributes);
     switch (n->kind) {
     /* ---- type positions: the only places a simple name is a reference */
     case AST_TYPE_REF:
@@ -2244,8 +2245,10 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
         pi_seed_ast(n->method_decl.return_type);
         pi_seed_list(&n->method_decl.params);
         pi_seed_list(&n->method_decl.type_params);
-        pi_seed_list(&n->method_decl.where_clauses);
-        pi_seed_list(&n->method_decl.base_args);
+        if (n->method_decl.ext) {
+            pi_seed_list(&n->method_decl.ext->where_clauses);
+            pi_seed_list(&n->method_decl.ext->base_args);
+        }
         pi_seed_ast(n->method_decl.body);
         return;
     case AST_CLASS_DECL:
@@ -2253,7 +2256,8 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
     case AST_INTERFACE_DECL:
         pi_seed_list(&n->type_decl.bases);
         pi_seed_list(&n->type_decl.members);
-        pi_seed_list(&n->type_decl.where_clauses);
+        if (n->type_decl.where_clauses)
+            pi_seed_list(n->type_decl.where_clauses);
         return;
     case AST_ENUM_DECL:
         pi_seed_list(&n->type_decl.bases);

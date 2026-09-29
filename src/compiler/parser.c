@@ -160,8 +160,6 @@ static zan_ast_node_t *parse_delegate_decl(zan_parser_t *p, uint32_t mods) {
     ddecl->method_decl.type_params = dtype_params;
     ddecl->method_decl.body = NULL;
     ddecl->method_decl.modifiers = mods;
-    ddecl->method_decl.extern_lib = (zan_istr_t){NULL, 0};
-    ddecl->method_decl.entry_point = NULL;
     return ddecl;
 }
 
@@ -227,7 +225,8 @@ static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
         zan_ast_node_t *decl = parse_type_decl(p, mods);
         decl->type_decl.is_c_layout = has_c_layout;
         decl->type_decl.is_explicit_layout = has_explicit_layout;
-        decl->attributes = type_attrs;
+        if (type_attrs.count > 0)
+            zan_ast_ensure_decl_meta(decl, p->arena)->attributes = type_attrs;
         zan_ast_list_push(&unit->comp_unit.decls, decl, p->arena);
         return true;
     }
@@ -3296,11 +3295,8 @@ static zan_ast_node_t *parse_local_func(zan_parser_t *p) {
     n->method_decl.return_type = ret_type;
     n->method_decl.params = params;
     n->method_decl.type_params = type_params;
-    zan_ast_list_init(&n->method_decl.where_clauses);
     n->method_decl.body = body;
     n->method_decl.modifiers = MOD_PRIVATE | MOD_STATIC;
-    n->method_decl.extern_lib = (zan_istr_t){NULL, 0};
-    n->method_decl.entry_point = NULL;
     n->method_decl.has_base_init = false;
     n->method_decl.has_this_init = false;
     zan_ast_list_push(&p->pending_members, n, p->arena);
@@ -3998,7 +3994,6 @@ static zan_ast_node_t *synth_property_accessor(zan_parser_t *p, zan_istr_t name,
     n->method_decl.return_type = ret_type;
     zan_ast_list_init(&n->method_decl.params);
     zan_ast_list_init(&n->method_decl.type_params);
-    zan_ast_list_init(&n->method_decl.where_clauses);
     if (value_type) {
         zan_ast_node_t *param = zan_ast_new(p->arena, AST_PARAM, loc);
         /* the setter parameter is named `value`, C#-style */
@@ -4022,7 +4017,8 @@ static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
     parse_attr_usages(p, &attrs, &dll_import_lib, &dll_entry_point, &dll_variadic);
     zan_ast_node_t *n = parse_member_decl_inner(p, dll_import_lib, dll_entry_point,
                                                 dll_variadic);
-    if (n) n->attributes = attrs;
+    if (n && attrs.count > 0)
+        zan_ast_ensure_decl_meta(n, p->arena)->attributes = attrs;
     return n;
 }
 
@@ -4123,11 +4119,8 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         cn->method_decl.return_type = conv_ret;
         cn->method_decl.params = conv_params;
         zan_ast_list_init(&cn->method_decl.type_params);
-        zan_ast_list_init(&cn->method_decl.where_clauses);
         cn->method_decl.body = conv_body;
         cn->method_decl.modifiers = mods | MOD_STATIC;
-        cn->method_decl.extern_lib = (zan_istr_t){NULL, 0};
-        cn->method_decl.entry_point = NULL;
         return cn;
     }
 ordinary_member:
@@ -4177,7 +4170,9 @@ ordinary_member:
         n->method_decl.body = body;
         n->method_decl.modifiers = mods;
         n->method_decl.return_type = NULL;
-        n->method_decl.base_args = base_args;
+        if (base_args.count > 0) {
+            zan_ast_ensure_method_ext(n, p->arena)->base_args = base_args;
+        }
         n->method_decl.has_base_init = has_base_init;
         n->method_decl.has_this_init = has_this_init;
         zan_ast_list_init(&n->method_decl.type_params);
@@ -4221,8 +4216,6 @@ ordinary_member:
         zan_ast_list_init(&n->method_decl.type_params);
         n->method_decl.body = body;
         n->method_decl.modifiers = mods | MOD_STATIC;
-        n->method_decl.extern_lib = (zan_istr_t){NULL, 0};
-        n->method_decl.entry_point = NULL;
         return n;
     }
 
@@ -4333,11 +4326,8 @@ ordinary_member:
             g->method_decl.return_type = type;
             g->method_decl.params = idx_params;
             zan_ast_list_init(&g->method_decl.type_params);
-            zan_ast_list_init(&g->method_decl.where_clauses);
             g->method_decl.body = getter_body;
             g->method_decl.modifiers = mods; /* instance, receiver is `this` */
-            g->method_decl.extern_lib = (zan_istr_t){NULL, 0};
-            g->method_decl.entry_point = NULL;
             zan_ast_list_push(&p->pending_members, g, p->arena);
         }
         if (setter_body) {
@@ -4347,7 +4337,6 @@ ordinary_member:
             s->method_decl.return_type = NULL; /* void */
             s->method_decl.params = idx_params;
             zan_ast_list_init(&s->method_decl.type_params);
-            zan_ast_list_init(&s->method_decl.where_clauses);
             zan_ast_node_t *vp = zan_ast_new(p->arena, AST_PARAM, loc);
             zan_istr_t vn = {(char *)"value", 5};
             vp->param.name = vn;
@@ -4356,8 +4345,6 @@ ordinary_member:
             zan_ast_list_push(&s->method_decl.params, vp, p->arena);
             s->method_decl.body = setter_body;
             s->method_decl.modifiers = mods;
-            s->method_decl.extern_lib = (zan_istr_t){NULL, 0};
-            s->method_decl.entry_point = NULL;
             zan_ast_list_push(&p->pending_members, s, p->arena);
         }
         return n;
@@ -4453,14 +4440,17 @@ ordinary_member:
         n->method_decl.type_params = type_params;
         n->method_decl.body = body;
         n->method_decl.modifiers = mods;
-        n->method_decl.extern_lib = dll_import_lib;
-        if (dll_entry_point.str) {
-            n->method_decl.entry_point = (zan_istr_t *)zan_arena_alloc(
-                p->arena, sizeof(zan_istr_t));
-            *n->method_decl.entry_point = dll_entry_point;
-        }
         n->method_decl.is_variadic = dll_variadic;
-        n->method_decl.where_clauses = wheres;
+        if (dll_import_lib.str || dll_entry_point.str || wheres.count > 0) {
+            zan_method_ext_t *ext = zan_ast_ensure_method_ext(n, p->arena);
+            ext->extern_lib = dll_import_lib;
+            if (dll_entry_point.str) {
+                ext->entry_point = (zan_istr_t *)zan_arena_alloc(
+                    p->arena, sizeof(zan_istr_t));
+                *ext->entry_point = dll_entry_point;
+            }
+            ext->where_clauses = wheres;
+        }
         desugar_yield_method(p, n);
         desugar_async_task_method(p, n);
         return n;
@@ -4720,7 +4710,13 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
     n->type_decl.bases = bases;
     n->type_decl.members = members;
     n->type_decl.modifiers = modifiers;
-    n->type_decl.where_clauses = wheres;
+    if (wheres.count > 0) {
+        n->type_decl.where_clauses = (zan_ast_list_t *)zan_arena_alloc(
+            p->arena, sizeof(zan_ast_list_t));
+        *n->type_decl.where_clauses = wheres;
+    } else {
+        n->type_decl.where_clauses = NULL;
+    }
     return n;
 }
 
@@ -5134,9 +5130,16 @@ void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
             for (int bi = 0; bi < d->type_decl.bases.count; bi++)
                 zan_ast_list_push(&first->type_decl.bases,
                                   d->type_decl.bases.items[bi], arena);
-            for (int wi = 0; wi < d->type_decl.where_clauses.count; wi++)
-                zan_ast_list_push(&first->type_decl.where_clauses,
-                                  d->type_decl.where_clauses.items[wi], arena);
+            if (d->type_decl.where_clauses && d->type_decl.where_clauses->count > 0) {
+                if (!first->type_decl.where_clauses) {
+                    first->type_decl.where_clauses = (zan_ast_list_t *)zan_arena_alloc(
+                        arena, sizeof(zan_ast_list_t));
+                    zan_ast_list_init(first->type_decl.where_clauses);
+                }
+                for (int wi = 0; wi < d->type_decl.where_clauses->count; wi++)
+                    zan_ast_list_push(first->type_decl.where_clauses,
+                                      d->type_decl.where_clauses->items[wi], arena);
+            }
         } else {
             decls->items[out++] = d;
         }
@@ -5504,8 +5507,9 @@ static zan_ast_node_t *find_type_decl_by_name(zan_ast_node_t *unit, zan_istr_t n
         if (d->type_decl.name.len == name.len &&
             memcmp(d->type_decl.name.str, name.str, (size_t)name.len) == 0)
             return d;
-        if (d->orig_name.len == name.len &&
-            memcmp(d->orig_name.str, name.str, (size_t)name.len) == 0)
+        zan_istr_t orig = zan_ast_orig_name(d);
+        if (orig.len == name.len &&
+            memcmp(orig.str, name.str, (size_t)name.len) == 0)
             return d;
         if (d->type_decl.name.len > name.len + 1 &&
             d->type_decl.name.str[d->type_decl.name.len - name.len - 1] == '_' &&

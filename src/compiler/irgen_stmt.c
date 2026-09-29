@@ -455,7 +455,7 @@ static int call_targets_extern(zan_irgen_t *g, zan_ast_node_t *expr) {
         if (cls) sym = get_method_sym(cls, expr->call.callee->member.name);
     }
     if (!sym || !sym->decl || sym->decl->kind != AST_METHOD_DECL) return 0;
-    return sym->decl->method_decl.extern_lib.str != NULL ||
+    return zan_ast_method_extern_lib(sym->decl).str != NULL ||
            (sym->decl->method_decl.modifiers & MOD_EXTERN) != 0;
 }
 
