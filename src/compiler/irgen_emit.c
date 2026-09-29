@@ -1622,6 +1622,8 @@ typedef struct {
 typedef struct {
     work_fn_slot_t *slots;
     int cap; /* power of two, 0 = not built */
+    const method_body_work_t *work;
+    int work_count;
 } work_fn_index_t;
 
 static uint64_t work_fn_hash(LLVMValueRef fn) {
@@ -1639,6 +1641,8 @@ static void work_fn_index_build(work_fn_index_t *ix,
     ix->slots = (work_fn_slot_t *)calloc((size_t)cap, sizeof(*ix->slots));
     if (!ix->slots) return; /* cap stays 0; lookups report "unknown parent" */
     ix->cap = cap;
+    ix->work = work;
+    ix->work_count = work_count;
     for (int w = 0; w < work_count; w++) {
         for (int which = 0; which < 2; which++) {
             LLVMValueRef key = which == 0 ? work[w].fn : work[w].resume_fn;
@@ -1664,6 +1668,59 @@ static int work_fn_index_lookup(const work_fn_index_t *ix, LLVMValueRef key) {
     return -1;
 }
 
+/* Helper: traverse up constant expression / aggregate nodes to locate an enclosing
+ * global variable, stopping after a few hops to avoid cycles. */
+static LLVMValueRef find_owning_global(LLVMValueRef val, int depth) {
+    if (!val || depth > 4) return NULL;
+    if (LLVMIsAGlobalVariable(val)) return val;
+    for (LLVMUseRef u = LLVMGetFirstUse(val); u; u = LLVMGetNextUse(u)) {
+        LLVMValueRef user = LLVMGetUser(u);
+        if (LLVMIsAGlobalVariable(user)) return user;
+        if (LLVMIsAConstant(user)) {
+            LLVMValueRef gv = find_owning_global(user, depth + 1);
+            if (gv) return gv;
+        }
+    }
+    return NULL;
+}
+
+/* Helper: check if a class's instance constructor has already been marked live. */
+static bool class_ctor_is_live(const work_fn_index_t *ix, const char *cname,
+                               const unsigned char *live) {
+    if (!ix || !ix->work || !cname) return false;
+    size_t clen = strlen(cname);
+    for (int w = 0; w < ix->work_count; w++) {
+        zan_symbol_t *sym = ix->work[w].type_sym;
+        if (sym && sym->name.len == clen &&
+            memcmp(sym->name.str, cname, clen) == 0 &&
+            ix->work[w].member->kind == AST_CONSTRUCTOR_DECL &&
+            !(ix->work[w].member->method_decl.modifiers & MOD_STATIC)) {
+            if (live[w] >= 1) return true;
+        }
+    }
+    return false;
+}
+
+/* Helper: check if a global variable (specifically __zan_vtable_*) is referenced by any
+ * live instruction (e.g. object initializer / field 0 store). */
+static bool vtable_has_live_use(LLVMValueRef vtg, const unsigned char *live,
+                                const work_fn_index_t *ix, int depth) {
+    if (!vtg || depth > 4) return false;
+    for (LLVMUseRef u = LLVMGetFirstUse(vtg); u; u = LLVMGetNextUse(u)) {
+        LLVMValueRef user = LLVMGetUser(u);
+        if (LLVMIsAInstruction(user)) {
+            LLVMValueRef parent = LLVMGetBasicBlockParent(LLVMGetInstructionParent(user));
+            if (!parent) return true;
+            int i = work_fn_index_lookup(ix, parent);
+            if (i < 0 || live[i] == 2) return true;
+        } else if (LLVMIsAConstantExpr(user)) {
+            if (vtable_has_live_use(user, live, ix, depth + 1))
+                return true;
+        }
+    }
+    return false;
+}
+
 /* LLVM use edges give a conservative pre-body reachability graph: all call
  * targets, method groups, constructor references and vtables are registered
  * before this pass. A declaration used by a live function must have its body
@@ -1675,10 +1732,27 @@ static bool body_has_live_use(LLVMValueRef fn, const unsigned char *live,
     for (LLVMUseRef u = LLVMGetFirstUse(fn); u; u = LLVMGetNextUse(u)) {
         LLVMValueRef user = LLVMGetUser(u);
         /* A constant expression/aggregate may sit between the function and
-         * the instruction/global that ultimately consumes its address. Do not
-         * infer deadness from that intermediate node. */
+         * the instruction/global that ultimately consumes its address.
+         * For vtables (__zan_vtable_*), only treat the edge as live if the class
+         * has an active constructor or the vtable global itself is referenced
+         * by live code. For other globals/constants, keep conservative root. */
         if (LLVMIsAConstantExpr(user) || LLVMIsAConstantArray(user) ||
-            LLVMIsAConstantStruct(user)) return true;
+            LLVMIsAConstantStruct(user)) {
+            LLVMValueRef gv = find_owning_global(user, 0);
+            if (gv && LLVMIsAGlobalVariable(gv)) {
+                const char *gname = LLVMGetValueName(gv);
+                if (gname && strncmp(gname, "__zan_vtable_", 13) == 0) {
+                    const char *cname = gname + 13;
+                    if (class_ctor_is_live(ix, cname, live) ||
+                        vtable_has_live_use(gv, live, ix, 0)) {
+                        return true;
+                    }
+                    /* VTable for an uninstantiated class does not keep this method alive. */
+                    continue;
+                }
+            }
+            return true;
+        }
         LLVMValueRef parent = LLVMIsAInstruction(user)
             ? LLVMGetBasicBlockParent(LLVMGetInstructionParent(user)) : NULL;
         if (!parent) return true;
@@ -2742,7 +2816,7 @@ done:
      * call instruction names their implementation. Register these edges now,
      * before asking which stdlib bodies can safely be omitted. */
     if (prune_stdlib_bodies) emit_vtables(g);
-    work_fn_index_t work_ix = { NULL, 0 };
+    work_fn_index_t work_ix = { 0 };
     work_fn_index_build(&work_ix, work, work_count);
     int pending;
     do {
@@ -2751,13 +2825,32 @@ done:
             if (live[w]) continue;
             zan_ast_node_t *member = work[w].member;
             /* A library's public methods are entry points for external
-             * clients. Reflection emits late-bound thunks for whole method
-             * tables: when any live code uses it, retain every method rather
-             * than rely on incomplete pre-finalization table edges. */
+             * clients. Reflection preserves method tables for types that
+             * were explicitly queried via typeof() or registered into metadata. */
+            bool is_refl_root = false;
+            if (g->refl_used && work[w].type_sym) {
+                zan_symbol_t *tsym = work[w].type_sym;
+                if (g->refl_mtabs) {
+                    for (int m = 0; m < g->refl_mtab_count; m++) {
+                        if (g->refl_mtabs[m].sym == tsym) {
+                            is_refl_root = true;
+                            break;
+                        }
+                    }
+                }
+                if (!is_refl_root && g->refl_metas) {
+                    for (int m = 0; m < g->refl_meta_count; m++) {
+                        if (g->refl_metas[m].sym == tsym) {
+                            is_refl_root = true;
+                            break;
+                        }
+                    }
+                }
+            }
             bool root = (g->emit_lib &&
                          ((member->method_decl.modifiers & MOD_PUBLIC) ||
                           member->kind == AST_CONSTRUCTOR_DECL)) ||
-                        g->refl_used;
+                        is_refl_root;
             if (!root)
                 root = body_has_live_use(work[w].fn, live, &work_ix);
             if (root) { live[w] = 1; pending++; }

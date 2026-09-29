@@ -142,6 +142,9 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   件世界拖活（App_ctor 自身就引用 45 个类描述符 + ImageHttp 拖活 TLS）。
   裁剪大头在 stdlib 解耦（ControlFactory 的重臂照 CEF/WebView 的
   Bootstrap 注册模式移出主 switch），不在链接器。
+- **生成前函数体裁剪（A-MEM1）的两大击穿暗桩与解法（2026-09-29）**：
+  1. `g->refl_used` 暴力全局保活：只要项目碰了 `typeof`，全局标志就会把所有符号无条件作为 root 保活。必须收敛为仅当类型的 `sym` 出现在反射元数据表（`g->refl_mtabs` / `g->refl_metas`）时才保活，未被反射的 stdlib 辅助类不应被拉活。
+  2. 虚表常量数组（`__zan_vtable_*`）无脑判定为存活：`emit_vtables` 预先为所有拥有虚方法的类生成了虚表数组，而 `body_has_live_use` 对常量数组无脑 `return true`，导致所有派生类的虚方法及级联依赖全部被钉死。解法：常量聚合向上回溯归属全局变量，仅当该类的实例构造函数已存活或虚表被活指令真正读取/写入时才算活，未实例化的死类虚方法安全裁剪为 `unreachable` 桩。实测 probe_refl 指令数暴降 96.7%（27,455→908），GUI 探针指令数降 30%（236,282→165,294），BasicBlocks 减少 11,360 个，Peak Commit 显著下降。
 - **测量配方**：`zanc --publish -o x.a`（静态库输出路径保留完整对象，链
   接后 obj_tmp 会删）→ `llvm-ar x` → 用 build/ld.exe（PE）或 ld.lld
   （ELF）手动重链，加 `--print-gc-sections`；缺驱动符号时补
