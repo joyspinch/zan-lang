@@ -1185,8 +1185,37 @@
     return t;
   }
 
+  // Axis scale top rounds up to a 1/2/5 decade so the ticks read cleanly; the
+  // exact peak still goes to the header via [data-max].
+  function niceMax(v) {
+    if (v <= 0) { return 1; }
+    var mag = Math.pow(10, Math.floor(Math.log(v) / Math.LN10));
+    var n = v / mag;
+    if (n <= 1) { return mag; }
+    if (n <= 2) { return 2 * mag; }
+    if (n <= 5) { return 5 * mag; }
+    return 10 * mag;
+  }
+
+  // Compact tick number: integers above 100, else at most two decimals with no
+  // trailing zeros (quarter steps of a 1/2/5 decade always terminate there).
+  function fmtAxis(v) {
+    if (v >= 100) { return String(Math.round(v)); }
+    return String(Math.round(v * 100) / 100);
+  }
+
+  // X tick text: day buckets carry their clock time; live samples count
+  // seconds back from now, same wording as the tooltip.
+  function xTickLabel(p) {
+    if (!p) { return ''; }
+    if (p.label) { return p.label; }
+    if (typeof p.t === 'number') { return p.t === 0 ? '现在' : (-p.t) + 's前'; }
+    return '';
+  }
+
   /* A line chart is a polyline over a scaled array; a charting library would be
-   * a lot of bytes for that. */
+   * a lot of bytes for that. Axes: five y ticks on the left, three x ticks
+   * (start / middle / end) along the bottom. */
   function draw(id, series, pts, unit) {
     var root = panelEl();
     var c = root ? root.querySelector('#' + id) : null;
@@ -1196,29 +1225,62 @@
     c.width = w * dpr; c.height = h * dpr;
     var g = c.getContext('2d');
 
-    var max = 1;
+    var peak = 1;
     series.forEach(function (s) {
-      s.values.forEach(function (v) { if (v > max) { max = v; } });
+      s.values.forEach(function (v) { if (v > peak) { peak = v; } });
     });
+    var max = niceMax(peak);
+
+    // The plot sits inside margins that make room for the y labels (left) and
+    // the x labels (bottom); padL follows the widest tick text.
+    var padT = 6, padB = 18, padR = 10;
+    var font = '10px system-ui, sans-serif';
+    g.font = font;
+    var padL = 0;
+    for (var ti = 0; ti <= 4; ti++) {
+      padL = Math.max(padL, g.measureText(fmtAxis(max - (max * ti) / 4)).width);
+    }
+    padL = Math.ceil(padL) + 12;
+    var plotW = w - padL - padR, plotH = h - padT - padB;
+    function px(i, n) { return padL + (n < 2 ? plotW / 2 : (plotW * i) / (n - 1)); }
+    function py(v) { return padT + plotH - (plotH * v) / max; }
 
     // Redraws the whole chart; `hover` >= 0 overlays a guide line and a dot on
     // each series at that sample, so the tooltip has a visible anchor.
     function render(hover) {
       g.setTransform(dpr, 0, 0, dpr, 0, 0);
       g.clearRect(0, 0, w, h);
-      g.strokeStyle = '#eef0f3';
+      g.font = font;
       g.lineWidth = 1;
-      for (var i = 1; i < 4; i++) {
-        var gy = Math.round(h * i / 4) + .5;
-        g.beginPath(); g.moveTo(0, gy); g.lineTo(w, gy); g.stroke();
+      g.fillStyle = '#98a1b2';
+      for (var i = 0; i <= 4; i++) {
+        var gy = Math.round(padT + (plotH * i) / 4) + .5;
+        g.strokeStyle = i === 4 ? '#d9dee6' : '#eef0f3';
+        g.beginPath(); g.moveTo(padL, gy); g.lineTo(w - padR, gy); g.stroke();
+        g.textAlign = 'right';
+        g.fillText(fmtAxis(max - (max * i) / 4), padL - 5, gy + 3.5);
+      }
+      g.strokeStyle = '#d9dee6';
+      g.beginPath();
+      g.moveTo(padL + .5, padT);
+      g.lineTo(padL + .5, padT + plotH);
+      g.stroke();
+      var n0 = pts ? pts.length : 0;
+      if (n0 >= 2) {
+        g.fillStyle = '#98a1b2';
+        var ends = [0, Math.round((n0 - 1) / 2), n0 - 1];
+        for (var k = 0; k < ends.length; k++) {
+          g.textAlign = k === 0 ? 'left' : (k === 2 ? 'right' : 'center');
+          g.fillText(xTickLabel(pts[ends[k]]), px(ends[k], n0), h - 5);
+        }
       }
       series.forEach(function (s) {
         var n = s.values.length;
         if (n < 2) { return; }
         g.beginPath();
         for (var i = 0; i < n; i++) {
-          var x = w * i / (n - 1);
-          var y = h - (h - 4) * (s.values[i] / max);
+          var x = px(i, n);
+          var y = py(s.values[i]);
           if (i === 0) { g.moveTo(x, y); } else { g.lineTo(x, y); }
         }
         g.strokeStyle = s.color;
@@ -1227,12 +1289,12 @@
       });
       var nn = series[0] ? series[0].values.length : 0;
       if (hover >= 0 && nn >= 2) {
-        var hx = w * hover / (nn - 1);
+        var hx = px(hover, nn);
         g.strokeStyle = '#94a3b8';
         g.lineWidth = 1;
-        g.beginPath(); g.moveTo(hx + .5, 0); g.lineTo(hx + .5, h); g.stroke();
+        g.beginPath(); g.moveTo(hx + .5, padT); g.lineTo(hx + .5, padT + plotH); g.stroke();
         series.forEach(function (s) {
-          var y = h - (h - 4) * (s.values[hover] / max);
+          var y = py(s.values[hover]);
           g.fillStyle = s.color;
           g.beginPath(); g.arc(hx, y, 3, 0, Math.PI * 2); g.fill();
         });
@@ -1251,7 +1313,9 @@
         if (!sv || !sv[0] || sv[0].values.length < 2) { return; }
         var rect = c.getBoundingClientRect();
         var n = sv[0].values.length;
-        var idx = Math.round((ev.clientX - rect.left) / rect.width * (n - 1));
+        // The x scale spans the plot, not the whole canvas: the left margin
+        // carries the y labels.
+        var idx = Math.round(((ev.clientX - rect.left) - padL) / plotW * (n - 1));
         if (idx < 0) { idx = 0; }
         if (idx > n - 1) { idx = n - 1; }
         c._render(idx);
@@ -1288,7 +1352,7 @@
     }
 
     var label = root.querySelector('[data-max="' + id + '"]');
-    if (label) { label.textContent = '峰值 ' + max; }
+    if (label) { label.textContent = '峰值 ' + peak; }
   }
 
 
