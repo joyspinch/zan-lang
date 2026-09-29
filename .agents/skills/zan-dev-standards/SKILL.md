@@ -158,7 +158,11 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   在途编辑 stdlib/编译器期间跑测试，产物混进 WIP 源，无关测试假挂假绿
   （2026-09-25 GUI 拖拽 ctest 挂死 vs 手动快速 FAIL 二相性， targeted
   `git stash push -- <自己的文件>` 复跑一次即证明与己无关，TASKS A368）。
-  同产物"ctest 挂死、手动跑通"先手动复跑再怀疑代码。
+  同产物"ctest 挂死、手动跑通"先手动复跑再怀疑代码。编译器本身被并发
+  改动搞崩时（zanc 段错误/未改源也 Access violation），不碰 build/ 与
+  对方文件：`git worktree add _scratch/<名> HEAD` 后用主缓存同款编译参数
+  （clang/ninja/LLVM_DIR 见 build/CMakeCache.txt）自建干净 zanc 验证
+  自己的改动（2026-09-29 表格修复验证即此法，用完 `git worktree remove`）。
 - **PowerShell 合成点击四连坑（PrintWindow 抓窗 + mouse_event 注入流）**：
   ① 进程必须先 `SetProcessDpiAwarenessContext(-4)`——DPI 不感知时
   `GetWindowRect`/`SetCursorPos` 全在虚拟化坐标系，注入点整体漂 1.5 倍；

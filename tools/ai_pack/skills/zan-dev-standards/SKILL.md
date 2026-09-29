@@ -155,7 +155,11 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   在途编辑 stdlib/编译器期间跑测试，产物混进 WIP 源，无关测试假挂假绿
   （2026-09-25 GUI 拖拽 ctest 挂死 vs 手动快速 FAIL 二相性， targeted
   `git stash push -- <自己的文件>` 复跑一次即证明与己无关）。
-  同产物"ctest 挂死、手动跑通"先手动复跑再怀疑代码。
+  同产物"ctest 挂死、手动跑通"先手动复跑再怀疑代码。编译器本身被并发
+  改动搞崩时（zanc 段错误/未改源也报错崩），不碰 build/ 与对方文件：
+  `git worktree add _scratch/<名> HEAD` 后用主构建同款编译参数自建干净
+  编译器验证自己的改动，用完 `git worktree remove`（2026-09-29 表格
+  修复验证即此法）。
 - **PowerShell 合成点击四连坑（PrintWindow 抓窗 + mouse_event 注入流）**：
   ① 进程必须先 `SetProcessDpiAwarenessContext(-4)`——DPI 不感知时
   `GetWindowRect`/`SetCursorPos` 全在虚拟化坐标系，注入点整体漂 1.5 倍；
