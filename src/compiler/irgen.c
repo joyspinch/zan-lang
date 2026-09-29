@@ -3333,6 +3333,56 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     g->static_field_count = g->static_field_cap = 0;
     g->cur_mtps = NULL;
     g->cur_mbind = NULL;
+    zan_irgen_shard_buf_free(g);
+}
+
+void zan_irgen_shard_buf_append(zan_irgen_t *g, LLVMValueRef fn, const char *txt) {
+    if (!g || !txt || !txt[0]) return;
+    if (g->streaming_shard_count == 0 || g->streaming_shard_cur_fns >= 250) {
+        if (g->streaming_shard_count >= g->streaming_shard_cap) {
+            int ncap = g->streaming_shard_cap ? g->streaming_shard_cap * 2 : 16;
+            g->streaming_shards = (struct zan_shard_buf *)realloc(
+                g->streaming_shards, (size_t)ncap * sizeof(*g->streaming_shards));
+            for (int i = g->streaming_shard_cap; i < ncap; i++)
+                memset(&g->streaming_shards[i], 0, sizeof(g->streaming_shards[i]));
+            g->streaming_shard_cap = ncap;
+        }
+        g->streaming_shard_count++;
+        g->streaming_shard_cur_fns = 0;
+    }
+    struct zan_shard_buf *sb = &g->streaming_shards[g->streaming_shard_count - 1];
+    size_t tlen = strlen(txt);
+    if (sb->len + tlen + 2 > sb->cap) {
+        size_t ncap = sb->cap ? sb->cap * 2 : 65536;
+        while (ncap < sb->len + tlen + 2) ncap *= 2;
+        sb->text = (char *)realloc(sb->text, ncap);
+        sb->cap = ncap;
+    }
+    memcpy(sb->text + sb->len, txt, tlen);
+    sb->len += tlen;
+    sb->text[sb->len++] = '\n';
+    sb->text[sb->len] = '\0';
+    if (fn) {
+        if (sb->fn_count >= sb->fns_cap) {
+            int ncap = sb->fns_cap ? sb->fns_cap * 2 : 64;
+            sb->fns = (LLVMValueRef *)realloc(sb->fns, (size_t)ncap * sizeof(LLVMValueRef));
+            sb->fns_cap = ncap;
+        }
+        sb->fns[sb->fn_count] = fn;
+    }
+    sb->fn_count++;
+    g->streaming_shard_cur_fns++;
+}
+
+void zan_irgen_shard_buf_free(zan_irgen_t *g) {
+    if (!g || !g->streaming_shards) return;
+    for (int i = 0; i < g->streaming_shard_count; i++) {
+        free(g->streaming_shards[i].text);
+        free(g->streaming_shards[i].fns);
+    }
+    free(g->streaming_shards);
+    g->streaming_shards = NULL;
+    g->streaming_shard_count = g->streaming_shard_cap = g->streaming_shard_cur_fns = 0;
 }
 
 /* ---- type mapping ---- */

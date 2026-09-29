@@ -845,6 +845,199 @@ static bool sh_unique_fn_name(zan_irgen_t *g, const char *base, const char *sfx,
     return false;
 }
 
+/* ---- streaming shard harvesting & instant eviction ---- */
+static void sh_harvest_symbols_from_text(sh_state_t *st, const char *text,
+                                        sh_map_t *decl_fns, sh_map_t *decl_globs,
+                                        sh_map_t *local_fns) {
+    for (const char *p = text; *p; p++) {
+        if (*p != '@') continue;
+        bool quoted = false;
+        const char *s = p + 1;
+        if (*s == '"') {
+            quoted = true;
+            s++;
+        } else if (!sh_ident_char(*s) || (*s >= '0' && *s <= '9')) {
+            continue;
+        }
+        char name[512];
+        size_t n = 0;
+        if (quoted) {
+            while (*s && *s != '"' && n < sizeof(name) - 1) name[n++] = *s++;
+            if (*s == '"') s++;
+        } else {
+            while (sh_ident_char(*s) && n < sizeof(name) - 1) name[n++] = *s++;
+        }
+        name[n] = '\0';
+        LLVMValueRef fn = LLVMGetNamedFunction(st->g->mod, name);
+        if (fn) {
+            if (sh_map_get(local_fns, fn) < 0 && sh_map_get(decl_fns, fn) < 0) {
+                sh_map_put(decl_fns, fn, 1);
+            }
+            continue;
+        }
+        LLVMValueRef gv = LLVMGetNamedGlobal(st->g->mod, name);
+        if (gv) {
+            if (sh_map_get(decl_globs, gv) < 0) {
+                sh_map_put(decl_globs, gv, 1);
+            }
+            continue;
+        }
+    }
+}
+
+static int sh_run_streaming_shards(zan_irgen_t *g, const char *obj_base, char ***out_objs) {
+    int nshard = g->streaming_shard_count;
+    char **objs = (char **)calloc((size_t)nshard, sizeof(*objs));
+    if (!objs) return -1;
+
+    sh_state_t st;
+    memset(&st, 0, sizeof(st));
+    st.g = g;
+    LLVMTargetMachineRef tm = sh_make_tm(&st);
+    if (!tm) {
+        free(objs);
+        return -1;
+    }
+
+    fprintf(stderr, "streaming-shard: emitting %d shard objects on the fly\n", nshard);
+
+    for (int s = 0; s < nshard; s++) {
+        struct zan_shard_buf *sb = &g->streaming_shards[s];
+        if (!sb->text || sb->len == 0) continue;
+
+        sh_sbuf_t gdecls = {0}, types = {0}, frag = {0};
+        sh_map_t decl_fns, decl_globs, local_fns;
+        sh_map_init(&decl_fns); sh_map_init(&decl_globs); sh_map_init(&local_fns);
+        sh_map_init(&st.type_done);
+
+        for (int k = 0; k < sb->fn_count; k++) {
+            if (sb->fns && sb->fns[k]) {
+                sh_map_put(&local_fns, sb->fns[k], 1);
+            }
+        }
+        sh_harvest_symbols_from_text(&st, sb->text, &decl_fns, &decl_globs, &local_fns);
+
+        /* export and emit global declarations */
+        for (int i = 0; i <= decl_globs.mask; i++) {
+            if (decl_globs.vals[i] > 0) {
+                LLVMValueRef gv = decl_globs.keys[i];
+                if (!LLVMIsDeclaration(gv)) {
+                    LLVMSetLinkage(gv, LLVMExternalLinkage);
+                }
+                sh_emit_global_decl(&st, &gdecls, gv);
+            }
+        }
+
+        /* export and emit function declarations */
+        for (int i = 0; i <= decl_fns.mask; i++) {
+            if (decl_fns.vals[i] > 0) {
+                LLVMValueRef fn = decl_fns.keys[i];
+                if (!LLVMIsDeclaration(fn)) {
+                    LLVMSetLinkage(fn, LLVMExternalLinkage);
+                }
+                sh_emit_fn_decl(&gdecls, fn);
+            }
+        }
+
+        /* harvest struct types from bodies and declarations */
+        sh_harvest_types(&st, &types, sb->text);
+        sh_harvest_types(&st, &types, gdecls.p ? gdecls.p : "");
+
+        /* assemble final fragment */
+        sh_sb_puts(&frag, types.p ? types.p : "");
+        sh_sb_puts(&frag, gdecls.p ? gdecls.p : "");
+        sh_sb_puts(&frag, sb->text);
+
+        char path[1200];
+        snprintf(path, sizeof(path), "%s.shard%d.o", obj_base, s);
+        char errbuf[256];
+        bool ok = sh_emit_one(&st, &frag, tm, path, errbuf, sizeof(errbuf));
+
+        sh_map_free(&local_fns);
+        sh_map_free(&decl_fns);
+        sh_map_free(&decl_globs);
+        sh_map_free(&st.type_done);
+        st.type_done.keys = NULL; st.type_done.vals = NULL;
+        free(gdecls.p); free(types.p); free(frag.p);
+
+        /* Instant eviction of text buffer: free immediately to drop memory */
+        free(sb->text);
+        sb->text = NULL;
+        sb->len = sb->cap = 0;
+
+        if (!ok) {
+            fprintf(stderr, "streaming-shard %d failed: %s\n", s, errbuf);
+            for (int k = 0; k <= s; k++) {
+                if (objs[k]) { remove(objs[k]); free(objs[k]); }
+            }
+            free(objs);
+            return -1;
+        }
+
+        objs[s] = (char *)malloc(strlen(path) + 1);
+        if (objs[s]) strcpy(objs[s], path);
+    }
+
+    *out_objs = objs;
+    return nshard;
+}
+
+static int g_harvest_calls = 0;
+static int g_harvest_decl = 0;
+static int g_harvest_no_bb = 0;
+static int g_harvest_comdat = 0;
+static int g_harvest_success = 0;
+
+void zan_irgen_shard_harvest_stats(void) {
+    fprintf(stderr, "\n=== HARVEST STATS: calls=%d, decl=%d, no_bb=%d, comdat=%d, success=%d ===\n\n",
+            g_harvest_calls, g_harvest_decl, g_harvest_no_bb, g_harvest_comdat, g_harvest_success);
+}
+
+bool zan_irgen_shard_harvest_fn(zan_irgen_t *g, LLVMValueRef fn) {
+    g_harvest_calls++;
+    if (!g || !fn || LLVMIsDeclaration(fn)) { g_harvest_decl++; return false; }
+    LLVMBasicBlockRef first_bb = LLVMGetFirstBasicBlock(fn);
+    if (!first_bb) { g_harvest_no_bb++; return false; }
+
+    LLVMSetLinkage(fn, LLVMExternalLinkage);
+    char *fntxt = LLVMPrintValueToString(fn);
+    if (!fntxt) return false;
+
+    /* If the function header carries comdat or alias, keep it in coordinator */
+    const char *hnl = strchr(fntxt, '\n');
+    size_t hlen = hnl ? (size_t)(hnl - fntxt) : strlen(fntxt);
+    if (hlen < 4096) {
+        char hbuf[4096];
+        memcpy(hbuf, fntxt, hlen);
+        hbuf[hlen] = '\0';
+        if (strstr(hbuf, " comdat($")) {
+            g_harvest_comdat++;
+            LLVMDisposeMessage(fntxt);
+            return false;
+        }
+    }
+
+    zan_irgen_shard_buf_append(g, fn, fntxt);
+    LLVMDisposeMessage(fntxt);
+
+    /* Instant Eviction: delete all basic blocks from coordinator module */
+    LLVMBasicBlockRef bb = first_bb;
+    while (bb) {
+        LLVMBasicBlockRef next_bb = LLVMGetNextBasicBlock(bb);
+        LLVMDeleteBasicBlock(bb);
+        bb = next_bb;
+    }
+    LLVMSetLinkage(fn, LLVMExternalLinkage);
+    if (LLVMGetFirstBasicBlock(fn) != NULL) {
+        static int warn_cnt = 0;
+        if (warn_cnt++ < 5) {
+            fprintf(stderr, "HARVEST BUG: fn '%s' still has first_bb after delete!\n", LLVMGetValueName(fn));
+        }
+    }
+    g_harvest_success++;
+    return true;
+}
+
 /* ---- entry ---------------------------------------------------------------- */
 /*
  * Returns the number of shard objects written (>= 0, may be 0 = clean
@@ -887,6 +1080,9 @@ static void sh_trace_scan_const(LLVMValueRef owner, LLVMValueRef v, int depth) {
 int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                         const char *obj_base, char ***out_objs) {
     *out_objs = NULL;
+    if (g && g->streaming_shard_count > 0) {
+        return sh_run_streaming_shards(g, obj_base, out_objs);
+    }
     if (!m || m->fn_count == 0) return 0;
 
     long long max_fn = 400, max_insn = 80000;
@@ -1367,6 +1563,25 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                 objs[s] = (char *)malloc(strlen(path) + 1);
                 if (objs[s]) strcpy(objs[s], path);
                 else sh_fail(&st, "out of memory");
+                /* Instant eviction: this shard's machine code is now safely on disk.
+                 * Clear all basic blocks of its functions in the coordinator module
+                 * immediately, converting them to external declarations and reclaiming
+                 * LLVM instruction objects per shard. */
+                for (int c = 0; c < ncomp; c++) {
+                    if (shard_of_comp[c] != s) continue;
+                    for (int j = 0; j < comps[c].n; j++) {
+                        LLVMValueRef fn = mem[comps[c].idx[j]].fn;
+                        if (!LLVMIsDeclaration(fn)) {
+                            LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
+                            while (bb) {
+                                LLVMBasicBlockRef next_bb = LLVMGetNextBasicBlock(bb);
+                                LLVMDeleteBasicBlock(bb);
+                                bb = next_bb;
+                            }
+                            LLVMSetLinkage(fn, LLVMExternalLinkage);
+                        }
+                    }
+                }
             } else {
                 sh_fail(&st, "shard %d: %s", s, errbuf);
                 remove(path);

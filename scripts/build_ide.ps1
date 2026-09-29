@@ -193,6 +193,7 @@ if ($code -ne 0) {
     Write-Output "IDE_LINK_FAILED code=$code"
     exit 1
 }
+if ($env:ZAN_IDE_SHOW_OUT) { $out | ForEach-Object { Write-Output $_ } }
 
 # The stylesheet is baked into the exe (embed_gen above) and read from memory;
 # a copy beside the executable would only shadow it, so drop any stale one --

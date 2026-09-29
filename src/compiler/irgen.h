@@ -793,7 +793,28 @@ struct zan_irgen {
     unsigned body_write_memo_cap;   /* power of two, or 0 = not built */
     unsigned body_write_memo_count;
     zan_ast_node_t *body_write_scan_done; /* body the full scan last covered */
+
+    /* Streaming sharding state: harvest function bodies to shard text buffers
+     * as soon as they emit, immediately clearing their LLVM BasicBlocks to keep
+     * coordinator module peak memory bounded under 300~500 MB. */
+    bool enable_streaming_shard;
+    int  streaming_shard_count;
+    int  streaming_shard_cap;
+    struct zan_shard_buf {
+        char         *text;
+        size_t        len;
+        size_t        cap;
+        int           fn_count;
+        LLVMValueRef *fns;
+        int           fns_cap;
+    } *streaming_shards;
+    int streaming_shard_cur_fns;
 };
+
+void zan_irgen_shard_buf_append(zan_irgen_t *g, LLVMValueRef fn, const char *txt);
+void zan_irgen_shard_buf_free(zan_irgen_t *g);
+bool zan_irgen_shard_harvest_fn(zan_irgen_t *g, LLVMValueRef fn);
+void zan_irgen_shard_harvest_stats(void);
 
 /* Zan compiles a whole program (every reachable stdlib and user file) into one
  * LLVM module and links an executable, so nothing outside the module can call a

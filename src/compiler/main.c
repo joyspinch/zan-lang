@@ -4052,6 +4052,7 @@ int main(int argc, char **argv) {
      * a corrupted value; a binary that prefers fail-fast opts in here). */
     bool strict_runtime = false;
     bool publish_mode = false;
+    int obfuscate_strings_opt = -1;
     bool debug_info = false; /* -g / --debug: emit DWARF for source debugging */
     bool fast_alloc = false;
     const char *stdlib_path = NULL;
@@ -4136,6 +4137,10 @@ int main(int argc, char **argv) {
             do_deny_warnings = true;
         } else if (strcmp(argv[i], "--publish") == 0) {
             publish_mode = true;
+        } else if (strcmp(argv[i], "--obfuscate-strings") == 0) {
+            obfuscate_strings_opt = 1;
+        } else if (strcmp(argv[i], "--no-obfuscate-strings") == 0) {
+            obfuscate_strings_opt = 0;
         } else if (strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--debug") == 0) {
             debug_info = true;
         } else if (strcmp(argv[i], "--fast-alloc") == 0) {
@@ -5051,13 +5056,33 @@ int main(int argc, char **argv) {
      * zig -- until they are rebuilt, keep the self-contained merged-text
      * form (same A78-4 knife-1 sizes, no missing-symbol risk). */
     irgen.rt_guard_split = !cross_compiling;
-    /* Publish builds scramble string literals in the image (un-scrambled by a
-     * .ctors constructor at startup) so a `strings` pass over the exe reveals
-     * no embedded keys/URLs/SQL/prompts. */
-    irgen.obfuscate_strings = publish_mode;
+    /* Obfuscate string literals: opt-in via --obfuscate-strings or ZAN_OBF=1.
+     * Default OFF because in-place startup deobfuscation marks every string page dirty,
+     * causing massive private commit memory bloat (e.g. +220MB on large apps). */
+    const char *obf_env = getenv("ZAN_OBF");
+    const char *no_obf_env = getenv("ZAN_NO_OBF");
+    if (obfuscate_strings_opt >= 0) {
+        irgen.obfuscate_strings = (obfuscate_strings_opt == 1);
+    } else if (obf_env && obf_env[0] == '1') {
+        irgen.obfuscate_strings = true;
+    } else if (no_obf_env && no_obf_env[0] == '1') {
+        irgen.obfuscate_strings = false;
+    } else {
+        irgen.obfuscate_strings = false;
+    }
     irgen.fast_codegen = false;
     irgen.emit_lib = emit_lib;
     irgen.emit_shared = lib_shared;
+
+    const char *shard_env = getenv("ZAN_SHARD");
+    const char *no_shard_env = getenv("ZAN_NO_SHARD");
+    bool native_arch = (target.arch == ZAN_ARCH_X86_64 ||
+                        target.arch == ZAN_ARCH_AARCH64);
+    bool shard_opt_out = (shard_env && shard_env[0] == '0') ||
+                         (no_shard_env && no_shard_env[0] == '1');
+    bool want_shard = native_arch && !shard_opt_out &&
+                      (shard_env && shard_env[0] == '1');
+    irgen.enable_streaming_shard = want_shard;
 
     if (zan_irgen_emit(&irgen, ast) != ZAN_OK) {
         fprintf(stderr, "error: code generation failed\n");
@@ -5113,18 +5138,12 @@ int main(int argc, char **argv) {
      * bodies into separate objects; the snapshot then stays alive until the
      * shard pass below has run. */
     const char *mf_json_path = getenv("ZAN_CODEGEN_MANIFEST_JSON");
-    const char *shard_env = getenv("ZAN_SHARD");
-    const char *no_shard_env = getenv("ZAN_NO_SHARD");
-    bool native_arch = (target.arch == ZAN_ARCH_X86_64 ||
-                        target.arch == ZAN_ARCH_AARCH64);
-    bool shard_opt_out = (shard_env && shard_env[0] == '0') ||
-                         (no_shard_env && no_shard_env[0] == '1');
-    bool want_shard = native_arch && !shard_opt_out &&
-                      ((shard_env && shard_env[0] == '1') || publish_mode);
     zan_cg_manifest_t mf;
     bool mf_built = false;
     if (getenv("ZAN_CODEGEN_MANIFEST") || mf_json_path || want_shard) {
-        zan_opt_strip_unused(&irgen);
+        if (!irgen.enable_streaming_shard) {
+            zan_opt_strip_unused(&irgen);
+        }
         phase("manifest");
         bool mf_native = target.arch == ZAN_ARCH_X86_64 ||
                          target.arch == ZAN_ARCH_AARCH64;
@@ -5138,36 +5157,39 @@ int main(int argc, char **argv) {
                     mf_json_path);
     }
 
-    /* The AST, binder and source excerpts are no longer needed by LLVM passes.
-     * Keep the few DllImport names read by linker preflight and late pruning in
-     * the code-generation arena before releasing the entire frontend graph. */
-    for (int i = 0; i < irgen.extern_lib_count; i++) {
-        zan_istr_t *lib = &irgen.extern_libs[i];
-        lib->str = zan_arena_strdup(ir_arena, lib->str, lib->len);
+    /* Release frontend AST, binder and source excerpts now that manifest is built.
+     * LLVM sharding, optimization and emission passes only need irgen.mod;
+     * keeping the frontend graph during these heavy phases wastes 200MB+ memory. */
+    if (arena) {
+        for (int i = 0; i < irgen.extern_lib_count; i++) {
+            zan_istr_t *lib = &irgen.extern_libs[i];
+            lib->str = zan_arena_strdup(ir_arena, lib->str, lib->len);
+        }
+        for (int i = 0; i < irgen.extern_fn_count; i++) {
+            zan_istr_t *lib = &irgen.extern_fns[i].lib;
+            zan_istr_t *name = &irgen.extern_fns[i].name;
+            lib->str = zan_arena_strdup(ir_arena, lib->str, lib->len);
+            name->str = zan_arena_strdup(ir_arena, name->str, name->len);
+        }
+        zan_diag_t *ir_diag = (zan_diag_t *)zan_arena_alloc(ir_arena, sizeof(*ir_diag));
+        *ir_diag = *diag;
+        ir_diag->file_sources = NULL;
+        const char **ir_file_names = (const char **)malloc(
+            (size_t)ir_diag->file_count * sizeof(*ir_file_names));
+        for (int i = 0; i < ir_diag->file_count; i++)
+            ir_file_names[i] = zan_arena_strdup(ir_arena,
+                ir_diag->file_names[i], strlen(ir_diag->file_names[i]));
+        ir_diag->file_names = ir_file_names;
+        ir_diag->entries = NULL;
+        ir_diag->entry_count = ir_diag->entry_cap = 0;
+        irgen.diag = ir_diag;
+        zan_diag_free_buffers(diag);
+        zan_arena_free(arena);
+        arena = NULL;
+        g_main_arena = ir_arena;
+        irgen.binder = NULL;
     }
-    for (int i = 0; i < irgen.extern_fn_count; i++) {
-        zan_istr_t *lib = &irgen.extern_fns[i].lib;
-        zan_istr_t *name = &irgen.extern_fns[i].name;
-        lib->str = zan_arena_strdup(ir_arena, lib->str, lib->len);
-        name->str = zan_arena_strdup(ir_arena, name->str, name->len);
-    }
-    zan_diag_t *ir_diag = (zan_diag_t *)zan_arena_alloc(ir_arena, sizeof(*ir_diag));
-    *ir_diag = *diag;
-    ir_diag->file_sources = NULL;
-    const char **ir_file_names = (const char **)malloc(
-        (size_t)ir_diag->file_count * sizeof(*ir_file_names));
-    for (int i = 0; i < ir_diag->file_count; i++)
-        ir_file_names[i] = zan_arena_strdup(ir_arena,
-            ir_diag->file_names[i], strlen(ir_diag->file_names[i]));
-    ir_diag->file_names = ir_file_names;
-    ir_diag->entries = NULL;
-    ir_diag->entry_count = ir_diag->entry_cap = 0;
-    irgen.diag = ir_diag;
-    zan_diag_free_buffers(diag);
-    zan_arena_free(arena);
-    arena = NULL;
-    g_main_arena = ir_arena;
-    irgen.binder = NULL;
+    if (source) { free(source); source = NULL; }
 
     /* ---- optimize ---- */
     zan_opt_level_t effective_opt = ZAN_OPT_NONE;

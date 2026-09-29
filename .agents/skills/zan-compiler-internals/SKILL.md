@@ -286,7 +286,14 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   因 stdlib 变更缓存失效而打印，曾被误读成"删了反而多拉 14 个文件"）；
   程序自己的图以下一行 `Published N files` / exe 尺寸为准。② 日志带
   CRLF——从日志抽文件列表再 `grep`/`[ -f ]` 探测时必须先
-  `tr -d '\r'`，否则路径带 \r 全部 MISS，得出"图内没人引用它"的假阴性
+  `tr -d '\r'`，否则路径带 \r 全部 MISS，得出"图内没人引用它"的假阴性。
+
+## 发布产物命名与字符串混淆内存陷阱（2026-09-29）
+
+- **Windows Image File Execution Options 劫持通用名 `app.exe`**：
+  在 Windows 注册表 `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\app.exe` 下若被开启了 `GlobalFlag = 0x02000000` (Page Heap / 页面堆) 并注入 `verifier.dll`，任何名为 `app.exe` 的二进制在启动时都会被 Windows 内核强制挂钩，每个微小堆分配独占 4KB 物理内存保护页，导致进程启动内存暴增至 270MB+ 并可能引发莫名崩溃（`0x80000003` 断点）。ZanIDE 发布与构建绝不可无脑使用目录名 `Path.GetFileName(root)` 作为 `app.exe`，必须优先取 `zan.proj` 中的 `name` 属性（如 `OnePlus.exe`），彻底避开系统对通用名字的调试注入。
+- **发布构建默认字符串混淆导致 220MB+ 内存页脏化（Dirty Pages）**：
+  字符串混淆将只读常量从只读段（`.rdata`，支持 OS 内存映射与按需 Page-in，不计入私有提交 Commit）变为可写数据段（`.data`），并在 `main` 执行前的全局构造函数 `__zan.deobf` 中对数万个字符串执行原地解密写入。这会导致全量页面被 Dirty 写入，直接被操作系统强制分配数百 MB 的物理私有提交内存。混淆功能必须默认关闭（Opt-in），通过 `--obfuscate-strings` 或 `ZAN_OBF=1` 按需显式启用。
   （本次差点据此推翻真实触发链）。
 - **改 Worker/HttpFramer 这类"唯一宿主"的收尾清单**：grep 全仓库旧 API
   调用点逐个补（`CreateTls`→`HttpFramerTls.Create`、`onSseSubscriber`→
