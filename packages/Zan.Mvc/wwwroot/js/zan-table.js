@@ -56,19 +56,32 @@
 
   /* 单元格值的排序类型：纯数字（含 %、千分位、单位后缀）按数值，
      日期样（2026-09-15、2026-09-15 10:20:30）按字符串（同格式字典序
-     即时间序），其余按 localeCompare。 */
+     即时间序），其余按 localeCompare。µ 同时收微符号(U+00B5)与希腊
+     小写 mu(U+03BC) 两个码位，防字体/来源差异漏判。 */
+  var MU = '[µμ]';
   function kindOf(text) {
     var t = text.trim();
     if (t === '') { return 'empty'; }
-    if (/^-?[\d,]+(\.\d+)?\s*(%|ms|us|µs|s|KB|MB|GB)?$/.test(t)) { return 'num'; }
+    if (new RegExp('^-?[\\d,]+(\\.\\d+)?\\s*(%|ms|us|' + MU + 's|s|KB|MB|GB)?$').test(t)) { return 'num'; }
     if (/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/.test(t)) { return 'date'; }
     return 'text';
   }
 
+  /* 数值排序按单位归一（时长到 ms、容量到字节），否则 721 µs 会被
+     当成 721 ms 压过 275.00 ms。裸数与 % 原值参与比较。 */
   function sortValue(cell, kind) {
     var t = cell.textContent.trim();
-    if (kind === 'num') { return parseFloat(t.replace(/[,\s]/g, '')) || 0; }
-    return t;
+    if (kind !== 'num') { return t; }
+    var m = new RegExp('^(-?[\\d,]+(?:\\.\\d+)?)\\s*(%|ms|us|' + MU + 's|s|KB|MB|GB)?$').exec(t);
+    if (!m) { return parseFloat(t.replace(/[,\s]/g, '')) || 0; }
+    var v = parseFloat(m[1].replace(/,/g, ''));
+    var u = m[2] || '';
+    if (u === 'us' || u === 'µs' || u === 'μs') { return v / 1000; }
+    if (u === 's') { return v * 1000; }
+    if (u === 'KB') { return v * 1024; }
+    if (u === 'MB') { return v * 1048576; }
+    if (u === 'GB') { return v * 1073741824; }
+    return v;
   }
 
   function enhance(table) {
