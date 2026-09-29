@@ -3204,6 +3204,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_events_contract PROPERTIES TIMEOUT 120)
 
+  # Event sender parallel channel (S = Sender): dual-channel raising order,
+  # sender identity, Any()/gate counting, and old-channel compatibility.
+  add_test(NAME conformance_gui_sender_channel
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/sender_channel_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_sender_channel.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_sender_channel${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_sender_channel PROPERTIES TIMEOUT 120)
+
   # GenForm declarative column click events: columns[i].click must desugar
   # into one HitField-filtered CellClick binding; columns without click stay
   # binding-free.

@@ -1,0 +1,106 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// 事件 sender 平行通道契约（S = Sender，2e296631 落地）：
+/// 新旧双通道互不干扰、可混用，触发顺序先无参后带 sender，
+/// sender 恒为触发事件的控件。锁定的事实：
+/// - UiEvent.RaiseS/RaiseIfS 全通道触发，RemoveS 只摘 sender 通道；
+/// - WidgetEvents.Any() 与各门控数两通道合计（仅 sender 注册也照常
+///   注册命中区域——漏数会让 sender-only 控件收不到点击）；
+/// - Control.OnClickS → BindEventS → WidgetEvents.AddByNameS 路由，
+///   基类未声明的语义事件名安全忽略；按钮的 OnClickS 进按钮自己的
+///   语义 Click（PostS 派发），与 OnClick 同一队列；
+/// - 旧 OnClick/+= 通道行为不变（437 个既有注册点的兼容面）。
+/// 期望输出：ALL PASS。
+class SenderChannelTest {
+    static int oldHits;
+    static int sHits;
+    static Control lastS;
+    static int fails;
+    static int checks;
+
+    static void Check(string name, bool ok) {
+        checks = checks + 1;
+        if (!ok) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    static void Main() {
+        Control a = new Button();
+        Control b = new Button();
+
+        // UiEvent 双通道：RaiseS 先无参后带 sender，RaiseIfS 门控。
+        UiEvent ev = new UiEvent();
+        ev.Add(() => { oldHits = oldHits + 1; });
+        ev.AddS((Control s) => { sHits = sHits + 1; lastS = s; });
+        ev.RaiseS(a);
+        ev.RaiseIfS(false, b);
+        ev.RaiseIfS(true, b);
+        Check("old channel fired 2x", oldHits == 2);
+        Check("sender channel fired 2x", sHits == 2);
+        Check("last sender is b", lastS == b);
+        Check("CountS==1", ev.CountS() == 1);
+        Check("CountAll==2", ev.CountAll() == 2);
+
+        // RemoveS 只摘 sender 通道最近一个相同注册项。
+        UiEvent ev2 = new UiEvent();
+        ControlEvent h = (Control s) => { };
+        ev2.AddS(h);
+        ev2.AddS(h);
+        ev2.RemoveS(h);
+        Check("RemoveS removes one", ev2.CountS() == 1);
+        ev2.RemoveS(h);
+        Check("RemoveS removes again", ev2.CountS() == 0);
+
+        // WidgetEvents：仅 sender 注册也让 Any() 为真（命中区域照常注册）。
+        WidgetEvents w = new WidgetEvents();
+        Check("Any empty", w.Any() == false);
+        Check("unknown name rejected", w.AddByNameS("Nope", (Control s) => { }) == false);
+        Check("AddByNameS Click", w.AddByNameS("Click", (Control s) => { }) == true);
+        Check("Any after sender-only", w.Any() == true);
+        Check("Click CountS==1", w.Click.CountS() == 1);
+
+        // Control 链式 OnClickS -> BindEventS -> AddByNameS 路由
+        //（Panel 无特化重写，走基类通用事件包）。
+        Control c = new Panel();
+        c.OnClickS((Control s) => { sHits = sHits + 100; lastS = s; });
+        Check("OnClickS routed to On.Click", c.On.Click.CountS() == 1);
+        c.OnChangeS((Control s) => { });
+        Check("OnChangeS ignored on base (no Change channel)", c.On.Click.CountS() == 1);
+
+        // 旧通道不受影响：OnClick/+= 继续可用且与 sender 通道共存。
+        c.OnClick(() => { oldHits = oldHits + 100; });
+        c.On.Click.Add(() => { oldHits = oldHits + 1000; });
+        Check("old OnClick registered", c.On.Click.Count() == 2);
+        Check("both channels coexist", c.On.Click.CountAll() == 3);
+
+        // RaiseS 全链路：两通道都触发，sender 正确。
+        c.On.Click.RaiseIfS(true, c);
+        Check("RaiseS old channel", oldHits == 1102);
+        Check("RaiseS sender channel", sHits == 102);
+        Check("RaiseS sender is c", lastS == c);
+
+        // Button 特化：OnClickS/OnClick 都路由进 Button 的语义 Click。
+        Button btn = new Button();
+        btn.OnClickS((Control s) => { sHits = sHits + 1; lastS = s; });
+        Check("Button OnClickS routes to semantic Click", btn.Click.CountS() == 1);
+        btn.OnClick(() => { oldHits = oldHits + 1; });
+        Check("Button OnClick routes to semantic Click", btn.Click.Count() == 1);
+
+        // 生命周期 OnShowS/OnHideS 走 AddS。
+        Control d = new Button();
+        d.OnShowS((Control s) => { });
+        d.OnHideS((Control s) => { });
+        Check("OnShowS", d.Show.CountS() == 1);
+        Check("OnHideS", d.Hide.CountS() == 1);
+
+        if (fails == 0) {
+            Console.WriteLine("ALL PASS");
+        } else {
+            Console.WriteLine("FAILURES " + fails);
+        }
+    }
+}
