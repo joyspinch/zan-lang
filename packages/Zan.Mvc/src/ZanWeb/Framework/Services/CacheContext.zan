@@ -166,10 +166,22 @@ class CacheContext {
         } finally { this.redis.Release(client); }
     }
 
-    /* 验证码写入须一次性带 TTL；Redis 不可达时不发出不可验证的码。*/
+    /* 单个验证码的最大错试次数与计数存活期。6 位码在 10 分钟窗口内
+       有百万空间，比对处不设上限等于把爆破交给运气；错满即作废。
+       计数 key 比码多活 60 秒，且由 SetCodeAsync 在重发时清零——
+       换新码重来的合法用户拿到全新预算，爆破者受发送侧限速约束。 */
+    static int CodeMaxTries = 5;
+    static int CodeTriesTtl = 660;
+
+    /* 验证码写入须一次性带 TTL；Redis 不可达时不发出不可验证的码。
+       重发即重置错试预算（发送侧另有限速，见 VerifyCode）。*/
     async bool SetCodeAsync(string key, string code, int seconds) {
+        string tryKey = key + ":tries";
         if (this.redis == null) {
-            lock (this.store) { this.LocalSetTtl(key, code, seconds); }
+            lock (this.store) {
+                this.LocalSetTtl(key, code, seconds);
+                this.LocalDel(tryKey);
+            }
             return true;
         }
         RedisClient client = await this.redis.AcquireAsync();
@@ -179,28 +191,53 @@ class CacheContext {
             args.Add("SET"); args.Add(key); args.Add(code);
             args.Add("EX"); args.Add(Convert.ToString(seconds));
             RedisReply reply = await client.CommandAsync(args);
-            return reply != null && reply.AsString() == "OK";
+            bool ok = reply != null && reply.AsString() == "OK";
+            if (ok) {
+                List<string> del = new List<string>();
+                del.Add("DEL"); del.Add(tryKey);
+                RedisReply _d = await client.CommandAsync(del);
+            }
+            return ok;
         } finally { this.redis.Release(client); }
     }
 
     /* 比对与删除在 Redis 单个脚本中执行；本地内存同一把锁保护。
-       错误、过期、重复使用以及缓存故障一律拒绝。 */
+       错误、过期、重复使用、超过错试上限以及缓存故障一律拒绝。
+       脚本返回 1=通过，0=错码（计数+1），-1=错满已作废。 */
     async bool ConsumeCodeAsync(string key, string code) {
+        string tryKey = key + ":tries";
         if (this.redis == null) {
             lock (this.store) {
+                int tries = Filter.ToInt(this.LocalGet(tryKey), 0);
+                if (tries >= CacheContext.CodeMaxTries) {
+                    this.LocalDel(key);
+                    return false;
+                }
                 string saved = this.LocalGet(key);
-                if (saved.Length == 0 || saved != code) { return false; }
+                if (saved.Length == 0 || saved != code) {
+                    this.LocalSetTtl(tryKey,
+                        Convert.ToString(tries + 1), CacheContext.CodeTriesTtl);
+                    return false;
+                }
                 this.LocalDel(key);
+                this.LocalDel(tryKey);
                 return true;
             }
         }
         RedisClient client = await this.redis.AcquireAsync();
         if (client == null) { return false; }
         try {
+            string script = "local t = tonumber(redis.call('GET', KEYS[2]) or '0') "
+                + "if t >= tonumber(ARGV[2]) then redis.call('DEL', KEYS[1]) return -1 end "
+                + "if redis.call('GET', KEYS[1]) == ARGV[1] then "
+                + "redis.call('DEL', KEYS[1]) redis.call('DEL', KEYS[2]) return 1 end "
+                + "redis.call('SET', KEYS[2], t + 1, 'EX', ARGV[3]) return 0";
             List<string> args = new List<string>();
             args.Add("EVAL");
-            args.Add("if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end");
-            args.Add("1"); args.Add(key); args.Add(code);
+            args.Add(script);
+            args.Add("2"); args.Add(key); args.Add(tryKey); args.Add(code);
+            args.Add(Convert.ToString(CacheContext.CodeMaxTries));
+            args.Add(Convert.ToString(CacheContext.CodeTriesTtl));
             RedisReply reply = await client.CommandAsync(args);
             return reply != null && !reply.IsError() && reply.AsInt() == 1;
         } finally { this.redis.Release(client); }

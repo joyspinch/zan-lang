@@ -1,10 +1,12 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Web;
 using ZanWeb.Model;
 using ZanWeb.Dao;
+using ZanWeb.Core;
 using ZanWeb.Security;
 
 namespace ZanWeb.Core;
@@ -13,28 +15,122 @@ namespace ZanWeb.Core;
 async delegate bool SeedFn(IDbConnection db);
 
 class Schema {
-    /* 创建/更新全部表并填充种子数据。数据库不可达时返回 false，服务器仍启动。*/
+    /* 迁移互斥租约与等待参数。租约有效期必须远大于一次完整迁移的
+       时长（秒级 schema、百万行级 backfill 也远用不到 15 分钟）；
+       持约进程崩溃后租约到点自动让出，不会死锁后续启动。 */
+    static int LeaseSec = 900;
+    static int WaitMs = 60000;
+
+    /* 创建/更新全部表并填充种子数据。数据库不可达或迁移失败时返回
+       false，服务器仍启动（探活应答、日志记账，Boot 负责重试与告警）。*/
     static async bool Ensure(DbContext ctx) {
         IDbConnection db = await ctx.Acquire();
         if (db == null) { return false; }
         try {
-            /* SQLite 启用 WAL（其他引擎无操作）：多 worker 共享文件时避免写者阻塞读者。*/
-            await DbSchema.UseWriteAheadLogAsync(db);
-            /* 编译期已知所有 [Table] 类，一行调用覆盖全部，新模型无需补行。*/
-            await db.SyncStructureAllAsync();
-            await Schema.BackfillGenFlags(db);
-
-            if (!await Schema.SeedAdmin(db)) { return false; }
-            if (!await Schema.SeedRoles(db)) { return false; }
-            if (!await Schema.SeedDepartments(db)) { return false; }
-            if (!await Schema.SeedDicts(db)) { return false; }
-            if (!await Schema.SeedSettings(db)) { return false; }
-            if (!await Schema.SeedJobs(db)) { return false; }
-            if (!await Schema.RunSeed(db)) { return false; }
-            return true;
+            if (!await Schema.AcquireLease(db)) { return false; }
+            try {
+                /* 必须接住 Apply 的结果：种子失败要如实回报未就绪；
+                   也绝不能用「await 后丢弃」的裸语句形态——协程改写会
+                   丢掉外层返回值（编译器挂账），捕获形态无恙。 */
+                if (!await Schema.Apply(db)) { return false; }
+                return true;
+            } finally {
+                await Schema.ReleaseLease(db);
+            }
+        } catch (Exception ex) {
+            /* 迁移失败不再带栈炸掉启动：一条可定位的诊断，服务器继续
+               起来——数据面在修好前如实失败，比半截 schema 更可运维。 */
+            Log.Error("[db] schema migration failed: " + ex.Message);
+            Console.WriteLine("[db] schema migration failed: " + ex.Message);
+            return false;
         } finally {
             ctx.Release(db);
         }
+    }
+
+    /* Apply 是 Ensure 的租约内主体：WAL → 全量 CodeFirst → 标志回填 →
+       种子。每一步都幂等，等待租约的 worker 轮到后重跑一遍是快速 no-op。*/
+    static async bool Apply(IDbConnection db) {
+        /* SQLite 启用 WAL（其他引擎无操作）：多 worker 共享文件时避免写者阻塞读者。*/
+        await DbSchema.UseWriteAheadLogAsync(db);
+        /* 编译期已知所有 [Table] 类，一行调用覆盖全部，新模型无需补行。*/
+        await db.SyncStructureAllAsync();
+        await Schema.BackfillGenFlags(db);
+
+        if (!await Schema.SeedAdmin(db)) { return false; }
+        if (!await Schema.SeedRoles(db)) { return false; }
+        if (!await Schema.SeedDepartments(db)) { return false; }
+        if (!await Schema.SeedDicts(db)) { return false; }
+        if (!await Schema.SeedSettings(db)) { return false; }
+        if (!await Schema.SeedJobs(db)) { return false; }
+        if (!await Schema.RunSeed(db)) { return false; }
+        return true;
+    }
+
+    /* ---- 迁移互斥租约：每个 worker 进程启动都会跑一遍 Ensure，
+       并发 CodeFirst DDL 与「先查数再插入」的种子没有互斥时会交错
+       （重复 admin、半截表）。sys_lock 用普通 CREATE/INSERT/UPDATE/
+       DELETE 表达租约，不依赖任何引擎专有特性；行带过期时间，竞争
+       者最多等 WaitMs，等到即幂等重跑，等不到如实放弃。 ---- */
+
+    /* 持约者标识：进程内一次性 nonce + pid + 端口，保证跨机器跨重启
+       都不会撞成同一串（撞了会让释放语句误删别人的租约）。 */
+    static string leaseHolder = "";
+
+    static string Holder() {
+        if (Schema.leaseHolder.Length == 0) {
+            Schema.leaseHolder = "w" + Convert.ToString(WebApp.NowSeconds())
+                + "p" + Convert.ToString(ProcessHost.Pid())
+                + "r" + Convert.ToString(Cfg.Server.port);
+        }
+        return Schema.leaseHolder;
+    }
+
+    static async void CreateLockTable(IDbConnection db) {
+        /* 三家方言通用的最小 DDL；值全部由框架自产，无用户输入。 */
+        await db.ExecuteAsync("CREATE TABLE IF NOT EXISTS sys_lock ("
+            + "name varchar(64) NOT NULL, holder varchar(64) NOT NULL, "
+            + "expires int NOT NULL, PRIMARY KEY(name))");
+    }
+
+    static async bool AcquireLease(IDbConnection db) {
+        await Schema.CreateLockTable(db);
+        string holder = Schema.Holder();
+        int waited = 0;
+        while (true) {
+            int now = WebApp.NowSeconds();
+            /* 过期租约先扫掉，再公平竞争。 */
+            int _s = await db.ExecuteAsync(
+                "DELETE FROM sys_lock WHERE expires < "
+                + Convert.ToString(now));
+            try {
+                int _i = await db.ExecuteAsync("INSERT INTO sys_lock"
+                    + "(name, holder, expires) VALUES('schema', '"
+                    + holder + "', " + Convert.ToString(now + Schema.LeaseSec)
+                    + ")");
+                return true;
+            } catch {
+                /* 主键冲突 = 已有持约者（并发启动或租约未过期）。 */
+            }
+            int claimed = await db.ExecuteAsync("UPDATE sys_lock SET holder='"
+                + holder + "', expires=" + Convert.ToString(now + Schema.LeaseSec)
+                + " WHERE name='schema' AND expires < " + Convert.ToString(now));
+            if (claimed > 0) { return true; }
+            if (waited >= Schema.WaitMs) {
+                Log.Error("[db] schema lock busy after "
+                    + Convert.ToString(Schema.WaitMs / 1000)
+                    + "s (another instance is migrating?) -- boot continues without schema");
+                Console.WriteLine("[db] schema lock busy -- see error log");
+                return false;
+            }
+            await Task.Delay(2000);
+            waited = waited + 2000;
+        }
+    }
+
+    static async void ReleaseLease(IDbConnection db) {
+        int _r = await db.ExecuteAsync("DELETE FROM sys_lock WHERE "
+            + "name='schema' AND holder='" + Schema.Holder() + "'");
     }
 
     /* 表设计器的动作/行内编辑标志后补列时，旧行是 NULL（ORM 读作 0）——
