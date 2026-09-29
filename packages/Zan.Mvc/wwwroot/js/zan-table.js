@@ -228,8 +228,10 @@
     bar.appendChild(density);
 
     /* 状态条插到表格元素之前（表格常直接躺在 .card 里，同级即视觉上位）；
-       表格包在滚动容器里时再往外提一级，否则状态条跟着横向滚动滚出视野 */
-    var barHost = table.closest('.table-scroll') || table.parentNode;
+       表格包在滚动容器里时锚滚动容器，否则状态条跟着横向滚动滚出视野。
+       无包裹时必须锚表格本身——锚 parentNode 会把状态条插成卡的兄弟位，
+       卡若躺在 .grid 里就成了多余网格子项，把整页挤成错误自动流 */
+    var barHost = table.closest('.table-scroll') || table;
     barHost.parentNode.insertBefore(bar, barHost);
 
     function setDensity(mode) {
