@@ -1530,17 +1530,26 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             /* C#: the return value is evaluated first, then every enclosing
              * finally runs, then the function returns. Spill the value across
              * them -- a finally body may `await`, which ends this invocation
-             * and leaves the SSA value behind. */
+             * and leaves the SSA value behind. The spill goes to the heap
+             * frame's RETSPILL slot: an entry alloca dies here, because the
+             * entry block re-executes on the next $resume invocation and the
+             * reload would read a fresh, uninitialized stack slot (B-ID19). */
             if (g->finally_count > 0) {
-                LLVMValueRef ri_slot = ri
-                    ? emit_entry_alloca(g, LLVMTypeOf(ri), "ret.fin.slot") : NULL;
-                if (ri_slot) zan_store_fit(g, ri, ri_slot);
+                if (ri) {
+                    LLVMValueRef ri_slot = LLVMBuildStructGEP2(g->builder,
+                        g->current_async_frame_type, g->current_async_frame,
+                        ASYNC_FRAME_RETSPILL, "ret.fin.slot");
+                    zan_store_fit(g, ri, ri_slot);
+                }
                 emit_pending_finallys(g, locals, 0);
                 if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
                     break;   /* a finally left the function itself */
-                if (ri_slot)
-                    ri = LLVMBuildLoad2(g->builder, LLVMTypeOf(ri), ri_slot,
-                                        "ret.fin");
+                if (ri)
+                    ri = LLVMBuildLoad2(g->builder, LLVMTypeOf(ri),
+                        LLVMBuildStructGEP2(g->builder,
+                            g->current_async_frame_type, g->current_async_frame,
+                            ASYNC_FRAME_RETSPILL, "ret.fin"),
+                        "ret.fin");
             }
             emit_release_active_catch_excs(g, 0);
             emit_async_complete(g, locals, ri);

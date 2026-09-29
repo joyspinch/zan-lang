@@ -102,36 +102,47 @@ enum {
                                    * outlive the coroutine (the reaper frees the
                                    * frame), so Task.Cancel first checks the
                                    * handle against this list. */
-    ASYNC_FRAME_HSTACK = 16,      /* [ntries x i32]: ids of the try
+    ASYNC_FRAME_RETSPILL = 16,    /* i64: `return e` inside a try whose finally
+                                   * runs before the return completes. The value
+                                   * is encoded here (the same i64 the result
+                                   * slot will receive) while the finally bodies
+                                   * run: a finally that awaits returns from
+                                   * this $resume invocation, so the value
+                                   * cannot sit in an entry alloca -- the entry
+                                   * block re-executes on the next invocation
+                                   * and would hand the reload a fresh, dead
+                                   * slot. Compiler-private: past the shared
+                                   * 16-field header prefix, like HSTACK. */
+    ASYNC_FRAME_HSTACK = 17,      /* [ntries x i32]: ids of the try
                                    * handlers this frame has armed, innermost
                                    * last -- re-armed at each resume (see
                                    * emit_async_eh_prologue). ntries is this
                                    * body's try count (current_async_handler_cap),
                                    * an exact bound: ids are handed out one per
                                    * lowered try. */
-    ASYNC_FRAME_CEXC = 17,        /* [ntries x i8*]: the exception each
+    ASYNC_FRAME_CEXC = 18,        /* [ntries x i8*]: the exception each
                                    * open catch is currently handling, indexed by
                                    * the try's compile-time handler id. Frame- (not
                                    * stack-) resident because an await inside a
                                    * catch body returns from this $resume
                                    * invocation: its allocas are garbage when the
                                    * catch epilogue resumes and releases. */
-    ASYNC_FRAME_CEXC_OWNED = 18,  /* [ntries x i32]: whether that
+    ASYNC_FRAME_CEXC_OWNED = 19,  /* [ntries x i32]: whether that
                                    * exception carries the in-flight +1 */
-    ASYNC_FRAME_CEXC_TID = 19,    /* [ntries x i8*]: that exception's
+    ASYNC_FRAME_CEXC_TID = 20,    /* [ntries x i8*]: that exception's
                                    * class type descriptor, so a bare `throw;`
                                    * rethrows with the original dynamic type
                                    * even after an await (or a nested throw)
                                    * has overwritten the in-flight global */
-    ASYNC_FRAME_FINEXC = 20,      /* [ZAN_MAX_FINALLY_DEPTH x i8*]: the exception
+    ASYNC_FRAME_FINEXC = 21,      /* [ZAN_MAX_FINALLY_DEPTH x i8*]: the exception
                                    * in flight across a `finally` body, indexed
                                    * by the try's finally-region depth. A finally
                                    * that awaits returns from this $resume, so
                                    * the exception it has to re-raise afterwards
                                    * cannot sit in an alloca. */
-    ASYNC_FRAME_FINEXC_OWNED = 21,/* [ZAN_MAX_FINALLY_DEPTH x i32] */
-    ASYNC_FRAME_FINEXC_TID = 22,  /* [ZAN_MAX_FINALLY_DEPTH x i8*] */
-    ASYNC_FRAME_FIRST_PARAM = 23
+    ASYNC_FRAME_FINEXC_OWNED = 22,/* [ZAN_MAX_FINALLY_DEPTH x i32] */
+    ASYNC_FRAME_FINEXC_TID = 23,  /* [ZAN_MAX_FINALLY_DEPTH x i8*] */
+    ASYNC_FRAME_FIRST_PARAM = 24
 };
 static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v);
 static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,

@@ -1,0 +1,64 @@
+using System;
+
+/* `return e` inside a try whose finally awaits: the return value is spilled to
+ * the heap frame's RETSPILL slot, so it survives the suspension the finally's
+ * await introduces. A stack alloca dies here -- the $resume entry block
+ * re-executes after the suspension and hands the reload a fresh, uninitialized
+ * slot (B-ID19: the bare-await form returned false, the loop form returned
+ * garbage, and adding unrelated locals flipped the "caught" form too). */
+class Program {
+    static async bool Apply(int db) { await Task.Delay(1); return true; }
+    static async void Release(int db) { await Task.Delay(1); }
+    static async bool Lease(int db) { await Task.Delay(1); return true; }
+
+    /* bare `await Apply(1);` discards the result; the inner return must still
+     * reach the outer caller as true */
+    static async bool BareForm() {
+        try {
+            if (!await Lease(1)) { return false; }
+            try {
+                await Apply(1);
+                return true;
+            } finally {
+                await Release(1);
+            }
+        } catch (Exception ex) {
+            Console.WriteLine("caught " + ex.Message);
+            return false;
+        }
+    }
+
+    /* return value computed in a loop body, finally suspends */
+    static async int LoopForm() {
+        for (int i = 1; i < 4; i = i + 1) {
+            try {
+                if (i == 2) { return i * 10; }
+            } finally {
+                await Task.Delay(1);
+            }
+        }
+        return -1;
+    }
+
+    /* break out of a loop inside a try with an awaiting finally: no return
+     * value crosses, the loop exit must still land on the right iteration */
+    static async int BreakForm() {
+        int hit = 0;
+        for (int i = 0; i < 5; i = i + 1) {
+            try {
+                if (i == 2) { break; }
+                hit = i;
+            } finally {
+                await Task.Delay(1);
+            }
+        }
+        return hit;
+    }
+
+    static async void Main() {
+        bool a = await BareForm();
+        Console.WriteLine("bare=" + (a ? "TRUE" : "FALSE"));
+        Console.WriteLine("loop=" + Convert.ToString(await LoopForm()));
+        Console.WriteLine("brk=" + Convert.ToString(await BreakForm()));
+    }
+}

@@ -609,6 +609,7 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         fields[ASYNC_FRAME_AWAITER] = i8ptr;
         fields[ASYNC_FRAME_AWAITER_STEP] = g->co_step_ptr;
         fields[ASYNC_FRAME_RESULT] = i64;
+        fields[ASYNC_FRAME_RETSPILL] = i64;
         fields[ASYNC_FRAME_CLEANUP] = g->co_step_ptr;
         fields[ASYNC_FRAME_HCOUNT] = i32;
         fields[ASYNC_FRAME_SELF_STEP] = g->co_step_ptr;

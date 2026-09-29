@@ -2597,9 +2597,9 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         i8ptr, /* CHILD: sub-frame currently awaited */
         i8ptr  /* LNEXT: live detached-frame list link */
     };
-    /* Stops before ASYNC_FRAME_HSTACK: the per-handler arrays are sized per
-     * function (one slot per try in that body), so they are not part of the
-     * shared prefix. Only the fields above are reached through this type. */
+    /* Stops before ASYNC_FRAME_RETSPILL: the return spill and the per-handler
+     * arrays beyond it are sized/used per function, so they are not part of
+     * the shared prefix. Only the fields above are reached through this type. */
     g->co_header_type = LLVMStructCreateNamed(g->ctx, "zan.co.header");
     LLVMStructSetBody(g->co_header_type, co_hdr_fields, 16, 0);
     g->current_async_frame = NULL;
