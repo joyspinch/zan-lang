@@ -63,27 +63,21 @@ class FwdChannel {
     }
 
     /// <summary>写出整段 `data`；成功返回写出的字节数，
-    /// 对端提前关闭时返回已写出的部分长度。</summary>
+    /// 对端提前关闭时返回已写出的部分长度。消除 Substring 分配并确保二进制安全。</summary>
     async int SendAllAsync(string data) {
+        if (data == null || this.closed) { return 0; }
         int total = data.Length;
         if (total == 0) { return 0; }
-        if (this.closed) { return 0; }
-        int sent = 0;
         HttpDeadlineToken watch = HttpDeadline.Arm(this.sock, this.idleMs);
         try {
-            while (sent < total) {
-                string rest = data.Substring(sent, total - sent);
-                int n;
-                if (this.tls != null) {
-                    n = await this.tls.SendAsync(rest, rest.Length);
-                } else {
-                    n = await Socket.SendAsync(this.sock, rest, rest.Length);
-                }
-                if (HttpDeadline.Expired(watch) || n <= 0) { return sent; }
-                sent = sent + n;
-                HttpDeadline.Touch(watch, this.idleMs);
+            int n;
+            if (this.tls != null) {
+                n = await this.tls.SendAsync(data, total);
+            } else {
+                n = await Socket.SendAsync(this.sock, data, total);
             }
-            return sent;
+            if (HttpDeadline.Expired(watch) || n <= 0) { return 0; }
+            return n;
         } finally {
             HttpDeadline.Disarm(watch);
         }

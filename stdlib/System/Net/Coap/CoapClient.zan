@@ -197,18 +197,25 @@ class CoapClient {
             o = o + 1;
             int delta = (b >> 4) & 15;
             int len = b & 15;
-            if (delta == 13) { o = o + 1; }
-            else if (delta == 14) { o = o + 2; }
+            if (delta == 15 || len == 15) { return null; }
+            if (delta == 13) {
+                if (o >= n) { return null; }
+                o = o + 1;
+            } else if (delta == 14) {
+                if (o + 1 >= n) { return null; }
+                o = o + 2;
+            }
             if (len == 13) {
-                if (o < n) { len = 13 + (d[o] & 255); }
+                if (o >= n) { return null; }
+                len = 13 + (d[o] & 255);
                 o = o + 1;
             } else if (len == 14) {
-                if (o + 1 < n) {
-                    len = 269 + ((d[o] & 255) << 8) + (d[o + 1] & 255);
-                }
+                if (o + 1 >= n) { return null; }
+                len = 269 + ((d[o] & 255) << 8) + (d[o + 1] & 255);
                 o = o + 2;
             }
             o = o + len;
+            if (o > n) { return null; }
         }
         string payload = "";
         if (o < n && (d[o] & 255) == 255 && o + 1 < n) {
@@ -224,7 +231,13 @@ class CoapClient {
         UdpClient udp = new UdpClient();
         int msgId = this.nextMsgId & 65535;
         this.nextMsgId = this.nextMsgId + 1;
-        int tok = (msgId * 31 + 7) & 65535;
+        byte[] rtokBytes = RandomNumberGenerator.GetBytes(2);
+        int tok = 0;
+        if (rtokBytes != null) {
+            tok = ((rtokBytes[0] & 255) << 8) | (rtokBytes[1] & 255);
+        } else {
+            tok = (msgId * 31 + 7) & 65535;
+        }
         List<int> lenBox = new List<int>();
         byte[] pkt = BuildRequest(code, path, payload, msgId, tok, lenBox);
         int pktLen = lenBox[0];
@@ -233,13 +246,13 @@ class CoapClient {
         int attempt = 0;
         int window = this.ackTimeoutMs;
         CoapResponse result = null;
+        byte[] rb = new byte[2048];
         while (result == null && attempt <= this.maxRetransmit) {
             int _s = await udp.SendBytesToAsync(wire, pktLen, this.host, this.port);
             long start = Stopwatch.GetMilliseconds();
             while (result == null
                    && Stopwatch.GetMilliseconds() - start < window) {
                 if (Socket.IsReadable(udp.GetSocket())) {
-                    byte[] rb = new byte[2048];
                     int rn = udp.RecvBytesFrom(rb, 2048);
                     result = CoapClient.ParseResponse(rb, rn, msgId, tok);
                 } else {

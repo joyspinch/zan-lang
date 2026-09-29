@@ -38,6 +38,13 @@ class SipMessage {
         return m;
     }
 
+    public bool GetIsRequest() { return this.isRequest; }
+    public string GetMethod() { return this.method; }
+    public string GetUri() { return this.uri; }
+    public int GetStatus() { return this.status; }
+    public string GetReason() { return this.reason; }
+    public string GetBody() { return this.body; }
+
     /// <summary>添加头部（追加；SIP 允许重复，如 Via）。</summary>
     SipMessage Add(string name, string headerValue) {
         this.headerNames.Add(name);
@@ -97,6 +104,18 @@ class SipMessage {
         return sb.ToString();
     }
 
+    /// <summary>安全解析十进制非负整数，非法字符或空串返回 -1。</summary>
+    static int ParsePositiveInt(string s) {
+        if (s == null || s.Length == 0) { return -1; }
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { return -1; }
+            v = v * 10 + (c - 48);
+        }
+        return v;
+    }
+
     /// <summary>解析线上消息；起始行不是 SIP 时返回 null。</summary>
     static SipMessage Parse(string data) {
         int lineEnd = SipMessage.FindCrlf(data, 0);
@@ -108,10 +127,11 @@ class SipMessage {
             // "SIP/2.0 200 OK"
             string rest = start.Substring(8, start.Length - 8);
             int sp = rest.IndexOf(" ");
-            if (sp < 0) {
-                m.status = Convert.ToInt32(rest);
-            } else {
-                m.status = Convert.ToInt32(rest.Substring(0, sp));
+            string codeStr = sp < 0 ? rest : rest.Substring(0, sp);
+            int code = SipMessage.ParsePositiveInt(codeStr);
+            if (code <= 0) { return null; }
+            m.status = code;
+            if (sp >= 0) {
                 m.reason = rest.Substring(sp + 1, rest.Length - sp - 1);
             }
         } else {
@@ -132,7 +152,19 @@ class SipMessage {
             int e = SipMessage.FindCrlf(data, pos);
             if (e < 0) { break; }
             if (e == pos) {                       // 空行：正文紧随其后
-                m.body = data.Substring(pos + 2, data.Length - pos - 2);
+                int bodyStart = pos + 2;
+                int remaining = data.Length - bodyStart;
+                string clStr = m.Header("Content-Length");
+                if (clStr.Length == 0) {
+                    clStr = m.Header("l");
+                }
+                int cl = SipMessage.ParsePositiveInt(clStr);
+                if (cl >= 0) {
+                    int bodyLen = cl < remaining ? cl : remaining;
+                    m.body = data.Substring(bodyStart, bodyLen);
+                } else {
+                    m.body = data.Substring(bodyStart, remaining);
+                }
                 break;
             }
             string line = data.Substring(pos, e - pos);

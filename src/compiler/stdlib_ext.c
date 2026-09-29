@@ -622,16 +622,35 @@ static zan_json_value_t *parse_json_value(const char **p, const char *end,
         if (depth >= ZAN_JSON_MAX_DEPTH) { free(val); return NULL; }
         val->type = ZAN_JSON_OBJECT;
         val->object_val.cap = 8;
+        val->object_val.count = 0;
         val->object_val.keys = (char **)malloc(sizeof(char *) * 8);
         val->object_val.values = (zan_json_value_t **)malloc(sizeof(zan_json_value_t *) * 8);
         (*p)++;
         skip_json_ws(p, end);
+        if (*p < end && **p == '}') {
+            (*p)++;
+            return val;
+        }
         while (*p < end && **p != '}') {
             skip_json_ws(p, end);
             char *key = parse_json_string(p, end, NULL);
+            if (!key) {
+                zan_json_free(val);
+                return NULL;
+            }
             skip_json_ws(p, end);
-            if (*p < end && **p == ':') (*p)++;
+            if (*p >= end || **p != ':') {
+                free(key);
+                zan_json_free(val);
+                return NULL;
+            }
+            (*p)++;
             zan_json_value_t *v = parse_json_value(p, end, depth + 1);
+            if (!v) {
+                free(key);
+                zan_json_free(val);
+                return NULL;
+            }
             if (val->object_val.count >= val->object_val.cap) {
                 val->object_val.cap *= 2;
                 val->object_val.keys = (char **)realloc(val->object_val.keys, sizeof(char *) * (size_t)val->object_val.cap);
@@ -641,27 +660,60 @@ static zan_json_value_t *parse_json_value(const char **p, const char *end,
             val->object_val.values[val->object_val.count] = v;
             val->object_val.count++;
             skip_json_ws(p, end);
-            if (*p < end && **p == ',') (*p)++;
+            if (*p < end && **p == ',') {
+                (*p)++;
+            } else if (*p < end && **p == '}') {
+                break;
+            } else {
+                zan_json_free(val);
+                return NULL;
+            }
         }
-        if (*p < end) (*p)++;
+        if (*p < end && **p == '}') {
+            (*p)++;
+        } else {
+            zan_json_free(val);
+            return NULL;
+        }
     } else if (**p == '[') {
         if (depth >= ZAN_JSON_MAX_DEPTH) { free(val); return NULL; }
         val->type = ZAN_JSON_ARRAY;
         val->array_val.cap = 8;
+        val->array_val.count = 0;
         val->array_val.items = (zan_json_value_t **)malloc(sizeof(zan_json_value_t *) * 8);
         (*p)++;
         skip_json_ws(p, end);
+        if (*p < end && **p == ']') {
+            (*p)++;
+            return val;
+        }
         while (*p < end && **p != ']') {
             zan_json_value_t *item = parse_json_value(p, end, depth + 1);
+            if (!item) {
+                zan_json_free(val);
+                return NULL;
+            }
             if (val->array_val.count >= val->array_val.cap) {
                 val->array_val.cap *= 2;
                 val->array_val.items = (zan_json_value_t **)realloc(val->array_val.items, sizeof(zan_json_value_t *) * (size_t)val->array_val.cap);
             }
             val->array_val.items[val->array_val.count++] = item;
             skip_json_ws(p, end);
-            if (*p < end && **p == ',') (*p)++;
+            if (*p < end && **p == ',') {
+                (*p)++;
+            } else if (*p < end && **p == ']') {
+                break;
+            } else {
+                zan_json_free(val);
+                return NULL;
+            }
         }
-        if (*p < end) (*p)++;
+        if (*p < end && **p == ']') {
+            (*p)++;
+        } else {
+            zan_json_free(val);
+            return NULL;
+        }
     } else if (strncmp(*p, "true", 4) == 0) {
         val->type = ZAN_JSON_BOOL; val->bool_val = true; *p += 4;
     } else if (strncmp(*p, "false", 5) == 0) {

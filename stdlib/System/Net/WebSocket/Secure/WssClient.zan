@@ -5,6 +5,7 @@ using System.Net.Http;
 using System.Net.WebSocket;
 using System.Security.Cryptography;
 using System.Runtime.Intrinsics;
+using System.Threading;
 
 namespace System.Net.WebSocket.Secure;
 
@@ -22,6 +23,11 @@ class WssClient {
     WsReader reader;
     WsAssembler asm;
     bool connected;
+    bool sendBusy;
+    List<AsyncGate> sendWaiters;
+    int lastOpcode;
+    int lastLen;
+    byte[] lastBinary;
 
     /// 内部构造：未连接；经 ConnectAsync 使用。
     WssClient() {
@@ -30,6 +36,11 @@ class WssClient {
         this.reader = null;
         this.asm = new WsAssembler(16777216);
         this.connected = false;
+        this.sendBusy = false;
+        this.sendWaiters = new List<AsyncGate>();
+        this.lastOpcode = 0;
+        this.lastLen = 0;
+        this.lastBinary = null;
     }
 
     /// 发起 wss://host:port/path 握手：TCP 连接 → TLS 握手（带 SNI
@@ -122,6 +133,12 @@ class WssClient {
     /// 发送空 Ping 帧（对端的 Pong 由 RecvText 静默消费）。
     async void Ping() { await this.SendFrame(WsOpcode.Ping, "", 0); }
 
+    /// 上一次成功接收并交付的消息操作码（WsOpcode.Text 或 WsOpcode.Binary）。
+    int LastOpcode() { return this.lastOpcode; }
+
+    /// 上一次成功接收并交付的消息精确字节数。
+    int LastLength() { return this.lastLen; }
+
     /// 挂起直到下一个文本/二进制消息（分片消息重组到 fin 后整条
     /// 交付；Ping 以 Pong 应答后继续；Close、协议错误（-2/-3）或
     /// 断开返回 ""）。
@@ -157,9 +174,51 @@ class WssClient {
             if (feed < 0) { this.CloseNow(); return ""; }
             if (feed == 0) { continue; }
             if (!this.asm.ValidComplete()) { this.CloseNow(); return ""; }
+            this.lastOpcode = this.asm.MessageOpcode();
+            this.lastLen = this.asm.MessageLen();
+            this.lastBinary = null;
             return this.asm.Complete();
         }
         return "";
+    }
+
+    /// <summary>挂起直到下一个文本/二进制消息。返回未截断的原生 byte[]，
+    /// 彻底消除二进制消息中 NUL 字符被字符串截断的隐患；Close 或断开返回 null。</summary>
+    async byte[] RecvBinary() {
+        while (this.connected) {
+            int total = this.reader.FrameSize();
+            while (total < 0) {
+                if (total == -2 || total == -3) { this.CloseNow(); return null; }
+                int n = await this.reader.FillMore();
+                if (n == 0) { this.CloseNow(); return null; }
+                total = this.reader.FrameSize();
+            }
+            WsFrame frame = this.reader.TakeFrame(total);
+            if (!WsFrame.ValidInbound(frame, false)) {
+                this.CloseNow();
+                return null;
+            }
+            if (frame.opcode == WsOpcode.Close) {
+                await this.SendFrame(WsOpcode.Close, "", 0);
+                this.CloseNow();
+                return null;
+            }
+            if (frame.opcode == WsOpcode.Ping) {
+                await this.SendFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
+                continue;
+            }
+            if (frame.opcode == WsOpcode.Pong) { continue; }
+            int feed = this.asm.Feed(frame);
+            if (feed < 0) { this.CloseNow(); return null; }
+            if (feed == 0) { continue; }
+            if (!this.asm.ValidComplete()) { this.CloseNow(); return null; }
+            this.lastOpcode = this.asm.MessageOpcode();
+            this.lastLen = this.asm.MessageLen();
+            byte[] bytes = this.asm.CompleteBytes();
+            this.lastBinary = bytes;
+            return bytes;
+        }
+        return null;
     }
 
     /// 协礼关闭：先发空关闭帧（未连接时跳过），随后无条件断开并
@@ -171,90 +230,114 @@ class WssClient {
         this.CloseNow();
     }
 
+    async void AcquireSend() {
+        while (this.sendBusy) {
+            AsyncGate g = new AsyncGate();
+            this.sendWaiters.Add(g);
+            await g.Wait();
+            g.Close();
+        }
+        this.sendBusy = true;
+    }
+
+    void ReleaseSend() {
+        this.sendBusy = false;
+        if (this.sendWaiters.Count > 0) {
+            AsyncGate g = this.sendWaiters[0];
+            this.sendWaiters.RemoveAt(0);
+            g.Signal();
+        }
+    }
+
     /// 客户端发送入口：RFC 6455 要求客户端帧必须掩码（每帧 CSPRNG
-    /// 掩码键）+ 正确的扩展长度编码。发送失败（<= 0）就地断开。
+    /// 掩码键）+ 正确的扩展长度编码。并发发送受锁保护，保证原子串行。发送失败（<= 0）就地断开。
     async void SendFrame(int opcode, string payload, int payloadLen) {
         if (!this.connected || payload == null || payloadLen < 0
             || payloadLen > 16777216
             || opcode < 0 || opcode > WsOpcode.Pong
             || (opcode >= 8 && payloadLen > 125)) { return; }
-        int ext = 0;
-        if (payloadLen > 65535) { ext = 8; }
-        else if (payloadLen > 125) { ext = 2; }
-        int headerLen = 2 + ext + 4;
-        byte[] frame = new byte[headerLen + payloadLen + 1];
-        frame[0] = (byte)(128 | opcode);
-        int pos = 2;
-        if (ext == 0) {
-            frame[1] = (byte)(128 | payloadLen);
-        } else if (ext == 2) {
-            frame[1] = (byte)(128 | 126);
-            frame[2] = (byte)((payloadLen >> 8) & 255);
-            frame[3] = (byte)(payloadLen & 255);
-            pos = 4;
-        } else {
-            frame[1] = (byte)(128 | 127);
-            frame[2] = 0; frame[3] = 0; frame[4] = 0; frame[5] = 0;
-            frame[6] = (byte)((payloadLen >> 24) & 255);
-            frame[7] = (byte)((payloadLen >> 16) & 255);
-            frame[8] = (byte)((payloadLen >> 8) & 255);
-            frame[9] = (byte)(payloadLen & 255);
-            pos = 10;
-        }
-        byte[] mask = RandomNumberGenerator.GetBytes(4);
-        if (mask == null) { mask = new byte[] { 0, 0, 0, 0 }; }
-        for (int m = 0; m < 4; m = m + 1) { frame[pos + m] = mask[m]; }
-        pos = pos + 4;
-
-        if (payloadLen > 0) {
-            NativeMemory.PutString((nint)frame, pos, payload, payloadLen);
-
-            long m0 = (long)(mask[0] & 255);
-            long m1 = (long)(mask[1] & 255);
-            long m2 = (long)(mask[2] & 255);
-            long m3 = (long)(mask[3] & 255);
-            long k32 = m0 | (m1 << 8) | (m2 << 16) | (m3 << 24);
-            long k64 = k32 | (k32 << 32);
-
-            Vector256 mask256 = Vector256.Create(k64, k64, k64, k64);
-            Vector128 mask128 = Vector128.Create(k64, k64);
-
-            int iEnc = 0;
-            while (iEnc + 32 <= payloadLen) {
-                Vector256 v = Vector256.Load(frame, pos + iEnc);
-                v = Vector256.Xor(v, mask256);
-                Vector256.Store(frame, pos + iEnc, v);
-                iEnc = iEnc + 32;
+        await this.AcquireSend();
+        try {
+            int ext = 0;
+            if (payloadLen > 65535) { ext = 8; }
+            else if (payloadLen > 125) { ext = 2; }
+            int headerLen = 2 + ext + 4;
+            byte[] frame = new byte[headerLen + payloadLen + 1];
+            frame[0] = (byte)(128 | opcode);
+            int pos = 2;
+            if (ext == 0) {
+                frame[1] = (byte)(128 | payloadLen);
+            } else if (ext == 2) {
+                frame[1] = (byte)(128 | 126);
+                frame[2] = (byte)((payloadLen >> 8) & 255);
+                frame[3] = (byte)(payloadLen & 255);
+                pos = 4;
+            } else {
+                frame[1] = (byte)(128 | 127);
+                frame[2] = 0; frame[3] = 0; frame[4] = 0; frame[5] = 0;
+                frame[6] = (byte)((payloadLen >> 24) & 255);
+                frame[7] = (byte)((payloadLen >> 16) & 255);
+                frame[8] = (byte)((payloadLen >> 8) & 255);
+                frame[9] = (byte)(payloadLen & 255);
+                pos = 10;
             }
-            while (iEnc + 16 <= payloadLen) {
-                Vector128 v128 = Vector128.Load(frame, pos + iEnc);
-                v128 = Vector128.Xor(v128, mask128);
-                Vector128.Store(frame, pos + iEnc, v128);
-                iEnc = iEnc + 16;
-            }
-            int limitEnc = payloadLen - 3;
-            int sm0 = (int)m0; int sm1 = (int)m1; int sm2 = (int)m2; int sm3 = (int)m3;
-            while (iEnc < limitEnc) {
-                frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm0);
-                frame[pos + iEnc + 1] = (byte)((frame[pos + iEnc + 1] & 255) ^ sm1);
-                frame[pos + iEnc + 2] = (byte)((frame[pos + iEnc + 2] & 255) ^ sm2);
-                frame[pos + iEnc + 3] = (byte)((frame[pos + iEnc + 3] & 255) ^ sm3);
-                iEnc = iEnc + 4;
-            }
-            if (iEnc < payloadLen) {
-                frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm0);
-                iEnc = iEnc + 1;
+            byte[] mask = RandomNumberGenerator.GetBytes(4);
+            if (mask == null) { mask = new byte[] { 0, 0, 0, 0 }; }
+            for (int m = 0; m < 4; m = m + 1) { frame[pos + m] = mask[m]; }
+            pos = pos + 4;
+
+            if (payloadLen > 0) {
+                NativeMemory.PutString((nint)frame, pos, payload, payloadLen);
+
+                long m0 = (long)(mask[0] & 255);
+                long m1 = (long)(mask[1] & 255);
+                long m2 = (long)(mask[2] & 255);
+                long m3 = (long)(mask[3] & 255);
+                long k32 = m0 | (m1 << 8) | (m2 << 16) | (m3 << 24);
+                long k64 = k32 | (k32 << 32);
+
+                Vector256 mask256 = Vector256.Create(k64, k64, k64, k64);
+                Vector128 mask128 = Vector128.Create(k64, k64);
+
+                int iEnc = 0;
+                while (iEnc + 32 <= payloadLen) {
+                    Vector256 v = Vector256.Load(frame, pos + iEnc);
+                    v = Vector256.Xor(v, mask256);
+                    Vector256.Store(frame, pos + iEnc, v);
+                    iEnc = iEnc + 32;
+                }
+                while (iEnc + 16 <= payloadLen) {
+                    Vector128 v128 = Vector128.Load(frame, pos + iEnc);
+                    v128 = Vector128.Xor(v128, mask128);
+                    Vector128.Store(frame, pos + iEnc, v128);
+                    iEnc = iEnc + 16;
+                }
+                int limitEnc = payloadLen - 3;
+                int sm0 = (int)m0; int sm1 = (int)m1; int sm2 = (int)m2; int sm3 = (int)m3;
+                while (iEnc < limitEnc) {
+                    frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm0);
+                    frame[pos + iEnc + 1] = (byte)((frame[pos + iEnc + 1] & 255) ^ sm1);
+                    frame[pos + iEnc + 2] = (byte)((frame[pos + iEnc + 2] & 255) ^ sm2);
+                    frame[pos + iEnc + 3] = (byte)((frame[pos + iEnc + 3] & 255) ^ sm3);
+                    iEnc = iEnc + 4;
+                }
                 if (iEnc < payloadLen) {
-                    frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm1);
+                    frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm0);
                     iEnc = iEnc + 1;
                     if (iEnc < payloadLen) {
-                        frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm2);
+                        frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm1);
+                        iEnc = iEnc + 1;
+                        if (iEnc < payloadLen) {
+                            frame[pos + iEnc] = (byte)((frame[pos + iEnc] & 255) ^ sm2);
+                        }
                     }
                 }
             }
+            int sent = await this.stream.SendAsync(frame, headerLen + payloadLen);
+            if (sent <= 0) { this.CloseNow(); }
+        } finally {
+            this.ReleaseSend();
         }
-        int sent = await this.stream.SendAsync(frame, headerLen + payloadLen);
-        if (sent <= 0) { this.CloseNow(); }
     }
 
     /// 立即断开并释放全部句柄（TLS 流、连接、上下文、reader）。

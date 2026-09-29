@@ -1755,22 +1755,29 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
 强制重建——看到 "zan: compiling code generators" 才是真重建。
 
 
-## ORM 表访问器是编译期生成的（GenDb），新 [Table] 模型零接线
+## 通讯协议层加固与大数据量处理定式（TLS/MQTT/Modbus/WS/HTTP/CoAP/SIP/WebDAV）
 
-**坑**：server-collab 控制器里 `this.OaMessage.Where(...)` 在整个模板源码
-里找不到任何属性声明——差点按"漏了接线"去翻 DbContext/AdminController。
-实际是 stdlib `System/Compiler/GenDb.zan` 在编译期重写：`obj.<Entity>`
-（<Entity> 匹配 [Table] 类名）整体替换为 `__DbBind.Q_<T>(obj.__Conn())`
-等绑定树（指令 db_acc_head / db_acc_root）；`db.Select<T>()/Insert<T>/
-Update<T>()/Delete<T>()/SyncStructure<T>()` 根调用同样重写（db_root）。
-任何带 `__Conn()` 的类（模板 AppController 的请求租约）自动获得全部实体
-访问器。
+**坑一（二进制缓冲遇 NUL 误截断/越界）**：
+- `TlsStream.RecvIntoAsync` 等接收 API 严禁使用 `buf.Length`（C 风格 `strlen`）来做容量校验，接收二进制时首字节或任意字节为 `0x00` 会让 `buf.Length` 骤降为 0，误触发越界拦截中断链路。
+- 接收复用缓冲必须以调用方显式声明的接收上限（`max`）与非空检查定界。
 
-**定式**：加新模型 = 新建 [Table] 类文件即可，控制器 `this.<Entity>`、
-裸连接 `db.Select<T>()`、`SyncStructureAllAsync()` 加列全部自动生效，
-无需任何注册/清单；存量库加列后旧行 NULL 读作 0（哨兵语义，见
-tenantId 回填先例）。另：`Insert(x).ExecuteIdentityAsync()` 的返回值才
-是自增 id，且**不回写** `x.id`。
+**坑二（WebSocket 帧交错 Send Interleaving）**：
+- `SendBytesAsync` 是异步挂起 IO（等待 `WriteReady`）。
+- 若无并发发送门控，当后台协程发送心跳 `Ping()` 或其他消息时，若与业务协程并发写入，两个 WebSocket 帧的字节流会交错混杂在同一个 TCP 连接上，导致对端报 RFC 6455 1002 Protocol Error 瞬间断链。
+- 客户端（`WebSocketClient` / `WssClient`）必须引入异步排队互斥锁（`AsyncGate` 队列表），文本、二进制、Ping、Pong、Close 全路径统一进门控。
+
+**坑三（Modbus 工控死循环与事务错配）**：
+- `Socket.Recv` 返回负数（链路重置/网络中断）时若只判 `n == 0`，配合 `ReadReady` 会导致 100% CPU 忙死循环。
+- `TransactAsync` 必须强校验应答 MBAP 头的 Transaction ID 是否与请求发出的 `tid` 相符，并校验包体长度合法性，否则网络抖动或重连时会误收上一个请求的应答导致工业传感器/控制命令数据串号。
+
+**坑四（大流转发与 MQTT 协议内存雪崩）**：
+- 转发代理（如 `HttpForwarder`）处理部分发送时，绝不可在循环内对剩余数据调用 `Substring`，否则数兆大请求在慢速对端下会产生数万次堆内存分配与垃圾回收雪崩。
+- MQTT 吞吐量瓶颈：`MqttReader` 缓冲区滑动、扩容与包体切分必须使用 SIMD 加速的 `NativeMemory.Copy` 原生内存移动，彻底废除逐字节解释循环。
+
+**坑五（HTTP 非标准端口 Host 头丢失与 SIP/CoAP 解析漏洞）**：
+- `HttpClient` 当端口非 80/443 时，`Host` 请求头必须输出 `host:port`，否则代理服务器虚拟主机分发失败。
+- `SipMessage` 遇到空行时必须按 `Content-Length`（或 `l` 头）精确定界正文，防止粘包或流水线后续报文被误污染吞并，且状态码必须防御非纯数字输入。
+- `CoapClient` Token 必须使用 `RandomNumberGenerator` 系统级 CSPRNG，禁止使用易被推算的线性算式，Option 解析严格拒绝 RFC 7252 保留值（15）与越界畸形报文。
 
 
 ## File 读族 alt-base 回退 exe 目录 vs Directory 清理 CWD 相对：测试缓存目录必须用绝对路径

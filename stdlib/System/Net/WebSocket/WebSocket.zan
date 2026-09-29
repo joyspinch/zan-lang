@@ -6,6 +6,7 @@ using System.Text;
 using System.Security.Cryptography;
 using System.Collections.Generic;
 using System.Runtime.Intrinsics;
+using System.Threading;
 
 namespace System.Net.WebSocket;
 
@@ -369,6 +370,14 @@ class WsFrame {
         f.masked = (byte1 & 128) != 0;
 
         int payloadLen = byte1 & 127;
+        if (f.opcode >= 8) {
+            // RFC 6455 §5.5: 所有控制帧（Close/Ping/Pong）载荷不得超过 125 字节，
+            // 且绝对禁止分片（FIN 必须为 1）。
+            if (!f.fin || payloadLen > 125) {
+                f.opcode = WsOpcode.Close;
+                return f;
+            }
+        }
         int offset = offset0 + 2;
 
         if (payloadLen == 126) {
@@ -378,14 +387,19 @@ class WsFrame {
         } else if (payloadLen == 127) {
             if (offset0 + 10 > dataEnd) { f.opcode = WsOpcode.Close; return f; }
             if ((data[offset0 + 2] & 255) != 0 || (data[offset0 + 3] & 255) != 0
-                || (data[offset0 + 4] & 255) != 0 || (data[offset0 + 5] & 255) != 0) {
-                // 64 位长度的有效位超出 32 位：按 RFC 视为协议错误。
+                || (data[offset0 + 4] & 255) != 0 || (data[offset0 + 5] & 255) != 0
+                || (data[offset0 + 6] & 128) != 0) {
+                // 64 位长度的高 32 位及最高位（MSB）必须为 0：按 RFC 6455 §5.2 视为协议错误。
                 f.opcode = WsOpcode.Close;
                 return f;
             }
             payloadLen = ((data[offset0 + 6] & 255) << 24) +
                          ((data[offset0 + 7] & 255) << 16) +
                          ((data[offset0 + 8] & 255) << 8) + (data[offset0 + 9] & 255);
+            if (payloadLen < 0) {
+                f.opcode = WsOpcode.Close;
+                return f;
+            }
             offset = offset0 + 10;
         }
 
@@ -715,9 +729,16 @@ class WsReader {
         int s = this.start;
         int avail = this.len - s;
         if (avail < 2) { return -1; }
+        int b0 = this.buf[s] & 255;
+        int opcode = b0 & 15;
+        bool fin = (b0 & 128) != 0;
         int b1 = this.buf[s + 1] & 255;
         bool masked = (b1 & 128) != 0;
         int payloadLen = b1 & 127;
+        if (opcode >= 8) {
+            // RFC 6455 §5.5: 控制帧禁止分片且载荷 <= 125
+            if (!fin || payloadLen > 125) { return -2; }
+        }
         int offset = 2;
         if (payloadLen == 126) {
             if (avail < 4) { return -1; }
@@ -726,12 +747,14 @@ class WsReader {
         } else if (payloadLen == 127) {
             if (avail < 10) { return -1; }
             if ((this.buf[s + 2] & 255) != 0 || (this.buf[s + 3] & 255) != 0
-                || (this.buf[s + 4] & 255) != 0 || (this.buf[s + 5] & 255) != 0) {
+                || (this.buf[s + 4] & 255) != 0 || (this.buf[s + 5] & 255) != 0
+                || (this.buf[s + 6] & 128) != 0) {
                 return -2;
             }
             payloadLen = ((this.buf[s + 6] & 255) << 24) +
                          ((this.buf[s + 7] & 255) << 16) +
                          ((this.buf[s + 8] & 255) << 8) + (this.buf[s + 9] & 255);
+            if (payloadLen < 0) { return -2; }
             offset = 10;
         }
         int maskLen = 0;
@@ -942,6 +965,18 @@ class WsAssembler {
         return m;
     }
 
+    /// <summary>取出重组完成的消息原始字节并复位状态。</summary>
+    byte[] CompleteBytes() {
+        int dl = this.dataLen;
+        byte[] b = new byte[dl + 1];
+        if (dl > 0) {
+            NativeMemory.Copy((nint)b, (nint)this.dataBuf, dl);
+        }
+        this.opcode = 0 - 1;
+        this.dataLen = 0;
+        return b;
+    }
+
     /// <summary>重组完成消息的 opcode（Text 或 Binary）。</summary>
     int MessageOpcode() { return this.opcode; }
 
@@ -964,6 +999,11 @@ class WebSocketClient {
     // 全部错位；且无缓冲上限，对端可慢慢撑爆内存。
     WsReader reader;
     WsAssembler asm;
+    bool sendBusy;
+    List<AsyncGate> sendWaiters;
+    int lastOpcode;
+    int lastLen;
+    byte[] lastBinary;
 
     /// 内部构造：未连接；经 ConnectAsync 使用。
     WebSocketClient() {
@@ -973,6 +1013,11 @@ class WebSocketClient {
         this.path = "/";
         this.reader = null;
         this.asm = new WsAssembler(16777216);
+        this.sendBusy = false;
+        this.sendWaiters = new List<AsyncGate>();
+        this.lastOpcode = 0;
+        this.lastLen = 0;
+        this.lastBinary = null;
     }
 
     /// 发起 ws://host:port/path 握手（随机 Sec-WebSocket-Key，校验
@@ -1084,19 +1129,43 @@ class WebSocketClient {
         return ws;
     }
 
-    /// <summary>客户端方向统一发送入口：掩码 + 正确的帧长。
-    /// 返回 false 表示连接已不可用。</summary>
+    async void AcquireSend() {
+        while (this.sendBusy) {
+            AsyncGate g = new AsyncGate();
+            this.sendWaiters.Add(g);
+            await g.Wait();
+            g.Close();
+        }
+        this.sendBusy = true;
+    }
+
+    void ReleaseSend() {
+        this.sendBusy = false;
+        if (this.sendWaiters.Count > 0) {
+            AsyncGate g = this.sendWaiters[0];
+            this.sendWaiters.RemoveAt(0);
+            g.Signal();
+        }
+    }
+
+    /// <summary>客户端方向统一发送入口：掩码 + 正确的帧长 + 协程互斥串行发送，
+    /// 彻底消除心跳与并发业务数据帧交叉交错损坏。返回 false 表示连接已不可用。</summary>
     async bool SendFrame(int opcode, string payload, int payloadLen) {
         if (!this.connected || this.conn == null || payload == null || payloadLen < 0
             || payloadLen > 16777216
             || (opcode >= 8 && (payloadLen > 125 || opcode > WsOpcode.Pong))
             || (opcode < 0 || opcode > WsOpcode.Pong)) { return false; }
-        WsFrame frame = WsFrame.RawFrame(opcode, payload, payloadLen);
-        byte[] encoded = frame.EncodeMasked();
-        int total = WsFrame.HeaderLen(payloadLen) + 4 + payloadLen;
-        int n = await this.conn.SendBytesAsync(encoded, total);
-        if (n <= 0) { this.connected = false; return false; }
-        return true;
+        await this.AcquireSend();
+        try {
+            WsFrame frame = WsFrame.RawFrame(opcode, payload, payloadLen);
+            byte[] encoded = frame.EncodeMasked();
+            int total = WsFrame.HeaderLen(payloadLen) + 4 + payloadLen;
+            int n = await this.conn.SendBytesAsync(encoded, total);
+            if (n <= 0) { this.connected = false; return false; }
+            return true;
+        } finally {
+            this.ReleaseSend();
+        }
     }
 
     /// 发送一条 Text 消息（fire-and-forget，失败仅置 disconnected）。
@@ -1113,6 +1182,12 @@ class WebSocketClient {
     async void Ping() {
         await this.SendFrame(WsOpcode.Ping, "", 0);
     }
+
+    /// <summary>上一次成功接收并交付的消息操作码（WsOpcode.Text 或 WsOpcode.Binary）。</summary>
+    int LastOpcode() { return this.lastOpcode; }
+
+    /// <summary>上一次成功接收并交付的消息精确字节数。</summary>
+    int LastLength() { return this.lastLen; }
 
     /// <summary>挂起直到下一个文本/二进制消息。Ping 以 Pong 应答后
     /// 继续循环；分片消息重组到 fin 后整条交付；Close 或断开
@@ -1164,9 +1239,60 @@ class WebSocketClient {
                 this.CloseNow();
                 return "";
             }
+            this.lastOpcode = this.asm.MessageOpcode();
+            this.lastLen = this.asm.MessageLen();
+            this.lastBinary = null;
             return this.asm.Complete();
         }
         return "";
+    }
+
+    /// <summary>挂起直到下一个文本/二进制消息。返回未截断的原生 byte[]，
+    /// 彻底消除二进制消息中 NUL 字符被字符串截断的隐患；Close 或断开返回 null。</summary>
+    async byte[] RecvBinary() {
+        return await this.RecvBinary(0);
+    }
+
+    /// <summary>带空闲窗口的原生二进制消息接收。</summary>
+    async byte[] RecvBinary(int timeoutMs) {
+        while (this.connected) {
+            int total = this.reader.FrameSize();
+            while (total < 0) {
+                if (total == -2 || total == -3) { this.CloseNow(); return null; }
+                int n = await this.reader.FillMore(timeoutMs);
+                if (n == 0) { this.CloseNow(); return null; }
+                if (n < 0) { return null; }
+                total = this.reader.FrameSize();
+            }
+            WsFrame frame = this.reader.TakeFrame(total);
+            if (!WsFrame.ValidInbound(frame, false)) {
+                this.CloseNow();
+                return null;
+            }
+            if (frame.opcode == WsOpcode.Close) {
+                await this.SendFrame(WsOpcode.Close, "", 0);
+                this.CloseNow();
+                return null;
+            }
+            if (frame.opcode == WsOpcode.Ping) {
+                await this.SendFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
+                continue;
+            }
+            if (frame.opcode == WsOpcode.Pong) { continue; }
+            int feed = this.asm.Feed(frame);
+            if (feed < 0) { this.CloseNow(); return null; }
+            if (feed == 0) { continue; }
+            if (!this.asm.ValidComplete()) {
+                this.CloseNow();
+                return null;
+            }
+            this.lastOpcode = this.asm.MessageOpcode();
+            this.lastLen = this.asm.MessageLen();
+            byte[] bytes = this.asm.CompleteBytes();
+            this.lastBinary = bytes;
+            return bytes;
+        }
+        return null;
     }
 
     /// 立即断开（不发关闭帧）；RecvText 之后返回 ""。

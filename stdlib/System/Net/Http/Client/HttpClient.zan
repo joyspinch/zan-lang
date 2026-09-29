@@ -554,9 +554,15 @@ class HttpClient {
         sb.Append(" ");
         sb.Append(path);
         sb.Append(" HTTP/1.1\r\n");
-        sb.Append("Host: ");
-        sb.Append(this.host);
-        sb.Append("\r\n");
+        if (!this.HasHeaderName("Host")) {
+            sb.Append("Host: ");
+            sb.Append(this.host);
+            if ((this.useTls && this.port != 443) || (!this.useTls && this.port != 80)) {
+                sb.Append(":");
+                sb.Append(Convert.ToString(this.port));
+            }
+            sb.Append("\r\n");
+        }
 
         for (int i = 0; i < this.defaultHeaders.Count; i = i + 1) {
             sb.Append(this.defaultHeaders[i]);
@@ -1464,16 +1470,28 @@ class HttpClient {
     /// 字体等二进制资源的下载与上传；文本响应照常可用 body 读取。
     /// 绑定 policy 时按同一规则跟随重定向（3xx 原样返回仍是默认）。</summary>
     async HttpResponse SendBytesAsync(string method, string path, string body) {
+        int bodyLen = body != null ? body.Length : 0;
+        return await this.SendBytesAsync(method, path, body, bodyLen);
+    }
+
+    /// <summary>发送原始字节正文（带显式字节长度，二进制安全，可含 NUL 字节）。</summary>
+    async HttpResponse SendBytesAsync(string method, string path, string body, int bodyLen) {
         this.ResetTotalBudget();
-        this.CheckRequestLimit(body.Length);
+        this.CheckRequestLimit(bodyLen);
         this.CheckTargetPolicy();
         if (this.callPolicy == null || this.callPolicy.MaxRedirects() <= 0) {
-            HttpResponse direct = await HttpClient.SendBytesOnceAsync(this,
-                method, path, body);
+            HttpResponse direct = await HttpClient.SendBytesOnceWithLenAsync(this,
+                method, path, body, bodyLen);
             return direct;
         }
         return await this.FollowBytesRedirects(method, path, body,
             HttpClient.SendBytesOnceAsync);
+    }
+
+    /// <summary>发送原始字节数组（带显式字节长度，二进制安全，可含 NUL 字节）。</summary>
+    async HttpResponse SendBytesAsync(string method, string path, byte[] body, int bodyLen) {
+        string s = body != null && bodyLen > 0 ? body.ToStr(0, bodyLen) : "";
+        return await this.SendBytesAsync(method, path, s, bodyLen);
     }
 
     /// 一次真实上线：SendBytesAsync 的无重定向主体，同时作为
@@ -1481,20 +1499,34 @@ class HttpClient {
     /// 重定向改写（301/302/303 → GET）后驱动端据此发空 GET。
     static async HttpResponse SendBytesOnceAsync(HttpClient client,
             string method, string path, string body) {
+        int bodyLen = body != null ? body.Length : 0;
+        return await HttpClient.SendBytesOnceWithLenAsync(client, method, path, body, bodyLen);
+    }
+
+    static async HttpResponse SendBytesOnceWithLenAsync(HttpClient client,
+            string method, string path, string body, int bodyLen) {
         if (client.useTls) {
-            HttpResponse tResp = await client.SendBytesTlsAsync(method, path,
-                                                                body);
+            HttpResponse tResp = await client.SendBytesTlsWithLenAsync(method, path,
+                                                                body, bodyLen);
             return tResp;
         }
         TcpClient conn = await client.ConnectTarget();
         if (conn == null) { client.FailConnect(); }
         HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), client.WriteBudget(), client.TotalBudget());
-        string req = client.BuildRequest(method, path, body, true);
-        int _sent = await conn.SendBytesAsync(req, req.Length);
-        if (_sent != req.Length) {
+        string reqHead = client.BuildRequestHead(method, path, bodyLen, true);
+        int _sent = await conn.SendBytesAsync(reqHead, reqHead.Length);
+        if (_sent != reqHead.Length) {
             HttpDeadline.Disarm(watch);
             conn.Close();
             throw new HttpRequestException("request write failed");
+        }
+        if (bodyLen > 0 && body != null) {
+            int _b = await conn.SendBytesAsync(body, bodyLen);
+            if (_b != bodyLen) {
+                HttpDeadline.Disarm(watch);
+                conn.Close();
+                throw new HttpRequestException("request body write failed");
+            }
         }
         HttpDeadline.Touch(watch, client.ReadBudget());
         HttpResponse resp = await client.ReadFramedResponse(conn, path, method,
@@ -1655,6 +1687,12 @@ class HttpClient {
     /// 精确字节数）。
     async HttpResponse SendBytesTlsAsync(string method, string path,
                                          string body) {
+        int bodyLen = body != null ? body.Length : 0;
+        return await this.SendBytesTlsWithLenAsync(method, path, body, bodyLen);
+    }
+
+    async HttpResponse SendBytesTlsWithLenAsync(string method, string path,
+                                                string body, int bodyLen) {
         Socket.Initialize();
         TcpClient conn = await this.ConnectTarget();
         if (conn == null) { FailConnect(); }
@@ -1690,14 +1728,24 @@ class HttpClient {
             throw new HttpRequestException(tlsHandshakeError);
         }
         HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
-        string req = this.BuildRequest(method, path, body, true);
-        int _sent = await stream.SendAsync(req, req.Length);
-        if (_sent != req.Length) {
+        string reqHead = this.BuildRequestHead(method, path, bodyLen, true);
+        int _sent = await stream.SendAsync(reqHead, reqHead.Length);
+        if (_sent != reqHead.Length) {
             HttpDeadline.Disarm(watch);
             stream.Close();
             conn.Close();
             ctx.Free();
             throw new HttpRequestException("request write failed");
+        }
+        if (bodyLen > 0 && body != null) {
+            int _b = await stream.SendAsync(body, bodyLen);
+            if (_b != bodyLen) {
+                HttpDeadline.Disarm(watch);
+                stream.Close();
+                conn.Close();
+                ctx.Free();
+                throw new HttpRequestException("request body write failed");
+            }
         }
         HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
                                                           watch, stream, ctx);

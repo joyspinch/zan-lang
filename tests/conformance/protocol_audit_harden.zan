@@ -1,0 +1,245 @@
+using System;
+using System.IO;
+using System.Net.Http.Client;
+using System.Net.Mqtt;
+using System.Net.WebSocket;
+using System.Net.Sip;
+using System.Net.Sockets;
+using System.Net.Modbus;
+using System.Collections.Generic;
+
+class Program {
+    static void TestMqttReaderMemory() {
+        MqttReader reader = new MqttReader((nint)0);
+        // 验证 1MB 大数据量原生内存快速扩容与对齐
+        reader.Ensure(1048576);
+        reader.Compact();
+        Console.WriteLine("mqtt reader memory ok");
+    }
+
+    static void TestHttpClientHost() {
+        HttpClient c1 = new HttpClient("example.com", 8080);
+        string head1 = c1.BuildRequestHead("GET", "/test", 0, false);
+        if (head1.IndexOf("Host: example.com:8080\r\n") < 0) {
+            Console.WriteLine("FAIL: HttpClient should include 8080");
+            Environment.Exit(1);
+        }
+
+        HttpClient c2 = new HttpClient("example.com", 80);
+        string head2 = c2.BuildRequestHead("GET", "/test", 0, false);
+        if (head2.IndexOf("Host: example.com\r\n") < 0) {
+            Console.WriteLine("FAIL: HttpClient should not include 80");
+            Environment.Exit(2);
+        }
+
+        HttpClient c3 = HttpClient.CreateHttps("example.com", 8443);
+        string head3 = c3.BuildRequestHead("GET", "/test", 0, false);
+        if (head3.IndexOf("Host: example.com:8443\r\n") < 0) {
+            Console.WriteLine("FAIL: HttpClient should include 8443");
+            Environment.Exit(3);
+        }
+
+        HttpClient c4 = HttpClient.CreateHttps("example.com", 443);
+        string head4 = c4.BuildRequestHead("GET", "/test", 0, false);
+        if (head4.IndexOf("Host: example.com\r\n") < 0) {
+            Console.WriteLine("FAIL: HttpClient should not include 443");
+            Environment.Exit(4);
+        }
+
+        Console.WriteLine("http client host ok");
+    }
+
+    static void TestWsAssemblerBytes() {
+        WsAssembler asm = new WsAssembler(65536);
+        WsFrame frame = WsFrame.RawFrame(WsOpcode.Binary, "ABC\0DEF", 7);
+        int feed = asm.Feed(frame);
+        if (feed != 1) {
+            Console.WriteLine("FAIL: asm feed");
+            Environment.Exit(5);
+        }
+        byte[] bytes = asm.CompleteBytes();
+        if (bytes == null || bytes[3] != 0 || bytes[4] != 68) {
+            Console.WriteLine("FAIL: asm complete bytes");
+            Environment.Exit(6);
+        }
+        Console.WriteLine("ws assembler binary bytes ok");
+    }
+
+    static void TestSipFramingAndDefense() {
+        string raw = "SIP/2.0 200 OK\r\nContent-Length: 4\r\n\r\nHELLONEXT_PIPELINED_DATA";
+        SipMessage m = SipMessage.Parse(raw);
+        if (m == null || m.GetBody() != "HELL") {
+            Console.WriteLine("FAIL: sip body length framing");
+            Environment.Exit(7);
+        }
+        string badStatus = "SIP/2.0 XYZ OK\r\n\r\n";
+        SipMessage mBad = SipMessage.Parse(badStatus);
+        if (mBad != null) {
+            Console.WriteLine("FAIL: sip bad status should be rejected");
+            Environment.Exit(8);
+        }
+        Console.WriteLine("sip framing ok");
+    }
+
+    static async void RunModbusServer(TcpListener listener) {
+        nint client = await listener.AcceptAsync();
+        if (client < 0) { return; }
+        byte[] req = new byte[12];
+        // 第 1 轮：正常回显对应 TID
+        int n = await Socket.RecvOv(client, req, 12);
+        if (n == 12) {
+            byte[] resp = new byte[11];
+            resp[0] = req[0];
+            resp[1] = req[1];
+            resp[2] = 0; // proto
+            resp[3] = 0;
+            resp[4] = 0; // len
+            resp[5] = 5;
+            resp[6] = 1; // unit
+            resp[7] = 3; // fc
+            resp[8] = 2; // byte count
+            resp[9] = 18; // 0x12
+            resp[10] = 52; // 0x34
+            await Socket.SendAsync(client, resp.ToStr(0, 11), 11);
+        }
+
+        // 第 2 轮：故意返回不匹配的 TID (999 -> 0x03E7)，模拟网络串号
+        int n2 = await Socket.RecvOv(client, req, 12);
+        if (n2 == 12) {
+            byte[] respBad = new byte[11];
+            respBad[0] = 3;  // TID 999 故意错乱！
+            respBad[1] = 231;
+            respBad[2] = 0;
+            respBad[3] = 0;
+            respBad[4] = 0;
+            respBad[5] = 5;
+            respBad[6] = 1;
+            respBad[7] = 3;
+            respBad[8] = 2;
+            respBad[9] = 18;
+            respBad[10] = 52;
+            await Socket.SendAsync(client, respBad.ToStr(0, 11), 11);
+        }
+        Socket.Close(client);
+    }
+
+    static async void TestModbusDefense() {
+        TcpListener listener = TcpListener.CreateAndStart("127.0.0.1", 15502, 16);
+        RunModbusServer(listener);
+
+        ModbusClient m = await ModbusClient.ConnectAsync("127.0.0.1", 15502, 1);
+        if (m == null) {
+            Console.WriteLine("FAIL: modbus connect failed");
+            Environment.Exit(9);
+        }
+
+        // 1. 正常请求读取保持寄存器 0，数量 1
+        List<int> regs = await m.ReadHoldingAsync(0, 1);
+        if (regs == null || regs.Count != 1 || regs[0] != 4660) {
+            Console.WriteLine("FAIL: modbus normal read failed");
+            Environment.Exit(10);
+        }
+
+        // 2. 第二次读取：服务端故意返回错乱的 TID 999！客户端防数据串号机制触发拦截！
+        List<int> regs2 = await m.ReadHoldingAsync(0, 1);
+        if (regs2.Count != 0 || m.LastError() != "transaction id mismatch") {
+            Console.WriteLine("FAIL: modbus tid mismatch not caught: " + m.LastError());
+            Environment.Exit(11);
+        }
+
+        listener.Stop();
+        m.Close();
+        Console.WriteLine("modbus defense ok");
+    }
+
+    static void TestStreamBinaryWrite() {
+        string tmpPath = "_scratch/test_stream_bin.dat";
+        FileStream fs = FileStream.OpenWrite(tmpPath);
+        byte[] payload = new byte[8];
+        payload[0] = 65; // 'A'
+        payload[1] = 0;  // NUL
+        payload[2] = 66; // 'B'
+        payload[3] = 0;  // NUL
+        payload[4] = 67; // 'C'
+        payload[5] = 255;
+        payload[6] = 0;
+        payload[7] = 68; // 'D'
+        int written = fs.WriteBytes(payload, 0, 8);
+        fs.Flush();
+        fs.Close();
+        if (written != 8) {
+            Console.WriteLine("FAIL: stream write binary bytes count: " + Convert.ToString(written));
+            Environment.Exit(12);
+        }
+        byte[] readBack = File.ReadBytes(tmpPath, 0, 8);
+        File.Delete(tmpPath);
+        if (readBack == null || readBack.Length != 8 || readBack[1] != 0 || readBack[2] != 66 || readBack[3] != 0 || readBack[4] != 67) {
+            Console.WriteLine("FAIL: stream binary bytes content mismatch");
+            Environment.Exit(13);
+        }
+        Console.WriteLine("stream binary write ok");
+    }
+
+    static void TestWsControlFrameAnd64BitOverflow() {
+        // 1. 分片控制帧 (fin=0, opcode=9 Ping): 必须按协议违规拒收为 Close 帧
+        byte[] fragPing = new byte[4];
+        fragPing[0] = 9;   // fin=0, opcode=9
+        fragPing[1] = 0;   // payloadLen=0
+        fragPing[2] = 0;
+        fragPing[3] = 0;
+        WsFrame f1 = WsFrame.DecodeAt(fragPing.ToStr(0, 2), 0, 2);
+        if (f1.opcode != WsOpcode.Close) {
+            Console.WriteLine("FAIL: fragmented ping should be rejected as Close");
+            Environment.Exit(14);
+        }
+
+        // 2. 超长控制帧 (fin=1, opcode=9 Ping, payloadLen=126): 必须按协议违规拒收为 Close 帧
+        byte[] largePing = new byte[6];
+        largePing[0] = (byte)(128 + 9); // fin=1, opcode=9
+        largePing[1] = 126;             // 扩展长度
+        largePing[2] = 0;
+        largePing[3] = 130;
+        WsFrame f2 = WsFrame.DecodeAt(largePing.ToStr(0, 4), 0, 4);
+        if (f2.opcode != WsOpcode.Close) {
+            Console.WriteLine("FAIL: ping with length > 125 should be rejected as Close");
+            Environment.Exit(15);
+        }
+
+        // 3. 64 位长度带符号溢出 (fin=1, opcode=2 Binary, payloadLen=127, byte 6 = 0x80):
+        byte[] over64 = new byte[12];
+        over64[0] = (byte)(128 + 2); // fin=1, opcode=2
+        over64[1] = 127;             // 64-bit len
+        over64[2] = 0; over64[3] = 0; over64[4] = 0; over64[5] = 0;
+        over64[6] = 128; // MSB=1 -> 溢出负数!
+        over64[7] = 0; over64[8] = 0; over64[9] = 1;
+        WsFrame f3 = WsFrame.DecodeAt(over64.ToStr(0, 10), 0, 10);
+        if (f3.opcode != WsOpcode.Close) {
+            Console.WriteLine("FAIL: 64-bit ws length with MSB=1 should be rejected as Close");
+            Environment.Exit(16);
+        }
+
+        Console.WriteLine("ws control frame and 64bit bounds ok");
+    }
+
+    static void TestHttpClientBinaryBody() {
+        HttpClient client = new HttpClient("127.0.0.1", 8080);
+        string head = client.BuildRequestHead("POST", "/upload", 1024, true);
+        if (head.IndexOf("Content-Length: 1024\r\n") < 0) {
+            Console.WriteLine("FAIL: HttpClient BuildRequestHead Content-Length");
+            Environment.Exit(17);
+        }
+        Console.WriteLine("http client binary body ok");
+    }
+
+    static async void Main() {
+        TestMqttReaderMemory();
+        TestHttpClientHost();
+        TestWsAssemblerBytes();
+        TestSipFramingAndDefense();
+        await TestModbusDefense();
+        TestStreamBinaryWrite();
+        TestWsControlFrameAnd64BitOverflow();
+        TestHttpClientBinaryBody();
+        Console.WriteLine("ALL_PROTOCOL_AUDIT_OK");
+    }
+}
