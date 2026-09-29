@@ -149,7 +149,12 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   `/xxx/form?id=N` 返回裸 `<form>`（含 lay-footer 的取消/保存按钮，但无
   head/link/script），css/js 全靠 data-dialog 弹窗注入宿主页后继承——
   脱离弹窗直接 goto 片段 URL 验收，会拿到"样式不生效、页签点击无反应"的
-  假故障（2026-09-29 表设计器验收白走一轮），交互必须在宿主页弹窗语境测。
+  假故障（2026-09-29 表设计器验收白走一轮），交互必须在宿主页弹窗语境测；
+  ⑫ `app.exe reload` 会把 worker 搞挂且 master 仍握着监听 socket——端口
+  LISTEN 但请求 000 超时（连接进 backlog 无人应答，两实例先后中招），
+  刷视图/配置一律 stop+start；master+worker 常驻时 exe 被运行进程占用，
+  zanc 链接 `app.exe` 报 Permission denied，先 stop 并 netstat 复核再编
+  （2026-09-29 SSE 30s 断流修复部署即踩）。
 - **共享工作树上的测试归责：先隔离再定责**。测试结果异常先查
   并发提交时间线（`git log --format="%h %ad %s" -3`）：共享树另一会话
   在途编辑 stdlib/编译器期间跑测试，产物混进 WIP 源，无关测试假挂假绿
