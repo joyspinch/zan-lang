@@ -394,32 +394,41 @@ typedef struct {
     LLVMMetadataRef composite;   /* completed composite (after RAUW) */
     int building;
 } zan_di_type_rec_t;
-static zan_di_type_rec_t *g_di_types = NULL;
+/* Records are individually allocated and the table only holds pointers:
+ * di_class_composite / di_array_composite hold a rec across the recursive
+ * di_type_for_zan member walk, and a realloc that moved the records turned
+ * every outer rec into freed heap (ASAN heap-use-after-free in
+ * di_class_composite; the -g IDE-input crash this fixes). */
+static zan_di_type_rec_t **g_di_types = NULL;
 static int g_di_type_count = 0, g_di_type_cap = 0;
 
 /* Clear the per-run type cache: the metadata belongs to the module of one
  * zan_irgen_emit, so the next run must not reuse pointers into it. */
 static void di_debug_types_reset(void) {
+    for (int i = 0; i < g_di_type_count; i++) free(g_di_types[i]);
+    free(g_di_types);
     g_di_types = NULL;
     g_di_type_count = g_di_type_cap = 0;
 }
 
 static zan_di_type_rec_t *di_type_rec(zan_type_t *t) {
     for (int i = 0; i < g_di_type_count; i++)
-        if (g_di_types[i].type == t) return &g_di_types[i];
+        if (g_di_types[i]->type == t) return g_di_types[i];
     if (g_di_type_count >= g_di_type_cap) {
         int cap = g_di_type_cap > 0 ? g_di_type_cap * 2 : 64;
-        zan_di_type_rec_t *grown = (zan_di_type_rec_t *)realloc(g_di_types,
-            sizeof(zan_di_type_rec_t) * (size_t)cap);
+        zan_di_type_rec_t **grown = (zan_di_type_rec_t **)realloc(g_di_types,
+            sizeof(zan_di_type_rec_t *) * (size_t)cap);
         if (!grown) return NULL;
         g_di_types = grown;
         g_di_type_cap = cap;
     }
-    zan_di_type_rec_t *r = &g_di_types[g_di_type_count++];
+    zan_di_type_rec_t *r = (zan_di_type_rec_t *)malloc(sizeof(*r));
+    if (!r) return NULL;
     r->type = t;
     r->placeholder = NULL;
     r->composite = NULL;
     r->building = 0;
+    g_di_types[g_di_type_count++] = r;
     return r;
 }
 

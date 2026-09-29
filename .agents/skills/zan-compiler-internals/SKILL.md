@@ -948,6 +948,20 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   全部过期，逐条归因毫无意义；判据是 `ls -l build/zanc.exe` 的 mtime 落在你的运行
   区间内 → 整档作废重跑。
 
+## 编译期大型工程内存暴增治理（A-MEM1/2/3 经验定式，2026-09-29）
+
+- **代码生成与元数据导出三阶治理（A-MEM3）**：
+  - **触发检测前置（AST Fast-Check）**：元数据导出极其昂贵，在导出前必须先做 AST 浅层特征扫描（`zan_gen_ast_triggered`），无 `Json.Serialize`/ORM 实体/Controller 路由的项目直接返回 0，彻底避免分配兆字节元数据 JSON。
+  - **流式文件写入**：请求打包（`{"mode":"codegen","unit":...}`）禁止把整份多兆字节元数据在堆上二次复制拼接，改用 `FILE*` 顺序流式写入 prefix、meta、suffix，写完即刻释放 meta。
+  - **调用点候选者先验过滤（gm_is_candidate_ast_call）**：大型项目中 98% 的函数调用是普通数学/控制台/集合操作，递归为其创建参数表达式树和 JSON DOM 会产生数十万个小堆对象。过滤必须在创建 JSON 节点**前**执行；**但 `c->rec_nodes` 映射必须在候选过滤前先记录**，以保持 call ID、placeholder 和 `gm_find_expr` 索引 100% 严密对齐，杜绝 rewrite 查找击穿。实测 534 文件 ZanIDE 前端峰值直接从 487MB 暴降至 258MB（-47%）。
+- **前端 AST 节点极致紧凑化与生命周期（A-MEM2）**：
+  - **公共头只留真通用字段**：99% 节点是表达式/语句，绝不内联属性列表与命名空间元数据（`zan_decl_meta_t *meta` 外置）；方法冷门字段（`extern_lib`、`where_clauses`、`base_args`）移入 `zan_method_ext_t *ext`。
+  - **静态断言守门**：`_Static_assert(sizeof(zan_ast_node_t) <= 120)`，严防后续随意增加字段导致数百万节点膨胀。
+  - **字符串比对走栈缓冲区**：命名空间解析与 using 符号查找使用 512B 栈局部缓冲区或临时堆，禁止污染单向增长的主 Arena。
+- **IRGen 虚方法与反射保活治理（A-MEM1）**：
+  - **反射保活收敛**：切断 `root = ... || g->refl_used` 全局暴力保活，仅对真正登记在反射元数据表（`refl_mtabs`）中的目标类型保活。
+  - **虚表按需感知**：常量聚合溯源归属全局变量，未实例化的类虚方法不判定为存活，生成为单条 `unreachable` 桩，切断数十万条未调用 stdlib 方法级联拉活。
+
 - 另一条常客：**端口/资源竞争与真 flaky**。判别法是把**同一个二进制**（不重编）
   连跑 5 次——通过/挂起交错就说明是被测代码里的竞争，单次的超时/失败不能当回归
   （本次 `conformance_gui_listview_scrollbar_drag` 同一 exe 3 过 2 挂，而它属

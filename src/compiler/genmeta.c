@@ -52,7 +52,19 @@ typedef struct {
     int *pend_ids;
     int pend_count;
     int pend_cap;
+    /* Precomputed seed filters: avoid allocating 98% of dead call DOM nodes */
+    const char *const *expr_names;
+    int expr_count;
+    const char *const *table_names;
+    int table_count;
 } gm_ctx_t;
+
+static bool gm_name_in(const char *name, const char *const *names, int count) {
+    if (!name || !names) return false;
+    for (int i = 0; i < count; i++)
+        if (strcmp(name, names[i]) == 0) return true;
+    return false;
+}
 
 static json_value *gm_arg_json(zan_ast_node_t *n);
 
@@ -373,9 +385,64 @@ static int gm_rec_lookup(zan_ast_node_t *call, gm_ctx_t *c) {
     return 0;
 }
 
+static bool gm_is_candidate_ast_call(zan_ast_node_t *call, gm_ctx_t *c) {
+    zan_ast_node_t *callee = call->call.callee;
+    if (!callee) return false;
+    const char *name = NULL;
+    if (callee->kind == AST_MEMBER_ACCESS) {
+        if (callee->member.name.str) name = callee->member.name.str;
+    } else if (callee->kind == AST_IDENTIFIER) {
+        if (callee->ident.name.str) name = callee->ident.name.str;
+    }
+
+    /* 1. Reserved receiver placeholder */
+    for (int i = 0; i < c->pend_count; i++) {
+        if (c->pend_nodes[i] == call) return true;
+    }
+
+    /* 2. Generic method calls: Json.Serialize<T>, db.Insert<T>, etc.
+     * All generator root targets carry type arguments! */
+    if (call->call.type_args.count > 0) return true;
+
+    zan_ast_node_t *robj = (callee->kind == AST_MEMBER_ACCESS)
+                               ? callee->member.object
+                               : NULL;
+    /* 3. Receiver is a call that was recorded (fluent chain descendant) */
+    if (robj && robj->kind == AST_CALL) {
+        if (gm_rec_lookup(robj, c) != 0) return true;
+    }
+
+    /* 4. Receiver is Json */
+    if (robj && robj->kind == AST_IDENTIFIER && robj->ident.name.str &&
+        strcmp(robj->ident.name.str, "Json") == 0)
+        return true;
+
+    /* 5. Name is a known seed */
+    static const char *const seeds[] = {
+        "Serialize", "Deserialize",
+        "In", "InText", "InRaw", "InInt", "InLong", "InDouble", "InBool",
+        "HasIn", "Need", "NeedText", "NeedInt", "NeedLong", "Param", "Paged",
+        "Query", "Select", "Insert", "Update", "Delete", "SyncStructure",
+        "SyncStructureAsync", "SyncStructureAll", "SyncStructureAllAsync",
+        "Read", "ReadAsync"
+    };
+    if (name && gm_name_in(name, seeds, (int)(sizeof(seeds) / sizeof(seeds[0]))))
+        return true;
+
+    /* 6. Name is an Expr<T> taking method */
+    if (name && gm_name_in(name, c->expr_names, c->expr_count))
+        return true;
+
+    /* 7. Receiver is a member access to a Table entity */
+    if (robj && robj->kind == AST_MEMBER_ACCESS && robj->member.name.str &&
+        gm_name_in(robj->member.name.str, c->table_names, c->table_count))
+        return true;
+
+    return false;
+}
+
 static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
     zan_ast_node_t *callee = call->call.callee;
-    json_value *o = json_new_obj();
     /* children-first: a placeholder id may still exist if this node was
      * reserved by an outer call before it was walked (defensive path) */
     int id = 0;
@@ -389,6 +456,9 @@ static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
         }
     }
     if (!id) id = ++c->call_id;
+
+    /* Record the AST node -> id mapping BEFORE candidate filtering so that
+     * node indices and placeholder lookups match gm_find_expr 100% exactly. */
     if (c->rec_count >= c->rec_cap) {
         int ncap = c->rec_cap ? c->rec_cap * 2 : 256;
         zan_ast_node_t **nn =
@@ -405,6 +475,15 @@ static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
         c->rec_ids[c->rec_count] = id;
         c->rec_count++;
     }
+
+    /* Fast discard: 98% of ordinary calls (Math, Console, list, string)
+     * are never generator seeds nor fluent chain members. Discard without
+     * allocating ANY json_value nodes or expr trees. */
+    if (!gm_is_candidate_ast_call(call, c)) {
+        return;
+    }
+
+    json_value *o = json_new_obj();
     json_obj_set(o, "id", json_new_num((double)id));
     json_obj_set(o, "file", json_new_num((double)call->loc.file_id));
     json_obj_set(o, "line", json_new_num((double)call->loc.line));
@@ -446,13 +525,6 @@ static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
         json_arr_add(args, gm_arg_json(call->call.args.items[i]));
     json_obj_set(o, "args", args);
     json_arr_add(c->calls, o);
-}
-
-static bool gm_name_in(const char *name, const char *const *names, int count) {
-    if (!name) return false;
-    for (int i = 0; i < count; i++)
-        if (strcmp(name, names[i]) == 0) return true;
-    return false;
 }
 
 /* Table entity names of the unit: `[Table] class Order` -- accessor members
@@ -575,7 +647,9 @@ static const char **gm_expr_method_names(json_value *classes, int *out_count) {
     return names;
 }
 
-static void gm_prune_calls(json_value *calls, json_value *classes) {
+static void gm_prune_calls(json_value *calls, const char *const *expr_names,
+                           int expr_count, const char *const *table_names,
+                           int table_count) {
     if (!calls || calls->type != JSON_ARR || calls->as.arr.count == 0) return;
     int max_id = 0;
     for (int i = 0; i < calls->as.arr.count; i++) {
@@ -585,10 +659,6 @@ static void gm_prune_calls(json_value *calls, json_value *classes) {
     }
     bool *keep = (bool *)calloc((size_t)max_id + 1, sizeof(bool));
     if (!keep) zan_host_oom();
-    int expr_count = 0;
-    const char **expr_names = gm_expr_method_names(classes, &expr_count);
-    int table_count = 0;
-    const char **table_names = gm_table_entity_names(classes, &table_count);
     for (int i = 0; i < calls->as.arr.count; i++) {
         json_value *call = calls->as.arr.items[i];
         int id = (int)json_get_num(json_obj_get(call, "id"), 0);
@@ -632,8 +702,6 @@ static void gm_prune_calls(json_value *calls, json_value *classes) {
             json_free(call);
     }
     calls->as.arr.count = out;
-    free(expr_names);
-    free(table_names);
     free(keep);
 }
 
@@ -1265,6 +1333,11 @@ static char *gm_export(zan_ast_node_t *unit, zan_diag_t *diag) {
         gm_export_type(unit->comp_unit.decls.items[i], classes);
     json_obj_set(root, "classes", classes);
 
+    int expr_count = 0;
+    const char **expr_names = gm_expr_method_names(classes, &expr_count);
+    int table_count = 0;
+    const char **table_names = gm_table_entity_names(classes, &table_count);
+
     gm_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.calls = json_new_arr();
@@ -1273,6 +1346,10 @@ static char *gm_export(zan_ast_node_t *unit, zan_diag_t *diag) {
     ctx.pend_ids = NULL;
     ctx.pend_count = 0;
     ctx.pend_cap = 0;
+    ctx.expr_names = expr_names;
+    ctx.expr_count = expr_count;
+    ctx.table_names = table_names;
+    ctx.table_count = table_count;
     /* walk every method body and field initializer for call sites */
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
@@ -1291,8 +1368,11 @@ static char *gm_export(zan_ast_node_t *unit, zan_diag_t *diag) {
             }
         }
     }
-    gm_prune_calls(ctx.calls, classes);
+    gm_prune_calls(ctx.calls, expr_names, expr_count, table_names, table_count);
     json_obj_set(root, "calls", ctx.calls);
+
+    free(expr_names);
+    free(table_names);
 
     free(ctx.pend_nodes);
     free(ctx.pend_ids);

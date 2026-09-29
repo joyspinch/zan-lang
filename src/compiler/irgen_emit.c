@@ -3631,6 +3631,16 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
              * it silences every static constructor (string deobfuscation, the
              * runtime registries) and the program dies at startup. */
             if (strncmp(nm, "llvm.", 5) == 0) continue;
+            /* Interned guard texts (zan_irgen_intern_string, name "rterr",
+             * LLVM-renamed rterr.N) stay in the merged .rdata blob: -g on a
+             * real program interns thousands of distinct site messages, and
+             * one compose section per message pushes GNU ld's PE/COFF '$'
+             * grouping over its limits ("relocation truncated to fit:
+             * IMAGE_REL_AMD64_REL32 against .rdata$rterr.N" on a 13 MB
+             * object, nowhere near a 2 GB span). They are private text the
+             * runtime report reads through hard pointers, so per-string gc
+             * granularity buys nothing. */
+            if (strncmp(nm, "rterr", 5) == 0) continue;
             char sec[260];
             /* LLVMIsConstant() answers "is this Value a Constant subclass",
              * which is TRUE for every GlobalVariable; the read-only flag of

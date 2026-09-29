@@ -4473,7 +4473,12 @@ int main(int argc, char **argv) {
             pi_pp_defines = pp_defines;
             pi_pp_define_count = pp_define_count;
             pi_publish_mode = publish_mode;
-            pi_stdlib_root_buf = stdlib_root;
+            /* resolved_stdlib_root, not stdlib_root: the block-local array's
+             * scope ends with this if, but the pull-in filter keeps reading
+             * the pointer for the whole parse loop -- a stale stack slot
+             * makes the leaf match in pi_reach_input_dir chase garbage
+             * (ASAN: stack-use-after-scope, 27-byte strlen past the scope). */
+            pi_stdlib_root_buf = resolved_stdlib_root;
             /* Seeding happens in the main parse loop below, right after each
              * file is parsed (parse-once: the old separate throwaway pass
              * parsed every included file twice). The closure itself is
@@ -4715,10 +4720,13 @@ int main(int argc, char **argv) {
         zan_parser_merge_partials(ast, arena, diag);
         zan_compile_trace("desugar events");
         zan_parser_desugar_events(ast, arena, diag);
+        phase("flatten/merge");
         zan_compile_trace("nsresolve");
         zan_nsresolve_run(ast, arena, diag);
+        phase("nsresolve_1");
         zan_compile_trace("specialize generic bases");
         zan_parser_specialize_generic_bases(ast, arena, diag);
+        phase("specialize_bases");
 
         /* --gen-meta: dump the compilation-unit metadata the Zan-scripted
          * code generators consume (see genmeta.h) and exit. Must run before
@@ -4764,6 +4772,7 @@ int main(int argc, char **argv) {
             free(source);
             return 1;
         }
+        phase("codegen");
         /* Demand-driven pull-in, second round: generated classes reference
          * stdlib types the user program never spells (dbgen output binds the
          * whole System.Data.Orm subtree -- OrmSelect/OrmMeta/OrmCol/...), so
@@ -4858,6 +4867,7 @@ int main(int argc, char **argv) {
          * merge deleted exactly the types the generated classes bind against. */
         zan_compile_trace("prune");
         zan_nsresolve_prune(ast, arena, diag);
+        phase("prune");
         zan_compile_trace("resolve done");
     }
 
