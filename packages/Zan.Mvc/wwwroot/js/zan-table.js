@@ -236,7 +236,7 @@
        不并进 form——表单里点按钮会触发提交语义。 */
     var barHost = table.closest('.table-scroll') || table;
     var mergeInto = barHost.previousElementSibling;
-    if (mergeInto && mergeInto.matches('div.toolbar, header')) {
+    if (mergeInto && mergeInto.matches('div.toolbar, div.tbar, header')) {
       mergeInto.appendChild(bar);
       bar.classList.add('zt-merged');
     } else {
