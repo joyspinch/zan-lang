@@ -227,8 +227,10 @@
     });
     bar.appendChild(density);
 
-    /* 状态条插到表格元素之前（表格常直接躺在 .card 里，同级即视觉上位） */
-    table.parentNode.insertBefore(bar, table);
+    /* 状态条插到表格元素之前（表格常直接躺在 .card 里，同级即视觉上位）；
+       表格包在滚动容器里时再往外提一级，否则状态条跟着横向滚动滚出视野 */
+    var barHost = table.closest('.table-scroll') || table.parentNode;
+    barHost.parentNode.insertBefore(bar, barHost);
 
     function setDensity(mode) {
       var compact = mode === 'compact';
