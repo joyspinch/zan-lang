@@ -285,6 +285,66 @@ static nr_type_t *find_full(nr_ctx_t *c, zan_istr_t full) {
     return i >= 0 ? &c->items[i] : NULL;
 }
 
+static nr_type_t *find_full_joined(nr_ctx_t *c, zan_istr_t a, zan_istr_t b) {
+    if (a.len == 0) return find_full(c, b);
+    if (b.len == 0) return find_full(c, a);
+    char buf[512];
+    size_t total = (size_t)a.len + 1 + (size_t)b.len;
+    char *p = buf;
+    if (total > sizeof(buf)) {
+        p = (char *)malloc(total);
+        if (!p) return NULL;
+    }
+    memcpy(p, a.str, a.len);
+    p[a.len] = '.';
+    memcpy(p + a.len + 1, b.str, b.len);
+    zan_istr_t key;
+    key.str = p;
+    key.len = (uint32_t)total;
+    nr_type_t *res = find_full(c, key);
+    if (p != buf) free(p);
+    return res;
+}
+
+static zan_istr_t flatten_qname_buf(zan_ast_node_t *q, char *buf, size_t buf_cap, char **out_heap) {
+    zan_istr_t empty = {0};
+    *out_heap = NULL;
+    if (!q) return empty;
+    if (q->kind == AST_IDENTIFIER) return q->ident.name;
+    if (q->kind == AST_QUALIFIED_NAME) {
+        size_t total = 0;
+        int parts = 0;
+        for (int i = 0; i < q->qualified_name.parts.count; i++) {
+            zan_ast_node_t *p = q->qualified_name.parts.items[i];
+            if (!p || p->kind != AST_IDENTIFIER) continue;
+            if (parts > 0) total++;
+            total += p->ident.name.len;
+            parts++;
+        }
+        char *p = buf;
+        if (total > buf_cap) {
+            p = (char *)malloc(total ? total : 1);
+            *out_heap = p;
+            if (!p) return empty;
+        }
+        size_t n = 0;
+        parts = 0;
+        for (int i = 0; i < q->qualified_name.parts.count; i++) {
+            zan_ast_node_t *part = q->qualified_name.parts.items[i];
+            if (!part || part->kind != AST_IDENTIFIER) continue;
+            if (parts > 0) p[n++] = '.';
+            memcpy(p + n, part->ident.name.str, part->ident.name.len);
+            n += part->ident.name.len;
+            parts++;
+        }
+        zan_istr_t r;
+        r.str = p;
+        r.len = (uint32_t)n;
+        return r;
+    }
+    return empty;
+}
+
 static int count_simple(nr_ctx_t *c, zan_istr_t simple) {
     /* same-simple-name groups live in one bucket chain; count them there */
     int n = 0;
@@ -371,11 +431,14 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
         /* explicit qualified reference: try full, then using-prefixed */
         t = find_full(c, R);
         if (!t && usings) {
+            char ubuf[256];
             for (int i = 0; i < usings->count && !t; i++) {
                 zan_ast_node_t *u = usings->items[i];
                 if (!u || u->kind != AST_USING_DECL || u->using_decl.is_static) continue;
-                zan_istr_t up = flatten_qname(u->using_decl.name, c->arena);
-                t = find_full(c, join_ns(c->arena, up, R));
+                char *uheap = NULL;
+                zan_istr_t up = flatten_qname_buf(u->using_decl.name, ubuf, sizeof(ubuf), &uheap);
+                t = find_full_joined(c, up, R);
+                if (uheap) free(uheap);
             }
         }
         if (t && !arity_matches(tr, t)) {
@@ -406,7 +469,7 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
      * same-named stdlib type pulled in by `using` (the generated global
      * `partial class App` bound its App.OnLoad to Gui.App). join_ns returns
      * the bare name for an empty ctx_ns, so this covers both. */
-    t = find_full(c, join_ns(c->arena, ctx_ns, R));
+    t = find_full_joined(c, ctx_ns, R);
     if (t && !arity_matches(tr, t)) {
         /* The same-namespace declaration cannot take the reference's type
          * arguments: leave the reference untouched (it resolves to the
@@ -416,11 +479,14 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
         return;
     }
     if (!t && usings) {
+        char ubuf[256];
         for (int i = 0; i < usings->count && !t; i++) {
             zan_ast_node_t *u = usings->items[i];
             if (!u || u->kind != AST_USING_DECL || u->using_decl.is_static) continue;
-            zan_istr_t up = flatten_qname(u->using_decl.name, c->arena);
-            t = find_full(c, join_ns(c->arena, up, R));
+            char *uheap = NULL;
+            zan_istr_t up = flatten_qname_buf(u->using_decl.name, ubuf, sizeof(ubuf), &uheap);
+            t = find_full_joined(c, up, R);
+            if (uheap) free(uheap);
             if (t && !arity_matches(tr, t)) t = NULL;
         }
     }
@@ -468,13 +534,16 @@ static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
      * global `partial class App` resolves through `using Gui;` to Gui.App and
      * the binder reports `'Gui_App' has no member 'OnLoad'`. join_ns returns
      * the bare name for an empty ctx_ns, so this covers both scopes. */
-    t = find_full(c, join_ns(c->arena, ctx_ns, R));
+    t = find_full_joined(c, ctx_ns, R);
     if (!t && usings) {
+        char ubuf[256];
         for (int i = 0; i < usings->count && !t; i++) {
             zan_ast_node_t *u = usings->items[i];
             if (!u || u->kind != AST_USING_DECL || u->using_decl.is_static) continue;
-            zan_istr_t up = flatten_qname(u->using_decl.name, c->arena);
-            t = find_full(c, join_ns(c->arena, up, R));
+            char *uheap = NULL;
+            zan_istr_t up = flatten_qname_buf(u->using_decl.name, ubuf, sizeof(ubuf), &uheap);
+            t = find_full_joined(c, up, R);
+            if (uheap) free(uheap);
         }
     }
     if (!t) t = find_full(c, R);
