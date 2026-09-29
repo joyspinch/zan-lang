@@ -117,12 +117,14 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **UI 驱动用合成事件，不用真实 OS 点击**：driver 的 `clickid` 在点击时刻
   解析命中区中心并注入，天然免疫窗口框偏移；hit id 只在**同一次构建的
   同一次运行内**有效（控件增删会整体移位），点击前当场 dump。
-- **ZanWeb 模板实机核对九坑**（2026-09-25 ListPage/FormPage/视觉重绘验证，每条都白折腾过一轮）：
+- **ZanWeb 模板实机核对坑清单**（2026-09-25 ListPage/FormPage/视觉重绘验证起，每条都白折腾过一轮）：
   ① 静态资产挂在 `/static/*`（`StaticFiles.Mount(app, "/static", "wwwroot")`），
   curl `/js/x.js` 拿到的是 API 层 `{"code":"404"}` JSON——不是"服务了旧文件"，
   先核对 URL 再怀疑缓存；② 改 wwwroot 的 JS/CSS 必须同步升布局模板
   里的 `?v=N`：资产响应带 `Cache-Control: max-age=3600`，浏览器缓存键含查询串，
-  只 reload 页面拿不到新 JS（新代码 "确认加载" 要看执行中的函数源码或版本参数）；
+  只 reload 页面拿不到新 JS（新代码 "确认加载" 要看执行中的函数源码或版本参数），
+  且版本号升级放在该轮资产编辑**全部完成之后**——先升 v 后再改 js，会以新版本号
+  缓存旧内容，之后怎么刷新都是旧的（2026-09-29 菜单图标不渲染即此故，再升一位才好）；
   ③ `app.exe start` 会 daemon 出脱离启动任务的 worker，杀后台任务杀不掉它——
   重建 exe 报 `Permission denied`、旧进程继续占端口继续服务旧视图，须
   `app.exe stop` **并按 netstat 确认监听端口 PID 已清**（stop 不干净时链接
@@ -143,7 +145,11 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   另：e2e 末轮 forgot 流程会把 admin 密码重置为 `newpass-e2e-123`，手动
   补测登录拿种子密码 admin1234 会误判"登录坏了"；⑩ 移动包内文件后
   必须全仓 grep 旧路径——构建测试注册里写死的源文件绝对路径漏改，
-  就报 `cannot open file` 白挂一轮才发现。
+  就报 `cannot open file` 白挂一轮才发现；⑪ 表单视图是"片段页"：
+  `/xxx/form?id=N` 返回裸 `<form>`（含 lay-footer 的取消/保存按钮，但无
+  head/link/script），css/js 全靠 data-dialog 弹窗注入宿主页后继承——
+  脱离弹窗直接 goto 片段 URL 验收，会拿到"样式不生效、页签点击无反应"的
+  假故障（2026-09-29 表设计器验收白走一轮），交互必须在宿主页弹窗语境测。
 - **共享工作树上的测试归责：先隔离再定责**。测试结果异常先查
   并发提交时间线（`git log --format="%h %ad %s" -3`）：共享树另一会话
   在途编辑 stdlib/编译器期间跑测试，产物混进 WIP 源，无关测试假挂假绿
