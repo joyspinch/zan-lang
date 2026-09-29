@@ -963,7 +963,9 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   - **虚表按需感知**：常量聚合溯源归属全局变量，未实例化的类虚方法不判定为存活，生成为单条 `unreachable`桩，切断数十万条未调用 stdlib 方法级联拉活。
 - **函数体 AST 发射后即刻丢弃与模块分片发射即刻销毁（A-MEM4）**：
   - **AST Body 即刻卸载铁律**：普通非泛型方法在生成完 LLVM IR 后，立即将其语法树置空（`member->method_decl.body = NULL;`），使数百万表达式 AST 节点生命周期不再延续至后端结束；注意必须保留 `Main` / `__DesignMain` 直至入口包装完成，避免入口函数生成为空导致 `globaldce` 将整个工程当做死代码清空。**特别注意：泛型特化发射（emit_method_spec_body）决不能清空 `member->method_decl.body`**！同一个泛型模板（如 `List<T>.Find`）可能被特化多次，首次置空会导致后续特化解引用 NULL 空指针触发 `0xC0000005`（Access Violation 崩溃，退出码 `-1073741819`）。
-  - **分片自适应默认激活**：分片发射（Module Sharding）不应依赖隐藏的环境变量 `ZAN_SHARD=1`（用户在 IDE 界面点击发布或命令行默认构建时无此变量），应在 native 目标（x86_64 / aarch64）的 `--publish` 发布构建下自适应默认开启（支持 `ZAN_NO_SHARD=1` / `ZAN_SHARD=0` 关闭）。当函数规模较小、规划分片数 `<= 1` 时自动跳过保持单模块，小工程零额外开销；超大项目（如 730 文件 OnePlus、534 文件 ZanIDE）自动切分 40+ 分片并即刻销毁，全局优化从 35 秒降至 10 秒，链接时间缩短 75%，主模块 Commit 常驻大幅下降。
+  - **分片发射即刻销毁与零文本膨胀（Module Sharding）**：
+    - **禁止整模块文本打印**：绝不可调用 `LLVMPrintModuleToString(g->mod)` 提取函数体！大型项目中 350 万条 IR 指令整块转字符串会在 LLVM 内部产生多次倍增扩容，额外强占数百兆堆内存，直接将全流程峰值凭空推高 302 MB（导致实测出现 1,481 MB 虚假峰值）；必须使用 LLVM 原生 API `LLVMPrintValueToString(fn)` 对待分片函数逐个流式打印，写完当前函数即刻 `LLVMDisposeMessage` 释放，全流程 0 全局文本膨胀、0 spans 结构体分配，将分片发射阶段的峰值死死焊死在 1,179 MB 以下。
+    - **分片自适应默认激活**：分片发射（Module Sharding）不应依赖隐藏的环境变量 `ZAN_SHARD=1`（用户在 IDE 界面点击发布或命令行默认构建时无此变量），应在 native 目标（x86_64 / aarch64）的 `--publish` 发布构建下自适应默认开启（支持 `ZAN_NO_SHARD=1` / `ZAN_SHARD=0` 关闭）。当函数规模较小、规划分片数 `<= 1` 时自动跳过保持单模块，小工程零额外开销；超大项目（如 730 文件 OnePlus、534 文件 ZanIDE）自动切分 40+ 分片并即刻销毁，全局优化从 35 秒降至 10 秒，链接时间缩短 75%，主模块 Commit 常驻大幅下降。
   - **标准库命名空间规范**：Zan 语言的标准库 GUI 库命名空间为 `using Gui;`，不存在 `using Zan.Gui` 或 `using Zan.Core;`。若用户代码误写，auto-stdlib 会将其当作第三方扩展包拉取并在找不到时报告 `ZANPKG_MISSING namespace=Zan/Gui`，最终因命名空间未定义在语义检查阶段报错。
   - **跨分片调用与数据布局**：分片间调用通过标准 external declare 降阶，全局变量按只读可复制（TRAVEL）与外部声明（DECL）清晰判定，带引号的 LLVM 结构体名（`%"..."`）必须在分片中完整导出对应类型声明，避免 Parse 失败；最终由 `lld-link` 将各分片 `.o` 统一链接。
 

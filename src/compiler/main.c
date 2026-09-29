@@ -5208,6 +5208,26 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (output_file) {
+        char out_dir[1024];
+        size_t olen = strlen(output_file);
+        if (olen < sizeof(out_dir)) {
+            memcpy(out_dir, output_file, olen + 1);
+            for (char *p = out_dir; *p; p++) {
+                if ((*p == '/' || *p == '\\') && p > out_dir) {
+                    char sep = *p;
+                    *p = '\0';
+#ifdef _WIN32
+                    CreateDirectoryA(out_dir, NULL);
+#else
+                    mkdir(out_dir, 0755);
+#endif
+                    *p = sep;
+                }
+            }
+        }
+    }
+
     /* Pre-optimization Module Sharding: split eligible bodies into separate
      * objects, compile and immediately dispose their temporary LLVM modules,
      * then delete moved bodies from the coordinator before the heavy global

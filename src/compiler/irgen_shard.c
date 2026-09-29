@@ -756,9 +756,32 @@ static LLVMTargetMachineRef sh_make_tm(sh_state_t *st) {
     return tm;
 }
 
+static void sh_ensure_parent_dir(const char *path) {
+    if (!path) return;
+    char dir[1024];
+    size_t len = strlen(path);
+    if (len >= sizeof(dir)) return;
+    memcpy(dir, path, len + 1);
+    char *p = dir;
+    while (*p) {
+        if ((*p == '/' || *p == '\\') && p > dir) {
+            char sep = *p;
+            *p = '\0';
+#ifdef _WIN32
+            CreateDirectoryA(dir, NULL);
+#else
+            mkdir(dir, 0755);
+#endif
+            *p = sep;
+        }
+        p++;
+    }
+}
+
 static bool sh_emit_one(sh_state_t *st, sh_sbuf_t *frag, LLVMTargetMachineRef tm,
                         const char *path, char *errbuf, size_t errsz) {
     zan_irgen_t *g = st->g;
+    sh_ensure_parent_dir(path);
     const char *dump = getenv("ZAN_SHARD_DUMP");
     if (dump && *dump) {
         FILE *df = fopen(dump, "wb");
@@ -1155,22 +1178,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     objs = (char **)calloc((size_t)nshard, sizeof(*objs));
     if (!objs) { snprintf(st.reason, sizeof(st.reason), "out of memory"); st.failed = true; }
 
-    /* one whole-module print; member bodies are carved out of this text */
-    sh_probe_mem("before print_mod");
-    char *modtxt = st.failed ? NULL : LLVMPrintModuleToString(g->mod);
-    sh_probe_mem("after print_mod");
-    int nspans = 0;
-    sh_span_t *spans = modtxt ? sh_index_module_text(modtxt, &nspans) : NULL;
-    sh_probe_mem("after index_spans");
-    if (!spans) {
-        snprintf(st.reason, sizeof(st.reason),
-                 "module text index failed");
-        st.failed = true;
-    } else {
-        SH_TRACE("module text: %d bytes, %d defines\n",
-                 (int)strlen(modtxt), nspans);
-    }
-
     for (int s = 0; s < nshard && !st.failed; s++) {
         SH_TRACE("shard %d: assembling\n", s);
         sh_sbuf_t bodies = {0}, gdecls = {0}, types = {0}, frag = {0};
@@ -1225,32 +1232,31 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                     sh_map_free(&refs.body_done);
                     if (!ok) break;
                 }
-                const sh_span_t *span =
-                    sh_span_find(spans, nspans, LLVMGetValueName(fn));
-                if (!span || !span->len) {
-                    sh_fail(&st, "body '%s' missing from module text",
-                            LLVMGetValueName(fn));
+                char *fntxt = LLVMPrintValueToString(fn);
+                if (!fntxt) {
+                    sh_fail(&st, "body '%s' print failed", LLVMGetValueName(fn));
                     ok = false;
                     break;
                 }
                 /* comdat/alias can only appear on the define header line */
                 {
-                    const char *hdr = modtxt + span->off;
-                    const char *hnl = strchr(hdr, '\n');
-                    size_t hlen = hnl ? (size_t)(hnl - hdr) : 0;
+                    const char *hnl = strchr(fntxt, '\n');
+                    size_t hlen = hnl ? (size_t)(hnl - fntxt) : strlen(fntxt);
                     char hbuf[4096];
                     if (hlen >= sizeof(hbuf)) hlen = sizeof(hbuf) - 1;
-                    memcpy(hbuf, hdr, hlen);
+                    memcpy(hbuf, fntxt, hlen);
                     hbuf[hlen] = '\0';
                     if (strstr(hbuf, " comdat($")) {
                         sh_fail(&st, "body '%s' carries comdat",
                                 LLVMGetValueName(fn));
+                        LLVMDisposeMessage(fntxt);
                         ok = false;
                         break;
                     }
                 }
-                sh_sb_putn(&bodies, modtxt + span->off, span->len);
+                sh_sb_puts(&bodies, fntxt);
                 sh_sb_puts(&bodies, "\n");
+                LLVMDisposeMessage(fntxt);
             }
             free(mbrs);
         }
@@ -1375,15 +1381,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         sh_map_free(&st.type_done);
         st.type_done.keys = NULL; st.type_done.vals = NULL;
         free(bodies.p); free(gdecls.p); free(types.p); free(frag.p);
-    }
-
-    if (spans) {
-        for (int i = 0; i < nspans; i++) free(spans[i].name);
-        free(spans);
-    }
-    if (modtxt) {
-        LLVMDisposeMessage(modtxt);
-        sh_probe_mem("after modtxt free");
     }
 
     if (st.failed) {
