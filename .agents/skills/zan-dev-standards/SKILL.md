@@ -157,7 +157,7 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   LISTEN 但请求 000 超时（连接进 backlog 无人应答，两实例先后中招），
   刷视图/配置一律 stop+start；master+worker 常驻时 exe 被运行进程占用，
   zanc 链接 `app.exe` 报 Permission denied，先 stop 并 netstat 复核再编
-  （2026-09-29 SSE 30s 断流修复部署即踩）；⑬ 浏览器整页截图连续超时（30s 连发）先 DOM 快照确认页面没坏再改 clip 小区域出图——是取帧层不稳，不是页面坏了（2026-09-29 仪表盘验收 3 连超时，裁剪即出图）；⑭ 路由按注册串精确匹配，Route("/admin") 不收 /admin/ 尾斜杠——goto 得 {"code":"404"} JSON 先核尾斜杠再怀疑服务挂了；⑮ 浏览器窗口级截屏会把旁边开着的窗口拍进同一张图，图上出现"第二个应用副本/双份侧栏"≠DOM 有两个壳——先 elementFromPoint 或壳计数定真相再动手（2026-09-29 coder 页验收把邻窗 8123 误读成页面复制体）；⑯ CSS 表格自动布局里 td/th 的 width 只是建议，列位紧张时被压到内容宽（zt-cell 定宽 36 被压到 13，勾选列贴死相邻列）——定宽列必须配 min-width 才是硬下限；overflow 容器裁剪绘制但 getBoundingClientRect 仍报全宽，量"是否溢出"要看 scrollWidth>clientWidth 或视觉，别信 rect（2026-09-29 窄视口审计 zt-cell 压缩 + 部门/知识库两页 rect 误报）。
+  （2026-09-29 SSE 30s 断流修复部署即踩）；⑬ 浏览器整页截图连续超时（30s 连发）先 DOM 快照确认页面没坏再改 clip 小区域出图——是取帧层不稳，不是页面坏了（2026-09-29 仪表盘验收 3 连超时，裁剪即出图）；⑭ 路由按注册串精确匹配，Route("/admin") 不收 /admin/ 尾斜杠——goto 得 {"code":"404"} JSON 先核尾斜杠再怀疑服务挂了；⑮ 浏览器窗口级截屏会把旁边开着的窗口拍进同一张图，图上出现"第二个应用副本/双份侧栏"≠DOM 有两个壳——先 elementFromPoint 或壳计数定真相再动手（2026-09-29 coder 页验收把邻窗 8123 误读成页面复制体）；⑯ CSS 表格自动布局里 td/th 的 width 只是建议，列位紧张时被压到内容宽（zt-cell 定宽 36 被压到 13，勾选列贴死相邻列）——定宽列必须配 min-width 才是硬下限；overflow 容器裁剪绘制但 getBoundingClientRect 仍报全宽，量"是否溢出"要看 scrollWidth>clientWidth 或视觉，别信 rect（2026-09-29 窄视口审计 zt-cell 压缩 + 部门/知识库两页 rect 误报）；⑰ grid 子项的 margin-bottom 参与轨道行高——为去双倍间距把它清零，会把"最后一行卡片借给容器的 12px"一起清掉，网格之间归零贴死；块级兄弟的纵向节奏要给唯一来源 `.parent > * + * { margin-top }`（与卡片残留 margin-bottom 自动折叠取一份），修一处别再靠多层 margin 叠加（2026-09-29 监控页网格间 0 间距回归）。
 - **共享工作树上的测试归责：先隔离再定责**。smoke/e2e 结果异常先查
   并发提交时间线（`git log --format="%h %ad %s" -3`）：共享树另一会话
   在途编辑 stdlib/编译器期间跑测试，产物混进 WIP 源，无关测试假挂假绿
