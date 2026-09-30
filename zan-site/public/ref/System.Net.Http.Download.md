@@ -1,6 +1,6 @@
 # System.Net.Http.Download
 
-> 源码: `stdlib/System/Net/Http/Download/DownloadJob.zan`
+> 源码: `packages/Zan.Net/src/System/Net/Http/Download/DownloadJob.zan`
 
 
 ## DownloadItem (class)

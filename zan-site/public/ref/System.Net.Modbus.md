@@ -1,6 +1,6 @@
 # System.Net.Modbus
 
-> 源码: `stdlib/System/Net/Modbus/ModbusClient.zan`
+> 源码: `packages/Zan.Net/src/System/Net/Modbus/ModbusClient.zan`
 
 
 ## ModbusClient (class)

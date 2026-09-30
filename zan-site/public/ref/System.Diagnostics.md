@@ -1,6 +1,6 @@
 # System.Diagnostics
 
-> 源码: `stdlib/System/Diagnostics/Log.zan`, `stdlib/System/Diagnostics/Privileges.zan`, `stdlib/System/Diagnostics/Process.zan`, `stdlib/System/Diagnostics/ProcessControl.zan`, `stdlib/System/Diagnostics/ProcessHost.zan`, `stdlib/System/Diagnostics/ProcessList.zan`, `stdlib/System/Diagnostics/ServerMetrics.zan`
+> 源码: `packages/Zan.Diagnostics/src/System/Diagnostics/Log.zan`, `packages/Zan.Diagnostics/src/System/Diagnostics/Privileges.zan`, `packages/Zan.Diagnostics/src/System/Diagnostics/Process.zan`, `packages/Zan.Diagnostics/src/System/Diagnostics/ProcessControl.zan`, `packages/Zan.Diagnostics/src/System/Diagnostics/ProcessHost.zan`, `packages/Zan.Diagnostics/src/System/Diagnostics/ProcessList.zan`, `packages/Zan.Diagnostics/src/System/Diagnostics/ServerMetrics.zan`
 
 
 ## ErrEntry (class)

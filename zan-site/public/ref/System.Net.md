@@ -1,6 +1,6 @@
 # System.Net
 
-> 源码: `stdlib/System/Net/Net.zan`, `stdlib/System/Net/NetworkInterface.zan`, `stdlib/System/Net/Ping.zan`, `stdlib/System/Net/ServerBanner.zan`, `stdlib/System/Net/Worker.Mqtt.zan`, `stdlib/System/Net/Worker.Sse.zan`, `stdlib/System/Net/Worker.Ws.zan`, `stdlib/System/Net/Worker.zan`
+> 源码: `packages/Zan.Net/src/System/Net/Net.zan`, `packages/Zan.Net/src/System/Net/NetworkInterface.zan`, `packages/Zan.Net/src/System/Net/Ping.zan`, `packages/Zan.Net/src/System/Net/ServerBanner.zan`, `packages/Zan.Net/src/System/Net/Worker.Mqtt.zan`, `packages/Zan.Net/src/System/Net/Worker.Sse.zan`, `packages/Zan.Net/src/System/Net/Worker.Ws.zan`, `packages/Zan.Net/src/System/Net/Worker.zan`
 
 
 ## BannerService (class)

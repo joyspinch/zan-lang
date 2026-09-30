@@ -1,6 +1,6 @@
 # System.Net.Http.Proxy
 
-> 源码: `stdlib/System/Net/Http/Proxy/HttpForwarder.zan`
+> 源码: `packages/Zan.Net/src/System/Net/Http/Proxy/HttpForwarder.zan`
 
 
 ## FwdChannel (class)

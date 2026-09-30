@@ -1,6 +1,6 @@
 # System.Net.Coap
 
-> 源码: `stdlib/System/Net/Coap/CoapClient.zan`
+> 源码: `packages/Zan.Net/src/System/Net/Coap/CoapClient.zan`
 
 
 ## CoapClient (class)

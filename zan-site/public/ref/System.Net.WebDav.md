@@ -1,6 +1,6 @@
 # System.Net.WebDav
 
-> 源码: `stdlib/System/Net/WebDav/WebDavClient.zan`
+> 源码: `packages/Zan.Net/src/System/Net/WebDav/WebDavClient.zan`
 
 
 ## WebDavClient (class)

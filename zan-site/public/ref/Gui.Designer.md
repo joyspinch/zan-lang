@@ -345,6 +345,13 @@ signal 订阅、运行期动态状态不在文档模型里（本来也存不进�
 - void EndCtrlZoom(App app)
   - 退出真控件等比缩放：从基线精确还原主题度量与 app.dpiScale。
 
+- void PvPreviewClick(App app, int ox, int oy, int psMilli)
+  - 预览态画布点击的事件分发反馈（B-ID21）：命中字段若声明了
+    事件绑定，状态条闪现 "事件 → 处理器名"（优先 Click，其次
+    第一条声明），与真控件预览树的绑定分发走同一 PvFlash。
+    仿画字段没有活命中区，这一层点击命中就是它们的预览分发；
+    组件引用字段由接线后的真控件树自己分发，这里跳过。
+
 - bool PvBasic(App app, FormField f, int x, int y, int w, int avail, int line)
   - 基础输入控件（输入/多行/密码/数字/下拉/开关/评分/滑块）用
     FormBuilder 构造的真控件渲染预览，取代仿画，使设计与运行完全
@@ -1127,11 +1134,25 @@ signal 订阅、运行期动态状态不在文档模型里（本来也存不进�
     落到目标控件（预览树按组件文档原名查找）。实例值存
     f.extra 的 "props" 直通对象。
 
-- Control PvCompCtl(FormField f, int w, int h)
+- Control PvCompCtl(App app, FormField f, int w, int h)
   - 引用节点画布预览的构建缓存：组件文档只在代次变化时
     重建（SetUserComponents / 尺寸变化 / 实例属性变化），
     其余帧复用整棵 FormBuilder 树只重渲染。找不到组件或
-    解析失败返回 null，调用方退回占位块。
+    解析失败返回 null，调用方退回占位块。新构建的树按声明
+    接线预览分发（B-ID21），缓存命中直接复用已接线的树。
+
+- void WirePreviewEvents(App app, Control root)
+  - 给预览真控件树按声明绑定分发反馈（B-ID21）：ChildWindow.
+    WireNode 的设计器版——处理器名没有注册表可解析，改成状态条
+    闪现反馈。基类 FireCommon 只给有订阅的控件注册命中区
+    （`!On.Any()` 即返回），所以绑定本身就让"点了没反应"的
+    声明控件变成可点的活预览。闭包按迭代捕获（B-ID33 语义），
+    循环内绑定各拿各的 evt/hn。
+
+- void PvFlash(App app, string evt, string hname, Control sender)
+  - 预览态事件分发反馈：状态条闪现 "事件 → 处理器名"，sender
+    非空时附控件种类。预览里声明的处理器没有真身可调，这条
+    反馈本身就是"这里会触发"的所见即所得。
 
 - void AddCustomField(string kind)
   - 添加运行期注册（HeavyControls）的自定义组件

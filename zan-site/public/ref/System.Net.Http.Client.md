@@ -1,6 +1,6 @@
 # System.Net.Http.Client
 
-> 源码: `stdlib/System/Net/Http/Client/CookieJar.zan`, `stdlib/System/Net/Http/Client/HttpClient.zan`, `stdlib/System/Net/Http/Client/SseSink.zan`
+> 源码: `packages/Zan.Net/src/System/Net/Http/Client/CookieJar.zan`, `packages/Zan.Net/src/System/Net/Http/Client/HttpClient.zan`, `packages/Zan.Net/src/System/Net/Http/Client/SseSink.zan`
 
 
 ## Cookie (class)

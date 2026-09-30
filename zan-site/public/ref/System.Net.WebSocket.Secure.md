@@ -1,6 +1,6 @@
 # System.Net.WebSocket.Secure
 
-> 源码: `stdlib/System/Net/WebSocket/Secure/WssClient.zan`, `stdlib/System/Net/WebSocket/Secure/WssServer.zan`
+> 源码: `packages/Zan.Net/src/System/Net/WebSocket/Secure/WssClient.zan`, `packages/Zan.Net/src/System/Net/WebSocket/Secure/WssServer.zan`
 
 
 ## WssClient (class)

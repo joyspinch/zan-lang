@@ -1,6 +1,6 @@
 # System.Net.Sip
 
-> 源码: `stdlib/System/Net/Sip/SipClient.zan`, `stdlib/System/Net/Sip/SipMessage.zan`
+> 源码: `packages/Zan.Net/src/System/Net/Sip/SipClient.zan`, `packages/Zan.Net/src/System/Net/Sip/SipMessage.zan`
 
 
 ## SipClient (class)

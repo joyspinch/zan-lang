@@ -1,6 +1,6 @@
 # System.Net.Sse
 
-> 源码: `stdlib/System/Net/Sse/Sse.zan`
+> 源码: `packages/Zan.Net/src/System/Net/Sse/Sse.zan`
 
 
 ## SseClient (class)

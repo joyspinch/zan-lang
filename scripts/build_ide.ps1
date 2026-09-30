@@ -107,6 +107,21 @@ if (Test-Path packages\Zan.Diagnostics) {
 if (Test-Path packages\Zan.Text) {
     $files += (Get-ChildItem packages\Zan.Text\src -Recurse -Include *.zan).FullName
 }
+if (Test-Path packages\Zan.Linq) {
+    $files += (Get-ChildItem packages\Zan.Linq\src -Recurse -Include *.zan).FullName
+}
+if (Test-Path packages\Zan.Scripting) {
+    $files += (Get-ChildItem packages\Zan.Scripting\src -Recurse -Include *.zan).FullName
+}
+if (Test-Path packages\Zan.Knowledge) {
+    $files += (Get-ChildItem packages\Zan.Knowledge\src -Recurse -Include *.zan).FullName
+}
+if (Test-Path packages\Zan.Globalization) {
+    $files += (Get-ChildItem packages\Zan.Globalization\src -Recurse -Include *.zan).FullName
+}
+if (Test-Path packages\Zan.Resources) {
+    $files += (Get-ChildItem packages\Zan.Resources\src -Recurse -Include *.zan).FullName
+}
 # System pieces the editor/workspace rely on.
 $files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")

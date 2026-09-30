@@ -1,6 +1,6 @@
 # System.Net.Mqtt
 
-> 源码: `stdlib/System/Net/Mqtt/MqttBroker.zan`, `stdlib/System/Net/Mqtt/MqttClient.zan`, `stdlib/System/Net/Mqtt/MqttReader.zan`, `stdlib/System/Net/Mqtt/MqttSharedBus.zan`
+> 源码: `packages/Zan.Net/src/System/Net/Mqtt/MqttBroker.zan`, `packages/Zan.Net/src/System/Net/Mqtt/MqttClient.zan`, `packages/Zan.Net/src/System/Net/Mqtt/MqttReader.zan`, `packages/Zan.Net/src/System/Net/Mqtt/MqttSharedBus.zan`
 
 
 ## MqttBroker (class)
@@ -324,69 +324,6 @@ int d = await c.DisconnectAsync();
     clean session 标志、遗嘱标志与载荷、keepAlive 秒数与 client id。
 
 
-## MqttClientDetailDoc (class)
-
-单个客户端的完整快照（含订阅列表）。
-
-- int id;
-
-- string client_id;
-
-- string addr;
-
-- int connected_at;
-
-- int msgs_in;
-
-- int msgs_out;
-
-- List<MqttSubDoc> subscriptions;
-
-
-## MqttClientDoc (class)
-
-已连接客户端的管理快照条目。
-
-- int id;
-
-- string client_id;
-
-- string addr;
-
-- int connected_at;
-
-- int keepalive;
-
-- int subs;
-
-- int msgs_in;
-
-- int msgs_out;
-
-
-## MqttMetricsDoc (class)
-
-broker 吞吐量快照（对应 MetricsJson 输出结构）。
-
-- int uptime_sec;
-
-- int clients_connected;
-
-- int clients_total;
-
-- int subscriptions;
-
-- int topics;
-
-- int messages_in;
-
-- int messages_out;
-
-- int bytes_in;
-
-- int bytes_out;
-
-
 ## MqttPacket (class)
 
 表示一个解码完成的完整 MQTT 报文。
@@ -604,26 +541,6 @@ broker 持有的单个已连接 MQTT 客户端会话：其套接字、客户端 
     完成并释放（与 WsSharedBus.Stop 同一收尾定式）。
 
 
-## MqttSubDoc (class)
-
-订阅条目（管理快照用）。
-
-- string filter;
-
-- int qos;
-
-
-## MqttSubEntryDoc (class)
-
-订阅平铺条目（客户端 id + 过滤器 + QoS）。
-
-- string client_id;
-
-- string filter;
-
-- int qos;
-
-
 ## MqttSubscription (class)
 
 会话订阅的主题过滤器及授予的 QoS 实体记录。
@@ -633,17 +550,6 @@ broker 持有的单个已连接 MQTT 客户端会话：其套接字、客户端 
 - int qos;
 
 - MqttSubscription(string filter, int qos)
-
-
-## MqttTopicDoc (class)
-
-已见主题：名称、消息计数、最后一条负载。
-
-- string topic;
-
-- int messages;
-
-- string last;
 
 
 ## MqttTopicStat (class)

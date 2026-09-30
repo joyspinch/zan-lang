@@ -1,6 +1,6 @@
 # System.Net.Https
 
-> 源码: `stdlib/System/Net/Https/HttpsServer.zan`
+> 源码: `packages/Zan.Net/src/System/Net/Https/HttpsServer.zan`
 
 
 ## HttpsServer (class)

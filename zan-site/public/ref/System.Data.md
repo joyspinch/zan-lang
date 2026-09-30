@@ -630,6 +630,9 @@ KingbaseES/人大金仓, Vastbase, GaussDB, QuestDB) via libpq.
 - bool HasRows()
   - 检查结果集是否包含行。
 
+- DbRow RowAt(int index)
+  - 返回指定索引处的只读行实体（零列表克隆，大数据量循环极速读取推荐）。
+
 - List<string> GetRow(int index)
   - 将整行作为字符串列表返回（内部行的副本）。
 
@@ -650,6 +653,27 @@ KingbaseES/人大金仓, Vastbase, GaussDB, QuestDB) via libpq.
 - List<bool> nulls;
 
 - DbRow(List<string> values, List<bool> nulls)
+
+- int Count()
+  - 返回该行的字段总数。
+
+- string GetString(int col)
+  - 获取指定列索引处的字符串值。
+
+- bool IsNull(int col)
+  - 指定列是否为 SQL NULL。
+
+- int GetInt(int col)
+  - 获取指定列索引处的整数值。
+
+- long GetLong(int col)
+  - 获取指定列索引处的 64 位整数值。
+
+- double GetDouble(int col)
+  - 获取指定列索引处的双精度浮点值。
+
+- bool GetBool(int col)
+  - 获取指定列索引处的布尔值。
 
 
 ## DbTrace (class)

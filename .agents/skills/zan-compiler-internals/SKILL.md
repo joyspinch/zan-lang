@@ -2750,3 +2750,7 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   同构代码里同样存在；循环前先剥一个尾分隔符。
 - 验证定式：数据表类拆包**必须探针查表**（中文输入→查音），ASCII 直通
   （Pinyin("zhongwen")=="zhongwen"）不触发数据链，测了等于没测。
+- 探针里的内建类型**不走全限定名**：BT 注册的内建类型（Console 等，
+  builtin_api.c 成员表）不进命名空间解析的限定名回退，`System.Console.WriteLine(..)`
+  直接报 "'Console' is not a known variable, type, or namespace"（2026-10-01
+  真空门探针踩过，白白烧一轮编译）；探针一律 `using System;` + 裸名形态。

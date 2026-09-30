@@ -14,13 +14,15 @@
 | `ProcessList.zan` | 系统进程枚举（ProcessEntry） |
 | `ProcessHost.zan` | 常驻子进程宿主（保活与重启） |
 | `Privileges.zan` | 特权检查（管理员/提权探测） |
+| `ServiceProcess.zan` | Windows 服务集成（SCM 状态码快照：查询/状态/PID） |
 
 ## 消费者
 
 - `Zan.Data`（DbTrace 日志）、`Zan.Desktop`（多处进程/窗口探测）、
   `Zan.AppUpdate`（更新进度日志）
 - stdlib 内 `System.Web`（WebApp/HttpContext 监控与错误落盘）、
-  `System.Scripting`（Lua 宿主）、`System.ServiceProcess`
+  `System.Scripting` 已随 `Zan.Scripting` 包迁出（Lua 宿主用 Log）
+- `examples/input/service_task_demo.zan`、conformance `win_serviceprocess_smoke.zan`
 - ZanIDE（编辑器内派生工具进程）
 
 ## 不在包内

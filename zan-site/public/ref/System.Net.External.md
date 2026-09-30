@@ -1,6 +1,6 @@
 # System.Net.External
 
-> 源码: `stdlib/System/Net/External/ExternalCallPolicy.zan`, `stdlib/System/Net/External/ExternalTarget.zan`, `stdlib/System/Net/External/ExternalTargetPolicy.zan`
+> 源码: `packages/Zan.Net/src/System/Net/External/ExternalCallPolicy.zan`, `packages/Zan.Net/src/System/Net/External/ExternalTarget.zan`, `packages/Zan.Net/src/System/Net/External/ExternalTargetPolicy.zan`
 
 
 ## ExternalCallPolicy (class)

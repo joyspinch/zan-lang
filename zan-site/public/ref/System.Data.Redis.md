@@ -175,11 +175,32 @@ NUL 字节的值可原样返回（使用 RedisReply.len）。命令
 - async int DelAsync(string key)
   - DEL key。返回被删除的键数（0 或 1）。
 
+- async int DelMultipleAsync(List<string> keys)
+  - DEL 批量删除多个键。返回被成功删除的键数量。
+
 - async int ExistsAsync(string key)
   - EXISTS key。键存在返回 1，否则返回 0。
 
 - async int IncrAsync(string key)
-  - INCR key。返回自增后的值。
+  - INCR key。返回自增后的值（32 位）。
+
+- async long Incr64Async(string key)
+  - INCR key。返回自增后的 64 位值，杜绝 20 亿计数溢出。
+
+- async long IncrByAsync(string key, long amount)
+  - INCRBY key amount。按指定的 64 位增量自增，返回新值。
+
+- async long Decr64Async(string key)
+  - DECR key。返回自减后的 64 位值。
+
+- async long DecrByAsync(string key, long amount)
+  - DECRBY key amount。按指定的 64 位减量自减，返回新值。
+
+- async List<string> MGetAsync(List<string> keys)
+  - MGET 批量获取多个键对应的值（支持大数据量批量获取）。不存在的键在列表中表现为空字符串。
+
+- async bool MSetAsync(List<string> keys, List<string> vals)
+  - MSET 批量设置多个键值对。收到 +OK 返回 true。
 
 - async int ExpireAsync(string key, int seconds)
   - EXPIRE key seconds。设置成功返回 1。
@@ -282,6 +303,8 @@ NUL 字节时，用它代替 <c>str.Length</c>（二进制安全）。
 
 - int integer;
 
+- long integer64;
+
 - List<RedisReply> items;
 
 - RedisReply()
@@ -303,6 +326,9 @@ NUL 字节时，用它代替 <c>str.Length</c>（二进制安全）。
 
 - int AsInt()
   - 返回整数负载（非整数类型返回 0）。
+
+- long AsLong()
+  - 返回 64 位长整数负载（非整数类型尝试从字符串转换，非法返回 0）。
 
 - int Count()
   - ARRAY 回复的元素数量（否则为 0）。

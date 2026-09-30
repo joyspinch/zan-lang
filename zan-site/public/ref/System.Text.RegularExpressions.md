@@ -1,6 +1,6 @@
 # System.Text.RegularExpressions
 
-> 源码: `stdlib/System/Text/RegularExpressions/Match.zan`, `stdlib/System/Text/RegularExpressions/Regex.zan`, `stdlib/System/Text/RegularExpressions/RegexProgram.zan`
+> 源码: `packages/Zan.Text/src/System/Text/RegularExpressions/Match.zan`, `packages/Zan.Text/src/System/Text/RegularExpressions/Regex.zan`, `packages/Zan.Text/src/System/Text/RegularExpressions/RegexProgram.zan`
 
 
 ## Match (class)

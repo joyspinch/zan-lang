@@ -1,6 +1,6 @@
 # System.Net.Sockets
 
-> 源码: `stdlib/System/Net/Sockets/AsyncSocket.zan`, `stdlib/System/Net/Sockets/Socket.zan`, `stdlib/System/Net/Sockets/TcpClient.zan`, `stdlib/System/Net/Sockets/TcpListener.zan`, `stdlib/System/Net/Sockets/UdpClient.zan`
+> 源码: `packages/Zan.Net/src/System/Net/Sockets/AsyncSocket.zan`, `packages/Zan.Net/src/System/Net/Sockets/Socket.zan`, `packages/Zan.Net/src/System/Net/Sockets/TcpClient.zan`, `packages/Zan.Net/src/System/Net/Sockets/TcpListener.zan`, `packages/Zan.Net/src/System/Net/Sockets/UdpClient.zan`
 
 
 ## AsyncSocket (class)

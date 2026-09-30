@@ -826,6 +826,9 @@ SQL 文本。name 是来源参数名（回填分页链接用，可空）。
 - void WhereIn(string c, List<long> vs)
   - `WhereIn` 的 long 版本。
 
+- void WhereIn(string c, List<string> vs)
+  - `WhereIn` 的 string 版本。
+
 - void WhereNone()
   - 恒假条件：数据边界为空集时用它表达"一行都不许删"。
 
@@ -1060,18 +1063,33 @@ Only/Skip 决定的列集合在运行期成形，upsert 子句按方言拼装。
   - 冲突子句。键列缺省取实体主键；方言差异
     （excluded 对 VALUES()、GREATEST 对 max）在 OrmDialect 里解决。
 
-- int BuildDicts()
-  - 动态列写入：所有行按第一行的列形状对齐，缺的列写
+- int BuildDictsRange(int start, int count)
+  - 动态列写入（指定行范围）：所有行按第一行的列形状对齐，缺的列写
     NULL，值按列声明类型绑定。
+
+- int BuildDicts()
+  - 动态列写入：全量行按第一行的列形状对齐。
+
+- int BuildRowsRange(int start, int count)
+  - 实体行写入（指定行范围）：列集合成形一次，每行按同一集合绑定。
 
 - int BuildRows()
   - 实体行写入：列集合成形一次，每行按同一集合绑定。
 
+- int safeBatchRows(int colCount)
+  - 计算当前数据库引擎下安全的分批行数，防止超大批量参数溢出与 SQL 膨胀。
+
 - int ExecuteDicts()
-  - 执行动态列 INSERT，返回受影响行数。
+  - 执行动态列 INSERT，返回受影响行数。超大批量时自动分批执行，防止参数超限。
 
 - async int ExecuteDictsAsync()
-  - 异步执行动态列 INSERT。
+  - 异步执行动态列 INSERT。超大批量时自动分批执行。
+
+- int ExecuteRows()
+  - 执行实体行 INSERT，返回受影响行数。超大批量时自动分批执行。
+
+- async int ExecuteRowsAsync()
+  - 异步执行实体行 INSERT。超大批量时自动分批执行。
 
 - int ExecuteAffrows()
   - 执行插入（动态列优先，否则实体行），返回受影响行数。
@@ -1366,6 +1384,9 @@ Only/Skip 决定的列集合在运行期成形，upsert 子句按方言拼装。
 - void tail(StringBuilder sb)
   - 把 WHERE/GROUP BY/HAVING/ORDER BY 片段追加到 SELECT 文本之后。
 
+- void appendLimitOffset(StringBuilder sb)
+  - 追加 LIMIT/OFFSET 或 OFFSET/FETCH 分页子句（按数据库方言）。
+
 - string BuildSelect()
   - 实体行的 SELECT。分页写法按方言：SQL Server/Oracle 用
     OFFSET ... FETCH（且必须有 ORDER BY）。
@@ -1380,7 +1401,7 @@ Only/Skip 决定的列集合在运行期成形，upsert 子句按方言拼装。
   - 单列/投影的 SELECT（分页在 DTO 版里按 LIMIT/OFFSET）。
 
 - string BuildDto(string cols)
-  - 投影 SELECT 的语句文本（固定 LIMIT/OFFSET 分页写法）。
+  - 投影 SELECT 的语句文本（按数据库方言分页）。
 
 - List<string> MapCol(DbResult r)
   - 把结果集第一列抽成字符串列表。
@@ -1403,7 +1424,7 @@ Only/Skip 决定的列集合在运行期成形，upsert 子句按方言拼装。
 - string BuildCount()
   - 分组后的行数：分组键上的 COUNT 要套一层子查询。
     派生表必须带别名——MySQL/PostgreSQL/SQL Server 对无别名
-    的子查询直接报语法错。
+    的子查询直接报语法错；Oracle 不允许 AS 关键字。
 
 - string BuildAgg(string expr)
   - 聚合 SELECT 的语句文本（表达式如 "COUNT(*)"、"SUM(t.n)"），
@@ -1589,6 +1610,9 @@ CodeFirst：缺表建表、缺列加列、缺索引补索引。DDL 从实体元�
 
 - void WhereIn(string c, List<long> vs)
   - `WhereIn` 的 long 版本。
+
+- void WhereIn(string c, List<string> vs)
+  - `WhereIn` 的 string 版本。
 
 - void WhereNone()
   - 恒假条件：数据边界为空集时用它表达"一行都不许动"。

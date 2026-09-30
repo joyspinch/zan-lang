@@ -1,6 +1,6 @@
 # System.Text
 
-> 源码: `stdlib/System/Text/Bm25Index.zan`, `stdlib/System/Text/Csv.zan`, `stdlib/System/Text/Encoding.zan`, `stdlib/System/Text/FuzzyMatching.zan`, `stdlib/System/Text/Markdown.zan`, `stdlib/System/Text/Pinyin.zan`, `stdlib/System/Text/Template.zan`, `stdlib/System/Text/TextTable.zan`
+> 源码: `packages/Zan.Text/src/System/Text/Bm25Index.zan`, `packages/Zan.Text/src/System/Text/Csv.zan`, `packages/Zan.Text/src/System/Text/FuzzyMatching.zan`, `packages/Zan.Text/src/System/Text/Markdown.zan`, `packages/Zan.Text/src/System/Text/Pinyin.zan`, `packages/Zan.Text/src/System/Text/Template.zan`, `packages/Zan.Text/src/System/Text/TextTable.zan`, `stdlib/System/Text/Encoding.zan`
 
 
 ## Bm25Document (class)
