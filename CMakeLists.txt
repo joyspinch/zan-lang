@@ -2105,6 +2105,25 @@ add_test(NAME conformance_nsresolve_ancestor
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(conformance_nsresolve_ancestor PROPERTIES TIMEOUT 120)
 
+# ---- Generator-child package isolation: the nested --no-gen generator
+#      build runs with --no-packages, because package files skip the
+#      pull-in live-name gate and a package carrying generator-magic calls
+#      (Json.Serialize) cannot resolve there. The case's own unreferenced
+#      JsonBoom package keeps parent-side non-interference covered; the
+#      child-isolation behavior stays pinned by the repo's own packages
+#      (Zan.Mvc/Zan.Gui/Zan.Sdk.Jd all carry Json.Serialize calls), which
+#      poisoned every such compile pre-fix. ----
+add_test(NAME conformance_gen_pkg_isolation
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/gen_pkg_isolation/main.zan
+    -DZANC_ARGS=--auto-stdlib
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gen_pkg_isolation/expected.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gen_pkg_isolation${_exe_ext}
+    -DWORKDIR=${CMAKE_SOURCE_DIR}/tests/conformance/gen_pkg_isolation
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gen_pkg_isolation PROPERTIES TIMEOUT 120)
+
 # ---- Response file: `zanc @file` takes its arguments from a file, so a
 #      whole-project build is not capped by the shell's command-line limit
 #      (cmd.exe truncates at 8191 characters). ----

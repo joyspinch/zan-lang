@@ -312,6 +312,8 @@
 
 - static async int Flush()
 
+- static async void FlushAtExit()
+
 - static async void Sweep(IDbConnection db)
 
 - static async List<MetricSql> SqlTotals(long from, long to, int limit, string rank)

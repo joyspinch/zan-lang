@@ -799,7 +799,8 @@ static int auto_include_namespace(const char *stdlib_root, const char *subdir,
     found = found || package_count > 0;
     /* `using System;` imports compiler/runtime core names rather than a
      * marketplace namespace; it must never become an install suggestion. */
-    if (!found && strcmp(subdir, "System") != 0 &&
+    if (!found && package_project_root[0] != '\0' &&
+        strcmp(subdir, "System") != 0 &&
         !project_namespace_declared(subdir)) {
         fprintf(stderr, "ZANPKG_MISSING namespace=%s\n", subdir);
         missing_namespace_count++;
@@ -2609,7 +2610,8 @@ static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
     found = found || package_count > 0;
     /* `using System;` imports compiler/runtime core names rather than a
      * marketplace namespace; it must never become an install suggestion. */
-    if (!found && strcmp(d->subdir, "System") != 0 &&
+    if (!found && package_project_root[0] != '\0' &&
+        strcmp(d->subdir, "System") != 0 &&
         !project_namespace_declared(d->subdir)) {
         fprintf(stderr, "ZANPKG_MISSING namespace=%s\n", d->subdir);
         missing_namespace_count++;
@@ -3986,6 +3988,8 @@ static void print_usage(void) {
     fprintf(stderr, "  --stdlib-path <dir>  Path to stdlib directory\n");
     fprintf(stderr, "  --auto-stdlib    Automatically find stdlib and installed package namespaces (default)\n");
     fprintf(stderr, "  --no-stdlib      Disable automatic stdlib and package discovery\n");
+    fprintf(stderr, "  --no-packages    Disable package discovery only (used for the nested\n");
+    fprintf(stderr, "                   code-generator build, whose closure is stdlib-only)\n");
     fprintf(stderr, "  --package-api <url>  Configure marketplace API (HTTPS; localhost HTTP allowed)\n");
     fprintf(stderr, "  --package-list-missing  Scan inputs and print missing namespace diagnostics\n");
     fprintf(stderr, "  --package-install <dir> --package-name <name>  Install a local package directory\n");
@@ -4186,6 +4190,7 @@ int main(int argc, char **argv) {
     bool fast_alloc = false;
     const char *stdlib_path = NULL;
     bool auto_stdlib = true;
+    bool packages_disabled = false;
     /* --quiet: suppress the human progress lines ("Compiled N files -> ...",
      * driver bundling notices, APK packaging) that otherwise go to stdout.
      * stdout is a machine channel -- `--emit-ir` writes the IR there -- and
@@ -4303,6 +4308,12 @@ int main(int argc, char **argv) {
             auto_stdlib = true;
         } else if (strcmp(argv[i], "--no-stdlib") == 0) {
             auto_stdlib = false;
+        } else if (strcmp(argv[i], "--no-packages") == 0) {
+            /* Generator-child mode: an empty project root turns every
+             * package-store lookup in package.c into a no-op, so user
+             * packages cannot leak into the generator closure. */
+            packages_disabled = true;
+            package_project_root[0] = '\0';
         } else if (strcmp(argv[i], "--package-api") == 0 && i + 1 < argc) {
             package_api = argv[++i];
         } else if (strcmp(argv[i], "--package-list-missing") == 0) {
@@ -4450,7 +4461,7 @@ int main(int argc, char **argv) {
     if (package_project)
         snprintf(package_project_root, sizeof(package_project_root), "%s",
                  package_project);
-    else
+    else if (!packages_disabled)
         resolve_package_project_root(input_file);
     for (int fi = 0; fi < input_count; fi++) {
         /* Design docs / saved components are generator data, not Zan

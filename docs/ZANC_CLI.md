@@ -120,6 +120,7 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 |---|---|
 | `--auto-stdlib` | 自动定位 stdlib 与已安装包，**按需拉入**用到的命名空间 |
 | `--stdlib-path <dir>` | 指定 stdlib 目录（测试门用；拉入仍按需） |
+| `--no-packages` | 只关包发现（stdlib 拉入照常）。由 zanc 自己在嵌套构建代码生成器时传给子进程：生成器闭包钉死在 stdlib——包文件跳过拉入活名门会无条件入编，而生成器魔法调用（`Json.Serialize<T>`/`db.Insert<T>`）只在父编译降级，`--no-gen` 子编里无法解析；用户包里任何带魔法调用的文件都会炸掉所有触发生成器的编译。回归锁 `conformance_gen_pkg_isolation` |
 | `--package-api <url>` / `--package-list-missing` / `--package-install <dir> --package-name <n>` / `--package-scope` / `--package-project` | 包市场：API 地址、缺包诊断、本地包安装与作用域 |
 
 ### 目标与运行时

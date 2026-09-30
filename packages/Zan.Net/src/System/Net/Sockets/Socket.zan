@@ -1,0 +1,1209 @@
+using System;
+
+namespace System.Net.Sockets;
+
+/// <summary>
+/// 跨平台的低层套接字操作。
+/// Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
+/// </summary>
+class Socket {
+    // 整个 API 中套接字句柄统一使用 `nint`，同 C#
+    // （SafeSocketHandle / IntPtr）：Windows SOCKET 是 UINT_PTR，POSIX fd 是
+    // 32 位 int。只有下面的 Sys* 包装函数符合真实 C 签名，
+    // 在 POSIX 需要 fd 处截断为 `int`。
+    [DllImport("crt", EntryPoint = "zan_io_socket_send")]
+    static extern long ReactorSend(nint sock, string buf, long len, int flags);
+
+    [DllImport("crt", EntryPoint = "zan_io_socket_send")]
+    static extern long ReactorSendPtr(nint sock, nint buf, long len, int flags);
+
+    [DllImport("crt", EntryPoint = "zan_io_socket_recv")]
+    static extern long ReactorRecv(nint sock, string buf, long len, int flags);
+
+    [DllImport("crt", EntryPoint = "zan_io_socket_ready")]
+    static extern int ReactorReady(nint sock, int writeReady);
+
+    /// <summary>探测非阻塞连接的结果：0 表示已连接，
+    /// 失败时为正的 SO_ERROR 码（或 -1），连接进行中为 -2。</summary>
+    [DllImport("crt", EntryPoint = "zan_io_connect_status")]
+    static extern int ConnectStatus(nint sock);
+
+    [DllImport("crt", EntryPoint = "zan_io_socket_alive")]
+    static extern int SocketAlive(nint sock);
+
+    /// <summary>关闭通知钩子：必须在 close 之前调用，把 reactor 中挂起
+    /// 在该 fd 上的就绪等待者以「对端关闭」形态唤醒并摘除注册，
+    /// 消除 fd 号复用后老等待者错投到新连接的窗口（A291⑤）。</summary>
+    [DllImport("crt", EntryPoint = "zan_io_close_notify")]
+    static extern void ReactorCloseNotify(nint sock);
+
+    [DllImport("crt", EntryPoint = "zan_io_socket_peer_ip")]
+    static extern string NativePeerIp(nint sock);
+
+    // ---- Platform-specific DllImport ----
+    #if WINDOWS
+    [DllImport("ws2_32", EntryPoint = "WSAStartup")]
+    static extern int WSAStartup(ushort version, string wsaData);
+
+    [DllImport("crt", EntryPoint = "zan_io_socket_cleanup")]
+    static extern void ReactorCleanup();
+
+    [DllImport("ws2_32")]
+    static extern nint socket(int af, int type, int protocol);
+
+    [DllImport("ws2_32")]
+    static extern int closesocket(nint s);
+
+    [DllImport("ws2_32", EntryPoint = "send")]
+    static extern int winsend(nint s, string buf, int len, int flags);
+
+    [DllImport("ws2_32", EntryPoint = "recv")]
+    static extern int winrecv(nint s, string buf, int len, int flags);
+
+    [DllImport("ws2_32")]
+    static extern int bind(nint s, string addr, int addrlen);
+
+    [DllImport("ws2_32")]
+    static extern int listen(nint s, int backlog);
+
+    [DllImport("ws2_32")]
+    static extern nint accept(nint s, string addr, string addrlen);
+
+    [DllImport("ws2_32")]
+    static extern int connect(nint s, string addr, int addrlen);
+
+    [DllImport("ws2_32")]
+    static extern int setsockopt(nint s, int level, int optname, string optval, int optlen);
+
+    [DllImport("ws2_32")]
+    static extern int ioctlsocket(nint s, int cmd, string argp);
+
+    [DllImport("ws2_32")]
+    static extern int shutdown(nint s, int how);
+
+    [DllImport("kernel32", EntryPoint = "CancelIoEx")]
+    static extern int CancelIoEx(nint handle, nint overlapped);
+
+    [DllImport("ws2_32")]
+    static extern int sendto(nint s, string buf, int len, int flags, string to, int tolen);
+
+    [DllImport("ws2_32")]
+    static extern int recvfrom(nint s, string buf, int len, int flags, string from, string fromlen);
+
+    [DllImport("ws2_32")]
+    static extern ushort htons(ushort hostshort);
+
+    [DllImport("ws2_32")]
+    static extern int htonl(int hostlong);
+
+    [DllImport("ws2_32")]
+    static extern ushort ntohs(ushort netshort);
+
+    [DllImport("ws2_32")]
+    static extern int inet_addr(string cp);
+
+    [DllImport("ws2_32", EntryPoint = "WSAGetLastError")]
+    static extern int WinLastError();
+
+    // Winsock 接收完整 SOCKET 句柄，因此这些只是直接转发。
+    /// 关闭套接字（closesocket 直转发，收完整 SOCKET 句柄）。
+    static int SysClose(nint s) { return closesocket(s); }
+    /// 关闭收发（shutdown 直转发，收完整 SOCKET 句柄）。
+    static int SysShutdown(nint s, int how) { return shutdown(s, how); }
+    /// 绑定地址（bind 直转发，收完整 SOCKET 句柄）。
+    static int SysBind(nint s, string addr, int addrlen) { return bind(s, addr, addrlen); }
+    /// 开始监听（listen 直转发，收完整 SOCKET 句柄）。
+    static int SysListen(nint s, int backlog) { return listen(s, backlog); }
+    /// 接受连接（accept 直转发，收完整 SOCKET 句柄）。
+    static nint SysAccept(nint s, string addr, string addrlen) { return accept(s, addr, addrlen); }
+    /// 发起连接（connect 直转发，收完整 SOCKET 句柄）。
+    static int SysConnect(nint s, string addr, int addrlen) { return connect(s, addr, addrlen); }
+    /// 设置套接字选项（setsockopt 直转发，收完整 SOCKET 句柄）。
+    static int SysSetSockOpt(nint s, int level, int optname, string optval, int optlen) {
+        return setsockopt(s, level, optname, optval, optlen);
+    }
+    /// UDP 发送数据报（sendto 直转发，收完整 SOCKET 句柄）。
+    static int SysSendTo(nint s, string buf, int len, int flags, string to, int tolen) {
+        return sendto(s, buf, len, flags, to, tolen);
+    }
+    /// UDP 接收数据报（recvfrom 直转发，收完整 SOCKET 句柄）。
+    static int SysRecvFrom(nint s, string buf, int len, int flags, string from, string fromlen) {
+        return recvfrom(s, buf, len, flags, from, fromlen);
+    }
+    #elif LINUX || MACOS
+    [DllImport("crt")]
+    static extern int socket(int af, int type, int protocol);
+
+    [DllImport("crt", EntryPoint = "close")]
+    static extern int closesocket(int fd);
+
+    [DllImport("crt", EntryPoint = "send")]
+    static extern int winsend(int fd, string buf, int len, int flags);
+
+    [DllImport("crt", EntryPoint = "recv")]
+    static extern int winrecv(int fd, string buf, int len, int flags);
+
+    [DllImport("crt")]
+    static extern int bind(int fd, string addr, int addrlen);
+
+    [DllImport("crt")]
+    static extern int listen(int fd, int backlog);
+
+    [DllImport("crt")]
+    static extern int accept(int fd, string addr, string addrlen);
+
+    [DllImport("crt")]
+    static extern int connect(int fd, string addr, int addrlen);
+
+    [DllImport("crt")]
+    static extern int setsockopt(int fd, int level, int optname, string optval, int optlen);
+
+    [DllImport("crt")]
+    static extern int shutdown(int fd, int how);
+
+    [DllImport("crt")]
+    static extern int sendto(int fd, string buf, int len, int flags, string to, int tolen);
+
+    [DllImport("crt")]
+    static extern int recvfrom(int fd, string buf, int len, int flags, string from, string fromlen);
+
+    [DllImport("crt")]
+    static extern ushort htons(ushort hostshort);
+
+    [DllImport("crt")]
+    static extern int htonl(int hostlong);
+
+    [DllImport("crt")]
+    static extern ushort ntohs(ushort netshort);
+
+    // in_addr_t 是 32 位（网络字节序的 IPv4 地址），与 Windows 分支
+    // 保持同一签名，否则调用方在 POSIX 上会撞上 nint->int 收窄错误。
+    [DllImport("crt")]
+    static extern int inet_addr(string cp);
+
+    [DllImport("crt")]
+    static extern int fcntl(int fd, int cmd, int arg);
+
+    // POSIX errno：bionic 导出 __errno()，glibc/musl 导出 __errno_location()，
+    // Darwin 导出 __error()，都返回 int*。ANDROID 也定义 LINUX，
+    // 所以安卓分支必须排在 LINUX 之前。WASI 用 wasi-libc 的
+    // __errno_location（musl 同源）。
+    #if ANDROID
+    [DllImport("crt", EntryPoint = "__errno")]
+    static extern nint NativeErrnoLocation();
+    #elif LINUX
+    [DllImport("crt", EntryPoint = "__errno_location")]
+    static extern nint NativeErrnoLocation();
+    #elif MACOS
+    [DllImport("crt", EntryPoint = "__error")]
+    static extern nint NativeErrnoLocation();
+    #elif WASI
+    [DllImport("crt", EntryPoint = "__errno_location")]
+    static extern nint NativeErrnoLocation();
+    #endif
+
+    // POSIX fd 是 32 位 int：在此一次性截断句柄。
+    /// 关闭套接字（句柄在此截断为 int fd 传给 close）。
+    static int SysClose(nint s) { return closesocket((int)s); }
+    /// 关闭收发（句柄截断为 int fd 传给 shutdown）。
+    static int SysShutdown(nint s, int how) { return shutdown((int)s, how); }
+    /// 绑定地址（句柄截断为 int fd 传给 bind）。
+    static int SysBind(nint s, string addr, int addrlen) { return bind((int)s, addr, addrlen); }
+    /// 开始监听（句柄截断为 int fd 传给 listen）。
+    static int SysListen(nint s, int backlog) { return listen((int)s, backlog); }
+    /// 接受连接（句柄截断为 int fd 传给 accept）。
+    static nint SysAccept(nint s, string addr, string addrlen) { return accept((int)s, addr, addrlen); }
+    /// 发起连接（句柄截断为 int fd 传给 connect）。
+    static int SysConnect(nint s, string addr, int addrlen) { return connect((int)s, addr, addrlen); }
+    /// 设置套接字选项（句柄截断为 int fd 传给 setsockopt）。
+    static int SysSetSockOpt(nint s, int level, int optname, string optval, int optlen) {
+        return setsockopt((int)s, level, optname, optval, optlen);
+    }
+    /// UDP 发送数据报（句柄截断为 int fd 传给 sendto）。
+    static int SysSendTo(nint s, string buf, int len, int flags, string to, int tolen) {
+        return sendto((int)s, buf, len, flags, to, tolen);
+    }
+    /// UDP 接收数据报（句柄截断为 int fd 传给 recvfrom）。
+    static int SysRecvFrom(nint s, string buf, int len, int flags, string from, string fromlen) {
+        return recvfrom((int)s, buf, len, flags, from, fromlen);
+    }
+    #elif WASI
+    // wasm32（WASI）：没有套接字系统调用，全部退"失败"桩（-1），
+    // 与 zanrt_syncw.o 的运行时桩同一姿态——wasm 上套接字不存在，
+    // GUI 程序引用这些符号只为编译通过，真调用者先撞 zan_io_* 桩。
+    static int SysClose(nint s) { return -1; }
+    static int SysShutdown(nint s, int how) { return -1; }
+    static int SysBind(nint s, string addr, int addrlen) { return -1; }
+    static int SysListen(nint s, int backlog) { return -1; }
+    static nint SysAccept(nint s, string addr, string addrlen) { return -1; }
+    static int SysConnect(nint s, string addr, int addrlen) { return -1; }
+    static int SysSetSockOpt(nint s, int level, int optname, string optval, int optlen) {
+        return -1;
+    }
+    static int SysSendTo(nint s, string buf, int len, int flags, string to, int tolen) {
+        return -1;
+    }
+    static int SysRecvFrom(nint s, string buf, int len, int flags, string from, string fromlen) {
+        return -1;
+    }
+    #endif
+
+    // wasm32（WASI）：wasi-libc 有 htons（libc.a），inet_addr 没有——
+    // 语义由下面的纯 Zan InetAddr 顶替。POSIX/Windows 用原生版本。
+    #if WASI
+    [DllImport("crt")]
+    static extern ushort htons(ushort hostshort);
+    #endif
+
+    /// 纯 Zan 的 inet_addr（点分 IPv4 → 网络字节序整数，第一段在
+    /// 低字节；失败返回 -1）。wasi-libc 不导出 inet_addr，wasm32 走
+    /// 这里；其他平台转发原生 inet_addr。255.255.255.255 按 inet_addr
+    /// 惯例也返回 -1，调用方自行特判。
+    static int InetAddr(string cp) {
+        #if WASI
+        int value = 0;
+        int part = 0;
+        int count = 0;
+        int i = 0;
+        while (i < cp.Length) {
+            int c = cp[i] & 255;
+            if (c == 46) { // '.'
+                if (part > 255) { return -1; }
+                value = value | (part << (count * 8));
+                count = count + 1;
+                part = 0;
+                if (count > 3) { return -1; }
+            } else if (c >= 48 && c <= 57) {
+                part = part * 10 + c - 48;
+                if (part > 255) { return -1; }
+            } else {
+                return -1;
+            }
+            i = i + 1;
+        }
+        if (count != 3 || part > 255) { return -1; }
+        return value | (part << 24);
+        #else
+        return inet_addr(cp);
+        #endif
+    }
+
+    // 主机名解析由运行时提供（rt_io.c），三个平台都有；
+    // 曾经只声明在 WINDOWS 分支里，于是 ResolveIpv4/ResolveHostName
+    // 在 Linux/macOS 上根本编译不过。
+    [DllImport("crt", EntryPoint = "zan_io_resolve_ipv4")]
+    static extern int NativeResolveIpv4(string hostname);
+
+    // getaddrinfo 版解析：主机名或字面量 IP（IPv4/IPv6）→ 完整
+    // sockaddr 字节（16 或 28），返回实际长度（失败 0）。sockaddr
+    // 布局（含平台 family 字节序）全部在 C 端填充，不进 stdlib。
+    [DllImport("crt", EntryPoint = "zan_io_resolve_sa")]
+    static extern int NativeResolveSockAddr(string name, int port, byte[] buf, int cap);
+
+    // 每个候选固定 32 字节：前 16/28 字节是 native sockaddr，余下清零。
+    [DllImport("crt", EntryPoint = "zan_io_resolve_all")]
+    static extern int NativeResolveAll(string name, int port, byte[] buf, int cap);
+
+    // await native extern 只能安全跨挂起传递标量；把托管对象转换为其
+    // 原始地址后调用 C worker ABI，结果仍回到当前 async frame。
+    [DllImport("crt", EntryPoint = "zan_io_resolve_all_async")]
+    static extern long NativeResolveAllAsync(nint name, int port, nint buf, int cap);
+
+    [DllImport("crt", EntryPoint = "zan_io_sockaddr_family")]
+    static extern int NativeSockAddrFamily(nint sa, int len);
+
+    [DllImport("crt", EntryPoint = "zan_io_sockaddr_is_safe")]
+    static extern int NativeSockAddrIsSafe(nint sa, int len,
+                                           int allowLoopback);
+
+    [DllImport("crt", EntryPoint = "zan_io_connect_sa")]
+    static extern long NativeConnectSockAddr(nint sock, nint sa, int len,
+                                             int timeoutMs);
+
+    // 把 sockaddr 的地址部分格式化为文本（IPv4 点分 / IPv6 冒号十六进制）。
+    // 注意：这两个 *_str 原生返回值按 ABI 是“采纳而非拷贝”，背后是
+    // 线程共享缓冲——存进托管字符串后，同 worker 的下一次调用或
+    // await 迁移都会让内容悄悄变化。跨 await 持有 IP 文本的代码
+    // （WebApp、UDP 回信）必须走下面的 SockAddrIpText/RemoteIp 拷贝封装。
+    [DllImport("crt", EntryPoint = "zan_io_sockaddr_ip_str")]
+    static extern string NativeSockAddrIp(byte[] sa);
+
+    [DllImport("crt", EntryPoint = "zan_io_sockaddr_ip_str_into")]
+    static extern int NativeSockAddrIpInto(byte[] sa, nint buf, int cap);
+
+    [DllImport("crt", EntryPoint = "zan_io_socket_peer_ip_into")]
+    static extern int NativePeerIpInto(nint sock, nint buf, int cap);
+
+    /// 从临时原生缓冲取出拷贝好的地址文本并释放缓冲。
+    static string IpTextFromNative(nint buf, int n) {
+        if (n <= 0) { NativeMemory.Free(buf); return ""; }
+        string s = NativeMemory.GetString(buf, 0, n);
+        NativeMemory.Free(buf);
+        return s;
+    }
+
+    /// <summary>sockaddr → 地址文本（拷贝语义，可安全跨 await 持有）。</summary>
+    static string SockAddrIpText(byte[] sa) {
+        nint buf = NativeMemory.Alloc(64);   // INET6_ADDRSTRLEN 上限
+        if (buf == 0) { return ""; }
+        return IpTextFromNative(buf, NativeSockAddrIpInto(sa, buf, 64));
+    }
+
+    [DllImport("crt")]
+    static extern long strlen(string str);
+
+
+    // 用于带截止时限操作的单调时钟（与
+    // Stopwatch 同源；声明在此处，套接字层就不依赖
+    // System.Threading）。
+    [DllImport("crt", EntryPoint = "zan_monotonic_us")]
+    static extern long NativeMonotonicUs();
+
+    /// <summary>初始化套接字子系统（Windows 为 WSAStartup，Linux 无操作）。</summary>
+    static void Initialize() {
+        #if WINDOWS
+        byte[] wsaData = new byte[512];
+        WSAStartup(514, wsaData);
+        #endif
+    }
+
+    /// <summary>清理套接字子系统。</summary>
+    static void Cleanup() {
+        #if WINDOWS
+        ReactorCleanup();
+        #endif
+    }
+
+    /// <summary>创建 TCP 套接字。wasm32 无套接字：恒失败。
+    /// 与 TcpListener/TcpClient 构造器一样先做平台套接字子系统
+    /// 初始化（Windows WSAStartup 引用计数、幂等）：raw 路径没有
+    /// 别的入口替调用方做这件事，漏了会在 Windows 上静默返 -1。</summary>
+    static nint CreateTcp() {
+        #if WASI
+        return -1;
+        #else
+        Socket.Initialize();
+        nint s = socket(2, 1, 6);
+        if (s < 0) { Socket.CaptureLastError(); }
+        return s;
+        #endif
+    }
+
+    /// <summary>创建 IPv6 TCP 套接字（AF_INET6）。IPv6 连接
+    /// 也可用 IPv4 套接字配 ::ffff: 映射地址，但原生 v6 套接字
+    /// 才能直接绑定/监听 [::1] 这类纯 v6 地址。</summary>
+    static nint CreateTcp6() {
+        #if WASI
+        return -1;
+        #else
+        Socket.Initialize();
+        // AF_INET6 的平台常量不同：Windows 23（winsock2），
+        // POSIX 10。
+        #if WINDOWS
+        nint s = socket(23, 1, 6);
+        #else
+        nint s = socket(10, 1, 6);
+        #endif
+        if (s < 0) { Socket.CaptureLastError(); }
+        return s;
+        #endif
+    }
+
+    /// <summary>创建 UDP 套接字。wasm32 无套接字：恒失败。</summary>
+    static nint CreateUdp() {
+        #if WASI
+        return -1;
+        #else
+        Socket.Initialize();
+        nint s = socket(2, 2, 17);
+        if (s < 0) { Socket.CaptureLastError(); }
+        return s;
+        #endif
+    }
+
+    /// <summary>创建 IPv6 UDP 套接字（AF_INET6）。wasm32 恒失败。</summary>
+    static nint CreateUdp6() {
+        #if WASI
+        return -1;
+        #else
+        Socket.Initialize();
+        #if WINDOWS
+        nint s = socket(23, 2, 17);
+        #else
+        nint s = socket(10, 2, 17);
+        #endif
+        if (s < 0) { Socket.CaptureLastError(); }
+        return s;
+        #endif
+    }
+
+    /// <summary>关闭套接字。</summary>
+    static void Close(nint sock) {
+        ReactorCloseNotify(sock);   // 先摘 reactor 注册（A291⑤），再关描述符
+        SysClose(sock);
+    }
+
+    /// <summary>双向关闭连接而不释放
+    /// 描述符。IO reactor 中挂起在此套接字上的协程
+    /// 会以 0 字节读（对端关闭语义）被唤醒并正常退出；
+    /// 而直接关闭描述符不会这样：fd 会
+    /// 带着未完成事件离开 reactor 集合，协程将永远
+    /// 无法恢复。用于挂断超限的连接。</summary>
+    static void ShutdownBoth(nint sock) {
+        SysShutdown(sock, 2);   // SD_BOTH / SHUT_RDWR
+        #if WINDOWS
+        // 本地 shutdown 不会完成已提交的 WSARecv，因此在
+        // Windows 上必须显式请求唤醒：CancelIoEx 完成
+        // 句柄上所有挂起的重叠操作，reactor
+        // 将其报告为 0 字节——与 POSIX 免费提供的对端关闭形态相同。
+        int _cancelled = CancelIoEx(sock, 0);
+        #endif
+    }
+
+    /// <summary>将套接字设为非阻塞模式。wasm32（WASI）没有
+    /// fcntl/ioctlsocket：一律报"已是阻塞模型失败"（返回 -1），
+    /// GUI 程序引用此符号只是超时管道、从不开真套接字。</summary>
+    static int SetNonBlocking(nint sock) {
+        int rc = -1;
+        #if WINDOWS
+        byte[] argp = new byte[4];
+        argp[0] = 1;
+        rc = ioctlsocket(sock, -2147195266, argp);
+        #elif LINUX
+        int flags = fcntl((int)sock, 3, 0);
+        rc = fcntl((int)sock, 4, flags | 2048);
+        #elif MACOS
+        int flags = fcntl((int)sock, 3, 0);
+        rc = fcntl((int)sock, 4, flags | 4);
+        #endif
+        if (rc != 0) { Socket.CaptureLastError(); }
+        return rc;
+    }
+
+    /// <summary>在套接字上设置 SO_REUSEADDR。</summary>
+    static void SetReuseAddr(nint sock) {
+        byte[] optval = new byte[4];
+        optval[0] = 1;
+        #if WINDOWS
+        SysSetSockOpt(sock, 65535, 4, optval, 4);
+        #elif LINUX
+        SysSetSockOpt(sock, 1, 2, optval, 4);
+        #elif MACOS
+        SysSetSockOpt(sock, 65535, 4, optval, 4);
+        #endif
+    }
+
+    /// <summary>启用 SO_REUSEPORT，使多个进程能绑定同一
+    /// address:port，由内核在它们之间负载均衡入站连接——
+    /// 这是多 worker 水平扩展的基础（Linux/macOS）。必须
+    /// 在 bind() 之前设置。Windows 无 SO_REUSEPORT，故设置 SO_REUSEADDR
+    /// 替代（那里仍是单进程独占端口）。</summary>
+    static void SetReusePort(nint sock) {
+        byte[] optval = new byte[4];
+        optval[0] = 1;
+        #if WINDOWS
+        SysSetSockOpt(sock, 65535, 4, optval, 4);
+        #elif LINUX
+        SysSetSockOpt(sock, 1, 15, optval, 4);
+        #elif MACOS
+        SysSetSockOpt(sock, 65535, 512, optval, 4);
+        #endif
+    }
+
+    /// <summary>在接受连接上禁用 Nagle 算法（TCP_NODELAY）。
+    /// 否则小回复要等对端对前一条的 ACK，
+    /// 管线化请求的客户端会撞上约 40ms 的延迟 ACK 停顿：
+    /// websocket echo 路径仅因此一项就测得 1.8 万条消息/秒。
+    /// 所有支持的平台上 IPPROTO_TCP 为 6、TCP_NODELAY 为 1。</summary>
+    static void SetNoDelay(nint sock) {
+        byte[] optval = new byte[4];
+        optval[0] = 1;
+        SysSetSockOpt(sock, 6, 1, optval, 4);
+    }
+
+    /// <summary>在套接字上启用 SO_BROADCAST（使用各平台正确的常量）。</summary>
+    static void SetBroadcast(nint sock) {
+        byte[] optval = new byte[4];
+        optval[0] = 1;
+        #if WINDOWS
+        SysSetSockOpt(sock, 65535, 32, optval, 4);
+        #elif LINUX
+        SysSetSockOpt(sock, 1, 6, optval, 4);
+        #elif MACOS
+        SysSetSockOpt(sock, 65535, 32, optval, 4);
+        #endif
+    }
+
+    /// <summary>把主机名或 IP 文本（IPv4/IPv6）解析为完整的
+    /// sockaddr 字节（IPv4 16 字节 / IPv6 28 字节），供
+    /// connect/bind/sendto 使用。字面量 IP 和主机名统一由
+    /// getaddrinfo 处理（C 端按返回地址族填充 sockaddr，布局
+    /// 不进 stdlib）。"0.0.0.0"/空串仍走零地址快路径；解析失败
+    /// 时回退 0.0.0.0（旧行为，随后的 connect/bind 会报错）。
+    /// 返回的数组长度即 sockaddr 实际长度。</summary>
+    static byte[] BuildSockAddr(string ip, int port) {
+        if (ip == "0.0.0.0" || ip == "") {
+            return BuildSockAddrResolved(0, port);
+        }
+        byte[] addr = new byte[28];
+        int len = Socket.NativeResolveSockAddr(ip, port, addr, 28);
+        if (len == 28) { return addr; }
+        if (len == 16) {
+            byte[] v4 = new byte[16];
+            for (int i = 0; i < 16; i = i + 1) { v4[i] = addr[i]; }
+            return v4;
+        }
+        return BuildSockAddrResolved(0, port);
+    }
+
+    /// <summary>该地址是否为数值字面量（IPv4 点分十进制或含冒号的
+    /// IPv6），即无需 DNS 解析即可直接构建 sockaddr。</summary>
+    static bool IsNumericHost(string ip) {
+        if (ip == "") { return false; }
+        if (ip.IndexOf(":") >= 0) { return true; }
+        if (InetAddr(ip) != 0 - 1) { return true; }
+        return ip == "255.255.255.255";
+    }
+
+    /// <summary>BuildSockAddr 的异步版本：主机名通过
+    /// <see cref="ResolveSockAddr"/> 在后台线程解析（不会阻塞
+    /// 事件循环），字面量 IP 走同步快路径。供 ConnectAsync /
+    /// SendToAsync 使用。</summary>
+    static async byte[] BuildSockAddrAsync(string ip, int port) {
+        Socket.MarkResolveFailed(false);
+        if (ip == "0.0.0.0" || ip == "") {
+            Socket.MarkResolveFailed(true);
+            return null;
+        }
+        // Numeric literals are parsed locally and never sent to DNS.
+        if (Socket.IsNumericHost(ip)) {
+            return Socket.BuildSockAddr(ip, port);
+        }
+        byte[] addr = new byte[28];
+        int len = await Socket.ResolveSockAddr(ip, port, addr, 28);
+        if (len == 28) { return addr; }
+        if (len == 16) {
+            byte[] v4 = new byte[16];
+            for (int i = 0; i < 16; i = i + 1) { v4[i] = addr[i]; }
+            return v4;
+        }
+        Socket.MarkResolveFailed(true);
+        return null;
+    }
+
+    /// <summary>同步解析全部地址候选到调用方提供的固定缓冲区。
+    /// 每条记录占 32 字节，前 16/28 字节为 sockaddr，其余清零；返回
+    /// 候选数，失败返回 0。</summary>
+    static int ResolveAll(string host, int port, byte[] records) {
+        if (host == "" || records == null) { return 0; }
+        return Socket.NativeResolveAll(host, port, records, records.Length);
+    }
+
+    /// <summary>异步解析全部地址候选到调用方提供的固定缓冲区。返回候选
+    /// 数，失败返回 0；解析失败绝不伪造 0.0.0.0。</summary>
+    static async int ResolveAllAsync(string host, int port, byte[] records) {
+        if (host == "" || records == null || records.Length < 32) { return 0; }
+        #if WASI
+        // wasm32：await 直接 extern 被编译器拒绝，且 zanrt_syncw.o 的
+        // 桩本来就是同步失败——直接退桩，不进协程。
+        return 0;
+        #else
+        // Convert managed values to stable raw addresses before crossing the
+        // async boundary. The frame retains host and records while the worker
+        // writes only within this caller-owned buffer.
+        nint hostPtr = (nint)host;
+        nint recordsPtr = (nint)records;
+        long n = await Socket.NativeResolveAllAsync(hostPtr, port, recordsPtr,
+                                                    records.Length);
+        if (n <= 0) { return 0; }
+        return (int)n;
+        #endif
+    }
+
+    /// 返回 sockaddr 记录的地址族常量（平台原生值）。
+    static int SockAddrFamily(byte[] record, int len) {
+        nint p = (nint)record;
+        return Socket.NativeSockAddrFamily(p, len);
+    }
+
+    /// 该 sockaddr 是否为可安全连接的常规地址（非未指定/组播）；
+    /// allowLoopback 决定环回地址是否放行。
+    static bool SockAddrIsSafe(byte[] record, int len, bool allowLoopback) {
+        nint p = (nint)record;
+        return Socket.NativeSockAddrIsSafe(p, len,
+            allowLoopback ? 1 : 0) != 0;
+    }
+
+    /// 该地址族常量是否为 IPv6（AF_INET6 的平台取值不同）。
+    static bool IsV6Family(int family) {
+        #if WINDOWS
+        return family == 23;
+        #elif MACOS
+        return family == 30;
+        #else
+        return family == 10;
+        #endif
+    }
+
+    /// <summary>对一个已经解析出的 sockaddr 做精确异步连接。仅传递
+    /// 二进制地址给 runtime，不会再次按主机名解析。</summary>
+    static async int ConnectSockAddrAsync(nint sock, byte[] record, int len,
+                                          int timeoutMs) {
+        #if WASI
+        // wasm32：await 直接 extern 被编译器拒绝；连接本就不可能
+        // 成功，直接报失败（-1）。
+        return -1;
+        #else
+        nint p = (nint)record;
+        // The exact-connect ABI performs the nonblocking connect and waits on a
+        // worker. It receives only the binary sockaddr; hostname resolution is
+        // impossible on this path. timeoutMs is enforced by the caller's
+        // overall candidate deadline (the native wait itself has no deadline).
+        long r = await Socket.NativeConnectSockAddr(sock, p, len, timeoutMs);
+        return (int)r;
+        #endif
+    }
+
+    /// <summary>从已解析的 IPv4 整数地址构建 sockaddr_in（字节序与
+    /// <c>inet_addr</c> 一致）。供异步连接复用——解析已在
+    /// ConnectAsync 中通过异步 DNS 完成，这里不再执行阻塞解析。</summary>
+    static byte[] BuildSockAddrResolved(int ipAddr, int port) {
+        byte[] addr = new byte[16];
+        #if MACOS
+        addr[0] = 16;
+        addr[1] = 2;
+        #else
+        addr[0] = 2;
+        addr[1] = 0;
+        #endif
+        int nport = (int)htons((ushort)port);
+        addr[2] = (byte)(nport & 255);
+        addr[3] = (byte)((nport >> 8) & 255);
+        addr[4] = (byte)(ipAddr & 255);
+        addr[5] = (byte)((ipAddr >> 8) & 255);
+        addr[6] = (byte)((ipAddr >> 16) & 255);
+        addr[7] = (byte)((ipAddr >> 24) & 255);
+        return addr;
+    }
+
+    /// <summary>将套接字绑定到地址和端口。</summary>
+    static int Bind(nint sock, string ip, int port) {
+        byte[] addr = BuildSockAddr(ip, port);
+        int rc = SysBind(sock, addr, addr.Length);
+        if (rc != 0) { Socket.CaptureLastError(); }
+        return rc;
+    }
+
+    /// <summary>开始监听连接。</summary>
+    static int Listen(nint sock, int backlog) {
+        int rc = SysListen(sock, backlog);
+        if (rc != 0) { Socket.CaptureLastError(); }
+        return rc;
+    }
+
+    /// <summary>同步接受连接。</summary>
+    static nint Accept(nint sock) {
+        byte[] clientAddr = new byte[16];
+        byte[] addrLen = new byte[4];
+        addrLen[0] = 16;
+        nint client = SysAccept(sock, clientAddr, addrLen);
+        if (client < 0) { Socket.CaptureLastError(); }
+        return client;
+    }
+
+    /// <summary>在 IO reactor 上挂起，直到有入站连接
+    /// 待处理，然后接受。要求监听套接字为非阻塞。</summary>
+    static async nint AcceptAsync(nint sock) {
+        #if WINDOWS
+        return await Socket.AcceptOv(sock);
+        #else
+        while (true) {
+            await Socket.ReadReady(sock);
+            nint client = Accept(sock);
+            if (client >= 0) {
+                return client;
+            }
+            // accept 挂起期间监听器被关闭（Stop()）：
+            // 它永远不会再就绪，因此直接报告失败，
+            // 而不是永远重新注册监视器。
+            if (!Socket.IsOpen(sock)) {
+                return -1;
+            }
+        }
+        return -1;
+        #endif
+    }
+
+    /// <summary>同步连接到远程地址。</summary>
+    static int Connect(nint sock, string ip, int port) {
+        if (ip == "" || ip == "0.0.0.0") { return -1; }
+        byte[] addr;
+        if (Socket.IsNumericHost(ip)) {
+            addr = BuildSockAddr(ip, port);
+        } else {
+            addr = new byte[28];
+            int resolved = Socket.NativeResolveSockAddr(ip, port, addr, 28);
+            if (resolved == 0) { return -1; }
+            if (resolved == 16) {
+                byte[] v4 = new byte[16];
+                for (int i = 0; i < 16; i = i + 1) { v4[i] = addr[i]; }
+                addr = v4;
+            }
+        }
+        int rc = SysConnect(sock, addr, addr.Length);
+        if (rc != 0) { Socket.CaptureLastError(); }
+        return rc;
+    }
+
+    /// <summary>发起非阻塞连接，然后在 IO reactor 上挂起
+    /// 直到连接确定。成功返回 0，失败返回非零错误
+    /// 码（SO_ERROR，如拒绝/不可达；无错误码时为 -1）
+    /// 。要求套接字为非阻塞。
+    ///
+    /// reactor 的可写就绪唤醒可能早于挂起的连接
+    /// 确定（尤其是 Windows，零字节发送探测会提前完成，
+    /// 连接失败通过异常集合报告），因此
+    /// 每次唤醒后用 ConnectStatus 检查结果，仍在进行中时
+    /// 稍作延迟再轮询。</summary>
+    /// <summary>把 IP 文本解析为 sockaddr 用的 IPv4 整数地址
+    /// （0.0.0.0/空串 → 0）。字面量 IP 直接用 inet_addr；
+    /// 主机名通过异步 DNS 解析（<see cref="ResolveAsync"/>），
+    /// 在后台线程执行，不会阻塞事件循环。</summary>
+    static async int AsyncResolveIp(string ip) {
+        if (ip == "0.0.0.0" || ip == "") {
+            return 0;
+        }
+        int ipAddr = InetAddr(ip);
+        if (ipAddr == 0 - 1) {
+            ipAddr = await Socket.ResolveAsync(ip);
+        }
+        return ipAddr;
+    }
+
+    /// <summary>连接到 `ip:port`，默认截止 120 秒。黑洞地址永远不会
+    /// 唤醒 reactor——旧实现在这里以 Task.Delay(1) 死循环轮询，
+    /// 永久挂起协程并烧 CPU；现在与带超时的重载共用同一条
+    /// 退避轮询路径，超时返回 -3（套接字留给调用方关闭）。
+    /// 需要不同时限的调用方请用四参重载（timeoutMs <= 0 表示
+    /// 真正无截止）。</summary>
+    static async int ConnectAsync(nint sock, string ip, int port) {
+        return await Socket.ConnectAsync(sock, ip, port, 120000);
+    }
+
+    /// <summary>受 <paramref name="timeoutMs"/> 限制的 ConnectAsync：在时限内
+    /// 连接既未成功也未失败时返回 -3
+    /// （黑洞地址永远不唤醒 reactor，因此无超时重载
+    /// 会永远挂起）。非正超时表示"无
+    /// 截止时间"，转而使用 reactor 驱动的重载。
+    ///
+    /// 连接挂起期间用 ConnectStatus 轮询结果，
+    /// 并递增延迟，而非等待可写就绪：reactor 唤醒
+    /// 无法取消，因此截止时间只能由本协程拥有的定时器
+    /// 观察。套接字留给调用方关闭。</summary>
+    static async int ConnectAsync(nint sock, string ip, int port, int timeoutMs) {
+        byte[] addr = await Socket.BuildSockAddrAsync(ip, port);
+        if (addr == null) {
+            Socket.MarkResolveFailed(true);
+            return -1;
+        }
+        int family = Socket.SockAddrFamily(addr, addr.Length);
+        if (family == 0) { return -1; }
+        return await Socket.ConnectSockAddrAsync(sock, addr,
+            Socket.IsV6Family(family) ? 28 : 16, timeoutMs);
+    }
+
+
+    /// <summary>同步发送数据。</summary>
+    static int Send(nint sock, string data, int len) {
+        return (int)ReactorSend(sock, data, len, 0);
+    }
+
+    /// <summary>挂起直到可写，然后发送；部分写入时重新等待，
+    /// 直到 <paramref name="len"/> 字节全部发送或对端关闭。
+    /// 返回已发送字节数。要求套接字为非阻塞。
+    ///
+    /// 二进制安全：未发送的剩余部分放在独立缓冲区中重建，
+    /// 用下标拷贝而非 <c>data + totalSent</c> 指针运算。在
+    /// 字符串上这会变成拼接，并在第一个 NUL
+    /// 字节处截断，损坏任何含 NUL 的负载（如 MQTT 包）。
+    ///
+    /// 急切发送：先尝试非阻塞发送，仅在套接字会阻塞时
+    /// 才等待 reactor（部分写入 / 发送缓冲区已满）
+    /// 。不拥塞的套接字上，整个负载一次系统调用即发出
+    /// 且无需挂起，省去每条消息一次 reactor 往返。</summary>
+    static async int SendAsync(nint sock, string data, int len) {
+        int totalSent = 0;
+        while (totalSent < len) {
+            int sent = (int)ReactorSendPtr(sock, (nint)data + (nint)totalSent, (long)(len - totalSent), 0);
+            if (sent > 0) {
+                totalSent = totalSent + sent;
+            } else if (sent == 0) {
+                return totalSent;
+            } else if (sent == -1) {
+                // 会阻塞：等待套接字可写后重试。
+                await Socket.WriteReady(sock);
+            } else {
+                // 致命错误（对端重置/中止、broken pipe 等）。
+                return totalSent;
+            }
+        }
+        return totalSent;
+    }
+
+    /// <summary>异步发送字节数组切片。零堆内存分配与零额外拷贝。</summary>
+    static async int SendAsync(nint sock, byte[] data, int len) {
+        return await Socket.SendBytesAsync(sock, data, 0, len);
+    }
+
+    /// <summary>异步发送字节数组指定偏移和长度的切片。零堆内存分配与零额外拷贝。</summary>
+    static async int SendBytesAsync(nint sock, byte[] data, int offset, int len) {
+        if (data == null || offset < 0 || len <= 0 || offset + len > data.Length) { return 0; }
+        int totalSent = 0;
+        while (totalSent < len) {
+            int sent = (int)ReactorSendPtr(sock, (nint)data + (nint)offset + (nint)totalSent, (long)(len - totalSent), 0);
+            if (sent > 0) {
+                totalSent = totalSent + sent;
+            } else if (sent == 0) {
+                return totalSent;
+            } else if (sent == -1) {
+                await Socket.WriteReady(sock);
+            } else {
+                return totalSent;
+            }
+        }
+        return totalSent;
+    }
+
+    /// <summary>发送字符串（自动计算长度）。</summary>
+    static int SendString(nint sock, string data) {
+        int len = (int)strlen(data);
+        return Send(sock, data, len);
+    }
+
+    /// <summary>异步发送整串字符串（长度由 strlen 计算）。</summary>
+    static async int SendStringAsync(nint sock, string data) {
+        int len = (int)strlen(data);
+        int r = await SendAsync(sock, data, len);
+        return r;
+    }
+
+    /// <summary>同步接收数据。</summary>
+    static int Recv(nint sock, string buf, int bufSize) {
+        return (int)ReactorRecv(sock, buf, bufSize, 0);
+    }
+
+    /// <summary>异步接收数据到字节数组，避免中间字符串分配与拷贝。正常读到返回实际字节数，对端关闭返回 0。</summary>
+    static async int RecvBytesAsync(nint sock, byte[] buf, int maxLen) {
+        if (buf == null || maxLen <= 0) { return 0; }
+        int n = await Socket.RecvOv(sock, buf, maxLen);
+        if (n < 0) { return 0; }
+        return n;
+    }
+
+    /// <summary>在 IO reactor 上挂起直到可读，然后最多接收
+    /// <paramref name="bufSize"/> 字节。返回以 NUL 结尾的
+    /// 字符串（对端关闭/EOF 时为空）。需要非阻塞套接字。</summary>
+    static async string RecvAsync(nint sock, int bufSize) {
+        byte[] buf = new byte[bufSize + 1];
+        // 使用真正的重叠接收（RecvOv），而非可读性探测
+        // 加同步 recv。零字节的 WSARecv 可读性探测可能在
+        // 无数据等待时就立即完成，使 ReadReady + ReactorRecv
+        // 误把 WSAEWOULDBLOCK 当作对端关闭，在对端数据
+        // 尚未到达时就返回空。RecvOv 向 buf 投递真正的 WSARecv，
+        // 只有读到数据（或对端关闭）时才完成。
+        int n = await Socket.RecvOv(sock, buf, bufSize);
+        if (n < 0) { n = 0; }
+        return buf.ToStr(0, n);
+    }
+
+    /// <summary>受 <paramref name="timeoutMs"/> 限制的 RecvAsync：时限内
+    /// 没有数据到达时返回空串（用 LastRecvTimedOut 与对端关闭区分）。
+    /// 非正超时表示"不设截止时间"，转而使用 reactor 驱动的重载。
+    ///
+    /// RecvToOv 把真正的接收与截止时间一起交给 reactor 竞速：谁先到
+    /// 谁交付（数据/对端关闭交付字节数，超时交付 -1），接收胜出时
+    /// reactor 自己撤掉截止时间，超时胜出时撤掉在途接收。纯事件驱动
+    /// ——挂起的协程不再按 1→16ms 周期生成轮询帧，高并发突发下就绪
+    /// 队列不再被灌爆（A268(b) 停摆悬崖的根修）。</summary>
+    static async string RecvAsync(nint sock, int bufSize, int timeoutMs) {
+        if (timeoutMs <= 0) {
+            string plain = await Socket.RecvAsync(sock, bufSize);
+            return plain;
+        }
+        byte[] buf = new byte[bufSize + 1];
+        int n = await Socket.RecvToOv(sock, buf, bufSize, timeoutMs);
+        if (n < 0) {
+            // 截止时间到了：撤收。-1 只在超时分支出现，不会混入 0（对端关闭）。
+            Socket.MarkRecvTimeout(true);
+            return "";
+        }
+        Socket.MarkRecvTimeout(false);
+        return buf.ToStr(0, n);
+    }
+
+    /// <summary>本协程最近一次带超时的接收是因超时放弃、而非对端
+    /// 关闭时为 true。通过同步辅助函数写入，因为在 async 方法内给
+    /// 静态变量赋值会被按值捕获。</summary>
+    static bool LastRecvTimedOut() {
+        return Socket.recvTimedOut;
+    }
+
+    static bool recvTimedOut = false;
+
+    /// 更新 LastRecvTimedOut 报告的标志（见带超时 RecvAsync）。
+    static void MarkRecvTimeout(bool timedOut) {
+        Socket.recvTimedOut = timedOut;
+    }
+
+    /// <summary>挂起直到可读，然后最多接收 <paramref
+    /// name="bufSize"/> 字节到调用方提供的缓冲区，在接收
+    /// 字节数处补 NUL。返回读取的字节数（对端关闭时为 0）。让
+    /// keep-alive 连接在多个请求间复用同一个缓冲区，而不是
+    /// 每个请求都重新分配并清零一块（最大 64KB）缓冲区。</summary>
+    static async int RecvIntoAsync(nint sock, string buf, int bufSize) {
+        int n = await Socket.RecvOv(sock, buf, bufSize);
+        if (n > 0) {
+            buf[n] = 0;
+            return n;
+        }
+        buf[0] = 0;
+        return 0;
+    }
+
+    /// <summary>接收数据到缓冲区（返回字符串）。</summary>
+    static string Receive(nint sock, int bufSize) {
+        byte[] buf = new byte[bufSize + 1];
+        int n = Recv(sock, buf, bufSize);
+        if (n < 0) { n = 0; }
+        return buf.ToStr(0, n);
+    }
+
+    /// <summary>发送一个 UDP 数据报（同步解析地址，含 IPv6）。</summary>
+    static int SendTo(nint sock, string data, int len, string ip, int port) {
+        byte[] addr = BuildSockAddr(ip, port);
+        return SysSendTo(sock, data, len, 0, addr, addr.Length);
+    }
+
+    /// <summary>挂起直到可写，然后发送一个 UDP 数据报。需要
+    /// 非阻塞套接字。主机名通过异步 DNS 解析（<see
+    /// cref="BuildSockAddrAsync"/>），不会阻塞事件循环。</summary>
+    static async int SendToAsync(nint sock, string data, int len, string ip, int port) {
+        byte[] addr = await Socket.BuildSockAddrAsync(ip, port);
+        if (addr == null) { return -1; }
+        await Socket.WriteReady(sock);
+        return SysSendTo(sock, data, len, 0, addr, addr.Length);
+    }
+
+    /// <summary>接收一个 UDP 数据报。</summary>
+    static string RecvFrom(nint sock, int bufSize) {
+        byte[] buf = new byte[bufSize + 1];
+        // 32 字节缓冲容纳 sockaddr_storage：IPv6 对端地址是
+        // 28 字节 sockaddr_in6，16 字节的 sockaddr_in 缓冲会被
+        // recvfrom 写穿（堆损坏）。
+        byte[] fromAddr = new byte[32];
+        byte[] fromLen = new byte[4];
+        fromLen[0] = 32;
+        int n = SysRecvFrom(sock, buf, bufSize, 0, fromAddr, fromLen);
+        // recvfrom 是 ws2_32 的原始导入，返回 C `int`；-1 错误会
+        // 以 0xFFFFFFFF 零扩展返回。对低 32 位做符号归一化，使
+        // 下面的错误检查能看到真正的负数而不是约 4G（否则会让
+        // Substring 复制远超缓冲区——造成堆损坏）。
+        if (n > 2147483647) { n = n - 4294967296; }
+        if (n < 0) { n = 0; }
+        return buf.ToStr(0, n);
+    }
+
+    /// <summary>接收 UDP 数据报到调用方提供的缓冲区，返回
+    /// 字节数（出错/无数据时为 0）。用于二进制数据报：
+    /// 字符串版本用 strlen 计算长度，会在第一个 NUL
+    /// 字节处截断。</summary>
+    static int RecvFromInto(nint sock, byte[] buf, int bufSize) {
+        byte[] fromAddr = new byte[32];
+        byte[] fromLen = new byte[4];
+        fromLen[0] = 32;
+        int n = SysRecvFrom(sock, buf, bufSize, 0, fromAddr, fromLen);
+        // 对低 32 位做符号归一化（见 RecvFrom）。
+        if (n > 2147483647) { n = n - 4294967296; }
+        if (n < 0) { n = 0; }
+        return n;
+    }
+
+    /// <summary>在 IO reactor 上挂起直到有数据报可用，然后
+    /// 接收数据报。需要非阻塞套接字。</summary>
+    static async string RecvFromAsync(nint sock, int bufSize) {
+        await Socket.ReadReady(sock);
+        string result = RecvFrom(sock, bufSize);
+        return result;
+    }
+
+    // 最近一次 RecvFromPeer/RecvFromPeerAsync 收到数据报的发送方地址。
+    // 单线程运行时：请在 recv 后、该协程下一次 await 之前
+    // 通过 PeerIp/PeerPort 立即读取。
+    static string lastPeerIp = "";
+    static int lastPeerPort = 0;
+
+    /// <summary>最近一次通过 RecvFromPeer / RecvFromPeerAsync
+    /// 收到数据报的发送方 IPv4 地址。</summary>
+    static string PeerIp() {
+        return lastPeerIp;
+    }
+
+    /// <summary>最近一次通过 RecvFromPeer / RecvFromPeerAsync
+    /// 收到数据报的发送方 UDP 端口。</summary>
+    static int PeerPort() {
+        return lastPeerPort;
+    }
+
+    /// <summary>接收一个 UDP 数据报并记录发送方地址，以便
+    /// 服务器回信（见 PeerIp/PeerPort）。返回负载（出错/关闭时
+    /// 为空 ""）。</summary>
+    static string RecvFromPeer(nint sock, int bufSize) {
+        byte[] buf = new byte[bufSize + 1];
+        // 32 字节容纳 sockaddr_in6（28 字节）；IPv6 对端地址
+        // 会让 16 字节缓冲被 recvfrom 写穿。
+        byte[] fromAddr = new byte[32];
+        byte[] fromLen = new byte[4];
+        fromLen[0] = 32;
+        int n = SysRecvFrom(sock, buf, bufSize, 0, fromAddr, fromLen);
+        // 对低 32 位做符号归一化（见 RecvFrom）。
+        if (n > 2147483647) { n = n - 4294967296; }
+        if (n < 0) { n = 0; }
+        if (n > 0) {
+            // 端口在 sockaddr_in / sockaddr_in6 的同一偏移（2），
+            // 均为网络字节序；地址文本由 C 端按族格式化。
+            lastPeerPort = ((fromAddr[2] & 255) << 8) + (fromAddr[3] & 255);
+            lastPeerIp = Socket.SockAddrIpText(fromAddr);
+        } else {
+            lastPeerPort = 0;
+            lastPeerIp = "";
+        }
+        return buf.ToStr(0, n);
+    }
+
+    /// <summary>挂起直到数据报到达，接收并记录
+    /// 发送方地址（见 PeerIp/PeerPort）。需要非阻塞套接字。</summary>
+    static async string RecvFromPeerAsync(nint sock, int bufSize) {
+        await Socket.ReadReady(sock);
+        string result = RecvFromPeer(sock, bufSize);
+        return result;
+    }
+
+    [DllImport("crt", EntryPoint = "memcpy")]
+    static extern nint PlatMemCopyIn(byte[] dst, nint src, long n);
+
+    /// <summary>将主机名解析为 IPv4 地址，字节序与
+    /// <c>inet_addr</c> 一致（第一段在低字节），无法
+    /// 解析时返回 0。通过运行时 C shim 调用 gethostbyname/AF_INET，
+    /// 避免在 Zan 代码中硬编码 hostent 布局。</summary>
+    static int ResolveIpv4(string hostname) {
+        return Socket.NativeResolveIpv4(hostname);
+    }
+
+    /// <summary>异步将主机名解析为 IPv4 地址（返回值与
+    /// <see cref="ResolveIpv4"/> 相同：0 表示失败）。解析在
+    /// 后台线程执行，协程在 IO reactor 上挂起直到完成，不会
+    /// 阻塞事件循环——ConnectAsync 用它替代同步解析。</summary>
+    static async int ResolveAsync(string hostname) {
+        return await Socket.ResolveAsync(hostname);
+    }
+
+    /// <summary>将主机名解析为 IP 地址。若无法解析则返回 ""；
+    /// 否则返回原主机名。</summary>
+    static string Resolve(string hostname) {
+        if (Socket.NativeResolveIpv4(hostname) == 0) { return ""; }
+        return hostname;
+    }
+
+    /// <summary>远端 IP 地址文本。拷贝语义：返回的托管字符串拥有自己的
+    /// 字节，不受线程共享格式化缓冲或 await 后协程迁移的影响
+    /// （此前直接采纳原生指针，WebApp 存下 ctx.RemoteIp 后会被
+    /// 下一个连接的调用悄悄改写——限流键因此被污染）。</summary>
+    static string RemoteIp(nint sock) {
+        nint buf = NativeMemory.Alloc(64);   // INET6_ADDRSTRLEN 上限
+        if (buf == 0) { return ""; }
+        return IpTextFromNative(buf, NativePeerIpInto(sock, buf, 64));
+    }
+
+    /// <summary>最近一次失败的套接字系统调用的平台错误码：
+    /// Windows 的 WSAGetLastError，POSIX 的 errno。供失败路径
+    /// 构造诊断信息——之前 CreateTcp/Bind/Listen 的失败
+    /// 被静默吞掉，调用方只知道操作失败了。</summary>
+    static int LastSocketError() {
+        return Socket.lastError;
+    }
+
+    // WSAGetLastError / errno 是线程局部的，且会被任何后续
+    // FFI 调用覆盖——哪怕是一次成功的 closesocket 也会清零。
+    // 失败路径往往在读取错误码之前还要关闭 fd 清理资源，因此
+    // 错误码必须在失败检查点（上述调用返回失败时）立即捕获，
+    // 而不是事后查询。LastSocketError() 返回的就是这个缓存。
+    static int lastError;
+    static bool resolveFailed;
+
+    /// 失败检查点处立即捕获平台错误码（见 lastError 上的说明）。
+    static void CaptureLastError() {
+        #if WINDOWS
+        Socket.lastError = WinLastError();
+        #elif LINUX
+        nint slot = NativeErrnoLocation();
+        byte[] x = new byte[4];
+        PlatMemCopyIn(x, slot, 4);
+        Socket.lastError = (x[0] & 255) + ((x[1] & 255) << 8)
+            + ((x[2] & 255) << 16) + ((x[3] & 255) << 24);
+        #elif MACOS
+        nint slot = NativeErrnoLocation();
+        byte[] x = new byte[4];
+        PlatMemCopyIn(x, slot, 4);
+        Socket.lastError = (x[0] & 255) + ((x[1] & 255) << 8)
+            + ((x[2] & 255) << 16) + ((x[3] & 255) << 24);
+        #endif
+    }
+
+    /// 最近一次解析是否失败（BuildSockAddrAsync / ConnectAsync 置位）。
+    static bool LastResolveFailed() {
+        return Socket.resolveFailed;
+    }
+
+    /// 更新 LastResolveFailed 报告的标志。
+    static void MarkResolveFailed(bool failed) {
+        Socket.resolveFailed = failed;
+    }
+
+    /// IPv4 文本 → 整数（字节序与 <c>inet_addr</c> 一致，第一段在低
+    /// 字节），再按点分十进制的高位在前重排为 0..4294967295；
+    /// 解析失败返回 -1（255.255.255.255 例外，inet_addr 对它返回 -1
+    /// 但它是合法地址）。
+    static long Ipv4ToLong(string ip) {
+        int address = InetAddr(ip);
+        if (address == 0 - 1 && ip != "255.255.255.255") { return -1; }
+        return (long)(address & 255) * 16777216
+            + (long)((address >> 8) & 255) * 65536
+            + (long)((address >> 16) & 255) * 256
+            + (long)((address >> 24) & 255);
+    }
+
+    /// Ipv4ToLong 的逆变换：0..4294967295 → 点分十进制；越界返回 ""。
+    static string LongToIpv4(long ipValue) {
+        if (ipValue < 0 || ipValue > 4294967295) { return ""; }
+        return Convert.ToString((ipValue >> 24) & 255) + "."
+            + Convert.ToString((ipValue >> 16) & 255) + "."
+            + Convert.ToString((ipValue >> 8) & 255) + "."
+            + Convert.ToString(ipValue & 255);
+    }
+
+    /// <summary>套接字是否仍然存活；false 表示
+    /// 已被关闭（例如监听器被 Stop() 关闭）。</summary>
+    static bool IsOpen(nint sock) {
+        return SocketAlive(sock) != 0;
+    }
+
+    /// <summary>用 select() 以零超时检查套接字是否可读。</summary>
+    static bool IsReadable(nint sock) {
+        return ReactorReady(sock, 0) > 0;
+    }
+
+    /// <summary>用 select() 以零超时检查套接字是否可写。</summary>
+    static bool IsWritable(nint sock) {
+        return ReactorReady(sock, 1) > 0;
+    }
+}

@@ -749,7 +749,12 @@ int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
                             zan_pkg_namespace_probe_t probe,
                             zan_pkg_source_visitor_t visitor, void *context,
                             int hierarchical) {
-    if (!project_dir || !pkg_safe_namespace_path(namespace_path) || !probe || !visitor) return 0;
+    /* Empty project root = packages disabled (--no-packages, the generator
+     * child): user packages must not leak into that closure, because pkg
+     * files skip the live-name gate and may carry generator-magic calls
+     * (Json.Serialize, db.Insert<T>) that cannot resolve under --no-gen. */
+    if (!project_dir || !project_dir[0] ||
+        !pkg_safe_namespace_path(namespace_path) || !probe || !visitor) return 0;
     char target_ns[256]; size_t n = strlen(namespace_path);
     if (n >= sizeof(target_ns)) return 0;
     for (size_t i = 0; i <= n; i++)
@@ -854,7 +859,8 @@ static int pkg_store_source_roots(const char *store,
 
 int zan_pkg_all_source_roots(const char *project_dir,
                              char (*out_roots)[1024], int max_roots) {
-    if (!out_roots || max_roots <= 0) return 0;
+    if (!project_dir || !project_dir[0] || !out_roots || max_roots <= 0)
+        return 0;
     char store[1024];
     int count = 0;
     if (project_dir && project_dir[0]) {
@@ -895,7 +901,8 @@ int zan_pkg_all_source_roots(const char *project_dir,
 
 int zan_pkg_find_namespace(const char *project_dir, const char *namespace_path,
                            char (*out_dirs)[1024], int max_dirs) {
-    if (!project_dir || !pkg_safe_namespace_path(namespace_path) ||
+    if (!project_dir || !project_dir[0] ||
+        !pkg_safe_namespace_path(namespace_path) ||
         !out_dirs || max_dirs <= 0) return 0;
     char store[1024]; int count = 0;
     /* 1. Project packages/ directory (monorepo / local packages) */

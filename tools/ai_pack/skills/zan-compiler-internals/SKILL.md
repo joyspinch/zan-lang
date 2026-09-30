@@ -2559,3 +2559,24 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   tar -x` 解到独立临时目录，再拷入当前 zanc 及其运行时 obj 兄弟文件——包/stdlib
   发现跟 zanc **二进制位置**走，床内 zanc 只见 HEAD 冻结包，工作树在途噪声（别的
   会话改到一半的包文件）完全隔离。tar 对 linux 驱动符号链接的报错在 Windows 无害。
+
+## 生成器子编译不认生成器魔法，也不许吸包：--no-packages（2026-09-30，System.Net 拆包实测）
+
+- 坑：`Json.Serialize<T>`/`db.Insert<T>` 是**生成器魔法**——只在父编译的生成管线里
+  降级重写（`__JsonBind.D_/S_`），全仓根本没有 `class Json`。生成器子编译带
+  `--no-gen`，重写不发生，这类调用在此语境**不可解析**。此前不炸纯因 stdlib 文件
+  受拉入活名门保护（子闭包没人提那个文件 → 不入集）；拆包后包文件跳过活名门
+  **无条件入编**（`[pullin] incl ... because pkg`），用户包里任何带魔法调用的文件
+  （MQTT broker 管理端点、Web 框架错误页同款）都会炸掉**所有**触发生成器的编译
+  （报 `unresolved call 'Json.Serialize'`）。雪上加霜：被活名门 skip 的文件，其
+  `using` 仍会被编译器侧的启发式词法扫描 reach，目录一 reach 就整包入编。
+- 修法：zanc 新旗标 `--no-packages`（空 project root 令包发现三入口
+  visit_namespace/all_source_roots/find_namespace 全变 no-op，连 exe 相对与全局
+  包店一并关掉），生成器子进程 argv 带上；`--no-packages` 同时静音
+  `ZANPKG_MISSING`（包是"被设计关掉"不是"缺失"）。生成器缓存键含 zexe 字节+
+  stdlib 全量内容，键不需另动。生成器闭包本来就只需 stdlib，顺带把子编译从
+  数百个无关 Gui 文件缩回纯 stdlib。回归锁：`conformance_gen_pkg_isolation`
+  （自带未引用毒包 + Json 触发 main）。
+- 定式：拆包后凡是"stdlib 文件当初靠活名门躲过的坑"都要重估——包文件的入编
+  语义是"无条件"，stdlib 的语义是"被提及才入"。生成器子编译、LSP 单文件、
+  任何 `--no-gen` 路径都在此列。
