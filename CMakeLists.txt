@@ -801,6 +801,36 @@ if(NOT WIN32)
     add_dependencies(zanc zanrt_sigpipe_test)
 endif()
 
+# B-ID30: a ready() during a foreground multi-worker run must not start a
+# second, detached worker pool. Needs the ZAN_CO_DRIVER flavor of the reactor
+# (the pool machinery lives there), so it cannot share the targets above.
+# The thread-count assertion reads /proc (Linux); elsewhere it degrades to
+# proving the frames still run to completion under the single-pool gate.
+if(NOT WIN32)
+    add_executable(zanrt_fg_pool_test
+        tests/runtime/rt_fg_pool_test.c
+        src/runtime/rt_io.c
+        src/runtime/rt_timer.c
+    )
+    target_compile_definitions(zanrt_fg_pool_test PRIVATE
+        ZAN_IO_STACKLESS_ONLY ZAN_CO_DRIVER)
+    target_include_directories(zanrt_fg_pool_test PRIVATE ${CMAKE_SOURCE_DIR})
+    set_target_properties(zanrt_fg_pool_test PROPERTIES
+        C_STANDARD 11
+        C_STANDARD_REQUIRED YES
+    )
+    # The driver half is documented to run with _GNU_SOURCE (rt_crash.h).
+    target_compile_definitions(zanrt_fg_pool_test PRIVATE _GNU_SOURCE)
+    find_package(Threads REQUIRED)
+    target_link_libraries(zanrt_fg_pool_test PRIVATE Threads::Threads)
+    if(NOT APPLE)
+        target_link_libraries(zanrt_fg_pool_test PRIVATE rt)
+    endif()
+    add_test(NAME runtime_fg_pool COMMAND zanrt_fg_pool_test)
+    set_tests_properties(runtime_fg_pool PROPERTIES TIMEOUT 60)
+    add_dependencies(zanc zanrt_fg_pool_test)
+endif()
+
 # ---- json OOM recovery test (A1) ----
 # json.c is built with -DZAN_ALLOC_INJECT so its abort-on-OOM policy is replaced
 # by NULL-return and the Nth allocation can be forced to fail; the test then

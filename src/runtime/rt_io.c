@@ -4273,6 +4273,7 @@ static zan_co_worker_t  g_wk[ZAN_CO_MAXW];
  * a task queued by any thread is executed without the host program ever
  * entering zan_co_sched_run. Worker count stays ZAN_CO_WORKERS. */
 static volatile LONG g_co_pool_live;   /* a generation of background workers is serving */
+static volatile LONG g_co_pool_fg;     /* the foreground zan_co_sched_run owns execution */
 static int           g_co_pool_gen;     /* generation id (stale workers skip the handshake) */
 static volatile LONG g_co_pool_out;     /* workers of the current generation still running */
 static int           g_io_shards_live;  /* reactor sharded exactly once per process */
@@ -5191,23 +5192,30 @@ static void co_pool_retire(zan_co_worker_t *w) {
 }
 
 static void co_pool_ensure(void) {
-    if (g_co_pool_live) return;
+    /* The foreground run counts as a live pool: while zan_co_sched_run's own
+     * workers serve the queues, a ready here must not start a second, detached
+     * generation behind their backs (2x workers, interleaved lifecycles --
+     * B-ID30). A pool of either kind re-checks for stragglers on its way out
+     * (sched_run's post-join ensure), so closing the gate here never strands a
+     * queued frame. */
+    if (g_co_pool_live || g_co_pool_fg) return;
     if (InterlockedCompareExchange(&g_co_pool_live, 1, 0) == 0) {
         co_pool_start_background();
     }
 }
 
 void zan_co_sched_run(void) {
-    if (g_co_pool_live) {
-        /* A background pool owns execution (a foreign thread spawned work
-         * before the host ever called this). Do not start a second pool --
-         * wait for the outstanding work, then hand back. Every schedulable
-         * state is covered by the four counters: queued (pending), parked on
-         * IO, parked on a timer, or running. A live-but-done frame is NOT
-         * work and must not block the pump: a Task<T> spawn deliberately
-         * leaves its frame unreaped so Task.Result can read it, so
-         * live_count never reaches 0 while a result is pending -- waiting on
-         * it here deadlocked the very Wait/Result pump that should reap it
+    if (g_co_pool_live || g_co_pool_fg) {
+        /* A pool owns execution: a detached background generation (a foreign
+         * thread spawned work before the host ever called this), or the
+         * foreground pool another thread is running right now. Do not start a
+         * second pool -- wait for the outstanding work, then hand back. Every
+         * schedulable state is covered by the four counters: queued (pending),
+         * parked on IO, parked on a timer, or running. A live-but-done frame is
+         * NOT work and must not block the pump: a Task<T> spawn deliberately
+         * leaves its frame unreaped so Task.Result can read it, so live_count
+         * never reaches 0 while a result is pending -- waiting on it here
+         * deadlocked the very Wait/Result pump that should reap it
          * (cs_b15_task, 2026-09-23). */
         for (;;) {
             /* Take an epoch-stable snapshot. A worker can dequeue before it
@@ -5236,6 +5244,12 @@ void zan_co_sched_run(void) {
     g_co_workers = co_worker_count();
     int w = g_co_workers;
     g_co_stop = 0;
+    /* Publish foreground ownership before any worker exists. Every wake -- an
+     * IO completion, a timer pop -- ends in zan_co_ready, whose tail calls
+     * co_pool_ensure; without this flag each wake saw g_co_pool_live == 0
+     * there and started a second, detached pool: 2x workers over-subscribed
+     * on the same queues, two pool lifecycles interleaved (B-ID30). */
+    InterlockedExchange(&g_co_pool_fg, 1);
     /* Shard the reactor before any worker starts: a shard with no waiter would
      * hold completions nobody dequeues. */
     io_shards_start(w);
@@ -5264,6 +5278,16 @@ void zan_co_sched_run(void) {
         pthread_join(th[i], NULL);
     }
 #endif
+    InterlockedExchange(&g_co_pool_fg, 0);
+    /* A frame readied between the last worker's final quiescence check and
+     * this point found co_pool_ensure closed (fg flag up) with no worker left
+     * alive to serve it. Re-run the workers' own idle predicate and hand any
+     * straggler to a fresh background pool instead of tearing the port down
+     * underneath it. */
+    if (!co_all_idle()) {
+        co_pool_ensure();
+        return;             /* the background pool owns the port now */
+    }
     co_stats_dump();
     zan_io_shutdown();
 }
@@ -5275,12 +5299,13 @@ void zan_co_sched_run(void) {
  * the ONE frame it named (root-await entries -- Thread.Start bodies -- block
  * until their own job completes, not until global quiescence). */
 void zan_co_sched_run_until(const volatile int *done) {
-    if (g_co_pool_live && done != NULL) {
-        /* Pool runs the work; this thread only waits for the ONE frame it
-         * named -- yield-spin so a frame that completes in microseconds
-         * does not eat a 1ms sleep granularity. Once *done is set, return
-         * immediately so callers are not blocked by long-running background
-         * tasks (e.g. metrics flushers or timers). */
+    if ((g_co_pool_live || g_co_pool_fg) && done != NULL) {
+        /* A pool (background generation or the foreground run) is serving the
+         * queues; this thread only waits for the ONE frame it named -- yield-
+         * spin so a frame that completes in microseconds does not eat a 1ms
+         * sleep granularity. Once *done is set, return immediately so callers
+         * are not blocked by long-running background tasks (e.g. metrics
+         * flushers or timers). */
         int spins = 0;
         /* Acquire load: the producer publishes the result slot BEFORE the
          * release store of *done, so seeing 1 here guarantees the result

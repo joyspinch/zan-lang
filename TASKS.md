@@ -22,10 +22,6 @@
 ")`（或恢复既有转换语义，先归因）。
 - [ ] **B-ID28** GUI 回归门禁恢复——tests/gui/chatview_bubble_test.zan 以 build/zanc(HEAD) 编译后挂死（零输出，窗口建起不进帧），guimin 探针（同编译器、App.Create/Show/FrameGuarded/PumpGuarded/RequestAnimationFrame 全链路）DONE 正常，包根皮肤探针（stdlib-noskins+ZanSkinSim）DONE 正常，非 GUI 探针正常——挂死锁定在 chatview 88 文件闭包与并行会话在途 rt_io.c 定时器/反应器在途状态的环境交互，非拆包/包根发现回归。并行会话 rt_io 工作落地、zan_gui.dll 代际重暂存后：ctest -R conformance_gui_chatview_bubble 复跑，绿则解锁整包 Gui 拆分（B-ID26 尾注）。
 
-## 未完成 · 运行时
-
-- [ ] **B-ID30**（原编号 B-ID28，让位并行会话 05e55978 的同名条目，批0 修正）前台 sched_run 运行中首个协程唤醒经 co_pool_ensure 再启一组后台 worker 池：`zan_co_ready` 尾部无条件 `co_pool_ensure()`（`g_co_pool_live==0` 即 CAS 0→1 起 g_co_workers 个后台线程），而 `zan_co_sched_run` 前台分支自己已按同一 worker 数起池并内联跑 worker0——任何 await 恢复（如 io_wake）都触发，前台模式瞬时 2× worker 过订、前后台两组池生命周期交错（后台组靠 co_all_idle 自退，前台组看自己的空闲计数）。2026-09-30 批2f gdb 栈转储实证（前台 co_worker(0) 在 poll 轮内、另一 LWP 跑 co_worker_thunk），此前被 init 自锁掩盖、批2f 修复后暴露为既有行为；探针 32/32 全过说明现网无害，但 worker 翻倍与双重池语义需收敛：co_pool_ensure 应感知前台池在跑（独立于 g_co_pool_live 的前台标志）。
-
 ## 未完成 · 语义决策（审计批遗留，待拍板）
 
 - [ ] **B-ID31** 运行时错误软着陆 vs fail-fast 默认：全仓审计批（2026-09-30）识别——部分运行时错误路径现为软着陆（记录后继续），提案是改走 fail-fast 默认（Go 的 unrecovered panic 语义）。批2b 核实相关守卫在代码里已存在，改不改默认属产品语义拍板项，审计批未动。批2 相关结论以 git 历史为准（a94129fa..29ddaae2 系列）。
