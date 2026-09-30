@@ -1878,6 +1878,12 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
   - 定式：实现 `HeaderLong` 与 64 位 `RangeTotal`，`BuildDownloadRequest`、`DownloadBinaryOnceAsync` 全面支持 `long have`；`File` 增补 `GetSize64(path)` 经底层 `zan_file_length` 获得精确 64 位文件大小。
 - **Modbus TCP 客户端连接关闭唤醒**：
   - `ModbusClient.Close()` 必须同步调用 `ReleaseLock()` 并释放唤醒所有 `waiters` 挂起的协程，防止外部在并发交互期间关闭连接造成协程永久悬死。
+**坑十二（大文件流式上传句柄暴风根治与 File.ReadBytes 向量化加速）**：
+- **大文件上传反复开闭句柄风暴**：
+  - `HttpClient.UploadFileBytesAsync`（明文与 TLS）原先在 64KB 发送循环内反复调用 `File.ReadBytes(localPath, offset, want)`，导致 1GB 文件上传触发上万次 `fopen` / `fseek` / `fclose` 系统调用与句柄震荡，易引发文件占用冲突或句柄耗尽；
+  - 定式：`SendBytesBodyAsync` 与 `SendBytesBodyTlsAsync` 统一改为单句柄顺序流式读取（一次 `fopen`，逐块 `fread` 直发，结束 `fclose`），并全面支持 64 位文件长度（`long fileLen`、`long total`、`long offset`），`UploadTick` 对超 2GB 进度安全钳制在 32 位上限，防整数溢出；
+- **File.ReadBytes 向量化搬运**：
+  - `File.ReadBytes` 分块从 4KB 扩至 64KB，彻底剥离解释层逐字节 `for` 循环，全面使用 `NativeMemory.Copy` 快速搬运数据。
 
 
 ## File 读族 alt-base 回退 exe 目录 vs Directory 清理 CWD 相对：测试缓存目录必须用绝对路径

@@ -113,6 +113,9 @@ class HttpClient {
     static extern long fwrite(string buf, long size, long count, nint fp);
 
     [DllImport("crt")]
+    static extern long fread(byte[] buf, long size, long count, nint fp);
+
+    [DllImport("crt")]
     static extern int fseek(nint fp, int offset, int origin);
 
     [DllImport("crt")]
@@ -231,9 +234,13 @@ class HttpClient {
     }
 
     /// 探针非空时上报一次进度；装探针的调用点在发送循环里，成本只有
-    /// 一次空判 + 一次委托调用。
-    void UploadTick(int sentBytes, int totalBytes) {
-        if (this.uploadProbe != null) { this.uploadProbe(sentBytes, totalBytes); }
+    /// 一次空判 + 一次委托调用。对 >2GB 上传安全钳制在 32 位上限，防溢出。
+    void UploadTick(long sentBytes, long totalBytes) {
+        if (this.uploadProbe != null) {
+            int sent = sentBytes > 2147483647 ? 2147483647 : (int)sentBytes;
+            int total = totalBytes > 2147483647 ? 2147483647 : (int)totalBytes;
+            this.uploadProbe(sent, total);
+        }
     }
 
     /// <summary>最近一次二进制下载失败的阶段诊断；成功或尚未下载时为空。</summary>
@@ -352,9 +359,9 @@ class HttpClient {
 
     /// 绑定 policy 后，正文在建连前按统一 max request bytes 拒绝，
     /// 避免副作用请求已经上线。超限时抛 HttpRequestException。
-    void CheckRequestLimit(int bodyBytes) {
+    void CheckRequestLimit(long bodyBytes) {
         if (this.callPolicy == null) { return; }
-        int limit = this.callPolicy.MaxRequestBytes();
+        long limit = (long)this.callPolicy.MaxRequestBytes();
         if (limit > 0 && bodyBytes > limit) {
             throw new HttpRequestException(
                 "request body exceeds " + Convert.ToString(limit) + " bytes");
@@ -542,8 +549,8 @@ class HttpClient {
         return true;
     }
 
-    /// 构建请求头部半区；bodyLen<=0 时不写 Content-Length。
-    string BuildRequestHead(string method, string path, int bodyLen,
+    /// 构建请求头部半区；bodyLen<=0 时不写 Content-Length。支持 64 位大请求体。
+    string BuildRequestHead(string method, string path, long bodyLen,
                             bool close) {
         if (!HttpClient.IsMethodSafe(method) || !HttpClient.IsHostSafe(this.host)
             || !HttpClient.IsRequestTargetSafe(path)) {
@@ -1755,13 +1762,13 @@ class HttpClient {
     /// UploadFileBytesAsync 的明文通道：头部 + 文件字节 + 尾部三段式，
     /// 每段按显式字节长度发送——strlen 定长的 SendAsync 会把内嵌 NUL
     /// 后的正文截掉；Content-Length（total）与各段发送长度取自同一处
-    /// （与 HttpServer 发送二进制响应同一纪律）。文件按 64KB 分块
-    /// 读取上线，进度探针随字节推进。绑定 policy 时接入字节重定向链：
+    /// （与 HttpServer 发送二进制响应同一纪律）。单句柄流式读取，
+    /// 文件按 64KB 分块读取上线，进度探针随字节推进。绑定 policy 时接入字节重定向链：
     /// 3xx 原样返回仍是默认；301/302/303 改写为 GET 后实体不重放
     /// （multipart 上传无法降级），由驱动端发空 GET。
     async HttpResponse SendBytesBodyAsync(string method, string path,
-            string head, string localPath, int fileLen, string tail,
-            int total) {
+            string head, string localPath, long fileLen, string tail,
+            long total) {
         this.CheckRequestLimit(total);
         this.CheckTargetPolicy();
         TcpClient conn = await this.ConnectTarget();
@@ -1775,28 +1782,38 @@ class HttpClient {
             conn.Close();
             throw new HttpRequestException("upload write failed");
         }
-        this.UploadTick(req.Length + head.Length, total);
-        int offset = 0;
+        this.UploadTick((long)(req.Length + head.Length), total);
+        nint fp = fopen(localPath, "rb");
+        if (fp == 0) {
+            HttpDeadline.Disarm(watch);
+            conn.Close();
+            throw new FileNotFoundException("Could not open file: " + localPath);
+        }
+        long offset = 0;
+        byte[] chunk = new byte[65536];
         while (offset < fileLen) {
-            int want = fileLen - offset;
+            long want = fileLen - offset;
             if (want > 65536) { want = 65536; }
-            byte[] chunk = File.ReadBytes(localPath, offset, want);
-            if (chunk.Length < want) {
+            int got = (int)fread(chunk, 1, want, fp);
+            if (got < (int)want) {
+                fclose(fp);
                 HttpDeadline.Disarm(watch);
                 this.CloseChannel(conn, null, null, null);
                 throw new HttpRequestException(
                     "file shrank while being uploaded: " + localPath);
             }
-            int _c = await conn.SendBytesAsync(chunk, chunk.Length);
-            if (_c != chunk.Length) {
+            int _c = await conn.SendBytesAsync(chunk, got);
+            if (_c != got) {
+                fclose(fp);
                 HttpDeadline.Disarm(watch);
                 conn.Close();
                 throw new HttpRequestException("upload write failed");
             }
             HttpDeadline.Touch(watch, this.WriteBudget());
-            offset = offset + chunk.Length;
-            this.UploadTick(req.Length + head.Length + offset, total);
+            offset = offset + (long)got;
+            this.UploadTick((long)(req.Length + head.Length) + offset, total);
         }
+        fclose(fp);
         int _t = await conn.SendBytesAsync(tail, tail.Length);
         if (_t != tail.Length) {
             HttpDeadline.Disarm(watch);
@@ -1839,10 +1856,10 @@ class HttpClient {
     }
 
     /// UploadFileBytesAsync 的 TLS 变体：握手同 SendBytesTlsAsync，
-    /// 三段式正文按显式长度发送，读取走 HttpFramerTls.Create。
+    /// 三段式正文按显式长度发送，单句柄流式读取，读取走 HttpFramerTls.Create。
     async HttpResponse SendBytesBodyTlsAsync(string method, string path,
-            string head, string localPath, int fileLen, string tail,
-            int total) {
+            string head, string localPath, long fileLen, string tail,
+            long total) {
         this.CheckRequestLimit(total);
         this.CheckTargetPolicy();
         Socket.Initialize();
@@ -1890,20 +1907,29 @@ class HttpClient {
             ctx.Free();
             throw new HttpRequestException("upload write failed");
         }
-        this.UploadTick(req.Length + head.Length, total);
-        int offset = 0;
+        this.UploadTick((long)(req.Length + head.Length), total);
+        nint fp = fopen(localPath, "rb");
+        if (fp == 0) {
+            HttpDeadline.Disarm(watch);
+            this.CloseChannel(conn, null, stream, ctx);
+            throw new FileNotFoundException("Could not open file: " + localPath);
+        }
+        long offset = 0;
+        byte[] chunk = new byte[65536];
         while (offset < fileLen) {
-            int want = fileLen - offset;
+            long want = fileLen - offset;
             if (want > 65536) { want = 65536; }
-            byte[] chunk = File.ReadBytes(localPath, offset, want);
-            if (chunk.Length < want) {
+            int got = (int)fread(chunk, 1, want, fp);
+            if (got < (int)want) {
+                fclose(fp);
                 HttpDeadline.Disarm(watch);
                 this.CloseChannel(conn, null, stream, ctx);
                 throw new HttpRequestException(
                     "file shrank while being uploaded: " + localPath);
             }
-            int _c = await stream.SendAsync(chunk, chunk.Length);
-            if (_c != chunk.Length) {
+            int _c = await stream.SendBytesAsync(chunk, got);
+            if (_c != got) {
+                fclose(fp);
                 HttpDeadline.Disarm(watch);
                 stream.Close();
                 conn.Close();
@@ -1911,9 +1937,10 @@ class HttpClient {
                 throw new HttpRequestException("upload write failed");
             }
             HttpDeadline.Touch(watch, this.WriteBudget());
-            offset = offset + chunk.Length;
-            this.UploadTick(req.Length + head.Length + offset, total);
+            offset = offset + (long)got;
+            this.UploadTick((long)(req.Length + head.Length) + offset, total);
         }
+        fclose(fp);
         int _t = await stream.SendAsync(tail, tail.Length);
         if (_t != tail.Length) {
             HttpDeadline.Disarm(watch);
@@ -2728,7 +2755,7 @@ class HttpClient {
     /// 进度（已上线字节/总字节）经 <see cref="SetUploadProbe"/> 上报。</summary>
     async HttpResponse UploadFileBytesAsync(string path, string field,
             string localPath, string fileName) {
-        int fileLen = File.GetSize(localPath);
+        long fileLen = File.GetSize64(localPath);
         if (fileLen < 0) {
             throw new FileNotFoundException("Could not open file: "
                 + localPath);
@@ -2743,7 +2770,7 @@ class HttpClient {
             + "\"; filename=\"" + fileName + "\"\r\n"
             + "Content-Type: " + HttpClient.GuessMime(fileName) + "\r\n\r\n";
         string tail = "\r\n--" + boundary + "--\r\n";
-        int total = head.Length + fileLen + tail.Length;
+        long total = (long)head.Length + fileLen + (long)tail.Length;
         this.CheckTargetPolicy();
         this.CheckRequestLimit(total);
         if (!this.HasHeaderName("Content-Type")) {
