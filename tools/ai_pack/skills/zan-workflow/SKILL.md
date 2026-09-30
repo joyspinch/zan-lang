@@ -45,6 +45,15 @@ description: 版本提交与任务管理规范——提交信息格式（scope: 
   目录级 `git mv stdlib/Gui packages/Zan.Gui/src/Gui` 连续三次 Permission denied
   （当时无 zanc 进程），逐 17 个子目录移动全部成功。
 
+- **搬移带驱动束的包，`git add` 会被 .gitignore 静默拦截**：*.dll/*.so/*.dylib
+  是全局通配忽略且无 drivers 例外，整目录 `git add packages/X` 不报错但二进制
+  全部不入库——推送后才发现 HEAD 缺 lua54.dll（2026-10-01 Zan.Scripting 实测，
+  靠 Zan.Data libpq.dll 已入库作对照才定位）。搬完 `git ls-files`/status 逐文件
+  比对，二进制逐个 `git add -f`；文本驱动束（driver.manifest/bundle stub/def）
+  不受影响。附带坑：Windows 检出（core.symlinks=false）重加 symlink 会退化成
+  100644 文本文件，Linux 侧拿到假 so——用
+  `git update-index --add --cacheinfo 120000,<blob>,<路径>` 恢复链接语义。
+
 ## 三、任务台账（TASKS.md）：挂账有据，清账移单
 
 - **台账只记两类**：未修缺陷（编号+一句话现象+根因线索+复现探针位置）、
