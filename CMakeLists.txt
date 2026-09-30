@@ -1407,6 +1407,19 @@ add_test(NAME diag_member_call_qualifies_type
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_member_call_qualifies_type PROPERTIES TIMEOUT 60)
 
+# B-ID24 (user-adjudicated): a decimal literal in [2^31, 2^32] written into an
+# int slot used to wrap two's-complement (the uint32-bit-pattern exemption);
+# it now narrows with a CS0031-style error. Hex keeps the ARGB bit-pattern
+# wrap, and the explicit cast is the opt-in (conformance_int_literal_range).
+add_test(NAME diag_decimal_literal_narrowing
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/decimal_literal_narrowing.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_decimal_literal_narrowing${_exe_ext}
+    "-DEXPECT_REGEX=narrowing conversion from .long. to .int."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_decimal_literal_narrowing PROPERTIES TIMEOUT 60)
+
 # A `"role": "control"` .html design doc is an embeddable Control, not a window: it has
 # no Main/Show, so naming one as the project entry has to fail at formgen time
 # instead of linking a program with no entry point.

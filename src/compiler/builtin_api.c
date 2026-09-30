@@ -317,6 +317,7 @@ static const zan_builtin_member_t members_task[] = {
     { "Spawn",  'M', "long Spawn(asyncCall)" },
     { "Run",    'M', "long Run(asyncCall)" },
     { "Delay",  'M', "await Task.Delay(long ms)" },
+    { "Yield",  'M', "await Task.Yield()" },
     { "WhenAll",'M', "async int WhenAll(List<long> handles)" },
     { "WhenAny",'M', "async int WhenAny(List<long> handles)" },
     { "IsDone", 'M', "int IsDone(long handle)" },

@@ -10117,6 +10117,42 @@ static LLVMValueRef emit_await_blocking_extern(zan_irgen_t *g,
 
 static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
+        /* await Task.Yield() — cooperative requeue. Inside an async body:
+         * re-enqueue this frame at the TAIL of the driver's ready queue and
+         * return; the resume-k block re-enters from the queue after every
+         * currently-ready frame has had a turn, which is what lets a
+         * long-running frame give way without a timer. Same shape as Delay
+         * minus the timer registration (timers re-ready through zan_co_ready
+         * too -- the hook is set to it in zan_co_sched_init). At a non-async
+         * root it is a no-op (nothing to yield to). Yields no value. */
+        if (is_call_to(expr->await_expr.expr, "Task", "Yield") &&
+            expr->await_expr.expr->call.args.count == 0) {
+            if (g->current_async_frame && g->current_async_switch) {
+                int k = g->current_async_next_state++;
+                LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+                LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                LLVMValueRef selfframe = g->current_async_frame;
+                emit_async_save_slots(g);
+                zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0),
+                    LLVMBuildStructGEP2(g->builder, g->current_async_frame_type, selfframe,
+                                        ASYNC_FRAME_STATE, "self.state"));
+                zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready,
+                    (LLVMValueRef[]){ LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self"),
+                                      g->current_async_resume_fn }, 2, "");
+                emit_async_eh_unarm(g);
+                LLVMBuildRetVoid(g->builder);
+
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+                    g->current_async_resume_fn, "co.resume");
+                LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
+                LLVMPositionBuilderAtEnd(g->builder, rk);
+                emit_async_reload_slots(g);
+                return LLVMConstInt(di64, 0, 0);
+            }
+            return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
+        }
+
         /* await Task.Delay(ms) — time-based suspension (no sub-frame). Inside an
          * async body: register a one-shot timer that will re-ready this frame at
          * now+ms, then SUSPEND; the resume-k block just continues. At a non-async

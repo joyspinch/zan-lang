@@ -2638,3 +2638,10 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   旧 gen/ref-data.json，搬移后的 stdlib/ 路径静默残留且 git diff 为 0 的
   假象极具迷惑性；必须先 `python gen/api_extract.py` 再 site_build，验收
   标志是 index.json 里出现 `packages/<名>/` 新路径。
+- 并行会话锁死共享 build/zanc.exe（它连续编译时 lld-link 报 "failed to write output:
+  permission denied"，链接竞速必输）时的私目录验证配方：`cmake -B _scratch/bld-y -G Ninja
+  -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR=<主 CMakeCache 的 LLVM_DIR> -DCMAKE_C_COMPILER=/
+  -DCMAKE_CXX_COMPILER=<主缓存的 clang 路径>`（不传则 find_package 失败、或抓 PATH 里的
+  TDM-GCC 出 rpcnsip.h 类型错——AGENTS 警告的私目录变体），再 `--build --target zanc`；
+  私 zanc 编探针须带 `--stdlib-path stdlib`（exe 旁发现失效）+ `--no-packages`（隔离并行
+  会话在途包改动）。共账 build/ 不必抢：对方下次 ninja 调用自动用新源重链。

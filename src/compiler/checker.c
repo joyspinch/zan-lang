@@ -1636,9 +1636,20 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
         bool has_constant = const_integral_value(expr, &constant);
         bool native_handle_narrowing = value->kind == TYPE_NINT &&
             target->kind != TYPE_LONG && target->kind != TYPE_NINT;
+        /* A long constant that fits uint32 passes into an int slot by bit
+         * pattern -- but only when the operand spelling is not decimal.
+         * Hex in [2^31, 2^32] already types as `int` at the literal itself
+         * (the ARGB design), and the mask idiom (`x & 4294967295`) arrives
+         * as a binary expression, so both keep working untouched. What this
+         * exemption otherwise served was the accidental decimal constant:
+         * `int x = 3000000000` silently wrapped. A direct decimal literal
+         * now narrows like C# CS0031 and needs an explicit cast (B-ID24,
+         * user-adjudicated 2026-10-01). */
+        bool decimal_radix = expr && expr->kind == AST_INT_LITERAL &&
+            expr->lit_radix == 10;
         bool uint32_bit_pattern = value->kind == TYPE_LONG &&
             target->kind == TYPE_INT && has_constant && constant >= 0 &&
-            (uint64_t)constant <= UINT32_MAX;
+            (uint64_t)constant <= UINT32_MAX && !decimal_radix;
         /* The lexer preserves an unsuffixed/hex literal's full uint64 bit
          * pattern in int_val, so direct ulong literals above INT64_MAX appear
          * negative here. They are still exact ulong constants; a unary minus

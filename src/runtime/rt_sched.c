@@ -32,8 +32,31 @@
 #endif
 #include "../common/host_oom.h"
 
-/* Per-coroutine stack size. */
-#define ZAN_CO_STACK (128 * 1024)
+/* Per-coroutine stack size. 128 KB by default; ZAN_CO_STACK overrides it in
+ * bytes (clamped 64 KB..16 MB). The number is address-space/commit, not
+ * resident -- stacks are mmap'd / CreateFiber'd lazily, so a shallow coroutine
+ * touches only a few pages. Resolved once on first use; the scheduler is
+ * single-threaded (M:1), so no lock is needed.
+#define ZAN_CO_STACK_DEFAULT (128 * 1024)
+
+static size_t co_stack_size(void) {
+    static size_t cached;
+    if (!cached) {
+        size_t v = ZAN_CO_STACK_DEFAULT;
+        const char *env = getenv("ZAN_CO_STACK");
+        if (env && env[0]) {
+            char *end = NULL;
+            long long parsed = strtoll(env, &end, 10);
+            if (end && end != env && parsed > 0) {
+                if (parsed < 64 * 1024) parsed = 64 * 1024;
+                if (parsed > 16LL * 1024 * 1024) parsed = 16LL * 1024 * 1024;
+                v = (size_t)parsed;
+            }
+        }
+        cached = v;
+    }
+    return cached;
+}
 
 /* ---- coroutine + task objects ---- */
 
@@ -88,7 +111,7 @@ static void WINAPI co_trampoline(void *p);
 static void plat_sched_enter(void) { g_sched_fiber = ConvertThreadToFiber(NULL); }
 static void plat_sched_leave(void) { ConvertFiberToThread(); }
 static void *plat_fiber_new(zan_co_t *co) {
-    return CreateFiber(ZAN_CO_STACK, co_trampoline, co);
+    return CreateFiber((SIZE_T)co_stack_size(), co_trampoline, co);
 }
 static void plat_fiber_delete(void *f) { DeleteFiber(f); }
 static void plat_switch(void *to)      { SwitchToFiber(to); }
@@ -132,7 +155,7 @@ static char *plat_stack_alloc(void) {
         return s;
     }
     long page = sysconf(_SC_PAGESIZE);
-    size_t total = ZAN_CO_STACK + (size_t)page;
+    size_t total = co_stack_size() + (size_t)page;
     char *base = (char *)mmap(NULL, total, PROT_READ | PROT_WRITE,
                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (base == MAP_FAILED) return NULL;
@@ -151,7 +174,7 @@ static void plat_stack_free(char *stack) {
         return;
     }
     long page = sysconf(_SC_PAGESIZE);
-    munmap((char *)stack - page, ZAN_CO_STACK + (size_t)page);
+    munmap((char *)stack - page, co_stack_size() + (size_t)page);
 }
 
 static void plat_sched_enter(void) { g_sched_fiber = &g_sched_ctx; }
