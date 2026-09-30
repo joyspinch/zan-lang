@@ -21,11 +21,17 @@
 ')` 双重不匹配（内建 Split 签名 `List<string> Split(string separator)` 收 string；List<string>→string[] 无隐式转换），调用点 685355f6 引入、此前可编译说明近期 checker/内建面变化打破，worktree@29ddaae2 复现与 B-ID25 拆包无关（2026-09-30 坐实）；publish_ide.ps1 的 zan-mcp 步骤带 PUBLISH_WARN 继续、dist 落 stale 二进制。修法：调用点改 `List<string> lines = code.Split("
 ")`（或恢复既有转换语义，先归因）。
 - [ ] **B-ID28** GUI 回归门禁恢复——tests/gui/chatview_bubble_test.zan 以 build/zanc(HEAD) 编译后挂死（零输出，窗口建起不进帧），guimin 探针（同编译器、App.Create/Show/FrameGuarded/PumpGuarded/RequestAnimationFrame 全链路）DONE 正常，包根皮肤探针（stdlib-noskins+ZanSkinSim）DONE 正常，非 GUI 探针正常——挂死锁定在 chatview 88 文件闭包与并行会话在途 rt_io.c 定时器/反应器在途状态的环境交互，非拆包/包根发现回归。并行会话 rt_io 工作落地、zan_gui.dll 代际重暂存后：ctest -R conformance_gui_chatview_bubble 复跑，绿则解锁整包 Gui 拆分（B-ID26 尾注）。
-- [ ] **B-ID27** zanc 与部分运行时测试目标在 Linux 无法构建（2026-09-30 批2f WSL 验证时发现，HEAD `29ddaae2` 复现）：① `src/compiler/arena.c` 无条件 `#include <windows.h>`，Linux 编译即错，zanc 整体断；② `src/runtime/rt_crash.h` 使用 `SA_ONSTACK`（glibc 在 `_GNU_SOURCE` 下才暴露），`-std=c11` 严格模式目标不定义它——zanrt_timer 与 addr_test/sigpipe_test/sync_test 编译失败。影响：Linux/CI 侧编译器与运行时 POSIX 路径无法本机构建验证（批2f 的多 worker 反应器只能绕开构建系统手编探针）。方向：arena.c 按 `_WIN32` 分支化；rt_crash.h 或构建系统在 `__linux__` 下补 `_GNU_SOURCE`。
+- [ ] **B-ID29**（原编号 B-ID27，让位并行会话 05e55978 的同名条目，批0 修正）zanc 与部分运行时测试目标在 Linux 无法构建（2026-09-30 批2f WSL 验证时发现，HEAD `29ddaae2` 复现）：① `src/compiler/arena.c` 无条件 `#include <windows.h>`，Linux 编译即错，zanc 整体断；② `src/runtime/rt_crash.h` 使用 `SA_ONSTACK`（glibc 在 `_GNU_SOURCE` 下才暴露），`-std=c11` 严格模式目标不定义它——zanrt_timer 与 addr_test/sigpipe_test/sync_test 编译失败。影响：Linux/CI 侧编译器与运行时 POSIX 路径无法本机构建验证（批2f 的多 worker 反应器只能绕开构建系统手编探针）。方向：arena.c 按 `_WIN32` 分支化；rt_crash.h 或构建系统在 `__linux__` 下补 `_GNU_SOURCE`。
 
 ## 未完成 · 运行时
 
-- [ ] **B-ID28** 前台 sched_run 运行中首个协程唤醒经 co_pool_ensure 再启一组后台 worker 池：`zan_co_ready` 尾部无条件 `co_pool_ensure()`（`g_co_pool_live==0` 即 CAS 0→1 起 g_co_workers 个后台线程），而 `zan_co_sched_run` 前台分支自己已按同一 worker 数起池并内联跑 worker0——任何 await 恢复（如 io_wake）都触发，前台模式瞬时 2× worker 过订、前后台两组池生命周期交错（后台组靠 co_all_idle 自退，前台组看自己的空闲计数）。2026-09-30 批2f gdb 栈转储实证（前台 co_worker(0) 在 poll 轮内、另一 LWP 跑 co_worker_thunk），此前被 init 自锁掩盖、批2f 修复后暴露为既有行为；探针 32/32 全过说明现网无害，但 worker 翻倍与双重池语义需收敛：co_pool_ensure 应感知前台池在跑（独立于 g_co_pool_live 的前台标志）。
+- [ ] **B-ID30**（原编号 B-ID28，让位并行会话 05e55978 的同名条目，批0 修正）前台 sched_run 运行中首个协程唤醒经 co_pool_ensure 再启一组后台 worker 池：`zan_co_ready` 尾部无条件 `co_pool_ensure()`（`g_co_pool_live==0` 即 CAS 0→1 起 g_co_workers 个后台线程），而 `zan_co_sched_run` 前台分支自己已按同一 worker 数起池并内联跑 worker0——任何 await 恢复（如 io_wake）都触发，前台模式瞬时 2× worker 过订、前后台两组池生命周期交错（后台组靠 co_all_idle 自退，前台组看自己的空闲计数）。2026-09-30 批2f gdb 栈转储实证（前台 co_worker(0) 在 poll 轮内、另一 LWP 跑 co_worker_thunk），此前被 init 自锁掩盖、批2f 修复后暴露为既有行为；探针 32/32 全过说明现网无害，但 worker 翻倍与双重池语义需收敛：co_pool_ensure 应感知前台池在跑（独立于 g_co_pool_live 的前台标志）。
+
+## 未完成 · 语义决策（审计批遗留，待拍板）
+
+- [ ] **B-ID31** 运行时错误软着陆 vs fail-fast 默认：全仓审计批（2026-09-30）识别——部分运行时错误路径现为软着陆（记录后继续），提案是改走 fail-fast 默认（Go 的 unrecovered panic 语义）。批2b 核实相关守卫在代码里已存在，改不改默认属产品语义拍板项，审计批未动。批2 相关结论以 git 历史为准（a94129fa..29ddaae2 系列）。
+- [ ] **B-ID32** long/ulong 混号比较诊断：二进制数值提升 ulong 胜出（checker.c 数值提升，TYPE_ULONG 分支），long 操作数负值回绕成巨无符号——`long x = -1; ulong y = 1; x > y` 静默得 true。C# 要求显式转换（CS0037 一类报错），C/Java 静默转换。需拍板：保持现状或加编译诊断；加诊断须全仓扫混号比较点评估落点。
+- [ ] **B-ID33** for 循环闭包捕获语义：现状为按变量捕获（2026-09-30 探针实证：循环变量闭包三连得 `3,3,3`，体内局部副本得 `0,1,2`——经典 C#1/JS var 行为，体内手工副本有效）。C#5+/Go1.22+ 已改按迭代捕获（每迭代一份新存储）。需拍板：改语义（静默改变所有循环内闭包的既有行为，破坏性）或维持现状并在文档/诊断层给捕获循环变量的闭包提提醒。
 
 ## 未完成 · 编译内存
 
