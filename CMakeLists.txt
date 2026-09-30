@@ -930,6 +930,29 @@ add_test(NAME diag_async_aggregate_return
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_async_aggregate_return PROPERTIES TIMEOUT 60)
 
+# A hex/binary/octal literal above ulong.MaxValue used to be clamped by
+# strtoull with no diagnostic -- a 65-bit literal silently became a DIFFERENT
+# number (-1). All three radix paths now reject it like the decimal path does.
+add_test(NAME diag_int_literal_radix_overflow
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/int_literal_radix_overflow.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_int_literal_radix_overflow${_exe_ext}
+    "-DEXPECT_REGEX=integer literal is too large for 'ulong'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_int_literal_radix_overflow PROPERTIES TIMEOUT 60)
+
+# An explicit L suffix pins the literal to long; a value above long.MaxValue
+# cannot fit and is rejected instead of silently wrapping to -1.
+add_test(NAME diag_int_literal_long_suffix_overflow
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/int_literal_long_suffix_overflow.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_int_literal_long_suffix_overflow${_exe_ext}
+    "-DEXPECT_REGEX=integer literal is too large for 'long'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_int_literal_long_suffix_overflow PROPERTIES TIMEOUT 60)
+
 # wasm32 has no C ABI classification for aggregates crossing an extern
 # boundary. Declaring one must stay legal (stdlib SIMD headers get pulled
 # into compiles that never call them -- the declaration used to hard-error

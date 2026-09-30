@@ -704,6 +704,35 @@ static int lexer_int_suffix(zan_lexer_t *lex) {
     return enc;
 }
 
+/* Parse a hex/binary/octal digit string into the token's 64-bit slot under the
+ * same overflow discipline as the decimal path. strtoull clamps to
+ * ulong.MaxValue with ERANGE above it -- keeping the clamp silently truncated a
+ * 65-bit literal to 0xFFFFFFFFFFFFFFFF with no diagnostic. An explicit L suffix
+ * cannot hold a value above long.MaxValue (C# CS0031), and an unsuffixed one is
+ * typed ulong exactly like the decimal path's auto-promotion: keeping the raw
+ * bit pattern made the checker type `var v = 0xFFFFFFFFFFFFFFFF` as a negative
+ * long, silently CHANGING the written value to -1. */
+static int64_t lexer_radix_int_value(zan_lexer_t *lex, zan_loc_t loc,
+                                     const char *buf, int radix,
+                                     int *lit_suffix) {
+    errno = 0;
+    unsigned long long uv = strtoull(buf, NULL, radix);
+    if (errno == ERANGE) {
+        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                      "integer literal is too large for 'ulong'");
+        *lit_suffix = 0;
+        return 0;
+    }
+    if (uv <= 0x7FFFFFFFFFFFFFFFULL) return (int64_t)uv;
+    if (*lit_suffix == 1) {
+        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                      "integer literal is too large for 'long'");
+        return (int64_t)uv;
+    }
+    if (*lit_suffix == 0) *lit_suffix = 3; /* above long.MaxValue -> ulong */
+    return (int64_t)uv;
+}
+
 static zan_token_t lexer_number(zan_lexer_t *lex) {
     zan_loc_t loc = lexer_loc(lex);
     size_t start = lex->pos;
@@ -750,7 +779,8 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
             if (lit_truncated)
                 zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                               "integer literal is too long");
-            tok.int_val = (int64_t)strtoull(buf, NULL, 16);
+            tok.int_val = lexer_radix_int_value(lex, loc, buf, 16,
+                                                &tok.lit_suffix);
             return tok;
         }
         if (next == 'b' || next == 'B') {
@@ -789,7 +819,8 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
             if (lit_truncated)
                 zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                               "integer literal is too long");
-            tok.int_val = (int64_t)strtoull(buf, NULL, 2);
+            tok.int_val = lexer_radix_int_value(lex, loc, buf, 2,
+                                                &tok.lit_suffix);
             return tok;
         }
         if (next == 'o' || next == 'O') {
@@ -834,7 +865,8 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
             if (lit_truncated)
                 zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                               "integer literal is too long");
-            tok.int_val = (int64_t)strtoull(buf, NULL, 8);
+            tok.int_val = lexer_radix_int_value(lex, loc, buf, 8,
+                                                &tok.lit_suffix);
             return tok;
         }
     }
