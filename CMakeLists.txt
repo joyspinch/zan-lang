@@ -814,6 +814,21 @@ if(NOT WIN32)
 endif()
 add_test(NAME unit_json_trailing COMMAND zan_json_trailing_test)
 
+# ---- json \u0000 rejection test (NUL truncation) ----
+add_executable(zan_json_nul_test
+    tests/unit/json_nul_test.c
+    src/common/json.c
+)
+target_include_directories(zan_json_nul_test PRIVATE ${CMAKE_SOURCE_DIR})
+set_target_properties(zan_json_nul_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(NOT WIN32)
+    target_link_libraries(zan_json_nul_test PRIVATE m)
+endif()
+add_test(NAME unit_json_nul COMMAND zan_json_nul_test)
+
 # A design doc node must name a real Zan Control class. Invalid kinds fail at
 # formgen time instead of silently becoming a Panel or Label.
 add_test(NAME diag_invalid_design_kind

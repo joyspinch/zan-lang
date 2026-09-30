@@ -341,6 +341,12 @@ static json_value *jp_string(jparser *j) {
                     else if (h >= 'A' && h <= 'F') code |= (unsigned)(h - 'A' + 10);
                     else { j->ok = false; free(buf); return NULL; }
                 }
+                /* \u0000 decodes to a raw NUL, which the NUL-terminated string
+                 * model cannot carry: every strlen/strcmp/serialize consumer
+                 * would silently truncate at it (parsing "a\u0000b" reads back
+                 * "a"; a re-encode would drop the tail -- a bytes-changing
+                 * round trip that masks peer desync). Fail closed instead. */
+                if (code == 0) { j->ok = false; free(buf); return NULL; }
                 if (code >= 0xD800 && code <= 0xDBFF &&
                     j->end - j->p >= 6 && j->p[0] == '\\' && j->p[1] == 'u') {
                     j->p += 2;
