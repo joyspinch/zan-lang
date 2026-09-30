@@ -2087,7 +2087,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 expr->call.args.count == 1 &&
                 is_string_expr(g, sc->member.object, locals) &&
                 is_string_like_expr(g, expr->call.args.items[0], locals)) {
-                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
                 LLVMValueRef s = emit_expr(g, sc->member.object, locals);
                 int p_owned;
@@ -2096,10 +2095,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 /* a null receiver compares as the empty string, matching the
                  * null-coalescing the other string methods use */
                 s = emit_str_nonnull(g, s);
-                LLVMTypeRef strcmp_ty = LLVMFunctionType(i32,
-                    (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
-                LLVMValueRef cmp = zan_call2(g->builder, strcmp_ty,
-                    g->fn_strcmp, (LLVMValueRef[]){ s, p }, 2, "eq.cmp");
+                /* length-aware ordinal compare: strcmp truncated at the
+                 * first embedded NUL, so Equals lied about digest-carrying
+                 * strings */
+                LLVMValueRef ocmp = get_str_ordinal_cmp_fn(g, expr->loc);
+                LLVMValueRef cmp = zan_call2(g->builder,
+                    LLVMGlobalGetValueType(ocmp), ocmp,
+                    (LLVMValueRef[]){ s, p }, 2, "eq.cmp");
                 LLVMValueRef res = zan_icmp(g->builder, LLVMIntEQ, cmp,
                     LLVMConstInt(i32, 0, 0), "eq.str");
                 emit_release_owned_call_temp(g, sc->member.object, s, locals);

@@ -439,7 +439,8 @@ static LLVMValueRef get_str_split_fn(zan_irgen_t *g) {
 }
 
 /* i1 __zan_dict_key_eq(i8* a, i8* b, i64 is_str): key comparison for Dict
- * scans — strcmp equality for string keys, raw pointer/bit equality for
+ * scans -- length-aware ordinal equality for string keys (strcmp collided a
+ * key with its own NUL-truncated prefix), raw pointer/bit equality for
  * scalar keys (stored inttoptr'd in the i8** key slots). */
 static LLVMValueRef get_dict_key_eq_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_dict_key_eq");
@@ -451,8 +452,8 @@ static LLVMValueRef get_dict_key_eq_fn(zan_irgen_t *g) {
     LLVMTypeRef fnty = LLVMFunctionType(i1, (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
     fn = LLVMAddFunction(g->mod, "__zan_dict_key_eq", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
-    LLVMTypeRef strcmp_ty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
-    LLVMValueRef strcmp_fn = get_libc_fn(g, "strcmp", strcmp_ty);
+    LLVMValueRef ocmp = get_str_ordinal_cmp_fn(g, (zan_loc_t){0});
+    LLVMTypeRef ocmp_ty = LLVMGlobalGetValueType(ocmp);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef str_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "str");
@@ -465,7 +466,7 @@ static LLVMValueRef get_dict_key_eq_fn(zan_irgen_t *g) {
         LLVMConstInt(i64, 0, 0), "isv");
     LLVMBuildCondBr(g->builder, isv, str_bb, raw_bb);
     LLVMPositionBuilderAtEnd(g->builder, str_bb);
-    LLVMValueRef cmp = zan_call2(g->builder, strcmp_ty, strcmp_fn,
+    LLVMValueRef cmp = zan_call2(g->builder, ocmp_ty, ocmp,
         (LLVMValueRef[]){ a, b2 }, 2, "cmp");
     LLVMBuildRet(g->builder, zan_icmp(g->builder, LLVMIntEQ, cmp,
         LLVMConstInt(i32t, 0, 0), "eq"));

@@ -2146,6 +2146,84 @@ static LLVMValueRef emit_string_length(zan_irgen_t *g, LLVMValueRef payload,
     return emit_string_len_ex(g, payload, 1, loc);
 }
 
+/* Ordinal 3-way compare `i32 __zan_str_ocmp(i8* a, i8* b)` for `string`
+ * payloads: <0 / 0 / >0 like memcmp, so ==/!=/</<=/>/>=, str.Equals and Dict
+ * string keys all derive from one length-aware primitive.
+ *
+ * strcmp is WRONG for these: a managed string may hold embedded NUL bytes
+ * (a raw digest read through the zero-copy str/byte contract), and strcmp
+ * truncated it at the first NUL -- "a\0b" == "a" was true and a Dict key
+ * collided with its prefix. The length comes from emit_string_len_ex (cached
+ * header length / byte-buffer element count / strlen for a bare extern
+ * pointer), then memcmp runs over the common prefix with a length tiebreak.
+ * The hash in __zan_dict_hash may keep stopping at the first NUL: equal
+ * hashes only mean "scan the bucket", the ocmp decides. */
+static LLVMValueRef get_str_ordinal_cmp_fn(zan_irgen_t *g, zan_loc_t loc) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_str_ocmp");
+    if (fn) return fn;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef fnty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ i8ptr, i8ptr },
+                                        2, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_str_ocmp", fnty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    LLVMTypeRef memcmp_ty = LLVMFunctionType(i32t,
+        (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
+    LLVMValueRef memcmp_fn = get_libc_fn(g, "memcmp", memcmp_ty);
+
+    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef saved_fn = g->current_fn;
+    g->current_fn = fn;
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef ret0 = LLVMAppendBasicBlockInContext(g->ctx, fn, "same");
+    LLVMBasicBlockRef nullbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "null");
+    LLVMBasicBlockRef retneg = LLVMAppendBasicBlockInContext(g->ctx, fn, "neq");
+    LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "body");
+    LLVMValueRef a = LLVMGetParam(fn, 0);
+    LLVMValueRef b2 = LLVMGetParam(fn, 1);
+
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, a, b2, "same"),
+        ret0, nullbb);
+    /* Same reference (incl. both null) is equal. A lone null has no header to
+     * probe -- strcmp would have faulted; report "not equal". */
+    LLVMPositionBuilderAtEnd(g->builder, ret0);
+    LLVMBuildRet(g->builder, LLVMConstInt(i32t, 0, 0));
+    LLVMPositionBuilderAtEnd(g->builder, nullbb);
+    LLVMValueRef an = zan_icmp(g->builder, LLVMIntEQ, a,
+        LLVMConstNull(i8ptr), "an");
+    LLVMValueRef bn = zan_icmp(g->builder, LLVMIntEQ, b2,
+        LLVMConstNull(i8ptr), "bn");
+    LLVMBuildCondBr(g->builder, zan_or(g->builder, an, bn, "en"),
+        retneg, body);
+    LLVMPositionBuilderAtEnd(g->builder, retneg);
+    LLVMBuildRet(g->builder, LLVMConstInt(i32t, (uint64_t)-1, 1));
+    LLVMPositionBuilderAtEnd(g->builder, body);
+    LLVMValueRef la = emit_string_len_ex(g, a, 1, loc);
+    LLVMValueRef lb = emit_string_len_ex(g, b2, 1, loc);
+    LLVMValueRef llt = zan_icmp(g->builder, LLVMIntSLT, la, lb, "llt");
+    LLVMValueRef m = LLVMBuildSelect(g->builder, llt, la, lb, "minlen");
+    LLVMValueRef mr = zan_call2(g->builder, memcmp_ty, memcmp_fn,
+        (LLVMValueRef[]){ a, b2, m }, 3, "ocmp.memcmp");
+    /* Different lengths with an equal common prefix order by length; equal
+     * lengths take memcmp verbatim (0 when both are empty). */
+    LLVMValueRef tail = LLVMBuildSelect(g->builder, llt,
+        LLVMConstInt(i32t, (uint64_t)-1, 1), LLVMConstInt(i32t, 1, 0),
+        "tail");
+    LLVMValueRef inner = LLVMBuildSelect(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, mr, LLVMConstInt(i32t, 0, 0), "nz"),
+        mr, tail, "body");
+    LLVMValueRef r = LLVMBuildSelect(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, la, lb, "leq"), mr, inner, "ocmp");
+    LLVMBuildRet(g->builder, r);
+
+    g->current_fn = saved_fn;
+    if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+    return fn;
+}
+
 static void emit_span_window_check(zan_irgen_t *g, LLVMValueRef start,
                                    LLVMValueRef window, LLVMValueRef length,
                                    zan_loc_t loc, const char *kind) {

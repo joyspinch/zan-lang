@@ -3274,11 +3274,12 @@ static LLVMValueRef emit_typed_equality(zan_irgen_t *g, zan_type_t *type,
         }
         LLVMValueRef lc = emit_str_nonnull(g, left);
         LLVMValueRef rc = emit_str_nonnull(g, right);
-        LLVMValueRef args[] = {lc, rc};
+        /* Length-aware ordinal compare, like the ==/!= lowering: strcmp
+         * truncated at the first embedded NUL. */
+        LLVMValueRef ocmp = get_str_ordinal_cmp_fn(g, (zan_loc_t){0});
         LLVMValueRef cmp = zan_call2(
-            g->builder,
-            LLVMFunctionType(i32, (LLVMTypeRef[]){i8ptr, i8ptr}, 2, 0),
-            g->fn_strcmp, args, 2, "eq.str");
+            g->builder, LLVMGlobalGetValueType(ocmp), ocmp,
+            (LLVMValueRef[]){lc, rc}, 2, "eq.str");
         return zan_icmp(g->builder, LLVMIntEQ, cmp,
                         LLVMConstInt(i32, 0, 0), "eq.s");
     }
@@ -3633,14 +3634,15 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
             both_ptr && str_operand &&
             expr->binary.left->kind != AST_NULL_LITERAL &&
             expr->binary.right->kind != AST_NULL_LITERAL) {
-            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
             LLVMValueRef lc = emit_str_nonnull(g, left);
             LLVMValueRef rc = emit_str_nonnull(g, right);
-            LLVMValueRef cmp_args[] = { lc, rc };
+            /* Length-aware ordinal compare: strcmp truncated a managed string
+             * at its first embedded NUL ("a\0b" == "a" was true). */
+            LLVMValueRef ocmp = get_str_ordinal_cmp_fn(g, expr->loc);
             LLVMValueRef r = zan_call2(g->builder,
-                LLVMFunctionType(i32t, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
-                g->fn_strcmp, cmp_args, 2, "scmp");
+                LLVMGlobalGetValueType(ocmp), ocmp,
+                (LLVMValueRef[]){ lc, rc }, 2, "scmp");
             LLVMValueRef seq = zan_icmp(g->builder,
                 expr->binary.op == TK_EQ_EQ ? LLVMIntEQ : LLVMIntNE,
                 r, LLVMConstInt(i32t, 0, 0), "seq");
@@ -3663,14 +3665,15 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
             both_ptr && str_operand &&
             expr->binary.left->kind != AST_NULL_LITERAL &&
             expr->binary.right->kind != AST_NULL_LITERAL) {
-            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
             LLVMValueRef lc = emit_str_nonnull(g, left);
             LLVMValueRef rc = emit_str_nonnull(g, right);
-            LLVMValueRef cmp_args[] = { lc, rc };
+            /* Same length-aware ordinal compare as ==: ordering also
+             * truncated at the first embedded NUL. */
+            LLVMValueRef ocmp = get_str_ordinal_cmp_fn(g, expr->loc);
             LLVMValueRef r = zan_call2(g->builder,
-                LLVMFunctionType(i32t, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
-                g->fn_strcmp, cmp_args, 2, "scmp");
+                LLVMGlobalGetValueType(ocmp), ocmp,
+                (LLVMValueRef[]){ lc, rc }, 2, "scmp");
             LLVMIntPredicate pred =
                 expr->binary.op == TK_LESS       ? LLVMIntSLT :
                 expr->binary.op == TK_LESS_EQ    ? LLVMIntSLE :
