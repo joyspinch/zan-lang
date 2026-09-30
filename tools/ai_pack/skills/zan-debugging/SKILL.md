@@ -105,3 +105,17 @@ Build with debug info (default build, i.e. no `--publish`) before stepping.
 Report what you observed — the diagnostic text, the leak report, the variable
 value. A hypothesis you did not check is a hypothesis, and must be labelled as
 one.
+
+## GUI 程序挂死在事件泵里：先核对 exe 与 zan_gui.dll 的代际配对（2026-09-30，chatview 回归实测）
+
+- 症状：窗口创建成功且"已响应"，stdout 零输出、UiErrorLog 无异常
+  （异常被 PumpSafe 吞进内存环），进程停在 `App.PumpGuarded()` 内部。
+- 先做一步：用**当前** `build/zan_gui.dll` 覆盖 exe 旁的
+  `zan_gui.dll` 重跑。zanc 会把 `stdlib/Gui/drivers/<plat>/zan_gui.dll`
+  （提交版二进制）暂存到 exe 旁；src/runtime 重编后若这批提交版驱动
+  没跟着刷新，新编译的 exe 配旧驱动就挂在泵里——与用户代码、与
+  stdlib/包布局全都无关（2026-09-30 实测 HEAD 布局与拆包布局同样复现，
+  换新 dll 双双 PASS）。
+- 为什么：exe 的运行时对象与驱动 dll 必须同一代际（运行时帧布局/
+  协程约定的改动会进 dll ABI）；ctest/conformance 编译产物旁边落的
+  是 stdlib 里那份静态驱动，它是最容易过期的一环。

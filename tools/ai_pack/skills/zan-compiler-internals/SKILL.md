@@ -979,6 +979,23 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
     - **分片自适应默认激活**：分片发射（Module Sharding）不应依赖隐藏的环境变量 `ZAN_SHARD=1`（用户在 IDE 界面点击发布或命令行默认构建时无此变量），应在 native 目标（x86_64 / aarch64）的 `--publish` 发布构建下自适应默认开启（支持 `ZAN_NO_SHARD=1` / `ZAN_SHARD=0` 关闭）。当函数规模较小、规划分片数 `<= 1` 时自动跳过保持单模块，小工程零额外开销；超大项目（如 730 文件 OnePlus、534 文件 ZanIDE）自动切分 40+ 分片并即刻销毁，全局优化从 35 秒降至 10 秒，链接时间缩短 75%，主模块 Commit 常驻大幅下降。
   - **标准库命名空间规范**：Zan 语言的标准库 GUI 库命名空间为 `using Gui;`，不存在 `using Zan.Gui` 或 `using Zan.Core;`。若用户代码误写，auto-stdlib 会将其当作第三方扩展包拉取并在找不到时报告 `ZANPKG_MISSING namespace=Zan/Gui`，最终因命名空间未定义在语义检查阶段报错。
   - **跨分片调用与数据布局**：分片间调用通过标准 external declare 降阶，全局变量按只读可复制（TRAVEL）与外部声明（DECL）清晰判定，带引号的 LLVM 结构体名（`%"..."`）必须在分片中完整导出对应类型声明，避免 Parse 失败；最终由 `lld-link` 将各分片 `.o` 统一链接。
+  - **AST arena 早释放的收益边界与事实快照化（A-MEM5，2026-09-29）**：
+    - **峰值窗口铁律：峰值 = irgen 完成那一刻，不是 manifest**。732 文件 OnePlus 实测（`ZAN_PROBE_MEM` 逐阶段 Commit/Peak/Arena 采样）：irgen 结束时 Commit 1,101 MB / Peak 1,112 MB——此刻 LLVM module（~885 MB）与 AST arena（215 MB）**必然共存**（函数体边发射边消费 AST，arena 无法部分释放）；早释放只能削掉释放点之后的驻留，动不了共存窗口本身。
+    - **早释放的真实收益是后期驻留**：AST 释放上移到 manifest 之前后，manifest 阶段 Commit 1,111→895 MB（-216 MB），25 分钟 shard emit 窗口驻留 1,007~1,023→886~897 MB（约 -120 MB），全进程 Peak 1,117→1,112 MB（-5 MB，只是 manifest 自身超冲）。把释放点提前**不等于**峰值下降——峰值在释放点之前就已定型，验收别只盯 Peak 数字。
+    - **后期读者必须事实快照化**：arena 释放后所有悬空读者逐一排查过（shard/optimizer/write_obj/write_ir 零 AST 访问；`mf_is_spec` 只比 LLVMValueRef）。唯一回读点 `mf_is_virtual_dispatch` 读 `sym->decl->method_decl.modifiers`——symbol 本身也分配在 AST arena（`make_symbol(b->arena,...)`），整个指针都悬空。修法：`zan_fn_entry` 加 `uint32_t modifiers`，`irgen_register_function`（唯一注册点）在 emit 时快照 `sym->modifiers`（bind 时已从 AST 拷贝的位副本），manifest 改读快照。**泛型 spec 不走 functions[]**（走 `generic_fns[]`，manifest 用 `mf_is_spec` 按 LLVMValueRef 判定），快照面恰好闭合。
+    - **手工 A/B 编译器二进制时 exe 同目录发现面陷阱**：worktree zanc 的包发现/exe 兄弟目录规则与主树一致，跑 OnePlus 这类外部项目无碍；但 A/B 对比产物字节级 diff 时 COFF 时间戳每次不同，比尺寸+运行行为，别比字节。
+  - **后端 LLVM 早释放与分片单趟索引提取（A-MEM6，2026-09-30）**：
+    - **write_obj 后即刻释放 LLVM backend 状态（`zan_irgen_release_llvm`）**：在目标文件写出（`zan_irgen_write_obj`）完成后，链接开始之前，LLVM module、builder 及相关大型映射表（functions、fn_index、struct_types、literals 等）已完成历史使命。此时调用 `zan_irgen_release_llvm` 销毁 module 与相关内存，在进入链接阶段前归还约 400 MB 物理提交（OnePlus 732 文件实测：free llvm 阶段 Commit 瞬间从 846 MB 降至 447 MB）。
+    - **分片阶段单趟全模块流式导出与哈希索引切片**：
+      - **病灶机理**：逐函数调用 `LLVMPrintValueToString` 会让 LLVM 为每个函数重复扫描全模块以构建 `SlotTracker`，在 8,900+ 函数的大项目中形成 $O(N \times \text{ModuleSize})$ 平方级耗时（分片发射耗时高达 25~30 分钟），且 `LLVMPrintModuleToString` 内存字符串又会因倍增分配产生虚假内存峰值。
+      - **定式解法**：在 shard 循环开始前，通过 `LLVMPrintModuleToFile` 将当前 module 一次性写入临时文件，通过 `fopen`/`fread` 读入后构建 `sh_body_index_t` 开地址哈希索引（单趟扫描 `define ` 与 `}` 定界），每个待分片函数在常数时间 $O(1)$ 获取其在只读缓冲区中的起始指针与字节长度（`sh_body_slice_t`），零字符串二次分配直接组装进 fragment。所有分片处理完毕后立即释放索引、缓冲区并物理删除临时 `.ll` 文件。分片发射效率从数十分钟降至数十秒，且峰值与内存完全可控。
+    - **分片组装与发射两阶段解耦（A-MEM7，2026-09-30）**：
+      - **病灶机理**：若分片组装（基于 body_index 拼接 fragment）与分片发射（`LLVMParseIRInContext` + `LLVMTargetMachineEmitToFile`）交织在同一个循环内，全模块文本缓冲区（~150MB）与索引必须在所有分片发射期间全程驻留。当单个 Shard 解析与后端代码生成时，coordinator 模块（~885MB）、文本缓冲区（~150MB）、shard module 与 codegen 工作集（~150MB）三者叠加，导致发射期间内存 Commit 达 1,166 MB、峰值冲高至 1,251 MB。
+      - **定式解法**：将分片拆为「Pass 2a 全量组装写出分片 fragment」与「Pass 2b 独立发射目标文件」两阶段。Pass 2a 仅负责遍历索引组装各分片 IR 文本并流式落盘为 `.frag.ll` 临时文件；Pass 2a 结束后立即彻底释放全模块文本缓冲区（`free(ll_buf)`）与哈希索引（`sh_free_body_index`），并删除临时全模块 `.ll`。进入 Pass 2b 后，单分片按需读入仅 3~4MB 的 fragment 进行独立解析与代码生成，发射完毕即刻删除 `.frag.ll`。
+      - **实测证明**：OnePlus 733 文件全量 publish 实测：Shard 0 发射前 Commit 从 1,166 MB 直降至 938 MB（净降 228 MB），全阶段 Shard 驻留稳定在 1,010 MB 左右，彻底消除了 1,251 MB 的次级峰值尖峰。
+    - **阶段资源精确归因**：
+      - 实测证明：链接阶段（`link`）在 732 文件项目下仅耗时 294 ms，且内存 Commit 维持在 447 MB，链接本身绝非内存与耗时瓶颈；
+      - 真正耗时与驻留的大头在于 LLVM 优化与目标文件写出（`write obj` 耗时约 10 秒，驻留 846 MB），早释放策略精准切断了 LLVM 模块对链接窗口的内存压迫。
 
 - 另一条常客：**端口/资源竞争与真 flaky**。判别法是把**同一个二进制**（不重编）
   连跑 5 次——通过/挂起交错就说明是被测代码里的竞争，单次的超时/失败不能当回归
@@ -2320,3 +2337,16 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
 - **峰值账要记全共存项**：分片窗口峰值=coordinator（原体未删）+shard 解析
   出的新 module+fragment 文本三者共存，文本往返让峰值 1278MB→2207MB。
   把内存从一相挪到另一相不算省，验收只看全进程 PeakPagefileUsage。
+
+## 包存储发现含 CWD/项目根相对项：对照编译必炸双拉（2026-09-30，Gui.CodeEditor 拆包实测）
+
+- zanc 解析包存储时会扫 `项目根/packages`（monorepo 包仓）与 exe 旁
+  `packages/`。做"旧布局 vs 新布局"对照编译时，只要 CWD 或项目根下有
+  packages/，同一命名空间就被 stdlib glob 与包探测**双供给**——
+  duplicate type declaration 成片（一次 667 错），极易误判成改动引入。
+- 实测规则：对照实验把 **CWD 切到空目录**（两条发现路径同时落空），
+  或用无 packages/ 的独立工具链副本；`--stdlib-path` 只覆盖 stdlib，
+  `--package-project` 只改安装作用域，**都挡不住**包存储发现。
+- 为什么：按需拉入按"命名空间 → 文件声明"精确匹配，stdlib 与包同供
+  一个命名空间时不去重；错误形态是成片 duplicate 而非缺符号，归因
+  极易反了（先怀疑布局改动，其实是发现路径重叠）。
