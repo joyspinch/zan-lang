@@ -291,7 +291,7 @@ class TDengineConnection : IDbConnection {
 
     /// <summary>解析 chunk-size 行（十六进制，可带 ";extension"，以 CR 结尾）。</summary>
     static int HexOf(string text) {
-        int v = 0;
+        long v = 0;
         int i = 0;
         bool any = false;
         while (i < text.Length) {
@@ -302,13 +302,14 @@ class TDengineConnection : IDbConnection {
             else if (c >= 65 && c <= 70) { d = c - 55; }
             else { i = text.Length; }
             if (d >= 0) {
-                v = v * 16 + d;
+                v = v * 16 + (long)d;
+                if (v > 2147483647) { return 0 - 1; }
                 any = true;
                 i = i + 1;
             }
         }
         if (!any) { return 0 - 1; }
-        return v;
+        return (int)v;
     }
 
     /// <summary>响应声明使用分块传输时返回 true。</summary>
@@ -389,14 +390,19 @@ class TDengineConnection : IDbConnection {
             return "";
         }
 
-        StringBuilder raw = new StringBuilder();
-        bool reading = true;
-        while (reading) {
-            string chunk = Socket.Receive(sock, 65536);
-            if (chunk.Length == 0) { reading = false; } else { raw.Append(chunk); }
+        string rawStr = "";
+        try {
+            StringBuilder raw = new StringBuilder();
+            bool reading = true;
+            while (reading) {
+                string chunk = Socket.Receive(sock, 65536);
+                if (chunk.Length == 0) { reading = false; } else { raw.Append(chunk); }
+            }
+            rawStr = raw.ToString();
+        } finally {
+            Socket.Close(sock);
         }
-        Socket.Close(sock);
-        return BodyOf(raw.ToString());
+        return BodyOf(rawStr);
     }
 
     /// <summary>在 IO reactor 上执行 Post：连接、发送、接收都挂起
@@ -425,14 +431,19 @@ class TDengineConnection : IDbConnection {
             return "";
         }
 
-        StringBuilder raw = new StringBuilder();
-        bool reading = true;
-        while (reading) {
-            string chunk = await AsyncSocket.Receive(sock, 65536);
-            if (chunk.Length == 0) { reading = false; } else { raw.Append(chunk); }
+        string rawStr = "";
+        try {
+            StringBuilder raw = new StringBuilder();
+            bool reading = true;
+            while (reading) {
+                string chunk = await AsyncSocket.Receive(sock, 65536);
+                if (chunk.Length == 0) { reading = false; } else { raw.Append(chunk); }
+            }
+            rawStr = raw.ToString();
+        } finally {
+            Socket.Close(sock);
         }
-        Socket.Close(sock);
-        return BodyOf(raw.ToString());
+        return BodyOf(rawStr);
     }
 
     // ===== 响应解码 =====
@@ -507,13 +518,25 @@ class TDengineConnection : IDbConnection {
             for (int r = 0; r < data.Count(); r = r + 1) {
                 JsonValue jrow = data.At(r);
                 List<string> row = new List<string>();
-                List<bool> nulls = new List<bool>();
+                List<bool> nulls = null;
                 for (int c = 0; c < jrow.Count(); c = c + 1) {
                     JsonValue cell = jrow.At(c);
                     row.Add(cell.AsString(""));
-                    nulls.Add(cell.IsNull());
+                    if (cell.IsNull()) {
+                        if (nulls == null) {
+                            nulls = new List<bool>();
+                            for (int k = 0; k < c; k = k + 1) { nulls.Add(false); }
+                        }
+                        nulls.Add(true);
+                    } else if (nulls != null) {
+                        nulls.Add(false);
+                    }
                 }
-                result.AddRowNulls(row, nulls);
+                if (nulls != null) {
+                    result.AddRowNulls(row, nulls);
+                } else {
+                    result.AddRow(row);
+                }
             }
         }
 

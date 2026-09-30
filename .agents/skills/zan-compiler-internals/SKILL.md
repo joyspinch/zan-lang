@@ -1047,6 +1047,14 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
       - 实测证明：链接阶段（`link`）在 732 文件项目下仅耗时 294 ms，且内存 Commit 维持在 447 MB，链接本身绝非内存与耗时瓶颈；
       - 真正耗时与驻留的大头在于 LLVM 优化与目标文件写出（`write obj` 耗时约 10 秒，驻留 846 MB），早释放策略精准切断了 LLVM 模块对链接窗口的内存压迫。
 
+## 企业级数据库与大数据量流式传输定式（2026-10-01）
+
+- **连接池 OpenOne 异常封装与槽位释放**：各数据库连接池（`DbPool`、`MySqlPool`、`PgPool`、`SqlServerPool`、`FirebirdPool`、`TDenginePool`）在 `TryReserve()` 预留连接槽位后执行 `OpenOne()`。若 `OpenOne()` 抛出异常（网络中断、认证失败、DNS 解析错误等），异常直接向上冒泡会导致预留的 `liveCount` 槽位无法归还（未调用 `UndoReserve()`），导致连接池假满并永久拒绝/挂起后续请求。最佳实践：在 `OpenOne()` 内部通过 `try ... catch (Exception ex) { return null; }` 捕获异常，外部 `AcquireAsync()` 即可安全走到 `if (opened == null || !opened.IsConnected()) { core.NoteOpenFailed(); core.UndoReserve(); return null; }`，槽位精准归还且协程主路径免于 landing pad 性能抖动与时序踩踏。
+- **DbResult / DbRow 按需空值（On-demand NULL tracking）**：无 SQL NULL 记录行不应为每行无条件分配 `new List<bool>()`，高并发与十万行大表下这会产生大量小对象堆分配。改为默认 `null`，仅在第一次扫描到真实 NULL 列时分配并向前补足 `false`，非 NULL 记录走轻量 `AddRow(row)`，在 `IsNull` 处判空快速返回 `false`。
+- **ORM 方言分页与无分页保护（`OrmSelect` / `QueryBuilder`）**：SQL Server 和 Oracle 使用 `OFFSET m ROWS FETCH NEXT n ROWS ONLY` 语法，且严格要求 `ORDER BY`。若未做方言分支或对无分页查询盲目追加 `OFFSET 0 ROWS`，不仅破坏非分页查询的语义，还会因缺少排序列报错；`BuildDto` 等投影查询也必须统一接入方言分页，避免标准 `LIMIT/OFFSET` 语法在 SQL Server 等引擎上抛语法错误。
+- **XLSX 大数据量流式生成与块缓冲**：大表导出禁止一次性把所有行对象保存在内存（`rows` 列表），通过 `ZipWriter.BeginEntry/WriteData/EndEntry` 配合适度大小的 `StringBuilder` 块缓冲区（如 64KB）逐行渲染与批量输出，内存占用与总导出数据量解耦，实现近恒定常数级内存开销。
+
+
 
 - 另一条常客：**端口/资源竞争与真 flaky**。判别法是把**同一个二进制**（不重编）
   连跑 5 次——通过/挂起交错就说明是被测代码里的竞争，单次的超时/失败不能当回归

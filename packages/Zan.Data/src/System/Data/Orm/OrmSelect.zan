@@ -340,23 +340,9 @@ class OrmSelect {
         if (this.ob.Length > 0) { sb.Append(" ORDER BY "); sb.Append(this.ob); }
     }
 
-    /// <summary>实体行的 SELECT。分页写法按方言：SQL Server/Oracle 用
-    /// OFFSET ... FETCH（且必须有 ORDER BY）。</summary>
-    string BuildSelect() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("SELECT ");
-        if (this.distinct) { sb.Append("DISTINCT "); }
-        sb.Append(this.meta.SelectList());
-        for (int i = 0; i < this.meta.Navs.Count; i = i + 1) {
-            if (this.navOn[i]) { sb.Append(this.meta.Navs[i].SelectList()); }
-        }
-        sb.Append(" FROM ");
-        sb.Append(this.tbl);
-        sb.Append(" t");
-        for (int i = 0; i < this.meta.Navs.Count; i = i + 1) {
-            if (this.navOn[i]) { sb.Append(this.meta.Navs[i].Join()); }
-        }
-        this.tail(sb);
+    /// 追加 LIMIT/OFFSET 或 OFFSET/FETCH 分页子句（按数据库方言）。
+    void appendLimitOffset(StringBuilder sb) {
+        if (this.limN < 0 && this.offN < 0) { return; }
         int pv = this.db.GetProvider();
         if (pv == DbProvider.SqlServer || pv == DbProvider.Oracle) {
             int off = this.offN;
@@ -386,6 +372,26 @@ class OrmSelect {
                 sb.Append(Convert.ToString(this.offN));
             }
         }
+    }
+
+    /// <summary>实体行的 SELECT。分页写法按方言：SQL Server/Oracle 用
+    /// OFFSET ... FETCH（且必须有 ORDER BY）。</summary>
+    string BuildSelect() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("SELECT ");
+        if (this.distinct) { sb.Append("DISTINCT "); }
+        sb.Append(this.meta.SelectList());
+        for (int i = 0; i < this.meta.Navs.Count; i = i + 1) {
+            if (this.navOn[i]) { sb.Append(this.meta.Navs[i].SelectList()); }
+        }
+        sb.Append(" FROM ");
+        sb.Append(this.tbl);
+        sb.Append(" t");
+        for (int i = 0; i < this.meta.Navs.Count; i = i + 1) {
+            if (this.navOn[i]) { sb.Append(this.meta.Navs[i].Join()); }
+        }
+        this.tail(sb);
+        this.appendLimitOffset(sb);
         return sb.ToString();
     }
 
@@ -406,25 +412,22 @@ class OrmSelect {
         return sb.ToString();
     }
 
-    /// 投影 SELECT 的语句文本（固定 LIMIT/OFFSET 分页写法）。
+    /// 投影 SELECT 的语句文本（按数据库方言分页）。
     string BuildDto(string cols) {
         StringBuilder sb = new StringBuilder();
         sb.Append("SELECT " + cols + " FROM " + this.tbl + " t");
         this.tail(sb);
-        if (this.limN >= 0) {
-            sb.Append(" LIMIT " + Convert.ToString(this.limN));
-        }
-        if (this.offN >= 0) {
-            sb.Append(" OFFSET " + Convert.ToString(this.offN));
-        }
+        this.appendLimitOffset(sb);
         return sb.ToString();
     }
 
     /// 把结果集第一列抽成字符串列表。
     List<string> MapCol(DbResult r) {
         List<string> outp = new List<string>();
+        if (r == null) { return outp; }
         int row = 0;
-        while (row < r.RowCount()) {
+        int n = r.RowCount();
+        while (row < n) {
             outp.Add(r.GetString(row, 0));
             row = row + 1;
         }
@@ -459,14 +462,19 @@ class OrmSelect {
 
     /// <summary>分组后的行数：分组键上的 COUNT 要套一层子查询。
     /// 派生表必须带别名——MySQL/PostgreSQL/SQL Server 对无别名
-    /// 的子查询直接报语法错。</summary>
+    /// 的子查询直接报语法错；Oracle 不允许 AS 关键字。</summary>
     string BuildCount() {
         StringBuilder sb = new StringBuilder();
         sb.Append("SELECT COUNT(*) FROM (SELECT 1 FROM " + this.tbl + " t");
         if (this.w.Length > 0) { sb.Append(" WHERE " + this.w); }
         sb.Append(" GROUP BY " + this.gb);
         if (this.h.Length > 0) { sb.Append(" HAVING " + this.h); }
-        sb.Append(") AS cnt");
+        int pv = this.db.GetProvider();
+        if (pv == DbProvider.Oracle) {
+            sb.Append(") cnt");
+        } else {
+            sb.Append(") AS cnt");
+        }
         return sb.ToString();
     }
 
@@ -495,42 +503,42 @@ class OrmSelect {
     /// 聚合结果取 int；无行时为 0。
     int AggI(string expr) {
         DbResult r = this.AggR(expr);
-        if (r.RowCount() == 0) { return 0; }
+        if (r == null || r.RowCount() == 0) { return 0; }
         return r.GetInt(0, 0);
     }
 
     /// 聚合结果取 long；无行时为 0。
     long AggL(string expr) {
         DbResult r = this.AggR(expr);
-        if (r.RowCount() == 0) { return 0; }
+        if (r == null || r.RowCount() == 0) { return 0; }
         return r.GetLong(0, 0);
     }
 
     /// 聚合结果取 double；无行时为 0.0。
     double AggD(string expr) {
         DbResult r = this.AggR(expr);
-        if (r.RowCount() == 0) { return 0.0; }
+        if (r == null || r.RowCount() == 0) { return 0.0; }
         return r.GetDouble(0, 0);
     }
 
     /// <see cref="AggI"/> 的异步版本。
     async int AggIAsync(string expr) {
         DbResult r = await this.AggRAsync(expr);
-        if (r.RowCount() == 0) { return 0; }
+        if (r == null || r.RowCount() == 0) { return 0; }
         return r.GetInt(0, 0);
     }
 
     /// <see cref="AggL"/> 的异步版本。
     async long AggLAsync(string expr) {
         DbResult r = await this.AggRAsync(expr);
-        if (r.RowCount() == 0) { return 0; }
+        if (r == null || r.RowCount() == 0) { return 0; }
         return r.GetLong(0, 0);
     }
 
     /// <see cref="AggD"/> 的异步版本。
     async double AggDAsync(string expr) {
         DbResult r = await this.AggRAsync(expr);
-        if (r.RowCount() == 0) { return 0.0; }
+        if (r == null || r.RowCount() == 0) { return 0.0; }
         return r.GetDouble(0, 0);
     }
 
@@ -538,7 +546,7 @@ class OrmSelect {
     int Count() {
         if (this.gb.Length > 0) {
             DbResult r = this.db.Query(this.BuildCount(), this.ps);
-            if (r.RowCount() == 0) { return 0; }
+            if (r == null || r.RowCount() == 0) { return 0; }
             return r.GetInt(0, 0);
         }
         return this.AggI("COUNT(*)");
@@ -549,7 +557,7 @@ class OrmSelect {
         if (this.gb.Length > 0) {
             string sql = this.BuildCount();
             DbResult r = await this.db.QueryAsync(sql, this.ps);
-            if (r.RowCount() == 0) { return 0; }
+            if (r == null || r.RowCount() == 0) { return 0; }
             return r.GetInt(0, 0);
         }
         return await this.AggIAsync("COUNT(*)");

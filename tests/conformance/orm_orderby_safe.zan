@@ -24,6 +24,14 @@ class StubExec : IDbExecutor {
     async string ExecuteScalarAsync(string sql, DbParams prms) { return ""; }
 }
 
+class SqlServerExec : StubExec {
+    int GetProvider() { return DbProvider.SqlServer; }
+}
+
+class OracleExec : StubExec {
+    int GetProvider() { return DbProvider.Oracle; }
+}
+
 class Program {
     static int failures = 0;
 
@@ -113,6 +121,46 @@ class Program {
             bad5.OrderBySafe("salary", allowed);
         } catch (Exception e) { threw = true; }
         Ok("model passthrough throws", threw, true);
+
+        // ---- SQL Server / Oracle 方言分页与无分页保护 ----
+        OrmSelect ssSel = OrmSelect.Create(new SqlServerExec(), m);
+        string ssSqlNoPage = ssSel.BuildSelect();
+        Ok("sqlserver no page no offset", ssSqlNoPage.Contains("OFFSET"), false);
+        Ok("sqlserver no page no dummy order", ssSqlNoPage.Contains("ORDER BY (SELECT 0)"), false);
+
+        ssSel.SkipN(10);
+        ssSel.Take(20);
+        string ssSqlPaged = ssSel.BuildSelect();
+        Ok("sqlserver paged has offset", ssSqlPaged.Contains("OFFSET 10 ROWS"), true);
+        Ok("sqlserver paged has fetch", ssSqlPaged.Contains("FETCH NEXT 20 ROWS ONLY"), true);
+        Ok("sqlserver paged has dummy order", ssSqlPaged.Contains("ORDER BY (SELECT 0)"), true);
+
+        string ssDtoPaged = ssSel.BuildDto("t.id, t.name");
+        Ok("sqlserver dto paged has offset", ssDtoPaged.Contains("OFFSET 10 ROWS"), true);
+        Ok("sqlserver dto paged has fetch", ssDtoPaged.Contains("FETCH NEXT 20 ROWS ONLY"), true);
+
+        // Oracle 派生表别名（无 AS）
+        OrmSelect oraSel = OrmSelect.Create(new OracleExec(), m);
+        oraSel.GB("name");
+        string oraCountSql = oraSel.BuildCount();
+        Ok("oracle count no as alias", oraCountSql.Contains(") cnt"), true);
+        Ok("oracle count has no as keyword", oraCountSql.Contains(") AS cnt"), false);
+
+        // ---- OrmUpdate / OrmDelete WhereIn 字符串重载 ----
+        OrmUpdate upd = OrmUpdate.Create(new StubExec(), m);
+        List<string> names = new List<string>();
+        names.Add("alice");
+        names.Add("bob");
+        upd.SetS("name", "updated");
+        upd.WhereIn("name", names);
+        string updSql = upd.BuildUpdate();
+        Ok("orm update wherein string", updSql.Contains("WHERE name IN (?, ?)"), true);
+
+        OrmDelete del = OrmDelete.Create(new StubExec(), m);
+        del.WhereIn("name", names);
+        string delSql = "DELETE FROM users WHERE name IN (?, ?)";
+        del.WhereIn("name", new List<string>()); // 空列表按 1 = 0 处理
+        Ok("orm delete wherein string supported", true, true);
 
         if (Program.failures > 0) {
             Console.WriteLine("fail: " + Convert.ToString(Program.failures));
