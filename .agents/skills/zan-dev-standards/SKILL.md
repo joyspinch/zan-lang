@@ -284,6 +284,17 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   Windows 下只携带不触发 TLS 的程序可直接链接——不可解析的非系统库会被
   自动桩化（调用时才报错），不再链接期失败。
 
+- **GUI 测试合成驱动的“静止泵”永挂坑**（2026-09-30 chatview_bubble/transfer/
+  chart_stackedarea_aa 三测试在安静机器上集体挂死，同一二进制早晨有人用机器时全绿，
+  cdb attach 抓栈定位）：`App.ProcessEvent` 在无挂起重绘、无动画截止、无待处理事件
+  时走阻塞 `window.WaitEvent()`（GetMessageW 无限等；空闲零 CPU 是产品正确语义，
+  不要改成轮询）。测试帧与帧之间常处于静止，静止泵只能靠环境消息流（鼠标活动等）
+  偶然喂活——机器一安静就必挂，且挂点随时序漂移，极难归因。定式：守卫帧体
+  （FrameGuarded 的 body）末尾续订 `RequestAnimationFrame(16)`（spinner 的文档化
+  模式，animNextMs 截止让泵走 ≤16ms 非阻塞等待），或泵前 `RequestRedraw()`
+  （datatable 系同款）；纯数据突变后必须请求重绘再泵。诊断抓
+  `USER32!GetMessageW` 栈一锤定音。
+
 ## 四、经验沉淀纪律（skill 的准入标准）
 
 - 沉淀的是**通用可落地的规则**：动作 + 理由 + 适用边界。三样缺一的
