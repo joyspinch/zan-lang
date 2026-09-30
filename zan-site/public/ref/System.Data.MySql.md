@@ -89,6 +89,16 @@ db.Close();
 
 - List<PreparedStmt> stmtCache;
 
+- TlsStream tls;
+
+- bool busy;
+
+- List<AsyncGate> waiters;
+
+- async bool AcquireLock()
+
+- void ReleaseLock()
+
 - MySqlConnection()
   - 空连接；外部经 `OpenParamsAsync` 构造。
 
@@ -96,16 +106,19 @@ db.Close();
   - 恰好读取 <paramref name="need"/> 个字节到
     <paramref name="dst"/> 的 <paramref name="off"/> 处，在 IO
     reactor 上分段读取间挂起。返回实际读到的字节数（对端关闭时 < need，
-    不足）。
+    不足）。TLS 建立后从解密流读取（每次最多一个 TLS 记录，
+    逐字节汇入目标缓冲，与明文路径的 tmp 汇入同一形状）。
 
 - internal async byte[]readPacket()
   - 读取一个协议数据包，返回其负载，并将长度写入
     <c>lastLen</c>（负载是二进制，从不当作
     NUL 结尾的字符串读取）。同时设置 <c>lastSeq</c>。连接关闭时返回 null。
+    支持 MySQL 协议大于 16MB (0xFFFFFF) 的多包分片流式拼装。
 
 - internal async int writePacket(string payload, int len, int seq)
   - 以给定序列号写入一个协议数据包（4 字节头 + 负载）
-    ，二进制安全（按长度发送）。
+    ，二进制安全（按长度发送）。TLS 建立后写入加密流
+    （头与负载合为一段明文交由 TLS 分记录）。超 16MB 时按 MySQL 规范自动分片。
 
 - bool isEof(byte[]pkt)
   - 将缓冲区中 <paramref name="len"/> 个字节复制到新的
@@ -140,7 +153,20 @@ db.Close();
   - 使用原生线协议打开协程化的 MySQL/MariaDB 连接
     。
 
-- internal async bool doConnect(string host, int port, string db, string user, string pw)
+- static bool verifyTls=true;
+
+- static void SetTlsVerify(bool verify)
+  - 切换后续 OpenSecureParamsAsync 的证书与主机名校验。
+    仅测试/开发自签场景关闭；生产保持默认开启。
+
+- static async MySqlConnection OpenSecureParamsAsync(string host, int port, string database, string user, string password)
+  - 与 `OpenParamsAsync` 相同，但把通道升级为
+    TLS（MySQL 协议的 CLIENT_SSL：SSLRequest 后整个会话加密）。
+    服务器不报 CLIENT_SSL 能力时显式失败（绝不静默降级明文）；
+    握手按 <paramref name="host"/> 做证书主机名校验，信任系统根。
+    A287①：口令与查询不再走明文信道。
+
+- internal async bool doConnect(string host, int port, string db, string user, string pw, bool secure)
   - 完整握手与认证（协程版）：解析握手包、发送握手响应，
     处理 OK / ERR / AuthMoreData（快速成功与 RSA 全量认证）/
     AuthSwitch。返回认证是否成功；失败原因写入 lastError。
@@ -153,7 +179,7 @@ db.Close();
     语句的结果为空，受影响行数会被记录。当服务器返回错误包或
     会话已断开时抛出 `DbException`，
     因此空结果总意味着「无行」；
-    错误信息仍可通过 `GetError` 获取。
+    错误信息仍可通过 `GetError` 获取。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
 
 - async int ExecuteAsync(string sql)
   - 执行非查询语句并返回受影响行数。语句失败时
@@ -197,7 +223,7 @@ db.Close();
   - 通过二进制预编译语句协议执行参数化查询
     （COM_STMT_PREPARE + COM_STMT_EXECUTE）。参数值带外传输，
     绝不拼入 SQL 文本。预编译语句按连接缓存，
-    重复查询可省去 prepare 往返。
+    重复查询可省去 prepare 往返。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
 
 - async int ExecuteParamsAsync(string sql, DbParams prms)
   - 执行参数化非查询语句；返回受影响行数。
@@ -274,7 +300,11 @@ db.Close();
   - 连接是否已打开。
 
 - void Close()
-  - 关闭连接。
+  - 关闭连接。TLS 通道先发 close_notify 再关套接字
+    （TlsStream.Close 不拥有底层 fd）。安全释放互斥门控并唤醒所有等待者。
+
+- void Dispose()
+  - 释放连接持有的资源（实现 IDisposable，等同于 Close）。
 
 
 ## MySqlConnector (class)
@@ -585,6 +615,9 @@ db.Close();
 - void Close()
   - 关闭套接字并清空预编译语句缓存。重复调用安全；
     未连接时也只做缓存清理。
+
+- void Dispose()
+  - 释放连接持有的资源（实现 IDisposable，等同于 Close）。
 
 
 ## MySqlWire (class)

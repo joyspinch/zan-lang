@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.GetPurchaseInfo
 
-> 源码: `stdlib/Sdk/Jd/Api/GetPurchaseInfo/GetPurchaseInfoRequest.zan`, `stdlib/Sdk/Jd/Api/GetPurchaseInfo/JdGetPurchaseInfoApi.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/GetPurchaseInfo/GetPurchaseInfoRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/GetPurchaseInfo/JdGetPurchaseInfoApi.zan`
 
 
 ## GetPurchaseInfoRequest (class)

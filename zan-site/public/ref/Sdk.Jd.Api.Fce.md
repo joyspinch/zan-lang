@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Fce
 
-> 源码: `stdlib/Sdk/Jd/Api/Fce/FceAlphaGetVenderCarrierRequest.zan`, `stdlib/Sdk/Jd/Api/Fce/JdFceApi.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Fce/FceAlphaGetVenderCarrierRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Fce/JdFceApi.zan`
 
 
 ## FceAlphaGetVenderCarrierRequest (class)

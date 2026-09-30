@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Jm
 
-> 源码: `stdlib/Sdk/Jd/Api/Jm/JdJmApi.zan`, `stdlib/Sdk/Jd/Api/Jm/JmOrderGetPayUrlRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Jm/JdJmApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Jm/JmOrderGetPayUrlRequest.zan`
 
 
 ## JdJmApi (class)

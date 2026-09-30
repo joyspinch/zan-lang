@@ -23,6 +23,16 @@
 
 - bool connected;
 
+- bool sendBusy;
+
+- List<AsyncGate> sendWaiters;
+
+- int lastOpcode;
+
+- int lastLen;
+
+- byte[]lastBinary;
+
 - WssClient()
   - 内部构造：未连接；经 ConnectAsync 使用。
 
@@ -41,21 +51,44 @@
 - async void SendBinary(string bytes, int len)
   - 发送一条二进制消息（bytes 可含 NUL，len 为精确字节数）。
 
+- async void SendBinary(byte[]bytes, int offset, int len)
+  - 发送一条二进制消息（byte[] 原生切片，无需经过字符串中转）。
+
+- async void SendBinary(byte[]bytes)
+  - 发送一条完整二进制消息。
+
 - async void Ping()
   - 发送空 Ping 帧（对端的 Pong 由 RecvText 静默消费）。
+
+- int LastOpcode()
+  - 上一次成功接收并交付的消息操作码（WsOpcode.Text 或 WsOpcode.Binary）。
+
+- int LastLength()
+  - 上一次成功接收并交付的消息精确字节数。
 
 - async string RecvText()
   - 挂起直到下一个文本/二进制消息（分片消息重组到 fin 后整条
     交付；Ping 以 Pong 应答后继续；Close、协议错误（-2/-3）或
     断开返回 ""）。
 
+- async byte[]RecvBinary()
+  - 挂起直到下一个文本/二进制消息。返回未截断的原生 byte[]，
+    彻底消除二进制消息中 NUL 字符被字符串截断的隐患；Close 或断开返回 null。
+
 - async void Close()
   - 协礼关闭：先发空关闭帧（未连接时跳过），随后无条件断开并
     释放 TLS 流与上下文；重复调用安全。
 
+- async void AcquireSend()
+
+- void ReleaseSend()
+
 - async void SendFrame(int opcode, string payload, int payloadLen)
   - 客户端发送入口：RFC 6455 要求客户端帧必须掩码（每帧 CSPRNG
-    掩码键）+ 正确的扩展长度编码。发送失败（<= 0）就地断开。
+    掩码键）+ 正确的扩展长度编码。并发发送受锁保护，保证原子串行。发送失败（<= 0）就地断开。
+
+- async void SendFrameBytes(int opcode, byte[]payload, int offset, int payloadLen)
+  - 客户端原生字节数组发送入口：掩码 + 帧长 + 互斥串行发送。
 
 - void CloseNow()
   - 立即断开并释放全部句柄（TLS 流、连接、上下文、reader）。
@@ -97,6 +130,8 @@ await server.Start();
 
 - int maxConnections;
 
+- int requestTimeoutMs;
+
 - WssMessageHandler messageHandler;
 
 - WssServer(string host, int port)
@@ -115,16 +150,16 @@ await server.Start();
   - 设置最大并发连接数；超限连接立即关闭（TLS 连接各持
     SSL/BIO 与缓冲，必须设闸）。
 
+- WssServer SetTimeout(int ms)
+  - 设置 TLS 握手及 Upgrade 头的超时（毫秒）。默认 30 秒；
+    非正值禁用超时，建立连接后的帧循环不受此限制。
+
 - async void Start()
   - 开始接受连接并逐条派发处理协程；running 置位后阻塞循环，
     直到 Stop() 被调用（从其他协程）。
 
 - void Stop()
   - 请求停止接受连接；在途连接处理完当前消息后自然收尾。
-
-- static bool IsUpgradeToken(string value)
-  - Upgrade 头是否为 "websocket"（RFC 7230 令牌比较：大小写
-    不敏感、容忍尾部空白）。
 
 - async void HandleConnection(nint clientSock)
   - 单条连接的生命周期：TLS 握手 → WebSocket Upgrade（缺 Upgrade

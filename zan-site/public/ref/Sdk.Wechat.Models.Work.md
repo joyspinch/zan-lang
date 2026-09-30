@@ -1,6 +1,6 @@
 # Sdk.Wechat.Models.Work
 
-> 源码: `stdlib/Sdk/Wechat/Models/Work/WechatWorkModels.zan`
+> 源码: `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/Models/Work/WechatWorkModels.zan`
 
 
 ## WechatWorkAddCalendarJsonResult (class)

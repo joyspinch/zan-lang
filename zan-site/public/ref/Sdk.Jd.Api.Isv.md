@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Isv
 
-> 源码: `stdlib/Sdk/Jd/Api/Isv/IsvAddisvlogRequest.zan`, `stdlib/Sdk/Jd/Api/Isv/IsvUploadBatchLogRequest.zan`, `stdlib/Sdk/Jd/Api/Isv/IsvUploadDBOperationLogRequest.zan`, `stdlib/Sdk/Jd/Api/Isv/IsvUploadLoginLogRequest.zan`, `stdlib/Sdk/Jd/Api/Isv/IsvUploadOrderInfoLogRequest.zan`, `stdlib/Sdk/Jd/Api/Isv/IsvUploadThirdAppTransmitOrderInfoLogRequest.zan`, `stdlib/Sdk/Jd/Api/Isv/JdIsvApi.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Isv/IsvAddisvlogRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Isv/IsvUploadBatchLogRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Isv/IsvUploadDBOperationLogRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Isv/IsvUploadLoginLogRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Isv/IsvUploadOrderInfoLogRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Isv/IsvUploadThirdAppTransmitOrderInfoLogRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Isv/JdIsvApi.zan`
 
 
 ## IsvAddisvlogRequest (class)

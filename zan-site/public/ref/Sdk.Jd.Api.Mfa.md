@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Mfa
 
-> 源码: `stdlib/Sdk/Jd/Api/Mfa/JdMfaApi.zan`, `stdlib/Sdk/Jd/Api/Mfa/MfaInnerEliminateRiskRequest.zan`, `stdlib/Sdk/Jd/Api/Mfa/MfaInnerSendCodeToMobileRequest.zan`, `stdlib/Sdk/Jd/Api/Mfa/MfaInnerUserUnifiedAuthenticationRequest.zan`, `stdlib/Sdk/Jd/Api/Mfa/MfaInnerValidateMsgCodeRequest.zan`, `stdlib/Sdk/Jd/Api/Mfa/MfaUserUnifiedAuthenticationRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Mfa/JdMfaApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Mfa/MfaInnerEliminateRiskRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Mfa/MfaInnerSendCodeToMobileRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Mfa/MfaInnerUserUnifiedAuthenticationRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Mfa/MfaInnerValidateMsgCodeRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Mfa/MfaUserUnifiedAuthenticationRequest.zan`
 
 
 ## JdMfaApi (class)

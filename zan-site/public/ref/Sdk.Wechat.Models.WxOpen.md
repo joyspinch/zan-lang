@@ -1,6 +1,6 @@
 # Sdk.Wechat.Models.WxOpen
 
-> 源码: `stdlib/Sdk/Wechat/Models/WxOpen/WechatWxOpenModels.zan`
+> 源码: `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/Models/WxOpen/WechatWxOpenModels.zan`
 
 
 ## WechatWxOpenAddJsonResult (class)

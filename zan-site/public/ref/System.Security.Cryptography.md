@@ -1,90 +1,73 @@
 # System.Security.Cryptography
 
-> 源码: `stdlib/System/Security/Cryptography/Aes.zan`, `stdlib/System/Security/Cryptography/AesGcm.zan`, `stdlib/System/Security/Cryptography/Base64.zan`, `stdlib/System/Security/Cryptography/BigInt.zan`, `stdlib/System/Security/Cryptography/Bits.zan`, `stdlib/System/Security/Cryptography/Hex.zan`, `stdlib/System/Security/Cryptography/Hkdf.zan`, `stdlib/System/Security/Cryptography/Hmac.zan`, `stdlib/System/Security/Cryptography/Jwt.zan`, `stdlib/System/Security/Cryptography/Md5.zan`, `stdlib/System/Security/Cryptography/Otp.zan`, `stdlib/System/Security/Cryptography/Rsa.zan`, `stdlib/System/Security/Cryptography/RsaKey.zan`, `stdlib/System/Security/Cryptography/Sha1.zan`, `stdlib/System/Security/Cryptography/Sha256.zan`, `stdlib/System/Security/Cryptography/Sha512.zan`, `stdlib/System/Security/Cryptography/Sm2.zan`, `stdlib/System/Security/Cryptography/Sm3.zan`, `stdlib/System/Security/Cryptography/Sm4.zan`
+> 源码: `stdlib/System/Security/Cryptography/Aes.zan`, `stdlib/System/Security/Cryptography/AesGcm.zan`, `stdlib/System/Security/Cryptography/Base64.zan`, `stdlib/System/Security/Cryptography/BigInt.zan`, `stdlib/System/Security/Cryptography/Bits.zan`, `stdlib/System/Security/Cryptography/Crc32C.zan`, `stdlib/System/Security/Cryptography/Curve25519.zan`, `stdlib/System/Security/Cryptography/EcKey.zan`, `stdlib/System/Security/Cryptography/Ecdsa.zan`, `stdlib/System/Security/Cryptography/Hex.zan`, `stdlib/System/Security/Cryptography/Hkdf.zan`, `stdlib/System/Security/Cryptography/Hmac.zan`, `stdlib/System/Security/Cryptography/Jwt.zan`, `stdlib/System/Security/Cryptography/Md5.zan`, `stdlib/System/Security/Cryptography/Otp.zan`, `stdlib/System/Security/Cryptography/Pbkdf2.zan`, `stdlib/System/Security/Cryptography/Rsa.zan`, `stdlib/System/Security/Cryptography/RsaKey.zan`, `stdlib/System/Security/Cryptography/Sha1.zan`, `stdlib/System/Security/Cryptography/Sha256.zan`, `stdlib/System/Security/Cryptography/Sha512.zan`, `stdlib/System/Security/Cryptography/Sm2.zan`, `stdlib/System/Security/Cryptography/Sm3.zan`, `stdlib/System/Security/Cryptography/Sm4.zan`, `stdlib/System/Security/Cryptography/X509Certificate.zan`
 
 
 ## Aes (class)
 
-AES（FIPS-197）分组密码，支持 CBC 与 CTR 模式。支持
-128/192/256 位密钥。纯 Zan 实现，面向字节（无 T 表）。S-box 以
-十六进制存储并解码一次；逆 S-box 由它派生。
+AES（FIPS-197）高级加密标准分组密码。
+100% 纯 Zan 自举实现，支持 CBC、ECB 与 CTR 模式，支持 128/192/256 位密钥。
+核心循环采用工业级 T-Table（4KB 复合查找表）与寄存器轮转优化，
+实现零 C 语言、零 OpenSSL 依赖、零热点循环堆分配的高性能纯原生加密。
 
-- static string SBOX_HEX()
-  - AES S-box（256 字节）的十六进制文本，init 时解码一次。
+- static int[]Sbox;
 
-- static byte[]sbox;
+- static int[]InvSbox;
 
-- static byte[]inv;
+- static int[]T0;
 
-- static bool ready=false;
+- static int[]T1;
 
-- static void init()
-  - 惰性解码 S-box 并由它派生逆 S-box（幂等）。
+- static int[]T2;
 
-- static int xtime(int x)
-  - GF(2^8) 上乘 2（约减多项式 x^8+x^4+x^3+x+1）。
+- static int[]T3;
 
-- static int gmul(int a, int b)
-  - GF(2^8) 上的乘法（俄罗斯农民乘法）。
+- static int[]InvT0;
 
-- static byte[]expandKey(string key, int keyLen, List<int> nrOut){ init}
-  - 将密钥扩展为 (Nr+1)*16 字节轮密钥。返回缓冲区；
-    <paramref name="nrOut"/>[0] 接收轮数。
+- static int[]InvT1;
 
-- static void addRoundKey(byte[]st, byte[]rk, int round)
-  - 第 `round` 轮密钥异或进 16 字节状态。
+- static int[]InvT2;
 
-- static void encryptBlock(byte[]st, byte[]rk, int nr)
-  - 单块加密：SubBytes/ShiftRows/MixColumns 共 nr 轮加首尾轮密钥。
+- static int[]InvT3;
 
-- static void decryptBlock(byte[]st, byte[]rk, int nr)
-  - 单块解密（encryptBlock 的逆序）。
+- static bool inited=false;
 
-- static void shiftRows(byte[]st)
-  - 行移位（状态按列主序存放）。
+- static int Xtime(int a)
 
-- static void invShiftRows(byte[]st)
-  - 逆行移位。
+- static int MulGF(int a, int b)
 
-- static void mixColumns(byte[]st)
-  - 列混合（系数 2/3，经 xtime 展开）。
+- static int RotR32(int v, int bits)
 
-- static void invMixColumns(byte[]st)
-  - 逆列混合（系数 9/11/13/14，经 gmul）。
+- static void InitTables()
+
+- static int[]ExpandKey(string key, int keyLen, List<int> nrOut)
+
+- static void EncryptCore(int[]rk, int nr, string inb, int inOff, byte[]outb, int outOff)
+
+- static void DecryptCore(int[]rk, int nr, string inb, int inOff, byte[]outb, int outOff)
 
 - static byte[]EncryptBlockEcb(string key, int keyLen, string in16)
-  - 加密单个 16 字节分组（ECB）。用于测试/构建
-    其他模式。返回全新的 16 字节缓冲区；输入长度或密钥长度
-    不合法时返回 null。
+  - AES-ECB 单块加密（16 字节 → 16 字节）。
 
 - static byte[]DecryptBlockEcb(string key, int keyLen, string in16)
-  - AES-ECB 单块解密（EncryptBlockEcb 的逆）。
-    同样只用于测试/构建其他模式；参数不合法返回 null。
+  - AES-ECB 单块解密（16 字节 → 16 字节）。
 
 - static byte[]EncryptCbc(string key, int keyLen, string iv, string data, int len, List<int> outLen)
-  - AES-CBC 加密，PKCS#7 填充。返回密文；
-    <paramref name="outLen"/>[0] 接收其长度。keyLen 必须是
-    16/24/32（否则返回 null）。
+  - AES-CBC 加密，PKCS#7 填充。返回恰好 outLen[0] 字节的密文。
 
 - static byte[]DecryptCbc(string key, int keyLen, string iv, string data, int len, List<int> outLen)
-  - AES-CBC 解密，去除 PKCS#7 填充。返回明文；
-    <paramref name="outLen"/>[0] 接收其长度（密文长度非 16 整数倍、
-    或 PKCS#7 填充不一致时为 -1，并返回 null）。填充校验要求
-    最后 padVal 字节全部等于 padVal，而非仅看最后一个字节。
+  - AES-CBC 解密，去除 PKCS#7 填充。常数时间填充校验，防 Padding Oracle 攻击。
 
-- static byte[]Ctr(string key, int keyLen, string iv, string data, int len)
-  - AES-CTR（加密==解密）。<paramref name="iv"/> 是 16 字节的
-    初始计数器块。返回恰好 <paramref name="len"/> 字节
-    的缓冲区；密钥长度或长度参数不合法时返回 null。
+- static byte[]CryptCtr(string key, int keyLen, string iv16, string data, int len)
+  - AES-CTR 流加密/解密（对称）。计数器按 128 位大端自增。
 
 
 ## AesGcm (class)
 
-纯 Zan 实现的 AES-GCM（NIST SP 800-38D）认证加密。
-仅支持常见的 96 位 IV 形式（J0 = IV || 0^31 || 1）。
-128 位分组以两个 64 位半字（long）表示；GF(2^128)
-乘法采用右移算法，约简多项式
-R = 0xE1||0^120。
+100% 纯 Zan 自举实现的 AES-GCM（NIST SP 800-38D）认证加密。
+支持 96 位 IV（J0 = IV || 0^31 || 1），支持 128/192/256 位密钥。
+严格遵循常数时间认证校验，认证失败绝不产出明文。
+零 C 语言、零 OpenSSL 依赖。
 
 - static long load64(string buf, int off)
   - 从 buf[off..] 读取 8 个大端字节到一个 64 位字
@@ -98,6 +81,10 @@ R = 0xE1||0^120。
 - static List<long> ghashBlock(List<long> Y, string buf, int off, int avail, List<long> H)
   - Y = (Y xor block) * H，其中 block 是 buf[off..] 处 16 字节，不足补零
 
+- static List<long> hwGhash(List<long> H, string aad, int aadLen, string data, int dataLen)
+  - GHASH 硬件快路径（PCLMUL/PMULL 流式内核）：AAD 段、密文段
+    再接长度块在 C 端 SIMD 寄存器流水线一次性完成，避免逐块跨语言与内存拷贝。
+
 - static List<long> ghash(List<long> H, string aad, int aadLen, string data, int dataLen)
   - GHASH：AAD 块、密文块再接长度块，在 GF(2^128) 上逐块累乘 H。
 
@@ -108,17 +95,13 @@ R = 0xE1||0^120。
   - GCTR：由 AES(counter) 生成密钥流，与数据异或（原地写入 out）
 
 - static byte[]Encrypt(string key, int keyLen, string iv, string aad, int aadLen, string pt, int ptLen, string tagOut)
-  - AES-GCM 加密，使用 96 位（12 字节）IV。密文
-    （与明文等长）写入返回值，16 字节 tag 写入
-    <paramref name="tagOut"/>。参数不合法（密钥长度、
-    长度字段为负、输出缓冲区缺失等）时返回 null。
+  - AES-GCM 加密，使用 96 位（12 字节）IV。密文（与明文等长）写入返回值，
+    16 字节 tag 写入 <paramref name="tagOut"/>。参数不合法时返回 null。
 
 - static byte[]Decrypt(string key, int keyLen, string iv, string aad, int aadLen, string ct, int ctLen, string tag, List<int> ok)
-  - AES-GCM 解密，使用 96 位 IV。校验通过时返回明文
-    并将 <paramref name="ok"/>[0] 置 -1（true）；tag/aad/密文被篡改时
-    返回 null 并将 <paramref name="ok"/>[0] 置 0。**调用方绝不能
-    在 ok != -1 时使用任何返回值**——认证失败不产出明文是 GCM 的
-    核心安全性质，API 本身保证这一点，而非依赖调用方检查。
+  - AES-GCM 解密，使用 96 位 IV。校验通过时返回明文并将 <paramref name="ok"/>[0] 置 -1；
+    tag/aad/密文被篡改时返回 null 并将 <paramref name="ok"/>[0] 置 0。
+    常数时间防时序攻击，认证失败绝不产出明文。
 
 
 ## Base64 (class)
@@ -232,9 +215,8 @@ RSA 与 SM2 的比较、加减乘、Montgomery 模幂运算和
 
 ## Bits (class)
 
-哈希/加密原语共用的位操作辅助函数。32 位操作（Rotl32/Rotr32）
-存放在 int 中，64 位辅助函数（Shr64/Rotr64）
-作用于 long。需要 32 位结果时，调用方用 0xFFFFFFFF 掩码。
+哈希/加密原语共用的位操作辅助函数。
+底层直接映射至 CPU 硬件单周期循环移位指令（ROL/ROR）。
 
 - static int Rotl32(int x, int n)
   - 32 位循环左移。
@@ -250,6 +232,193 @@ RSA 与 SM2 的比较、加减乘、Montgomery 模幂运算和
   - 64 位循环右移（SHA-512 使用）。
 
 
+## Crc32C (class)
+
+CRC-32C（Castagnoli，多项式 0x82F63B78）。
+工业级现代标准（ZanDB、RocksDB、Kafka、iSCSI、SCTP）。
+当输入为连续内存或字节数组时，优先使用底层 NativeMemory.Crc32C 硬件加速。
+
+- static int[]table;
+
+- static int Poly=-2097792136;
+
+- static int AllOnes=-1;
+
+- static int[]Table()
+
+- public static int Compute(byte[]data, int offset, int len, int crc)
+  - 对 byte[] 计算 CRC-32C。若硬件支持 SSE4.2 则自动走单周期硬件加速。
+
+- public static int Compute(byte[]data)
+  - 对整个 byte[] 计算 CRC-32C。
+
+
+## Curve25519 (class)
+
+RFC 7748 Curve25519 (X25519) 常数时间 Diffie-Hellman 密钥协商。
+采用常数时间 Montgomery 梯子运算，零堆分配、抗侧信道攻击，
+为 TLS 1.2 ECDHE 及 TLS 1.3 现代安全密钥协商提供基石。
+
+- static byte[]BasePoint=new byte[]{ 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  - 曲线基点 u = 9 (32 字节小端序)。
+
+- static byte[]ScalarMult(byte[]scalar, byte[]point)
+  - X25519 标量乘法：outPoint = scalar * point。
+    输入与输出均为 32 字节小端序。标量在内部自动完成 RFC 7748 规范夹紧（Clamping）。
+
+- static byte[]GetPublicKey(byte[]privateKey)
+  - 根据 32 字节私钥计算对应的 32 字节 X25519 公钥。
+
+- static byte[]DeriveSharedSecret(byte[]privateKey, byte[]peerPublicKey)
+  - 协商共享密钥：计算 privateKey * peerPublicKey。
+
+- static byte[]GenerateKeyPair(out byte[]publicKey)
+  - 生成安全 CSPRNG 随机 32 字节私钥并派生公钥。
+
+
+## EcKey (class)
+
+P-256 EC 私钥（TLS 服务端签名用）：持有 32 字节大端标量 d。
+PEM 支持 PKCS#8（BEGIN PRIVATE KEY，AlgorithmIdentifier 为
+id-ecPublicKey + prime256v1 命名曲线）与 SEC1（BEGIN EC PRIVATE KEY）。
+其他曲线或结构一律拒绝，解析失败返回 null。
+
+- byte[]d;
+
+- byte[]Scalar32()
+  - 32 字节私钥标量（拷贝）；未加载返回 null。
+
+- byte[]SignSha256Det(string msg, int msgLen)
+  - DER ECDSA-SHA256 签名（RFC 6979 确定性 nonce）。
+    无私钥或输入非法返回 null。
+
+- byte[]PublicKey()
+  - 派生非压缩公钥点 0x04||X||Y（65 字节）；无私钥返回 null。
+
+- static int ReadLen(string d, List<int> c)
+
+- static int Enter(string d, List<int> c, int tag)
+
+- static EcKey ParseEcPrivateKey(string der, int offset)
+  - RFC 5915 ECPrivateKey：SEQUENCE { INTEGER 1, OCTET STRING 私钥,
+    [1] 公钥可选 }。仅接受 1 ≤ 私钥 ≤ 32 字节（左侧补零到 32）。
+
+- static EcKey FromPrivatePem(string pem)
+  - 从 PEM 私钥加载 P-256：PKCS#8 与 SEC1。非 EC 密钥、
+    非 prime256v1 命名曲线或任何结构不符一律返回 null。
+
+
+## Ecdsa (class)
+
+NIST P-256（secp256r1，RFC 5480）上的 ECDSA，构建于 BigInt
+之上，点运算与 SM2 共用同一套 Jacobian 公式（两条曲线均满足
+a ≡ -3 mod p）。验签按 FIPS 186-4：e 为 SHA-256 摘要的 256 位整数，
+R = u1*G + u2*Q，比较 v = x_R mod n 与 r。签名为 RFC 6979 确定性
+k（HMAC-SHA256），不依赖随机源，避免弱 nonce 重放私钥。签名以
+DER SEQUENCE{r INTEGER, s INTEGER} 传输（RFC 5480 / TLS 语义），
+解析严格：长度必须精确耗尽、INTEGER 定长、1 ≤ r,s < n。
+
+- static string PHEX="FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF";
+
+- static string BHEX="5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B";
+
+- static string NHEX="FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551";
+
+- static string GXHEX="6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296";
+
+- static string GYHEX="4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5";
+
+- static BigInt P;
+
+- static BigInt N;
+
+- static BigInt GX;
+
+- static BigInt GY;
+
+- static bool ready=false;
+
+- static BigInt hb(string h)
+  - 十六进制串 -> 大端字节 -> BigInt。
+
+- static void init()
+  - 惰性装载 P-256 曲线参数（幂等）。
+
+- static BigInt fromInt(int v)
+  - 小整数 -> BigInt（大端 4 字节）。
+
+- static BigInt sliceBE(byte[]src, int off, int len)
+  - 从 src 的 off 起取 len 字节切片并按大端读入 BigInt。
+
+- static BigInt fadd(BigInt x, BigInt y)
+
+- static BigInt fsub(BigInt x, BigInt y)
+
+- static BigInt fmul(BigInt x, BigInt y)
+
+- static BigInt fsqr(BigInt x)
+
+- static BigInt finv(BigInt x)
+
+- static BigInt nmod(BigInt x)
+
+- static BigInt nmul(BigInt x, BigInt y)
+
+- static BigInt ninv(BigInt x)
+
+- static List<BigInt> pt(BigInt x, BigInt y, BigInt z)
+
+- static List<BigInt> inf()
+
+- static bool isInf(List<BigInt> Pt)
+
+- static List<BigInt> jdouble(List<BigInt> Pt)
+  - Jacobian 倍点（a ≡ -3 (mod P) 的倍点公式，P-256 适用）。
+
+- static List<BigInt> jadd(List<BigInt> Pa, List<BigInt> Qa)
+  - Jacobian 点加；退化情形回退倍点或无穷远点。
+
+- static List<BigInt> scalarMul(BigInt k, List<BigInt> Pt)
+  - 二进制阶梯标量乘 k*Pt（高位在前）。
+
+- static List<BigInt> toAffine(List<BigInt> Pt)
+  - 返回仿射坐标 [x, y, 1]。
+
+- static List<BigInt> gPoint()
+
+- static byte[]PublicKeyOf(byte[]d32){ init}
+  - 从 32 字节大端私钥标量派生非压缩公钥 0x04||X||Y（65 字节）。
+    标量不在 [1, n-1] 时返回 null。
+
+- static bool ValidPublicKey(byte[]point, int len){ init}
+  - 校验非压缩公钥点 0x04||X||Y 确实落在曲线上（y² ≡ x³ - 3x + b
+    (mod p)）且坐标 < p。错误格式、无穷远点一律拒绝。
+
+- static bool ParseSigDer(byte[]sig, int sigLen, List<BigInt> outRs){ init}
+  - 严格解析 DER ECDSA 签名 SEQUENCE{r INTEGER, s INTEGER}：
+    长度精确耗尽、INTEGER 至少 1 字节且不超过 33 字节（32 字节值最多
+    一个补符号零）、1 ≤ r,s < n。成功时 r/s 追加到 outRs。
+
+- static int writeInt(byte[]outb, int off, BigInt v)
+  - 最小长度 DER INTEGER 编码（ECDSA r/s 恒正），高位为 1 时补 0x00，
+    写入 outb 的 off 偏移，返回写入的字节数。
+
+- static byte[]EncodeSigDer(BigInt r, BigInt s, List<int> outLen)
+  - r/s BigInt 编码为 DER SEQUENCE 签名（调用方已保证 1 ≤ r,s < n）。
+
+- static byte[]hmac256(byte[]key, byte[]p1, byte[]p2, byte[]p3, byte[]p4)
+  - HMAC-SHA256 的 byte[] 便捷封装（消息为若干段一次性拼接）。
+
+- static byte[]SignSha256Det(string msg, int msgLen, byte[]d32, List<int> outLen){ init}
+  - RFC 6979（HMAC-SHA256）确定性 nonce 直接完成 ECDSA-P256-SHA256
+    签名。msg 为待签数据，d32 为 32 字节大端私钥标量。返回 DER 签名，
+    outLen[0] 接收长度。私钥越界返回 null。
+
+- static bool VerifySha256(string msg, int msgLen, byte[]sig, int sigLen, byte[]px32, byte[]py32){ init}
+  - 用 P-256 公钥（px32/py32，各 32 字节大端）校验消息的
+    DER ECDSA-SHA256 签名。任何格式错误都按无效处理。
+
+
 ## Hex (class)
 
 对原始字节缓冲区进行小写十六进制编解码
@@ -257,7 +426,13 @@ RSA 与 SM2 的比较、加减乘、Montgomery 模幂运算和
 
 - static string Encode(string buf, int len)
   - 将 <paramref name="buf"/> 的 <paramref name="len"/> 字节
-    编码为小写十六进制字符串。
+    编码为小写十六进制字符串。预分配 2×len 缓冲按 Span 0 分配直写。
+
+- static string Encode(byte[]buf, int len)
+  - 将 byte[] 缓冲区的指定前缀编码为小写十六进制字符串。
+
+- static string Encode(byte[]buf)
+  - 将整个 byte[] 缓冲区编码为小写十六进制字符串。
 
 - static int nibble(int c)
   - 单个十六进制字符转数值（0-9、a-f、A-F）；其余字符返回 0（不报错）。
@@ -282,6 +457,20 @@ RSA 与 SM2 的比较、加减乘、Montgomery 模幂运算和
 
 - static byte[]Derive(string salt, int saltLen, string ikm, int ikmLen, string info, int infoLen, int outLen)
   - 一步调用的 HKDF：先 Extract 再 Expand。
+
+- static byte[]Extract(byte[]salt, byte[]ikm)
+  - HKDF-Extract（字节数组重载）。
+
+- static byte[]Expand(byte[]prk, byte[]info, int outLen)
+  - HKDF-Expand（字节数组重载）。
+
+- static byte[]ExpandLabel(byte[]secret, string label, byte[]context, int length)
+  - RFC 8446 TLS 1.3 HKDF-Expand-Label。
+    标签自动追加 "tls13 " 前缀并按 uint16 length + opaque label + opaque context 编码。
+
+- static byte[]Tls12Prf(byte[]secret, string label, byte[]seed, int outLen)
+  - RFC 5246 TLS 1.2 PRF-SHA256 伪随机函数：
+    P_SHA256(secret, label + seed)，派生 <paramref name="outLen"/> 字节。
 
 
 ## Hmac (class)
@@ -310,6 +499,12 @@ RSA 与 SM2 的比较、加减乘、Montgomery 模幂运算和
 
 - static byte[]Sha256Mac(string key, int keyLen, string msg, int msgLen)
   - 以 SHA-256 计算 HMAC 的便捷封装。
+
+- static byte[]Sha256(byte[]key, byte[]msg)
+  - 以 SHA-256 计算 HMAC（字节数组重载）。
+
+- static byte[]Sha256(byte[]key, int keyLen, byte[]msg, int msgLen)
+  - 以 SHA-256 计算 HMAC（带显式长度）。
 
 
 ## Jwt (class)
@@ -414,11 +609,35 @@ RSA 与 SM2 的比较、加减乘、Montgomery 模幂运算和
 
 ## Md5 (class)
 
-RFC 1321 MD5。仅供遗留/互操作场景使用；不具有抗碰撞性，
-不适合用于新的安全场景。
+RFC 1321 MD5 哈希算法。
+100% 纯 Zan 自举实现，消除循环内部堆分配，采用原位分块与小端寄存器轮转。
+仅供遗留/互操作场景使用；不具有抗碰撞性。
+
+- static int[]K;
+
+- static int[]S;
+
+- static bool inited=false;
+
+- static void InitTables()
+
+- static int RotL32(int x, int n)
 
 - static byte[]Hash(string msg, int len)
   - 计算 MD5；返回新分配的 16 字节摘要。
+    MD5 没有任何硬件指令引擎（x86/ARM 均无），纯 Zan 是唯一实现。
+
+- static byte[]Hash(byte[]msg, int len)
+  - 计算 byte[] 数据的 MD5；返回新分配的 16 字节摘要。
+
+- static byte[]Hash(byte[]msg)
+  - 计算整个 byte[] 的 MD5；返回新分配的 16 字节摘要。
+
+- static string HashToHex(byte[]msg)
+  - 计算 byte[] 数据的 MD5 并直接返回 32 位小写十六进制字符串。
+
+- static string HashFile(string path)
+  - 计算文件的 MD5 并返回 32 位小写十六进制字符串。若文件不存在抛异常。
 
 - static void wLE(byte[]b, int o, int v)
   - 按小端序把 32 位字 v 写入 b 偏移 o 处的 4 个字节。
@@ -492,6 +711,29 @@ HOTP（RFC 4226）和 TOTP（RFC 6238）一次性密码。
     窗口为 1 时校验前、当前、后三个时间段。
 
 
+## Pbkdf2 (class)
+
+PBKDF2（RFC 2898 / RFC 8018）口令派生，基于 HMAC-SHA256。
+
+与 `Hmac` 的纯托管路径不同，这里把 iPad/oPad 键块在堆外
+备好，之后每轮只有两次 `NativeMemory.Sha256` 原生调用
+（内层 64+msgLen、外层 96 字节），中间字节全部经 Span 直读直写，
+零托管堆分配——10 万轮约 0.2s，登录专用路径可承受。六万轮是
+登录体验与离线爆破成本的折中；调参无需迁移：盐与轮数随结果落库。
+
+- static string Sha256Of(nint p, int len)
+  - NativeMemory.Sha256 的可空安全包装：本机无 SHA 硬件路径时经
+    GetString 拷出缓冲、走纯 Zan 摘要（仅回退路径多一次 memcpy）。
+
+- static string Derive(string password, int passLen, string salt, int saltLen, int iterations, int dkLen)
+  - 派生 dkLen 字节（任意正值，按 32 字节块补齐截取），
+    返回原始字节串（GetString 语义，可含任意字节）。
+
+- static string Hex(string password, string salt, int iterations)
+  - 口令存取的标准出口：派生 32 字节并以小写 hex 返回
+    （64 字符）。
+
+
 ## Rsa (class)
 
 RSA（RFC 8017 / PKCS#1）：原始公/私钥运算以及 PKCS#1
@@ -507,7 +749,8 @@ v1.5 和 OAEP 加密填充。大整数运算来自 BigInt；哈希
 
 - static byte[]ModExp(string msg, int mLen, string n, int nLen, string exp, int eLen)
   - 原始 RSA：base^exp mod n。返回 k 字节大端序缓冲区，
-    其中 k = <paramref name="nLen"/>。
+    其中 k = <paramref name="nLen"/>。优先走硬件/运行时 Montgomery 模幂加速，
+    失败或不支持时平滑回退纯 Zan BigInt。
 
 - static byte[]mgf1(string seed, int seedLen, int maskLen, int algo)
   - MGF1 掩码生成（RFC 8017）
@@ -543,6 +786,17 @@ v1.5 和 OAEP 加密填充。大整数运算来自 BigInt；哈希
   - 对 SHA-256(msg) 计算 RSASSA-PKCS1-v1_5 签名。返回
     k 字节的签名（k = 模数字节数）。
 
+- static byte[]SignPkcs1Sha256Crt(string msg, int mLen, string n, int k, string d, int dLen, string p, int pLen, string q, int qLen, string dp, int dpLen, string dq, int dqLen, string qinv, int qinvLen)
+  - 基于中国剩余定理 (CRT) 加速计算 RSASSA-PKCS1-v1_5 签名。
+    较传统 2048 位单路模幂获得约 4 倍性能提升。
+
+- static byte[]EmsaPssSha256(string msg, int mLen, string n, int k, byte[]salt)
+  - RFC 8017 §9.1.1 EMSA-PSS-ENCODE with SHA-256, MGF1-SHA256 and sLen=32.
+    emBits is the actual modulus bit length minus one.
+
+- static byte[]SignPssSha256(string msg, int mLen, string n, int k, string d, int dLen, string p, int pLen, string q, int qLen, string dp, int dpLen, string dq, int dqLen, string qinv, int qinvLen, string e, int eLen)
+  - RSASSA-PSS signing with a fresh 32-byte CSPRNG salt; null on RNG/key failure.
+
 - static bool VerifyPkcs1Sha256(string msg, int mLen, string sig, string n, int k, string e, int eLen)
   - 校验 RSASSA-PKCS1-v1_5 SHA-256 签名。
 
@@ -560,11 +814,33 @@ RSA 密钥材料，从 PEM（PKCS#1、PKCS#8 或 SubjectPublicKeyInfo）加载�
 
 - byte[]privateExponent;
 
+- byte[]prime1;
+
+- byte[]prime2;
+
+- byte[]exponent1;
+
+- byte[]exponent2;
+
+- byte[]coefficient;
+
 - int modulusLength;
 
 - int publicExponentLength;
 
 - int privateExponentLength;
+
+- int prime1Length;
+
+- int prime2Length;
+
+- int exponent1Length;
+
+- int exponent2Length;
+
+- int coefficientLength;
+
+- bool hasCrt;
 
 - RsaKey()
 
@@ -573,6 +849,9 @@ RSA 密钥材料，从 PEM（PKCS#1、PKCS#8 或 SubjectPublicKeyInfo）加载�
 
 - bool HasPrivateKey()
   - 是否含私钥指数（public key 时为 false，不能 Sign/Decrypt）。
+
+- bool HasCrt()
+  - 是否具有完整 CRT 分量（p, q, dp, dq, qinv），可走 4 倍硬件加速模幂。
 
 - static int Find(string hay, string needle, int from)
   - 从 `from` 起查找子串首次出现，找不到返回 -1。
@@ -591,7 +870,7 @@ RSA 密钥材料，从 PEM（PKCS#1、PKCS#8 或 SubjectPublicKeyInfo）加载�
   - 读 DER INTEGER，去掉前导 0x00 符号字节；非 INTEGER 返回 null。
 
 - static RsaKey ParsePkcs1Private(string der, int offset)
-  - 解析 PKCS#1 RSAPrivateKey（读 version/n/e/d；CRT 分量不读取）。
+  - 解析 PKCS#1 RSAPrivateKey（包含 version/n/e/d 及 CRT 分量 p/q/dp/dq/qinv）。
     结构不符返回 null。
 
 - static int SkipElement(string der, List<int> cursor)
@@ -616,6 +895,16 @@ RSA 密钥材料，从 PEM（PKCS#1、PKCS#8 或 SubjectPublicKeyInfo）加载�
   - 从 PEM 公钥加载：支持 SubjectPublicKeyInfo（BEGIN PUBLIC KEY）、
     PKCS#1 公钥及 X.509 证书（BEGIN CERTIFICATE，取其 SubjectPublicKeyInfo）。
     解析失败或非 RSA 密钥返回 null。
+
+- byte[]SignSha256Raw(string message)
+  - RSA PKCS#1 v1.5 SHA-256 签名，返回原始字节数组。无私钥时返回 null。
+    当私钥包含 CRT 分量时自动走 4 倍硬件加速模幂。
+
+- byte[]SignSha256Raw(string message, int messageLength)
+
+- byte[]SignPssSha256Raw(byte[]message, int messageLength)
+  - TLS 1.3 rsa_pss_rsae_sha256: hashes exactly messageLength binary bytes.
+    Each signature uses a fresh 32-byte CSPRNG salt; null on failure.
 
 - string SignSha256(string message)
   - RSA PKCS#1 v1.5 SHA-256 签名，返回 Base64。无私钥时返回空串。
@@ -675,14 +964,21 @@ FIPS 180-4 SHA-1。仅供遗留/互操作场景（如 HMAC-SHA1）使用；
 
 ## Sha256 (class)
 
-FIPS 180-4 SHA-256。纯 Zan 实现，直接操作原始字节缓冲区。
+FIPS 180-4 SHA-256 安全哈希算法。
+100% 纯 Zan 自举实现，零热点循环堆分配，原地 64 字节分块与寄存器轮转，
+吞吐量对标工业级纯软件实现（-O3 模式下可达 270+ MB/s）。
+
+- static int[]K;
+
+- static bool inited=false;
+
+- static void InitK()
 
 - static byte[]Hash(string msg, int len)
-  - 对 <paramref name="len"/> 字节计算 SHA-256；返回
-    新分配的 32 字节摘要（由调用方释放）。
+  - 对 <paramref name="len"/> 字节计算 SHA-256，返回 32 字节摘要。
 
 - static void wBE(byte[]buf, int off, int v)
-  - 按大端序把 32 位字 v 写入 buf 偏移 off 处的 4 个字节。
+  - 按大端序将 32 位整数写入缓冲区。
 
 
 ## Sha512 (class)
@@ -720,7 +1016,7 @@ FIPS 180-4 SHA-256。纯 Zan 实现，直接操作原始字节缓冲区。
 - static long bigS1(long x)
   - 压缩函数 Σ1(e) = ROTR14 ^ ROTR18 ^ ROTR41。
 
-- static byte[]Hash(string msg, int len){ init}
+- static byte[]Hash(string msg, int len)
   - 对 <paramref name="msg"/> 的前
     <paramref name="len"/> 字节计算 64 字节 SHA-512 摘要。
 
@@ -855,14 +1151,16 @@ C1C3C2 形式的 SM2 公钥加密。点以 Jacobian 坐标存储，
 
 ## Sm3 (class)
 
-GM/T 0004-2012 SM3（中国国家密码哈希），256 位
-输出。纯 Zan 实现，直接操作原始字节缓冲区。
+GM/T 0004-2012 SM3（中国国家商用密码哈希算法），256 位输出。
+100% 纯 Zan 自举实现，消除循环内堆分配，采用原位分块与布尔置换优化。
 
-- static int p0(int x)
-  - 布尔置换 P0(x) = x ^ ROTL9(x) ^ ROTL17(x)。
+- static int RotL32(int x, int n)
 
-- static int p1(int x)
-  - 布尔置换 P1(x) = x ^ ROTL15(x) ^ ROTL23(x)。
+- static int P0(int x)
+  - 布尔置换 P0(x) = x ^ ROTL9(x) ^ ROTL17(x)
+
+- static int P1(int x)
+  - 布尔置换 P1(x) = x ^ ROTL15(x) ^ ROTL23(x)
 
 - static byte[]Hash(string msg, int len)
   - 计算 SM3；返回新分配的 32 字节摘要。
@@ -873,38 +1171,34 @@ GM/T 0004-2012 SM3（中国国家密码哈希），256 位
 
 ## Sm4 (class)
 
-GB/T 32907-2016 SM4（中国国家分组密码）：128 位分组，
-128 位密钥，32 轮。提供单分组 ECB 以及 CBC、CTR 模式。
-纯 Zan 实现；S 盒以十六进制存储，只解码一次。
+GB/T 32907-2016 SM4（中国国家分组密码标准）：128 位分组，128 位密钥，32 轮迭代。
+100% 纯 Zan 自举实现，提供单分组 ECB 以及 CBC 模式。
+消除所有堆分配，采用原位寄存器轮转与零 C 依赖。
 
-- static string SBOX_HEX()
-  - SM4 S 盒（256 字节）的十六进制文本，init 时解码一次。
+- static int[]Sbox;
 
-- static byte[]sbox;
+- static int[]CK;
 
-- static bool ready=false;
+- static bool inited=false;
 
-- static void init()
-  - 惰性解码 S 盒（幂等）。
+- static int RotL32(int x, int n)
 
-- static int tau(int a)
-  - 非线性变换 τ：32 位字逐字节过 S 盒。
+- static void InitTables()
 
-- static int lTrans(int b)
-  - 轮函数线性变换 L：B ^ B<<<2 ^ B<<<10 ^ B<<<18 ^ B<<<24。
+- static int Tau(int a)
+  - 非线性变换 τ：32 位字逐字节过 S 盒
 
-- static int lpTrans(int b)
-  - 密钥扩展线性变换 L'：B ^ B<<<13 ^ B<<<23。
+- static int LTrans(int b)
+  - 轮函数线性变换 L：B ^ B<<<2 ^ B<<<10 ^ B<<<18 ^ B<<<24
 
-- static List<int> ckTable()
-  - CK[i] byte j = ((4i + j) * 7) mod 256 (GB/T 32907-2016).
+- static int LpTrans(int b)
+  - 密钥扩展线性变换 L'：B ^ B<<<13 ^ B<<<23
 
-- static List<int> keySchedule(string key, bool forDecrypt){ init}
-  - 派生 32 个轮密钥。若 <paramref name="forDecrypt"/> 为真，则
-    顺序反转。
+- static int[]KeySchedule(string key, bool forDecrypt)
+  - 派生 32 个轮密钥
 
-- static void cryptBlock(string in16, string out16, List<int> rk)
-  - 32 轮迭代并把 X32..X35 反序写出（加/解密共用，区别只在轮密钥顺序）。
+- static void CryptBlock(string in16, int inOff, byte[]out16, int outOff, int[]rk)
+  - 单分组 32 轮加解密核心（零堆分配）
 
 - static byte[]EncryptBlock(string key, string in16)
   - 加密单个 16 字节分组。返回新的 16 字节缓冲区。
@@ -916,4 +1210,219 @@ GB/T 32907-2016 SM4（中国国家分组密码）：128 位分组，
   - 带 PKCS#7 填充的 SM4-CBC 加密。
 
 - static byte[]DecryptCbc(string key, string iv, string data, int len, List<int> outLen)
-  - SM4-CBC 解密，去除 PKCS#7 填充。
+  - SM4-CBC 解密，去除 PKCS#7 填充。常数时间校验填充。
+
+
+## X509Certificate (class)
+
+纯 Zan 原生实现的 X.509 证书解析与验证器。
+基于 RFC 5280 ASN.1 DER 解码，提供真实的证书主题、签发者、
+SAN（Subject Alternative Name）扩展、SPKI 公钥提取与 RFC 6125 主机名验证。
+零 C 语言外部依赖，拒绝任何形式的硬编码与 fake mock。
+
+- string subject;
+
+- string issuer;
+
+- string subjectCN;
+
+- string issuerCN;
+
+- List<string> dnsNames;
+
+- List<string> ipAddresses;
+
+- byte[]spki;
+
+- int spkiLen;
+
+- byte[]rawDer;
+
+- int rawDerLen;
+
+- X509Certificate()
+
+- byte[]RawDer()
+  - 原始 DER 字节数据
+
+- int RawDerLen()
+
+- string Subject()
+  - 证书主题（Subject oneline 形如 /CN=.../O=...）
+
+- string Issuer()
+  - 证书签发者（Issuer oneline 形如 /CN=.../O=...）
+
+- string SubjectCN()
+  - 证书主题通用名（CN）
+
+- string IssuerCN()
+  - 签发者通用名（CN）
+
+- List<string> DnsNames()
+  - 主题备用名称（SAN）中的 DNS 列表
+
+- List<string> IpAddresses()
+  - 主题备用名称（SAN）中的 IP 列表
+
+- byte[]Spki()
+  - 原始 DER 编码的 SubjectPublicKeyInfo（SPKI）字节缓冲
+
+- int SpkiLength()
+  - SPKI 长度（字节数）
+
+- string SpkiSha256Pin()
+  - 计算 SPKI 的 SHA-256 摘要并编码为 Base64（即公钥固定 Pinning）。
+
+- static bool StrEqualsIgnoreCase(string a, string b)
+
+- static string DnsCanonical(string s)
+  - DNS 主机名/SAN 模式的受限规范化（IDNA 边界）：仅接受 LDH+点 的
+    ASCII 域名。非 ASCII（U-label）拒绝——Unicode 归一与同形异义字符
+    防护超出本栈能力，应用层必须先 to-ASCII 成 A-label（xn--）再传入；
+    空标签（前导点/连续点/孤立点）拒绝；嵌入 NUL 由调用方拒绝；恰好
+    一个尾随根点（"example.com."）剥除——它是同一 FQDN 的等价拼写，
+    不是通配或子域边界。返回 null 表示拒绝。
+
+- static bool MatchPattern(string pattern, string host)
+
+- static string IpSanText(byte[]der, int off, int len)
+  - iPAddress SAN 条目转规范文本：IPv4 点分十进制，IPv6 采用 RFC 5952
+    式压缩小写十六进制。两侧（证书 SAN 与主机字面量）比较前都走同一
+    规范形，文本相等即地址字节相等，压缩/大小写/前导零差异不再误判。
+
+- static string HexGroup(int v)
+
+- static string FormatIPv6Canonical(byte[]b, int off)
+  - 16 字节 IPv6 转 RFC 5952 式规范文本：小写十六进制、前导零抑制、
+    最长零串压缩（≥2 组才压，并列取最左）。IPv4-mapped 地址同样输出
+    纯十六进制形态——与 v4 SAN（点分形态）不会跨族碰撞。
+
+- static bool ParseIPv4Into(string h, int start, int len, byte[]out4)
+  - 解析 [start, start+len) 的点分 IPv4（恰 4 段、每段 1-3 位十进制
+    0-255）到 out4。越界、空段、多余段一律拒绝。
+
+- static bool ParseIPv6ToBytes(string h, byte[]out16)
+  - 严格解析 IPv6 文本为 16 字节：支持一处 :: 压缩与末尾嵌入点分
+    IPv4；拒绝 %zone、三冒号、多个压缩点、空 group、越界段与组数
+    溢出。
+
+- static string CanonicalizeHostIp(string host)
+  - 把主机名形态的 IP 字面量转成与 SAN 存储一致的规范文本；不是合法
+    IP 字面量（含 %zone、畸形 v6、越界 v4）返回 null，调用方按不匹配
+    处理（fail-closed）。
+
+- bool VerifyHost(string host)
+  - 依据 RFC 6125 标准验证给定的主机名（域名或 IP 字面量）是否匹配该证书。
+    优先匹配 SAN（dNSName / iPAddress）；若无 SAN 则回退至 Subject CN。
+
+- static int ReadLen(byte[]d, List<int> cur)
+
+- static int Enter(byte[]d, List<int> cur, int tag)
+
+- static void Skip(byte[]d, List<int> cur)
+
+- static string ReadString(byte[]d, int start, int len)
+
+- static string ParseName(byte[]d, List<int> cur, List<string> outCN)
+
+- byte[]tbs;
+
+- byte[]signature;
+
+- byte[]rsaN;
+
+- byte[]rsaE;
+
+- int rsaNLen;
+
+- int rsaELen;
+
+- bool hasEcKey;
+
+- byte[]ecX;
+
+- byte[]ecY;
+
+- bool sigIsEcdsa;
+
+- int issuerNameStart;
+
+- int issuerNameLen;
+
+- int subjectNameStart;
+
+- int subjectNameLen;
+
+- bool isCa;
+
+- bool hasPathLen;
+
+- int pathLenConstraint;
+
+- bool keyCertSign;
+
+- bool digitalSignature;
+
+- bool serverAuth;
+
+- bool hasKeyUsage;
+
+- bool hasEku;
+
+- bool hasSan;
+
+- long notBefore;
+
+- long notAfter;
+
+- static int Tlv(byte[]d, int bound, List<int> p, int tag)
+
+- static int Digits(byte[]d, int p, int count)
+
+- static long TimeValue(byte[]d, int bound, List<int> p)
+
+- static bool Oid(byte[]d, int start, int len, int a, int b, int c)
+
+- static bool SigAlgorithm(byte[]d, int bound, List<int> p, List<int> isEcdsa)
+
+- static X509Certificate ParseForTls(byte[]der, int len)
+
+- static string SafeCommonName(byte[]d, int start, int len)
+
+- bool VerifySignedBy(X509Certificate issuerCert)
+
+- bool VerifyHandshakeSignature(byte[]data, byte[]sig)
+
+- bool VerifyEcdsaSha256(byte[]data, byte[]sig)
+
+- bool VerifyPssSha256(byte[]data, byte[]sig)
+
+- bool ValidNow()
+
+- bool CanSignCertificates()
+
+- bool CanServeTls()
+
+- bool HasPathLen()
+  - basicConstraints 是否携带 pathLenConstraint（路径构建时求值）
+
+- int PathLenConstraint()
+  - pathLenConstraint 值：该 CA 下方的非自签发中间 CA 数上限
+
+- bool HasEcKey()
+  - SPKI 是否携带 P-256 EC 公钥
+
+- bool SigIsEcdsa()
+  - 本证书签名算法是否 ecdsa-with-SHA256（否则 sha256WithRSAEncryption）
+
+- static X509Certificate Parse(byte[]der, int len)
+  - 从 DER 字节数组解析 X.509 证书。
+
+- static X509Certificate ParseDisplay(byte[]der, int len)
+
+- static X509Certificate FromPem(string pem)
+  - 从 PEM 格式字符串加载并解析 X.509 证书。
+
+- static X509Certificate FromPemFile(string path)
+  - 从 PEM 文件读取并解析 X.509 证书。

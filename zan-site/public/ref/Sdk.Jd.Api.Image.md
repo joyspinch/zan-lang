@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Image
 
-> 源码: `stdlib/Sdk/Jd/Api/Image/ImageReadFindFirstImageRequest.zan`, `stdlib/Sdk/Jd/Api/Image/ImageReadFindImagesByColorRequest.zan`, `stdlib/Sdk/Jd/Api/Image/ImageReadFindImagesByWareIdRequest.zan`, `stdlib/Sdk/Jd/Api/Image/ImageWriteDeleteRequest.zan`, `stdlib/Sdk/Jd/Api/Image/ImageWriteUpdateRectangleRequest.zan`, `stdlib/Sdk/Jd/Api/Image/ImageWriteUpdateRequest.zan`, `stdlib/Sdk/Jd/Api/Image/JdImageApi.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Image/ImageReadFindFirstImageRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Image/ImageReadFindImagesByColorRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Image/ImageReadFindImagesByWareIdRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Image/ImageWriteDeleteRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Image/ImageWriteUpdateRectangleRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Image/ImageWriteUpdateRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Image/JdImageApi.zan`
 
 
 ## ImageReadFindFirstImageRequest (class)

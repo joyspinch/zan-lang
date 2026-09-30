@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.GetThirdPdfByOrderIdForVender
 
-> 源码: `stdlib/Sdk/Jd/Api/GetThirdPdfByOrderIdForVender/GetThirdPdfByOrderIdForVenderRequest.zan`, `stdlib/Sdk/Jd/Api/GetThirdPdfByOrderIdForVender/JdGetThirdPdfByOrderIdForVenderApi.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/GetThirdPdfByOrderIdForVender/GetThirdPdfByOrderIdForVenderRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/GetThirdPdfByOrderIdForVender/JdGetThirdPdfByOrderIdForVenderApi.zan`
 
 
 ## GetThirdPdfByOrderIdForVenderRequest (class)

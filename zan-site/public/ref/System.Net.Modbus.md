@@ -30,6 +30,10 @@ m.Close();
 
 - bool connected;
 
+- bool busy;
+
+- List<AsyncGate> waiters;
+
 - string lastError;
   - 成功交换后为空 ""；失败后为简短原因，
     以便调用方区分异常应答与链路断开。
@@ -53,14 +57,19 @@ m.Close();
 
 - async byte[]ReadBytesAsync(int need)
   - 在 IO reactor 上挂起，跨多次 recv 精确读取
-    <paramref name="need"/> 个字节；对端关闭时置 connected=false
+    <paramref name="need"/> 个字节；对端关闭或出错时置 connected=false
     并返回已到手的（残缺）缓冲。
+
+- async bool AcquireLock()
+
+- void ReleaseLock()
 
 - async byte[]TransactAsync(byte[]pdu, int pduLen)
   - 一次请求/响应往返：发送 MBAP 头 + PDU，接收帧化的
-    应答 PDU（功能字节 + 数据）。传输失败或收到异常应答时
-    返回占位数组，并设置 `LastError`；事务 id 与
-    长度上限（260）在此校验。
+    应答 PDU（功能字节 + 数据）。带并发排队门控，确保单连接上
+    事务互斥单飞，杜绝并发请求在 TCP 流上相互踩踏。
+
+- async byte[]TransactInternalAsync(byte[]pdu, int pduLen)
 
 - async List<int> ReadBitsAsync(int fc, int addr, int count)
   - 线圈（fc 1）与离散输入（fc 2）共用的读取器：

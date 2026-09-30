@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Transport
 
-> 源码: `stdlib/Sdk/Jd/Api/Transport/JdTransportApi.zan`, `stdlib/Sdk/Jd/Api/Transport/TransportWriteUpdateWareTransportIdRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Transport/JdTransportApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Transport/TransportWriteUpdateWareTransportIdRequest.zan`
 
 
 ## JdTransportApi (class)

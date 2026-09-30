@@ -1,6 +1,6 @@
 # System.Threading
 
-> 源码: `stdlib/System/Threading/AsyncGate.zan`, `stdlib/System/Threading/AsyncRwLock.zan`, `stdlib/System/Threading/BlockingQueue.zan`, `stdlib/System/Threading/Gate.zan`, `stdlib/System/Threading/SemaphoreSlim.zan`, `stdlib/System/Threading/Threading.zan`, `stdlib/System/Threading/Timer.zan`
+> 源码: `stdlib/System/Threading/AsyncGate.zan`, `stdlib/System/Threading/AsyncRuntime.zan`, `stdlib/System/Threading/AsyncRwLock.zan`, `stdlib/System/Threading/BlockingQueue.zan`, `stdlib/System/Threading/Gate.zan`, `stdlib/System/Threading/SemaphoreSlim.zan`, `stdlib/System/Threading/Threading.zan`, `stdlib/System/Threading/Timer.zan`
 
 
 ## AsyncGate (class)
@@ -32,6 +32,50 @@
 
 - void Close()
   - 释放运行时句柄；此后的 Wait 立即返回 false。
+
+
+## AsyncRuntime (class)
+
+协程/IO 多 worker 驱动的程序化配置。在 <c>Main</c> 里、驱动
+启动前调用（生成的 main 在调度器 init 与 run 之间执行 Main 体，
+此处写入的值会被启动中的驱动读到）。显式设置优先于
+<c>ZAN_CO_WORKERS</c> / <c>ZAN_IO_SHARDS</c> / <c>ZAN_IO_SYNCFAST</c>
+环境变量；不设置时驱动沿用环境变量与自身默认。
+仅在 <c>--async-workers</c>（多 worker 调度器）下生效。
+
+- [DllImport("crt", EntryPoint="zan_async_set_workers")]static extern void PlatSetWorkers(int workers);
+
+- [DllImport("crt", EntryPoint="zan_async_set_io_shards")]static extern void PlatSetIoShards(int shards);
+
+- [DllImport("crt", EntryPoint="zan_async_set_sync_fast")]static extern void PlatSetSyncFast(int on);
+
+- [DllImport("crt", EntryPoint="zan_async_cfg_workers")]static extern int PlatWorkers();
+
+- [DllImport("crt", EntryPoint="zan_async_cfg_io_shards")]static extern int PlatIoShards();
+
+- [DllImport("crt", EntryPoint="zan_async_cfg_sync_fast")]static extern int PlatSyncFast();
+
+- static void SetWorkers(int workers)
+  - 设置工作协程数。0 表示不设置（沿用
+    <c>ZAN_CO_WORKERS</c>，仍未设时 = 逻辑核数）。
+
+- static void SetIoShards(int shards)
+  - 设置 IO 完成端口分片数（每个分片一个端口，连接按句柄哈希
+    归属分片，同连接的步骤始终在同一线程上续跑）。只做下调：
+    大于驱动默认的值被忽略，1 恢复单一共享端口。
+
+- static void SetSyncFast(bool on)
+  - 设置同步完成快路径：开启后同步完成的 IO 操作不再向完成
+    端口投递包，原地续跑（<c>FILE_SKIP_COMPLETION_PORT_ON_SUCCESS</c>）。
+
+- static int Workers()
+  - 读回当前工作协程数设置（0 = 未设置）。
+
+- static int IoShards()
+  - 读回当前 IO 分片数设置（0 = 未设置）。
+
+- static int SyncFast()
+  - 读回同步完成快路径设置（-1 = 未设置，0/1 = 显式关/开）。
 
 
 ## AsyncRwLock (class)
@@ -967,8 +1011,8 @@ Windows 上使用 Win32 API，POSIX（Linux/macOS）上使用 libc 中的 pthrea
     导致 Gui.Reactive.Dispatcher 把后台线程误判为
     UI 线程而直接执行 GUI 操作。
 
-- static void SleepAsync(int milliseconds)
-  - 异步休眠（Sleep 的包装）。
+- static async Task SleepAsync(int milliseconds)
+  - 非阻塞异步休眠（对齐现代 Task.Delay 协程挂起，不占用调度器线程）。
 
 
 ## Timer (class)

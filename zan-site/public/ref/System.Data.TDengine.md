@@ -240,6 +240,9 @@ db.Close();
 - int GetProvider()
   - 返回 provider id（DbProvider.TDengine）。
 
+- void Dispose()
+  - 释放连接持有的资源（实现 IDisposable，等同于 Close）。
+
 
 ## TDengineConnector (class)
 

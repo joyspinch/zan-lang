@@ -248,9 +248,12 @@ PlatformNotSupportedException。
   - 卸载钩子并等待钩子线程结束；
     未安装任何钩子时调用也安全。
 
+- static async Task<bool> InstallAsync(int kind, KeyboardHookCallback kcb, MouseHookCallback mcb)
+  - 异步安装 `kind` 类型钩子（协程驱动，非阻塞等待）。
+
 - static bool Install(int kind, KeyboardHookCallback kcb, MouseHookCallback mcb)
   - 安装 `kind` 类型钩子（13 = WH_KEYBOARD_LL，14 = WH_MOUSE_LL）；
-    已有钩子或 3 秒内未安装成功返回 false。
+    已有钩子或超时未安装成功返回 false。
 
 - static void HookThreadEntry()
   - 运行在钩子线程上：安装后一直泵取 GetMessage。
@@ -319,6 +322,9 @@ PlatformNotSupportedException。
   - 从 "Ctrl+Shift+A" 形式的组合键注册热键。组合键生效时
     返回 true；已注册其他热键或组合键格式错误
     （或已被其他程序占用）时返回 false。
+
+- static async Task<bool> RegisterAsync(int vk, int mods, HotkeyCallback cb)
+  - 异步注册全局热键（协程驱动，非阻塞等待）。
 
 - static bool Register(int vk, int mods, HotkeyCallback cb)
   - 从 VK 码和修饰键位注册热键（参见
@@ -492,11 +498,19 @@ Keyboard.Press(Keyboard.VK("Enter"));
 - static void SetScrollLock(bool on)
   - 设置 ScrollLock 状态（0x91）。
 
+- static async Task WaitUpAsync(int vk)
+  - 异步等待直到 `vk` 被释放（协程挂起，不卡死 GUI 线程）。
+
+- static async Task WaitAsync(int vk)
+  - 异步等待直到 `vk` 被按下（协程挂起，不卡死 GUI 线程）。
+
 - static void WaitUp(int vk)
   - 阻塞直到 `vk` 被释放。以 1 ms 间隔轮询。
+    仅限控制台/测试脚本使用；在 GUI 线程中请使用 `WaitUpAsync` 以免界面卡死。
 
 - static void Wait(int vk)
   - 阻塞直到 `vk` 被按下。以 1 ms 间隔轮询。
+    仅限控制台/测试脚本使用；在 GUI 线程中请使用 `WaitAsync` 以免界面卡死。
 
 - static int VK(string name)
   - 键名转 VK 码。名称不区分大小写。可识别
@@ -673,12 +687,16 @@ Mouse.Click(Mouse.Left());
 - static void MoveTo(int x, int y)
   - 将光标一步移动到 `x`,`y`。
 
+- static async Task MoveToAsync(int x, int y, int steps)
+  - 将光标异步分 `steps` 步插值移动到 `x`,`y`（协程挂起，不卡死 GUI）。
+
 - static void MoveTo(int x, int y, int steps)
   - 将光标分 `steps` 步插值移动到 `x`,`y`，
     每步之间短暂休眠。steps 为 0 或 1 时直接跳过去。
     分步轨迹看起来像人类的拖拽/滑动，而不是瞬间传送，
     某些目标（游戏、远程桌面会话防护）
     对此有要求。
+    警告：同步平滑移动包含阻塞睡眠，GUI 线程请优先使用 `MoveToAsync`。
 
 - static void Down(int button)
   - 按下 `button` 不释放。

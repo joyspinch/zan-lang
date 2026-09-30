@@ -61,6 +61,8 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
 
 - [DllImport("crt", EntryPoint="zan_io_socket_send")]static extern long ReactorSend(nint sock, string buf, long len, int flags);
 
+- [DllImport("crt", EntryPoint="zan_io_socket_send")]static extern long ReactorSendPtr(nint sock, nint buf, long len, int flags);
+
 - [DllImport("crt", EntryPoint="zan_io_socket_recv")]static extern long ReactorRecv(nint sock, string buf, long len, int flags);
 
 - [DllImport("crt", EntryPoint="zan_io_socket_ready")]static extern int ReactorReady(nint sock, int writeReady);
@@ -70,6 +72,11 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
     失败时为正的 SO_ERROR 码（或 -1），连接进行中为 -2。
 
 - [DllImport("crt", EntryPoint="zan_io_socket_alive")]static extern int SocketAlive(nint sock);
+
+- [DllImport("crt", EntryPoint="zan_io_close_notify")]static extern void ReactorCloseNotify(nint sock);
+  - 关闭通知钩子：必须在 close 之前调用，把 reactor 中挂起
+    在该 fd 上的就绪等待者以「对端关闭」形态唤醒并摘除注册，
+    消除 fd 号复用后老等待者错投到新连接的窗口（A291⑤）。
 
 - [DllImport("crt", EntryPoint="zan_io_socket_peer_ip")]static extern string NativePeerIp(nint sock);
 
@@ -182,6 +189,8 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
 
 - [DllImport("crt", EntryPoint="__error")]static extern nint NativeErrnoLocation();
 
+- [DllImport("crt", EntryPoint="__errno_location")]static extern nint NativeErrnoLocation();
+
 - static int SysClose(nint s)
   - 关闭套接字（句柄在此截断为 int fd 传给 close）。
 
@@ -227,19 +236,13 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
 
 - static int SysRecvFrom(nint s, string buf, int len, int flags, string from, string fromlen)
 
-- static int NativeResolveIpv4(string hostname)
+- [DllImport("crt")]static extern ushort htons(ushort hostshort);
 
-- static int NativeResolveSockAddr(string name, int port, byte[]buf, int cap)
-
-- static int NativeResolveAll(string name, int port, byte[]buf, int cap)
-
-- static async long NativeResolveAllAsync2(nint name, int port, nint buf, int cap)
-
-- static int NativeSockAddrFamily(nint sa, int len)
-
-- static int NativeSockAddrIsSafe(nint sa, int len, int allowLoopback)
-
-- static async long NativeConnectSockAddr2(nint sock, nint sa, int len, int timeoutMs)
+- static int InetAddr(string cp)
+  - 纯 Zan 的 inet_addr（点分 IPv4 → 网络字节序整数，第一段在
+    低字节；失败返回 -1）。wasi-libc 不导出 inet_addr，wasm32 走
+    这里；其他平台转发原生 inet_addr。255.255.255.255 按 inet_addr
+    惯例也返回 -1，调用方自行特判。
 
 - [DllImport("crt", EntryPoint="zan_io_resolve_ipv4")]static extern int NativeResolveIpv4(string hostname);
 
@@ -247,13 +250,13 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
 
 - [DllImport("crt", EntryPoint="zan_io_resolve_all")]static extern int NativeResolveAll(string name, int port, byte[]buf, int cap);
 
-- [DllImport("crt", EntryPoint="zan_io_resolve_all_async")]static extern long NativeResolveAllAsync2(nint name, int port, nint buf, int cap);
+- [DllImport("crt", EntryPoint="zan_io_resolve_all_async")]static extern long NativeResolveAllAsync(nint name, int port, nint buf, int cap);
 
 - [DllImport("crt", EntryPoint="zan_io_sockaddr_family")]static extern int NativeSockAddrFamily(nint sa, int len);
 
 - [DllImport("crt", EntryPoint="zan_io_sockaddr_is_safe")]static extern int NativeSockAddrIsSafe(nint sa, int len, int allowLoopback);
 
-- [DllImport("crt", EntryPoint="zan_io_connect_sa")]static extern long NativeConnectSockAddr2(nint sock, nint sa, int len, int timeoutMs);
+- [DllImport("crt", EntryPoint="zan_io_connect_sa")]static extern long NativeConnectSockAddr(nint sock, nint sa, int len, int timeoutMs);
 
 - [DllImport("crt", EntryPoint="zan_io_sockaddr_ip_str")]static extern string NativeSockAddrIp(byte[]sa);
 
@@ -277,12 +280,11 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
 - static void Cleanup()
   - 清理套接字子系统。
 
-- static ushort htons(ushort hostshort)
-
-- static int inet_addr(string cp)
-
 - static nint CreateTcp()
-  - 创建 TCP 套接字。
+  - 创建 TCP 套接字。wasm32 无套接字：恒失败。
+    与 TcpListener/TcpClient 构造器一样先做平台套接字子系统
+    初始化（Windows WSAStartup 引用计数、幂等）：raw 路径没有
+    别的入口替调用方做这件事，漏了会在 Windows 上静默返 -1。
 
 - static nint CreateTcp6()
   - 创建 IPv6 TCP 套接字（AF_INET6）。IPv6 连接
@@ -290,10 +292,10 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
     才能直接绑定/监听 [::1] 这类纯 v6 地址。
 
 - static nint CreateUdp()
-  - 创建 UDP 套接字。
+  - 创建 UDP 套接字。wasm32 无套接字：恒失败。
 
 - static nint CreateUdp6()
-  - 创建 IPv6 UDP 套接字（AF_INET6）。
+  - 创建 IPv6 UDP 套接字（AF_INET6）。wasm32 恒失败。
 
 - static void Close(nint sock)
   - 关闭套接字。
@@ -307,7 +309,9 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
     无法恢复。用于挂断超限的连接。
 
 - static int SetNonBlocking(nint sock)
-  - 将套接字设为非阻塞模式。
+  - 将套接字设为非阻塞模式。wasm32（WASI）没有
+    fcntl/ioctlsocket：一律报"已是阻塞模型失败"（返回 -1），
+    GUI 程序引用此符号只是超时管道、从不开真套接字。
 
 - static void SetReuseAddr(nint sock)
   - 在套接字上设置 SO_REUSEADDR。
@@ -446,6 +450,12 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
     。不拥塞的套接字上，整个负载一次系统调用即发出
     且无需挂起，省去每条消息一次 reactor 往返。
 
+- static async int SendAsync(nint sock, byte[]data, int len)
+  - 异步发送字节数组切片。零堆内存分配与零额外拷贝。
+
+- static async int SendBytesAsync(nint sock, byte[]data, int offset, int len)
+  - 异步发送字节数组指定偏移和长度的切片。零堆内存分配与零额外拷贝。
+
 - static int SendString(nint sock, string data)
   - 发送字符串（自动计算长度）。
 
@@ -454,6 +464,9 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
 
 - static int Recv(nint sock, string buf, int bufSize)
   - 同步接收数据。
+
+- static async int RecvBytesAsync(nint sock, byte[]buf, int maxLen)
+  - 异步接收数据到字节数组，避免中间字符串分配与拷贝。正常读到返回实际字节数，对端关闭返回 0。
 
 - static async string RecvAsync(nint sock, int bufSize)
   - 在 IO reactor 上挂起直到可读，然后最多接收
@@ -465,9 +478,11 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
     没有数据到达时返回空串（用 LastRecvTimedOut 与对端关闭区分）。
     非正超时表示"不设截止时间"，转而使用 reactor 驱动的重载。
     
-    用零超时的 select() 轮询可读性，而不是等 reactor 唤醒：唤醒
-    无法取消，所以对一个接受了连接却永不回话的对端，不带截止
-    时间的接收会永远挂起。
+    RecvToOv 把真正的接收与截止时间一起交给 reactor 竞速：谁先到
+    谁交付（数据/对端关闭交付字节数，超时交付 -1），接收胜出时
+    reactor 自己撤掉截止时间，超时胜出时撤掉在途接收。纯事件驱动
+    ——挂起的协程不再按 1→16ms 周期生成轮询帧，高并发突发下就绪
+    队列不再被灌爆（A268(b) 停摆悬崖的根修）。
 
 - static bool LastRecvTimedOut()
   - 本协程最近一次带超时的接收是因超时放弃、而非对端
@@ -678,6 +693,9 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
 - async int SendBytesAsync(string data, int len)
   - 发送原始字节，必要时在 IO reactor 上挂起。
 
+- async int SendBytesAsync(byte[]data, int len)
+  - 发送原始字节数组，必要时在 IO reactor 上挂起。
+
 - async string RecvAsync(int bufSize)
   - 接收数据，在 IO reactor 上挂起直到可读。
 
@@ -701,7 +719,10 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
 
 - static int recvPoolSize=65536;
 
-- static int recvPoolMax=256;
+- static int recvPoolMax=1024;
+
+- static string AllocBuffer(int size)
+  - 高效指数倍增构建指定大小的填充字符串（O(log N) 级构造，避免逐字符拼接海量中间对象）。
 
 - static string RentRecvBuffer(int size)
   - 借一个至少 <paramref name="size"/> 字节的接收缓冲区。
@@ -720,6 +741,9 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
 
 - void Close()
   - 关闭连接。
+
+- void Dispose()
+  - 释放客户端连接与缓冲区资源（实现 IDisposable，等同于 Close）。
 
 - bool IsConnected()
   - 已连接时返回 true。
@@ -765,13 +789,15 @@ nint client = await TcpListener.AcceptAsync(listener);
     监听、设为非阻塞）失败时关闭已创建的 fd 并抛
     SocketException（端口被占用等），绝不留下一个
     running=true 但实际没在监听的监听器。
+    host 含 ':'（IPv6 字面量）时用 AF_INET6 套接字——AF_INET
+    套接字绑 [::1] 恒失败；IPv4 字面量与主机名仍走 AF_INET。
 
 - void StartReusePort()
   - 在 bind 前启用 SO_REUSEPORT 再开始监听，这样
     多个 worker 进程可共享同一地址:端口，由内核
     在它们之间负载均衡入站连接（Linux/macOS）。Windows 上行为同
     Start（无 SO_REUSEPORT）。任一步失败时关闭 fd 并抛
-    SocketException。
+    SocketException。IPv6 主机的套接字族选择与 Start 相同。
 
 - async nint AcceptAsync()
   - 在 IO reactor 上挂起直到客户端连接，然后接受

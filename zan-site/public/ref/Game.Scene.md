@@ -1,6 +1,6 @@
 # Game.Scene
 
-> 源码: `stdlib/Game/Scene/SceneDesigner.zan`, `stdlib/Game/Scene/SceneDoc.zan`, `stdlib/Game/Scene/SceneView.zan`
+> 源码: `packages/Zan.Game/src/Game/Scene/SceneDesigner.zan`, `packages/Zan.Game/src/Game/Scene/SceneDoc.zan`, `packages/Zan.Game/src/Game/Scene/SceneView.zan`
 
 
 ## Anchor (class)

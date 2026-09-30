@@ -68,8 +68,15 @@ Multi-Status 上限 4 MiB / 10000 个资源，超限抛 ArgumentException。
 - async HttpResponse GetAsync(string path)
   - 下载资源；状态码/正文在返回的响应里。
 
+- async HttpResponse GetBinaryAsync(string path)
+  - 二进制安全下载资源（状态码/正文字节数组在返回的响应里）。
+
 - async HttpResponse PutAsync(string path, string body)
   - 上传资源（Content-Type: application/octet-stream）；
+    201/204 等状态码在返回的响应里。
+
+- async HttpResponse PutBytesAsync(string path, byte[]data)
+  - 上传二进制资源（Content-Type: application/octet-stream）；
     201/204 等状态码在返回的响应里。
 
 - async HttpResponse DeleteAsync(string path)
@@ -128,6 +135,9 @@ Multi-Status 上限 4 MiB / 10000 个资源，超限抛 ArgumentException。
 
 - static string Trim(string text)
   - 去掉两侧 XML 空白（空格/制表/CR/LF）。
+
+- static bool IsSpaceByte(int c)
+  - 该单字符字节是否为 XML 空白。
 
 - static bool IsSpace(string ch)
   - 该单字符是否为 XML 空白。

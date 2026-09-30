@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Union
 
-> 源码: `stdlib/Sdk/Jd/Api/Union/JdUnionApi.zan`, `stdlib/Sdk/Jd/Api/Union/UnionPopOpenApiDetailOrdersV1Request.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Union/JdUnionApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Union/UnionPopOpenApiDetailOrdersV1Request.zan`
 
 
 ## JdUnionApi (class)

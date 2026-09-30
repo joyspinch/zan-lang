@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Shopcategories
 
-> 源码: `stdlib/Sdk/Jd/Api/Shopcategories/JdShopcategoriesApi.zan`, `stdlib/Sdk/Jd/Api/Shopcategories/ShopcategoriesReadFindShopCategoriesByWareIdRequest.zan`, `stdlib/Sdk/Jd/Api/Shopcategories/ShopcategoriesWriteSaveWareShopCategoriesRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Shopcategories/JdShopcategoriesApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Shopcategories/ShopcategoriesReadFindShopCategoriesByWareIdRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Shopcategories/ShopcategoriesWriteSaveWareShopCategoriesRequest.zan`
 
 
 ## JdShopcategoriesApi (class)

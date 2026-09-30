@@ -376,6 +376,8 @@ Window.Close(wnd);
 窗口会匹配失败而非阻塞调用方。仅支持 Windows；其他
 平台会抛出 PlatformNotSupportedException。
 
+- [DllImport("kernel32", EntryPoint="Sleep")]static extern void SleepW(int ms);
+
 - [DllImport("user32", EntryPoint="IsWindow")]static extern int WinIsWindow(nint hwnd);
 
 - [DllImport("user32", EntryPoint="IsWindowVisible")]static extern int WinIsWindowVisible(nint hwnd);

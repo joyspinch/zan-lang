@@ -1,6 +1,6 @@
 # System.Net.WebSocket
 
-> 源码: `stdlib/System/Net/WebSocket/WebSocket.zan`
+> 源码: `stdlib/System/Net/WebSocket/WebSocket.zan`, `stdlib/System/Net/WebSocket/WsSharedBus.zan`
 
 
 ## WebSocketClient (class)
@@ -21,6 +21,16 @@ WebSocket 客户端。
 
 - WsAssembler asm;
 
+- bool sendBusy;
+
+- List<AsyncGate> sendWaiters;
+
+- int lastOpcode;
+
+- int lastLen;
+
+- byte[]lastBinary;
+
 - WebSocketClient()
   - 内部构造：未连接；经 ConnectAsync 使用。
 
@@ -30,9 +40,24 @@ WebSocket 客户端。
     一个 connected=false 的对象，用 IsConnected() 判断成败（失败
     路径已顺手关闭底层连接）。
 
+- static async WebSocketClient ConnectAsyncHeaders(string host, int port, string path, List<string> headers)
+  - 带自定义握手头的连接。`headers` 里每一项是一个完整的
+    头行（如 "Authorization: Bearer xxx"），原样追加在标准握手头
+    之后——授权在升级前生效的 MVC 路由（needsAuth 检查先于
+    WsUpgrade）没有它就永远 401。行内出现 CR/LF/NUL/DEL 一律
+    拒绝并按握手失败返回（头注入会伪造额外头/截断握手块），
+    其余字节不校验——值里写什么由调用方负责。
+
+- async void AcquireSend()
+
+- void ReleaseSend()
+
 - async bool SendFrame(int opcode, string payload, int payloadLen)
-  - 客户端方向统一发送入口：掩码 + 正确的帧长。
-    返回 false 表示连接已不可用。
+  - 客户端方向统一发送入口：掩码 + 正确的帧长 + 协程互斥串行发送，
+    彻底消除心跳与并发业务数据帧交叉交错损坏。返回 false 表示连接已不可用。
+
+- async bool SendFrameBytes(int opcode, byte[]payload, int offset, int payloadLen)
+  - 客户端方向原生字节数组发送入口：掩码 + 帧长 + 协程互斥串行发送。
 
 - async void SendText(string text)
   - 发送一条 Text 消息（fire-and-forget，失败仅置 disconnected）。
@@ -40,13 +65,41 @@ WebSocket 客户端。
 - async void SendBinary(string data, int len)
   - 发送一条二进制消息（data 可含 NUL，len 为精确字节数）。
 
+- async void SendBinary(byte[]data, int offset, int len)
+  - 发送一条二进制消息（byte[] 原生切片，无需经过字符串中转）。
+
+- async void SendBinary(byte[]data)
+  - 发送一条完整二进制消息。
+
 - async void Ping()
   - 发送空 Ping 帧（对端的 Pong 由 RecvText 静默消费）。
+
+- int LastOpcode()
+  - 上一次成功接收并交付的消息操作码（WsOpcode.Text 或 WsOpcode.Binary）。
+
+- int LastLength()
+  - 上一次成功接收并交付的消息精确字节数。
 
 - async string RecvText()
   - 挂起直到下一个文本/二进制消息。Ping 以 Pong 应答后
     继续循环；分片消息重组到 fin 后整条交付；Close 或断开
     返回 ""。
+
+- async string RecvText(int timeoutMs)
+  - 带空闲窗口的 RecvText：时限内没有任何帧到达时返回 ""
+    ——连接未断，IsConnected() 仍为 true，已收到的半截帧留在
+    缓冲区里下次接着读；这正是心跳调用方的判据（超时 → Ping()
+    → 继续 RecvText(timeout)）。真正的断开（对端关闭帧/EOF/协议
+    错误）会 CloseNow，IsConnected() 变 false。timeoutMs 非正表示
+    不限时。空数据消息与空闲超时都返回 ""，无法区分——协议上
+    不发空消息（发心跳用 Ping）就没有歧义。
+
+- async byte[]RecvBinary()
+  - 挂起直到下一个文本/二进制消息。返回未截断的原生 byte[]，
+    彻底消除二进制消息中 NUL 字符被字符串截断的隐患；Close 或断开返回 null。
+
+- async byte[]RecvBinary(int timeoutMs)
+  - 带空闲窗口的原生二进制消息接收。
 
 - void CloseNow()
   - 立即断开（不发关闭帧）；RecvText 之后返回 ""。
@@ -70,8 +123,6 @@ opcode 0 的 continuation 帧追加负载，fin=1 交付。此前三条
 
 - int opcode;
 
-- string data;
-
 - int dataLen;
 
 - int maxLen;
@@ -90,8 +141,15 @@ opcode 0 的 continuation 帧追加负载，fin=1 交付。此前三条
     MessageOpcode 取出；-1 = 协议违规（无起始帧的 continuation
     或分片中途插入新数据帧）；-2 = 累计超过 maxLen。
 
+- bool ValidComplete()
+  - 完成消息前校验文本消息的 UTF-8；二进制消息不做编码约束。
+
 - string Complete()
-  - 取出重组完成的消息并复位状态。
+  - 取出重组完成的消息并复位状态。按显式长度一次转换，
+    内嵌 NUL 仍是消息的一部分；保留缓冲容量供下一条消息复用。
+
+- byte[]CompleteBytes()
+  - 取出重组完成的消息原始字节并复位状态。
 
 - int MessageOpcode()
   - 重组完成消息的 opcode（Text 或 Binary）。
@@ -108,11 +166,17 @@ WebSocket 帧构建与解析器（RFC 6455）。
 
 - string payload;
 
+- byte[]payloadBytes;
+
+- int payloadOffset;
+
 - int payloadLen;
 
 - bool fin;
 
 - bool masked;
+
+- int rsv;
 
 - WsFrame()
   - 内部构造：Text 帧、fin、不掩码；字段由各工厂方法填。
@@ -139,6 +203,9 @@ WebSocket 帧构建与解析器（RFC 6455）。
 
 - static WsFrame RawFrame(int opcode, string payload, int payloadLen)
   - 任意 opcode 的出站帧（客户端统一发送入口用）。
+
+- static WsFrame RawBytes(int opcode, byte[]payload, int offset, int payloadLen)
+  - 任意 opcode 的原生字节数组出站帧（客户端统一发送入口用）。
 
 - static int HeaderLen(int payloadLen)
   - 帧头字节数（RFC 6455 长度编码）。发送方据它
@@ -172,6 +239,30 @@ WebSocket 帧构建与解析器（RFC 6455）。
     opcode 就是 0），因此绝不能拿 `data.Length` 当边界用——
     旧的按 strlen 钳制会提前截断 dataEnd，让解码器把完整帧
     误判为空帧并静默丢弃。
+
+- static bool ValidInbound(WsFrame frame, bool requireMasked)
+  - RFC 6455 入站帧门禁。服务端要求客户端帧带掩码；客户端要求
+    服务端帧不带掩码。未协商扩展时 RSV 必须为零，控制帧必须完整
+    且不超过 125 字节。
+
+- static bool ValidControlPayload(WsFrame frame)
+
+- static bool ValidUtf8(string text, int len)
+  - 严格校验一段显式长度的 UTF-8。过短、过长、代理项和超范围码点
+    均拒绝；调用方只在完整消息/关闭原因上调用，避免拆分码点被误判。
+
+
+## WsHandshake (class)
+
+Shared server-side RFC 6455 upgrade gate for plain and TLS ports.
+
+- static bool HasToken(string value, string token)
+
+- static bool Valid(HttpRequest req)
+
+- static bool SafeRequestPart(string value, bool allowEmpty)
+
+- static bool ValidResponse(string head, string expectedAccept)
 
 
 ## WsOpcode (class)
@@ -259,6 +350,19 @@ WebSocket 帧操作码（opcode）。
   - 挂起在 reactor 上直到可读，然后把收到的字节
     追加进缓冲区。返回读取的字节数；0 表示对端已关闭（EOF）。
 
+- async int FillMore(int timeoutMs)
+  - 带空闲窗口的 FillMore：时限内没有任何字节到达时返回
+    -1（连接未断，帧缓冲里已收到的半截字节原样保留，下次接着
+    读）；数据/对端关闭的语义与 FillMore 相同（>0 = 字节数，
+    0 = EOF）。timeoutMs 非正表示不限时，等价于 FillMore()。
+    
+    实现走 Socket.RecvToOv——把接收与截止时间一起交给 reactor
+    竞速（超时交付 -1，不 shutdown 套接字），而不是 HttpDeadline
+    的手法：后者靠 ShutdownBoth 挂断唤醒，用一次连接就废一次，
+    撑不起「每 15 秒空闲窗口到期就 Ping 一下再继续收」的长连接
+    心跳循环。TLS 源分支没有对等的带截止时间原语，退化为不限时
+    （wss 心跳调用方应改用上层 Ping/Pong 探活）。
+
 - int FrameSize()
   - 缓冲区头部帧的总字节长度；若完整帧尚未全部缓冲
     则返回 -1。返回 -2 = 协议违规（64 位长度的高 32 位非零，
@@ -271,14 +375,14 @@ WebSocket 帧操作码（opcode）。
 
 - int FindHeaderEnd()
   - 在缓冲的未读字节里扫描 HTTP 头部结束标记
-    （CRLFCRLF）。返回相对游标的偏移；未找到返回 -1。
+    （CRLFCRLF）。借助 AVX2 向量化 IndexOf 快速跳过普通字节。
+    返回相对游标的偏移；未找到返回 -1。
     握手与首帧常在同一段到达，而帧字节可能含 NUL，
     因此扫描必须按字节下标进行，不能走字符串长度。
 
 - string Slice(int n)
   - 取出游标处 n 个字节，作为显式长度的字符串
-    （不推进游标）。头部是文本，但同一缓冲里可能已带有
-    含 NUL 的帧字节——长度必须显式传递，不能用 strlen。
+    （不推进游标）。零额外堆分配拷贝。
 
 - void Append(string data, int n)
   - 把外部收到的字节（例如 TLS 流解密出的明文）
@@ -286,6 +390,66 @@ WebSocket 帧操作码（opcode）。
 
 - void Consume(int total)
   - 跳过游标处的帧以丢弃它。
+
+
+## WsSharedBus (class)
+
+基于 SharedTable 共享内存环形缓冲区的跨进程 WebSocket/长连接消息总线。
+零外部依赖，基于系统共享内存（Windows MMF / POSIX shm）提供极高吞吐的
+跨 Worker 进程事件分发：
+targetType = 0: 全局广播（向所有 worker 的所有连接广播）
+targetType = 1: 频道/房间广播（向所有 worker 中加入指定 channel 的连接广播）
+targetType = 2: 定向投递（向特定 connection ID 所在 worker 精准单播）
+并提供跨进程实时的集群连接总数原子计数（ClusterConnCount）。
+
+- SharedTable busTable;
+
+- string name;
+
+- int ringCapacity;
+
+- long lastReadSeq;
+
+- bool running;
+
+- int pid;
+
+- long busNonce;
+
+- static long nonceCounter=0;
+
+- public WsSharedBus(string name, int ringCapacity)
+
+- void InitTable()
+
+- public bool IsAvailable()
+
+- public void PublishBroadcast(string payload, int payloadLen)
+  - 发布跨进程全局广播消息。
+
+- public void PublishChannel(string channel, string payload, int payloadLen)
+  - 发布跨进程频道/房间广播消息。
+
+- public void PublishDirect(int targetId, string payload, int payloadLen)
+  - 发布跨进程针对指定连接 ID 的定向投递消息。
+
+- void PublishInternal(int targetType, string channel, int targetId, string payload, int payloadLen)
+
+- public void OnConnChange(int delta)
+  - 增减全局在线连接数统计。
+
+- public int GetTotalConnCount()
+  - 获取集群跨 Worker 实时在线连接总数。
+
+- public void StartPolling(IWsSharedBusConsumer consumer)
+  - 启动后台轮询协程，监听其他 Worker 发来的跨进程消息。
+    <remarks>必须是同步方法：Zan 的 async 方法体在首次调度泵时才启动，
+    若把快照写进 async 体，调用点与首次泵之间发布的消息会被当旧序号跳过。
+    快照必须在调用点急切完成，循环体晚一点启动无所谓。</remarks>
+
+- private async void PollLoop(IWsSharedBusConsumer consumer)
+
+- public void Stop()
 
 
 ## WsWriter (class)
@@ -322,3 +486,10 @@ echo 路径把时间全花在系统调用上（满载内核约 13 万消息/秒�
     已循环补发，返回值小于请求长度只会是对端重置/中止等
     致命错误——旧实现无视这点直接清零缓冲，把没发出去的
     帧当已发，帧流从此错位且无任何上报。
+
+
+## IWsSharedBusConsumer (interface)
+
+跨进程 WebSocket 共享消息总线事件接收接口。
+
+- void OnSharedBusMessage(int targetType, string channel, int targetId, string payload, int payloadLen);

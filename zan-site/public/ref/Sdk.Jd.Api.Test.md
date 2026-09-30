@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Test
 
-> 源码: `stdlib/Sdk/Jd/Api/Test/JdTestApi.zan`, `stdlib/Sdk/Jd/Api/Test/TestDemo1Request.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Test/JdTestApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Test/TestDemo1Request.zan`
 
 
 ## JdTestApi (class)

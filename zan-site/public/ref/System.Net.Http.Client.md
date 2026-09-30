@@ -5,8 +5,8 @@
 
 ## Cookie (class)
 
-一条已存储的 cookie。<c>hostOnly</c> 区分 Set-Cookie 是否带了
-Domain 属性：不带时只回给设置它的那台主机，带时连子域一起匹配。
+一条已存储的 cookie。缺少 PSL 时显式 Domain 也只回给响应主机；
+<c>hostOnly</c> 控制回放时是否允许匹配子域。
 <c>expires</c> 为 0 表示会话 cookie（进程内一直有效）。
 
 - string name;
@@ -92,6 +92,14 @@ Domain 属性：不带时只回给设置它的那台主机，带时连子域一�
 - static bool DomainMatches(string host, string domain, bool hostOnly)
   - 请求主机 `host` 是否落在 cookie 的域内：host-only 要求完全相等，
     域 cookie 则允许子域（"api.example.com" 命中 "example.com"）。
+
+- static bool DomainAttributeOk(string host, string domain)
+  - 没有 PSL 就无法分辨任意公共后缀与可注册域。Domain 属性
+    只接受响应主机的完全相同拼写，且按 host-only 存储；这是
+    保守的安全子集，不提供 RFC 6265 的跨子域 Domain 语义。
+
+- static bool IsIpHost(string host)
+  - host 是否是 IP 字面量：IPv4 四段全数字，或含 ':' 的 IPv6。
 
 - static bool PathMatches(string path, string cookiePath)
   - RFC 6265 的 path-match：相等、cookie 路径以 "/" 结尾的前缀，
@@ -314,7 +322,9 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
     用于双向 TLS 客户端认证。
 
 - HttpClient SetHeader(string name, string headerValue)
-  - 为所有请求添加默认头。
+  - 为所有请求添加默认头。名字或值含 CR/LF/NUL/DEL
+    （会注入额外头字段或提前结束头部）、或名字含冒号（可夹带出
+    第二个头字段）时不添加——与 HttpResponse.SetHeader 同一防线。
 
 - HttpClient SetTimeout(int ms)
   - 设置请求超时时间（毫秒）：连接阶段和
@@ -374,6 +384,9 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
     已武装时不重置：一次外呼（含 UploadFileBytesAsync 先行武装、
     通道随后调用）从第一跳起点计时，重定向各跳继承同一时刻。
 
+- void ResetTotalBudget()
+  - 每个公共入口重新武装；只有内部重定向跳数继承已有截止时间。
+
 - void Close()
   - 关闭复用的 keep-alive 连接（若在）。客户端仍可继续
     使用：下一次请求会重新建立连接。进程退出前或长寿命客户端
@@ -396,11 +409,25 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
   - 将 <paramref name="hay"/> 的前 <paramref name="n"/> 个字节与 <paramref name="name"/> 做
     ASCII 大小写不敏感的相等比较。
 
+- static bool IsRequestTargetSafe(string path)
+  - 请求目标（request-target）是否可安全写入请求行：CR/LF/NUL/DEL
+    会把一行撕成两行（请求行注入/第二个请求），空格会把请求行切成
+    多个 token。SetHeader 有同一防线；请求行是调用方字符串进入
+    报文的另一入口，不能漏。
+
+- static bool IsMethodSafe(string method)
+
+- static bool IsHostSafe(string host)
+
 - string BuildRequestHead(string method, string path, int bodyLen, bool close)
   - 构建请求头部半区；bodyLen<=0 时不写 Content-Length。
 
 - string BuildRequest(string method, string path, string body, bool close)
   - BuildRequestHead 加上文本正文（一次性通道用）。
+
+- string BuildDownloadRequest(string path, int have)
+  - 下载请求沿用统一 method/host/path/header 注入校验，只额外插入
+    Range 字段；Range 不从调用方原文拼接进请求行。
 
 - void AbsorbCookies(string path, string raw)
   - 把响应里的 Set-Cookie 交给存储。未启用 cookie 时什么都不做，
@@ -473,7 +500,11 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
     的实体无法安全降级重放，下载驱动的 Range 语义由驱动端用 method
     参数表达。
 
-- async string RequestOnceAsync(string method, string path, string body)
+- async HttpResponse FollowBytesFromResponse(string method, string path, string body, HttpBytesDriver driver, HttpResponse resp)
+  - Uploads send their multipart body first; only subsequent rewritten GET
+    hops use the bodyless redirect driver.
+
+- void ValidateTextResponse(string raw, string method)
   - 发送 HTTP 请求并返回原始响应。当连接（或 TLS 握手）失败
     或请求未在超时内完成时，抛出
     HttpRequestException。
@@ -483,6 +514,10 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
     默认走 keep-alive 复用通道（同一客户端同时只允许一个在途
     请求）；已有请求在途时，并发调用退回一次性 Connection: close
     通道，各自读到对端关闭为止。
+    Reject absent or incomplete fixed-length text responses instead of
+    letting HttpResponse.Parse manufacture a successful empty 200.
+
+- async string RequestOnceAsync(string method, string path, string body)
 
 - async string RequestTlsAsync(string method, string path, string body)
   - 一次性 TLS 请求：新建 TLS 连接后发送请求并读取完整响应。
@@ -505,7 +540,7 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
     文本里找（头部块是 ASCII，整体小写后按行首匹配）。
 
 - static bool HeadSaysClose(string head)
-  - 头部块是否带 Connection: close（值大小写不敏感）。
+  - 头部块是否带 Connection: close（按逗号 token、OWS 和大小写解析）。
 
 - async HttpResponse SendAsync(string method, string path, string body)
   - 发送请求并返回解析后的响应，使调用者可以看到
@@ -524,10 +559,18 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
     字体等二进制资源的下载与上传；文本响应照常可用 body 读取。
     绑定 policy 时按同一规则跟随重定向（3xx 原样返回仍是默认）。
 
+- async HttpResponse SendBytesAsync(string method, string path, string body, int bodyLen)
+  - 发送原始字节正文（带显式字节长度，二进制安全，可含 NUL 字节）。
+
+- async HttpResponse SendBytesAsync(string method, string path, byte[]body, int bodyLen)
+  - 发送原始字节数组（带显式字节长度，二进制安全，可含 NUL 字节）。
+
 - static async HttpResponse SendBytesOnceAsync(HttpClient client, string method, string path, string body)
   - 一次真实上线：SendBytesAsync 的无重定向主体，同时作为
     FollowBytesRedirects 的驱动回调。method 随驱动签名显式传递：
     重定向改写（301/302/303 → GET）后驱动端据此发空 GET。
+
+- static async HttpResponse SendBytesOnceWithLenAsync(HttpClient client, string method, string path, string body, int bodyLen)
 
 - async HttpResponse ReadFramedResponse(TcpClient conn, string path, string method, HttpDeadlineToken watch, TlsStream stream, TlsContext ctx)
   - SendBytesAsync / SendBytesTlsAsync / SendBytesBodyAsync 共用的
@@ -543,8 +586,10 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
 
 - async HttpResponse SendBytesTlsAsync(string method, string path, string body)
   - SendBytesAsync 的 TLS 变体：握手与一次性通道一致，只是读取
-    走 HttpFramer.CreateTls（TlsStream.RecvIntoAsync 同样给出
+    走 HttpFramerTls.Create（TlsStream.RecvIntoAsync 同样给出
     精确字节数）。
+
+- async HttpResponse SendBytesTlsWithLenAsync(string method, string path, string body, int bodyLen)
 
 - async HttpResponse SendBytesBodyAsync(string method, string path, string head, string localPath, int fileLen, string tail, int total)
   - UploadFileBytesAsync 的明文通道：头部 + 文件字节 + 尾部三段式，
@@ -564,7 +609,7 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
 
 - async HttpResponse SendBytesBodyTlsAsync(string method, string path, string head, string localPath, int fileLen, string tail, int total)
   - UploadFileBytesAsync 的 TLS 变体：握手同 SendBytesTlsAsync，
-    三段式正文按显式长度发送，读取走 HttpFramer.CreateTls。
+    三段式正文按显式长度发送，读取走 HttpFramerTls.Create。
 
 - async string GetAsync(string path)
   - 发送 GET 请求并返回响应体。
@@ -592,7 +637,7 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
   - 将内容下载到文件。
 
 - static int IndexOf(string s, string needle, int from)
-  - 逐字节的子串搜索（避免逐字符的 Substring 分配）。
+  - 逐字节的子串搜索（利用原生机器指令向量化搜索）。
 
 - static int ParseHex(string s)
   - 解析十六进制 chunk 大小前缀，在第一个非十六进制字节处停止
@@ -617,7 +662,10 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
     SSE 流按假尺寸行解析到乱码/截断。
 
 - static int HeadStatus(string head)
-  - 从 "HTTP/1.1 200 OK" 中解析出数字状态码。
+  - 从状态行解析数字状态码；不是严格的 "HTTP/1.0|1.1 OWS 3DIGIT"
+    （版本后缀、缺 OWS、非数字、第 4 位数字）时返回 0，与
+    HttpResponse.Parse 的拒收口径一致——下载/SSE 路径按 <100
+    拒收，不按数字前缀猜。
 
 - async int PostSseToFileAsync(string path, string body, string outFile, string doneFile)
   - 将响应体边到达边流入 <paramref name="outFile"/>
@@ -651,6 +699,11 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
 - static bool EndsWithCi(string s, string suf)
   - 当 `s` 末尾字节等于 `suf` 时返回 true（ASCII 大小写不敏感）。
 
+- static void ValidateMultipartToken(string what, string value)
+  - multipart 的 name/filename 原样进入 Content-Disposition 的引号内：
+    含 CR/LF/NUL/DEL 会注入额外头字段或提前结束头部，含引号会逃出
+    引号串。非法即抛，与 WebDavClient.ValidateHeader 同一防线。
+
 - static string GuessMime(string name)
   - 将文件后缀映射为 content type，默认 octet-stream。
 
@@ -667,6 +720,10 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
 - static int RangeTotal(string head)
   - 从 "Content-Range: bytes X-Y/Z" 头取得资源总大小（Z 值），
     无该头时返回 0。
+
+- static bool RangeAlreadyComplete(string head, int have)
+  - A 416 proves completion only when the server supplies an unsatisfied
+    Content-Range with a known total matching the local file size.
 
 - async HttpResponse UploadFileAsync(string path, string field, string localPath, string fileName)
   - 将本地文件作为 multipart/form-data 的单个字段上传到

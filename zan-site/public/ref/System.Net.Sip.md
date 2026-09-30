@@ -77,6 +77,18 @@ SipClient 中，媒体（RTP/SDP 协商）不在范围内。
 - static SipMessage Request(string method, string uri)
   - 创建请求消息。
 
+- public bool GetIsRequest()
+
+- public string GetMethod()
+
+- public string GetUri()
+
+- public int GetStatus()
+
+- public string GetReason()
+
+- public string GetBody()
+
 - SipMessage Add(string name, string headerValue)
   - 添加头部（追加；SIP 允许重复，如 Via）。
 
@@ -89,6 +101,9 @@ SipClient 中，媒体（RTP/SDP 协商）不在范围内。
 - string Serialize()
   - 序列化为线上形式（头部 + CRLF CRLF + 正文）。
     Content-Length 自动生成。
+
+- static int ParsePositiveInt(string s)
+  - 安全解析十进制非负整数，非法字符或空串返回 -1。
 
 - static SipMessage Parse(string data)
   - 解析线上消息；起始行不是 SIP 时返回 null。

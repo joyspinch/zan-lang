@@ -1,6 +1,6 @@
 # System.Data.Orm
 
-> 源码: `stdlib/System/Data/Orm/DbSchema.zan`, `stdlib/System/Data/Orm/DbTable.zan`, `stdlib/System/Data/Orm/ExprSql.zan`, `stdlib/System/Data/Orm/IOrmRows.zan`, `stdlib/System/Data/Orm/Model.zan`, `stdlib/System/Data/Orm/OrmDialect.zan`, `stdlib/System/Data/Orm/OrmInsert.zan`, `stdlib/System/Data/Orm/OrmMeta.zan`, `stdlib/System/Data/Orm/OrmSelect.zan`, `stdlib/System/Data/Orm/OrmSync.zan`, `stdlib/System/Data/Orm/OrmWrite.zan`, `stdlib/System/Data/Orm/QueryBuilder.zan`
+> 源码: `stdlib/System/Data/Orm/DbSchema.zan`, `stdlib/System/Data/Orm/DbTable.zan`, `stdlib/System/Data/Orm/ExprSql.zan`, `stdlib/System/Data/Orm/IOrmRows.zan`, `stdlib/System/Data/Orm/Model.zan`, `stdlib/System/Data/Orm/OrmCond.zan`, `stdlib/System/Data/Orm/OrmDialect.zan`, `stdlib/System/Data/Orm/OrmInsert.zan`, `stdlib/System/Data/Orm/OrmMeta.zan`, `stdlib/System/Data/Orm/OrmSelect.zan`, `stdlib/System/Data/Orm/OrmSync.zan`, `stdlib/System/Data/Orm/OrmWrite.zan`, `stdlib/System/Data/Orm/QueryBuilder.zan`
 
 
 ## DbColumnDef (class)
@@ -191,6 +191,12 @@ SQL 文本由 `QueryBuilder` 生成 —— 调用方只描述
   - DbValues 里的每一列都按等值匹配（提交上来的
     筛选表单原样交给 ORM）。
 
+- DbTableQuery WhereIn(string column, List<int> values)
+  - column IN (整型列表)，逐个占位符；空列表按恒假处理。
+
+- DbTableQuery WhereIn(string column, List<long> values)
+  - column IN (64 位整数列表)，逐个占位符；空列表按恒假处理。
+
 - DbTableQuery OrderBy(string column)
   - 升序排序。
 
@@ -217,6 +223,10 @@ SQL 文本由 `QueryBuilder` 生成 —— 调用方只描述
 
 - async int ExecuteDeleteAsync()
   - 删除符合条件的行，返回删除行数。
+
+- async int ExecuteUpdateAsync(DbValues row)
+  - 按 DbValues 更新符合条件的行，返回更新行数。SET 值排在
+    WHERE 值之前，与 BuildUpdateParams 的占位符顺序一致。
 
 - async DbResult run(string columns)
   - 执行 SELECT：套用已设置的 Limit/Offset 后按给定列清单查询。
@@ -721,6 +731,30 @@ Kind 与编译期 <c>DbField.Kind</c> 一致：0 int、1 double、
   - 动态值按列声明类型转换时用的 DbParams 类型码。
 
 
+## OrmCond (class)
+
+一条声明式查询条件：声明式列表页（ListPage.Collect 一类）
+的产出，经 `OrmSelect.WhereConds` 变成参数化 WHERE。
+
+col/kind/value 都是声明侧给定的自由文本，但各自的出口都被 ORM 收口：
+col 在 `OrmSelect` 里按实体元数据校验（未知列抛异常），
+kind 只认 LIKE/EQ/GE/LE，value 永远走绑定参数——用户输入进不了
+SQL 文本。name 是来源参数名（回填分页链接用，可空）。
+
+- string name;
+
+- string col;
+
+- string kind;
+
+- string value;
+
+- static long Num(string s)
+  - 宽松数字解析：可选正负号 + 纯数字，其余形态一律 0
+    （与 Web 层 Filter.ToInt 的容错一致）。EQ/GE/LE 的 value 在
+    WhereConds 里经它落到整型绑定。
+
+
 ## OrmDelete (class)
 
 类型化 DELETE 的运行期实现：条件片段 + 绑定值。
@@ -759,6 +793,27 @@ Kind 与编译期 <c>DbField.Kind</c> 一致：0 int、1 double、
 
 - void WhereDict(DbValues v)
   - 字典键值批量进 WHERE（等值条件，列名经元数据校验）。
+
+- string RequireCol(string c)
+  - 校验列名属于本实体（剥掉可选的 "t." 前缀）；未知列抛异常。
+
+- void WhereEq(string c, string v)
+  - column = 文本值。
+
+- void WhereEq(string c, int v)
+  - column = 整数值。
+
+- void WhereEq(string c, long v)
+  - column = 64 位整数值。
+
+- void WhereIn(string c, List<int> vs)
+  - column IN (逐个占位符)；空列表按恒假处理，不生成 `IN ()`。
+
+- void WhereIn(string c, List<long> vs)
+  - `WhereIn` 的 long 版本。
+
+- void WhereNone()
+  - 恒假条件：数据边界为空集时用它表达"一行都不许删"。
 
 - void P(string v)
   - WHERE 参数：与 W 片段中占位符的出现顺序一致。
@@ -1208,8 +1263,49 @@ Only/Skip 决定的列集合在运行期成形，upsert 子句按方言拼装。
 - void InD(List<double> vs)
   - `InI` 的 double 版本。
 
+- string RequireCol(string c)
+  - 校验列名属于本实体并补全 "t." 别名；未知列抛异常。
+
+- void WhereEq(string c, string v)
+  - column = 文本值。
+
+- void WhereEq(string c, int v)
+  - column = 整数值。
+
+- void WhereEq(string c, long v)
+  - column = 64 位整数值。
+
+- void WhereGe(string c, long v)
+  - column >= 整数值。
+
+- void WhereLe(string c, long v)
+  - column <= 整数值。
+
+- void WhereIn(string c, List<int> vs)
+  - column IN (逐个占位符)；空列表按恒假处理，不生成 `IN ()`。
+
+- void WhereIn(string c, List<long> vs)
+  - `WhereIn` 的 long 版本。
+
+- void WhereIn(string c, List<string> vs)
+  - `WhereIn` 的 string 版本。
+
+- void WhereLikeAny(string cols, string v)
+  - 多列 OR LIKE："username|email" 一并子串匹配同一个值，每列绑定
+    自己的参数，列名逐一校验。
+
+- void WhereNone()
+  - 恒假条件：数据边界为空集时用它表达"一行都不许看"。
+
+- void WhereConds(List<OrmCond> cs)
+  - 声明式条件（`OrmCond` 列表）落成参数化 WHERE：
+    LIKE 走多列 OR 匹配，EQ/GE/LE 按宽松数字解析后绑定。
+
 - void OB(string col)
   - ORDER BY 追加一列（升序）。
+
+- void OrderBy(string col)
+  - ORDER BY 别名（支持带 DESC/ASC 的原生表达式片段）。
 
 - void OBD(string col)
   - ORDER BY 追加一列（降序）。
@@ -1453,6 +1549,27 @@ CodeFirst：缺表建表、缺列加列、缺索引补索引。DDL 从实体元�
 - void WhereDict(DbValues v)
   - 字典键值批量进 WHERE（等值条件）。
 
+- string RequireCol(string c)
+  - 校验列名属于本实体（剥掉可选的 "t." 前缀）；未知列抛异常。
+
+- void WhereEq(string c, string v)
+  - column = 文本值。
+
+- void WhereEq(string c, int v)
+  - column = 整数值。
+
+- void WhereEq(string c, long v)
+  - column = 64 位整数值。
+
+- void WhereIn(string c, List<int> vs)
+  - column IN (逐个占位符)；空列表按恒假处理，不生成 `IN ()`。
+
+- void WhereIn(string c, List<long> vs)
+  - `WhereIn` 的 long 版本。
+
+- void WhereNone()
+  - 恒假条件：数据边界为空集时用它表达"一行都不许动"。
+
 - void P(string v)
   - WHERE 参数：与 W 片段中占位符的出现顺序一致。
 
@@ -1592,6 +1709,14 @@ db.Execute(sql, qb.InsertParams());
 
 - QueryBuilder WhereIn(string column, List<string> values)
   - 添加 WHERE column IN (?, ?, ...)，使用绑定参数。
+
+- QueryBuilder WhereInInts(string column, List<int> values)
+  - 添加 WHERE column IN (?, ?, ...)，使用整数参数；
+    空列表按恒假处理（`IN (NULL)`），不生成 `IN ()`。
+
+- QueryBuilder WhereInLongs(string column, List<long> values)
+  - 添加 WHERE column IN (?, ?, ...)，使用 64 位整数参数；
+    空列表按恒假处理（`IN (NULL)`），不生成 `IN ()`。
 
 - QueryBuilder WhereNotIn(string column, List<string> values)
   - 添加 WHERE column NOT IN (?, ?, ...)，使用绑定参数。

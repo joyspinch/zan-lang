@@ -37,6 +37,10 @@ NUL 字节的值可原样返回（使用 RedisReply.len）。命令
 
 - string lastError;
 
+- bool busy;
+
+- List<AsyncGate> waiters;
+
 - byte[]inbuf;
 
 - int incap;
@@ -48,6 +52,14 @@ NUL 字节的值可原样返回（使用 RedisReply.len）。命令
 - byte[]tmp;
 
 - int tmpcap;
+
+- TlsStream tls;
+
+- static bool verifyTls=true;
+
+- static void SetTlsVerify(bool verify)
+  - 切换后续 ConnectSecureAsync 的证书与主机名校验。
+    仅测试/开发自签场景关闭；生产保持默认开启。
 
 - [DllImport("crt")]static extern long strlen(string str);
 
@@ -61,6 +73,19 @@ NUL 字节的值可原样返回（使用 RedisReply.len）。命令
 - static async RedisClient ConnectAsync(string host, int port, int timeoutMs)
   - 带连接超时（毫秒，0 = 不限时）的连接；失败返回 null。
 
+- static async RedisClient ConnectSecureAsync(string host, int port, int timeoutMs)
+  - 与 `ConnectAsync` 相同，但 TCP 建连后立即把
+    通道升级为 TLS（Redis 的 TLS 监听从首字节就是加密流，无需
+    协商握手）。认证（AUTH）与数据全部走加密信道。
+    握手按 <paramref name="host"/> 做证书主机名校验，信任系统根。
+    A287③：口令不再明文过网。
+
+- static async RedisClient doConnect(string host, int port, int timeoutMs, bool secure)
+
+- async bool AcquireLock()
+
+- void ReleaseLock()
+
 - void Close()
   - 关闭连接并释放缓冲区。
 
@@ -71,7 +96,7 @@ NUL 字节的值可原样返回（使用 RedisReply.len）。命令
 
 - void ensureRoom(int extra)
   - 确保接收缓冲区在尾位置之后还能容纳 <paramref name="extra"/> 字节，
-    必要时先压缩再扩容。
+    必要时先压缩再扩容。带上限与溢出防护。
 
 - async int fillMore()
   - 从套接字接收一块数据存入缓冲区。返回
@@ -83,7 +108,7 @@ NUL 字节的值可原样返回（使用 RedisReply.len）。命令
 
 - async string readLine()
   - 从头游标处读取一行以 CRLF 结尾的行（不含 CRLF），
-    需要时补读更多数据。对端
+    借助 AVX2 向量化 IndexOf 快速跳过普通字节，需要时补读更多数据。对端
     关闭时返回 null。
 
 - async string readBulk(int n)
@@ -99,7 +124,16 @@ NUL 字节的值可原样返回（使用 RedisReply.len）。命令
     然后发送。参数长度用 strlen 度量。
 
 - async RedisReply CommandAsync(List<string> args)
-  - 发送命令（参数向量）并等待其回复。
+  - 发送命令（参数向量）并等待其回复。内部使用 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
+
+- async RedisReply CommandInternalAsync(List<string> args)
+
+- async RedisReply CommandBytesAsync(List<string> prefixArgs, byte[]binaryArg)
+  - 发送带二进制参数的命令（如 SET key <byte[]>）并等待回复。
+    前缀参数以字符串形式编码，最后一个二进制参数按原生字节流发送，
+    完全二进制安全，支持任意包含 NUL 字节的大数据量载荷。
+
+- async RedisReply CommandBytesInternalAsync(List<string> prefixArgs, byte[]binaryArg)
 
 - async RedisReply CommandAsync1(string a0)
   - 便捷方法：单参数命令（例如 PING）。
@@ -122,10 +156,17 @@ NUL 字节的值可原样返回（使用 RedisReply.len）。命令
 - async bool SetAsync(string key, string val)
   - SET key value。收到 +OK 返回 true。
 
+- async bool SetBytesAsync(string key, byte[]val)
+  - 二进制安全的 SET：将原始字节数组作为值存储。支持包含 NUL 字节的任意二进制载荷与大数据量。
+
 - async string GetAsync(string key)
   - GET key。返回对应的值；键不存在（nil）时
     返回空字符串。如需区分 nil 与
     空值，请使用 `GetReplyAsync`。
+
+- async byte[]GetBytesAsync(string key)
+  - 二进制安全的 GET：返回原始字节数组。支持包含 NUL 字节的任意二进制载荷。
+    键不存在或出错时返回 null。
 
 - async RedisReply GetReplyAsync(string key)
   - GET key，返回原始回复，使调用方可区分
@@ -253,6 +294,9 @@ NUL 字节时，用它代替 <c>str.Length</c>（二进制安全）。
 
 - bool IsString()
   - 当回复为简单字符串或 bulk 字符串时为 true。
+
+- byte[]AsBytes()
+  - 返回原始字节数组。二进制安全，即使包含 NUL 字节也不会被截断。
 
 - string AsString()
   - 返回字符串负载（nil 或非字符串类型返回空）。

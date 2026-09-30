@@ -1,6 +1,6 @@
 # System.Linq
 
-> 源码: `stdlib/System/Linq/Enumerable.zan`, `stdlib/System/Linq/Expression.zan`
+> 源码: `stdlib/System/Linq/Enumerable.zan`, `stdlib/System/Linq/Expression.zan`, `stdlib/System/Linq/Stream.zan`
 
 
 ## Enumerable (class)
@@ -29,6 +29,11 @@ OrderBy(k1, k2) 按主、次两个 int 键排序。出于同样
 First/Last/Single 在空序列（Single 对不明确的序列）时抛出
 InvalidOperationException，与 C# 一致；*OrDefault 变体
 则返回类型默认值。
+
+- static Stream<T> AsStream<T>(this List<T> src)
+  - 为序列开启零分配惰性流水线（Stream Pipeline）。
+    中间操作（Where/Skip/Take/TakeWhile/Distinct/Select）不分配临时列表，
+    终结操作（ToList/First/Count/Any/All/ForEach）进行单趟遍历并短路提前终止。
 
 - static List<T> Where<T>(this List<T> src, Predicate<T> pred)
   - 保留 pred 返回 true 的元素。
@@ -125,7 +130,7 @@ InvalidOperationException，与 C# 一致；*OrDefault 变体
 
 - static List<T> Distinct<T>(this List<T> src)
   - 去重元素，保留首次出现（使用 ==；
-    对引用类型是同一性比较，而非结构相等）。
+    对引用类型是同一性比较，而非结构相等）。基于哈希表 O(N) 实现。
 
 - static List<T> Distinct<T>(this List<T> src, EqualityComparer<T> eq)
   - 在给定相等比较器下去重，保留
@@ -136,7 +141,7 @@ InvalidOperationException，与 C# 一致；*OrDefault 变体
     由接收者的元素类型选择该重载）。
 
 - static List<string> DistinctStr(this List<string> src)
-  - 按值比较去重字符串，保留首次出现。
+  - 按值比较去重字符串，保留首次出现。基于哈希表 O(N) 实现。
 
 - static List<T> OrderBy<T>(this List<T> src, StrKeySelector<T> key)
   - 按字符串键升序排序（OrderByStr 的 C# 风格重载；
@@ -214,7 +219,7 @@ InvalidOperationException，与 C# 一致；*OrDefault 变体
 - static List <Grouping<T>> GroupBy<T>(this List<T> src, KeySelector<T> key)
   - 按整数键对元素分组。Grouping.IntKey 保存
     键；Grouping.Key 保存其字符串形式。分组顺序按首次
-    出现排序。
+    出现排序。基于哈希表 O(N) 实现。
 
 - static List <Grouping<T>> GroupBy<T>(this List<T> src, StrKeySelector<T> key)
   - 按字符串键分组（GroupByStr 的 C# 风格重载；
@@ -222,15 +227,15 @@ InvalidOperationException，与 C# 一致；*OrDefault 变体
 
 - static List <Grouping<T>> GroupByStr<T>(this List<T> src, StrKeySelector<T> key)
   - 按字符串键（按值比较）分组。分组
-    顺序按首次出现排列。
+    顺序按首次出现排列。基于哈希表 O(N) 实现。
 
 - static List <Grouping<R>> GroupByKeysInt <T, R>(this List<T> src, List<int> keys, List<R> items)
   - 按预先计算的整数键分组（键与元素列表并行；
-    Grouping.Items 为投影后的元素）。
+    Grouping.Items 为投影后的元素）。基于哈希表 O(N) 实现。
 
 - static List <Grouping<R>> GroupByKeysStr <T, R>(this List<T> src, List<string> keys, List<R> items)
   - 按预先计算的字符串键分组（键与元素列表并行；
-    Grouping.Items 为投影后的元素）。
+    Grouping.Items 为投影后的元素）。基于哈希表 O(N) 实现。
 
 - static A Aggregate <T, A>(this List<T> src, A seed, Accumulator <T, A> folder)
   - 从 seed 开始把序列折叠进累加器。
@@ -304,7 +309,7 @@ InvalidOperationException，与 C# 一致；*OrDefault 变体
   - LikeMatch 的递归体：'%' 尝试消耗任意长度，'_' 匹配单个字符。
 
 - static List<T> In<T>(this List<T> src, List<T> values)
-  - SQL IN：保留 values 中存在的元素（使用 ==）。
+  - SQL IN：保留 values 中存在的元素（使用 ==）。基于哈希加速。
 
 - static List<T> In<T>(this List<T> src, List<T> values, EqualityComparer<T> eq)
   - 在给定相等比较器下的 SQL IN（对引用类型
@@ -315,7 +320,44 @@ InvalidOperationException，与 C# 一致；*OrDefault 变体
     InStr）。
 
 - static List<string> InStr(this List<string> src, List<string> values)
-  - 对字符串执行 SQL IN，按值比较。
+  - 对字符串执行 SQL IN，按值比较。基于哈希加速。
+
+- static List<T> TakeTop<T>(this List<T> src, KeySelector<T> key, int k)
+  - 基于优先队列（堆）求整数键最小的前 k 个元素（升序排序，O(N log K)）。
+    当 k 远小于序列长度时，显著优于全量排序后再 Take。
+
+- static List<T> TakeTopDescending<T>(this List<T> src, KeySelector<T> key, int k)
+  - 基于优先队列（堆）求整数键最大的前 k 个元素（降序排序，O(N log K)）。
+
+- static List<T> Union<T>(this List<T> first, List<T> second)
+  - 并集并去重（保留元素首次出现的顺序，O(N + M)）。
+
+- static List<string> UnionStr(this List<string> first, List<string> second)
+  - 字符串并集并去重（保留元素首次出现的顺序，O(N + M)）。
+
+- static List<T> Intersect<T>(this List<T> first, List<T> second)
+  - 交集并去重（保留在 first 中首次出现的顺序，O(N + M)）。
+
+- static List<string> IntersectStr(this List<string> first, List<string> second)
+  - 字符串交集并去重（保留在 first 中首次出现的顺序，O(N + M)）。
+
+- static List<T> Except<T>(this List<T> first, List<T> second)
+  - 差集并去重（属于 first 且不属于 second 的元素，保留首次出现的顺序，O(N + M)）。
+
+- static List<string> ExceptStr(this List<string> first, List<string> second)
+  - 字符串差集并去重（属于 first 且不属于 second 的元素，保留首次出现的顺序，O(N + M)）。
+
+- static Dict <int, T> ToDictInt<T>(this List<T> src, KeySelector<T> keySel)
+  - 将序列转换为 Dict<int, T> 映射表（整数键，值为元素本身）。
+
+- static Dict <string, T> ToDictStr<T>(this List<T> src, StrKeySelector<T> keySel)
+  - 将序列转换为 Dict<string, T> 映射表（字符串键，值为元素本身）。
+
+- static Dict <int, V> ToDictInt <T, V>(this List<T> src, KeySelector<T> keySel, Selector <T, V> valSel)
+  - 将序列转换为 Dict<int, V> 映射表（整数键，自定义值投影）。
+
+- static Dict <string, V> ToDictStr <T, V>(this List<T> src, StrKeySelector<T> keySel, Selector <T, V> valSel)
+  - 将序列转换为 Dict<string, V> 映射表（字符串键，自定义值投影）。
 
 
 ## Expr (class)
@@ -428,6 +470,83 @@ GroupBy 产生的一组结果：key 及其元素。
   - 空组：键为空串、元素列表为空。
 
 
+## Stream (class)
+
+针对 `List<T>` 的零分配惰性求值流水线（Stream Pipeline）。
+
+核心特性：
+1. 零中间分配（Zero Allocation）：Where/Skip/Take/TakeWhile 不创建任何中间 List；
+2. 短路提前终止（Short-Circuiting）：Take(k)、First()、Any() 在满足条件时立即 break，不再扫描后续元素；
+3. 单趟遍历（Single Pass）：所有谓词在一个内联循环中流水线式过滤，CPU 缓存行高度亲和。
+
+示例：
+List<int> page = users.AsStream()
+.Where((User u) => u.age >= 18)
+.Skip(20)
+.Take(10)
+.Select<int>((User u) => u.id)
+.ToList();
+
+- List<T> src;
+
+- List <Predicate<T>> filters;
+
+- Predicate<T> takeWhilePred;
+
+- int skipN;
+
+- int takeN;
+
+- bool distinct;
+
+- public Stream(List<T> src)
+
+- static Stream<T> Of(List<T> src)
+  - 从 List 创建流。
+
+- Stream<T> Where(Predicate<T> pred)
+  - 保留满足谓词的元素（中间操作，惰性追加）。多次调用按 AND 组合。
+
+- Stream<T> Skip(int n)
+  - 跳过前 n 个满足过滤条件的元素（中间操作）。
+
+- Stream<T> Take(int n)
+  - 截取最多 n 个元素（中间操作，在终结操作时支持极速短路）。
+
+- Stream<T> TakeWhile(Predicate<T> pred)
+  - 当谓词返回 true 时持续提取，遇到首个 false 立即终结整条流（中间操作）。
+
+- Stream<T> Distinct()
+  - 流式去重（中间操作，基于哈希表保证唯一性）。
+
+- Stream<R> Select<R>(Selector <T, R> selector)
+  - 使用 selector 变换元素类型并开启新子流（中间操作）。
+
+- List<T> ToList()
+  - 物化为新的 List<T>（单趟遍历，按需提前终止）。
+
+- T First()
+  - 返回第一个匹配元素。匹配到立即退出循环（短路）。空序列抛异常。
+
+- T FirstOrDefault(T dflt)
+  - 返回第一个匹配元素，无匹配时返回给定的默认值。匹配到立即退出循环（短路）。
+
+- bool Any()
+  - 是否存在至少一个满足流过滤条件的元素（找到首个匹配项即短路退出）。
+
+- bool Any(Predicate<T> pred)
+  - 流中是否存在满足特定谓词的元素（短路）。
+
+- bool All(Predicate<T> pred)
+  - 流中是否所有满足现有过滤的元素均满足给定谓词（短路）。
+
+- int Count()
+  - 统计匹配元素总数（尊重 Take/Skip 约束）。
+
+- void ForEach(Action<T> action)
+  - 遍历消费流中每一个有效元素。
+
+
 ## A (delegate)
 
 将累加器与下一个元素合并。
@@ -476,3 +595,10 @@ GroupBy 产生的一组结果：key 及其元素。
 从元素提取字符串排序键。
 
 `delegate string StrKeySelector<T>(T item);`
+
+
+## void (delegate)
+
+对流中每个元素执行的操作。
+
+`delegate void Action<T>(T item);`

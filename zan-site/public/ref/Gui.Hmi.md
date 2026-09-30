@@ -1,6 +1,6 @@
 # Gui.Hmi
 
-> 源码: `stdlib/Gui/Hmi/Alarm.zan`, `stdlib/Gui/Hmi/EquipPanel.zan`, `stdlib/Gui/Hmi/Gauge.zan`, `stdlib/Gui/Hmi/Indicator.zan`, `stdlib/Gui/Hmi/IoTag.zan`, `stdlib/Gui/Hmi/NumPad.zan`, `stdlib/Gui/Hmi/Trend.zan`
+> 源码: `packages/Zan.Industrial/src/Gui/Hmi/Alarm.zan`, `packages/Zan.Industrial/src/Gui/Hmi/EquipPanel.zan`, `packages/Zan.Industrial/src/Gui/Hmi/Gauge.zan`, `packages/Zan.Industrial/src/Gui/Hmi/Indicator.zan`, `packages/Zan.Industrial/src/Gui/Hmi/IoTag.zan`, `packages/Zan.Industrial/src/Gui/Hmi/NumPad.zan`, `packages/Zan.Industrial/src/Gui/Hmi/Trend.zan`
 
 
 ## AlarmBanner (class)

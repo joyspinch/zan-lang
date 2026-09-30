@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Fw
 
-> 源码: `stdlib/Sdk/Jd/Api/Fw/FwMarketPaymentoutRequest.zan`, `stdlib/Sdk/Jd/Api/Fw/JdFwApi.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Fw/FwMarketPaymentoutRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Fw/JdFwApi.zan`
 
 
 ## FwMarketPaymentoutRequest (class)

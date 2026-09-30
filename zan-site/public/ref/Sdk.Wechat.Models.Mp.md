@@ -1,6 +1,6 @@
 # Sdk.Wechat.Models.Mp
 
-> 源码: `stdlib/Sdk/Wechat/Models/Mp/WechatMpModels.zan`
+> 源码: `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/Models/Mp/WechatMpModels.zan`
 
 
 ## WechatMpActionInfo (class)

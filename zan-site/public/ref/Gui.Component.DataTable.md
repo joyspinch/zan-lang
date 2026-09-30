@@ -1,6 +1,6 @@
 # Gui.Component.DataTable
 
-> 源码: `stdlib/Gui/Component/DataTable/DataGrid.zan`, `stdlib/Gui/Component/DataTable/DataTable.CfClear.zan`, `stdlib/Gui/Component/DataTable/DataTable.ColumnChooser.zan`, `stdlib/Gui/Component/DataTable/DataTable.Columns.zan`, `stdlib/Gui/Component/DataTable/DataTable.CompCell.zan`, `stdlib/Gui/Component/DataTable/DataTable.Compute.zan`, `stdlib/Gui/Component/DataTable/DataTable.DataSource.zan`, `stdlib/Gui/Component/DataTable/DataTable.Diagnostics.zan`, `stdlib/Gui/Component/DataTable/DataTable.Edit.zan`, `stdlib/Gui/Component/DataTable/DataTable.Export.zan`, `stdlib/Gui/Component/DataTable/DataTable.ExportUi.zan`, `stdlib/Gui/Component/DataTable/DataTable.Filter.zan`, `stdlib/Gui/Component/DataTable/DataTable.FilterBuilder.zan`, `stdlib/Gui/Component/DataTable/DataTable.FilterDescribe.zan`, `stdlib/Gui/Component/DataTable/DataTable.FilterUI.zan`, `stdlib/Gui/Component/DataTable/DataTable.Formula.zan`, `stdlib/Gui/Component/DataTable/DataTable.HttpSource.zan`, `stdlib/Gui/Component/DataTable/DataTable.Identity.zan`, `stdlib/Gui/Component/DataTable/DataTable.Lang.zan`, `stdlib/Gui/Component/DataTable/DataTable.Layout.zan`, `stdlib/Gui/Component/DataTable/DataTable.LocalSource.zan`, `stdlib/Gui/Component/DataTable/DataTable.MasterDetail.zan`, `stdlib/Gui/Component/DataTable/DataTable.Overlays.zan`, `stdlib/Gui/Component/DataTable/DataTable.PivotView.zan`, `stdlib/Gui/Component/DataTable/DataTable.Query.zan`, `stdlib/Gui/Component/DataTable/DataTable.QueryPlan.zan`, `stdlib/Gui/Component/DataTable/DataTable.QueryRequest.zan`, `stdlib/Gui/Component/DataTable/DataTable.QueryResult.zan`, `stdlib/Gui/Component/DataTable/DataTable.Realtime.zan`, `stdlib/Gui/Component/DataTable/DataTable.Render.zan`, `stdlib/Gui/Component/DataTable/DataTable.RowCache.zan`, `stdlib/Gui/Component/DataTable/DataTable.Rows.zan`, `stdlib/Gui/Component/DataTable/DataTable.Schema.zan`, `stdlib/Gui/Component/DataTable/DataTable.Search.zan`, `stdlib/Gui/Component/DataTable/DataTable.Selection.zan`, `stdlib/Gui/Component/DataTable/DataTable.Server.zan`, `stdlib/Gui/Component/DataTable/DataTable.Sort.zan`, `stdlib/Gui/Component/DataTable/DataTable.Transaction.zan`, `stdlib/Gui/Component/DataTable/DataTable.TransactionRequest.zan`, `stdlib/Gui/Component/DataTable/DataTable.Transpose.zan`, `stdlib/Gui/Component/DataTable/DataTable.Value.zan`, `stdlib/Gui/Component/DataTable/DataTable.WidgetComp.zan`, `stdlib/Gui/Component/DataTable/DataTable.zan`, `stdlib/Gui/Component/DataTable/DataTableModel.zan`
+> 源码: `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataGrid.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.CfClear.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.ColumnChooser.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Columns.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.CompCell.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Compute.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.DataSource.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Diagnostics.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Edit.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Export.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.ExportUi.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.ExportXlsx.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Filter.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.FilterBuilder.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.FilterDescribe.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.FilterUI.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Formula.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.HttpSource.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Identity.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.ImageSlot.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Lang.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Layout.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.LocalSource.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.MasterDetail.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Overlays.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.PivotView.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Query.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.QueryPlan.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.QueryRequest.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.QueryResult.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Realtime.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Render.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.RowCache.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Rows.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Schema.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Search.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Selection.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Server.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Sort.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Transaction.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.TransactionRequest.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Transpose.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Value.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.WidgetComp.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTableBootstrap.zan`, `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTableModel.zan`
 
 
 ## BandGridComp (class)
@@ -552,6 +552,10 @@ align：0 左对齐，1 居中，2 右对齐
     int ci = DataTable.Col(cols, "name");
     ```
 
+- string FieldName()
+  - 列的稳定字段名（`Field` 设的名字；未命名列返回 ""）。
+    命中信息按名消费用（DataGrid.HitField → 列级事件按名分派）。
+
 - static DataColumn Describe(DataColumn c, string text)
   - 设置表头悬停提示的描述文本。与其他构建器一样可组合：
     
@@ -1046,6 +1050,12 @@ side.Add(grid);
 - override bool SetExtra(string key, string val)
 
 - override List<string> Events()
+
+- string HitField()
+  - 最近一次命中的数据字段名（CellClick/ColumnResize 等事件
+    的 HitCol 翻译成稳定 field 名；越界/未命名列返回 ""）。
+    GenForm 的声明式列级事件（columns[i].click）按它分派，
+    列重排不影响路由。
 
 - override void BindEvent(string evt, Action a)
   - 把网格的语义事件转发到引擎 state 自身的 UiEvent
@@ -2028,6 +2038,19 @@ DataTable 模块：派生显示——Top-N/集合过滤、行
   - 筛选集合上的逐列 min/max，用于数据条和色阶
     归一化。只扫描 cfMode 为 1 或 2 的列。
 
+- static void RankByValue(List<double> vals, List<int> ranks)
+  - Top/Bottom 名次：ranks[k] = vals 中严格大于 vals[k] 的个数
+    （并列值同名次，与旧 O(n²) 逐对计数语义一致）。索引数组按
+    值降序稳定归并排序，同值段的首位即该段的名次。
+
+- static void RankMerge(List<double> vals, List<int> idx, int lo, int mid, int hi, List<int> tmp)
+  - RankByValue 的一趟合并：按值降序，相等保留原序（稳定）。
+
+- static int CfOrderPos(DataTableState st, int row)
+  - 行源索引在过滤集合（st.order）中的显示序；没有 Top/Bottom
+    规则列时字典不维护，恒 -1。渲染的 Top/Bottom 命中判定
+    用它替代对 st.order 的线性查找。
+
 
 ## DataTable (class)
 
@@ -2091,7 +2114,9 @@ DataTable 模块：单元格内编辑——开始/提交/取消、日历与
 
 ## DataTable (class)
 
-DataTable 分部：文件导出（CSV / XLSX，同步 + 异步流式）。
+DataTable 分部：文件导出（CSV 同步 + 异步流式；XLSX 支路在
+DataTable.ExportXlsx.zan——XlsxBook/Zip/Deflate 家族只有真的
+导出 Excel 的程序才需要，按需拉取据此整支裁掉，见 A332）。
 行选择语义与 `BuildText`（剪贴板复制）完全一致，
 "所见即所得"——导出的就是过滤/排序后看到的行。序列化本体在
 `XlsxBook`（数据层），不依赖 GUI；服务端/控制台
@@ -2101,8 +2126,28 @@ DataTable 分部：文件导出（CSV / XLSX，同步 + 异步流式）。
 
 - static AtomicInt sExportBusy=new AtomicInt(0);
   - 后台导出忙标志：0 空闲 / 1 占用，抢占成功者才开工。
-    wasm32 没有原子/线程（链接期被拒），导出是 UI 线程同步操作，
-    忙标志无意义——桩成 0/1 的普通 int。
+
+- static Func<bool> sXlsxCore;
+  - xlsx 写盘核心槽：DataTableXlsx.ExportToXlsxAsync 启动任务前
+    装入（闭包持有实参），Worker 线程只经此槽调用——主文件不
+    拼 Xlsx 家族的任何类型，xlsx 支路随导出调用按需拉入。
+
+- static XlsxExportUiFn sXlsxExportUi;
+  - xlsx 弹层导出入口槽：由 DataTableXlsx.Importable()（或宿主
+    显式 DataTableXlsx.InstallExportUi）装配。Overlays 的 Excel
+    菜单项只经此槽调用——本文件族若拼 DataTableXlsx 类名，
+    按需拉取会把 XlsxBook/Zip/Deflate 拖进每个放表格的程序
+    （A332）。未装配 = null，菜单项点击报「未启用 Excel 导出」。
+
+- static void InstallXlsxExportUi(XlsxExportUiFn fn)
+  - 装配 xlsx 弹层导出入口（幂等）。DataTableXlsx.InstallExportUi
+    在文件被拉入时调用；需要 Excel 导出但从未装配的宿主可显式
+    调用同一个入口触发拉入。
+
+- static bool RunXlsxExportUi(App app, DataTableState st, List<DataColumn> cols, DataSource src, string path, bool selectionOnly)
+  - Overlays 的 Excel 菜单项走这里：经槽调 xlsx 入口，未装配
+    返回 false（弹层显示「没有可导出的内容」——与无可导内容
+    同形，xlsx 写盘家族不进图）。
 
 - static bool ExportToCsv(DataTableState st, List<DataColumn> cols, DataSource src, string path, bool selectionOnly)
   - 导出为 CSV 文件，始终含表头行。行选择：
@@ -2111,22 +2156,6 @@ DataTable 分部：文件导出（CSV / XLSX，同步 + 异步流式）。
     两者皆无返回 false。内容与复制粘贴一致（显示文本，
     RFC 4180 转义）。UTF-8 带 BOM，Excel 双击打开不乱码。
     逐行流式写出，内存占用与行数无关；路径打不开返回 false。
-
-- static bool ExportToXlsx(DataTableState st, List<DataColumn> cols, DataSource src, string path, bool selectionOnly)
-  - 导出为 .xlsx 文件，语义与 `ExportToCsv` 相同，
-    但按列声明的类型写出真值：数值列写数字（可参与 Excel 汇总）、
-    日期列写 Excel 日期、bool 列写布尔，其余写文本；首行加粗、
-    冻结首行、列宽自适应。流式写盘（内存占用与行数无关），超
-    1048576 行自动分表；路径打不开时返回 false。
-
-- static bool ExportToXlsxAsync(DataTableState st, List<DataColumn> cols, DataSource src, string path, bool selectionOnly, DataTableExportProgress progress)
-  - 异步导出为 .xlsx：立即返回 true 表示任务已启动，写盘在后台
-    线程上流式进行。行集/列区间在本调用内（当前线程）冻结成
-    快照——之后表格的排序、过滤、勾选变化不影响本次导出；数据
-    源内容本身请保持只读。进度/取消经 `progress` 回调（在后台
-    线程上发生，UI 更新用 App.Post 切回），结束时必有一次
-    OnDone。返回 false：已有导出在运行（并回调
-    OnDone(false, "已有导出在运行")）或无可导内容（不回调）。
 
 - static bool ExportToCsvAsync(DataTableState st, List<DataColumn> cols, DataSource src, string path, bool selectionOnly, DataTableExportProgress progress)
   - 异步导出为 CSV，语义与 `ExportToXlsxAsync`
@@ -2141,27 +2170,17 @@ DataTable 分部：文件导出（CSV / XLSX，同步 + 异步流式）。
     取走，之后表格再排序/过滤/勾选都不影响本次导出。无可导内容
     返回 null。
 
-- static bool ExportXlsxSnapshot(DataTableExportSnapshot snap, List<DataColumn> cols, DataSource src, string path, DataTableExportProgress progress)
-  - xlsx 写盘核心（同步与后台线程共用）。progress 为 null 表示
-    不需要进度/取消。返回 false = 取消或写盘失败。
-
 - static bool ExportCsvSnapshot(DataTableExportSnapshot snap, List<DataColumn> cols, DataSource src, string path, DataTableExportProgress progress)
   - CSV 写盘核心：逐行流式（UTF-8 带 BOM；RFC 4180 转义与
     复制粘贴一致）。返回 false = 取消或写盘失败。
-
-- static XlsxCell ExportCell(int ci, List<DataColumn> cols, DataColumn col, DataSource src, int row)
-  - 单元格 → xlsx 值：按列声明的类型键取数（与排序/汇总走的
-    是同一条路径，导出与表格显示不会各说各话）。
-    空单元格返回 null（写出时跳过）。计算列导出公式实数。
 
 
 ## DataTable (class)
 
 - static bool ExportToXlsxAsyncUi(App app, DataTableState st, List<DataColumn> cols, DataSource src, string path, bool selectionOnly)
-  - 异步导出 .xlsx 并显示居中进度弹层（含取消/关闭）。行选择
-    与快照语义与 `ExportToXlsxAsync` 完全一致。
-    返回 false（无可导内容或已有导出在运行）时弹层仍会显示
-    失败原因，点关闭收起。
+  - 异步导出 .xlsx 并显示进度弹层：经 sXlsxExportUi 槽（xlsx 写盘
+    家族随真实导出调用才拉入，见 A332）。CSV 入口是
+    `ExportToCsvAsyncUi`。
 
 - static bool ExportToCsvAsyncUi(App app, DataTableState st, List<DataColumn> cols, DataSource src, string path, bool selectionOnly)
   - 异步导出 CSV 并显示进度弹层，语义同上。
@@ -3120,12 +3139,22 @@ DataTable 模块：单元格渲染（条件格式、单元格类型）
   - 指针指向的插入槽位（0..count）：中点位于
     指针左侧的芯片数量。
 
-- static void RenderGroupPanel(App app, int x, int y, int viewW, int h, List<DataColumn> cols, DataTableState st, bool headerDrag)
+- static int ModalEvt(App app, DataTableState st)
   - 表头上方的分组条带：每个分组列一个芯片
     （由外到内），带移除按钮；有内容拖过时显示插入指示，
     未分组时显示提示。
     列头被拖动期间 `headerDrag` 为 true，条带
     可标示自己为放置目标。
+    模态浮层（行右键菜单/表头右键菜单/列选择器/条件格式清除/
+    编辑器弹窗）打开期间，表格交互面归浮层所有：内容阶段的事件
+    种类就地清零。表头 chrome（全选框/排序/列菜单/筛选钮/手柄）、
+    分组与筛选芯片条、表格体一样都是几何命中——读的是原始事件，
+    弹层的全窗阻挡拦不住几何命中；菜单比表格高时会被钳到表格
+    顶部，菜单项正好盖住表头，点菜单项就点穿到全选框上，选中行
+    被改成点击位置的行（2026-09 用户实测）。浮层自身的内容在
+    覆盖层阶段绘制，仍读原始事件，不受此抑制影响。
+
+- static void RenderGroupPanel(App app, int x, int y, int viewW, int h, List<DataColumn> cols, DataTableState st, bool headerDrag)
 
 - static void Render(App app, int x, int y, int viewW, int viewH, List<DataColumn> cols, List<DataRow> rows, DataTableState st)
   - 便捷重载：渲染内存中的 List<DataRow>（包装为
@@ -3817,6 +3846,33 @@ DataTable 分部：值解析、数字/实数/bool/日期格式化与
     宽松解析——"¥12" 之类带修饰的文本也能读出数值。
 
 
+## DataTableBootstrap (class)
+
+DataTable 家族（DataGrid/Transfer）的 HeavyControls 注册入口。
+ControlFactory 主 switch 的 "DataGrid" 分支要求 Gui.Component.
+DataTable 目录整体编译进图（DataGrid + 模型/渲染，0.8MB+），
+不用表格的程序发布也背上这份体积。改由宿主在启动时调用一次
+`Install`：设计器生成代码直接 new DataGrid<T>()/
+Transfer<T>() 的程序不受影响；运行期经 JSON/HTML 按 kind 重建
+（Serialize/Html 克隆、FormBuilder 的 ft 23/41/84 字段）需要注册。
+不注册的程序里 DataTable 目录整体被裁掉。
+图片列的远端取回（http(s) URL）是独立 opt-in：Gui.ImageHttp.
+Install()（同时装配 Widget.Image 与 GridImageSlot）——不调用的
+程序网络栈与 ssl/crypto 驱动不进编译图，图片列画占位。这里
+绝不能拼 ImageHttp：按需拉取按名字拉文件，本文件一进图家族
+就进图，装配行会把 6.4MB OpenSSL 拖回每个注册宿主。
+
+- static bool installed;
+
+- static void Install()
+
+- static Control MakeDataGrid(string kind)
+
+- static Control MakeTransfer(string kind)
+  - 泛型穿梭框：无参字符串工厂只能造 string 实例供设计器/运行期
+    预览；类型化的 Transfer<T> 由代码持有实体列表来绑定。
+
+
 ## DataTableExportProgress (class)
 
 DataTable 导出的进度/取消钩子。回调都在后台写盘线程上发生：
@@ -3949,35 +4005,6 @@ DataTable 导出进度弹层：ExportToXlsxAsyncUi / ExportToCsvAsyncUi
 - List<FrameColumn> columns;
 
 
-## DataTableRowSource (class)
-
-`XlsxRowSource` 适配器：把快照 + DataSource 逐行喂给
-流式写盘。排序/过滤/勾选状态已在快照里冻结（所见即所得）；
-CellText/CellNum 等直接读应用侧数据源——导出期间应用不应改写
-数据源内容（行数上限 1048576 由 XlsxBook 自动分表兜住）。
-
-- public DataSource src;
-
-- public List<DataColumn> cols;
-
-- public DataTableExportSnapshot snap;
-
-- public DataTableExportProgress progress;
-
-- override int RowCount()
-  - 行数 = 快照行数 + 1（表头行）。
-
-- override bool FillRow(int index, List<XlsxCell> row)
-  - index 0 写表头（快照列区间内的列标题），其余按快照行序
-    逐格写出数据行。
-
-- override void OnProgress(int done, int total)
-  - 把写盘进度转发给调用方钩子；未挂接 progress 时忽略。
-
-- override bool Cancelled()
-  - 把取消询问转发给调用方钩子；未挂接 progress 时恒不取消。
-
-
 ## DataTableState (class)
 
 DataTable 持久状态——创建一次（在帧循环外）并
@@ -4097,6 +4124,10 @@ DataTable 持久状态——创建一次（在帧循环外）并
 - List<double> cfMaxR;
 
 - List<int> cfRank;
+
+- Dict <int, int> cfOrderPos;
+
+- List<string> formulaSeen;
 
 - List<int> menuCfMode;
 
@@ -4608,6 +4639,45 @@ DataTable 持久状态——创建一次（在帧循环外）并
     首次到达时提交（message/ok 不被后续帧改写）。
 
 
+## DataTableXlsx (class)
+
+xlsx 写盘核心与带弹层的导出入口（原 DataTable partial 的
+XLSX 支路，见文件头）。
+
+- static void InstallExportUi()
+  - 装配 xlsx 弹层导出口（把本类的 ExportToXlsxAsyncUi 挂进
+    DataTable.sXlsxExportUi 槽）。需要 Excel 导出的宿主（或测试）
+    调一次本方法——按需拉取按名计数，这一拼就把本文件连同
+    XlsxBook/Zip/Deflate 写盘家族拉进图；不调用的程序整支裁掉。
+
+- static bool ExportToXlsxAsyncUi(App app, DataTableState st, List<DataColumn> cols, DataSource src, string path, bool selectionOnly)
+  - 异步导出 .xlsx 并显示居中进度弹层（含取消/关闭）。行选择
+    与快照语义与 `DataTable.ExportToCsvAsync` 完全
+    一致。返回 false（无可导内容或已有导出在运行）时弹层仍会
+    显示失败原因，点关闭收起。弹层本体（DataTableExportUi/
+    Progress/SyncUi）在 DataTable.ExportUi.zan——本文件被拉入
+    的前提是有人真的点了 Excel 导出（Overlays 菜单项先经
+    DataTable.sXlsxExportUi 槽查装配），那时弹层文件必然在图。
+
+- static bool ExportToXlsxAsync(DataTableState st, List<DataColumn> cols, DataSource src, string path, bool selectionOnly, DataTableExportProgress progress)
+  - 异步导出为 .xlsx：立即返回 true 表示任务已启动，写盘在后台
+    线程上流式进行。行集/列区间在本调用内（当前线程）冻结成
+    快照——之后表格的排序、过滤、勾选变化不影响本次导出；数据
+    源内容本身请保持只读。进度/取消经 `progress` 回调（在后台
+    线程上发生，UI 更新用 App.Post 切回），结束时必有一次
+    OnDone。返回 false：已有导出在运行（并回调
+    OnDone(false, "已有导出在运行")）或无可导内容（不回调）。
+
+- static bool ExportXlsxSnapshot(DataTableExportSnapshot snap, List<DataColumn> cols, DataSource src, string path, DataTableExportProgress progress)
+  - xlsx 写盘核心（同步与后台线程共用）。progress 为 null 表示
+    不需要进度/取消。返回 false = 取消或写盘失败。
+
+- static XlsxCell ExportCell(int ci, List<DataColumn> cols, DataColumn col, DataSource src, int row)
+  - 单元格 → xlsx 值：按列声明的类型键取数（与排序/汇总走的
+    是同一条路径，导出与表格显示不会各说各话）。
+    空单元格返回 null（写出时跳过）。计算列导出公式实数。
+
+
 ## DeltaBatch (class)
 
 一批实时增量。批是应用/传输的最小单元：同批内后面的 op
@@ -4843,6 +4913,12 @@ cell 操作只写 `field`（列的稳定 Field 名）和 `value`。
 - static void Worker()
   - 线程入口：从静态槽取任务按 kind 分派写盘，结束后清槽并
     释放忙标志。异常经 OnDone(false, 异常消息) 上报。
+    注意：这里绝不能拼 DataTableXlsx/Xlsx* 类型——本文件随
+    partial 家族进每个放表格的程序，一拼就把 XlsxBook/Zip/
+    Deflate 写盘家族拖回去（A332）。xlsx 分派经 vtable 化的
+    委托槽走：DataTableXlsx.ExportToXlsxAsync 启动任务时把
+    写盘核心装进 sXlsxCore，未装 = xlsx 支路不在图，走 null
+    报错路径（调用方是 ExportToXlsx*，自身即证明已拉入）。
 
 
 ## FilterChip (class)
@@ -5111,6 +5187,18 @@ grid.RealCol("Amount", 110, 2, o => o.amount).Money("¥").Sum();
     从类型化访问器推导。
 
 
+## GridImageSlot (class)
+
+- static GridUrlEnsureFn ensurer;
+  - 注册的取回实现（ImageHttp.EnsureUrl：排队-去重-mem: key 缓存）。
+
+- static void SetEnsurer(GridUrlEnsureFn fn)
+
+- static string Ensure(App app, string url)
+  - 就绪返回已注册的 `mem:` key，加载中/失败/未注册返回 null——
+    null 直接落渲染的占位分支，与未就绪同形。
+
+
 ## GridSource (class)
 
 将 `List<T>` 及各列访问器适配为引擎的 `DataSource`，
@@ -5215,9 +5303,10 @@ HTTP 块源：ServerDataSource 的"限流接口 + 本地缓存"适配器。
 1. **缓存先行**：每个块 (start,count) 对应缓存目录里的一个 JSON
 文件。命中直接在 UI 线程同步供给（零网络、零等待）；未命中才
 入队后台拉取，取回后先落盘再交付——进程重启后同一块不再打网。
-2. **后台交付**：拉取走全局单工的静态 Job 通道（线程入口只能是
-静态方法组——实例方法组/闭包喂给 Thread.Start 会编译通过、
-调用即崩，探针见 _scratch/hts_probe*.zan；该编译器缺陷另案）。
+2. **后台交付**：拉取走全局单工的静态 Job 通道（线程入口用
+静态方法组 + 静态槽位，而不是给每条取数连源一起捕获；实例
+方法组与捕获 lambda 自 2026-09 起已能直接喂给 Thread.Start，
+见 docs/ABI.md §3.6）。
 void 循环里 await 静态 async 取数（try 在 async 体内，TASKS
 A88 悬挂教训），完成写静态槽位，由网格每帧的 Poll() 在 UI
 线程并入。源状态除经 Mutex 保护的槽位外不出 UI 线程，迟到/
@@ -7933,6 +8022,15 @@ RootCount 直接索引。
 `delegate bool GridBool<T>(T row);`
 
 
+## bool (delegate)
+
+xlsx 弹层导出入口的槽签名（实现在 DataTable.ExportXlsx.zan 的
+DataTableXlsx.ExportToXlsxAsyncUi；类型在此，槽经类型无关的
+委托调用，主文件族不拼 xlsx 家族类名）。
+
+`delegate bool XlsxExportUiFn(App app, DataTableState st, List<DataColumn> cols, DataSource src, string path, bool selectionOnly);`
+
+
 ## double (delegate)
 
 从实体读取小数键，用于声明了
@@ -7955,6 +8053,19 @@ RootCount 直接索引。
 `grid.Col("Name", 140, u => u.name)`。
 
 `delegate string GridText<T>(T row);`
+
+
+## string (delegate)
+
+DataGrid 图片列的远端取回通道槽（与 Widget.Image 的 urlFetcher 同构）。
+渲染遇到 http(s) 图片单元格时经 `Ensure` 走注册的实现；
+未注册画加载失败占位，网络栈不进编译图。装配点在
+Gui.ImageHttp.Install()（同时给 Widget.Image 注册）——需要远端
+图片列的程序调它（或经 Html.Install 间接）。槽独立成类而不是
+放进 partial class DataTable：谁拼 "DataTable" 谁拉 30 个 partial
+分片，ImageHttp 装配时绝不能背全家。
+
+`delegate string GridUrlEnsureFn(App app, string url);`
 
 
 ## string (delegate)

@@ -12,6 +12,10 @@ GetSystemInfo，负载来自 GetSystemTimes。Linux 读取
 /proc/cpuinfo 和 /proc/stat。其他平台抛出
 PlatformNotSupportedException.
 
+- [DllImport("kernel32", EntryPoint="Sleep")]static extern void SleepW(int ms);
+
+- [DllImport("crt", EntryPoint="usleep")]static extern int Usleep(int us);
+
 - static string Brand()
   - CPU 品牌字符串，如 "Intel(R) Core(TM) i7-10750H CPU @
     2.60GHz"。读取失败时为空。
@@ -87,6 +91,23 @@ IOKit/ioreg），仍抛出 PlatformNotSupportedException。
   - 枚举所有安装类中存在和不存在的设备。仅 Windows 有
     区别（All() 还包含历史幽灵设备节点）；Linux sysfs 只暴露当前
     存在的设备，All() 与 Present() 结果相同。
+
+- static bool HasIndirectDisplayAdapter()
+  - 当前机器是否装了 IDD 间接显示适配器（向日葵
+    OrayIddDriver、GameViewer 虚拟显示适配器等远程控屏/虚拟屏
+    驱动）。判定依据：Display 类设备的 hardwareIds/实例 ID 含
+    IDD 标识或已知厂商根。CEF 的 DirectComposition 交换链在这类
+    机器上会让 GPU 子进程连崩（A50-4），宿主可据此自动降级。
+    非 Windows 恒 false。
+
+- static string DisplayClassGuid="{ 4D36E968E32511CEBFC108002BE10318}";
+  - Display 类安装 GUID
+    {4d36e968-e325-11ce-bfc1-08002be10318}（含虚拟显示适配器）。
+
+- static List<string> IddMarkers()
+  - 已知 IDD/虚拟显示适配器标识（小写比较）。
+
+- static bool WinHasIddAdapter()
 
 - static List<DeviceInfo> List(bool presentOnly)
   - 枚举所有安装类。presentOnly=true 等价 Present()，

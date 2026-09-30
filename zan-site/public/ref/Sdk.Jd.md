@@ -1,6 +1,6 @@
 # Sdk.Jd
 
-> 源码: `stdlib/Sdk/Jd/JdClient.zan`, `stdlib/Sdk/Jd/JdException.zan`, `stdlib/Sdk/Jd/JdRequest.zan`, `stdlib/Sdk/Jd/JdResponse.zan`, `stdlib/Sdk/Jd/JdSign.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/JdClient.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/JdException.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/JdRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/JdResponse.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/JdSign.zan`
 
 
 ## JdClient (class)

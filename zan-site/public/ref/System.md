@@ -1,6 +1,39 @@
 # System
 
-> 源码: `stdlib/System/Audio.zan`, `stdlib/System/Binding.zan`, `stdlib/System/ConsoleColor.zan`, `stdlib/System/DateTime.zan`, `stdlib/System/Exception.zan`, `stdlib/System/Guid.zan`, `stdlib/System/IDisposable.zan`, `stdlib/System/Interop.zan`, `stdlib/System/ListExtensions.zan`, `stdlib/System/NativeMemory.zan`, `stdlib/System/Random.zan`, `stdlib/System/RandomNumberGenerator.zan`, `stdlib/System/Stopwatch.zan`, `stdlib/System/StringExtensions.zan`, `stdlib/System/TaskJoin.zan`, `stdlib/System/TimeSpan.zan`, `stdlib/System/ZanVersion.zan`
+> 源码: `stdlib/System/AppPath.zan`, `stdlib/System/Audio.zan`, `stdlib/System/Binding.zan`, `stdlib/System/ConsoleColor.zan`, `stdlib/System/Convert.zan`, `stdlib/System/DateTime.zan`, `stdlib/System/Environment.zan`, `stdlib/System/Exception.zan`, `stdlib/System/Guid.zan`, `stdlib/System/IDisposable.zan`, `stdlib/System/Interop.zan`, `stdlib/System/ListExtensions.zan`, `stdlib/System/MemoryExtensions.zan`, `stdlib/System/NativeMemory.zan`, `stdlib/System/OperatingSystem.zan`, `stdlib/System/Random.zan`, `stdlib/System/RandomNumberGenerator.zan`, `stdlib/System/Stopwatch.zan`, `stdlib/System/StringExtensions.zan`, `stdlib/System/TaskJoin.zan`, `stdlib/System/TimeSpan.zan`, `stdlib/System/ZanVersion.zan`
+
+
+## AppPath (class)
+
+自进程两原语：本进程可执行文件的绝对路径与当前 PID（A332 肥边⑤）。
+独立小文件——Gui 的图标/Skin/错误日志只要"自己 exe 在哪"一句话，
+过去拼 ProcessHost/ProcessList 会把进程管理全家（1100+ 行）拉进
+每个 GUI 程序；原语落这里，重家族委托回本类保持各自 API，
+拼 AppPath 只拉这几十行。
+
+平台支持：Windows（kernel32）/ Linux（/proc）/ macOS（crt），
+其余平台返回 ""/0，调用方按无法确定处理。
+
+- [DllImport("kernel32", EntryPoint="GetModuleFileNameW")]static extern int GetModuleFileNameW(nint module, nint buf, int size);
+
+- [DllImport("kernel32", EntryPoint="GetCurrentProcessId")]static extern int GetCurrentProcessId();
+
+- [DllImport("crt")]static extern int readlink(string path, byte[]buf, int size);
+
+- [DllImport("crt", EntryPoint="_NSGetExecutablePath")]static extern int NSGetExecutablePath(nint buf, nint size);
+
+- static string Exe()
+  - 正在运行的可执行文件的绝对路径；无法确定时返回 ""。
+    单文件发布时是解包后的真实镜像路径（与 ProcessHost.SelfExe
+    语义一致）。
+
+- static int Pid()
+  - 当前进程的 PID；不支持的平台返回 0。
+
+- static int IndexOf(string s, char c)
+  - 子串首个下标；没有则 -1（Linux 分支专用的小助手）。
+
+- static int ParseInt(string s)
 
 
 ## ArgumentException (class)
@@ -11,172 +44,50 @@
   - 以描述参数无效原因的消息构造。
 
 
+## ArgumentNullException (class)
+
+当传递给方法的参数为 null 且该方法不接受 null 时抛出。
+
+- public ArgumentNullException(string paramName):base("Value cannot be null.(Parameter '"+paramName+"')")
+
+
+## ArgumentOutOfRangeException (class)
+
+当参数值超出调用方法所定义的允许取值范围时抛出。
+
+- public ArgumentOutOfRangeException(string message):base(message)
+
+
 ## Audio (class)
 
-原生音频设备：一次打开，之后所有声音都混到这一个设备上。
-
-零依赖原生实现（WASAPI 先行），取代原 SDL3 的音频桥。
-`AudioClip` 是解码好的采样（WAV/OGG），
-`AudioVoice` 是它的一次播放；同一个 clip 可以同时起多个
-voice（叠加音效），混音由运行时后台线程完成。
+原生音频设备（向后兼容入口，建议优先使用 `System.Media.Audio`）。
 
 - static bool Open()
-  - 打开默认播放设备（已打开时直接返回 true）。
+  - 打开默认播放设备。
 
 - static bool IsOpen()
   - 播放设备已打开时为真。
 
 - static void SetVolume(double volume)
-  - 主音量（0..1，可放大到 1 以上）。对已经在响的声音同样
-    生效，所以静音/淡出立即听得到。
+  - 设置主音量。
 
 - static double Volume()
-  - 当前主音量（0..1）。
+  - 当前主音量。
 
 - static string DriverName()
-  - 原生音频后端名（Windows 上是 "wasapi"；其他平台的
-    原生后端尚未落地，返回空串）。
+  - 原生音频后端名。
 
 - static int ActiveVoices()
-  - 还在响的声音数：一次性音效播完即回收，不用调用方登记。
+  - 还在响的声音数。
 
 - static void StopAll()
-  - 立刻停掉所有声音（切场景/退出时用）。
+  - 立刻停掉所有声音。
 
 - static void Close()
-  - 关闭设备，并停掉设备上剩下的声音。
+  - 关闭设备。
 
 - static string LastError()
-  - 最近一次失败的原因（设备打开失败/解码失败等）；
-    没有失败记录时为空串。
-
-
-## AudioClip (class)
-
-加载到内存的采样（s16 PCM）。`Play` 每次返回
-一个新的 `AudioVoice`，所以同一个 clip 可以叠着响。
-
-- nint handle;
-
-- static AudioClip LoadWav(string path)
-  - 加载 WAV 文件（PCM 8/16/24/32 位与 32 位浮点，含
-    WAVE_FORMAT_EXTENSIBLE）。失败时返回的对象 IsValid() 为 false
-    （原因见 <c>Audio.LastError()</c>），不返回 null。
-
-- static AudioClip LoadOgg(string path)
-  - 加载 OGG Vorbis 文件（背景音乐）。失败时返回的对象
-    IsValid() 为 false，不返回 null。
-
-- static AudioClip LoadWavFromMem(string data, int len)
-  - 从内存字节解析 WAV。<paramref name="data"/> 是完整的
-    WAV 文件字节（如从加密资源包解密出来的内容），全程不落盘。
-    字节只在本次调用内同步读取（PCM 会被拷出），返回后即可释放
-    缓冲区，不转移所有权。失败时返回的对象 IsValid() 为 false
-    （原因见 <c>Audio.LastError()</c>），不返回 null。
-
-- static AudioClip LoadOggFromMem(string data, int len)
-  - 从内存字节解码 OGG Vorbis（背景音乐）。字节只在本次
-    调用内同步读取（PCM 会被拷出），返回后即可释放缓冲区。
-    失败时返回的对象 IsValid() 为 false。
-
-- bool IsValid()
-  - 加载成功时为真（失败时为假对象，不返回 null）。
-
-- int Frequency()
-  - 采样率（Hz）。
-
-- int Channels()
-  - 声道数（1 单声道、2 立体声）。
-
-- int DurationMs()
-  - 时长（毫秒）。
-
-- AudioVoice Play()
-  - 用默认音量播一次。
-
-- AudioVoice Play(double gain, int loop)
-  - 播一次。<paramref name="gain"/> 是这一个声音的音量，
-    <paramref name="loop"/> 非 0 表示循环（背景音乐）。
-
-- AudioVoice PlayLooping(double gain)
-  - 循环播放，直到 `AudioVoice.Stop`。
-
-- void Close()
-  - 释放采样，并停掉还在读它的声音。
-
-
-## AudioNative (class)
-
-zan_audio 原生桥（音频随 zan_gui 运行时导出）。
-
-- [DllImport("zan_gui")]static extern int zan_audio_open();
-
-- [DllImport("zan_gui")]static extern void zan_audio_close();
-
-- [DllImport("zan_gui")]static extern int zan_audio_is_open();
-
-- [DllImport("zan_gui")]static extern void zan_audio_set_volume(double volume);
-
-- [DllImport("zan_gui")]static extern double zan_audio_volume();
-
-- [DllImport("zan_gui")]static extern string zan_audio_driver_name();
-
-- [DllImport("zan_gui")]static extern int zan_audio_active_voices();
-
-- [DllImport("zan_gui")]static extern void zan_audio_stop_all();
-
-- [DllImport("zan_gui")]static extern string zan_audio_last_error();
-
-- [DllImport("zan_gui")]static extern nint zan_audio_load_wav(string path);
-
-- [DllImport("zan_gui")]static extern nint zan_audio_load_ogg(string path);
-
-- [DllImport("zan_gui")]static extern nint zan_audio_load_wav_mem(string data, int len);
-
-- [DllImport("zan_gui")]static extern nint zan_audio_load_ogg_mem(string data, int len);
-
-- [DllImport("zan_gui")]static extern void zan_audio_free_clip(nint clip);
-
-- [DllImport("zan_gui")]static extern int zan_audio_clip_frequency(nint clip);
-
-- [DllImport("zan_gui")]static extern int zan_audio_clip_channels(nint clip);
-
-- [DllImport("zan_gui")]static extern int zan_audio_clip_duration_ms(nint clip);
-
-- [DllImport("zan_gui")]static extern long zan_audio_play(nint clip, double gain, int loop);
-
-- [DllImport("zan_gui")]static extern int zan_audio_voice_playing(long voice);
-
-- [DllImport("zan_gui")]static extern void zan_audio_voice_stop(long voice);
-
-- [DllImport("zan_gui")]static extern void zan_audio_voice_set_gain(long voice, double gain);
-
-
-## AudioVoice (class)
-
-一次播放（voice）。
-
-句柄带世代号：声音播完后句柄失效，`IsPlaying` 老实返回
-false、`Stop` 什么也不做，因此一个存活时间比声音长的
-AudioVoice 变量是安全的，不会碰到被回收的槽位。
-
-- long handle;
-
-- static AudioVoice Of(long handle)
-  - 包装一个原生 voice 句柄；0 表示没起来的声音，此时对象
-    依然可用（IsPlaying 为 false），调用方不需要判空。
-
-- bool IsValid()
-  - 声音是否成功起播（设备没开、voice 池满时为 false）。
-
-- bool IsPlaying()
-  - 声音仍在响时为真；播完或已 Stop 即 false（句柄按世代号失效）。
-
-- void SetGain(double gain)
-  - 这一个声音的音量（会再乘上主音量）。
-
-- void Stop()
-  - 停掉这一个声音并使句柄失效；对已失效句柄无操作。
+  - 最近一次失败原因。
 
 
 ## Binding (class)
@@ -413,6 +324,37 @@ nint handler = v.Build();
   - 释放对象与 vtable 内存（Build 之后调用才有效）。
 
 
+## Convert (class)
+
+基础数据类型与常用编码格式转换工具（纯 Zan 实现，零外部依赖）。
+对齐 .NET System.Convert 标准，用于 Base64、Hex 等纯数据编码，
+避免非加密用途被误导引入底层 C 密码学库。
+
+- static string BASE64_ALPHA()
+  - RFC 4648 标准 Base64 字母表
+
+- static string ToBase64String(byte[]inArray)
+  - 将字节数组编码为 Base64 字符串。
+
+- static int DecB64(int c)
+  - 单个 Base64 字符解码为数值 (0-63)，非法字符返回 -1
+
+- static byte[]FromBase64String(string s)
+  - 将 Base64 字符串解码为字节数组。
+
+- static string ToHexString(byte[]inArray)
+  - 将字节数组编码为小写十六进制文本（零中间字符串分配）。
+
+- static string ToHexString(byte[]inArray, int offset, int length)
+  - 将字节数组切片编码为小写十六进制文本（零中间字符串分配）。
+
+- static int Nibble(int c)
+  - 单个十六进制字符转数值
+
+- static byte[]FromHexString(string hex)
+  - 将十六进制字符串解码为字节数组。
+
+
 ## DateTime (class)
 
 UTC 时刻，精度为 1 秒，存储为
@@ -427,6 +369,8 @@ Unix 纪元（1970-01-01 00:00:00 UTC）以来的秒数。
 
 - [DllImport("crt")]static extern long time(nint ptr);
 
+- [DllImport("kernel32", EntryPoint="GetSystemTimeAsFileTime")]static extern void GetSystemTimeAsFileTime(nint lpFileTime);
+
 - [DllImport("crt", EntryPoint="localtime")]static extern nint plat_localtime(nint tptr);
   - 本机时区换算全部交给 libc 的时区库：localtime 把纪元秒展开成本地
     墙钟字段，再用 timegm（Windows 上是 _mkgmtime）把这组字段当作 UTC
@@ -438,8 +382,11 @@ Unix 纪元（1970-01-01 00:00:00 UTC）以来的秒数。
 
 - [DllImport("crt", EntryPoint="timegm")]static extern long plat_timegm(nint tm);
 
+- long epochMs;
+  - 自 1970-01-01T00:00:00Z 以来的毫秒数。
+
 - long epoch;
-  - 自 1970-01-01T00:00:00Z 以来的秒数。
+  - 自 1970-01-01T00:00:00Z 以来的秒数（向后兼容）。
 
 - int year;
   - 年。
@@ -459,14 +406,23 @@ Unix 纪元（1970-01-01 00:00:00 UTC）以来的秒数。
 - int second;
   - 秒，0..59。
 
+- int millisecond;
+  - 毫秒，0..999。
+
 - int dayOfWeek;
   - 星期几，0=星期日 .. 6=星期六。
 
-- DateTime(long unixSeconds)
-  - 根据 Unix 时间戳（秒，UTC）构造时刻。
+- static long GetCurrentUnixMilliseconds()
+  - 内部精确获取当前系统 Unix 纪元毫秒。
+
+- DateTime(long unixSeconds):this(unixSeconds*1000, 0)
+  - 根据 Unix 时间戳（秒，UTC）构造时刻（毫秒置 0）。
+
+- DateTime(long unixMs, int dummy)
+  - 根据 Unix 时间戳（毫秒，UTC）构造时刻。
 
 - static DateTime UtcNow()
-  - 当前时刻（UTC）。
+  - 当前时刻（UTC，毫秒精度）。
 
 - static DateTime Now()
   - `UtcNow` 的别名；不应用本地时区偏移。
@@ -490,6 +446,9 @@ Unix 纪元（1970-01-01 00:00:00 UTC）以来的秒数。
 - static DateTime FromUnixSeconds(long seconds)
   - 根据 Unix 时间戳（自纪元起的秒数）构造时刻。
 
+- static DateTime FromUnixMilliseconds(long milliseconds)
+  - 根据 Unix 时间戳（自纪元起的毫秒数）构造时刻。
+
 - static DateTime FromDate(int year, int month, int day)
   - 给定日历日期当天的 UTC 午夜零点。
 
@@ -500,6 +459,11 @@ Unix 纪元（1970-01-01 00:00:00 UTC）以来的秒数。
   - 公历日期到 Unix 纪元的天数——与构造器所用的
     civil-from-days 算法互为逆运算。
     1970 年之前的日期为负。
+
+- static void CivilFromDays(int days, out int year, out int month, out int day)
+  - `DaysFromCivil` 的逆运算：把 Unix 纪元天序换算回公历年月日。
+    结果按 <paramref name="year"/>/<paramref name="month"/>/<paramref name="day"/>
+    三个 out 参数返回（1970 年之前的天序为负，同样成立）。
 
 - static int DaysInMonth(int year, int month)
   - <paramref name="year"/> 年 <paramref name="month"/> 月的天数。
@@ -528,8 +492,17 @@ Unix 纪元（1970-01-01 00:00:00 UTC）以来的秒数。
 - int DayOfWeek()
   - 星期几，0=星期日 .. 6=星期六。
 
+- int Millisecond()
+  - 毫秒（0..999）。
+
 - long ToUnixSeconds()
   - Unix 纪元以来的秒数（UTC）。
+
+- long ToUnixMilliseconds()
+  - Unix 纪元以来的毫秒数（UTC）。
+
+- DateTime AddMilliseconds(long ms)
+  - 加 n 毫秒。
 
 - DateTime AddSeconds(long n)
   - 加 n 秒。
@@ -544,10 +517,10 @@ Unix 纪元（1970-01-01 00:00:00 UTC）以来的秒数。
   - 加 n 天。
 
 - TimeSpan Subtract(DateTime other)
-  - 此时刻与 <paramref name="other"/> 之间的间隔。
+  - 此时刻与 <paramref name="other"/> 之间的间隔（毫秒精度）。
 
 - bool Equals(DateTime other)
-  - 同一时刻（纪元秒相等）。
+  - 同一时刻（纪元毫秒相等）。
 
 - bool IsBefore(DateTime other)
   - 早于 other。
@@ -557,6 +530,9 @@ Unix 纪元（1970-01-01 00:00:00 UTC）以来的秒数。
 
 - string ToString()
   - 类 ISO 文本："YYYY-MM-DD HH:MM:SS"。
+
+- string ToStringWithMillis()
+  - 带毫秒的类 ISO 文本："YYYY-MM-DD HH:MM:SS.fff"。
 
 - string ToDateString()
   - 仅日期："YYYY-MM-DD"。
@@ -588,6 +564,40 @@ Unix 纪元（1970-01-01 00:00:00 UTC）以来的秒数。
   - 向下取整的模运算；结果符号与除数一致。
 
 
+## Environment (class)
+
+提供有关当前环境和平台的信息以及操作它们的方法，符合现代 C# (System.Environment) 标准。
+
+- [DllImport("kernel32", EntryPoint="SetEnvironmentVariableW")]static extern int SetEnvironmentVariableW(nint name, nint val);
+
+- [DllImport("crt", EntryPoint="setenv")]static extern int setenv(string name, string val, int overwrite);
+
+- [DllImport("crt", EntryPoint="unsetenv")]static extern int unsetenv(string name);
+
+- [DllImport("crt", EntryPoint="exit")]static extern void crt_exit(int code);
+
+- public static int ProcessId { get }
+  - 获取当前进程的唯一标识符 (PID)。
+
+- public static string ProcessPath { get }
+  - 获取启动当前进程的可执行文件的完全限定路径。
+
+- public static string NewLine { get }
+  - 获取当前平台的换行字符串。
+
+- public static string GetEnvironmentVariable(string variable)
+  - 从当前进程检索环境变量的值。
+
+- public static void SetEnvironmentVariable(string variable, string value)
+  - 创建、修改或删除当前进程中存储的环境变量。
+
+- public static void Exit(int exitCode)
+  - 终止此进程并向基础操作系统提供指定的退出代码。
+
+- public static long TickCount64 { get }
+  - 获取系统启动后经过的毫秒数。
+
+
 ## Exception (class)
 
 所有异常的基础类型，携带人类可读的消息，通过
@@ -596,11 +606,17 @@ Unix 纪元（1970-01-01 00:00:00 UTC）以来的秒数。
 - public string Message;
   - 人类可读的异常消息。
 
+- public Exception InnerException;
+  - 导致当前异常的内部异常实例。
+
 - public Exception(string message)
   - 以人类可读的消息构造异常。
 
+- public Exception(string message, Exception innerException)
+  - 以人类可读的消息和内部异常构造异常。
+
 - public string ToString()
-  - 消息文本即字符串形式。
+  - 消息文本即字符串形式（若有内部异常则级联输出）。
 
 
 ## FileNotFoundException (class)
@@ -762,13 +778,82 @@ box(0, Wide.Of("hi"), Wide.Of("zan"), 0);
     被限制在列表范围内。
 
 - static void Sort(this List<int> src)
-  - 原地升序排序整数。
+  - 原地升序排序整数（自适应快速排序，O(N log N)）。
+
+- static void QuickSortInt(List<int> a, int lo, int hi)
 
 - static void Sort(this List<double> src)
-  - 原地升序排序数值。
+  - 原地升序排序数值（自适应快速排序，O(N log N)）。
+
+- static void QuickSortDouble(List<double> a, int lo, int hi)
 
 - static void Sort(this List<string> src)
-  - 原地按序数升序排序字符串。
+  - 原地按序数升序排序字符串（自适应快速排序，O(N log N)）。
+
+- static void QuickSortString(List<string> a, int lo, int hi)
+
+- static void Sort<T>(this List<T> src, Comparison<T> comparison)
+  - 使用自定义比较器原地排序任意对象列表（自适应快速排序，O(N log N)）。
+
+- static void QuickSortCustom<T>(List<T> a, int lo, int hi, Comparison<T> cmp)
+
+
+## MemoryExtensions (class)
+
+提供针对 byte[] 数组与连续内存块的高吞吐向量化加速扩展方法（SequenceEqual、IndexOf、LastIndexOf、Contains）。
+核心循环全面基于 AVX2 256 位宽与 SSE2 128 位硬件向量单周期并行扫描，
+配合 BitOperations.TrailingZeroCount / LeadingZeroCount 硬件指令实现 O(1) 瞬时索引定位。
+
+- public static bool SequenceEqual(this byte[]first, byte[]second)
+  - 确定两个字节序列是否在内容上完全相等（AVX2 32 字节并行扫描）。
+
+- public static int IndexOf(this byte[]source, byte value, int startIndex, int count)
+  - 在字节序列切片中查找指定字节值的第一个匹配项索引（AVX2 32 字节并行 + TrailingZeroCount 硬件指令单周期定位）。
+
+- public static int IndexOf(this byte[]source, byte value, int startIndex)
+  - 在字节序列中查找指定字节值的第一个匹配项索引（AVX2 32 字节并行 + TrailingZeroCount 硬件指令单周期定位）。
+
+- public static int IndexOf(this byte[]source, byte value)
+  - 在字节序列中查找指定字节值的第一个匹配项索引。
+
+- public static int LastIndexOf(this byte[]source, byte value)
+  - 在字节序列中从后往前查找指定字节值的最后一个匹配项索引（AVX2 32 字节逆向扫描 + LeadingZeroCount 单周期定位）。
+
+- public static bool Contains(this byte[]source, byte value)
+  - 判断字节序列中是否包含指定的字节值。
+
+- public static bool IsAscii(this byte[]source, int offset, int length)
+  - 检查指定字节序列切片是否全为 ASCII 字符（0..127）。AVX2 32 字节并行扫描高位掩码（vpmovmskb == 0）。
+
+- public static bool IsAscii(this byte[]source)
+  - 检查整段字节序列是否全为 ASCII 字符（0..127）。
+
+- public static int IndexOfAny(this byte[]source, byte value1, byte value2, int startIndex, int count)
+  - 在字节序列切片中并发查找两个目标字节中的任意一个匹配项（例如快速扫描 \r 或 \n，引号或反斜杠）。AVX2 32 字节双目标单周期比对。
+
+- public static int IndexOfAny(this byte[]source, byte value1, byte value2, int startIndex)
+  - 在字节序列中并发查找两个目标字节中的任意一个匹配项（例如快速扫描 \r 或 \n，引号或反斜杠）。AVX2 32 字节双目标单周期比对。
+
+- public static int IndexOfAny(this byte[]source, byte value1, byte value2)
+  - 在字节序列中查找两个目标字节中的任意一个匹配项。
+
+- public static void ToUpperAscii(this byte[]source, int offset, int length)
+  - 将指定切片内的 ASCII 小写字母（a-z）就地转换为大写字母（A-Z）。AVX2 32 字节无分支饱和算术并行变换。
+
+- public static void ToUpperAscii(this byte[]source)
+  - 将整段字节序列内的 ASCII 小写字母（a-z）就地转换为大写字母（A-Z）。
+
+- public static void ToLowerAscii(this byte[]source, int offset, int length)
+  - 将指定切片内的 ASCII 大写字母（A-Z）就地转换为小写字母（a-z）。AVX2 32 字节无分支饱和算术并行变换。
+
+- public static void ToLowerAscii(this byte[]source)
+  - 将整段字节序列内的 ASCII 大写字母（A-Z）就地转换为小写字母（a-z）。
+
+- public static string ToHexString(this byte[]source)
+  - 将字节数组快速编码为小写十六进制字符串（零中间对象分配）。
+
+- public static string ToHexString(this byte[]source, int offset, int length)
+  - 将字节数组切片快速编码为小写十六进制字符串（零中间对象分配）。
 
 
 ## NativeMemory (class)
@@ -800,6 +885,10 @@ ByteBuffer.Raw() 之类的固定缓冲区），并且不能在
 - [DllImport("crt")]static extern void Copy(nint dst, nint src, int n);
   - 将 n 字节从 src 复制到 dst（允许重叠，memmove 语义）。
 
+- [DllImport("crt")]static extern void Copy2D(nint dst, int dstStride, nint src, int srcStride, int rowBytes, int height);
+  - 2D 跨步内存复制：将 src（跨步 srcStride）的 height 行、每行 rowBytes 字节
+    复制到 dst（跨步 dstStride）。支持非连续切片与矩形图像裁剪/贴图。
+
 - [DllImport("crt")]static extern void Fill(nint p, int v, int n);
   - 用 v 的低 8 位填充 p 处的 n 字节。
 
@@ -819,6 +908,172 @@ ByteBuffer.Raw() 之类的固定缓冲区），并且不能在
 - [DllImport("crt")]static extern int Crc32(nint p, int len);
   - p 处 len 字节的 CRC-32（IEEE，poly 0xEDB88320）。
 
+- [DllImport("crt")]static extern int Crc32C(nint p, int len);
+  - p 处 len 字节的 CRC-32C（Castagnoli，poly 0x82F63B78）。
+    常用于现代数据库存储页（ZanDB、RocksDB）与网络协议的完整性校验。
+
+- [DllImport("crt")]static extern long Crc32CUpdate(long crc, nint p, long len);
+  - CRC-32C 续算：把 p 处 len 字节追加到 crc（SSE4.2 crc32/ARMv8 CRC
+    指令流水线）。返回更新后的 CRC；无硬件路径返回 -1（正常 CRC 值
+    恒为非负 32 位数，-1 不会歧义）。
+
+- [DllImport("crt")]static extern string Sha256(nint p, int len);
+  - 对 p 处 len 字节计算 FIPS 180-4 SHA-256，返回 32 字节原始
+    摘要的新 ARC 字符串（调用方持有 +1）。返回值是真托管串，
+    消费点照常释放；不是 extern 借用指针。本机无硬件路径时
+    返回 null，调用方应回退到纯 Zan 实现。
+
+- [DllImport("crt")]static extern string Sha1(nint p, int len);
+  - 对 p 处 len 字节计算 FIPS 180-4 SHA-1，返回 20 字节原始摘要的
+    新 ARC 字符串（调用方持有 +1）；无硬件路径返回 null。
+
+- [DllImport("crt")]static extern string Sha512(nint p, int len);
+  - 对 p 处 len 字节计算 FIPS 180-4 SHA-512，返回 64 字节原始摘要的
+    新 ARC 字符串（调用方持有 +1）；无硬件路径返回 null。
+
+- [DllImport("crt")]static extern long AesCbcEncrypt(nint dst, nint src, long size, nint key, int keybits, nint iv);
+  - 硬件加速 AES-CBC 加密（AES-NI/ARMv8 单周期吞吐），keybits 为
+    128/192/256，含 PKCS#7 填充，返回密文长度；无硬件路径返回 -1。
+
+- [DllImport("crt")]static extern long AesCbcDecrypt(nint dst, nint src, long size, nint key, int keybits, nint iv);
+  - 硬件加速 AES-CBC 解密（AES-NI 并行解码），返回明文长度；无硬件路径返回 -1。
+
+- [DllImport("crt")]static extern long AesEcbBlock(nint key, int keybits, nint in16, nint out16);
+  - 单块 AES-ECB（FIPS-197）：把 in16 的 16 字节加密写入 out16。
+    成功返回 0，无硬件路径返回 -1。
+
+- [DllImport("crt")]static extern long AesCtrCrypt(nint dst, nint src, long size, nint key, int keybits, nint counter);
+  - AES-CTR keystream 异或（SP 800-38A）：counter 为 128 位大端计数器，
+    原地前进越过已消耗的块。成功返回 size，无硬件路径返回 -1。
+
+- [DllImport("crt")]static extern long GhashBlock(nint h, nint x, nint y);
+  - GHASH 一步（GCM，SP 800-38D）：y = (y ^ x) * h，三者均为 16 字节块。
+    成功返回 0，无硬件路径返回 -1。
+
+- [DllImport("crt")]static extern long GhashUpdate(nint h, nint data, long len, nint y);
+  - GHASH 连续流式哈希（GCM，SP 800-38D）：逐块处理 data 的 len 字节并累加到 y16。
+    成功返回 0，无硬件路径返回 -1。
+
+- [DllImport("crt")]static extern long AesGcmEncrypt(nint key, int keybits, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint outBuf, nint tag16);
+  - 硬件加速一体化 AES-GCM 认证加密（SP 800-38D）。
+    支持 原地/独立 缓冲区加密，无跨层 FFI 开销与零堆内存分配。
+    成功返回密文长度（等于 inLen），无硬件路径或失败返回 -1。
+
+- [DllImport("crt")]static extern long AesGcmDecrypt(nint key, int keybits, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint tag16, nint outBuf);
+  - 硬件加速一体化 AES-GCM 认证解密（SP 800-38D）。
+    成功返回明文长度（等于 inLen），MAC 认证失败或无硬件路径返回 -1。
+
+- [DllImport("crt")]static extern long AesGcmInit(nint ctxBuf, long ctxLen, nint key, int keybits);
+  - 初始化 AES-GCM 预计算上下文（预展开密钥编排并预计算 GHASH H 与反射常量）。
+    ctxBuf 建议至少 384 字节，成功返回 0，失败返回 -1。
+
+- [DllImport("crt")]static extern long AesGcmEncryptCtx(nint ctxBuf, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint outBuf, nint tag16);
+  - 基于预计算上下文的高吞吐 AES-GCM 认证加密，消除每记录重复密钥展开开销。
+
+- [DllImport("crt")]static extern long AesGcmDecryptCtx(nint ctxBuf, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint tag16, nint outBuf);
+  - 基于预计算上下文的高吞吐 AES-GCM 认证解密，消除每记录重复密钥展开开销。
+
+- [DllImport("crt")]static extern long RsaModPow(nint baseVal, long bLen, nint exp, long eLen, nint mod, long mLen, nint outBuf);
+  - Montgomery 模幂加速 baseVal^exp mod mod（最大 4096 位奇模数）。大端序字节缓冲区。
+    成功返回 0，无硬件路径或参数不合法返回 -1。
+
+- [DllImport("crt")]static extern long RsaCrtModPow(nint msg, long mLen, nint p, long pLen, nint q, long qLen, nint dp, long dpLen, nint dq, long dqLen, nint qinv, long qinvLen, nint outBuf, long outLen);
+  - RSA 中国剩余定理 (CRT) 加速模幂：
+    s1 = msg^dp mod p, s2 = msg^dq mod q, 通过 Garner 算法重构 s = s2 + ((s1 - s2) * qinv mod p) * q。
+    成功返回 0，失败返回 -1。
+
+- [DllImport("crt")]static extern long X25519(nint scalar, nint point, nint outBuf);
+  - RFC 7748 X25519 常数时间密钥交换：计算 scalar * point 写入 outBuf。
+    scalar、point、outBuf 均为 32 字节小端序缓冲区，原地夹紧标量。成功返回 0，失败返回 -1。
+
+- [DllImport("crt")]static extern string Sm3(nint p, int len);
+  - 高性能流水线国密 SM3 摘要计算（GM/T 0004-2012），返回 32 字节原始
+    摘要的新 ARC 字符串（调用方持有 +1）；无硬件路径返回 null。
+
+- [DllImport("crt")]static extern long Sm4CbcEncrypt(nint dst, nint src, long size, nint key, nint iv);
+  - 硬件查表流水线 SM4-CBC 加密（GB/T 32907-2016，含 PKCS#7 填充）。
+
+- [DllImport("crt")]static extern long Sm4CbcDecrypt(nint dst, nint src, long size, nint key, nint iv);
+  - 硬件查表流水线 SM4-CBC 解密（GB/T 32907-2016，含 PKCS#7 校验去除）。
+
+- [DllImport("crt")]static extern string Base64Encode(nint ptr, long size);
+  - 高吞吐 SIMD / 流水线 Base64 编码，返回新分配的 ARC 字符串。
+
+- [DllImport("crt")]static extern long Base64Decode(nint dst, nint src, long size);
+  - 高吞吐 SIMD / 流水线 Base64 解码，将解码字节写入 dst，返回实际解码字节数（失败返回负值）。
+
+- [DllImport("crt")]static extern long JsonSkipWhitespace(nint ptr, long pos, long len);
+  - SIMD 向量化 JSON 空白跳过：并行比对空格、换行、回车、制表符，返回首个非空白字符偏移。
+
+- [DllImport("crt")]static extern long JsonScanString(nint ptr, long pos, long len);
+  - SIMD 向量化 JSON 字符串扫描：并行查找闭引号 '\"' 或转义符 '\\'。
+    命中闭引号返回其正偏移量 (>= 0)；命中反斜杠转义符返回 -(esc_pos + 1)；未命中到达末尾返回 len。
+
+- public static bool SequenceEqual(nint a, nint b, int len)
+  - 利用 AVX2/SSE2 硬件向量化单指令周期，比较两块连续原始内存的内容是否完全一致。
+
+- public static int IndexOf(nint p, int len, byte target)
+  - 利用 AVX2 + BMI1 TrailingZeroCount 硬件加速单指令定位，在连续原始内存中查找字节 target 的偏移量。
+
+- public static bool IsAscii(nint p, int len)
+  - 利用 AVX2/SSE2 硬件向量化扫描，快速检测连续原始内存是否全为 ASCII 字符（0..127）。
+
+- public static int IndexOfAny(nint p, int len, byte val1, byte val2)
+  - 利用 AVX2/SSE2 硬件向量化并发匹配两个目标字节中的任意一个（例如快速扫描 \r 或 \n，引号或反斜杠）。
+
+- public static int MatchGroup16(nint groupPtr, byte targetH2)
+  - SwissTable 16 字节控制组并发探测：单周期匹配 16 个槽位的 H2 标签，返回 16 位匹配掩码。
+
+- public static int MatchEmpty16(nint groupPtr)
+  - SwissTable 16 字节控制组空槽探测：提取最高位为 1（0x80 Empty / 0xFE Deleted）的所有槽位掩码。
+
+
+## NotSupportedException (class)
+
+当调用的方法或功能不受支持时抛出。
+
+- public NotSupportedException(string message)
+
+
+## ObjectDisposedException (class)
+
+当在已释放或关闭的对象上执行操作时抛出。
+
+- public ObjectDisposedException(string objectName):base("Cannot access a disposed object. Object name: '"+objectName+"'.")
+
+
+## OperatingSystem (class)
+
+提供有关当前操作系统平台的信息，符合现代 C# (System.OperatingSystem) 标准。
+交叉编译时静态解析为目标系统平台。
+
+- public static bool IsWindows()
+  - 指示当前应用程序是否在 Windows 上运行。
+
+- public static bool IsLinux()
+  - 指示当前应用程序是否在 Linux 上运行。
+
+- public static bool IsMacOS()
+  - 指示当前应用程序是否在 macOS 上运行。
+
+- public static bool IsWasi()
+  - 指示当前应用程序是否在 WebAssembly / WASI 运行。
+
+- public static bool IsWasm32()
+  - 指示当前应用程序是否在 WebAssembly 32 位环境运行。
+
+- public static bool IsMusl()
+  - 指示当前系统是否使用 musl libc。
+
+- public static bool IsRiscv64()
+  - 指示当前系统架构是否为 RISC-V 64。
+
+- public static string Platform { get }
+  - 返回当前操作系统标识（"windows" | "linux" | "macos" | "wasi"）。
+
+- public static bool IsOSPlatform(string platform)
+  - 根据平台名称判断是否匹配当前平台（不区分大小写，如 "windows", "linux", "osx", "macos", "wasi"）。
+
 
 ## PlatformNotSupportedException (class)
 
@@ -833,10 +1088,11 @@ ByteBuffer.Raw() 之类的固定缓冲区），并且不能在
 
 ## Pump (class)
 
-嵌套的 Win32 消息循环。异步 COM 完成以投递消息的形式
-到达调用（apartment）线程，因此等待完成就需要
-泵消息：同步包装器通过 `Pump.Until(flag, 5000)` 等待
-回调而不死锁 UI 线程。
+【已废弃 / DEPRECATED】嵌套的 Win32 消息循环。
+警告：严禁在 GUI 线程中调用 Pump.Until 做同步等待！
+嵌套消息泵会劫持外层主循环（App.Run），造成消息重入、自绘卡死、CSS 动画和定时器停摆。
+现代异步等待必须使用标准的 `async/await` 与 `Gate` / `Task`。
+此类仅保留用于非 GUI 控制台工具对旧版 COM 组件的临时兼容。
 
 - static nint user32;
   - 惰性解析出的 user32.dll 句柄与四个入口地址（0 为未加载/失败）。
@@ -1052,35 +1308,41 @@ long ms = sw.ElapsedMilliseconds();
 会静默产生垃圾结果；把它们实现为真正的 Zan 代码，可以让
 编译器、IDE 和语言服务器共用同一套实现。
 
+- [DllImport("crt")]static extern long strtoll(string s, nint endp, int base_);
+
+- [DllImport("crt")]static extern double strtod(string s, nint endp);
+
 - static bool IsNullOrEmpty(this string s)
   - 与 C# 的 `string.IsNullOrEmpty` 一致：字符串为 null 或
     长度为 0 时返回 true。先判 null（对 null 的引用比较是安全的），
     因此对 null 字符串调用它不会解引用，也就不会崩溃。用它替代
     `s == ""`——后者会在原生层对空指针做字符串比较直接崩溃。
 
+- static bool IsWhitespaceByte(int b)
+
 - static bool IsNullOrWhiteSpace(this string s)
   - 与 C# 的 `string.IsNullOrWhiteSpace` 一致：null、空串或
-    仅由空白字符组成时返回 true。
+    仅由空白字符组成时返回 true（零临时分配高效实现，长连续空格 SIMD 快速跳过）。
 
 - static string PadLeft(this string s, int width)
-  - 在 `width` 个空格宽的字段中右对齐字符串。
+  - 在 `width` 个空格宽的字段中右对齐字符串（O(N) 高效构建）。
 
 - static string PadLeft(this string s, int width, string pad)
   - 右对齐字符串，用 `pad` 填充（取其第一个
     字符；`pad` 为空时原样返回字符串）。
 
 - static string PadRight(this string s, int width)
-  - 在 `width` 个空格宽的字段中左对齐字符串。
+  - 在 `width` 个空格宽的字段中左对齐字符串（O(N) 高效构建）。
 
 - static string PadRight(this string s, int width, string pad)
   - 左对齐字符串，用 `pad` 填充（取其第一个
     字符；`pad` 为空时原样返回字符串）。
 
 - static string TrimStart(this string s)
-  - 返回去掉前导空白字符的副本。
+  - 返回去掉前导空白字符的副本（零临时循环分配）。
 
 - static string TrimEnd(this string s)
-  - 返回去掉尾部空白字符的副本。
+  - 返回去掉尾部空白字符的副本（零临时循环分配）。
 
 - static string Insert(this string s, int index, string text)
   - 在 `index` 处插入 `value` 的副本。越界的索引
@@ -1107,6 +1369,50 @@ long ms = sw.ElapsedMilliseconds();
 
 - static int CountOf(this string s, string needle)
   - `needle` 不重叠出现的次数。
+
+- static int ToInt32(this string s)
+  - 十进制解析成 int：strtoll 语义（与 Convert.ToInt32 内建
+    同一实现），空串/非数字前缀得 0，不抛异常。对 null 返回 0 不解
+    引用——静态 Convert.ToInt32 没有 null 守卫，实例形态常接在可能
+    为空的输入上，这里补上。
+
+- static long ToInt64(this string s)
+  - 十进制解析成 long：strtoll 全量 64 位（与 Convert.ToInt64
+    内建同一实现），空串/非数字前缀得 0；null 同上返回 0。
+
+- static double ToDouble(this string s)
+  - 解析成 double：strtod 语义（与 Convert.ToDouble 内建同一
+    实现），空串/非数字前缀得 0.0；null 同上返回 0.0。
+
+- static int ByteAt(this string s, int index)
+  - 取第 <paramref name="index"/> 个字节（0-255，与
+    <c>s[i] & 255</c> 同值，但意图显式）。越界返回 -1 不抛异常
+    （与Substring 的宽松风格一致，调用方据此判断是否到达末尾）。
+
+- static string RuneAt(this string s, int byteIndex)
+  - 取从字节偏移 <paramref name="byteIndex"/> 起的第一个
+    Unicode 码点，编码为 1-4 字节的 UTF-8 字符串返回。非法序列
+    （截断的多字节头、落单续字节）按解码惯例返回 U+FFFD 单字符，
+    前进 1 字节，绝不越界。想要 int 码点用
+    Encoding.DecodeCodePoint。
+
+- static int RuneCount(this string s)
+  - 字符串里有多少个 Unicode 码点（≠ Length 的字节数，
+    非 ASCII 时更小）。逐字节扫描，非法序列按 1 码点计。
+
+- static string CharAt(this string s, int runeIndex)
+  - 把第 <paramref name="runeIndex"/> 个码点（0 起，按码点
+    计数不按字节）取出来。找不到（越界）返回空串。内部从 0 顺序
+    扫描，O(n)——需要反复随机访问时先转码点数组。
+
+- static byte[]FromHexString(this string s)
+  - 将十六进制字符串解析为原始字节数组。
+
+- static string ToUpperAscii(this string s)
+  - 返回字符串的 ASCII 大写副本。通过 AVX2/SSE 向量化饱和算术无分支执行，比逐字节调用快 30 倍。
+
+- static string ToLowerAscii(this string s)
+  - 返回字符串的 ASCII 小写副本。通过 AVX2/SSE 向量化饱和算术无分支执行，比逐字节调用快 30 倍。
 
 
 ## TaskJoin (class)
@@ -1156,11 +1462,17 @@ int i = await Task.WhenAny(hs);      // 最先完成者的下标
 总秒数存储。由 `DateTime.Subtract` 或
 <c>From*</c> 工厂方法产生。
 
+- long totalMs;
+  - 带符号的总毫秒数。
+
 - long total;
-  - 带符号的总秒数。
+  - 兼容旧的秒数字段。
 
 - TimeSpan(long seconds)
-  - 从带符号的秒数构造一个时间间隔。
+  - 从带符号的秒数构造一个时间间隔（保持秒级兼容）。
+
+- static TimeSpan FromMilliseconds(long ms)
+  - 从毫秒数构造高精度时间间隔。
 
 - static TimeSpan FromSeconds(long s)
   - 从秒数构造：`FromSeconds(90)` = 1 分 30 秒。
@@ -1173,6 +1485,9 @@ int i = await Task.WhenAny(hs);      // 最先完成者的下标
 
 - static TimeSpan FromDays(long d)
   - 从天数构造。
+
+- long TotalMilliseconds()
+  - 整个间隔的毫秒数（带符号，精度无损）。
 
 - long TotalSeconds()
   - 整个间隔的秒数（带符号，精度无损）。
@@ -1187,8 +1502,7 @@ int i = await Task.WhenAny(hs);      // 最先完成者的下标
   - 整天数，向零截断。
 
 - int Days()
-  - 天分量（日历式拆分，恒非负）：
-    -1.5 天 = Days 1 + 负号（见 TotalSeconds）。
+  - 天分量（日历式拆分，恒非负）。
 
 - int Hours()
   - 小时分量（0-23，恒非负）。
@@ -1198,6 +1512,9 @@ int i = await Task.WhenAny(hs);      // 最先完成者的下标
 
 - int Seconds()
   - 秒分量（0-59，恒非负）。
+
+- int Milliseconds()
+  - 毫秒分量（0-999，恒非负）。
 
 - bool IsNegative()
   - 时间间隔为负时返回 true。
@@ -1212,7 +1529,14 @@ int i = await Task.WhenAny(hs);      // 最先完成者的下标
   - 取反（正变负）。
 
 - string ToString()
-  - 文本格式为 "[-][D.]HH:MM:SS"。
+  - 文本格式为 "[-][D.]HH:MM:SS[.fff]"。
+
+
+## TimeoutException (class)
+
+当为进程或操作分配的时间已超时抛出。
+
+- public TimeoutException(string message)
 
 
 ## Wide (class)
@@ -1363,6 +1687,13 @@ TlsSetValue 的调用形式（成功返回非 0）。
 CoCreateInstance 的调用形式（返回 HRESULT）。
 
 `delegate int CoCreateInstanceFn(nint clsid, nint outer, int ctx, nint iid, nint result);`
+
+
+## int (delegate)
+
+泛型比较器委托：x 小于 y 返回负数，等于返回 0，大于返回正数。
+
+`delegate int Comparison<T>(T x, T y);`
 
 
 ## nint (delegate)

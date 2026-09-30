@@ -1,6 +1,6 @@
 # System.IO
 
-> 源码: `stdlib/System/IO/ByteBuffer.zan`, `stdlib/System/IO/Directory.zan`, `stdlib/System/IO/DirectoryTree.zan`, `stdlib/System/IO/File.zan`, `stdlib/System/IO/FileInfo.zan`, `stdlib/System/IO/FileInfoEx.zan`, `stdlib/System/IO/FileStream.zan`, `stdlib/System/IO/IniFile.zan`, `stdlib/System/IO/KnownFolders.zan`, `stdlib/System/IO/MemoryMappedFile.zan`, `stdlib/System/IO/MemoryStream.zan`, `stdlib/System/IO/Path.zan`, `stdlib/System/IO/PathEx.zan`, `stdlib/System/IO/Shortcut.zan`, `stdlib/System/IO/Stream.zan`, `stdlib/System/IO/StreamReader.zan`, `stdlib/System/IO/StreamWriter.zan`
+> 源码: `stdlib/System/IO/ByteBuffer.zan`, `stdlib/System/IO/Directory.zan`, `stdlib/System/IO/DirectoryTree.zan`, `stdlib/System/IO/File.zan`, `stdlib/System/IO/FileAccess.zan`, `stdlib/System/IO/FileInfo.zan`, `stdlib/System/IO/FileInfoEx.zan`, `stdlib/System/IO/FileMode.zan`, `stdlib/System/IO/FileStream.zan`, `stdlib/System/IO/IniFile.zan`, `stdlib/System/IO/KnownFolders.zan`, `stdlib/System/IO/MemoryMappedFile.zan`, `stdlib/System/IO/MemoryStream.zan`, `stdlib/System/IO/Path.zan`, `stdlib/System/IO/PathEx.zan`, `stdlib/System/IO/SeekOrigin.zan`, `stdlib/System/IO/Shortcut.zan`, `stdlib/System/IO/Stream.zan`, `stdlib/System/IO/StreamReader.zan`, `stdlib/System/IO/StreamWriter.zan`
 
 
 ## ByteBuffer (class)
@@ -99,6 +99,9 @@ long v = b.ReadU32();
     以 NUL 结尾，<c>s.Length</c> 只数到第一个 NUL，而网络收到的
     字节（HTTP 二进制请求体、上传内容）本就可能含 NUL。
 
+- ByteBuffer WriteBytes(byte[]src, int offset, int count)
+  - 追加字节数组切片，不写长度前缀。零额外中间拷贝，完全二进制安全。
+
 - int ByteAt(int i)
   - 已写入字节中下标 i 处的字节（0-255）；越界返回 -1。
     供扫描分隔符（HTTP 头部空行、分块长度行）时逐字节查看，
@@ -143,6 +146,20 @@ long v = b.ReadU32();
   - 读取 LEB128 变长整数；数据截断或超过 64 位时抛
     InvalidOperationException。
 
+- int PeekU8(int pos)
+  - 显式位置读取一个字节（不移动读游标）；越界返回 -1。
+    供裸解析循环按位置消费，免除 SeekRead 往返。
+
+- long ReadVarIntAt(int pos, out int np)
+  - 显式位置读取 LEB128 变长整数：解析自 pos 起，
+    结束后的位置写入 np（返回值即数值）。越界/截断返回 -1。
+    与 `ReadVarInt` 同格式，但完全不碰读游标。
+
+- int CmpRangeRaw(int off, int len, string other)
+  - 缓冲内 [off, off+len) 与 other 的序数比较：memcmp
+    前缀、长度定序（字节串语义，与 String.CompareOrdinal 同序）。
+    零分配；越界区间被钳制。
+
 - nint ReadBytes(int count)
   - 将 count 字节读入新分配的原始块
     （调用方用 NativeMemory.Free 释放，或包装进 ByteBuffer）。
@@ -152,6 +169,10 @@ long v = b.ReadU32();
 
 - long Crc32(int count)
   - 对前 count 字节计算 CRC32（IEEE，反射）。
+
+- long Crc32C(int count)
+  - 对前 count 字节计算 CRC32C（Castagnoli，poly 0x82F63B78）。
+    优先走 SSE4.2/ARMv8 CRC 指令内核，无硬件回退逐字节内建。
 
 
 ## Directory (class)
@@ -434,12 +455,19 @@ PathFilter.Only(".zan").Skip("build bin obj"));
 - static bool EmbedExists(string path)
   - 该路径是否有内嵌副本。
 
+- static string StripBom(string s)
+  - 去掉开头的 UTF-8 BOM（EF BB BF）。BOM 是编码标记而不是
+    内容，.NET 的 File.ReadAllText 会据此识别编码并把它排除在结果之外；
+    这里也必须去掉，否则以 BOM 保存的文本首字符是三个不可见字节，
+    任何"看第一个字符"的解析都会整段失效（CSS 的 `:root` 变量块就是
+    一例：选择器变成 \uFEFF:root，不等于 ":root"，变量全部丢弃）。
+
 - static string ReadAllText(string path)
   - 以字符串形式读取整个文件内容。
     文件无法打开时抛出 FileNotFoundException。
 
-- static string ReadAllTextAsync(string path)
-  - 读取文件内容（ReadAllText 的包装）。
+- static async string ReadAllTextAsync(string path)
+  - 异步读取文件内容（完全对齐 C# .NET 异步 TAP 契约）。
 
 - static void WriteAllText(string path, string content)
   - 将字符串写入文件，不存在则创建，已存在则覆盖。
@@ -449,8 +477,8 @@ PathFilter.Only(".zan").Skip("build bin obj"));
     把 '\n' 翻成 "\r\n"，而 fputs 会在首个 NUL 处停止 —— 两者都会让
     写回的内容与传入的字符串不一致（写文件再读回不等于原文）。
 
-- static void WriteAllTextAsync(string path, string content)
-  - 写入文件内容（WriteAllText 的包装）。
+- static async void WriteAllTextAsync(string path, string content)
+  - 异步写入文件内容（完全对齐 C# .NET 异步 TAP 契约）。
 
 - static void AppendAllText(string path, string content)
   - 将字符串追加到文件末尾。
@@ -556,6 +584,35 @@ PathFilter.Only(".zan").Skip("build bin obj"));
   - 将原始字节追加到文件末尾（二进制安全）。
     文件不存在时创建。
 
+- [DllImport("crt")]static extern long zan_file_set_time(string path, int which, long unixSec);
+
+- [DllImport("kernel32", EntryPoint="CreateHardLinkW")]static extern int CreateHardLinkW(nint link, nint target, nint secAttrs);
+
+- [DllImport("kernel32", EntryPoint="GetFileAttributesW")]static extern int GetFileAttributesW(nint path);
+
+- [DllImport("crt")]static extern int link(string existing, string newLink);
+
+- static bool SetLastWriteTime(string path, long unixSec)
+  - 将最后写入时间设置为 Unix 时间戳（秒）。
+    文件不存在或平台无法设置时返回 false。
+
+- static bool SetLastAccessTime(string path, long unixSec)
+  - 将最后访问时间设置为 Unix 时间戳（秒）。
+
+- static bool SetCreationTime(string path, long unixSec)
+  - 设置创建时间（仅 Windows；其他平台返回 false）。
+
+- static bool CreateHardLink(string link, string target)
+  - 在 link 创建指向已有文件 target 的硬链接。
+    链接创建失败时返回 false（目标不存在、跨卷、权限不足）。
+
+- static bool IsReparsePoint(string path)
+  - 当 path 是 reparse point（目录 junction、符号链接或 OneDrive 占位文件）时返回 true。
+    仅 Windows；其他平台返回 false。
+
+- static string GetMimeType(string path)
+  - 根据文件扩展名（转小写）猜测 MIME 类型。未知扩展名回退为 application/octet-stream。
+
 
 ## FileInfo (class)
 
@@ -608,6 +665,15 @@ PathFilter.Only(".zan").Skip("build bin obj"));
 - bool SetReadOnly(bool on)
   - 将文件设为只读或可写。无法修改时返回 false
     （文件不存在、无权限）。
+
+- bool SetLastWriteTime(long unixSec)
+  - 设置最后写入时间（Unix 秒）。
+
+- bool SetLastAccessTime(long unixSec)
+  - 设置最后访问时间（Unix 秒）。
+
+- bool SetCreationTime(long unixSec)
+  - 设置创建时间（仅 Windows；Unix 秒）。
 
 - bool NewerThan(string other)
   - 当 `this` 比 `other` 新时返回 true，即 `other` 需要重新构建。
@@ -714,28 +780,25 @@ FileInfoEx.CreateHardLink("link.txt", "target.txt");
 
 - static bool SetLastWriteTime(string path, long unixSec)
   - 将最后写入时间设置为 Unix 时间戳。
-    文件不存在或平台无法设置时返回 false。
+    建议优先使用 `File.SetLastWriteTime`。
 
 - static bool SetLastAccessTime(string path, long unixSec)
   - 将最后访问时间设置为 Unix 时间戳。
+    建议优先使用 `File.SetLastAccessTime`。
 
 - static bool SetCreationTime(string path, long unixSec)
   - 设置创建时间（仅 Windows；其他平台返回 false）。
+    建议优先使用 `File.SetCreationTime`。
 
 - static bool CreateHardLink(string link, string target)
   - 在 `link` 创建指向已有文件 `target` 的硬链接。
-    链接创建失败时返回 false（目标不存在、
-    跨卷、权限不足）。
-
-- [DllImport("crt")]static extern int link(string existing, string newLink);
-
-- static int LinkPosix(string link, string target)
-  - POSIX link(2) 的换序包装：把 CreateHardLink 的
-    (link, target) 调成 link(target, link)。
+    链接创建失败时返回 false（目标不存在、跨卷、权限不足）。
+    建议优先使用 `File.CreateHardLink`。
 
 - static bool IsReparsePoint(string path)
   - 当 `path` 是 reparse point（目录 junction、符号
     链接或 OneDrive 占位文件）时返回 true。仅 Windows；其他平台返回 false。
+    建议优先使用 `File.IsReparsePoint`。
 
 
 ## FileStream (class)
@@ -1070,6 +1133,9 @@ int value = new Span<int>(view2, 1024)[0];
     取消映射。POSIX 上只有创建者关闭才释放名称；
     打开者关闭只释放自己的句柄。
 
+- void Dispose()
+  - 释放映射句柄（实现 IDisposable，等同于 Close）。
+
 - static bool Unlink(string name)
   - 显式移除具名区域，即使还有打开的句柄。
     POSIX 上立即释放名称；Windows 上具名对象是引用计数的
@@ -1197,35 +1263,21 @@ ms.Close();
 - static string Normalize(string path)
   - 将路径分隔符规范化为平台分隔符。
 
-
-## PathEx (class)
-
-基础之外的路径辅助功能：glob 匹配（<c>*</c>、<c>?</c>、
-<c>**</c>）、相对路径解析，以及
-<c>.</c>/<c>..</c> 段的规范化清理。纯字符串逻辑，与平台无关。
-
-bool hit = PathEx.IsMatch("src/**/*.zan", "src/a/b/c.zan");   // true
-string rel = PathEx.GetRelativePath("C:\\a\\b", "C:\\a\\b\\c\\d.txt");
-
-- static bool IsMatch(string pattern, string path)
-  - 当 `path` 匹配 glob 模式 `pattern` 时为真。两者都接受
-    `/` 或 `\` 分隔符。<c>*</c> 匹配单个路径段内，
-    <c>?</c> 匹配一个字符，<c>**</c> 匹配零个或多个路径段。
-
-- static bool IsUnder(string dir, string path)
-  - 当 `path` 是 `dir` 的目录前缀（或等于 `dir`）时为真，
-    在 Windows 上按段不区分大小写比较。
+- static string GetRelativePath(string relativeTo, string path)
+  - 返回从 relativeTo 目录到 path 的相对路径（等同于现代 C# 的 Path.GetRelativePath）。
+    两者按段拆分；公共前缀被去掉，剩余部分用 "../" 跳转连接。Windows 盘符不区分大小写比较。
 
 - static string Clean(string path)
-  - 移除 <c>.</c> 并解析 <c>..</c> 段
-    （"a/./b/../c" -> "a/c"）。无法解析的前导 <c>..</c> 会
-    保留。分隔符按输入原样保留。
+  - 规范化路径并解析 . 与 .. 段（"a/./b/../c" -> "a/c"）。
+    无法解析的前导 .. 会保留。分隔符按输入原样保留。
 
-- static string GetRelativePath(string from, string to)
-  - 从 `from`（目录）到 `to`（其下或其旁的路径）的相对路径
-    两者按段拆分；公共前缀
-    被去掉，剩余部分用 "../" 跳转连接。
-    Windows 盘符不区分大小写比较。
+- static bool IsMatch(string pattern, string path)
+  - 当 path 匹配 glob 模式 pattern 时为真。两者都接受
+    / 或 \ 分隔符。* 匹配单个路径段内，? 匹配一个字符，** 匹配零个或多个路径段。
+
+- static bool IsUnder(string dir, string path)
+  - 当 path 是 dir 的目录前缀（或等于 dir）时为真，
+    在 Windows 上按段不区分大小写比较。
 
 - static bool MatchSegments(List<string> pat, int pi, List<string> pth, int ti)
   - 按段递归匹配；"**" 消耗零个或多个路径段。
@@ -1243,11 +1295,38 @@ string rel = PathEx.GetRelativePath("C:\\a\\b", "C:\\a\\b\\c\\d.txt");
 - static bool Same(string a, string b)
   - 段比较；Windows 上不区分大小写。
 
-- static bool CharEqual(string a, string b)
+- static bool CharEqual(int a, int b)
   - 单字符比较；Windows 上不区分大小写。
 
 - static int IndexOf(string hay, string needle, int from)
   - 从 from 起查找子串；没有时返回 -1。
+
+
+## PathEx (class)
+
+历史路径扩展辅助工具（已收敛至 `Path`）。
+本类完整保留全部公开方法以保证 100% 向后兼容，内部直接转发至 `Path`。
+新代码建议直接使用 `Path.IsMatch`、`Path.IsUnder`、
+`Path.Clean` 与 `Path.GetRelativePath`。
+
+- static bool IsMatch(string pattern, string path)
+  - 当 `path` 匹配 glob 模式 `pattern` 时为真。两者都接受
+    `/` 或 `\` 分隔符。<c>*</c> 匹配单个路径段内，
+    <c>?</c> 匹配一个字符，<c>**</c> 匹配零个或多个路径段。
+
+- static bool IsUnder(string dir, string path)
+  - 当 `path` 是 `dir` 的目录前缀（或等于 `dir`）时为真，
+    在 Windows 上按段不区分大小写比较。
+
+- static string Clean(string path)
+  - 移除 <c>.</c> 并解析 <c>..</c> 段
+    （"a/./b/../c" -> "a/c"）。无法解析的前导 <c>..</c> 会
+    保留。分隔符按输入原样保留。
+
+- static string GetRelativePath(string from, string to)
+  - 从 `from`（目录）到 `to`（其下或其旁的路径）的相对路径。
+    两者按段拆分；公共前缀被去掉，剩余部分用 "../" 跳转连接。
+    Windows 盘符不区分大小写比较。
 
 
 ## PathFilter (class)
@@ -1255,7 +1334,7 @@ string rel = PathEx.GetRelativePath("C:\\a\\b", "C:\\a\\b\\c\\d.txt");
 目录遍历的过滤条件：保留哪些后缀、隐藏哪些后缀、跳过哪些子目录。
 后缀表和目录表都是空格分隔的字符串，因此调用点一行写完：
 
-PathFilter src = PathFilter.Only(".zan .zform .zscene")
+PathFilter src = PathFilter.Only(".zan .html .zscene")
 .Skip("publish build bin obj dist tools");
 
 - string exts;
@@ -1482,6 +1561,9 @@ ByteBuffer.Raw）同样被接受，用于零拷贝路径。
   - 移动游标。`origin`：0 = 开头，1 = 当前，2 = 末尾。
     返回新的绝对位置，不可定位时返回 -1。
 
+- virtual long Seek(long offset, SeekOrigin origin)
+  - 按指定参考点设置当前流中的位置（对齐 C# .NET 标准的 Seek 重载）。
+
 - virtual int ReadInto(nint buf, int count)
   - 读取最多 `count` 字节到裸地址 `buf`。
     返回读取的字节数；0 表示流结束。
@@ -1496,11 +1578,23 @@ ByteBuffer.Raw）同样被接受，用于零拷贝路径。
 - virtual void Close()
   - 释放流。可安全地重复调用。
 
+- virtual void Dispose()
+  - 执行与释放、释放或重置非托管资源关联的应用程序定义的任务（实现 IDisposable）。
+
 - string Read(int count)
   - 读取最多 `count` 字节；流结束时返回 ""。
 
+- int WriteFromAll(nint buf, int count)
+  - 从裸地址 `buf` 循环写出 `count` 字节，直到全部写出或发生错误。
+
 - int Write(string data)
   - 写入 `data` 的全部字节。返回实际写入的字节数。
+
+- int Write(string data, int count)
+  - 写入 `data` 的前 `count` 个字节（二进制安全，可含 NUL）。
+
+- int WriteBytes(byte[]data, int offset, int count)
+  - 写入字节数组的一部分（二进制安全）。
 
 - int ReadByte()
   - 读取一个字节，流结束时返回 -1。
@@ -1555,6 +1649,12 @@ r.Close();
 
 - StreamReader()
 
+- StreamReader(string path):this()
+  - 打开文件用于读取。若文件不存在则抛出 FileNotFoundException。
+
+- StreamReader(Stream s):this()
+  - 从现有流读取文本（不由本 reader 关闭）。
+
 - static StreamReader Wrap(Stream s)
   - 从现有流读取文本（不由本 reader
     关闭）。
@@ -1594,6 +1694,9 @@ r.Close();
 - void Close()
   - 关闭 reader；若该 reader 打开了底层流，也一并关闭
     该流。
+
+- void Dispose()
+  - 释放 reader 占用的资源（实现 IDisposable，等同于 Close）。
 
 
 ## StreamWriter (class)
@@ -1656,9 +1759,51 @@ w.Close();
   - 刷新后，若本 writer 打开了底层
     流，则关闭该流。
 
+- void Dispose()
+  - 释放 writer 占用的资源（实现 IDisposable，等同于 Close）。
+
 
 ## int (delegate)
 
 SetEnvironmentVariableW 的函数指针签名（经 Interop.Entry 取用）。
 
 `delegate int SetEnvironmentVariableWFn(nint name, nint val);`
+
+
+## FileAccess (enum)
+
+定义文件的读取、写入或读/写访问权限（完全对齐 C# .NET 的 FileAccess）。
+
+- Read = =1
+
+- Write = =2
+
+- ReadWrite = =3
+
+
+## FileMode (enum)
+
+指定操作系统打开文件的方式（完全对齐 C# .NET 的 FileMode）。
+
+- CreateNew = =1
+
+- Create = =2
+
+- Open = =3
+
+- OpenOrCreate = =4
+
+- Truncate = =5
+
+- Append = =6
+
+
+## SeekOrigin (enum)
+
+指定在流中查找的参考点（完全对齐 C# .NET 的 SeekOrigin）。
+
+- Begin = =0
+
+- Current = =1
+
+- End = =2

@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Data
 
-> 源码: `stdlib/Sdk/Jd/Api/Data/DataVenderCommonQueryRequest.zan`, `stdlib/Sdk/Jd/Api/Data/JdDataApi.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Data/DataVenderCommonQueryRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Data/JdDataApi.zan`
 
 
 ## DataVenderCommonQueryRequest (class)

@@ -1,6 +1,74 @@
 # Gui.Component.WebView
 
-> 源码: `stdlib/Gui/Component/WebView/WebView.zan`, `stdlib/Gui/Component/WebView/WebView2.zan`, `stdlib/Gui/Component/WebView/WebViewBackend.zan`, `stdlib/Gui/Component/WebView/WebViewBox.zan`
+> 源码: `packages/Zan.Gui.Browser/src/Gui/Component/WebView/LinkWindow.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebView.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebView2.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebViewBackend.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebViewBootstrap.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebViewBox.zan`
+
+
+## LinkWindow (class)
+
+`<a href>` 缺省路由的链接窗口（App.OpenLink 经 WebViewBootstrap
+注册的导航器懒建，每个 App 全程复用一个）：整棵保留树就是一枚
+WebViewBox，根控件直接拿满窗口客户区；页面标题经 TitleChanged
+同步到 OS 窗口标题。运行时 WebView 不可用（缺 WebView2/WKWebView
+运行时，首次 Render 创建失败）时首帧后自动把这次导航转交系统
+浏览器并关窗——链接不能表现为"点了没反应"。
+本类随 WebView 家族整体住在 Component/WebView：App 编译图不背
+它（auto-stdlib 按 using 整目录拉入），装了 WebView 家族的程序
+经 WebViewBootstrap.Install 拿到全部链接路由。
+
+- WebViewBox wv;
+
+- string lastUrl;
+  - 最近一次导航目标（WebView 不可用时的系统浏览器回落对象；
+    回落完成后清空防重复打开）。
+
+- int idBase;
+
+- LinkWindow()
+
+- override string Title()
+
+- override int Width()
+
+- override int Height()
+
+- override int IdBase()
+  - 每个窗口一枚固定的 WidgetId 基线（主窗口不回卷进程级计数，
+    子窗口不钉基线则控件 hover/press 每帧错位）。
+
+- void Navigate(string url, App parent)
+  - 导航：首次调用建窗口（跟随 parent 的皮肤/标题栏约定），
+    之后只 Navigate（已开的窗口再次点链接 = 原地换页）。
+
+- override void AfterFrame()
+  - 首帧之后原生视图必然已创建：IsSupported 翻 false 即创建失败
+    （平台没有 WebView 运行时），这次导航转交系统浏览器并关窗。
+
+- override void OnCloseRequested()
+  - 用户点标题栏 X：先销毁原生视图（每个 WebViewBox 一个浏览器
+    实例，不随 Teardown 的窗口/画布销毁自动释放）。
+
+
+## WebCookie (class)
+
+强类型 Web Cookie 实体对象（完全对齐现代化强类型设计，避免字符串序列化/拆解）。
+
+- public string name;
+
+- public string value;
+
+- public string domain;
+
+- public string path;
+
+- public double expires;
+
+- public bool isHttpOnly;
+
+- public bool isSecure;
+
+- public WebCookie()
+
+- public WebCookie(string n, string v, string d="", string p="/"){ this.name=n;this.value=v;this.domain=d;this.path=p;this.expires=0.0;this.isHttpOnly=false;this.isSecure=false;}
 
 
 ## WebView (class)
@@ -61,6 +129,16 @@ DevTools（OpenDevTools）。
 - List<string> pendingScripts;
 
 - List<string> pendingStyles;
+
+- bool pendingDevTools;
+
+- bool devToolsEnabled;
+
+- bool devToolsExplicit;
+
+- bool contextMenuEnabled;
+
+- bool contextMenuExplicit;
 
 - SignalString url;
 
@@ -157,118 +235,12 @@ DevTools（OpenDevTools）。
 
 - string Eval(string js)
   - 在页面中运行 JavaScript 并返回字符串化的结果（出错/无结果时为
-    ""）。用于读取请求参数、DOM 状态或
-    从页面获取的响应体。
+    同步读取 JS 执行结果（非阻塞，禁止在 GUI 线程跑消息泵）。
+    如需异步等待计算结果，请优先使用 `EvalWithResultAsync`。
 
-- bool SupportsMessages()
-  - 这个运行时上能不能收页面发来的消息。三端同形：页面侧都是
-    window.webkit.messageHandlers.<name>.postMessage(x)（Windows 由注入
-    shim 把 WebView2 的 window.chrome.webview 桥包装成同形），消息按
-    `TakeMessage` 逐条取。
+- async string EvalWithResultAsync(string js, int timeoutMs=5000){ if (!supported||handle==0){ return"";}string res=await WebViewBackend.EvalWithResultAsync(handle, js, timeoutMs);return res;}async bool EnsureReadyAsync(int timeoutMs=15000){ if (!supported||handle==0){ return false;}bool ok=await WebViewBackend.EnsureReadyAsync(handle, timeoutMs);return ok;}bool SupportsMessages(){ return WebViewBackend.HasBridge();}void AddMessageHandler(string handlerName){ if (handlerName==""){ return;}if (!created||!supported||handle==0){ pendingHandlers.Add(handlerName);return;}WebViewBackend.AddHandler(handle, handlerName);}void RemoveMessageHandler(string handlerName){ if (supported&&handle!=0){ WebViewBackend.RemoveHandler(handle, handlerName);}}string TakeMessage(){ if (!supported||handle==0){ return"";}return WebViewBackend.TakeMessage(handle);}int MessagePending(){ if (!supported||handle==0){ return 0;}return WebViewBackend.PendingMessages(handle);}int MessageDropped(){ if (!supported||handle==0){ return 0;}return WebViewBackend.DroppedMessages(handle);}void InjectScript(string js, bool atDocumentEnd){ if (js==""){ return;}if (!created||!supported||handle==0){ string tag="0";if (atDocumentEnd){ tag="1";}pendingScripts.Add(tag+js);return;}WebViewBackend.AddScript(handle, js, atDocumentEnd);}void InjectStyle(string css){ if (css==""){ return;}if (!created||!supported||handle==0){ pendingStyles.Add(css);return;}WebViewBackend.AddStyle(handle, css);}void ClearInjected(){ pendingScripts=new List<string>();pendingStyles=new List<string>();if (supported&&handle!=0){ WebViewBackend.RemoveScripts(handle);}}void EvalAsync(string js){ if (supported&&handle!=0){ WebViewBackend.EvalAsync(handle, js);}}string GetCookies(string forUrl){ if (!supported||handle==0){ return"";}return WebViewBackend.GetCookies(handle, forUrl);}async string GetCookiesAsync(string forUrl, int timeoutMs=5000){ if (!supported||handle==0){ return"";}string res=await WebViewBackend.GetCookiesAsync(handle, forUrl, timeoutMs);return res;}async List<WebCookie> GetCookieListAsync(string forUrl="", int timeoutMs=5000){ if (!supported||handle==0){ return new List<WebCookie>();}List<WebCookie> res=await WebViewBackend.GetCookieListAsync(handle, forUrl, timeoutMs);return res;}async string GetCookieDetailsAsync(string forUrl, int timeoutMs=5000){ if (!supported||handle==0){ return"";}string res=await WebViewBackend.GetCookieDetailsAsync(handle, forUrl, timeoutMs);return res;}void SetCookie(string forUrl, string cookieName, string cookieValue){ if (supported&&handle!=0){ WebViewBackend.SetCookie(handle, forUrl, cookieName, cookieValue);}}void ClearCookies(){ if (supported&&handle!=0){ WebViewBackend.ClearCookies(handle);}}void ClearBrowsingData(){ if (supported&&handle!=0){ WebViewBackend.ClearData(handle);}}void SetZoom(int percent){ if (!supported||handle==0){ return;}if (percent <25){ percent=25;}if (percent> 500){ percent=500;}WebViewBackend.SetZoom(handle, percent);}void OpenDevTools(){ if (!created||handle==0){ pendingDevTools=true;return;}if (supported&&handle!=0){ WebViewBackend.OpenDevTools(handle);}}void SetDevToolsEnabled(bool enabled){ devToolsEnabled=enabled;devToolsExplicit=true;if (created&&supported&&handle!=0){ WebViewBackend.SetDevToolsEnabled(handle, enabled);}}void SetContextMenuEnabled(bool enabled){ contextMenuEnabled=enabled;contextMenuExplicit=true;if (created&&supported&&handle!=0){ WebViewBackend.SetContextMenuEnabled(handle, enabled);}}void Hide(){ if (created&&supported&&handle!=0){ WebViewBackend.SetVisible(handle, false);}}void Destroy(){ if (created&&supported&&handle!=0){ NativeLayer.Forget(handle);WebViewBackend.Destroy(handle);}handle=0;created=false;}int Render(App app, int x, int y, int w, int h){ EnsureCreated(app);if (!supported){ WebView.PaintPlaceholder(app, x, y, w, h);return handle;}WebViewBackend.SetFrame(handle, x, y, w, h);NativeLayer.Register(app, handle, x, y, w, h, WebViewBackend.ApplyClip);string pendingNav=WebViewBackend.DrainWindowNav(handle);if (pendingNav!=""){ WebViewBackend.Navigate(handle, pendingNav);}bool dirty=false;string request=WebViewBackend.LastRequest(handle);if (request!=lastSeenRequest){ lastSeenRequest=request;if (request!=""){ NavStart.Raise();}dirty=true;}bool busy=WebViewBackend.IsLoading(handle);if (busy!=lastSeenLoading){ lastSeenLoading=busy;LoadingChanged.Raise();dirty=true;}int seq=WebViewBackend.NavSeq(handle);if (seq!=lastNavSeq){ lastNavSeq=seq;url.Set(WebViewBackend.GetUrl(handle));title.Set(WebViewBackend.GetTitle(handle));NavComplete.Raise();dirty=true;}string docTitle=title.Get();if (docTitle!=lastSeenTitle){ lastSeenTitle=docTitle;TitleChanged.Raise();dirty=true;}if (dirty){ app.RequestRedraw();}return handle;}static void PaintPlaceholder(App app, int x, int y, int w, int h){ Canvas c=app.canvas;Theme t=app.theme;StyleBox s=Style.Part(app, "webview", "placeholder", "", "", "", Style.SNormal());StyleBox icon=Style.Part(app, "webview", "icon", "", "", "", Style.SNormal());StyleBox label=Style.Part(app, "webview", "label", "", "", "", Style.SNormal());c.FillRect(x, y, w, h, s.BgOr(0));c.DrawRect(x, y, w, h, s.BorderOr(0), t.borderWidth);c.DrawGlyphIn("globe", x, y-app.Scale(28), w, h, t.iconSizeLarge, icon.FgOr(0));c.DrawTextCentered(x, y+app.Scale(18), w, h, "WebView needs a native backend(Windows WebView2 / macOS WKWebView / Android system WebView)", label.FgOr(0), Style.FontFallback(app, "medium"));}static string Normalize(string target){ if (target==""){ return"";}if (WebView.HasScheme(target)){ return target;}return"https://"+target;}static bool HasScheme(string s){ int n=s.Length;for (int i=0;i+2 <n;i=i+1){ if (s[i]==':'&&s[i+1]=='/'&&s[i+2]=='/'){ return true;}}return false;}
+  - 异步运行 JavaScript 并等待返回值（协程挂起，零消息泵，不阻塞 GUI 线程）。
 
-- void AddMessageHandler(string handlerName)
-  - 让页面可以用
-    window.webkit.messageHandlers.<name>.postMessage(x)
-    给宿主发消息；消息按 `TakeMessage` 逐条取（和 CEF 那边的
-    CDP 队列同一套用法）。可在原生视图创建前调用。
-
-- void RemoveMessageHandler(string handlerName)
-  - 撤掉 AddMessageHandler 注册的消息通道（不支持的后端为空操作）。
-
-- string TakeMessage()
-  - 取走一条页面消息，格式 "<handler>\t<body>"（body 是字符串原文，
-    其他类型的 postMessage 参数是 JSON）；空队列为 ""。
-
-- int MessagePending()
-  - 队列里待取的消息数。
-
-- int MessageDropped()
-  - 因为迟迟没被取走而丢掉的消息数（队列有界，防止跑飞的页面把内存
-    吃光）。
-
-- void InjectScript(string js, bool atDocumentEnd)
-  - 每次导航都注入的脚本：atDocumentEnd=true 在文档解析完后跑（能用
-    document/window），false 则在页面自己的脚本之前跑（适合装桥）。
-
-- void InjectStyle(string css)
-  - 每次导航都注入的 CSS。
-
-- void ClearInjected()
-  - 撤掉此前注入的所有脚本/样式（下一次导航起生效）。
-
-- void EvalAsync(string js)
-  - Native→JS，但不等结果：`Eval` 要等返回值，会自旋事件
-    循环，从绘制/事件回调里调不合适。
-
-- string GetCookies(string forUrl)
-  - `url` 的 Cookie，序列化为 "name=value; name2=value2"（无则为 ""）。
-    传 "" 获取存储中的所有 Cookie。
-
-- void SetCookie(string forUrl, string cookieName, string cookieValue)
-  - 为 `url` 的主机在存储中设置 Cookie（路径默认为 "/"）。
-
-- void ClearCookies()
-  - 清除共享存储中的所有 Cookie。
-
-- void ClearBrowsingData()
-  - 清掉这个配置文件的全部网站数据：Cookie、缓存、localStorage、
-    IndexedDB…（“退出登录并忘记我”）。Windows 运行时带 Profile2 接口
-    时走 ClearBrowsingData(ALL_SITE)，否则退化为 `ClearCookies`。
-
-- void SetZoom(int percent)
-  - 整页缩放，percent 为百分数（100 = 原大），立即生效；每次导航后
-    保持。越界取 25..500。后端不支持时为空操作。
-
-- void OpenDevTools()
-  - 为当前页打开浏览器 DevTools 窗口（调试用）。Windows 直接弹出
-    DevTools 窗口；macOS 无程序化入口，创建时已启用 "Inspect
-    Element"（右键菜单），因此此调用为空操作。
-
-- void Hide()
-  - 隐藏原生视图（对不在屏幕上的标签/面板调用）。
-
-- void Destroy()
-  - 销毁原生视图并释放其资源。销毁后再调用其他方法均为
-    空操作；如需重用应新建实例。
-
-- int Render(App app, int x, int y, int w, int h)
-  - 将原生视图放到给定的客户区矩形中并显示，然后
-    轮询引擎的变化，更新 Url()/Title() 并触发
-    NavStart / LoadingChanged / TitleChanged / NavComplete。浏览器运行在
-    自己的线程上，因此其事件以这种每帧差异的形式到达 UI。
-    在没有原生 Web 视图的平台上，它绘制一个覆盖相同矩形的
-    画布内占位符。
-    每帧驱动：摆放原生视图、登记裁剪占位并轮询引擎差异
-    事件（NavStart/LoadingChanged/TitleChanged/NavComplete）。浏览器
-    运行在自己的线程上，事件以这种每帧差异的形式到达 UI，因此
-    隐藏的实例必须有人替它调 Hide()（WebViewBox 自动处理）。
-    返回原生句柄（不支持时为 0 并画占位符）。
-
-- static void PaintPlaceholder(App app, int x, int y, int w, int h)
-  - 无原生后端时的画布内占位：图标加一行说明文字。
-
-- static string Normalize(string target)
-  - 导航目标补全：没有协议前缀的裸地址加 `https://`。
-
-- static bool HasScheme(string s)
-  - 是否带协议前缀（"://"）。
-
-
-## WebViewBootstrap (class)
-
-HeavyControls/链接路由注册入口：宿主启动时调一次 `Install()`，之后
-设计稿里的 WebViewBox 可用、`<a href>` 走内嵌导航器。不调用的程序
-整个家族被 DCE 删光，发布不携带浏览器 DLL。
-
-- static bool EnsureRuntime()
-  - 确保系统装着 WebView2 运行时，可直接内嵌网页时返回 true。没装则
-    下载微软官方 bootstrapper（约 1.8MB）静默安装（弹一次 UAC 提权），
-    装成功返回 true——之后要**新建 WebView/WebViewBox 实例**才会重试
-    创建。Win7/8.1 上 bootstrapper 已不派发兼容版（109 为最后版本），
-    会打开官方下载页并返回 false（用户装 109 离线包，或发布带 CEF 的
-    zan_cef109 驱动）。macOS 返回 true（WKWebView 系统自带）。建议在
-    `IsSupported()==false` 时询问用户后再调，不要默认静默下载执行
-    安装程序。
 
 ## WebView2 (class)
 
@@ -299,6 +271,22 @@ COM 对象。这两者都可用本语言表达——`Com.Call*`
 - [DllImport("gdi32", EntryPoint="CombineRgn")]static extern int CombineRgn(nint dst, nint src1, nint src2, int mode);
 
 - [DllImport("gdi32", EntryPoint="DeleteObject")]static extern int DeleteObject(nint obj);
+
+- static nint CreateWindowExW(int exStyle, nint cls, nint title, int style, int x, int y, int w, int h, nint parent, nint menu, nint inst, nint param)
+
+- static int DestroyWindow(nint hwnd)
+
+- static int SetWindowPos(nint hwnd, nint after, int x, int y, int w, int h, int flags)
+
+- static int ShowWindow(nint hwnd, int cmd)
+
+- static int SetWindowRgn(nint hwnd, nint rgn, bool redraw)
+
+- static nint CreateRectRgn(int l, int t, int r, int b)
+
+- static int CombineRgn(nint dst, nint src1, nint src2, int mode)
+
+- static int DeleteObject(nint obj)
 
 - static List<WebView2> views;
 
@@ -335,6 +323,10 @@ COM 对象。这两者都可用本语言表达——`Com.Call*`
 
 - long srcToken;
 
+- long msgToken;
+
+- long winToken;
+
 - int navSeq;
 
 - int lastStatus;
@@ -351,7 +343,41 @@ COM 对象。这两者都可用本语言表达——`Com.Call*`
 
 - string cookieResult;
 
+- string cookieDetailsResult;
+
+- List<WebCookie> cookieListResult;
+
+- List<string> msgQ;
+
+- int msgDrops;
+
+- List<string> handlerNames;
+
+- List<string> shimIds;
+
+- List<string> scriptIds;
+
+- string pendingScriptId;
+
+- string pendingWindowNav;
+
+- nint msgSink;
+
+- nint winSink;
+
 - PumpGate gate;
+
+- bool ready;
+
+- bool initFailed;
+
+- Gate readyGate;
+
+- Gate evalGate;
+
+- Gate cookieGate;
+
+- string pendingInitUrl;
 
 - int fx;
 
@@ -371,9 +397,33 @@ COM 对象。这两者都可用本语言表达——`Com.Call*`
 
 - bool visibleSet;
 
-- static int SlotGetSource()
+- bool devToolsEnabled;
+
+- bool contextMenuEnabled;
+
+- bool devToolsSet;
+
+- bool contextMenuSet;
+
+- static int SlotGetSettings()
   - ICoreWebView2 的 vtable 槽。
-    槽 4：get_Source，读取当前页面 URI。
+    槽 3：get_Settings，读取当前环境设置接口 ICoreWebView2Settings。
+
+- static int SlotGetAreDevToolsEnabled()
+  - ICoreWebView2Settings 的 vtable 槽。
+    槽 11：get_AreDevToolsEnabled
+
+- static int SlotPutAreDevToolsEnabled()
+  - 槽 12：put_AreDevToolsEnabled
+
+- static int SlotGetAreDefaultContextMenusEnabled()
+  - 槽 13：get_AreDefaultContextMenusEnabled
+
+- static int SlotPutAreDefaultContextMenusEnabled()
+  - 槽 14：put_AreDefaultContextMenusEnabled
+
+- static int SlotGetSource()
+  - 槽 4：get_Source，读取当前页面 URI。
 
 - static int SlotNavigate()
   - 槽 5：Navigate，导航到指定 URI。
@@ -424,7 +474,7 @@ COM 对象。这两者都可用本语言表达——`Com.Call*`
   - 槽 48：get_DocumentTitle，读取页面标题。
 
 - static int SlotGetCookieManager()
-  - ICoreWebView2_2（新增 Cookie 管理器）的 vtable 槽。
+  - ICoreWebView2_2 接口虚函数 get_CookieManager（继承 ICoreWebView2，槽位 66）。
 
 - static string IidWebView2_2()
   - ICoreWebView2_2 的接口 IID，QueryInterface 取 Cookie 管理器时使用。
@@ -466,6 +516,12 @@ COM 对象。这两者都可用本语言表达——`Com.Call*`
 - static int SlotCookieValue()
   - ICoreWebView2Cookie 槽 4：get_Value，读 Cookie 值。
 
+- static int SlotCookieDomain()
+  - ICoreWebView2Cookie 槽 6：get_Domain，读所属域名。
+
+- static int SlotCookiePath()
+  - ICoreWebView2Cookie 槽 7：get_Path，读路径。
+
 - static int SlotCookieCount()
   - ICoreWebView2CookieList 槽 3：get_Count，读列表长度。
 
@@ -483,6 +539,61 @@ COM 对象。这两者都可用本语言表达——`Com.Call*`
   - ICoreWebView2NavigationStartingEventArgs 的 vtable 槽。
     槽 3：get_Uri，读取本次导航的目标 URI。
 
+- static int SlotAddDocScript()
+  - ICoreWebView2 的 vtable 槽（27..51 一段，官方 WebView2.h 实数）。
+    槽 27：AddScriptToExecuteOnDocumentCreated，注册每次导航（文档任何
+    脚本之前）执行的脚本，完成回调回传脚本 id。
+
+- static int SlotRemoveDocScript()
+  - 槽 28：RemoveScriptToExecuteOnDocumentCreated，按 id 撤掉注入脚本。
+
+- static int SlotAddWebMessage()
+  - 槽 34：add_WebMessageReceived，订阅页面 window.chrome.webview
+    .postMessage 事件。
+
+- static int SlotRemoveWebMessage()
+  - 槽 35：remove_WebMessageReceived，按令牌退订页面消息事件。
+
+- static int SlotAddNewWindow()
+  - 槽 44：add_NewWindowRequested，订阅新开窗口/ target=_blank 请求。
+
+- static int SlotRemoveNewWindow()
+  - 槽 45：remove_NewWindowRequested，按令牌退订新开窗口事件。
+
+- static int SlotOpenDevTools()
+  - 槽 51：OpenDevToolsWindow，为当前页打开 DevTools 窗口。
+
+- static int SlotPutZoomFactor()
+  - ICoreWebView2Controller 的 vtable 槽。
+    槽 8：put_ZoomFactor，整页缩放（1.0 = 100%）。
+
+- static int SlotTryGetWebMessage()
+  - ICoreWebView2WebMessageReceivedEventArgs 的 vtable 槽。
+    槽 5：TryGetWebMessageAsString，取消息正文（字符串原文或 JSON）。
+
+- static int SlotNewWinUri()
+  - ICoreWebView2NewWindowRequestedEventArgs 的 vtable 槽。
+    槽 3：get_Uri，读取新窗口要加载的目标 URI。
+
+- static int SlotNewWinHandled()
+  - 槽 6：put_Handled，声明宿主已接管新窗口请求（阻止弹原生窗口）。
+
+- static string IidWebView2_13()
+  - ICoreWebView2_13 的 IID，取 ICoreWebView2Profile 时用。
+
+- static int SlotGetProfile()
+  - ICoreWebView2_13 的 vtable 槽 3：get_Profile。
+
+- static string IidProfile2()
+  - ICoreWebView2Profile2 的 IID，取 ClearBrowsingData 时用。
+
+- static int SlotClearBrowsingData()
+  - ICoreWebView2Profile2 的 vtable 槽 3：ClearBrowsingData(kinds, handler)。
+
+- static int DataKindsAllSite()
+  - COREWEBVIEW2_BROWSING_DATA_KINDS_ALL_SITE：Cookie、各类 DOM 存储、
+    磁盘缓存与 Service Worker（"退出登录并忘记我"的取值）。
+
 - static List<WebView2> All()
   - 全部存活视图的静态表（惰性创建；下标 0 对应句柄 1）。
 
@@ -491,6 +602,11 @@ COM 对象。这两者都可用本语言表达——`Com.Call*`
 
 - static bool IsAvailable()
   - 存在 WebView2Loader.dll 和运行时环境时为 true。
+
+- static string RuntimeVersion()
+  - 系统已安装的 WebView2 运行时版本号；无加载器或无运行时
+    为 ""。注意方向：这是同步方法调用的出参（CoTaskMemAlloc），要
+    释放——与完成回调参数"只读"的规矩相反。
 
 - static int Create(nint hwnd, string profileId)
   - 创建以 `hwnd` 为父窗口的视图，按 `profileId` 隔离（共享同一 id 的视图
@@ -509,146 +625,101 @@ COM 对象。这两者都可用本语言表达——`Com.Call*`
     创建时不带 WS_VISIBLE：第一帧结算出可见区域后才显示。
 
 - bool Start(nint hwnd, string profileId)
-  - 启动序列：建宿主子窗口 → 创建 Environment（泵消息至多 8s）→
-    创建 Controller（泵至多 12s，成功时顺带取 core）→ 订阅
-    NavigationStarting/SourceChanged/NavigationCompleted 三个事件 →
-    以隐藏的零尺寸空白状态收尾。任一步失败返回 false。
+  - 启动序列：建宿主子窗口 → 异步发起 Environment 创建流水线（非阻塞，零消息泵）→
+    待 OnController 回调触发后由主消息循环自然挂载 core 并应用几何。
 
-- long Subscribe(int slot, nint sink)
-  - add_* 接受处理器和一个 EventRegistrationToken 输出参数；
-    稍后 remove_* 需要的就是这个 token。
+- void AttachCore()
+  - 在 Controller 回调就绪后挂载事件并应用排队的几何与状态。
 
-- void Unsubscribe(int slot, long token)
-  - remove_* 撤销订阅：token 装进 8 字节临时单元按地址传给 COM。
+- async bool EnsureReadyAsync(int timeoutMs=15000){ if (ready){ return true;}if (initFailed){ return false;}await readyGate.Wait(timeoutMs);return ready;}long Subscribe(int slot, nint sink){ nint token=NativeMemory.Alloc(8);new Span<long>(token, 1)[0]=0;Com.Call2(core, slot, sink, token);long t=new Span<long>(token, 1)[0];NativeMemory.Free(token);return t;}void Unsubscribe(int slot, long token){ nint cell=NativeMemory.Alloc(8);new Span<long>(cell, 1)[0]=token;Com.Call1(core, slot, (nint)token);NativeMemory.Free(cell);}static string ProfileDir(string profileId){ string userEnv=Interop.EnvVar("WEBVIEW2_USER_DATA_FOLDER");if (userEnv!=""){ return userEnv;}string id=profileId;if (id==""){ id="default";}string safe="";for (int i=0;i <id.Length;i=i+1){ char ch=id[i];if (WebView2.IsSafeChar(ch)){ safe=safe+id.Substring(i, 1);}else{ safe=safe+"_";}}string root=Interop.EnvVar("LOCALAPPDATA");if (root==""){ root=Interop.EnvVar("TEMP");}return root+"\\ZanGui\\WebView2\\"+safe;}static bool IsSafeChar(char ch){ if (ch>='a'&&ch <='z'){ return true;}if (ch>='A'&&ch <='Z'){ return true;}if (ch>='0'&&ch <='9'){ return true;}if (ch=='-'||ch=='_'){ return true;}return false;}static int OnQueryInterface(nint self, nint riid, nint ppv){ if (ppv==0){ return Com.Fail();}new Span<long>(ppv, 1)[0]=self;return 0;}static int OnAddRef(nint self){ return 2;}static int OnRelease(nint self){ return 1;}static int OnEnvironment(nint self, int hr, nint result){ WebView2 w=WebView2.Get(ComVtbl.State(self));if (w==null){ return 0;}if (Com.Ok(hr)&&result!=0){ w.env=Com.Keep(result);w.ctlSink=w.Sink((nint)WebView2.OnController);int chr=Com.Call2(w.env, WebView2.SlotCreateController(), w.host, w.ctlSink);if (!Com.Ok(chr)){ w.initFailed=true;w.gate.Signal();w.readyGate.Signal();}}else{ w.initFailed=true;w.gate.Signal();w.readyGate.Signal();}return 0;}static int OnController(nint self, int hr, nint result){ WebView2 w=WebView2.Get(ComVtbl.State(self));if (w==null){ return 0;}if (Com.Ok(hr)&&result!=0){ w.ctrl=Com.Keep(result);w.core=Com.Get(w.ctrl, WebView2.SlotGetCoreWebView2());w.AttachCore();w.ready=true;}else{ w.initFailed=true;}w.gate.Signal();w.readyGate.Signal();return 0;}static int OnNavigationStarting(nint self, nint sender, nint args){ WebView2 w=WebView2.Get(ComVtbl.State(self));if (w==null){ return 0;}if (args!=0){ w.lastRequest=Com.GetString(args, WebView2.SlotArgsUri());}w.loading=true;return 0;}static int OnNavigationCompleted(nint self, nint sender, nint args){ WebView2 w=WebView2.Get(ComVtbl.State(self));if (w==null){ return 0;}if (args!=0){ int ok=Com.GetInt(args, WebView2.SlotIsSuccess());int status=Com.GetInt(args, WebView2.SlotWebErrorStatus());if (ok!=0){ w.lastStatus=200;}else{ w.lastStatus=400+status;}}if (sender!=0){ w.url=Com.GetString(sender, WebView2.SlotGetSource());w.title=Com.GetString(sender, WebView2.SlotGetDocumentTitle());}w.loading=false;w.navSeq=w.navSeq+1;return 0;}static int OnSourceChanged(nint self, nint sender, nint args){ WebView2 w=WebView2.Get(ComVtbl.State(self));if (w==null){ return 0;}if (sender!=0){ w.url=Com.GetString(sender, WebView2.SlotGetSource());}w.navSeq=w.navSeq+1;return 0;}static int OnWebMessageReceived(nint self, nint sender, nint args){ WebView2 w=WebView2.Get(ComVtbl.State(self));if (w==null){ return 0;}if (args!=0){ string line=Com.GetString(args, WebView2.SlotTryGetWebMessage());if (line!=""){ w.PushMessage(line);}}return 0;}static int OnNewWindowRequested(nint self, nint sender, nint args){ WebView2 w=WebView2.Get(ComVtbl.State(self));if (w==null){ return 0;}if (args!=0){ string uri=Com.GetString(args, WebView2.SlotNewWinUri());Com.Call1(args, WebView2.SlotNewWinHandled(), (nint)1);if (uri!=""){ w.pendingWindowNav=uri;}}return 0;}static int OnDocScriptAdded(nint self, int hr, nint id){ WebView2 w=WebView2.Get(ComVtbl.State(self));if (w==null){ return 0;}if (Com.Ok(hr)&&id!=0){ string sid=Wide.Read(id);if (sid!=""){ w.pendingScriptId=sid;w.scriptIds.Add(sid);}}w.gate.Signal();return 0;}static int OnScriptCompleted(nint self, int hr, nint json){ WebView2 w=WebView2.Get(ComVtbl.State(self));if (w==null){ return 0;}if (Com.Ok(hr)){ w.evalResult=Wide.Read(json);}w.gate.Signal();w.evalGate.Signal();return 0;}static int OnCookiesCompleted(nint self, int hr, nint list){ WebView2 w=WebView2.Get(ComVtbl.State(self));if (w==null){ return 0;}if (Com.Ok(hr)&&list!=0){ w.cookieResult=WebView2.Serialize(list);w.cookieDetailsResult=WebView2.SerializeDetails(list);w.cookieListResult=WebView2.ExtractCookies(list);}w.gate.Signal();w.cookieGate.Signal();return 0;}static string Serialize(nint list){ int n=Com.GetInt(list, WebView2.SlotCookieCount());string outp="";for (int i=0;i <n;i=i+1){ nint cell=NativeMemory.Alloc(8);new Span<long>(cell, 1)[0]=0;int hr=Com.Call2(list, WebView2.SlotCookieAt(), i, cell);nint cookie=new Span<long>(cell, 1)[0];NativeMemory.Free(cell);if (Com.Ok(hr)&&cookie!=0){ string name=Com.GetString(cookie, WebView2.SlotCookieName());string val=Com.GetString(cookie, WebView2.SlotCookieValue());if (name!=""){ if (outp!=""){ outp=outp+"; ";}outp=outp+name+"="+val;}Com.Release(cookie);}}return outp;}static string SerializeDetails(nint list){ int n=Com.GetInt(list, WebView2.SlotCookieCount());string outp="";for (int i=0;i <n;i=i+1){ nint cell=NativeMemory.Alloc(8);new Span<long>(cell, 1)[0]=0;int hr=Com.Call2(list, WebView2.SlotCookieAt(), i, cell);nint cookie=new Span<long>(cell, 1)[0];NativeMemory.Free(cell);if (Com.Ok(hr)&&cookie!=0){ string name=Com.GetString(cookie, WebView2.SlotCookieName());string val=Com.GetString(cookie, WebView2.SlotCookieValue());string dom=Com.GetString(cookie, WebView2.SlotCookieDomain());string path=Com.GetString(cookie, WebView2.SlotCookiePath());if (name!=""){ outp=outp+name+"\t"+val+"\t"+dom+"\t"+path+"\n";}Com.Release(cookie);}}return outp;}static List<WebCookie> ExtractCookies(nint list){ List<WebCookie> result=new List<WebCookie>();if (list==0){ return result;}int n=Com.GetInt(list, WebView2.SlotCookieCount());for (int i=0;i <n;i=i+1){ nint cell=NativeMemory.Alloc(8);new Span<long>(cell, 1)[0]=0;int hr=Com.Call2(list, WebView2.SlotCookieAt(), i, cell);nint cookie=new Span<long>(cell, 1)[0];NativeMemory.Free(cell);if (Com.Ok(hr)&&cookie!=0){ string name=Com.GetString(cookie, WebView2.SlotCookieName());string val=Com.GetString(cookie, WebView2.SlotCookieValue());string dom=Com.GetString(cookie, WebView2.SlotCookieDomain());string path=Com.GetString(cookie, WebView2.SlotCookiePath());if (name!=""){ result.Add(new WebCookie(name, val, dom, path));}Com.Release(cookie);}}return result;}void SetFrame(int x, int y, int w, int h){ if (ctrl==0){ return;}if (frameSet&&x==fx&&y==fy&&w==fw&&h==fh){ return;}fx=x;fy=y;fw=w;fh=h;frameSet=true;if (host!=0){ WebView2.SetWindowPos(host, 0, x, y, w, h, 4|16);}nint rect=NativeMemory.Alloc(16);new Span<int>(rect, 1)[0]=0;new Span<int>(rect+4, 1)[0]=0;new Span<int>(rect+8, 1)[0]=w;new Span<int>(rect+12, 1)[0]=h;Com.Call1(ctrl, WebView2.SlotPutBounds(), rect);NativeMemory.Free(rect);clipSet=false;}void SetVisible(bool visible){ if (ctrl==0){ return;}if (visibleSet&&visible==this.visible){ return;}this.visible=visible;visibleSet=true;int v=0;if (visible){ v=1;}Com.Call1(ctrl, WebView2.SlotPutIsVisible(), v);if (host!=0){ int cmd=0;if (visible){ cmd=4;}WebView2.ShowWindow(host, cmd);}}void SetClip(string spec){ if (ctrl==0){ return;}if (spec.Length==0){ this.SetVisible(false);return;}if (clipSet&&spec==clipSpec){ this.SetVisible(true);return;}clipSpec=spec;clipSet=true;if (host!=0){ nint rgn=0;bool whole=false;List<string> parts=spec.Split(";");for (int i=0;i <parts.Count;i=i+1){ List<string> n=parts[i].Split(", ");if (n.Count <4){ continue;}int l=Convert.ToInt32(n[0])-fx;int t=Convert.ToInt32(n[1])-fy;int r=l+Convert.ToInt32(n[2]);int b=t+Convert.ToInt32(n[3]);if (parts.Count==1&&l <=0&&t <=0&&r>=fw&&b>=fh){ whole=true;}nint piece=WebView2.CreateRectRgn(l, t, r, b);if (piece==0){ continue;}if (rgn==0){ rgn=piece;}else{ WebView2.CombineRgn(rgn, rgn, piece, 2);WebView2.DeleteObject(piece);}}if (whole){ if (rgn!=0){ WebView2.DeleteObject(rgn);}WebView2.SetWindowRgn(host, 0, true);}else if (rgn!=0){ WebView2.SetWindowRgn(host, rgn, true);}}this.SetVisible(true);}void Navigate(string target){ if (core==0){ pendingInitUrl=target;return;}nint u=Wide.Of(target);Com.Call1(core, WebView2.SlotNavigate(), u);Wide.Free(u);}void LoadHtml(string html, string baseUrl){ if (core==0){ return;}nint h=Wide.Of(html);Com.Call1(core, WebView2.SlotNavigateToString(), h);Wide.Free(h);}void Back(){ Com.Call0(core, WebView2.SlotGoBack());}void Forward(){ Com.Call0(core, WebView2.SlotGoForward());}void Reload(){ Com.Call0(core, WebView2.SlotReload());}void StopLoading(){ Com.Call0(core, WebView2.SlotStop());}bool CanGoBack(){ return Com.GetInt(core, WebView2.SlotCanGoBack())!=0;}bool CanGoForward(){ return Com.GetInt(core, WebView2.SlotCanGoForward())!=0;}bool IsLoading(){ return loading;}string LastRequest(){ return lastRequest;}int NavSeq(){ return navSeq;}int LastStatus(){ return lastStatus;}string GetUrl(){ if (core!=0){ url=Com.GetString(core, WebView2.SlotGetSource());}return url;}string GetTitle(){ if (core!=0){ title=Com.GetString(core, WebView2.SlotGetDocumentTitle());}return title;}static void IssueOnUi(Action issue){ if (!Dispatcher.Post(issue)){ issue();}}async string EvalWithResultAsync(string js, int timeoutMs=5000){ if (core==0){ return"";}evalResult="";nint sink=this.Sink((nint)WebView2.OnScriptCompleted);evalGate=new Gate();WebView2.IssueOnUi(()=>{ nint script=Wide.Of(js);int hr=Com.Call2(core, WebView2.SlotExecuteScript(), script, sink);Wide.Free(script);if (!Com.Ok(hr)){ Console.WriteLine("[WV2]ExecuteScript hr="+Convert.ToString(hr));evalGate.Signal();}});await evalGate.Wait(timeoutMs);return evalResult;}string Eval(string js){ if (core==0){ return"";}nint sink=this.Sink((nint)WebView2.OnScriptCompleted);nint script=Wide.Of(js);evalResult="";Com.Call2(core, WebView2.SlotExecuteScript(), script, sink);Wide.Free(script);return evalResult;}static nint voidSink;
+  - 异步等待 WebView2 完全就绪（协程挂起，零消息泵，不阻塞 GUI 线程）。
 
-- static string ProfileDir(string profileId)
-  - %LOCALAPPDATA%\ZanGui\WebView2\<profile>；WebView2 按此文件夹
-    划分 Cookie 和存储，这正是配置文件隔离的原理。
+- static nint VoidSink()
 
-- static bool IsSafeChar(char ch)
-  - 保证配置文件文件夹是单个安全的路径段。
+- static int OnVoidCompleted(nint self, int hr, nint json)
+  - 空结果回调（COM）：结果串归引擎所有（见 OnDocScriptAdded 注），
+    不释放、无状态。
 
-- static int OnQueryInterface(nint self, nint riid, nint ppv)
-  - WebView2 只索取它拿到的接口，因此对任何 riid 都返回
-    `this` 是完成处理器惯常的应答方式。
+- void EvalAsync(string js)
+  - 发射后不管的 Native→JS：不泵消息等返回值，绘制/事件回调里也
+    能安全调用。
 
-- static int OnAddRef(nint self)
-  - 回调对象与视图同生命周期，因此引用计数只是名义上的。
+- bool AddHandler(string name)
+  - 注册消息通道（原生视图创建前后皆可调用；创建前由 WebView 控件
+    挂起，创建时补上）。同一通道重复注册为幂等成功。
 
-- static int OnRelease(nint self)
-  - Release 回调：恒返回 1；回调对象随视图一起释放，不单独回收。
+- void RemoveHandler(string name)
+  - 撤掉消息通道：移除 shim 脚本（对之后的页面生效），名字出活跃表
+    （当前页残留的 shim 再 postMessage 也会被名字检查挡下）。
 
-- static int OnEnvironment(nint self, int hr, nint result)
-  - Environment 创建完成回调（COM）：成功则保留 env 引用，
-    并唤醒 Start 里的 gate。
+- void PushMessage(string line)
 
-- static int OnController(nint self, int hr, nint result)
-  - Controller 创建完成回调（COM）：成功则保留 ctrl 并取 core，
-    唤醒 Start 里的 gate。
+- string TakeMessage()
 
-- static int OnNavigationStarting(nint self, nint sender, nint args)
-  - 导航开始回调（COM）：记录目标 URL 到 lastRequest，置 loading
-    （完成时由 OnNavigationCompleted 解除）。
+- int PendingMessages()
 
-- static int OnNavigationCompleted(nint self, nint sender, nint args)
-  - 导航完成回调（COM）：记录近似 HTTP 状态（成功 200，失败
-    400+WebView2 错误枚举）、URL/标题，navSeq 自增解除 loading。
+- int DroppedMessages()
 
-- static int OnSourceChanged(nint self, nint sender, nint args)
-  - SPA 导航无需完整加载即可改变 URL；此回调保持 Url()
-    的真实性。
+- string AddDocScript(string js)
+  - AddScriptToExecuteOnDocumentCreated 的一次调用：非阻塞向引擎注册（零消息泵），
+    回调到达后自动记录脚本 id。
 
-- static int OnScriptCompleted(nint self, int hr, nint json)
-  - Eval 完成回调（COM）：成功则记下 JSON 结果，唤醒 Eval 的 gate。
+- bool InjectScript(string js, bool atEnd)
+  - 每次导航都注入的脚本：atEnd=true 包一层 readyState 门，文档解析完
+    再跑（WebView2 只有"任何脚本之前"一档，document-end 语义由此
+    仿真；脚本包在闭包里，页面可见的全局需显式挂到 window 上）。
 
-- static int OnCookiesCompleted(nint self, int hr, nint list)
-  - GetCookies 完成回调（COM）：序列化 Cookie 列表到 cookieResult，
-    唤醒 gate。
+- bool InjectStyle(string css)
+  - 每次导航都注入的 CSS：包成 <style> 追加脚本（与 macOS 后端同构）。
 
-- static string Serialize(nint list)
-  - 将 Cookie 列表呈现为 "name=value; name2=value2"。
+- void ClearScripts()
+  - 撤掉全部 InjectScript/InjectStyle 注入（消息桥 shim 不受影响，
+    与 macOS 的 removeAllUserScripts 语义一致）。
 
-- void SetFrame(int x, int y, int w, int h)
-  - 把视图摆到客户区的 [x,y,w,h]：宿主子窗口移到该位置，
-    controller 在宿主内部铺满。每帧都会调，所以矩形未变时不
-    重复下发（put_Bounds 会触发一次重布局）。
+- static string JsQuote(string s)
+  - JS 字符串字面量（带双引号）：转义反斜杠、引号与控制字符，防注入
+    进的文本破坏脚本结构。
 
-- void SetVisible(bool visible)
-  - 显示或隐藏：put_IsVisible 加宿主子窗口 SW_SHOWNOACTIVATE/SW_HIDE
-    （出现不抢焦点）。状态未变时不重复下发。
+- static string ShimScript(string name)
+  - <name> 通道的 shim：把 WebView2 的 window.chrome.webview 桥包装成
+    与 macOS 同形的 window.webkit.messageHandlers.<name>.postMessage。
+    字符串原样传递，其他类型 JSON 序列化，两端正文语义一致。
 
-- void SetClip(string spec)
-  - 把本帧未被遮挡的区域（"x,y,w,h;..."，客户区坐标）下发给
-    宿主子窗口。区域为空则隐藏；刚好盖满自身矩形则去掉区域
-    （SetWindowRgn(0)），没有弹层时不给系统多余的剪裁负担。
+- static string DeferToDomReady(string js)
+  - document-end 语义仿真：解析未完挂 DOMContentLoaded，否则立即执行。
 
-- void Navigate(string target)
-  - 导航到 target；core 未就绪时忽略。
+- void SetZoom(int percent)
+  - 整页缩放，percent 为百分数（100 = 原大）。旧运行时缺 ZoomFactor
+    的情形不需处理：槽位自首个公开版即存在。
 
-- void LoadHtml(string html, string baseUrl)
-  - WebView2 没有带 base-url 的 NavigateToString 形式，因此 `baseUrl`
-    被接受但忽略。
+- void OpenDevTools()
+  - 为当前页打开 DevTools 窗口（发布给最终用户的程序不必携带）。
 
-- void Back()
-  - 历史后退一页（core 未就绪为空操作）。
+- bool ClearBrowsingData()
+  - 清掉本视图数据仓的全部网站数据（Cookie、DOM 存储、缓存、
+    Service Worker）。需要较新的运行时（ICoreWebView2Profile2）；
+    不可用时返回 false，调用方退化为只清 Cookie。
 
-- void Forward()
-  - 历史前进一页。
+- string DrainWindowNav()
+  - 取走上一帧新窗口请求记下的就地加载目标（无则为 ""）。由每帧的
+    轮询调用，把 window.open/target=_blank 落到本视图导航。
 
-- void Reload()
-  - 重新加载当前页。
+- void SetDevToolsEnabled(bool enabled)
+  - 设置是否允许开发者工具（F12、快捷键及检查元素）
 
-- void StopLoading()
-  - 停止当前加载。
+- void SetContextMenuEnabled(bool enabled)
+  - 设置是否允许默认右键上下文菜单
 
-- bool CanGoBack()
-  - 能否后退。
-
-- bool CanGoForward()
-  - 能否前进。
-
-- bool IsLoading()
-  - 是否正在加载（NavigationStarting 置位、Completed 复位）。
-
-- string LastRequest()
-  - 最近一次 OnNavigationStarting 捕获的目标 URL（导航发起即记录，
-    供挂起导航消费逻辑使用）。
-
-- int NavSeq()
-  - 导航序号与近似 HTTP 状态（事件域，不经 COM 往返）。
-
-- int LastStatus()
-  - 近似 HTTP 状态：成功 200，失败 400+WebView2 错误枚举；无导航为 0。
-
-- string GetUrl()
-  - 实时从核心对象读取当前 URL/标题（同时刷新事件缓存值）。
-
-- string GetTitle()
-  - 实时从核心对象读取当前页面标题（同时刷新事件缓存值）。
-
-- string Eval(string js)
-  - 运行 JavaScript 并等待其 JSON 结果（出错/超时返回 ""）。
+- void ApplySettings()
+  - 同步设置到底层 ICoreWebView2Settings
 
 - nint Cookies()
   - ICoreWebView2_2 带有 Cookie 管理器；较旧的运行时
     则不产生任何 Cookie。
 
-- string GetCookies(string forUrl)
-  - `forUrl` 的 Cookie，形如 "name=value; ..."；"" 表示整个存储。
-
-- void SetCookie(string forUrl, string cookieName, string cookieValue)
-  - WebView2 按主机和路径而非 URL 存储 Cookie，因此
-    从 `forUrl` 提取主机，并把 Cookie 写到站点根路径。
-
-- void ClearCookies()
-  - 清空该 profile 数据仓的全部 Cookie（运行时无 Cookie 管理器
-    时为空操作）。
-
-- static string HostOf(string url)
-  - URL 的主机部分：去掉协议、路径、查询和端口。
-
-- void Dispose()
-  - 释放 COM 引用、关闭控制器并销毁宿主子窗口与回调对象。
+- async string GetCookiesAsync(string forUrl, int timeoutMs=5000){ nint sink=this.Sink((nint)WebView2.OnCookiesCompleted);cookieResult="";cookieGate=new Gate();WebView2.IssueOnUi(()=>{ nint cm=this.Cookies();if (cm==0){ Console.WriteLine("[WV2]Cookies()returned 0!");cookieGate.Signal();return;}nint u=0;if (forUrl!=""){ u=Wide.Of(forUrl);}int hr=Com.Call2(cm, WebView2.SlotGetCookies(), u, sink);if (u!=0){ Wide.Free(u);}Com.Release(cm);if (!Com.Ok(hr)){ Console.WriteLine("[WV2]SlotGetCookies hr="+Convert.ToString(hr));cookieGate.Signal();}});await cookieGate.Wait(timeoutMs);return cookieResult;}async string GetCookieDetailsAsync(string forUrl, int timeoutMs=5000){ nint sink=this.Sink((nint)WebView2.OnCookiesCompleted);cookieResult="";cookieDetailsResult="";cookieGate=new Gate();WebView2.IssueOnUi(()=>{ nint cm=this.Cookies();if (cm==0){ Console.WriteLine("[WV2]Cookies()returned 0!");cookieGate.Signal();return;}nint u=0;if (forUrl!=""){ u=Wide.Of(forUrl);}int hr=Com.Call2(cm, WebView2.SlotGetCookies(), u, sink);if (u!=0){ Wide.Free(u);}Com.Release(cm);if (!Com.Ok(hr)){ Console.WriteLine("[WV2]SlotGetCookies hr="+Convert.ToString(hr));cookieGate.Signal();}});await cookieGate.Wait(timeoutMs);return cookieDetailsResult;}async List<WebCookie> GetCookieListAsync(string forUrl="", int timeoutMs=5000){ nint sink=this.Sink((nint)WebView2.OnCookiesCompleted);cookieResult="";cookieDetailsResult="";cookieListResult=new List<WebCookie>();cookieGate=new Gate();WebView2.IssueOnUi(()=>{ nint cm=this.Cookies();if (cm==0){ Console.WriteLine("[WV2]Cookies()returned 0!");cookieGate.Signal();return;}nint u=0;if (forUrl!=""){ u=Wide.Of(forUrl);}int hr=Com.Call2(cm, WebView2.SlotGetCookies(), u, sink);if (u!=0){ Wide.Free(u);}Com.Release(cm);if (!Com.Ok(hr)){ Console.WriteLine("[WV2]SlotGetCookies hr="+Convert.ToString(hr));cookieGate.Signal();}});await cookieGate.Wait(timeoutMs);return cookieListResult;}string GetCookies(string forUrl){ nint cm=this.Cookies();if (cm==0){ return cookieResult;}nint sink=this.Sink((nint)WebView2.OnCookiesCompleted);nint u=0;if (forUrl!=""){ u=Wide.Of(forUrl);}Com.Call2(cm, WebView2.SlotGetCookies(), u, sink);if (u!=0){ Wide.Free(u);}Com.Release(cm);return cookieResult;}void SetCookie(string forUrl, string cookieName, string cookieValue){ nint cm=this.Cookies();if (cm==0){ return;}string host=WebView2.HostOf(forUrl);if (host!=""){ nint n=Wide.Of(cookieName);nint val=Wide.Of(cookieValue);nint d=Wide.Of(host);nint p=Wide.Of("/");nint cell=NativeMemory.Alloc(8);new Span<long>(cell, 1)[0]=0;int hr=Com.Call5(cm, WebView2.SlotCreateCookie(), n, val, d, p, cell);nint cookie=new Span<long>(cell, 1)[0];NativeMemory.Free(cell);if (Com.Ok(hr)&&cookie!=0){ Com.Call1(cm, WebView2.SlotAddOrUpdateCookie(), cookie);Com.Release(cookie);}Wide.Free(n);Wide.Free(val);Wide.Free(d);Wide.Free(p);}Com.Release(cm);}void ClearCookies(){ nint cm=this.Cookies();if (cm==0){ return;}Com.Call0(cm, WebView2.SlotDeleteAllCookies());Com.Release(cm);}static string HostOf(string url){ int n=url.Length;int start=0;int i=0;while (i+2 <n){ if (url[i]==':'&&url[i+1]=='/'&&url[i+2]=='/'){ start=i+3;i=n;}else{ i=i+1;}}string host="";i=start;while (i <n){ char ch=url[i];if (ch=='/'||ch=='?'||ch=='#'||ch==':'){ return host;}host=host+url.Substring(i, 1);i=i+1;}return host;}void Dispose(){ if (core!=0){ this.Unsubscribe(WebView2.SlotRemoveNavigationCompleted(), navToken);this.Unsubscribe(WebView2.SlotRemoveNavigationStarting(), startToken);this.Unsubscribe(WebView2.SlotRemoveSourceChanged(), srcToken);this.Unsubscribe(WebView2.SlotRemoveWebMessage(), msgToken);this.Unsubscribe(WebView2.SlotRemoveNewWindow(), winToken);Com.Release(core);core=0;}if (ctrl!=0){ Com.Call0(ctrl, WebView2.SlotControllerClose());Com.Release(ctrl);ctrl=0;}if (env!=0){ Com.Release(env);env=0;}if (host!=0){ WebView2.DestroyWindow(host);host=0;}}
+  - 异步读取 `forUrl` 匹配域名的 Cookie 并在回调到达时恢复（协程挂起，
+    零消息泵，不卡死 GUI 线程）。发起经 IssueOnUi 投回 UI 线程（下同）。
 
 
 ## WebViewBackend (class)
@@ -708,6 +779,10 @@ Windows 上的引擎是 Edge WebView2，在 Zan（WebView2.zan）中
 - [DllImport("zan_gui")]static extern void zan_gui_webview_set_cookie(int h, string url, string cookieName, string cookieValue);
 
 - [DllImport("zan_gui")]static extern void zan_gui_webview_clear_cookies(int h);
+
+- [DllImport("zan_gui")]static extern void zan_gui_webview_set_devtools_enabled(int h, int enabled);
+
+- [DllImport("zan_gui")]static extern void zan_gui_webview_set_context_menu_enabled(int h, int enabled);
 
 - static int Create(nint hwnd, string profileId)
   - 创建以窗口句柄为父的视图，返回句柄。profileId 隔离
@@ -774,19 +849,11 @@ Windows 上的引擎是 Edge WebView2，在 Zan（WebView2.zan）中
   - 最近一次导航请求的 URL（导航开始时记录；无/无效句柄为 ""）。
 
 - static string Eval(int h, string js)
-  - 同步执行 JS 并取返回值（macOS 上会自旋 runloop 等待；
-    不需要返回值时优先用 EvalAsync）。失败或无引擎返回 ""。
+  - 同步执行 JS 并取返回值（非阻塞，禁止在 GUI 线程跑消息泵）。
+    如需异步等待计算结果，请优先使用 `EvalWithResultAsync`。失败或无引擎返回 ""。
 
-- static string GetCookies(int h, string url)
-  - 取 `url` 匹配域名的 Cookie（"name=value; ..." 形式；无/失败为 ""）。
-
-- static void SetCookie(int h, string url, string cookieName, string cookieValue)
-  - 为 `url` 所在域写一枚 Cookie；无效句柄被忽略。
-
-- static void ClearCookies(int h)
-  - 清掉该视图数据仓的全部 Cookie；无效句柄被忽略。
-
-- static nint guiMod=0;
+- static async string EvalWithResultAsync(int h, string js, int timeoutMs=5000){ WebView2 w=WebView2.Get(h);if (w==null){ return"";}string res=await w.EvalWithResultAsync(js, timeoutMs);return res;return WebViewBackend.zan_gui_webview_eval(h, js);return"";}static async bool EnsureReadyAsync(int h, int timeoutMs=15000){ WebView2 w=WebView2.Get(h);if (w==null){ return false;}bool ok=await w.EnsureReadyAsync(timeoutMs);return ok;return true;}static string GetCookies(int h, string url){ WebView2 w=WebView2.Get(h);if (w==null){ return"";}return w.GetCookies(url);return WebViewBackend.zan_gui_webview_get_cookies(h, url);return"";}static async string GetCookiesAsync(int h, string url, int timeoutMs=5000){ WebView2 w=WebView2.Get(h);if (w==null){ return"";}string res=await w.GetCookiesAsync(url, timeoutMs);return res;return WebViewBackend.zan_gui_webview_get_cookies(h, url);return"";}static async List<WebCookie> GetCookieListAsync(int h, string url, int timeoutMs=5000){ WebView2 w=WebView2.Get(h);if (w==null){ return new List<WebCookie>();}List<WebCookie> res=await w.GetCookieListAsync(url, timeoutMs);return res;return new List<WebCookie>();}static async string GetCookieDetailsAsync(int h, string url, int timeoutMs=5000){ WebView2 w=WebView2.Get(h);if (w==null){ return"";}string res=await w.GetCookieDetailsAsync(url, timeoutMs);return res;return"";}static void SetCookie(int h, string url, string cookieName, string cookieValue){ WebView2 w=WebView2.Get(h);if (w!=null){ w.SetCookie(url, cookieName, cookieValue);}WebViewBackend.zan_gui_webview_set_cookie(h, url, cookieName, cookieValue);}static void ClearCookies(int h){ WebView2 w=WebView2.Get(h);if (w!=null){ w.ClearCookies();}WebViewBackend.zan_gui_webview_clear_cookies(h);}static nint guiMod=0;
+  - 异步执行 JS 并等待其返回值（协程挂起，零消息泵，不阻塞 GUI 线程）。
 
 - static bool guiTried=false;
 
@@ -812,6 +879,8 @@ Windows 上的引擎是 Edge WebView2，在 Zan（WebView2.zan）中
 
 - static nint addr_setClip=0;
 
+- static nint addr_setZoom=0;
+
 - static void ResolveBridge()
   - 解析 zan_gui 里可选的 WKWebView 桥接入口。zan_gui 已被主程序加载，
     dlopen 只是拿到同一个镜像的句柄：先按可执行文件同目录找（发布包把
@@ -819,13 +888,14 @@ Windows 上的引擎是 Edge WebView2，在 Zan（WebView2.zan）中
     由 libzan_gui.so 提供（系统 WebView 后端，gui_runtime_android.c）。
 
 - static bool HasBridge()
-  - 当前平台/运行时是否支持 JS→原生 的消息桥。仅 macOS
-    运行时带桥接入口时为 true；Windows 走 WebView2 自身通道。
+  - 当前平台/运行时是否支持 JS→native 的消息桥。Windows 走
+    WebView2 的 WebMessageReceived（shim 对齐 window.webkit 语义）；
+    macOS/Android 由 zan_gui 运行时提供桥接入口时为 true。
 
 - static bool AddHandler(int h, string handlerName)
   - 注册 window.webkit.messageHandlers.<name> 消息通道；
-    页面 postMessage 的内容随后用 TakeMessage 逐条取。运行时不
-    支持时返回 false。
+    页面 postMessage 的内容随后用 TakeMessage 逐条取。运行时
+    不支持时返回 false。
 
 - static void RemoveHandler(int h, string handlerName)
   - 撤掉 AddHandler 注册的消息通道；不支持时为空操作。
@@ -852,18 +922,120 @@ Windows 上的引擎是 Edge WebView2，在 Zan（WebView2.zan）中
   - 撤掉全部注入脚本与样式；不支持时为空操作。
 
 - static void EvalAsync(int h, string js)
-  - 不等待结果的 Native→JS 调用（Eval 会自旋 runloop 等
-    返回值）；运行时没有这个入口时退回同步 Eval。
+  - 不等待结果的 Native→JS 调用（Eval 会泵消息等
+    返回值，从绘制/事件回调里调不合适）；运行时没有这个入口时
+    退回同步 Eval。
 
 - static void ClearData(int h)
   - 清掉该视图数据仓的全部网站数据（Cookie、缓存、
-    localStorage…）；运行时不支持时退化为只清 Cookie。
+    localStorage…）。Windows 上运行时带 Profile2 接口时走
+    ClearBrowsingData(ALL_SITE)，否则退化为只清 Cookie；macOS/Android
+    运行时不支持时同样退化。
+
+- static void SetZoom(int h, int percent)
+  - 整页缩放，percent 为百分数（100 = 原大）。macOS/Android
+    需运行时带 set_zoom 入口（旧库没有时为空操作）。
+
+- static void OpenDevTools(int h)
+  - 为当前页打开 DevTools。Windows 直接开窗口；macOS 由
+    创建时的 developerExtrasEnabled 支持右键检查，无程序化入口，
+    因而为空操作。
+
+- static void SetDevToolsEnabled(int h, bool enabled)
+  - 设置是否允许开发者工具（F12、快捷键及检查元素）。
+    Windows 走 ICoreWebView2Settings，macOS/Android 走原生桥接设置。
+
+- static void SetContextMenuEnabled(int h, bool enabled)
+  - 设置是否允许默认右键上下文菜单。
+    Windows 走 ICoreWebView2Settings，macOS/Android 走原生桥接设置。
+
+- static string DrainWindowNav(int h)
+  - 取走上一帧记下的新窗口就地加载目标（无则为 ""）。每帧
+    由 Render 轮询：window.open/target=_blank 被接管后在下一帧落到
+    本视图导航，避免在事件回调内重入导航。
+
+
+## WebViewBootstrap (class)
+
+WebView 家族的 HeavyControls/链接路由注册入口。IDE、浏览器示例
+等真正用到 WebViewBox 的宿主在启动时调用一次 `Install`；
+不调用的程序里整个 WebView 家族被裁掉，发布不再携带
+WebView2Loader.dll（bundle 的 "if WebView2_" 前缀条件）。
+
+Install 同时向 App 注册 <a href> 内嵌导航器（宿主就地图优先，
+没有就懒建 App 级链接窗口）：LinkWindow/WebViewBox 只住在本目录，
+App 编译图不背 WebView（auto-stdlib 按 using 整目录拉入），
+未安装的程序链接直开系统浏览器。原 App.UseWebview 的业务入口
+由 `UseAsLinkTarget` 承接。WebView2Loader.dll 也按
+组件驱动存放（本目录 drivers/，清单以 "if WebView" 前缀门控），
+不用 WebView 的程序发布不携带。
+
+- static bool installed;
+
+- static WebViewBox hostBox;
+  - 宿主注册的内嵌就地图（UseAsLinkTarget）：非空且属于发起
+    导航的 App 时链接就地 Navigate 它，不开链接窗口。
+
+- static App hostBoxOwner;
+
+- static LinkWindow linkWin;
+  - App 级链接窗口（原 App.linkWin）：首次点链接懒建，之后
+    复用；关掉后再点重建。
+
+- static void Install()
+
+- static void UseAsLinkTarget(App app, WebViewBox box)
+  - 业务侧注册宿主自有的内嵌网页视图（如应用自带的浏览器标签，
+    原 App.UseWebview）：之后 <a href> 的缺省路由就地 Navigate 它
+    而不开链接窗口。传 null 注销。WebView 运行时不可用
+    （IsSupported false）的注册会被导航忽略并走链接窗口/系统浏览器。
+
+- static bool NavigateLink(App app, string url)
+  - App.linkNavigator 的实现（见 Gui.LinkNavigateFn）：总是返回
+    true——WebView 不可用的回落在 LinkWindow 首帧内部完成。
+
+- static Control MakeWebViewBox(string kind)
+
+- [DllImport("urlmon", EntryPoint="URLDownloadToFileW")]static extern int UrlDownloadToFile(nint caller, nint url, nint file, int reserved, nint callback);
+
+- [DllImport("ntdll", EntryPoint="RtlGetVersion")]static extern int RtlGetVersion(nint info);
+
+- [DllImport("kernel32", EntryPoint="CreateProcessW")]static extern int CreateProcess(nint app, nint cmdline, nint procAttr, nint threadAttr, int inheritHandles, int flags, nint env, nint dir, nint startupInfo, nint procInfo);
+
+- [DllImport("kernel32", EntryPoint="WaitForSingleObject")]static extern int WaitForSingleObject(nint handle, int ms);
+
+- [DllImport("kernel32", EntryPoint="CloseHandle")]static extern int CloseHandle(nint handle);
+
+- [DllImport("shell32", EntryPoint="ShellExecuteW")]static extern nint ShellExecute(nint hwnd, nint verb, nint file, nint parameters, nint dir, int show);
+
+- static string BootstrapperUrl()
+  - 微软官方 Evergreen Bootstrapper 直链（fwlink 永久重定向）。
+
+- static bool EnsureRuntime()
+  - 确保系统装着 WebView2 运行时，可直接内嵌网页时返回
+    true。没装则下载官方 bootstrapper 静默安装（会弹一次 UAC 提权，
+    视网速等半分钟到几分钟），装成功返回 true——之后要**新建
+    WebView/WebViewBox 实例**才会重试创建（旧实例 created 标志是
+    一次性的）。Win7/8.1 打开官方下载页并返回 false（由用户装
+    109 离线包，程序里 <c>IsSupported()</c> 为 false 时引导即可）。
+    macOS 返回 true（WKWebView 系统自带），其他平台返回 false。
+    建议在首帧发现 <c>IsSupported()==false</c> 时询问用户后再调，
+    不要默认静默下载执行安装程序。
+
+- static bool IsWindows7Or8()
+  - Win7/8.1 判定：ntdll RtlGetVersion 的主版本号 < 10。
+
+- static bool RunInstaller(string exe)
+  - 以 `exe` 为命令行首起进程并等它退出（至多 10 分钟）：
+    bootstrapper 的 manifest 自带提权，UAC 弹窗由它自己触发。
+
+- static void OpenUrl(string url)
 
 
 ## WebViewBox (class)
 
 可摆放的网页视图控件：把原生 WebView 包成一个普通的保留式
-Control，因此设计器 / .zform 里的网页视图和别的控件一样，
+Control，因此设计器 / .html 设计稿里的网页视图和别的控件一样，
 由布局给它一块矩形、由它自己负责绘制。
 
 WebViewBox box = new WebViewBox();
@@ -897,7 +1069,7 @@ box.View().NavComplete += () => { ... };
     本控件唯一拥有的 WebView 实例。
 
 - void SetStartUrl(string u)
-  - 起始地址（设计属性 `url`，.zform 里也可写成
+  - 起始地址（设计属性 `url`，设计文档里也可写成
     `placeholder`）。首帧之前设置只记录起始地址，待首次绘制时
     导航一次；首帧之后设置立即等同于 Navigate。
 
@@ -918,6 +1090,12 @@ box.View().NavComplete += () => { ... };
 
 - void Stop()
   - 停止当前加载。
+
+- void SetZoom(int percent)
+  - 整页缩放（百分数，100 = 原大；25..500 截断），转发底层视图。
+
+- void OpenDevTools()
+  - 为当前页打开 DevTools（见 WebView.OpenDevTools）。
 
 - bool CanGoBack()
   - 能否后退。
@@ -957,6 +1135,10 @@ box.View().NavComplete += () => { ... };
 - override void BindEvent(string evt, Action a)
   - 浏览器的语义事件挂在原生视图上，设计里的 `onNavComplete`
     之类因此直接落到它的 UiEvent，宿主不必自己接线。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - override void OnPaint(App app)
   - 绘制：零尺寸时隐藏原生视图；首帧前先消费起始地址（原生视图
@@ -1002,6 +1184,22 @@ CreateCoreWebView2EnvironmentWithOptions，加载器唯一的扁平导出。
 
 ## int (delegate)
 
+GetAvailableCoreWebView2BrowserVersionString 的调用形式：查系统
+已安装运行时的版本号。
+
+`delegate int WvGetVersionFn(nint folder, nint version);`
+
+
+## int (delegate)
+
+ICoreWebView2Controller::put_ZoomFactor：双精度缩放系数按值传递
+（x64 ABI 走 xmm 寄存器，不能用指针型委托代替）。
+
+`delegate int WvPutZoomFn(nint self, double zoom);`
+
+
+## int (delegate)
+
 `delegate int WvNameFn(int h, string name);`
 
 
@@ -1028,3 +1226,8 @@ CreateCoreWebView2EnvironmentWithOptions，加载器唯一的扁平导出。
 ## void (delegate)
 
 `delegate void WvVoidIntFn(int h);`
+
+
+## void (delegate)
+
+`delegate void WvZoomIntFn(int h, int percent);`

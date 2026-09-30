@@ -1,6 +1,97 @@
 # Gui.Component
 
-> 源码: `stdlib/Gui/Component/ChatView.zan`, `stdlib/Gui/Component/ConsoleView.zan`, `stdlib/Gui/Component/Dock.zan`, `stdlib/Gui/Component/FilePicker.zan`, `stdlib/Gui/Component/FileTree.zan`, `stdlib/Gui/Component/GraphView.zan`, `stdlib/Gui/Component/LogView.zan`, `stdlib/Gui/Component/PropertyGrid.zan`, `stdlib/Gui/Component/Ribbon.zan`, `stdlib/Gui/Component/SessionList.zan`
+> 源码: `packages/Zan.Gui.CodeEditor/src/Gui/Component/ChatView.zan`, `packages/Zan.Gui.CodeEditor/src/Gui/Component/ConsoleView.zan`, `stdlib/Gui/Component/Dock.zan`, `stdlib/Gui/Component/EditorPalette.zan`, `stdlib/Gui/Component/FilePicker.zan`, `stdlib/Gui/Component/FileTree.zan`, `stdlib/Gui/Component/GraphView.zan`, `stdlib/Gui/Component/LogView.zan`, `stdlib/Gui/Component/PropertyGrid.zan`, `stdlib/Gui/Component/Ribbon.zan`, `stdlib/Gui/Component/SessionList.zan`
+
+
+## ChatBubble (class)
+
+气泡模式里的一条：一条消息在内容坐标里的位置，以及它要画的东西。
+由 `ChatView.BuildBubbles` 生成、`PaintBubbles` 消费，宿主看不到。
+
+与记录模式的行表（`TextRun`）分开，是因为两者不是一回事：记录模式
+的消息是「若干等高的展示行」，气泡模式的消息是「一个宽度按内容、
+高度按换行结果的可变盒子」。把气泡硬塞进行表，量出来的宽度与画出来
+的盒子迟早对不上。
+
+- int idx;
+  - 消息在 `data` 里的下标；-1 表示这不是一条消息（busy 提示行）。
+
+- int top;
+  - 内容坐标里的顶边，以及这块占的高度（含名字行与时刻分隔）。
+
+- int h;
+
+- int divH;
+  - 顶部为时刻分隔预留的高度（0 = 这条不画分隔）与要画的文本。
+
+- string divText;
+
+- int nameH;
+  - 名字行高度（群聊里别人的消息才有）与名字。
+
+- string name;
+
+- int quoteH;
+  - 引用块高度（这条消息是「引用某条消息」的回复时非 0）与内容：
+    被引人的显示名 + 原文摘要。IM 客户端把引用画在正文上方那一条，
+    与名字行占的是同一段纵向空间的两个位置（引用在下、名字在上）。
+
+- string quoteWho;
+
+- string quoteText;
+
+- string quoteShown;
+  - 已经省略号截好的引用行（`引用者: 摘要`），绘制时直接画它，
+    免得每帧在一段长摘要上做一次二分。
+
+- List<string> lines;
+  - 气泡正文的换行结果与最长行宽（图片气泡为空 / 0）。
+
+- WrappedText linesAt;
+  - 展示行 → 正文的字节偏移账（与 `lines` 同长）：鼠标落点换算成
+    正文偏移、选区高亮反算每行的像素区间都要它。图片气泡为空。
+
+- int textW;
+
+- int imgW;
+  - 图片气泡的画面尺寸（0 = 文本气泡）。
+
+- int imgH;
+
+- string imgPath;
+  - 图片气泡的图片路径（`imgW > 0` 时有效）。
+
+- string initial;
+  - 头像首字与配色类名（busy 行没有头像）。
+
+- string avaCls;
+
+- bool mine;
+  - 这条是「我」发的（右对齐、头像在右）。
+
+- int bw;
+  - 气泡自身的宽高（含内边距）。
+
+- int bh;
+
+- bool waiting;
+  - busy 提示行：气泡用弱色画、不跟任何消息关联。
+
+- ChatBubble()
+  - 全部字段显式归零：`new` 出来的实例不依赖语言对未赋值字段的默认值。
+
+
+## ChatHit (class)
+
+气泡模式里的一处落点：命中第几条消息、落在正文的第几个字节。
+选择按「消息下标 + 正文偏移」记（不是展示行/列）——展示行随窗口
+宽度重排，正文偏移不会，改窗口宽度后选区仍框住同一段文字。
+
+- int msg;
+
+- int off;
+
+- ChatHit()
 
 
 ## ChatMessage (class)
@@ -38,8 +129,37 @@
     字段），头行就不显示时刻。流式那条气泡在建出来时定下这个值，后面
     每一拍只改正文，因此显示的是「这一轮开始说话的时间」。
 
+- string img;
+  - 图片附件路径（本地文件 / http(s) / data URI，交给 `Gui.Widget.Image`
+    解码）。非空时这一轮在气泡模式里画成一张图片气泡；正文仍然保留，
+    供记录模式（ChatStyle.Log）与复制使用。
+
+- string msgId;
+  - 宿主的消息 id（IM/服务端场景按 id 对账增量流；"" = 本地消息）。
+
+- int mark;
+  - 回执位（IM 用）：0 发出 / 1 送达 / 2 已读 / -1 别人的消息。
+    渲染走 kind（宿主把 mark 翻成 "wx-acked" 一类的节拍串）。
+
+- string quoteWho;
+  - 引用回复：被引消息的发送者显示名与原文摘要（"" = 这条不是回复）。
+    引用块画在自己气泡内、正文之上，与 IM 客户端的观感一致。
+
+- string quoteText;
+
+- string quoteId;
+  - 被引消息的宿主 id（发送时原样回给服务端，对端才能还原引用关系）。
+
+- bool card;
+  - 卡片消息（任务卡片一类「整体即入口」的消息）：左键单击（未拖动）
+    交给宿主 OnBubbleActivate，不进文本选区——卡片没有可选中正文，
+    IM 惯例里单击选区对它没有意义。默认 false。
+
 - static ChatMessage Create(string role, string text)
   - 一条普通消息：无思考、无信封，时间戳取当前 UTC 时刻。
+
+- static ChatMessage CreateImage(string role, string path, string text)
+  - 一条带图片的消息（气泡模式画图片，记录模式画正文）。
 
 - static ChatMessage CreateWithReason(string role, string text, string reason)
   - 带思考过程的普通消息。
@@ -94,6 +214,19 @@
   - 英文默认文案；宿主按需覆盖字段即可。
 
 
+## ChatStyle (class)
+
+聊天视图的排版模式。
+
+- static int Log()
+  - 工具调用式记录（默认）：整宽行、轮次色块、头行横幅。适合助手/工具
+    会话——那里每一条背后都跟着一大段工件，气泡会把它挤成窄柱。
+
+- static int Bubble()
+  - IM 气泡：左右分置的圆角气泡、头像、时刻与发送者名字在外的聊天记录。
+    适合人对人的会话（微信/QQ 那种一次一两句的往来）。
+
+
 ## ChatView (class)
 
 可复用的**聊天视图控件**：消息流 + markdown-lite 排版 + 思考过程与
@@ -118,6 +251,32 @@ code-behind 只调用 `Bind` / `SetBusy`。
 - ChatSpeakerOf speakerOf;
 
 - ChatKindLabel kindLabelOf;
+
+- int style;
+  - 排版模式（ChatStyle.Log / ChatStyle.Bubble）。
+
+- ChatClock clockOf;
+  - 时刻格式化钩子（null = 组件内置的本机时区 HH:MM）。
+
+- ChatAvatarClick avatarClick;
+  - 气泡头像被点中时的宿主回调（bubble 模式专用，见 AvatarHit）。
+
+- ChatBubbleMenu bubbleMenu;
+  - 气泡上右键的宿主回调（bubble 模式；null = 不响应右键）。
+
+- ChatBubbleMenu bubbleActivate;
+  - 卡片消息（msg.card）左键单击的宿主回调（null = 卡片不响应单击）。
+
+- int actMsg;
+  - 卡片单击的按下状态：命中消息下标与按下点（未拖动即视为单击）。
+
+- int actX;
+
+- int actY;
+
+- App uiApp;
+  - 命中测试要从鼠标坐标换算气泡几何，而点击事件到达时手里没有
+    App 参数——OnPaint 把当帧的 app 缓存下来供 AvatarHit 用。
 
 - List<TextRun> cache;
   - 正在排的那份行表，以及增量重排用的水位线：`cacheTurns` 之前的
@@ -155,6 +314,44 @@ code-behind 只调用 `Bind` / `SetBusy`。
 
 - Label emptyLbl;
 
+- List<ChatBubble> bub;
+  - 量好的气泡几何（内容坐标，不含滚动偏移）。
+
+- string bubKey;
+  - 几何缓存对应的输入签名（"" = 还没量过）。
+
+- int bubH;
+  - 几何的总高度（内容坐标），滚动条的界限由它和视口高算出。
+
+- bool bubStale;
+  - 本次几何是整份重排（会丢弃选区）。
+
+- SignalInt bscr;
+  - 气泡模式的像素滚动信号（0 = 贴住最新一条）。
+
+- int bubWMille;
+  - 气泡正文的最大宽度比例（千分比），由 `WithBubbleWidth` 给。
+
+- string bubSig;
+  - 上次量气泡用的布局签名（`BubbleLayoutSig`），变了就是整份重排。
+
+- bool showNames;
+  - 别人的气泡上方显示发言人名字（群聊）。自己发的永远不显示。
+
+- int selMsg0;
+
+- int selOff0;
+
+- int selMsg1;
+
+- int selOff1;
+
+- bool selDrag;
+
+- ChatQuote quoteCb;
+  - 宿主回调：用户对某条消息选择「引用」。文本是选中部分（没有选区
+    就是整条），宿主据此在输入区拉起引用条。
+
 - ChatView()
   - 空视图：英文默认文案，常驻的记录网格与空态提示都已建好
     （是否显示由每帧绘制决定）。
@@ -174,6 +371,27 @@ code-behind 只调用 `Bind` / `SetBusy`。
 - ChatView WithSpeakers(ChatSpeakerOf who, ChatKindLabel kindLabel)
   - 多智能体会话的外观解析钩子（单助手程序不必调用）。
 
+- ChatView WithStyle(int st)
+  - 排版模式（ChatStyle.Log / ChatStyle.Bubble）。换了模式要整份重排。
+
+- ChatView WithClock(ChatClock c)
+  - 时刻格式化钩子（气泡模式的时刻分隔与气泡尾巴小字都走它）。
+
+- ChatView WithBubbleWidth(int mille)
+  - 气泡正文的最大宽度（占视口宽的千分比，默认 620 = 六成）。窗口
+    很宽时一条短消息拉满整屏并不好读，这个上限就是「一句话最长能
+    占多宽」；窗口变窄时气泡仍然按可用宽度收窄，不会溢出。
+
+- int Style()
+  - 当前排版模式。
+
+- ChatView WithSpeakerNames(bool on)
+  - 别人的气泡上方是否显示发言人名字（群聊场景）。一对一聊天关掉它：
+    左边永远只有一个人，名字行只是白占一行高度。
+
+- string Clock(long at)
+  - 本机时区下这条消息的显示文本；没有记时间的旧消息返回 ""。
+
 - static string ClockText(long at)
   - 一条消息头行右侧的本机时区时刻（HH:MM）；没有记时间的旧消息返回 ""。
 
@@ -186,6 +404,10 @@ code-behind 只调用 `Bind` / `SetBusy`。
 - SignalInt Scroll()
   - 底端锚定的滚动偏移信号（0 = 贴住最新一行）。
 
+- SignalInt BubbleScroll()
+  - 气泡模式的像素滚动偏移信号（0 = 贴住最新一条）。宿主把它接到
+    自己的滚动记忆上时用；不接也不影响滚轮与拖动。
+
 - void Reset()
   - 换掉一整份记录（切换会话）：缓存、折叠、选区与滚动全部归零。
 
@@ -193,18 +415,86 @@ code-behind 只调用 `Bind` / `SetBusy`。
   - 下一帧整份重排（文案、字号或钩子变了）。
 
 - string SelectedText()
-  - 当前选中的文本（未选中则 ""）。
+  - 当前选中的文本（未选中则 ""）。气泡模式下回答气泡选区，
+    记录模式下回答行网格选区——宿主两个模式都可能用。
+
+- bool HasSelection()
+  - 气泡模式下是否有选区（宿主菜单据此决定「复制」是灰的还是亮的）。
+
+- void ClearSelection()
+  - 清空当前选择（气泡/记录两模式通用）。
 
 - override void OnPaint(App app)
   - 绘制：按有无消息在记录网格与空态提示间切换；消费滚轮、做
     增量重排（受时间预算约束），把排好的行、滚动、选区与折叠
     状态交给常驻的 StyledText 呈现。
 
+- ChatView OnAvatarClick(ChatAvatarClick cb)
+  - 宿主注册「气泡头像被点」回调；链式返回自己。
+
+- void AvatarHit()
+  - 点击命中测试：只有 bubble 模式响应。点击坐标来自缓存的
+    uiApp（事件到达在两帧之间，没有 app 参数），气泡几何与
+    PaintBubbles 同一套换算：先滚动态偏移出每条气泡的 y，
+    头像在气泡同行一侧（我方在右、对方在左），直径 34 缩放像素。
+
+- ChatHit HitBubble(App app, int mx, int my, bool clamp)
+  - 把视口坐标换成「第几条消息、正文第几个字节」。
+    `clamp` 为真时越界的 y 收进最近的一条（拖选时指针拖出视口上下的
+    常用语义），为假时返回 msg = -1（右键/按键只认真实落点）。
+
+- void SelRange(out int m0, out int o0, out int m1, out int o1)
+  - 选择区间归一化后的两端（谁在文档里靠前谁当起点）。
+
+- string BubbleSelectionText()
+  - 气泡模式下选中的文本（跨消息拼接，未选中为 ""）。
+
+- bool HasBubbleSelection()
+  - 有选区（跨一个字符即算）。
+
+- void ClearBubbleSelection()
+  - 清掉气泡选区。
+
+- ChatHit SnapHit(ChatHit h)
+  - 起始偏移落在某个字符中间时钳到边界（拖选端点不得切开多字节字符）。
+
+- void BubbleMouse(App app)
+  - 气泡模式的鼠标处理：按下起选、移动续选、松开收尾、双击选整条、
+    右键把落点交给宿主菜单。滚动拖动与头像点击优先，命中不了正文
+    的落点不建立选区。
+
+- void BubbleDoubleClick(App app)
+  - 双击选整条（IM 惯例：双击一条消息选中它，右键即可引用/复制）。
+
+- ChatView OnBubbleMenu(ChatBubbleMenu cb)
+  - 宿主注册「气泡被右键」回调（复制/引用/转发一类菜单由宿主出）。
+
+- ChatView OnBubbleActivate(ChatBubbleMenu cb)
+  - 宿主注册「卡片消息被单击」回调（任务卡片一类整体即入口的消息；
+    只对 msg.card = true 的消息生效，见 BubbleMouse）。
+
+- ChatView OnQuote(ChatQuote cb)
+  - 宿主注册「引用了一条消息」回调（选中部分或整条）。
+
+- string NameOf(int idx)
+  - 消息的显示名（引用块里标「引用谁」用；与气泡上方的发言人同一口径）。
+
+- void TakeBubbleWheel(App app)
+  - 指针在气泡区上时滚轮滚动：气泡是像素滚动的，一档滚 40px（约一
+    行多一点），而不是记录模式的一整行。
+
 - void TakeWheel(App app)
   - 指针在记录上时滚轮滚动。
 
 - void TakeCopy(App app)
   - 指针在记录上时 Ctrl+C 复制选中的文本。
+
+- void TakeBubbleCopy(App app)
+  - 气泡模式下 Ctrl+C 复制选区、Ctrl+A 全选当前会话。
+    按键是窗口级事件，不要求指针正悬在控件上（记录模式那条
+    旧口径要求鼠标在框内，是当年点选语义的遗留；键盘复制不该
+    因为鼠标恰好移开了就失效）。命中区间用本控件的矩形限定：
+    一个窗口里叠着多个 ChatView 时不让它们一起响应。
 
 - void Build(App app)
   - 换行缓存：只有记录、宽度、字号或折叠状态变了才重建，而且只有
@@ -258,6 +548,48 @@ code-behind 只调用 `Bind` / `SetBusy`。
   - 只排 [from, to) 这几轮并**追加**进缓存。这样切分让已定型轮次的
     换行结果留下来，只重排正在流式输出的那一轮。
 
+- static int BubbleTimeGap()
+  - 两条消息相隔多久才插一条时刻分隔。5 分钟内连着说的几句算一轮，
+    只在轮次开头报一次时间——和 IM 客户端的手感一致。
+
+- static int BubbleFont(App app)
+  - 气泡正文的字号。
+
+- string BubbleLayoutSig(App app)
+  - 话轮几何的输入签名。它一变，整份重排（行宽全变），因此与
+    缓存键分开算：`layoutSig` 记账、`keyNow` 判断这一帧要不要干活。
+
+- void BuildBubble(App app)
+  - 把消息流量成一列可变高的气泡盒子（内容坐标）。换行结果缓存在
+    `bub` 里，只有签名变了才重算——`TextWrap.Lines` 是逐字符量宽，
+    每次绘制都重排一份长会话会把帧预算吃光。
+
+- string SpeakerName(ChatMessage msg)
+  - 发言者显示名（多智能体会话走 `speakerOf`，否则用文案里的助手名）。
+
+- string SpeakerInitial(ChatMessage msg)
+  - 发言者头像里的首字。
+
+- string InitialOf(string name)
+  - 名字首字（与 `StyledText.Initial` 同一套字符边界规则）。
+
+- void PaintBubbles(App app)
+  - 画一列气泡：时刻分隔居中、气泡靠发送者一侧、头像在最外侧，
+    图片气泡按 contain 铺进盒内。滚动是「离底部多少像素」，
+    滚轮与滚动条动的是同一个量。
+
+- static SignalInt bubbleBar;
+  - 滚动条要的是「像素、从顶算」，气泡滚动是「像素、从底算」；
+    常驻一个转换信号，免得每帧新分配。
+
+- static SignalInt BubbleBarSig()
+
+- static Avatar bubbleAva;
+  - 气泡头像复用同一实例：每个可见气泡都要一枚，每帧每气泡新分配
+    一个控件正是长会话卡顿的来源（与 StyledText 的头行头像同理）。
+
+- static Avatar BubbleAvatar()
+
 - static string SelectionText(List<TextRun> rows, LogState st)
   - `cache` 中选中的文本（换行拼接，未选中则 ""）。
 
@@ -266,7 +598,7 @@ code-behind 只调用 `Bind` / `SetBusy`。
 
 尾部滚动、可选择的控制台视图**控件**：把 LogView 的滚动与
 选择状态包进一个标准 retained 控件，于是声明式界面
-（`.zform`）可以像放 ListView 一样直接声明一个控制台，
+（.html 设计稿）可以像放 ListView 一样直接声明一个控制台，
 宿主只需要绑定行列表。行颜色可选。
 
 - List<string> data;
@@ -787,6 +1119,127 @@ Center 是其他所有面板围绕停靠的区域。
   - 其他面板围绕停靠的中央区域。
 
 
+## EditorPalette (class)
+
+代码编辑器语法高亮及其
+弹出组件（右键菜单、自动补全、悬停提示、引用列表）的语义颜色。
+语法与选区颜色跟随当前皮肤（亮/暗
+背景）；弹出组件在任何皮肤下都保持经典暗色调色板，
+确保浮层在任意编辑器背景上都清晰可读。
+
+- int keyword;
+
+- int type;
+
+- int str;
+
+- int comment;
+
+- int number;
+
+- int plain;
+
+- int selection;
+
+- int popupBg;
+
+- int panelBg;
+
+- int hoverBg;
+
+- int border;
+
+- int selBg;
+
+- int accent;
+
+- int signature;
+
+- int menuText;
+
+- int text;
+
+- int textSel;
+
+- int muted;
+
+- int lineNo;
+
+- int link;
+
+- int iconMethod;
+
+- int iconType;
+
+- int iconSnippet;
+
+- int iconEnum;
+
+- int iconDefault;
+
+- int iconDisabled;
+
+- int iconGlyph;
+
+- int iconGlyphDisabled;
+
+- int error;
+
+- int errorDim;
+
+- int errTipBg;
+
+- int errTipText;
+
+- int warn;
+
+- int warnLineBg;
+
+- int changeLabel;
+
+- int caretSecondary;
+
+- int minimapBg;
+
+- int minimapThumb;
+
+- int scrollThumb;
+
+- int shadowSoft;
+
+- int shadow;
+
+- int shadowMed;
+
+- int shadowStrong;
+
+- static EditorPalette Dark()
+  - 经典暗色调色板（VS 风格）。
+
+- static EditorPalette Light()
+  - 浅色背景语法，弹出组件保持不变。
+
+- static EditorPalette For(Gui.Theme t)
+  - 根据皮肤背景亮度选择对应的调色板。
+
+- static EditorPalette Preset(int idx)
+  - 编辑器配色主题选择器使用的命名预设语法调色板，基于
+    暗色 chrome。idx：0 = Dark+（默认），1 = Monokai，2 = Dracula，
+    3 = Solarized Dark，4 = Night Owl，5 = High Contrast。
+
+- static EditorPalette PresetFor(int idx, bool lightBg)
+  - 命名预设随皮肤背景亮度的变体：暗色背景沿用经典暗色预设；
+    浅色背景返回同色系加深、白底上可读的浅色变体。没有这一层，
+    宿主把暗底预设推给编辑器后，亮色皮肤的白底上画的就是
+    浅灰/亮蓝的暗底文字——刺眼且不可读。
+    浅色变体的每个角色色在白底上的对比度都不低于 4.5:1（WCAG AA
+    正文），因此同色系里偏亮的青/黄/绿需要压暗后才能上白底。
+    idx 含义见 `Preset`。
+
+- static EditorPalette Chrome()
+  - 两种调色板共用的暗色弹出组件。
+
+
 ## FileFilter (class)
 
 一个底部扩展名过滤器：显示标签和其以 ";" 分隔的模式
@@ -963,7 +1416,7 @@ Center 是其他所有面板围绕停靠的区域。
 
 - void ExpandAncestors(string dir)
 
-- void BuildTree(string dir, int depth, List<string> paths, List<int> depths)
+- void BuildTree(string dir, int depth, List<FilePickerTreeNode> nodes)
 
 - void Begin(int pickerMode, string initial, string extension, string defaultName, string dialogTitle)
 
@@ -1047,8 +1500,8 @@ Center 是其他所有面板围绕停靠的区域。
 
 - void Finish(int action)
 
-- bool InMultiSelection(int idx, List<string> paths)
-  - `idx` 行在多选集合里时为 true。列表行每帧重建（names/paths
+- bool InMultiSelection(int idx, List<FilePickerItem> items)
+  - `idx` 行在多选集合里时为 true。列表行每帧重建（items
     是 RenderContent 的局部量），这里按路径字符串比较——多选集合
     存的本来就是路径。
 
@@ -1080,6 +1533,30 @@ Center 是其他所有面板围绕停靠的区域。
     桌面（窗口模式）本函数是 no-op，宿主可以无条件调用。
 
 - void RenderContent(App app)
+
+
+## FilePickerItem (class)
+
+列表条目实体（名称 + 路径 + 类型 0:文件 1:文件夹），保证数据一致性。
+
+- public string name;
+
+- public string path;
+
+- public int kind;
+
+- public FilePickerItem(string name, string path, int kind)
+
+
+## FilePickerTreeNode (class)
+
+目录树节点实体（路径 + 缩进层级），保证数据一致性。
+
+- public string path;
+
+- public int depth;
+
+- public FilePickerTreeNode(string path, int depth)
 
 
 ## FileTree (class)
@@ -1257,13 +1734,17 @@ Activate，而是触发 Blocked，让宿主说明还差哪一步。
   - 覆写：CSS 类型选择器名（"graph"）。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（empty/class）。
+  - 覆写：返回设计器属性清单（empty）。
 
 - override List<string> Events()
   - 覆写：公共事件之外提供 "Select"/"Activate"/"Blocked"/"Context"。
 
 - override void BindEvent(string evt, Action a)
   - 覆写：四个语义事件各挂对应 UiEvent，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - GraphView Bind(List<GraphNode> nodes)
   - 绑定调用方的节点列表；不复制任何内容。
@@ -1507,6 +1988,9 @@ grid.RenderInside(app, new Rect(x, y, w, h));
 - List<SelectBox> picks;
   - 下拉行的编辑器（按行索引对齐，非下拉行为 null）。
 
+- List <List<int>> pickSegIds;
+  - 选项少于等于 4 个时的分段单选按钮稳定控件 id。
+
 - List<int> minusIds;
   - 整数属性行的 -/+ 步进按钮稳定控件 id（按行索引对齐，
     非整数行也占位）。
@@ -1521,6 +2005,9 @@ grid.RenderInside(app, new Rect(x, y, w, h));
 
 - SignalInt scroll;
   - 纵向滚动偏移（像素）。
+
+- public int LabelWidth;
+  - 自定义标签列宽（逻辑像素，0 = 自动根据内容自适应）。
 
 - string Empty;
   - 没有属性时显示的文本（"" 不画）。
@@ -1602,6 +2089,10 @@ grid.RenderInside(app, new Rect(x, y, w, h));
 
 - override void BindEvent(string evt, Action a)
   - 绑定事件："Change" 接 UiEvent，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 
 ## Ribbon (class)
@@ -1809,3 +2300,37 @@ SessionList 在单帧内报告的内容：切换、删除或新建聊天点击�
 把协议节拍（`ChatMessage.kind`）翻成头行右侧的状态标签。
 
 `delegate string ChatKindLabel(string kind);`
+
+
+## string (delegate)
+
+把消息时刻翻成要显示的文本（气泡模式下是分隔时刻与气泡尾巴上的小字）。
+给了它就由宿主决定格式（含时区与本地化）；不给时组件用本机时区的 HH:MM。
+
+`delegate string ChatClock(long at);`
+
+
+## void (delegate)
+
+气泡头像被点击：告诉宿主命中的是 `data` 里的第几条消息
+（宿主据此弹出发言人的资料面板之类的名片界面）。
+
+`delegate void ChatAvatarClick(int msgIndex);`
+
+
+## void (delegate)
+
+一条消息被「引用」：宿主拿到消息下标与要引用的正文（用户选中了
+一段就是那一段，未选中就是整条）。IM 客户端据此把引用块塞进
+输入框，发送时把被引消息 id 一并带给服务端，对端才看得到引用关系。
+
+`delegate void ChatQuote(int msgIndex, string text);`
+
+
+## void (delegate)
+
+气泡上按下右键：宿主弹自己的菜单（复制 / 引用 / 转发…）。
+组件不带任何菜单文案——文案与业务动作都是宿主的事，
+这里只把「右键了哪一条、当前选中了什么」告诉宿主。
+
+`delegate void ChatBubbleMenu(int msgIndex, string selText);`

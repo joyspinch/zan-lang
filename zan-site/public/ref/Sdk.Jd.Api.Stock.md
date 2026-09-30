@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Stock
 
-> 源码: `stdlib/Sdk/Jd/Api/Stock/JdStockApi.zan`, `stdlib/Sdk/Jd/Api/Stock/StockReadFindSkuStockRequest.zan`, `stdlib/Sdk/Jd/Api/Stock/StockWriteUpdateSkuStockRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Stock/JdStockApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Stock/StockReadFindSkuStockRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Stock/StockWriteUpdateSkuStockRequest.zan`
 
 
 ## JdStockApi (class)

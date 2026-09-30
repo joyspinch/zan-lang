@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.User
 
-> 源码: `stdlib/Sdk/Jd/Api/User/JdUserApi.zan`, `stdlib/Sdk/Jd/Api/User/UserGetUserInfoByOpenIdRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/User/JdUserApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/User/UserGetUserInfoByOpenIdRequest.zan`
 
 
 ## JdUserApi (class)

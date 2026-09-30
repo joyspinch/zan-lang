@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Acty
 
-> 源码: `stdlib/Sdk/Jd/Api/Acty/ActyQueryRegistrationDataCountRequest.zan`, `stdlib/Sdk/Jd/Api/Acty/JdActyApi.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Acty/ActyQueryRegistrationDataCountRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Acty/JdActyApi.zan`
 
 
 ## ActyQueryRegistrationDataCountRequest (class)

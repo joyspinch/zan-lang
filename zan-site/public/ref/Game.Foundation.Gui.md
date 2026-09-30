@@ -1,6 +1,6 @@
 # Game.Foundation.Gui
 
-> 源码: `stdlib/Game/Foundation/Gui/Host.zan`
+> 源码: `packages/Zan.Game/src/Game/Foundation/Gui/Host.zan`, `packages/Zan.Game/src/Game/Foundation/Gui/HudLayer.zan`
 
 
 ## GuiHost (class)
@@ -30,12 +30,17 @@ Gui 标题栏（皮肤按钮默认关，宿主每帧在内容之上画 chrome，
 
 - FixedStepClock clock;
 
+- HudLayer hud;
+
 - bool running;
 
 - int lastTick;
 
 - GuiHost(string title, int logicalWidth, int logicalHeight, int fixedStepMilliseconds)
   - fixedStepMilliseconds <= 0 时取 16ms（约 60Hz）。
+
+- HudLayer Hud()
+  - 获取 HUD 挂载层，供挂载标准 GUI 组件。
 
 - bool Run(IGuiHostLoop loop)
   - 运行主循环直到退出：轮询事件 → 推进固定步长时钟 →
@@ -81,6 +86,40 @@ Gui 标题栏（皮肤按钮默认关，宿主每帧在内容之上画 chrome，
     手机上驱动交还原表面坐标，由同一视口反变换。
 
 - int MouseY()
+
+
+## HudLayer (class)
+
+声明式游戏 HUD 挂载层。
+允许在游戏世界画布之上挂载标准的 Zan GUI 控件（按钮、背包面板、血条、设置对话框等）。
+既享受游戏循环的高帧率与低延迟，又拥有标准 GUI 组件的精美排版与事件响应。
+
+- List<Control> controls;
+
+- bool visible;
+
+- HudLayer()
+
+- bool IsVisible()
+  - HUD 是否可见。
+
+- void SetVisible(bool v)
+  - 设置 HUD 显示/隐藏。
+
+- void Add(Control control)
+  - 挂载一个 GUI 控件至 HUD 层。
+
+- bool Remove(Control control)
+  - 从 HUD 层移除控件。
+
+- void Clear()
+  - 清空所有 HUD 控件。
+
+- int Count()
+  - 当前挂载的控件数量。
+
+- void Render(App app, Canvas canvas)
+  - 在游戏画面渲染完成后调用，将 HUD 控件分层叠画至画布上。
 
 
 ## IGuiHostLoop (interface)

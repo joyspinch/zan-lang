@@ -1,6 +1,55 @@
 # Gui.Designer
 
-> 源码: `stdlib/Gui/Designer/Designer.Form.zan`, `stdlib/Gui/Designer/Designer.Inspector.zan`, `stdlib/Gui/Designer/Designer.zan`
+> 源码: `stdlib/Gui/Designer/DesignExport.zan`, `stdlib/Gui/Designer/Designer.Form.zan`, `stdlib/Gui/Designer/Designer.Html.zan`, `stdlib/Gui/Designer/Designer.Inspector.zan`, `stdlib/Gui/Designer/Designer.zan`
+
+
+## DesignExport (class)
+
+控件树 → 设计文档导出器（WEB_GUI_ROADMAP P8）：把运行期/代码建的
+保留控件树反向序列化成设计器 JSON 文档模型（再经
+`DesignerHtml.FromJsonDoc` 得到 .html 设计稿），让存量手搭界面
+一次性搬进声明层——之后设计器可打开编辑、CSS 皮肤按 class 生效。
+
+映射规则（与 GenForm.EmitField 的消费端一一对应，读写对称）：
+- kind ← `Control.Kind()`；Element 例外——裸标签名（div/span）
+不是合法控件 kind，固定导出 kind="Element"，真实标签进 "tag"
+键、纯文本内容进 "text" 键（装载端 InitElement/SetText 还原）；
+- name/class/style ← 同名属性（style 反向自 ApplyInline 落下的
+style* 字段重组，只发与缺省不同的键）；
+- dock/fx/fy/fw/fh ← dock 与 logX/logY/logW/logH（logPlaceSet
+为假时不发几何，装载端按内容测量）；
+- label ← `GetProp("text")`（容器没有 text，发空串即跳过）；
+- options ← Props() 里 kind==3（枚举）spec 的选项表；
+- on<Event> ← events 槽（SetHandler 存的处理器名）；
+- bind/bindProp ← bindPath/bindProp；
+- children ← kids 递归（Element 的文档序混合内容里，文本 run
+并入元素文本，子控件仍是 kids）。
+
+导出是**有损有界**的：只保结构/几何/样式/事件名，回调 Action、
+signal 订阅、运行期动态状态不在文档模型里（本来也存不进声明层）。
+文档级键（winW/winTitle/layoutMode…）由调用方补：`ExportDoc` 的
+覆载接收一个现成的文档头。
+
+- static string Export(Control root, string name, int winW, int winH)
+  - 控件树 → 设计文档 JSON（紧凑 PrettyToJson）。`name` 是文档名
+    （生成 partial class 名），`winW`/`winH` 是窗口文档尺寸——
+    传 role="control" 的文档头可用零值，本方法不填窗口键。
+
+- static string ExportHtml(Control root, string name, int winW, int winH)
+  - 控件树 → .html 设计稿文本（Export + FromJsonDoc 的组合捷径）。
+
+- static JsonValue NodeJson(Control c)
+  - 单个控件 → 字段对象。容器递归 kids；Element 的纯文本内容进
+    "text" 键（装载端 InitElement 后 SetText 还原 elText）。
+
+- static string StyleJson(Control c)
+  - 反向重组内联 style 文本：只发 ApplyInline 会落控件的视觉键且
+    值非缺省。样式层是单向解析（原文不存），这里按 style* 字段
+    的现值重建，顺序固定——装载端 ApplyInline 语义与原声明等价。
+
+- static JsonValue EnumProps(Control c)
+  - 控件发布且已绑定的枚举属性（kind==3）：当前下标 → 选项名。
+    未绑定或空选项表的 spec 跳过（那些是派生键，导不出快照）。
 
 
 ## Designer (class)
@@ -115,7 +164,10 @@
 
 - void ApplyDockLayer(List<FormField> lst, int ax, int ay, int aw, int ah, int tabFilter)
   - 把一层停靠组件排进 (ax, ay, aw, ah)。`tabFilter >= 0` 时
-    只排该标签页下的子级。
+    只排该标签页下的子级。两遍式与运行时 Control.Arrange 同构：
+    第一遍四边停靠按子序切剩余矩形，第二遍 Fill 统一铺最终的
+    剩余矩形——Fill 若内联在切边途中取矩形，会盖住排在其后
+    的边停靠条（运行时不会），画布和发布窗体从此不一致。
 
 - void RenderFreeField(App app, Canvas c, Theme t, FormField f, int ox, int oy, int psMilli, int px, int py)
   - 自由画布元素的设计空间 -> 屏幕空间转换（子节点已在 px/py 中
@@ -238,13 +290,12 @@
   - 在设计空间 (dx, dy) 处把面板字段添加到自由画布，
     新元素以光标为中心；光标下有容器则成为它的子级。
 
-- int DefaultFreeW(FormField f)
-  - 新拖入自由画布组件的默认宽度：表格/时间线/树/图表等宽组件
-    与 Tabs 320，标题及外壳类（工具条/状态栏等沿边铺满的）480，
-    其余 200。
+- static int DefaultFreeW(FormField f)
+  - 新拖入自由画布组件的默认宽度：依据各控件标准尺寸与内容度量确定，
+    确保点选、选中框手柄与实际呈现区域严丝合缝。
 
-- int DefaultFreeH(FormField f)
-  - 新拖入自由画布组件的默认高度：直接取字段的行数单位。
+- static int DefaultFreeH(FormField f)
+  - 新拖入自由画布组件的默认高度：依据各控件标准尺寸与内容度量确定。
 
 - void DrawLabel(App app, Canvas c, Theme t, FormField f, int lx, int ly, int lw, int align)
   - 画字段的标签文本：必填字段前置红色星号（hideStar 时省略），
@@ -256,6 +307,10 @@
 
 - int PvFont(int fsz)
   - PvS 的字号版：乘 pvScale（BeginCtrlZoom 里跳过）并钳制下限 7。
+
+- void ApplyPreviewFormSize(Control ctl, int size)
+  - 表单级尺寸逐节点补给没有显式 tiny/small/medium/large 的控件；
+    容器自己显式定档不应阻断后代，与 GenForm 的递归生成规则一致。
 
 - void PreviewControl(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int avail)
   - 绘制字段输入控件的非交互预览。
@@ -278,6 +333,10 @@
   - 在给定矩形里渲染一个保留式控件的实时预览：量测、按给定矩形
     排布、渲染，全程夹在 BeginCtrlZoom/EndCtrlZoom 里随画布等比
     缩放（PvCtrlAuto 是高度按测量结果重排的版本）。
+
+- void PvCtrlPrepared(App app, Control ctl, int x, int y, int w, int h)
+  - 已按自己的文档应用过尺寸默认值的组件树只负责渲染，不能再被
+    宿主设计稿的 formSize 覆盖。
 
 - void BeginCtrlZoom(App app)
   - 进入真控件等比缩放：按视图缩放（winZoom，50%–200%）临时放大/缩小
@@ -312,6 +371,23 @@
 
 - void Box(App app, Canvas c, Theme t, int x, int y, int w, int h)
   - 画预览里单行输入框的底：圆角填充 + 边框，各仿画控件共用。
+
+
+## Designer (class)
+
+设计器部分：HTML 存取格式（WEB_GUI_ROADMAP P7）——设计文档的
+存盘/打开格式就是 .html（JSON 文档模型退役为内部表示）。外皮只有
+这两个方法：内部模型、Undo/Redo 快照与 JSON 抽屉仍是文档 JSON。
+
+- string SaveHtml()
+  - 当前设计 → HTML 文本（存盘格式）：文档级键落在 <body> 的
+    data-* 属性上，字段树变元素树（kind 存 data-kind，与运行期
+    data-on-* 事件协议同形）。
+
+- void LoadHtmlText(string s)
+  - HTML 文本 → 设计模型（打开 .html 设计稿）。带 data-zan-design
+    标记的文档逐键还原；普通 HTML 也能导入（tag 兜底 kind）。
+    解析失败走 loadError/lastError（宿主提示），模型保持清空。
 
 
 ## Designer (class)
@@ -355,6 +431,11 @@
 
 - static int IndexOfColon(string s)
   - s 中第一个冒号的下标，没有则 -1（"标题:字段" 约定的分隔符）。
+
+- static List<string> SplitDecls(string s)
+  - 内联声明文本按 ";" 拆成声明行（STYLE 编辑器逐行显示用）：
+    去首尾空白、丢空行。v1 限制：值里带分号（如 content:";"）
+    会被拆开——设计期样式里极罕见，遇上的手工编辑 JSON 画布。
 
 - List<PropSpec> WindowSpecs()
   - 根 Window 的属性列表：窗口装饰（标题 / 尺寸 / 标志）以及
@@ -438,14 +519,14 @@
 - void LoadJson(string s)
   - 打开/换入一份新文档：恢复模型后清空撤销/重做历史——快照
     是整份设计 JSON，不清理的话，上一个文档的撤销会把别的设计
-    灌进当前画布并在帧末落盘覆盖本文件（IDE 所有 .zform 标签页
+    灌进当前画布并在帧末落盘覆盖本文件（IDE 所有设计稿标签页
     共用一个设计器单例）。JSON 抽屉 Apply 也走这里，行为一致。
     解析失败（loadError）保持历史，与旧行为一致。
 
 - void ResetHistoryLocked()
   - 载入新文档时清空撤销/重做历史：快照是整份设计 JSON，
     不清理的话，上一个文档的撤销会把别的设计灌进当前画布
-    并在帧末落盘覆盖本文件（IDE 所有 .zform 标签页共用一个
+    并在帧末落盘覆盖本文件（IDE 所有设计稿标签页共用一个
     设计器单例）。JSON 抽屉 Apply 也走这里，行为一致。
 
 - bool loadError;
@@ -465,7 +546,7 @@
 
 - static bool RetargetDoc(JsonValue doc, int devW, int devH)
   - 把设计文档改到 devW x devH 画布，并把绝对定位的控件夹回
-    新画布内。就地编辑 JSON：.zform 每个字段携带的状态（kind、
+    新画布内。就地编辑 JSON：设计文档每个字段携带的状态（kind、
     placeholder、绑定、事件、options、容器 kids）远多于这里要动的
     几何，任何「反序列化到模型再序列化回去」的写法都会静默丢掉
     其余键——控件会全部退化成默认 Input。
@@ -570,9 +651,27 @@
 
 - int freeDragDy;
 
+- int freeDragStartX;
+
+- int freeDragStartY;
+
+- bool freeDragHasMoved;
+
+- bool canvasMenuOpen;
+
+- int canvasMenuX;
+
+- int canvasMenuY;
+
+- bool canvasMenuArm;
+
+- FormField canvasMenuHit;
+
 - int freeGuideX;
 
 - int freeGuideY;
+
+- FormField hoverField;
 
 - int freeSelPX;
 
@@ -734,6 +833,8 @@
 
 - int winOpacity;
 
+- int winShadow;
+
 - string docRole;
   - 设计文档的 "role"："control" 的文档编译成可嵌入的自定义
     组件（partial class X : Control）而不是窗口。设计器自己
@@ -799,7 +900,101 @@
 
 - List<Input> compPropInputs;
 
+- List<Switch> compPropSwitches;
+
+- List<bool> compPropIsBool;
+
 - List<string> compPropShadow;
+
+- string styleEditFor;
+
+- List<Input> styleInputs;
+
+- FormField rowsEdField;
+
+- FormField propsEdField;
+
+- int rowsEdSel;
+
+- int rowsEdSelPrev;
+
+- int propsEdSel;
+
+- int propsEdSelPrev;
+
+- int rowsEdGen;
+
+- int propsEdGen;
+
+- Input rowsFilter;
+
+- Input propsFilter;
+
+- int rowsScroll;
+
+- int propsScroll;
+
+- string rowEdTitle;
+
+- string rowEdField;
+
+- bool rowEdRight;
+
+- bool rowEdSep;
+
+- string propEdKey;
+
+- string propEdVal;
+
+- int colEdWidth;
+
+- int colEdAlign;
+
+- int colEdType;
+
+- bool colEdSortable;
+
+- bool colEdResizable;
+
+- bool colEdEditable;
+
+- int colEdDecimals;
+
+- string colEdMoney;
+
+- bool colEdPercent;
+
+- string colEdPrefix;
+
+- string colEdSuffix;
+
+- bool colEdGrouped;
+
+- int colEdSummary;
+
+- int colEdPin;
+
+- string colEdBand;
+
+- string colEdClick;
+
+- string ofEd;
+
+- PropertyGrid edGridRows;
+
+- PropertyGrid edGridProps;
+
+- Input iconHolder;
+
+- Input iconPickTarget;
+
+- Input iconPickSearch;
+
+- LayerState rowsWin;
+
+- LayerState propsWin;
+
+- LayerState iconWin;
 
 - bool openCompRequested;
 
@@ -807,7 +1002,7 @@
 
 - void SetLayoutMode(int mode)
   - 切换被设计窗口的布局模型。宿主在打开一份设计时
-    调用（.zform 里存了 layoutMode），设计器自己不提供
+    调用（设计文档里存了 layoutMode），设计器自己不提供
     切换命令：两种布局不共享坐标，来回切会丢摆放。
 
 - void SeedFreeBounds()
@@ -865,7 +1060,7 @@
     打开 components/<名>.zcomp 文档本身供编辑。
 
 - void AddUserComponent(int k)
-  - 在表单上放置一个已保存用户组件的**引用**节点：.zform 里
+  - 在表单上放置一个已保存用户组件的**引用**节点：设计文档里
     只写 {"kind":名,"ref":名,...}——组件设计的每次进化自动
     跟随所有实例（WinForms UserControl 语义），要改内部就打开
     组件本身，检查器提供「解包为内联副本」作逃生门。默认矩形
@@ -890,12 +1085,36 @@
 
 - static void SetCompPropValue(FormField f, string key, string val)
 
+- static int AlertLevelOf(string spec)
+  - 告警横幅语义词 → Layer 通知类型（2 info / 3 success /
+    4 warning / 5 error）；数字串与角色词都认，其余落 info。
+
+- static bool RenameCompProp(FormField f, string from, string to)
+  - 把 props 直通表里的 `from` 键改名为 `to`（值随迁）。三种情况
+    拒绝并原样返回 false：`to` 已存在（先 Drop 再 Set 会把已有
+    键的值静默覆盖掉——改名是编辑意图，吞别人的值属于数据丢
+    失，调用方可用 HasCompProp 预检给出提示）、`from` 不存在、
+    from == to。返回是否真的发生了改名。
+
+- static void DropCompProp(FormField f, string key)
+  - 从 props 直通表里删掉 `key`（不存在则无操作）。JsonValue
+    没有按键删除，直接改写 keys/vals 两个平行表（keys 顺序
+    决定 FieldJson 写回顺序，保持稳定）。
+
+- static bool IsBoolProp(string key, string label, string val)
+  - 识别属性是否为布尔型（以 Switch 开关进行展示与编辑）。
+
+- static string CleanPropLabel(string rawLabel)
+  - 清理属性标签中用于提示类型的冗余后缀（例如 "(true/false)"），
+    使设计器属性面板的 Label 干净利落，不被无谓文字挤占。
+
 - static List<string> BuiltinPropRows(string kind)
   - 内置组件的直通属性行：kind → "键|双语标签" 列表。值存
     f.extra["props"]——与引用节点实例值同一张直通表，GenForm
     泛化发射 SetProp、画布预览经 ApplyFieldProps 落到真控件。
     只列设计期有意义的形态/展示属性；运行态开关（如 Countdown
-    的 active）不进来。没有行的 kind 返回 null。
+    的 active）不进来。键全部取自各控件 Props()/SetExtra 的
+    已支持集，新增前先核对控件源码。没有行的 kind 返回 null。
 
 - static void ApplyFieldProps(Control ctl, FormField f)
   - 把字段 extra["props"] 直通表落到真控件上（画布预览用）：
@@ -1014,15 +1233,31 @@
   - 删除主选中项，并清掉多选与可能引用它的交互状态
     （避免悬空引用崩溃）。
 
+- void CutSel()
+  - 剪切选中组件到剪贴板并从画布移除。
+
+- void BringToFront()
+  - 将选中组件移至其容器/根列表的顶层（最上方绘制）。
+
+- void SendToBack()
+  - 将选中组件移至其容器/根列表的底层（最下方绘制）。
+
+- void SetSelDock(int side)
+  - 快捷设置选中组件的停靠方式。
+
+- List<string> CanvasMenuLabels()
+
+- void HandleCanvasMenu(App app, int cc)
+
 - void Render(App app, int x, int y, int w, int h)
-  - 每帧入口：把进程级 WidgetId 计数器固定到设计器专用基值
-    （800000）后绘制整个设计器，完成即恢复，使即时模式控件
-    每帧获得稳定 id（hover/press/click 都按 id 关联）。
+  - 每帧入口：用 app.focus.PushIds 固定设计器专用基值
+    每帧入口：基于 Path Hash ID 作用域绘制整个设计器，
+    确保即时模式控件每帧获得稳定唯一的层级路径 ID，
+    与保留式长生命周期控件（Input 等）完全物理隔离。
 
 - void RenderHostPanels(App app, Rect toolRect, Rect propRect)
-  - 宿主把组件面板和属性面板画进自己的 dock 面板里。调用
-    它就等于告诉设计器「左右两栏归我管」，设计器自己那份
-    不再排版。id 基值和 Render 分开，避免两趟互相错位。
+  - 宿主把组件面板和属性面板画进自己的 dock 面板里。
+    分别使用独立的作用域隔离，两面板互不影响。
 
 - void RenderPinned(App app, int x, int y, int w, int h)
   - 设计器本体的一帧：功能区、画布（或 JSON 抽屉）、组件托盘、
@@ -1106,11 +1341,147 @@
 
 - int SmallBtn(App app, string text, int type, int x, int y, int w)
   - 渲染一个小按钮（高 28）并返回其 id。检查器各处使用，
-    让控件能放进紧凑的行内。
+    让控件能放进紧凑的行内。使用 AllocId() 保证即时模式每帧稳定 id
+    且与保留式持久控件（Input 等，>=1000000）完全隔离。
 
 - int SmallIconBtn(App app, string iconName, int type, int x, int y, int w)
   - 小号（高 28）纯图标按钮——尺寸与 SmallBtn 相同，但
     标签是矢量 Icon 字形而非文本字符。
+
+- bool OpenRowsEditor(App app, FormField f)
+  - 检查器「OPTIONS/COLUMNS」区头部的打开按钮：把选中组件
+    装进行编辑窗口。非选项类组件返回 false（不画按钮）。
+
+- void OpenPropsEditor(App app, FormField f)
+  - 检查器 WIDGET PROPS 区头部的打开按钮：extra["props"]
+    直通表的窗口编辑器。没有直通行（BuiltinPropRows 为空）
+    的内置组件与引用节点都可用（手写键也能进来改）。
+
+- LayerState NewEditorWindow(App app, int w, int h, string title)
+  - 大编辑器统一开 LayerState 仿真窗口：居中、可拖动、可缩放，
+    内容几何每帧从窗口读。每次打开新建（几何随内容变），
+    构造器自带 Layer 保留 id 段并恢复宿主计数器，随开随建无害。
+
+- bool BigEditorOpen()
+  - 任一大编辑器窗口开着。画布的原始指针路径（选中/拖拽/滚轮
+    直接读指针事件、不走命中测试）在这期间整体让位——窗口
+    矩形的吞命中只护得住走命中测试的控件，护不住这些裸路径。
+
+- void CloseBigEditors()
+  - 关闭全部编辑器窗口并清掉编辑态。选中下标一并复位，下次
+    打开按打开逻辑重选。
+
+- void LoadRowScratch(FormField f, int i)
+  - 把第 `i` 行选项原文解析进暂存字段（选中行变化时调用）。
+
+- string JoinRowOption(FormField f)
+  - 把暂存字段按组件的存储约定拼回选项原文。全空行返回 ""，
+    调用方按普通编辑写回（清空行文字 = 行变空，删除整行走
+    工具条的删除按钮）。
+
+- List<PropSpec> RowSpecs(FormField f)
+  - 选中行的右侧属性表：常规段（标题 + 图标/数据字段）+
+    选项段（分隔条 / 靠右，仅工具条与功能区）。绑定目标是
+    暂存字段，写回在帧末统一做。
+
+- List<PropSpec> PropSpecs()
+  - 选中键的右侧属性表（键 + 值）。绑定目标是暂存字段。
+
+- void LoadPropScratch(FormField f, int i)
+  - 把第 `i` 个键的键值读进暂存字段（选中键变化时调用）。
+
+- void WriteBackProps(App app, FormField f)
+  - 帧末把暂存字段写回选中键（原位改名保持键序，值直接覆盖）。
+    改名撞上已有键时忽略改名（表里不允许重复键）。
+
+- void EnsureSelVisible(int count, int slot, int viewH)
+  - 行/键列表滚动：保证选中行可见（增删/移动/键盘换选后调用）。
+
+- void EnsurePropSelVisible(int count, int slot, int viewH)
+  - props 列表滚动：保证选中键可见。
+
+- static JsonValue ColEntry(FormField f, int i)
+  - 第 `i` 列的 columns 条目（没有或不是对象返回 null = 全缺省）。
+
+- static JsonValue ColsArray(FormField f)
+  - extra["columns"] 数组（不存在或不是数组返回 null）。
+
+- static void DropKey(JsonValue o, string key)
+  - 从 JSON 对象里删掉一个键（JsonValue 没有按键删除，直接
+    改写 keys/vals 平行表；键不存在时无操作）。
+
+- void LoadColScratch(FormField f, int i)
+  - 选中列的声明式属性读进暂存字段（选中行变化时随
+    LoadRowScratch 一起调）。
+
+- static bool ColBool(JsonValue e, string key)
+  - 列条目里的布尔键（缺/false）。
+
+- void ColDesired(List<string> keys, List<JsonValue> vals)
+  - 暂存值对应的声明键值（偏离缺省的才进表）。读的是暂存
+    字段本身，帧末写回与探针共用。
+
+- void WriteBackCol(App app, FormField f)
+  - 帧末把列属性暂存写回 extra["columns"][i]：全部键都在缺省
+    且条目不存在时不动文档；需要条目时按需补位（空对象占位，
+    GenForm 对缺 field 的条目整条跳过，占位无副作用）。
+
+- static void MoveColEntry(FormField f, int from, int to)
+  - columns 条目跟随 options 移动（下标对齐约定）。
+
+- static void RemoveColEntry(FormField f, int i)
+  - columns 条目跟随 options 删除。
+
+- static void CopyColEntry(FormField f, int from, int to)
+  - 复制列时属性条目跟随：from 处有条目就在 to 处放副本
+    （按需补位），没有条目就把 to 处清成空对象。
+
+- static JsonValue NormalizedColumns(FormField f, JsonValue cols)
+  - 把 columns 数组按 options 的顺序重排（field 名匹配，退而
+    按 title，再退按位置）。GenForm 先行的设计稿里列声明顺序
+    可能与 options 不同，设计器以 options 为列序真相。条目数
+    可以少于 options（缺 = 全缺省），匹配不上的原样保留在尾部
+    （不吞键，GenForm 对它们照常发射）。
+
+- void RenderRowsEditor(App app, Canvas c, Theme t)
+  - 选项/列编辑窗口（LayerState 仿真窗口，可拖动/缩放）。商业
+    组件设计器同款的主从布局，每帧调用；内容几何从窗口实时
+    x/y/w/h 读出，拖动/缩放自动跟随：
+    
+    ┌ 工具条：选项 (N) ··················· [↑][↓] [添加][复制][删除] ┐
+    ├ 筛选…   ┬ 行属性 · 第 i/N 行                                   ┤
+    │ 行列表   │ PropertyGrid（标题 / 图标或字段 / 分隔条 / 靠右）      ┤
+    ├ 说明区：选中行原文 · 格式 · 绑定路径 ················ [关闭] ──┤
+
+- void OpenIconPicker(App app, Input target)
+  - 点图标格旁的格子按钮：开选择器窗口，锁定写回目标输入框。
+
+- void RenderIconPicker(App app, Canvas c, Theme t)
+  - 图标选择器窗口：网格铺开 Icon.Names() 的全部内置
+    图标（图标 + 名字），顶部搜索框按名字过滤；点选写回发起
+    的输入框并收起。当前值命中的格子高亮。几何随窗口实时读。
+
+- static bool NameHas(string hay, string sub)
+  - 大小写不敏感的子串测试（图标搜索过滤用）。
+
+- static string RowMainText(FormField f, int i)
+  - 第 `i` 行选项的主文本：标题；工具条/功能区的分隔条行显示
+    「— 分隔条 —」。解析与 LoadRowScratch 同拆法。
+
+- static string RowSubText(FormField f, int i)
+  - 第 `i` 行选项的副文本：数据字段键 / 图标名（没有则 ""）。
+
+- static bool RowIsSep(FormField f, int i)
+  - 第 `i` 行是否是分隔条（工具条/功能区的 "-"）。
+
+- static bool HasCompProp(FormField f, string key)
+  - extra["props"] 里是否已有键 `key`（props 新增键的去重用）。
+
+- void RenderPropsEditor(App app, Canvas c, Theme t)
+  - 组件属性（extra["props"] 直通表）弹窗编辑器：与行编辑器同一
+    套主从布局——左侧键列表（可筛选，副文本是当前值），右侧选中
+    键的键/值属性表，底部说明。键名就是控件 SetProp 认的名字，
+    生成代码与画布预览共用同一张表。
 
 
 ## TabHeaderHit (class)

@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Detection
 
-> 源码: `stdlib/Sdk/Jd/Api/Detection/DetectionImagesRedLineDetectBatchRequest.zan`, `stdlib/Sdk/Jd/Api/Detection/JdDetectionApi.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Detection/DetectionImagesRedLineDetectBatchRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Detection/JdDetectionApi.zan`
 
 
 ## DetectionImagesRedLineDetectBatchRequest (class)

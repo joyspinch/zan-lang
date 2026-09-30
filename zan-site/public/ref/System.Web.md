@@ -1,6 +1,6 @@
 # System.Web
 
-> 源码: `stdlib/System/Web/ApiDocs.zan`, `stdlib/System/Web/Attributes.zan`, `stdlib/System/Web/Controller.zan`, `stdlib/System/Web/HttpContext.zan`, `stdlib/System/Web/Menu.zan`, `stdlib/System/Web/Router.zan`, `stdlib/System/Web/Security.zan`, `stdlib/System/Web/StaticFiles.zan`, `stdlib/System/Web/Validate.zan`, `stdlib/System/Web/View.zan`, `stdlib/System/Web/WebApp.zan`, `stdlib/System/Web/WsSession.zan`
+> 源码: `stdlib/System/Web/ApiDocs.zan`, `stdlib/System/Web/Attributes.zan`, `stdlib/System/Web/Controller.zan`, `stdlib/System/Web/DesignerHtml.zan`, `stdlib/System/Web/Html.zan`, `stdlib/System/Web/HtmlScope.zan`, `stdlib/System/Web/HttpContext.zan`, `stdlib/System/Web/Menu.zan`, `stdlib/System/Web/Router.zan`, `stdlib/System/Web/Security.zan`, `stdlib/System/Web/StaticFiles.zan`, `stdlib/System/Web/Validate.zan`, `stdlib/System/Web/View.zan`, `stdlib/System/Web/WebApp.zan`, `stdlib/System/Web/WebWs.zan`, `stdlib/System/Web/WsSession.zan`
 
 
 ## ApiDocs (class)
@@ -38,25 +38,24 @@ disagree with the endpoint that runs.
 - static async void Spec(HttpContext ctx)
   - GET <path>.json 处理器：no-store 输出 OpenAPI 文档。
 
-- static string Q(string s)
-  - A JSON string literal, quotes included.
-
 - static async void Page(HttpContext ctx)
   - GET <path> 处理器：输出离线 UI 页面。
 
 - static string SpecJson(WebApp host)
   - The OpenAPI 3.0 document for every registered route.
+    全程 JsonValue 树构建 + ToJson 序列化——标题/描述等文本经
+    Encoding.JsonEscape 转义，任何路由名/参数名都毁不掉文档结构。
 
 - static string OpenApiPath(string pattern)
   - "/user/{id}" is already OpenAPI's own syntax; this keeps the
     conversion in one place in case the router's syntax ever diverges.
 
-- static void Operation(StringBuilder sb, Route rt)
+- static JsonValue Operation(Route rt)
   - 把一条路由写成一个 OpenAPI operation：summary/operationId/tags、
     x-login/x-auth/x-menu 徽标、parameters 与 requestBody（写请求的
     非 path 参数归入表单体）、responses。
 
-- static void Responses(StringBuilder sb, Route rt)
+- static JsonValue Responses(Route rt)
   - What the endpoint answers with, per status.
     
     The shapes are the framework's own and therefore knowable: an HTML page,
@@ -65,13 +64,13 @@ disagree with the endpoint that runs.
     precisely as it describes the request, instead of the bare "200 ok" a
     generator produces when nobody tells it anything.
 
-- static void EnvelopeSchema(StringBuilder sb)
-  - {"code","msg","data"} 统一信封的 schema 字面量。
+- static JsonValue EnvelopeSchema()
+  - {"code","msg","data"} 统一信封的 schema。
 
-- static void ErrorResponse(StringBuilder sb, string status, string desc, string code, string msg)
-  - 追加一个错误状态响应（信封 schema + 示例）。
+- static JsonValue ErrorResponse(string desc, string code, string msg)
+  - 一个错误状态响应（信封 schema + 示例）。
 
-- static void ParamJson(StringBuilder sb, ApiParam p)
+- static JsonValue ParamJson(ApiParam p)
   - 一个 OpenAPI parameter 对象（in 取 path/query）。
 
 - static string Tag(Route rt)
@@ -216,7 +215,9 @@ Actions are instance methods that read/write through <c>this</c>:
 void Login() {
 string user = this.In("user");
 ...
-this.Ok("{\"token\":\"" + token + "\"}");
+JsonValue body = JsonValue.NewObject();
+body.PutStr("token", token);
+this.Ok(body.ToJson());
 }
 
 Cross-cutting auth (login / permission / rank) is declared with attributes
@@ -246,6 +247,10 @@ project's per-controller hooks).
     cannot await. The generated trampoline awaits this one; it defaults to
     the synchronous `OnBefore` hook so existing controllers keep
     working.
+
+- virtual void __UseReadOnly()
+  - [ReadOnly] request intent, set by the generated route before
+    OnBeforeAsync acquires a connection. Plain controllers ignore it.
 
 - virtual async bool OnBeforeAsync()
   - Awaitable controller setup. Override this (instead of
@@ -435,7 +440,8 @@ X-CSRF-Token 头或 _csrf 表单字段；SameSite=Lax 保留，本身就是
 
 - static bool Guard(HttpContext ctx)
   - Before 钩子本体。返回 false 表示已写好 403 响应，
-    管线短路。
+    管线短路。前哨先做 Origin/Sec-Fetch-Site 站点校验（浏览器自动
+    附带、免客户端配合），double-submit token 是第二道闸。
 
 - static string NewToken()
   - 新 token：16 随机字节的 hex（128 位熵）。
@@ -443,6 +449,24 @@ X-CSRF-Token 头或 _csrf 表单字段；SameSite=Lax 保留，本身就是
 - static bool ConstantTimeEquals(string a, string b)
   - 常时比较：按较长一方的长度累积异或，长度不等直接计入差异位，
     不因首个差异字节提前返回。
+
+- static bool OriginGuard(HttpContext ctx)
+  - 站点校验前哨（Before 钩子形态）：不安全方法上依据
+    浏览器自动附带的证据拒绝跨站请求，无需页面/脚本配合——
+    Sec-Fetch-Site: cross-site 直接拒；带 Origin 头且其 authority
+    与 Host 不符也拒。两样都缺（老浏览器、非浏览器客户端）放行，
+    此时 SameSite=Lax 会话 cookie 仍是底线。安全方法一律放行。
+
+- static bool OriginCheck(HttpContext ctx)
+  - 前哨的纯校验半口：true 放行，false 跨站（应答由钩子写）。
+
+- static bool SameAuthority(string origin, string host)
+  - Origin 的 authority（冒号后段，去默认端口、小写）是否与 Host
+    一致。大小写不敏感按 RFC 3986；Host 缺失视为不一致（保守）。
+
+- static string TrimDefaultPort(string auth, bool isHttps)
+  - 去掉明确的默认端口后缀（https 的 :443 / 明文的 :80）；
+    其余端口保留参与比较。
 
 
 ## CustomAttribute (class)
@@ -511,6 +535,106 @@ Human label (menu text / docs); method-level overrides class-level.
 - string text;
 
 - DescriptionAttribute(string text)
+
+
+## DesignerHtml (class)
+
+设计器文档的 HTML 存取编解码器（WEB_GUI_ROADMAP P7）：把设计器
+的 JSON 文档模型与 HTML 文本互相转换——HTML 从此是设计器
+的存取格式。纯字符串层，不依赖 Gui：设计器
+(Gui.Designer)、编译期生成器 (GenForm/GenHtml) 两端共用。
+
+编码规则（全键保真往返）：
+- 文档级键（name/winW/role/...）→ <body> 的 data-<kebab> 属性；
+name 另发 id 便于阅读；body 带 data-zan-design 标记（IsDesignDoc
+据此区分设计稿与普通 HTML UI 文档）。
+- 字段对象 → 元素：kind 决定 tag，能原生就原生（Panel→div、
+Label→label、Button→button、Input→input、TextArea→textarea、
+Image→img、Divider→hr、Progress→progress、SelectBox→select、
+Typography→p、Checkbox/Radio/Slider/ColorPicker/InputNumber/
+DatePicker→input+type=…，其余 div），kind 本身存 data-kind
+（自定义组件/共享控件的权威标记，读端优先于 tag 兜底）；
+name → id；class → class；style → style；kids → 子元素。
+- 原生属性/内容直进原生通道：<img src/alt>、<input/textarea
+placeholder/value>、表单族 min/max/step、<progress value/max>、
+checkbox/radio 的 value(=label)/checked(=defOn)、<select> 的
+<option> 子元素（含 selected）、button/label/textarea/p 的
+文本内容——与 data-* 通道等价，读端不分来源。
+- 其余标量键 → data-<kebab>="值"（camelCase 键名 kebab 化——
+解析器把属性名整体小写，kebab 保大小写信息；false/""/0 跳过，
+与 HTML 布尔属性同趣，读端有缺省）。
+- 事件键 on<Event> → data-on-<kebab 事件名>：与 P5 运行时事件
+协议 data-on-<evt>="名" 完全同形（LoadHtml 与设计稿一致）。
+- 复合值（props 直通表、DataGrid columns、winShape 区域数组…）
+→ data-x-<kebab>='<紧凑 JSON>'，读端原样解析回对象/数组——
+字符串值不作数字/布尔嗅探，props 的 "min":"0" 不会漂成数字。
+- options（字符串数组）→ data-options="a|b|c"（与 JoinOpts 同
+分隔，| 内嵌限制相同）。
+- 属性值统一实体转义（& < > "）；原生语义发原生形态——img 的
+src/alt、input/textarea 的 placeholder/value 发真属性，
+button/label/textarea 的 text 发元素文本（读端与 data-* 通道
+等价），其余键全在属性里，规避 HTML 空白塌缩。
+
+- static bool IsDesignDoc(string html)
+  - 是否设计器文档：body 带 data-zan-design 标记。标记是裸属性
+    （值为空串），不能用 Attr(...) != "" 判——那样存在与缺失
+    不可区分，永远返回 false。
+
+- static string FromJsonDoc(string json)
+  - 设计器 JSON 文档 → HTML 文本。
+
+- static string ToJsonDoc(string html)
+  - HTML 文本 → 设计器 JSON 文档（PrettyToJson 字符串）。
+
+- static void FieldHtml(StringBuilder b, JsonValue o, int depth)
+
+- static JsonValue FieldJson(WDoc doc, WNode n)
+
+- static void PutAttr(JsonValue o, string suffix, string v)
+  - 一个 data- 后缀属性折进对象：on-<kebab> → "on"+Pascal 事件键；
+    x-<kebab> → 复合 JSON 或字符串的未建模键；其余 → Unkebab 键 +
+    标量嗅探（true/false → 布尔，整数/小数字面 → 数字，其余字符串）。
+
+- static void AppendKey(StringBuilder b, JsonValue v, string key, int mode)
+  - 键值 → 属性写出发射（标量 false/""/0 跳过；复合值走 x- JSON）。
+    零值/空串有义的键豁免跳过：几何四键 fx/fy/fw/fh（矩形边界，
+    FieldJson 无条件写出，丢了会在解码端回落到 32 的缺省高）、
+    winZoom（0 = 适应视口，模型缺省 1000）、layoutMode（0 = 吸附/
+    流式布局，丢了读端回落 1 变自由布局）、pad/gap（0 = 显式无
+    内边距/间距，压过样式表缺省）、label/placeholder（"" = 显式
+    清空，缺了会回落 kind 缺省文案）。其余键 0/"" == 读端缺省，
+    跳过保持文档干净；
+    新键是否入名单由模型级往返等价校验兜底。
+
+- static string KebabKey(string s)
+  - "winW" → "win-w"；"onClick" → "on-click" 由调用方拆 on 前缀后
+    调用（这里只处理纯 Pascal/camel 段）。
+
+- static string Unkebab(string s)
+  - "win-w" → "winW"；"row-click" → "RowClick"（事件端用）。
+
+- static bool IsNumeric(string s)
+
+- static string EscapeAttr(string s)
+  - 属性值实体转义。
+
+- static string KindTag(string kind)
+  - kind → 存储 tag。有 HTML 原生等价物的走原生标签；Panel 走裸
+    div（布局兜底形态，kind 由 TagKind("div") 恢复）；其余组件走
+    `zan-<kebab>` 自定义元素（HTML5 合法标签名，tokenizer 的
+    IsNameChar 收连字符）——组件化写法，不再骑在 div 上打标记。
+
+- static string TagKind(string tag)
+  - tag → kind（读端兜底；data-kind 缺失时）。zan-<kebab> 自定义
+    元素反解回 Pascal kind，与 KindTag 的默认分支互逆。
+
+- static string InputTypeKind(string ty)
+  - input 的 type 属性 → 组件 kind（<input type=checkbox> 是 Checkbox
+    而不是 Input）。只在 data-kind 缺失、kind 从标签兜底而来时细化：
+    data-kind 是权威标记，写了就不改写。
+
+- static string KindInputType(string kind)
+  - input 变体组件导出时发哪个 type 属性。
 
 
 ## Filter (class)
@@ -583,6 +707,145 @@ Everything is compile-time checked -- no reflection, no string dispatch.
 
 - void RunAfter(HttpContext ctx, long elapsedUs)
   - 按注册顺序执行全部 after 钩子（不可短路）。
+
+
+## HtmlParser (class)
+
+- static JsonValue pendingHeadAttr;
+  - head 的 data-* 属性暂存（head 是透明容器；P7 设计器文档把
+    文档级元数据放 body 属性，head 侧只透传 data- 键）。
+
+- static bool inHead;
+  - 解析游标是否在 <head> 区内（head 透明，子元素按 head 语义
+    处理：不建节点、不触发隐式 body；</head> 之后当正文）。
+
+- static WDoc Parse(string html, string baseDir)
+  - 解析 `html`（整文档或片段）为声明记录。`baseDir` 是 `<link>`
+    相对路径的基目录（空 = 不解析 link）。
+
+- static WOpenResult OpenTag(string html, int i, List<string> an, List<string> av)
+  - 扫开标签：名字 + 属性表 + 自闭合标记，返回游标。
+
+- static void HandleOpen(List<WFrame> st, WDoc doc, string name, List<string> an, List<string> av, bool selfClose, string baseDir)
+
+- static WFrame Frame(WDoc doc, int rec, string tag, int mode)
+
+- static int PushNode(WDoc doc, string tag, int parent, List<string> an, List<string> av)
+
+- static void CloseTag(List<WFrame> st, WDoc doc, string name)
+
+- static void CloseTop(List<WFrame> st, WDoc doc)
+
+- static void FeedText(List<WFrame> st, string raw)
+
+- static void Flush(WDoc doc, WFrame f, bool nextInline)
+  - 结算 pending 文本。`nextInline`：紧随其后的节点是否行内级——
+    尾随空格只在后面还是行内内容时保留（HTML 空白语义）。
+
+
+## HtmlScope (class)
+
+HtmlScope.zan -- HTML 文档 CSS 的编译/装载期作用域收窄（Vue
+<style scoped> 同语义），GenHtml 生成通道与 App.LoadHtml 运行期
+装载通道共用这一份实现。给定作用域类 zs，把样式表里每条规则的
+每个复合块补上该类——同名类跨文档互不串、裸 body 只作用自己的
+根。@media/@supports 内层递归；@keyframes/@font-face 等块原样；
+注释与字符串不参与结构判定；已含 zs 的块跳过（幂等）。
+作用域类由调用方造：编译通道取文档基名（zs-<基名>，与生成类名
+同源），运行期装载取序号（zs-load-<n>）。运行期挂载件（列表行
+模板等 Build 之外长出的控件）不携作用域类，其样式放皮肤层。
+
+- static string Styles(string css, string zs)
+  - 样式表 scoping 主入口：逐顶层段（注释 / at 规则 / 普通规则）
+    走一遍，规则 prelude 改写、块体原样。
+
+- static int ScopeAt(string css, int i, string zs, StringBuilder outp)
+  - at 规则：返回处理后的下一个下标。@media/@supports 递归内层；
+    其余（@keyframes 的百分比段、@font-face、未知块）整块原样。
+
+- static string ScopePrelude(string sel, string zs)
+  - 规则 prelude（选择器列表）：顶层逗号切分，逐片 scoping 后拼回。
+
+- static string ScopeOne(string piece, string zs)
+  - 一片选择器（可能带组合器链）：逐复合块补 zs。注释剥离、空白
+    归一；显式组合器（>/+/~）覆盖待定后代空格。
+
+- static string ScopeCompound(string chunk, string zs)
+  - 单复合块补 zs：插到主体名/类列之后、首个伪类/属性之前——
+    类列顺序无关语义，且保证类在 `::before`/`[attr]` 前的语法序。
+    已含该类则原样（幂等）；无主体（裸 `:hover`）补 `*` 主体，
+    否则规则会泄成全局。
+
+- static int SkipNoise(string s, int i)
+  - 越过 i 处的注释/字符串（可连续），返回首个"实"字符下标。
+
+- static int MatchChunk(string s, int open)
+  - 括号/引号块的配对下标（引号支持 \\ 转义，括号计嵌套，
+    注释/内层字符串不参与配对）；找不到返回 -1。
+
+- static int MatchBrace(string s, int open)
+  - '{' 的配对 '}'（注释/字符串感知）。
+
+- static bool HasClsToken(string chunk, string zs)
+  - 复合块里是否已有 zs 这个类词（".zs-x" 后跟非名字字符）。
+
+- static int FindFrom(string s, string needle, int start)
+
+- static bool StartsWithAt(string s, int at, string needle)
+
+- static bool NameChar(string c)
+
+- static bool Alnum(string c)
+
+
+## HtmlText (class)
+
+data-on-* 解析出的逻辑事件名映射（"click" → "Click"）独立于
+Gui 的事件类型，供生成器与运行时共用。
+
+- static string EventKind(string suffix)
+  - data-on-* 后缀 → AddByName 事件名。未映射的后缀返回空
+    （静默忽略：HTML 引用宿主没接的事件不该炸）。
+
+- static string Attr(List<string> an, List<string> av, string name)
+
+- static List<string> SplitClass(string v)
+
+- static bool StartsWith(string s, string p)
+
+- static string CollapseSpace(string s)
+  - 连续空白塌缩成单空格（HTML 文本语义），不 trim 首尾。
+
+- static string TrimLead(string s)
+
+- static string TrimTrail(string s)
+
+- static string DecodeEntities(string s)
+  - 命名实体（amp/lt/gt/quot/apos/nbsp）+ 数字实体（' '）。
+
+- static int ParseIntOr(string s, int dflt)
+  - 十进制整数（容 '-'）；非数字串返回 dflt。
+
+- static int ParseHex(string s)
+
+- static bool IsAlpha(int c)
+
+- static bool IsNameChar(int c)
+
+- static bool IsSpaceChar(int c)
+
+- static int FindFrom(string s, string sub, int from)
+
+- static int FindCloseTag(string s, string tag, int from)
+  - 大小写不敏感地找 `</tag`（原文模式收尾）。
+
+- static bool IsInlineTag(string t)
+  - 行内级 tag 表：块表用白名单（UA 样式表 display:block 的集合
+    + 原文/元数据 tag），其余一律按 Chrome 缺省 inline 处理。
+
+- static bool IsBlockTag(string t)
+
+- static bool IsVoidTag(string t)
 
 
 ## HttpContext (class)
@@ -789,7 +1052,9 @@ so ARC reclaims everything without a request-scoped pool.
   - 追加响应头；名称与值都经 HeaderSafe 清洗（可链式）。
 
 - HttpContext SetCookie(string name, string val, int maxAgeSeconds)
-  - 设置 HttpOnly + SameSite=Lax 的会话 cookie（可链式）。
+  - 设置 HttpOnly + SameSite=Lax 的会话 cookie（可链式）。请求经
+    TLS 反代（X-Forwarded-Proto: https）时追加 Secure——明文直连
+    不加，避免本地开发/无 TLS 部署拿不到 cookie。
 
 - HttpContext SetCookieJs(string name, string val, int maxAgeSeconds)
   - Sets a JS-readable cookie (no HttpOnly). The only
@@ -797,6 +1062,9 @@ so ARC reclaims everything without a request-scoped pool.
     must read the cookie to echo it in X-CSRF-Token, so it cannot be
     HttpOnly. SameSite=Lax stays, which is itself the first line of
     defense. Everything else should use `SetCookie`.
+
+- static string SecureFlag(HttpContext ctx)
+  - TLS 反代协议（X-Forwarded-Proto: https）→ "; Secure"，否则空串。
 
 - void Html(string html)
   - 以 text/html; charset=utf-8 应答并结束本请求。
@@ -813,8 +1081,14 @@ so ARC reclaims everything without a request-scoped pool.
   - True when the response body is bytes: the server sends the
     header block and then <c>bodyBytes</c> by count.
 
+- bool StatusForbidsBody()
+  - Statuses whose response ends at the header terminator,
+    regardless of any body the handler prepared (RFC 9112 §6.3).
+
 - int BodyLength()
-  - Response body size in bytes, whichever form it takes.
+  - Response body size in bytes. HEAD retains the corresponding
+    GET length; bodyless statuses return zero so the separate binary send
+    path cannot put forbidden bytes after the header block.
 
 - void Json(string json)
   - 以 application/json 应答并结束本请求。
@@ -914,24 +1188,6 @@ so ARC reclaims everything without a request-scoped pool.
     Upgrade header whose token list contains "websocket" (case
     insensitive) plus a non-empty Sec-WebSocket-Key. Anything else is an
     ordinary request and goes down the normal response path.
-
-- async WsSession WsUpgrade()
-  - Completes the RFC 6455 handshake and hands the connection to
-    a `WsSession`. The upgrade runs AFTER routing and
-    authorization, so a WebSocket session on the MVC port inherits the
-    route's full permission semantics — the part a standalone WS port
-    cannot give you.
-    
-    Session lifetime follows the SSE hijack contract: the handler that
-    called WsUpgrade owns the connection until it returns; the connection
-    loop then sees hijacked and tears down without writing a response.
-    null = not an upgrade request (answer normally) or the 101 write
-    failed (peer gone).
-    
-    An idle session is cut by the connection sweeper at the request
-    timeout. Recv/Send re-arm the deadline automatically on activity; a
-    session that may go quiet should be kept alive with periodic Ping()
-    pushes.
 
 - string BuildResponse(bool keepAlive)
   - 序列化为完整 HTTP/1.1 报文：状态行、Content-Type/Length、依
@@ -1050,7 +1306,8 @@ caller's business.
 
 - static string Json(string itemsJson, int total, ListQuery q)
   - 列表响应 JSON（{"items","total","page","limit","pages"}）；
-    items 是已序列化的行 JSON，空时输出 []。
+    items 是已序列化的行 JSON，经 PutJson 挂树（能解析就保型嵌入，
+    解析不出按字符串存——无论如何不会产出非法 JSON），空时输出 []。
 
 
 ## LockLease (class)
@@ -1301,6 +1558,13 @@ wall-clock seconds. Single-threaded event loop => no locking needed.
 
 - int CountOf(string key)
   - key 当前窗口已计的请求数；表未就绪返回 0。
+
+
+## ReadOnlyAttribute (class)
+
+Opt in one pure read action to a read replica before the request
+lease is acquired. Never infer this from GET: a GET can write, and actions
+that require read-after-write consistency must stay on the primary.
 
 
 ## Route (class)
@@ -1589,6 +1853,70 @@ or a database without touching the hook contract.
 
 ## StaticFiles (class)
 
+- static string prefix="";
+
+- static string root="";
+
+- static int maxAge=86400;
+
+- static const int MaxFileBytes=4*1024*1024;
+
+- static List<StaticMount> mounts=new List<StaticMount>();
+
+- static void Mount(WebApp app, string urlPrefix, string dir)
+  - Mounts `dir` under `urlPrefix` and registers the hook on the
+    app. `urlPrefix` is matched literally ("/static" answers
+    "/static/css/app.css"); `dir` is relative to the process working
+    directory.
+
+- static void MaxAge(int seconds)
+  - How long browsers may cache an asset (seconds). Set it to 0
+    while developing so an edited file is picked up by a reload. Existing
+    mounts follow: Mount snapshots maxAge into the mount record, so a
+    MaxAge call that only touched the static default would be silently
+    swallowed by every earlier Mount — the usual Mount-then-MaxAge order
+    answered assets with the 86400 default (static_files_bounded caught
+    it).
+
+- static bool Serve(HttpContext ctx)
+  - Before hook: answers asset requests, passes everything else on
+    (true = keep going).
+
+- static bool ServeFile(HttpContext ctx, string rel, string rootDir, string urlPrefix, int ageSeconds)
+
+- static void ServeStream(HttpContext ctx, string rel, Stream file)
+  - Buffered static response from an opened stream. The caller
+    owns the stream. Reads use the checked length plus a one-byte EOF probe.
+
+- static void ServeStreamMount(HttpContext ctx, string rel, Stream file, string urlPrefix, int ageSeconds)
+
+- static bool TooLarge(HttpContext ctx, long length)
+
+- static void Answer(HttpContext ctx, string rel, byte[]data, int size)
+
+- static void AnswerMount(HttpContext ctx, string urlPrefix, int ageSeconds, string rel, byte[]data, int size)
+
+- static string Relative(string path)
+  - The path below the mount point, or null when the request is not
+    for this mount.
+
+- static string RelativeTo(string path, string urlPrefix)
+
+- static bool IsSafe(string rel)
+  - Only unreserved path characters, and no empty or dot-leading
+    segment: that rules out "..", absolute paths, backslashes, NUL bytes and
+    hidden files in one pass.
+
+- static string ContentType(string rel)
+  - 按扩展名（小写化后）映射 Content-Type；未知类型为
+    application/octet-stream。
+
+- static string Extension(string rel)
+  - 末段最后一个 '.' 之后的扩展名（小写）；无扩展名或以 '.' 结尾为空串。
+
+
+## StaticMount (class)
+
 Serves files from a directory on disk (CSS/JS/fonts/images: everything the
 views reference but no controller should own).
 
@@ -1606,60 +1934,23 @@ The URL path is resolved against the mounted directory only: a request is
 rejected unless every byte is an unreserved file character, so "..", "//",
 backslashes, NUL and query-smuggled separators cannot walk out of the root.
 
-Bodies are cached per worker after the first hit (assets are immutable in a
-deployment; restart or bump the file name to publish a new one) and served
-with a long max-age. Files are read as bytes and written back untouched, so
-images and fonts survive the trip.
+Bodies are not cached in workers: a public upload directory can contain an
+unbounded number of files. HttpContext supports buffered binary responses,
+not file streaming, so files above MaxFileBytes (4 MiB) return 413, including
+HEAD. Larger downloads need a streaming file server. Upload acceptance is
+separate and is not changed by this limit. Each in-flight GET owns at most
+one bounded body; total memory still depends on connection concurrency.
+Browser caching follows MaxAge. Binary bytes, including NUL, are preserved.
+Trusted build-time embedded resources retain the runtime's own lazy decode
+cache; this limit bounds their response copy, not runtime decompression.
 
-- static string prefix="";
+- string prefix;
 
-- static string root="";
+- string root;
 
-- static int maxAge=86400;
+- int maxAge;
 
-- static List<string> paths=null;
-
-- static List <byte[]> blobs=null;
-
-- static List<int> sizes=null;
-
-- static List<string> types=null;
-
-- static void Mount(WebApp app, string urlPrefix, string dir)
-  - Mounts `dir` under `urlPrefix` and registers the hook on the
-    app. `urlPrefix` is matched literally ("/static" answers
-    "/static/css/app.css"); `dir` is relative to the process working
-    directory.
-
-- static void MaxAge(int seconds)
-  - How long browsers may cache an asset (seconds). Set it to 0
-    while developing so an edited file is picked up by a reload -- the
-    per-worker body cache still needs a restart.
-
-- static bool Serve(HttpContext ctx)
-  - Before hook: answers asset requests, passes everything else on
-    (true = keep going).
-
-- static int Cached(string rel)
-  - Index of an already-read asset, or -1. The table holds one
-    entry per file served since start-up, so the scan is over a handful of
-    deployed assets, not over anything a request can grow.
-
-- static string Relative(string path)
-  - The path below the mount point, or null when the request is not
-    for this mount.
-
-- static bool IsSafe(string rel)
-  - Only unreserved path characters, and no empty or dot-leading
-    segment: that rules out "..", absolute paths, backslashes, NUL bytes and
-    hidden files in one pass.
-
-- static string ContentType(string rel)
-  - 按扩展名（小写化后）映射 Content-Type；未知类型为
-    application/octet-stream。
-
-- static string Extension(string rel)
-  - 末段最后一个 '.' 之后的扩展名（小写）；无扩展名或以 '.' 结尾为空串。
+- StaticMount(string prefix, string root, int maxAge)
 
 
 ## StrMap (class)
@@ -1752,8 +2043,7 @@ characters, ExtAllowed enforces an extension whitelist.
   - Value must be one of the comma-separated whitelist entries.
 
 - static bool ContainsStr(string s, string pat)
-  - Multi-character substring search (string.Contains only
-    supports single characters reliably).
+  - Multi-character substring search.
 
 - string ErrorsJson()
   - 错误列表的 JSON 数组。
@@ -1890,6 +2180,53 @@ layout.html + {{content}} wraps every RenderPage() body
 
 - List<StrMap> ListOf(string name)
   - 取具名行列表；没有则 null。
+
+
+## WDoc (class)
+
+解析产物：声明记录 + 收集的样式（<style> 与 <link>）。
+
+- List<WNode> nodes;
+
+- string css;
+
+
+## WFrame (class)
+
+建栈帧。mode：0 普通容器，1 捕获文本（button/textarea），
+2 原文收集（style），3 原文跳过（script/title）。
+
+- int rec;
+
+- string tag;
+
+- int mode;
+
+- string pending;
+
+- bool prevInline;
+
+- string label;
+
+
+## WItem (class)
+
+容器内容条目：kid >= 0 是子节点下标，否则是文本片 text。
+
+- int kid;
+
+- string text;
+
+
+## WOpenResult (class)
+
+开标签扫描结果（无 out 参数，用返回类承载游标）。
+
+- string name;
+
+- int next;
+
+- bool selfClose;
 
 
 ## WebApp (class)
@@ -2155,9 +2492,18 @@ when the request completes.
     to the millisecond clock (~15.6ms per tick on Windows), which reported
     every fast endpoint as "0 ms".
 
+- async bool LimitExceeded(HttpContext ctx, Route route)
+  - 全局与路由限流的唯一判定点，在正文缓冲/解析之前调用。
+    键语义与键序与原 DispatchInner 内联判定一致：全局限流按 uid（匿名
+    回落 IP，再回落 _unknown_），路由限流按 rateScope 拼 uid/ip。返回
+    true 表示超限，应答由调用方写出并断连。ctx.uid 顺带在这里解析好
+    （AuthUser 只看请求头），DispatchInner 复用、不再重付会话查询。
+
 - async string DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startUs)
-  - 认证之后的请求管线，按序：全局限流 → before 钩子 → 404/405 →
-    填路由元数据 → 路由限流 → 登录/权限门 → [Lock] 请求锁 → handler。
+  - 认证之后的请求管线，按序：before 钩子 → 404/405 → 填路由元数据 →
+    登录/权限门 → [Lock] 请求锁 → handler。全局限流与路由限流已前移到
+    正文读取之前（HandleConnectionInner 的 LimitExceeded——被限请求不再
+    花服务器的带宽与解析 CPU），uid 亦由门处解析好放在 ctx.uid。
     ApiError 变成它携带的应答；其余异常记录后回答 500，handler 结束
     时仍未写应答的也兜底 500。
 
@@ -2265,10 +2611,38 @@ channel (Windows).
     路由/钩子/上传管线与单进程完全一致；daemon 时以守护进程运行。
 
 
+## WebWs (class)
+
+Web 层 WebSocket 升级装配（A332 肥边⑥）：把 HttpContext.WsUpgrade 的
+帧编解码依赖（WsReader/WsWriter/WsAssembler/WsSession，连带 WebSocket
+家族 866 行）从核心 HttpContext 外迁为独立类。HttpContext 是一切
+WebApp 程序的必经类型——它的方法签名引用 WsSession 就会把 ws 编解码
+拉进每一个纯 HTTP 服务。应用调用 <c>WebWs.Upgrade(ctx)</c> 即 opt-in，
+升级前路由/权限已生效的语义不变（ctx 的握手/劫持状态经公开成员操作）。
+
+- static async WsSession Upgrade(HttpContext ctx)
+  - Completes the RFC 6455 handshake and hands the connection to
+    a `WsSession`. The upgrade runs AFTER routing and
+    authorization, so a WebSocket session on the MVC port inherits the
+    route's full permission semantics — the part a standalone WS port
+    cannot give you.
+    
+    Session lifetime follows the SSE hijack contract: the handler that
+    called Upgrade owns the connection until it returns; the connection
+    loop then sees hijacked and tears down without writing a response.
+    null = not an upgrade request (answer normally) or the 101 write
+    failed (peer gone).
+    
+    An idle session is cut by the connection sweeper at the request
+    timeout. Recv/Send re-arm the deadline automatically on activity; a
+    session that may go quiet should be kept alive with periodic Ping()
+    pushes.
+
+
 ## WsSession (class)
 
 Server side of a WebSocket session on the MVC port, created by
-`HttpContext.WsUpgrade`. One object owns the upgraded
+`WebWs.Upgrade`. One object owns the upgraded
 connection: Recv() is the only way to read (ping/pong/close/fragment
 reassembly are handled inside, so a handler never sees protocol
 noise), Send* push to the peer without any inbound message first —
@@ -2320,6 +2694,22 @@ returning ends the session the same way the SSE hijack does.
     the session. Protocol violations and oversized messages close with
     1002/1009. Returns null when the session is over (peer close, EOF,
     protocol error) — stop the loop.
+
+- async string Recv(int timeoutMs)
+  - Recv with an idle window: when no frame arrives within
+    timeoutMs the call returns "" while Open() stays true and any
+    partially buffered bytes survive for the next call — the handler's
+    cue to Ping() (which doubles as the keep-alive that re-arms the
+    connection deadline) and park again. A null return still means the
+    session is over. timeoutMs non-positive waits indefinitely.
+    
+    An empty data message is indistinguishable from the idle window
+    (both return "") — keep protocol payloads non-empty (heartbeats are
+    Ping frames, not empty texts) and there is no ambiguity. This also
+    lets a handler enforce its own session lifetime: a loop parked on
+    Recv now wakes every window even for sessions that only ever see
+    Pong traffic, so a wall-clock cap is checked on every tick instead
+    of only when a real message happens to arrive.
 
 - async bool SendText(string message)
   - Pushes one text message. false = the peer is gone; stop the

@@ -1,77 +1,148 @@
 # System.Net.Tls
 
-> 源码: `stdlib/System/Net/Tls/TlsStream.zan`
+> 源码: `stdlib/System/Net/Tls/TlsHandshake.zan`, `stdlib/System/Net/Tls/TlsRecord.zan`, `stdlib/System/Net/Tls/TlsStream.zan`
+
+
+## TlsByteReader (class)
+
+字节数组大端序安全读取器。
+
+- byte[]data;
+
+- int pos;
+
+- int limit;
+
+- TlsByteReader(byte[]data, int offset, int length)
+
+- int Remaining()
+
+- int Offset()
+
+- bool Has(int count)
+
+- int ReadU8()
+
+- int ReadU16()
+
+- int ReadU24()
+
+- byte[]ReadBytes(int count)
+
+- void Skip(int count)
+
+
+## TlsByteWriter (class)
+
+动态字节数组构建器。
+
+动态字节数组构建器（带双指针滑动窗口，消除高频前缀消费带来的 O(N) 内存拷贝开销）。
+
+- byte[]buf;
+
+- int head;
+
+- int len;
+
+- TlsByteWriter()
+
+- void EnsureCap(int extra)
+
+- void WriteU8(int v)
+
+- void WriteU16(int v)
+
+- void WriteU24(int v)
+
+- void WriteBytes(byte[]b, int offset, int count)
+
+- void WriteBytes(byte[]b)
+
+- int Length()
+
+- int Head()
+
+- byte[]Buffer()
+
+- void Advance(int count)
+
+- int PeekU8(int off)
+
+- int PeekU16(int off)
+
+- byte[]ToArray()
+
+- void RemovePrefix(int count)
+
+
+## TlsCipherState (class)
+
+TLS 记录层 AEAD (AES-128-GCM) 密码状态机。
+支持 TLS 1.2 与 TLS 1.3 双版本单向记录加密与解密。
+零 C 语言与零 OpenSSL 依赖，100% Zan 原生实现。
+
+- int version;
+
+- byte[]key;
+
+- byte[]iv;
+
+- long seq;
+
+- byte[]gcmCtx;
+
+- bool hasCtx;
+
+- byte[]nonceBuf;
+
+- byte[]seqBuf;
+
+- byte[]aadBuf;
+
+- byte[]decBuf;
+
+- TlsCipherState(int version, byte[]key, byte[]iv)
+
+- int Version()
+
+- long SequenceNumber()
+
+- int RecordLen(int plainLen)
+
+- int EncryptToBuf(int contentType, nint dataPtr, int len, byte[]outBuf, int outOffset)
+  - 直写加密并封装为完整 TLS 记录（含 5 字节记录头）。返回写入的记录总字节数，失败返回 -1。
+
+- byte[]Encrypt(int contentType, byte[]data, int offset, int len)
+  - 加密明文负载并封装为完整 TLS 记录（含 5 字节记录头）。
+
+- byte[]Decrypt(byte[]header, byte[]payload, int pOffset, int pLen, List<int> outContentType)
+  - 解密 TLS 记录密文负载，剥离认证标签与填充，产出原始明文与真实 ContentType。
+
+- int EncryptTls12ToBuf(int contentType, nint dataPtr, int len, byte[]outBuf, int outOffset)
+
+- byte[]DecryptTls12(byte[]header, byte[]payload, int pOffset, int pLen, List<int> outContentType)
+
+- int EncryptTls13ToBuf(int contentType, nint dataPtr, int len, byte[]outBuf, int outOffset)
+
+- byte[]DecryptTls13(byte[]header, byte[]payload, int pOffset, int pLen, List<int> outContentType)
 
 
 ## TlsContext (class)
 
-TLS 上下文：封装 OpenSSL 的 SSL_CTX。每个服务器（带
-证书 + 私钥）或每个客户端创建一个，再据此为每个连接派生
-`TlsStream`。
-
-服务器端：
-TlsContext tls = TlsContext.CreateServer("cert.pem", "key.pem");
-TlsStream s = await TlsStream.AcceptAsync(tls, clientSock);
-
-客户端：
-TlsContext tls = TlsContext.CreateClient();
-TlsStream s = await TlsStream.ConnectAsync(tls, sock, "example.com");
-
-- [DllImport("ssl")]static extern string TLS_server_method();
-
-- [DllImport("ssl")]static extern string TLS_client_method();
-
-- [DllImport("ssl")]static extern string SSL_CTX_new(string method);
-
-- [DllImport("ssl")]static extern void SSL_CTX_free(string ctx);
-
-- [DllImport("ssl")]static extern int SSL_CTX_use_certificate_chain_file(string ctx, string file);
-
-- [DllImport("ssl")]static extern int SSL_CTX_use_PrivateKey_file(string ctx, string file, int type);
-
-- [DllImport("ssl")]static extern int SSL_CTX_check_private_key(string ctx);
-
-- [DllImport("ssl")]static extern void SSL_CTX_set_verify(string ctx, int mode, string callback);
-
-- [DllImport("ssl")]static extern int SSL_CTX_set_default_verify_paths(string ctx);
-
-- [DllImport("ssl")]static extern int SSL_CTX_load_verify_locations(string ctx, string file, string path);
-
-- [DllImport("ssl")]static extern string SSL_CTX_get_cert_store(string ctx);
-
-- [DllImport("crypto")]static extern long ERR_get_error();
-
-- [DllImport("crypto")]static extern string d2i_X509(string px, byte[]pp, int len);
-
-- [DllImport("crypto")]static extern int X509_STORE_add_cert(string store, string x);
-
-- [DllImport("crypto")]static extern void X509_free(string x);
-
-- [DllImport("crypto")]static extern string X509_get_issuer_name(string x);
-
-- [DllImport("crypto")]static extern string X509_get_subject_name(string x);
-
-- [DllImport("crypto")]static extern int X509_NAME_oneline(string name, byte[]buf, int size);
-
-- [DllImport("crt", EntryPoint="memcpy")]static extern nint PlatMemCopyIn(byte[]dst, nint src, long n);
-
-- [DllImport("crt", EntryPoint="memcpy")]static extern nint PlatMemCopyOut(nint dst, string src, long n);
-
-- [DllImport("crypt32", EntryPoint="CertOpenSystemStoreA")]static extern nint CertOpenSystemStore(nint prov, string name);
-
-- [DllImport("crypt32")]static extern nint CertEnumCertificatesInStore(nint store, nint prev);
-
-- [DllImport("crypt32")]static extern int CertCloseStore(nint store, int flags);
-
-- [DllImport("crt", EntryPoint="zan_crypto_cert_encoded")]static extern nint CertEncoded(nint cert, nint outLen);
-
-- string ctx;
+纯 Zan 原生 TLS 上下文。
+记录与握手无 OpenSSL 依赖；Windows 客户端系统信任经 Crypt32 SSL 链策略验证。
 
 - bool server;
 
 - string error;
 
 - bool verify;
+
+- bool disableTls13;
+
+- string certFile;
+
+- string keyFile;
 
 - string trust;
 
@@ -81,170 +152,436 @@ TlsStream s = await TlsStream.ConnectAsync(tls, sock, "example.com");
 
 - CertPolicyFn certPolicy;
 
+- List<X509Certificate> trustedCerts;
+
+- List<X509Certificate> cachedChain;
+
+- X509Certificate cachedCert;
+
+- RsaKey cachedKey;
+
+- EcKey cachedEcKey;
+
+- static int MAX_TRUST_BUNDLE_BYTES=4194304;
+
+- static int MAX_TRUST_CERT_BYTES=32768;
+
+- static int MAX_TRUST_CERTS=2048;
+
+- static int MAX_CHAIN_DER_BYTES=131072;
+
+- static string PEM_BEGIN="-----BEGIN CERTIFICATE-----";
+
+- static string PEM_END="-----END CERTIFICATE-----";
+
 - TlsContext()
-  - 内部构造：verify 默认开启；经 CreateServer/CreateClient 使用。
 
-- void SetCertPolicy(CertPolicyFn fn)
-  - 设置证书策略（见 `CertPolicyFn`）。
-    只影响客户端方向；与 DisableVerify() 互斥的放宽手段：
-    校验仍在跑，放行与否由策略逐连接决定。
+- static List<X509Certificate> ParseTrustBundle(string pem, bool strict)
 
-- bool PolicyActive()
-  - 是否已设置证书策略（握手后逐连接裁决校验结果）。
+- static List<X509Certificate> ReadTrustBundle(string path, bool strict)
 
-- void AddPin(string spkiSha256Base64)
-  - 添加一个可接受的服务器公钥 pin：即
-    DER SubjectPublicKeyInfo 的 base64 SHA-256（即由
-    `openssl ... -pubkey | openssl pkey -pubin -outform der
-    | openssl dgst -sha256 -binary | base64` 命令得到的值）。
+- static List<X509Certificate> ParseCertChain(string pem)
+  - 解析服务端证书 PEM 链束：全部证书按出现顺序保留（叶子在
+    前），数量与 DER 总长受限；任何一张无法解析即整体拒绝。
 
-- void RequirePinning(bool on)
-  - 开关 pin 强制校验。发布构建始终开启，保证
-    发布的二进制始终校验配置的 pin；HTTP 客户端中的开发开关
-    是唯一可以放宽它的途径。
+- static List<X509Certificate> ReadCertChainFile(string path)
 
-- bool PinningActive()
-  - 当握手必须满足至少一个已配置的
-    pin 时为 true。
-
-- bool PinMatches(string got)
-  - `got`（base64 的 SPKI SHA-256）与任一 pin 匹配时为 true。
-
-- static TlsContext CreateServer(string certFile, string keyFile)
-  - 从 PEM 证书链
-    和 PEM 私钥创建服务器端 TLS 上下文。失败（路径错误/私钥
-    不匹配）时返回 null；原因见 LastError()。
-
-- static TlsContext CreateClient()
-  - 创建客户端 TLS 上下文。证书校验
-    使用系统默认信任库；如需自签名开发服务器，可调用
-    DisableVerify()。
-
-- static TlsContext CreateClientWithCertificate(string certFile, string keyFile)
-  - 创建带 PEM 证书链和对应 PEM 私钥的
-    客户端 TLS 上下文，用于双向 TLS 认证。
-
-- void DisableVerify()
-  - 禁用对端证书校验（仅限开发）。
-    0 = SSL_VERIFY_NONE。
-
-- static nint PtrAt(nint ptr, int off)
-  - 从结构体的 ptr + off 处读取一个原生指针宽度的字段。
-
-- static int IntAt(nint ptr, int off)
-  - 从结构体的 ptr + off 处读取一个小端序 32 位字段。
-
-- static void LoadSystemRootsWindows(string sslctx)
-  - 枚举 Windows "ROOT" 证书库，把所有受信任的
-    根证书（包括本地安装的代理/MITM CA）加入支撑 sslctx 的
-    OpenSSL X509_STORE，使校验结果与系统信任一致。
-
-- static string LoadSystemRootsUnix(string sslctx)
-  - 随包分发的 OpenSSL 是 CI 上的构建产物，编译期 OPENSSLDIR 指向构建机的
-    目录（macOS 那份是 /opt/homebrew/etc/openssl@3，Linux 那份是
-    /usr/lib/ssl）。这些目录在用户机器上通常不存在，于是
-    SSL_CTX_set_default_verify_paths 一张根证书都装不进来，所有 https
-    请求都在链校验处失败。按 curl 的做法探测本机的系统 CA 包，
-    装上第一个存在的，返回其路径；都没有则返回 ""。
-
-- string TrustHint()
-  - 链校验失败时补充的定位提示：本机一个系统 CA
-    信任库都没装上时点名该原因，否则为 ""。
-
-- static byte[]PemBodyToDer(string pem, int expectedLen)
-  - 从 PEM 字符串中抽出 base64 正文（BEGIN/END 标记之间）并解码为 DER。
+- static List<X509Certificate> TrustFromCandidates(string[]paths)
+  - 按顺序尝试每个候选 bundle 路径：存在但损坏/不可解析的
+    候选只被跳过，不阻断后续候选；全部候选都不可用才返回 null
+    （调用方随之 fail-closed）。
 
 - bool AddTrustedCert(string pemFile)
-  - 把 PEM 格式的 CA（或自签名）证书加入本上下文的信任库，
-    使其签发的对端证书在链校验中被接受。返回 true 表示成功。
-    用于私有 CA 与测试（自签名开发服务器）。
+  - Add every supported CA certificate in a bounded PEM bundle, in addition to defaults.
+
+- static List<X509Certificate> SystemTrustRoots()
+
+- void SetCertPolicy(CertPolicyFn fn)
+
+- bool PolicyActive()
+
+- void AddPin(string spkiSha256Base64)
+
+- void RequirePinning(bool on)
+
+- bool PinningActive()
+
+- bool PinMatches(string got)
+
+- static TlsContext CreateServer(string certFile, string keyFile)
+  - 创建服务器端 TLS 上下文。证书文件可以是 PEM 链束
+    （叶子在前，其后为中间证书）；单证书文件行为不变。链束任何一环
+    无法解析即整体拒绝，不得静默降级为只发叶子。
+
+- static TlsContext CreateClient()
+  - 创建客户端 TLS 上下文；Windows 使用系统 SSL 链策略，Linux 使用发行版 CA bundle。
+
+- static TlsContext CreateClientWithCertificate(string certFile, string keyFile)
+  - 创建带客户端证书与私钥的 TLS 上下文（双向认证）。
+
+- void DisableVerify()
+  - 禁用对端证书与主机名校验（仅用于本地自签名开发调试）。
+
+- void DisableTls13()
+  - 禁用 TLS 1.3，将协商上限限制为 TLS 1.2。
 
 - string Handle()
-  - 底层 OpenSSL SSL_CTX 指针（interop 传递用，勿手工释放）。
 
 - bool IsServer()
-  - 是否为服务器端上下文。
+
+- string TrustHint()
 
 - void Free()
-  - 释放底层的 SSL_CTX。
+
+
+## TlsEngine (class)
+
+纯 Zan 原生 TLS 1.2 / TLS 1.3 客户端与服务端流引擎。
+TLS 记录与握手为原生 Zan；Windows 客户端证书链使用系统 Crypt32 SSL 策略。
+
+- [DllImport("crt", EntryPoint="zan_io_crypto_windows_ssl_policy")]static extern int WindowsSslPolicy(nint certs, int totalLen, int count, nint host, int hostLen);
+
+- static int StateInitial=0;
+
+- static int StateClientHelloSent=1;
+
+- static int StateTls13Handshake=2;
+
+- static int StateTls12Handshake=3;
+
+- static int StateTls12WaitingFinished=4;
+
+- static int StateServerWaitingClientHello=5;
+
+- static int StateServerTls13WaitingFinished=6;
+
+- static int StateServerTls12WaitingClientKeyExchange=7;
+
+- static int StateServerTls12WaitingFinished=8;
+
+- static int StateConnected=9;
+
+- static int StateClosed=10;
+
+- static int StateFailed=11;
+
+- static int MaxPreAuthHandshakeBytes=262144;
+
+- string host;
+
+- bool disableVerify;
+
+- bool disableTls13;
+
+- List<string> pins;
+
+- bool pinRequired;
+
+- CertPolicyFn certPolicy;
+
+- List<X509Certificate> trustedCerts;
+
+- bool isServer;
+
+- string certFile;
+
+- string keyFile;
+
+- X509Certificate cachedCert;
+
+- List<X509Certificate> certChain;
+
+- RsaKey cachedKey;
+
+- EcKey cachedEcKey;
+
+- bool clientAdvertised0805;
+
+- bool clientAdvertised0403;
+
+- static int MaxServerChainCerts=8;
+
+- static int MaxServerChainDerBytes=131072;
+
+- int state;
+
+- string lastError;
+
+- long verifyResult;
+
+- string peerCertText;
+
+- int osTrustDiag;
+
+- X509Certificate peerCert;
+
+- List<X509Certificate> peerChain;
+
+- bool peerAuthenticated;
+
+- bool handshakeSignatureVerified;
+
+- bool receivedEncryptedExtensions;
+
+- int preAuthHandshakeBytes;
+
+- int negotiatedVersion;
+
+- int negotiatedCipherSuite;
+
+- byte[]clientRandom;
+
+- byte[]serverRandom;
+
+- byte[]sessionId;
+
+- byte[]clientX25519Priv;
+
+- byte[]clientX25519Pub;
+
+- byte[]serverX25519Pub;
+
+- byte[]handshakeSecret;
+
+- byte[]clientHsTraffic;
+
+- byte[]serverHsTraffic;
+
+- byte[]clientAppTrafficSecret;
+
+- byte[]clientAppKeyPending;
+
+- byte[]clientAppIvPending;
+
+- byte[]tls12MasterSecret;
+
+- byte[]transcriptHashBeforeFinished;
+
+- byte[]tls12ClientWriteKey;
+
+- byte[]tls12ClientWriteIv;
+
+- byte[]tls12ServerWriteKey;
+
+- byte[]tls12ServerWriteIv;
+
+- TlsTranscript transcript;
+
+- TlsCipherState readCipher;
+
+- TlsCipherState writeCipher;
+
+- TlsByteWriter inNet;
+
+- TlsByteWriter outNet;
+
+- TlsByteWriter appReadBuf;
+
+- TlsByteWriter handshakeBuf;
+
+- byte[]recHeader;
+
+- List<int> recType;
+
+- TlsEngine(string host, bool disableVerify, bool disableTls13, List<string> pins, bool pinRequired, CertPolicyFn certPolicy, List<X509Certificate> trustedCerts, bool isServer, string certFile, string keyFile)
+
+- void SetCredentials(X509Certificate cert, RsaKey key, EcKey ecKey)
+
+- void SetCertChain(List<X509Certificate> chain)
+  - 服务端证书链：叶子在前、中间证书随后。链中每张 DER 都
+    有效且总长受限；为空或不合法时保留 SetCredentials 的单证书回退。
+
+- List<X509Certificate> SendChain()
+  - 待发送的服务端证书列表（叶子在前）；无链时退回单证书。
+
+- int OutNetLength()
+
+- byte[]OutNetBuffer()
+
+- int OutNetHead()
+
+- void DropOutNet(int count)
+
+- bool IsConnected()
+
+- bool IsClosed()
+
+- string LastError()
+
+- long VerifyResult()
+
+- int OsTrustDiag()
+  - Windows 系统信任桥接的诊断码（1=信任，0=输入/环境拒绝，负值=失败分类）
+
+- string PeerCertificateText()
+
+- X509Certificate PeerCertificate()
+
+- int NegotiatedVersion()
+
+- static byte[]RandomBytes(int n)
+
+- byte[]DeriveX25519Shared(byte[]privateKey, byte[]peerPublic, string error)
+
+- static byte[]GenerateX25519(out byte[]publicKey)
+
+- void StartHandshake()
+  - 启动 TLS 握手。客户端产出 ClientHello 记录，服务端置待接收状态。
+
+- void FeedNetwork(byte[]data, int offset, int len)
+  - 向引擎灌入网络层读到的原始数据字节。
+
+- byte[]DrainNetwork()
+  - 从引擎取出待发送至网络的加密数据字节。
+
+- int Step()
+  - 驱动握手与记录处理状态机前进。返回 1 表示握手已完成，0 表示需继续从网络读入数据，-1 表示出错。
+
+- int ProcessRecord(int ctype, byte[]header, byte[]inBuf, int pOffset, int pLen)
+
+- int ProcessHandshakePayload(byte[]data)
+
+- int ProcessOneHandshakeMessage(int msgType, byte[]fullMsg, byte[]body)
+
+- int HandleServerHello(byte[]fullMsg, byte[]body)
+
+- int HandleCertificate(byte[]fullMsg, byte[]body)
+
+- bool WindowsTrustedPeer()
+
+- int VerifyCertificate()
+
+- int HandleCertificateVerify(byte[]fullMsg, byte[]body)
+
+- int HandleFinished(byte[]fullMsg, byte[]body)
+
+- int HandleFinishedTls13(byte[]fullMsg, byte[]body)
+
+- int HandleServerKeyExchange(byte[]fullMsg, byte[]body)
+
+- int HandleServerHelloDone(byte[]fullMsg, byte[]body)
+
+- int HandleFinishedTls12(byte[]fullMsg, byte[]body)
+
+- int HandleClientHello(byte[]fullMsg, byte[]body)
+
+- int ServerStartTls13(byte[]clientShare)
+
+- int ServerStartTls12()
+
+- int HandleClientKeyExchange(byte[]fullMsg, byte[]body)
+
+- int HandleServerFinished(byte[]fullMsg, byte[]body)
+
+- int SendAppData(nint dataPtr, int len)
+  - 加密应用数据指针并零拷贝直写到待发网络缓冲区，按 16KB 分片封装为 TLS 记录。
+
+- int SendAppData(byte[]data, int offset, int len)
+  - 加密应用数据字节数组并放入待发网络缓冲区。
+
+- int SendAppData(string data, int offset, int len)
+  - 加密应用数据字符串并放入待发网络缓冲区。
+
+- int RecvAppData(byte[]outBuf, int offset, int maxLen)
+  - 从已解密的应用缓冲区提取明文数据到字节数组。
+
+- int RecvAppData(string outBuf, int offset, int maxLen)
+  - 从已解密的应用缓冲区提取明文数据到原生字符串/内存切片。
+
+- int AvailableAppData()
+
+- void Fail(string msg)
+
+- byte[]BuildClientHello()
+
+
+## TlsRecord (class)
+
+TLS 记录层协议常量。
+
+- static int ContentTypeChangeCipherSpec=20;
+
+- static int ContentTypeAlert=21;
+
+- static int ContentTypeHandshake=22;
+
+- static int ContentTypeApplicationData=23;
+
+- static int VersionTls10=769;
+
+- static int VersionTls11=770;
+
+- static int VersionTls12=771;
+
+- static int VersionTls13=772;
+
+- static int HandshakeHelloRequest=0;
+
+- static int HandshakeClientHello=1;
+
+- static int HandshakeServerHello=2;
+
+- static int HandshakeNewSessionTicket=4;
+
+- static int HandshakeEndOfEarlyData=5;
+
+- static int HandshakeEncryptedExtensions=8;
+
+- static int HandshakeCertificate=11;
+
+- static int HandshakeServerKeyExchange=12;
+
+- static int HandshakeCertificateRequest=13;
+
+- static int HandshakeServerHelloDone=14;
+
+- static int HandshakeCertificateVerify=15;
+
+- static int HandshakeClientKeyExchange=16;
+
+- static int HandshakeFinished=20;
+
+- static int HandshakeKeyUpdate=24;
+
+- static int AlertLevelWarning=1;
+
+- static int AlertLevelFatal=2;
+
+- static int AlertCloseNotify=0;
+
+- static int AlertUnexpectedMessage=10;
+
+- static int AlertBadRecordMac=20;
+
+- static int AlertHandshakeFailure=40;
+
+- static int AlertBadCertificate=42;
+
+- static int AlertIllegalParameter=47;
+
+- static int AlertDecodeError=50;
+
+- static int AlertDecryptError=51;
+
+- static int AlertInternalError=80;
+
+- static int AlertUnrecognizedName=112;
+
+- static byte[]FormatPlaintext(int contentType, int version, byte[]data, int offset, int len)
+  - 构造明文 TLS 记录包（用于握手未加密阶段）。
+
+- static void WriteSeq64(byte[]buf, int offset, long seq)
+  - 将 64 位无符号序列号按大端写入缓冲区。
 
 
 ## TlsStream (class)
 
-非阻塞套接字上的一条 TLS 连接，由 OpenSSL 内存
-BIO 驱动，因此所有套接字 IO 都经过协程 reactor（await
-Socket.ReadReady / Socket.SendAsync），TLS 不会阻塞线程。
-
-加密字节在 socket <-> rbio/wbio 间流动；SSL_read/SSL_write 使
-明文出入 SSL 引擎。WANT_READ 时向 rbio 灌入一次套接字读取；
-wbio 中待发的字节则在每次引擎步骤后
-刷回套接字。
+非阻塞套接字上的纯 Zan 原生 TLS 1.2 / TLS 1.3 流。
+原生 AES-128-GCM、X25519、HKDF 与 X.509 握手；Windows 客户端另用 Crypt32 SSL 链策略。
 
 - [DllImport("crt", EntryPoint="zan_monotonic_us")]static extern long MonotonicUs();
 
-- [DllImport("ssl")]static extern string SSL_new(string ctx);
-
-- [DllImport("ssl")]static extern void SSL_free(string ssl);
-
-- [DllImport("ssl")]static extern void SSL_set_bio(string ssl, string rbio, string wbio);
-
-- [DllImport("ssl")]static extern void SSL_set_accept_state(string ssl);
-
-- [DllImport("ssl")]static extern void SSL_set_connect_state(string ssl);
-
-- [DllImport("ssl")]static extern int SSL_do_handshake(string ssl);
-
-- [DllImport("ssl")]static extern int SSL_read(string ssl, string buf, int num);
-
-- [DllImport("ssl")]static extern int SSL_write(string ssl, string buf, int num);
-
-- [DllImport("ssl")]static extern int SSL_get_error(string ssl, int ret);
-
-- [DllImport("ssl")]static extern int SSL_set_verify(string ssl, int mode, string callback);
-
-- [DllImport("ssl")]static extern int SSL_shutdown(string ssl);
-
-- [DllImport("ssl")]static extern int SSL_ctrl(string ssl, int cmd, int larg, string parg);
-
-- [DllImport("ssl")]static extern string SSL_get0_param(string ssl);
-
-- [DllImport("ssl")]static extern long SSL_get_verify_result(string ssl);
-
-- [DllImport("crypto")]static extern int X509_VERIFY_PARAM_set1_host(string param, string name, long len);
-
-- [DllImport("crypto")]static extern int X509_VERIFY_PARAM_set1_ip_asc(string param, string ipasc);
-
-- [DllImport("crypto")]static extern void X509_VERIFY_PARAM_set_hostflags(string param, long flags);
-
-- [DllImport("crypto")]static extern string X509_VERIFY_PARAM_get0_name(string param);
-
-- [DllImport("crypto")]static extern string BIO_new(string method);
-
-- [DllImport("crypto")]static extern string BIO_s_mem();
-
-- [DllImport("crypto")]static extern int BIO_write(string bio, string data, int dlen);
-
-- [DllImport("crypto")]static extern int BIO_read(string bio, string data, int dlen);
-
-- [DllImport("crypto")]static extern int BIO_ctrl_pending(string bio);
-
-- [DllImport("ssl")]static extern string SSL_get1_peer_certificate(string ssl);
-
-- [DllImport("crypto")]static extern string X509_get_X509_PUBKEY(string x);
-
-- [DllImport("crypto")]static extern int i2d_X509_PUBKEY(string pubkey, byte[]pp);
-
-- [DllImport("crypto")]static extern void X509_free(string x);
-
-- [DllImport("crypto", EntryPoint="CRYPTO_free")]static extern void OpenSslFree(nint p, string file, int line);
-
-- [DllImport("crt", EntryPoint="memcpy")]static extern nint PlatMemCopyIn(byte[]dst, nint src, long n);
-
-- string ssl;
-
-- string rbio;
-
-- string wbio;
+- TlsEngine engine;
 
 - nint sock;
 
@@ -254,124 +591,110 @@ wbio 中待发的字节则在每次引擎步骤后
 
 - byte[]scratch;
 
-- static int SCRATCH=17408;
+- static int SCRATCH=65536;
+
+- byte[]pendingOut;
+
+- int pendingLen;
 
 - static string lastError="";
 
 - static int Norm(int v)
-  - C 的 `int` 返回值是零扩展的（C 的 -1 读到为 4294967295）；
-    将其折回有符号 32 位，错误检查才能正常工作。
 
 - static string LastError()
-  - 最近一次失败的原因文本（CreateServer/CreateClient/
-    ConnectAsync 失败后可读）；成功操作会先清空它。
 
 - static void SetLastError(string error)
-  - 更新 LastError 报告的原因文本。
+
+- static bool ValidReceiveRange(int bufferLength, int offset, int max)
 
 - TlsStream()
-  - 内部构造：经 Setup() 使用。
 
-- static TlsStream Setup(TlsContext ctx, nint sock)
-  - 把 ctx 包装到套接字上（分配 SSL 与内存 BIO 对、
-    SCRATCH 暂存缓冲）；不执行握手。失败返回 null。
+- static TlsStream Setup(TlsContext ctx, nint sock, string host)
 
 - static async TlsStream AcceptAsync(TlsContext ctx, nint sock)
-  - 服务器端：包装已接受的套接字并执行 TLS 握手。
-    默认 30 秒握手预算；握手失败或超时返回 null，原因见
-    `LastError`。
+  - 服务器端：接受客户端连接并执行 TLS 握手。
 
 - static async TlsStream AcceptAsync(TlsContext ctx, nint sock, int timeoutMs)
-  - 服务器端 TLS 握手，timeoutMs 为握手阶段预算；<= 0
-    表示不设握手截止时间。
 
 - static async TlsStream ConnectAsync(TlsContext ctx, nint sock, string host)
-  - 客户端：包装已连接的套接字，发送
-    <paramref name="host"/> 的 SNI 并执行 TLS 握手。握手失败时
-    返回 null。
-    客户端 TLS 握手；timeoutMs 为握手阶段预算，<= 0 表示不设
-    握手截止时间。保留三参数入口供非 HTTP 调用方使用。
+  - 客户端：连接对端服务器并执行 TLS 握手。
 
 - static async TlsStream ConnectAsync(TlsContext ctx, nint sock, string host, int timeoutMs)
-  - 带握手预算的客户端 TLS 握手：timeoutMs <= 0 表示不设截止。
-    失败（Setup 失败、主机名校验参数出错、握手失败、证书链/主机名
-    校验不通过且无策略放行、pin 不匹配）返回 null，原因见 LastError。
 
-- static bool IsIpLiteral(string host)
-  - host 是否为 IP 字面量（IPv4 点分十进制或 IPv6 含冒号）：
-    是则主机名校验走 set1_ip_asc，否则走 set1_host。
+- static TlsStream ConnectStepped(TlsContext ctx, nint sock, string host)
 
-- static string PeerCertText(string ssl)
-  - 对端证书的可读文本："issuer=... subject=..."；无对端证书
-    时返回 ""。证书策略回调与错误报告共用。
+- static TlsStream AcceptStepped(TlsContext ctx, nint sock)
 
-- static string NameText(string name)
-  - X509_NAME → 单行可读文本（X509_NAME_oneline 形式）。
+- static TlsStream SetupStepped(TlsContext ctx, nint sock, string host)
 
-- static string SpkiPinOf(string ssl)
-  - 对端证书 DER
-    SubjectPublicKeyInfo 的 base64 SHA-256（即通过 TlsContext.AddPin 固定的值），
-    没有对端证书/编码时返回 ""。
+- int HandshakePump()
+
+- string HandshakeDrain()
+
+- void HandshakeFeed(string data)
+
+- void EnsurePending(int extra)
+
+- string PeerCertificateText()
+  - 获取当前连接对端证书的描述文本（形如 issuer=... subject=...）。
+
+- static string SpkiPinOf(TlsStream stream)
 
 - async int FlushOutAsync()
-  - 把 wbio 中待发的加密输出字节刷到套接字。
-    必须保证 BIO 中读出的每一块都完整发出；否则截断的 TLS
-    记录会导致握手/数据损坏。Socket.SendAsync 在内部已经循环
-    重发，因此其返回值应等于请求发送的字节数；若不相等则
-    视为连接已不可用。
 
 - async int PumpInAsync()
-  - 从套接字读一块加密字节灌入 rbio。返回字节数，
-    对端关闭为 0，出错为 -1；无可读数据时挂起等待。
 
 - async int HandshakeAsync(int timeoutMs)
-  - 驱动 TLS 握手直至完成。成功返回 1。
-    整个握手有 30 秒硬截止：对端每 30 秒滴一字节的慢速攻击
-    此前会无限循环 WANT_READ，钉死一个协程 + SSL + BIO + 17KB
-    暂存缓冲——面向公网的服务器这样被逐个耗干。超时返回 -2，
-    调用方照常关闭连接。
-    
-    截止检查是墙钟轮询，仅在本协程被唤醒时执行；完全静默的
-    对端不会唤醒任何东西，所以另外武装进程级 HttpDeadline
-    扫描器（每秒唤醒，超时 shutdown 套接字）——被 shutdown
-    唤醒的 PumpInAsync 读到 0 按对端关闭返回 -1，走正常清理。
-    await ReadReady 自身没有计时能力，这是唯一能让"静默对端"
-    也吃到期满的办法。
 
 - int EndHandshakeWatch(int result)
-  - 握手结束时释放 deadline 槽位（服务器的连接循环随后会按
-    每请求节奏重新 Arm）。result 原样返回。
 
 - async string RecvAsync(int max)
-  - 接收解密后的应用字节（最多
-    <paramref name="max"/>，最多一个暂存缓冲区）。正常关闭或出错时
-    返回 ""。
+  - 接收解密后的应用字节（最多 max）。正常关闭或出错时返回空串。
 
 - async int RecvIntoAsync(string buf, int max)
-  - 接收解密后的字节到调用方提供的缓冲区
-    （二进制安全：返回字节数，不做 NUL 截断）。
-    正常关闭返回 0，出错返回 -1。
+  - 接收解密后的字节到调用方提供的缓冲区。正常关闭返回 0，出错返回 -1。
+
+- async int RecvBytesAsync(byte[]buf, int offset, int max)
+  - 接收解密后的字节到调用方提供的字节数组。正常关闭返回 0，出错返回 -1。
 
 - async int SendAsync(string data, int len)
-  - 加密并发送 <paramref name="len"/> 字节。成功返回
-    明文字节数，失败返回 -1。
+  - 加密并发送 len 字节字符串数据。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。
+
+- async int SendAsync(byte[]data, int len)
+  - 加密并发送字节数组前 len 字节。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。
+
+- async int SendBytesAsync(byte[]data, int offset, int len)
+  - 加密并发送字节数组切片。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。
+
+- async int SendBytesAsync(byte[]data)
+  - 加密并发送完整字节数组。
 
 - async int SendStringAsync(string data)
   - 发送整个字符串（其 .Length 个字节）。
 
 - void Close()
-  - 发送 TLS close_notify 并释放 SSL 引擎与 BIO 所有权；
-    底层套接字仍归调用方所有（且必须由其关闭）。Close 后继续
-    调用安全：所有方法按未打开处理。
+  - 关闭 TLS 连接。
+
+
+## TlsTranscript (class)
+
+TLS 握手消息转录摘要（Transcript Hash），记录自 ClientHello 起所有握手层消息。
+
+- TlsByteWriter writer;
+
+- TlsTranscript()
+
+- void Update(byte[]msg, int offset, int len)
+
+- void Update(byte[]msg)
+
+- byte[]CurrentHash()
 
 
 ## bool (delegate)
 
-证书策略：客户端握手后若链/主机名校验不通过（verify_result
-!= 0），以 (verifyResult, 对端证书文本) 调用；返回 true 放行
-本次连接，false 拒绝。证书文本形如
-"issuer=/CN=GlobalSign.../O=Alibaba subject=/CN=example.com"。
-典型用途：老系统缺根证书时按已知签发者放行（.NET
-ServerCertificateValidationCallback 的对应物）。
+证书策略委托：客户端握手后若链/主机名校验不通过（verifyResult != 0），
+以 (verifyResult, 对端证书文本) 调用；返回 true 放行本次连接，false 拒绝。
+证书文本形如 "issuer=/CN=.../O=... subject=/CN=example.com"。
 
 `delegate bool CertPolicyFn(long verifyResult, string certText);`

@@ -1,6 +1,6 @@
 # Game.Board
 
-> 源码: `stdlib/Game/Board/Grid.zan`, `stdlib/Game/Board/Match.zan`
+> 源码: `packages/Zan.Game/src/Game/Board/Grid.zan`, `packages/Zan.Game/src/Game/Board/Match.zan`
 
 
 ## BoardCommand (class)

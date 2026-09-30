@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Arealimit
 
-> 源码: `stdlib/Sdk/Jd/Api/Arealimit/ArealimitReadFindAreaLimitsByWareIdRequest.zan`, `stdlib/Sdk/Jd/Api/Arealimit/JdArealimitApi.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Arealimit/ArealimitReadFindAreaLimitsByWareIdRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Arealimit/JdArealimitApi.zan`
 
 
 ## ArealimitReadFindAreaLimitsByWareIdRequest (class)

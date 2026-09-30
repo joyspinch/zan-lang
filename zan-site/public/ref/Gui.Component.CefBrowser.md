@@ -1,6 +1,6 @@
 # Gui.Component.CefBrowser
 
-> 源码: `stdlib/Gui/Component/CefBrowser/CefBackend.zan`, `stdlib/Gui/Component/CefBrowser/CefBootstrap.zan`, `stdlib/Gui/Component/CefBrowser/CefBrowser.zan`, `stdlib/Gui/Component/CefBrowser/CefBrowserBox.zan`, `stdlib/Gui/Component/CefBrowser/CefCdp.zan`, `stdlib/Gui/Component/CefBrowser/CefCookies.zan`, `stdlib/Gui/Component/CefBrowser/CefFingerprint.zan`, `stdlib/Gui/Component/CefBrowser/CefHost.zan`, `stdlib/Gui/Component/CefBrowser/CefOptions.zan`, `stdlib/Gui/Component/CefBrowser/CefPage.zan`, `stdlib/Gui/Component/CefBrowser/CefRuntime.zan`
+> 源码: `packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefBackend.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefBootstrap.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefBrowser.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefBrowserBox.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefCdp.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefControlBootstrap.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefCookies.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefFingerprint.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefHost.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefOptions.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefPage.zan`, `packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefRuntime.zan`
 
 
 ## CefArchive (class)
@@ -724,20 +724,11 @@ IsSupported() 为 false，Render 画一个画布内占位符（说明原因）�
 - static string UrlEscape(string s)
   - data: URL 里必须转义的字符（其余按 UTF-8 原样传，Chromium 接受）。
 
-- static string JsonString(string s)
-  - 把字符串包成 JSON 字面量（CDP 参数拼装用）。
-    
-    控制字符按 JSON 规范用 `\u00XX` 转义，而不是像以前那样静默换成空格——
-    旧行为会让 NUL / 0x01-0x1F 被吃掉、CDF 收到的 expression 是错的。
-
-- static string HexDigit(int n)
-  - 数字 0-15 转小写十六进制字符（JSON 转义用）。
-
 
 ## CefBrowserBox (class)
 
 可摆放的 Chromium 浏览器控件：把原生 CefBrowser 包成一个普通的保留式
-Control，因此设计器 / .zform 里的 CEF 浏览器和别的控件一样，由布局给它
+Control，因此设计器 / .html 设计稿里的 CEF 浏览器和别的控件一样，由布局给它
 一块矩形、由它自己负责绘制（与 WebViewBox 同构，只是引擎换成自带的
 Chromium）。
 
@@ -766,7 +757,7 @@ box.View().NavComplete += () => { ... };
     本控件唯一拥有的 CefBrowser 实例。
 
 - void SetStartUrl(string u)
-  - 起始地址（设计属性 `url`，.zform 里也可写成
+  - 起始地址（设计属性 `url`，设计文档里也可写成
     `placeholder`）。首帧之前设置只记录起始地址，待首次绘制时
     导航一次；首帧之后设置立即等同于 Navigate。
 
@@ -826,6 +817,10 @@ box.View().NavComplete += () => { ... };
 - override void BindEvent(string evt, Action a)
   - 浏览器的语义事件挂在原生视图上，设计里的 `onNavComplete` 之类
     因此直接落到它的 UiEvent，宿主不必自己接线。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - override void OnPaint(App app)
   - 绘制：零尺寸时隐藏原生浏览器；首帧前先消费起始地址（原生
@@ -934,6 +929,21 @@ cdp.Send("Page.captureScreenshot", "{}", (result) => { ... });
     未知转义保留转义后那个字符本身），无转义时原样返回。
 
 
+## CefControlBootstrap (class)
+
+CEF 家族的 HeavyControls 注册入口。IDE、浏览器示例等真正用到
+CefBrowserBox 的宿主在启动时调用一次 `Install`（放在
+Main 最前，与 CefBootstrap.RunHelper 同一位置约定）；不调用的程序
+里整个 CEF 家族被 globaldce 删光，发布不再携带 zan_cef/zan_cef109
+DLL（bundle 的 "if CefBackend_" 前缀条件不再命中）。
+
+- static bool installed;
+
+- static void Install()
+
+- static Control MakeCefBrowserBox(string kind)
+
+
 ## CefCookies (class)
 
 Cookie 读写，走 CDP（`CefCdp`）。回复是异步到达的，所以每个
@@ -993,7 +1003,8 @@ Cookie 存在 profile 目录里（`CefOptions.profileDir`），
 
 - static string Param(string name, string value, string domain, string path, bool secure, string url, long expires)
   - 拼一条 Network.CookieParam。url 非空时用 url 形式，否则
-    domain/path；expires < 0 表示会话 Cookie。
+    domain/path；expires < 0 表示会话 Cookie。树构建产出，转义交给
+    ToJson。
 
 
 ## CefFingerprint (class)
@@ -1459,8 +1470,15 @@ helper 子进程也要按同一份配置找运行时。
     分号时整串改用分号分隔，否则带逗号的开关值会被拆开。
 
 - static bool NoDcomp()
-  - 是否禁用 DirectComposition：配置字段为 true，或环境变量
-    ZAN_CEF_NO_DCOMP 设为非 "0" 非空值时为 true。
+  - 是否禁用 DirectComposition：显式配置字段为 true 时恒为 true
+    （配置优先，与 CefOptions 其他字段一致）；否则环境变量
+    ZAN_CEF_NO_DCOMP 是其后两路的总闸——设 "0" 压掉（CI 固定
+    行为用），设其他非空值直接 true；都没设时，装了 IDD 虚拟
+    显示适配器（向日葵/GameViewer 等远程控屏驱动）的 Windows
+    机器自动打开——DComp 交换链在那类机器上会让 GPU 子进程连崩
+    退到软件 GL（A50-4 拍板=默认自动关）。显式设
+    disableDirectComposition=false 压不过探测；要把探测整体退场
+    （配置字段优先级不变）用 ZAN_CEF_NO_DCOMP=0。
 
 - static string Join(string left, string right)
   - 拼接两段开关列表：任一段为空直接返回另一段；任一段含分号

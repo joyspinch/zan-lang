@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Vender
 
-> 源码: `stdlib/Sdk/Jd/Api/Vender/JdVenderApi.zan`, `stdlib/Sdk/Jd/Api/Vender/VenderAuthFindUserRequest.zan`, `stdlib/Sdk/Jd/Api/Vender/VenderCategoryGetFullValidCategoryResultByVenderIdRequest.zan`, `stdlib/Sdk/Jd/Api/Vender/VenderCategoryGetValidCategoryResultByVenderIdRequest.zan`, `stdlib/Sdk/Jd/Api/Vender/VenderInfoQueryByPinRequest.zan`, `stdlib/Sdk/Jd/Api/Vender/VenderShipaddressQueryRequest.zan`, `stdlib/Sdk/Jd/Api/Vender/VenderShopQueryRequest.zan`, `stdlib/Sdk/Jd/Api/Vender/VenderShopcategoryGetShopCategorysByVenderIdRequest.zan`, `stdlib/Sdk/Jd/Api/Vender/VenderVbinfoGetBasicVenderInfoByVenderIdRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Vender/JdVenderApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Vender/VenderAuthFindUserRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Vender/VenderCategoryGetFullValidCategoryResultByVenderIdRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Vender/VenderCategoryGetValidCategoryResultByVenderIdRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Vender/VenderInfoQueryByPinRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Vender/VenderShipaddressQueryRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Vender/VenderShopQueryRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Vender/VenderShopcategoryGetShopCategorysByVenderIdRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Vender/VenderVbinfoGetBasicVenderInfoByVenderIdRequest.zan`
 
 
 ## JdVenderApi (class)

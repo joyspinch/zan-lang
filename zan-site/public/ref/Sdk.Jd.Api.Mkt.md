@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Mkt
 
-> 源码: `stdlib/Sdk/Jd/Api/Mkt/JdMktApi.zan`, `stdlib/Sdk/Jd/Api/Mkt/MktSmartstrategyIntelligentisvGetCouponBatchRequest.zan`, `stdlib/Sdk/Jd/Api/Mkt/MktSmartstrategyIntelligentisvGetDeliveryChannelRequest.zan`, `stdlib/Sdk/Jd/Api/Mkt/MktSmartstrategyIntelligentisvGetISVPlanEffectListRequest.zan`, `stdlib/Sdk/Jd/Api/Mkt/MktSmartstrategyIntelligentisvSubmitISVPlanRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Mkt/JdMktApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Mkt/MktSmartstrategyIntelligentisvGetCouponBatchRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Mkt/MktSmartstrategyIntelligentisvGetDeliveryChannelRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Mkt/MktSmartstrategyIntelligentisvGetISVPlanEffectListRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Mkt/MktSmartstrategyIntelligentisvSubmitISVPlanRequest.zan`
 
 
 ## JdMktApi (class)

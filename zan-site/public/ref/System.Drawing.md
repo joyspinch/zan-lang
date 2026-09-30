@@ -1,32 +1,6 @@
 # System.Drawing
 
-> 源码: `stdlib/System/Drawing/Graphics.zan`, `stdlib/System/Drawing/Primitives.zan`
-
-
-## Bitmap (class)
-
-通过 GDI 创建和操作位图。
-
-- [DllImport("gdi32")]static extern int CreateCompatibleDC(int hdc);
-
-- [DllImport("gdi32")]static extern int CreateCompatibleBitmap(int hdc, int width, int height);
-
-- [DllImport("gdi32")]static extern int SelectObject(int hdc, int obj);
-
-- [DllImport("gdi32")]static extern int DeleteDC(int hdc);
-
-- [DllImport("gdi32")]static extern int DeleteObject(int obj);
-
-- [DllImport("gdi32")]static extern int BitBlt(int hdcDest, int xDest, int yDest, int width, int height, int hdcSrc, int xSrc, int ySrc, int rop);
-
-- static int CreateMemoryDC(int hwndDC, int width, int height)
-  - 创建带兼容位图的内存 DC。
-
-- static void CopyTo(int srcDC, int destDC, int x, int y, int width, int height)
-  - 将位图内容复制到目标 DC。
-
-- static void Destroy(int memDC)
-  - 删除内存 DC。
+> 源码: `stdlib/System/Drawing/ImageBuffer.zan`, `stdlib/System/Drawing/PixelOps.zan`, `stdlib/System/Drawing/Primitives.zan`
 
 
 ## Color (class)
@@ -82,105 +56,86 @@
   - 不透明橙（255,165,0）。
 
 
-## Font (class)
+## ImageBuffer (class)
 
-提供 GDI 文本渲染所需的字体创建。
+纯 Zan 自举的托管 32 位 ARGB 图像缓冲区。
+封装内存管理、边界安全与高性能图像处理流水线（Crop、Resize、Blit、Fill）。
+所有热路径计算全部下沉至底层物理原语（NativeMemory.Copy2D 与 PixelOps），
+杜绝 C 业务胶水依赖，具备工业级运行效率。
 
-- [DllImport("gdi32")]static extern int CreateFontA(int height, int width, int escapement, int orientation, int weight, int italic, int underline, int strikeout, int charset, int outPrecision, int clipPrecision, int quality, int pitchAndFamily, string faceName);
+- public int Width;
 
-- [DllImport("gdi32")]static extern int SelectObject(int hdc, int obj);
+- public int Height;
 
-- [DllImport("gdi32")]static extern int DeleteObject(int obj);
+- public int Stride;
 
-- static int Create(string name, int size)
-  - 按指定名称和大小创建字体。
+- public nint Pixels;
 
-- static int CreateBold(string name, int size)
-  - 创建粗体字体。
+- public ImageBuffer(int width, int height)
 
-- static int CreateItalic(string name, int size)
-  - 创建斜体字体。
+- public void Dispose()
 
-- static int Select(int hdc, int font)
-  - 将字体选入设备上下文。
+- public void Clear(int color)
+  - 以指定 32 位 ARGB 颜色清空图像。
 
-- static void Destroy(int font)
-  - 删除字体对象。
+- public void FillRect(int x, int y, int w, int h, int color)
+  - 在指定矩形区域填充 32 位 ARGB 颜色（自动边界裁剪）。
+
+- public ImageBuffer Crop(int x, int y, int w, int h)
+  - 裁剪子区域并返回新的 ImageBuffer（由 Copy2D 物理加速，零冗余遍历）。
+
+- public ImageBuffer Resize(int newWidth, int newHeight)
+  - 双线性重采样拉伸到目标尺寸（由 ResampleBilinearRow 向量化物理加速）。
+
+- public void Blit(ImageBuffer src, int dx, int dy, bool alphaBlend)
+  - 将另一个 ImageBuffer 绘制到当前图像（支持直接覆盖与 Porter-Duff Over 混合）。
+
+- public void SwapRB()
+  - 将当前图像的通道在 RGBA 与 BGRA 之间翻转。
+
+- public void AdjustBrightness(int delta)
+  - 调整整幅图像的明暗度（delta 为 -255..255）。基于 AVX2 饱和加减硬件指令，杜绝溢出反转。
+
+- public void Blend50(ImageBuffer other)
+  - 50% 均值混合（基于 AVX2 vpavgb 32 字节并行硬件指令）。
+
+- public void Darken(ImageBuffer other)
+  - 变暗混合（Min 滤镜，基于 AVX2 vpminub 32 字节并行硬件指令）。
+
+- public void Lighten(ImageBuffer other)
+  - 变亮混合（Max 滤镜，基于 AVX2 vpmaxub 32 字节并行硬件指令）。
+
+- public void Invert()
+  - 颜色反相（基于 AVX2 32 字节并行 XOR 硬件流水线）。
+
+- public void Grayscale()
+  - 灰度化（基于定点数加权通道融合 Y = (B*29 + G*150 + R*77) >> 8）。保留 Alpha 通道不变。
+
+- public void BoxBlur(int radius)
+  - 高性能双向可分离均值盒式模糊（Box Blur，可用于毛玻璃特效与平滑）。
+    radius: 模糊半径（像素），必须 >= 1。
+    采用定点数倒数乘法加速，彻底消除每像素除法开销。
 
 
-## Graphics (class)
+## PixelOps (class)
 
-在设备上下文上提供 GDI 绘图操作。
+底层高性能像素操作物理原语（硬件加速与向量化）。
+由编译器 irgen 直接降低为 LLVM 向量化内部循环与指令，
+供上层 ImageBuffer、GUI 渲染器与游戏引擎自举调用。
 
-- [DllImport("gdi32")]static extern int CreateSolidBrush(int color);
+- [DllImport("crt")]static extern void BlendOver(nint dst, nint src, int count);
+  - 将 count 个 32 位 ARGB 像素使用标准 Porter-Duff Over 算法合成到 dst。
 
-- [DllImport("gdi32")]static extern int CreatePen(int style, int width, int color);
+- [DllImport("crt")]static extern void SwapRB(nint dst, nint src, int count);
+  - 交换 count 个 32 位像素的 R 和 B 通道（RGBA ↔ BGRA）。
 
-- [DllImport("gdi32")]static extern int SelectObject(int hdc, int obj);
+- [DllImport("crt")]static extern void FillRect(nint dst, int dstStride, int x, int y, int w, int h, int color);
+  - 快速填充指定矩形区域的 32 位像素颜色。
 
-- [DllImport("gdi32")]static extern int DeleteObject(nint obj);
-
-- [DllImport("gdi32")]static extern int Rectangle(nint hdc, int left, int top, int right, int bottom);
-
-- [DllImport("gdi32")]static extern int Ellipse(nint hdc, int left, int top, int right, int bottom);
-
-- [DllImport("gdi32")]static extern int MoveToEx(nint hdc, int x, int y, nint lpPoint);
-
-- [DllImport("gdi32")]static extern int LineTo(nint hdc, int x, int y);
-
-- [DllImport("gdi32")]static extern int SetPixel(nint hdc, int x, int y, int color);
-
-- [DllImport("gdi32")]static extern int GetPixel(nint hdc, int x, int y);
-
-- [DllImport("gdi32")]static extern int SetBkMode(nint hdc, int mode);
-
-- [DllImport("gdi32")]static extern int SetTextColor(nint hdc, int color);
-
-- [DllImport("gdi32")]static extern int TextOutA(nint hdc, int x, int y, string text, int len);
-
-- [DllImport("gdi32")]static extern int SetBkColor(nint hdc, int color);
-
-- [DllImport("gdi32")]static extern int RoundRect(nint hdc, int left, int top, int right, int bottom, int rx, int ry);
-
-- [DllImport("gdi32")]static extern int Polygon(nint hdc, string points, int count);
-
-- [DllImport("gdi32")]static extern int Polyline(nint hdc, string points, int count);
-
-- [DllImport("gdi32")]static extern int Arc(nint hdc, int x1, int y1, int x2, int y2, int x3, int y3, int x4, int y4);
-
-- [DllImport("gdi32")]static extern int Pie(nint hdc, int x1, int y1, int x2, int y2, int x3, int y3, int x4, int y4);
-
-- [DllImport("gdi32")]static extern int CreateFont(int height, int width, int escapement, int orientation, int weight, int italic, int underline, int strikeout, int charset, int outPrecision, int clipPrecision, int quality, int pitchAndFamily, string faceName);
-
-- [DllImport("user32")]static extern int FillRect(int hdc, string rect, int brush);
-
-- [DllImport("user32")]static extern int GetDC(int hwnd);
-
-- [DllImport("user32")]static extern int ReleaseDC(int hwnd, int hdc);
-
-- static void FillRectangle(int hdc, int x, int y, int w, int h, int color)
-  - 绘制实心矩形。
-
-- static void DrawRectangle(int hdc, int x, int y, int w, int h, int color, int penWidth)
-  - 绘制矩形边框。
-
-- static void FillEllipse(int hdc, int x, int y, int w, int h, int color)
-  - 绘制实心椭圆。
-
-- static void DrawLine(int hdc, int x1, int y1, int x2, int y2, int color, int penWidth)
-  - 在两点之间绘制一条直线。
-
-- static void DrawText(int hdc, string text, int x, int y, int color)
-  - 在指定位置绘制文本。
-
-- static void FillRoundRect(int hdc, int x, int y, int w, int h, int rx, int ry, int color)
-  - 绘制实心圆角矩形。
-
-- static int FromHwnd(int hwnd)
-  - 获取窗口的设备上下文。
-
-- static void Release(int hwnd, int hdc)
-  - 释放设备上下文。
+- [DllImport("crt")]static extern void ResampleBilinearRow(nint dst, nint src0, nint src1, nint xIndices, nint xWeights, int weightY, int width);
+  - 双线性重采样单行：根据 X 轴源索引、X 轴权重数组和当前行 Y 权重，
+    对 src0 和 src1 两行像素进行水平加垂直双线性插值，输出 width 个像素到 dst。
+    xWeights 与 weightY 范围为 0..256（定点数）。
 
 
 ## Point (class)

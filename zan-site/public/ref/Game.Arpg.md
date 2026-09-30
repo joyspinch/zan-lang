@@ -1,6 +1,6 @@
 # Game.Arpg
 
-> 源码: `stdlib/Game/Arpg/Combat.zan`, `stdlib/Game/Arpg/Config.zan`, `stdlib/Game/Arpg/DataBinding.zan`, `stdlib/Game/Arpg/Entity.zan`, `stdlib/Game/Arpg/Events.zan`, `stdlib/Game/Arpg/Fonts/PixelFont.zan`, `stdlib/Game/Arpg/Formula.zan`, `stdlib/Game/Arpg/Global.zan`, `stdlib/Game/Arpg/Map.zan`, `stdlib/Game/Arpg/Menu.zan`, `stdlib/Game/Arpg/Music.zan`, `stdlib/Game/Arpg/Net.zan`, `stdlib/Game/Arpg/NetRuntime.zan`, `stdlib/Game/Arpg/Presentation.zan`, `stdlib/Game/Arpg/Primitives.zan`, `stdlib/Game/Arpg/Project.zan`, `stdlib/Game/Arpg/RichText.zan`, `stdlib/Game/Arpg/Runtime.zan`, `stdlib/Game/Arpg/Server.zan`, `stdlib/Game/Arpg/ServerEvents.zan`, `stdlib/Game/Arpg/TextLayout.zan`, `stdlib/Game/Arpg/Tween.zan`, `stdlib/Game/Arpg/UiRuntime.zan`
+> 源码: `packages/Zan.Game/src/Game/Arpg/Combat.zan`, `packages/Zan.Game/src/Game/Arpg/Config.zan`, `packages/Zan.Game/src/Game/Arpg/DataBinding.zan`, `packages/Zan.Game/src/Game/Arpg/Entity.zan`, `packages/Zan.Game/src/Game/Arpg/Events.zan`, `packages/Zan.Game/src/Game/Arpg/Fonts/PixelFont.zan`, `packages/Zan.Game/src/Game/Arpg/Formula.zan`, `packages/Zan.Game/src/Game/Arpg/Global.zan`, `packages/Zan.Game/src/Game/Arpg/IsoTileMap.zan`, `packages/Zan.Game/src/Game/Arpg/LootScatter.zan`, `packages/Zan.Game/src/Game/Arpg/Map.zan`, `packages/Zan.Game/src/Game/Arpg/Menu.zan`, `packages/Zan.Game/src/Game/Arpg/Music.zan`, `packages/Zan.Game/src/Game/Arpg/Net.zan`, `packages/Zan.Game/src/Game/Arpg/NetRuntime.zan`, `packages/Zan.Game/src/Game/Arpg/Presentation.zan`, `packages/Zan.Game/src/Game/Arpg/Primitives.zan`, `packages/Zan.Game/src/Game/Arpg/Project.zan`, `packages/Zan.Game/src/Game/Arpg/RichText.zan`, `packages/Zan.Game/src/Game/Arpg/Runtime.zan`, `packages/Zan.Game/src/Game/Arpg/Server.zan`, `packages/Zan.Game/src/Game/Arpg/ServerEvents.zan`, `packages/Zan.Game/src/Game/Arpg/TextLayout.zan`, `packages/Zan.Game/src/Game/Arpg/Tween.zan`, `packages/Zan.Game/src/Game/Arpg/UiRuntime.zan`, `packages/Zan.Game/src/Game/Arpg/YSortLayer.zan`
 
 
 ## ArpgActor (class)
@@ -4028,20 +4028,33 @@ content 为空时返回空文档。
 - static ArpgRichTextDocument Parse(string content, ArpgDataSource source)
   - 模板求值 + 富文本解析；source 可为 null（占位符解析为空）。
 
+- static int PackColor(ArpgColor color)
+  - ArpgColor → Gui 打包色（0xAARRGGBB）。
+
+- static ArpgColor UnpackColor(int packed)
+  - Gui 打包色（0xAARRGGBB）→ ArpgColor。
+
 
 ## ArpgRichTextDocument (class)
 
 富文本解析结果：原始输入与按序排列的 run 列表。绘制/布局层
 遍历 runs 并按各 run 的 Kind 分派处理。
+薄适配：包住 Gui.RichTextDocument；RunAt 的 Arpg 包装按需建
+一次并缓存（文档随后 Add 时缓存惰性续建）。
 
-- string sourceText;
+- Gui.RichTextDocument inner;
 
-- List<ArpgRichTextRun> runs;
+- List<ArpgRichTextRun> cache;
 
 - ArpgRichTextDocument(string sourceText)
 
+- ArpgRichTextDocument(Gui.RichTextDocument inner)
+
+- void SyncCache()
+  - 把包装缓存补到与内部 run 数一致。
+
 - string SourceText()
-  - 解析前的原始输入（模板求值后的文本）。
+  - 解析前的原始输入。
 
 - int RunCount()
   - run 总数。
@@ -4158,18 +4171,17 @@ content 为空时返回空文档。
 标记格式为 "action|参数列表"：竖线前是链接动作文本，竖线后
 可带逗号分隔的 1~4 个参数：样式编号、常态色、悬停色、按下色。
 颜色参数支持 0xRRGGBBAA；未提供的颜色为全透明。
+薄适配：解析与存取都委托 Gui.RichTextLink，颜色在边界换算成
+ArpgColor。
 
-- string raw;
-
-- int style;
-
-- ArpgColor normalColor;
-
-- ArpgColor hoverColor;
-
-- ArpgColor pressedColor;
+- Gui.RichTextLink inner;
 
 - ArpgRichTextLink(string marker)
+
+- ArpgRichTextLink(Gui.RichTextLink inner)
+
+- Gui.RichTextLink Inner()
+  - 内部 Gui 链接对象（适配层内部用）。
 
 - string Raw()
   - 链接动作原文（标记中竖线前的部分）。
@@ -4197,18 +4209,12 @@ content 为空时返回空文档。
 
 富文本解析器：把标签化文本切分为类型化 run 流。支持颜色
 快捷标记（#W #R #Y #B #G #H #L）、#c()/#bg()/#f() 样式标签、
-#p()/#a()/#z()/#item() 资源标签、#br(宽度)/#md/#rt 排版标签
-与 #@标记@内容@ 超链接。无法识别的 # 按普通文本保留。
+#p()/#a()/#z()/#item() 资源标签、#br(宽度)/#md/#rt/#lf 排版标签
+与 #@标记@内容@ 超链接。无法识别的 # 按普通文本保留，
+## 转义为字面 '#'。
+薄适配：解析完全委托 Gui.RichTextParser。
 
-- string input;
-
-- int position;
-
-- ArpgRichTextDocument document;
-
-- ArpgRichTextStyle style;
-
-- ArpgRichTextLink link;
+- Gui.RichTextParser inner;
 
 - ArpgRichTextParser(string input, ArpgRichTextStyle style, ArpgRichTextLink link)
 
@@ -4235,31 +4241,6 @@ content 为空时返回空文档。
   - 解析颜色参数串：1 个参数按 0xRRGGBBAA，4 个参数按
     r,g,b,a 十进制；其他情况返回全透明。
 
-- bool Starts(string token)
-  - 当前位置是否以 token 开头（不消费）。
-
-- string Parenthesized(int prefixLength)
-  - 读取当前位置起 prefixLength 个字符之后的括号体并消费到
-    ')' 之后；找不到闭括号返回 null 且不消费。
-
-- void AddText(string text)
-  - 追加一个文本 run（空串忽略），携带当前样式与链接。
-
-- void AddSimple(int kind)
-  - 追加一个指定类型的 run，携带当前样式与链接。
-
-- void AddNested(string text, ArpgRichTextLink nestedLink)
-  - 以给定链接嵌套解析 text（样式为当前样式的副本），把结果
-    run 依次并入本文档；用于 #@标记@内容@ 的内容部分。
-
-- bool ParseColorShortcut()
-  - 尝试解析当前位置的颜色快捷标记（#W #R #Y #B #G #H #L）；
-    命中则设置样式颜色并消费 2 字符返回 true。
-
-- bool ParseTag()
-  - 尝试解析当前位置的任一标签并消费输入；命中返回 true，
-    未命中返回 false（调用方把 '#' 按普通文本处理）。
-
 - ArpgRichTextDocument Parse()
   - 解析全部输入并返回文档：\n 产生 LineBreak，'#' 触发标签
     解析（未识别时按普通文本保留），其余字符累积为文本 run。
@@ -4270,32 +4251,20 @@ content 为空时返回空文档。
 富文本解析产物的单个片段（run）：一段文本、一张图片、一个
 动画、一个占位或一次换行。携带创建时刻的样式快照与所在链接
 （非链接 run 的 Link 为 null），布局/绘制层按 Kind 分派处理。
+薄适配：包住 Gui.RichTextRun，样式/链接包装按需建一次。
 
-- int kind;
+- Gui.RichTextRun inner;
 
-- string text;
+- ArpgRichTextStyle styleWrap;
 
-- string resource;
-
-- string action;
-
-- int quantity;
-
-- int offsetX;
-
-- int offsetY;
-
-- int width;
-
-- int height;
-
-- double scale;
-
-- ArpgRichTextStyle style;
-
-- ArpgRichTextLink link;
+- ArpgRichTextLink linkWrap;
 
 - ArpgRichTextRun(int kind, ArpgRichTextStyle style, ArpgRichTextLink link)
+
+- ArpgRichTextRun(Gui.RichTextRun inner)
+
+- Gui.RichTextRun Inner()
+  - 内部 Gui run 对象（适配层内部用）。
 
 - static ArpgRichTextRun CreateText(string text)
   - 创建一个默认样式、无链接的纯文本 run。
@@ -4368,6 +4337,10 @@ Animation=2 动画（#a）、Spacer=3 空白占位（#z）、
 Item=4 物品片段（#item）、LineBreak=5 换行（源文本 \n）、
 WrapWidth=6 换行宽度段（#br(宽度) 或 #md/#rt 携带宽度时）。
 
+实现在 Gui.RichTextRunKind——富文本的解析与数据模型已经
+统一收敛到 stdlib/Gui（组件都到 Gui 下），本命名空间只保留
+Arpg 时代的类型名作薄适配，外部工程无需迁移。
+
 - static int Text()
   - 纯文本 run 类型常量（0）。
 
@@ -4395,16 +4368,16 @@ WrapWidth=6 换行宽度段（#br(宽度) 或 #md/#rt 携带宽度时）。
 富文本样式快照：前景/背景色、字体名与水平对齐。
 解析过程中随 #c/#bg/#f/#md/#rt 等标签变化，并拷贝进
 后续创建的 run。对齐取值：0=左，1=中（#md），2=右（#rt）。
+薄适配：存取委托 Gui.RichTextStyle，颜色在边界换算。
 
-- ArpgColor color;
-
-- ArpgColor background;
-
-- string font;
-
-- int alignment;
+- Gui.RichTextStyle inner;
 
 - ArpgRichTextStyle(ArpgColor color, ArpgColor background, string font, int alignment)
+
+- ArpgRichTextStyle(Gui.RichTextStyle inner)
+
+- Gui.RichTextStyle Inner()
+  - 内部 Gui 样式对象（适配层内部用）。
 
 - static ArpgRichTextStyle Default()
   - 默认样式：白字、透明背景、空字体名、左对齐。
@@ -5986,6 +5959,124 @@ buff/技能/传送门/时间推进）都从这里进入。
 - GlobalEntry(string key, string val, int kind)
 
 
+## IsoTileMap (class)
+
+2.5D 等轴测（Isometric）斜 45 度菱形地图映射引擎。
+专为传奇类、暗黑类、经典模拟经营游戏设计。
+采用工业界标准的 2:1 等轴测投影变换（例如 64x32 菱形地砖）。
+
+- int mapWidth;
+
+- int mapHeight;
+
+- int tileWidth;
+
+- int tileHeight;
+
+- int halfTileW;
+
+- int halfTileH;
+
+- int[]groundTiles;
+
+- byte[]collision;
+
+- IsoTileMap(int mapW, int mapH, int tileW, int tileH)
+
+- static IsoTileMap Create(int mapW, int mapH, int tileW, int tileH)
+
+- int MapWidth { get }
+
+- int MapHeight { get }
+
+- int TileWidth { get }
+
+- int TileHeight { get }
+
+- int Index(int gx, int gy)
+
+- void SetTile(int gx, int gy, int tileId, bool blocked)
+
+- int GetTile(int gx, int gy)
+
+- bool IsBlocked(int gx, int gy)
+
+- void GridToWorld(int gx, int gy, out double sx, out double sy)
+  - 网格坐标 (gx, gy) 转换为屏幕空间坐标 (sx, sy)。
+    菱形地表中心点。
+
+- void WorldToGrid(double sx, double sy, out int gx, out int gy)
+  - 世界/屏幕拾取坐标 (sx, sy) 逆转换为网格坐标 (gx, gy)。
+    鼠标点击寻路、移动落点的核心算子。
+
+- static int GetDirection8(double fromX, double fromY, double toX, double toY)
+  - 计算 8 方向朝向索引（0: 上, 1: 右上, 2: 右, 3: 右下, 4: 下, 5: 左下, 6: 左, 7: 左上）。
+    ARPG 角色移动、砍怪朝向判定的标准算法。
+
+
+## LootScatter (class)
+
+经典 ARPG 爆装与金币四散飞出弹跳物理系统（“怪物大爆”）。
+模拟物品从怪物体内向四周抛射、在重力作用下抛物线运动并在地面多次弹性跳跃落地的全套真实物理轨迹。
+
+- int capacity;
+
+- int activeCount;
+
+- bool[]active;
+
+- int[]itemIds;
+
+- int[]itemTypes;
+
+- double[]posX;
+
+- double[]posY;
+
+- double[]posZ;
+
+- double[]velX;
+
+- double[]velY;
+
+- double[]velZ;
+
+- int[]bounceCount;
+
+- bool[]isSettled;
+
+- Random rnd;
+
+- LootScatter(int cap)
+
+- static LootScatter Create(int cap)
+
+- int ActiveCount { get }
+
+- bool IsActive(int idx)
+
+- bool IsSettled(int idx)
+
+- double GetX(int idx)
+
+- double GetY(int idx)
+
+- double GetGroundY(int idx)
+
+- int GetType(int idx)
+
+- int GetItemId(int idx)
+
+- void Burst(double originX, double originY, int count, int startItemId)
+  - 在 (originX, originY) 处引爆多件战利品向四周喷射。
+
+- void Update(double dt)
+  - 逐物理步长更新弹跳重力模拟。
+
+- bool Collect(int slot)
+  - 拾取战利品。
+
+
 ## ServerConfig (class)
 
 Server.lua 配置：服务端入口（通过 `-s` 启动）、ArpgTcpServer
@@ -6188,6 +6279,53 @@ host、port、path 与 secure 标志。端口省略时默认 80（ws）
 
 - bool Secure()
   - 是否 wss（加密）。
+
+
+## YSortLayer (class)
+
+2.5D 遮挡关系 Y 轴动态深度排序层（YSort）。
+解决树木、建筑物、玩家、怪物、NPC 之间的相互遮挡层级。
+零 GC 预分配，支持千级实体每帧原位快速排序。
+
+- int capacity;
+
+- int count;
+
+- int[]entityIds;
+
+- int[]entityTypes;
+
+- double[]footY;
+
+- int[]orderIndices;
+
+- YSortLayer(int cap)
+
+- static YSortLayer Create(int cap)
+
+- int Count { get }
+
+- void Clear()
+
+- bool Push(int id, int type, double y)
+  - 登记一个待渲染实体及其脚底世界 Y 坐标。
+
+- void Sort()
+  - 原位快速排序，按 footY 从小到大排定渲染顺序。
+
+- void QuickSort(int left, int right)
+
+- int GetSortedEntityId(int i)
+  - 获取排序后第 i 个槽位的实体 ID（0 分配直通）。
+
+- int GetSortedEntityType(int i)
+  - 获取排序后第 i 个槽位的实体类型。
+
+- double GetSortedFootY(int i)
+  - 获取排序后第 i 个槽位的脚底 Y 坐标。
+
+- void ForEachSorted(Action <int, int, double> renderAction)
+  - 依正确的深度遮挡顺序逐个提取实体渲染。
 
 
 ## bool (delegate)

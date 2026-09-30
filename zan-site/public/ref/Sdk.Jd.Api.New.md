@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.New
 
-> 源码: `stdlib/Sdk/Jd/Api/New/JdNewApi.zan`, `stdlib/Sdk/Jd/Api/New/NewWareAttributeGroupsQueryRequest.zan`, `stdlib/Sdk/Jd/Api/New/NewWareAttributeValuesQueryRequest.zan`, `stdlib/Sdk/Jd/Api/New/NewWareAttributesQueryRequest.zan`, `stdlib/Sdk/Jd/Api/New/NewWareBaseproductGetRequest.zan`, `stdlib/Sdk/Jd/Api/New/NewWareMobilebigfieldGetRequest.zan`, `stdlib/Sdk/Jd/Api/New/NewWareProductsortattGetRequest.zan`, `stdlib/Sdk/Jd/Api/New/NewWareSameproductskuidsQueryRequest.zan`, `stdlib/Sdk/Jd/Api/New/NewWareVenderSkusQueryRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/New/JdNewApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/New/NewWareAttributeGroupsQueryRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/New/NewWareAttributeValuesQueryRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/New/NewWareAttributesQueryRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/New/NewWareBaseproductGetRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/New/NewWareMobilebigfieldGetRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/New/NewWareProductsortattGetRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/New/NewWareSameproductskuidsQueryRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/New/NewWareVenderSkusQueryRequest.zan`
 
 
 ## JdNewApi (class)

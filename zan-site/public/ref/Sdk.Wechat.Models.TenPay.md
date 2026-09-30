@@ -1,6 +1,6 @@
 # Sdk.Wechat.Models.TenPay
 
-> 源码: `stdlib/Sdk/Wechat/Models/TenPay/WechatPayModels.zan`
+> 源码: `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/Models/TenPay/WechatPayModels.zan`
 
 
 ## WechatPayAccountInfo (class)

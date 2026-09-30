@@ -1,6 +1,6 @@
 # Sdk.Wechat.Models.Open
 
-> 源码: `stdlib/Sdk/Wechat/Models/Open/WechatOpenModels.zan`
+> 源码: `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/Models/Open/WechatOpenModels.zan`
 
 
 ## WechatOpenAccountBasicInfoJsonResult (class)

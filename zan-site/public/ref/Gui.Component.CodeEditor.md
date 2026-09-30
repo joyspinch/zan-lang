@@ -1,6 +1,6 @@
 # Gui.Component.CodeEditor
 
-> 源码: `stdlib/Gui/Component/CodeEditor/CodeEditor.Completion.zan`, `stdlib/Gui/Component/CodeEditor/CodeEditor.Debug.zan`, `stdlib/Gui/Component/CodeEditor/CodeEditor.Intelli.zan`, `stdlib/Gui/Component/CodeEditor/CodeEditor.Render.zan`, `stdlib/Gui/Component/CodeEditor/CodeEditor.Symbols.zan`, `stdlib/Gui/Component/CodeEditor/CodeEditor.zan`, `stdlib/Gui/Component/CodeEditor/EditorPalette.zan`
+> 源码: `packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.Completion.zan`, `packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.Debug.zan`, `packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.Intelli.zan`, `packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.Render.zan`, `packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.Symbols.zan`, `packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan`
 
 
 ## Caret (class)
@@ -55,6 +55,54 @@
 - bool blockIn;
 
 - bool blockOpen;
+
+
+## CeSymbolMember (class)
+
+- public string owner;
+
+- public string name;
+
+- public string kind;
+
+- public string sig;
+
+- public bool isStatic;
+
+- public CeSymbolMember(string owner, string name, string kind, string sig, bool isStatic)
+
+
+## CeSymbolType (class)
+
+- public string name;
+
+- public string baseTypes;
+
+- public CeSymbolType(string name, string baseTypes)
+
+
+## CeTypeScope (class)
+
+- public string typeName;
+
+- public int depth;
+
+- public CeTypeScope(string typeName, int depth)
+
+
+## CodeCompletionItem (class)
+
+外部语义补全项（如 LSP / 智能分析器提供）
+
+- string label;
+
+- string kind;
+
+- string detail;
+
+- string doc;
+
+- CodeCompletionItem(string label, string kind, string detail, string doc)
 
 
 ## CodeEditor (class)
@@ -161,6 +209,10 @@ CodeEditor 分部：自动补全弹窗、符号索引和
     或普通代码块的关键：'{' 前的头部不含 '('（那是
     方法或控制语句）、不含 '='（赋值）也不含 '['
     （索引器），花括号内是 get / set。
+
+- static bool MightBeDecl(string line)
+  - 快速前置判断：绝大多数语句、注释、控制流与空行都不可能声明成员，
+    避免每行都去 TrimStr 和字符循环。
 
 - static string DeclNameAt(string line)
   - 若 `line` 声明了成员则返回其名称，否则返回 ""。
@@ -538,6 +590,10 @@ CodeEditor 分部：IntelliSense 描述与片段展开，以及
     从当前缓冲区解析，再查其他项目文件。找不到返回 ""
     —— 调用方可回退到精编的 stdlib 签名。
 
+- string SigHelpForHover(string name)
+  - 鼠标悬停时的符号签名查询：优先查内置标准库与项目源码声明，
+    绝不触发光标位置的 LSP 同步调用，避免光标与鼠标分离时的错误请求与主线程卡顿。
+
 - string SigHelpFor(string name)
   - `name` 用于参数提示的签名，按被调用者记忆化。
     
@@ -599,6 +655,52 @@ CodeEditor 分部：IntelliSense 描述与片段展开，以及
 - void SetExecLine(int line)
   - 把 `line` 高亮为当前暂停的执行行（-1 清除）。
 
+- void SetFoldRanges(List<int> starts, List<int> ends)
+  - 注入折叠区间（0 起行号、闭区间，end 行保持可见）。
+    覆盖上一次注入；当前折叠状态一并复位。
+
+- int FoldRegionCount()
+  - 已注入的折叠区间数。
+
+- bool AnyFolded()
+  - 有区间处于折叠状态时为 true；此时行布局/滚动按可见行解释。
+
+- bool FoldRegionValid(int i)
+  - 区间 `i` 在当前缓冲区内仍然成立：行号在界内且首尾行带花括号。
+    文本编辑会让行号漂移，失效区间不得再隐藏内容。
+
+- bool FoldableAt(int line)
+  - `line`（0 起）是某个有效区间的折叠起点时返回 true（槽位画标记）。
+
+- bool FoldedAt(int line)
+  - `line` 是折叠中（有效且已折叠）区间的起点时返回 true。
+
+- bool FoldHides(int line)
+  - `line` 被某个已折叠的有效区间隐藏（起点行本身可见）时返回 true。
+
+- void ToggleFold(int line)
+  - 切换以 `line` 为起点的折叠；该行不是有效折叠起点时无操作。
+
+- void UnfoldAll()
+  - 全部展开（编辑后行号漂移的安全态；BumpTextVersion 已自动调用）。
+
+- void UnfoldContaining(int line)
+  - `line` 落在隐藏区时展开覆盖它的区间（光标/执行行落点保护）。
+
+- int FoldVisibleTotal()
+  - 折叠生效时整个缓冲区的可见行数（供滚动上限）。
+    三趟遍历同序：先判本行可见（此前的 hideEnd），
+    再让以本行为起点的折叠区间延伸隐藏段——起点行本身可见。
+
+- int FoldDocLineOfRow(int row)
+  - 可见行号 `row` 对应的文档行（滚动顶部行映射）；越界取最后可见行。
+
+- int FoldVisibleRowOf(int docLine)
+  - 文档行 `docLine` 折叠后对应的可见行号（保持光标可见用）。
+
+- int FoldNextVisible(int ln)
+  - 跳过 `ln` 所在的隐藏段，返回其后第一个可见行。
+
 - void HandleInput(App app)
   - 分发输入事件：kind==6（字符/编辑键）转 HandleCharKey，
     kind==4（导航/选择键）转 HandleNavKey，其余种类忽略。
@@ -610,19 +712,19 @@ CodeEditor 分部：IntelliSense 描述与片段展开，以及
   - kind==4：导航 / 选择 / 多光标移动键。
 
 - static int ColFromX(string s, int px, int fontSize)
-  - 把像素 x 偏移（相对文本原点）映射为列索引：
-    即测量前缀宽度达到 `px` 的第一个字符边界。
-    前缀宽度随边界单调递增，因此对边界
-    二分查找只需 O(log n) 次 MeasureText 调用，而非每字符一次
-    —— 拖拽选择期间每次鼠标移动都会执行，被取代的
-    二次扫描正是长行选择延迟的
-    根源。
+  - 把像素 x 偏移（相对文本原点）映射为列索引。
+    实现移至 TextWrap.ColFromX（Input/TextArea 只需文本布局，
+    不必拖入整个代码编辑器）；此处保留委托稳住内部调用点。
 
 
 ## CodeEditor (class)
 
 CodeEditor 分部：语法高亮（按行缓存的词法分析）
 和主渲染路径（装订线、文本、光标、弹窗、缩略图）。
+
+- static List<string> s_lineNumPool;
+
+- static string GetLineNumStr(int line1)
 
 - static bool InSet(string chars, string ch)
   - 单字符字符串 `ch` 出现在 `set` 中时返回 true。
@@ -774,19 +876,9 @@ File.OpenRead()、Math.Clamp() 和 Convert.ToDecimal()（均不存在），
 优先于这些表；它们保留为尚未
 建立索引的工作区的回退。
 
-- static List<string> symOwners;
+- static List<CeSymbolMember> symMembers;
 
-- static List<string> symNames;
-
-- static List<string> symKinds;
-
-- static List<string> symSigs;
-
-- static List<string> symStatics;
-
-- static List<string> symTypes;
-
-- static List<string> symBases;
+- static List<CeSymbolType> symTypes;
 
 - static bool SymbolIndexLoaded()
   - 索引成功加载后返回 true。
@@ -955,9 +1047,24 @@ ed.Render(app, editorRect);               // 每帧调用
 
 - int scrollLine;
 
+- int scrollY;
+
+- int targetScrollY;
+
+- int maxScrollY;
+
 - int ensuredCaretLine;
 
 - int lastId;
+
+- public string documentPath="";
+  - 当前编辑的文件完整路径（用于 LSP 语义服务）
+
+- public CodeCompletionProvider externalCompletion;
+  - 外部智能补全提供者（如 LSP）
+
+- public CodeSignatureProvider externalSignature;
+  - 外部参数签名提示提供者（如 LSP）
 
 - List<int> rowLine;
 
@@ -1062,6 +1169,14 @@ ed.Render(app, editorRect);               // 每帧调用
 
 - int pageRows;
 
+- int textVersion;
+
+- int lastScrollMs;
+
+- int wheelAccum;
+
+- List<string> rowDecl;
+
 - List<Caret> carets;
 
 - string clipboard;
@@ -1073,6 +1188,12 @@ ed.Render(app, editorRect);               // 每帧调用
 - List<EditSnapshot> undoStack;
 
 - List<EditSnapshot> redoStack;
+
+- int undoEditKind;
+
+- int undoEditLine;
+
+- int undoEditCol;
 
 - List<Diagnostic> errors;
 
@@ -1186,6 +1307,18 @@ ed.Render(app, editorRect);               // 每帧调用
 
 - int hoverTipY;
 
+- int lastHoverMoveMs;
+
+- int lastHoverX;
+
+- int lastHoverY;
+
+- List<int> foldStart;
+
+- List<int> foldEnd;
+
+- List<bool> foldFolded;
+
 - bool ctxOpen;
 
 - int ctxX;
@@ -1247,11 +1380,18 @@ ed.Render(app, editorRect);               // 每帧调用
 - CodeEditor()
 
 - static List<string> SplitLines(string s)
-  - 按 '\n' 把字符串拆分为行（去除 '\r'）。
+  - 按 '\n' 把字符串拆分为行（去除 '\r'）。实现移至
+    TextWrap.SplitLines：输入框/多行框只需文本布局原语，
+    不必拖入整个代码编辑器；此处保留委托以稳住内部调用点。
 
 - void SetLines(List<string> ls)
   - 整体替换缓冲区：保证至少一行，光标与滚动复位到开头，
     并强制下一帧重新计算诊断。
+
+- void BumpTextVersion()
+  - 标记文本已被修改，递增单调版本号。
+    编辑会让折叠区间的行号漂移，因此顺带全部展开，
+    由宿主在语义刷新后重新注入区间。
 
 - void LoadText(string s)
   - 载入整段文本（SetLines 的字符串版），同时清空 CodeLens、
@@ -1261,8 +1401,8 @@ ed.Render(app, editorRect);               // 每帧调用
   - 全部文本（行以 '\n' 连接）。
 
 - int TextStamp()
-  - 廉价的内容指纹（行数 + 总字符数）；使宿主
-    无需实例化完整文本即可每帧检测缓冲区变化。
+  - O(1) 内容版本号：文本实际变更时才递增，
+    彻底消除每帧遍历全文件所有行统计长度的巨大卡顿。
 
 - int LineCount()
   - 缓冲区行数。
@@ -1290,6 +1430,12 @@ ed.Render(app, editorRect);               // 每帧调用
 
 - void SetScrollLine(int line)
   - 设置首个可见行（钳制到 [0, 行数-1]）。
+
+- int ScrollY()
+  - 当前视口垂直像素滚动偏移。
+
+- void SetScrollY(int y)
+  - 设置垂直像素滚动偏移。
 
 - bool CompletionActive()
   - 补全弹窗显示期间返回 true。
@@ -1327,6 +1473,7 @@ ed.Render(app, editorRect);               // 每帧调用
   - 用上次 Run/Build 针对本文件报告的真实错误
     替换红色下划线 + 提示显示的编译器诊断，并
     把光标跳到第一个错误，使其原因立即可见。
+    当编译成功（diagnostics 为空）时，清空启发式扫描的假阳性错误，保证与编译器一致。
 
 - bool CompilerDiagStale()
   - 设置编译器诊断后缓冲区一旦变化即返回 true，
@@ -1400,10 +1547,25 @@ ed.Render(app, editorRect);               // 每帧调用
   - 从当前行移除最多一级缩进（Shift+Tab，无
     选区时）。
 
+- static List<string> CloneLines(List<string> src)
+
+- void EndUndoGroup()
+  - 终结连续输入/退格的合并事务。在回车、选区编辑、粘贴、光标移动时调用。
+
+- void PushUndoSnapshot()
+  - 压入一个完整的撤销快照（浅拷贝行引用列表，零 string.Join 开销）。
+
 - void SaveUndo()
   - ---- 撤销 / 重做 ----
-    把当前全文与光标压入撤销栈（上限 50 条，超出丢最旧），
-    并清空重做栈。
+    普通离散编辑动作：终结之前的合并事务，压入快照。
+
+- void SaveUndoTyping()
+  - 连续单字输入的合并撤销：同一行连续键入时只在输入起始压一次栈，避免每击一键都分配快照。
+
+- void SaveUndoBackspace()
+  - 连续单字退格的合并撤销：同一行连续退格时合并。
+
+- void RestoreSnapshot(EditSnapshot s)
 
 - void Undo()
   - 撤销最近一次编辑：撤销前状态先压入重做栈，恢复后清除选区。
@@ -1438,9 +1600,9 @@ ed.Render(app, editorRect);               // 每帧调用
     移动会扩展选区；否则丢弃选区。
 
 - void BuildRowLayout(Rect area, int lineH, int lensH)
-  - 布局本帧各行：从 `scrollLine` 起所有能放入
+  - 布局本帧各行：从 `scrollY` 起所有能放入
     `area` 的代码行，声明了成员的代码行前加 lens 行。
-    每帧在行与像素互相换算之前调用一次。
+    逐像素计算首行偏移与位置，并复用表容器消除每帧堆分配。
 
 - int VisibleRowCount()
   - 本帧布局的代码行数（至少 1），作为滚动页大小。
@@ -1594,6 +1756,8 @@ ed.Render(app, editorRect);               // 每帧调用
 
 - int color;
 
+- int width;
+
 - CodeSpan(string text, int color)
   - 组装一段带色的高亮文本。
 
@@ -1642,8 +1806,10 @@ ed.Render(app, editorRect);               // 每帧调用
 
 ## EditSnapshot (class)
 
-一条撤销/重做记录：完整的缓冲区文本及要恢复的
-光标行/列。用单个实体取代并行的文本/行/列栈。
+一条撤销/重做记录：以行列表深拷贝（引用复制）及光标行/列
+构成的快照，彻底消灭旧实现每次击键 string.Join 全文的巨大开销。
+
+- List<string> lines;
 
 - string text;
 
@@ -1651,128 +1817,9 @@ ed.Render(app, editorRect);               // 每帧调用
 
 - int col;
 
+- EditSnapshot(List<string> lines, int line, int col)
+
 - EditSnapshot(string text, int line, int col)
-
-
-## EditorPalette (class)
-
-代码编辑器语法高亮及其
-弹出组件（右键菜单、自动补全、悬停提示、引用列表）的语义颜色。
-语法与选区颜色跟随当前皮肤（亮/暗
-背景）；弹出组件在任何皮肤下都保持经典暗色调色板，
-确保浮层在任意编辑器背景上都清晰可读。
-
-- int keyword;
-
-- int type;
-
-- int str;
-
-- int comment;
-
-- int number;
-
-- int plain;
-
-- int selection;
-
-- int popupBg;
-
-- int panelBg;
-
-- int hoverBg;
-
-- int border;
-
-- int selBg;
-
-- int accent;
-
-- int signature;
-
-- int menuText;
-
-- int text;
-
-- int textSel;
-
-- int muted;
-
-- int lineNo;
-
-- int link;
-
-- int iconMethod;
-
-- int iconType;
-
-- int iconSnippet;
-
-- int iconEnum;
-
-- int iconDefault;
-
-- int iconDisabled;
-
-- int iconGlyph;
-
-- int iconGlyphDisabled;
-
-- int error;
-
-- int errorDim;
-
-- int errTipBg;
-
-- int errTipText;
-
-- int warn;
-
-- int warnLineBg;
-
-- int changeLabel;
-
-- int caretSecondary;
-
-- int minimapBg;
-
-- int minimapThumb;
-
-- int scrollThumb;
-
-- int shadowSoft;
-
-- int shadow;
-
-- int shadowMed;
-
-- int shadowStrong;
-
-- static EditorPalette Dark()
-  - 经典暗色调色板（VS 风格）。
-
-- static EditorPalette Light()
-  - 浅色背景语法，弹出组件保持不变。
-
-- static EditorPalette For(Gui.Theme t)
-  - 根据皮肤背景亮度选择对应的调色板。
-
-- static EditorPalette Preset(int idx)
-  - 编辑器配色主题选择器使用的命名预设语法调色板，基于
-    暗色 chrome。idx：0 = Dark+（默认），1 = Monokai，2 = Dracula，
-    3 = Solarized Dark，4 = Night Owl，5 = High Contrast。
-
-- static EditorPalette PresetFor(int idx, bool lightBg)
-  - 命名预设随皮肤背景亮度的变体：暗色背景沿用经典暗色预设；
-    浅色背景返回同色系加深、白底上可读的浅色变体。没有这一层，
-    宿主把暗底预设推给编辑器后，亮色皮肤的白底上画的就是
-    浅灰/亮蓝的暗底文字——刺眼且不可读。
-    浅色变体的每个角色色在白底上的对比度都不低于 4.5:1（WCAG AA
-    正文），因此同色系里偏亮的青/黄/绿需要压暗后才能上白底。
-    idx 含义见 `Preset`。
-
-- static EditorPalette Chrome()
-  - 两种调色板共用的暗色弹出组件。
 
 
 ## ProjType (class)
@@ -1797,3 +1844,13 @@ ed.Render(app, editorRect);               // 每帧调用
 - string ns;
 
 - QuickFix(int line, string ns)
+
+
+## List (delegate)
+
+`delegate List<CodeCompletionItem> CodeCompletionProvider(string path, int line0, int col0);`
+
+
+## string (delegate)
+
+`delegate string CodeSignatureProvider(string path, int line0, int col0, string callee);`

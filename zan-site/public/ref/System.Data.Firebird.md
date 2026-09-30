@@ -928,6 +928,14 @@ await db.CloseAsync();
 
 - FbError lastStatus;
 
+- bool busy;
+
+- List<AsyncGate> waiters;
+
+- async bool AcquireLock()
+
+- void ReleaseLock()
+
 - static int FETCH_ROWS=400;
   - 每次 fetch 往返请求服务器发送的行数。
 
@@ -1035,10 +1043,10 @@ await db.CloseAsync();
     连接像自动提交一样工作的原因。
 
 - async bool CommitAsync()
-  - 提交当前事务并开启新事务。
+  - 提交当前事务并开启新事务。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
 
 - async bool RollbackAsync()
-  - 回滚当前事务并开启新事务。
+  - 回滚当前事务并开启新事务。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
 
 - async int allocStatement()
   - 分配语句句柄；失败返回 -1。
@@ -1085,7 +1093,7 @@ await db.CloseAsync();
 - async DbResult QueryAsync(string sql, DbParams prms)
   - 运行带参数的语句。占位符是协议
     自身的位置占位符，因此值采用绑定而非拼入
-    SQL 文本。
+    SQL 文本。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
 
 - async int ExecuteAsync(string sql)
   - 运行语句并返回其影响的行数。语句
@@ -1105,7 +1113,7 @@ await db.CloseAsync();
   - ExecuteScalarAsync 的带参数版本。
 
 - async bool PingAsync()
-  - 用于验证会话仍可用的往返。
+  - 用于验证会话仍可用的往返。内部通过 AsyncGate 门控保证单连接事务互斥。
 
 - int AffectedRows()
   - 上一条语句影响的行数。
@@ -1139,7 +1147,7 @@ await db.CloseAsync();
     关闭套接字。
 
 - void Close()
-  - 不经分离往返直接丢弃连接。
+  - 不经分离往返直接丢弃连接。安全释放互斥门控并唤醒所有等待者。
 
 
 ## FirebirdPool (class)

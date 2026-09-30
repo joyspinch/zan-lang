@@ -196,6 +196,9 @@ sqlite3_errmsg 文本；因此空结果集总意味着「无行」。
 - bool IsConnected()
   - 返回连接是否已打开。
 
+- void Dispose()
+  - 释放连接持有的资源（实现 IDisposable，等同于 Close）。
+
 - int GetProvider()
   - 返回 provider id（DbProvider.SQLite）。
 

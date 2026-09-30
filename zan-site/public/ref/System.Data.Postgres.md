@@ -31,6 +31,14 @@ new DbParams().Add(name));
 
 - string lastError;
 
+- bool busy;
+
+- List<AsyncGate> waiters;
+
+- async bool AcquireLock()
+
+- void ReleaseLock()
+
 - [DllImport("libpq")]static extern nint PQconnectdb(string conninfo);
 
 - [DllImport("libpq")]static extern int PQstatus(nint conn);
@@ -60,8 +68,6 @@ new DbParams().Add(name));
 - [DllImport("libpq")]static extern nint PQexecParams(nint conn, string command, int nParams, nint paramTypes, nint paramValues, nint paramLengths, nint paramFormats, int resultFormat);
 
 - [DllImport("libpq")]static extern int PQsendQueryParams(nint conn, string command, int nParams, nint paramTypes, nint paramValues, nint paramLengths, nint paramFormats, int resultFormat);
-
-- [DllImport("crt")]static extern nint memcpy(string dest, string src, long n);
 
 - [DllImport("libpq")]static extern nint PQconnectStart(string conninfo);
 
@@ -96,7 +102,7 @@ new DbParams().Add(name));
     行/块注释以及美元引用（$$..$$ / $tag$..$tag$）内部的
     `?` 一律原样保留——此前无脑改写，
     SELECT * FROM t WHERE note = 'a?b' 会变成 $1 参数错位、
-    注释里的示例 SQL 直接破坏语句。
+    注释里的示例 SQL 直接破坏语句。采用分块游标区间切片，0 单字符堆分配。
 
 - static byte[]BuildParamBlock(DbParams prms, List <byte[]> keepAlive)
   - 为 PQexecParams 构建 char** paramValues 块：一个
@@ -154,20 +160,20 @@ new DbParams().Add(name));
 - async DbResult QueryAsync(string sql)
   - 发送查询并异步收完所有结果，保留
     最后一个返回行的结果集。在 reactor 上挂起等待 IO 就绪，
-    使工作线程可供其他协程使用。
+    使工作线程可供其他协程使用。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
 
 - async DbResult QueryParamsAsync(string sql, DbParams prms)
   - 异步发送参数化查询（PQsendQueryParams）
     并在 IO reactor 上收完结果。语句失败时抛出
-    `DbException`。
+    `DbException`。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
 
 - async int ExecuteParamsAsync(string sql, DbParams prms)
   - 异步发送参数化非查询语句并返回
-    受影响行数。语句失败时抛出 `DbException`。
+    受影响行数。语句失败时抛出 `DbException`。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
 
 - async int ExecuteAsync(string sql)
   - 异步发送非查询语句并返回
-    受影响行数。语句失败时抛出 `DbException`。
+    受影响行数。语句失败时抛出 `DbException`。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
 
 - void fail()
   - 抛出记录的失败。libpq 的消息来自服务器本身，
@@ -208,13 +214,16 @@ new DbParams().Add(name));
   - 回滚当前事务。
 
 - void Close()
-  - 关闭数据库连接。
+  - 关闭数据库连接。安全释放互斥门控并唤醒所有等待者。
 
 - bool IsConnected()
   - 返回连接是否已打开。
 
 - int GetProvider()
   - 返回提供程序 ID（DbProvider.PostgreSQL）。
+
+- void Dispose()
+  - 释放连接持有的资源（实现 IDisposable，等同于 Close）。
 
 
 ## PgConnector (class)

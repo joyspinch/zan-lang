@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Media
 
-> 源码: `stdlib/Sdk/Jd/Api/Media/JdMediaApi.zan`, `stdlib/Sdk/Jd/Api/Media/MediaGetMaterialBySkuIdsRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Media/JdMediaApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Media/MediaGetMaterialBySkuIdsRequest.zan`
 
 
 ## JdMediaApi (class)

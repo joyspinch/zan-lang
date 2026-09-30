@@ -17,7 +17,7 @@ gallery 索引生成：从 seed 出发扫描 templates/ 与 examples/ 补全条�
 
 - static void ScanTemplates(string dir, string root, List<string> refs, List<JsonValue> outp, GalleryResult r)
   - 扫描 templates/<family>/<template>/：带 template.manifest 的目录
-    生成一条目（entry 文件 + 同名 .zform）；已由 seed 覆盖的目录跳过，
+    生成一条目（entry 文件 + 同名 .html 设计稿）；已由 seed 覆盖的目录跳过，
     缺 entry 键记告警。
 
 - static void ScanExamples(string dir, string root, List<string> refs, List<JsonValue> outp, GalleryResult r)
@@ -29,8 +29,8 @@ gallery 索引生成：从 seed 出发扫描 templates/ 与 examples/ 补全条�
 - static string Manifest(string path, string key)
   - 读 manifest 的 "key=value" 行，返回 value；缺键为空串。
 
-- static string TemplateKind(string family, bool hasZform)
-  - 模板家族 + 是否带 .zform → 条目 kind（gui-designer/gui-immediate/
+- static string TemplateKind(string family, bool hasDesign)
+  - 模板家族 + 是否带 .html 设计稿 → 条目 kind（gui-designer/gui-immediate/
     server/console/library，其余小写家族名）。
 
 - static string TemplateSummary(string manifest)
@@ -219,6 +219,9 @@ Static source reader for the .zform schema and control catalogue.
   - 解析一个属性的链式配置：Also（别名，"|" 连接）、WithTip、
     Option（选项，"|" 连接）、Step(step,lo,hi)（范围）与 StepBy(step)。
 
+- static void AddOptions(KnowledgeProp p, string opts)
+  - 往 `p.options` 追加一段（"|" 连接，与 Option() 同语义）。
+
 - static JsonValue ControlJson(KnowledgeControl c)
   - 控件条目的 JSON 视图：name/file/line/styleKind/designer/creatable/
     generic/inheritsBase/defaultOf/events（含 common 标记）/props。
@@ -284,8 +287,18 @@ Static source reader for the .zform schema and control catalogue.
 - static int Match(string s, int open)
   - 与 open 处 '{' 配对的 '}' 下标；无则 -1。
 
-- static List<string> Lines(string s)
+- static List<string> JoinBraces(List<string> ls)
   - 按 '\n' 切行（丢弃 '\r'）。
+    把折行的 List 初始化器并回一行（`new List<string>{ ... }` 常
+    因选项多而折行；不并回则单行扫描看不到完整选项表）。只并含
+    "List<" 的起始行——控制流块（if/for 的 `{`）不并，块内逐行
+    声明的属性不会因合并而丢。配对计数在 Mask 后的文本上做，
+    字符串字面量里的花括号不算。
+
+- static int BraceDelta(string s)
+  - 一行文本上 '{' 与 '}' 的差值（字面量与注释抹平后计数）。
+
+- static List<string> Lines(string s)
 
 - static string Trim(string s)
   - 去除首尾空格/制表符。

@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Order
 
-> 源码: `stdlib/Sdk/Jd/Api/Order/JdOrderApi.zan`, `stdlib/Sdk/Jd/Api/Order/OrderVenderRemarkQueryByOrderIdRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Order/JdOrderApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Order/OrderVenderRemarkQueryByOrderIdRequest.zan`
 
 
 ## JdOrderApi (class)

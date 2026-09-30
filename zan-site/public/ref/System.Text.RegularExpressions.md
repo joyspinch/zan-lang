@@ -176,7 +176,7 @@ string text = re.Replace("port=8080", "$2:$1");
   - `${...}` 里的组号或组名对应的组号，无法解析时 -1。
 
 - static int DigitValue(string d)
-  - 十进制字符的数值（'0'->'0' … '9'->9）；非数字字符返回 0。
+  - 十进制字符的数值（'0'->0 … '9'->9）；非数字字符返回 0。
 
 - static bool IsDigit(string d)
   - 判断是否为十进制字符 '0'-'9'。
@@ -190,6 +190,8 @@ string text = re.Replace("port=8080", "$2:$1");
 
 - static string Replaced(string input, string pattern, string replacement)
   - 一次性替换，不保留编译后的模式。
+
+- static bool IsMetaChar(int c)
 
 - static string Escape(string text)
   - 转义 `text` 中的元字符，使其

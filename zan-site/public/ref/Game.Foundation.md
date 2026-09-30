@@ -1,6 +1,121 @@
 # Game.Foundation
 
-> 源码: `stdlib/Game/Foundation/Input.zan`, `stdlib/Game/Foundation/Scene.zan`, `stdlib/Game/Foundation/Timing.zan`
+> 源码: `packages/Zan.Game/src/Game/Foundation/AudioBus.zan`, `packages/Zan.Game/src/Game/Foundation/Input.zan`, `packages/Zan.Game/src/Game/Foundation/Pool.zan`, `packages/Zan.Game/src/Game/Foundation/Scene.zan`, `packages/Zan.Game/src/Game/Foundation/SpatialAudio2D.zan`, `packages/Zan.Game/src/Game/Foundation/SpringDamper.zan`, `packages/Zan.Game/src/Game/Foundation/Timing.zan`, `packages/Zan.Game/src/Game/Foundation/TrajectorySimulator.zan`, `packages/Zan.Game/src/Game/Foundation/Tween.zan`
+
+
+## AudioBus (class)
+
+游戏级音频总线与混音管理器。
+提供分级通道音量控制、独立静音、BGM 平滑淡入淡出、以及音效防爆音限频机制。
+
+- double masterVolume;
+
+- double bgmVolume;
+
+- double sfxVolume;
+
+- double voiceVolume;
+
+- bool masterMuted;
+
+- bool bgmMuted;
+
+- bool sfxMuted;
+
+- bool voiceMuted;
+
+- AudioVoice currentBgmVoice;
+
+- AudioClip pendingBgmClip;
+
+- int fadeOutDurationMs;
+
+- int fadeInDurationMs;
+
+- int fadeElapsedMs;
+
+- double fadeStartGain;
+
+- double fadeTargetGain;
+
+- int fadePhase;
+
+- Dictionary <string, int> sfxCooldowns;
+
+- AudioBus()
+
+- void SetMasterVolume(double volume)
+
+- double MasterVolume()
+
+- void SetBgmVolume(double volume)
+
+- double BgmVolume()
+
+- void SetSfxVolume(double volume)
+
+- double SfxVolume()
+
+- void SetVoiceVolume(double volume)
+
+- double VoiceVolume()
+
+- void SetMasterMuted(bool muted)
+
+- bool IsMasterMuted()
+
+- void SetBgmMuted(bool muted)
+
+- bool IsBgmMuted()
+
+- void SetSfxMuted(bool muted)
+
+- bool IsSfxMuted()
+
+- void SetVoiceMuted(bool muted)
+
+- bool IsVoiceMuted()
+
+- double EffectiveGain(int channel, double localGain)
+  - 计算某通道当前声音的实际有效增益（考虑主音量、通道音量与静音状态）。
+
+- void PlayBgm(AudioClip clip, double gain)
+  - 立即播放背景音乐（循环）。
+
+- void StopBgm()
+  - 停止当前 BGM。
+
+- void FadeOutBgm(int durationMs)
+  - 触发 BGM 平滑淡出。
+
+- void CrossFadeBgm(AudioClip nextClip, int fadeOutMs, int fadeInMs, double targetVolume)
+  - 平滑淡出当前音乐并淡入新音乐。
+
+- bool IsBgmFading()
+
+- bool CanPlaySfx(string sfxKey, int cooldownMs)
+  - 检查指定音效是否允许播放（若距上次播放超过 cooldownMs 则允许并刷新时间戳）。
+
+- AudioVoice PlaySfxThrottled(string sfxKey, AudioClip clip, int cooldownMs, double gain)
+  - 播放一次性音效，带防爆音限频过滤。
+
+- void Update(int deltaMs)
+  - 帧循环推进：负责更新淡入淡出插值与音效冷却倒计时。
+
+- void ApplyBgmVoiceGain()
+
+
+## AudioChannel (class)
+
+音频总线通道标识。
+
+- const int Master=0;
+
+- const int Bgm=1;
+
+- const int Sfx=2;
+
+- const int Voice=3;
 
 
 ## DeterministicRandom (class)
@@ -35,6 +150,89 @@ state 即可完整恢复随机序列，用于存档、确定性回放与网络�
 
 - void Restore(long state)
   - 恢复到指定状态（0 自动改为 1），后续序列与保存时一致。
+
+
+## EaseType (class)
+
+缓动类型枚举常数。
+涵盖主流曲线族：线性、二次、三次、四次、五次、正弦、指数、圆弧、回弹、弹跳与弹性。
+
+- const int Linear=0;
+
+- const int QuadIn=1;
+
+- const int QuadOut=2;
+
+- const int QuadInOut=3;
+
+- const int CubicIn=4;
+
+- const int CubicOut=5;
+
+- const int CubicInOut=6;
+
+- const int QuartIn=7;
+
+- const int QuartOut=8;
+
+- const int QuartInOut=9;
+
+- const int QuintIn=10;
+
+- const int QuintOut=11;
+
+- const int QuintInOut=12;
+
+- const int SineIn=13;
+
+- const int SineOut=14;
+
+- const int SineInOut=15;
+
+- const int ExpoIn=16;
+
+- const int ExpoOut=17;
+
+- const int ExpoInOut=18;
+
+- const int CircIn=19;
+
+- const int CircOut=20;
+
+- const int CircInOut=21;
+
+- const int BackIn=22;
+
+- const int BackOut=23;
+
+- const int BackInOut=24;
+
+- const int BounceIn=25;
+
+- const int BounceOut=26;
+
+- const int BounceInOut=27;
+
+- const int ElasticIn=28;
+
+- const int ElasticOut=29;
+
+- const int ElasticInOut=30;
+
+
+## Easing (class)
+
+标准缓动方程求值器。将 [0, 1] 的线性归一化进度映射为指定曲线的插值因子。
+
+- const double PI=3.14159265358979323846;
+
+- const double HALF_PI=1.57079632679489661923;
+
+- static double Evaluate(int easeType, double t)
+  - 对指定缓动类型计算归一化时间 t 在 [0, 1] 上的插值因子。
+    若 t <= 0 返回 0；t >= 1 返回 1（弹性/回弹曲线中间允许超出边界）。
+
+- static double BounceOutCore(double t)
 
 
 ## FixedStepClock (class)
@@ -261,6 +459,32 @@ Set 只在按下的转换沿置位，之后保持锁存，直到 BeginFrame 清�
   - 清空全部输入：所有绑定与动作复位为未按下。
 
 
+## ObjectPool (class)
+
+高性能通用对象池，供高频分配与丢弃的对象（粒子、弹幕、飘字文本、音效请求等）复用。
+避免反复 new / ARC 回收带来的缓存未命中与内存抖动。
+
+- List<T> items;
+
+- int maxCapacity;
+
+- ObjectPool(int maxCapacity)
+
+- ObjectPool()
+
+- int Count()
+  - 当前池内空闲可用对象数。
+
+- T Rent()
+  - 从池中借出一个对象；若池为空返回 null，由调用方负责构造新实例。
+
+- bool Return(T item)
+  - 将使用完毕的对象归还池中；若池已达上限则直接丢弃交由垃圾回收。
+
+- void Clear()
+  - 清空池内所有缓存对象。
+
+
 ## SceneStack (class)
 
 基于栈的游戏状态管理者，用于菜单、加载画面、游戏过程、暂停
@@ -295,6 +519,235 @@ Set 只在按下的转换沿置位，之后保持锁存，直到 BeginFrame 清�
 
 - void Clear()
   - 依次弹出全部场景（每个都收到 Exit），清空栈。
+
+
+## SpatialAudio2D (class)
+
+2.5D / 2D 空间立体声与声相衰减系统（Spatial Audio 2D）。
+专为 ARPG 传奇打怪听声辨位、RTS 战场侧翼交火与射击弹道音效打造：
+1. 距离平方反比与线性衰减（随与听者/相机中心距离降低增益）；
+2. 屏幕左右声相偏转（Stereo Panning: -1.0 极左 ~ +1.0 极右）；
+3. 等功率立体声能量法则（Constant Power Panning）；
+4. 移动音源追踪与视区外超远距静音裁剪。
+
+- double listenerX;
+
+- double listenerY;
+
+- double panSpanWidth;
+
+- double minDistance;
+
+- double maxDistance;
+
+- AudioBus audioBus;
+
+- SpatialAudio2D(AudioBus bus, double spanW, double minD, double maxD)
+
+- static SpatialAudio2D Create(AudioBus bus, double spanW, double minD, double maxD)
+
+- double ListenerX{ get set}
+
+- double ListenerY{ get set}
+
+- double MinDistance{ get set}
+
+- double MaxDistance{ get set}
+
+- void SetListenerPosition(double x, double y)
+
+- void CalculateSpatial(double sourceX, double sourceY, double baseGain, out double outPan, out double outGain)
+  - 计算指定世界坐标处的声相值与距离衰减增益。
+    outPan: -1.0 (极左) ~ +1.0 (极右)
+    outGain: 0.0 ~ 1.0
+
+- AudioVoice PlayAt(AudioClip clip, double sourceX, double sourceY, double baseGain, int loop)
+  - 在指定空间坐标处触发一次具有立体声空间感的音效。
+
+
+## SpringDamper (class)
+
+二阶弹簧阻尼振荡器（Spring-Damper Model）。
+用于丝滑的相机跟随、UI 弹跳弹性动效、角色物理阻尼手感，彻底替代容易产生超调抖动的普通线性 Lerp。
+基于隐式欧拉半积分数值解，在变帧率 dt 下仍保持极高数值稳定性。
+
+- double current;
+
+- double target;
+
+- double velocity;
+
+- double stiffness;
+
+- double damping;
+
+- SpringDamper(double initialValue, double stiffness, double damping)
+
+- SpringDamper(double initialValue)
+
+- void SetTarget(double target)
+  - 设置目标位置（激励源）。
+
+- void SnapTo(double val)
+  - 瞬间重置当前位置与速度（如场景切换或瞬移）。
+
+- void AddImpulse(double impulse)
+  - 给系统施加一个瞬时冲量（如受击震动、开火后座力）。
+
+- double Update(double dt)
+  - 推进物理时间 dt 秒，返回当前帧插值后的值。
+
+- double GetValue()
+
+- double GetVelocity()
+
+- double GetTarget()
+
+- bool IsAtRest(double tolerance)
+  - 判断振荡是否已基本静止（位置贴近且速度极小）。
+
+
+## TrajectoryPoint (class)
+
+轨迹采样点。
+
+- double time;
+
+- double x;
+
+- double y;
+
+- double vx;
+
+- double vy;
+
+- TrajectoryPoint(double time, double x, double y, double vx, double vy)
+
+- double GetTime()
+
+- double GetX()
+
+- double GetY()
+
+- double GetVx()
+
+- double GetVy()
+
+
+## TrajectorySimulator (class)
+
+离线手感物理轨迹仿真器。
+专供游戏手感调参（跳跃手感、重力加速度、阻力曲线），可在无游戏窗口环境下直接输出物理曲线指标。
+
+- static List<TrajectoryPoint> SimulateJump(double gravity, double jumpVelocity, double airDrag, int maxSteps, double dt)
+  - 仿真跳跃手感轨迹并输出诊断分析。
+    gravity: 重力加速度 (如 980.0 px/s^2)
+    jumpVelocity: 起跳初速度 (向上为负或正，此处统一按向上初速度标量值计算)
+    airDrag: 空气阻力系数 (0.0 ~ 1.0)
+    maxSteps: 最大仿真帧数 (如 120 帧，约 2 秒)
+    dt: 单帧步长 (默认 1/60 秒)
+
+- static double[]AnalyzeJumpMetrics(double gravity, double jumpVelocity, double airDrag)
+  - 计算跳跃手感属性摘要：返回 [最高点高度(像素), 达到最高点耗时(秒), 滞空总时长(秒)]
+
+
+## Tween (class)
+
+独立的补间动画实例。管理从起始值向目标值的平滑过渡，
+支持延迟等待、循环/往复、单步增量更新与完成态查询。
+
+- double fromValue;
+
+- double toValue;
+
+- int durationMs;
+
+- int delayMs;
+
+- int easeType;
+
+- int loopMode;
+
+- int elapsedMs;
+
+- bool finished;
+
+- bool paused;
+
+- bool reverse;
+
+- double currentValue;
+
+- Tween(double from, double to, int durationMs, int easeType)
+  - 创建数值补间动画实例。
+
+- Tween SetDelay(int delayMs)
+  - 设置延迟毫秒数
+
+- Tween SetLoop(int loopMode)
+  - 设置循环模式：Once / Loop / Yoyo
+
+- void Pause()
+  - 暂停补间更新
+
+- void Resume()
+  - 恢复补间更新
+
+- bool IsPaused()
+  - 是否处于暂停状态
+
+- void Reset()
+  - 重置补间回到初始状态
+
+- void Complete()
+  - 立即完成补间并跳至最终目标值
+
+- void Update(int deltaMs)
+  - 推进补间动画时间。以毫秒为增量。
+
+- double Value()
+  - 获取当前计算插值结果
+
+- double Progress()
+  - 获取归一化进度 [0.0, 1.0]
+
+- bool IsFinished()
+  - 是否已播放完毕
+
+
+## TweenGroup (class)
+
+补间动画管理器。集中批量推进多个动画，并在动效播放完毕后自动清理。
+
+- List<Tween> tweens;
+
+- TweenGroup()
+
+- Tween Add(Tween tween)
+  - 注册一个补间实例
+
+- Tween To(double from, double to, int durationMs, int easeType)
+  - 创建并添加一个缓动实例
+
+- void Update(int deltaMs)
+  - 集中推进所有补间并移除已完成的一次性动效
+
+- int Count()
+  - 当前托管的动效数量
+
+- void Clear()
+  - 清空所有托管的动效
+
+
+## TweenLoop (class)
+
+缓动循环模式。
+
+- const int Once=0;
+
+- const int Loop=1;
+
+- const int Yoyo=2;
 
 
 ## IGameScene (interface)

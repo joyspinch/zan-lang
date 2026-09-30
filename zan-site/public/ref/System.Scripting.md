@@ -11,7 +11,7 @@ Zan 的进程内 Lua 嵌入（Lua 5.3 / 5.4）。
 （LoadLibrary/GetProcAddress）在运行期解析所有入口点，因此
 从未用到 <c>System.Scripting</c> 的程序不会链接 Lua；
 没有 Lua 的机器只会得到 `Lua.IsAvailable` == false，
-而不是加载失败。这与 `Python` 等其他可选
+而不是加载失败。这与 `Python`、SDL3 等其他可选
 原生依赖的处理方式一致。
 
 using System.Scripting;
@@ -148,6 +148,14 @@ p["lang"] = "Lua";
 
 - static void Finalize()
   - 关闭 Lua 状态并释放运行时库。
+
+- static void Sandbox()
+  - 收紧脚本环境（沙箱，A291①）：移除可逃逸宿主的全局入口——
+    <c>os.execute/remove/rename/exit</c>（进程与文件系统）、<c>io</c>
+    整库、<c>dofile/loadfile</c>（文件加载）、<c>require/package</c>
+    （模块加载同样落盘）。宿主在 `Initialize` 之后对不可信
+    脚本调用一次即可；幂等。保留 <c>os.time/clock/date/getenv</c>、
+    <c>math/string/table</c> 等纯计算库。
 
 - static nint State()
   - 底层 lua_State*（未初始化时为 0）。

@@ -1,6 +1,6 @@
 # System.Net
 
-> 源码: `stdlib/System/Net/Net.zan`, `stdlib/System/Net/NetworkInterface.zan`, `stdlib/System/Net/Ping.zan`, `stdlib/System/Net/ServerBanner.zan`, `stdlib/System/Net/Worker.zan`
+> 源码: `stdlib/System/Net/Net.zan`, `stdlib/System/Net/NetworkInterface.zan`, `stdlib/System/Net/Ping.zan`, `stdlib/System/Net/ServerBanner.zan`, `stdlib/System/Net/Worker.Mqtt.zan`, `stdlib/System/Net/Worker.Sse.zan`, `stdlib/System/Net/Worker.Ws.zan`, `stdlib/System/Net/Worker.zan`
 
 
 ## BannerService (class)
@@ -38,10 +38,6 @@ connection for shutdown after the current callback returns.
 
 - bool closed;
 
-- WsWriter wsWriter;
-
-- TcpClient wsClient;
-
 - Connection(int id, nint sock, string protocol)
 
 - void SetData(string data)
@@ -61,22 +57,12 @@ connection for shutdown after the current callback returns.
 
 - void Send(string data)
   - Queues raw bytes to the peer (fire-and-forget; usable from
-    synchronous callbacks). For "websocket" workers, prefer Push (framed)
-    or returning the reply from onMessage; Send writes raw bytes.
+    synchronous callbacks). On a WebSocket connection prefer WorkerWs.Push
+    (framed) or returning the reply from onMessage; Send writes raw
+    bytes.
 
 - async int SendAsync(string data)
   - Sends data and suspends until it is written.
-
-- async bool Push(string data)
-  - WebSocket push：把一条 Text 帧排进该连接的出站缓冲并立即
-    写出（服务端帧不掩码）。可从任何回调上下文调用——包括 onOpen 里
-    主动欢迎、定时器里广播等没有入站消息先行的场景，这正是与"从
-    onMessage 返回应答"的区别。连接已关或非 WS 连接返回 false。
-    帧序与帧循环共用同一缓冲，Append 到 Flush 之间不让出，天然一致。
-
-- async bool PushBinary(string data, int len)
-  - WebSocket 二进制 push：`data` 可含 NUL，`len` 为精确
-    字节数（绝不 strlen）。语义同 Push。
 
 - void Close()
   - Marks the connection to be closed by its worker loop.
@@ -301,20 +287,24 @@ w.onHttpRequest = App.Handle;       // HttpRequest -> HttpResponse
 Worker.RunAll();                    // never returns
 
 Protocols: "tcp", "udp", "http", "websocket" (or "ws"), "sse", "mqtt".
-Callbacks (assign what the protocol needs); the second name is an alias
-reading the way that protocol usually does:
+The ws/sse/mqtt protocol machinery compiles in only when its shard is
+installed -- call once before RunAll: WorkerWs.Install() (websocket +
+ws-upgrade on http ports), WorkerSse.Install(), WorkerMqtt.Install().
+RunAll fails fast with a message when a dedicated protocol worker has no
+shard installed. Callbacks (assign what the protocol needs); the second
+name is an alias reading the way that protocol usually does:
 onConnect / onOpen                  -- tcp, websocket: connection up
 onMessage / onReceive               -- tcp, websocket: data in, reply out
 onClose                             -- tcp, websocket: connection gone
 onHttpRequest / onRequest           -- http
 onUdpMessage / onPacket             -- udp
-onSseSubscriber                     -- sse
+WorkerSse.onSseSubscriber           -- sse (shard static, not a field)
 (none)                              -- mqtt: connections are served by
 the built-in MqttBroker.Global()
 
 An "http" worker with onOpen/onMessage set also serves WebSocket on that
-same port: a request asking to upgrade becomes a frame loop, everything else
-is answered by onRequest.
+same port once WorkerWs.Install() has run: a request asking to upgrade
+becomes a frame loop, everything else is answered by onRequest.
 
 MULTI-PROCESS MODEL (count > 1). The initially launched process becomes the
 MASTER: it spawns `count` worker copies of this executable and supervises
@@ -375,9 +365,6 @@ event loop on this process's coroutine scheduler -- no child processes.
 - DatagramHandler onUdpMessage;
   - 每个完整 UDP 数据报调用；返回串回发给发送方，返回 "" 不回发。
 
-- SseSubscriberHandler onSseSubscriber;
-  - SSE 订阅者握手完成后调用；应用持有 SseConnection 主动推事件。
-
 - RawConnHandler onRawConnection;
   - 设置后接管该 Worker 的整条连接：socket 交给回调自主驱动，
     绕过内建协议处理与连接数闸门。
@@ -393,10 +380,6 @@ event loop on this process's coroutine scheduler -- no child processes.
 
 - HttpRequestHandler onRequest;
   - onHttpRequest 的 HTTP 叫法（请求已解析）。
-
-- List<Connection> wsConns;
-
-- static nint wsRegLock=0;
 
 - static List<Worker> workers=new List<Worker>();
 
@@ -459,6 +442,8 @@ event loop on this process's coroutine scheduler -- no child processes.
 - static void SetDebug(bool on)
   - Enables verbose master/worker handoff tracing.
 
+- [DllImport("crt")]static extern int chmod(string path, int mode);
+
 - [DllImport("ws2_32", EntryPoint="WSADuplicateSocketA")]static extern int WSADuplicateSocketA(nint s, int pid, string info);
 
 - [DllImport("ws2_32", EntryPoint="WSASocketA")]static extern nint WSASocketA(int af, int type, int protocol, string info, int g, int flags);
@@ -480,27 +465,6 @@ event loop on this process's coroutine scheduler -- no child processes.
 
 - HttpRequestHandler RequestHandler()
   - onRequest 与 onHttpRequest 中已设置的那个。
-
-- static void WsRegInit()
-  - 惰性创建 WebSocket 注册表用的互斥锁。
-
-- void WsConnAdd(Connection conn)
-  - Upgrade 成功后由 HandleWebSocket 调用（单线程 accept 路径）。
-
-- void WsConnRemove(Connection conn)
-  - 连接结束后由 HandleWebSocket 调用。
-
-- int WsConnCount()
-  - 本 Worker 当前在线 WebSocket 连接数（进程内）。
-
-- Connection WsConnById(int id)
-  - 按连接 id 取在线连接；不存在（已断开）返回 null。
-    用于定时器等无引用上下文里找回连接后 conn.Push(...)。
-
-- async int WsBroadcast(string data)
-  - 向所有在线 WebSocket 连接广播一条 Text 帧，返回成功
-    投递数。快照在锁内拷出、Push 在锁外执行——Push 是 await 点，
-    决不能持锁挂起。断开的连接由其帧循环稍后自行移除。
 
 - bool HasWsHandlers()
   - Whether this worker can serve WebSocket connections, i.e. whether an HTTP
@@ -608,7 +572,14 @@ event loop on this process's coroutine scheduler -- no child processes.
 - static string ctlToken="";
 
 - static string CtlToken()
-  - 本实例令牌（"<pid>-<unix秒>"），用于甄别控制端口应答者是否本实例的 master。
+  - 本实例令牌：CSPRNG 16 字节的 32 位 hex（A291②）。原先的
+    "<pid>-<unix秒>" 可被本机任何进程按进程表+时间预算出来，从而在
+    控制端口上伪造 PONG 冒充本实例 master（影响 start 的占用判定与
+    stop/status 的寻址结论）。令牌只做身份甄别，不是控制命令的鉴权
+    凭据——CSPRNG 不可用时退回旧形态，甄别仍然工作。
+
+- static string ByteHex(byte[]b, int n)
+  - 字节数组的低位在前 hex 编码（每字节两位）。
 
 - static string RecordedCtlToken()
   - The token of the instance that recorded the control port, or "" when
@@ -937,6 +908,12 @@ event loop on this process's coroutine scheduler -- no child processes.
     sets SO_REUSEPORT before bind (POSIX multi-worker). Returns the socket
     or -1.
 
+- static ProtoEntryFn wsEntry;
+
+- static ProtoEntryFn sseEntry;
+
+- static ProtoEntryFn mqttEntry;
+
 - async void RunOnSocket(nint sock)
   - Serves this worker's protocol on an already-bound socket.
 
@@ -945,6 +922,19 @@ event loop on this process's coroutine scheduler -- no child processes.
     整条连接交给它（回调自主计数，不计入连接数闸门）；否则超过
     maxConnections 的连接直接关闭，余者按协议路由到 HTTP/WebSocket/
     SSE/MQTT/TCP 处理协程。
+
+- async void RunProto(ProtoEntryFn entry, nint clientSock)
+  - Spawnable wrapper around a protocol-shard entry. Task.Spawn needs a
+    concrete async method frame (same reason as RunRaw); the shard entry
+    itself arrives as a delegate. 槽为空（分片未装）时关连接归还计数，
+    不 NRE——专用协议在 RunAll 已先行报错，这里是兜底。
+
+- static void CheckProtoEntries()
+  - RunAll 前的协议分片检查：专用协议（websocket/sse/mqtt）的入口槽为
+    空说明对应分片没装（WorkerWs/WorkerSse/WorkerMqtt.Install()），
+    直接报错退出——比第一个连接进来时静默断开可诊断得多。http 端口
+    设了 ws 回调但没装分片只告警：明文 HTTP 语义不受影响。这里只读
+    槽字段，不拼分片类型名（拼了会把分片拉回编译图，槽就白拆了）。
 
 - async void RunRaw(nint clientSock)
   - Spawnable async wrapper around the raw-connection delegate. Task.Spawn
@@ -968,25 +958,242 @@ event loop on this process's coroutine scheduler -- no child processes.
     Worker path and a bare HttpServer cannot drift apart. DropConn 在
     finally 中：ServeConnection 抛出时计数同样必须归还。
 
-- async void HandleWebSocket(nint clientSock)
-  - A WebSocket port is an HTTP port until the client asks to upgrade, so the
-    request head is read and parsed first: an Upgrade request becomes a frame
-    loop, anything else is served as HTTP (swoole's WebSocket\Server does the
-    same). The bytes consumed here are handed to whichever path takes over.
+- async void RunUdp(nint sock)
+  - UDP 事件循环：每收到一个数据报调用 onPacket（未设回调时默认回显），
+    非空返回串回发给发送方；Stop 置位退出循环后关闭 socket。
 
-- async void HandleSse(nint clientSock)
+
+## WorkerMqtt (class)
+
+MQTT 协议分片（A332 肥边③）：把 mqtt 端口的连接交给内置
+MqttBroker.Global() 处理，从 Worker.zan 外迁为独立类。应用调用一次
+WorkerMqtt.Install() 本文件才进编译图（并连带拉入 Mqtt 全家——
+broker + client 约 1300 行），纯 HTTP 服务不背 MQTT。mqtt 协议没有
+应用回调。槽反转与独立类（不写 partial Worker）的理由见
+Worker.ProtoEntryFn 的文档。
+
+- static void Install()
+  - Installs the MQTT shard into the Worker entry slot. Call once
+    before Worker.RunAll().
+
+- static void Uninstall()
+  - 进程退出前的拆卸入口：解除协议分片并停机/清空
+    进程级 broker。静态 mqttEntry 与 MqttBroker.inst 是泄漏
+    探测里的保持根，不拆就恒报"退出仍可达"（A352）。
+
+- static async void HandleMqtt(Worker w, nint clientSock)
+  - 把连接交给内置的 MqttBroker.Global() 处理。
+
+
+## WorkerSse (class)
+
+SSE 协议分片（A332 肥边③）：订阅握手/事件流处理，从 Worker.zan 外迁
+为独立类。应用调用一次 WorkerSse.Install() 本文件才进编译图（并连带
+拉入 Sse.zan），纯 HTTP 服务不背 SSE；订阅回调从原来的 Worker 字段
+改为这里的静态字段 WorkerSse.onSseSubscriber（签名引用 SseConnection，
+放在核心会把 SSE 拖回编译图）。槽反转与独立类（不写 partial Worker）
+的理由见 Worker.ProtoEntryFn 的文档。
+
+- static SseSubscriberHandler onSseSubscriber;
+  - SSE 订阅者握手完成后调用；应用持有 SseConnection 主动推事件。
+
+- static List<SseConnection> conns=new List<SseConnection>();
+
+- static nint sseLock=0;
+
+- static WsSharedBus sharedBus=null;
+
+- static WorkerSseConsumer busConsumer=null;
+
+- static void SseInit()
+
+- static void EnableSharedBus(string busName)
+  - 启用基于 SharedTable 的跨进程 SSE 广播总线。
+
+- static void Install()
+  - Installs the SSE shard into the Worker entry slot. Call once
+    before Worker.RunAll().
+
+- static void DisableSharedBus()
+  - 停掉跨进程总线轮询并解除静态持有。sharedBus/
+    busConsumer 是 WsSharedBus→SharedTable 链在泄漏探测里的
+    保持根，不拆就恒报"退出仍可达"（A352）。
+
+- static void Uninstall()
+  - 进程退出前的拆卸入口：解除协议分片、订阅者回调
+    并停总线，与 Install() 对称。
+
+- static void Attach(SseConnection conn)
+  - 登记本进程活跃的 SSE 连接。
+
+- static void Detach(SseConnection conn)
+  - 注销 SSE 连接。
+
+- static int ConnCount()
+  - 本 Worker 进程在线 SSE 连接数。
+
+- static int ClusterConnCount()
+  - 获取集群跨 Worker 实时在线 SSE 连接总数。
+
+- static async int BroadcastLocal(string eventName, string data)
+  - 向本进程内所有活跃 SSE 连接本地广播事件。
+
+- static async int Broadcast(string eventName, string data)
+  - 跨 Worker 向全集群所有在线 SSE 客户端广播具名事件。
+
+- static async int Broadcast(string data)
+  - 跨 Worker 向全集群所有在线 SSE 客户端广播无名事件。
+
+- public static async void OnSharedMessage(int targetType, string channel, int targetId, string payload, int payloadLen)
+
+- static async void HandleSse(Worker w, nint clientSock)
   - SSE 订阅：读取 GET 请求头后回 200 text/event-stream（带 no-cache 与
     CORS 通配头），把连接包成 SseConnection 交给 onSseSubscriber（未设
     回调时立即关闭）；此后连接由应用持有。请求头读取与 HTTP 路径
     一样武装 requestTimeout（慢速滴字客户端不能永久钉住连接），
     清理在 finally 中执行——onSseSubscriber 抛出时 DropConn 不能丢。
 
-- async void HandleMqtt(nint clientSock)
-  - 把连接交给内置的 MqttBroker.Global() 处理；mqtt 协议没有应用回调。
 
-- async void RunUdp(nint sock)
-  - UDP 事件循环：每收到一个数据报调用 onPacket（未设回调时默认回显），
-    非空返回串回发给发送方；Stop 置位退出循环后关闭 socket。
+## WorkerSseConsumer (class)
+
+- public void OnSharedBusMessage(int targetType, string channel, int targetId, string payload, int payloadLen)
+
+
+## WorkerWs (class)
+
+WebSocket 协议分片（A332 肥边③）：握手/帧循环/连接注册表/Push 的实现，
+从 Worker.zan 外迁为独立类。Worker 核心只经静态槽分发（Worker.wsEntry），
+应用调用一次 WorkerWs.Install() 本文件才进编译图——纯 HTTP 服务不背
+ws 编解码（约 870 行），正如不背 SSE/MQTT。槽反转与独立类（不写
+partial Worker）的理由见 Worker.ProtoEntryFn 的文档。
+
+- [DllImport("crt")]static extern long strlen(string str);
+
+- static void Install()
+  - Installs the WebSocket shard into the Worker entry slot.
+    Call once before Worker.RunAll(); a worker-process copy re-runs it
+    through its own Main.
+
+- static void DisableSharedBus()
+  - 停掉跨进程总线轮询并解除静态持有。sharedBus/
+    busConsumer 是 WsSharedBus→SharedTable 链在泄漏探测里的
+    保持根，不拆就恒报"退出仍可达"（A352）。
+
+- static void Uninstall()
+  - 进程退出前的拆卸入口：解除协议分片并停总线，
+    与 Install() 对称。
+
+- static WsSharedBus sharedBus=null;
+
+- static WorkerWsConsumer busConsumer=null;
+
+- static Dict <string, List<Connection>> channels=new Dict <string, List<Connection>>();
+
+- static nint chanLock=0;
+
+- static void ChanInit()
+
+- static void EnableSharedBus(string busName)
+  - 启用基于 SharedTable 共享内存的跨 Worker 进程 WebSocket 消息总线。
+
+- static void Join(string channel, Connection conn)
+  - 订阅者加入频道/房间。
+
+- static void Leave(string channel, Connection conn)
+  - 订阅者离开频道/房间。
+
+- static void LeaveAllChannels(Connection conn)
+  - 断开时从所有频道中自动清理该连接。
+
+- static Dict <int, WsLink> conns=new Dict <int, WsLink>();
+
+- static nint regLock=0;
+
+- static void RegInit()
+  - 惰性创建注册表用的互斥锁。
+
+- static void Attach(Connection conn, WsWriter writer, TcpClient client)
+  - Upgrade 成功后由 HandleWebSocket 调用（单线程 accept 路径）：
+    出站 writer/client 挂到连接的注册项上，Push/Broadcast 经 id 找回。
+
+- static void ConnRemove(Connection conn)
+  - 连接结束后由 HandleWebSocket 调用（O(1) 删除）。
+
+- static WsLink LinkOf(int id)
+  - 按连接 id 找注册项；不存在（已断开）返回 null（O(1) 哈希查找）。
+
+- static int ConnCount()
+  - 本进程当前在线 WebSocket 连接数。
+
+- static int ClusterConnCount()
+  - 获取集群跨 Worker 实时在线 WebSocket 连接总数。
+
+- static Connection ConnById(int id)
+  - 按连接 id 取在线连接；不存在（已断开）返回 null。
+    用于定时器等无引用上下文里找回连接后 WorkerWs.Push(conn, ...)。
+
+- static async int BroadcastLocal(string data)
+  - 向本进程内所有在线 WebSocket 连接广播一条 Text 帧，返回成功投递数。
+
+- static async int Broadcast(string data)
+  - 向所有 Worker 进程的所有在线 WebSocket 连接全局广播一条 Text 帧。
+    本进程连接立即本地推送，其他 Worker 进程经 SharedTable 环形总线接收后推送。
+
+- static async int BroadcastToLocal(string channel, string data)
+  - 向本进程内加入指定频道/房间的所有连接广播一条 Text 帧。
+
+- static async int BroadcastTo(string channel, string data)
+  - 跨 Worker 向加入指定频道/房间的所有在线连接广播 Text 帧。
+
+- static async bool PushTo(int connId, string data)
+  - 精准向指定连接 ID 发送消息。若该连接在本进程则立即发送；
+    若在集群其他 Worker 进程，则经 SharedTable 路由至目标进程发送。
+
+- public static async void OnSharedMessage(int targetType, string channel, int targetId, string payload, int payloadLen)
+  - 接收来自其他 Worker 进程发来的跨进程共享总线消息。
+
+- static async bool Push(Connection c, string data)
+  - WebSocket push：把一条 Text 帧排进该连接的出站缓冲并立即
+    写出（服务端帧不掩码）。可从任何回调上下文调用——包括 onOpen 里
+    主动欢迎、定时器里广播等没有入站消息先行的场景，这正是与"从
+    onMessage 返回应答"的区别。连接已关或未升级返回 false。
+    帧序与帧循环共用同一缓冲，Append 到 Flush 之间不让出，天然一致。
+
+- static async bool PushBinary(Connection c, string data, int len)
+  - WebSocket 二进制 push：`data` 可含 NUL，`len` 为精确
+    字节数（绝不 strlen）。语义同 Push。
+
+- static async void HandleWebSocket(Worker w, nint clientSock)
+  - A WebSocket port is an HTTP port until the client asks to upgrade, so the
+    request head is read and parsed first: an Upgrade request becomes a frame
+    loop, anything else is served as HTTP (swoole's WebSocket\Server does the
+    same). The bytes consumed here are handed to whichever path takes over.
+
+
+## WorkerWsConsumer (class)
+
+- public void OnSharedBusMessage(int targetType, string channel, int targetId, string payload, int payloadLen)
+
+
+## WsLink (class)
+
+一条在线 WebSocket 连接的注册项：连接对象 + 出站 writer + 底层
+socket。原先是 Connection 上的 wsWriter/wsClient 字段——字段类型
+引用 ws 家族会把编解码拖回核心文件，故随分片外迁、按连接 id 关联。
+
+- Connection conn;
+
+- WsWriter writer;
+
+- TcpClient client;
+
+- bool busy;
+
+- List<AsyncGate> waiters;
+
+- async bool LockAsync()
+
+- void Unlock()
 
 
 ## string (delegate)
@@ -1008,6 +1215,16 @@ sent back to the datagram's sender; return "" to send nothing. Async.
 
 ## void (delegate)
 
+Invoked when an SSE subscriber completes its handshake. The
+application keeps the SseConnection and pushes events through it. Async.
+（原 Worker.zan 顶层委托——签名引用 SseConnection，随 SSE 分片外迁，
+否则核心文件会把 SSE 家族拖进一切 Worker 程序。）
+
+`delegate void SseSubscriberHandler(SseConnection conn);`
+
+
+## void (delegate)
+
 Invoked when a client connection is established. Async so the
 handler can await I/O (Db/Redis/etc.) without blocking the event loop.
 
@@ -1024,14 +1241,6 @@ conn.Close()). Async: may await I/O.
 
 ## void (delegate)
 
-Invoked when an SSE subscriber completes its handshake. The
-application keeps the SseConnection and pushes events through it. Async.
-
-`delegate void SseSubscriberHandler(SseConnection conn);`
-
-
-## void (delegate)
-
 Invoked with a freshly accepted (and, on Windows, handed-off)
 client socket. When set it overrides the built-in per-protocol handling:
 the callback owns the socket and drives the whole connection itself. Lets
@@ -1040,6 +1249,20 @@ accept + WSADuplicateSocket handoff + supervision while keeping its own
 request pipeline. Async so it can await I/O.
 
 `delegate void RawConnHandler(nint sock);`
+
+
+## void (delegate)
+
+Per-connection entry of a protocol shard (ws/sse/mqtt). The
+implementations live in Worker.Ws/Sse/Mqtt.zan as independent classes
+(WorkerWs/WorkerSse/WorkerMqtt) that install themselves into the static
+entry slots on Worker from their Install(); until an app calls those, the
+shard files never join the compile graph at all (A332 lazy pull-in: a
+stdlib file is pulled only when a type it declares is spelled in type
+position, so a pure-HTTP server compiles without the ws codec, the SSE
+helper or the MQTT broker). Async so it can await I/O.
+
+`delegate void ProtoEntryFn(Worker w, nint sock);`
 
 
 ## PingStatus (enum)

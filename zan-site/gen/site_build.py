@@ -488,7 +488,7 @@ def ref_md_ns(ns, d):
     out = [f"# {ns}\n"]
     files = d.get("files", [])
     if files:
-        out.append("> 源码: " + ", ".join(f"`stdlib/{f}`" for f in files) + "\n")
+        out.append("> 源码: " + ", ".join(f"`{f}`" for f in files) + "\n")
     for t in d.get("types", []):
         out.append(f"\n## {t['name']} ({t['kind']})\n")
         doc = (t.get("comment") or "").strip()
@@ -523,16 +523,16 @@ def build_ref():
         files = d.get("files", [])
         if files:
             content.append('<div class="note"><p><span class="zh">源码文件：</span>'
-                           + ", ".join(f'<code class="inline">stdlib/{esc(f)}</code>' for f in files)
+                           + ", ".join(f'<code class="inline">{esc(f)}</code>' for f in files)
                            + "</p></div>")
         for t in d.get("types", []):
             content.append(type_html(t))
         out = page(ns + " — 标准库参考 · Zan",
-                   ns + " 标准库 API 参考：完整类型与成员签名，来自 stdlib 源码。",
+                   ns + " API 参考：完整类型与成员签名，来自 stdlib 与 packages 源码。",
                    '<span class="zh">知识库 · 标准库参考</span><span class="en">API reference</span>',
                    ns,
-                   f'<span class="zh">{len(d.get("types", []))} 个类型 · 完整签名由 stdlib 源码提取</span>'
-                   f'<span class="en">{len(d.get("types", []))} types · extracted from stdlib source</span>',
+                   f'<span class="zh">{len(d.get("types", []))} 个类型 · 完整签名由 stdlib/packages 源码提取</span>'
+                   f'<span class="en">{len(d.get("types", []))} types · extracted from stdlib and package sources</span>',
                    "/stdlib.html", ref_sidebar(data, ns), "\n".join(content))
         with open(os.path.join(REF, ns + ".html"), "w", encoding="utf-8") as f:
             f.write(out)

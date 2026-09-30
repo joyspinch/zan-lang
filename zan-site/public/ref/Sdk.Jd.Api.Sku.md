@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Sku
 
-> 源码: `stdlib/Sdk/Jd/Api/Sku/JdSkuApi.zan`, `stdlib/Sdk/Jd/Api/Sku/SkuReadFindSkuByIdRequest.zan`, `stdlib/Sdk/Jd/Api/Sku/SkuReadSearchSkuListRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Sku/JdSkuApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Sku/SkuReadFindSkuByIdRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Sku/SkuReadSearchSkuListRequest.zan`
 
 
 ## JdSkuApi (class)

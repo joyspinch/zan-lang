@@ -1,30 +1,6 @@
 # System.Json
 
-> 源码: `stdlib/System/Json/Json.zan`, `stdlib/System/Json/JsonTape.zan`, `stdlib/System/Json/JsonValue.zan`
-
-
-## JsonBuilder (class)
-
-用于生成 JSON 字符串的简单 JSON 构建器。
-
-- static string ObjectStart()
-  - 对象起始 "{"。
-
-- static string ObjectEnd(string json)
-  - 收尾对象：末尾有多余逗号则去掉，补上 "}"。
-
-- static string AddString(string json, string key, string val)
-  - 追加字符串成员；key 与 val 都原样写入，不做任何转义，
-    含引号/反斜杠的内容会产出非法 JSON。
-
-- static string AddInt(string json, string key, int val)
-  - 追加整数成员。
-
-- static string AddBool(string json, string key, bool val)
-  - 追加布尔成员。
-
-- static string AddNull(string json, string key)
-  - 追加 null 成员。
+> 源码: `stdlib/System/Json/JsonTape.zan`, `stdlib/System/Json/JsonValue.zan`
 
 
 ## JsonDoc (class)
@@ -71,10 +47,7 @@
     错误 -(位置+1) 语义与旧递归实现逐点一致。
 
 - static int ScanKey(List<JsonSlot> sl, List<JsonPair> pr, List<string> pool, string src, byte[]buf, int len, int pos, int pbase, int[]fr)
-  - 对象键 token 扫描（起始引号在 pos）：SWAR 快径零拷贝写进 pr
-    新对；含转义走 EscStringInto。对挂进 pbase 帧的键链并计数。
-    返回闭引号后位置或 -(错误位置+1)。每键一次调用——预测好的
-    直接调用实测便宜，不值得复制 60 行内联块。
+  - 对象键 token 扫描（起始引号在 pos）：SIMD 向量查找闭引号与转义符。
 
 - static int EscStringInto(List<string> pool, string src, byte[]buf, int len, int start, int esc)
   - 转义 token 物化：前缀 (start..esc) 原文进池，再从 esc（首个
@@ -141,32 +114,6 @@
 - string ToJson()
 
 - void WriteSlot(StringBuilder sb, int at)
-
-
-## JsonParser (class)
-
-用纯 Zan 实现的最小 JSON 解析器和序列化器。
-支持字符串、数字、布尔、null、数组和对象。
-
-- [DllImport("crt")]static extern long strlen(string str);
-
-- static string GetString(string json, string key)
-  - 从 JSON 对象字符串中按 key 提取 JSON 字符串值。
-
-- static int GetInt(string json, string key)
-  - 按 key 提取 JSON 整数值。
-
-- static double GetDouble(string json, string key)
-  - 按 key 提取 JSON 数字（double）值。
-
-- static bool HasKey(string json, string key)
-  - 检查 JSON 中是否存在指定 key。
-
-- static bool GetBool(string json, string key)
-  - 检查指定 key 的 JSON 布尔值是否为 true。
-
-- static string GetValueRaw(string json, string key)
-  - 获取 key 的原始值字符串（不带引号）。
 
 
 ## JsonReader (class)
@@ -312,6 +259,9 @@ keys/vals 并置（同一次键查找碰一个 Cache 行，不用两趟）。
 - List<JsonValue> vals;
   - kind 5 时与 keys 并置的值列表。
 
+- Dict <string, int> keyIndex;
+  - kind 5 时的键索引哈希表（键数 > 8 且被频繁查找时懒加载构建，加速宽对象属性访问）。
+
 - static int MaxDepth=512;
   - 组树（WriteTo/WritePretty）与解析（ReadValueAt）共用的
     嵌套深度上限。序列化同样是递归的：无界深度的树会在
@@ -341,6 +291,9 @@ keys/vals 并置（同一次键查找碰一个 Cache 行，不用两趟）。
 - static JsonValue NewObject()
   - 构造空对象（kind 5）。
 
+- JsonValue Clone()
+  - 深拷贝当前 JsonValue 及其所有子节点（对象和数组递归克隆）。
+
 - bool IsNull()
   - 是否为 null 值（kind 0）。
 
@@ -367,6 +320,8 @@ keys/vals 并置（同一次键查找碰一个 Cache 行，不用两趟）。
 
 - JsonValue Get(string key)
   - `key` 对应的值；不存在或不是对象时返回 null。
+    键数量 <= 8 时走连续内存线性扫描（零额外内存、缓存行友好）；
+    键数量 > 8 时自动激活懒加载哈希索引，O(1) 访问。
 
 - void Set(string key, JsonValue v)
   - 若 `key` 已存在则替换其值，否则追加（对象）。
@@ -383,6 +338,48 @@ keys/vals 并置（同一次键查找碰一个 Cache 行，不用两趟）。
   - 与 PathSet 类似，但写入任意 JsonValue 叶子，使绑定的控件
     能在回写时保持值的 JSON 类型（bool / number / string），
     而不是全部转成字符串。
+
+- void PutStr(string key, string v)
+  - 追加字符串成员（null 值写成 JSON null，与字符串 "null" 区分）。
+
+- void PutInt(string key, long v)
+  - 追加整数成员。
+
+- void PutDouble(string key, double v)
+  - 追加浮点成员。
+
+- void PutBool(string key, bool v)
+  - 追加布尔成员。
+
+- void PutNull(string key)
+  - 追加 null 成员。
+
+- void PutJson(string key, string jsonText)
+  - 把一段已序列化的 JSON 文本作为成员值嵌入：能解析就挂
+    解析出的子树（对象/数组/数字原样保型），解析失败则整段按字符串
+    存——任何输入都不可能产出非法 JSON。用于收编「片段拼接」：把
+    上游序列化好的 items/errors 等挂进外层报文，不再 Substring(1)
+    之类按文本外科手术拼。
+
+- void AppendStr(string v)
+  - 数组末尾追加字符串元素（null 按空串存，数组元素无 null 语义）。
+
+- void AppendInt(long v)
+  - 数组末尾追加整数元素。
+
+- void AppendDouble(double v)
+  - 数组末尾追加浮点元素。
+
+- void AppendBool(bool v)
+  - 数组末尾追加布尔元素。
+
+- void AppendJson(string jsonText)
+  - 数组末尾嵌入一段已序列化 JSON 文本（语义同 PutJson）。
+
+- static JsonValue ParseOrStr(string jsonText)
+  - ParseLenient 的无异常形态：能解析返回子树；解析失败或
+    结果是 null 字面量时返回字符串形态——用于 PutJson/AppendJson 的
+    「片段嵌入」语义，保证任何输入都得到一个合法 JSON 值。
 
 - void Append(JsonValue v)
   - 数组末尾追加元素（数组）。
@@ -420,7 +417,7 @@ keys/vals 并置（同一次键查找碰一个 Cache 行，不用两趟）。
 - string PrettyToJson()
   - 序列化为便于阅读的多行 JSON 字符串（两空格
     缩进，每个 key 一行），用于手工编辑的交换文件，如
-    .zform / .zscene。与 ToJson 一样可通过 Parse 往返。
+    .zscene 设计文档。与 ToJson 一样可通过 Parse 往返。
     嵌套超限时与 ToJson 一样抛 JsonException。
 
 - void WritePretty(StringBuilder sb, int depth)

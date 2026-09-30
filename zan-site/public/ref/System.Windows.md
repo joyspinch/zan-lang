@@ -286,6 +286,9 @@ PlatformNotSupportedException。
 - static int posixPumpStop;
   - 泵线程已退出标志（Remove 等它置位）。
 
+- static async Task<bool> AddAsync(string iconPath, string tooltip, TrayIconCallback cb)
+  - 异步添加托盘图标（协程驱动，非阻塞等待，不卡死 UI 线程）。
+
 - static bool Add(string iconPath, string tooltip, TrayIconCallback cb)
   - 添加托盘图标。`iconPath` 是 .ico 文件（"" 使用默认
     应用图标）。`tooltip` 是悬停文本。图标

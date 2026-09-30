@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Vas
 
-> 源码: `stdlib/Sdk/Jd/Api/Vas/JdVasApi.zan`, `stdlib/Sdk/Jd/Api/Vas/VasSubscribeGetByCodeRequest.zan`, `stdlib/Sdk/Jd/Api/Vas/VasSubscribeGetRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Vas/JdVasApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Vas/VasSubscribeGetByCodeRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Vas/VasSubscribeGetRequest.zan`
 
 
 ## JdVasApi (class)

@@ -1,6 +1,6 @@
 # Sdk.Wechat
 
-> 源码: `stdlib/Sdk/Wechat/CheckSignature.zan`, `stdlib/Sdk/Wechat/Message.zan`, `stdlib/Sdk/Wechat/WXBizMsgCrypt.zan`, `stdlib/Sdk/Wechat/WechatApiTransport.zan`, `stdlib/Sdk/Wechat/WechatClient.zan`, `stdlib/Sdk/Wechat/WechatCredential.zan`, `stdlib/Sdk/Wechat/WechatException.zan`, `stdlib/Sdk/Wechat/WechatMultipart.zan`, `stdlib/Sdk/Wechat/WechatRawResponse.zan`, `stdlib/Sdk/Wechat/WechatResponse.zan`, `stdlib/Sdk/Wechat/WechatTypedRequest.zan`, `stdlib/Sdk/Wechat/XmlUtil.zan`
+> 源码: `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/CheckSignature.zan`, `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/Message.zan`, `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/WXBizMsgCrypt.zan`, `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/WechatApiTransport.zan`, `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/WechatClient.zan`, `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/WechatCredential.zan`, `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/WechatException.zan`, `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/WechatMultipart.zan`, `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/WechatRawResponse.zan`, `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/WechatResponse.zan`, `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/WechatTypedRequest.zan`, `packages/Zan.Sdk.Wechat/src/Sdk/Wechat/XmlUtil.zan`
 
 
 ## CheckSignature (class)

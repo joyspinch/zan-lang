@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Club
 
-> 源码: `stdlib/Sdk/Jd/Api/Club/ClubPopCommentreplySaveRequest.zan`, `stdlib/Sdk/Jd/Api/Club/JdClubApi.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Club/ClubPopCommentreplySaveRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Club/JdClubApi.zan`
 
 
 ## ClubPopCommentreplySaveRequest (class)

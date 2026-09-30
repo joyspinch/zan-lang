@@ -1,6 +1,6 @@
 # Game.Idle
 
-> 源码: `stdlib/Game/Idle/BigNum.zan`, `stdlib/Game/Idle/Curves.zan`, `stdlib/Game/Idle/Offline.zan`, `stdlib/Game/Idle/Wallet.zan`
+> 源码: `packages/Zan.Game/src/Game/Idle/BigNum.zan`, `packages/Zan.Game/src/Game/Idle/Curves.zan`, `packages/Zan.Game/src/Game/Idle/FloatingText.zan`, `packages/Zan.Game/src/Game/Idle/JuiceEffect.zan`, `packages/Zan.Game/src/Game/Idle/Offline.zan`, `packages/Zan.Game/src/Game/Idle/OfflineReward.zan`, `packages/Zan.Game/src/Game/Idle/Wallet.zan`
 
 
 ## BigNum (class)
@@ -67,6 +67,86 @@
     放置数值炸表时宁可"卡住"也不能返 0 触发免费购买 bug）。
 
 
+## FloatingTextItem (class)
+
+单个动态跳字粒子。
+
+- bool active;
+
+- string text;
+
+- double x;
+
+- double y;
+
+- double vx;
+
+- double vy;
+
+- double lifeTime;
+
+- double maxLife;
+
+- int color;
+
+- double scale;
+
+- bool isCrit;
+
+- FloatingTextItem()
+
+- static FloatingTextItem Create()
+
+- bool Active { get }
+
+- string Text { get }
+
+- double X { get }
+
+- double Y { get }
+
+- double Scale { get }
+
+- int Color { get }
+
+- double Alpha { get }
+
+- void Spawn(double startX, double startY, string text, int color, double scale, bool isCrit, double duration)
+
+- void Update(double dt)
+
+
+## FloatingTextManager (class)
+
+放置游戏/ARPG 高性能飘字管理器（零 GC 对象池）。
+支持伤害跳字、暴击金黄放大、金币产出喷涌与经验获取飘字。
+
+- FloatingTextItem[]pool;
+
+- int maxCount;
+
+- FloatingTextManager(int capacity)
+
+- static FloatingTextManager Create(int capacity)
+
+- int ActiveCount { get }
+
+- void SpawnDamage(double x, double y, long amount, bool isCrit)
+  - 产生伤害飘字。
+
+- void SpawnGold(double x, double y, string formattedAmount)
+  - 产生金币产出飘字。
+
+- void Spawn(double x, double y, string text, int color, double scale, bool isCrit, double duration)
+  - 底层生成跳字。
+
+- void Update(double dt)
+  - 时钟推进。
+
+- void Render(Canvas c, Camera2D cam)
+  - 极速渲染所有活跃跳字。
+
+
 ## Offline (class)
 
 离线收益结算：放置类"回来时有事发生"的标准算法。
@@ -100,6 +180,61 @@ WebApp.NowSeconds），本库不做 IO。legend/wuwei 模板各有一份
     返回 true 时调用方应循环 Step()，false 直接乘。
 
 
+## OfflineRewardCalculator (class)
+
+放置游戏离线挂机收益计算与结算驱动器。
+
+- double maxOfflineHours;
+
+- double goldPerSecond;
+
+- OfflineRewardCalculator(double maxHours, double ratePerSec)
+
+- static OfflineRewardCalculator Create(double maxHours, double ratePerSec)
+
+- double MaxOfflineHours{ get set}
+
+- double GoldPerSecond{ get set}
+
+- void CalculateReward(long lastLogoutUnixSec, long nowUnixSec, out long outElapsedSec, out long outCappedSec, out double outTotalGold)
+  - 计算离线时间与金币收益结算结果。
+
+- static string FormatDuration(long totalSeconds)
+  - 将秒数格式化为人类可读的挂机时长文本（例如 "05时24分"）。
+
+
+## SquashAndStretch (class)
+
+游戏爽快感打击动效（Juice Effects）：
+包含点击果冻缩放（Squash & Stretch）弹簧阻尼振荡器。
+
+- double scaleX;
+
+- double scaleY;
+
+- double velocityX;
+
+- double velocityY;
+
+- double stiffness;
+
+- double damping;
+
+- SquashAndStretch()
+
+- static SquashAndStretch Create()
+
+- double ScaleX { get }
+
+- double ScaleY { get }
+
+- void Trigger(double amount)
+  - 触发一次挤压打击或点击（例如 X 变宽 1.25，Y 被压扁 0.75）。
+
+- void Update(double dt)
+  - 弹簧阻尼物理步进更新（内部自动子步切分保证数值稳定性）。
+
+
 ## Wallet (class)
 
 多资源容器：放置类"金币/宝石/素材…"的通用账本。
@@ -109,11 +244,7 @@ WebApp.NowSeconds），本库不做 IO。legend/wuwei 模板各有一份
 同一策略：卡住而不是回绕出负余额）。名字区分大小写，槽序即
 插入序（UI 按创建顺序画进度条）。
 
-- List<string> keys;
-
-- List<long> amounts;
-
-- List<long> caps;
+- List<WalletSlot> slots;
 
 - string changedKey;
   - 变更快照：最近一次变动的键与新余额（UI 每帧轮询对账，
@@ -163,3 +294,14 @@ WebApp.NowSeconds），本库不做 IO。legend/wuwei 模板各有一份
   - 从 ToSaveText 恢复余额；cap 沿用当前 Define 的值（版本迁移
     点：上调 cap 不需要动存档）。未知键忽略（老存档的废弃资源
     自然蒸发），缺失键保持 0。
+
+
+## WalletSlot (class)
+
+- public string key;
+
+- public long amount;
+
+- public long cap;
+
+- public WalletSlot(string key, long amount, long cap)

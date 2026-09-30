@@ -84,10 +84,12 @@ DownloadDialog dlg = DownloadDialog.Show(app, "系统检查更新", job);
     方便无显示器宿主回退到静默路径。
 
 - async bool RunStandalone()
-  - 驱动独立窗口直到任务成功或用户关窗，并返回是否成功。
-    失败/取消时窗口保留，调用方可以先更新说明文字，再调用
-    `WaitStandaloneClose` 等用户关窗。用户关窗不会取消任务；
+  - 驱动窗口直到任务成功或用户关窗，并返回是否成功（协程异步驱动，零消息泵阻塞）。
+    失败/取消时窗口保留，调用方可以先更新说明文字，再等待用户关窗。用户关窗不会取消任务；
     关窗后不再绘制界面，剩余工作静默等到收工。
+
+- async Task WaitStandaloneCloseAsync()
+  - 异步等待用户关闭窗口（协程挂起，不卡死 GUI）。
 
 - void WaitStandaloneClose()
   - 失败/取消后继续驱动窗口，直到用户关窗。

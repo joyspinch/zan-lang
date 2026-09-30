@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Jos
 
-> 源码: `stdlib/Sdk/Jd/Api/Jos/JdJosApi.zan`, `stdlib/Sdk/Jd/Api/Jos/JosIsvTokenEncryptionRequest.zan`, `stdlib/Sdk/Jd/Api/Jos/JosMasterKeyGetRequest.zan`, `stdlib/Sdk/Jd/Api/Jos/JosOauthRpcXidPin2XidRequest.zan`, `stdlib/Sdk/Jd/Api/Jos/JosOrderOaidWaitingRequest.zan`, `stdlib/Sdk/Jd/Api/Jos/JosSecretApiReportGetRequest.zan`, `stdlib/Sdk/Jd/Api/Jos/JosVoucherInfoGetRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Jos/JdJosApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Jos/JosIsvTokenEncryptionRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Jos/JosMasterKeyGetRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Jos/JosOauthRpcXidPin2XidRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Jos/JosOrderOaidWaitingRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Jos/JosSecretApiReportGetRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Jos/JosVoucherInfoGetRequest.zan`
 
 
 ## JdJosApi (class)

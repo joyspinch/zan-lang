@@ -109,7 +109,11 @@ Log.Error("db connect failed: " + err);
   - 记录一条 FATAL 级消息。
 
 - static void Write(int level, string msg)
-  - 写一条记录：`时间 [级别] pid/wid 正文`。
+  - 写一条记录：`时间 [级别] pid/wid 正文`。文件写入失败
+    （目录被删、文件被杀毒/索引器短暂独占）绝不向上抛：日志是诊断
+    旁路，写不进去只能降级到控制台，拖垮业务流程就是本末倒置
+    （实测：AppendAllText 抛 IOException 曾让服务端目录装载三次
+    全灭，服务带空目录上线）。失败后清 lastPath，下一条重验目录。
 
 - static string RollBySize(string path)
   - 把已写满的 `path` 改名为第一个空闲的 `path.N`，返回仍然
@@ -1093,20 +1097,20 @@ RecentErrors() 返回的一条错误记录：ErrEntry 的对外投影。
     A lone placeholder (e.g. `name = ?`) is left untouched so unrelated
     columns do not get merged; only genuine value lists shrink.
 
-- JsonValue TopSqlJson(int limit)
+- public JsonValue TopSqlJson(int limit)
   - The leaderboard: up to `limit` normalized statements ranked by
     total time spent, most expensive first. A selection scan rather than a
     sort -- the shape set is small and bounded, and `limit` is tiny.
 
-- JsonValue TopReqJson(int limit)
+- public JsonValue TopReqJson(int limit)
   - The request leaderboard: endpoints ranked by total time served,
     highest first, capped at `limit` rows. Selection-sort over a copied pool
     (the list is tiny and this avoids mutating the live aggregates).
 
-- JsonValue SlowReqJson()
+- public JsonValue SlowReqJson()
   - 慢请求 ring 的 JSON 数组（{"req","us"}），按记录先后排列。
 
-- JsonValue SlowQueryJson()
+- public JsonValue SlowQueryJson()
   - 慢查询 ring 的 JSON 数组（{"sql","us"}），按记录先后排列。
 
 - long SeriesPercentile(int idx, int pct)

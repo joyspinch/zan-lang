@@ -1,6 +1,6 @@
 # System.Commercial
 
-> 源码: `stdlib/System/Commercial/LicenseClient.zan`
+> 源码: `packages/Zan.Commercial/src/System/Commercial/LicenseClient.zan`
 
 
 ## LicenseCheckResult (class)

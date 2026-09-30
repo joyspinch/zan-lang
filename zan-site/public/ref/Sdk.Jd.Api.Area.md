@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Area
 
-> 源码: `stdlib/Sdk/Jd/Api/Area/AreaProvinceGetRequest.zan`, `stdlib/Sdk/Jd/Api/Area/JdAreaApi.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Area/AreaProvinceGetRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Area/JdAreaApi.zan`
 
 
 ## AreaProvinceGetRequest (class)

@@ -1,47 +1,55 @@
 # Platform
 
-> 源码: `stdlib/Platform/Runtime.zan`
+> 源码: `packages/Zan.Platform.Compat/src/Platform/Runtime.zan`
 
 
 ## Runtime (class)
 
-运行时平台检测与信息。所有查询都解析为
-编译时选定的目标平台（WINDOWS / LINUX / MACOS），
-因此交叉编译的程序报告目标系统而非构建主机。
+运行时平台检测与信息（历史兼容层）。
+建议新代码直接使用符合 C# 标准的 `System.OperatingSystem` 和 `System.Environment`。
+所有查询均解析为编译时选定的目标平台，交叉编译程序报告目标系统。
 
-- [DllImport("crt", EntryPoint="_getpid")]static extern int plat_getpid();
+- public static string GetPlatform()
+  - 返回当前平台名称（"windows" | "linux" | "macos" | "wasi"）。
 
-- [DllImport("crt", EntryPoint="getpid")]static extern int plat_getpid();
-
-- static string GetPlatform()
-  - 返回当前平台名称。
-
-- static bool IsWindows()
+- public static bool IsWindows()
   - 在 Windows 上运行时返回 true。
 
-- static bool IsLinux()
+- public static bool IsLinux()
   - 在 Linux 上运行时返回 true。
 
-- static bool IsMacOS()
+- public static bool IsMacOS()
   - 在 macOS 上运行时返回 true。
 
-- static bool IsWasi()
+- public static bool IsWasi()
   - 在 WASI 上运行时返回 true。
 
-- static bool IsMusl()
+- public static bool IsMusl()
   - 使用 musl libc 时返回 true。
 
-- static bool IsRiscv64()
+- public static bool IsRiscv64()
   - 目标为 RISC-V 64 位时返回 true。
 
-- static bool IsWasm32()
+- public static bool IsWasm32()
   - 目标为 WebAssembly 32 位时返回 true。
 
-- static int GetProcessId()
+- public static int GetProcessId()
   - 获取当前进程 ID。
 
-- static string PathSeparator()
+- public static int Pid=> Environment.ProcessId;
+  - 当前进程 ID 属性别名。
+
+- public static string OS=> OperatingSystem.Platform;
+  - 当前平台标识属性别名。
+
+- public static string ExePath=> Environment.ProcessPath;
+  - 当前可执行文件路径属性别名。
+
+- public static long TickCountMs=> Environment.TickCount64;
+  - 启动毫秒滴答数别名。
+
+- public static string PathSeparator()
   - 返回当前平台的路径分隔符。
 
-- static string NewLine()
+- public static string NewLine()
   - 返回当前平台的换行符。

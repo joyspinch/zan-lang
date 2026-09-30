@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.UserRelatedRpcI18nService
 
-> 源码: `stdlib/Sdk/Jd/Api/UserRelatedRpcI18nService/JdUserRelatedRpcI18nServiceApi.zan`, `stdlib/Sdk/Jd/Api/UserRelatedRpcI18nService/UserRelatedRpcI18nServiceGetOpenIdRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/UserRelatedRpcI18nService/JdUserRelatedRpcI18nServiceApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/UserRelatedRpcI18nService/UserRelatedRpcI18nServiceGetOpenIdRequest.zan`
 
 
 ## JdUserRelatedRpcI18nServiceApi (class)

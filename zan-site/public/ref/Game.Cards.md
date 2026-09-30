@@ -1,6 +1,86 @@
 # Game.Cards
 
-> 源码: `stdlib/Game/Cards/Battle.zan`, `stdlib/Game/Cards/Cards.zan`
+> 源码: `packages/Zan.Game/src/Game/Cards/ActionQueue.zan`, `packages/Zan.Game/src/Game/Cards/Battle.zan`, `packages/Zan.Game/src/Game/Cards/CardZone.zan`, `packages/Zan.Game/src/Game/Cards/Cards.zan`, `packages/Zan.Game/src/Game/Cards/HandFanLayout.zan`
+
+
+## ActionQueue (class)
+
+卡牌与策略游戏动作演播序列队列。
+将回合制逻辑演算与视觉动画解耦，确保法术连击、亡语触发、伤害扣血按节奏流畅展现。
+
+- GameAction[]queue;
+
+- int head;
+
+- int tail;
+
+- int count;
+
+- int capacity;
+
+- GameAction currentAction;
+
+- double currentTimer;
+
+- bool isPlaying;
+
+- ActionQueue(int cap)
+
+- static ActionQueue Create(int cap)
+
+- bool IsPlaying { get }
+
+- int PendingCount { get }
+
+- bool Enqueue(ActionKind kind, int src, int tgt, int val, double duration)
+  - 向队列尾部推入一个动作。
+
+- void Update(double dt, Action<GameAction> onActionStart, Action<GameAction> onActionFinish)
+  - 逐物理帧推进演播序列。
+    触发 onActionStart 和 onActionFinish 委托。
+
+- void Clear()
+
+
+## BoardSlot (class)
+
+战场卡槽或交互区域。
+
+- int slotIndex;
+
+- double x;
+
+- double y;
+
+- double width;
+
+- double height;
+
+- int occupantCardId;
+
+- BoardSlot(int idx, double x, double y, double w, double h)
+
+- static BoardSlot Create(int idx, double x, double y, double w, double h)
+
+- int Index { get }
+
+- double X { get }
+
+- double Y { get }
+
+- double Width { get }
+
+- double Height { get }
+
+- int OccupantCardId{ get set}
+
+- bool IsEmpty { get }
+
+- bool Contains(double px, double py)
+  - 判断点 (px, py) 是否落在卡槽范围内。
+
+- double DistanceSqToCenter(double px, double py)
+  - 计算点到卡槽中心点的欧氏距离平方，用于磁吸距离计算。
 
 
 ## CardActor (class)
@@ -475,3 +555,112 @@ Add 同 id 的定义会覆盖旧定义。
 
 - void Clear()
   - 清空区域内全部卡牌。
+
+
+## CardZoneManager (class)
+
+卡牌容器与拖拽磁吸判定管理器。
+
+- BoardSlot[]playerSlots;
+
+- BoardSlot[]enemySlots;
+
+- int slotCapacity;
+
+- CardZoneManager(int maxSlots)
+
+- static CardZoneManager Create(int maxSlots)
+
+- void SetupPlayerSlot(int index, double x, double y, double w, double h)
+
+- void SetupEnemySlot(int index, double x, double y, double w, double h)
+
+- BoardSlot GetPlayerSlot(int index)
+
+- int FindSnapPlayerSlot(double cardCenterX, double cardCenterY, double snapThresholdPx)
+  - 寻找玩家拖拽卡牌时距离最近且合法的空置卡槽。
+    snapThresholdPx: 磁吸感应门限像素。
+    未命中或超出磁吸范围返回 -1。
+
+
+## GameAction (class)
+
+单个待演播动作节拍。
+
+- ActionKind kind;
+
+- int sourceId;
+
+- int targetId;
+
+- int value;
+
+- double duration;
+
+- GameAction(ActionKind kind, int src, int tgt, int val, double dur)
+
+- static GameAction Create(ActionKind kind, int src, int tgt, int val, double dur)
+
+- ActionKind Kind { get }
+
+- int SourceId { get }
+
+- int TargetId { get }
+
+- int Value { get }
+
+- double Duration { get }
+
+
+## HandFanLayout (class)
+
+手牌扇形弧度自然排布算法（类似《炉石传说》《杀戮尖塔》）。
+解决卡牌平铺呆板重叠的问题，根据持牌张数自适应计算每张牌的位置、拱起弧度与旋转倾角。
+
+- double arcRadius;
+
+- double maxSpreadAngle;
+
+- double cardSpacing;
+
+- double hoverLift;
+
+- double hoverScale;
+
+- HandFanLayout(double radius, double maxAngle, double spacing)
+
+- static HandFanLayout Create(double radius, double maxAngle, double spacing)
+
+- void CalculateCardTransform(int index, int count, int hoveredIndex, double centerX, double bottomY, out double outX, out double outY, out double outRotRad, out double outScale)
+  - 为拥有 count 张手牌的序列计算第 index 张牌的目标变换。
+    输出：目标世界坐标 (outX, outY), 倾斜角弧度 outRotRad, 缩放比率 outScale。
+
+
+## ActionKind (enum)
+
+演播动作类型。
+
+- PlayCardAnim
+
+- DealDamage
+
+- MinionDeath
+
+- DrawCardAnim
+
+- PauseWait = 战术性短暂停顿
+
+
+## ZoneType (enum)
+
+卡牌区域类型。
+
+- Deck
+
+- Hand
+
+- Board
+
+- Discard
+
+- Exile = 放逐区

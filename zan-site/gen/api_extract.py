@@ -504,16 +504,18 @@ class Extractor:
         self.namespaces[ns]["types"].append(t)
 
     # ------------------------------------------------------------------ #
-    def parse_file(self, path):
+    def parse_file(self, path, infer_root, disp):
         with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
             text = f.read()
         toks = tokenize(text)
-        rel = os.path.relpath(path, self.stdlib).replace("\\", "/")
+        rel = os.path.relpath(path, infer_root).replace("\\", "/")
         self.file_ns = ""  # 每个文件独立
         # 目录推断命名空间：stdlib/Gui/ChildWindow.zan -> Gui（无显式 namespace 时用）
         parts = rel.split("/")
         self.infer_ns = ".".join(parts[:-1]) if len(parts) > 1 else ""
-        self._walk(toks, rel, 0, [])
+        # 记录用仓库相对路径：stdlib 文件带 stdlib/ 前缀，包文件带
+        # packages/<名>/<布局>/ 前缀（site_build 原样展示，不再自行拼前缀）。
+        self._walk(toks, disp, 0, [])
 
     def _walk(self, toks, fname, i, ns_stack, file_ns=None, type_ctx=None, end_i=None):
         """顶层 / 类型体扫描。
@@ -1096,18 +1098,23 @@ class Extractor:
             "static": "static" in mods, "file": fname, "type": inner,
         })
 
-    def run(self, stdlib):
-        self.stdlib = stdlib
+    def run(self, roots):
+        """roots: [(文件系统根, 显示前缀)]。stdlib 之外还扫各包源根
+        （packages/<名>/src 等），包命名空间与 stdlib 命名空间同页合并。"""
         self.file_ns = ""
         files = []
-        for root, _dirs, names in os.walk(stdlib):
-            for nm in sorted(names):
-                if nm.endswith(".zan"):
-                    files.append(os.path.join(root, nm))
-        for path in sorted(files):
+        for fs_root, prefix in roots:
+            for root, _dirs, names in os.walk(fs_root):
+                for nm in sorted(names):
+                    if nm.endswith(".zan"):
+                        rel = os.path.relpath(os.path.join(root, nm),
+                                              fs_root).replace("\\", "/")
+                        files.append((os.path.join(root, nm), fs_root,
+                                      prefix + rel))
+        for path, infer_root, disp in sorted(files, key=lambda x: x[2]):
             self.file_ns = ""
             try:
-                self.parse_file(path)
+                self.parse_file(path, infer_root, disp)
             except Exception as e:  # 单文件失败不中断
                 print(f"WARN parse {path}: {e}", file=sys.stderr)
         # 排序输出
@@ -1124,8 +1131,18 @@ def main():
         os.path.dirname(os.path.abspath(__file__)), "..", "..", "stdlib")
     outdir = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "..", "public", "ref")
+    roots = [(os.path.normpath(stdlib), "stdlib/")]
+    # 包源根（命名空间保留式拆包后，Gui.* 等家族部分住在 packages/ 下）
+    pkg_base = os.path.normpath(os.path.join(os.path.dirname(stdlib), "packages"))
+    if os.path.isdir(pkg_base):
+        for nm in sorted(os.listdir(pkg_base)):
+            for layout in ("src", "stdlib"):
+                sub = os.path.join(pkg_base, nm, layout)
+                if os.path.isdir(sub):
+                    roots.append((sub, "packages/" + nm + "/" + layout + "/"))
+                    break
     ex = Extractor()
-    data = ex.run(os.path.normpath(stdlib))
+    data = ex.run(roots)
     os.makedirs(outdir, exist_ok=True)
     # 全量 API 模型是构建中间产物，只放 gen/（不要部署）；
     # index.json（命名空间→类型清单）是轻量索引，放 public/ref 供 AI 检索。

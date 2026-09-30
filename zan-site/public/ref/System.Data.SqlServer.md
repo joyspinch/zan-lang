@@ -12,10 +12,11 @@ sp_executesql RPC 都由 `TdsMessage` 构建，每步网络
 <c>Socket.SendAsync</c> / <c>Socket.RecvOv</c>），因此查询从不阻塞
 工作线程，多个连接可在单线程上并行推进。
 
-登录包以明文发送：TDS 会对密码字段做加扰，但
-那只是混淆而非加密，因此开启了 “force encryption” 的服务器
-会拒绝登录（其 PRELOGIN 应答 ENCRYPT_REQ，表现为
-连接错误而非静默降级）。
+明文路径（OpenAsync）的登录包以明文发送：TDS 会对密码字段做
+加扰，但那只是混淆而非加密，因此开启了 "force encryption" 的
+服务器会拒绝登录（其 PRELOGIN 应答 ENCRYPT_REQ，表现为
+连接错误而非静默降级）。跨网使用请走
+`OpenSecureAsync`（A287②：整条流含口令走 TLS）。
 
 用法：
 SqlServerConnection db = await SqlServerConnection.OpenAsync(
@@ -44,12 +45,33 @@ db.Close();
 
 - int packetId;
 
+- TlsStream tls;
+
+- bool busy;
+
+- List<AsyncGate> waiters;
+
+- async bool AcquireLock()
+
+- void ReleaseLock()
+
+- static bool verifyTls=true;
+
+- static void SetTlsVerify(bool verify)
+  - 切换后续 OpenSecureAsync 的证书与主机名校验。
+    仅测试/开发自签场景关闭；生产保持默认开启。
+
 - SqlServerConnection()
   - 私有构造；统一经 `OpenAsync` 创建。
 
 - async int recvExact(byte[]dst, int off, int need)
   - 恰好读取 <paramref name="need"/> 字节，部分读取之间
-    会挂起。返回实际读到的字节数。
+    会挂起。返回实际读到的字节数。TLS 建立后从解密流读取
+    （TDS 报文层整体运行在隧道之内）。
+
+- async int recvExactRaw(byte[]dst, int off, int need)
+  - 握手阶段专用的原话路收发（0x12 封装的 TLS 密文），
+    绝不经 recvExact——那里此时还走不了隧道。
 
 - async bool sendMessage(int type, TdsBytes payload)
   - 发送一条消息，按协商的包大小拆分成
@@ -63,14 +85,29 @@ db.Close();
 - static async SqlServerConnection OpenAsync(string host, int port, string database, string user, string password)
   - 打开连接并使用 SQL Server 认证方式登录。
 
-- async bool handshake(string host, int port, string db, string user, string pw)
-  - PRELOGIN + LOGIN7 握手：声明 ENCRYPT_NOT_SUP 保持明文，
-    服务器要求 TLS（ENCRYPT_REQ）时在这里失败；登录应答
+- static async SqlServerConnection OpenSecureAsync(string host, int port, string database, string user, string password)
+  - 与 `OpenAsync` 相同，但 PRELOGIN 协商
+    ENCRYPT_ON，握手响应起整条 TDS 流（含 LOGIN7 与口令）走 TLS。
+    MS-TDS 的特例：握手期间的 TLS 记录封装在 PRELOGIN(0x12) 报文
+    里，握手完成后裸 TLS 记录直达套接字、TDS 报文层整体进入隧道。
+    服务器拒绝加密（应答 NOT_SUP）时显式失败——绝不静默降级
+    明文（A287②）。
+
+- async bool handshake(string host, int port, string db, string user, string pw, bool secure)
+  - PRELOGIN + LOGIN7 握手。明文路径声明 ENCRYPT_NOT_SUP，
+    服务器要求 TLS（ENCRYPT_REQ）时在这里失败；安全路径声明
+    ENCRYPT_ON 并在 PRELOGIN 应答后把通道升级为 TLS。登录应答
     带出服务器版本与实际绑定的数据库。
+
+- async bool tlsUpgrade(string host)
+  - 把通道升级为 TLS：握手期间的 TLS 记录按 MS-TDS 规则
+    封装在 PRELOGIN(0x12) 报文里收发；握手完成后调用方照常经
+    sendMessage/recvMessage 走隧道（裸 TLS 记录，TDS 报文层在
+    解密侧）。失败时已记录 lastError。
 
 - async TdsResponse roundTrip(int type, TdsBytes payload)
   - 发送一条消息并解码响应：网络失败会把连接标记为断开并返回
-    空响应，语句级失败只记录（由调用方决定是否抛出）。
+    空响应，语句级失败只记录（由调用方决定是否抛出）。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
 
 - async DbResult QueryAsync(string sql)
   - 运行语句批处理并返回结果集。当服务器拒绝批处理时抛出
@@ -121,7 +158,8 @@ db.Close();
   - 恒为 `DbProvider.SqlServer`。
 
 - void Close()
-  - 关闭套接字；重复调用安全。
+  - 关闭套接字；重复调用安全。TLS 先发 close_notify（fd 仍归
+    调用方）再关套接字。安全唤醒所有门控等待者。
 
 
 ## SqlServerPool (class)

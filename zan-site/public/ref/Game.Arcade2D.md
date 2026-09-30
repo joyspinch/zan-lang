@@ -1,6 +1,36 @@
 # Game.Arcade2D
 
-> 源码: `stdlib/Game/Arcade2D/Animation.zan`, `stdlib/Game/Arcade2D/Geometry.zan`, `stdlib/Game/Arcade2D/World.zan`
+> 源码: `packages/Zan.Game/src/Game/Arcade2D/Animation.zan`, `packages/Zan.Game/src/Game/Arcade2D/Collision2D.zan`, `packages/Zan.Game/src/Game/Arcade2D/Geometry.zan`, `packages/Zan.Game/src/Game/Arcade2D/World.zan`
+
+
+## AdvancedCollision2D (class)
+
+高级 2D 碰撞检测与空间几何计算扩展。
+
+- const double EPSILON=0.0000001;
+
+- static RaycastHit2D RaycastRect(double ox, double oy, double dx, double dy, double maxDist, Rect2 rect)
+  - 2D 射线与轴对齐矩形 (AABB) 快速相交检测（Slab 法）。
+
+- static RaycastHit2D RaycastCircle(double ox, double oy, double dx, double dy, double maxDist, Circle2 circle)
+  - 2D 射线与圆的相交检测。
+
+- static Vector2 ClosestPointOnSegment(double px, double py, double ax, double ay, double bx, double by)
+  - 计算点 P 到线段 AB 的最近投影点。
+
+- static bool SegmentIntersect(double ax1, double ay1, double ax2, double ay2, double bx1, double by1, double bx2, double by2, Vector2 outHit)
+  - 判断两条 2D 线段 A1A2 与 B1B2 是否相交，相交时通过 outHit 返回交点坐标。
+
+- static Vector2 FindSegmentIntersection(double ax1, double ay1, double ax2, double ay2, double bx1, double by1, double bx2, double by2)
+  - 便捷版本：若两线段相交返回交点 Vector2，否则返回 null。
+
+- static bool CircleVsSegment(Circle2 circle, double ax, double ay, double bx, double by)
+  - 圆形与线段（骨架线段/胶囊体端点）相交测试。
+
+- static CollisionManifold RectManifold(Rect2 a, Rect2 b)
+  - 计算两个 AABB 轴对齐矩形的碰撞流形。
+    若相交，返回最小分离法线（Normal 指向物体 B）与穿透深度（Depth），
+    用于将重叠物体推开纠正物理穿模。
 
 
 ## AnimationClip (class)
@@ -427,6 +457,77 @@
 
 - static double DistanceSquared(double ax, double ay, double bx, double by)
   - 两点间距离的平方（避免开方）；比较距离时用它配对同侧平方阈值。
+
+
+## CollisionManifold (class)
+
+2D 碰撞接触流形（Collision Manifold）。
+包含两物体相交时的法线方向与重叠穿透深度，供物理位移分离（Depenetration）使用。
+
+- bool collided;
+
+- double normalX;
+
+- double normalY;
+
+- double depth;
+
+- CollisionManifold(bool collided, double nx, double ny, double depth)
+
+- static CollisionManifold None()
+  - 创建未碰撞流形
+
+- bool Collided()
+  - 是否发生碰撞接触
+
+- double NormalX()
+  - 物体 A 推开物体 B 的分离法线 X（从 A 指向 B）
+
+- double NormalY()
+  - 物体 A 推开物体 B 的分离法线 Y（从 A 指向 B）
+
+- double Depth()
+  - 沿法线方向的重叠穿透深度
+
+
+## RaycastHit2D (class)
+
+2D 射线检测结果。包含命中状态、碰撞距离、接触点坐标与法线向量。
+
+- bool hit;
+
+- double distance;
+
+- double pointX;
+
+- double pointY;
+
+- double normalX;
+
+- double normalY;
+
+- RaycastHit2D(bool hit, double distance, double px, double py, double nx, double ny)
+
+- static RaycastHit2D Miss()
+  - 创建未命中结果
+
+- bool Hit()
+  - 是否命中目标
+
+- double Distance()
+  - 从射线起点到命中点的距离
+
+- double PointX()
+  - 命中点世界坐标 X
+
+- double PointY()
+  - 命中点世界坐标 Y
+
+- double NormalX()
+  - 命中表面单位法线 X
+
+- double NormalY()
+  - 命中表面单位法线 Y
 
 
 ## Rect2 (class)

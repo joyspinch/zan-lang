@@ -1,6 +1,6 @@
 # System.Net.Mqtt
 
-> 源码: `stdlib/System/Net/Mqtt/MqttBroker.zan`, `stdlib/System/Net/Mqtt/MqttClient.zan`
+> 源码: `stdlib/System/Net/Mqtt/MqttBroker.zan`, `stdlib/System/Net/Mqtt/MqttClient.zan`, `stdlib/System/Net/Mqtt/MqttReader.zan`, `stdlib/System/Net/Mqtt/MqttSharedBus.zan`
 
 
 ## MqttBroker (class)
@@ -21,6 +21,12 @@ worker 由 Worker 接受连接并为每个客户端调用
 - List<MqttSession> sessions;
 
 - List<MqttTopicStat> topics;
+
+- List<MqttRetainedMessage> retainedMessages;
+
+- bool keepAliveRunning;
+
+- MqttSharedBus sharedBus;
 
 - int nextId;
 
@@ -60,6 +66,18 @@ worker 由 Worker 接受连接并为每个客户端调用
 - static MqttBroker Instance()
   - 进程级共享实例（未 Use 时返回惰性创建的默认实例）。
 
+- static void TeardownGlobal()
+  - 进程退出前的拆卸入口：停掉共享总线轮询并清空
+    注册表，再解除进程级实例。静态 inst 是 broker 及其
+    sessions/topics/retained 列表在泄漏探测里的保持根，
+    不拆就恒报"退出仍可达"（A352）。
+
+- void Shutdown()
+  - 停机：停 KeepAlive 巡检协程（其帧持有 this，不置
+    停止标志它就永生，broker 及列表在退出泄漏探测里恒可达）、
+    停总线轮询、断开并清空全部会话/统计/保留消息。可随后
+    TeardownGlobal 一并解除静态实例。
+
 - int Count()
   - 当前连接的客户端数。
 
@@ -88,13 +106,30 @@ worker 由 Worker 接受连接并为每个客户端调用
   - 构建 QoS 0 的 PUBLISH 报文（固定头 + varint 剩余长度 +
     2 字节主题长度 + 主题 + 载荷；载荷可含 NUL，按 len 精确拷贝）。
 
+- static byte[]BuildPublishRetain(string topic, string payload, int payloadLen)
+  - 构建带 Retain 标记的 PUBLISH 报文。
+
+- void SaveRetained(string topic, string payload, int payloadLen, int qos)
+  - 存储或清除保留消息（payloadLen == 0 时按规范删除对应主题的保留消息）。
+
 - int PublishPacketLen(string topic, int payloadLen)
   - 同一报文的线上总长（1 固定头 + varint 长度 + 剩余），
     供发送方统计字节用，不必实际构建报文。
 
-- async int PublishToSubscribers(string topic, string payload, int payloadLen)
-  - 将消息投递给所有过滤器匹配
+- public void EnableSharedBus(string busName)
+  - 启用跨进程共享内存消息总线（基于 SharedTable）。
+    在 Worker 多进程模型下，消息不仅推送到当前 Worker 的本地订阅者，
+    还会通过跨进程共享内存总线广播给其他 Worker 进程中的订阅者。
+
+- public async int PublishLocal(string topic, string payload, int payloadLen)
+  - 将消息投递给本进程内所有过滤器匹配
     <paramref name="topic"/> 的存活会话。返回接收者数量。
+    采用非阻塞优先直接发送 + 异步慢客户端容错快速隔离机制，
+    防止单连接慢速或挂起导致全局广播路径被卡死。
+
+- async int PublishToSubscribers(string topic, string payload, int payloadLen)
+  - 分发消息：先投递给本进程内匹配的会话，若启用了跨进程共享总线，
+    则同时广播至总线同步到其他 Worker 进程。
 
 - void Touch(string topic, string payload)
   - 将消息记录到其主题下（消息计数 + 最后一条
@@ -133,6 +168,13 @@ worker 由 Worker 接受连接并为每个客户端调用
 - string MetricsJson()
   - broker 吞吐量快照。
 
+- async void EnsureKeepAliveInspector()
+  - 启动 KeepAlive 心跳定时巡检协程（MQTT-3.1.2.10）。
+    每 1 秒轮询一次所有已连接的存活会话；若客户端声明的 keepAlive > 0，
+    且距上次收到任何报文已超过 1.5 * keepAlive 秒，则判定对端假死/异常离线，
+    主动调用 Socket.ShutdownBoth 唤醒并终止挂起的读取协程，
+    触发会话自动清理与 LWT 遗嘱广播。
+
 - async void HandleConnection(nint sock)
   - 在已接受的套接字上服务一个 MQTT 客户端，直到其
     断开。"mqtt" 协议的 Worker 用它服务每个客户端连接。
@@ -163,6 +205,8 @@ int d = await c.DisconnectAsync();
 
 - TcpClient conn;
 
+- MqttReader reader;
+
 - string clientId;
 
 - string host;
@@ -175,10 +219,23 @@ int d = await c.DisconnectAsync();
 
 - int keepAlive;
 
+- string willTopic;
+
+- string willMessage;
+
+- int willQos;
+
+- bool willRetain;
+
+- bool hasWill;
+
 - [DllImport("crt")]static extern long strlen(string str);
 
 - MqttClient()
   - 构造未连接的客户端；连接通过 `ConnectAsync` 建立。
+
+- public void SetWill(string topic, string message, int qos, bool retain)
+  - 设置客户端遗嘱（LWT）属性，在连接建立前配置。
 
 - async int ReadByteAsync()
   - 精确读取一个字节，对端关闭时返回 -1。
@@ -208,9 +265,24 @@ int d = await c.DisconnectAsync();
   - 连接 broker 并执行 MQTT CONNECT/CONNACK
     握手，每个网络步骤都在 IO reactor 上挂起。
 
+- static async MqttClient ConnectAsync(string host, int port, string clientId, string willTopic, string willMessage, int willQos, bool willRetain)
+  - 带遗嘱（LWT）配置连接 broker 并执行 MQTT CONNECT/CONNACK 握手。
+
+- static async MqttClient ConnectAsync(string host, int port, string clientId, int keepAlive, string willTopic, string willMessage, int willQos, bool willRetain)
+  - 带遗嘱（LWT）与自定义 KeepAlive 秒数连接 broker 并执行 MQTT CONNECT/CONNACK 握手。
+
 - async int PublishAsync(string topic, string message, int qos)
   - 发布消息，在 IO reactor 上挂起。QoS 1 时
     还会等待 PUBACK。返回已发送的字节数。
+
+- async int PublishAsync(string topic, string message, int qos, bool retain)
+  - 发布消息并指定 retain 标志，在 IO reactor 上挂起。
+
+- async int PublishBytesAsync(string topic, byte[]payload, int offset, int count, int qos, bool retain)
+  - 以原生字节数组切片发布二进制消息，彻底杜绝包含 NUL 字节时被截断。在 IO reactor 上挂起。
+
+- async int PublishBytesAsync(string topic, byte[]payload, int qos, bool retain)
+  - 以原生字节数组发布完整二进制消息。
 
 - async int SubscribeAsync(string topic, int qos)
   - 订阅主题并等待 SUBACK，在 IO
@@ -225,6 +297,10 @@ int d = await c.DisconnectAsync();
     在 IO reactor 上挂起直到数据到达。对 broker 的
     PINGREQ 透明响应，并继续等待真正的消息。
 
+- async byte[]ReceiveBytesAsync()
+  - 等待下一个传入的 PUBLISH 并返回其原生二进制负载，彻底杜绝包含 NUL 字节时被截断。
+    在 IO reactor 上挂起直到数据到达。对端关闭或出错时返回 null。
+
 - async int PingAsync()
   - 发送 PINGREQ 保活，在 IO reactor 上挂起。
     返回已发送的字节数。
@@ -233,13 +309,16 @@ int d = await c.DisconnectAsync();
   - 发送 DISCONNECT 并关闭连接，在 IO
     reactor 上等待发送完成。返回已发送的字节数。
 
+- public void Abort()
+  - 强制断开底层连接（不发送 DISCONNECT 报文），用于模拟客户端异常断开并触发遗嘱消息（LWT）。
+
 - bool IsConnected()
   - 连接是否仍存活：CONNACK 返回码为 0 后为 true，
     对端关闭或 `DisconnectAsync` 后为 false。
 
 - byte[]BuildConnectPacket()
   - 编码 CONNECT 报文：协议名 "MQTT"、协议级别 4（3.1.1）、
-    clean session 标志、keepAlive 秒数与 client id。
+    clean session 标志、遗嘱标志与载荷、keepAlive 秒数与 client id。
 
 
 ## MqttClientDetailDoc (class)
@@ -305,6 +384,19 @@ broker 吞吐量快照（对应 MetricsJson 输出结构）。
 - int bytes_out;
 
 
+## MqttPacket (class)
+
+表示一个解码完成的完整 MQTT 报文。
+
+- public int packetType;
+
+- public int flags;
+
+- public byte[]body;
+
+- public int bodyLen;
+
+
 ## MqttPacketType (class)
 
 MQTT v3.1.1 控制报文类型（固定头第一个字节的高 4 位）。
@@ -320,6 +412,15 @@ MQTT v3.1.1 控制报文类型（固定头第一个字节的高 4 位）。
 
 - static const int PUBACK=4;
   - QoS 1 发布确认。
+
+- static const int PUBREC=5;
+  - QoS 2 发布已收到（第二阶段）。
+
+- static const int PUBREL=6;
+  - QoS 2 发布释放（第三阶段）。
+
+- static const int PUBCOMP=7;
+  - QoS 2 发布完成（第四阶段）。
 
 - static const int SUBSCRIBE=8;
   - 订阅请求。
@@ -358,6 +459,63 @@ MQTT QoS 服务等级（编码进 PUBLISH 固定头）。
     实际处理与 QoS 0 相同）。
 
 
+## MqttReader (class)
+
+纯内存滑动窗口 MQTT 报文预读与帧解析器。
+彻底消除逐字节 RecvOv(1) 系统调用，一次 RecvOv 批量读入多字节，并在纯内存中
+状态机解码变长剩余长度（Remaining Length）与报文帧边界。
+
+- nint sock;
+
+- byte[]buf;
+
+- int len;
+
+- int cap;
+
+- int start;
+
+- byte[]tmp;
+
+- int maxPacketLen;
+
+- public MqttReader(nint sock)
+
+- public void SetSocket(nint sock)
+
+- public void Compact()
+
+- public void Ensure(int need)
+
+- public async int FillMore()
+
+- public int PacketSize()
+  - 检测当前缓冲中是否已经包含完整的下一个 MQTT 报文。
+    返回值：
+    > 0 : 完整报文总字节数（固定头 + 剩余长度字节 + 载荷）；
+    -1  : 数据未收全，需要等待更多数据；
+    -2  : 畸形协议：变长长度超过 4 字节；
+    -3  : 报文长度超过 maxPacketLen。
+
+- public async MqttPacket ReadPacketAsync()
+  - 读取下一个完整报文。返回 null 表示流结束或协议错误。
+
+
+## MqttRetainedMessage (class)
+
+为主题保留的最新消息（Retained Message）。
+
+- public string topic;
+
+- public string payload;
+
+- public int payloadLen;
+
+- public int qos;
+
+- public MqttRetainedMessage(string topic, string payload, int payloadLen, int qos)
+
+
 ## MqttSession (class)
 
 broker 持有的单个已连接 MQTT 客户端会话：其套接字、客户端 id
@@ -391,8 +549,58 @@ broker 持有的单个已连接 MQTT 客户端会话：其套接字、客户端 
 
 - int msgsOut;
 
+- bool cleanSession;
+
+- bool willFlag;
+
+- int willQos;
+
+- bool willRetain;
+
+- string willTopic;
+
+- string willMessage;
+
+- bool receivedDisconnect;
+
 - MqttSession(nint sock)
   - 内部构造：未 CONNECT 的裸会话，id/clientId 在握手时填。
+
+
+## MqttSharedBus (class)
+
+基于 SharedTable 共享内存环形缓冲区的跨进程 MQTT 消息总线。
+在 Worker 多进程模型下无需部署外部中间件即可实现零拷贝/极低延迟的跨进程主题广播。
+
+- SharedTable busTable;
+
+- string name;
+
+- int ringCapacity;
+
+- long lastReadSeq;
+
+- bool running;
+
+- MqttBroker broker;
+
+- int pid;
+
+- public MqttSharedBus(MqttBroker broker, string name, int ringCapacity)
+
+- void InitTable()
+
+- public bool IsAvailable()
+
+- public void Broadcast(string topic, string payload, int payloadLen)
+  - 向跨进程总线广播消息，由各 Worker 进程异步抓取并下发给各自连接的本地订阅者。
+
+- public async void StartPolling()
+  - 启动跨进程总线轮询协程。
+
+- public void Stop()
+  - 停掉轮询协程：只翻标志，下一跳 10ms 轮询帧自行
+    完成并释放（与 WsSharedBus.Stop 同一收尾定式）。
 
 
 ## MqttSubDoc (class)

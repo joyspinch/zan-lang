@@ -1,6 +1,55 @@
 # Gui.Widget
 
-> 源码: `stdlib/Gui/Widget/Avatar.zan`, `stdlib/Gui/Widget/Badge.zan`, `stdlib/Gui/Widget/BoxContent.zan`, `stdlib/Gui/Widget/Breadcrumb.zan`, `stdlib/Gui/Widget/Button.zan`, `stdlib/Gui/Widget/ButtonGroup.zan`, `stdlib/Gui/Widget/Calendar.zan`, `stdlib/Gui/Widget/Card.zan`, `stdlib/Gui/Widget/Carousel.zan`, `stdlib/Gui/Widget/Checkbox.zan`, `stdlib/Gui/Widget/ChoiceGroup.zan`, `stdlib/Gui/Widget/CodeBlock.zan`, `stdlib/Gui/Widget/Collapse.zan`, `stdlib/Gui/Widget/ColorPicker.zan`, `stdlib/Gui/Widget/ContextMenu.zan`, `stdlib/Gui/Widget/Countdown.zan`, `stdlib/Gui/Widget/DatePicker.zan`, `stdlib/Gui/Widget/Divider.zan`, `stdlib/Gui/Widget/Dropdown.zan`, `stdlib/Gui/Widget/DynamicTags.zan`, `stdlib/Gui/Widget/Ellipsis.zan`, `stdlib/Gui/Widget/Empty.zan`, `stdlib/Gui/Widget/Flex.zan`, `stdlib/Gui/Widget/FloatButton.zan`, `stdlib/Gui/Widget/FormBuilder.zan`, `stdlib/Gui/Widget/FormField.zan`, `stdlib/Gui/Widget/FormGroup.zan`, `stdlib/Gui/Widget/Grid.zan`, `stdlib/Gui/Widget/GridItem.zan`, `stdlib/Gui/Widget/IconView.zan`, `stdlib/Gui/Widget/Image.zan`, `stdlib/Gui/Widget/Input.zan`, `stdlib/Gui/Widget/InputNumber.zan`, `stdlib/Gui/Widget/InputOtp.zan`, `stdlib/Gui/Widget/Label.zan`, `stdlib/Gui/Widget/Layer.zan`, `stdlib/Gui/Widget/ListItem.zan`, `stdlib/Gui/Widget/ListView.zan`, `stdlib/Gui/Widget/Marquee.zan`, `stdlib/Gui/Widget/Menu.zan`, `stdlib/Gui/Widget/NumberAnimation.zan`, `stdlib/Gui/Widget/PageHeader.zan`, `stdlib/Gui/Widget/Pagination.zan`, `stdlib/Gui/Widget/Panel.zan`, `stdlib/Gui/Widget/Popover.zan`, `stdlib/Gui/Widget/Progress.zan`, `stdlib/Gui/Widget/Prompt.zan`, `stdlib/Gui/Widget/QrCode.zan`, `stdlib/Gui/Widget/Radio.zan`, `stdlib/Gui/Widget/Rate.zan`, `stdlib/Gui/Widget/Result.zan`, `stdlib/Gui/Widget/Ribbon.zan`, `stdlib/Gui/Widget/ScrollColumn.zan`, `stdlib/Gui/Widget/ScrollView.zan`, `stdlib/Gui/Widget/Scrollbar.zan`, `stdlib/Gui/Widget/SelectBox.zan`, `stdlib/Gui/Widget/Skeleton.zan`, `stdlib/Gui/Widget/Slider.zan`, `stdlib/Gui/Widget/Spin.zan`, `stdlib/Gui/Widget/Split.zan`, `stdlib/Gui/Widget/SplitPanel.zan`, `stdlib/Gui/Widget/Statistic.zan`, `stdlib/Gui/Widget/StatusBar.zan`, `stdlib/Gui/Widget/Steps.zan`, `stdlib/Gui/Widget/StyledText.zan`, `stdlib/Gui/Widget/Switch.zan`, `stdlib/Gui/Widget/Table.zan`, `stdlib/Gui/Widget/Tabs.zan`, `stdlib/Gui/Widget/Tag.zan`, `stdlib/Gui/Widget/TextArea.zan`, `stdlib/Gui/Widget/Timeline.zan`, `stdlib/Gui/Widget/ToolStrip.zan`, `stdlib/Gui/Widget/Tooltip.zan`, `stdlib/Gui/Widget/Transfer.zan`, `stdlib/Gui/Widget/TreeView.zan`, `stdlib/Gui/Widget/Typography.zan`, `stdlib/Gui/Widget/Upload.zan`, `stdlib/Gui/Widget/VirtualList.zan`, `stdlib/Gui/Widget/Watermark.zan`, `stdlib/Gui/Widget/Wizard.zan`
+> 源码: `packages/Zan.Gui.CodeEditor/src/Gui/Widget/CodeBlock.zan`, `stdlib/Gui/Widget/AlertBox.zan`, `stdlib/Gui/Widget/Avatar.zan`, `stdlib/Gui/Widget/Badge.zan`, `stdlib/Gui/Widget/BoxContent.zan`, `stdlib/Gui/Widget/Breadcrumb.zan`, `stdlib/Gui/Widget/Button.zan`, `stdlib/Gui/Widget/ButtonGroup.zan`, `stdlib/Gui/Widget/Calendar.zan`, `stdlib/Gui/Widget/Card.zan`, `stdlib/Gui/Widget/Carousel.zan`, `stdlib/Gui/Widget/Checkbox.zan`, `stdlib/Gui/Widget/ChoiceGroup.zan`, `stdlib/Gui/Widget/Collapse.zan`, `stdlib/Gui/Widget/ColorPicker.zan`, `stdlib/Gui/Widget/ContextMenu.zan`, `stdlib/Gui/Widget/Countdown.zan`, `stdlib/Gui/Widget/DatePicker.zan`, `stdlib/Gui/Widget/Divider.zan`, `stdlib/Gui/Widget/Dropdown.zan`, `stdlib/Gui/Widget/DynamicTags.zan`, `stdlib/Gui/Widget/Ellipsis.zan`, `stdlib/Gui/Widget/Empty.zan`, `stdlib/Gui/Widget/Flex.zan`, `stdlib/Gui/Widget/FloatButton.zan`, `stdlib/Gui/Widget/FormBuilder.zan`, `stdlib/Gui/Widget/FormField.zan`, `stdlib/Gui/Widget/FormGroup.zan`, `stdlib/Gui/Widget/Grid.zan`, `stdlib/Gui/Widget/GridItem.zan`, `stdlib/Gui/Widget/IconView.zan`, `stdlib/Gui/Widget/Image.zan`, `stdlib/Gui/Widget/Input.zan`, `stdlib/Gui/Widget/InputNumber.zan`, `stdlib/Gui/Widget/InputOtp.zan`, `stdlib/Gui/Widget/Label.zan`, `stdlib/Gui/Widget/Layer.zan`, `stdlib/Gui/Widget/ListItem.zan`, `stdlib/Gui/Widget/ListView.zan`, `stdlib/Gui/Widget/Marquee.zan`, `stdlib/Gui/Widget/Menu.zan`, `stdlib/Gui/Widget/NumberAnimation.zan`, `stdlib/Gui/Widget/PageHeader.zan`, `stdlib/Gui/Widget/Pagination.zan`, `stdlib/Gui/Widget/Panel.zan`, `stdlib/Gui/Widget/Popover.zan`, `stdlib/Gui/Widget/Progress.zan`, `stdlib/Gui/Widget/Prompt.zan`, `stdlib/Gui/Widget/QrCode.zan`, `stdlib/Gui/Widget/QrEncoder.zan`, `stdlib/Gui/Widget/Radio.zan`, `stdlib/Gui/Widget/Rate.zan`, `stdlib/Gui/Widget/Result.zan`, `stdlib/Gui/Widget/Ribbon.zan`, `stdlib/Gui/Widget/RichText.zan`, `stdlib/Gui/Widget/ScrollColumn.zan`, `stdlib/Gui/Widget/ScrollView.zan`, `stdlib/Gui/Widget/Scrollbar.zan`, `stdlib/Gui/Widget/SelectBox.zan`, `stdlib/Gui/Widget/Skeleton.zan`, `stdlib/Gui/Widget/Slider.zan`, `stdlib/Gui/Widget/Spin.zan`, `stdlib/Gui/Widget/Split.zan`, `stdlib/Gui/Widget/SplitPanel.zan`, `stdlib/Gui/Widget/Statistic.zan`, `stdlib/Gui/Widget/StatusBar.zan`, `stdlib/Gui/Widget/Steps.zan`, `stdlib/Gui/Widget/StyledText.zan`, `stdlib/Gui/Widget/Switch.zan`, `stdlib/Gui/Widget/Table.zan`, `stdlib/Gui/Widget/Tabs.zan`, `stdlib/Gui/Widget/Tag.zan`, `stdlib/Gui/Widget/TextArea.zan`, `stdlib/Gui/Widget/Timeline.zan`, `stdlib/Gui/Widget/ToolStrip.zan`, `stdlib/Gui/Widget/Tooltip.zan`, `stdlib/Gui/Widget/Transfer.zan`, `stdlib/Gui/Widget/TreeView.zan`, `stdlib/Gui/Widget/Typography.zan`, `stdlib/Gui/Widget/Upload.zan`, `stdlib/Gui/Widget/VirtualList.zan`, `stdlib/Gui/Widget/Watermark.zan`, `stdlib/Gui/Widget/Wizard.zan`
+
+
+## AlertBox (class)
+
+内联警告横幅。不可交互的语义提示条：左侧色条 + 语义图标 +
+一行文本，视觉复用 Layer 通知卡片的 `notification` 皮肤规则
+（info/success/warning/error 四个角色类），因此换肤可一次
+性重设所有横幅。
+
+AlertBox a = new AlertBox { Text = "已保存", type = 1 };
+
+设计器工具箱的「内联警告横幅」（FormField ftype 28）生成
+的就是本控件——此前画布用 Layer.DrawNotify 即时预览、生成
+代码却发射不存在的 `Alert` 类，发布即编译失败；本类型补上
+后设计承诺闭环（legacy 文档里的 kind "Alert" 由 TypeOf 与
+ControlFactory 双别名收编）。
+
+- Binding<string> Text;
+  - 横幅文本（Binding<string>，可响应式绑定模型字段）。
+
+- int typeNo;
+  - 语义类型在 type 枚举里的下标：0 info / 1 success /
+    2 warning / 3 error。Layer 通知类型 = 下标 + 2
+    （RoleClass：2 info / 3 success / 4 warning / 5 error）。
+
+- void InitAlertBox(string msg)
+  - 初始化：以横幅文本注册，默认 info 档。
+
+- AlertBox()
+  - 空文本横幅（设计器用）。
+
+- AlertBox(string msg)
+  - 给定文本的 info 横幅。
+
+- string Label()
+  - 当前文本；Text 为 null 时返回空串。
+
+- override void OnMeasure(App app)
+  - 覆写：首选高度与 Layer 通知卡片一致，宽度铺满父容器。
+
+- override void OnPaint(App app)
+  - 覆写：整幅委托 Layer.DrawNotify（与设计器画布预览、
+    运行期通知共用同一渲染器，所见即所得）。
+
+- override string Kind()
+  - 控件类型标识（序列化/设计器用）。
+
+- override List<PropSpec> Props()
+  - 覆写：返回设计器属性清单（文本 / 语义类型）。
 
 
 ## Avatar (class)
@@ -54,20 +103,12 @@ Avatar c = new Avatar { Text = "S", Size = 48, Shape = "square" };
   - 绘制：按直径在盒内居中画头像表面（Shape 映射圆角）与
     图标/首字母文本。
 
-- string Kind()
-  - 控件类型标识（序列化/设计器用）。
+- override string Kind()
+  - 控件类型标识（序列化/设计器用）。override 不能省：漏了
+    修饰符，注册表策略按覆写扫描就找不到自报标签。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（text/icon/size/shape/class）。
-
-- override string GetExtra(string key)
-  - shape prop 是枚举（string），通过 GetExtra/SetExtra 与
-    字符串字段 Shape 同步。PropSpec.Enum 驱动的是内部 num，
-    这里由 SetExtra 接住字符串后回写到 Shape。
-
-- override bool SetExtra(string key, string val)
-  - 设计器写入 `shape`（枚举字符串回写到 Shape 字段）；
-    其他键返回 false 交给基类。
+  - 覆写：返回设计器属性清单（text/icon/size/shape）。
 
 
 ## Badge (class)
@@ -263,6 +304,11 @@ StyleBox，`BoxContent` 在该盒子里绘制图标和标签，
   - 悬停说明，悬停稳定后显示在按钮下方。空
     表示无提示。
 
+- string TipSide;
+  - 提示气泡出现在按钮的哪一侧："bottom"（默认）、"top"、
+    "left"、"right"。窄条上的图标按钮（导航栏、工具条）
+    常用 "right"，气泡不会被窗口边缘截住。
+
 - int wid;
 
 - bool clicked;
@@ -406,6 +452,10 @@ StyleBox，`BoxContent` 在该盒子里绘制图标和标签，
   - 把 Click 路由到 Click UiEvent 字段（与 `btn.Click += h` 同一队列），
     而非基类的 `On` 事件集，使 JSON/设计器的 `onClick`
     处理器与代码处理器走同一通道并按序执行。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - override void OnMeasure(App app)
   - 首选尺寸由解析样式 + 内容得出，停靠/自动布局
@@ -720,7 +770,7 @@ cal.RenderInside(app, new Rect(20, 60, 560, 300));
   - 控件类型标识（序列化/设计器用）。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（text/mode/class）。
+  - 覆写：返回设计器属性清单（text/mode）。
 
 - override string GetExtra(string key)
   - 设计器读取选中日期（"text"/"value" 同键，YYYY-MM-DD；未选返回 ""）。
@@ -735,6 +785,10 @@ cal.RenderInside(app, new Rect(20, 60, 560, 300));
 - override void BindEvent(string evt, Action a)
   - 覆写："Change"/"PanelChange" 挂各自 UiEvent，其余按名称走
     通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - override void OnMeasure(App app)
   - 覆写：按模式量首选尺寸——面板模式紧凑，月历默认 600x340
@@ -821,7 +875,7 @@ panel 模式渲染成日号下方一枚色点。tone：0 primary，1 info，
   - 保留模式容器：`Card c = new Card("Profile"); c.Add(child);`
 
 - Card():this("")
-  - 无标题卡片：设计器与 `.zform` 生成的代码用 `new Card()`
+  - 无标题卡片：设计器与设计稿生成的代码用 `new Card()`
     建字段，没有这个构造函数就没有任何构造函数会跑，
     卡片的 children 还是 null，第一次 Add 就崩。
 
@@ -1011,7 +1065,7 @@ panel 模式渲染成日号下方一枚色点。tone：0 primary，1 info，
 
 - override List<PropSpec> Props()
   - 覆写：返回设计器属性清单（slides/index/autoplay/interval/
-    dotPlacement/direction/class）。
+    dotPlacement/direction）。
 
 - override string GetExtra(string key)
   - 幻灯片是列表，因此以逗号分隔的值序列化
@@ -1025,6 +1079,10 @@ panel 模式渲染成日号下方一枚色点。tone：0 primary，1 info，
 
 - override void BindEvent(string evt, Action a)
   - 覆写："Change" 挂 Change 事件，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 
 ## CarouselAnim (class)
@@ -1116,7 +1174,7 @@ agree.Render(app, x, y);
   - 初始化：标题与勾选信号（默认非半选）。
 
 - Checkbox()
-  - Default constructor used by .zform and the string-kind registry.
+  - Default constructor used by design docs and the string-kind registry.
 
 - Checkbox(string lbl)
   - 保留模式构造函数：`Checkbox agree = new Checkbox("I agree");`
@@ -1127,7 +1185,7 @@ agree.Render(app, x, y);
 - string Str()
   - 当前显示的标题。唯一的标题通道就是 `label` 字段：
     `Props()` 把它以活绑定暴露给 GetProp/SetProp（设计器、
-    zform 宿主与运行期 SetProp("label"/"text") 全部同路）。
+    设计稿宿主与运行期 SetProp("label"/"text") 全部同路）。
     曾经这里有一个优先于 label 的 `text` 常量绑定，结果是
     运行期改 label 字段后渲染仍读旧常量——发布/项目配置
     对话框里所有复选框标签因此消失，教训：标题只留一条通道。
@@ -1157,6 +1215,11 @@ agree.Render(app, x, y);
     主题的控件高度）。停靠成一列的复选框行高由容器决定，
     用主题高度画会让方框和点击区溢出到下一行上。
 
+- void Toggle()
+  - 模拟一次用户切换（无头测试/仿真也走这条）：翻转选中态、触发
+    Change，并经 weak parent 向容器冒泡（Control.OnChildEvent）。
+    程序化静默改值用 SetChecked。
+
 - override List<string> Events()
   - 覆写：公共事件之外提供 "Change" 与 "Toggle"。
 
@@ -1168,6 +1231,10 @@ agree.Render(app, x, y);
 
 - override void BindEvent(string evt, Action a)
   - 覆写："Change"/"Toggle" 都挂 Change 事件，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - int PaintStyled(App app, int id, int x, int y, int h, string text, bool checked)
   - 同三参版本，非半选。
@@ -1210,7 +1277,11 @@ agree.Render(app, x, y);
   - 构造空组。
 
 - override Control MakeItem(int index, string text)
-  - 覆写：为选项造一个真实 Checkbox，其切换冒泡为组级 Change。
+  - 覆写：为选项造一个真实 Checkbox，其切换经 OnChildEvent 冒泡为
+    组级 Change（不挂捕获组的闭包——引用环，逐项泄漏）。
+
+- override void OnChildEvent(Control child, string evt)
+  - 子复选框用户切换冒泡（Control.OnChildEvent）：触发组级 Change。
 
 - bool IsChecked(int index)
   - 第 index 个选项的勾选状态；越界或该项不是复选框时返回 false。
@@ -1227,6 +1298,10 @@ agree.Render(app, x, y);
 
 - override void BindEvent(string evt, Action a)
   - 覆写："Change"/"Toggle" 都挂组事件，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - override List<string> Events()
   - 覆写：公共事件之外提供 "Change"。
@@ -1309,7 +1384,7 @@ agree.Render(app, x, y);
   - 供子类实现：为第 index 个选项构造单个选择控件。
 
 - virtual string OptionsText()
-  - 选项以 `a|b|c` 字符串表示（设计器 / .zform 属性往返）；
+  - 选项以 `a|b|c` 字符串表示（设计器 / 设计文档属性往返）；
     子类可扩展语法（RadioGroup 的 `!` 后缀 = 禁用位）。
 
 - int Count()
@@ -1338,13 +1413,6 @@ agree.Render(app, x, y);
 - override void SetProp(string key, string val)
   - 覆写：写入 `options` 先清后建（面板可反复编辑，追加语义
     只属于构造期的 SetOptionsText 直调）；其余键交基类。
-
-- override string GetExtra(string key)
-  - 设计器读取 `options`（"A|B|C" 文本）；其余键返回 ""。
-
-- override bool SetExtra(string key, string val)
-  - 设计器写入 `options`（"A|B|C" 逐项追加）；其他键返回 false
-    交给基类。
 
 - override List<PropSpec> Props()
   - 覆写：返回设计器属性清单（columns/rowHeight）。
@@ -1498,13 +1566,17 @@ cb.RenderInside(app, rect);
   - 控件类型标识（序列化/设计器用）。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（caption/copyLabel/class）。
+  - 覆写：返回设计器属性清单（caption/copyLabel）。
 
 - override List<string> Events()
   - 覆写：公共事件之外提供 "Copy"。
 
 - override void BindEvent(string evt, Action a)
   - 覆写："Copy" 挂 Copy 事件，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 
 ## Collapse (class)
@@ -1584,7 +1656,7 @@ c.Active = vm.openPanel;
   - 控件类型标识（序列化/设计器用）。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（标题 / 正文 / 展开项 / 箭头位置 / 多开 / 类）。
+  - 覆写：返回设计器属性清单（标题 / 正文 / 展开项 / 箭头位置 / 多开）。
 
 - override string GetExtra(string key)
   - 设计器额外键：`titles`/`bodies` 以逗号分隔文本与面板列表
@@ -1598,6 +1670,10 @@ c.Active = vm.openPanel;
 
 - override void BindEvent(string evt, Action a)
   - 覆写："Change" 挂 Change 事件，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 
 ## CollapsePanel (class)
@@ -1748,6 +1824,9 @@ RgbOf / AlphaOf（App.LerpColor 同款符号安全写法），禁止裸除。
 - static string Hex2(int b)
   - 字节 → 两位大写十六进制文本。
 
+- static int HexByte(int c)
+  - 单个十六进制 ASCII 字节 → 0..15（非法返回 -1；大小写均接受）。
+
 - static int HexDigit(string ch)
   - 单个十六进制字符 → 0..15（非法返回 -1；大小写均接受）。
 
@@ -1852,17 +1931,30 @@ RgbOf / AlphaOf（App.LerpColor 同款符号安全写法），禁止裸除。
 - override List<PropSpec> Props()
   - 设计器属性表：showAlpha 开关与 mode 取值格式枚举。
 
+- override string GetProp(string key)
+  - 覆写：showAlpha 截写走 SetShowAlpha（关闭时重置 alpha=255，
+    spec 直绑字段丢这一副作用——管线开关后 alpha 残留实测）；mode
+    应答归一化名（原 GetExtra 臂语义，ModeName 校验 + 默认 rgb）。
+
+- override void SetProp(string key, string val)
+
 - override string GetExtra(string key)
-  - 设计器读取扩展属性：value/color 返回当前取值文本，showAlpha/mode 返回同名设置。
+  - 设计器读取扩展属性：value/color 无 spec（extra-only），返回
+    当前取值文本；showAlpha/mode 走上面的 GetProp 覆写。
 
 - override bool SetExtra(string key, string val)
-  - 设计器写入扩展属性：showAlpha/mode/value/color/text；未知键返回 false。
+  - 设计器写入扩展属性：value/color/text（extra-only）；未知键
+    返回 false。
 
 - override List<string> Events()
   - 设计器事件列表：通用事件之外提供 "Change"。
 
 - override void BindEvent(string evt, Action a)
   - 设计器事件绑定："Change" 订阅 Change，其余事件走通用 On。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - void SetText(string value)
   - 从文本赋值（designer / 程序化）："#RRGGBB[AA]" 与
@@ -2095,6 +2187,10 @@ cd.Finish += () => { label.Text = "Done"; };
 - override void BindEvent(string evt, Action a)
   - 设计器/反射绑定：按事件名挂回调。
 
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
+
 
 ## DatePicker (class)
 
@@ -2172,6 +2268,9 @@ hour/minute 字段，结束时间为 endHour/endMinute）
   - Naive UI type prop：date | datetime | daterange | datetimerange |
     week | month | monthrange | quarter | quarterrange | year | yearrange。
 
+- List<DateShortcut> shortcuts;
+  - 快捷选项配置列表（为空时不显示侧边栏；由配置项动态驱动）。
+
 - Binding<string> Size;
   - Naive UI size prop：small | medium | large。Binding<string>
     映射为 input.small/large 档位 class，支持响应式换档。
@@ -2196,16 +2295,29 @@ hour/minute 字段，结束时间为 endHour/endMinute）
   - 覆写：返回设计器属性清单（日期文本 / 类型 / 尺寸档）。
 
 - override string GetExtra(string key)
-  - 覆写：应答扩展属性键（日期文本与 type）。
+  - 覆写：应答扩展属性键（日期文本、type 与 shortcuts 配置）。
 
 - override bool SetExtra(string key, string val)
-  - 覆写：写回扩展属性键（文本经 SetText 解析，type 合法值切换粒度）。
+  - 覆写：写回扩展属性键（文本经 SetText 解析，type 合法值切换粒度，shortcuts 配置快捷项）。
+
+- DatePicker ClearShortcuts()
+  - 清空快捷选项。
+
+- DatePicker AddShortcut(string label, int startOffset, int endOffset)
+  - 增加一项快捷选项（相对今天的天数偏移，0=今天，-1=昨天）。
+
+- DatePicker UseDefaultShortcuts()
+  - 一键配置常用电商/广告报表标准快捷选项（今天、昨天、过去7/14/15/30/60/90天）。
 
 - override List<string> Events()
   - 覆写：公共事件之外提供 "Change"。
 
 - override void BindEvent(string evt, Action a)
   - 覆写："Change" 挂 Change 事件，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - DatePicker OnChange(Action a)
   - 挂接 Change 回调（链式）。
@@ -2320,6 +2432,12 @@ hour/minute 字段，结束时间为 endHour/endMinute）
 - override void OnPaintOverlay(App app)
   - 覆写：展开且归属本实例时绘制日历/时间弹层（Naive UI 各 type 面板）。
 
+- void ApplyShortcut(DateShortcut sc)
+  - 快捷区间点选应用：按配置的相对今天偏移计算起止日期。
+
+- void ApplyShortcutIndex(int index)
+  - 按索引应用已配置的快捷选项（供程序化触发与测试）。
+
 - DateTime HoverDay(App app, int panelX, int top, int pad, int cellW, int cellH, int year, int month)
   - 扫描一个月的日期网格，返回鼠标悬停到的日期（无则 null）。
     仅供区间预览在绘制前整帧调用一次。
@@ -2347,6 +2465,19 @@ hour/minute 字段，结束时间为 endHour/endMinute）
   - 绘制一组 "HH:MM" 数字（三段按文本宽度排布，整体居中于
     gx 起的槽内）；点击命中返回 1=小时、2=分钟，由调用方对
     相应字段做递增循环。
+
+
+## DateShortcut (class)
+
+日期选择器的快捷选项定义（相对今天的天数偏移，0=今天，-1=昨天）。
+
+- string label;
+
+- int startOffset;
+
+- int endOffset;
+
+- DateShortcut(string label, int startOffset, int endOffset)
 
 
 ## Divider (class)
@@ -2487,6 +2618,11 @@ parent.Add(pick);           // 尺寸和位置由布局决定
 - void InitDropdown()
   - 公共初始化（构造共用）。
 
+- Dropdown()
+  - 零参构造：设计器放置的 kind 走 GenForm 缺省类型实参
+    （`new Dropdown<string>()`），拿不出条目转换器；工具箱与
+    ControlFactory 的可构造契约要求这个形态存在。
+
 - Dropdown(CellOf<T> text)
   - 文本条目：`new Dropdown<City>(c => c.name)`。
 
@@ -2576,6 +2712,13 @@ parent.Add(pick);           // 尺寸和位置由布局决定
   - flat 模式把实体列表转成菜单条目（action = 行号）。每帧重建：
     数据是调用方的，绑定后原地修改也要在下一帧生效。
 
+- override string GetExtra(string key)
+  - 选项以 `a|b|c` 文本表示（设计器 / 设计文档属性往返）。
+    设计稿放置的下拉没有实体访问器，选项直接落菜单模式。
+
+- override bool SetExtra(string key, string val)
+  - "a|b|c" 文本 → 菜单条目（SetExtra 反序列化；清除选中）。
+
 - override void OnPaintOverlay(App app)
   - 延迟面板：交给共享富菜单（图标/分隔线/子菜单/滚动条）在
     覆盖层阶段绘制与分发。面板不窄于触发器。
@@ -2587,6 +2730,10 @@ parent.Add(pick);           // 尺寸和位置由布局决定
   - 把下拉框的语义事件（Change/Opened/Closed）路由到对应
     UiEvent 字段；其余回落到 `On` 上的通用事件包
     （其 AddByName 忽略未知名称）。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 
 ## DropdownChrome (class)
@@ -2748,11 +2895,11 @@ tag.add                                     尾部触发器
 
 - override List<PropSpec> Props()
   - 覆写：返回设计器属性清单（closable/max/addText/placeholder/
-    size/class）。
+    size）。
 
 - override string GetExtra(string key)
   - 标签集合按 `|` 分隔的原样文本回读（Tabs.SetItemsText 同款），
-    供设计器与 .zform 序列化。
+    供设计器与设计文档序列化。
 
 - override bool SetExtra(string key, string val)
   - 设计器写入 `options`（`|` 分隔标签文本），整体重建标签；
@@ -2763,6 +2910,10 @@ tag.add                                     尾部触发器
 
 - override void BindEvent(string evt, Action a)
   - 覆写："Change" 挂 Change 事件，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - override void OnMeasure(App app)
   - 覆写：按尺寸档映射 Class 后量取行高与自然行宽。
@@ -3097,7 +3248,7 @@ if (Ui.Clicked(app, id)) { ... }
   - 控件类型标识（序列化/设计器用）。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（icon/size/class）。
+  - 覆写：返回设计器属性清单（icon/size）。
 
 - override List<string> Events()
   - 覆写：公共事件之外提供 "Click"。
@@ -3105,10 +3256,14 @@ if (Ui.Clicked(app, id)) { ... }
 - override void BindEvent(string evt, Action a)
   - 覆写："Click" 挂 Click 事件，其余按名称走通用路由。
 
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
+
 
 ## FormBuilder (class)
 
-统一的 .zform -> 真控件树构建器。设计器预览与运行时窗口
+统一的设计文档 -> 真控件树构建器。设计器预览与运行时窗口
 共用这一套：把设计文档（Designer.SaveJson / formgen 消费的同一 JSON）
 实例化为真正的 Control 树，按 24 列流式或自由画布布局排布。
 
@@ -3252,7 +3407,7 @@ Navigation: 34 steps      35 breadcrumb   36 tabs      37 pagination
 
 - bool compRef;
   - 该字段是一个「已保存用户组件」的引用节点（而非项目源码
-    类）：.zform 里写成 {"kind":名,"ref":名,...}，组件设计
+    类）：设计文档里写成 {"kind":名,"ref":名,...}，组件设计
     的每次进化自动跟随所有实例；GenForm 编译期按 ref 展开
     组件文档，画布上按组件文档做真控件预览。
 
@@ -3335,6 +3490,14 @@ Navigation: 34 steps      35 breadcrumb   36 tabs      37 pagination
     对应运行时 Tabs 的 orient 属性）。序列化为
     "orient": "horizontal"/"vertical"，纵向时画布与生成
     代码都让子级让出左侧轨道。
+
+- string styleText;
+  - 字段内联 CSS 声明文本（与元素 style 属性同一语义与优先级：
+    "color:#c00; padding:8px"）。设计文档存 "style" 键（.html
+    设计稿里就是元素的 style 属性），画布预览与生成代码经
+    SetProp("style") 走 StyleSheet.ApplyInline 通道落地。
+    名字不叫 Style：与 Gui.Style 类名撞，方法体里裸写 Style.Part
+    会被这个字段抢走解析。
 
 - JsonValue extra;
   - 设计器未建模的字段键原样保留(DataGrid 的 "of"/"columns"、
@@ -3446,7 +3609,7 @@ Navigation: 34 steps      35 breadcrumb   36 tabs      37 pagination
   - 用于默认模型名称的短类型键，如 "input"、"select"。
 
 - static int TypeForKey(string key)
-  - TypeKey 的逆运算：由规范字符串类型（即 .zform 的
+  - TypeKey 的逆运算：由规范字符串类型（即设计文档的
     `kind` 字段中所写）求 ftype。"custom" -> 100；未知 -> 0（input）。
 
 - static int MaxType()
@@ -3515,6 +3678,13 @@ Navigation: 34 steps      35 breadcrumb   36 tabs      37 pagination
   - 通过重建列表来移除一个选项（运行时的列表中段
     RemoveAt 与列表中段 Insert 一样可能破坏堆）。
 
+- void SetOptionAt(int i, string s)
+  - 原地改写第 i 个选项（设计器弹窗行编辑用）。
+
+- void MoveOption(int from, int to)
+  - 把 from 处的选项移动到 to（同为越界安全的中段移动，
+    通过重建列表完成）。
+
 - string JoinOptions()
   - 选项列表 → "a|b|c" 文本（GetExtra 序列化用）。
 
@@ -3522,12 +3692,12 @@ Navigation: 34 steps      35 breadcrumb   36 tabs      37 pagination
   - "a|b|c" 文本 → 选项列表（SetExtra 反序列化用）。
 
 - string KindName()
-  - Canonical .zform kind for this field. Custom fields retain the
+  - Canonical design-doc kind for this field. Custom fields retain the
     discovered class name directly; built-ins use their real widget kind.
 
 - static string KindForType(int ft)
   - The single source of truth for "which widget class does this field
-    become": the designer writes it into `kind`, the .zform generator
+    become": the designer writes it into `kind`, the design-doc generator
     declares it as the field's type, and TypeForKey reads it back. Every
     built-in type maps to a real Control with a parameterless constructor,
     so a design can never generate code that names a type that does not
@@ -3540,7 +3710,7 @@ Navigation: 34 steps      35 breadcrumb   36 tabs      37 pagination
 
 - override List<PropSpec> Props()
   - 覆写：返回设计器属性清单（label/fname/placeholder/required/
-    wrap/defOn/class/span/dock/customKind/options，部分按类型给）。
+    wrap/defOn/span/dock/customKind/options，部分按类型给）。
 
 - override string GetExtra(string key)
   - 选项列表存为文本，逗号分隔的每项即一个选项。
@@ -4030,7 +4200,19 @@ img.Error += () => img.Reload();
     base64 位图解码进内存注册表。
 
 - void ResolveUrl(App app, string src)
-  - http(s) URL：内存缓存命中直接用，否则交 ImageHttp 后台取回。
+  - http(s) URL：内存缓存命中直接用，否则交远端取回通道后台
+    取回（Gui.ImageHttp 经 SetUrlFetcher 注册）。未安装时远端图
+    直接进失败态——桌面程序极少用 http 源，网络栈整个不进编译图。
+
+- delegate void
+  - 远端取回通道槽：Gui.ImageHttp.Install() 注册 Fetch（后台
+    线程取回、经 App.Post 封送回 UI 线程调 OnFetched 等回调）。
+
+- UrlFetchFn(App app, Image img, string src, string key);
+
+- static UrlFetchFn urlFetcher;
+
+- static void SetUrlFetcher(UrlFetchFn fn)
 
 - void RasterSvg(int boxW, int boxH)
   - 把 SVG 源光栅化到 imgKey。boxW/boxH > 0 时按盒子尺寸光栅
@@ -4081,6 +4263,10 @@ img.Error += () => img.Reload();
 
 - override void BindEvent(string evt, Action a)
   - 覆写："Loaded"/"Error" 各挂对应 UiEvent，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - override string GetExtra(string key)
   - 设计器额外键：`fit` 收发 contain/cover/fill/none。
@@ -4379,6 +4565,10 @@ Delete、Left/Right/Home/End），就地编辑绑定的 SignalString，并将
   - 将输入框自身的语义事件（Change/Submit）路由到对应的 UiEvent
     字段；其余事件落入 `On` 上的通用事件包。
 
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
+
 - override void OnMeasure(App app)
   - 覆写：按尺寸档解析样式，高取样式行高，宽缺省 220。
 
@@ -4618,17 +4808,34 @@ format/parse，设了 format 通常就要设 parse）；
   - 覆写：返回设计器属性清单（值 / 尺寸档 / 前后缀 / 按钮位置）；
     设计期常量键（min/max/step 等）经 GetExtra/SetExtra 应答。
 
+- override string GetProp(string key)
+  - 覆写：value/text 应答 DisplayText（格式化取值文本，原 GetExtra
+    臂语义），precision 应答钳位后的 Decimals（spec 读裸 Precision）。
+
+- override void SetProp(string key, string val)
+  - 覆写：value/text 截写走 ParseScaled（"2,300" 千分位与按
+    precision 缩放的展示文本都能进模型，spec 裸 Convert 只认纯
+    整数），再经 SetRaw 收口钳制/校验/事件。
+
 - override string GetExtra(string key)
-  - 覆写：应答扩展属性键（值显示文本与 min/max/step/precision 等设计期常量）。
+  - 覆写：应答扩展属性键。loading 无 spec（extra-only），是这里
+    的唯一存留键；value/precision 等走上面的 GetProp 覆写，其余
+    键（min/max/step/hint/group/prefix/suffix/placement）spec 活
+    绑字段，管线直读。
 
 - override bool SetExtra(string key, string val)
-  - 覆写：写回扩展属性键（值经解析换算写入，其余常量直写）。
+  - 覆写：写回扩展属性键。loading（extra-only）之外全部交
+    SetProp 管线；未知键返回 false。
 
 - override List<string> Events()
   - 覆写：公共事件之外提供 "Change"、"Submit" 与 "Invalid"。
 
 - override void BindEvent(string evt, Action a)
   - 覆写：三个语义事件挂对应 UiEvent，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - override void OnMeasure(App app)
   - 覆写：按尺寸档解析 input 样式，高取样式行高，宽缺省 140。
@@ -4857,6 +5064,10 @@ code.Render(app, 40, 40, 320, 40);
 
 - override void BindEvent(string evt, Action a)
   - 覆写：两个语义事件挂对应 UiEvent，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - override void OnMeasure(App app)
   - 覆写：宽 = 格宽 x 格数 + 间距与分隔符，高 = 单元格边长（按尺寸档）。
@@ -5110,6 +5321,9 @@ l.Text = vm.status;                // 绑定，每帧重读
 - static int Entrance(App app, LayerState s)
   - layer 打开以来的入场进度（千分比）；仍在缓入时
     会重新启动动画计时。
+
+- static int EntranceDy(App app, LayerState s)
+  - 入场动画当前的竖直上移量（px）：外框（RenderWindow）画的时候把窗口 y 上移这么多，宿主自绘正文的窗口（设计器大编辑器）必须用同一偏移定位正文，否则入场那 180ms 只有外框在动、内容停在终点不动。
 
 - static int ExitMs()
   - 出场动画时长（layui isOutAnim ~300ms 的量级）。
@@ -5460,7 +5674,7 @@ d => new ListItem(d.title, d.desc));
   - 覆写：按内边距缩进画标题/副标题，超宽省略号截断。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（text/desc/selected/class）。
+  - 覆写：返回设计器属性清单（text/desc/selected）。
 
 
 ## ListView (class)
@@ -5536,6 +5750,13 @@ feed.Bind(model.inbox);
 
 - int rowHitCount;
 
+- List<RowDragOut> dragOut;
+  - 拖出行手势（OnDragOut）的订阅者，与按下那一刻记住的行下标
+    （-1 = 当前按下的不是行）。指针拖到列表外时命中测试已经
+    没有行可归属，下标只能在按下那一帧记下。
+
+- int dragOutFrom;
+
 - static int RowIdReserve()
   - 模板行独占的 id 段长度：够放几百行、每行十来个控件。
 
@@ -5565,11 +5786,11 @@ feed.Bind(model.inbox);
   - 自定义行：模板构建每行的控件子树。
 
 - ListView<T> WithColumns(List <ListColumn<T>> columns)
-  - 声明式构造后再给列（`.zform` 里声明的列表用默认构造函数，
+  - 声明式构造后再给列（设计稿里声明的列表用默认构造函数，
     列在代码里补上：列标题多是本地化文本，属于代码而非设计）。
 
 - ListView<T> WithRow(RowOf<T> row)
-  - 声明式构造后再给行模板（`.zform` 里声明的列表用
+  - 声明式构造后再给行模板（设计稿里声明的列表用
     默认构造函数，行模板在代码里补上）。
 
 - override string Kind()
@@ -5642,6 +5863,12 @@ feed.Bind(model.inbox);
 - ListView<T> OnContext(Action a)
   - 某行被右键点击时回调。
 
+- ListView<T> OnDragOut(RowDragOut a)
+  - 订阅「行被拖出列表」手势：在某行上按下、拖到列表矩形之外
+    松开时回调该行下标。列表只识别手势并报告下标，是否开窗、
+    开成什么窗口由宿主决定；在列表矩形内松开不算数（那次手势
+    仍归滚动/选择），右键与长按菜单不受影响。
+
 - ListView<T> EmptyText(string text)
   - 列表为空时显示的文本。
 
@@ -5671,9 +5898,14 @@ feed.Bind(model.inbox);
     的 EnsureIds），数据超出块长时整块换新——按倍数增长，持续追加
     的信息流不至于每来一条就换一遍所有行的 id。
 
-- int RowInteract(App app, int index, int x, int y, int w, int h)
+- void DragOutTick(App app)
   - 处理某行矩形的选择 / 激活 / 右键菜单。返回其注册的 id，
     调用方可据此绘制 hover 状态。
+    每帧一次的「拖出行」判定（OnPaint 顶部调用）：按下帧记下行
+    下标，松开帧若指针已在列表矩形之外则回调。下标只在按下帧
+    认，因为拖到窗口外时命中测试里已经没有行可归属。
+
+- int RowInteract(App app, int index, int x, int y, int w, int h)
 
 - void NoteSelfDamage(App app)
   - 选中一行只改变列表自己的像素，因此把损伤限定在控件矩形
@@ -5720,6 +5952,10 @@ feed.Bind(model.inbox);
     UiEvent 字段；其余事件落入 `On` 上的通用事件包
     （其 AddByName 忽略不认识的名称，因此 JSON/设计器中的 `onSelect`
     处理器不会静默地永远不执行）。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 
 ## Marquee (class)
@@ -5799,7 +6035,7 @@ mq.Animate(Gallery.demoMarquee);
   - 控件类型标识（序列化/设计器用）。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（text/speed/autoFill/class）。
+  - 覆写：返回设计器属性清单（text/speed/autoFill）。
 
 
 ## MarqueeAnim (class)
@@ -6095,13 +6331,17 @@ ru.Separator = " ";  ru.Decimal = ",";   // -> "699 700,699"
 
 - override List<PropSpec> Props()
   - 覆写：返回设计器属性清单（to/from/duration/active/precision/
-    separator/decimal/prefix/suffix/class）。
+    separator/decimal/prefix/suffix）。
 
 - override List<string> Events()
   - 覆写：公共事件之外提供 "Finish"。
 
 - override void BindEvent(string evt, Action a)
   - 覆写："Finish" 挂 Finish 事件，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 
 ## PageHeader (class)
@@ -6161,7 +6401,7 @@ h.Back.On(vm.GoBack);
   - 控件类型标识（序列化/设计器用）。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（text/subtitle/icon/class）。
+  - 覆写：返回设计器属性清单（text/subtitle/icon）。
 
 - override List<string> Events()
   - 覆写：公共事件之外提供 "Back"。
@@ -6170,6 +6410,10 @@ h.Back.On(vm.GoBack);
   - 将返回箭头的 Back 路由到其 UiEvent 字段；其余事件
     落入 `On` 上的通用事件包（其 AddByName 忽略它
     不认识的名称）。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 
 ## Pagination (class)
@@ -6522,7 +6766,7 @@ pg.RenderAt(app, x, y);
 - override List<PropSpec> Props()
   - 覆写：返回设计器属性清单（total/page/itemCount/pageSize/
     pageSizes/showTotal/jumper/prefix/suffix/prevText/nextText/
-    pagerCount/class）。
+    pagerCount）。
 
 - override string GetExtra(string key)
   - 设计器读取 sizes 候选、段顺序与跳页文案四个文档键；
@@ -6546,6 +6790,10 @@ pg.RenderAt(app, x, y);
 - override void BindEvent(string evt, Action a)
   - 覆写："Change"/"SizeChange"（别名 "SizeChanged"）各挂对应
     UiEvent，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 
 ## Panel (class)
@@ -6650,6 +6898,12 @@ box.RenderInside(app, rect);
 - override int StylePadT()
   - 标题行是面板自身的装饰：样式表 `padding` 只能叠加，
     绝不能把内容框顶回标题下面（与 Card 同一约定）。
+    
+    `padSet`（显式 `Pad()`/`Padding()`）优先，与基类的
+    `StylePadL/R/B` 一致：皮肤里写了 `padding` 的类一旦套在调过
+    `Padding(top, …)` 的面板上，顶部内边距就会被皮肤清零——实测
+    排行榜页的左面板顶被吃掉 3 设备、整个面板上移，而左右内边距
+    却正常，就是这么来的。
 
 - Rect Inner()
   - 该面板表面给子控件留下的内容矩形，
@@ -6728,23 +6982,6 @@ pop.Render(app, x, y, w, h);
 
 ## Progress (class)
 
-进度指示器（Naive UI Progress 的完整形状集）。类型
-default(1)/info(2)/success(3)/warning(4)/error(5) 选配色；
-形状有四种：线性轨道条（默认）、圆环 `Ring()`、多圆环
-`Multi()`（`AddCircle` 逐环加值）、仪表盘 `Dashboard()`
-（下方留缺口的 270° 弧）。
-
-其余能力对齐 Naive UI：`showIndicator` 百分比文本、
-`strokeWidth` 轨道高度 / 圆环厚度、`processing` 处理中
-滚动斜纹、`FillColor`/`RailColor` 覆盖皮肤颜色
-（color / rail-color）、`Format` 自定义指示文本模板、
-`Size` 圆环直径。
-
-new Progress(66, 3)                          // 绿色线性条
-new Progress(72, 0).Ring()                   // 圆环
-new Progress(0, 0).Multi().AddCircle(72, 0).AddCircle(45, 2)
-new Progress(60, 0).Dashboard().Processing(true)
-
 - int percent;
   - 未绑定 data 时的本地百分比（绘制时钳到 0..100）。
 
@@ -6780,11 +7017,9 @@ new Progress(60, 0).Dashboard().Processing(true)
 - int ringSize;
   - 圆环直径（CSS px，ring/multi/dashboard）。0 = 跟随布局与皮肤。
 
-- List<int> circlePcts;
+- List<ProgressRing> rings;
   - 多圆环各环的百分比与颜色变体。`AddCircle` 填充；设计器 /
-    .zform 经 `circles` 额外属性按 `"72:0,45:2"` 原样回填。
-
-- List<int> circleTypes;
+    设计文档经 `circles` 额外属性按 `"72:0,45:2"` 原样回填。
 
 - void InitProgress(int pct, int pt)
   - 初始化：置百分比/变体并清零其余字段（条形、显示指示文本）。
@@ -6845,6 +7080,14 @@ new Progress(60, 0).Dashboard().Processing(true)
 
 - string VariantClass()
   - 当前实例变体对应的皮肤类。
+
+- string PartCls()
+  - 部件选择器（`::track`/`::fill`/`::label`/`::ring-label`）用的类串：
+    控件自己的类 + 变体类，两者都能命中——`.el-bar::track` 与
+    `progress.info::fill` 各按各的写。Checkbox 一直把 `Class` 交给部件
+    解析（`.st-check::box` 就是这么生效的），Progress 原来只传变体类，
+    于是给条挂了用户类后 `::track` 选不中、轨道色悄悄退回皮肤默认
+    （实测：五行修炼页的空槽按原版取 #171e29，渲染出来还是主题灰）。
 
 - override List<PropSpec> Props()
   - 覆写：返回设计器属性清单（percent/type/shape/showIndicator/
@@ -6909,6 +7152,33 @@ new Progress(60, 0).Dashboard().Processing(true)
 - static bool RectOnScreen(App app, int x, int y, int w, int h)
   - 矩形与窗口表面重叠时返回 true；处理中斜纹只在
     真正可见时驱动重绘，屏幕外不空转。
+
+
+## ProgressRing (class)
+
+进度指示器（Naive UI Progress 的完整形状集）。类型
+default(1)/info(2)/success(3)/warning(4)/error(5) 选配色；
+形状有四种：线性轨道条（默认）、圆环 `Ring()`、多圆环
+`Multi()`（`AddCircle` 逐环加值）、仪表盘 `Dashboard()`
+（下方留缺口的 270° 弧）。
+
+其余能力对齐 Naive UI：`showIndicator` 百分比文本、
+`strokeWidth` 轨道高度 / 圆环厚度、`processing` 处理中
+滚动斜纹、`FillColor`/`RailColor` 覆盖皮肤颜色
+（color / rail-color）、`Format` 自定义指示文本模板、
+`Size` 圆环直径。
+
+new Progress(66, 3)                          // 绿色线性条
+new Progress(72, 0).Ring()                   // 圆环
+new Progress(0, 0).Multi().AddCircle(72, 0).AddCircle(45, 2)
+new Progress(60, 0).Dashboard().Processing(true)
+多圆环单个环的聚合实体（百分比 + 颜色变体），保证数据一致性。
+
+- public int percent;
+
+- public int ringType;
+
+- public ProgressRing(int percent, int ringType)
 
 
 ## Prompt (class)
@@ -7008,6 +7278,10 @@ width）；显式属性值 0 = 交给 CSS。编码结果按 (Text,Ecl,Logo)
 - override void BindEvent(string evt, Action a)
   - 覆写："Change" 挂 Change 事件，其余按名称走通用路由。
 
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
+
 - override void OnMeasure(App app)
   - 覆写：按模块数与盒宽量出正方形首选尺寸。
 
@@ -7077,6 +7351,180 @@ width）；显式属性值 0 = 交给 CSS。编码结果按 (Text,Ecl,Logo)
   - 写一个 PNG 分块（长度/类型/数据/CRC），返回新偏移。
 
 
+## QrEncoder (class)
+
+纯 Zan 的 QR Code（模型 1-40）编码器，ISO/IEC 18004：
+
+- 输入按 Unicode 码点分成 Numeric / Alphanumeric / Byte(UTF-8) 游程
+混合编码（中文等多字节字符原样按 UTF-8 字节进 Byte 段，与系统
+码页无关）；短游程（<=8 字符）折回 Byte，省模式切换开销。
+- 自动选最小版本；L/M/Q/H 四级纠错（GF(256) Reed-Solomon，分块交织）。
+- 八个掩码全试、按标准罚分四条选优；格式信息 BCH(15,5)、
+v>=7 版本信息 BCH(18,6)。
+- 超容量抛 Exception（与 stdlib 异常约定一致）。
+
+`Encode(text, ecl)` 返回 `QrMatrix`。渲染/导出在 Gui.Widget.QrCode。
+
+- static int[]EC_PER_BLOCK_L=new int[]{ -1, 7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28, 28, 28, 30, 30, 26, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30};
+
+- static int[]EC_PER_BLOCK_M=new int[]{ -1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28};
+
+- static int[]EC_PER_BLOCK_Q=new int[]{ -1, 13, 22, 18, 26, 18, 24, 18, 22, 20, 24, 28, 26, 24, 20, 30, 24, 28, 28, 26, 30, 28, 30, 30, 30, 30, 28, 30, 30, 37, 34, 28, 30, 31, 24, 37, 32, 29, 37, 34, 31};
+
+- static int[]EC_PER_BLOCK_H=new int[]{ -1, 17, 28, 22, 16, 22, 28, 26, 26, 24, 28, 24, 28, 22, 24, 24, 30, 28, 28, 26, 28, 30, 24, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30};
+
+- static int[]NUM_BLOCKS_L=new int[]{ -1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8, 8, 9, 9, 10, 12, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 24, 25};
+
+- static int[]NUM_BLOCKS_M=new int[]{ -1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49};
+
+- static int[]NUM_BLOCKS_Q=new int[]{ -1, 1, 1, 2, 2, 4, 4, 6, 6, 8, 8, 8, 10, 12, 16, 12, 17, 16, 18, 21, 20, 23, 23, 25, 27, 29, 34, 34, 35, 38, 40, 43, 45, 48, 51, 53, 56, 59, 62, 65, 68};
+
+- static int[]NUM_BLOCKS_H=new int[]{ -1, 1, 1, 2, 4, 4, 4, 5, 6, 8, 8, 11, 11, 16, 16, 18, 16, 19, 21, 25, 25, 25, 34, 30, 32, 35, 37, 40, 42, 45, 48, 51, 54, 57, 60, 63, 66, 70, 74, 77, 81};
+
+- static int EcPerBlock(QrEcl ecl, int ver)
+  - 该版本/级别每块纠错码字数（ISO 18004 表）。
+
+- static int NumBlocks(QrEcl ecl, int ver)
+  - 该版本/级别的纠错分块数。
+
+- static int MODE_NUMERIC=1;
+
+- static int MODE_ALNUM=2;
+
+- static int MODE_BYTE=4;
+
+- static string ALNUM_CHARS="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+
+- static int[]AlignPattern(int ver)
+  - 校正图形的坐标轴序列（ISO/IEC 18004 Table E.1，v=1 返回空）。
+
+- static int[]BlockPlan(int ver, QrEcl ecl)
+  - 按版本/级别给出完整序列 [numBlocksG1, dataG1, numBlocksG2, dataG2]。
+    从官方 (总码字 - 纠错码字) 反推数据位。
+
+- static int TotalCodewords(int ver)
+  - 总码字数 = floor(rawDataModules/8)。
+
+- static int[]gfExp=null;
+
+- static int[]gfLog=null;
+
+- static void EnsureGf()
+  - 首次调用时构建 GF(256) 的指数/对数表（本原多项式 0x11D）。
+
+- static int GfMul(int a, int b)
+  - GF(256) 乘法（任一操作数为 0 时结果为 0）。
+
+- static int[]RsGenerator(int deg)
+  - RS 生成多项式（Nayuki 式）：prod (x - a^i)，i = 0..deg-1。
+    返回长度 deg 的数组，result[deg-1] = 1（最高次系数），升幂索引，
+    最高次 x^deg 的系数隐式为 1。
+
+- static int[]RsRemainder(int[]data, int dataLen, int[]gen)
+  - data 对生成多项式 gen 取模（Nayuki 式），返回 deg 个纠错码字。
+
+- class Segment
+  - 一个编码分段：mode 为指示符值，chars 是字符数（numeric/alnum 为
+    字符数，byte 为字节数），bits 是该段的数据位（不含模式/计数头）。
+
+- public static QrMatrix Encode(string text, QrEcl ecl)
+  - 按级别编码文本，返回不含静区的模块矩阵。
+
+- public static QrEcl ParseEcl(string s)
+  - 级别名 -> 枚举（大小写均可）；未知返回 M（与 layui 默认一致）。
+
+- static bool IsNumeric(int b)
+  - 字节是否为 ASCII 数字 0-9。
+
+- static int AlnumValueByte(int c)
+  - ASCII 字节在字母数字表中的值（0-44），不在表内时 -1。
+
+- static int AlnumValue(string ch)
+  - 字符在字母数字表中的值（0-44），不在表内时 -1。
+
+- static int SeqByteLen(int lead)
+  - 以 lead 为首字节的 UTF-8 码点字节长度（1-4）。
+
+- static List <QrEncoder.Segment> MakeSegments(string text)
+  - 按码点游程切段：数字 / 字母数字 / 字节（UTF-8 原样），再把短的非
+    Byte 游程折回 Byte（模式切换头 4+cc 位往往比直接写进 UTF-8 更贵）。
+
+- static QrEncoder.Segment MakeByteRun(string run)
+  - 把一段文本编码为 Byte 段（每字节 8 位，高位在前）。
+
+- static int ModeOfByte(int b, string text, int pos)
+  - 字节 b（UTF-8 首字节）+ 文本上下文 -> 该码点的模式。
+
+- static int CharCountBits(int mode, int ver)
+  - 模式指示符后的字符计数字段宽度（按版本 1-9/10-26/27-40 分三档）。
+
+- static int DataCapacity(int ver, QrEcl ecl)
+  - 该版本/级别的数据码字容量（总码字减去全部纠错码字）。
+
+- static int PickVersion(List <QrEncoder.Segment> segs, QrEcl ecl)
+  - 能容纳这些分段的最小版本，1..40；放不下返回 -1。
+
+- static int WriteSegments(List <QrEncoder.Segment> segs, int ver, QrEcl ecl, int[]cw)
+  - 分段位流 + 终止符 + 填充写入 cw（容量码字），返回实际数据码字数。
+
+- static void AppendVal(List<int> bits, int val, int n)
+  - 把 val 的低 n 位按高位在前追加进位流。
+
+- static void SetFn(bool[]fn, int size, int x, int y)
+  - 标记 (x,y) 为功能模块（不可掩码、不放数据），越界忽略。
+
+- static void SetDark(bool[]dark, bool[]fn, int size, int x, int y)
+  - 标记功能模块并置为深色，越界忽略。
+
+- static void DrawFinder(bool[]dark, bool[]fn, int size, int cx, int cy)
+  - 定位图形 + 分隔：以 (cx,cy) 为中心的 7x7 环，越界部分丢弃
+    （Nayuki 的 dist!=2 && dist!=4 画法）。
+
+- static void DrawAlign(bool[]dark, bool[]fn, int size, int cx, int cy)
+  - 校正图形：以 (cx,cy) 为中心的 5x5 图案（同心环），越界部分丢弃。
+
+- static int BchVersion(int ver)
+  - 版本信息 18 位：版本号左移 12 位，低位接 BCH(18,6) 纠错位。
+
+- static QrMatrix BuildMatrix(int ver, QrEcl ecl, int[]cw, int nDataCw)
+  - 组装最终矩阵：画功能图形与版本/格式信息区，按 ISO 分块做
+    RS 纠错并交织，蛇形放入数据模块，再对八个掩码逐一应用、
+    按罚分选优。
+
+- static bool[]ApplyMask(bool[]dark, bool[]fn, int size, int mask, QrEcl ecl)
+  - 掩码 + 格式信息写入，返回成品矩阵（new 数组，深拷贝）。
+
+- static bool MaskBit(int m, int x, int y)
+  - 掩码 m 在 (x,y) 处是否翻转（ISO 18004 的八种掩码条件）。
+
+- static int Penalty(bool[]m, int size)
+  - 掩码罚分总值（ISO 18004 四条规则：同色游程、2x2 同色块、
+    类定位图形 1011101、深色比例偏离 50%）。
+
+- static int RunPenaltyLine(bool[]m, int size, int line, bool horizontal)
+  - 单行/列的同色游程罚分（游程 ≥5 时加 3+(长度-5)）。
+
+- static bool Pattern11(bool[]m, int size, int x, int y, bool horizontal)
+  - 11 格窗口 == 0000 1011101（从 (x,y) 沿 horizontal 方向）。
+
+
+## QrMatrix (class)
+
+二维码编码结果：version/size/ecl + 边长 size 的模块矩阵（true = 深色，
+不含静区）。`Get(x,y)` 按行主序读模块。
+
+- public int version;
+
+- public int size;
+
+- public QrEcl ecl;
+
+- public bool[]modules;
+
+- public bool Get(int x, int y)
+  - (x,y) 处模块是否深色（行主序，不含静区）。
+
+
 ## Radio (class)
 
 带响应式 int 绑定（选中索引）的单选按钮。
@@ -7120,7 +7568,7 @@ a.Render(app, x, y, "Option A");
   - 初始化：组信号、本项选项值与标题。
 
 - Radio()
-  - Default constructor used by .zform and the string-kind registry.
+  - Default constructor used by design docs and the string-kind registry.
 
 - Radio(int ov, string lbl)
   - 自持信号：`Radio a = new Radio(0, "Option A");`，随后通过 `.data`
@@ -7159,6 +7607,11 @@ a.Render(app, x, y, "Option A");
     选中）。选中状态变化时写组信号与 data 绑定、Raise Change 并请求
     重绘；已选中再点不重复触发。返回控件 id。
 
+- void Select()
+  - 选中本项（静默判重）：写组信号与 data 绑定、触发 Change，并经
+    weak parent 向容器冒泡（RadioGroup.OnChildEvent）。无头测试 /
+    仿真的用户切换入口。
+
 - override List<string> Events()
   - 设计器事件清单：公共事件外加 Change。
 
@@ -7168,6 +7621,10 @@ a.Render(app, x, y, "Option A");
 
 - override void BindEvent(string evt, Action a)
   - 事件路由：Change 走语义事件，其余按名转发给 On。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - int PaintStyled(App app, int id, int x, int y, string text, bool selected)
   - 立即模式绘制主体：解析根/指示环/圆点/标签四个样式
@@ -7191,7 +7648,7 @@ a.Render(app, x, y, "Option A");
 后绘制并向左右各外扩 1px 盖住接缝，强调色描边压在中性色上。
 
 段一般不单独使用：RadioGroup 的按钮形态或 RadioButtonGroup 直接
-挂一排段。独立保留模式（.zform / 注册表）也可用：自持信号、
+挂一排段。独立保留模式（注册表 / 直接挂载）也可用：自持信号、
 整段独立成胶囊。
 
 - SignalInt model;
@@ -7256,8 +7713,8 @@ a.Render(app, x, y, "Option A");
     文字，并注册命中矩形。选中态由组决定绘制次序。
 
 - void Select()
-  - 选中本项（静默判重）：写 model 并触发段事件；组的冒泡由
-    订阅方（RadioGroup/RadioButtonGroup）接线。
+  - 选中本项（静默判重）：写 model 并触发段事件，再经 weak parent
+    向容器冒泡（RadioButtonGroup.OnChildEvent）。
 
 - override string Kind()
   - 控件类型标识（序列化/设计器用）。
@@ -7271,8 +7728,12 @@ a.Render(app, x, y, "Option A");
 - override void BindEvent(string evt, Action a)
   - 覆写："Change" 挂段事件，其余按名称走通用路由。
 
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
+
 - override void OnMeasure(App app)
-  - 独立保留模式（.zform / 直接挂载）：自绘整段 + 点击。
+  - 独立保留模式（注册表 / 直接挂载）：自绘整段 + 点击。
 
 - override void OnPaint(App app)
   - 独立保留模式绘制：自绘按钮段；点击，或聚焦后按空格/回车，
@@ -7338,7 +7799,14 @@ int v = g.Selected().Get();
   - 追加选项（value 默认 = 下标）。
 
 - RadioButton AddOption(string label, int value)
-  - 追加选项（显式 value），段事件冒泡为组级 Change。
+  - 追加选项（显式 value）：段经 weak parent 冒泡到本组的
+    OnChildEvent（不挂捕获组的闭包——引用环，逐段泄漏）。
+    注意段不进 children（组自行调度绘制），只指 parent 供冒泡与
+    禁用链上行。
+
+- override void OnChildEvent(Control child, string evt)
+  - 段的用户切换冒泡：先触发本组 Change，再向自己的容器继续冒泡
+    （挂载在 RadioGroup 按钮形态下时即组级联动）。
 
 - void ClearItems()
   - 清空全部段。
@@ -7384,6 +7852,10 @@ int v = g.Selected().Get();
 
 - override void BindEvent(string evt, Action a)
   - 覆写："Change" 挂组事件，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - override List<string> Events()
   - 覆写：公共事件之外提供 "Change"。
@@ -7502,6 +7974,10 @@ SetOptions，label-field/value-field 的显式对应物）；
   - 覆写：为下标造一个真实 Radio（写选项 value，禁用位与组
     Change 冒泡），并把落后的元数据列表就地补齐。
 
+- override void OnChildEvent(Control child, string evt)
+  - 子项用户切换冒泡（Control.OnChildEvent）：先同步组级绑定，
+    再触发组 Change——与旧闭包接线同序。
+
 - override void OnMeasure(App app)
   - 覆写：先同步组状态；按钮形态量按钮段加内边距，圆点形态走基类。
 
@@ -7531,6 +8007,10 @@ SetOptions，label-field/value-field 的显式对应物）；
 
 - override void BindEvent(string evt, Action a)
   - 覆写："Change" 挂组事件，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - override List<string> Events()
   - 覆写：公共事件之外提供 "Change"。
@@ -7707,6 +8187,10 @@ stars.Render(app, x, y);
     一切落到 `On` 的公共事件集（其 AddByName 忽略
     不认识的名称）。
 
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
+
 - void PaintStars(App app, int x, int y)
   - 按 `rate` CSS 规则绘制星星，悬停的星（半星模式下是悬停的
     半格）预览将要设置的评分。半星模式（allowHalf）下每颗星
@@ -7781,7 +8265,7 @@ class：`info`（默认）/ `success` / `warning` / `error` 决定强调色
   - 控件类型标识（序列化/设计器用）。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（text/desc/icon/class）。
+  - 覆写：返回设计器属性清单（text/desc/icon）。
 
 - override bool SetExtra(string key, string val)
   - 旧文档中的数字 `status` 选择对应的角色 class。
@@ -7998,6 +8482,163 @@ Office 风格功能区组中的一个命令。`small` 渲染紧凑的
 - string TipText()
   - 悬停气泡显示：标题，及下方命令功能的描述
     （仅标题说明不了新信息）。
+
+
+## RichText (class)
+
+富文本控件：标记文本进、按真实字体度量换行、逐段绘制。
+标记语法与 Game.Arpg 同一种（#c/#bg/#f 颜色字体、#W #R #Y #B #G
+#H #L 快捷色、#md/#rt 对齐、#br 变宽、#p/#a/#item/#z 资源段、
+#@动作@内容@ 链接、## 转义 #），解析产物颜色为 0xAARRGGBB。
+
+滚动模型仿 StyledText：bottomAnchor=true（默认，聊天用）时
+scroll 是「距底端的行数」，0 = 贴住最新一行；false（文档用）时
+scroll 是「距顶端的行数」。绘制后写出 maxScroll 供调用方回读；
+给了 scrollBar 信号就在右侧画一条可拖动的纵向滚动条。滚轮
+内置。资源段（#p/#a/#item）当前只占位推进排版，不绘制内容。
+
+- string markup;
+  - 标记文本；每帧赋同一串不会重复解析（字符串相等即跳过）。
+
+- RichTextDocument doc;
+  - 解析缓存（markup 变化时重建）。
+
+- List<RichTextLine> lines;
+  - 排版缓存：行列表与布局键（markup/宽度/字号任一变化才重排）。
+
+- string laidMarkup;
+
+- int laidW;
+
+- int laidFont;
+
+- int scroll;
+  - 滚动偏移（行数；方向见 bottomAnchor），调用方持有。
+
+- int maxScroll;
+  - 绘制后写出：本帧的最大滚动偏移（行数）。
+
+- bool bottomAnchor;
+  - true = 底端锚定（聊天），false = 顶端锚定（文档）。
+
+- SignalInt scrollBar;
+  - 调用方的滚动条信号；非 null 且有得滚时画纵向滚动条。
+
+- int fontPxOverride;
+  - 字号覆盖（像素）；0 = 按 label small 样式解析。
+
+- int defaultColor;
+  - 解析初始前景色（0xAARRGGBB）；0 = 取样式表 richtext 前景，
+    再退白。快捷色/显式颜色标签始终覆盖它。
+
+- int rowH;
+  - 行高（排版时算出，绘制与滚动共用）。
+
+- SignalInt barPx;
+  - 滚动条要的「像素、从顶算」转换信号（构造时建一次）。
+
+- List<RichTextLinkActivated> linkHandlers;
+  - 链接点击处理列表（#@动作@…@ 被点下并抬起时逐个调用）。
+
+- string pressedAction;
+  - 按下时命中的链接动作（抬起时还在同一链接上才算点击）。
+
+- RichText()
+  - 空控件；Markup 赋值后自会解析排版。
+
+- void SetMarkup(string newValue)
+  - 设置标记文本（每帧赋同一串是廉价的：相等即跳过）。
+
+- string Markup()
+  - 当前标记文本。
+
+- void SetBottomAnchor(bool newValue)
+  - 滚动方向：true 底端锚定（默认），false 顶端锚定。
+
+- void SetFontPx(int newValue)
+  - 字号覆盖（像素）；0 = 跟随 label small 样式。
+
+- void SetDefaultColor(int newValue)
+  - 解析初始前景色（0xAARRGGBB）；0 = 取样式表，再退白。
+
+- void OnLinkActivated(RichTextLinkActivated handler)
+  - 注册链接点击处理（可多个，按注册顺序调用）。
+
+- override string Kind()
+  - 控件类型标识（序列化/设计器用）。
+
+- int LineCount()
+  - 当前排版行数（未排版为 -1）。诊断与测试用。
+
+- int ResolveFontPx(App app)
+  - 解析出的实际字号。
+
+- int ResolveDefaultColor(App app)
+  - 解析初始前景色：显式 defaultColor 优先，其次样式表 richtext
+    前景，最后白色。
+
+- override void OnMeasure(App app)
+  - 覆写：纯铺满槽位的画布，偏好尺寸取当前边界。
+
+- RichTextLine NewLine(int alignment)
+  - 新建一个空行。
+
+- void RebuildLayout(App app, int availW, int fp)
+  - 排版：把解析产物按真实度量折成行。逐字累加宽度（CJK 无
+    字距问题；拉丁允许极小偏差），超宽即折行，颜色/背景/链接
+    随段延续——这正是多色聊天段跨行不断色的关键。
+
+- void EnsureLayout(App app, int availW, int fp)
+  - 确保解析与排版缓存对当前 markup/宽度/字号有效。
+
+- override void OnPaint(App app)
+  - 覆写：解析 → 排版 → 处理滚轮与链接点击 → 逐段绘制背景与
+    文字 → 写出 maxScroll → 可选滚动条。
+
+- int BarW(App app)
+  - 滚动条占用的宽度（与 StyledText 一致，收窄换行宽用）。
+
+- RichTextSegment SegmentHit(int pad, int start, int maxRows, int mx, int my)
+  - (mx,my) 落在的可见段；不在任何段上返回 null。
+
+
+## RichTextLine (class)
+
+排版产物的一行：段列表、行宽、对齐（0 左 1 中 2 右）与行高。
+段是同一渲染样式下连续的文本片段，跨 run 折行时颜色/背景/链接
+随段延续。字段直接读写（控件内部数据，仿 TextRun 先例）。
+
+- List<RichTextSegment> segments;
+
+- int width;
+
+- int alignment;
+
+- int height;
+
+- RichTextLine(int alignment)
+  - 构造一个空行并指定对齐。
+
+
+## RichTextSegment (class)
+
+行内一个可绘制的文本片段：位置与宽度在排版时定，携带颜色、
+背景与所在链接（null = 非链接）。
+
+- string text;
+
+- int x;
+
+- int width;
+
+- int color;
+
+- int background;
+
+- RichTextLink link;
+
+- RichTextSegment(string text, int color, int background, RichTextLink link)
+  - 构造一个片段；x/width 由排版回填。
 
 
 ## ScrollColumn (class)
@@ -8372,7 +9013,7 @@ new SelectBox(hint, false).Clearable(true).Status(SelectBox.Error())
   - 从普通标签列表构建选择框（JSON / 设计器 / 单行场景使用）。
 
 - string OptionsText()
-  - 选项以 `a|b|c` 字符串表示（设计器 / .zform 属性往返）。
+  - 选项以 `a|b|c` 字符串表示（设计器 / 设计文档属性往返）。
 
 - void SetOptionsText(string text)
   - "a|b|c" 文本 → 选项列表（SetExtra 反序列化；滚动复位）。
@@ -8593,6 +9234,10 @@ new SelectBox(hint, false).Clearable(true).Status(SelectBox.Error())
 
 - override string Kind()
   - 控件类型标识（序列化/设计器用）。
+    控件类型标识（序列化/设计器用）。必须与注册键一致：
+    Serialize/Html 克隆按 `c.Kind()` 写、按同名 kind 重建——
+    旧自报名 "Select" 在注册表里没有键，下拉框在克隆通道
+    拿 null 被静默丢弃（注册表探针实证）。
 
 - override List<PropSpec> Props()
   - 覆写：返回设计器属性清单（占位 / 选项 / 选中值 / 清除 / 尺寸 /
@@ -8609,6 +9254,10 @@ new SelectBox(hint, false).Clearable(true).Status(SelectBox.Error())
 
 - override void BindEvent(string evt, Action a)
   - 覆写：语义事件挂对应 UiEvent，其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - override void OnMeasure(App app)
   - 覆写：高取样式行高（触发器），宽缺省 200。
@@ -9022,6 +9671,10 @@ sl.stepMark = true;            // 只能停在标记值上
 - override void BindEvent(string evt, Action a)
   - 覆写："Change"/"DragEnd" 挂对应事件，其余按名称走通用路由。
 
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
+
 - bool NearThumb(App app, int cx, int cy, int r)
   - 圆钮命中（悬停气泡用）：指针落在钮的外扩方框里。
 
@@ -9240,11 +9893,11 @@ root.Add(sp);
   - 覆写：返回设计器属性清单（orient/size/minFirst/minSecond）。
 
 - override Control SlotHost(int slot)
-  - 设计里放进某个窗格的子控件（.zform 的 `childTab`：0 = 第一格，
+  - 设计里放进某个窗格的子控件（设计文档的 `childTab`：0 = 第一格，
     1 = 第二格）真正的父节点就是那个窗格——否则它们会挂在
     分栏容器自己身上，而 Arrange 只摆两个窗格，于是全部消失。
     设计时窗格选择：slot 0 → 第一格，slot ≥1 → 第二格。
-    （对应 .zform 的 `childTab`。）
+    （对应设计文档的 `childTab`。）
 
 - override string GetExtra(string key)
   - 方向与分栏尺寸也可以写成一条 `options`（"vertical|620"），
@@ -9316,7 +9969,7 @@ Statistic s = new Statistic { Text = "Active users", Value = "12,480" };
   - 控件类型标识（序列化/设计器用）。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（text/value/class）。
+  - 覆写：返回设计器属性清单（text/value）。
 
 
 ## StatusBar (class)
@@ -9347,7 +10000,7 @@ bar.RenderAt(app, 0, y, width, height);
   - 控件类型标识（序列化/设计器用）。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（tint/class）。
+  - 覆写：返回设计器属性清单（tint）。
 
 - override void SetProp(string key, string val)
   - 面板直改 `options` 必须走重建入口（直写字段不会重建状态项）。
@@ -9366,11 +10019,11 @@ bar.RenderAt(app, 0, y, width, height);
 
 - void SetItemsText(string spec)
   - 按序列化文本重建全部项：每条一个标题，`|` 分隔，
-    前缀 `>` 靠右。设计器与 .zform 走这条路径。
+    前缀 `>` 靠右。设计器与设计文档走这条路径。
 
 - override string GetExtra(string key)
   - 项集合是一个列表，不是字段，因此走 extra 属性：
-    设计器 / .zform 的 `options` 由此真正建出状态项。
+    设计器 / 设计文档的 `options` 由此真正建出状态项。
 
 - override bool SetExtra(string key, string val)
   - 设计器写入 `options`（按分隔文本重建状态项，前缀 `>` 靠右）；
@@ -9623,6 +10276,10 @@ s.ErrorIndex = 1;
   - 将步骤的 Change 路由到自己的 UiEvent 字段；其余一切落到
     `On` 的公共事件集（其 AddByName 忽略不认识的名称）。
 
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
+
 
 ## StyledText (class)
 
@@ -9844,6 +10501,10 @@ dark.Render(app, x, y);
 - override void BindEvent(string evt, Action a)
   - 覆写："Change"/"Toggle" 都挂 Change 事件，其余按名称走通用路由。
 
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
+
 - override string GetProp(string key)
   - 覆写：int 轴激活时 "value" 键按值语义应答，其余交给基类。
 
@@ -9945,7 +10606,7 @@ dark.Render(app, x, y);
 
 - List<Panel> pages;
   - 设计出来的页容器（下标 = 标签索引）。有了它，标签条
-    本身就是容器：设计器 / .zform 里放在某个标签下的控件
+    本身就是容器：设计器 / 设计文档里放在某个标签下的控件
     经 SlotHost 落进对应的页，切换标签即切换页面，宿主
     不必自己隐藏和摆放每一页。为空时控件行为与从前一致
     （只画标签条，页面由宿主自行绘制）。
@@ -10081,12 +10742,12 @@ dark.Render(app, x, y);
     持有它们的宿主也能据此（HostForm() == null）回收资源。
 
 - override Control SlotHost(int slot)
-  - 设计里放在某个标签下的控件（.zform 的 `childTab`）真正的
+  - 设计里放在某个标签下的控件（设计文档的 `childTab`）真正的
     父节点就是那一页。
 
 - void SetItemsText(string spec)
   - 按序列化文本重建标签：每条一个标题，`|` 分隔，
-    前缀 `x` 表示该标签可关闭。设计器与 .zform 走这条路径。
+    前缀 `x` 表示该标签可关闭。设计器与设计文档走这条路径。
 
 - override string GetExtra(string key)
   - 覆写：应答扩展属性键，"options" 为标签标题的序列化串。
@@ -10102,6 +10763,10 @@ dark.Render(app, x, y);
     路由到对应的 UiEvent 字段，使 JSON/设计器的 `onTabChanged` 处理器
     可与每帧的 TakeChanged()/TakeClosed()/TakeAdded() 轮询并存；
     其余事件全部落入 `On` 的公共绑定。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - override void OnMeasure(App app)
   - 首选尺寸：水平条取内容宽度（容器可能压缩它们，
@@ -10351,7 +11016,7 @@ tag                                        默认
 
 - override List<PropSpec> Props()
   - 覆写：返回设计器属性清单（text/icon/closable/checkable/
-    checked/class）。
+    checked）。
 
 - override List<string> Events()
   - 覆写：公共事件之外提供 "Close"。
@@ -10359,6 +11024,10 @@ tag                                        默认
 - override void BindEvent(string evt, Action a)
   - 将关闭字形的 Close 路由到其 UiEvent 字段；其余事件
     全部落入 `On` 的公共绑定。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - override void OnMeasure(App app)
   - 覆写：宽度取样式表或自然宽度，高度取样式表或主题小行高。
@@ -10655,6 +11324,10 @@ Control）、`SetStatus` 校验态描边、`ShowCount`+`MaxLen`
 - override void BindEvent(string evt, Action a)
   - 覆写："Change" 挂 Change 事件，其余按名称走通用路由。
 
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
+
 - int BottomRowH(App app)
   - 框外底行（show-count 文本与校验消息共用同一排，框下沿 2px 起）。
     父容器渲染子树时会把自己的矩形作为裁剪带（Control.RenderTree 的
@@ -10818,7 +11491,7 @@ tl.Add(new TimelineItem("12:30", "Published", "", "success", ""));
     条目间用 `|`（见 ItemsText 注释）。
 
 - void SetItemsText(string spec)
-  - 从 ItemsText 同格式串重建条目列表（设计器 / .zform 用）。
+  - 从 ItemsText 同格式串重建条目列表（设计器 / 设计文档用）。
 
 - override string GetExtra(string key)
   - 设计器额外键：`items`（条目往返串）。
@@ -10830,7 +11503,7 @@ tl.Add(new TimelineItem("12:30", "Published", "", "success", ""));
   - 控件类型标识（序列化/设计器用）。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（size/class）。
+  - 覆写：返回设计器属性清单（size）。
 
 
 ## TimelineItem (class)
@@ -10932,6 +11605,10 @@ bar.ItemAt(save).Click += () => { ... };
 - override void BindEvent(string evt, Action a)
   - 覆写："ItemClick" 挂 ItemClick 事件，其余按名称走通用路由。
 
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
+
 - void OnItemClick(ToolItemCallback cb)
   - 任何一项被点击时回调，参数为项的索引。
 
@@ -10942,7 +11619,7 @@ bar.ItemAt(save).Click += () => { ... };
   - 控件类型标识（序列化/设计器用）。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（iconOnly/tint/class）。
+  - 覆写：返回设计器属性清单（iconOnly/tint）。
 
 - override void SetProp(string key, string val)
   - 面板直改 `options` 必须走重建入口（直写字段不会重建按钮项）。
@@ -10979,7 +11656,7 @@ bar.ItemAt(save).Click += () => { ... };
 
 - void SetItemsText(string spec)
   - 按序列化文本重建全部项：每条 `"标题:图标"`，
-    前缀 `>` 靠右，`-` 为分隔条。设计器与 .zform 走这条路径。
+    前缀 `>` 靠右，`-` 为分隔条。设计器与设计文档走这条路径。
 
 - void SetIconOnly(bool on)
   - 切换只显示图标模式；只影响之后新建的项——已有项的标题在
@@ -10987,7 +11664,7 @@ bar.ItemAt(save).Click += () => { ... };
 
 - override string GetExtra(string key)
   - 项集合是一个列表，不是字段，因此走 extra 属性：
-    设计器 / .zform 的 `options` 由此真正建出按钮。
+    设计器 / 设计文档的 `options` 由此真正建出按钮。
 
 - override bool SetExtra(string key, string val)
   - 设计器写入 `options`（按分隔文本重建按钮项）；其他键返回
@@ -11104,6 +11781,9 @@ bar.ItemAt(save).Click += () => { ... };
     Request 一次（Input.Button 的 Tip 已有 900ms 阈值）。这里保留
     钩子便于未来把所有内嵌悬停提示迁移到统一计时器。
     Naive UI Tooltip 的 `delay` prop 即此参数。
+
+- static void Cancel()
+  - 取消本帧挂起的提示请求（如在右键菜单或模态弹层打开时放弃当前悬停气泡）。
 
 - static void Flush(App app)
   - 绘制本帧请求的提示（若有）并清空队列。
@@ -11425,6 +12105,10 @@ t.Render(app, x, y, w, h);              // 每帧画进这块框
   - 覆写："Change"/"SelectChanged" 挂各自 UiEvent，其余按名称走
     通用路由。
 
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
+
 - override List<PropSpec> Props()
   - 覆写：返回设计器属性清单（oneWay/searchable/emptyText/
     searchHintLeft/searchHintRight）。
@@ -11650,7 +12334,7 @@ UI 线程（UiEvent.Post），后台任务重建绑定列表
   - 控件类型标识（序列化/设计器用）。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（checks/empty/class）。
+  - 覆写：返回设计器属性清单（checks/empty）。
 
 - override string StyleType()
   - 覆写：CSS 类型选择器名（"tree"）。
@@ -11865,6 +12549,10 @@ UI 线程（UiEvent.Post），后台任务重建绑定列表
     JSON/设计器处理器映射到 `On`，而 AddByName 忽略未知名称，
     处理器会静默地从未执行。
 
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
+
 - static int SubtreeEnd(List<TreeNode> nodes, int idx)
   - `idx` 的子树之后第一个节点的索引。
 
@@ -11937,7 +12625,7 @@ Typography p = new Typography { Text = vm.summary, Class = "paragraph" };
   - 控件类型标识（序列化/设计器用）。
 
 - override List<PropSpec> Props()
-  - 覆写：返回设计器属性清单（text/class）。
+  - 覆写：返回设计器属性清单（text）。
 
 
 ## Upload (class)
@@ -12109,6 +12797,10 @@ List<UploadFile> 赋给 Files（或 SetFiles）共享引用。
 - override void BindEvent(string evt, Action a)
   - 覆写：语义事件各挂对应 UiEvent（"Upload" 与 "UploadStart"
     同槽），其余按名称走通用路由。
+
+- override void BindEventS(string evt, ControlEvent a)
+  - `BindEvent` 的 sender 通道（S = Sender）：
+    特化事件接本控件的 UiEvent，通用事件按名路由。
 
 - void SetFiles(List<UploadFile> files)
   - 受控列表：共享宿主 List 引用（非受控时忽略 null）。
@@ -12352,15 +13044,17 @@ Upload 列表中的一个文件项（Naive UI file-list 元素）。
 
 ## UploadJob (class)
 
-一项内置 HTTP 上传的工作对象：绑定到具体项（实例方法组，
-规避闭包），在后台线程跑 HttpClient.UploadFileBytesAsync，
-进度/完成经 App.Post 封送回 UI 线程。
+一项内置 HTTP 上传的工作对象：绑定到具体项（实例方法组），
+在后台线程跑 HttpClient.UploadFileBytesAsync，进度/完成经
+App.Post 封送回 UI 线程。
 
-线程入口必须是静态方法组：实例方法组降级为带 `this` 的闭包
-记录，而 `zan_thread_start` 只接受裸函数指针（ImageHttp、
-DataTable.Export 同受此约），故这里走「静态队列 + 单 worker」
-范式：Enqueue 在空闲时拉起 UploadJob.Run，Run 取一项 await
-一项，队列排空即退，下次入队再拉起。
+这里走「静态队列 + 单 worker」范式：Enqueue 在空闲时拉起
+UploadJob.Run，Run 取一项 await 一项，队列排空即退，下次
+入队再拉起。线程入口用静态方法组是风格选择，不是语言限制
+——实例方法组与捕获 lambda 自 2026-09 起都能直接交给
+Thread.Start（见 docs/ABI.md §3.6）；而作业状态本就要传实例，
+走队列 + 静态字段比每条作业连宿主一起捕获更清楚
+（ImageHttp、DataTable.Export 同此形状）。
 
 - static nint lockHandle;
   - 任务队列互斥锁句柄（懒建）。
@@ -12713,7 +13407,7 @@ DockFill()/Grow() 或 CSS width/height 给出覆盖范围。
 
 - override List<PropSpec> Props()
   - 覆写：返回设计器属性清单（content/src/color/fontpx/rotate/
-    间距偏移/贴片尺寸/textalign/weight/noclip/class）。
+    间距偏移/贴片尺寸/textalign/weight/noclip）。
 
 
 ## Wizard (class)
@@ -12967,6 +13661,12 @@ name/icon/description 并行列表约定，改为单一实体。
     DeviceProfile）。空串 = 自由尺寸（桌面），向导的目标
     设备行预选桌面并放开分辨率预设与自定义宽高。
 
+- string caps;
+  - 模板声明的能力标签（manifest `caps=`，逗号分隔：
+    gui / network / crypto / game / audio / db …）。空串 =
+    未声明；向导在描述下方原样展示，创建者据此一眼看出
+    这个模板产出的项目会用到哪些生态面。
+
 - WizardTemplate(string c, string n, string ic, string d)
   - 构造：分类/名称/图标/描述必填，形态与预览信息经
     Shape/Look 链式补齐。
@@ -12979,6 +13679,9 @@ name/icon/description 并行列表约定，改为单一实体。
 
 - WizardTemplate Device(string id)
   - 声明目标设备画像 id（manifest `device=`）。
+
+- WizardTemplate Caps(string spec)
+  - 声明能力标签（manifest `caps=`，逗号分隔原样展示）。
 
 
 ## Control (delegate)
@@ -13104,6 +13807,22 @@ f => f.name)`.
 
 ## void (delegate)
 
+某行被「拖出列表」时回调（行下标）：在某行上按下、拖到列表
+矩形之外再松开。宿主据此把这一行变成独立窗口（会话拖出成浮窗），
+列表本身不开窗，也不定义「拖到哪里才算拖出」的下游语义。
+
+`delegate void RowDragOut(int index);`
+
+
+## void (delegate)
+
+富文本链接点击回调：action 为 #@标记@…@ 里竖线前的动作原文。
+
+`delegate void RichTextLinkActivated(string action);`
+
+
+## void (delegate)
+
 工具条项被点击时的回调，带项的索引。
 
 `delegate void ToolItemCallback(int index);`
@@ -13116,3 +13835,16 @@ custom-request 钩子：接管一项的传输（Naive UI custom-request）。
 SetItemStatus。必须是非捕获方法组。
 
 `delegate void UploadRequestFn(UploadFile item);`
+
+
+## QrEcl (enum)
+
+纠错级别（ISO/IEC 18004）。
+
+- L = =0
+
+- M = =1
+
+- Q = =2
+
+- H = =3

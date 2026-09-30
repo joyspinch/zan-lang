@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Adwords
 
-> 源码: `stdlib/Sdk/Jd/Api/Adwords/AdwordsReadFindAdWordsByWareIdRequest.zan`, `stdlib/Sdk/Jd/Api/Adwords/AdwordsWriteUpdateWareAdWordsRequest.zan`, `stdlib/Sdk/Jd/Api/Adwords/JdAdwordsApi.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Adwords/AdwordsReadFindAdWordsByWareIdRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Adwords/AdwordsWriteUpdateWareAdWordsRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Adwords/JdAdwordsApi.zan`
 
 
 ## AdwordsReadFindAdWordsByWareIdRequest (class)

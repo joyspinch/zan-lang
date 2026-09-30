@@ -1,6 +1,6 @@
 # Gui
 
-> 源码: `stdlib/Gui/App.zan`, `stdlib/Gui/ChildWindow.zan`, `stdlib/Gui/Component/BandGrid.zan`, `stdlib/Gui/Control.zan`, `stdlib/Gui/ControlFactory.zan`, `stdlib/Gui/Css.zan`, `stdlib/Gui/Device.zan`, `stdlib/Gui/Effects.zan`, `stdlib/Gui/Event.zan`, `stdlib/Gui/Focus.zan`, `stdlib/Gui/Fx.zan`, `stdlib/Gui/HandlerRegistry.zan`, `stdlib/Gui/HitTest.zan`, `stdlib/Gui/Icon.zan`, `stdlib/Gui/IconSvg.zan`, `stdlib/Gui/IconSvgData.zan`, `stdlib/Gui/IconVector.zan`, `stdlib/Gui/ImageHttp.zan`, `stdlib/Gui/Layout.zan`, `stdlib/Gui/Math3D.zan`, `stdlib/Gui/Menu.zan`, `stdlib/Gui/NativeLayer.zan`, `stdlib/Gui/Nav.zan`, `stdlib/Gui/OverlayPopup.zan`, `stdlib/Gui/PropSpec.zan`, `stdlib/Gui/QrEncoder.zan`, `stdlib/Gui/Reactive.zan`, `stdlib/Gui/Render.zan`, `stdlib/Gui/Serialize.zan`, `stdlib/Gui/Skin.zan`, `stdlib/Gui/Stack.zan`, `stdlib/Gui/Style.zan`, `stdlib/Gui/StyleBox.zan`, `stdlib/Gui/StyleSheet.zan`, `stdlib/Gui/Text.zan`, `stdlib/Gui/Theme.zan`, `stdlib/Gui/Types.zan`, `stdlib/Gui/Ui.zan`, `stdlib/Gui/UiErrorLog.zan`, `stdlib/Gui/UserComponents.zan`
+> 源码: `stdlib/Gui/Component/BandGrid.zan`, `stdlib/Gui/Core/App.zan`, `stdlib/Gui/Core/ChildWindow.zan`, `stdlib/Gui/Core/Control.zan`, `stdlib/Gui/Core/ControlBootstrap.zan`, `stdlib/Gui/Core/ControlFactory.zan`, `stdlib/Gui/Core/DamageTracker.zan`, `stdlib/Gui/Core/Device.zan`, `stdlib/Gui/Core/Element.zan`, `stdlib/Gui/Core/Event.zan`, `stdlib/Gui/Core/Focus.zan`, `stdlib/Gui/Core/HandlerRegistry.zan`, `stdlib/Gui/Core/HeavyControls.zan`, `stdlib/Gui/Core/HitTest.zan`, `stdlib/Gui/Core/Menu.zan`, `stdlib/Gui/Core/NativeLayer.zan`, `stdlib/Gui/Core/Nav.zan`, `stdlib/Gui/Core/OverlayPopup.zan`, `stdlib/Gui/Core/PropSpec.zan`, `stdlib/Gui/Core/Reactive.zan`, `stdlib/Gui/Core/Serialize.zan`, `stdlib/Gui/Core/Types.zan`, `stdlib/Gui/Core/Ui.zan`, `stdlib/Gui/Core/UiErrorLog.zan`, `stdlib/Gui/Core/UserComponents.zan`, `stdlib/Gui/Layout/CssGrid.zan`, `stdlib/Gui/Layout/Layout.zan`, `stdlib/Gui/Layout/LineBox.zan`, `stdlib/Gui/Layout/Scroll.zan`, `stdlib/Gui/Layout/Stack.zan`, `stdlib/Gui/Markup/Html.zan`, `stdlib/Gui/Markup/HtmlApi.zan`, `stdlib/Gui/Media/Icon.zan`, `stdlib/Gui/Media/IconSvg.zan`, `stdlib/Gui/Media/IconSvgData.zan`, `stdlib/Gui/Media/IconVector.zan`, `stdlib/Gui/Media/ImageHttp.zan`, `stdlib/Gui/Rendering/Fx.zan`, `stdlib/Gui/Rendering/Math3D.zan`, `stdlib/Gui/Rendering/Render.zan`, `stdlib/Gui/Rendering/RenderAA.zan`, `stdlib/Gui/Rendering/SpriteBatch.zan`, `stdlib/Gui/Styling/Css.zan`, `stdlib/Gui/Styling/DesignTokens.zan`, `stdlib/Gui/Styling/Effects.zan`, `stdlib/Gui/Styling/Skin.zan`, `stdlib/Gui/Styling/Style.zan`, `stdlib/Gui/Styling/StyleBox.zan`, `stdlib/Gui/Styling/StyleSheet.zan`, `stdlib/Gui/Styling/Theme.zan`, `stdlib/Gui/Text/RichText.zan`, `stdlib/Gui/Text/Text.zan`
 
 
 ## AnimSlot (class)
@@ -43,6 +43,8 @@ App 保留动画存储中的一个带键补间/状态槽。取代了
 
 - bool pollPending;
 
+- int lastPollResult;
+
 - int frameErrors;
   - 被 SafeFrame/PumpSafe 捕下的帧异常计数与最后一条消息：
     界面可以把它当状态显示（“本次运行有 N 个错误”）。
@@ -52,6 +54,12 @@ App 保留动画存储中的一个带键补间/状态槽。取代了
 - FrameBody frameBody;
 
 - static App frameApp;
+
+- static App FrameApp()
+  - 最近一次注册过帧体的 App（主窗口）。纯静态助手拿不到控件
+    树上的 app 时用它回落——帧绘制路径上（本进程只有一个主窗）
+    它就是当前正在画的 App；ChildWindow 树渲染时 app 由宿主
+    显式传递，不走这里。无帧体的控制台探针返回 null。
 
 - static bool wndProcPainting;
 
@@ -164,6 +172,10 @@ App 保留动画存储中的一个带键补间/状态槽。取代了
 
 - string appCss;
 
+- int htmlLoadSeq;
+
+- static LinkNavigateFn linkNavigator;
+
 - StyleSheet chartSheet;
 
 - string chartThemeName;
@@ -171,6 +183,10 @@ App 保留动画存储中的一个带键补间/状态槽。取代了
 - string skinName;
 
 - StyleSheet useCssSheet;
+
+- bool reducedMotion;
+
+- Control styleCtx;
 
 - bool glassNative;
 
@@ -215,6 +231,12 @@ App 保留动画存储中的一个带键补间/状态槽。取代了
 - int wheelCapOrder;
 
 - int wheelOwnerOrder;
+
+- bool wheelClaimSeen;
+
+- bool wheelConsumed;
+
+- bool wheelReplayArmed;
 
 - int tabHoldId;
 
@@ -471,6 +493,10 @@ App 保留动画存储中的一个带键补间/状态槽。取代了
 
 - int bgSnapGen;
 
+- Dict <string, StyleBox> styleCache;
+
+- int styleCacheGen;
+
 - int metricsScale;
 
 - string bgImagePath;
@@ -585,19 +611,96 @@ App 保留动画存储中的一个带键补间/状态槽。取代了
 - bool ReloadSkin()
   - 从磁盘重新读取当前皮肤的 CSS（皮肤热编辑）。
 
-- void UseAppCss(string css)
+- Control LoadHtml(string html)
   - 安装应用自身的样式表：用于页面布局
     （`display: flex`、宽度、间距）并样式化自有元素类的 CSS。
     与 UseCss 不同，它不随皮肤切换而失效——它会重新叠加到每个
     皮肤的样式表之上，应用未指定的内容仍以皮肤外观为准。
+    WEB_GUI_ROADMAP P5：装载 HTML 声明，返回 body 根（调用方
+    Add 到宿主/窗口）。`<style>`/`<link rel=stylesheet>` 收集的
+    CSS 并进 appCss。`data-on-*` 经 handlers 接线；无事件需求用
+    LoadHtml。
 
-- bool UseChartTheme(string name)
-  - 安装图表主题包 `Gui.Component.Chart/themes/<name>.css`（图表
-    自己的皮肤，纯 CSS 配置，由组件的 ChartTheme 负责发现与读取）。
-    主题包编译成一块独立的样式表，解析时垫在内置基线之上、
-    Gui 皮肤之下：皮肤写过的 chart 规则优先，主题包只补基线
-    没定义的部分，与皮肤/appCss 互不合并。名称为 "default" 或
-    "" 时卸载主题包。找不到主题包时保持现状并返回 false。
+- Control LoadHtmlWith(string html, HtmlHandlers handlers, string baseDir)
+  - 完整形态：带处理器注册表与 `<link>` 的基目录。实现在
+    Gui.Html（解析/建树/链接扫描），经 SetHtmlLoader 注册——
+    App 编译图不背 HTML 声明层（auto-stdlib 按需拉取）。未安装
+    （程序既没拼 Html.* 入口也没调 Html.Install()）时返回 null，
+    调用方显式失败而不是静默空树。
+
+- static HtmlLoadFn htmlLoader;
+  - HTML 装载后端槽：由 Gui.Html.Install() 注册，业务代码不要
+    直接调。
+
+- static void SetHtmlLoader(HtmlLoadFn fn)
+
+- static LinkScanFn linkScanner;
+  - 链接扫描槽（声明层 <a href> 接线）：Gui.Html.Install() 注册；
+    ChildWindow.WireNode 的模板行克隆与 LoadHtml 后端都走这里。
+
+- static void SetLinkScanner(LinkScanFn fn)
+
+- static void AutoLinkTree(Control root, App app)
+  - 对一棵树做 <a href> 缺省导航接线（P5）。静态：无宿主进程
+    （headless 测试）也能走，app 为 null 时扫描器自行容忍。
+    未安装 HTML 声明层时空操作——树里没有声明层 <a> 可扫。
+
+- static Control CloneTree(Control root)
+  - 模板行克隆槽：ChildWindow 展开声明层 `data-for` 模板行时经
+    这里取原型深拷贝（Gui.Html.Install() 注册 Html.Clone）。
+    未安装 HTML 声明层时返回 null——那时也没有 template 原型
+    可展开，调用方按空行跳过。静态：无宿主也能走空槽语义。
+
+- static CloneTreeFn cloneTree;
+  - 克隆后端槽：由 Gui.Html.Install() 注册，业务代码不要直接调。
+
+- static void SetCloneTree(CloneTreeFn fn)
+
+- static List<AppHookFn> presentTails;
+  - 帧呈现尾段挂点表（AppHookFn）：重家族在自身入口处自挂
+    （如 ChartView 首帧渲染时挂 ChartView.FlushTooltips）。
+
+- static void AddPresentTail(AppHookFn fn)
+  - 注册帧呈现尾段回调（重复注册以一次为准由调用方自行保证）。
+
+- string NextLoadScope()
+  - 装载作用域类名（zs-load-<序>）由装载后端领取：每次装载唯一，
+    多次装载的同名类互不串（System.Web.HtmlScope 共用实现）。
+
+- void ApplyScopedTree(Control root, string scopedCss, string zs)
+  - 装载后端的落树收尾：作用域 CSS 并进 appCss 链、整树补作用
+    域类（原 LoadHtmlWith 内联逻辑，搬进 Html.LoadForApp）。
+
+- void OpenLink(string url, bool newWindow)
+  - <a href> 的缺省路由（P5 链接语义）。newWindow
+    （target="_blank" 新弹窗）直接弹系统浏览器；否则优先走内嵌
+    导航器——安装了 WebView 家族的程序由 WebViewBootstrap.Install()
+    注册（宿主就地图 Navigate，没有就懒建 App 级链接窗口全程复用；
+    WebView 运行时不可用时首帧回落系统浏览器）。未安装 WebView
+    家族的程序一律系统浏览器，编译图因此不背 WebView。
+
+- static void OpenInSystemBrowser(string url)
+  - 系统关联程序打开 url（target="_blank" 与内嵌导航不可用时的
+    回落通道）。Windows 走 ShellExecuteW——不经 cmd.exe，URL 里
+    的 & ? # 等元字符不会被 shell 吃掉；POSIX 经 RunDetached 的
+    sh，URL 单引号包裹 + '\'' 转义防注入。原在 Gui.Html（链接
+    语义的底层通道属 App 核心，Html 未安装也要能用）。
+
+- static void SetLinkNavigator(LinkNavigateFn fn)
+  - WebView 家族（宿主就地图/链接窗口）向 App 注册 <a href> 内嵌
+    导航的入口，由 Gui.Component.WebView.WebViewBootstrap.Install()
+    调用；业务代码不要直接调。
+
+- void MarkScope(Control n, string zs)
+  - 给装载树每个元素补作用域类（编译通道由生成码逐节点 AddClass，
+    运行期树建好了，走一遍后处理）。
+
+- void UseAppCss(string css)
+
+- void SetChartSheet(StyleSheet s, string pkgName)
+  - 安装/卸载图表主题包编译出的独立样式表（App 自身不认识
+    Chart 家族；主题包的发现与读取在 ChartTheme，经这里落到
+    app 上）。s = null 表示卸载，图表跟随 Gui 皮肤 token 回落。
 
 - string ChartThemeName()
   - 当前图表主题包名（未安装时为 ""）。
@@ -733,6 +836,12 @@ App 保留动画存储中的一个带键补间/状态槽。取代了
 
 - int WindowShapeRadius()
   - 圆角矩形轮廓的圆角半径（见 SetWindowShape）。
+
+- int EffectiveCornerRadius()
+  - 当前窗口生效的外轮廓圆角半径（物理/缩放后像素）。
+    异形圆角窗口（SetWindowShape）返回其规格半径缩放值；
+    Win11 DWM 统一圆角窗口（SetWindowRoundCorners(true)）返回 8px 缩放值；
+    方角窗口返回 0。
 
 - void SetChromeVisible(bool on)
   - 显示/隐藏自定义标题栏边框。隐藏时：OS 仍允许顶部
@@ -963,6 +1072,21 @@ App 保留动画存储中的一个带键补间/状态槽。取代了
 
 - void EndIdScope()
 
+- void PushId(string strKey)
+  - 压入字符串命名的 ID 作用域（Path Hash ID Stack）。
+
+- void PushId(int intKey)
+  - 压入整数命名的 ID 作用域（如循环下标 i）。
+
+- void PopId()
+  - 弹出当前 ID 作用域。
+
+- int GetId(string strKey)
+  - 计算指定字符串 key 在当前作用域下的唯一哈希 ID。
+
+- int GetId(int intKey)
+  - 计算指定整数 key 在当前作用域下的唯一哈希 ID。
+
 - void NoteGlassRect(int x, int y, int w, int h)
   - StyleBox 在画玻璃时登记面板矩形（本帧内有效）。见 glassRects。
 
@@ -1055,6 +1179,11 @@ App 保留动画存储中的一个带键补间/状态槽。取代了
 - void SetClientSize(int w, int h)
   - 把 OS 窗口客户区调整为 (w, h) 逻辑像素：登录小窗长成主窗口
     这类形态切换用。画布随 WM_SIZE 自动重铺。
+
+- void SetClientSizeDev(int wDev, int hDev)
+  - 精确设置客户区（**设备**像素，不加 OS 框架补偿）。见
+    Window.SetClientSizeDev：照参考图定尺寸的小窗用这个，
+    SetClientSize 会把客户区撑大一圈。
 
 - void CenterWindow()
   - 将 OS 窗口在其显示器工作区居中。
@@ -1409,6 +1538,12 @@ App 保留动画存储中的一个带键补间/状态槽。取代了
     那一路，会在没有独立消息泵的窗口上永久睡死（游戏窗口的消息
     只有 SDL_PollEvent 泵送，HUD 合成循环不调它）。
 
+- int PollOneEvent()
+  - 以非阻塞轮询方式处理一个挂起的 OS 消息/事件：
+    返回 1 = 成功分发了一个事件；
+    返回 0 = 当前队列无挂起事件（已排空）；
+    返回 -1 = 收到窗口关闭请求 (WM_QUIT)。
+
 - bool ProcessEvent()
 
 - nint WindowHandle()
@@ -1549,6 +1684,13 @@ App 保留动画存储中的一个带键补间/状态槽。取代了
     手柄先响应系统命中测试，按下永远到不了
     客户区，只有滚轮还能滚动。角手柄保持优先，
     保证对角缩放仍可操作。绘制期间每帧调用一次。
+
+- void ReservePopupHit(int x, int y, int w, int h)
+  - 为浮层（上下文菜单、下拉弹层）抢占 [x,y,w,h] 的系统命中，
+    与 ReserveEdgeHit 同一机制、同一每帧清除节奏，画弹层时调用。
+    无边框外壳的标题条整条按 HTCAPTION 交给 OS，弹层矩形伸进
+    标题条时里面的按下会被当成拖拽标题吞掉——菜单行看得见
+    点不到；登记后这部分命中还给客户区。
 
 - int BlockHitsMenu()
   - 全窗口 BlockHitsRect：模态遮罩的标准遮罩，其
@@ -1699,6 +1841,23 @@ App 保留动画存储中的一个带键补间/状态槽。取代了
   - 本次按压已持续的毫秒数；无按压时值无意义。
     触摸上的"长按提示"门控（Ui.HoldTipIn）用它把
     按住时长当作悬停稳定时长的等价物。
+
+
+## AttrCond (class)
+
+`[attr op "value"]` 里的一个属性条件（见 Selector.attrs）。
+op 为 "" 表示存在性（`[attr]`），否则是 `= ~= |= ^= $= *=`。
+name 是属性名（小写）：`class` 条件对 class 原文求值（immediate
+路径也可判）；其余条件查节点属性表（Control.CssAttr），只在
+retained 树内可判。
+
+- string name;
+
+- string op;
+
+- string val;
+
+- bool nocase;
 
 
 ## BackdropFx (class)
@@ -2101,11 +2260,15 @@ g.SetSelectedNum(30);           // 选中格批量设值
 
 - [DllImport("zan_gui")]static extern void zan_gui_draw_text(int surfaceId, int x, int y, string text, int color, int fontSize);
 
+- [DllImport("zan_gui")]static extern void zan_gui_draw_text_bold(int surfaceId, int x, int y, string text, int color, int fontSize);
+
 - [DllImport("zan_gui")]static extern void zan_gui_draw_text_rot(int surfaceId, int x, int y, string text, int color, int fontSize, int angle);
 
 - [DllImport("zan_gui")]static extern int zan_gui_measure_text(string text, int fontSize);
 
 - [DllImport("zan_gui")]static extern int zan_gui_font_height(int fontSize);
+
+- [DllImport("zan_gui")]static extern int zan_gui_font_ascent(int fontSize);
 
 - [DllImport("zan_gui")]static extern void zan_gui_text_stat_enable(int enabled);
 
@@ -2120,6 +2283,12 @@ g.SetSelectedNum(30);           // 选中格批量设值
 - [DllImport("zan_gui")]static extern void zan_gui_image_evict(string path);
 
 - [DllImport("zan_gui")]static extern void zan_gui_blit_image(int surfaceId, string path, int dx, int dy, int dw, int dh, int sx, int sy, int sw, int sh);
+
+- [DllImport("zan_gui")]static extern int zan_gui_sprite_handle(string key);
+
+- [DllImport("zan_gui")]static extern int zan_gui_bake_sprite(string key, int surfaceId, int x, int y, int w, int h);
+
+- [DllImport("zan_gui")]static extern void zan_gui_sprite_batch(int surfaceId, int handle, nint quads, int count);
 
 - [DllImport("zan_gui")]static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
 
@@ -2399,6 +2568,10 @@ g.SetSelectedNum(30);           // 选中格批量设值
 - void DrawText(int x, int y, string text, int color, int fontSize)
   - 在指定位置绘制文本。
 
+- void DrawTextBold(int x, int y, string text, int color, int fontSize)
+  - 粗体文本（ECharts title 默认 textStyle.fontWeight 'bold'）。
+    字形图集按 (文本, 字号, 字重) 分键，与常规文本互不干扰。
+
 - void DrawTextRot(int x, int y, string text, int color, int fontSize, int angleDeg)
   - 绘制绕锚点旋转的文本。`(x, y)` 是未旋转行盒的左上角，
     整行文本绕它刚性旋转；`angleDeg` 为度，正 = 顺时针（CSS
@@ -2415,6 +2588,11 @@ g.SetSelectedNum(30);           // 选中格批量设值
 
 - static int FontHeight(int fontSize)
   - 返回字体高度（像素）。
+
+- static int FontAscent(int fontSize)
+  - 基线上方的高度（GDI tmAscent / FreeType ascender）。行盒
+    baseline 数学用：同一系统字体在 Chrome 的行布局要逐像素
+    对上，inline 盒必须按真基线放。异常度量时回退整格高。
 
 - static int FontPadTop(int fontSize)
   - 栅格化器在 FontHeight 内字形墨迹上方留下的空行
@@ -2519,6 +2697,26 @@ g.SetSelectedNum(30);           // 选中格批量设值
     （box filter，避免 nearest 丢列/丢行的闪烁），放大或 1:1 时
     按目标像素中心最近邻采样。传 sw=0,sh=0 以整幅图像为源。
 
+- public int SpriteHandle(string key)
+  - 注册精灵图源（图像路径，或 ImageLoadMem 的 "mem:" key），
+    返回稳定句柄（>0，0 = 解码失败）。同一 key 幂等返回同句柄。
+    句柄供 `DrawSprites` 批量提交，避免每精灵跨一次 FFI。
+
+- public int BakeSprite(string key, int x, int y, int w, int h)
+  - 把本画布的指定矩形区域（或整画布）烘焙成精灵图集条目
+    （A356 P0 烘焙层）：将自绘特效/血条/卡牌框一次性光栅化进内存图集，
+    之后作为贴图四边形提交到 SpriteBatch，避免每帧重复自绘。
+    返回 sprite handle（可在 DrawSprites / SpriteBatch.Draw 中使用）。
+
+- public int BakeSprite(string key)
+
+- public void DrawSprites(int handle, nint quads, int count)
+  - 提交打包精灵批（A356 P0 的批量贴图通路）：quads 每精灵
+    10 个 float——dx,dy,dw,dh, sx,sy,sw,sh, tint(0xAABBGGRR，-1=不染色)，
+    保留位；count 为精灵数。源 w/h<=0 取整图。一层一次 FFI：
+    GPU 路径并入顶点批（不落 CPU 光栅），CPU 兜底逐个 blit。
+    打包缓冲由 <c>SpriteBatch</c> 维护，跨帧复用。
+
 - void DrawImage(string path, int x, int y)
   - 在 (x,y) 处不缩放地绘制整幅图像文件。
 
@@ -2610,6 +2808,24 @@ cache of this render loop, not a declaration. This is the dialog
 
 - List<string> boundSnaps;
 
+- List<Control> tmplKeys;
+  - `<template data-for>` 展开登记（平行列表，按模板控件引用线性
+    查找——与 boundKeys 同一 house pattern）：tmplKeys = 模板原型
+    控件，tmplCounts = 上帧源数组长度（变化才重建行），rowRoots =
+    已展开的行根（原型子项的克隆，插在模板紧后），rowTmpl = 行
+    归属的模板。scopeKeys/scopeVals = 行内绑定作用域（行内声明了
+    bind/bindIf 的控件 → 本项 JsonValue；项内命中优先，回落根模型）。
+
+- List<int> tmplCounts;
+
+- List<Control> rowRoots;
+
+- List<Control> rowTmpl;
+
+- List<Control> scopeKeys;
+
+- List<JsonValue> scopeVals;
+
 - ChildWindow()
   - 构造：全部字段置空/默认（idBase 基线 900000）。
 
@@ -2654,6 +2870,17 @@ cache of this render loop, not a declaration. This is the dialog
   - Registers (or replaces) the Action bound to a design handler name;
     Wire() resolves each control's `on<Event>` names through this table.
 
+- void HandleArg(string name, Action<string> a)
+  - Registers the `Action<string>` for a handler name declared with
+    `data-arg`: controls carrying that attribute get the attribute value
+    passed as the argument (Html.WireArg / WireNode 闭包捕获)。
+
+- void HandleSender(string name, ControlEvent a)
+  - 注册绑定到 `name` 的带 sender 处理器（平行通道）：Wire() 解析到
+    具体控件时，把该控件作为实参交给处理器——一个 HandleSender
+    可以服务整棵树上的多个绑定，处理器按 sender 区分来源。
+    与 Handle 相互独立；同名两槽都注册时各建一条订阅（多播）。
+
 - void Wire()
   - Resolves every recorded `on<Event>` handler name to its Action and
     pushes the model into the bound controls (state -> UI). Call once
@@ -2661,6 +2888,9 @@ cache of this render loop, not a declaration. This is the dialog
 
 - void WireNode(Control c)
   - 递归解析控件树上的 `on<Event>` 处理器名并绑定到已注册的 Action。
+    sender 槽（HandleSender）绑定闭包捕获被接线控件；带 `data-arg`
+    声明的控件优先走带参槽（实参闭包捕获 = 值快照）；带参槽未注册
+    时回落无参解析。各槽独立成订阅，同名多槽注册时多播。
 
 - void SyncFromModel()
   - 把绑定的状态实体值推入每个声明了 `bind` 路径的控件
@@ -2669,10 +2899,16 @@ cache of this render loop, not a declaration. This is the dialog
 
 - void SyncFromNode(Control c)
   - 递归把模型值推入声明了 bind 路径的控件（值变化才写），
-    并记录绑定快照。
+    按 bindIf 声明插拔显示，并记录绑定快照。`template` 原型子树
+    不参与同步/回写（它是克隆底版，不是活界面）。
 
 - void SyncChangedNode(Control c)
   - 把每个绑定控件的当前值读回状态实体（UI -> state）。
+
+- JsonValue ValueFor(Control c, string path)
+  - 绑定路径取值：控件在模板行作用域里（scopeKeys 有登记）先查
+    本项 JsonValue，未命中回落根模型——行内相对路径（"name"）与
+    绝对路径（"vm.title"）因此可以在同一行混用。
 
 - void RecordSnapshot(Control c, string v)
   - 记录（或更新）控件绑定属性的模型侧确认值——上次由模型
@@ -2688,7 +2924,47 @@ cache of this render loop, not a declaration. This is the dialog
 
 - void WriteBoundValue(Control c, string s)
   - 把字符串值写回模型节点：按现有节点的类型转换为
-    bool / 数值 / 字符串，保持模型原有的形状。
+    bool / 数值 / 字符串，保持模型原有的形状。行作用域控件写到
+    本项 JsonValue（数组元素的引用，就地生效）。
+
+- void RegisterTemplates(Control c)
+  - Wire 期登记静态树上的模板原型（v1 不支持嵌套模板：原型子树
+    不再下扫）。未挂模型时登记了也惰性——展开只发生在
+    SyncFromModel。
+
+- void EnsureExpanded()
+  - 每帧核对各模板的源数组长度；与上帧一致就什么都不做（行是活
+    控件，绑定照常同步），变了才整组重建。
+
+- void RemoveRows(Control t)
+  - 撤除模板 `t` 的全部行（数组重建前调）：从各自的父节点摘下
+    并清掉行内控件的作用域登记。
+
+- void DetachRow(Control row)
+  - 行根脱父：Element 父走 DropKid（文档序表一并清，不留幽灵
+    占位），控件父走普通 Remove。
+
+- void ScopeRow(Control c, JsonValue item)
+  - 登记行子树里所有声明了 bind/bindIf 的控件的作用域（本项
+    JsonValue）。只登记声明了绑定的控件——表按引用线性查，登记
+    面越小每帧越便宜。
+
+- void ScopePut(Control c, JsonValue item)
+
+- JsonValue ScopeOf(Control c)
+  - 控件的行作用域；不在任何行里返回 null。
+
+- void ScopeDropRow(Control c)
+  - 撤行时清作用域登记：行子树里声明了绑定的控件逐个摘除（就地
+    压缩，尾部截断）。残留条目永不命中（键是引用），但数组频繁
+    重建的窗口靠这一步封住增长。
+
+- void ScopeDropOne(Control c)
+
+- static bool Truthy(JsonValue v)
+  - data-if 路径取值的真值裁决：null 假；布尔原样；数字非 0；
+    字符串非空且不为 "false"。比 AsBool 的严格 "true" 宽——HTML
+    侧路径值多是字符串状态名（"on"/"done"）。
 
 - virtual bool Pending()
   - Extra reasons to repaint: actions raised by handlers between
@@ -2699,7 +2975,7 @@ cache of this render loop, not a declaration. This is the dialog
 
 - virtual void OnLanguageChanged(string lang)
   - 语言切换广播：宿主把 UI 语言切到 `lang`（"zh" / "en" 语言码）后，
-    对每个开着的子窗口调用一次。子类在这里重填 zform 的设计期
+    对每个开着的子窗口调用一次。子类在这里重填设计文档的设计期
     文案（ApplyTexts 模式）并刷新依赖语言的静态扇出字段；窗口
     标题由基类重取 Title() 处理，子类无需关心。
 
@@ -2723,6 +2999,8 @@ cache of this render loop, not a declaration. This is the dialog
   - Drives this window without a parent application's loop. ProcessEvent
     supplies the blocking event wait when there is no redraw or animation,
     so a background job can be observed without a busy loop.
+    注意：仅用于无主窗口循环的单机独立控制台场景；在包含 App.Run 的 GUI 程序中
+    请优先使用普通子窗口或协程 await 驱动，禁止使用嵌套独立泵打断主界面渲染。
 
 - void PumpStandaloneUntilKeepOpen(ChildWindowStop stop)
   - Drives the standalone window without closing it when the stop condition
@@ -2811,10 +3089,20 @@ same way as one opened from the ribbon.
 
 - static FilePicker picker;
 
+- static long routedSeq;
+  - 最近一次已路由的事件序号与结果（`RouteEvent` 幂等）。标准循环
+    `Form.Run` 与自带帧钩子的宿主（ZanIDE 外壳）都会按 hwnd 路由，
+    同一事件经两处必然把一次按压/释放重放一遍——双击计数、长按
+    计时、拖拽起点都会被算两遍。事件序号是"每投递一个新事件 +1"，
+    正好是那件事件的身份证；它同时挡住动画帧里 `EventKind()` 的
+    陈旧回读（没有新事件时序号不变）。
+
+- static bool routedHandled;
+
 - static List<FilePicker> pickers;
   - 组件自建的附加选择器（Upload 内建选文件弹窗等）。单一 `picker`
     槽归应用 shell 注册的共享选择器所有（IDE 的 pathPicker）；这批
-    由组件按需登记，数量不限。PumpAll/Route/Wants 统一照顾两处。
+    由组件按需登记，数量不限。PumpAll/RouteEvent/Wants 统一照顾两处。
 
 - static List<ChildWindow> All()
   - 注册表（惰性创建）。
@@ -2870,9 +3158,12 @@ same way as one opened from the ribbon.
   - Requests a repaint on every window whose deadline has passed; true when
     at least one was due.
 
-- static bool Route(nint hwnd)
-  - Hands the event to the window it is addressed to; false when no child
-    owns it (it belongs to the main window or the file picker).
+- static bool RouteEvent(nint hwnd)
+  - 把事件交给它所属的那扇顶层窗口（子窗口 / 共享选择器 / 组件
+    选择器）；都不属于时返回 false（那是主窗口自己的事件）。
+    由事件泵 `App.ProcessEvent` 对每一件非本窗口事件调用一次，
+    宿主循环因此不必知道 hwnd 路由这回事。幂等（按事件序号）：
+    自带循环/帧钩子的宿主若再调一次，同一件事件不会被送第二遍。
 
 - static bool PaintForResize(nint hwnd)
   - Paints one frame for the child window that owns `hwnd` (called from the
@@ -2973,6 +3264,15 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
     首选尺寸，因此根据子节点自测量的容器
     会保留给定的那个轴。
 
+- bool fillW;
+  - 该轴的 prefW/prefH 是容器按内容补齐的（MeasureDocked /
+    MeasureFlexContent），不是作者或控件自定的。这类值每帧
+    先清零再重算：首帧样式或缩放还没就位时算出的错值，靠
+    「非零就不重算」的补齐规则会永远留在控件上（曾把徽标行
+    钉死在 20px，33px 的徽标被行裁掉底部）。
+
+- bool fillH;
+
 - int logW;
   - Sizes a document declares (UiDoc `width`/`height`/`gap`/`pad`/`x`/`y`)
     are logical pixels, written as they look at 100%. They are kept apart
@@ -3010,6 +3310,10 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
     宿主要把子树排进一个已知宽度的矩形时，用 HintWrapWidth 直接
     给出宽度，第一次测量就能算准行数。
 
+- List<FloatIntrusion> hostFloats;
+  - 父块流传下的 float 入侵（P3 绕排，坐标已换算到本块内容框）。
+    float 在父级落位后回填、定位后重测高度；无 float 时为 null。
+
 - bool visible;
 
 - int bx;
@@ -3020,6 +3324,20 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
 - int bw;
 
 - int bh;
+
+- int scrollY;
+  - CSS 滚动容器（P6）：当前滚动偏移与最近一次排布出的内容延伸
+    （padding-box 坐标，px）。偏移在 Arrange 期按延伸钳制并把
+    子树平移 -scrollY / -scrollX；交互状态（滚轮/拖动）惰性建。
+
+- int scrollExtent;
+
+- int scrollX;
+  - 水平轴（P6 横滚）：overflow-x auto/scroll 与纵向同语义。
+
+- int scrollExtentX;
+
+- ScrollState scroll;
 
 - weak Control parent;
 
@@ -3075,6 +3393,19 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
   - 绑定写入的控件属性名（SetProp/GetProp 认的名字）。
     为空时 ChildWindow 依次回退 `value`/`text`。
 
+- string bindIf;
+  - data-if 声明（HTML `data-if` / JSON `if`）：模型路径真值插拔。
+    挂了模型的 ChildWindow 每帧按模型该路径的真值调 SetShown；
+    无模型宿主时惰性（恒显示）。与 bindPath 同型的声明通道，
+    Serialize 尾部可选字段。
+
+- string handlerArg;
+  - data-arg 声明（HTML `data-arg`）：本控件 data-on-* 事件
+    处理器的实参。Wire 期经注册表的 Action<string> 槽闭包捕获
+    （Html.WireArg / ChildWindow.WireNode）；无参注册表照旧按
+    无参 Action 接线。空 = 无参。声明通道，v1 不进序列化
+    （设计器事件模型是纯名字，带参文档由 HTML 层承载）。
+
 - string Class;
   - 可选样式类（JSON `class`），供 StyleSheet 通过 `.class` 选择器
     把声明级联到此控件。空 = 无。
@@ -3104,6 +3435,11 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
     悬停/按下插值出的过渡态，不可复用）。测量按常态进行，
     有了它，一帧里没有变化的节点就不必重新走一遍样式解析。
 
+- string computedStyleCtx;
+  - computedStyle 是在哪个树上下文签名（Style.CtxSig）下解析的：
+    组合器/结构性伪类让样式随节点位置变化，控件被挪到别的容器后
+    必须重解析。"" = 无树上下文（immediate 或表内无此类规则）。
+
 - string styleTypeLower;
   - Kind() 的小写形式（默认的类型选择器）。每帧每节点都要问
     好几次，现算就是每次一个新字符串。
@@ -3115,6 +3451,8 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
 - int styleBgTo;
 
 - int styleRadius;
+
+- int styleCorners;
 
 - int styleBorderColor;
 
@@ -3142,6 +3480,12 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
 
 - Control Radius(int r)
   - 设置圆角半径（px），并使样式缓存失效；返回 this。
+
+- Control Corners(int m)
+  - 设置起效圆角掩码（Corner.TL/TR/BL/BR 组合），并使样式缓存失效；返回 this。
+
+- int Corners()
+  - 获取当前起效圆角掩码。
 
 - Control Border(int color, int w)
   - 设置边框颜色与宽度（px），并使样式缓存失效；返回 this。
@@ -3218,6 +3562,66 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
 - Control OnHide(Action a)
   - 订阅生命周期事件 Hide（可见性翻转为隐藏时触发）并返回 this。
 
+- Control OnClickS(ControlEvent h)
+  - 订阅 Click 事件（处理器收到本控件）并返回 this。
+
+- Control OnDoubleClickS(ControlEvent h)
+  - 订阅 DoubleClick 事件（处理器收到本控件）并返回 this。
+
+- Control OnRightClickS(ControlEvent h)
+  - 订阅 RightClick 事件（处理器收到本控件）并返回 this。
+
+- Control OnChangeS(ControlEvent h)
+  - 订阅 Change 事件（处理器收到本控件）并返回 this。
+
+- Control OnEnterS(ControlEvent h)
+  - 订阅 Enter（指针进入）事件（处理器收到本控件）并返回 this。
+
+- Control OnLeaveS(ControlEvent h)
+  - 订阅 Leave（指针离开）事件（处理器收到本控件）并返回 this。
+
+- Control OnMouseDownS(ControlEvent h)
+  - 订阅 MouseDown 事件（处理器收到本控件）并返回 this。
+
+- Control OnMouseUpS(ControlEvent h)
+  - 订阅 MouseUp 事件（处理器收到本控件）并返回 this。
+
+- Control OnWheelS(ControlEvent h)
+  - 订阅 Wheel 事件（处理器收到本控件）并返回 this。
+
+- Control OnFocusS(ControlEvent h)
+  - 订阅 Focus 事件（处理器收到本控件）并返回 this。
+
+- Control OnBlurS(ControlEvent h)
+  - 订阅 Blur 事件（处理器收到本控件）并返回 this。
+
+- Control OnKeyDownS(ControlEvent h)
+  - 订阅 KeyDown 事件（处理器收到本控件）并返回 this。
+
+- Control OnKeyUpS(ControlEvent h)
+  - 订阅 KeyUp 事件（处理器收到本控件）并返回 this。
+
+- Control OnLongPressS(ControlEvent h)
+  - 订阅 LongPress 事件（处理器收到本控件）并返回 this。
+
+- Control OnSwipeS(ControlEvent h)
+  - 订阅 Swipe 事件（处理器收到本控件）并返回 this。
+
+- Control OnDragS(ControlEvent h)
+  - 订阅 Drag 事件（处理器收到本控件）并返回 this。
+
+- Control OnDropS(ControlEvent h)
+  - 订阅 Drop 事件（处理器收到本控件）并返回 this。
+
+- Control OnResizeS(ControlEvent h)
+  - 订阅生命周期事件 Resize（处理器收到本控件）并返回 this。
+
+- Control OnShowS(ControlEvent h)
+  - 订阅生命周期事件 Show（处理器收到本控件）并返回 this。
+
+- Control OnHideS(ControlEvent h)
+  - 订阅生命周期事件 Hide（处理器收到本控件）并返回 this。
+
 - bool IsDisabled()
   - 当控件自身被禁用或位于被禁用的祖先之下时为 true，
     控件正是据此解析其 `:disabled` 样式及其
@@ -3253,9 +3657,28 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
     这样针对表面的样式表规则
     （内边距、背景、模糊）不会作用于布局节点。
 
-- StyleBox ResolveStyle(App app, int state)
+- virtual void OnChildEvent(Control child, string evt)
+  - 子控件事件冒泡钩子：子控件的用户切换在自己的 Change 之后经
+    weak parent 反向通知到这里，容器按需覆写。取代「子事件表挂
+    捕获容器的闭包」的旧接线——那构成 容器→子→事件表→闭包→容器
+    引用环，ARC 不回收，逐选项泄漏（leakcheck_checkbox_group /
+    radio_group）。默认无操作；evt 目前只有 "Change"。
+
+- virtual string CssAttr(string key)
+  - CSS 属性选择器的取值源（`[type="text"]`/`[data-x]`/`[href]`）。
+    基类只认 `id`（=设计器名 name）；带真实属性表的节点（HTML 层
+    的 Element）覆写它。返回 "" 表示属性不存在——存在性条件
+    `[attr]` 不命中，与"没有树上下文就不命中"同一约定。
+
+- virtual bool CssHasAttr(string key)
+  - 属性存在性（`[attr]` 无操作符条件）：与 CssAttr 并行的口径——
+    属性可以在表里但值为空串（HTML 布尔属性 ``），
+    那种情况存在性要成立，而取值比较对空串本就没有意义。
+
+- virtual StyleBox ResolveStyle(App app, int state)
   - 按本控件的 StyleType/Class/name 解析 `state` 状态的样式
-    （含 inline 覆盖），并记入 computedStyle。
+    （含 inline 覆盖），并记入 computedStyle。虚方法：Element
+    覆写以在宿主盒解析后顺带取 ::before/::after 伪文本。
 
 - StyleBox ResolveStyleAs(App app, string type, string cls, int state)
   - ResolveStyle 的显式类型/类版本（部件或借用其他类型外观的
@@ -3329,9 +3752,50 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
 - int StylePadB()
   - 内容框底部内边距：显式 Pad()/Padding() 优先于样式表（同 StylePadL）。
 
+- int StyleInsetL()
+
+- int StyleInsetT()
+
+- int StyleInsetR()
+
+- int StyleInsetB()
+
 - int StyleDisplay()
   - 此节点的 CSS `display`：0 block（子节点停靠），1 flex（子节点沿
     flex-direction 排列），2 none。
+
+- int StyleOverflowX()
+  - CSS overflow 的 per-axis 计算值（P6）：0 visible / 1 hidden /
+    2 auto / 3 scroll。单轴声明时另一根的 visible 按规范计算成
+    auto（CSS Overflow——混合 visible 会让 visible 轴变 auto）。
+
+- int StyleOverflowY()
+
+- bool IsScrollContainer()
+  - 是否为滚动容器：任一轴声明了非 visible 的 overflow。
+
+- void SetScrollTop(int v)
+  - 程序性滚动（等价 el.scrollTop = v）：下一帧 Arrange 钳制并把
+    子树平移。overflow:hidden 的容器同样可程序滚动（Chrome 同款，
+    只是没有滚轮/滚动条交互）。
+
+- int ScrollTop()
+  - 当前滚动偏移（px，钳制后）。
+
+- int ScrollExtent()
+  - 最近一次排布出的内容延伸（padding-box 坐标，px；
+    等价 DOM scrollHeight 与 clientHeight 取大）。
+
+- void SetScrollLeft(int v)
+  - 程序性横向滚动（等价 el.scrollLeft = v，P6 横滚）：钳制与
+    子树平移同 SetScrollTop，下一帧 Arrange 收口。
+
+- int ScrollLeft()
+  - 当前水平滚动偏移（px，钳制后）。
+
+- int ScrollExtentX()
+  - 最近一次排布出的水平内容延伸（padding-box 坐标，px；
+    等价 DOM scrollWidth 与 clientWidth 取大）。
 
 - int StyleWidthIn(int avail)
   - 在 `avail` 像素的包含块内声明的主/交叉轴尺寸，
@@ -3344,12 +3808,19 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
 
 - bool StyleDeclaresWidth()
   - 样式表声明了宽度/高度（如 `button.large` 这样的尺寸类）时为 true，
-    区别于测量偏好。停靠在行中的子节点
-    若声明了交叉轴尺寸则保留它（并居中），而不是
-    被拉伸到行高。
+    区别于测量偏好。百分比声明（width:50%）也算——调用方必须传入
+    真实包含块基准（avail），% 才有定义；包含块未定的测量期调用方
+    （grid 轨道、float 重测、内在宽）请用 *Abs 变体，让 % 按 auto
+    回落测量偏好（css-sizing：内在尺寸计算中百分比视作 auto）。
 
 - bool StyleDeclaresHeight()
   - 样式表声明了高度时为 true（与 StyleDeclaresWidth 配对使用）。
+
+- bool StyleDeclaresWidthAbs()
+  - 只认绝对值（px）声明的宽度：包含块未定的测量期判定用。
+
+- bool StyleDeclaresHeightAbs()
+  - 只认绝对值（px）声明的高度，同 StyleDeclaresWidthAbs。
 
 - int StyleGrow()
   - 此节点的 CSS `flex-grow`（0 = 保持自身尺寸）。
@@ -3376,8 +3847,37 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
 - int StyleAspect()
   - CSS `aspect-ratio` 的千分比（0 = 未声明）。
 
-- int StyleMarL()
+- int StylePosition()
+  - 此节点的 CSS `position`：0 static，1 relative，2 absolute/fixed。
+    absolute 子项脱离常规流（测量与排布两端都跳过），由
+    ArrangePositioned 按偏移边定位。
+
+- int StyleZIndex()
+  - CSS `z-index`（0 = 文档序；有非零值时兄弟绘制与命中
+    都按值稳定排序）。
+
+- int StyleOrder()
+  - CSS `order`（flex 排布顺序；0 保持文档序，同值稳定）。
+
+- int StyleInlineLevel()
   - 样式表声明的外边距（px；未解析样式时为 0）。
+    行内级（P2 行盒）：`inline`/`inline-block`/`inline-flex` 置 1，
+    块流容器把它排进行盒而不是当独立块。
+
+- int StyleFloat()
+  - 块流 float（P3）：0 无 / 1 left / 2 right——非零时子项脱离
+    垂直堆叠、行盒绕排（CSS 2.1 §9.5）。
+
+- int StyleClear()
+  - clear（P3）：0 无 / 1 left / 2 right / 3 both——顶边被推到
+    相关 float 底边之下。
+
+- virtual List<FlowEntry> FlowEntries()
+  - 块流内容序列（P2）：按此序列分段/排布——默认只有子项
+    （FlexKids 过滤）；Element 覆写为文档序的 文本/子项 混合
+    序列（AddText/AddKid 交错）。
+
+- int StyleMarL()
 
 - int StyleMarT()
   - 样式表声明的外边距（px；未解析样式时为 0）。
@@ -3419,7 +3919,7 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
 - void FireOn(App app, int id)
   - 针对 `id` 触发此节点的通用事件包。控件在
     注册命中区域后每帧调用一次；等价于
-    On.Fire(app, id)，但调用点更统一。
+    On.Fire(app, id, this)，但调用点更统一。
 
 - Control Dock(int d)
   - 设置停靠方式（Dock.* 值）；返回 this。
@@ -3533,6 +4033,8 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
 - Control HitTest(int x, int y)
   - 其已解析边界包含该点的最深层可见后代，
     优先选择更靠后（最上层）的子节点。用于设计器命中选择。
+    子项带非零 z-index 时按绘制序的逆序试命中（值大的先试，
+    同值保持文档序靠后者优先），与 RenderTree 的绘制顺序一致。
 
 - Control Find(string n)
   - 按名称深度优先搜索，包括本节点。找不到返回 null。
@@ -3576,6 +4078,118 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
     少了这一步，只有最外层容器能拿到宿主给的宽度：嵌在一列里的
     换行 flex 行会按单行测量，第二行被裁掉。
 
+- static int CollapseMargins(int a, int b)
+  - 相邻两个塌陷 margin 的合并值（CSS 2.1 §8.3.1）：同为非负取大；
+    同为负取绝对值大的；一正一负相加。
+
+- bool FlowSepT()
+  - 顶部是否有"分隔"（即不与首子的 margin-top 塌陷）：BFC
+    （flow-root/行内级/overflow != visible/absolute 定位容器）、
+    非 block 流容器，或 border-top/padding-top 把首子隔开。
+
+- bool FlowSepB()
+  - 底部分隔（不与尾子的 margin-bottom 塌陷），规则同 FlowSepT。
+
+- int FlowMarT(Control c)
+  - 子项 `c` 在块流父里的有效上外边距：display:flow 的普通容器
+    （非 BFC、无分隔内衬）与首子塌陷——递归取链上合并值；
+    其余原样返回自身 margin-top。空块的双边自塌在兄弟链合并。
+
+- int FlowMarB(Control c)
+  - 子项 `c` 的有效下外边距，规则同 FlowMarT（对最后一个流内子项）。
+
+- bool IsEmptyFlowBlock(Control c)
+  - 块流意义上的空块（CSS 2.1 §8.3.1 自塌条件）：display:flow、
+    无流内子项、无匿名文本、块尺寸为零——声明高 >0、min-height
+    >0、上下 border/padding 任一非零都使它成为真实盒子
+    （`height: 0` 仍是零，塌穿；`height: 30px` 不塌）。
+
+- virtual string FlowText()
+  - 行内内容（P2 行盒）：元素直接持有的裸文本（Element.SetText）。
+    Control 没有；Element 覆写。块流容器把它与行内级子项一起排成
+    行盒（自身文本在前——"text…" 的文档序
+    简化；文本与块子项交错的真实序要等 P5 HTML 层）。
+
+- virtual void InlineRunsBegin()
+  - 行盒排布期钩子：本节点将作为行内参与者被落位——先清上一帧
+    的 run 缓存（Element 覆写；绘制端以"本帧是否 fresh"防陈旧）。
+
+- virtual void InlineRunPlace(int x, int topY, int w, int h, int drawOff, int fs, string text)
+  - 行盒排布期钩子：落位一个文本 run。坐标与 Arrange 同一空间
+    （窗口根相对）；topY = piece 顶（基线 − asc），drawOff =
+    半行距下移，DrawText y = topY + drawOff。
+
+- void MeasureFlow(App app)
+  - 真块流测量（P1）：margin 塌陷后取各块高度之和——兄弟相邻
+    margin 合并、容器不塌陷（FlowSepT/B）时首/尾 margin 计入
+    内容高、塌陷时塌出容器外由父结算。gap 在相邻已放置块之间
+    追加。空块（无内容无子）只贡献一条塌陷链不占高；"只有空块
+    的 BFC 容器"把链关在内容框里占高。
+
+- void ArrangeFlow(int cx, int cy, int cw, int ch, int gapPx)
+  - 真块流排布（P1）：pending 携带"已塌陷未结算"的下义务 margin，
+    遇到下一个块的上 margin 时合并落位；首/尾链在分隔容器里计入
+    内容位，普通容器里塌出容器外。`margin-left/right: auto` 把
+    声明宽以外的剩余空间分给对应边（两边 auto = 水平居中，
+    CSS 10.3.3）。容器高 auto（fillH）时子项百分比高按 0，与
+    测量端一致。
+
+- void SetHostFloats(Control c, List<FloatIntrusion> src, int dx, int dy)
+  - 把父级的 float 入侵表换算成本块内容框坐标后传给 `c`（P3 绕
+    排）：float 影响后代块的行盒，而各层排版都在自己的内容框里
+    做，坐标要逐级平移。无 float 时清空，防上一帧残留。
+
+- void PlaceFloatKid(List<FloatIntrusion> floats, Control c, int frameW, int yFlow, int cx, int cy, bool place)
+  - 放一个 float 子项（P3，CSS 2.1 §9.5.1 简化子集）：从流位置
+    yFlow 起，clear 先推；左 float 贴同行左 float 右缘/内容左缘，
+    右 float 镜像；放不下（越内容右缘/撞右 float）下坠到最低
+    float 底（NextShelf），无处可坠就原地溢出（防呆不挂死）。
+    入侵记录用内容框坐标 x 与流坐标 y（margin box 语义）；place
+    时把子项 Arrange 到 border box。测量/排布两端共用同一算法，
+    行盒绕排的高度才与落位一致。
+
+- StyleBox InheritText(StyleBox parent, StyleBox own)
+  - 行内文本的继承态（CSS 可继承属性在行盒里的落地）：段内文本
+    未声明 font-size / line-height / white-space 时随容器——span
+    不写 line-height 时浏览器用的就是父级行高，少了这一步混排
+    基线整体错位。只服务行盒 piece；块级子树的样式解析不受影响。
+
+- FlowSegment FlowLayoutSegment(List<FlowEntry> seg, int wrapW, int wAvail, List<FloatIntrusion> floats, int segY)
+  - 排版一个行内段（P2）：条目 = 文本块（容器自身）或行内子项
+    （无子且有文本 → 文本 run、否则原子盒）。wrapW 是折行宽
+    （测量端 = 断行提示，0 = 单行；排布端 = 内容宽），wAvail 是
+    百分比宽的包含块（测量端按 0，shrink-to-fit 同规矩）。
+    floats/segY（P3）：段前的 float 入侵表与段在流里的起点——
+    行盒绕排用；floats 为 null/空时与旧路径逐 bit 相同。
+
+- void FlowSegmentPlace(FlowSegment fs2, int cx, int y0, int availW, int align, List<FlowEntry> seg)
+  - 落位一个行内段（P2）：text-align 分配行内剩余空间；文本 piece
+    回填 owner 的 run 缓存（InlineRunPlace）；原子盒按
+    vertical-align（baseline 下 margin 边坐基线 / middle 对
+    baseline + x 高一半 / top、bottom 对行盒上下）落位；文本型
+    owner 的矩形 = 全部 run 的并集（inline 盒的 Chrome 矩形语义）。
+
+- List<Control> GridItems()
+  - grid 条目：可见、非定位、非 none 的直接子项（文档序）。
+
+- int GridOuterW(Control c)
+  - 条目外围宽（轨道尺寸用）：声明宽用声明值（包含块未定，%
+    按 auto 回落测量偏好，与块流测量同规矩）；加水平 margin。
+
+- int GridOuterH(Control c)
+
+- void MeasureGridContent(App app)
+  - 按内容测量一个 `display: grid` 容器：列轨先定宽（声明宽的容器
+    按声明内容宽放大 fr/auto，auto 容器只按内容基尺寸），宽度相关
+    的条目高度按所在列宽重测后定行轨。只填补留空的轴。
+
+- void ArrangeGrid(int cx, int cy, int cw, int ch)
+  - grid 排布（P4）：列轨按实际内容宽定尺寸 → 宽度相关条目重测 →
+    行轨定尺寸 → 逐条目落格。格内对齐：inline 轴 justify-items、
+    block 轴 align-items（0 stretch / 1 start / 2 center / 3 end）；
+    stretch 只对未声明尺寸的条目生效，声明了尺寸按 start（Chrome
+    同款）。
+
 - void MeasureDocked(App app)
   - 停靠容器在没人给尺寸时按内容测量：一列停靠的行
     高等于各行之和，一行停靠的控件宽等于各控件之和
@@ -3598,9 +4212,33 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
 - static int FitGap(int requested, int available)
   - 把请求间距钳制到剩余空间内；剩余 <= 0 时返回 0。
 
-- virtual void Arrange(int px, int py, int pw, int ph)
+- void ArrangeScrollTail(int clientH)
   - 计算此节点及其子树（通过停靠）的边界。
     虚方法，使容器（如 ScrollColumn）可以偏移/裁剪其子节点。
+    滚动容器排布收口（P6）：流/flex/grid/legacy 四条排布路径都
+    经过这里；非滚动容器零开销。clientH 是内容框高。
+
+- void UpdateScroll(int clientH, int padB)
+  - Arrange 尾段（P6 滚动容器）：算内容延伸、钳偏移、把子树平移
+    -scrollY/-scrollX。延伸 = 可见内容底/右缘（子项 border-box，
+    absolute 后代也计入——Chrome 里 abs 后代贡献滚动溢出）+ 自身
+    对应侧 padding，换算到 padding-box 坐标；下限 = client 尺寸
+    （内容不足不滚）。`clientH` 是内容框高，`padB` 是内容框底
+    padding（延伸含它，CSSOM scrollHeight/scrollWidth 同义）。
+
+- void ShiftTree(int dx, int dy)
+  - 子树整体平移（滚动偏移的渲染/命中实现）：后代都是绝对坐标，
+    逐层平移；下一帧 Arrange 从自然位置重排，不会累积。
+
+- virtual void Arrange(int px, int py, int pw, int ph)
+
+- void ArrangePositioned(int cx, int cy, int cw, int ch)
+  - 排布 `position` 子项。absolute/fixed 脱离常规流（停靠/flex
+    的测量与排布两端都跳过它），包含块是父内容框：top/right/
+    bottom/left（inset 展开成这四条）里声明的边起作用，宽度
+    优先取声明值，左右两边都声明时用差值，否则取测量偏好；
+    relative 不脱流，在流位置上平移（left/right 同设按 CSS 用
+    left，top/bottom 同设用 top，未声明当 0）。
 
 - static bool overlapEnvRead;
   - 环境变量只读一次，避免每帧碰内核。
@@ -3669,7 +4307,7 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
 
 - void ReportLint(Control c, string rule, string detail)
 
-- void ArrangeFlex(int cx, int cy, int cw, int ch, int gapPx)
+- List<Control> FlexKids()
   - 把子节点作为一个 CSS flex 容器排布在本节点的内容框内。
     
     `flex-wrap: nowrap`（默认）时全部子节点排成一条 flex 行。
@@ -3678,6 +4316,12 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
     之间用交叉轴间距（row 容器取 `row-gap`，column 容器取
     `column-gap`，都回退到 `gap`）分隔，多余的交叉轴空间按
     `align-content` 分配。每一行内部的规则见 ArrangeFlexLine。
+    flex 容器参与排布的子项：可见、非 absolute（absolute 脱离
+    常规流）、按 CSS `order` 稳定排序（同 order 保持文档序）。
+    测量（MeasureFlexContent）与排布（ArrangeFlex）共用同一份
+    顺序，断行行数才一致。
+
+- void ArrangeFlex(int cx, int cy, int cw, int ch, int gapPx)
 
 - void ArrangeFlexLine(List<Control> items, int cx, int cy, int cw, int ch, int gapPx, bool row, int crossOff, int crossBox)
   - 排布一条 flex 行：每个子节点取声明的主轴尺寸（px 或框的
@@ -3755,6 +4399,12 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
     自己的语义事件（Change/Submit/RowClick/...）路由到正确的
     UiEvent 字段，然后为通用事件集调用基类。JSON
     加载器用它附加经注册表解析的 `on<Event>` 处理器。
+
+- virtual void BindEventS(string evt, ControlEvent h)
+  - `BindEvent` 的 sender 通道：处理器在触发时收到
+    本控件。基类按事件名路由到 `WidgetEvents.AddByNameS`；
+    为 `BindEvent` 特化过事件（如 Change/Toggle）的
+    控件同样重写本方法，把对应名字接进自己的 UiEvent。
 
 - PropSpec PropOf(string key)
   - `key` 对应的规格；若此控件未发布该绑定
@@ -3859,6 +4509,39 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
     RenderTree（而非 Paint），因为一些控件已声明了静态
     Paint，而编译器仅按名称解析方法调用。
 
+- void RenderTreeInner(App app)
+
+
+## ControlBootstrap (class)
+
+标准保留控件的 HeavyControls 注册入口（与 CEF/WebView/Chart/
+DataTable 同一契约：先注册后可用）。ControlFactory 不再内联任何
+`new Xxx()` 分支——那样每个分支名都是活标识符，auto-stdlib 按需
+拉取会把全部控件文件（连同 ImageHttp→网络栈这样的重依赖）拖进
+每个程序的编译图。设计器生成代码与手写 `new Button()` 直接持有
+类型，不受影响；运行期按 kind 字符串重建（Serialize/Html 克隆、
+FormBuilder、动态表单）的宿主在启动时调用一次 `Install`。
+不调用的程序只编译自己拼写过的控件。
+
+- static bool installed;
+
+- static List<string> Names()
+  - ControlFactory 主 switch 原有的 kind 名单（设计器面板与
+    JSON 装载器的标准保留控件），外加设计器工具箱全量的
+    展示/反馈/导航/工控 kind——名单缺了它们，Serialize/Html
+    克隆、FormBuilder 动态表单按 kind 重建时拿到 null，控件
+    在运行期整体消失（与 GenForm.IsStdWidgetKind 对齐）。
+
+- static void Install()
+  - 注册全部标准 kind（幂等）。调用后 ControlFactory.Kinds() 与
+    Create(kind) 恢复完整名单。
+
+- static Control Make(string kind)
+  - kind → 控件实例（与原 ControlFactory 主 switch 逐分支等价；
+    泛型控件 DataGrid/Transfer 在 DataTableBootstrap、ChartHost 在
+    ChartBootstrap）。未注册 kind 返回 null（"miss 即 null"契约
+    不变——拼错的 kind 仍显式失败）。
+
 
 ## ControlChildren (class)
 
@@ -3883,13 +4566,15 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
 ## ControlFactory (class)
 
 反序列化时根据 Kind() 标签重建 Control，并为
-设计器的组件面板提供数据。保持为单一 switch，这样向设计器
-添加一个控件只需在这里改一行，再加上控件自身的模型
-重写（Kind/Props/GetProp/SetProp）。
+设计器的组件面板提供数据。本类不内联任何控件构造分支：那样
+每个分支名都是活标识符，auto-stdlib 按需拉取会把全部控件文件
+拖进每个程序的编译图（重家族教训的推广，见 ControlBootstrap/
+各 *Bootstrap）。标准控件经 ControlBootstrap.Install() 注册，
+重家族与宿主自有组件（IDE/画廊等）经各自 Bootstrap.Install()
+挂进同一张 HeavyControls 表，名单与构造都从它汇总。
 
 - static List<string> Kinds()
-  - Standard retained controls exposed to the designer and JSON loader.
-    Project components are appended by the project-generated registry.
+  - 已注册控件的全名单（设计器面板与 JSON 装载器用）。
 
 - static Control Create(string kind)
   - Construct the real Control named by `kind`. There is deliberately no
@@ -3925,26 +4610,6 @@ MeasureTree/InitControl/OnPaint/OnMeasure），以免与
 
 ## Css (class)
 
-一个小型 CSS 解析器：把以真实 CSS 文本编写的皮肤样式表转换成
-StyleSheet 已能应用的 选择器 -> 声明 映射。
-
-皮肤过去是 Zan 代码（每个皮肤一个 Theme 预设），因此任何超出
-调色板交换的东西——控件形状、渐变、阴影、各状态外观——都意味着
-要改控件代码。现在皮肤是放在美术资源旁的 `.css` 文件，
-GUI 在运行时加载，用户可以重新设计应用外观（或自带皮肤），
-而无需改动或重新构建任何代码：
-
-:root { --accent: #d92b2b; --radius: 999; }
-button.primary        { background: linear-gradient(#ffd76a, #e0a020);
-radius: var(--radius); border: 1 #8a5b12; }
-button.primary:hover  { background: #ffe08a; }
-tab.item:active       { border-bottom: 2 var(--accent); }
-
-有目的地支持（仅此而已，无更多级联）：声明块、选择器
-列表（`a, b { }`）、`:state` 后缀、`/* 注释 */` 以及 `:root`
-中以 `var(--name)` 引用的自定义属性。其余一律解析为
-普通属性，由 StyleSheet/控件决定其含义。
-
 - static StyleSheet Parse(string src)
   - 把 `src` 解析为样式表，选择器保留其 `:state` 后缀。
     格式错误的文档会产出所有干净解析出的部分，一条坏规则
@@ -3959,9 +4624,95 @@ tab.item:active       { border-bottom: 2 var(--accent); }
     只代表这份 CSS 自己声明了什么（Skin.ThemeOf 按它推导主题，
     掺进主题 token 就成了自我喂养）。同名时本身的变量胜出。
 
+- static string ResolveImports(string path)
+  - 读取 CSS 文件并把其中的 `@import "x.css";` / `@import url("x.css");`
+    语句替换成被引文件的内容。相对路径按引入者所在目录解析；
+    环形引用与超过 8 层的嵌套按空文本收场（浏览器对循环
+    @import 也只是忽略）。文件不存在返回 ""。
+
+- static string ResolveImportsDepth(string path, List<string> seen, int depth)
+
+- static int IndexOfImport(string s)
+  - `s` 里第一个不在字符串里的 `@import` 关键字位置。
+
+- static int MatchImportEnd(string s, int at)
+  - `at` 起的 import 语句的结尾分号下标（字符串里的分号不算）。
+
+- static string NormalizeKey(string path)
+  - 环检测用的路径规范化：`\` 归一为 `/`，逐段消解 `.` 与
+    `..`（越顶的 `..` 丢弃）。保留大小写，不在不同文件系统
+    之间猜语义。
+
 - static StyleSheet ParseWithSources(string src, List<string> extraNames, List<string> extraVals, int physicalCount)
   - External theme tokens precede inherited logical skin variables. Keep
     the boundary explicit so app CSS does not mistake skin sizes for pixels.
+
+- static void ParseRulesInto(StyleSheet sheet, string s, List<string> varNames, List<string> varVals, int externalCount)
+  - 把一段样式表文本里的规则块解析进 `sheet`（供顶层与
+    `@supports` 的内层递归调用）。
+    
+    配对必须按括号深度做，不能取「下一个 }」：`@media (...){a{x}}`
+    的第一个 `}` 是内层 `a` 的，用它会得到选择器 `@media (...){a`
+    ——这条 at-rule 连同紧随其后的第一条规则一起消失，中间那个
+    `x` 还会被当成声明表。样式表里出现一条媒体查询就悄悄吃掉
+    相邻规则，是这套解析器最贵的一个坑。
+
+- static void ParseRulesIntoM(StyleSheet sheet, string s, List<string> varNames, List<string> varVals, int externalCount, MediaCond outer)
+  - ParseRulesInto 的媒体上下文版本：`outer` 非空表示正在
+    `@media` 块内解析，普通规则带着条件进 mediaRules（运行期
+    按窗口/主题求值），不再进常驻级联。
+
+- static string AtName(string prelude)
+  - `@supports` / `@media` 等 at-rule 的名字（去掉 `@`，转小写）。
+
+- static string AtPrelude(string prelude)
+  - at-rule 的 prelude 部分（名字之后、`{` 之前）。
+
+- static MediaCond ParseMedia(string prelude)
+  - 把 `@media` 的 prelude 解析成可求值条件；解析不了（空、
+    括号不配对、特征语法坏）返回 null——CSS 语义是"not all"，
+    调用方按判假 + 守卫报出处理。
+
+- static MediaAlt ParseMediaAlt(string alt)
+  - 单个备选：`[not] [only] feat [and feat]*`。
+
+- static bool ParseMediaFeatInto(string part, List<MediaFeat> acc)
+  - 解析一条媒体特征并追加进 acc（1 或 2 条）。支持
+    `(min-width: 800px)`、裸特征 `(pointer: coarse)`、裸媒体
+    类型、Level 4 单边范围（`(width >= 800px)`、`(800px <=
+    width)`——名字在右时方向翻转）与双边链 `(400px <= width
+    <= 2000px)`（拆成 min/max 两条特征）。
+
+- static string MinFeatName(string name)
+  - `width` 族特征名 -> `min-` 形式（未知名原样返回，
+    求值时按未知特征判假）。
+
+- static string MaxFeatName(string name)
+  - `width` 族特征名 -> `max-` 形式。
+
+- static bool IsMediaName(string name)
+  - 媒体特征名/媒体类型是否是引擎认识的拼写。
+
+- static List<string> SplitKeyword(string s, string kw)
+  - 按（括号外的）关键词 `kw` 切分。
+
+- static bool SupportsCondition(string cond)
+  - 求值 `@supports` 条件：静态可判定的子集——`not` / `and` / `or`、
+    括号、以及 `(prop: value)` 声明测试（引擎认得这条声明即为真）。
+    `selector(...)` / `font-tech(...)` 等一律假。
+
+- static int FindTopKeyword(string s, string kw)
+  - 括号外第一个整词 `kw`（前后是空白或边界）的下标，无则 -1。
+
+- static int TopToken(string s, string tok)
+  - 顶层（括号外）第一个 `tok` 的下标，无则 -1。
+
+- static bool StartsWithStr(string s, string prefix)
+  - s 是否以 prefix 开头。
+
+- static int MatchBrace(string s, int open)
+  - 与 `open`（一个 `{` 的下标）配对的那个 `}`，按嵌套深度找；
+    没有配对时返回 -1。引号里的花括号不计数（`content: "}"`）。
 
 - static JsonValue ParseBlock(string body, List<string> varNames, List<string> varVals)
   - 单个块的声明，`var(--x)` 已解析，自定义
@@ -3978,9 +4729,26 @@ tab.item:active       { border-bottom: 2 var(--accent); }
   - 去掉结尾的 `!important`（此处的级联本就是"后规则
     胜出"，因此该标志没有额外含义）。
 
+- static bool HasImportant(string val)
+  - 值是否带 `!important`。
+    
+    级联里 `!important` 的权重高于一切（连 inline 也压得住）。
+    这里把它实现为「带标记的声明最后再套一遍」：解析时把带标记的
+    声明另存一份到 `__zan_important`，StyleSheet.Apply 在普通级联
+    （含 inline）之后统一应用，于是 `label { color: red !important }`
+    真的能压住 inline 的 `color: blue`。
+    
+    之前这个标记被直接剥掉、当普通声明处理，等于把"作者明确
+    要求不许被覆盖"降级成"看谁写在后面"——换肤或宿主注入一行
+    inline 就能悄悄改掉它。
+
 - static string Lower(string s)
   - 把属性名/关键字转小写（选择器保留大小写，因此 `#Save`
     仍能匹配名为 `Save` 的控件）。
+
+- static string ImportantOf(JsonValue block, string k)
+  - `block` 里那条 `!important` 的声明（`k` 不区分大小写），
+    没有时返回 ""。
 
 - static void MergeInto(StyleSheet sheet, string sel, JsonValue block)
   - 把 `block` 的声明加入 `sel`，保留同一选择器早先规则
@@ -3992,6 +4760,14 @@ tab.item:active       { border-bottom: 2 var(--accent); }
 - static string ExpandVars(string val, List<string> names, List<string> vals)
   - 替换 `val` 中的每个 `var(--name)`；未知名称展开为 ""。
 
+- static int MatchParen(string s, int open)
+  - 与 `open`（一个 `(` 的下标）配对的那个 `)`，按嵌套深度找；
+    没有配对时返回 -1。`var(--x, rgba(0,0,0,.4))` 的第一个 `)` 是
+    内层 rgba 的，直接取会把回退值截断成 `rgba(0,0,0,.4`。
+
+- static int TopComma(string s)
+  - `s` 中第一个括号外层的 `,` 下标，没有时 -1。
+
 - static string StripComments(string src)
   - 删除 `/* ... */` 注释（逐片处理，大样式表只需一趟
     而非每字符一个字符串）。
@@ -4000,18 +4776,92 @@ tab.item:active       { border-bottom: 2 var(--accent); }
   - 按 `sep` 拆分并修剪每部分（空白和换行）。
 
 - static List<string> SplitTopTrim(string s, string sep)
-  - 按顶层 `sep`（单字符）拆分并修剪每部分：括号内的分隔符
+  - 按顶层 `sep`（单字符）拆分并修剪每部分：括号内与引号内的分隔符
     不拆，因此 `linear-gradient(90deg, rgba(0,0,0,.5), #fff)` 的
-    函数式颜色停靠点会作为整体保留。
+    函数式颜色停靠点、`[class="a,b"]` 的属性值、`tab:is(.a, .b)`
+    的选择器列表都作为整体保留。
+
+- static List<string> SelectorTokens(string s)
+  - 选择器文本的 token 化：复合选择器原文与组合器交替。显式组合器
+    （`>`/`+`/`~`）各占一个 token，纯空隙产出单空格 token（后代
+    组合器）；括号与引号内的符号和空白原样保留，因此 `:not(a > b)`、
+    `[title="a b"]` 仍是一个完整的复合块。
 
 - static int IndexFrom(string s, string needle, int start)
   - `s` 中从 `start` 起首次出现 `needle` 的下标，无则 -1。
+
+- static bool IsSpaceByte(int c)
+  - c 是否为空白字符码点（空格/制表/回车/换行）。
 
 - static bool Space(string ch)
   - ch 是否为空白字符（空格/制表/回车/换行）。
 
 - static string Trim(string s)
-  - 去除两端的空白字符。
+  - 去除两端的空白字符（利用内置 SSA 硬件寄存器级极速裁剪）。
+
+- static string PseudoContent(string raw, Control host)
+  - content 声明值 → 实际文本（::before/::after 伪文本）。
+    逐段拼接：引号串（含 `\` 转义与 1-6 位 hex 码点转义，转义后
+    的一个空白按规范吃掉）与 attr(name)（查 host 的属性表，
+    Control.CssAttr）；none/normal 出 ""，counter 系/open-quote/
+    var() 等引擎没有对应物的段整段跳过（不是整条失败）。
+    host 可为 null。多字节字符按 UTF-8 序列整体拷贝。
+
+- static int HexValByte(int b)
+  - ASCII 16 进制位的数值（IsHexByte 为真的字符才有效）。
+
+- static bool IsHexByte(int b)
+
+
+## CssGrid (class)
+
+- static GridLine ParseLine(string v)
+  - "1 / 3"、"span 2"、"2 / span 3"、"auto"、"3"。命名线/负线号
+    不认（负线号按 auto 兜底）。
+
+- static List<GridTrack> ParseTracks(string v)
+  - 轨道列表：顶层按空白切（括号内不切），repeat(N, …) 展开。
+
+- static GridTrack ParseOne(string w)
+  - 单条轨道。
+
+- static List<string> SplitTop(string v)
+  - 括号感知的顶层切分（"minmax(100px, 1fr) 2fr" → 2 段）。
+
+- static bool StartsWith(string s, string pre)
+
+- static bool EndsWith(string s, string suf)
+
+- static GridPlace Place(List<Control> items, int expCols, int expRows)
+  - 放置（CSS 8.5 简化）：显式位置先落，再"行定列自"、"列定行自"，
+    最后全 auto 的稀疏行主序游标。expCols/expRows 是模板声明的
+    显式轨道数（空轨道也占位）。隐式列/行按需扩展（列扩展要按
+    行主序重建占用表）。
+
+- static bool Free(List<bool> occ, int nCols, int c, int r, int cs, int rs)
+
+- static void Mark(List<bool> occ, int nCols, int c, int r, int cs, int rs)
+
+- static int FindFreeInRow(List<bool> occ, int nCols, int r, int cs)
+
+- static int FindFreeInCol(List<bool> occ, int nCols, int capRows, int c, int rs)
+
+- static List<bool> Widen(List<bool> occ, int oldCols, int rows, int newCols)
+  - 扩列：行主序平铺表在每行尾补 (newCols-oldCols) 个空位。
+
+- static List<int> SizeTracks(List<GridTrack> defs, List<GridTrack> auto, int n, List<int> span1At, List<int> span1Sz, int avail, int gap)
+  - 定尺寸（CSS 12 简化）：基尺寸 → 非弹性轨道均分放大（钉在增长
+    上限）→ fr 按比例吃掉剩余 → 无 fr 时剩余均分给 auto（stretch，
+    Chrome 对 align-content: normal 的行为）。avail < 0（auto 容器）
+    只给基尺寸。contentOf(i, track) 回调不可用，调用方直接把每条
+    轨道的"跨 1 格条目最大外围尺寸"传进来。
+
+- static int SpanSum(List<int> size, int gap, int start, int span)
+  - Σ 轨道 + 间距（span 个格子从第 start 条起）。
+
+- static int TrackOffset(List<int> size, int gap, int start)
+  - 第 start 条轨道的起点到第 0 条起点的距离：前 start 条尺寸 +
+    start 道 gap（SpanSum 的"跨内 gap"是 span-1 道，语义不同）。
 
 
 ## Cursor (class)
@@ -4034,9 +4884,71 @@ tab.item:active       { border-bottom: 2 var(--accent); }
   - 垂直调整大小（4）。
 
 
+## DamageTracker (class)
+
+脏区与受损条带追踪器（Damage / Dirty Region Tracker）。
+负责管理即时模式与局部帧渲染过程中的矩形求并、边界裁剪、外扩防羽化、
+面积估算以及像素欠账（Dirty Debt）回升逻辑，彻底从 App.zan 中抽离纯几何算法。
+
+- int x;
+
+- int y;
+
+- int w;
+
+- int h;
+
+- bool hasDamage;
+
+- int debtCount;
+
+- DamageTracker()
+
+- int X()
+
+- int Y()
+
+- int Width()
+
+- int Height()
+
+- bool HasDamage()
+
+- void Reset()
+  - 清空当前损伤矩形。
+
+- void Set(int nx, int ny, int nw, int nh)
+  - 直接设置当前的损伤矩形。
+
+- void Union(int ox, int oy, int ow, int oh)
+  - 向当前受损矩形并入另一个矩形（Union）。
+
+- void Pad(int padX, int padY)
+  - 外扩当前损伤矩形（防羽化、抗锯齿或外阴影残留）。
+
+- void ClampTo(int boundW, int boundH)
+  - 将当前损伤矩形限制在画布/窗口边界之内。
+
+- int Area()
+  - 计算当前受损矩形的像素面积。
+
+- bool IsFullWindow(int totalW, int totalH)
+  - 判断受损矩形是否占满或接近整窗（例如面积超过总面积的一半），
+    当面积过大时，条带局部呈现不再合算，建议退回整窗呈现。
+
+- void NoteDebt()
+  - 记录一次条带欠账（例如由于遮挡或重叠导致的局部脏区丢失）。
+
+- bool HasDebt()
+  - 是否存在未补偿的脏区欠账。
+
+- void ClearDebt()
+  - 清空欠账计数。
+
+
 ## DeviceProfile (class)
 
-目标设备画像：新建项目向导与 .zform 设计器共用的
+目标设备画像：新建项目向导与表单设计器共用的
 设备单一来源。一张画像 = 一个设备类别 + 它的设计
 基准视口（逻辑像素）+ 该类别是否允许自由尺寸。
 
@@ -4051,7 +4963,7 @@ tab.item:active       { border-bottom: 2 var(--accent); }
 横竖屏切换。
 
 - string id;
-  - 画像 id（.zform "device" 键、manifest "device=" 的取值）。
+  - 画像 id（设计文档 "device" 键、manifest "device=" 的取值）。
 
 - string en;
   - 英文 / 中文显示名。
@@ -4102,7 +5014,7 @@ tab.item:active       { border-bottom: 2 var(--accent); }
 
 - static List<DeviceProfile> All()
   - 全部设备画像（顺序即向导 chips 的顺序；0 号是自由的
-    桌面/2in1，也是 .zform 缺省——"device" 键为空即它）。
+    桌面/2in1，也是设计文档缺省——"device" 键为空即它）。
 
 - static int Count()
   - 画像数量（向导 chips 行排版用）。
@@ -4171,6 +5083,157 @@ tab.item:active       { border-bottom: 2 var(--accent); }
 
 - static int Fill()
   - 5：填充其余停靠子节点用剩的空间。
+
+
+## Element (class)
+
+通用元素容器（WEB_GUI_ROADMAP P0/P5）：kind 即 CSS type 选择器
+匹配的标签名（div/p/span/section/...）。HTML 声明层（P5）建树的
+容器节点直接落成 Element；代码里也可以用它写 web 风格的布局
+容器。纯文本内容经 SetText 提供——块容器里是匿名文本块，
+行内级（span）里被父容器拆成 run 排进行盒。
+
+- string elTag;
+
+- string elText;
+
+- List<ElementRun> elRuns;
+
+- bool elRunsFresh;
+
+- List<FlowEntry> elOrder;
+
+- Dict <string, string> elAttrs;
+  - 原始属性表（HTML 声明层留下的 type/data-*/href 等），
+    CSS 属性选择器（`[type="text"]`）的取值源。
+
+- string elBefore;
+  - ::before/::after 的 content 文本（宿主样式解析时刷新，
+    "" = 无伪元素）。参与本元素的流内容：inline 走 FlowText 拼接，
+    块容器在 FlowEntries 首尾各占一段匿名文本。
+
+- string elAfter;
+
+- string elTitle;
+  - HTML `title` 属性（悬停提示文本，"" = 无）。非空时 OnPaint
+    每帧问一次 tipPainter——悬停停稳即向帧末提示队列登记。
+    绘制实现在 Gui.Html（经 SetTipPainter 注册）；elTitle 只在
+    HTML 声明层赋值，未安装时恒空串，钩子不会被走到。
+
+- delegate void
+  - title 提示原生绘制槽（Gui.Html.Install() 注册 Html.PaintTip）。
+
+- TipPaintFn(Control el, string title);
+
+- static TipPaintFn tipPainter;
+
+- static void SetTipPainter(TipPaintFn fn)
+
+- void InitElement(string tag, string nodeName)
+
+- Element SetAttr(string k, string v)
+  - 记录一个原始属性（树构建期逐个喂入；同名覆盖；键折小写）。
+
+- override string CssAttr(string key)
+  - CSS 属性选择器取值源：先查属性表，缺了落基类（id → name）。
+
+- override bool CssHasAttr(string key)
+  - 表里有就算存在——值为空串的布尔属性（``）也要让
+    `[hidden]` 命中；不进表的手搭节点回落按 name 判 id。
+
+- override string GetExtra(string key)
+  - 绑定通道的文本投影：Element 没有 Props 声明槽，"text" 经
+    GetExtra/SetExtra 落到 SetText/Text——模板行里的
+    `` 由 ChildWindow 按 Element 的缺省
+    绑定属性 text 推送/读回（真控件的缺省是 value）。没有这条
+    通道，SetProp("text") 会掉进"非空值当样式类"的基类兜底。
+    投影文本 = SetText 的整块 + AddText 的裸文本段（生成的建树
+    代码与运行时 Html.Parse 都走 AddText——它只记 FlowEntry，
+    不写 elText；只读 elText 会把静态文档读成空串）。
+
+- override bool SetExtra(string key, string val)
+
+- Element CopyAttrsFrom(Element src)
+  - 从同类元素拷贝原始属性表（Html.Clone 的 template 行展开用：
+    data-for/data-bind/data-if 等声明随行复制）。src 无表时本元素
+    保持原状；键已折小写，直接平移。
+
+- override StyleBox ResolveStyle(App app, int state)
+  - 宿主样式解析后顺带解析 ::before/::after 伪盒，取出 content
+    文本。伪盒经 Style.Part 按键缓存，这里只是字典查询 + 短串
+    解析；伪盒里 content 之外的声明 v1 不消费（伪元素自身的
+    颜色/字号等是后续工作），文本沿用宿主样式绘制。
+
+- override string Kind()
+  - 标签名（StyleType() 折小写后与 CSS type 选择器匹配）。
+
+- Element SetText(string t)
+  - 元素的纯文本内容：块流布局（P2）把它排进行盒参与排版。
+
+- string Text()
+  - 元素的纯文本内容。
+
+- Element AddText(string t)
+  - 文档序追加一段裸文本（P2 行内混排："text " + span + " more"）。
+    与 AddKid 的交错顺序即行盒的分段顺序。
+
+- Element AddKid(Control c)
+  - 文档序追加子项（同 Add，但记录与 AddText 的交错顺序）。
+
+- void DropKid(Control c)
+  - 从文档序与子列表里一并摘除 `c`（运行时行撤除用：普通 Remove
+    会在 elOrder 留陈旧条目，FlowEntries 仍按它占位——幽灵布局）。
+    没有文档序记录时回落普通 Remove。
+
+- FlowEntry TextEntry(string t)
+  - 一段匿名文本的流条目。
+
+- override List<FlowEntry> FlowEntries()
+  - 块流内容序列（Control.FlowEntries 覆写）：::before 伪文本
+    最先、::after 最后（CSS 生成内容语义），中间是 SetText 的
+    整块文本与 elOrder 文档序；从未用 AddText/AddKid 记录顺序时
+    子项照旧按 FlexKids 序追加（P0/P1 代码零改动）。
+
+- int ElFontSize()
+
+- override string FlowText()
+  - 行内内容（Control.FlowText 覆写）。elText 之外，**纯文本的
+    elOrder**（AddText 记录、无控件子项）也算行内内容——
+    display:inline 的元素按文本 run 参与父级行盒（web 语义），
+    而不是原子盒坐基线把行高撑爆（P5 html oracle 实证：span 里的
+    "beta" 走原子盒让 20px 行涨到 24）。混排（有控件子项）的仍
+    走原子盒路径，行为与 P2 一致。::before/::after 文本按 CSS
+    生成内容语义拼在首尾。
+
+- override void InlineRunsBegin()
+  - 行盒排布期：清上一帧的 run 缓存并标记本帧 fresh。
+
+- override void InlineRunPlace(int x, int topY, int w, int h, int drawOff, int fs, string text)
+
+- override void OnPaint(App app)
+  - 保留模式绘制：背景/边框由基类 PaintStyleBox 完成。块容器里
+    画落位好的 run（text-align/折行由行盒决定）；非 fresh 的
+    缓存（上帧行内、本帧没被行盒排到）直接丢弃。
+
+
+## ElementRun (class)
+
+一个落位的行内文本 run（P2 行盒）：坐标与 Arrange 同一空间
+（窗口根相对），绘制端直接用。
+
+- string text;
+
+- int x;
+
+- int topY;
+
+- int w;
+
+- int h;
+
+- int drawOff;
+
+- int fs;
 
 
 ## EventBinding (class)
@@ -4246,6 +5309,45 @@ Compute 写入的结果矩形（resultX/Y/W/H）与内容尺寸（contentW/H）�
     contentW/H 为内容实际尺寸。解算前可修改样式，重算需重新调用。
 
 
+## FloatIntrusion (class)
+
+一个 float 的入侵带（P3）：margin box 在容器内容框流坐标里的
+占位；行盒收窄与 clear 下坠都查这张表。
+
+- int side;
+
+- int x0;
+
+- int x1;
+
+- int yTop;
+
+- int yBot;
+
+
+## FlowEntry (class)
+
+块流内容序列的条目（P2）：文本块（text 非空）或子项。块流容器
+按文档序分段——文本与行内子项连续的区段合成匿名块排行盒，
+块级子项截断段（CSS 匿名块模型）。
+
+- string text;
+
+- Control kid;
+
+
+## FlowSegment (class)
+
+一次行内段的排版结果（MeasureFlow/ArrangeFlow 共用同一份，
+测量端读 height/width，排布端落位 lines）。
+
+- List<InlineLine> lines;
+
+- int height;
+
+- int width;
+
+
 ## FocusManager (class)
 
 即时模式 UI 的焦点/悬停/按压状态机：按控件 id 记录当前与
@@ -4258,6 +5360,12 @@ IME 会话跟随。App 在解析每帧指针/键盘事件时写入，
 - int hoveredId;
 
 - int pressedId;
+
+- int hoverStartMs;
+  - 悬停目标变为当前 hoveredId 的时刻（Window.GetTickMs）。
+    悬停提示（title tooltip）用它判断"指针停稳"——目标一变
+    就重置，滚动/重排导致的悬停重算（RefreshScrollHover 等）
+    也走 SetHovered，自然重新计时。
 
 - int prevFocusedId;
 
@@ -4280,10 +5388,36 @@ IME 会话跟随。App 在解析每帧指针/键盘事件时写入，
   - 当前 IME 会话归属的控件 id（-1=会话关闭）。只在
     翻转时通知后端；Android 软键盘随会话显隐。
 
+- List<int> idStack;
+  - 路径哈希 ID 栈（Path Hash ID Stack）。
+
+- int scopeAutoSeq;
+  - 当前作用域内的局部序列号（供作用域内的 AllocId 使用）。
+
 - FocusManager()
 
+- int CurrentScopeId()
+  - 当前作用域的基准种子 ID（栈空时使用 FNV 初始值）。
+
+- int GetId(string strKey)
+  - 在当前作用域下计算指定字符串 key 的哈希 ID（不入栈）。
+
+- int GetId(int intKey)
+  - 在当前作用域下计算指定整数 key 的哈希 ID（不入栈）。
+
+- void PushId(string strKey)
+  - 压入字符串命名的子作用域。
+
+- void PushId(int intKey)
+  - 压入整数命名的子作用域（如循环下标 i）。
+
+- void PopId()
+  - 弹出当前作用域。
+
 - int AllocId()
-  - 本帧的下一个即时模式 id（按注册顺序递增，从 0 开始）。
+  - 本帧的下一个即时模式 id。
+    若在 PushId 作用域内，根据当前层级路径自动派发稳定的哈希 ID；
+    若在作用域外，回退为全局线性递增（完全保持向后兼容）。
 
 - void PushIds(int first)
   - 即时模式 id 按绘制顺序递增，所以一个区域多画 / 少画
@@ -4347,7 +5481,11 @@ IME 会话跟随。App 在解析每帧指针/键盘事件时写入，
   - 写入焦点 id（事件解析层在按下时调用，-1 = 无）。
 
 - void SetHovered(int id)
-  - 写入悬停 id（本帧命中测试的最顶层控件，-1 = 无）。
+  - 写入悬停 id（本帧命中测试的最顶层控件，-1 = 无）。目标
+    变化时重记 hoverStartMs——悬停提示的"停稳计时"从这里起算。
+
+- int HoveredMs()
+  - 指针已在当前悬停目标上停稳的毫秒数（目标一变即从 0 起算）。
 
 - void SetPressed(int id)
   - 写入按压 id（-1 = 无）。
@@ -4360,6 +5498,32 @@ IME 会话跟随。App 在解析每帧指针/键盘事件时写入，
 
 - void ClearFocus()
   - 清除焦点 id（-1）。
+
+
+## FontScale (class)
+
+标准文字层级阶梯（Type Scale）。桌面端排版仅允许在此 6 档中选择。
+
+- const int Caption=10;
+  - 10pt: 辅助说明、状态栏次级信息、时间戳
+
+- const int Small=11;
+  - 11pt: 密集列表项、辅助标签、次级侧栏文字
+
+- const int Body=12;
+  - 12pt: 标准正文、常规按钮文字、表单标签与输入
+
+- const int Subhead=14;
+  - 14pt: 卡片副标题、加重列表标题、二级区块头
+
+- const int Title=16;
+  - 16pt: 面板主标题、弹窗标题、主要功能区头部
+
+- const int Hero=20;
+  - 20pt: 页面主标题、大卡片核心 KPI 指标数字
+
+- const int Display=26;
+  - 26pt: 巨型展示数字
 
 
 ## Form (class)
@@ -4377,7 +5541,7 @@ IME 会话跟随。App 在解析每帧指针/键盘事件时写入，
 
 - HandlerRegistry handlers;
   - 设计出的 `on<Event>` 绑定的 Name -> Action 表（与
-    UiDoc/HandlerRegistry 契约相同）：.zform 存储处理器名，
+    UiDoc/HandlerRegistry 契约相同）：设计文档存储处理器名，
     业务文件用 On() 注册 Action，生成的
     生成代码把每个控件的事件订阅到 Handle(name)。从未注册的
     处理器自然不会触发。
@@ -4434,6 +5598,16 @@ IME 会话跟随。App 在解析每帧指针/键盘事件时写入，
   - 到期的周期任务全部跑一遍，并把下一个到期时刻告知
     事件循环（以便在无输入时也能醒过来）。手写循环可
     直接调用它。
+    
+    时钟取 `Window.GetTickMs()` 而不是 `app.nowMs`：后者只在
+    **渲染了一帧**的 BeginFrame 里推进，而"没到期"的那一圈恰恰
+    不渲染（`if (!app.needsRedraw) continue;`）。用缓存时钟的后果是
+    任务放完第一炮就再也不响——第二圈算出 `due` 还没到，于是按
+    120ms 重新排一次唤醒，唤醒回来读到的还是上一帧的旧时间，循环
+    往复，直到鼠标划过窗口触发一次真渲染才补跑一拍。实机上表现
+    为"空闲窗口 Every(120) 每几秒才跑一拍"（传奇模板页 31 的挂机
+    动画就是这么静止的）。GetTickMs 是真实单调时钟，冻结时钟时
+    仍返回冻结值，确定性截图不受影响。
 
 - Control Ctl(string name)
   - 第一个（深度优先）名为 `name` 的控件，或 null。
@@ -4622,6 +5796,45 @@ Fx.Specular(app, id, x, y, w, h, radius, 0xFFFFFFFF);
 - FxOptions()
 
 
+## GridPlace (class)
+
+一次放置的输出：条目平行数组（0 基格子坐标 + span），以及网格
+最终的列/行数（含隐式轨道）。测量与排布端各算一遍，结果一致
+（纯函数，无状态）。
+
+- List<Control> items;
+
+- List<int> colStart;
+
+- List<int> colSpan;
+
+- List<int> rowStart;
+
+- List<int> rowSpan;
+
+- int nCols;
+
+- int nRows;
+
+
+## GridTrack (class)
+
+一条轨道定义。kind：0 px，1 %（千分），2 auto，3 fr，4 minmax；
+minmax 的上下限用同一套 kind/val 编码存在 min*/max* 里。
+
+- int kind;
+
+- int val;
+
+- int minKind;
+
+- int minVal;
+
+- int maxKind;
+
+- int maxVal;
+
+
 ## HandlerEntry (class)
 
 支撑 JSON UI 约定的 Name -> Action 表。视图文档只存
@@ -4634,6 +5847,13 @@ Handle("save", MyPage.Save) 一次性注册匹配的 Action。随后加载器
 - string name;
 
 - Action action;
+
+- Action<string> argAction;
+  - 带参变体（`data-arg` / HandleArg 通道）：与 action 并行——
+    同一名字通常只注册其一；带参槽非空时 Wire 期闭包捕获实参。
+
+- ControlEvent senderAction;
+  - sender 变体（HandleSender 通道）：Wire 期闭包捕获被接线控件。
 
 - HandlerEntry(string name, Action action)
 
@@ -4655,6 +5875,61 @@ Name -> Action 的注册表：保存 HandlerEntry 线性表，
 
 - Action Get(string name)
   - 绑定到 `name` 的 Action，未注册时为 null。
+
+- void SetArg(string name, Action<string> a)
+  - 注册（或替换）绑定到 `name` 的带参 Action。按名独立于 Set：
+    SetArg 不清 action 槽、Set 不清 argAction 槽，但同一名字
+    混注两槽时 Wire 期带参优先（文档不要混用同一名字）。
+
+- Action<string> GetArg(string name)
+  - 绑定到 `name` 的带参 Action，未注册时为 null。
+
+- void SetSender(string name, ControlEvent a)
+  - 注册（或替换）绑定到 `name` 的带 sender Action。按名独立于
+    Set/SetArg：各槽互不清除；同名多槽都注册时 Wire 期各建一条订阅。
+
+- ControlEvent GetSender(string name)
+  - 绑定到 `name` 的带 sender Action，未注册时为 null。
+
+
+## HasCond (class)
+
+`:has(...)` 里的一个相对选择器：inner 是括号内逗号项解析出的
+选择器（可带组合器链），lead 是首组合器（0 后代/任意、1 `>`、
+2 `+`、3 `~`），决定候选元素相对宿主的取法。
+
+- Selector inner;
+
+- int lead;
+
+
+## HeavyControls (class)
+
+- static List<string> names;
+
+- static List<ControlFactoryFn> fns;
+
+- static List<string> aliasFrom;
+
+- static List<string> aliasTo;
+
+- static void Register(string kind, ControlFactoryFn fn)
+  - 注册一个重尾 kind 的工厂（重复注册以最后一次为准）。
+
+- static void RegisterAlias(string from, string to)
+  - 注册 legacy 序列化 kind 的归一化别名（from → to）。别名不进
+    Kinds() 名单——名单只列现行 kind，别名只服务旧文档读侧。
+
+- static bool Has(string kind)
+  - kind 是否已注册（ControlFactory.Kinds 的名单扩展）。
+
+- static List<string> HeavyKinds()
+  - 已注册 kind 的名字快照（设计器调色板/名单对齐用）。
+
+- static Control Create(string kind)
+  - 已注册 kind 的工厂调用；legacy 别名先归一化再查表。未注册
+    返回 null（与主 switch 的 "miss 即 null" 契约一致——文档里的
+    kind 拼错仍显式失败）。
 
 
 ## HitRegion (class)
@@ -4823,6 +6098,121 @@ dump hitregions 投影输出，供无障碍/自动化识别区域用途，
 
 - int GetWidgetType(int id)
   - id 注册的控件类型（HitRegion.widgetType），未注册时 -1。
+
+
+## Html (class)
+
+WEB_GUI_ROADMAP P5：HTML 声明层的 Gui 侧——把 System.Web.HtmlParser
+的声明记录构建成控件树。解析/空白/实体/记录全在纯层（生成器
+GenHtml 也吃同一份记录，运行时与编译期同构）；本文件只负责
+tag→控件映射与属性协议（事件接线、绑定路径、样式类）。
+
+tag 映射：容器 tag → Element（UA 样式表给 web 缺省语义），
+button → Button、input → Input/Checkbox、textarea → TextArea、
+img → Image；select 等未映射 tag 落 Element 占位。
+
+属性协议：id → 选择器名（nodeName），class → AddClass，
+style → 合成 .zgen-N 规则（复用整套级联与 !important 机制），
+data-on-<evt>="名" 经 HtmlHandlers 注册表接 BindEvent，
+data-bind → bindPath，data-if → bindIf。其余属性（Element 进
+原始属性表；真控件忽略）。
+
+与 App 的解耦（auto-stdlib 按需拉取，活名才入编译图）：契约类型
+HtmlDoc/HtmlHandlers 在 Gui.HtmlApi（App.LoadHtml 的签名只背它们），
+装载实现在本文件，经 `Install` 注册进 App 的装载槽。
+只经 `app.LoadHtml(...)` 用 HTML 的宿主需在启动时调用一次 Install；
+拼写了任何 Html.* 构建入口的程序会被自动安装。不安装的程序
+App 编译图不背解析器/渲染器/System.Web。
+
+- static bool loaderInstalled;
+
+- static void Install()
+  - 向 App 注册 HTML 装载与链接扫描实现（App.LoadHtmlWith 的
+    后端、ChildWindow.WireNode 的扫描通道），并补齐 Element 的
+    title 提示、模板行克隆与远端图片三个通道。
+
+- static Control LoadForApp(App app, string html, HtmlHandlers handlers, string baseDir)
+
+- static HtmlDoc Parse(string html, string baseDir, HtmlHandlers handlers)
+  - 解析 `html`（整文档或片段）并建树。`baseDir` 是 `<link>`
+    相对路径的基目录（空 = 不解析 link）。`handlers` 可为 null。
+
+- static Control Build(WDoc wd, WNode n, HtmlDoc doc, HtmlHandlers handlers)
+  - 一条记录 → 一个控件（构造 + 属性协议）。容器自己的文本不在这
+    里加——装配阶段按 items 文档序与子控件交错加入。
+
+- static void PaintTip(Control c, string tip)
+  - title 属性的渲染期轮询（Element.OnPaint 每帧调用）：本元素
+    正被悬停且停稳达 DefaultDelayMs 时，向帧末提示队列登记
+    （Request 幂等，重复登记无害）。指针挪走/悬停目标一变即
+    失效——气泡生命周期与浏览器一致。命中矩形来自 FireCommon
+    （链接/带事件的元素）或宿主注册；纯展示容器无人监听时没有
+    命中区，也就无提示（不给静态内容开指针）。App 从静态
+    FrameApp 取（渲染帧内即当前 App；无帧体的探针直接跳过）。
+
+- static void AddChild(Control parent, Control c)
+  - 挂子节点：Element 父走 AddKid（与 AddText 的文档序交错，
+    行盒混排依赖），控件父走普通 Add。
+
+- static Control Clone(Control c)
+  - 深拷贝一棵控件树（`<template data-for>` 行展开用）。Element
+    走同构克隆——Props() 没有覆写、Serialize 无法往返，标签/文本/
+    原始属性表必须特判搬运；Class 原样带上（行内 style 的 zgen-N
+    规则已在应用样式表里，克隆件挂同名类即生效）。其余控件按注册
+    kind 重建（未注册返回 null，调用侧跳过不占位），Props 声明槽
+    与事件名照搬；几何与绑定声明逐项复制，子树递归。
+
+- static void Wire(HtmlHandlers handlers, Control c, string evt, string name)
+  - data-on-* 接线的公开钩子：生成的/手写的建树代码统一走这里，
+    由它消化"名字 → 注册表 Action → BindEvent"与 Button 等控件
+    把事件路由到专属槽位的差异（BindEvent 多态分派）。名字无论
+    有没有注册表都落控件（SetHandler）——与 GenForm 生成的建树
+    代码同一契约，ChildWindow.Wire 等宿主才能二次解析。
+
+- static void WireArg(HtmlHandlers handlers, Control c, string evt, string name, string arg)
+  - 带参接线（`data-arg`）：按名查带参槽，把实参闭包进无参
+    Action 再 BindEvent（实参是只读捕获的局部——创建时值快照，
+    语义即"这个控件永远带着它的参数"）。名字照落控件；带参槽
+    未命中时静默不接（与 Wire 同一契约）。
+
+- static void AutoLink(Control c, App app)
+  - 给一个元素接上缺省导航。已有 Click 监听（data-on-click 或
+    宿主程序化 OnClick）即宿主接管，不再叠加；app 为 null 不接
+    （编译期生成的树没有 App 上下文，由挂载它的窗口 WireNode
+    或宿主 AutoLinkTree 补）。幂等：已接 Click 的元素跳过。
+
+- static void AutoLinkTree(Control root, App app)
+  - 对一棵树做链接扫描（LoadHtmlWith / 宿主自挂的手搭或生成树）。
+
+- static bool Navigable(string href)
+  - href 可路由：仅 http/https（大小写不敏感）。相对路径没有
+    base 可解析；# 锚在保留树上无滚动目标；javascript:/mailto:
+    等其它 scheme 涉及脚本执行或 shell 关联程序——本版一律
+    不路由（宁缺毋滥，AI 生成的 UI 不至于误触系统处理器）。
+
+
+## HtmlHandlers (class)
+
+data-on-* 的处理器注册表：`handlers.Add("submit", () => ...)`，
+HTML 里 `data-on-click="submit"` 命中同名条目即接线。带参变体
+`AddArg("row", a => ...)` 配 `data-arg` 使用（见 Html.WireArg）。
+
+- Dict <string, Action> map;
+
+- Dict <string, Action<string>> argMap;
+
+- void Add(string name, Action a)
+
+- void AddArg(string name, Action<string> a)
+  - 注册带参处理器：同名文档节点写了 `data-arg="x"`，触发时
+    收到 "x"。
+
+- Action Find(string name)
+  - 未注册的名字返回 null（静默不接线——HTML 是声明，事件在
+    宿主语言里，名字打错表现为按钮没反应而非崩溃）。
+
+- Action<string> FindArg(string name)
+  - 带参槽查找，未注册返回 null。
 
 
 ## Icon (class)
@@ -5017,6 +6407,19 @@ Canvas.DrawIcon 是入口；请调用它，而不是这些辅助函数。
     未知码点不绘制任何内容。
 
 
+## IdHash (class)
+
+32 位 FNV-1a 路径哈希算法实现。
+用于现代即时模式 UI 的层级路径 ID（Path Hash ID Stack）计算。
+
+- static int HashString(string key, int seed)
+  - 对字符串 key 进行 FNV-1a 哈希。
+    支持 "Label###CustomId" 语法：若包含 "###"，则仅对其后半部分进行哈希。
+
+- static int HashInt(int key, int seed)
+  - 对 32 位整型 key 进行 FNV-1a 哈希（展开 4 字节）。
+
+
 ## ImageHttp (class)
 
 Image 控件与 DataTable 图片列共用的网络图片加载器。
@@ -5025,6 +6428,16 @@ Image 控件与 DataTable 图片列共用的网络图片加载器。
 注册；单个共享 worker 逐条处理排队的请求。UI 线程入口是
 `Fetch`（控件模式）与 `EnsureUrl`（无控件
 的 URL 槽模式）。
+
+- static bool installed;
+
+- static void Install()
+  - 向 Widget.Image 与 DataGrid 图片列注册远端取回实现（ResolveUrl
+    的 http(s) 通道与 GridImageSlot）。需要远端图的程序（或经
+    Html.Install 间接）调用；不装则 Image 的 http 源与表格图片列
+    进失败/占位态，网络栈与 ssl/crypto 驱动不进编译图。这里拼
+    GridImageSlot 只拉它那枚小文件——绝不能反过来在 DataTable
+    家族里拼 ImageHttp，那会给每个放表格的程序背上 6.4MB OpenSSL。
 
 - class Req
   - 一次取回请求：UI 线程排队，worker 领走，完成后经 Post 通知。
@@ -5068,6 +6481,75 @@ Image 控件与 DataTable 图片列共用的网络图片加载器。
     发生在 UI 线程（图像注册表与光栅器只从 UI 线程触碰）。
 
 
+## InlineLine (class)
+
+一个行盒：pieces（含空格）+ 合计宽 + 基线上/下高。P3 行几何：
+xOff/availW 是行顶处 float 入侵收窄后的可用区（0 = 无 float 的
+盲路径，落位端回退容器宽）；yOff 是行顶在段内的 y——整行下坠
+后行间有空洞，段高与落位都按"段顶 + yOff"计，不能靠行高累加。
+
+- List<InlinePiece> pieces;
+
+- int width;
+
+- int asc;
+
+- int desc;
+
+- int xOff;
+
+- int availW;
+
+- int yOff;
+
+
+## InlinePiece (class)
+
+行盒排版（WEB_GUI_ROADMAP P2）：把块流容器里的行内内容——容器
+自身文本 + `inline`/`inline-block` 子项——排成一行或多行，几何
+按 CSS 2.1 的 A/D（基线上/下）模型：每 piece 贡献
+asc = 字体 ascent + 半行距，desc = 行高 − asc；行高 = max(asc)
++ max(desc)，每行再叠加容器的 strut（块自身字体/行高）。
+折行逐 piece 贪心；text-align 落位时分配剩余空间；
+vertical-align 支持 baseline/middle/top/bottom。P3 起 Layout 另有
+float 感知的 LayoutF：行可用区按行顶与 float 入侵带相交查询，
+放不下整行下坠（绕排）。
+
+- Control owner;
+
+- bool isStrut;
+
+- bool isBox;
+
+- bool isSpace;
+
+- bool hardBreak;
+
+- string text;
+
+- StyleBox st;
+
+- int fs;
+
+- int w;
+
+- int lh;
+
+- int asc;
+
+- int desc;
+
+- int ascOff;
+
+- int boxH;
+
+- int ml;
+
+- int mr;
+
+- int x;
+
+
 ## Insets (class)
 
 四边内边距/外边距（上右下左）。
@@ -5093,6 +6575,68 @@ Image 控件与 DataTable 图片列共用的网络图片加载器。
 
 - int Vertical()
   - 垂直总跨度（top+bottom）。
+
+
+## LineBox (class)
+
+- static InlinePiece MakeText(Control owner, StyleBox st, string text, bool space)
+  - 文本 piece：按样式折算字号/行高/基线（半行距模型）。
+
+- static InlinePiece MakeBox(Control kid, int w, int h, int ml, int mr, int mt, int mb, StyleBox st, int xhHalf)
+  - 原子盒 piece（inline-block 等）：基线对齐时下 margin 边坐在
+    基线上（CSS 10.8.1），asc = margin-top + 盒高、desc = margin-bottom。
+    va:middle 时盒中点对到基线向上半个 x 高（浏览器实测语义，
+    CSS 原文的 "baseline + 半 x 高" 是排版向上方向的加法），
+    行内 A/D 贡献改为盒相对基线上下伸出的部分。
+
+- static InlinePiece MakeStrut(StyleBox st)
+  - 容器支柱（strut）：块的字体/行高参与每一行的 A/D 竞争。
+
+- static LineSpan LineAvail(List<FloatIntrusion> floats, int availW, int yTop, int yBot)
+  - [yTop, yBot) 带与 float 入侵的相交查询：左 float 把行左缘
+    抬到 x1，右 float 把右边界压到 x0（同一带内取最窄者）。
+
+- static int ClearY(List<FloatIntrusion> floats, int side, int y)
+  - clear 要求块顶边 ≥ 相关侧 float 的最低底边（side 1 左 / 2 右
+    / 3 双侧）；无相关 float 时原 y 返回。
+
+- static int NextShelf(List<FloatIntrusion> floats, int y)
+  - 严格大于 y 的最低 float 底边（下一搁架）；没有则返回 y，
+    调用方据此停止下坠、行在原地溢出（防呆不挂死）。
+
+- static void PushText(List<InlinePiece> sink, Control owner, StyleBox st, string text)
+  - 把一段文本拆成 piece 序列。white-space：
+    0 normal / 1 nowrap——空白折叠成单空格 piece、按词可断；
+    2 pre / 3 pre-wrap——按 \n 硬分段，空白原样保留、段内不断
+    （空段也给 piece，保住空行的高度）。
+
+- static void Layout(List<InlinePiece> items, InlinePiece strut, int availW, List<InlineLine> sink)
+  - 排版：贪心填行。nowrap 的 piece 自身不引发行首断行
+    （white-space 是逐 owner 的）；pre 的硬断行永远生效。
+    strut 参与（但不属于）每一行。
+
+- static void LayoutF(List<InlinePiece> items, InlinePiece strut, int availW, List<InlineLine> sink, List<FloatIntrusion> floats, int yStart)
+  - float 感知排版（P3）：与 Layout 同一贪心骨架，但每行的可用
+    区在行顶处与 float 入侵带相交查询（yStart = 本段在流里的起
+    点）。行宽只在行顶处查询（Chrome 同款：float 贴着行底擦过
+    不收窄本行）；piece 放不下且行顶查询显示 xOff 已越过可用右
+    缘，就整行下坠到下一搁架、从行首重排（CSS 9.5"line box 放
+    不下就移到 float 之下"）。行几何随行记录，排布端据此绕排。
+
+- static int Flush(InlineLine cur, int width, InlinePiece strut, List<InlineLine> sink, int yOff)
+  - 结束当前行（裁掉行尾空白，行高 = strut 与 pieces 的 A/D 竞争）。
+    yOff 记入行盒；返回行高（asc+desc，空行 0）供调用方推进 y。
+
+
+## LineSpan (class)
+
+行顶查询结果：xOff = 左侧 float 抬起的行左缘，availW = 右侧
+float 压剩的右边界（都是容器内容框坐标；行内 limit 用
+availW − xOff 现算）。
+
+- int xOff;
+
+- int availW;
 
 
 ## Mat4 (class)
@@ -5121,8 +6665,18 @@ Image 控件与 DataTable 图片列共用的网络图片加载器。
 
 - public static Mat4 Mul(Mat4 a, Mat4 b)
   - 矩阵乘 this * b（先施 b 再施 this，与 v' = M*v 一致）。
+    采用 Vector128 FMA 融和乘加向量化流水线加速计算。
 
 - public Mat4 Mul(Mat4 b)
+
+- public void TransformPoints(float[]inXyz, int inOffset, float[]outXyz, int outOffset, int count)
+  - 使用当前矩阵对批量 3D 顶点 (x, y, z) 进行批量坐标变换（FMA 融和乘加向量化流水线）。
+    inXyz: 输入顶点数组，每顶点占 3 个 float。
+    outXyz: 输出顶点数组，每顶点占 3 个 float。
+    count: 顶点数量。
+
+- public void TransformPoints4(float[]inXyzw, int inOffset, float[]outXyzw, int outOffset, int count)
+  - 使用当前矩阵对批量 4D 齐次坐标 (x, y, z, w) 进行批量变换，单周期 16 字节对齐写出。
 
 - public static Mat4 Perspective(float fovYRad, float aspect, float nearZ, float farZ)
   - 透视投影（D3D 风格深度 0..1），fovY 弧度，近远必须为正。
@@ -5135,6 +6689,88 @@ Image 控件与 DataTable 图片列共用的网络图片加载器。
 
 - public float[]ToColumnMajor()
   - 转列主序 float[16]（GPU 侧 uniformMatrix4fv 的约定）。
+
+
+## MathCursor (class)
+
+calc()/min()/max()/clamp() 求值游标：token 表 + 当前位置。
+MathExpr/MathTerm/MathFactor 递归下降时推进 pos。
+
+- List<string> toks;
+
+- int pos;
+
+
+## MediaAlt (class)
+
+一个备选：`not` 前缀 + and 连接的特征。
+
+- bool neg;
+
+- List<MediaFeat> feats;
+
+- bool AltTrue(StyleBox b)
+
+- static MediaAlt And(MediaAlt x, MediaAlt y)
+  - 两个备选的 and（特征并集；neg 简化取或——两边同时取反的
+    嵌套 @media 极罕见，语义差可忽略）。
+
+
+## MediaCond (class)
+
+`@media` 条件：逗号分隔的备选（or 连接）。
+由 Css.ParseMedia 从 prelude 解析，Apply 时按窗口/主题现算。
+
+- List<MediaAlt> alts;
+  - 逗号分隔的备选，任一成立即成立。
+
+- bool True(StyleBox b)
+  - 条件在本环境是否成立。任意备选成立即为真。
+
+- static MediaCond And(MediaCond x, MediaCond y)
+  - 两个条件的 and 组合（嵌套 @media 用）：A 的每个备选与 B 的
+    每个备选做笛卡尔 and。
+
+
+## MediaFeat (class)
+
+单个媒体特征：`(min-width: 800px)`、`(orientation: landscape)`、
+裸媒体类型（`screen`）。未知特征/取值一律判假（保守）。
+
+- string name;
+
+- string val;
+
+- bool True(StyleBox b)
+
+
+## MediaOp (class)
+
+一个小型 CSS 解析器：把以真实 CSS 文本编写的皮肤样式表转换成
+StyleSheet 已能应用的 选择器 -> 声明 映射。
+
+皮肤过去是 Zan 代码（每个皮肤一个 Theme 预设），因此任何超出
+调色板交换的东西——控件形状、渐变、阴影、各状态外观——都意味着
+要改控件代码。现在皮肤是放在美术资源旁的 `.css` 文件，
+GUI 在运行时加载，用户可以重新设计应用外观（或自带皮肤），
+而无需改动或重新构建任何代码：
+
+:root { --accent: #d92b2b; --radius: 999; }
+button.primary        { background: linear-gradient(#ffd76a, #e0a020);
+radius: var(--radius); border: 1 #8a5b12; }
+button.primary:hover  { background: #ffe08a; }
+tab.item:active       { border-bottom: 2 var(--accent); }
+
+有目的地支持（仅此而已，无更多级联）：声明块、选择器
+列表（`a, b { }`）、`:state` 后缀、`/* 注释 */` 以及 `:root`
+中以 `var(--name)` 引用的自定义属性。其余一律解析为
+普通属性，由 StyleSheet/控件决定其含义。
+
+- public int at;
+
+- public string tx;
+
+- public MediaOp(int at, string tx)
 
 
 ## MenuItem (class)
@@ -5228,10 +6864,6 @@ Upload 到不同表面。
 
 - public ushort[]IndexArray()
   - 三角索引缓冲（Canvas.MeshUpload 封送用）。
-
-- public void AddCubeAt(float cx, float cy, float cz)
-  - 以立方体（边长 2，中心 (cx,cy,cz)）填充此网格，六面 UV 全贴。
-    其余同 AddCube。
 
 - public void AddCube()
   - 以单位立方体（边长 2，中心原点）填充此网格，六面 UV 全贴。
@@ -5669,8 +7301,16 @@ Dropdown / Menu 使用）。Zan 委托无法捕获局部变量或绑定 `this`�
     右侧留白（快捷键文本 / 子菜单箭头），并限制最小宽度。
 
 - static int MenuRowH(App app)
-  - 富菜单行高：比表单控件（heightMedium）紧凑——右键菜单
-    条目多，一行 26 逻辑像素才能一屏放下。
+  - 富菜单行高与间距：比表单控件（heightMedium）紧凑，
+    整体缩小菜单体积以提升桌面端操作信息密度与轻量感。
+
+- static int MenuPadV(App app)
+
+- static int MenuPadH(App app)
+
+- static int MenuSepH(App app)
+
+- static int MenuHdrH(App app)
 
 - static int RichViewH(App app, List<MenuItem> items, int maxRows)
   - 富项目列表的可视高度：窗口装得下全部条目时整高显示
@@ -5710,6 +7350,36 @@ Dropdown / Menu 使用）。Zan 委托无法捕获局部变量或绑定 `this`�
     悬停展开的一层子菜单。叶子项在左键松开时把 `action` 写入
     `result` 并关闭；面板外按压、Escape 或窗口失焦也关闭。
     行悬停按几何解析，仅悬停行变化时请求重绘。
+
+
+## Palette (class)
+
+常用高质感现代语义色板（ARGB: 0xAARRGGBB）。
+经典 Slate/Zinc 质感，远离高饱和度刺眼配色。
+
+- const int BgDark=unchecked((int)0xFF0F172A);
+
+- const int SurfaceDark=unchecked((int)0xFF1E293B);
+
+- const int SurfaceHover=unchecked((int)0xFF334155);
+
+- const int BorderDark=unchecked((int)0xFF334155);
+
+- const int TextHigh=unchecked((int)0xFFF8FAFC);
+
+- const int TextMed=unchecked((int)0xFF94A3B8);
+
+- const int TextLow=unchecked((int)0xFF64748B);
+
+- const int PrimaryBrand=unchecked((int)0xFF3B82F6);
+
+- const int PrimaryHover=unchecked((int)0xFF2563EB);
+
+- const int Success=unchecked((int)0xFF10B981);
+
+- const int Warning=unchecked((int)0xFFF59E0B);
+
+- const int Danger=unchecked((int)0xFFEF4444);
 
 
 ## ParseCursor (class)
@@ -5854,6 +7524,15 @@ kind：0 文本，1 整数，2 布尔，3 枚举（见 `options`），4 颜色�
 - static PropSpec Color(string k, string lbl)
   - 工厂：颜色属性（kind 4）。
 
+- static List<string> Sizes()
+  - 尺寸四档选项表（tiny/small/medium/large），给
+    `PropSpec.Enum("size", "Size", PropSpec.Sizes())` 用——全库
+    统一从这里取，免得十六处字面量各自漂移。每次调用新建列表：
+    PropSpec 持有 options 引用且 `Option()` 会追加，共享实例会串台。
+
+- static List<string> Sizes3()
+  - 尺寸三档选项表（small/medium/large）：不带 tiny 档的控件用。
+
 - static PropSpec Section(string lbl)
   - 枚举属性，值为 `opts` 之一（以其标签文本存储）。
     分组标题行（只有标题文字，没有值也没有编辑器）。
@@ -5865,175 +7544,30 @@ kind：0 文本，1 整数，2 布尔，3 枚举（见 `options`），4 颜色�
   - 追加一个枚举选项（返回 this，便于链式调用）。
 
 
-## QrEncoder (class)
+## Radius (class)
 
-纯 Zan 的 QR Code（模型 1-40）编码器，ISO/IEC 18004：
+统一圆角档位系统。
 
-- 输入按 Unicode 码点分成 Numeric / Alphanumeric / Byte(UTF-8) 游程
-混合编码（中文等多字节字符原样按 UTF-8 字节进 Byte 段，与系统
-码页无关）；短游程（<=8 字符）折回 Byte，省模式切换开销。
-- 自动选最小版本；L/M/Q/H 四级纠错（GF(256) Reed-Solomon，分块交织）。
-- 八个掩码全试、按标准罚分四条选优；格式信息 BCH(15,5)、
-v>=7 版本信息 BCH(18,6)。
-- 超容量抛 Exception（与 stdlib 异常约定一致）。
+- const int None=0;
+  - 0px: 直角/硬边（平铺表格、贴边分栏）
 
-`Encode(text, ecl)` 返回 `QrMatrix`。渲染/导出在 Gui.Widget.QrCode。
+- const int XS=2;
+  - 2px: 微圆角
 
-- static int[]EC_PER_BLOCK_L=new int[]{ -1, 7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28, 28, 28, 30, 30, 26, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30};
+- const int S=4;
+  - 4px: 小圆角（紧凑按钮、Tag、Badge、代码块）
 
-- static int[]EC_PER_BLOCK_M=new int[]{ -1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28};
+- const int M=8;
+  - 8px: 标准圆角（标准按钮、文本框、下拉框、常规卡片）
 
-- static int[]EC_PER_BLOCK_Q=new int[]{ -1, 13, 22, 18, 26, 18, 24, 18, 22, 20, 24, 28, 26, 24, 20, 30, 24, 28, 28, 26, 30, 28, 30, 30, 30, 30, 28, 30, 30, 37, 34, 28, 30, 31, 24, 37, 32, 29, 37, 34, 31};
+- const int L=12;
+  - 12px: 柔和中圆角（浮层面板、主工作区卡片、Dialog）
 
-- static int[]EC_PER_BLOCK_H=new int[]{ -1, 17, 28, 22, 16, 22, 28, 26, 26, 24, 28, 24, 28, 22, 24, 24, 30, 28, 28, 26, 28, 30, 24, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30};
+- const int XL=16;
+  - 16px: 大圆角（弹窗外框、特色大卡片）
 
-- static int[]NUM_BLOCKS_L=new int[]{ -1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8, 8, 9, 9, 10, 12, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 24, 25};
-
-- static int[]NUM_BLOCKS_M=new int[]{ -1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49};
-
-- static int[]NUM_BLOCKS_Q=new int[]{ -1, 1, 1, 2, 2, 4, 4, 6, 6, 8, 8, 8, 10, 12, 16, 12, 17, 16, 18, 21, 20, 23, 23, 25, 27, 29, 34, 34, 35, 38, 40, 43, 45, 48, 51, 53, 56, 59, 62, 65, 68};
-
-- static int[]NUM_BLOCKS_H=new int[]{ -1, 1, 1, 2, 4, 4, 4, 5, 6, 8, 8, 11, 11, 16, 16, 18, 16, 19, 21, 25, 25, 25, 34, 30, 32, 35, 37, 40, 42, 45, 48, 51, 54, 57, 60, 63, 66, 70, 74, 77, 81};
-
-- static int EcPerBlock(QrEcl ecl, int ver)
-  - 该版本/级别每块纠错码字数（ISO 18004 表）。
-
-- static int NumBlocks(QrEcl ecl, int ver)
-  - 该版本/级别的纠错分块数。
-
-- static int MODE_NUMERIC=1;
-
-- static int MODE_ALNUM=2;
-
-- static int MODE_BYTE=4;
-
-- static string ALNUM_CHARS="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
-
-- static int[]AlignPattern(int ver)
-  - 校正图形的坐标轴序列（ISO/IEC 18004 Table E.1，v=1 返回空）。
-
-- static int[]BlockPlan(int ver, QrEcl ecl)
-  - 按版本/级别给出完整序列 [numBlocksG1, dataG1, numBlocksG2, dataG2]。
-    从官方 (总码字 - 纠错码字) 反推数据位。
-
-- static int TotalCodewords(int ver)
-  - 总码字数 = floor(rawDataModules/8)。
-
-- static int[]gfExp=null;
-
-- static int[]gfLog=null;
-
-- static void EnsureGf()
-  - 首次调用时构建 GF(256) 的指数/对数表（本原多项式 0x11D）。
-
-- static int GfMul(int a, int b)
-  - GF(256) 乘法（任一操作数为 0 时结果为 0）。
-
-- static int[]RsGenerator(int deg)
-  - RS 生成多项式（Nayuki 式）：prod (x - a^i)，i = 0..deg-1。
-    返回长度 deg 的数组，result[deg-1] = 1（最高次系数），升幂索引，
-    最高次 x^deg 的系数隐式为 1。
-
-- static int[]RsRemainder(int[]data, int dataLen, int[]gen)
-  - data 对生成多项式 gen 取模（Nayuki 式），返回 deg 个纠错码字。
-
-- class Segment
-  - 一个编码分段：mode 为指示符值，chars 是字符数（numeric/alnum 为
-    字符数，byte 为字节数），bits 是该段的数据位（不含模式/计数头）。
-
-- public static QrMatrix Encode(string text, QrEcl ecl)
-  - 按级别编码文本，返回不含静区的模块矩阵。
-
-- public static QrEcl ParseEcl(string s)
-  - 级别名 -> 枚举（大小写均可）；未知返回 M（与 layui 默认一致）。
-
-- static bool IsNumeric(int b)
-  - 字节是否为 ASCII 数字 0-9。
-
-- static int AlnumValue(string ch)
-  - 字符在字母数字表中的值（0-44），不在表内时 -1。
-
-- static int SeqByteLen(int lead)
-  - 以 lead 为首字节的 UTF-8 码点字节长度（1-4）。
-
-- static List <QrEncoder.Segment> MakeSegments(string text)
-  - 按码点游程切段：数字 / 字母数字 / 字节（UTF-8 原样），再把短的非
-    Byte 游程折回 Byte（模式切换头 4+cc 位往往比直接写进 UTF-8 更贵）。
-
-- static QrEncoder.Segment MakeByteRun(string run)
-  - 把一段文本编码为 Byte 段（每字节 8 位，高位在前）。
-
-- static int ModeOfByte(int b, string text, int pos)
-  - 字节 b（UTF-8 首字节）+ 文本上下文 -> 该码点的模式。
-
-- static int CharCountBits(int mode, int ver)
-  - 模式指示符后的字符计数字段宽度（按版本 1-9/10-26/27-40 分三档）。
-
-- static int DataCapacity(int ver, QrEcl ecl)
-  - 该版本/级别的数据码字容量（总码字减去全部纠错码字）。
-
-- static int PickVersion(List <QrEncoder.Segment> segs, QrEcl ecl)
-  - 能容纳这些分段的最小版本，1..40；放不下返回 -1。
-
-- static int WriteSegments(List <QrEncoder.Segment> segs, int ver, QrEcl ecl, int[]cw)
-  - 分段位流 + 终止符 + 填充写入 cw（容量码字），返回实际数据码字数。
-
-- static void AppendVal(List<int> bits, int val, int n)
-  - 把 val 的低 n 位按高位在前追加进位流。
-
-- static void SetFn(bool[]fn, int size, int x, int y)
-  - 标记 (x,y) 为功能模块（不可掩码、不放数据），越界忽略。
-
-- static void SetDark(bool[]dark, bool[]fn, int size, int x, int y)
-  - 标记功能模块并置为深色，越界忽略。
-
-- static void DrawFinder(bool[]dark, bool[]fn, int size, int cx, int cy)
-  - 定位图形 + 分隔：以 (cx,cy) 为中心的 7x7 环，越界部分丢弃
-    （Nayuki 的 dist!=2 && dist!=4 画法）。
-
-- static void DrawAlign(bool[]dark, bool[]fn, int size, int cx, int cy)
-  - 校正图形：以 (cx,cy) 为中心的 5x5 图案（同心环），越界部分丢弃。
-
-- static int BchVersion(int ver)
-  - 版本信息 18 位：版本号左移 12 位，低位接 BCH(18,6) 纠错位。
-
-- static QrMatrix BuildMatrix(int ver, QrEcl ecl, int[]cw, int nDataCw)
-  - 组装最终矩阵：画功能图形与版本/格式信息区，按 ISO 分块做
-    RS 纠错并交织，蛇形放入数据模块，再对八个掩码逐一应用、
-    按罚分选优。
-
-- static bool[]ApplyMask(bool[]dark, bool[]fn, int size, int mask, QrEcl ecl)
-  - 掩码 + 格式信息写入，返回成品矩阵（new 数组，深拷贝）。
-
-- static bool MaskBit(int m, int x, int y)
-  - 掩码 m 在 (x,y) 处是否翻转（ISO 18004 的八种掩码条件）。
-
-- static int Penalty(bool[]m, int size)
-  - 掩码罚分总值（ISO 18004 四条规则：同色游程、2x2 同色块、
-    类定位图形 1011101、深色比例偏离 50%）。
-
-- static int RunPenaltyLine(bool[]m, int size, int line, bool horizontal)
-  - 单行/列的同色游程罚分（游程 ≥5 时加 3+(长度-5)）。
-
-- static bool Pattern11(bool[]m, int size, int x, int y, bool horizontal)
-  - 11 格窗口 == 0000 1011101（从 (x,y) 沿 horizontal 方向）。
-
-
-## QrMatrix (class)
-
-二维码编码结果：version/size/ecl + 边长 size 的模块矩阵（true = 深色，
-不含静区）。`Get(x,y)` 按行主序读模块。
-
-- public int version;
-
-- public int size;
-
-- public QrEcl ecl;
-
-- public bool[]modules;
-
-- public bool Get(int x, int y)
-  - (x,y) 处模块是否深色（行主序，不含静区）。
+- const int Full=9999;
+  - 9999px: 完全胶囊圆角（Pill 按钮、圆形头像）
 
 
 ## Rect (class)
@@ -6066,6 +7600,31 @@ v>=7 版本信息 BCH(18,6)。
   - 四周向外扩大 amount 像素的新矩形。
 
 
+## RenderAA (class)
+
+通用抗锯齿列/带填充助手：与任何图表家族无关的纯 Canvas 几何
+代码（1/256 px 定点覆盖率混合）。原先住在 ChartView partial
+家族里，DataTable 迷你图列想复用时按需拉取会把 Chart 全家
+（21 个分片 + 布局/模型 ~35 文件）拖进编译图——抽成独立小文件，
+谁拼 RenderAA 谁只拉这一个文件。
+
+- static int WithAlpha(int packed, int a)
+  - 与打包不透明颜色相同的 RGB，但替换 alpha（0 透明..255 不透明）。
+
+- static void FillColumnAA(Canvas c, int px, int yyF, int baseY, int color, bool gradient, int topA, int botA, int solidA)
+  - 单个抗锯齿列：顶边 yyF 是 1/256 定点（列顶落在边界行 iy
+    内的覆盖率 = 256-frac），从边行到 baseY 之间实体填充。
+    gradient 时实体段用 FillVGrad（渐变强端贴数据线），否则
+    用 solidA 均匀透明度。基线在路径上方（反向轴悬挂面积，
+    如雨量图右轴）走镜像分支。
+
+- static void FillBandColumnAA(Canvas c, int px, int topF, int botF, int color, bool gradient, int topA, int botA, int solidA)
+  - 堆叠色带的单个抗锯齿列：顶部和底部边界都带小数覆盖率。
+    底部被吸附到整像素的色带会与下方色带（其顶部自带小数部分）
+    形成阶梯状接缝，使两个堆叠颜色之间的接缝参差不齐——对两条
+    边都混合，使共享行的两份覆盖率合计为一整行。
+
+
 ## RenderBackend (class)
 
 画布背后的光栅器。`Cpu` 是永久保留的兜底实现，`Gpu` 是
@@ -6082,17 +7641,429 @@ v>=7 版本信息 BCH(18,6)。
 - static int Auto()
 
 
+## RichTextDocument (class)
+
+富文本解析结果：原始输入与按序排列的 run 列表。绘制/布局层
+遍历 runs 并按各 run 的 Kind 分派处理。
+
+- string sourceText;
+
+- List<RichTextRun> runs;
+
+- RichTextDocument(string sourceText)
+
+- string SourceText()
+  - 解析前的原始输入。
+
+- int RunCount()
+  - run 总数。
+
+- RichTextRun RunAt(int index)
+  - 第 index 个 run（不查越界）。
+
+- void Add(RichTextRun run)
+  - 追加一个 run 到末尾。
+
+
+## RichTextLink (class)
+
+富文本链接（#@标记@内容@ 语法中标记部分的类型化表示）。
+标记格式为 "action|参数列表"：竖线前是链接动作文本，竖线后
+可带逗号分隔的 1~4 个参数：样式编号、常态色、悬停色、按下色。
+颜色参数按 0xRRGGBBAA 书写，存为 Gui 的 0xAARRGGBB 打包 int；
+未提供的颜色为 0（全透明）。
+
+- string raw;
+
+- int style;
+
+- int normalColor;
+
+- int hoverColor;
+
+- int pressedColor;
+
+- RichTextLink(string marker)
+
+- string Raw()
+  - 链接动作原文（标记中竖线前的部分）。
+
+- int Count()
+  - 动作参数个数（按逗号分隔；无参数为 0）。
+
+- string At(int index)
+  - 第 index 个动作参数（两侧去空白）；越界返回空串。
+
+- int Style()
+  - 样式编号（标记第 1 个参数，未提供为 0）。
+
+- int NormalColor()
+  - 常态颜色（0xAARRGGBB，未提供时为 0）。
+
+- int HoverColor()
+  - 悬停颜色（0xAARRGGBB，未提供时为 0）。
+
+- int PressedColor()
+  - 按下颜色（0xAARRGGBB，未提供时为 0）。
+
+
+## RichTextParser (class)
+
+富文本解析器：把标签化文本切分为类型化 run 流。支持颜色
+快捷标记（#W #R #Y #B #G #H #L）、#c()/#bg()/#f() 样式标签、
+#p()/#a()/#z()/#item() 资源标签、#br(宽度)/#md/#rt/#lf 排版标签
+与 #@标记@内容@ 超链接。无法识别的 # 按普通文本保留；
+## 转义为字面 #（聊天正文里出现 # 时用）。颜色书写遵循
+0xRRGGBBAA（与 Game.Arpg 同一种标记语言），内部统一存为
+Gui 的 0xAARRGGBB。
+
+- string input;
+
+- int position;
+
+- RichTextDocument document;
+
+- RichTextStyle style;
+
+- RichTextLink link;
+
+- RichTextParser(string input, RichTextStyle style, RichTextLink link)
+
+- static RichTextDocument ParseText(string input)
+  - 便捷入口：按默认样式解析整段标记文本。
+
+- static RichTextDocument ParseText(string input, int defaultColor)
+  - `defaultColor` 是没写色码段落的初始前景（0xAARRGGBB）：
+    控件把皮肤 `richtext` 规则的前景传进来，亮色皮肤才能有
+    深色默认段——Default() 的纯白是深色游戏底的习惯。
+
+- static int FindIn(string text, string token, int start)
+  - 在 text 中从 start 起查找 token 首次出现的位置；未找到返回 -1。
+
+- static int ArgCount(string text)
+  - 按逗号分隔的参数个数（空串为 0，"a,,b" 计 3）。
+
+- static string ArgAt(string text, int index)
+  - 第 index 个逗号分隔参数（两侧去空白）；越界返回空串。
+
+- static bool IsSpace(string ch)
+  - 单个字符是否为空白（空格/制表/回车/换行）。
+
+- static string TrimText(string s)
+  - 两侧去空白。
+
+- static bool StartsAt(string text, int pos, string token)
+  - 当前位置是否以 token 开头（不消费）。
+
+- static int HexDigit(string digit)
+  - 单个十六进制字符的数值（0-9/a-f/A-F）；其他字符返回 0。
+
+- static int ParseInt(string text)
+  - 解析整数：支持十进制与 0x 前缀十六进制（可带负号），
+    两侧去空白；无有效数字时返回 0（不置错）。
+
+- static int ParseColor(string text)
+  - 解析 0xRRGGBBAA 颜色为 Gui 的 0xAARRGGBB 打包 int；
+    空串、"0" 或格式不符返回 0（全透明）。
+
+- static int ParseColorArgs(string args)
+  - 解析颜色参数串：1 个参数按 0xRRGGBBAA，4 个参数按
+    r,g,b,a 十进制；其他情况返回 0（全透明）。
+
+- bool Starts(string token)
+  - 当前位置是否以 token 开头（不消费）。
+
+- string Parenthesized(int prefixLength)
+  - 读取当前位置起 prefixLength 个字符之后的括号体并消费到
+    ')' 之后；找不到闭括号返回 null 且不消费。
+
+- void AddText(string text)
+  - 追加一个文本 run（空串忽略），携带当前样式与链接。
+
+- void AddSimple(int kind)
+  - 追加一个指定类型的 run，携带当前样式与链接。
+
+- void AddNested(string text, RichTextLink nestedLink)
+  - 以给定链接嵌套解析 text（样式为当前样式的副本），把结果
+    run 依次并入本文档；用于 #@标记@内容@ 的内容部分。
+
+- bool ParseColorShortcut()
+  - 尝试解析当前位置的颜色快捷标记（#W #R #Y #B #G #H #L）；
+    命中则设置样式颜色并消费 2 字符返回 true。
+
+- bool ParseTag()
+  - 尝试解析当前位置的任一标签并消费输入；命中返回 true，
+    未命中返回 false（调用方把 '#' 按普通文本处理）。
+
+- RichTextDocument Parse()
+  - 解析全部输入并返回文档：\n 产生 LineBreak，'#' 触发标签
+    解析（未识别时按普通文本保留，## 转义为字面 '#'），
+    其余字符累积为文本 run。
+
+
+## RichTextRun (class)
+
+富文本解析产物的单个片段（run）：一段文本、一张图片、一个
+动画、一个占位或一次换行。携带创建时刻的样式快照与所在链接
+（非链接 run 的 Link 为 null），布局/绘制层按 Kind 分派处理。
+
+- int kind;
+
+- string text;
+
+- string resource;
+
+- string action;
+
+- int quantity;
+
+- int offsetX;
+
+- int offsetY;
+
+- int width;
+
+- int height;
+
+- double scale;
+
+- RichTextStyle style;
+
+- RichTextLink link;
+
+- RichTextRun(int kind, RichTextStyle style, RichTextLink link)
+
+- static RichTextRun CreateText(string text)
+  - 创建一个默认样式、无链接的纯文本 run。
+
+- int Kind()
+  - run 类型（RichTextRunKind 常量）。
+
+- string Text()
+  - 文本内容（仅 Text run 有意义，其他为空串）。
+
+- string Resource()
+  - 资源 Id（Image/Animation/Item run）。
+
+- string Action()
+  - 动画动作名（仅 Animation run 有意义）。
+
+- int Quantity()
+  - 物品数量（仅 Item run 有意义）。
+
+- int OffsetX()
+  - 相对排版位置的 X 偏移（像素）。
+
+- int OffsetY()
+  - 相对排版位置的 Y 偏移（像素）。
+
+- int Width()
+  - 宽度（像素；图片/动画未指定时布局按字号兜底）。
+
+- int Height()
+  - 高度（像素；未指定时布局按字号兜底）。
+
+- double Scale()
+  - 动画缩放（默认 1.0）。
+
+- RichTextStyle Style()
+  - 创建时刻的样式快照（独立副本，修改不影响其他 run）。
+
+- RichTextLink Link()
+  - 所在链接；非链接 run 返回 null。
+
+- bool IsLink()
+  - 该 run 是否位于超链接内。
+
+- void SetText(string newValue)
+  - 设置文本内容。
+
+- void SetResource(string newValue)
+  - 设置资源 Id。
+
+- void SetAction(string newValue)
+  - 设置动画动作名。
+
+- void SetQuantity(int newValue)
+  - 设置物品数量。
+
+- void SetOffset(int x, int y)
+  - 同时设置 X/Y 偏移（像素）。
+
+- void SetSize(int width, int height)
+  - 同时设置宽高（像素）。
+
+- void SetScale(double newValue)
+  - 设置动画缩放。
+
+
+## RichTextRunKind (class)
+
+富文本 run 类型常量：Text=0 纯文本、Image=1 图片（#p）、
+Animation=2 动画（#a）、Spacer=3 空白占位（#z）、
+Item=4 物品片段（#item）、LineBreak=5 换行（源文本 \n）、
+WrapWidth=6 换行宽度段（#br(宽度) 或 #md/#rt 携带宽度时）。
+
+- static int Text()
+  - 纯文本 run 类型常量（0）。
+
+- static int Image()
+  - 图片 run 类型常量（1），由 #p(资源,x,y,宽,高) 产生。
+
+- static int Animation()
+  - 动画 run 类型常量（2），由 #a(资源,动作,缩放,宽,高,x,y) 产生。
+
+- static int Spacer()
+  - 空白占位 run 类型常量（3），由 #z(宽,高) 产生。
+
+- static int Item()
+  - 物品片段 run 类型常量（4），由 #item(资源,数量) 产生。
+
+- static int LineBreak()
+  - 换行 run 类型常量（5），源文本中的每个 \n 产生一个。
+
+- static int WrapWidth()
+  - 换行宽度 run 类型常量（6）；携带宽度时改变后续换行宽度，宽度 0 仅切换对齐。
+
+
+## RichTextStyle (class)
+
+富文本样式快照：前景/背景色、字体名与水平对齐。
+解析过程中随 #c/#bg/#f/#md/#rt 等标签变化，并拷贝进
+后续创建的 run。颜色均为 Gui 的 0xAARRGGBB 打包 int；
+对齐取值：0=左，1=中（#md），2=右（#rt）。
+
+- int color;
+
+- int background;
+
+- string font;
+
+- int alignment;
+
+- RichTextStyle(int color, int background, string font, int alignment)
+
+- static RichTextStyle Default()
+  - 默认样式：白字、透明背景、空字体名、左对齐。
+
+- RichTextStyle Clone()
+  - 返回独立副本（修改副本不影响原样式）。
+
+- int Color()
+  - 当前前景色（0xAARRGGBB）。
+
+- int Background()
+  - 当前背景色（0xAARRGGBB，0 = 无背景）。
+
+- string Font()
+  - 当前字体名（空串表示默认字体）。
+
+- int Alignment()
+  - 当前水平对齐：0=左，1=中（#md），2=右（#rt）。
+
+- void SetColor(int newValue)
+  - 设置前景色（0xAARRGGBB；影响后续创建的 run）。
+
+- void SetBackground(int newValue)
+  - 设置背景色（0xAARRGGBB）。
+
+- void SetFont(string newValue)
+  - 设置字体名。
+
+- void SetAlignment(int newValue)
+  - 设置水平对齐（0=左 1=中 2=右）。
+
+
+## ScrollState (class)
+
+CSS 滚动容器的交互状态（WEB_GUI_ROADMAP P6）：滚轮认领、
+覆盖式滚动条绘制与滑块拖动。偏移本体存在 Control.scrollY /
+Control.scrollX——排布期（Arrange）按内容延伸钳制并把子树
+平移 -scrollY / -scrollX，本类只管"输入如何改 offset"与
+"滚动条怎么画"，方法都吃现值返回新值。
+
+与 Widget.ScrollView 的分工：ScrollView 是立即模式帮助类（自带
+塌陷保护——内容高度按帧实测会抖）；保留模式树里内容高度来自
+上一次排布，是确定的，塌陷恢复不适用（差异记 roadmap 台账）。
+滚动条是覆盖式（overlay）：画在内容上、不占布局宽——Chrome
+经典滚动条占 17px 布局宽，这里不模拟（oracle 用 --hide-scrollbars
+对齐，台账）。
+
+- bool dragging;
+
+- int dragMouseY0;
+
+- int dragOffset0;
+
+- int dragMo0;
+
+- bool draggingX;
+
+- int dragMouseX0;
+
+- int dragOffsetX0;
+
+- int dragMoX0;
+
+- int barW;
+  - 滚动条宽（OnMeasure 后的消费端自行 Scale；此处存基准值）。
+
+- ScrollState()
+
+- bool WheelXY(App app, int x, int y, int w, int h, Control host, int oxMode, int oyMode)
+  - 双轴滚轮认领（渲染期每帧调用）：指针悬停且**该轴真的溢出**
+    时才认领（CaptureWheel 两段式，与单轴版同序）——声明了
+    auto/scroll 但内容放得下的容器不认领：认领了 offset 也只会
+    被钳回 0，白白吃掉本属于外层容器/页面的滚轮，指针扫过这类
+    区域时消费权内外横跳，滚动条表现为乱跳（Chrome 滚动链同款
+    语义：不溢出不拦截）。滚轮帧上 shift+滚轮且横向可滚时平移
+    host.scrollX——Chrome Windows 同款（触控板横扫由外壳映射成
+    shift+滚轮），横向滚不动时回落纵向；其余平移 host.scrollY。
+    写入即钳位：贴底/贴顶时差值为 0 → 返回 false 不算消费，也
+    不再把越界 offset 留给下一帧 Arrange 收拾。返回是否移动了
+    偏移（调用方据此报损伤）。取代单轴 Wheel（双轴分支并到
+    一处，认领只做一次）。
+
+- bool WantsBar(int extent, int client, int mode)
+  - 该不该画滚动条：scroll 常驻（Chrome 桌面对 overflow:scroll
+    总是显示轨道），auto 溢出才出，hidden 永不（调用方不调）。
+
+- int Clamp(int offset, int extent, int client)
+  - 排布期钳制：offset 落回 [0, extent-client]（mo<0 视为 0）。
+
+- int Bar(App app, int x, int y, int w, int h, int offset, int extent, int mode)
+  - 渲染尾段（子项画完、裁剪弹出后调用）：画覆盖式滚动条并处理
+    轨道点击/滑块拖动，返回（可能被拖动改写的）offset。条带矩形
+    是滚动容器的 padding box；不溢出且 mode=auto 时只收拖动状态。
+
+- int BarX(App app, int x, int y, int w, int h, int offset, int extent, int mode)
+  - 水平轴版 Bar（P6 横滚）：轨道贴 padding box 底边，滑块按
+    scrollExtentX/scrollX 映射；拖拽跟随 mouseX，其余语义与
+    纵向 Bar 全同。先纵后横绘制——右下角被横向轨道盖住
+    （Chrome 经典滚动条此处是独立方角，台账）。
+
+
 ## Selector (class)
 
-一个已解析的选择器：把 `button.ghost.primary::icon:hover` 拆成类型名、
-其类链、可选的 id、可选的 `::part` 和可选的
-`:state`。这就是引擎建模的全部选择器语法——足以用 CSS 描述
-组件的完整外观（其部件和状态），而且
-足够小，匹配保持为一次表扫描。
+一个已解析的选择器：最右侧复合块是主体（`panel.card > .head .title:hover`
+的主体是 `.title:hover`），左侧的复合块经 `up`/`combo` 挂成链。主体块拆成
+类型名、类链、id、部件与状态；另加属性条件（`[class*="frag"]` / `[disabled]`）、
+`:not()/:is()/:where()` 与结构性伪类（`:nth-child()` 等）。
+
+组合器链和结构性伪类要真实的树上下文才能求值：带 Control 的 retained
+路径（`MatchNodeCtx`）按 parent/children 匹配；immediate 路径（`MatchNode`）
+没有节点可看，这些选择器整体不命中（规则不丢，换到 retained 树里就活）。
+两者都不静默——Lint 会把"只在 retained 树生效"的条数汇总报出。
 
 - string type;
 
+- bool universal;
+  - `*` 通配：匹配任意类型（权重 0）。
+
 - string classes;
+
+- List<string> classList;
+  - classes 的预切分形式（匹配热路径上不再分配）。
 
 - string id;
 
@@ -6100,27 +8071,160 @@ v>=7 版本信息 BCH(18,6)。
 
 - string state;
   - 以空格分隔的伪类名（`:hover:selected` -> "hover selected"），
-    无状态时为 ""。多个伪类是与关系，因此“选中且悬停”
+    无状态时为 ""。多个伪类是与关系，因此"选中且悬停"
     这类组合外观能写在 CSS 里，而不必回到代码里分支。
 
 - string clsContains;
   - `[class*="frag"]` 里的 frag：class 属性原文的子串匹配，
     用于 `custom-{hex}` 这类复合 class 片段（无该条件时为 ""）。
+    大小写敏感的子串条件才走这个快路径，其余走 attrs。
+
+- List<AttrCond> attrs;
+  - class 上的属性条件（`[class^="x"]` 等）。
+
+- int reqMask;
+  - 必须置位的状态位（`:hover`、`[disabled]`）。
+
+- int forbidMask;
+  - 必须清零的状态位（`:enabled`、`[disabled="false"]`）。
+
+- List<Selector> nots;
+  - `:not(...)`：其中任一命中则本选择器不匹配。
+
+- List<Selector> ises;
+  - `:is(...)` / `:where(...)`：任一命中即命中（前者计特异性，后者不计）。
+
+- List<Selector> wheres;
+
+- List<HasCond> hasList;
+  - `:has(...)`：宿主的相对范围内存在候选命中内层选择器即命中。
+
+- Selector up;
+  - 主体左侧的复合块（null = 没有链，主体就是整个选择器）。
+    链上的状态/伪类按被匹配祖先自身最近一次解析的状态求值。
+
+- int combo;
+  - `up` 与本块之间的连接器：0 后代（空隙）、1 子（`>`）、
+    2 相邻兄弟（`+`）、3 通用兄弟（`~`）。
+
+- int structCode;
+  - 结构性伪类码（StructCode：1 first-child … 12 root），0 无。
+    要兄弟/父子信息，仅在带树上下文的匹配里可判定。
+
+- int anbA;
+  - `:nth-child(an+b)` 系参数（结构码 4/5/9/10 时有效）。
+
+- int anbB;
+
+- bool never;
+  - 语法接受但引擎无法判定（行级伪元素、无法求值的 `:not()`、
+    `:lang()` 等）时置位，永不匹配。
+
+- string why;
+  - never 的原因（Lint 用它把"写了没反应"说清楚）。
 
 - static Selector Parse(string sel)
-  - 解析一个选择器；遇到本引擎不建模的形式（后代/子组合器、
-    `class*` 之外的属性选择器、`:root`）时返回 null，
-    这类选择器永远不会匹配。
+  - 解析一个选择器：先按组合器切成复合块序列（从右往左挂链），
+    再逐块走 ParseCompound。引擎无法建模的块按约定返回 null
+    （丢弃整条规则）或置 never（永不匹配），二者都不静默。
+
+- static Selector ParseCompound(string sel)
+  - 解析单个复合选择器（不含组合器）：`button.ghost.primary::icon:hover`。
+    引擎不建模的形式按约定返回 null 或置 never。
+
+- int Pseudo(string s, int at)
+  - 处理 `at` 处的 `:`：`::part`、`:state`、`[pseudo-element]`、
+    `:not()/:is()/:where()` 或结构性伪类（`:nth-child()` 等）。
+    返回下一个下标，硬错误（无法配对）返回 -1。
+
+- static int StructCode(string name)
+  - 结构性伪类名 -> 码。0 = 不是结构性伪类。
+
+- bool SetAnB(string arg)
+  - 解析 `an+b` 参数（空格容忍）：odd/even/`3`/`n`/`-n+3`/`2n-1`。
+
+- static bool SignedInt(string s, out int v)
+  - 带符号十进制整数（`-3`/`+7`/`12`），坏文本返回 false。
+
+- bool MatchAnB(int idx)
+  - 1 基序号是否落在 `anA*n + anbB` 的序列里（n = 0,1,2,…）。
+
+- static List<Selector> ParseList(string text)
+  - 逗号分隔的选择器列表（`:not(a, b)` 内层）；无法解析的项留 null。
+
+- bool AddAttr(string inner)
+  - 解析 `[...]` 的内容并记入本选择器；不建模的属性返回 false
+    （调用方因此丢弃整条规则，与旧行为一致）。
+
+- static int AttrState(string name)
+  - 布尔属性名对应的状态位（无对应返回 0）。
+
+- static bool IsPseudoElement(string name)
+  - 是否为 CSS 标准伪元素名（单冒号旧拼写也要认成部件）。
+
+- static bool IsGenerated(string name)
+  - 行级伪元素：行盒模型没有对应绘制原语，语法接受但永不匹配。
+    `::before`/`::after` 已支持——content 文本按宿主流内容合成
+    （Element 伪文本），不再落 here。
+
+- bool MatchNode(string nodeType, List<string> classes, string cls, string nodeId, string nodePart, int stateBits)
+  - 规则 `i` 是否选中给定的节点（无树上下文版本：组合器链与
+    结构性伪类整体不命中——immediate 路径没有节点可看）。
+
+- bool MatchNodeCtx(string nodeType, List<string> classes, string cls, string nodeId, string nodePart, int stateBits, Control node)
+  - 带树上下文的匹配：`node` 是主体控件（retained 树的节点），
+    组合器沿 parent/children 求值，结构性伪类按兄弟信息求值。
+
+- bool MatchChain(Selector up, Control node)
+  - 组合器连接：`up` 复合块要能在 `node` 的对应近邻上命中。
+    链上的状态位按近邻控件最近一次解析的状态求值（未解析过
+    视为常态）——不是完全实时，但比一律按常态强。
+
+- static Control SiblingAt(Control par, Control node, int back)
+  - `node` 往前数第 `back` 个兄弟（1 = 紧邻的前一个），越界为 null。
+    负值往后数（-1 = 紧邻的后一个）。兄弟关系只看 children
+    （与 CSS 的元素兄弟一致，不区分可见性）。
+
+- static bool HasMatch(Control host, HasCond hc)
+  - :has() 求值：候选 = 宿主按 lead 组合器取的相对范围
+    （0 严格后代、1 直接子、2 紧邻后兄弟、3 全部后兄弟），任一
+    候选命中内层选择器即成立。内层自身的组合器链从候选向上正常
+    求值，链的最左块可能落在宿主子树之外（`:scope div img` 的
+    严格辖域）——`div img` 这类嵌套链是已知近似，常见形如
+    `:has(> img)`/`:has(img)`/`:has(+ p)` 均精确。
+
+- static bool ScanSubtree(Selector inner, Control host, int depth)
+  - 子树扫描：depth 0 = 全部严格后代，1 = 仅直接子。
+
+- static bool SelHit(Selector s, Control c)
+  - 候选节点是否命中（部件位恒空：:has 内层不允许伪元素部件）。
+
+- bool MatchStruct(Control node)
+  - 结构性伪类在真实节点上的求值。没有父节点的根视为
+    首子 + 末子 + 唯一子（CSS 里根元素同样如此）。
+
+- bool Relational()
+  - 此选择器是否依赖树上下文（组合器链、结构性伪类、:has()，或
+    需要查节点属性表的非 class 属性条件）：immediate 路径不会
+    命中，且表里有它时样式缓存键要并节点位置签名（同型不同属性
+    的兄弟节点不得共用缓存），Lint 按它汇总"只在 retained 树生效"。
+
+- static bool MatchAttr(AttrCond a, List<string> classes, string cls, Control node)
+  - 一个属性条件是否成立。`class` 条件对 class 原文/词表求值
+    （immediate 路径也可判）；其余条件查 `node` 的属性表
+    （Control.CssAttr），node 为 null（immediate 路径）或无表时
+    保守不命中。存在性条件走 CssHasAttr——布尔属性值为空串
+    （``）也算存在，与"在不在表里"分开。
+
+- static bool HayOp(string op, string hay, string val)
+  - `=`/`^=`/`$=`/`|=`/`*=` 对原文串求值（nocase 已在两参上生效）。
+
+- static bool HoldsCI(List<string> classes, string name)
+  - 大小写不敏感的类 token 命中（类名已在调用前转小写）。
 
 - int Specificity()
-  - 此选择器在级联中的权重。伪状态高于
-    其他一切，因此无论作者写在哪里，`:hover` 都叠加在基础外观之上；
-    其下按 CSS 顺序：type <
-    class < 类链 < id。
-
-- static string ClassContains(string attr)
-  - `class*="frag"`（允许内部空白，双引号或单引号）→ frag；
-    其余属性写法不是子串匹配，返回 null（选择器不建模）。
+  - `:not()`/`:is()`/`:has()` 取内层最大权重；组合器链按 CSS
+    逐块累加。
 
 - static bool NameChar(string ch)
   - 可作为类型/类/id/部件名称字符时为 true。
@@ -6134,9 +8238,10 @@ v>=7 版本信息 BCH(18,6)。
 
 每行一个节点，制表符分隔：
 kind name dock padL padT padR padB gap mx my prefW prefH nChildren nProps
-[propKey propVal]* nEvents [evtName handlerId]* bindPath bindProp class
+[propKey propVal]* nEvents [evtName handlerId]* bindPath bindProp class bindIf
 值会转义，制表符/换行/反斜杠得以保留；子节点
-紧跟在父节点之后按前序排列。
+紧跟在父节点之后按前序排列。事件之后的四个绑定字段是按版本
+追加的，读端逐个 `fi < f.Count` 探测——旧文档缺尾部字段照读。
 
 - static string Esc(string s)
   - 转义值文本中的反斜杠/制表符/换行（序列化行格式用）。
@@ -6427,6 +8532,76 @@ CSS 样式化的东西仍得到皮肤的调色板），其余每条规则供给�
   - `prefix` 下以 '\n' 连接的内置资源名列表。
 
 
+## Space (class)
+
+8pt 网格间距系统档位（标准界面排版节奏，杜绝魔数）。
+
+- const int None=0;
+  - 0px: 无间距
+
+- const int XXS=2;
+  - 2px: 微小缝隙（分割线偏移、密集状态指示微调）
+
+- const int XS=4;
+  - 4px: 紧凑间距（图文并排微小间隔、Tag 内边距）
+
+- const int S=8;
+  - 8px: 基础单元（标准小间距、表单项行距、控件内间距）
+
+- const int SM=12;
+  - 12px: 次级中等间距（卡片紧凑内衬）
+
+- const int M=16;
+  - 16px: 标准中等间距（模块常规内衬、卡片内边距 Padding）
+
+- const int L=24;
+  - 24px: 呼吸感大间距（主内容区边距、分块大间距）
+
+- const int XL=32;
+  - 32px: 视差特大间距（模态框外留白、页面分段大空隙）
+
+- const int XXL=48;
+  - 48px: 巨型间距（Hero 区域留白）
+
+
+## SpriteBatch (class)
+
+打包精灵批（A356 P0）：把一层的全部精灵四边形装进一块预分配的
+NativeMemory 缓冲，跨帧复用——热路径零分配，整层一次 FFI 提交
+（`Canvas.DrawSprites`）。GPU 路径并入 zan_gui 的顶点批
+（贴图四边形不再逐个落 CPU 光栅）；CPU 兜底逐个 blit。
+
+每精灵 10 个 float：dx,dy,dw,dh, sx,sy,sw,sh, tint(0xAABBGGRR，
+-1=不染色)，保留位。源 w/h<=0 取整图。坐标单位=画布像素，
+源坐标单位=图源像素。
+
+- nint buf;
+
+- int capSprites;
+
+- int count;
+
+- SpriteBatch()
+
+- public static SpriteBatch Create(int capSprites)
+  - 分配可容纳 capSprites 个精灵的批缓冲。
+
+- public void Begin()
+  - 清空批（不释放缓冲），开始装新一层。
+
+- public int Count()
+  - 本批已装填的精灵数。
+
+- public void Add(float dx, float dy, float dw, float dh, float sx, float sy, float sw, float sh, int tint)
+  - 装一个精灵。缓冲满时静默丢弃（容量在 Create 时定）。
+
+- public void Draw(Canvas c, int handle)
+  - 整层一次提交到画布。handle 来自 Canvas.SpriteHandle。
+
+- public void Dispose()
+  - 释放底层缓冲。此后本对象不可再用。
+
+
 ## Stack (class)
 
 立即模式组合用的线性布局游标。
@@ -6533,6 +8708,33 @@ Rect search = bar.Fill();
     再手动分配宽度。
 
 
+## State (class)
+
+泛型响应式状态容器（Reactive State Container）。
+封装任意类型的数据并记录单调递增版本号；当绑定了 App 时，值发生赋值修改
+会自动触发界面的重绘请求（App.RequestRedraw），彻底摆脱手动处处调用 RequestRedraw 的负担。
+
+- T val;
+
+- int version;
+
+- App hostApp;
+
+- State(T initial)
+
+- void BindApp(App app)
+  - 绑定当前的 GUI 宿主，变更时自动触发重绘。
+
+- T Get()
+  - 获取当前值。
+
+- void Set(T v)
+  - 写入新值。版本号递增，若绑定了 App 自动请求刷新。
+
+- int Version()
+  - 写入次数，供帧轮询比对。
+
+
 ## Style (class)
 
 样式解析器：把（控件类型、类、状态）解析为一个
@@ -6614,16 +8816,9 @@ s.DrawLabel(app, x, y, w, h, label);
 - static int StateOf(App app, int id, bool disabled)
   - 控件 `id` 的实时交互状态，以状态位掩码表示。
 
-- static Dict <string, StyleBox> cache;
-
-- static int cacheGen;
-
 - static int statResolve;
 
 - static int statHit;
-
-- static void CacheReset(int gen)
-  - 重建解析缓存并记下主题代次 `gen`；旧代次的全部键作废。
 
 - static int StatPeek(int idx)
   - 读解析计数但不清零，供按帧算差值（0 = 解析次数，1 = 命中次数）。
@@ -6635,7 +8830,7 @@ s.DrawLabel(app, x, y, w, h, label);
   - 查解析缓存（每次调用计入解析统计，命中计入命中统计）；
     缓存为空或主题代次不符时重建并返回 null（未命中）。
 
-- static void CachePut(string key, StyleBox box)
+- static void CachePut(App app, string key, StyleBox box)
   - 把解析结果放入缓存；同键已存在时保留先到的。
 
 - static StyleBox Of(App app, string type, string cls, int state)
@@ -6671,11 +8866,34 @@ s.DrawLabel(app, x, y, w, h, label);
     `floatbutton` 只改它自己——因此是别名在前、本名在后，
     而不是把上百条按钮规则在 CSS 里复制一遍。
 
+- static void ApplySheetCtx(StyleSheet sheet, StyleBox b, string type, string cls, string id, int state, Control node)
+  - ApplySheet 的树上下文版本：`node` 是主体控件，组合器链与
+    结构性伪类按真实树求值（immediate 路径传 null，规则不命中）。
+
 - static string SheetAlias(string type)
   - 该控件族借用哪个类型的 CSS 规则（"" = 不借）。
 
 - static void ApplyPartSheet(StyleSheet sheet, StyleBox b, string type, string part, string cls, string id, int state)
   - 控件某个 `type::part` 的同样处理（`menu::item`、`card::title`）。
+
+- static void ApplyPartSheetCtx(StyleSheet sheet, StyleBox b, string type, string part, string cls, string id, int state, Control node)
+  - ApplyPartSheet 的树上下文版本。
+
+- static int NodeState(Control c)
+  - 控件最近一次解析出的状态位（尚未解析过/处于过渡混合态时
+    视为常态）。组合器链上左侧块的 `:hover` 等按它求值——
+    不是完全实时，但比一律按常态更接近作者预期。
+
+- static string MediaSig(App app)
+  - 媒体环境的缓存键签名：媒体规则的求值结果随窗口尺寸/主题
+    暗色/减少动效变化，任一活跃样式表带 @media 时把它并进键。
+
+- static bool AnyMedia(StyleSheet basef, StyleSheet chartf, StyleSheet sheet)
+  - 活跃样式表里是否有需要运行期求值的 @media 规则。
+
+- static string CtxSig(Control node)
+  - 树上下文的缓存键签名：从根到 `node` 的 `类型.类/序号` 链。
+    树的结构一变签名就变，样式缓存随之自然失效。
 
 - static List<string> Classes(string cls)
   - 拆分以空格分隔的类列表（"primary ghost" -> [primary, ghost]）。
@@ -6773,6 +8991,13 @@ s.DrawLabel(app, x, y, w, h, label);
 
 - static string TokN(string name, int v)
   - 数值 token（长度/强度/开关），以十进制输出。
+
+- static string UaCss()
+  - UA 样式表（WEB_GUI_ROADMAP P0）：web 元素的缺省语义，垫在
+    装载链最底（App.ApplyAppCss 第一个 merge），皮肤与应用样式
+    按正常层叠覆盖。只给纯布局/排版 tag——与真控件 Kind 撞名的
+    （label/button/form/input/...）不给，避免改变现有控件的
+    display 归类。
 
 - static int FontFallback(App app, string size)
   - 尺寸档对应的主题字号：tiny/small/large/huge，
@@ -6909,6 +9134,24 @@ s.DrawLabel(app, x, y, w, h, "Save");
 
 - int nowrap;
 
+- int tsColor;
+  - `text-shadow`：文字底下的投影/描边色（0 = 无）。
+    压在图片上的浅色小字（图名、地图标注）靠它保住可读性。
+
+- int tsDx;
+
+- int tsDy;
+
+- string contentRaw;
+  - `content` 声明原文（::before/::after 伪元素的取值源）：
+    引号串/attr()/none 的混合原文，由消费端（Element 伪文本）
+    解析成实际文本。"" = 本盒没有 content 声明。
+
+- int tsOutline;
+  - 1 = 按四向描边绘制（原声明是 ≥3 层零模糊投影，
+    如 `1px 1px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, …`，
+    作者要的是文字描边而不是单侧投影）。
+
 - int borderColor;
 
 - int borderW;
@@ -7019,6 +9262,34 @@ s.DrawLabel(app, x, y, w, h, "Save");
 - int columns;
   - 每行的等分列数（-1 未设置 = 按可用宽度自动换行）。
 
+- string gridCols;
+  - 容器轨道模板存原文串（Clone 直拷；repeat()/minmax() 的展开只在
+    排版时用到，不值得驻留在每个 StyleBox 里）。"" = 未声明。
+
+- string gridRows;
+
+- string gridAutoCols;
+
+- string gridAutoRows;
+
+- int gColStart;
+  - 条目放置（grid-column/row 系）：线号 1 基，0 = auto；
+    span 缺省语义 1（0 = 未声明，消费端 max(1)）。
+
+- int gColEnd;
+
+- int gColSpan;
+
+- int gRowStart;
+
+- int gRowEnd;
+
+- int gRowSpan;
+
+- int justifyItems;
+  - 网格条目在格子内的对齐（同 alignItems 编码）：inline 轴
+    （`justify-items`，place-items 的第二词）。
+
 - int display;
 
 - int flexDir;
@@ -7070,11 +9341,57 @@ s.DrawLabel(app, x, y, w, h, "Save");
 
 - int overflow;
 
+- int overflowCss;
+  - CSS 意义上的 overflow 真实声明：0 visible，1 hidden/clip/auto/
+    scroll，-1 未声明。overflow 字段缺省 1 是引擎渲染裁剪约定，
+    不能当 BFC 判据（声明了 hidden 才是 BFC，CSS 2.1 §9.4.1）。
+
+- int overflowX;
+  - per-axis 滚动语义（P6）：0 visible / 1 hidden(clip) / 2 auto /
+    3 scroll。滚动容器判据、滚动条与滚轮交互都看这两根；单轴声明
+    时另一根 visible 按规范计算成 auto（消费端 StyleOverflow*）。
+    水平轴只裁剪不滚动（台账）。
+
+- int overflowY;
+
 - int zIndex;
 
 - int cursor;
 
+- int ccMask;
+
 - int visible;
+
+- int inlineLevel;
+  - 行内级标记：1 = inline/inline-block/inline-flex（参与父块流容器
+    的行盒横排）。0 = 块级。
+
+- int floatSide;
+  - CSS `float`：0 none，1 left，2 right（P3 完成绕排布局）。
+
+- int clearSide;
+  - CSS `clear`：0 none，1 left，2 right，3 both。
+
+- int boxSizing;
+  - CSS `box-sizing`：0 border-box（缺省，声明尺寸含 border+padding），
+    1 content-box（声明尺寸只含内容，布局端反推框宽）。
+
+- int whiteSpace;
+  - CSS `white-space`：0 normal，1 nowrap，2 pre，3 pre-wrap。
+    旧字段 nowrap 同步维护（绘制端"不折行"位）：nowrap/pre 置 1。
+
+- int lineHeightKind;
+  - `line-height` 的量纲：0 未声明/normal，1 px（lineHeight），
+    2 千分（lineHeight = 相对 fontPx 的倍数 * 1000，含 % 形式）。
+
+- int bfc;
+  - 块格式化上下文标记（CSS BFC，P1）：`flow-root`/行内级置 1。
+    BFC 容器不与首/尾子的 margin 塌陷；`display: block` 的普通
+    容器为 0——与首尾子塌陷（web 语义）。
+
+- int vaInline;
+  - 行内 `vertical-align`（P2 行盒）：0 baseline，1 middle，
+    2 top，3 bottom。长度/百分比暂按 baseline（audit 报 coerced）。
 
 - int transitionMs;
 
@@ -7091,6 +9408,22 @@ s.DrawLabel(app, x, y, w, h, "Save");
 - int scale;
 
 - int rotate;
+
+- int envRemPx;
+  - rem 的基准：主题正文字号（px）。
+
+- int envVw;
+  - vw 的基准：窗口逻辑宽。
+
+- int envVh;
+  - vh 的基准：窗口逻辑高。
+
+- bool mediaDark;
+  - 媒体查询环境：`prefers-color-scheme: dark` 的求值结果
+    （app.isDark）。
+
+- bool mediaReduced;
+  - 媒体查询环境：`prefers-reduced-motion: reduce`（app.reducedMotion）。
 
 - static int Unset()
   - 度量未设置的通用哨兵（-1）。
@@ -7128,6 +9461,17 @@ s.DrawLabel(app, x, y, w, h, "Save");
 - StyleBox Clone()
   - 逐字段复制（解析缓存发放副本，以便控件可以
     微调自己的 box 而不污染缓存）。
+
+- int BorderTopPx()
+  - 各边 border 实际宽度（px）：四边声明优先，未声明回退统一
+    `borderW`。border 参与布局（WEB_GUI_ROADMAP P0）——
+    box-sizing: border-box 时内容框 = 框 − border − padding。
+
+- int BorderRightPx()
+
+- int BorderBottomPx()
+
+- int BorderLeftPx()
 
 - int BgOr(int fb)
   - 填充背景色；未设置（0）返回 fb。
@@ -7179,7 +9523,10 @@ s.DrawLabel(app, x, y, w, h, "Save");
 
 - static int MetricIn(int pm, int abs, int avail, int fb)
   - 按包含块解析度量：百分比优先，其次
-    绝对值声明，最后才是调用方的回退值。
+    绝对值声明，最后才是调用方的回退值。`avail <= 0` 在本引擎的
+    约定里是"包含块未定"（测量路径一律传 0），此时百分比按 auto
+    回落 `fb`（css-sizing：内在尺寸计算中百分比视作 auto），
+    而不是解析成 0 把内容尺寸抹掉。
 
 - int WidthIn(int avail, int fb)
   - 在 `avail` px 的包含块内声明的宽度（样式未声明时用 `fb`），
@@ -7301,14 +9648,31 @@ s.DrawLabel(app, x, y, w, h, "Save");
 - int SpinDeg(App app, int x, int y, int w, int h)
   - 本帧 `spin` 动画贡献的旋转角度（度）。
 
-- int DrawLabel(App app, int x, int y, int w, int h, string label)
+- int LineHeightPx(int fs)
   - 在 [x,y,w,h] 内绘制标签，遵循颜色、字号/字重、
     text-align、vertical-align、letter-spacing、text-transform 和
     text-overflow: ellipsis。返回实际绘制的宽度。
+    行高像素：量纲 1 = lineHeight（px）；2 = 千分倍 × 字号
+    （`line-height: 1.5` / `150%`）。0 = 未声明/normal。
+
+- int DrawLabel(App app, int x, int y, int w, int h, string label)
 
 - void DrawRun(Canvas c, int x, int y, string s, int color, int fs)
   - 在精确原点绘制一段文本（无盒子对齐），应用
-    字间距以及 `font-weight >= 600` 的模拟加粗。
+    字间距、`font-weight >= 600` 的模拟加粗，以及 `text-shadow`。
+    
+    text-shadow 必须在字形之前画：X11/Win32 的文字是直接覆盖
+    合成，先画字再画影子会把影子盖在笔画上而不是垫在下面。
+    `tsOutline`（原声明是 ≥3 层零模糊投影）按四向描边绘制——
+    那正是 `1px 1px 0 #000, -1px -1px 0 #000, …` 的意图，
+    单侧偏移会让压在图片上的白字半边发糊。
+
+- void DrawTextShadow(Canvas c, int x, int y, string s, int fs)
+  - 文字投影/描边：四向描边（tsOutline）或单侧偏移。
+    
+    `s` 是已经应用过 text-transform/ellipsis 的最终串，偏移按
+    声明值原样使用（px，不随 DPI 放大——描边宽度 1px 是字形本身
+    的观感，放大到 1.5px 反而糊）。
 
 - static int MeasureSpaced(string s, int fs, int spacing)
   - 文本宽度：MeasureText 加上 letter-spacing（每字符 spacing 像素）。
@@ -7348,36 +9712,19 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
 
 - List<string> selText;
 
-- List<string> selType;
-
-- List<string> selClasses;
-
-- List<string> selClass0;
-  - 规则要求的第一个类名（无类要求时为“”）。把颜色与状态
-    下沉进 CSS 后，`button` 那一桶里绝大多数规则都带类
-    （`button.ghost.primary:hover` 之类），先用这一个字符串比较筛掉，
-    就不必为每条规则再切分一次类名串。
-
-- List<string> selContains;
-  - `[class*="frag"]` 要求的 class 属性子串（无该要求时为“”）。
-
-- List<string> selId;
-
-- List<string> selPart;
-
-- List<string> selState;
-
-- List<int> selStateMask;
-  - 选择器要求的状态位（多个伪类取与）；引擎不认识其中
-    任何一个伪类时为 -1（该规则永不匹配）。
-
-- List<int> selSpec;
+- List<Selector> selObjs;
+  - 已解析的选择器对象（与 selText/selBlock 对齐）。选择器语法
+    （`*`、属性条件、`:not()/:is()`）全在 Selector 里求值，
+    这里不再维护平行的手抄字段。
 
 - int indexedCount;
 
 - List<JsonValue> selBlock;
   - 每条规则的声明块，索引与上面的选择器表对齐：匹配后直接取，
     不再按选择器文本回查 rules（一次首帧解析要按名字查上百次）。
+
+- List<JsonValue> selImportant;
+  - 每条规则里 `!important` 那部分声明（无则 null），与 selBlock 对齐。
 
 - Dict <string, List<int>> byType;
   - 按类型名分桶的规则下标（升序，因此与 anyType 归并后仍是级联顺序）。
@@ -7387,12 +9734,92 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
 - List<int> anyType;
   - 没有类型选择器的规则下标（`.primary`、`#save`、`::option`）。
 
+- int atRulesDropped;
+  - 解析时被跳过的 at-rule 块数（`@media` / `@keyframes` / …）。
+    跳过是浏览器行为，但"跳过了多少"必须能看见——否则一整块
+    响应式样式消失时，皮肤作者只会以为引擎支持它。
+
+- Dict <string, int> atRuleKinds;
+  - 被跳过的 at-rule 按名字计数（`media` -> 3），供 Lint 说明丢的是什么。
+
+- int atGuardsSkipped;
+  - 因 `@supports` 守卫在本引擎上判假而跳过的块数（守卫成立时块会
+    展开，所以这不是"不支持 @supports"，Lint 里与 atRulesDropped 分开报）。
+
+- Dict <string, int> atRuleGuards;
+  - 判假的守卫条件原文计数（`(display: grid)` -> 2）。
+
+- List<string> lintDropped;
+  - 词法上认不出（选择器含组合器/伪元素等）而被丢弃的规则文本。
+    与 atRulesDropped 一起供 StyleSheet.Lint 报告。
+
+- List<string> lintNever;
+  - 语法接受、但引擎判定永不匹配的选择器（结构性伪类、未知伪类、
+    `::before`/`::after`、无法求值的 `:not()`），形如
+    `sel  [never: 原因]`。这些以前是静默的——Lint 现在把它们列出来。
+
+- List<string> lintUnused;
+  - 声明了、但 Decl 一条都没消费掉的规则文本。
+
+- List<string> lintValue;
+  - 值里带了引擎解析不了的长度单位（`em`/`rem`/`pt`/`calc()` 等），
+    会被当裸数字用：形如 `sel  [unit: key: value]`。这是审计里
+    "最危险的一类"静默失败，Lint 把它点名。
+
+- List<string> lintInert;
+  - 规则里出现了"收了但不生效"的属性（box-sizing / float），
+    形如 `sel  [inert: float]`。
+
+- int lintGen;
+  - lintDropped/lintUnused 已收集到的 rules 代数。
+
+- bool relational;
+  - 索引建立时置位：表里存在依赖树上下文的选择器（组合器链或
+    结构性伪类）。这类规则只在 retained 控件树上命中，且命中结果
+    随节点位置变化——Style.Resolve 因此把位置签名加进缓存键。
+
+- List<Selector> mediaSels;
+  - 已解析选择器（与 mediaBlocks/mediaConds 对齐）。
+
+- List<JsonValue> mediaBlocks;
+  - 各条媒体规则的声明块与 !important 部分。
+
+- List<JsonValue> mediaImportants;
+
+- List<MediaCond> mediaConds;
+  - 各条媒体规则的守卫条件。
+
+- int mediaCount;
+  - 收到的媒体块数（含内层规则展开前的块数口径不好对齐，
+    这里计"带条件的规则条数"）。
+
 - StyleSheet()
   - 构造空表（规则/变量为空 JSON 对象，索引延迟建立）。
+
+- void NoteAtRule(string name)
+  - 记下一条被跳过的 at-rule（Css 解析器调用）。
+
+- void NoteGuard(string cond)
+  - 记下一条 `@supports` 守卫判假而跳过的块（条件原文作键）。
+    守卫成立时块是会展开的，所以这条不走 NoteAtRule——否则 Lint
+    会把它说成"@supports 不支持"，而作者明明写对了语法。
 
 - static StyleSheet FromCss(string src)
   - 解析以 CSS 文本编写的样式表（见 Css）。皮肤以 `.css` 文件发布，
     以便在不重新构建应用的情况下编写和替换。
+
+- void AddMediaRule(string sel, JsonValue block, MediaCond cond)
+  - 收一条带媒体条件的规则（Css 解析 @media 时调用）。同一选择器
+    的媒体规则按文档顺序追加（后写的胜出）；选择器解析失败按
+    CSS 语义整条丢弃，但同时报进 lintDropped。
+
+- bool HasMedia()
+  - 表里是否有需要运行期求值的媒体规则。
+
+- void ApplyMedia(StyleBox b, string type, List<string> want, string cls, string id, string part, int stateBits, Control node, bool importantPass)
+  - 在 ApplyCascade/ApplyImportant 的主循环之后套用媒体规则：
+    守卫成立且选择器命中才生效。媒体规则整体排在常驻规则之后
+    （近似文档序，与 @layer 摊平同一档的简化）。
 
 - void MergeSheet(StyleSheet other)
   - 将另一张表的规则和自定义属性叠加到当前表上
@@ -7406,6 +9833,10 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
 - bool IsEmpty()
   - 样式表完全没有规则时为 true（应用未加载皮肤）。
 
+- List<string> Audit()
+  - 解析/合并这张表时丢掉了什么，人话列表；空 = 全部生效。
+    见 CollectLint 的判定口径。
+
 - string Var(string name)
   - `:root` 自定义属性的值（`Var("--accent")`），不存在时返回“”。
 
@@ -7415,7 +9846,8 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
 - void ApplyBox(StyleBox b, string selector)
   - 将一个选择器的声明叠加到已解析的样式盒上。未知
     属性在此忽略（它们是控件属性，由
-    ApplySelector 处理）。
+    ApplySelector 处理）。`!important` 的声明放在最后再套一遍，
+    与 StyleSheet.ApplyMatch 的级联顺序一致。
 
 - void ApplyMatch(StyleBox b, string type, string cls, string id, string part, int stateBits)
   - 将匹配控件的每条规则应用到 `b`，最弱的匹配优先，
@@ -7428,18 +9860,37 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
     活动状态的规则，因此无论作者把 `:hover` 放在文件
     何处，它都只需注明变化的部分。
 
+- void ApplyMatchCtx(StyleBox b, string type, string cls, string id, string part, int stateBits, Control node)
+  - ApplyMatch 的树上下文版本：`node` 是主体控件（retained 树），
+    组合器链与结构性伪类按真实树求值；immediate 路径传 null，
+    这类选择器不命中（规则不丢）。
+
+- void ApplyCascade(StyleBox b, string type, string cls, string id, string part, int stateBits)
+  - 普通声明（不含 `!important`）的级联。
+
+- void ApplyCascadeCtx(StyleBox b, string type, string cls, string id, string part, int stateBits, Control node)
+
+- void ApplyImportant(StyleBox b, string type, string cls, string id, string part, int stateBits)
+  - 把匹配规则里 `!important` 的声明再套一遍。`!important` 的
+    权重高于一切——包括宿主写下的 inline 样式——所以它必须跑在
+    普通级联（以及 inline）之后，而不是像以前那样被剥掉标记、
+    混在普通声明里按顺序碰运气。
+
+- void ApplyImportantCtx(StyleBox b, string type, string cls, string id, string part, int stateBits, Control node)
+
 - void ApplyDecls(StyleBox b, JsonValue block)
-  - 把已经取到的声明块叠加到样式盒上。
+  - 把已经取到的声明块叠加到样式盒上（`!important` 由
+    ApplyImportant 另行处理，这里跳过）。
 
 - bool Matches(int i, string type, List<string> classes, string id, string part, int stateBits, string cls)
-  - 规则 `i` 是否选中给定的控件/部件/状态。`cls` 是 class
-    属性原文，供 `[class*="frag"]` 做子串匹配。
+  - 规则 `i` 是否选中给定的控件/部件/状态。选择器的全部条件
+    （类型/类/id/部件/伪状态/属性/`:not()`）都交给 Selector 求值。
 
-- static int StateMask(string state)
-  - 一组伪类名对应的状态位掩码（含未知伪类时为 -1）。
+- bool MatchesCtx(int i, string type, List<string> classes, string id, string part, int stateBits, string cls, Control node)
+  - Matches 的树上下文版本（组合器链/结构性伪类在 retained 树上求值）。
 
-- static string FirstClass(string classes)
-  - 空格分隔类名串里的第一个名字（“”表示没有类要求）。
+- bool HasRelational()
+  - 表里是否有依赖树上下文的选择器（首次调用建立索引）。
 
 - static bool Holds(List<string> list, string name)
   - 类名列表中是否含 name。
@@ -7447,6 +9898,62 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
 - void Index()
   - 一次性解析每个选择器，并按权重保持规则有序，因此
     匹配就是对已排序表的扫描。
+
+- List<string> Lint()
+  - 把这张样式表里"写了但没生效"的部分整理成可读报告：
+    
+    * 被跳过的 at-rule（`@media` 等）——引擎没有媒体查询；
+    * 选择器含组合同器/伪元素而被丢弃的规则——引擎的选择器模型
+    只有 `type.class#id::part:state`，没有祖先链；
+    * 声明全部不被 Decl 消费的规则（`float`、`text-shadow` 之类
+    拼错或未实现的属性）。
+    
+    返回空列表表示这张表里的每一条都真的会生效。皮肤调试时
+    调一次就能把"改了没反应"从猜测变成清单；正常渲染路径不
+    调用它，因此不影响开销。
+
+- void CollectLint()
+  - 填充 lintDropped / lintUnused（按 rules 代次缓存，Lint 连调免费）。
+
+- static bool Known(string key)
+  - 属性名是否被 Decl 消费（用一次性探针盒判定，与真实的
+    派发走同一条路径，因此新增属性不会和这份清单脱节）。
+    会改到盒子的探针无妨：盒子是新建的，用完即弃。
+
+- static bool SupportsDecl(string prop, string val)
+  - `@supports (prop: value)` 的声明测试：引擎认得这条声明即为真。
+    用与真实派发同一条路，所以"支持什么"不会和实现脱节。
+
+- static bool GuardValueKnown(string prop, string val)
+  - `@supports` 的值级校验。DeclLayout/DeclText 里有一批属性对未知取值
+    静默回落到默认值（`display: grid` 变 block、`position: sticky` 变
+    static），若只看"属性认得"就会把假守卫判真：作者写
+    `@supports (display: grid) { .g { display: grid } }` 的本意是"不支持
+    就用前面的 flex 兜底"，误判真反而把兜底覆盖成 block 布局。故这些
+    属性按 Decl 里的取值表逐值核对；表外属性不做值级判断（保守回退）。
+    取值表与 DeclLayout/DeclText 同步维护，只影响守卫判断的方向
+    （表漏了只会让守卫偏假，不会凭空支持）。
+
+- static string AtRuleSummary(Dict <string, int> kinds)
+  - 被跳过的 at-rule 的可读清单（`@media x3, @keyframes x1`）。
+
+- static string GuardSummary(Dict <string, int> conds)
+  - 判假的 `@supports` 守卫条件计数（`(display: grid) x2`），
+    与 AtRuleSummary 的区别是不加 `@` 前缀（键是条件原文，不是名字）。
+
+- static bool ValueUnresolved(string key, string val)
+  - 这条声明的值里有没有引擎解析不了、会被当裸数字吞掉的部分。
+
+- static bool PctCoerced(string k)
+  - 该属性上的 `%` 会被当裸数字用（与 width/height 的 widthPm 相对）。
+
+- static bool HasUnresolvedUnit(string val)
+  - 值里是否含引擎不认识的长度单位拼写。px/em/rem/ex/ch/vw/vh/
+    vmin/vmax/pt/pc/cm/mm/in/q 与 calc()/min()/max()/clamp() 都有
+    求值器，不再是"会被当裸数字吞掉"的一类；`%` 按属性另有通道。
+
+- static bool IsAlpha(string ch)
+  - 单字符是否为 ASCII 字母。
 
 - static string ValStr(JsonValue v)
   - 声明值的文本形式（数字转成字符串，因此 JSON 表中的 `radius: 8`
@@ -7460,6 +9967,19 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
   - 将一条 CSS 声明应用到样式盒。当该
     属性不是引擎理解的视觉/布局属性时返回 false。
 
+- static int CcBits(string key)
+  - currentColor 记账位：哪个颜色通道引用了前景色。
+
+- static void ResolveCurrentColor(StyleBox b)
+  - 级联完成后把 ccMask 记下的通道替换成最终前景色；fg 未设
+    （0）时保持原样，不猜。
+
+- static string StripVendor(string k)
+  - 剥掉厂商前缀：`-webkit-box-shadow` -> `box-shadow`。带前缀的
+    网页 CSS 十分常见（bootstrap 一类语料里 transform/transition/
+    box-shadow 几乎都带），而引擎对两者语义一致。自定义属性
+    `--x` 与引擎私有拼写 `-zan-*` 不经过这里（后者显式列出）。
+
 - static bool DeclSource(StyleBox b, string key, string val, bool prescaled)
   - 应用一条声明，并按属性类别记录“预缩放来源”位
     （Decl 不认得的属性返回 false）。
@@ -7470,8 +9990,13 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
 - static bool DeclFill(StyleBox b, string k, string v)
   - fill：背景 / 透明度 / 模糊滤镜。
 
-- static bool DeclText(StyleBox b, string k, string v)
+- static void LineHeightOf(StyleBox b, string v)
   - text：颜色 / 字体 / 对齐 / 变换 / 换行。
+    `line-height`：`normal`（未声明态）、长度（px/em/…）、百分比
+    或无单位数字（倍数）。量纲记 lineHeightKind：0 未声明，1 px，
+    2 千分（% 按 n*10，倍数按 n*1000；消费端乘 fontPx / 1000）。
+
+- static bool DeclText(StyleBox b, string k, string v)
 
 - static bool DeclBorderBox(StyleBox b, string k, string v)
   - border / 圆角 / 阴影。
@@ -7486,9 +10011,21 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
 - static bool DeclLayout(StyleBox b, string k, string v)
   - layout：display / flexbox / position / overflow / visibility / cursor。
 
-- static int JustifyCode(string v)
+- static bool Inert(string key)
+  - 被 Decl 收下、但不会产生任何视觉/布局效果的属性：认它们是
+    为了不让键名漏到 Control.SetProp 变成 class（`float: right`
+    会凭空加一个 `.right` 类），但作者以为写了就有用。
+    StyleSheet.Lint 会把它们单独列出来。清单是真实 CSS 属性名的
+    白名单——专有属性名（皮肤作者的 `variant: primary` 一类）
+    仍然走 SetProp 的 prop/class 通道。
+
+- static int AlignItemCode(string v)
   - `justify-content` 的取值码：0 start，1 center，2 end，
     3 space-between，4 space-around/evenly。
+    对齐关键词 → alignItems/justifyItems 编码（0 stretch/normal、
+    1 start 系、2 center、3 end 系）；grid 与 flex 共用。
+
+- static int JustifyCode(string v)
 
 - static int AlignContentCode(string v)
   - `align-content` 的取值码：0 start，1 center，2 end，
@@ -7510,16 +10047,40 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
 
 - static void DeclBackground(StyleBox b, string val)
   - `background: <color> | linear-gradient([<dir>,] a, b[, c])`。
+    停靠点上的位置（`#fff 40%`）在解析时被丢掉：运行时的
+    `grad_sample` 只采样 0/500/1000 三个位置，任意停靠点
+    没有对应的绘制原语（见 StopColor）。
 
 - static int GradientDir(string tok)
   - 渐变方向关键字/角度作为 StyleBox.bgDir，当该
     token 是颜色停靠点（color stop）时返回 -1。
+    
+    五个方向码（StyleBox.bgDir）：0 向下、1 向右、2 右下、
+    3 向上、4 左下。CSS 的 `to left` 是横向的另一个朝向，没有
+    独立的码——它等价于「向右的渐变把两端调过来」，所以这里
+    返回 1 由 DeclBackground 交换首末停靠点（见那里的 sw）。
+    以前 `to left` 落到 -1，整条 gradient 被当成纯色：背景不是渐变。
+
+- static bool IsLeftward(string tok)
+  - 停靠点是不是镜像的横向渐变（`to left` / `270deg`）。
+
+- static void DeclTextShadow(StyleBox b, string val)
+  - `text-shadow: <dx> <dy> [blur] <color>[, ...]`——只取第一层
+    （CSS 里它画在最上面），模糊半径无对应绘制原语、忽略几何
+    只保留偏移；层数 ≥3 且偏移非零、`0` 模糊时按描边处理，
+    这正是 `1px 1px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, …`
+    那圈四向描边的意图。
 
 - static string StopColor(string stop)
   - 去掉停靠点的位置（`#fff 40%` -> `#fff`）。
 
 - static void DeclBorder(StyleBox b, string val, int side)
   - `border[-side]: <width> [style] <color>`（顺序任意，宽度可选）。
+    
+    style 词（`dashed`/`dotted`）以前被 `continue` 掉、不落到任何
+    字段上：`border: 1 dashed var(--border-secondary)` 解析成实线，
+    作者看到的是「虚线写了没反应」。这里把它记进 borderStyle，
+    绘制侧（StyleBox.PaintBorders）已经会据此走 Fx.DashedBorder。
 
 - static void DeclRadius(StyleBox b, string val)
   - `border-radius: all | tl tr br bl`（`999`/`50%` 将形状完全圆化）。
@@ -7541,8 +10102,12 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
     `35%` 或千分比 `350`），可选高光颜色（默认白）。绘制由
     StyleBox 统一完成，因此任何画 box 的控件都能被皮肤点亮。
 
-- static void DeclSides(StyleBox b, string val, int which)
+- static int SideVal(StyleBox b, string tok, bool margin)
   - `padding/margin: all | v h | t h b | t r b l`。
+    margin/padding 单边值：margin 的 `auto` 记哨兵 -1（布局端做
+    水平居中/贴边），padding 的 `auto` 按 0。
+
+- static void DeclSides(StyleBox b, string val, int which)
 
 - static void DeclTransition(StyleBox b, string val)
   - `transition: [prop] <duration> [timing]`——这里只有时长和 timing
@@ -7556,8 +10121,9 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
     内置关键帧（spin、pulse、breath、shimmer、float、glow、aurora、
     motes），由 Fx 绘制。
 
-- static int BlurArg(string val)
-  - 滤镜值中的 `blur(20px)` -> 20（无时为 0）。
+- static int BlurArg(StyleBox b, string val)
+  - 滤镜值中的 `blur(20px)` -> 20（无时为 0）。长度走 Len
+    （`blur(0.2em)` 这类也能解析）。
 
 - static int Easing(string val)
   - 缓动函数名转枚举码：ease/linear/ease-in/ease-out/ease-in-out，
@@ -7575,11 +10141,26 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
   - 将匹配的规则应用到 `c`，按特异性升序（type，然后
     class，然后 id），最具体的选择器胜出。
 
+- void ApplyImportantSelector(Control c, string selector)
+  - 把一个选择器里 `!important` 的声明套到控件上。
+
 - void ApplySelector(Control c, string selector)
   - 将一个选择器的声明应用到控件：layout 键落在
     控件自身的字段上，视觉键走共享的 StyleBox 解析器
     （因此 CSS 在 retained 和 immediate 模式下行为一致），其余
     通过 SetProp 发布给控件。
+
+- static void ApplyBlock(Control c, JsonValue block)
+  - ApplySelector 的主体：一个声明块（JsonValue 对象）落到
+    控件上。选择器路径与内联 style 通道（ApplyInline）共用。
+
+- static void ApplyInline(Control c, string decls)
+  - 内联 style 声明（style="color:#c00; padding:8px"）落到控件：
+    声明文本交给整块 CSS 解析器（缩写键/颜色/函数/!important 全
+    部复用），再走 ApplyBlock——与选择器路径同一落点语义。
+    内联值是字面量，应用一次即终值，不随主题/皮肤重算，与浏览器
+    inline style 同语义；视觉键经 CopyToControl 落 style* 覆盖
+    字段，优先级高于类规则（在每次样式解析的 Inline 覆盖之后）。
 
 - static void CopyToControl(StyleBox b, Control c)
   - 复制控件内联携带的视觉属性（Control 只保留
@@ -7598,10 +10179,75 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
     返回 0（= 未设置），因此坏规则只是什么都不做。
 
 - static int ParseRgb(string val)
-  - `rgb(r,g,b)` / `rgba(r,g,b,a)`，`a` 为 0..1 或百分比。
+  - `rgb(r,g,b)` / `rgba(r,g,b,a)`，也收现代空格语法
+    `rgb(0 128 255)` 与斜杠 alpha `rgb(0 128 255 / 50%)`。
+
+- static List<string> FuncArgs(string val)
+  - 函数式颜色取参：顶层 `/` 之后是 alpha；主串按逗号（旧语法）
+    或空白（现代语法）切分。
+
+- static int Alpha255(string tok)
+  - alpha token：`0.5` / `50%` -> 0..255。
+
+- static double DblChan(string tok, double pctDiv)
+  - 颜色函数的浮点通道：`50%` -> Perm/pctDiv（oklab 标度 0..1 用
+    1000，lab 标度 0..100 用 10），裸数按十进制浮点。
+
+- static double ParseDbl(string tok)
+  - 十进制 token -> double（无指数；色彩换算专用）。
+
+- static int Hue360(string tok)
+  - 色相 token -> 0..359 度：`210`、`210deg`、`0.5turn`、
+    `200grad`、`3.14rad`（浮点解析，支持小数色相）。
+
+- static void Hexcone(int h, int c, out int r, out int g, out int b)
+  - 色环六棱锥：h（度）、c（千分色度）-> 千分制 r,g,b，最大
+    分量恰为 c。hsl 与 hwb 共用。
 
 - static int ParseHsl(string val)
-  - `hsl(h,s%,l%)` / `hsla(...)` 转换为 RGB（整数运算）。
+  - `hsl(h,s%,l%)` / `hsla(...)` / `hsl(120 50% 50% / 30%)`
+    转换为 RGB（整数运算）。
+
+- static int ParseHwb(string val)
+  - `hwb(h w% b% [/ a])`：色相纯色按白、黑分量收缩（w+b 超过
+    100% 时按比例归一）。
+
+- static int ParseOklabLike(string val, bool polar)
+  - `oklab(L a b [/ a])` 与 `oklch(L C H [/ a])`（感知色彩空间，
+    Tailwind 一类现代调色板的缺省写法）。
+
+- static int OklabToRgb(double L, double ax, double bx, int alpha)
+  - OKLab -> 线性 sRGB（Björn Ottosson 的常数）-> gamma 8bit。
+
+- static int ParseCielabLike(string val, bool polar)
+  - `lab(L a b [/ a])` 与 `lch(L C H [/ a])`（CIE Lab，D50 白点）。
+
+- static int LabToRgb(double L, double ax, double bx, int alpha)
+  - CIE Lab(D50) -> XYZ(D50) -> Bradford 适应到 D65 ->
+    线性 sRGB。矩阵常数取自 CSS Color 4 转换样例。
+
+- static int ByteOf(int c, int shift)
+  - 颜色的一个 8bit 通道：shift 16=r、8=g、0=b。颜色 int 带
+    FF alpha 时为负，必须用无符号移位语义（>> 后 & 255）。
+
+- static int Gamma255(double c)
+  - 线性光分量 -> sRGB gamma -> 0..255。
+
+- static double CosD(double deg)
+  - 度制余弦：区间归约后五阶泰勒（|误差| < 5e-6，色彩换算足够；
+    运行时没有 Math.Cos/Sin）。
+
+- static double SinD(double deg)
+  - 度制正弦（cos(x-90) = sin(x)）。
+
+- static int ParseColorMix(string val)
+  - `color-mix(in <space>, c1 [p1], c2 [p2])`：混合空间按 sRGB
+    近似（感知空间的混合差异对本引擎的用途可忽略）；百分比
+    缺省 50%，两侧和不为 100% 时按比例归一。
+
+- static string TakePct(string s, out int pct)
+  - 抽出尾部独立百分比 token（`red 30%` -> "red", 300）；
+    没有时 pct 返回 -1、原串返回。
 
 - static int Chan(string tok)
   - 单个 rgb() 通道：`0..255` 或百分比。
@@ -7614,6 +10260,11 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
 
 - static int NamedColor(string name)
   - 皮肤实际会用到的 CSS 命名颜色（未知时为 0）。
+    CSS Color Module Level 4 全部 148 个具名颜色（X11 + CSS
+    扩展）。此前只有 42 个常用名，官方示例用到的 lightskyblue /
+    orangered / azure / tomato / peru / chocolate 落空解析成 0——
+    0 在渲染期等于"未着色"，map-HK 的 visualMap 色带因此整图
+    透明（区域全不画），这是 C6 会话查出来的第二处独立缺陷。
 
 - static int HexToInt(string h)
   - 将十六进制字符串（最多 8 位）转换为打包 int。最高位为 1
@@ -7639,6 +10290,46 @@ hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
 
 - static int Ms(string val)
   - CSS 时长（毫秒）：`200`、`200ms`、`0.25s`。
+
+- static int Len(StyleBox b, string val)
+  - CSS 长度求值，返回 px 整数。单位：px/无单位照旧；em 相对当前
+    有效字号（解析级联里已声明的 font-size，未声明时主题正文）；
+    rem 相对根字号；ex/ch 近似半高（0.5em）；pt 按 96dpi 折算；
+    vw/vh/vmin/vmax 相对窗口逻辑尺寸；`%` 保持各属性原有语义
+    （这里当裸数字返回，声明点的百分比分支不受影响）。
+    calc()/min()/max()/clamp() 递归求值（见 CssMath）。
+
+- static bool HasMath(string v)
+  - 值里是否带数学函数（calc/min/max/clamp）。
+
+- static int Round1000(int perm)
+  - 千分比转 px 的四舍五入。
+
+- static int NumPerm(string numStr)
+  - 数字文本 -> 千分比整数：`12` -> 12000、`1.5` -> 1500、
+    `.5` -> 500、`-2` -> -2000。（不能复用 Perm：它对无小数点的
+    整数按原样返回——那是 alpha 通道的语义，不是长度。）
+
+- static int UnitPx(StyleBox b, string tok)
+  - 单个"数字+单位"记号 -> px 整数。未知单位按裸数字处理
+    （ValueUnresolved 仍会点名），空数字回退 Num。
+
+- static int CssMath(StyleBox b, string val)
+  - calc()/min()/max()/clamp() 求值（可嵌套）。叶子单位在 UnitPx
+    折算成 px；`%` 在表达式里按视口宽近似——容器宽度在样式解析期
+    （布局之前）不可得，视口是稳定的基准，Lint/审计文档有说明。
+
+- static List<string> MathTokens(string s)
+  - 表达式 token 化：数字+单位、运算符、括号；空白跳过。
+
+- static int MathExpr(StyleBox b, MathCursor c)
+  - 加减层：term (('+'|'-') term)*。
+
+- static int MathTerm(StyleBox b, MathCursor c)
+  - 乘除层：factor (('*'|'/') factor)*。除零按 0（坏表达式不炸）。
+
+- static int MathFactor(StyleBox b, MathCursor c)
+  - 因子层：括号表达式 / 一元符号 / 数字+单位。
 
 - static int ParseInt(string s)
   - 值转整数（透传 Num 解析）。
@@ -7785,11 +10476,30 @@ hub.RaiseIf(BTN_SAVE, Ui.Clicked(app, id));
 - static string Trim(string s)
   - 去除首尾的 ASCII 空白（空格、制表符、CR、LF）。
 
+- static WrappedText LinesAt(string s, int maxW, int fs)
+  - 换行并记录每行在原文里的起始字节偏移（`Lines` 的带账版本）。
+    
+    换行规则与 `Lines` 逐字一致（调用方按行绘制时两者结果必须同一
+    份）；差别只在这里把每行的起点也留下来。硬换行（字节 10）不计
+    入行文本，因此下一行的起点要跳过它——偏移口径与 `Lines` 拼回
+    原文时丢掉的正是那一个换行符，两处一致才对得上。
+
 - static List<string> Lines(string s, int maxW, int fs)
   - 将 `s` 拆成行，每行在 `fs` 磅下都能放进 `maxW` 像素，
     尽可能在空格处换行，否则在任意字符处换行（因此无空格的 CJK
     文本也能换行）。硬换行（字节 10）始终断行。
     至少返回一行；结尾换行不会增加空行。
+
+- static List<string> SplitLines(string s)
+  - 按 '\n' 把字符串拆分为行（去除 '\r'）。至少返回一行。
+
+- static int ColFromX(string s, int px, int fontSize)
+  - 把像素 x 偏移（相对文本原点）映射为列索引：
+    即测量前缀宽度达到 `px` 的第一个字符边界。
+    前缀宽度随边界单调递增，因此对边界二分查找只需
+    O(log n) 次 MeasureText 调用，而非每字符一次。
+    这两个原语住在这里而不是 CodeEditor：Input/TextArea
+    的鼠标定位只依赖文本布局，不必拖入整个代码编辑器。
 
 
 ## Theme (class)
@@ -8338,6 +11048,12 @@ UI 线程的分发队列。
 
 - List<Action> handlers;
 
+- List<ControlEvent> senderHandlers;
+  - 平行 sender 通道（S = Sender）：注册在这里的处理器在触发时
+    收到触发事件的控件。与无参通道相互独立、可混用；同一事件
+    内先无参后带 sender，各自保持注册顺序。编译器按名称解析
+    调用（无重载），因此带 sender 通道是平行方法而非重载。
+
 - UiEvent()
 
 - static UiEvent op_add(UiEvent self, Action handler)
@@ -8350,6 +11066,21 @@ UI 线程的分发队列。
 - void Add(Action handler)
   - 注册一个处理器（等同 <c>+=</c>）。
 
+- void AddS(ControlEvent h)
+  - ---- 平行 sender 通道（S = Sender）----
+    注册带 sender 的处理器：触发时收到触发本事件的控件。
+    等价旧通道的 `Add`，存进独立的表。
+
+- void RemoveS(ControlEvent h)
+  - 移除 sender 通道最近的相同注册项；从未添加则为空操作。
+
+- int CountS()
+  - sender 通道已注册的处理器数量。
+
+- int CountAll()
+  - 两个通道的处理器合计数——"有没有人监听"类门控用它，
+    只看 `Count` 会漏掉仅注册 sender 通道的控件。
+
 - void Clear()
   - 清空所有处理器。
 
@@ -8359,12 +11090,25 @@ UI 线程的分发队列。
 - void Raise()
   - 在当前线程上调用所有处理器。
 
+- void RaiseS(Control sender)
+  - 全通道触发：先调用无参处理器，再把 <paramref name="sender"/>
+    传给 sender 通道。这是控件事件每帧的标准触发路径；
+    `Raise` 只触发无参通道，供无 sender 语境的
+    非控件 UiEvent（如 DataTable 的列宽事件）继续使用。
+
 - void RaiseIf(bool fire)
   - 仅当 <paramref name="fire"/> 为 true 时才调用处理器。
+
+- void RaiseIfS(bool fire, Control sender)
+  - `RaiseIf` 的全通道形式。
 
 - void Post()
   - 将所有处理器调度到 UI 线程的分发队列。可从
     任何线程安全调用；处理器稍后在 UI 线程上执行（参见 App.DrainPosts）。
+
+- void PostS(Control sender)
+  - `Post` 的全通道形式：sender 在入队时就地捕获，
+    处理器稍后在 UI 线程上收到该控件。
 
 
 ## UserComponentRegistry (class)
@@ -8479,14 +11223,21 @@ btn.On.Click += () => { ... };
     未知名称会被忽略，这样引用特定控件
     事件（在别处接线）的文档不会在此报错。匹配时返回 true。
 
+- bool AddByNameS(string evt, ControlEvent a)
+  - `AddByName` 的 sender 通道形式：按事件名订阅，
+    触发时处理器收到触发事件的控件（`Control.BindEventS`
+    的基类路由）。
+
 - bool Any()
   - 当内置事件中至少有一个监听器时返回 true。允许
     容器跳过命中区域的注册（从而不抢占
     下方内容的指针），直到有人监听。
 
-- void Fire(App app, int id)
+- void Fire(App app, int id, Control sender)
   - 本帧对 `id` 满足条件的已注册处理器都会触发，
     在控件注册命中区域后每帧调用一次。
+    <paramref name="sender"/> 是触发事件的控件（两通道都会收到，
+    无参处理器忽略它）；自行接线的控件传 <c>this</c>。
     低频/轮询驱动的事件（移动、滚轮、按键、手势、拖拽）以
     有无监听器为门槛，空闲控件无需付出开销。
 
@@ -8539,6 +11290,85 @@ btn.On.Click += () => { ... };
     子 id 在帧间连续且稳定。
 
 
+## WidgetSize (class)
+
+统一控件尺寸与交互高度档位。
+
+- const int Mini=24;
+  - 24px: 紧凑微型控件（紧凑工具条图标按钮、密集列表操作按键）
+
+- const int Small=28;
+  - 28px: 次紧凑控件（工具栏标准项、表格内嵌按钮）
+
+- const int Medium=32;
+  - 32px: 桌面端标准控件高度（常规 Button、Input、SelectBox）
+
+- const int Large=40;
+  - 40px: 强调型大控件（全局搜索框、呼吁操作主按钮）
+
+
+## WrappedText (class)
+
+换行结果：`lines[i]` 是第 i 个展示行，`starts[i]` 是它在原文里的
+起始字节偏移。
+
+偏移不是可有可无的：鼠标落点要先换算成「第几行第几列」再折回原文的
+字节位置，选中高亮又要反着算回每行的像素区间。只留行文本的话，这条
+展示行 ↔ 原文的映射每个调用方都得自己再扫一遍，硬换行被吃掉的那一
+个字节还会各算各的（选中文本多一个/少一个换行）。
+
+- List<string> lines;
+
+- List<int> starts;
+
+- WrappedText()
+
+
+## Control (delegate)
+
+HTML 装载后端（App.LoadHtmlWith 的实现，Gui.Html 经
+App.SetHtmlLoader 注册）。
+
+`delegate Control HtmlLoadFn(App app, string html, HtmlHandlers handlers, string baseDir);`
+
+
+## Control (delegate)
+
+深拷贝一棵控件树（HTML 模板行展开的原型复制），由
+Gui.Html.Install() 经 App.SetCloneTree 注册。未安装 = 没有
+声明层模板原型可拷，返回 null（调用方跳过该行）。
+
+`delegate Control CloneTreeFn(Control root);`
+
+
+## Control (delegate)
+
+重尾控件的宿主注册表（先注册后可用）。
+
+ControlFactory 的单一 switch 会把每个 kind 分支的静态构造链拉进编译
+图：设计稿/运行期文档只要经它建树，"CefBrowserBox" 分支就让整个
+CEF 家族（CefBrowserBox → CefBrowser → CefHost → CefBackend）、
+"WebViewBox" 分支就让 WebView 家族跟着存活——几行代码的演示程序
+也被 zanc 判定"图里有 CefBackend_ 符号"，发布时 zan_cef/zan_cef109/
+WebView2Loader 全部跟随（bundle 的 "if 前缀" 条件是符号存在性判定）。
+把这两类控件移出主 switch、改为宿主启动时注册工厂，不注册的程序
+globaldce 把整个家族删光，DLL 不再进发布目录。
+
+注册入口：CEF 侧 CefBootstrap.Install()、WebView 侧 WebViewBootstrap.
+Install()（IDE、gui_cef_browser 等真正用到它们的宿主在启动时调用）。
+
+`delegate Control ControlFactoryFn(string kind);`
+
+
+## bool (delegate)
+
+<a href> 内嵌导航器（App.linkNavigator）：由 WebView 家族经
+App.SetLinkNavigator 注册；app=发起导航的宿主。返回 true =
+已处理（含 WebView 不可用时转交系统浏览器的内部回落）。
+
+`delegate bool LinkNavigateFn(App app, string url);`
+
+
 ## bool (delegate)
 
 独立泵的停止条件（返回 true 即结束 PumpStandaloneUntil 循环）。
@@ -8563,10 +11393,38 @@ btn.On.Click += () => { ... };
 
 ## void (delegate)
 
+帧呈现尾段挂点（App.PresentFrame：弹层/提示绘制之后、原生浮层
+结算之前）。重家族的跨帧收尾经 App.AddPresentTail 注册（Chart
+的延迟提示刷新），App 编译图不背这些家族。
+
+`delegate void AppHookFn(App app);`
+
+
+## void (delegate)
+
+<a href> 链接扫描（HTML 声明层 P5 语义：把声明 <a> 接到
+App.OpenLink），由 Gui.Html.Install() 经 App.SetLinkScanner 注册。
+未安装 = 树里没有声明层 <a>，扫描空操作。
+
+`delegate void LinkScanFn(Control root, App app);`
+
+
+## void (delegate)
+
 无参数的 GUI 事件处理器，类似 C# 的 <c>Action</c> / <c>EventHandler</c>。
 可赋值为 lambda（<c>() => { ... }</c>）或静态方法组。
 
 `delegate void Action();`
+
+
+## void (delegate)
+
+sender 通道专用委托：处理器收到触发事件的控件。
+独立命名而非复用 <c>Action<Control></c>（后者住在
+System.Linq，且与 `Action` 同名，子命名空间下
+名字解析歧义），也让注册点读起来明确是控件事件。
+
+`delegate void ControlEvent(Control sender);`
 
 
 ## void (delegate)
@@ -8585,19 +11443,6 @@ Render 收到的矩形同一坐标系）；空串表示本帧完全被遮挡，
 `win` 为承载窗口；页内出口（Embed）没有窗口，传 null。
 
 `delegate void NavEnterHandler(NavWindow win, JsonValue args);`
-
-
-## QrEcl (enum)
-
-纠错级别（ISO/IEC 18004）。
-
-- L = =0
-
-- M = =1
-
-- Q = =2
-
-- H = =3
 
 
 ## Color (struct)

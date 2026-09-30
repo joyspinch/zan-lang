@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.SkuFareTemplateService
 
-> 源码: `stdlib/Sdk/Jd/Api/SkuFareTemplateService/JdSkuFareTemplateServiceApi.zan`, `stdlib/Sdk/Jd/Api/SkuFareTemplateService/SkuFareTemplateServiceGetTemplatesRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/SkuFareTemplateService/JdSkuFareTemplateServiceApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/SkuFareTemplateService/SkuFareTemplateServiceGetTemplatesRequest.zan`
 
 
 ## JdSkuFareTemplateServiceApi (class)

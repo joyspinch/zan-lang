@@ -1,6 +1,6 @@
 # Game.Kit
 
-> 源码: `stdlib/Game/Kit/Assets.zan`, `stdlib/Game/Kit/CanvasPrims.zan`, `stdlib/Game/Kit/Packed.zan`, `stdlib/Game/Kit/Support.zan`
+> 源码: `packages/Zan.Game/src/Game/Kit/Assets.zan`, `packages/Zan.Game/src/Game/Kit/CanvasPrims.zan`, `packages/Zan.Game/src/Game/Kit/Packed.zan`, `packages/Zan.Game/src/Game/Kit/SpriteBatch.zan`, `packages/Zan.Game/src/Game/Kit/Support.zan`
 
 
 ## Assets (class)
@@ -91,17 +91,17 @@
 
 - static void Ring(Canvas c, int x, int y, int w, int h, int rad, int t, int cr, int cg, int cb, int ca)
 
-- static void RingCircle(Canvas c, int cx, int cy, int r, int t, int cr, int cg, int cb, int ca)
+- static void RingCircle(Canvas c, int cx, int cy, int rad, int t, int cr, int cg, int cb, int ca)
 
-- static void Card(Canvas c, int x, int y, int w, int h, int rad, int fr, int fg, int fb, int fr2, int fg2, int fb2, int fa, int br, int bg, int bb, int ba, int bt)
+- static void Card(Canvas c, int x, int y, int w, int h, int rad, int fr, int fg, int fb, int f2r, int f2g, int f2b, int tr, int tg, int tb, int ta, int t, int dir)
 
-- static void Pill(Canvas c, int x, int y, int w, int h, int fr, int fg, int fb, int fr2, int fg2, int fb2, int fa, int br, int bg, int bb, int ba)
+- static void Pill(Canvas c, int x, int y, int w, int h, int dir, int fr, int fg, int fb, int f2r, int f2g, int f2b, int tr, int tg, int tb, int ta)
 
 - static bool GoldButton(Canvas c, int mx, int my, int x, int y, int w, int h, string label, int scale, int kind)
 
 - static void Vignette(Canvas c, int w, int h, int a)
 
-- static void Rule(Canvas c, int cx, int y, int halfW, int cr, int cg, int cb, int ca)
+- static void Rule(Canvas c, int cx, int cy, int halfW, int cr, int cg, int cb, int ca)
 
 
 ## CKitUi (class)
@@ -214,6 +214,48 @@
 - int Range(int lo, int hi)
 
 - double NextDouble01()
+
+
+## SpriteBatch (class)
+
+2D 游戏批量图元与精灵渲染上下文。
+封装批量绘制指令流、全局颜色/Alpha 混合与视口映射，提供绘图统计以指导性能调优。
+
+- Canvas canvas;
+
+- bool inBatch;
+
+- int drawCalls;
+
+- int itemCount;
+
+- int globalAlpha;
+
+- SpriteBatch()
+
+- int DrawCalls()
+  - 当前已提交的批次绘制调用数（DrawCalls）。
+
+- int ItemCount()
+  - 本帧批量绘制的项目（图元/精灵）总数。
+
+- void SetGlobalAlpha(int alpha)
+  - 设置全局 Alpha 透明度乘数（0~255）。
+
+- void Begin(Canvas c)
+  - 开始一个精灵批处理阶段。
+
+- void End()
+  - 结束批处理阶段。
+
+- void DrawRect(int x, int y, int w, int h, int color)
+  - 批量绘制实心矩形。
+
+- void DrawBall(int cx, int cy, int rad, int r, int g, int b, int a)
+  - 批量绘制实心圆盘。
+
+- void DrawGlow(int cx, int cy, int rad, int r, int g, int b, int a)
+  - 批量绘制柔和径向光晕。
 
 
 ## Talker (class)

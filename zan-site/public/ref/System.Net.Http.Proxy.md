@@ -37,13 +37,32 @@ http/https。
 
 - async int SendAllAsync(string data)
   - 写出整段 `data`；成功返回写出的字节数，
-    对端提前关闭时返回已写出的部分长度。
+    对端提前关闭时返回已写出的部分长度。消除 Substring 分配并确保二进制安全。
+
+- async int RecvBytesAsync(byte[]data, int max)
+  - 接收原始字节到 data，返回真实字节数；0 表示关闭或失败。
+    不经 string.Length/strlen，正文中的 NUL 不会被当成 EOF。
+
+- async int SendAllBytesAsync(byte[]data, int offset, int len)
+  - 发送字节数组切片，部分写入时继续发送；返回实际发送数。
 
 - void Close()
   - 关闭链路（幂等）。TLS 链路同时释放流与上下文。
 
 - bool IsClosed()
   - 链路是否已关闭。
+
+- void SetIdleMs(int ms)
+  - 调整空闲截止（毫秒；0 = 不设截止）。隧道在
+    `Tunnel` 入口把两条链路都切到 0。
+
+- void Shutdown()
+  - 半关闭：只对套接字做双向 shutdown，不释放描述符。
+    隧道的对端方向泵可能还挂在本链路的读上——直接 Close 会把
+    它脚下的 fd 抽掉（Windows 上 select 对已关闭的句柄不再报
+    可读，轮询式接收从此永远等不到任何事件）；shutdown 让
+    对端下一轮探测立即看到可读、recv 返回 0（EOF 语义）正常
+    退出，由它在自己的退出路径里做完整的 Close。
 
 - nint Sock()
   - 底层套接字（连接池用它做零阻塞的存活检查）。
@@ -105,14 +124,14 @@ http/https。
 
 ## FwdReader (class)
 
-带前瞻缓冲的链路读取器。转发要按行/按定长切出协议帧
-（请求头块、分块长度行），又不能吞掉属于下一帧的字节，
-因此多读到的部分留在缓冲里，由 `TakeBuffered`
-交给下一段直接转发——这是"边收边转"不丢字节的关键。
+带前瞻缓冲的链路读取器：协议头按文本读，正文按真实字节数读。
+同包到达的正文留在 ByteBuffer 中，不能用 strlen 截断 NUL。
 
 - FwdChannel ch;
 
-- string buf;
+- ByteBuffer buf;
+
+- byte[]recv;
 
 - bool eof;
 
@@ -121,31 +140,31 @@ http/https。
 - FwdReader(FwdChannel ch, int chunkBytes)
   - <paramref name="chunkBytes"/> 为单批读取与转发的块大小（字节）。
 
+- ~FwdReader()
+
 - async bool FillAsync()
   - 再读一批到缓冲；对端关闭时返回 false。
 
 - async string ReadHeadAsync(int cap)
-  - 读到请求/响应头块结束（含空行），最多 `cap` 字节；
-    未见结束空行就断开或超过上限时返回空串。多读的正文字节
-    留在缓冲中。
+  - 读到头块结束（含空行），正文仍留在原始字节缓冲中。
 
 - async string ReadLineAsync(int cap)
-  - 读到行尾（含 CRLF），最多 `cap` 字节；行不完整就
-    断开时返回空串。分块编码的长度行/尾部用它。
+  - 读到行尾（含 CRLF），正文原样保留在缓冲中。
 
-- async string ReadSomeAsync(int max)
-  - 取出当前已缓冲的字节（可能为空），最多 `max` 个；
-    缓冲为空时先读一批。对端关闭且无缓冲时返回空串。
+- async int ReadSomeBytesAsync(byte[]data, int max)
+  - 取至多 max 个原始字节，返回真实字节数；0 表示 EOF。
 
-- string TakeBuffered()
-  - 取走并清空缓冲（不再读取）。
+- int TakeBufferedBytes(byte[]data, int max)
+  - 仅取缓冲中已有字节，不读套接字。可循环取至返回 0。
 
 - bool AtEof()
   - 对端已关闭且缓冲取尽——链路已读到 EOF，不可再复用。
 
+- async int ReadByteAsync()
+  - 从缓冲取一个字节，必要时从套接字补充。
+
 - bool Drained()
-  - 缓冲已空且对端未关闭——即这条链路正好停在一帧的
-    边界上，可以安全地留给下一个请求。
+  - 缓冲已空且对端未关闭——正好停在帧边界。
 
 
 ## HttpForwarder (class)
@@ -220,8 +239,23 @@ Upgrade 与 CONNECT 仍照旧方式用完即关。用
     明文 http，缺端口时 https 用 443、http 用 80）。
 
 - void ParseUpstream(string upstream)
-  - 解析 upstream 字符串为上游 host、port 与 TLS 标志
-    （协议前缀与显式端口优先，缺省按构造器文档）。
+  - 解析 upstream 字符串为上游 host、port 与 TLS 标志。
+    authority 用 bracket-aware 严格解析（复用 ExternalTarget 的
+    端口/IPv6 校验形状）：支持 [IPv6]:port，拒绝未闭合括号、
+    非数字端口、0、大于 65535 与 host:80junk 这类前缀数字——
+    旧 ParseInt 按"数字前缀即端口"接受畸形值，端口可能静默
+    变成另一个目标。
+
+- static bool IsAuthorityByte(string h)
+  - authority 主机部分（无方括号形态）只允许 DNS 名与 IPv4 字面量
+    字节：空格、控制字符、user@、路径分隔符都会被 Socket.ConnectAsync
+    或 Host 改写解释成别的目标。IPv6 一律走方括号 + ValidIPv6；
+    IDN 必须先转 punycode。
+
+- static int PortOf(string authority, int at)
+  - upstream 的 ":端口" 解析：1-65535 返回端口，未写返回 0，
+    畸形（非数字、0、>65535、>5 位）返回 -1——调用方按 -1 拒绝
+    整个 upstream，不再按数字前缀猜。
 
 - HttpForwarder SetTimeout(int ms)
   - 空闲超时（毫秒）：两个方向都这么久没有字节
@@ -229,20 +263,26 @@ Upgrade 与 CONNECT 仍照旧方式用完即关。用
     因此默认 5 分钟。同时更新明文链路的接收截止——
     此前该值只作用于连接建立，注释承诺的空闲判定从未生效，
     慢速客户端/卡死上游会永久占用协程与套接字。
+    钳在 1ms-24h：0/负数会让空闲判定失效（协程永久挂起），
+    过大的值同样不可恢复。
 
 - HttpForwarder SetChunkBytes(int bytes)
-  - 单次搬运的块大小（字节）。
+  - 单次搬运的块大小（字节）。钳在 1KiB-1MiB：过小是
+    每块一次系统调用的放大器，过大则每连接白白占住一块缓冲。
 
 - HttpForwarder SetMaxHeadBytes(int bytes)
-  - 请求/响应头块的上限（字节）。
+  - 请求/响应头块的上限（字节）。钳在 1KiB-1MiB：
+    下限防 0/负数让所有请求立即失败，上限防每连接无界缓冲。
 
 - HttpForwarder SetMaxConnections(int max)
-  - 最大并发连接数。
+  - 最大并发连接数。钳在 1-1000000：0/负数会拒绝所有
+    连接（拒绝路径本身不递减计数，等于永久自锁）。
 
 - HttpForwarder SetUpstreamKeepAlive(int maxIdle, int idleMs)
   - 上游空闲链路上限与空闲存活时长（毫秒）。
     存活时长应短于上游自己的 keep-alive 超时，否则每次复用
-    都要先碰一下已被对端关掉的链路。
+    都要先碰一下已被对端关掉的链路。两值都钳界：
+    maxIdle 1-4096、idleMs 1-86400000。
 
 - HttpForwarder DisableUpstreamKeepAlive()
   - 关掉上游连接复用，退回“每请求一连 + Connection:
@@ -283,7 +323,10 @@ Upgrade 与 CONNECT 仍照旧方式用完即关。用
     （TLS 直通，转发器不解密）。
 
 - async FwdChannel ConnectUpstream()
-  - 建立上游连接（必要时完成 TLS 握手）。
+  - 建立上游连接（必要时完成 TLS 握手）。连接走
+    TcpClient.ConnectAsync：按解析结果的地址族逐条建连——
+    此前裸 AF_INET 套接字连 IPv6 上游（[::1]）恒失败；
+    上游是运营者配置的目标，回环上游（本地 sidecar/测试）合法。
 
 - string RewriteRequestHead(string head, string peer)
   - 改写请求头：Host 指向上游、剥离逐跳头部、
@@ -307,7 +350,7 @@ Upgrade 与 CONNECT 仍照旧方式用完即关。用
   - 上游愿意保持这条链路：HTTP/1.1 且 Connection 里没有
     close。HTTP/1.0 响应默认关闭，不复用。
 
-- static string RewriteResponseHead(string head)
+- static string RewriteResponseHead(string head, bool switched)
   - 改写响应头：剥离逐跳头部并标明连接将关闭。
     Transfer-Encoding 保留（分块帧原样透传给下游）。
 
@@ -326,7 +369,7 @@ Upgrade 与 CONNECT 仍照旧方式用完即关。用
 - static async long PumpToEof(FwdReader src, FwdChannel dst, int chunkBytes)
   - 一直搬运到源端关闭（无 Content-Length 的流式响应）。
 
-- static async long PumpChunked(FwdReader src, FwdChannel dst, int chunkBytes)
+- static async long PumpChunked(FwdReader src, FwdChannel dst, string head, int chunkBytes)
   - 逐块搬运分块编码：长度行原样透传，随后转发该块
     的数据与 CRLF；0 长度块后转发尾部直到空行结束。逐块转发
     正是流式聊天在下游能立刻显示的原因。
@@ -351,7 +394,14 @@ Upgrade 与 CONNECT 仍照旧方式用完即关。用
   - 请求行的方法（大写形式原样返回）。
 
 - static int StatusOf(string head)
-  - 状态行的状态码，无法解析时返回 0。
+  - 状态行的状态码；状态行不是严格的
+    "HTTP/1.0|1.1 SP 3DIGIT [SP reason]"（版本后缀如 HTTP/1.1x、
+    缺空格、非数字）时返回 0——调用方按 <100 拒收，不按
+    数字前缀猜。
+
+- static bool IsResponseHeadValid(string head)
+  - 响应头块语法（含严格状态行）。IsHeadSyntaxValid 不校验
+    首行（请求/响应共用），响应侧在它之上加 IsStatusLineValid。
 
 - static string LowerName(string line)
   - 头部行的字段名（小写）；不是头部行时返回空串。
@@ -364,6 +414,28 @@ Upgrade 与 CONNECT 仍照旧方式用完即关。用
 
 - static string HeaderValue(string head, string name)
   - 头块中 `name`（小写）的值，缺失时为空串。
+
+- static bool IsTokenByte(int b)
+  - HTTP token 字节（字段名、方法、Connection 成员）。
+
+- static bool IsToken(string s)
+
+- static bool IsHeaderLineValid(string line)
+  - 检查字段行及裸 CR/LF，拒绝上游与代理不同的解析结果。
+
+- static bool IsTrailerLineValid(string line, string head)
+  - trailer 字段行校验。除固定禁区（Content-Length/TE/Host/
+    逐跳）外，还拒绝响应 Connection 头动态提名的字段——RFC 7230 §4.1.2：
+    "Connection: X-Foo" 把 X-Foo 降为逐跳语义，出现在 trailer 里再
+    被原样转发，宽容的下游会把它当普通头解释（走私向量）。
+
+- static bool IsHeadSyntaxValid(string head)
+
+- static bool HasHeaderToken(string head, string field, string token)
+
+- static bool AreConnectionTokensValid(string head)
+
+- static bool IsRequestValid(string head)
 
 - static bool IsHopByHop(string name)
   - 逐跳头部（RFC 7230 6.1）：只对单段连接有意义，
@@ -392,9 +464,6 @@ Upgrade 与 CONNECT 仍照旧方式用完即关。用
     非法时返回 -1。位数超过 13 即按非法处理：13 位十六进制已覆盖
     8TiB，合法分块远小于此，无上限的累加会回绕出小正数值，
     把转发器的分块定界悄悄打乱。
-
-- static int ParseInt(string s)
-  - 解析前导十进制数字（ParseUpstream 的端口用）；无数字时为 0。
 
 - static string Lower(string s)
   - ASCII 大写转小写。

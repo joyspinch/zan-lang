@@ -193,6 +193,27 @@ string out = Csv.Serialize(rows);                 // 逗号分隔，自动加引
     码点越界或落在代理区时用替换字符 U+FFFD，因此结果
     始终是合法 UTF-8。JSON 的 <c>\uXXXX</c> 解码走这里。
 
+- static int DecodeCodePoint(string s, int byteIndex, int[]cpOut)
+  - 从字节偏移 <paramref name="byteIndex"/> 起解码一个
+    Unicode 码点，写入 <paramref name="cpOut"/>（长度 ≥1 的 int 数组
+    ——Zan 无出参，借用数组回传）并返回该码点占用的字节数
+    （1-4）。byteIndex 越界返回 0，cpOut[0] 不动。非法序列
+    （截断的多字节头、落单续字节、过长编码）返回 1、
+    cpOut[0] = U+FFFD，与 `GetString` 的替换行为一致。
+
+- static string RuneAt(string s, int byteIndex)
+  - 从字节偏移 <paramref name="byteIndex"/> 起解码一个码点
+    并直接编码回 1-4 字节 UTF-8 字符串（等价 DecodeCodePoint 后接
+    Utf8FromCodePoint）。非法序列收敛为 U+FFFD 单字符。
+
+- static int CodePointCount(string s)
+  - 字符串中的码点个数（≠ Length 字节数，非 ASCII 时更
+    小）。非法序列按 1 码点计。
+
+- static string RuneFromIndex(string s, int runeIndex)
+  - 取第 <paramref name="runeIndex"/> 个码点（0 起），
+    编码为 UTF-8 字符串返回；越界返回空串。O(n) 顺序扫描。
+
 - static string UrlEncode(string text)
   - 对字符串进行 URL 编码。
 
@@ -261,6 +282,8 @@ bool hit = Fuzzy.Matches("zanc", "build/zanc.exe");  // true
 Bm25Index idx = new Bm25Index();
 idx.Add(1, "the quick brown fox");
 List<string> hits = idx.Search("quick fox");     // ["1"]
+
+- static bool SameByte(int a, int b)
 
 - static bool Matches(string query, string candidate)
   - 当 `query` 作为 `candidate` 的子序列出现时返回 true
@@ -419,6 +442,10 @@ module must stay tiny for every program that merely touches pinyin.
 
 - static string Lookup(string han)
   - Pinyin of one hanzi, or "" when it is not in the table.
+
+- static int Utf8ByteWidth(int c0)
+  - UTF-8 byte width of the first byte: 1 for ASCII,
+    2/3/4 for multi-byte sequences.
 
 - static int Utf8Width(string ch)
   - UTF-8 byte width of the first character: 1 for ASCII,

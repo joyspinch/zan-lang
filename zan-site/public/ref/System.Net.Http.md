@@ -1,6 +1,85 @@
 # System.Net.Http
 
-> 源码: `stdlib/System/Net/Http/HttpFramer.zan`, `stdlib/System/Net/Http/HttpRequest.zan`, `stdlib/System/Net/Http/HttpResponse.zan`, `stdlib/System/Net/Http/HttpServer.zan`
+> 源码: `stdlib/System/Net/Http/Http2Frame.zan`, `stdlib/System/Net/Http/HttpFramer.Tls.zan`, `stdlib/System/Net/Http/HttpFramer.zan`, `stdlib/System/Net/Http/HttpRequest.zan`, `stdlib/System/Net/Http/HttpResponse.zan`, `stdlib/System/Net/Http/HttpServer.zan`
+
+
+## Http2Flags (class)
+
+- public const int END_STREAM=1;
+
+- public const int END_HEADERS=4;
+
+- public const int PADDED=8;
+
+- public const int PRIORITY=32;
+
+- public const int ACK=1;
+
+
+## Http2Frame (class)
+
+- public static const string PREFACE="PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+  - HTTP/2 客户端连接序言（24 字节明文）。
+
+- public int length;
+
+- public int type;
+
+- public int flags;
+
+- public int streamId;
+
+- public byte[]payload;
+
+- public Http2Frame()
+
+- public static byte[]EncodeHeader(int length, int type, int flags, int streamId)
+  - 编码 9 字节固定帧头：
+    Length (24-bit) + Type (8-bit) + Flags (8-bit) + StreamID (31-bit)。
+
+- public static byte[]BuildSettingsAck()
+  - 构造空的 SETTINGS 确认帧（ACK）。
+
+
+## Http2FrameType (class)
+
+HTTP/2 二进制分帧基础规范（RFC 7540）。
+提供连接序言检测、9 字节固定帧头编解码与核心帧类型枚举。
+
+- public const int DATA=0;
+
+- public const int HEADERS=1;
+
+- public const int PRIORITY=2;
+
+- public const int RST_STREAM=3;
+
+- public const int SETTINGS=4;
+
+- public const int PUSH_PROMISE=5;
+
+- public const int PING=6;
+
+- public const int GOAWAY=7;
+
+- public const int WINDOW_UPDATE=8;
+
+- public const int CONTINUATION=9;
+
+
+## Http2Settings (class)
+
+- public const int HEADER_TABLE_SIZE=1;
+
+- public const int ENABLE_PUSH=2;
+
+- public const int MAX_CONCURRENT_STREAMS=3;
+
+- public const int INITIAL_WINDOW_SIZE=4;
+
+- public const int MAX_FRAME_SIZE=5;
+
+- public const int MAX_HEADER_LIST_SIZE=6;
 
 
 ## HttpDeadline (class)
@@ -132,7 +211,7 @@ f.Consume(f.RequestBytes());                     // 只丢弃本请求
 
 - nint sock;
 
-- TlsStream tls;
+- FramerRecvFn recv;
 
 - string buf;
 
@@ -147,19 +226,18 @@ f.Consume(f.RequestBytes());                     // 只丢弃本请求
 - int wireBytes;
 
 - HttpFramer()
-  - 私有构造：用 `Create` / `CreateTls` 创建。
+  - 私有构造：用 `Create` 创建；TLS 变体见 HttpFramerTls.Create。
 
 - static HttpFramer Create(nint sock)
   - 为明文套接字创建拆包器（64KB 复用接收缓冲）。
-
-- static HttpFramer CreateTls(TlsStream stream)
-  - 从 TLS 连接拆包：除了字节源不同，定界规则与明文
-    HTTP 完全一样（TlsStream.RecvIntoAsync 同样给出精确字节数）。
 
 - void Prime(string bytes, int len)
   - 把已经从套接字读出的字节放回流头部。同一端口同时
     服务 HTTP 与 WebSocket 时，要先看过请求头才能判断协议，
     已消费的字节由此交还拆包器。
+
+- void PrimeBytes(byte[]bytes, int offset, int len)
+  - 以原生字节数组把已读出的前缀放回流头部。完全二进制安全，避免字符串转换导致的 NUL 截断。
 
 - int Pending()
   - 尚未消费的字节数。
@@ -170,6 +248,10 @@ f.Consume(f.RequestBytes());                     // 只丢弃本请求
 - async int Fill()
   - 接收一次，把收到的字节追加到待处理缓冲区。
     返回收到的字节数，0 表示对端关闭。
+
+- async int FillTo(int maxPending)
+  - 分块元数据/正文的受限接收；不能用 Fill 的固定 64KB
+    读取无终止符的长度行，也不能让小块的线缆开销无限驻留。
 
 - int HeaderEnd()
   - 头部结束空行之后的下标（即正文首字节的位置），
@@ -207,6 +289,15 @@ f.Consume(f.RequestBytes());                     // 只丢弃本请求
     中途关闭。分块编码在这里解码，解码后的正文与固定长度
     正文一样，对处理器不可区分。
 
+- async int ReadResponseBody(HttpResponse response, int headerLen, int maxBodyBytes)
+  - 响应体定界使用响应解析器，不能把状态行交给要求
+    request-target 与 Host 的 HttpRequest.Parse。ReadChunked 只借用
+    req 作为解码结果容器，不重新解析响应头。
+
+- async int SaveBodyToFile(HttpRequest req, string filePath, int maxBytes)
+  - 流式将请求体分块直接落盘，避免超大正文（如 GB 级上传）引发 OOM。
+    内存仅占用当前分块缓冲区（<=64KB），落盘完成后保留后续流水线请求字节。
+
 - int RequestBytes()
   - 本请求在线路上占用的字节数（头部 + 正文，分块编码则
     是整个分块序列）。`Consume` 用它精确丢弃，
@@ -215,7 +306,7 @@ f.Consume(f.RequestBytes());                     // 只丢弃本请求
 - void Consume(int count)
   - 丢弃已处理请求的字节，保留其后的流水线字节。
 
-- async int ReadChunked(HttpRequest req, int he, int maxBodyBytes)
+- async int ReadChunkedBody(HttpRequest req, HttpResponse response, int he, int maxBodyBytes)
   - 解码 Transfer-Encoding: chunked 的请求体。
     
     逐块读取 "长度(十六进制)[;扩展]CRLF 数据 CRLF"，直到长度为 0 的
@@ -229,8 +320,7 @@ f.Consume(f.RequestBytes());                     // 只丢弃本请求
 
 - async int SkipTrailer(int from)
   - 跳过结束块之后的 trailer 头部，返回其后的线路下标；
-    对端中途关闭返回 -1。单行超过 8KB 按 -1（畸形）处理：trailer
-    行与长度行一样不受正文限额约束，必须自带上限。
+    对端中途关闭返回 -1，行或累计长度超过 8KB 返回 -2。
 
 - int IndexOfLf(int from)
   - 从 <paramref name="from"/> 起第一个 LF 的下标，没有则 -1。
@@ -241,6 +331,19 @@ f.Consume(f.RequestBytes());                     // 只丢弃本请求
 - void Dispose()
   - 归还接收缓冲区并释放待处理缓冲区。连接关闭时调用；
     之后不得再使用本拆包器。
+
+
+## HttpFramerTls (class)
+
+HTTPS 拆包装配（A332 肥边④）：从 TLS 流构造 HttpFramer——字节源以
+实例方法组注入（FramerRecvFn），核心 HttpFramer 因此不拼 TlsStream
+类型名，TLS 全家（连带 Base64/Sha256 与 ssl/crypto 驱动拷贝）只进
+真正说 TLS 的程序：HttpClient / HttpsServer / Wss* 拼本类即 opt-in，
+纯 HTTP 服务不背。
+
+- static HttpFramer Create(TlsStream stream)
+  - 从 TLS 连接拆包：除了字节源不同，定界规则与明文
+    HTTP 完全一样（TlsStream.RecvIntoAsync 同样给出精确字节数）。
 
 
 ## HttpRequest (class)
@@ -268,6 +371,8 @@ HTTP 请求的表示与解析器。
 
 - string cookie;
 
+- string userAgent;
+
 - int contentLength;
 
 - bool keepAlive;
@@ -291,11 +396,6 @@ HTTP 请求的表示与解析器。
 
 - static int TrimOwsStop(string raw, int start, int stop)
   - [start, stop) 终点回退 RFC 7230 OWS（SP / HTAB）。
-
-- static bool FinalTransferChunked(string raw, int start, int stop)
-  - Transfer-Encoding 是逗号分隔的 token 列表；只有最后一个
-    token 为 chunked 时才可由 HttpFramer 解码。token 之间的 OWS 合法，
-    其它编码不被静默忽略，避免把未定界的字节当成下一条请求。
 
 - static HttpRequest Parse(string raw)
   - 把原始 HTTP 请求字符串解析为 HttpRequest。
@@ -328,14 +428,17 @@ HTTP 请求的表示与解析器。
 - string GetHeader(string name)
   - 按名称获取某个头部值（大小写不敏感）。
 
+- static bool RegionExact(string raw, int pos, int stop, string str)
+  - 比对 raw[pos..stop) 与 str 是否逐字节完全匹配（零分配）。
+
 - string GetQueryParam(string name)
   - 按名称获取查询参数值（值已 url 解码，与
-    `GetFormField` 一致）。
+    `GetFormField` 一致）。采用零分配切片匹配，未命中项不产生任何堆分配。
 
 - string GetFormField(string name)
   - 从 application/x-www-form-urlencoded 正文中读取字段，
     对值做 url 解码。相当于 GetQueryParam 的 POST 正文版；
-    字段不存在时返回 ""。
+    采用零拷贝切片匹配，字段不存在时返回 ""，且不分配任何字符串。
 
 - static string Build(string method, string path, string host, string body)
   - 构建用于发送的 HTTP 请求字符串。
@@ -345,6 +448,12 @@ HTTP 请求的表示与解析器。
 
 - static string BuildPost(string path, string host, string body)
   - 构建 POST 请求。
+
+- string UserAgent()
+  - 获取请求的 User-Agent 标头值。
+
+- Dict <string, string> GetQueryParams()
+  - 一次性解析所有查询参数为键值对字典（零多余反序列化）。
 
 
 ## HttpResponse (class)
@@ -368,6 +477,12 @@ HTTP 响应的构建器与解析器。
 - List<string> headers;
 
 - bool keepAlive;
+
+- int framingLength;
+
+- bool framingHasLength;
+
+- bool framingChunked;
 
 - HttpResponse()
   - 私有构造：200 / keep-alive 的默认状态，由各静态工厂使用。
@@ -394,6 +509,18 @@ HTTP 响应的构建器与解析器。
 - static bool HasCrlf(string s)
   - 字符串是否含 CR/LF（头部注入检查用）。
 
+- static bool HeaderFramingSafe(bool isName, string s)
+  - 头部名/值是否不含会破坏报文分帧或被下游误读的字符：
+    值禁所有控制字符（HTAB 除外）与 DEL——只禁 NUL/CR/LF 会让
+    0x01 这类 CTL 溜进报文，宽容下游可能按不同规则切分；名字另禁
+    冒号——否则可夹带出第二个头字段（头注入）。名字按 HTTP token
+    字符集判定。
+    <paramref name="isName"/> 为 true 时按名字判定。
+
+- static bool IsValidHeader(string name, string value)
+  - 头部名与值是否可安全写入：名字非空且无冒号，两者都
+    不含分帧字符。请求侧（HttpClient）与响应侧共用同一防线。
+
 - static HttpResponse Redirect(string url)
   - 创建重定向响应。Location 不允许注入折行；非法值
     被保守拒绝，不产生一个可被下游解释的重定向头。
@@ -416,8 +543,8 @@ HTTP 响应的构建器与解析器。
   - 主动释放响应持有的头部存储。
 
 - HttpResponse SetHeader(string name, string headerValue)
-  - 设置响应头。名称和值均禁止 CR/LF，避免注入
-    额外字段或响应体；非法输入保持响应可序列化但不添加该头。
+  - 设置响应头。定界与连接模式由 BuildHeadersSb 唯一生成；
+    拒绝这些保留字段，避免客户端看到相互矛盾的长度或分块边界。
 
 - string GetHeader(string name)
   - Returns one response header by name. Header names are
@@ -429,12 +556,16 @@ HTTP 响应的构建器与解析器。
 - HttpResponse SetKeepAlive(bool keep)
   - 设置连接模式。
 
+- StringBuilder BuildHeadersSb()
+  - 构建包含状态行与所有头部的 StringBuilder（含结尾空行 CRLF）。
+
 - string BuildHeaders()
   - 只序列化状态行与头部（含结尾空行）。二进制正文时
     调用方先发这个字符串，再按字节发 <c>bodyBytes</c>。
 
 - string Build()
   - 将响应序列化为原始 HTTP 响应字符串。仅适用于文本正文；
+    头部与正文在同一个 StringBuilder 内完成拼装，消除二次大内存分配。
     二进制正文请用 `BuildHeaders` + <c>bodyBytes</c>。
 
 - static bool IsOws(int c)
@@ -446,8 +577,22 @@ HTTP 响应的构建器与解析器。
 - static int TrimOwsStop(string s, int start, int stop)
   - [start, stop) 终点回退 OWS，返回尾后第一个非 OWS 下标。
 
+- bool ParseFraming()
+  - Parse response framing independently from the strict request
+    parser. Conflicting/invalid lengths and unsupported transfer codings
+    fail closed before any body is read.
+
+- static bool ValidStatusLine(string line)
+  - 状态行严格校验：HTTP/1.0|HTTP/1.1 + 至少一个 OWS +
+    三位状态码（1xx-5xx）+ 可选 OWS reason（不含控制字符，HTAB
+    除外）。版本与状态码间缺 OWS、状态码带后缀（"HTTP/1.1x 200"）
+    或 600+ 一律拒绝——否则状态码可被下游按不同切分方式读出。
+
 - static HttpResponse Parse(string raw)
-  - 解析原始 HTTP 响应（客户端用法）。
+  - 解析原始 HTTP 响应（客户端用法）。状态行、字段行或
+    分帧不合法时返回 statusCode=0 的空响应——合法状态码恒 >= 100，
+    调用方以 <100 判定拒收并断开链路；绝不把畸形报文解释成
+    "200 空响应"（响应错位的起点）。
 
 
 ## HttpRoute (class)
@@ -550,7 +695,9 @@ HTTP/1.1 帧解析与限制在 stdlib 中的唯一实现；Worker 的 "http" 协
   - 设置单个请求的最大可接受大小（字节，
     请求头 + 请求体）。超过该大小的请求会返回 413，
     并关闭连接，防止客户端用
-    无限制的请求耗尽内存。
+    无限制的请求耗尽内存。上限钳在 1 GiB：再大时帧解析里的
+    `headerEnd + bodyLen` 会 int 回绕，判限失效而放行超额请求；
+    下限 1 KiB 避免 0/负数让每个请求都被 413。
 
 - HttpServer SetMaxHeaderBytes(int bytes)
   - 设置请求头块的最大大小（字节）。
@@ -609,6 +756,9 @@ HTTP/1.1 帧解析与限制在 stdlib 中的唯一实现；Worker 的 "http" 协
     需要先查看请求头部才能确定协议类型，
     并把已消费的字节交给本函数。
 
+- static async void ServePrimedBytes(nint clientSock, HttpRequestHandler handler, byte[]pending, int pendingLen, int maxHeaderBytes, int maxRequestBytes, int timeoutMs)
+  - 原生字节数组重载：将已读前缀放回流头部。完全二进制安全，杜绝 NUL 截断。
+
 - static async void ServeFramed(nint clientSock, HttpRequestHandler handler, HttpFramer framer, int maxHeaderBytes, int maxRequestBytes, int timeoutMs)
   - 已经用 `HttpFramer` 读过若干字节的连接
     （如 WebSocket 端口先读握手头部）交回 HTTP 循环：拆包器连同
@@ -640,3 +790,14 @@ HTTP/1.1 帧解析与限制在 stdlib 中的唯一实现；Worker 的 "http" 协
 连接的协程或 worker 事件循环。
 
 `delegate HttpResponse HttpRequestHandler(HttpRequest request);`
+
+
+## int (delegate)
+
+TLS 分片注入的字节源：从 TLS 记录层精确收 (buf, cap) 内的字节，
+返回收到的字节数（0 = 对端关闭），形态跟随 Socket.RecvIntoAsync，
+使分片可以逐参转发。核心文件不拼 TlsStream 类型名——拼了会把
+TLS 全家（连带 Base64/Sha256 与 ssl/crypto 驱动拷贝）拉进一切
+HTTP 程序（A332 肥边④）。
+
+`delegate int FramerRecvFn(string buf, int cap);`

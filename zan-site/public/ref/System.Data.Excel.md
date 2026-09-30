@@ -13,7 +13,7 @@ double 的精确文本化与显示宽度估算。
     控制字符（保留制表符、换行、回车）。
 
 - static string EscAttr(string s)
-  - 属性值转义：在 `Esc` 基础上再转义双引号。
+  - 属性值转义：在 `Esc` 基础上再转义双引号（单趟流式切片）。
 
 - static string ColRef(int c)
   - 0 → A、25 → Z、26 → AA……（Excel 列引用）。

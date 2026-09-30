@@ -433,9 +433,7 @@ IDE 发布 "editor"（缓冲区/光标/补全状态）和 "log"。
 
 - static int failCount;
 
-- static List<string> probeNames;
-
-- static List<string> probeVals;
+- static List<UiProbe> probes;
 
 - static bool Active()
   - ZAN_UI_SCRIPT 驱动的会话运行中时为真（可设置 probe）。
@@ -551,6 +549,15 @@ IDE 发布 "editor"（缓冲区/光标/补全状态）和 "log"。
     构建 probe JSON 的宿主（如 IDE 的编辑器快照）可复用。
 
 
+## UiProbe (class)
+
+- public string name;
+
+- public string value;
+
+- public UiProbe(string name, string value)
+
+
 ## Win32Shell (class)
 
 Windows 窗口外壳——类注册、窗口过程、
@@ -575,6 +582,13 @@ Windows 窗口外壳——类注册、窗口过程、
 - [DllImport("shell32", EntryPoint="DragQueryPoint")]static extern int DragQueryPoint(nint hdrop, nint pt);
 
 - [DllImport("shell32", EntryPoint="DragFinish")]static extern void DragFinish(nint hdrop);
+
+- [DllImport("shell32", EntryPoint="ShellExecuteW")]static extern nint WinShellExecuteW(nint hwnd, nint op, nint file, nint args, nint dir, int show);
+
+- static void ShellOpenUrl(string url)
+  - 用系统关联程序打开 url/文件（`<a target="_blank">` 的系统
+    浏览器通道）。直接调 shell32 的 ShellExecuteW，不经
+    cmd.exe——URL 里的 & ? # = 等字符不会被 shell 元字符拆散。
 
 - [DllImport("user32", EntryPoint="CreateWindowExW")]static extern nint CreateWindowExW(int exStyle, nint cls, nint title, int style, int x, int y, int w, int h, nint parent, nint menu, nint inst, nint param);
 
@@ -828,6 +842,8 @@ Windows 窗口外壳——类注册、窗口过程、
 
 - static List<nint> fixedHwnd;
 
+- static List<nint> noMaxHwnd;
+
 - static int imeX;
 
 - static int imeY;
@@ -839,6 +855,10 @@ Windows 窗口外壳——类注册、窗口过程、
 - static int shapeMode;
 
 - static List<int> shapeRegions;
+
+- static int winOpacityPercent;
+
+- static bool hasShadowBand;
 
 - static List<byte> shapeMask;
 
@@ -1076,6 +1096,15 @@ Windows 窗口外壳——类注册、窗口过程、
     伸缩，位置不变）。WM_SIZE 走正常路径，应用的画布与布局
     下一帧自动跟上。登录小窗 → 主窗口这类形态切换用。
 
+- static void ResizeClientExact(nint hwnd, int scaledW, int scaledH)
+  - 把窗口客户区调整为**精确**的 (scaledW, scaledH) 设备像素。
+    与 ResizeClient 的区别是**不做 AdjustWindowRect 补偿**：本壳的
+    WM_NCCALCSIZE（wp!=0 时直接返回 0）已经把客户区扩成整个窗口矩形，
+    再按标准框架补偿就等于凭空加一圈死边（150% 屏实测右 22 / 下 55），
+    客户区变成 562x633 而不是请求的 540x578——照参考图量出来的小窗
+    会「比图大一圈、内容贴左上」。舞台路径（CreateWindowSized stage=true）
+    出于同样理由跳过补偿，这里补上普通路径的精确版本。
+
 - static void Minimize(nint hwnd)
   - 最小化窗口（SW_MINIMIZE）。
 
@@ -1126,6 +1155,15 @@ Windows 窗口外壳——类注册、窗口过程、
   - 登记窗口是否允许用户改变尺寸；false 时 WM_NCHITTEST 不再
     报告边缘/角手柄，双击标题栏与 SC_MAXIMIZE/SC_SIZE 也被吞掉。
     重复设置同值无副作用。
+
+- static bool MaximizableOf(nint hwnd)
+  - 窗口是否允许最大化（默认允许）。关闭了最大化按钮的窗口
+    必须登记 false，否则双击标题栏 / SC_MAXIMIZE 照样放大窗口。
+
+- static void SetMaximizable(nint hwnd, bool on)
+  - 登记窗口是否允许最大化；false 时双击标题栏与
+    SC_MAXIMIZE（Win+Up、系统菜单）不再放大窗口，双击
+    已最大的窗口仍可还原。重复设置同值无副作用。
 
 - static List<nint> toolHwnd;
 
@@ -1606,6 +1644,16 @@ Windows 窗口外壳——类注册、窗口过程、
     位置不变。登录小窗 → 主窗口这类形态切换用；WM_SIZE 走正常
     路径，画布与布局下一帧自动跟上。
 
+- void SetClientSizeDev(int wDev, int hDev)
+  - 把客户区调整为**精确**的 (wDev, hDev) **设备**像素，不加
+    OS 框架补偿（本壳客户区本就等于窗口矩形）。登录小窗这类「照参考图
+    定尺寸」的窗口用它：SetClientSize 的补偿会让实际客户区比请求值大
+    一圈（150% 屏 540x578 → 562x633），内容看着贴左上、四周留白不匀；
+    且设备像素入参没有 `logical*144/96` 的截断（578 不是 1.5 的整数倍，
+    走逻辑像素只能落在 577 或 579 上）。只放大窗口的形态切换
+    （登录小窗 → 主窗）继续用 SetClientSize——主窗那套 Spec 尺寸是
+    按补偿后的 1888x993 校准的，换成本函数会把整窗布局打偏。
+
 - void Center()
   - 在显示器工作区上居中窗口。
 
@@ -1655,6 +1703,11 @@ Windows 窗口外壳——类注册、窗口过程、
     没有新事件时保持不变。EventKind()/EventX() 等在没有新
     事件的循环迭代里返回上一次的旧值（动画分支不泵就退出），
     应用要区分"新事件"与"陈旧回读"时比对这里。
+
+- static long EventSeqGlobal()
+  - 最近投递事件的进程级序号（不依赖某个窗口实例）。多顶层
+    窗口的事件路由需要一个「这件事件处理过没有」的幂等键，
+    而路由器（ChildWindows.Route）手里只有 hwnd、没有窗口对象。
 
 - int EventX()
   - 最近事件的 X 坐标：鼠标/滚轮/拖放为客户端像素，键盘类为 0。
@@ -1719,8 +1772,7 @@ Windows 窗口外壳——类注册、窗口过程、
     下一次 Present 对整个窗口上传，不做任何差分。
     整窗帧若不声明，呈现范围就交给运行时的差分影子——
     影子与屏幕失步时旧帧内容会永久留在屏上（见
-    Win32Shell.PresentFull）。移动端外壳（OHOS/Android 原生）
-    用同一声明在换窗口（旋转、后台回来）后强制整帧重传。
+    Win32Shell.PresentFull）。
 
 - void SetTitle(string title)
   - 设置窗口标题。
@@ -1821,6 +1873,11 @@ Windows 窗口外壳——类注册、窗口过程、
 - void SetResizable(bool on)
   - 窗口是否可由用户改变大小。关闭后边框不再
     充当尺寸手柄，双击标题栏与最大化也不再放大窗口。
+    仅限 Windows；其他平台为安全空操作。
+
+- void SetMaximizable(bool on)
+  - 窗口是否允许最大化（默认允许）。标题栏不画最大化
+    按钮的窗口应关闭它，否则双击标题栏与 Win+Up 仍会放大窗口。
     仅限 Windows；其他平台为安全空操作。
 
 - void SetToolWindow(bool on)

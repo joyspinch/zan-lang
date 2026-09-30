@@ -272,10 +272,10 @@ DbConnection any = DbConnection.OpenODBC("DSN=mydsn;UID=u;PWD=p;");
   - 回滚当前事务。
 
 - void Close()
-  - 关闭数据库连接。
+  - 关闭连接并释放 ODBC 句柄。
 
 - bool IsConnected()
-  - 返回连接是否打开。
+  - 连接当前有效时为 true。
 
 - int GetProvider()
   - 返回 provider 类型。
@@ -290,6 +290,9 @@ DbConnection any = DbConnection.OpenODBC("DSN=mydsn;UID=u;PWD=p;");
   - 执行带参数的查询（同步）。真参数绑定，取数逻辑与
     无参 Query 共用同一形状。失败时抛出
     `DbException`。
+
+- void Dispose()
+  - 释放连接持有的资源（实现 IDisposable，等同于 Close）。
 
 
 ## DbException (class)
@@ -563,6 +566,8 @@ KingbaseES/人大金仓, Vastbase, GaussDB, QuestDB) via libpq.
 
 - int columnCount;
 
+- Dict <string, int> colMap;
+
 - DbResult()
 
 - static DbResult Empty()
@@ -613,7 +618,7 @@ KingbaseES/人大金仓, Vastbase, GaussDB, QuestDB) via libpq.
   - 按行索引和列名取值。
 
 - int GetColumnIndex(string name)
-  - 按列名获取列索引。
+  - 按列名获取列索引。内部带有懒加载字典索引缓存，将大数据量高频调用从 O(N) 线性扫描降为 O(1)。
 
 - string GetColumnName(int index)
   - 获取指定索引处的列名。
@@ -1090,6 +1095,9 @@ giving it back (see `Unwrap`).
 - void Close()
   - Closes the wrapped connection (not timed).
 
+- void Dispose()
+  - 释放连接持有的资源（实现 IDisposable，等同于 Close）。
+
 - void BeginTransaction()
   - Transactional forwarding — transaction control itself is not timed.
 
@@ -1161,6 +1169,9 @@ takes, so a server can hand this straight to its metrics.
 
 - async bool RollbackAsync();
   - 回滚事务写入的协程版本。
+
+- void Dispose();
+  - 释放连接持有的资源（实现 IDisposable，等同于 Close）。
 
 
 ## IDbConnector (interface)

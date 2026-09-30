@@ -1,6 +1,6 @@
 # Game.Arpg.Data
 
-> 源码: `stdlib/Game/Arpg/Data/Db.zan`, `stdlib/Game/Arpg/Data/Save.zan`, `stdlib/Game/Arpg/Data/SaveState.zan`
+> 源码: `packages/Zan.Game/src/Game/Arpg/Data/Db.zan`, `packages/Zan.Game/src/Game/Arpg/Data/Save.zan`, `packages/Zan.Game/src/Game/Arpg/Data/SaveState.zan`
 
 
 ## ArpgDatabase (class)
@@ -34,14 +34,26 @@ SqliteComponentConfig (类型="Sqlite", 名称) to a real System.Data.Sqlite
 - bool IsOpen()
   - 连接是否处于打开状态。
 
+- SqliteConnection Conn()
+  - 底层数据库连接（供 ORM 实体操作与高级查询使用）。
+
 - int Execute(string sql)
   - 执行: runs a non-query statement, 返回 affected row 数量 (-1 on 错误).
+
+- int Execute(string sql, DbParams prms)
+  - 执行带参数的非查询语句。
 
 - DbResult Query(string sql)
   - 查询: runs a query and 返回 the materialized result 设置.
 
+- DbResult Query(string sql, DbParams prms)
+  - 执行带参数的查询并返回物化的结果集。
+
 - string Scalar(string sql)
   - 执行聚合查询并返回第一行第一列（没有则为空字符串）。
+
+- string Scalar(string sql, DbParams prms)
+  - 执行带参数的标量查询。
 
 - int LastInsertId()
   - 最近一次 INSERT 语句生成的 rowid。
@@ -116,9 +128,9 @@ SqliteComponentConfig (类型="Sqlite", 名称) to a real System.Data.Sqlite
 ## ArpgSaveRepository (class)
 
 基于通用 SQLite 连接的 ZGM 原生存档仓库。
-其结构为 ZGM 私有：每个槽位一行，外加规范化的子行，用于
-背包、装备、已学技能与生效中的增益。它与
-通用 System.Data.Sqlite API 保持分离。
+其结构由标准库 ORM 实体（ArpgSaveSlotEntity 等）与强类型表达式查询驱动，
+涵盖主槽位及规范化的子表（背包、装备、已学技能与生效增益）。
+完全杜绝手拼 SQL 字符串与裸 SQL 注入风险。
 
 - ArpgDatabase database;
 
@@ -126,7 +138,7 @@ SqliteComponentConfig (类型="Sqlite", 名称) to a real System.Data.Sqlite
 
 - static ArpgSaveRepository Open(ArpgDatabase database)
   - 在已打开的数据库上打开存档仓库：database 为 null 或未打开时
-    返回 null，否则建表并返回仓库；IsReady() 反映建表是否成功，
+    返回 null，否则同步实体结构建表并返回仓库；IsReady() 反映就绪状态，
     未就绪时所有读写操作均失败。
 
 - static ArpgSaveRepository OpenProject(ArpgProject project, string componentName, string path)
@@ -134,53 +146,40 @@ SqliteComponentConfig (类型="Sqlite", 名称) to a real System.Data.Sqlite
     数据库文件 path 上打开存档仓库（组件缺失时返回 null）。
 
 - bool IsReady()
-  - 建表是否成功；为 false 时 Save/Load 等操作一律拒绝。
+  - 建表与实体同步是否成功；为 false 时 Save/Load 等操作一律拒绝。
 
 - ArpgDatabase Database()
   - 底层数据库连接。
 
 - bool HasColumn(string table, string column)
-  - 表 table 是否已存在列 column（用 PRAGMA table_info 查询）。
-
-- bool EnsureColumn(string table, string column, string definition)
-  - 确保表 table 存在列 column：已存在直接返回 true，缺失时
-    ALTER TABLE 添加（definition 为列定义），失败返回 false。
+  - 表 table 是否已存在列 column。
 
 - bool Initialize()
-  - 创建全部存档表（IF NOT EXISTS，含主槽表与物品/装备/技能/
-    增益四张子表），并为旧库补齐 hero_experience/hero_rage 两列。
-    任一步失败返回 false。
-
-- static string Quote(string text)
-  - 为 SQLite 转义一个值，无需第二套 SQL 参数 API。
-    仓库只拼接槽位与物品标识符；数值
-    快照字段以整数形式输出。
+  - 基于 ORM CodeFirst 自动同步并迁移全部存档表结构（含主槽表与四张子表），
+    自动补齐缺失列，任一步失败返回 false。
 
 - bool Save(string slot, ArpgSaveState state)
-  - 将 state 全量覆写保存到槽位 slot：主行 INSERT OR REPLACE，
-    四张子表先删后插，整个过程在一个事务内，任一步失败即
-    回滚并返回 false。未就绪、slot 为空串或 state 为 null 时
+  - 将 state 覆写保存到槽位 slot：主行与四张子表在事务内先删后插，
+    全部采用 ORM 强类型表达式与实体写入。未就绪、slot 为空串或 state 为 null 时
     直接返回 false。
 
 - ArpgSaveState Load(string slot)
-  - 读取槽位 slot 为 ArpgSaveState：主行不存在、未就绪或 slot
-    为空串时返回 null。物品/装备/技能/增益子行分别按名称排序
-    读回（与保存顺序无关）。
+  - 读取槽位 slot 为 ArpgSaveState：使用 ORM 强类型表达式查询。
+    主行不存在、未就绪或 slot 为空串时返回 null。
+    物品/装备/技能/增益子行分别按实体表达式排序读回。
 
 - bool Exists(string slot)
   - 槽位 slot 是否已有存档；未就绪或 slot 为空串时返回 false。
 
 - bool Delete(string slot)
-  - 删除槽位 slot：在一个事务内删除主行与全部子行，任一步
-    失败即回滚并返回 false。返回 true 表示槽位确实存在且已删除，
-    槽位本不存在返回 false（此时数据已无变化）。
+  - 删除槽位 slot：在一个事务内通过 ORM 表达式删除主行与全部子行。
+    返回 true 表示槽位确实存在且已删除，槽位本不存在返回 false。
 
 - int SlotCount()
   - 存档槽位总数；未就绪时返回 0。
 
 - string SlotAt(int index)
-  - 按槽位名排序后的第 index 个槽位名；未就绪、index 为负或
-    越界时返回空串。
+  - 按槽位名排序后的第 index 个槽位名；未就绪、index 为负或越界时返回空串。
 
 - void Close()
   - 关闭底层数据库并将仓库置为未就绪；之后所有操作均失败。

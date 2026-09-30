@@ -1,6 +1,6 @@
 # System.Compiler
 
-> 源码: `stdlib/System/Compiler/GenCommon.zan`, `stdlib/System/Compiler/GenDb.zan`, `stdlib/System/Compiler/GenDbEmit.zan`, `stdlib/System/Compiler/GenForm.zan`, `stdlib/System/Compiler/GenIndex.zan`, `stdlib/System/Compiler/GenJson.zan`, `stdlib/System/Compiler/GenRoute.zan`, `stdlib/System/Compiler/GenScene.zan`, `stdlib/System/Compiler/ZanGen.zan`
+> 源码: `stdlib/System/Compiler/GenCommon.zan`, `stdlib/System/Compiler/GenDb.zan`, `stdlib/System/Compiler/GenDbEmit.zan`, `stdlib/System/Compiler/GenForm.zan`, `stdlib/System/Compiler/GenHtml.zan`, `stdlib/System/Compiler/GenIndex.zan`, `stdlib/System/Compiler/GenJson.zan`, `stdlib/System/Compiler/GenRoute.zan`, `stdlib/System/Compiler/GenScene.zan`, `stdlib/System/Compiler/ZanGen.zan`
 
 
 ## DbField (class)
@@ -111,6 +111,11 @@ ZanGen 各生成器共享的工具集: 回复组装、字符串转义、诊断�
 - static JsonValue AttrArg(JsonValue attr, string key)
   - 具名属性参数(`Name = expr`)的表达式树,或 null。
 
+- static JsonValue AttrPositional(JsonValue attr)
+  - 属性的第一个位置实参（`[Table("t_x")]` 的 "t_x"）。
+    genmeta 把位置实参序列化为裸表达式树（不是 assign 包装），
+    只认 str/int 字面量。
+
 - static string AttrStr(JsonValue attr, string key)
   - 具名属性参数取字符串字面量, 缺失或类型不符返回 ""。
 
@@ -145,7 +150,9 @@ ZanGen 各生成器共享的工具集: 回复组装、字符串转义、诊断�
   - 按字段名在字段列表中查找, 没有返回 null。
 
 - static string TableOf(string cls)
-  - 实体的表名([Table(Name=...)], 缺省用类名)。
+  - 实体的表名([Table("t_x")] 或 [Table(Name = "t_x")]，缺省用类名)。
+    位置实参形态曾被静默丢弃（AttrArg 只认 assign 包装），回落成
+    类名当表名，运行期报 no such table——探针实锤后补上。
 
 - static List<JsonValue> IndexAttrs(string cls)
   - 实体上的 `[Index(Name = "...", Fields = "a,b", IsUnique = true)]`,
@@ -275,7 +282,7 @@ ZanGen 各生成器共享的工具集: 回复组装、字符串转义、诊断�
     畸形聚合发诊断并返回非空,但 w.Ok 已清。
 
 - static string BindMethod(int kind)
-  - 绑定类型 -> 链方法名。
+  - 绑定类型 -> 链方法名（`__` 前缀 = 降级专用，应用层不得手写）。
 
 - static JsonValue OpObj(string m, JsonValue args)
   - 链操作 { m, args }。
@@ -346,8 +353,8 @@ ZanGen 各生成器共享的工具集: 回复组装、字符串转义、诊断�
     成 `.W(frag).P(v)...` 链(db_chain 指令)。
 
 - static JsonValue BuildWhereChain(JsonValue recv, string cls, JsonValue lambda, JsonValue call)
-  - 把 `recv.W(...)` 构建为 `.W(frag).P(v)...` 链树(Read 访问器用,
-    不经过指令)。诊断挂在 w.Call 上。
+  - 把 `recv.W(...)` 构建为 `.__Frag(frag).__P(v)...` 链树(Read 访问器
+    用,不经过指令)。诊断挂在 w.Call 上。
 
 - static void RewriteWhereIf(JsonValue call, string cls)
   - `WhereIf(cond, p => ...)`:片段与参数只在 cond 成立时应用。
@@ -545,9 +552,11 @@ ZanGen 各生成器共享的工具集: 回复组装、字符串转义、诊断�
 
 ## GenForm (class)
 
-.zform 设计文档到合成 partial class 的代码生成器。
+设计文档到合成 partial class 的代码生成器。
 与 src/compiler/formgen.c 等价(输出逐字节一致);入口是
-`Translate`,由 design 请求分派 .zform 文件进来。
+`Translate`,由 design 请求分派 .html 设计稿进来
+(.zform JSON 设计文档已删,旧项目先转 .html—— DesignerHtml
+FromJsonDoc 是规范转换器)。
 
 - static List<string> compNames;
   - 本轮 design 请求携带的用户组件文档（design 请求的
@@ -558,13 +567,14 @@ ZanGen 各生成器共享的工具集: 回复组装、字符串转义、诊断�
 - static List<JsonValue> compDocs;
 
 - static void Translate(JsonValue req, JsonValue reply)
-  - 翻译 design 请求里所有 .zform 文件(.zscene 归 GenScene):
+  - 翻译 design 请求里所有 .html 设计稿(.zscene 归 GenScene):
     逐个解析、校验、合成为 .zan 源码,经 GenCommon.AddSource
     追加进 reply 的 sources;失败时写 reply 的 error 后返回。
 
 - static StringBuilder TranslateOne(JsonValue reply, string json, string file_name, bool emit_main)
-  - 翻译单个 .zform 文档。失败返回 null;具体诊断(非法 kind 等)
-    已写入 reply 的 error,纯解析失败则不设 error(C 端报通用错误)。
+  - 翻译单个设计文档(JSON 模型,来自 DesignerHtml.ToJsonDoc)。
+    失败返回 null;具体诊断(非法 kind 等)已写入 reply 的 error,
+    纯解析失败则不设 error(C 端报通用错误)。
 
 - static JsonValue CompDoc(string name)
   - 组件名对应的组件文档；未登记返回 null。
@@ -586,10 +596,12 @@ ZanGen 各生成器共享的工具集: 回复组装、字符串转义、诊断�
   - 校验字段树:每个字段的 kind 必须是合法 Zan 标识符(递归 kids)。
 
 - static void ValidateColumns(JsonValue reply, JsonValue o, string f0, int idx)
-  - 校验 DataGrid 的声明式列:columns 必须是对象数组,每列的
-    "field" 是行实体上的字段路径(点分标识符),"type" 只认
-    text/num/real/bool/date。带列的网格还必须写 "of"——列访问器
-    读的是 "of" 类型的字段,缺省的 string 上没有它们。
+  - 校验 DataGrid 的声明式列。列有两个声明面：手写文档的
+    columns 对象数组，与设计器列编辑器写出的 options
+    "标题:字段" 选项串（设计器以 options 为列序真相，columns
+    条目只是同下标的声明属性跟随表）。任一面声明了带字段的
+    列，"of" 就是必需的——列访问器读的是 "of" 类型的字段，
+    缺省的 string 上没有它们。
 
 - static bool ValidFieldPath(string s)
   - 列的 "field" 是实体上的字段路径:点分的合法标识符
@@ -598,10 +610,41 @@ ZanGen 各生成器共享的工具集: 回复组装、字符串转义、诊断�
 - static string KindOf(JsonValue o)
   - 字段的控件 kind:取 "kind" 字符串值,缺省或非字符串返回 ""。
 
+- static void ScanHeavyKinds(JsonValue node, bool[]flags)
+  - 设计树重家族 kind 扫描（生成头部按需发射 using 用）：
+    flags[0]=Chart（ChartHost）、flags[1]=DataTable（DataGrid/
+    Transfer）、flags[2]=WebView（WebViewBox）、flags[3]=Cef
+    （CefBrowserBox）。kind 别名与 TypeOf 同步归一
+    （Table/DataTable→DataGrid、Chart→ChartHost）。递归数组与
+    对象的 "kids"/"fields" 子树；其余节点忽略。
+
 - static string TypeOf(JsonValue o)
   - 字段的 Zan 类型:泛型控件在 "of" 里写类型实参
     (`"kind": "ListView", "of": "string"` -> `ListView<string>`),
     多个实参用逗号分隔。非泛型控件就是 kind 本身。
+
+- static string QualifyKind(string kind)
+  - 控件 kind → 命名空间限定名（A314）。生成类落在全局命名空间，
+    裸 `Panel`/`Button` 会优先绑定到用户项目的同名全局类（全局
+    声明压过 using import），字段与构造必须发射限定名才能锁住
+    stdlib 真身（遮蔽下的限定逃逸，见 A312）。名单与
+    ControlFactory.Kinds() 对齐（外加泛型控件 ListView/Dropdown）；
+    名单外的 kind 是用户自定义 Control 派生类，保持裸名让它解析
+    到用户项目自己的类。
+
+- static List<string> NonConstructibleKinds()
+  - 设计文档里不允许实例化的 kind：抽象基类（ChoiceGroup 是
+    RadioGroup/CheckboxGroup 的基类，自身无零参构造，GenForm 发射
+    `new ChoiceGroup()` 会得到 labels/children 为 null 的半初始化实例，
+    首帧即空引用——html_gallery 曾因此整卡崩溃）。名单内 kind 一律
+    在校验期报错，具体子类不受影响。
+
+- static bool IsStdWidgetKind(string kind)
+
+- static bool IsHmiKind(string kind)
+  - 声明在 Gui.Hmi 命名空间的保留控件（工业/告警族，见
+    Hmi/Alarm、Indicator、Gauge、NumPad、Trend、EquipPanel）。
+    QualifyKind 据此发射 `Gui.Hmi.X` 而不是 `Gui.Widget.X`。
 
 - static string DefaultTypeArgs(string kind)
   - 泛型控件缺省的类型实参:设计器放置的控件只有 kind,
@@ -633,6 +676,10 @@ ZanGen 各生成器共享的工具集: 回复组装、字符串转义、诊断�
 - static string JoinOpts(JsonValue o)
   - Join options with '|' (mirrors JoinOpts).
 
+- static void EmitSetProp(StringBuilder b, string vn, string key, string v)
+  - 发射一条字符串 SetProp：值超长（base64 资源等）时拆成
+    多段字面量相加，绕开单字面量 4095 字符的词法上限。
+
 - static void FieldSetup(StringBuilder b, JsonValue o, string vn)
   - 应用 schema 级属性(options/placeholder/required/defOn)。
 
@@ -642,6 +689,31 @@ ZanGen 各生成器共享的工具集: 回复组装、字符串转义、诊断�
     ({"field":"name"} -> `__r => __r.name`),不经过任何字符串行
     中间层;字段名或列类型与实体不符时由编译器在生成代码上报错。
     数据本身由 code-behind 用 `grid.Bind(list)` 传入 List<of>。
+    设计器文档的列序真相在 options（"标题:字段" 选项串，列编辑
+    器写的就是它），columns[i] 只是同下标的声明属性跟随表——
+    options 非空时按它合成列，两处声明在 EmitColumn 汇合。
+
+- static JsonValue ColEntryAt(JsonValue cols, int i)
+  - columns 数组第 i 个条目（缺失/非数组/越界/非对象返回 null）。
+
+- static string OptFieldOf(string opt)
+  - 设计器列选项 "标题:字段" 的字段部分（首个冒号之后；没有
+    冒号返回 ""）。与 Designer.ColField 同约定。
+
+- static string OptFieldAt(JsonValue opts, int i)
+  - options 数组第 i 项的字段部分（opts 非数组/越界返回 ""）。
+
+- static string OptTitleOf(string opt)
+  - 列选项的标题部分（首个冒号之前；没有冒号是整串）。
+
+- static void EmitOptionColumn(StringBuilder b, string vn, string opt, JsonValue entry, string of)
+  - 把一条 options 列选项（"标题:字段"）连同同下标的 columns
+    声明条目发射成列：field/title 以显式条目优先，缺省从选项串
+    解析，条目的其余声明键（width/type/align/聚合…）原样并入，
+    走与手写 columns 相同的 EmitColumn 通道。只有标题的列在无
+    "of"（DataGrid<string>，行即文本）时发射 `__r => __r` 直读
+    行文本；有 "of" 时无法构成访问器，跳过（与手写 columns 缺
+    field 的行为一致）。
 
 - static void EmitColumn(StringBuilder b, JsonValue c, string vn)
   - 把一列的声明展开成 DataGrid<T> 的链式列构造调用
@@ -651,17 +723,25 @@ ZanGen 各生成器共享的工具集: 回复组装、字符串转义、诊断�
 - static void EmitHandlers(StringBuilder wire, JsonValue o, string vn, string dispatch)
   - 发射 on<Event> 处理器绑定(事件名 = 去掉前导 "on" 的键)。
 
-- static string ParentExpr(JsonValue o, string parent)
+- static string ParentExpr(JsonValue o, string parent, string parentKind)
   - 子控件归属的容器表达式：设计把它放在容器的某个“位”
     上时（`childTab`：标签页的第几页、分栏的哪个窗格），真正
     的父节点是那个内部容器（见 Control.SlotHost），而不是容器
     自身——直接挂在容器上的子控件会全部重叠在一起或压根
-    就不参与布局。
+    就不参与布局。slot-host 容器（Tabs/SplitPanel）的子级缺
+    `childTab` 就是第 0 位：设计器模型里 0 值被 HTML 序列化
+    跳过（data-child-tab="0" 不落盘），按“挂容器本体”处理会让
+    这些子控件运行时整个不可见（Tabs 只渲染页容器），设计里
+    却明明看得到。
+
+- static bool HasSizeClass(string classes)
+  - 是否已经由控件自己声明尺寸档。按空格分词，避免把
+    `small-card` 这类普通语义类误判成尺寸覆盖。
 
 - static int ChildrenCount(JsonValue o)
   - 直接子控件数:无 "kids" 数组则为 0。自动布局用它估容器高度。
 
-- static int EmitField(StringBuilder decls, StringBuilder body, StringBuilder wire, StringBuilder valid, JsonValue o, string parent, int id, List<string> used, bool freeMode, bool parentIsFlow, string dispatch, bool instanceFields, bool anon)
+- static int EmitField(StringBuilder decls, StringBuilder body, StringBuilder wire, StringBuilder valid, JsonValue o, string parent, string parentKind, int id, List<string> used, bool freeMode, bool parentIsFlow, string dispatch, bool instanceFields, bool anon, string defaultSizeClass)
   - 发射一个字段的声明/构造/事件接线/校验,递归容器 kids。
     返回下一个局部 id。与旧 formgen 的 fg_emit_field 逐字节等价。
     `anon`:组件引用展开的内部字段——不生成具名声明、不接内部
@@ -672,6 +752,67 @@ ZanGen 各生成器共享的工具集: 回复组装、字符串转义、诊断�
   - 容器在自动堆叠（Dock.Top / 流式格）里的偏好高度：
     引用展开的壳带 "ph" 键（组件画布高），其余容器维持
     44 + 44 * 子数的旧估算。
+
+
+## GenHtml (class)
+
+GenHtml.zan -- .html 声明文档 → 建树类的代码生成器
+（WEB_GUI_ROADMAP P5）。与运行时 App.LoadHtml 共用 System.Web 的
+解析记录（HtmlParser.Parse 的 WDoc/WNode）：编译期把 .html 展开
+成纯建树代码，发布不携带 HTML 文本与解析器；动态装载仍走
+App.LoadHtml（同一解析器，同一几何）。
+
+输入(design 请求的 files[i])：
+{ "name": "ui.html", "text": "<html 文本>", "emitMain": 忽略 }
+输出：reply.sources 里追加一段名为 name 的 .zan 源码，形态
+（ui.html → 类 UiHtml；类名 = 文件基名帕斯卡化 + Html 后缀）：
+public class UiHtml {
+public static string Css = "...<style> 与 style 属性收集...";
+public static Control Build(HtmlHandlers handlers) { ... }
+}
+调用方：`Control root = UiHtml.Build(handlers);` 之后自行
+`app.UseAppCss(UiHtml.Css)`（或并进自己的样式表）再挂树。
+
+样式 scoping（Vue <style scoped> 同语义）：多份文档的 Css 合装
+进同一张 app 表时，裸标签/类选择器会跨文档互中。生成期给每个
+元素混入文档作用域类 zs-<基名>，并把文档 CSS 每个复合块补上
+该类——规则只命中本文档的元素（System.Web.HtmlScope）。运行期挂载件
+（列表行模板等 Build 之外长出来的控件）不携作用域类，其样式
+放皮肤层（全局通道）——与 Vue 的组件样式不泄漏子组件同一取舍。
+
+生成依据是 WDoc.nodes 声明记录（tag/父下标/属性/文档序内容）——
+与运行时同一次解析的产物，天然同构。本文件只依赖 System.Web
+纯层（不能 using Gui：生成器 exe 的活名闭包会滤掉 Gui 的
+传递依赖，UiDriver 的 Json.Serialize 编译不进来）。
+
+- static void Translate(JsonValue req, JsonValue reply)
+  - 翻译 design 请求里所有 .html/.htm 文件；失败写 reply 的 error。
+
+- static bool Emit(string path, WDoc wd, StringBuilder outp)
+
+- static void EmitDecl(StringBuilder b, WNode n, int idx, string genCls, string zs)
+  - 一条记录 = 一个变量的声明 + 属性协议（构造；文本与挂树在
+    EmitContent 按文档序发射）。
+
+- static void EmitContent(StringBuilder b, WNode n, int idx)
+  - 父节点 idx 的内容游走：文本片 AddText、子节点 AddChild，
+    严格 items 文档序（只有容器记录带文本项——捕获控件的文本
+    走自己的构造协议，void 元素无内容）。
+
+- static void EmitWiring(StringBuilder b, WNode n, int idx)
+  - data-on-* 接线（树建完统一挂，html 文档序不敏感）。节点声明了
+    `data-arg` 时走带参 WireArg（实参闭包捕获）。
+
+- static string ClassName(string path)
+  - "src/ui.html" → "UiHtml"（基名帕斯卡化 + Html；非标识符字符
+    当分节符丢弃，数字开头的段补 _）。
+
+- static string BaseName(string path)
+
+- static string ScopeClassOf(string path)
+  - 文档路径 → 作用域类：基名去扩展名后小写、非字母数字折 '-'。
+    与生成类名同源（同目录同名文档本来就会撞生成类名），
+    作用域类继承该唯一性。改写本身在 System.Web.HtmlScope 共用。
 
 
 ## GenIndex (class)
@@ -835,7 +976,7 @@ System.Json 实体映射器: 为 Json.Deserialize/Serialize 生成 __JsonBind �
 
 ## GenRoute (class)
 
-属性路由生成器: 消费 genmeta 单元元数据, 合成 __AttrRoutes 路由注册源码。
+属性与约定路由生成器: 消费 genmeta 单元元数据, 合成 __AttrRoutes 路由注册源码。
 
 - static JsonValue Reply;
   - 输出容器: 合成源码与诊断写进这里(reply)。
@@ -851,25 +992,23 @@ System.Json 实体映射器: 为 Json.Deserialize/Serialize 生成 __JsonBind �
 
 - static List<string> MetaOrder;
 
-- static List<string> PName;
+- static List<RouteParamDoc> ParamDocs;
 
-- static List<string> PType;
-
-- static List<bool> PRequired;
-
-- static List<string> PDef;
-
-- static List<string> PDesc;
-
-- static List<string> PWhere;
-
-- static List<string> PmParam;
-
-- static List<string> PmProp;
+- static Dict <string, string> ParamToProp;
 
 - static int ConstKind;
 
 - static string ConstSval;
+
+- static Dict <string, string> ModTitle;
+
+- static Dict <string, string> ModIcon;
+
+- static Dict <string, string> ModOrder;
+
+- static Dict <string, string> ModNs;
+
+- static List<string> ModKeys;
 
 - static string RType;
 
@@ -913,12 +1052,16 @@ System.Json 实体映射器: 为 Json.Deserialize/Serialize 生成 __JsonBind �
 - static string AttrStringArg(JsonValue d, string nm)
   - 属性类上第一个 <name>(...) 的字符串参数;无则 ""。
 
+- static string AttrNamedArg(JsonValue d, string attrName, string propName)
+  - 属性类上名为 attrName 的属性中指定命名参数 propName 的字符串值;无则 ""。
+
 - static bool DerivesFrom(JsonValue cls, string basename)
   - 类的 bases 里是否直接列出 basename(不递归)。
 
 - static bool IsController(JsonValue cls)
   - 类是否呈控制器形状: 名以 Controller 结尾、继承
-    Controller/ApiController, 或带 [Route]/[ApiController]。
+    Controller/ApiController/CrudController, 或带 [Route]/[ApiController]。
+    抽象类与泛型原型类不直接生成路由分发器。
 
 - static string ControllerDisplay(JsonValue cls)
   - 原始(未改名)简单类名:nsresolve 会给重名控制器改名,但
@@ -930,14 +1073,18 @@ System.Json 实体映射器: 为 Json.Deserialize/Serialize 生成 __JsonBind �
 
 - static string ControllerActionName(JsonValue cls, string disp, string mod)
   - action 名的控制器半段:模块 + 源码名,与视图键同一个拼法。
-    
-    始终带模块前缀,即使当前程序里没有重名控制器:名字是权限的持久标识,
-    存进库、写进日志。若只在重名时才加前缀,以后新增一个同名控制器就会把
-    已有的 "Users.Save" 集体改成 "Admin.System.Users.Save",库里的旧授权
-    全部对不上 —— 静默失权。前缀恒定,加控制器就只是加控制器。
 
 - static string ControllerToken(JsonValue cls)
   - 控制器 token = 原始类名去掉 "Controller" 后缀并小写。
+
+- static void ResolveModule(JsonValue cls, out string modKey, out string modTitle, out string modIcon, out string modOrder)
+  - 自动解析控制器所属的管理模块（支持类自身标记、单一模块声明类匹配、命名空间与类名前缀匹配）
+
+- static string DefaultClassRoute(JsonValue cls)
+  - 计算控制器的约定路由前缀 (namespace + class 组合，零注解按约定生效)
+
+- static string InferMethodVerb(string mname)
+  - 约定动词推断：若未显式标注动词属性，按方法名语义推导
 
 - static string BuildPath(string clsTpl, string mTpl, string ctrlTok, string actionTok)
   - 合并类/方法路由模板, 替换 [controller]/[action] token, 归一化
@@ -950,6 +1097,9 @@ System.Json 实体映射器: 为 Json.Deserialize/Serialize 生成 __JsonBind �
   - 把 ConstKind/ConstSval 写入元数据键 key; onlyAbsent 时键已存在
     则跳过。首次插入顺序记录在 MetaOrder。
 
+- static void MetaSetDirect(string key, string val, int kind)
+  - 直接写入已求值的元数据键值(kind: 0=int, 1=bool, 2=str, 3=id/enum)
+
 - static int MetaGetKind(string key)
   - 键的元数据类别, 没有返回 -1。
 
@@ -957,7 +1107,7 @@ System.Json 实体映射器: 为 Json.Deserialize/Serialize 生成 __JsonBind �
   - 键的元数据值, 没有返回 ""。
 
 - static string PmapProp(string param)
-  - ctor 参数名 → 属性名映射, 没有返回 ""。
+  - ctor 参数名 → 属性名映射 (O(1) 哈希查询), 没有返回 ""。
 
 - static void ApplyAttr(JsonValue attr)
   - 应用一次属性用法到元数据:属性类默认值(仅缺省时)先,
@@ -974,7 +1124,7 @@ System.Json 实体映射器: 为 Json.Deserialize/Serialize 生成 __JsonBind �
   - 记录一次输入调用发现的参数: 同名重复读按更强声明合并
     (必填/具体类型/默认与描述取先到者), 超过 64 个静默丢弃。
 
-- static bool PNameSeen(string nm)
+- static bool ParamDocSeen(string nm)
   - 参数名是否已登记。
 
 - static void ParamAddOne(string nm, string ty, string desc, string def)
@@ -1046,7 +1196,7 @@ System.Json 实体映射器: 为 Json.Deserialize/Serialize 生成 __JsonBind �
 `Translate`,由 design 请求分派 .zscene 文件进来。
 
 - static void Translate(JsonValue req, JsonValue reply)
-  - 翻译 design 请求里所有 .zscene 文件(.zform 归 GenForm):
+  - 翻译 design 请求里所有 .zscene 文件(.html 设计稿归 GenForm):
     逐个解析、合成为 .zan 源码,经 GenCommon.AddSource 追加进
     reply 的 sources;失败时写 reply 的 error 后返回。
 
@@ -1075,6 +1225,25 @@ System.Json 实体映射器: 为 Json.Deserialize/Serialize 生成 __JsonBind �
 - static StringBuilder TranslateOne(JsonValue reply, string json, string file_name, bool emit_main)
   - 翻译单个 .zscene 文档。解析失败返回 null(不设 error,
     由 C 端报通用错误)。
+
+
+## RouteParamDoc (class)
+
+路由参数文档模型 (单一实体结构，彻底消灭并行 List 坏味道)
+
+- public string name;
+
+- public string type;
+
+- public bool required;
+
+- public string def;
+
+- public string desc;
+
+- public string source;
+
+- public RouteParamDoc(string name, string type, bool required, string def, string desc, string source)
 
 
 ## ZanGen (class)

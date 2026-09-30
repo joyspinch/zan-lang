@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Jzt
 
-> 源码: `stdlib/Sdk/Jd/Api/Jzt/JdJztApi.zan`, `stdlib/Sdk/Jd/Api/Jzt/JztFindAllSubPinsRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Jzt/JdJztApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Jzt/JztFindAllSubPinsRequest.zan`
 
 
 ## JdJztApi (class)

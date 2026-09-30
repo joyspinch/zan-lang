@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Price
 
-> 源码: `stdlib/Sdk/Jd/Api/Price/JdPriceApi.zan`, `stdlib/Sdk/Jd/Api/Price/PriceWriteUpdateSkuJdPriceRequest.zan`, `stdlib/Sdk/Jd/Api/Price/PriceWriteUpdateWareMarketPriceRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Price/JdPriceApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Price/PriceWriteUpdateSkuJdPriceRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Price/PriceWriteUpdateWareMarketPriceRequest.zan`
 
 
 ## JdPriceApi (class)

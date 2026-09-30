@@ -1,6 +1,6 @@
 # Sdk.Jd.Api.Market
 
-> 源码: `stdlib/Sdk/Jd/Api/Market/JdMarketApi.zan`, `stdlib/Sdk/Jd/Api/Market/MarketBdpCartGetPinsBySkuIdRequest.zan`, `stdlib/Sdk/Jd/Api/Market/MarketChargeListGetRequest.zan`, `stdlib/Sdk/Jd/Api/Market/MarketDbpCartCartDataReadServiceGetCarSkuCountRequest.zan`, `stdlib/Sdk/Jd/Api/Market/MarketServiceGetRequest.zan`, `stdlib/Sdk/Jd/Api/Market/MarketServiceListGetRequest.zan`
+> 源码: `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Market/JdMarketApi.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Market/MarketBdpCartGetPinsBySkuIdRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Market/MarketChargeListGetRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Market/MarketDbpCartCartDataReadServiceGetCarSkuCountRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Market/MarketServiceGetRequest.zan`, `packages/Zan.Sdk.Jd/src/Sdk/Jd/Api/Market/MarketServiceListGetRequest.zan`
 
 
 ## JdMarketApi (class)
