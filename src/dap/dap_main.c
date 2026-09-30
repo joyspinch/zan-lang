@@ -54,9 +54,11 @@ typedef SOCKET dap_sock_t;
 #else
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <time.h>
 typedef int dap_sock_t;
 #define DAP_INVALID_SOCK (-1)
 #endif
@@ -88,9 +90,58 @@ static bool sock_send_all(dap_sock_t s, const char *buf, int n) {
 }
 
 /* Byte-level transport callbacks over the client socket; the Content-Length
- * framing itself is shared with the stdio path (see common/rpc.c). */
+ * framing itself is shared with the stdio path (see common/rpc.c).
+ *
+ * A DAP session may idle freely BETWEEN frames (the debugger client sits on
+ * breakpoints for minutes), so the wait for a frame's first byte stays
+ * unbounded -- exactly like the stdio transport. But once a frame has
+ * started, the peer must finish it: a client that dribbles one byte per
+ * recv, or dies mid-frame with a half-open connection, would otherwise
+ * park the server thread forever. The deadline is per frame: armed on the
+ * first byte, never extended per chunk, disarmed by rpc_read_message_sock
+ * when the frame ends. Even the 64MB cap moves over loopback in seconds,
+ * so a minute is far past any legitimate peer. */
+#ifndef DAP_FRAME_DEADLINE_MS
+#define DAP_FRAME_DEADLINE_MS 60000
+#endif
+
+typedef struct {
+    dap_sock_t s;
+    bool started;        /* a frame is in flight: the deadline is armed */
+    long long deadline;  /* monotonic ms when the frame must be complete */
+} dap_frame_reader_t;
+
+static long long dap_now_ms(void) {
+#ifdef _WIN32
+    return (long long)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+
 static int sock_reader(void *ctx, char *buf, int n) {
-    return (int)recv(*(dap_sock_t *)ctx, buf, n, 0);
+    dap_frame_reader_t *r = (dap_frame_reader_t *)ctx;
+    if (r->started) {
+        /* Bounded wait for the next chunk; a blown deadline or a select
+         * error reads as EOF, which ends the frame and the session. */
+        long long wait = r->deadline - dap_now_ms();
+        if (wait <= 0) return 0;
+        fd_set fds;
+        struct timeval tv;
+        FD_ZERO(&fds);
+        FD_SET(r->s, &fds);
+        tv.tv_sec = (long)(wait / 1000);
+        tv.tv_usec = (long)((wait % 1000) * 1000);
+        if (select((int)r->s + 1, &fds, NULL, NULL, &tv) <= 0) return 0;
+    }
+    int got = (int)recv(r->s, buf, n, 0);
+    if (got > 0 && !r->started) {
+        r->started = true;
+        r->deadline = dap_now_ms() + DAP_FRAME_DEADLINE_MS;
+    }
+    return got;
 }
 
 static bool sock_writer(void *ctx, const char *buf, int n) {
@@ -100,7 +151,10 @@ static bool sock_writer(void *ctx, const char *buf, int n) {
 /* Read one Content-Length framed message from the socket. Returns a malloc'd
  * NUL-terminated body, or NULL on disconnect. */
 static char *rpc_read_message_sock(dap_sock_t s) {
-    return rpc_read_message_cb(sock_reader, &s, 64 * 1024 * 1024);
+    static dap_frame_reader_t r;   /* the reader loop is single-threaded */
+    r.s = s;
+    r.started = false;             /* each frame arms fresh on first byte */
+    return rpc_read_message_cb(sock_reader, &r, 64 * 1024 * 1024);
 }
 
 static void rpc_write_message_sock(dap_sock_t s, const char *payload) {

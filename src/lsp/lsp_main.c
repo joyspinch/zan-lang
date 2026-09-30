@@ -48,6 +48,7 @@ typedef SOCKET lsp_sock_t;
 #define LSP_INVALID_SOCK INVALID_SOCKET
 #else
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -150,8 +151,49 @@ static bool sock_send_all(lsp_sock_t s, const char *buf, int n) {
     return true;
 }
 
+/* An LSP session may idle freely BETWEEN frames (the editor can sit on a
+ * request for minutes), so the wait for a frame's first byte stays
+ * unbounded -- exactly like the stdio transport. But once a frame has
+ * started, the peer must finish it: a client that dribbles one byte per
+ * recv, or dies mid-frame with a half-open connection, would otherwise
+ * park this server forever, and it serves exactly one client -- whoever
+ * connects first owns it. The deadline is per frame: armed on the first
+ * byte, never extended per chunk, disarmed by rpc_read_message_sock when
+ * the frame ends. Even the 64MB cap moves over loopback in seconds, so a
+ * minute is far past any legitimate peer. */
+#ifndef LSP_FRAME_DEADLINE_MS
+#define LSP_FRAME_DEADLINE_MS 60000
+#endif
+
+typedef struct {
+    lsp_sock_t s;
+    bool started;        /* a frame is in flight: the deadline is armed */
+    uint64_t deadline;   /* monotonic ms when the frame must be complete */
+} lsp_frame_reader_t;
+
+static uint64_t lsp_now_ms(void);   /* defined with the diagnostics code */
+
 static int sock_reader(void *ctx, char *buf, int n) {
-    return (int)recv(*(lsp_sock_t *)ctx, buf, n, 0);
+    lsp_frame_reader_t *r = (lsp_frame_reader_t *)ctx;
+    if (r->started) {
+        /* Bounded wait for the next chunk; a blown deadline or a select
+         * error reads as EOF, which ends the frame and the session. */
+        long long wait = (long long)(r->deadline - lsp_now_ms());
+        if (wait <= 0) return 0;
+        fd_set fds;
+        struct timeval tv;
+        FD_ZERO(&fds);
+        FD_SET(r->s, &fds);
+        tv.tv_sec = (long)(wait / 1000);
+        tv.tv_usec = (long)((wait % 1000) * 1000);
+        if (select((int)r->s + 1, &fds, NULL, NULL, &tv) <= 0) return 0;
+    }
+    int got = (int)recv(r->s, buf, n, 0);
+    if (got > 0 && !r->started) {
+        r->started = true;
+        r->deadline = lsp_now_ms() + (uint64_t)LSP_FRAME_DEADLINE_MS;
+    }
+    return got;
 }
 
 static bool sock_writer(void *ctx, const char *buf, int n) {
@@ -159,7 +201,10 @@ static bool sock_writer(void *ctx, const char *buf, int n) {
 }
 
 static char *rpc_read_message_sock(lsp_sock_t s) {
-    return rpc_read_message_cb(sock_reader, &s, 64 * 1024 * 1024);
+    static lsp_frame_reader_t r;   /* the reader loop is single-threaded */
+    r.s = s;
+    r.started = false;             /* each frame arms fresh on first byte */
+    return rpc_read_message_cb(sock_reader, &r, 64 * 1024 * 1024);
 }
 
 static void rpc_write_message_sock(lsp_sock_t s, const char *payload) {
