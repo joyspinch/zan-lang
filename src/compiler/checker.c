@@ -4332,10 +4332,24 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
         (obj_type->kind == TYPE_CLASS || obj_type->kind == TYPE_STRUCT ||
          obj_type->kind == TYPE_INTERFACE) &&
         obj_type != c->binder->type_error && obj_type->sym) {
-        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                      "'%.*s' has no member '%.*s'",
-                      (int)obj_type->sym->name.len, obj_type->sym->name.str,
-                      (int)expr->member.name.len, expr->member.name.str);
+        /* The bare-identifier receiver is the trap: with no local/field of
+         * that name the binder falls through to a unique imported type, and
+         * "'Menu' has no member 'visible'" reads as "my field broke" when it
+         * really means "this is the imported Gui.Widget.Menu class" (the
+         * missing-input case files the field in the first place). Qualify
+         * the type so the resolution is visible in the message itself. */
+        zan_istr_t ns = access_symbol_ns(obj_type->sym);
+        if (ns.len)
+            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                          "type '%.*s.%.*s' has no member '%.*s'",
+                          (int)ns.len, ns.str,
+                          (int)obj_type->sym->name.len, obj_type->sym->name.str,
+                          (int)expr->member.name.len, expr->member.name.str);
+        else
+            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                          "'%.*s' has no member '%.*s'",
+                          (int)obj_type->sym->name.len, obj_type->sym->name.str,
+                          (int)expr->member.name.len, expr->member.name.str);
         return c->binder->type_error;
     }
     return c->binder->type_error;

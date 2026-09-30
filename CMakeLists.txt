@@ -1378,6 +1378,22 @@ add_test(NAME diag_nonexistent_member_access
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_nonexistent_member_access PROPERTIES TIMEOUT 60)
 
+# The bare-identifier receiver trap: with no local/field of that name the
+# binder falls through to a unique imported type, and the member error used
+# to print the simple name only -- "'Menu' has no member 'visible'" read as
+# "my field broke" when the receiver really resolved to the imported class
+# (the wuwei sweep misdiagnosed a missing design doc this way). The message
+# qualifies the type so the resolution is visible in the error itself.
+add_test(NAME diag_member_access_qualifies_type
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/member_access_qualifies_type.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/diag/member_access_qualifies_type_lib.zan"
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_member_access_qualifies_type${_exe_ext}
+    "-DEXPECT_REGEX=type .Shapes\\.Menu. has no member .visible."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_member_access_qualifies_type PROPERTIES TIMEOUT 60)
+
 # A `"role": "control"` .html design doc is an embeddable Control, not a window: it has
 # no Main/Show, so naming one as the project entry has to fail at formgen time
 # instead of linking a program with no entry point.

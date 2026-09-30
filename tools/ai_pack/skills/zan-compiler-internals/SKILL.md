@@ -209,12 +209,12 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   有意保留）。语义钉在 conformance 用例 ns_ambiguity_arity_filter。
   同族辟谣（B-ID39 撤案）：**「字段被同名导入类遮蔽」机制不存在**——checker
   裸名本就字段优先，生成字段 `Menu` 与 Gui.Widget.Menu 同名相安无事，插桩
-  实证传入 App.html 后原样全绿。那类 "'Menu' has no member 'visible'" 一枝
-  独秀的成员错，真因是 **zanc 不自动发现入口旁的 .html 设计稿**：漏传时
-  生成字段全部缺席，裸名 `Menu` 经"全库唯一简单名"兜底命中同名类型，报出
-  这条误导性成员错（其余 undeclared 群在 checker 静默、要等 irgen 才冒，
-  所以它独占输出）。撞到别修名字解析——先核对设计稿/生成输入在不在编译
-  输入里。
+  实证传入 App.html 后原样全绿。那类一枝独秀的成员错，真因是 **zanc 不自动
+  发现入口旁的 .html 设计稿**：漏传时生成字段全部缺席，裸名 `Menu` 经"全库
+  唯一简单名"兜底命中同名类型，报 no member——修后消息直接印全限定类型名
+  （`type 'Gui.Widget.Menu' has no member 'visible'`），错误里出现导入类型
+  全名即命中兜底（其余 undeclared 群在 checker 静默、要等 irgen 才冒，所以
+  它独占输出）。撞到别修名字解析——先核对设计稿/生成输入在不在编译输入里。
 - **stdlib 输入自我遮蔽坑（2026-09-16，datatable 5 例红）**：显式传入的
   stdlib 文件在 entry 循环被打 `user_decl`（本意：用户文件遮蔽 stdlib
   同名类，防冲突改名），结果它自己写全的 `DataTable.CellTextRouted` 调用头
