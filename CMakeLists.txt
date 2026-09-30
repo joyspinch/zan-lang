@@ -611,6 +611,15 @@ endif()
 option(ZAN_BUILD_GUI "Build the native zan_gui runtime library" ON)
 set(ZAN_GUI_AVAILABLE FALSE)
 if(ZAN_BUILD_GUI)
+    # B-ID23: gui_runtime.c mirrors ABI decisions that live in zanc's emission
+    # logic (object/string layout, calling conventions, reflection protocol),
+    # not in any C header ninja could track. A zanc-only rebuild therefore
+    # used to leave a stale-generation zan_gui.dll in build/ (GUI exes hung in
+    # App.PumpGuarded). Pinning the zanc executable as a compile dependency of
+    # both sources forces a same-generation recompile whenever zanc relinks --
+    # two files, a few seconds.
+    set_source_files_properties(src/runtime/gui_runtime.c src/runtime/gui_runtime_dwrite.cpp
+        PROPERTIES OBJECT_DEPENDS "${CMAKE_BINARY_DIR}/zanc${CMAKE_EXECUTABLE_SUFFIX}")
     if(WIN32)
         # gui_runtime_dwrite.cpp: DirectWrite glyph fallback (color emoji).
         # C++ because the SDK's dwrite.h only parses as C++; the rest of the

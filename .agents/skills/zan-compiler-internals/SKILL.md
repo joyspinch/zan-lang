@@ -2591,3 +2591,18 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
 - 排除自身编译器改动干扰的快捷 A/B：dist/win-x64/toolchain/zanc.exe 是上一轮
   publish 的编译器快照，把它拷到 build/zanc.exe 跑同一构建（IDE_NO_PUBLISH=1），
   同错 ⇒ 非新编译器回归。用完恢复原 zanc。
+
+## 构建代际联动：gui_runtime 的 ABI 由 zanc 发射侧决定，ninja 追不到（B-ID23，2026-09-30）
+
+- 坑：gui_runtime.c（zan_gui.dll 的源）镜像的 ABI 决策活在 zanc 的发射逻辑里
+  （对象/串布局、调用约定、反射协议），**不在任何 C 头里**——ninja 的依赖追踪
+  只覆盖 C 源/头。zanc 单独重链（如编译器加固批）后，gui_runtime.c "未变"
+  不重编，build/ 里留下旧代际 zan_gui.dll：新 zanc 编出的 GUI exe 挂死
+  App.PumpGuarded（窗口活着、零 stdout、异常被吞内存环），且错配随构建状态
+  漂移、时好时坏，极难定位。
+- 修法：`set_source_files_properties(gui_runtime.c gui_runtime_dwrite.cpp
+  PROPERTIES OBJECT_DEPENDS "<build>/zanc.exe")`——把 zanc 可执行文件钉成
+  编译依赖，zanc 重链即同代强制重编（两个文件，秒级）。机制自检：touch
+  build/zanc.exe 后 build zan_gui 必须出现 gui_runtime 重编行。
+- 同型问题举一反三：凡"C 侧手抄镜像发射侧契约"的文件（自研运行时、驱动、
+  生成器宿主）都照此钉住生成器可执行文件，别指望源码 diff 触发重编。
