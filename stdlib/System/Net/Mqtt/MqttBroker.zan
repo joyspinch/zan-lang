@@ -6,6 +6,16 @@ using System.Json;
 
 namespace System.Net.Mqtt;
 
+/// <summary>会话订阅的主题过滤器及授予的 QoS 实体记录。</summary>
+class MqttSubscription {
+    string filter;
+    int qos;
+    MqttSubscription(string filter, int qos) {
+        this.filter = filter;
+        this.qos = qos;
+    }
+}
+
 /// <summary>broker 持有的单个已连接 MQTT 客户端会话：其套接字、客户端 id
 /// 与当前生效的主题过滤器。</summary>
 class MqttSession {
@@ -13,8 +23,7 @@ class MqttSession {
     nint sock;
     string clientId;
     string addr;
-    List<string> filters;
-    List<int> qos;
+    List<MqttSubscription> subscriptions;
     bool alive;
     bool connected;
     int connectedAt;
@@ -38,8 +47,7 @@ class MqttSession {
         this.sock = sock;
         this.clientId = "";
         this.addr = "";
-        this.filters = new List<string>();
-        this.qos = new List<int>();
+        this.subscriptions = new List<MqttSubscription>();
         this.alive = true;
         this.connected = false;
         this.connectedAt = 0;
@@ -335,7 +343,7 @@ class MqttBroker {
     // ---- 报文构建器 ----
 
     /// 构建 QoS 0 的 PUBLISH 报文（固定头 + varint 剩余长度 +
-    /// 2 字节主题长度 + 主题 + 载荷；载荷可含 NUL，按 len 精确拷贝）。
+    /// 2 字节主题长度 + 主题 + 载荷；载荷可含 NUL，按 len 原生内存精确拷贝）。
     static byte[] BuildPublish(string topic, string payload, int payloadLen) {
         int topicLen = (int)strlen(topic);
         int remainLen = 2 + topicLen + payloadLen;
@@ -361,16 +369,48 @@ class MqttBroker {
         offset = offset + 1;
         packet[offset] = (byte)(topicLen & 255);
         offset = offset + 1;
-        int i = 0;
-        for (; i < topicLen; i = i + 1) {
-            packet[offset] = (byte)topic[i];
-            offset = offset + 1;
+        if (topicLen > 0) {
+            NativeMemory.PutString((nint)packet, offset, topic, topicLen);
+            offset = offset + topicLen;
         }
-        i = 0;
-        while (i < payloadLen) {
-            packet[offset] = (byte)payload[i];
+        if (payloadLen > 0 && payload != null) {
+            NativeMemory.PutString((nint)packet, offset, payload, payloadLen);
+            offset = offset + payloadLen;
+        }
+        return packet;
+    }
+
+    /// 构建 QoS 0 的 PUBLISH 报文（原生 byte[] 载荷，零中转字符串拷贝）。
+    static byte[] BuildPublishBytes(string topic, byte[] payload, int pOffset, int payloadLen) {
+        int topicLen = (int)strlen(topic);
+        int remainLen = 2 + topicLen + payloadLen;
+        byte[] packet = new byte[remainLen + 5];
+        int offset = 0;
+        packet[offset] = (byte)(MqttPacketType.PUBLISH << 4);
+        offset = offset + 1;
+        int rl = remainLen;
+        while (true) {
+            int digit = rl & 127;
+            rl = rl >> 7;
+            if (rl > 0) {
+                packet[offset] = (byte)(digit | 128);
+            } else {
+                packet[offset] = (byte)digit;
+            }
             offset = offset + 1;
-            i = i + 1;
+            if (rl == 0) { break; }
+        }
+        packet[offset] = (byte)((topicLen >> 8) & 255);
+        offset = offset + 1;
+        packet[offset] = (byte)(topicLen & 255);
+        offset = offset + 1;
+        if (topicLen > 0) {
+            NativeMemory.PutString((nint)packet, offset, topic, topicLen);
+            offset = offset + topicLen;
+        }
+        if (payloadLen > 0 && payload != null) {
+            NativeMemory.Copy((nint)packet + (nint)offset, (nint)payload + (nint)pOffset, payloadLen);
+            offset = offset + payloadLen;
         }
         return packet;
     }
@@ -437,8 +477,8 @@ class MqttBroker {
             MqttSession sess = this.sessions[i];
             if (sess.alive) {
                 bool match = false;
-                for (int j = 0; j < sess.filters.Count; j = j + 1) {
-                    if (TopicMatches(sess.filters[j], topic)) { match = true; break; }
+                for (int j = 0; j < sess.subscriptions.Count; j = j + 1) {
+                    if (TopicMatches(sess.subscriptions[j].filter, topic)) { match = true; break; }
                 }
                 if (match) {
                     int n = await Socket.SendAsync(sess.sock, packet, packetLen);
@@ -528,8 +568,8 @@ class MqttBroker {
 
     /// 该会话的任一过滤器是否匹配主题。
     bool Matches(MqttSession sess, string topic) {
-        for (int j = 0; j < sess.filters.Count; j = j + 1) {
-            if (TopicMatches(sess.filters[j], topic)) { return true; }
+        for (int j = 0; j < sess.subscriptions.Count; j = j + 1) {
+            if (TopicMatches(sess.subscriptions[j].filter, topic)) { return true; }
         }
         return false;
     }
@@ -556,7 +596,7 @@ class MqttBroker {
     int SubsTotal() {
         int n = 0;
         for (int i = 0; i < this.sessions.Count; i = i + 1) {
-            n = n + this.sessions[i].filters.Count;
+            n = n + this.sessions[i].subscriptions.Count;
         }
         return n;
     }
@@ -572,7 +612,7 @@ class MqttBroker {
             o.addr = c.addr;
             o.connected_at = c.connectedAt;
             o.keepalive = c.keepAlive;
-            o.subs = c.filters.Count;
+            o.subs = c.subscriptions.Count;
             o.msgs_in = c.msgsIn;
             o.msgs_out = c.msgsOut;
             outp.Add(o);
@@ -593,12 +633,10 @@ class MqttBroker {
                 o.msgs_in = c.msgsIn;
                 o.msgs_out = c.msgsOut;
                 o.subscriptions = new List<MqttSubDoc>();
-                for (int j = 0; j < c.filters.Count; j = j + 1) {
+                for (int j = 0; j < c.subscriptions.Count; j = j + 1) {
                     MqttSubDoc f = new MqttSubDoc();
-                    f.filter = c.filters[j];
-                    int q = 0;
-                    if (j < c.qos.Count) { q = c.qos[j]; }
-                    f.qos = q;
+                    f.filter = c.subscriptions[j].filter;
+                    f.qos = c.subscriptions[j].qos;
                     o.subscriptions.Add(f);
                 }
                 return Json.Serialize<MqttClientDetailDoc>(o);
@@ -612,13 +650,11 @@ class MqttBroker {
         List<MqttSubEntryDoc> outp = new List<MqttSubEntryDoc>();
         for (int i = 0; i < this.sessions.Count; i = i + 1) {
             MqttSession c = this.sessions[i];
-            for (int j = 0; j < c.filters.Count; j = j + 1) {
+            for (int j = 0; j < c.subscriptions.Count; j = j + 1) {
                 MqttSubEntryDoc o = new MqttSubEntryDoc();
                 o.client_id = c.clientId;
-                o.filter = c.filters[j];
-                int q = 0;
-                if (j < c.qos.Count) { q = c.qos[j]; }
-                o.qos = q;
+                o.filter = c.subscriptions[j].filter;
+                o.qos = c.subscriptions[j].qos;
                 outp.Add(o);
             }
         }
@@ -844,7 +880,7 @@ class MqttBroker {
                 if (remainLen < 2) { break; }   // 包标识 2 字节
                 // 订阅已满时仍要走完解析并回 SUBACK（0x80 = 失败），
                 // 直接断连会违反协议；先记住配额是否已用尽。
-                bool quotaExceeded = sess.filters.Count >= maxFilters;
+                bool quotaExceeded = sess.subscriptions.Count >= maxFilters;
                 int pid = ((body[0] & 255) << 8) + (body[1] & 255);
                 // 主题过滤器：（2 字节长度 + 过滤器 + 1 字节 qos）*
                 int offset = 2;
@@ -871,18 +907,17 @@ class MqttBroker {
                     // 重复过滤器按协议替换 QoS 而非追加，否则同一
                     // 过滤器在会话里越积越多，扇出时重复投递。
                     bool replaced = false;
-                    for (int e = 0; e < sess.filters.Count; e = e + 1) {
-                        if (sess.filters[e] == filter) {
-                            if (e < sess.qos.Count) { sess.qos[e] = reqQos; }
+                    for (int e = 0; e < sess.subscriptions.Count; e = e + 1) {
+                        if (sess.subscriptions[e].filter == filter) {
+                            sess.subscriptions[e].qos = reqQos;
                             replaced = true;
                             break;
                         }
                     }
                     if (!replaced) {
-                        sess.filters.Add(filter);
-                        sess.qos.Add(reqQos);
+                        sess.subscriptions.Add(new MqttSubscription(filter, reqQos));
                         newlySubscribedFilters.Add(filter);
-                        if (sess.filters.Count >= maxFilters) {
+                        if (sess.subscriptions.Count >= maxFilters) {
                             quotaExceeded = true;
                         }
                     }
@@ -923,10 +958,9 @@ class MqttBroker {
                     string filter = body.ToStr(offset, fLen);
                     offset = offset + fLen;
                     int k = 0;
-                    while (k < sess.filters.Count) {
-                        if (sess.filters[k] == filter) {
-                            sess.filters.RemoveAt(k);
-                            if (k < sess.qos.Count) { sess.qos.RemoveAt(k); }
+                    while (k < sess.subscriptions.Count) {
+                        if (sess.subscriptions[k].filter == filter) {
+                            sess.subscriptions.RemoveAt(k);
                         } else {
                             k = k + 1;
                         }

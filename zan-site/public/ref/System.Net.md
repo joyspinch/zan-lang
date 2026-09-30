@@ -389,6 +389,8 @@ event loop on this process's coroutine scheduler -- no child processes.
 
 - static bool stopping=false;
 
+- static List<ShutdownHook> shutdownHooks=new List<ShutdownHook>();
+
 - static List<TcpClient> ctlConn=new List<TcpClient>();
 
 - static List<int> ctlWid=new List<int>();
@@ -867,6 +869,18 @@ event loop on this process's coroutine scheduler -- no child processes.
     the grace period is over), so a stop/reload does not cut off a response
     that is halfway out.
 
+- static async void RunShutdownHooks()
+  - Runs the registered shutdown hooks (Worker.OnShutdown) in
+    order. User code is not trusted: a throwing hook logs and the rest
+    still run, and the process still exits.
+
+- static void OnShutdown(ShutdownHook hook)
+  - Registers a callback for the end-of-drain shutdown path (see
+    ShutdownHook). Hooks run in registration order after the last in-flight
+    connection finished (or the 30s grace period expired) and before
+    exit(0), on every stop path (single-process STOP, worker QUIT, and the
+    master's own stop).
+
 - static async void RunAsWorkerProcess()
   - worker 进程入口：向 master 的控制端口发 HELLO 注册。Windows 上为每个
     TCP listener 开一条 CHAN 交接通道并服务 master 递来的 socket；POSIX 上
@@ -1255,6 +1269,19 @@ accept + WSADuplicateSocket handoff + supervision while keeping its own
 request pipeline. Async so it can await I/O.
 
 `delegate void RawConnHandler(nint sock);`
+
+
+## void (delegate)
+
+Invoked once a stop has drained (the in-flight connections are
+done, or the 30s grace period expired), just before the process exits.
+Register with Worker.OnShutdown to flush in-memory buffers (metric
+windows, log queues, ...) so a stop does not lose the last flush window.
+Runs on every stop path: the single-process STOP command, the master's
+QUIT to a worker, and the master's own stop. Async so it can await
+I/O.
+
+`delegate void ShutdownHook();`
 
 
 ## void (delegate)

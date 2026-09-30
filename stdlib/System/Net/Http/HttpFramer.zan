@@ -266,8 +266,12 @@ class HttpFramer {
     }
 
     /// <summary>流式将请求体分块直接落盘，避免超大正文（如 GB 级上传）引发 OOM。
+    /// 支持 Content-Length 与 Transfer-Encoding: chunked 两大传输定界，
     /// 内存仅占用当前分块缓冲区（<=64KB），落盘完成后保留后续流水线请求字节。</summary>
     async int SaveBodyToFile(HttpRequest req, string filePath, int maxBytes) {
+        if (req.chunked) {
+            return await this.SaveChunkedBodyToFile(req, filePath, maxBytes);
+        }
         int he = req.bodyStart;
         int total = req.contentLength;
         if (total <= 0) { this.wireBytes = he; return 0; }
@@ -318,6 +322,119 @@ class HttpFramer {
 
         fs.Flush();
         fs.Close();
+        this.wireBytes = 0;
+        return 0;
+    }
+
+    /// <summary>流式将 chunked 编码的请求体直接落盘，避免超大 chunked 正文占用堆内存。
+    /// 每解码一个 chunk 直接写盘并 Discard，内存恒定在当前 chunk 大小以内。</summary>
+    async int SaveChunkedBodyToFile(HttpRequest req, string filePath, int maxBytes) {
+        int pos = req.bodyStart;
+        int decoded = 0;
+        FileStream fs = FileStream.OpenWrite(filePath);
+        while (true) {
+            int scan = pos;
+            int lf = this.IndexOfLf(scan);
+            while (lf < 0) {
+                if (this.pend.Length() - pos >= 8193) {
+                    fs.Close();
+                    File.Delete(filePath);
+                    return 400;
+                }
+                scan = this.pend.Length();
+                int n = await this.FillTo(pos + 8194);
+                if (n < 0) { fs.Close(); File.Delete(filePath); return 400; }
+                if (n == 0) { fs.Close(); File.Delete(filePath); return -1; }
+                lf = this.IndexOfLf(scan);
+            }
+            if (lf - pos > 8192 || lf == pos || this.pend.ByteAt(lf - 1) != 13) {
+                fs.Close();
+                File.Delete(filePath);
+                return 400;
+            }
+            long size = 0;
+            int i = pos;
+            bool any = false;
+            bool bad = false;
+            while (i < lf) {
+                int c = this.pend.ByteAt(i);
+                if (c == 13) {
+                    if (i == lf - 1) { break; }
+                    bad = true; break;
+                }
+                if (c == 59) { break; }
+                int d = HttpFramer.HexVal(c);
+                if (d < 0) { bad = true; break; }
+                if (size > ((long)maxBytes - (long)d) / 16) {
+                    fs.Close();
+                    File.Delete(filePath);
+                    return 413;
+                }
+                size = size * 16 + (long)d;
+                any = true;
+                i = i + 1;
+            }
+            if (bad || !any) {
+                fs.Close();
+                File.Delete(filePath);
+                return 400;
+            }
+            for (int j = i; j < lf - 1; j = j + 1) {
+                int extByte = this.pend.ByteAt(j);
+                if (extByte == 13 || extByte == 10 || extByte == 0 || extByte == 127) {
+                    fs.Close();
+                    File.Delete(filePath);
+                    return 400;
+                }
+            }
+            pos = lf + 1;
+            if (size == 0) {
+                int end = await this.SkipTrailer(pos);
+                if (end < 0) {
+                    fs.Close();
+                    File.Delete(filePath);
+                    return end == -2 ? 400 : -1;
+                }
+                pos = end;
+                break;
+            }
+            if (size > (long)maxBytes - decoded) {
+                fs.Close();
+                File.Delete(filePath);
+                return 413;
+            }
+            while (this.pend.Length() - pos < size + 2) {
+                int n = await this.FillTo(pos + (int)size + 2);
+                if (n < 0) { fs.Close(); File.Delete(filePath); return 400; }
+                if (n == 0) { fs.Close(); File.Delete(filePath); return -1; }
+            }
+            int chunk = (int)size;
+            int w = fs.WriteFromAll(this.pend.Raw() + (nint)pos, chunk);
+            if (w < chunk) {
+                fs.Close();
+                File.Delete(filePath);
+                return -1;
+            }
+            decoded = decoded + chunk;
+            pos = pos + chunk;
+            int c1 = this.pend.ByteAt(pos);
+            int c2 = this.pend.ByteAt(pos + 1);
+            if (c1 != 13 || c2 != 10) {
+                fs.Close();
+                File.Delete(filePath);
+                return 400;
+            }
+            pos = pos + 2;
+            this.pend.Discard(pos);
+            pos = 0;
+            this.scanned = 0;
+        }
+        fs.Flush();
+        fs.Close();
+        req.contentLength = decoded;
+        req.bodyLength = decoded;
+        this.pend.Discard(pos);
+        this.scanned = 0;
         this.wireBytes = 0;
         return 0;
     }

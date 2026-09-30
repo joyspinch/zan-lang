@@ -185,6 +185,15 @@ class FwdChannel {
     }
 }
 
+class FwdPooledItem {
+    FwdChannel ch;
+    long expiry;
+    FwdPooledItem(FwdChannel ch, long expiry) {
+        this.ch = ch;
+        this.expiry = expiry;
+    }
+}
+
 /// <summary>
 /// 上游连接池：转发器只有一个上游（host:port + 是否 TLS），因此
 /// 池子不需要键，一条空闲链路对下一个请求总是可用的。
@@ -199,12 +208,11 @@ class FwdChannel {
 /// （无正文的请求换新连接重发一次）。
 ///
 /// 池表是转发器实例级的，而连接协程可能落在不同 worker 线程上，
-/// 因此每处访问都在 <c>lock (idle)</c> 内；临界区里只有列表操作与
+/// 因此每处访问都在 <c>lock (items)</c> 内；临界区里只有列表操作与
 /// 关闭套接字，不含 await。
 /// </summary>
 class FwdPool {
-    List<FwdChannel> idle;
-    List<long> expiry;
+    List<FwdPooledItem> items;
     int maxIdle;
     int idleMs;
     long hits;
@@ -213,8 +221,7 @@ class FwdPool {
     /// <summary>创建空池：空闲链路上限 <paramref name="maxIdle"/> 条、
     /// 空闲存活 <paramref name="idleMs"/> 毫秒。</summary>
     FwdPool(int maxIdle, int idleMs) {
-        this.idle = new List<FwdChannel>();
-        this.expiry = new List<long>();
+        this.items = new List<FwdPooledItem>();
         this.maxIdle = maxIdle;
         this.idleMs = idleMs;
         this.hits = 0;
@@ -223,21 +230,19 @@ class FwdPool {
 
     /// <summary>取一条可用的空闲链路，没有则返回 null（调用方新建）。</summary>
     FwdChannel Take() {
-        lock (idle) {
+        lock (items) {
             long now = Stopwatch.GetMilliseconds();
-            while (this.idle.Count > 0) {
-                int last = this.idle.Count - 1;
-                FwdChannel ch = this.idle[last];
-                long exp = this.expiry[last];
-                this.idle.RemoveAt(last);
-                this.expiry.RemoveAt(last);
-                if (now > exp || ch.IsClosed()
-                    || !Socket.IsOpen(ch.Sock())
-                    || Socket.IsReadable(ch.Sock())) {
-                    ch.Close();
+            while (this.items.Count > 0) {
+                int last = this.items.Count - 1;
+                FwdPooledItem it = this.items[last];
+                this.items.RemoveAt(last);
+                if (now > it.expiry || it.ch.IsClosed()
+                    || !Socket.IsOpen(it.ch.Sock())
+                    || Socket.IsReadable(it.ch.Sock())) {
+                    it.ch.Close();
                 } else {
                     this.hits = this.hits + 1;
-                    return ch;
+                    return it.ch;
                 }
             }
             this.misses = this.misses + 1;
@@ -250,24 +255,22 @@ class FwdPool {
     void Give(FwdChannel ch) {
         if (ch == null) { return; }
         if (ch.IsClosed()) { return; }
-        lock (idle) {
-            if (this.idle.Count >= this.maxIdle) {
+        lock (items) {
+            if (this.items.Count >= this.maxIdle) {
                 ch.Close();
                 return;
             }
-            this.idle.Add(ch);
-            this.expiry.Add(Stopwatch.GetMilliseconds() + (long)this.idleMs);
+            this.items.Add(new FwdPooledItem(ch, Stopwatch.GetMilliseconds() + (long)this.idleMs));
         }
     }
 
     /// <summary>关闭所有空闲链路（转发器停止时调用）。</summary>
     void CloseAll() {
-        lock (idle) {
-            for (int i = 0; i < this.idle.Count; i = i + 1) {
-                this.idle[i].Close();
+        lock (items) {
+            for (int i = 0; i < this.items.Count; i = i + 1) {
+                this.items[i].ch.Close();
             }
-            this.idle.Clear();
-            this.expiry.Clear();
+            this.items.Clear();
         }
     }
 
@@ -279,8 +282,8 @@ class FwdPool {
 
     /// <summary>当前空闲链路数。</summary>
     int IdleCount() {
-        lock (idle) {
-            return this.idle.Count;
+        lock (items) {
+            return this.items.Count;
         }
     }
 }

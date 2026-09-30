@@ -2,11 +2,13 @@ using System;
 using System.IO;
 using System.Net.Http;
 using System.Net.Http.Client;
+using System.Net.Http.Proxy;
 using System.Net.Mqtt;
 using System.Net.WebSocket;
 using System.Net.Sip;
 using System.Net.Sockets;
 using System.Net.Modbus;
+using System.Net.WebDav;
 using System.Collections.Generic;
 
 class Program {
@@ -339,6 +341,75 @@ class Program {
         Console.WriteLine("http 64bit headers and download ok");
     }
 
+    static void TestFwdPoolAndWebDav() {
+        FwdPool pool = new FwdPool(10, 5000);
+        if (pool.IdleCount() != 0 || pool.Hits() != 0 || pool.Misses() != 0) {
+            Console.WriteLine("FAIL: FwdPool init");
+            Environment.Exit(31);
+        }
+        WebDavClient wd = new WebDavClient("127.0.0.1", 8080);
+        Console.WriteLine("fwd pool and webdav ok");
+    }
+
+    static void TestUdpRawBytesAndSipHeaders() {
+        UdpClient udp = new UdpClient();
+        byte[] raw = new byte[8];
+        raw[0] = 42; raw[1] = 0; raw[2] = 255; raw[3] = 0;
+        udp.Close();
+
+        SipMessage sip = SipMessage.Request("INVITE", "sip:user@test.local");
+        sip.Add("Call-ID", "audit-12345");
+        sip.Add("CSeq", "1 INVITE");
+        if (sip.Header("Call-ID") != "audit-12345" || sip.Header("cseq") != "1 INVITE") {
+            Console.WriteLine("FAIL: SipMessage header retrieval");
+            Environment.Exit(32);
+        }
+        string wire = sip.Serialize();
+        SipMessage parsed = SipMessage.Parse(wire);
+        if (parsed == null || parsed.Header("call-id") != "audit-12345") {
+            Console.WriteLine("FAIL: SipMessage serialize and parse");
+            Environment.Exit(33);
+        }
+        Console.WriteLine("udp raw bytes and sip headers ok");
+    }
+
+    static async Task TestSaveChunkedBodyToFile() {
+        HttpFramer framer = HttpFramer.Create(-1);
+        string chunkedPkt = "POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+            + "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        framer.Prime(chunkedPkt, chunkedPkt.Length);
+        int headEnd = await framer.ReadHead(4096);
+        HttpRequest req = HttpRequest.Parse(framer.Head(headEnd), headEnd);
+        string tmpFile = "chunked_save_test.tmp";
+        int res = await framer.SaveBodyToFile(req, tmpFile, 65536);
+        if (res != 0) {
+            Console.WriteLine("FAIL: SaveBodyToFile chunked res=" + Convert.ToString(res));
+            Environment.Exit(34);
+        }
+        string content = File.ReadAllText(tmpFile);
+        File.Delete(tmpFile);
+        if (content != "hello world") {
+            Console.WriteLine("FAIL: SaveBodyToFile content: " + content);
+            Environment.Exit(35);
+        }
+        framer.Dispose();
+        Console.WriteLine("save chunked body to file ok");
+    }
+
+    static void TestHttp2AndSse() {
+        byte[] rst = Http2Frame.BuildRstStream(3, Http2Error.CANCEL);
+        if (rst.Length != 13 || rst[3] != Http2FrameType.RST_STREAM || rst[8] != 3) {
+            Console.WriteLine("FAIL: http2 rst stream");
+            Environment.Exit(36);
+        }
+        Http2Frame decoded = Http2Frame.DecodeHeader(rst, 0);
+        if (decoded == null || decoded.length != 4 || decoded.type != Http2FrameType.RST_STREAM || decoded.streamId != 3) {
+            Console.WriteLine("FAIL: http2 decode header");
+            Environment.Exit(37);
+        }
+        Console.WriteLine("http2 and sse ok");
+    }
+
     static async void Main() {
         TestMqttReaderMemory();
         TestHttpClientHost();
@@ -353,6 +424,10 @@ class Program {
         TestTcpClientFastBuffer();
         TestWsBinaryByteMasking();
         TestHttp64BitHeaderAndDownload();
+        TestFwdPoolAndWebDav();
+        TestUdpRawBytesAndSipHeaders();
+        await TestSaveChunkedBodyToFile();
+        TestHttp2AndSse();
         Console.WriteLine("ALL_PROTOCOL_AUDIT_OK");
     }
 }

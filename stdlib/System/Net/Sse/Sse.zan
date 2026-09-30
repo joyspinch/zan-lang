@@ -100,16 +100,35 @@ class SseConnection {
         }
         sb.Append("\n");
         string frame = sb.ToString();
-        // 循环直到整段写出：单次 send 在 TCP 背压下短写会把事件截成
-        // 半帧，下一个事件从中间开始，流就此错位。
         int total = frame.Length;
-        int sent = 0;
-        while (sent < total) {
-            string rest = frame.Substring(sent, total - sent);
-            int n = await this.client.SendAsync(rest);
-            if (n <= 0) { this.open = false; return n; }
-            sent = sent + n;
+        int n = await this.client.SendBytesAsync(frame, total);
+        if (n <= 0) { this.open = false; return n; }
+        return total;
+    }
+
+    /// <summary>发送具名事件，载荷为原生字节数组。</summary>
+    async int SendBytesAsync(string eventName, byte[] data, int dataOffset, int dataLen) {
+        StringBuilder sb = new StringBuilder();
+        if (eventName.Length > 0) {
+            sb.Append("event: ");
+            sb.Append(eventName);
+            sb.Append("\n");
         }
+        sb.Append("data: ");
+        int total = sb.Length + dataLen + 2;
+        byte[] frame = new byte[total + 1];
+        int off = 0;
+        string header = sb.ToString();
+        NativeMemory.PutString((nint)frame, off, header, header.Length);
+        off = off + header.Length;
+        if (dataLen > 0 && data != null) {
+            NativeMemory.Copy((nint)frame + (nint)off, (nint)data + (nint)dataOffset, dataLen);
+            off = off + dataLen;
+        }
+        frame[off] = 10;
+        frame[off + 1] = 10;
+        int n = await this.client.SendBytesAsync(frame, total);
+        if (n <= 0) { this.open = false; return n; }
         return total;
     }
 
@@ -243,7 +262,7 @@ class SseClient {
         SseEvent e = new SseEvent();
         bool any = false;
         int start = 0;
-        bool firstData = true;
+        StringBuilder dataSb = null;
         for (int i = 0; i <= block.Length; i = i + 1) {
             if (i == block.Length || (block[i] & 255) == 10) {
                 int lineEnd = i;
@@ -264,8 +283,13 @@ class SseClient {
                     }
                     if (field == "event") { e.name = val; any = true; }
                     else if (field == "data") {
-                        if (firstData) { e.data = val; firstData = false; }
-                        else { e.data = e.data + "\n" + val; }
+                        if (dataSb == null) {
+                            dataSb = new StringBuilder();
+                            dataSb.Append(val);
+                        } else {
+                            dataSb.Append("\n");
+                            dataSb.Append(val);
+                        }
                         any = true;
                     }
                     else if (field == "id") { e.id = val; any = true; }
@@ -273,6 +297,7 @@ class SseClient {
                 start = i + 1;
             }
         }
+        if (dataSb != null) { e.data = dataSb.ToString(); }
         if (!any) { return null; }
         return e;
     }

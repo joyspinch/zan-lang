@@ -359,6 +359,35 @@ class WorkerWs {
         }
     }
 
+    /// <summary>WebSocket 原始字节数组 push：零中转字符串拷贝与二进制安全。</summary>
+    static async bool PushBinary(Connection c, byte[] data, int offset, int len) {
+        if (data == null || offset < 0 || len <= 0 || offset + len > data.Length) { return false; }
+        WsLink link = WorkerWs.LinkOf(c.GetId());
+        if (link == null || c.IsClosed()) { return false; }
+        await link.LockAsync();
+        try {
+            if (c.IsClosed()) { return false; }
+            WsFrame frame = WsFrame.RawBytes(WsOpcode.Binary, data, offset, len);
+            byte[] encoded = frame.Encode();
+            link.writer.Append(encoded, WsFrame.HeaderLen(len) + len);
+            int n = await link.writer.Flush(link.client);
+            if (n < 0) {
+                c.Close();
+                return false;
+            }
+            Worker.BumpSent();
+            return true;
+        } finally {
+            link.Unlock();
+        }
+    }
+
+    /// <summary>WebSocket 原始字节数组 push 全量切片。</summary>
+    static async bool PushBinary(Connection c, byte[] data) {
+        int len = data != null ? data.Length : 0;
+        return await WorkerWs.PushBinary(c, data, 0, len);
+    }
+
     // ---- 帧循环 ----
 
     /// A WebSocket port is an HTTP port until the client asks to upgrade, so the

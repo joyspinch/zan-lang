@@ -38,6 +38,24 @@ class Http2Flags {
     public const int ACK = 1;
 }
 
+/// <summary>HTTP/2 标准错误码（RFC 7540 §7）。</summary>
+class Http2Error {
+    public const int NO_ERROR = 0;
+    public const int PROTOCOL_ERROR = 1;
+    public const int INTERNAL_ERROR = 2;
+    public const int FLOW_CONTROL_ERROR = 3;
+    public const int SETTINGS_TIMEOUT = 4;
+    public const int STREAM_CLOSED = 5;
+    public const int FRAME_SIZE_ERROR = 6;
+    public const int REFUSED_STREAM = 7;
+    public const int CANCEL = 8;
+    public const int COMPRESSION_ERROR = 9;
+    public const int CONNECT_ERROR = 10;
+    public const int ENHANCE_YOUR_CALM = 11;
+    public const int INADEQUATE_SECURITY = 12;
+    public const int HTTP_1_1_REQUIRED = 13;
+}
+
 class Http2Frame {
     /// <summary>HTTP/2 客户端连接序言（24 字节明文）。</summary>
     public static const string PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -72,8 +90,72 @@ class Http2Frame {
         return hdr;
     }
 
+    /// <summary>从字节数组指定偏移解码 9 字节固定帧头。</summary>
+    public static Http2Frame DecodeHeader(byte[] buf, int offset) {
+        if (buf == null || offset < 0 || offset + 9 > buf.Length) { return null; }
+        Http2Frame f = new Http2Frame();
+        f.length = ((buf[offset] & 255) << 16) | ((buf[offset + 1] & 255) << 8) | (buf[offset + 2] & 255);
+        f.type = buf[offset + 3] & 255;
+        f.flags = buf[offset + 4] & 255;
+        f.streamId = ((buf[offset + 5] & 127) << 24) | ((buf[offset + 6] & 255) << 16)
+                   | ((buf[offset + 7] & 255) << 8) | (buf[offset + 8] & 255);
+        return f;
+    }
+
     /// <summary>构造空的 SETTINGS 确认帧（ACK）。</summary>
     public static byte[] BuildSettingsAck() {
         return EncodeHeader(0, Http2FrameType.SETTINGS, Http2Flags.ACK, 0);
+    }
+
+    /// <summary>构造 RST_STREAM 帧（RFC 7540 §6.4，4 字节错误码载荷）。</summary>
+    public static byte[] BuildRstStream(int streamId, int errorCode) {
+        byte[] pkt = new byte[13];
+        byte[] hdr = EncodeHeader(4, Http2FrameType.RST_STREAM, 0, streamId);
+        NativeMemory.Copy((nint)pkt, (nint)hdr, 9);
+        pkt[9] = (byte)((errorCode >> 24) & 255);
+        pkt[10] = (byte)((errorCode >> 16) & 255);
+        pkt[11] = (byte)((errorCode >> 8) & 255);
+        pkt[12] = (byte)(errorCode & 255);
+        return pkt;
+    }
+
+    /// <summary>构造 GOAWAY 帧（RFC 7540 §6.8，连接级流 0，8 字节基础载荷）。</summary>
+    public static byte[] BuildGoAway(int lastStreamId, int errorCode) {
+        byte[] pkt = new byte[17];
+        byte[] hdr = EncodeHeader(8, Http2FrameType.GOAWAY, 0, 0);
+        NativeMemory.Copy((nint)pkt, (nint)hdr, 9);
+        pkt[9] = (byte)((lastStreamId >> 24) & 127);
+        pkt[10] = (byte)((lastStreamId >> 16) & 255);
+        pkt[11] = (byte)((lastStreamId >> 8) & 255);
+        pkt[12] = (byte)(lastStreamId & 255);
+        pkt[13] = (byte)((errorCode >> 24) & 255);
+        pkt[14] = (byte)((errorCode >> 16) & 255);
+        pkt[15] = (byte)((errorCode >> 8) & 255);
+        pkt[16] = (byte)(errorCode & 255);
+        return pkt;
+    }
+
+    /// <summary>构造 WINDOW_UPDATE 帧（RFC 7540 §6.9，4 字节窗口增量载荷）。</summary>
+    public static byte[] BuildWindowUpdate(int streamId, int windowSizeIncrement) {
+        byte[] pkt = new byte[13];
+        byte[] hdr = EncodeHeader(4, Http2FrameType.WINDOW_UPDATE, 0, streamId);
+        NativeMemory.Copy((nint)pkt, (nint)hdr, 9);
+        pkt[9] = (byte)((windowSizeIncrement >> 24) & 127);
+        pkt[10] = (byte)((windowSizeIncrement >> 16) & 255);
+        pkt[11] = (byte)((windowSizeIncrement >> 8) & 255);
+        pkt[12] = (byte)(windowSizeIncrement & 255);
+        return pkt;
+    }
+
+    /// <summary>构造 PING 帧（RFC 7540 §6.7，8 字节透明载荷）。</summary>
+    public static byte[] BuildPing(byte[] opaqueData8, bool ack) {
+        byte[] pkt = new byte[17];
+        int flags = ack ? Http2Flags.ACK : 0;
+        byte[] hdr = EncodeHeader(8, Http2FrameType.PING, flags, 0);
+        NativeMemory.Copy((nint)pkt, (nint)hdr, 9);
+        if (opaqueData8 != null && opaqueData8.Length >= 8) {
+            NativeMemory.Copy((nint)pkt + 9, (nint)opaqueData8, 8);
+        }
+        return pkt;
     }
 }

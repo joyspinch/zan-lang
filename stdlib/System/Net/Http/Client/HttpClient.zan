@@ -1495,10 +1495,36 @@ class HttpClient {
             HttpClient.SendBytesOnceAsync);
     }
 
-    /// <summary>发送原始字节数组（带显式字节长度，二进制安全，可含 NUL 字节）。</summary>
+    /// <summary>发送原始字节数组（带显式字节长度，二进制安全，零中转字符串拷贝）。</summary>
     async HttpResponse SendBytesAsync(string method, string path, byte[] body, int bodyLen) {
-        string s = body != null && bodyLen > 0 ? body.ToStr(0, bodyLen) : "";
-        return await this.SendBytesAsync(method, path, s, bodyLen);
+        this.ResetTotalBudget();
+        this.CheckRequestLimit((long)bodyLen);
+        this.CheckTargetPolicy();
+        HttpResponse direct = await HttpClient.SendBytesOnceWithRawBytesAsync(this,
+            method, path, body, bodyLen);
+        return direct;
+    }
+
+    /// <summary>流式上传本地文件作为请求正文（适用于 PUT / POST 原始文件上传，如 WebDAV、对象存储等），
+    /// 单句柄 64KB 流式直发，零中转整文件内存分配，支持超 2GB 大文件。</summary>
+    async HttpResponse UploadFileRawAsync(string method, string path, string localPath, string contentType) {
+        long fileLen = File.GetSize64(localPath);
+        if (fileLen < 0) {
+            throw new FileNotFoundException("Could not open file: " + localPath);
+        }
+        this.ResetTotalBudget();
+        this.CheckTargetPolicy();
+        this.CheckRequestLimit(fileLen);
+        if (contentType != null && contentType.Length > 0 && !this.HasHeaderName("Content-Type")) {
+            this.SetHeader("Content-Type", contentType);
+        }
+        HttpResponse resp;
+        if (this.useTls) {
+            resp = await this.SendBytesBodyTlsAsync(method, path, "", localPath, fileLen, "", fileLen);
+        } else {
+            resp = await this.SendBytesBodyAsync(method, path, "", localPath, fileLen, "", fileLen);
+        }
+        return resp;
     }
 
     /// 一次真实上线：SendBytesAsync 的无重定向主体，同时作为
@@ -1508,6 +1534,37 @@ class HttpClient {
             string method, string path, string body) {
         int bodyLen = body != null ? body.Length : 0;
         return await HttpClient.SendBytesOnceWithLenAsync(client, method, path, body, bodyLen);
+    }
+
+    static async HttpResponse SendBytesOnceWithRawBytesAsync(HttpClient client,
+            string method, string path, byte[] body, int bodyLen) {
+        if (client.useTls) {
+            HttpResponse tResp = await client.SendBytesTlsWithRawBytesAsync(method, path,
+                                                                body, bodyLen);
+            return tResp;
+        }
+        TcpClient conn = await client.ConnectTarget();
+        if (conn == null) { client.FailConnect(); }
+        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), client.WriteBudget(), client.TotalBudget());
+        string reqHead = client.BuildRequestHead(method, path, (long)bodyLen, true);
+        int _sent = await conn.SendBytesAsync(reqHead, reqHead.Length);
+        if (_sent != reqHead.Length) {
+            HttpDeadline.Disarm(watch);
+            conn.Close();
+            throw new HttpRequestException("request write failed");
+        }
+        if (bodyLen > 0 && body != null) {
+            int _b = await conn.SendBytesAsync(body, bodyLen);
+            if (_b != bodyLen) {
+                HttpDeadline.Disarm(watch);
+                conn.Close();
+                throw new HttpRequestException("request body write failed");
+            }
+        }
+        HttpDeadline.Touch(watch, client.ReadBudget());
+        HttpResponse resp = await client.ReadFramedResponse(conn, path, method,
+                                                          watch, null, null);
+        return resp;
     }
 
     static async HttpResponse SendBytesOnceWithLenAsync(HttpClient client,
@@ -1746,6 +1803,67 @@ class HttpClient {
         }
         if (bodyLen > 0 && body != null) {
             int _b = await stream.SendAsync(body, bodyLen);
+            if (_b != bodyLen) {
+                HttpDeadline.Disarm(watch);
+                stream.Close();
+                conn.Close();
+                ctx.Free();
+                throw new HttpRequestException("request body write failed");
+            }
+        }
+        HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
+                                                          watch, stream, ctx);
+        return resp;
+    }
+
+    async HttpResponse SendBytesTlsWithRawBytesAsync(string method, string path,
+                                                    byte[] body, int bodyLen) {
+        Socket.Initialize();
+        TcpClient conn = await this.ConnectTarget();
+        if (conn == null) { FailConnect(); }
+        TlsContext ctx;
+        if (this.clientCertificateFile.Length > 0
+            && this.clientPrivateKeyFile.Length > 0) {
+            ctx = TlsContext.CreateClientWithCertificate(
+                this.clientCertificateFile, this.clientPrivateKeyFile);
+        } else {
+            ctx = TlsContext.CreateClient();
+        }
+        if (ctx != null && this.certPolicy != null) {
+            ctx.SetCertPolicy(this.certPolicy);
+        }
+        if (ctx == null) {
+            conn.Close();
+            string tlsError = TlsStream.LastError();
+            if (tlsError == "") { tlsError = "TLS 上下文初始化失败"; }
+            throw new HttpRequestException(tlsError);
+        }
+        if (!this.verifyTls) {
+            ctx.DisableVerify();
+        }
+        this.ApplyPinning(ctx);
+        TlsStream stream = await this.ConnectTls(ctx, conn.Sock());
+        if (stream == null) {
+            conn.Close();
+            ctx.Free();
+            string tlsHandshakeError = TlsStream.LastError();
+            if (tlsHandshakeError == "") {
+                tlsHandshakeError = "TLS 握手失败";
+            }
+            throw new HttpRequestException(tlsHandshakeError);
+        }
+        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
+        string reqHead = this.BuildRequestHead(method, path, (long)bodyLen, true);
+        int _sent = await stream.SendAsync(reqHead, reqHead.Length);
+        if (_sent != reqHead.Length) {
+            HttpDeadline.Disarm(watch);
+            stream.Close();
+            conn.Close();
+            ctx.Free();
+            throw new HttpRequestException("request write failed");
+        }
+        if (bodyLen > 0 && body != null) {
+            int _b = await stream.SendBytesAsync(body, bodyLen);
             if (_b != bodyLen) {
                 HttpDeadline.Disarm(watch);
                 stream.Close();
@@ -3150,6 +3268,20 @@ class HttpClient {
     /// <see cref="SetCancelProbe"/> 的探针并在下载中路取消时返回 -2
     /// （已收字节保留在 <paramref name="localPath"/>，可续传）。绑定了
     /// <see cref="ExternalCallPolicy"/> 且 `Redirects(n)&gt;0` 时，
+    /// 3xx 按策略逐跳跟随（语义与
+    /// <see cref="DownloadRangeToFileAsync"/> 相同）；未启用时 3xx 仍按
+    /// 错误状态拒绝落盘。</summary>
+    /// <summary>流式二进制下载到本地文件（无独立进度标记文件）。</summary>
+    async long DownloadBinaryToFileAsync(string path, string localPath) {
+        return await this.DownloadBinaryToFileAsync(path, localPath, "");
+    }
+
+    /// <summary>二进制安全的端点下载：以追加写模式流式写入
+    /// <paramref name="localPath"/>，正文按字节搬运——正文里的 NUL
+    /// 字节不会被误当作 EOF。支持断点续传与 Content-Range
+    /// 校验；下载中断时返回负数错误码（已收字节保留在
+    /// <paramref name="localPath"/>，可续传）。绑定了
+    /// <see cref="ExternalCallPolicy"/> 且 `Redirects(n)>0` 时，
     /// 3xx 按策略逐跳跟随（语义与
     /// <see cref="DownloadRangeToFileAsync"/> 相同）；未启用时 3xx 仍按
     /// 错误状态拒绝落盘。</summary>
