@@ -3347,10 +3347,13 @@ static bool zan_win_system_lib(const char *lib, int lib_len) {
 #define ZAN_MAX_DRIVERS 1024
 typedef struct {
     char lib[64];      /* normalized -l basename, e.g. "sqlite3", "zan_sdl3" */
-    char module[512];  /* owning module path relative to stdlib root, '/'-sep */
+    char module[512];  /* owning module path relative to its root, '/'-sep */
     char sym[64];      /* "<lib> if <prefix>": a driver the program loads at run
                         * time (dlopen) instead of linking, so it is used when
                         * the image defines a function with this prefix. */
+    char root[1024];   /* owning source root: the stdlib root, or a package
+                        * source root once the owning module ships as a
+                        * package; bundles live at <root>/<module>/drivers/. */
 } zan_driver_entry_t;
 typedef struct {
     zan_driver_entry_t entries[ZAN_MAX_DRIVERS];
@@ -3359,7 +3362,7 @@ typedef struct {
 
 static void zan_registry_add(zan_driver_registry_t *reg,
                              const char *lib, const char *module,
-                             const char *sym) {
+                             const char *sym, const char *root) {
     if (reg->count >= ZAN_MAX_DRIVERS) return;
     for (int i = 0; i < reg->count; i++)
         if (strcmp(reg->entries[i].lib, lib) == 0) return; /* first wins */
@@ -3369,14 +3372,17 @@ static void zan_registry_add(zan_driver_registry_t *reg,
              sizeof(reg->entries[0].module), "%s", module);
     snprintf(reg->entries[reg->count].sym,
              sizeof(reg->entries[0].sym), "%s", sym ? sym : "");
+    snprintf(reg->entries[reg->count].root,
+             sizeof(reg->entries[0].root), "%s", root ? root : "");
     reg->count++;
 }
 
 /* Read one module's driver.manifest, registering each listed lib against the
- * owning module (its directory relative to the stdlib root). */
+ * owning module (its directory relative to the root it was found under). */
 static void zan_read_driver_manifest(const char *manifest_path,
                                      const char *module,
-                                     zan_driver_registry_t *reg) {
+                                     zan_driver_registry_t *reg,
+                                     const char *root) {
     FILE *f = fopen(manifest_path, "rb");
     if (!f) return;
     char line[128];
@@ -3402,7 +3408,7 @@ static void zan_read_driver_manifest(const char *manifest_path,
                 s[--ll] = '\0';
             if (s[0] == '\0') continue;
         }
-        zan_registry_add(reg, s, module, sym);
+        zan_registry_add(reg, s, module, sym, root);
     }
     fclose(f);
 }
@@ -3462,19 +3468,42 @@ static void zan_walk_stdlib_dirs(const char *dir_full, const char *rel,
 #endif
 }
 
+/* Walk context: the registry to fill and the root every discovered module
+ * is relative to (the stdlib root, or a package source root). */
+typedef struct {
+    zan_driver_registry_t *reg;
+    const char *root;
+} zan_driver_root_scan_t;
+
 static void zan_scan_driver_module(const char *dir_full, const char *rel,
                                    void *ctx) {
     if (!rel[0]) return;
+    zan_driver_root_scan_t *scan = (zan_driver_root_scan_t *)ctx;
     char manifest[1200];
     snprintf(manifest, sizeof(manifest), "%s/drivers/driver.manifest", dir_full);
-    zan_read_driver_manifest(manifest, rel, (zan_driver_registry_t *)ctx);
+    zan_read_driver_manifest(manifest, rel, scan->reg, scan->root);
 }
 
 static void zan_discover_drivers(const char *stdlib_root,
                                  zan_driver_registry_t *reg) {
     reg->count = 0;
-    if (!stdlib_root || !stdlib_root[0]) return;
-    zan_walk_stdlib_dirs(stdlib_root, "", 0, zan_scan_driver_module, reg);
+    zan_driver_root_scan_t scan;
+    if (stdlib_root && stdlib_root[0]) {
+        scan.reg = reg;
+        scan.root = stdlib_root;
+        zan_walk_stdlib_dirs(stdlib_root, "", 0, zan_scan_driver_module, &scan);
+    }
+    /* Packages own drivers too (e.g. zan_gui once Gui ships as a package):
+     * walk every visible package source root the same way. Stdlib entries
+     * were added first, so they keep first-wins on duplicate lib basenames. */
+    char pkg_roots[24][1024];
+    int pkg_n = zan_pkg_all_source_roots(package_project_root, pkg_roots, 24);
+    for (int i = 0; i < pkg_n; i++) {
+        scan.reg = reg;
+        scan.root = pkg_roots[i];
+        zan_walk_stdlib_dirs(pkg_roots[i], "", 0, zan_scan_driver_module,
+                             &scan);
+    }
 }
 
 /* Index of the discovered driver whose lib basename matches, or -1. */
@@ -3527,9 +3556,41 @@ static bool zan_find_static_library(const char *stdlib_root,
     };
     zan_walk_stdlib_dirs(stdlib_root, "", 0,
                          zan_find_static_library_dir, &search);
+    if (!search.result[0]) {
+        /* Package-owned drivers ship the same drivers/<target>/static shape
+         * inside their package source root. */
+        char pkg_roots[24][1024];
+        int pkg_n = zan_pkg_all_source_roots(package_project_root,
+                                             pkg_roots, 24);
+        for (int i = 0; i < pkg_n && !search.result[0]; i++)
+            zan_walk_stdlib_dirs(pkg_roots[i], "", 0,
+                                 zan_find_static_library_dir, &search);
+    }
     if (!search.result[0] || strlen(search.result) >= outsz) return false;
     snprintf(out, outsz, "%s", search.result);
     return true;
+}
+
+/* Resolve a Gui resource directory that ships either in the stdlib tree
+ * (Gui/icons, Gui/skins) or, once Gui becomes a package, inside a package
+ * source root (<pkg-root>/Gui/...). The stdlib copy keeps precedence so an
+ * existing stdlib layout always wins. Returns false and empties `out` when
+ * no copy exists. */
+static bool zan_resolve_gui_resource_dir(const char *stdlib_root,
+                                        const char *rel, char *out,
+                                        size_t cap) {
+    if (stdlib_root && stdlib_root[0]) {
+        snprintf(out, cap, "%s/%s", stdlib_root, rel);
+        if (zan_file_exists(out)) return true;
+    }
+    char pkg_roots[24][1024];
+    int pkg_n = zan_pkg_all_source_roots(package_project_root, pkg_roots, 24);
+    for (int i = 0; i < pkg_n; i++) {
+        snprintf(out, cap, "%s/%s", pkg_roots[i], rel);
+        if (zan_file_exists(out)) return true;
+    }
+    out[0] = '\0';
+    return false;
 }
 
 /* Copy a file byte-for-byte (portable; no shell). Returns 0 on success. */
@@ -3878,7 +3939,8 @@ static void print_usage(void) {
     fprintf(stderr, "  --package-list-missing  Scan inputs and print missing namespace diagnostics\n");
     fprintf(stderr, "  --package-install <dir> --package-name <name>  Install a local package directory\n");
     fprintf(stderr, "  --package-scope <project|global>  Select install scope (default project)\n");
-    fprintf(stderr, "  --package-project <dir>  Project root for project-scope installation\n");
+    fprintf(stderr, "  --package-project <dir>  Project root for package discovery and\n"
+                           "                           project-scope installation\n");
     fprintf(stderr, "  -O0..-O3/-Os/-Oz Set optimization level (default: O0; --publish: Os;\n");
     fprintf(stderr, "                   -Oz = minimum size for edge/embedded deployments)\n");
     fprintf(stderr, "  -g, --debug      Emit DWARF debug info for source-level debugging (forces -O0)\n");
@@ -4330,7 +4392,15 @@ int main(int argc, char **argv) {
     }
 
     input_file = input_files[0];
-    resolve_package_project_root(input_file);
+    /* An explicit --package-project is authoritative for compile-time
+     * package discovery (namespace pull, package-root drivers/resources);
+     * without it, walk up from the input file looking for a zan.proj and
+     * fall back to the cwd. */
+    if (package_project)
+        snprintf(package_project_root, sizeof(package_project_root), "%s",
+                 package_project);
+    else
+        resolve_package_project_root(input_file);
     for (int fi = 0; fi < input_count; fi++) {
         /* Design docs / saved components are generator data, not Zan
          * source: their raw text is only meaningful to the generator, and
@@ -5367,10 +5437,10 @@ int main(int argc, char **argv) {
                 char archive[1200];
                 archive[0] = '\0';
                 int didx = zan_driver_find(&cross_reg, nm, nlen);
-                if (didx >= 0 && resolved_stdlib_root[0]) {
+                if (didx >= 0) {
                     snprintf(archive, sizeof(archive),
                              "%s/%s/drivers/%s/static/lib%.*s.a",
-                             resolved_stdlib_root,
+                             cross_reg.entries[didx].root,
                              cross_reg.entries[didx].module, dsub, nlen, nm);
                 }
                 if (archive[0] && zan_file_exists(archive)) {
@@ -5434,10 +5504,10 @@ int main(int argc, char **argv) {
                       resolvable = 1;
                   } else {
                       int didx = zan_driver_find(&oreg, nm, nlen);
-                      if (didx >= 0 && resolved_stdlib_root[0]) {
+                      if (didx >= 0) {
                           snprintf(drvso, sizeof(drvso),
                                    "%s/%s/drivers/%s/static/lib%.*s.a",
-                                   resolved_stdlib_root,
+                                   oreg.entries[didx].root,
                                    oreg.entries[didx].module,
                                    odrop_sub, nlen, nm);
                           if (zan_file_exists(drvso)) {
@@ -5446,7 +5516,7 @@ int main(int argc, char **argv) {
                           } else {
                               snprintf(drvso, sizeof(drvso),
                                        "%s/%s/drivers/%s/lib%.*s.so",
-                                       resolved_stdlib_root,
+                                       oreg.entries[didx].root,
                                        oreg.entries[didx].module,
                                        odrop_sub, nlen, nm);
                               resolvable = zan_file_exists(drvso);
@@ -5498,10 +5568,10 @@ int main(int argc, char **argv) {
                 char dylib[1200];
                 dylib[0] = '\0';
                 int didx = zan_driver_find(&mac_reg, nm, nlen);
-                if (didx >= 0 && resolved_stdlib_root[0]) {
+                if (didx >= 0) {
                     char driver_dir[1200];
                     snprintf(driver_dir, sizeof(driver_dir),
-                             "%s/%s/drivers/%s", resolved_stdlib_root,
+                             "%s/%s/drivers/%s", mac_reg.entries[didx].root,
                              mac_reg.entries[didx].module, dsub);
                     zan_find_macos_driver_dylib(
                         driver_dir, nm, nlen, dylib, sizeof(dylib));
@@ -5598,10 +5668,10 @@ int main(int argc, char **argv) {
                       resolvable = 1;
                   } else {
                       int didx = zan_driver_find(&driver_reg, nm, nlen);
-                      if (didx >= 0 && resolved_stdlib_root[0]) {
+                      if (didx >= 0) {
                           snprintf(stubso, sizeof(stubso),
                                    "%s/%s/drivers/%s/lib%.*s.so",
-                                   resolved_stdlib_root,
+                                   driver_reg.entries[didx].root,
                                    driver_reg.entries[didx].module,
                                    zan_driver_subdir(&target), nlen, nm);
                           resolvable = zan_file_exists(stubso);
@@ -5613,7 +5683,7 @@ int main(int argc, char **argv) {
                                * drivers/<target>/static. */
                               snprintf(stubso, sizeof(stubso),
                                        "%s/%s/drivers/%s/static/lib%.*s.a",
-                                       resolved_stdlib_root,
+                                       driver_reg.entries[didx].root,
                                        driver_reg.entries[didx].module,
                                        zan_driver_subdir(&target), nlen, nm);
                               resolvable = zan_file_exists(stubso);
@@ -5642,6 +5712,7 @@ int main(int argc, char **argv) {
         const char *used_drivers[ZAN_MAX_USED_DRIVERS]; int used_driver_count = 0;
         int used_driver_len[ZAN_MAX_USED_DRIVERS];
         const char *used_driver_module[ZAN_MAX_USED_DRIVERS];
+        const char *used_driver_root[ZAN_MAX_USED_DRIVERS];
         bool used_driver_runtime[ZAN_MAX_USED_DRIVERS] = { false };  /* dlopen'd, not linked */
         bool used_driver_static[ZAN_MAX_USED_DRIVERS] = { false };
         bool used_driver_embedded[ZAN_MAX_USED_DRIVERS] = { false };  /* inside the executable */
@@ -5659,6 +5730,7 @@ int main(int argc, char **argv) {
                 used_drivers[used_driver_count] = nm;
                 used_driver_len[used_driver_count] = nlen;
                 used_driver_module[used_driver_count] = driver_reg.entries[didx].module;
+                used_driver_root[used_driver_count] = driver_reg.entries[didx].root;
                 used_driver_runtime[used_driver_count] = false;
                 used_driver_count++;
             }
@@ -5681,6 +5753,7 @@ int main(int argc, char **argv) {
             used_drivers[used_driver_count] = lib;
             used_driver_len[used_driver_count] = (int)strlen(lib);
             used_driver_module[used_driver_count] = driver_reg.entries[di].module;
+            used_driver_root[used_driver_count] = driver_reg.entries[di].root;
             used_driver_runtime[used_driver_count] = true;
             used_driver_count++;
         }
@@ -5693,10 +5766,10 @@ int main(int argc, char **argv) {
                              driver_dir_override);
                 } else {
                     const char *mod = used_driver_module[d];
-                    if (mod && mod[0] && resolved_stdlib_root[0]) {
+                    const char *droot = used_driver_root[d];
+                    if (mod && mod[0] && droot && droot[0]) {
                         snprintf(driver_dirs[d], sizeof(driver_dirs[d]),
-                                 "%s/%s/drivers/%s", resolved_stdlib_root,
-                                 mod, dsub);
+                                 "%s/%s/drivers/%s", droot, mod, dsub);
                     }
                 }
             }
@@ -5878,9 +5951,8 @@ int main(int argc, char **argv) {
         if (resolved_stdlib_root[0] &&
             zan_irgen_defines_prefix(&irgen, "IconSvgData_")) {
             char icons_dir[1200];
-            snprintf(icons_dir, sizeof(icons_dir), "%s/Gui/icons",
-                     resolved_stdlib_root);
-            if (zan_file_exists(icons_dir)) {
+            if (zan_resolve_gui_resource_dir(resolved_stdlib_root, "Gui/icons",
+                                             icons_dir, sizeof(icons_dir))) {
                 char *icon_spec = (char *)malloc(strlen(icons_dir) + 32);
                 if (icon_spec) {
                     /* resource names "icons/<file>" match the reader's
@@ -5974,9 +6046,9 @@ int main(int argc, char **argv) {
             }
             if (!skins_staged) {
                 char skins_dir[1200];
-                snprintf(skins_dir, sizeof(skins_dir), "%s/Gui/skins",
-                         resolved_stdlib_root);
-                if (zan_file_exists(skins_dir)) {
+                if (zan_resolve_gui_resource_dir(resolved_stdlib_root,
+                                                 "Gui/skins", skins_dir,
+                                                 sizeof(skins_dir))) {
                     char *skin_spec = (char *)malloc(strlen(skins_dir) + 32);
                     if (skin_spec) {
                         /* resource names "skins/<pack>/skin.css" match the

@@ -72,6 +72,7 @@ zan_artifact_is_current(_current ${OUT_EXE})
 if(NOT _current)
   execute_process(
     COMMAND ${ZANC} ${SRC} -o ${OUT_EXE} ${ZANC_ARGS}
+            --package-project ${WORKDIR}
     RESULT_VARIABLE compile_rc
     OUTPUT_VARIABLE compile_out
     ERROR_VARIABLE  compile_err)

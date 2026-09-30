@@ -735,6 +735,107 @@ int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
     return found;
 }
 
+/* Append one package's source root to the list. Layout precedence per
+ * package: src/ (standard) > stdlib/ (legacy) > the package dir itself.
+ * Roots keep '/' separators throughout; pkg_is_dir normalizes them where
+ * the platform needs it and every consumer accepts them. */
+static int pkg_add_package_root(const char *store, const char *name,
+                                char (*out_roots)[1024], int count,
+                                int max_roots) {
+    char root[1024], cand[1024];
+    snprintf(root, sizeof(root), "%s/%s", store, name);
+    /* 1. Standard source package layout: <pkg>/src */
+    snprintf(cand, sizeof(cand), "%s/src", root);
+    if (!pkg_is_dir(cand)) {
+        /* 2. Legacy package layout: <pkg>/stdlib */
+        snprintf(cand, sizeof(cand), "%s/stdlib", root);
+    }
+    if (!pkg_is_dir(cand)) {
+        /* 3. Flat package layout: the package dir itself */
+        snprintf(cand, sizeof(cand), "%s", root);
+    }
+    if (!pkg_is_dir(cand) || count >= max_roots ||
+        pkg_dir_in_list(out_roots, count, cand))
+        return count;
+    snprintf(out_roots[count++], 1024, "%s", cand);
+    return count;
+}
+
+static int pkg_store_source_roots(const char *store,
+                                  char (*out_roots)[1024], int count,
+                                  int max_roots) {
+    if (!pkg_is_dir(store)) return count;
+#ifdef _WIN32
+    char pattern[1024]; WIN32_FIND_DATAA fd;
+    snprintf(pattern, sizeof(pattern), "%s\\*", store);
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return count;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+            (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+            !pkg_safe_component(fd.cFileName)) continue;
+        count = pkg_add_package_root(store, fd.cFileName, out_roots,
+                                     count, max_roots);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(store); if (!d) return count;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (!pkg_safe_component(e->d_name)) continue;
+        char pkg[1024]; struct stat st;
+        snprintf(pkg, sizeof(pkg), "%s/%s", store, e->d_name);
+        if (lstat(pkg, &st) != 0 || !S_ISDIR(st.st_mode) ||
+            S_ISLNK(st.st_mode)) continue;
+        count = pkg_add_package_root(store, e->d_name, out_roots,
+                                     count, max_roots);
+    }
+    closedir(d);
+#endif
+    return count;
+}
+
+int zan_pkg_all_source_roots(const char *project_dir,
+                             char (*out_roots)[1024], int max_roots) {
+    if (!out_roots || max_roots <= 0) return 0;
+    char store[1024];
+    int count = 0;
+    if (project_dir && project_dir[0]) {
+        snprintf(store, sizeof(store), "%s/packages", project_dir);
+        count = pkg_store_source_roots(store, out_roots, count, max_roots);
+        snprintf(store, sizeof(store), "%s/.zan-packages", project_dir);
+        count = pkg_store_source_roots(store, out_roots, count, max_roots);
+    }
+    char exe_dir[1024] = {0};
+#ifdef _WIN32
+    if (GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir))) {
+        char *sep = strrchr(exe_dir, '\\'); if (sep) *sep = 0;
+        snprintf(store, sizeof(store), "%s/../packages", exe_dir);
+        count = pkg_store_source_roots(store, out_roots, count, max_roots);
+        snprintf(store, sizeof(store), "%s/packages", exe_dir);
+        count = pkg_store_source_roots(store, out_roots, count, max_roots);
+    }
+#elif defined(__APPLE__)
+    uint32_t size = sizeof(exe_dir);
+    if (_NSGetExecutablePath(exe_dir, &size) == 0) {
+        char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
+        snprintf(store, sizeof(store), "%s/../packages", exe_dir);
+        count = pkg_store_source_roots(store, out_roots, count, max_roots);
+    }
+#else
+    ssize_t len = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
+    if (len > 0) {
+        exe_dir[len] = 0;
+        char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
+        snprintf(store, sizeof(store), "%s/../packages", exe_dir);
+        count = pkg_store_source_roots(store, out_roots, count, max_roots);
+    }
+#endif
+    if (zan_pkg_global_store(store, sizeof(store)))
+        count = pkg_store_source_roots(store, out_roots, count, max_roots);
+    return count;
+}
+
 int zan_pkg_find_namespace(const char *project_dir, const char *namespace_path,
                            char (*out_dirs)[1024], int max_dirs) {
     if (!project_dir || !pkg_safe_namespace_path(namespace_path) ||

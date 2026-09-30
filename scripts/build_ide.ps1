@@ -83,6 +83,9 @@ $files += (Get-ChildItem stdlib\Gui -Recurse -Include *.zan).FullName
 if (Test-Path packages\Zan.Gui.Charts) {
     $files += (Get-ChildItem packages\Zan.Gui.Charts\src -Recurse -Include *.zan).FullName
 }
+if (Test-Path packages\Zan.Gui.Browser) {
+    $files += (Get-ChildItem packages\Zan.Gui.Browser\src -Recurse -Include *.zan).FullName
+}
 if (Test-Path packages\Zan.Industrial) {
     $files += (Get-ChildItem packages\Zan.Industrial\src -Recurse -Include *.zan).FullName
 }

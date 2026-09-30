@@ -1,5 +1,5 @@
 #!/bin/sh
-# Cross-build the macOS CEF driver (stdlib/Gui/Component/CefBrowser) without a
+# Cross-build the macOS CEF driver (packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser) without a
 # Mac and without an Apple SDK: `zig cc` carries the Darwin libc headers, and
 # zan_cef.c only imports libSystem symbols (AppKit is reached through dlopen'd
 # libobjc at run time), so the same trick scripts/build_macos_rt.sh uses works
@@ -15,7 +15,7 @@
 # range covers it -- writing the number twice is exactly how the earlier
 # "cef api hash mismatch" happened.
 #
-# Outputs, into stdlib/Gui/Component/CefBrowser/drivers/macos-{arm64,x64} -- the
+# Outputs, into packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/drivers/macos-{arm64,x64} -- the
 # directories zanc bundles from (zan_driver_subdir() in src/compiler/main.c):
 #   libzan_cef.dylib   the driver
 #   zan_cef_helper     the Chromium subprocess executable of macOS bundles
@@ -34,8 +34,8 @@ fi
 INC=$1
 ZIG=${2:-zig}
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-SRC="$ROOT/stdlib/Gui/Component/CefBrowser/native/zan_cef.c"
-HELPER_SRC="$ROOT/stdlib/Gui/Component/CefBrowser/native/zan_cef_helper.c"
+SRC="$ROOT/packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/native/zan_cef.c"
+HELPER_SRC="$ROOT/packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/native/zan_cef_helper.c"
 
 if [ ! -f "$INC/include/cef_api_hash.h" ]; then
     echo "$INC does not look like a CEF distribution (no include/cef_api_hash.h)" >&2
@@ -52,7 +52,7 @@ fi
 for pair in arm64:aarch64 x64:x86_64; do
     sub=${pair%%:*}
     arch=${pair#*:}
-    out="$ROOT/stdlib/Gui/Component/CefBrowser/drivers/macos-$sub"
+    out="$ROOT/packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/drivers/macos-$sub"
     mkdir -p "$out"
     # .11.0 stamps LC_BUILD_VERSION minos 11.0, matching what zanc passes to
     # ld64.lld for macOS targets. -g0: DWARF would embed the build directory,

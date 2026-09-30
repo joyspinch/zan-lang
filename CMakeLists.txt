@@ -632,10 +632,10 @@ if(ZAN_BUILD_GUI)
             endif()
         endif()
         # Embedded WebView needs nothing here: the Edge WebView2 backend is
-        # written in Zan (stdlib/Gui/Component/WebView/WebView2.zan) against
+        # written in Zan (packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebView2.zan) against
         # its COM interfaces, and resolves WebView2Loader.dll (shipped in the
         # WebView component's own driver bundle under
-        # stdlib/Gui/Component/WebView/drivers) at run time, so a machine
+        # packages/Zan.Gui.Browser/src/Gui/Component/WebView/drivers) at run time, so a machine
         # without the WebView2 runtime still runs GUI apps -- the widget falls
         # back to its placeholder.
         set(ZAN_GUI_AVAILABLE TRUE)
@@ -2740,7 +2740,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2749,7 +2749,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_fold_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_fold.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_fold${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2758,7 +2758,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2767,7 +2767,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_identity_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_identity.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_identity${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2776,7 +2776,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_query_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_query.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_query${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2785,7 +2785,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_topn_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_topn.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_topn${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2794,7 +2794,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_multisort_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_multisort.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_multisort${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2803,7 +2803,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_sparse_page_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_sparse_page.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_sparse_page${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2812,7 +2812,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_query_source_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_query_source.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_query_source${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2821,7 +2821,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_local_source_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_local_source.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_local_source${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2830,7 +2830,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_query_plan_contract_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_query_plan_contract.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_query_plan_contract${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2839,7 +2839,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_transaction_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_transaction.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_transaction${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2848,7 +2848,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_query_transaction_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_query_transaction.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_query_transaction${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2857,7 +2857,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_selection_model_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_selection_model.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_selection_model${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2866,7 +2866,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_realtime_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_realtime.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_realtime${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2875,7 +2875,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_tree_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_tree.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_tree${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2884,7 +2884,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_filtertree_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_filtertree.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_filtertree${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2893,7 +2893,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_formula_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_formula.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_formula${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2902,7 +2902,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_colchooser_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_colchooser.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_colchooser${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2911,7 +2911,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_masterdetail_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_masterdetail.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_masterdetail${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2920,7 +2920,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_filterbar_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_filterbar.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_filterbar${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2931,7 +2931,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_i18n_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_i18n.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_i18n${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2940,7 +2940,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_multirange_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_multirange.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_multirange${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2952,7 +2952,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_ctxmenu_selection_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_ctxmenu_selection.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_ctxmenu_selection${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2964,7 +2964,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_a11y_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_a11y.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_a11y${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2977,7 +2977,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_spark_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_spark.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_spark${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2991,7 +2991,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_exportui_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_exportui.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_exportui${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -3488,7 +3488,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/webview_interop_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/WebView/WebView2.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebView2.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_webview_interop.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_webview_interop${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)

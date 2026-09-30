@@ -28,7 +28,7 @@ set(_budget
 )
 
 set(_skip_files
-  "stdlib/Gui/Component/WebView/WebView2.zan"
+  "packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebView2.zan"
 )
 
 file(GLOB_RECURSE _sources "${ROOT}/stdlib/Gui/*.zan")

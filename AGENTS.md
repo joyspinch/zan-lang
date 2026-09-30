@@ -231,7 +231,7 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DZAN_BUILD_CEF=ON -DZAN_BUIL
 cmake --build build --target zan_cef
 ```
 
-Built drivers are staged next to the source (`stdlib/Gui/Component/CefBrowser/drivers/<plat>/`)
+Built drivers are staged next to the source (`packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/drivers/<plat>/`)
 so `zanc --publish` carries them with the program. The CEF *runtime* (libcef)
 is still downloaded per-machine at first run; see
 `examples/gui_cef_browser/README.md` for `ZAN_CEF_*` env vars.

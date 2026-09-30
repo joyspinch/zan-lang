@@ -17,7 +17,7 @@
 set -e
 REPO=/d/project/zan-lang
 ZIG="${ZIG:-/c/Users/QQ/.mozbuild/zig/zig-x86_64-windows-0.14.1/zig.exe}"
-SRC="$REPO/stdlib/Gui/Component/CefBrowser/native/zan_cef.c"
+SRC="$REPO/packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/native/zan_cef.c"
 HEADERS_ROOT="$REPO/build/cef-headers"
 mkdir -p "$HEADERS_ROOT"
 
@@ -26,12 +26,12 @@ mkdir -p "$HEADERS_ROOT"
 CEF_API="$(grep -o 'ZAN_CEF_API_VERSION "[0-9]*"' "$REPO/cmake/ZanCef.cmake" |
            grep -o '[0-9]*')"
 BRANCH=$(grep -o 'CurrentBranch() { return "[0-9]*\.' \
-          "$REPO/stdlib/Gui/Component/CefBrowser/CefRuntime.zan" |
+          "$REPO/packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefRuntime.zan" |
           grep -o '[0-9]*')
-LINE=$(grep -B1 '"linux64"' "$REPO/stdlib/Gui/Component/CefBrowser/CefRuntime.zan" |
+LINE=$(grep -B1 '"linux64"' "$REPO/packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefRuntime.zan" |
        grep "\"$BRANCH\." | head -1)
 VERSION=$(echo "$LINE" | grep -o '"[^"]*"' | head -1 | tr -d '"')
-SHA1=$(grep -A2 '"linux64"' "$REPO/stdlib/Gui/Component/CefBrowser/CefRuntime.zan" |
+SHA1=$(grep -A2 '"linux64"' "$REPO/packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefRuntime.zan" |
        grep -o '[0-9a-f]\{40\}' | head -1)
 if [ -z "$VERSION" ] || [ -z "$SHA1" ] || [ -z "$CEF_API" ]; then
     echo "cannot parse pinned CEF version/sha1/api from CefRuntime.zan / ZanCef.cmake" >&2
@@ -57,10 +57,10 @@ fi
 
 build () { # arch triple outdir
     local arch=$1 triple=$2 outdir=$3
-    mkdir -p "$REPO/stdlib/Gui/Component/CefBrowser/drivers/$outdir"
+    mkdir -p "$REPO/packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/drivers/$outdir"
     "$ZIG" cc -target "$triple" -shared -fPIC -O2 -g0 -I "$H" \
         -DCEF_API_VERSION="$CEF_API" "$SRC" \
-        -o "$REPO/stdlib/Gui/Component/CefBrowser/drivers/$outdir/libzan_cef.so" \
+        -o "$REPO/packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/drivers/$outdir/libzan_cef.so" \
         -lpthread -ldl -lm
     echo "== $outdir staged"
 }

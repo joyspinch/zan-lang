@@ -2346,7 +2346,37 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   duplicate type declaration 成片（一次 667 错），极易误判成改动引入。
 - 实测规则：对照实验把 **CWD 切到空目录**（两条发现路径同时落空），
   或用无 packages/ 的独立工具链副本；`--stdlib-path` 只覆盖 stdlib，
-  `--package-project` 只改安装作用域，**都挡不住**包存储发现。
+  包存储发现本身挡不住（注意：`--package-project` 自 2026-09-30 起对
+  编译期包发现生效，见下节，旧论断"只改安装作用域"已废止）。
 - 为什么：按需拉入按"命名空间 → 文件声明"精确匹配，stdlib 与包同供
   一个命名空间时不去重；错误形态是成片 duplicate 而非缺符号，归因
   极易反了（先怀疑布局改动，其实是发现路径重叠）。
+
+## 包根资源发现成编译器能力 + --package-project 编译期语义修正（2026-09-30，Zan.Gui.Browser 拆包实测）
+
+- 机制定式：zanc 驱动发现/静态库查找/皮肤图标内嵌已从"只走 stdlib 根"扩为
+  "stdlib 根 + 各包源根"（`zan_pkg_all_source_roots`：项目 packages/、
+  .zan-packages/、exe 相对、全局店逐一枚举，src/ > stdlib/ > flat 布局；驱动
+  注册表条目带所属根，暂存路径按 `<root>/<module>/drivers/` 拼）。模块拆包后
+  其 `drivers/driver.manifest` 随包走，发布随行不断；skins/icons 解析 stdlib
+  优先、包根兜底（`<pkg-root>/Gui/skins`），整包 Gui 拆分即插即用。
+- 坑（--package-project 编译期语义曾是死的）：该旗标原只喂 pkg-install
+  流程，参数解析后 `resolve_package_project_root(input_file)` 无条件覆写
+  编译期包发现根，旗标对命名空间拉取无效——帮助文本写"安装作用域"，A/B
+  时把它当编译期参数用，会把"包命名空间解析不到"误归因为拆包回归。定式：
+  显式旗标现优先（直接采用），否则走原路（输入文件上溯找 zan.proj → 回落
+  CWD）。
+- 坑（嵌套构建树破坏 exe 相对 stdlib 发现）：stdlib 根默认取 exe 兄弟
+  `../stdlib`；独立子目录（如 build/bpkg）里的 zanc 解析到 build/stdlib 不
+  存在，stdlib 整体不拉入，错误形态是 App/Form 全 undefined——极易误归因
+  为"包发现坏了"。独立构建树验证编译器改动必须显式 `--stdlib-path`。
+- 坑（"if 前缀"驱动不随行 ≠ 发现断了）：`"<lib> if <prefix>"` 驱动随行
+  条件是映像真的发射了该前缀函数；程序闭包不发射（gui_cef_browser 的映像
+  零个 CefBackend_ 函数）时 zan_cef 不随行，是既有语义非回归。排查随行
+  问题先用 HEAD worktree + 旧工具链发布同物 A/B，再谈归因。
+- 坑（ctest 案例的编译工作目录）：run_case 里 zanc 编译调用不设
+  WORKING_DIRECTORY（继承 ctest 的 build 目录），只有运行产物回落仓库根
+  ——包命名空间案例编译期解析不到包。已修：编译统一补
+  `--package-project ${WORKDIR}`。连带定式：模块搬进包时，CMakeLists 里
+  所有 `<模块>/<文件>.zan` 显式输入路径必须同步改（golden 案例已注册但没
+  人跑 = 坏了也没人发现）。

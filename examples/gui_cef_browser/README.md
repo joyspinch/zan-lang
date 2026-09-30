@@ -147,7 +147,7 @@ web.Reload();                // 注入脚本对「下一个」文档生效
 
 尚未包成 Zan API 的原生 handler：弹窗策略（`on_before_popup`，`target=_blank`
 目前由 Chromium 自己开原生窗口）、右键菜单定制、打印/查找 UI。这些要动
-`stdlib/Gui/Component/CefBrowser/native/zan_cef.c`，且 CEF 151 与 109 两个变体的
+`packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/native/zan_cef.c`，且 CEF 151 与 109 两个变体的
 回调签名不同，见 `TASKS.md`。
 
 ## 镜像与完全离线安装

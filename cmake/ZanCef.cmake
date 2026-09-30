@@ -14,7 +14,7 @@
 # build tree. Nothing enters the repository.
 #
 # Which CEF the driver is built against has exactly one source of truth: the
-# pinned table in stdlib/Gui/Component/CefBrowser/CefRuntime.zan, which is also
+# pinned table in packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefRuntime.zan, which is also
 # what a program downloads at run time. Spelling the version here as well let
 # the two drift (headers 151.3.18 vs runtime 151.3.23), and libcef then refuses
 # to load with "cef api hash mismatch", so it is read out of that file instead.
@@ -34,7 +34,7 @@ set(ZAN_CEF_API_VERSION "15101"
 # (CurrentBranch / LegacyBranch), and the version is the first entry of the
 # pinned table on that branch.
 function(zan_cef_pinned_version prefix_fn out_var)
-    file(READ "${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/CefBrowser/CefRuntime.zan"
+    file(READ "${CMAKE_SOURCE_DIR}/packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/CefRuntime.zan"
          _src)
     string(REGEX MATCH
            "${prefix_fn}\\(\\)[ \t]*{[ \t]*return[ \t]*\"([0-9]+\\.)\""
@@ -193,7 +193,7 @@ function(zan_cef_add_variant target version tag)
         return()
     endif()
     add_library(${target} SHARED
-        "${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/CefBrowser/native/zan_cef.c")
+        "${CMAKE_SOURCE_DIR}/packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/native/zan_cef.c")
     target_include_directories(${target} PRIVATE "${headers}")
     if(tag STREQUAL "legacy")
         # CEF 109 predates the versioned C API (no CEF_API_VERSION, unsized
@@ -213,13 +213,13 @@ function(zan_cef_add_variant target version tag)
         target_link_libraries(${target} PRIVATE dl)
     endif()
     # zanc bundles a run-time loaded driver from the directory of the stdlib
-    # module owning it (stdlib/Gui/Component/CefBrowser/drivers/<target>, see
+    # module owning it (packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/drivers/<target>, see
     # its driver.manifest), so the built library is staged there. Without that
     # copy nothing lands beside the produced executable and CefBackend reports
     # "找不到原生 zan_cef driver" on a machine with no system-wide install.
     zan_cef_driver_subdir(_sub)
     set(_drv
-        "${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/CefBrowser/drivers/${_sub}")
+        "${CMAKE_SOURCE_DIR}/packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/drivers/${_sub}")
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "${_drv}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different

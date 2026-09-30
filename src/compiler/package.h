@@ -137,6 +137,14 @@ bool zan_pkg_global_store(char *out, size_t out_size);
 int zan_pkg_find_namespace(const char *project_dir, const char *namespace_path,
                            char (*out_dirs)[1024], int max_dirs);
 
+/* Enumerate every visible package's source root across all stores (project
+ * packages/, .zan-packages/, toolchain-relative packages/, global store) —
+ * one root per package, layout precedence src/ > stdlib/ (legacy) > flat.
+ * Non-namespace assets a package owns (driver manifests, skin/icon packs)
+ * are discovered by walking these roots. */
+int zan_pkg_all_source_roots(const char *project_dir,
+                             char (*out_roots)[1024], int max_roots);
+
 /* Visit installed package files by declared namespace, regardless of their
  * physical directories. Paths refer to original sources, never copies. */
 typedef void (*zan_pkg_source_visitor_t)(const char *path, void *context);
