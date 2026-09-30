@@ -31,11 +31,24 @@ namespace System.Web;
 /// Trusted build-time embedded resources retain the runtime's own lazy decode
 /// cache; this limit bounds their response copy, not runtime decompression.
 /// </summary>
+class StaticMount {
+    string prefix;
+    string root;
+    int maxAge;
+
+    StaticMount(string prefix, string root, int maxAge) {
+        this.prefix = prefix;
+        this.root = root;
+        this.maxAge = maxAge;
+    }
+}
+
 class StaticFiles {
     static string prefix = "";
     static string root = "";
     static int maxAge = 86400;
     static const int MaxFileBytes = 4 * 1024 * 1024;
+    static List<StaticMount> mounts = new List<StaticMount>();
 
     /// <summary>Mounts `dir` under `urlPrefix` and registers the hook on the
     /// app. `urlPrefix` is matched literally ("/static" answers
@@ -44,6 +57,8 @@ class StaticFiles {
     static void Mount(WebApp app, string urlPrefix, string dir) {
         StaticFiles.prefix = urlPrefix;
         StaticFiles.root = dir;
+        StaticMount m = new StaticMount(urlPrefix, dir, StaticFiles.maxAge);
+        StaticFiles.mounts.Add(m);
         app.Before(StaticFiles.Serve);
     }
 
@@ -56,15 +71,28 @@ class StaticFiles {
     /// <summary>Before hook: answers asset requests, passes everything else on
     /// (true = keep going).</summary>
     static bool Serve(HttpContext ctx) {
-        if (StaticFiles.root.Length == 0) { return true; }
         if (ctx.method != "GET" && ctx.method != "HEAD") { return true; }
-        string rel = StaticFiles.Relative(ctx.path);
-        if (rel == null) { return true; }
+        if (StaticFiles.mounts.Count > 0) {
+            for (int i = 0; i < StaticFiles.mounts.Count; i = i + 1) {
+                StaticMount m = StaticFiles.mounts[i];
+                string rel = StaticFiles.RelativeTo(ctx.path, m.prefix);
+                if (rel != null) {
+                    return StaticFiles.ServeFile(ctx, rel, m.root, m.prefix, m.maxAge);
+                }
+            }
+        }
+        if (StaticFiles.root.Length == 0) { return true; }
+        string relLegacy = StaticFiles.Relative(ctx.path);
+        if (relLegacy == null) { return true; }
+        return StaticFiles.ServeFile(ctx, relLegacy, StaticFiles.root, StaticFiles.prefix, StaticFiles.maxAge);
+    }
+
+    static bool ServeFile(HttpContext ctx, string rel, string rootDir, string urlPrefix, int ageSeconds) {
         if (rel.Length == 0 || !StaticFiles.IsSafe(rel)) {
             ctx.Status(404, "Not Found").Text("not found");
             return false;
         }
-        string full = Directory.ReadPath(StaticFiles.root + "/" + rel);
+        string full = Directory.ReadPath(rootDir + "/" + rel);
         if (!File.Exists(full)) {
             ctx.Status(404, "Not Found").Text("not found");
             return false;
@@ -93,13 +121,13 @@ class StaticFiles {
                 embedded = new byte[length];
                 if (length > 0) { File.EmbedCopyIn(embedded, src, length); }
             }
-            StaticFiles.Answer(ctx, rel, embedded, length);
+            StaticFiles.AnswerMount(ctx, urlPrefix, ageSeconds, rel, embedded, length);
             return false;
         }
         try {
             // Measure and read the SAME handle, in 64 bits. A pathname size
             // check followed by ReadAllBytes can race replacement/growth.
-            StaticFiles.ServeStream(ctx, rel, file);
+            StaticFiles.ServeStreamMount(ctx, rel, file, urlPrefix, ageSeconds);
         } finally {
             file.Close();
         }
@@ -109,6 +137,10 @@ class StaticFiles {
     /// <summary>Buffered static response from an opened stream. The caller
     /// owns the stream. Reads use the checked length plus a one-byte EOF probe.</summary>
     static void ServeStream(HttpContext ctx, string rel, Stream file) {
+        StaticFiles.ServeStreamMount(ctx, rel, file, StaticFiles.prefix, StaticFiles.maxAge);
+    }
+
+    static void ServeStreamMount(HttpContext ctx, string rel, Stream file, string urlPrefix, int ageSeconds) {
         long length = file.Length();
         if (length < 0 || file.Seek(0, 0) != 0) {
             ctx.Status(404, "Not Found").Text("not found");
@@ -119,7 +151,7 @@ class StaticFiles {
         if (ctx.method == "HEAD") {
             // Binary's non-null marker carries Content-Length; WebApp never
             // sends its bytes for HEAD. Do not allocate/read the file body.
-            StaticFiles.Answer(ctx, rel, new byte[0], size);
+            StaticFiles.AnswerMount(ctx, urlPrefix, ageSeconds, rel, new byte[0], size);
             return;
         }
         byte[] data = new byte[size];
@@ -140,7 +172,7 @@ class StaticFiles {
             ctx.Status(503, "Service Unavailable").Text("static file changed or unreadable");
             return;
         }
-        StaticFiles.Answer(ctx, rel, data, size);
+        StaticFiles.AnswerMount(ctx, urlPrefix, ageSeconds, rel, data, size);
     }
 
     static bool TooLarge(HttpContext ctx, long length) {
@@ -150,19 +182,26 @@ class StaticFiles {
     }
 
     static void Answer(HttpContext ctx, string rel, byte[] data, int size) {
-        ctx.routePattern = StaticFiles.prefix + "/" + rel;
+        StaticFiles.AnswerMount(ctx, StaticFiles.prefix, StaticFiles.maxAge, rel, data, size);
+    }
+
+    static void AnswerMount(HttpContext ctx, string urlPrefix, int ageSeconds, string rel, byte[] data, int size) {
+        ctx.routePattern = urlPrefix + "/" + rel;
         ctx.SetHeader("Cache-Control", "public, max-age="
-            + Convert.ToString(StaticFiles.maxAge));
+            + Convert.ToString(ageSeconds));
         ctx.Binary(StaticFiles.ContentType(rel), data, size);
     }
 
     /// <summary>The path below the mount point, or null when the request is not
     /// for this mount.</summary>
     static string Relative(string path) {
-        string p = StaticFiles.prefix;
-        int pn = p.Length;
+        return StaticFiles.RelativeTo(path, StaticFiles.prefix);
+    }
+
+    static string RelativeTo(string path, string urlPrefix) {
+        int pn = urlPrefix.Length;
         if (path.Length <= pn) { return null; }
-        if (path.Substring(0, pn) != p) { return null; }
+        if (path.Substring(0, pn) != urlPrefix) { return null; }
         if ((path[pn] & 255) != 47) { return null; }        // '/'
         return path.Substring(pn + 1);
     }

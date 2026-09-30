@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Net.Sockets;
 using System.Net.Tls;
 using System.Data.Redis;
+using System.Threading;
 
 namespace System.Data.Redis;
 
@@ -35,6 +36,8 @@ class RedisClient {
     int port;
     bool connected;
     string lastError;
+    bool busy;
+    List<AsyncGate> waiters;
 
     // 接收缓冲区带显式 [head, tail) 有效区间，使 RESP 回复可
     // 按字节精确解析（二进制安全），而非依赖 NUL 结尾。
@@ -74,6 +77,8 @@ class RedisClient {
         this.tmp = null;
         this.tmpcap = 16384;
         this.tls = null;
+        this.busy = false;
+        this.waiters = new List<AsyncGate>();
     }
 
     /// <summary>连接 Redis 服务器，在 IO reactor 上挂起直到
@@ -134,8 +139,34 @@ class RedisClient {
         return c;
     }
 
+    async bool AcquireLock() {
+        while (this.busy) {
+            AsyncGate g = new AsyncGate();
+            this.waiters.Add(g);
+            await g.Wait();
+            g.Close();
+        }
+        this.busy = true;
+        return true;
+    }
+
+    void ReleaseLock() {
+        this.busy = false;
+        if (this.waiters != null && this.waiters.Count > 0) {
+            AsyncGate g = this.waiters[0];
+            this.waiters.RemoveAt(0);
+            g.Signal();
+        }
+    }
+
     /// <summary>关闭连接并释放缓冲区。</summary>
     void Close() {
+        this.ReleaseLock();
+        while (this.waiters != null && this.waiters.Count > 0) {
+            AsyncGate g = this.waiters[0];
+            this.waiters.RemoveAt(0);
+            g.Signal();
+        }
         // TLS 先发 close_notify 再关套接字（TlsStream.Close 不拥有底层 fd）。
         if (this.tls != null) {
             this.tls.Close();
@@ -159,7 +190,7 @@ class RedisClient {
     }
 
     /// <summary>确保接收缓冲区在尾位置之后还能容纳 <paramref name="extra"/> 字节，
-    /// 必要时先压缩再扩容。</summary>
+    /// 必要时先压缩再扩容。带上限与溢出防护。</summary>
     void ensureRoom(int extra) {
         if (this.intail + extra <= this.incap) {
             return;
@@ -175,8 +206,12 @@ class RedisClient {
         if (this.intail + extra <= this.incap) {
             return;
         }
-        int ncap = this.incap * 2;
+        int ncap = this.incap > 0 ? this.incap * 2 : 16384;
         while (this.intail + extra > ncap) {
+            if (ncap > 1073741824 / 2) {
+                ncap = 1073741824;
+                break;
+            }
             ncap = ncap * 2;
         }
         byte[] nb = new byte[ncap + 1];
@@ -358,14 +393,107 @@ class RedisClient {
         return sent;
     }
 
-    /// <summary>发送命令（参数向量）并等待其回复。</summary>
+    /// <summary>发送命令（参数向量）并等待其回复。内部使用 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。</summary>
     async RedisReply CommandAsync(List<string> args) {
+        await this.AcquireLock();
+        try {
+            return await this.CommandInternalAsync(args);
+        } finally {
+            this.ReleaseLock();
+        }
+    }
+
+    async RedisReply CommandInternalAsync(List<string> args) {
         int sent = await this.sendArgs(args);
         RedisReply r = new RedisReply();
         if (!this.connected || sent <= 0) {
             r.kind = RedisReply.ERROR;
             r.str = "connection closed";
             this.lastError = r.str;
+            return r;
+        }
+        r = await this.readReply();
+        if (r.IsError()) {
+            this.lastError = r.str;
+        }
+        return r;
+    }
+
+    /// <summary>发送带二进制参数的命令（如 SET key <byte[]>）并等待回复。
+    /// 前缀参数以字符串形式编码，最后一个二进制参数按原生字节流发送，
+    /// 完全二进制安全，支持任意包含 NUL 字节的大数据量载荷。</summary>
+    async RedisReply CommandBytesAsync(List<string> prefixArgs, byte[] binaryArg) {
+        await this.AcquireLock();
+        try {
+            return await this.CommandBytesInternalAsync(prefixArgs, binaryArg);
+        } finally {
+            this.ReleaseLock();
+        }
+    }
+
+    async RedisReply CommandBytesInternalAsync(List<string> prefixArgs, byte[] binaryArg) {
+        RedisReply r = new RedisReply();
+        if (!this.connected) {
+            r.kind = RedisReply.ERROR;
+            r.str = "connection closed";
+            this.lastError = r.str;
+            return r;
+        }
+        int totalArgs = prefixArgs.Count + 1;
+        StringBuilder sb = new StringBuilder();
+        sb.Append("*");
+        sb.Append(Convert.ToString(totalArgs));
+        sb.Append("\r\n");
+        for (int i = 0; i < prefixArgs.Count; i = i + 1) {
+            string a = prefixArgs[i];
+            sb.Append("$");
+            sb.Append(Convert.ToString((int)strlen(a)));
+            sb.Append("\r\n");
+            sb.Append(a);
+            sb.Append("\r\n");
+        }
+        sb.Append("$");
+        int blen = binaryArg != null ? binaryArg.Length : 0;
+        sb.Append(Convert.ToString(blen));
+        sb.Append("\r\n");
+        string head = sb.ToString();
+        int hlen = (int)strlen(head);
+        int sentHead = 0;
+        if (this.tls != null) {
+            sentHead = await this.tls.SendAsync(head, hlen);
+        } else {
+            sentHead = await Socket.SendAsync(this.sock, head, hlen);
+        }
+        if (sentHead != hlen) {
+            this.Close();
+            r.kind = RedisReply.ERROR;
+            r.str = "connection closed";
+            return r;
+        }
+        if (blen > 0) {
+            int sentBin = 0;
+            if (this.tls != null) {
+                sentBin = await this.tls.SendBytesAsync(binaryArg, 0, blen);
+            } else {
+                sentBin = await Socket.SendBytesAsync(this.sock, binaryArg, 0, blen);
+            }
+            if (sentBin != blen) {
+                this.Close();
+                r.kind = RedisReply.ERROR;
+                r.str = "connection closed";
+                return r;
+            }
+        }
+        int sentTail = 0;
+        if (this.tls != null) {
+            sentTail = await this.tls.SendAsync("\r\n", 2);
+        } else {
+            sentTail = await Socket.SendAsync(this.sock, "\r\n", 2);
+        }
+        if (sentTail != 2) {
+            this.Close();
+            r.kind = RedisReply.ERROR;
+            r.str = "connection closed";
             return r;
         }
         r = await this.readReply();
@@ -426,6 +554,14 @@ class RedisClient {
         return r.AsString() == "OK";
     }
 
+    /// <summary>二进制安全的 SET：将原始字节数组作为值存储。支持包含 NUL 字节的任意二进制载荷与大数据量。</summary>
+    async bool SetBytesAsync(string key, byte[] val) {
+        if (val == null) { return false; }
+        List<string> args = new List<string>{ "SET", key };
+        RedisReply r = await this.CommandBytesAsync(args, val);
+        return r.IsString() && r.AsString() == "OK";
+    }
+
     /// <summary>GET key。返回对应的值；键不存在（nil）时
     /// 返回空字符串。如需区分 nil 与
     /// 空值，请使用 <see cref="GetReplyAsync"/>。</summary>
@@ -435,6 +571,14 @@ class RedisClient {
             return "";
         }
         return r.AsString();
+    }
+
+    /// <summary>二进制安全的 GET：返回原始字节数组。支持包含 NUL 字节的任意二进制载荷。
+    /// 键不存在或出错时返回 null。</summary>
+    async byte[] GetBytesAsync(string key) {
+        RedisReply r = await this.CommandAsync2("GET", key);
+        if (r.IsNil() || r.IsError()) { return null; }
+        return r.AsBytes();
     }
 
     /// <summary>GET key，返回原始回复，使调用方可区分
