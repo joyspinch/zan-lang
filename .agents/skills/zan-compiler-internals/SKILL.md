@@ -198,7 +198,8 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   `Action<Canvas,int,int>`（仓里只有零元 Gui.Action 与一元
   System.Linq.Action<T>，多元泛型根本不存在）潜伏三周，直到首个模板
   （game/idle）真引用才爆。教训：① 基建批次的验证不能只编"入口程序"，
-  要有把包/库**整树拉进编译集**的健康普查（逐文件或整包合编）；
+  要有把包/库**整树拉进编译集**的健康普查（`scripts\pkg_sweep.ps1` 一键
+  全包整树合编；2026-10-01 基线 26 包全绿，后续拆包/大改后重跑）；
   ② 多参回调一律声明具名委托（`delegate void BulletHitFn(int, double, ...)`
   放消费方同命名空间），lambda 实参照常转换，别指望仓里有多元 Action。
 - **同名类型歧义按泛型元数过滤（B-ID38，已根治）**：`using System; using Gui;`
