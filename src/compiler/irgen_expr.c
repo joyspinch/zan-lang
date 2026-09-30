@@ -10627,10 +10627,13 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
 
                 LLVMAddCase(g->current_async_switch, LLVMConstInt(i32, (unsigned)k, 0), rk);
 
-                /* Fast path probe: if sub is already completed, inline directly. */
+                /* Fast path probe: if sub is already completed, inline directly.
+                 * Acquire: pairs with the sub frame's release store of DONE so
+                 * the RESULT read below is the completed one. */
                 LLVMValueRef done_p = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
                     ASYNC_FRAME_DONE, "sub.done.p");
                 LLVMValueRef is_done = LLVMBuildLoad2(g->builder, i32, done_p, "sub.is_done");
+                LLVMSetOrdering(is_done, LLVMAtomicOrderingAcquire);
                 LLVMValueRef fast_cond = zan_icmp(g->builder, LLVMIntNE, is_done,
                     LLVMConstInt(i32, 0, 0), "sub.already_done");
                 LLVMBuildCondBr(g->builder, fast_cond, fast_bb, prep_bb);
@@ -10714,7 +10717,10 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
              * in a concurrent client/server program would never run. */
             LLVMValueRef done_p = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
                 ASYNC_FRAME_DONE, "sub.done.p");
+            /* Acquire probe: pairs with the frame's release DONE store; the
+             * pump loop in zan_co_sched_run_until re-probes with acquire. */
             LLVMValueRef is_done = LLVMBuildLoad2(g->builder, i32, done_p, "sub.is_done");
+            LLVMSetOrdering(is_done, LLVMAtomicOrderingAcquire);
             LLVMValueRef need_pump = zan_icmp(g->builder, LLVMIntEQ, is_done,
                 LLVMConstInt(i32, 0, 0), "sub.need_pump");
             LLVMValueRef fn = g->current_fn;

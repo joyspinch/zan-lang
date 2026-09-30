@@ -5132,7 +5132,10 @@ void zan_co_sched_run_until(const volatile int *done) {
          * immediately so callers are not blocked by long-running background
          * tasks (e.g. metrics flushers or timers). */
         int spins = 0;
-        while (!*done) {
+        /* Acquire load: the producer publishes the result slot BEFORE the
+         * release store of *done, so seeing 1 here guarantees the result
+         * read after the loop is the completed one, on every CPU. */
+        while (__atomic_load_n(done, __ATOMIC_ACQUIRE) == 0) {
             if (spins < 512) { Sleep(0); spins++; }
             else Sleep(1);
         }
@@ -5196,14 +5199,16 @@ size_t zan_co_pending(void) {
 void zan_co_sched_run_until(const volatile int *done) {
     for (;;) {
         while (g_rq_head) {
-            if (done && *done) return;
+            /* Acquire: pairs with the coroutine's release store of *done so
+             * the frame's result slot is visible once this reads 1. */
+            if (done && __atomic_load_n(done, __ATOMIC_ACQUIRE) != 0) return;
             zan_co_node *n = g_rq_head;
             g_rq_head = n->next; if (!g_rq_head) g_rq_tail = NULL;
             void *frame = n->frame; zan_co_step_t step = n->step;
             free(n);
             step(frame);
         }
-        if (done && *done) return;
+        if (done && __atomic_load_n(done, __ATOMIC_ACQUIRE) != 0) return;
         long long timeout = zan_timer_next_timeout();
         if (timeout >= 0) {
             if (timeout > 0) {

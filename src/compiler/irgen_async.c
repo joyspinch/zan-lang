@@ -229,7 +229,15 @@ static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals, LLVMValue
 
     LLVMValueRef done_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
         ASYNC_FRAME_DONE, "fr.done");
-    LLVMBuildStore(g->builder, LLVMConstInt(i32, 1, 0), done_ptr);
+    /* Release exchange: every waiter that observes DONE==1 through an
+     * acquire load (the await fast-path probe, the root-drive probe and the
+     * runtime's zan_co_sched_run_until spin) must also see the RESULT store
+     * above. Plain stores left that ordering to luck -- fine under x86 TSO,
+     * a real race under weak arm64/wasm32 memory order and for the LLVM
+     * optimizer, which may hoist the dependent plain RESULT load above the
+     * plain DONE probe. */
+    LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpXchg, done_ptr,
+        LLVMConstInt(i32, 1, 0), LLVMAtomicOrderingRelease, 0);
     LLVMBuildStore(g->builder, LLVMConstInt(i32, -1, 1),
         LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_STATE, "fr.state"));
     /* a `return` inside a try leaves that try's armed-handler count behind;
