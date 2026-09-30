@@ -1,6 +1,6 @@
 # System.IO.Compression
 
-> 源码: `stdlib/System/IO/Compression/BZip2.zan`, `stdlib/System/IO/Compression/Crc32.zan`, `stdlib/System/IO/Compression/Deflate.zan`, `stdlib/System/IO/Compression/GZip.zan`, `stdlib/System/IO/Compression/Tar.zan`, `stdlib/System/IO/Compression/Zip.zan`
+> 源码: `packages/Zan.IO/src/System/IO/Compression/BZip2.zan`, `packages/Zan.IO/src/System/IO/Compression/Crc32.zan`, `packages/Zan.IO/src/System/IO/Compression/Deflate.zan`, `packages/Zan.IO/src/System/IO/Compression/GZip.zan`, `packages/Zan.IO/src/System/IO/Compression/Tar.zan`, `packages/Zan.IO/src/System/IO/Compression/Zip.zan`
 
 
 ## BZip2 (class)

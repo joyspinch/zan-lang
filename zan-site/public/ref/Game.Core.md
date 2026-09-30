@@ -317,7 +317,7 @@ loopStart..末尾——例如施法前摇后接持续施法）。
 
 - InputMapper input;
 
-- Action <Canvas, int, int> onRenderHudCallback;
+- HudRenderFn onRenderHudCallback;
 
 - bool autoDriveClock;
 
@@ -331,7 +331,7 @@ loopStart..末尾——例如施法前摇后接持续施法）。
 
 - bool AutoDriveClock{ get set}
 
-- void SetHudRenderer(Action <Canvas, int, int> hudCallback)
+- void SetHudRenderer(HudRenderFn hudCallback)
   - 注册顶层 HUD / UI 绘制回调（在场景世界渲染完成后叠加）。
 
 - override void OnMeasure(App app)
@@ -427,7 +427,7 @@ loopStart..末尾——例如施法前摇后接持续施法）。
 
 - bool popPendingOnSwitch;
 
-- Action <int, int> onAudioTransitionCallback;
+- AudioTransitionFn onAudioTransitionCallback;
 
 - SceneManager(int maxStackDepth)
 
@@ -448,7 +448,7 @@ loopStart..末尾——例如施法前摇后接持续施法）。
 - Scene Pop()
   - 弹出顶层场景，恢复下一层场景为活跃态。
 
-- void SetAudioTransitionCallback(Action <int, int> callback)
+- void SetAudioTransitionCallback(AudioTransitionFn callback)
   - 设置切场时的音频渐隐渐入联动回调。
 
 - void SwitchScene(Scene nextScene, double duration)
@@ -506,6 +506,22 @@ loopStart..末尾——例如施法前摇后接持续施法）。
 - int FindNearest(double qx, double qy, double maxRange)
   - 寻找离指定点 (qx, qy) 在 maxRange 范围内最近的实体 ID，未找到返回 -1。
     塔防防御塔攻击索敌、自动施法的关键核心算子。
+
+
+## void (delegate)
+
+HUD 叠层渲染回调：画布、视口宽、视口高（设备像素）。
+仓里没有多元 Action 泛型（System.Linq 只有 Action<T> 一元，
+Gui.Action 是零元），多参回调一律声明具名委托。
+
+`delegate void HudRenderFn(Canvas canvas, int width, int height);`
+
+
+## void (delegate)
+
+切场音频联动回调：渐出毫秒、渐入毫秒。
+
+`delegate void AudioTransitionFn(int fadeOutMs, int fadeInMs);`
 
 
 ## TransitionPhase (enum)

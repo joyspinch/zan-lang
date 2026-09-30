@@ -1,6 +1,6 @@
 # System.Scripting
 
-> 源码: `stdlib/System/Scripting/Lua.zan`
+> 源码: `packages/Zan.Scripting/src/System/Scripting/Lua.zan`
 
 
 ## Lua (class)

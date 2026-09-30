@@ -64,7 +64,7 @@
 - void ReceiveServerFrame(int frameIdx, PlayerCommand[]cmds, int count)
   - 接收到服务器广播的指定逻辑帧命令包。
 
-- int Update(double dt, Action <int, FrameBucket> onExecuteLogicTick)
+- int Update(double dt, LogicTickFn onExecuteLogicTick)
   - 推进时间并尝试消耗帧。
     回调 delegate: void OnExecuteFrame(int frameIndex, FrameBucket bucket)
 
@@ -193,7 +193,7 @@
 
 - void Resume()
 
-- int Update(double dt, Action <int, List<PlayerCommand>> onExecuteFrame)
+- int Update(double dt, ReplayFrameFn onExecuteFrame)
   - 推进回放时间轴，按倍速逐帧触发执行回调。
 
 
@@ -225,3 +225,17 @@
   - 结束录制。
 
 - List<ReplayFrameRecord> GetFrames()
+
+
+## void (delegate)
+
+帧同步逻辑帧执行回调：逻辑帧号、该帧指令桶。
+
+`delegate void LogicTickFn(int logicFrame, FrameBucket bucket);`
+
+
+## void (delegate)
+
+录像回放帧执行回调：帧号、该帧玩家指令集。
+
+`delegate void ReplayFrameFn(int frameIndex, List<PlayerCommand> commands);`

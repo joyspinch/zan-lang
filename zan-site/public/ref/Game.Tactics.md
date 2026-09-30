@@ -59,7 +59,7 @@
 - int Spawn(BulletType type, double spawnX, double spawnY, int tgtId, double tgtX, double tgtY, double speed, double dmg, double splashR, double maxLife)
   - 发射一枚直线或追踪子弹。
 
-- void Update(double dt, Action <int, double, double, double, double> onHitCallback)
+- void Update(double dt, BulletHitFn onHitCallback)
   - 逐物理步长更新所有活动子弹位置，返回命中目标的子弹索引委托回调。
 
 - void Kill(int idx)
@@ -307,9 +307,30 @@ RTS 海量单位集群互斥避障（Reciprocal Velocity Obstacles - RVO2 / ORCA
 - void StartNextWaveImmediately()
   - 跳过准备倒计时，立即开启下一波怪物进击。
 
-- void Update(double dt, int aliveMonsterCount, Action <int, int> onSpawnMonster, Action<int> onWaveCompleted)
+- void Update(double dt, int aliveMonsterCount, SpawnMonsterFn onSpawnMonster, WaveCompleteFn onWaveCompleted)
   - 逐物理帧推进波次状态机。
     当需要生成怪物时触发 onSpawnMonster 委托。
+
+
+## void (delegate)
+
+子弹命中回调：子弹槽位、命中点 x/y、伤害、溅射半径。
+
+`delegate void BulletHitFn(int bulletIndex, double x, double y, double damage, double splashRadius);`
+
+
+## void (delegate)
+
+生成怪物回调：波次号、怪物类型。
+
+`delegate void SpawnMonsterFn(int wave, int mobType);`
+
+
+## void (delegate)
+
+波次完成回调：波次号。
+
+`delegate void WaveCompleteFn(int wave);`
 
 
 ## BulletType (enum)

@@ -122,13 +122,19 @@ if (Test-Path packages\Zan.Globalization) {
 if (Test-Path packages\Zan.Resources) {
     $files += (Get-ChildItem packages\Zan.Resources\src -Recurse -Include *.zan).FullName
 }
+if (Test-Path packages\Zan.IO) {
+    $files += (Get-ChildItem packages\Zan.IO\src -Recurse -Include *.zan).FullName
+}
+# Tar (publish archives macOS/Linux output dirs as tar -- the only common
+# format that carries the unix mode bit, see ZanIDE.Package.zan) rides in the
+# Zan.IO group above alongside Zip/GZip used by Xlsx and MarketplaceInstall.
+if (Test-Path packages\Zan.Web) {
+    $files += (Get-ChildItem packages\Zan.Web\src -Recurse -Include *.zan).FullName
+}
 # System pieces the editor/workspace rely on.
 $files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\IO\FileInfo.zan")
-# The publish path archives a macOS/Linux output directory as tar (the only
-# common format that carries the unix mode bit) -- see ZanIDE.Package.zan.
-$files += (Join-Path (Get-Location) "stdlib\System\IO\Compression\Tar.zan")
 
 # Entry FIRST: zanc gives the generated Main() to the first design document on
 # the command line (genrun.c passes emitMain only for paths[0]), so the form

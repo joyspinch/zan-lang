@@ -1,6 +1,6 @@
 # System.IO.Watch
 
-> 源码: `stdlib/System/IO/Watch/DirectoryWatcher.zan`
+> 源码: `packages/Zan.IO/src/System/IO/Watch/DirectoryWatcher.zan`
 
 
 ## DirectoryWatcher (class)

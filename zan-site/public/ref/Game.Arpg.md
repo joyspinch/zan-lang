@@ -6324,7 +6324,7 @@ host、port、path 与 secure 标志。端口省略时默认 80（ws）
 - double GetSortedFootY(int i)
   - 获取排序后第 i 个槽位的脚底 Y 坐标。
 
-- void ForEachSorted(Action <int, int, double> renderAction)
+- void ForEachSorted(SortedRenderFn renderAction)
   - 依正确的深度遮挡顺序逐个提取实体渲染。
 
 
@@ -6637,6 +6637,15 @@ host、port、path 与 secure 标志。端口省略时默认 80（ws）
 窗口自定义事件回调（由 FireCustom 触发，payload 原样透传）。
 
 `delegate void ArpgWindowCustomEvent(string windowId, string name, string payload);`
+
+
+## void (delegate)
+
+深度序渲染回调：实体 id、类型槽位、脚底 y（屏幕系）。
+仓里没有多元 Action 泛型（System.Linq 只有 Action<T> 一元，
+Gui.Action 是零元），多参回调一律声明具名委托。
+
+`delegate void SortedRenderFn(int entityId, int entityType, double footY);`
 
 
 ## ArpgEasing (enum)

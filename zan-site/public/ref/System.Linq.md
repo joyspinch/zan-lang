@@ -1,6 +1,6 @@
 # System.Linq
 
-> 源码: `stdlib/System/Linq/Enumerable.zan`, `stdlib/System/Linq/Expression.zan`, `stdlib/System/Linq/Stream.zan`
+> 源码: `packages/Zan.Linq/src/System/Linq/Enumerable.zan`, `packages/Zan.Linq/src/System/Linq/Expression.zan`, `packages/Zan.Linq/src/System/Linq/Stream.zan`
 
 
 ## Enumerable (class)

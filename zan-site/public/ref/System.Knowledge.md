@@ -1,6 +1,6 @@
 # System.Knowledge
 
-> 源码: `stdlib/System/Knowledge/GalleryIndex.zan`, `stdlib/System/Knowledge/ZformSchema.zan`
+> 源码: `packages/Zan.Knowledge/src/System/Knowledge/GalleryIndex.zan`, `packages/Zan.Knowledge/src/System/Knowledge/ZformSchema.zan`
 
 
 ## GalleryIndex (class)

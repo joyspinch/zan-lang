@@ -35,7 +35,7 @@
 - bool Enqueue(ActionKind kind, int src, int tgt, int val, double duration)
   - 向队列尾部推入一个动作。
 
-- void Update(double dt, Action<GameAction> onActionStart, Action<GameAction> onActionFinish)
+- void Update(double dt, System.Linq.Action<GameAction> onActionStart, System.Linq.Action<GameAction> onActionFinish)
   - 逐物理帧推进演播序列。
     触发 onActionStart 和 onActionFinish 委托。
 

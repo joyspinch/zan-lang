@@ -1,6 +1,6 @@
 # System.ServiceProcess
 
-> 源码: `stdlib/System/ServiceProcess/ServiceProcess.zan`
+> 源码: `packages/Zan.Diagnostics/src/System/ServiceProcess/ServiceProcess.zan`
 
 
 ## ServiceInfo (class)

@@ -1,6 +1,6 @@
 # System.Globalization
 
-> 源码: `stdlib/System/Globalization/Lang.zan`, `stdlib/System/Globalization/Lunar.zan`
+> 源码: `packages/Zan.Globalization/src/System/Globalization/Lang.zan`, `packages/Zan.Globalization/src/System/Globalization/Lunar.zan`
 
 
 ## Lang (class)

@@ -1,6 +1,6 @@
 # System.Resources
 
-> 源码: `stdlib/System/Resources/ResourcePack.zan`
+> 源码: `packages/Zan.Resources/src/System/Resources/ResourcePack.zan`
 
 
 ## PackIndexEntry (class)

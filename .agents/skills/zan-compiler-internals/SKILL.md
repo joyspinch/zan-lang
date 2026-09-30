@@ -2757,3 +2757,12 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   builtin_api.c 成员表）不进命名空间解析的限定名回退，`System.Console.WriteLine(..)`
   直接报 "'Console' is not a known variable, type, or namespace"（2026-10-01
   真空门探针踩过，白白烧一轮编译）；探针一律 `using System;` + 裸名形态。
+- 拆包轮的**验证假绿双坑**（2026-10-01，IO/Web 拆包实测）：① run_case.cmake
+  有工件复用优化——conf_*.exe 新于全部源+STDLIB_STAMP 即跳过编译直接重跑，
+  而 stdlib **布局搬移不碰 stamp 不重建 zanc**，家族 ctest 可能整批 0.06s
+  "通过"实际全是拆包前编的旧 exe。拆包轮跑 ctest 前先 `rm build/conf_*`（或
+  核对工件 mtime > 搬移时间）；0.06 秒过一次 zanc 编译本身就是警报。
+  ② zan-site 再生只跑 `site_build.py` 不重提取——ref 页/index.json 沿用
+  旧 gen/ref-data.json，搬移后的 stdlib/ 路径静默残留且 git diff 为 0 的
+  假象极具迷惑性；必须先 `python gen/api_extract.py` 再 site_build，验收
+  标志是 index.json 里出现 `packages/<名>/` 新路径。
