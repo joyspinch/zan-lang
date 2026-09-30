@@ -1137,12 +1137,17 @@ typedef struct pi_name {
     const char *str;
     unsigned len;
     int flagged;                /* live: some parsed source spells this name */
-    int user_decl;              /* declared as a top-level type by an input
-                                 * file: unqualified mentions in user code
+    int user_decl;              /* declared as a GLOBAL-scope top-level type
+                                 * by an input file: unqualified mentions
                                  * resolve to the user's own declaration, so
                                  * they must not pull a same-named stdlib
                                  * file (qualified `Ns.Name` mentions still
-                                 * do -- see pi_seed_source). */
+                                 * do -- see pi_seed_source). Namespace-
+                                 * scoped declarations don't seed it: their
+                                 * namespace is invisible to other files'
+                                 * scope chains, so a same-named stdlib file
+                                 * must stay pullable (nsresolve then sorts
+                                 * the pair out). */
     int ns_root;                /* segment of a known namespace path */
     struct pi_name *next;
 } pi_name_t;
@@ -1966,6 +1971,10 @@ static void pi_seed_source(const char *source, size_t len) {
         zan_apply_lex_defines(&lex, pi_target, pi_pp_defines,
                               pi_pp_define_count, pi_publish_mode);
         int depth = 0;
+        /* set once a file-scoped `namespace X;` is seen: every later
+         * top-level declaration is ns-scoped, so it must not seed the
+         * user_decl shadow (see pi_seed_parsed_unit) */
+        int ns_file_scoped = 0;
         zan_token_kind_t prev = TK_EOF;
         pi_name_t *chain = NULL;    /* first segment of the dotted chain */
         for (;;) {
@@ -2029,6 +2038,8 @@ static void pi_seed_source(const char *source, size_t len) {
                     if (tok.kind != TK_IDENT) break;
                 }
                 nsname[used] = 0;
+                if (tok.kind == TK_SEMICOLON)
+                    ns_file_scoped = 1;   /* decls below are ns-scoped */
                 if (tok.kind == TK_SEMICOLON || tok.kind == TK_LBRACE) {
                     for (char *seg = nsname; *seg; ) {
                         char *dot = strchr(seg, '/');
@@ -2047,7 +2058,8 @@ static void pi_seed_source(const char *source, size_t len) {
             case TK_STRUCT:
             case TK_ENUM:
             case TK_INTERFACE:
-                if (depth <= 1 && prev != TK_COLON && prev != TK_COMMA &&
+                if (depth == 0 && !ns_file_scoped &&
+                    prev != TK_COLON && prev != TK_COMMA &&
                     pass == 1) {
                     zan_token_t next = zan_lexer_peek(&lex);
                     if (next.kind == TK_IDENT) {
@@ -2062,7 +2074,8 @@ static void pi_seed_source(const char *source, size_t len) {
                 }
                 break;
             case TK_DELEGATE:
-                if (depth <= 1 && prev != TK_COLON && prev != TK_COMMA &&
+                if (depth == 0 && !ns_file_scoped &&
+                    prev != TK_COLON && prev != TK_COMMA &&
                     pass == 1) {
                     pi_name_t *name = NULL;
                     int angle = 0;
@@ -2085,7 +2098,8 @@ static void pi_seed_source(const char *source, size_t len) {
                 break;
             case TK_IDENT:
                 /* `record Name(...)` lowers to a class. */
-                if (depth <= 1 && tok.str_val.len == 6 &&
+                if (depth == 0 && !ns_file_scoped &&
+                    tok.str_val.len == 6 &&
                     memcmp(tok.str_val.str, "record", 6) == 0 &&
                     zan_lexer_peek(&lex).kind == TK_IDENT && pass == 1) {
                     tok = zan_lexer_next(&lex);
@@ -2706,30 +2720,34 @@ static void pi_seed_parsed_unit(zan_ast_node_t *unit, int is_entry) {
                         qn->qualified_name.parts.count - 1]->ident.name);
             }
         }
-        /* top-level declared names of an entry are its OWN declarations:
-         * same-named stdlib files must not be pulled (user_decl), matching
-         * the lexical pass's entry handling */
+        /* Top-level declared names of an entry are its OWN declarations --
+         * but only at GLOBAL scope. The shadow's premise is that an
+         * unqualified mention resolves to the entry's declaration; that
+         * holds only where the declaring namespace is in scope. A
+         * namespace-scoped input declaration (package file
+         * `System.Management.Cpu`) is invisible to a file referencing bare
+         * `Cpu` through `using System.Runtime.Intrinsics`, so suppressing
+         * the stdlib pull there starves nsresolve of the real declaration
+         * and the binder misbinds the name to the package's class (order-
+         * dependently: the shadow only blocked flags that arrived after
+         * the declaring file was parsed). Global-scope declarations keep
+         * the shadow: the generated `partial class App` wins over stdlib
+         * Gui.App by the global-namespace rule, so pulling Gui/App.zan is
+         * pure width. */
         if (is_entry && !pi_seed_stdlib_input) {
-            zan_ast_node_t *ns = unit->comp_unit.ns;
-            const zan_ast_list_t *scopes[2];
-            int scope_count = 0;
-            scopes[scope_count++] = &unit->comp_unit.decls;
-            if (ns && ns->kind == AST_NAMESPACE_DECL)
-                scopes[scope_count++] = &ns->namespace_decl.members;
-            for (int s = 0; s < scope_count; s++) {
-                for (int i = 0; i < scopes[s]->count; i++) {
-                    zan_ast_node_t *d = scopes[s]->items[i];
-                    if (!d || (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL &&
-                               d->kind != AST_INTERFACE_DECL &&
-                               d->kind != AST_DELEGATE_DECL))
-                        continue;
-                    /* `name` sits at offset 0 in both union arms */
-                    zan_istr_t name = d->type_decl.name;
-                    if (!name.str || name.len <= 0) continue;
-                    pi_name_t *nm = pi_intern(name.str,
-                                              (size_t)name.len);
-                    if (nm) nm->user_decl = 1;
-                }
+            for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+                zan_ast_node_t *d = unit->comp_unit.decls.items[i];
+                if (!d || (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL &&
+                           d->kind != AST_INTERFACE_DECL &&
+                           d->kind != AST_DELEGATE_DECL))
+                    continue;
+                if (zan_ast_ns_name(d).len > 0) continue;
+                /* `name` sits at offset 0 in both union arms */
+                zan_istr_t name = d->type_decl.name;
+                if (!name.str || name.len <= 0) continue;
+                pi_name_t *nm = pi_intern(name.str,
+                                          (size_t)name.len);
+                if (nm) nm->user_decl = 1;
             }
         }
         pi_seed_ast(unit);

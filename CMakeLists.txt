@@ -2090,6 +2090,21 @@ add_test(NAME conformance_multifile
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_multifile${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# ---- nsresolve enclosing-namespace resolution: a bare name in Gui.Sub
+#      binds to Gui.App by the ancestor walk and KEEPS that binding when a
+#      global-scope App joins the compile and both Apps get collision-
+#      mangled (the design-generated global `partial class App` shape that
+#      broke Zan.Gui.DataTable's bare-App files). ----
+add_test(NAME conformance_nsresolve_ancestor
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/nsresolve_ancestor/main.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/nsresolve_ancestor/lib.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsresolve_ancestor/sub.zan;--auto-stdlib"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/nsresolve_ancestor/expected.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_nsresolve_ancestor${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_nsresolve_ancestor PROPERTIES TIMEOUT 120)
+
 # ---- Response file: `zanc @file` takes its arguments from a file, so a
 #      whole-project build is not capped by the shell's command-line limit
 #      (cmd.exe truncates at 8191 characters). ----

@@ -2606,3 +2606,36 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   build/zanc.exe 后 build zan_gui 必须出现 gui_runtime 重编行。
 - 同型问题举一反三：凡"C 侧手抄镜像发射侧契约"的文件（自研运行时、驱动、
   生成器宿主）都照此钉住生成器可执行文件，别指望源码 diff 触发重编。
+
+## 拉入门 user_decl 遮蔽与外围命名空间解析：同名类错绑的两个底层缺口（Zan.Security 拆包实测，2026-09-30）
+
+- 坑一（拉入门 user_decl 遮蔽命名空间盲+顺序依赖）：pi 活名门控的 `user_decl`
+  遮蔽按**裸名**生效——任何输入文件声明的顶层类型 X 都会压制 stdlib 同名 X.zan
+  的拉入，不论声明在哪个命名空间。包文件 `System.Management.Cpu`（显式清单）
+  一进编译，`Crc32C` 里 `using System.Runtime.Intrinsics;` + 裸 `Cpu.HasSse42`
+  就拉不进 stdlib 真身：nsresolve 表里只剩 Management.Cpu，using 命中落空，
+  裸名兜底错绑（报 `'Cpu' has no member 'HasSse42'`）。更毒的是**顺序依赖**：
+  遮蔽只在 `pi_flag_istr` 打标时生效——声明文件排在引用文件之前才压制，
+  排后则 flag 先到获胜，同一代码随参数顺序时过不过。B-ID35 教训"带 using 的
+  调用方不受影响"在拉入层不成立：using 命中的前提（stdlib 文件入表）被拉入门
+  掐掉了。`ZAN_PULLIN_DEBUG=1` 直接看 `incl/skip ... because X` 定位此类。
+- 修法一：user_decl 遮蔽窄化到**全局命名空间**声明（AST 路径看 stamp 后
+  `zan_ast_ns_name(d).len==0`；词法路径跟踪文件级 `namespace X;`）。设计稿
+  生成的全局 `partial class App` 场景保留遮蔽（全局声明绑定必赢，拉入纯浪费
+  宽度）；命名空间内声明交给 nsresolve 冲突改名正确裁决，且打标顺序无关。
+- 坑二（外围命名空间不逐级查找）：nsresolve 原来只试 ctx_ns 全拼接 + usings，
+  没有 C# 的 enclosing-namespace 逐级回溯。`namespace Gui.Sub;` 里裸 `App`
+  （真身 Gui.App）、`namespace System.Runtime.Intrinsics.X86;` 里裸 `Cpu`
+  （真身父命名空间的 Cpu）全靠**全局兜底唯一性**侥幸——解析集里一旦出现
+  另一个同名（设计稿全局 App、包 Management.Cpu），冲突改名后未改写的裸引用
+  集体死（`undefined type` / `has no member`）。约 20+ 个 Gui 包文件
+  （DataTable.Export.zan 等）正是这个形态，`using Gui;` 经层级包发现整树入集
+  后必炸。
+- 修法二：resolve_ref 与 resolve_static_receiver 在 ctx 命中后、usings 之前
+  沿 ns 链从内向外逐级试（`Gui.Component.DataTable`→`Gui.Component`→`Gui`，
+  全局兜底仍是最后一级）。回归锁：`conformance_nsresolve_ancestor` 三文件
+  （Gui.App / Gui.Sub 裸引用 / 全局 App 对撞），旧编译器 `enclosing FAIL
+  got=global-app`、新编译器 PASS——正是"旧靠兜底侥幸、新按作用域正确"的分水岭。
+- 探针定式：此类编译器缺口最小两文件常测不出（小世界无同框撞名/顺序恰好
+  幸存），必须**二分真实全量输入**：先 `@rsp` 全量复现，再逐组裁剪到最小
+  复现集，`ZAN_PULLIN_DEBUG=1` 对比拉入清单定锁 who-suppressed-what。

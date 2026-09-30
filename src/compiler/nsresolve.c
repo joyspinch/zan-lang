@@ -466,13 +466,31 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
         return;
     }
 
-    /* simple name: same-namespace first, then usings. The global namespace is
-     * a namespace too: a declaration at global scope must win over an import,
-     * or a file with no `namespace` line resolves its own class to a
-     * same-named stdlib type pulled in by `using` (the generated global
-     * `partial class App` bound its App.OnLoad to Gui.App). join_ns returns
-     * the bare name for an empty ctx_ns, so this covers both. */
+    /* simple name: same-namespace first, then enclosing namespaces (C#
+     * scoping: a file in Gui.Component.DataTable sees Gui's types without
+     * a using -- every Gui.* package file relying on a bare `App` did this
+     * through the fragile global fallback until now), then usings. The
+     * global namespace is a namespace too: a declaration at global scope
+     * must win over an import, or a file with no `namespace` line resolves
+     * its own class to a same-named stdlib type pulled in by `using` (the
+     * generated global `partial class App` bound its App.OnLoad to
+     * Gui.App). join_ns returns the bare name for an empty ctx_ns, so the
+     * first call covers ctx==global; the walk below adds the ancestors,
+     * innermost first, global last. */
     t = find_full_joined(c, ctx_ns, R);
+    if (!t && ctx_ns.len > 0) {
+        char abuf[256];
+        if (ctx_ns.len < sizeof(abuf)) {
+            memcpy(abuf, ctx_ns.str, ctx_ns.len);
+            abuf[ctx_ns.len] = '\0';
+            for (char *dot = strrchr(abuf, '.'); dot; dot = strrchr(abuf, '.')) {
+                *dot = '\0';
+                zan_istr_t anc = mk_istr(c->arena, abuf, (uint32_t)(dot - abuf));
+                t = find_full_joined(c, anc, R);
+                if (t) break;
+            }
+        }
+    }
     if (t && !arity_matches(tr, t)) {
         /* The same-namespace declaration cannot take the reference's type
          * arguments: leave the reference untouched (it resolves to the
@@ -531,13 +549,31 @@ static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
     if (c->refs) zan_refs_add(c->refs, R, c->arena);
 
     nr_type_t *t = NULL;
-    /* Same-namespace first, the global namespace included -- the same rule
-     * resolve_ref applies to type positions. A declaration at global scope
-     * must win over an import, or `App.OnLoad(form)` in the design-generated
-     * global `partial class App` resolves through `using Gui;` to Gui.App and
-     * the binder reports `'Gui_App' has no member 'OnLoad'`. join_ns returns
-     * the bare name for an empty ctx_ns, so this covers both scopes. */
+    /* Same-namespace first, then enclosing namespaces (the expression-
+     * position twin of resolve_ref's ancestor walk: `Cpu.HasSse42` inside
+     * namespace System.Runtime.Intrinsics.X86 binds to the parent
+     * Intrinsics Cpu by scope, not by the global fallback's uniqueness
+     * luck), the global namespace included -- the same rule resolve_ref
+     * applies to type positions. A declaration at global scope must win
+     * over an import, or `App.OnLoad(form)` in the design-generated global
+     * `partial class App` resolves through `using Gui;` to Gui.App and the
+     * binder reports `'Gui_App' has no member 'OnLoad'`. join_ns returns
+     * the bare name for an empty ctx_ns, so the first call covers
+     * ctx==global. */
     t = find_full_joined(c, ctx_ns, R);
+    if (!t && ctx_ns.len > 0) {
+        char abuf[256];
+        if (ctx_ns.len < sizeof(abuf)) {
+            memcpy(abuf, ctx_ns.str, ctx_ns.len);
+            abuf[ctx_ns.len] = '\0';
+            for (char *dot = strrchr(abuf, '.'); dot; dot = strrchr(abuf, '.')) {
+                *dot = '\0';
+                zan_istr_t anc = mk_istr(c->arena, abuf, (uint32_t)(dot - abuf));
+                t = find_full_joined(c, anc, R);
+                if (t) break;
+            }
+        }
+    }
     if (!t && usings) {
         char ubuf[256];
         for (int i = 0; i < usings->count && !t; i++) {

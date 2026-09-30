@@ -1,6 +1,6 @@
 # System.Security
 
-> 源码: `stdlib/System/Security/Guard.zan`
+> 源码: `packages/Zan.Security/src/System/Security/Guard.zan`
 
 
 ## Guard (class)

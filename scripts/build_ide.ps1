@@ -95,6 +95,9 @@ if (Test-Path packages\Zan.Data) {
 if (Test-Path packages\Zan.Desktop) {
     $files += (Get-ChildItem packages\Zan.Desktop\src -Recurse -Include *.zan).FullName
 }
+if (Test-Path packages\Zan.Security) {
+    $files += (Get-ChildItem packages\Zan.Security\src -Recurse -Include *.zan).FullName
+}
 # System pieces the editor/workspace rely on.
 $files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
@@ -130,9 +133,15 @@ if ($designs.Count -gt 0) {
 $exeOut = Join-Path (Get-Location) "build\ZanIDE.exe"
 $exeOld = Join-Path (Get-Location) "build\ZanIDE.prev.exe"
 
+# The source list goes through a zanc @file response file: the explicit list
+# crossed the Windows 32K command-line limit when Zan.Security joined the
+# package groups ("The filename or extension is too long" from CreateProcess).
+$rsp = Join-Path (Get-Location) "build\ide_files.rsp"
+$files | ForEach-Object { '"' + $_ + '"' } | Set-Content -Path $rsp -Encoding UTF8
+
 $zanArgs = @()
 $zanArgs += $entry
-$zanArgs += $files
+$zanArgs += ("@" + $rsp)
 $zanArgs += @("-o", $exeOut, "--subsystem", "windows")
 # Release shape (--publish): Os codegen + the optimization sweep + a stripped
 # link. The unoptimized dev default (O0 + fast_codegen) made the exe ~21 MB,
