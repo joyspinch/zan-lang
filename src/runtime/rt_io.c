@@ -202,13 +202,44 @@ typedef struct zan_io_entry {
 
 static zan_io_entry_t *g_io_entries;    /* linked list of active watchers */
 
-/* Pending recv-op parameters, consumed by the next io_register. The POSIX
- * backends run only under the single-thread inline driver, so plain statics are
- * safe (the multi-worker driver is Windows/IOCP-only). */
-static void   *g_pending_rbuf;
-static int32_t  g_pending_rlen;
-static int64_t *g_pending_out_n;
-static intptr_t *g_pending_accept_out;
+/* Pending recv-op parameters, consumed by the next io_register. The whole
+ * lifetime of these values is straight-line code in zan_io_recv_co /
+ * zan_io_recv_to_co / zan_io_accept_co on one thread (set, then io_register
+ * consumes them -- no yield in between), so thread-local storage keeps each
+ * park pair private. Plain statics raced under the multi-worker driver
+ * (zanrt_io_mt, linked for --async-workers on Windows/Linux/macOS/iOS
+ * targets): two workers parking at once clobbered each other's sinks, so one
+ * watcher recv'd into the other's buffer and the other's out_n was never
+ * written. */
+static _Thread_local void   *g_pending_rbuf;
+static _Thread_local int32_t  g_pending_rlen;
+static _Thread_local int64_t *g_pending_out_n;
+static _Thread_local intptr_t *g_pending_accept_out;
+
+/* The reactor state below (slot table, entry list, dead queue, rto list,
+ * g_io_count) is shared. The multi-worker driver runs coroutines on several
+ * OS threads on POSIX too, so two workers can be inside io_register /
+ * zan_io_poll / zan_io_close_notify concurrently; every one of those entries
+ * takes this mutex (helpers assume it is held). This restores the
+ * single-reactor-turn assumption the rto and sweep protocols were designed
+ * under -- the same serialization the Windows side gets from per-shard IOCPs
+ * and rto_claim. On the single-thread drivers it compiles to no-ops: there a
+ * poll turn can switch fibers (io_wake -> zan_io_resume), so a real lock
+ * could self-deadlock, and there is nothing to serialize anyway. */
+#if defined(ZAN_CO_DRIVER) && !defined(_WIN32)
+static pthread_mutex_t g_reactor_mx = PTHREAD_MUTEX_INITIALIZER;
+static void reactor_lock(void)   { pthread_mutex_lock(&g_reactor_mx); }
+static void reactor_unlock(void) { pthread_mutex_unlock(&g_reactor_mx); }
+#else
+static void reactor_lock(void)   {}
+static void reactor_unlock(void) {}
+#endif
+
+/* Backend entry bodies (defined in each platform section below; exactly one
+ * compiles). The public wrappers above them lock, then delegate. */
+static void io_init_locked(void);
+static void io_shutdown_locked(void);
+static int32_t io_poll_locked(int64_t timeout_ms);
 
 /* ---- watchers stranded on a dead fd ----
  * A watcher whose fd is already closed (or was never valid: -1 out of a failed
@@ -243,7 +274,11 @@ typedef struct zan_io_dead {
 
 static zan_io_dead_t *g_io_dead;
 static int g_io_dead_count;
-static int g_io_fast_budget = ZAN_IO_FAST_BURST;
+/* Per-thread: each worker's speculative-recv budget refills when THAT worker
+ * turns the reactor (zan_io_pump_timeout), and only that same thread's fast
+ * paths spend it. A shared int was an unsynchronized read-modify-write race
+ * across workers. */
+static _Thread_local int g_io_fast_budget = ZAN_IO_FAST_BURST;
 
 /* An fd the kernel still knows (zan_io_socket_alive: a single fcntl here). */
 static int io_fd_usable(intptr_t fd) {
@@ -261,10 +296,13 @@ static int io_fd_usable(intptr_t fd) {
  * leaves the slot -- io_take (event/sweep/close delivery) and io_mark_dead
  * (every failure path) drop it -- and rto_timeout_scan, run at the top of each
  * backend's poll turn, delivers -1 (timeout) for whatever is still parked.
- * The POSIX reactors are single-threaded, so no claim flag is needed: each
- * retire path is unreachable once the waiter is gone from its slot. Frames
- * only run between poll turns, so reuse of a frame address before the next
- * scan is impossible; and a fresh rto_arm drops any same-frame entry anyway. */
+ * No claim flag is needed here: the retire paths and the scans are all inside
+ * a reactor_lock() section, so exactly one of {recv delivery, deadline scan}
+ * can observe a given waiter -- the mutual exclusion the Windows side gets
+ * from its atomic rto_claim under the sharded IOCPs. rto_arm itself runs
+ * under the caller's lock too (zan_io_recv_to_co holds it across arm +
+ * register so no turn can observe the entry before its watcher exists and
+ * drop it as stale). */
 typedef struct zan_io_rto {
     int fd;
     void *frame;
@@ -1311,7 +1349,7 @@ static int io_sweep_slots(void) {
 
 static int g_epoll_fd = -1;
 
-void zan_io_init(void) {
+static void io_init_locked(void) {
     if (g_io_started) return;
     zan_io_ignore_sigpipe();
     /* A fresh reactor lifetime clears any poison from a failed previous one:
@@ -1338,7 +1376,20 @@ void zan_io_init(void) {
     g_io_started = 1;
 }
 
-void zan_io_shutdown(void) {
+void zan_io_init(void) {
+    /* Fast path first, WITHOUT the reactor lock: zan_co_ready ->
+     * co_pool_ensure -> co_pool_start_background calls this from inside a
+     * poll turn (io_wake readied a frame while io_poll_locked held the
+     * mutex), and a non-recursive re-lock there would self-deadlock. The
+     * flag read is benign: a simultaneous first init still serializes on
+     * the lock, and io_init_locked re-checks g_io_started under it. */
+    if (g_io_started) return;
+    reactor_lock();
+    io_init_locked();
+    reactor_unlock();
+}
+
+static void io_shutdown_locked(void) {
     if (g_slots) {
         for (int fd = 0; fd < g_slots_cap; fd++) {
             zan_io_slot_t *s = &g_slots[fd];
@@ -1360,6 +1411,12 @@ void zan_io_shutdown(void) {
     if (g_epoll_fd >= 0) { close(g_epoll_fd); g_epoll_fd = -1; }
     if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
     g_io_started = 0;
+}
+
+void zan_io_shutdown(void) {
+    reactor_lock();
+    io_shutdown_locked();
+    reactor_unlock();
 }
 
 static int io_arm(int fd, zan_io_slot_t *s) {
@@ -1391,7 +1448,7 @@ static int io_arm(int fd, zan_io_slot_t *s) {
     return 0;
 }
 
-static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+static void io_register_locked(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
     if (g_io_broken) {   /* backend never started: fail, don't park forever */
         io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
         g_pending_rbuf = NULL;
@@ -1458,6 +1515,12 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     }
 }
 
+static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+    reactor_lock();
+    io_register_locked(fd, interest, co, step);
+    reactor_unlock();
+}
+
 /* One waiter per direction is stored inline in the slot (the common case:
  * one coroutine reading and/or writing a socket). The rare extra waiter on
  * the same fd+direction chains through `next`. */
@@ -1496,6 +1559,13 @@ static int rto_timeout_scan(void) {
 }
 
 int32_t zan_io_poll(int64_t timeout_ms) {
+    reactor_lock();
+    int32_t woke = io_poll_locked(timeout_ms);
+    reactor_unlock();
+    return woke;
+}
+
+static int32_t io_poll_locked(int64_t timeout_ms) {
     if (g_io_dead) return io_flush_dead();
     if (g_rto) {   /* recv-to deadlines: bound the overshoot to one turn */
         int wr = rto_timeout_scan();
@@ -1613,7 +1683,11 @@ static void io_close_notify_slots(intptr_t fdp) {
         }
     }
 }
-void zan_io_close_notify(intptr_t fd) { io_close_notify_slots(fd); }
+void zan_io_close_notify(intptr_t fd) {
+    reactor_lock();
+    io_close_notify_slots(fd);
+    reactor_unlock();
+}
 
 #elif defined(__APPLE__) || defined(__FreeBSD__)
 /* ==================== KQUEUE ==================== */
@@ -1621,6 +1695,19 @@ void zan_io_close_notify(intptr_t fd) { io_close_notify_slots(fd); }
 static int g_kq_fd = -1;
 
 void zan_io_init(void) {
+    /* Fast path first, WITHOUT the reactor lock: zan_co_ready ->
+     * co_pool_ensure -> co_pool_start_background calls this from inside a
+     * poll turn (io_wake readied a frame while io_poll_locked held the
+     * mutex), and a non-recursive re-lock there would self-deadlock. The
+     * flag read is benign: a simultaneous first init still serializes on
+     * the lock, and io_init_locked re-checks g_io_started under it. */
+    if (g_io_started) return;
+    reactor_lock();
+    io_init_locked();
+    reactor_unlock();
+}
+
+static void io_init_locked(void) {
     if (g_io_started) return;
     zan_io_ignore_sigpipe();
     /* Fresh reactor lifetime: clear any poison from a failed previous one. */
@@ -1648,6 +1735,12 @@ void zan_io_init(void) {
 }
 
 void zan_io_shutdown(void) {
+    reactor_lock();
+    io_shutdown_locked();
+    reactor_unlock();
+}
+
+static void io_shutdown_locked(void) {
     if (g_slots) {
         for (int fd = 0; fd < g_slots_cap; fd++) {
             zan_io_slot_t *s = &g_slots[fd];
@@ -1670,7 +1763,7 @@ void zan_io_shutdown(void) {
     g_io_started = 0;
 }
 
-static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+static void io_register_locked(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
     if (g_io_broken) {   /* backend never started: fail, don't park forever */
         io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
         g_pending_rbuf = NULL;
@@ -1747,6 +1840,12 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     }
 }
 
+static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+    reactor_lock();
+    io_register_locked(fd, interest, co, step);
+    reactor_unlock();
+}
+
 /* Deliver -1 for recv-to waiters whose fd never became readable in time.
  * Same contract as the epoll scan. No re-arm after the unlink: the fd's
  * EV_ONESHOT kevent was armed at io_register and stays armed until an event
@@ -1777,6 +1876,13 @@ static int rto_timeout_scan(void) {
 }
 
 int32_t zan_io_poll(int64_t timeout_ms) {
+    reactor_lock();
+    int32_t woke = io_poll_locked(timeout_ms);
+    reactor_unlock();
+    return woke;
+}
+
+static int32_t io_poll_locked(int64_t timeout_ms) {
     if (g_io_dead) return io_flush_dead();
     if (g_rto) {   /* recv-to deadlines: bound the overshoot to one turn */
         int wr = rto_timeout_scan();
@@ -1910,7 +2016,11 @@ static void io_close_notify_slots(intptr_t fdp) {
         }
     }
 }
-void zan_io_close_notify(intptr_t fd) { io_close_notify_slots(fd); }
+void zan_io_close_notify(intptr_t fd) {
+    reactor_lock();
+    io_close_notify_slots(fd);
+    reactor_unlock();
+}
 
 #elif defined(_WIN32)
 /* ==================== WINDOWS IOCP ==================== */
@@ -2879,6 +2989,19 @@ void zan_io_close_notify(intptr_t fd) {
 /* ==================== FALLBACK SELECT (POSIX) ==================== */
 
 void zan_io_init(void) {
+    /* Fast path first, WITHOUT the reactor lock: zan_co_ready ->
+     * co_pool_ensure -> co_pool_start_background calls this from inside a
+     * poll turn (io_wake readied a frame while io_poll_locked held the
+     * mutex), and a non-recursive re-lock there would self-deadlock. The
+     * flag read is benign: a simultaneous first init still serializes on
+     * the lock, and io_init_locked re-checks g_io_started under it. */
+    if (g_io_started) return;
+    reactor_lock();
+    io_init_locked();
+    reactor_unlock();
+}
+
+static void io_init_locked(void) {
     if (g_io_started) return;
     zan_io_ignore_sigpipe();
     g_io_entries = NULL;
@@ -2897,6 +3020,12 @@ void zan_io_init(void) {
 }
 
 void zan_io_shutdown(void) {
+    reactor_lock();
+    io_shutdown_locked();
+    reactor_unlock();
+}
+
+static void io_shutdown_locked(void) {
     zan_io_entry_t *e = g_io_entries;
     while (e) {
         zan_io_entry_t *n = e->next;
@@ -2913,7 +3042,7 @@ void zan_io_shutdown(void) {
     g_io_started = 0;
 }
 
-static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+static void io_register_locked(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
     /* select can only represent fd numbers below FD_SETSIZE; fail anything it
      * (or the kernel) cannot watch instead of parking the coroutine. */
     if (fd >= FD_SETSIZE) { io_reject_dead_fd(-1, co, step); return; }
@@ -2936,7 +3065,20 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     g_io_count++;
 }
 
+static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+    reactor_lock();
+    io_register_locked(fd, interest, co, step);
+    reactor_unlock();
+}
+
 int32_t zan_io_poll(int64_t timeout_ms) {
+    reactor_lock();
+    int32_t woke = io_poll_locked(timeout_ms);
+    reactor_unlock();
+    return woke;
+}
+
+static int32_t io_poll_locked(int64_t timeout_ms) {
     if (g_io_dead) return io_flush_dead();
     if (g_rto) {   /* recv-to deadlines: bound the overshoot to one turn */
         int wr = rto_timeout_scan();
@@ -3680,11 +3822,19 @@ void zan_io_recv_to_co(intptr_t fd, void *buf, int32_t len, int64_t timeout_ms,
         }
     }
 #endif
+    /* The deadline must not become visible to a poll turn before its watcher
+     * exists: under the multi-worker driver, another worker's rto scan running
+     * between the arm and the registration would find no slot waiter and drop
+     * the entry as stale -- the recv would then park past its timeout. Hold
+     * the reactor lock across both (the locked register variant: io_register
+     * itself would lock again). */
+    reactor_lock();
     rto_arm((int)fd, frame, step, out_n, timeout_ms);
     g_pending_rbuf = buf;
     g_pending_rlen = len;
     g_pending_out_n = out_n;
-    io_register(fd, ZAN_IO_READ, frame, step);
+    io_register_locked(fd, ZAN_IO_READ, frame, step);
+    reactor_unlock();
 }
 
 void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
