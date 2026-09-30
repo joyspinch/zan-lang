@@ -1884,6 +1884,20 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
   - 定式：`SendBytesBodyAsync` 与 `SendBytesBodyTlsAsync` 统一改为单句柄顺序流式读取（一次 `fopen`，逐块 `fread` 直发，结束 `fclose`），并全面支持 64 位文件长度（`long fileLen`、`long total`、`long offset`），`UploadTick` 对超 2GB 进度安全钳制在 32 位上限，防整数溢出；
 - **File.ReadBytes 向量化搬运**：
   - `File.ReadBytes` 分块从 4KB 扩至 64KB，彻底剥离解释层逐字节 `for` 循环，全面使用 `NativeMemory.Copy` 快速搬运数据。
+**坑十三（WebDAV/HTTP 原始流式上传零拷贝与连接池平行列表实体化重构）**：
+- **HTTP/WebDAV 二进制上传中转字符串内存膨胀**：
+  - `HttpClient.SendBytesAsync(byte[])` 原先通过 `body.ToStr(0, bodyLen)` 中转为托管字符串，在大二进制数据上传时不仅在堆上制造翻倍的内存膨胀，且缺乏本地文件原始 PUT 流式接口，导致超大文件无法直接做 WebDAV/云存储 PUT；
+  - 定式：`HttpClient` 增补 `SendBytesOnceWithRawBytesAsync` 与 `SendBytesTlsWithRawBytesAsync`，原生字节直达底层套接字与 TLS 流；增补 `UploadFileRawAsync` 支持 PUT/POST 64KB 单句柄流式直发；`WebDavClient` 对应升级 `PutBytesAsync` 零拷贝，并增补 `PutFileAsync` 与 `GetToFileAsync` 超大文件流式收发；
+- **连接池平行列表违规实体化重构**：
+  - `FwdPool` 原先维护 `List<FwdChannel> idle` 与 `List<long> expiry` 平行列表，违背结构化集合规范；统一重构为 `FwdPooledItem` 实体对象承载。
+**坑十四（UDP/CoAP/NTP 原始字节直发、SipMessage 平行列表实体化与 WebSocket 原生字节推送）**：
+- **UDP/CoAP/NTP 报文二进制截断与字符串中转**：
+  - `UdpClient.SendBytesTo` 与 `SendBytesToAsync` 此前仅接收 `string data`，CoAP 和 NTP 在封包后通过 `pkt.ToStr(0, len)` 强转为字符串；遇上全零或含 `0x00` 的二进制控制字节、时间戳或选项时存在中转分配与语义扭曲隐患；
+  - 定式：`UdpClient` 增补 `SendBytesTo(byte[] data, int len, string ip, int port)` 与 `SendBytesToAsync(byte[] data, int len, string ip, int port)` 原生字节直发接口；`CoapClient` 与 `NtpClient` 剥离全部 `ToStr` 转换，直接走字节数组出站；
+- **SipMessage 头部平行列表重构**：
+  - `SipMessage` 原先维护 `List<string> headerNames` 与 `List<string> headerValues` 两条平行列表，违背结构化实体规范；重构为 `SipHeader` 实体承载；
+- **WebSocket 原生字节推流补齐**：
+  - `WorkerWs` 增补 `PushBinary(Connection c, byte[] data, int offset, int len)` 与 `PushBinary(Connection c, byte[] data)` 接口，无缝复用 `WsFrame.RawBytes` 与底层 `NativeMemory.Copy`，消除业务推送二进制帧时的中转字符串构造。
 
 
 ## File 读族 alt-base 回退 exe 目录 vs Directory 清理 CWD 相对：测试缓存目录必须用绝对路径
@@ -2486,3 +2500,33 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   `--package-project ${WORKDIR}`。连带定式：模块搬进包时，CMakeLists 里
   所有 `<模块>/<文件>.zan` 显式输入路径必须同步改（golden 案例已注册但没
   人跑 = 坏了也没人发现）。
+
+## 闭包捕获的引用模型与"按迭代捕获"的实现边界（B-ID33，2026-09-30）
+
+坑出处：for 循环变量被闭包捕获时三连得 `3,3,3`（C#1/JS var 行为），提案改 Go 1.22
+按迭代语义。第一直觉"回边处造新 cell 并重绑槽位"是死路：irgen 单遍发射，cond/body
+的代码在回边**之前**就已发射完毕，读的是绑定当时的 SSA 槽指针——回边重绑只影响
+"之后发射"的代码，cond 会永远读初代 cell（`0<3` 死循环）。单遍发射下要真写透共享，
+唯一出路是给全部装箱变量访问加双重间接（先 load 当前 cell 指针、再 load payload），
+几十处访问点全动，代价不可接受——已作为偏差记入任务台账。
+
+落地定式（捕获点快照）：flag 链 `local_var_t.per_iteration`（AST_FOR_STMT 对 init
+区间打标）→ `cap_use` 传 `caps[i].per_iter`（cap_scan 的查询模式也走 cap_use，但
+只写纯数据、不发射 IR，安全）→ `emit_closure_record` 是闭包记录构建的唯一收口点
+（lambda/delegate 全走它），对 per_iter 装箱捕获不 retain 共享 cell，改
+`emit_box_cell` 造新 cell 装当前值：rc payload 先 retain 自己的引用（旧 cell 留它
+自己的），记录独占创建引用（跳过 emit_arc_retain），析构走 build_closure_dtor 的
+boxed 分支随记录释放——引用自然平衡，leakcheck 干净。
+
+引用模型备忘：装箱变量 = 声明方 owner slot +1（tagged 指针；EH unwind 时对 slot
+跑 dtor 并置空，使后续清理幂等）、每个闭包记录 +1（build 处 emit_arc_retain）、
+cell dtor 在归零时释放 payload。快照 cell = 记录独占那份创建引用，无额外 +1。
+
+同迭代"先捕获后变异"闭包看到捕获时值而非写透值（Go 1.22 得后者）；"先变异后捕获"
+两者一致（探针实证 0 与 10）。这是快照与真共享的可观察边界，用前想清楚要不要。
+
+foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就是值拷贝，天然按迭代。
+
+构建卫生：同一 build 目录并发起两次 ninja 链接同一 exe，Windows exe 镜像锁会
+`lld-link: failed to write output ... permission denied`——串行构建；链接失败先
+`tasklist` 查 zanc.exe/lld-link 残留（也可能是并行会话的瞬时编译，会自行退出）。

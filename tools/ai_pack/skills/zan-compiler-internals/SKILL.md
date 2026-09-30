@@ -2420,3 +2420,33 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   `--package-project ${WORKDIR}`。连带定式：模块搬进包时，CMakeLists 里
   所有 `<模块>/<文件>.zan` 显式输入路径必须同步改（golden 案例已注册但没
   人跑 = 坏了也没人发现）。
+
+## 闭包捕获的引用模型与"按迭代捕获"的实现边界
+
+坑出处：for 循环变量被闭包捕获时三连得 `3,3,3`（C#1/JS var 行为），提案改 Go 1.22
+按迭代语义。第一直觉"回边处造新 cell 并重绑槽位"是死路：irgen 单遍发射，cond/body
+的代码在回边**之前**就已发射完毕，读的是绑定当时的 SSA 槽指针——回边重绑只影响
+"之后发射"的代码，cond 会永远读初代 cell（`0<3` 死循环）。单遍发射下要真写透共享，
+唯一出路是给全部装箱变量访问加双重间接（先 load 当前 cell 指针、再 load payload），
+几十处访问点全动，代价不可接受——已作为偏差记入项目任务台账。
+
+落地定式（捕获点快照）：flag 链 `local_var_t.per_iteration`（for 语句发射处对 init
+区间打标）→ `cap_use` 传 `caps[i].per_iter`（cap_scan 的查询模式也走 cap_use，但
+只写纯数据、不发射 IR，安全）→ `emit_closure_record` 是闭包记录构建的唯一收口点
+（lambda/delegate 全走它），对 per_iter 装箱捕获不 retain 共享 cell，改
+`emit_box_cell` 造新 cell 装当前值：rc payload 先 retain 自己的引用（旧 cell 留它
+自己的），记录独占创建引用（跳过 emit_arc_retain），析构走 build_closure_dtor 的
+boxed 分支随记录释放——引用自然平衡，leakcheck 干净。
+
+引用模型备忘：装箱变量 = 声明方 owner slot +1（tagged 指针；EH unwind 时对 slot
+跑 dtor 并置空，使后续清理幂等）、每个闭包记录 +1（build 处 emit_arc_retain）、
+cell dtor 在归零时释放 payload。快照 cell = 记录独占那份创建引用，无额外 +1。
+
+同迭代"先捕获后变异"闭包看到捕获时值而非写透值（Go 1.22 得后者）；"先变异后捕获"
+两者一致（探针实证 0 与 10）。这是快照与真共享的可观察边界，用前想清楚要不要。
+
+foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就是值拷贝，天然按迭代。
+
+构建卫生：同一 build 目录并发起两次 ninja 链接同一 exe，Windows exe 镜像锁会
+`lld-link: failed to write output ... permission denied`——串行构建；链接失败先
+查 zanc/lld-link 残留进程（也可能是并行会话的瞬时编译，会自行退出）。
