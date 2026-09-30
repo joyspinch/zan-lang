@@ -1,0 +1,123 @@
+// Conformance: ORDER BY 白名单 API（批3d）。ORDER BY 无法参数化——排序列
+// 直接进 SQL 文本——*Safe 变体必须封死两个注入面：OrmSelect.OrderBySafe
+// 按实体元数据校验（RequireCol 同款），QueryBuilder / ModelQuery 的
+// OrderBySafe 按调用方给出的 allowed 清单（外加标识符形状）校验。
+// 裸 OrderBy 保留给硬编码列。
+using System;
+using System.Data;
+using System.Data.Orm;
+
+/// 不落库的执行器桩：排序阶段只读 GetProvider()，其余一律不会被调。
+class StubExec : IDbExecutor {
+    DbResult Query(string sql, DbParams prms) { return null; }
+    int Execute(string sql, DbParams prms) { return 0; }
+    DbResult Query(string sql) { return null; }
+    int Execute(string sql) { return 0; }
+    string ExecuteScalar(string sql) { return ""; }
+    string ExecuteScalar(string sql, DbParams prms) { return ""; }
+    int GetProvider() { return DbProvider.SQLite; }
+    async DbResult QueryAsync(string sql, DbParams prms) { return null; }
+    async int ExecuteAsync(string sql, DbParams prms) { return 0; }
+    async DbResult QueryAsync(string sql) { return null; }
+    async int ExecuteAsync(string sql) { return 0; }
+    async string ExecuteScalarAsync(string sql) { return ""; }
+    async string ExecuteScalarAsync(string sql, DbParams prms) { return ""; }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Ok(string what, bool got, bool want) {
+        if (got == want) {
+            Console.WriteLine("ok " + what);
+        } else {
+            Console.WriteLine("FAIL " + what);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static void Main() {
+        OrmMeta m = OrmMeta.Of("User", "users");
+        m.Col("id", "id", DbParams.KindInt, true, true, true, true, 0);
+        m.Col("name", "name", DbParams.KindText, false, false, false, true,
+              64);
+        m.Col("balance", "balance", DbParams.KindInt, true, false, false,
+              true, 0);
+        m.Seal();
+
+        // ---- OrmSelect：元数据白名单。多列、降序、"t." 别名形式。----
+        OrmSelect sel = OrmSelect.Create(new StubExec(), m);
+        sel.OrderBySafe("name");
+        sel.OrderBySafeDesc("balance");
+        sel.OrderBySafe("t.id");
+        string sql = sel.BuildSelect();
+        Ok("orm clause",
+           sql.Contains("ORDER BY t.name, t.balance DESC, t.id"), true);
+
+        bool threw = false;
+        try {
+            OrmSelect bad = OrmSelect.Create(new StubExec(), m);
+            bad.OrderBySafe("password");
+        } catch (Exception e) { threw = true; }
+        Ok("orm unknown col throws", threw, true);
+
+        threw = false;
+        try {
+            OrmSelect bad2 = OrmSelect.Create(new StubExec(), m);
+            bad2.OrderBySafe("name; DROP TABLE users");
+        } catch (Exception e) { threw = true; }
+        Ok("orm injection col throws", threw, true);
+
+        // ---- QueryBuilder：显式 allowed 清单。----
+        List<string> allowed = new List<string>();
+        allowed.Add("name");
+        allowed.Add("created_at");
+
+        QueryBuilder qb = QueryBuilder.From("users");
+        qb.OrderBySafe("created_at", allowed);
+        Ok("qb clause",
+           qb.BuildSelectParams("id, name, created_at")
+             .Contains("ORDER BY created_at"), true);
+
+        QueryBuilder qd = QueryBuilder.From("users");
+        qd.OrderBySafeDesc("name", allowed);
+        Ok("qb desc clause",
+           qd.BuildSelectParams("id").Contains("ORDER BY name DESC"), true);
+
+        threw = false;
+        try {
+            QueryBuilder bad3 = QueryBuilder.From("users");
+            bad3.OrderBySafe("salary", allowed);
+        } catch (Exception e) { threw = true; }
+        Ok("qb off-list col throws", threw, true);
+
+        // 名单命中但标识符形状不合法仍要被 RequireIdent 拦下——
+        // 白名单放行不等于形状放行。
+        List<string> evil = new List<string>();
+        evil.Add("name; DROP TABLE users");
+        threw = false;
+        try {
+            QueryBuilder bad4 = QueryBuilder.From("users");
+            bad4.OrderBySafe("name; DROP TABLE users", evil);
+        } catch (Exception e) { threw = true; }
+        Ok("qb on-list unsafe ident throws", threw, true);
+
+        // ---- ModelQuery 透传（排序阶段不触碰 db，桩即可）。----
+        ModelQuery mq = ModelQuery.NewSelect(new StubExec(), "users");
+        mq.OrderBySafe("name", allowed);
+        Ok("model passthrough accepts", true, true);
+
+        threw = false;
+        try {
+            ModelQuery bad5 = ModelQuery.NewSelect(new StubExec(), "users");
+            bad5.OrderBySafe("salary", allowed);
+        } catch (Exception e) { threw = true; }
+        Ok("model passthrough throws", threw, true);
+
+        if (Program.failures > 0) {
+            Console.WriteLine("fail: " + Convert.ToString(Program.failures));
+        } else {
+            Console.WriteLine("all pass");
+        }
+    }
+}
