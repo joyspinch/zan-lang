@@ -237,6 +237,15 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   回复错位；断言谓词用目标回复的独有形状（如"含 rows 数组"），宽谓词
   （"有 ok 字段即中"）会被心跳/广播回复误命中；每个操作前清空上一操作
   的待收队列。
+- **多进程服务的停机探针（Worker/RunCommand）**：`<app> start` 恒为
+  master + worker 子进程（单进程捷径仅非 CLI 的裸 RunAll），HTTP 服务跑在
+  子进程；start master、worker、stop 客户端**都会执行 Main**。证据标记必须
+  **按 pid 分文件**——共享一个标记文件会被三个进程互相覆盖（读到的永远是
+  最后写者，信号错乱难排查），子进程 stdout 可能被重定向、Console 断言会
+  静默丢失；钩子内先 `await Task.Delay` 再落标记，可证明"被等待"而非
+  fire-and-forget。排查停机路径先想"自己关的连接被自己当 master 之死"
+  竞态（如 ChannelLoop 对 handoff 通道 EOF 无条件 exit(0)，把整个排空
+  等待短路）。
 - **外壳非客户区行为用真实消息 + 显式泵断言**：双击标题栏、SC_MAXIMIZE
   这类 WndProc 路径，PostMessage 到真实 hwnd 再显式 PumpGuarded，消息在
   泵内同步派发，无 sleep、无时序依赖。两条坑：NC 双击的 wParam 必须是

@@ -34,6 +34,15 @@ async delegate string DatagramHandler(string data);
 /// request pipeline. Async so it can await I/O.</summary>
 async delegate void RawConnHandler(nint sock);
 
+/// <summary>Invoked once a stop has drained (the in-flight connections are
+/// done, or the 30s grace period expired), just before the process exits.
+/// Register with Worker.OnShutdown to flush in-memory buffers (metric
+/// windows, log queues, ...) so a stop does not lose the last flush window.
+/// Runs on every stop path: the single-process STOP command, the master's
+/// QUIT to a worker, and the master's own stop. Async so it can await
+/// I/O.</summary>
+async delegate void ShutdownHook();
+
 /// <summary>Per-connection entry of a protocol shard (ws/sse/mqtt). The
 /// implementations live in Worker.Ws/Sse/Mqtt.zan as independent classes
 /// (WorkerWs/WorkerSse/WorkerMqtt) that install themselves into the static
@@ -153,6 +162,9 @@ class Worker {
     static bool cliMode = false;
     // Set by a STOP command: workers that exit are not respawned.
     static bool stopping = false;
+    // End-of-drain callbacks (Worker.OnShutdown), run in registration order
+    // right before exit(0) so buffered data gets one last write.
+    static List<ShutdownHook> shutdownHooks = new List<ShutdownHook>();
     // Live worker control connections, used to ask a worker to quit.
     static List<TcpClient> ctlConn = new List<TcpClient>();
     static List<int> ctlWid = new List<int>();
@@ -1600,6 +1612,9 @@ class Worker {
         }
         ForgetControlPort();
         StatsDestroy();
+        // The master registered hooks too (framework boot runs here): flush
+        // whatever the master process buffered before it leaves as well.
+        await RunShutdownHooks();
         Console.WriteLine("[Worker] master stopped");
         exit(0);
     }
@@ -1799,6 +1814,11 @@ class Worker {
     /// that is halfway out.
     static async void DrainThenExit() {
         StopAll();
+        // Mark the stop deliberate BEFORE closing the handoff channels: the
+        // channel loops read those closures and must not take them for a
+        // master death (their exit(0) used to kill the process mid-drain,
+        // cutting the in-flight wait and the shutdown hooks short).
+        stopping = true;
         #if WINDOWS
         // Drop the handoff channels so the master stops giving this worker new
         // connections while it finishes the ones it already has.
@@ -1822,8 +1842,33 @@ class Worker {
             ForgetControlPort();
             StatsDestroy();
         }
+        await RunShutdownHooks();
         exit(0);
     }
+
+    /// <summary>Runs the registered shutdown hooks (Worker.OnShutdown) in
+    /// order. User code is not trusted: a throwing hook logs and the rest
+    /// still run, and the process still exits.</summary>
+    static async void RunShutdownHooks() {
+        // Last-chance flushes (B-ID20): the drain only waits for the in-flight
+        // connections; buffered data (metric windows, log queues) still needs
+        // a writer before the process goes away.
+        for (int i = 0; i < shutdownHooks.Count; i = i + 1) {
+            try {
+                await shutdownHooks[i]();
+            } catch (Exception e) {
+                Console.WriteLine("[worker] shutdown hook exception: "
+                    + e.Message);
+            }
+        }
+    }
+
+    /// <summary>Registers a callback for the end-of-drain shutdown path (see
+    /// ShutdownHook). Hooks run in registration order after the last in-flight
+    /// connection finished (or the 30s grace period expired) and before
+    /// exit(0), on every stop path (single-process STOP, worker QUIT, and the
+    /// master's own stop).</summary>
+    static void OnShutdown(ShutdownHook hook) { shutdownHooks.Add(hook); }
 
     // ======================================================================
     // worker process: obtain listeners, serve, exit with master
@@ -1906,12 +1951,21 @@ class Worker {
             byte[] info = new byte[373];
             bool ok = await RecvExact(ch, info, 372);
             if (!ok) {
+                // EOF on our own handoff channel during a deliberate drain is
+                // expected: DrainThenExit closed the channels before waiting
+                // for the in-flight connections. Killing the process here
+                // raced the drain and the shutdown hooks away (the loop used
+                // to exit(0) unconditionally); only a master death exits.
+                if (stopping) { return; }
                 exit(0);   // master gone
             }
             nint s = WSASocketA(-1, -1, -1, info, 0, 1);
             Dbg("worker rebuilt s=" + Convert.ToString(s));
             int _a = await ch.SendAsync("K");
-            if (_a <= 0) { exit(0); }
+            if (_a <= 0) {
+                if (stopping) { return; }
+                exit(0);
+            }
             if (s >= 0) {
                 Socket.SetNonBlocking(s);
                 w.Dispatch(s);
