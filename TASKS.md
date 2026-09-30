@@ -23,9 +23,9 @@
 
 ## 未完成 · 语义决策（审计批遗留，待拍板）
 
-- [ ] **B-ID31** 运行时错误软着陆 vs fail-fast 默认：全仓审计批（2026-09-30）识别——部分运行时错误路径现为软着陆（记录后继续），提案是改走 fail-fast 默认（Go 的 unrecovered panic 语义）。批2b 核实相关守卫在代码里已存在，改不改默认属产品语义拍板项，审计批未动。批2 相关结论以 git 历史为准（a94129fa..29ddaae2 系列）。
-- [ ] **B-ID32** long/ulong 混号比较诊断：二进制数值提升 ulong 胜出（checker.c 数值提升，TYPE_ULONG 分支），long 操作数负值回绕成巨无符号——`long x = -1; ulong y = 1; x > y` 静默得 true。C# 要求显式转换（CS0037 一类报错），C/Java 静默转换。需拍板：保持现状或加编译诊断；加诊断须全仓扫混号比较点评估落点。
-- [ ] **B-ID33** for 循环闭包捕获语义：现状为按变量捕获（2026-09-30 探针实证：循环变量闭包三连得 `3,3,3`，体内局部副本得 `0,1,2`——经典 C#1/JS var 行为，体内手工副本有效）。C#5+/Go1.22+ 已改按迭代捕获（每迭代一份新存储）。需拍板：改语义（静默改变所有循环内闭包的既有行为，破坏性）或维持现状并在文档/诊断层给捕获循环变量的闭包提提醒。
+- [ ] **B-ID31** 运行时错误软着陆 vs fail-fast 默认：全仓审计批（2026-09-30）识别——部分运行时错误路径现为软着陆（记录后继续），提案是改走 fail-fast 默认（Go 的 unrecovered panic 语义）。批2b 核实相关守卫在代码里已存在，改不改默认属产品语义拍板项，审计批未动。批2 相关结论以 git 历史为准（a94129fa..29ddaae2 系列）。**决策依据（2026-09-30 盘点）**：运行时 C 层大多已 fail-fast 双态（`zan_rt_fatal` 漏斗 handler 返回也 abort，rt_timer.c:533；调度器滞留协程退出先报后停 rt_sched.c:502；GQCS 丢包有 pre-park drain 守卫）；设计内软着陆一处——GUI 每帧护栏 `zan__guard_call`（帧内硬故障隔离 + FaultCount 计数，产品语义正确，非缺陷）。真正的"记录后继续"集中在 **stdlib 异常面**：61 处 catch 仅 6 处重抛，代表性真吞点 UiErrorLog.zan:73（"无处可报；忽略"）、IconSvgData.zan:163（返空串）、GenRoute.zan 两处 rollback 空 catch、Power.zan 空 catch——改 fail-fast 的实际工程量 = 逐个裁决这 ~55 处 catch 的语义（哪些该传播、哪些是合法的错误值转换），运行时 C 层几乎不用动。
+- [ ] **B-ID32** long/ulong 混号比较诊断：二进制数值提升 ulong 胜出（checker.c 数值提升，TYPE_ULONG 分支），long 操作数负值回绕成巨无符号——`long x = -1; ulong y = 1; x > y` 静默得 true。C# 要求显式转换（CS0037 一类报错），C/Java 静默转换。需拍板：保持现状或加编译诊断。**决策依据（2026-09-30 插桩扫描）**：checker.c 提升处（promote_numeric 的 ulong 分支 + 关系/等值两处数值放行点）插桩 DIAG_WARNING 探针验证（`x > y` 告警照发、程序仍跑出 true）；全仓语料**零命中**——IDE 全量（ide_zan + stdlib/Gui + Charts/Browser/Industrial 三包，编译 EXIT=0）、examples 30 项（全文件模式）、templates 全部、tests/conformance 703 + tests/gui 108。**仓内加报错/警告的破坏面 = 0**，诊断只影响未来用户代码；实施时注意 conformance golden 是否捕获 stderr（有告警进金样的用例需同步重生成）。
+- [ ] **B-ID33** for 循环闭包捕获语义：现状为按变量捕获（2026-09-30 探针实证：循环变量闭包三连得 `3,3,3`，体内局部副本得 `0,1,2`——经典 C#1/JS var 行为，体内手工副本有效）。C#5+/Go1.22+ 已改按迭代捕获（每迭代一份新存储）。需拍板：改语义或维持现状并提醒。**决策依据（2026-09-30 插桩扫描）**：irgen 装箱点（emit_boxed_var_decl + for-init 旗标）插桩 DIAG_WARNING 探针验证（`() => i` 告警照发、运行仍 3,3,3）；与 B-ID32 同批语料（IDE/examples/templates/tests 共约 1200 编译单元）**捕获循环变量的闭包零命中**——改按迭代语义对仓内现有代码**零破坏**，脚枪只存在于未来代码；foreach 变量捕获未单独插桩，实施时按 C#5 先例一并处理。
 
 ## 未完成 · 编译内存
 
