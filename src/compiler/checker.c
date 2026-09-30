@@ -1436,6 +1436,35 @@ static bool const_integral_value(zan_ast_node_t *expr, int64_t *value) {
     return false;
 }
 
+/* C# binary-operator rule for mixed signed/unsigned integrals: neither
+ * operand has an implicit conversion to the other, so the operator is an
+ * error -- the ulong-wins promotion silently reinterprets the signed
+ * operand as unsigned, wrapping negatives into huge magnitudes
+ * (`long x = -1; ulong y = 1; x > y` compared true, B-ID32). A non-negative
+ * constant on the signed side stays legal (C# implicit constant conversion,
+ * so `u > 0` keeps working). */
+static bool mixed_sign_compare_error(zan_binder_t *b, zan_diag_t *diag,
+                                     zan_ast_node_t *expr,
+                                     zan_type_t *left, zan_type_t *right) {
+    bool lu = left->kind == TYPE_ULONG, ru = right->kind == TYPE_ULONG;
+    if (!lu && !ru) return false;
+    zan_type_t *s = lu ? right : left;
+    if (s->kind != TYPE_LONG && s->kind != TYPE_INT &&
+        s->kind != TYPE_SHORT && s->kind != TYPE_SBYTE &&
+        s->kind != TYPE_NINT)
+        return false;
+    zan_ast_node_t *se = lu ? expr->binary.right : expr->binary.left;
+    int64_t constant = 0;
+    if (const_integral_value(se, &constant) && constant >= 0) return false;
+    zan_diag_emit(diag, DIAG_ERROR, expr->loc,
+                  "operator cannot be applied to operands of type '%s' and "
+                  "'%s': mixed signed/unsigned comparison needs an explicit "
+                  "cast (C# rules)",
+                  type_name(left), type_name(right));
+    (void)b;
+    return true;
+}
+
 static bool integral_conversion_is_safe(zan_type_t *target, zan_type_t *value,
                                         zan_ast_node_t *expr) {
     int64_t tmin, vmin, constant;
@@ -2511,7 +2540,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                       left->kind == TYPE_ENUM;
             bool rn = type_is_numeric(right) || right->kind == TYPE_CHAR ||
                       right->kind == TYPE_ENUM;
-            if (ln && rn) return c->binder->type_bool;
+            if (ln && rn) {
+                if (mixed_sign_compare_error(c->binder, c->diag, expr, left, right))
+                    return c->binder->type_error;
+                return c->binder->type_bool;
+            }
             /* Nullable value equality: `int? == null`, `int? == int` and
              * `int? == int?` are compared on the payload (irgen lowers the
              * lifted comparison). */
@@ -2568,7 +2601,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                       left->kind == TYPE_ENUM;
             bool rn = type_is_numeric(right) || right->kind == TYPE_CHAR ||
                       right->kind == TYPE_ENUM;
-            if (ln && rn) return c->binder->type_bool;
+            if (ln && rn) {
+                if (mixed_sign_compare_error(c->binder, c->diag, expr, left, right))
+                    return c->binder->type_error;
+                return c->binder->type_bool;
+            }
             /* Lifted nullable relational: `int? > 3` compares the payloads
              * (null yields false in irgen). */
             if (left->kind == TYPE_NULLABLE || right->kind == TYPE_NULLABLE) {

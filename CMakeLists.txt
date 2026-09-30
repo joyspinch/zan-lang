@@ -904,6 +904,19 @@ add_test(NAME diag_ctor_missing_parameterless
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ctor_missing_parameterless PROPERTIES TIMEOUT 60)
 
+# Mixed signed/unsigned comparison: the ulong-wins promotion would silently
+# reinterpret the signed operand (a negative long becomes a huge ulong), so
+# the operator is an error unless the signed side is a non-negative constant
+# (B-ID32). Legal shapes live in conformance mixed_sign_compare.
+add_test(NAME diag_mixed_sign_compare
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/mixed_sign_compare.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_mixed_sign_compare${_exe_ext}
+    "-DEXPECT_REGEX=mixed signed/unsigned comparison needs an explicit cast"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_mixed_sign_compare PROPERTIES TIMEOUT 60)
+
 # A void call has no result, so using one as an argument or an initializer
 # is a type error. The checker used to let both slip through and irgen then
 # emitted invalid IR (verifier: "Incorrect number of arguments" / "storing
