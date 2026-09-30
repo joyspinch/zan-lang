@@ -85,6 +85,15 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   失配 + 钩子首行日志打不出来 = 槽位没接上。SDK 新版编译器对该形状
   直接告警（`--deny-warnings` 可升级为编译失败），合法重载与真
   override 不误报。
+- **语言事实第五则（2026-10-01 XML DOM 包首日踩出）**：① 包命名空间按
+  using 拉取：`packages/*` 里的类型必须先 `using System.Xml;`（对应的
+  包命名空间）才入编，漏 using 直接报 `undefined type 'XmlNode'` 且不
+  指向缺 using——新包首次使用先补 using 再排查别的（与 stdlib 按需拉入
+  同一门槛，包从 packages/ 发现根扫描）；② 可空返回值不得链式解引用：
+  checker 强制（`'RootElement' can return null; accessing ... faults at
+  runtime`），既有代码惯例是存局部变量判空，无 `?.` 使用先例、别臆测其
+  形态；深层取值逐层存局部判空，同根多条断言用 `if (x != null) {}` 包住
+  整段，测试探针尤其常用。
 - **声明驱动的 CRUD 定式（ListPage/Crud，2026-09-25 落地）**：一屏一个
   `ScreenDef()` 静态声明（列 Col/Tag/Flag、行内操作 Ops、筛选、工具栏、
   `Table/EditFields` 写白名单），渲染 `Screen()` 整段产出 screenHtml
