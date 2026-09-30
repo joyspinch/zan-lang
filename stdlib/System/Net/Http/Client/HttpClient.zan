@@ -608,8 +608,8 @@ class HttpClient {
     }
 
     /// 下载请求沿用统一 method/host/path/header 注入校验，只额外插入
-    /// Range 字段；Range 不从调用方原文拼接进请求行。
-    string BuildDownloadRequest(string path, int have) {
+    /// Range 字段；Range 不从调用方原文拼接进请求行，支持 64 位大文件断点。
+    string BuildDownloadRequest(string path, long have) {
         string head = this.BuildRequestHead("GET", path, 0, true);
         if (have <= 0) { return head; }
         int end = head.Length - 2;
@@ -2589,9 +2589,9 @@ class HttpClient {
         return "";
     }
 
-    /// 读取整数值的响应头（大小写不敏感，从行首匹配），
-    /// 例如 HeaderInt(head, "content-length")。不存在时返回 0。
-    static int HeaderInt(string head, string lowerName) {
+    /// 读取 64 位整数值的响应头（大小写不敏感，从行首匹配），
+    /// 例如 HeaderLong(head, "content-length")。不存在时返回 0。
+    static long HeaderLong(string head, string lowerName) {
         int n = head.Length;
         int nl = lowerName.Length;
         for (int i = 0; i + nl <= n; i = i + 1) {
@@ -2602,10 +2602,10 @@ class HttpClient {
                 while (j < n && ((head[j] & 255) == 32 || (head[j] & 255) == 58)) {
                     j = j + 1;
                 }
-                int v = 0;
+                long v = 0;
                 bool any = false;
                 while (j < n && (head[j] & 255) >= 48 && (head[j] & 255) <= 57) {
-                    v = v * 10 + ((head[j] & 255) - 48);
+                    v = v * 10 + (long)((head[j] & 255) - 48);
                     j = j + 1;
                     any = true;
                 }
@@ -2615,9 +2615,15 @@ class HttpClient {
         return 0;
     }
 
+    /// 读取整数值的响应头（大小写不敏感，从行首匹配），
+    /// 例如 HeaderInt(head, "content-length")。不存在时返回 0。
+    static int HeaderInt(string head, string lowerName) {
+        return (int)HttpClient.HeaderLong(head, lowerName);
+    }
+
     /// 从 "Content-Range: bytes X-Y/Z" 头取得资源总大小（Z 值），
-    /// 无该头时返回 0。
-    static int RangeTotal(string head) {
+    /// 无该头时返回 0。支持 64 位大文件。
+    static long RangeTotal(string head) {
         int n = head.Length;
         string key = "content-range";
         int kl = key.Length;
@@ -2635,11 +2641,11 @@ class HttpClient {
         if (idx < 0) { return 0; }
         int slash = HttpClient.IndexOf(head, "/", idx);
         if (slash < 0) { return 0; }
-        int v = 0;
+        long v = 0;
         bool any = false;
         int j = slash + 1;
         while (j < n && (head[j] & 255) >= 48 && (head[j] & 255) <= 57) {
-            v = v * 10 + ((head[j] & 255) - 48);
+            v = v * 10 + (long)((head[j] & 255) - 48);
             j = j + 1;
             any = true;
         }
@@ -2649,7 +2655,7 @@ class HttpClient {
 
     /// A 416 proves completion only when the server supplies an unsatisfied
     /// Content-Range with a known total matching the local file size.
-    static bool RangeAlreadyComplete(string head, int have) {
+    static bool RangeAlreadyComplete(string head, long have) {
         string range = HttpClient.HeadHeader(head, "content-range").Trim();
         if (!range.StartsWith("bytes */")) { return false; }
         string digits = range.Substring(8);
@@ -2658,8 +2664,7 @@ class HttpClient {
         for (int i = 0; i < digits.Length; i = i + 1) {
             int d = digits[i] & 255;
             if (d < 48 || d > 57) { return false; }
-            total = total * 10 + d - 48;
-            if (total > 2147483647) { return false; }
+            total = total * 10 + (long)(d - 48);
         }
         return have > 0 && total == have;
     }
@@ -3138,8 +3143,8 @@ class HttpClient {
     async long DownloadBinaryOnceAsync(string path, string localPath,
             string progressFile, List<string> visited, int hops) {
         this.SetDownloadError("");
-        int bodyLimit = 0;
-        if (this.callPolicy != null) { bodyLimit = this.callPolicy.MaxBodyBytes(); }
+        long bodyLimit = 0;
+        if (this.callPolicy != null) { bodyLimit = (long)this.callPolicy.MaxBodyBytes(); }
         if (this.callPolicy != null) {
             bool targetOk = ExternalTargetPolicy.IsClientAllowed(this.host,
                 this.port, this.useTls,
@@ -3151,12 +3156,14 @@ class HttpClient {
                 return 0 - 1;
             }
         }
-        int have = 0;
-        nint probe = fopen(localPath, "rb");
-        if (probe != 0) {
-            fseek(probe, 0, 2);
-            have = ftell(probe);
-            fclose(probe);
+        long have = 0;
+        if (File.Exists(localPath)) {
+            try {
+                have = File.GetSize64(localPath);
+            } catch (Exception _ex) {
+                have = 0;
+            }
+            if (have < 0) { have = 0; }
         }
         if (bodyLimit > 0 && have > bodyLimit) {
             this.SetDownloadError("已有文件超过 " + Convert.ToString(bodyLimit) + " bytes");
@@ -3352,13 +3359,13 @@ class HttpClient {
         if (resume) {
             written = have;
             if (total <= 0) {
-                int cl = HttpClient.HeaderInt(headText, "content-length");
+                long cl = HttpClient.HeaderLong(headText, "content-length");
                 if (cl > 0) { total = have + cl; }
             }
         } else {
             have = 0;
             if (total <= 0) {
-                total = HttpClient.HeaderInt(headText, "content-length");
+                total = HttpClient.HeaderLong(headText, "content-length");
             }
         }
 

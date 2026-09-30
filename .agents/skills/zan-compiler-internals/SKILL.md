@@ -1872,6 +1872,12 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
   - 定式：引入 `AsyncGate` 异步门控与 `waiters` 队列保护完整的请求生命周期，并在 `Close()` 中唤醒所有排队者。
 - **Firebird 驱动收发包 NativeMemory 加速**：
   - `recvExact` 与 `sendPacket` 剥离逐字节解释循环，全面接入 `NativeMemory.Copy`，消除大字段（BLOB）和长结果集下的大量解释器空耗。
+**坑十一（HTTP 大文件下载 64 位整型长度与 Modbus 协程唤醒）**：
+- **HTTP 大文件下载与断点续传 64 位整数溢出**：
+  - `HttpClient` 原先使用 `int HeaderInt(head, "content-length")` 和 `int RangeTotal(head)`，当下载超过 2GB 的大文件（如安装包、模型权重、镜像归档）时，32 位有符号整数发生负溢出，导致 `Content-Length` 解析为负数、已完成判定（416 校验中原先硬编码 `total > 2147483647 -> false`）失效、且断点续传 `Range: bytes=have-` 截断；
+  - 定式：实现 `HeaderLong` 与 64 位 `RangeTotal`，`BuildDownloadRequest`、`DownloadBinaryOnceAsync` 全面支持 `long have`；`File` 增补 `GetSize64(path)` 经底层 `zan_file_length` 获得精确 64 位文件大小。
+- **Modbus TCP 客户端连接关闭唤醒**：
+  - `ModbusClient.Close()` 必须同步调用 `ReleaseLock()` 并释放唤醒所有 `waiters` 挂起的协程，防止外部在并发交互期间关闭连接造成协程永久悬死。
 
 
 ## File 读族 alt-base 回退 exe 目录 vs Directory 清理 CWD 相对：测试缓存目录必须用绝对路径
