@@ -355,6 +355,86 @@ class MqttClient {
         return sent;
     }
 
+    /// <summary>以原生字节数组切片发布二进制消息，彻底杜绝包含 NUL 字节时被截断。在 IO reactor 上挂起。</summary>
+    async int PublishBytesAsync(string topic, byte[] payload, int offset, int count, int qos, bool retain) {
+        if (payload == null || offset < 0 || count < 0 || offset + count > payload.Length) { return -1; }
+        int topicLen = (int)strlen(topic);
+        int msgLen = count;
+
+        int byte0 = (MqttPacketType.PUBLISH << 4);
+        if (qos > 0) {
+            byte0 = byte0 + (qos << 1);
+        }
+        if (retain) {
+            byte0 = byte0 | 1;
+        }
+
+        int remainLen = 2 + topicLen + msgLen;
+        if (qos > 0) {
+            remainLen = remainLen + 2;
+        }
+
+        byte[] packet = new byte[1 + MqttClient.RemainLenBytes(remainLen) + remainLen];
+        int poffset = 0;
+        packet[poffset] = (byte)(byte0);
+        poffset = poffset + 1;
+        poffset = poffset + MqttClient.WriteRemainLen(packet, poffset, remainLen);
+
+        packet[poffset] = (byte)((topicLen >> 8) & 255);
+        poffset = poffset + 1;
+        packet[poffset] = (byte)(topicLen & 255);
+        poffset = poffset + 1;
+
+        int i = 0;
+        for (; i < topicLen; i = i + 1) {
+            packet[poffset] = (byte)(topic[i]);
+            poffset = poffset + 1;
+        }
+
+        if (qos > 0) {
+            int pid = this.nextPacketId;
+            this.nextPacketId = this.nextPacketId + 1;
+            if (this.nextPacketId > 65535) {
+                this.nextPacketId = 1;
+            }
+            packet[poffset] = (byte)((pid >> 8) & 255);
+            poffset = poffset + 1;
+            packet[poffset] = (byte)(pid & 255);
+            poffset = poffset + 1;
+        }
+
+        if (msgLen > 0) {
+            NativeMemory.Copy((nint)packet + (nint)poffset, (nint)payload + (nint)offset, msgLen);
+            poffset = poffset + msgLen;
+        }
+
+        int sent = await this.conn.SendBytesAsync(packet, poffset);
+
+        if (qos == MqttQos.AtLeastOnce) {
+            int acked = await DrainPacketAsync();
+        } else if (qos == MqttQos.ExactlyOnce) {
+            MqttPacket rec = await this.reader.ReadPacketAsync();
+            if (rec != null && rec.packetType == MqttPacketType.PUBREC) {
+                int pid = this.nextPacketId - 1;
+                byte[] pubrel = new byte[4];
+                pubrel[0] = 98;
+                pubrel[1] = 2;
+                pubrel[2] = (byte)((pid >> 8) & 255);
+                pubrel[3] = (byte)(pid & 255);
+                await this.conn.SendBytesAsync(pubrel, 4);
+                MqttPacket comp = await this.reader.ReadPacketAsync();
+            }
+        }
+
+        return sent;
+    }
+
+    /// <summary>以原生字节数组发布完整二进制消息。</summary>
+    async int PublishBytesAsync(string topic, byte[] payload, int qos, bool retain) {
+        if (payload == null) { return -1; }
+        return await this.PublishBytesAsync(topic, payload, 0, payload.Length, qos, retain);
+    }
+
     /// <summary>订阅主题并等待 SUBACK，在 IO
     /// reactor 上挂起。返回已发送的字节数。</summary>
     async int SubscribeAsync(string topic, int qos) {
@@ -476,6 +556,59 @@ class MqttClient {
             }
 
             return body.ToStr(0, remainLen);
+        }
+    }
+
+    /// <summary>等待下一个传入的 PUBLISH 并返回其原生二进制负载，彻底杜绝包含 NUL 字节时被截断。
+    /// 在 IO reactor 上挂起直到数据到达。对端关闭或出错时返回 null。</summary>
+    async byte[] ReceiveBytesAsync() {
+        if (this.reader == null) { return null; }
+        while (true) {
+            MqttPacket pkt = await this.reader.ReadPacketAsync();
+            if (pkt == null) {
+                this.connected = false;
+                return null;
+            }
+
+            int byte0 = (pkt.packetType << 4) | (pkt.flags & 15);
+            int remainLen = pkt.bodyLen;
+            byte[] body = pkt.body;
+            int packetType = pkt.packetType;
+
+            if (packetType == MqttPacketType.PUBLISH) {
+                if (remainLen < 2) { return null; }
+                int topicLen = ((body[0] & 255) << 8) + (body[1] & 255);
+                int offset = 2 + topicLen;
+
+                int qos = (byte0 >> 1) & 3;
+                if (qos > 0) {
+                    offset = offset + 2;
+                }
+
+                if (offset > remainLen) {
+                    this.connected = false;
+                    return null;
+                }
+
+                int payloadLen = remainLen - offset;
+                byte[] res = new byte[payloadLen];
+                if (payloadLen > 0) {
+                    NativeMemory.Copy((nint)res, (nint)body + (nint)offset, payloadLen);
+                }
+                return res;
+            } else if (packetType == MqttPacketType.PINGREQ) {
+                byte[] pong = new byte[2];
+                pong[0] = (byte)(MqttPacketType.PINGRESP << 4);
+                pong[1] = 0;
+                int sent = await this.conn.SendBytesAsync(pong, 2);
+                continue;
+            }
+
+            byte[] rawRes = new byte[remainLen];
+            if (remainLen > 0) {
+                NativeMemory.Copy((nint)rawRes, (nint)body, remainLen);
+            }
+            return rawRes;
         }
     }
 

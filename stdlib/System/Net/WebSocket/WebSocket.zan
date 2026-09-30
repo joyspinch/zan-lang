@@ -133,6 +133,8 @@ class WsHandshake {
 class WsFrame {
     int opcode;
     string payload;
+    byte[] payloadBytes;
+    int payloadOffset;
     int payloadLen;
     bool fin;
     bool masked;
@@ -142,6 +144,8 @@ class WsFrame {
     WsFrame() {
         this.opcode = WsOpcode.Text;
         this.payload = "";
+        this.payloadBytes = null;
+        this.payloadOffset = 0;
         this.payloadLen = 0;
         this.fin = true;
         this.masked = false;
@@ -210,6 +214,16 @@ class WsFrame {
         return f;
     }
 
+    /// <summary>任意 opcode 的原生字节数组出站帧（客户端统一发送入口用）。</summary>
+    static WsFrame RawBytes(int opcode, byte[] payload, int offset, int payloadLen) {
+        WsFrame f = new WsFrame();
+        f.opcode = opcode;
+        f.payloadBytes = payload;
+        f.payloadOffset = offset;
+        f.payloadLen = payloadLen;
+        return f;
+    }
+
     /// <summary>帧头字节数（RFC 6455 长度编码）。发送方据它
     /// 计算真实写出长度——此前发送方硬编码 2，载荷超过 125 字节时
     /// 帧头被截断、帧流从此错位。</summary>
@@ -246,7 +260,11 @@ class WsFrame {
         }
 
         if (this.payloadLen > 0) {
-            NativeMemory.PutString((nint)buf, headerLen, this.payload, this.payloadLen);
+            if (this.payloadBytes != null) {
+                NativeMemory.Copy((nint)buf + (nint)headerLen, (nint)this.payloadBytes + (nint)this.payloadOffset, this.payloadLen);
+            } else {
+                NativeMemory.PutString((nint)buf, headerLen, this.payload, this.payloadLen);
+            }
         }
 
         return buf;
@@ -288,7 +306,11 @@ class WsFrame {
         pos = pos + 4;
 
         if (this.payloadLen > 0) {
-            NativeMemory.PutString((nint)buf, pos, this.payload, this.payloadLen);
+            if (this.payloadBytes != null) {
+                NativeMemory.Copy((nint)buf + (nint)pos, (nint)this.payloadBytes + (nint)this.payloadOffset, this.payloadLen);
+            } else {
+                NativeMemory.PutString((nint)buf, pos, this.payload, this.payloadLen);
+            }
 
             long m0 = (long)(mask[0] & 255);
             long m1 = (long)(mask[1] & 255);
@@ -1168,6 +1190,26 @@ class WebSocketClient {
         }
     }
 
+    /// <summary>客户端方向原生字节数组发送入口：掩码 + 帧长 + 协程互斥串行发送。</summary>
+    async bool SendFrameBytes(int opcode, byte[] payload, int offset, int payloadLen) {
+        if (!this.connected || this.conn == null || payload == null || offset < 0 || payloadLen < 0
+            || offset + payloadLen > payload.Length
+            || payloadLen > 16777216
+            || (opcode >= 8 && (payloadLen > 125 || opcode > WsOpcode.Pong))
+            || (opcode < 0 || opcode > WsOpcode.Pong)) { return false; }
+        await this.AcquireSend();
+        try {
+            WsFrame frame = WsFrame.RawBytes(opcode, payload, offset, payloadLen);
+            byte[] encoded = frame.EncodeMasked();
+            int total = WsFrame.HeaderLen(payloadLen) + 4 + payloadLen;
+            int n = await this.conn.SendBytesAsync(encoded, total);
+            if (n <= 0) { this.connected = false; return false; }
+            return true;
+        } finally {
+            this.ReleaseSend();
+        }
+    }
+
     /// 发送一条 Text 消息（fire-and-forget，失败仅置 disconnected）。
     async void SendText(string text) {
         await this.SendFrame(WsOpcode.Text, text, text.Length);
@@ -1176,6 +1218,17 @@ class WebSocketClient {
     /// 发送一条二进制消息（data 可含 NUL，len 为精确字节数）。
     async void SendBinary(string data, int len) {
         await this.SendFrame(WsOpcode.Binary, data, len);
+    }
+
+    /// 发送一条二进制消息（byte[] 原生切片，无需经过字符串中转）。
+    async void SendBinary(byte[] data, int offset, int len) {
+        await this.SendFrameBytes(WsOpcode.Binary, data, offset, len);
+    }
+
+    /// 发送一条完整二进制消息。
+    async void SendBinary(byte[] data) {
+        if (data == null) { return; }
+        await this.SendFrameBytes(WsOpcode.Binary, data, 0, data.Length);
     }
 
     /// 发送空 Ping 帧（对端的 Pong 由 RecvText 静默消费）。

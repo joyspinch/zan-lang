@@ -1797,6 +1797,14 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
 - `SipMessage` 遇到空行时必须按 `Content-Length`（或 `l` 头）精确定界正文，防止粘包或流水线后续报文被误污染吞并，且状态码必须防御非纯数字输入。
 - `CoapClient` Token 必须使用 `RandomNumberGenerator` 系统级 CSPRNG，禁止使用易被推算的线性算式，Option 解析严格拒绝 RFC 7252 保留值（15）与越界畸形报文。
 
+**坑六（数据库与协议层 TLS 接收 string.Length 伪 EOF 与二进制截断）**：
+- `TlsStream.RecvAsync` 通过 `b.ToStr(0, read)` 返回 string，若对端发送包含 `0x00` 的二进制报文（如 SQL Server TDS 包头、MySQL packet 负载、Redis bulk string、MQTT publish 载荷）：
+  - 消费者调用 `chunk.Length` 会在首个 `0x00` 字节处被 C 语言 `strlen` 截断；
+  - 若首字节即为 `0x00`，`chunk.Length` 骤降为 0，上层协议循环（如 `recvExact`）会把 0 误判为对端关闭（伪 EOF），导致连接异常中断或报文错位。
+- **定式**：
+  - 数据库与通讯协议（`SqlServerConnection`、`MySqlConnection`、`RedisClient`、`MqttClient`）接收必须统一走原生字节接口（`TlsStream.RecvBytesAsync`、`Socket.RecvOv` / `RecvIntoAsync`），严禁用 string 中转底层二进制报文；
+  - WebSocket（`WebSocket` / `WssClient`）出站全面支持原生 `byte[]` 载荷（`SendBinary(byte[] data, int offset, int len)`、`SendBinary(byte[] data)`），并通过 `WsFrame.RawBytes` 与 `NativeMemory.Copy` 直达 AVX2/SSE2 向量掩码，杜绝字符串中转堆分配与截断隐患。
+
 
 ## File 读族 alt-base 回退 exe 目录 vs Directory 清理 CWD 相对：测试缓存目录必须用绝对路径
 
