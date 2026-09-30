@@ -1914,6 +1914,13 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
 - **SSE 服务端推送二次字符串切片与多行数据二次幂拼接消除**：
   - `SseConnection.SendAsync` 在底层 TCP 发生背压部分写入时，原先在循环内反复执行 `frame.Substring(sent, total - sent)` 造成大量堆内存分配；`ParseBlock` 在接收多行 `data:` 时原先使用字符串拼接导致二次幂内存膨胀；`TcpClient` 缺失基于偏移量与长度的字节数组切片发送；
   - 定式：`TcpClient` 增补 `SendBytesAsync(byte[] data, int offset, int len)` 与 `TcpListener.AcceptTcpClientAsync()`；`SseConnection` 移除无谓的 Substring 循环并增补 `SendBytesAsync(eventName, byte[] data, offset, len)` 原生字节推送通道；`SseClient.ParseBlock` 改用 `StringBuilder` 线性累加多行数据载荷。
+**坑十六（数据库大数据量结果集空值标记按需实例化与游标复用、TDengine 分块与套接字异常防护）**：
+- **大数据量行级对象冗余分配**：
+  - `DbResult` 原先在每行记录无任何 SQL NULL 时，仍无条件为每行创建 `new List<bool>()`，导致 10 万行 20 列的大宽表产生 10 万个无意义的布尔列表对象；`MySqlConnection` 与 `MySqlSyncConnection` 在逐行解码时，每行均 `new List<int>()` 仅用于充当变长解析偏移游标；
+  - 定式：`DbResult.AddRow` 接收 `null` 标记，`IsNull` 判断时判空直返 `false`，仅当该行真正包含 NULL 字段时才懒加载创建 `List<bool>`；MySQL 线协议解码将 `cur` 游标提升至循环外部复用，消除数万次临时列表分配；Postgres、SqlServer、Firebird 结果集转换全面接入按需空标记判定；
+- **TDengine REST HTTP 传输健壮性与句柄异常泄漏**：
+  - `HexOf` 分块十六进制长度原先使用 32 位整型计算，当遇到异常恶意大 chunk 时存在有符号整型溢出风险；`Post` 与 `PostAsync` 在套接字接收循环发生异常时，原先跳过 `Socket.Close` 造成底层 socket 泄漏；
+  - 定式：`HexOf` 升级为 64 位防溢出累加并限制在 2GB 上限内；`Post` 与 `PostAsync` 采用 `try ... finally { Socket.Close(sock); }` 保障异常中断时套接字句柄 100% 安全释放。
 
 
 ## File 读族 alt-base 回退 exe 目录 vs Directory 清理 CWD 相对：测试缓存目录必须用绝对路径
@@ -2639,3 +2646,27 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
 - 探针定式：此类编译器缺口最小两文件常测不出（小世界无同框撞名/顺序恰好
   幸存），必须**二分真实全量输入**：先 `@rsp` 全量复现，再逐组裁剪到最小
   复现集，`ZAN_PULLIN_DEBUG=1` 对比拉入清单定锁 who-suppressed-what。
+
+## 项目与包共用命名空间名的"平行副本"：双向撞名无增量解（2026-09-30，server-collab 模板实测）
+
+- 坑：拆包前的老项目（模板/示例）常整树保留框架平行副本，且与包**共用命名空间
+  名**（模板 `namespace ZanWeb.Dao.Sys`、`ZanWeb.Framework.Services` 与包同名同
+  形）。编译集一旦两侧同框（B-ID18 后包发现按层级拉族，更易同框），同名命名空间
+  被**合并**成一张表，两份同名类都在：裸名解析命中哪份由 using/同 ns/兜底的竞争
+  决定，且**双向都会中招**——包侧裸名（`MetricsStore`、`SettingKeys`、
+  `SysUserDao`）命中模板副本，报 `has no member FlushAtExit`（模板副本落后于包的
+  新成员）/构造重载不匹配；模板侧裸名（`AppController`、`User`）命中包副本，报
+  基类不匹配/类型互转失败。表面症状是"成员不存在/重载不匹配"，根因是撞名错绑，
+  与"文件没编进来"极易混淆。
+- 为什么逐文件补 using 救不了：using 导入的是**合并后**的命名空间，两份同名类
+  依然同框，逐文件加 using 只是把撞面从兜底竞争换成 using 竞争、换边再炸。增量
+  修复路线（挑出错文件逐个限定/补 using）已实验证伪（57 错收敛不动）。唯一干净
+  终局：项目删除与包重复的平行副本、整体改吃包命名空间（对齐包消费形态再生），
+  或项目整体改名空间隔离。拆包迁移立项时，**存量模板/示例必须同批盘点**，否则
+  它们只在"包发现窄的老发布"下侥幸绿（dist 老代际拉族窄不踩），新一代工具链一
+  落地就爆。
+- 定性手法（隔离并行会话在途编辑）：冻结床 = `git archive HEAD packages stdlib |
+  tar -x` + 当前 build/zanc.exe + zanrt_*.obj 兄弟 obj 拷入 _scratch 独立目录——
+  包/stdlib 发现跟 zanc **二进制位置**走，床内 zanc 只见 HEAD 冻结包，工作树在途
+  噪声（别的会话改到一半的包文件）完全隔离。tar 对 linux 驱动符号链接的报错在
+  Windows 无害。
