@@ -296,7 +296,12 @@ f.Consume(f.RequestBytes());                     // 只丢弃本请求
 
 - async int SaveBodyToFile(HttpRequest req, string filePath, int maxBytes)
   - 流式将请求体分块直接落盘，避免超大正文（如 GB 级上传）引发 OOM。
+    支持 Content-Length 与 Transfer-Encoding: chunked 两大传输定界，
     内存仅占用当前分块缓冲区（<=64KB），落盘完成后保留后续流水线请求字节。
+
+- async int SaveChunkedBodyToFile(HttpRequest req, string filePath, int maxBytes)
+  - 流式将 chunked 编码的请求体直接落盘，避免超大 chunked 正文占用堆内存。
+    每解码一个 chunk 直接写盘并 Discard，内存恒定在当前 chunk 大小以内。
 
 - int RequestBytes()
   - 本请求在线路上占用的字节数（头部 + 正文，分块编码则

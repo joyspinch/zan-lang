@@ -83,12 +83,10 @@ http/https。
 （无正文的请求换新连接重发一次）。
 
 池表是转发器实例级的，而连接协程可能落在不同 worker 线程上，
-因此每处访问都在 <c>lock (idle)</c> 内；临界区里只有列表操作与
+因此每处访问都在 <c>lock (items)</c> 内；临界区里只有列表操作与
 关闭套接字，不含 await。
 
-- List<FwdChannel> idle;
-
-- List<long> expiry;
+- List<FwdPooledItem> items;
 
 - int maxIdle;
 
@@ -120,6 +118,15 @@ http/https。
 
 - int IdleCount()
   - 当前空闲链路数。
+
+
+## FwdPooledItem (class)
+
+- FwdChannel ch;
+
+- long expiry;
+
+- FwdPooledItem(FwdChannel ch, long expiry)
 
 
 ## FwdReader (class)

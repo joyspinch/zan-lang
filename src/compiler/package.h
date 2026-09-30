@@ -146,12 +146,17 @@ int zan_pkg_all_source_roots(const char *project_dir,
                              char (*out_roots)[1024], int max_roots);
 
 /* Visit installed package files by declared namespace, regardless of their
- * physical directories. Paths refer to original sources, never copies. */
+ * physical directories. Paths refer to original sources, never copies.
+ * `hierarchical` also matches namespaces underneath the target (and
+ * namespace-less files through their source-relative directory); callers
+ * must pass 0 for namespaces the stdlib also provides, or a ubiquitous
+ * `using System;` would reach every package's System.* sources. */
 typedef void (*zan_pkg_source_visitor_t)(const char *path, void *context);
 typedef int (*zan_pkg_namespace_probe_t)(const char *path, char *out_ns, size_t cap);
 int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
                             zan_pkg_namespace_probe_t probe,
-                            zan_pkg_source_visitor_t visitor, void *context);
+                            zan_pkg_source_visitor_t visitor, void *context,
+                            int hierarchical);
 
 /* Secure local-directory install foundation. The source must contain a valid
  * zan.pkg whose name matches package_name. Symlinks/reparse points and unsafe

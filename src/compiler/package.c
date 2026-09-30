@@ -561,10 +561,46 @@ static int pkg_scan_store(const char *store, const char *namespace_path,
  * MVC deliberately keeps Framework/ and Modules/ in its original source tree,
  * while its declarations use e.g. ZanWeb.Ai and ZanWeb.Web. Selecting individual
  * original files avoids aliases, duplicate compilation and source-tree changes. */
+
+/* Namespace match for package source discovery: the declared namespace equals
+ * the reached namespace, or — for project-package namespaces only (the caller
+ * gates stdlib-rooted ones to exact matching) — lives underneath it
+ * (ZanWeb.Controllers under ZanWeb). The pre-2e75673e walker globbed a
+ * matching package's whole tree, so hierarchical packages resolved a root
+ * `using` to their sub-namespaces; the exact-only rewrite lost those files
+ * (route-table-driven MVC controllers never joined the parse, B-ID18). */
+static int pkg_ns_match(const char *declared, const char *target_ns,
+                        int hierarchical) {
+    if (strcmp(declared, target_ns) == 0) return 1;
+    if (!hierarchical) return 0;
+    size_t tl = strlen(target_ns);
+    return strncmp(declared, target_ns, tl) == 0 && declared[tl] == '.';
+}
+
+/* Namespace-less source files (global-namespace helpers such as MySqlWire,
+ * pure-function libraries merged from async/sync twins) are discovered
+ * through their source-root-relative directory: separators map to dots and
+ * the result must equal the reached namespace, so the file joins exactly
+ * the one directory whose namespace its siblings declare. */
+static void pkg_rel_dir_ns(const char *dir, const char *src_root,
+                           char *out, size_t cap) {
+    size_t rl = strlen(src_root);
+    const char *rel = strlen(dir) >= rl ? dir + rl : dir;
+    if (*rel == '/' || *rel == '\\') rel++;
+    size_t w = 0;
+    for (; *rel && w + 1 < cap; rel++) {
+        char c = *rel;
+        if (c == '/' || c == '\\') c = '.';
+        out[w++] = c;
+    }
+    out[w] = '\0';
+}
+
 static int pkg_visit_source_tree(const char *dir, const char *target_ns,
                                  zan_pkg_namespace_probe_t probe,
                                  zan_pkg_source_visitor_t visitor, void *context,
-                                 int depth) {
+                                 int depth, const char *src_root,
+                                 int hierarchical) {
     if (depth > 64) return 0;
     int found = 0;
 #ifdef _WIN32
@@ -578,12 +614,21 @@ static int pkg_visit_source_tree(const char *dir, const char *target_ns,
         char path[1024];
         if (snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName) >= (int)sizeof(path)) continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            found += pkg_visit_source_tree(path, target_ns, probe, visitor, context, depth + 1);
+            found += pkg_visit_source_tree(path, target_ns, probe, visitor, context,
+                                           depth + 1, src_root, hierarchical);
         } else {
             size_t n = strlen(fd.cFileName);
             if (n < 5 || strcmp(fd.cFileName + n - 4, ".zan") != 0) continue;
             char declared[256] = {0};
-            if (probe(path, declared, sizeof(declared)) && strcmp(declared, target_ns) == 0) {
+            int ok;
+            if (probe(path, declared, sizeof(declared)) && declared[0]) {
+                ok = pkg_ns_match(declared, target_ns, hierarchical);
+            } else {
+                char relns[256];
+                pkg_rel_dir_ns(dir, src_root, relns, sizeof(relns));
+                ok = relns[0] != '\0' && strcmp(relns, target_ns) == 0;
+            }
+            if (ok) {
                 visitor(path, context);
                 found++;
             }
@@ -600,12 +645,21 @@ static int pkg_visit_source_tree(const char *dir, const char *target_ns,
         if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= (int)sizeof(path) ||
             lstat(path, &st) != 0 || S_ISLNK(st.st_mode)) continue;
         if (S_ISDIR(st.st_mode)) {
-            found += pkg_visit_source_tree(path, target_ns, probe, visitor, context, depth + 1);
+            found += pkg_visit_source_tree(path, target_ns, probe, visitor, context,
+                                           depth + 1, src_root, hierarchical);
         } else if (S_ISREG(st.st_mode)) {
             size_t n = strlen(e->d_name);
             if (n < 5 || strcmp(e->d_name + n - 4, ".zan") != 0) continue;
             char declared[256] = {0};
-            if (probe(path, declared, sizeof(declared)) && strcmp(declared, target_ns) == 0) {
+            int ok;
+            if (probe(path, declared, sizeof(declared)) && declared[0]) {
+                ok = pkg_ns_match(declared, target_ns, hierarchical);
+            } else {
+                char relns[256];
+                pkg_rel_dir_ns(dir, src_root, relns, sizeof(relns));
+                ok = relns[0] != '\0' && strcmp(relns, target_ns) == 0;
+            }
+            if (ok) {
                 visitor(path, context);
                 found++;
             }
@@ -640,7 +694,7 @@ static bool pkg_mark_seen(pkg_seen_names_t *seen, const char *name) {
 static int pkg_visit_store(const char *store, const char *target_ns,
                            zan_pkg_namespace_probe_t probe,
                            zan_pkg_source_visitor_t visitor, void *context,
-                           pkg_seen_names_t *seen) {
+                           pkg_seen_names_t *seen, int hierarchical) {
     if (!pkg_is_dir(store)) return 0;
     int found = 0;
 #ifdef _WIN32
@@ -660,7 +714,8 @@ static int pkg_visit_store(const char *store, const char *target_ns,
             if (!pkg_is_dir(source)) snprintf(source, sizeof(source), "%s", root);
         }
         if (!pkg_mark_seen(seen, fd.cFileName)) continue;
-        int hits = pkg_visit_source_tree(source, target_ns, probe, visitor, context, 0);
+        int hits = pkg_visit_source_tree(source, target_ns, probe, visitor, context, 0,
+                                         source, hierarchical);
         if (hits) zan_pkg_note_usage(store, fd.cFileName);
         found += hits;
     } while (FindNextFileA(h, &fd));
@@ -680,7 +735,8 @@ static int pkg_visit_store(const char *store, const char *target_ns,
             if (!pkg_is_dir(source)) snprintf(source, sizeof(source), "%s", root);
         }
         if (!pkg_mark_seen(seen, e->d_name)) continue;
-        int hits = pkg_visit_source_tree(source, target_ns, probe, visitor, context, 0);
+        int hits = pkg_visit_source_tree(source, target_ns, probe, visitor, context, 0,
+                                         source, hierarchical);
         if (hits) zan_pkg_note_usage(store, e->d_name);
         found += hits;
     }
@@ -691,7 +747,8 @@ static int pkg_visit_store(const char *store, const char *target_ns,
 
 int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
                             zan_pkg_namespace_probe_t probe,
-                            zan_pkg_source_visitor_t visitor, void *context) {
+                            zan_pkg_source_visitor_t visitor, void *context,
+                            int hierarchical) {
     if (!project_dir || !pkg_safe_namespace_path(namespace_path) || !probe || !visitor) return 0;
     char target_ns[256]; size_t n = strlen(namespace_path);
     if (n >= sizeof(target_ns)) return 0;
@@ -700,24 +757,24 @@ int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
     char store[1024]; int found = 0;
     pkg_seen_names_t seen = {0};
     snprintf(store, sizeof(store), "%s" PATH_SEP "packages", project_dir);
-    found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen);
+    found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
     snprintf(store, sizeof(store), "%s" PATH_SEP ".zan-packages", project_dir);
-    found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen);
+    found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
     char exe_dir[1024] = {0};
 #ifdef _WIN32
     if (GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir))) {
         char *sep = strrchr(exe_dir, '\\'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s\\..\\packages", exe_dir);
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen);
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
         snprintf(store, sizeof(store), "%s\\packages", exe_dir);
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen);
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
     }
 #elif defined(__APPLE__)
     uint32_t size = sizeof(exe_dir);
     if (_NSGetExecutablePath(exe_dir, &size) == 0) {
         char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s/../packages", exe_dir);
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen);
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
     }
 #else
     ssize_t len = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
@@ -725,11 +782,11 @@ int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
         exe_dir[len] = 0;
         char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s/../packages", exe_dir);
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen);
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
     }
 #endif
     if (zan_pkg_global_store(store, sizeof(store)))
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen);
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
     for (int i = 0; i < seen.count; i++) free(seen.names[i]);
     free(seen.names);
     return found;

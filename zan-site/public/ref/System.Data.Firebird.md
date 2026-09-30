@@ -1,6 +1,6 @@
 # System.Data.Firebird
 
-> 源码: `stdlib/System/Data/Firebird/FbSql.zan`, `stdlib/System/Data/Firebird/FbSrp.zan`, `stdlib/System/Data/Firebird/FbWire.zan`, `stdlib/System/Data/Firebird/FirebirdConnection.zan`, `stdlib/System/Data/Firebird/FirebirdPool.zan`
+> 源码: `packages/Zan.Data/src/System/Data/Firebird/FbSql.zan`, `packages/Zan.Data/src/System/Data/Firebird/FbSrp.zan`, `packages/Zan.Data/src/System/Data/Firebird/FbWire.zan`, `packages/Zan.Data/src/System/Data/Firebird/FirebirdConnection.zan`, `packages/Zan.Data/src/System/Data/Firebird/FirebirdPool.zan`
 
 
 ## FbArc4 (class)

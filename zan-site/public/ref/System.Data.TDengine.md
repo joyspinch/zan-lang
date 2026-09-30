@@ -1,6 +1,6 @@
 # System.Data.TDengine
 
-> 源码: `stdlib/System/Data/TDengine/TDengineConnection.zan`, `stdlib/System/Data/TDengine/TDengineConnector.zan`, `stdlib/System/Data/TDengine/TDenginePool.zan`
+> 源码: `packages/Zan.Data/src/System/Data/TDengine/TDengineConnection.zan`, `packages/Zan.Data/src/System/Data/TDengine/TDengineConnector.zan`, `packages/Zan.Data/src/System/Data/TDengine/TDenginePool.zan`
 
 
 ## TDengineConnection (class)

@@ -1,6 +1,6 @@
 # System.Data.Sqlite
 
-> 源码: `stdlib/System/Data/Sqlite/SqliteConnection.zan`, `stdlib/System/Data/Sqlite/SqliteConnector.zan`, `stdlib/System/Data/Sqlite/SqlitePool.zan`
+> 源码: `packages/Zan.Data/src/System/Data/Sqlite/SqliteConnection.zan`, `packages/Zan.Data/src/System/Data/Sqlite/SqliteConnector.zan`, `packages/Zan.Data/src/System/Data/Sqlite/SqlitePool.zan`
 
 
 ## SqliteConnection (class)

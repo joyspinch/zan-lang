@@ -2450,3 +2450,26 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
 构建卫生：同一 build 目录并发起两次 ninja 链接同一 exe，Windows exe 镜像锁会
 `lld-link: failed to write output ... permission denied`——串行构建；链接失败先
 查 zanc/lld-link 残留进程（也可能是并行会话的瞬时编译，会自行退出）。
+
+## 包发现不认无命名空间文件：拆库出包前先扫"无 ns 源"（2026-09-30，Zan.Data 拆包实测）
+
+- 坑：包发现按"声明命名空间==目标"精确匹配（pkg_visit_source_tree），无命名空间的
+  全局命名空间纯函数库（如 MySqlWire.zan，从 async/sync 双胞胎合并而来）永远不成为
+  候选——同目录同命名空间的调用方文件能进编译，它进不了，`unresolved call` 且错误
+  挂在包内文件行号上，极易误判为搬迁搬丢了文件或编译器解析回归。按目录 glob 拉入
+  的老布局没有这个问题，改成包后此路径消失；层级包盲区同根同源。
+- 修复语义（三件套）：① 声明 ns 精确或"目标+点"前缀匹配（pkg_ns_match）；
+  ② 无 ns 文件按"源根相对目录（分隔符转点）==目标命名空间"匹配（pkg_rel_dir_ns）
+  ——文件只归入其兄弟声明的那一个目录，逐目录访问天然不重复；③ 安全门：stdlib
+  同名目录存在的命名空间保持精确匹配（stdlib_has_dir）——否则 ubiquitous 的
+  `using System;` 配 pkg_src 无条件入集，会把所有包的 System.* 源拉进每一次编译
+  （pkg_src 是"只被生成路由表点名"的包文件的活名门豁免）。
+- 动手前先扫：逐包源 `grep -c "^namespace"` 找零命中文件——无 ns 源是拆包的
+  隐藏地雷，发现即知要靠 rel-dir 匹配（或给文件补 ns，但那是绕行不是修复）。
+- A/B 隔离技法（归因"编译器回归还是拆包破损"）：把新 zanc 与运行时目标文件一起
+  拷进干净 worktree 的构建目录（编译器按 exe 相对路径找运行时对象与 stdlib，
+  只拷 exe 会在链接期报缺 .obj），在 worktree 内 CWD 编译同一输入——三格矩阵
+  （旧树+新编译器 PASS / 新树+新编译器 FAIL ⇒ 非编译器回归，是包发现语义）一次定音。
+- 金样 CRLF 假差异：程序输出经控制台带 CR、金样是纯 LF 时，手搓 diff 报
+  `1c1 < PASS > PASS`；先 od -c 看字节，再用 diff --strip-trailing-cr 复核，
+  并与干净树 A/B 确认既有，勿当回归修。

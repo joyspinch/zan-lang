@@ -663,6 +663,9 @@ TLS 记录层协议常量。
 - async int SendAsync(byte[]data, int len)
   - 加密并发送字节数组前 len 字节。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。
 
+- async int SendBytesAsync(byte[]data, int len)
+  - 加密并发送字节数组前 len 字节。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。
+
 - async int SendBytesAsync(byte[]data, int offset, int len)
   - 加密并发送字节数组切片。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。
 

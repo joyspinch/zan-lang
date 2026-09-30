@@ -876,12 +876,19 @@ await udp.SendToAsync("Hello", "127.0.0.1", 9999);
   - 发送数据报，在 IO reactor 上挂起直到可写。
 
 - int SendBytesTo(string data, int len, string ip, int port)
-  - 发送原始字节。
+  - 发送原始字节（字符串形式，带显式长度）。
+
+- int SendBytesTo(byte[]data, int len, string ip, int port)
+  - 发送原始字节数组（零拷贝与二进制安全）。
 
 - async int SendBytesToAsync(string data, int len, string ip, int port)
-  - 以显式长度发送原始字节，在 IO
+  - 以显式长度发送原始字节（字符串形式），在 IO
     reactor 上挂起直到可写。用于二进制数据报：字符串
     重载用 strlen 计算长度，会在第一个 NUL 处停止。
+
+- async int SendBytesToAsync(byte[]data, int len, string ip, int port)
+  - 以显式长度发送原始字节数组，在 IO
+    reactor 上挂起直到可写。零中转字符串拷贝与二进制安全。
 
 - string RecvFrom(int bufSize)
   - 同步接收数据报。

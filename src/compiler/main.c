@@ -533,6 +533,22 @@ static int resolve_stdlib_dir(const char *stdlib_root, const char *subdir,
 }
 #endif
 
+/* Does the stdlib provide this namespace directory? Gates package hierarchy
+ * expansion (see pi_process_dir): stdlib-rooted namespaces keep exact
+ * package matching so `using System;` cannot reach package System.* files. */
+static int stdlib_has_dir(const char *stdlib_root, const char *subdir) {
+#ifdef _WIN32
+    char p[1024];
+    if (snprintf(p, sizeof(p), "%s\\%s", stdlib_root, subdir) >= (int)sizeof(p)) return 0;
+    for (char *q = p; *q; q++) if (*q == '/') *q = '\\';
+    DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    char r[1024];
+    return resolve_stdlib_dir(stdlib_root, subdir, r, sizeof(r));
+#endif
+}
+
 /* Namespace directories already globbed, so the same `using` in a hundred
  * files costs one directory listing. */
 static char **globbed_dirs = NULL;
@@ -773,10 +789,13 @@ static void package_add_input(const char *path, void *context) {
 static int auto_include_namespace(const char *stdlib_root, const char *subdir,
                                   const char ***files, int *count, int *cap) {
     int found = glob_stdlib_dir(stdlib_root, subdir, files, count, cap);
+    char probe_dir[1024];
+    int hierarchical = stdlib_has_dir(stdlib_root, subdir) == 0;
     pkg_auto_include_t args = { files, count, cap };
     int package_count = zan_pkg_visit_namespace(package_project_root, subdir,
                                                   probe_file_namespace,
-                                                  package_add_input, &args);
+                                                  package_add_input, &args,
+                                                  hierarchical);
     found = found || package_count > 0;
     /* `using System;` imports compiler/runtime core names rather than a
      * marketplace namespace; it must never become an install suggestion. */
@@ -1137,6 +1156,10 @@ typedef struct pi_file {
     pi_name_t **idents; int ident_count, ident_cap; /* every identifier */
     char **usings; int using_count, using_cap;    /* dotted subdirs */
     int has_ext;                /* hosts an extension method */
+    int pkg_src;                /* installed-package source: joins the parse
+                                   unconditionally -- package controllers are
+                                   named only by generated route tables
+                                   (GenRoute/__AttrRoutes), never by user code */
     int included;               /* joins the parse */
     int parsed;                 /* already appended to the input list */
     int seeded;                 /* already parse-seeded in the fixpoint */
@@ -1306,6 +1329,7 @@ static void pi_add_file(pi_dir_t *d, const char *path) {
     f->idents = NULL; f->ident_count = 0; f->ident_cap = 0;
     f->usings = NULL; f->using_count = 0; f->using_cap = 0;
     f->has_ext = 0;
+    f->pkg_src = 0;
     f->included = 0;
     f->parsed = 0;
     f->seeded = 0;
@@ -2545,7 +2569,9 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
 }
 
 static void pi_add_package_source(const char *path, void *context) {
-    pi_add_file((pi_dir_t *)context, path);
+    pi_dir_t *d = (pi_dir_t *)context;
+    pi_add_file(d, path);
+    if (d->file_count > 0) { d->files[d->file_count - 1].pkg_src = 1; }
 }
 
 /* Scan stdlib candidates and matching declared-namespace package sources.
@@ -2555,10 +2581,17 @@ static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
     d->reached = 1;
     int before = d->file_count;
     pi_glob_into(d, stdlib_root, d->subdir);
+    /* Hierarchy expansion is for project-package namespaces only: a stdlib
+     * directory with the same name keeps exact matching, or a ubiquitous
+     * `using System;` would reach every package's System.* sources -- and
+     * pkg_src files below skip the live-name gate, pulling them into every
+     * compile unconditionally. */
+    int hierarchical = stdlib_has_dir(stdlib_root, d->subdir) == 0;
     int found = d->file_count != before;
     int package_count = zan_pkg_visit_namespace(package_project_root, d->subdir,
                                                  probe_file_namespace,
-                                                 pi_add_package_source, d);
+                                                 pi_add_package_source, d,
+                                                 hierarchical);
     found = found || package_count > 0;
     /* `using System;` imports compiler/runtime core names rather than a
      * marketplace namespace; it must never become an install suggestion. */
@@ -2583,8 +2616,8 @@ static int pi_close_once(const char *stdlib_root) {
         for (int i = 0; i < d->file_count; i++) {
             pi_file_t *f = &d->files[i];
             if (f->included) continue;
-            int hit = f->has_ext;
-            const char *why = f->has_ext ? "ext" : NULL;
+            int hit = f->has_ext || f->pkg_src;
+            const char *why = f->has_ext ? "ext" : (f->pkg_src ? "pkg" : NULL);
             for (int k = 0; k < f->top_count && !hit; k++)
                 if (f->top[k]->flagged) { hit = 1; why = f->top[k]->str; }
             if (!hit) continue;

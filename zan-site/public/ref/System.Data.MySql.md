@@ -1,6 +1,6 @@
 # System.Data.MySql
 
-> 源码: `stdlib/System/Data/MySql/MySqlConnection.zan`, `stdlib/System/Data/MySql/MySqlConnector.zan`, `stdlib/System/Data/MySql/MySqlPool.zan`, `stdlib/System/Data/MySql/MySqlSyncConnection.zan`, `stdlib/System/Data/MySql/MySqlWire.zan`
+> 源码: `packages/Zan.Data/src/System/Data/MySql/MySqlConnection.zan`, `packages/Zan.Data/src/System/Data/MySql/MySqlConnector.zan`, `packages/Zan.Data/src/System/Data/MySql/MySqlPool.zan`, `packages/Zan.Data/src/System/Data/MySql/MySqlSyncConnection.zan`, `packages/Zan.Data/src/System/Data/MySql/MySqlWire.zan`
 
 
 ## MySqlAsyncConnector (class)

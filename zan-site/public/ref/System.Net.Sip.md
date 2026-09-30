@@ -49,6 +49,17 @@ SipMessage reg = await c.RegisterAsync("alice", 3600);
     首个最终（>=200）响应生效。超时返回 null。
 
 
+## SipHeader (class)
+
+SIP 头部实体记录（键/值对）。
+
+- string name;
+
+- string value;
+
+- SipHeader(string name, string value)
+
+
 ## SipMessage (class)
 
 单条 SIP 消息（RFC 3261）：请求或响应、头部、可选正文。
@@ -65,9 +76,7 @@ SipClient 中，媒体（RTP/SDP 协商）不在范围内。
 
 - string reason;
 
-- List<string> headerNames;
-
-- List<string> headerValues;
+- List<SipHeader> headers;
 
 - string body;
 

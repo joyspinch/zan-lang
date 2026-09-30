@@ -1,6 +1,6 @@
 # System.Data.Excel
 
-> 源码: `stdlib/System/Data/Excel/Xlsx.zan`
+> 源码: `packages/Zan.Data/src/System/Data/Excel/Xlsx.zan`
 
 
 ## Xlsx (class)

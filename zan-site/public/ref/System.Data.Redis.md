@@ -1,6 +1,6 @@
 # System.Data.Redis
 
-> 源码: `stdlib/System/Data/Redis/RedisClient.zan`, `stdlib/System/Data/Redis/RedisPool.zan`, `stdlib/System/Data/Redis/RedisReply.zan`
+> 源码: `packages/Zan.Data/src/System/Data/Redis/RedisClient.zan`, `packages/Zan.Data/src/System/Data/Redis/RedisPool.zan`, `packages/Zan.Data/src/System/Data/Redis/RedisReply.zan`
 
 
 ## RedisClient (class)

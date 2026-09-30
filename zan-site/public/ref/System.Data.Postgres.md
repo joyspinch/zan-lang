@@ -1,6 +1,6 @@
 # System.Data.Postgres
 
-> 源码: `stdlib/System/Data/Postgres/PgConnector.zan`, `stdlib/System/Data/Postgres/PgPool.zan`, `stdlib/System/Data/Postgres/PostgresConnection.zan`
+> 源码: `packages/Zan.Data/src/System/Data/Postgres/PgConnector.zan`, `packages/Zan.Data/src/System/Data/Postgres/PgPool.zan`, `packages/Zan.Data/src/System/Data/Postgres/PostgresConnection.zan`
 
 
 ## PgConnection (class)

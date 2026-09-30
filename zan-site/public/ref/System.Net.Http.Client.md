@@ -235,6 +235,8 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
 
 - [DllImport("crt")]static extern long fwrite(string buf, long size, long count, nint fp);
 
+- [DllImport("crt")]static extern long fread(byte[]buf, long size, long count, nint fp);
+
 - [DllImport("crt")]static extern int fseek(nint fp, int offset, int origin);
 
 - [DllImport("crt")]static extern int ftell(nint fp);
@@ -288,9 +290,9 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
     回 UI，不要在里面做别的事。目前 `UploadFileBytesAsync`
     汇报进度；其余请求不装探针。
 
-- void UploadTick(int sentBytes, int totalBytes)
+- void UploadTick(long sentBytes, long totalBytes)
   - 探针非空时上报一次进度；装探针的调用点在发送循环里，成本只有
-    一次空判 + 一次委托调用。
+    一次空判 + 一次委托调用。对 >2GB 上传安全钳制在 32 位上限，防溢出。
 
 - string LastDownloadError()
   - 最近一次二进制下载失败的阶段诊断；成功或尚未下载时为空。
@@ -345,7 +347,7 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
     ExternalTargetPolicy。DNS 多地址复核仍由 socket 层继续补齐。
     不允许时抛 HttpRequestException。
 
-- void CheckRequestLimit(int bodyBytes)
+- void CheckRequestLimit(long bodyBytes)
   - 绑定 policy 后，正文在建连前按统一 max request bytes 拒绝，
     避免副作用请求已经上线。超限时抛 HttpRequestException。
 
@@ -419,8 +421,8 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
 
 - static bool IsHostSafe(string host)
 
-- string BuildRequestHead(string method, string path, int bodyLen, bool close)
-  - 构建请求头部半区；bodyLen<=0 时不写 Content-Length。
+- string BuildRequestHead(string method, string path, long bodyLen, bool close)
+  - 构建请求头部半区；bodyLen<=0 时不写 Content-Length。支持 64 位大请求体。
 
 - string BuildRequest(string method, string path, string body, bool close)
   - BuildRequestHead 加上文本正文（一次性通道用）。
@@ -563,12 +565,18 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
   - 发送原始字节正文（带显式字节长度，二进制安全，可含 NUL 字节）。
 
 - async HttpResponse SendBytesAsync(string method, string path, byte[]body, int bodyLen)
-  - 发送原始字节数组（带显式字节长度，二进制安全，可含 NUL 字节）。
+  - 发送原始字节数组（带显式字节长度，二进制安全，零中转字符串拷贝）。
+
+- async HttpResponse UploadFileRawAsync(string method, string path, string localPath, string contentType)
+  - 流式上传本地文件作为请求正文（适用于 PUT / POST 原始文件上传，如 WebDAV、对象存储等），
+    单句柄 64KB 流式直发，零中转整文件内存分配，支持超 2GB 大文件。
 
 - static async HttpResponse SendBytesOnceAsync(HttpClient client, string method, string path, string body)
   - 一次真实上线：SendBytesAsync 的无重定向主体，同时作为
     FollowBytesRedirects 的驱动回调。method 随驱动签名显式传递：
     重定向改写（301/302/303 → GET）后驱动端据此发空 GET。
+
+- static async HttpResponse SendBytesOnceWithRawBytesAsync(HttpClient client, string method, string path, byte[]body, int bodyLen)
 
 - static async HttpResponse SendBytesOnceWithLenAsync(HttpClient client, string method, string path, string body, int bodyLen)
 
@@ -591,12 +599,14 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
 
 - async HttpResponse SendBytesTlsWithLenAsync(string method, string path, string body, int bodyLen)
 
-- async HttpResponse SendBytesBodyAsync(string method, string path, string head, string localPath, int fileLen, string tail, int total)
+- async HttpResponse SendBytesTlsWithRawBytesAsync(string method, string path, byte[]body, int bodyLen)
+
+- async HttpResponse SendBytesBodyAsync(string method, string path, string head, string localPath, long fileLen, string tail, long total)
   - UploadFileBytesAsync 的明文通道：头部 + 文件字节 + 尾部三段式，
     每段按显式字节长度发送——strlen 定长的 SendAsync 会把内嵌 NUL
     后的正文截掉；Content-Length（total）与各段发送长度取自同一处
-    （与 HttpServer 发送二进制响应同一纪律）。文件按 64KB 分块
-    读取上线，进度探针随字节推进。绑定 policy 时接入字节重定向链：
+    （与 HttpServer 发送二进制响应同一纪律）。单句柄流式读取，
+    文件按 64KB 分块读取上线，进度探针随字节推进。绑定 policy 时接入字节重定向链：
     3xx 原样返回仍是默认；301/302/303 改写为 GET 后实体不重放
     （multipart 上传无法降级），由驱动端发空 GET。
 
@@ -607,9 +617,9 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
     重传，而 307/308 重放由 RedirectReplay 直接拒绝（非 GET/HEAD），
     因此实体分块只存在于首发路径。
 
-- async HttpResponse SendBytesBodyTlsAsync(string method, string path, string head, string localPath, int fileLen, string tail, int total)
+- async HttpResponse SendBytesBodyTlsAsync(string method, string path, string head, string localPath, long fileLen, string tail, long total)
   - UploadFileBytesAsync 的 TLS 变体：握手同 SendBytesTlsAsync，
-    三段式正文按显式长度发送，读取走 HttpFramerTls.Create。
+    三段式正文按显式长度发送，单句柄流式读取，读取走 HttpFramerTls.Create。
 
 - async string GetAsync(string path)
   - 发送 GET 请求并返回响应体。
@@ -770,7 +780,7 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
     客户端上递归重开整段下载——have 从本地文件重建，Range 行为
     逐跳一致。visited/hops 由入口初始化，跨跳共享防循环。
 
-- async long DownloadBinaryToFileAsync(string path, string localPath, string progressFile)
+- async long DownloadBinaryToFileAsync(string path, string localPath)
   - 把 <paramref name="path"/> 下载到
     <paramref name="localPath"/>，正文按字节搬运——正文里的 NUL
     不会被当成结尾，因此适合 .tar.bz2 / .zip 之类的二进制归档
@@ -785,6 +795,18 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
     Content-Length/Range 的 identity 正文）时返回 -1；装了
     `SetCancelProbe` 的探针并在下载中路取消时返回 -2
     （已收字节保留在 <paramref name="localPath"/>，可续传）。绑定了
+    `ExternalCallPolicy` 且 `Redirects(n)>0` 时，
+    3xx 按策略逐跳跟随（语义与
+    `DownloadRangeToFileAsync` 相同）；未启用时 3xx 仍按
+    错误状态拒绝落盘。
+    流式二进制下载到本地文件（无独立进度标记文件）。
+
+- async long DownloadBinaryToFileAsync(string path, string localPath, string progressFile)
+  - 二进制安全的端点下载：以追加写模式流式写入
+    <paramref name="localPath"/>，正文按字节搬运——正文里的 NUL
+    字节不会被误当作 EOF。支持断点续传与 Content-Range
+    校验；下载中断时返回负数错误码（已收字节保留在
+    <paramref name="localPath"/>，可续传）。绑定了
     `ExternalCallPolicy` 且 `Redirects(n)>0` 时，
     3xx 按策略逐跳跟随（语义与
     `DownloadRangeToFileAsync` 相同）；未启用时 3xx 仍按

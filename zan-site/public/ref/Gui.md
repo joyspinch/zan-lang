@@ -6241,7 +6241,7 @@ HTML 里 `data-on-click="submit"` 命中同名条目即接线。带参变体
 ## IconSvg (class)
 
 SVG 矢量图标集：精选 Tabler Icons 子集（MIT 授权），数据与名称
-表在 IconSvgData（JSON 数据包 stdlib/Gui/icons/tabler.json，发布时
+表在 IconSvgData（JSON 数据包 packages/Zan.Gui/src/Gui/icons/tabler.json，发布时
 自动 --embed 进可执行文件），由 scripts/gen_icons_tabler.py 生成。
 
 与 Icon/IconVector（手绘线段近似，零依赖）互补：框架内部的
@@ -6289,7 +6289,7 @@ IconSvg 的数据表:Tabler Icons 精选子集(MIT 授权,
 https://github.com/tabler/tabler-icons),由 scripts/gen_icons_tabler.py
 生成——**生成物,请勿手改**;要换子集或更新上游版本时重跑该脚本。
 
-数据以 JSON 包(stdlib/Gui/icons/tabler.json)随标准库走,编译发布时经
+数据以 JSON 包(packages/Zan.Gui/src/Gui/icons/tabler.json)随 Zan.Gui 包走,编译发布时经
 `zanc --embed` 烤进可执行镜像,运行时惰性解析一次:没画过图标的程序
 只带一份 ~260KB 的数据文件,不再把它展开成代码节;画了才在内存里建表。
 
@@ -6297,7 +6297,7 @@ https://github.com/tabler/tabler-icons),由 scripts/gen_icons_tabler.py
 1. 环境变量 ZAN_GUI_ICONS 指向的文件或目录;
 2. exe 旁 icons/、assets/icons/;
 3. exe 内嵌资源 icons/(*.json);
-4. 标准库副本 stdlib/Gui/icons/(开发树)。
+4. Zan.Gui 包源码副本 packages/Zan.Gui/src/Gui/icons/(开发树)。
 后发现的同名文件不覆盖先命中的;不同名的 JSON 与内置包合并(追加/覆盖
 同名图标),所以应用只需放一个自己的 json 就能加图标或换掉个别图标。
 
@@ -8361,8 +8361,8 @@ kind name dock padL padT padR padB gap mx my prefW prefH nChildren nProps
 每控件规则）及其美术资源。皮肤是数据而非代码——用户可以在
 应用旁放一个文件夹并在运行时选用：
 
-stdlib/Gui/skins/fortune/skin.css
-stdlib/Gui/skins/fortune/banner.png
+packages/Zan.Gui/src/Gui/skins/fortune/skin.css
+packages/Zan.Gui/src/Gui/skins/fortune/banner.png
 
 Skin s = Skin.Load("fortune");
 s.Apply(app);            // 主题令牌 + 样式表 + 背景美术
@@ -8425,7 +8425,7 @@ CSS 样式化的东西仍得到皮肤的调色板），其余每条规则供给�
 
 - static List<string> Roots()
   - 搜索皮肤包的根，最具体者优先：`$ZAN_GUI_SKINS`、
-    应用自己的 `skins/`，然后是 stdlib 副本（从构建树运行时）。
+    应用自己的 `skins/`，然后是 Zan.Gui 包源码副本（从构建树/发布树运行时）。
 
 - static string ExeDir()
   - 正在运行的可执行文件所在目录（不含末尾分隔符），无法确定时返回 ""。

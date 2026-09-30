@@ -1,6 +1,6 @@
 # System.Data.SqlServer
 
-> 源码: `stdlib/System/Data/SqlServer/SqlServerConnection.zan`, `stdlib/System/Data/SqlServer/SqlServerPool.zan`, `stdlib/System/Data/SqlServer/TdsCodec.zan`, `stdlib/System/Data/SqlServer/TdsMessage.zan`, `stdlib/System/Data/SqlServer/TdsTypes.zan`
+> 源码: `packages/Zan.Data/src/System/Data/SqlServer/SqlServerConnection.zan`, `packages/Zan.Data/src/System/Data/SqlServer/SqlServerPool.zan`, `packages/Zan.Data/src/System/Data/SqlServer/TdsCodec.zan`, `packages/Zan.Data/src/System/Data/SqlServer/TdsMessage.zan`, `packages/Zan.Data/src/System/Data/SqlServer/TdsTypes.zan`
 
 
 ## SqlServerConnection (class)

@@ -89,6 +89,9 @@ if (Test-Path packages\Zan.Gui.Browser) {
 if (Test-Path packages\Zan.Industrial) {
     $files += (Get-ChildItem packages\Zan.Industrial\src -Recurse -Include *.zan).FullName
 }
+if (Test-Path packages\Zan.Data) {
+    $files += (Get-ChildItem packages\Zan.Data\src -Recurse -Include *.zan).FullName
+}
 # System pieces the editor/workspace rely on.
 $files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")

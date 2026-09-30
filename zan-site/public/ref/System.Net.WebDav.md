@@ -77,7 +77,14 @@ Multi-Status 上限 4 MiB / 10000 个资源，超限抛 ArgumentException。
 
 - async HttpResponse PutBytesAsync(string path, byte[]data)
   - 上传二进制资源（Content-Type: application/octet-stream）；
-    201/204 等状态码在返回的响应里。
+    零中转字符串拷贝，201/204 等状态码在返回的响应里。
+
+- async HttpResponse PutFileAsync(string path, string localPath)
+  - 流式上传本地文件（PUT application/octet-stream）；
+    单句柄 64KB 流式直发，零整文件内存缓冲，支持超 2GB 大文件，201/204 等状态码在返回的响应里。
+
+- async long GetToFileAsync(string path, string localPath)
+  - 流式下载 WebDAV 资源到本地文件，支持断点续传与超 2GB 大文件。成功返回已接收字节数。
 
 - async HttpResponse DeleteAsync(string path)
   - 删除资源或集合；状态码在返回的响应里。

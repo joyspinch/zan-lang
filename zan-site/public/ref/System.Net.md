@@ -1163,6 +1163,12 @@ partial Worker）的理由见 Worker.ProtoEntryFn 的文档。
   - WebSocket 二进制 push：`data` 可含 NUL，`len` 为精确
     字节数（绝不 strlen）。语义同 Push。
 
+- static async bool PushBinary(Connection c, byte[]data, int offset, int len)
+  - WebSocket 原始字节数组 push：零中转字符串拷贝与二进制安全。
+
+- static async bool PushBinary(Connection c, byte[]data)
+  - WebSocket 原始字节数组 push 全量切片。
+
 - static async void HandleWebSocket(Worker w, nint clientSock)
   - A WebSocket port is an HTTP port until the client asks to upgrade, so the
     request head is read and parsed first: an Upgrade request becomes a frame
