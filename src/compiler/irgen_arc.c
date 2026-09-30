@@ -924,9 +924,62 @@ static void emit_array_release(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v)
         fn, &a, 1, "");
 }
 
-/* Emit the body of __zan_release_<T>: null-guard, peek the refcount, release the
- * RC-managed fields when it is about to hit zero, then hand off to
- * zan_rt_release for the decrement + free. */
+/* Shared tail of every destroy: leak accounting, then --arc-guard quarantine
+ * or a plain free of the 16-byte header. Callers have already claimed the
+ * destroy (the fetch_sub came back 1) and released the fields; weak targets
+ * have had their registry slots nulled before the fields went. Saves and
+ * restores the builder so release-body construction can call it mid-emission. */
+static LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
+    LLVMValueRef existing = LLVMGetNamedFunction(g->mod, "__zan_arc_free");
+    if (existing) return existing;
+    LLVMContextRef c = g->ctx;
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMTypeRef ft = LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, "__zan_arc_free", ft);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(b);
+    LLVMValueRef saved_fn = g->current_fn;
+    di_clear(g); /* synthetic fn: don't inherit a user fn's DISubprogram scope */
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
+    LLVMPositionBuilderAtEnd(b, entry);
+    g->current_fn = fn;
+    LLVMValueRef obj = LLVMGetParam(fn, 0);
+    if (g->check_leaks) {
+        /* read the allocation-site index while the object memory is still live */
+        LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+        LLVMValueRef site_ptr = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg8, 1, "sptr");
+        LLVMValueRef site_iptr = LLVMBuildBitCast(b, site_ptr, LLVMPointerType(i64, 0), "siptr");
+        LLVMValueRef site = LLVMBuildLoad2(b, i64, site_iptr, "site");
+        /* leak tracking: one fewer live object, and one fewer at this site */
+        emit_leak_counter_add(g, g->g_live, -1);
+        LLVMValueRef gidx[2] = { LLVMConstInt(LLVMInt32TypeInContext(c), 0, 0), site };
+        LLVMValueRef sc_ptr = LLVMBuildGEP2(b, g->site_live_type, g->g_site_live, gidx, 2, "scptr");
+        emit_leak_counter_add(g, sc_ptr, -1);
+    }
+    if (g->arc_guard) {
+        LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
+        LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
+        LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
+        emit_arc_quarantine(g, obj, rcip);
+    } else {
+        /* free(obj - 16) to include the header */
+        LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
+        LLVMValueRef header_ptr = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "hdr");
+        LLVMTypeRef free_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0);
+        zan_call2(b, free_fn_type, g->fn_free, &header_ptr, 1, "");
+    }
+    LLVMBuildRetVoid(b);
+    g->current_fn = saved_fn;
+    if (saved_bb) LLVMPositionBuilderAtEnd(b, saved_bb);
+    return fn;
+}
+
+/* Emit the body of __zan_release_<T>: null-guard, atomically claim the destroy
+ * (fetch_sub hands the pre-op value 1 to exactly one caller), release the
+ * RC-managed fields, then free through __zan_arc_free. A pre-op <= 0 defers
+ * to zan_rt_release, whose underflow checks report the over-release. */
 static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
                                     zan_type_t *inst, LLVMValueRef fn) {
     di_clear(g); /* synthetic fn: don't inherit a user fn's DISubprogram scope */
@@ -948,9 +1001,17 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
     LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
     LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
-    LLVMValueRef rc = LLVMBuildLoad2(b, i64, rcip, "rc");
-    LLVMValueRef is1 = zan_icmp(b, LLVMIntEQ, rc, LLVMConstInt(i64, 1, 0), "is1");
-    LLVMBuildCondBr(b, is1, relf, dorel);
+    /* Atomically claim the destroy decision. A plain `load rc == 1` peek let
+     * two concurrent final releases both observe 1 and release the fields
+     * twice; fetch_sub hands the pre-op value to exactly one caller. */
+    LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
+        LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
+    LLVMValueRef is1 = zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(i64, 1, 0), "is1");
+    LLVMValueRef over = zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(i64, 0, 0), "over");
+    LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(c, fn, "last");
+    LLVMBuildCondBr(b, over, dorel, last_bb);
+    LLVMPositionBuilderAtEnd(b, last_bb);
+    LLVMBuildCondBr(b, is1, relf, ret);
     LLVMPositionBuilderAtEnd(b, relf);
     LLVMValueRef self = LLVMBuildBitCast(b, obj, LLVMPointerType(structT, 0), "self");
     int fi = class_vptr_offset(sym);
@@ -1008,7 +1069,17 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
             emit_arc_release_typed(g, ft, cv);
         }
     }
-    LLVMBuildBr(b, dorel);
+    /* The destroy was claimed above, so free here: handing back to
+     * zan_rt_release would decrement again and underflow the count this
+     * path already took. */
+    LLVMBasicBlockRef freebb = LLVMAppendBasicBlockInContext(c, fn, "freebb");
+    LLVMBuildBr(b, freebb);
+    LLVMPositionBuilderAtEnd(b, freebb);
+    zan_call2(b, LLVMGlobalGetValueType(g->rt_weak_nil_all),
+              g->rt_weak_nil_all, &obj, 1, "");
+    LLVMValueRef freefn = get_arc_free_decl(g);
+    zan_call2(b, LLVMGlobalGetValueType(freefn), freefn, &obj, 1, "");
+    LLVMBuildBr(b, ret);
     LLVMPositionBuilderAtEnd(b, dorel);
     zan_call2(b, LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0),
                    g->rt_release, &obj, 1, "");
@@ -1042,9 +1113,17 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
     LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
     LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
     LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
-    LLVMValueRef rc = LLVMBuildLoad2(b, i64, rcip, "rc");
-    LLVMValueRef is1 = zan_icmp(b, LLVMIntEQ, rc, LLVMConstInt(i64, 1, 0), "is1");
-    LLVMBuildCondBr(b, is1, relf, dorel);
+    /* Atomically claim the destroy decision. A plain `load rc == 1` peek let
+     * two concurrent final releases both observe 1 and release the fields
+     * twice; fetch_sub hands the pre-op value to exactly one caller. */
+    LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
+        LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
+    LLVMValueRef is1 = zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(i64, 1, 0), "is1");
+    LLVMValueRef over = zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(i64, 0, 0), "over");
+    LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(c, fn, "last");
+    LLVMBuildCondBr(b, over, dorel, last_bb);
+    LLVMPositionBuilderAtEnd(b, last_bb);
+    LLVMBuildCondBr(b, is1, relf, ret);
     LLVMPositionBuilderAtEnd(b, relf);
     LLVMTypeRef free_ty = LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0);
     if (coll_kind == 1) {
@@ -1079,7 +1158,12 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
         LLVMValueRef data = LLVMBuildLoad2(b, i8ptr, dp, "data");
         zan_call2(b, free_ty, g->fn_free, &data, 1, "");
     }
-    LLVMBuildBr(b, dorel);
+    LLVMBasicBlockRef freebb = LLVMAppendBasicBlockInContext(c, fn, "freebb");
+    LLVMBuildBr(b, freebb);
+    LLVMPositionBuilderAtEnd(b, freebb);
+    LLVMValueRef freefn = get_arc_free_decl(g);
+    zan_call2(b, LLVMGlobalGetValueType(freefn), freefn, &obj, 1, "");
+    LLVMBuildBr(b, ret);
     LLVMPositionBuilderAtEnd(b, dorel);
     zan_call2(b, LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0),
                    g->rt_release, &obj, 1, "");

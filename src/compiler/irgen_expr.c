@@ -11969,9 +11969,19 @@ static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
     LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
     LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), rec, &neg16, 1, "rcp");
     LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
-    LLVMValueRef rc = LLVMBuildLoad2(b, i64, rcip, "rc");
-    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, rc, LLVMConstInt(i64, 1, 0), "is1"),
-                    drop, dec);
+    /* Atomic claim, same as the class/collection release bodies: a plain
+     * `load rc == 1` peek let two concurrent final releases both drop the
+     * captures. */
+    LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
+        LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
+    LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(c, fn, "last");
+    LLVMBasicBlockRef freebb = LLVMAppendBasicBlockInContext(c, fn, "freebb");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(c, fn, "done");
+    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(i64, 0, 0), "over"),
+                    dec, last_bb);
+    LLVMPositionBuilderAtEnd(b, last_bb);
+    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(i64, 1, 0), "is1"),
+                    drop, done_bb);
     LLVMPositionBuilderAtEnd(b, drop);
     /* the bound receiver of a method group (null for a lambda; the release is
      * null-tolerant) */
@@ -12005,10 +12015,16 @@ static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
         LLVMValueRef v = LLVMBuildLoad2(g->builder, i8ptr, p, "tv");
         emit_arc_release_typed(g, NULL, v);
     }
-    LLVMBuildBr(g->builder, dec);
+    LLVMBuildBr(g->builder, freebb);
+    LLVMPositionBuilderAtEnd(g->builder, freebb);
+    LLVMValueRef freefn = get_arc_free_decl(g);
+    zan_call2(g->builder, LLVMGlobalGetValueType(freefn), freefn, &rec, 1, "");
+    LLVMBuildBr(g->builder, done_bb);
     LLVMPositionBuilderAtEnd(g->builder, dec);
     zan_call2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0),
               g->rt_release, &rec, 1, "");
+    LLVMBuildBr(g->builder, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, done_bb);
     LLVMBuildRetVoid(g->builder);
     LLVMDisposeBuilder(b);
     g->builder = saved;

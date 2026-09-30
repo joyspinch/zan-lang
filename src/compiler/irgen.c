@@ -1685,6 +1685,12 @@ static void emit_arc_fault_report(zan_irgen_t *g, LLVMValueRef obj,
     LLVMBuildUnreachable(g->builder);
 }
 
+/* Defined in irgen_arc.c: the shared destroy tail (leak counters, then
+ * --arc-guard quarantine or a plain free of the 16-byte header), factored so
+ * zan_rt_release's free path and the per-class/collection/closure release
+ * bodies all free through one code path. */
+static LLVMValueRef get_arc_free_decl(zan_irgen_t *g);
+
 static void emit_arc_underflow_check(zan_irgen_t *g, LLVMValueRef fn,
                                     LLVMValueRef rc_old, LLVMValueRef obj,
                                     LLVMValueRef site, unsigned code,
@@ -2820,28 +2826,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef free_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "dofree");
         LLVMBuildCondBr(g->builder, is_zero, free_bb, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, free_bb);
-        LLVMValueRef site = NULL;
-        if (g->check_leaks) {
-            /* read the allocation-site index while the object memory is still live */
-            LLVMValueRef site_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "sptr");
-            LLVMValueRef site_iptr = LLVMBuildBitCast(g->builder, site_ptr, LLVMPointerType(i64, 0), "siptr");
-            site = LLVMBuildLoad2(g->builder, i64, site_iptr, "site");
-        }
-        /* free(obj - 16) to include the header */
-        LLVMValueRef header_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "hdr");
-        LLVMTypeRef free_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-            (LLVMTypeRef[]){ i8ptr }, 1, 0);
         zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_weak_nil_all),
                   g->rt_weak_nil_all, &obj, 1, "");
-        if (g->arc_guard) emit_arc_quarantine(g, obj, rc_iptr);
-        else zan_call2(g->builder, free_fn_type, g->fn_free, &header_ptr, 1, "");
-        if (g->check_leaks) {
-            /* leak tracking: one fewer live object, and one fewer at this site */
-            emit_leak_counter_add(g, g->g_live, -1);
-            LLVMValueRef gidx[2] = { LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0), site };
-            LLVMValueRef sc_ptr = LLVMBuildGEP2(g->builder, g->site_live_type, g->g_site_live, gidx, 2, "scptr");
-            emit_leak_counter_add(g, sc_ptr, -1);
-        }
+        LLVMValueRef freefn = get_arc_free_decl(g);
+        zan_call2(g->builder, LLVMGlobalGetValueType(freefn), freefn, &obj, 1, "");
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, ret_bb);
         LLVMBuildRetVoid(g->builder);
