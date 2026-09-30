@@ -914,6 +914,50 @@ static void anf_normalize_body(zan_irgen_t *g, zan_ast_node_t **slot, int *count
     anf_normalize_block(g, body, counter);
 }
 
+/* Rewrite a per-iteration loop position whose expression contains an await so
+ * the expression evaluates at statement position inside the loop body:
+ *
+ *   while (C) B      ->  while (true) { <C-hoists>; if (!C) break; B }
+ *   do B while (C)   ->  do { B <C-hoists>; if (!C) break; } while (true)
+ *   for (I; C; S) B  ->  for (I; [true]; [S]) { <C-hoists>; if (!C) break; B [S']; }
+ *
+ * `<C-hoists>` are the `var $awN = await E;` declarations anf_expr appends for
+ * every await in C. Hoisting C out of the loop was never an option (the
+ * condition is re-evaluated every iteration), but leaving the await IN the
+ * condition is just as broken: the eager operands computed before the
+ * suspension are SSA temps, and their consumer (the resume-block icmp/add)
+ * sits in a block those temps do not dominate ("Instruction does not dominate
+ * all uses"). At statement position every hoisted await becomes a named scalar
+ * local, which async_scan makes frame-resident and every state block reloads,
+ * so no SSA value crosses the suspension.
+ *
+ * break/continue targets are unchanged: the guard stands exactly where the
+ * condition used to be evaluated, and a for-step moved to the end of the body
+ * still runs after the body and before the re-test -- which is also where
+ * `continue` lands. Returns the `true` literal to store into the loop's
+ * condition slot (left in place when only the step contained awaits). */
+static zan_ast_node_t *anf_loop_cond_guard(zan_irgen_t *g, zan_ast_list_t *dst,
+                                           int *counter, zan_ast_node_t **cond_slot,
+                                           const zan_loc_t *loc) {
+    anf_ctx_t c = { g, dst, counter };
+    zan_ast_node_t *residual = anf_expr(&c, *cond_slot);
+    zan_ast_node_t *neg = zan_ast_new(g->arena, AST_UNARY, *loc);
+    neg->unary.op = TK_BANG;
+    neg->unary.operand = residual;
+    zan_ast_node_t *tb = zan_ast_new(g->arena, AST_BLOCK, *loc);
+    zan_ast_list_init(&tb->block.stmts);
+    zan_ast_list_push(&tb->block.stmts,
+        zan_ast_new(g->arena, AST_BREAK_STMT, *loc), g->arena);
+    zan_ast_node_t *ifs = zan_ast_new(g->arena, AST_IF_STMT, *loc);
+    ifs->if_stmt.cond = neg;
+    ifs->if_stmt.then_body = tb;
+    ifs->if_stmt.else_body = NULL;
+    zan_ast_list_push(dst, ifs, g->arena);
+    zan_ast_node_t *tru = zan_ast_new(g->arena, AST_BOOL_LITERAL, *loc);
+    tru->bool_val = true;
+    return tru;
+}
+
 /* Normalize one statement, appending any hoisted declarations to `dst` (in
  * evaluation order) *before* the statement is pushed by the caller. Nested
  * statement bodies are normalized recursively. */
@@ -966,12 +1010,53 @@ static void anf_normalize_stmt(zan_irgen_t *g, zan_ast_node_t *st,
         break;
     case AST_WHILE_STMT:
     case AST_DO_WHILE_STMT:
-        /* condition is re-evaluated each iteration → must NOT hoist it out */
-        anf_normalize_body(g, &st->while_stmt.body, counter);
+        /* condition is re-evaluated each iteration → must NOT hoist it out;
+         * an await left in it dies at the suspension instead -- evaluate it
+         * at statement position at the top (while) / bottom (do-while) of the
+         * body and gate the iteration with an if-break (see
+         * anf_loop_cond_guard). */
+        if (anf_expr_contains_await(st->while_stmt.cond)) {
+            bool is_do = (st->kind == AST_DO_WHILE_STMT);
+            zan_ast_node_t *blk = zan_ast_new(g->arena, AST_BLOCK, st->loc);
+            zan_ast_list_init(&blk->block.stmts);
+            if (is_do) {
+                anf_normalize_body(g, &st->while_stmt.body, counter);
+                zan_ast_list_push(&blk->block.stmts, st->while_stmt.body, g->arena);
+            }
+            st->while_stmt.cond = anf_loop_cond_guard(g, &blk->block.stmts,
+                counter, &st->while_stmt.cond, &st->loc);
+            if (!is_do)
+                zan_ast_list_push(&blk->block.stmts, st->while_stmt.body, g->arena);
+            st->while_stmt.body = blk;
+        } else {
+            anf_normalize_body(g, &st->while_stmt.body, counter);
+        }
         break;
-    case AST_FOR_STMT:
-        anf_normalize_body(g, &st->for_stmt.body, counter);
+    case AST_FOR_STMT: {
+        bool cond_awaits = anf_expr_contains_await(st->for_stmt.cond);
+        bool step_awaits = anf_expr_contains_await(st->for_stmt.step);
+        if (cond_awaits || step_awaits) {
+            zan_ast_node_t *blk = zan_ast_new(g->arena, AST_BLOCK, st->loc);
+            zan_ast_list_init(&blk->block.stmts);
+            if (cond_awaits)
+                st->for_stmt.cond = anf_loop_cond_guard(g, &blk->block.stmts,
+                    counter, &st->for_stmt.cond, &st->loc);
+            anf_normalize_body(g, &st->for_stmt.body, counter);
+            zan_ast_list_push(&blk->block.stmts, st->for_stmt.body, g->arena);
+            if (step_awaits) {
+                anf_ctx_t c2 = { g, &blk->block.stmts, counter };
+                zan_ast_node_t *step = anf_expr(&c2, st->for_stmt.step);
+                zan_ast_node_t *es = zan_ast_new(g->arena, AST_EXPR_STMT, st->loc);
+                es->expr_stmt.expr = step;
+                zan_ast_list_push(&blk->block.stmts, es, g->arena);
+                st->for_stmt.step = NULL;
+            }
+            st->for_stmt.body = blk;
+        } else {
+            anf_normalize_body(g, &st->for_stmt.body, counter);
+        }
         break;
+    }
     case AST_FOREACH_STMT:
         anf_normalize_body(g, &st->foreach_stmt.body, counter);
         break;

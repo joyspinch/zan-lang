@@ -2754,6 +2754,22 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "do.body");
         LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "do.cond");
         LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "do.end");
+        LLVMBasicBlockRef saved_break = g->break_target;
+        LLVMBasicBlockRef saved_cont = g->continue_target;
+        int saved_loop_base = g->loop_locals_base;
+        int saved_loop_cbase = g->loop_catch_base;
+        int saved_loop_fbase = g->finally_loop_base;
+        int saved_loop_ehbase = g->eh_armed_loop_base;
+        /* break/continue targets were never registered here, so a break in a
+         * do-while body silently fell through (no target -> empty statement,
+         * infinite loop; a stale outer target -> exited the wrong loop).
+         * continue re-tests the condition, which is what cond_bb holds. */
+        g->break_target = end_bb;
+        g->continue_target = cond_bb;
+        g->loop_locals_base = body_start;
+        g->loop_catch_base = g->catch_cleanup_count;
+        g->finally_loop_base = g->finally_count;
+        g->eh_armed_loop_base = g->eh_armed_count;
         LLVMBuildBr(g->builder, body_bb);
 
         LLVMPositionBuilderAtEnd(g->builder, body_bb);
@@ -2769,6 +2785,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMValueRef cond = emit_expr(g, stmt->while_stmt.cond, locals);
         cond = zan_tobool(g->builder, cond, "dcond");
         LLVMBuildCondBr(g->builder, cond, body_bb, end_bb);
+
+        g->break_target = saved_break;
+        g->continue_target = saved_cont;
+        g->loop_locals_base = saved_loop_base;
+        g->loop_catch_base = saved_loop_cbase;
+        g->finally_loop_base = saved_loop_fbase;
+        g->eh_armed_loop_base = saved_loop_ehbase;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         break;
