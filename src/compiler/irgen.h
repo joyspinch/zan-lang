@@ -841,6 +841,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             bool check_leaks, bool runtime_checks,
                             bool arc_guard, bool arc_net);
 void zan_irgen_destroy(zan_irgen_t *g);
+void zan_irgen_release_llvm(zan_irgen_t *g);
 
 /* Intern a compiler-emitted guard text (see irgen.c): identical strings share
  * one private global instead of each emit site allocating its own .rdata. */

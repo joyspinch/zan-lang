@@ -2597,9 +2597,9 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         i8ptr, /* CHILD: sub-frame currently awaited */
         i8ptr  /* LNEXT: live detached-frame list link */
     };
-    /* Stops before ASYNC_FRAME_RETSPILL: the return spill and the per-handler
-     * arrays beyond it are sized/used per function, so they are not part of
-     * the shared prefix. Only the fields above are reached through this type. */
+    /* Stops before ASYNC_FRAME_HSTACK: the per-handler arrays are sized per
+     * function (one slot per try in that body), so they are not part of the
+     * shared prefix. Only the fields above are reached through this type. */
     g->co_header_type = LLVMStructCreateNamed(g->ctx, "zan.co.header");
     LLVMStructSetBody(g->co_header_type, co_hdr_fields, 16, 0);
     g->current_async_frame = NULL;
@@ -3252,6 +3252,54 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     }
 
     return ZAN_OK;
+}
+
+void zan_irgen_release_llvm(zan_irgen_t *g) {
+    if (!g) return;
+    if (s_current_irgen == g) s_current_irgen = NULL;
+    if (g_di_emit_ctx == g) g_di_emit_ctx = NULL;
+    if (g->builder) {
+        LLVMDisposeBuilder(g->builder);
+        g->builder = NULL;
+    }
+    if (g->mod) {
+        LLVMDisposeModule(g->mod);
+        g->mod = NULL;
+    }
+    free(g->functions);
+    g->functions = NULL;
+    g->function_count = g->function_cap = 0;
+    free(g->fn_index);
+    g->fn_index = NULL;
+    g->fn_index_cap = 0;
+    free(g->struct_types);
+    g->struct_types = NULL;
+    g->struct_type_count = g->struct_type_cap = 0;
+    free(g->obf_literals);
+    g->obf_literals = NULL;
+    g->obf_literal_count = g->obf_literal_cap = 0;
+    free(g->string_literals);
+    g->string_literals = NULL;
+    g->string_literal_count = g->string_literal_cap = 0;
+    free(g->goto_labels);
+    g->goto_labels = NULL;
+    g->goto_label_count = g->goto_label_cap = 0;
+    free(g->bind_accs);
+    g->bind_accs = NULL;
+    g->bind_acc_count = g->bind_acc_cap = 0;
+    free(g->catch_cleanups);
+    g->catch_cleanups = NULL;
+    g->catch_cleanup_count = g->catch_cleanup_cap = 0;
+    free(g->body_write_memo);
+    g->body_write_memo = NULL;
+    g->body_write_memo_cap = g->body_write_memo_count = 0;
+    g->body_write_scan_done = NULL;
+    free(g->site_inst);
+    g->site_inst = NULL;
+    free(g->class_release);
+    g->class_release = NULL;
+    g->class_release_count = g->class_release_cap = 0;
+    class_index_reset();
 }
 
 void zan_irgen_destroy(zan_irgen_t *g) {

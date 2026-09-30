@@ -168,6 +168,105 @@ static bool sh_name_is(const LLVMValueRef v, const char *pfx) {
     return n && strncmp(n, pfx, strlen(pfx)) == 0;
 }
 
+/* ---- fast module body index (single-pass extraction) --------------------- */
+typedef struct {
+    const char *start;
+    size_t      len;
+} sh_body_slice_t;
+
+typedef struct {
+    char            **keys;
+    sh_body_slice_t  *vals;
+    int               mask;
+    int               count;
+} sh_body_index_t;
+
+static size_t sh_hash_str(const char *s, size_t len) {
+    size_t h = 2166136261U;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (unsigned char)s[i];
+        h *= 16777619U;
+    }
+    return h;
+}
+
+static void sh_build_body_index(sh_body_index_t *idx, const char *buf, size_t buf_len) {
+    int cap = 32768;
+    idx->mask = cap - 1;
+    idx->count = 0;
+    idx->keys = (char **)calloc((size_t)cap, sizeof(char *));
+    idx->vals = (sh_body_slice_t *)calloc((size_t)cap, sizeof(sh_body_slice_t));
+    if (!idx->keys || !idx->vals) return;
+
+    const char *p = buf;
+    const char *end = buf + buf_len;
+    while (p < end) {
+        const char *def_start = NULL;
+        if (p == buf && strncmp(p, "define ", 7) == 0) {
+            def_start = p;
+        } else {
+            const char *hit = strstr(p, "\ndefine ");
+            if (!hit || hit >= end) break;
+            def_start = hit + 1;
+        }
+        const char *at = strchr(def_start, '@');
+        if (!at || at >= end) break;
+        at++;
+        const char *name_start = at;
+        const char *name_end = NULL;
+        if (*at == '"') {
+            name_start = at + 1;
+            name_end = strchr(name_start, '"');
+            if (!name_end || name_end >= end) break;
+        } else {
+            name_end = name_start;
+            while (name_end < end && *name_end && *name_end != '(' && *name_end != ' ')
+                name_end++;
+        }
+        size_t name_len = (size_t)(name_end - name_start);
+        const char *close_brace = strstr(name_end, "\n}");
+        if (!close_brace || close_brace >= end) break;
+        const char *def_end = close_brace + 2;
+        if (def_end < end && *def_end == '\r') def_end++;
+        if (def_end < end && *def_end == '\n') def_end++;
+
+        char *key = (char *)malloc(name_len + 1);
+        if (key) {
+            memcpy(key, name_start, name_len);
+            key[name_len] = '\0';
+            size_t h = sh_hash_str(key, name_len) & (size_t)idx->mask;
+            while (idx->keys[h]) {
+                h = (h + 1) & (size_t)idx->mask;
+            }
+            idx->keys[h] = key;
+            idx->vals[h].start = def_start;
+            idx->vals[h].len = (size_t)(def_end - def_start);
+            idx->count++;
+        }
+        p = def_end;
+    }
+}
+
+static const sh_body_slice_t *sh_find_body_slice(const sh_body_index_t *idx, const char *name) {
+    if (!idx || !idx->keys || !name) return NULL;
+    size_t len = strlen(name);
+    size_t h = sh_hash_str(name, len) & (size_t)idx->mask;
+    while (idx->keys[h]) {
+        if (strcmp(idx->keys[h], name) == 0) return &idx->vals[h];
+        h = (h + 1) & (size_t)idx->mask;
+    }
+    return NULL;
+}
+
+static void sh_free_body_index(sh_body_index_t *idx) {
+    if (!idx || !idx->keys) return;
+    int cap = idx->mask + 1;
+    for (int i = 0; i < cap; i++) free(idx->keys[i]);
+    free(idx->keys);
+    free(idx->vals);
+    memset(idx, 0, sizeof(*idx));
+}
+
 /* ---- function verdicts ---------------------------------------------------- */
 /* A coordinator body referenced from a shard must be reachable through an
  * external symbol. Declarations already are; defined bodies exported by the
@@ -740,23 +839,57 @@ static void sh_ensure_parent_dir(const char *path) {
     }
 }
 
-static bool sh_emit_one(sh_state_t *st, sh_sbuf_t *frag, LLVMTargetMachineRef tm,
-                        const char *path, char *errbuf, size_t errsz) {
+static bool sh_emit_one_file(sh_state_t *st, const char *frag_path,
+                             LLVMTargetMachineRef tm, const char *path,
+                             char *errbuf, size_t errsz) {
     zan_irgen_t *g = st->g;
     sh_ensure_parent_dir(path);
     const char *dump = getenv("ZAN_SHARD_DUMP");
     if (dump && *dump) {
         FILE *df = fopen(dump, "wb");
-        if (df) {
-            fwrite(frag->p ? frag->p : "", 1, frag->n, df);
-            fclose(df);
+        FILE *sf = fopen(frag_path, "rb");
+        if (df && sf) {
+            char cbuf[8192];
+            size_t n;
+            while ((n = fread(cbuf, 1, sizeof(cbuf), sf)) > 0)
+                fwrite(cbuf, 1, n, df);
         }
+        if (sf) fclose(sf);
+        if (df) fclose(df);
     }
+    FILE *f = fopen(frag_path, "rb");
+    if (!f) {
+        snprintf(errbuf, errsz, "cannot open shard fragment file '%s'", frag_path);
+        return false;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) {
+        fclose(f);
+        snprintf(errbuf, errsz, "cannot stat shard fragment file '%s'", frag_path);
+        return false;
+    }
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(f);
+        snprintf(errbuf, errsz, "out of memory reading shard fragment");
+        return false;
+    }
+    size_t nr = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[nr] = '\0';
+
     LLVMContextRef ctx = LLVMContextCreate();
-    if (!ctx) { snprintf(errbuf, errsz, "context create failed"); return false; }
-    SH_TRACE("shard emit: frag %d bytes -> parse\n", (int)frag->n);
+    if (!ctx) {
+        free(buf);
+        snprintf(errbuf, errsz, "context create failed");
+        return false;
+    }
+    SH_TRACE("shard emit: frag %d bytes -> parse\n", (int)nr);
     LLVMMemoryBufferRef mb = LLVMCreateMemoryBufferWithMemoryRangeCopy(
-        frag->p ? frag->p : "", frag->n, "zan-shard");
+        buf, nr, "zan-shard");
+    free(buf);
     LLVMModuleRef mod = NULL;
     char *perr = NULL;
     if (LLVMParseIRInContext(ctx, mb, &mod, &perr)) {
@@ -1141,6 +1274,35 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     objs = (char **)calloc((size_t)nshard, sizeof(*objs));
     if (!objs) { snprintf(st.reason, sizeof(st.reason), "out of memory"); st.failed = true; }
 
+    char tmp_ll[1024];
+    tmp_ll[0] = '\0';
+    char *ll_buf = NULL;
+    sh_body_index_t body_idx = {0};
+    if (obj_base && !st.failed) {
+        snprintf(tmp_ll, sizeof(tmp_ll), "%s.shard.tmp.ll", obj_base);
+        char *err_msg = NULL;
+        if (LLVMPrintModuleToFile(g->mod, tmp_ll, &err_msg) == 0) {
+            FILE *f = fopen(tmp_ll, "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                long sz = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                if (sz > 0) {
+                    ll_buf = (char *)malloc((size_t)sz + 1);
+                    if (ll_buf) {
+                        size_t nr = fread(ll_buf, 1, (size_t)sz, f);
+                        ll_buf[nr] = '\0';
+                        sh_build_body_index(&body_idx, ll_buf, nr);
+                    }
+                }
+                fclose(f);
+            }
+        } else {
+            if (err_msg) LLVMDisposeMessage(err_msg);
+            tmp_ll[0] = '\0';
+        }
+    }
+
     for (int s = 0; s < nshard && !st.failed; s++) {
         SH_TRACE("shard %d: assembling\n", s);
         sh_sbuf_t bodies = {0}, gdecls = {0}, types = {0}, frag = {0};
@@ -1195,31 +1357,48 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                     sh_map_free(&refs.body_done);
                     if (!ok) break;
                 }
-                char *fntxt = LLVMPrintValueToString(fn);
-                if (!fntxt) {
-                    sh_fail(&st, "body '%s' print failed", LLVMGetValueName(fn));
-                    ok = false;
-                    break;
-                }
-                /* comdat/alias can only appear on the define header line */
-                {
-                    const char *hnl = strchr(fntxt, '\n');
-                    size_t hlen = hnl ? (size_t)(hnl - fntxt) : strlen(fntxt);
+                const char *fn_name = LLVMGetValueName(fn);
+                const sh_body_slice_t *sl = sh_find_body_slice(&body_idx, fn_name);
+                if (sl) {
+                    const char *hnl = (const char *)memchr(sl->start, '\n', sl->len);
+                    size_t hlen = hnl ? (size_t)(hnl - sl->start) : sl->len;
                     char hbuf[4096];
                     if (hlen >= sizeof(hbuf)) hlen = sizeof(hbuf) - 1;
-                    memcpy(hbuf, fntxt, hlen);
+                    memcpy(hbuf, sl->start, hlen);
                     hbuf[hlen] = '\0';
                     if (strstr(hbuf, " comdat($")) {
-                        sh_fail(&st, "body '%s' carries comdat",
-                                LLVMGetValueName(fn));
-                        LLVMDisposeMessage(fntxt);
+                        sh_fail(&st, "body '%s' carries comdat", fn_name);
                         ok = false;
                         break;
                     }
+                    sh_sb_putn(&bodies, sl->start, sl->len);
+                    sh_sb_puts(&bodies, "\n");
+                } else {
+                    char *fntxt = LLVMPrintValueToString(fn);
+                    if (!fntxt) {
+                        sh_fail(&st, "body '%s' print failed", fn_name);
+                        ok = false;
+                        break;
+                    }
+                    /* comdat/alias can only appear on the define header line */
+                    {
+                        const char *hnl = strchr(fntxt, '\n');
+                        size_t hlen = hnl ? (size_t)(hnl - fntxt) : strlen(fntxt);
+                        char hbuf[4096];
+                        if (hlen >= sizeof(hbuf)) hlen = sizeof(hbuf) - 1;
+                        memcpy(hbuf, fntxt, hlen);
+                        hbuf[hlen] = '\0';
+                        if (strstr(hbuf, " comdat($")) {
+                            sh_fail(&st, "body '%s' carries comdat", fn_name);
+                            LLVMDisposeMessage(fntxt);
+                            ok = false;
+                            break;
+                        }
+                    }
+                    sh_sb_puts(&bodies, fntxt);
+                    sh_sb_puts(&bodies, "\n");
+                    LLVMDisposeMessage(fntxt);
                 }
-                sh_sb_puts(&bodies, fntxt);
-                sh_sb_puts(&bodies, "\n");
-                LLVMDisposeMessage(fntxt);
             }
             free(mbrs);
         }
@@ -1320,22 +1499,16 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         }
 
         if (ok) {
-            char path[1200];
-            snprintf(path, sizeof(path), "%s.shard%d.o", obj_base, s);
-            char errbuf[256];
-            char ptag[64];
-            snprintf(ptag, sizeof(ptag), "shard %d: before emit", s);
-            sh_probe_mem(ptag);
-            if (sh_emit_one(&st, &frag, tm, path, errbuf, sizeof(errbuf))) {
-                objs[s] = (char *)malloc(strlen(path) + 1);
-                if (objs[s]) strcpy(objs[s], path);
-                else sh_fail(&st, "out of memory");
+            char frag_path[1200];
+            snprintf(frag_path, sizeof(frag_path), "%s.shard%d.frag.ll", obj_base, s);
+            FILE *ff = fopen(frag_path, "wb");
+            if (ff) {
+                if (frag.n > 0) fwrite(frag.p, 1, frag.n, ff);
+                fclose(ff);
             } else {
-                sh_fail(&st, "shard %d: %s", s, errbuf);
-                remove(path);
+                sh_fail(&st, "cannot open shard fragment file '%s'", frag_path);
+                ok = false;
             }
-            snprintf(ptag, sizeof(ptag), "shard %d: after emit", s);
-            sh_probe_mem(ptag);
         }
 
         sh_map_free(&local);
@@ -1346,7 +1519,45 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         free(bodies.p); free(gdecls.p); free(types.p); free(frag.p);
     }
 
+    sh_free_body_index(&body_idx);
+    free(ll_buf);
+    ll_buf = NULL;
+    if (tmp_ll[0]) {
+        remove(tmp_ll);
+        tmp_ll[0] = '\0';
+    }
+
+    /* Pass 2b: emit each shard from its fragment file.
+     * At this point, the module text buffer (~150MB) and body index have been
+     * freed, freeing peak memory before LLVM parses and codegens each shard. */
+    for (int s = 0; s < nshard && !st.failed; s++) {
+        char frag_path[1200];
+        snprintf(frag_path, sizeof(frag_path), "%s.shard%d.frag.ll", obj_base, s);
+        char path[1200];
+        snprintf(path, sizeof(path), "%s.shard%d.o", obj_base, s);
+        char errbuf[256];
+        char ptag[64];
+        snprintf(ptag, sizeof(ptag), "shard %d: before emit", s);
+        sh_probe_mem(ptag);
+        if (sh_emit_one_file(&st, frag_path, tm, path, errbuf, sizeof(errbuf))) {
+            objs[s] = (char *)malloc(strlen(path) + 1);
+            if (objs[s]) strcpy(objs[s], path);
+            else sh_fail(&st, "out of memory");
+        } else {
+            sh_fail(&st, "shard %d: %s", s, errbuf);
+            remove(path);
+        }
+        remove(frag_path);
+        snprintf(ptag, sizeof(ptag), "shard %d: after emit", s);
+        sh_probe_mem(ptag);
+    }
+
     if (st.failed) {
+        for (int s = 0; s < nshard; s++) {
+            char frag_path[1200];
+            snprintf(frag_path, sizeof(frag_path), "%s.shard%d.frag.ll", obj_base, s);
+            remove(frag_path);
+        }
         /* restore every linkage change, drop partial objects, fall back */
         for (int i = 0; i < st.link_n; i++)
             LLVMSetLinkage(st.link_recs[i].glob ? st.link_recs[i].glob

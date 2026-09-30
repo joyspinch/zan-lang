@@ -6222,6 +6222,10 @@ int main(int argc, char **argv) {
         }
 
         generated_object_vec_add(&generated_objects, obj_tmp);
+        phase("write obj");
+        probe_phase_mem("write obj");
+        zan_irgen_release_llvm(&irgen);
+        probe_phase_mem("free llvm");
 
         /* An icon is just another link input: compile the .ico into a .rsrc
          * object here (no windres needed) and hand it to whichever linker
