@@ -1053,6 +1053,9 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - **DbResult / DbRow 按需空值（On-demand NULL tracking）**：无 SQL NULL 记录行不应为每行无条件分配 `new List<bool>()`，高并发与十万行大表下这会产生大量小对象堆分配。改为默认 `null`，仅在第一次扫描到真实 NULL 列时分配并向前补足 `false`，非 NULL 记录走轻量 `AddRow(row)`，在 `IsNull` 处判空快速返回 `false`。
 - **ORM 方言分页与无分页保护（`OrmSelect` / `QueryBuilder`）**：SQL Server 和 Oracle 使用 `OFFSET m ROWS FETCH NEXT n ROWS ONLY` 语法，且严格要求 `ORDER BY`。若未做方言分支或对无分页查询盲目追加 `OFFSET 0 ROWS`，不仅破坏非分页查询的语义，还会因缺少排序列报错；`BuildDto` 等投影查询也必须统一接入方言分页，避免标准 `LIMIT/OFFSET` 语法在 SQL Server 等引擎上抛语法错误。
 - **XLSX 大数据量流式生成与块缓冲**：大表导出禁止一次性把所有行对象保存在内存（`rows` 列表），通过 `ZipWriter.BeginEntry/WriteData/EndEntry` 配合适度大小的 `StringBuilder` 块缓冲区（如 64KB）逐行渲染与批量输出，内存占用与总导出数据量解耦，实现近恒定常数级内存开销。
+- **ORM 超大批量写入参数上限与自动分批（`OrmInsert`）**：各 SQL 数据库对 Prepared Statement 参数个数具有硬性上限（SQL Server 上限 2,100，SQLite 上限 999，MySQL/PostgreSQL 上限 65,535）。当批量插入上千甚至上万行数据时，单条巨大的 SQL 不仅引发数据库参数超限崩溃，还会在堆上瞬间分配数十兆的 StringBuilder 与 DbParams 引起 GC 卡顿。解法：在 `OrmInsert` 引入 `safeBatchRows(colCount)` 动态计算单批次安全行数（如 SQLite 500/N，SQL Server 1000/N，默认 1000/N，上限 500 行），并在 `ExecuteAffrows` / `ExecuteAffrowsAsync`（实体行与字典行双通道）自动按批次范围（`BuildRowsRange`/`BuildDictsRange`）执行与累加行数，内存与参数严格恒定在安全阈值内。
+- **ORM 写入字段名元数据严格校验**：`OrmUpdate.SetI/SetL/SetD/SetS/SetB/SetIncr*` 以及 `OrmInsert.Only/Skip/OC/ACC/GMX/GMN` 必须经 `this.meta.Require(c)` 或 `RequireCol(c)` 校验，剥除可选的 `t.` 前缀并检查实体字段元数据，未知列或非法注入片段抛异常，杜绝直接拼接裸列名进 SQL 文本。
+- **MqttBroker 规避代码生成器 Json.Serialize<T> 循环依赖**：`MqttBroker` 位于网络核心服务路径，管理快照（`ClientsJson`/`ClientDetailJson`/`SubscriptionsJson`/`TopicsJson`/`MetricsJson`）统一改用标准库原生 `JsonValue` 组树（`NewObject`/`NewArray`/`NewStr`/`NewInt`/`arr.items.Add`/`ToJson()`），彻底打破在编译器子进程 `--no-gen` 模式下的序列化降层依赖；测试与退出时显式调用 `WorkerMqtt.Uninstall()`（解除 `Worker.mqttEntry` 并执行 `MqttBroker.TeardownGlobal()`），确保 leakcheck 零保持根干净退出。
 
 
 

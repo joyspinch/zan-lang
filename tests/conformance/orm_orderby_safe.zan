@@ -32,6 +32,20 @@ class OracleExec : StubExec {
     int GetProvider() { return DbProvider.Oracle; }
 }
 
+class RecordingExec : StubExec {
+    int execCount;
+    List<string> sqls;
+    RecordingExec() {
+        this.execCount = 0;
+        this.sqls = new List<string>();
+    }
+    int Execute(string sql, DbParams prms) {
+        this.execCount = this.execCount + 1;
+        this.sqls.Add(sql);
+        return 1;
+    }
+}
+
 class Program {
     static int failures = 0;
 
@@ -161,6 +175,34 @@ class Program {
         string delSql = "DELETE FROM users WHERE name IN (?, ?)";
         del.WhereIn("name", new List<string>()); // 空列表按 1 = 0 处理
         Ok("orm delete wherein string supported", true, true);
+
+        // ---- OrmUpdate.SetI / OrmInsert.Only 未知列元数据校验抛异常 ----
+        threw = false;
+        try {
+            OrmUpdate badUpd = OrmUpdate.Create(new StubExec(), m);
+            badUpd.SetI("malicious_or_unknown", 42);
+        } catch (Exception e) { threw = true; }
+        Ok("orm update seti unknown col throws", threw, true);
+
+        threw = false;
+        try {
+            OrmInsert badIns = OrmInsert.Create(new StubExec(), m);
+            badIns.Only("malicious_or_unknown");
+        } catch (Exception e) { threw = true; }
+        Ok("orm insert only unknown col throws", threw, true);
+
+        // ---- OrmInsert 大数据量批量自动分批切片验证 ----
+        RecordingExec rec = new RecordingExec();
+        OrmInsert batchIns = OrmInsert.Create(rec, m);
+        for (int row = 0; row < 1200; row = row + 1) {
+            DbValues v = new DbValues();
+            v.Set("id", row + 1);
+            v.Set("name", "user_" + Convert.ToString(row + 1));
+            batchIns.AddDict(v);
+        }
+        int totalAff = batchIns.ExecuteAffrows();
+        Ok("orm insert batch chunk count", rec.execCount == 5, true);
+        Ok("orm insert batch total aff", totalAff == 5, true);
 
         if (Program.failures > 0) {
             Console.WriteLine("fail: " + Convert.ToString(Program.failures));

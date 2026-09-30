@@ -64,17 +64,17 @@ class OrmInsert {
     }
 
     /// 只插入该列（可多次调用，与 Skip 互斥语义）。
-    void Only(string c) { this.only.Add(c); }
+    void Only(string c) { this.only.Add(this.meta.Require(c)); }
     /// 跳过该列（可多次调用）。
-    void Skip(string c) { this.skip.Add(c); }
+    void Skip(string c) { this.skip.Add(this.meta.Require(c)); }
     /// upsert：冲突时把该列更新为新值；键列缺省取主键。
-    void OC(string c) { this.conf.Add(c); this.upsert = true; }
+    void OC(string c) { this.conf.Add(this.meta.Require(c)); this.upsert = true; }
     /// upsert：冲突时该列累加（counter 语义）。
-    void ACC(string c) { this.acc.Add(c); this.upsert = true; }
+    void ACC(string c) { this.acc.Add(this.meta.Require(c)); this.upsert = true; }
     /// upsert：冲突时该列取更大值（GREATEST/max）。
-    void GMX(string c) { this.gmx.Add(c); this.upsert = true; }
+    void GMX(string c) { this.gmx.Add(this.meta.Require(c)); this.upsert = true; }
     /// upsert：冲突时该列取更小值。
-    void GMN(string c) { this.gmn.Add(c); this.upsert = true; }
+    void GMN(string c) { this.gmn.Add(this.meta.Require(c)); this.upsert = true; }
     /// upsert：冲突时什么都不改（DO NOTHING）。
     void NOP() { this.nop = true; this.upsert = true; }
     /// 动态列行数。
@@ -136,9 +136,10 @@ class OrmInsert {
         return sb.ToString();
     }
 
-    /// <summary>动态列写入：所有行按第一行的列形状对齐，缺的列写
+    /// <summary>动态列写入（指定行范围）：所有行按第一行的列形状对齐，缺的列写
     /// NULL，值按列声明类型绑定。</summary>
-    int BuildDicts() {
+    int BuildDictsRange(int start, int count) {
+        if (count <= 0) { return 0; }
         DbParams ps = new DbParams();
         DbValues head = this.dicts[0];
         StringBuilder sb = new StringBuilder();
@@ -153,8 +154,8 @@ class OrmInsert {
         }
         sb.Append(") VALUES ");
         int i = 0;
-        while (i < this.dicts.Count) {
-            DbValues v = this.dicts[i];
+        while (i < count) {
+            DbValues v = this.dicts[start + i];
             if (i > 0) { sb.Append(", "); }
             sb.Append("(");
             int k = 0;
@@ -175,10 +176,14 @@ class OrmInsert {
         return 1;
     }
 
-    /// <summary>实体行写入：列集合成形一次，每行按同一集合绑定。</summary>
-    int BuildRows() {
-        int nrows = this.RowCount();
-        if (nrows == 0) { return 0; }
+    /// <summary>动态列写入：全量行按第一行的列形状对齐。</summary>
+    int BuildDicts() {
+        return this.BuildDictsRange(0, this.dicts.Count);
+    }
+
+    /// <summary>实体行写入（指定行范围）：列集合成形一次，每行按同一集合绑定。</summary>
+    int BuildRowsRange(int start, int count) {
+        if (count <= 0) { return 0; }
         List<OrmCol> cols = this.used();
         if (cols.Count == 0) { return 0; }
         DbParams ps = new DbParams();
@@ -190,13 +195,14 @@ class OrmInsert {
         sb.Append(") VALUES ");
         string marks = OrmDialect.Marks(cols.Count);
         int i = 0;
-        while (i < nrows) {
+        while (i < count) {
+            int rowIdx = start + i;
             if (i > 0) { sb.Append(", "); }
             sb.Append("(");
             sb.Append(marks);
             sb.Append(")");
             for (int k = 0; k < cols.Count; k = k + 1) {
-                this.rows.BindCol(i, cols[k], ps);
+                this.rows.BindCol(rowIdx, cols[k], ps);
             }
             i = i + 1;
         }
@@ -206,30 +212,128 @@ class OrmInsert {
         return 1;
     }
 
-    /// 执行动态列 INSERT，返回受影响行数。
-    int ExecuteDicts() {
-        if (this.BuildDicts() == 0) { return 0; }
-        return this.db.Execute(this.sql, this.bound);
+    /// <summary>实体行写入：列集合成形一次，每行按同一集合绑定。</summary>
+    int BuildRows() {
+        return this.BuildRowsRange(0, this.RowCount());
     }
 
-    /// 异步执行动态列 INSERT。
+    /// 计算当前数据库引擎下安全的分批行数，防止超大批量参数溢出与 SQL 膨胀。
+    int safeBatchRows(int colCount) {
+        if (colCount <= 0) { return 500; }
+        int p = this.db.GetProvider();
+        int maxParams = 1000;
+        if (p == DbProvider.SQLite) { maxParams = 500; }
+        else if (p == DbProvider.SqlServer) { maxParams = 1000; }
+        int b = maxParams / colCount;
+        if (b < 1) { b = 1; }
+        if (b > 500) { b = 500; }
+        return b;
+    }
+
+    /// 执行动态列 INSERT，返回受影响行数。超大批量时自动分批执行，防止参数超限。
+    int ExecuteDicts() {
+        int total = this.dicts.Count;
+        if (total == 0) { return 0; }
+        int cols = this.dicts[0].Count();
+        int batch = this.safeBatchRows(cols);
+        if (total <= batch) {
+            if (this.BuildDicts() == 0) { return 0; }
+            return this.db.Execute(this.sql, this.bound);
+        }
+        int aff = 0;
+        int off = 0;
+        while (off < total) {
+            int take = total - off;
+            if (take > batch) { take = batch; }
+            if (this.BuildDictsRange(off, take) > 0) {
+                aff = aff + this.db.Execute(this.sql, this.bound);
+            }
+            off = off + take;
+        }
+        return aff;
+    }
+
+    /// 异步执行动态列 INSERT。超大批量时自动分批执行。
     async int ExecuteDictsAsync() {
-        if (this.BuildDicts() == 0) { return 0; }
-        return await this.db.ExecuteAsync(this.sql, this.bound);
+        int total = this.dicts.Count;
+        if (total == 0) { return 0; }
+        int cols = this.dicts[0].Count();
+        int batch = this.safeBatchRows(cols);
+        if (total <= batch) {
+            if (this.BuildDicts() == 0) { return 0; }
+            return await this.db.ExecuteAsync(this.sql, this.bound);
+        }
+        int aff = 0;
+        int off = 0;
+        while (off < total) {
+            int take = total - off;
+            if (take > batch) { take = batch; }
+            if (this.BuildDictsRange(off, take) > 0) {
+                aff = aff + await this.db.ExecuteAsync(this.sql, this.bound);
+            }
+            off = off + take;
+        }
+        return aff;
+    }
+
+    /// 执行实体行 INSERT，返回受影响行数。超大批量时自动分批执行。
+    int ExecuteRows() {
+        int total = this.RowCount();
+        if (total == 0) { return 0; }
+        List<OrmCol> cols = this.used();
+        if (cols.Count == 0) { return 0; }
+        int batch = this.safeBatchRows(cols.Count);
+        if (total <= batch) {
+            if (this.BuildRows() == 0) { return 0; }
+            return this.db.Execute(this.sql, this.bound);
+        }
+        int aff = 0;
+        int off = 0;
+        while (off < total) {
+            int take = total - off;
+            if (take > batch) { take = batch; }
+            if (this.BuildRowsRange(off, take) > 0) {
+                aff = aff + this.db.Execute(this.sql, this.bound);
+            }
+            off = off + take;
+        }
+        return aff;
+    }
+
+    /// 异步执行实体行 INSERT。超大批量时自动分批执行。
+    async int ExecuteRowsAsync() {
+        int total = this.RowCount();
+        if (total == 0) { return 0; }
+        List<OrmCol> cols = this.used();
+        if (cols.Count == 0) { return 0; }
+        int batch = this.safeBatchRows(cols.Count);
+        if (total <= batch) {
+            if (this.BuildRows() == 0) { return 0; }
+            return await this.db.ExecuteAsync(this.sql, this.bound);
+        }
+        int aff = 0;
+        int off = 0;
+        while (off < total) {
+            int take = total - off;
+            if (take > batch) { take = batch; }
+            if (this.BuildRowsRange(off, take) > 0) {
+                aff = aff + await this.db.ExecuteAsync(this.sql, this.bound);
+            }
+            off = off + take;
+        }
+        return aff;
     }
 
     /// 执行插入（动态列优先，否则实体行），返回受影响行数。
     int ExecuteAffrows() {
         if (this.dicts.Count > 0) { return this.ExecuteDicts(); }
-        if (this.BuildRows() == 0) { return 0; }
-        return this.db.Execute(this.sql, this.bound);
+        return this.ExecuteRows();
     }
 
     /// 异步执行插入。
     async int ExecuteAffrowsAsync() {
         if (this.dicts.Count > 0) { return await this.ExecuteDictsAsync(); }
-        if (this.BuildRows() == 0) { return 0; }
-        return await this.db.ExecuteAsync(this.sql, this.bound);
+        return await this.ExecuteRowsAsync();
     }
 
     /// 插入单行并取自增主键值（0 = 插入失败或无自增列）。
