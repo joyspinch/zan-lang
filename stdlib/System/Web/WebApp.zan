@@ -438,6 +438,18 @@ class WebApp {
             ctx.__SetDeadlineSlot(watch, this.requestTimeoutMs);
             Route route = this.router.Match(ctx);
 
+            // 限流在正文之前：原顺序先把正文缓冲齐（≤maxBodyBytes）并解析
+            // form/multipart，DispatchInner 才判全局限流与路由限流——被限的
+            // 调用方照样花掉服务器的带宽与解析 CPU，限流形同虚设。判定只在
+            // 这里做一次（Allow 消耗令牌，判两次等于双倍扣减）；429 用
+            // SimpleResponse 应答并断连，因为正文留在流上没读，keep-alive
+            // 复用会把残余字节当下一个请求的头。
+            if (await this.LimitExceeded(ctx, route)) {
+                int _s1 = await client.SendAsync(WebApp.SimpleResponse(429,
+                    "Too Many Requests", "rate limit exceeded"));
+                break;
+            }
+
             if (route != null && route.streamUpload && request.contentLength > 0) {
                 // Streaming upload: the body goes to disk in 64KB chunks --
                 // memory stays flat no matter how large the file is.
@@ -615,24 +627,44 @@ class WebApp {
         return resp;
     }
 
-    /// 认证之后的请求管线，按序：全局限流 → before 钩子 → 404/405 →
-    /// 填路由元数据 → 路由限流 → 登录/权限门 → [Lock] 请求锁 → handler。
-    /// ApiError 变成它携带的应答；其余异常记录后回答 500，handler 结束
-    /// 时仍未写应答的也兜底 500。
-    async string DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startUs) {
-
+    /// <summary>全局与路由限流的唯一判定点，在正文缓冲/解析之前调用。
+    /// 键语义与键序与原 DispatchInner 内联判定一致：全局限流按 uid（匿名
+    /// 回落 IP，再回落 _unknown_），路由限流按 rateScope 拼 uid/ip。返回
+    /// true 表示超限，应答由调用方写出并断连。ctx.uid 顺带在这里解析好
+    /// （AuthUser 只看请求头），DispatchInner 复用、不再重付会话查询。
+    /// </summary>
+    async bool LimitExceeded(HttpContext ctx, Route route) {
         string uid = await this.AuthUser(ctx);
         ctx.uid = uid;
         string principal = uid;
         if (principal.Length == 0) { principal = ctx.RemoteIp(); }
         if (principal.Length == 0) { principal = "_unknown_"; }
-
         if (this.globalLimit > 0
             && !this.Limiter().Allow("_global_:" + principal, this.globalLimit)) {
-            ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
-            ctx.Json(WebApp.ErrorJson("429", "too many requests"));
-            return ctx.BuildResponse(keepAlive);
+            return true;
         }
+        if (route == null || route.rateLimit <= 0) { return false; }
+        string rateKey = route.Key();
+        if (route.rateScope == "uid") {
+            rateKey = rateKey + ":uid:" + uid;
+        } else if (route.rateScope == "ip") {
+            rateKey = rateKey + ":ip:" + ctx.RemoteIp();
+        }
+        return !this.Limiter().Allow(rateKey, route.rateLimit);
+    }
+
+    /// 认证之后的请求管线，按序：before 钩子 → 404/405 → 填路由元数据 →
+    /// 登录/权限门 → [Lock] 请求锁 → handler。全局限流与路由限流已前移到
+    /// 正文读取之前（HandleConnectionInner 的 LimitExceeded——被限请求不再
+    /// 花服务器的带宽与解析 CPU），uid 亦由门处解析好放在 ctx.uid。
+    /// ApiError 变成它携带的应答；其余异常记录后回答 500，handler 结束
+    /// 时仍未写应答的也兜底 500。
+    async string DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startUs) {
+
+        string uid = ctx.uid;
+        string principal = uid;
+        if (principal.Length == 0) { principal = ctx.RemoteIp(); }
+        if (principal.Length == 0) { principal = "_unknown_"; }
 
         // Before-hooks may short-circuit (must write a response first).
         if (!this.hooks.RunBefore(ctx)) {
@@ -658,19 +690,6 @@ class WebApp {
         // "/admin/users/42" is one call of it.
         ctx.routePattern = route.pattern;
         ctx.routeSlot = route.idx;
-
-        string rateKey = route.Key();
-        if (route.rateScope == "uid") {
-            rateKey = rateKey + ":uid:" + uid;
-        } else if (route.rateScope == "ip") {
-            rateKey = rateKey + ":ip:" + ctx.RemoteIp();
-        }
-        if (route.rateLimit > 0
-            && !this.Limiter().Allow(rateKey, route.rateLimit)) {
-            ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
-            ctx.Json(WebApp.ErrorJson("429", "route rate limit exceeded"));
-            return ctx.BuildResponse(keepAlive);
-        }
 
         // Refusing a request and refusing a navigation are the same decision
         // with two shapes: a script caller needs the status and the code, a
