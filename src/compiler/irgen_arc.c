@@ -1011,7 +1011,19 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(c, fn, "last");
     LLVMBuildCondBr(b, over, dorel, last_bb);
     LLVMPositionBuilderAtEnd(b, last_bb);
-    LLVMBuildCondBr(b, is1, relf, ret);
+    LLVMBasicBlockRef begin_bb = LLVMAppendBasicBlockInContext(c, fn, "begin");
+    LLVMBuildCondBr(b, is1, begin_bb, ret);
+    /* Commit gate BEFORE any field is released: zan_rt_weak_destroy_begin
+     * nulls every registry slot pointing at this object under the weak lock
+     * and only commits when the count is still zero. A weak reader that
+     * retained between our claim and its lock resurrected the object -- the
+     * gate aborts, our decrement is absorbed by the reader's +1, and the
+     * reader's own release claims the destroy. */
+    LLVMPositionBuilderAtEnd(b, begin_bb);
+    LLVMValueRef weak_ok = zan_call2(b,
+        LLVMGlobalGetValueType(g->rt_weak_destroy_begin),
+        g->rt_weak_destroy_begin, &obj, 1, "weak.begin");
+    LLVMBuildCondBr(b, weak_ok, relf, ret);
     LLVMPositionBuilderAtEnd(b, relf);
     LLVMValueRef self = LLVMBuildBitCast(b, obj, LLVMPointerType(structT, 0), "self");
     int fi = class_vptr_offset(sym);
@@ -1069,14 +1081,12 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
             emit_arc_release_typed(g, ft, cv);
         }
     }
-    /* The destroy was claimed above, so free here: handing back to
-     * zan_rt_release would decrement again and underflow the count this
-     * path already took. */
+    /* The destroy was committed by the gate above (slots nulled, count zero),
+     * so free here: handing back to zan_rt_release would decrement again and
+     * underflow the count this path already took. */
     LLVMBasicBlockRef freebb = LLVMAppendBasicBlockInContext(c, fn, "freebb");
     LLVMBuildBr(b, freebb);
     LLVMPositionBuilderAtEnd(b, freebb);
-    zan_call2(b, LLVMGlobalGetValueType(g->rt_weak_nil_all),
-              g->rt_weak_nil_all, &obj, 1, "");
     LLVMValueRef freefn = get_arc_free_decl(g);
     zan_call2(b, LLVMGlobalGetValueType(freefn), freefn, &obj, 1, "");
     LLVMBuildBr(b, ret);

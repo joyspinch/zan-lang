@@ -443,6 +443,17 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
      * contract is whatever its operand's is. */
     if (e->kind == AST_POSTFIX_UNARY && e->unary.op == TK_BANG)
         return expr_yields_owned_rc_value(g, e->unary.operand, locals);
+    /* A bare weak field inside an instance method (`up.tag` spelled just
+     * `up`) hands out +1 like its `this.up` spelling: the implicit-this read
+     * goes through the same weak handshake. Skipped when a local of the same
+     * name shadows the field -- the read is then a plain local load. */
+    if (e->kind == AST_IDENTIFIER && g->current_type_sym && g->current_this &&
+        !(locals && local_find(locals, e->ident.name))) {
+        zan_symbol_t *bfs = get_field_sym(g->current_type_sym, e->ident.name);
+        if (bfs && bfs->kind == SYM_FIELD &&
+            !(bfs->modifiers & MOD_STATIC) && (bfs->modifiers & MOD_WEAK))
+            return 1;
+    }
     if (e->kind == AST_INDEX) {
         /* A user-defined op_index lowers to a method call, so an RC-managed
          * return is owned (+1) exactly like an AST_CALL result. This applies
@@ -465,6 +476,16 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
      * and plain fields are slot loads and stay borrowed. */
     if (e->kind == AST_MEMBER_ACCESS) {
         zan_ast_node_t *obj = e->member.object;
+        /* A weak field read runs the registry handshake and hands the caller
+         * +1, whatever the receiver shape (including `?.`, whose receiver type
+         * is still statically known). Must be decided before the null_cond
+         * suppression below, or consumers would retain the +1 a second time. */
+        zan_type_t *ot0 = infer_expr_type(g, obj, locals);
+        if (ot0 && ot0->sym) {
+            zan_symbol_t *fs0 = get_field_sym(ot0->sym, e->member.name);
+            if (fs0 && fs0->kind == SYM_FIELD && (fs0->modifiers & MOD_WEAK))
+                return 1;
+        }
         zan_type_t *ot = infer_expr_type(g, obj, locals);
         if (e->member.null_cond) ot = NULL;
         zan_symbol_t *tsym = ot ? ot->sym : NULL;
@@ -636,6 +657,18 @@ static zan_type_t *member_owned_field_type(zan_irgen_t *g, zan_ast_node_t *e,
     zan_type_t *ft = subst_type_param_deep(g, fs->type, ot);
     if (ft && ft->kind == TYPE_TYPE_PARAM) ft = concretize(g, ft);
     return ft;
+}
+
+/* Whether e.member names a MOD_WEAK field of the receiver's class. A weak
+ * read runs the registry handshake and already hands the caller +1, so a
+ * consumer must not retain the loaded value a second time. */
+static int member_field_is_weak(zan_irgen_t *g, zan_ast_node_t *e,
+                                local_scope_t *locals) {
+    if (!e || e->kind != AST_MEMBER_ACCESS) return 0;
+    zan_type_t *ot = infer_expr_type(g, e->member.object, locals);
+    if (!ot || !ot->sym) return 0;
+    zan_symbol_t *fs = get_field_sym(ot->sym, e->member.name);
+    return (fs && (fs->modifiers & MOD_WEAK)) ? 1 : 0;
 }
 
 static int expr_member_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,

@@ -3080,8 +3080,10 @@ static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
                     zan_symbol_t *fsym = get_field_sym(g->current_type_sym, expr->ident.name);
                     zan_type_t *fty = fsym ? field_type_here(g, fsym->type) : NULL;
                     LLVMTypeRef ft = fty ? map_type(g, fty) : LLVMInt64TypeInContext(g->ctx);
-                    return promote_loaded(g,
-                        LLVMBuildLoad2(g->builder, ft, fptr, "fval"), fty);
+                    LLVMValueRef fval = (fsym && (fsym->modifiers & MOD_WEAK))
+                        ? emit_weak_field_load(g, fptr, ft)
+                        : LLVMBuildLoad2(g->builder, ft, fptr, "fval");
+                    return promote_loaded(g, fval, fty);
                 }
             }
         }
@@ -4283,9 +4285,14 @@ static void get_binding_accessors(zan_irgen_t *g, zan_symbol_t *cls,
         LLVMValueRef obj = LLVMBuildBitCast(g->builder, LLVMGetParam(get_fn, 0),
             LLVMPointerType(st, 0), "obj");
         LLVMValueRef fptr = emit_field_ptr(g, cls, st, obj, fi, "fld");
-        LLVMValueRef val = LLVMBuildLoad2(g->builder, vt, fptr, "val");
-        if (is_rc_managed_type(fs->type))
-            emit_rc_retain_for_type(g, fs->type, val);
+        LLVMValueRef val;
+        if (fs->modifiers & MOD_WEAK) {
+            val = emit_weak_field_load(g, fptr, vt);
+        } else {
+            val = LLVMBuildLoad2(g->builder, vt, fptr, "val");
+            if (is_rc_managed_type(fs->type))
+                emit_rc_retain_for_type(g, fs->type, val);
+        }
         LLVMBuildRet(g->builder, val);
     }
 
@@ -4303,15 +4310,13 @@ static void get_binding_accessors(zan_irgen_t *g, zan_symbol_t *cls,
             LLVMPointerType(st, 0), "obj");
         LLVMValueRef v = LLVMGetParam(set_fn, 1);
         LLVMValueRef fptr = emit_field_ptr(g, cls, st, obj, fi, "fld");
-        if (is_rc_managed_type(fs->type)) {
-            /* borrowed param: retain incoming, release the previous occupant */
-            LLVMValueRef old = LLVMBuildLoad2(g->builder, vt, fptr, "old");
-            emit_rc_retain_for_type(g, fs->type, v);
-            zan_store_fit(g, v, fptr);
-            emit_rc_release_for_type(g, fs->type, old);
-        } else {
-            zan_store_fit(g, v, fptr);
-        }
+        /* Route through the field-store helper so a weak field's slot is
+         * registered with the target's registry (a raw store here would leave
+         * the slot invisible to zan_rt_weak_nil_all: the target could be
+         * freed while the binding still hands it out). `v` is a borrowed
+         * parameter, so rhs=NULL keeps the retain-if-borrowed contract. */
+        emit_rc_store_field(g, fs->type, fptr, v, NULL, NULL,
+                            (fs->modifiers & MOD_WEAK) ? 1 : 0);
         LLVMBuildRetVoid(g->builder);
     }
 
@@ -4702,7 +4707,10 @@ static LLVMValueRef finish_member_of_temp(zan_irgen_t *g, zan_ast_node_t *expr,
         return fv;
     zan_type_t *ft = member_owned_field_type(g, expr, locals);
     if (ft && is_rc_managed_type(ft) &&
-        LLVMGetTypeKind(LLVMTypeOf(fv)) == LLVMPointerTypeKind)
+        LLVMGetTypeKind(LLVMTypeOf(fv)) == LLVMPointerTypeKind &&
+        /* a weak-field read already hands the caller +1 from the registry
+         * handshake; retaining here would double-count and pin the target */
+        !member_field_is_weak(g, expr, locals))
         emit_rc_retain_for_type(g, ft, fv);
     emit_rc_release_for_type(g, obj_type, obj_val);
     return fv;
@@ -7080,9 +7088,11 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                                 : NULL;
                             LLVMTypeRef field_type = fty ? map_type(g, fty)
                                 : LLVMInt64TypeInContext(g->ctx);
-                            LLVMValueRef fv = promote_loaded(g,
-                                LLVMBuildLoad2(g->builder, field_type, field_ptr, "fval"),
-                                fty);
+                            LLVMValueRef fv0 =
+                                (fsym && (fsym->modifiers & MOD_WEAK))
+                                ? emit_weak_field_load(g, field_ptr, field_type)
+                                : LLVMBuildLoad2(g->builder, field_type, field_ptr, "fval");
+                            LLVMValueRef fv = promote_loaded(g, fv0, fty);
                             return fv;
                         }
                     }
@@ -7124,9 +7134,11 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                                 ? subst_type_param(gpsym->type, et) : NULL;
                             LLVMTypeRef ft = fty ? map_type(g, fty)
                                 : LLVMInt64TypeInContext(g->ctx);
-                            return promote_loaded(g,
-                                LLVMBuildLoad2(g->builder, ft, field_ptr, "gfval"),
-                                fty);
+                            LLVMValueRef gfv0 =
+                                (gpsym && (gpsym->modifiers & MOD_WEAK))
+                                ? emit_weak_field_load(g, field_ptr, ft)
+                                : LLVMBuildLoad2(g->builder, ft, field_ptr, "gfval");
+                            return promote_loaded(g, gfv0, fty);
                         }
                     }
                     /* A property with a custom getter is computed, not read out
@@ -7170,9 +7182,11 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                             ? subst_type_param(fsym->type, rct) : NULL;
                         LLVMTypeRef ft = fty ? map_type(g, fty)
                                              : LLVMInt64TypeInContext(g->ctx);
-                        LLVMValueRef gfv = promote_loaded(g,
-                            LLVMBuildLoad2(g->builder, ft, field_ptr, "gfval"),
-                            fty);
+                        LLVMValueRef gfv0 =
+                            (fsym && (fsym->modifiers & MOD_WEAK))
+                            ? emit_weak_field_load(g, field_ptr, ft)
+                            : LLVMBuildLoad2(g->builder, ft, field_ptr, "gfval");
+                        LLVMValueRef gfv = promote_loaded(g, gfv0, fty);
                         return finish_member_of_temp(g, expr, locals, rct,
                                                      obj_val, gfv);
                     }

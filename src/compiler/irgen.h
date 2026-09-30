@@ -379,6 +379,8 @@ struct zan_irgen {
     LLVMValueRef weak_count;     /* zan_weak_count */
     LLVMValueRef rt_weak_store;  /* zan_rt_weak_store(void**, void*) */
     LLVMValueRef rt_weak_nil_all; /* zan_rt_weak_nil_all(void*) */
+    LLVMValueRef rt_weak_load_retain; /* void* zan_rt_weak_load_retain(void**) */
+    LLVMValueRef rt_weak_destroy_begin; /* int1 zan_rt_weak_destroy_begin(void*) */
 
     /* runtime diagnostics & leak detection */
     LLVMValueRef fn_printf;       /* int printf(const char*, ...) */

@@ -244,30 +244,20 @@ static void emit_weak_store_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
     LLVMBuildRetVoid(b);
 }
 
-static void emit_weak_nil_all_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
+/* Emit lock + bucket scan that unlinks every registry node whose target is
+ * `obj`, nulling each node's slot and freeing the node. Positions the builder
+ * at done_bb with the lock still held; the caller emits its epilogue there. */
+static void emit_weak_nil_scan(zan_irgen_t *g, LLVMValueRef fn,
+                               LLVMValueRef weak_calloc, LLVMValueRef obj,
+                               LLVMBasicBlockRef done_bb) {
     LLVMBuilderRef b = g->builder;
     LLVMTypeRef i8ptr = weak_i8ptr(g);
     LLVMTypeRef slot_t = weak_slot_type(g);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    LLVMValueRef obj = LLVMGetParam(g->rt_weak_nil_all, 0);
     LLVMValueRef null = LLVMConstPointerNull(i8ptr);
 
-    LLVMValueRef count = LLVMBuildLoad2(b, i64, g->weak_count, "weak.count");
-    LLVMSetAlignment(count, 8);
-    LLVMSetOrdering(count, LLVMAtomicOrderingMonotonic);
-    LLVMValueRef empty = LLVMBuildICmp(b, LLVMIntEQ, count,
-        LLVMConstInt(i64, 0, 0), "weak.empty");
-    LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx,
-        g->rt_weak_nil_all, "weak.nil.empty");
-    LLVMBasicBlockRef lock_bb = LLVMAppendBasicBlockInContext(g->ctx,
-        g->rt_weak_nil_all, "weak.nil.lock");
-    LLVMBuildCondBr(b, empty, ret_bb, lock_bb);
-    LLVMPositionBuilderAtEnd(b, ret_bb);
-    LLVMBuildRetVoid(b);
-
-    LLVMPositionBuilderAtEnd(b, lock_bb);
-    emit_weak_lock(g, g->rt_weak_nil_all);
-    LLVMValueRef buckets = weak_buckets_ensure(g, g->rt_weak_nil_all, weak_calloc);
+    emit_weak_lock(g, fn);
+    LLVMValueRef buckets = weak_buckets_ensure(g, fn, weak_calloc);
     LLVMValueRef bucket = weak_bucket_for(g, buckets, obj, "weak.nil.bucket");
     LLVMValueRef head = LLVMBuildLoad2(b, i8ptr, bucket, "weak.nil.head");
     LLVMValueRef curr_mem = LLVMBuildAlloca(b, i8ptr, "weak.nil.curr");
@@ -275,11 +265,9 @@ static void emit_weak_nil_all_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
     LLVMBuildStore(b, head, curr_mem);
     LLVMBuildStore(b, null, prev_mem);
     LLVMBasicBlockRef loop_bb = LLVMAppendBasicBlockInContext(g->ctx,
-        g->rt_weak_nil_all, "weak.nil.loop");
+        fn, "weak.nil.loop");
     LLVMBasicBlockRef check_bb = LLVMAppendBasicBlockInContext(g->ctx,
-        g->rt_weak_nil_all, "weak.nil.check");
-    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx,
-        g->rt_weak_nil_all, "weak.nil.done");
+        fn, "weak.nil.check");
     LLVMBuildBr(b, loop_bb);
 
     LLVMPositionBuilderAtEnd(b, loop_bb);
@@ -296,9 +284,9 @@ static void emit_weak_nil_all_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
     LLVMValueRef match = LLVMBuildICmp(b, LLVMIntEQ, target, obj,
                                        "weak.nil.target.match");
     LLVMBasicBlockRef found_bb = LLVMAppendBasicBlockInContext(g->ctx,
-        g->rt_weak_nil_all, "weak.nil.found");
+        fn, "weak.nil.found");
     LLVMBasicBlockRef next_bb = LLVMAppendBasicBlockInContext(g->ctx,
-        g->rt_weak_nil_all, "weak.nil.next");
+        fn, "weak.nil.next");
     LLVMBuildCondBr(b, match, found_bb, next_bb);
 
     LLVMPositionBuilderAtEnd(b, found_bb);
@@ -309,11 +297,11 @@ static void emit_weak_nil_all_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
     LLVMValueRef has_prev = LLVMBuildICmp(b, LLVMIntNE, prev, null,
                                           "weak.nil.hasprev");
     LLVMBasicBlockRef unlink_head_bb = LLVMAppendBasicBlockInContext(g->ctx,
-        g->rt_weak_nil_all, "weak.nil.unlink.head");
+        fn, "weak.nil.unlink.head");
     LLVMBasicBlockRef unlink_prev_bb = LLVMAppendBasicBlockInContext(g->ctx,
-        g->rt_weak_nil_all, "weak.nil.unlink.prev");
+        fn, "weak.nil.unlink.prev");
     LLVMBasicBlockRef removed_bb = LLVMAppendBasicBlockInContext(g->ctx,
-        g->rt_weak_nil_all, "weak.nil.unlinked");
+        fn, "weak.nil.unlinked");
     LLVMBuildCondBr(b, has_prev, unlink_prev_bb, unlink_head_bb);
 
     LLVMPositionBuilderAtEnd(b, unlink_head_bb);
@@ -335,10 +323,115 @@ static void emit_weak_nil_all_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
     LLVMBuildStore(b, curr, prev_mem);
     LLVMBuildStore(b, next, curr_mem);
     LLVMBuildBr(b, loop_bb);
+}
+
+static void emit_weak_count_check(zan_irgen_t *g, LLVMValueRef fn,
+                                  LLVMBasicBlockRef empty_bb,
+                                  LLVMBasicBlockRef lock_bb) {
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef count = LLVMBuildLoad2(b, i64, g->weak_count, "weak.count");
+    LLVMSetAlignment(count, 8);
+    LLVMSetOrdering(count, LLVMAtomicOrderingMonotonic);
+    LLVMValueRef empty = LLVMBuildICmp(b, LLVMIntEQ, count,
+        LLVMConstInt(i64, 0, 0), "weak.empty");
+    LLVMBuildCondBr(b, empty, empty_bb, lock_bb);
+}
+
+static void emit_weak_nil_all_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
+    LLVMBuilderRef b = g->builder;
+    LLVMValueRef obj = LLVMGetParam(g->rt_weak_nil_all, 0);
+
+    LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_weak_nil_all, "weak.nil.empty");
+    LLVMBasicBlockRef lock_bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_weak_nil_all, "weak.nil.lock");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_weak_nil_all, "weak.nil.done");
+    emit_weak_count_check(g, g->rt_weak_nil_all, ret_bb, lock_bb);
+    LLVMPositionBuilderAtEnd(b, ret_bb);
+    LLVMBuildRetVoid(b);
+
+    LLVMPositionBuilderAtEnd(b, lock_bb);
+    emit_weak_nil_scan(g, g->rt_weak_nil_all, weak_calloc, obj, done_bb);
 
     LLVMPositionBuilderAtEnd(b, done_bb);
     emit_weak_unlock(g);
     LLVMBuildRetVoid(b);
+}
+
+/* Body of zan_rt_weak_destroy_begin(void* obj) -> i1: under the registry lock,
+ * null every slot pointing at obj, then commit only if the refcount is still
+ * zero. This is the destroy-side half of the weak read handshake: a reader
+ * that retained between the release's fetch_sub and this lock resurrected the
+ * object -- the gate aborts, the releasing decrement is absorbed by the
+ * reader's +1, and the reader's own release claims the destroy later. An empty
+ * registry short-circuits: no slot was ever created, so no reader exists and
+ * the count reaching zero is final. */
+static void emit_weak_destroy_begin_body(zan_irgen_t *g,
+                                         LLVMValueRef weak_calloc) {
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef i8ptr = weak_i8ptr(g);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef obj = LLVMGetParam(g->rt_weak_destroy_begin, 0);
+
+    LLVMBasicBlockRef true_bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_weak_destroy_begin, "weak.begin.empty");
+    LLVMBasicBlockRef lock_bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_weak_destroy_begin, "weak.begin.lock");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_weak_destroy_begin, "weak.begin.done");
+    emit_weak_count_check(g, g->rt_weak_destroy_begin, true_bb, lock_bb);
+    LLVMPositionBuilderAtEnd(b, true_bb);
+    LLVMBuildRet(b, LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0));
+
+    LLVMPositionBuilderAtEnd(b, lock_bb);
+    emit_weak_nil_scan(g, g->rt_weak_destroy_begin, weak_calloc, obj, done_bb);
+
+    LLVMPositionBuilderAtEnd(b, done_bb);
+    LLVMValueRef neg16 = LLVMConstInt(i64,
+        (unsigned long long)ZAN_OBJ_RC_OFF, 1);
+    LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(g->ctx), obj,
+        &neg16, 1, "weak.begin.rcp");
+    LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0),
+        "weak.begin.rcip");
+    /* Read the count as a no-op fetch_add: an i64 atomic LOAD lowers to an
+     * __atomic_load libcall on 32-bit targets, while RMWs inline via
+     * cmpxchg8b. Monotonic is enough either way -- the registry spinlock's
+     * own acquire/release pairs order this read against the claim. */
+    LLVMValueRef rc = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpAdd, rcip,
+        LLVMConstInt(i64, 0, 0), LLVMAtomicOrderingMonotonic, 0);
+    LLVMValueRef ok = LLVMBuildICmp(b, LLVMIntEQ, rc,
+        LLVMConstInt(i64, 0, 0), "weak.begin.ok");
+    emit_weak_unlock(g);
+    LLVMBuildRet(b, ok);
+}
+
+/* Body of zan_rt_weak_load_retain(void** slot) -> void*: under the registry
+ * lock, load the slot and retain a non-null value before unlocking. A non-null
+ * return is a live object with a fresh +1 (the destroyer's commit gate runs
+ * under the same lock and aborts when the count moved); a null return means
+ * the target is gone or its teardown has begun. */
+static void emit_weak_load_retain_body(zan_irgen_t *g) {
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef i8ptr = weak_i8ptr(g);
+    LLVMValueRef slot = LLVMGetParam(g->rt_weak_load_retain, 0);
+    LLVMValueRef null = LLVMConstPointerNull(i8ptr);
+
+    emit_weak_lock(g, g->rt_weak_load_retain);
+    LLVMValueRef v = LLVMBuildLoad2(b, i8ptr, slot, "weak.ld.val");
+    LLVMBasicBlockRef do_ret = LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_weak_load_retain, "weak.ld.retain");
+    LLVMBasicBlockRef unlock_bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_weak_load_retain, "weak.ld.unlock");
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, v, null, "weak.ld.isnull"),
+                    unlock_bb, do_ret);
+    LLVMPositionBuilderAtEnd(b, do_ret);
+    zan_call2(b, LLVMGlobalGetValueType(g->rt_retain), g->rt_retain, &v, 1, "");
+    LLVMBuildBr(b, unlock_bb);
+    LLVMPositionBuilderAtEnd(b, unlock_bb);
+    emit_weak_unlock(g);
+    LLVMBuildRet(b, v);
 }
 
 static void emit_weak_runtime(zan_irgen_t *g) {
@@ -374,6 +467,15 @@ static void emit_weak_runtime(zan_irgen_t *g) {
     LLVMTypeRef nil_type = LLVMFunctionType(
         LLVMVoidTypeInContext(g->ctx), nil_args, 1, 0);
     g->rt_weak_nil_all = LLVMAddFunction(g->mod, "zan_rt_weak_nil_all", nil_type);
+    LLVMTypeRef load_args[] = { slot_t };
+    LLVMTypeRef load_type = LLVMFunctionType(i8ptr, load_args, 1, 0);
+    g->rt_weak_load_retain = LLVMAddFunction(g->mod,
+        "zan_rt_weak_load_retain", load_type);
+    LLVMTypeRef begin_args[] = { i8ptr };
+    LLVMTypeRef begin_type = LLVMFunctionType(
+        LLVMInt1TypeInContext(g->ctx), begin_args, 1, 0);
+    g->rt_weak_destroy_begin = LLVMAddFunction(g->mod,
+        "zan_rt_weak_destroy_begin", begin_type);
 
     LLVMBasicBlockRef store_entry = LLVMAppendBasicBlockInContext(g->ctx,
         g->rt_weak_store, "entry");
@@ -384,6 +486,16 @@ static void emit_weak_runtime(zan_irgen_t *g) {
         g->rt_weak_nil_all, "entry");
     LLVMPositionBuilderAtEnd(g->builder, nil_entry);
     emit_weak_nil_all_body(g, weak_calloc);
+
+    LLVMBasicBlockRef load_entry = LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_weak_load_retain, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, load_entry);
+    emit_weak_load_retain_body(g);
+
+    LLVMBasicBlockRef begin_entry = LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_weak_destroy_begin, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, begin_entry);
+    emit_weak_destroy_begin_body(g, weak_calloc);
 }
 
 static void emit_weak_store(zan_irgen_t *g, LLVMValueRef field_ptr,
@@ -398,4 +510,25 @@ static void emit_weak_store(zan_irgen_t *g, LLVMValueRef field_ptr,
     LLVMValueRef args[] = { slot, obj };
     zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_weak_store),
               g->rt_weak_store, args, 2, "");
+}
+
+/* Weak-field read handshake (call at every value-producing read of a
+ * MOD_WEAK class/interface field): the slot is loaded and a non-null value
+ * retained under the registry spinlock, so the returned reference is either
+ * null or a live object with a fresh +1. The +1 is real ownership: consumers
+ * must report the read as owned (+1) via expr_yields_owned_rc_value, which
+ * then releases it at the end of the value's use. */
+static LLVMValueRef emit_weak_field_load(zan_irgen_t *g, LLVMValueRef field_ptr,
+                                         LLVMTypeRef val_ty) {
+    LLVMTypeRef i8ptr = weak_i8ptr(g);
+    LLVMTypeRef slot_t = weak_slot_type(g);
+    LLVMValueRef sp = (LLVMTypeOf(field_ptr) == slot_t) ? field_ptr
+        : LLVMBuildBitCast(g->builder, field_ptr, slot_t, "weak.rsp");
+    LLVMValueRef args[] = { sp };
+    LLVMValueRef v = zan_call2(g->builder,
+        LLVMGlobalGetValueType(g->rt_weak_load_retain),
+        g->rt_weak_load_retain, args, 1, "weak.rload");
+    if (val_ty != i8ptr)
+        v = LLVMBuildBitCast(g->builder, v, val_ty, "weak.rval");
+    return v;
 }

@@ -2113,7 +2113,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef exit_args[] = { i32 };
     g->exit_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), exit_args, 1, 0);
     g->fn_exit = LLVMAddFunction(g->mod, "exit", g->exit_type);
-    emit_weak_runtime(g);
 
     if (g->check_leaks) {
         /* int atexit(void(*)(void)) → used to schedule the leak report */
@@ -2768,6 +2767,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMPositionBuilderAtEnd(g->builder, ret_bb);
         LLVMBuildRetVoid(g->builder);
     }
+
+    /* The weak registry helpers go here rather than with the other early
+     * runtime pieces: zan_rt_weak_load_retain's body calls zan_rt_retain, so
+     * the retain definition must exist first. zan_rt_weak_nil_all is still
+     * emitted before zan_rt_release, whose free path calls it. */
+    emit_weak_runtime(g);
 
     /* ARC runtime: zan_rt_release(void*) -> void */
     LLVMTypeRef release_args[] = { i8ptr };
