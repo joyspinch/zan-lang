@@ -768,6 +768,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     expr->call.args.count == 1);
                 int sb_is_appendline = (sbm.len == 10 && memcmp(sbm.str, "AppendLine", 10) == 0 &&
                                         expr->call.args.count <= 1);
+                int sb_is_clear = (sbm.len == 5 && memcmp(sbm.str, "Clear", 5) == 0 &&
+                                   expr->call.args.count == 0);
                 int sb_is_tostring = (sbm.len == 8 && memcmp(sbm.str, "ToString", 8) == 0 &&
                                       expr->call.args.count == 0);
                 /* The intrinsic evaluates its receiver expression directly, so
@@ -779,9 +781,26 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                  * recipe as the collection intrinsics: EH-register the receiver
                  * while the arguments run, drop it once the intrinsic is done. */
                 int sb_recv_own = 0;
-                if (sb_is_append || sb_is_appendline || sb_is_tostring)
+                if (sb_is_append || sb_is_appendline || sb_is_tostring || sb_is_clear)
                     sb_recv_own = emit_intrinsic_own_recv(g,
                         sbcallee->member.object, raw, locals);
+                if (sb_is_clear) {
+                    LLVMValueRef cptr = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 0, "sbcp");
+                    LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), cptr);
+                    LLVMValueRef dptr = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 2, "sbdp");
+                    LLVMValueRef data = LLVMBuildLoad2(g->builder, i8ptr, dptr, "sbdv");
+                    LLVMBasicBlockRef has_data = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sb_clr_data");
+                    LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sb_clr_cont");
+                    LLVMValueRef is_null = LLVMBuildICmp(g->builder, LLVMIntEQ, data, LLVMConstNull(i8ptr), "sb_data_null");
+                    LLVMBuildCondBr(g->builder, is_null, cont, has_data);
+                    LLVMPositionBuilderAtEnd(g->builder, has_data);
+                    LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), data);
+                    LLVMBuildBr(g->builder, cont);
+                    LLVMPositionBuilderAtEnd(g->builder, cont);
+                    emit_intrinsic_drop_recv(g, sbcallee->member.object, raw,
+                                             locals, sb_recv_own);
+                    return raw;
+                }
                 if (sb_is_append || sb_is_appendline) {
                     if (expr->call.args.count == 1) {
                         zan_ast_node_t *arg0 = expr->call.args.items[0];
@@ -5611,10 +5630,24 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     cur = (base && base != cur) ? base : NULL;
                 }
                 if (!found) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
-                        "'%.*s' has no member '%.*s'",
-                        (int)recv_cls->name.len, recv_cls->name.str,
-                        (int)mn.len, mn.str);
+                    /* Same tell as the checker's member diagnostic: the
+                     * receiver here is typically a bare identifier that
+                     * fell through to a unique imported type, and the
+                     * simple name alone read as "my field broke" when the
+                     * member never existed on the imported class. */
+                    zan_istr_t ns = recv_cls->decl
+                        ? zan_ast_ns_name(recv_cls->decl) : (zan_istr_t){0};
+                    if (ns.len)
+                        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                            "type '%.*s.%.*s' has no member '%.*s'",
+                            (int)ns.len, ns.str,
+                            (int)recv_cls->name.len, recv_cls->name.str,
+                            (int)mn.len, mn.str);
+                    else
+                        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                            "'%.*s' has no member '%.*s'",
+                            (int)recv_cls->name.len, recv_cls->name.str,
+                            (int)mn.len, mn.str);
                 }
             }
         }

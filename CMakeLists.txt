@@ -1394,6 +1394,19 @@ add_test(NAME diag_member_access_qualifies_type
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_member_access_qualifies_type PROPERTIES TIMEOUT 60)
 
+# Call-position face of the same trap: the checker stays silent for a member
+# access used as a call callee, so irgen diagnoses it -- it now prints the
+# qualified type for the same reason as diag_member_access_qualifies_type.
+add_test(NAME diag_member_call_qualifies_type
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/member_call_qualifies_type.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/diag/member_access_qualifies_type_lib.zan"
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_member_call_qualifies_type${_exe_ext}
+    "-DEXPECT_REGEX=type .Shapes\\.Menu. has no member .Show."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_member_call_qualifies_type PROPERTIES TIMEOUT 60)
+
 # A `"role": "control"` .html design doc is an embeddable Control, not a window: it has
 # no Main/Show, so naming one as the project entry has to fail at formgen time
 # instead of linking a program with no entry point.

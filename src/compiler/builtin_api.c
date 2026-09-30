@@ -57,6 +57,7 @@ static const zan_builtin_member_t members_dict[] = {
 static const zan_builtin_member_t members_sb[] = {
     { "Append",     'M', "void Append(object value)" },
     { "AppendLine", 'M', "void AppendLine(object value)" },
+    { "Clear",      'M', "void Clear()" },
     { "Length",     'P', "int Length" },
     { "ToString",   'M', "string ToString()" },
 };

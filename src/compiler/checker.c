@@ -50,6 +50,7 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
     if (zan_builtin_member_kind(bt, name.str, (int)name.len) != 'M') return NULL;
     const char *res = zan_builtin_member_result(bt, name.str, (int)name.len);
     if (!res) return NULL;
+    if (strcmp(res, "void") == 0) return c->binder->type_void;
     if (strcmp(res, "string") == 0) return c->binder->type_string;
     if (strcmp(res, "int") == 0) return c->binder->type_int;
     if (strcmp(res, "long") == 0) return c->binder->type_long;

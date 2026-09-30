@@ -1082,6 +1082,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - **Redis 64位整型与RESP批量键值操作（`RedisReply` / `RedisClient`）**：RESP协议的整数回复（`:12345678901234\r\n`）与自增计数（INCRBY、分布式计数器、雪花ID、时间戳）常远超32位有符号整型上限（21亿），若直接按32位int解析将发生静默溢出。解法：在`RedisReply`升级引入64位长整型`integer64`与`AsLong()`，并增补`Incr64Async`、`IncrByAsync`、`Decr64Async`、`DecrByAsync`；在大数据量键值读写场景下，单key循环请求导致严重的网络RTT往返空耗，补齐`MGetAsync`、`MSetAsync`与`DelMultipleAsync`原生RESP批量管道操作。
 - **DbResult 零拷贝行实体读取（`DbRow` / `DbResult.RowAt`）**：传统`DbResult.GetRow(i)`在遍历每一行时均创建新的`List<string>`副本并拷贝字段，在十万行级大结果集下产生十万次多余的列表堆分配与GC压力。在`DbRow`上直接提供`GetString`、`GetInt`、`GetLong`、`GetDouble`、`GetBool`与`IsNull`访问器，并在`DbResult`提供`RowAt(index)`返回只读行引用，消除行克隆分配。
 - **SQLite驱动行解码按需空值实例化与ZanDb块缓存锁生命周期安全（`SqliteConnection` / `BlockCache`）**：全套关系型数据库驱动中，`SqliteConnection` 的 `Query` 与 `QueryAsync` 亦应严格遵循按需空值定式，在扫描到首个 SQLITE_NULL 时才懒分配布尔列表，常规无 NULL 行直接通过 `AddRow` 入结果集，消除桌面端与单测中十万行级无 NULL 数据的堆分配浪费；嵌入式数据库 `BlockCache` 增补 `Close()` 幂等防御与销毁后操作短路拦截，`Release` 增补对 `pin == null` 的空安全防护，杜绝异常中断分支中的悬空解引用。
+- **StringBuilder.Clear 内建指令与 CSV 解析就地复用（`StringBuilder.Clear` / `Csv.ParseSep` / `Segment.Lookup`）**：在编译器底层补齐 `StringBuilder.Clear()` 原生指令（count 置零并终结 NUL），消除循环流式拼接时反复 `new StringBuilder` 的堆分配；`Csv.ParseSep` 接入 `field.Clear()` 与 `field.Length > 0` 长度直读，消除大 CSV 解析十万级单元格时小对象风暴；`Segment.Lookup` 增补缓存关闭或满员时的安全降级直读，`ScanRow.ValPtr` 补齐空指针防御，确保嵌入式内核健壮性。
 
 
 
