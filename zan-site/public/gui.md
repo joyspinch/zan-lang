@@ -1,6 +1,6 @@
 # GUI 开发指南（Zan）
 
-> 本指南覆盖 Zan 桌面 GUI 框架 `stdlib/Gui`（纯 Zan 源码 + 原生驱动
+> 本指南覆盖 Zan 桌面 GUI 框架 `packages/Zan.Gui/src/Gui`（纯 Zan 源码 + 原生驱动
 > `zan_gui`）：架构模型、`.zform` 可视化设计文档、代码式组件操作、布局、
 > 样式/主题/皮肤、事件、控件大全、自定义绘制与高级组件。
 > 所有 API 均可进一步查询逐命名空间参考页，如 [Gui](/ref/Gui)、
@@ -8,7 +8,7 @@
 
 ## 架构：App / Form / Control / Window
 
-`stdlib/Gui` 顶层是 `namespace Gui`；控件在 `Gui.Widget`，高级组件在
+`packages/Zan.Gui/src/Gui` 顶层是 `namespace Gui`；控件在 `Gui.Widget`，高级组件在
 `Gui.Component`（及其子命名空间 `Gui.Component.DataTable`、`Gui.Component.WebView`、
 `Gui.Component.CefBrowser`、`Gui.Component.CodeEditor`、`Gui.Component.Chart`），
 另有 `Gui.Designer`（可视化设计器）、`Gui.Hmi`（工控组件）、`Gui.Backend`
@@ -18,10 +18,10 @@
 
 | 概念 | 是什么 | 位置 |
 |---|---|---|
-| `Window` | 纯操作系统窗口封装（Win32/macOS/linux 经 FFI），`Show/Present/SetTitle/SetShape/SetOpacity/SetResizable/Close/...` | `stdlib/Gui/Backend/Native.zan` |
-| `App` | 应用宿主：持有窗口 + `canvas`（软件光栅器）+ 主题 + 焦点/命中测试 + 帧循环，构造 `App(title, w, h)`、`App.CreateDark(...)` | `stdlib/Gui/App.zan` |
-| `Form : Control` | **窗口本身就是控件**：`Form(string title, int w, int h)` 内部 `new App(...)`；`Form.Create/CreateDark/GetApp/SetTitle/Run/OnLoad/FrameHook/Every/OnExit` | `stdlib/Gui/Control.zan` |
-| `Control` | 组件树节点基类：字段属性 + 布局 + 事件 + 绘制虚方法 | `stdlib/Gui/Control.zan` |
+| `Window` | 纯操作系统窗口封装（Win32/macOS/linux 经 FFI），`Show/Present/SetTitle/SetShape/SetOpacity/SetResizable/Close/...` | `packages/Zan.Gui/src/Gui/Backend/Native.zan` |
+| `App` | 应用宿主：持有窗口 + `canvas`（软件光栅器）+ 主题 + 焦点/命中测试 + 帧循环，构造 `App(title, w, h)`、`App.CreateDark(...)` | `packages/Zan.Gui/src/Gui/Core/App.zan` |
+| `Form : Control` | **窗口本身就是控件**：`Form(string title, int w, int h)` 内部 `new App(...)`；`Form.Create/CreateDark/GetApp/SetTitle/Run/OnLoad/FrameHook/Every/OnExit` | `packages/Zan.Gui/src/Gui/Core/Control.zan` |
+| `Control` | 组件树节点基类：字段属性 + 布局 + 事件 + 绘制虚方法 | `packages/Zan.Gui/src/Gui/Core/Control.zan` |
 
 - `App` 与 `Window` 一对一；`Form` 是"窗口 + 根控件"的保留式封装。
 - **没有 `App.OnStart/OnStop`**。`Form` 提供的生命周期钩子是：
@@ -94,7 +94,7 @@ btn.Visible = true;
 btn.Disabled = busy;        // Binding<bool>，沿树向下继承
 ```
 
-公开字段（`stdlib/Gui/Control.zan`）：`name`（稳定名，`Find` 用）、`dock`、
+公开字段（`packages/Zan.Gui/src/Gui/Core/Control.zan`）：`name`（稳定名，`Find` 用）、`dock`、
 `layout`、`grow`、`prefW/prefH`（首选尺寸）、`mx/my`（手动偏移）、
 `padL/T/R/B`（内边距）、`gap`（子间距）、`visible`、`bx/by/bw/bh`（布局结果）、
 `parent`（weak）、`children`、`events`（设计器事件绑定）、`On`（`WidgetEvents`
@@ -305,11 +305,11 @@ btn.styleBg = 0x5b6cff;       // 内联字段直写
 gradient/borderRadiusSmall/Medium/Large/heightMedium/gapMedium` 等，
 `app.ApplyTheme(Theme.Dark(), true)`。
 
-内建皮肤（`stdlib/Gui/skins/`）：`base dark light brutalism chinese darkgold
+内建皮肤（`packages/Zan.Gui/src/Gui/skins/`）：`base dark light brutalism chinese darkgold
 dreamy emerald fortune liquidglass matrix mono neon peachblossom retroamber
 sunset`。
 
-### Tailwind 风格工具类（`stdlib/Gui/Tailwind.zan`）
+### Tailwind 风格工具类（`packages/Zan.Gui/src/Gui/Tailwind.zan`）
 
 间距刻度 `n*4px`（`p-2`、`m-4`）；变体 `hover:/focus:/active:/disabled:/
 checked:/selected:/focus-visible:`；任意值 `w-[240px]`、`bg-[#0f172a]`；

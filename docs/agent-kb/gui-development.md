@@ -2,7 +2,7 @@
 
 ## 心智模型：立即模式
 
-`stdlib/Gui` 是**立即模式**（immediate mode）UI：每帧重新绘制并即时判定交互，
+`packages/Zan.Gui/src/Gui` 是**立即模式**（immediate mode）UI：每帧重新绘制并即时判定交互，
 控件没有长生命周期对象树。典型循环（`Gui/App.zan`）：
 
 ```zan
@@ -37,7 +37,7 @@ while (app.isRunning) {
    这么做的）。
 4. 尺寸一律走 `app.Scale(n)` 做 DPI 缩放，不要写死像素。
 
-## Theme token（`stdlib/Gui/Theme.zan`）
+## Theme token（`packages/Zan.Gui/src/Gui/Styling/Theme.zan`）
 
 颜色是 `0xAARRGGBB` 打包进 `int`。**只能用已声明的 token**——写错名字以前会被静默折成 0，
 现在会编译报错（见 debugging-playbook）。常用集合：
@@ -56,7 +56,7 @@ while (app.isRunning) {
 皮肤与样式：`Skin.zan`（皮肤索引/切换）、`Style*.zan` / `StyleSheet.zan` / `Css.zan`
 （CSS 式样式层，IDE 自己的布局在 `src/ide_zan/assets/ide.css`）、`skins/`（资源）。
 
-## 绘制原语（`stdlib/Gui/Render.zan`）
+## 绘制原语（`packages/Zan.Gui/src/Gui/Rendering/Render.zan`）
 
 `Canvas` 上常用：`FillRect` `DrawRect` `FillRoundRect` `DrawCircle` `DrawLine`
 `DrawPolyline` `DrawText` `PushClip`/`PopClip` `BlurRect`。
@@ -201,7 +201,7 @@ smoke/standard 档）。皮肤命名空间 `numberanim`（base.css 三处：size
 
 | 想要 | 去哪 |
 | --- | --- |
-| 基础控件（58 个） | `stdlib/Gui/Widget/`：Button Input SelectBox Image Table Tabs TreeView ListView VirtualList Slider Switch Steps Timeline Pagination Progress Rate Tag Card Panel Collapse Popover Tooltip Dropdown Menu ContextMenu Breadcrumb PageHeader Result Empty Skeleton Spin Statistic … |
+| 基础控件（58 个） | `packages/Zan.Gui/src/Gui/Widget/`：Button Input SelectBox Image Table Tabs TreeView ListView VirtualList Slider Switch Steps Timeline Pagination Progress Rate Tag Card Panel Collapse Popover Tooltip Dropdown Menu ContextMenu Breadcrumb PageHeader Result Empty Skeleton Spin Statistic … |
 | 外壳容器 | `Widget/ToolStrip.zan` `StatusBar.zan` `SplitPanel.zan` `Split.zan` `Ribbon.zan` `Component/Dock.zan`（DockPanel）；自定义标题栏见 `App.RenderChrome` |
 | 向导/对话框 | `Widget/Wizard.zan`（新建项目/新建文件都用它）、`Widget/Prompt.zan`、`Widget/Layer.zan`（通知/浮层） |
 | 复合组件 | `Component/`：`Chart` `DataTable` `CodeEditor` `WebView` `PivotTable` `LogView` `FilePicker` `SessionList` |
@@ -246,7 +246,7 @@ IDE 见 `src/ide_zan/src/components/IdeBootstrap.zan`，画廊在 `gui_gallery.z
 
 **禁止在使用处自绘控件元素。** 示例、gallery、模板只能：实例化组件 → 配置属性 →
 喂数据 → 摆位置。仪表的圆弧、趋势的折线、柱状的条、LED 的灯珠，一律画在
-`stdlib/Gui/Hmi/*` 或 `stdlib/Gui/Component/Chart/*` 里面。
+`packages/Zan.Gui/src/Gui/Hmi/*` 或 `packages/Zan.Gui.Charts/src/Gui/Component/Chart/*` 里面。
 
 为什么不是风格问题：同一个控件存在两份绘制，组件修好之后示例还在按旧的错的画法
 显示，于是「组件是对的，demo 是错的」——gallery 的仪表演示就是这么歪的。
@@ -259,7 +259,7 @@ IDE 见 `src/ide_zan/src/components/IdeBootstrap.zan`，画廊在 `gui_gallery.z
   界限是「有没有在重画一个已经存在的控件」。
 - 审过一遍的结论（2026-08）：`examples/`、`templates/` 里没有 HMI/图表自绘，
   gallery 的仪表演示全是 `ChartSeries.Gauge(...)` 配置。所以仪表画错要去
-  `stdlib/Gui/Component/Chart/ChartViewPie.zan` 的 `DrawGauge` 查，别改 demo。
+  `packages/Zan.Gui.Charts/src/Gui/Component/Chart/ChartViewPie.zan` 的 `DrawGauge` 查，别改 demo。
 
 ## 设计器窗体（`.html` 设计稿）的数据流
 

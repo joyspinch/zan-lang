@@ -271,7 +271,7 @@ static char *read_file(const char *path, size_t *out_len) {
 
 /* Produce a normalized comparison key for a path so the same file passed both
  * explicitly and via auto-stdlib (which may differ in case / slash direction,
- * e.g. "stdlib\Gui\Widget\Select.zan" vs "...\stdlib\gui/widget\Select.zan")
+ * e.g. "packages\Zan.Gui\src\Gui\Widget\Select.zan" vs "...\stdlib\gui/widget\Select.zan")
  * compares equal and is only compiled once. */
 static void canon_key(const char *in, char *out, size_t out_sz) {
 #ifdef _WIN32
@@ -4538,7 +4538,7 @@ int main(int argc, char **argv) {
          * namespace->file table: adding or extending a stdlib module is just
          * dropping .zan files at the matching path, requiring no compiler change
          * or rebuild. The stdlib directory layout therefore mirrors the
-         * namespace hierarchy 1:1 (e.g. `using Gui.Widget;` -> stdlib/Gui/Widget,
+         * namespace hierarchy 1:1 (e.g. `using Gui.Widget;` -> packages/Zan.Gui/src/Gui/Widget,
          * `using System.Windows.Forms;` -> stdlib/System/Windows/Forms).
          *
          * Resolve to a fixpoint because a pulled-in module may itself `using`
@@ -5943,8 +5943,8 @@ int main(int argc, char **argv) {
         }
 
         /* ---- Gui icon packs inside the executable ----------------------
-         * stdlib/Gui/IconSvgData keeps its icon table in JSON data packs
-         * (stdlib/Gui/icons/*.json) and resolves them at run time through the
+         * packages/Zan.Gui/src/Gui/Media/IconSvgData.zan keeps its icon table in JSON data packs
+         * (packages/Zan.Gui/src/Gui/icons/*.json) and resolves them at run time through the
          * same discovery chain as skin packs: env ZAN_GUI_ICONS, an icons/
          * folder beside the exe, embedded resources, then the stdlib copy.
          * When the compiled program actually carries that module (its symbols
@@ -6009,7 +6009,7 @@ int main(int argc, char **argv) {
         }
 
         /* ---- Gui skin packs + base.css inside the executable ----------
-         * stdlib/Gui/skins holds the bundled skin packs (one folder with a
+         * packages/Zan.Gui/src/Gui/skins holds the bundled skin packs (one folder with a
          * skin.css per pack) plus the base.css every sheet builds on. They
          * resolve at run time through Skin.Roots(): env ZAN_GUI_SKINS, skins/
          * folders beside the exe or under the cwd, then embedded resources --

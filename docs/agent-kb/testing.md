@@ -32,7 +32,7 @@ scripts\test.ps1 full -ReleaseGate      # 完整集 + 确定性/泄漏/自举（
 
 - **测试与构建互斥**：用例共用 `build\zanc.exe` 和标准库时间戳，一边跑测试一边编译，
   会让毫无关系的用例失败。`scripts\test.ps1` 的注释里明确写了这条。
-- **gallery 与 IDE 构建互斥**：两者都会重写 `stdlib\Gui\CustomComponents.zan`
+- **gallery 与 IDE 构建互斥**：两者都会重写 `packages\Zan.Gui\src\Gui\CustomComponents.zan`
   （组件扫描产物）。串行跑。
 - **桌面资源类用例互斥**：托盘/屏幕/输入/自动化（`conformance_win_tray_screen_smoke`、
   `*_win_automation_*`、`*_win_uielement_*` 等）会抢真实桌面资源，`-j` 并发下偶发失败。

@@ -25,11 +25,11 @@ if ($LASTEXITCODE -ne 0) { throw "RUNTIME_LIB_FAILED" }
 
 Write-Output "[2/2] Compiling and linking charts_test.exe..."
 $files = @()
-$files += (Get-ChildItem stdlib\Gui\*.zan).FullName
-$files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName
+$files += (Get-ChildItem packages\Zan.Gui\src\Gui\*.zan).FullName
+$files += (Get-ChildItem packages\Zan.Gui\src\Gui\Widget\*.zan).FullName
 $chartDir = "packages\Zan.Gui.Charts\src\Gui\Component\Chart"
 if (-not (Test-Path $chartDir)) {
-    $chartDir = "stdlib\Gui\Component\Chart"
+    $chartDir = "packages\Zan.Gui.Charts\src\Gui\Component\Chart"
 }
 $files += (Get-ChildItem $chartDir\*.zan).FullName
 $files += (Get-ChildItem examples\gui_charts\*.zan).FullName

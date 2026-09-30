@@ -1,7 +1,7 @@
 /* gui_backend.h -- render backend seam for the GUI runtime.
  *
  * Every drawing primitive Zan can reach arrives through the ~45 zan_gui_*
- * exports in gui_runtime.c (stdlib/Gui/Render.zan holds their [DllImport]
+ * exports in gui_runtime.c (packages/Zan.Gui/src/Gui/Rendering/Render.zan holds their [DllImport]
  * declarations, and no widget ever touches pixels directly), so this is the one
  * place a second rasterizer has to be plugged in: a surface carries a backend
  * pointer, each export validates its arguments and then hands the call to that

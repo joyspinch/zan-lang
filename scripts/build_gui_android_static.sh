@@ -1,6 +1,6 @@
 #!/bin/bash
 # Rebuild the committed Android static GUI driver archives
-#   stdlib/Gui/drivers/android-{arm64,x64}/static/libzan_gui.a
+#   packages/Zan.Gui/src/Gui/drivers/android-{arm64,x64}/static/libzan_gui.a
 # that zanc links into --target android-* --emit-apk libmain.so builds.
 #
 # The archive is: gui_runtime.c compiled as ONE translation unit with
@@ -9,7 +9,7 @@
 # FreeType modules (FT2_BUILD_LIBRARY) baked in as separate members.
 #
 # Re-run this whenever src/runtime/gui_runtime*.c, src/runtime/libwebp/ or the
-# FreeType checkout change AND stdlib/Gui/Render.zan (or any stdlib surface)
+# FreeType checkout change AND packages/Zan.Gui/src/Gui/Rendering/Render.zan (or any stdlib surface)
 # gains a new `static extern` -- a stale archive does NOT fail the link
 # (-shared keeps unresolved symbols), it crashes the app at dlopen with
 # "cannot locate symbol" (see 2026-09-16 NewProject.apk incident).
@@ -72,10 +72,10 @@ build () { # triple outdir
 }
 
 case "${1:-all}" in
-  arm64) build aarch64-linux-android28 "$REPO/stdlib/Gui/drivers/android-arm64/static" ;;
-  x64)   build x86_64-linux-android28  "$REPO/stdlib/Gui/drivers/android-x64/static" ;;
-  all)   build aarch64-linux-android28 "$REPO/stdlib/Gui/drivers/android-arm64/static"
-         build x86_64-linux-android28  "$REPO/stdlib/Gui/drivers/android-x64/static" ;;
+  arm64) build aarch64-linux-android28 "$REPO/packages/Zan.Gui/src/Gui/drivers/android-arm64/static" ;;
+  x64)   build x86_64-linux-android28  "$REPO/packages/Zan.Gui/src/Gui/drivers/android-x64/static" ;;
+  all)   build aarch64-linux-android28 "$REPO/packages/Zan.Gui/src/Gui/drivers/android-arm64/static"
+         build x86_64-linux-android28  "$REPO/packages/Zan.Gui/src/Gui/drivers/android-x64/static" ;;
   *) echo "usage: $0 [arm64|x64|all] [ndk-root]" >&2; exit 2 ;;
 esac
 echo done

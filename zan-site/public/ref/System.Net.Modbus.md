@@ -53,7 +53,7 @@ m.Close();
   - 上一次交换的失败原因（成功时为 ""）。
 
 - void Close()
-  - 关闭连接（幂等）。
+  - 关闭连接并安全唤醒所有排队等待的协程（幂等）。
 
 - async byte[]ReadBytesAsync(int need)
   - 在 IO reactor 上挂起，跨多次 recv 精确读取

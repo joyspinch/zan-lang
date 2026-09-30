@@ -38,6 +38,13 @@ description: 版本提交与任务管理规范——提交信息格式（scope: 
 - 历史只前进：不 revert 别人的提交来"解决问题"，修根因向前修；
   回滚是决定不是调试手段。
 
+- **Windows 目录级 git mv 被 Permission denied 拒绝时逐子目录移动**：目录改名
+  需要目录句柄独占，任何进程把它当 CWD / 资源管理器开着它 / 索引器扫它都会拒绝，
+  而子目录/文件的改名只需各自句柄空闲——`for d in ...; git mv stdlib/X pkg/src/X`
+  逐项执行，锁定项报错重试即可，最后 rmdir 空壳。踩坑（2026-09-30 整包 Gui 拆分）：
+  目录级 `git mv stdlib/Gui packages/Zan.Gui/src/Gui` 连续三次 Permission denied
+  （当时无 zanc 进程），逐 17 个子目录移动全部成功。
+
 ## 三、任务台账（TASKS.md）：挂账有据，清账移单
 
 - **台账只记两类**：未修缺陷（编号+一句话现象+根因线索+复现探针位置）、

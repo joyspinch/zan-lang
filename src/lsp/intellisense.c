@@ -86,7 +86,7 @@ static const stdlib_class_t stdlib_classes[] = {
               "Sin", "Cos", "Tan", "Log", "Exp", "PI", "E", NULL}},
     {"Environment", {"ArgCount", "ArgAt", "Exit", "GetEnvironmentVariable", NULL}},
     {"String", {"IsNullOrEmpty", "Format", "Join", "Split", "Concat", NULL}},
-    /* ---- Gui widget API (from stdlib/Gui; Control's fluent event/style
+    /* ---- Gui widget API (from packages/Zan.Gui/src/Gui; Control's fluent event/style
      * setters are inherited by every widget) ---- */
     {"Control", {"OnClick", "OnChange", "OnFocus", "OnBlur", "OnKeyDown",
                  "OnMouseDown", "OnMouseUp", "OnEnter", "OnLeave", "OnWheel",

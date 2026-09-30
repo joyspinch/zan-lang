@@ -10,7 +10,7 @@
 # When you legitimately REMOVE reads, lower (or delete) that file's budget
 # line so the debt cannot silently creep back.
 #
-# Whitelisted (they implement the style layer itself): stdlib/Gui/Theme.zan,
+# Whitelisted (they implement the style layer itself): packages/Zan.Gui/src/Gui/Styling/Theme.zan,
 # Style.zan, StyleBox.zan, Fx.zan.
 #
 # Inputs: ROOT (repository root).
@@ -21,20 +21,20 @@ cmake_policy(SET CMP0007 NEW)
 # self-checks; these reads are not drawing paths. When adding exported fields,
 # keep ThemeDoc, ThemeJson, and this note in sync.
 set(_budget
-  "stdlib/Gui/Backend/UiDriver.zan=12"
-  "stdlib/Gui/Component/PropertyGrid.zan=7"
-  "stdlib/Gui/Designer/Designer.Inspector.zan=2"
+  "packages/Zan.Gui/src/Gui/Backend/UiDriver.zan=12"
+  "packages/Zan.Gui/src/Gui/Component/PropertyGrid.zan=7"
+  "packages/Zan.Gui/src/Gui/Designer/Designer.Inspector.zan=2"
 )
 
 set(_members "primary|primaryHover|primaryPressed|info|infoHover|infoPressed|success|successHover|successPressed|warning|warningHover|warningPressed|error|errorHover|errorPressed|textPrimary|textSecondary|textTertiary|textDisabled|textInverse|bgPrimary|bgSecondary|bgTertiary|bgHover|bgActive|bgDisabled|borderPrimary|borderSecondary|borderHover|borderFocus|divider|shadowColor|scrollbar|scrollbarHover|tooltipBg|tooltipBorder|tooltipText|glassTint|glassChromeTint")
 
-file(GLOB_RECURSE _sources "${ROOT}/stdlib/Gui/*.zan")
+file(GLOB_RECURSE _sources "${ROOT}/packages/Zan.Gui/src/Gui/*.zan")
 
 set(_fail "")
 foreach(_f ${_sources})
   file(RELATIVE_PATH _rel "${ROOT}" "${_f}")
-  if(_rel STREQUAL "stdlib/Gui/Styling/Theme.zan" OR _rel STREQUAL "stdlib/Gui/Styling/Style.zan"
-     OR _rel STREQUAL "stdlib/Gui/Styling/StyleBox.zan" OR _rel STREQUAL "stdlib/Gui/Rendering/Fx.zan")
+  if(_rel STREQUAL "packages/Zan.Gui/src/Gui/Styling/Theme.zan" OR _rel STREQUAL "packages/Zan.Gui/src/Gui/Styling/Style.zan"
+     OR _rel STREQUAL "packages/Zan.Gui/src/Gui/Styling/StyleBox.zan" OR _rel STREQUAL "packages/Zan.Gui/src/Gui/Rendering/Fx.zan")
     continue()
   endif()
   file(STRINGS "${_f}" _lines ENCODING UTF-8)
@@ -72,7 +72,7 @@ if(_fail)
   foreach(_o ${_fail})
     message("  ${_o}")
   endforeach()
-  message(FATAL_ERROR "new direct semantic-color reads in stdlib/Gui")
+  message(FATAL_ERROR "new direct semantic-color reads in packages/Zan.Gui/src/Gui")
 endif()
 
 message("THEME_COLOR_BUDGET_OK")

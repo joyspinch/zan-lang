@@ -1,6 +1,6 @@
 #!/bin/bash
 # Rebuild the HarmonyOS GUI driver (ohos-x64, matching the DevEco emulator)
-# and stage it into stdlib/Gui/drivers/ohos-x64/:
+# and stage it into packages/Zan.Gui/src/Gui/drivers/ohos-x64/:
 #
 #   libzan_gui.so          -- standalone driver .so (runtime-loaded form)
 #   static/libzan_gui.a    -- static archive zanc's --emit-lib link pulls in,
@@ -21,7 +21,7 @@ AR="$DEVECO/sdk/default/openharmony/native/llvm/bin/llvm-ar.exe"
 SYS="$DEVECO/sdk/default/openharmony/native/sysroot"
 FT=/d/project/firefox/modules/freetype2
 OUT="$REPO/_scratch/ft-ohos"
-DRV="$REPO/stdlib/Gui/drivers/ohos-x64"
+DRV="$REPO/packages/Zan.Gui/src/Gui/drivers/ohos-x64"
 
 # -DNDEBUG drops the vendored libs' assert() strings (their __FILE__ would
 # leak build-machine paths into published artifacts).

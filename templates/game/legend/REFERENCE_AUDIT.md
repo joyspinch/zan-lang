@@ -396,7 +396,7 @@ IoU 0.353，且结构逐笔吻合），而不是靠肉眼猜。
     高度 ≤ 0 当 fill，左面板必须写显式高度 `RankLeftH()`（710 设备）。
 14. **`Panel.StylePadT()` 曾忽略 `padSet`**：类上声明过 `padding` 时会把
     显式 `Padding(top, …)` 顶掉（左面板顶从 167 掉到 164）。已在标准库修
-    （`stdlib/Gui/Widget/Panel.zan`：`padSet` 优先，`StylePadL/R/B` 本来就是这个
+    （`packages/Zan.Gui/src/Gui/Widget/Panel.zan`：`padSet` 优先，`StylePadL/R/B` 本来就是这个
     语义），属标准库改动，走 smoke/standard 验收。
 
 **登记为已知偏差（不在 Zan 侧绕）**：
@@ -580,7 +580,7 @@ IoU 0.353，且结构逐笔吻合），而不是靠肉眼猜。
 
 **这一批踩到的坑（每个都实测复现过）**：
 
-1. **`Grow()` 的 `dock=5` 走第二趟布局**（`stdlib/Gui/Control.zan` dock 路径）：
+1. **`Grow()` 的 `dock=5` 走第二趟布局**（`packages/Zan.Gui/src/Gui/Core/Control.zan` dock 路径）：
    第一趟按序排 dock 1..4，第二趟才把所有 dock=5 子项塞进*剩余*矩形。所以
    **撑条放兄弟前面不占位**——内容照旧从顶排，撑条吃剩余（传说塔底行因此高
    38 设备）。定死改法：要么**定高 `VGap(h)`** 撑条，要么 `DockBottom()`。
@@ -1043,7 +1043,7 @@ border: 1px solid #3a4055;   /* 金边 #6a5a30 用于装备格 */
 > 这是「换页必须清空输入框」的硬依据：本版曾把上一页的账号/密码/回话带进
 > 下一页，被用户当场点出（「输入框都没清理肯定不对」）。
 > **清空必须放在 `RemoveAll()` 之后**——`Input` 析构时会把编辑缓冲经 `data`
-> 绑定回写字段，先清后删等于白清（`stdlib/Gui/Widget/Input.zan` 的
+> 绑定回写字段，先清后删等于白清（`packages/Zan.Gui/src/Gui/Widget/Input.zan` 的
 > `PushBinding`）。且清空要挂在「页真的变了」那一次，而不是 `LgGo`：页序有
 > 两条来源（用户点钮走 `LgGo`，服务端状态推进由 `LgPump` 直接改 `lgPage`），
 > 只在 `LgGo` 里清会漏掉后者。
@@ -1346,7 +1346,7 @@ textBox / progressBar / richTextBox / prefab / custom，**没有格子类**）�
 `Progress.PaintBar/PaintRing` 只传了 `VariantClass()`——用户给条挂的类根本不进类集合，
 `::track` 自然选不中，颜色悄悄退回皮肤默认。
 
-**修法（不走绕路，按规则 10 改标准库）**：`stdlib/Gui/Widget/Progress.zan` 新增
+**修法（不走绕路，按规则 10 改标准库）**：`packages/Zan.Gui/src/Gui/Widget/Progress.zan` 新增
 `PartCls()`（`VariantClass()` + `" "` + `Class`），`PaintBar`/`PaintRing` 两处调用点
 改用它。两套写法**各按各的命中**：`progress.info::fill`（变体）与 `.el-bar::track`
 （用户类）都成立。

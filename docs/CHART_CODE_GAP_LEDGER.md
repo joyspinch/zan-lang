@@ -2,7 +2,7 @@
 
 > 口径：**按 ECharts 6.1 源函数/源文件记账**，不按 demo 记账、不按截图记账。
 > 权威源 `_scratch/echarts-master/src/`（v6.1.0，596 个 `.ts`）。
-> 目标 `stdlib/Gui/Component/Chart/*.zan`（35 文件 / 31,759 行）。
+> 目标 `packages/Zan.Gui.Charts/src/Gui/Component/Chart/*.zan`（35 文件 / 31,759 行）。
 >
 > 本文是 `docs/CHART_COMPATIBILITY_5.md`「迁移账本」的**代码侧补充**：
 > 那份账本按官方示例记进度，本文按引擎代码记缺口。两者冲突时以本文为准，
@@ -245,6 +245,6 @@ node scripts/ec_oracle.js --option <option.json> [--width W] [--height H]
 ```
 
 `chart_gap_audit.py` 无外部依赖（只读仓库内
-`examples/gui_charts/options` 与 `stdlib/Gui/Component/Chart`）。
+`examples/gui_charts/options` 与 `packages/Zan.Gui.Charts/src/Gui/Component/Chart`）。
 `ec_oracle.js` 需要 node + ECharts 6.1 dist（见闸门 1），是开发工具，
 不进构建、不进 ctest 档位。

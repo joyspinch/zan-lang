@@ -46,8 +46,8 @@ STYLE = os.path.join(ROOT, 'stdlib', 'Gui', 'Style.zan')
 
 # 本项目自带的皮肤文件（不含 13 个图表主题包，那是另一条线）。
 CORPUS_A = [
-    'stdlib/Gui/skins/base.css',
-    'stdlib/Gui/skins/*/skin.css',
+    'packages/Zan.Gui/src/Gui/skins/base.css',
+    'packages/Zan.Gui/src/Gui/skins/*/skin.css',
     'src/ide_zan/assets/ide.css',
     'templates/game/*/skins/base.css',
     'templates/game/*/skins/*/skin.css',
@@ -88,7 +88,7 @@ def coerced_value(val):
             return True
     return False
 
-# 引擎会匹配的伪状态（stdlib/Gui/Style.zan:92-97 的 name 分派）。
+# 引擎会匹配的伪状态（packages/Zan.Gui/src/Gui/Styling/Style.zan:92-97 的 name 分派）。
 STATE_NAMES = {'hover', 'active', 'focus', 'focus-visible', 'disabled',
                'selected', 'checked'}
 
@@ -409,7 +409,7 @@ def _classify(s, states):
 
 
 def classify_selector(sel, states):
-    """镜像 Css.Selector.Parse（stdlib/Gui/Css.zan）的接受条件，
+    """镜像 Css.Selector.Parse（packages/Zan.Gui/src/Gui/Styling/Css.zan）的接受条件，
     再判断伪状态/伪元素/属性是否会匹配。返回 (kind, why)。"""
     return _classify(sel.strip(), states)
 

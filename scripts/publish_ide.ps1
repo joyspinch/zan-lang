@@ -166,7 +166,7 @@ if (Test-Path $depsList) {
 # (scripts\gen_embed.ps1, linked in by build_ide.ps1). The skin picker reads
 # them from the exe in memory, so no external skins\ folder ships at the root.
 # The filesystem is only a fallback for user overrides (an on-disk skins\ or
-# stdlib\Gui\skins still wins if present).
+# packages\Zan.Gui\src\Gui\skins still wins if present).
 
 # ---- copy the app icon so the IDE can stamp new projects with it ----
 # zanc also carries a compiled-in copy (see CMakeLists.txt), so a produced .exe

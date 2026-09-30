@@ -46,7 +46,7 @@ if ($LASTEXITCODE -ne 0) { throw "RUNTIME_LIB_FAILED" }
 # ---- bake the skin packs (base.css + skins) into the exe -----------------
 Write-Output "[2/4] Embedding skin packs (base.css + all skins) ..."
 & powershell -ExecutionPolicy Bypass -File scripts\gen_embed.ps1 `
-    -Root stdlib\Gui\skins -Prefix skins `
+    -Root packages\Zan.Gui\src\Gui\skins -Prefix skins `
     -OutC build\embed_gen_gallery.c -OutO build\embed_gen_gallery.o -Clang clang
 if ($LASTEXITCODE -ne 0) { throw "EMBED_GEN_FAILED" }
 
@@ -69,8 +69,8 @@ Copy-Item -LiteralPath (Join-Path $root "build\libzan_gui_gallery_gnu.a") `
 # ---- compile + link through zanc (its own bundled ld) --------------------
 Write-Output "[3/4] Compiling and linking gui_gallery (static, single file) ..."
 $files = @()
-$files += (Get-ChildItem stdlib\Gui\*.zan).FullName
-$files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName
+$files += (Get-ChildItem packages\Zan.Gui\src\Gui\*.zan).FullName
+$files += (Get-ChildItem packages\Zan.Gui\src\Gui\Widget\*.zan).FullName
 $files += (Get-ChildItem examples\gui_gallery\components\*.zan).FullName
 $files += (Join-Path (Get-Location) "examples\gui_gallery\gui_gallery.zan")
 

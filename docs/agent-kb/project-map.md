@@ -71,12 +71,12 @@
 | 路径 | 内容 |
 | --- | --- |
 | `stdlib/System/` | 核心类型、集合、IO、Json、Text（含 Regex）、Net（Http/Ws/Mqtt/Tls/Rpc/Sse）、Data/DB、Web（Router/ApiDocs/…） |
-| `stdlib/Gui/` | GUI 框架，见 [gui-development.md](gui-development.md) |
-| `stdlib/Gui/Widget/` (58 个) | 基础控件：Button/Input/Table/Tabs/Ribbon/ToolStrip/StatusBar/SplitPanel/Wizard… |
-| `stdlib/Gui/Component/` | 复合组件：Chart、DataTable、CodeEditor、WebView、Dock、FilePicker、PivotTable… |
-| `stdlib/Gui/Hmi/` | 工控：`IoTag`、`Indicator`(LED/数显)、`Gauge`、`Trend`、`Alarm`、`NumPad`、`EquipPanel` |
-| `stdlib/Gui/Designer/` | 表单设计器（`Designer.zan`、`Designer.Form.zan`、`Designer.Inspector.zan`） |
-| `stdlib/Gui/skins/`, `drivers/`, `Backend/` | 皮肤资源、原生驱动绑定、后端 |
+| `packages/Zan.Gui/src/Gui/` | GUI 框架，见 [gui-development.md](gui-development.md) |
+| `packages/Zan.Gui/src/Gui/Widget/` (58 个) | 基础控件：Button/Input/Table/Tabs/Ribbon/ToolStrip/StatusBar/SplitPanel/Wizard… |
+| `packages/Zan.Gui/src/Gui/Component/` | 复合组件：Chart、DataTable、CodeEditor、WebView、Dock、FilePicker、PivotTable… |
+| `packages/Zan.Gui/src/Gui/Hmi/` | 工控：`IoTag`、`Indicator`(LED/数显)、`Gauge`、`Trend`、`Alarm`、`NumPad`、`EquipPanel` |
+| `packages/Zan.Gui/src/Gui/Designer/` | 表单设计器（`Designer.zan`、`Designer.Form.zan`、`Designer.Inspector.zan`） |
+| `packages/Zan.Gui/src/Gui/skins/`, `drivers/`, `Backend/` | 皮肤资源、原生驱动绑定、后端 |
 | `stdlib/Game/`, `stdlib/Platform/`, `stdlib/Sdk/` | 游戏引擎、平台 API（Windows 托盘/打印/服务/自动化…）、第三方 SDK |
 
 ## 常见需求 → 落点
@@ -85,10 +85,10 @@
 | --- | --- |
 | 新语法/语义 | `parser.c` → `binder.c`/`checker.c` → `irgen_*.c` + `tests/conformance` |
 | 编译器误报/漏报 | 对应层 + `tests/diag`（编译期错误用 `run_compile_error.cmake`） |
-| 新控件 | `stdlib/Gui/Widget/<Name>.zan` + `stdlib/Gui/Component/` 注册 + gallery 示例 |
-| 新 HMI 元件 | `stdlib/Gui/Hmi/` + `templates/gui/gui-hmi` 演示 |
-| 主题/皮肤 | `stdlib/Gui/Theme.zan`, `Skin.zan`, `Style*.zan`, `skins/` |
-| 设计器行为 | `stdlib/Gui/Designer/*` + `stdlib/System/Compiler/GenForm.zan`（`.html` 设计稿 → 代码） |
+| 新控件 | `packages/Zan.Gui/src/Gui/Widget/<Name>.zan` + `packages/Zan.Gui/src/Gui/Component/` 注册 + gallery 示例 |
+| 新 HMI 元件 | `packages/Zan.Gui/src/Gui/Hmi/` + `templates/gui/gui-hmi` 演示 |
+| 主题/皮肤 | `packages/Zan.Gui/src/Gui/Styling/Theme.zan`, `Skin.zan`, `Style*.zan`, `skins/` |
+| 设计器行为 | `packages/Zan.Gui/src/Gui/Designer/*` + `stdlib/System/Compiler/GenForm.zan`（`.html` 设计稿 → 代码） |
 | 新建项目模板 | `templates/**/template.manifest` + `ZanIDE.Workspace.zan`（见 [templates-and-wizard.md](templates-and-wizard.md)） |
 | IDE 面板/命令 | `ZanIDE.Panels.zan` + `ZanIDE.zan`（命令分发）+ `ZanIDE.State.zan`（状态） |
 | 补全/跳转/悬停 | `src/lsp/` + `LspSession.zan` |

@@ -1,6 +1,6 @@
 # Gui.Reactive
 
-> 源码: `stdlib/Gui/Reactive/Events.zan`
+> 源码: `packages/Zan.Gui/src/Gui/Reactive/Events.zan`
 
 
 ## Dispatcher (class)

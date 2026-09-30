@@ -434,6 +434,8 @@ PathFilter.Only(".zan").Skip("build bin obj"));
 
 - [DllImport("crt")]static extern long zan_file_attributes(string path);
 
+- [DllImport("crt")]static extern long zan_file_length(string path);
+
 - [DllImport("crt")]static extern int zan_embed_has(string name);
 
 - [DllImport("crt")]static extern string zan_embed_read(string name);
@@ -538,6 +540,10 @@ PathFilter.Only(".zan").Skip("build bin obj"));
 
 - static int GetSize(string path)
   - 获取文件大小（字节）。
+    文件无法打开时抛出 FileNotFoundException。
+
+- static long GetSize64(string path)
+  - 获取文件大小（64 位长整型字节数）。
     文件无法打开时抛出 FileNotFoundException。
 
 - static List<string> ReadAllLines(string path)

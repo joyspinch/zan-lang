@@ -3,7 +3,7 @@
 from.
 
 Cross-compilation ships prebuilt runtime objects (toolchain/<target>/*.o) and a
-prebuilt GUI driver (stdlib/Gui/drivers/<target>/), because neither can be
+prebuilt GUI driver (packages/Zan.Gui/src/Gui/drivers/<target>/), because neither can be
 produced on a machine that is not that target. Nothing rebuilds them, so a
 runtime edit silently leaves every cross target on the old code -- twice now
 that has cost days: a pre-A2-0b zan_gui.dll made one test take 331 seconds, and
@@ -138,11 +138,11 @@ ARTIFACTS = [
     ("toolchain/ohos-arm64/clang_rt.crtend.o", ANDROID_NDK, "manual"),
     ("toolchain/ohos-arm64/libclang_rt.builtins.a", ANDROID_NDK, "manual"),
     ("toolchain/ohos-arm64/libunwind.a", ANDROID_NDK, "manual"),
-    ("stdlib/Gui/drivers/win-x64/zan_gui.dll", GUI, "gui"),
-    ("stdlib/Gui/drivers/linux-x64/static/libzan_gui.a", GUI, "gui"),
-    ("stdlib/Gui/drivers/linux-arm64/static/libzan_gui.a", GUI, "gui"),
-    ("stdlib/Gui/drivers/macos-arm64/libzan_gui.dylib", GUI, "gui"),
-    ("stdlib/Gui/drivers/macos-x64/libzan_gui.dylib", GUI, "gui"),
+    ("packages/Zan.Gui/src/Gui/drivers/win-x64/zan_gui.dll", GUI, "gui"),
+    ("packages/Zan.Gui/src/Gui/drivers/linux-x64/static/libzan_gui.a", GUI, "gui"),
+    ("packages/Zan.Gui/src/Gui/drivers/linux-arm64/static/libzan_gui.a", GUI, "gui"),
+    ("packages/Zan.Gui/src/Gui/drivers/macos-arm64/libzan_gui.dylib", GUI, "gui"),
+    ("packages/Zan.Gui/src/Gui/drivers/macos-x64/libzan_gui.dylib", GUI, "gui"),
 ]
 
 

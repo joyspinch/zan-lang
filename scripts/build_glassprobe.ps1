@@ -10,8 +10,8 @@ if ($LASTEXITCODE -ne 0) { throw "llvm-lib failed" }
 clang -O2 -std=c11 -I src\runtime -c src\runtime\rt_sync.c -o build\zanrt_sync_glass.obj
 if ($LASTEXITCODE -ne 0) { throw "rt_sync compile failed" }
 $files = @()
-$files += (Get-ChildItem stdlib\Gui\*.zan).FullName
-$files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName
+$files += (Get-ChildItem packages\Zan.Gui\src\Gui\*.zan).FullName
+$files += (Get-ChildItem packages\Zan.Gui\src\Gui\Widget\*.zan).FullName
 $files += (Join-Path (Get-Location) "examples\glass_probe\glass_probe.zan")
 Push-Location build
 $ir = & .\zanc.exe --emit-ir $files

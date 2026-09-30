@@ -3,7 +3,7 @@
 # LLVM required (mirrors the native driver staging convention). The
 # Win32-backend runtime DLL (build\zan_gui.dll, from the CMake zan_gui_runtime
 # target) imports only system DLLs, so a linked GUI exe needs only zan_gui.dll
-# beside it. zanc auto-discovers this via stdlib\Gui\drivers\driver.manifest.
+# beside it. zanc auto-discovers this via packages\Zan.Gui\src\Gui\drivers\driver.manifest.
 #
 # Run after `cmake --build build` (which produces build\zan_gui.dll).
 $ErrorActionPreference = "Stop"
@@ -16,10 +16,10 @@ if (!(Test-Path $dll)) {
     exit 1
 }
 
-$drvDir = Join-Path $root "stdlib\Gui\drivers\win-x64"
+$drvDir = Join-Path $root "packages\Zan.Gui\src\Gui\drivers\win-x64"
 New-Item -ItemType Directory -Force -Path $drvDir | Out-Null
 
-$man = Join-Path $root "stdlib\Gui\drivers\driver.manifest"
+$man = Join-Path $root "packages\Zan.Gui\src\Gui\drivers\driver.manifest"
 @"
 # Native [DllImport] libraries owned by this module (one -l basename per line).
 # blank lines and '#' comments are ignored. zanc discovers this file to bundle

@@ -21,16 +21,16 @@
 cmake_policy(SET CMP0007 NEW)
 
 set(_budget
-  "stdlib/Gui/Styling/Style.zan=15"
-  "stdlib/Gui/Styling/Theme.zan=15"
-  "stdlib/Gui/Styling/StyleBox.zan=1"
-  "stdlib/Gui/Backend/UiDriver.zan=5"
-  "stdlib/Gui/Component/Chart/ChartResolved.zan=1"
-  "stdlib/Gui/Component/CodeEditor/CodeEditor.zan=1"
+  "packages/Zan.Gui/src/Gui/Styling/Style.zan=15"
+  "packages/Zan.Gui/src/Gui/Styling/Theme.zan=15"
+  "packages/Zan.Gui/src/Gui/Styling/StyleBox.zan=1"
+  "packages/Zan.Gui/src/Gui/Backend/UiDriver.zan=5"
+  "packages/Zan.Gui.Charts/src/Gui/Component/Chart/ChartResolved.zan=1"
+  "packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan=1"
 )
 set(_members "fontSizeTiny|fontSizeSmall|fontSizeMedium|fontSizeLarge|fontSizeHuge")
 set(_total_budget 38)
-file(GLOB_RECURSE _sources "${ROOT}/stdlib/Gui/*.zan")
+file(GLOB_RECURSE _sources "${ROOT}/packages/Zan.Gui/src/Gui/*.zan")
 
 set(_fail "")
 set(_total 0)
@@ -58,7 +58,7 @@ foreach(_f ${_sources})
   math(EXPR _total "${_total} + ${_n}")
   get_filename_component(_dir "${_rel}" DIRECTORY)
   list(APPEND _dir_names "${_dir}")
-  if(_rel MATCHES "^stdlib/Gui/Widget/")
+  if(_rel MATCHES "^packages/Zan.Gui/src/Gui/Widget/")
     math(EXPR _widget_total "${_widget_total} + ${_n}")
   endif()
   set(_allowed 0)
@@ -107,7 +107,7 @@ if(_fail)
   foreach(_o ${_fail})
     message("  ${_o}")
   endforeach()
-  message(FATAL_ERROR "new direct Theme font-size reads in stdlib/Gui")
+  message(FATAL_ERROR "new direct Theme font-size reads in packages/Zan.Gui/src/Gui")
 endif()
 
 if(_total GREATER _total_budget)

@@ -69,7 +69,7 @@ templates/<group>/<id>/template.manifest
 480x320、800x480、1024x600、Phone 390x844、Tablet 768x1024、1280x720、1366x768、
 1920x1080、Watch 466x466、368x448、194x368）。要加设备就改这三个函数。
 
-## 向导实现要点（`stdlib/Gui/Widget/Wizard.zan`）
+## 向导实现要点（`packages/Zan.Gui/src/Gui/Widget/Wizard.zan`）
 
 - `WizardTemplate` 除 `cat/name/icon/desc` 外带元数据，用链式设置：
   `new WizardTemplate(cat, name, icon, desc).Shape(sizeable, w, h, round).Look(preview, sketch)`

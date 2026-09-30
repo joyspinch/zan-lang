@@ -35,8 +35,8 @@ try {
 
     Write-Output "[2/2] Compiling and linking gallery_test.exe..."
     $files = @()
-    $files += (Get-ChildItem stdlib\Gui\*.zan).FullName
-    $files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName
+    $files += (Get-ChildItem packages\Zan.Gui\src\Gui\*.zan).FullName
+    $files += (Get-ChildItem packages\Zan.Gui\src\Gui\Widget\*.zan).FullName
     $files += (Get-ChildItem $galleryComponents\*.zan).FullName
     $files += (Join-Path (Get-Location) "examples\gui_gallery\gui_gallery.zan")
     $files += (Join-Path (Get-Location) "examples\gui_gallery\MapChinaData.zan")

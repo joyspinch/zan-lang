@@ -1,6 +1,6 @@
 # Zan GUI Component Gallery
 
-Zan 官方 GUI 组件全景画廊（基于 `stdlib/Gui` 原生自研渲染管线）。
+Zan 官方 GUI 组件全景画廊（基于 `packages/Zan.Gui/src/Gui` 原生自研渲染管线）。
 
 提供 NaiveUI 风格的交互式控件展示台：
 - **左侧导航**：按基础控件、表单输入、数据展示、图表呈现、高级交互（富文本、代码编辑器、图表、HMI仪表等）分类浏览；

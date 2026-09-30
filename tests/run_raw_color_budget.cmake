@@ -21,30 +21,29 @@
 cmake_policy(SET CMP0007 NEW)
 
 set(_budget
-  "stdlib/Gui/App.zan=1"
-  "stdlib/Gui/Widget/Layer.zan=2"
-  "stdlib/Gui/Widget/Wizard.zan=2"
-  "stdlib/Gui/Component/CodeEditor/CodeEditor.Render.zan=1"
+  "packages/Zan.Gui/src/Gui/Core/App.zan=1"
+  "packages/Zan.Gui/src/Gui/Widget/Layer.zan=2"
+  "packages/Zan.Gui/src/Gui/Widget/Wizard.zan=2"
 )
 
 set(_skip_files
   "packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebView2.zan"
 )
 
-file(GLOB_RECURSE _sources "${ROOT}/stdlib/Gui/*.zan")
+file(GLOB_RECURSE _sources "${ROOT}/packages/Zan.Gui/src/Gui/*.zan")
 
 set(_fail "")
 foreach(_f ${_sources})
   file(RELATIVE_PATH _rel "${ROOT}" "${_f}")
-  if(_rel MATCHES "^stdlib/Gui/Backend/")
+  if(_rel MATCHES "^packages/Zan.Gui/src/Gui/Backend/")
     continue()
   endif()
   if(_rel IN_LIST _skip_files)
     continue()
   endif()
-  if(_rel STREQUAL "stdlib/Gui/Theme.zan" OR _rel STREQUAL "stdlib/Gui/Style.zan"
-     OR _rel STREQUAL "stdlib/Gui/StyleBox.zan" OR _rel STREQUAL "stdlib/Gui/Fx.zan"
-     OR _rel STREQUAL "stdlib/Gui/EditorPalette.zan")
+  if(_rel STREQUAL "packages/Zan.Gui/src/Gui/Styling/Theme.zan" OR _rel STREQUAL "packages/Zan.Gui/src/Gui/Styling/Style.zan"
+     OR _rel STREQUAL "packages/Zan.Gui/src/Gui/Styling/StyleBox.zan" OR _rel STREQUAL "packages/Zan.Gui/src/Gui/Rendering/Fx.zan"
+     OR _rel STREQUAL "packages/Zan.Gui/src/Gui/Component/EditorPalette.zan")
     continue()
   endif()
   file(STRINGS "${_f}" _lines ENCODING UTF-8)
@@ -85,7 +84,7 @@ if(_fail)
   foreach(_o ${_fail})
     message("  ${_o}")
   endforeach()
-  message(FATAL_ERROR "new raw color literals in stdlib/Gui")
+  message(FATAL_ERROR "new raw color literals in packages/Zan.Gui/src/Gui")
 endif()
 
 message("RAW_COLOR_BUDGET_OK")

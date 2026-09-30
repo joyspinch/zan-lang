@@ -1,6 +1,6 @@
 # Gui.Designer
 
-> 源码: `stdlib/Gui/Designer/DesignExport.zan`, `stdlib/Gui/Designer/Designer.Form.zan`, `stdlib/Gui/Designer/Designer.Html.zan`, `stdlib/Gui/Designer/Designer.Inspector.zan`, `stdlib/Gui/Designer/Designer.zan`
+> 源码: `packages/Zan.Gui/src/Gui/Designer/DesignExport.zan`, `packages/Zan.Gui/src/Gui/Designer/Designer.Form.zan`, `packages/Zan.Gui/src/Gui/Designer/Designer.Html.zan`, `packages/Zan.Gui/src/Gui/Designer/Designer.Inspector.zan`, `packages/Zan.Gui/src/Gui/Designer/Designer.zan`
 
 
 ## DesignExport (class)

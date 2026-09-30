@@ -14,7 +14,7 @@ function Fail([string]$mark, [string]$message) {
     exit 1
 }
 
-$guiDir = Join-Path $root "stdlib\Gui\drivers\win-x64"
+$guiDir = Join-Path $root "packages\Zan.Gui\src\Gui\drivers\win-x64"
 $sqliteDir = Join-Path $root "stdlib\System\Data\Sqlite\drivers\win-x64"
 $guiStatic = Join-Path $guiDir "static"
 $sqliteStatic = Join-Path $sqliteDir "static"

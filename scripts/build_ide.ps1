@@ -64,7 +64,7 @@ $clangDir = Split-Path -Parent $clangExe
 # resources (that is how ide.css and topics.json used to need disk copies).
 # The 'ide' group is filtered to *.css because assets\ also holds docs\.
 & powershell -ExecutionPolicy Bypass -File scripts\gen_embed.ps1 `
-    -Group "stdlib\Gui\skins=skins;src\ide_zan\assets\docs=docs;src\ide_zan\assets=ide:*.css" `
+    -Group "packages\Zan.Gui\src\Gui\skins=skins;src\ide_zan\assets\docs=docs;src\ide_zan\assets=ide:*.css" `
     -OutC build\embed_gen.c -OutO build\embed_gen.o -Clang $clangExe
 if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_GEN_FAILED"; exit 1 }
 
@@ -79,7 +79,7 @@ $files = @()
 $files += (Get-ChildItem src\ide_zan\*.zan -Recurse).FullName
 # The GUI stdlib is namespaced across subfolders (Gui root + Widget /
 # Component / Designer); recurse so every part is compiled.
-$files += (Get-ChildItem stdlib\Gui -Recurse -Include *.zan).FullName
+$files += (Get-ChildItem packages\Zan.Gui\src\Gui -Recurse -Include *.zan).FullName
 if (Test-Path packages\Zan.Gui.Charts) {
     $files += (Get-ChildItem packages\Zan.Gui.Charts\src -Recurse -Include *.zan).FullName
 }

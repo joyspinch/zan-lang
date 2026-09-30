@@ -39,7 +39,7 @@ endforeach()
 
 if(_offences)
   message("A GUI example or template draws widget internals itself.")
-  message("Move the drawing into the component (stdlib/Gui/...) and let the")
+  message("Move the drawing into the component (packages/Zan.Gui/src/Gui/...) and let the")
   message("example only instantiate it, configure it and feed it data:")
   foreach(_o ${_offences})
     message("  ${_o}")

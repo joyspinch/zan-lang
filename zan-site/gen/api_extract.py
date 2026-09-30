@@ -481,7 +481,7 @@ class Extractor:
 
     def ns_of(self, stack, file_ns):
         """命名空间计算；无显式 namespace 且无块 ns 时按目录推断
-        （stdlib/Gui/ChildWindow.zan 这类文件 → Gui）。"""
+        （packages/Zan.Gui/src/Gui/Core/ChildWindow.zan 这类文件 → Gui）。"""
         ns = file_ns
         if not ns and not stack:
             ns = self.infer_ns
@@ -510,7 +510,7 @@ class Extractor:
         toks = tokenize(text)
         rel = os.path.relpath(path, infer_root).replace("\\", "/")
         self.file_ns = ""  # 每个文件独立
-        # 目录推断命名空间：stdlib/Gui/ChildWindow.zan -> Gui（无显式 namespace 时用）
+        # 目录推断命名空间：packages/Zan.Gui/src/Gui/Core/ChildWindow.zan -> Gui（无显式 namespace 时用）
         parts = rel.split("/")
         self.infer_ns = ".".join(parts[:-1]) if len(parts) > 1 else ""
         # 记录用仓库相对路径：stdlib 文件带 stdlib/ 前缀，包文件带

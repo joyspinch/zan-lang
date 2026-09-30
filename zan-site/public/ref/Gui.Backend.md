@@ -1,6 +1,6 @@
 # Gui.Backend
 
-> 源码: `stdlib/Gui/Backend/Native.zan`, `stdlib/Gui/Backend/UiDriver.zan`, `stdlib/Gui/Backend/Win32Shell.zan`
+> 源码: `packages/Zan.Gui/src/Gui/Backend/Native.zan`, `packages/Zan.Gui/src/Gui/Backend/UiDriver.zan`, `packages/Zan.Gui/src/Gui/Backend/Win32Shell.zan`
 
 
 ## Clipboard (class)

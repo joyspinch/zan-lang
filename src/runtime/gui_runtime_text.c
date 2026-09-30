@@ -1,7 +1,7 @@
 /* gui_runtime_text.c -- text rendering (Win32 GDI / Linux Xft + fallback).
  *
  * The Win32 window shell (window class, WndProc, event queue, presentation,
- * clipboard, IME, glass) lives in Zan: stdlib/Gui/Win32Shell.zan.
+ * clipboard, IME, glass) lives in Zan: packages/Zan.Gui/src/Gui/Backend/Win32Shell.zan.
  *
  * Part of the gui_runtime translation unit: #include'd by gui_runtime.c in
  * a fixed order; not compiled standalone (preprocessor state and static
@@ -852,7 +852,7 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
 
 /* The text profiler counts GDI calls and its caches, so only the Win32 text
  * path has anything to report. Canvas.TextStat* is declared unconditionally
- * in Zan (stdlib/Gui/Render.zan), so every program touching it -- including
+ * in Zan (packages/Zan.Gui/src/Gui/Rendering/Render.zan), so every program touching it -- including
  * the GUI conformance cases -- needs the symbols to exist elsewhere too;
  * here they report "profiler off / nothing measured". */
 EXPORT void zan_gui_text_stat_enable(i32 enabled) { (void)enabled; }

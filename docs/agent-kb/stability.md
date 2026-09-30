@@ -9,9 +9,9 @@
 | 层 | 机制 | 位置 / 关键字 |
 | --- | --- | --- |
 | 原生硬崩（访问违例、堆损坏） | Windows unhandled-exception filter，写 `<exe目录>\zan_crash.log`（时间、模块+偏移、寄存器、回溯） | `src/runtime/rt_crash.h`，由 `rt_io.c` 与 `gui_runtime.c` 包含 |
-| 一帧内抛出的 Zan 异常 | `App.SafeFrame(FrameBody)`：`BeginFrame → body → PresentFrame` 包在 try 里，异常记账后丢掉这一帧并请求全量重绘 | `stdlib/Gui/App.zan`，grep `SafeFrame` |
+| 一帧内抛出的 Zan 异常 | `App.SafeFrame(FrameBody)`：`BeginFrame → body → PresentFrame` 包在 try 里，异常记账后丢掉这一帧并请求全量重绘 | `packages/Zan.Gui/src/Gui/Core/App.zan`，grep `SafeFrame` |
 | 事件分发里抛出的异常 | `App.PumpSafe()`：`ProcessEvent()` 的受保护版本，异常不再终止进程 | 同上，grep `PumpSafe` |
-| 界面错误记录 | `Gui.UiErrorLog`：内存环（最近 100 条，面板直接读）+ `<exe目录>\zan_ui_errors.log`；同一条错误按 1/2/4/8… 次落盘，避免坏帧每帧刷爆日志 | `stdlib/Gui/UiErrorLog.zan` |
+| 界面错误记录 | `Gui.UiErrorLog`：内存环（最近 100 条，面板直接读）+ `<exe目录>\zan_ui_errors.log`；同一条错误按 1/2/4/8… 次落盘，避免坏帧每帧刷爆日志 | `packages/Zan.Gui/src/Gui/Core/UiErrorLog.zan` |
 
 写自己事件循环的应用（IDE、gallery、示例）有两种接法：
 

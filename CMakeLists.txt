@@ -625,7 +625,7 @@ if(ZAN_BUILD_GUI)
         # made GUI programs fail with "undefined reference to zan_gui_*" for
         # symbols the committed bundle predated. llvm-dlltool ships with the
         # LLVM the toolchain already requires; when absent the committed
-        # stdlib/Gui/drivers/win-x64/libzan_gui.dll.a still resolves (the
+        # packages/Zan.Gui/src/Gui/drivers/win-x64/libzan_gui.dll.a still resolves (the
         # build script scripts/build_gui_driver.ps1 refreshes it).
         find_program(ZAN_LLVM_DLLTOOL llvm-dlltool)
         if(ZAN_LLVM_DLLTOOL)
@@ -1679,7 +1679,7 @@ set_tests_properties(policy_sdk_wechat PROPERTIES TIMEOUT 120)
 
 # A conformance case that uses the Gui namespace reaches the
 # [DllImport("zan_gui")] exports, so it must link the library this build just
-# produced: the driver bundle committed under stdlib/Gui/drivers/ lags behind
+# produced: the driver bundle committed under packages/Zan.Gui/src/Gui/drivers/ lags behind
 # newly added exports (the tests/gui/* cases below pass --driver-dir for the
 # same reason). Which cases those are is read from the sources rather than
 # guessed from their names, because Gui.Component.Chart and friends link the
@@ -1687,7 +1687,7 @@ set_tests_properties(policy_sdk_wechat PROPERTIES TIMEOUT 120)
 #
 # Only where the build output is what the linker consumes: on Windows that is
 # the GNU import library (libzan_gui.dll.a), which scripts/build_gui_driver.ps1
-# generates into stdlib/Gui/drivers/win-x64 -- the build tree holds the MSVC
+# generates into packages/Zan.Gui/src/Gui/drivers/win-x64 -- the build tree holds the MSVC
 # zan_gui.lib, which zanc's bundled GNU ld cannot read. So Windows keeps the
 # bundled lookup and the driver script stays the step that refreshes it.
 set(_gui_driver_args "")
@@ -2333,7 +2333,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       # only the non-auto-included Stack.zan is passed explicitly here.
       # --driver-dir: link the freshly built zan_gui, not the committed
       # driver bundle (which may lag behind newly added native exports).
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Layout/Stack.zan${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Layout/Stack.zan${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_stack.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_stack${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2344,7 +2344,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/tabs_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Widget/Tabs.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Widget/Tabs.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_tabs.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_tabs${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2356,7 +2356,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/dynamictags_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Widget/DynamicTags.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Widget/DynamicTags.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_dynamictags.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_dynamictags${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2465,7 +2465,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/virtuallist_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Widget/VirtualList.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Widget/VirtualList.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_virtuallist.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_virtuallist${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2501,7 +2501,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/icon_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Media/Icon.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Media/Icon.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_icon.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_icon${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2798,7 +2798,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/text_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Text/Text.zan${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Text/Text.zan${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_text.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_text${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -3543,7 +3543,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/css_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Styling/Css.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/Styling/StyleSheet.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/Styling/StyleBox.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Styling/Css.zan;${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Styling/StyleSheet.zan;${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Styling/StyleBox.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_css.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_css${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)

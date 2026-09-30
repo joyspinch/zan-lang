@@ -1,6 +1,6 @@
 # Gui.Animation
 
-> 源码: `stdlib/Gui/Animation/Easing.zan`, `stdlib/Gui/Animation/SpriteAnimator.zan`, `stdlib/Gui/Animation/Timeline.zan`, `stdlib/Gui/Animation/Tween.zan`
+> 源码: `packages/Zan.Gui/src/Gui/Animation/Easing.zan`, `packages/Zan.Gui/src/Gui/Animation/SpriteAnimator.zan`, `packages/Zan.Gui/src/Gui/Animation/Timeline.zan`, `packages/Zan.Gui/src/Gui/Animation/Tween.zan`
 
 
 ## EaseType (class)

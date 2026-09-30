@@ -464,9 +464,10 @@ db.Close();
 - byte[]readPacket()
   - 读取一个协议数据包，返回其有效载荷，
     长度记录在 <c>lastLen</c>；连接关闭时返回 null。
+    支持 MySQL 协议大于 16MB (0xFFFFFF) 的多包分片流式拼装。
 
 - int writePacket(string payload, int len, int seq)
-  - 写入一个协议数据包（4 字节包头 + 有效载荷）。
+  - 写入一个协议数据包（4 字节包头 + 有效载荷）。超 16MB 时按 MySQL 规范自动分片。
 
 - bool isEof(byte[]pkt)
   - 将缓冲区中的 <paramref name="len"/> 字节复制到新的

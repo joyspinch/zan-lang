@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the self-contained static Linux GUI driver archive
-#   stdlib/Gui/drivers/<target>/static/libzan_gui.a
+#   packages/Zan.Gui/src/Gui/drivers/<target>/static/libzan_gui.a
 # that zanc links into --target linux-{x64,arm64} GUI builds.
 #
 # The archive is: gui_runtime.c compiled as a single translation unit
@@ -29,7 +29,7 @@ case "$TARGET" in
 esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="$ROOT/stdlib/Gui/drivers/$TARGET/static"
+DEST="$ROOT/packages/Zan.Gui/src/Gui/drivers/$TARGET/static"
 WORK="$ROOT/build/linux_gui_drivers_$ARCH_SUFFIX"
 mkdir -p "$DEST" "$WORK"
 

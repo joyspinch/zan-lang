@@ -21,7 +21,7 @@ param(
     # "<dir>=<prefix>" or "<dir>=<prefix>:<wildcard>", several separated by
     # ';' -- pass them as ONE argument, because `powershell -File` hands every
     # token to the next positional parameter instead of building an array:
-    #   -Group "stdlib\Gui\skins=skins;src\ide_zan\assets=ide:*.css"
+    #   -Group "packages\Zan.Gui\src\Gui\skins=skins;src\ide_zan\assets=ide:*.css"
     [string[]]$Group = @(),
     [string]$Root = "",                            # single group: directory to embed
     [string]$Prefix = "",                          # single group: name prefix, e.g. "skins"

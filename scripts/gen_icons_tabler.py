@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate stdlib/Gui/icons/tabler.json — the curated Tabler icon pack for
+"""Generate packages/Zan.Gui/src/Gui/icons/tabler.json — the curated Tabler icon pack for
 Gui.IconSvgData.
 
 Selection: a hand-picked core list of everyday app-UI names is always kept
@@ -16,7 +16,7 @@ wrapper hardcode the viewBox.
 
 Usage:
     python scripts/gen_icons_tabler.py --count 1000 \
-        --out stdlib/Gui/icons/tabler.json
+        --out packages/Zan.Gui/src/Gui/icons/tabler.json
 
 Tabler Icons is MIT licensed: https://github.com/tabler/tabler-icons
 """
@@ -152,7 +152,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--count", type=int, default=1000)
     ap.add_argument("--family-cap", type=int, default=8)
-    ap.add_argument("--out", default="stdlib/Gui/icons/tabler.json")
+    ap.add_argument("--out", default="packages/Zan.Gui/src/Gui/icons/tabler.json")
     args = ap.parse_args()
 
     col = fetch_json(f"{API}/collection?prefix=tabler")

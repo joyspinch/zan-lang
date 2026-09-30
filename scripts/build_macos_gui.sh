@@ -3,7 +3,7 @@
 #
 # This is the one driver that can only be built on macOS: it is Objective-C
 # against Cocoa/WebKit. `zanc --target macos-*` cross links GUI programs
-# against the copy committed under stdlib/Gui/drivers/, so any newly added
+# against the copy committed under packages/Zan.Gui/src/Gui/drivers/, so any newly added
 # zan_gui_* export only becomes usable after this script has refreshed it --
 # it is the same command the drivers workflow runs (.github/workflows/
 # drivers.yml, "Stage zan_gui driver"), kept here so it can be run by hand.
@@ -23,7 +23,7 @@ want="${1:-both}"
 build() {
     target="$1"
     arch_flag="$2"
-    dest="stdlib/Gui/drivers/$target"
+    dest="packages/Zan.Gui/src/Gui/drivers/$target"
     mkdir -p "$dest"
     # shellcheck disable=SC2086
     xcrun clang -O2 -fPIC -dynamiclib $arch_flag -mmacosx-version-min=11.0 \

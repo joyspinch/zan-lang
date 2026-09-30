@@ -1,6 +1,6 @@
 # Gui.Component
 
-> 源码: `packages/Zan.Gui.CodeEditor/src/Gui/Component/ChatView.zan`, `packages/Zan.Gui.CodeEditor/src/Gui/Component/ConsoleView.zan`, `stdlib/Gui/Component/Dock.zan`, `stdlib/Gui/Component/EditorPalette.zan`, `stdlib/Gui/Component/FilePicker.zan`, `stdlib/Gui/Component/FileTree.zan`, `stdlib/Gui/Component/GraphView.zan`, `stdlib/Gui/Component/LogView.zan`, `stdlib/Gui/Component/PropertyGrid.zan`, `stdlib/Gui/Component/Ribbon.zan`, `stdlib/Gui/Component/SessionList.zan`
+> 源码: `packages/Zan.Gui.CodeEditor/src/Gui/Component/ChatView.zan`, `packages/Zan.Gui.CodeEditor/src/Gui/Component/ConsoleView.zan`, `packages/Zan.Gui/src/Gui/Component/Dock.zan`, `packages/Zan.Gui/src/Gui/Component/EditorPalette.zan`, `packages/Zan.Gui/src/Gui/Component/FilePicker.zan`, `packages/Zan.Gui/src/Gui/Component/FileTree.zan`, `packages/Zan.Gui/src/Gui/Component/GraphView.zan`, `packages/Zan.Gui/src/Gui/Component/LogView.zan`, `packages/Zan.Gui/src/Gui/Component/PropertyGrid.zan`, `packages/Zan.Gui/src/Gui/Component/Ribbon.zan`, `packages/Zan.Gui/src/Gui/Component/SessionList.zan`
 
 
 ## ChatBubble (class)

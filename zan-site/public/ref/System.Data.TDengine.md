@@ -52,6 +52,14 @@ db.Close();
 
 - int affected;
 
+- bool busy;
+
+- List<AsyncGate> waiters;
+
+- async bool AcquireLock()
+
+- void ReleaseLock()
+
 - TDengineConnection()
   - 私有构造；统一经 `Open`/`OpenToken`/
     `OpenAsync` 创建。
@@ -182,7 +190,7 @@ db.Close();
 
 - async DbResult QueryAsync(string sql)
   - 查询，不阻塞 worker 线程。失败时抛出
-    `DbException`。
+    `DbException`。由 AsyncGate 保证单连接互斥。
 
 - async DbResult QueryAsync(string sql, DbParams prms)
   - 参数化查询，不阻塞 worker 线程。占位符个数
@@ -190,7 +198,7 @@ db.Close();
 
 - async int ExecuteAsync(string sql)
   - 执行语句，不阻塞 worker 线程。失败时抛出
-    `DbException`。
+    `DbException`。由 AsyncGate 保证单连接互斥。
 
 - async int ExecuteAsync(string sql, DbParams prms)
   - 执行参数化语句，不阻塞 worker 线程。失败时
@@ -234,8 +242,7 @@ db.Close();
   - 打开时 adapter 正常响应（凭据校验通过）且未调用 Close。
 
 - void Close()
-  - 释放连接状态。REST 协议是无状态的，因此
-    不会向服务器发送任何内容。
+  - 释放连接状态。安全释放互斥门控并唤醒所有等待者。
 
 - int GetProvider()
   - 返回 provider id（DbProvider.TDengine）。

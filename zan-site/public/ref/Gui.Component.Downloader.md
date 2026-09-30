@@ -1,6 +1,6 @@
 # Gui.Component.Downloader
 
-> 源码: `stdlib/Gui/Component/Downloader/DownloadDialog.zan`
+> 源码: `packages/Zan.Gui/src/Gui/Component/Downloader/DownloadDialog.zan`
 
 
 ## DownloadDialog (class)

@@ -31,7 +31,7 @@
 - 缺口：改动 → **自动选层级** → 跑 → 结构化解析结果 → 失败自动喂回诊断上下文。
   规则已经明确（见 [testing.md](testing.md)），只是没自动化。
 - 落地：IDE"验证"命令：按改动路径推层级（改 `src/compiler` → standard；改
-  `stdlib/Gui` → standard + gallery；改 `templates` → e2e_pipeline），
+  `packages/Zan.Gui/src/Gui` → standard + gallery；改 `templates` → e2e_pipeline），
   串行调度（避免共享 `zanc.exe` 与桌面资源冲突），把失败用例、诊断、日志直接
   变成可点击的结构化条目。
 

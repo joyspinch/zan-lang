@@ -82,9 +82,9 @@ _scratch\probe.exe
 
 | 位置 | 错误写法 | 正确写法 | 说明 |
 | --- | --- | --- | --- |
-| `stdlib/Gui/Widget/CodeBlock.zan` | `app.theme.surface` | `app.theme.bgSecondary` | Theme 没有 `surface` |
-| `stdlib/Gui/Widget/Label.zan` | `app.theme.windowW` | `app.canvas.Width()` | 窗口宽度不在 Theme 上 |
-| `stdlib/Gui/Component/DataTable/DataTable.Compute.zan` | `dispRows[i].level` | 经 `groups[gi].level` 查 | 层级在分组行上，不在显示行上 |
+| `packages/Zan.Gui/src/Gui/Widget/CodeBlock.zan` | `app.theme.surface` | `app.theme.bgSecondary` | Theme 没有 `surface` |
+| `packages/Zan.Gui/src/Gui/Widget/Label.zan` | `app.theme.windowW` | `app.canvas.Width()` | 窗口宽度不在 Theme 上 |
+| `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Compute.zan` | `dispRows[i].level` | 经 `groups[gi].level` 查 | 层级在分组行上，不在显示行上 |
 | `templates/server/server-iot/.../Routes.gen.zan` | `.Group("iot")` / `.Rank(9)` | `.Meta("Group","iot")` / `.Meta("Rank","9")` | `Route` 没有这两个方法，元数据走 `Meta` |
 
 **教训**：静默降级（返回 0/null/空串）是最贵的"容错"。宁可编译期报错。

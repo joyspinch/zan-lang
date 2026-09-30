@@ -845,7 +845,7 @@ EXPORT void zan_gui_sleep_ms(i32 ms) {
 }
 
 /* libc compatibility shim for the bundled static X11 archive
- * (stdlib/Gui/drivers/linux-x64/static/libzan_gui.a). Its Xlib objects were
+ * (packages/Zan.Gui/src/Gui/drivers/linux-x64/static/libzan_gui.a). Its Xlib objects were
  * compiled against a libc that has issetugid() (musl/BSD); glibc before 2.41
  * does not, so statically linking the font/locale part of Xlib fails with
  * "undefined reference to issetugid". Weak, so a libc that does define it

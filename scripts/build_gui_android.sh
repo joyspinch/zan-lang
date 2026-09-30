@@ -35,9 +35,9 @@ build () { # arch triple sdllib drvdir
   "$NDK/${triple}-clang" -fPIC -shared -g0 -o "$OUT/libzan_gui_${arch}.so" \
     "$OUT/gui_${arch}.o" \
     -L"$sdllib" -lSDL3 -L"$OUT" -lfreetype_${arch} -llog -lm
-  mkdir -p "$REPO/stdlib/Gui/drivers/$drvdir"
-  cp -f "$OUT/libzan_gui_${arch}.so" "$REPO/stdlib/Gui/drivers/$drvdir/libzan_gui.so"
-  echo "== $arch: staged -> stdlib/Gui/drivers/$drvdir/libzan_gui.so"
+  mkdir -p "$REPO/packages/Zan.Gui/src/Gui/drivers/$drvdir"
+  cp -f "$OUT/libzan_gui_${arch}.so" "$REPO/packages/Zan.Gui/src/Gui/drivers/$drvdir/libzan_gui.so"
+  echo "== $arch: staged -> packages/Zan.Gui/src/Gui/drivers/$drvdir/libzan_gui.so"
 }
 
 case "${1:-all}" in

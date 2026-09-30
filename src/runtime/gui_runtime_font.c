@@ -1119,7 +1119,7 @@ EXPORT i32 zan_gui_font_ascent(i32 font_size) {
 #endif /* software bitmap text */
 
 /* Icon glyphs are drawn in Zan, as vector primitives on top of the Canvas
- * line/rect/circle/sector calls: stdlib/Gui/IconVector.zan. */
+ * line/rect/circle/sector calls: packages/Zan.Gui/src/Gui/Media/IconVector.zan. */
 
 #if defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
 /* ---- window management (EWMH / Xlib) ---- */

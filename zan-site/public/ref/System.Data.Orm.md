@@ -203,6 +203,13 @@ SQL 文本由 `QueryBuilder` 生成 —— 调用方只描述
 - DbTableQuery OrderByDesc(string column)
   - 降序排序。
 
+- DbTableQuery OrderBySafe(string column, List<string> allowed)
+  - 白名单版排序（升序）：allowed 之外的列一律抛异常。
+    排序列无法参数化，可能来自用户输入（?sort=）时必须持单。
+
+- DbTableQuery OrderBySafeDesc(string column, List<string> allowed)
+  - 白名单版排序（降序）。
+
 - DbTableQuery Limit(int count)
   - 最多读多少行。
 
@@ -555,6 +562,13 @@ NOT NULL / PRIMARY KEY / DEFAULT 等后缀）。用一个实体代替并行的
 
 - ModelQuery OrderByDescending(string column)
   - `OrderByDesc` 的别名。
+
+- ModelQuery OrderBySafe(string column, List<string> allowed)
+  - 白名单版排序（升序）：allowed 之外的列一律抛异常。
+    排序列无法参数化，可能来自用户输入（?sort=）时必须持单。
+
+- ModelQuery OrderBySafeDesc(string column, List<string> allowed)
+  - 白名单版排序（降序）。
 
 - ModelQuery WhereLike(string column, string pattern)
   - 添加 `column LIKE ?`，使用绑定模式。
@@ -1310,6 +1324,15 @@ Only/Skip 决定的列集合在运行期成形，upsert 子句按方言拼装。
 - void OBD(string col)
   - ORDER BY 追加一列（降序）。
 
+- void OrderBySafe(string col)
+  - ORDER BY 白名单版（升序）：列名必须属于本实体
+    （`RequireCol` 同款校验，未知列抛异常）。ORDER BY
+    无法参数化——排序列进的是 SQL 文本，可能来自用户输入（?sort=）
+    的列一律走这里，让实体元数据做白名单。
+
+- void OrderBySafeDesc(string col)
+  - ORDER BY 白名单版（降序）。
+
 - void GB(string col)
   - GROUP BY 单列。
 
@@ -1774,6 +1797,19 @@ db.Execute(sql, qb.InsertParams());
 
 - QueryBuilder OrderByDesc(string column)
   - 设置 ORDER BY DESC 子句（列名已做标识符校验）。
+
+- static void CheckAllowed(string column, List<string> allowed)
+  - 列名必须精确命中调用方提供的白名单；未命中抛异常。
+
+- QueryBuilder OrderBySafe(string column, List<string> allowed)
+  - 白名单版 ORDER BY：列名必须命中 allowed（精确匹配）
+    且是安全标识符，否则抛异常。RequireIdent 挡住注入语法，但挡不住
+    "合法但未授权"的列——排序既能被攻击者当布尔预言机（按保密列
+    排序观察顺序差），也能放大误差泄密；ORDER BY 无法参数化，可能
+    来自用户输入（?sort=）的排序列必须持单。
+
+- QueryBuilder OrderBySafeDesc(string column, List<string> allowed)
+  - 白名单版 ORDER BY DESC。
 
 - QueryBuilder GroupBy(string column)
   - 设置 GROUP BY 子句（列名已做标识符校验）。

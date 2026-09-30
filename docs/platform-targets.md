@@ -71,7 +71,7 @@ because it is the same code path a normal `zanc` invocation on that OS takes.
 |------------------------------------|--------------------------------------------------------------------|-----------------------------------|
 | `linux-x64` / `linux-musl` / `linux-arm64` / `riscv64` | `ld.lld -static` + bundled musl sysroot `<zanc>/{linux-musl,linux-arm64,linux-riscv64}` → a dependency-free static ELF. | **None** — async-socket (`zanrt_io.o`) *and* the sync runtime (`zanrt_sync.o`: `AtomicInt`/`SharedTable`) are both linked in. "Build on Windows/macOS → upload → run on Linux" just works. |
 | `win-x64` / `win-arm64`            | `ld.lld` MinGW driver + bundled `win-<arch>/mingw/lib`; PE output. | Async-socket (`zanrt_io.o` / `zanrt_io_mt.o`), sync runtime (`zanrt_sync.o`), timer (`zanrt_timer.o`) and embed-API (`zan_embed_api.o`) objects are staged at `win-<arch>/` and linked on demand — no remaining cross restriction. Objects are maintained by `scripts/build_win_rt.sh` and refreshed by the drivers workflow. |
-| `macos-x64` / `macos-arm64`        | `ld64.lld -arch <arch> -platform_version macos 11.0` + bundled `macos/libSystem.tbd` (MIT symbol stub; no Apple SDK redistributed) + the Mach-O runtime objects in `macos/<arch>/` for async/atomics; Mach-O output linking `-lSystem` plus, for GUI programs, the prebuilt `stdlib/Gui/drivers/macos-<arch>/libzan_gui.dylib` (`@rpath` install name; its own Cocoa/WebKit dependencies bind on the target Mac, so no framework stubs are needed here). arm64 output is ad-hoc code-signed by the linker (`LC_CODE_SIGNATURE`, `CS_ADHOC|CS_LINKER_SIGNED`), which is what Apple Silicon requires to execute it at all. | Async-socket, `AtomicInt`/`SharedTable` and Cocoa GUI all link. Both `macos-arm64` and `macos-x64` GUI dylibs are committed. Nothing here has been run on a real Mac — verification stops at "links + correct Mach-O/signature structure". Developer ID signing/notarization is a separate, not-yet-implemented step needed only for distribution. |
+| `macos-x64` / `macos-arm64`        | `ld64.lld -arch <arch> -platform_version macos 11.0` + bundled `macos/libSystem.tbd` (MIT symbol stub; no Apple SDK redistributed) + the Mach-O runtime objects in `macos/<arch>/` for async/atomics; Mach-O output linking `-lSystem` plus, for GUI programs, the prebuilt `packages/Zan.Gui/src/Gui/drivers/macos-<arch>/libzan_gui.dylib` (`@rpath` install name; its own Cocoa/WebKit dependencies bind on the target Mac, so no framework stubs are needed here). arm64 output is ad-hoc code-signed by the linker (`LC_CODE_SIGNATURE`, `CS_ADHOC|CS_LINKER_SIGNED`), which is what Apple Silicon requires to execute it at all. | Async-socket, `AtomicInt`/`SharedTable` and Cocoa GUI all link. Both `macos-arm64` and `macos-x64` GUI dylibs are committed. Nothing here has been run on a real Mac — verification stops at "links + correct Mach-O/signature structure". Developer ID signing/notarization is a separate, not-yet-implemented step needed only for distribution. |
 | `wasm32` (WASI)                    | `wasm-ld` + bundled wasm32 sysroot (`crt1.o`); WASI command module. | **No async-socket**; single-threaded WASI model; try/catch works (WebAssembly EH, see §4). |
 | `ios-arm64`                        | `ld64.lld -arch arm64 -platform_version ios 14.0 14.0 -adhoc_codesign` + bundled `ios/libSystem.tbd` + runtime objects in `ios/arm64/`; outputs Mach-O ARM64 binary or packages directly into `.ipa` (`--emit-ipa` or `-o <name>.ipa`) with `Payload/<App>.app/` bundle structure, `Info.plist`, `PkgInfo`, and Ad-hoc code signing. | CLI and async-socket runtime supported out of the box. Installable on iOS via TrollStore, jailbreak devices, or sideloading tools (AltStore/Sideloadly) without requiring Apple developer certificates. |
 
@@ -146,7 +146,7 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
 - `src/runtime/gui_runtime_mac.m` is Objective-C against Cocoa/CoreText/QuartzCore/
   IOSurface/WebKit headers, which only the Apple SDK provides, so it is built on a
   Mac by `.github/workflows/drivers.yml` and the resulting `libzan_gui.dylib` is
-  committed under `stdlib/Gui/drivers/macos-<arch>/`.
+  committed under `packages/Zan.Gui/src/Gui/drivers/macos-<arch>/`.
 - **No framework `.tbd` stubs are needed.** Because that dylib is a *dynamic*
   library with an `@rpath` install name, the cross link only resolves
   `_zan_gui_*` against it; its Cocoa/WebKit imports are bound by dyld on the target
@@ -179,7 +179,7 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   RESUME/FOCUS) into the event loop (kind 7 attach / kind 8 close / kind 12
   pause-resume), translates `AInputQueue` touch into pointer events, and
   presents the CPU surface through EGL (RGBA texture upload with dirty-rect
-  subimage, BGRA-swap shader, `eglSwapBuffers`). `stdlib/Gui/drivers/
+  subimage, BGRA-swap shader, `eglSwapBuffers`). `packages/Zan.Gui/src/Gui/drivers/
   android-{x64,arm64}/` ship the static `libzan_gui.a` (FreeType baked in)
   that `zanc` links into the emitted `libmain.so`; the APK shell
   (`toolchain/apk-shell/`, `android.app.NativeActivity` +
@@ -322,7 +322,7 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   while instantiate + font mount happen). Fonts must be mounted into the
   worker's in-memory FS pre-start (`/fonts/ui.ttf` + the 6 MB `/fonts/cjk.ttf`
   subset, shipped as pieces like the engine) or every CJK glyph renders "?".
-- **Package size**: a GUI engine wasm is ~14 MB (`stdlib/Gui` + FreeType +
+- **Package size**: a GUI engine wasm is ~14 MB (`packages/Zan.Gui/src/Gui` + FreeType +
   font data), while a mini-game **main package caps at 4 MB** and a single
   `.wasm` cannot be split across subpackages. The shipping shape is therefore
   CDN/asset download into `USER_DATA_PATH` at first run (pieces reassembled

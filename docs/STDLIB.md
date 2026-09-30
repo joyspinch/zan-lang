@@ -24,7 +24,7 @@ target (named after the cross-compile toolchain, see `zan_driver_subdir` in
 `src/compiler/main.c`):
 
 ```
-stdlib/Gui/drivers/           # GUI native driver (zan_gui)
+packages/Zan.Gui/src/Gui/drivers/           # GUI native driver (zan_gui)
 ├── driver.manifest           # one `-l` basename per line, e.g. "zan_gui"
 ├── win-x64/                  # zan_gui.dll + import lib + WebView2 loader
 ├── win-arm64/
@@ -656,7 +656,7 @@ subdirectory:
    (`win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `linux-riscv64`,
    `macos-x64`, `macos-arm64` — matching the cross-compile toolchain names).
 3. Native code is called from Zan through `[DllImport]`/`extern` declarations
-   (e.g. `stdlib/Gui/Backend/Win32Shell.zan`); the driver DLL/SO is loaded at
+   (e.g. `packages/Zan.Gui/src/Gui/Backend/Win32Shell.zan`); the driver DLL/SO is loaded at
    runtime.
 4. On `--publish`, the manifest's libraries are copied next to the output
    executable (`--link-mode shared`, the default) or folded in where a static

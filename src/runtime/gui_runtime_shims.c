@@ -15,7 +15,7 @@
  * macOS (gui_runtime_mac.m, ZAN_GUI_COCOA): a WKWebView subview of the
  * window's content view; Android (gui_runtime_android.c, __ANDROID__): a
  * system WebView overlaid by the APK shell's Java bridge (org.zan.app.ZanWeb).
- * Windows drives Edge WebView2 from Zan itself (stdlib/Gui/WebView2.zan,
+ * Windows drives Edge WebView2 from Zan itself (packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebView2.zan,
  * straight against its COM interfaces) and every other platform takes
  * WebViewBackend's own fallback, so neither references these exports. Only a
  * macOS build that opts out of the Cocoa backend (the SDL windowing shell)

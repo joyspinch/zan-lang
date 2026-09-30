@@ -4,7 +4,7 @@ endif()
 file(TO_CMAKE_PATH "${ROOT}" ROOT)
 # 控件注册收编后，名单与构造分支住在 ControlBootstrap（安装进
 # HeavyControls）；ControlFactory 只做转发，策略改查 ControlBootstrap。
-set(factory "${ROOT}/stdlib/Gui/Core/ControlBootstrap.zan")
+set(factory "${ROOT}/packages/Zan.Gui/src/Gui/Core/ControlBootstrap.zan")
 if(NOT EXISTS "${factory}")
   message(FATAL_ERROR "control factory is missing: ${factory}")
 endif()
@@ -53,7 +53,7 @@ if(NOT "${sorted_kinds}" STREQUAL "${sorted_create}")
 endif()
 
 file(GLOB_RECURSE zan_files LIST_DIRECTORIES false
-  "${ROOT}/stdlib/Gui/*.zan"
+  "${ROOT}/packages/Zan.Gui/src/Gui/*.zan"
   "${ROOT}/packages/*.zan")
 set(kind_labels "")
 list(LENGTH create_classes class_count)
@@ -109,7 +109,7 @@ if(last_class GREATER_EQUAL 0)
 endif()
 # 拉入收编策略：ControlFactory 自身不得再内联任何控件构造分支，
 # 否则每个分支名都是活标识符，按需拉取会把全部控件拖进编译图。
-file(READ "${ROOT}/stdlib/Gui/Core/ControlFactory.zan" factory_source)
+file(READ "${ROOT}/packages/Zan.Gui/src/Gui/Core/ControlFactory.zan" factory_source)
 string(REGEX MATCH "return[ ]+new[ ]+" inlined "${factory_source}")
 if(inlined)
   message(FATAL_ERROR

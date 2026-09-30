@@ -18,7 +18,7 @@ Usage:
     python scripts/chart_gap_audit.py --markdown out.md
 
 Requires no ECharts checkout: it compares the corpus already committed under
-``examples/gui_charts/options`` against ``stdlib/Gui/Component/Chart``.
+``examples/gui_charts/options`` against ``packages/Zan.Gui.Charts/src/Gui/Component/Chart``.
 """
 import argparse
 import collections

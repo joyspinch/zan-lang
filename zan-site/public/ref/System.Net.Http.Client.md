@@ -425,9 +425,9 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
 - string BuildRequest(string method, string path, string body, bool close)
   - BuildRequestHead 加上文本正文（一次性通道用）。
 
-- string BuildDownloadRequest(string path, int have)
+- string BuildDownloadRequest(string path, long have)
   - 下载请求沿用统一 method/host/path/header 注入校验，只额外插入
-    Range 字段；Range 不从调用方原文拼接进请求行。
+    Range 字段；Range 不从调用方原文拼接进请求行，支持 64 位大文件断点。
 
 - void AbsorbCookies(string path, string raw)
   - 把响应里的 Set-Cookie 交给存储。未启用 cookie 时什么都不做，
@@ -713,15 +713,19 @@ HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
     不走 HttpResponse.Parse（头部与正文共享一次手写读取），重定向
     的 Location 就在这里解析。
 
+- static long HeaderLong(string head, string lowerName)
+  - 读取 64 位整数值的响应头（大小写不敏感，从行首匹配），
+    例如 HeaderLong(head, "content-length")。不存在时返回 0。
+
 - static int HeaderInt(string head, string lowerName)
   - 读取整数值的响应头（大小写不敏感，从行首匹配），
     例如 HeaderInt(head, "content-length")。不存在时返回 0。
 
-- static int RangeTotal(string head)
+- static long RangeTotal(string head)
   - 从 "Content-Range: bytes X-Y/Z" 头取得资源总大小（Z 值），
-    无该头时返回 0。
+    无该头时返回 0。支持 64 位大文件。
 
-- static bool RangeAlreadyComplete(string head, int have)
+- static bool RangeAlreadyComplete(string head, long have)
   - A 416 proves completion only when the server supplies an unsatisfied
     Content-Range with a known total matching the local file size.
 

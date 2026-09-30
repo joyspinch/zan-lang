@@ -34,7 +34,7 @@ build/zanc templates/game/goldminer/src/main.zan templates/game/goldminer/src/Ga
 
 界面架构
 --------
-GuiHost 版（Game.Foundation.Gui）：窗口/事件/呈现由 stdlib/Gui 原生
+GuiHost 版（Game.Foundation.Gui）：窗口/事件/呈现由 packages/Zan.Gui/src/Gui 原生
 外壳承担，不依赖 SDL。全部画面走 Canvas 直绘：
 
 - 场景层（src/main.zan 的 DrawAll）：背景、矿工、抓钩（矢量三爪钩，

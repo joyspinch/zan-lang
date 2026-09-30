@@ -235,5 +235,5 @@ c.DrawText(x, y, label, fg, font);
 * 纯透明度阴影（`Layer` 的 `0x22000000` 圈层）。
 
 新增例外时：先问一句"皮肤该不该能改它"。能改 → 走 CSS；不能改 → 留预算行 +
-代码注释。实现位置：`stdlib/Gui/{Theme,Style,StyleBox,Fx}.zan` 与
-`stdlib/Gui/skins/base.css`；测试在 `tests/run_*_budget.cmake`。
+代码注释。实现位置：`packages/Zan.Gui/src/Gui/{Theme,Style,StyleBox,Fx}.zan` 与
+`packages/Zan.Gui/src/Gui/skins/base.css`；测试在 `tests/run_*_budget.cmake`。

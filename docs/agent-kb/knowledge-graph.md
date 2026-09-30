@@ -26,8 +26,8 @@
 | `zandoc`（`src/doc`） | 文档注释、公开 API 说明 |
 | `templates/**/template.manifest` | 模板清单及其结构化元数据（type/target/category/size/sketch…） |
 | `CMakeLists.txt` + `tests/` | 测试清单、层级标签、每个测试覆盖的源文件 |
-| `stdlib/Gui/Theme.zan`、`skins/` | 主题 token 全集 |
-| `stdlib/Gui/Widget`、`Component`、`Hmi` + `PropSpec`/`ControlFactory` | 控件能力目录（可用属性、能否被设计器摆放） |
+| `packages/Zan.Gui/src/Gui/Styling/Theme.zan`、`skins/` | 主题 token 全集 |
+| `packages/Zan.Gui/src/Gui/Widget`、`Component`、`Hmi` + `PropSpec`/`ControlFactory` | 控件能力目录（可用属性、能否被设计器摆放） |
 | `docs/**` | 文档章节及它描述的符号 |
 | 项目树 + `zan.proj` | 项目结构、入口、目标平台 |
 
@@ -50,7 +50,7 @@
 
 - **搜索优先**：输入 `Gauge` 立刻定位节点，展开一跳邻居（谁定义它、谁引用它、哪个测试
   覆盖它、哪个文档写了它、哪个模板用了它）。
-- **筛选**：按类型（只看控件 / 只看模板 / 只看测试）、按模块（`stdlib/Gui` 子树）、
+- **筛选**：按类型（只看控件 / 只看模板 / 只看测试）、按模块（`packages/Zan.Gui/src/Gui` 子树）、
   按状态（只看 `stale`/`missing`）。
 - **跳转**：任意节点双击打开源码定位；关系边可显示"引用点列表"。
 - **增量刷新**：保存文件后只重算受影响子图；全量重建作为显式命令。

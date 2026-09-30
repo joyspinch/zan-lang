@@ -2,7 +2,7 @@
 
 状态：**设计稿，未实施**（A356 挂账）。方向由 owner 于 2026-09-24 确定：
 
-1. 放置类游戏 = **工具 + 皮肤**，留在 stdlib/Gui 轨，不进游戏引擎；
+1. 放置类游戏 = **工具 + 皮肤**，留在 packages/Zan.Gui/src/Gui 轨，不进游戏引擎；
 2. 工具轨缺**动画能力** → 渲染引擎整体能力增强（两轨共享）；
 3. 游戏引擎**推倒重设计**，按大类（传奇/红警/帝国/魔兽/卡牌/独立游戏）建通用基座，
    而不是在现有 Kit 上逐模板打补丁。
@@ -18,8 +18,8 @@
 | 2 | 批处理只覆盖几何与文本：rect/circle/radial 顶点批按 mode 聚合、文本有字形图集。传奇/RTS/卡牌的画面主体（成百上千图集精灵、图块）是全栈最弱原语 | `gui_gl_backend.c:857+` |
 | 3 | CanvasPrims 每帧程序化重画光晕（FillRadial 逐像素径向衰减）；SDL 时代 bake 纹理一次每帧贴图，canvas 化丢了烘焙层 | `packages/Zan.Game/src/Game/Kit/CanvasPrims.zan` |
 | 4 | Kit.SpriteBatch 是假批：计数器封装，逐图元 FFI 调 CDraw | `SpriteBatch.zan:10-60` |
-| 5 | Gui 动画能力 = `Control.Transition(ms)` 样式过渡旋钮；无时间线/缓动驱动/帧动画；游戏包的 Tween（20+ 缓动曲线）过不去工具侧 | `stdlib/Gui/Core/Control.zan:324`、`Foundation/Tween.zan` |
-| 6 | Gui 失效模型：脏区存在但一帧混请求即回退整窗重绘 | `stdlib/Gui/Core/App.zan:686`、`:2763` |
+| 5 | Gui 动画能力 = `Control.Transition(ms)` 样式过渡旋钮；无时间线/缓动驱动/帧动画；游戏包的 Tween（20+ 缓动曲线）过不去工具侧 | `packages/Zan.Gui/src/Gui/Core/Control.zan:324`、`Foundation/Tween.zan` |
+| 6 | Gui 失效模型：脏区存在但一帧混请求即回退整窗重绘 | `packages/Zan.Gui/src/Gui/Core/App.zan:686`、`:2763` |
 
 GuiHost 主循环本身健康（事件排空、定步积分、连续出帧、预算睡眠）——病在渲染
 供给，不在循环。这解释了现状的形成：放置/工具类（legend 1.8 万行、wuwei）建在
@@ -52,7 +52,7 @@ zan_gui 运行时新增三个能力，GL 与 CPU 兜底路径同步实现：
 
 ### 1.3 动画驱动器（A，工具轨缺口——放置类="工具+皮肤"的最后一块）
 
-stdlib/Gui.Core 新增 **Timeline/Animator**：
+packages/Zan.Gui/src/Gui.Core 新增 **Timeline/Animator**：
 
 - **值动画**：`Anim.From/to/duration/ease/onTick`，插值回调改控件属性；
   缓动曲线族与 `Foundation/Tween.zan` 的语义对齐（实现上提到共享处或双份对齐）。
