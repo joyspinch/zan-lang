@@ -176,6 +176,15 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   确认检测通道真的会报错，再采信"探针没报错=无罪"——探针不炸只说明被测
   代码根本没进检测路径（如包文件未进解析集），这类阴性结果才有信息量；
   没做过阴性对照的"通过"不算证据。
+- **编译健康普查必须按各程序的官方输入形态（2026-10-01 templates/examples
+  普查教训，38 项里 4 项假红全是普查方法学造的）**：伴生文件要合编
+  （gui_gallery 的 MapChinaData.zan 与 components/，gui_charts 甚至跨目录
+  借 gui_gallery 的伴生文件——见 build_charts.ps1）；html 设计稿必须
+  显式作编译输入（zanc **不**自动发现入口旁的 .html，模板 src 里的
+  App.html 也一样要传；漏了报一片 undeclared，且可能被更早的类型遮蔽
+  错掩蔽成单错）；无 Main 的教学快照库（examples/crypto_reference）按
+  "零 error 行"判绿（不链接是预期）；单文件散装示例才逐文件独立编。
+  拿不准就抄该目录 README/构建脚本的 zanc 命令行。
 - **zanc 失败退出码恒 0**：编译出错也返回 0（自身崩溃除外），脚本判定
   必须 grep 输出里的 "error"，不能只看 `$?`。另注意 stdlib 跟 zanc 的
   exe 目录走、包跟 cwd 走（向上找 zan.proj）——换 zanc 做 A/B 时包解析

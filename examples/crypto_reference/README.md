@@ -13,9 +13,13 @@ libcrypto 的 EVP 接口（AES-NI/PCLMULQDQ 硬件加速），本目录的实现
 | `AesGcmReference.zan` | AES-GCM（GHASH、GF(2^128) 右移乘法、J0=IV\|\|0^31\|\|1，96 位 IV） | `System.Security.Cryptography.AesGcm` |
 | `Sm4Reference.zan`    | SM4（GB/T 32907-2016，S 盒、τ 变换、L/L' 线性变换、32 轮），ECB/CBC | `System.Security.Cryptography.Sm4` |
 
-> 这些文件是它们被移出 stdlib 时点的快照，命名空间保持
-> `System.Security.Cryptography`，拷回 stdlib 对应路径并把 stdlib 版本
-> 的 EVP 实现换掉即可恢复纯 Zan 行为（不推荐——性能差两个数量级）。
+> 这些文件是它们被移出 stdlib 时点的快照。命名空间用 `CryptoReference`
+> （2026-10-01 起：`System.Security.Cryptography` 已随 Zan.Security 包
+> 提供同名 Aes/AesGcm/Sm4，同框即撞重声明，快照改名空间以保持可编译；
+> Hex/Bits 辅助类仍借包内实现，文件头保留对应 `using`）。要恢复纯 Zan
+> 行为：拷回包对应路径、把命名空间改回 `System.Security.Cryptography`、
+> 删掉对包内 Hex/Bits 的依赖（或一并带走），再把包版本的 EVP 实现
+> 换掉（不推荐——性能差两个数量级）。
 
 ## 为什么 stdlib 换成了 EVP
 

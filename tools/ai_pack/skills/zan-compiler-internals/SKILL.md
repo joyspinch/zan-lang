@@ -192,6 +192,26 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   豁免活名门，否则任何 codegen 驱动的包（MVC 控制器、生成器宿主）都会
   静默脱图。归因四步：无包探针 ROUTES=1 → 带包探针 __AttrRoutes 未合成 →
   垃圾探针（编译必错）证明包文件未进解析 → 活引用探针 ROUTES=1。
+- **按需拉取=死代码屏蔽罩（2026-10-01 模板普查实证）**：从未被任何编译
+  单元引用的基建文件（Zan.Game 的 GameViewport/SceneManager/BulletPool
+  等"引擎管线"批）**从不进编译集，坏了也不响**——出生即坏的多参
+  `Action<Canvas,int,int>`（仓里只有零元 Gui.Action 与一元
+  System.Linq.Action<T>，多元泛型根本不存在）潜伏三周，直到首个模板
+  （game/idle）真引用才爆。教训：① 基建批次的验证不能只编"入口程序"，
+  要有把包/库**整树拉进编译集**的健康普查（逐文件或整包合编）；
+  ② 多参回调一律声明具名委托（`delegate void BulletHitFn(int, double, ...)`
+  放消费方同命名空间），lambda 实参照常转换，别指望仓里有多元 Action。
+- **泛型实例化的同名歧义不按元数过滤（B-ID38，现行语义+绕开）**：
+  `using System; using Gui;` 下 `Action<int>` 报 ambiguous（候选零元
+  Gui.Action + 一元 System.Linq.Action<T> 全列）；裸名反而正常（零元
+  `Action` 唯一命中 Gui.Action）。绕开=使用点限定 `System.Linq.Action<int>`。
+  同族：**字段被同名导入类遮蔽**（B-ID39）——类内字段与 using 导入类同名
+  （生成字段 `Menu` vs Gui.Widget.Menu）时，`Menu.visible` 解析到类型报
+  no member，字段不可达；C# 语义是表达式语境成员优先。绕开=设计稿字段
+  改名避让（wuwei MenuRoot）。两个都是解析器缺口，根治前靠限定名/改名。
+  遮蔽错还有**诊断掩蔽**效应：它是编译前期的绑定错，一报即停——wuwei
+  漏传设计稿时类型检查期的整片 undeclared 群全被吞，唯一报错就是 463 的
+  遮蔽错；看到"只有一条成员错"别当全貌，补齐输入形态重编再看。
 - **stdlib 输入自我遮蔽坑（2026-09-16，datatable 5 例红）**：显式传入的
   stdlib 文件在 entry 循环被打 `user_decl`（本意：用户文件遮蔽 stdlib
   同名类，防冲突改名），结果它自己写全的 `DataTable.CellTextRouted` 调用头
