@@ -424,6 +424,30 @@ static bool arity_matches(const zan_ast_node_t *tr, const nr_type_t *t) {
     return decl_type_param_count(t->decl) == tr->type_ref.type_args.count;
 }
 
+/* Same as count_simple, but a reference carrying type arguments only
+ * conflicts with declarations of the same generic arity: `Action<int>` under
+ * `using System; using Gui;` has one arity-1 candidate (System.Linq.Action<T>)
+ * and one arity-0 one (Gui.Action) -- counting by name alone reported a false
+ * "ambiguous type" even though exactly one candidate can take the argument
+ * list (B-ID38). An arity-matched reference stays untouched and the binder
+ * resolves it globally, like the qualified paths above already do via
+ * arity_matches. A reference without type arguments keeps the name-based
+ * count (a bare `Action` with two imported Actions IS ambiguous, C# CS0104). */
+static int count_simple_matching(nr_ctx_t *c, zan_istr_t simple,
+                                 const zan_ast_node_t *tr) {
+    int want = tr->type_ref.type_args.count;
+    if (want == 0) return count_simple(c, simple);
+    int n = 0;
+    for (int node = c->by_simple.buckets[nr_hash(simple) & c->by_simple.mask];
+         node >= 0; node = c->by_simple.chains[node].next) {
+        int idx = c->by_simple.chains[node].idx;
+        if (ns_istr_eq(c->items[idx].simple, simple) &&
+            decl_type_param_count(c->items[idx].decl) == want)
+            n++;
+    }
+    return n;
+}
+
 static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
                         zan_istr_t ctx_ns, zan_ast_list_t *usings) {
     zan_istr_t R = tr->type_ref.name;
@@ -525,7 +549,7 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
      * namespace(s) and is ambiguous, warn the user to qualify it; otherwise
      * leave it unchanged (builtin, generic type parameter, or a unique
      * non-conflicting global/simple type the binder resolves as before). */
-    if (count_simple(c, R) >= 2 && !find_full(c, R)) {
+    if (count_simple_matching(c, R, tr) >= 2 && !find_full(c, R)) {
         zan_diag_emit(c->diag, DIAG_ERROR, tr->loc,
                       "ambiguous type '%.*s'; qualify it with its namespace",
                       (int)R.len, R.str);

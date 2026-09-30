@@ -201,17 +201,20 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   要有把包/库**整树拉进编译集**的健康普查（逐文件或整包合编）；
   ② 多参回调一律声明具名委托（`delegate void BulletHitFn(int, double, ...)`
   放消费方同命名空间），lambda 实参照常转换，别指望仓里有多元 Action。
-- **泛型实例化的同名歧义不按元数过滤（B-ID38，现行语义+绕开）**：
-  `using System; using Gui;` 下 `Action<int>` 报 ambiguous（候选零元
-  Gui.Action + 一元 System.Linq.Action<T> 全列）；裸名反而正常（零元
-  `Action` 唯一命中 Gui.Action）。绕开=使用点限定 `System.Linq.Action<int>`。
-  同族：**字段被同名导入类遮蔽**（B-ID39）——类内字段与 using 导入类同名
-  （生成字段 `Menu` vs Gui.Widget.Menu）时，`Menu.visible` 解析到类型报
-  no member，字段不可达；C# 语义是表达式语境成员优先。绕开=设计稿字段
-  改名避让（wuwei MenuRoot）。两个都是解析器缺口，根治前靠限定名/改名。
-  遮蔽错还有**诊断掩蔽**效应：它是编译前期的绑定错，一报即停——wuwei
-  漏传设计稿时类型检查期的整片 undeclared 群全被吞，唯一报错就是 463 的
-  遮蔽错；看到"只有一条成员错"别当全貌，补齐输入形态重编再看。
+- **同名类型歧义按泛型元数过滤（B-ID38，已根治）**：`using System; using Gui;`
+  下 `Action<int>` 曾误报 ambiguous——歧义判定按名全列候选（零元 Gui.Action
+  加一元 System.Linq.Action<T>，不看能不能吃下实参）。修后 nsresolve 对带
+  类型实参的引用只数同元数声明：恰一元可匹配即解析到 System.Linq.Action<T>；
+  裸名仍按名计数——两个同名零元 `Action` 双导入照报歧义（对齐 C# CS0104，
+  有意保留）。语义钉在 conformance 用例 ns_ambiguity_arity_filter。
+  同族辟谣（B-ID39 撤案）：**「字段被同名导入类遮蔽」机制不存在**——checker
+  裸名本就字段优先，生成字段 `Menu` 与 Gui.Widget.Menu 同名相安无事，插桩
+  实证传入 App.html 后原样全绿。那类 "'Menu' has no member 'visible'" 一枝
+  独秀的成员错，真因是 **zanc 不自动发现入口旁的 .html 设计稿**：漏传时
+  生成字段全部缺席，裸名 `Menu` 经"全库唯一简单名"兜底命中同名类型，报出
+  这条误导性成员错（其余 undeclared 群在 checker 静默、要等 irgen 才冒，
+  所以它独占输出）。撞到别修名字解析——先核对设计稿/生成输入在不在编译
+  输入里。
 - **stdlib 输入自我遮蔽坑（2026-09-16，datatable 5 例红）**：显式传入的
   stdlib 文件在 entry 循环被打 `user_decl`（本意：用户文件遮蔽 stdlib
   同名类，防冲突改名），结果它自己写全的 `DataTable.CellTextRouted` 调用头
