@@ -84,6 +84,25 @@ static zan_timer_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static void timer_lock(void) { pthread_mutex_lock(&g_lock); }
 static void timer_unlock(void) { pthread_mutex_unlock(&g_lock); }
 #endif
+
+/* Dispatcher identity for the DELAY wake window (see zan_timer_dispatch_due):
+ * a cross-thread cancel that loses the removed re-check race must wait the
+ * window out before its caller frees the frame, while a same-thread cancel
+ * (a coroutine cancelling itself from inside the resumed code) must NOT wait
+ * -- waiting would deadlock against our own ready() return. */
+#if defined(_WIN32)
+static unsigned long timer_self_tid(void) { return GetCurrentThreadId(); }
+static void timer_yield(void) { Sleep(1); }
+#elif defined(__wasm__) || defined(ZAN_BARE_METAL)
+static unsigned long timer_self_tid(void) { return 1; }
+static void timer_yield(void) { (void)0; }
+#else
+#include <sched.h>
+static unsigned long timer_self_tid(void) {
+    return (unsigned long)(uintptr_t)pthread_self();
+}
+static void timer_yield(void) { sched_yield(); }
+#endif
 /* The Windows C runtime's argv is decoded with the process ANSI code page,
  * whereas Zan strings and the Windows file APIs use UTF-8. Reparse the
  * original Unicode command line and retain the converted vector for process
@@ -541,6 +560,10 @@ typedef struct zan_timer_entry {
     unsigned long long sequence;
     zan_timer_kind kind;
     int removed;
+    /* The dispatcher re-read `removed == 0`, released the lock and is inside
+     * its ready() for this entry's frame. Set under the lock; a cancel that
+     * arrives after the re-read waits (cross-thread) for it to clear. */
+    int waking;
     zan_timer_callback_t callback;
     void *frame;
     zan_timer_step_t step;
@@ -560,6 +583,9 @@ static void (*g_ready_hook)(void *frame, zan_timer_step_t step);
  * longer in the heap, so the usual scan would miss it and the timer would
  * reschedule forever. Read/written under the lock. */
 static zan_timer_entry *g_dispatching;
+/* Thread id of the dispatcher while a DELAY wake window is open (waking==1
+ * on the g_dispatching entry). Under the lock. */
+static unsigned long g_dispatch_tid;
 /* Live (not removed) entries currently in the heap. Maintained on every push /
  * pop / removal so zan_timer_pending() is an O(1) unlocked read: the
  * multi-worker driver calls it once per scheduler loop iteration on every
@@ -731,6 +757,19 @@ int zan_timer_cancel_delay(void *frame) {
         g_dispatching->removed = 1;
         found++;
     }
+    /* Close the dispatch TOCTOU: between the dispatcher's removed re-read and
+     * its ready() call this cancel can interleave (multi-worker pool), and the
+     * owner contract is cancel-then-FREE -- returning now would let the frame
+     * be freed under the wake. Wait the open wake window out. Same thread
+     * needs no wait: a coroutine cancelling itself from inside the resumed
+     * code runs within our own ready(), where waiting would deadlock. */
+    while (g_dispatching && g_dispatching->kind == ZAN_TIMER_DELAY &&
+           g_dispatching->waking && g_dispatching->frame == frame &&
+           g_dispatch_tid != timer_self_tid()) {
+        timer_unlock();
+        timer_yield();
+        timer_lock();
+    }
     /* Physically purge cancelled DELAY entries instead of waiting for the
      * lazy root pop. A removed entry normally self-cleans: once its due time
      * passes it surfaces at the root and dispatch_due/next_timeout free it.
@@ -850,6 +889,13 @@ long long zan_timer_dispatch_due(void) {
             timer_lock();
             ready = g_ready_hook;
             int cancelled = entry->removed;
+            if (!cancelled) {
+                /* Claim the wake window: a cancel that interleaves after this
+                 * re-read (another thread) sees waking==1 and waits for the
+                 * tail below to clear it before its caller frees the frame. */
+                entry->waking = 1;
+                g_dispatch_tid = timer_self_tid();
+            }
             timer_unlock();
             if (!cancelled) {
                 if (ready) ready(entry->frame, entry->step);
@@ -860,6 +906,11 @@ long long zan_timer_dispatch_due(void) {
         dispatched++;
 
         timer_lock();
+        /* Close the wake claim BEFORE the entry becomes freeable below and
+         * g_dispatching moves on: a cancel waiting in its wake-window spin
+         * re-reads g_dispatching fresh and leaves the loop once waking is 0
+         * (or the pointer moved past this entry). */
+        entry->waking = 0;
         g_dispatching = prev;
         if (entry->kind == ZAN_TIMER_PUBLIC) entry->exec_msec = elapsed;
         if (entry->kind == ZAN_TIMER_PUBLIC && entry->interval > 0 && !entry->removed) {
