@@ -2,6 +2,7 @@ using System;
 using System.Data;
 using System.Net.Sockets;
 using System.Net.Tls;
+using System.Threading;
 
 namespace System.Data.SqlServer;
 
@@ -38,6 +39,29 @@ class SqlServerConnection {
     int packetSize;
     int packetId;
     TlsStream tls;      // 非空 = 通道已加密（OpenSecureAsync 建立）
+    bool busy;
+    List<AsyncGate> waiters;
+
+    async bool AcquireLock() {
+        while (this.busy) {
+            AsyncGate g = new AsyncGate();
+            if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
+            this.waiters.Add(g);
+            await g.Wait();
+            g.Close();
+        }
+        this.busy = true;
+        return true;
+    }
+
+    void ReleaseLock() {
+        this.busy = false;
+        if (this.waiters != null && this.waiters.Count > 0) {
+            AsyncGate g = this.waiters[0];
+            this.waiters.RemoveAt(0);
+            g.Signal();
+        }
+    }
 
     // TLS 校验开关：默认开启——证书链与主机名都验。自签/测试服务器
     // 可经 SetTlsVerify(false) 放宽（只加密不校验），与 HttpClient/
@@ -88,9 +112,7 @@ class SqlServerConnection {
             if (n <= 0) {
                 return got;
             }
-            for (int j = 0; j < n; j = j + 1) {
-                dst[off + got + j] = tmp[j];
-            }
+            NativeMemory.Copy((nint)dst + (nint)(off + got), (nint)tmp, n);
             got = got + n;
         }
         return got;
@@ -106,9 +128,7 @@ class SqlServerConnection {
             if (n <= 0) {
                 return got;
             }
-            for (int j = 0; j < n; j = j + 1) {
-                dst[off + got + j] = tmp[j];
-            }
+            NativeMemory.Copy((nint)dst + (nint)(off + got), (nint)tmp, n);
             got = got + n;
         }
         return got;
@@ -373,34 +393,39 @@ class SqlServerConnection {
     // ============================================================
 
     /// 发送一条消息并解码响应：网络失败会把连接标记为断开并返回
-    /// 空响应，语句级失败只记录（由调用方决定是否抛出）。
+    /// 空响应，语句级失败只记录（由调用方决定是否抛出）。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
     async TdsResponse roundTrip(int type, TdsBytes payload) {
-        this.lastError = "";
-        if (!this.connected) {
+        await this.AcquireLock();
+        try {
+            this.lastError = "";
+            if (!this.connected) {
+                payload.Release();
+                this.lastError = "not connected";
+                return new TdsResponse();
+            }
+            this.packetId = 1;
+            bool sent = await this.sendMessage(type, payload);
             payload.Release();
-            this.lastError = "not connected";
-            return new TdsResponse();
+            if (!sent) {
+                this.connected = false;
+                return new TdsResponse();
+            }
+            TdsBytes body = await this.recvMessage();
+            if (body == null) {
+                this.connected = false;
+                return new TdsResponse();
+            }
+            TdsResponse resp = TdsMessage.Decode(body);
+            body.Release();
+            this.lastAffected = resp.Affected();
+            if (resp.Failed()) {
+                this.lastError = resp.Error();
+                this.lastNumber = resp.ErrorNumber();
+            }
+            return resp;
+        } finally {
+            this.ReleaseLock();
         }
-        this.packetId = 1;
-        bool sent = await this.sendMessage(type, payload);
-        payload.Release();
-        if (!sent) {
-            this.connected = false;
-            return new TdsResponse();
-        }
-        TdsBytes body = await this.recvMessage();
-        if (body == null) {
-            this.connected = false;
-            return new TdsResponse();
-        }
-        TdsResponse resp = TdsMessage.Decode(body);
-        body.Release();
-        this.lastAffected = resp.Affected();
-        if (resp.Failed()) {
-            this.lastError = resp.Error();
-            this.lastNumber = resp.ErrorNumber();
-        }
-        return resp;
     }
 
     /// <summary>运行语句批处理并返回结果集。当服务器拒绝批处理时抛出
@@ -536,8 +561,14 @@ class SqlServerConnection {
     int GetProvider() { return DbProvider.SqlServer; }
 
     /// 关闭套接字；重复调用安全。TLS 先发 close_notify（fd 仍归
-    /// 调用方）再关套接字。
+    /// 调用方）再关套接字。安全唤醒所有门控等待者。
     void Close() {
+        this.ReleaseLock();
+        while (this.waiters != null && this.waiters.Count > 0) {
+            AsyncGate g = this.waiters[0];
+            this.waiters.RemoveAt(0);
+            g.Signal();
+        }
         if (this.tls != null) {
             this.tls.Close();
             this.tls = null;

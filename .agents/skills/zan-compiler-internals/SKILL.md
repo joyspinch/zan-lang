@@ -1819,7 +1819,13 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
   - 定式：`MqttClient.ReceiveAsync` 与 `ReceiveBytesAsync` 解析到 QoS > 0 时必须立即按其报文标识符回送对应 ACK（PUBACK/PUBREC/PUBCOMP），并正确过滤心跳包。
 - **WebSocket 连接多协程并发 Push 帧缓冲区踩踏**：
   - 多业务协程向同一长连接推流（如通知、广播、报警）时，若无互斥门控，多个协程会同时操作同一连接的 `WsWriter` 输出缓冲并在 `Flush()` 的 `SendBytesAsync` 挂起期间相互覆盖 `buf` 与 `len`，引发帧数据穿插错位或乱序断链；
-  - 定式：`WsLink` 增加 `AsyncGate` 异步互斥锁，`WorkerWs.Push` / `PushBinary` 全程在互斥门控内完成帧封装与套接字写出，并在连接关闭时唤醒全部排队者。
+**坑九（MySQL 大数据量超 16MB 分包拼接与 SQLite 语句缓存覆写）**：
+- **MySQL 线协议 16MB (0xFFFFFF) 边界截断与协议错位**：
+  - MySQL 线协议每个数据包头部仅 3 字节长度（最大 $2^{24}-1 = 16,777,215$ 字节）。当单列、大字段（BLOB/JSON/TEXT）或批处理超过 16MB 时，服务端与客户端均须按 16MB 分包，递增包序列号并在小于 16MB 的包处结束；
+  - 若客户端只读单包，后续数据包会留在套接字输入缓冲区中，被下一次查询误当成响应包头，造成协议永久错位与断链；
+  - 定式：`MySqlConnection.readPacket()` 遇 `len == 16777215` 时必须循环拼装分片直至终包；`writePacket` 超 16MB 自动分片发送；套接字接收逐字节循环全部接入 `NativeMemory.Copy` 加速。
+- **SQLite 语句缓存覆写**：
+  - `SqliteConnection` 使用索引器 `stmtBusy[sql] = true/false` 代替 `Add`，杜绝重复键异常。
 
 
 ## File 读族 alt-base 回退 exe 目录 vs Directory 清理 CWD 相对：测试缓存目录必须用绝对路径

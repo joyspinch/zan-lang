@@ -61,18 +61,19 @@ class MySqlSyncConnection : IDbConnection {
     /// 读到的字节数（对端关闭时 &lt; need）。</summary>
     int recvExact(byte[] dst, int off, int need) {
         int got = 0;
+        byte[] tmp = new byte[need + 1];
         while (got < need) {
-            byte[] tmp = new byte[need - got + 1];
             int n = Socket.Recv(this.sock, tmp, need - got);
             if (n <= 0) { return got; }
-            for (int j = 0; j < n; j = j + 1) { dst[off + got + j] = tmp[j]; }
+            NativeMemory.Copy((nint)dst + (nint)(off + got), (nint)tmp, n);
             got = got + n;
         }
         return got;
     }
 
     /// <summary>读取一个协议数据包，返回其有效载荷，
-    /// 长度记录在 <c>lastLen</c>；连接关闭时返回 null。</summary>
+    /// 长度记录在 <c>lastLen</c>；连接关闭时返回 null。
+    /// 支持 MySQL 协议大于 16MB (0xFFFFFF) 的多包分片流式拼装。</summary>
     byte[] readPacket() {
         byte[] hdr = new byte[5];
         int got = this.recvExact(hdr, 0, 4);
@@ -85,15 +86,55 @@ class MySqlSyncConnection : IDbConnection {
             int g2 = this.recvExact(pay, 0, len);
             if (g2 < len) { this.lastLen = -1; return null; }
         }
+        if (len == 16777215) {
+            int totalLen = len;
+            while (len == 16777215) {
+                int gotH = this.recvExact(hdr, 0, 4);
+                if (gotH < 4) { break; }
+                len = (hdr[0]&255) | ((hdr[1]&255)<<8) | ((hdr[2]&255)<<16);
+                this.lastSeq = hdr[3] & 255;
+                byte[] nextChunk = new byte[len + 1];
+                if (len > 0) {
+                    int g3 = this.recvExact(nextChunk, 0, len);
+                    if (g3 < len) { break; }
+                }
+                byte[] merged = new byte[totalLen + len + 1];
+                NativeMemory.Copy((nint)merged, (nint)pay, totalLen);
+                if (len > 0) {
+                    NativeMemory.Copy((nint)merged + (nint)totalLen, (nint)nextChunk, len);
+                }
+                pay = merged;
+                totalLen = totalLen + len;
+            }
+            this.lastLen = totalLen;
+        }
         return pay;
     }
 
-    /// <summary>写入一个协议数据包（4 字节包头 + 有效载荷）。</summary>
+    /// <summary>写入一个协议数据包（4 字节包头 + 有效载荷）。超 16MB 时按 MySQL 规范自动分片。</summary>
     int writePacket(string payload, int len, int seq) {
-        byte[] buf = new byte[len + 5];
-        buf[0]=(byte)(len&255); buf[1]=(byte)((len>>8)&255); buf[2]=(byte)((len>>16)&255); buf[3]=(byte)(seq&255);
-        for (int i = 0; i < len; i = i + 1) { buf[i+4] = (byte)(payload[i] & 255); }
-        return Socket.Send(this.sock, buf, len + 4);
+        if (len < 16777215) {
+            byte[] buf = new byte[len + 5];
+            buf[0]=(byte)(len&255); buf[1]=(byte)((len>>8)&255); buf[2]=(byte)((len>>16)&255); buf[3]=(byte)(seq&255);
+            NativeMemory.PutString((nint)buf + (nint)4, 0, payload, len);
+            return Socket.Send(this.sock, buf, len + 4);
+        }
+        int offset = 0;
+        int curSeq = seq;
+        int sentTotal = 0;
+        while (offset < len) {
+            int chunkLen = len - offset;
+            if (chunkLen > 16777215) { chunkLen = 16777215; }
+            byte[] buf = new byte[chunkLen + 5];
+            buf[0]=(byte)(chunkLen&255); buf[1]=(byte)((chunkLen>>8)&255); buf[2]=(byte)((chunkLen>>16)&255); buf[3]=(byte)(curSeq&255);
+            NativeMemory.PutString((nint)buf + (nint)4, 0, payload.Substring(offset, chunkLen), chunkLen);
+            int r = Socket.Send(this.sock, buf, chunkLen + 4);
+            if (r <= 0) { return r; }
+            sentTotal = sentTotal + r;
+            offset = offset + chunkLen;
+            curSeq = (curSeq + 1) & 255;
+        }
+        return sentTotal;
     }
 
     /// <summary>将缓冲区中的 <paramref name="len"/> 字节复制到新的

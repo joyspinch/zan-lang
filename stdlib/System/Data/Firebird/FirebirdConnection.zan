@@ -1,6 +1,7 @@
 using System;
 using System.Data;
 using System.Net.Sockets;
+using System.Threading;
 
 namespace System.Data.Firebird;
 
@@ -127,6 +128,29 @@ class FirebirdConnection {
     FbArc4 encOut;
     bool wantCrypt;
     FbError lastStatus;
+    bool busy;
+    List<AsyncGate> waiters;
+
+    async bool AcquireLock() {
+        while (this.busy) {
+            AsyncGate g = new AsyncGate();
+            if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
+            this.waiters.Add(g);
+            await g.Wait();
+            g.Close();
+        }
+        this.busy = true;
+        return true;
+    }
+
+    void ReleaseLock() {
+        this.busy = false;
+        if (this.waiters != null && this.waiters.Count > 0) {
+            AsyncGate g = this.waiters[0];
+            this.waiters.RemoveAt(0);
+            g.Signal();
+        }
+    }
 
     /// <summary>每次 fetch 往返请求服务器发送的行数。</summary>
     static int FETCH_ROWS = 400;
@@ -828,34 +852,44 @@ class FirebirdConnection {
         return ok;
     }
 
-    /// <summary>提交当前事务并开启新事务。</summary>
+    /// <summary>提交当前事务并开启新事务。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。</summary>
     async bool CommitAsync() {
-        if (!this.connected) { return false; }
-        FbBuf p = new FbBuf();
-        p.Int(FbOp.COMMIT);
-        p.Int(this.transHandle);
-        FbResponse resp = await this.roundTrip(p.ToBytes());
-        if (resp == null) { return false; }
-        bool ok = !resp.Failed();
-        resp.Release();
-        this.transHandle = 0 - 1;
-        if (!ok) { return false; }
-        return await this.beginTransaction();
+        await this.AcquireLock();
+        try {
+            if (!this.connected) { return false; }
+            FbBuf p = new FbBuf();
+            p.Int(FbOp.COMMIT);
+            p.Int(this.transHandle);
+            FbResponse resp = await this.roundTrip(p.ToBytes());
+            if (resp == null) { return false; }
+            bool ok = !resp.Failed();
+            resp.Release();
+            this.transHandle = 0 - 1;
+            if (!ok) { return false; }
+            return await this.beginTransaction();
+        } finally {
+            this.ReleaseLock();
+        }
     }
 
-    /// <summary>回滚当前事务并开启新事务。</summary>
+    /// <summary>回滚当前事务并开启新事务。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。</summary>
     async bool RollbackAsync() {
-        if (!this.connected) { return false; }
-        FbBuf p = new FbBuf();
-        p.Int(FbOp.ROLLBACK);
-        p.Int(this.transHandle);
-        FbResponse resp = await this.roundTrip(p.ToBytes());
-        if (resp == null) { return false; }
-        bool ok = !resp.Failed();
-        resp.Release();
-        this.transHandle = 0 - 1;
-        if (!ok) { return false; }
-        return await this.beginTransaction();
+        await this.AcquireLock();
+        try {
+            if (!this.connected) { return false; }
+            FbBuf p = new FbBuf();
+            p.Int(FbOp.ROLLBACK);
+            p.Int(this.transHandle);
+            FbResponse resp = await this.roundTrip(p.ToBytes());
+            if (resp == null) { return false; }
+            bool ok = !resp.Failed();
+            resp.Release();
+            this.transHandle = 0 - 1;
+            if (!ok) { return false; }
+            return await this.beginTransaction();
+        } finally {
+            this.ReleaseLock();
+        }
     }
 
     // ============================================================
@@ -1248,46 +1282,51 @@ class FirebirdConnection {
 
     /// <summary>运行带参数的语句。占位符是协议
     /// 自身的位置占位符，因此值采用绑定而非拼入
-    /// SQL 文本。</summary>
+    /// SQL 文本。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。</summary>
     async DbResult QueryAsync(string sql, DbParams prms) {
-        this.lastError = "";
-        this.lastStatus = new FbError();
-        if (!this.connected) {
-            this.lastError = "not connected";
-            this.fail();
-        }
-        int stmt = await this.allocStatement();
-        if (stmt < 0) { this.fail(); }
-        FbXsqlda xs = await this.prepare(stmt, sql);
-        if (xs == null) {
+        await this.AcquireLock();
+        try {
+            this.lastError = "";
+            this.lastStatus = new FbError();
+            if (!this.connected) {
+                this.lastError = "not connected";
+                this.fail();
+            }
+            int stmt = await this.allocStatement();
+            if (stmt < 0) { this.fail(); }
+            FbXsqlda xs = await this.prepare(stmt, sql);
+            if (xs == null) {
+                await this.freeStatement(stmt);
+                this.fail();
+            }
+            if (xs.StmtType() == FbType.STMT_EXEC_PROCEDURE && xs.Count() > 0) {
+                // 带输出参数的过程以 op_sql_response 应答，
+                // 而非游标；应据此判断，避免误读数据流。
+                await this.freeStatement(stmt);
+                this.lastError = "EXECUTE PROCEDURE with output parameters is not"
+                    + " supported; select from the procedure instead";
+                this.fail();
+            }
+            bool ok = await this.execute(stmt, prms);
+            if (!ok) {
+                await this.freeStatement(stmt);
+                this.fail();
+            }
+            DbResult res = DbResult.Empty();
+            if (xs.IsSelect() && xs.Count() > 0) {
+                res = await this.fetchAll(stmt, xs);
+                this.lastAffected = res.RowCount();
+            } else {
+                this.lastAffected = await this.affectedRows(stmt, false);
+            }
             await this.freeStatement(stmt);
-            this.fail();
+            if (!xs.IsSelect()) {
+                await this.commitRetaining();
+            }
+            return res;
+        } finally {
+            this.ReleaseLock();
         }
-        if (xs.StmtType() == FbType.STMT_EXEC_PROCEDURE && xs.Count() > 0) {
-            // 带输出参数的过程以 op_sql_response 应答，
-            // 而非游标；应据此判断，避免误读数据流。
-            await this.freeStatement(stmt);
-            this.lastError = "EXECUTE PROCEDURE with output parameters is not"
-                + " supported; select from the procedure instead";
-            this.fail();
-        }
-        bool ok = await this.execute(stmt, prms);
-        if (!ok) {
-            await this.freeStatement(stmt);
-            this.fail();
-        }
-        DbResult res = DbResult.Empty();
-        if (xs.IsSelect() && xs.Count() > 0) {
-            res = await this.fetchAll(stmt, xs);
-            this.lastAffected = res.RowCount();
-        } else {
-            this.lastAffected = await this.affectedRows(stmt, false);
-        }
-        await this.freeStatement(stmt);
-        if (!xs.IsSelect()) {
-            await this.commitRetaining();
-        }
-        return res;
     }
 
     /// <summary>运行语句并返回其影响的行数。语句
@@ -1328,16 +1367,21 @@ class FirebirdConnection {
         return r.GetString(0, 0);
     }
 
-    /// <summary>用于验证会话仍可用的往返。</summary>
+    /// <summary>用于验证会话仍可用的往返。内部通过 AsyncGate 门控保证单连接事务互斥。</summary>
     async bool PingAsync() {
-        if (!this.connected) { return false; }
-        FbBuf p = new FbBuf();
-        p.Int(FbOp.PING);
-        FbResponse resp = await this.roundTrip(p.ToBytes());
-        if (resp == null) { return false; }
-        bool ok = !resp.Failed();
-        resp.Release();
-        return ok;
+        await this.AcquireLock();
+        try {
+            if (!this.connected) { return false; }
+            FbBuf p = new FbBuf();
+            p.Int(FbOp.PING);
+            FbResponse resp = await this.roundTrip(p.ToBytes());
+            if (resp == null) { return false; }
+            bool ok = !resp.Failed();
+            resp.Release();
+            return ok;
+        } finally {
+            this.ReleaseLock();
+        }
     }
 
     // ============================================================
@@ -1395,8 +1439,14 @@ class FirebirdConnection {
         this.Close();
     }
 
-    /// <summary>不经分离往返直接丢弃连接。</summary>
+    /// <summary>不经分离往返直接丢弃连接。安全释放互斥门控并唤醒所有等待者。</summary>
     void Close() {
+        this.ReleaseLock();
+        while (this.waiters != null && this.waiters.Count > 0) {
+            AsyncGate g = this.waiters[0];
+            this.waiters.RemoveAt(0);
+            g.Signal();
+        }
         if (this.sock >= 0) {
             Socket.Close(this.sock);
             this.sock = 0 - 1;

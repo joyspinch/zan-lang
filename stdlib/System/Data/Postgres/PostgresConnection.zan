@@ -2,6 +2,7 @@ using System;
 using System.Data;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 
 namespace System.Data.Postgres;
 
@@ -30,6 +31,29 @@ class PgConnection : IDbConnection {
     nint handle;     // PGconn*
     bool connected;
     string lastError;
+    bool busy;
+    List<AsyncGate> waiters;
+
+    async bool AcquireLock() {
+        while (this.busy) {
+            AsyncGate g = new AsyncGate();
+            if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
+            this.waiters.Add(g);
+            await g.Wait();
+            g.Close();
+        }
+        this.busy = true;
+        return true;
+    }
+
+    void ReleaseLock() {
+        this.busy = false;
+        if (this.waiters != null && this.waiters.Count > 0) {
+            AsyncGate g = this.waiters[0];
+            this.waiters.RemoveAt(0);
+            g.Signal();
+        }
+    }
 
     [DllImport("libpq")]
     static extern nint PQconnectdb(string conninfo); // -> PGconn*
@@ -79,10 +103,6 @@ class PgConnection : IDbConnection {
     static extern int PQsendQueryParams(nint conn, string command, int nParams,
         nint paramTypes, nint paramValues, nint paramLengths, nint paramFormats,
         int resultFormat);   // 1 = ok, 0 = fail
-
-
-    [DllImport("crt")]
-    static extern nint memcpy(string dest, string src, long n); // 返回 dest 指针
 
     // ---- 非阻塞（异步）libpq 入口 ----
     [DllImport("libpq")]
@@ -223,8 +243,11 @@ class PgConnection : IDbConnection {
             nint p = 0;
             if (!prms.IsNull(i)) {
                 string t = prms.AsText(i);
-                byte[] buf = new byte[t.Length + 1];
-                p = memcpy(buf, t, t.Length);
+                int tlen = t.Length;
+                byte[] buf = new byte[tlen + 1];
+                NativeMemory.PutString((nint)buf, 0, t, tlen);
+                buf[tlen] = 0;
+                p = (nint)buf;
                 keepAlive.Add(buf);
             }
             int off = i * 8;
@@ -495,203 +518,223 @@ class PgConnection : IDbConnection {
 
     /// <summary>发送查询并异步收完所有结果，保留
     /// 最后一个返回行的结果集。在 reactor 上挂起等待 IO 就绪，
-    /// 使工作线程可供其他协程使用。</summary>
+    /// 使工作线程可供其他协程使用。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。</summary>
     async DbResult QueryAsync(string sql) {
-        if (!this.connected) {
-            this.lastError = "not connected";
-            this.fail();
-        }
-        DbResult result = new DbResult();
-        if (PQsendQuery(this.handle, sql) == 0) {
-            this.lastError = CopyText(PQerrorMessage(this.handle));
-            this.fail();
-        }
-        int f = await this.flushOutput();
-        if (f < 0) {
-            this.lastError = "cannot send the query";
-            this.fail();
-        }
-        bool failed = false;
-        while (true) {
-            bool ready = await this.waitReady();
-            if (!ready) {
-                this.lastError = "the connection went away mid-statement";
+        await this.AcquireLock();
+        try {
+            if (!this.connected) {
+                this.lastError = "not connected";
                 this.fail();
             }
-            nint res = PQgetResult(this.handle);
-            if (res == 0) {
-                break;
-            }
-            if (PQresultStatus(res) == 2) {   // TUPLES_OK
-                int cols = PQnfields(res);
-                result = new DbResult();
-                result.SetColumnCount(cols);
-                int c = 0;
-                for (; c < cols; c = c + 1) {
-                    result.AddColumnName(CopyText(PQfname(res, c)));
-                }
-                int rows = PQntuples(res);
-                for (int r = 0; r < rows; r = r + 1) {
-                    List<string> row = new List<string>();
-                    List<bool> nullFlags = new List<bool>();
-                    c = 0;
-                    while (c < cols) {
-                        if (PQgetisnull(res, r, c) == 1) {
-                            row.Add("");
-                            nullFlags.Add(true);
-                        } else {
-                            row.Add(CopyText(PQgetvalue(res, r, c)));
-                            nullFlags.Add(false);
-                        }
-                        c = c + 1;
-                    }
-                    result.AddRowNulls(row, nullFlags);
-                }
-            } else if (PQresultStatus(res) != 1) {   // not COMMAND_OK
+            DbResult result = new DbResult();
+            if (PQsendQuery(this.handle, sql) == 0) {
                 this.lastError = CopyText(PQerrorMessage(this.handle));
-                failed = true;
+                this.fail();
             }
-            PQclear(res);
+            int f = await this.flushOutput();
+            if (f < 0) {
+                this.lastError = "cannot send the query";
+                this.fail();
+            }
+            bool failed = false;
+            while (true) {
+                bool ready = await this.waitReady();
+                if (!ready) {
+                    this.lastError = "the connection went away mid-statement";
+                    this.fail();
+                }
+                nint res = PQgetResult(this.handle);
+                if (res == 0) {
+                    break;
+                }
+                if (PQresultStatus(res) == 2) {   // TUPLES_OK
+                    int cols = PQnfields(res);
+                    result = new DbResult();
+                    result.SetColumnCount(cols);
+                    int c = 0;
+                    for (; c < cols; c = c + 1) {
+                        result.AddColumnName(CopyText(PQfname(res, c)));
+                    }
+                    int rows = PQntuples(res);
+                    for (int r = 0; r < rows; r = r + 1) {
+                        List<string> row = new List<string>();
+                        List<bool> nullFlags = new List<bool>();
+                        c = 0;
+                        while (c < cols) {
+                            if (PQgetisnull(res, r, c) == 1) {
+                                row.Add("");
+                                nullFlags.Add(true);
+                            } else {
+                                row.Add(CopyText(PQgetvalue(res, r, c)));
+                                nullFlags.Add(false);
+                            }
+                            c = c + 1;
+                        }
+                        result.AddRowNulls(row, nullFlags);
+                    }
+                } else if (PQresultStatus(res) != 1) {   // not COMMAND_OK
+                    this.lastError = CopyText(PQerrorMessage(this.handle));
+                    failed = true;
+                }
+                PQclear(res);
+            }
+            if (failed) { this.fail(); }
+            return result;
+        } finally {
+            this.ReleaseLock();
         }
-        if (failed) { this.fail(); }
-        return result;
     }
 
     /// <summary>异步发送参数化查询（PQsendQueryParams）
     /// 并在 IO reactor 上收完结果。语句失败时抛出
-    /// <see cref="DbException"/>。</summary>
+    /// <see cref="DbException"/>。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。</summary>
     async DbResult QueryParamsAsync(string sql, DbParams prms) {
-        if (!this.connected) {
-            this.lastError = "not connected";
-            this.fail();
-        }
-        DbResult result = new DbResult();
-        List<byte[]> keepAlive = new List<byte[]>();
-        byte[] block = BuildParamBlock(prms, keepAlive);
-        int ok = PQsendQueryParams(this.handle, ToDollarParams(sql), prms.Count(),
-            0, block, 0, 0, 0);
-        if (ok == 0) {
-            this.lastError = CopyText(PQerrorMessage(this.handle));
-            this.fail();
-        }
-        int f = await this.flushOutput();
-        if (f < 0) {
-            this.lastError = "cannot send the query";
-            this.fail();
-        }
-        bool failedP = false;
-        while (true) {
-            bool ready = await this.waitReady();
-            if (!ready) {
-                this.lastError = "the connection went away mid-statement";
+        await this.AcquireLock();
+        try {
+            if (!this.connected) {
+                this.lastError = "not connected";
                 this.fail();
             }
-            nint res = PQgetResult(this.handle);
-            if (res == 0) {
-                break;
-            }
-            if (PQresultStatus(res) == 2) {   // TUPLES_OK
-                result = ReadTuples(res);
-            } else if (PQresultStatus(res) != 1) {   // not COMMAND_OK
+            DbResult result = new DbResult();
+            List<byte[]> keepAlive = new List<byte[]>();
+            byte[] block = BuildParamBlock(prms, keepAlive);
+            int ok = PQsendQueryParams(this.handle, ToDollarParams(sql), prms.Count(),
+                0, block, 0, 0, 0);
+            if (ok == 0) {
                 this.lastError = CopyText(PQerrorMessage(this.handle));
-                failedP = true;
+                this.fail();
             }
-            PQclear(res);
+            int f = await this.flushOutput();
+            if (f < 0) {
+                this.lastError = "cannot send the query";
+                this.fail();
+            }
+            bool failedP = false;
+            while (true) {
+                bool ready = await this.waitReady();
+                if (!ready) {
+                    this.lastError = "the connection went away mid-statement";
+                    this.fail();
+                }
+                nint res = PQgetResult(this.handle);
+                if (res == 0) {
+                    break;
+                }
+                if (PQresultStatus(res) == 2) {   // TUPLES_OK
+                    result = ReadTuples(res);
+                } else if (PQresultStatus(res) != 1) {   // not COMMAND_OK
+                    this.lastError = CopyText(PQerrorMessage(this.handle));
+                    failedP = true;
+                }
+                PQclear(res);
+            }
+            if (failedP) { this.fail(); }
+            return result;
+        } finally {
+            this.ReleaseLock();
         }
-        if (failedP) { this.fail(); }
-        return result;
     }
 
     /// <summary>异步发送参数化非查询语句并返回
-    /// 受影响行数。语句失败时抛出 <see cref="DbException"/>。
+    /// 受影响行数。语句失败时抛出 <see cref="DbException"/>。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
     /// </summary>
     async int ExecuteParamsAsync(string sql, DbParams prms) {
-        if (!this.connected) {
-            this.lastError = "not connected";
-            this.fail();
-        }
-        List<byte[]> keepAlive = new List<byte[]>();
-        byte[] block = BuildParamBlock(prms, keepAlive);
-        int ok = PQsendQueryParams(this.handle, ToDollarParams(sql), prms.Count(),
-            0, block, 0, 0, 0);
-        if (ok == 0) {
-            this.lastError = CopyText(PQerrorMessage(this.handle));
-            this.fail();
-        }
-        int f2 = await this.flushOutput();
-        if (f2 < 0) {
-            this.lastError = "cannot send the statement";
-            this.fail();
-        }
-        int affected2 = 0;
-        bool failed2 = false;
-        while (true) {
-            bool ready = await this.waitReady();
-            if (!ready) {
-                this.lastError = "the connection went away mid-statement";
+        await this.AcquireLock();
+        try {
+            if (!this.connected) {
+                this.lastError = "not connected";
                 this.fail();
             }
-            nint res = PQgetResult(this.handle);
-            if (res == 0) {
-                break;
-            }
-            int st = PQresultStatus(res);
-            if (st == 1 || st == 2) {
-                affected2 = Encoding.ParseInt(PQcmdTuples(res));
-            } else {
+            List<byte[]> keepAlive = new List<byte[]>();
+            byte[] block = BuildParamBlock(prms, keepAlive);
+            int ok = PQsendQueryParams(this.handle, ToDollarParams(sql), prms.Count(),
+                0, block, 0, 0, 0);
+            if (ok == 0) {
                 this.lastError = CopyText(PQerrorMessage(this.handle));
-                failed2 = true;
+                this.fail();
             }
-            PQclear(res);
+            int f2 = await this.flushOutput();
+            if (f2 < 0) {
+                this.lastError = "cannot send the statement";
+                this.fail();
+            }
+            int affected2 = 0;
+            bool failed2 = false;
+            while (true) {
+                bool ready = await this.waitReady();
+                if (!ready) {
+                    this.lastError = "the connection went away mid-statement";
+                    this.fail();
+                }
+                nint res = PQgetResult(this.handle);
+                if (res == 0) {
+                    break;
+                }
+                int st = PQresultStatus(res);
+                if (st == 1 || st == 2) {
+                    affected2 = Encoding.ParseInt(PQcmdTuples(res));
+                } else {
+                    this.lastError = CopyText(PQerrorMessage(this.handle));
+                    failed2 = true;
+                }
+                PQclear(res);
+            }
+            if (failed2) {
+                this.fail();
+            }
+            return affected2;
+        } finally {
+            this.ReleaseLock();
         }
-        if (failed2) {
-            this.fail();
-        }
-        return affected2;
     }
 
     /// <summary>异步发送非查询语句并返回
-    /// 受影响行数。语句失败时抛出 <see cref="DbException"/>。
+    /// 受影响行数。语句失败时抛出 <see cref="DbException"/>。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
     /// </summary>
     async int ExecuteAsync(string sql) {
-        if (!this.connected) {
-            this.lastError = "not connected";
-            this.fail();
-        }
-        if (PQsendQuery(this.handle, sql) == 0) {
-            this.lastError = CopyText(PQerrorMessage(this.handle));
-            this.fail();
-        }
-        int f = await this.flushOutput();
-        if (f < 0) {
-            this.lastError = "cannot send the statement";
-            this.fail();
-        }
-        int affected = 0;
-        bool failed = false;
-        while (true) {
-            bool ready = await this.waitReady();
-            if (!ready) {
-                this.lastError = "the connection went away mid-statement";
+        await this.AcquireLock();
+        try {
+            if (!this.connected) {
+                this.lastError = "not connected";
                 this.fail();
             }
-            nint res = PQgetResult(this.handle);
-            if (res == 0) {
-                break;
-            }
-            int st = PQresultStatus(res);
-            if (st == 1 || st == 2) {   // COMMAND_OK / TUPLES_OK
-                affected = Encoding.ParseInt(PQcmdTuples(res));
-            } else {
+            if (PQsendQuery(this.handle, sql) == 0) {
                 this.lastError = CopyText(PQerrorMessage(this.handle));
-                failed = true;
+                this.fail();
             }
-            PQclear(res);
+            int f = await this.flushOutput();
+            if (f < 0) {
+                this.lastError = "cannot send the statement";
+                this.fail();
+            }
+            int affected = 0;
+            bool failed = false;
+            while (true) {
+                bool ready = await this.waitReady();
+                if (!ready) {
+                    this.lastError = "the connection went away mid-statement";
+                    this.fail();
+                }
+                nint res = PQgetResult(this.handle);
+                if (res == 0) {
+                    break;
+                }
+                int st = PQresultStatus(res);
+                if (st == 1 || st == 2) {   // COMMAND_OK / TUPLES_OK
+                    affected = Encoding.ParseInt(PQcmdTuples(res));
+                } else {
+                    this.lastError = CopyText(PQerrorMessage(this.handle));
+                    failed = true;
+                }
+                PQclear(res);
+            }
+            if (failed) {
+                this.fail();
+            }
+            return affected;
+        } finally {
+            this.ReleaseLock();
         }
-        if (failed) {
-            this.fail();
-        }
-        return affected;
     }
 
     /// <summary>抛出记录的失败。libpq 的消息来自服务器本身，
@@ -753,8 +796,14 @@ class PgConnection : IDbConnection {
     /// <summary>回滚当前事务。</summary>
     void Rollback() { Execute("ROLLBACK"); }
 
-    /// <summary>关闭数据库连接。</summary>
+    /// <summary>关闭数据库连接。安全释放互斥门控并唤醒所有等待者。</summary>
     void Close() {
+        this.ReleaseLock();
+        while (this.waiters != null && this.waiters.Count > 0) {
+            AsyncGate g = this.waiters[0];
+            this.waiters.RemoveAt(0);
+            g.Signal();
+        }
         // 句柄存在即释放，哪怕连接已判死：查询中途死掉的连接
         // connected 已被清掉但 PGconn 还在——只看 connected 会泄漏。
         if (this.connected || this.handle != 0) {

@@ -171,6 +171,13 @@ class WorkerWs {
         Mutex.Lock(WorkerWs.regLock);
         int id = conn.GetId();
         if (WorkerWs.conns.ContainsKey(id)) {
+            WsLink link = WorkerWs.conns[id];
+            link.Unlock();
+            while (link.waiters != null && link.waiters.Count > 0) {
+                AsyncGate g = link.waiters[0];
+                link.waiters.RemoveAt(0);
+                g.Signal();
+            }
             WorkerWs.conns.Remove(id);
         }
         Mutex.Unlock(WorkerWs.regLock);
@@ -310,17 +317,23 @@ class WorkerWs {
     static async bool Push(Connection c, string data) {
         WsLink link = WorkerWs.LinkOf(c.GetId());
         if (link == null || c.IsClosed()) { return false; }
-        int len = (int)strlen(data);
-        WsFrame frame = WsFrame.RawFrame(WsOpcode.Text, data, len);
-        byte[] encoded = frame.Encode();
-        link.writer.Append(encoded, WsFrame.HeaderLen(len) + len);
-        int n = await link.writer.Flush(link.client);
-        if (n < 0) {
-            c.Close();
-            return false;
+        await link.LockAsync();
+        try {
+            if (c.IsClosed()) { return false; }
+            int len = (int)strlen(data);
+            WsFrame frame = WsFrame.RawFrame(WsOpcode.Text, data, len);
+            byte[] encoded = frame.Encode();
+            link.writer.Append(encoded, WsFrame.HeaderLen(len) + len);
+            int n = await link.writer.Flush(link.client);
+            if (n < 0) {
+                c.Close();
+                return false;
+            }
+            Worker.BumpSent();
+            return true;
+        } finally {
+            link.Unlock();
         }
-        Worker.BumpSent();
-        return true;
     }
 
     /// <summary>WebSocket 二进制 push：`data` 可含 NUL，`len` 为精确
@@ -328,16 +341,22 @@ class WorkerWs {
     static async bool PushBinary(Connection c, string data, int len) {
         WsLink link = WorkerWs.LinkOf(c.GetId());
         if (link == null || c.IsClosed()) { return false; }
-        WsFrame frame = WsFrame.RawFrame(WsOpcode.Binary, data, len);
-        byte[] encoded = frame.Encode();
-        link.writer.Append(encoded, WsFrame.HeaderLen(len) + len);
-        int n = await link.writer.Flush(link.client);
-        if (n < 0) {
-            c.Close();
-            return false;
+        await link.LockAsync();
+        try {
+            if (c.IsClosed()) { return false; }
+            WsFrame frame = WsFrame.RawFrame(WsOpcode.Binary, data, len);
+            byte[] encoded = frame.Encode();
+            link.writer.Append(encoded, WsFrame.HeaderLen(len) + len);
+            int n = await link.writer.Flush(link.client);
+            if (n < 0) {
+                c.Close();
+                return false;
+            }
+            Worker.BumpSent();
+            return true;
+        } finally {
+            link.Unlock();
         }
-        Worker.BumpSent();
-        return true;
     }
 
     // ---- 帧循环 ----
@@ -563,6 +582,29 @@ class WsLink {
     Connection conn;
     WsWriter writer;
     TcpClient client;
+    bool busy;
+    List<AsyncGate> waiters;
+
+    async bool LockAsync() {
+        while (this.busy) {
+            AsyncGate g = new AsyncGate();
+            if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
+            this.waiters.Add(g);
+            await g.Wait();
+            g.Close();
+        }
+        this.busy = true;
+        return true;
+    }
+
+    void Unlock() {
+        this.busy = false;
+        if (this.waiters != null && this.waiters.Count > 0) {
+            AsyncGate g = this.waiters[0];
+            this.waiters.RemoveAt(0);
+            g.Signal();
+        }
+    }
 }
 
 class WorkerWsConsumer : IWsSharedBusConsumer {
