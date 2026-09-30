@@ -647,6 +647,29 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   拷进 toolchain/。OHOS NDK clang 15.0.4 在 DevEco Studio 安装目录的
   native/ 下。
 
+## Linux 构建三断点：feature 宏分层、fortify 契约、死包含（B-ID29）
+
+- **glibc 头文件的 feature 宏分层必须显式给**：`SA_ONSTACK` 在
+  `__USE_GNU` 层——要显式 `-D_GNU_SOURCE`，`-std=gnu11` 也不保证暴露
+  （实测 WSL Ubuntu）；`struct sigaction`/`sigaction`/`gmtime_r` 是 POSIX
+  层，严格 `-std=c11` 全隐。凡自定义编译命令（CMake custom_command 等）
+  显式写了 `-std=c11` 的，feature 宏一并显式传，别指望编译器默认档；
+  头文件注释承诺「构建侧会定义」的要核实真的有人定义。内核 ABI 位
+  （如 `SA_ONSTACK 0x08000000`，glibc/musl 同值）可作不依赖包含顺序的
+  兑底 define。
+- **glibc fortify 的 realpath 契约是 abort 不是截断**：`__realpath_chk`
+  要求目标缓冲 ≥ PATH_MAX(4096)，小了直接 `*** buffer overflow detected
+  ***: terminated`——`char buf[1024]` 喂 `realpath` 在默认开 fortify 的
+  发行版上启动即炸。Windows 侧走自家 API 无此契约，平台分支里喂
+  `realpath` 的缓冲一律 PATH_MAX。gdb 一发入魂：`gdb -batch -ex run
+  -ex bt` 看 `__chk_fail ← __realpath_chk` 帧。
+- **死包含按平台炸**：无条件 `#include <windows.h>` 的 C 文件在 Linux
+  编译即错；grep 确认零 Win32 API 使用就删，别按平台分支化留着。
+- **验证定式：构建绿 ≠ 能跑**。修 Linux 构建必须全量 `cmake -B <dir>
+  -G Ninja && cmake --build --target zanc` 链接成功 + 真编译运行一个
+  hello 探针；只单编对象抓不到 fortify abort（只在运行时炸）。这类
+  缺陷会被「构建本来就断」掩盖成潜伏雷，修通构建后才首曝。
+
 ## IOCP 唤醒包丢失家族与 raw socket 探针陷阱（A298 收尾，2026-09-14）
 
 - **丢包路径的契约**：Windows 上 `PostQueuedCompletionStatus` 失败（DNS/-2
@@ -669,6 +692,23 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   静默返 -1。**socket 探针必须断言 fd>0 且 Bind==0**——否则挂在不存在的
   fd 上，`AcceptAsync(-1)` 立即返回会伪装成「苏醒」，探针假阳性（首轮
   listener 探针就因此"通过"过一次）。
+
+## 懒启动池的所有权谓词：前台泵自起池也要置所有权标志（B-ID30）
+
+- **「无池则起池」的懒启动入口（ensure）必须与所有持有执行所有权的路径
+  共用同一个所有权谓词**：前台 `sched_run` 自起 worker 并内联跑 worker0
+  时若不置 live 标志，每次唤醒（IO 完成、timer 弹出、外部线程 spawn）汇入
+  ensure 都看到「无池」而二启一组 detached 后台池——2× worker 过订同一批
+  队列、两组池生命周期交错。自起池的路径同样要置所有权标志，判据只有
+  一个（live || fg），别让两条路径各记各的。
+- **池退出要复查掉队帧**：最后一次空闲检查与清理动作（关反应器 port）
+  之间 ready 进来的帧会没人接管——退出前按 worker 同款空闲谓词复查，
+  非空闲就把残留工作交给新池再退，别把 port 拆在活帧脚下。
+- **并发修复的 A/B 定式**：`git show HEAD:<file>` 编旧对象、跑同一探针，
+  证明探针真能抓住缺陷（修前线程峰值 9 FAIL / 修后 5 PASS）——只看
+  修后绿不能证明探针有效。线程峰值从 /proc/self/status 的 Threads 采样；
+  前台池要靠「arm 住 pending 工作但不触发 ready」的定时器撑住（arm 不
+  走 ready，dispatch 才走），否则 ensure 在起前台池前就被先触发。
 
 ## conformance 处置四分法
 
