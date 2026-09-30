@@ -829,23 +829,26 @@ static void emit_leak_report_support(zan_irgen_t *g) {
     zan_call2(b, fprintf_type, fn_fprintf, fsum_args, 3, "");
     LLVMBuildBr(b, head_bb);
 
-    /* iterate the site buckets, printing those with a positive live count */
+    /* iterate the site buckets, printing those with a positive live count.
+     * B-ID17: the bound is the published site count, not a fixed cap. */
     LLVMPositionBuilderAtEnd(b, head_bb);
     LLVMValueRef idx = LLVMBuildPhi(b, i64, "i");
-    LLVMValueRef in_range = zan_icmp(b, LLVMIntSLT, idx,
-        LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "inrange");
+    LLVMValueRef bound = LLVMBuildLoad2(b, i64, g->g_site_count, "bound");
+    LLVMValueRef in_range = zan_icmp(b, LLVMIntSLT, idx, bound, "inrange");
     LLVMBuildCondBr(b, in_range, body_bb, close_bb);
 
     LLVMPositionBuilderAtEnd(b, body_bb);
-    LLVMValueRef z32 = LLVMConstInt(i32t, 0, 0);
-    LLVMValueRef cidx[2] = { z32, idx };
-    LLVMValueRef sc_ptr = LLVMBuildGEP2(b, g->site_live_type, g->g_site_live, cidx, 2, "scptr");
+    LLVMValueRef ltbl = LLVMBuildLoad2(b, LLVMPointerType(i64, 0),
+        g->g_site_live, "ltbl");
+    LLVMValueRef sc_ptr = LLVMBuildGEP2(b, i64, ltbl, &idx, 1, "scptr");
     LLVMValueRef sc = LLVMBuildLoad2(b, i64, sc_ptr, "sc");
     LLVMValueRef has = zan_icmp(b, LLVMIntSGT, sc, LLVMConstInt(i64, 0, 0), "has");
     LLVMBuildCondBr(b, has, print_bb, next_bb);
 
     LLVMPositionBuilderAtEnd(b, print_bb);
-    LLVMValueRef nm_ptr = LLVMBuildGEP2(b, g->site_names_type, g->g_site_names, cidx, 2, "nmptr");
+    LLVMValueRef ntbl = LLVMBuildLoad2(b, LLVMPointerType(i8p, 0),
+        g->g_site_names, "ntbl");
+    LLVMValueRef nm_ptr = LLVMBuildGEP2(b, i8p, ntbl, &idx, 1, "nmptr");
     LLVMValueRef nm = LLVMBuildLoad2(b, i8p, nm_ptr, "nm");
     LLVMValueRef dmsg = zan_irgen_intern_string(g,
         "  %lld object(s) leaked, allocated at %s\n");

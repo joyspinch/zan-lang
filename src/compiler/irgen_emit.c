@@ -2954,6 +2954,7 @@ done:
      * been registered (Pass 1) and referenced (Passes 2/3). */
     di_clear(g); /* the following are synthetic fns; no user source scope */
     emit_all_class_releases(g);
+    emit_site_live_tables(g);
     emit_site_dtor_table(g);
     emit_site_tyname_table(g);
     emit_site_meta_table(g);

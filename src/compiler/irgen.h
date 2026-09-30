@@ -400,19 +400,21 @@ struct zan_irgen {
     int static_field_count;
     int static_field_cap;
     LLVMValueRef g_live;          /* i64 global: net live ARC allocations */
-    LLVMValueRef g_site_live;     /* [N x i64] global: live count per alloc site */
-    LLVMValueRef g_site_names;    /* [N x i8*] global: "file:line:col" per site */
-    LLVMTypeRef  site_live_type;  /* [N x i64] array type */
-    LLVMTypeRef  site_names_type; /* [N x i8*] array type */
-    LLVMValueRef g_site_dtors;    /* [N x i8*] global: release fn per alloc site */
-    LLVMTypeRef  site_dtors_type; /* [N x i8*] array type */
-    LLVMValueRef g_site_tynames;  /* [N x i8*] global: ancestor-name list ptr
+    /* check-leaks site tables (B-ID17): the arrays are created at finalize
+     * with the exact site count -- unknown during emission, and LLVM fixes a
+     * global's type at creation -- so instrumentation reaches them through
+     * these pointer globals, and __zan_site_count carries the bound for every
+     * runtime index check. Only check-leaks builds reference them; descriptor
+     * builds leave them null and the optimizer drops the globals. */
+    LLVMValueRef g_site_live;     /* ptr to [N x i64]: live count per alloc site */
+    LLVMValueRef g_site_names;    /* ptr to [N x i8*]: "file:line:col" per site */
+    LLVMValueRef g_site_dtors;    /* ptr to [N x i8*]: release fn per alloc site */
+    LLVMValueRef g_site_tynames;  /* ptr to [N x i8*]: ancestor-name list ptr
                                    * per site, for runtime `is`/`as` checks */
-    LLVMTypeRef  site_tynames_type; /* [N x i8*] array type */
-    LLVMValueRef g_site_meta;     /* [N x i8*] global: reflection type record
+    LLVMValueRef g_site_meta;     /* ptr to [N x i8*]: reflection type record
                                    * per alloc site, so obj.GetType() answers
                                    * the object's CONCRETE type (irgen_reflect.c) */
-    LLVMTypeRef  site_meta_type;  /* [N x i8*] array type */
+    LLVMValueRef g_site_count;    /* i64: number of slots in the site tables */
     zan_symbol_t **site_syms;    /* concrete class symbol per alloc site */
     zan_type_t   **site_inst;    /* per site: the instantiated class type, so a
                                   * generic class's destructor releases the

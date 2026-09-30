@@ -1723,15 +1723,18 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   `ZAN_ARRAY_MAGIC`，装**矩形数组**时是 rank（小整数）——三种都不是指针，
   解引用即崩：`object o = "lit"; o.GetType()` 一行必崩。
   **check-leaks 构建为什么看不出**：那条路用无符号范围比较
-  `0 < site < ZAN_MAX_LEAK_SITES` 挡住串标签/垃圾字（`is` 侧还额外把串标签先分流），
+  `0 < site < 站点数` 挡住串标签/垃圾字（B-ID17 后站点数从 finalize 发射的
+  `__zan_site_count` 全局加载，原 `ZAN_MAX_LEAK_SITES`=4096 常量已除；
+  `is` 侧还额外把串标签先分流），
   于是 `--check-leaks` 全程正常——**「两种模式语义分叉」的隐蔽 bug 只在默认
   （发布）构建踩**。排查这类「-g/--check-leaks 好、发布崩」的问题，直接怀疑
   描述符头解引用路径。
 - **修法定式二**：解引用前判形状——`GetType()` 侧拒
-  `zan_hdr_is_string` / `ZAN_ARRAY_MAGIC` / `site < 4096`（描述符是全局，
+  `zan_hdr_is_string` / `ZAN_ARRAY_MAGIC` / 小整数（描述符是全局，
   绝不可能是小整数，矩形数组的 rank 由此挡住）；`is` 侧把判空扩成
-  「0 / 数组魔数 / < 4096」并集。两条路都**退回静态类型的记录**，与 check-leaks
+  「0 / 数组魔数 / 小整数」并集。两条路都**退回静态类型的记录**，与 check-leaks
   构建对同一值的回答**逐字一致**——修完必须两模式输出比对，别再引入新分叉。
+  （descriptor 路径的「小整数」判别取字面 4096 哨兵即可，与站点数无关，勿混。）
 - 遗留（未修，独立设计变更）：`GetType()` 对槽里的串/数组仍答静态类型
   （`object`），C# 语义应答 `string`/`int[]`；要改需给两类载荷造记录并按形状分派，
   会同时改 check-leaks 侧既有答案。

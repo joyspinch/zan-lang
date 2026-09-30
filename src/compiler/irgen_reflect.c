@@ -1457,11 +1457,13 @@ static LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
     LLVMValueRef in_range;
     if (!g->desc_hdr) {
         /* site 0 means "not recorded"; the string magic and any garbage are out
-         * of range for the unsigned compare */
+         * of range for the unsigned compare. B-ID17: the bound is the
+         * published site count, not a fixed cap. */
+        LLVMValueRef bound = LLVMBuildLoad2(g->builder, i64, g->g_site_count,
+                                            "refl.bound");
         in_range = LLVMBuildAnd(g->builder,
             LLVMBuildICmp(g->builder, LLVMIntUGT, site, LLVMConstInt(i64, 0, 0), "refl.s0"),
-            LLVMBuildICmp(g->builder, LLVMIntULT, site,
-                          LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "refl.sn"),
+            LLVMBuildICmp(g->builder, LLVMIntULT, site, bound, "refl.sn"),
             "refl.sok");
     } else {
         /* descriptor mode: the header word is the record pointer; load its
@@ -1503,9 +1505,10 @@ static LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(g->builder, in_range, ld, fb);
 
     LLVMPositionBuilderAtEnd(g->builder, ld);
-    LLVMValueRef idxs[2] = { LLVMConstInt(i64, 0, 0), site };
-    LLVMValueRef slot = LLVMBuildGEP2(g->builder, g->site_meta_type,
-                                      g->g_site_meta, idxs, 2, "refl.mslot");
+    LLVMValueRef mtbl = LLVMBuildLoad2(g->builder, LLVMPointerType(i8ptr, 0),
+                                       g->g_site_meta, "refl.mtbl");
+    LLVMValueRef slot = LLVMBuildGEP2(g->builder, i8ptr, mtbl, &site, 1,
+                                      "refl.mslot");
     LLVMValueRef m = LLVMBuildLoad2(g->builder, i8ptr, slot, "refl.m");
     LLVMBuildCondBr(g->builder, LLVMBuildIsNull(g->builder, m, "refl.mnull"), fb, hit);
 
@@ -2677,23 +2680,30 @@ static bool refl_emit_instance_call(zan_irgen_t *g, zan_type_t *rt,
     return true;
 }
 
-/* Per-allocation-site record table, so GetType() can answer the concrete type.
- * Emitted only when the module actually reflects. */
+/* Per-allocation-site record table (through the __zan_site_meta pointer
+ * global), so GetType() can answer the concrete type. B-ID17: the array is
+ * created here with the real site count. Emitted only when the module actually
+ * reflects. */
 static void emit_site_meta_table(zan_irgen_t *g) {
     if (!g->refl_used || !g->g_site_meta || !g->site_syms) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    int n = ZAN_MAX_LEAK_SITES;
+    int n = g->leak_site_count;
+    if (n <= 0) return;
     LLVMValueRef *elems = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
     if (!elems) return;
     for (int i = 0; i < n; i++) {
         elems[i] = LLVMConstNull(i8ptr);
-        if (i >= g->leak_site_count) continue;
         if (g->site_coll && g->site_coll[i]) continue;   /* List/Dict/... */
         zan_symbol_t *sym = g->site_syms[i];
         if (!sym || !sym->type) continue;
         elems[i] = refl_meta_for(g, sym->type, sym->name.str, (int)sym->name.len);
     }
-    LLVMSetInitializer(g->g_site_meta, LLVMConstArray(i8ptr, elems, (unsigned)n));
+    LLVMTypeRef at = LLVMArrayType(i8ptr, (unsigned)n);
+    LLVMValueRef arr = LLVMAddGlobal(g->mod, at, "__zan_site_meta_tbl");
+    LLVMSetInitializer(arr, LLVMConstArray(i8ptr, elems, (unsigned)n));
+    LLVMSetLinkage(arr, LLVMInternalLinkage);
+    LLVMSetInitializer(g->g_site_meta,
+        LLVMConstBitCast(arr, LLVMPointerType(i8ptr, 0)));
     free(elems);
 }
 

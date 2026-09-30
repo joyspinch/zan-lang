@@ -11117,8 +11117,7 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
-    LLVMValueRef table = LLVMGetNamedGlobal(g->mod, "__zan_site_tynames");
-    if (!g->desc_hdr && !table) return LLVMConstInt(i1, 0, 0);
+    if (!g->desc_hdr && !g->g_site_tynames) return LLVMConstInt(i1, 0, 0);
     LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
     LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef false_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.f");
@@ -11164,19 +11163,19 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
         LLVMConstInt(i32, 0, 0), "is.seq");
     LLVMBuildCondBr(g->builder, seq, true_bb, false_bb);
 
-    /* out-of-range site index -> not a T. The bound is the constant table
-     * size, not g->leak_site_count: site indices are assigned module-wide
-     * across every `new` site, and this check may be emitted (e.g. inside a
-     * helper function) before later functions register their sites. The
-     * per-site name list is null for any never-registered index, so the walk
-     * below answers false for those anyway. */
+    /* out-of-range site index -> not a T. B-ID17: the bound is the published
+     * site count loaded at run time (the table is sized at finalize, after
+     * this check is emitted; site indices are assigned module-wide across
+     * every `new` site). The per-site name list is null for any
+     * never-registered index, so the walk below answers false for those. */
     LLVMPositionBuilderAtEnd(g->builder, oob_bb);
     LLVMValueRef oob;
     if (!g->desc_hdr) {
+        LLVMValueRef bound = LLVMBuildLoad2(g->builder, i64,
+            g->g_site_count, "is.bound");
         oob = zan_or(g->builder,
             zan_icmp(g->builder, LLVMIntSLT, site, LLVMConstInt(i64, 0, 0), "is.neg"),
-            zan_icmp(g->builder, LLVMIntSGE, site,
-                LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "is.oob"),
+            zan_icmp(g->builder, LLVMIntSGE, site, bound, "is.oob"),
             "is.oob2");
     } else {
         /* descriptor mode: the header word is the record pointer (never a
@@ -11203,10 +11202,11 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
     LLVMValueRef idx = LLVMBuildPhi(g->builder, i64, "is.i");
     LLVMValueRef list;
     if (!g->desc_hdr) {
-        LLVMValueRef list_p = LLVMBuildGEP2(g->builder,
-            LLVMArrayType(i8ptr, ZAN_MAX_LEAK_SITES), table,
-            (LLVMValueRef[]){ LLVMConstInt(i64, 0, 0), site }, 2, "is.lp");
-        list = LLVMBuildLoad2(g->builder, i8ptr, list_p, "is.list");
+        LLVMValueRef tbl = LLVMBuildLoad2(g->builder,
+            LLVMPointerType(i8ptr, 0), g->g_site_tynames, "is.tbl");
+        list = LLVMBuildLoad2(g->builder, i8ptr,
+            LLVMBuildGEP2(g->builder, i8ptr, tbl, &site, 1, "is.lp"),
+            "is.list");
     } else {
         /* load the record, then its tynames field (offset 8) */
         LLVMValueRef dp = LLVMBuildIntToPtr(g->builder, site,

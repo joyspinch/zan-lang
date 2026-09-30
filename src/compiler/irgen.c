@@ -967,12 +967,13 @@ static zan_irgen_t *g_di_emit_ctx = NULL;
  * Allocation sites with the same concrete class/generic/collection shape share
  * one slot; aliasing different shapes would dispatch the wrong destructor.
  *
- * The cap only limits CHECK-LEAKS builds: those index fixed
- * [ZAN_MAX_LEAK_SITES x ...] runtime tables keyed on the site id. Every other
- * build (descriptor mode, the default) stores a per-shape descriptor pointer
- * in the object header and its host-side site arrays grow dynamically, so
- * real programs are not bounded here. */
-#define ZAN_MAX_LEAK_SITES 4096
+ * Check-leaks builds used to index fixed [4096 x ...] runtime tables keyed on
+ * the site id, which made the number a hard compile-time ceiling (B-ID17: the
+ * IDE's full 534-file input blew past it). The tables are now emitted at
+ * finalize with the real site count and reached through pointer globals, so
+ * nothing bounds the site count here anymore. Every other build (descriptor
+ * mode, the default) stores a per-shape descriptor pointer in the object
+ * header and its host-side site arrays grow dynamically. */
 
 static bool types_equal(zan_type_t *a, zan_type_t *b);
 static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
@@ -1079,10 +1080,9 @@ static LLVMValueRef create_arc_desc(zan_irgen_t *g, int site_idx) {
 }
 
 /* Host-side per-site arrays (the `site_*` parallel tables and, in descriptor
- * mode, `desc_gv`). Only the check-leaks build indexes a fixed-size LLVM
- * runtime table, so only it keeps the cap: the runtime arrays are
- * [ZAN_MAX_LEAK_SITES x ...] there. Every other build grows these to whatever
- * the program's shape count demands. */
+ * mode, `desc_gv`). These grow dynamically; the RUNTIME tables they mirror are
+ * emitted at finalize with the real site count (see emit_site_live_tables),
+ * so no build is bounded by a fixed slot count anymore. */
 static bool site_arrays_reserve(zan_irgen_t *g, int want) {
     if (want <= g->leak_site_cap) return true;
     int newcap = g->leak_site_cap ? g->leak_site_cap * 2 : 256;
@@ -1162,15 +1162,9 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
             if (existing_sym == sym && types_equal(existing_inst, inst)) return i;
         }
     }
-    /* check-leaks builds index fixed [ZAN_MAX_LEAK_SITES x ...] runtime
-     * tables, so their cap is real; every other build grows. */
-    if (g->leak_site_count >= ZAN_MAX_LEAK_SITES && g->check_leaks) {
-        fprintf(stderr,
-            "zanc: too many distinct ARC allocation sites "
-            "(check-leaks maximum %d)\n",
-            ZAN_MAX_LEAK_SITES);
-        exit(1);
-    }
+    /* B-ID17: the runtime tables are sized to the real site count at
+     * finalize, so there is no cap to enforce here anymore; the host-side
+     * metadata arrays just grow. */
     if (!site_arrays_reserve(g, g->leak_site_count + 1) ||
         (g->desc_hdr && !desc_gv_reserve(g, g->leak_site_count + 1))) {
         fprintf(stderr, "zanc: out of memory growing ARC site tables\n");
@@ -1191,13 +1185,6 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
  * exists only for leak accounting -- and there it must be unique per lambda,
  * otherwise every closure in the program reports under one source location. */
 static int reserve_closure_site(zan_irgen_t *g) {
-    if (g->leak_site_count >= ZAN_MAX_LEAK_SITES && g->check_leaks) {
-        fprintf(stderr,
-            "zanc: too many distinct ARC destructor shapes "
-            "(check-leaks maximum %d)\n",
-            ZAN_MAX_LEAK_SITES);
-        exit(1);
-    }
     if (!site_arrays_reserve(g, g->leak_site_count + 1) ||
         (g->desc_hdr && !desc_gv_reserve(g, g->leak_site_count + 1))) {
         fprintf(stderr, "zanc: out of memory growing ARC site tables\n");
@@ -1974,35 +1961,37 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     {
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i8p  = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-        g->site_live_type  = LLVMArrayType(i64t, ZAN_MAX_LEAK_SITES);
-        g->site_names_type = LLVMArrayType(i8p,  ZAN_MAX_LEAK_SITES);
-        g->g_site_live = LLVMAddGlobal(g->mod, g->site_live_type, "__zan_site_live");
-        LLVMSetInitializer(g->g_site_live, LLVMConstNull(g->site_live_type));
-        LLVMSetLinkage(g->g_site_live, LLVMInternalLinkage);
-        g->g_site_names = LLVMAddGlobal(g->mod, g->site_names_type, "__zan_site_names");
-        LLVMSetInitializer(g->g_site_names, LLVMConstNull(g->site_names_type));
-        LLVMSetLinkage(g->g_site_names, LLVMInternalLinkage);
-        /* per-site ancestor-name list pointers for runtime `is`/`as` checks.
-         * The three per-shape tables below exist ONLY in check-leaks mode:
-         * descriptor builds (default) store one {dtor, tynames, meta, site}
-         * record pointer in the object header instead, so no global array
-         * pins every class's methods and --gc-sections can drop dead ones. */
         if (!g->desc_hdr) {
-            g->site_dtors_type = LLVMArrayType(i8p, ZAN_MAX_LEAK_SITES);
-            g->g_site_dtors = LLVMAddGlobal(g->mod, g->site_dtors_type, "__zan_site_dtors");
-            LLVMSetInitializer(g->g_site_dtors, LLVMConstNull(g->site_dtors_type));
+            /* B-ID17: the site tables are emitted at finalize with the real
+             * site count, so instrumentation reaches them through pointer
+             * globals (a global's type is fixed at creation, long before the
+             * count is known) and every runtime index check loads
+             * __zan_site_count instead of comparing against a fixed cap.
+             * Host-side per-site metadata below still grows dynamically. */
+            g->g_site_count = LLVMAddGlobal(g->mod, i64t, "__zan_site_count");
+            LLVMSetInitializer(g->g_site_count, LLVMConstInt(i64t, 0, 0));
+            LLVMSetLinkage(g->g_site_count, LLVMInternalLinkage);
+            g->g_site_live = LLVMAddGlobal(g->mod, LLVMPointerType(i64t, 0), "__zan_site_live");
+            LLVMSetInitializer(g->g_site_live, LLVMConstNull(LLVMPointerType(i64t, 0)));
+            LLVMSetLinkage(g->g_site_live, LLVMInternalLinkage);
+            g->g_site_names = LLVMAddGlobal(g->mod, LLVMPointerType(i8p, 0), "__zan_site_names");
+            LLVMSetInitializer(g->g_site_names, LLVMConstNull(LLVMPointerType(i8p, 0)));
+            LLVMSetLinkage(g->g_site_names, LLVMInternalLinkage);
+            /* per-site concrete destructor for release dispatch, ancestor-name
+             * list pointers for runtime `is`/`as` checks, and the reflection
+             * type record for obj.GetType(). The three per-shape tables below
+             * exist ONLY in check-leaks mode: descriptor builds (default)
+             * store one {dtor, tynames, meta, site} record pointer in the
+             * object header instead, so no global array pins every class's
+             * methods and --gc-sections can drop dead ones. */
+            g->g_site_dtors = LLVMAddGlobal(g->mod, LLVMPointerType(i8p, 0), "__zan_site_dtors");
+            LLVMSetInitializer(g->g_site_dtors, LLVMConstNull(LLVMPointerType(i8p, 0)));
             LLVMSetLinkage(g->g_site_dtors, LLVMInternalLinkage);
-        }
-        /* per-site ancestor-name list pointers for runtime `is`/`as` checks */
-        if (!g->desc_hdr) {
-            g->site_tynames_type = LLVMArrayType(i8p, ZAN_MAX_LEAK_SITES);
-            g->g_site_tynames = LLVMAddGlobal(g->mod, g->site_tynames_type, "__zan_site_tynames");
-            LLVMSetInitializer(g->g_site_tynames, LLVMConstNull(g->site_tynames_type));
+            g->g_site_tynames = LLVMAddGlobal(g->mod, LLVMPointerType(i8p, 0), "__zan_site_tynames");
+            LLVMSetInitializer(g->g_site_tynames, LLVMConstNull(LLVMPointerType(i8p, 0)));
             LLVMSetLinkage(g->g_site_tynames, LLVMInternalLinkage);
-            /* per-site reflection type record, for obj.GetType() */
-            g->site_meta_type = LLVMArrayType(i8p, ZAN_MAX_LEAK_SITES);
-            g->g_site_meta = LLVMAddGlobal(g->mod, g->site_meta_type, "__zan_site_meta");
-            LLVMSetInitializer(g->g_site_meta, LLVMConstNull(g->site_meta_type));
+            g->g_site_meta = LLVMAddGlobal(g->mod, LLVMPointerType(i8p, 0), "__zan_site_meta");
+            LLVMSetInitializer(g->g_site_meta, LLVMConstNull(LLVMPointerType(i8p, 0)));
             LLVMSetLinkage(g->g_site_meta, LLVMInternalLinkage);
         }
         g->site_syms = (zan_symbol_t **)calloc(g->leak_site_cap, sizeof(zan_symbol_t *));
@@ -2902,17 +2891,20 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef siptr = LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "siptr");
         LLVMValueRef dpp;
         if (!g->desc_hdr) {
-            /* site-index mode (check-leaks): dispatch through the dtor table */
+            /* site-index mode (check-leaks): dispatch through the dtor table.
+             * B-ID17: the bound and the table pointer load at runtime -- the
+             * table is sized at finalize, after this code is emitted. */
             LLVMValueRef site = LLVMBuildLoad2(g->builder, i64, siptr, "site");
+            LLVMValueRef bound = LLVMBuildLoad2(g->builder, i64,
+                g->g_site_count, "bound");
             LLVMValueRef inrange = zan_icmp(g->builder, LLVMIntULT, site,
-                LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "inrange");
+                bound, "inrange");
             LLVMBuildCondBr(g->builder, inrange, lookup, fb);
             LLVMPositionBuilderAtEnd(g->builder, lookup);
-            LLVMValueRef z32 = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
-            LLVMValueRef gidx[2] = { z32, site };
+            LLVMValueRef dtbl = LLVMBuildLoad2(g->builder,
+                LLVMPointerType(i8ptr, 0), g->g_site_dtors, "dtbl");
             LLVMValueRef dtor = LLVMBuildLoad2(g->builder, i8ptr,
-                LLVMBuildGEP2(g->builder, g->site_dtors_type, g->g_site_dtors,
-                              gidx, 2, "dtorp"), "dtor");
+                LLVMBuildGEP2(g->builder, i8ptr, dtbl, &site, 1, "dtorp"), "dtor");
             dpp = dtor;
             LLVMValueRef hasd = zan_icmp(g->builder, LLVMIntNE, dtor, LLVMConstNull(i8ptr), "hasd");
             LLVMBuildCondBr(g->builder, hasd, calld, fb);
@@ -2994,13 +2986,17 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
         if (g->check_leaks) {
-            /* leak tracking: total + per-site count, and record the site name */
-            LLVMValueRef z32 = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+            /* leak tracking: total + per-site count, and record the site name.
+             * B-ID17: tables are reached through pointer globals -- the arrays
+             * behind them are created at finalize with the real site count. */
             emit_leak_counter_add(g, g->g_live, 1);
-            LLVMValueRef gidx[2] = { z32, site };
-            LLVMValueRef sc_ptr = LLVMBuildGEP2(g->builder, g->site_live_type, g->g_site_live, gidx, 2, "scptr");
+            LLVMValueRef ltbl = LLVMBuildLoad2(g->builder,
+                LLVMPointerType(i64, 0), g->g_site_live, "ltbl");
+            LLVMValueRef sc_ptr = LLVMBuildGEP2(g->builder, i64, ltbl, &site, 1, "scptr");
             emit_leak_counter_add(g, sc_ptr, 1);
-            LLVMValueRef nm_ptr = LLVMBuildGEP2(g->builder, g->site_names_type, g->g_site_names, gidx, 2, "nmptr");
+            LLVMValueRef ntbl = LLVMBuildLoad2(g->builder,
+                LLVMPointerType(i8ptr, 0), g->g_site_names, "ntbl");
+            LLVMValueRef nm_ptr = LLVMBuildGEP2(g->builder, i8ptr, ntbl, &site, 1, "nmptr");
             LLVMBuildStore(g->builder, name, nm_ptr);
             emit_arc_trace_call(g, arc_trace_ev, "A", user_ptr,
                 LLVMConstInt(i64, 1, 0), site);
