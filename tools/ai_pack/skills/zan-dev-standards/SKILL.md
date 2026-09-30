@@ -362,5 +362,8 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   会看到与己无关的解析错误假象。隔离法：`git archive HEAD packages stdlib |
   tar -x` 解到独立临时目录，再拷入当前 zanc 与其运行时 obj 兄弟文件——包/stdlib
   发现跟 zanc **二进制位置**走，床内 zanc 只见 HEAD 冻结包，与工作树在途编辑完全
-  解耦；tar 报 linux 驱动符号链接失败在 Windows 无碍。适合"要在别人施工时量出
+  解耦；tar 报 linux 驱动符号链接失败在 Windows 无碍。**zanc 必须连带
+  捆绑件**：`ld.exe`、`ld.lld.exe`、`mingw/`（dllcrt2.o 等）拷到 zanc 同目录
+  ——zanc 只找自己旁边的 ld.exe，缺了就静默回退 PATH 上的 ld（GNU-ABI 链接满屏
+  undefined reference，档案里符号明明都在）。适合"要在别人施工时量出
   自己改动的真实基线"的场景（撞名定性、A/B 对照），日常验证仍走工作树。
