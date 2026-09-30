@@ -1365,9 +1365,23 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             ? LLVMBuildFPExt(g->builder, b, dbl, "ext")
                             : b)
                        : LLVMBuildSIToFP(g->builder, b, dbl, "tofp");
+                /* C# Math.Max/Min propagate NaN: either operand NaN makes the
+                 * result NaN, in both argument orders, and .NET returns the
+                 * FIRST NaN in argument order (left if left is NaN, else
+                 * right). A bare ordered comparison + select returned the
+                 * OTHER operand instead (Math.Max(NaN, 5) was 5). Test each
+                 * operand for NaN in order, then the ordered pick. */
+                LLVMValueRef a_nan = LLVMBuildFCmp(g->builder,
+                    LLVMRealUNO, a, a, "an");
+                LLVMValueRef b_nan = LLVMBuildFCmp(g->builder,
+                    LLVMRealUNO, b, b, "bn");
                 LLVMValueRef cmp = LLVMBuildFCmp(g->builder,
                     want_max ? LLVMRealOGT : LLVMRealOLT, a, b, "cmp");
-                return LLVMBuildSelect(g->builder, cmp, a, b,
+                LLVMValueRef picked = LLVMBuildSelect(g->builder, cmp, a, b,
+                    want_max ? "max" : "min");
+                LLVMValueRef from_b = LLVMBuildSelect(g->builder, b_nan, b,
+                    picked, want_max ? "max" : "min");
+                return LLVMBuildSelect(g->builder, a_nan, a, from_b,
                     want_max ? "max" : "min");
             }
             /* Integers of different widths (Math.Max(anInt, aLong)) can be
