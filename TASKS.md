@@ -21,7 +21,6 @@
 ')` 双重不匹配（内建 Split 签名 `List<string> Split(string separator)` 收 string；List<string>→string[] 无隐式转换），调用点 685355f6 引入、此前可编译说明近期 checker/内建面变化打破，worktree@29ddaae2 复现与 B-ID25 拆包无关（2026-09-30 坐实）；publish_ide.ps1 的 zan-mcp 步骤带 PUBLISH_WARN 继续、dist 落 stale 二进制。修法：调用点改 `List<string> lines = code.Split("
 ")`（或恢复既有转换语义，先归因）。
 - [ ] **B-ID28** GUI 回归门禁恢复——tests/gui/chatview_bubble_test.zan 以 build/zanc(HEAD) 编译后挂死（零输出，窗口建起不进帧），guimin 探针（同编译器、App.Create/Show/FrameGuarded/PumpGuarded/RequestAnimationFrame 全链路）DONE 正常，包根皮肤探针（stdlib-noskins+ZanSkinSim）DONE 正常，非 GUI 探针正常——挂死锁定在 chatview 88 文件闭包与并行会话在途 rt_io.c 定时器/反应器在途状态的环境交互，非拆包/包根发现回归。并行会话 rt_io 工作落地、zan_gui.dll 代际重暂存后：ctest -R conformance_gui_chatview_bubble 复跑，绿则解锁整包 Gui 拆分（B-ID26 尾注）。
-- [ ] **B-ID29**（原编号 B-ID27，让位并行会话 05e55978 的同名条目，批0 修正）zanc 与部分运行时测试目标在 Linux 无法构建（2026-09-30 批2f WSL 验证时发现，HEAD `29ddaae2` 复现）：① `src/compiler/arena.c` 无条件 `#include <windows.h>`，Linux 编译即错，zanc 整体断；② `src/runtime/rt_crash.h` 使用 `SA_ONSTACK`（glibc 在 `_GNU_SOURCE` 下才暴露），`-std=c11` 严格模式目标不定义它——zanrt_timer 与 addr_test/sigpipe_test/sync_test 编译失败。影响：Linux/CI 侧编译器与运行时 POSIX 路径无法本机构建验证（批2f 的多 worker 反应器只能绕开构建系统手编探针）。方向：arena.c 按 `_WIN32` 分支化；rt_crash.h 或构建系统在 `__linux__` 下补 `_GNU_SOURCE`。
 
 ## 未完成 · 运行时
 

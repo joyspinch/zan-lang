@@ -191,10 +191,21 @@ if(WIN32)
 else()
     set(ZAN_RT_IO_CC ${CMAKE_C_COMPILER})
 endif()
+# rt_crash.h's POSIX surface is documented to run with _GNU_SOURCE ("the
+# runtime builds define it"): SA_ONSTACK lives on glibc's __USE_GNU tier (a
+# plain -std=c11 object does not see it), dladdr crash symbolization and
+# gmtime_r likewise. These objects are built with explicit strict flags, so
+# carry the feature macro here. Windows/MinGW takes no definitions (the
+# glibc feature tiers do not exist there).
+if(NOT WIN32)
+    set(ZAN_RT_OBJ_DEFS -D_GNU_SOURCE)
+else()
+    set(ZAN_RT_OBJ_DEFS)
+endif()
 set(ZAN_RT_IO_OBJ "${CMAKE_BINARY_DIR}/zanrt_io${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_IO_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} -DZAN_IO_STACKLESS_ONLY
+    COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -DZAN_IO_STACKLESS_ONLY
             -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c -o ${ZAN_RT_IO_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
@@ -218,7 +229,7 @@ target_compile_definitions(zanc PRIVATE ZAN_RT_IO_OBJ="${ZAN_RT_IO_OBJ}")
 set(ZAN_RT_TIMER_OBJ "${CMAKE_BINARY_DIR}/zanrt_timer${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_TIMER_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} -std=c11
+    COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -std=c11
             -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c -o ${ZAN_RT_TIMER_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c
@@ -298,7 +309,7 @@ target_sources(zanc PRIVATE
 set(ZAN_RT_IO_MT_OBJ "${CMAKE_BINARY_DIR}/zanrt_io_mt${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_IO_MT_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER
+    COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER
             -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c -o ${ZAN_RT_IO_MT_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
@@ -330,7 +341,7 @@ add_custom_command(TARGET zanc POST_BUILD
 set(ZAN_RT_MEM_OBJ "${CMAKE_BINARY_DIR}/zanrt_mem${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_MEM_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} -std=c11
+    COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -std=c11
             -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_mem.c -o ${ZAN_RT_MEM_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_mem.c
@@ -718,6 +729,11 @@ set_target_properties(zanrt_sync_test PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED YES
 )
+if(NOT WIN32)
+    # rt_sync/rt_file exercise the POSIX surface (pthreads, sigaction);
+    # strict -std=c11 alone hides it on glibc.
+    target_compile_definitions(zanrt_sync_test PRIVATE _GNU_SOURCE)
+endif()
 if(WIN32)
     target_link_libraries(zanrt_sync_test PRIVATE)
 else()
@@ -744,6 +760,9 @@ set_target_properties(zanrt_io_addr_test PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED YES
 )
+if(NOT WIN32)
+    target_compile_definitions(zanrt_io_addr_test PRIVATE _GNU_SOURCE)
+endif()
 if(WIN32)
     target_link_libraries(zanrt_io_addr_test PRIVATE ws2_32)
 else()
@@ -772,6 +791,9 @@ if(NOT WIN32)
         C_STANDARD 11
         C_STANDARD_REQUIRED YES
     )
+    # The test body itself uses sigaction/struct sigaction; strict
+    # -std=c11 alone hides them on glibc.
+    target_compile_definitions(zanrt_sigpipe_test PRIVATE _GNU_SOURCE)
     find_package(Threads REQUIRED)
     target_link_libraries(zanrt_sigpipe_test PRIVATE Threads::Threads)
     add_test(NAME runtime_sigpipe COMMAND zanrt_sigpipe_test)

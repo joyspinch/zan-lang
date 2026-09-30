@@ -4496,7 +4496,12 @@ int main(int argc, char **argv) {
      * diagnostics, leak-site descriptors and per-access null-guard strings,
      * and the uncollapsed form bloats each of those by the redundant prefix. */
     {
-        char norm_root[1024];
+        /* PATH_MAX-sized: glibc's fortified realpath (__realpath_chk, armed by
+         * the distro's default _FORTIFY_SOURCE) aborts the process when the
+         * destination buffer is smaller than PATH_MAX -- a 1024 buffer killed
+         * every Linux zanc at startup inside main(). The _WIN32 twin has no
+         * such contract. */
+        char norm_root[4096];
 #ifdef _WIN32
         if (zan_utf8_full_path(stdlib_root, norm_root, sizeof(norm_root)))
             snprintf(stdlib_root, sizeof(stdlib_root), "%s", norm_root);

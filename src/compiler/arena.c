@@ -1,7 +1,6 @@
 /* arena.c -- Bump allocator implementation. */
 
 #include "arena.h"
-#include <windows.h>
 #include <stdlib.h>
 #include <string.h>
 

@@ -1480,6 +1480,15 @@ static void zan__crash_install(void) {
     once = 1;
     zan__crash_resolve_paths();
     zan__crash_cache_handler_state();
+#if defined(__linux__) && !defined(SA_ONSTACK)
+    /* SA_ONSTACK sits behind _GNU_SOURCE on glibc, and this header is
+     * routinely included after system headers, where a late feature-macro
+     * define cannot help. The flag is a kernel sigaction ABI bit (same
+     * value on glibc and musl, stable for decades), so take the literal
+     * when the macro never surfaced rather than failing every strict
+     * -std=c11 compile that reaches here. */
+#define SA_ONSTACK 0x08000000
+#endif
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = zan__crash_handler;
