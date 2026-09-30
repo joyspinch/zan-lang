@@ -4193,6 +4193,10 @@ typedef struct {
      * new one, and scope exit releases every field. Only private allocas are
      * flagged -- by-ref params and the borrowed `this` pointer are not. */
     int struct_rc;
+    /* B-ID33: 1 on a variable declared in a `for` init clause: a closure
+     * capturing it takes a fresh per-iteration cell holding the value at
+     * capture time (Go 1.22), not a reference to the one loop-carried cell. */
+    int per_iteration;
 } local_var_t;
 
 /* A function's locals live in a single flat scope. The backing array grows
@@ -4272,6 +4276,7 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].async_decl = NULL;
     scope->vars[scope->count].frame_owner = -1;
     scope->vars[scope->count].struct_rc = 0;
+    scope->vars[scope->count].per_iteration = 0;
     scope->count++;
     /* Record the variable for the debugger (no-op unless building with -g). The
      * emit context supplies the compiler state; local_add itself is g-free.

@@ -1780,6 +1780,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     case AST_FOR_STMT: {
         int for_start = locals->count;
         if (stmt->for_stmt.init) emit_stmt(g, stmt->for_stmt.init, locals);
+        /* B-ID33: variables declared in the init clause capture per iteration
+         * (Go 1.22). A closure created in the body takes a fresh cell holding
+         * the variable's value at capture time (see emit_closure_record), so
+         * storing delegates in a loop captures 0, 1, 2 instead of three
+         * references to the one loop-carried cell that ends at 3. The loop
+         * machinery itself keeps the single cell -- reads, writes, the step
+         * and the condition are untouched; only the capture shape changes. */
+        for (int i = for_start; i < locals->count; i++)
+            locals->vars[i].per_iteration = 1;
         /* Loop variables declared in the init clause live in [for_start,
          * for_body_start) and must survive across iterations (the step and
          * condition read them). Only body-scope locals [for_body_start, ..)

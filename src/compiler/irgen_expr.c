@@ -11572,6 +11572,10 @@ typedef struct {
      * reference to its cell, not a copy of its value, so writes on either
      * side are writes to the one variable. */
     int          boxed;
+    /* B-ID33: the boxed local is a `for`-init variable, so the record takes a
+     * fresh cell holding its value at capture time instead of retaining the
+     * shared loop cell (Go 1.22 per-iteration capture). */
+    int          per_iter;
 } lambda_capture_t;
 
 typedef struct {
@@ -11671,6 +11675,7 @@ static void cap_use(capture_scan_t *cs, zan_istr_t name) {
     c->name = name;
     c->type = lv->type;
     c->boxed = lv->box_cell ? 1 : 0;
+    c->per_iter = lv->per_iteration;
     if (c->boxed) {
         c->slot = lv->box_cell;
         c->llvm = LLVMPointerType(LLVMInt8TypeInContext(cs->g->ctx), 0);
@@ -12048,6 +12053,11 @@ static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
 /* Allocate and populate a closure record in the current frame and return the
  * tagged delegate value. `caps` are read from their enclosing slots, `self`
  * (when the record has a receiver field) is already loaded. */
+static LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
+                                  LLVMTypeRef payload, zan_type_t *vtype,
+                                  LLVMValueRef init);
+static LLVMValueRef box_value_ptr(zan_irgen_t *g, LLVMValueRef cell,
+                                  LLVMTypeRef payload);
 static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
                                         const char *lname, LLVMTypeRef rec_ty,
                                         LLVMValueRef fn_ptr, LLVMValueRef target,
@@ -12088,7 +12098,30 @@ static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
     for (int i = 0; i < capc; i++) {
         if (caps[i].boxed) {
             LLVMValueRef cell = caps[i].slot;
-            emit_arc_retain(g, cell);
+            if (caps[i].per_iter) {
+                /* B-ID33: a `for`-init variable is captured per iteration
+                 * (Go 1.22): build a fresh cell holding the variable's value
+                 * at capture time instead of retaining the one loop-carried
+                 * cell, so `for (int i = 0; i < 3; i++) fs.Add(() => i);`
+                 * captures 0, 1, 2 rather than three references to a cell
+                 * that ends at 3. The record owns the fresh cell's creation
+                 * reference outright (no extra retain), and its payload needs
+                 * its own reference when rc-managed -- the loop cell keeps
+                 * the one it has. */
+                zan_type_t *pt = caps[i].type;
+                LLVMTypeRef payload = map_type(g, pt);
+                LLVMValueRef cur = LLVMBuildLoad2(g->builder, payload,
+                    box_value_ptr(g, cell, payload), "loopvar.cap");
+                if (pt->kind == TYPE_STRUCT &&
+                    type_contains_collection_rc(g, pt, 0))
+                    emit_collection_value_retain(g, pt, cur, 0);
+                else if (is_rc_managed_type(pt) &&
+                         LLVMGetTypeKind(payload) == LLVMPointerTypeKind)
+                    emit_rc_retain_for_type(g, pt, cur);
+                cell = emit_box_cell(g, loc, payload, pt, cur);
+            } else {
+                emit_arc_retain(g, cell);
+            }
             LLVMBuildStore(g->builder, cell,
                 LLVMBuildStructGEP2(g->builder, rec_ty, rec,
                                     (unsigned)(ZAN_CLOSURE_HDR_FIELDS + i), "cap.bp"));
