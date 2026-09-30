@@ -2705,3 +2705,27 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
 - 定式：拆包后凡是"stdlib 文件当初靠活名门躲过的坑"都要重估——包文件的入编
   语义是"无条件"，stdlib 的语义是"被提及才入"。生成器子编译、LSP 单文件、
   任何 `--no-gen` 路径都在此列。
+
+## 分裂命名空间与数据资产：拆半留半的三连坑（2026-10-01，Zan.Text 拆包实测）
+
+- 坑一（真空门击穿）：System/Text 拆半留半（Encoding 留 stdlib，七个处理文件
+  入包）后 hello-world 从 14 文件涨到 21——永远入编的 ext 核心文件
+  （StringExtensions 等）带着 `using System.Text;`，把 System/Text 目录变成
+  **每编译必 reach**；包文件 pkg_src 无条件入编（活名门豁免是给"包取代整个
+  命名空间"设计的），于是整包拖进每个编译。修法：分裂命名空间（stdlib 目录
+  仍在，`hierarchical==0`）时包文件补 `gate_live` 标记、走与 stdlib 相同的
+  活名门；整目录迁走（stdlib 目录已消失）的包不受影响。修后 hello 13 文件、
+  `Csv.Parse` 活名照常按需拉入。
+- 坑二（auto-embed 硬编码）：Pinyin 的 GB2312 数据表靠 zanc 编译期自动嵌入
+  （main.c 硬编码 `<stdlib>/System/Text/data/pinyin.txt` → 资源名
+  "text/pinyin.txt"）。文件搬进包后嵌入静默落空，运行时回退链
+  （env→exe 旁→embed→源码树 walk-up）全脱，汉字直通不查表——表面是
+  "翻译失效"，实为嵌入断链。修法：改走 `zan_resolve_gui_resource_dir`
+  （stdlib 候选 + 全部包源根候选，Gui skins/icons 同款）。
+- 坑三（walk-up 尾分隔符停摆）：数据回退链的源码树逐级上溯写法
+  `dir=ExeDir(); 循环{ 扫到最后分隔符; dir=Substring(0,i); 试候选 }`——
+  ExeDir 返回**带尾分隔符**的目录，第一轮扫描立刻在末字符 break，
+  Substring(0,len) 原地不动，六轮全试同一条候选。此模式在 Gui 图标包等
+  同构代码里同样存在；循环前先剥一个尾分隔符。
+- 验证定式：数据表类拆包**必须探针查表**（中文输入→查音），ASCII 直通
+  （Pinyin("zhongwen")=="zhongwen"）不触发数据链，测了等于没测。

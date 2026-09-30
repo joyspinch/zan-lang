@@ -1166,6 +1166,12 @@ typedef struct pi_file {
                                    unconditionally -- package controllers are
                                    named only by generated route tables
                                    (GenRoute/__AttrRoutes), never by user code */
+    int gate_live;              /* split namespace (the stdlib dir still
+                                   exists next to the package): join only
+                                   when a top-level name is live, like a
+                                   stdlib file -- unconditional pkg joins
+                                   here would drag the whole package into
+                                   every compile that reaches the ns */
     int included;               /* joins the parse */
     int parsed;                 /* already appended to the input list */
     int seeded;                 /* already parse-seeded in the fixpoint */
@@ -2603,11 +2609,21 @@ static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
      * compile unconditionally. */
     int hierarchical = stdlib_has_dir(stdlib_root, d->subdir) == 0;
     int found = d->file_count != before;
+    int pre_visit = d->file_count;
     int package_count = zan_pkg_visit_namespace(package_project_root, d->subdir,
                                                  probe_file_namespace,
                                                  pi_add_package_source, d,
                                                  hierarchical);
     found = found || package_count > 0;
+    /* Split namespace (the stdlib dir still exists beside the package):
+     * package files must clear the live-name gate like stdlib files. This
+     * dir is reached by always-included core files (`using System.Text;` in
+     * an extension-method helper), and an unconditional join would drag the
+     * whole package into every compile (hello-world went 14 -> 21 files). */
+    if (!hierarchical) {
+        for (int i = pre_visit; i < d->file_count; i++)
+            d->files[i].gate_live = 1;
+    }
     /* `using System;` imports compiler/runtime core names rather than a
      * marketplace namespace; it must never become an install suggestion. */
     if (!found && package_project_root[0] != '\0' &&
@@ -2632,8 +2648,10 @@ static int pi_close_once(const char *stdlib_root) {
         for (int i = 0; i < d->file_count; i++) {
             pi_file_t *f = &d->files[i];
             if (f->included) continue;
-            int hit = f->has_ext || f->pkg_src;
-            const char *why = f->has_ext ? "ext" : (f->pkg_src ? "pkg" : NULL);
+            int hit = f->has_ext || (f->pkg_src && !f->gate_live);
+            const char *why = f->has_ext ? "ext"
+                              : (f->pkg_src ? (f->gate_live ? NULL : "pkg")
+                                             : NULL);
             for (int k = 0; k < f->top_count && !hit; k++)
                 if (f->top[k]->flagged) { hit = 1; why = f->top[k]->str; }
             if (!hit) continue;
@@ -6039,19 +6057,20 @@ int main(int argc, char **argv) {
         }
 
         /* ---- Pinyin dictionary inside the executable -------------------
-         * stdlib/System/Text/Pinyin keeps its GB2312 hanzi->pinyin table in
-         * a data file (stdlib/System/Text/data/pinyin.txt) resolved at run
-         * time like the Gui icon packs: env override, a file beside the exe,
-         * embedded resources, then the stdlib copy. When the compiled
-         * program actually carries that module, the stdlib file is baked in
-         * automatically under its discovery name "text/pinyin.txt" so a
-         * published program converts hanzi with nothing beside the exe. */
-        if (resolved_stdlib_root[0] &&
-            zan_irgen_defines_prefix(&irgen, "Pinyin_")) {
+         * System.Text.Pinyin keeps its GB2312 hanzi->pinyin table in a data
+         * file (Text/data/pinyin.txt, stdlib before the Zan.Text package
+         * split, packages/Zan.Text/src after) resolved at run time like the
+         * Gui icon packs: env override, a file beside the exe, embedded
+         * resources, then the source tree. When the compiled program
+         * actually carries that module, the file is baked in automatically
+         * under its discovery name "text/pinyin.txt" so a published program
+         * converts hanzi with nothing beside the exe. */
+        if (zan_irgen_defines_prefix(&irgen, "Pinyin_")) {
             char pinyin_path[1200];
-            snprintf(pinyin_path, sizeof(pinyin_path), "%s/System/Text/data/"
-                     "pinyin.txt", resolved_stdlib_root);
-            if (zan_file_exists(pinyin_path)) {
+            if (zan_resolve_gui_resource_dir(resolved_stdlib_root,
+                                            "System/Text/data/pinyin.txt",
+                                            pinyin_path, sizeof(pinyin_path))
+                ) {
                 char *pinyin_spec = (char *)malloc(strlen(pinyin_path) + 32);
                 if (pinyin_spec) {
                     /* resource name matches the reader's
