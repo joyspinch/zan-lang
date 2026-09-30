@@ -1434,8 +1434,9 @@ partial class Designer {
     /// 引用节点画布预览的构建缓存：组件文档只在代次变化时
     /// 重建（SetUserComponents / 尺寸变化 / 实例属性变化），
     /// 其余帧复用整棵 FormBuilder 树只重渲染。找不到组件或
-    /// 解析失败返回 null，调用方退回占位块。
-    Control PvCompCtl(FormField f, int w, int h) {
+    /// 解析失败返回 null，调用方退回占位块。新构建的树按声明
+    /// 接线预览分发（B-ID21），缓存命中直接复用已接线的树。
+    Control PvCompCtl(App app, FormField f, int w, int h) {
         if (f.customKind == "") { return null; }
         string doc = this.UserCompJson(f.customKind);
         if (doc == "") { return null; }
@@ -1455,6 +1456,15 @@ partial class Designer {
         Control ctl = FormBuilder.Build(root);
         this.ApplyCompProps(ctl, root, f);
         this.ApplyPreviewFormSize(ctl, root.Int("formSize", 1));
+        this.WirePreviewEvents(app, ctl);
+        // 宿主设计稿在引用节点上声明的 on<Event>：组件文档里没有，
+        // 单独绑到树的根控件（运行期 WireNode 解析的就是这批）。
+        for (int i = 0; i < f.events.Count; i = i + 1) {
+            string fe = f.events[i].key;
+            string fh = f.events[i].val;
+            if (fe == "" || fh == "") { continue; }
+            ctl.BindEventS(fe, (Control s) => { this.PvFlash(app, fe, fh, s); });
+        }
         pvCompKeys.Add(key);
         pvCompCtls.Add(ctl);
         if (pvCompKeys.Count > 64) {
@@ -1462,6 +1472,35 @@ partial class Designer {
             pvCompCtls.Clear();
         }
         return ctl;
+    }
+
+    /// 给预览真控件树按声明绑定分发反馈（B-ID21）：ChildWindow.
+    /// WireNode 的设计器版——处理器名没有注册表可解析，改成状态条
+    /// 闪现反馈。基类 FireCommon 只给有订阅的控件注册命中区
+    /// （`!On.Any()` 即返回），所以绑定本身就让"点了没反应"的
+    /// 声明控件变成可点的活预览。闭包按迭代捕获（B-ID33 语义），
+    /// 循环内绑定各拿各的 evt/hn。
+    void WirePreviewEvents(App app, Control root) {
+        if (root == null) { return; }
+        for (int i = 0; i < root.events.Count; i = i + 1) {
+            string evt = root.events[i].key;
+            string hn = root.events[i].val;
+            if (evt == "" || hn == "") { continue; }
+            root.BindEventS(evt, (Control s) => { this.PvFlash(app, evt, hn, s); });
+        }
+        for (int j = 0; j < root.children.Count; j = j + 1) {
+            this.WirePreviewEvents(app, root.children[j]);
+        }
+    }
+
+    /// 预览态事件分发反馈：状态条闪现 "事件 → 处理器名"，sender
+    /// 非空时附控件种类。预览里声明的处理器没有真身可调，这条
+    /// 反馈本身就是"这里会触发"的所见即所得。
+    void PvFlash(App app, string evt, string hname, Control sender) {
+        string who = "";
+        if (sender != null) { who = " · " + sender.Kind(); }
+        msg = Designer.T("preview ", "预览 ") + evt + " → " + hname + who;
+        if (app != null) { app.RequestRedraw(); }
     }
 
     /// 添加运行期注册（HeavyControls）的自定义组件
