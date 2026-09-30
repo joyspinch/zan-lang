@@ -63,6 +63,9 @@ SendAsync/SendDataAsync 推送事件，最后以 Close 收尾。
     `data:` 行，保证多行负载在线上格式中不被破坏。
     返回值 <= 0 表示订阅者已断开。
 
+- async int SendBytesAsync(string eventName, byte[]data, int dataOffset, int dataLen)
+  - 发送具名事件，载荷为原生字节数组。
+
 - async int SendDataAsync(string data)
   - 发送匿名（"message"）事件。
 

@@ -1,6 +1,6 @@
 # System.Automation
 
-> 源码: `stdlib/System/Automation/UiElement.zan`, `stdlib/System/Automation/Window.zan`
+> 源码: `packages/Zan.Desktop/src/System/Automation/UiElement.zan`, `packages/Zan.Desktop/src/System/Automation/Window.zan`
 
 
 ## UiElement (class)

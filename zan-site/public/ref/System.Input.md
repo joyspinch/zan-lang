@@ -1,6 +1,6 @@
 # System.Input
 
-> 源码: `stdlib/System/Input/Background.zan`, `stdlib/System/Input/Hook.zan`, `stdlib/System/Input/Hotkey.zan`, `stdlib/System/Input/InputTool.zan`, `stdlib/System/Input/Keyboard.zan`, `stdlib/System/Input/Mouse.zan`
+> 源码: `packages/Zan.Desktop/src/System/Input/Background.zan`, `packages/Zan.Desktop/src/System/Input/Hook.zan`, `packages/Zan.Desktop/src/System/Input/Hotkey.zan`, `packages/Zan.Desktop/src/System/Input/InputTool.zan`, `packages/Zan.Desktop/src/System/Input/Keyboard.zan`, `packages/Zan.Desktop/src/System/Input/Mouse.zan`
 
 
 ## Background (class)

@@ -1901,6 +1901,16 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
 - **HTTP Chunked 上传零内存累积流式落盘**：
   - `HttpFramer.SaveBodyToFile` 此前仅支持定长 `Content-Length` 请求体写盘，对 `Transfer-Encoding: chunked` 的分块上传未处理；
   - 定式：增补 `SaveChunkedBodyToFile`，按 RFC 9112 规范流式解码各个十六进制 chunk 并直接写盘后即时 `Discard`，将 GB 级 chunked 上传内存恒定在单个分块（<=64KB）以内，异常或超限时自动回滚清理临时文件。
+**坑十五（MQTT 会话订阅实体建模与原生字节广播、HTTP/2 二进制帧编解码与 SSE 零二次切片发送）**：
+- **MQTT 会话过滤器与 QoS 平行列表违规实体化重构**：
+  - `MqttSession` 原先维护 `List<string> filters` 与 `List<int> qos` 两条平行列表，在增删订阅与管理接口导出时需双向索引对齐，存在索引错位与代码冗余隐患；
+  - 定式：定义 `MqttSubscription(filter, qos)` 实体记录，统一由 `List<MqttSubscription> subscriptions` 承载；`BuildPublish` 载荷搬运剥离逐字节解释循环，替换为 `NativeMemory.PutString`，并增补 `BuildPublishBytes` 支持裸字节数组切片零中转字符串直发；
+- **HTTP/2 协议层二进制分帧基础能力扩充**：
+  - 原 `Http2Frame` 仅支持帧头编码与设置帧确认，缺失 RFC 7540 标准错误码、固定帧头解码与控制帧构建原语；
+  - 定式：补齐 `Http2Error` 错误码（RFC 7540 §7）、`DecodeHeader(buf, offset)` 帧头反序列化，以及 `BuildRstStream`、`BuildGoAway`、`BuildWindowUpdate`、`BuildPing` 等控制分帧构建方法；
+- **SSE 服务端推送二次字符串切片与多行数据二次幂拼接消除**：
+  - `SseConnection.SendAsync` 在底层 TCP 发生背压部分写入时，原先在循环内反复执行 `frame.Substring(sent, total - sent)` 造成大量堆内存分配；`ParseBlock` 在接收多行 `data:` 时原先使用字符串拼接导致二次幂内存膨胀；`TcpClient` 缺失基于偏移量与长度的字节数组切片发送；
+  - 定式：`TcpClient` 增补 `SendBytesAsync(byte[] data, int offset, int len)` 与 `TcpListener.AcceptTcpClientAsync()`；`SseConnection` 移除无谓的 Substring 循环并增补 `SendBytesAsync(eventName, byte[] data, offset, len)` 原生字节推送通道；`SseClient.ParseBlock` 改用 `StringBuilder` 线性累加多行数据载荷。
 
 
 ## File 读族 alt-base 回退 exe 目录 vs Directory 清理 CWD 相对：测试缓存目录必须用绝对路径
@@ -2557,3 +2567,24 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
 - 金样 CRLF 假差异：程序输出经控制台带 CR、金样是纯 LF 时，手搓 diff 报
   `1c1 < PASS > PASS`；先 od -c 看字节，再用 diff --strip-trailing-cr 复核，
   并与 HEAD 干净树 A/B 确认既有，勿当回归修。
+
+## 裸简单名调用的"全局兜底唯一性"：跨包同名类同框即失效（2026-09-30，Zan.Desktop 拆包实测）
+
+- 坑：不带 using 的静态调用（如 Gui 代码裸写 `Window.GetTickMs()`，Window 实为
+  Gui.Backend.Window）走简单名全局兜底解析，该兜底要求**全编译面唯一**。当另一个包
+  声明了同名类（System.Automation.Window / System.Windows.Clipboard）同框编译，
+  所有缺精确 using 的裸调用集体失效——报 `not a known variable, type, or namespace`
+  而非 ambiguous，极具误导性（看似"类没编进来"，实为撞名把兜底打挂）。带 using 的
+  调用方不受影响（using 命中优先于兜底），所以最小两文件复现常测不出来——必须
+  复刻"调用方无 using"的形态。
+- 地雷为何长期不爆：消费者从不同框。IDE 显式清单从不编 Automation；demand-pull
+  程序不拉 Desktop；同名类分属 Gui 包与 Desktop 包后，只有把两包同时喂进编译
+  （IDE 全量构建正是）才引爆。拆包/加包时先扫同名类对：
+  `grep -rn "^class Window\b" packages/*/{src,stdlib}` 之类，成对即预警。
+- 修法是补精确 using（`using Gui.Backend;` 一行/文件），不是改编译器语义——
+  裸调依赖兜底唯一性本就是侥幸。一个文件同时 using 两个提供同名类的命名空间时
+  （如 ZanIDE.zan 同时要 System.Windows.MessageBox 与 Gui.Backend.Clipboard），
+  把用途少的那个改成限定调用（`System.Windows.MessageBox.Show(...)`）并删其 using。
+- 排除自身编译器改动干扰的快捷 A/B：dist/win-x64/toolchain/zanc.exe 是上一轮
+  publish 的编译器快照，把它拷到 build/zanc.exe 跑同一构建（IDE_NO_PUBLISH=1），
+  同错 ⇒ 非新编译器回归。用完恢复原 zanc。

@@ -1,6 +1,6 @@
 # System.Management
 
-> 源码: `stdlib/System/Management/Cpu.zan`, `stdlib/System/Management/Device.zan`, `stdlib/System/Management/Display.zan`, `stdlib/System/Management/Memory.zan`, `stdlib/System/Management/Power.zan`, `stdlib/System/Management/Registry.zan`, `stdlib/System/Management/Storage.zan`, `stdlib/System/Management/SystemInfo.zan`, `stdlib/System/Management/TaskScheduler.zan`
+> 源码: `packages/Zan.Desktop/src/System/Management/Cpu.zan`, `packages/Zan.Desktop/src/System/Management/Device.zan`, `packages/Zan.Desktop/src/System/Management/Display.zan`, `packages/Zan.Desktop/src/System/Management/Memory.zan`, `packages/Zan.Desktop/src/System/Management/Power.zan`, `packages/Zan.Desktop/src/System/Management/Registry.zan`, `packages/Zan.Desktop/src/System/Management/Storage.zan`, `packages/Zan.Desktop/src/System/Management/SystemInfo.zan`, `packages/Zan.Desktop/src/System/Management/TaskScheduler.zan`
 
 
 ## Cpu (class)

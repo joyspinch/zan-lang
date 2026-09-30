@@ -696,6 +696,9 @@ Windows 使用 Winsock2，Linux/macOS 使用 BSD 套接字（libc）。
 - async int SendBytesAsync(byte[]data, int len)
   - 发送原始字节数组，必要时在 IO reactor 上挂起。
 
+- async int SendBytesAsync(byte[]data, int offset, int len)
+  - 发送原始字节数组指定切片，必要时在 IO reactor 上挂起。
+
 - async string RecvAsync(int bufSize)
   - 接收数据，在 IO reactor 上挂起直到可读。
 
@@ -803,6 +806,10 @@ nint client = await TcpListener.AcceptAsync(listener);
   - 在 IO reactor 上挂起直到客户端连接，然后接受
     连接。接受的套接字被设为非阻塞，因此其上的异步 recv/send 也会
     在 reactor 上挂起。
+
+- async TcpClient AcceptTcpClientAsync()
+  - 在 IO reactor 上挂起直到客户端连接，返回已置为非阻塞的
+    `TcpClient` 实例。接受失败返回 null。
 
 - nint Accept()
   - 同步接受客户端连接。

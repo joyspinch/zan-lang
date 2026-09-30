@@ -1,6 +1,6 @@
 # System.Windows.Clipboard
 
-> 源码: `stdlib/System/Windows/Clipboard/Clipboard.zan`
+> 源码: `packages/Zan.Desktop/src/System/Windows/Clipboard/Clipboard.zan`
 
 
 ## ClipFormat (class)

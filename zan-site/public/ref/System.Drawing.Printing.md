@@ -1,6 +1,6 @@
 # System.Drawing.Printing
 
-> 源码: `stdlib/System/Drawing/Printing/Printing.zan`
+> 源码: `packages/Zan.Desktop/src/System/Drawing/Printing/Printing.zan`
 
 
 ## CupsRawPrinterBackend (class)

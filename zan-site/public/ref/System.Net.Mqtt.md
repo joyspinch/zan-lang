@@ -104,7 +104,10 @@ worker 由 Worker 接受连接并为每个客户端调用
 
 - static byte[]BuildPublish(string topic, string payload, int payloadLen)
   - 构建 QoS 0 的 PUBLISH 报文（固定头 + varint 剩余长度 +
-    2 字节主题长度 + 主题 + 载荷；载荷可含 NUL，按 len 精确拷贝）。
+    2 字节主题长度 + 主题 + 载荷；载荷可含 NUL，按 len 原生内存精确拷贝）。
+
+- static byte[]BuildPublishBytes(string topic, byte[]payload, int pOffset, int payloadLen)
+  - 构建 QoS 0 的 PUBLISH 报文（原生 byte[] 载荷，零中转字符串拷贝）。
 
 - static byte[]BuildPublishRetain(string topic, string payload, int payloadLen)
   - 构建带 Retain 标记的 PUBLISH 报文。
@@ -529,9 +532,7 @@ broker 持有的单个已连接 MQTT 客户端会话：其套接字、客户端 
 
 - string addr;
 
-- List<string> filters;
-
-- List<int> qos;
+- List<MqttSubscription> subscriptions;
 
 - bool alive;
 
@@ -621,6 +622,17 @@ broker 持有的单个已连接 MQTT 客户端会话：其套接字、客户端 
 - string filter;
 
 - int qos;
+
+
+## MqttSubscription (class)
+
+会话订阅的主题过滤器及授予的 QoS 实体记录。
+
+- string filter;
+
+- int qos;
+
+- MqttSubscription(string filter, int qos)
 
 
 ## MqttTopicDoc (class)

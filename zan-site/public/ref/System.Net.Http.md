@@ -3,6 +3,39 @@
 > 源码: `stdlib/System/Net/Http/Http2Frame.zan`, `stdlib/System/Net/Http/HttpFramer.Tls.zan`, `stdlib/System/Net/Http/HttpFramer.zan`, `stdlib/System/Net/Http/HttpRequest.zan`, `stdlib/System/Net/Http/HttpResponse.zan`, `stdlib/System/Net/Http/HttpServer.zan`
 
 
+## Http2Error (class)
+
+HTTP/2 标准错误码（RFC 7540 §7）。
+
+- public const int NO_ERROR=0;
+
+- public const int PROTOCOL_ERROR=1;
+
+- public const int INTERNAL_ERROR=2;
+
+- public const int FLOW_CONTROL_ERROR=3;
+
+- public const int SETTINGS_TIMEOUT=4;
+
+- public const int STREAM_CLOSED=5;
+
+- public const int FRAME_SIZE_ERROR=6;
+
+- public const int REFUSED_STREAM=7;
+
+- public const int CANCEL=8;
+
+- public const int COMPRESSION_ERROR=9;
+
+- public const int CONNECT_ERROR=10;
+
+- public const int ENHANCE_YOUR_CALM=11;
+
+- public const int INADEQUATE_SECURITY=12;
+
+- public const int HTTP_1_1_REQUIRED=13;
+
+
 ## Http2Flags (class)
 
 - public const int END_STREAM=1;
@@ -37,8 +70,23 @@
   - 编码 9 字节固定帧头：
     Length (24-bit) + Type (8-bit) + Flags (8-bit) + StreamID (31-bit)。
 
+- public static Http2Frame DecodeHeader(byte[]buf, int offset)
+  - 从字节数组指定偏移解码 9 字节固定帧头。
+
 - public static byte[]BuildSettingsAck()
   - 构造空的 SETTINGS 确认帧（ACK）。
+
+- public static byte[]BuildRstStream(int streamId, int errorCode)
+  - 构造 RST_STREAM 帧（RFC 7540 §6.4，4 字节错误码载荷）。
+
+- public static byte[]BuildGoAway(int lastStreamId, int errorCode)
+  - 构造 GOAWAY 帧（RFC 7540 §6.8，连接级流 0，8 字节基础载荷）。
+
+- public static byte[]BuildWindowUpdate(int streamId, int windowSizeIncrement)
+  - 构造 WINDOW_UPDATE 帧（RFC 7540 §6.9，4 字节窗口增量载荷）。
+
+- public static byte[]BuildPing(byte[]opaqueData8, bool ack)
+  - 构造 PING 帧（RFC 7540 §6.7，8 字节透明载荷）。
 
 
 ## Http2FrameType (class)

@@ -1,6 +1,6 @@
 # System.Media
 
-> 源码: `stdlib/System/Media/Audio.zan`
+> 源码: `packages/Zan.Desktop/src/System/Media/Audio.zan`
 
 
 ## Audio (class)

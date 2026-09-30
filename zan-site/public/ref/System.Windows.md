@@ -1,6 +1,6 @@
 # System.Windows
 
-> 源码: `stdlib/System/Windows/MessageBox.zan`, `stdlib/System/Windows/Screen.zan`, `stdlib/System/Windows/TrayIcon.zan`
+> 源码: `packages/Zan.Desktop/src/System/Windows/MessageBox.zan`, `packages/Zan.Desktop/src/System/Windows/Screen.zan`, `packages/Zan.Desktop/src/System/Windows/TrayIcon.zan`
 
 
 ## MessageBox (class)

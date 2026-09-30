@@ -1,6 +1,6 @@
 # System.Drawing
 
-> 源码: `stdlib/System/Drawing/ImageBuffer.zan`, `stdlib/System/Drawing/PixelOps.zan`, `stdlib/System/Drawing/Primitives.zan`
+> 源码: `packages/Zan.Desktop/src/System/Drawing/ImageBuffer.zan`, `packages/Zan.Desktop/src/System/Drawing/PixelOps.zan`, `packages/Zan.Desktop/src/System/Drawing/Primitives.zan`
 
 
 ## Color (class)
