@@ -101,11 +101,13 @@ if (Test-Path packages\Zan.Security) {
 if (Test-Path packages\Zan.Net) {
     $files += (Get-ChildItem packages\Zan.Net\src -Recurse -Include *.zan).FullName
 }
+if (Test-Path packages\Zan.Diagnostics) {
+    $files += (Get-ChildItem packages\Zan.Diagnostics\src -Recurse -Include *.zan).FullName
+}
 # System pieces the editor/workspace rely on.
 $files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\IO\FileInfo.zan")
-$files += (Join-Path (Get-Location) "stdlib\System\Diagnostics\Process.zan")
 # The publish path archives a macOS/Linux output directory as tar (the only
 # common format that carries the unix mode bit) -- see ZanIDE.Package.zan.
 $files += (Join-Path (Get-Location) "stdlib\System\IO\Compression\Tar.zan")

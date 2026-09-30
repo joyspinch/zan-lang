@@ -323,9 +323,10 @@ class RedisClient {
             r.len = (int)strlen(rest);
             return r;
         }
-        if (prefix == 58) {                 // ':' 整数
+        if (prefix == 58) {                 // ':' 整数（64 位安全）
             r.kind = RedisReply.INT;
-            r.integer = Convert.ToInt(rest);
+            r.integer64 = Convert.ToInt64(rest);
+            r.integer = (int)r.integer64;
             return r;
         }
         if (prefix == 36) {                 // '$' bulk 字符串
@@ -593,16 +594,90 @@ class RedisClient {
         return r.AsInt();
     }
 
+    /// <summary>DEL 批量删除多个键。返回被成功删除的键数量。</summary>
+    async int DelMultipleAsync(List<string> keys) {
+        if (keys == null || keys.Count == 0) { return 0; }
+        List<string> args = new List<string>();
+        args.Add("DEL");
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            args.Add(keys[i]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsInt();
+    }
+
     /// <summary>EXISTS key。键存在返回 1，否则返回 0。</summary>
     async int ExistsAsync(string key) {
         RedisReply r = await this.CommandAsync2("EXISTS", key);
         return r.AsInt();
     }
 
-    /// <summary>INCR key。返回自增后的值。</summary>
+    /// <summary>INCR key。返回自增后的值（32 位）。</summary>
     async int IncrAsync(string key) {
         RedisReply r = await this.CommandAsync2("INCR", key);
         return r.AsInt();
+    }
+
+    /// <summary>INCR key。返回自增后的 64 位值，杜绝 20 亿计数溢出。</summary>
+    async long Incr64Async(string key) {
+        RedisReply r = await this.CommandAsync2("INCR", key);
+        return r.AsLong();
+    }
+
+    /// <summary>INCRBY key amount。按指定的 64 位增量自增，返回新值。</summary>
+    async long IncrByAsync(string key, long amount) {
+        RedisReply r = await this.CommandAsync3("INCRBY", key, Convert.ToString(amount));
+        return r.AsLong();
+    }
+
+    /// <summary>DECR key。返回自减后的 64 位值。</summary>
+    async long Decr64Async(string key) {
+        RedisReply r = await this.CommandAsync2("DECR", key);
+        return r.AsLong();
+    }
+
+    /// <summary>DECRBY key amount。按指定的 64 位减量自减，返回新值。</summary>
+    async long DecrByAsync(string key, long amount) {
+        RedisReply r = await this.CommandAsync3("DECRBY", key, Convert.ToString(amount));
+        return r.AsLong();
+    }
+
+    /// <summary>MGET 批量获取多个键对应的值（支持大数据量批量获取）。不存在的键在列表中表现为空字符串。</summary>
+    async List<string> MGetAsync(List<string> keys) {
+        List<string> res = new List<string>();
+        if (keys == null || keys.Count == 0) { return res; }
+        List<string> args = new List<string>();
+        args.Add("MGET");
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            args.Add(keys[i]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        if (r.kind == RedisReply.ARRAY && r.items != null) {
+            for (int i = 0; i < r.items.Count; i = i + 1) {
+                RedisReply item = r.items[i];
+                if (item.IsNil()) {
+                    res.Add("");
+                } else {
+                    res.Add(item.AsString());
+                }
+            }
+        }
+        return res;
+    }
+
+    /// <summary>MSET 批量设置多个键值对。收到 +OK 返回 true。</summary>
+    async bool MSetAsync(List<string> keys, List<string> vals) {
+        if (keys == null || vals == null || keys.Count == 0 || keys.Count != vals.Count) {
+            return false;
+        }
+        List<string> args = new List<string>();
+        args.Add("MSET");
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            args.Add(keys[i]);
+            args.Add(vals[i]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsString() == "OK";
     }
 
     /// <summary>EXPIRE key seconds。设置成功返回 1。</summary>

@@ -1056,6 +1056,8 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - **ORM 超大批量写入参数上限与自动分批（`OrmInsert`）**：各 SQL 数据库对 Prepared Statement 参数个数具有硬性上限（SQL Server 上限 2,100，SQLite 上限 999，MySQL/PostgreSQL 上限 65,535）。当批量插入上千甚至上万行数据时，单条巨大的 SQL 不仅引发数据库参数超限崩溃，还会在堆上瞬间分配数十兆的 StringBuilder 与 DbParams 引起 GC 卡顿。解法：在 `OrmInsert` 引入 `safeBatchRows(colCount)` 动态计算单批次安全行数（如 SQLite 500/N，SQL Server 1000/N，默认 1000/N，上限 500 行），并在 `ExecuteAffrows` / `ExecuteAffrowsAsync`（实体行与字典行双通道）自动按批次范围（`BuildRowsRange`/`BuildDictsRange`）执行与累加行数，内存与参数严格恒定在安全阈值内。
 - **ORM 写入字段名元数据严格校验**：`OrmUpdate.SetI/SetL/SetD/SetS/SetB/SetIncr*` 以及 `OrmInsert.Only/Skip/OC/ACC/GMX/GMN` 必须经 `this.meta.Require(c)` 或 `RequireCol(c)` 校验，剥除可选的 `t.` 前缀并检查实体字段元数据，未知列或非法注入片段抛异常，杜绝直接拼接裸列名进 SQL 文本。
 - **MqttBroker 规避代码生成器 Json.Serialize<T> 循环依赖**：`MqttBroker` 位于网络核心服务路径，管理快照（`ClientsJson`/`ClientDetailJson`/`SubscriptionsJson`/`TopicsJson`/`MetricsJson`）统一改用标准库原生 `JsonValue` 组树（`NewObject`/`NewArray`/`NewStr`/`NewInt`/`arr.items.Add`/`ToJson()`），彻底打破在编译器子进程 `--no-gen` 模式下的序列化降层依赖；测试与退出时显式调用 `WorkerMqtt.Uninstall()`（解除 `Worker.mqttEntry` 并执行 `MqttBroker.TeardownGlobal()`），确保 leakcheck 零保持根干净退出。
+- **Redis 64位整型与RESP批量键值操作（`RedisReply` / `RedisClient`）**：RESP协议的整数回复（`:12345678901234\r\n`）与自增计数（INCRBY、分布式计数器、雪花ID、时间戳）常远超32位有符号整型上限（21亿），若直接按32位int解析将发生静默溢出。解法：在`RedisReply`升级引入64位长整型`integer64`与`AsLong()`，并增补`Incr64Async`、`IncrByAsync`、`Decr64Async`、`DecrByAsync`；在大数据量键值读写场景下，单key循环请求导致严重的网络RTT往返空耗，补齐`MGetAsync`、`MSetAsync`与`DelMultipleAsync`原生RESP批量管道操作。
+- **DbResult 零拷贝行实体读取（`DbRow` / `DbResult.RowAt`）**：传统`DbResult.GetRow(i)`在遍历每一行时均创建新的`List<string>`副本并拷贝字段，在十万行级大结果集下产生十万次多余的列表堆分配与GC压力。在`DbRow`上直接提供`GetString`、`GetInt`、`GetLong`、`GetDouble`、`GetBool`与`IsNull`访问器，并在`DbResult`提供`RowAt(index)`返回只读行引用，消除行克隆分配。
 
 
 
