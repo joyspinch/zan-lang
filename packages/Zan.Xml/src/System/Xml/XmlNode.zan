@@ -1,0 +1,261 @@
+using System;
+using System.Text;
+
+namespace System.Xml;
+
+/// <summary>
+/// XML 属性。名字原样保留（可带命名空间前缀，如 <c>D:href</c>）；
+/// 值为实体解码、CR 归一后的文本。
+/// </summary>
+class XmlAttribute {
+    /// 属性名（原样，含前缀）。
+    public string name;
+    /// 属性值（已解码）。
+    public string value;
+}
+
+/// <summary>
+/// XML 树节点。元素/文本/CDATA/注释/PI/声明/DOCTYPE 用
+/// <see cref="kind"/> 区分：元素持有 <see cref="attrs"/> 与
+/// <see cref="children"/>，其余类别只用 <see cref="text"/> 承载内容。
+///
+/// 命名空间不做解析（没有 xmlns 作用域表）：名字按原文匹配，
+/// 用不带前缀的名字查找时回退到"忽略前缀只比本地名"，这样
+/// <c>Element("href")</c> 能命中 <c>&lt;D:href&gt;</c>——WebDAV、
+/// WeChat 这类前缀随服务器变化的报文靠这一条规则就够用。
+/// </summary>
+class XmlNode {
+    /// 节点类别：0 元素，1 文本，2 CDATA，3 注释，4 PI，5 声明，6 DOCTYPE。
+    public int kind;
+    /// 元素名 / PI 与声明的目标名；DOCTYPE 时不用（原文存 text）。
+    public string name;
+    /// 文本与 CDATA 的内容；注释与 PI 的正文；DOCTYPE 的原文。
+    public string text;
+    /// 元素属性（其余类别为 null）。
+    public List<XmlAttribute> attrs;
+    /// 子节点（仅元素有）。
+    public List<XmlNode> children;
+
+    /// 构造元素节点。
+    static XmlNode NewElement(string name) {
+        XmlNode n = new XmlNode();
+        n.kind = 0;
+        n.name = name;
+        return n;
+    }
+
+    /// 构造文本节点。
+    static XmlNode NewText(string text) {
+        XmlNode n = new XmlNode();
+        n.kind = 1;
+        n.text = text;
+        return n;
+    }
+
+    /// 构造 CDATA 节点（内容原样保存，不参与实体解码）。
+    static XmlNode NewCdata(string text) {
+        XmlNode n = new XmlNode();
+        n.kind = 2;
+        n.text = text;
+        return n;
+    }
+
+    /// 构造注释节点。
+    static XmlNode NewComment(string text) {
+        XmlNode n = new XmlNode();
+        n.kind = 3;
+        n.text = text;
+        return n;
+    }
+
+    /// 构造处理指令节点（<c>&lt;?target body?&gt;</c>）。
+    static XmlNode NewPi(string target, string body) {
+        XmlNode n = new XmlNode();
+        n.kind = 4;
+        n.name = target;
+        n.text = body;
+        return n;
+    }
+
+    /// 构造 XML 声明节点；版本/编码/standalone 走属性表。
+    static XmlNode NewDecl() {
+        XmlNode n = new XmlNode();
+        n.kind = 5;
+        n.name = "xml";
+        return n;
+    }
+
+    /// 构造 DOCTYPE 节点（<see cref="text"/> 存 <c>&lt;!DOCTYPE ...&gt;</c> 原文）。
+    static XmlNode NewDoctype(string raw) {
+        XmlNode n = new XmlNode();
+        n.kind = 6;
+        n.text = raw;
+        return n;
+    }
+
+    /// 是否元素节点。
+    bool IsElement() {
+        return kind == 0;
+    }
+
+    /// 追加子节点（懒建 children 列表）。
+    void AddChild(XmlNode child) {
+        if (children == null) { children = new List<XmlNode>(); }
+        children.Add(child);
+    }
+
+    /// 追加文本：上一子节点已是文本就并入，避免实体解码把一段
+    /// 文本切成多个碎片节点。
+    void MergeText(string piece) {
+        if (piece.Length == 0) { return; }
+        if (children != null && children.Count > 0) {
+            XmlNode last = children[children.Count - 1];
+            if (last.kind == 1) {
+                last.text = last.text + piece;
+                return;
+            }
+        }
+        AddChild(XmlNode.NewText(piece));
+    }
+
+    /// 构建侧便捷方法：追加一段文本（合并语义同 <see cref="MergeText"/>）。
+    void AddText(string text) {
+        MergeText(text);
+    }
+
+    /// 追加属性（懒建 attrs 列表）。
+    void AddAttr(XmlAttribute a) {
+        if (attrs == null) { attrs = new List<XmlAttribute>(); }
+        attrs.Add(a);
+    }
+
+    /// 设置属性：已有同名（原样比较）就改值，没有则追加。
+    void SetAttr(string attrName, string value) {
+        if (attrs != null) {
+            for (int i = 0; i < attrs.Count; i = i + 1) {
+                if (attrs[i].name == attrName) {
+                    attrs[i].value = value;
+                    return;
+                }
+            }
+        }
+        XmlAttribute a = new XmlAttribute();
+        a.name = attrName;
+        a.value = value;
+        AddAttr(a);
+    }
+
+    /// 取属性值；不存在返回 null。无前缀的名字回退本地名匹配。
+    string Attr(string attrName) {
+        if (attrs == null) { return null; }
+        for (int i = 0; i < attrs.Count; i = i + 1) {
+            if (attrs[i].name == attrName) { return attrs[i].value; }
+        }
+        if (XmlNode.IndexOf(attrName, ":", 0) < 0) {
+            for (int i = 0; i < attrs.Count; i = i + 1) {
+                if (XmlNode.LocalNameOf(attrs[i].name) == attrName) {
+                    return attrs[i].value;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// 取属性值；不存在返回 fallback。
+    string AttrOr(string attrName, string fallback) {
+        string v = Attr(attrName);
+        if (v == null) { return fallback; }
+        return v;
+    }
+
+    /// 本地名：原样名字里最后一个 ':' 之后的部分；无前缀时原样返回。
+    string LocalName() {
+        return XmlNode.LocalNameOf(name);
+    }
+
+    /// 限定名的本地名部分（最后一个 ':' 之后）；无 ':' 原样返回。
+    static string LocalNameOf(string qname) {
+        if (qname == null) { return ""; }
+        int colon = -1;
+        for (int i = qname.Length - 1; i >= 0; i = i - 1) {
+            if ((qname[i] & 255) == 58) {
+                colon = i;
+                break;
+            }
+        }
+        if (colon < 0) { return qname; }
+        return qname.Substring(colon + 1, qname.Length - colon - 1);
+    }
+
+    /// 子节点按名匹配规则：先精确匹配原样名字；查询名不带 ':'
+    /// 时再回退本地名匹配。带前缀的查询只做精确匹配。
+    bool MatchesName(string want) {
+        if (name == want) { return true; }
+        if (XmlNode.IndexOf(want, ":", 0) >= 0) { return false; }
+        return XmlNode.LocalNameOf(name) == want;
+    }
+
+    /// 第一个按 <see cref="MatchesName"/> 命中的子元素；没有返回 null。
+    XmlNode Element(string name) {
+        if (children == null) { return null; }
+        for (int i = 0; i < children.Count; i = i + 1) {
+            XmlNode c = children[i];
+            if (c.kind == 0 && c.MatchesName(name)) { return c; }
+        }
+        return null;
+    }
+
+    /// 全部按 <see cref="MatchesName"/> 命中的子元素（按文档顺序）。
+    List<XmlNode> Elements(string name) {
+        List<XmlNode> outList = new List<XmlNode>();
+        if (children == null) { return outList; }
+        for (int i = 0; i < children.Count; i = i + 1) {
+            XmlNode c = children[i];
+            if (c.kind == 0 && c.MatchesName(name)) { outList.Add(c); }
+        }
+        return outList;
+    }
+
+    /// 子元素列表（跳过文本/注释等，按文档顺序；不含孙辈）。
+    List<XmlNode> ElementChildren() {
+        List<XmlNode> outList = new List<XmlNode>();
+        if (children == null) { return outList; }
+        for (int i = 0; i < children.Count; i = i + 1) {
+            if (children[i].kind == 0) { outList.Add(children[i]); }
+        }
+        return outList;
+    }
+
+    /// 递归拼接自身与全部后代的文本/CDATA 内容（同 .NET InnerText）。
+    string InnerText() {
+        StringBuilder sb = new StringBuilder();
+        AppendTextInto(sb);
+        return sb.ToString();
+    }
+
+    void AppendTextInto(StringBuilder sb) {
+        if (kind == 1 || kind == 2) {
+            sb.Append(text);
+            return;
+        }
+        if (children == null) { return; }
+        for (int i = 0; i < children.Count; i = i + 1) {
+            children[i].AppendTextInto(sb);
+        }
+    }
+
+    /// 在 <see cref="s"/> 中自 <see cref="from"/> 起找子串；找不到
+    /// 返回 -1。stdlib 字符串按 UTF-8 字节存取，这里按字节比较。
+    static int IndexOf(string s, string needle, int from) {
+        int n = s.Length;
+        int m = needle.Length;
+        for (int i = from; i <= n - m; i = i + 1) {
+            int j = 0;
+            while (j < m && (s[i + j] & 255) == (needle[j] & 255)) {
+                j = j + 1;
+            }
+            if (j == m) { return i; }
+        }
+        return -1;
+    }
+}

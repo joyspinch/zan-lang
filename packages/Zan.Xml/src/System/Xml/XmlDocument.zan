@@ -1,0 +1,224 @@
+using System;
+using System.IO;
+using System.Text;
+
+namespace System.Xml;
+
+/// <summary>
+/// XML 文档：文档级节点（声明/注释/PI/根元素，按原文顺序）+
+/// 解析与序列化门面。
+///
+///   XmlDocument doc = XmlDocument.Parse(xmlText);
+///   XmlNode item = doc.Element("rss").Element("channel").Element("item");
+///   string title = item.Element("title").InnerText();
+///   File.WriteAllText("out.xml", doc.ToPrettyXml());
+///
+/// 解析（XmlDocument.Parse）与序列化（ToXml/ToPrettyXml）互为逆
+/// 操作：写出的文本再次 Parse 得到语义相同的树。序列化不是字节
+/// 级还原——实体统一成最短形（<c>&amp;#65;</c> → <c>A</c>）、自闭合
+/// 空元素统一成 <c>&lt;a/&gt;</c>、\r 归一后再按需转义——但信息无损。
+/// </summary>
+class XmlDocument {
+    /// 文档级节点序列（声明/注释/PI/根元素，按原文顺序）。
+    public List<XmlNode> children = new List<XmlNode>();
+
+    /// <summary>解析 XML 文本。格式非法抛 <see cref="XmlException"/>。</summary>
+    static XmlDocument Parse(string xml) {
+        return XmlParser.Parse(xml);
+    }
+
+    /// <summary>读取并解析 <paramref name="path"/> 处的文件。文件
+    /// 读不了（不存在/无权限）按 IO 异常抛；内容非法按
+    /// <see cref="XmlException"/> 抛。</summary>
+    static XmlDocument Load(string path) {
+        return XmlDocument.Parse(File.ReadAllText(path));
+    }
+
+    /// 根元素；文档没有元素时返回 null。
+    XmlNode RootElement() {
+        for (int i = 0; i < children.Count; i = i + 1) {
+            if (children[i].kind == 0) { return children[i]; }
+        }
+        return null;
+    }
+
+    /// 根元素下按名查找的快捷方式（规则同 XmlNode.Element）。
+    XmlNode Element(string name) {
+        XmlNode root = RootElement();
+        if (root == null) { return null; }
+        return root.Element(name);
+    }
+
+    /// 紧凑序列化：保留全部节点（注释/CDATA/PI/声明），不引入
+    /// 任何空白。
+    string ToXml() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < children.Count; i = i + 1) {
+            XmlDocument.WriteNode(sb, children[i], 0, false);
+        }
+        return sb.ToString();
+    }
+
+    /// 缩进序列化（2 空格/层）：纯空白文本节点略去；唯一非空
+    /// 文本子节点的元素行内输出。同样可被 Parse 无损读回。
+    string ToPrettyXml() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < children.Count; i = i + 1) {
+            XmlDocument.WriteNode(sb, children[i], 0, true);
+            if (children[i].kind != 0) { sb.Append("\n"); }
+        }
+        return sb.ToString();
+    }
+
+    /// 以紧凑形式写文件（UTF-8）。
+    void Save(string path) {
+        File.WriteAllText(path, ToXml());
+    }
+
+    /// 序列化一个节点（含全部后代）。约定：元素收尾时自带换行
+    /// （pretty 模式），非元素类别不带——由调用方补，保证文档层
+    /// 每个顶层块后恰一个换行。
+    static void WriteNode(StringBuilder sb, XmlNode n, int depth, bool pretty) {
+        if (n.kind == 1) {
+            XmlDocument.EscapeText(sb, n.text);
+            return;
+        }
+        if (n.kind == 2) {
+            XmlDocument.EmitCdata(sb, n.text);
+            return;
+        }
+        if (n.kind == 3) {
+            sb.Append("<!--");
+            sb.Append(n.text);
+            sb.Append("-->");
+            return;
+        }
+        if (n.kind == 4) {
+            sb.Append("<?");
+            sb.Append(n.name);
+            if (n.text != null && n.text.Length > 0) {
+                sb.Append(" ");
+                sb.Append(n.text);
+            }
+            sb.Append("?>");
+            return;
+        }
+        if (n.kind == 5) {
+            sb.Append("<?xml");
+            XmlDocument.WriteAttrs(sb, n);
+            sb.Append("?>");
+            return;
+        }
+        if (n.kind == 6) {
+            sb.Append(n.text);                            // DOCTYPE 原文
+            return;
+        }
+        // 元素
+        XmlDocument.Indent(sb, depth, pretty);
+        sb.Append("<");
+        sb.Append(n.name);
+        XmlDocument.WriteAttrs(sb, n);
+        int count = n.children == null ? 0 : n.children.Count;
+        if (count == 0) {
+            sb.Append("/>");
+            XmlDocument.Newline(sb, pretty);
+            return;
+        }
+        sb.Append(">");
+        // 行内：唯一子节点是非空文本/CDATA。
+        if (pretty && count == 1 && (n.children[0].kind == 1 || n.children[0].kind == 2)
+            && n.children[0].text.Trim().Length > 0) {
+            XmlDocument.WriteNode(sb, n.children[0], 0, pretty);
+            sb.Append("</");
+            sb.Append(n.name);
+            sb.Append(">");
+            XmlDocument.Newline(sb, pretty);
+            return;
+        }
+        XmlDocument.Newline(sb, pretty);
+        for (int i = 0; i < count; i = i + 1) {
+            XmlNode ch = n.children[i];
+            if (pretty && ch.kind == 1 && ch.text.Trim().Length == 0) {
+                continue;                                 // 纯空白略去
+            }
+            XmlDocument.WriteNode(sb, ch, depth + 1, pretty);
+        }
+        XmlDocument.Indent(sb, depth, pretty);
+        sb.Append("</");
+        sb.Append(n.name);
+        sb.Append(">");
+        XmlDocument.Newline(sb, pretty);
+    }
+
+    static void WriteAttrs(StringBuilder sb, XmlNode n) {
+        if (n.attrs == null) { return; }
+        for (int i = 0; i < n.attrs.Count; i = i + 1) {
+            sb.Append(" ");
+            sb.Append(n.attrs[i].name);
+            sb.Append("=\"");
+            XmlDocument.EscapeAttr(sb, n.attrs[i].value);
+            sb.Append("\"");
+        }
+    }
+
+    /// CDATA 回写：内容里的 "]]&gt;" 拆成 "]]]]&gt;&lt;![CDATA[&gt;"
+    /// （.NET 同款技巧），读回得到原内容。
+    static void EmitCdata(StringBuilder sb, string text) {
+        sb.Append("<![CDATA[");
+        int from = 0;
+        int hit = XmlNode.IndexOf(text, "]]>", from);
+        while (hit >= 0) {
+            sb.Append(text.Substring(from, hit + 2 - from));
+            sb.Append("]]><![CDATA[>");
+            from = hit + 3;
+            hit = XmlNode.IndexOf(text, "]]>", from);
+        }
+        sb.Append(text.Substring(from, text.Length - from));
+        sb.Append("]]>");
+    }
+
+    /// 文本转义：&amp; &lt; &gt; 与 \r（\r 不转义会在解析时被
+    /// CR 归一吃掉，往返即失真）。
+    static void EscapeText(StringBuilder sb, string t) {
+        XmlDocument.EscapeRuns(sb, t, false);
+    }
+
+    /// 属性值转义：在文本转义之上加 &quot; 与 \n \t（属性值里的
+    /// 换行/制表会破坏引号结构与行内可读性）。
+    static void EscapeAttr(StringBuilder sb, string t) {
+        XmlDocument.EscapeRuns(sb, t, true);
+    }
+
+    static void EscapeRuns(StringBuilder sb, string t, bool isAttr) {
+        int from = 0;
+        int n = t.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = t[i] & 255;
+            string rep = null;
+            if (c == 38) { rep = "&amp;"; }
+            else if (c == 60) { rep = "&lt;"; }
+            else if (c == 62) { rep = "&gt;"; }
+            else if (c == 13) { rep = "&#13;"; }
+            else if (isAttr && c == 34) { rep = "&quot;"; }
+            else if (isAttr && c == 10) { rep = "&#10;"; }
+            else if (isAttr && c == 9) { rep = "&#9;"; }
+            if (rep != null) {
+                if (i > from) { sb.Append(t.Substring(from, i - from)); }
+                sb.Append(rep);
+                from = i + 1;
+            }
+        }
+        if (from < n) { sb.Append(t.Substring(from, n - from)); }
+    }
+
+    static void Indent(StringBuilder sb, int depth, bool pretty) {
+        if (!pretty) { return; }
+        for (int i = 0; i < depth; i = i + 1) {
+            sb.Append("  ");
+        }
+    }
+
+    static void Newline(StringBuilder sb, bool pretty) {
+        if (pretty) { sb.Append("\n"); }
+    }
+}

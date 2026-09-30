@@ -1,0 +1,390 @@
+using System;
+using System.Text;
+
+namespace System.Xml;
+
+/// <summary>
+/// 递归下降 XML 解析器（XmlDocument.Parse 的实现）。字节游标风格
+/// 与 System.Json 的 JsonReader 一致：<c>s[pos] &amp; 255</c> 逐字节
+/// 判别，格式非法立即抛 <see cref="XmlException"/>（带行列号）。
+///
+/// 支持范围：元素/属性（单双引号）、文本、五种命名实体与
+/// <c>&amp;#DDD;</c>/<c>&amp;#xHH;</c> 数字字符引用、CDATA、注释、
+/// PI、XML 声明、DOCTYPE（原文截取，含内部子集）。命名空间不
+/// 解析，前缀原样留在名字里。非 ASCII 字节整体视作名字字符，
+/// 中文元素/属性名可用。
+/// </summary>
+class XmlParser {
+    /// 输入文本与游标。
+    string s;
+    int pos;
+    int len;
+    /// 与 JsonValue 对称的嵌套深度上限：写侧序列化同样递归，
+    /// 无界深度会耗尽调用栈，读写两侧一起限。
+    static int MaxDepth = 512;
+
+    /// <summary>解析入口。格式非法时抛 XmlException（带行列号）。</summary>
+    static XmlDocument Parse(string src) {
+        XmlParser p = new XmlParser();
+        p.s = src;
+        p.pos = 0;
+        p.len = src.Length;
+        return p.ReadDocument();
+    }
+
+    /// 文档层：空白/声明/注释/PI/DOCTYPE 之间恰一个根元素；
+    /// 根外的零散文本非法。
+    XmlDocument ReadDocument() {
+        XmlDocument doc = new XmlDocument();
+        bool sawRoot = false;
+        while (pos < len) {
+            SkipWs();
+            if (pos >= len) { break; }
+            int c = CurB();
+            if (c != 60) {                                    // '<'
+                Err("unexpected text outside the root element");
+            }
+            if (Has("<!--")) {
+                doc.children.Add(ReadComment());
+            } else if (Has("<?")) {
+                doc.children.Add(ReadPiOrDecl());
+            } else if (Has("<!DOCTYPE") || Has("<!doctype")) {
+                doc.children.Add(ReadDoctype());
+            } else if (Has("<!")) {
+                Err("unexpected <! construct at document level");
+            } else {
+                if (sawRoot) { Err("multiple root elements"); }
+                doc.children.Add(ReadElement(1));
+                sawRoot = true;
+            }
+        }
+        if (!sawRoot) { Err("no root element"); }
+        return doc;
+    }
+
+    /// 前置 '<' 已确认，读开始标签、属性，再递归读内容直到匹配
+    /// 的结束标签（自闭合则直接返回）。
+    XmlNode ReadElement(int depth) {
+        if (depth > XmlParser.MaxDepth) { Err("XML nesting too deep"); }
+        pos = pos + 1;                                        // 消费 '<'
+        string name = ReadName();
+        XmlNode elem = XmlNode.NewElement(name);
+        if (!ReadAttrs(elem, false)) {
+            ReadChildren(elem, depth);
+        }
+        return elem;
+    }
+
+    /// 属性序列，读到 '>'（普通标签）或 '/>'（自闭合）为止；
+    /// isDecl 时以 '?&gt;' 收尾（xml 声明的伪属性）。返回是否自闭合
+    /// ——自闭合元素没有内容可读，调用方不得再进 ReadChildren。
+    bool ReadAttrs(XmlNode elem, bool isDecl) {
+        while (pos < len) {
+            SkipWs();
+            int c = CurB();
+            if (isDecl) {
+                if (c == 63) {                                // '?'
+                    if (pos + 1 < len && (s[pos + 1] & 255) == 62) {
+                        pos = pos + 2;
+                        return true;
+                    }
+                    Err("bad character after '?' in xml declaration");
+                }
+            } else {
+                if (c == 62) { pos = pos + 1; return false; } // '>'
+                if (c == 47) {                                // '/'
+                    if (pos + 1 < len && (s[pos + 1] & 255) == 62) {
+                        pos = pos + 2;
+                        return true;
+                    }
+                    Err("expected '>' after '/'");
+                }
+            }
+            string aname = ReadName();
+            SkipWs();
+            if (CurB() != 61) { Err("expected '=' after attribute name"); }
+            pos = pos + 1;                                    // 消费 '='
+            SkipWs();
+            int q = CurB();
+            if (q != 34 && q != 39) { Err("attribute value must be quoted"); }
+            pos = pos + 1;                                    // 消费引号
+            int start = pos;
+            while (pos < len && (s[pos] & 255) != q) { pos = pos + 1; }
+            if (pos >= len) { Err("unterminated attribute value"); }
+            string raw = s.Substring(start, pos - start);
+            pos = pos + 1;                                    // 消费闭引号
+            XmlAttribute a = new XmlAttribute();
+            a.name = aname;
+            a.value = DecodeText(raw);
+            elem.AddAttr(a);
+        }
+        Err("unterminated tag <" + (elem.name == null ? "" : elem.name) + ">");
+        return false;
+    }
+
+    /// 元素内容：文本游程与子元素/CDATA/注释/PI 交替，直到匹配
+    /// 的结束标签。结束标签名与开始不符立即报错。
+    void ReadChildren(XmlNode elem, int depth) {
+        while (pos < len) {
+            int c = CurB();
+            if (c != 60) {                                    // '<'
+                int start = pos;
+                while (pos < len && (s[pos] & 255) != 60) { pos = pos + 1; }
+                elem.MergeText(DecodeText(s.Substring(start, pos - start)));
+                continue;
+            }
+            if (Has("</")) {
+                pos = pos + 2;
+                string closeName = ReadName();
+                SkipWs();
+                if (CurB() != 62) { Err("expected '>' after closing tag name"); }
+                pos = pos + 1;                                // 消费 '>'
+                if (closeName != elem.name) {
+                    Err("mismatched closing tag </" + closeName
+                        + "> for <" + elem.name + ">");
+                }
+                return;
+            }
+            if (Has("<!--")) {
+                elem.AddChild(ReadComment());
+                continue;
+            }
+            if (Has("<![CDATA[")) {
+                elem.AddChild(ReadCdata());
+                continue;
+            }
+            if (Has("<?")) {
+                elem.AddChild(ReadPiOrDecl());
+                continue;
+            }
+            if (Has("<!")) { Err("unexpected <! construct in element content"); }
+            XmlNode child = ReadElement(depth + 1);
+            elem.AddChild(child);
+        }
+        Err("unclosed element <" + elem.name + ">");
+    }
+
+    /// '<!--' 已确认，读到 '--&gt;'。注释正文原样保存（含 '--' 的
+    /// 非法形态不校验，写侧原样回吐）。
+    XmlNode ReadComment() {
+        pos = pos + 4;                                        // 消费 '<!--'
+        int start = pos;
+        while (pos < len) {
+            if (Has("-->")) {
+                XmlNode n = XmlNode.NewComment(s.Substring(start, pos - start));
+                pos = pos + 3;
+                return n;
+            }
+            pos = pos + 1;
+        }
+        Err("unterminated comment");
+        return null;
+    }
+
+    /// '&lt;![CDATA[' 已确认，读到 ']]&gt;'。内容原样保存（其中
+    /// 出现 ']]&gt;' 属非法形态，按首个 ']]&gt;' 截断的宽松语义处理）。
+    XmlNode ReadCdata() {
+        pos = pos + 9;                                        // 消费 '<![CDATA['
+        int start = pos;
+        while (pos < len) {
+            if (Has("]]>")) {
+                XmlNode n = XmlNode.NewCdata(s.Substring(start, pos - start));
+                pos = pos + 3;
+                return n;
+            }
+            pos = pos + 1;
+        }
+        Err("unterminated CDATA section");
+        return null;
+    }
+
+    /// '&lt;?' 已确认。目标名为 'xml' 的是声明（伪属性走属性表），
+    /// 其余为 PI（目标名 + 原文正文）。
+    XmlNode ReadPiOrDecl() {
+        pos = pos + 2;                                        // 消费 '<?'
+        string target = ReadName();
+        if (target == "xml") {
+            XmlNode decl = XmlNode.NewDecl();
+            ReadAttrs(decl, true);
+            return decl;
+        }
+        SkipWs();
+        int start = pos;
+        while (pos < len) {
+            if (Has("?>")) { break; }
+            pos = pos + 1;
+        }
+        if (pos >= len) { Err("unterminated processing instruction"); }
+        XmlNode pi = XmlNode.NewPi(target, s.Substring(start, pos - start));
+        pos = pos + 2;                                        // 消费 '?>'
+        return pi;
+    }
+
+    /// '&lt;!DOCTYPE' 已确认，原文截取到未配对的 '>'（内部子集
+    /// [...] 里的 '>' 不算结束）。不做 DTD 校验。
+    XmlNode ReadDoctype() {
+        int start = pos;
+        pos = pos + 2;                                        // 消费 '<!'
+        bool bracket = false;
+        while (pos < len) {
+            int c = s[pos] & 255;
+            if (c == 91) { bracket = true; }                  // '['
+            else if (c == 93) { bracket = false; }            // ']'
+            else if (c == 62 && !bracket) {                   // '>'
+                pos = pos + 1;
+                return XmlNode.NewDoctype(s.Substring(start, pos - start));
+            }
+            pos = pos + 1;
+        }
+        Err("unterminated DOCTYPE declaration");
+        return null;
+    }
+
+    /// 读名字：ASCII 字母/数字与 <c>_ - . :</c>，非 ASCII 字节
+    /// （UTF-8 多字节整体）也计入，中文标签名可用。
+    string ReadName() {
+        int start = pos;
+        while (pos < len) {
+            int c = s[pos] & 255;
+            bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+                || (c >= 48 && c <= 57) || c == 95 || c == 45
+                || c == 46 || c == 58 || c >= 128;
+            if (!ok) { break; }
+            pos = pos + 1;
+        }
+        if (pos == start) { Err("expected a name"); }
+        return s.Substring(start, pos - start);
+    }
+
+    /// 实体解码 + CR 归一（\r\n 与孤立 \r 都归一成 \n，XML 规范
+    /// 行为；写侧把 \r 转义成 &amp;#13; 保证往返无损）。
+    /// 快路径：游程里既无 '&' 又无 '\r' 时原串返回，零分配。
+    string DecodeText(string raw) {
+        int n = raw.Length;
+        int scan = 0;
+        while (scan < n) {
+            int c = raw[scan] & 255;
+            if (c == 38 || c == 13) { break; }                // '&' '\r'
+            scan = scan + 1;
+        }
+        if (scan >= n) { return raw; }
+        StringBuilder sb = new StringBuilder();
+        if (scan > 0) { sb.Append(raw.Substring(0, scan)); }
+        int i = scan;
+        while (i < n) {
+            int c = raw[i] & 255;
+            if (c == 38) {                                    // '&'
+                i = ReadEntity(raw, i, sb);
+            } else if (c == 13) {                             // '\r'
+                if (i + 1 < n && (raw[i + 1] & 255) == 10) { i = i + 1; }
+                sb.Append("\n");
+                i = i + 1;
+            } else {
+                int j = i;
+                while (j < n) {
+                    int d = raw[j] & 255;
+                    if (d == 38 || d == 13) { break; }
+                    j = j + 1;
+                }
+                sb.Append(raw.Substring(i, j - i));
+                i = j;
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// 解码 raw 中自 i 起（raw[i] == '&'）的一个实体，把结果追加进
+    /// sb，返回 ';' 之后的新游标。未知实体与非法数字引用报错。
+    int ReadEntity(string raw, int i, StringBuilder sb) {
+        int semi = XmlNode.IndexOf(raw, ";", i + 1);
+        if (semi < 0 || semi - i > 12) {
+            Err("malformed entity reference");
+        }
+        string ent = raw.Substring(i + 1, semi - i - 1);
+        if (ent == "lt") { sb.Append("<"); }
+        else if (ent == "gt") { sb.Append(">"); }
+        else if (ent == "amp") { sb.Append("&"); }
+        else if (ent == "quot") { sb.Append("\""); }
+        else if (ent == "apos") { sb.Append("'"); }
+        else if (ent.Length > 0 && (ent[0] & 255) == 35) {    // '#'
+            int cp = 0;
+            int k = 1;
+            bool hex = false;
+            if (ent.Length > 1) {
+                int h = ent[1] & 255;
+                if (h == 120 || h == 88) {                    // 'x' 'X'
+                    hex = true;
+                    k = 2;
+                }
+            }
+            if (k >= ent.Length) { Err("empty character reference"); }
+            while (k < ent.Length) {
+                int d = XmlParser.DigitVal(ent[k] & 255, hex);
+                if (d < 0) { Err("invalid character reference &" + ent + ";"); }
+                cp = cp * (hex ? 16 : 10) + d;
+                if (cp > 1114111) { Err("character reference out of range"); }
+                k = k + 1;
+            }
+            // U+0000 装不进以 NUL 结尾的 Zan 字符串；代理区不成码点。
+            if (cp == 0 || (cp >= 55296 && cp <= 57343)) {
+                Err("character reference cannot be represented");
+            }
+            sb.Append(Encoding.Utf8FromCodePoint(cp));
+        } else {
+            Err("unknown entity &" + ent + ";");
+        }
+        return semi + 1;
+    }
+
+    /// 一个数字字符的值；非法返回 -1。hex 关掉时只收十进制。
+    static int DigitVal(int c, bool hex) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (hex && c >= 97 && c <= 102) { return c - 87; }
+        if (hex && c >= 65 && c <= 70) { return c - 55; }
+        return -1;
+    }
+
+    void SkipWs() {
+        while (pos < len) {
+            int c = s[pos] & 255;
+            if (c == 32 || c == 9 || c == 10 || c == 13) {
+                pos = pos + 1;
+            } else {
+                return;
+            }
+        }
+    }
+
+    int CurB() {
+        if (pos >= len) { return -1; }
+        return s[pos] & 255;
+    }
+
+    /// 游标处是否恰为 lit。
+    bool Has(string lit) {
+        int n = lit.Length;
+        if (pos + n > len) { return false; }
+        for (int i = 0; i < n; i = i + 1) {
+            if ((s[pos + i] & 255) != (lit[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    /// 抛带行列号的 XmlException。行列号现算：只走错误路径，
+    /// O(n) 一次可接受。
+    void Err(string msg) {
+        int line = 1;
+        int col = 1;
+        int stop = pos < len ? pos : len;
+        for (int i = 0; i < stop; i = i + 1) {
+            if ((s[i] & 255) == 10) {
+                line = line + 1;
+                col = 1;
+            } else {
+                col = col + 1;
+            }
+        }
+        throw new XmlException(msg + " at line "
+            + Convert.ToString(line) + ", column " + Convert.ToString(col));
+    }
+}

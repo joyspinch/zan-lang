@@ -1,0 +1,222 @@
+// XmlDocument test: parse (declaration/comment/PI/DOCTYPE, entities incl.
+// numeric char refs, CDATA, single-quoted attrs), tree walking + InnerText,
+// prefix-tolerant local-name lookup (WebDAV-style multistatus), programmatic
+// tree build, compact/pretty writer round-trips + idempotence, entity/attr
+// escaping round-trip, error paths with line:col, depth limit.
+using System;
+using System.IO;
+using System.Text;
+using System.Xml;
+
+namespace Conf;
+
+class Prog {
+    static void Main() {
+        int bad = 0;
+        // --- 解析：声明/注释/PI/DOCTYPE/实体/CDATA/单引号属性/嵌套 ---
+        string src = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            + "<!-- config for unit test -->\n"
+            + "<?render mode=\"fast\"?>\n"
+            + "<!DOCTYPE note SYSTEM \"note.dtd\">\n"
+            + "<config version=\"2\">\n"
+            + "  <server host=\"127.0.0.1\" port='8080'/>\n"
+            + "  <title>A &lt; B &amp; C &#65; &#x4e2d;</title>\n"
+            + "  <payload><![CDATA[if (a<b && b>c) { x = \"s\"; }]]></payload>\n"
+            + "  <path>C:\\dir\\file</path>\n"
+            + "</config>\n";
+        XmlDocument doc = XmlDocument.Parse(src);
+        XmlNode cfg = doc.RootElement();
+        if (cfg == null) { bad = bad + 1; }
+        else {
+            if (cfg.name != "config") { bad = bad + 1; }
+            if (cfg.Attr("version") != "2") { bad = bad + 1; }
+            XmlNode server = cfg.Element("server");
+            if (server == null) { bad = bad + 1; }
+            else {
+                if (server.Attr("host") != "127.0.0.1") { bad = bad + 1; }
+                if (server.Attr("port") != "8080") { bad = bad + 1; }
+            }
+            XmlNode title = cfg.Element("title");
+            if (title == null) { bad = bad + 1; }
+            else if (title.InnerText() != "A < B & C A 中") { bad = bad + 1; }
+            XmlNode payload = cfg.Element("payload");
+            if (payload == null) { bad = bad + 1; }
+            else if (payload.InnerText()
+                != "if (a<b && b>c) { x = \"s\"; }") { bad = bad + 1; }
+            XmlNode pathEl = cfg.Element("path");
+            if (pathEl == null) { bad = bad + 1; }
+            else if (pathEl.InnerText() != "C:\\dir\\file") { bad = bad + 1; }
+        }
+        // 文档级节点全部保留：声明/注释/PI/DOCTYPE/根元素。
+        if (doc.children.Count != 5) { bad = bad + 1; }
+        if (doc.children[0].kind != 5) { bad = bad + 1; }
+        if (doc.children[0].Attr("version") != "1.0") { bad = bad + 1; }
+        if (doc.children[0].Attr("encoding") != "UTF-8") { bad = bad + 1; }
+        if (doc.children[1].kind != 3) { bad = bad + 1; }
+        if (doc.children[2].kind != 4) { bad = bad + 1; }
+        if (doc.children[3].kind != 6) { bad = bad + 1; }
+        // --- 紧凑往返：写→读→写 幂等，信息无损 ---
+        string compact = doc.ToXml();
+        XmlDocument re = XmlDocument.Parse(compact);
+        XmlNode reRoot = re.RootElement();
+        if (reRoot == null) { bad = bad + 1; }
+        else {
+            if (re.ToXml() != compact) { bad = bad + 1; }
+            XmlNode rt = reRoot.Element("title");
+            if (rt == null) { bad = bad + 1; }
+            else if (rt.InnerText() != "A < B & C A 中") { bad = bad + 1; }
+            XmlNode rp = reRoot.Element("payload");
+            if (rp == null) { bad = bad + 1; }
+            else if (rp.InnerText() != "if (a<b && b>c) { x = \"s\"; }") {
+                bad = bad + 1;
+            }
+        }
+        // --- 缩进：输出有层级缩进、可无损读回、再次输出幂等 ---
+        string pretty = doc.ToPrettyXml();
+        if (XmlNode.IndexOf(pretty, "\n  <server", 0) < 0) { bad = bad + 1; }
+        XmlDocument pre = XmlDocument.Parse(pretty);
+        XmlNode preRoot = pre.RootElement();
+        if (preRoot == null) { bad = bad + 1; }
+        else {
+            XmlNode pt = preRoot.Element("title");
+            if (pt == null) { bad = bad + 1; }
+            else if (pt.InnerText() != "A < B & C A 中") { bad = bad + 1; }
+            XmlNode pp = preRoot.Element("payload");
+            if (pp == null) { bad = bad + 1; }
+            else if (pp.InnerText() != "if (a<b && b>c) { x = \"s\"; }") {
+                bad = bad + 1;
+            }
+            if (pre.ToPrettyXml() != pretty) { bad = bad + 1; }
+        }
+        // --- 前缀回退：WebDAV 风格 multistatus（不带前缀查到带前缀元素）---
+        string dav = "<?xml version=\"1.0\"?>\n"
+            + "<D:multistatus xmlns:D=\"DAV:\">\n"
+            + "  <D:response>\n"
+            + "    <D:href>/a/b.txt</D:href>\n"
+            + "    <D:propstat><D:prop>"
+            + "<D:getcontentlength>42</D:getcontentlength>"
+            + "</D:prop></D:propstat>\n"
+            + "  </D:response>\n"
+            + "  <D:response><D:href>/c/</D:href></D:response>\n"
+            + "</D:multistatus>\n";
+        XmlDocument dd = XmlDocument.Parse(dav);
+        XmlNode multi = dd.RootElement();
+        if (multi == null) { bad = bad + 1; }
+        else {
+            if (multi.Attr("xmlns:D") != "DAV:") { bad = bad + 1; }
+            List<XmlNode> responses = multi.Elements("response");
+            if (responses.Count != 2) { bad = bad + 1; }
+            if (responses.Count > 0) {
+                XmlNode resp0 = responses[0];
+                XmlNode href = resp0.Element("href");
+                if (href == null) { bad = bad + 1; }
+                else {
+                    if (href.InnerText() != "/a/b.txt") { bad = bad + 1; }
+                    if (href.LocalName() != "href") { bad = bad + 1; }
+                }
+                XmlNode propstat = resp0.Element("propstat");
+                if (propstat == null) { bad = bad + 1; }
+                else {
+                    XmlNode prop = propstat.Element("prop");
+                    if (prop == null) { bad = bad + 1; }
+                    else {
+                        XmlNode lenEl = prop.Element("getcontentlength");
+                        if (lenEl == null) { bad = bad + 1; }
+                        else if (lenEl.InnerText() != "42") { bad = bad + 1; }
+                    }
+                }
+                // 带前缀的查询只做精确匹配：查 "X:href" 不应命中。
+                if (resp0.Element("X:href") != null) { bad = bad + 1; }
+            }
+            if (responses.Count > 1) {
+                XmlNode href1 = responses[1].Element("href");
+                if (href1 == null) { bad = bad + 1; }
+                else if (href1.InnerText() != "/c/") { bad = bad + 1; }
+            }
+        }
+        // --- 程序化建树 + 转义往返（属性里的引号/尖括号、文本里的
+        // 控制字符、CDATA 里的 "]]>"）---
+        XmlNode root = XmlNode.NewElement("resources");
+        root.SetAttr("count", "2");
+        XmlNode r1 = XmlNode.NewElement("file");
+        r1.SetAttr("name", "a\"b<c>");
+        r1.AddText("line1\nline2\tend");
+        root.AddChild(r1);
+        XmlNode r2 = XmlNode.NewElement("note");
+        r2.AddChild(XmlNode.NewCdata("]]> tricky"));
+        root.AddChild(r2);
+        XmlDocument built = new XmlDocument();
+        built.children.Add(root);
+        string bxml = built.ToXml();
+        XmlDocument bre = XmlDocument.Parse(bxml);
+        XmlNode breRoot = bre.RootElement();
+        if (breRoot == null) { bad = bad + 1; }
+        else {
+            XmlNode bf = breRoot.Element("file");
+            if (bf == null) { bad = bad + 1; }
+            else {
+                if (bf.Attr("name") != "a\"b<c>") { bad = bad + 1; }
+                if (bf.InnerText() != "line1\nline2\tend") { bad = bad + 1; }
+            }
+            XmlNode bn = breRoot.Element("note");
+            if (bn == null) { bad = bad + 1; }
+            else if (bn.InnerText() != "]]> tricky") { bad = bad + 1; }
+            if (bre.ToXml() != bxml) { bad = bad + 1; }
+            // SetAttr 改已有属性，不追加重复项。
+            breRoot.SetAttr("count", "3");
+            if (breRoot.Attr("count") != "3") { bad = bad + 1; }
+            if (breRoot.attrs == null || breRoot.attrs.Count != 1) {
+                bad = bad + 1;
+            }
+        }
+        // --- 错误路径 ---
+        bool threw = false;
+        try { XmlDocument.Parse("<a></b>"); } catch (XmlException e) { threw = true; }
+        if (!threw) { bad = bad + 1; }
+        threw = false;
+        try { XmlDocument.Parse("<a>"); } catch (XmlException e) { threw = true; }
+        if (!threw) { bad = bad + 1; }
+        threw = false;
+        try {
+            XmlDocument.Parse("<a>x&bogus;y</a>");
+        } catch (XmlException e) { threw = true; }
+        if (!threw) { bad = bad + 1; }
+        threw = false;
+        try {
+            XmlDocument.Parse("plain text only");
+        } catch (XmlException e) { threw = true; }
+        if (!threw) { bad = bad + 1; }
+        threw = false;
+        try {
+            XmlDocument.Parse("<a></a><b></b>");
+        } catch (XmlException e) { threw = true; }
+        if (!threw) { bad = bad + 1; }
+        threw = false;
+        try {
+            XmlDocument.Parse("<a attr=noquote/>");
+        } catch (XmlException e) { threw = true; }
+        if (!threw) { bad = bad + 1; }
+        // 深度上限：512 层以内可解析，超出报错。
+        StringBuilder ok500 = new StringBuilder();
+        for (int i = 0; i < 500; i = i + 1) { ok500.Append("<d>"); }
+        for (int i = 0; i < 500; i = i + 1) { ok500.Append("</d>"); }
+        XmlDocument deepOk = XmlDocument.Parse(ok500.ToString());
+        if (deepOk.RootElement() == null) { bad = bad + 1; }
+        StringBuilder deep = new StringBuilder();
+        for (int i = 0; i < 600; i = i + 1) { deep.Append("<d>"); }
+        for (int i = 0; i < 600; i = i + 1) { deep.Append("</d>"); }
+        threw = false;
+        try {
+            XmlDocument.Parse(deep.ToString());
+        } catch (XmlException e) { threw = true; }
+        if (!threw) { bad = bad + 1; }
+        // 错误消息带行列号。
+        try {
+            XmlDocument.Parse("<a>\n  <b>\n  </c>\n</a>");
+            bad = bad + 1;
+        } catch (XmlException e) {
+            if (XmlNode.IndexOf(e.Message, "line 3", 0) < 0) { bad = bad + 1; }
+        }
+        Console.WriteLine("xml-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}
