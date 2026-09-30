@@ -4,6 +4,7 @@ using System.Json;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Security.Cryptography;
+using System.Threading;
 
 namespace System.Data.TDengine;
 
@@ -48,6 +49,29 @@ class TDengineConnection : IDbConnection {
     string lastError;
     int lastCode;         // taosAdapter 的错误码（响应 JSON 的 `code`）
     int affected;
+    bool busy;
+    List<AsyncGate> waiters;
+
+    async bool AcquireLock() {
+        while (this.busy) {
+            AsyncGate g = new AsyncGate();
+            if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
+            this.waiters.Add(g);
+            await g.Wait();
+            g.Close();
+        }
+        this.busy = true;
+        return true;
+    }
+
+    void ReleaseLock() {
+        this.busy = false;
+        if (this.waiters != null && this.waiters.Count > 0) {
+            AsyncGate g = this.waiters[0];
+            this.waiters.RemoveAt(0);
+            g.Signal();
+        }
+    }
 
     /// 私有构造；统一经 <see cref="Open"/>/<see cref="OpenToken"/>/
     /// <see cref="OpenAsync"/> 创建。
@@ -60,6 +84,8 @@ class TDengineConnection : IDbConnection {
         this.lastError = "";
         this.lastCode = 0;
         this.affected = 0;
+        this.busy = false;
+        this.waiters = new List<AsyncGate>();
     }
 
     /// <summary>使用 HTTP Basic 凭据打开连接，不
@@ -583,17 +609,22 @@ class TDengineConnection : IDbConnection {
     // ===== 协程 API =====
 
     /// <summary>查询，不阻塞 worker 线程。失败时抛出
-    /// <see cref="DbException"/>。</summary>
+    /// <see cref="DbException"/>。由 AsyncGate 保证单连接互斥。</summary>
     async DbResult QueryAsync(string sql) {
-        if (!this.connected) {
-            this.lastError = "not connected";
-            this.lastCode = 0;
-            this.Fail();
+        await this.AcquireLock();
+        try {
+            if (!this.connected) {
+                this.lastError = "not connected";
+                this.lastCode = 0;
+                this.Fail();
+            }
+            string body = await PostAsync(sql);
+            DbResult r = Decode(body);
+            if (this.lastError.Length > 0) { this.Fail(); }
+            return r;
+        } finally {
+            this.ReleaseLock();
         }
-        string body = await PostAsync(sql);
-        DbResult r = Decode(body);
-        if (this.lastError.Length > 0) { this.Fail(); }
-        return r;
     }
 
     /// <summary>参数化查询，不阻塞 worker 线程。占位符个数
@@ -614,17 +645,22 @@ class TDengineConnection : IDbConnection {
     }
 
     /// <summary>执行语句，不阻塞 worker 线程。失败时抛出
-    /// <see cref="DbException"/>。</summary>
+    /// <see cref="DbException"/>。由 AsyncGate 保证单连接互斥。</summary>
     async int ExecuteAsync(string sql) {
-        if (!this.connected) {
-            this.lastError = "not connected";
-            this.lastCode = 0;
-            this.Fail();
+        await this.AcquireLock();
+        try {
+            if (!this.connected) {
+                this.lastError = "not connected";
+                this.lastCode = 0;
+                this.Fail();
+            }
+            string body = await PostAsync(sql);
+            DbResult r = Decode(body);
+            if (this.lastError.Length > 0) { this.Fail(); }
+            return this.affected;
+        } finally {
+            this.ReleaseLock();
         }
-        string body = await PostAsync(sql);
-        DbResult r = Decode(body);
-        if (this.lastError.Length > 0) { this.Fail(); }
-        return this.affected;
     }
 
     /// <summary>执行参数化语句，不阻塞 worker 线程。失败时
@@ -687,9 +723,14 @@ class TDengineConnection : IDbConnection {
     /// 打开时 adapter 正常响应（凭据校验通过）且未调用 Close。
     bool IsConnected() { return this.connected; }
 
-    /// <summary>释放连接状态。REST 协议是无状态的，因此
-    /// 不会向服务器发送任何内容。</summary>
+    /// <summary>释放连接状态。安全释放互斥门控并唤醒所有等待者。</summary>
     void Close() {
+        this.ReleaseLock();
+        while (this.waiters != null && this.waiters.Count > 0) {
+            AsyncGate g = this.waiters[0];
+            this.waiters.RemoveAt(0);
+            g.Signal();
+        }
         this.connected = false;
         this.auth = "";
     }

@@ -1826,6 +1826,12 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
   - 定式：`MySqlConnection.readPacket()` 遇 `len == 16777215` 时必须循环拼装分片直至终包；`writePacket` 超 16MB 自动分片发送；套接字接收逐字节循环全部接入 `NativeMemory.Copy` 加速。
 - **SQLite 语句缓存覆写**：
   - `SqliteConnection` 使用索引器 `stmtBusy[sql] = true/false` 代替 `Add`，杜绝重复键异常。
+**坑十（TDengine 协程并发互斥门控与 Firebird 原生内存拷贝加速）**：
+- **TDengine 客户端单连接协程互斥**：
+  - `TDengineConnection` 多个协程并发调用 `QueryAsync` / `ExecuteAsync` 时，若未加排队互斥，会并发读写 `lastError`、`lastCode` 与 `affected` 实例状态，导致错误状态交织错乱；
+  - 定式：引入 `AsyncGate` 异步门控与 `waiters` 队列保护完整的请求生命周期，并在 `Close()` 中唤醒所有排队者。
+- **Firebird 驱动收发包 NativeMemory 加速**：
+  - `recvExact` 与 `sendPacket` 剥离逐字节解释循环，全面接入 `NativeMemory.Copy`，消除大字段（BLOB）和长结果集下的大量解释器空耗。
 
 
 ## File 读族 alt-base 回退 exe 目录 vs Directory 清理 CWD 相对：测试缓存目录必须用绝对路径
