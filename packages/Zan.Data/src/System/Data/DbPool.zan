@@ -33,11 +33,13 @@ namespace System.Data;
 class DbPool {
     IDbConnector connector;
     PoolCore<IDbConnection> core;
+    string lastOpenError;
 
     /// 由各 Connector 的 <c>Pool()</c> 工厂构造（构造器不公开）。
     DbPool(IDbConnector connector, int maxSize) {
         this.connector = connector;
         this.core = new PoolCore<IDbConnection>(maxSize);
+        this.lastOpenError = "";
     }
 
     /// 经 connector 打开一个新连接。
@@ -45,6 +47,9 @@ class DbPool {
         try {
             return await this.connector.ConnectAsync();
         } catch (Exception ex) {
+            /* 契约：借出失败折进 null（Acquire 记退避）。异常消息存给
+               Acquire 的 episode 首条诊断用。 */
+            this.lastOpenError = ex.Message;
             return null;
         }
     }
@@ -82,11 +87,21 @@ class DbPool {
             if (this.core.TryReserve()) {
                 IDbConnection opened = await this.OpenOne();
                 if (opened == null || !opened.IsConnected()) {
+                    /* 契约：借出失败折进 null（下面随即记退避）。根因只在
+                       失败 episode 的首条记录诊断，退避期内零星重试静默。 */
+                    if (!this.core.OpenFailing()) {
+                        string why = this.lastOpenError;
+                        Console.WriteLine("[dbpool] connect failed: "
+                            + (why.Length > 0 ? why
+                                : "refused, timeout, or auth rejected"));
+                        this.lastOpenError = "";
+                    }
                     this.core.NoteOpenFailed();
                     this.core.UndoReserve();
                     return null;
                 }
                 this.core.NoteOpenOk();
+                this.lastOpenError = "";
                 this.core.Borrow(opened);
                 return opened;
             }

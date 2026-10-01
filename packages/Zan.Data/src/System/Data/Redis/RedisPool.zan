@@ -27,20 +27,36 @@ class RedisPool {
     }
 
     /// 新建一个客户端并用 PING 验证可用性；任何失败都关闭连接并
-    /// 返回 null（不抛出，由调用方记录建连失败）。
+    /// 返回 null（不抛出，由调用方记退避）。失败根因按 episode 首条
+    /// 记录诊断：退避期内静默，恢复后再次失败重新记录。
     async RedisClient OpenOne() {
         RedisClient client = await RedisClient.ConnectAsync(
             this.host, this.port, this.connectTimeoutMs);
-        if (client == null) { return null; }
+        if (client == null) {
+            this.NoteOpenEpisode("connect failed (refused or timeout)");
+            return null;
+        }
         try {
             if (!await client.PingAsync()) {
+                string why = client.GetLastError();
+                this.NoteOpenEpisode("ping failed"
+                    + (why.Length > 0 ? ": " + why : ""));
                 client.Close();
                 return null;
             }
             return client;
-        } catch {
+        } catch (Exception ex) {
+            this.NoteOpenEpisode("ping error: " + ex.Message);
             client.Close();
             return null;
+        }
+    }
+
+    /// 建连失败 episode 的首条诊断（池处于退避中即静默）。
+    void NoteOpenEpisode(string detail) {
+        if (!this.core.OpenFailing()) {
+            Console.WriteLine("[redispool] " + this.host + ":"
+                + Convert.ToString(this.port) + " " + detail);
         }
     }
 
@@ -68,7 +84,8 @@ class RedisPool {
                 RedisClient opened = null;
                 try {
                     opened = await this.OpenOne();
-                } catch {
+                } catch (Exception ex) {
+                    this.NoteOpenEpisode("open error: " + ex.Message);
                     this.core.NoteOpenFailed();
                     this.core.UndoReserve();
                     return null;
