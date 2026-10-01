@@ -81,12 +81,14 @@ src/Controller/Admin/Game/  GM 页：Realms（区服）/ Players（角色）/ On
 src/Game/ClassCurves.zan    三职业成长曲线：形状忠实移植传奇2 服务端源码
                         RecalcLevelAbilitys（血量/法力/主属性/物防/魔防），
                         数值带按迷你传奇真怪表校准；Fight 在其上叠加装备
-src/Framework/Schema.zan    建表 + 种子（3 区服、内置角色、欢迎公告；游戏目录——35 图/
+src/Framework/GameSeed.zan  游戏域种子（3 区服、欢迎公告；游戏目录——35 图/
                         732 物品/232 刷怪点/2662 掉落条目——由 data/M2.DB
                         快照整表种入，见 src/Framework/GameSnapshot.zan 与
-                        tools/sync_csv_to_db.py）
+                        tools/sync_csv_to_db.py）；建表与 sys 域种子（内置
+                        角色/字典/站点设置）由 Zan.Mvc 包 Schema 负责，在
+                        main.zan 里先 Schema.Ensure 后 GameSeed.Ensure 补种
 views/                  视图（与控制器一一对应；Account/Index/Admin 三套布局）
-tools/e2e.py            端到端自检：注册/找回 + 完整协议 + GM + 战斗闭环（114 项断言）
+tools/e2e.py            端到端自检：注册/找回 + 完整协议 + GM + 战斗闭环（138 项断言）
 ```
 
 ## 快速开始
@@ -103,7 +105,7 @@ zanc src/main.zan src/**/*.zan --auto-stdlib -o legend-server.exe
 
 - 玩家网页：`http://127.0.0.1:48099/` — 区服列表 + **注册账号** +
   **找回密码**；注册即建 `game_account`，之后连 TCP 网关进游戏。
-- 管理后台：`http://127.0.0.1:48099/admin`，种子账号 **admin / admin1234**。
+- 管理后台：`http://127.0.0.1:48099/admin`，种子账号 **admin / admin-bootstrap-2026**（[auth].bootstrapPassword，≥12 字符，包 Schema 硬校验）。
 - 数据库默认 SQLite（`data/app.db`），首次启动自动建表与种子；换 MySQL
   改 `[database]` 即可，游戏代码不感知驱动。
 
@@ -296,7 +298,7 @@ game_mob / game_item / game_bag / game_drop` 九张表由 `Schema.Ensure`
 ## 端到端自检
 
 `tools/e2e.py`（标准库 urllib/socket，无第三方依赖）对运行中的服务端跑
-**114 项断言**：网页注册/重复注册、找回密码三步与 5 次答错锁定、TCP
+**138 项断言**：网页注册/重复注册、找回密码三步与 5 次答错锁定、TCP
 注册/登录/选区/建角/进区全流程、维护区拒绝、每区一角色与区内昵称唯一、
 按区收窄的聊天/走位/同图查询、换区后角色状态保持、GM 区服 CRUD（含
 维护门控与删除保护）、GM 发奖/封禁/踢线实时推送、公告推送、按秒折算的
@@ -305,7 +307,7 @@ game_mob / game_item / game_bag / game_drop` 九张表由 `Schema.Ensure`
 （`ev drop` 实时推）、穿脱武器攻防变化、卖皮半价回收、自动挂机逐 tick
 推 `ev fight`、跨图自动暂停回图续打、30 级打赤月恶魔三回合倒下回城
 半血、GM 降级钳血与满血拒药、flush 后 hp/经验/穿戴/背包落库核验。
-**114 项断言**。在服务端目录里运行（它会读 `data/app.db` 验证落库），
+**138 项断言**。在服务端目录里运行（它会读 `data/app.db` 验证落库），
 跑之前删掉 `data/app.db*` 重启服务端，保证注册流程从空表开始；用法
 详见文件头。
 

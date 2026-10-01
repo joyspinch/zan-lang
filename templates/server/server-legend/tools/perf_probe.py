@@ -15,6 +15,7 @@ P6 GM announce push fanout latency (8 attached bots)
 Output: PERF lines + PERF_DONE.
 """
 import json
+import os
 
 import socket
 import statistics
@@ -24,8 +25,19 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BASE = "http://127.0.0.1:48099"
-GAME = ("127.0.0.1", 47100)
+def _ports():
+    """端口唯一信源是 config/app.json（[game].port + [server].port），
+    不在脚本里再抄一份常量——改端口改一处就够。"""
+    cfg = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "config", "app.json")
+    with open(cfg, encoding="utf-8") as f:
+        c = json.load(f)
+    return (int(c["game"]["port"]), int(c["server"]["port"]))
+
+
+GAME_PORT, HTTP_PORT = _ports()
+BASE = "http://127.0.0.1:%d" % HTTP_PORT
+GAME = ("127.0.0.1", GAME_PORT)
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **kw):
@@ -190,7 +202,7 @@ def login_worker(idx):
             if s is None:
                 s = socket.socket()
                 s.bind((f"127.0.0.{2 + idx % 8}", 0))
-                s.connect(("127.0.0.1", 48099))
+                s.connect(("127.0.0.1", HTTP_PORT))
                 s.settimeout(10)
             payload = json.dumps({"user": f"perf{idx:02d}", "pass": "pass123"})
             s.sendall(("POST /api/game/login HTTP/1.1\r\nHost: 127.0.0.1\r\n"

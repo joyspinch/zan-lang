@@ -5,7 +5,7 @@ Run against a live instance. Duration defaults to 600s (override: argv[1]
 seconds). Mixes hostile traffic with normal clients and watches resources:
 
 - 3 garbler threads: random bytes / 300KB oversized frame / split frames,
-  reconnect loop on port 47100
+  reconnect loop on [game].port from config/app.json
 - 3 churn threads: connect-login-attach then RST close (SO_LINGER 0), ~1/s
 - 2 normal bots: login/enter/state loop at ~1 op/s, error + latency tracked
 - monitor: VmRSS + fd count of every legend-server pid every 5s
@@ -37,8 +37,21 @@ bot_ops = [0]
 # 若撞上 bot 的账号，bot 的报错只会反映「被顶号」这一正确业务语义。
 CHURN_USER = "chaos_churn"
 
+def _ports():
+    """端口唯一信源是 config/app.json（[game].port + [server].port），
+    不在脚本里再抄一份常量——改端口改一处就够。"""
+    cfg = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "config", "app.json")
+    with open(cfg, encoding="utf-8") as f:
+        c = json.load(f)
+    return (int(c["game"]["port"]), int(c["server"]["port"]))
+
+
+GAME_PORT, HTTP_PORT = _ports()
+
+
 def api(path, obj, timeout=10):
-    req = urllib.request.Request("http://127.0.0.1:48099" + path)
+    req = urllib.request.Request("http://127.0.0.1:%d" % HTTP_PORT + path)
     req.add_header("Content-Type", "application/json")
     try:
         r = urllib.request.urlopen(req, json.dumps(obj).encode(), timeout=timeout)
@@ -58,7 +71,7 @@ def garbler(mode):
         try:
             s = socket.socket()
             s.settimeout(2)
-            s.connect(("127.0.0.1", 47100))
+            s.connect(("127.0.0.1", GAME_PORT))
             try:
                 s.recv(4096)
             except OSError:
@@ -84,7 +97,7 @@ def churn():
             s.settimeout(3)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
                          struct.pack("ii", 1, 0))
-            s.connect(("127.0.0.1", 47100))
+            s.connect(("127.0.0.1", GAME_PORT))
             s.recv(4096)
             s.sendall((f'{{"op":"login","user":"{CHURN_USER}",'
                        f'"pass":"pass123"}}\n').encode())

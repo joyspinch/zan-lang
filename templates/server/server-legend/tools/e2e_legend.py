@@ -137,7 +137,7 @@ def start_server(exe):
     log = open(os.path.join(ROOT, "data", "e2e_legend_server.log"), "ab")
     proc = subprocess.Popen([exe], cwd=ROOT, stdout=log, stderr=log)
     if not wait_port():
-        raise SystemExit("server did not listen on 47100; see data/e2e_legend_server.log")
+        raise SystemExit("server did not listen on game port %d; see data/e2e_legend_server.log" % GAME_PORT)
     time.sleep(1.5)
     return proc
 
