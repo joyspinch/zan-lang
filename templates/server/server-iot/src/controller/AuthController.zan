@@ -1,44 +1,45 @@
 using System;
 using System.Json;
+using System.Web;
+using ZanWeb;
 
-namespace ZanWeb;
+namespace ZanWeb.Auth;
 
-/* 管理控制台会话认证。演示凭证 admin/admin 映射 uid "1"（rank 9 via DefaultAuth），替换为自有用户存储。令牌通过 Authorization: Bearer <token> 或 zsession cookie 传递。 */
-class AuthController {
-    [Post]
-    [Title("登录")]
-    static async void Login(HttpContext ctx) {
-        string user = ctx.In("user");
-        string pass = ctx.In("pass");
-        Validator v = new Validator();
-        v.Require(user, "user");
-        v.MaxLen(user, 32, "user");
-        v.Require(pass, "pass");
-        v.MaxLen(pass, 64, "pass");
-        if (!v.Ok()) {
-            ctx.Status(422, "Unprocessable Entity");
-            ctx.Api("1003", "validation failed", v.ErrorsJson());
+/* 管理控制台会话认证：/auth/login 发会话（Bearer 或 zsession cookie 双通道，
+   包 WebApp.AuthUser 两条都解析），/auth/me 回显当前 uid。演示凭证是包
+   Schema 种子的 bootstrap 管理员（[auth].bootstrapPassword），替换为自有
+   用户存储时接 sys_user 即可。 */
+[Route("[controller]/[action]")]
+[Description("认证")]
+class AuthController : ApiController {
+    [HttpPost]
+    [Description("登录")]
+    async void Login() {
+        string user = this.In("user");
+        string pass = this.In("pass");
+        if (user.Length == 0 || user.Length > 32 || pass.Length == 0
+            || pass.Length > 64) {
+            this.Fail(422, "1003", "validation failed");
             return;
         }
-        if (user == "admin" && pass == "admin") {
-            string token = WebHost.Current().sessions.Issue("1", WebApp.NowSeconds());
-            ctx.SetCookie("zsession", token, 86400);
-            JsonValue o = JsonValue.NewObject();
-            o.Put("token", JsonValue.NewStr(token));
-            Reply.Ok(ctx, o.ToJson());
-        } else {
-            Reply.Fail(ctx, 401, "1001", "bad credentials");
+        /* 空令牌同时覆盖"无此账号"与"密码错误"，不向调用方透露是哪一种。 */
+        string token = await AuthUser.Login(user, pass);
+        if (token.Length == 0) {
+            this.Fail(401, "1001", "bad credentials");
+            return;
         }
+        this.Ctx().SetCookie("zsession", token, 86400);
+        JsonValue o = JsonValue.NewObject();
+        o.Put("token", JsonValue.NewStr(token));
+        this.Ok(o.ToJson());
     }
 
-    [Get]
-    [Title("当前用户")]
-    [Login]
-    static async void Me(HttpContext ctx) {
-        // 框架把解析出的身份放在 HttpContext.uid（typed 字段，0c5c6164 起
-        // 取代旧 state 草稿表）；rank 随登录用户的存储而异，这里只回显 uid。
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    [Description("当前用户")]
+    async void Me() {
         JsonValue o = JsonValue.NewObject();
-        o.Put("uid", JsonValue.NewStr(ctx.uid));
-        Reply.Ok(ctx, o.ToJson());
+        o.Put("uid", JsonValue.NewStr(this.Ctx().uid));
+        this.Ok(o.ToJson());
     }
 }

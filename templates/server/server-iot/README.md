@@ -2,11 +2,12 @@
 
 An MQTT 3.1.1 message broker **plus** an attribute-driven web management console,
 in one Zan binary. Devices speak MQTT on `:1883`; operators use the HTTP console
-and JSON API on `:8080`. Both halves come from the standard library: the broker
-is `System.Net.Mqtt.MqttBroker`, the console is `System.Web` (convention
-routing, unified input filtering, auth/rank/lock, in-memory views) — the same
-web stack `server-mvc` uses. The template itself only holds config, DB, cache,
-controllers, routes and views.
+and JSON API on `:8080`. The web half comes from the **Zan.Mvc package**:
+attribute routing is generated at compile time (`__AttrRoutes`), auth/sessions
+use the package services (`AuthToken`/`AuthUser`/`Cfg`), and the console
+account is the package Schema's bootstrap admin — the same stack the other
+server templates consume. The broker itself is `System.Net.Mqtt.MqttBroker`.
+The template holds config, the `[mqtt]` config shim, controllers and views.
 
 ## Features
 
@@ -22,23 +23,18 @@ controllers, routes and views.
 - **Performance monitoring** (`/admin/stats`, `/iot/metrics`): uptime, connected
   vs. cumulative clients, subscription/topic counts, message + byte throughput,
   and the full HTTP runtime metrics snapshot.
-- **Attribute-driven routes** (`[Get]`/`[Post]`/`[Route]`/`[Auth]`/`[Rank]`/
-  `[Lock]`/`[Menu]`/`[Title]`) collected into `src/framework/Routes.gen.zan`.
-  These can also be collapsed into one combined attribute, e.g.
-  `[Api(post, route="/iot/clients/{id}/kick", title="踢下线", auth, rank=9, lock="global")]`
-  (bare flags + `key=value`; the single attributes still work and can be mixed).
+- **Attribute-driven routes** (`[HttpGet]`/`[HttpPost]`/`[Route]`/
+  `[Custom(Authorization = ...)]`/`[Lock]`/`[Description]`) generated into
+  `__AttrRoutes` at compile time — same convention as the Zan.Mvc package.
 
 ## Layout
 
 ```
-config/app.json            server + mqtt ports (edit, no recompile)
-views/index.html           dashboard (polls the /iot/* APIs)
-src/main.zan               registers Worker("mqtt") + Worker("http") console, Worker.RunAll
-src/controller/            HTTP actions (Iot / Auth / Home) + Reply helpers
-src/framework/Config.zan   config/app.json loader
-src/framework/Db.zan       DbConnection bootstrap
-src/framework/Cache.zan    in-memory TTL cache (Redis optional)
-src/framework/Routes.gen.zan  route table built from the controller attributes
+config/app.json            server/mqtt/auth/database settings (edit, no recompile)
+views/Home/HomeController.Index.html   dashboard (polls the /iot/ JSON APIs)
+src/main.zan               package wiring + Worker("mqtt") + Worker("http"), Worker.RunAll
+src/controller/            HTTP actions (Iot / Auth / Home), package ApiController base
+src/Framework/MqttCfg.zan  template-only [mqtt] config section over package Cfg
 ```
 
 ## Build & run
@@ -56,19 +52,19 @@ app.exe
 | Method & path                 | Auth      | Purpose                          |
 |-------------------------------|-----------|----------------------------------|
 | `GET  /`                      | —         | dashboard                        |
-| `GET  /health`                | —         | liveness probe (`db` field is informational — the broker does not depend on the database) |
+| `GET  /health`                | —         | liveness probe (`?deep=1` adds a database roundtrip; the broker itself does not depend on the database) |
 | `GET  /iot/clients`           | —         | connected clients                |
 | `GET  /iot/clients/{id}`      | —         | one client + its subscriptions   |
-| `POST /iot/clients/{id}/kick` | rank ≥ 9  | force-disconnect (global lock)   |
+| `POST /iot/clients/{id}/kick` | login     | force-disconnect (global lock)   |
 | `GET  /iot/subscriptions`     | —         | all subscriptions                |
 | `GET  /iot/topics`            | —         | all topics + last payload        |
 | `GET  /iot/metrics`           | —         | broker performance snapshot      |
-| `POST /iot/publish`           | rank ≥ 3  | inject a message (`topic`,`payload`) |
-| `GET  /admin/stats`           | rank ≥ 9  | broker + HTTP metrics            |
-| `POST /auth/login`            | —         | demo admin/admin → bearer token  |
+| `POST /iot/publish`           | login     | inject a message (`topic`,`payload`) |
+| `GET  /admin/stats`           | login     | broker + HTTP metrics            |
+| `POST /auth/login`            | —         | `admin` / `[auth].bootstrapPassword` (default `admin-bootstrap-2026`) → session cookie + bearer token |
 
-Read frontend params through `ctx.In / ctx.InInt / ctx.InText` (central filter);
-`ctx.InRaw` when you deliberately need the unfiltered value (e.g. publish payload).
+Read frontend params through `this.In(...)` / `this.InRaw(...)` on the package
+controller base; JSON API replies use the package envelope `{"code":0,"msg","data","traceId"}`.
 
 ## Try it
 

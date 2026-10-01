@@ -1,4 +1,5 @@
 using System;
+using System.Data;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Mqtt;
@@ -6,33 +7,69 @@ using ZanWeb;
 using System.Web;
 
 /* {{NAME}} -- EMQX 风格 MQTT 物联网管理服务器。 */
-/* 两个监听器都挂在 Worker 统一宿主上：MQTT 3.1.1 代理（config mqtt.port，默认 1883，Worker("mqtt") -> 内置 MqttBroker.Global()）接收设备、跟踪会话/订阅、路由带 +/# 通配符的 PUBLISH；HTTP 管理控制台（config server.port，默认 8080）提供看板及 /iot/<wildcard> JSON API，路由表见 src/framework/Routes.gen.zan（新增控制器/动作时编辑）。 */
-/* 运行期设置存于 config/app.json（改 host/port 无需重编译）。 */
+/* 框架来自 Zan.Mvc 包：路由从 [Route] 属性编译期生成（__AttrRoutes），
+   认证/会话/配置用包服务（AuthToken/AuthUser/Cfg），控制台账号是包
+   Schema 种子的 bootstrap 管理员。两个监听器都挂在 Worker 统一宿主上：
+   MQTT 3.1.1 代理（config [mqtt]，默认 0.0.0.0:1883，Worker("mqtt") ->
+   内置 MqttBroker.Global()）接收设备、跟踪会话/订阅、路由带 +/# 通配符
+   的 PUBLISH；HTTP 管理控制台（config [server]，默认 127.0.0.1:8080）
+   提供看板与 /iot/ 下的 JSON API。数据库是可选件（包 Schema 只为控制台
+   登录种 sys 域），设备面不依赖库。运行期设置存于 config/app.json。 */
 class Program {
     static async void Main() {
         /* config/ 和 views/ 按相对路径读取，进程需位于发布目录；双击或从其他目录启动时不满足。 */
         bool _cd = ProcessHost.UseAppDir("config/app.json");
-        Config.Load("config/app.json");
+        Cfg.Load("config/app.json");
+        MqttCfg.Load("config/app.json");
 
-        /* ---- MQTT 代理（Worker 统一宿主，见 Worker.zan HandleMqtt）---- */
-        MqttBroker.Use(new MqttBroker(
-            Config.Str("mqtt", "host", "0.0.0.0"),
-            Config.Int("mqtt", "port", 1883)));
+        /* 数据库可选：只为控制台登录（sys 域）服务，[database] 未配置时
+           默认 SQLite data/app.db，不可达则登录 503、MQTT 面不受影响。 */
+        DbPool pool = Db.OpenPool();
+        DbContext db = DbContext.Of(pool);
+        CacheContext cache = CacheContext.Of(Db.OpenRedis());
+        AppServices services = new AppServices(db, cache);
+        AppServices.Use(services);
+
+        /* 启动时执行一次 Schema 迁移与 sys 域种子（bootstrap 管理员） */
+        bool ready = await Schema.Ensure(db);
+
+        /* ---- MQTT 代理（Worker 统一宿主）---- */
+        MqttBroker.Use(new MqttBroker(MqttCfg.host, MqttCfg.port));
         Worker mqttPort = new Worker("mqtt",
-            Config.Str("mqtt", "host", "0.0.0.0"),
-            Config.Int("mqtt", "port", 1883));    /* 连接由内置 MqttBroker.Global() 接管 */
+            MqttCfg.host, MqttCfg.port);      /* 连接由内置 MqttBroker.Global() 接管 */
 
         /* ---- HTTP 管理控制台 ---- */
-        WebApp app = new WebApp(
-            Config.Str("server", "host", "127.0.0.1"),
-            Config.Int("server", "port", 8080));
+        WebApp app = new WebApp(Cfg.Server.host, Cfg.Server.port);
+        app.MaxBody(Cfg.Server.maxBodyMB * 1024 * 1024);
+        app.GlobalLimit(Cfg.Server.globalLimitPerSec);
         WebHost.Use(app);
+        app.AuthResolver(AuthToken.Resolve);
+        app.PermissionResolver(AuthUser.Allow);
+        app.LoginPath(Routes.Login);
         app.Views("views");
-        app.MaxBody(Config.Int("server", "maxBodyMB", 2) * 1024 * 1024);
-        app.GlobalLimit(Config.Int("server", "globalLimitPerSec", 0));
         app.Before(Program.AccessLog);
 
-        Routes.Map(app);                  /* 路由表（src/framework/Routes.gen.zan） */
+        /* 路由：编译期从控制器属性生成，运行时只执行注册 */
+        __AttrRoutes.Register(app);
+
+        /* 权限索引：从路由表建立 screen->bit 映射（本模板只有 Login 级路由） */
+        Perm.Index(app);
+
+        if (ready) {
+            bool grantsReady = await Schema.SyncRoleGrants(app);
+            if (!grantsReady) {
+                Console.WriteLine("[rbac] role grants not synchronized"
+                    + " -- check database connectivity and schema");
+            }
+            IDbConnection rbac = await AppServices.Current().Db().Acquire();
+            if (rbac != null) {
+                await PermTable.LoadRoles(rbac);
+                AppServices.Current().Db().Release(rbac);
+            }
+        } else {
+            Console.WriteLine("[db] schema not applied (database unreachable)"
+                + " -- console login unavailable until database is up");
+        }
 
         /* HTTP 控制台也注册为 Worker，两个监听器同进程统一调度 */
         Worker httpPort = new Worker("http", app.Host(), app.Port());
