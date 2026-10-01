@@ -31,4 +31,12 @@ mkdir -p "$OUT"
 # Every emitted program calls zan_timer_* from its inline coroutine driver, so a
 # cross-link needs this object unconditionally (see main.c).
 "$CC" -O2 -g0 -std=c11 -I "$RT" -c "$RT/rt_timer.c" -o "$OUT/zanrt_timer.o"
-echo "built toolchain/$SUB: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o"
+# Embedded-resource API + compressed-resource decoder: GUI programs pull
+# skins/icons through the auto-embed path, so the cross link injects these two
+# objects (same flags as the ZAN_INFLATE_OBJ recipe in CMakeLists.txt).
+"$CC" -O2 -g0 -std=c11 -I "$RT" -c "$RT/zan_embed_api.c" -o "$OUT/zan_embed_api.o"
+"$CC" -O2 -g0 -std=c11 \
+    -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
+    -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
+    -I "$ROOT/src/common" -c "$RT/zan_inflate.c" -o "$OUT/zan_inflate.o"
+echo "built toolchain/$SUB: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zan_embed_api.o zan_inflate.o"

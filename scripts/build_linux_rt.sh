@@ -42,5 +42,15 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
     # so a cross-link needs this object unconditionally (see main.c).
     "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
         -I "$RT" -O2 -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
-    echo "built toolchain/$sub: zanrt_io.o zanrt_sync.o zanrt_file.o zanrt_timer.o"
+    # Embedded-resource API + compressed-resource decoder: GUI programs pull
+    # skins/icons through the auto-embed path, so the cross link injects these
+    # two objects (same flags as the ZAN_INFLATE_OBJ recipe in CMakeLists.txt).
+    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC -I "$RT" -O2 \
+        -c "$RT/zan_embed_api.c" -o "$out/zan_embed_api.o"
+    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC -O2 \
+        -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
+        -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
+        -I "$ROOT/src/common" \
+        -c "$RT/zan_inflate.c" -o "$out/zan_inflate.o"
+    echo "built toolchain/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zan_embed_api.o zan_inflate.o"
 done

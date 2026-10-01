@@ -5256,7 +5256,13 @@ int main(int argc, char **argv) {
                         target.arch == ZAN_ARCH_AARCH64);
     bool shard_opt_out = (shard_env && shard_env[0] == '0') ||
                          (no_shard_env && no_shard_env[0] == '1');
-    bool want_shard = native_arch && !shard_opt_out &&
+    /* Sharded emission splits function bodies into <obj>.shardN.o files; only
+     * the native link branches consume them (they iterate generated_objects).
+     * Every cross branch assembles an explicit link line (obj_tmp + runtime
+     * objects) and would silently drop the shards, leaving each moved body an
+     * undefined __zan_release_* / __zan_desc_* reference at link time -- a
+     * cross publish failed exactly that way until this gate existed. */
+    bool want_shard = native_arch && !cross_compiling && !shard_opt_out &&
                       ((shard_env && shard_env[0] == '1') || publish_mode);
 
     if (zan_irgen_emit(&irgen, ast) != ZAN_OK) {

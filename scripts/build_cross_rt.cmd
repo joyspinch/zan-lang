@@ -27,6 +27,10 @@ for %%P in (linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64) do (
     "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\%%A\zanrt_sync.o  || exit /b 1
     "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\%%A\zanrt_file.o  || exit /b 1
     "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || exit /b 1
+    rem Embedded-resource API + decoder: GUI programs pull skins/icons through
+    rem the auto-embed path, so the cross link injects these two objects.
+    "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\zan_embed_api.c -o toolchain\%%A\zan_embed_api.o || exit /b 1
+    "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -O2 -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS -I src\common -c %RT%\zan_inflate.c -o toolchain\%%A\zan_inflate.o || exit /b 1
     echo built toolchain\%%A
   )
 )
@@ -42,6 +46,9 @@ for %%P in (arm64:aarch64 x64:x86_64) do (
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\macos\%%A\zanrt_file.o  || exit /b 1
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\macos\%%A\zanrt_timer.o || exit /b 1
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\gui_compat_mac.c -o toolchain\macos\%%A\zanrt_gui.o || exit /b 1
+    rem Embedded-resource API + decoder for the auto-embed path (GUI skins/icons).
+    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\zan_embed_api.c -o toolchain\macos\%%A\zan_embed_api.o || exit /b 1
+    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -O2 -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS -I src\common -c %RT%\zan_inflate.c -o toolchain\macos\%%A\zan_inflate.o || exit /b 1
     echo built toolchain\macos\%%A
   )
 )
