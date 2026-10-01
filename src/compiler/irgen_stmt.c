@@ -1761,7 +1761,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         emit_stmt(g, stmt->while_stmt.body, locals);
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
             emit_release_owned_locals_from(g, locals, body_start);
-            LLVMBuildBr(g->builder, cond_bb);
+            /* back-edge cooperative preemption (B-ID44): inside an async fn
+             * this plants the poll/requeue site; outside it is a no-op. */
+            if (!emit_async_preempt_site(g, cond_bb))
+                LLVMBuildBr(g->builder, cond_bb);
         } else {
             emit_release_owned_locals_from(g, locals, body_start);
         }
@@ -1838,7 +1841,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         LLVMPositionBuilderAtEnd(g->builder, step_bb);
         if (stmt->for_stmt.step) emit_expr(g, stmt->for_stmt.step, locals);
-        LLVMBuildBr(g->builder, cond_bb);
+        /* back-edge cooperative preemption (B-ID44): the step already ran, so
+         * the resume path re-enters at the condition; no-op outside async. */
+        if (!emit_async_preempt_site(g, cond_bb))
+            LLVMBuildBr(g->builder, cond_bb);
 
         g->break_target = saved_break;
         g->continue_target = saved_cont;
@@ -2785,7 +2791,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         emit_stmt(g, stmt->while_stmt.body, locals);
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
             emit_release_owned_locals_from(g, locals, body_start);
-            LLVMBuildBr(g->builder, cond_bb);
+            /* back-edge cooperative preemption (B-ID44): resume re-tests the
+             * condition; no-op outside async fns. */
+            if (!emit_async_preempt_site(g, cond_bb))
+                LLVMBuildBr(g->builder, cond_bb);
         } else {
             emit_release_owned_locals_from(g, locals, body_start);
         }

@@ -32,5 +32,7 @@
 
 - [ ] **B-ID46** NativeMemory 缺 `PutF64/GetF64`（double↔u64 位型 reinterpret 原语）——语言无 reinterpret 转换（`float`/`sbyte`/`short` 类型亦不存在），IEEE-754 位构造只能纯 Zan 归一化循环实现，已四处复制同一算法：`Zan.Data` 的 TdsMessage.DoubleBits、FbSql.DoubleBits，`Zan.Protobuf` 的 DoubleBits/BitsDouble，`Zan.MsgPack` 的 DoubleBits/BitsDouble/BitsSingle。编码侧归一化对 ±∞/NaN 不终止（各处都得收口）、解码侧逐位累加每次 52 次循环（memcpy 级本可一条指令）。方向：NativeMemory 增 `PutF64(nint, double)`/`GetF64(nint)` + 可选 `PutF32/GetF32`，LLVM bitcast 落地零开销，四个站点收敛为调用方；conformance 钉 ±∞/NaN/-0.0/次正规位型。挂账原因：本轮三个序列化包按 rule 10 只挂账不绕路——纯 Zan 算法正确性已向量锁定（protobuf_wire/msgpack_values 双 conformance），补原语属编译器+运行时批次单独做。
 
+- [ ] **B-ID47** wasm32 目标 async 程序链接失败：`wasm-ld: undefined symbol: _setjmp`——任何含 async/await 的程序 `--target wasm32` 编译在 LLVM IR verify 之后、wasm 链接时缺 `_setjmp`（2026-10-01 抢占轮实测，task_yield/async_delay_max 同样失败；**旧 zanc 亦然，既有缺口非新回归**）。IR 层已验证无恙（module verify 通过才走到链接），阻塞的是 wasm32 async 的运行时验证路径（M:1 内联驱动 poll 发射体因此只做了 IR 级验证）。方向：wasm sysroot 补 setjmp/longjmp 移植（musl wasi 有 setjmp，符号名 `_setjmp` 别名缺失）或 async wasm 降级走无 setjmp 的纯 CPS 恢复路径；验证：`zanc task_yield.zan --target wasm32` 链接成功 + wasmtime/wasm3 跑通输出。
+
 ## 未完成 · 编译内存
 

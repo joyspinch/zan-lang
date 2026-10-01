@@ -193,7 +193,9 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | 变量 | 作用 |
 |---|---|
 | `ZAN_RT_HARD` | 设了它守卫失败即硬退出（默认构建下等效 `--strict-runtime` 的行为） |
-| `ZAN_CO_WORKERS` | 多 worker 协程调度器的 worker 数（默认=逻辑核数；需程序以 --mt 构建） |
+| `ZAN_CO_WORKERS` | 多 worker 协程调度器的 worker 数（native 64-bit 目标默认即多 worker 驱动，无需任何构建旗标；默认=min(逻辑核数，4)，见 `AsyncRuntime.SetWorkers` 优先） |
+| `ZAN_CO_QUANTUM_MS` | 协程协作式抢占的时间片（毫秒，默认 2，0=关闭）：编译器在 async 函数的每个循环回边埋 `zan_co_poll`，超片的计算密集帧自动重排到队尾，不再饿死定时器/IO 回调/兄弟协程；Windows 时钟粒度 ~15ms，实际片长取整到时钟 tick |
+| `ZAN_CO_STACK` | Task.Spawn/Run 有栈 fiber 的栈大小（默认 128KB，范围 64KB~16MB） |
 | `ZAN_GUI_ICONS` | 覆盖图标包目录（发现序：env → exe 旁 icons/ → 内嵌 → stdlib） |
 | `ZAN_CEF_*` | CEF 浏览器驱动运行时定位（examples/gui_cef_browser/README.md 全表：RUNTIME/CACHE/MIRROR/LOG/SWITCHES/HELPER* 等一族） |
 

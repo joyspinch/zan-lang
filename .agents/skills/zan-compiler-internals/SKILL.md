@@ -2776,3 +2776,7 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   私 zanc 编探针须带 `--stdlib-path stdlib`（exe 旁发现失效）+ `--no-packages`（隔离并行
   会话在途包改动）。共账 build/ 不必抢：对方下次 ninja 调用自动用新源重链。
 - **机制开关类注释会滞后架构演进，还会污染台账**（2026-10-01，async-workers 正名轮实测）：多 worker M:N 异步驱动早就是 native 64-bit 目标的**默认**（编译器按 target 判定选链哪个驱动对象），而运行时 11 处注释仍写"编译时加 --async-workers 才启用"——该旗标从未出现在 argv 解析里，纯注释民间传说；新会话（包括写台账的会话）读注释即被带偏，把"已默认"错记成"待评估缺口"，白做一轮"默认化改造"调研。定式：机制/开关类陈述以**代码判定点**为准绳——`grep -rn '<旗标名>' src/compiler/` 若只命中注释、argv 解析零命中，即为传说；真值源是编译器里选路径的那处初始化（capability 判定/条件编译），注释只有对上判定点才可信。写台账引用机制前先做这一步。
+- **协作式调度器"定时器只在 idle 泵"会在持续负载下饿死 timer 交付**（2026-10-01 抢占轮实测）：回边抢占让 CPU 密集帧每片重排自身后，就绪队列**永不为空**，而 M:1 的 run_until 和 mt 的 co_worker 都只在队列排空的 idle 路径派发到期定时器——`Task.Delay` 兄弟照样饿死，抢占等于白做。通则：忙碌路径必须也派发到期定时器（M:1 每次 dispatch 顺手 zan_timer_dispatch_due，一锁一堆顶；mt 走现成 1ms 节流 co_pump_timers）。任何"事件循环只在没活干时看钟"的调度器都有同款坑。
+- **LLVM 会把纯计算热循环折成闭式（SCEV），热循环探针必须含不透明副作用**：`s=s+j` 累加循环在 Release 下被折成一条公式，"热循环"微秒跑完，抢占/调度探针全程测不到东西。内层循环塞原子 RMW（AtomicInt.Add）或外部调用才保得住真实耗时；探针断言也别用会被 LICM 提外的普通 Load（外层判 flag 用 intervening 有副作用调用保证不被提升）。
+- **特性带 env 关闭旋钮时，探针必须跑"关"态做 A/B**：ZAN_CO_QUANTUM_MS=0 重跑同一探针得到相反断言（brokeEarly 1 vs 0），证明测试真的测到了特性而不是恒真；conformance 用例配 ctest `ENVIRONMENT` property pin 住关键变量（本例 ZAN_CO_WORKERS=1，否则多 worker 下兄弟本就在别的 worker 上跑，用例恒绿测不到抢占）。
+- 私目录 zanc 追加两条：编译 wasm32 目标需 `build/wasm32` sysroot 在**exe 旁**（`cp -r build/wasm32 _scratch/bld-y/`），且 wasm32 async 目前链不过（`_setjmp` undefined，既有缺口非新回归）——IR verify 阶段已足够验证发射体；包类型用例在私 zanc 下走 MVC 模式显式传包源文件（exe 侧发现不出 _scratch，`--auto-stdlib` 半解析会报 ZANPKG_MISSING 假象）。

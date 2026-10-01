@@ -198,7 +198,8 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   `Action<Canvas,int,int>`（仓里只有零元 Gui.Action 与一元
   System.Linq.Action<T>，多元泛型根本不存在）潜伏三周，直到首个模板
   （game/idle）真引用才爆。教训：① 基建批次的验证不能只编"入口程序"，
-  要有把包/库**整树拉进编译集**的健康普查（逐文件或整包合编）；
+  要有把包/库**整树拉进编译集**的健康普查（`scripts\pkg_sweep.ps1` 一键
+  全包整树合编；2026-10-01 基线 26 包全绿，后续拆包/大改后重跑）；
   ② 多参回调一律声明具名委托（`delegate void BulletHitFn(int, double, ...)`
   放消费方同命名空间），lambda 实参照常转换，别指望仓里有多元 Action。
 - **同名类型歧义按泛型元数过滤（B-ID38，已根治）**：`using System; using Gui;`
@@ -309,7 +310,14 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   因 stdlib 变更缓存失效而打印，曾被误读成"删了反而多拉 14 个文件"）；
   程序自己的图以下一行 `Published N files` / exe 尺寸为准。② 日志带
   CRLF——从日志抽文件列表再 `grep`/`[ -f ]` 探测时必须先
-  `tr -d '\r'`，否则路径带 \r 全部 MISS，得出"图内没人引用它"的假阴性
+  `tr -d '\r'`，否则路径带 \r 全部 MISS，得出"图内没人引用它"的假阴性。
+
+## 发布产物命名与字符串混淆内存陷阱（2026-09-29）
+
+- **Windows Image File Execution Options 劫持通用名 `app.exe`**：
+  在 Windows 注册表 `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\app.exe` 下若被开启了 `GlobalFlag = 0x02000000` (Page Heap / 页面堆) 并注入 `verifier.dll`，任何名为 `app.exe` 的二进制在启动时都会被 Windows 内核强制挂钩，每个微小堆分配独占 4KB 物理内存保护页，导致进程启动内存暴增至 270MB+ 并可能引发莫名崩溃（`0x80000003` 断点）。ZanIDE 发布与构建绝不可无脑使用目录名 `Path.GetFileName(root)` 作为 `app.exe`，必须优先取 `zan.proj` 中的 `name` 属性（如 `OnePlus.exe`），彻底避开系统对通用名字的调试注入。
+- **发布构建默认字符串混淆导致 220MB+ 内存页脏化（Dirty Pages）**：
+  字符串混淆将只读常量从只读段（`.rdata`，支持 OS 内存映射与按需 Page-in，不计入私有提交 Commit）变为可写数据段（`.data`），并在 `main` 执行前的全局构造函数 `__zan.deobf` 中对数万个字符串执行原地解密写入。这会导致全量页面被 Dirty 写入，直接被操作系统强制分配数百 MB 的物理私有提交内存。混淆功能必须默认关闭（Opt-in），通过 `--obfuscate-strings` 或 `ZAN_OBF=1` 按需显式启用。
   （本次差点据此推翻真实触发链）。
 - **改 Worker/HttpFramer 这类"唯一宿主"的收尾清单**：grep 全仓库旧 API
   调用点逐个补（`CreateTls`→`HttpFramerTls.Create`、`onSseSubscriber`→
@@ -663,7 +671,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   拷进 toolchain/。OHOS NDK clang 15.0.4 在 DevEco Studio 安装目录的
   native/ 下。
 
-## Linux 构建三断点：feature 宏分层、fortify 契约、死包含
+## Linux 构建三断点：feature 宏分层、fortify 契约、死包含（B-ID29）
 
 - **glibc 头文件的 feature 宏分层必须显式给**：`SA_ONSTACK` 在
   `__USE_GNU` 层——要显式 `-D_GNU_SOURCE`，`-std=gnu11` 也不保证暴露
@@ -709,7 +717,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   fd 上，`AcceptAsync(-1)` 立即返回会伪装成「苏醒」，探针假阳性（首轮
   listener 探针就因此"通过"过一次）。
 
-## 懒启动池的所有权谓词：前台泵自起池也要置所有权标志
+## 懒启动池的所有权谓词：前台泵自起池也要置所有权标志（B-ID30）
 
 - **「无池则起池」的懒启动入口（ensure）必须与所有持有执行所有权的路径
   共用同一个所有权谓词**：前台 `sched_run` 自起 worker 并内联跑 worker0
@@ -720,7 +728,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - **池退出要复查掉队帧**：最后一次空闲检查与清理动作（关反应器 port）
   之间 ready 进来的帧会没人接管——退出前按 worker 同款空闲谓词复查，
   非空闲就把残留工作交给新池再退，别把 port 拆在活帧脚下。
-- **并发修复的 A/B 定式**：用版本库里的旧版源文件编旧对象、跑同一探针，
+- **并发修复的 A/B 定式**：`git show HEAD:<file>` 编旧对象、跑同一探针，
   证明探针真能抓住缺陷（修前线程峰值 9 FAIL / 修后 5 PASS）——只看
   修后绿不能证明探针有效。线程峰值从 /proc/self/status 的 Threads 采样；
   前台池要靠「arm 住 pending 工作但不触发 ready」的定时器撑住（arm 不
@@ -1039,7 +1047,10 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   - **AST Body 即刻卸载铁律**：普通非泛型方法在生成完 LLVM IR 后，立即将其语法树置空（`member->method_decl.body = NULL;`），使数百万表达式 AST 节点生命周期不再延续至后端结束；注意必须保留 `Main` / `__DesignMain` 直至入口包装完成，避免入口函数生成为空导致 `globaldce` 将整个工程当做死代码清空。**特别注意：泛型特化发射（emit_method_spec_body）决不能清空 `member->method_decl.body`**！同一个泛型模板（如 `List<T>.Find`）可能被特化多次，首次置空会导致后续特化解引用 NULL 空指针触发 `0xC0000005`（Access Violation 崩溃，退出码 `-1073741819`）。
   - **分片发射即刻销毁与零文本膨胀（Module Sharding）**：
     - **禁止整模块文本打印**：绝不可调用 `LLVMPrintModuleToString(g->mod)` 提取函数体！大型项目中 350 万条 IR 指令整块转字符串会在 LLVM 内部产生多次倍增扩容，额外强占数百兆堆内存，直接将全流程峰值凭空推高 302 MB（导致实测出现 1,481 MB 虚假峰值）；必须使用 LLVM 原生 API `LLVMPrintValueToString(fn)` 对待分片函数逐个流式打印，写完当前函数即刻 `LLVMDisposeMessage` 释放，全流程 0 全局文本膨胀、0 spans 结构体分配，将分片发射阶段的峰值死死焊死在 1,179 MB 以下。
+    - **分片期间严禁提前销毁未完工成员基本块**：单个 Shard 发射为 `.o` 后，不可在循环内立即调用 `LLVMDeleteBasicBlock` 清空 Coordinator 模块中对应函数的 BasicBlocks。因为后续 Shard 在做引用闭包或跨函数分析时，若碰到已被提早物理删除基本块的函数，LLVM 内部的 Use 链与指令遍历会直接触发 `0xC0000005` 段错误崩溃（退出码 `-1073741819`）。驱逐时机必须保持在所有 Shard 全部落盘后，由主流程统一通过 `LLVMReplaceAllUsesWith` + `LLVMDeleteFunction` 安全回收。
+    - **发布包运行时对象完整性（`publish_ide.ps1` 与 `stage_dev_toolchain.ps1`）**：除了 `zanrt_*` 运行时对象，还必须收集 `zan_inflate*`（内嵌资源解压，miniz）和 `zan_embed_api*` 到 toolchain 目录，否则大型项目在带有资源内嵌的发布模式下（如包含 HTML/CSS/图片资源），链接器会因找不到 `zan_inflate.obj` 报错中断并导致发布失败。
     - **分片自适应默认激活**：分片发射（Module Sharding）不应依赖隐藏的环境变量 `ZAN_SHARD=1`（用户在 IDE 界面点击发布或命令行默认构建时无此变量），应在 native 目标（x86_64 / aarch64）的 `--publish` 发布构建下自适应默认开启（支持 `ZAN_NO_SHARD=1` / `ZAN_SHARD=0` 关闭）。当函数规模较小、规划分片数 `<= 1` 时自动跳过保持单模块，小工程零额外开销；超大项目（如 730 文件 OnePlus、534 文件 ZanIDE）自动切分 40+ 分片并即刻销毁，全局优化从 35 秒降至 10 秒，链接时间缩短 75%，主模块 Commit 常驻大幅下降。
+    - **协程工作线程默认上限**：在 16/32/64 核高配机器上，`co_worker_count` 默认回退如果盲目使用 CPU 核数，会为每个工作线程创建 1MB 物理栈并产生数十个闲置线程，单是线程栈与锁竞争就膨胀数十兆内存。在无 `ZAN_CO_WORKERS` 显式配置时，协程工作线程应默认上限设为 `min(CPU, 4)`，兼顾吞吐与极低内存底噪。
   - **标准库命名空间规范**：Zan 语言的标准库 GUI 库命名空间为 `using Gui;`，不存在 `using Zan.Gui` 或 `using Zan.Core;`。若用户代码误写，auto-stdlib 会将其当作第三方扩展包拉取并在找不到时报告 `ZANPKG_MISSING namespace=Zan/Gui`，最终因命名空间未定义在语义检查阶段报错。
   - **跨分片调用与数据布局**：分片间调用通过标准 external declare 降阶，全局变量按只读可复制（TRAVEL）与外部声明（DECL）清晰判定，带引号的 LLVM 结构体名（`%"..."`）必须在分片中完整导出对应类型声明，避免 Parse 失败；最终由 `lld-link` 将各分片 `.o` 统一链接。
   - **AST arena 早释放的收益边界与事实快照化（A-MEM5，2026-09-29）**：
@@ -1059,6 +1070,22 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
     - **阶段资源精确归因**：
       - 实测证明：链接阶段（`link`）在 732 文件项目下仅耗时 294 ms，且内存 Commit 维持在 447 MB，链接本身绝非内存与耗时瓶颈；
       - 真正耗时与驻留的大头在于 LLVM 优化与目标文件写出（`write obj` 耗时约 10 秒，驻留 846 MB），早释放策略精准切断了 LLVM 模块对链接窗口的内存压迫。
+
+## 企业级数据库与大数据量流式传输定式（2026-10-01）
+
+- **连接池 OpenOne 异常封装与槽位释放**：各数据库连接池（`DbPool`、`MySqlPool`、`PgPool`、`SqlServerPool`、`FirebirdPool`、`TDenginePool`）在 `TryReserve()` 预留连接槽位后执行 `OpenOne()`。若 `OpenOne()` 抛出异常（网络中断、认证失败、DNS 解析错误等），异常直接向上冒泡会导致预留的 `liveCount` 槽位无法归还（未调用 `UndoReserve()`），导致连接池假满并永久拒绝/挂起后续请求。最佳实践：在 `OpenOne()` 内部通过 `try ... catch (Exception ex) { return null; }` 捕获异常，外部 `AcquireAsync()` 即可安全走到 `if (opened == null || !opened.IsConnected()) { core.NoteOpenFailed(); core.UndoReserve(); return null; }`，槽位精准归还且协程主路径免于 landing pad 性能抖动与时序踩踏。
+- **DbResult / DbRow 按需空值（On-demand NULL tracking）**：无 SQL NULL 记录行不应为每行无条件分配 `new List<bool>()`，高并发与十万行大表下这会产生大量小对象堆分配。改为默认 `null`，仅在第一次扫描到真实 NULL 列时分配并向前补足 `false`，非 NULL 记录走轻量 `AddRow(row)`，在 `IsNull` 处判空快速返回 `false`。
+- **ORM 方言分页与无分页保护（`OrmSelect` / `QueryBuilder`）**：SQL Server 和 Oracle 使用 `OFFSET m ROWS FETCH NEXT n ROWS ONLY` 语法，且严格要求 `ORDER BY`。若未做方言分支或对无分页查询盲目追加 `OFFSET 0 ROWS`，不仅破坏非分页查询的语义，还会因缺少排序列报错；`BuildDto` 等投影查询也必须统一接入方言分页，避免标准 `LIMIT/OFFSET` 语法在 SQL Server 等引擎上抛语法错误。
+- **XLSX 大数据量流式生成与块缓冲**：大表导出禁止一次性把所有行对象保存在内存（`rows` 列表），通过 `ZipWriter.BeginEntry/WriteData/EndEntry` 配合适度大小的 `StringBuilder` 块缓冲区（如 64KB）逐行渲染与批量输出，内存占用与总导出数据量解耦，实现近恒定常数级内存开销。
+- **ORM 超大批量写入参数上限与自动分批（`OrmInsert`）**：各 SQL 数据库对 Prepared Statement 参数个数具有硬性上限（SQL Server 上限 2,100，SQLite 上限 999，MySQL/PostgreSQL 上限 65,535）。当批量插入上千甚至上万行数据时，单条巨大的 SQL 不仅引发数据库参数超限崩溃，还会在堆上瞬间分配数十兆的 StringBuilder 与 DbParams 引起 GC 卡顿。解法：在 `OrmInsert` 引入 `safeBatchRows(colCount)` 动态计算单批次安全行数（如 SQLite 500/N，SQL Server 1000/N，默认 1000/N，上限 500 行），并在 `ExecuteAffrows` / `ExecuteAffrowsAsync`（实体行与字典行双通道）自动按批次范围（`BuildRowsRange`/`BuildDictsRange`）执行与累加行数，内存与参数严格恒定在安全阈值内。
+- **ORM 写入字段名元数据严格校验**：`OrmUpdate.SetI/SetL/SetD/SetS/SetB/SetIncr*` 以及 `OrmInsert.Only/Skip/OC/ACC/GMX/GMN` 必须经 `this.meta.Require(c)` 或 `RequireCol(c)` 校验，剥除可选的 `t.` 前缀并检查实体字段元数据，未知列或非法注入片段抛异常，杜绝直接拼接裸列名进 SQL 文本。
+- **MqttBroker 规避代码生成器 Json.Serialize<T> 循环依赖**：`MqttBroker` 位于网络核心服务路径，管理快照（`ClientsJson`/`ClientDetailJson`/`SubscriptionsJson`/`TopicsJson`/`MetricsJson`）统一改用标准库原生 `JsonValue` 组树（`NewObject`/`NewArray`/`NewStr`/`NewInt`/`arr.items.Add`/`ToJson()`），彻底打破在编译器子进程 `--no-gen` 模式下的序列化降层依赖；测试与退出时显式调用 `WorkerMqtt.Uninstall()`（解除 `Worker.mqttEntry` 并执行 `MqttBroker.TeardownGlobal()`），确保 leakcheck 零保持根干净退出。
+- **Redis 64位整型与RESP批量键值操作（`RedisReply` / `RedisClient`）**：RESP协议的整数回复（`:12345678901234\r\n`）与自增计数（INCRBY、分布式计数器、雪花ID、时间戳）常远超32位有符号整型上限（21亿），若直接按32位int解析将发生静默溢出。解法：在`RedisReply`升级引入64位长整型`integer64`与`AsLong()`，并增补`Incr64Async`、`IncrByAsync`、`Decr64Async`、`DecrByAsync`；在大数据量键值读写场景下，单key循环请求导致严重的网络RTT往返空耗，补齐`MGetAsync`、`MSetAsync`与`DelMultipleAsync`原生RESP批量管道操作。
+- **DbResult 零拷贝行实体读取（`DbRow` / `DbResult.RowAt`）**：传统`DbResult.GetRow(i)`在遍历每一行时均创建新的`List<string>`副本并拷贝字段，在十万行级大结果集下产生十万次多余的列表堆分配与GC压力。在`DbRow`上直接提供`GetString`、`GetInt`、`GetLong`、`GetDouble`、`GetBool`与`IsNull`访问器，并在`DbResult`提供`RowAt(index)`返回只读行引用，消除行克隆分配。
+- **SQLite驱动行解码按需空值实例化与ZanDb块缓存锁生命周期安全（`SqliteConnection` / `BlockCache`）**：全套关系型数据库驱动中，`SqliteConnection` 的 `Query` 与 `QueryAsync` 亦应严格遵循按需空值定式，在扫描到首个 SQLITE_NULL 时才懒分配布尔列表，常规无 NULL 行直接通过 `AddRow` 入结果集，消除桌面端与单测中十万行级无 NULL 数据的堆分配浪费；嵌入式数据库 `BlockCache` 增补 `Close()` 幂等防御与销毁后操作短路拦截，`Release` 增补对 `pin == null` 的空安全防护，杜绝异常中断分支中的悬空解引用。
+- **StringBuilder.Clear 内建指令与 CSV 解析就地复用（`StringBuilder.Clear` / `Csv.ParseSep` / `Segment.Lookup`）**：在编译器底层补齐 `StringBuilder.Clear()` 原生指令（count 置零并终结 NUL），消除循环流式拼接时反复 `new StringBuilder` 的堆分配；`Csv.ParseSep` 接入 `field.Clear()` 与 `field.Length > 0` 长度直读，消除大 CSV 解析十万级单元格时小对象风暴；`Segment.Lookup` 增补缓存关闭或满员时的安全降级直读，`ScanRow.ValPtr` 补齐空指针防御，确保嵌入式内核健壮性。
+
+
 
 - 另一条常客：**端口/资源竞争与真 flaky**。判别法是把**同一个二进制**（不重编）
   连跑 5 次——通过/挂起交错就说明是被测代码里的竞争，单次的超时/失败不能当回归
@@ -1828,22 +1855,111 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
 强制重建——看到 "zan: compiling code generators" 才是真重建。
 
 
-## ORM 表访问器是编译期生成的（GenDb），新 [Table] 模型零接线
+## 通讯协议层加固与大数据量处理定式（TLS/MQTT/Modbus/WS/HTTP/CoAP/SIP/WebDAV）
 
-**坑**：server-collab 控制器里 `this.OaMessage.Where(...)` 在整个模板源码
-里找不到任何属性声明——差点按"漏了接线"去翻 DbContext/AdminController。
-实际是 stdlib `System/Compiler/GenDb.zan` 在编译期重写：`obj.<Entity>`
-（<Entity> 匹配 [Table] 类名）整体替换为 `__DbBind.Q_<T>(obj.__Conn())`
-等绑定树（指令 db_acc_head / db_acc_root）；`db.Select<T>()/Insert<T>/
-Update<T>()/Delete<T>()/SyncStructure<T>()` 根调用同样重写（db_root）。
-任何带 `__Conn()` 的类（模板 AppController 的请求租约）自动获得全部实体
-访问器。
+**坑一（二进制缓冲遇 NUL 误截断/越界）**：
+- `TlsStream.RecvIntoAsync` 等接收 API 严禁使用 `buf.Length`（C 风格 `strlen`）来做容量校验，接收二进制时首字节或任意字节为 `0x00` 会让 `buf.Length` 骤降为 0，误触发越界拦截中断链路。
+- 接收复用缓冲必须以调用方显式声明的接收上限（`max`）与非空检查定界。
 
-**定式**：加新模型 = 新建 [Table] 类文件即可，控制器 `this.<Entity>`、
-裸连接 `db.Select<T>()`、`SyncStructureAllAsync()` 加列全部自动生效，
-无需任何注册/清单；存量库加列后旧行 NULL 读作 0（哨兵语义，见
-tenantId 回填先例）。另：`Insert(x).ExecuteIdentityAsync()` 的返回值才
-是自增 id，且**不回写** `x.id`。
+**坑二（WebSocket 帧交错 Send Interleaving）**：
+- `SendBytesAsync` 是异步挂起 IO（等待 `WriteReady`）。
+- 若无并发发送门控，当后台协程发送心跳 `Ping()` 或其他消息时，若与业务协程并发写入，两个 WebSocket 帧的字节流会交错混杂在同一个 TCP 连接上，导致对端报 RFC 6455 1002 Protocol Error 瞬间断链。
+- 客户端（`WebSocketClient` / `WssClient`）必须引入异步排队互斥锁（`AsyncGate` 队列表），文本、二进制、Ping、Pong、Close 全路径统一进门控。
+
+**坑三（Modbus 工控死循环与事务错配）**：
+- `Socket.Recv` 返回负数（链路重置/网络中断）时若只判 `n == 0`，配合 `ReadReady` 会导致 100% CPU 忙死循环。
+- `TransactAsync` 必须强校验应答 MBAP 头的 Transaction ID 是否与请求发出的 `tid` 相符，并校验包体长度合法性，否则网络抖动或重连时会误收上一个请求的应答导致工业传感器/控制命令数据串号。
+
+**坑四（大流转发与 MQTT 协议内存雪崩）**：
+- 转发代理（如 `HttpForwarder`）处理部分发送时，绝不可在循环内对剩余数据调用 `Substring`，否则数兆大请求在慢速对端下会产生数万次堆内存分配与垃圾回收雪崩。
+- MQTT 吞吐量瓶颈：`MqttReader` 缓冲区滑动、扩容与包体切分必须使用 SIMD 加速的 `NativeMemory.Copy` 原生内存移动，彻底废除逐字节解释循环。
+
+**坑五（HTTP 非标准端口 Host 头丢失与 SIP/CoAP 解析漏洞）**：
+- `HttpClient` 当端口非 80/443 时，`Host` 请求头必须输出 `host:port`，否则代理服务器虚拟主机分发失败。
+- `SipMessage` 遇到空行时必须按 `Content-Length`（或 `l` 头）精确定界正文，防止粘包或流水线后续报文被误污染吞并，且状态码必须防御非纯数字输入。
+- `CoapClient` Token 必须使用 `RandomNumberGenerator` 系统级 CSPRNG，禁止使用易被推算的线性算式，Option 解析严格拒绝 RFC 7252 保留值（15）与越界畸形报文。
+
+**坑六（数据库与协议层 TLS 接收 string.Length 伪 EOF 与二进制截断）**：
+- `TlsStream.RecvAsync` 通过 `b.ToStr(0, read)` 返回 string，若对端发送包含 `0x00` 的二进制报文（如 SQL Server TDS 包头、MySQL packet 负载、Redis bulk string、MQTT publish 载荷）：
+  - 消费者调用 `chunk.Length` 会在首个 `0x00` 字节处被 C 语言 `strlen` 截断；
+  - 若首字节即为 `0x00`，`chunk.Length` 骤降为 0，上层协议循环（如 `recvExact`）会把 0 误判为对端关闭（伪 EOF），导致连接异常中断或报文错位。
+- **定式**：
+  - 数据库与通讯协议（`SqlServerConnection`、`MySqlConnection`、`RedisClient`、`MqttClient`）接收必须统一走原生字节接口（`TlsStream.RecvBytesAsync`、`Socket.RecvOv` / `RecvIntoAsync`），严禁用 string 中转底层二进制报文；
+  - WebSocket（`WebSocket` / `WssClient`）出站全面支持原生 `byte[]` 载荷（`SendBinary(byte[] data, int offset, int len)`、`SendBinary(byte[] data)`），并通过 `WsFrame.RawBytes` 与 `NativeMemory.Copy` 直达 AVX2/SSE2 向量掩码，杜绝字符串中转堆分配与截断隐患。
+
+**坑七（数据库单连接多协程并发踩踏与协议解串乱序）**：
+- **隐患背景**：MySQL Wire、SQL Server TDS、PostgreSQL libpq、Firebird Wire 等基于单 TCP 连接/单会话句柄的客户端，其线协议本质是请求-响应锁步（Lockstep）交互模型：发送命令 -> 逐个接收包头/列定义/行数据包/EOF 或 OK/ERR 包。
+- **并发交织灾难**：当多个业务协程并发调用同一连接上的 `QueryAsync` / `ExecuteAsync` / `QueryParamsAsync` 时，由于每个异步操作中途都在网络 IO（`Socket.RecvOv` / `Socket.ReadReady`）上挂起（await），后发起的查询向套接字注入报文，或者提前截获上一查询尚未收完的列定义/行包。最终导致报文错序、协议断链、或致命的“串号交付”（协程 A 查到了协程 B 的用户数据）。
+- **定式**：
+  - 数据库驱动客户端（`MySqlConnection`、`SqlServerConnection`、`PgConnection`、`FirebirdConnection`）内部必须集成连接级异步互斥锁 `AsyncGate`（`AcquireLock()` 与 `ReleaseLock()`）；
+  - 所有公共出入站查询入口必须以 `await this.AcquireLock(); try { ... } finally { this.ReleaseLock(); }` 完整保护单连接完整的事务/查询生命周期（含预编译、参数绑定、执行、全结果集回读）；
+  - `Close()` 必须强制重置互斥标志，并唤醒所有在 `waiters` 中排队的 `AsyncGate` 等待者，杜绝挂起协程永久悬死泄漏；
+**坑八（物联网 MQTT QoS 1/2 订阅端应答遗漏与 WebSocket 并发推送踩踏）**：
+- **MQTT 订阅端断连与重复风暴**：
+  - 规范（RFC 3.1.1 §4.3.2）要求接收到 QoS 1 PUBLISH 必须回送 PUBACK，接收到 QoS 2 必须回送 PUBREC 并在收到 PUBREL 时回复 PUBCOMP；
+  - 若客户端只读出负载而不向 broker 发送确认报文，主流 Broker（Mosquitto、EMQX、HiveMQ、AWS IoT）会认为消息未成功交付，不断重传，导致网络风暴或超时踢掉客户端；PINGRESP 也不能当作正文负载误返回；
+  - 定式：`MqttClient.ReceiveAsync` 与 `ReceiveBytesAsync` 解析到 QoS > 0 时必须立即按其报文标识符回送对应 ACK（PUBACK/PUBREC/PUBCOMP），并正确过滤心跳包。
+- **WebSocket 连接多协程并发 Push 帧缓冲区踩踏**：
+  - 多业务协程向同一长连接推流（如通知、广播、报警）时，若无互斥门控，多个协程会同时操作同一连接的 `WsWriter` 输出缓冲并在 `Flush()` 的 `SendBytesAsync` 挂起期间相互覆盖 `buf` 与 `len`，引发帧数据穿插错位或乱序断链；
+**坑九（MySQL 大数据量超 16MB 分包拼接与 SQLite 语句缓存覆写）**：
+- **MySQL 线协议 16MB (0xFFFFFF) 边界截断与协议错位**：
+  - MySQL 线协议每个数据包头部仅 3 字节长度（最大 $2^{24}-1 = 16,777,215$ 字节）。当单列、大字段（BLOB/JSON/TEXT）或批处理超过 16MB 时，服务端与客户端均须按 16MB 分包，递增包序列号并在小于 16MB 的包处结束；
+  - 若客户端只读单包，后续数据包会留在套接字输入缓冲区中，被下一次查询误当成响应包头，造成协议永久错位与断链；
+  - 定式：`MySqlConnection.readPacket()` 遇 `len == 16777215` 时必须循环拼装分片直至终包；`writePacket` 超 16MB 自动分片发送；套接字接收逐字节循环全部接入 `NativeMemory.Copy` 加速。
+- **SQLite 语句缓存覆写**：
+  - `SqliteConnection` 使用索引器 `stmtBusy[sql] = true/false` 代替 `Add`，杜绝重复键异常。
+**坑十（TDengine 协程并发互斥门控与 Firebird 原生内存拷贝加速）**：
+- **TDengine 客户端单连接协程互斥**：
+  - `TDengineConnection` 多个协程并发调用 `QueryAsync` / `ExecuteAsync` 时，若未加排队互斥，会并发读写 `lastError`、`lastCode` 与 `affected` 实例状态，导致错误状态交织错乱；
+  - 定式：引入 `AsyncGate` 异步门控与 `waiters` 队列保护完整的请求生命周期，并在 `Close()` 中唤醒所有排队者。
+- **Firebird 驱动收发包 NativeMemory 加速**：
+  - `recvExact` 与 `sendPacket` 剥离逐字节解释循环，全面接入 `NativeMemory.Copy`，消除大字段（BLOB）和长结果集下的大量解释器空耗。
+**坑十一（HTTP 大文件下载 64 位整型长度与 Modbus 协程唤醒）**：
+- **HTTP 大文件下载与断点续传 64 位整数溢出**：
+  - `HttpClient` 原先使用 `int HeaderInt(head, "content-length")` 和 `int RangeTotal(head)`，当下载超过 2GB 的大文件（如安装包、模型权重、镜像归档）时，32 位有符号整数发生负溢出，导致 `Content-Length` 解析为负数、已完成判定（416 校验中原先硬编码 `total > 2147483647 -> false`）失效、且断点续传 `Range: bytes=have-` 截断；
+  - 定式：实现 `HeaderLong` 与 64 位 `RangeTotal`，`BuildDownloadRequest`、`DownloadBinaryOnceAsync` 全面支持 `long have`；`File` 增补 `GetSize64(path)` 经底层 `zan_file_length` 获得精确 64 位文件大小。
+- **Modbus TCP 客户端连接关闭唤醒**：
+  - `ModbusClient.Close()` 必须同步调用 `ReleaseLock()` 并释放唤醒所有 `waiters` 挂起的协程，防止外部在并发交互期间关闭连接造成协程永久悬死。
+**坑十二（大文件流式上传句柄暴风根治与 File.ReadBytes 向量化加速）**：
+- **大文件上传反复开闭句柄风暴**：
+  - `HttpClient.UploadFileBytesAsync`（明文与 TLS）原先在 64KB 发送循环内反复调用 `File.ReadBytes(localPath, offset, want)`，导致 1GB 文件上传触发上万次 `fopen` / `fseek` / `fclose` 系统调用与句柄震荡，易引发文件占用冲突或句柄耗尽；
+  - 定式：`SendBytesBodyAsync` 与 `SendBytesBodyTlsAsync` 统一改为单句柄顺序流式读取（一次 `fopen`，逐块 `fread` 直发，结束 `fclose`），并全面支持 64 位文件长度（`long fileLen`、`long total`、`long offset`），`UploadTick` 对超 2GB 进度安全钳制在 32 位上限，防整数溢出；
+- **File.ReadBytes 向量化搬运**：
+  - `File.ReadBytes` 分块从 4KB 扩至 64KB，彻底剥离解释层逐字节 `for` 循环，全面使用 `NativeMemory.Copy` 快速搬运数据。
+**坑十三（WebDAV/HTTP 原始流式上传零拷贝与连接池平行列表实体化重构）**：
+- **HTTP/WebDAV 二进制上传中转字符串内存膨胀**：
+  - `HttpClient.SendBytesAsync(byte[])` 原先通过 `body.ToStr(0, bodyLen)` 中转为托管字符串，在大二进制数据上传时不仅在堆上制造翻倍的内存膨胀，且缺乏本地文件原始 PUT 流式接口，导致超大文件无法直接做 WebDAV/云存储 PUT；
+  - 定式：`HttpClient` 增补 `SendBytesOnceWithRawBytesAsync` 与 `SendBytesTlsWithRawBytesAsync`，原生字节直达底层套接字与 TLS 流；增补 `UploadFileRawAsync` 支持 PUT/POST 64KB 单句柄流式直发；`WebDavClient` 对应升级 `PutBytesAsync` 零拷贝，并增补 `PutFileAsync` 与 `GetToFileAsync` 超大文件流式收发；
+- **连接池平行列表违规实体化重构**：
+  - `FwdPool` 原先维护 `List<FwdChannel> idle` 与 `List<long> expiry` 平行列表，违背结构化集合规范；统一重构为 `FwdPooledItem` 实体对象承载。
+**坑十四（UDP/CoAP/NTP 原始字节直发、SipMessage 平行列表实体化与 WebSocket 原生字节推送）**：
+- **UDP/CoAP/NTP 报文二进制截断与字符串中转**：
+  - `UdpClient.SendBytesTo` 与 `SendBytesToAsync` 此前仅接收 `string data`，CoAP 和 NTP 在封包后通过 `pkt.ToStr(0, len)` 强转为字符串；遇上全零或含 `0x00` 的二进制控制字节、时间戳或选项时存在中转分配与语义扭曲隐患；
+  - 定式：`UdpClient` 增补 `SendBytesTo(byte[] data, int len, string ip, int port)` 与 `SendBytesToAsync(byte[] data, int len, string ip, int port)` 原生字节直发接口；`CoapClient` 与 `NtpClient` 剥离全部 `ToStr` 转换，直接走字节数组出站；
+- **SipMessage 头部平行列表重构**：
+  - `SipMessage` 原先维护 `List<string> headerNames` 与 `List<string> headerValues` 两条平行列表，违背结构化实体规范；重构为 `SipHeader` 实体承载；
+- **WebSocket 原生字节推流补齐**：
+  - `WorkerWs` 增补 `PushBinary(Connection c, byte[] data, int offset, int len)` 与 `PushBinary(Connection c, byte[] data)` 接口，无缝复用 `WsFrame.RawBytes` 与底层 `NativeMemory.Copy`，消除业务推送二进制帧时的中转字符串构造；
+- **HTTP Chunked 上传零内存累积流式落盘**：
+  - `HttpFramer.SaveBodyToFile` 此前仅支持定长 `Content-Length` 请求体写盘，对 `Transfer-Encoding: chunked` 的分块上传未处理；
+  - 定式：增补 `SaveChunkedBodyToFile`，按 RFC 9112 规范流式解码各个十六进制 chunk 并直接写盘后即时 `Discard`，将 GB 级 chunked 上传内存恒定在单个分块（<=64KB）以内，异常或超限时自动回滚清理临时文件。
+**坑十五（MQTT 会话订阅实体建模与原生字节广播、HTTP/2 二进制帧编解码与 SSE 零二次切片发送）**：
+- **MQTT 会话过滤器与 QoS 平行列表违规实体化重构**：
+  - `MqttSession` 原先维护 `List<string> filters` 与 `List<int> qos` 两条平行列表，在增删订阅与管理接口导出时需双向索引对齐，存在索引错位与代码冗余隐患；
+  - 定式：定义 `MqttSubscription(filter, qos)` 实体记录，统一由 `List<MqttSubscription> subscriptions` 承载；`BuildPublish` 载荷搬运剥离逐字节解释循环，替换为 `NativeMemory.PutString`，并增补 `BuildPublishBytes` 支持裸字节数组切片零中转字符串直发；
+- **HTTP/2 协议层二进制分帧基础能力扩充**：
+  - 原 `Http2Frame` 仅支持帧头编码与设置帧确认，缺失 RFC 7540 标准错误码、固定帧头解码与控制帧构建原语；
+  - 定式：补齐 `Http2Error` 错误码（RFC 7540 §7）、`DecodeHeader(buf, offset)` 帧头反序列化，以及 `BuildRstStream`、`BuildGoAway`、`BuildWindowUpdate`、`BuildPing` 等控制分帧构建方法；
+- **SSE 服务端推送二次字符串切片与多行数据二次幂拼接消除**：
+  - `SseConnection.SendAsync` 在底层 TCP 发生背压部分写入时，原先在循环内反复执行 `frame.Substring(sent, total - sent)` 造成大量堆内存分配；`ParseBlock` 在接收多行 `data:` 时原先使用字符串拼接导致二次幂内存膨胀；`TcpClient` 缺失基于偏移量与长度的字节数组切片发送；
+  - 定式：`TcpClient` 增补 `SendBytesAsync(byte[] data, int offset, int len)` 与 `TcpListener.AcceptTcpClientAsync()`；`SseConnection` 移除无谓的 Substring 循环并增补 `SendBytesAsync(eventName, byte[] data, offset, len)` 原生字节推送通道；`SseClient.ParseBlock` 改用 `StringBuilder` 线性累加多行数据载荷。
+**坑十六（数据库大数据量结果集空值标记按需实例化与游标复用、TDengine 分块与套接字异常防护）**：
+- **大数据量行级对象冗余分配**：
+  - `DbResult` 原先在每行记录无任何 SQL NULL 时，仍无条件为每行创建 `new List<bool>()`，导致 10 万行 20 列的大宽表产生 10 万个无意义的布尔列表对象；`MySqlConnection` 与 `MySqlSyncConnection` 在逐行解码时，每行均 `new List<int>()` 仅用于充当变长解析偏移游标；
+  - 定式：`DbResult.AddRow` 接收 `null` 标记，`IsNull` 判断时判空直返 `false`，仅当该行真正包含 NULL 字段时才懒加载创建 `List<bool>`；MySQL 线协议解码将 `cur` 游标提升至循环外部复用，消除数万次临时列表分配；Postgres、SqlServer、Firebird 结果集转换全面接入按需空标记判定；
+- **TDengine REST HTTP 传输健壮性与句柄异常泄漏**：
+  - `HexOf` 分块十六进制长度原先使用 32 位整型计算，当遇到异常恶意大 chunk 时存在有符号整型溢出风险；`Post` 与 `PostAsync` 在套接字接收循环发生异常时，原先跳过 `Socket.Close` 造成底层 socket 泄漏；
+  - 定式：`HexOf` 升级为 64 位防溢出累加并限制在 2GB 上限内；`Post` 与 `PostAsync` 采用 `try ... finally { Socket.Close(sock); }` 保障异常中断时套接字句柄 100% 安全释放。
 
 
 ## File 读族 alt-base 回退 exe 目录 vs Directory 清理 CWD 相对：测试缓存目录必须用绝对路径
@@ -2447,16 +2563,16 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   所有 `<模块>/<文件>.zan` 显式输入路径必须同步改（golden 案例已注册但没
   人跑 = 坏了也没人发现）。
 
-## 闭包捕获的引用模型与"按迭代捕获"的实现边界
+## 闭包捕获的引用模型与"按迭代捕获"的实现边界（B-ID33，2026-09-30）
 
 坑出处：for 循环变量被闭包捕获时三连得 `3,3,3`（C#1/JS var 行为），提案改 Go 1.22
 按迭代语义。第一直觉"回边处造新 cell 并重绑槽位"是死路：irgen 单遍发射，cond/body
 的代码在回边**之前**就已发射完毕，读的是绑定当时的 SSA 槽指针——回边重绑只影响
 "之后发射"的代码，cond 会永远读初代 cell（`0<3` 死循环）。单遍发射下要真写透共享，
 唯一出路是给全部装箱变量访问加双重间接（先 load 当前 cell 指针、再 load payload），
-几十处访问点全动，代价不可接受——已作为偏差记入项目任务台账。
+几十处访问点全动，代价不可接受——已作为偏差记入任务台账。
 
-落地定式（捕获点快照）：flag 链 `local_var_t.per_iteration`（for 语句发射处对 init
+落地定式（捕获点快照）：flag 链 `local_var_t.per_iteration`（AST_FOR_STMT 对 init
 区间打标）→ `cap_use` 传 `caps[i].per_iter`（cap_scan 的查询模式也走 cap_use，但
 只写纯数据、不发射 IR，安全）→ `emit_closure_record` 是闭包记录构建的唯一收口点
 （lambda/delegate 全走它），对 per_iter 装箱捕获不 retain 共享 cell，改
@@ -2475,58 +2591,68 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
 
 构建卫生：同一 build 目录并发起两次 ninja 链接同一 exe，Windows exe 镜像锁会
 `lld-link: failed to write output ... permission denied`——串行构建；链接失败先
-查 zanc/lld-link 残留进程（也可能是并行会话的瞬时编译，会自行退出）。
+`tasklist` 查 zanc.exe/lld-link 残留（也可能是并行会话的瞬时编译，会自行退出）。
 
 ## 包发现不认无命名空间文件：拆库出包前先扫"无 ns 源"（2026-09-30，Zan.Data 拆包实测）
 
 - 坑：包发现按"声明命名空间==目标"精确匹配（pkg_visit_source_tree），无命名空间的
-  全局命名空间纯函数库（如 MySqlWire.zan，从 async/sync 双胞胎合并而来）永远不成为
-  候选——同目录同命名空间的调用方文件能进编译，它进不了，`unresolved call` 且错误
-  挂在包内文件行号上，极易误判为搬迁搬丢了文件或编译器解析回归。按目录 glob 拉入
-  的老布局没有这个问题，改成包后此路径消失；层级包盲区同根同源。
-- 修复语义（三件套）：① 声明 ns 精确或"目标+点"前缀匹配（pkg_ns_match）；
-  ② 无 ns 文件按"源根相对目录（分隔符转点）==目标命名空间"匹配（pkg_rel_dir_ns）
-  ——文件只归入其兄弟声明的那一个目录，逐目录访问天然不重复；③ 安全门：stdlib
-  同名目录存在的命名空间保持精确匹配（stdlib_has_dir）——否则 ubiquitous 的
-  `using System;` 配 pkg_src 无条件入集，会把所有包的 System.* 源拉进每一次编译
-  （pkg_src 是"只被生成路由表点名"的包文件的活名门豁免）。
+  全局命名空间纯函数库（如 MySqlWire.zan，批 D-1 从 async/sync 双胞胎合并而来）
+  永远不成为候选——同目录同命名空间的调用方文件能进编译，它进不了，
+  `unresolved call 'MySqlWire.readLenenc'` 且错误挂在包内文件行号上，极易误判为
+  搬迁搬丢了文件或编译器解析回归。stdlib 时代它靠整目录 glob 天然入集，拆包后
+  此路径消失；层级包（ZanWeb.Controllers）盲区同根同源（B-ID18，2e75673e 引入）。
+- 修复语义（package.c/main.c，三件套）：① 声明 ns 精确或"目标+点"前缀匹配
+  （pkg_ns_match）；② 无 ns 文件按"源根相对目录（分隔符转点）==目标命名空间"匹配
+  （pkg_rel_dir_ns）——文件只归入其兄弟声明的那一个目录，逐目录访问天然不重复；
+  ③ 安全门：stdlib 同名目录存在的命名空间保持精确匹配（stdlib_has_dir）——否则
+  ubiquitous 的 `using System;` 配 pkg_src 无条件入集，会把所有包的 System.* 源
+  拉进每一次编译（pkg_src 是"只被生成路由表点名"的包文件的活名门豁免，见 B-ID18）。
 - 动手前先扫：逐包源 `grep -c "^namespace"` 找零命中文件——无 ns 源是拆包的
   隐藏地雷，发现即知要靠 rel-dir 匹配（或给文件补 ns，但那是绕行不是修复）。
-- A/B 隔离技法（归因"编译器回归还是拆包破损"）：把新 zanc 与运行时目标文件一起
-  拷进干净 worktree 的构建目录（编译器按 exe 相对路径找运行时对象与 stdlib，
+- A/B 隔离技法（归因"编译器回归还是拆包破损"）：把 build/zanc.exe 与 build/zanrt*.obj
+  一起拷进干净 worktree 的 build/（zanc 按 exe 相对路径找运行时对象与 stdlib，
   只拷 exe 会在链接期报缺 .obj），在 worktree 内 CWD 编译同一输入——三格矩阵
   （旧树+新编译器 PASS / 新树+新编译器 FAIL ⇒ 非编译器回归，是包发现语义）一次定音。
 - 金样 CRLF 假差异：程序输出经控制台带 CR、金样是纯 LF 时，手搓 diff 报
   `1c1 < PASS > PASS`；先 od -c 看字节，再用 diff --strip-trailing-cr 复核，
-  并与干净树 A/B 确认既有，勿当回归修。
+  并与 HEAD 干净树 A/B 确认既有，勿当回归修。
 
 ## 裸简单名调用的"全局兜底唯一性"：跨包同名类同框即失效（2026-09-30，Zan.Desktop 拆包实测）
 
-- 坑：不带 using 的静态调用（裸写 `Window.GetTickMs()`，Window 实为某深层命名空间的
-  类）走简单名全局兜底解析，该兜底要求**全编译面唯一**。当另一个包声明了同名类同框
-  编译，所有缺精确 using 的裸调用集体失效——报 not-a-known-name 而非 ambiguous，极具
-  误导性（看似"类没编进来"，实为撞名把兜底打挂）。带 using 的调用方不受影响
-  （using 命中优先于兜底），所以最小两文件复现常测不出来——必须复刻"调用方无 using"。
-- 地雷为何长期不爆：消费者从不同框（显式清单的构建不编另一包，按需拉入的程序不引
-  另一包）。拆包/加包时先扫同名类对（对包源 grep `^class X\b` 找重复声明），成对即预警。
-- 修法是补精确 using（一行/文件），不是改编译器语义——裸调依赖兜底唯一性本就是侥幸。
-  一个文件同时 using 两个提供同名类的命名空间时，把用途少的那个改成限定调用并删其 using。
-- 排除自身编译器改动干扰的快捷 A/B：上一轮发布工具链目录里的编译器快照拷来跑同一
-  构建，同错 ⇒ 非新编译器回归；用完恢复。
+- 坑：不带 using 的静态调用（如 Gui 代码裸写 `Window.GetTickMs()`，Window 实为
+  Gui.Backend.Window）走简单名全局兜底解析，该兜底要求**全编译面唯一**。当另一个包
+  声明了同名类（System.Automation.Window / System.Windows.Clipboard）同框编译，
+  所有缺精确 using 的裸调用集体失效——报 `not a known variable, type, or namespace`
+  而非 ambiguous，极具误导性（看似"类没编进来"，实为撞名把兜底打挂）。带 using 的
+  调用方不受影响（using 命中优先于兜底），所以最小两文件复现常测不出来——必须
+  复刻"调用方无 using"的形态。
+- 地雷为何长期不爆：消费者从不同框。IDE 显式清单从不编 Automation；demand-pull
+  程序不拉 Desktop；同名类分属 Gui 包与 Desktop 包后，只有把两包同时喂进编译
+  （IDE 全量构建正是）才引爆。拆包/加包时先扫同名类对：
+  `grep -rn "^class Window\b" packages/*/{src,stdlib}` 之类，成对即预警。
+- 修法是补精确 using（`using Gui.Backend;` 一行/文件），不是改编译器语义——
+  裸调依赖兜底唯一性本就是侥幸。一个文件同时 using 两个提供同名类的命名空间时
+  （如 ZanIDE.zan 同时要 System.Windows.MessageBox 与 Gui.Backend.Clipboard），
+  把用途少的那个改成限定调用（`System.Windows.MessageBox.Show(...)`）并删其 using。
+- 排除自身编译器改动干扰的快捷 A/B：dist/win-x64/toolchain/zanc.exe 是上一轮
+  publish 的编译器快照，把它拷到 build/zanc.exe 跑同一构建（IDE_NO_PUBLISH=1），
+  同错 ⇒ 非新编译器回归。用完恢复原 zanc。
 
-## 构建代际联动：原生运行时的 ABI 由编译器发射侧决定，ninja 追不到（B-ID23，2026-09-30）
+## 构建代际联动：gui_runtime 的 ABI 由 zanc 发射侧决定，ninja 追不到（B-ID23，2026-09-30）
 
-- 坑：原生运行时/驱动源（如 gui_runtime.c）镜像的 ABI 决策活在编译器发射逻辑里
-  （对象/串布局、调用约定、协议常量），**不在任何 C 头里**——ninja 的依赖追踪
-  只覆盖 C 源/头。编译器单独重链后，运行时源"未变"不重编，构建产物里留下
-  旧代际共享库：新编译器编出的程序挂死在运行时边界（窗口活着、零输出、异常
-  被吞），且错配随构建状态漂移、时好时坏，极难定位。
-- 修法：`set_source_files_properties(<runtime-sources>
-  PROPERTIES OBJECT_DEPENDS "<build>/<compiler-executable>")`——把编译器
-  可执行文件钉成编译依赖，编译器重链即同代强制重编。机制自检：touch 编译器
-  可执行文件后 build 运行时目标，必须出现重编行。
-- 同型问题举一反三：凡"C 侧手抄镜像编译器发射契约"的文件（自研运行时、
-  驱动、生成器宿主）都照此钉住生成器可执行文件，别指望源码 diff 触发重编。
+- 坑：gui_runtime.c（zan_gui.dll 的源）镜像的 ABI 决策活在 zanc 的发射逻辑里
+  （对象/串布局、调用约定、反射协议），**不在任何 C 头里**——ninja 的依赖追踪
+  只覆盖 C 源/头。zanc 单独重链（如编译器加固批）后，gui_runtime.c "未变"
+  不重编，build/ 里留下旧代际 zan_gui.dll：新 zanc 编出的 GUI exe 挂死
+  App.PumpGuarded（窗口活着、零 stdout、异常被吞内存环），且错配随构建状态
+  漂移、时好时坏，极难定位。
+- 修法：`set_source_files_properties(gui_runtime.c gui_runtime_dwrite.cpp
+  PROPERTIES OBJECT_DEPENDS "<build>/zanc.exe")`——把 zanc 可执行文件钉成
+  编译依赖，zanc 重链即同代强制重编（两个文件，秒级）。机制自检：touch
+  build/zanc.exe 后 build zan_gui 必须出现 gui_runtime 重编行。
+- 同型问题举一反三：凡"C 侧手抄镜像发射侧契约"的文件（自研运行时、驱动、
+  生成器宿主）都照此钉住生成器可执行文件，别指望源码 diff 触发重编。
+
 ## 拉入门 user_decl 遮蔽与外围命名空间解析：同名类错绑的两个底层缺口（Zan.Security 拆包实测，2026-09-30）
 
 - 坑一（拉入门 user_decl 遮蔽命名空间盲+顺序依赖）：pi 活名门控的 `user_decl`
@@ -2564,48 +2690,52 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
 
 - 坑：拆包前的老项目（模板/示例）常整树保留框架平行副本，且与包**共用命名空间
   名**（模板 `namespace ZanWeb.Dao.Sys`、`ZanWeb.Framework.Services` 与包同名同
-  形）。编译集一旦两侧同框（包发现按层级拉族后更易同框），同名命名空间被**合并**
-  成一张表，两份同名类都在：裸名解析命中哪份由 using/同 ns/兜底的竞争决定，且
-  **双向都会中招**——包侧裸名（`MetricsStore`、`SettingKeys`、`SysUserDao`）命中
-  模板副本，报 `has no member FlushAtExit`（模板副本落后于包的新成员）/构造重载
-  不匹配；模板侧裸名（`AppController`、`User`）命中包副本，报基类不匹配/类型互转
-  失败。表面症状是"成员不存在/重载不匹配"，根因是撞名错绑，与"文件没编进来"极
-  易混淆。
+  形）。编译集一旦两侧同框（B-ID18 后包发现按层级拉族，更易同框），同名命名空间
+  被**合并**成一张表，两份同名类都在：裸名解析命中哪份由 using/同 ns/兜底的竞争
+  决定，且**双向都会中招**——包侧裸名（`MetricsStore`、`SettingKeys`、
+  `SysUserDao`）命中模板副本，报 `has no member FlushAtExit`（模板副本落后于包的
+  新成员）/构造重载不匹配；模板侧裸名（`AppController`、`User`）命中包副本，报
+  基类不匹配/类型互转失败。表面症状是"成员不存在/重载不匹配"，根因是撞名错绑，
+  与"文件没编进来"极易混淆。
 - 为什么逐文件补 using 救不了：using 导入的是**合并后**的命名空间，两份同名类
   依然同框，逐文件加 using 只是把撞面从兜底竞争换成 using 竞争、换边再炸。增量
   修复路线（挑出错文件逐个限定/补 using）已实验证伪（57 错收敛不动）。唯一干净
   终局：项目删除与包重复的平行副本、整体改吃包命名空间（对齐包消费形态再生），
   或项目整体改名空间隔离。拆包迁移立项时，**存量模板/示例必须同批盘点**，否则
-  它们只在"包发现窄的老发布"下侥幸绿（老发布拉族窄不踩），新一代工具链一落地
-  就爆。
+  它们只在"包发现窄的老发布"下侥幸绿（dist 老代际拉族窄不踩），新一代工具链一
+  落地就爆。
 - 定性手法（隔离并行会话在途编辑）：冻结床 = `git archive HEAD packages stdlib |
-  tar -x` 解到独立临时目录，再拷入当前 zanc 及其运行时 obj 兄弟文件——包/stdlib
-  发现跟 zanc **二进制位置**走，床内 zanc 只见 HEAD 冻结包，工作树在途噪声（别的
-  会话改到一半的包文件）完全隔离。tar 对 linux 驱动符号链接的报错在 Windows 无害。
+  tar -x` + 当前 build/zanc.exe + zanrt_*.obj 兄弟 obj 拷入 _scratch 独立目录——
+  包/stdlib 发现跟 zanc **二进制位置**走，床内 zanc 只见 HEAD 冻结包，工作树在途
+  噪声（别的会话改到一半的包文件）完全隔离。tar 对 linux 驱动符号链接的报错在
+  Windows 无害。
 
-## 生成器子编译不认生成器魔法，也不许吸包：--no-packages（2026-09-30，System.Net 拆包实测）
+## 生成器子编译不认生成器魔法，也不许吸包：--no-packages（2026-09-30，Zan.Net 拆包实测）
 
 - 坑：`Json.Serialize<T>`/`db.Insert<T>` 是**生成器魔法**——只在父编译的生成管线里
-  降级重写（`__JsonBind.D_/S_`），全仓根本没有 `class Json`。生成器子编译带
-  `--no-gen`，重写不发生，这类调用在此语境**不可解析**。此前不炸纯因 stdlib 文件
-  受拉入活名门保护（子闭包没人提那个文件 → 不入集）；拆包后包文件跳过活名门
+  降级重写（`__JsonBind.D_/S_`），全仓根本没有 `class Json`。genrun 的生成器子编译
+  带 `--no-gen`，重写不发生，这类调用在此语境**不可解析**。此前不炸纯因 stdlib 文件
+  受拉入活名门保护（子闭包没人提 MqttBroker → 不入集）；拆包后包文件跳过活名门
   **无条件入编**（`[pullin] incl ... because pkg`），用户包里任何带魔法调用的文件
-  （MQTT broker 管理端点、Web 框架错误页同款）都会炸掉**所有**触发生成器的编译
+  （MqttBroker 管理端点、WebApp 错误页同款）都会炸掉**所有**触发生成器的编译
   （报 `unresolved call 'Json.Serialize'`）。雪上加霜：被活名门 skip 的文件，其
-  `using` 仍会被编译器侧的启发式词法扫描 reach，目录一 reach 就整包入编。
-- 修法：zanc 新旗标 `--no-packages`（空 project root 令包发现三入口
+  `using` 仍会被启发式词法扫描 reach（main.c 词标扫描对已扫文件逐 using
+  pi_reach），目录一 reach 就整包入编。
+- 修法：zanc 新旗标 `--no-packages`（空 project root 令 package.c 三个发现入口
   visit_namespace/all_source_roots/find_namespace 全变 no-op，连 exe 相对与全局
-  包店一并关掉），生成器子进程 argv 带上；`--no-packages` 同时静音
-  `ZANPKG_MISSING`（包是"被设计关掉"不是"缺失"）。生成器缓存键含 zexe 字节+
-  stdlib 全量内容，键不需另动。生成器闭包本来就只需 stdlib，顺带把子编译从
-  数百个无关 Gui 文件缩回纯 stdlib。回归锁：`conformance_gen_pkg_isolation`
-  （自带未引用毒包 + Json 触发 main）。
+  包店一并关掉），genrun 子进程 argv 带上；`--no-packages` 同时静音
+  `ZANPKG_MISSING`（包是"被设计关掉"不是"缺失"）。缓存键含 zexe 字节+stdlib 全量
+  内容，键不需另动。生成器闭包本来就只需 stdlib，顺带把子编译从 648+ Gui 文件
+  缩回纯 stdlib。回归锁：`conformance_gen_pkg_isolation`（自带未引用毒包
+  JsonBoom + Json 触发 main；修复前由仓库 Zan.Net 毒文件实证红）。
 - 定式：拆包后凡是"stdlib 文件当初靠活名门躲过的坑"都要重估——包文件的入编
   语义是"无条件"，stdlib 的语义是"被提及才入"。生成器子编译、LSP 单文件、
   任何 `--no-gen` 路径都在此列。
+
 ## 分裂命名空间与数据资产：拆半留半的三连坑（2026-10-01，Zan.Text 拆包实测）
 
-- 坑一（真空门击穿）：Text 命名空间拆半留半（编码器留 stdlib，文本处理文件入包）后 hello-world 从 14 文件涨到 21——永远入编的 ext 核心文件
+- 坑一（真空门击穿）：System/Text 拆半留半（Encoding 留 stdlib，七个处理文件
+  入包）后 hello-world 从 14 文件涨到 21——永远入编的 ext 核心文件
   （StringExtensions 等）带着 `using System.Text;`，把 System/Text 目录变成
   **每编译必 reach**；包文件 pkg_src 无条件入编（活名门豁免是给"包取代整个
   命名空间"设计的），于是整包拖进每个编译。修法：分裂命名空间（stdlib 目录
@@ -2613,7 +2743,7 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   活名门；整目录迁走（stdlib 目录已消失）的包不受影响。修后 hello 13 文件、
   `Csv.Parse` 活名照常按需拉入。
 - 坑二（auto-embed 硬编码）：Pinyin 的 GB2312 数据表靠 zanc 编译期自动嵌入
-  （编译器侧硬编码 `<stdlib>/System/Text/data/pinyin.txt` → 资源名
+  （main.c 硬编码 `<stdlib>/System/Text/data/pinyin.txt` → 资源名
   "text/pinyin.txt"）。文件搬进包后嵌入静默落空，运行时回退链
   （env→exe 旁→embed→源码树 walk-up）全脱，汉字直通不查表——表面是
   "翻译失效"，实为嵌入断链。修法：改走 `zan_resolve_gui_resource_dir`
@@ -2646,3 +2776,7 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   私 zanc 编探针须带 `--stdlib-path stdlib`（exe 旁发现失效）+ `--no-packages`（隔离并行
   会话在途包改动）。共账 build/ 不必抢：对方下次 ninja 调用自动用新源重链。
 - **机制开关类注释会滞后架构演进，还会污染台账**（2026-10-01，async-workers 正名轮实测）：多 worker M:N 异步驱动早就是 native 64-bit 目标的**默认**（编译器按 target 判定选链哪个驱动对象），而运行时 11 处注释仍写"编译时加 --async-workers 才启用"——该旗标从未出现在 argv 解析里，纯注释民间传说；新会话（包括写台账的会话）读注释即被带偏，把"已默认"错记成"待评估缺口"，白做一轮"默认化改造"调研。定式：机制/开关类陈述以**代码判定点**为准绳——`grep -rn '<旗标名>' src/compiler/` 若只命中注释、argv 解析零命中，即为传说；真值源是编译器里选路径的那处初始化（capability 判定/条件编译），注释只有对上判定点才可信。写台账引用机制前先做这一步。
+- **协作式调度器"定时器只在 idle 泵"会在持续负载下饿死 timer 交付**（2026-10-01 抢占轮实测）：回边抢占让 CPU 密集帧每片重排自身后，就绪队列**永不为空**，而 M:1 的 run_until 和 mt 的 co_worker 都只在队列排空的 idle 路径派发到期定时器——`Task.Delay` 兄弟照样饿死，抢占等于白做。通则：忙碌路径必须也派发到期定时器（M:1 每次 dispatch 顺手 zan_timer_dispatch_due，一锁一堆顶；mt 走现成 1ms 节流 co_pump_timers）。任何"事件循环只在没活干时看钟"的调度器都有同款坑。
+- **LLVM 会把纯计算热循环折成闭式（SCEV），热循环探针必须含不透明副作用**：`s=s+j` 累加循环在 Release 下被折成一条公式，"热循环"微秒跑完，抢占/调度探针全程测不到东西。内层循环塞原子 RMW（AtomicInt.Add）或外部调用才保得住真实耗时；探针断言也别用会被 LICM 提外的普通 Load（外层判 flag 用 intervening 有副作用调用保证不被提升）。
+- **特性带 env 关闭旋钮时，探针必须跑"关"态做 A/B**：ZAN_CO_QUANTUM_MS=0 重跑同一探针得到相反断言（brokeEarly 1 vs 0），证明测试真的测到了特性而不是恒真；conformance 用例配 ctest `ENVIRONMENT` property pin 住关键变量（本例 ZAN_CO_WORKERS=1，否则多 worker 下兄弟本就在别的 worker 上跑，用例恒绿测不到抢占）。
+- 私目录 zanc 追加两条：编译 wasm32 目标需 `build/wasm32` sysroot 在**exe 旁**（`cp -r build/wasm32 _scratch/bld-y/`），且 wasm32 async 目前链不过（`_setjmp` undefined，既有缺口非新回归）——IR verify 阶段已足够验证发射体；包类型用例在私 zanc 下走 MVC 模式显式传包源文件（exe 侧发现不出 _scratch，`--auto-stdlib` 半解析会报 ZANPKG_MISSING 假象）。

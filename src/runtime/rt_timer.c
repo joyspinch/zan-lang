@@ -613,6 +613,23 @@ long long zan_timer_now_ms(void) {
 #endif
 }
 
+/* Cooperative scheduling quantum in ms: how long a coroutine frame may run
+ * before the poll sites the compiler plants at async loop back-edges call
+ * zan_co_poll and, past this budget, requeue the frame so its siblings (and
+ * the timer/IO pumps) get a turn. ZAN_CO_QUANTUM_MS overrides; 0 disables
+ * preemption outright. Cached idempotently -- a first-call race between
+ * workers computes the same value (same pattern as zan_io_trace above). */
+long long zan_co_quantum_ms(void) {
+    static long long q = -1;
+    if (q >= 0) return q;
+    long long v = 2;
+    const char *e = getenv("ZAN_CO_QUANTUM_MS");
+    if (e && *e) v = strtoll(e, NULL, 10);
+    if (v < 0) v = 0;
+    q = v;
+    return q;
+}
+
 static int timer_less(const zan_timer_entry *a, const zan_timer_entry *b) {
     return a->due_ms < b->due_ms ||
            (a->due_ms == b->due_ms && a->sequence < b->sequence);

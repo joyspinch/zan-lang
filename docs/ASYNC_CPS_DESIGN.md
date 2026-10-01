@@ -183,13 +183,48 @@ void zan_co_ready(void *frame, void (*step)(void*));
 void zan_co_sched_run(void);
 ```
 The default single-threaded implementation is emitted into the generated module.
-When `--async-workers` is used, `zanrt_io_mt` supplies the same ABI with an OS
-worker pool. IO await operations register a one-shot watcher through `rt_io`; when
-it completes, the reactor calls `zan_co_ready(frame, step)`.
+On native 64-bit targets (Windows/Linux/macOS/iOS x86_64/AArch64) `zanrt_io_mt`
+supplies the same ABI with an OS worker pool — this multi-worker driver is the
+DEFAULT, selected by target capability in the compiler (`external_async_executor`),
+not by any flag. IO await operations register a one-shot watcher through `rt_io`;
+when it completes, the reactor calls `zan_co_ready(frame, step)`.
 
 The ready queue and IO reactor are driven together: the scheduler drains ready
 frames, pumps IO while watchers remain, and stops when no runnable or pending IO
 work is left.
+
+### Cooperative preemption at loop back-edges (B-ID44)
+
+A compute-bound loop inside an async function never awaits, so it would hold
+its worker forever and starve timers, IO callbacks and sibling frames. The
+compiler therefore plants a poll at every `while`/`for`/`do` back-edge of an
+async function:
+
+```
+backedge:  if (zan_co_poll())  -> save slots, state = k, zan_co_ready(frame, resume), ret void
+           resume-k:           -> reload slots, re-enter the back edge
+```
+
+`zan_co_poll` (M:1: emitted inline; mt: provided by `zanrt_io_mt`) returns 1
+once the running frame has held its worker past the cooperative quantum —
+`ZAN_CO_QUANTUM_MS`, default 2ms, 0 disables. Both drivers restamp the slice
+clock at every dispatch, so a requeued frame gets a fresh budget. Because the
+poll site sits between statements, the same invariant that makes `await` work
+applies unchanged: only frame-resident named scalars survive the `ret void`
+(`emit_async_save_slots` covers them; ANF keeps SSA temporaries from
+crossing). The requeue itself is the exact `await Task.Yield()` sequence.
+
+One consequence had to be fixed in both drivers: a frame that requeues itself
+every slice keeps the ready queue non-empty forever, and both schedulers
+formerly dispatched due timers only on the idle path — so `Task.Delay`
+siblings would starve even with preemption live. The busy path now dispatches
+due timers as well (M:1: `zan_timer_dispatch_due` per dispatch; mt: the
+~1ms-throttled `co_pump_timers` in `co_run`).
+
+Not covered by back-edge polling: compute-bound loops in NON-async functions
+(the poll sites only exist in async bodies) — those still monopolize a worker;
+use `Thread`/`Task.Run` offloading or split the work with explicit
+`await Task.Yield()` calls. Non-async loops carry zero overhead.
 
 ### IO reactor backends and the real-async Net stack
 

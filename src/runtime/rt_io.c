@@ -4240,8 +4240,10 @@ typedef struct {
     int         index;
     int         bg_gen;
     int                searching;
-    /* Set while this worker blocks on its shard, so a producer can aim the wake
-     * packet at a port that actually has a waiter. */
+    /* Set in co_run right before the step: wall clock when this worker handed
+     * the CPU to the currently running frame. zan_co_poll compares it against
+     * the quantum to requeue compute-bound frames that never await. */
+    long long          slice_start_ms;
     volatile LONG      parked;
     unsigned           tick;
     unsigned           rng;
@@ -4667,6 +4669,24 @@ static int co_worker_count(void) {
     return w;
 }
 
+/* Cooperative preemption poll, planted by the compiler at every loop
+ * back-edge of an async function: returns 1 when the running frame has held
+ * its worker past zan_co_quantum_ms and must requeue itself (the same
+ * requeue as await Task.Yield) so siblings and the timer/IO pumps get a
+ * turn. Runs on the worker that is executing the frame; a foreign thread
+ * running a step (never the case today) just returns 0, degrading to the
+ * no-preemption behavior. Note the clock: GetTickCount64 ticks at ~15ms on
+ * Windows, so the effective slice granularity is the clock tick, not the
+ * configured quantum. */
+int zan_co_poll(void) {
+    long long q = zan_co_quantum_ms();
+    if (q <= 0) return 0;
+    zan_co_worker_t *w = co_self();
+    if (!w || w->slice_start_ms <= 0) return 0;
+    long long now = co_now_ms();
+    return (now - w->slice_start_ms >= q) ? 1 : 0;
+}
+
 void zan_co_sched_init(void) {
     if (!g_co_inited) {
         InitializeCriticalSection(&g_co_lock);
@@ -4797,6 +4817,8 @@ static int co_has_runnable(void) {
 /* Run one task. The frame is claimed (CO_QUEUED -> CO_RUNNING) before the
  * step and released afterwards; a concurrent free saw CO_RUNNING and only set
  * CO_DEAD, so the state word is still ours to read when the step returns. */
+static long long co_pump_timers(void);
+
 static void co_run(zan_co_worker_t *w, zan_co_task *t) {
     zan_co_fhdr *h = co_hdr(t->frame);
     long long s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
@@ -4816,6 +4838,14 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
     InterlockedIncrement(&g_co_running);
     w->st.ran++;
     co_trace("run", t->frame);
+    /* Busy-path timer pump (throttled pool-wide to ~1ms inside): a frame that
+     * requeues itself every slice (a preempted compute loop) keeps this
+     * worker's task stream non-empty forever, and the idle path below would
+     * never pump due timers -- Delay/Timer deliveries would starve under
+     * sustained load. Firing due timers here keeps them alive; the
+     * g_timer_owner gate in co_pump_timers_now serializes the pool. */
+    co_pump_timers();
+    w->slice_start_ms = co_now_ms();
     t->step(t->frame);
     co_trace("done", t->frame);
     for (;;) {

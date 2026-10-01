@@ -580,6 +580,57 @@ static void emit_async_reload_slots(zan_irgen_t *g) {
     }
 }
 
+/* Cooperative preemption site (B-ID44). Planted by the loop emitters at every
+ * back-edge of an async function: poll the driver; when the slice is up,
+ * requeue this frame with the exact `await Task.Yield()` sequence and re-enter
+ * the loop at resume_target once the scheduler gets back to it. This is what
+ * keeps a compute-bound loop (no awaits of its own) from monopolizing the
+ * worker and starving timers, IO callbacks, and sibling coroutines.
+ *
+ * Safe at statement boundaries by the same invariant that makes awaits work:
+ * only frame-resident named scalars survive the `ret void` (save_slots covers
+ * them; ANF keeps SSA temporaries from crossing), and the back edge sits
+ * between statements. In a non-async function this emits nothing and returns
+ * false, so the caller falls through to its plain back-edge branch. */
+static bool emit_async_preempt_site(zan_irgen_t *g, LLVMBasicBlockRef resume_target) {
+    if (!g->current_async_frame || !g->current_async_switch) return false;
+    LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_fn, "co.preempt.cont");
+    LLVMBasicBlockRef preempt_bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_fn, "co.preempt");
+    int k = g->current_async_next_state++;
+    LLVMValueRef fired = zan_call2(g->builder, g->rt_co_poll_type, g->rt_co_poll,
+        NULL, 0, "poll");
+    LLVMValueRef want = zan_icmp(g->builder, LLVMIntNE, fired,
+        LLVMConstInt(di32, 0, 0), "poll.want");
+    LLVMBuildCondBr(g->builder, want, preempt_bb, cont_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, preempt_bb);
+    LLVMValueRef selfframe = g->current_async_frame;
+    emit_async_save_slots(g);
+    zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0),
+        LLVMBuildStructGEP2(g->builder, g->current_async_frame_type, selfframe,
+                            ASYNC_FRAME_STATE, "preempt.state"));
+    zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready,
+        (LLVMValueRef[]){ LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self"),
+                          g->current_async_resume_fn }, 2, "");
+    emit_async_eh_unarm(g);
+    LLVMBuildRetVoid(g->builder);
+
+    LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_async_resume_fn, "co.preempt.resume");
+    LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
+    LLVMPositionBuilderAtEnd(g->builder, rk);
+    emit_async_reload_slots(g);
+    LLVMBuildBr(g->builder, resume_target);
+
+    LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+    LLVMBuildBr(g->builder, resume_target);
+    return true;
+}
+
 /* ---- await A-normal-form (ANF) normalization ----
  *
  * S3 keeps a value alive across a suspension only when it is a named scalar

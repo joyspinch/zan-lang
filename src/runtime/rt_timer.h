@@ -107,6 +107,11 @@ void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step);
  * entries cancelled. */
 int zan_timer_cancel_delay(void *frame);
 long long zan_timer_next_timeout(void);
+/* Cooperative scheduling quantum in ms (ZAN_CO_QUANTUM_MS, default 2, 0
+ * disables): read by the drivers' zan_co_poll to decide when a frame that has
+ * run past its slice must requeue. Lives with the timer because both drivers
+ * already link this object for their clocks. */
+long long zan_co_quantum_ms(void);
 /* These return counts; `long long` (not size_t) because the compiler's IR
  * declares them with Zan's 64-bit int and wasm32's size_t is 32-bit. */
 long long zan_timer_dispatch_due(void);

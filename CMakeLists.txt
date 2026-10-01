@@ -1858,6 +1858,13 @@ foreach(_src ${_conf_srcs})
     RESOURCE_LOCK src_${_name} TIMEOUT 120)
 endforeach()
 
+# Back-edge preemption (B-ID44) is only observable when the hot frame and its
+# Delay sibling share ONE worker: with the default pool the sibling runs on
+# another worker regardless. Pin the pool down for this one case; every other
+# case keeps the machine-default pool.
+set_tests_properties(conformance_async_preempt_hotloop PROPERTIES
+  ENVIRONMENT "ZAN_CO_WORKERS=1")
+
 # ---- wasm32 try/catch: cross-compile to a linked module --------------------
 # try/catch on wasm32 lowers to WebAssembly exception handling (catchswitch /
 # invoke / __cxa_throw + zanrt_ehtag.o). The suite cannot RUN a wasm module, so

@@ -2163,6 +2163,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef co_ready_args[] = { i8ptr, g->co_step_ptr };
     g->rt_co_ready_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), co_ready_args, 2, 0);
     g->rt_co_ready = LLVMAddFunction(g->mod, "zan_co_ready", g->rt_co_ready_type);
+    /* i32 zan_co_poll(void): cooperative preemption checkpoint. The compiler
+     * plants a call at every loop back-edge inside an async function; a
+     * non-zero return means the running frame has held the worker past its
+     * slice and must requeue itself (the exact Task.Yield sequence). */
+    g->rt_co_poll_type = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), NULL, 0, 0);
+    g->rt_co_poll = LLVMAddFunction(g->mod, "zan_co_poll", g->rt_co_poll_type);
     /* void __zan_co_frame_free(void *frame): release an async frame through the
      * multi-worker driver, which defers the free while the scheduler still
      * references the frame (running on some worker, or queued on another). */
@@ -2288,6 +2294,24 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMSetLinkage(g_nodes, LLVMInternalLinkage);
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
 
+        /* Preemption bookkeeping (B-ID44): __zan_co_quantum_ms caches the
+         * cooperative slice length (zan_co_quantum_ms, from the linked
+         * timer runtime; 0 = disabled) and __zan_co_slice_start is stamped
+         * by the dispatch path below, so zan_co_poll can decide whether the
+         * running frame has outrun its budget. */
+        LLVMValueRef g_slice_start = LLVMAddGlobal(g->mod, i64t, "__zan_co_slice_start");
+        LLVMSetInitializer(g_slice_start, LLVMConstInt(i64t, 0, 0));
+        LLVMSetLinkage(g_slice_start, LLVMInternalLinkage);
+        LLVMValueRef g_quantum = LLVMAddGlobal(g->mod, i64t, "__zan_co_quantum_ms");
+        LLVMSetInitializer(g_quantum, LLVMConstInt(i64t, 0, 0));
+        LLVMSetLinkage(g_quantum, LLVMInternalLinkage);
+        /* extern long long zan_timer_now_ms(void) / zan_co_quantum_ms(void):
+         * both resolved from the linked timer runtime, which the driver
+         * already depends on for zan_timer_delay. */
+        LLVMTypeRef now_type = LLVMFunctionType(i64t, NULL, 0, 0);
+        LLVMValueRef timer_now = LLVMAddFunction(g->mod, "zan_timer_now_ms", now_type);
+        LLVMValueRef co_quantum = LLVMAddFunction(g->mod, "zan_co_quantum_ms", now_type);
+
         /* The unified timer runtime owns a dynamic-array min-heap shared by
          * Task.Delay and public Timer entries. Public clear operations filter by
          * entry kind, so they cannot remove coroutine delays. */
@@ -2361,10 +2385,42 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMPositionBuilderAtEnd(g->builder, bb);
             LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), g_head);
             LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), g_tail);
+            LLVMValueRef q = zan_call2(g->builder, now_type, co_quantum, NULL, 0, "q");
+            LLVMBuildStore(g->builder, q, g_quantum);
+            LLVMValueRef t0 = zan_call2(g->builder, now_type, timer_now, NULL, 0, "t0");
+            LLVMBuildStore(g->builder, t0, g_slice_start);
             zan_call2(g->builder, timer_reset_type, timer_reset, NULL, 0, "");
             zan_call2(g->builder, timer_hook_type, timer_set_hook,
                 (LLVMValueRef[]){ g->rt_co_ready }, 1, "");
             LLVMBuildRetVoid(g->builder);
+        }
+
+        /* i32 zan_co_poll(void): 1 when the running frame has held the
+         * worker past its quantum. One clock call per back-edge iteration
+         * (vDSO / KUSER_SHARED_DATA grade); the dispatch path restamps
+         * __zan_co_slice_start, so a requeued frame gets a fresh slice. */
+        {
+            LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_poll, "entry");
+            LLVMBasicBlockRef check = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_poll, "check");
+            LLVMBasicBlockRef yes   = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_poll, "yes");
+            LLVMBasicBlockRef no    = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_poll, "no");
+            LLVMPositionBuilderAtEnd(g->builder, entry);
+            LLVMValueRef q = LLVMBuildLoad2(g->builder, i64t, g_quantum, "q");
+            LLVMValueRef enabled = zan_icmp(g->builder, LLVMIntSGT, q,
+                LLVMConstInt(i64t, 0, 0), "q.on");
+            LLVMBuildCondBr(g->builder, enabled, check, no);
+
+            LLVMPositionBuilderAtEnd(g->builder, check);
+            LLVMValueRef now = zan_call2(g->builder, now_type, timer_now, NULL, 0, "now");
+            LLVMValueRef start = LLVMBuildLoad2(g->builder, i64t, g_slice_start, "start");
+            LLVMValueRef elapsed = LLVMBuildSub(g->builder, now, start, "elapsed");
+            LLVMValueRef over = zan_icmp(g->builder, LLVMIntSGE, elapsed, q, "over");
+            LLVMBuildCondBr(g->builder, over, yes, no);
+
+            LLVMPositionBuilderAtEnd(g->builder, yes);
+            LLVMBuildRet(g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 1, 0));
+            LLVMPositionBuilderAtEnd(g->builder, no);
+            LLVMBuildRet(g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0));
         }
 
         /* void zan_co_delay(i64 ms, i8* frame, step): register in the unified
@@ -2520,6 +2576,18 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 LLVMBuildLoad2(g->builder, i8ptr, g_nodes, "nodes.head"),
                 LLVMBuildStructGEP2(g->builder, node_ty, head, 0, "n.recycle"));
             LLVMBuildStore(g->builder, head, g_nodes);
+            /* Busy-path timer dispatch: a frame that requeues itself every
+             * slice (a preempted compute loop) never lets the queue drain,
+             * and the idle path below would never pump due timers. Firing
+             * due timers here (cheap heap peek under the timer lock) keeps
+             * Delay/Timer deliveries alive under sustained load. */
+            (void)zan_call2(g->builder, timer_next_type, timer_dispatch,
+                NULL, 0, "due.busy");
+            /* stamp the slice start: zan_co_poll measures from here, so a
+             * requeued (preempted) frame gets a fresh budget on redispatch. */
+            LLVMValueRef slice_now = zan_call2(g->builder, now_type, timer_now,
+                NULL, 0, "slice.now");
+            LLVMBuildStore(g->builder, slice_now, g_slice_start);
             zan_call2(g->builder, g->co_step_type, st,
                 (LLVMValueRef[]){ fr }, 1, "");
             LLVMBuildBr(g->builder, head_bb);

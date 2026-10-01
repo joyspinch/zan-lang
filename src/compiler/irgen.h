@@ -585,6 +585,12 @@ struct zan_irgen {
     LLVMTypeRef  co_header_type;  /* shared frame header {i64,step*,i32,i32,i8*,step*,i64} */
     LLVMValueRef rt_co_ready;     /* void zan_co_ready(void* frame, step) */
     LLVMTypeRef  rt_co_ready_type;
+    /* i32 zan_co_poll(void): planted at async loop back-edges; returns
+     * non-zero when the driver wants the running frame requeued (slice
+     * expired). M:1 driver: body emitted below. Multi-worker driver:
+     * resolved from zanrt_io_mt at link time. */
+    LLVMValueRef rt_co_poll;
+    LLVMTypeRef  rt_co_poll_type;
     LLVMValueRef rt_co_frame_free;/* void __zan_co_frame_free(void* frame) */
     LLVMTypeRef  rt_co_frame_free_type;
     LLVMValueRef rt_co_sched_init;/* void zan_co_sched_init(void) */

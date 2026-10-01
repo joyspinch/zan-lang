@@ -1,0 +1,55 @@
+// Starvation probe (B-ID44 back-edge preemption). Run with ZAN_CO_WORKERS=1:
+// a compute-bound async frame (no awaits; the inner loop's atomic RMW keeps
+// LLVM from folding it away) shares one worker with a Task.Delay(30) sibling.
+// With preemption on (default) the hot frame requeues every slice, the delay
+// delivers mid-flight, and Hot observes the flag and breaks early ->
+// brokeEarly=1. ZAN_CO_QUANTUM_MS=0 disables preemption: Hot monopolizes the
+// worker, brokeEarly=0, and the delay arrives only after the loop exhausts.
+using System;
+using System.Threading;
+
+class Program {
+    static AtomicInt waiterDone;
+    static AtomicInt brokeEarly;
+    static AtomicInt spin;
+
+    static async int Hot() {
+        int outer = 0;
+        while (outer < 4) {
+            long j = 0;
+            while (j < 4000000) {
+                j = j + 1;
+                Program.spin.Add(1);
+            }
+            outer = outer + 1;
+            if (Program.waiterDone.Load() == 1) {
+                Program.brokeEarly.Add(1);
+                break;
+            }
+        }
+        return 0;
+    }
+
+    static async int Waiter() {
+        await Task.Delay(30);
+        Program.waiterDone.Add(1);
+        return 0;
+    }
+
+    static async int Run() {
+        Program.waiterDone = new AtomicInt(0);
+        Program.brokeEarly = new AtomicInt(0);
+        Program.spin = new AtomicInt(0);
+        List<long> jobs = new List<long>();
+        jobs.Add(Task.Spawn(Program.Hot()));
+        jobs.Add(Task.Spawn(Program.Waiter()));
+        await Task.WhenAll(jobs);
+        return 0;
+    }
+
+    static async void Main() {
+        await Program.Run();
+        Console.WriteLine("brokeEarly=" + Convert.ToString(Program.brokeEarly.Load()));
+        Console.WriteLine("ok");
+    }
+}
