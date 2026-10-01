@@ -1,0 +1,228 @@
+// Toml test: full-shape parse (bare/dotted/quoted keys, tables, arrays of
+// tables with sub-navigation, all four string kinds, dec/hex/oct/bin ints,
+// underscores, long.MinValue, floats, bools, datetimes as strings, arrays
+// with trailing comma, inline tables), writer round-trip + idempotence,
+// key quoting, and error paths (duplicate header, bad escape, int overflow,
+// null in writer).
+using System;
+using System.IO;
+using System.Text;
+using System.Json;
+using System.Toml;
+
+namespace Conf;
+
+class Prog {
+    // 断言助手：值缺失按失败计，避免可空链式解引用。
+    static int ChkStr(JsonValue v, string want) {
+        if (v == null) { return 1; }
+        if (v.AsString("") != want) { return 1; }
+        return 0;
+    }
+
+    static int ChkLong(JsonValue v, long want) {
+        if (v == null) { return 1; }
+        if (v.AsLong(0) != want) { return 1; }
+        return 0;
+    }
+
+    static int ChkDouble(JsonValue v, double want) {
+        if (v == null) { return 1; }
+        if (Math.Abs(v.AsDouble(0) - want) > 1e-9) { return 1; }
+        return 0;
+    }
+
+    static int ChkBool(JsonValue v, bool want) {
+        if (v == null) { return 1; }
+        if (v.AsBool(!want) != want) { return 1; }
+        return 0;
+    }
+
+    // TOML 表无序：写出器会把对象值键挪到表头区，往返后同层键序可能
+    // 变化。语义相等必须按键集合递归比，不能比 ToJson 原文。
+    static bool Eqv(JsonValue a, JsonValue b) {
+        if (a == null) { return b == null; }
+        if (b == null) { return false; }
+        if (a.IsObject()) {
+            if (!b.IsObject()) { return false; }
+            if (a.Count() != b.Count()) { return false; }
+            for (int i = 0; i < a.Count(); i = i + 1) {
+                string k = a.KeyAt(i);
+                if (!b.Has(k)) { return false; }
+                if (!Eqv(a.ValAt(i), b.Get(k))) { return false; }
+            }
+            return true;
+        }
+        if (a.IsArray()) {
+            if (!b.IsArray()) { return false; }
+            if (a.Count() != b.Count()) { return false; }
+            for (int i = 0; i < a.Count(); i = i + 1) {
+                if (!Eqv(a.At(i), b.At(i))) { return false; }
+            }
+            return true;
+        }
+        if (a.IsString()) { return b.IsString() && a.AsString("") == b.AsString(""); }
+        if (a.IsBool()) { return b.IsBool() && a.AsBool(false) == b.AsBool(false); }
+        if (a.IsNull()) { return b.IsNull(); }
+        if (a.IsNumber()) {
+            if (!b.IsNumber()) { return false; }
+            if (a.AsLong(0) != b.AsLong(0)) {
+                return Math.Abs(a.AsDouble(0) - b.AsDouble(0)) < 1e-9;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    static int IndexOf(string s, string needle) {
+        int n = s.Length;
+        int m = needle.Length;
+        for (int i = 0; i <= n - m; i = i + 1) {
+            int j = 0;
+            while (j < m && (s[i + j] & 255) == (needle[j] & 255)) {
+                j = j + 1;
+            }
+            if (j == m) { return i; }
+        }
+        return -1;
+    }
+
+    static void Main() {
+        int bad = 0;
+        string src = "# 全量特性\n"
+            + "title = \"TOML 测试\"\n"
+            + "count = 1_000\n"
+            + "hex = 0xFF\n"
+            + "oct = 0o755\n"
+            + "bin = 0b1010\n"
+            + "neg = -9223372036854775808\n"
+            + "pi = 3.14159\n"
+            + "big = 1.25e3\n"
+            + "flag = true\n"
+            + "off = false\n"
+            + "date = 1979-05-27\n"
+            + "stamp = 1979-05-27 07:32:00Z\n"
+            + "clock = 07:32:00\n"
+            + "basic = \"a\\tb\\n\\u4e2d\\\"q\\\"\"\n"
+            + "literal = 'C:\\path\\no\\escape'\n"
+            + "multi = \"\"\"\nline1\nline2\\\njoined\"\"\"\n"
+            + "mliteral = '''\nraw \\n stays'''\n"
+            + "arr = [1, 2, 3,\n  4,]\n"
+            + "nested = [[1, 2], [3]]\n"
+            + "inline = { a = 1, b = \"x\" }\n"
+            + "empty-table = {}\n"
+            + "\"quoted key\" = 1\n"
+            + "[server]\n"
+            + "host = \"127.0.0.1\"\n"
+            + "port = 8080\n"
+            + "[server.tls]\n"
+            + "enabled = true\n"
+            + "[[fruit]]\n"
+            + "name = \"apple\"\n"
+            + "[fruit.physical]\n"
+            + "color = \"red\"\n"
+            + "[[fruit]]\n"
+            + "name = \"banana\"\n"
+            + "[fruit.physical]\n"
+            + "color = \"yellow\"\n";
+        JsonValue conf = Toml.Parse(src);
+        bad = bad + ChkStr(conf.PathGet("title"), "TOML 测试");
+        bad = bad + ChkLong(conf.PathGet("count"), 1000);
+        bad = bad + ChkLong(conf.PathGet("hex"), 255);
+        bad = bad + ChkLong(conf.PathGet("oct"), 493);
+        bad = bad + ChkLong(conf.PathGet("bin"), 10);
+        long minLong = -9223372036854775807 - 1;
+        bad = bad + ChkLong(conf.PathGet("neg"), minLong);
+        bad = bad + ChkDouble(conf.PathGet("pi"), 3.14159);
+        bad = bad + ChkDouble(conf.PathGet("big"), 1250.0);
+        bad = bad + ChkBool(conf.PathGet("flag"), true);
+        bad = bad + ChkBool(conf.PathGet("off"), false);
+        // 日期时间按原文存字符串。
+        bad = bad + ChkStr(conf.PathGet("date"), "1979-05-27");
+        bad = bad + ChkStr(conf.PathGet("stamp"), "1979-05-27 07:32:00Z");
+        bad = bad + ChkStr(conf.PathGet("clock"), "07:32:00");
+        bad = bad + ChkStr(conf.PathGet("basic"), "a\tb\n中\"q\"");
+        bad = bad + ChkStr(conf.PathGet("literal"), "C:\\path\\no\\escape");
+        bad = bad + ChkStr(conf.PathGet("multi"), "line1\nline2joined");
+        bad = bad + ChkStr(conf.PathGet("mliteral"), "raw \\n stays");
+        JsonValue arr = conf.Get("arr");
+        if (arr == null) { bad = bad + 1; }
+        else {
+            if (arr.Count() != 4) { bad = bad + 1; }
+            else { bad = bad + ChkLong(arr.At(3), 4); }
+        }
+        JsonValue nested = conf.Get("nested");
+        if (nested == null) { bad = bad + 1; }
+        else { bad = bad + ChkLong(nested.At(1).At(0), 3); }
+        bad = bad + ChkLong(conf.PathGet("inline.a"), 1);
+        bad = bad + ChkStr(conf.PathGet("inline.b"), "x");
+        JsonValue et = conf.Get("empty-table");
+        if (et == null) { bad = bad + 1; }
+        else {
+            if (!et.IsObject()) { bad = bad + 1; }
+            else if (et.Count() != 0) { bad = bad + 1; }
+        }
+        bad = bad + ChkLong(conf.PathGet("quoted key"), 1);
+        bad = bad + ChkStr(conf.PathGet("server.host"), "127.0.0.1");
+        bad = bad + ChkLong(conf.PathGet("server.port"), 8080);
+        bad = bad + ChkBool(conf.PathGet("server.tls.enabled"), true);
+        JsonValue fruits = conf.Get("fruit");
+        if (fruits == null) { bad = bad + 1; }
+        else {
+            if (fruits.Count() != 2) { bad = bad + 1; }
+            else {
+                bad = bad + ChkStr(fruits.At(0).Get("name"), "apple");
+                bad = bad + ChkStr(fruits.At(0).PathGet("physical.color"), "red");
+                bad = bad + ChkStr(fruits.At(1).Get("name"), "banana");
+                bad = bad + ChkStr(fruits.At(1).PathGet("physical.color"), "yellow");
+            }
+        }
+        // --- 写出往返：Parse → ToToml → Parse 语义相等（表无序），再写幂等 ---
+        string t1 = Toml.ToToml(conf);
+        JsonValue re = Toml.Parse(t1);
+        if (!Eqv(re, conf)) { bad = bad + 1; }
+        string t2 = Toml.ToToml(re);
+        if (t2 != t1) { bad = bad + 1; }
+        // 表头块前有空行分隔、子表在简单键之后、引号键原样回写。
+        if (IndexOf(t1, "\n[server]") < 0) { bad = bad + 1; }
+        if (IndexOf(t1, "\"quoted key\" = 1") < 0) { bad = bad + 1; }
+        // 行内表里的对象嵌套：数组套对象落行内表。
+        JsonValue mix = JsonValue.NewObject();
+        JsonValue marr = JsonValue.NewArray();
+        JsonValue elem = JsonValue.NewObject();
+        elem.PutStr("k", "v");
+        marr.Append(elem);
+        marr.AppendInt(7);
+        mix.Put("mix", marr);
+        string mx = Toml.ToToml(mix);
+        if (IndexOf(mx, "[{ k = \"v\" }, 7]") < 0) { bad = bad + 1; }
+        JsonValue mre = Toml.Parse(mx);
+        if (!Eqv(mre, mix)) { bad = bad + 1; }
+        // --- 错误路径 ---
+        bool threw = false;
+        try {
+            Toml.Parse("[a]\nx = 1\n[a]\n");
+        } catch (TomlException e) { threw = true; }
+        if (!threw) { bad = bad + 1; }
+        threw = false;
+        try {
+            Toml.Parse("v = \"a\\qb\"\n");
+        } catch (TomlException e) { threw = true; }
+        if (!threw) { bad = bad + 1; }
+        threw = false;
+        try {
+            Toml.Parse("v = 99999999999999999999999\n");
+        } catch (TomlException e) { threw = true; }
+        if (!threw) { bad = bad + 1; }
+        threw = false;
+        try { Toml.Parse("v =\n"); } catch (TomlException e) { threw = true; }
+        if (!threw) { bad = bad + 1; }
+        // 写侧：TOML 无 null。
+        JsonValue withNull = JsonValue.NewObject();
+        withNull.PutNull("gone");
+        threw = false;
+        try { Toml.ToToml(withNull); } catch (TomlException e) { threw = true; }
+        if (!threw) { bad = bad + 1; }
+        Console.WriteLine("toml-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

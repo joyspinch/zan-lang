@@ -1,0 +1,211 @@
+using System;
+using System.IO;
+using System.Text;
+
+namespace System.Toml;
+
+/// <summary>
+/// TOML 门面：Parse 把文本解析成 <see cref="JsonValue"/> 值树（表→
+/// object、数组→array、整数/浮点→number、日期时间按原文存字符串）；
+/// ToToml 把值树写回 TOML 文本。
+///
+///   JsonValue conf = Toml.Parse(File.ReadAllText("app.toml"));
+///   string host = conf.Get("server").Get("host").AsString("");
+///   File.WriteAllText("app.toml", Toml.ToToml(conf));
+///
+/// 语义往返（Parse → ToToml → Parse 得到相等的树）；注释与原排版
+/// 不保真。TOML 没有 null：写出含 null 的树会抛 TomlException。
+/// </summary>
+class Toml {
+    /// 嵌套深度上限（写侧防环；解析侧同值在 TomlParser）。
+    static int MaxDepth = 512;
+
+    /// <summary>解析 TOML 文本。格式非法抛 <see cref="TomlException"/>
+    /// （带行列号）。</summary>
+    static JsonValue Parse(string src) {
+        return TomlParser.Parse(src);
+    }
+
+    /// <summary>读取并解析文件。文件异常按 IO 异常抛，内容非法按
+    /// <see cref="TomlException"/> 抛。</summary>
+    static JsonValue Load(string path) {
+        return Toml.Parse(File.ReadAllText(path));
+    }
+
+    /// <summary>把值树序列化为 TOML 文本。根必须是表；树里含
+    /// null（TOML 无此值）或深度超限时抛 <see cref="TomlException"/>。</summary>
+    static string ToToml(JsonValue root) {
+        if (root == null || !root.IsObject()) {
+            throw new TomlException("ToToml: root must be a table");
+        }
+        StringBuilder sb = new StringBuilder();
+        Toml.WriteTable(sb, root, new List<string>());
+        return sb.ToString();
+    }
+
+    /// 以 TOML 文本写文件。
+    static void Save(string path, JsonValue root) {
+        File.WriteAllText(path, Toml.ToToml(root));
+    }
+
+    /// 一张表：简单键（标量/数组/空表行内）在前，子表头在后。
+    static void WriteTable(StringBuilder sb, JsonValue table, List<string> path) {
+        for (int i = 0; i < table.Count(); i = i + 1) {
+            string key = table.KeyAt(i);
+            JsonValue v = table.Get(key);
+            if (v == null) { continue; }                      // Get 可空契约
+            if (v.IsObject() && v.Count() > 0) { continue; }
+            if (v.IsArray() && Toml.AllObjects(v)) { continue; }   // 走表数组头
+            sb.Append(Toml.EncodeKey(key));
+            sb.Append(" = ");
+            Toml.WriteValue(sb, v, 1);
+            sb.Append("\n");
+        }
+        for (int i = 0; i < table.Count(); i = i + 1) {
+            string key = table.KeyAt(i);
+            JsonValue v = table.Get(key);
+            if (v == null) { continue; }
+            if (v.IsObject() && v.Count() > 0) {
+                Toml.Separate(sb);
+                List<string> sub = Toml.ExtendPath(path, key);
+                sb.Append(Toml.Header(sub, false));
+                sb.Append("\n");
+                Toml.WriteTable(sb, v, sub);
+                continue;
+            }
+            if (v.IsArray() && Toml.AllObjects(v)) {
+                for (int j = 0; j < v.Count(); j = j + 1) {
+                    Toml.Separate(sb);
+                    List<string> sub = Toml.ExtendPath(path, key);
+                    sb.Append(Toml.Header(sub, true));
+                    sb.Append("\n");
+                    Toml.WriteTable(sb, v.At(j), sub);
+                }
+            }
+        }
+    }
+
+    /// 值编码：null 非法，标量/数组/行内表全部行内呈现（嵌套对象
+    /// 在数组里落成行内表，这是它们在 TOML 里唯一的值形态）。
+    static void WriteValue(StringBuilder sb, JsonValue v, int depth) {
+        if (depth > Toml.MaxDepth) {
+            throw new TomlException("ToToml: nesting too deep (cycle?)");
+        }
+        if (v.IsNull()) {
+            throw new TomlException("ToToml: TOML has no null value");
+        }
+        if (v.IsBool()) {
+            sb.Append(v.AsBool(false) ? "true" : "false");
+            return;
+        }
+        if (v.IsNumber()) {
+            sb.Append(JsonValue.NumText(v));
+            return;
+        }
+        if (v.IsString()) {
+            Toml.EncodeString(sb, v.AsString(""));
+            return;
+        }
+        if (v.IsArray()) {
+            sb.Append("[");
+            for (int i = 0; i < v.Count(); i = i + 1) {
+                if (i > 0) { sb.Append(", "); }
+                Toml.WriteValue(sb, v.At(i), depth + 1);
+            }
+            sb.Append("]");
+            return;
+        }
+        // 行内表；空表紧凑写成 {}，非空才加内侧空格。
+        if (v.Count() == 0) { sb.Append("{}"); return; }
+        sb.Append("{ ");
+        for (int i = 0; i < v.Count(); i = i + 1) {
+            if (i > 0) { sb.Append(", "); }
+            string k = v.KeyAt(i);
+            sb.Append(Toml.EncodeKey(k));
+            sb.Append(" = ");
+            Toml.WriteValue(sb, v.Get(k), depth + 1);
+        }
+        sb.Append(" }");
+    }
+
+    /// 表头文本：[a.b] 或 [[a.b]]。
+    static string Header(List<string> path, bool arrayTable) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(arrayTable ? "[[" : "[");
+        for (int i = 0; i < path.Count; i = i + 1) {
+            if (i > 0) { sb.Append("."); }
+            sb.Append(Toml.EncodeKey(path[i]));
+        }
+        sb.Append(arrayTable ? "]]" : "]");
+        return sb.ToString();
+    }
+
+    /// 键编码：裸键 [A-Za-z0-9_-]+ 直写，其余加引号。
+    static string EncodeKey(string key) {
+        bool bare = key.Length > 0;
+        for (int i = 0; bare && i < key.Length; i = i + 1) {
+            int c = key[i] & 255;
+            bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+                || (c >= 48 && c <= 57) || c == 95 || c == 45;
+            if (!ok) { bare = false; }
+        }
+        if (bare) { return key; }
+        StringBuilder sb = new StringBuilder();
+        Toml.EncodeString(sb, key);
+        return sb.ToString();
+    }
+
+    /// 基本字符串编码：\ " 与控制字符转义，非 ASCII 原样（UTF-8）。
+    static void EncodeString(StringBuilder sb, string t) {
+        sb.Append("\"");
+        int from = 0;
+        int n = t.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = t[i] & 255;
+            string rep = null;
+            if (c == 34) { rep = "\\\""; }
+            else if (c == 92) { rep = "\\\\"; }
+            else if (c == 8) { rep = "\\b"; }
+            else if (c == 9) { rep = "\\t"; }
+            else if (c == 10) { rep = "\\n"; }
+            else if (c == 12) { rep = "\\f"; }
+            else if (c == 13) { rep = "\\r"; }
+            else if (c < 32 || c == 127) {
+                rep = "\\u00" + Toml.Hex2(c);
+            }
+            if (rep != null) {
+                if (i > from) { sb.Append(t.Substring(from, i - from)); }
+                sb.Append(rep);
+                from = i + 1;
+            }
+        }
+        if (from < n) { sb.Append(t.Substring(from, n - from)); }
+        sb.Append("\"");
+    }
+
+    static void Separate(StringBuilder sb) {
+        if (sb.Length > 0) { sb.Append("\n"); }
+    }
+
+    static List<string> ExtendPath(List<string> path, string key) {
+        List<string> sub = new List<string>();
+        for (int i = 0; i < path.Count; i = i + 1) { sub.Add(path[i]); }
+        sub.Add(key);
+        return sub;
+    }
+
+    static bool AllObjects(JsonValue arr) {
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            if (!arr.At(i).IsObject()) { return false; }
+        }
+        return arr.Count() > 0;
+    }
+
+    static string Hex2(int c) {
+        string hex = "0123456789ABCDEF";
+        string out2 = "";
+        out2 = out2 + hex.Substring((c >> 4) & 15, 1);
+        out2 = out2 + hex.Substring(c & 15, 1);
+        return out2;
+    }
+}

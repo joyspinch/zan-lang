@@ -1,0 +1,663 @@
+using System;
+using System.Text;
+
+namespace System.Toml;
+
+/// <summary>
+/// 递归下降 TOML 解析器（Toml.Parse 的实现），值树落
+/// <see cref="JsonValue"/>：整数/浮点走 number，四种日期时间按原文
+/// 存字符串，表/行内表落 object，数组落 array。
+///
+/// 字节游标风格与 System.Xml/Json 一致：<c>s[pos] &amp; 255</c> 逐字节
+/// 判别，格式非法立即抛 <see cref="TomlException"/>（带行列号）。
+///
+/// 有意宽松的三处（都在 README 声明）：行内表允许跨行；被点号键
+/// 打开过的表允许再被表头补键；表头重复只查"完全相同的头"。
+/// </summary>
+class TomlParser {
+    /// 输入文本与游标。
+    string s;
+    int pos;
+    int len;
+    /// 数组/行内表嵌套深度上限（与 Json 读写两侧的约定对称）。
+    static int MaxDepth = 512;
+    /// long 上限（Zan 无 long.MaxValue 表达式，直写常数）。
+    static long MaxLong = 9223372036854775807;
+
+    JsonValue root;
+    /// 当前表：后续键值对落这里。
+    JsonValue cur;
+    /// 已出现的表头路径（段间以字节 1 连接），查重复定义。
+    Dict<string, bool> headers;
+    /// 整数解析溢出哨兵（ParseIntBase 设置，调用方核对后报错）。
+    bool intOverflow;
+
+    /// <summary>解析入口。格式非法抛 TomlException（带行列号）。</summary>
+    static JsonValue Parse(string src) {
+        TomlParser p = new TomlParser();
+        p.s = src;
+        p.pos = 0;
+        p.len = src.Length;
+        return p.ReadDocument();
+    }
+
+    JsonValue ReadDocument() {
+        root = JsonValue.NewObject();
+        cur = root;
+        headers = new Dict<string, bool>();
+        while (pos < len) {
+            SkipWsNewlinesComments();
+            if (pos >= len) { break; }
+            int c = CurB();
+            if (c == 91) {                                    // '['
+                ReadTableHeader();
+            } else {
+                ReadKeyValue(cur, true);
+            }
+        }
+        return root;
+    }
+
+    /// 表头：[a.b.c] 或 [[arr]]。导航到（或创建）目标表并设为 cur。
+    void ReadTableHeader() {
+        bool arrayTable = Has("[[");
+        pos = pos + (arrayTable ? 2 : 1);
+        List<string> path = ReadKeyPath();
+        SkipH();
+        if (arrayTable) {
+            if (!Has("]]")) { Err("expected ']]'"); }
+            pos = pos + 2;
+        } else {
+            if (CurB() != 93) { Err("expected ']'"); }        // ']'
+            pos = pos + 1;
+        }
+        EndOfLine("table header");
+        cur = NavigateHeader(path, arrayTable);
+    }
+
+    /// 键值对：path.to.key = value。文档层与表头的对收口到行尾；
+    /// 行内表里的对以 ',' / '}' 收口，不做行尾校验。
+    void ReadKeyValue(JsonValue owner, bool needLineEnd) {
+        List<string> path = ReadKeyPath();
+        SkipH();
+        if (CurB() != 61) { Err("expected '=' after key"); }  // '='
+        pos = pos + 1;
+        SkipH();
+        JsonValue v = ReadValue(1);
+        SetValue(owner, path, v);
+        if (needLineEnd) { EndOfLine("key-value pair"); }
+    }
+
+    /// 键路径：key (. key)*；bare / 基本串 / 字面串三种键型。
+    List<string> ReadKeyPath() {
+        List<string> path = new List<string>();
+        while (pos < len) {
+            path.Add(ReadKey());
+            SkipH();
+            if (CurB() == 46) {                               // '.'
+                pos = pos + 1;
+                SkipH();
+                continue;
+            }
+            break;
+        }
+        if (path.Count == 0) { Err("expected a key"); }
+        return path;
+    }
+
+    string ReadKey() {
+        int c = CurB();
+        if (c == 34) { return ReadBasicString(); }            // '"'
+        if (c == 39) { return ReadLiteralString(); }          // '\''
+        int start = pos;
+        while (pos < len) {
+            int d = s[pos] & 255;
+            bool ok = (d >= 97 && d <= 122) || (d >= 65 && d <= 90)
+                || (d >= 48 && d <= 57) || d == 95 || d == 45
+                || d >= 128;                                  // [A-Za-z0-9_-] + 非 ASCII
+            if (!ok) { break; }
+            pos = pos + 1;
+        }
+        if (pos == start) { Err("expected a key"); }
+        return s.Substring(start, pos - start);
+    }
+
+    /// 值分派：字符串/数组/行内表/布尔/数字与日期时间。
+    JsonValue ReadValue(int depth) {
+        if (depth > TomlParser.MaxDepth) { Err("TOML nesting too deep"); }
+        int c = CurB();
+        if (c == 34) {                                        // '"'
+            if (Has("\"\"\"")) { return JsonValue.NewStr(ReadMultilineBasic()); }
+            return JsonValue.NewStr(ReadBasicString());
+        }
+        if (c == 39) {                                        // '\''
+            if (Has("'''")) { return JsonValue.NewStr(ReadMultilineLiteral()); }
+            return JsonValue.NewStr(ReadLiteralString());
+        }
+        if (c == 91) { return ReadArray(depth); }             // '['
+        if (c == 123) { return ReadInlineTable(depth); }      // '{'
+        if (c == 116) { ExpectWord("true"); return JsonValue.NewBool(true); }
+        if (c == 102) { ExpectWord("false"); return JsonValue.NewBool(false); }
+        return ReadNumberOrDatetime();
+    }
+
+    /// 数组：跨行、注释、尾逗号都合法。
+    JsonValue ReadArray(int depth) {
+        JsonValue arr = JsonValue.NewArray();
+        pos = pos + 1;                                        // 消费 '['
+        while (pos < len) {
+            SkipWsNewlinesComments();
+            if (CurB() == 93) { pos = pos + 1; return arr; }  // ']'
+            if (pos >= len) { Err("unterminated array"); }
+            arr.Append(ReadValue(depth + 1));
+            SkipWsNewlinesComments();
+            int c = CurB();
+            if (c == 44) {                                    // ','
+                pos = pos + 1;
+                continue;
+            }
+            if (c == 93) { pos = pos + 1; return arr; }
+            Err("expected ',' or ']' in array");
+        }
+        Err("unterminated array");
+        return arr;
+    }
+
+    /// 行内表：{ k = v, ... }。规范要求单行，这里允许跨行（宽松）。
+    JsonValue ReadInlineTable(int depth) {
+        JsonValue obj = JsonValue.NewObject();
+        pos = pos + 1;                                        // 消费 '{'
+        SkipWsNewlinesComments();
+        if (CurB() == 125) { pos = pos + 1; return obj; }     // '}'
+        while (pos < len) {
+            ReadKeyValue(obj, false);
+            SkipWsNewlinesComments();
+            int c = CurB();
+            if (c == 44) {                                    // ','
+                pos = pos + 1;
+                SkipWsNewlinesComments();
+                continue;
+            }
+            if (c == 125) { pos = pos + 1; return obj; }
+            Err("expected ',' or '}' in inline table");
+        }
+        Err("unterminated inline table");
+        return obj;
+    }
+
+    /// 数字与四种日期时间共用一个 token 扫描：token 取
+    /// [0-9A-Za-z+-._:] 加"空格后跟数字"（datetime 的空格分隔形态），
+    /// 再按形态分类。下划线分隔符剥掉。
+    JsonValue ReadNumberOrDatetime() {
+        int start = pos;
+        while (pos < len) {
+            int c = s[pos] & 255;
+            bool tok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122) || c == 43 || c == 45
+                || c == 46 || c == 58 || c == 95;             // 数字字母 + - . : _
+            if (tok) {
+                pos = pos + 1;
+                continue;
+            }
+            if (c == 32 && pos + 1 < len) {                   // ' '
+                int nxt = s[pos + 1] & 255;
+                if (nxt >= 48 && nxt <= 57) {                 // datetime 空格分隔
+                    pos = pos + 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        if (pos == start) { Err("expected a value"); }
+        string tok = s.Substring(start, pos - start);
+        string t = TomlParser.Strip(tok, "_");
+        // 日期时间：以 4 位年份起头（YYYY-MM-DD...）或纯时间 HH:MM...
+        if (TomlParser.DateLike(t)) { return JsonValue.NewStr(tok); }
+        bool isInt = TomlParser.IntShape(t);
+        if (isInt) {
+            this.intOverflow = false;
+            long v = this.ParseIntBase(t);
+            if (this.intOverflow) { Err("integer out of 64-bit range: " + tok); }
+            return JsonValue.NewInt(v);
+        }
+        if (t == "inf" || t == "+inf") { return JsonValue.NewNum("Infinity"); }
+        if (t == "-inf") { return JsonValue.NewNum("-Infinity"); }
+        if (t == "nan" || t == "+nan" || t == "-nan") { return JsonValue.NewNum("NaN"); }
+        if (t.Length > 0 && (t[0] & 255) == 43) {
+            t = t.Substring(1, t.Length - 1);                 // DoubleOf 不收 '+'
+        }
+        double d = JsonValue.DoubleOf(t);
+        return JsonValue.NewDouble(d);
+    }
+
+    /// 基本字符串 "..."：转义 \b \t \n \f \r \" \\ \uXXXX \UXXXXXXXX。
+    string ReadBasicString() {
+        pos = pos + 1;                                        // 消费 '"'
+        StringBuilder sb = new StringBuilder();
+        while (pos < len) {
+            int c = s[pos] & 255;
+            if (c == 34) { pos = pos + 1; return sb.ToString(); }
+            if (c == 10) { Err("newline in basic string"); }
+            if (c == 92) {                                    // '\'
+                pos = pos + 1;
+                ReadEscape(sb);
+                continue;
+            }
+            AppendRun(sb, c);
+        }
+        Err("unterminated basic string");
+        return "";
+    }
+
+    /// 多行基本字符串 """..."""：开界定符后的首个换行剥掉；
+    /// 行尾反斜杠吃掉后续空白与换行（行拼接）。
+    string ReadMultilineBasic() {
+        pos = pos + 3;                                        // 消费 """
+        if (CurB() == 10) { pos = pos + 1; }                  // 首换行剥掉
+        else if (CurB() == 13 && pos + 1 < len && (s[pos + 1] & 255) == 10) {
+            pos = pos + 2;
+        }
+        StringBuilder sb = new StringBuilder();
+        while (pos < len) {
+            if (Has("\"\"\"")) {
+                // 内容里的 " 允许出现在界定符前："""" = 引号 + 收口。
+                if (pos + 3 < len && (s[pos + 3] & 255) == 34) {
+                    sb.Append("\"");
+                    pos = pos + 1;
+                    continue;
+                }
+                pos = pos + 3;
+                return sb.ToString();
+            }
+            int c = s[pos] & 255;
+            if (c == 92 && TomlParser.LineBackslash(s, pos, len)) {
+                // 行尾反斜杠：吃掉反斜杠 + 空白 + 换行。
+                pos = pos + 1;
+                while (pos < len) {
+                    int w = s[pos] & 255;
+                    if (w == 32 || w == 9 || w == 10 || w == 13) {
+                        pos = pos + 1;
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if (c == 92) {                                    // '\'
+                pos = pos + 1;
+                ReadEscape(sb);
+                continue;
+            }
+            AppendRun(sb, c);
+        }
+        Err("unterminated multi-line basic string");
+        return "";
+    }
+
+    /// 字面字符串 '...'：内容原样，无转义。
+    string ReadLiteralString() {
+        pos = pos + 1;
+        int start = pos;
+        while (pos < len) {
+            int c = s[pos] & 255;
+            if (c == 39) {                                    // '\''
+                string t = s.Substring(start, pos - start);
+                pos = pos + 1;
+                return t;
+            }
+            if (c == 10) { Err("newline in literal string"); }
+            pos = pos + 1;
+        }
+        Err("unterminated literal string");
+        return "";
+    }
+
+    /// 多行字面字符串 '''...'''：开界定符后的首个换行剥掉，内容原样。
+    string ReadMultilineLiteral() {
+        pos = pos + 3;
+        if (CurB() == 10) { pos = pos + 1; }
+        else if (CurB() == 13 && pos + 1 < len && (s[pos + 1] & 255) == 10) {
+            pos = pos + 2;
+        }
+        int start = pos;
+        while (pos < len) {
+            if (Has("'''")) {
+                if (pos + 3 < len && (s[pos + 3] & 255) == 39) {
+                    pos = pos + 1;                            // 内容里的 '
+                    continue;
+                }
+                string t = s.Substring(start, pos - start);
+                pos = pos + 3;
+                return t;
+            }
+            pos = pos + 1;
+        }
+        Err("unterminated multi-line literal string");
+        return "";
+    }
+
+    /// 把 path 各段在 owner 下导航/创建（中间段必须是表），写入末段。
+    void SetValue(JsonValue owner, List<string> path, JsonValue v) {
+        JsonValue t = owner;
+        for (int i = 0; i < path.Count - 1; i = i + 1) {
+            JsonValue nxt = t.Get(path[i]);
+            if (nxt == null) {
+                nxt = JsonValue.NewObject();
+                t.Set(path[i], nxt);
+            } else if (!nxt.IsObject()) {
+                Err("key '" + path[i] + "' is not a table");
+            }
+            t = nxt;
+        }
+        t.Set(path[path.Count - 1], v);
+    }
+
+    /// 表头导航：中间段沿表走（遇数组取末元素——[[fruit]] 后的
+    /// [fruit.physical] 语义）；末段按表/表数组取或建。普通表头的
+    /// 重复定义查重在这里做：去重键带数组元素序号，不同元素下的
+    /// 同名子表互不冲突；表数组头（arrayTable）本身允许重复，不查。
+    JsonValue NavigateHeader(List<string> path, bool arrayTable) {
+        JsonValue t = root;
+        StringBuilder kb = new StringBuilder();
+        for (int i = 0; i < path.Count - 1; i = i + 1) {
+            JsonValue nxt = t.Get(path[i]);
+            if (nxt == null) {
+                nxt = JsonValue.NewObject();
+                t.Set(path[i], nxt);
+            } else if (nxt.IsArray() && nxt.Count() > 0
+                && nxt.At(nxt.Count() - 1).IsObject()) {
+                int idx = nxt.Count() - 1;
+                nxt = nxt.At(idx);                            // 上一个表数组元素
+                kb.Append("\u0001");
+                kb.Append(path[i]);
+                kb.Append("#" + Convert.ToString(idx));
+                t = nxt;
+                continue;
+            } else if (!nxt.IsObject()) {
+                Err("'" + path[i] + "' is not a table");
+            }
+            kb.Append("\u0001");
+            kb.Append(path[i]);
+            t = nxt;
+        }
+        string last = path[path.Count - 1];
+        JsonValue dest = t.Get(last);
+        if (arrayTable) {
+            if (dest == null) {
+                dest = JsonValue.NewArray();
+                t.Set(last, dest);
+            } else if (!dest.IsArray()) {
+                Err("'" + last + "' is not an array of tables");
+            }
+            JsonValue elem = JsonValue.NewObject();
+            dest.Append(elem);
+            return elem;
+        }
+        if (dest == null) {
+            dest = JsonValue.NewObject();
+            t.Set(last, dest);
+        } else if (!dest.IsObject()) {
+            Err("'" + last + "' is not a table");
+        }
+        // 无论新建还是复用都要登记：只登记复用分支会让首个定义漏记，
+        // 第二次同名表头查不到重、第三次才报错。
+        kb.Append("\u0001");
+        kb.Append(last);
+        string key = kb.ToString();
+        if (headers.ContainsKey(key)) {
+            Err("table defined twice: " + key);
+        }
+        headers[key] = true;
+        return dest;
+    }
+
+    /// 行尾收口：水平空白 + 可选注释，然后必须换行或 EOF。
+    void EndOfLine(string what) {
+        SkipH();
+        if (CurB() == 35) {                                   // '#'
+            while (pos < len && (s[pos] & 255) != 10) { pos = pos + 1; }
+        }
+        if (pos >= len) { return; }
+        int c = CurB();
+        if (c == 10) { pos = pos + 1; return; }
+        if (c == 13) {
+            pos = pos + 1;
+            if (pos < len && (s[pos] & 255) == 10) { pos = pos + 1; }
+            return;
+        }
+        Err("unexpected content after " + what);
+    }
+
+    void SkipWsNewlinesComments() {
+        while (pos < len) {
+            int c = s[pos] & 255;
+            if (c == 32 || c == 9 || c == 10 || c == 13) {
+                pos = pos + 1;
+            } else if (c == 35) {                             // '#'
+                while (pos < len && (s[pos] & 255) != 10) { pos = pos + 1; }
+            } else {
+                return;
+            }
+        }
+    }
+
+    void SkipH() {
+        while (pos < len) {
+            int c = s[pos] & 255;
+            if (c == 32 || c == 9) { pos = pos + 1; } else { return; }
+        }
+    }
+
+    int CurB() {
+        if (pos >= len) { return -1; }
+        return s[pos] & 255;
+    }
+
+    bool Has(string lit) {
+        int n = lit.Length;
+        if (pos + n > len) { return false; }
+        for (int i = 0; i < n; i = i + 1) {
+            if ((s[pos + i] & 255) != (lit[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    void ExpectWord(string word) {
+        if (!Has(word)) { Err("invalid value"); }
+        pos = pos + word.Length;
+    }
+
+    /// 转义体：pos 指在 '\' 之后，读一个转义并追加进 sb。
+    void ReadEscape(StringBuilder sb) {
+        if (pos >= len) { Err("unterminated escape"); }
+        int c = s[pos] & 255;
+        pos = pos + 1;
+        if (c == 98) { sb.Append(Encoding.CharFromCode(8)); }         // \b
+        else if (c == 116) { sb.Append("\t"); }                       // \t
+        else if (c == 110) { sb.Append("\n"); }                       // \n
+        else if (c == 102) { sb.Append(Encoding.CharFromCode(12)); }  // \f
+        else if (c == 114) { sb.Append("\r"); }                       // \r
+        else if (c == 34) { sb.Append("\""); }
+        else if (c == 92) { sb.Append("\\"); }
+        else if (c == 117 || c == 85) {                               // \u \U
+            int digits = c == 117 ? 4 : 8;
+            if (pos + digits > len) { Err("truncated \\u escape"); }
+            int cp = 0;
+            for (int i = 0; i < digits; i = i + 1) {
+                int d = TomlParser.HexVal(s[pos + i] & 255);
+                if (d < 0) { Err("bad hex digit in \\u escape"); }
+                cp = cp * 16 + d;
+            }
+            pos = pos + digits;
+            if (cp == 0 || (cp >= 55296 && cp <= 57343)) {
+                Err("escape cannot be represented");
+            }
+            sb.Append(Encoding.Utf8FromCodePoint(cp));
+        } else {
+            Err("unknown escape \\" + s.Substring(pos - 1, 1));
+        }
+    }
+
+    /// 非 ASCII 字节整段追加（多字节 UTF-8 不可逐字节 Substring）。
+    void AppendRun(StringBuilder sb, int firstByte) {
+        int start = pos;
+        pos = pos + 1;
+        if (firstByte < 128) {
+            sb.Append(s.Substring(start, 1));
+            return;
+        }
+        while (pos < len && (s[pos] & 255) >= 128) { pos = pos + 1; }
+        sb.Append(s.Substring(start, pos - start));
+    }
+
+    void Err(string msg) {
+        int line = 1;
+        int col = 1;
+        int stop = pos < len ? pos : len;
+        for (int i = 0; i < stop; i = i + 1) {
+            if ((s[i] & 255) == 10) {
+                line = line + 1;
+                col = 1;
+            } else {
+                col = col + 1;
+            }
+        }
+        throw new TomlException(msg + " at line "
+            + Convert.ToString(line) + ", column " + Convert.ToString(col));
+    }
+
+    // ---- token 分类与进制解析（静态助手）----
+
+    /// 是否日期/时间形态：YYYY-MM-DD 起头，或 HH:MM 起头。
+    static bool DateLike(string t) {
+        if (t.Length >= 10 && TomlParser.Digits(t, 0, 4)
+            && (t[4] & 255) == 45 && TomlParser.Digits(t, 5, 2)
+            && (t[7] & 255) == 45 && TomlParser.Digits(t, 8, 2)) {
+            return true;
+        }
+        if (t.Length >= 5 && TomlParser.Digits(t, 0, 2)
+            && (t[2] & 255) == 58 && TomlParser.Digits(t, 3, 2)) {
+            return true;
+        }
+        return false;
+    }
+
+    static bool Digits(string t, int from, int n) {
+        if (from + n > t.Length) { return false; }
+        for (int i = 0; i < n; i = i + 1) {
+            int c = t[from + i] & 255;
+            if (c < 48 || c > 57) { return false; }
+        }
+        return true;
+    }
+
+    /// 整数形态：[+-]? (0x|0o|0b)? 数字串（下划线已剥）。
+    static bool IntShape(string t) {
+        int i = 0;
+        if (i < t.Length && ((t[i] & 255) == 43 || (t[i] & 255) == 45)) {
+            i = i + 1;
+        }
+        int rest = t.Length - i;
+        if (rest == 0) { return false; }
+        if (rest > 2 && (t[i] & 255) == 48) {
+            int k = (t[i + 1] & 255);
+            if (k == 120 || k == 111 || k == 98) { return true; }     // 0x 0o 0b
+        }
+        for (int j = i; j < t.Length; j = j + 1) {
+            int c = t[j] & 255;
+            if (c < 48 || c > 57) { return false; }
+        }
+        return true;
+    }
+
+    /// 按前缀进制解析整数（0x 十六进制、0o 八进制、0b 二进制、其余
+    /// 十进制）。溢出置 intOverflow 哨兵并返回 0；-2^63 的补码边界
+    /// 单独识别（幅值 2^63 比正侧上限多 1，先于常规累加撞线）。
+    long ParseIntBase(string t) {
+        int i = 0;
+        bool neg = false;
+        if (i < t.Length && ((t[i] & 255) == 43 || (t[i] & 255) == 45)) {
+            neg = (t[i] & 255) == 45;
+            i = i + 1;
+        }
+        int baseN = 10;
+        if (i + 1 < t.Length && (t[i] & 255) == 48) {
+            int k = t[i + 1] & 255;
+            if (k == 120) { baseN = 16; i = i + 2; }
+            else if (k == 111) { baseN = 8; i = i + 2; }
+            else if (k == 98) { baseN = 2; i = i + 2; }
+        }
+        if (i >= t.Length) { return 0; }
+        if (neg && baseN == 10 && t.Substring(i, t.Length - i) == "9223372036854775808") {
+            return long.MinValue;
+        }
+        long acc = 0;
+        while (i < t.Length) {
+            int d = TomlParser.HexVal(t[i] & 255);
+            if (d < 0 || d >= baseN) { return 0; }
+            if (acc > (TomlParser.MaxLong - d) / baseN) {
+                this.intOverflow = true;
+                return 0;
+            }
+            acc = acc * baseN + d;
+            i = i + 1;
+        }
+        return neg ? -acc : acc;
+    }
+
+    static string Strip(string t, string cut) {
+        if (TomlParser.IndexOf(t, cut, 0) < 0) { return t; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < t.Length; i = i + 1) {
+            bool hit = false;
+            for (int j = 0; j < cut.Length; j = j + 1) {
+                if ((t[i] & 255) == (cut[j] & 255)) { hit = true; break; }
+            }
+            if (!hit) { sb.Append(t.Substring(i, 1)); }
+        }
+        return sb.ToString();
+    }
+
+    static int HexVal(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 87; }
+        if (c >= 65 && c <= 70) { return c - 55; }
+        return -1;
+    }
+
+    static int IndexOf(string s, string needle, int from) {
+        int n = s.Length;
+        int m = needle.Length;
+        for (int i = from; i <= n - m; i = i + 1) {
+            int j = 0;
+            while (j < m && (s[i + j] & 255) == (needle[j] & 255)) {
+                j = j + 1;
+            }
+            if (j == m) { return i; }
+        }
+        return -1;
+    }
+
+    /// 反斜杠后是否跟"到行尾只有空白"（行拼接形态）。
+    static bool LineBackslash(string s, int pos, int len) {
+        int i = pos + 1;
+        while (i < len) {
+            int c = s[i] & 255;
+            if (c == 32 || c == 9) {
+                i = i + 1;
+                continue;
+            }
+            return c == 10 || c == 13;
+        }
+        return false;
+    }
+
+    static string JoinPath(List<string> path) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < path.Count; i = i + 1) {
+            if (i > 0) { sb.Append("\u0001"); }
+            sb.Append(path[i]);
+        }
+        return sb.ToString();
+    }
+}
