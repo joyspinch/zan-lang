@@ -1095,7 +1095,11 @@ __attribute__((constructor)) static void zan__crash_ctor(void) {
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#if defined(__GLIBC__) || defined(__APPLE__)
+#if (defined(__GLIBC__) || defined(__APPLE__)) && !defined(ZAN_NO_EXECINFO)
+/* ZAN_NO_EXECINFO: the static GUI driver archive is built on glibc hosts but
+ * linked by zanc against the musl sysroot (all linux publishes are
+ * musl-static), so it must not carry glibc-only backtrace symbols; the
+ * dladdr/frame-walk path below is what musl builds use anyway. */
 #include <execinfo.h>
 #define ZAN_CRASH_HAVE_BACKTRACE 1
 #endif

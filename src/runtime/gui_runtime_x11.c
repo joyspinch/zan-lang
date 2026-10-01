@@ -77,7 +77,7 @@ static void x11_set_scale_metrics(int scale) {
  * queue. Slots: [kind, x, y, button, keycode, mods, 0, 0]. */
 #define ZAN_EVQ_CAP 64
 static int g_evq_linux[ZAN_EVQ_CAP][8];
-static int evq_head_linux = 0, g_evq_tail_linux = 0;
+static int g_evq_head_linux = 0, g_evq_tail_linux = 0;
 
 /* Monotonic counter bumped every time an event is delivered into
  * g_pending_event_linux. Event getters return the LAST event even when no

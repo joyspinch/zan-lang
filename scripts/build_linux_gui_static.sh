@@ -43,11 +43,27 @@ FT_CFLAGS="$(pkg-config --cflags freetype2 2>/dev/null || echo "-I/usr/include/f
 # -DNDEBUG drops the vendored libs' assert() strings (their __FILE__ would
 # leak build-machine paths into every static publish); -ffunction-sections
 # pairs with the publish link's --gc-sections, which on ELF really prunes.
-$CC -O2 -g0 -DNDEBUG -ffunction-sections -fdata-sections -fPIC -std=c11 \
+# -std=gnu11: the TU pulls in rt_crash.h + gui_runtime_x11.c, which need
+# siginfo_t/SA_SIGINFO/CLOCK_MONOTONIC/strdup -- strict -std=c11 hides those
+# declarations and the compile fails. -U_FORTIFY_SOURCE: distro gcc enables
+# _FORTIFY_SOURCE by default at -O, emitting __memcpy_chk/__snprintf_chk
+# references that the musl sysroot zanc links every linux publish with cannot
+# resolve. -DZAN_NO_EXECINFO: same for backtrace() -- rt_crash.h falls back to
+# its dladdr/frame-walk path (what musl builds use anyway), keeping the
+# archive linkable on musl.
+$CC -O2 -g0 -DNDEBUG -ffunction-sections -fdata-sections -fPIC -std=gnu11 \
+    -U_FORTIFY_SOURCE -DZAN_NO_EXECINFO \
     -DZAN_GUI_STATIC -DZAN_GUI_FREETYPE \
     $FT_CFLAGS \
     -I"$ROOT/src/runtime" \
     -c "$ROOT/src/runtime/gui_runtime.c" -o "$WORK/zan_gui_${ARCH_SUFFIX}.o"
+
+echo "== [1b] Compiling fortify/link shims =="
+# -U_FORTIFY_SOURCE is mandatory here: with it, this file's own memcpy/... would
+# be rewritten to the very __*_chk symbols it exists to provide.
+$CC -O2 -g0 -ffunction-sections -fdata-sections -fPIC -std=gnu11 \
+    -U_FORTIFY_SOURCE \
+    -c "$ROOT/src/runtime/zan_fortify_compat.c" -o "$WORK/zan_fortify_compat.o"
 
 echo "== [2/3] Extracting static X11 system objects =="
 X_OBJS_DIR="$WORK/x_objs"
@@ -66,11 +82,18 @@ find_static_lib() {
     return 1
 }
 
-for lib in libX11.a libXau.a libxcb.a; do
+# Extract into one subdirectory per archive: member names collide across them
+# (libX11.a and libXdmcp.a both carry a Flush.o -- XFlush vs XdmcpFlush), and a
+# shared directory silently overwrites one library's object with the other's.
+i=0
+for lib in libX11.a libXau.a libxcb.a libXdmcp.a; do
     LIBPATH="$(find_static_lib "$lib" || true)"
     if [ -n "$LIBPATH" ]; then
+        i=$((i+1))
+        LIBDIR="$X_OBJS_DIR/$i"
+        mkdir -p "$LIBDIR"
         echo "Extracting $LIBPATH..."
-        (cd "$X_OBJS_DIR" && $AR x "$LIBPATH")
+        (cd "$LIBDIR" && $AR x "$LIBPATH")
     else
         echo "Notice: $lib not found under /usr/lib/$TRIPLET, skipping extraction"
     fi
@@ -78,7 +101,7 @@ done
 
 echo "== [3/3] Creating merged static archive libzan_gui.a =="
 rm -f "$DEST/libzan_gui.a"
-$AR rcs "$DEST/libzan_gui.a" "$WORK/zan_gui_${ARCH_SUFFIX}.o" "$X_OBJS_DIR"/*.o 2>/dev/null || \
-$AR rcs "$DEST/libzan_gui.a" "$WORK/zan_gui_${ARCH_SUFFIX}.o"
+$AR rcs "$DEST/libzan_gui.a" "$WORK/zan_gui_${ARCH_SUFFIX}.o" "$WORK/zan_fortify_compat.o" "$X_OBJS_DIR"/*/*.o 2>/dev/null || \
+$AR rcs "$DEST/libzan_gui.a" "$WORK/zan_gui_${ARCH_SUFFIX}.o" "$WORK/zan_fortify_compat.o"
 
 echo "Successfully generated $DEST/libzan_gui.a"
