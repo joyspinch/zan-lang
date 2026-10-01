@@ -1,5 +1,8 @@
 # Zan.Platform.Compat - 早期平台 API 历史兼容包
 
+> **成熟度：冻结** —— 历史兼容转发层：只保证旧代码编译通过，不加新能力、
+> 不配独立测试；新代码请直接用标准库 `System.OperatingSystem`/`Environment`。
+
 `Zan.Platform.Compat` 是为兼容 Zan 早期历史代码而提供的 API 转发层。
 
 在 Zan 0.2 早期版本中，系统环境与操作系统判断曾位于 `Platform.Runtime` 命名空间。新版本已全面对齐现代标准，将跨平台能力统一收敛至标准库的 `System.OperatingSystem` 与 `System.Environment`。

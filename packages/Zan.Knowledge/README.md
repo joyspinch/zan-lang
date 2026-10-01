@@ -1,5 +1,8 @@
 # Zan.Knowledge
 
+> **成熟度：实验性** —— 由仓库内 CLI/MCP 工具链消费，但尚无 conformance 测试锁；
+> 接口可能随工具链调整。
+
 设计器知识库：gallery 索引与 Zform schema 生成（CLI 与 MCP server 共用的
 source-driven 产物与告警）。`using System.Knowledge;` 按需拉入，
 命名空间保留零破坏。

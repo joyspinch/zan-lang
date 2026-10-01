@@ -1,5 +1,8 @@
 # Zan.Mvc — ZanWeb Web MVC Framework
 
+> **成熟度：迁移中** —— server 系列模板正从平行框架副本迁入本包
+> （TASKS.md B-ID37）；迁移与用例补齐前不建议新项目采用。
+
 Enterprise web application skeleton modeled on a production swoole (ZxPHP)
 framework, rebuilt on Zan's coroutine runtime — a layered controller/model
 structure, an external config file, and the ORM and cache wired in by default.
