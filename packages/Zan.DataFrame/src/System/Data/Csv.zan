@@ -1,0 +1,200 @@
+using System;
+
+namespace System.Data;
+
+/// <summary>
+/// RFC 4180 CSV 解析与写出。
+///
+/// 解析按字节进行（Zan 字符串即 UTF-8 字节），多字节字符原样保留：
+///  - 字段分隔符为逗号；记录分隔符为 CRLF、LF 或 CR；
+///  - 引号字段（以 '"' 起始）可包含逗号与换行，'"' 转义为两个 '"'；
+///  - 输入开头的 UTF-8 BOM（EF BB BF）被剥除；
+///  - 末尾的记录分隔符不产生空记录；文本结束后无换行的最后一条
+///    记录正常收尾；
+///  - 字段两侧的空白按规范属于字段本身，不做裁剪。
+///
+/// 写出（Escape/RowToText）与解析严格互逆：含逗号、引号或换行的
+/// 字段加引号，字段内引号翻倍。
+///
+///   CsvTable t = Csv.Parse(File.ReadAllText("data.csv"));
+///   List<string> cells = Csv.ParseRow("1,\"a,b\",3");
+///   string line = Csv.RowToText(fields);
+/// </summary>
+class Csv {
+    /// <summary>解析整段 CSV 文本为表：调用方约定首记录为表头
+    /// （本层不做该假设）。空文本返回零行表。</summary>
+    static CsvTable Parse(string text) {
+        CsvTable t = new CsvTable();
+        int n = text.Length;
+        int i = 0;
+        if (n >= 3 && (text[0] & 255) == 239 && (text[1] & 255) == 187
+            && (text[2] & 255) == 191) {
+            i = 3;                                  // UTF-8 BOM
+        }
+        List<string> rec = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        bool dirty = false;                         // 当前记录已有内容
+        while (i < n) {
+            int c = text[i] & 255;
+            if (c == 34) {                          // '"'
+                if (sb.Length == 0) {
+                    // 字段起始的引号：进入引号模式直到配对的闭引号。
+                    dirty = true;
+                    i = i + 1;
+                    while (i < n) {
+                        int q = text[i] & 255;
+                        if (q == 34) {
+                            if (i + 1 < n && (text[i + 1] & 255) == 34) {
+                                sb.Append("\"");
+                                i = i + 2;
+                            } else {
+                                i = i + 1;
+                                break;
+                            }
+                        } else {
+                            int start = i;
+                            while (i < n && (text[i] & 255) != 34) {
+                                i = i + 1;
+                            }
+                            sb.Append(text.Substring(start, i - start));
+                        }
+                    }
+                } else {
+                    // 字段中途的引号（ab"cd）：按规范外字符原样收下。
+                    sb.Append("\"");
+                    i = i + 1;
+                    dirty = true;
+                }
+                continue;
+            }
+            if (c == 44) {                          // ',' 字段结束
+                rec.Add(sb.ToString());
+                sb.Clear();
+                dirty = true;
+                i = i + 1;
+                continue;
+            }
+            if (c == 13 || c == 10) {               // CR/LF 记录结束
+                if (c == 13 && i + 1 < n && (text[i + 1] & 255) == 10) {
+                    i = i + 2;
+                } else {
+                    i = i + 1;
+                }
+                rec.Add(sb.ToString());
+                sb.Clear();
+                if (t.header.Count == 0 && t.rows.Count == 0) {
+                    t.header = rec;                 // 首记录即表头
+                } else {
+                    t.rows.Add(rec);
+                }
+                rec = new List<string>();
+                dirty = false;
+                continue;
+            }
+            int begin = i;
+            while (i < n) {
+                int d = text[i] & 255;
+                if (d == 44 || d == 13 || d == 10 || d == 34) { break; }
+                i = i + 1;
+            }
+            sb.Append(text.Substring(begin, i - begin));
+            dirty = true;
+        }
+        if (dirty) {
+            rec.Add(sb.ToString());
+            if (t.header.Count == 0 && t.rows.Count == 0) {
+                t.header = rec;                     // 无换行收尾的单记录文本
+            } else {
+                t.rows.Add(rec);
+            }
+        }
+        return t;
+    }
+
+    /// <summary>解析单行记录（无引号内换行的场景，如命令行工具的
+    /// CSV 输出）。单记录文本没有表头概念，首记录按数据返回；
+    /// 空行或 null 返回空列表。</summary>
+    static List<string> ParseRow(string line) {
+        if (line == null) { return new List<string>(); }
+        CsvTable t = Csv.Parse(line);
+        if (t.rows.Count > 0) { return t.rows[0]; }
+        if (t.header.Count > 0) { return t.header; }
+        return new List<string>();
+    }
+
+    /// <summary>写出单个字段：含逗号、引号或换行时加引号，
+    /// 字段内引号翻倍；其余原样返回。</summary>
+    static string Escape(string field) {
+        bool need = false;
+        int n = field.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = field[i] & 255;
+            if (c == 44 || c == 34 || c == 13 || c == 10) {
+                need = true;
+                break;
+            }
+        }
+        if (!need) { return field; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("\"");
+        for (int i = 0; i < n; i = i + 1) {
+            if ((field[i] & 255) == 34) {
+                sb.Append("\"\"");
+            } else {
+                sb.Append(field.Substring(i, 1));
+            }
+        }
+        sb.Append("\"");
+        return sb.ToString();
+    }
+
+    /// <summary>把一条记录写为一行（不含行尾换行符）。</summary>
+    static string RowToText(List<string> fields) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append(Csv.Escape(fields[i]));
+        }
+        return sb.ToString();
+    }
+}
+
+/// <summary>一次 CSV 解析的结果：调用方约定 header 为首记录，
+/// rows 为其后各记录（本层不做该假设，两者都是普通记录）。</summary>
+class CsvTable {
+    /// 首记录（约定为表头）。
+    List<string> header;
+    /// 其余各记录；每条记录的字段数可能与表头不一致（宽松解析）。
+    List<List<string>> rows;
+
+    CsvTable() {
+        this.header = new List<string>();
+        this.rows = new List<List<string>>();
+    }
+
+    /// 表头记录（未解析出任何记录时为空列表）。
+    List<string> Header() { return this.header; }
+
+    /// 数据记录列表。
+    List<List<string>> Rows() { return this.rows; }
+
+    /// 数据行数（不含表头）。
+    int RowCount() { return this.rows.Count; }
+
+    /// <summary>按表头名取整列；名字不存在时返回 null。
+    /// 只在行数一致的规整表上有列语义。</summary>
+    List<string> Column(string name) {
+        int at = -1;
+        for (int i = 0; i < this.header.Count; i = i + 1) {
+            if (this.header[i] == name) { at = i; break; }
+        }
+        if (at < 0) { return null; }
+        List<string> col = new List<string>();
+        for (int r = 0; r < this.rows.Count; r = r + 1) {
+            List<string> row = this.rows[r];
+            if (at < row.Count) { col.Add(row[at]); }
+            else { col.Add(""); }
+        }
+        return col;
+    }
+}

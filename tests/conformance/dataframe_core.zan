@@ -1,0 +1,143 @@
+// System.Data DataFrame 冒烟：RFC4180 解析（BOM/引号转义/引号内换行/
+// 中文）、逐列类型推断、Filter、稳定 SortBy、GroupBy+聚合、哈希 Join
+// （含右表撞名 _1 后缀）与 ToCsv 往返。纯 Zan，无原生依赖。
+using System;
+using System.Data;
+
+namespace Conf;
+
+class Prog {
+    static int Main() {
+        try {
+            return Prog.Run();
+        } catch (Exception e) {
+            Console.WriteLine("threw: " + e.ToString());
+            return 1;
+        }
+    }
+
+    static int Run() {
+        int bad = 0;
+
+        // ---- CSV 解析：BOM 剥除 + 引号转义 + 引号内换行 + 中文 ----
+        byte[] bomBytes = Convert.FromBase64String("77u/");
+        string bom = bomBytes == null ? "" : bomBytes.ToStr(0, 3);
+        string csv = bom + "name,note,qty\r\n"
+            + "\"Jiang, Mr.\",\"said \"\"hi\"\"\",3\r\n"
+            + "杭州,\"line1\nline2\",5\r\n";
+        DataFrame raw = DataFrame.FromCsv(csv);
+        if (raw.Rows() != 2) { bad = bad + 1; }
+        if (raw.ColCount() != 3) { bad = bad + 1; }
+        if (raw.GetStr(0, "name") != "Jiang, Mr.") { bad = bad + 1; }
+        if (raw.GetStr(0, "note") != "said \"hi\"") { bad = bad + 1; }
+        if (raw.GetStr(1, "name") != "杭州") { bad = bad + 1; }
+        if (raw.GetStr(1, "note") != "line1\nline2") { bad = bad + 1; }
+        if (raw.GetInt(1, "qty") != 5L) { bad = bad + 1; }
+        // 类型推断：qty 全整数 → Int；其余 → Str
+        if (raw.Kind("qty") != ColKind.Int) { bad = bad + 1; }
+        if (raw.Kind("name") != ColKind.Str) { bad = bad + 1; }
+
+        // ---- 销售表：过滤 / 稳定排序 / 分组聚合 ----
+        DataFrame sales = DataFrame.FromCsv(
+            "city,qty,price\r\n"
+            + "beijing,3,2.5\r\n"
+            + "shanghai,5,1.5\r\n"
+            + "beijing,4,3.0\r\n"
+            + "hangzhou,2,9.9\r\n"
+            + "shanghai,1,2.0\r\n");
+        if (sales.Rows() != 5) { bad = bad + 1; }
+        if (sales.Kind("price") != ColKind.Float) { bad = bad + 1; }
+
+        DataFrame big = sales.Filter((int row) => sales.GetFloat(row, "qty") > 1.0);
+        if (big.Rows() != 4) { bad = bad + 1; }
+
+        // 按 city 升序，稳定：beijing 两行保持 2.5 在 3.0 前的原相对顺序
+        DataFrame byCity = big.SortBy("city", false);
+        Console.WriteLine("sorted: " + byCity.GetStr(0, "city") + "/"
+            + Convert.ToString(byCity.GetFloat(0, "price")) + " "
+            + byCity.GetStr(1, "city") + "/"
+            + Convert.ToString(byCity.GetFloat(1, "price")) + " "
+            + byCity.GetStr(2, "city") + " "
+            + byCity.GetStr(3, "city") + "/"
+            + Convert.ToString(byCity.GetFloat(3, "price")));
+        if (byCity.GetStr(0, "city") != "beijing"
+            || byCity.GetStr(1, "city") != "beijing") { bad = bad + 1; }
+        if (byCity.GetFloat(0, "price") != 2.5 || byCity.GetFloat(1, "price") != 3.0) {
+            bad = bad + 1;
+        }
+        if (byCity.GetFloat(2, "price") != 9.9) { bad = bad + 1; }
+        // 过滤后仅剩的一行 shanghai 排在末位
+        if (byCity.GetStr(3, "city") != "shanghai"
+            || byCity.GetFloat(3, "price") != 1.5) { bad = bad + 1; }
+
+        // 降序按 price
+        DataFrame byPrice = big.SortBy("price", true);
+        if (byPrice.GetFloat(0, "price") != 9.9
+            || byPrice.GetFloat(3, "price") != 1.5) { bad = bad + 1; }
+
+        // 分组聚合：beijing sum(qty)=7 avg(price)=2.75；
+        // shanghai sum(qty)=5 avg(price)=1.75；hangzhou sum=2 avg=9.9
+        List<RowGroup> gs = big.GroupBy("city");
+        if (gs.Count != 3) { bad = bad + 1; }
+        for (int i = 0; i < gs.Count; i = i + 1) {
+            RowGroup g = gs[i];
+            Console.WriteLine("group " + g.Key() + " n="
+                + Convert.ToString(g.Count()) + " sumQty="
+                + Convert.ToString(big.Sum(g.Rows(), "qty")) + " avgPrice="
+                + Convert.ToString(big.Avg(g.Rows(), "price")));
+        }
+        if (gs[0].Key() != "beijing" || big.Sum(gs[0].Rows(), "qty") != 7.0) {
+            bad = bad + 1;
+        }
+        if (big.Avg(gs[0].Rows(), "price") != 2.75) { bad = bad + 1; }
+        if (gs[1].Key() != "shanghai" || big.Sum(gs[1].Rows(), "qty") != 5.0) {
+            bad = bad + 1;
+        }
+        if (gs[2].Key() != "hangzhou" || big.Max(gs[2].Rows(), "price") != 9.9) {
+            bad = bad + 1;
+        }
+        if (big.Min(big.AllRows(), "price") != 1.5) { bad = bad + 1; }
+        if (big.Aggregate(big.AllRows(), "price", Agg.Count) != 4.0) { bad = bad + 1; }
+
+        // ---- Join：内连接 + 右表撞名列加 _1 ----
+        DataFrame pop = DataFrame.FromCsv("city,pop\r\nbeijing,2100\r\nshanghai,2400\r\n");
+        DataFrame joined = big.Join(pop, "city", "city");
+        if (joined.Rows() != 3) { bad = bad + 1; }          // hangzhou 无人口被丢弃
+        if (joined.ColCount() != 4) { bad = bad + 1; }
+        if (joined.GetStr(0, "city") != "beijing"
+            || joined.GetInt(0, "pop") != 2100L) { bad = bad + 1; }
+        if (joined.GetStr(1, "city") != "shanghai"
+            || joined.GetInt(1, "pop") != 2400L) { bad = bad + 1; }
+        if (joined.GetInt(2, "pop") != 2100L) { bad = bad + 1; }
+
+        DataFrame prices = DataFrame.FromCsv("city,price\r\nbeijing,9\r\nshanghai,8\r\n");
+        DataFrame clash = big.Join(prices, "city", "city");
+        if (clash.ColCount() != 4) { bad = bad + 1; }
+        if (clash.Kind("price_1") != ColKind.Int) { bad = bad + 1; }
+        if (clash.GetStr(0, "city") != "beijing" || clash.GetInt(0, "price_1") != 9L) {
+            bad = bad + 1;
+        }
+
+        // ---- ToCsv 往返：需引号字段（逗号/引号/换行）写出后再解析等价 ----
+        DataFrame weird = DataFrame.New();
+        weird.AddColumn("label", ColKind.Str);
+        weird.AddColumn("v", ColKind.Int);
+        weird.AddStrRow("a,b", "1");
+        weird.AddStrRow("say \"hi\"", "2");
+        weird.AddStrRow("多\n行", "3");
+        string text = weird.ToCsv();
+        DataFrame back = DataFrame.FromCsv(text);
+        if (back.Rows() != 3) { bad = bad + 1; }
+        if (back.GetStr(0, "label") != "a,b"
+            || back.GetStr(1, "label") != "say \"hi\""
+            || back.GetStr(2, "label") != "多\n行") { bad = bad + 1; }
+        if (back.GetInt(2, "v") != 3L) { bad = bad + 1; }
+
+        if (bad == 0) {
+            Console.WriteLine("df-ok: 1");
+        } else {
+            Console.WriteLine("df-ok: 0");
+        }
+        return 0;
+    }
+}

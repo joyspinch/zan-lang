@@ -1,0 +1,648 @@
+using System;
+
+namespace System.Data;
+
+/// 列的类型。CSV 装载时按整列内容推断：全部像整数 → Int，
+/// 全部像数值 → Float，否则 Str。
+enum ColKind {
+    Str,
+    Int,
+    Float
+}
+
+/// 聚合操作。Count 只看行数，与列值无关。
+enum Agg {
+    Sum,
+    Avg,
+    Min,
+    Max,
+    Count
+}
+
+/// 行谓词：接收行号，返回该行是否保留。闭包可捕获 DataFrame
+/// 自身来读取单元格值。
+delegate bool RowFn(int row);
+
+/// 行号比较器（SortBy 的排序键）。
+delegate int RowCmpFn(int a, int b);
+
+/// 一列的列存：按 kind 只使用对应的那个列表（Int 用 ints、
+/// Float 用 nums、Str 用 text），其余保持 null 不占内存。
+class DataCol {
+    /// 列名（来自 CSV 表头或 AddColumn）。
+    string name;
+    /// 列类型（ColKind 值）。
+    int kind;
+    /// Str 列的存储。
+    List<string> text;
+    /// Int 列的存储。
+    List<long> ints;
+    /// Float 列的存储。
+    List<double> nums;
+
+    static DataCol Create(string colName, int colKind) {
+        DataCol c = new DataCol();
+        c.name = colName;
+        c.kind = colKind;
+        if (colKind == ColKind.Str) { c.text = new List<string>(); }
+        else if (colKind == ColKind.Int) { c.ints = new List<long>(); }
+        else { c.nums = new List<double>(); }
+        return c;
+    }
+
+    string Name() { return this.name; }
+    int Kind() { return this.kind; }
+    int Count() {
+        if (this.kind == ColKind.Str) { return this.text.Count; }
+        if (this.kind == ColKind.Int) { return this.ints.Count; }
+        return this.nums.Count;
+    }
+
+    /// 追加一个单元格，值按本列类型转换（跨类型写入按
+    /// GetStr/SetStr 的转换语义）。
+    void Append(string v) {
+        if (this.kind == ColKind.Str) { this.text.Add(v); }
+        else if (this.kind == ColKind.Int) { this.ints.Add(v.ToInt64()); }
+        else { this.nums.Add(Convert.ToDouble(v)); }
+    }
+
+    void AppendLong(long v) {
+        if (this.kind == ColKind.Str) {
+            this.text.Add(Convert.ToString(v));
+        } else if (this.kind == ColKind.Int) {
+            this.ints.Add(v);
+        } else {
+            this.nums.Add((double)v);
+        }
+    }
+
+    void AppendDouble(double v) {
+        if (this.kind == ColKind.Str) {
+            this.text.Add(Convert.ToString(v));
+        } else if (this.kind == ColKind.Int) {
+            this.ints.Add((long)v);
+        } else {
+            this.nums.Add(v);
+        }
+    }
+
+    /// 追加同类型列在 srcRow 行的值（要求两列 kind 相同）。
+    void AppendFrom(DataCol src, int srcRow) {
+        if (this.kind == ColKind.Str) { this.text.Add(src.text[srcRow]); }
+        else if (this.kind == ColKind.Int) { this.ints.Add(src.ints[srcRow]); }
+        else { this.nums.Add(src.nums[srcRow]); }
+    }
+
+    /// 覆盖 row 行（必须已存在）。
+    void PutStr(int row, string v) {
+        if (this.kind == ColKind.Str) { this.text[row] = v; }
+        else if (this.kind == ColKind.Int) { this.ints[row] = v.ToInt64(); }
+        else { this.nums[row] = Convert.ToDouble(v); }
+    }
+
+    void PutLong(int row, long v) {
+        if (this.kind == ColKind.Str) { this.text[row] = Convert.ToString(v); }
+        else if (this.kind == ColKind.Int) { this.ints[row] = v; }
+        else { this.nums[row] = (double)v; }
+    }
+
+    void PutDouble(int row, double v) {
+        if (this.kind == ColKind.Str) { this.text[row] = Convert.ToString(v); }
+        else if (this.kind == ColKind.Int) { this.ints[row] = (long)v; }
+        else { this.nums[row] = v; }
+    }
+
+    string GetStr(int row) {
+        if (this.kind == ColKind.Str) { return this.text[row]; }
+        if (this.kind == ColKind.Int) { return Convert.ToString(this.ints[row]); }
+        return Convert.ToString(this.nums[row]);
+    }
+
+    long GetLong(int row) {
+        if (this.kind == ColKind.Str) { return this.text[row].ToInt64(); }
+        if (this.kind == ColKind.Int) { return this.ints[row]; }
+        return (long)this.nums[row];
+    }
+
+    double GetDouble(int row) {
+        if (this.kind == ColKind.Str) { return Convert.ToDouble(this.text[row]); }
+        if (this.kind == ColKind.Int) { return (double)this.ints[row]; }
+        return this.nums[row];
+    }
+}
+
+/// <summary>
+/// 列式内存表：DataFrame 的最小核心。
+///
+///   DataFrame df = DataFrame.FromCsv(File.ReadAllText("sales.csv"));
+///   DataFrame big = df.Filter((int row) => df.GetFloat(row, 1) > 2.0);
+///   big = big.SortBy("price", true);
+///   List<RowGroup> gs = big.GroupBy("city");
+///   for (int i = 0; i < gs.Count; i = i + 1) {
+///       double s = big.Sum(gs[i].Rows(), "qty");
+///   }
+///
+/// 设计要点：
+///  - 列存：每列一个类型化列表（long/double/string），CSV 装载时
+///    按整列内容做类型推断；空列推断为 Str。
+///  - 跨类型访问自动转换：Int 列 GetStr 得十进制文本，Float 列
+///    GetLong 截断；double ↔ 文本走最短往返格式，往返无损。
+///  - Filter/SortBy 返回新表；GroupBy 返回的行号组属于原表，
+///    配合 Aggregate 系列使用。
+///  - Join 为内连接哈希实现：右表键列不进结果，其余右表列与左表
+///    撞名时加 "_1" 后缀。
+/// </summary>
+class DataFrame {
+    /// 列集（顺序即列序）。
+    List<DataCol> cols;
+    /// 行数（各列长度恒等于它）。
+    int rowCount;
+
+    DataFrame() {
+        this.cols = new List<DataCol>();
+        this.rowCount = 0;
+    }
+
+    /// 空表。
+    static DataFrame New() {
+        return new DataFrame();
+    }
+
+    /// <summary>从 CSV 文本装载：首记录为表头，其后每记录一行；
+    /// 逐列推断类型。行数与表头列数不一致的记录按宽松规则补空串/
+    /// 截断（缺失字段补空，多余字段丢弃）。</summary>
+    static DataFrame FromCsv(string text) {
+        CsvTable t = Csv.Parse(text);
+        DataFrame df = new DataFrame();
+        List<string> header = t.Header();
+        if (t.RowCount() == 0 || header.Count == 0) { return df; }
+        for (int c = 0; c < header.Count; c = c + 1) {
+            int kind = DataFrame.InferKind(t, c);
+            df.cols.Add(DataCol.Create(header[c], kind));
+        }
+        df.rowCount = t.RowCount();
+        List<List<string>> rows = t.Rows();
+        for (int r = 0; r < rows.Count; r = r + 1) {
+            List<string> row = rows[r];
+            for (int c = 0; c < df.cols.Count; c = c + 1) {
+                if (c < row.Count) { df.cols[c].Append(row[c]); }
+                else { df.cols[c].Append(""); }
+            }
+        }
+        return df;
+    }
+
+    /// 第 at 列（0 起）的整列类型推断：全部像整数 → Int；
+    /// 全部像数值（整数或小数/指数形式）→ Float；否则 Str。
+    static int InferKind(CsvTable t, int at) {
+        List<List<string>> rows = t.Rows();
+        bool allInt = true;
+        bool allNum = true;
+        for (int r = 0; r < rows.Count; r = r + 1) {
+            List<string> row = rows[r];
+            string v = at < row.Count ? row[at] : "";
+            bool isInt = DataFrame.LooksInt(v);
+            if (!isInt) { allInt = false; }
+            if (!isInt && !DataFrame.LooksFloat(v)) { allNum = false; }
+            if (!allNum) { break; }
+        }
+        if (allInt) { return ColKind.Int; }
+        if (allNum) { return ColKind.Float; }
+        return ColKind.Str;
+    }
+
+    /// 严格十进制整数形态：可选 +/- 后全数字（不允许空白）。
+    static bool LooksInt(string s) {
+        int n = s.Length;
+        int i = 0;
+        if (n > 0 && ((s[0] & 255) == 45 || (s[0] & 255) == 43)) { i = 1; }
+        if (i >= n) { return false; }
+        for (; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { return false; }
+        }
+        return true;
+    }
+
+    /// 严格数值形态：尾数（数字与至多一个小数点，至少一位数字）
+    /// 加可选指数（e/E [+/-] 数字）。排除 strtod 也接受的
+    /// inf/nan/十六进制与前后空白。
+    static bool LooksFloat(string s) {
+        int n = s.Length;
+        int i = 0;
+        int digits = 0;
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) { digits = digits + 1; i = i + 1; continue; }
+            if (c == 46) { i = i + 1; continue; }
+            break;
+        }
+        if (digits == 0) { return false; }
+        if (i < n && ((s[i] & 255) == 101 || (s[i] & 255) == 69)) {
+            i = i + 1;
+            if (i < n && ((s[i] & 255) == 45 || (s[i] & 255) == 43)) { i = i + 1; }
+            int expDigits = 0;
+            while (i < n) {
+                int c = s[i] & 255;
+                if (c < 48 || c > 57) { break; }
+                expDigits = expDigits + 1;
+                i = i + 1;
+            }
+            if (expDigits == 0) { return false; }
+        }
+        return i == n;
+    }
+
+    /// 加一列（ColKind 值）；新列以默认值补齐到当前行数。
+    /// 名字重复时本层不拦截（ColIndex 命中第一列）。
+    DataFrame AddColumn(string name, int kind) {
+        DataCol c = DataCol.Create(name, kind);
+        for (int r = 0; r < this.rowCount; r = r + 1) {
+            if (kind == ColKind.Str) { c.Append(""); }
+            else if (kind == ColKind.Int) { c.AppendLong(0); }
+            else { c.AppendDouble(0.0); }
+        }
+        this.cols.Add(c);
+        return this;
+    }
+
+    /// 行数。
+    int Rows() { return this.rowCount; }
+
+    /// 列数。
+    int ColCount() { return this.cols.Count; }
+
+    /// 列名列表（按列序）。
+    List<string> Names() {
+        List<string> names = new List<string>();
+        for (int i = 0; i < this.cols.Count; i = i + 1) {
+            names.Add(this.cols[i].Name());
+        }
+        return names;
+    }
+
+    /// 列序号；不存在返回 -1（命中第一个同名列）。
+    int ColIndex(string name) {
+        for (int i = 0; i < this.cols.Count; i = i + 1) {
+            if (this.cols[i].Name() == name) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    /// 列类型（ColKind 值）；列不存在返回 ColKind.Str。
+    int Kind(string name) {
+        int at = this.ColIndex(name);
+        if (at < 0) { return ColKind.Str; }
+        return this.cols[at].Kind();
+    }
+
+    /// 追加一个空行，返回其行号。
+    int AddRow() {
+        int row = this.rowCount;
+        this.rowCount = this.rowCount + 1;
+        for (int c = 0; c < this.cols.Count; c = c + 1) {
+            int kind = this.cols[c].Kind();
+            if (kind == ColKind.Str) { this.cols[c].Append(""); }
+            else if (kind == ColKind.Int) { this.cols[c].AppendLong(0); }
+            else { this.cols[c].AppendDouble(0.0); }
+        }
+        return row;
+    }
+
+    /// 追加一行并按字符串逐列填入（缺的补空、多的丢弃）。
+    void AddStrRow(params string[] cells) {
+        int row = this.AddRow();
+        for (int c = 0; c < this.cols.Count && c < cells.Length; c = c + 1) {
+            this.cols[c].PutStr(row, cells[c]);
+        }
+    }
+
+    /// 追加一行并按 double 逐列填入（Int 列截断）。
+    void AddFloatRow(params double[] cells) {
+        int row = this.AddRow();
+        for (int c = 0; c < this.cols.Count && c < cells.Length; c = c + 1) {
+            this.cols[c].PutDouble(row, cells[c]);
+        }
+    }
+
+    /// 列存在性守卫：抛出带列名的异常。
+    DataCol ColOrThrow(string name) {
+        int at = this.ColIndex(name);
+        if (at < 0) {
+            throw new InvalidOperationException("DataFrame 没有列: " + name);
+        }
+        return this.cols[at];
+    }
+
+    /// 读单元格为文本。
+    string GetStr(int row, int col) {
+        if (col < 0 || col >= this.cols.Count) { return ""; }
+        return this.cols[col].GetStr(row);
+    }
+
+    /// 按列名读单元格为文本。
+    string GetStr(int row, string col) {
+        return this.ColOrThrow(col).GetStr(row);
+    }
+
+    /// 读单元格为 64 位整数（Float 列截断；Str 列按 strtoll 前缀）。
+    long GetInt(int row, int col) {
+        if (col < 0 || col >= this.cols.Count) { return 0; }
+        return this.cols[col].GetLong(row);
+    }
+
+    long GetInt(int row, string col) {
+        return this.ColOrThrow(col).GetLong(row);
+    }
+
+    /// 读单元格为 double（Int 列提升；Str 列按 strtod 前缀）。
+    double GetFloat(int row, int col) {
+        if (col < 0 || col >= this.cols.Count) { return 0.0; }
+        return this.cols[col].GetDouble(row);
+    }
+
+    double GetFloat(int row, string col) {
+        return this.ColOrThrow(col).GetDouble(row);
+    }
+
+    /// 写单元格（文本形态，按列类型转换）。
+    void SetStr(int row, int col, string v) {
+        this.cols[col].PutStr(row, v);
+    }
+
+    void SetStr(int row, string col, string v) {
+        this.ColOrThrow(col).PutStr(row, v);
+    }
+
+    /// 写单元格（64 位整数）。
+    void SetInt(int row, int col, long v) {
+        this.cols[col].PutLong(row, v);
+    }
+
+    void SetInt(int row, string col, long v) {
+        this.ColOrThrow(col).PutLong(row, v);
+    }
+
+    /// 写单元格（double；Int 列截断）。
+    void SetFloat(int row, int col, double v) {
+        this.cols[col].PutDouble(row, v);
+    }
+
+    void SetFloat(int row, string col, double v) {
+        this.ColOrThrow(col).PutDouble(row, v);
+    }
+
+    /// <summary>过滤：谓词为 true 的行组成新表（同一 schema）。
+    /// 谓词闭包可捕获本帧读取任意单元格。</summary>
+    DataFrame Filter(RowFn fn) {
+        DataFrame outDf = new DataFrame();
+        for (int c = 0; c < this.cols.Count; c = c + 1) {
+            outDf.cols.Add(DataCol.Create(this.cols[c].Name(), this.cols[c].Kind()));
+        }
+        for (int r = 0; r < this.rowCount; r = r + 1) {
+            if (fn(r)) {
+                for (int c = 0; c < this.cols.Count; c = c + 1) {
+                    outDf.cols[c].AppendFrom(this.cols[c], r);
+                }
+                outDf.rowCount = outDf.rowCount + 1;
+            }
+        }
+        return outDf;
+    }
+
+    /// 全部行号（0..Rows()-1），供 Aggregate 系列整表聚合使用。
+    List<int> AllRows() {
+        List<int> all = new List<int>();
+        for (int r = 0; r < this.rowCount; r = r + 1) { all.Add(r); }
+        return all;
+    }
+
+    /// <summary>按列稳定排序（相等保持原相对顺序），返回新表。
+    /// desc 为 true 时降序。列不存在抛异常。</summary>
+    DataFrame SortBy(string col, bool desc) {
+        DataCol key = this.ColOrThrow(col);
+        List<int> idx = new List<int>();
+        for (int r = 0; r < this.rowCount; r = r + 1) { idx.Add(r); }
+        int kind = key.Kind();
+        // 闭包捕获键列与方向；相等时返回负数让归并取左，保持稳定。
+        RowCmpFn cmp = (int a, int b) => {
+            int r = 0;
+            if (kind == ColKind.Int) {
+                long x = key.ints[a];
+                long y = key.ints[b];
+                r = x < y ? 0 - 1 : (x > y ? 1 : 0);
+            } else if (kind == ColKind.Float) {
+                double x = key.nums[a];
+                double y = key.nums[b];
+                r = x < y ? 0 - 1 : (x > y ? 1 : 0);
+            } else {
+                r = key.text[a].CompareTo(key.text[b]);
+            }
+            return desc ? 0 - r : r;
+        };
+        List<int> tmp = new List<int>();
+        DataFrame.MergeSort(idx, tmp, 0, this.rowCount, cmp);
+        DataFrame outDf = new DataFrame();
+        for (int c = 0; c < this.cols.Count; c = c + 1) {
+            outDf.cols.Add(DataCol.Create(this.cols[c].Name(), this.cols[c].Kind()));
+        }
+        for (int i = 0; i < idx.Count; i = i + 1) {
+            for (int c = 0; c < this.cols.Count; c = c + 1) {
+                outDf.cols[c].AppendFrom(this.cols[c], idx[i]);
+            }
+            outDf.rowCount = outDf.rowCount + 1;
+        }
+        return outDf;
+    }
+
+    /// 归并排序（稳定）：对 idx[lo, hi) 排序，tmp 为工作缓冲。
+    static void MergeSort(List<int> idx, List<int> tmp, int lo, int hi,
+                          RowCmpFn cmp) {
+        if (hi - lo < 2) { return; }
+        int mid = lo + (hi - lo) / 2;
+        DataFrame.MergeSort(idx, tmp, lo, mid, cmp);
+        DataFrame.MergeSort(idx, tmp, mid, hi, cmp);
+        int a = lo;
+        int b = mid;
+        tmp.Clear();
+        while (a < mid && b < hi) {
+            if (cmp(idx[b], idx[a]) < 0) { tmp.Add(idx[b]); b = b + 1; }
+            else { tmp.Add(idx[a]); a = a + 1; }        // 取左保稳定
+        }
+        while (a < mid) { tmp.Add(idx[a]); a = a + 1; }
+        while (b < hi) { tmp.Add(idx[b]); b = b + 1; }
+        for (int i = 0; i < tmp.Count; i = i + 1) {
+            idx[lo + i] = tmp[i];
+        }
+    }
+
+    /// <summary>按列分组：键为单元格文本形态，组按首次出现顺序排列。
+    /// 返回的 RowGroup.Rows() 是本表的行号列表，配合 Aggregate 用。
+    /// </summary>
+    List<RowGroup> GroupBy(string col) {
+        DataCol key = this.ColOrThrow(col);
+        List<RowGroup> groups = new List<RowGroup>();
+        Dictionary<string, RowGroup> map = new Dictionary<string, RowGroup>();
+        for (int r = 0; r < this.rowCount; r = r + 1) {
+            string k = key.GetStr(r);
+            RowGroup g;
+            if (map.ContainsKey(k)) {
+                g = map[k];
+            } else {
+                g = RowGroup.Create(k);
+                map[k] = g;
+                groups.Add(g);
+            }
+            g.rows.Add(r);
+        }
+        return groups;
+    }
+
+    /// <summary>对行号集合按列聚合，返回 double（Count 即行数）。
+    /// Int 列先累 long 求和避免精度损失；Str 列按数值解析。
+    /// 空集合：Sum/Count 得 0，Avg/Min/Max 得 0。</summary>
+    double Aggregate(List<int> rows, string col, int op) {
+        if (op == Agg.Count) { return (double)rows.Count; }
+        DataCol c = this.ColOrThrow(col);
+        if (rows.Count == 0) { return 0.0; }
+        if (op == Agg.Sum && c.Kind() == ColKind.Int) {
+            long s = 0;
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                s = s + c.ints[rows[i]];
+            }
+            return (double)s;
+        }
+        double sum = 0.0;
+        double low = c.GetDouble(rows[0]);
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            double v = c.GetDouble(rows[i]);
+            sum = sum + v;
+            if (v < low) { low = v; }
+        }
+        if (op == Agg.Sum) { return sum; }
+        if (op == Agg.Avg) { return sum / (double)rows.Count; }
+        if (op == Agg.Max) {
+            double hi = c.GetDouble(rows[0]);
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                double v = c.GetDouble(rows[i]);
+                if (v > hi) { hi = v; }
+            }
+            return hi;
+        }
+        return low;
+    }
+
+    /// 行号集合按列求和。
+    double Sum(List<int> rows, string col) {
+        return this.Aggregate(rows, col, Agg.Sum);
+    }
+
+    /// 行号集合按列平均。
+    double Avg(List<int> rows, string col) {
+        return this.Aggregate(rows, col, Agg.Avg);
+    }
+
+    /// 行号集合按列最小值。
+    double Min(List<int> rows, string col) {
+        return this.Aggregate(rows, col, Agg.Min);
+    }
+
+    /// 行号集合按列最大值。
+    double Max(List<int> rows, string col) {
+        return this.Aggregate(rows, col, Agg.Max);
+    }
+
+    /// <summary>内连接：以 left.keyCol == right.rightKeyCol 为等值条件
+    /// 的哈希连接。结果列为左表全部列加右表除键列外的列；右表列与
+    /// 左表撞名时加 "_1" 后缀。每对匹配行产出一行（左行序 × 右行序）。
+    /// </summary>
+    DataFrame Join(DataFrame right, string keyCol, string rightKeyCol) {
+        int li = this.ColIndex(keyCol);
+        int ri = right.ColIndex(rightKeyCol);
+        if (li < 0) {
+            throw new InvalidOperationException("Join: 左表没有列: " + keyCol);
+        }
+        if (ri < 0) {
+            throw new InvalidOperationException("Join: 右表没有列: " + rightKeyCol);
+        }
+        Dictionary<string, List<int>> map = new Dictionary<string, List<int>>();
+        for (int r = 0; r < right.rowCount; r = r + 1) {
+            string k = right.cols[ri].GetStr(r);
+            if (!map.ContainsKey(k)) { map[k] = new List<int>(); }
+            map[k].Add(r);
+        }
+        DataFrame outDf = new DataFrame();
+        for (int c = 0; c < this.cols.Count; c = c + 1) {
+            outDf.cols.Add(DataCol.Create(this.cols[c].Name(), this.cols[c].Kind()));
+        }
+        for (int c = 0; c < right.cols.Count; c = c + 1) {
+            if (c == ri) { continue; }
+            string name = right.cols[c].Name();
+            if (this.ColIndex(name) >= 0) { name = name + "_1"; }
+            outDf.cols.Add(DataCol.Create(name, right.cols[c].Kind()));
+        }
+        for (int r = 0; r < this.rowCount; r = r + 1) {
+            string k = this.cols[li].GetStr(r);
+            if (!map.ContainsKey(k)) { continue; }
+            List<int> matches = map[k];
+            for (int m = 0; m < matches.Count; m = m + 1) {
+                for (int c = 0; c < this.cols.Count; c = c + 1) {
+                    outDf.cols[c].AppendFrom(this.cols[c], r);
+                }
+                int oc = this.cols.Count;
+                for (int c = 0; c < right.cols.Count; c = c + 1) {
+                    if (c == ri) { continue; }
+                    outDf.cols[oc].AppendFrom(right.cols[c], matches[m]);
+                    oc = oc + 1;
+                }
+                outDf.rowCount = outDf.rowCount + 1;
+            }
+        }
+        return outDf;
+    }
+
+    /// <summary>写出 CSV 文本：表头一行加数据行（CRLF 行尾），
+    /// 需要引号的字段按 Csv.Escape 处理。往返 Parse(ToCsv()) 等价。</summary>
+    string ToCsv() {
+        StringBuilder sb = new StringBuilder();
+        List<string> fields = new List<string>();
+        for (int c = 0; c < this.cols.Count; c = c + 1) {
+            fields.Add(this.cols[c].Name());
+        }
+        sb.Append(Csv.RowToText(fields));
+        sb.Append("\r\n");
+        for (int r = 0; r < this.rowCount; r = r + 1) {
+            fields.Clear();
+            for (int c = 0; c < this.cols.Count; c = c + 1) {
+                fields.Add(this.cols[c].GetStr(r));
+            }
+            sb.Append(Csv.RowToText(fields));
+            sb.Append("\r\n");
+        }
+        return sb.ToString();
+    }
+}
+
+/// 一次分组：键（单元格文本形态）+ 属于该组的行号列表。
+class RowGroup {
+    /// 组键（GetStr 形态）。
+    string key;
+    /// 组内行号（升序，属原表）。
+    List<int> rows;
+
+    static RowGroup Create(string groupKey) {
+        RowGroup g = new RowGroup();
+        g.key = groupKey;
+        g.rows = new List<int>();
+        return g;
+    }
+
+    /// 组键文本。
+    string Key() { return this.key; }
+
+    /// 组内行号列表（可读改）。
+    List<int> Rows() { return this.rows; }
+
+    /// 组内行数。
+    int Count() { return this.rows.Count; }
+}
