@@ -36,7 +36,7 @@ void   zan_co_sched_run(void);
 void   zan_co_sched_run_until(const volatile int *done);
 size_t zan_co_pending(void);
 
-/* Release an async frame. Emitted code (--async-workers) calls this instead of
+/* Release an async frame. Emitted code (multi-worker driver builds) calls this instead of
  * free() for coroutine frames: under the multi-worker driver the scheduler may
  * still hold a reference (the frame is running, or a task naming it sits in a
  * worker queue), and the driver defers the free until that reference is gone.

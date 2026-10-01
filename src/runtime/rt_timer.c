@@ -265,7 +265,7 @@ unsigned char *zan_rt_soft_scratch(void) {
  *
  * Called with the timer lock held (the note/report entry points take it
  * around zan_soft_seen): soft reports can fire on any worker thread under
- * --async-workers, and the count+store was an unsynchronized RMW that could
+ * multi-worker builds, and the count+store was an unsynchronized RMW that could
  * drop or corrupt entries -- worst case two threads store past index 255. */
 static int zan_soft_seen(const char *text) {
     for (int i = 0; i < g_soft_seen_count; i++)
@@ -948,7 +948,7 @@ long long zan_timer_dispatch_due(void) {
 
 long long zan_timer_pending(void) {
     /* Writers mutate g_live under the timer lock, but this read is lock-free
-     * (it runs once per scheduler iteration on every --async-workers worker).
+     * (it runs once per scheduler iteration on every multi-worker driver worker).
      * A plain load tears on 32-bit targets, and a torn 0 makes the driver's
      * idle check declare the pool finished while a timer is still pending. */
     return __atomic_load_n(&g_live, __ATOMIC_RELAXED);
@@ -1079,7 +1079,7 @@ void swoole_timer_stats(long long *a, long long *b, long long *c) { zan_timer_st
  *     O(N) per completion -- at 1000 connections, a walk of a thousand frames
  *     per finished coroutine;
  *   - the splice was unsynchronized, which the multi-worker driver
- *     (--async-workers) turns into a crash: workers on different OS threads
+ *     (multi-worker driver) turns into a crash: workers on different OS threads
  *     mutate the list concurrently and one follows a stale link (an access
  *     violation inside the emitted __zan_co_untrack).
  *

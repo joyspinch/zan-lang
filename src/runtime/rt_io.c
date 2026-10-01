@@ -207,7 +207,7 @@ static zan_io_entry_t *g_io_entries;    /* linked list of active watchers */
  * zan_io_recv_to_co / zan_io_accept_co on one thread (set, then io_register
  * consumes them -- no yield in between), so thread-local storage keeps each
  * park pair private. Plain statics raced under the multi-worker driver
- * (zanrt_io_mt, linked for --async-workers on Windows/Linux/macOS/iOS
+ * (zanrt_io_mt, the default driver on Windows/Linux/macOS/iOS x86_64/AArch64
  * targets): two workers parking at once clobbered each other's sinks, so one
  * watcher recv'd into the other's buffer and the other's out_n was never
  * written. */
@@ -567,7 +567,7 @@ const char *zan_io_sockaddr_ip_str(const void *sa) {
  * The plain const char* returns are ADOPTED by the FFI without a copy
  * (docs/ABI.md), but their backing storage is per-thread shared state: a
  * value stored into a managed string before an await silently changed
- * content after the next call on this worker -- or, under --async-workers,
+ * content after the next call on this worker -- or, under the multi-worker driver,
  * after fiber migration (UDP reply paths read the peer IP post-await). The
  * stdlib wrappers now copy into caller-owned storage through these; they
  * return the text length excluding NUL, or -1 on failure / bad args /
@@ -4033,10 +4033,12 @@ int64_t zan_io_connect(intptr_t fd, const char *ip, int32_t port) {
 #endif /* ZAN_IO_STACKLESS_ONLY */
 
 /* ======================================================================
- * Multi-worker cooperative coroutine driver (opt-in, -DZAN_CO_DRIVER)
+ * Multi-worker cooperative coroutine driver (default for native 64-bit
+ * targets; compiled under -DZAN_CO_DRIVER)
  * ----------------------------------------------------------------------
- * Built into the alternate reactor object (zanrt_io_mt) that zanc links when
- * a program is compiled with --async-workers. In that mode zanc does NOT emit
+ * Built into the alternate reactor object (zanrt_io_mt) that zanc links for
+ * native 64-bit targets (the external executor is a target capability, not a
+ * flag -- see main.c external_async_executor). In this mode zanc does NOT emit
  * its inline single-threaded ready-queue driver; this one takes its place and
  * provides the same compiler-facing ABI (zan_co_sched_init / zan_co_ready /
  * zan_co_sched_run / zan_co_delay), but runs the ready queue across a pool of
@@ -4336,7 +4338,7 @@ static int co_worker_shard(int worker) {
 
 /* Wake one parked worker -- but only when nobody is searching already (that
  * worker will find the task) and only up to one unconsumed packet per parked
- * worker. Posting one packet per ready frame is what made --async-workers
+ * worker. Posting one packet per ready frame is what made the multi-worker
  * burn CPU linearly in the worker count at flat throughput. */
 static zan_co_worker_t *co_self(void);
 
@@ -4595,7 +4597,7 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
     co_pool_ensure();
 }
 
-/* Release an async frame. Called by the compiler (--async-workers) instead of
+/* Release an async frame. Called by the compiler (multi-worker builds) instead of
  * free() wherever an awaiter, a reaper or the frame's own cleanup drops a
  * frame, because the scheduler may still hold a reference to it:
  *   - running: the worker frees it when the step returns (it must still read
@@ -5360,7 +5362,7 @@ void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
     zan_timer_delay(ms, frame, step);
 }
 
-/* Frame release hook the compiler emits under --async-workers. This driver is
+/* Frame release hook the compiler emits for multi-worker builds. This driver is
  * single-threaded, so nothing can hold a reference the program does not know
  * about and the free needs no handshake. */
 void __zan_co_frame_free(void *frame) { free(frame); }
