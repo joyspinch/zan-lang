@@ -1,0 +1,665 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+
+namespace System.ML;
+
+/// <summary>
+/// ONNX Runtime 推理的纯 Zan 封装（机器学习/OCR/AI 应用的统一推理底座）。
+///
+/// 与 <see cref="System.Scripting.Lua"/> 同一加载哲学：运行期
+/// <see cref="Interop"/>（LoadLibrary/GetProcAddress）定位
+/// onnxruntime 动态库，经 `OrtGetApiBase()->GetApi(ORT_API_VERSION)`
+/// 拿到 C API 函数表，每个入口按 <b>官方头文件 offsetof 实测的槽位
+/// 偏移</b>读取地址再经 delegate 调用——零 C shim、零链接期依赖，
+/// 从不接触 ONNX 的程序不加载任何东西；库缺席时
+/// <see cref="Ort.IsAvailable"/> == false 而不是加载失败。
+///
+///   using System.ML;
+///
+///   if (!Ort.IsAvailable()) { ... 回退 ... }
+///   OrtSession s = OrtSession.FromFile("model.onnx");
+///   OrtTensor out = s.Run1(OrtTensor.Matrix(2, 3, x));
+///   float y = out.Data()[0];
+///
+/// 函数表版本契约：ONNX Runtime 承诺同一 ORT_API_VERSION 的表布局
+/// 稳定（新版本只追加），因此对 v30（onnxruntime 1.30.x）实测的
+/// 偏移在一切 ≥1.30 的运行时上有效。请求版本 30 时旧运行时直接
+/// 返回失败（fail-closed，不会错位调用）。
+///
+/// 内存所有权：输入张量的数据缓冲由本类分配（CreateTensor 不拷贝、
+/// ReleaseValue 不释放调用方数据），Run 结束即释放；输出张量在读取
+/// 托管副本后立即 ReleaseValue。所有 API 返回前不留原生资源。
+/// </summary>
+class Ort {
+    /// onnxruntime 模块句柄（TryResolve 前为 0）。
+    static nint mod;
+    /// OrtApiBase*。
+    static nint apiBase;
+    /// OrtApi* 函数表。
+    static nint api;
+    /// 进程级 OrtEnv*。
+    static nint env;
+    /// 符号解析完成标志。
+    static bool resolved;
+
+    /// 请求的 C API 版本：ORT_API_VERSION=30（onnxruntime 1.30.x）。
+    static int API_VERSION = 30;
+
+    // ---- OrtApi 函数表槽位偏移（v1.30.0 头文件 offsetof 实测，
+    //      生成方式见包 README）。每个常量的名字即成员名。----
+    static int OFF_CREATE_ENV = 24;
+    static int OFF_CREATE_SESSION_FROM_ARRAY = 64;
+    static int OFF_CREATE_SESSION_OPTIONS = 80;
+    static int OFF_GET_ALLOCATOR_WITH_DEFAULT_OPTIONS = 624;
+    static int OFF_SESSION_GET_INPUT_COUNT = 240;
+    static int OFF_SESSION_GET_INPUT_NAME = 288;
+    static int OFF_SESSION_GET_OUTPUT_COUNT = 248;
+    static int OFF_SESSION_GET_OUTPUT_NAME = 296;
+    static int OFF_ALLOCATOR_FREE = 608;
+    static int OFF_CREATE_CPU_MEMORY_INFO = 552;
+    static int OFF_CREATE_TENSOR_WITH_DATA_AS_ORT_VALUE = 392;
+    static int OFF_RUN = 72;
+    static int OFF_GET_TENSOR_MUTABLE_DATA = 408;
+    static int OFF_GET_TENSOR_TYPE_AND_SHAPE = 520;
+    static int OFF_GET_DIMENSIONS_COUNT = 488;
+    static int OFF_GET_DIMENSIONS = 496;
+    static int OFF_RELEASE_TENSOR_TYPE_AND_SHAPE_INFO = 792;
+    static int OFF_GET_ERROR_MESSAGE = 16;
+    static int OFF_RELEASE_ENV = 736;
+    static int OFF_RELEASE_STATUS = 744;
+    static int OFF_RELEASE_MEMORY_INFO = 752;
+    static int OFF_RELEASE_SESSION = 760;
+    static int OFF_RELEASE_SESSION_OPTIONS = 800;
+    static int OFF_RELEASE_VALUE = 768;
+
+    // ---- 枚举值（v1.30 头文件实测）----
+    /// OrtArenaAllocator。
+    static int ALLOC_ARENA = 1;
+    /// OrtMemTypeDefault。
+    static int MEM_DEFAULT = 0;
+    /// ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT。
+    static int ELEM_FLOAT = 1;
+    /// ORT_LOGGING_LEVEL_WARNING。
+    static int LOG_WARNING = 2;
+
+    /// <summary>能加载可用的 onnxruntime 动态库时为 true。</summary>
+    static bool IsAvailable() {
+        return Ort.TryResolve();
+    }
+
+    /// <summary>创建进程级 OrtEnv（幂等）。库缺席时抛异常。</summary>
+    static void Initialize() {
+        if (!Ort.TryResolve()) {
+            throw new InvalidOperationException(
+                "ONNX Runtime 不可用: 未找到 onnxruntime 动态库(可放在 exe 旁或加入搜索路径)");
+        }
+        if (Ort.env != 0) { return; }
+        nint cell = NativeMemory.Alloc(8);
+        new Span<long>(cell, 1)[0] = 0;
+        OrtFnCreateEnv f = (OrtFnCreateEnv)Ort.Slot(Ort.api, Ort.OFF_CREATE_ENV);
+        nint st = f(Ort.LOG_WARNING, "zan-ort", cell);
+        nint created = new Span<long>(cell, 1)[0];
+        NativeMemory.Free(cell);
+        Ort.Check(st, "CreateEnv");
+        Ort.env = created;
+    }
+
+    /// <summary>进程级 OrtEnv*；未初始化时自动 Initialize。</summary>
+    static nint Env() {
+        Ort.Initialize();
+        return Ort.env;
+    }
+
+    /// <summary>释放进程级资源：会话外的 Env 由本方法收尾；
+    /// 幂等。此后本类不可再运行推理（可重新 Initialize）。</summary>
+    static void Shutdown() {
+        if (Ort.env != 0) {
+            Ort.ReleaseAt(Ort.OFF_RELEASE_ENV, Ort.env);
+            Ort.env = 0;
+        }
+    }
+
+    /// <summary>从文件装载 ONNX 模型。</summary>
+    static OrtSession LoadSession(string path) {
+        byte[] bytes = File.ReadAllBytes(path);
+        return Ort.LoadSession(bytes);
+    }
+
+    /// <summary>从模型字节装载（内嵌模型/加密分发场景：
+    /// 字节读入后交由 CreateSessionFromArray，原生侧装载期即复制，
+    /// 调用返回后调用方可清零缓冲）。</summary>
+    static OrtSession LoadSession(byte[] modelBytes) {
+        Ort.Initialize();
+        nint optCell = NativeMemory.Alloc(8);
+        new Span<long>(optCell, 1)[0] = 0;
+        OrtFnCreateSessionOptions mkOpt =
+            (OrtFnCreateSessionOptions)Ort.Slot(Ort.api, Ort.OFF_CREATE_SESSION_OPTIONS);
+        nint st = mkOpt(optCell);
+        nint options = new Span<long>(optCell, 1)[0];
+        NativeMemory.Free(optCell);
+        Ort.Check(st, "CreateSessionOptions");
+
+        nint sesCell = NativeMemory.Alloc(8);
+        new Span<long>(sesCell, 1)[0] = 0;
+        // 模型字节复制进原生缓冲再交 CreateSessionFromArray——装载期
+        // 原生侧即完成复制，调用返回即可释放。
+        long mlen = modelBytes.Length;
+        nint mbuf = NativeMemory.Alloc(mlen);
+        Span<byte> msrc = new Span<byte>(modelBytes, modelBytes.Length);
+        Span<byte> mdst = new Span<byte>(mbuf, modelBytes.Length);
+        for (int i = 0; i < modelBytes.Length; i = i + 1) {
+            mdst[i] = msrc[i];
+        }
+        OrtFnCreateSessionFromArray mkSes =
+            (OrtFnCreateSessionFromArray)Ort.Slot(Ort.api, Ort.OFF_CREATE_SESSION_FROM_ARRAY);
+        st = mkSes(Ort.env, mbuf, mlen, options, sesCell);
+        nint session = new Span<long>(sesCell, 1)[0];
+        NativeMemory.Free(mbuf);
+        NativeMemory.Free(sesCell);
+        Ort.ReleaseAt(Ort.OFF_RELEASE_SESSION_OPTIONS, options);
+        Ort.Check(st, "CreateSession");
+        return OrtSession.Wrap(session);
+    }
+
+    /// OrtApiBase::GetApi 的调用形式。
+    static nint GetApiTable() {
+        OrtFnGetApi g = (OrtFnGetApi)Ort.Slot(Ort.apiBase, 0);
+        return g(Ort.API_VERSION);
+    }
+
+    /// 读函数表/结构体中 offset 处的指针槽位。
+    static nint Slot(nint basePtr, int offset) {
+        return new Span<long>(basePtr + offset, 1)[0];
+    }
+
+    /// 调用 Release 系槽位释放对象（p 为 0 时忽略）。
+    static void ReleaseAt(int offset, nint p) {
+        if (p == 0) { return; }
+        OrtFnRelease r = (OrtFnRelease)Ort.Slot(Ort.api, offset);
+        r(p);
+    }
+
+    /// status 非 0 时取出错误文本、释放 status 并抛出。
+    static void Check(nint status, string what) {
+        if (status == 0) { return; }
+        string text = "";
+        OrtFnGetErrorMessage msg =
+            (OrtFnGetErrorMessage)Ort.Slot(Ort.api, Ort.OFF_GET_ERROR_MESSAGE);
+        if (msg != null) { text = msg(status); }
+        Ort.ReleaseAt(Ort.OFF_RELEASE_STATUS, status);
+        throw new InvalidOperationException("ONNX Runtime " + what + " 失败: " + text);
+    }
+
+    /// 定位并加载 onnxruntime、解析 OrtGetApiBase、请求版本化函数表；
+    /// 成功后缓存。失败路径全部回滚句柄。
+    static bool TryResolve() {
+        if (Ort.resolved) { return true; }
+        if (Ort.mod == 0) {
+            // Windows 上 LoadLibrary 裸名本就先搜 exe 目录；POSIX 的
+            // dlopen 裸名不走 exe 目录，因此先用 AppDir 限定路径探测。
+            string[] cands = new string[] {
+                "onnxruntime.dll",
+                "libonnxruntime.so", "libonnxruntime.so.1",
+                "libonnxruntime.dylib"
+            };
+            string appdir = ProcessHost.AppDir();
+            if (appdir != "") {
+                for (int i = 0; i < cands.Length; i = i + 1) {
+                    Ort.mod = Interop.Load(appdir + "/" + cands[i]);
+                    if (Ort.mod != 0) { break; }
+                }
+            }
+            for (int i = 0; Ort.mod == 0 && i < cands.Length; i = i + 1) {
+                Ort.mod = Interop.Load(cands[i]);
+                if (Ort.mod != 0) { break; }
+            }
+            if (Ort.mod == 0) { return false; }
+        }
+        nint entry = Interop.Symbol(Ort.mod, "OrtGetApiBase");
+        if (entry == 0) {
+            Interop.Unload(Ort.mod);
+            Ort.mod = 0;
+            return false;
+        }
+        OrtGetApiBaseFn getBase = (OrtGetApiBaseFn)entry;
+        Ort.apiBase = getBase();
+        if (Ort.apiBase == 0) {
+            Interop.Unload(Ort.mod);
+            Ort.mod = 0;
+            return false;
+        }
+        Ort.api = Ort.GetApiTable();
+        if (Ort.api == 0) {
+            // 运行时比请求的 API 版本旧：fail-closed，不猜布局。
+            Ort.apiBase = 0;
+            Interop.Unload(Ort.mod);
+            Ort.mod = 0;
+            return false;
+        }
+        Ort.resolved = true;
+        return true;
+    }
+
+    /// <summary>运行时库版本文本（GetVersionString）；未就绪返回空。
+    /// 供诊断/日志。</summary>
+    static string RuntimeVersion() {
+        if (!Ort.TryResolve()) { return ""; }
+        nint f = Ort.Slot(Ort.apiBase, 8);
+        OrtFnVersionString v = (OrtFnVersionString)f;
+        return v();
+    }
+
+    /// <summary>把名字数组写成 NUL 分隔的原生 char* 数组（char**）。
+    /// 每个名字复制进独立缓冲，返回数组指针；缓冲总数写入
+    /// outBufs（调用方用 FreeNames 释放）。空表返回 0。</summary>
+    static nint WriteNames(string[] names, List<nint> outBufs) {
+        if (names.Length == 0) { return 0; }
+        nint arr = NativeMemory.Alloc(names.Length * 8);
+        for (int i = 0; i < names.Length; i = i + 1) {
+            string s = names[i];
+            nint buf = NativeMemory.Alloc(s.Length + 1);
+            NativeMemory.PutString(buf, 0, s, s.Length);
+            new Span<byte>(buf + s.Length, 1)[0] = 0;
+            new Span<long>(arr + i * 8, 1)[0] = buf;
+            outBufs.Add(buf);
+        }
+        return arr;
+    }
+
+    /// 释放 WriteNames 产生的名字缓冲与数组。
+    static void FreeNames(nint arr, List<nint> bufs) {
+        for (int i = 0; i < bufs.Count; i = i + 1) {
+            NativeMemory.Free(bufs[i]);
+        }
+        if (arr != 0) { NativeMemory.Free(arr); }
+    }
+
+    /// 读 NUL 结尾的 C 字符串为 Zan 字符串。
+    static string CString(nint p) {
+        if (p == 0) { return ""; }
+        int len = 0;
+        while (new Span<byte>(p + len, 1)[0] != 0) { len = len + 1; }
+        if (len == 0) { return ""; }
+        return NativeMemory.GetString(p, 0, len);
+    }
+}
+
+/// <summary>
+/// 一个已装载的 ONNX 模型会话。装载时缓存输入/输出名；
+/// <see cref="Run"/> 按名对位张量并返回输出张量（托管副本，
+/// 原生侧即时释放）。
+/// </summary>
+class OrtSession {
+    /// OrtSession*。
+    nint session;
+    /// 输入名（会话序）。
+    string[] inputNames;
+    /// 输出名（会话序）。
+    string[] outputNames;
+
+    static OrtSession Wrap(nint nativeSession) {
+        OrtSession s = new OrtSession();
+        s.session = nativeSession;
+        s.inputNames = s.ReadNames(true);
+        s.outputNames = s.ReadNames(false);
+        return s;
+    }
+
+    /// 输入名列表。
+    string[] InputNames() { return this.inputNames; }
+
+    /// 输出名列表。
+    string[] OutputNames() { return this.outputNames; }
+
+    /// <summary>单输入单输出便捷形式：等价于
+    /// Run(new OrtTensor[]{input})[0]。</summary>
+    OrtTensor Run1(OrtTensor input) {
+        OrtTensor[] inputs = new OrtTensor[1];
+        inputs[0] = input;
+        OrtTensor[] outs = this.Run(inputs);
+        return outs[0];
+    }
+
+    /// <summary>执行推理：inputs 按会话输入序对位（数量必须一致），
+    /// 返回按会话输出序的输出张量。原生资源在返回前全部释放，
+    /// 只带走托管副本。</summary>
+    OrtTensor[] Run(OrtTensor[] inputs) {
+        if (inputs.Length != this.inputNames.Length) {
+            throw new InvalidOperationException("ONNX 输入数量不匹配: 期望 "
+                + Convert.ToString(this.inputNames.Length) + " 实际 "
+                + Convert.ToString(inputs.Length));
+        }
+        List<nint> nameBufs = new List<nint>();
+        nint inNames = Ort.WriteNames(this.inputNames, nameBufs);
+        nint outNames = Ort.WriteNames(this.outputNames, nameBufs);
+
+        // 输入值数组 + 每个输入的原生数据缓冲（CreateTensor 不拷贝，
+        // 数据归调用方所有，Run 结束后统一释放）。
+        nint inValues = NativeMemory.Alloc(inputs.Length * 8);
+        List<nint> inData = new List<nint>();
+        for (int i = 0; i < inputs.Length; i = i + 1) {
+            nint value = this.MakeInput(inputs[i], inData);
+            new Span<long>(inValues + i * 8, 1)[0] = value;
+        }
+        int nOut = this.outputNames.Length;
+        nint outValues = NativeMemory.Alloc(nOut * 8);
+        for (int i = 0; i < nOut; i = i + 1) {
+            new Span<long>(outValues + i * 8, 1)[0] = 0;
+        }
+
+        OrtFnRun run = (OrtFnRun)Ort.Slot(Ort.api, Ort.OFF_RUN);
+        nint st = run(this.session, 0, inNames, inValues, inputs.Length,
+                      outNames, nOut, outValues);
+
+        // 先取输出托管副本再清理（Check 抛异常前也不能留原生资源，
+        // 因此清理统一走 finally 语义的顺序路径：先读、再放、后查错
+        // 不行——必须先查错再读；异常路径的清理在此方法内显式完成）。
+        if (st != 0) {
+            this.DropInputs(inValues, inputs.Length, inData);
+            NativeMemory.Free(inValues);
+            // Run 失败时输出数组里已产生的 OrtValue 也要放掉
+            //（入口置 0，非 0 即 ORT 创建的）。
+            for (int i = 0; i < nOut; i = i + 1) {
+                nint v = new Span<long>(outValues + i * 8, 1)[0];
+                Ort.ReleaseAt(Ort.OFF_RELEASE_VALUE, v);
+            }
+            NativeMemory.Free(outValues);
+            Ort.FreeNames(inNames, nameBufs);
+            Ort.Check(st, "Run");
+            return null;
+        }
+
+        OrtTensor[] outs = new OrtTensor[nOut];
+        for (int i = 0; i < nOut; i = i + 1) {
+            nint v = new Span<long>(outValues + i * 8, 1)[0];
+            outs[i] = this.ReadOutput(v);
+            Ort.ReleaseAt(Ort.OFF_RELEASE_VALUE, v);
+        }
+
+        this.DropInputs(inValues, inputs.Length, inData);
+        NativeMemory.Free(inValues);
+        NativeMemory.Free(outValues);
+        Ort.FreeNames(inNames, nameBufs);
+        return outs;
+    }
+
+    /// 关闭会话并释放（此后不可再 Run）。
+    void Close() {
+        if (this.session != 0) {
+            Ort.ReleaseAt(Ort.OFF_RELEASE_SESSION, this.session);
+            this.session = 0;
+        }
+    }
+
+    /// 为一个输入建 OrtValue：数据与形状复制进原生缓冲。
+    /// 数据缓冲追加进 inData 供 Run 结束统一释放。
+    nint MakeInput(OrtTensor t, List<nint> inData) {
+        long n = t.ElementCount();
+        nint data = NativeMemory.Alloc(n * 4);
+        Span<float> src = t.Span();
+        for (int i = 0; i < n; i = i + 1) {
+            new Span<float>(data + i * 4, 1)[0] = src[i];
+        }
+        inData.Add(data);
+        nint shape = NativeMemory.Alloc(t.Rank() * 8);
+        long[] dims = t.shape;
+        for (int i = 0; i < t.Rank(); i = i + 1) {
+            new Span<long>(shape + i * 8, 1)[0] = dims[i];
+        }
+        nint infoCell = NativeMemory.Alloc(8);
+        new Span<long>(infoCell, 1)[0] = 0;
+        OrtFnCreateCpuMemoryInfo mkInfo =
+            (OrtFnCreateCpuMemoryInfo)Ort.Slot(Ort.api, Ort.OFF_CREATE_CPU_MEMORY_INFO);
+        nint st = mkInfo(Ort.ALLOC_ARENA, Ort.MEM_DEFAULT, infoCell);
+        nint info = new Span<long>(infoCell, 1)[0];
+        NativeMemory.Free(infoCell);
+        Ort.Check(st, "CreateCpuMemoryInfo");
+
+        nint valueCell = NativeMemory.Alloc(8);
+        new Span<long>(valueCell, 1)[0] = 0;
+        OrtFnCreateTensorWithValue mkTensor =
+            (OrtFnCreateTensorWithValue)Ort.Slot(Ort.api, Ort.OFF_CREATE_TENSOR_WITH_DATA_AS_ORT_VALUE);
+        st = mkTensor(info, data, n * 4, shape, t.Rank(), Ort.ELEM_FLOAT, valueCell);
+        nint value = new Span<long>(valueCell, 1)[0];
+        NativeMemory.Free(valueCell);
+        Ort.ReleaseAt(Ort.OFF_RELEASE_MEMORY_INFO, info);
+        Ort.Check(st, "CreateTensorWithDataAsOrtValue");
+        return value;
+    }
+
+    /// 释放输入值与其数据缓冲。
+    void DropInputs(nint inValues, int n, List<nint> inData) {
+        for (int i = 0; i < n; i = i + 1) {
+            nint v = new Span<long>(inValues + i * 8, 1)[0];
+            Ort.ReleaseAt(Ort.OFF_RELEASE_VALUE, v);
+        }
+        for (int i = 0; i < inData.Count; i = i + 1) {
+            NativeMemory.Free(inData[i]);
+        }
+    }
+
+    /// 把输出 OrtValue 读成托管张量（数据/形状拷出，原生对象由
+    /// 调用方 ReleaseValue）。
+    OrtTensor ReadOutput(nint value) {
+        nint infoCell = NativeMemory.Alloc(8);
+        new Span<long>(infoCell, 1)[0] = 0;
+        OrtFnGetTensorTypeAndShape gInfo =
+            (OrtFnGetTensorTypeAndShape)Ort.Slot(Ort.api, Ort.OFF_GET_TENSOR_TYPE_AND_SHAPE);
+        nint st = gInfo(value, infoCell);
+        nint info = new Span<long>(infoCell, 1)[0];
+        NativeMemory.Free(infoCell);
+        Ort.Check(st, "GetTensorTypeAndShape");
+
+        nint rankCell = NativeMemory.Alloc(8);
+        new Span<long>(rankCell, 1)[0] = 0;
+        OrtFnGetDimensionsCount gRank =
+            (OrtFnGetDimensionsCount)Ort.Slot(Ort.api, Ort.OFF_GET_DIMENSIONS_COUNT);
+        st = gRank(info, rankCell);
+        int rank = (int)new Span<long>(rankCell, 1)[0];
+        NativeMemory.Free(rankCell);
+        Ort.Check(st, "GetDimensionsCount");
+
+        long[] dims = new long[rank];
+        nint dimBuf = NativeMemory.Alloc(rank * 8);
+        OrtFnGetDimensions gDims =
+            (OrtFnGetDimensions)Ort.Slot(Ort.api, Ort.OFF_GET_DIMENSIONS);
+        st = gDims(info, dimBuf, rank);
+        for (int i = 0; i < rank; i = i + 1) {
+            dims[i] = new Span<long>(dimBuf + i * 8, 1)[0];
+        }
+        NativeMemory.Free(dimBuf);
+        Ort.ReleaseAt(Ort.OFF_RELEASE_TENSOR_TYPE_AND_SHAPE_INFO, info);
+        Ort.Check(st, "GetDimensions");
+
+        long total = 1;
+        for (int i = 0; i < rank; i = i + 1) { total = total * dims[i]; }
+        nint dataCell = NativeMemory.Alloc(8);
+        new Span<long>(dataCell, 1)[0] = 0;
+        OrtFnGetTensorMutableData gData =
+            (OrtFnGetTensorMutableData)Ort.Slot(Ort.api, Ort.OFF_GET_TENSOR_MUTABLE_DATA);
+        st = gData(value, dataCell);
+        nint data = new Span<long>(dataCell, 1)[0];
+        NativeMemory.Free(dataCell);
+        Ort.Check(st, "GetTensorMutableData");
+
+        float[] outData = new float[(int)total];
+        Span<float> view = new Span<float>(data, outData.Length);
+        for (int i = 0; i < outData.Length; i = i + 1) {
+            outData[i] = view[i];
+        }
+        return OrtTensor.Wrap(outData, dims);
+    }
+
+    /// 读会话的输入/输出名（isInput 选边），名字经默认分配器
+    /// 取出即拷贝即释放。
+    string[] ReadNames(bool isInput) {
+        nint allocCell = NativeMemory.Alloc(8);
+        new Span<long>(allocCell, 1)[0] = 0;
+        OrtFnGetAllocatorWithDefaultOptions gAlloc =
+            (OrtFnGetAllocatorWithDefaultOptions)Ort.Slot(Ort.api, Ort.OFF_GET_ALLOCATOR_WITH_DEFAULT_OPTIONS);
+        nint st = gAlloc(allocCell);
+        nint alloc = new Span<long>(allocCell, 1)[0];
+        NativeMemory.Free(allocCell);
+        Ort.Check(st, "GetAllocatorWithDefaultOptions");
+
+        nint countCell = NativeMemory.Alloc(8);
+        new Span<long>(countCell, 1)[0] = 0;
+        if (isInput) {
+            OrtFnSessionGetCount gCount =
+                (OrtFnSessionGetCount)Ort.Slot(Ort.api, Ort.OFF_SESSION_GET_INPUT_COUNT);
+            st = gCount(this.session, countCell);
+        } else {
+            OrtFnSessionGetCount gCount =
+                (OrtFnSessionGetCount)Ort.Slot(Ort.api, Ort.OFF_SESSION_GET_OUTPUT_COUNT);
+            st = gCount(this.session, countCell);
+        }
+        Ort.Check(st, isInput ? "SessionGetInputCount" : "SessionGetOutputCount");
+        int count = (int)new Span<long>(countCell, 1)[0];
+        NativeMemory.Free(countCell);
+        string[] names = new string[count];
+        for (int i = 0; i < count; i = i + 1) {
+            nint nameCell = NativeMemory.Alloc(8);
+            new Span<long>(nameCell, 1)[0] = 0;
+            nint nameSt;
+            if (isInput) {
+                OrtFnSessionGetName gName =
+                    (OrtFnSessionGetName)Ort.Slot(Ort.api, Ort.OFF_SESSION_GET_INPUT_NAME);
+                nameSt = gName(this.session, i, alloc, nameCell);
+            } else {
+                OrtFnSessionGetName gName =
+                    (OrtFnSessionGetName)Ort.Slot(Ort.api, Ort.OFF_SESSION_GET_OUTPUT_NAME);
+                nameSt = gName(this.session, i, alloc, nameCell);
+            }
+            nint namePtr = new Span<long>(nameCell, 1)[0];
+            NativeMemory.Free(nameCell);
+            Ort.Check(nameSt, "SessionGetName");
+            names[i] = CString(namePtr);
+            OrtFnAllocatorFree afree =
+                (OrtFnAllocatorFree)Ort.Slot(Ort.api, Ort.OFF_ALLOCATOR_FREE);
+            nint fst = afree(alloc, namePtr);
+            Ort.Check(fst, "AllocatorFree");
+        }
+        return names;
+    }
+}
+
+/// <summary>一个 float32 张量：数据托管副本 + 形状。
+/// 工厂按维度构造，Run 的输入输出都是它。</summary>
+class OrtTensor {
+    /// 行主序数据。
+    float[] data;
+    /// 各维长度。
+    long[] shape;
+
+    static OrtTensor Wrap(float[] d, long[] s) {
+        OrtTensor t = new OrtTensor();
+        t.data = d;
+        t.shape = s;
+        return t;
+    }
+
+    /// 以给定形状包装数据（长度不匹配抛异常）。
+    static OrtTensor Of(float[] d, long[] s) {
+        long total = 1;
+        for (int i = 0; i < s.Length; i = i + 1) { total = total * s[i]; }
+        if (total != d.Length) {
+            throw new InvalidOperationException("张量形状与数据长度不符: "
+                + Convert.ToString(total) + " vs " + Convert.ToString(d.Length));
+        }
+        return OrtTensor.Wrap(d, s);
+    }
+
+    /// 一维向量。
+    static OrtTensor Vector(float[] d) {
+        long[] s = new long[1];
+        s[0] = d.Length;
+        return OrtTensor.Wrap(d, s);
+    }
+
+    /// 二维矩阵（行主序）。
+    static OrtTensor Matrix(int rows, int cols, float[] d) {
+        long[] s = new long[2];
+        s[0] = rows;
+        s[1] = cols;
+        return OrtTensor.Of(d, s);
+    }
+
+    /// 标量。
+    static OrtTensor Scalar(float v) {
+        float[] d = new float[1];
+        d[0] = v;
+        long[] s = new long[1];
+        s[0] = 1;
+        return OrtTensor.Wrap(d, s);
+    }
+
+    /// 数据（行主序托管副本）。
+    float[] Data() { return this.data; }
+
+    /// 形状（各维长度）。
+    long[] Shape() { return this.shape; }
+
+    /// 维数。
+    int Rank() { return this.shape.Length; }
+
+    /// 元素总数。
+    long ElementCount() {
+        long total = 1;
+        for (int i = 0; i < this.shape.Length; i = i + 1) {
+            total = total * this.shape[i];
+        }
+        return total;
+    }
+
+    /// 供会话内部批量搬运的数据视图。
+    Span<float> Span() { return new Span<float>(this.data, this.data.Length); }
+}
+
+// ---- ONNX Runtime C API 的调用形式（按需声明）----
+/// OrtApiBase::GetApi：请求版本化函数表。
+delegate nint OrtFnGetApi(int version);
+/// OrtApiBase::GetVersionString。
+delegate string OrtFnVersionString();
+/// CreateEnv(level, logid, OrtEnv** out) -> OrtStatus*。
+delegate nint OrtFnCreateEnv(int level, string logid, nint outEnv);
+/// CreateSessionOptions(OrtSessionOptions** out) -> OrtStatus*。
+delegate nint OrtFnCreateSessionOptions(nint outOptions);
+/// CreateSessionFromArray(env, modelData, len, options, OrtSession** out)。
+delegate nint OrtFnCreateSessionFromArray(nint env, nint modelData, long len,
+                                          nint options, nint outSession);
+/// GetAllocatorWithDefaultOptions(OrtAllocator** out)。
+delegate nint OrtFnGetAllocatorWithDefaultOptions(nint outAllocator);
+/// SessionGetInputCount / SessionGetOutputCount(session, size_t* out)。
+delegate nint OrtFnSessionGetCount(nint session, nint outCount);
+/// SessionGetInputName / SessionGetOutputName(session, i, alloc, char** out)。
+delegate nint OrtFnSessionGetName(nint session, long index, nint allocator,
+                                  nint outName);
+/// AllocatorFree(alloc, ptr) -> OrtStatus*。
+delegate nint OrtFnAllocatorFree(nint allocator, nint ptr);
+/// CreateCpuMemoryInfo(allocType, memType, OrtMemoryInfo** out)。
+delegate nint OrtFnCreateCpuMemoryInfo(int allocType, int memType, nint outInfo);
+/// CreateTensorWithDataAsOrtValue(info, data, len, shape, rank, elemType, out)。
+delegate nint OrtFnCreateTensorWithValue(nint info, nint data, long len,
+                                         nint shape, long rank, int elemType,
+                                         nint outValue);
+/// Run(session, opts, inNames, inValues, nIn, outNames, nOut, outValues)
+/// ——注意输出个数在输出值数组之前（v1.30 头文件实测）。
+delegate nint OrtFnRun(nint session, nint runOptions, nint inNames,
+                       nint inValues, long nInputs, nint outNames,
+                       long nOutputs, nint outValues);
+/// GetTensorMutableData(value, void** out)。
+delegate nint OrtFnGetTensorMutableData(nint value, nint outData);
+/// GetTensorTypeAndShape(value, OrtTensorTypeAndShapeInfo** out)。
+delegate nint OrtFnGetTensorTypeAndShape(nint value, nint outInfo);
+/// GetDimensionsCount(info, size_t* out)。
+delegate nint OrtFnGetDimensionsCount(nint info, nint outCount);
+/// GetDimensions(info, int64* dims, len)。
+delegate nint OrtFnGetDimensions(nint info, nint dims, long len);
+/// Release 系统一形式（ReleaseEnv/Status/MemoryInfo/Session/
+/// SessionOptions/Value/TensorTypeAndShapeInfo）。
+delegate void OrtFnRelease(nint p);
+/// GetErrorMessage(status) -> const char*。
+delegate string OrtFnGetErrorMessage(nint status);
+/// OrtGetApiBase() -> const OrtApiBase*。
+delegate nint OrtGetApiBaseFn();
