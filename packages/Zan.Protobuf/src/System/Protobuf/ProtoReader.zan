@@ -1,0 +1,290 @@
+using System;
+
+namespace System.Protobuf;
+
+/// <summary>
+/// protobuf 线格式读取器：在 byte[] 上游走，Next() 取下一个字段
+/// （字段号 + wire type），按 wire type 读取值，或 Skip() 跳过未知
+/// 字段（五种 wire type 全支持，含已废弃的 group 配对跳过）。只做
+/// wire format——字段与消息模式的对应关系由调用方维护。
+/// </summary>
+class ProtoReader {
+    byte[] buf;
+    int pos;
+    int len;
+    int curField;
+    int curWire;
+
+    /// 包装整段编码字节。
+    public ProtoReader(byte[] data) {
+        buf = data;
+        pos = 0;
+        len = data.Length;
+        curField = 0;
+        curWire = 0;
+    }
+
+    /// 包装一段切片 [offset, offset+count)。
+    public ProtoReader(byte[] data, int offset, int count) {
+        buf = data;
+        pos = offset;
+        len = offset + count;
+        curField = 0;
+        curWire = 0;
+    }
+
+    /// 当前字段号（Next 为真时有效）。
+    int FieldNumber() { return curField; }
+    /// 当前 wire type（0 varint / 1 fixed64 / 2 len / 5 fixed32）。
+    int WireType() { return curWire; }
+
+    /// <summary>前进到下一个字段；输入耗尽返回假。tag 非法（字段号
+    /// 0 或 varint 截断）即抛 ProtoException。</summary>
+    bool Next() {
+        if (pos >= len) { return false; }
+        long tag = ReadVarint();
+        curField = (int)(tag >> 3);
+        curWire = (int)(tag & 7);
+        if (curField == 0) {
+            throw new ProtoException("field number 0 at byte "
+                + Convert.ToString(pos));
+        }
+        return true;
+    }
+
+    long ReadVarint() {
+        long result = 0;
+        int shift = 0;
+        while (pos < len) {
+            int b = buf[pos] & 255;
+            pos = pos + 1;
+            result = result + ((long)(b & 127) << shift);
+            if ((b & 128) == 0) { return result; }
+            shift = shift + 7;
+            if (shift > 63) {
+                throw new ProtoException("varint longer than 10 bytes at byte "
+                    + Convert.ToString(pos));
+            }
+        }
+        throw new ProtoException("truncated varint at byte "
+            + Convert.ToString(pos));
+    }
+
+    void Need(int n) {
+        // 用减法比较：pos + n 在极端 varint 长度下会溢出 int 绕过检查。
+        if (n < 0 || n > len - pos) {
+            throw new ProtoException("truncated at byte "
+                + Convert.ToString(pos) + " (need " + Convert.ToString(n) + ")");
+        }
+    }
+
+    // ===== 按当前字段读值（调用方按自己的 schema 选） =====
+
+    /// varint 字段原始 64 位（int64/uint64/bool/enum 共用）。
+    long ReadVarintField() {
+        ExpectWire(0, "varint");
+        return ReadVarint();
+    }
+
+    /// int32 字段：截断到低 32 位二补码（规范行为——编码侧负数是
+    /// 10 字节 64 位形态，读取按 int32 解释）。
+    int ReadInt32() {
+        return (int)ReadVarintField();
+    }
+
+    /// int64 字段。
+    long ReadInt64() {
+        return ReadVarintField();
+    }
+
+    /// uint32 字段（0..4294967295）。
+    long ReadUint32() {
+        return ReadVarintField() & 4294967295;
+    }
+
+    /// uint64 字段。
+    long ReadUint64() {
+        return ReadVarintField();
+    }
+
+    /// bool 字段。
+    bool ReadBool() {
+        return ReadVarintField() != 0;
+    }
+
+    /// enum 字段（int32 形态）。
+    int ReadEnum() {
+        return (int)ReadVarintField();
+    }
+
+    /// sint32 字段：ZigZag 逆映射。
+    int ReadSint32() {
+        long z = ReadVarintField();
+        return (int)(((z >> 1) & 2147483647) ^ (0 - (z & 1)));
+    }
+
+    /// sint64 字段：ZigZag 逆映射（逻辑右移清符号扩展）。
+    long ReadSint64() {
+        long z = ReadVarintField();
+        return ((z >> 1) & 9223372036854775807) ^ (0 - (z & 1));
+    }
+
+    /// fixed64 字段（小端 64 位）。
+    long ReadFixed64() {
+        ExpectWire(1, "fixed64");
+        Need(8);
+        long v = ((long)(buf[pos] & 255))
+            | ((long)(buf[pos + 1] & 255) << 8)
+            | ((long)(buf[pos + 2] & 255) << 16)
+            | ((long)(buf[pos + 3] & 255) << 24)
+            | ((long)(buf[pos + 4] & 255) << 32)
+            | ((long)(buf[pos + 5] & 255) << 40)
+            | ((long)(buf[pos + 6] & 255) << 48)
+            | ((long)(buf[pos + 7] & 255) << 56);
+        pos = pos + 8;
+        return v;
+    }
+
+    /// fixed32 字段（小端 32 位）。
+    long ReadFixed32() {
+        ExpectWire(5, "fixed32");
+        Need(4);
+        long v = ((long)(buf[pos] & 255))
+            | ((long)(buf[pos + 1] & 255) << 8)
+            | ((long)(buf[pos + 2] & 255) << 16)
+            | ((long)(buf[pos + 3] & 255) << 24);
+        pos = pos + 4;
+        return v;
+    }
+
+    /// double 字段。
+    double ReadDouble() {
+        return BitsDouble(ReadFixed64());
+    }
+
+    /// string 字段（UTF-8 解码）。
+    string ReadString() {
+        byte[] b = ReadBytes();
+        return Encoding.GetString(b, 0, b.Length);
+    }
+
+    /// bytes 字段（复制成新 byte[]）。
+    byte[] ReadBytes() {
+        ExpectWire(2, "length-delimited");
+        int n = (int)ReadVarint();
+        Need(n);
+        byte[] out2 = new byte[n];
+        NativeMemory.Copy((nint)out2, (nint)buf + pos, n);
+        pos = pos + n;
+        return out2;
+    }
+
+    /// <summary>嵌套消息：返回该字段的载荷字节（未解析）。要流式读
+    /// 子字段，把它包进 <c>new ProtoReader(payload)</c>；要跳过时
+    /// 直接 <see cref="Skip"/>，不必取载荷。</summary>
+    byte[] ReadMessage() {
+        return ReadBytes();
+    }
+
+    /// <summary>跳过当前字段（任意 wire type）。SGROUP（3）向下
+    /// 配对到 EGROUP（4）——嵌套深度限 512，防恶意构造。</summary>
+    void Skip() {
+        SkipDepth(0);
+    }
+
+    void SkipDepth(int depth) {
+        if (depth > 512) {
+            throw new ProtoException("group nesting too deep at byte "
+                + Convert.ToString(pos));
+        }
+        int w = curWire;
+        if (w == 0) { ReadVarint(); }
+        else if (w == 1) { Need(8); pos = pos + 8; }
+        else if (w == 2) {
+            int n = (int)ReadVarint();
+            Need(n);
+            pos = pos + n;
+        } else if (w == 3) {
+            bool closed = false;
+            while (pos < len) {
+                long tag = ReadVarint();
+                int f = (int)(tag >> 3);
+                int g = (int)(tag & 7);
+                if (f == 0) {
+                    throw new ProtoException("field number 0 in group at byte "
+                        + Convert.ToString(pos));
+                }
+                if (g == 4) { closed = true; break; }
+                curWire = g;
+                SkipDepth(depth + 1);
+            }
+            if (!closed) {
+                throw new ProtoException("unterminated group at byte "
+                    + Convert.ToString(pos));
+            }
+        } else if (w == 5) { Need(4); pos = pos + 4; }
+        else {
+            throw new ProtoException("unknown wire type " + Convert.ToString(w)
+                + " at byte " + Convert.ToString(pos));
+        }
+    }
+
+    void ExpectWire(int want, string what) {
+        if (curWire != want) {
+            throw new ProtoException("wire type mismatch: expected "
+                + what + " (" + Convert.ToString(want) + "), got "
+                + Convert.ToString(curWire) + " for field "
+                + Convert.ToString(curField));
+        }
+    }
+
+    /// <summary>由 IEEE-754 位模式还原 double：二进制定点逐位累加
+    /// 尾数（每项 2^(b-52) 恰好可表示，和不超过 53 位有效位、精确），
+    /// 再乘 2 的幂（幂的乘除精确，只动指数）。与 Zan.Data 的
+    /// MySqlWire.ieeeToText 同一算法形状。次正规数、±∞、NaN 都还原。</summary>
+    static double BitsDouble(long bits) {
+        int sign = (int)((bits >> 63) & 1);
+        int exp = (int)((bits >> 52) & 2047);
+        long mant = bits & 4503599627370495;             // 2^52-1
+        if (exp == 2047) {
+            // 2^1024 溢出成 +∞；∞-∞ 得 NaN。不能递归自造（位型仍是
+            // 特殊值，会无限递归）。
+            double inf = Pow2(1024);
+            if (mant == 0) { return sign == 1 ? 0.0 - inf : inf; }
+            return inf - inf;
+        }
+        double m = 0.0;
+        if (exp == 0) {
+            if (mant == 0) { return sign == 1 ? -1.0 * 0.0 : 0.0; }  // ±0
+            // 次正规：无隐含 1，指数固定 -1022。
+            int b = 51;
+            while (b >= 0) {
+                if (((mant >> b) & 1) == 1) { m = m + Pow2(b - 52); }
+                b = b - 1;
+            }
+            double v = m * Pow2(-1022);
+            return sign == 1 ? 0.0 - v : v;
+        }
+        m = 1.0;
+        int b2 = 51;
+        while (b2 >= 0) {
+            if (((mant >> b2) & 1) == 1) { m = m + Pow2(b2 - 52); }
+            b2 = b2 - 1;
+        }
+        double r = m * Pow2(exp - 1023);
+        return sign == 1 ? 0.0 - r : r;
+    }
+
+    /// 2 的 e 次幂（循环乘除；2 的幂乘除只动指数，精确）。
+    static double Pow2(int e) {
+        double v = 1.0;
+        if (e >= 0) {
+            int i = 0;
+            while (i < e) { v = v * 2.0; i = i + 1; }
+        } else {
+            int i = 0;
+            while (i > e) { v = v / 2.0; i = i - 1; }
+        }
+        return v;
+    }
+}

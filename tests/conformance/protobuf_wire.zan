@@ -1,0 +1,266 @@
+// Protobuf wire-format test: official encoding vectors (Test1 150,
+// "testing", nested 1a 03 08 96 01, packed 12 06 03 8e 02 9e a7 05),
+// zigzag round-trips at int32/int64 extremes, 10-byte negative varint,
+// max field-number tag, fixed32/64, IEEE-754 double encode/decode
+// (incl. ±inf / NaN / -0.0 via crafted bits), unknown-field skipping
+// (varint/fixed64/len/SGROUP+EGROUP, nested groups), reader slices,
+// and error paths (truncation, field 0, overlong length, bad wire type).
+using System;
+using System.Json;
+using System.Protobuf;
+
+namespace Conf;
+
+class Prog {
+    static int bad = 0;
+
+    static string Hex(byte[] b) {
+        StringBuilder sb = new StringBuilder();
+        string hex = "0123456789abcdef";
+        int i = 0;
+        while (i < b.Length) {
+            if (i > 0) { sb.Append(" "); }
+            int v = b[i] & 255;
+            sb.Append(hex.Substring(v >> 4, 1));
+            sb.Append(hex.Substring(v & 15, 1));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static void Chk(string label, string got, string want) {
+        if (got != want) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static void ChkL(string label, long got, long want) {
+        if (got != want) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static void Main() {
+        // --- 官方向量：写出侧 ---
+        ProtoWriter w = new ProtoWriter();
+        w.WriteInt32(1, 150);
+        Chk("varint150", Hex(w.ToBytes()), "08 96 01");
+        ProtoWriter w2 = new ProtoWriter();
+        w2.WriteString(2, "testing");
+        Chk("string", Hex(w2.ToBytes()), "12 07 74 65 73 74 69 6e 67");
+        ProtoWriter w3 = new ProtoWriter();
+        w3.WriteMessage(3, w.ToBytes());
+        Chk("nested-payload", Hex(w3.ToBytes()), "1a 03 08 96 01");
+        ProtoWriter w4 = new ProtoWriter();
+        int m = w4.BeginMessage(3);
+        w4.WriteInt32(1, 150);
+        w4.EndMessage();
+        Chk("nested-stream", Hex(w4.ToBytes()), "1a 03 08 96 01");
+
+        // ZigZag 与 10 字节负 varint。
+        ProtoWriter w5 = new ProtoWriter();
+        w5.WriteSint32(1, -2);
+        Chk("zigzag32", Hex(w5.ToBytes()), "08 03");
+        ProtoWriter w5b = new ProtoWriter();
+        w5b.WriteSint64(1, -1);
+        Chk("zigzag64", Hex(w5b.ToBytes()), "08 01");
+        ProtoWriter w6 = new ProtoWriter();
+        w6.WriteInt32(1, -1);
+        Chk("negint32", Hex(w6.ToBytes()), "08 ff ff ff ff ff ff ff ff ff 01");
+
+        // packed：[3, 270, 86942]。
+        ProtoWriter w7 = new ProtoWriter();
+        int pm = w7.BeginMessage(2);
+        w7.RawVarint(3);
+        w7.RawVarint(270);
+        w7.RawVarint(86942);
+        w7.EndMessage();
+        Chk("packed", Hex(w7.ToBytes()), "12 06 03 8e 02 9e a7 05");
+
+        // double 1.5 / fixed32 / 最大字段号。
+        ProtoWriter w8 = new ProtoWriter();
+        w8.WriteDouble(1, 1.5);
+        Chk("double15", Hex(w8.ToBytes()), "09 00 00 00 00 00 00 f8 3f");
+        ProtoWriter w9 = new ProtoWriter();
+        w9.WriteFixed32(1, 1);
+        Chk("fixed32", Hex(w9.ToBytes()), "0d 01 00 00 00");
+        ProtoWriter w10 = new ProtoWriter();
+        w10.WriteInt32(536870911, 1);
+        Chk("bigfield", Hex(w10.ToBytes()), "f8 ff ff ff 0f 01");
+
+        // WriteMessage 拷贝载荷：改源数组不影响已编字节。
+        byte[] src = new byte[2];
+        src[0] = (byte)8; src[1] = (byte)1;
+        ProtoWriter wc = new ProtoWriter();
+        wc.WriteMessage(1, src);
+        src[1] = (byte)9;
+        Chk("payload-copy", Hex(wc.ToBytes()), "0a 02 08 01");
+
+        // --- 读取侧 ---
+        ProtoReader r = new ProtoReader(w3.ToBytes());
+        if (!r.Next()) { bad = bad + 1; Console.WriteLine("FAIL next1"); }
+        ChkL("r.field", r.FieldNumber(), 3);
+        ChkL("r.wire", r.WireType(), 2);
+        byte[] payload = r.ReadMessage();
+        ProtoReader inner = new ProtoReader(payload);
+        if (!inner.Next()) { bad = bad + 1; Console.WriteLine("FAIL inner-next"); }
+        ChkL("inner.field", inner.FieldNumber(), 1);
+        ChkL("inner.val", inner.ReadInt32(), 150);
+        if (inner.Next()) { bad = bad + 1; Console.WriteLine("FAIL inner-extra"); }
+
+        // 切片读取：跳过外层头两个字节直读内层 varint。
+        byte[] whole = w3.ToBytes();
+        ProtoReader rs = new ProtoReader(whole, 2, 3);
+        rs.Next();
+        ChkL("slice.val", rs.ReadInt32(), 150);
+
+        // ZigZag 极端往返。
+        ProtoWriter wz = new ProtoWriter();
+        wz.WriteSint32(1, -2147483648);
+        wz.WriteSint32(2, 2147483647);
+        wz.WriteSint64(3, -9223372036854775807 - 1);
+        wz.WriteSint64(4, 9223372036854775807);
+        ProtoReader rz = new ProtoReader(wz.ToBytes());
+        rz.Next();
+        ChkL("zz-min32", rz.ReadSint32(), -2147483648);
+        rz.Next();
+        ChkL("zz-max32", rz.ReadSint32(), 2147483647);
+        rz.Next();
+        ChkL("zz-min64", rz.ReadSint64(), -9223372036854775807 - 1);
+        rz.Next();
+        ChkL("zz-max64", rz.ReadSint64(), 9223372036854775807);
+
+        // int64/uint64 大值。
+        ProtoWriter wi = new ProtoWriter();
+        wi.WriteInt64(1, -9223372036854775807 - 1);
+        wi.WriteUint64(2, 9223372036854775807);
+        ProtoReader ri = new ProtoReader(wi.ToBytes());
+        ri.Next();
+        ChkL("i64-min", ri.ReadInt64(), -9223372036854775807 - 1);
+        ri.Next();
+        ChkL("u64", ri.ReadUint64(), 9223372036854775807);
+
+        // bool / uint32 / bytes / double 往返 + double 特殊值解码。
+        ProtoWriter wb = new ProtoWriter();
+        wb.WriteBool(1, true);
+        wb.WriteUint32(2, 4294967295);
+        byte[] blob = new byte[3];
+        blob[0] = (byte)1; blob[1] = (byte)2; blob[2] = (byte)3;
+        wb.WriteBytes(3, blob);
+        wb.WriteDouble(4, 2.5);
+        wb.WriteDouble(5, -1.5);
+        ProtoReader rb = new ProtoReader(wb.ToBytes());
+        rb.Next();
+        ChkL("bool", rb.ReadBool() ? 1 : 0, 1);
+        rb.Next();
+        ChkL("u32max", rb.ReadUint32(), 4294967295);
+        rb.Next();
+        byte[] got = rb.ReadBytes();
+        ChkL("bytes.len", got.Length, 3);
+        ChkL("bytes.2", got[2] & 255, 3);
+        rb.Next();
+        double d = rb.ReadDouble();
+        if (d != 2.5) { bad = bad + 1; Console.WriteLine("FAIL double-2.5"); }
+        rb.Next();
+        double dn = rb.ReadDouble();
+        if (dn != -1.5) { bad = bad + 1; Console.WriteLine("FAIL double-neg"); }
+        // 手工位型：+inf、-inf、NaN、-0.0（写出器不产这些 double，
+        // 用 fixed64 直接给位型，读取要还原）。
+        ProtoWriter wf = new ProtoWriter();
+        wf.WriteFixed64(1, 9218868437227405312);           // 0x7FF0.. = +inf
+        wf.WriteFixed64(2, -4503599627370496);             // 0xFFF0.. = -inf
+        wf.WriteFixed64(3, 9221120237041090560);           // 0x7FF8.. = NaN
+        wf.WriteFixed64(4, -9223372036854775807 - 1);      // 0x8000.. = -0.0
+        ProtoReader rf = new ProtoReader(wf.ToBytes());
+        rf.Next();
+        double pinf = rf.ReadDouble();
+        if (pinf != pinf || !(pinf > 1e308)) { bad = bad + 1; Console.WriteLine("FAIL inf"); }
+        rf.Next();
+        double ninf = rf.ReadDouble();
+        if (ninf != ninf || !(ninf < -1e308)) { bad = bad + 1; Console.WriteLine("FAIL -inf"); }
+        rf.Next();
+        double nanv = rf.ReadDouble();
+        if (nanv == nanv) { bad = bad + 1; Console.WriteLine("FAIL nan"); }
+        rf.Next();
+        double nz = rf.ReadDouble();
+        if (nz != 0.0 || 1.0 / nz > 0.0) { bad = bad + 1; Console.WriteLine("FAIL -0.0"); }
+
+        // 未知字段跳过：varint / fixed64 / len 各一 + 只读目标字段。
+        ProtoWriter wu = new ProtoWriter();
+        wu.WriteInt32(8, 300);
+        wu.WriteFixed64(15, 12345);
+        wu.WriteString(9, "xy");
+        wu.WriteString(2, "testing");
+        ProtoReader ru = new ProtoReader(wu.ToBytes());
+        bool saw2 = false;
+        while (ru.Next()) {
+            if (ru.FieldNumber() == 2) {
+                if (ru.ReadString() == "testing") { saw2 = true; }
+            } else {
+                ru.Skip();
+            }
+        }
+        if (!saw2) { bad = bad + 1; Console.WriteLine("FAIL skip-round"); }
+
+        // 手工构造 group（写出器不产）：field9 SGROUP，内含 varint 与
+        // 嵌套 group，EGROUP 收口；跳过后读目标 string。
+        byte[] grp = new byte[] {
+            (byte)75, (byte)8, (byte)7,                     // 9/3 { 1: 7
+            (byte)67, (byte)8, (byte)1, (byte)68,           //   8/3 { 1:1 } 嵌套
+            (byte)76,                                       // }
+            (byte)18, (byte)7, 116, 101, 115, 116, 105, 110, 103  // 2: "testing"
+        };
+        ProtoReader rg = new ProtoReader(grp);
+        bool gsaw = false;
+        while (rg.Next()) {
+            if (rg.FieldNumber() == 2) {
+                if (rg.ReadString() == "testing") { gsaw = true; }
+            } else {
+                rg.Skip();
+            }
+        }
+        if (!gsaw) { bad = bad + 1; Console.WriteLine("FAIL group-skip"); }
+
+        // --- 错误路径 ---
+        try {
+            ProtoReader rt = new ProtoReader(new byte[] { (byte)8 });
+            rt.Next();
+            rt.ReadInt32();
+            Console.WriteLine("trunc-varint NOT THROWN");
+            bad = bad + 1;
+        } catch (ProtoException) { }
+        try {
+            ProtoReader r0 = new ProtoReader(new byte[] { (byte)0 });
+            r0.Next();
+            Console.WriteLine("field0 NOT THROWN");
+            bad = bad + 1;
+        } catch (ProtoException) { }
+        try {
+            ProtoReader rl = new ProtoReader(new byte[] { (byte)18, (byte)127 });
+            rl.Next();
+            rl.ReadString();
+            Console.WriteLine("overrun-len NOT THROWN");
+            bad = bad + 1;
+        } catch (ProtoException) { }
+        try {
+            // field1 wire7：未知 wire type，Skip 必须报错。
+            ProtoReader rw = new ProtoReader(new byte[] { (byte)15 });
+            rw.Next();
+            rw.Skip();
+            Console.WriteLine("bad-wire NOT THROWN");
+            bad = bad + 1;
+        } catch (ProtoException) { }
+        // 未闭合 group。
+        try {
+            ProtoReader rg2 = new ProtoReader(new byte[] { (byte)75, (byte)8, (byte)7 });
+            rg2.Next();
+            rg2.Skip();
+            Console.WriteLine("open-group NOT THROWN");
+            bad = bad + 1;
+        } catch (ProtoException) { }
+
+        Console.WriteLine("protobuf-wire-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

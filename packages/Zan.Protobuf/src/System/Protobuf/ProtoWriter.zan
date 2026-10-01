@@ -1,0 +1,279 @@
+using System;
+
+namespace System.Protobuf;
+
+/// <summary>
+/// protobuf 线格式写出器：往可增长的 byte[] 里按字段号编码标量、
+/// 字符串/字节串、嵌套消息与 packed 重复字段。只做 wire format——
+/// 没有 .proto schema 与代码生成，字段号由调用方给出（与手写
+/// proto 的编码约定一致）。字节缓冲的倍增扩容走 NativeMemory.Copy
+/// 整块搬移（与 ByteBuffer 同形），不用逐字节循环。
+/// </summary>
+class ProtoWriter {
+    byte[] buf;
+    int len;
+    // BeginMessage/EndMessage 的未闭合子消息栈：偶数下标是字段号，
+    // 奇数下标是对应载荷起始位置（mark）。交错压入保证配对。
+    List<int> openFields;
+    List<int> openMarks;
+
+    /// 构造一个空写出器。
+    public ProtoWriter() {
+        buf = new byte[64];
+        len = 0;
+        openFields = new List<int>();
+        openMarks = new List<int>();
+    }
+
+    /// 已编码字节数。
+    int Length() { return len; }
+
+    void EnsureRoom(int extra) {
+        if (len + extra <= buf.Length) { return; }
+        int c = buf.Length * 2;
+        if (c < 16) { c = 16; }
+        while (c < len + extra) { c = c * 2; }
+        byte[] grown = new byte[c];
+        NativeMemory.Copy((nint)grown, (nint)buf, len);
+        buf = grown;
+    }
+
+    /// 校验字段号范围（1 .. 2^29-1），返回打上 wire type 的 tag key。
+    static long Tag(int field, int wire) {
+        if (field < 1 || field > 536870911) {
+            throw new ProtoException("field number out of range: "
+                + Convert.ToString(field));
+        }
+        return ((long)field << 3) | (long)wire;
+    }
+
+    /// 追加 1 字节。
+    void RawU8(int b) {
+        EnsureRoom(1);
+        buf[len] = (byte)b;
+        len = len + 1;
+    }
+
+    /// <summary>追加无 tag 的 64 位 varint（LEB128，负数走 10 字节
+    /// 形态）。公开给 packed 重复字段用：BeginMessage 后连续调
+    /// RawVarint 即是 packed varint 载荷。</summary>
+    void RawVarint(long v) {
+        long x = v;
+        while ((x & -128) != 0) {
+            RawU8((int)((x & 127) | 128));
+            x = (x >> 7) & 144115188075855871;   // 清掉算术右移的符号扩展位
+        }
+        RawU8((int)(x & 127));
+    }
+
+    /// 追加无 tag 的小端 64 位。
+    void RawFixed64(long v) {
+        EnsureRoom(8);
+        buf[len] = (byte)v;
+        buf[len + 1] = (byte)(v >> 8);
+        buf[len + 2] = (byte)(v >> 16);
+        buf[len + 3] = (byte)(v >> 24);
+        buf[len + 4] = (byte)(v >> 32);
+        buf[len + 5] = (byte)(v >> 40);
+        buf[len + 6] = (byte)(v >> 48);
+        buf[len + 7] = (byte)(v >> 56);
+        len = len + 8;
+    }
+
+    /// 追加无 tag 的小端 32 位。
+    void RawFixed32(long v) {
+        EnsureRoom(4);
+        buf[len] = (byte)v;
+        buf[len + 1] = (byte)(v >> 8);
+        buf[len + 2] = (byte)(v >> 16);
+        buf[len + 3] = (byte)(v >> 24);
+        len = len + 4;
+    }
+
+    // ===== 有 tag 的字段写出（wire type 0：varint） =====
+
+    /// int32 字段：负数按 64 位二补码 varint 编码（10 字节，规范行为）。
+    void WriteInt32(int field, int v) { WriteVarint(field, v); }
+    /// int64 字段。
+    void WriteInt64(int field, long v) { WriteVarint(field, v); }
+    /// uint32 字段（0..4294967295 以 long 传入）。
+    void WriteUint32(int field, long v) { WriteVarint(field, v); }
+    /// uint64 字段。
+    void WriteUint64(int field, long v) { WriteVarint(field, v); }
+    /// bool 字段（true=1，false=0）。
+    void WriteBool(int field, bool v) { WriteVarint(field, v ? 1 : 0); }
+    /// enum 字段（按 int32 编码）。
+    void WriteEnum(int field, int v) { WriteVarint(field, v); }
+
+    /// varint 字段的共同主体。
+    void WriteVarint(int field, long v) {
+        long tag = Tag(field, 0);
+        RawVarint(tag);
+        RawVarint(v);
+    }
+
+    /// <summary>sint32 字段：ZigZag 映射（0→0，-1→1，1→2，…），
+    /// 小负数不付 10 字节代价。</summary>
+    void WriteSint32(int field, int v) {
+        long z = (long)((v << 1) ^ (v >> 31)) & 4294967295;
+        WriteVarint(field, z);
+    }
+
+    /// sint64 字段：ZigZag 映射（64 位）。
+    void WriteSint64(int field, long v) {
+        long z = (v << 1) ^ (v >> 63);
+        WriteVarint(field, z);
+    }
+
+    // ===== wire type 2：长度界定 =====
+
+    /// string 字段（UTF-8）。
+    void WriteString(int field, string s) {
+        byte[] b = Encoding.GetBytes(s);
+        WriteBytesField(field, b, 0, b.Length);
+    }
+
+    /// bytes 字段（整块）。
+    void WriteBytes(int field, byte[] v) {
+        WriteBytesField(field, v, 0, v.Length);
+    }
+
+    /// bytes 字段（切片）。
+    void WriteBytes(int field, byte[] v, int offset, int count) {
+        WriteBytesField(field, v, offset, count);
+    }
+
+    /// 嵌套消息字段：载荷是已经编码好的字节（可用另一个 ProtoWriter
+    /// 编出）。流式嵌套用 BeginMessage/EndMessage。
+    void WriteMessage(int field, byte[] payload) {
+        WriteBytesField(field, payload, 0, payload.Length);
+    }
+
+    void WriteBytesField(int field, byte[] v, int offset, int count) {
+        if (v == null) { throw new ProtoException("null bytes payload"); }
+        if (offset < 0 || count < 0 || offset + count > v.Length) {
+            throw new ProtoException("bytes slice out of range");
+        }
+        RawVarint(Tag(field, 2));
+        RawVarint(count);
+        EnsureRoom(count);
+        NativeMemory.Copy((nint)buf + len, (nint)v + offset, count);
+        len = len + count;
+    }
+
+    /// <summary>定长 64 位字段（fixed64；double 走 WriteDouble）。</summary>
+    void WriteFixed64(int field, long v) {
+        RawVarint(Tag(field, 1));
+        RawFixed64(v);
+    }
+
+    /// 定长 32 位字段（fixed32/sfixed32）。
+    void WriteFixed32(int field, long v) {
+        RawVarint(Tag(field, 5));
+        RawFixed32(v);
+    }
+
+    /// double 字段（IEEE-754 位模式，wire type 1）。
+    void WriteDouble(int field, double v) {
+        WriteFixed64(field, DoubleBits(v));
+    }
+
+    // ===== 流式嵌套 / packed =====
+
+    /// <summary>开始一个子消息（或 packed 重复字段）载荷：记下当前
+    /// 位置并压栈字段号，之后到 <see cref="EndMessage"/> 之间的所有
+    /// 写出都进入该载荷；End 时在载荷前补 tag + varint 长度（载荷
+    /// 整体右移让位）。可嵌套；字段号只做范围校验。</summary>
+    int BeginMessage(int field) {
+        Tag(field, 2);                                   // 只为范围校验
+        openFields.Add(field);
+        openMarks.Add(len);
+        return len;
+    }
+
+    /// 结束最近一个 BeginMessage 打开的载荷，补上长度前缀。
+    void EndMessage() {
+        int n = openFields.Count;
+        if (n == 0) {
+            throw new ProtoException("EndMessage without BeginMessage");
+        }
+        int field = openFields[n - 1];
+        int mark = openMarks[n - 1];
+        openFields.RemoveAt(n - 1);
+        openMarks.RemoveAt(n - 1);
+        int payload = len - mark;
+        // 头部 = tag varint + 长度 varint，各至多 5 字节。
+        int header = 0;
+        long tag = Tag(field, 2);
+        long t = tag;
+        while ((t & -128) != 0) { header = header + 1; t = (t >> 7) & 144115188075855871; }
+        header = header + 1;
+        int h2 = 0;
+        long p = payload;
+        while ((p & -128) != 0) { h2 = h2 + 1; p = (p >> 7) & 144115188075855871; }
+        header = header + h2 + 1;
+        EnsureRoom(header);
+        NativeMemory.Copy((nint)buf + mark + header, (nint)buf + mark, payload);
+        int at = mark;
+        long x = tag;
+        while ((x & -128) != 0) {
+            buf[at] = (byte)((x & 127) | 128);
+            at = at + 1;
+            x = (x >> 7) & 144115188075855871;
+        }
+        buf[at] = (byte)(x & 127);
+        at = at + 1;
+        x = payload;
+        while ((x & -128) != 0) {
+            buf[at] = (byte)((x & 127) | 128);
+            at = at + 1;
+            x = (x >> 7) & 144115188075855871;
+        }
+        buf[at] = (byte)(x & 127);
+        len = len + header;
+    }
+
+    // ===== 结果与 IEEE-754 =====
+
+    /// 取出已编码字节（复制一份；写出器可 Reset 复用）。
+    byte[] ToBytes() {
+        byte[] out2 = new byte[len];
+        NativeMemory.Copy((nint)out2, (nint)buf, len);
+        return out2;
+    }
+
+    /// 清空缓冲（保留分配），从零再编。
+    void Reset() { len = 0; }
+
+    /// <summary>double 的 IEEE-754 位模式：对数值做归一化来构造
+    /// （语言没有 reinterpret 转换）。与 Zan.Data 的
+    /// TdsMessage.DoubleBits 同一算法；±∞ 与 NaN 单独收口——归一化
+    /// 循环对非有限值不终止。</summary>
+    static long DoubleBits(double v) {
+        if (v != v) { return 9221120237041090560; }      // 0x7FF8000000000000，quiet NaN
+        if (v == 0.0) { return 0; }
+        int sign = 0;
+        if (v < 0.0) {
+            sign = 1;
+            v = 0.0 - v;
+        }
+        if (v > 1.7976931348623157e308) {                // ±Infinity
+            return ((long)sign << 63) | 9218868437227405312;  // 0x7FF0 << 52
+        }
+        int exp = 0;
+        while (v >= 2.0) { v = v / 2.0; exp = exp + 1; }
+        while (v < 1.0) { v = v * 2.0; exp = exp - 1; }
+        double frac = v - 1.0;
+        long mant = 0;
+        for (int i = 0; i < 52; i = i + 1) {
+            frac = frac * 2.0;
+            int bit = 0;
+            if (frac >= 1.0) {
+                bit = 1;
+                frac = frac - 1.0;
+            }
+            mant = (mant << 1) | bit;
+        }
+        return ((long)sign << 63) | ((long)(exp + 1023) << 52) | mant;
+    }
+}
