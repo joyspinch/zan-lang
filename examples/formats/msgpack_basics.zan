@@ -1,0 +1,88 @@
+// ============================================================================
+// MessagePack 基础 —— Zan.MsgPack：二进制 JSON，编解码与体量对比
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. MsgPack.Pack / Unpack：JsonValue ↔ msgpack 字节（整数走最短前缀形态）
+//   2. MsgPack.Load / Save：直接读写文件
+//   3. 体量对比：同一段数据 JSON 文本 vs msgpack 字节数
+//
+// 运行：zanc examples/formats/msgpack_basics.zan --auto-stdlib -o mp.exe && ./mp.exe
+// ============================================================================
+using System;
+using System.Json;
+using System.MsgPack;
+
+class Program {
+    static string S(JsonValue v, string d) {
+        if (v == null) { return d; }
+        return v.AsString(d);
+    }
+
+    static long L(JsonValue v, long d) {
+        if (v == null) { return d; }
+        return v.AsLong(d);
+    }
+
+    static double D(JsonValue v, double d) {
+        if (v == null) { return d; }
+        return v.AsDouble(d);
+    }
+
+    /// 字节数组 → 十六进制（演示用，长串截断）。
+    static string Hex(byte[] b) {
+        string digits = "0123456789abcdef";
+        string out2 = "";
+        int i = 0;
+        while (i < b.Length && i < 24) {
+            int v = b[i] & 255;
+            if (i > 0) { out2 = out2 + " "; }
+            out2 = out2 + digits.Substring(v >> 4, 1) + digits.Substring(v & 15, 1);
+            i = i + 1;
+        }
+        if (b.Length > 24) { out2 = out2 + " ..."; }
+        return out2;
+    }
+
+    static void Main() {
+        JsonValue v = JsonValue.NewObject();
+        v.Put("id", JsonValue.NewInt(1234));
+        v.Put("name", JsonValue.NewStr("sensor"));
+        v.Put("ok", JsonValue.NewBool(true));
+        v.Put("gain", JsonValue.NewDouble(0.5));
+        JsonValue tags = JsonValue.NewArray();
+        tags.Append(JsonValue.NewStr("a"));
+        tags.Append(JsonValue.NewStr("b"));
+        v.Put("tags", tags);
+
+        // ---- 编码：fixmap 前缀 + 整数最短形态（1234 → cd 04 d2） ----
+        byte[] bin = MsgPack.Pack(v);
+        Console.WriteLine("msgpack   = " + Hex(bin) + " (" + bin.Length + " bytes)");
+
+        // ---- 解码：回来的树与原值相等 ----
+        JsonValue back = MsgPack.Unpack(bin);
+        Console.WriteLine("id        = " + L(back.Get("id"), 0));
+        Console.WriteLine("name      = " + S(back.Get("name"), ""));
+        Console.WriteLine("ok        = " + (L(back.Get("ok"), 0) == 1));
+        Console.WriteLine("gain      = " + D(back.Get("gain"), 0));
+        JsonValue tagsBack = back.Get("tags");
+        Console.WriteLine("tags      = " + (tagsBack == null ? 0 : tagsBack.Count()));
+
+        // ---- 体量：JSON 文本 vs msgpack ----
+        string json = v.ToJson();
+        Console.WriteLine("size      = json " + json.Length + " chars vs msgpack " + bin.Length + " bytes");
+
+        // ---- 文件：Save/Load 对称 ----
+        MsgPack.Save(v, "_mp_demo.bin");
+        JsonValue disk = MsgPack.Load("_mp_demo.bin");
+        Console.WriteLine("disk      = " + (L(disk.Get("id"), -1) == 1234));
+        File.Delete("_mp_demo.bin");
+
+        // ---- 错误路径：保留类型 0xC1 抛 MsgPackException ----
+        try {
+            MsgPack.Unpack(new byte[] { 193 });
+            Console.WriteLine("reserved  = NOT THROWN");
+        } catch (MsgPackException e) {
+            Console.WriteLine("reserved  = " + e.Message);
+        }
+    }
+}

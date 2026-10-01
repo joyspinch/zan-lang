@@ -1,0 +1,88 @@
+// ============================================================================
+// TOML 配置 —— Zan.Toml（System.Toml）：解析、类型、写出
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. Toml.Parse：TOML 文本 → System.Json.JsonValue（表=对象，数组同序）
+//   2. 核心类型：整数十/十六/八进制、下划线分隔、浮点、bool、日期时间（字符串）
+//   3. 导航：Get/PathGet（"server.host" 点路径直达嵌套表）；缺失返回 null，
+//      示例用 S/L/D 帮助函数统一判空兜底
+//   4. Toml.ToToml：写出。表无序——往返后键序可能变化，语义比对不能比原文
+//
+// 运行：zanc examples/formats/toml_config.zan --auto-stdlib -o toml.exe && ./toml.exe
+// ============================================================================
+using System;
+using System.Json;
+using System.Toml;
+
+class Program {
+    // ---- 可空兜底助手：Get/PathGet 缺失返回 null，取值统一走这里 ----
+    static string S(JsonValue v, string d) {
+        if (v == null) { return d; }
+        return v.AsString(d);
+    }
+
+    static long L(JsonValue v, long d) {
+        if (v == null) { return d; }
+        return v.AsLong(d);
+    }
+
+    static double D(JsonValue v, double d) {
+        if (v == null) { return d; }
+        return v.AsDouble(d);
+    }
+
+    static void Main() {
+        string src = "title = \"deploys\"\n" +
+            "count = 1_000\n" +
+            "mask = 0xff\n" +
+            "perm = 0o755\n" +
+            "ratio = 0.25\n" +
+            "on = true\n" +
+            "date = 1979-05-27\n" +
+            "\n" +
+            "[server]\n" +
+            "host = \"127.0.0.1\"\n" +
+            "ports = [80, 443]\n" +
+            "\n" +
+            "[[items]]\n" +
+            "name = \"a\"\n" +
+            "[[items]]\n" +
+            "name = \"b\"\n";
+
+        JsonValue conf = Toml.Parse(src);
+
+        // ---- 标量与类型 ----
+        Console.WriteLine("title     = " + S(conf.Get("title"), "?"));
+        Console.WriteLine("count     = " + L(conf.Get("count"), 0));       // 下划线分隔
+        Console.WriteLine("mask      = " + L(conf.Get("mask"), 0));       // 0xff → 255
+        Console.WriteLine("perm      = " + L(conf.Get("perm"), 0));       // 0o755 → 493
+        Console.WriteLine("ratio     = " + D(conf.Get("ratio"), 0));
+        Console.WriteLine("date      = " + S(conf.Get("date"), "?"));     // 日期按字符串
+
+        // ---- 嵌套表与数组 ----
+        Console.WriteLine("srv.host  = " + S(conf.PathGet("server.host"), "?"));
+        JsonValue ports = conf.PathGet("server.ports");
+        Console.WriteLine("srv.ports = " + (ports == null ? "?" : L(ports.At(0), 0)
+            + "," + L(ports.At(1), 0)));
+        JsonValue items = conf.Get("items");
+        Console.WriteLine("items     = " + (items == null ? 0 : items.Count())
+            + " (first=" + (items == null ? "?" : S(items.At(0).Get("name"), "?")) + ")");
+
+        // ---- 写出与往返：表无序，比对值不比对文本 ----
+        string out2 = Toml.ToToml(conf);
+        JsonValue back = Toml.Parse(out2);
+        JsonValue itemsBack = back.Get("items");
+        bool same = S(back.PathGet("server.host"), "") == "127.0.0.1"
+            && L(back.Get("mask"), -1) == 255
+            && itemsBack != null && itemsBack.Count() == 2;
+        Console.WriteLine("roundtrip = " + same);
+
+        // ---- 错误路径：重复表头抛 TomlException ----
+        try {
+            Toml.Parse("[a]\nx = 1\n[a]\n");
+            Console.WriteLine("dup-table = NOT THROWN");
+        } catch (TomlException e) {
+            Console.WriteLine("dup-table = " + e.Message);
+        }
+    }
+}

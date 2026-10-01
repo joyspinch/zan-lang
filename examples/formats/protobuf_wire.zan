@@ -1,0 +1,75 @@
+// ============================================================================
+// Protobuf wire 基础 —— Zan.Protobuf：手工编解码 wire 格式
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. ProtoWriter：按 (field, wire) 写 varint / 长度界定 / 嵌套消息
+//   2. ProtoReader：Next() 游标逐字段走，按 FieldNumber/WireType 分发
+//   3. 向前兼容：读到不认识的字段号用 Skip() 跳过——旧代码读新数据不炸
+//   4. 没有 .proto 代码生成：字段号就是契约，适合自带小协议的场景
+//
+// 运行：zanc examples/formats/protobuf_wire.zan --auto-stdlib -o pb.exe && ./pb.exe
+// ============================================================================
+using System;
+using System.Protobuf;
+
+class Program {
+    static void Main() {
+        // ---- 编码：field 1 varint id、field 2 字符串、field 3 嵌套消息 ----
+        ProtoWriter w = new ProtoWriter();
+        w.WriteInt32(1, 1001);
+        w.WriteString(2, "actuator");
+        int mark = w.BeginMessage(3);            // 嵌套：{x: 2, y: 3}
+        w.WriteInt32(1, 2);
+        w.WriteInt32(2, 3);
+        w.EndMessage();
+        byte[] bin = w.ToBytes();
+        Console.WriteLine("bytes     = " + bin.Length + " (field1=08 e9 07, field2=12 08 …)");
+
+        // ---- 解码：逐字段分发 ----
+        ProtoReader r = new ProtoReader(bin);
+        while (r.Next()) {
+            int f = r.FieldNumber();
+            if (f == 1) {
+                Console.WriteLine("id        = " + r.ReadInt32());
+            } else if (f == 2) {
+                Console.WriteLine("name      = " + r.ReadString());
+            } else if (f == 3) {
+                byte[] nested = r.ReadMessage();
+                ProtoReader nr = new ProtoReader(nested);
+                long x = 0;
+                long y = 0;
+                while (nr.Next()) {
+                    if (nr.FieldNumber() == 1) { x = nr.ReadInt64(); }
+                    else if (nr.FieldNumber() == 2) { y = nr.ReadInt64(); }
+                    else { nr.Skip(); }
+                }
+                Console.WriteLine("point     = (" + x + ", " + y + ")");
+            } else {
+                r.Skip();                        // 未知字段：跳过保向前兼容
+            }
+        }
+
+        // ---- 向前兼容演示：新版本加了 field 9 字符串，旧读取器照常解析 ----
+        ProtoWriter w2 = new ProtoWriter();
+        w2.WriteInt32(1, 7);
+        w2.WriteString(9, "future-field");
+        ProtoReader r2 = new ProtoReader(w2.ToBytes());
+        long idOnly = 0;
+        while (r2.Next()) {
+            if (r2.FieldNumber() == 1) { idOnly = r2.ReadInt64(); }
+            else { r2.Skip(); }
+        }
+        Console.WriteLine("forward   = id " + idOnly + ", unknown skipped");
+
+        // ---- 错误路径：长度界定字段截断在读值时抛 ProtoException ----
+        try {
+            // 18 = field 2, wire 2（长度界定）；长度声明 200 但没有载荷。
+            ProtoReader bad = new ProtoReader(new byte[] { 18, 200 });
+            bad.Next();
+            bad.ReadString();
+            Console.WriteLine("truncated = NOT THROWN");
+        } catch (ProtoException e) {
+            Console.WriteLine("truncated = " + e.Message);
+        }
+    }
+}

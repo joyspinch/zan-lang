@@ -1,0 +1,88 @@
+// ============================================================================
+// YAML 配置 —— Zan.Yaml（System.Yaml）：core 子集解析与写出
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. Yaml.Parse：块映射/嵌套/"- k: v" 压缩序列，值树 = System.Json.JsonValue
+//   2. core schema 类型：0x 整数、浮点、true/false、'4' 引号保字符串
+//   3. 块标量 |（字面保留换行）、行内注释
+//   4. Yaml.ToYaml：写出（键序保持），Parse(ToYaml(v)) 可做文本级往返
+//
+// 运行：zanc examples/formats/yaml_config.zan --auto-stdlib -o yaml.exe && ./yaml.exe
+// ============================================================================
+using System;
+using System.Json;
+using System.Yaml;
+
+class Program {
+    // ---- 可空兜底助手：Get/PathGet 缺失返回 null，取值统一走这里 ----
+    static string S(JsonValue v, string d) {
+        if (v == null) { return d; }
+        return v.AsString(d);
+    }
+
+    static long L(JsonValue v, long d) {
+        if (v == null) { return d; }
+        return v.AsLong(d);
+    }
+
+    static double D(JsonValue v, double d) {
+        if (v == null) { return d; }
+        return v.AsDouble(d);
+    }
+
+    static void Main() {
+        string src = "name: deploy\n" +
+            "replicas: 0x10\n" +
+            "ratio: 0.5\n" +
+            "verbose: true\n" +
+            "owner:\n" +
+            "  # 行内注释\n" +
+            "  email: ops@example.com\n" +
+            "limits:\n" +
+            "  cpu: '4'\n" +                       // 引号里的 4 是字符串不是数字
+            "  mem: 2.5e9\n" +
+            "hosts:\n" +
+            "  - host: a.internal\n" +
+            "    port: 8080\n" +
+            "  - host: b.internal\n" +
+            "    port: 8443\n" +
+            "script: |\n" +
+            "  set -e\n" +
+            "  make all\n";
+
+        JsonValue conf = Yaml.Parse(src);
+
+        Console.WriteLine("name      = " + S(conf.Get("name"), "?"));
+        Console.WriteLine("replicas  = " + L(conf.Get("replicas"), 0));      // 0x10 → 16
+        Console.WriteLine("ratio     = " + D(conf.Get("ratio"), 0));
+        Console.WriteLine("verbose   = " + (L(conf.Get("verbose"), 0) == 1));
+        Console.WriteLine("email     = " + S(conf.PathGet("owner.email"), "?"));
+        Console.WriteLine("cpu       = " + S(conf.PathGet("limits.cpu"), "?") + " (string)");
+
+        JsonValue hosts = conf.Get("hosts");
+        int i = 0;
+        if (hosts != null) {
+            while (i < hosts.Count()) {
+                JsonValue h = hosts.At(i);
+                Console.WriteLine("host      = " + S(h.Get("host"), "?")
+                    + ":" + L(h.Get("port"), 0));
+                i = i + 1;
+            }
+        }
+        Console.WriteLine("script    =");
+        Console.Write(S(conf.Get("script"), ""));
+
+        // ---- 写出与往返：键序保持，文本级一致 ----
+        string out2 = Yaml.ToYaml(conf);
+        string back = Yaml.ToYaml(Yaml.Parse(out2));
+        Console.WriteLine("roundtrip = " + (out2 == back));
+
+        // ---- 错误路径：重复键抛 YamlException（带行号） ----
+        try {
+            Yaml.Parse("a: 1\na: 2\n");
+            Console.WriteLine("dup-key   = NOT THROWN");
+        } catch (YamlException e) {
+            Console.WriteLine("dup-key   = " + e.Message);
+        }
+    }
+}
