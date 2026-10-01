@@ -1,0 +1,207 @@
+// YAML core subset test: block maps/seqs (compact "- k: v" nesting),
+// flow collections (multi-line), quoted scalars with escapes, anchors
+// and aliases, literal/folded block scalars with chomping, core-schema
+// typing (0x/0o ints, floats, .inf/.nan), writer quoting triggers,
+// text-level round-trip (order preserved), and error paths (duplicate
+// key, tab indent, unknown alias, multi-document, unterminated flow).
+using System;
+using System.Json;
+using System.Yaml;
+
+namespace Probe;
+
+class Prog {
+    static int bad = 0;
+
+    static void ChkB(string label, bool ok) {
+        if (!ok) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static void ChkS(string label, string got, string want) {
+        if (got != want) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+            Console.WriteLine("  got  <" + got + ">");
+            Console.WriteLine("  want <" + want + ">");
+        }
+    }
+
+    /// 取子节点；缺失返回 NewNull 哨兵——返回值永非 null，
+    /// 调用方可直接链式取成员（探针只查存在路径）。
+    static JsonValue G(JsonValue v, string k) {
+        JsonValue r = v.Get(k);
+        if (r == null) { return JsonValue.NewNull(); }
+        return r;
+    }
+
+    /// 解析出的树取标量文本形态（类型+值）用于断言。
+    static string Shape(JsonValue v) {
+        if (v == null) { return "absent"; }
+        if (v.IsNull()) { return "null"; }
+        if (v.IsBool()) { return v.AsBool(false) ? "bool:true" : "bool:false"; }
+        if (v.IsInt()) { return "int:" + Convert.ToString(v.AsLong(0)); }
+        if (v.IsNumber()) { return "num:" + Convert.ToString(v.AsDouble(0)); }
+        return "str:" + v.AsString("");
+    }
+
+    static void Main() {
+        // --- 1. 块映射：全标量类型 ---
+        JsonValue d = Yaml.Parse("name: tom\nage: 30\nratio: 2.5\nok: true\nnope: null\ntilde: ~\nempty:\nhex: 0x1f\noct: 0o17\n");
+        ChkS("scalars name", Shape(d.Get("name")), "str:tom");
+        ChkS("scalars age", Shape(G(d, "age")), "int:30");
+        ChkS("scalars ratio", Shape(G(d, "ratio")), "num:2.5");
+        ChkS("scalars ok", Shape(G(d, "ok")), "bool:true");
+        ChkS("scalars nope", Shape(G(d, "nope")), "null");
+        ChkS("scalars tilde", Shape(G(d, "tilde")), "null");
+        ChkS("scalars empty", Shape(G(d, "empty")), "null");
+        ChkS("scalars hex", Shape(G(d, "hex")), "int:31");
+        ChkS("scalars oct", Shape(G(d, "oct")), "int:15");
+
+        // --- 2. 嵌套映射 + 注释 ---
+        JsonValue n = Yaml.Parse("# top\nserver:\n  host: local # inline\n  port: 8080\n");
+        JsonValue srv = G(n, "server");
+        ChkS("nest host", Shape(G(srv, "host")), "str:local");
+        ChkS("nest port", Shape(G(srv, "port")), "int:8080");
+
+        // --- 3. 块序列 + 压缩映射项 ---
+        JsonValue s = Yaml.Parse("items:\n  - name: a\n    qty: 1\n  - name: b\n    qty: 2\n-plain: 0\n");
+        JsonValue items = G(s, "items");
+        ChkB("seq count", items.Count() == 2);
+        ChkS("seq0 name", Shape(G(items.At(0), "name")), "str:a");
+        ChkS("seq0 qty", Shape(G(items.At(0), "qty")), "int:1");
+        ChkS("seq1 name", Shape(G(items.At(1), "name")), "str:b");
+        ChkS("seq dash-start key", Shape(G(s, "-plain")), "int:0");
+
+        JsonValue sq = Yaml.Parse("l:\n  - 1\n  - two\n  - true\n");
+        JsonValue l = G(sq, "l");
+        ChkB("seq bare count", l.Count() == 3);
+        ChkS("seq bare types", Shape(l.At(0)) + "|" + Shape(l.At(1)) + "|" + Shape(l.At(2)),
+            "int:1|str:two|bool:true");
+
+        JsonValue dash = Yaml.Parse("- a\n- b\n");
+        ChkB("root seq", dash.IsArray() && dash.Count() == 2);
+
+        // --- 4. 流式集合（含跨行） ---
+        JsonValue f = Yaml.Parse("arr: [1, 2, x]\nmap: {a: 1, b: two}\n");
+        JsonValue arr = G(f, "arr");
+        ChkB("flow arr", arr.Count() == 3 && Shape(arr.At(2)) == "str:x");
+        JsonValue mp = G(f, "map");
+        ChkS("flow map", Shape(G(mp, "a")) + "|" + Shape(G(mp, "b")), "int:1|str:two");
+
+        JsonValue mf = Yaml.Parse("m: [1,\n  2,\n  3]\n");
+        ChkB("flow multiline", G(mf, "m").Count() == 3);
+
+        JsonValue ef = Yaml.Parse("e: {}\nl: []\n");
+        ChkB("flow empty", G(ef, "e").Count() == 0 && G(ef, "l").Count() == 0);
+
+        // --- 5. 引号标量 ---
+        JsonValue q = Yaml.Parse("a: \"123\\nline\"\nb: 'it''s'\nc: \"\\u4e2d\"\n");
+        ChkS("dq escape", Shape(G(q, "a")), "str:123\nline");
+        ChkS("sq escape", Shape(G(q, "b")), "str:it's");
+        ChkS("dq unicode", Shape(G(q, "c")), "str:中");
+
+        // --- 6. 锚点与别名 ---
+        JsonValue an = Yaml.Parse("base: &b\n  x: 1\nuse: *b\nsame: *b\n");
+        ChkS("alias val", Shape(G(G(an, "use"), "x")), "int:1");
+        ChkS("alias again", Shape(G(G(an, "same"), "x")), "int:1");
+        JsonValue an2 = Yaml.Parse("a: &v 42\nb: *v\n");
+        ChkS("alias scalar", Shape(G(an2, "b")), "int:42");
+
+        // --- 7. 块标量 ---
+        JsonValue bs = Yaml.Parse("clip: |\n  l1\n  l2\nstrip: |-\n  l1\n  l2\nkeep: |+\n  l1\n\nfold: >\n  f1\n  f2\n");
+        ChkS("bs clip", Shape(G(bs, "clip")), "str:l1\nl2\n");
+        ChkS("bs strip", Shape(G(bs, "strip")), "str:l1\nl2");
+        ChkS("bs keep", Shape(G(bs, "keep")), "str:l1\n\n");
+        ChkS("bs fold", Shape(G(bs, "fold")), "str:f1 f2\n");
+
+        JsonValue bsd = Yaml.Parse("list:\n  - |\n    in-seq\n");
+        ChkS("bs in seq", Shape(G(bsd, "list").At(0)), "str:in-seq\n");
+
+        // --- 8. 特殊浮点 ---
+        JsonValue sp = Yaml.Parse("pinf: .inf\nninf: -.inf\nnan: .nan\n");
+        double pd = G(sp, "pinf").AsDouble(0);
+        double nd = G(sp, "ninf").AsDouble(0);
+        double td = G(sp, "nan").AsDouble(0);
+        ChkB("float inf", pd > 1e308 && nd < -1e308 && td != td);
+
+        // --- 9. 加引号触发：字符串写成 plain 会被误读的都要加引号 ---
+        JsonValue rq = Yaml.Parse("k:\n  n1: \"123\"\n  n2: \"true\"\n  n3: \"null\"\n  n4: \"1.5\"\n  n5: \"a: b\"\n  n6: \" #tag\"\n  n7: \" lead\"\n  n8: \"x: \"\n  n9: \"\"\n  n10: \"[bracket]\"\n");
+        JsonValue kq = G(rq, "k");
+        ChkS("quote int-str", Shape(G(kq, "n1")), "str:123");
+        ChkS("quote bool-str", Shape(G(kq, "n2")), "str:true");
+        ChkS("quote null-str", Shape(G(kq, "n3")), "str:null");
+        ChkS("quote float-str", Shape(G(kq, "n4")), "str:1.5");
+        ChkS("quote colon", Shape(G(kq, "n5")), "str:a: b");
+        ChkS("quote hash", Shape(G(kq, "n6")), "str: #tag");
+        ChkS("quote lead-sp", Shape(G(kq, "n7")), "str: lead");
+        ChkS("quote trail-colon", Shape(G(kq, "n8")), "str:x: ");
+        ChkS("quote empty", Shape(G(kq, "n9")), "str:");
+        ChkS("quote bracket", Shape(G(kq, "n10")), "str:[bracket]");
+
+        // --- 10. 写出形态 ---
+        JsonValue w = JsonValue.NewObject();
+        w.Put("name", JsonValue.NewStr("tom"));
+        w.Put("age", JsonValue.NewInt(30));
+        JsonValue sub = JsonValue.NewObject();
+        sub.Put("host", JsonValue.NewStr("local"));
+        w.Put("server", sub);
+        JsonValue lst = JsonValue.NewArray();
+        JsonValue it0 = JsonValue.NewObject();
+        it0.Put("n", JsonValue.NewStr("a"));
+        it0.Put("q", JsonValue.NewInt(1));
+        lst.Append(it0);
+        lst.Append(JsonValue.NewStr("x"));
+        w.Put("items", lst);
+        w.Put("empty", JsonValue.NewObject());
+        w.Put("flt", JsonValue.NewDouble(2.5));
+        string y = Yaml.ToYaml(w);
+        ChkS("write shape", y,
+            "name: tom\nage: 30\nserver:\n  host: local\nitems:\n  - n: a\n    q: 1\n  - x\nempty: {}\nflt: 2.5\n");
+
+        // 整值浮点保型
+        JsonValue wf = JsonValue.NewObject();
+        wf.Put("f", JsonValue.NewDouble(3.0));
+        JsonValue rf = Yaml.Parse(Yaml.ToYaml(wf));
+        ChkB("float int-valued keeps type", !G(rf, "f").IsInt());
+
+        // --- 11. 文本级往返（YAML 保序，可直接比文本） ---
+        string src1 = "a: 1\nb:\n  - x\n  - y: 2\n    z: t\n\": colon\": c\nn: 1.25\n";
+        string r1 = Yaml.ToYaml(Yaml.Parse(src1));
+        ChkS("roundtrip text", r1, src1);
+        string src2 = "- 1\n- \"2\"\n- true\n- null\n";
+        string r2 = Yaml.ToYaml(Yaml.Parse(src2));
+        ChkS("roundtrip seq", r2, src2);
+
+        // --- 12. 错误路径 ---
+        try {
+            Yaml.Parse("a: 1\na: 2\n");
+            Console.WriteLine("dup-key NOT THROWN");
+            bad = bad + 1;
+        } catch (YamlException) { }
+        try {
+            Yaml.Parse("a:\n\tb: 1\n");
+            Console.WriteLine("tab NOT THROWN");
+            bad = bad + 1;
+        } catch (YamlException) { }
+        try {
+            Yaml.Parse("a: *nope\n");
+            Console.WriteLine("alias NOT THROWN");
+            bad = bad + 1;
+        } catch (YamlException) { }
+        try {
+            Yaml.Parse("---\na: 1\n---\nb: 2\n");
+            Console.WriteLine("multidoc NOT THROWN");
+            bad = bad + 1;
+        } catch (YamlException) { }
+        try {
+            Yaml.Parse("a: [1, 2\n");
+            Console.WriteLine("open-flow NOT THROWN");
+            bad = bad + 1;
+        } catch (YamlException) { }
+
+        Console.WriteLine("yaml-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

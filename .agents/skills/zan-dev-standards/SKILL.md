@@ -116,6 +116,18 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   仍是特殊值，无限递归）；③ 判 NaN 用 `x != x`，判 ±∞ 用
   `x > 1e308` / `x < -1e308`——`x == x` 对 ∞ 恒真，照 NaN 惯用法写
   会误报失败。
+- **语言事实第八则（2026-10-01 Zan.Yaml 首日踩出）**：① 同类里
+  **static 方法调用实例方法不报检查器错**，直到 LLVM verification 才炸
+  （`Operand is null`，指向被调函数的 this 实参）——报错不提示
+  "static 调实例"，纯帮助类小函数一开始就 `static` 化（`JsonValue`
+  伴随 helper 如 `HexDigit`）；② 字符串转义集合有限：`\b`/`\f` 是
+  编译错（invalid escape sequence），要控制字符用
+  `Encoding.Utf8FromCodePoint(8)`（退格）/`(12)`（换页）落；③
+  `while (true)` **合法**（stdlib TaskJoin/ByteBuffer/JsonTape 都在
+  用）——别凭"语言不支持"把循环改写成标志位绕路（此前会话曾这样
+  误绕，证伪撤案）；④ 可空返回链式取成员（`Get().Get()`）检查器
+  强制"先落地局部 + 判空"，测试代码给一个永非 null 的哨兵 helper
+  （缺失返 `NewNull`）一次消音全部链式断言。
 - **声明驱动的 CRUD 定式（ListPage/Crud，2026-09-25 落地）**：一屏一个
   `ScreenDef()` 静态声明（列 Col/Tag/Flag、行内操作 Ops、筛选、工具栏、
   `Table/EditFields` 写白名单），渲染 `Screen()` 整段产出 screenHtml

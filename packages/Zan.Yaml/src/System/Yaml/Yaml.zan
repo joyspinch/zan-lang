@@ -1,0 +1,230 @@
+using System;
+using System.Text;
+using System.Json;
+
+namespace System.Yaml;
+
+/// <summary>
+/// YAML 门面：Parse/Load 解析（core 子集，见 YamlParser），ToYaml/Save
+/// 写出（2 空格缩进块风格，键保持插入顺序，序列化映射有序所以
+/// Parse(ToYaml(v)) 与 v 可做文本级往返比对）。浮点写 side 用
+/// core schema 形态（.inf/.nan、整值浮点补 ".0" 保型）。
+/// </summary>
+class Yaml {
+
+    /// 解析 YAML 文本；非法输入抛 YamlException（带行号）。
+    public static JsonValue Parse(string src) {
+        YamlParser p = new YamlParser(src);
+        return p.ParseDocument();
+    }
+
+    /// 读取并解析 YAML 文件。
+    public static JsonValue Load(string path) {
+        return Parse(File.ReadAllText(path));
+    }
+
+    /// 序列化为 YAML（末尾带换行）。空对象/空数组写 {} / []。
+    public static string ToYaml(JsonValue v) {
+        StringBuilder sb = new StringBuilder();
+        if (v.IsObject()) {
+            WriteMap(sb, v, 0, true);
+        } else if (v.IsArray()) {
+            WriteSeq(sb, v, 0, true);
+        } else {
+            sb.Append(ScalarText(v));
+        }
+        sb.Append("\n");
+        return sb.ToString();
+    }
+
+    /// 序列化并写文件。
+    public static void Save(JsonValue v, string path) {
+        File.WriteAllText(path, ToYaml(v));
+    }
+
+    // ===== 写出 =====
+
+    /// 映射：每行 "\n" + 缩进 + key: value；firstInline=true 表示首行
+    /// 已由调用方定位（根文档或 "- " 之后），不加换行缩进。
+    static void WriteMap(StringBuilder sb, JsonValue m, int indent, bool firstInline) {
+        int n = m.Count();
+        int i = 0;
+        while (i < n) {
+            string k = m.KeyAt(i);
+            JsonValue val = m.ValAt(i);
+            if (i == 0 && firstInline) {
+                // 首键内联，调用方已输出位置
+            } else {
+                sb.Append("\n");
+                AppendIndent(sb, indent);
+            }
+            sb.Append(EmitKey(k));
+            sb.Append(":");
+            WriteValueAfter(sb, val, indent);
+            i = i + 1;
+        }
+    }
+
+    /// 序列：每行 "\n" + 缩进 + "- item"；子映射/子序列用压缩形式
+    /// 首项内联（"- k: v" / "- - a"）。
+    static void WriteSeq(StringBuilder sb, JsonValue a, int indent, bool firstInline) {
+        int n = a.Count();
+        int i = 0;
+        while (i < n) {
+            JsonValue item = a.At(i);
+            if (i == 0 && firstInline) {
+                // 首项内联，调用方已输出位置
+            } else {
+                sb.Append("\n");
+                AppendIndent(sb, indent);
+            }
+            sb.Append("-");
+            if (item.IsObject()) {
+                if (item.Count() == 0) { sb.Append(" {}"); }
+                else {
+                    sb.Append(" ");
+                    WriteMap(sb, item, indent + 2, true);
+                }
+            } else if (item.IsArray()) {
+                if (item.Count() == 0) { sb.Append(" []"); }
+                else {
+                    sb.Append(" ");
+                    WriteSeq(sb, item, indent + 2, true);
+                }
+            } else {
+                sb.Append(" ");
+                sb.Append(ScalarText(item));
+            }
+            i = i + 1;
+        }
+    }
+
+    /// "key:" 之后的部分：标量内联，非空集合下沉一层，空集合 {} []。
+    static void WriteValueAfter(StringBuilder sb, JsonValue val, int indent) {
+        if (val.IsObject()) {
+            if (val.Count() == 0) { sb.Append(" {}"); }
+            else { WriteMap(sb, val, indent + 2, false); }
+        } else if (val.IsArray()) {
+            if (val.Count() == 0) { sb.Append(" []"); }
+            else { WriteSeq(sb, val, indent + 2, false); }
+        } else {
+            sb.Append(" ");
+            sb.Append(ScalarText(val));
+        }
+    }
+
+    static void AppendIndent(StringBuilder sb, int indent) {
+        int i = 0;
+        while (i < indent) { sb.Append(" "); i = i + 1; }
+    }
+
+    static string EmitKey(string k) {
+        if (NeedsQuote(k)) { return EncodeDoubleQuoted(k); }
+        return k;
+    }
+
+    /// 标量 → core schema 文本：null/bool 原形；整数直接十进制；
+    /// 浮点整值补 ".0" 保型（否则往返变 int）；特殊值 .inf/.nan；
+    /// 字符串按需加引号。
+    static string ScalarText(JsonValue v) {
+        if (v.IsNull()) { return "null"; }
+        if (v.IsBool()) { return v.AsBool(false) ? "true" : "false"; }
+        if (v.IsInt()) { return Convert.ToString(v.AsLong(0)); }
+        if (v.IsNumber()) { return DoubleText(v.AsDouble(0)); }
+        string s = v.AsString("");
+        if (NeedsQuote(s)) { return EncodeDoubleQuoted(s); }
+        return s;
+    }
+
+    static string DoubleText(double d) {
+        if (d != d) { return ".nan"; }
+        if (d > 1e308) { return ".inf"; }
+        if (d < -1e308) { return "-.inf"; }
+        string s = Convert.ToString(d);
+        bool hasMark = false;
+        int i = 0;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c == 46 || c == 101 || c == 69) { hasMark = true; }
+            i = i + 1;
+        }
+        if (!hasMark) { return s + ".0"; }
+        return s;
+    }
+
+    /// 该字符串按 plain 写出会不会被重新解析成别的类型/结构——
+    /// 会则必须加引号。判定复用读侧 TypeScalar：变型即加引号，
+    /// 另加指示符/结构歧义等形态规则。
+    static bool NeedsQuote(string s) {
+        if (s.Length == 0) { return true; }
+        JsonValue re = YamlParser.TypeScalar(s);
+        if (!re.IsString()) { return true; }
+        int c0 = s[0] & 255;
+        if (s == "-" || (s.Length >= 2 && c0 == 45 && (s[1] & 255) == 32)) {
+            return true;                                     // 会被当成序列项
+        }
+        if (s == "?" || (s.Length >= 2 && c0 == 63 && (s[1] & 255) == 32)) {
+            return true;
+        }
+        if (s.Length >= 2 && c0 == 58 && (s[1] & 255) == 32) {
+            return true;                                     // ": x" 会当映射
+        }
+        if (c0 == 44 || c0 == 91 || c0 == 93 || c0 == 123 || c0 == 125
+            || c0 == 35 || c0 == 38 || c0 == 42 || c0 == 33 || c0 == 124
+            || c0 == 62 || c0 == 39 || c0 == 34 || c0 == 37 || c0 == 64
+            || c0 == 96) {
+            return true;                                     // , [ ] { } # & * ! | > ' " % @ `
+        }
+        if ((s[0] & 255) == 32 || (s[s.Length - 1] & 255) == 32) {
+            return true;                                     // 首尾空格
+        }
+        int i = 0;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c == 58 && (i + 1 >= s.Length || (s[i + 1] & 255) == 32)) {
+                return true;                                 // ": " 或结尾 ":"
+            }
+            if (c == 35 && i > 0 && (s[i - 1] & 255) == 32) {
+                return true;                                 // " #" 注释起
+            }
+            if (c < 32 || c == 127) {
+                return true;                                 // 控制字符/DEL
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// 双引号包裹 + 转义：\\ \" \n \t \r，其余控制字符 \xXX。
+    /// 非 ASCII 原样输出（UTF-8）。
+    static string EncodeDoubleQuoted(string s) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("\"");
+        int i = 0;
+        int n = s.Length;
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c == 34) { sb.Append("\\\""); }
+            else if (c == 92) { sb.Append("\\\\"); }
+            else if (c == 10) { sb.Append("\\n"); }
+            else if (c == 9) { sb.Append("\\t"); }
+            else if (c == 13) { sb.Append("\\r"); }
+            else if (c < 32 || c == 127) {
+                sb.Append("\\x");
+                int hi = (c >> 4) & 15;
+                int lo = c & 15;
+                sb.Append(HexChar(hi));
+                sb.Append(HexChar(lo));
+            } else {
+                sb.Append(s.Substring(i, 1));
+            }
+            i = i + 1;
+        }
+        sb.Append("\"");
+        return sb.ToString();
+    }
+
+    static string HexChar(int v) {
+        return Encoding.Utf8FromCodePoint(v < 10 ? 48 + v : 87 + v);
+    }
+}
