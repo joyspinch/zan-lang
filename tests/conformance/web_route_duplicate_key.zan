@@ -1,0 +1,66 @@
+// Route-key dedupe: when an app controller and a demand-pulled package
+// controller both claim the same (verb, path), only the FIRST declared
+// registration is emitted. Declaration order puts app source files ahead of
+// package files, so app screens override package defaults -- the same
+// semantics as the view merge (app layout.html wins). Without the dedupe,
+// Router.Add's last-write-wins let the package route silently replace the
+// app route (e.g. an app landing page losing to the package marketing page).
+using System;
+using System.Web;
+
+namespace Conf;
+
+/* Declared first -- plays the app-side controller and must win "/". */
+[Route("[controller]/[action]")]
+class FirstLanding : Controller {
+    [HttpGet]
+    [Route("/")]
+    async void Index() {
+        this.Ok("\"first\"");
+    }
+}
+
+/* Declared second -- plays the package-side controller; its "/" route must
+   not be emitted at all (neither handler nor docs). */
+[Route("[controller]/[action]")]
+class SecondLanding : Controller {
+    [HttpGet]
+    [Route("/")]
+    async void Index() {
+        this.Ok("\"second\"");
+    }
+}
+
+class Program {
+    static int failures;
+
+    static void Check(bool ok, string label) {
+        if (!ok) {
+            Program.failures = Program.failures + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static HttpContext Ctx(string method, string path) {
+        HttpRequest req = HttpRequest.Parse(method + " " + path
+            + " HTTP/1.1\r\nHost: t\r\n\r\n");
+        return new HttpContext(req, "127.0.0.1");
+    }
+
+    static async void Main() {
+        WebApp app = new WebApp("127.0.0.1", 0);
+        __AttrRoutes.Register(app);
+        HttpContext ctx = Program.Ctx("GET", "/");
+        Route r = app.router.Match(ctx);
+        Program.Check(r != null, "route / registered");
+        if (r != null) {
+            Program.Check(r.action == "FirstLanding.Index",
+                "first declared controller wins (" + r.action + ")");
+            await r.handler(ctx);
+            string resp = ctx.BuildResponse(true);
+            Program.Check(resp.Contains("first") && !resp.Contains("second"),
+                "response served by first handler");
+        }
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+    }
+}
