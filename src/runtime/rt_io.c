@@ -4208,6 +4208,13 @@ typedef struct {
 #define CO_RUNNING   2LL   /* a worker is inside step(frame) right now */
 #define CO_NOTIFIED  4LL   /* readied while running: re-queue after the step */
 #define CO_DEAD      8LL   /* released; whoever holds it does the free */
+#define CO_SELFQ     16LL  /* the notify was the frame readying ITSELF
+                            * (Task.Yield / quantum preemption): the
+                            * step-return requeue must take the ring TAIL, not
+                            * the LIFO run-next cell -- a yielder that kept
+                            * re-occupying the cell starved injected work 61:1
+                            * (the ZAN_GLOBAL_TICK poll was the only thing that
+                            * ever reached the injector queue) */
 
 typedef struct { void *frame; zan_co_step_t step; } zan_co_task;
 
@@ -4225,6 +4232,7 @@ typedef struct {
     unsigned long long steal_fail;  /* searches that found nothing */
     unsigned long long park;        /* blocking waits on the port */
     unsigned long long wake_post;   /* wake packets this worker posted */
+    unsigned long long selfq;       /* self-ready requeues sent to the tail */
 } zan_co_stats_t;
 
 typedef struct {
@@ -4247,6 +4255,11 @@ typedef struct {
      * coarse here: GetTickCount64 ticks at ~15.6ms on Windows, which would
      * turn the 2ms default quantum into a ~15ms slice. */
     long long          slice_start_us;
+    /* Frame whose step this worker is currently inside (NULL between steps).
+     * zan_co_ready compares against it to tell a frame readying ITSELF
+     * (Task.Yield, quantum preemption -- requeue at the ring tail) from an
+     * IO/timer/peer continuation (keep the LIFO cell's cache locality). */
+    void              *cur;
     volatile LONG      parked;
     unsigned           tick;
     unsigned           rng;
@@ -4407,6 +4420,29 @@ static int inj_pop(zan_co_task *out) {
     }
     LeaveCriticalSection(&g_inj_lock);
     return n != NULL;
+}
+
+/* Drain up to `max` injected tasks under ONE lock acquisition. The fairness
+ * poll (ZAN_GLOBAL_TICK) only visits the injector every 61st schedule; a
+ * single-task visit let a self-requeueing frame that owns the local ring
+ * starve injected work at 61:1. Moving a batch per visit brings the ratio
+ * under 1:1 while keeping the lock traffic at the same once-per-61 rate. */
+#define ZAN_INJ_BATCH 64
+static int inj_pop_batch(zan_co_task *out, int max) {
+    if (g_inj_len <= 0) return 0;          /* unlocked hint */
+    EnterCriticalSection(&g_inj_lock);
+    int n = 0;
+    while (n < max && g_inj_head) {
+        zan_co_node *nd = g_inj_head;
+        g_inj_head = nd->next;
+        if (!g_inj_head) g_inj_tail = NULL;
+        out[n].frame = nd->frame; out[n].step = nd->step;
+        nd->next = g_inj_free; g_inj_free = nd;
+        InterlockedDecrement(&g_inj_len);
+        n++;
+    }
+    LeaveCriticalSection(&g_inj_lock);
+    return n;
 }
 
 /* ---- per-worker ring ---- */
@@ -4577,11 +4613,18 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
          * step to lose -- only a redundant wake of the same one. */
         if (s & CO_QUEUED) return;
         if (s & CO_RUNNING) {
-            /* Readied while it runs (an IO completion racing the step that
-             * issued the next op). Bank the resume step; the worker running
-             * it re-queues the frame when the step returns. */
+            /* Readied while it runs. Two shapes: an IO/timer/peer completion
+             * racing the step that issued the next op (keep the LIFO cell --
+             * the continuation wants this core), or the frame readying
+             * ITSELF (Task.Yield, quantum preemption): mark CO_SELFQ so the
+             * step-return requeue takes the ring TAIL instead. A yielder
+             * that re-occupied the cell handed the CPU straight back to
+             * itself and starved injected work ~57:1. */
+            zan_co_worker_t *sw = co_self();
+            long long selfq = (sw && sw->cur == frame) ? CO_SELFQ : 0;
             __atomic_store_n(&h->pending, step, __ATOMIC_RELAXED);
-            if (__atomic_compare_exchange_n(&h->sched, &s, s | CO_NOTIFIED, 0,
+            if (__atomic_compare_exchange_n(&h->sched, &s,
+                                            s | CO_NOTIFIED | selfq, 0,
                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
                 return;
             continue;
@@ -4775,11 +4818,19 @@ static int co_steal(zan_co_worker_t *w, zan_co_task *out) {
 
 static int co_next_task(zan_co_worker_t *w, zan_co_task *out) {
     /* Fairness poll: a worker fed by its own LIFO cell would never look at the
-     * injector, starving frames readied by non-worker threads. */
-    if (++w->tick % ZAN_GLOBAL_TICK == 0 && inj_pop(out)) {
-        w->lifo_budget = ZAN_LIFO_BUDGET;
-        w->st.inj_pop++;
-        return 1;
+     * injector, starving frames readied by non-worker threads. The visit
+     * moves a BATCH (one lock acquisition): a yield-polling frame that keeps
+     * the local ring to itself used to dilute a single-task visit to 61:1. */
+    if (++w->tick % ZAN_GLOBAL_TICK == 0 && g_inj_len > 0) {
+        zan_co_task batch[ZAN_INJ_BATCH];
+        int n = inj_pop_batch(batch, ZAN_INJ_BATCH);
+        if (n > 0) {
+            w->lifo_budget = ZAN_LIFO_BUDGET;
+            w->st.inj_pop += (unsigned long long)n;
+            for (int i = 1; i < n; i++) lq_push(w, batch[i]);
+            *out = batch[0];
+            return 1;
+        }
     }
     if (w->lifo_full) {
         if (w->lifo_budget > 0) {
@@ -4833,7 +4884,7 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
             InterlockedDecrement(&g_co_outstanding);
             return;
         }
-        long long n = (s & ~(CO_QUEUED | CO_NOTIFIED)) | CO_RUNNING;
+        long long n = (s & ~(CO_QUEUED | CO_NOTIFIED | CO_SELFQ)) | CO_RUNNING;
         if (__atomic_compare_exchange_n(&h->sched, &s, n, 0,
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             break;
@@ -4849,17 +4900,37 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
      * g_timer_owner gate in co_pump_timers_now serializes the pool. */
     co_pump_timers();
     w->slice_start_us = zan_co_precise_us();
+    w->cur = t->frame;
     t->step(t->frame);
+    w->cur = NULL;
     co_trace("done", t->frame);
     for (;;) {
         s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
         if (s & CO_DEAD) { free(t->frame); break; }
         if (s & CO_NOTIFIED) {
             zan_co_step_t step = __atomic_load_n(&h->pending, __ATOMIC_RELAXED);
+            int selfq = (s & CO_SELFQ) != 0;
             if (!__atomic_compare_exchange_n(&h->sched, &s, CO_QUEUED, 0,
                                              __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
                 continue;
-            co_submit(t->frame, step ? step : t->step);
+            if (selfq) {
+                /* Voluntary yield / quantum preemption: ring TAIL, so queued
+                 * and injected work runs before the yielder comes back. The
+                 * accounting MUST match co_submit (outstanding+activity):
+                 * zan_co_sched_run's wait loop only sees queued work through
+                 * g_co_outstanding, and a requeue that skipped it let the run
+                 * return early -- @main swept the rc statics mid-program and
+                 * the still-queued frame read a nulled static. */
+                zan_co_task rq;
+                rq.frame = t->frame;
+                rq.step = step ? step : t->step;
+                InterlockedIncrement(&g_co_outstanding);
+                InterlockedIncrement(&g_co_activity);
+                lq_push(w, rq);
+                w->st.selfq++;
+            } else {
+                co_submit(t->frame, step ? step : t->step);
+            }
             break;
         }
         if (__atomic_compare_exchange_n(&h->sched, &s, 0LL, 0,
@@ -5150,27 +5221,28 @@ static void co_stats_dump(void) {
                 "COSTAT worker=%d ran=%llu lifo_put=%llu lifo_hit=%llu "
                 "lifo_demote=%llu lq_push=%llu lq_pop=%llu spill=%llu "
                 "inj_push=%llu inj_pop=%llu steal_ok=%llu steal_fail=%llu "
-                "park=%llu wake_post=%llu\n",
+                "park=%llu wake_post=%llu selfq=%llu\n",
                 i, s->ran, s->lifo_put, s->lifo_hit, s->lifo_demote,
                 s->lq_push, s->lq_pop, s->spill, s->inj_push, s->inj_pop,
-                s->steal_ok, s->steal_fail, s->park, s->wake_post);
+                s->steal_ok, s->steal_fail, s->park, s->wake_post, s->selfq);
         tot.ran += s->ran;                 tot.lifo_put += s->lifo_put;
         tot.lifo_hit += s->lifo_hit;       tot.lifo_demote += s->lifo_demote;
         tot.lq_push += s->lq_push;         tot.lq_pop += s->lq_pop;
         tot.spill += s->spill;             tot.inj_push += s->inj_push;
         tot.inj_pop += s->inj_pop;         tot.steal_ok += s->steal_ok;
         tot.steal_fail += s->steal_fail;   tot.park += s->park;
-        tot.wake_post += s->wake_post;
+        tot.wake_post += s->wake_post;     tot.selfq += s->selfq;
     }
     fprintf(stderr,
             "COSTAT total workers=%d shards=%d ran=%llu lifo_put=%llu lifo_hit=%llu "
             "lifo_demote=%llu lq_push=%llu lq_pop=%llu spill=%llu "
             "inj_push=%llu inj_pop=%llu steal_ok=%llu steal_fail=%llu "
-            "park=%llu wake_post=%llu inj_push_ext=%ld sync_inline=%ld\n",
+            "park=%llu wake_post=%llu selfq=%llu inj_push_ext=%ld sync_inline=%ld\n",
             g_co_workers, (int)g_shards, tot.ran, tot.lifo_put, tot.lifo_hit,
             tot.lifo_demote, tot.lq_push, tot.lq_pop, tot.spill,
             tot.inj_push, tot.inj_pop, tot.steal_ok, tot.steal_fail,
-            tot.park, tot.wake_post, (long)g_inj_push_ext, (long)g_sync_inline);
+            tot.park, tot.wake_post, tot.selfq,
+            (long)g_inj_push_ext, (long)g_sync_inline);
     fflush(stderr);
 }
 
