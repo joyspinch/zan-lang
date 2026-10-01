@@ -20,6 +20,7 @@ Run from the SERVER directory against a FRESH data/app.db:
   2. python tools/e2e.py
 """
 import json
+import os
 import socket
 import sys
 import time
@@ -27,8 +28,19 @@ import urllib.parse
 import urllib.request
 import urllib.error
 
-BASE = "http://127.0.0.1:48099"
-GAME = ("127.0.0.1", 47100)
+def _ports():
+    """端口唯一信源是 config/app.json（[game].port + [server].port），
+    不在脚本里再抄一份常量——改端口改一处就够。"""
+    cfg = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "config", "app.json")
+    with open(cfg, encoding="utf-8") as f:
+        c = json.load(f)
+    return (int(c["game"]["port"]), int(c["server"]["port"]))
+
+
+GAME_PORT, HTTP_PORT = _ports()
+BASE = "http://127.0.0.1:%d" % HTTP_PORT
+GAME = ("127.0.0.1", GAME_PORT)
 checks = 0
 
 T0 = time.time()
@@ -369,7 +381,7 @@ ok(r is not None, "bob re-enters realm 1, character state kept")
 
 # ---------- 5. GM 后台 ----------
 st, html, setc = http("/admin/login", data={
-    "user": "admin", "pass": "admin1234"})
+    "user": "admin", "pass": "admin-bootstrap-2026"})
 cookie = ""
 for c in setc:
     if c.startswith("zsession="):

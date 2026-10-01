@@ -1,0 +1,527 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using ZanWeb.Model.Game;
+
+namespace ZanWeb;
+
+/* 游戏世界种子：区服 + data/M2.DB 快照驱动的地图/物品/怪物/技能目录。
+   包 (Zan.Mvc) 的 Schema 只种 sys/admin 域，游戏域由本类在
+   Schema.Ensure 之后补种。种子带计数保护，重复启动不变。 */
+class GameSeed {
+    /* 幂等入口：main.zan 在 Schema.Ensure 成功后调用（自持连接）。 */
+    public static async bool Ensure(IDbConnection db) {
+        return await SeedGame(db);
+    }
+
+    static async bool SeedGame(IDbConnection db) {
+        int realms = await db.Select<Realm>().CountAsync();
+        if (realms == 0) {
+            if (!await GameSeed.AddRealm(db, "一区·雷霆之怒", 0, 1)) { return false; }
+            if (!await GameSeed.AddRealm(db, "二区·烈焰天下", 0, 2)) { return false; }
+            if (!await GameSeed.AddRealm(db, "三区·战神殿", 1, 3)) { return false; }
+        } else {
+            /* 旧库补倍率列：ALTER TABLE 加列后旧行是 NULL，归一到 1.0 倍
+               （用 is null 判空，=0 匹配不到 NULL）。 */
+            await db.ExecuteAsync("update game_realm set expRate=10000"
+                + " where expRate is null or expRate=0");
+            await db.ExecuteAsync("update game_realm set goldRate=10000"
+                + " where goldRate is null or goldRate=0");
+            await db.ExecuteAsync("update game_realm set dropRate=10000"
+                + " where dropRate is null or dropRate=0");
+        }
+        int maps = await db.Select<GameMap>().CountAsync();
+        int itemsN = await db.Select<Item>().CountAsync();
+        int mobsN = await db.Select<Mob>().CountAsync();
+        int dropsN = await db.Select<Drop>().CountAsync();
+        if (maps == 0 || itemsN == 0 || mobsN == 0 || dropsN == 0) {
+            /* 游戏目录（地图/物品/刷怪点/爆率）整体来自 M2.DB 快照——
+               迷你传奇 data.dll 的原值。任一为空都整表重建；快照缺失
+               则拒绝启动（空目录开不出来）。 */
+            if (!await GameSnapshot.Open("data/M2.DB")) {
+                Console.WriteLine("[game] catalog seeds pending but"
+                    + " data/M2.DB is missing"
+                    + " -- run tools/sync_csv_to_db.py first");
+                return false;
+            }
+            if (!await GameSeed.SeedMaps(db)) { GameSnapshot.Close(); return false; }
+            if (!await GameSeed.SeedItems(db)) { GameSnapshot.Close(); return false; }
+            if (!await GameSeed.SeedMobs(db)) { GameSnapshot.Close(); return false; }
+            if (!await GameSeed.SeedSkillsFromSnap(db)) { GameSnapshot.Close(); return false; }
+            GameSnapshot.Close();
+        } else {
+            /* 旧库补全：种子期只有 slot/攻/防的库，按快照逐条覆写为
+               原值（槽位 + 攻/魔/道/防/魔御区间 + 职业/重量/门槛/
+               售价）。按名称命中，空值与非空都写一遍，幂等。 */
+            if (itemsN > 0) {
+                await GameSnapshot.Open("data/M2.DB");
+                DbResult snap = await GameSnapshot.Table("gameitem");
+                for (int i = 0; i < snap.RowCount(); i = i + 1) {
+                    string nm = GameSnapshot.Str(snap, i, "name");
+                    if (nm.Length == 0) { continue; }
+                    Item f = GameSeed.ItemFromSnap(snap, i);
+                    await db.Update<Item>()
+                        .Set(a => a.slot, f.slot)
+                        .Set(a => a.kind, f.kind)
+                        .Set(a => a.atk, f.atk)
+                        .Set(a => a.atkMin, f.atkMin)
+                        .Set(a => a.magic, f.magic)
+                        .Set(a => a.magicMin, f.magicMin)
+                        .Set(a => a.tao, f.tao)
+                        .Set(a => a.taoMin, f.taoMin)
+                        .Set(a => a.def, f.def)
+                        .Set(a => a.defMin, f.defMin)
+                        .Set(a => a.mdef, f.mdef)
+                        .Set(a => a.mdefMin, f.mdefMin)
+                        .Set(a => a.hp, f.hp)
+                        .Set(a => a.mp, f.mp)
+                        .Set(a => a.jobNeed, f.jobNeed)
+                        .Set(a => a.weight, f.weight)
+                        .Set(a => a.minLevel, f.minLevel)
+                        .Set(a => a.price, f.price)
+                        .Set(a => a.picture, f.picture)
+                        .Where(a => a.name == nm)
+                        .ExecuteAffrowsAsync();
+                }
+                /* 老库补 game_map.boss：按图名对上快照 gamemap 的
+                   BOSS 怪名，BOSS 链解锁用。幂等。 */
+                DbResult gm = await GameSnapshot.Table("gamemap");
+                DbResult gmMons = await GameSnapshot.Table("gamemonster");
+                List<GameMap> rtMaps = await db.Select<GameMap>().ToListAsync();
+                for (int i = 0; i < gm.RowCount(); i = i + 1) {
+                    int bossId = GameSnapshot.Int(gm, i, "boss");
+                    int brow = GameSeed.MonsterRow(gmMons, "", bossId);
+                    if (brow < 0) { continue; }
+                    string snapMap = GameSnapshot.Str(gm, i, "name");
+                    string bossName = GameSnapshot.Str(gmMons, brow, "name");
+                    for (int k = 0; k < rtMaps.Count; k = k + 1) {
+                        if (rtMaps[k].name != snapMap) { continue; }
+                        await db.Update<GameMap>()
+                            .Set(a => a.boss, bossName)
+                            .Where(a => a.id == rtMaps[k].id)
+                            .ExecuteAffrowsAsync();
+                        break;
+                    }
+                }
+                /* 老库补 game_mob 攻下限/法力/魔防（内页 BOSS 面板展示
+                   列）：按名称对快照 gamemonster 原值覆写，幂等。 */
+                DbResult gmMons2 = await GameSnapshot.Table("gamemonster");
+                for (int i = 0; i < gmMons2.RowCount(); i = i + 1) {
+                    string nm = GameSnapshot.Str(gmMons2, i, "name");
+                    if (nm.Length == 0) { continue; }
+                    await db.Update<Mob>()
+                        .Set(a => a.atkMin, GameSnapshot.Int(gmMons2, i, "za1"))
+                        .Set(a => a.mp, GameSnapshot.Int(gmMons2, i, "zmp"))
+                        .Set(a => a.mdef, GameSnapshot.Int(gmMons2, i, "ze2"))
+                        .Where(a => a.name == nm)
+                        .ExecuteAffrowsAsync();
+                }
+                GameSnapshot.Close();
+            }
+            /* 老库补 BOSS 挑战次数：新列旧行是 NULL/0，归一到每天 20 次。 */
+            await db.ExecuteAsync("update game_player set bossTries=20"
+                + " where bossTries is null or bossTries=0");
+            if (!await GameSeed.SeedSkills(db)) { return false; }
+        }
+        int ann = await db.Select<Announce>().CountAsync();
+        if (ann == 0) {
+            Announce row = new Announce();
+            row.title = "欢迎来到 {{NAME}}";
+            row.body = "服务器刚刚开区，祝大家游戏愉快。公告由 GM 在后台发布，登录与在线都会收到推送。";
+            row.enabled = 1;
+            row.author = "system";
+            row.createdAt = WebApp.NowSeconds();
+            int _id = await db.Insert<Announce>(row).ExecuteIdentityAsync();
+            if (_id <= 0) { return false; }
+        }
+        return true;
+    }
+
+    /* ---- 游戏目录种子：全部由 M2.DB 快照驱动，见 GameSnapshot ---- */
+
+    /* 技能：skills 表原值 24 条（三职业各 8：4 主动 + 4 被动，伤害/
+       治疗系数、冷却、耗蓝、升级花费全是原值）。快照 id 不保留；
+       job 0/1/2 与原表一致。老库补种路径自己开关快照连接。 */
+    static async bool SeedSkills(IDbConnection db) {
+        int n = await db.Select<Skill>().CountAsync();
+        if (n > 0) { return true; }
+        if (!await GameSnapshot.Open("data/M2.DB")) { return false; }
+        bool ok = await GameSeed.SeedSkillsFromSnap(db);
+        GameSnapshot.Close();
+        return ok;
+    }
+
+    /* 种子主体：假定快照连接已打开（冷启动路径由 SeedGame 打开）。 */
+    static async bool SeedSkillsFromSnap(IDbConnection db) {
+        DbResult snap = await GameSnapshot.Table("skills");
+        for (int i = 0; i < snap.RowCount(); i = i + 1) {
+            string name = GameSnapshot.Str(snap, i, "name");
+            if (name.Length == 0) { continue; }
+            Skill s = new Skill();
+            s.name = name;
+            s.job = GameSnapshot.Int(snap, i, "job");
+            s.slot = GameSnapshot.Int(snap, i, "slot");
+            s.kind = GameSnapshot.Str(snap, i, "kind");
+            s.target = GameSnapshot.Str(snap, i, "target");
+            s.cooldown = GameSnapshot.Int(snap, i, "cooldown");
+            s.mana = GameSnapshot.Int(snap, i, "mana");
+            s.damagePct = GameSnapshot.Int(snap, i, "damage_pct");
+            s.damagePerLevel = GameSnapshot.Int(snap, i, "damage_per_level");
+            s.healPct = GameSnapshot.Int(snap, i, "heal_pct");
+            s.healPerLevel = GameSnapshot.Int(snap, i, "heal_per_level");
+            s.passiveDamagePct =
+                GameSnapshot.Int(snap, i, "passive_damage_pct");
+            s.passiveDefensePct =
+                GameSnapshot.Int(snap, i, "passive_defense_pct");
+            s.maxLevel = GameSnapshot.Int(snap, i, "max_level");
+            s.trainGold = GameSnapshot.Long(snap, i, "train_gold");
+            s.trainIron = GameSnapshot.Int(snap, i, "train_iron");
+            s.school = GameSnapshot.Str(snap, i, "school");
+            s.status = 1;
+            int _id = await db.Insert<Skill>(s).ExecuteIdentityAsync();
+            if (_id <= 0) { return false; }
+        }
+        return true;
+    }
+
+    /* 地图：gamemap 原值（名称/门槛/美术键），sortOrder=快照 id，
+       掉落换算按它回查运行时 id。 */
+    static async bool SeedMaps(IDbConnection db) {
+        int n = await db.Select<GameMap>().CountAsync();
+        if (n > 0) { return true; }
+        DbResult snap = await GameSnapshot.Table("gamemap");
+        DbResult mons = await GameSnapshot.Table("gamemonster");
+        for (int i = 0; i < snap.RowCount(); i = i + 1) {
+            GameMap m = new GameMap();
+            m.name = GameSnapshot.Str(snap, i, "name");
+            m.minLevel = GameSnapshot.Int(snap, i, "lvl");
+            m.sortOrder = GameSnapshot.Int(snap, i, "id");
+            m.picture = GameSnapshot.Str(snap, i, "picture");
+            /* BOSS 链：快照 boss 存 gamemonster 行 id，落库存怪名，
+               Fight.LoadCatalog 按图+名圈 BOSS 怪。 */
+            int bossId = GameSnapshot.Int(snap, i, "boss");
+            int brow = GameSeed.MonsterRow(mons, "", bossId);
+            m.boss = brow >= 0
+                ? GameSnapshot.Str(mons, brow, "name") : "";
+            m.status = 1;
+            int _id = await db.Insert<GameMap>(m).ExecuteIdentityAsync();
+            if (_id <= 0) { return false; }
+        }
+        return true;
+    }
+
+    /* 物品：gameitem 原值 732 条。快照 id 不保留（自增主键），怪物
+       掉落串引用的快照 id 由 SeedMobs 经名称换算。四类归并（kind）：
+       消耗→0（hp 原值）、装备·武器→1（atk=上限攻 a2）、装备·其余→2
+       （def=d2）、道具/虚拟→3。价格 pirce、门槛 lvl、美术键 picture
+       原样带入。data.dll 里没有药水（回复是挂机内置行为），目录即
+       原版原味。 */
+    /* bclass（原版二级分类）→ 穿戴槽位。非穿戴类回 -1。 */
+    static int SlotOfBclass(string bclass) {
+        if (bclass == "武器") { return 0; }
+        if (bclass == "衣服") { return 1; }
+        if (bclass == "头盔") { return 2; }
+        if (bclass == "项链") { return 3; }
+        if (bclass == "手镯") { return 4; }
+        if (bclass == "戒指") { return 6; }
+        if (bclass == "腰带") { return 8; }
+        if (bclass == "靴子") { return 9; }
+        if (bclass == "勋章") { return 10; }
+        if (bclass == "宝石") { return 11; }
+        return -1;
+    }
+
+    /* 快照一行 → 物品模板（全字段）。属性区间攻(a)/魔(b)/道(c)/
+       防(d)/魔御(e) 原值全量导入——首饰勋章同样带攻（荣耀戒指
+       攻10-35），战斗聚合对全部穿戴位求和。job 列 1战/2法/3道，
+       换成与玩家一致的 0战/1法/2道（0=不限）。种子与老库补全共用。 */
+    static ZanWeb.Model.Game.Item ItemFromSnap(DbResult snap, int i) {
+        string name = GameSnapshot.Str(snap, i, "name");
+        string aclass = GameSnapshot.Str(snap, i, "aclass");
+        string bclass = GameSnapshot.Str(snap, i, "bclass");
+        Item row = new Item();
+        row.name = name;
+        row.slot = GameSeed.SlotOfBclass(bclass);
+        if (aclass == "消耗") { row.kind = 0; }
+        else if (aclass == "装备") { row.kind = bclass == "武器" ? 1 : 2; }
+        else { row.kind = 3; }
+        row.atk = GameSnapshot.Int(snap, i, "a2");
+        row.atkMin = GameSnapshot.Int(snap, i, "a1");
+        row.magic = GameSnapshot.Int(snap, i, "b2");
+        row.magicMin = GameSnapshot.Int(snap, i, "b1");
+        row.tao = GameSnapshot.Int(snap, i, "c2");
+        row.taoMin = GameSnapshot.Int(snap, i, "c1");
+        row.def = GameSnapshot.Int(snap, i, "d2");
+        row.defMin = GameSnapshot.Int(snap, i, "d1");
+        row.mdef = GameSnapshot.Int(snap, i, "e2");
+        row.mdefMin = GameSnapshot.Int(snap, i, "e1");
+        row.hp = GameSnapshot.Int(snap, i, "hp");
+        row.mp = GameSnapshot.Int(snap, i, "mp");
+        int job = GameSnapshot.Int(snap, i, "job");
+        row.jobNeed = job > 0 && job <= 3 ? job - 1 : 0;
+        row.weight = GameSnapshot.Int(snap, i, "weight");
+        row.price = GameSnapshot.Long(snap, i, "pirce");
+        row.minLevel = GameSnapshot.Int(snap, i, "lvl");
+        row.picture = GameSnapshot.Str(snap, i, "picture");
+        row.status = 1;
+        return row;
+    }
+
+    static async bool SeedItems(IDbConnection db) {
+        int n = await db.Select<Item>().CountAsync();
+        if (n > 0) { return true; }
+        DbResult snap = await GameSnapshot.Table("gameitem");
+        for (int i = 0; i < snap.RowCount(); i = i + 1) {
+            if (GameSnapshot.Str(snap, i, "name").Length == 0) { continue; }
+            Item row = GameSeed.ItemFromSnap(snap, i);
+            int _id = await db.Insert<Item>(row).ExecuteIdentityAsync();
+            if (_id <= 0) { return false; }
+        }
+        return true;
+    }
+
+    /* 刷怪点：结构（哪张图刷哪些怪、BOSS 是谁）完全按 gamemap 的
+       present/boss 串重建；数值优先取 gamemonster 原值（data.dll 只
+       带 42 只怪的数值：zhp/za2/zd2 → hp/攻/防），没有的按地图门槛
+       曲线补齐——补出的数值与原值一样落库，后台可逐条调。掉落取该
+       怪（缺则该图）掉落串第一个非消耗项，weight×10 记万分比；经验/
+       金币按地图档位 exp、money..money×3（BOSS 经验×5）。 */
+    static async bool SeedMobs(IDbConnection db) {
+        int n = await db.Select<Mob>().CountAsync();
+        if (n > 0) { return true; }
+        DbResult mons = await GameSnapshot.Table("gamemonster");
+        DbResult maps = await GameSnapshot.Table("gamemap");
+        DbResult snapItems = await GameSnapshot.Table("gameitem");
+        List<int> snapIds = new List<int>();
+        List<string> snapNames = new List<string>();
+        List<string> snapClass = new List<string>();
+        for (int i = 0; i < snapItems.RowCount(); i = i + 1) {
+            snapIds.Add(GameSnapshot.Int(snapItems, i, "id"));
+            snapNames.Add(GameSnapshot.Str(snapItems, i, "name"));
+            snapClass.Add(GameSnapshot.Str(snapItems, i, "aclass"));
+        }
+        List<Item> items = await db.Select<Item>().ToListAsync();
+        List<GameMap> rtMaps = await db.Select<GameMap>().ToListAsync();
+        for (int i = 0; i < maps.RowCount(); i = i + 1) {
+            int mapId = GameSeed.MapIdBySort(rtMaps,
+                GameSnapshot.Int(maps, i, "id"));
+            if (mapId == 0) { continue; }
+            int mapLvl = GameSnapshot.Int(maps, i, "lvl");
+            int exp = GameSnapshot.Int(maps, i, "exp");
+            long money = GameSnapshot.Long(maps, i, "money");
+            string mapDrop = GameSnapshot.Str(maps, i, "item");
+            List<string> names = GameSeed.SplitList(
+                GameSnapshot.Str(maps, i, "present"), 124 /* '|' */);
+            for (int k = 0; k < names.Count; k = k + 1) {
+                if (!await GameSeed.SeedSpawn(db, mons, snapIds, snapNames,
+                        snapClass, items, names[k], mapId, mapLvl,
+                        exp, money, mapDrop, false)) { return false; }
+            }
+            string boss = GameSnapshot.Str(maps, i, "boss");
+            if (boss.Length > 0) {
+                int bossRow = GameSeed.MonsterRow(mons, "",
+                    Convert.ToInt(boss));
+                if (bossRow >= 0 && !await GameSeed.SeedSpawn(db, mons,
+                        snapIds, snapNames, snapClass, items,
+                        GameSnapshot.Str(mons, bossRow, "name"), mapId,
+                        mapLvl, exp, money, mapDrop, true)) { return false; }
+            }
+        }
+        return true;
+    }
+
+    /* 一个刷怪点 = 一行 Mob + 它的爆率清单（game_drop）。gamemonster
+       里有原值（zhp>0）就用原值，否则按地图门槛补——合成曲线对齐真怪
+       表（稻草人 200hp@2 … 赤月恶魔 3000hp@50）：普通 hp=150+45·lvl
+       攻=8+1.8·lvl 防=2+0.9·lvl；BOSS hp=400+42·lvl 攻=10+3·lvl
+       防=5+0.8·lvl。 */
+    static async bool SeedSpawn(IDbConnection db, DbResult mons,
+            List<int> snapIds, List<string> snapNames,
+            List<string> snapClass, List<Item> items, string name,
+            int mapId, int mapLvl, int exp, long money, string mapDrop,
+            bool boss) {
+        int row = GameSeed.MonsterRow(mons, name, 0);
+        int lvl = 0;
+        int hp = 0;
+        int atk = 0;
+        int def = 0;
+        int atkMin = 0;
+        int mp = 0;
+        int mdef = 0;
+        string picture = "";
+        string drops = "";
+        if (row >= 0 && GameSnapshot.Int(mons, row, "zhp") > 0) {
+            lvl = GameSnapshot.Int(mons, row, "lvl");
+            hp = GameSnapshot.Int(mons, row, "zhp");
+            atk = GameSeed.AttrOf(mons, row, "za2", "za1");
+            atkMin = GameSnapshot.Int(mons, row, "za1");
+            def = GameSeed.AttrOf(mons, row, "zd2", "zd1");
+            mp = GameSnapshot.Int(mons, row, "zmp");
+            mdef = GameSnapshot.Int(mons, row, "ze2");
+            picture = GameSnapshot.Str(mons, row, "picture");
+            drops = GameSnapshot.Str(mons, row, "item");
+        }
+        if (hp == 0) {
+            lvl = mapLvl;
+            if (boss) {
+                hp = 400 + 42 * mapLvl;
+                atk = 10 + 3 * mapLvl;
+                def = 5 + 4 * mapLvl / 5;
+            } else {
+                hp = 150 + 45 * mapLvl;
+                atk = 8 + 9 * mapLvl / 5;
+                def = 2 + 9 * mapLvl / 10;
+            }
+            atkMin = atk * 2 / 5;
+            mp = 20 + 5 * lvl;
+            mdef = def * 3 / 5;
+        }
+        if (drops.Length == 0) { drops = mapDrop; }
+        Mob m = new Mob();
+        m.name = name;
+        m.mapId = mapId;
+        m.level = lvl;
+        m.hp = hp;
+        m.atk = atk;
+        m.atkMin = atkMin;
+        m.def = def;
+        m.mdef = mdef;
+        m.mp = mp;
+        m.exp = boss ? exp * 5 : exp;
+        m.goldMin = money;
+        m.goldMax = money * 3;
+        m.respawnSec = boss ? 300 : 10;
+        m.count = boss ? 1 : 4;
+        m.picture = picture;
+        m.status = 1;
+        int _id = await db.Insert<Mob>(m).ExecuteIdentityAsync();
+        if (_id <= 0) { return false; }
+        return await GameSeed.SeedDrops(db, drops, snapIds, snapNames,
+            snapClass, items, _id);
+    }
+
+    /* 爆率种子：掉落串 "快照id|数量|?|权重/..." 的全部条目逐条写入
+       game_drop（权重×10 = 万分比，封顶 5000；含消耗品——原表就有，
+       GM 可在爆率管理页删改）。 */
+    static async bool SeedDrops(IDbConnection db, string drops,
+            List<int> snapIds, List<string> snapNames,
+            List<string> snapClass, List<Item> items, int mobId) {
+        List<string> entries = GameSeed.SplitList(drops, 47 /* '/' */);
+        int sort = 0;
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            List<string> f = GameSeed.SplitList(entries[i], 124 /* '|' */);
+            if (f.Count < 4) { continue; }
+            int snapId = Convert.ToInt(f[0]);
+            string nm = GameSeed.SnapAt(snapIds, snapNames, snapId);
+            if (nm.Length == 0) { continue; }
+            int rtId = GameSeed.ItemIdByName(items, nm);
+            if (rtId == 0) { continue; }
+            int rate = Convert.ToInt(f[3]) * 10;
+            if (rate <= 0) { continue; }
+            if (rate > 5000) { rate = 5000; }
+            Drop d = new Drop();
+            d.mobId = mobId;
+            d.itemId = rtId;
+            d.rate = rate;
+            d.sort = sort;
+            sort = sort + 1;
+            int _id = await db.Insert<Drop>(d).ExecuteIdentityAsync();
+            if (_id <= 0) { return false; }
+        }
+        return true;
+    }
+
+    /* 按分隔符拆串（sep 传字符码：'|'=124、'/'=47），跳过空段。 */
+    static List<string> SplitList(string s, int sep) {
+        List<string> parts = new List<string>();
+        int start = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if ((int)s[i] == sep) {
+                if (i > start) { parts.Add(s.Substring(start, i - start)); }
+                start = i + 1;
+            }
+        }
+        if (start < s.Length) { parts.Add(s.Substring(start)); }
+        return parts;
+    }
+
+    /* gamemonster 行定位：name 非空按名找（present 串是名字），否则
+       按 id 找（图 boss 列存 id）。 */
+    static int MonsterRow(DbResult mons, string name, int id) {
+        for (int i = 0; i < mons.RowCount(); i = i + 1) {
+            if (name.Length > 0) {
+                if (GameSnapshot.Str(mons, i, "name") == name) { return i; }
+            } else if (GameSnapshot.Int(mons, i, "id") == id) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /* 主属性取上限列，缺则退下限列（za2→za1 / zd2→zd1）。 */
+    static int AttrOf(DbResult mons, int row, string hi, string lo) {
+        int v = GameSnapshot.Int(mons, row, hi);
+        if (v > 0) { return v; }
+        return GameSnapshot.Int(mons, row, lo);
+    }
+
+    /* 快照 id → 并列表取值（缺 → 空串）。 */
+    static string SnapAt(List<int> ids, List<string> vals, int id) {
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (ids[i] == id) { return vals[i]; }
+        }
+        return "";
+    }
+
+    static int ItemIdByName(List<Item> items, string name) {
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (items[i].name == name) { return items[i].id; }
+        }
+        return 0;
+    }
+
+    /* 运行时地图 id：种子把快照 id 写进 sortOrder，按它回查。 */
+    static int MapIdBySort(List<GameMap> maps, int sortOrder) {
+        for (int i = 0; i < maps.Count; i = i + 1) {
+            if (maps[i].sortOrder == sortOrder) { return maps[i].id; }
+        }
+        return 0;
+    }
+
+
+    static async bool AddRealm(IDbConnection db, string name, int state,
+                            int sort) {
+        return await GameSeed.AddRealm(db, name, state, sort, 10000, 10000,
+            10000);
+    }
+
+    /* 倍率走万分比整型（10000=1.0 倍），种子默认全 1.0 倍。
+       分区组：种子全归“永久区”；GM 开新区时在后台改 grp 即分出
+       “公测1-10区”这类组（客户端分区窗按组两层展示）。 */
+    static async bool AddRealm(IDbConnection db, string name, int state,
+                            int sort, int expRate, int goldRate,
+                            int dropRate) {
+        Realm r = new Realm();
+        r.name = name;
+        r.grp = "永久区";
+        r.state = state;
+        r.sort = sort;
+        r.expRate = expRate;
+        r.goldRate = goldRate;
+        r.dropRate = dropRate;
+        r.createdAt = WebApp.NowSeconds();
+        int _id = await db.Insert<Realm>(r).ExecuteIdentityAsync();
+        return _id > 0;
+    }
+
+    static async bool AddMap(IDbConnection db, string name, int minLevel,
+                          int sortOrder) {
+        GameMap m = new GameMap();
+        m.name = name;
+        m.minLevel = minLevel;
+        m.sortOrder = sortOrder;
+        m.status = 1;
+        int _id = await db.Insert<GameMap>(m).ExecuteIdentityAsync();
+        return _id > 0;
+    }
+}

@@ -16,6 +16,7 @@ Output: SEC_PASS/SEC_FAIL/OBS lines + SEC_SUMMARY. Exit 1 on any FAIL.
 OBS = observation worth recording, not a failure (documented defaults).
 """
 import json
+import os
 import socket
 import sys
 import time
@@ -23,8 +24,19 @@ import urllib.parse
 import urllib.request
 import urllib.error
 
-BASE = "http://127.0.0.1:48099"
-GAME = ("127.0.0.1", 47100)
+def _ports():
+    """端口唯一信源是 config/app.json（[game].port + [server].port），
+    不在脚本里再抄一份常量——改端口改一处就够。"""
+    cfg = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "config", "app.json")
+    with open(cfg, encoding="utf-8") as f:
+        c = json.load(f)
+    return (int(c["game"]["port"]), int(c["server"]["port"]))
+
+
+GAME_PORT, HTTP_PORT = _ports()
+BASE = "http://127.0.0.1:%d" % HTTP_PORT
+GAME = ("127.0.0.1", GAME_PORT)
 results = {"pass": 0, "fail": 0, "obs": 0}
 
 def out(kind, name, detail=""):
@@ -188,7 +200,7 @@ if st == 200 and html.strip().startswith("{") and '"code":"0000"' in html:
     out("fail", "S4 admin-authz 未授权可调管理写接口")
 else:
     out("pass", "S4 admin-authz 未授权 POST 管理写接口被拒")
-st, html, setc = http("/admin/login", data={"user": "admin", "pass": "admin1234"})
+st, html, setc = http("/admin/login", data={"user": "admin", "pass": "admin-bootstrap-2026"})
 if setc:
     flags = " ".join(setc)
     out("pass", "S4 admin-login 默认口令可登录（模板预期，生产必须改）")

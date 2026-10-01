@@ -33,8 +33,18 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)          # templates/server/server-legend
-GAME = ("127.0.0.1", 47100)
-BASE = "http://127.0.0.1:48099"
+
+def _ports():
+    """端口唯一信源是 config/app.json（[game].port + [server].port），
+    不在脚本里再抄一份常量——改端口改一处就够。"""
+    import json
+    with open(os.path.join(ROOT, "config", "app.json"), encoding="utf-8") as f:
+        c = json.load(f)
+    return (int(c["game"]["port"]), int(c["server"]["port"]))
+
+GAME_PORT, HTTP_PORT = _ports()
+GAME = ("127.0.0.1", GAME_PORT)
+BASE = "http://127.0.0.1:%d" % HTTP_PORT
 
 fails = []
 checks = 0
@@ -159,7 +169,7 @@ def newchar(name):
     return c, (r["self"]["uid"] if r and r.get("self") else 0)
 
 def gm_login():
-    st, _, setc = http("/admin/login", data={"user": "admin", "pass": "admin1234"})
+    st, _, setc = http("/admin/login", data={"user": "admin", "pass": "admin-bootstrap-2026"})
     return "".join(x.split(";")[0] + "; " for x in setc)
 
 def gm_save(cookie, uid, nickname, gold="10000000", gems="1000", gift=None):
