@@ -568,6 +568,22 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   （第 16 参起仍是 i64 未被 coerce）。限定名 `A.big17(...)` 路径正常（探针
   `p17.zan` / `p60.zan` / `p17b.zan`）。
 
+## 编译器内建三件套契约：is_call_to 拦截、builtin_api 表、stdlib 声明可独立缺失（B-ID46，2026-10-01）
+
+- **事实**：NativeMemory 这类"stdlib 声明 + 编译器内建"的 API 由三处拼成——
+  ① irgen_expr.c 的 `is_call_to(expr, "NativeMemory", "X") && argc==N` 拦截降级
+  （bitcast/单 libc 调用）；② builtin_api.c 的 `members_nativemem[]` 表（无 stdlib
+  模式下的检查面）；③ stdlib .zan 的 `static extern` 声明（checker 类型面）。
+  三者**可独立缺失**：AsI64/AsF64 的 ①② 早已齐备，只缺 ③——补两行 extern
+  声明即通，差点误开成"编译器+运行时批次"单独做。
+- **纪律**：怀疑 stdlib 缺 API / 准备"补原语"之前，先 grep ①②③ 三处——实现
+  可能早就在，缺的只是声明。extern 声明只是给 checker 看的类型桩，命名的库
+  从未被链接（NativeMemory.zan 头注即此契约）。
+- **两个探针坑**：负位型写不成十六进制字面量（`0xC000000000000000L` 报
+  "integer literal is too large for 'long'"），改十进制负数；IEEE 取 -0.0 必须用
+  一元负号 `-z`——`0.0 - z` 对 z=+0.0 得 +0.0（IEEE 减法 x−x=+0，不是常量
+  折叠问题），位型语义探针必须走 fneg。
+
 ## irgen_builtins 算术内联保宽：禁止对 8 位整型混用 zan_add 与 LLVMBuildSelect（2026-09-25）
 
 - **症状**：在编译器内置字符串方法生成（如 `__zan_str_to_upper` / `__zan_str_to_lower`）中，使用 SSA 计算 `%c8 = select i1 %in_rng, %conv, %c` 时，LLVM 校验直接报错 `Invalid operands for select instruction!`。
