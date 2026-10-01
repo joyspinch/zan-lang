@@ -480,31 +480,45 @@ class JsonDoc {
     }
 
     /// 就地解析 [from, to) 的浮点 token。运算顺序与
-    /// JsonValue.DoubleOf 完全一致（整数部分累乘、小数按 0.1 递减
-    /// 权、指数逐次 ×/÷10），结果位级相同。
+    /// JsonValue.DoubleOf 完全一致（long 尾数 + 精确 10 的幂表一次
+    /// 缩放），结果位级相同。
     static double DoubleInRange(byte[] buf, int from, int to) {
         int i = from;
         bool neg = false;
         if (i < to && (buf[i] & 255) == 45) { neg = true; i = i + 1; }
         else if (i < to && (buf[i] & 255) == 43) { i = i + 1; }
-        double acc = 0.0;
+        long mant = 0;
+        int exp10 = 0;
+        bool roundUp = false;
+        bool seenDigit = false;
         while (i < to) {
             int d = (buf[i] & 255) - 48;
             if (d < 0 || d > 9) { break; }
-            acc = acc * 10.0 + (double)d;
+            seenDigit = true;
+            if (mant < 100000000000000000) {
+                mant = mant * 10 + d;
+            } else {
+                if (!roundUp && d >= 5) { roundUp = true; }
+                exp10 = exp10 + 1;
+            }
             i = i + 1;
         }
         if (i < to && (buf[i] & 255) == 46) {
             i = i + 1;
-            double scale = 0.1;
             while (i < to) {
                 int d = (buf[i] & 255) - 48;
                 if (d < 0 || d > 9) { break; }
-                acc = acc + (double)d * scale;
-                scale = scale * 0.1;
+                seenDigit = true;
+                if (mant < 100000000000000000) {
+                    mant = mant * 10 + d;
+                    exp10 = exp10 - 1;
+                } else {
+                    if (!roundUp && d >= 5) { roundUp = true; }
+                }
                 i = i + 1;
             }
         }
+        if (!seenDigit) { return 0.0; }
         if (i < to && ((buf[i] & 255) == 101 || (buf[i] & 255) == 69)) {
             i = i + 1;
             bool eneg = false;
@@ -514,15 +528,23 @@ class JsonDoc {
             while (i < to) {
                 int d = (buf[i] & 255) - 48;
                 if (d < 0 || d > 9) { break; }
-                ex = ex * 10 + d;
+                if (ex < 100000000) { ex = ex * 10 + d; }
                 i = i + 1;
             }
-            for (int k = 0; k < ex; k = k + 1) {
-                if (eneg) { acc = acc / 10.0; } else { acc = acc * 10.0; }
-            }
+            if (eneg) { exp10 = exp10 - ex; } else { exp10 = exp10 + ex; }
         }
-        if (neg) { return 0.0 - acc; }
-        return acc;
+        if (roundUp) { mant = mant + 1; }
+        double v = mant;
+        int e = exp10;
+        while (e > 22) { v = v * 1e22; e = e - 22; }
+        while (e < -22) { v = v / 1e22; e = e + 22; }
+        if (e >= 0) {
+            v = v * JsonValue.Pow10Tab[e];
+        } else {
+            v = v / JsonValue.Pow10Tab[0 - e];
+        }
+        if (neg) { return 0.0 - v; }
+        return v;
     }
 
     /// 从 `at` 开始的 4 位十六进制值；不足 4 位或含非十六进制
