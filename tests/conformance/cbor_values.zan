@@ -1,0 +1,179 @@
+// CBOR (RFC 8949) test: Appendix A shortest-form vectors for the
+// writer (ints, negative ints, text, containers, float64), decoder
+// forms the writer never emits (half float 0xF9 incl. 65504/-0.0,
+// single float 0xFA, indefinite-length chunked text and arrays,
+// tags 0/1 timestamps → ISO 8601, unknown-tag stripping), semantic
+// round-trip with int/float form preservation, and error paths
+// (reserved additional info, truncation, stray break, unterminated
+// indefinite, non-text map key).
+using System;
+using System.Json;
+using System.Cbor;
+
+namespace Conf;
+
+class Prog {
+    static int bad = 0;
+
+    static string Hex(byte[] b) {
+        StringBuilder sb = new StringBuilder();
+        string hex = "0123456789abcdef";
+        int i = 0;
+        while (i < b.Length) {
+            if (i > 0) { sb.Append(" "); }
+            int v = b[i] & 255;
+            sb.Append(hex.Substring(v >> 4, 1));
+            sb.Append(hex.Substring(v & 15, 1));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static int HexVal(int c) {
+        if (c >= 97) { return c - 87; }
+        if (c >= 65) { return c - 55; }
+        return c - 48;
+    }
+
+    static byte[] Unhex(string s) {
+        byte[] b = new byte[s.Length / 2 + 1];
+        int at = 0;
+        int i = 0;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c == 32) {
+                i = i + 1;
+            } else {
+                b[at] = (byte)((HexVal(c) << 4) | HexVal(s[i + 1] & 255));
+                at = at + 1;
+                i = i + 2;
+            }
+        }
+        byte[] out2 = new byte[at];
+        NativeMemory.Copy((nint)out2, (nint)b, at);
+        return out2;
+    }
+
+    static void Chk(string label, string got, string want) {
+        if (got != want) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static void ChkS(string label, string got, string want) {
+        if (got != want) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static void Main() {
+        // --- 编码：Appendix A 规范最短形态 ---
+        Chk("enc 0", Hex(Cbor.Encode(JsonValue.NewInt(0))), "00");
+        Chk("enc 23", Hex(Cbor.Encode(JsonValue.NewInt(23))), "17");
+        Chk("enc 24", Hex(Cbor.Encode(JsonValue.NewInt(24))), "18 18");
+        Chk("enc 100", Hex(Cbor.Encode(JsonValue.NewInt(100))), "18 64");
+        Chk("enc 1000", Hex(Cbor.Encode(JsonValue.NewInt(1000))), "19 03 e8");
+        Chk("enc 1e6", Hex(Cbor.Encode(JsonValue.NewInt(1000000))), "1a 00 0f 42 40");
+        Chk("enc 1e12", Hex(Cbor.Encode(JsonValue.NewInt(1000000000000))),
+            "1b 00 00 00 e8 d4 a5 10 00");
+        Chk("enc -1", Hex(Cbor.Encode(JsonValue.NewInt(-1))), "20");
+        Chk("enc -10", Hex(Cbor.Encode(JsonValue.NewInt(-10))), "29");
+        Chk("enc -100", Hex(Cbor.Encode(JsonValue.NewInt(-100))), "38 63");
+        Chk("enc -1000", Hex(Cbor.Encode(JsonValue.NewInt(-1000))), "39 03 e7");
+        Chk("enc ietf", Hex(Cbor.Encode(JsonValue.NewStr("IETF"))), "64 49 45 54 46");
+        Chk("enc yen", Hex(Cbor.Encode(JsonValue.NewStr("¥"))), "62 c2 a5");
+        Chk("enc arr", Hex(Cbor.Encode(JsonValue.Parse("[1,2,3]"))), "83 01 02 03");
+        Chk("enc map", Hex(Cbor.Encode(JsonValue.Parse("{\"a\":1,\"b\":[2,3]}"))),
+            "a2 61 61 01 61 62 82 02 03");
+        Chk("enc false", Hex(Cbor.Encode(JsonValue.NewBool(false))), "f4");
+        Chk("enc true", Hex(Cbor.Encode(JsonValue.NewBool(true))), "f5");
+        Chk("enc null", Hex(Cbor.Encode(JsonValue.NewNull())), "f6");
+        Chk("enc 1.0e300", Hex(Cbor.Encode(JsonValue.NewDouble(1.0e300))),
+            "fb 7e 37 e4 3c 88 00 75 9c");
+
+        // --- 解码：编码器不产的形态 ---
+        ChkS("dec 1e12", Convert.ToString(
+            Cbor.Decode(Unhex("1b 00 00 00 e8 d4 a5 10 00")).AsLong(9)),
+            "1000000000000");
+        // 半精度：1.5（f93e00）、65504（f97bff）、-0.0（f98000）
+        double h = Cbor.Decode(Unhex("f9 3e 00")).AsDouble(0);
+        if (h != 1.5) { bad = bad + 1; Console.WriteLine("FAIL half-1.5"); }
+        double h2 = Cbor.Decode(Unhex("f9 7b ff")).AsDouble(0);
+        if (h2 != 65504.0) { bad = bad + 1; Console.WriteLine("FAIL half-65504"); }
+        double nz = Cbor.Decode(Unhex("f9 80 00")).AsDouble(0);
+        if (nz != 0.0 || 1.0 / nz > 0.0) { bad = bad + 1; Console.WriteLine("FAIL half--0"); }
+        // 单精度 100000.0（fa47c35000）、双精度 1.0e300
+        double f = Cbor.Decode(Unhex("fa 47 c3 50 00")).AsDouble(0);
+        if (f != 100000.0) { bad = bad + 1; Console.WriteLine("FAIL f32-100000"); }
+        double d = Cbor.Decode(Unhex("fb 7e 37 e4 3c 88 00 75 9c")).AsDouble(0);
+        if (d != 1.0e300) { bad = bad + 1; Console.WriteLine("FAIL f64-1e300"); }
+        // indefinite 数组：[1, [2,3], (_ 4,5)]
+        ChkS("dec indef-arr", Cbor.Decode(Unhex("83 01 82 02 03 9f 04 05 ff")).ToJson(),
+            "[1,[2,3],[4,5]]");
+        // indefinite 文本分片：(_ "st", "ream")
+        ChkS("dec indef-str", Cbor.Decode(Unhex("7f 62 73 74 64 72 65 61 6d ff"))
+            .AsString(""), "stream");
+        // tag 1(1363896240) → 纪元秒 → ISO
+        ChkS("dec tag1", Cbor.Decode(Unhex("c1 1a 51 4b 67 b0")).AsString(""),
+            "2013-03-21T20:04:00Z");
+        // tag 0(RFC3339 文本) 原样
+        ChkS("dec tag0", Cbor.Decode(Unhex(
+            "c0 74 32 30 31 33 2d 30 33 2d 32 31 54 32 30 3a 30 34 3a 30 30 5a"))
+            .AsString(""), "2013-03-21T20:04:00Z");
+        // 未知 tag（999）剥掉取内层
+        ChkS("dec unknown-tag", Cbor.Decode(new byte[] {
+            0xd9, 0x03, 0xe7, 0x61, 0x61 }).AsString(""), "a");
+        // 纪元秒 tag 1 浮点形态：c1 + 编码器产出的 fb 位型
+        byte[] dbl = Cbor.Encode(JsonValue.NewDouble(1363896240.0));
+        byte[] tagged = new byte[1 + dbl.Length];
+        tagged[0] = 0xc1;
+        NativeMemory.Copy((nint)tagged + 1, (nint)dbl, dbl.Length);
+        ChkS("dec tag1-f", Cbor.Decode(tagged).AsString(""),
+            "2013-03-21T20:04:00Z");
+
+        // 语义往返（保序 → ToJson 判等）+ int/float 形态保持
+        string json = "{\"n\":-5,\"s\":\"héllo\",\"f\":2.25,"
+            + "\"arr\":[1,true,null,\"x\"],\"o\":{\"k\":42}}";
+        JsonValue jv = JsonValue.Parse(json);
+        JsonValue back = Cbor.Decode(Cbor.Encode(jv));
+        if (back.ToJson() != jv.ToJson()) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL roundtrip");
+        }
+        JsonValue vi = Cbor.Decode(Cbor.Encode(JsonValue.NewInt(7)));
+        if (!vi.IsInt()) { bad = bad + 1; Console.WriteLine("FAIL int-form"); }
+        JsonValue vd = Cbor.Decode(Cbor.Encode(JsonValue.NewDouble(7.0)));
+        if (vd.IsInt()) { bad = bad + 1; Console.WriteLine("FAIL float-form"); }
+
+        // --- 错误路径 ---
+        try {
+            Cbor.Decode(Unhex("1c"));                        // ai 28 保留
+            Console.WriteLine("ai28 NOT THROWN");
+            bad = bad + 1;
+        } catch (CborException) { }
+        try {
+            Cbor.Decode(Unhex("64 49"));                     // 文本截断
+            Console.WriteLine("trunc NOT THROWN");
+            bad = bad + 1;
+        } catch (CborException) { }
+        try {
+            Cbor.Decode(Unhex("ff"));                        // 孤立 break
+            Console.WriteLine("break NOT THROWN");
+            bad = bad + 1;
+        } catch (CborException) { }
+        try {
+            Cbor.Decode(Unhex("9f 01"));                     // indefinite 未闭合
+            Console.WriteLine("open-indef NOT THROWN");
+            bad = bad + 1;
+        } catch (CborException) { }
+        try {
+            Cbor.Decode(Unhex("a1 01 61 61"));               // 映射键非文本
+            Console.WriteLine("int-key NOT THROWN");
+            bad = bad + 1;
+        } catch (CborException) { }
+
+        Console.WriteLine("cbor-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

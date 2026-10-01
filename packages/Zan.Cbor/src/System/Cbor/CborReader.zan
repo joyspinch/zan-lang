@@ -1,0 +1,393 @@
+using System;
+using System.Json;
+
+namespace System.Cbor;
+
+/// <summary>
+/// CBOR 解码原语：在 byte[] 上游走，ReadValue 按首字节 major type
+/// 分派还原成 System.Json.JsonValue。全形态：indefinite 长度（文本/
+/// 字节串分片拼接、数组/映射读到 break）、tag（0/1 时间戳 → ISO
+/// 字符串，其余按 RFC 建议剥掉继续解码内层）、半精度 0xF9/单精度
+/// 0xFA/双精度 0xFB 浮点。byte string 按 UTF-8 尽力解码（JsonValue
+/// 无字节形态）。深度限 512。
+/// </summary>
+class CborReader {
+    byte[] buf;
+    int pos;
+    int len;
+
+    /// 包装整段字节。
+    public CborReader(byte[] data) {
+        buf = data;
+        pos = 0;
+        len = data.Length;
+    }
+
+    /// 包装切片 [offset, offset+count)。
+    public CborReader(byte[] data, int offset, int count) {
+        buf = data;
+        pos = offset;
+        len = offset + count;
+    }
+
+    int U8() {
+        if (pos >= len) {
+            throw new CborException("truncated at byte "
+                + Convert.ToString(pos));
+        }
+        int b = buf[pos] & 255;
+        pos = pos + 1;
+        return b;
+    }
+
+    int U16BE() {
+        int hi = U8();
+        return (hi << 8) | U8();
+    }
+
+    long U32BE() {
+        long v = U8();
+        v = (v << 8) | U8();
+        v = (v << 8) | U8();
+        return (v << 8) | U8();
+    }
+
+    long U64BE() {
+        long v = U8();
+        int i = 0;
+        while (i < 7) {
+            v = (v << 8) | U8();
+            i = i + 1;
+        }
+        return v;
+    }
+
+    /// 读 argument（additional info 0-27；24-31 保留）。返回值带
+    /// 独立码 31（indefinite）时由调用方分支。
+    long Arg(int ai) {
+        if (ai < 24) { return ai; }
+        if (ai == 24) { return U8(); }
+        if (ai == 25) { return U16BE(); }
+        if (ai == 26) { return U32BE(); }
+        if (ai == 27) { return U64BE(); }
+        throw new CborException("reserved additional info "
+            + Convert.ToString(ai) + " at byte " + Convert.ToString(pos));
+    }
+
+    byte[] Take(int n) {
+        if (n < 0 || n > len - pos) {
+            throw new CborException("truncated at byte "
+                + Convert.ToString(pos) + " (need " + Convert.ToString(n) + ")");
+        }
+        byte[] out2 = new byte[n];
+        NativeMemory.Copy((nint)out2, (nint)buf + pos, n);
+        pos = pos + n;
+        return out2;
+    }
+
+    /// <summary>读一个完整值（深度上限 512）。</summary>
+    JsonValue ReadValue(int depth) {
+        if (depth > 512) {
+            throw new CborException("nesting too deep at byte "
+                + Convert.ToString(pos));
+        }
+        int ib = U8();
+        int major = ib >> 5;
+        int ai = ib & 31;
+        if (major == 0) {                                     // 无符号整数
+            long v = Arg(ai);
+            if (v >= 0) { return JsonValue.NewInt(v); }
+            // 2^63..2^64-1 → double（精度丢失，文档化）。
+            long hi = (v >> 1) & 9223372036854775807;
+            return JsonValue.NewDouble((double)hi * 2.0 + (double)(v & 1));
+        }
+        if (major == 1) {                                     // 负整数
+            long n = Arg(ai);
+            if (n >= 0) { return JsonValue.NewInt(-1 - n); }
+            return JsonValue.NewDouble(0.0 - U64ToDouble(~n) - 1.0);
+        }
+        if (major == 2) {                                     // byte string
+            if (ai == 31) { return JsonValue.NewStr(TextOf(TakeChunks(2))); }
+            return JsonValue.NewStr(TextOf(Take((int)Arg(ai))));
+        }
+        if (major == 3) {                                     // text string
+            if (ai == 31) { return JsonValue.NewStr(TextOf(TakeChunks(3))); }
+            return JsonValue.NewStr(TextOf(Take((int)Arg(ai))));
+        }
+        if (major == 4) {                                     // array
+            JsonValue arr = JsonValue.NewArray();
+            if (ai == 31) {
+                while (!AtBreak()) { arr.Append(ReadValue(depth + 1)); }
+                return arr;
+            }
+            int n = (int)Arg(ai);
+            int i = 0;
+            while (i < n) {
+                arr.Append(ReadValue(depth + 1));
+                i = i + 1;
+            }
+            return arr;
+        }
+        if (major == 5) {                                     // map
+            JsonValue obj = JsonValue.NewObject();
+            if (ai == 31) {
+                while (!AtBreak()) {
+                    PutEntry(obj, depth);
+                }
+                return obj;
+            }
+            int n = (int)Arg(ai);
+            int i = 0;
+            while (i < n) {
+                PutEntry(obj, depth);
+                i = i + 1;
+            }
+            return obj;
+        }
+        if (major == 6) {                                     // tag
+            long tag = Arg(ai);
+            if (ai == 31) {
+                throw new CborException("indefinite tag at byte "
+                    + Convert.ToString(pos));
+            }
+            JsonValue inner = ReadValue(depth + 1);
+            return Tagged(tag, inner);
+        }
+        return SimpleValue(ai);                               // major 7
+    }
+
+    /// map 条目：key 必须是文本字符串（JsonValue 对象键即字符串）。
+    void PutEntry(JsonValue obj, int depth) {
+        JsonValue k = ReadValue(depth + 1);
+        if (!k.IsString()) {
+            throw new CborException("map key is not a text string at byte "
+                + Convert.ToString(pos));
+        }
+        obj.Put(k.AsString(""), ReadValue(depth + 1));
+    }
+
+    /// indefinite 主体：分片读到 break。wantMajor 校验分片类型一致。
+    byte[] TakeChunks(int wantMajor) {
+        byte[] acc = new byte[64];
+        int n = 0;
+        bool closed = false;
+        while (pos < len) {
+            int ib = buf[pos] & 255;
+            pos = pos + 1;                                // 消费块头字节
+            if (ib == 255) { closed = true; break; }              // break
+            int major = ib >> 5;
+            int ai = ib & 31;
+            if (major != wantMajor || ai == 31) {
+                throw new CborException("bad chunk header at byte "
+                    + Convert.ToString(pos));
+            }
+            byte[] chunk = Take((int)Arg(ai));
+            if (n + chunk.Length > acc.Length) {
+                int c = acc.Length * 2;
+                while (c < n + chunk.Length) { c = c * 2; }
+                byte[] grown = new byte[c];
+                NativeMemory.Copy((nint)grown, (nint)acc, n);
+                acc = grown;
+            }
+            NativeMemory.Copy((nint)acc + n, (nint)chunk, chunk.Length);
+            n = n + chunk.Length;
+        }
+        if (!closed) {
+            throw new CborException("unterminated indefinite at byte "
+                + Convert.ToString(pos));
+        }
+        byte[] out2 = new byte[n];
+        NativeMemory.Copy((nint)out2, (nint)acc, n);
+        return out2;
+    }
+
+    /// 窥探 break（0xFF）；非 break 原样返回假（由 ReadValue 继续读）。
+    bool AtBreak() {
+        if (pos >= len) {
+            throw new CborException("unterminated indefinite at byte "
+                + Convert.ToString(pos));
+        }
+        if ((buf[pos] & 255) == 255) { pos = pos + 1; return true; }
+        return false;
+    }
+
+    /// tag 的目标语义：0 = RFC3339 文本（原样）、1 = 纪元秒（int/double
+    /// → ISO）；其余 tag 按 RFC 建议剥掉（不解语义，取内层）。
+    static JsonValue Tagged(long tag, JsonValue inner) {
+        if (tag == 0) { return inner; }
+        if (tag == 1) {
+            if (inner.IsInt()) {
+                return JsonValue.NewStr(IsoFromUnixNanos(inner.AsLong(0), 0));
+            }
+            double d = inner.AsDouble(0);
+            long sec = (long)d;
+            long ms = (long)((d - (double)sec) * 1000.0);
+            return JsonValue.NewStr(IsoFromUnixNanos(sec, ms * 1000000));
+        }
+        return inner;
+    }
+
+    /// major 7：simple/float。break 只在 indefinite 循环里合法消费。
+    JsonValue SimpleValue(int ai) {
+        if (ai == 20) { return JsonValue.NewBool(false); }
+        if (ai == 21) { return JsonValue.NewBool(true); }
+        if (ai == 22 || ai == 23) { return JsonValue.NewNull(); }  // null/undefined
+        if (ai == 25) { return JsonValue.NewDouble(BitsHalf(U16BE())); }
+        if (ai == 26) { return JsonValue.NewDouble(BitsSingle((int)U32BE())); }
+        if (ai == 27) { return JsonValue.NewDouble(BitsDouble(U64BE())); }
+        if (ai == 24) {
+            throw new CborException("unassigned simple value at byte "
+                + Convert.ToString(pos - 1));
+        }
+        if (ai == 31) {
+            throw new CborException("unexpected break at byte "
+                + Convert.ToString(pos - 1));
+        }
+        throw new CborException("unexpected simple value " + Convert.ToString(ai)
+            + " at byte " + Convert.ToString(pos - 1));
+    }
+
+    /// 字节 → 字符串（UTF-8 尽力，非法序列 U+FFFD）。
+    static string TextOf(byte[] b) {
+        return Encoding.GetString(b, 0, b.Length);
+    }
+
+    /// Unix 秒 + 纳秒 → ISO 8601 UTC。
+    static string IsoFromUnixNanos(long sec, long nanos) {
+        DateTime t = DateTime.FromUnixSeconds(sec);
+        StringBuilder sb = new StringBuilder();
+        sb.Append(Pad4(t.Year()));
+        sb.Append("-");
+        sb.Append(Pad2(t.Month()));
+        sb.Append("-");
+        sb.Append(Pad2(t.Day()));
+        sb.Append("T");
+        sb.Append(Pad2(t.Hour()));
+        sb.Append(":");
+        sb.Append(Pad2(t.Minute()));
+        sb.Append(":");
+        sb.Append(Pad2(t.Second()));
+        long ms = nanos / 1000000;
+        if (ms > 0) {
+            sb.Append(".");
+            if (ms < 100) { sb.Append("0"); }
+            if (ms < 10) { sb.Append("0"); }
+            sb.Append(Convert.ToString(ms));
+        }
+        sb.Append("Z");
+        return sb.ToString();
+    }
+
+    static string Pad2(int v) {
+        if (v < 10) { return "0" + Convert.ToString(v); }
+        return Convert.ToString(v);
+    }
+
+    static string Pad4(int v) {
+        string s = Convert.ToString(v);
+        while (s.Length < 4) { s = "0" + s; }
+        return s;
+    }
+
+    /// u64（作为有符号 long 已为负）→ double 近似。
+    static double U64ToDouble(long v) {
+        long hi = (v >> 1) & 9223372036854775807;
+        return (double)hi * 2.0 + (double)(v & 1);
+    }
+
+    /// 半精度位型 → double（半精度的全部值在 double 里精确）。
+    static double BitsHalf(int bits) {
+        int sign = (bits >> 15) & 1;
+        int exp = (bits >> 10) & 31;
+        int mant = bits & 1023;
+        if (exp == 31) {
+            double inf = Pow2(1024);
+            if (mant == 0) { return sign == 1 ? 0.0 - inf : inf; }
+            return inf - inf;
+        }
+        if (exp == 0) {
+            if (mant == 0) { return sign == 1 ? -1.0 * 0.0 : 0.0; }
+            // 次正规：m * 2^-24（m ≤ 2^10 精确）。
+            double m = (double)mant * Pow2(-24);
+            double v = m;
+            return sign == 1 ? 0.0 - v : v;
+        }
+        double r = (double)mant * Pow2(-10);
+        double r2 = (1.0 + r) * Pow2(exp - 15);
+        return sign == 1 ? 0.0 - r2 : r2;
+    }
+
+    /// 32 位 IEEE-754 位型 → double。
+    static double BitsSingle(int bits) {
+        int sign = (bits >> 31) & 1;
+        int exp = (bits >> 23) & 255;
+        int mant = bits & 8388607;
+        if (exp == 255) {
+            double inf = Pow2(128);
+            if (mant == 0) { return sign == 1 ? 0.0 - inf : inf; }
+            return inf - inf;
+        }
+        double m = 0.0;
+        if (exp == 0) {
+            if (mant == 0) { return sign == 1 ? -1.0 * 0.0 : 0.0; }
+            int b = 22;
+            while (b >= 0) {
+                if (((mant >> b) & 1) == 1) { m = m + Pow2(b - 23); }
+                b = b - 1;
+            }
+            double v = m * Pow2(-126);
+            return sign == 1 ? 0.0 - v : v;
+        }
+        m = 1.0;
+        int b2 = 22;
+        while (b2 >= 0) {
+            if (((mant >> b2) & 1) == 1) { m = m + Pow2(b2 - 23); }
+            b2 = b2 - 1;
+        }
+        double r = m * Pow2(exp - 127);
+        return sign == 1 ? 0.0 - r : r;
+    }
+
+    /// 64 位 IEEE-754 位型 → double（逐位累加，精确）。
+    static double BitsDouble(long bits) {
+        int sign = (int)((bits >> 63) & 1);
+        int exp = (int)((bits >> 52) & 2047);
+        long mant = bits & 4503599627370495;
+        if (exp == 2047) {
+            double inf = Pow2(1024);
+            if (mant == 0) { return sign == 1 ? 0.0 - inf : inf; }
+            return inf - inf;
+        }
+        double m = 0.0;
+        if (exp == 0) {
+            if (mant == 0) { return sign == 1 ? -1.0 * 0.0 : 0.0; }
+            int b = 51;
+            while (b >= 0) {
+                if (((mant >> b) & 1) == 1) { m = m + Pow2(b - 52); }
+                b = b - 1;
+            }
+            double v = m * Pow2(-1022);
+            return sign == 1 ? 0.0 - v : v;
+        }
+        m = 1.0;
+        int b2 = 51;
+        while (b2 >= 0) {
+            if (((mant >> b2) & 1) == 1) { m = m + Pow2(b2 - 52); }
+            b2 = b2 - 1;
+        }
+        double r = m * Pow2(exp - 1023);
+        return sign == 1 ? 0.0 - r : r;
+    }
+
+    static double Pow2(int e) {
+        double v = 1.0;
+        if (e >= 0) {
+            int i = 0;
+            while (i < e) { v = v * 2.0; i = i + 1; }
+        } else {
+            int i = 0;
+            while (i > e) { v = v / 2.0; i = i - 1; }
+        }
+        return v;
+    }
+}

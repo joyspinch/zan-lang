@@ -1,0 +1,160 @@
+using System;
+using System.Text;
+
+namespace System.Cbor;
+
+/// <summary>
+/// CBOR 编码原语（RFC 8949）：确定长度（definite）编码，argument 走
+/// 规范最短形态（additional info 0-23 直接、24-27 定宽）。负整数按
+/// major type 1（值 = -1 - n，n = ~v 免溢出）。字节缓冲倍增扩容整块
+/// NativeMemory.Copy 搬移，数值大端。
+/// </summary>
+class CborWriter {
+    byte[] buf;
+    int len;
+
+    public CborWriter() {
+        buf = new byte[64];
+        len = 0;
+    }
+
+    /// 已编码字节数。
+    int Length() { return len; }
+
+    void EnsureRoom(int extra) {
+        if (len + extra <= buf.Length) { return; }
+        int c = buf.Length * 2;
+        if (c < 16) { c = 16; }
+        while (c < len + extra) { c = c * 2; }
+        byte[] grown = new byte[c];
+        NativeMemory.Copy((nint)grown, (nint)buf, len);
+        buf = grown;
+    }
+
+    void RawU8(int b) {
+        EnsureRoom(1);
+        buf[len] = (byte)b;
+        len = len + 1;
+    }
+
+    void RawU16BE(int v) {
+        EnsureRoom(2);
+        buf[len] = (byte)(v >> 8);
+        buf[len + 1] = (byte)v;
+        len = len + 2;
+    }
+
+    void RawU32BE(long v) {
+        EnsureRoom(4);
+        buf[len] = (byte)(v >> 24);
+        buf[len + 1] = (byte)(v >> 16);
+        buf[len + 2] = (byte)(v >> 8);
+        buf[len + 3] = (byte)v;
+        len = len + 4;
+    }
+
+    void RawU64BE(long v) {
+        EnsureRoom(8);
+        buf[len] = (byte)(v >> 56);
+        buf[len + 1] = (byte)(v >> 48);
+        buf[len + 2] = (byte)(v >> 40);
+        buf[len + 3] = (byte)(v >> 32);
+        buf[len + 4] = (byte)(v >> 24);
+        buf[len + 5] = (byte)(v >> 16);
+        buf[len + 6] = (byte)(v >> 8);
+        buf[len + 7] = (byte)v;
+        len = len + 8;
+    }
+
+    /// 写 major type 头 + argument（规范最短：≤23 内联，24/25/26/27
+    /// 定宽；明确不产 indefinite）。
+    void Head(int major, long arg) {
+        int m = major << 5;
+        if (arg < 24) {
+            RawU8(m | (int)arg);
+        } else if (arg < 256) { RawU8(m | 24); RawU8((int)arg); }
+        else if (arg < 65536) { RawU8(m | 25); RawU16BE((int)arg); }
+        else if (arg < 4294967296) { RawU8(m | 26); RawU32BE(arg); }
+        else { RawU8(m | 27); RawU64BE(arg); }
+    }
+
+    /// 无符号整数（major 0）。
+    void WriteUint(long v) { Head(0, v); }
+
+    /// 负整数（major 1，值 = -1 - n；n = ~v 对 long.MinValue 也不溢出）。
+    void WriteNeg(long v) { Head(1, ~v); }
+
+    /// text string（major 3）。
+    void WriteString(string s) {
+        byte[] b = Encoding.GetBytes(s);
+        Head(3, b.Length);
+        EnsureRoom(b.Length);
+        NativeMemory.Copy((nint)buf + len, (nint)b, b.Length);
+        len = len + b.Length;
+    }
+
+    /// byte string（major 2）。
+    void WriteBytes(byte[] b) {
+        Head(2, b.Length);
+        EnsureRoom(b.Length);
+        NativeMemory.Copy((nint)buf + len, (nint)b, b.Length);
+        len = len + b.Length;
+    }
+
+    /// 数组头（major 4，确定长度）。
+    void WriteArrayHeader(int n) { Head(4, n); }
+
+    /// 映射头（major 5，确定长度）。
+    void WriteMapHeader(int n) { Head(5, n); }
+
+    /// false/true/null（major 7 simple：20/21/22）。
+    void WriteBool(bool b) { RawU8(b ? 245 : 244); }
+    void WriteNull() { RawU8(246); }
+
+    /// float64（0xFB，固定 64 位——不做最短浮点规范化，文档化取舍）。
+    void WriteDouble(double d) {
+        RawU8(251);
+        RawU64BE(DoubleBits(d));
+    }
+
+    /// 任意 tag 头（major 6）。
+    void WriteTag(long tag) { Head(6, tag); }
+
+    /// 取出已编码字节（复制一份）。
+    byte[] ToBytes() {
+        byte[] out2 = new byte[len];
+        NativeMemory.Copy((nint)out2, (nint)buf, len);
+        return out2;
+    }
+
+    /// <summary>double 的 IEEE-754 位模式：归一化构造（±∞/NaN 收口，
+    /// 归一化循环对非有限值不终止）。与 TdsMessage.DoubleBits 同一
+    /// 算法。</summary>
+    static long DoubleBits(double v) {
+        if (v != v) { return 9221120237041090560; }      // 0x7FF8000000000000
+        if (v == 0.0) { return 0; }
+        int sign = 0;
+        if (v < 0.0) {
+            sign = 1;
+            v = 0.0 - v;
+        }
+        if (v > 1.7976931348623157e308) {                // ±Infinity
+            return ((long)sign << 63) | 9218868437227405312;
+        }
+        int exp = 0;
+        while (v >= 2.0) { v = v / 2.0; exp = exp + 1; }
+        while (v < 1.0) { v = v * 2.0; exp = exp - 1; }
+        double frac = v - 1.0;
+        long mant = 0;
+        for (int i = 0; i < 52; i = i + 1) {
+            frac = frac * 2.0;
+            int bit = 0;
+            if (frac >= 1.0) {
+                bit = 1;
+                frac = frac - 1.0;
+            }
+            mant = (mant << 1) | bit;
+        }
+        return ((long)sign << 63) | ((long)(exp + 1023) << 52) | mant;
+    }
+}
