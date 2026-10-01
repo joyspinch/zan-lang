@@ -1188,6 +1188,12 @@ typedef struct {
      * finally body once per copy of that body -- the frame's per-handler slot
      * arrays are sized from this */
     int            try_count;
+    /* deepest OPEN try-with-finally seen (the FINEXC slot index is the
+     * emitter's g->finally_count, which counts exactly these, lambdas
+     * excluded by its save/reset around nested function bodies) -- sizes the
+     * frame's FINEXC arrays instead of the 256 ceiling */
+    int            fin_depth;
+    int            fin_depth_max;
 } async_scan_t;
 
 static bool async_type_is_scalar(LLVMTypeRef t) {
@@ -1512,6 +1518,10 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
         break;
     case AST_TRY_STMT:
         s->try_count++;
+        if (st->try_stmt.finally_body) {
+            s->fin_depth++;
+            if (s->fin_depth > s->fin_depth_max) s->fin_depth_max = s->fin_depth;
+        }
         async_scan_stmt(s, st->try_stmt.try_body);
         for (int i = 0; i < st->try_stmt.catches.count; i++) {
             zan_ast_node_t *cc = st->try_stmt.catches.items[i];
@@ -1541,6 +1551,7 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
             for (int c = 0; c < copies; c++)
                 async_scan_stmt(s, st->try_stmt.finally_body);
         }
+        if (st->try_stmt.finally_body) s->fin_depth--;
         break;
     case AST_SWITCH_STMT:
         async_scan_expr(s, st->switch_stmt.expr);

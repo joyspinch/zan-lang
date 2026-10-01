@@ -464,6 +464,10 @@ typedef struct {
     int             sub_base;       /* frame index of the first sub-task slot */
     int             ret_agg_slot;   /* frame index of aggregate return slot (-1 if none) */
     int             handler_cap;    /* per-handler slots in the frame */
+    /* deepest try/finally nesting the scan found in the body: sizes the
+     * FINEXC slot arrays. Was ZAN_MAX_FINALLY_DEPTH (256) unconditionally,
+     * which padded every async frame with ~5KB of never-touched slots. */
+    int             fin_depth_max;
     zan_type_t     *cur_inst;       /* instantiation being specialized, or NULL */
     LLVMTypeRef     fn_type;        /* signature of `fn` (the ramp, when async) */
     zan_ast_list_t *mtps;           /* method type params of a specialization */
@@ -623,12 +627,16 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         fields[ASYNC_FRAME_CEXC] = LLVMArrayType(i8ptr, (unsigned)w->handler_cap);
         fields[ASYNC_FRAME_CEXC_OWNED] = LLVMArrayType(i32, (unsigned)w->handler_cap);
         fields[ASYNC_FRAME_CEXC_TID] = LLVMArrayType(i8ptr, (unsigned)w->handler_cap);
-        fields[ASYNC_FRAME_FINEXC] =
-            LLVMArrayType(i8ptr, ZAN_MAX_FINALLY_DEPTH);
-        fields[ASYNC_FRAME_FINEXC_OWNED] =
-            LLVMArrayType(i32, ZAN_MAX_FINALLY_DEPTH);
-        fields[ASYNC_FRAME_FINEXC_TID] =
-            LLVMArrayType(i8ptr, ZAN_MAX_FINALLY_DEPTH);
+        /* one slot group per finally nesting level the scan found (>=1:
+         * LLVM rejects zero-length array members), not the 256 ceiling --
+         * a try-free body carried ~5KB of dead slots this way. */
+        {
+            unsigned fin_cap = (unsigned)(w->fin_depth_max > 0
+                                              ? w->fin_depth_max : 1);
+            fields[ASYNC_FRAME_FINEXC] = LLVMArrayType(i8ptr, fin_cap);
+            fields[ASYNC_FRAME_FINEXC_OWNED] = LLVMArrayType(i32, fin_cap);
+            fields[ASYNC_FRAME_FINEXC_TID] = LLVMArrayType(i8ptr, fin_cap);
+        }
         for (int k = 0; k < total_params; k++) {
             fields[ASYNC_FRAME_FIRST_PARAM + k] = param_types[k];
         }
