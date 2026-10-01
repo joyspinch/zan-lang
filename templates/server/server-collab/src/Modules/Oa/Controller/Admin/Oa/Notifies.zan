@@ -5,7 +5,7 @@ using System.Json;
 using System.Threading;
 using System.Web;
 using ZanWeb.Model.Oa;
-using ZanWeb.Model.Sys;
+using ZanWeb.Model;
 
 namespace ZanWeb.Admin.Oa;
 
@@ -26,21 +26,21 @@ class Notifies : AdminController {
     [Custom(IsMenu = true, Icon = "mdi:bell", Perm = PermBit.View)]
     [Description("通知中心")]
     async void Index() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         ViewData d = await this.Layout("通知中心");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
         ListQuery q = this.Paged("id", 20);
         /* Bug#6（本体 B）：sys_notify 历史脏数据（跨租户提及等）按 userId
            可见即死信泄漏——读面统一补 tenantId 双闸。 */
         List<SysNotify> rows = await this.SysNotify
-            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id)
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id)
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.SysNotify
-            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id).CountAsync();
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id).CountAsync();
         /* 免打扰现状（flow 域开关即页面上的示范位；其余模块开关随迁移渐次加入）。 */
         SysNotifyPref pref = await this.SysNotifyPref
-            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
                 && a.module == "flow").FirstAsync();
         bool muted = pref != null && pref.muted == 1;
         if (muted) { d.Set("muted", "1"); } else { d.Set("mutedOff", "1"); }
@@ -71,14 +71,14 @@ class Notifies : AdminController {
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("未读通知")]
     async void Unread() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         /* Bug#6（本体 B）：未读数与未读列表同补租户闸（铃铛数据源）。 */
         List<SysNotify> rows = await this.SysNotify
-            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
                 && a.isRead == 0)
             .OrderByDescending(a => a.id).Take(8).ToListAsync();
         int total = await this.SysNotify
-            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
                 && a.isRead == 0).CountAsync();
         JsonValue items = JsonValue.NewArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
@@ -102,14 +102,14 @@ class Notifies : AdminController {
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("通知事件流")]
     async void Stream() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         HttpContext ctx = this.Ctx();
         WsSession ws = await WebWs.Upgrade(ctx);
         if (ws != null) {
             /* 首帧同步未读数——此刻尚未登记进 NotifyHub，无并发写方，安全。
                Bug#6（本体 B）：WS 订阅首帧未读数补租户闸。 */
             int unread = await this.SysNotify
-                .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
+                .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
                     && a.isRead == 0).CountAsync();
             JsonValue first = JsonValue.NewObject();
             first.PutStr("type", "unread");
@@ -134,7 +134,7 @@ class Notifies : AdminController {
         ZanWeb.NotifyHub.JoinSse(me.id, ctx);
         /* 首帧同步一次未读数，页面打开即为最新。Bug#6（本体 B）：SSE 同补。 */
         int unread2 = await this.SysNotify
-            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
                 && a.isRead == 0).CountAsync();
         if (!await ctx.SseSend("unread", "{\"count\":"
                 + Convert.ToString(unread2) + "}")) {
@@ -157,7 +157,7 @@ class Notifies : AdminController {
     [Custom(Perm = PermBit.Update)]
     [Description("标记已读")]
     async void Read() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int id = this.InInt("id", 0);
         long now = WebApp.NowSeconds();
         if (id > 0) {
@@ -165,13 +165,13 @@ class Notifies : AdminController {
                脏死信已被读面隐藏，写面保持一致防复活路径。 */
             int _n = await this.SysNotify.Update()
                 .Set(a => a.isRead, 1)
-                .Where(a => a.id == id && a.tenantId == this.TenantId()
+                .Where(a => a.id == id && a.tenantId == Tenant.Cur()
                     && a.userId == me.id)
                 .ExecuteAffrowsAsync();
         } else {
             int _n = await this.SysNotify.Update()
                 .Set(a => a.isRead, 1)
-                .Where(a => a.tenantId == this.TenantId() && a.userId == me.id)
+                .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id)
                 .ExecuteAffrowsAsync();
         }
         this.Saved("已标记");
@@ -184,12 +184,12 @@ class Notifies : AdminController {
     [Custom(Perm = PermBit.Update)]
     [Description("免打扰开关")]
     async void Mute() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         string module = Fmt.Text(this.In("module"), "flow");
         int on = this.InInt("on", 0);
         long now = WebApp.NowSeconds();
         SysNotifyPref row = await this.SysNotifyPref
-            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
                 && a.module == module).FirstAsync();
         if (row != null) {
             int _u = await this.SysNotifyPref.Update()
@@ -198,7 +198,7 @@ class Notifies : AdminController {
                 .Where(a => a.id == row.id).ExecuteAffrowsAsync();
         } else {
             SysNotifyPref p = new SysNotifyPref();
-            p.tenantId = this.TenantId();
+            p.tenantId = Tenant.Cur();
             p.userId = me.id;
             p.module = module;
             p.muted = on;

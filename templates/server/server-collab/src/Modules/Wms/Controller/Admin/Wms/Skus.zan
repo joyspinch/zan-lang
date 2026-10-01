@@ -4,7 +4,7 @@ using System.Data.Orm;
 using System.Web;
 using ZanWeb;
 using ZanWeb.Dao.Wms;
-using ZanWeb.Model.Sys;
+using ZanWeb.Model;
 using ZanWeb.Model.Wms;
 
 namespace ZanWeb.Admin.Wms;
@@ -26,12 +26,12 @@ class Skus : AdminController {
         string kw = q.Kw();
         /* 租户硬边（#34）：列表只出本租户行。 */
         List<WmsSku> rows = await this.WmsSku
-            .Where(a => a.tenantId == this.TenantId())
+            .Where(a => a.tenantId == Tenant.Cur())
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.sku.Contains(kw))
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.WmsSku
-            .Where(a => a.tenantId == this.TenantId())
+            .Where(a => a.tenantId == Tenant.Cur())
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.sku.Contains(kw))
             .CountAsync();
 
@@ -61,7 +61,7 @@ class Skus : AdminController {
         d.Set("new", "1");
         if (id > 0) {
             WmsSku s = await this.WmsSku
-                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .Where(a => a.id == id && a.tenantId == Tenant.Cur())
                 .FirstAsync();
             if (s == null) { this.Fail(404, "0404", "商品不存在"); }
             d.Set("dialogTitle", "编辑商品");
@@ -91,14 +91,14 @@ class Skus : AdminController {
                 .Set(a => a.unit, unit)
                 .Set(a => a.spec, spec)
                 .Set(a => a.updatedAt, WebApp.NowSeconds())
-                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .Where(a => a.id == id && a.tenantId == Tenant.Cur())
                 .ExecuteAffrowsAsync();
             await this.Note("编辑商品", "#" + Convert.ToString(id) + " " + name, n > 0, "");
             this.Saved("商品已保存");
             return;
         }
         WmsSku s = new WmsSku();
-        s.tenantId = this.TenantId();
+        s.tenantId = Tenant.Cur();
         s.sku = sku;
         s.name = name;
         s.unit = unit;
@@ -116,11 +116,11 @@ class Skus : AdminController {
     async void Delete() {
         int id = this.InInt("id", 0);
         WmsSku s = await this.WmsSku
-            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .FirstAsync();
         if (s == null) { this.Fail(404, "0404", "商品不存在"); }
         int n = await this.WmsSku.Delete()
-            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .ExecuteAffrowsAsync();
         await this.Note("删除商品", "#" + Convert.ToString(id) + " " + s.name, n > 0, "");
         this.Saved("商品已删除");
@@ -128,13 +128,13 @@ class Skus : AdminController {
 
     /* ---- T7 导入导出（ExcelIo 公共层）----------------------------------- */
 
-    static List<string> Headers() {
+    private static List<string> Headers() {
         List<string> h = new List<string>();
         h.Add("SKU编码"); h.Add("商品名称"); h.Add("单位"); h.Add("规格");
         return h;
     }
 
-    static List<FieldRule> Rules() {
+    private static List<FieldRule> Rules() {
         List<FieldRule> r = new List<FieldRule>();
         r.Add(FieldRule.Text("SKU编码", true, 64));
         r.Add(FieldRule.Text("商品名称", true, 128));
@@ -144,7 +144,7 @@ class Skus : AdminController {
     }
 
     /* ImportRow 处理器：同步 + 平行 List（ExcelIo.ImportRow 双重约定）。 */
-    static string SaveRow(IDbConnection db, int tenantId, User me,
+    static string SaveRow(IDbConnection db, int tenantId, SysUser me,
                           List<string> keys, List<string> vals) {
         string sku = ExcelIo.Rec(keys, vals, "SKU编码");
         int dup = new WmsSkuDao(db).CountBySkuSync(tenantId, sku);
@@ -167,7 +167,7 @@ class Skus : AdminController {
     async void Export() {
         bool xlsx = this.InInt("xlsx", 0) == 1;
         List<WmsSku> rows = await this.WmsSku
-            .Where(a => a.tenantId == this.TenantId())
+            .Where(a => a.tenantId == Tenant.Cur())
             .OrderBy(a => a.id).ToListAsync();
         List<List<string>> data = new List<List<string>>();
         for (int i = 0; i < rows.Count; i = i + 1) {
@@ -193,17 +193,17 @@ class Skus : AdminController {
     [Custom(Perm = PermBit.Create, ApiMax = 30, Upload = true)]
     [Description("导入商品")]
     async void Import() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         if (this.ctx.uploadPath.Length == 0) {
             this.Fail(400, "1002", "没有上传内容");
         }
         string text = File.ReadAllText(this.ctx.uploadPath);
-        int batchId = await ExcelIo.Import(this.Held(), this.TenantId(),
+        int batchId = await ExcelIo.Import(this.Held(), Tenant.Cur(),
             me, "wms_sku", "upload.csv", Skus.Headers(),
             Skus.Rules(), Csv.Parse(text), Skus.SaveRow);
         await this.Note("导入商品", "批次#" + Convert.ToString(batchId),
             true, "");
-        this.Ok(await ExcelIo.BatchReport(this.Held(), this.TenantId(),
+        this.Ok(await ExcelIo.BatchReport(this.Held(), Tenant.Cur(),
             batchId));
     }
 }

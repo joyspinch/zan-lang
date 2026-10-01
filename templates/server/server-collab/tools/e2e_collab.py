@@ -150,16 +150,6 @@ def stop_server(proc):
         proc.wait()
     time.sleep(1)
 
-def set_tenant(username, tenant):
-    """跨租户负向测试的搬运工：直接改库（单租户恒 1 的一期没有第二个租户
-    的 API 面）。WAL 允许与服务进程并发写；tenantId=2 不会被启动回填
-    （只归 NULL/0）改写。"""
-    p = os.path.join(ROOT, "data", "app.db")
-    cx = sqlite3.connect(p, timeout=15)
-    cx.execute("UPDATE sys_user SET tenantId=? WHERE username=?", (tenant, username))
-    cx.commit()
-    cx.close()
-
 TS = str(int(time.time()))[-6:]
 
 def png_bytes(w, h):
@@ -230,7 +220,7 @@ def run_flow():
     crid = lambda tag: "e2e-%s-%s" % (TS, tag)
 
     # ---- admin cookie login + create accounts B, C ----------------------
-    st, _, setc = http("/admin/login", data={"user": "admin", "pass": "admin1234"})
+    st, _, setc = http("/admin/login", data={"user": "admin", "pass": "admin-bootstrap-2026"})
     cookie = "".join(x.split(";")[0] + "; " for x in setc)
     ok(st in (200, 302) and cookie != "", "admin cookie login")
 
@@ -247,13 +237,14 @@ def run_flow():
             saved = False
         ok(saved, "create account %s" % uname)
         st, j, _ = http("/admin/system/users?kw=" + urllib.parse.quote(uname), cookie=cookie)
-        m = re.search(uname + r"[\s\S]{0,400}?users/roles\?id=(\d+)", j)
+        m = re.search(r'<tr data-id="(\d+)"[\s\S]{0,600}?' + re.escape(uname), j)
         uid = int(m.group(1)) if m else 0
         ok(uid > 0, "%s id listed in admin users" % uname)
         st, j, _ = http("/admin/system/users/roles?id=" + str(uid), cookie=cookie)
         listed = re.findall(r'name="roleIds\[\]" value="(\d+)"', j)
         ok("1" in listed and "2" in listed, "roles dialog lists built-in roles (%s)" % uname)
-        form = [("id", str(uid)), ("roleIds[]", "1"), ("roleIds[]", "2")]
+        # 包契约：checkbox 组由前端 admin.js 合成单一逗号字段 roleIds=1,2
+        form = [("id", str(uid)), ("roleIds", "1,2")]
         st, j, _ = http("/admin/system/users/rolessave", data=form, cookie=cookie)
         try:
             ok(json.loads(j).get("code") == "0000", "assign roles to %s" % uname)
@@ -264,7 +255,7 @@ def run_flow():
     cid = ids["cx_c_" + TS]
 
     # ---- token logins ----------------------------------------------------
-    st, env = call("POST", "/api/auth/login", {"user": "admin", "pass": "admin1234"})
+    st, env = call("POST", "/api/auth/login", {"user": "admin", "pass": "admin-bootstrap-2026"})
     ta = (env or {}).get("data", {}).get("token", "")
     ok(ta != "", "A (admin) token login")
     st, env = call("POST", "/api/auth/login", {"user": "cx_b_" + TS, "pass": "cxpass2026"})
@@ -316,16 +307,10 @@ def run_flow():
     mem = data_of(env).get("members") or []
     ok(st == 200 and len(mem) == 2 and mem[0]["role"] == "owner", "A members lists 2 with owner first")
 
-    # ---- cross-tenant: B moved to tenant 2 --------------------------------
-    set_tenant("cx_b_" + TS, 2)
-    st, env = call("GET", "/api/collab/conversations", token=tb)
-    ok(len(data_of(env).get("conversations") or []) == 0,
-       "cross-tenant B conversations empty")
-    st, env = call("GET", "/api/collab/members?conversationId=%d" % conv, token=tb)
-    ok(st == 404, "cross-tenant B members -> 404 (no existence leak)")
-    set_tenant("cx_b_" + TS, 1)
-    st, env = call("GET", "/api/collab/members?conversationId=%d" % conv, token=tb)
-    ok(st == 200, "restored B sees members again")
+    # ---- cross-tenant（已随包代际退役） ------------------------------------
+    # Zan.Mvc 包已全局化 sys 主数据（sys_user 无租户列、无租户绑定），
+    # 原第 7 步"直改库把 B 搬去租户 2"失去了主数据锚点，整步退役；
+    # 业务行 tenantId 列保留为数据谱系（恒 1，见 src/Framework/Tenant.zan）。
 
     # ---- role gating on invite --------------------------------------------
     st, env = call("POST", "/api/collab/invite",
@@ -425,13 +410,7 @@ def run_flow():
     ok(bool(msgs) and msgs[-1].get("replyTo") is None,
        "forged replyTo stored as replyTo=0")
 
-    # cross-tenant send -> 404 (no existence leak)
-    set_tenant("cx_c_" + TS, 2)
-    st, env = call("POST", "/api/collab/send",
-                   {"conversationId": str(conv), "content": "跨界",
-                    "clientRequestId": crid("m4")}, token=tc)
-    ok(st == 404, "cross-tenant send -> 404")
-    set_tenant("cx_c_" + TS, 1)
+    # cross-tenant send（已随包代际退役，同第 7 步：主数据无租户锚点）
 
     # empty content rejected
     st, env = call("POST", "/api/collab/send",
@@ -496,10 +475,8 @@ def run_flow():
                     "clientRequestId": crid("m9")}, token=ta)
     ok(st == 400, "re-binding an attachment rejected (400, not 500)")
 
-    set_tenant("cx_c_" + TS, 2)
-    st, _got = download(att_png, tc)
-    ok(st == 404, "cross-tenant download -> 404")
-    set_tenant("cx_c_" + TS, 1)
+    # cross-tenant download（已随包代际退役，同第 7 步；附件租户闸现对
+    # Tenant.Cur() 常量门，单租户下恒放行同租户行）
 
     # ---- tasks: state machine, claim CAS, audit timeline (A327-10) --------
     k_t1 = crid("t1")

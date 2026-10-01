@@ -5,8 +5,8 @@ using System.Data;
 using System.Data.Orm;
 using System.Json;
 using System.Web;
-using ZanWeb.Dao.Sys;
-using ZanWeb.Model.Sys;
+using ZanWeb.Dao;
+using ZanWeb.Model;
 
 namespace ZanWeb;
 
@@ -16,7 +16,7 @@ namespace ZanWeb;
    共用本类，杜绝三处各写一套漂移。
    字段类型 8 种白名单：text/textarea/number/date/select/radio/checkbox/
    attachment。select/radio/checkbox 选项来源二选一：内联 options 数组
-   （value=label）或 optionsSrc="dict:类型code"（现查 DictItem，字典变动
+   （value=label）或 optionsSrc="dict:类型code"（现查 SysDictItem，字典变动
    跟随）。attachment 与行强关联（oa_attachment 多态挂载），填报期行未建
    只出占位说明，详情页（relatedId>0）渲染附件区容器。
    模板引擎无嵌套 each——选项/控件统一服务端拼 HTML 经三括号原始输出，
@@ -159,7 +159,7 @@ class FormSchema {
        但已填部分的格式/取值仍要拦（脏值进 dataJson 会在详情渲染/导出
        复发）。 */
     static List<string> Validate(JsonValue schema, JsonValue data,
-                                 List<DictItem> dicts, bool draft) {
+                                 List<SysDictItem> dicts, bool draft) {
         List<string> errs = new List<string>();
         if (schema == null || !schema.IsObject()) { errs.Add("schema 缺失"); return errs; }
         JsonValue fields = schema.Get("fields");
@@ -240,7 +240,7 @@ class FormSchema {
     }
 
     /* 选项允许值：内联 options 优先，否则按 dict:code 现查结果过滤。 */
-    static List<string> Allowed(JsonValue f, List<DictItem> dicts) {
+    static List<string> Allowed(JsonValue f, List<SysDictItem> dicts) {
         List<string> allowed = new List<string>();
         JsonValue opts = f.Get("options");
         if (opts != null && opts.IsArray()) {
@@ -299,7 +299,7 @@ class FormSchema {
 
     /* schema 内 dict: 来源的类型 code 收集 + 一次 IN 查询预取（调用方把
        结果传回 Validate/Render，避免每字段一查）。 */
-    static async List<DictItem> DictsFor(IDbConnection db, JsonValue schema) {
+    static async List<SysDictItem> DictsFor(IDbConnection db, JsonValue schema) {
         List<string> codes = new List<string>();
         if (schema != null && schema.IsObject()) {
             JsonValue fields = schema.Get("fields");
@@ -312,16 +312,22 @@ class FormSchema {
                 }
             }
         }
-        List<DictItem> rows = new List<DictItem>();
+        List<SysDictItem> rows = new List<SysDictItem>();
         if (codes.Count == 0) { return rows; }
-        return await new DictItemDao(db).ByTypeCodesActive(codes);
+        /* 包 DAO 只提供单码查询：按码序逐码取启用项拼接（等价旧
+           ByTypeCodesActive 的多码合取，顺序沿用码序）。 */
+        for (int i = 0; i < codes.Count; i = i + 1) {
+            List<SysDictItem> part = await new SysDictItemDao(db).ByTypeCodeActive(codes[i]);
+            for (int j = 0; j < part.Count; j = j + 1) { rows.Add(part[j]); }
+        }
+        return rows;
     }
 
     /* 转视图字段行：d.AddList("fields") 追加。控件 HTML 服务端拼装（插值
        全过 View.HtmlEscape），视图以三括号原始输出。dataJson 非空时回填
        value/selected/checked。 */
     static void Render(ViewData d, JsonValue schema, JsonValue data,
-                       int relatedId, List<DictItem> dicts) {
+                       int relatedId, List<SysDictItem> dicts) {
         JsonValue dt = data;
         if (dt == null || !dt.IsObject()) { dt = JsonValue.NewObject(); }
         List<StrMap> items = d.AddList("fields");
@@ -410,12 +416,12 @@ class FormSchema {
     }
 
     /* 选项 HTML：option/radio/checkbox 三形态。内联 options value=label；
-       dict 来源 value=DictItem.value、label=DictItem.label。
+       dict 来源 value=SysDictItem.value、label=SysDictItem.label。
        checkbox 组名必须以 [] 结尾：admin.js 的 submit 只把 [] 结尾的
        同名组合并为逗号串提交，普通同名重复键会被服务端 last-win 覆盖
        （StrMap.Set），多选将坍缩成最后一个勾选值。radio/select 单值
        保持原名。 */
-    static string Opts(JsonValue f, List<DictItem> dicts, List<string> vals,
+    static string Opts(JsonValue f, List<SysDictItem> dicts, List<string> vals,
                        string kind) {
         string name = "f_" + f.Str("code", "");
         if (kind == "checkbox") { name = name + "[]"; }

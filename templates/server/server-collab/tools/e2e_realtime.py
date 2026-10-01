@@ -271,7 +271,7 @@ def run_flow():
     crid = lambda tag: "rt-%s-%s" % (TS, tag)
 
     # ---- admin + account B -------------------------------------------------
-    st, _, setc = http_form("/admin/login", {"user": "admin", "pass": "admin1234"})
+    st, _, setc = http_form("/admin/login", {"user": "admin", "pass": "admin-bootstrap-2026"})
     cookie = "".join(x.split(";")[0] + "; " for x in setc)
     ok(st in (200, 302) and cookie != "", "admin cookie login")
     user_b = "rt_b_" + TS
@@ -286,18 +286,19 @@ def run_flow():
         ok(False, "create account B")
     st, j, _ = http_form("/admin/system/users?kw=" + urllib.parse.quote(user_b),
                          cookie=cookie)
-    m = re.search(user_b + r"[\s\S]{0,400}?users/roles\?id=(\d+)", j)
+    m = re.search(r'<tr data-id="(\d+)"[\s\S]{0,600}?' + re.escape(user_b), j)
     bid = int(m.group(1)) if m else 0
     ok(bid > 0, "B id resolved")
     st, j, _ = http_form("/admin/system/users/rolessave",
-                         [("id", str(bid)), ("roleIds[]", "1"), ("roleIds[]", "2")],
+                         # 包契约：admin.js 把 checkbox 组合成 roleIds=1,2
+                         [("id", str(bid)), ("roleIds", "1,2")],
                          cookie=cookie)
     try:
         ok(json.loads(j).get("code") == "0000", "assign roles to B")
     except Exception:
         ok(False, "assign roles to B")
 
-    da = call("POST", "/api/auth/login", {"user": "admin", "pass": "admin1234"})
+    da = call("POST", "/api/auth/login", {"user": "admin", "pass": "admin-bootstrap-2026"})
     TOKENS["a"] = data_of(da[1]).get("token", "")
     db_ = call("POST", "/api/auth/login", {"user": user_b, "pass": "rtpass2026"})
     TOKENS["b"] = data_of(db_[1]).get("token", "")
@@ -360,7 +361,8 @@ def run_flow():
                 "/api/collab/messages?conversationId=%d" % conv,
                 "/api/collab/events?after=0"][i % 4]
         st, env = call("GET", path, token=tb)
-        if st != 200 or env is None or (env or {}).get("code") != "0000":
+        # 包 ApiController 信封 code=0（int），与 "0000" 同为成功
+        if st != 200 or env is None or (env or {}).get("code") not in (0, "0", "0000"):
             burst_ok = False
         CLEAN_CALLS[0] += 1
     ok(burst_ok, "15-call burst under background coroutines: all envelopes valid")

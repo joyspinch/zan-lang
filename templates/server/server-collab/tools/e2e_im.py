@@ -99,7 +99,9 @@ def api(method, path, data=None, token=None):
         j = json.loads(raw)
     except Exception:
         return None
-    if j.get("code") != "0000":
+    # 信封双方言：包 ApiController.Ok 答 code=0（int），
+    # Zan.Web 基类答 "0000"（str）——两者都是成功。
+    if j.get("code") not in (0, "0", "0000"):
         print("  [api] %s %s -> %s" % (method, path, raw[:120]))
         return None
     return j.get("data")
@@ -186,7 +188,7 @@ def main():
 
 def run_flow():
     # ---- admin cookie login + create account B -------------------------
-    st, _, setc = http("/admin/login", data={"user": "admin", "pass": "admin1234"})
+    st, _, setc = http("/admin/login", data={"user": "admin", "pass": "admin-bootstrap-2026"})
     cookie = "".join(x.split(";")[0] + "; " for x in setc)
     ok(st in (200, 302) and cookie != "", "admin cookie login")
 
@@ -209,7 +211,7 @@ def run_flow():
     # （/admin/system/users/roles?id=N），行首单元是用户名。
     st, j, _ = http("/admin/system/users?kw=" + urllib.parse.quote(user_b),
                     cookie=cookie)
-    m = re.search(user_b + r"[\s\S]{0,400}?users/roles\?id=(\d+)", j)
+    m = re.search(r'<tr data-id="(\d+)"[\s\S]{0,600}?' + re.escape(user_b), j)
     uid_b = int(m.group(1)) if m else 0
     ok(uid_b > 0, "B id listed in admin users")
     # editor 角色只授 content 屏，/api/im/* 走 admin 角色（SyncRoleGrants
@@ -219,9 +221,9 @@ def run_flow():
     st, j, _ = http("/admin/system/users/roles?id=" + str(uid_b), cookie=cookie)
     listed = re.findall(r'name="roleIds\[\]" value="(\d+)"', j)
     ok("1" in listed and "2" in listed, "roles dialog lists built-in roles 1+2")
-    # 浏览器 checkbox 组按 name[] 惯例提交；ParsePairs 只对带 [] 的
-    # 重复键做合并（无 [] 后值覆盖前值），必须带 []。
-    form = [("id", str(uid_b)), ("roleIds[]", "1"), ("roleIds[]", "2")]
+    # 包契约：浏览器 admin.js 把 checkbox 组合成单一逗号字段
+    # roleIds=1,2 再 POST（RolesSave 读 In("roleIds")）。
+    form = [("id", str(uid_b)), ("roleIds", "1,2")]
     st, j, _ = http("/admin/system/users/rolessave", data=form, cookie=cookie)
     try:
         roles_saved = json.loads(j).get("code") == "0000"
@@ -230,7 +232,7 @@ def run_flow():
     ok(roles_saved, "assign roles to B")
 
     # ---- token login both ends -----------------------------------------
-    da = api("POST", "/api/auth/login", {"user": "admin", "pass": "admin1234"})
+    da = api("POST", "/api/auth/login", {"user": "admin", "pass": "admin-bootstrap-2026"})
     ok(da is not None and da.get("token"), "A (admin) token login")
     ta = da.get("token")
     db_ = api("POST", "/api/auth/login", {"user": user_b, "pass": "wxpass2026"})

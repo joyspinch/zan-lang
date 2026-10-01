@@ -4,7 +4,7 @@ using System.Data;
 using System.Data.Orm;
 using System.Web;
 using ZanWeb.Model.Oa;
-using ZanWeb.Model.Sys;
+using ZanWeb.Model;
 
 namespace ZanWeb.Admin.Oa;
 
@@ -24,18 +24,18 @@ class Announcements : AdminController {
     [Custom(IsMenu = true, Icon = "mdi:bullhorn", Perm = PermBit.View)]
     [Description("公告")]
     async void Index() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         ViewData d = await this.Layout("公告");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
         ListQuery q = this.Paged("id", 20);
         string kw = q.Kw();
         List<OaAnnouncement> rows = await this.OaAnnouncement
-            .Where(a => a.tenantId == this.TenantId())
+            
             .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
             .OrderByDescending(a => a.pinned).OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.OaAnnouncement
-            .Where(a => a.tenantId == this.TenantId())
+            
             .WhereIf(kw.Length > 0, a => a.title.Contains(kw)).CountAsync();
         d.Set("empty", total == 0 ? "1" : "");
         d.Set("kw", kw);
@@ -44,14 +44,14 @@ class Announcements : AdminController {
         d.Set("canDelete", this.Can(PermBit.Delete) ? "1" : "");
         /* 我的已读集合：红点对照（读时插行，无行=未读）。 */
         List<OaAnnouncementRead> reads = await this.OaAnnouncementRead
-            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id)
+            .Where(a => a.userId == me.id)
             .ToListAsync();
         /* 发布人昵称映射（页内 id 集合一次拉取，内部规模）。 */
         List<int> pubIds = new List<int>();
         for (int i = 0; i < rows.Count; i = i + 1) {
             if (!pubIds.Contains(rows[i].publisherId)) { pubIds.Add(rows[i].publisherId); }
         }
-        List<User> pubs = await this.User
+        List<SysUser> pubs = await this.SysUser
             .WhereIf(pubIds.Count > 0, a => pubIds.Contains(a.id)).ToListAsync();
         List<StrMap> items = d.AddList("rows");
         for (int i = 0; i < rows.Count; i = i + 1) {
@@ -84,10 +84,10 @@ class Announcements : AdminController {
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("公告详情")]
     async void Detail() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int id = this.InInt("id", 0);
         OaAnnouncement r = await this.OaAnnouncement
-            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .Where(a => a.id == id)
             .FirstAsync();
         if (r == null) { this.Fail(404, "0404", "公告不存在"); return; }
         if (!Announcements.DeptHit(r, me)) { this.Fail(404, "0404", "公告不存在"); return; }
@@ -100,18 +100,18 @@ class Announcements : AdminController {
         d.Set("createdAt", Fmt.Stamp(r.createdAt));
         List<int> pubIds = new List<int>();
         pubIds.Add(r.publisherId);
-        List<User> pubs = await this.User
+        List<SysUser> pubs = await this.SysUser
             .Where(a => a.id == r.publisherId).ToListAsync();
         if (pubs.Count > 0) { d.Set("publisher", Announcements.NameOf(pubs, r.publisherId)); }
         this.Dialog(d);
 
         /* 打开即已读（先查后插防重；插行失败由 UNIQUE 拦，读态正确性优先）。 */
         OaAnnouncementRead hit = await this.OaAnnouncementRead
-            .Where(a => a.tenantId == this.TenantId() && a.announcementId == r.id
+            .Where(a => a.announcementId == r.id
                 && a.userId == me.id).FirstAsync();
         if (hit == null) {
             OaAnnouncementRead row = new OaAnnouncementRead();
-            row.tenantId = this.TenantId();
+            row.tenantId = Tenant.Cur();
             row.announcementId = r.id;
             row.userId = me.id;
             row.readAt = WebApp.NowSeconds();
@@ -128,7 +128,7 @@ class Announcements : AdminController {
         OaAnnouncement r = null;
         if (id > 0) {
             r = await this.OaAnnouncement
-                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .Where(a => a.id == id)
                 .FirstAsync();
             if (r == null) { this.Fail(404, "0404", "公告不存在"); return; }
         }
@@ -139,10 +139,10 @@ class Announcements : AdminController {
         d.Set("content", r == null ? "" : r.content);
         d.Set("pinned", r != null && r.pinned == 1 ? "checked" : "");
         d.Set("canPinned", this.Can(PermBit.Update) ? "1" : "");
-        List<Department> depts = await this.Department.ToListAsync();
+        List<SysDepartment> depts = await this.SysDepartment.ToListAsync();
         List<StrMap> items = d.AddList("depts");
         for (int i = 0; i < depts.Count; i = i + 1) {
-            Department dep = depts[i];
+            SysDepartment dep = depts[i];
             StrMap m = new StrMap();
             m.Set("id", Convert.ToString(dep.id));
             m.Set("name", dep.name);
@@ -159,7 +159,7 @@ class Announcements : AdminController {
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存公告")]
     async void Save() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int id = this.InInt("id", 0);
         string title = this.Need("title", "公告标题");
         if (title.Length == 0) { this.Fail(400, "0004", "请填写公告标题"); return; }
@@ -173,7 +173,7 @@ class Announcements : AdminController {
         long now = WebApp.NowSeconds();
         if (id > 0) {
             OaAnnouncement r = await this.OaAnnouncement
-                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .Where(a => a.id == id)
                 .FirstAsync();
             if (r == null) { this.Fail(404, "0404", "公告不存在"); return; }
             if (r.publisherId != me.id && me.isSuper != 1) {
@@ -185,7 +185,7 @@ class Announcements : AdminController {
                 .Set(a => a.deptIds, deptIds)
                 .Set(a => a.pinned, pinned)
                 .Set(a => a.updatedAt, now)
-                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .Where(a => a.id == id)
                 .ExecuteAffrowsAsync();
             if (n <= 0) { this.Fail(404, "0404", "公告不存在"); return; }
             await this.Note("保存公告", title, true, "");
@@ -193,7 +193,7 @@ class Announcements : AdminController {
             return;
         }
         OaAnnouncement row = new OaAnnouncement();
-        row.tenantId = this.TenantId();
+        row.tenantId = Tenant.Cur();
         row.title = title;
         row.content = content;
         row.deptIds = deptIds;
@@ -212,20 +212,20 @@ class Announcements : AdminController {
     [Custom(Perm = PermBit.Delete)]
     [Description("删除公告")]
     async void Delete() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int id = this.InInt("id", 0);
         OaAnnouncement r = await this.OaAnnouncement
-            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .Where(a => a.id == id)
             .FirstAsync();
         if (r == null) { this.Fail(404, "0404", "公告不存在"); return; }
         if (r.publisherId != me.id && me.isSuper != 1) {
             this.Fail(403, "0403", "仅发布者或管理员可删除"); return;
         }
         int _c1 = await this.OaAnnouncementRead.Delete()
-            .Where(a => a.tenantId == this.TenantId() && a.announcementId == r.id)
+            .Where(a => a.announcementId == r.id)
             .ExecuteAffrowsAsync();
         int _c2 = await this.OaAnnouncement.Delete()
-            .Where(a => a.id == r.id && a.tenantId == this.TenantId())
+            .Where(a => a.id == r.id)
             .ExecuteAffrowsAsync();
         await this.Note("删除公告", r.title, true, "");
         this.Saved("已删除");
@@ -239,13 +239,13 @@ class Announcements : AdminController {
         int id = this.InInt("id", 0);
         int pin = this.InInt("pin", 1) == 1 ? 1 : 0;
         OaAnnouncement r = await this.OaAnnouncement
-            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .Where(a => a.id == id)
             .FirstAsync();
         if (r == null) { this.Fail(404, "0404", "公告不存在"); return; }
         int n = await this.OaAnnouncement.Update()
             .Set(a => a.pinned, pin)
             .Set(a => a.updatedAt, WebApp.NowSeconds())
-            .Where(a => a.id == r.id && a.tenantId == this.TenantId())
+            .Where(a => a.id == r.id)
             .ExecuteAffrowsAsync();
         await this.Note(pin == 1 ? "公告置顶" : "取消置顶", r.title, true, "");
         this.Saved(n > 0 ? (pin == 1 ? "已置顶" : "已取消置顶") : "操作失败");
@@ -256,10 +256,10 @@ class Announcements : AdminController {
     [Custom(IsMenu = false, Perm = PermBit.Update)]
     [Description("已读名单")]
     async void Reads() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int id = this.InInt("id", 0);
         OaAnnouncement r = await this.OaAnnouncement
-            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .Where(a => a.id == id)
             .FirstAsync();
         if (r == null) { this.Fail(404, "0404", "公告不存在"); return; }
         if (r.publisherId != me.id && me.isSuper != 1) {
@@ -267,15 +267,15 @@ class Announcements : AdminController {
         }
         /* 受众现算：组织变动受众跟随（同 Detail 口径）。 */
         List<int> deptIds = Announcements.IdsOf(r.deptIds);
-        List<User> members = await this.User
-            .Where(a => a.tenantId == this.TenantId() && a.status == 1)
+        List<SysUser> members = await this.SysUser
+            .Where(a => a.status == 1)
             .WhereIf(deptIds.Count > 0, a => deptIds.Contains(a.departmentId))
             .ToListAsync();
         List<OaAnnouncementRead> reads = await this.OaAnnouncementRead
-            .Where(a => a.tenantId == this.TenantId() && a.announcementId == r.id)
+            .Where(a => a.announcementId == r.id)
             .OrderByDescending(a => a.id).ToListAsync();
-        List<User> users = await this.User
-            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        List<SysUser> users = await this.SysUser
+            .ToListAsync();
         ViewData d = new ViewData();
         d.Set("id", Convert.ToString(r.id));
         d.Set("dialogTitle", "已读名单");
@@ -298,7 +298,7 @@ class Announcements : AdminController {
 
     /* 受众判定（轻量）：deptIds 空=全员；否则我的部门在列
        （AuthUser.Holds 逗号精确匹配，防 1 撞 11）。 */
-    static bool DeptHit(OaAnnouncement r, User me) {
+    static bool DeptHit(OaAnnouncement r, SysUser me) {
         if (r.deptIds.Length == 0) { return true; }
         return AuthUser.Holds(r.deptIds, Convert.ToString(me.departmentId));
     }
@@ -312,7 +312,7 @@ class Announcements : AdminController {
     }
 
     /* deptIds 逗号串 → id 列表（受众现算用；写入侧受控全为数字）。 */
-    static List<int> IdsOf(string csv) {
+    private static List<int> IdsOf(string csv) {
         List<int> ids = new List<int>();
         if (csv.Length == 0) { return ids; }
         List<string> parts = csv.Split(",");
@@ -324,7 +324,7 @@ class Announcements : AdminController {
     }
 
     /* 昵称映射：昵称空回退用户名（与 Flows.UserOpts 同款）。 */
-    static string NameOf(List<User> users, int id) {
+    static string NameOf(List<SysUser> users, int id) {
         for (int i = 0; i < users.Count; i = i + 1) {
             if (users[i].id == id) { return Fmt.Text(users[i].nickname, users[i].username); }
         }

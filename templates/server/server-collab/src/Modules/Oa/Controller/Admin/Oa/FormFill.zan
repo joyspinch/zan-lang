@@ -6,7 +6,7 @@ using System.Json;
 using System.Web;
 using ZanWeb.Model.Flow;
 using ZanWeb.Model.Oa;
-using ZanWeb.Model.Sys;
+using ZanWeb.Model;
 
 namespace ZanWeb.Admin.Oa;
 
@@ -51,20 +51,20 @@ class FormFill : AdminController {
     [Custom(IsMenu = true, Icon = "mdi:clipboard-text", Perm = PermBit.View)]
     [Description("表单填报")]
     async void Index() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         ViewData d = await this.Layout("表单填报");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
         /* 只列启用定义：停用表单收敛入口，历史提交在 我的提交/详情 不受影响。 */
         List<OaFormDef> defs = await this.OaFormDef
-            .Where(a => a.tenantId == this.TenantId() && a.status == 1)
+            .Where(a => a.status == 1)
             .OrderByDescending(a => a.id).ToListAsync();
         List<FlowDef> flows = await this.FlowDef
-            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+            .ToListAsync();
         List<StrMap> items = d.AddList("rows");
         for (int i = 0; i < defs.Count; i = i + 1) {
             OaFormDef r = defs[i];
             int mine = await this.OaFormData
-                .Where(a => a.tenantId == this.TenantId() && a.formId == r.id
+                .Where(a => a.formId == r.id
                     && a.submitterId == me.id).CountAsync();
             StrMap m = new StrMap();
             m.Set("id", Convert.ToString(r.id));
@@ -84,15 +84,15 @@ class FormFill : AdminController {
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("填写表单")]
     async void Fill() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int formId = this.InInt("formId", 0);
         OaFormDef def = await this.OaFormDef
-            .Where(a => a.id == formId && a.tenantId == this.TenantId())
+            .Where(a => a.id == formId)
             .FirstAsync();
         if (def == null) { this.Fail(404, "0404", "表单不存在"); return; }
         if (def.status != 1) { this.Fail(400, "0004", "表单已停用，无法填报"); return; }
         JsonValue schema = FormSchema.Parse(def.schemaJson);
-        List<DictItem> dicts = await FormSchema.DictsFor(this.Held(), schema);
+        List<SysDictItem> dicts = await FormSchema.DictsFor(this.Held(), schema);
         ViewData d = await this.Layout("填写：" + def.name);
         d.Set("formId", Convert.ToString(def.id));
         d.Set("name", def.name);
@@ -101,7 +101,7 @@ class FormFill : AdminController {
         FormSchema.Render(d, schema, null, 0, dicts);
         if (def.flowDefId > 0) {
             FlowDef fd = await this.FlowDef
-                .Where(a => a.id == def.flowDefId && a.tenantId == this.TenantId())
+                .Where(a => a.id == def.flowDefId)
                 .FirstAsync();
             if (fd == null || fd.status != 1) { d.Set("flowStopped", "1"); }
         }
@@ -114,17 +114,17 @@ class FormFill : AdminController {
     [Custom(Perm = PermBit.Create)]
     [Description("提交表单")]
     async void Submit() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int formId = this.InInt("formId", 0);
         bool draft = this.InInt("draft", 0) == 1;
         OaFormDef def = await this.OaFormDef
-            .Where(a => a.id == formId && a.tenantId == this.TenantId())
+            .Where(a => a.id == formId)
             .FirstAsync();
         if (def == null) { this.Fail(404, "0404", "表单不存在"); return; }
         if (def.status != 1) { this.Fail(400, "0004", "表单已停用，无法填报"); return; }
         JsonValue schema = FormSchema.Parse(def.schemaJson);
         JsonValue data = this.Collect(schema);
-        List<DictItem> dicts = await FormSchema.DictsFor(this.Held(), schema);
+        List<SysDictItem> dicts = await FormSchema.DictsFor(this.Held(), schema);
         List<string> errs = FormSchema.Validate(schema, data, dicts, draft);
         if (errs.Count > 0) {
             this.Fail(400, "0004", FormSchema.Join(errs));
@@ -138,7 +138,7 @@ class FormFill : AdminController {
         FlowDef fd = null;
         if (!draft && def.flowDefId > 0) {
             fd = await this.FlowDef
-                .Where(a => a.id == def.flowDefId && a.tenantId == this.TenantId())
+                .Where(a => a.id == def.flowDefId)
                 .FirstAsync();
             if (fd == null) { this.Fail(400, "0004", "绑定的流程不存在"); return; }
             if (fd.status != 1) {
@@ -149,7 +149,7 @@ class FormFill : AdminController {
         string summary = FormFill.Summary(schema, data);
         long now = WebApp.NowSeconds();
         OaFormData row = new OaFormData();
-        row.tenantId = this.TenantId();
+        row.tenantId = Tenant.Cur();
         row.formId = def.id;
         row.dataJson = dataJson;
         row.schemaSnapshot = def.schemaJson;
@@ -167,11 +167,11 @@ class FormFill : AdminController {
                 title, "form_data:" + Convert.ToString(id), me.id);
             int _up = await this.OaFormData.Update()
                 .Set(a => a.instId, instId)
-                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .Where(a => a.id == id)
                 .ExecuteAffrowsAsync();
         }
         if (!draft) {
-            await Notify.Send(this.Held(), this.TenantId(), me.id, "oa", "info",
+            await Notify.Send(this.Held(), Tenant.Cur(), me.id, "oa", "info",
                 "表单已提交", def.name + " " + summary,
                 "/admin/oa/formfill/detail?id=" + Convert.ToString(id));
         }
@@ -185,19 +185,19 @@ class FormFill : AdminController {
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("我的提交")]
     async void My() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         ViewData d = await this.Layout("我的提交");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
         ListQuery q = this.Paged("id", 20);
         List<OaFormData> rows = await this.OaFormData
-            .Where(a => a.tenantId == this.TenantId() && a.submitterId == me.id)
+            .Where(a => a.submitterId == me.id)
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.OaFormData
-            .Where(a => a.tenantId == this.TenantId() && a.submitterId == me.id)
+            .Where(a => a.submitterId == me.id)
             .CountAsync();
         List<OaFormDef> defs = await this.OaFormDef
-            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+            .ToListAsync();
         List<StrMap> items = d.AddList("rows");
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaFormData r = rows[i];
@@ -223,16 +223,16 @@ class FormFill : AdminController {
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("提交详情")]
     async void Detail() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int id = this.InInt("id", 0);
         OaFormData r = await this.OaFormData
-            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .Where(a => a.id == id)
             .FirstAsync();
         if (r == null) { this.Fail(404, "0404", "提交不存在"); return; }
         FlowInst inst = await FormFill.InstOf(this, r);
         JsonValue schema = JsonValue.ParseLenient(r.schemaSnapshot);
         JsonValue data = JsonValue.ParseLenient(r.dataJson);
-        List<DictItem> dicts = await FormSchema.DictsFor(this.Held(), schema);
+        List<SysDictItem> dicts = await FormSchema.DictsFor(this.Held(), schema);
         bool inDialog = this.In("as") == "dialog";
         ViewData d = inDialog ? new ViewData() : await this.Layout("提交详情");
         if (inDialog) { d.Set("dialogTitle", "提交详情"); }
@@ -254,24 +254,24 @@ class FormFill : AdminController {
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("提交记录")]
     async void All() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int formId = this.InInt("formId", 0);
         OaFormDef def = await this.OaFormDef
-            .Where(a => a.id == formId && a.tenantId == this.TenantId())
+            .Where(a => a.id == formId)
             .FirstAsync();
         if (def == null) { this.Fail(404, "0404", "表单不存在"); return; }
         ViewData d = await this.Layout("提交记录：" + def.name);
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
         ListQuery q = this.Paged("id", 20);
         List<OaFormData> rows = await this.OaFormData
-            .Where(a => a.tenantId == this.TenantId() && a.formId == def.id)
+            .Where(a => a.formId == def.id)
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.OaFormData
-            .Where(a => a.tenantId == this.TenantId() && a.formId == def.id)
+            .Where(a => a.formId == def.id)
             .CountAsync();
-        List<User> users = await this.User
-            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        List<SysUser> users = await this.SysUser
+            .ToListAsync();
         List<StrMap> items = d.AddList("rows");
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaFormData r = rows[i];
@@ -305,16 +305,16 @@ class FormFill : AdminController {
     [Custom(Perm = PermBit.Export)]
     [Description("导出提交记录")]
     async void Export() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int formId = this.InInt("formId", 0);
         bool mine = this.InInt("mine", 0) == 1;
         bool xlsx = this.InInt("xlsx", 0) == 1;
         OaFormDef def = await this.OaFormDef
-            .Where(a => a.id == formId && a.tenantId == this.TenantId())
+            .Where(a => a.id == formId)
             .FirstAsync();
         if (def == null) { this.Fail(404, "0404", "表单不存在"); return; }
         List<OaFormData> rows = await this.OaFormData
-            .Where(a => a.tenantId == this.TenantId() && a.formId == def.id
+            .Where(a => a.formId == def.id
                 && a.status == 1)
             .WhereIf(mine, a => a.submitterId == me.id)
             .OrderBy(a => a.id).ToListAsync();
@@ -345,10 +345,10 @@ class FormFill : AdminController {
         for (int i = 0; i < exportFields.Count; i = i + 1) {
             headers.Add(exportFields[i].label);
         }
-        List<User> users = await this.User
-            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        List<SysUser> users = await this.SysUser
+            .ToListAsync();
         List<FlowInst> insts = await this.FlowInst
-            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+            .ToListAsync();
         List<List<string>> data = new List<List<string>>();
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaFormData r = rows[i];
@@ -365,8 +365,7 @@ class FormFill : AdminController {
                 if (ef.type == "attachment") {
                     if (atts == null) {
                         atts = await this.OaAttachment
-                            .Where(a => a.tenantId == this.TenantId()
-                                && a.module == "form" && a.relatedId == r.id)
+                            .Where(a => a.module == "form" && a.relatedId == r.id)
                             .OrderBy(a => a.id).ToListAsync();
                     }
                     for (int k = 0; k < atts.Count; k = k + 1) {
@@ -395,7 +394,7 @@ class FormFill : AdminController {
             Attachment.BaseName(def.name) + "-提交记录", headers, data, xlsx);
     }
 
-    static FlowInst FindInst(List<FlowInst> insts, int instId) {
+    private static FlowInst FindInst(List<FlowInst> insts, int instId) {
         if (instId <= 0) { return null; }
         for (int i = 0; i < insts.Count; i = i + 1) {
             if (insts[i].id == instId) { return insts[i]; }
@@ -410,7 +409,7 @@ class FormFill : AdminController {
        已挡），此处拆回数组落 dataJson；
        attachment 无表单值（随行挂载）；其余标量 Trim 后存字符串值
        （OaFormData.dataJson 契约：值恒字符串或字符串数组）。 */
-    JsonValue Collect(JsonValue schema) {
+    private JsonValue Collect(JsonValue schema) {
         JsonValue o = JsonValue.NewObject();
         JsonValue fields = schema.Get("fields");
         if (fields == null || !fields.IsArray()) { return o; }
@@ -472,7 +471,7 @@ class FormFill : AdminController {
     static async FlowInst InstOf(FormFill c, OaFormData r) {
         if (r.instId <= 0) { return null; }
         return await c.FlowInst
-            .Where(a => a.id == r.instId && a.tenantId == c.TenantId())
+            .Where(a => a.id == r.instId && a.tenantId == Tenant.Cur())
             .FirstAsync();
     }
 
@@ -501,7 +500,7 @@ class FormFill : AdminController {
         return "表单#" + Convert.ToString(formId);
     }
 
-    static string UserName(List<User> users, int userId) {
+    static string UserName(List<SysUser> users, int userId) {
         for (int i = 0; i < users.Count; i = i + 1) {
             if (users[i].id == userId) {
                 return Fmt.Text(users[i].nickname, users[i].username);

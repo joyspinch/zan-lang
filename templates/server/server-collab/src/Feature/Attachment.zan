@@ -4,7 +4,7 @@ using System.Data.Orm;
 using System.IO;
 using ZanWeb.Dao.Oa;
 using ZanWeb.Model.Oa;
-using ZanWeb.Model.Sys;
+using ZanWeb.Model;
 
 namespace ZanWeb;
 
@@ -96,6 +96,17 @@ class Attachment {
         return s;
     }
 
+    /* 配额计数行回塦（A327-09，原并行 Schema.EnsureAttachUsage 迁来）：
+       oa_attach_usage 每租户一行，缺行时按 oa_attachment 存量求和建行
+       （幂等，已有行不动）；由 main.zan 在 Schema.Ensure 成功后调用。 */
+    static async void EnsureQuotaRow(IDbConnection db) {
+        await db.ExecuteAsync(
+            "INSERT INTO oa_attach_usage (tenantId, usedBytes, updatedAt) "
+            + "SELECT 1, COALESCE((SELECT SUM(size) FROM oa_attachment), 0), 0 "
+            + "WHERE NOT EXISTS "
+            + "(SELECT 1 FROM oa_attach_usage WHERE tenantId = 1)");
+    }
+
     /* 登记 + 归位：租户配额通过后，暂存文件移入
        data/uploads/t{tenantId}/{yyyyMM}/{hex}_{seq}.bin 并落库。
        返回登记行 id；配额超限抛 ApiError（调用方即控制器，语义为 403）。
@@ -118,7 +129,6 @@ class Attachment {
                 + Convert.ToString(quota / 1048576) + " MB）");
         }
 
-        long now = WebApp.NowSeconds();
         DateTime d = DateTime.FromUnixSeconds(now
             + (long)Fmt.OffsetMinutes() * 60);
         string dir = "data/uploads/t" + Convert.ToString(tenantId)
@@ -141,15 +151,16 @@ class Attachment {
         return await new OaAttachmentDao(db).Insert(a);
     }
 
-    /* 下载授权（软隔离的硬边在先）：跨租户一律拒绝（验收项）；同租户内
-       上传者本人、超管或持挂载模块授权屏 View 位的账号可下载。
+    /* 下载授权（软隔离的硬边在先）：附件租户须与当前租户一致（包代际
+       sys 主数据全局化，当前租户经应用本地门面 Tenant.Cur() 取值）；
+       同租户内上传者本人、超管或持挂载模块授权屏 View 位的账号可下载。
        sc 为调用方已解析的数据范围（Controller.Scope()），一期只做
        存在性校验位——范围收紧到部门/本人时的行级过滤是挂载方列表查询
        的职责，附件层只守租户与模块两道门。 */
-    static async bool CanDownload(User me, DataScope sc, string uid,
+    static async bool CanDownload(SysUser me, DataScope sc, string uid,
                                   OaAttachment att) {
         if (me == null || att == null) { return false; }
-        if (att.tenantId != me.tenantId) { return false; }
+        if (att.tenantId != Tenant.Cur()) { return false; }
         if (me.isSuper == 1) { return true; }
         if (att.uploaderId == me.id) { return true; }
         if (sc != null && sc.Any()) { return true; }

@@ -32,12 +32,11 @@ MVC 框架之上。**零 Redis、零外部服务依赖**：默认 SQLite（WAL�
 ```
 config/app.json         runtime config (host/port/limits/db/cache) — NOT compiled in
 src/main.zan            bootstrap only — routes come from controller attributes
-src/Controller/         平台域控制器
-  Account/                Login / Register（登录域，Bypass）
-  Admin/Dashboard.zan     工作台（聚合待办 + 公告卡片）
-  Admin/Profile.zan       个人中心
-  Admin/System/           Users / Roles / Departments / Dicts / Logs /
-                          SiteConfig / Backups / Docs（接口文档页）
+src/Controller/         平台域控制器（平台屏由 Zan.Mvc 包提供：
+                          工作台/个人中心/sys 全家/Register/监控/代码生成器，
+                          包 views 随包控制器同键合入本应用 views/）
+  Account/Login.zan       管理台登录（/admin/login，包无此路由）
+  Admin/System/Backups.zan 备份页（应用自有）
   Admin/Dev/Assistant.zan AI 助手（[Ai] 白名单策略）
   Api/                    Auth（令牌登录）、Data、Index
 src/Modules/            业务域（模型 + 控制器同目录内聚）
@@ -47,13 +46,12 @@ src/Modules/            业务域（模型 + 控制器同目录内聚）
   Wms/                    商品 / 仓库 / 库存 / 入库
   Ecbi/                   电商 BI：店铺 / 商品 / 广告 / 报表 / 平台
   Flow/                   流程定义 / 实例 / 任务 + 引擎（Engine.zan）+ 通知兼容层
-src/Feature/            横切能力：Attachment、TodoCenter、ExcelIo、Blocks、
-                        FormSchema、Backup、Search、CalendarRemind、
-                        MessageRelay、Mailer、Metrics、Ai…
-src/Framework/          应用接线：Cfg、Db、DbContext、Schema（CodeFirst DDL +
-                        种子）、Auth、Tenant、Notify(Hub)、DataScope、Perm(Table)、
-                        ExcelIo、Search、MessageRelay、AppServices
-src/Model/、src/Dao/    sys_* 平台实体与查询
+src/Feature/            横切能力：Attachment（含配额计数行回填）、TodoCenter、
+                        ExcelIo、Blocks、FormSchema、Backup、Search、
+                        CalendarRemind、MessageRelay、Notify(Hub)…
+src/Framework/          应用接线：Tenant（包全球化后的租户锚）、
+                        WebFmt、ExcelIo、MessageRelay、Search
+src/Modules/*/Model、Dao  业务实体与查询（sys_* 平台实体在 Zan.Mvc 包）
 views/                  templates, in the module structure of the controllers
   layout.html             the site-wide page wrapper (global {{content}} layout)
   <Module>/*.html         that module's views; a module's own layout.html

@@ -7,7 +7,7 @@ using System.Text;
 using System.Web;
 using ZanWeb.Dao.Oa;
 using ZanWeb.Model.Oa;
-using ZanWeb.Model.Sys;
+using ZanWeb.Model;
 
 namespace ZanWeb;
 
@@ -60,7 +60,7 @@ class FieldRule {
    1~4 条规则稳定、同内容 5 条规则崩溃；故障指令 mov rax,[rax] rax=0，
    行级定位 TestIo.zan 处理器首条 TryGetValue），平行 List 全程稳定，
    故改为键值平行表 + Rec 线性扫描（列数 ≤20，开销可忽略）。 */
-delegate string ImportRow(IDbConnection db, int tenantId, User me,
+delegate string ImportRow(IDbConnection db, int tenantId, SysUser me,
                           List<string> recKeys, List<string> recVals);
 
 /* 导入导出公共层（架构 §2.6 WP-6 / T6）：全站唯一的表格进出入口。
@@ -96,11 +96,23 @@ class ExcelIo {
                 + ".spreadsheetml.sheet", data, data.Length);
             return;
         }
-        string csv = Csv.Serialize(all);
+        string csv = ExcelIo.CsvText(all);
         byte[] body = csv.ToBytes();
         ctx.SetHeader("Content-Disposition",
             "attachment; filename=\"" + name + ".csv\"");
         ctx.Binary("text/csv; charset=utf-8", body, body.Length);
+    }
+
+
+    /* 多行记录写为 CSV 文本（RFC4180：经 System.Data 的 Csv.Escape/
+       RowToText，CRLF 行尾——Excel 直接打开兼容）。 */
+    static string CsvText(List<List<string>> table) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < table.Count; i = i + 1) {
+            if (i > 0) { sb.Append("\r\n"); }
+            sb.Append(Csv.RowToText(table[i]));
+        }
+        return sb.ToString();
     }
 
     /* CSV 模板下载：一行表头 + 一行示例（示例行帮用户对齐格式）。 */
@@ -109,7 +121,7 @@ class ExcelIo {
         List<List<string>> all = new List<List<string>>();
         all.Add(headers);
         if (sample != null) { all.Add(sample); }
-        string csv = Csv.Serialize(all);
+        string csv = ExcelIo.CsvText(all);
         byte[] body = csv.ToBytes();
         ctx.SetHeader("Content-Disposition",
             "attachment; filename=\"" + name + "-模板.csv\"");
@@ -117,20 +129,24 @@ class ExcelIo {
     }
 
     /* 导入主流程：校验 -> 分批事务 -> 报告落库。返回批次行 id。
-       dataRows[0] 为文件表头行、数据自 index 1 起（控制器把 Csv.Parse
-       结果整包传入）；表头按列名映射（顺序无关、未识别列忽略），
+       首记录为文件表头（控制器把 Csv.Parse
+       的 CsvTable 整包传入）；表头按列名映射（顺序无关、未识别列忽略），
        必填模板列缺失视为整个文件无效——此时也落一行 fail=全量的
        批次报告，便于前端展示原因。
        事务约定：ImportRow 处理器不得抛异常——业务错误一律以返回值
        报告；因此批事务只 Commit 不 Rollback（好行入库、错行跳过）。 */
-    static async int Import(IDbConnection db, int tenantId, User me,
+    static async int Import(IDbConnection db, int tenantId, SysUser me,
                             string module, string fileName,
                             List<string> headers, List<FieldRule> rules,
-                            List<List<string>> dataRows, ImportRow handler) {
+                            CsvTable dataRows, ImportRow handler) {
         long now = WebApp.NowSeconds();
         int ok = 0;
         int fail = 0;
         List<string> errs = new List<string>();
+        /* CSV 文本由调用方经 System.Data 的 RFC4180 解析器（Csv.Parse）
+           读成表：首记录即模板表头，其后为数据行。 */
+        List<string> head = dataRows.Header();
+        List<List<string>> rows = dataRows.Rows();
 
         /* 列映射：规则 -> 数据表头列位（平行 List，不用 Dict，见
            ImportRow 注记约定 2）。colIdx[i] = 模板列 rules[i] 在文件
@@ -139,8 +155,7 @@ class ExcelIo {
         for (int i = 0; i < rules.Count; i = i + 1) {
             colIdx.Add(0 - 1);
         }
-        if (dataRows.Count > 0) {
-            List<string> head = dataRows[0];
+        if (head.Count > 0) {
             for (int c = 0; c < head.Count; c = c + 1) {
                 string cn = head[c].Trim();
                 for (int i = 0; i < rules.Count; i = i + 1) {
@@ -161,14 +176,14 @@ class ExcelIo {
             }
         }
         if (missing.Length > 0) {
-            fail = dataRows.Count > 0 ? dataRows.Count - 1 : 0;
+            fail = rows.Count;
             errs.Add(ExcelIo.ErrJson(1, "", "表头缺少必填列：" + missing));
         }
 
         int batchLeft = 0;
-        for (int i = 1; i < dataRows.Count; i = i + 1) {
-            int rowNo = i + 1;   /* 含表头的 1-based 行号，对齐 Excel */
-            List<string> cells = dataRows[i];
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            int rowNo = i + 2;   /* 含表头的 1-based 行号，对齐 Excel */
+            List<string> cells = rows[i];
 
             /* 取列值 + 通用列校验（平行表：keys/vals 每行重建）。 */
             List<string> keys = new List<string>();
@@ -246,7 +261,7 @@ class ExcelIo {
         b.tenantId = tenantId;
         b.module = module;
         b.fileName = Fmt.Text(fileName, "");
-        b.total = dataRows.Count > 0 ? dataRows.Count - 1 : 0;
+        b.total = rows.Count;
         b.ok = ok;
         b.fail = fail;
         b.errors = errJson;

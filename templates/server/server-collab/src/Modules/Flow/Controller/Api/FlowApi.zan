@@ -4,7 +4,7 @@ using System.Data.Orm;
 using System.Json;
 using System.Web;
 using ZanWeb.Model.Flow;
-using ZanWeb.Model.Sys;
+using ZanWeb.Model;
 using ZanWeb.Modules.Flow;
 
 namespace ZanWeb.Api;
@@ -30,7 +30,7 @@ class FlowApi : ApiController {
     [Custom(Perm = PermBit.View)]
     async void FlowTemplates() {
         List<FlowDef> defs = await this.FlowDef
-            .Where(a => a.tenantId == this.TenantId() && a.status == 1)
+            .Where(a => a.tenantId == Tenant.Cur() && a.status == 1)
             .ToListAsync();
         List<FlowNode> nodes = await this.FlowNode
             .Where(a => a.defId > 0).ToListAsync();
@@ -48,7 +48,7 @@ class FlowApi : ApiController {
             o.Put("nodeCount", JsonValue.NewStr(Convert.ToString(count)));
             items.Append(o);
         }
-        List<Department> depts = await this.Department
+        List<SysDepartment> depts = await this.SysDepartment
             .Where(a => a.status == 1).ToListAsync();
         JsonValue darr = JsonValue.NewArray();
         for (int i = 0; i < depts.Count; i = i + 1) {
@@ -70,7 +70,7 @@ class FlowApi : ApiController {
     async void FlowTemplate() {
         FlowDef def = await this.FlowDef
             .Where(a => a.id == this.InInt("id", 0)
-                && a.tenantId == this.TenantId()).FirstAsync();
+                && a.tenantId == Tenant.Cur()).FirstAsync();
         if (def == null) { this.Fail(404, "0404", "流程不存在"); }
         List<FlowNode> nodes = await this.FlowNode
             .Where(a => a.defId == def.id).ToListAsync();
@@ -125,24 +125,24 @@ class FlowApi : ApiController {
         FlowDef def;
         if (id > 0) {
             def = await this.FlowDef
-                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .Where(a => a.id == id && a.tenantId == Tenant.Cur())
                 .FirstAsync();
             if (def == null) { this.Fail(404, "0404", "流程不存在"); }
             int live = await this.FlowInst
                 .Where(a => a.defId == id && a.status == 1
-                    && a.tenantId == this.TenantId()).CountAsync();
+                    && a.tenantId == Tenant.Cur()).CountAsync();
             if (live > 0) { this.Fail(409, "0409", "有进行中的实例，模板不可改"); }
             int _u = await this.FlowDef.Update()
                 .Set(a => a.name, name)
                 .Set(a => a.description, this.In("description"))
                 .Set(a => a.updatedAt, now)
-                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .Where(a => a.id == id && a.tenantId == Tenant.Cur())
                 .ExecuteAffrowsAsync();
             int _d = await this.FlowNode.Delete()
                 .Where(a => a.defId == id).ExecuteAffrowsAsync();
         } else {
             def = new FlowDef();
-            def.tenantId = this.TenantId();
+            def.tenantId = Tenant.Cur();
             def.name = name;
             def.description = this.In("description");
             def.status = 1;
@@ -175,11 +175,11 @@ class FlowApi : ApiController {
     [Description("发起流程")]
     [Custom(Perm = PermBit.Create)]
     async void FlowStart() {
-        User me = await this.Me();
+        SysUser me = await this.Me();
         string title = this.Need("title", "实例标题");
         FlowDef def = await this.FlowDef
             .Where(a => a.id == this.InInt("defId", 0)
-                && a.tenantId == this.TenantId()).FirstAsync();
+                && a.tenantId == Tenant.Cur()).FirstAsync();
         if (def == null) { this.Fail(404, "0404", "流程不存在"); }
         if (def.status != 1) { this.Fail(400, "0004", "流程已停用"); }
         int instId = await ZanWeb.Modules.Flow.Engine.Start(
@@ -194,7 +194,7 @@ class FlowApi : ApiController {
     [Description("我的工作流待办")]
     [Custom(Perm = PermBit.View)]
     async void FlowMine() {
-        User me = await this.Me();
+        SysUser me = await this.Me();
         List<FlowTask> mine = await this.FlowTask
             .Where(a => a.assignUserId == me.id
                 && (a.status == 0 || a.status == 3)).ToListAsync();
@@ -207,7 +207,7 @@ class FlowApi : ApiController {
             pool = new List<FlowTask>();
         }
         List<FlowInst> myInsts = await this.FlowInst
-            .Where(a => a.tenantId == this.TenantId() && a.startedBy == me.id
+            .Where(a => a.tenantId == Tenant.Cur() && a.startedBy == me.id
                 && a.status == 1).ToListAsync();
         List<int> instIds = new List<int>();
         for (int i = 0; i < myInsts.Count; i = i + 1) {
@@ -222,7 +222,7 @@ class FlowApi : ApiController {
             accept = new List<FlowTask>();
         }
         List<FlowInst> allInsts = await this.FlowInst
-            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+            .Where(a => a.tenantId == Tenant.Cur()).ToListAsync();
         List<FlowNode> allNodes = await this.FlowNode
             .Where(a => a.defId > 0).ToListAsync();
         JsonValue mineArr = this.Shape(mine, allInsts, allNodes);
@@ -236,7 +236,7 @@ class FlowApi : ApiController {
     }
 
     /* 行装组：任务 → {taskId,instId,title,nodeName,status,result,at}。 */
-    JsonValue Shape(List<FlowTask> tasks, List<FlowInst> insts,
+    private JsonValue Shape(List<FlowTask> tasks, List<FlowInst> insts,
                     List<FlowNode> nodes) {
         JsonValue items = JsonValue.NewArray();
         for (int i = 0; i < tasks.Count; i = i + 1) {
@@ -268,10 +268,10 @@ class FlowApi : ApiController {
     [Description("流程实例详情")]
     [Custom(Perm = PermBit.View)]
     async void FlowInst() {
-        User me = await this.Me();
+        SysUser me = await this.Me();
         FlowInst inst = await this.FlowInst
             .Where(a => a.id == this.InInt("id", 0)
-                && a.tenantId == this.TenantId()).FirstAsync();
+                && a.tenantId == Tenant.Cur()).FirstAsync();
         if (inst == null) { this.Fail(404, "0404", "流程不存在"); }
         FlowDef def = await this.FlowDef
             .Where(a => a.id == inst.defId).FirstAsync();
@@ -314,7 +314,7 @@ class FlowApi : ApiController {
                 userIds.Add(logs[i].userId);
             }
         }
-        List<User> users = await this.User
+        List<SysUser> users = await this.SysUser
             .Where(a => userIds.Contains(a.id)).ToListAsync();
 
         JsonValue nodesArr = JsonValue.NewArray();
@@ -373,8 +373,8 @@ class FlowApi : ApiController {
 
     /* 当前登录账号（ApiAuth 下 uid 必在；查不到即 401——token 版本失效等）。
        与 CollabApi.Me 同款（基类无此件，各 Api 控制器自带）。 */
-    async User Me() {
-        User me = await this.User
+    private async  SysUser Me() {
+        SysUser me = await this.SysUser
             .Where(a => a.id == Filter.ToInt(this.uid, 0)).FirstAsync();
         if (me == null || me.status != 1) {
             this.Fail(401, "1001", "账号不可用，请重新登录");
@@ -382,7 +382,7 @@ class FlowApi : ApiController {
         return me;
     }
 
-    string NameOf(List<User> users, int userId) {
+    private string NameOf(List<SysUser> users, int userId) {
         for (int i = 0; i < users.Count; i = i + 1) {
             if (users[i].id == userId) {
                 return Fmt.Text(users[i].nickname, users[i].username);
@@ -392,13 +392,13 @@ class FlowApi : ApiController {
     }
 
     /* 待办行装载（认领/提交/验收/驳回共用）：inst 在手、任务在手。 */
-    async FlowTask HeldTask() {
+    private async  FlowTask HeldTask() {
         FlowTask t = await this.FlowTask
             .Where(a => a.id == this.InInt("taskId", 0)).FirstAsync();
         if (t == null) { this.Fail(404, "0404", "任务不存在"); }
         FlowInst inst = await this.FlowInst
             .Where(a => a.id == t.instId
-                && a.tenantId == this.TenantId()).FirstAsync();
+                && a.tenantId == Tenant.Cur()).FirstAsync();
         if (inst == null) { this.Fail(404, "0404", "任务不存在"); }
         return t;
     }
@@ -408,7 +408,7 @@ class FlowApi : ApiController {
     [Description("认领流程任务")]
     [Custom(Perm = PermBit.Update)]
     async void FlowClaim() {
-        User me = await this.Me();
+        SysUser me = await this.Me();
         FlowTask t = await this.HeldTask();
         if (t.status != 0 || t.assignUserId != 0) {
             this.Fail(409, "0409", "任务已被认领或不在待处理态");
@@ -429,7 +429,7 @@ class FlowApi : ApiController {
     [Description("提交验收")]
     [Custom(Perm = PermBit.Update)]
     async void FlowSubmit() {
-        User me = await this.Me();
+        SysUser me = await this.Me();
         FlowTask t = await this.HeldTask();
         if (t.assignUserId != me.id) { this.Fail(403, "0403", "仅执行人可提交"); }
         if (t.status != 0) { this.Fail(409, "0409", "任务不在待处理态"); }
@@ -447,7 +447,7 @@ class FlowApi : ApiController {
     [Description("验收通过")]
     [Custom(Perm = PermBit.Update)]
     async void FlowAccept() {
-        User me = await this.Me();
+        SysUser me = await this.Me();
         FlowTask t = await this.HeldTask();
         FlowInst inst = await this.FlowInst
             .Where(a => a.id == t.instId).FirstAsync();
@@ -472,7 +472,7 @@ class FlowApi : ApiController {
     [Description("验收驳回")]
     [Custom(Perm = PermBit.Update)]
     async void FlowReject() {
-        User me = await this.Me();
+        SysUser me = await this.Me();
         FlowTask t = await this.HeldTask();
         FlowInst inst = await this.FlowInst
             .Where(a => a.id == t.instId).FirstAsync();
@@ -494,10 +494,10 @@ class FlowApi : ApiController {
     [Description("终止流程")]
     [Custom(Perm = PermBit.Update)]
     async void FlowCancel() {
-        User me = await this.Me();
+        SysUser me = await this.Me();
         FlowInst inst = await this.FlowInst
             .Where(a => a.id == this.InInt("instId", 0)
-                && a.tenantId == this.TenantId()).FirstAsync();
+                && a.tenantId == Tenant.Cur()).FirstAsync();
         if (inst == null) { this.Fail(404, "0404", "流程不存在"); }
         if (inst.startedBy != me.id) { this.Fail(403, "0403", "仅发起人可终止"); }
         if (inst.status != 1) { this.Fail(409, "0409", "流程已结束"); }

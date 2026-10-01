@@ -5,7 +5,7 @@ using System.Data.Orm;
 using System.Web;
 using System.Json;
 using ZanWeb.Model.Oa;
-using ZanWeb.Model.Sys;
+using ZanWeb.Model;
 
 namespace ZanWeb.Admin.Oa;
 
@@ -28,16 +28,15 @@ class Messages : AdminController {
     [Custom(IsMenu = true, Icon = "mdi:email", Perm = PermBit.View)]
     [Description("站内私信")]
     async void Index() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         ViewData d = await this.Layout("站内私信");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
         /* 全量拉取（id DESC=最新在前），内存按对端分组取最新+未读数。 */
         List<OaMessage> rows = await this.OaMessage
-            .Where(a => a.tenantId == this.TenantId()
-                && (a.fromId == me.id || a.toId == me.id))
+            .Where(a => (a.fromId == me.id || a.toId == me.id))
             .OrderByDescending(a => a.id).ToListAsync();
-        List<User> users = await this.User
-            .Where(a => a.tenantId == this.TenantId() && a.status == 1)
+        List<SysUser> users = await this.SysUser
+            .Where(a => a.status == 1)
             .ToListAsync();
         List<int> peers = new List<int>();
         List<int> unread = new List<int>();
@@ -77,20 +76,19 @@ class Messages : AdminController {
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("私信对话")]
     async void Chat() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int peerId = this.InInt("peer", 0);
-        User peer = await this.User
-            .Where(a => a.id == peerId && a.tenantId == this.TenantId()
+        SysUser peer = await this.SysUser
+            .Where(a => a.id == peerId
                 && a.status == 1).FirstAsync();
         if (peer == null) { this.Fail(404, "0404", "对方不存在或已停用"); return; }
-        List<User> peerList = new List<User>();
+        List<SysUser> peerList = new List<SysUser>();
         peerList.Add(peer);
         string peerName = Messages.NameOf(peerList, peer.id);
         ViewData d = await this.Layout("与 " + peerName);
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
         List<OaMessage> rows = await this.OaMessage
-            .Where(a => a.tenantId == this.TenantId()
-                && ((a.fromId == me.id && a.toId == peer.id)
+            .Where(a => ((a.fromId == me.id && a.toId == peer.id)
                     || (a.fromId == peer.id && a.toId == me.id)))
             .OrderBy(a => a.id).ToListAsync();
         List<StrMap> items = d.AddList("rows");
@@ -124,11 +122,10 @@ class Messages : AdminController {
         int _n = await this.OaMessage.Update()
             .Set(a => a.isRead, 1)
             .Set(a => a.isAcked, 1)
-            .Where(a => a.tenantId == this.TenantId()
-                && a.toId == me.id && a.fromId == peer.id && a.isRead == 0)
+            .Where(a => a.toId == me.id && a.fromId == peer.id && a.isRead == 0)
             .ExecuteAffrowsAsync();
         if (_n > 0 && maxUnread > 0) {
-            await this.Receipt(this.TenantId(), maxUnread, peer.id, me.id, 2);
+            await this.Receipt(Tenant.Cur(), maxUnread, peer.id, me.id, 2);
         }
         this.Page(d);
     }
@@ -139,7 +136,7 @@ class Messages : AdminController {
     [Custom(Perm = PermBit.View)]
     [Description("发送私信")]
     async void Send() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int peerId = this.InInt("peer", 0);
         /* Bug#8：私信正文 textarea 多行语义，Need 内部走 In(Filter.Clean) 会剥
            换行——InRaw + 同语义空检查（原 Need 文案不变）。 */
@@ -147,12 +144,12 @@ class Messages : AdminController {
         if (content.Length == 0) { this.Fail(400, "0003", "私信内容不能为空"); return; }
         if (content.Length > 2048) { content = content.Substring(0, 2048); }
         if (peerId == me.id) { this.Fail(400, "0004", "不能给自己发私信"); return; }
-        User peer = await this.User
-            .Where(a => a.id == peerId && a.tenantId == this.TenantId()
+        SysUser peer = await this.SysUser
+            .Where(a => a.id == peerId
                 && a.status == 1).FirstAsync();
         if (peer == null) { this.Fail(404, "0404", "对方不存在或已停用"); return; }
         OaMessage r = new OaMessage();
-        r.tenantId = this.TenantId();
+        r.tenantId = Tenant.Cur();
         r.fromId = me.id;
         r.toId = peer.id;
         r.content = content;
@@ -160,7 +157,7 @@ class Messages : AdminController {
         r.replyTo = 0;
         r.createdAt = WebApp.NowSeconds();
         int msgId = await this.OaMessage.Insert(r).ExecuteIdentityAsync();
-        await Notify.Send(this.Held(), this.TenantId(), peer.id, "oa", "message",
+        await Notify.Send(this.Held(), Tenant.Cur(), peer.id, "oa", "message",
             "新私信：" + Fmt.Text(me.nickname, me.username),
             Messages.Excerpt(content, 50),
             "/admin/oa/messages/chat?peer=" + Convert.ToString(me.id));
@@ -175,11 +172,11 @@ class Messages : AdminController {
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("私信送达回执")]
     async void Ack() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int id = this.InInt("id", 0);
         if (id <= 0) { this.Ctx().Json(Envelope("0003")); return; }
         OaMessage r = await this.OaMessage
-            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .Where(a => a.id == id)
             .FirstAsync();
         if (r == null || r.toId != me.id) {
             this.Ctx().Json(Envelope("0404"));
@@ -187,11 +184,11 @@ class Messages : AdminController {
         }
         int n = await this.OaMessage.Update()
             .Set(a => a.isAcked, 1)
-            .Where(a => a.id == r.id && a.tenantId == this.TenantId()
+            .Where(a => a.id == r.id
                 && a.toId == me.id && a.isAcked == 0)
             .ExecuteAffrowsAsync();
         if (n > 0) {
-            await this.Receipt(this.TenantId(), r.id, r.fromId, me.id, 1);
+            await this.Receipt(Tenant.Cur(), r.id, r.fromId, me.id, 1);
         }
         this.Ctx().Json(Envelope("0000"));
     }
@@ -203,15 +200,14 @@ class Messages : AdminController {
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("私信已读回执")]
     async void Read() {
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int peerId = this.InInt("peer", 0);
         if (peerId <= 0 || peerId == me.id) {
             this.Ctx().Json(Envelope("0003"));
             return;
         }
         List<OaMessage> unread = await this.OaMessage
-            .Where(a => a.tenantId == this.TenantId()
-                && a.toId == me.id && a.fromId == peerId && a.isRead == 0)
+            .Where(a => a.toId == me.id && a.fromId == peerId && a.isRead == 0)
             .OrderBy(a => a.id).ToListAsync();
         if (unread.Count == 0) { this.Ctx().Json(Envelope("0000")); return; }
         int maxId = 0;
@@ -221,10 +217,9 @@ class Messages : AdminController {
         await this.OaMessage.Update()
             .Set(a => a.isRead, 1)
             .Set(a => a.isAcked, 1)
-            .Where(a => a.tenantId == this.TenantId()
-                && a.toId == me.id && a.fromId == peerId && a.isRead == 0)
+            .Where(a => a.toId == me.id && a.fromId == peerId && a.isRead == 0)
             .ExecuteAffrowsAsync();
-        await this.Receipt(this.TenantId(), maxId, peerId, me.id, 2);
+        await this.Receipt(Tenant.Cur(), maxId, peerId, me.id, 2);
         this.Ctx().Json(Envelope("0000"));
     }
 
@@ -241,7 +236,7 @@ class Messages : AdminController {
     /* 回执事件落库：read/ack 共用。事件表即总线，MessageRelay 水位扫描
        后向消息发送方（ev.fromId）扇出实时帧；kind 1=送达 2=已读，与
        OaMessageEvent.kind 对应。只增不改，回执时序即存证（主库可查）。 */
-    async void Receipt(int tenantId, int msgId, int senderId, int byId,
+    private async  void Receipt(int tenantId, int msgId, int senderId, int byId,
         int kind) {
         OaMessageEvent ev = new OaMessageEvent();
         ev.tenantId = tenantId;
@@ -261,7 +256,7 @@ class Messages : AdminController {
     }
 
     /* 昵称空回退用户名；对端行缺席（已删号的历史会话）显示占位。 */
-    static string NameOf(List<User> users, int id) {
+    static string NameOf(List<SysUser> users, int id) {
         for (int i = 0; i < users.Count; i = i + 1) {
             if (users[i].id == id) { return Fmt.Text(users[i].nickname, users[i].username); }
         }
@@ -270,5 +265,5 @@ class Messages : AdminController {
 
     /* 单行摘要：换行折空格，超长截断。截断走 Fmt.Excerpt——按字节截之前
        先回退到 UTF-8 字符边界，切掉半个汉字会让整个 JSON 应答不可解析。 */
-    static string Excerpt(string s, int max) { return Fmt.Excerpt(s, max); }
+    static string Excerpt(string s, int max) { return WebFmt.Excerpt(s, max); }
 }

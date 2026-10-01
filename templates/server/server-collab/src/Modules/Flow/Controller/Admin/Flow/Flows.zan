@@ -3,7 +3,7 @@ using System.Data;
 using System.Data.Orm;
 using System.Web;
 using ZanWeb.Model.Flow;
-using ZanWeb.Model.Sys;
+using ZanWeb.Model;
 using ZanWeb.Modules.Flow;
 
 namespace ZanWeb.Admin.Flow;
@@ -25,12 +25,12 @@ class Flows : AdminController {
         string kw = q.Kw();
         /* 租户硬边（#34）：流程定义/实例列表只出本租户行。 */
         List<FlowDef> rows = await this.FlowDef
-            .Where(a => a.tenantId == this.TenantId())
+            
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
             .OrderBy(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.FlowDef
-            .Where(a => a.tenantId == this.TenantId())
+            
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw)).CountAsync();
         d.Set("empty", total == 0 ? "1" : "");
         d.Set("kw", kw);
@@ -65,7 +65,7 @@ class Flows : AdminController {
         List<FlowNode> ordered = new List<FlowNode>();
         if (id > 0) {
             FlowDef r = await this.FlowDef
-                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .Where(a => a.id == id)
                 .FirstAsync();
             if (r == null) { this.Fail(404, "0404", "流程不存在"); return; }
             d.Set("id", Convert.ToString(id));
@@ -149,9 +149,9 @@ class Flows : AdminController {
            员工候选池=本租户启用账号（sys_user.tenantId，Bug#4 本体 B：
            该枚举面被编辑弹窗暴露，必须租户闸）；部门为全局组织架构
            （sys_department 无租户列，同角色/字典形态）。 */
-        List<Department> depts = await this.Department.ToListAsync();
-        List<User> users = await this.User
-            .Where(a => a.tenantId == this.TenantId() && a.status == 1)
+        List<SysDepartment> depts = await this.SysDepartment.ToListAsync();
+        List<SysUser> users = await this.SysUser
+            .Where(a => a.status == 1)
             .ToListAsync();
         List<StrMap> nodeRows = d.ListOf("nodes");
         if (nodeRows != null) {
@@ -173,7 +173,7 @@ class Flows : AdminController {
     }
 
     /* Bug#7：部门候选串，sel 与 option value（原始 id）相等才补 selected。 */
-    static string DeptOpts(List<Department> depts, int sel) {
+    static string DeptOpts(List<SysDepartment> depts, int sel) {
         string s = "";
         for (int i = 0; i < depts.Count; i = i + 1) {
             int did = depts[i].id;
@@ -185,7 +185,7 @@ class Flows : AdminController {
     }
 
     /* Bug#7：员工候选串，同上；昵称空时回退用户名（与原渲染一致）。 */
-    static string UserOpts(List<User> users, int sel) {
+    static string UserOpts(List<SysUser> users, int sel) {
         string s = "";
         for (int i = 0; i < users.Count; i = i + 1) {
             int uid = users[i].id;
@@ -209,7 +209,7 @@ class Flows : AdminController {
         FlowDef def;
         if (id > 0) {
             def = await this.FlowDef
-                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .Where(a => a.id == id)
                 .FirstAsync();
             if (def == null) { this.Fail(404, "0404", "流程不存在"); return; }
             int _u = await this.FlowDef.Update()
@@ -217,11 +217,11 @@ class Flows : AdminController {
                 .Set(a => a.description, this.In("description"))
                 .Set(a => a.status, this.InInt("status", 0))
                 .Set(a => a.updatedAt, now)
-                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .Where(a => a.id == id)
                 .ExecuteAffrowsAsync();
         } else {
             def = new FlowDef();
-            def.tenantId = this.TenantId();
+            def.tenantId = Tenant.Cur();
             def.name = name;
             def.description = this.In("description");
             def.status = 1;
@@ -263,12 +263,12 @@ class Flows : AdminController {
         int defId = this.InInt("defId", 0);
         string title = this.Need("title", "实例标题");
         FlowDef def = await this.FlowDef
-            .Where(a => a.id == defId && a.tenantId == this.TenantId())
+            .Where(a => a.id == defId)
             .FirstAsync();
         if (def == null) { this.Fail(404, "0404", "流程不存在"); return; }
         if (def.status != 1) { this.Fail(400, "0004", "流程已停用"); return; }
         if (title.Length == 0) { this.Fail(400, "0004", "请填写实例标题"); return; }
-        User me = await this.Admin();
+        SysUser me = await this.Admin();
         int instId = await ZanWeb.Modules.Flow.Engine.Start(
             this.Held(), def, title, this.In("bizRef"), me.id);
         await this.Note("发起流程", title, true, "");
@@ -287,7 +287,7 @@ class Flows : AdminController {
         int n = await this.FlowDef.Update()
             .Set(a => a.status, status)
             .Set(a => a.updatedAt, now)
-            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .Where(a => a.id == id)
             .ExecuteAffrowsAsync();
         this.Saved(n > 0 ? (status == 1 ? "已启用" : "已停用") : "流程不存在");
     }
@@ -302,17 +302,17 @@ class Flows : AdminController {
            跨租户删除先把目标租户的节点清空、再撞 404，造成内容丢失
            （QA #42 probe_flowdel.py 实锤）。与 Save 同模式。 */
         FlowDef def = await this.FlowDef
-            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .Where(a => a.id == id)
             .FirstAsync();
         if (def == null) { this.Fail(404, "0404", "流程不存在"); return; }
         int used = await this.FlowInst
             .Where(a => a.defId == def.id && a.status == 1
-                && a.tenantId == this.TenantId()).CountAsync();
+               ).CountAsync();
         if (used > 0) { this.Fail(400, "0004", "有进行中的实例，先终止再删除"); return; }
         int _n1 = await this.FlowNode.Delete()
             .Where(a => a.defId == def.id).ExecuteAffrowsAsync();
         int _n2 = await this.FlowDef.Delete()
-            .Where(a => a.id == def.id && a.tenantId == this.TenantId())
+            .Where(a => a.id == def.id)
             .ExecuteAffrowsAsync();
         await this.Note("删除流程", "defId=" + Convert.ToString(def.id), true, "");
         this.Saved("已删除");
@@ -328,16 +328,16 @@ class Flows : AdminController {
         ListQuery q = this.Paged("id", 20);
         string kw = q.Kw();
         List<FlowInst> rows = await this.FlowInst
-            .Where(a => a.tenantId == this.TenantId())
+            
             .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.FlowInst
-            .Where(a => a.tenantId == this.TenantId())
+            
             .WhereIf(kw.Length > 0, a => a.title.Contains(kw)).CountAsync();
 
         List<FlowDef> defs = await this.FlowDef
-            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+            .ToListAsync();
         List<StrMap> defopts = d.AddList("defs");
         for (int i = 0; i < defs.Count; i = i + 1) {
             if (defs[i].status != 1) { continue; }
@@ -379,7 +379,7 @@ class Flows : AdminController {
             .Set(a => a.status, 3)
             .Set(a => a.currentNodeId, 0)
             .Set(a => a.updatedAt, now)
-            .Where(a => a.id == id && a.tenantId == this.TenantId()
+            .Where(a => a.id == id
                 && a.status == 1).ExecuteAffrowsAsync();
         this.Saved(_n > 0 ? "已终止" : "实例不在进行中");
     }
