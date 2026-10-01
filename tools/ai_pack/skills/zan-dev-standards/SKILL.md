@@ -125,6 +125,12 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   误绕，证伪撤案）；④ 可空返回链式取成员（`Get().Get()`）检查器
   强制"先落地局部 + 判空"，测试代码给一个永非 null 的哨兵 helper
   （缺失返 `NewNull`）一次消音全部链式断言。
+- **文本格式包的 BOM 防线（2026-10-01 Yaml/Toml/Xml 跨平台审计踩出）**：
+  文件读取 API 已在文件层剥 UTF-8 BOM，但 `Parse(src)` 收网络报文/
+  内嵌资源时没有这层兜底——Windows 工具产出的文本常带 EF BB BF，不剥
+  首键/首标签带隐形字节或报"expected <"。任何文本格式解析器的 Parse
+  入口自己剥一次 BOM（三字节判定 + Substring(3)），一致性测试加
+  BOM+CRLF 向量锁行为；换行侧在切行层吃掉 CRLF/孤立 CR，写出恒 `\n`。
 - **声明驱动的 CRUD 定式（ListPage/Crud，2026-09-25 落地）**：一屏一个
   `ScreenDef()` 静态声明（列 Col/Tag/Flag、行内操作 Ops、筛选、工具栏、
   `Table/EditFields` 写白名单），渲染 `Screen()` 整段产出 screenHtml
