@@ -104,6 +104,18 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   挪进 `[表头]` 区块，同层键序变化是语义不变的（TOML 表无序），拿 JSON
   文本判等会误报失败：递归 `Eqv(a,b)`（对象逐 KeyAt 查 Has+ValAt 递归、
   数组按序递归、标量按类型比）才是正确闸门。
+- **语言事实第七则（2026-10-01 Zan.Protobuf/Zan.MsgPack 首日踩出）**：
+  ① 数值类型只有 `int`/`long`/`double`/`bool`——没有 `float`，也没有
+  `sbyte`/`short` 有符号小整型：32 位浮点字段做不了（当文档化取舍写进
+  README），小整型符号扩展手工算（`v >= 128 → v - 256`），别臆测类型
+  存在；② IEEE-754 位型互转没有 reinterpret，配方是复用
+  `TdsMessage.DoubleBits` 归一化构造（**±∞/NaN 必须先收口**——归一化
+  循环对非有限值永不终止）+ `MySqlWire.ieeeToText` 形状的逐位累加解码
+  （各项 2^(b-52) 恰可表示、和精确）；解码侧造 ±∞/NaN 用
+  `Pow2(1024)` 溢出与 `inf - inf`，**不能拿特殊位型递归自造**（位型
+  仍是特殊值，无限递归）；③ 判 NaN 用 `x != x`，判 ±∞ 用
+  `x > 1e308` / `x < -1e308`——`x == x` 对 ∞ 恒真，照 NaN 惯用法写
+  会误报失败。
 - **声明驱动的 CRUD 定式（ListPage/Crud，2026-09-25 落地）**：一屏一个
   `ScreenDef()` 静态声明（列 Col/Tag/Flag、行内操作 Ops、筛选、工具栏、
   `Table/EditFields` 写白名单），渲染 `Screen()` 整段产出 screenHtml

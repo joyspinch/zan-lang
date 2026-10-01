@@ -1,0 +1,149 @@
+// MessagePack test: official vectors for the integer family
+// (fixint/uint8-32/int8-16 boundaries), fixstr with multibyte UTF-8,
+// float64 bit pattern, containers, float32 decode, timestamp ext
+// (32/64-bit forms → ISO 8601), semantic round-trip with int/float
+// form preservation, uint64 high-bit → double, File Save/Load, and
+// error paths (0xC1, unknown ext, truncation).
+using System;
+using System.IO;
+using System.Json;
+using System.MsgPack;
+
+namespace Conf;
+
+class Prog {
+    static int bad = 0;
+
+    static string Hex(byte[] b) {
+        StringBuilder sb = new StringBuilder();
+        string hex = "0123456789abcdef";
+        int i = 0;
+        while (i < b.Length) {
+            if (i > 0) { sb.Append(" "); }
+            int v = b[i] & 255;
+            sb.Append(hex.Substring(v >> 4, 1));
+            sb.Append(hex.Substring(v & 15, 1));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static void Chk(string label, string got, string want) {
+        if (got != want) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static void ChkS(string label, string got, string want) {
+        if (got != want) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static void Main() {
+        // nil/bool
+        Chk("nil", Hex(MsgPack.Pack(JsonValue.NewNull())), "c0");
+        Chk("true", Hex(MsgPack.Pack(JsonValue.NewBool(true))), "c3");
+        Chk("false", Hex(MsgPack.Pack(JsonValue.NewBool(false))), "c2");
+        // 整数家族规范最短形态
+        Chk("0", Hex(MsgPack.Pack(JsonValue.NewInt(0))), "00");
+        Chk("127", Hex(MsgPack.Pack(JsonValue.NewInt(127))), "7f");
+        Chk("128", Hex(MsgPack.Pack(JsonValue.NewInt(128))), "cc 80");
+        Chk("256", Hex(MsgPack.Pack(JsonValue.NewInt(256))), "cd 01 00");
+        Chk("65536", Hex(MsgPack.Pack(JsonValue.NewInt(65536))), "ce 00 01 00 00");
+        Chk("-1", Hex(MsgPack.Pack(JsonValue.NewInt(-1))), "ff");
+        Chk("-32", Hex(MsgPack.Pack(JsonValue.NewInt(-32))), "e0");
+        Chk("-33", Hex(MsgPack.Pack(JsonValue.NewInt(-33))), "d0 df");
+        Chk("-129", Hex(MsgPack.Pack(JsonValue.NewInt(-129))), "d1 ff 7f");
+        // 字符串与 float64
+        Chk("a", Hex(MsgPack.Pack(JsonValue.NewStr("a"))), "a1 61");
+        Chk("zhong", Hex(MsgPack.Pack(JsonValue.NewStr("中"))), "a3 e4 b8 ad");
+        Chk("1.5", Hex(MsgPack.Pack(JsonValue.NewDouble(1.5))),
+            "cb 3f f8 00 00 00 00 00 00");
+        // 容器
+        JsonValue arr = JsonValue.NewArray();
+        arr.AppendInt(1);
+        arr.AppendInt(2);
+        arr.AppendInt(3);
+        Chk("array", Hex(MsgPack.Pack(arr)), "93 01 02 03");
+        JsonValue obj = JsonValue.NewObject();
+        obj.PutBool("a", true);
+        Chk("map", Hex(MsgPack.Pack(obj)), "81 a1 61 c3");
+
+        // 解码侧
+        JsonValue v1 = MsgPack.Unpack(new byte[] { 255 });
+        ChkS("dec--1", Convert.ToString(v1.AsLong(99)), "-1");
+        JsonValue v2 = MsgPack.Unpack(new byte[] { 204, 128 });
+        ChkS("dec-128", Convert.ToString(v2.AsLong(99)), "128");
+        JsonValue v3 = MsgPack.Unpack(new byte[] { 208, 223 });
+        ChkS("dec--33", Convert.ToString(v3.AsLong(99)), "-33");
+        JsonValue v4 = MsgPack.Unpack(new byte[] { 163, 228, 184, 173 });
+        ChkS("dec-zhong", v4.AsString(""), "中");
+
+        // float32 家族：1.5f = 0x3FC00000
+        JsonValue v5 = MsgPack.Unpack(new byte[] { 202, 63, 192, 0, 0 });
+        double f = v5.AsDouble(0);
+        if (f != 1.5) { bad = bad + 1; Console.WriteLine("FAIL f32-1.5"); }
+
+        // timestamp ext：32 位与 64 位形态 → ISO 8601 UTC。
+        JsonValue v6 = MsgPack.Unpack(new byte[] { 214, 255, 0, 0, 0, 0 });
+        ChkS("ts32", v6.AsString(""), "1970-01-01T00:00:00Z");
+        JsonValue v7 = MsgPack.Unpack(new byte[] {
+            215, 255, 0, 0, 0, 0, 0, 0, 0, 1 });
+        ChkS("ts64", v7.AsString(""), "1970-01-01T00:00:01Z");
+
+        // 语义往返：Parse JSON → Pack → Unpack → ToJson 相等。
+        string json = "{\"n\":-5,\"s\":\"héllo\",\"f\":2.25,"
+            + "\"arr\":[1,true,null,\"x\"],\"o\":{\"k\":42}}";
+        JsonValue jv = JsonValue.Parse(json);
+        JsonValue back = MsgPack.Unpack(MsgPack.Pack(jv));
+        if (back.ToJson() != jv.ToJson()) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL roundtrip");
+        }
+
+        // int/float 形态保持。
+        JsonValue vi = MsgPack.Unpack(MsgPack.Pack(JsonValue.NewInt(7)));
+        if (!vi.IsInt()) { bad = bad + 1; Console.WriteLine("FAIL int-form"); }
+        JsonValue vd = MsgPack.Unpack(MsgPack.Pack(JsonValue.NewDouble(7.0)));
+        if (vd.IsInt()) { bad = bad + 1; Console.WriteLine("FAIL float-form"); }
+
+        // uint64 高位 → double。
+        JsonValue vu = MsgPack.Unpack(new byte[] {
+            207, 128, 0, 0, 0, 0, 0, 0, 0 });
+        double du = vu.AsDouble(0);
+        if (du != 9223372036854775808.0) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL u64-hi");
+        }
+
+        // 文件往返。
+        MsgPack.Save(jv, "_scratch/mp_roundtrip.bin");
+        JsonValue fromFile = MsgPack.Load("_scratch/mp_roundtrip.bin");
+        if (fromFile.ToJson() != jv.ToJson()) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL file-roundtrip");
+        }
+
+        // 错误路径。
+        try {
+            MsgPack.Unpack(new byte[] { 193 });
+            Console.WriteLine("c1 NOT THROWN");
+            bad = bad + 1;
+        } catch (MsgPackException) { }
+        try {
+            MsgPack.Unpack(new byte[] { 212, 6, 1 });
+            Console.WriteLine("ext NOT THROWN");
+            bad = bad + 1;
+        } catch (MsgPackException) { }
+        try {
+            MsgPack.Unpack(new byte[] { 165, 97 });
+            Console.WriteLine("trunc NOT THROWN");
+            bad = bad + 1;
+        } catch (MsgPackException) { }
+
+        Console.WriteLine("msgpack-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

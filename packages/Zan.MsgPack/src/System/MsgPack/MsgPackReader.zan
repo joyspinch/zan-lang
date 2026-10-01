@@ -1,0 +1,367 @@
+using System;
+using System.Json;
+
+namespace System.MsgPack;
+
+/// <summary>
+/// MessagePack 解码原语：在 byte[] 上游走，ReadValue 按首字节分派
+/// 递归还原成 System.Json.JsonValue。bin 家族按 UTF-8 尽力解码成
+/// 字符串（非法序列收敛 U+FFFD）；timestamp extension（type -1）
+/// 还原成 ISO 8601 UTC 字符串；其他 extension 报错。深度限 512。
+/// </summary>
+class MsgPackReader {
+    byte[] buf;
+    int pos;
+    int len;
+
+    /// 包装整段字节。
+    public MsgPackReader(byte[] data) {
+        buf = data;
+        pos = 0;
+        len = data.Length;
+    }
+
+    /// 包装切片 [offset, offset+count)。
+    public MsgPackReader(byte[] data, int offset, int count) {
+        buf = data;
+        pos = offset;
+        len = offset + count;
+    }
+
+    int U8() {
+        if (pos >= len) {
+            throw new MsgPackException("truncated at byte "
+                + Convert.ToString(pos));
+        }
+        int b = buf[pos] & 255;
+        pos = pos + 1;
+        return b;
+    }
+
+    int U16BE() {
+        int hi = U8();
+        return (hi << 8) | U8();
+    }
+
+    long U32BE() {
+        long v = U8();
+        v = (v << 8) | U8();
+        v = (v << 8) | U8();
+        return (v << 8) | U8();
+    }
+
+    long U64BE() {
+        long v = U8();
+        int i = 0;
+        while (i < 7) {
+            v = (v << 8) | U8();
+            i = i + 1;
+        }
+        return v;
+    }
+
+    /// 取 n 字节（越界抛）。n 用减法比较防 int 溢出绕过。
+    byte[] Take(int n) {
+        if (n < 0 || n > len - pos) {
+            throw new MsgPackException("truncated at byte "
+                + Convert.ToString(pos) + " (need " + Convert.ToString(n) + ")");
+        }
+        byte[] out2 = new byte[n];
+        NativeMemory.Copy((nint)out2, (nint)buf + pos, n);
+        pos = pos + n;
+        return out2;
+    }
+
+    /// 有符号 8 位（语言无 sbyte，手动符号扩展）。
+    int S8() {
+        int v = U8();
+        if (v >= 128) { v = v - 256; }
+        return v;
+    }
+
+    /// 有符号 16 位。
+    int S16() {
+        int v = U16BE();
+        if (v >= 32768) { v = v - 65536; }
+        return v;
+    }
+
+    /// <summary>读一个完整值。depth 是递归深度（容器嵌套），上限
+    /// 512——恶意构造的深嵌套会栈溢出，两侧一起限。</summary>
+    JsonValue ReadValue(int depth) {
+        if (depth > 512) {
+            throw new MsgPackException("nesting too deep at byte "
+                + Convert.ToString(pos));
+        }
+        int b = U8();
+        if (b < 128) { return JsonValue.NewInt(b); }          // 正 fixint
+        if (b >= 224) { return JsonValue.NewInt(b - 256); }   // 负 fixint
+        if (b >= 128 && b <= 143) {                           // fixmap
+            int n = b & 15;
+            JsonValue obj = JsonValue.NewObject();
+            int i = 0;
+            while (i < n) {
+                JsonValue k = ReadValue(depth + 1);
+                if (!k.IsString()) {
+                    throw new MsgPackException("map key is not a string at byte "
+                        + Convert.ToString(pos));
+                }
+                obj.Put(k.AsString(""), ReadValue(depth + 1));
+                i = i + 1;
+            }
+            return obj;
+        }
+        if (b >= 144 && b <= 159) {                           // fixarray
+            int n = b & 15;
+            JsonValue arr = JsonValue.NewArray();
+            int i = 0;
+            while (i < n) {
+                arr.Append(ReadValue(depth + 1));
+                i = i + 1;
+            }
+            return arr;
+        }
+        if (b >= 160 && b <= 191) {                           // fixstr
+            return JsonValue.NewStr(DecodedText(Take(b & 31)));
+        }
+        if (b == 192) { return JsonValue.NewNull(); }         // nil
+        if (b == 193) {
+            throw new MsgPackException("reserved code 0xC1 at byte "
+                + Convert.ToString(pos - 1));
+        }
+        if (b == 194) { return JsonValue.NewBool(false); }
+        if (b == 195) { return JsonValue.NewBool(true); }
+        if (b >= 196 && b <= 198) {                           // bin8/16/32
+            int n = b == 196 ? U8() : (b == 197 ? U16BE() : (int)U32BE());
+            // bin 无文本语义：UTF-8 尽力解码（非法序列 U+FFFD）。
+            return JsonValue.NewStr(DecodedText(Take(n)));
+        }
+        if (b >= 199 && b <= 201) {                           // ext8/16/32
+            int n = b == 199 ? U8() : (b == 200 ? U16BE() : (int)U32BE());
+            int type = S8();
+            return ExtValue(type, Take(n));
+        }
+        if (b == 202) { return JsonValue.NewDouble(BitsSingle((int)U32BE())); }
+        if (b == 203) { return JsonValue.NewDouble(BitsDouble(U64BE())); }
+        if (b == 204) { return JsonValue.NewInt(U8()); }            // uint8
+        if (b == 205) { return JsonValue.NewInt(U16BE()); }         // uint16
+        if (b == 206) { return JsonValue.NewInt(U32BE()); }         // uint32
+        if (b == 207) {                                             // uint64
+            long v = U64BE();
+            if (v >= 0) { return JsonValue.NewInt(v); }
+            // 高位溢出 int64：转 double（53 位有效位之外的精度丢失）。
+            long hi = (v >> 1) & 9223372036854775807;
+            return JsonValue.NewDouble((double)hi * 2.0 + (double)(v & 1));
+        }
+        if (b == 208) { return JsonValue.NewInt(S8()); }            // int8
+        if (b == 209) { return JsonValue.NewInt(S16()); }           // int16
+        if (b == 210) { return JsonValue.NewInt((int)U32BE()); }    // int32
+        if (b == 211) { return JsonValue.NewInt(U64BE()); }         // int64
+        if (b >= 212 && b <= 216) {                           // fixext 1/2/4/8/16
+            int n = 1 << (b - 212);
+            int type = S8();
+            return ExtValue(type, Take(n));
+        }
+        if (b == 217) { return JsonValue.NewStr(DecodedText(Take(U8()))); }
+        if (b == 218) { return JsonValue.NewStr(DecodedText(Take(U16BE()))); }
+        if (b == 219) { return JsonValue.NewStr(DecodedText(Take((int)U32BE()))); }
+        if (b == 220) { return ArrayOf(U16BE(), depth); }
+        if (b == 221) { return ArrayOf((int)U32BE(), depth); }
+        if (b == 222) { return MapOf(U16BE(), depth); }
+        if (b == 223) { return MapOf((int)U32BE(), depth); }
+        throw new MsgPackException("unknown code 0x"
+            + Convert.ToString((b >> 4) < 10 ? 48 + (b >> 4) : 87 + (b >> 4))
+            + Convert.ToString((b & 15) < 10 ? 48 + (b & 15) : 87 + (b & 15))
+            + " at byte " + Convert.ToString(pos - 1));
+    }
+
+    JsonValue ArrayOf(int n, int depth) {
+        JsonValue arr = JsonValue.NewArray();
+        int i = 0;
+        while (i < n) {
+            arr.Append(ReadValue(depth + 1));
+            i = i + 1;
+        }
+        return arr;
+    }
+
+    JsonValue MapOf(int n, int depth) {
+        JsonValue obj = JsonValue.NewObject();
+        int i = 0;
+        while (i < n) {
+            JsonValue k = ReadValue(depth + 1);
+            if (!k.IsString()) {
+                throw new MsgPackException("map key is not a string at byte "
+                    + Convert.ToString(pos));
+            }
+            obj.Put(k.AsString(""), ReadValue(depth + 1));
+            i = i + 1;
+        }
+        return obj;
+    }
+
+    /// extension 主体：只认 timestamp（type -1），其余报错。
+    JsonValue ExtValue(int type, byte[] body) {
+        if (type != -1) {
+            throw new MsgPackException("unsupported ext type "
+                + Convert.ToString(type) + " at byte "
+                + Convert.ToString(pos));
+        }
+        if (body.Length == 4) {
+            long sec = U32Of(body, 0);
+            return JsonValue.NewStr(IsoFromUnix(sec));
+        }
+        if (body.Length == 8) {
+            long v = U64Of(body, 0);
+            long nanos = (v >> 34) & 1073741823;              // 高 30 位
+            long sec = v & 34359738367;                       // 低 34 位
+            return JsonValue.NewStr(IsoFromUnixNanos(sec, nanos));
+        }
+        if (body.Length == 12) {
+            long nanos = U32Of(body, 0);
+            long sec = U64Of(body, 4);
+            return JsonValue.NewStr(IsoFromUnixNanos(sec, nanos));
+        }
+        throw new MsgPackException("timestamp ext must be 4/8/12 bytes, got "
+            + Convert.ToString(body.Length));
+    }
+
+    long U32Of(byte[] b, int at) {
+        return ((long)(b[at] & 255) << 24) | ((long)(b[at + 1] & 255) << 16)
+            | ((long)(b[at + 2] & 255) << 8) | (long)(b[at + 3] & 255);
+    }
+
+    long U64Of(byte[] b, int at) {
+        long v = 0;
+        int i = 0;
+        while (i < 8) {
+            v = (v << 8) | (long)(b[at + i] & 255);
+            i = i + 1;
+        }
+        return v;
+    }
+
+    /// <summary>Unix 秒 → ISO 8601 UTC（"YYYY-MM-DDTHH:MM:SSZ"）。</summary>
+    static string IsoFromUnix(long sec) {
+        return IsoFromUnixNanos(sec, 0);
+    }
+
+    /// 带纳秒：非整毫秒截断到毫秒三位（ISO 字符串到毫秒为止）。
+    static string IsoFromUnixNanos(long sec, long nanos) {
+        DateTime t = DateTime.FromUnixSeconds(sec);
+        StringBuilder sb = new StringBuilder();
+        sb.Append(Pad4(t.Year()));
+        sb.Append("-");
+        sb.Append(Pad2(t.Month()));
+        sb.Append("-");
+        sb.Append(Pad2(t.Day()));
+        sb.Append("T");
+        sb.Append(Pad2(t.Hour()));
+        sb.Append(":");
+        sb.Append(Pad2(t.Minute()));
+        sb.Append(":");
+        sb.Append(Pad2(t.Second()));
+        long ms = nanos / 1000000;
+        if (ms > 0) {
+            sb.Append(".");
+            if (ms < 100) { sb.Append("0"); }
+            if (ms < 10) { sb.Append("0"); }
+            sb.Append(Convert.ToString(ms));
+        }
+        sb.Append("Z");
+        return sb.ToString();
+    }
+
+    static string Pad2(int v) {
+        if (v < 10) { return "0" + Convert.ToString(v); }
+        return Convert.ToString(v);
+    }
+
+    static string Pad4(int v) {
+        string s = Convert.ToString(v);
+        while (s.Length < 4) { s = "0" + s; }
+        return s;
+    }
+
+    /// <summary>由 IEEE-754 位型还原 double：二进制定点逐位累加尾数
+    /// （每项 2^(b-52) 恰可表示、和精确），再乘 2 的幂（精确）。
+    /// 与 MySqlWire.ieeeToText 同形。次正规、±∞、NaN、-0.0 全还原。</summary>
+    static double BitsDouble(long bits) {
+        int sign = (int)((bits >> 63) & 1);
+        int exp = (int)((bits >> 52) & 2047);
+        long mant = bits & 4503599627370495;             // 2^52-1
+        if (exp == 2047) {
+            double inf = Pow2(1024);                     // 2^1024 溢出成 ∞
+            if (mant == 0) { return sign == 1 ? 0.0 - inf : inf; }
+            return inf - inf;                            // NaN
+        }
+        double m = 0.0;
+        if (exp == 0) {
+            if (mant == 0) { return sign == 1 ? -1.0 * 0.0 : 0.0; }
+            int b = 51;
+            while (b >= 0) {
+                if (((mant >> b) & 1) == 1) { m = m + Pow2(b - 52); }
+                b = b - 1;
+            }
+            double v = m * Pow2(-1022);
+            return sign == 1 ? 0.0 - v : v;
+        }
+        m = 1.0;
+        int b2 = 51;
+        while (b2 >= 0) {
+            if (((mant >> b2) & 1) == 1) { m = m + Pow2(b2 - 52); }
+            b2 = b2 - 1;
+        }
+        double r = m * Pow2(exp - 1023);
+        return sign == 1 ? 0.0 - r : r;
+    }
+
+    /// 由 32 位 IEEE-754 位型还原 double（float32 家族）。
+    static double BitsSingle(int bits) {
+        int sign = (bits >> 31) & 1;
+        int exp = (bits >> 23) & 255;
+        int mant = bits & 8388607;                       // 2^23-1
+        if (exp == 255) {
+            double inf = Pow2(128);
+            if (mant == 0) { return sign == 1 ? 0.0 - inf : inf; }
+            return inf - inf;
+        }
+        double m = 0.0;
+        if (exp == 0) {
+            if (mant == 0) { return sign == 1 ? -1.0 * 0.0 : 0.0; }
+            int b = 22;
+            while (b >= 0) {
+                if (((mant >> b) & 1) == 1) { m = m + Pow2(b - 23); }
+                b = b - 1;
+            }
+            double v = m * Pow2(-126);
+            return sign == 1 ? 0.0 - v : v;
+        }
+        m = 1.0;
+        int b2 = 22;
+        while (b2 >= 0) {
+            if (((mant >> b2) & 1) == 1) { m = m + Pow2(b2 - 23); }
+            b2 = b2 - 1;
+        }
+        double r = m * Pow2(exp - 127);
+        return sign == 1 ? 0.0 - r : r;
+    }
+
+    static double Pow2(int e) {
+        double v = 1.0;
+        if (e >= 0) {
+            int i = 0;
+            while (i < e) { v = v * 2.0; i = i + 1; }
+        } else {
+            int i = 0;
+            while (i > e) { v = v / 2.0; i = i - 1; }
+        }
+        return v;
+    }
+
+    /// 字节 → 字符串（UTF-8 尽力，非法序列 U+FFFD；长度显式，
+    /// 内嵌 NUL 保留）。
+    static string DecodedText(byte[] b) {
+        return Encoding.GetString(b, 0, b.Length);
+    }
+}

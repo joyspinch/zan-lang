@@ -1,0 +1,181 @@
+using System;
+using System.Text;
+
+namespace System.MsgPack;
+
+/// <summary>
+/// MessagePack 编码原语：往可增长的 byte[] 里写 nil/bool/整数
+/// （fixint 到 int64 的规范最短形态）/float64/str/bin/数组头/映射头。
+/// 字节缓冲倍增扩容整块 NativeMemory.Copy 搬移（与 ByteBuffer 同形）。
+/// 数值都用大端（MessagePack 规范）。
+/// </summary>
+class MsgPackWriter {
+    byte[] buf;
+    int len;
+
+    public MsgPackWriter() {
+        buf = new byte[64];
+        len = 0;
+    }
+
+    /// 已编码字节数。
+    int Length() { return len; }
+
+    void EnsureRoom(int extra) {
+        if (len + extra <= buf.Length) { return; }
+        int c = buf.Length * 2;
+        if (c < 16) { c = 16; }
+        while (c < len + extra) { c = c * 2; }
+        byte[] grown = new byte[c];
+        NativeMemory.Copy((nint)grown, (nint)buf, len);
+        buf = grown;
+    }
+
+    /// 追加 1 字节。
+    void RawU8(int b) {
+        EnsureRoom(1);
+        buf[len] = (byte)b;
+        len = len + 1;
+    }
+
+    void RawU16BE(int v) {
+        EnsureRoom(2);
+        buf[len] = (byte)(v >> 8);
+        buf[len + 1] = (byte)v;
+        len = len + 2;
+    }
+
+    void RawU32BE(long v) {
+        EnsureRoom(4);
+        buf[len] = (byte)(v >> 24);
+        buf[len + 1] = (byte)(v >> 16);
+        buf[len + 2] = (byte)(v >> 8);
+        buf[len + 3] = (byte)v;
+        len = len + 4;
+    }
+
+    void RawU64BE(long v) {
+        EnsureRoom(8);
+        buf[len] = (byte)(v >> 56);
+        buf[len + 1] = (byte)(v >> 48);
+        buf[len + 2] = (byte)(v >> 40);
+        buf[len + 3] = (byte)(v >> 32);
+        buf[len + 4] = (byte)(v >> 24);
+        buf[len + 5] = (byte)(v >> 16);
+        buf[len + 6] = (byte)(v >> 8);
+        buf[len + 7] = (byte)v;
+        len = len + 8;
+    }
+
+    /// nil（0xC0）。
+    void WriteNil() { RawU8(192); }
+
+    /// bool（0xC2/0xC3）。
+    void WriteBool(bool b) { RawU8(b ? 195 : 194); }
+
+    /// <summary>整数的规范最短形态：0..127 正 fixint、-32..-1 负
+    /// fixint（都单字节），向上依次 uint8/16/32/64（正）与
+    /// int8/16/32/64（负）。</summary>
+    void WriteInt(long v) {
+        if (v >= 0) {
+            if (v < 128) { RawU8((int)v); }
+            else if (v < 256) { RawU8(204); RawU8((int)v); }
+            else if (v < 65536) { RawU8(205); RawU16BE((int)v); }
+            else if (v < 4294967296) { RawU8(206); RawU32BE(v); }
+            else { RawU8(207); RawU64BE(v); }
+        } else {
+            if (v >= -32) { RawU8((int)(v + 256)); }
+            else if (v >= -128) { RawU8(208); RawU8((int)(v + 256)); }
+            else if (v >= -32768) { RawU8(209); RawU16BE((int)(v + 65536)); }
+            else if (v >= -2147483648) { RawU8(210); RawU32BE(v + 4294967296); }
+            else { RawU8(211); RawU64BE(v); }
+        }
+    }
+
+    /// float64（0xCB + 8 字节大端 IEEE-754）。
+    void WriteDouble(double d) {
+        RawU8(203);
+        RawU64BE(DoubleBits(d));
+    }
+
+    /// string：UTF-8 编码后按 str 家族（fixstr/str8/16/32）写。
+    void WriteString(string s) {
+        byte[] b = Encoding.GetBytes(s);
+        WriteStrBytes(b);
+    }
+
+    /// str 家族主体（已编码 UTF-8 字节）。
+    void WriteStrBytes(byte[] b) {
+        int n = b.Length;
+        if (n <= 31) { RawU8(160 | n); }
+        else if (n <= 255) { RawU8(217); RawU8(n); }
+        else if (n <= 65535) { RawU8(218); RawU16BE(n); }
+        else { RawU8(219); RawU32BE(n); }
+        EnsureRoom(n);
+        NativeMemory.Copy((nint)buf + len, (nint)b, n);
+        len = len + n;
+    }
+
+    /// bin 家族（bin8/16/32），任意二进制字节。
+    void WriteBin(byte[] b) {
+        int n = b.Length;
+        if (n <= 255) { RawU8(196); RawU8(n); }
+        else if (n <= 65535) { RawU8(197); RawU16BE(n); }
+        else { RawU8(198); RawU32BE(n); }
+        EnsureRoom(n);
+        NativeMemory.Copy((nint)buf + len, (nint)b, n);
+        len = len + n;
+    }
+
+    /// 数组头：n ≤ 15 用 fixarray，否则 array16/32。
+    void WriteArrayHeader(int n) {
+        if (n <= 15) { RawU8(144 | n); }
+        else if (n <= 65535) { RawU8(220); RawU16BE(n); }
+        else { RawU8(221); RawU32BE(n); }
+    }
+
+    /// 映射头：n ≤ 15 用 fixmap，否则 map16/32。
+    void WriteMapHeader(int n) {
+        if (n <= 15) { RawU8(128 | n); }
+        else if (n <= 65535) { RawU8(222); RawU16BE(n); }
+        else { RawU8(223); RawU32BE(n); }
+    }
+
+    /// 取出已编码字节（复制一份）。
+    byte[] ToBytes() {
+        byte[] out2 = new byte[len];
+        NativeMemory.Copy((nint)out2, (nint)buf, len);
+        return out2;
+    }
+
+    /// <summary>double 的 IEEE-754 位模式：归一化构造（语言没有
+    /// reinterpret 转换）。与 Zan.Data 的 TdsMessage.DoubleBits 同一
+    /// 算法；±∞ 与 NaN 单独收口——归一化循环对非有限值不终止。</summary>
+    static long DoubleBits(double v) {
+        if (v != v) { return 9221120237041090560; }      // 0x7FF8000000000000
+        if (v == 0.0) { return 0; }
+        int sign = 0;
+        if (v < 0.0) {
+            sign = 1;
+            v = 0.0 - v;
+        }
+        if (v > 1.7976931348623157e308) {                // ±Infinity
+            return ((long)sign << 63) | 9218868437227405312;
+        }
+        int exp = 0;
+        while (v >= 2.0) { v = v / 2.0; exp = exp + 1; }
+        while (v < 1.0) { v = v * 2.0; exp = exp - 1; }
+        double frac = v - 1.0;
+        long mant = 0;
+        for (int i = 0; i < 52; i = i + 1) {
+            frac = frac * 2.0;
+            int bit = 0;
+            if (frac >= 1.0) {
+                bit = 1;
+                frac = frac - 1.0;
+            }
+            mant = (mant << 1) | bit;
+        }
+        return ((long)sign << 63) | ((long)(exp + 1023) << 52) | mant;
+    }
+}
