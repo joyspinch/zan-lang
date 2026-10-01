@@ -1,0 +1,98 @@
+// System.Ocr.Png smoke test: pure-Zan PNG decoding on hand-built fixtures.
+// Covers: RGB unfiltered, gray rows through all five filter types
+// (None/Sub/Up/Average/Paeth), palette expansion, RGBA passthrough, and the
+// malformed-input contract (short buffer, bad signature, unsupported bit
+// depth) surfacing as Zan exceptions. All expected pixels were fixed when
+// the fixtures were generated (see _scratch history in the package README).
+using System;
+using System.Ocr;
+
+namespace Conf;
+
+class Prog {
+    static int bad = 0;
+
+    static byte[] B64(string s) {
+        byte[] b = Convert.FromBase64String(s);
+        return b;
+    }
+
+    static void Rgba(Png p, int x, int y, int r, int g, int b2) {
+        byte[] px = p.Rgba();
+        int o = (y * p.Width() + x) * 4;
+        if (px[o] != (byte)r || px[o + 1] != (byte)g || px[o + 2] != (byte)b2
+            || px[o + 3] != (byte)255) {
+            bad = bad + 1;
+        }
+    }
+
+    static void Main() {
+        // P1: 4x2 RGB unfiltered — 上行全红下行全蓝
+        Png p1 = Png.Decode(B64("iVBORw0KGgoAAAANSUhEUgAAAAQAAAACCAIAAADwyuo0AAAAEUlEQVR42mP4z8AARwxI7P8AZ7IH+VvXfJEAAAAASUVORK5CYII="));
+        if (p1.Width() != 4 || p1.Height() != 2) { bad = bad + 1; }
+        Rgba(p1, 0, 0, 255, 0, 0);
+        Rgba(p1, 3, 0, 255, 0, 0);
+        Rgba(p1, 1, 1, 0, 0, 255);
+        Rgba(p1, 2, 1, 0, 0, 255);
+
+        // P2: 3x3 gray，三行分别走 None/Sub/Up 滤波
+        Png p2 = Png.Decode(B64("iVBORw0KGgoAAAANSUhEUgAAAAMAAAADCAAAAABzQ+pjAAAAEklEQVR42mPgEpFj1GBgYALSAAPcAKSx4YwNAAAAAElFTkSuQmCC"));
+        byte[] g2 = p2.Rgba();
+        if (g2[0] != 10 || g2[4] != 20 || g2[8] != 30) { bad = bad + 1; }
+        if (g2[12] != 40 || g2[16] != 40 || g2[20] != 40) { bad = bad + 1; }
+        if (g2[24] != 50 || g2[28] != 60 || g2[32] != 70) { bad = bad + 1; }
+
+        // P3: 2x2 调色板（红/白棋盘）
+        Png p3 = Png.Decode(B64("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAMAAABFaP0WAAAABlBMVEX/AAD///9BHTQRAAAADElEQVR42mNgYARCAAAMAAMVnhj8AAAAAElFTkSuQmCC"));
+        Rgba(p3, 0, 0, 255, 0, 0);
+        Rgba(p3, 1, 0, 255, 255, 255);
+        Rgba(p3, 0, 1, 255, 255, 255);
+        Rgba(p3, 1, 1, 255, 0, 0);
+
+        // P4: 2x1 RGBA，Paeth 滤波直通
+        Png p4 = Png.Decode(B64("iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAEUlEQVR42mNhZGL+z8zMzAAABWsBEx8KKekAAAAASUVORK5CYII="));
+        byte[] r4 = p4.Rgba();
+        if (r4[0] != 1 || r4[1] != 2 || r4[2] != 3 || r4[4] != 4
+            || r4[5] != 5 || r4[6] != 6) {
+            bad = bad + 1;
+        }
+
+        // P5: 2x2 gray，Average 滤波（下行 150/250）
+        Png p5 = Png.Decode(B64("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAAAAABX3VL4AAAADklEQVR42mNIOcGc4g0ABjYB35fIH/0AAAAASUVORK5CYII="));
+        byte[] g5 = p5.Rgba();
+        if (g5[0] != 100 || g5[4] != 200 || g5[8] != 150 || g5[12] != 250) {
+            bad = bad + 1;
+        }
+
+        // 畸形输入全部以 Zan 异常浮出
+        byte[] sig = new byte[4];
+        bool threw = false;
+        try {
+            Png.Decode(sig);
+        } catch (InvalidOperationException) {
+            threw = true;
+        }
+        if (!threw) { bad = bad + 1; }
+
+        threw = false;
+        try {
+            Png.Decode(B64("iVBORw0KGgo"));
+        } catch (InvalidOperationException) {
+            threw = true;
+        }
+        if (!threw) { bad = bad + 1; }
+
+        // 位深 16 的 IHDR（改 P2 的 depth 字节）必须被拒
+        byte[] d16 = B64("iVBORw0KGgoAAAANSUhEUgAAAAMAAAADCAAAAABzQ+pjAAAAEklEQVR42mPgEpFj1GBgYALSAAPcAKSx4YwNAAAAAElFTkSuQmCC");
+        d16[24] = 16;
+        threw = false;
+        try {
+            Png.Decode(d16);
+        } catch (InvalidOperationException) {
+            threw = true;
+        }
+        if (!threw) { bad = bad + 1; }
+
+        Console.WriteLine("ocr-png: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

@@ -1,0 +1,118 @@
+using System;
+
+namespace System.Ocr;
+
+/// <summary>一段识别结果：文本 + 平均置信度。</summary>
+class OcrText {
+    /// 解码出的文本（空白解码输出 ""）。
+    string text;
+    /// 被采纳帧的平均概率（无采纳帧时 0）。
+    float score;
+
+    static OcrText Wrap(string t, float s) {
+        OcrText r = new OcrText();
+        r.text = t;
+        r.score = s;
+        return r;
+    }
+
+    /// 解码文本。
+    string Text() { return this.text; }
+
+    /// 平均置信度。
+    float Score() { return this.score; }
+}
+
+/// <summary>
+/// CTC 贪心解码器 + PP-OCR 字典装载。识别输出是 [T, C] 的逐帧概率
+/// （C = 字典大小 + 1 个 blank；RapidOCR 惯例 blank=0、空格收尾），
+/// 贪心解码即逐帧取 argmax、折叠相邻重复、丢 blank。
+/// </summary>
+class Ctc {
+    /// 类索引 → 字符；labels[0] 为 blank（空串）。
+    string[] labels;
+
+    static Ctc Wrap(string[] ls) {
+        Ctc c = new Ctc();
+        c.labels = ls;
+        return c;
+    }
+
+    /// <summary>从字典文本装载：每行一个字符；生成 blank=0 的类表，
+    /// useSpace 时在表尾追加空格类（RapidOCR use_space_char 惯例）。</summary>
+    static Ctc FromDictText(string dictText, bool useSpace) {
+        List<string> lines = dictText == null ? new List<string>() : dictText.Split("\n");
+        int n = 0;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (lines[i].Length > 0) { n = n + 1; }
+        }
+        string[] ls = new string[n + (useSpace ? 2 : 1)];
+        ls[0] = "";
+        int k = 1;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (lines[i].Length == 0) { continue; }
+            string ch = lines[i];
+            if (ch.EndsWith("\r")) {
+                ch = ch.Substring(0, ch.Length - 1);
+            }
+            ls[k] = ch;
+            k = k + 1;
+        }
+        if (useSpace) {
+            ls[k] = " ";
+        }
+        return Ctc.Wrap(ls);
+    }
+
+    /// 单字符调试字典：把每个字符当一行（测试用）。
+    static Ctc FromChars(string chars, bool useSpace) {
+        string[] ls = new string[chars.Length + (useSpace ? 2 : 1)];
+        ls[0] = "";
+        for (int i = 0; i < chars.Length; i = i + 1) {
+            ls[i + 1] = chars.Substring(i, 1);
+        }
+        if (useSpace) {
+            ls[chars.Length + 1] = " ";
+        }
+        return Ctc.Wrap(ls);
+    }
+
+    /// 类数（含 blank）。
+    int ClassCount() { return this.labels.Length; }
+
+    /// <summary>贪心解码。probs 为 T*C 行主序帧概率，返回文本与
+    /// 平均置信度；全 blank 帧返回空文本、分数 0。</summary>
+    OcrText Greedy(float[] probs, int timeSteps, int classes) {
+        if (probs == null || probs.Length < timeSteps * classes) {
+            throw new InvalidOperationException("CTC 概率缓冲不足");
+        }
+        StringBuilder sb = new StringBuilder();
+        double sum = 0;
+        int picked = 0;
+        int prev = -1;
+        for (int t = 0; t < timeSteps; t = t + 1) {
+            int baseIdx = t * classes;
+            int best = 0;
+            float bv = probs[baseIdx];
+            for (int c = 1; c < classes; c = c + 1) {
+                if (probs[baseIdx + c] > bv) {
+                    bv = probs[baseIdx + c];
+                    best = c;
+                }
+            }
+            if (best != 0 && best != prev) {
+                if (best >= this.labels.Length) {
+                    throw new InvalidOperationException("CTC 类索引越界: "
+                        + Convert.ToString(best) + " ≥ "
+                        + Convert.ToString(this.labels.Length));
+                }
+                sb.Append(this.labels[best]);
+                sum = sum + bv;
+                picked = picked + 1;
+            }
+            prev = best;
+        }
+        float score = picked > 0 ? (float)(sum / picked) : 0.0f;
+        return OcrText.Wrap(sb.ToString(), score);
+    }
+}

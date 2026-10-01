@@ -1,0 +1,149 @@
+using System;
+
+namespace System.Ocr;
+
+/// <summary>一个检测出的文本框（原图像素坐标，轴对齐）。</summary>
+class DetBox {
+    /// 左上角（含）。
+    int minX;
+    /// 左上角（含）。
+    int minY;
+    /// 右下角（含）。
+    int maxX;
+    /// 右下角（含）。
+    int maxY;
+    /// 框内平均概率。
+    float score;
+
+    static DetBox Make(int x0, int y0, int x1, int y1, float s) {
+        DetBox b = new DetBox();
+        b.minX = x0;
+        b.minY = y0;
+        b.maxX = x1;
+        b.maxY = y1;
+        b.score = s;
+        return b;
+    }
+
+    /// 左边界。
+    int MinX() { return this.minX; }
+
+    /// 上边界。
+    int MinY() { return this.minY; }
+
+    /// 右边界。
+    int MaxX() { return this.maxX; }
+
+    /// 下边界。
+    int MaxY() { return this.maxY; }
+
+    /// 框内平均概率。
+    float Score() { return this.score; }
+}
+
+/// <summary>
+/// DBNet（PP-OCR 检测头）的后处理：概率图 → 二值化 → 连通域 →
+/// 矩形 unclip → 还原到原图坐标。
+///
+/// unclip 采用 DBNet 的 ClipperOffset 公式 d = area·ratio / perimeter，
+/// 对轴对齐矩形这是<b>精确</b>的（Clipper 的多边形普适性只在斜框
+/// min-area-rect 时才需要；文档/截图 OCR 的文字行是水平的）。
+/// </summary>
+class Det {
+    /// <summary>
+    /// 从概率图取文本框。probMap 为 mapH*mapW 行主序概率；
+    /// probThresh 二值化阈值；boxThresh 框内平均概率门槛；
+    /// unclipRatio 扩张系数（RapidOCR 默认 1.5）；
+    /// scaleX/scaleY 为概率图相对原图的缩放（>1 表示图被缩小）。
+    /// </summary>
+    static List<DetBox> Boxes(float[] probMap, int mapW, int mapH,
+                              float probThresh, float boxThresh,
+                              float unclipRatio, float scaleX, float scaleY) {
+        List<DetBox> result = new List<DetBox>();
+        byte[] mark = new byte[mapW * mapH];
+        List<int> queue = new List<int>();
+        for (int y0 = 0; y0 < mapH; y0 = y0 + 1) {
+            for (int x0 = 0; x0 < mapW; x0 = x0 + 1) {
+                int start = y0 * mapW + x0;
+                if (mark[start] != 0 || probMap[start] <= probThresh) {
+                    continue;
+                }
+                // BFS 收集一个连通域
+                int minX = x0;
+                int maxX = x0;
+                int minY = y0;
+                int maxY = y0;
+                double sum = 0;
+                int count = 0;
+                queue.Clear();
+                queue.Add(start);
+                mark[start] = 1;
+                int head = 0;
+                while (head < queue.Count) {
+                    int p = queue[head];
+                    head = head + 1;
+                    int px = p % mapW;
+                    int py = p / mapW;
+                    sum = sum + probMap[p];
+                    count = count + 1;
+                    if (px < minX) { minX = px; }
+                    if (px > maxX) { maxX = px; }
+                    if (py < minY) { minY = py; }
+                    if (py > maxY) { maxY = py; }
+                    if (px > 0 && mark[p - 1] == 0 && probMap[p - 1] > probThresh) {
+                        mark[p - 1] = 1;
+                        queue.Add(p - 1);
+                    }
+                    if (px < mapW - 1 && mark[p + 1] == 0
+                        && probMap[p + 1] > probThresh) {
+                        mark[p + 1] = 1;
+                        queue.Add(p + 1);
+                    }
+                    if (py > 0 && mark[p - mapW] == 0
+                        && probMap[p - mapW] > probThresh) {
+                        mark[p - mapW] = 1;
+                        queue.Add(p - mapW);
+                    }
+                    if (py < mapH - 1 && mark[p + mapW] == 0
+                        && probMap[p + mapW] > probThresh) {
+                        mark[p + mapW] = 1;
+                        queue.Add(p + mapW);
+                    }
+                }
+                float score = (float)(sum / count);
+                if (score < boxThresh) { continue; }
+                DetBox box = Det.Unclip(minX, minY, maxX, maxY, unclipRatio,
+                                        mapW, mapH, scaleX, scaleY, score);
+                if (box != null) { result.Add(box); }
+            }
+        }
+        return result;
+    }
+
+    /// 对一个连通域的包围盒做 DB unclip 并还原到原图坐标；
+    /// 太碎的框返回 null。
+    static DetBox Unclip(int minX, int minY, int maxX, int maxY,
+                         float unclipRatio, int mapW, int mapH,
+                         float scaleX, float scaleY, float score) {
+        int w = maxX - minX + 1;
+        int h = maxY - minY + 1;
+        double area = (double)w * (double)h;
+        double perimeter = 2.0 * (w + h);
+        int d = (int)(area * unclipRatio / perimeter);
+        int x0 = minX - d;
+        int y0 = minY - d;
+        int x1 = maxX + d;
+        int y1 = maxY + d;
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > mapW - 1) { x1 = mapW - 1; }
+        if (y1 > mapH - 1) { y1 = mapH - 1; }
+        // 还原到原图像素坐标：地图像素 x 覆盖原图 [x*s, (x+1)*s-1]
+        int ox0 = (int)(x0 * scaleX);
+        int oy0 = (int)(y0 * scaleY);
+        int ox1 = (int)((x1 + 1) * scaleX) - 1;
+        int oy1 = (int)((y1 + 1) * scaleY) - 1;
+        if (ox1 - ox0 < 2 || oy1 - oy0 < 2) { return null; }
+        return DetBox.Make(ox0, oy0, ox1, oy1, score);
+    }
+}

@@ -1,0 +1,214 @@
+using System;
+using System.ML;
+
+namespace System.Ocr;
+
+/// <summary>一行识别结果：文本、置信度、原图像素坐标框。</summary>
+class OcrLine {
+    /// 识别文本。
+    string text;
+    /// 平均置信度。
+    float score;
+    /// 框（原图像素，轴对齐，含端点）。
+    int minX;
+    int minY;
+    int maxX;
+    int maxY;
+
+    static OcrLine Make(string t, float s, int x0, int y0, int x1, int y1) {
+        OcrLine l = new OcrLine();
+        l.text = t;
+        l.score = s;
+        l.minX = x0;
+        l.minY = y0;
+        l.maxX = x1;
+        l.maxY = y1;
+        return l;
+    }
+
+    /// 识别文本。
+    string Text() { return this.text; }
+
+    /// 平均置信度。
+    float Score() { return this.score; }
+
+    /// 左边界。
+    int MinX() { return this.minX; }
+
+    /// 上边界。
+    int MinY() { return this.minY; }
+
+    /// 右边界。
+    int MaxX() { return this.maxX; }
+
+    /// 下边界。
+    int MaxY() { return this.maxY; }
+}
+
+/// <summary>
+/// PP-OCR 流水线：检测（DB 后处理）→ 阅读序排序 → 逐框识别
+/// （CRNN + CTC）。模型经 <see cref="Ort"/> 装载（运行期 dlopen，
+/// 见 Zan.ML）。
+///
+///   Ocr ocr = Ocr.Load("det.onnx", "rec.onnx", dictText);
+///   List<OcrLine> lines = ocr.Run(png.Rgba(), png.Width(), png.Height());
+///   foreach (OcrLine l in lines) print(l.Text());
+///
+/// 轴对齐假设：检测框取连通域包围盒（矩形 unclip 精确），适合文档/
+/// 截图等水平文本；斜排文本行会连排，后续引入 min-area-rect + 透视
+/// 裁剪再扩展（见包 README 的路线图）。
+/// </summary>
+class Ocr {
+    /// 检测会话。
+    OrtSession det;
+    /// 识别会话。
+    OrtSession rec;
+    /// CTC 解码器（含字典）。
+    Ctc ctc;
+    /// 检测输入长边上限。
+    int detLimit;
+    /// DB 二值化阈值。
+    float probThresh;
+    /// 框内平均概率门槛。
+    float boxThresh;
+    /// unclip 扩张系数。
+    float unclipRatio;
+    /// 识别输入高。
+    int recHeight;
+
+    static Ocr Wrap(OrtSession d, OrtSession r, Ctc c) {
+        Ocr o = new Ocr();
+        o.det = d;
+        o.rec = r;
+        o.ctc = c;
+        o.detLimit = 960;
+        o.probThresh = 0.3f;
+        o.boxThresh = 0.5f;
+        o.unclipRatio = 1.5f;
+        o.recHeight = 48;
+        return o;
+    }
+
+    /// <summary>装载检测/识别模型并构造解码器（dictText 为字典文本，
+    /// 每行一字符；null 等价空字典，仅用于无字调试）。</summary>
+    static Ocr Load(byte[] detModel, byte[] recModel, string dictText) {
+        OrtSession d = Ort.LoadSession(detModel);
+        OrtSession r = Ort.LoadSession(recModel);
+        Ctc c = dictText == null ? Ctc.FromChars("", true)
+                                 : Ctc.FromDictText(dictText, true);
+        return Ocr.Wrap(d, r, c);
+    }
+
+    /// 阅读序（行内左→右、行间上→下）的整图识别。
+    List<OcrLine> Run(byte[] rgba, int w, int h) {
+        // ---- 检测：整图归一化进 DB，后处理取框并还原坐标 ----
+        int[] wh = ImgUtil.DetInputSize(w, h, this.detLimit);
+        int dw = wh[0];
+        int dh = wh[1];
+        float[] detIn = ImgUtil.CropResizeNchw(rgba, w, h,
+            0, 0, w - 1, h - 1, dw, dh,
+            0.485f, 0.456f, 0.406f, 0.229f, 0.224f, 0.225f);
+        OrtTensor detOut = this.det.Run1(OrtTensor.Of(detIn, Ocr.Shape3(1, 3, dh, dw)));
+        float[] prob = detOut.Data();
+        long[] dshape = detOut.Shape();
+        int pmW = (int)dshape[3];
+        int pmH = (int)dshape[2];
+        List<DetBox> boxes = Det.Boxes(prob, pmW, pmH,
+            this.probThresh, this.boxThresh, this.unclipRatio,
+            (float)w / pmW, (float)h / pmH);
+        boxes = Ocr.ReadingOrder(boxes);
+
+        // ---- 识别：逐框裁剪缩放进 CRNN，CTC 解码 ----
+        List<OcrLine> lines = new List<OcrLine>();
+        for (int i = 0; i < boxes.Count; i = i + 1) {
+            DetBox b = boxes[i];
+            int bw = b.MaxX() - b.MinX() + 1;
+            int bh = b.MaxY() - b.MinY() + 1;
+            int rw = (int)((double)bw * this.recHeight / bh);
+            if (rw < 8) { rw = 8; }
+            if (rw > 640) { rw = 640; }
+            rw = (rw + 3) / 4 * 4;
+            float[] recIn = ImgUtil.CropResizeNchw(rgba, w, h,
+                b.MinX(), b.MinY(), b.MaxX(), b.MaxY(), rw, this.recHeight,
+                0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f);
+            OrtTensor recOut = this.rec.Run1(
+                OrtTensor.Of(recIn, Ocr.Shape3(1, 3, this.recHeight, rw)));
+            long[] rshape = recOut.Shape();
+            int rank = rshape.Length;
+            int t = (int)rshape[rank - 2];
+            int cls = (int)rshape[rank - 1];
+            OcrText txt = this.ctc.Greedy(recOut.Data(), t, cls);
+            if (txt.Text().Length == 0) { continue; }
+            lines.Add(OcrLine.Make(txt.Text(), txt.Score(),
+                b.MinX(), b.MinY(), b.MaxX(), b.MaxY()));
+        }
+        return lines;
+    }
+
+    /// [1,C,H,W] 形状。
+    static long[] Shape3(int n, int c, int h, int w) {
+        long[] s = new long[4];
+        s[0] = n;
+        s[1] = c;
+        s[2] = h;
+        s[3] = w;
+        return s;
+    }
+
+    /// 阅读序：按 y 分行（行内左→右），行间按行首 y。
+    static List<DetBox> ReadingOrder(List<DetBox> boxes) {
+        List<DetBox> by = new List<DetBox>();
+        for (int i = 0; i < boxes.Count; i = i + 1) { by.Add(boxes[i]); }
+        // 先按 minY 粗排
+        Ocr.SortByMinY(by, 0, by.Count - 1);
+        // 贪心分行
+        List<DetBox> ordered = new List<DetBox>();
+        int i0 = 0;
+        while (i0 < by.Count) {
+            int j = i0 + 1;
+            int lineBottom = by[i0].MaxY();
+            while (j < by.Count) {
+                int cy = (by[j].MinY() + by[j].MaxY()) / 2;
+                if (cy <= lineBottom) {
+                    if (by[j].MaxY() > lineBottom) { lineBottom = by[j].MaxY(); }
+                    j = j + 1;
+                } else {
+                    break;
+                }
+            }
+            // 行内按 minX 排
+            for (int a = i0; a < j; a = a + 1) {
+                int bm = a;
+                for (int b2 = a + 1; b2 < j; b2 = b2 + 1) {
+                    if (by[b2].MinX() < by[bm].MinX()) { bm = b2; }
+                }
+                DetBox tmp = by[a];
+                by[a] = by[bm];
+                by[bm] = tmp;
+            }
+            for (int a = i0; a < j; a = a + 1) { ordered.Add(by[a]); }
+            i0 = j;
+        }
+        return ordered;
+    }
+
+    /// minY 插排（框数少，简单插入排序足够）。
+    static void SortByMinY(List<DetBox> list, int lo, int hi) {
+        for (int i = lo + 1; i <= hi; i = i + 1) {
+            DetBox v = list[i];
+            int j = i - 1;
+            while (j >= lo && list[j].MinY() > v.MinY()) {
+                list[j + 1] = list[j];
+                j = j - 1;
+            }
+            list[j + 1] = v;
+        }
+    }
+
+    /// 关闭底层会话（推理收尾；Ocr 不可再 Run）。
+    void Close() {
+        this.det.Close();
+        this.rec.Close();
+        Ort.Shutdown();
+    }
+}

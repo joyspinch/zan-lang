@@ -1,0 +1,95 @@
+using System;
+
+namespace System.Ocr;
+
+/// <summary>
+/// OCR 的图像预处理原语：灰度、检测图二值化外的公共件——
+/// 双线性裁剪缩放 + NCHW 归一化。检测与识别共用同一实现，
+/// 只是目标尺寸与 mean/std 不同（检测 ImageNet 统计，识别 0.5/0.5）。
+/// </summary>
+class ImgUtil {
+    /// RGBA → 灰度（0..255 浮点，BT.601 系数）。
+    static float[] Gray(byte[] rgba, int w, int h) {
+        float[] g = new float[w * h];
+        for (int i = 0; i < w * h; i = i + 1) {
+            int p = i * 4;
+            g[i] = 0.299f * (rgba[p] & 255) + 0.587f * (rgba[p + 1] & 255)
+                 + 0.114f * (rgba[p + 2] & 255);
+        }
+        return g;
+    }
+
+    /// <summary>
+    /// 从 RGBA 图的 [minX..maxX]×[minY..maxY]（含端点）裁剪区域，
+    /// 双线性缩放到 outW×outH，输出 NCHW float
+    /// [3][outH][outW]，逐通道 (x/255 - mean[c]) / std[c]。
+    /// </summary>
+    static float[] CropResizeNchw(byte[] rgba, int imgW, int imgH,
+                                  int minX, int minY, int maxX, int maxY,
+                                  int outW, int outH,
+                                  float mean0, float mean1, float mean2,
+                                  float std0, float std1, float std2) {
+        if (maxX < minX || maxY < minY || imgW <= 0 || imgH <= 0
+            || outW <= 0 || outH <= 0) {
+            throw new InvalidOperationException("CropResizeNchw 参数非法");
+        }
+        float[] outPx = new float[3 * outH * outW];
+        double sw = maxX - minX + 1;
+        double sh = maxY - minY + 1;
+        for (int dy = 0; dy < outH; dy = dy + 1) {
+            double sy = (dy + 0.5) * sh / outH - 0.5;
+            if (sy < 0) { sy = 0; }
+            if (sy > sh - 1) { sy = sh - 1; }
+            int y0 = (int)sy;
+            int y1 = y0 + 1 < sh ? y0 + 1 : y0;
+            double fy = sy - y0;
+            int row0 = (minY + y0) * imgW;
+            int row1 = (minY + y1) * imgW;
+            for (int dx = 0; dx < outW; dx = dx + 1) {
+                double sx = (dx + 0.5) * sw / outW - 0.5;
+                if (sx < 0) { sx = 0; }
+                if (sx > sw - 1) { sx = sw - 1; }
+                int x0 = (int)sx;
+                int x1 = x0 + 1 < sw ? x0 + 1 : x0;
+                double fx = sx - x0;
+                int p00 = (row0 + minX + x0) * 4;
+                int p01 = (row0 + minX + x1) * 4;
+                int p10 = (row1 + minX + x0) * 4;
+                int p11 = (row1 + minX + x1) * 4;
+                double w00 = (1 - fx) * (1 - fy);
+                double w01 = fx * (1 - fy);
+                double w10 = (1 - fx) * fy;
+                double w11 = fx * fy;
+                int o = dy * outW + dx;
+                outPx[o] = (float)(((rgba[p00] & 255) * w00 + (rgba[p01] & 255) * w01
+                    + (rgba[p10] & 255) * w10 + (rgba[p11] & 255) * w11) / 255.0
+                    - mean0) / std0;
+                outPx[outH * outW + o] = (float)(((rgba[p00 + 1] & 255) * w00
+                    + (rgba[p01 + 1] & 255) * w01 + (rgba[p10 + 1] & 255) * w10
+                    + (rgba[p11 + 1] & 255) * w11) / 255.0 - mean1) / std1;
+                outPx[2 * outH * outW + o] = (float)(((rgba[p00 + 2] & 255) * w00
+                    + (rgba[p01 + 2] & 255) * w01 + (rgba[p10 + 2] & 255) * w10
+                    + (rgba[p11 + 2] & 255) * w11) / 255.0 - mean2) / std2;
+            }
+        }
+        return outPx;
+    }
+
+    /// <summary>整图缩放归一化（检测输入）：长边 ≤ limit、两边取整到
+    /// 32 的倍数（向上取整避免裁掉边缘文字，轻微拉伸由 DBNet 承受），
+    /// 返回目标宽高。</summary>
+    static int[] DetInputSize(int w, int h, int limit) {
+        double scale = 1.0;
+        if (w > limit || h > limit) {
+            scale = (double)limit / (w > h ? w : h);
+        }
+        int ow = (int)Math.Ceiling(w * scale / 32.0) * 32;
+        int oh = (int)Math.Ceiling(h * scale / 32.0) * 32;
+        if (ow < 32) { ow = 32; }
+        if (oh < 32) { oh = 32; }
+        int[] wh = new int[2];
+        wh[0] = ow;
+        wh[1] = oh;
+        return wh;
+    }
+}
