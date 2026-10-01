@@ -64,15 +64,17 @@ config/app.json         运行时配置（端口/库/缓存/授权策略），�
 src/main.zan            引导；路由来自控制器属性
 src/Controller/Api/License.zan    四个授权端点（上面契约）
 src/Controller/Admin/Lic/         管理后台：产品/激活码/账号授权/在线与设备
-src/Controller/Account/Login.zan  管理后台登录（seed: admin/admin1234）
+src/Controller/Account/Login.zan  管理后台登录（bootstrap: admin/admin-bootstrap-2026）
 src/Feature/LicenseFlow.zan       授权核心域：激活/登录/心跳/登出/解绑
 src/Model/Lic/                    lic_* 五张表实体
-src/Framework/Schema.zan          建表 + 种子（示例产品、演示码、内置角色）
+src/Framework/LicenseSeed.zan     授权域种子（示例产品、演示码；建表与
+                                  sys 域种子由 Zan.Mvc 包 Schema 负责）
 views/Admin/Lic/                  管理界面视图
 ```
 
 内置角色：`admin`（全部）与 `operator`（授权运营，只见 /admin/lic/*，
-发放激活码与账号授权、处理解绑）。首次启动用 admin/admin1234 登录。
+发放激活码与账号授权、处理解绑）。首次启动用 admin/admin-bootstrap-2026 登录（[auth].bootstrapPassword，
+≥12 字符，包 Schema 硬校验）。
 
 ## 演示种子
 
