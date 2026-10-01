@@ -4240,10 +4240,13 @@ typedef struct {
     int         index;
     int         bg_gen;
     int                searching;
-    /* Set in co_run right before the step: wall clock when this worker handed
-     * the CPU to the currently running frame. zan_co_poll compares it against
-     * the quantum to requeue compute-bound frames that never await. */
-    long long          slice_start_ms;
+    /* Set in co_run right before the step: monotonic microseconds
+     * (zan_co_precise_us) when this worker handed the CPU to the currently
+     * running frame. zan_co_poll compares it against the quantum to requeue
+     * compute-bound frames that never await. Millisecond clocks are too
+     * coarse here: GetTickCount64 ticks at ~15.6ms on Windows, which would
+     * turn the 2ms default quantum into a ~15ms slice. */
+    long long          slice_start_us;
     volatile LONG      parked;
     unsigned           tick;
     unsigned           rng;
@@ -4301,7 +4304,7 @@ static long long co_now_ms(void) { return (long long)GetTickCount64(); }
  * workers that lose the race reuse the cached deadline instead of queueing on
  * the lock. */
 static volatile LONG      g_timer_owner;
-static volatile long long g_timer_pumped_ms;
+static volatile long long g_timer_pumped_us;   /* zan_co_precise_us stamp */
 static volatile long long g_timer_next_ms;
 
 /* Bumped whenever work is created (a frame is queued or a timer armed). The
@@ -4675,16 +4678,16 @@ static int co_worker_count(void) {
  * requeue as await Task.Yield) so siblings and the timer/IO pumps get a
  * turn. Runs on the worker that is executing the frame; a foreign thread
  * running a step (never the case today) just returns 0, degrading to the
- * no-preemption behavior. Note the clock: GetTickCount64 ticks at ~15ms on
- * Windows, so the effective slice granularity is the clock tick, not the
- * configured quantum. */
+ * no-preemption behavior. Slice bookkeeping is microsecond grade
+ * (zan_co_precise_us): the ms wall clock ticks at ~15.6ms on Windows and
+ * would stretch the default 2ms quantum to a clock tick. */
 int zan_co_poll(void) {
     long long q = zan_co_quantum_ms();
     if (q <= 0) return 0;
     zan_co_worker_t *w = co_self();
-    if (!w || w->slice_start_ms <= 0) return 0;
-    long long now = co_now_ms();
-    return (now - w->slice_start_ms >= q) ? 1 : 0;
+    if (!w || w->slice_start_us <= 0) return 0;
+    long long now = zan_co_precise_us();
+    return (now - w->slice_start_us >= q * 1000) ? 1 : 0;
 }
 
 void zan_co_sched_init(void) {
@@ -4708,7 +4711,7 @@ void zan_co_sched_init(void) {
     g_co_pool_gen = 0;
     g_io_shards_live = 0;
     g_timer_owner = 0;
-    g_timer_pumped_ms = 0;
+    g_timer_pumped_us = 0;
     g_timer_next_ms = -1;
     g_co_activity = 0;
     EnterCriticalSection(&g_inj_lock);
@@ -4845,7 +4848,7 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
      * sustained load. Firing due timers here keeps them alive; the
      * g_timer_owner gate in co_pump_timers_now serializes the pool. */
     co_pump_timers();
-    w->slice_start_ms = co_now_ms();
+    w->slice_start_us = zan_co_precise_us();
     t->step(t->frame);
     co_trace("done", t->frame);
     for (;;) {
@@ -4893,17 +4896,19 @@ static long long co_pump_timers_now(void) {
     zan_timer_dispatch_due();
     long long next = zan_timer_next_timeout();
     g_timer_next_ms = next;
-    g_timer_pumped_ms = co_now_ms();
+    g_timer_pumped_us = zan_co_precise_us();
     InterlockedDecrement(&g_co_running);
     InterlockedExchange(&g_timer_owner, 0);
     return next;
 }
 
 static long long co_pump_timers(void) {
-    long long now = co_now_ms();
+    long long now = zan_co_precise_us();
     /* Throttled pool-wide to ~1ms: while the pump ran recently every caller
-     * reuses the cached deadline so the timer lock stays cold on busy loops. */
-    if (now - g_timer_pumped_ms >= 1)
+     * reuses the cached deadline so the timer lock stays cold on busy loops.
+     * Microsecond grade -- a ms wall clock's ~15.6ms Windows tick would turn
+     * the throttle into ~15ms of added Delay latency under load. */
+    if (now - g_timer_pumped_us >= 1000)
         return co_pump_timers_now();
     long long cached = g_timer_next_ms;
     return (cached == 0) ? 1 : cached;

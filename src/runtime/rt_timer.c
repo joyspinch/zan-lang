@@ -630,6 +630,33 @@ long long zan_co_quantum_ms(void) {
     return q;
 }
 
+/* Microsecond monotonic clock for the drivers' slice accounting and the mt
+ * pump throttle (see rt_timer.h). The two-term split is load-bearing: a
+ * straight c*1000000/freq overflows i64 after ~15 minutes of uptime at the
+ * usual 10MHz QPC frequency, while each term alone stays under it (seconds*
+ * 1e6 since boot; sub-second remainder*1e6). The freq cache race on first
+ * call is the same benign write-same-value pattern zan_co_quantum_ms has. */
+long long zan_co_precise_us(void) {
+#if defined(_WIN32)
+    static long long freq;
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    if (!freq) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        freq = f.QuadPart;
+    }
+    return (c.QuadPart / freq) * 1000000 +
+           (c.QuadPart % freq) * 1000000 / freq;
+#elif defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+#else
+    return zan_timer_now_ms() * 1000;   /* coarse boards: ms is the truth */
+#endif
+}
+
 static int timer_less(const zan_timer_entry *a, const zan_timer_entry *b) {
     return a->due_ms < b->due_ms ||
            (a->due_ms == b->due_ms && a->sequence < b->sequence);

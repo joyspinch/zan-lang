@@ -208,7 +208,12 @@ backedge:  if (zan_co_poll())  -> save slots, state = k, zan_co_ready(frame, res
 `zan_co_poll` (M:1: emitted inline; mt: provided by `zanrt_io_mt`) returns 1
 once the running frame has held its worker past the cooperative quantum —
 `ZAN_CO_QUANTUM_MS`, default 2ms, 0 disables. Both drivers restamp the slice
-clock at every dispatch, so a requeued frame gets a fresh budget. Because the
+clock at every dispatch, so a requeued frame gets a fresh budget. Slice
+bookkeeping is microsecond grade (`zan_co_precise_us`: QPC on Windows,
+`CLOCK_MONOTONIC` elsewhere): the millisecond wall clock ticks at ~15.6ms on
+Windows and would stretch the default 2ms quantum to a clock tick — real
+slices were ~15ms before the precise clock, timer deadlines stay on the ms
+clock where they belong. Because the
 poll site sits between statements, the same invariant that makes `await` work
 applies unchanged: only frame-resident named scalars survive the `ret void`
 (`emit_async_save_slots` covers them; ANF keeps SSA temporaries from

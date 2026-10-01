@@ -112,6 +112,12 @@ long long zan_timer_next_timeout(void);
  * run past its slice must requeue. Lives with the timer because both drivers
  * already link this object for their clocks. */
 long long zan_co_quantum_ms(void);
+/* Microsecond monotonic clock for slice/throttle accounting. The ms clock
+ * above is wall-deadline grade: on Windows GetTickCount64 ticks at ~15.6ms,
+ * which would turn a 2ms quantum into a ~15ms slice and a 1ms pump throttle
+ * into ~15ms. QPC is sub-microsecond on every supported Windows; POSIX
+ * CLOCK_MONOTONIC already is. Timer DEADLINES stay on zan_timer_now_ms. */
+long long zan_co_precise_us(void);
 /* These return counts; `long long` (not size_t) because the compiler's IR
  * declares them with Zan's 64-bit int and wasm32's size_t is 32-bit. */
 long long zan_timer_dispatch_due(void);
