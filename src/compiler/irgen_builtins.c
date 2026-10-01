@@ -1911,11 +1911,16 @@ static LLVMValueRef emit_eh_setjmp(zan_irgen_t *g, LLVMValueRef bufp) {
     }
     /* Bare-metal ELF libc (picolibc/newlib, the riscv*-unknown-elf case)
      * ships only `setjmp` — `_setjmp` is a hosted-libc (glibc/msvcrt) name.
-     * Linux triples keep `_setjmp` because it skips the sigmask save. */
+     * Linux triples keep `_setjmp` because it skips the sigmask save.
+     * wasm32/64 have no libc setjmp at all (wasi-libc) and no backend sjlj
+     * lowering: `setjmp` resolves to the always-calm stub in zanrt_wasm.o —
+     * the wasm EH transport is the engine's (wasm.throw + catchswitch), so
+     * the armed guard can never be re-entered by a longjmp; see rt_wasm.c. */
     bool riscv_bare = strncmp(g->target_triple, "riscv", 5) == 0 &&
                       !strstr(g->target_triple, "linux");
     LLVMTypeRef ty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ i8ptr }, 1, 0);
-    LLVMValueRef fn = get_libc_fn(g, riscv_bare ? "setjmp" : "_setjmp", ty);
+    LLVMValueRef fn = get_libc_fn(g,
+        (riscv_bare || g->target_is_wasm) ? "setjmp" : "_setjmp", ty);
     LLVMValueRef call = zan_call2(g->builder, ty, fn, &bufp, 1, "sj");
     add_enum_attr(g, fn, call, "returns_twice");
     return call;

@@ -226,6 +226,21 @@ Not covered by back-edge polling: compute-bound loops in NON-async functions
 use `Thread`/`Task.Run` offloading or split the work with explicit
 `await Task.Yield()` calls. Non-async loops carry zero overhead.
 
+### Exception transport on wasm32
+
+The setjmp/longjmp transport above has no wasm implementation: wasi-libc
+ships no setjmp and the LLVM wasm backend has no sjlj lowering. On wasm32
+the Zan exception transport is therefore the ENGINE's own EH — `throw`
+lowers to `__cxa_throw` invokes and `try` to catchswitches (the try/catch
+lowering; the `__cpp_exception` tag object is `toolchain/wasm32/zanrt_ehtag.o`).
+The async guard's arm lowers to the always-calm `setjmp` stub in
+`zanrt_wasm.c`: on wasm an armed guard can never be re-entered by a longjmp,
+so returning 0 unconditionally is the true behavior, and a throw escaping an
+async frame surfaces as an uncaught engine exception at the host — the same
+fail-fast an unhandled native throw has. Async programs compile, link and run
+on wasm32 (see `conformance_wasm32_async_yield`; a node WASI run of the
+artifact is the manual runtime check).
+
 ### IO reactor backends and the real-async Net stack
 
 Implemented end to end and verified on Linux, macOS and Windows (loopback-echo

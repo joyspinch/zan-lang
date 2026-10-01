@@ -1890,6 +1890,17 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/wasm32/libc.a"
             -o ${CMAKE_BINARY_DIR}/conf_wasm32_file_io_in_try.wasm
             ${CMAKE_SOURCE_DIR}/tests/wasm32/file_io_in_try.zan)
   set_tests_properties(conformance_wasm32_file_io_in_try PROPERTIES TIMEOUT 120)
+  # Async on wasm32: the CPS driver + Task.Yield must COMPILE AND LINK. The
+  # suite cannot run a wasm module (runtime semantics are exercised natively
+  # by conformance_task_yield; a node WASI run of this binary is the manual
+  # check). This locks in the wasm setjmp stub contract: the async guard arms
+  # lower to the always-calm `setjmp` stub in zanrt_wasm.o (see rt_wasm.c) --
+  # before B-ID47 every async program failed the wasm link on _setjmp.
+  add_test(NAME conformance_wasm32_async_yield
+    COMMAND $<TARGET_FILE:zanc> --auto-stdlib --target wasm32
+            -o ${CMAKE_BINARY_DIR}/conf_wasm32_async_yield.wasm
+            ${CMAKE_SOURCE_DIR}/tests/conformance/task_yield.zan)
+  set_tests_properties(conformance_wasm32_async_yield PROPERTIES TIMEOUT 120)
 endif()
 
 # ---- Android: cross-compile + static bionic link ---------------------------

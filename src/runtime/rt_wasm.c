@@ -48,3 +48,17 @@ int pthread_mutex_unlock(void *m) { (void)m; return 0; }
 int pthread_mutex_destroy(void *m) { (void)m; return 0; }
 
 void longjmp(void *env, int val) { (void)env; (void)val; abort(); }
+
+/* The async guard's arm (irgen_builtins.c emit_eh_setjmp lowers to this name
+ * on wasm targets, where wasi-libc ships no setjmp and the LLVM wasm backend
+ * has no sjlj lowering). Semantically this is the truth, not a dodge: on
+ * wasm32 the Zan exception transport is the engine's own EH -- a throw
+ * becomes wasm.throw / __cxa_throw (try/catch lowering; zanrt_ehtag.o) and
+ * the ENGINE unwinds to the catchswitch, so the guard armed around an async
+ * slice can never be re-entered by a longjmp. It always returns 0 (calm
+ * path); longjmp above stays reachable only as a link-resolution dead end. A
+ * throw escaping an async frame on wasm surfaces as an uncaught engine
+ * exception at the host -- the same fail-fast an unhandled native throw has.
+ * returns_twice matches the attribute the emitted call sites carry. */
+__attribute__((returns_twice))
+int setjmp(void *env) { (void)env; return 0; }
