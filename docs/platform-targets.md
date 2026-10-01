@@ -11,7 +11,8 @@ This file is the source of truth for target support. Keep it in sync with:
 - `src/compiler/crosscomp.c` — the target table (`s_targets[]`) and triple parsing.
 - `src/compiler/main.c` — the actual link paths (`zan_target_host`, the
   `cross_compiling` branches, `zan_driver_subdir`).
-- `stdlib/System/Data/<Module>/drivers/<target>/` — per-target native DB drivers.
+- `packages/Zan.Data/src/System/Data/<Module>/drivers/<target>/` — per-target
+  native DB drivers.
 
 ---
 
@@ -231,18 +232,11 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   inside; `src/compiler/apk.c` patches exactly one `dev.zan.app` package +
   one `Zan App` label string in the pool), and the precompiled
   `AndroidManifest.xml.bin` next to it ships with the permission.
-- **TLS**: `System.Net.Tls` ships bionic-compatible OpenSSL drivers for both
-  ABIs at `stdlib/System/Net/Tls/drivers/android-{arm64,x64}/` — Termux
-  3.6.3 builds with the SONAME/NEEDED names shortened in place
-  (`libssl.so.3` → `libssl.so`) because Android only extracts `lib*.so` to
-  `nativeLibraryDir`; each `*.bundle` lists one `.so` so `--emit-apk` packs
-  them into `lib/<abi>/`. Verified on the emulator with a loopback probe
-  (TLS server + client in one APK on 127.0.0.1, self-signed CA embedded and
-  trusted via `AddTrustedCert`): handshake, **certificate chain
-  verification**, and a full HTTPS request/response round trip pass on both
-  arm64 (Berberis translation) and x64. PEM material passed to
-  `TlsContext.CreateServer` must be written to a real file first — OpenSSL's
-  internal `fopen` cannot see `--embed` virtual files.
+- **TLS**: the native OpenSSL drivers (and their per-ABI Android staging) were
+  removed in f487f776 — `System.Net.Tls` is pure-Zan managed TLS and ships no
+  native driver on any target. The historical Termux OpenSSL build notes
+  (`libssl.so.3` SONAME shortening, PEM material written to a real file for
+  OpenSSL's internal `fopen`) applied only to that removed driver.
 - Known Android issues (see TASKS.md A88): a `try/catch` directly in a void
   `Thread.Start` entry hangs on android-arm64 — keep the entry try-free and
   `await` an async method that owns the try (the `ImageHttp` shape); a TLS

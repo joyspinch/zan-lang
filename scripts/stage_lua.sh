@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the Lua runtime that System.Scripting.Lua dlopen()s and stage it into
-# <repo>/stdlib/System/Scripting/drivers/<target>. Run on the matching native host
-# (linux-x64 / linux-arm64 / macos-x64 / macos-arm64).
+# <repo>/packages/Zan.Scripting/src/System/Scripting/drivers/<target>. Run on the
+# matching native host (linux-x64 / linux-arm64 / macos-x64 / macos-arm64).
 #
 #   scripts/stage_lua.sh linux-x64
 #
@@ -12,7 +12,7 @@ set -euo pipefail
 TARGET="${1:?usage: stage_lua.sh <linux-x64|linux-arm64|macos-x64|macos-arm64> [version]}"
 VERSION="${2:-5.4.6}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="$ROOT/stdlib/System/Scripting/drivers/$TARGET"
+DEST="$ROOT/packages/Zan.Scripting/src/System/Scripting/drivers/$TARGET"
 WORK="${TMPDIR:-/tmp}/zan-lua-$VERSION"
 SRC="$WORK/lua-$VERSION/src"
 

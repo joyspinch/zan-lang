@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stage the macOS libpq runtime closure into
-# stdlib/System/Data/Postgres/drivers/<target>/.
+# packages/Zan.Data/src/System/Data/Postgres/drivers/<target>/.
 #
 # Walks the dependency graph from libpq.5.dylib across the Homebrew keg dirs
 # (libpq, openssl@3, krb5), copies each non-system dylib, rewrites every
@@ -10,7 +10,7 @@ set -euo pipefail
 
 TARGET="${1:?usage: stage_libpq_macos.sh <macos-arm64|macos-x64>}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="$ROOT/stdlib/System/Data/Postgres/drivers/$TARGET"
+DEST="$ROOT/packages/Zan.Data/src/System/Data/Postgres/drivers/$TARGET"
 BREW="$(brew --prefix)"
 SRC_DIRS="$BREW/opt/libpq/lib $BREW/opt/openssl@3/lib $BREW/opt/krb5/lib"
 mkdir -p "$DEST"

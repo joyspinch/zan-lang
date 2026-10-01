@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stage the Linux libpq runtime closure into
-# stdlib/System/Data/Postgres/drivers/<target>/.
+# packages/Zan.Data/src/System/Data/Postgres/drivers/<target>/.
 #
 # Resolves libpq.so.5 (from libpq-dev), walks its shared-library closure with
 # ldd, copies every non-glibc/system dependency, sets each copy's rpath to
@@ -10,7 +10,7 @@ set -euo pipefail
 
 TARGET="${1:?usage: stage_libpq_linux.sh <linux-x64|linux-arm64>}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="$ROOT/stdlib/System/Data/Postgres/drivers/$TARGET"
+DEST="$ROOT/packages/Zan.Data/src/System/Data/Postgres/drivers/$TARGET"
 mkdir -p "$DEST"
 
 command -v patchelf >/dev/null || { echo "patchelf required" >&2; exit 2; }

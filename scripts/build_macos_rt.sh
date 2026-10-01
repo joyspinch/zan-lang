@@ -48,11 +48,22 @@ for pair in arm64:aarch64 x64:x86_64; do
     # GUI compatibility stubs (event seq/flag, font ascent, full surface presentation).
     "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 \
         -c "$RT/gui_compat_mac.c" -o "$out/zanrt_gui.o"
-    echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zanrt_gui.o"
+    # Embedded-resource API + compressed-resource decoder: GUI programs pull
+    # skins/icons through the auto-embed path, so irgen sets uses_embed_api /
+    # uses_inflate and the cross link injects these two objects (same flags as
+    # the ZAN_EMBED_OBJ / ZAN_INFLATE_OBJ recipes in CMakeLists.txt).
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 \
+        -c "$RT/zan_embed_api.c" -o "$out/zan_embed_api.o"
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -O2 \
+        -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
+        -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
+        -I "$ROOT/src/common" \
+        -c "$RT/zan_inflate.c" -o "$out/zan_inflate.o"
+    echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zanrt_gui.o zan_embed_api.o zan_inflate.o"
 done
 
-mkdir -p "$TOOLCHAIN/ios/arm64"
+mkdir -p "$ROOT/toolchain/ios/arm64"
 "$ZIG" cc -target aarch64-ios -g0 -std=c11 -fPIC -I "$RT" -O2 \
-    -c "$RT/gui_compat_mac.c" -o "$TOOLCHAIN/ios/arm64/zanrt_gui.o"
+    -c "$RT/gui_compat_mac.c" -o "$ROOT/toolchain/ios/arm64/zanrt_gui.o"
 echo "built toolchain/ios/arm64: zanrt_gui.o"
 

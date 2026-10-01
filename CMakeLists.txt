@@ -545,10 +545,11 @@ if(_cross_sysroot_cmds)
 endif()
 
 # ---- Native database drivers (publish-time bundling) ----
-# Each native DB driver now lives inside the stdlib module that owns it
-# (e.g. stdlib/System/Data/Sqlite/drivers/<target>/), so it travels with stdlib
-# and needs no separate staging next to zanc: zanc resolves it from
-# <stdlib_root>/<module>/drivers/<target>/. Driver binaries are gitignored and
+# Each native driver now lives inside the package module that owns it
+# (e.g. packages/Zan.Data/src/System/Data/Sqlite/drivers/<target>/), so it
+# travels with the package and needs no separate staging next to zanc: zanc
+# resolves it from <source_root>/<module>/drivers/<target>/ for both the
+# stdlib root and package roots. Driver binaries are gitignored and
 # dropped in per target by the developer / release-assembly step; only the
 # layout + manifests are tracked.
 

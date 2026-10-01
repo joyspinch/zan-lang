@@ -341,7 +341,7 @@ the process with `cannot read file` / `cannot write file` on failure.
 ```csharp
 namespace System.Net.Http;
 
-class HttpClient {                       // stdlib/System/Net/Http/Client/HttpClient.zan
+class HttpClient {                       // packages/Zan.Net/src/System/Net/Http/Client/HttpClient.zan
     HttpClient(string host, int port);   // host:port base; no base-URL form
 
     // configuration (fluent, return this)

@@ -95,14 +95,8 @@ fi
 
 make -C "$PG_BUILD/src/interfaces/libpq" libpq.a
 
-DEST="$ROOT/stdlib/System/Data/Postgres/drivers/$TARGET/static"
-TLS_DEST="$ROOT/stdlib/System/Net/Tls/drivers/$TARGET/static"
+DEST="$ROOT/packages/Zan.Data/src/System/Data/Postgres/drivers/$TARGET/static"
 mkdir -p "$DEST"
-if [[ "$TARGET" == linux-x64 ]]; then
-  mkdir -p "$TLS_DEST"
-  install -m 0644 "$OPENSSL_LIBDIR/libssl.a" "$TLS_DEST/libssl.a"
-  install -m 0644 "$OPENSSL_LIBDIR/libcrypto.a" "$TLS_DEST/libcrypto.a"
-fi
 
 # Merge libpq with frontend common/port objects, prefixing object names to avoid
 # collisions between the three input archives.
@@ -144,20 +138,8 @@ else
 ssl
 crypto
 EOF
-  cat > "$TLS_DEST/ssl.libs" <<'EOF'
-# OpenSSL 3.3.2, musl x86_64, no-shared/no-dso/no-tests/no-apps/no-docs.
-crypto
-EOF
-  cat > "$TLS_DEST/crypto.libs" <<'EOF'
-# OpenSSL 3.3.2, musl x86_64, no-shared/no-dso/no-tests/no-apps/no-docs.
-# No additional native libraries were required by the static link probe.
-EOF
 fi
 
 echo "== built $TARGET =="
 ls -l "$DEST/libpq.a"
 ls -l "$DEST/pq.libs"
-if [[ "$TARGET" == linux-x64 ]]; then
-  ls -l "$TLS_DEST/libssl.a" "$TLS_DEST/libcrypto.a" \
-    "$TLS_DEST/ssl.libs" "$TLS_DEST/crypto.libs"
-fi
