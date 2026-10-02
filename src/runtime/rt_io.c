@@ -5374,7 +5374,14 @@ static void co_pool_ensure(void) {
 }
 
 void zan_co_sched_run(void) {
-    if (g_co_pool_live || g_co_pool_fg) {
+    /* Foreground admission is a CAS, not a check-then-set (B-ID73): two
+     * threads entering the same window both passed the old plain read of
+     * g_co_pool_fg, each built a full worker set, and the second one's
+     * CreateThread overwrote the first's g_wk[i] entries -- corrupting the
+     * work-stealing deques behind the live pool. The winner of fg 0->1 owns
+     * the build below; a background generation (g_co_pool_live) or a
+     * concurrent foreground winner both funnel into the same wait. */
+    if (g_co_pool_live || InterlockedCompareExchange(&g_co_pool_fg, 1, 0) != 0) {
         /* A pool owns execution: a detached background generation (a foreign
          * thread spawned work before the host ever called this), or the
          * foreground pool another thread is running right now. Do not start a
@@ -5397,7 +5404,10 @@ void zan_co_sched_run(void) {
                 InterlockedCompareExchange(&g_co_outstanding, 0, 0) > 0;
             if (!busy && activity == InterlockedCompareExchange(&g_co_activity, 0, 0)) break;
             Sleep(1);
-            static DWORD stuck_since = 0;
+            /* Per-thread: this loop runs concurrently on every sched_run
+             * caller, and a shared static made each writer reset the other's
+             * watchdog (B-ID84 hygiene). */
+            static __thread DWORD stuck_since = 0;
             DWORD nowk = GetTickCount();
             if (stuck_since == 0) { stuck_since = nowk; continue; }
             if (nowk - stuck_since > 3000) {
@@ -5413,12 +5423,12 @@ void zan_co_sched_run(void) {
     g_co_workers = co_worker_count();
     int w = g_co_workers;
     g_co_stop = 0;
-    /* Publish foreground ownership before any worker exists. Every wake -- an
-     * IO completion, a timer pop -- ends in zan_co_ready, whose tail calls
-     * co_pool_ensure; without this flag each wake saw g_co_pool_live == 0
-     * there and started a second, detached pool: 2x workers over-subscribed
-     * on the same queues, two pool lifecycles interleaved (B-ID30). */
-    InterlockedExchange(&g_co_pool_fg, 1);
+    /* Foreground ownership was published by the admission CAS above, before
+     * any worker exists. Every wake -- an IO completion, a timer pop -- ends
+     * in zan_co_ready, whose tail calls co_pool_ensure; without this flag
+     * each wake saw g_co_pool_live == 0 there and started a second, detached
+     * pool: 2x workers over-subscribed on the same queues, two pool
+     * lifecycles interleaved (B-ID30). */
     /* Shard the reactor before any worker starts: a shard with no waiter would
      * hold completions nobody dequeues. */
     io_shards_start(w);
