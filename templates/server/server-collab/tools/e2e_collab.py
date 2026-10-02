@@ -60,7 +60,10 @@ def ok(cond, label):
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **kw): return None
-opener = urllib.request.build_opener(NoRedirect)
+os.environ["NO_PROXY"] = "127.0.0.1,localhost," + os.environ.get("NO_PROXY", "")
+os.environ["no_proxy"] = "127.0.0.1,localhost," + os.environ.get("no_proxy", "")
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+urllib.request.install_opener(opener)
 
 def http(path, data=None, cookie=None):
     req = urllib.request.Request(BASE + path)
@@ -138,6 +141,7 @@ def start_server(exe):
 
 def stop_server(proc):
     # master + worker 树一起杀（见 e2e_im.stop_server：孤儿 worker 攥监听端口）。
+    exe_name = os.path.basename(proc.args[0]) if proc.args else "collab_server.exe"
     if os.name == "nt":
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                        capture_output=True)
@@ -148,6 +152,8 @@ def stop_server(proc):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/IM", exe_name], capture_output=True)
     time.sleep(1)
 
 TS = str(int(time.time()))[-6:]

@@ -107,10 +107,10 @@ description: 服务端开发通用规范——四层架构（接入/业务/数�
 给 master+N worker 的 Zan 服务端模板写自动化 e2e/压测时，这几条都是
 踩过坑验证过的：
 
-1. **停服必须杀整树**（Windows：`taskkill /F /T /PID <master>`）。
-   只 `terminate()` 主进程，N 个 worker 变成攥着监听套接字的孤儿——
+1. **停服必须杀整树并保底强杀进程名**（Windows：`taskkill /F /T /PID <master>` 配合 `taskkill /F /IM <exe_name>`）。
+   只 `terminate()` 主进程或单杀 PID，N 个 worker 变成攥着监听套接字的孤儿——
    下一次起服新旧实例混着应答，症状是响应里掺二进制乱码、随机
-   connection reset，极易误判成协议 bug。重启前先 `tasklist` 确认清零。
+   connection reset，极易误判成协议 bug。重启前先 `wait_gone` 并确认端口释放。
 2. **admin 控制器 GET 默认整页 HTML**；要数据片段加请求头
    `X-Fragment: 1`（同族：`X-Requested-With` / `Accept: application/json`，
    见 WebApp.WantsPage）。裸 GET 拿到的是完整后台页，JSON 解析必炸。
@@ -129,6 +129,18 @@ description: 服务端开发通用规范——四层架构（接入/业务/数�
    协程开着必须把变量从环境里整个删掉，设 `ZAN_NO_BG=0` 照样静默
    跳过、实时通道（事件扇出 relay）不会装配，表现为「发送 200 但
    在线帧永不到达」。
+6. **事件扇出 Relay 的启动初始水位必须显式对齐**：
+   在后台循环启动前，由 `main.zan` 在对外暴露端口前主动借库执行一次
+   `InitWatermark(db)`（以 `Latest()` / `MAX(id)` 对齐内存水位）。
+   若交由循环首拍异步对齐，会存在时序竞态窗口：在首拍执行延迟期间（如被
+   调度到后几百毫秒），在线请求产生的新事件已写入 DB，随后首拍触发时
+   却把该新事件的 id 误作为初始历史水位，导致启动瞬间的新事件被当作历史
+   记录跳过扇出，在线推送偶发丢失。
+7. **本地自动化测试（e2e）必须隔离全局 HTTP 代理**：
+   测试脚本（如 Python `urllib`）在宿主环境配置了 `http_proxy`/`HTTP_PROXY`
+   时，可能将发往 `127.0.0.1:8090` 的内部请求发往外部代理服务器，
+   导致收到代理服务器的 404/Bad Gateway 伪报错。必须显式设置
+   `ProxyHandler({})` 与注入 `NO_PROXY=127.0.0.1,localhost`。
 
 数据建模通用准则（跨桌面/游戏/服务端）见 `data-modeling` skill；
 服务端 DB 专属细则见 `server-db-design` skill。

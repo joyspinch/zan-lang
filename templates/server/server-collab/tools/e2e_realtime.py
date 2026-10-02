@@ -51,7 +51,10 @@ def ok(cond, label):
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **kw): return None
-opener = urllib.request.build_opener(NoRedirect)
+os.environ["NO_PROXY"] = "127.0.0.1,localhost," + os.environ.get("NO_PROXY", "")
+os.environ["no_proxy"] = "127.0.0.1,localhost," + os.environ.get("no_proxy", "")
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+urllib.request.install_opener(opener)
 
 anomalies = []
 
@@ -187,6 +190,7 @@ def start_server(exe):
 
 def stop_server(proc):
     # master + worker 树一起杀（孤儿 worker 攥监听端口，见 e2e_im.stop_server）。
+    exe_name = os.path.basename(proc.args[0]) if proc.args else "collab_server.exe"
     if os.name == "nt":
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                        capture_output=True)
@@ -197,6 +201,8 @@ def stop_server(proc):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/IM", exe_name], capture_output=True)
     wait_gone()
     time.sleep(0.5)
 
@@ -240,7 +246,7 @@ def main():
                        {"conversationId": str(CONVS["id"]),
                         "content": "重启后补偿-" + TS,
                         "clientRequestId": "rt-%s-m5" % TS}, token=TOKENS["a"])
-        ok(st == 200, "send after restart")
+        ok(st == 200, "send after restart" + (" (st=%s, env=%s)" % (st, env) if st != 200 else ""))
         st, env = call("GET", "/api/collab/events?after=%d" % cursor, token=TOKENS["b"])
         evs = data_of(env).get("events") or []
         ok(len(evs) == 1 and evs[0].get("event") == "message.created"
@@ -404,7 +410,15 @@ def run_flow():
                    {"conversationId": str(conv), "content": "重连后在线-" + TS,
                     "clientRequestId": crid("m4")}, token=ta)
     ok(st == 200, "send after reconnect")
-    fr = sse2.read_frame(6)
+    fr = None
+    deadline = time.time() + 6
+    while time.time() < deadline:
+        f = sse2.read_frame(2)
+        if f is None or f[0] == "__timeout__":
+            break
+        if f[0] == "collab":
+            fr = f
+            break
     ok(fr is not None and fr[0] == "collab", "online delivery after reconnect")
     sse2.close()
 

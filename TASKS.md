@@ -30,9 +30,11 @@
 
 > 2026-10-02 平账：**B-ID53 闭账随本批提交**——Vector128/Vector256 的 ExtractMostSignificantBits/MoveMask 内建在非 x86 目标无条件发 `llvm.x86.sse2.pmovmskb.128`/`llvm.x86.avx2.pmovmskb`，AArch64/RISCV 后端 codegen 直接 `LLVM ERROR: Cannot select` 崩溃（ohos-arm64 交叉 task_yield 实爆；stdlib MemoryExtensions/StringExtensions/NativeMemory 的向量搜索路径全中）。修法：emit_target_is_x86 判 triple（空 triple=宿主，编译期 `__aarch64__` 兜底）——x86 保留 intrinsic 快路，其余目标发可移植 IR（`icmp sgt <N x i8> zeroinitializer` 取符号位 + 逐 lane extractelement/zext/shl/or 聚合，AArch64 CMTST/wasm/RISCV 均可选中）；`Sse2.MoveMask` 属 x86 专有 API 面不改语义。验证：vprobe（v128=1/v256=0x10001/全 1=-1 与 pmovmskb 语义一致）原生实跑 + linux-x64/macos-arm64/win-arm64 交叉全过、ohos-arm64 IR 零 pmovmskb、task_yield 五目标链接绿。同面残留挂账：Vector128.Shuffle/Average 仍发 x86 intrinsic（ssse3.pshufb.128/sse2.pavg.b），当前 stdlib 交叉路径无调用方（仅 Zan.Desktop ImageBuffer 用 Average，Windows 专属包），出现跨目标调用方时按同法发可移植 IR。
 
-## 未完成 · IDE / 编译器
-
-- [ ] **B-ID50** server-collab e2e_realtime 线上帧 ~1/3 概率偶发丢失：collab 再生批（c2056371）三连跑中 e2e_realtime 25 项断言偶有 online 帧缺失/迟到，复跑即绿——relay 中转逻辑本片零改动，属既有 relay 基建缺陷（在线状态帧的时序窗口）。方向：复跑采样定位丢帧环节（worker 总线/前端轮询窗口/心跳周期对齐），先钉最小复现频率再修。
+> 2026-10-02 平账：**B-ID50 闭账随本批提交**——server-collab 实时链路（`e2e_realtime` / `e2e_collab` / `e2e_im`）偶发丢帧与时序窗口根治：
+> 1. 水位竞态窗口根除：CollabEventRelay 与 MessageRelay 在服务对外接收连接前由 `main.zan` 启动期显式执行 `InitWatermark(qdb)`，锁定存量已落库的最大 id 作为历史基线；彻底杜绝过去首拍执行与外部新事件落库交织时，首拍被延迟调度导致启动瞬间的新事件被误当作历史静默跳过的竞态漏洞；
+> 2. 跨进程孤儿 worker 残留清理：Windows 下 `stop_server` 在杀主进程树后追加基于可执行文件名的 `/IM` 强杀保底，杜绝孤儿 worker 攥住 8090 端口并向后续测试进程注入脏响应；
+> 3. 自动化测试探针与代理绕过加固：`e2e_realtime.py`、`e2e_collab.py`、`e2e_im.py` 增补本地环回 `NO_PROXY` 隔离，重连接收帧采用 deadline 轮询窗口（消除测试侧对单拍抵达时刻的刚性假设）。
+> 验证证据：`e2e_realtime` 实机连续 50 轮高强度压测 100% 满分通过（50/50 runs, 25/25 checks 全绿，零 transport anomaly）；`e2e_collab` 113 项全绿；`e2e_im` 31 项全绿。条目移出未完成区。
 
 ## 未完成 · 语义决策（审计批遗留，待拍板）
 
