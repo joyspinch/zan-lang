@@ -310,7 +310,7 @@ static int zan_wav_parse(const unsigned char *b, int n, ZanAudioClip *c) {
     const unsigned char *data = NULL;
     int fmt_len = 0, data_len = 0;
     int fmt_tag = 0, fmt_bits = 0, fmt_ch = 0, fmt_freq = 0;
-    int pos;
+    int64_t pos;
 
     if (n < 12 || memcmp(b, "RIFF", 4) != 0 || memcmp(b + 8, "WAVE", 4) != 0) {
         zan_audio_set_err("not a RIFF/WAVE file");
@@ -318,18 +318,27 @@ static int zan_wav_parse(const unsigned char *b, int n, ZanAudioClip *c) {
     }
     pos = 12;
     while (pos + 8 <= n) {
-        unsigned int len = zan_wav_u32(b + pos + 4);
+        /* Chunk lengths are u32 in the spec. Everything they feed -- the
+         * in-bounds test, the data clamp and the word-aligned skip -- must
+         * stay unsigned/wide: a (int) cast turns len >= 2^31 negative, the
+         * fmt bound tautologically true and the skip lands pos near -2 GiB,
+         * walking the loop off the front of the buffer (B-ID71). */
+        uint32_t len = zan_wav_u32(b + pos + 4);
+        if (len >= 0x80000000u) {
+            zan_audio_set_err("wav chunk length out of range");
+            return 0;
+        }
         if (memcmp(b + pos, "fmt ", 4) == 0 && !fmt && len >= 16
-            && pos + 8 + (int)len <= n) {
+            && pos + 8 + (int64_t)len <= n) {
             fmt = b + pos + 8;
             fmt_len = (int)len;
         } else if (memcmp(b + pos, "data", 4) == 0 && !data) {
             data_len = (int)len;
-            if (pos + 8 + data_len > n) data_len = n - pos - 8; /* tolerate lying headers */
+            if (pos + 8 + (int64_t)data_len > n) data_len = (int)(n - pos - 8); /* tolerate lying headers */
             data = b + pos + 8;
         }
         if (fmt && data) break;
-        pos += 8 + (int)((len + 1) & ~1u); /* chunks are word-aligned */
+        pos += 8 + (int64_t)((len + 1u) & ~1u); /* chunks are word-aligned */
     }
     if (!fmt || !data || data_len <= 0) {
         zan_audio_set_err("wav fmt/data chunk missing or empty");
@@ -436,7 +445,10 @@ static void zan_audio_mix(unsigned char *dst, UINT32 frames) {
     int total;
 
     if (frames > ZAN_AUDIO_MAX_FILL) frames = ZAN_AUDIO_MAX_FILL;
-    if (devch < 1) devch = 2;
+    /* Three-way clamp, same as mix_s16/mix_f32 below: a bogus device count
+     * (0 or a hostile >MAX_CHANNELS) would otherwise size the static
+     * accumulator past its ZAN_AUDIO_MAX_CHANNELS stride (B-ID71). */
+    if (devch < 1 || devch > ZAN_AUDIO_MAX_CHANNELS) devch = 2;
     total = (int)frames * devch;
     memset(acc, 0, sizeof(float) * (size_t)total);
 
