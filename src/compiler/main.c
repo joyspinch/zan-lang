@@ -4261,7 +4261,10 @@ int main(int argc, char **argv) {
     bool publish_mode = false;
     int obfuscate_strings_opt = -1;
     bool debug_info = false; /* -g / --debug: emit DWARF for source debugging */
-    bool fast_alloc = false;
+    /* Small-object allocator link policy: 0 = default (native links it),
+     * 1 = --fast-alloc, -1 = --no-fast-alloc. Kept tri-state so the
+     * "no allocator object" warning only fires when the user asked. */
+    int fast_alloc_opt = 0;
     const char *stdlib_path = NULL;
     bool auto_stdlib = true;
     bool packages_disabled = false;
@@ -4352,14 +4355,15 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--debug") == 0) {
             debug_info = true;
         } else if (strcmp(argv[i], "--fast-alloc") == 0) {
-            /* Link the small-object allocator (src/runtime/rt_mem.c) in front
-             * of the CRT's malloc: per-thread caches, size-class free lists
-             * and owner-directed cross-thread frees, which is what an ARC
-             * program's one-block-per-string/object/frame traffic wants.
-             * Opt-in on native Windows because it wraps malloc/free for the
-             * whole image: a block that crosses into a DLL carrying its own
-             * CRT and is freed there would not come back through our free. */
-            fast_alloc = true;
+            fast_alloc_opt = 1;
+        } else if (strcmp(argv[i], "--no-fast-alloc") == 0) {
+            /* Both flags exist so either side can win a command line without
+             * depending on option order: --fast-alloc is a no-op by default
+             * now, and --no-fast-alloc restores the plain CRT allocator for
+             * runs that must not ride the wrapped malloc (a
+             * heap-diagnosis session, a driver boundary that hands blocks to
+             * a foreign CRT). */
+            fast_alloc_opt = -1;
         } else if (strcmp(argv[i], "--link-mode") == 0 && i + 1 < argc) {
             const char *m = argv[++i];
             if (strcmp(m, "static") == 0) link_static_drivers = true;
@@ -6580,13 +6584,19 @@ int main(int argc, char **argv) {
             rt_timer_obj = rt_timer_buf;
         }
 #endif
-        /* Small-object allocator (--fast-alloc): wraps malloc/free/calloc/
-         * realloc for the whole image, so it is only linked when asked for. */
+        /* Small-object allocator (rt_mem.c): wraps malloc/free/calloc/realloc
+         * for the whole image. Native default since 2026-10 -- per-thread
+         * caches and owner-directed cross-thread frees are what an ARC
+         * program's one-block-per-string/object/frame traffic wants, and the
+         * measured cases (spawn k=1 -31%, fanout k=32 no worse after remote
+         * sharding) beat the CRT on every shape tried. --no-fast-alloc opts
+         * out. ld64 has no --wrap, so Mach-O native builds never link it
+         * (mirrors the shared-lib link guard); Android cross never links it
+         * (bionic TLS bootstrap); linux-musl cross auto-links its own copy
+         * from the sysroot when present. */
+        bool fast_alloc = fast_alloc_opt >= 0;
         const char *rt_mem_obj = NULL;
 #ifdef ZAN_RT_MEM_OBJ
-        /* ld64 has no --wrap, so Mach-O native builds never link the
-         * allocator (mirrors the shared-lib link guard); the warning below
-         * tells the user instead of failing the link. */
         if (fast_alloc && !cross_compiling &&
             target.os != ZAN_OS_MACOS && target.os != ZAN_OS_IOS) {
             snprintf(rt_mem_buf, sizeof(rt_mem_buf), "%s/%s",
@@ -6594,7 +6604,7 @@ int main(int argc, char **argv) {
             if (zan_file_exists(rt_mem_buf)) rt_mem_obj = rt_mem_buf;
         }
 #endif
-        if (fast_alloc && !rt_mem_obj) {
+        if (fast_alloc_opt == 1 && !rt_mem_obj) {
             fprintf(stderr,
                     "warning: --fast-alloc ignored: no allocator object for "
                     "this target\n");
