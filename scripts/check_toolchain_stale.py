@@ -41,6 +41,7 @@ RT_WASM = ["src/runtime/rt_wasm.c"]   # zanrt_wasm.o compiles rt_wasm.c only; rt
                                      # links alongside as its own object (build_cross_rt.cmd)
 RT_GUI_MAC = ["src/runtime/gui_compat_mac.c"]
 ANDROID_NDK = []  # NDK-derived: no repo source drives it; never "stale" by src
+OHOS_NDK = []     # same for the OHOS SDK sysroot subset (libc.a, crt*, builtins)
 GUI = ["src/runtime/gui_runtime.c", "src/runtime/gui_runtime_text.c",
        "src/runtime/gui_runtime_font.c", "src/runtime/gui_runtime_x11.c",
        "src/runtime/gui_runtime_tray.c", "src/runtime/gui_runtime_sdl.c",
@@ -108,36 +109,53 @@ ARTIFACTS = [
     ("toolchain/android-arm64/crtbegin_static.o", ANDROID_NDK, "manual"),
     ("toolchain/android-arm64/crtend_android.o", ANDROID_NDK, "manual"),
     ("toolchain/android-arm64/libclang_rt.builtins.a", ANDROID_NDK, "manual"),
-    # OpenHarmony (OHOS) runtime objects: built with the OHOS NDK's clang per
-    # the recipe in build_cross_rt.cmd (target *-linux-ohos, musl sysroot).
-    ("toolchain/ohos-x64/zanrt_io.o", RT_IO, "manual"),
-    ("toolchain/ohos-x64/zanrt_sync.o", RT_SYNC, "manual"),
-    ("toolchain/ohos-x64/zanrt_file.o", RT_FILE, "manual"),
-    ("toolchain/ohos-x64/zanrt_timer.o", RT_TIMER, "manual"),
-    ("toolchain/ohos-arm64/zanrt_io.o", RT_IO, "manual"),
-    ("toolchain/ohos-arm64/zanrt_sync.o", RT_SYNC, "manual"),
-    ("toolchain/ohos-arm64/zanrt_file.o", RT_FILE, "manual"),
-    ("toolchain/ohos-arm64/zanrt_timer.o", RT_TIMER, "manual"),
+
+    # OHOS: the source-derived objects rebuild on any host via the zig
+    # fallback (scripts/build_ohos_rt_zig.sh: zig's bundled musl headers +
+    # -D__OHOS__, arm64 timer -mcpu=generic+sha2; proven 2026-10-02). The
+    # NDK/sysroot subset below tracks the OHOS SDK, not repo sources.
+    ("toolchain/ohos-arm64/zanrt_io.o", RT_IO, "runtime"),
+    ("toolchain/ohos-arm64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/ohos-arm64/zanrt_file.o", RT_FILE, "runtime"),
+    ("toolchain/ohos-arm64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/ohos-arm64/zan_embed_api.o",
+     ["src/runtime/zan_embed_api.c", "src/runtime/rt_timer.h"], "runtime"),
+    ("toolchain/ohos-arm64/zan_inflate.o",
+     ["src/runtime/zan_inflate.c", "src/common/miniz_tinfl.c"], "runtime"),
+    ("toolchain/ohos-arm64/zap_main.o", ["toolchain/ohos-x64/zap_main.c"], "runtime"),
+    ("toolchain/ohos-arm64/libEGL.so", ["scripts/ohos_stub.c"], "manual"),
+    ("toolchain/ohos-arm64/libGLESv3.so", ["scripts/ohos_stub.c"], "manual"),
+    ("toolchain/ohos-x64/zanrt_io.o", RT_IO, "runtime"),
+    ("toolchain/ohos-x64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/ohos-x64/zanrt_file.o", RT_FILE, "runtime"),
+    ("toolchain/ohos-x64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/ohos-x64/zan_embed_api.o",
+     ["src/runtime/zan_embed_api.c", "src/runtime/rt_timer.h"], "runtime"),
+    ("toolchain/ohos-x64/zan_inflate.o",
+     ["src/runtime/zan_inflate.c", "src/common/miniz_tinfl.c"], "runtime"),
+    ("toolchain/ohos-x64/zap_main.o", ["toolchain/ohos-x64/zap_main.c"], "runtime"),
+    ("toolchain/ohos-x64/libEGL.so", ["scripts/ohos_stub.c"], "manual"),
+    ("toolchain/ohos-x64/libGLESv3.so", ["scripts/ohos_stub.c"], "manual"),
     # The OHOS NDK sysroot subset (crt + libc.a + compiler-rt builtins/unwind)
-    # tracks the NDK itself, not repo sources -- report-only, refreshed by
+    # tracks the SDK itself, not repo sources -- report-only, refreshed by
     # hand. libm.a/libdl.a are empty archives in the OHOS sysroot and are not
     # committed.
-    ("toolchain/ohos-x64/libc.a", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-x64/crt1.o", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-x64/crti.o", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-x64/crtn.o", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-x64/clang_rt.crtbegin.o", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-x64/clang_rt.crtend.o", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-x64/libclang_rt.builtins.a", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-x64/libunwind.a", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-arm64/libc.a", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-arm64/crt1.o", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-arm64/crti.o", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-arm64/crtn.o", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-arm64/clang_rt.crtbegin.o", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-arm64/clang_rt.crtend.o", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-arm64/libclang_rt.builtins.a", ANDROID_NDK, "manual"),
-    ("toolchain/ohos-arm64/libunwind.a", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-arm64/libc.a", OHOS_NDK, "manual"),
+    ("toolchain/ohos-arm64/crt1.o", OHOS_NDK, "manual"),
+    ("toolchain/ohos-arm64/crti.o", OHOS_NDK, "manual"),
+    ("toolchain/ohos-arm64/crtn.o", OHOS_NDK, "manual"),
+    ("toolchain/ohos-arm64/clang_rt.crtbegin.o", OHOS_NDK, "manual"),
+    ("toolchain/ohos-arm64/clang_rt.crtend.o", OHOS_NDK, "manual"),
+    ("toolchain/ohos-arm64/libclang_rt.builtins.a", OHOS_NDK, "manual"),
+    ("toolchain/ohos-arm64/libunwind.a", OHOS_NDK, "manual"),
+    ("toolchain/ohos-x64/libc.a", OHOS_NDK, "manual"),
+    ("toolchain/ohos-x64/crt1.o", OHOS_NDK, "manual"),
+    ("toolchain/ohos-x64/crti.o", OHOS_NDK, "manual"),
+    ("toolchain/ohos-x64/crtn.o", OHOS_NDK, "manual"),
+    ("toolchain/ohos-x64/clang_rt.crtbegin.o", OHOS_NDK, "manual"),
+    ("toolchain/ohos-x64/clang_rt.crtend.o", OHOS_NDK, "manual"),
+    ("toolchain/ohos-x64/libclang_rt.builtins.a", OHOS_NDK, "manual"),
+    ("toolchain/ohos-x64/libunwind.a", OHOS_NDK, "manual"),
     ("packages/Zan.Gui/src/Gui/drivers/win-x64/zan_gui.dll", GUI, "gui"),
     ("packages/Zan.Gui/src/Gui/drivers/linux-x64/static/libzan_gui.a", GUI, "gui"),
     ("packages/Zan.Gui/src/Gui/drivers/linux-arm64/static/libzan_gui.a", GUI, "gui"),
@@ -218,8 +236,8 @@ def _find_ndk():
 def rebuild_cmd(artifact, zig, ndk):
     """The exact compile that (re)produces `artifact` locally, or None when
     this machine has no builder for it (GUI drivers need the target platform;
-    ohos needs its NDK, whose sysroot headers zig does not carry). Mirrors
-    do_rebuild / build_cross_rt.cmd flag for flag."""
+    the ohos stub .so pair is NDK-built by hand). Mirrors do_rebuild /
+    build_cross_rt.cmd flag for flag."""
     rt = "src/runtime"
     d, name = os.path.split(artifact.replace("\\", "/"))
     if d.startswith("toolchain/"):
@@ -248,6 +266,40 @@ def rebuild_cmd(artifact, zig, ndk):
                 + ([] if src == "rt_io.c" else c11)
                 + (["-DZAN_IO_STACKLESS_ONLY"] if src == "rt_io.c" else [])
                 + ["-c", f"{rt}/{src}"])
+    elif d.startswith("ohos-"):
+        # Mirror scripts/build_ohos_rt_zig.sh flag for flag (the NDK path in
+        # build_cross_rt.cmd must stay identical too): zig's musl headers plus
+        # -D__OHOS__ stand in for the NDK sysroot, and the objects link clean
+        # against the committed OHOS musl libc.a subset. zig 0.15 confirms the
+        # rebuild is byte-identical regardless of source-path style.
+        if not zig:
+            return None
+        arch = "aarch64" if d.endswith("arm64") else "x86_64"
+        if name == "zap_main.o":
+            # HAP shell adapter: no -D__OHOS__, no runtime includes.
+            return [zig, "cc", "-target", f"{arch}-linux-musl", "-g0", "-std=c11",
+                    "-fPIC", "-O2", "-c", "toolchain/ohos-x64/zap_main.c"]
+        table = {
+            "zanrt_io.o":
+                (["-DZAN_IO_STACKLESS_ONLY", "-I", rt, "-c", f"{rt}/rt_io.c"]),
+            "zanrt_sync.o":
+                (c11 + ["-I", rt, "-c", f"{rt}/rt_sync.c"]),
+            "zanrt_file.o":
+                (c11 + ["-I", rt, "-c", f"{rt}/rt_file.c"]),
+            "zanrt_timer.o":
+                (c11 + (["-mcpu=generic+sha2"] if arch == "aarch64" else [])
+                    + ["-I", rt, "-c", f"{rt}/rt_timer.c"]),
+            "zan_embed_api.o":
+                (c11 + ["-I", rt, "-I", "src/common", "-c", f"{rt}/zan_embed_api.c"]),
+            "zan_inflate.o":
+                (c11 + ["-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS",
+                        "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME", "-I", rt, "-I", "src/common",
+                        "-c", f"{rt}/zan_inflate.c"]),
+        }
+        if name not in table:
+            return None  # stub libEGL.so/libGLESv3.so: NDK-built by hand
+        return ([zig, "cc", "-target", f"{arch}-linux-musl", "-D__OHOS__",
+                 "-g0", "-fPIC", "-O2"] + table[name])
     else:
         return None
     if not zig:
@@ -356,6 +408,11 @@ def do_rebuild():
         subprocess.run([zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=c11", "-I", rt, "-O2", "-c", f"{rt}/rt_timer.c", "-o", f"{outdir}/zanrt_timer.o"], check=True)
         subprocess.run([zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11", "-I", rt, "-I", f"{rt}/libwebp/src", "-O2", "-c", f"{rt}/gui_runtime.c", "-o", f"{outdir}/zanrt_gui.o", "-DZAN_GUI_WASM"], check=True)
         subprocess.run([zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11", "-I", rt, "-O2", "-c", f"{rt}/rt_sync_wasm.c", "-o", f"{outdir}/zanrt_syncw.o"], check=True)
+
+        # ohos: delegate to the proven NDK-free recipe rather than duplicating
+        # its flag table here (same call shape as build_cross_rt.cmd's fallback).
+        print("Building ohos (via scripts/build_ohos_rt_zig.sh)...")
+        subprocess.run(["bash", "scripts/build_ohos_rt_zig.sh", zig.replace("\\", "/")], check=True)
 
     if ndk:
         clang = os.path.join(ndk, r"toolchains\llvm\prebuilt\windows-x86_64\bin\clang.exe")
