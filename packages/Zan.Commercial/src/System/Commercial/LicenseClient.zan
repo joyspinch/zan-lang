@@ -56,7 +56,10 @@ class LicenseCheckResult {
 ///   if (!r.ok) { Console.WriteLine(r.message); return; }
 ///
 /// 状态持久化在用户目录下（默认 ~/.zan-license/<product>/license.json），
-/// 剥离即回到未激活。SDK 从不通过网络传输任何明文密码——账号模式
+/// 状态文件带 HMAC-SHA256 认证（密钥由本机指纹派生，跨机拷贝/手改
+/// 字段都会校验失败回落到未激活）；signed 模式额外要求发行方 RSA 公钥
+/// 验签证书（VendorPublicKey 配置后强制，fail-closed）。剥离状态目录
+/// 即回到未激活。SDK 从不通过网络传输任何明文密码——账号模式
 /// 只上送服务端校验后的会话令牌。所有网络失败都返回结果对象而非
 /// 抛异常，宿主程序绝不因授权探测崩溃。</summary>
 class LicenseClient {
@@ -68,6 +71,10 @@ class LicenseClient {
     string product;
     /// 已加载的持久状态（null = 未加载）。
     LicenseState state;
+    /// 发行方 RSA 公钥（hex 模数/指数）。配置后 signed 模式强制验签：
+    /// 证书缺失/验签失败一律拒绝（fail-closed）。
+    string vendorKeyHex = "";
+    string vendorKeyExpHex = "010001";
 
     static LicenseClient shared;
 
@@ -90,6 +97,127 @@ class LicenseClient {
     /// 产品标识。
     void Product(string productId) {
         this.product = productId;
+    }
+
+    /// <summary>配置发行方 RSA 公钥（hex 模数、hex 指数）。配置后
+    /// signed 模式强制验签：本地证书无签名或验签失败即拒绝（fail-closed）；
+    /// 不配置则 signed 模式直接视为无效状态——离线证书没有可验证的
+    /// 信任锚就不该被采信。</summary>
+    void VendorPublicKey(string modulusHex, string exponentHex) {
+        this.vendorKeyHex = modulusHex != null ? modulusHex.ToLower() : "";
+        this.vendorKeyExpHex = exponentHex != null && exponentHex.Length > 0
+            ? exponentHex.ToLower() : "010001";
+    }
+
+    // ---- 状态文件认证（B-ID68：license.json 零认证修复） ----
+
+    /// 离线证书的规范化签名负载（与 MakeCertificate 逐字节一致）。
+    static string CertCanonical(string product, string deviceFp,
+                                string subject, long expiresAt) {
+        return "zan-cert-v1|" + product + "|" + deviceFp + "|" + subject
+            + "|" + Convert.ToString(expiresAt);
+    }
+
+    /// <summary>发行方签发离线证书（发布侧工具，与服务端模板配合）：
+    /// 用 RSA 私钥对 CertCanonical 做 RSASSA-PKCS1-v1_5/SHA-256 签名，
+    /// 返回可直接交给 InstallCertificate 的证书 JSON。长度一律取自
+    /// hex 字符串（Zan byte[] 的 Length 带尾部 NUL 槽，不可作长度）。</summary>
+    static string MakeCertificate(string product, string deviceFp,
+                                  string subject, long expiresAt,
+                                  string modulusHex, string privateExponentHex) {
+        if (modulusHex == null || privateExponentHex == null
+            || modulusHex.Length == 0 || (modulusHex.Length % 2) != 0
+            || privateExponentHex.Length == 0 || (privateExponentHex.Length % 2) != 0) {
+            return "";
+        }
+        string canonical = LicenseClient.CertCanonical(product, deviceFp, subject, expiresAt);
+        byte[] nBuf = Hex.Decode(modulusHex);
+        byte[] dBuf = Hex.Decode(privateExponentHex);
+        byte[] sig = Rsa.SignPkcs1Sha256(canonical, canonical.Length, nBuf,
+            modulusHex.Length / 2, dBuf, privateExponentHex.Length / 2);
+        if (sig == null) { return ""; }
+        string sigHex = Hex.Encode(sig, modulusHex.Length / 2);
+        JsonValue o = JsonValue.NewObject();
+        o.PutStr("product", product);
+        o.PutStr("device_fp", deviceFp);
+        o.PutStr("subject", subject);
+        o.Put("expires_at", JsonValue.NewNum(Convert.ToString(expiresAt)));
+        o.PutStr("sig", sigHex);
+        return o.ToJson();
+    }
+
+    /// 状态认证密钥：由本机指纹派生（换机/换用户即换钥匙，跨机拷贝
+    /// 的状态文件在这里就失效）。HMAC 密钥不落盘。
+    string StateAuthKey() {
+        return "zan-lic-key-v1|" + this.DeviceFp();
+    }
+
+    /// 状态字段的规范化串（Persist 与 EnsureLoaded 两侧唯一真相）。
+    static string StateCanonical(LicenseState s) {
+        return "zan-lic-v1|" + s.mode + "|" + s.product + "|" + s.subject
+            + "|" + s.deviceFp + "|" + s.sessionToken + "|"
+            + Convert.ToString(s.expiresAt) + "|"
+            + Convert.ToString(s.graceSeconds) + "|"
+            + Convert.ToString(s.lastHeartbeat) + "|" + s.salt;
+    }
+
+    /// 计算状态 HMAC-SHA256（hex）。salt 参与规范化：改字段必须连
+    /// MAC 一起重算，而重算需要本机因子派生的密钥。
+    string StateAuth(LicenseState s) {
+        string canonical = LicenseClient.StateCanonical(s);
+        byte[] mac = Hmac.Sha256Mac(this.StateAuthKey(), this.StateAuthKey().Length,
+            canonical, canonical.Length);
+        return Hex.Encode(mac, mac.Length);
+    }
+
+    /// 本地状态认证是否成立（常数时间比较，防逐字节探测）。
+    bool StateAuthOk() {
+        if (this.state.mac.Length == 0) { return false; }
+        string expected = this.StateAuth(this.state);
+        return Jwt.fixedEquals(this.state.mac, this.state.mac.Length,
+            expected, expected.Length);
+    }
+
+    /// signed 模式的证书验签：发行方公钥已配置 + 证书签名存在且有效。
+    bool SignedCertOk() {
+        if (this.vendorKeyHex.Length == 0) { return false; }
+        if (this.state.certSig.Length == 0) { return false; }
+        int k = this.vendorKeyHex.Length / 2;
+        if (this.state.certSig.Length != 2 * k) { return false; }
+        string canonical = LicenseClient.CertCanonical(this.state.product,
+            this.state.deviceFp, this.state.subject, this.state.expiresAt);
+        byte[] sig = Hex.Decode(this.state.certSig);
+        byte[] nBuf = Hex.Decode(this.vendorKeyHex);
+        byte[] eBuf = Hex.Decode(this.vendorKeyExpHex);
+        return Rsa.VerifyPkcs1Sha256(canonical, canonical.Length, sig,
+            nBuf, k, eBuf, this.vendorKeyExpHex.Length / 2);
+    }
+
+    /// <summary>安装发行方签发的离线证书（signed 模式激活入口）。
+    /// 本地只落盘不判真伪；Check() 时按 VendorPublicKey 验签
+    /// （fail-closed）。解析失败返回结果对象。</summary>
+    LicenseCheckResult InstallCertificate(string certJson) {
+        LicenseCheckResult bad = LicenseCheckResult.Fail("bad_state",
+            "证书格式非法，请向发行方索取完整证书");
+        if (certJson == null || certJson.Length == 0) { return bad; }
+        JsonValue o = JsonValue.ParseLenient(certJson);
+        if (o == null || !o.IsObject()) { return bad; }
+        string sig = o.Str("sig", "");
+        if (sig.Length == 0) { return bad; }
+        LicenseState s = new LicenseState();
+        s.mode = "signed";
+        s.product = o.Str("product", this.product);
+        s.subject = o.Str("subject", "");
+        s.deviceFp = o.Str("device_fp", "");
+        s.expiresAt = o.Long("expires_at", 0);
+        s.certSig = sig.ToLower();
+        this.state = s;
+        this.Persist();
+        LicenseCheckResult r = new LicenseCheckResult();
+        r.ok = true;
+        r.expiresAt = s.expiresAt;
+        r.message = "证书已安装（有效性在下次 Check 时验证）";
+        return r;
     }
 
     // ---- 本机指纹（隐私纪律：只传哈希，不传原始主机/用户名） ----
@@ -137,6 +265,11 @@ class LicenseClient {
                     this.state.expiresAt = o.Long("expires_at", 0);
                     this.state.graceSeconds = o.Int("grace_seconds", 0);
                     this.state.lastHeartbeat = o.Long("last_seen", 0);
+                    // 状态认证三元组：无 auth 的旧格式文件会被 Check()
+                    // 判为篡改态作废（fail-closed 迁移）。
+                    this.state.salt = o.Str("salt", "");
+                    this.state.mac = o.Str("auth", "").ToLower();
+                    this.state.certSig = o.Str("sig", "").ToLower();
                 }
             }
         } catch (Exception ex) {
@@ -144,9 +277,17 @@ class LicenseClient {
         }
     }
 
-    /// 把当前状态写回磁盘；失败静默（最坏情况是重新激活一次）。
+    /// 把当前状态写回磁盘（带 HMAC 认证字段）；失败静默（最坏情况是
+    /// 重新激活一次）。
     void Persist() {
         try {
+            if (this.state.salt.Length == 0) {
+                byte[] salt = RandomNumberGenerator.GetBytes(32);
+                this.state.salt = salt != null ? Hex.Encode(salt, 32) : "";
+            }
+            // 内存态同步：auth 既写进文件也留在 state 上，Persist 后
+            // 不重载文件直接 Check() 也要能过认证。
+            this.state.mac = this.StateAuth(this.state);
             Directory.CreateDirectoryRecursive(this.StateDir());
             JsonValue o = JsonValue.NewObject();
             o.Put("mode", JsonValue.NewStr(this.state.mode));
@@ -160,6 +301,11 @@ class LicenseClient {
                 Convert.ToString(this.state.graceSeconds)));
             o.Put("last_seen", JsonValue.NewNum(
                 Convert.ToString(this.state.lastHeartbeat)));
+            o.Put("salt", JsonValue.NewStr(this.state.salt));
+            o.Put("auth", JsonValue.NewStr(this.StateAuth(this.state)));
+            if (this.state.certSig.Length > 0) {
+                o.Put("sig", JsonValue.NewStr(this.state.certSig));
+            }
             File.WriteAllText(this.StatePath(), o.ToJson());
         } catch (Exception ex) {
             // 持久化失败不影响本次校验结论。
@@ -188,10 +334,20 @@ class LicenseClient {
     }
 
     /// <summary>总校验入口：启动时与需要时调用。本地有效即放行
-    /// （online 模式带最后心跳+宽限期），否则联网复检。绝不抛异常。</summary>
+    /// （online 模式带最后心跳+宽限期），否则联网复检。绝不抛异常。
+    /// 本地状态先过 HMAC 认证：认证失败（手改字段/跨机拷贝/旧格式）
+    /// 一律作废本地状态，绝不按其内容放行。</summary>
     async LicenseCheckResult Check() {
         this.EnsureLoaded();
         long now = DateTime.UtcNow().ToUnixSeconds();
+        // 0) 状态认证：HMAC 不成立 = 文件被篡改或来自别的机器。
+        //    内容整体不可信：清空本地状态，只把会话令牌留给静默重登
+        //    （令牌真伪由服务端裁决，本地不凭它放行）。
+        if (this.state.mode.Length > 0 && !this.StateAuthOk()) {
+            string savedSession = this.state.sessionToken;
+            this.state = new LicenseState();
+            this.state.sessionToken = savedSession;
+        }
         // 1) 本地状态检查：产品一致 + 未过期。
         if (this.state.mode.Length > 0 && this.state.product == this.product) {
             if (this.state.expiresAt != 0 && this.state.expiresAt <= now) {
@@ -203,8 +359,13 @@ class LicenseClient {
                 return LicenseCheckResult.Fail("device_mismatch",
                     "授权绑定在其他设备，请在服务端解绑后重新激活");
             }
-            // signed 证书模式：本地有效即可用（离线软件）。
+            // signed 证书模式：本地状态认证 + 发行方公钥验签双门槛，
+            // 缺一即拒绝——手写一个 mode=signed 的 JSON 不再是终身授权。
             if (this.state.mode == "signed") {
+                if (!this.SignedCertOk()) {
+                    return LicenseCheckResult.Fail("bad_state",
+                        "离线证书验证失败（缺发行方公钥/证书被改/未签名），请重新安装证书");
+                }
                 return this.OkResult(now);
             }
             // account/code/online：本地在宽限期内放行并后台复检。
@@ -439,6 +600,9 @@ class LicenseState {
         this.subject = "";
         this.deviceFp = "";
         this.sessionToken = "";
+        this.salt = "";
+        this.mac = "";
+        this.certSig = "";
     }
 
     /// account / code / signed / online（登录/激活时服务端下发）。
@@ -451,6 +615,12 @@ class LicenseState {
     public string deviceFp;
     /// 会话令牌（服务端可吊销；本地只存，不签发）。
     public string sessionToken;
+    /// 状态 HMAC 的盐（随机生成落盘；密钥由本机因子派生不落盘）。
+    public string salt;
+    /// 状态 HMAC-SHA256（hex）。缺失/不符 = 状态被篡改或跨机拷贝。
+    public string mac;
+    /// signed 模式的离线证书签名（hex，发行方 RSA 私钥签发）。
+    public string certSig;
     /// 授权到期 epoch 秒；0 = 终身。
     public long expiresAt;
     /// 掉线宽限秒数（服务端策略下发）。

@@ -17,7 +17,16 @@
   3. `signed` —— 离线签名证书授权（基于非对称加密验签，全程无网环境可用）。
   4. `online` —— 在线动态会话模式（支持心跳续期与掉线宽限期 graceSeconds）。
 - **设备指纹感知**：自动采集并匹配机器特征指纹，防范一码多机盗版。
-- **本地持久化与防篡改**：授权状态加密保存在用户目录（`~/.zan-license/<product>/license.json`）。
+- **本地持久化与防篡改**：授权状态保存在用户目录（`~/.zan-license/<product>/license.json`），
+  带 HMAC-SHA256 认证——密钥由本机指纹派生（不落盘），手改字段或跨机拷贝状态文件
+  一律校验失败回落到未激活；旧格式（无 auth 字段）文件按篡改态作废。
+- **signed 模式双门槛（fail-closed）**：本地状态 HMAC 认证之外，还要求用
+  `lic.VendorPublicKey(nHex, eHex)` 配置发行方 RSA 公钥并对证书验签；未配置公钥或
+  证书签名不符即拒绝。发行方签发证书用 `LicenseClient.MakeCertificate(product,
+  deviceFp, subject, expiresAt, nHex, dHex)`（RSA 私钥 hex），客户端经
+  `lic.InstallCertificate(certJson)` 安装。
+  注意：HMAC 的密钥在本机可推导，防的是"改字段/拷机器"这类低门槛篡改；
+  高价值产品必须使用 signed 模式（攻击者无私钥无法伪造证书）。
 - **非阻塞与高健壮性**：网络故障、超时统一返回结构化结果对象，不中断程序正常退出流程。
 
 ---
