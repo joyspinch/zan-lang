@@ -527,6 +527,16 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - **16MiB 溢出边界**：RFC 分块大小由十六进制串表示，客户端与服务端必须在每位累加时（`v = v * 16 + d`）校验 `v > 16777215`（0x00FFFFFF，16MiB-1）。若无上限，超长十六进制串会导致 32 位整型回绕成负数，下游 `need = crlf + 2 + size + 2` 算得负数直接杀死进程。
 - **回归锁定**：`ctest -R "http_chunk_len_overflow|http_framing|http_smuggling"` 孪生全过。
 
+## Redis RESP 协议与大数据量安全：512MB 单块上限与 100 万数组递归防线
+
+- **病灶**：在 `RedisClient` 解码 RESP 协议报文时，原先对 `$` bulk 字符串仅读取长度 `blen` 并直接无条件传入 `ensureAvailable(n + 2)`；对 `*` 数组同样根据 `count` 循环调用 `readReply()`。
+- **危害**：
+  1. Redis 官方规范（RESP spec）明确定义单个 bulk string 的绝对硬上限为 512MB；
+  2. 恶意或畸形对端若发送 `$2000000000\r\n`，`blen` 将达到约 2GB，客户端在 `ensureRoom` 时会触发连续扩容直至撑爆内存抛出 OOM 崩溃；
+  3. 恶意报文若发送超大数组 `*100000000\r\n`，客户端会在堆上直接分配容纳一亿个元素的 `List<RedisReply>` 并进入深层递归解析，造成严重的对象风暴与拒绝服务攻击；
+  4. 落地防御：严格钳制 `blen <= 536870912`（512MB），数组元素数 `count <= 1048576`（100 万），超限立即返回 protocol error 并安全切断连接，从源头封堵 OOM 慢滴与超大畸形包攻击。
+- **回归锁定**：`ctest -R "redis_client|redis_pool|redis_tls"` 12 项全套孪生测试 100% 全部通过。
+
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
 - **症状**：浏览器 `WebAssembly.instantiate` 报 `Compiling function #N:"X"
