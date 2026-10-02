@@ -1157,11 +1157,24 @@ static int pi_filter_active = 0;
  * partial siblings -- must flag normally instead of being suppressed as
  * user shadowing. */
 static int pi_seed_stdlib_input = 0;
+/* 1 while seeding a stdlib-authored source: flag helpers also stamp
+ * flagged_stdlib, the repair trigger's source gate (B-ID87). Set by the
+ * parse loops around pi_seed_parsed_unit/pi_seed_source, never nested. */
+static int pi_seeding_stdlib = 0;
+/* 1 while the repair walk metadata-scans a file: pi_note_using must not
+ * reach its using-dirs (the walk reads top-level names only). */
+static int pi_repair_scanning = 0;
 
 typedef struct pi_name {
     const char *str;
     unsigned len;
     int flagged;                /* live: some parsed source spells this name */
+    int flagged_stdlib;         /* flagged by a stdlib-authored source: only
+                                 * such mentions trigger the repair walk,
+                                 * whose whole point is that stdlib code
+                                 * must bind to the real declaration of
+                                 * what it names (B-ID87); user mentions
+                                 * keep today's fallback/inline behavior */
     int user_decl;              /* declared as a GLOBAL-scope top-level type
                                  * by an input file: unqualified mentions
                                  * resolve to the user's own declaration, so
@@ -1245,6 +1258,7 @@ static pi_name_t *pi_intern(const char *s, size_t len) {
     p->str = dup;
     p->len = (unsigned)len;
     p->flagged = 0;
+    p->flagged_stdlib = 0;
     p->next = pi_table[b];
     pi_table[b] = p;
     return p;
@@ -1490,6 +1504,11 @@ static void pi_glob_into(pi_dir_t *d, const char *root, const char *subdir) {
  * reached directory. Shared shape with scan_using_tokens's parser. */
 static void pi_note_using(pi_file_t *f, const char *subdir) {
     if (!subdir[0]) return;
+    /* The repair walk scans files with pi_scan_file purely to read their
+     * top-level names; reaching their using-dirs here would widen the reach
+     * set to the whole tree and join every package (B-ID87's first cut
+     * compiled a 13-file hello-world as 122 files). */
+    if (pi_repair_scanning) return;
     if (!pi_reserve((void *)&f->usings, f->using_count, &f->using_cap,
                     sizeof(char *)))
         return;
@@ -1508,6 +1527,7 @@ static void pi_flag_ident(pi_file_t *f, const char *s, size_t len) {
         /* Seed pass: the name is spelled by already-parsed sources, so it
          * is live right away. */
         name->flagged = 1;
+        if (pi_seeding_stdlib) name->flagged_stdlib = 1;
         return;
     }
     if (!pi_reserve((void *)&f->idents, f->ident_count, &f->ident_cap,
@@ -2170,7 +2190,7 @@ static void pi_seed_source(const char *source, size_t len) {
                                              "WhenAny", 7) == 0))) {
                                     pi_name_t *tj =
                                         pi_intern("TaskJoin", 8);
-                                    if (tj) tj->flagged = 1;
+                                    if (tj) { tj->flagged = 1; if (pi_seeding_stdlib) tj->flagged_stdlib = 1; }
                                 }
                             }
                             if (depth >= 1 && pi_typeish(prev) &&
@@ -2186,10 +2206,14 @@ static void pi_seed_source(const char *source, size_t len) {
                                  * so real constructor calls still pull. */
                             } else if (!name->user_decl) {
                                 name->flagged = 1;
+                                if (pi_seeding_stdlib)
+                                    name->flagged_stdlib = 1;
                             }
                         } else if (chain && chain->ns_root) {
                             /* `Ns.Segment` under a known namespace root. */
                             name->flagged = 1;
+                            if (pi_seeding_stdlib)
+                                name->flagged_stdlib = 1;
                         } else if (chain && chain->len == 4 &&
                                    memcmp(chain->str, "Task", 4) == 0 &&
                                    name->len == 7 &&
@@ -2200,7 +2224,7 @@ static void pi_seed_source(const char *source, size_t len) {
                              * seed sees the pre-desugar spelling, so mirror
                              * the rewrite or TaskJoin.zan is never pulled. */
                             pi_name_t *tj = pi_intern("TaskJoin", 8);
-                            if (tj) tj->flagged = 1;
+                            if (tj) { tj->flagged = 1; if (pi_seeding_stdlib) tj->flagged_stdlib = 1; }
                         }
                     }
                 }
@@ -2268,7 +2292,10 @@ static void pi_seed_list(const zan_ast_list_t *list) {
 static void pi_flag_istr(zan_istr_t name) {
     if (!name.str || name.len <= 0) return;
     pi_name_t *p = pi_intern(name.str, (size_t)name.len);
-    if (p && !p->user_decl) p->flagged = 1;
+    if (p && !p->user_decl) {
+        p->flagged = 1;
+        if (pi_seeding_stdlib) p->flagged_stdlib = 1;
+    }
 }
 
 /* Flag a segment that sits in a chain rooted at a known namespace segment
@@ -2279,7 +2306,10 @@ static void pi_flag_istr(zan_istr_t name) {
 static void pi_flag_qualified(zan_istr_t name) {
     if (!name.str || name.len <= 0) return;
     pi_name_t *p = pi_intern(name.str, (size_t)name.len);
-    if (p) p->flagged = 1;
+    if (p) {
+        p->flagged = 1;
+        if (pi_seeding_stdlib) p->flagged_stdlib = 1;
+    }
 }
 
 static int pi_is_ns_root(zan_istr_t name) {
@@ -2545,7 +2575,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
                     (memcmp(m.str, "WhenAll", 7) == 0 ||
                      memcmp(m.str, "WhenAny", 7) == 0)) {
                     pi_name_t *tj = pi_intern("TaskJoin", 8);
-                    if (tj) tj->flagged = 1;
+                    if (tj) { tj->flagged = 1; if (pi_seeding_stdlib) tj->flagged_stdlib = 1; }
                 }
             }
         }
@@ -2695,6 +2725,161 @@ static int pi_close_once(const char *stdlib_root) {
  * parse failure, fall back to the lexical seeding of the same source: the
  * closure must not shrink silently, and the main parse loop reports the
  * error exactly as before. */
+/* ---- repair round: reach stdlib directories for flagged-but-unsatisfied
+ * live names ----
+ *
+ * The closure's reach set grows only from `using` directives, but a parsed
+ * file can reference a stdlib type by a plain member-access root -- the
+ * `File.ReadAllText("/proc/self/stat")` inside AppPath.zan names `File`
+ * while its own usings never mention System.IO. The name flags live, no
+ * scanned file declares it, File.zan never joins the parse, and the call
+ * silently runs a different implementation of the same operation: the
+ * binder's fallback still resolves it, and irgen_call's inline fopen copy
+ * fires instead of stdlib File.ReadAllText (no BOM strip, no embedded
+ * fallback, abort instead of FileNotFoundException) -- chosen by whichever
+ * files the HOST's using set pulled, not by the call site (B-ID87). When
+ * the closure settles with such a name, reach every stdlib directory whose
+ * subtree holds a .zan file once and let the live-name gate re-run:
+ * inclusion still requires a real mention, so the cost is one metadata walk
+ * of the tree plus the genuinely referenced files. Package sources are not
+ * walked: a package file joins unconditionally once its namespace dir is
+ * reached, so this gap cannot hide a package declaration the same way. */
+
+static int pi_repair_done = 0;
+
+/* Unsatisfied = flagged live but declared by no scanned file. Collected
+ * once per repair trigger; the walk clears entries it satisfies. */
+static pi_name_t *pi_unsatisfied_set[256];
+static int pi_unsatisfied_count = 0;
+
+static int pi_name_declared_by_scanned(pi_name_t *n) {
+    for (pi_dir_t *d = pi_dirs_head; d; d = d->next)
+        for (int i = 0; i < d->file_count; i++)
+            for (int k = 0; k < d->files[i].top_count; k++)
+                if (d->files[i].top[k] == n) return 1;
+    return 0;
+}
+
+/* 1 when some name flagged by a stdlib-authored source is declared by no
+ * scanned file: its declaring directory was never reached, so stdlib code
+ * would bind it through the binder's fallback instead of its declaration
+ * -- the switching-implementations defect (B-ID87). User-only mentions
+ * don't count: their fallback/inline behavior is today's contract. */
+static int pi_unsatisfied_live_name(void) {
+    pi_unsatisfied_count = 0;
+    for (unsigned b = 0; b < PI_BUCKETS; b++)
+        for (pi_name_t *p = pi_table[b]; p; p = p->next) {
+            if (!p->flagged_stdlib || pi_name_declared_by_scanned(p)) continue;
+            if (pi_unsatisfied_count >= (int)(
+                    sizeof(pi_unsatisfied_set) / sizeof(pi_unsatisfied_set[0])))
+                return 1;
+            pi_unsatisfied_set[pi_unsatisfied_count++] = p;
+        }
+    return pi_unsatisfied_count > 0;
+}
+
+static void pi_unsatisfied_mark_declared(pi_name_t *n) {
+    for (int i = 0; i < pi_unsatisfied_count; i++) {
+        if (pi_unsatisfied_set[i] != n) continue;
+        pi_unsatisfied_set[i] = pi_unsatisfied_set[--pi_unsatisfied_count];
+        return;
+    }
+}
+
+static int pi_name_in_unsatisfied(pi_name_t *n) {
+    for (int i = 0; i < pi_unsatisfied_count; i++)
+        if (pi_unsatisfied_set[i] == n) return 1;
+    return 0;
+}
+
+/* Metadata-scan one .zan file for its top-level declared names (no parse)
+ * and clear any unsatisfied live name it declares. */
+static void pi_repair_scan_file(const char *path) {
+    pi_file_t f;
+    memset(&f, 0, sizeof(f));
+    f.path = (char *)path;
+    pi_repair_scanning = 1;
+    pi_scan_file(&f);
+    pi_repair_scanning = 0;
+    for (int k = 0; k < f.top_count; k++)
+        pi_unsatisfied_mark_declared(f.top[k]);
+}
+
+/* Repair walk: metadata-scan the stdlib tree for the unsatisfied names and
+ * reach ONLY the directories that declare one. Reaching every directory
+ * instead would let pi_process_dir's package-namespace visit join whole
+ * packages unconditionally (pkg_src files skip the live-name gate) -- the
+ * first cut reached all stdlib dirs and a 13-file hello-world parsed 122
+ * files. Returns 1 when any directory was reached. */
+static int pi_repair_walk(const char *root, const char *rel) {
+    char dir_path[1024];
+    if (rel[0]) snprintf(dir_path, sizeof(dir_path), "%s/%s", root, rel);
+    else snprintf(dir_path, sizeof(dir_path), "%s", root);
+    int reached_any = 0;
+    int dir_declares = 0;
+#ifdef _WIN32
+    char pattern[1024];
+    snprintf(pattern, sizeof(pattern), "%s\\*", dir_path);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (fd.cFileName[0] == '.') continue;
+        char child_path[1024];
+        snprintf(child_path, sizeof(child_path), "%s\\%s", dir_path,
+                 fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+            char child[512];
+            snprintf(child, sizeof(child), "%s%s%s", rel, rel[0] ? "/" : "",
+                     fd.cFileName);
+            if (pi_repair_walk(root, child)) reached_any = 1;
+            continue;
+        }
+        size_t nlen = strlen(fd.cFileName);
+        if (nlen < 5 || strcmp(fd.cFileName + nlen - 4, ".zan") != 0) continue;
+        int before = pi_unsatisfied_count;
+        pi_repair_scan_file(child_path);
+        if (pi_unsatisfied_count < before) dir_declares = 1;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(dir_path);
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char entry_path[1024];
+        snprintf(entry_path, sizeof(entry_path), "%s/%s", dir_path,
+                 e->d_name);
+        struct stat st;
+        if (lstat(entry_path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
+            char child[512];
+            snprintf(child, sizeof(child), "%s%s%s", rel, rel[0] ? "/" : "",
+                     e->d_name);
+            if (pi_repair_walk(root, child)) reached_any = 1;
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+        size_t nlen = strlen(e->d_name);
+        if (nlen < 5 || strcmp(e->d_name + nlen - 4, ".zan") != 0) continue;
+        int before = pi_unsatisfied_count;
+        pi_repair_scan_file(entry_path);
+        if (pi_unsatisfied_count < before) dir_declares = 1;
+    }
+    closedir(d);
+#endif
+    if (dir_declares) {
+        if (getenv("ZAN_PULLIN_DEBUG") != NULL)
+            fprintf(stderr, "[pullin] repair reach %s\n",
+                    rel[0] ? rel : "(root)");
+        pi_reach(rel);
+        reached_any = 1;
+    }
+    return reached_any;
+}
+
 /* Seed the live-name worklist and the reached-directory set from one
  * fully-parsed source (user file, design translation or generator output).
  * Identifiers become live, with one carve-out: a top-level type declared by
@@ -4916,12 +5101,21 @@ int main(int argc, char **argv) {
                              !zan_is_zcomp_path(input_files[fi]);
             pi_seed_stdlib_input =
                 seed_entry ? pi_reach_input_dir(input_files[fi]) : 0;
+            /* Mentions from stdlib-authored files stamp flagged_stdlib.
+             * fi == 0 is the entry and counts as user code even when it
+             * lives under the stdlib root (ZanGen), matching the
+             * from_stdlib stamp below. */
+            pi_seeding_stdlib =
+                fi > 0 && auto_stdlib && resolved_stdlib_root[0] &&
+                input_files[fi] &&
+                zan_path_is_under(input_files[fi], resolved_stdlib_root);
             if (parse_failed) {
                 g_scale_stats.throwaway_parse_fallbacks++;
                 pi_seed_source(src, slen);
             } else {
                 pi_seed_parsed_unit(unit, seed_entry);
             }
+            pi_seeding_stdlib = 0;
             pi_seed_stdlib_input = 0;
         }
         /* Mark stdlib-authored declarations so the reachability prune can
@@ -4961,6 +5155,16 @@ int main(int argc, char **argv) {
             int fresh = pi_append_included(&input_files, &input_count,
                                            &input_cap);
             if (!changed && !fresh) {
+                /* A flagged name nothing scanned declares means some parsed
+                 * file referenced a stdlib type across a directory no
+                 * `using` names -- widen the reach set once (B-ID87, see
+                 * pi_reach_all_dirs) and re-run; the live-name gate still
+                 * decides inclusion. */
+                if (!pi_repair_done && pi_unsatisfied_live_name()) {
+                    pi_repair_done = 1;
+                    pi_repair_walk(resolved_stdlib_root, "");
+                    continue;
+                }
                 pi_debug_dump();
                 break;
             }
@@ -5059,6 +5263,14 @@ int main(int argc, char **argv) {
                 int fresh = pi_append_included(&input_files, &input_count,
                                                &input_cap);
                 if (!changed && !fresh) {
+                    /* Same repair round as the main parse loop's closure
+                     * (B-ID87): generator texts can name stdlib types no
+                     * using-directive reaches. */
+                    if (!pi_repair_done && pi_unsatisfied_live_name()) {
+                        pi_repair_done = 1;
+                        pi_repair_walk(resolved_stdlib_root, "");
+                        continue;
+                    }
                     pi_debug_dump();
                     break;
                 }
@@ -5076,6 +5288,12 @@ int main(int argc, char **argv) {
                         return 1;
                     }
                     zan_nsresolve_stamp(unit, arena);
+                    /* Appended tail files are never the entry; the same
+                     * stdlib-authored test as the from_stdlib stamp below. */
+                    pi_seeding_stdlib =
+                        auto_stdlib && resolved_stdlib_root[0] &&
+                        zan_path_is_under(input_files[fi],
+                                          resolved_stdlib_root);
                     if (diag->error_count > errors_before) {
                         /* Lexical fallback keeps the closure from shrinking;
                          * the parse error is already on the main diag. */
@@ -5089,6 +5307,7 @@ int main(int argc, char **argv) {
                     } else {
                         pi_seed_parsed_unit(unit, 0);
                     }
+                    pi_seeding_stdlib = 0;
                     if (auto_stdlib && resolved_stdlib_root[0] &&
                         zan_path_is_under(input_files[fi], resolved_stdlib_root)) {
                         for (int k = 0; k < unit->comp_unit.decls.count; k++)
