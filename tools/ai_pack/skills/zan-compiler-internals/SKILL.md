@@ -299,11 +299,18 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
      `zan_co_quantum_ms()` 跨编译单元调用**（量子全局读住在 rt_timer.c）。修法=门控前移：
      先动 worker 本地计数器，255/256 次仅 TLS 读+RMW 即返回，量子/片/时钟全部挪进
      1/256 命中分支；修后开销入噪声。热路径上的"只是读个全局"若隔着编译单元就是一次真实调用。
-  4. **C11 `_Thread_local` 在本工具链（clang，mingw 目标）= emutls，热路径禁用**：
+  4. **C11 `_Thread_local` 在本工具链（原生对象 TDM-GCC、交叉对象 zig clang，均 GNU/mingw 目标）= emutls，热路径禁用**：
      想把 worker 指针换成 thread_local 直读省掉 TlsGetValue 调用，结果 clang 把它编成
      `__emutls_get_address`（~10ns/次的真调用，obj 内实锤），q=0 探针全套 5× 变慢
      （793ms→3.9s）。Windows 上 TlsGetValue（读 TEB→TLS 数组，无系统调用）反而是快路径；
      POSIX 的 pthread_getspecific 同理不可热路径化。换 TLS 机制前后必须重跑热探针对拍绝对值。
+  5. **生产者-消费者环的 head/tail 必须分缓存线（B-ID54 ②，2026-10-02）**：mt 驱动 worker 环
+     的 head（thieves CAS）与 tail（仅 owner store）原本相邻同线——k=32 下 16 个并发搜索者
+     对 head 的 CAS 把 owner 正在写的 tail 线反复打掉，生产者入环 123ns→800ns（6.5×），
+     spawn 批次提交侧即崩。修法=head/tail 各垫 56B + 结构 64B 对齐（数组元素逐个成立）。
+     副作用良性：producer 提速后环自然触顶溢出，注入队列批量路径（64/锁）接管分发，
+     steal 次数 -85%、park -79%。诊断：ZAN_CO_STATS（挂 atexit 后任何驱动路径退出都打）
+     看 steal/park；spawn/join 拆分计量区分提交侧 vs 汇合侧退化。
 
 ## stdlib 肥边治理：独立类分片 + 槽反转 + 实例方法组注入（A332 肥边③④，2026-09-17）
 

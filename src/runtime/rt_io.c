@@ -4244,9 +4244,16 @@ typedef struct {
 typedef struct {
     /* Ring: consumers (the owner and thieves) move `head` with CAS, only the
      * owner moves `tail`. A slot is never overwritten while a consumer may
-     * still read it: the owner refuses to push past head + ZAN_LQ_CAP. */
+     * still read it: the owner refuses to push past head + ZAN_LQ_CAP.
+     * head and tail live on separate cache lines: thieves CAS the head line
+     * while the owner pushes to the tail line, and sharing one line let the
+     * steal storm at k=32 slow the producer's pushes 6.5x -- every thief CAS
+     * invalidated the line the owner was writing (B-ID54). The struct is
+     * 64-aligned so the split holds for every array element. */
     volatile long long head;
+    char pad_head[56];
     volatile long long tail;
+    char pad_tail[56];
     zan_co_task        buf[ZAN_LQ_CAP];
     zan_co_task        lifo;
     int                lifo_full;
@@ -4277,7 +4284,7 @@ typedef struct {
      * ZAN_CO_STATS is set in the environment. */
     zan_co_stats_t     st;
     char               pad[64];      /* keep neighbours off this cache line */
-} zan_co_worker_t;
+} __attribute__((aligned(64))) zan_co_worker_t;
 
 static CRITICAL_SECTION g_co_lock;
 /* A queued task stays outstanding until its step returns. Queue length and
