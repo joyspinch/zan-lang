@@ -122,9 +122,19 @@ class Interop {
         nint wname = Wide.Of(name);
         nint buf = NativeMemory.Alloc(2048);
         new Span<short>(buf, 1)[0] = 0;
-        int units = call(wname, buf, 1023);
+        int size = 1023;
+        int units = call(wname, buf, size);
+        // 截断探测（B-ID84）：值放不下时 Win32 返回所需码元数而非报错，
+        // 静默截断会让长 PATH/TZ 之类的值悄悄缺尾。按所需尺寸重试一次，
+        // 上限 32K 码元，够 Windows 环境变量的实际天花板。
+        if (units >= size && units < 32768) {
+            NativeMemory.Free(buf);
+            size = units + 1;
+            buf = NativeMemory.Alloc(size * 2);
+            units = call(wname, buf, size);
+        }
         string text = "";
-        if (units > 0 && units < 1023) { text = Wide.Read(buf); }
+        if (units > 0 && units < size) { text = Wide.Read(buf); }
         NativeMemory.Free(buf);
         Wide.Free(wname);
         return text;
@@ -163,7 +173,9 @@ class Wide {
     static int Utf8() { return 65001; }
 
     /// 分配 `s` 的 NUL 结尾 UTF-16 副本。用 Free() 释放。
+    /// null 返回 0（Win32 宽字符参数的"缺失"约定），不再空引用崩溃。
     static nint Of(string s) {
+        if (s == null) { return 0; }
         int bytes = s.Length;
         nint src = NativeMemory.Alloc(bytes + 1);
         NativeMemory.PutString(src, 0, s, bytes);
@@ -445,8 +457,35 @@ class Com {
     }
 
     /// 将 `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` 解析为新建的
-    /// 16 字节 GUID（前三个字段为小端，符合 COM 预期）。
+    /// 16 字节 GUID（前三个字段为小端，符合 COM 预期）。文本形状
+    /// 不对（长度/连字符位置/十六进制字符）就抛 ArgumentException——
+    /// 原来非法字符静默按 0，排障时只看到"类未注册"这类误导性失败
+    ///（B-ID84）。
     static nint Guid(string text) {
+        if (text.Length != 36) {
+            throw new ArgumentException(
+                "Com.Guid: expected 36-char GUID, got length "
+                + text.Length + ": " + text);
+        }
+        int[] dashes = new int[] { 8, 13, 18, 23 };
+        for (int i = 0; i < dashes.Length; i = i + 1) {
+            if (text[dashes[i]] != 45) {
+                throw new ArgumentException(
+                    "Com.Guid: expected '-' at position "
+                    + dashes[i] + ": " + text);
+            }
+        }
+        for (int i = 0; i < 36; i = i + 1) {
+            int c = text[i] & 255;
+            bool hex = (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+                       || (c >= 65 && c <= 70);
+            if (i == 8 || i == 13 || i == 18 || i == 23) { continue; }
+            if (!hex) {
+                throw new ArgumentException(
+                    "Com.Guid: invalid hex character at "
+                    + i + ": " + text);
+            }
+        }
         nint g = NativeMemory.Alloc(16);
         new Span<int>(g, 1)[0] = Com.Hex(text, 0, 8);
         new Span<short>(g + 4, 1)[0] = Com.Hex(text, 9, 4);
