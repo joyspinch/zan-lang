@@ -517,6 +517,16 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   让老病灶显形。回归锁：tests/conformance/namespace_qualified_call.zan
   （负例孪生 fully_qualified_unresolved 必须保持红）。
 
+## HTTP 协议与大数据量分块解码：空块大小行严格判伪与 16MiB 溢出防线
+
+- **病灶**：在 `HttpClient` 处理 `Transfer-Encoding: chunked`（流式 SSE/大文件分段/下载）时，`ParseHex` 对纯非十六进制字符（例如恶意或畸形的一条空行 `\r\n`，`s.Length == 0` 或首字节即非十六进制字符）循环 0 次直接返回初值 `v = 0`。
+- **危害**：
+  1. 在 RFC 7230 §4.1 / RFC 9112 §7.1 规范中，`0\r\n` 才是合法的 EOF 终止块（Last-chunk），而空的长度行或以非 Hex 字符开头的行属于协议畸形语法错误；
+  2. 若返回 0，分块流解析器会误将该畸形行当作 `size == 0` 的合法终止块，触发提前 `cleanEnd = true` 截断正常流响应；更严重的场景下，若在下载或代理中发生跳跃，剩余响应体会被错误交错或当成下一条 HTTP 请求处理（引发请求/响应走私）；
+  3. `ParseHex` 必须引入 `any` 标记：未解析到任何有效 Hex 字符时严格返回 `-1`，迫使流式处理层按截断坏帧（400 / 异常中断）快速失败，杜绝走私与假满。
+- **16MiB 溢出边界**：RFC 分块大小由十六进制串表示，客户端与服务端必须在每位累加时（`v = v * 16 + d`）校验 `v > 16777215`（0x00FFFFFF，16MiB-1）。若无上限，超长十六进制串会导致 32 位整型回绕成负数，下游 `need = crlf + 2 + size + 2` 算得负数直接杀死进程。
+- **回归锁定**：`ctest -R "http_chunk_len_overflow|http_framing|http_smuggling"` 孪生全过。
+
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
 - **症状**：浏览器 `WebAssembly.instantiate` 报 `Compiling function #N:"X"
