@@ -555,6 +555,15 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   3. 落地重构：`Ensure` 将目标请求与扩容容量统一限制在 `maxCap` 与 1GB 整型安全边界以内，超过 512MB 阶段停止倍增平滑钳制，有效抵御畸形超大帧探测攻击。
 - **回归锁定**：`ctest -R "websocket_fragment_cost"` 4 项全套孪生测试（conformance/determinism/leakcheck/arcguard）100% 全部通过。
 
+## HTTP/2 二进制分帧合规：RFC 7540 §6 帧长与流 ID 作用域防御（Http2Frame）
+
+- **病灶**：`Http2Frame.DecodeHeader` 原先只做 9 字节反序列化解包，未校验 RFC 7540 §6 规定的控制帧定长要求（PING 必须 8 字节、RST_STREAM 与 WINDOW_UPDATE 必须 4 字节、SETTINGS 必须是 6 的倍数且 ACK 必须 0 字节、GOAWAY 至少 8 字节）以及流 ID 作用域约束。
+- **危害**：
+  1. 恶意的畸形报文若伪造 `PING` 帧且带有不合法的载荷长度（如 0 或超长），或在连接级帧（SETTINGS/PING/GOAWAY）中携带非 0 的 streamId，或在必须绑定具体流的帧（RST_STREAM/PUSH_PROMISE/CONTINUATION）中携带 streamId == 0；
+  2. 接收端若直接放行，将在后续流状态机或窗口管理中引发状态错乱、空引用崩溃或拒绝服务；
+  3. 落地重构：解码帧头时严格按 RFC 7540 §6 校验各帧长度与 streamId 边界，违规帧立即拦截并返回 `null`，确保协议层快速失败（Fail-Fast）。
+- **回归锁定**：`ctest -R "http2"` 4 项全套孪生测试（conformance/determinism/leakcheck/arcguard）100% 全部通过。
+
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
 - **症状**：浏览器 `WebAssembly.instantiate` 报 `Compiling function #N:"X"
