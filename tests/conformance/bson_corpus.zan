@@ -1,0 +1,439 @@
+// MongoDB 官方 bson-corpus 钉死（specifications/source/bson-corpus）：
+// canonical_bson 解码到值语义、值语义编码回规范字节双向钉（语料规范
+// 宽度与实现一致者），语料 decodeErrors 一律必须抛。与值模型的边界：
+// int64 语料整型保型（-1/0/1 的规范字节仍是 0x12），实现按值域选规范
+// 宽度——这组只钉解码；串值内嵌 NUL 合法（长度前缀消歧），键 cstring
+// 仍拒绝；binary 读侧丢子类型按 UTF-8 尽力解码，过时 subtype 0x02
+// 校验内嵌长度；Y10K 万年、负毫秒向下取整；invalid UTF-8 收敛
+// U+FFFD 不抛（尽力解码设计），语料的 invalid-UTF-8 向量不适用。
+using System;
+using System.Bson;
+using System.Json;
+using System.Text;
+
+namespace Conf;
+
+class Prog {
+    static int bad = 0;
+
+    static string Hex(byte[] b) {
+        StringBuilder sb = new StringBuilder();
+        string hex = "0123456789abcdef";
+        int i = 0;
+        while (i < b.Length) {
+            if (i > 0) { sb.Append(" "); }
+            int v = b[i] & 255;
+            sb.Append(hex.Substring(v >> 4, 1));
+            sb.Append(hex.Substring(v & 15, 1));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static byte[] HexBytes(string hex) {
+        byte[] out2 = new byte[hex.Length / 2];
+        int i = 0;
+        while (i < hex.Length) {
+            int hi = HexVal(hex[i]);
+            int lo = HexVal(hex[i + 1]);
+            out2[i / 2] = (byte)(hi * 16 + lo);
+            i = i + 2;
+        }
+        return out2;
+    }
+
+    static int HexVal(char c) {
+        int v = c & 255;
+        if (v >= 48 && v <= 57) { return v - 48; }
+        if (v >= 97 && v <= 102) { return v - 87; }
+        return 0;
+    }
+
+    static JsonValue Dec(string hex) {
+        return Bson.Unpack(HexBytes(hex));
+    }
+
+    static void Chk(string label, string got, string want) {
+        if (got != want) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    // 解码语料字节并断言 test_key 处的 long 值。
+    static void ChkL(string label, string hex, string key, long want) {
+        JsonValue v = Dec(hex);
+        JsonValue at = v.Get(key);
+        long got = at == null ? want - 1 : at.AsLong(want - 1);
+        if (got != want) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    // 解码语料字节并断言 test_key 处的 double 值。
+    static void ChkD(string label, string hex, string key, double want) {
+        JsonValue v = Dec(hex);
+        JsonValue at = v.Get(key);
+        double got = at == null ? want - 1 : at.AsDouble(want - 1);
+        if (got != want) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    // 解码语料字节并断言 test_key 处的字符串值。
+    static void ChkS(string label, string hex, string key, string want) {
+        JsonValue v = Dec(hex);
+        JsonValue at = v.Get(key);
+        string got = at == null ? null : at.AsString(null);
+        if (got != want) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    // 值语义编码必须精确命中语料 canonical 字节。
+    static void ChkEnc(string label, JsonValue v, string canonical) {
+        Chk(label, Hex(Bson.Pack(v)), Sp(canonical));
+    }
+
+    // 连续 hex → 空格分隔（Hex 输出形态）。
+    static string Sp(string hex) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < hex.Length) {
+            if (i > 0) { sb.Append(" "); }
+            sb.Append(hex.Substring(i, 2));
+            i = i + 2;
+        }
+        return sb.ToString();
+    }
+
+    // 语料 decodeErrors：解码必须抛 BsonException。
+    static void ChkThrow(string label, string hex) {
+        try {
+            Dec(hex);
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label + " NOT THROWN");
+        } catch (BsonException) { }
+    }
+
+    // 子文档取值断言：外层 test_key 处的子对象里 inner 键的字符串值。
+    static void ChkSub(string label, string hex, string outer, string inner,
+                       string want) {
+        JsonValue o = Dec(hex).Get(outer);
+        JsonValue at = o == null ? null : o.Get(inner);
+        string got = at == null ? null : at.AsString(null);
+        if (got != want) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static void Main() {
+        // ---- ObjectId：3 合法 + 截断错误 ----
+        ChkS("oid-zero", "1400000007610000000000000000000000000000",
+            "a", "000000000000000000000000");
+        ChkS("oid-ones", "14000000076100ffffffffffffffffffffffff00",
+            "a", "ffffffffffffffffffffffff");
+        ChkS("oid-rand", "1400000007610056e1fc72e0c917e9c471416100",
+            "a", "56e1fc72e0c917e9c4714161");
+        ChkThrow("oid-trunc", "1200000007610056e1fc72e0c917e9c471");
+
+        // ---- Boolean：0x00/0x01 严格，2/-1 必须抛 ----
+        JsonValue bt = Dec("090000000862000100").Get("b");
+        if (bt == null || !bt.IsBool() || !bt.AsBool(false)) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL bool-true-form");
+        }
+        JsonValue bf = Dec("090000000862000000").Get("b");
+        if (bf == null || !bf.IsBool() || bf.AsBool(true)) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL bool-false-form");
+        }
+        ChkEnc("bool-true-enc", JsonValue.Parse("{\"b\":true}"),
+            "090000000862000100");
+        ChkEnc("bool-false-enc", JsonValue.Parse("{\"b\":false}"),
+            "090000000862000000");
+        ChkThrow("bool-2", "090000000862000200");
+        ChkThrow("bool-ff", "09000000086200ff00");
+
+        // ---- Int32：Min/-1/0/1/Max 双向 + 坏长度抛 ----
+        ChkL("i32-min", "0c0000001069000000008000", "i", -2147483648);
+        ChkL("i32-max", "0c000000106900ffffff7f00", "i", 2147483647);
+        ChkL("i32-neg1", "0c000000106900ffffffff00", "i", -1);
+        ChkL("i32-zero", "0c0000001069000000000000", "i", 0);
+        ChkL("i32-one", "0c0000001069000100000000", "i", 1);
+        ChkEnc("i32-min-enc", JsonValue.Parse("{\"i\":-2147483648}"),
+            "0c0000001069000000008000");
+        ChkEnc("i32-max-enc", JsonValue.Parse("{\"i\":2147483647}"),
+            "0c000000106900ffffff7f00");
+        ChkEnc("i32-neg1-enc", JsonValue.Parse("{\"i\":-1}"),
+            "0c000000106900ffffffff00");
+        ChkEnc("i32-zero-enc", JsonValue.Parse("{\"i\":0}"),
+            "0c0000001069000000000000");
+        ChkEnc("i32-one-enc", JsonValue.Parse("{\"i\":1}"),
+            "0c0000001069000100000000");
+        ChkThrow("i32-badlen", "090000001061000500");
+
+        // ---- Int64：Min/Max 双向（宽度同为 0x12）；-1/0/1 语料
+        //      保型 0x12 而实现选规范 int32 宽度，只钉解码 ----
+        ChkL("i64-min", "10000000126100000000000000008000", "a",
+            -9223372036854775807 - 1);
+        ChkL("i64-max", "10000000126100ffffffffffffff7f00", "a",
+            9223372036854775807);
+        ChkEnc("i64-min-enc",
+            JsonValue.Parse("{\"a\":-9223372036854775808}"),
+            "10000000126100000000000000008000");
+        ChkEnc("i64-max-enc",
+            JsonValue.Parse("{\"a\":9223372036854775807}"),
+            "10000000126100ffffffffffffff7f00");
+        ChkL("i64-neg1", "10000000126100ffffffffffffffff00", "a", -1);
+        ChkL("i64-zero", "10000000126100000000000000000000", "a", 0);
+        ChkL("i64-one", "10000000126100010000000000000000", "a", 1);
+        ChkThrow("i64-trunc", "0c0000001261001234567800");
+
+        // ---- String：语料合法向量 + 6 个畸形长度/终止符抛 ----
+        ChkS("str-empty", "0d000000026100010000000000", "a", "");
+        ChkEnc("str-empty-enc", JsonValue.Parse("{\"a\":\"\"}"),
+            "0d000000026100010000000000");
+        ChkS("str-single", "0e00000002610002000000620000", "a", "b");
+        ChkEnc("str-single-enc", JsonValue.Parse("{\"a\":\"b\"}"),
+            "0e00000002610002000000620000");
+        ChkS("str-multi", "190000000261000d0000006162616261626162616261620000",
+            "a", "abababababab");
+        ChkEnc("str-multi-enc", JsonValue.Parse("{\"a\":\"abababababab\"}"),
+            "190000000261000d0000006162616261626162616261620000");
+        // 两个字节/三个字节的 UTF-8 多字节序列。
+        string e9 = Encoding.Utf8FromCodePoint(0xE9);
+        string star = Encoding.Utf8FromCodePoint(0x2606);
+        ChkS("str-2byte", "190000000261000d000000c3a9c3a9c3a9c3a9c3a9c3a90000",
+            "a", e9 + e9 + e9 + e9 + e9 + e9);
+        ChkEnc("str-2byte-enc", JsonValue.Parse("{\"a\":\"" + "éééééé" + "\"}"),
+            "190000000261000d000000c3a9c3a9c3a9c3a9c3a9c3a90000");
+        ChkS("str-3byte", "190000000261000d000000e29886e29886e29886e298860000",
+            "a", star + star + star + star);
+        // 串值内嵌 NUL 合法（长度前缀消歧；键 cstring 才拒绝）。
+        string nul = Encoding.Utf8FromCodePoint(0);
+        string nulStr = "ab" + nul + "bab" + nul + "babab";
+        ChkS("str-nuls", "190000000261000d0000006162006261620062616261620000",
+            "a", nulStr);
+        JsonValue nulObj = JsonValue.NewObject();
+        nulObj.Put("a", JsonValue.NewStr(nulStr));
+        ChkEnc("str-nuls-enc", nulObj,
+            "190000000261000d0000006162006261620062616261620000");
+        // 控制字符与引号反斜杠（0x01..0x1F + \" + ab）。
+        string esc = "ab\\\"";
+        int ci = 1;
+        while (ci <= 31) {
+            esc = esc + Encoding.Utf8FromCodePoint(ci);
+            ci = ci + 1;
+        }
+        esc = esc + "ab";
+        ChkS("str-esc", "320000000261002600000061625c220102030405060708090a0b"
+            + "0c0d0e0f101112131415161718191a1b1c1d1e1f61620000", "a", esc);
+        JsonValue escObj = JsonValue.NewObject();
+        escObj.Put("a", JsonValue.NewStr(esc));
+        ChkEnc("str-esc-enc", escObj,
+            "320000000261002600000061625c220102030405060708090a0b"
+            + "0c0d0e0f101112131415161718191a1b1c1d1e1f61620000");
+        ChkThrow("str-len0", "0c0000000261000000000000");
+        ChkThrow("str-lenneg", "0c000000026100ffffffff00");
+        ChkThrow("str-eatsterm", "10000000026100050000006200620000");
+        ChkThrow("str-overrun", "120000000200ffffff00666f6f6261720000");
+        ChkThrow("str-nonul", "1000000002610004000000616263ff00");
+        ChkThrow("str-extranul", "0e00000002610001000000000000");
+
+        // ---- DateTime：epoch/正/负（floor 到秒）/万年/前导零毫秒 ----
+        ChkS("dt-epoch", "10000000096100000000000000000000", "a",
+            "1970-01-01T00:00:00Z");
+        ChkS("dt-pos", "10000000096100c5d8d6cc3b01000000", "a",
+            "2012-12-24T12:15:30.501Z");
+        ChkS("dt-neg", "10000000096100c33ce7b9bdffffff00", "a",
+            "1960-12-24T12:15:30.499Z");
+        ChkS("dt-y10k", "1000000009610000dc1fd277e6000000", "a",
+            "10000-01-01T00:00:00Z");
+        ChkS("dt-lead0", "10000000096100d1d6d6cc3b01000000", "a",
+            "2012-12-24T12:15:30.001Z");
+        ChkThrow("dt-trunc", "0c0000000961001234567800");
+
+        // ---- Double：精确位型双向；-0.0 只钉编码；NaN/Inf 只钉解码
+        //      （JsonValue 无 NaN 字面量）。 ----
+        ChkD("dbl-1", "10000000016400000000000000f03f00", "d", 1.0);
+        ChkD("dbl-m1", "10000000016400000000000000f0bf00", "d", -1.0);
+        ChkD("dbl-tiny", "10000000016400000000008000f03f00", "d",
+            1.0001220703125);
+        ChkD("dbl-mtiny", "10000000016400000000008000f0bf00", "d",
+            -1.0001220703125);
+        double big = JsonValue.Parse("1.2345678921232E+18").AsDouble(0);
+        ChkD("dbl-big", "100000000164002a1bf5f41022b14300", "d", big);
+        ChkD("dbl-mbig", "100000000164002a1bf5f41022b1c300", "d", -big);
+        ChkD("dbl-zero", "10000000016400000000000000000000", "d", 0.0);
+        ChkEnc("dbl-1-enc", JsonValue.Parse("{\"d\":1.0}"),
+            "10000000016400000000000000f03f00");
+        ChkEnc("dbl-m1-enc", JsonValue.Parse("{\"d\":-1.0}"),
+            "10000000016400000000000000f0bf00");
+        ChkEnc("dbl-big-enc", JsonValue.Parse("{\"d\":1.2345678921232E+18}"),
+            "100000000164002a1bf5f41022b14300");
+        ChkEnc("dbl-zero-enc", JsonValue.Parse("{\"d\":0.0}"),
+            "10000000016400000000000000000000");
+        // -0.0 的负号位型：经 NewDouble 直构（System.Json 的 Parse
+        // 对 "-0.0" 丢符号，B-ID57 挂账）。
+        JsonValue nzObj = JsonValue.NewObject();
+        nzObj.Put("d", JsonValue.NewDouble(-0.0));
+        ChkEnc("dbl-negzero-enc", nzObj,
+            "10000000016400000000000000008000");
+        // NaN 收敛判定按位型（指数全 1 且尾数非 0，含带载荷变体；
+        // JsonValue 无 NaN 字面量，编码侧进不去）。
+        JsonValue nanV = Dec("10000000016400000000000000f87f00").Get("d");
+        long nanBits = nanV == null ? 0 : NativeMemory.AsI64(nanV.AsDouble(0.0));
+        if ((nanBits & 9218868437227405312) != 9218868437227405312
+            || (nanBits & 4503599627370495) == 0) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL dbl-nan");
+        }
+        // 带载荷的 NaN 同样是 NaN 位型（载荷 0x12 不外露在 AsDouble 语义里，
+        // 位型保留）。
+        JsonValue nanP = Dec("10000000016400120000000000f87f00").Get("d");
+        long nanPBits = nanP == null ? 0 : NativeMemory.AsI64(nanP.AsDouble(0.0));
+        if ((nanPBits & 9218868437227405312) != 9218868437227405312
+            || (nanPBits & 4503599627370495) == 0) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL dbl-nan-payload");
+        }
+        JsonValue infP = Dec("10000000016400000000000000f07f00").Get("d");
+        long infBits = infP == null ? 0 : NativeMemory.AsI64(infP.AsDouble(0.0));
+        if (infBits != 9218868437227405312) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL dbl-inf");
+        }
+        JsonValue minfP = Dec("10000000016400000000000000f0ff00").Get("d");
+        long minfBits = minfP == null ? 0 : NativeMemory.AsI64(minfP.AsDouble(0.0));
+        if (minfBits != -4503599627370496) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL dbl-minf");
+        }
+        ChkThrow("dbl-trunc", "0b0000000164000000f03f00");
+
+        // ---- Subdocument：空/空键/$ 前缀/点号键 ----
+        JsonValue subEmpty = Dec("0d000000037800050000000000").Get("x");
+        if (subEmpty == null || !subEmpty.IsObject() || subEmpty.Count() != 0) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL sub-empty");
+        }
+        ChkEnc("sub-empty-enc", JsonValue.Parse("{\"x\":{}}"),
+            "0d000000037800050000000000");
+        ChkS("sub-emptykey", "150000000378000d00000002000200000062000000",
+            "x", null);
+        ChkSub("sub-emptykey-val", "150000000378000d00000002000200000062000000",
+            "x", "", "b");
+        ChkEnc("sub-emptykey-enc", JsonValue.Parse("{\"x\":{\"\":\"b\"}}"),
+            "150000000378000d00000002000200000062000000");
+        ChkS("sub-single", "160000000378000e0000000261000200000062000000",
+            "x", null);
+        ChkSub("sub-single-val", "160000000378000e0000000261000200000062000000",
+            "x", "a", "b");
+        // $ 前缀与点号在子文档键里都是普通字符。
+        ChkSub("sub-dollar-val", "170000000378000f000000022461000200000062000000",
+            "x", "$a", "b");
+        ChkEnc("sub-dollar-enc", JsonValue.Parse("{\"x\":{\"$a\":\"b\"}}"),
+            "170000000378000f000000022461000200000062000000");
+        ChkSub("sub-dollarkey-val", "160000000378000e0000000224000200000061000000",
+            "x", "$", "a");
+        ChkSub("sub-dotted-val", "180000000378001000000002612e62000200000063000000",
+            "x", "a.b", "c");
+        ChkEnc("sub-dotted-enc", JsonValue.Parse("{\"x\":{\"a.b\":\"c\"}}"),
+            "180000000378001000000002612e62000200000063000000");
+        ChkSub("sub-dotkey-val", "160000000378000e000000022e000200000061000000",
+            "x", ".", "a");
+        ChkThrow("sub-overrun", "1800000003666f6f000f0000001062617200ffffff7f0000");
+        ChkThrow("sub-leak", "1500000003666f6f000a0000000862617200010000");
+        ChkThrow("sub-badstr", "1c00000003666f6f001200000002626172000500000062617a000000");
+        ChkThrow("sub-nulkey", "150000000378000d00000010610000010000000000");
+
+        // ---- Array：空/单元素双向；语料退化索引键（空串/ab/重复 "0"）
+        //      按顺序收集，同样还原 [10]/[10,20]；三个畸形长度抛 ----
+        JsonValue arrEmpty = Dec("0d000000046100050000000000").Get("a");
+        if (arrEmpty == null || !arrEmpty.IsArray() || arrEmpty.Count() != 0) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL arr-empty");
+        }
+        ChkEnc("arr-empty-enc", JsonValue.Parse("{\"a\":[]}"),
+            "0d000000046100050000000000");
+        JsonValue arrSingle = Dec("140000000461000c0000001030000a0000000000")
+            .Get("a");
+        if (arrSingle == null || !arrSingle.IsArray()
+            || arrSingle.Count() != 1 || arrSingle.At(0).AsLong(0) != 10) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL arr-single-form");
+        }
+        ChkEnc("arr-single-enc", JsonValue.Parse("{\"a\":[10]}"),
+            "140000000461000c0000001030000a0000000000");
+        // 退化索引键（空串/ab/重复 "0"）不参与语义，按顺序收集。
+        JsonValue arrDegen0 = Dec("130000000461000b00000010000a0000000000")
+            .Get("a");
+        if (arrDegen0 == null || !arrDegen0.IsArray()
+            || arrDegen0.Count() != 1 || arrDegen0.At(0).AsLong(0) != 10) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL arr-degen0-form");
+        }
+        JsonValue arrDegenAb = Dec("150000000461000d000000106162000a0000000000")
+            .Get("a");
+        if (arrDegenAb == null || !arrDegenAb.IsArray()
+            || arrDegenAb.Count() != 1 || arrDegenAb.At(0).AsLong(0) != 10) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL arr-degenab-form");
+        }
+        JsonValue arrDup = Dec("1b000000046100130000001030000a000000103100140000000000")
+            .Get("a");
+        if (arrDup == null || !arrDup.IsArray() || arrDup.Count() != 2
+            || arrDup.At(0).AsLong(0) != 10 || arrDup.At(1).AsLong(0) != 20) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL arr-dup-form");
+        }
+        ChkEnc("arr-dup-enc", JsonValue.Parse("{\"a\":[10,20]}"),
+            "1b000000046100130000001030000a000000103100140000000000");
+        // 退化重复索引 "0"/"0" 同样按顺序还原。
+        JsonValue arrDegenDup = Dec("1b000000046100130000001030000a000000103000140000000000")
+            .Get("a");
+        if (arrDegenDup == null || arrDegenDup.Count() != 2
+            || arrDegenDup.At(1).AsLong(0) != 20) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL arr-degendup-form");
+        }
+        ChkThrow("arr-overrun", "140000000461000d0000001030000a0000000000");
+        ChkThrow("arr-leak", "140000000461000b0000001030000a0000000000");
+        ChkThrow("arr-badstr", "1a00000004666f6f00100000000230000500000062617a000000");
+
+        // ---- Binary：零长度/子类型 0 尽力解码/subtype 0x02 内嵌长度
+        //      校验（合法 + 过长/过短/负一抛）----
+        ChkS("bin-empty", "0d000000057800000000000000", "x", "");
+        // 子类型 0 尽力解码：非法 UTF-8 收敛 U+FFFD，断言只钉"接受
+        // 且还原为字符串"，不钉替换单元个数（解码器策略细节）。
+        JsonValue binFf = Dec("0f0000000578000200000000ffff00").Get("x");
+        if (binFf == null || !binFf.IsString() || binFf.AsString("~").Length < 1) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL bin-sub0");
+        }
+        JsonValue binSub2 = Dec("13000000057800060000000202000000ffff00")
+            .Get("x");
+        if (binSub2 == null || !binSub2.IsString()
+            || binSub2.AsString("~").Length < 1) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL bin-sub2");
+        }
+        ChkThrow("bin-overrun",
+            "1d000000057800ff0000000573ffd26444b34c6990e8e7d1dfc035d400");
+        ChkThrow("bin-neglen", "0d000000057800ffffffff0000");
+        ChkThrow("bin-sub2-long", "13000000057800060000000203000000ffff00");
+        ChkThrow("bin-sub2-short", "13000000057800060000000201000000ffff00");
+        ChkThrow("bin-sub2-neg1", "130000000578000600000002ffffffffffff00");
+
+        if (bad != 0) {
+            Console.WriteLine("bson_corpus-ok: 0");
+        } else {
+            Console.WriteLine("bson_corpus-ok: 1");
+        }
+    }
+}
