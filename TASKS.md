@@ -112,11 +112,17 @@
   重跑回写四件驱动（win-x64 dll/win-arm64 dll/linux 双架构 a/macos 双 dylib），以 CI
   回写提交为准。win 双架构 io/embed 4 对象 rebuild 字节一致=内容已证最新（git 无法记录
   同字节提交，report-only）。runtime 组 28 项已字节级验证最新（主体随对象矩阵闭账）。
-- [ ] **B-ID83 残项（P2·性能）Data 惰性列物化**——四驱动每行每列无条件字符串物化+数值
-  重复解析（SqliteConnection.zan:344-373、PostgresConnection/MySqlConnection 同型，
-  DbResult.GetInt/GetLong/GetDouble 无缓存；20 列×1 万行=20 万次串分配/查询）：惰性列
-  物化/类型化直取（sqlite3_column_int64），涉四驱动读取面，单独批次。（b/c/d 随 b4ee0a62
-  闭账，Distinct(eq) O(N²) 已文档声明。）
+- [x] **B-ID83 残项（P2·性能）Data 惰性列物化**——闭账：DbResult 单元格改类型化双通道
+  （`DbCell{kind,ival}` 纯 POD 载荷 + texts 平行串表，JsonSlot 同款"纯 POD 才当数组"取舍；
+  kind 0=NULL/1=整数/2=文本，实数刻意留文本通道——sqlite REAL column_text "2.0" 与 double
+  最短往返 "2" 不同，直存 double 会在 GetString 上静默改写）。四驱动读取面整型列直取：
+  Sqlite sqlite3_column_int64（按 storage class），Postgres PQftype OID 21/23/20 解析一次
+  弃串，MySql 文本/二进制协议各两现场（列定义包提类型字节+UNSIGNED 旗标；无符号 BIGINT
+  回绕会改写 GetString 故留文本通道），SqlServer TdsCell 携 ival（Scalar INT2/4/8/N 直取）。
+  全部旧 API 逐字节保兼容（GetString 整数格 itoa=驱动文本、GetBool 仅 1 为真、AddRow/
+  AddRowNulls legacy 通道留给 Firebird/TDengine/ODBC/Excel）。实测 10k 行×21 列 ：memory:
+  sqlite：build 26ms→20ms、8 整数列+12 文本列类型化读 12ms→2ms（acc 逐位一致）；新增
+  tests/conformance/db_cell_types（28 检，含 >2^53 精度、负数、NULL、RowAt、GetRow 串化）。
 - [ ] **B-ID84 残项（P3批·卫生汇总）**——runtime：libwebp 1.4.0→例行升级、Windows g_fls
   DWORD 跨线程读/pthread key 失败不回收。zanc：verbatim/插值字符串 EOF 未终止无诊断
   （lexer.c:1335,1288）、浮点字面量超长误报 integer 措辞（:945）、arena 尺寸算术无溢出

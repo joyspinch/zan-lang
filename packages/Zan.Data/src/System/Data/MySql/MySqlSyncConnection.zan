@@ -504,6 +504,8 @@ class MySqlSyncConnection : IDbConnection {
         List<int> cc = new List<int>(); cc.Add(0);
         int ncols = (int)MySqlWire.readLenenc(first, cc);
         result.SetColumnCount(ncols);
+        List<int> colTypes = new List<int>();
+        List<int> colFlags = new List<int>();
         int c = 0;
         for (; c < ncols; c = c + 1) {
             byte[] cd = this.readPacket();
@@ -513,6 +515,11 @@ class MySqlSyncConnection : IDbConnection {
             MySqlWire.readLenencStr(cd, cur);
             MySqlWire.readLenencStr(cd, cur);
             result.AddColumnName(MySqlWire.readLenencStr(cd, cur));
+            MySqlWire.readLenencStr(cd, cur);   // org_name
+            MySqlWire.readLenenc(cd, cur);      // 定长字段标记（0x0c）
+            int p = cur[0];
+            colTypes.Add(cd[p + 6] & 255);      // 字符集 2 + 长度 4
+            colFlags.Add((cd[p+7]&255) | ((cd[p+8]&255) << 8));
         }
         byte[] colEof = this.readPacket();
         int rowCount = 0;
@@ -522,29 +529,33 @@ class MySqlSyncConnection : IDbConnection {
             if (row == null) { break; }
             if (this.isEof(row)) { break; }
             cur[0] = 0;
-            List<string> outRow = new List<string>();
-            List<bool> nullFlags = null;
+            List<DbCell> cells = new List<DbCell>();
+            List<string> texts = new List<string>();
             c = 0;
             while (c < ncols) {
-                if ((row[cur[0]] & 255) == 251) {
+                DbCell cell = new DbCell();
+                if ((row[cur[0]] & 255) == 251) {   // NULL 标记
                     cur[0] = cur[0] + 1;
-                    outRow.Add("");
-                    if (nullFlags == null) {
-                        nullFlags = new List<bool>();
-                        for (int k = 0; k < c; k = k + 1) { nullFlags.Add(false); }
-                    }
-                    nullFlags.Add(true);
+                    texts.Add("");
                 } else {
-                    outRow.Add(MySqlWire.readLenencStr(row, cur));
-                    if (nullFlags != null) { nullFlags.Add(false); }
+                    string v = MySqlWire.readLenencStr(row, cur);
+                    int ct = colTypes[c];
+                    // 整型列解析一次存 ival（B-ID83）；无符号 BIGINT
+                    // 超 long 的回绕会改写 GetString，保留文本通道。
+                    if ((ct == 1 || ct == 2 || ct == 3 || ct == 9 || ct == 13)
+                            || (ct == 8 && (colFlags[c] & 32) == 0)) {
+                        cell.kind = 1;
+                        cell.ival = Convert.ToInt64(v);
+                        texts.Add("");
+                    } else {
+                        cell.kind = 2;
+                        texts.Add(v);
+                    }
                 }
+                cells.Add(cell);
                 c = c + 1;
             }
-            if (nullFlags != null) {
-                result.AddRowNulls(outRow, nullFlags);
-            } else {
-                result.AddRow(outRow);
-            }
+            result.AddRowCells(cells, texts);
             rowCount = rowCount + 1;
         }
         this.lastAffected = rowCount;
@@ -561,6 +572,36 @@ class MySqlSyncConnection : IDbConnection {
 
     /// 按列类型解码二进制协议行值，返回其文本形式（整型带符号处理，
     /// 日期/时间/浮点按 wire 格式渲染，其余按 lenenc 字符串）。
+    /// <summary>在游标 cur[0] 处读取给定列类型的一个二进制协议整数值，
+    /// 读取后推进游标，返回 long（B-ID83：与 readBinValue 的整型分支
+    /// 同一定位与符号规则，只免去格式化成串；无符号 BIGINT 与
+    /// readBinValue 一样按 long 回绕解释）。</summary>
+    static long readBinLong(string buf, List<int> cur, int type, int flags) {
+        int p = cur[0];
+        bool uns = (flags & 32) != 0;
+        if (type == 1) {
+            int v = buf[p] & 255; cur[0] = p + 1;
+            if (!uns && v > 127) { v = v - 256; }
+            return v;
+        }
+        if (type == 2 || type == 13) {
+            int v = (buf[p]&255) | ((buf[p+1]&255) << 8); cur[0] = p + 2;
+            if (!uns && v > 32767) { v = v - 65536; }
+            return v;
+        }
+        if (type == 3 || type == 9) {
+            long v = (long)(buf[p]&255) | ((long)(buf[p+1]&255)<<8)
+                   | ((long)(buf[p+2]&255)<<16) | ((long)(buf[p+3]&255)<<24);
+            cur[0] = p + 4;
+            if (!uns && v > 2147483647) { v = v - 4294967296; }
+            return v;
+        }
+        long w = 0;
+        for (int i = 0; i < 8; i = i + 1) { w = w | ((long)(buf[p+i]&255) << (8*i)); }
+        cur[0] = p + 8;
+        return w;
+    }
+
     static string readBinValue(string buf, List<int> cur, int type, int flags) {
         int p = cur[0];
         bool uns = (flags & 32) != 0;
@@ -830,30 +871,31 @@ class MySqlSyncConnection : IDbConnection {
             if (this.isEof(row)) { break; }
             int bmLen = (ncols + 9) / 8;
             cur[0] = 1 + bmLen;
-            List<string> outRow = new List<string>();
-            List<bool> nullFlags = null;
+            List<DbCell> cells = new List<DbCell>();
+            List<string> texts = new List<string>();
             c = 0;
             while (c < ncols) {
+                DbCell cell = new DbCell();
                 int bit = c + 2;
                 int nb = row[1 + bit / 8] & 255;
                 if (((nb >> (bit % 8)) & 1) == 1) {
-                    outRow.Add("");
-                    if (nullFlags == null) {
-                        nullFlags = new List<bool>();
-                        for (int k = 0; k < c; k = k + 1) { nullFlags.Add(false); }
-                    }
-                    nullFlags.Add(true);
+                    texts.Add("");
                 } else {
-                    outRow.Add(readBinValue(row, cur, colTypes[c], colFlags[c]));
-                    if (nullFlags != null) { nullFlags.Add(false); }
+                    int ct = colTypes[c];
+                    if (ct == 1 || ct == 2 || ct == 3 || ct == 8
+                            || ct == 9 || ct == 13) {
+                        cell.kind = 1;    // 整型直取（B-ID83）
+                        cell.ival = readBinLong(row, cur, ct, colFlags[c]);
+                        texts.Add("");
+                    } else {
+                        cell.kind = 2;
+                        texts.Add(readBinValue(row, cur, ct, colFlags[c]));
+                    }
                 }
+                cells.Add(cell);
                 c = c + 1;
             }
-            if (nullFlags != null) {
-                result.AddRowNulls(outRow, nullFlags);
-            } else {
-                result.AddRow(outRow);
-            }
+            result.AddRowCells(cells, texts);
             rowCount = rowCount + 1;
         }
         this.lastAffected = rowCount;

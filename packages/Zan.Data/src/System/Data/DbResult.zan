@@ -3,41 +3,68 @@ using System.Text;
 
 namespace System.Data;
 
-/// <summary>一行结果：各单元格的字符串值及逐格的 SQL NULL 标记。
-/// 用单一实体承载，避免值与 NULL 标记脱节。</summary>
-class DbRow {
-    List<string> values;
-    List<bool> nulls;
+/// <summary>单元格存储类别：0 = SQL NULL，1 = 整数（ival 有效），
+/// 2 = 文本（texts 同下标有效）。整数格不再于读取时物化字符串
+/// （B-ID83：10k 行 × 20 列每次查询省下 ~8 万次串分配与 GetInt
+/// 的逐格重解析）；实数/大对象沿用文本通道——sqlite REAL 的
+/// column_text 形如 "2.0"，与 double 的最短往返格式（"2"）不同，
+/// 直接存 double 会在 GetString 上引入静默兼容差异。</summary>
+struct DbCell {
+    /// 0 = SQL NULL；1 = 整数；2 = 文本。
+    public int kind;
+    /// kind 1 的 64 位整数值。
+    public long ival;
+}
 
-    DbRow(List<string> values, List<bool> nulls) {
-        this.values = values;
-        this.nulls = nulls;
+/// <summary>一行结果：类型化单元格带（kind/ival）与文本载荷平行表。
+/// cells 刻意保持纯 POD（无 ARC 指针字段）——List&lt;struct&gt; 每次
+/// 下标读都按位拷贝，带指针字段就会每次 retain/release，纯 POD 才能
+/// 当数组用（同 JsonSlot/JsonPair 的取舍）；文本放 texts 平行表，
+/// 只在 kind 2 时读取。两表长度恒相等。</summary>
+class DbRow {
+    List<DbCell> cells;
+    List<string> texts;
+
+    DbRow(List<DbCell> cells, List<string> texts) {
+        this.cells = cells;
+        this.texts = texts;
     }
 
     /// <summary>返回该行的字段总数。</summary>
     int Count() {
-        if (this.values == null) { return 0; }
-        return this.values.Count;
+        if (this.cells == null) { return 0; }
+        return this.cells.Count;
     }
 
     /// <summary>获取指定列索引处的字符串值。</summary>
     string GetString(int col) {
-        if (this.values != null && col >= 0 && col < this.values.Count) {
-            return this.values[col];
+        if (this.cells == null || col < 0 || col >= this.cells.Count) {
+            return "";
+        }
+        DbCell cell = this.cells[col];
+        if (cell.kind == 1) {
+            return Convert.ToString(cell.ival);
+        }
+        if (cell.kind == 2) {
+            return this.texts[col];
         }
         return "";
     }
 
     /// <summary>指定列是否为 SQL NULL。</summary>
     bool IsNull(int col) {
-        if (this.nulls != null && col >= 0 && col < this.nulls.Count) {
-            return this.nulls[col];
+        if (this.cells != null && col >= 0 && col < this.cells.Count) {
+            return this.cells[col].kind == 0;
         }
         return false;
     }
 
     /// <summary>获取指定列索引处的整数值。</summary>
     int GetInt(int col) {
+        if (this.cells != null && col >= 0 && col < this.cells.Count
+            && this.cells[col].kind == 1) {
+            return (int)this.cells[col].ival;
+        }
         string val = this.GetString(col);
         if (val.Length == 0) { return 0; }
         return Convert.ToInt(val);
@@ -45,6 +72,10 @@ class DbRow {
 
     /// <summary>获取指定列索引处的 64 位整数值。</summary>
     long GetLong(int col) {
+        if (this.cells != null && col >= 0 && col < this.cells.Count
+            && this.cells[col].kind == 1) {
+            return this.cells[col].ival;
+        }
         string val = this.GetString(col);
         if (val.Length == 0) { return 0; }
         return Convert.ToInt64(val);
@@ -52,6 +83,10 @@ class DbRow {
 
     /// <summary>获取指定列索引处的双精度浮点值。</summary>
     double GetDouble(int col) {
+        if (this.cells != null && col >= 0 && col < this.cells.Count
+            && this.cells[col].kind == 1) {
+            return (double)this.cells[col].ival;
+        }
         string val = this.GetString(col);
         if (val.Length == 0) { return 0.0; }
         return Encoding.ParseDouble(val);
@@ -59,6 +94,10 @@ class DbRow {
 
     /// <summary>获取指定列索引处的布尔值。</summary>
     bool GetBool(int col) {
+        if (this.cells != null && col >= 0 && col < this.cells.Count
+            && this.cells[col].kind == 1) {
+            return this.cells[col].ival == 1;
+        }
         string val = this.GetString(col);
         return val == "1" || val == "true" || val == "True";
     }
@@ -66,7 +105,7 @@ class DbRow {
 
 /// <summary>
 /// 表示一次数据库查询的结果集。
-/// 以字符串值列表存储各行，并附带列名元数据。
+/// 以类型化单元格存储各行，并附带列名元数据。
 /// </summary>
 class DbResult {
     List<DbRow> rows;
@@ -97,25 +136,44 @@ class DbResult {
         this.colMap = null;
     }
 
+    /// <summary>添加一行已物化的单元格（驱动快路径：整数格免字符串
+    /// 物化）。cells 与 texts 长度必须一致；文本格的载荷在 texts。</summary>
+    void AddRowCells(List<DbCell> cells, List<string> texts) {
+        this.rows.Add(new DbRow(cells, texts));
+    }
+
     /// <summary>添加一行值（不含 SQL NULL）。</summary>
     void AddRow(List<string> row) {
-        this.rows.Add(new DbRow(row, null));
+        List<DbCell> cells = new List<DbCell>();
+        for (int i = 0; i < row.Count; i = i + 1) {
+            DbCell cell = new DbCell();
+            cell.kind = 2;
+            cells.Add(cell);
+        }
+        this.rows.Add(new DbRow(cells, row));
     }
 
     /// <summary>添加一行，并附逐列的 SQL NULL 标记，调用方
     /// 可通过 IsNull() 区分 NULL 与空字符串。</summary>
     void AddRowNulls(List<string> row, List<bool> nullFlags) {
-        this.rows.Add(new DbRow(row, nullFlags));
+        List<DbCell> cells = new List<DbCell>();
+        for (int i = 0; i < row.Count; i = i + 1) {
+            DbCell cell = new DbCell();
+            if (nullFlags != null && i < nullFlags.Count && nullFlags[i]) {
+                cell.kind = 0;
+            } else {
+                cell.kind = 2;
+            }
+            cells.Add(cell);
+        }
+        this.rows.Add(new DbRow(cells, row));
     }
 
     /// <summary>单元格为 SQL NULL 时为 true（空字符串则相反，
     /// GetString 对空字符串同样返回 ""）。</summary>
     bool IsNull(int row, int col) {
         if (row >= 0 && row < this.rows.Count) {
-            List<bool> flags = this.rows[row].nulls;
-            if (flags != null && col >= 0 && col < flags.Count) {
-                return flags[col];
-            }
+            return this.rows[row].IsNull(col);
         }
         return false;
     }
@@ -138,39 +196,41 @@ class DbResult {
     /// <summary>获取指定行列索引处的字符串值。</summary>
     string GetString(int row, int col) {
         if (row >= 0 && row < this.rows.Count) {
-            List<string> r = this.rows[row].values;
-            if (col >= 0 && col < r.Count) {
-                return r[col];
-            }
+            return this.rows[row].GetString(col);
         }
         return "";
     }
 
     /// <summary>获取指定行列索引处的整数值。</summary>
     int GetInt(int row, int col) {
-        string val = GetString(row, col);
-        if (val.Length == 0) { return 0; }
-        return Convert.ToInt(val);
+        if (row >= 0 && row < this.rows.Count) {
+            return this.rows[row].GetInt(col);
+        }
+        return 0;
     }
 
     /// <summary>获取指定行列索引处的 64 位整数值。</summary>
     long GetLong(int row, int col) {
-        string val = GetString(row, col);
-        if (val.Length == 0) { return 0; }
-        return Convert.ToInt64(val);
+        if (row >= 0 && row < this.rows.Count) {
+            return this.rows[row].GetLong(col);
+        }
+        return 0;
     }
 
     /// <summary>获取指定行列索引处的双精度值。</summary>
     double GetDouble(int row, int col) {
-        string val = GetString(row, col);
-        if (val.Length == 0) { return 0.0; }
-        return Encoding.ParseDouble(val);
+        if (row >= 0 && row < this.rows.Count) {
+            return this.rows[row].GetDouble(col);
+        }
+        return 0.0;
     }
 
     /// <summary>获取指定行列索引处的布尔值。</summary>
     bool GetBool(int row, int col) {
-        string val = GetString(row, col);
-        return val == "1" || val == "true" || val == "True";
+        if (row >= 0 && row < this.rows.Count) {
+            return this.rows[row].GetBool(col);
+        }
+        return false;
     }
 
     /// <summary>按行索引和列名取值。</summary>
@@ -232,10 +292,10 @@ class DbResult {
     /// <summary>将整行作为字符串列表返回（内部行的副本）。</summary>
     List<string> GetRow(int index) {
         if (index >= 0 && index < this.rows.Count) {
-            List<string> src = this.rows[index].values;
             List<string> copy = new List<string>();
-            for (int i = 0; i < src.Count; i = i + 1) {
-                copy.Add(src[i]);
+            DbRow src = this.rows[index];
+            for (int i = 0; i < src.Count(); i = i + 1) {
+                copy.Add(src.GetString(i));
             }
             return copy;
         }
@@ -260,13 +320,13 @@ class DbResult {
         // 打印分隔线
         Console.WriteLine("---");
 
-        // 打印各行
+        // 打印各行（整数格按 GetString 的十进制格式物化）
         for (int r = 0; r < this.rows.Count; r = r + 1) {
             StringBuilder rowSb = new StringBuilder();
-            List<string> row = this.rows[r].values;
-            for (int cc = 0; cc < row.Count; cc = cc + 1) {
+            DbRow row = this.rows[r];
+            for (int cc = 0; cc < row.Count(); cc = cc + 1) {
                 if (cc > 0) { rowSb.Append("\t"); }
-                rowSb.Append(row[cc]);
+                rowSb.Append(row.GetString(cc));
             }
             Console.WriteLine(rowSb.ToString());
         }

@@ -193,6 +193,7 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
 ### 探针测量与脚本改文件的三条硬纪律（2026-10-02 B-ID48 排查沉淀）
 
 - **测"超期/耗时"先核对单位与减数**：耗时量是微秒、延时参数是毫秒，`raw - delayMs` 少乘 1000 会把 0.5ms 真超期算成 50ms 假超期（本轮"2× 回归"查了两轮调度器，结果是自己探针的单位错）。测超期一律 `raw - delayMs * 1000`。
+- **Stopwatch.GetMilliseconds()/GetMicroseconds() 是静态单调钟读数（墙钟），不是流逝时间**：拿来当 elapsed 用会打出 1 亿毫秒级的数（2026-10-02 B-ID83 探针打出 `build=102483857ms`，误判为计时器坏了）。测流逝要么 `Stopwatch.GetMicroseconds()` 前后两次相减，要么 `StartNew()` + `ElapsedMilliseconds()`。
 - **trace 打点必须带绝对时刻，成对相对量串不成时间线**：`late_us` 只能回答"迟了几多"，回答不了"第几段路迟的"；push/fire/park/slept 各打点带 `zan_co_precise_us()` 绝对值，一轮就能定位迟滞在停车原语还是派发路径。
 - **脚本批量改文件必须读原文→逐处断言命中→写回→复验大小**：`open(p,"w").write(变量.replace(...))` 里变量不是文件内容时写出 0 字节（本轮两个运行时源文件被截断，靠会话内 grep 证据+HEAD 重建）；写完 `len(...)` 不对就停，别继续跑。
 

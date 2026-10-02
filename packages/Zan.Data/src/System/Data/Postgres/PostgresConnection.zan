@@ -89,6 +89,9 @@ class PgConnection : IDbConnection {
     static extern int PQgetisnull(nint res, int row, int col);
 
     [DllImport("libpq")]
+    static extern int PQftype(nint res, int col);   // 列类型 OID
+
+    [DllImport("libpq")]
     static extern string PQcmdTuples(nint res); // 受影响行数（文本形式）
 
     [DllImport("libpq")]
@@ -263,39 +266,51 @@ class PgConnection : IDbConnection {
         return block;
     }
 
+    /// <summary>把一行文本单元格转成类型化行（B-ID83）：int2/int4/int8
+    /// 列（OID 21/23/20）解析一次存 ival，不再保留串。PG 整型的文本
+    /// 形式是纯十进制，Convert.ToString(ival) 逐字节还原，实数/数值
+    /// 沿用文本通道（NUMERIC 文本形如 "2.0"，与 double 最短往返格式
+    /// 不同）。</summary>
+    static void PgAddTypedRow(DbResult result, nint res, int r, int cols,
+            List<int> colOids) {
+        List<DbCell> cells = new List<DbCell>();
+        List<string> texts = new List<string>();
+        int c = 0;
+        while (c < cols) {
+            DbCell cell = new DbCell();
+            if (PQgetisnull(res, r, c) == 1) {
+                texts.Add("");
+            } else {
+                int oid = colOids[c];
+                if (oid == 20 || oid == 21 || oid == 23) {
+                    cell.kind = 1;
+                    cell.ival = Convert.ToInt64(CopyText(PQgetvalue(res, r, c)));
+                    texts.Add("");
+                } else {
+                    cell.kind = 2;
+                    texts.Add(CopyText(PQgetvalue(res, r, c)));
+                }
+            }
+            cells.Add(cell);
+            c = c + 1;
+        }
+        result.AddRowCells(cells, texts);
+    }
+
     /// <summary>将 TUPLES_OK 的 PGresult 复制为 DbResult（NULL 单元格变为 ""）。</summary>
     static DbResult ReadTuples(nint res) {
         DbResult result = new DbResult();
         int cols = PQnfields(res);
         result.SetColumnCount(cols);
+        List<int> colOids = new List<int>();
         int c = 0;
         for (; c < cols; c = c + 1) {
             result.AddColumnName(CopyText(PQfname(res, c)));
+            colOids.Add(PQftype(res, c));
         }
         int rows = PQntuples(res);
         for (int r = 0; r < rows; r = r + 1) {
-            List<string> row = new List<string>();
-            List<bool> nullFlags = null;
-            c = 0;
-            while (c < cols) {
-                if (PQgetisnull(res, r, c) == 1) {
-                    row.Add("");
-                    if (nullFlags == null) {
-                        nullFlags = new List<bool>();
-                        for (int k = 0; k < c; k = k + 1) { nullFlags.Add(false); }
-                    }
-                    nullFlags.Add(true);
-                } else {
-                    row.Add(CopyText(PQgetvalue(res, r, c)));
-                    if (nullFlags != null) { nullFlags.Add(false); }
-                }
-                c = c + 1;
-            }
-            if (nullFlags != null) {
-                result.AddRowNulls(row, nullFlags);
-            } else {
-                result.AddRow(row);
-            }
+            PgAddTypedRow(result, res, r, cols, colOids);
         }
         return result;
     }
@@ -359,35 +374,16 @@ class PgConnection : IDbConnection {
 
         int cols = PQnfields(res);
         result.SetColumnCount(cols);
+        List<int> colOids = new List<int>();
         int c = 0;
         for (; c < cols; c = c + 1) {
             result.AddColumnName(CopyText(PQfname(res, c)));
+            colOids.Add(PQftype(res, c));
         }
 
         int rows = PQntuples(res);
         for (int r = 0; r < rows; r = r + 1) {
-            List<string> row = new List<string>();
-            List<bool> nullFlags = null;
-            c = 0;
-            while (c < cols) {
-                if (PQgetisnull(res, r, c) == 1) {
-                    row.Add("");
-                    if (nullFlags == null) {
-                        nullFlags = new List<bool>();
-                        for (int k = 0; k < c; k = k + 1) { nullFlags.Add(false); }
-                    }
-                    nullFlags.Add(true);
-                } else {
-                    row.Add(CopyText(PQgetvalue(res, r, c)));
-                    if (nullFlags != null) { nullFlags.Add(false); }
-                }
-                c = c + 1;
-            }
-            if (nullFlags != null) {
-                result.AddRowNulls(row, nullFlags);
-            } else {
-                result.AddRow(row);
-            }
+            PgAddTypedRow(result, res, r, cols, colOids);
         }
 
         PQclear(res);
@@ -567,34 +563,15 @@ class PgConnection : IDbConnection {
                     int cols = PQnfields(res);
                     result = new DbResult();
                     result.SetColumnCount(cols);
+                    List<int> colOids = new List<int>();
                     int c = 0;
                     for (; c < cols; c = c + 1) {
                         result.AddColumnName(CopyText(PQfname(res, c)));
+                        colOids.Add(PQftype(res, c));
                     }
                     int rows = PQntuples(res);
                     for (int r = 0; r < rows; r = r + 1) {
-                        List<string> row = new List<string>();
-                        List<bool> nullFlags = null;
-                        c = 0;
-                        while (c < cols) {
-                            if (PQgetisnull(res, r, c) == 1) {
-                                row.Add("");
-                                if (nullFlags == null) {
-                                    nullFlags = new List<bool>();
-                                    for (int k = 0; k < c; k = k + 1) { nullFlags.Add(false); }
-                                }
-                                nullFlags.Add(true);
-                            } else {
-                                row.Add(CopyText(PQgetvalue(res, r, c)));
-                                if (nullFlags != null) { nullFlags.Add(false); }
-                            }
-                            c = c + 1;
-                        }
-                        if (nullFlags != null) {
-                            result.AddRowNulls(row, nullFlags);
-                        } else {
-                            result.AddRow(row);
-                        }
+                        PgAddTypedRow(result, res, r, cols, colOids);
                     }
                 } else if (PQresultStatus(res) != 1) {   // not COMMAND_OK
                     this.lastError = CopyText(PQerrorMessage(this.handle));
