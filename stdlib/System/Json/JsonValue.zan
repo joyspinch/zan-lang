@@ -184,9 +184,11 @@ class JsonValue {
 
     // ---- 对象访问 -----------------------------------------------------
 
-    /// 追加键值对（对象）。不去重。
+    /// 追加键值对（对象）。不去重；重复键读取时首键胜（见 Get）。
     void Put(string key, JsonValue v) {
-        if (this.keyIndex != null) {
+        // 索引已在册的键不覆盖：首键胜——否则 Get 的哈希路径与
+        // n<=8 线性扫描语义相反（B-ID75b）。
+        if (this.keyIndex != null && !this.keyIndex.ContainsKey(key)) {
             this.keyIndex[key] = keys.Count;
         }
         keys.Add(key);
@@ -215,6 +217,7 @@ class JsonValue {
     /// `key` 对应的值；不存在或不是对象时返回 null。
     /// 键数量 <= 8 时走连续内存线性扫描（零额外内存、缓存行友好）；
     /// 键数量 > 8 时自动激活懒加载哈希索引，O(1) 访问。
+    /// 重复键统一首键胜（与线性扫描同语义）。
     JsonValue Get(string key) {
         if (kind != 5) { return null; }
         int n = keys.Count;
@@ -227,7 +230,9 @@ class JsonValue {
         if (this.keyIndex == null) {
             Dict<string, int> ki = new Dict<string, int>();
             for (int i = 0; i < n; i = i + 1) {
-                ki[keys[i]] = i;
+                // 首键胜：在册的不覆盖（B-ID75b——旧实现直接覆盖成
+                // 末键，与 n<=8 路径的线性首键扫描语义翻转）。
+                if (!ki.ContainsKey(keys[i])) { ki[keys[i]] = i; }
             }
             this.keyIndex = ki;
         }
@@ -288,9 +293,14 @@ class JsonValue {
 
     /// 与 PathSet 类似，但写入任意 JsonValue 叶子，使绑定的控件
     /// 能在回写时保持值的 JSON 类型（bool / number / string），
-    /// 而不是全部转成字符串。
+    /// 而不是全部转成字符串。根不是对象（数组/标量）时抛带路径的
+    /// JsonException——旧实现会对 null keys 解引用直接崩溃（B-ID75c）。
     void PathSetValue(string path, JsonValue leaf) {
         if (path == null) { return; }
+        if (!this.IsObject()) {
+            throw new JsonException(
+                "PathSetValue: root is not an object, path: " + path);
+        }
         JsonValue cur = this;
         int start = 0;
         int len = path.Length;
@@ -475,10 +485,14 @@ class JsonValue {
     }
 
     /// 数字的输出文本：解析时就地解析的整数/浮点走格式化，
-    /// NewNum 手工构造的值保留原始字面量。
+    /// NewNum 手工构造的值保留原始字面量。NaN/±Infinity 不是合法
+    /// JSON 数字，输出 null（B-ID75d；GenJson 生成 writer 的同型
+    /// 问题不在此文件，另行挂账）。
     static string NumText(JsonValue v) {
         if (v.numRaw != null && v.numRaw.Length > 0) { return v.numRaw; }
         if (v.numIsInt) { return Convert.ToString(v.numI); }
+        double d = v.numD;
+        if (d != d || d - d != 0) { return "null"; }
         return Convert.ToString(v.numD);
     }
 
@@ -1075,12 +1089,12 @@ class JsonReader {
                         }
                     }
                     if (cp == 0) {
-                        // Zan 字符串以 NUL 结尾，装不下 U+0000：静默丢掉
-                        // 会让写文件的内容与客户端发的不一致，因此明确
-                        // 报错，让调用方改用 base64 通道传二进制。
-                        throw new JsonException(
-                            "\\u0000 cannot be represented in a string; "
-                            + "send binary content as base64");
+                        // \u0000 接受并保留（与 JsonTape 的行为统一；
+                        // Zan 字符串带显式长度，装得下内嵌 NUL。BSON
+                        // 语料先例：管理串可含 NUL）。写出的内容经
+                        // Encoding.JsonEscape 转成 \u0000，往返无损。
+                        sb.Append(Encoding.Utf8FromCodePoint(0));
+                        continue;
                     }
                     sb.Append(Encoding.Utf8FromCodePoint(cp));
                     continue;

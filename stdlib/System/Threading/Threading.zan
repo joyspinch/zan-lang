@@ -70,8 +70,10 @@ class Thread {
 /// </summary>
 class Mutex {
     #if WINDOWS
+    // name 以 nint 传 NULL：传 "" 是合法的命名对象名，会让本进程所有
+    // 实例共享同一个内核互斥体（B-ID75g）。
     [DllImport("kernel32", EntryPoint = "CreateMutexA")]
-    static extern nint WinCreateMutex(nint secAttrs, int initialOwner, string name);
+    static extern nint WinCreateMutex(nint secAttrs, int initialOwner, nint name);
 
     [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
     static extern int WinWaitForSingleObject(nint handle, int milliseconds);
@@ -105,9 +107,9 @@ class Mutex {
     #endif
 
     #if WINDOWS
-    /// 创建 Win32 互斥锁句柄（匿名，非初始占有）。
+    /// 创建 Win32 互斥锁（匿名——name 传 NULL，非初始占有）。
     static nint Create() {
-        return WinCreateMutex(0, 0, "");
+        return WinCreateMutex(0, 0, 0);
     }
 
     /// 无限阻塞加锁（配对 Unlock）。
@@ -156,8 +158,10 @@ class Mutex {
 /// </summary>
 class Semaphore {
     #if WINDOWS
+    // name 以 nint 传 NULL（与 Mutex 同因："" 是合法命名对象，
+    // 会让全部实例共享同一信号量，B-ID75g 同型）。
     [DllImport("kernel32", EntryPoint = "CreateSemaphoreA")]
-    static extern nint WinCreateSemaphore(nint secAttrs, int initialCount, int maxCount, string name);
+    static extern nint WinCreateSemaphore(nint secAttrs, int initialCount, int maxCount, nint name);
 
     [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
     static extern int WinWaitForSingleObject(nint handle, int milliseconds);
@@ -213,12 +217,30 @@ class Semaphore {
 
     [DllImport("crt", EntryPoint = "clock_gettime")]
     static extern int SemClockGettime(int clkId, nint tp);
+
+    // errno 读取（线程局部）：sem_wait/sem_timedwait 被 signal 打断时
+    // 返回 -1 + EINTR，必须重试而不是当成失败/超时（B-ID75j）。
+    // Darwin 的 errno 是宏，真身是 __error()；glibc/musl/WASI 都是
+    // __errno_location()。EINTR 在这些平台都是 4。
+    #if MACOS
+    [DllImport("crt", EntryPoint = "__error")]
+    static extern nint SemErrnoLoc();
+    #else
+    [DllImport("crt", EntryPoint = "__errno_location")]
+    static extern nint SemErrnoLoc();
+    #endif
+
+    static int SemErrno() {
+        return new Span<int>(SemErrnoLoc(), 1)[0];
+    }
+
+    static int SemEintr() { return 4; }
     #endif
 
     #if WINDOWS
-    /// 创建信号量：initialCount 初始许可，maxCount 上限。
+    /// 创建信号量：initialCount 初始许可，maxCount 上限（匿名，name 传 NULL）。
     static nint Create(int initialCount, int maxCount) {
-        return WinCreateSemaphore(0, initialCount, maxCount, "");
+        return WinCreateSemaphore(0, initialCount, maxCount, 0);
     }
 
     /// 无限阻塞获取一个许可（配对 Release）。
@@ -284,30 +306,36 @@ class Semaphore {
         return sem;
     }
 
-    /// 无限阻塞获取一个许可（配对 Release）。
+    /// 无限阻塞获取一个许可（配对 Release）。EINTR（被 signal 打断）
+    /// 重试，其它错误返回（与旧实现同样不报错，语义不变）。
     static void Wait(string handle) {
-        SemWait(handle);
+        while (SemWait(handle) != 0) {
+            if (SemErrno() != Semaphore.SemEintr()) { return; }
+        }
     }
 
-    /// 限时获取：获取到返回 true；超时返回 false（不消耗许可）。
+    /// <summary>限时获取：获取到返回 true；超时返回 false（不消耗许可）。
     /// 负超时无限等待。sem_timedwait 接受 ABSOLUTE CLOCK_REALTIME
-    /// 绝对截止时间，因此需读时钟再加上超时。
+    /// 绝对截止时间，因此需读时钟再加上超时；EINTR 重试时重算截止
+    /// 时间（剩余超时从当前时刻起算）。</summary>
     static bool WaitFor(string handle, int timeoutMs) {
         if (timeoutMs < 0) {
-            SemWait(handle);
+            Semaphore.Wait(handle);
             return true;
         }
-        // sem_timedwait 接受 ABSOLUTE CLOCK_REALTIME 绝对截止时间，因此需读取
-        // 时钟再加上超时，而不是传入一个时长。
         nint ts = NativeMemory.Alloc(16);
-        SemClockGettime(0, ts);
-        Span<long> f = new Span<long>(ts, 2);
-        long ns = f[1] + (long)timeoutMs * 1000000;
-        f[0] = f[0] + ns / 1000000000;
-        f[1] = ns % 1000000000;
-        int r = SemTimedWait(handle, ts);
+        bool ok = false;
+        while (true) {
+            SemClockGettime(0, ts);
+            Span<long> f = new Span<long>(ts, 2);
+            long ns = f[1] + (long)timeoutMs * 1000000;
+            f[0] = f[0] + ns / 1000000000;
+            f[1] = ns % 1000000000;
+            if (SemTimedWait(handle, ts) == 0) { ok = true; break; }
+            if (SemErrno() != Semaphore.SemEintr()) { ok = false; break; }
+        }
         NativeMemory.Free(ts);
-        return r == 0;
+        return ok;
     }
 
     /// 归还一个许可。

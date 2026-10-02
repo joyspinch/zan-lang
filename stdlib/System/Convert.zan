@@ -71,8 +71,13 @@ class Convert {
         if (len > 0 && s[len - 1] == 61) { pad = pad + 1; }
         if (len > 1 && s[len - 2] == 61) { pad = pad + 1; }
 
-        int outLen = (len * 3) / 4 - pad;
-        if (outLen < 0) { outLen = 0; }
+        // (len*3)/4 按 64 位算（B-ID75l）：int 乘法在 len > 715827882
+        // 时回绕成负值，分配出错误长度的缓冲。输出上限 1GB，超长拒入
+        // ——返回 null，与本函数"非法输入返回 null"的既有约定一致。
+        long outLenL = ((long)len * 3) / 4 - pad;
+        if (outLenL < 0) { outLenL = 0; }
+        if (outLenL > 1073741824) { return null; }
+        int outLen = (int)outLenL;
         byte[] outb = new byte[outLen];
 
         long written = NativeMemory.Base64Decode(outb, s, (long)len);
@@ -137,10 +142,28 @@ class Convert {
         return 0;
     }
 
-    /// <summary>将十六进制字符串解码为字节数组。</summary>
+    /// <summary>将十六进制字符串解码为字节数组。长度必须为偶数，
+    /// 出现非十六进制字符时抛 ArgumentException（对齐 .NET 语义）。
+    /// 旧实现把非法字符静默按 0 处理；全仓调用方（StringExtensions
+    /// 扩展与硬件加速管线用例）均传可信输入，无人依赖宽松行为，
+    /// 故收紧（B-ID75n）。stdlib 无 FormatException，用 ArgumentException
+    /// ——与 Encoding.Base64Decode 的非法输入异常同型。</summary>
     static byte[] FromHexString(string hex) {
         if (hex == null || hex.Length == 0) { return new byte[0]; }
+        if ((hex.Length & 1) != 0) {
+            throw new ArgumentException(
+                "FromHexString: odd length " + hex.Length);
+        }
         int n = hex.Length / 2;
+        for (int i = 0; i < hex.Length; i = i + 1) {
+            int c = hex[i] & 255;
+            bool ok = (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+                || (c >= 65 && c <= 70);
+            if (!ok) {
+                throw new ArgumentException(
+                    "FromHexString: invalid hex character at " + i);
+            }
+        }
         byte[] outb = new byte[n];
         for (int i = 0; i < n; i = i + 1) {
             outb[i] = (byte)(((Nibble(hex[2*i] & 255) << 4) | Nibble(hex[2*i+1] & 255)) & 255);

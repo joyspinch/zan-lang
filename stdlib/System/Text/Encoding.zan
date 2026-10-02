@@ -10,27 +10,6 @@ class Encoding {
     [DllImport("crt")]
     static extern long strlen(string str);
 
-    /// <summary>将整数转换为字符串。逐位生成
-    /// 而不用 sprintf：变参 C 函数在 Darwin arm64 上采用不同 ABI（参数在栈上，
-    /// 而非寄存器中），因此 FFI 变参调用会在该平台
-    /// 破坏参数。</summary>
-    static string IntToString(int val) {
-        byte[] buf = new byte[32];
-        int v = val;
-        int neg = 0;
-        if (v < 0) { neg = 1; v = 0 - v; }
-        int end = 31;
-        int i = end;
-        if (v == 0) { i = i - 1; buf[i] = 48; }
-        while (v > 0) {
-            i = i - 1;
-            buf[i] = (byte)(48 + v % 10);
-            v = v / 10;
-        }
-        if (neg == 1) { i = i - 1; buf[i] = 45; }
-        return buf.ToStr(i, end - i);
-    }
-
     /// <summary>将 double 转换为字符串。</summary>
     static string DoubleToString(double val) {
         return "" + val;
@@ -62,8 +41,10 @@ class Encoding {
     }
 
     /// <summary>将字符串解析为 double，与 C 的 atof 一致：可选符号、
-    /// 整数和小数部分，以及可选十进制指数
-    /// （e/E）。无数字时返回 0。</summary>
+    /// 整数和小数部分（小数位钳 19 位——double 只有 ~17 位有效数字，
+    /// 更长的尾数只是白烧循环，frac 也会下溢成 0，B-ID84），以及
+    /// 可选十进制指数（e/E，指数位累加按 10^8 钳制防 i32 回绕）。
+    /// 无数字时返回 0。</summary>
     static double ParseDouble(string text) {
         int len = text.Length;
         int i = 0;
@@ -86,11 +67,19 @@ class Encoding {
         if (i < len && (text[i] & 255) == 46) {
             i = i + 1;
             double frac = 0.1;
-            while (i < len) {
+            int digits = 0;
+            while (i < len && digits < 19) {
                 int c = text[i] & 255;
                 if (c < 48 || c > 57) { break; }
                 val = val + (double)(c - 48) * frac;
                 frac = frac * 0.1;
+                digits = digits + 1;
+                i = i + 1;
+            }
+            // 钳制后剩余的小数位跳过（不再参与取值）。
+            while (i < len) {
+                int c = text[i] & 255;
+                if (c < 48 || c > 57) { break; }
                 i = i + 1;
             }
         }
@@ -107,18 +96,29 @@ class Encoding {
                 while (i < len) {
                     int c2 = text[i] & 255;
                     if (c2 < 48 || c2 > 57) { break; }
-                    exp = exp * 10 + (c2 - 48);
+                    if (exp < 100000000) { exp = exp * 10 + (c2 - 48); }
                     i = i + 1;
                 }
-                double p = 1.0;
-                for (int k = 0; k < exp; k = k + 1) { p = p * 10.0; }
+                double p;
+                if (exp > 400) {
+                    // 指数远超 double 域（±308）：0 保持 0，非零按
+                    // ±Infinity/±0 收敛，不做天文次乘法。
+                    if (val == 0.0) { return 0.0; }
+                    p = 1e308 * 10;   // +Infinity
+                } else {
+                    p = 1.0;
+                    for (int k = 0; k < exp; k = k + 1) { p = p * 10.0; }
+                }
                 if (esign > 0) { val = val * p; } else { val = val / p; }
             }
         }
         return sign * val;
     }
 
-    /// <summary>获取 UTF-8 字符串的字节数。</summary>
+    /// <summary>获取 UTF-8 字符串的字节数。注意：底层走 strlen，
+    /// 内嵌 NUL 时只数到第一个 NUL——本方法面向 extern 裸串（C
+    /// 字符串）场景；Zan 自有字符串自带长度，取字节数请直接用
+    /// <c>text.Length</c>。</summary>
     static int GetByteCount(string text) {
         return (int)strlen(text);
     }
@@ -635,8 +635,9 @@ class Encoding {
     /// <summary>计算 <paramref name="data"/> 前 <paramref
     /// name="len"/> 个字节的 20 字节 SHA-1 摘要，写入
     /// 调用方持有的 20 字节缓冲区 <paramref name="digest"/>。消息长度
-    /// 最高支持 2^29 字节（64 位长度字段由 32 位
-    /// 位计数写出），足以覆盖此处的握手/哈希用途。</summary>
+    /// 字段按 64 位写出（高低 32 位分开搬，(long)len*8 不经 int——
+    /// len ≥ 2^28 时 len*8 会 i32 回绕，B-ID75i），支持到 2^61 字节，
+    /// 覆盖此处的握手/哈希用途。</summary>
     static void Sha1(string data, int len, byte[] digest) {
         long h0 = 1732584193;   // 0x67452301
         long h1 = 4023233417;   // 0xEFCDAB89
@@ -644,7 +645,7 @@ class Encoding {
         long h3 = 271733878;    // 0x10325476
         long h4 = 3285377520;   // 0xC3D2E1F0
 
-        int bitLen = len * 8;
+        long bitLen = (long)len * 8;
         int fullLen = len + 1;
         while ((fullLen % 64) != 56) {
             fullLen = fullLen + 1;
@@ -656,6 +657,11 @@ class Encoding {
             msg[i] = (byte)data[i];
         }
         msg[len] = 128;   // 0x80 终止符；后续字节已为零
+        // 64 位大端长度（RFC 3174）：旧实现只写低 32 位且经 int 溢出。
+        msg[fullLen - 8] = (byte)((bitLen >> 56) & 255);
+        msg[fullLen - 7] = (byte)((bitLen >> 48) & 255);
+        msg[fullLen - 6] = (byte)((bitLen >> 40) & 255);
+        msg[fullLen - 5] = (byte)((bitLen >> 32) & 255);
         msg[fullLen - 4] = (byte)((bitLen >> 24) & 255);
         msg[fullLen - 3] = (byte)((bitLen >> 16) & 255);
         msg[fullLen - 2] = (byte)((bitLen >> 8) & 255);

@@ -22,17 +22,21 @@ class DateTime {
     static extern void GetSystemTimeAsFileTime(nint lpFileTime);
     #endif
 
-    /// 本机时区换算全部交给 libc 的时区库：localtime 把纪元秒展开成本地
-    /// 墙钟字段，再用 timegm（Windows 上是 _mkgmtime）把这组字段当作 UTC
-    /// 折回纪元秒，两者之差就是该时刻的实际偏移（自带夏令时）。
+    /// 本机时区换算全部交给 libc 的时区库：localtime_r（POSIX）/
+    /// _localtime64_s（Windows，msvcrt 只导出这个名字；参序为
+    /// (tm, time)，成功返回 0）把纪元秒展开进调用方提供的 struct tm
+    /// 缓冲——线程局部，替代旧 localtime 的共享静态缓冲（多线程并发
+    /// 取本地时间会互踩字段，B-ID75h）。再用 timegm（Windows 上是
+    /// _mkgmtime）把这组字段当作 UTC 折回纪元秒，两者之差就是该时刻
+    /// 的实际偏移（自带夏令时）。
     #if WINDOWS
-    [DllImport("crt", EntryPoint = "localtime")]
-    static extern nint plat_localtime(nint tptr);
+    [DllImport("crt", EntryPoint = "_localtime64_s")]
+    static extern int plat_localtime(nint tmOut, nint tptr);
     [DllImport("crt", EntryPoint = "_mkgmtime")]
     static extern long plat_timegm(nint tm);
     #else
-    [DllImport("crt", EntryPoint = "localtime")]
-    static extern nint plat_localtime(nint tptr);
+    [DllImport("crt", EntryPoint = "localtime_r")]
+    static extern nint plat_localtime(nint tptr, nint tmOut);
     [DllImport("crt", EntryPoint = "timegm")]
     static extern long plat_timegm(nint tm);
     #endif
@@ -132,12 +136,21 @@ class DateTime {
     /// 时区信息不可用时返回 0（等同 UTC）。
     /// </summary>
     static int LocalOffsetMinutesAt(long unixSeconds) {
-        nint p = NativeMemory.Alloc(8);
-        new Span<long>(p, 1)[0] = unixSeconds;
-        nint tm = plat_localtime(p);
-        NativeMemory.Free(p);
-        if (tm == 0) { return 0; }
+        nint tbuf = NativeMemory.Alloc(8);
+        new Span<long>(tbuf, 1)[0] = unixSeconds;
+        // struct tm 布局平台各异（glibc/Darwin 56 字节、MSVC 36 字节），
+        // 给 128 字节清零缓冲；读端只经 plat_timegm（libc 自己解释布局）。
+        nint tm = NativeMemory.Alloc(128);
+        NativeMemory.Fill(tm, 0, 128);
+        #if WINDOWS
+        bool ok = plat_localtime(tm, tbuf) == 0;
+        #else
+        bool ok = plat_localtime(tbuf, tm) != 0;
+        #endif
+        NativeMemory.Free(tbuf);
+        if (!ok) { NativeMemory.Free(tm); return 0; }
         long wall = plat_timegm(tm);
+        NativeMemory.Free(tm);
         if (wall == 0 - 1) { return 0; }
         return (int)((wall - unixSeconds) / 60);
     }
