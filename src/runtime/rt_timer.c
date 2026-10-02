@@ -1317,9 +1317,13 @@ void zan_co_live_reset(void) {
  *    awaiter_step=reap_fn (emit_detach_async_call): those two frame slots
  *    BELONG to the spawn/reap lifecycle and may not be borrowed. The old
  *    CAS-on-awaiter join design could never match on them.
- *  - The one universal point every detached frame passes before free is the
- *    untrack call inside the reap fn (untrack -> cancel_delay -> frame_free),
- *    so completion notification hooks there (see zan_co_live_del).
+ *  - Completion notification hooks at the emitted completion epilogue
+ *    (zan_join_complete, called right after DONE is published): every async
+ *    frame passes it exactly once, including result-carrying Task.Run frames
+ *    that stay TRACKED after completion (done=1, not reaped until Result/
+ *    Wait) — for those the untrack call never fires. The untrack point in
+ *    zan_co_live_del remains as the fallback for a frame that leaves the
+ *    registry without a normal completion.
  *  - The joiner suspends with the Delay shape: the runtime keeps
  *    (frame, step) and readies it later; the suspend path must NOT self-ready
  *    (a stray self-ready means an immediate empty resume and a broken wait).
@@ -1466,6 +1470,29 @@ static void join_on_untrack(void *frame, void **out_joiner, zan_timer_step_t *ou
     pr->done = 1;
     joinmap_remove(frame, pr);
     join_fire_locked(pr->owner, out_joiner, out_step);
+}
+
+/* completion hook (B-ID56): called by the emitted completion epilogue of
+ * EVERY async frame right after DONE is published. This is the primary join
+ * notification because it also covers result-carrying Task.Run frames, which
+ * stay tracked after completion (done=1, not reaped) until Result/Wait reaps
+ * them — the untrack hook alone never sees those, and the join would hang
+ * until the scheduler runs dry. The untrack hook in zan_co_live_del stays as
+ * the fallback for a frame that leaves the registry without a normal
+ * completion. Lock-free fast path for programs that never join. */
+void zan_join_complete(void *frame) {
+    if (!frame || !g_joinmap_cap) return;
+    void *fire_joiner = NULL;
+    zan_timer_step_t fire_step = NULL;
+    live_lock();
+    zan_join_pair_t *pr = joinmap_get(frame);
+    if (pr && !pr->done) {
+        pr->done = 1;
+        joinmap_remove(frame, pr);
+        join_fire_locked(pr->owner, &fire_joiner, &fire_step);
+    }
+    live_unlock();
+    if (fire_joiner && fire_step && g_ready_hook) g_ready_hook(fire_joiner, fire_step);
 }
 
 long long zan_join_new(int npairs, int any) {

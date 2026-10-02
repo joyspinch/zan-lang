@@ -245,6 +245,21 @@ static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals, LLVMValue
     LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0),
         LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "fr.hc"));
 
+    /* B-ID56: completion notification for event-driven joins (Task.WhenAll /
+     * WhenAny). Every async frame passes here exactly once after DONE is
+     * published, INCLUDING result-carrying Task.Run frames that stay tracked
+     * (done=1, not reaped) until Result/Wait reads them — those never reach
+     * the untrack hook, so completion is the primary join notification.
+     * Void call: must stay unnamed — LLVM rejects named void values. */
+    {
+        LLVMTypeRef jc_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+            (LLVMTypeRef[]){ i8ptr }, 1, 0);
+        LLVMValueRef jc = LLVMGetNamedFunction(g->mod, "zan_join_complete");
+        if (!jc) jc = LLVMAddFunction(g->mod, "zan_join_complete", jc_type);
+        LLVMValueRef jc_args[] = { LLVMBuildBitCast(g->builder, frame, i8ptr, "fr.jc") };
+        zan_call2(g->builder, jc_type, jc, jc_args, 1, "");
+    }
+
     emit_release_owned_locals(g, locals);
     /* balance the ramp's receiver retain: the frame owns a +1 on `this` for
      * as long as the coroutine runs (its caller may have dropped the temp
