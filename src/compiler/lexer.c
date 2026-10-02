@@ -364,8 +364,31 @@ static void pp_end_directive_line(zan_lexer_t *lex, int honor_conditional) {
     while (stop < lex->source_len && lex->source[stop] != '\n') {
         char c = lex->source[stop];
         if (c == '/' && stop + 1 < lex->source_len
-            && (lex->source[stop + 1] == '/' || lex->source[stop + 1] == '*'))
+            && lex->source[stop + 1] == '/') {
+            /* a line comment hides the rest of the line, #endif included */
             break;
+        }
+        if (c == '/' && stop + 1 < lex->source_len
+            && lex->source[stop + 1] == '*') {
+            /* a block comment that closes on this line hides only its own
+             * span: skip it and keep scanning. The old code broke on the
+             * comment opener unconditionally, so a conditional closed by
+             * a same-line #endif written after a closed block comment hid
+             * that #endif and the conditional stayed open. */
+            size_t end = stop + 2;
+            while (end < lex->source_len && lex->source[end] != '\n'
+                   && !(lex->source[end] == '*' && end + 1 < lex->source_len
+                        && lex->source[end + 1] == '/'))
+                end++;
+            if (end < lex->source_len && lex->source[end] == '*'
+                && end + 1 < lex->source_len && lex->source[end + 1] == '/') {
+                stop = end + 2;
+                continue;
+            }
+            /* unterminated on this line: the comment (and the newline)
+             * belong to it, let the main lexer pass consume it */
+            break;
+        }
         if (c == '#') {
             size_t p = stop + 1;
             while (p < lex->source_len && (lex->source[p] == ' ' || lex->source[p] == '\t')) p++;

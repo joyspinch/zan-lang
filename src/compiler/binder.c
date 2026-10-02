@@ -1681,6 +1681,85 @@ static void validate_interface_contracts(zan_binder_t *b, zan_ast_list_t *decls)
 }
 
 /* Pass 2: bind member declarations */
+/* Fold an enum member initializer to its integer value (B-ID60). The parser
+ * stores the initializer expression raw: `Red = -5` is a unary-minus node
+ * and `Green = Red + 1` names a sibling member, but every consumer (the
+ * irgen emitter, the reflection tables) only understands AST_INT_LITERAL and
+ * silently fell back to the running counter for anything else — Red
+ * compiled to 0. Fold here, once, in the same unsigned wrap-around
+ * arithmetic the irgen const folder uses (signed overflow would be UB in
+ * the compiler itself), and rewrite the node in place so every consumer
+ * sees one canonical shape. A sibling identifier resolves through the
+ * members already bound for this enum, whose values are literals by then. */
+static bool fold_enum_member_value(zan_binder_t *b, zan_symbol_t *type_sym,
+                                   zan_ast_node_t *e, int64_t *out) {
+    if (!e) return false;
+    switch (e->kind) {
+    case AST_INT_LITERAL:
+        *out = e->int_val;
+        return true;
+    case AST_UNARY: {
+        int64_t v;
+        if (!fold_enum_member_value(b, type_sym, e->unary.operand, &v))
+            return false;
+        uint64_t uv = (uint64_t)v;
+        switch (e->unary.op) {
+        case TK_MINUS: *out = (int64_t)(0ULL - uv); return true;
+        case TK_PLUS:  *out = v; return true;
+        case TK_TILDE: *out = ~v; return true;
+        default: return false;
+        }
+    }
+    case AST_BINARY: {
+        int64_t l, r;
+        if (!fold_enum_member_value(b, type_sym, e->binary.left, &l))
+            return false;
+        if (!fold_enum_member_value(b, type_sym, e->binary.right, &r))
+            return false;
+        uint64_t ul = (uint64_t)l, ur = (uint64_t)r;
+        switch (e->binary.op) {
+        case TK_PLUS:  *out = (int64_t)(ul + ur); return true;
+        case TK_MINUS: *out = (int64_t)(ul - ur); return true;
+        case TK_STAR:  *out = (int64_t)(ul * ur); return true;
+        case TK_SLASH:
+            if (!r || (l == INT64_MIN && r == -1)) return false;
+            *out = l / r; return true;
+        case TK_LESS_LESS: *out = (int64_t)((uint64_t)l << (r & 63)); return true;
+        case TK_AMP:   *out = l & r; return true;
+        case TK_PIPE:  *out = l | r; return true;
+        default: return false;
+        }
+    }
+    case AST_IDENTIFIER: {
+        for (int i = 0; i < type_sym->member_count; i++) {
+            zan_symbol_t *m = type_sym->members[i];
+            if (m->kind != SYM_ENUM_MEMBER) continue;
+            if (m->name.len != e->ident.name.len ||
+                memcmp(m->name.str, e->ident.name.str, m->name.len))
+                continue;
+            /* a later member naming this one is circular (Red = Green,
+             * Green = Red): the value is not a literal yet, so not constant */
+            zan_ast_node_t *md = m->decl;
+            if (!md || md->kind != AST_ENUM_MEMBER ||
+                !md->enum_member.value ||
+                md->enum_member.value->kind != AST_INT_LITERAL)
+                return false;
+            *out = md->enum_member.value->int_val;
+            return true;
+        }
+        return false;
+    }
+    default:
+        return false;
+    }
+}
+
+/* Enum members are ints: reject a folded value outside [INT32_MIN,
+ * INT32_MAX] here rather than letting it wrap in every consumer. */
+static bool enum_value_fits_int(int64_t v) {
+    return v >= INT32_MIN && v <= INT32_MAX;
+}
+
 static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
     zan_istr_t type_name = type_node->type_decl.name;
     zan_symbol_t *type_sym = scope_find(b->current_scope, type_name);
@@ -1757,6 +1836,35 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             break;
         }
         case AST_ENUM_MEMBER: {
+            /* Fold the initializer once, here: every downstream consumer
+             * (irgen emitter, reflection tables) keys on AST_INT_LITERAL.
+             * An unfoldable initializer is an error; clearing the value
+             * leaves the member to the running counter so compilation can
+             * surface more diagnostics. */
+            if (member->enum_member.value) {
+                int64_t v;
+                if (fold_enum_member_value(b, type_sym,
+                                           member->enum_member.value, &v)) {
+                    if (!enum_value_fits_int(v)) {
+                        zan_diag_emit(b->diag, DIAG_ERROR, member->loc,
+                            "enum member '%.*s' value %lld does not fit in "
+                            "'int' (enum members are 32-bit)",
+                            member->enum_member.name.len,
+                            member->enum_member.name.str, (long long)v);
+                    }
+                    zan_ast_node_t *lit = zan_ast_new(b->arena,
+                        AST_INT_LITERAL, member->loc);
+                    lit->int_val = v;
+                    member->enum_member.value = lit;
+                } else {
+                    zan_diag_emit(b->diag, DIAG_ERROR, member->loc,
+                        "enum member '%.*s' initializer must be an integer "
+                        "constant expression",
+                        member->enum_member.name.len,
+                        member->enum_member.name.str);
+                    member->enum_member.value = NULL;
+                }
+            }
             zan_symbol_t *em_sym = make_symbol(b->arena, SYM_ENUM_MEMBER,
                 member->enum_member.name, type_sym->type, member, MOD_PUBLIC);
             scope_add(b->arena, b->current_scope, em_sym);

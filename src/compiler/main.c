@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <time.h>
 #include <sys/stat.h>
 #ifdef _WIN32
@@ -148,6 +149,29 @@ static void link_cap_exceeded(const char *what, int cap) {
             "zanc: too many %s for one link (limit %d) -- raise the matching"
             " ZAN_LINK_MAX_* in src/compiler/main.c\n", what, cap);
     exit(1);
+}
+
+/* Append to a system() link command with a truncation check. Link lines are
+ * built by repeated snprintf(cmd + strlen(cmd), ...) appends; a silent
+ * truncation dropped the tail arguments (the libc --end-group, crtn.o) and
+ * surfaced later as baffling undefined symbols or a broken binary — the
+ * command only overflowed on inputs near the cap, so it looked like a
+ * program bug (B-ID76). Report and exit, like link_cap_exceeded. */
+static void cmd_appendf(char *cmd, size_t cap, const char *fmt, ...) {
+    size_t cur = strlen(cmd);
+    int need = -1;
+    if (cur < cap) {
+        va_list ap;
+        va_start(ap, fmt);
+        need = vsnprintf(cmd + cur, cap - cur, fmt, ap);
+        va_end(ap);
+    }
+    if (need < 0 || cur >= cap || (size_t)need >= cap - cur) {
+        fprintf(stderr,
+                "zanc: link command line exceeded its %d-byte buffer -- too"
+                " many inputs for one link\n", (int)cap);
+        exit(1);
+    }
 }
 
 /* ---- phase timing (--time) ---- */
@@ -7204,18 +7228,15 @@ int main(int argc, char **argv) {
                              "ld.lld -m %s -shared -e DllMain -o \"%s\" \"%s\""
                              " -out-implib \"%s\"",
                              wsub, obj_path, obj_tmp, implib);
-                    { size_t cur = strlen(cmd);
-                      snprintf(cmd + cur, sizeof(cmd) - cur,
+                    { cmd_appendf(cmd, sizeof(cmd),
                                " -lmingw32 -lmoldname -lmingwex -lmsvcrt"
                                " -lkernel32 -lshell32"); }
                     for (int di = 0; di < zan_lib_ndirs; di++) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                                  zan_lib_dirs[di]);
                     }
                     for (int di = 0; di < extra_lib_path_count; di++) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                                  extra_lib_paths[di]);
                     }
                     for (int li = 0; li < irgen.extern_lib_count; li++) {
@@ -7240,9 +7261,7 @@ int main(int argc, char **argv) {
                                     zan_find_macos_driver_dylib(
                                         driver_dirs[d], nm, nlen,
                                         fallback, sizeof(fallback))) {
-                                    size_t cur = strlen(cmd);
-                                    snprintf(cmd + cur,
-                                             sizeof(cmd) - cur, " \"%s\"",
+                                    cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                              fallback);
                                     nm = NULL;
                                 }
@@ -7250,13 +7269,11 @@ int main(int argc, char **argv) {
                             }
                             if (!nm) continue;
                         }
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " -l%.*s",
+                        cmd_appendf(cmd, sizeof(cmd), " -l%.*s",
                                  nlen, nm);
                     }
                     for (int li = 0; li < static_driver_lib_count; li++) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
+                        cmd_appendf(cmd, sizeof(cmd), " %s",
                                  static_driver_libs[li]);
                     }
                     if (getenv("ZAN_VERBOSE_LINK"))
@@ -7269,33 +7286,27 @@ int main(int argc, char **argv) {
                     /* link the runtime objects the library actually uses:
                      * host copies natively, target copies on a cross build */
                     if (rt_io_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_io_obj);
                     }
                     if (rt_sync_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_sync_obj);
                     }
                     if (rt_file_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_file_obj);
                     }
                     if (rt_embed_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_embed_obj);
                     }
                     if (rt_inflate_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_inflate_obj);
                     }
                     if (rt_timer_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_timer_obj);
                     }
                 } else if (target.os == ZAN_OS_MACOS) {
@@ -7326,33 +7337,27 @@ int main(int argc, char **argv) {
                     /* link the runtime objects the library actually uses:
                      * host copies natively, target copies on a cross build */
                     if (rt_io_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_io_obj);
                     }
                     if (rt_sync_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_sync_obj);
                     }
                     if (rt_file_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_file_obj);
                     }
                     if (rt_embed_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_embed_obj);
                     }
                     if (rt_inflate_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_inflate_obj);
                     }
                     if (rt_timer_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_timer_obj);
                     }
                 } else if (cross_compiling &&
@@ -7396,48 +7401,39 @@ int main(int argc, char **argv) {
                              " \"%s/android_native_app_glue.o\" \"%s\"",
                              obj_path, sys3, obj_tmp);
                     for (int di = 0; di < zan_lib_ndirs; di++) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                                  zan_lib_dirs[di]);
                     }
                     for (int di = 0; di < extra_lib_path_count; di++) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                                  extra_lib_paths[di]);
                     }
                     if (rt_io_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_io_obj);
                     }
                     if (rt_sync_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_sync_obj);
                     }
                     if (rt_file_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_file_obj);
                     }
                     if (rt_embed_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_embed_obj);
                     }
                     if (rt_inflate_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_inflate_obj);
                     }
                     if (rt_timer_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_timer_obj);
                     }
                     for (int li = 0; li < static_driver_lib_count; li++) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
+                        cmd_appendf(cmd, sizeof(cmd), " %s",
                                  static_driver_libs[li]);
                     }
                     for (int li = 0; li < irgen.extern_lib_count; li++) {
@@ -7449,12 +7445,10 @@ int main(int argc, char **argv) {
                             irgen.extern_libs[li].str,
                             (int)irgen.extern_libs[li].len, &nlen);
                         if (!nm) continue;
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " -l%.*s",
+                        cmd_appendf(cmd, sizeof(cmd), " -l%.*s",
                                  nlen, nm);
                     }
-                    { size_t cur = strlen(cmd);
-                      snprintf(cmd + cur, sizeof(cmd) - cur,
+                    { cmd_appendf(cmd, sizeof(cmd),
                                " \"%s/libc.so\" \"%s/libm.so\""
                                " \"%s/liblog.so\" \"%s/libdl.so\"",
                                sys3, sys3, sys3, sys3); }
@@ -7466,13 +7460,11 @@ int main(int argc, char **argv) {
                      * group, the same policy as the OHOS branch below
                      * (libc etc. stay explicit above; the glue object is
                      * already at the head of the line). */
-                    { size_t cur = strlen(cmd);
-                      snprintf(cmd + cur, sizeof(cmd) - cur,
+                    { cmd_appendf(cmd, sizeof(cmd),
                                " \"%s/libandroid.so\" \"%s/libEGL.so\""
                                " \"%s/libGLESv2.so\" \"%s/libaaudio.so\"",
                                sys3, sys3, sys3, sys3); }
-                    { size_t cur = strlen(cmd);
-                      snprintf(cmd + cur, sizeof(cmd) - cur,
+                    { cmd_appendf(cmd, sizeof(cmd),
                                " \"%s/libclang_rt.builtins.a\"",
                                sys3); }
                     if (getenv("ZAN_VERBOSE_LINK"))
@@ -7522,41 +7514,34 @@ int main(int argc, char **argv) {
                      * the module references, their own libc references stay
                      * undefined and resolve from the OHOS global namespace */
                     for (int d = 0; d < cross_archive_count; d++) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  cross_archives[d]);
                     }
                     /* same conditional Zan runtime objects as the exe link:
                      * a dlopened library has no second chance to resolve
                      * them, so whatever the module references must be inside */
                     if (rt_timer_obj) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_timer_obj);
                     }
                     if (irgen.uses_socket_async) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur,
+                        cmd_appendf(cmd, sizeof(cmd),
                                  " \"%s/zanrt_io.o\"", sys4);
                     }
                     if (irgen.uses_sync_runtime) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur,
+                        cmd_appendf(cmd, sizeof(cmd),
                                  " \"%s/zanrt_sync.o\"", sys4);
                     }
                     if (irgen.uses_file_runtime) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur,
+                        cmd_appendf(cmd, sizeof(cmd),
                                  " \"%s/zanrt_file.o\"", sys4);
                     }
                     if (irgen.uses_embed_api) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur,
+                        cmd_appendf(cmd, sizeof(cmd),
                                  " \"%s/zan_embed_api.o\"", sys4);
                     }
                     if (irgen.uses_inflate) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur,
+                        cmd_appendf(cmd, sizeof(cmd),
                                  " \"%s/zan_inflate.o\"", sys4);
                     }
                     if (getenv("ZAN_VERBOSE_LINK"))
@@ -7577,13 +7562,11 @@ int main(int argc, char **argv) {
                  * that binds a native dependency resolves it like an exe does */
                 if (!lib_spawned) {
                     for (int di = 0; di < zan_lib_ndirs; di++) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                                  zan_lib_dirs[di]);
                     }
                     for (int di = 0; di < extra_lib_path_count; di++) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                        cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                                  extra_lib_paths[di]);
                     }
                     for (int li = 0; li < irgen.extern_lib_count; li++) {
@@ -7599,13 +7582,11 @@ int main(int argc, char **argv) {
                             irgen.extern_libs[li].str,
                             (int)irgen.extern_libs[li].len, &nlen);
                         if (!nm) continue;
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " -l%.*s",
+                        cmd_appendf(cmd, sizeof(cmd), " -l%.*s",
                                  nlen, nm);
                     }
                     for (int li = 0; li < static_driver_lib_count; li++) {
-                        size_t cur = strlen(cmd);
-                        snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
+                        cmd_appendf(cmd, sizeof(cmd), " %s",
                                  static_driver_libs[li]);
                     }
                     if (getenv("ZAN_VERBOSE_LINK"))
@@ -7651,18 +7632,15 @@ int main(int argc, char **argv) {
                      "ld.lld -static%s -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\" \"%s\"",
                      publish_mode ? " -s --gc-sections" : "", obj_path, sys, sys, obj_tmp);
             for (int di = 0; di < zan_lib_ndirs; di++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          zan_lib_dirs[di]);
             }
             for (int di = 0; di < extra_lib_path_count; di++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          extra_lib_paths[di]);
             }
             if (rt_timer_obj) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", rt_timer_obj);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
             }
             if (rt_io_obj || irgen.uses_socket_async || external_async_executor) {
                 const char *ioname = external_async_executor ? "zanrt_io_mt.o" : "zanrt_io.o";
@@ -7672,31 +7650,26 @@ int main(int argc, char **argv) {
                     snprintf(rt_io_path, sizeof(rt_io_path), "%s/zanrt_io.o", sys);
                 }
                 if (zan_file_exists(rt_io_path)) {
-                    size_t cur = strlen(cmd);
-                    snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", rt_io_path);
+                    cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_io_path);
                 }
             }
             if (irgen.uses_sync_runtime) {
                 /* atomics / shared-table runtime; its pthread, flock and shm
                  * symbols resolve from the static musl libc.a below. */
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_sync.o\"", sys);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_sync.o\"", sys);
             }
             if (irgen.uses_file_runtime) {
                 /* file metadata / stream IO runtime (zan_file_*). */
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_file.o\"", sys);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_file.o\"", sys);
             }
             if (irgen.uses_embed_api) {
                 /* embedded-resource API; pure C, compiled for the target in the
                  * same sysroot build that produces zanrt_io.o */
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zan_embed_api.o\"", sys);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zan_embed_api.o\"", sys);
             }
             if (irgen.uses_inflate) {
                 /* compressed-resource decoder (see zan_inflate.c) */
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zan_inflate.o\"", sys);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zan_inflate.o\"", sys);
             }
             /* Small-object allocator in front of musl's mallocng: ARC programs
              * allocate one short-lived block per string/object/frame, which is
@@ -7705,33 +7678,27 @@ int main(int argc, char **argv) {
             { char memobj[1300];
               snprintf(memobj, sizeof(memobj), "%s/zanrt_mem.o", sys);
               if (zan_file_exists(memobj)) {
-                  size_t cur = strlen(cmd);
-                  snprintf(cmd + cur, sizeof(cmd) - cur,
+                  cmd_appendf(cmd, sizeof(cmd),
                            " \"%s\" --wrap=malloc --wrap=free"
                            " --wrap=calloc --wrap=realloc", memobj);
               } }
-            { size_t cur = strlen(cmd);
-              snprintf(cmd + cur, sizeof(cmd) - cur, " --start-group \"%s/libc.a\"", sys); }
+            { cmd_appendf(cmd, sizeof(cmd), " --start-group \"%s/libc.a\"", sys); }
             /* soft-float / int128 builtins (aarch64 long double is fp128) */
             { char gcclib[1300];
               snprintf(gcclib, sizeof(gcclib), "%s/libgcc.a", sys);
               if (zan_file_exists(gcclib)) {
-                  size_t cur = strlen(cmd);
-                  snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", gcclib);
+                  cmd_appendf(cmd, sizeof(cmd), " \"%s\"", gcclib);
               } }
             /* bundled static driver archives (sqlite3, ...), inside the group
              * so their libc references resolve from musl */
             for (int d = 0; d < cross_archive_count; d++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", cross_archives[d]);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", cross_archives[d]);
             }
             for (int li = 0; li < static_driver_lib_count; li++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
+                cmd_appendf(cmd, sizeof(cmd), " %s",
                          static_driver_libs[li]);
             }
-            { size_t cur = strlen(cmd);
-              snprintf(cmd + cur, sizeof(cmd) - cur,
+            { cmd_appendf(cmd, sizeof(cmd),
                        " --end-group \"%s/crtn.o\"", sys); }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_OHOS) {
@@ -7770,60 +7737,48 @@ int main(int argc, char **argv) {
                      " \"%s/clang_rt.crtbegin.o\" \"%s\"",
                      publish_mode ? " -s --gc-sections" : "", obj_path, sys, sys, sys, obj_tmp);
             for (int di = 0; di < zan_lib_ndirs; di++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          zan_lib_dirs[di]);
             }
             for (int di = 0; di < extra_lib_path_count; di++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          extra_lib_paths[di]);
             }
             if (rt_timer_obj) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", rt_timer_obj);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
             }
             if (irgen.uses_socket_async) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_io.o\"", sys);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_io.o\"", sys);
             }
             if (irgen.uses_sync_runtime) {
                 /* OHOS musl libc.a exposes pthread/epoll; the OHOS NDK sysroot
                  * lacks shm_open (libc.so only), so rt_sync.c's __OHOS__ shim
                  * backs shared tables with files under $ZAN_SHM_DIR
                  * (default /data/local/tmp), like the Android path. */
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_sync.o\"", sys);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_sync.o\"", sys);
             }
             if (irgen.uses_file_runtime) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_file.o\"", sys);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_file.o\"", sys);
             }
             if (irgen.uses_embed_api) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur,
+                cmd_appendf(cmd, sizeof(cmd),
                          " \"%s/zan_embed_api.o\"", sys);
             }
             if (irgen.uses_inflate) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur,
+                cmd_appendf(cmd, sizeof(cmd),
                          " \"%s/zan_inflate.o\"", sys);
             }
-            { size_t cur = strlen(cmd);
-              snprintf(cmd + cur, sizeof(cmd) - cur,
+            { cmd_appendf(cmd, sizeof(cmd),
                        " --start-group \"%s/libc.a\" \"%s/libunwind.a\""
                        " \"%s/libclang_rt.builtins.a\"", sys, sys, sys); }
             for (int d = 0; d < cross_archive_count; d++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", cross_archives[d]);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", cross_archives[d]);
             }
             for (int li = 0; li < static_driver_lib_count; li++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
+                cmd_appendf(cmd, sizeof(cmd), " %s",
                          static_driver_libs[li]);
             }
-            { size_t cur = strlen(cmd);
-              snprintf(cmd + cur, sizeof(cmd) - cur,
+            { cmd_appendf(cmd, sizeof(cmd),
                        " --end-group \"%s/clang_rt.crtend.o\" \"%s/crtn.o\"",
                        sys, sys); }
             if (getenv("ZAN_VERBOSE_LINK"))
@@ -7897,85 +7852,71 @@ int main(int argc, char **argv) {
                          publish_mode ? " -s --gc-sections" : "", obj_path, sys, obj_tmp);
             }
             for (int di = 0; di < zan_lib_ndirs; di++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          zan_lib_dirs[di]);
             }
             for (int di = 0; di < extra_lib_path_count; di++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          extra_lib_paths[di]);
             }
             if (rt_timer_obj) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", rt_timer_obj);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
             }
             if (irgen.uses_socket_async) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_io.o\"", sys);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_io.o\"", sys);
             }
             if (irgen.uses_sync_runtime) {
                 /* bionic has pthread/epoll; its missing shm_open is shimmed
                  * inside rt_sync.c itself (__ANDROID__), so the same object
                  * as the Linux sysroots links. */
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_sync.o\"", sys);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_sync.o\"", sys);
             }
             if (irgen.uses_file_runtime) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_file.o\"", sys);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_file.o\"", sys);
             }
             if (irgen.uses_embed_api) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur,
+                cmd_appendf(cmd, sizeof(cmd),
                          " \"%s/zan_embed_api.o\"", sys);
             }
             if (irgen.uses_inflate) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur,
+                cmd_appendf(cmd, sizeof(cmd),
                          " \"%s/zan_inflate.o\"", sys);
             }
-            { size_t cur = strlen(cmd);
-              if (drv_lib_count > 0) {
-                  /* dynamic: resolve libc/libm/liblog/libdl from the stub
-                   * shared libraries, and the imported drivers from the
-                   * driver search dirs above */
-                  snprintf(cmd + cur, sizeof(cmd) - cur,
-                           " --start-group");
-              } else {
-                  snprintf(cmd + cur, sizeof(cmd) - cur,
-                           " --start-group \"%s/libc.a\" \"%s/libm.a\"", sys, sys);
-              } }
+            if (drv_lib_count > 0) {
+                /* dynamic: resolve libc/libm/liblog/libdl from the stub
+                 * shared libraries, and the imported drivers from the
+                 * driver search dirs above */
+                cmd_appendf(cmd, sizeof(cmd), " --start-group");
+            } else {
+                cmd_appendf(cmd, sizeof(cmd),
+                         " --start-group \"%s/libc.a\" \"%s/libm.a\"", sys, sys);
+            }
             for (int d = 0; d < cross_archive_count; d++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", cross_archives[d]);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", cross_archives[d]);
             }
             for (int li = 0; li < static_driver_lib_count; li++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
+                cmd_appendf(cmd, sizeof(cmd), " %s",
                          static_driver_libs[li]);
             }
             for (int li = 0; li < drv_lib_count; li++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " -l%.*s",
+                cmd_appendf(cmd, sizeof(cmd), " -l%.*s",
                          drv_lib_len[li], drv_libs[li]);
             }
-            { size_t cur = strlen(cmd);
-              if (drv_lib_count > 0) {
-                  snprintf(cmd + cur, sizeof(cmd) - cur,
-                           " --end-group \"%s/libc.so\" \"%s/libm.so\""
-                           " \"%s/liblog.so\" \"%s/libdl.so\""
-                           " \"%s/libandroid.so\" \"%s/libEGL.so\""
-                           " \"%s/libGLESv2.so\""
-                           " \"%s/crtend_android.o\""
-                           " \"%s/libclang_rt.builtins.a\"",
-                           sys, sys, sys, sys, sys, sys, sys, sys, sys);
-              } else {
-                  snprintf(cmd + cur, sizeof(cmd) - cur,
-                           " --end-group \"%s/libdl.a\" \"%s/crtend_android.o\""
-                           " \"%s/libclang_rt.builtins.a\"",
-                           sys, sys, sys);
-              } }
+            if (drv_lib_count > 0) {
+                cmd_appendf(cmd, sizeof(cmd),
+                         " --end-group \"%s/libc.so\" \"%s/libm.so\""
+                         " \"%s/liblog.so\" \"%s/libdl.so\""
+                         " \"%s/libandroid.so\" \"%s/libEGL.so\""
+                         " \"%s/libGLESv2.so\""
+                         " \"%s/crtend_android.o\""
+                         " \"%s/libclang_rt.builtins.a\"",
+                         sys, sys, sys, sys, sys, sys, sys, sys, sys);
+            } else {
+                cmd_appendf(cmd, sizeof(cmd),
+                         " --end-group \"%s/libdl.a\" \"%s/crtend_android.o\""
+                         " \"%s/libclang_rt.builtins.a\"",
+                         sys, sys, sys);
+            }
             if (getenv("ZAN_VERBOSE_LINK"))
                 fprintf(stderr, "[link] %s\n", cmd);
             link_ret = system(cmd);
@@ -8063,63 +8004,48 @@ int main(int argc, char **argv) {
                          ? " --subsystem windows" : "",
                      obj_path, syslib, syslib);
             for (int di = 0; di < zan_lib_ndirs; di++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          zan_lib_dirs[di]);
             }
-            { size_t cur = strlen(cmd);
-              snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"", syslib); }
+            { cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", syslib); }
             for (int di = 0; di < extra_lib_path_count; di++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          extra_lib_paths[di]);
             }
-            { size_t cur = strlen(cmd);
-              snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", obj_tmp); }
+            { cmd_appendf(cmd, sizeof(cmd), " \"%s\"", obj_tmp); }
             if (rt_timer_obj) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", rt_timer_obj);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
             }
             if (winrt_io[0]) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", winrt_io);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", winrt_io);
             }
             if (winrt_sync[0]) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", winrt_sync);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", winrt_sync);
             }
             if (winrt_file[0]) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", winrt_file);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", winrt_file);
             }
             if (winrt_embed[0]) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", winrt_embed);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", winrt_embed);
             }
             if (winrt_inflate[0]) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", winrt_inflate);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", winrt_inflate);
             }
             for (int ei = 0; ei < extra_link_input_count; ei++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                          extra_link_inputs[ei]);
             }
-            { size_t cur = strlen(cmd);
-              snprintf(cmd + cur, sizeof(cmd) - cur, " --start-group"
+            { cmd_appendf(cmd, sizeof(cmd), " --start-group"
                        " -lmingw32 -lmoldname -lmingwex -lmsvcrt"
                        " -lkernel32 -ladvapi32 -lshell32 -luser32"); }
             if (winrt_io[0]) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " -lws2_32");
+                cmd_appendf(cmd, sizeof(cmd), " -lws2_32");
             }
-            { size_t cur = strlen(cmd);
-              snprintf(cmd + cur, sizeof(cmd) - cur, have_gcc
+            { cmd_appendf(cmd, sizeof(cmd), have_gcc
                        ? " -lgcc -lgcc_eh"
                        : " -lclang_rt.builtins-aarch64 -lunwind -lucrt"); }
             for (int ei = 0; ei < extra_link_lib_count; ei++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " -l%s",
+                cmd_appendf(cmd, sizeof(cmd), " -l%s",
                          extra_link_libs[ei]);
             }
             /* extern [DllImport] libraries: resolve from the bundled import
@@ -8130,16 +8056,13 @@ int main(int argc, char **argv) {
                     irgen.extern_libs[li].str,
                     (int)irgen.extern_libs[li].len, &nlen);
                 if (!nm) continue;
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " -l%.*s", nlen, nm);
+                cmd_appendf(cmd, sizeof(cmd), " -l%.*s", nlen, nm);
             }
             for (int li = 0; li < static_driver_lib_count; li++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
+                cmd_appendf(cmd, sizeof(cmd), " %s",
                          static_driver_libs[li]);
             }
-            { size_t cur = strlen(cmd);
-              snprintf(cmd + cur, sizeof(cmd) - cur,
+            { cmd_appendf(cmd, sizeof(cmd),
                        " --end-group \"%s/crtend.o\"", syslib); }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_WASI) {
@@ -8222,16 +8145,14 @@ int main(int argc, char **argv) {
                      publish_mode ? " -s --gc-sections" : "", obj_path, sys,
                      obj_tmp);
             for (int ei = 0; ei < extra_link_input_count; ei++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                          extra_link_inputs[ei]);
             }
             if (irgen.uses_file_runtime) {
                 /* file metadata / stream IO runtime (zan_file_*): pure libc +
                  * a mutex, so it links against the wasi-libc sysroot below
                  * (rt_sync.o cannot -- wasm has no pthread/shm). */
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_file.o\"",
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_file.o\"",
                          sys);
             }
             /* Every emitted program calls zan_timer_* from its inline
@@ -8239,8 +8160,7 @@ int main(int argc, char **argv) {
              * libzigc.a is zig's C-library companion (strlen/strcmp/abs and
              * friends): zig's libc.a references them without defining them,
              * so the link needs this archive on the command line too. */
-            { size_t cur = strlen(cmd);
-              snprintf(cmd + cur, sizeof(cmd) - cur,
+            { cmd_appendf(cmd, sizeof(cmd),
                        " \"%s/zanrt_timer.o\" \"%s/zanrt_wasm.o\"",
                        sys, sys); }
             {   /* GUI programs pull the software-rasterizer runtime + the
@@ -8267,8 +8187,7 @@ int main(int argc, char **argv) {
                         free(source);
                         return 1;
                     }
-                    size_t cur = strlen(cmd);
-                    snprintf(cmd + cur, sizeof(cmd) - cur,
+                    cmd_appendf(cmd, sizeof(cmd),
                              " \"%s\" --export=zan_gui_wasm_feed", guiobj);
                     /* FreeType text: zanrt_gui.o is built with
                      * ZAN_GUI_FREETYPE (build_cross_rt.cmd), so it references
@@ -8278,9 +8197,7 @@ int main(int argc, char **argv) {
                     char ftlib[1300];
                     snprintf(ftlib, sizeof(ftlib), "%s/libfreetype.a", sys);
                     if (zan_file_exists(ftlib)) {
-                        size_t curf = strlen(cmd);
-                        snprintf(cmd + curf, sizeof(cmd) - curf,
-                                 " \"%s\"", ftlib);
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"", ftlib);
                     }
                     /* Sync-family symbols the GUI stdlib pulls in
                      * (threads/atomics/monotonic/monitor): single-threaded
@@ -8292,9 +8209,7 @@ int main(int argc, char **argv) {
                     snprintf(syncwobj, sizeof(syncwobj),
                              "%s/zanrt_syncw.o", sys);
                     if (zan_file_exists(syncwobj)) {
-                        size_t cur2 = strlen(cmd);
-                        snprintf(cmd + cur2, sizeof(cmd) - cur2, " \"%s\"",
-                                 syncwobj);
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"", syncwobj);
                     }
                 }
             }
@@ -8302,12 +8217,10 @@ int main(int argc, char **argv) {
                 /* try/throw programs raise the C++ exception tag (throw 0):
                  * zanrt_ehtag.o defines that tag symbol, which the backend
                  * only declares as an undefined import of its own. */
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_ehtag.o\"",
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_ehtag.o\"",
                          sys);
             }
-            { size_t cur = strlen(cmd);
-              snprintf(cmd + cur, sizeof(cmd) - cur,
+            { cmd_appendf(cmd, sizeof(cmd),
                        " \"%s/libc.a\" \"%s/libm.a\" \"%s/libzigc.a\""
                        " \"%s/libclang_rt.builtins-wasm32.a\"",
                        sys, sys, sys, sys); }
@@ -8420,28 +8333,22 @@ int main(int argc, char **argv) {
                          obj_path, obj_tmp);
             }
             if (rt_timer_obj) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", rt_timer_obj);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
             }
             if (macrt_io[0]) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_io);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_io);
             }
             if (macrt_sync[0]) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_sync);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_sync);
             }
             if (macrt_file[0]) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_file);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_file);
             }
             if (macrt_embed[0]) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_embed);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_embed);
             }
             if (macrt_inflate[0]) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_inflate);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_inflate);
             }
             char macrt_gui[1400] = {0};
             snprintf(macrt_gui, sizeof(macrt_gui), "%s/zanrt_gui.o", macrt);
@@ -8468,26 +8375,21 @@ int main(int argc, char **argv) {
                 }
             }
             if (has_gui_driver && zan_file_exists(macrt_gui)) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_gui);
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_gui);
             }
             for (int ei = 0; ei < extra_link_input_count; ei++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                          extra_link_inputs[ei]);
             }
             for (int di = 0; di < cross_dylib_count; di++) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                          cross_dylibs[di]);
             }
             if (cross_dylib_count > 0) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur,
+                cmd_appendf(cmd, sizeof(cmd),
                          " -rpath @loader_path");
             }
-            { size_t cur = strlen(cmd);
-              snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", tbd); }
+            { cmd_appendf(cmd, sizeof(cmd), " \"%s\"", tbd); }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_FREESTANDING) {
             /* Cross/freestanding output remains the single-object fallback;
@@ -8683,63 +8585,49 @@ int main(int argc, char **argv) {
                      generated_objects.paths[0], obj_path,
                      publish_mode ? " -O2 -s" : "");
             for (int oi = 1; oi < generated_objects.count; oi++) {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"",
+                cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"",
                          generated_objects.paths[oi]);
             }
             if (rt_io_obj) {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\" -lws2_32", rt_io_obj);
+                cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\" -lws2_32", rt_io_obj);
             }
             if (rt_sync_obj) {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_sync_obj);
+                cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_sync_obj);
             }
             if (rt_file_obj) {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_file_obj);
+                cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_file_obj);
             }
             if (rt_embed_obj) {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_embed_obj);
+                cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_embed_obj);
             }
             if (rt_inflate_obj) {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_inflate_obj);
+                cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_inflate_obj);
             }
             if (rt_timer_obj) {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_timer_obj);
+                cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_timer_obj);
             }
             if (rt_mem_obj) {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                cmd_appendf(link_cmd, sizeof(link_cmd),
                          " \"%s\" -Wl,--wrap=malloc -Wl,--wrap=free"
                          " -Wl,--wrap=calloc -Wl,--wrap=realloc", rt_mem_obj);
             }
             for (int di = 0; di < zan_lib_ndirs; di++) {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -L\"%s\"", zan_lib_dirs[di]);
+                cmd_appendf(link_cmd, sizeof(link_cmd), " -L\"%s\"", zan_lib_dirs[di]);
             }
             if (link_subsystem && strcmp(link_subsystem, "windows") == 0) {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -Wl,--subsystem,windows");
+                cmd_appendf(link_cmd, sizeof(link_cmd), " -Wl,--subsystem,windows");
             }
             for (int di = 0; di < extra_lib_path_count; di++) {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -L\"%s\"", extra_lib_paths[di]);
+                cmd_appendf(link_cmd, sizeof(link_cmd), " -L\"%s\"", extra_lib_paths[di]);
             }
             for (int ei = 0; ei < extra_link_input_count; ei++) {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", extra_link_inputs[ei]);
+                cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", extra_link_inputs[ei]);
             }
             for (int ei = 0; ei < extra_link_lib_count; ei++) {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%s", extra_link_libs[ei]);
+                cmd_appendf(link_cmd, sizeof(link_cmd), " -l%s", extra_link_libs[ei]);
             }
             {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                cmd_appendf(link_cmd, sizeof(link_cmd),
                          " -l:libwinpthread.a");
             }
             for (int li = 0; li < irgen.extern_lib_count; li++) {
@@ -8748,12 +8636,10 @@ int main(int argc, char **argv) {
                     irgen.extern_libs[li].str,
                     (int)irgen.extern_libs[li].len, &nlen);
                 if (!nm) continue;
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", nlen, nm);
+                cmd_appendf(link_cmd, sizeof(link_cmd), " -l%.*s", nlen, nm);
             }
             for (int li = 0; li < static_driver_lib_count; li++) {
-                size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " %s",
+                cmd_appendf(link_cmd, sizeof(link_cmd), " %s",
                          static_driver_libs[li]);
             }
             if (getenv("ZAN_LINK_ECHO")) fprintf(stderr, "[link] %s\n", link_cmd);
@@ -8769,74 +8655,65 @@ int main(int argc, char **argv) {
                      obj_tmp, obj_path);
         }
         if (rt_io_obj) {
-            size_t cur = strlen(link_cmd);
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_io_obj);
+            cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_io_obj);
         }
         if (rt_sync_obj) {
-            size_t cur = strlen(link_cmd);
 #ifdef __APPLE__
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+            cmd_appendf(link_cmd, sizeof(link_cmd),
                      " \"%s\" -pthread", rt_sync_obj);
 #else
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+            cmd_appendf(link_cmd, sizeof(link_cmd),
                      " \"%s\" -pthread -lrt", rt_sync_obj);
 #endif
         }
         if (rt_file_obj) {
-            size_t cur = strlen(link_cmd);
 #ifdef __APPLE__
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+            cmd_appendf(link_cmd, sizeof(link_cmd),
                      " \"%s\" -pthread", rt_file_obj);
 #else
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+            cmd_appendf(link_cmd, sizeof(link_cmd),
                      " \"%s\" -pthread", rt_file_obj);
 #endif
         }
         if (rt_embed_obj) {
-            size_t cur = strlen(link_cmd);
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_embed_obj);
+            cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_embed_obj);
         }
         if (rt_inflate_obj) {
-            size_t cur = strlen(link_cmd);
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_inflate_obj);
+            cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_inflate_obj);
         }
         if (rt_timer_obj) {
-            size_t cur = strlen(link_cmd);
 #ifdef __APPLE__
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+            cmd_appendf(link_cmd, sizeof(link_cmd),
                      " \"%s\" -pthread", rt_timer_obj);
 #else
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+            cmd_appendf(link_cmd, sizeof(link_cmd),
                      " \"%s\" -pthread -lrt", rt_timer_obj);
 #endif
         }
         if (rt_mem_obj) {
-            size_t cur = strlen(link_cmd);
 #ifdef __APPLE__
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_mem_obj);
+            cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_mem_obj);
 #else
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+            cmd_appendf(link_cmd, sizeof(link_cmd),
                      " \"%s\" -Wl,--wrap=malloc -Wl,--wrap=free"
                      " -Wl,--wrap=calloc -Wl,--wrap=realloc", rt_mem_obj);
 #endif
         }
         for (int di = 0; di < zan_lib_ndirs; di++) {
-            size_t cur = strlen(link_cmd);
             /* -L for link-time resolution, -rpath so the produced exe can load
              * the shared library at runtime without LD_LIBRARY_PATH. */
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+            cmd_appendf(link_cmd, sizeof(link_cmd),
                      " -L\"%s\" -Wl,-rpath,\"%s\"", zan_lib_dirs[di], zan_lib_dirs[di]);
         }
         /* Runtime search path relative to the executable, so a --publish build
          * whose driver dylibs are copied next to the exe stays self-contained
          * even after the whole directory is relocated to the target machine. */
         if (used_driver_count > 0) {
-            size_t cur = strlen(link_cmd);
 #ifdef __APPLE__
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+            cmd_appendf(link_cmd, sizeof(link_cmd),
                      " -Wl,-rpath,@loader_path");
 #else
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+            cmd_appendf(link_cmd, sizeof(link_cmd),
                      " -Wl,-rpath,'$ORIGIN'");
 #endif
         }
@@ -8879,8 +8756,7 @@ int main(int argc, char **argv) {
                         zan_find_macos_driver_dylib(
                             driver_dirs[d], name, name_len,
                             fallback, sizeof(fallback))) {
-                        size_t cur = strlen(link_cmd);
-                        snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                        cmd_appendf(link_cmd, sizeof(link_cmd),
                                  " \"%s\"", fallback);
                         name = NULL;
                     }
@@ -8888,36 +8764,30 @@ int main(int argc, char **argv) {
                 }
                 if (!name) continue;
             }
-            size_t cur = strlen(link_cmd);
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", name_len, name);
+            cmd_appendf(link_cmd, sizeof(link_cmd), " -l%.*s", name_len, name);
         }
         for (int li = 0; li < static_driver_lib_count; li++) {
-            size_t cur = strlen(link_cmd);
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " %s",
+            cmd_appendf(link_cmd, sizeof(link_cmd), " %s",
                      static_driver_libs[li]);
         }
         /* caller-supplied link inputs (--libpath / --link-input / --link-lib);
          * --subsystem is Windows-only and ignored here. */
         for (int di = 0; di < extra_lib_path_count; di++) {
-            size_t cur = strlen(link_cmd);
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+            cmd_appendf(link_cmd, sizeof(link_cmd),
                      " -L\"%s\" -Wl,-rpath,\"%s\"", extra_lib_paths[di], extra_lib_paths[di]);
         }
         for (int ei = 0; ei < extra_link_input_count; ei++) {
-            size_t cur = strlen(link_cmd);
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", extra_link_inputs[ei]);
+            cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", extra_link_inputs[ei]);
         }
         for (int ei = 0; ei < extra_link_lib_count; ei++) {
-            size_t cur = strlen(link_cmd);
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%s", extra_link_libs[ei]);
+            cmd_appendf(link_cmd, sizeof(link_cmd), " -l%s", extra_link_libs[ei]);
         }
         /* libm again, last: the -lm above sits before the driver libraries, and
          * a static driver archive pulled in after it (zan_gui's software
          * rasterizer uses sqrt/atan2) would otherwise leave those references
          * unresolved -- ld only scans an archive for symbols already needed. */
         {
-            size_t cur = strlen(link_cmd);
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -lm");
+            cmd_appendf(link_cmd, sizeof(link_cmd), " -lm");
         }
         link_ret = system(link_cmd);
 #endif

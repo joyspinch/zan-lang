@@ -6315,25 +6315,35 @@ static int interp_format_to_printf(const zan_istr_t *spec, bool is_float,
     char code = s[0];
     int digits = 0;
     for (int i = 1; i < len; i++) {
-        if (s[i] >= '0' && s[i] <= '9') digits = digits * 10 + (s[i] - '0');
+        if (s[i] >= '0' && s[i] <= '9') {
+            /* saturate instead of overflowing `int` — compiler-level UB —
+             * on an absurd spec like {v:D99999999999999}; oversize counts
+             * are rejected per code below (B-ID76) */
+            if (digits <= 9999) digits = digits * 10 + (s[i] - '0');
+        }
     }
     switch (code) {
     case 'D': case 'd': /* decimal, zero-padded to `digits` */
         if (is_float) break;
-        if (digits <= 0) return 0;
+        if (digits <= 0 || digits > 512) return 0;
         if (is_ulong)
             return snprintf(out, outcap, "%%0%dllu", digits);
         return snprintf(out, outcap, "%%0%dlld", digits);
-    case 'X': case 'x': /* hex (upper/lower), zero-padded to `digits` */
+    case 'X': case 'x': /* hex (upper/lower), zero-padded to `digits`;
+                         * case follows the spec letter ({v:x2} is
+                         * lowercase, like C#) */
         if (is_float) break;
-        if (digits <= 0) return 0;
-        return snprintf(out, outcap, "%%0%dllX", digits);
+        if (digits <= 0 || digits > 512) return 0;
+        return snprintf(out, outcap, "%%0%dll%c", digits,
+                        code == 'X' ? 'X' : 'x');
     case 'F': case 'f': /* fixed-point with `digits` decimals */
         if (digits < 0) digits = 0;
+        if (digits > 512) digits = 512;
         if (want_float) *want_float = true;
         return snprintf(out, outcap, "%%.%dlf", digits);
     case 'E': case 'e': /* scientific */
         if (digits < 0) digits = 0;
+        if (digits > 512) digits = 512;
         if (want_float) *want_float = true;
         return snprintf(out, outcap, "%%.%dE", digits);
     case 'G': case 'g': /* general: default is %g; a digit count is
@@ -6566,15 +6576,29 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
         /* allocate result buffer with rc header */
         LLVMValueRef result = emit_string_alloc_rc(g, alloc_size);
 
-        /* strcpy first, strcat rest */
-        LLVMTypeRef strcpy_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
-        LLVMValueRef strcpy_args[] = { result, strs[0] };
-        zan_call2(g->builder, strcpy_type, g->fn_strcpy, strcpy_args, 2, "");
-
-        for (int i = 1; i < n; i++) {
-            LLVMValueRef cat_args[] = { result, strs[i] };
-            zan_call2(g->builder, strcpy_type, g->fn_strcat, cat_args, 2, "");
+        /* memcpy each part by its exact managed length. strcpy/strcat stop
+         * at the first embedded NUL, but every lens[i] counts the whole
+         * part (NUL-aware emit_string_length for string holes) and
+         * total_len is stamped as the result length — a `$"v={raw};"` with
+         * a raw FFI/zero-copy byte in the hole lost everything after the
+         * NUL and grew garbage bytes instead (B-ID61; same family as the
+         * `+` concat fix that introduced emit_str_concat_n). */
+        LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+        LLVMTypeRef memcpy_type = LLVMFunctionType(i8ptr,
+            (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
+        LLVMValueRef memcpy_fn = LLVMGetNamedFunction(g->mod, "memcpy");
+        if (!memcpy_fn) memcpy_fn = LLVMAddFunction(g->mod, "memcpy", memcpy_type);
+        LLVMValueRef off = LLVMConstInt(i64, 0, 0);
+        for (int i = 0; i < n; i++) {
+            LLVMValueRef dst = LLVMBuildGEP2(g->builder, i8, result, &off, 1,
+                                             "ip.dst");
+            zan_call2(g->builder, memcpy_type, memcpy_fn,
+                (LLVMValueRef[]){ dst, strs[i], lens[i] }, 3, "");
+            off = zan_add(g->builder, off, lens[i], "ip.off");
         }
+        LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, result, &off, 1,
+                                          "ip.end");
+        LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), endp);
 
         if (owns) {
             for (int i = 0; i < n; i++) {
@@ -7064,11 +7088,17 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             }
         }
 
-        /* Enum member access: EnumType.MemberName -> integer constant */
+        /* Enum member access: EnumType.MemberName -> integer constant.
+         * The binder folds every explicit initializer to AST_INT_LITERAL
+         * (or errors), so this counter only serves members left to the
+         * implicit sequence. It runs in int64: the old `(int)int_val + 1`
+         * wrapped a member declared at INT32_MAX into signed overflow UB
+         * in the compiler itself; the return truncates through uint32 so
+         * the corner wraps like two's complement (C#) instead (B-ID60). */
         if (expr->member.object->kind == AST_IDENTIFIER) {
             zan_symbol_t *enum_sym = zan_binder_lookup(g->binder, expr->member.object->ident.name);
             if (enum_sym && enum_sym->kind == SYM_ENUM) {
-                int enum_val = 0;
+                int64_t enum_val = 0;
                 for (int ei = 0; ei < enum_sym->member_count; ei++) {
                     if (enum_sym->members[ei]->kind == SYM_ENUM_MEMBER) {
                         if (enum_sym->members[ei]->name.len == expr->member.name.len &&
@@ -7078,16 +7108,16 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                             if (em_decl && em_decl->kind == AST_ENUM_MEMBER &&
                                 em_decl->enum_member.value &&
                                 em_decl->enum_member.value->kind == AST_INT_LITERAL) {
-                                enum_val = (int)em_decl->enum_member.value->int_val;
+                                enum_val = em_decl->enum_member.value->int_val;
                             }
                             return LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
-                                               (uint64_t)enum_val, 0);
+                                               (uint64_t)(uint32_t)enum_val, 0);
                         }
                         zan_ast_node_t *em_decl = enum_sym->members[ei]->decl;
                         if (em_decl && em_decl->kind == AST_ENUM_MEMBER &&
                             em_decl->enum_member.value &&
                             em_decl->enum_member.value->kind == AST_INT_LITERAL) {
-                            enum_val = (int)em_decl->enum_member.value->int_val + 1;
+                            enum_val = em_decl->enum_member.value->int_val + 1;
                         } else {
                             enum_val++;
                         }
