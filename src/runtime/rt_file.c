@@ -877,7 +877,15 @@ long long zan_file_unlock(long long handle) {
 #endif
     s->used = 0;
     s->gen = s->gen + 1;   /* a second unlock of the same value now fails */
-    if (s->gen == 0) { s->gen = 1; }
+    if (s->gen == 0) {
+        /* Same wrap policy as try_lock (B-ID84): a reset to 1 would
+         * revalidate a surviving handle minted 2^32 locks ago. Retire the
+         * slot instead -- used=2 makes zan_lk_index reject it and the
+         * reserve scan skip it, exactly like try_lock's own wrap path.
+         * One slot retired per 2^32 unlocks is the cheap side of that
+         * trade. */
+        s->used = 2;
+    }
     zan_fh_unlock();
 #ifdef _WIN32
     CloseHandle(h);

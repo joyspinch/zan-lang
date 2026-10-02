@@ -23,6 +23,9 @@
  * array header, which the compressor side guarantees for embed payloads. */
 uint32_t zan_embed_rawlen(const void *payload, uint64_t len) {
     if (!payload || !(len & 0x4000000000000000ULL)) return 0;
+    /* The 4-byte read below needs the untagged payload to actually hold
+     * them (B-ID84): a 1..3-byte body would read past its end. */
+    if ((len & ~0x4000000000000000ULL) < 4) return 0;
     uint32_t raw;
     memcpy(&raw, payload, 4);
     return raw;
@@ -46,6 +49,10 @@ void *zan_embed_decode(const void *payload, uint64_t len) {
     memcpy(&comp_len, (const char *)payload + 4, 4);
     const uint8_t *src = (const uint8_t *)payload + 8;
     if ((uint64_t)comp_len > total - 8) return NULL;
+    /* raw_len+1 wraps to 0 when raw_len == SIZE_MAX (32-bit targets: a u32
+     * is the whole size_t) -- malloc(0) would "succeed" and out[raw_len]
+     * below would write ~4 GiB past the buffer (B-ID84). */
+    if ((uint64_t)raw_len + 1 > (uint64_t)SIZE_MAX) return NULL;
     uint8_t *out = (uint8_t *)malloc((size_t)raw_len + 1);
     if (!out) return NULL;
     size_t out_len = raw_len;

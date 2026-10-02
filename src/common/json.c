@@ -430,14 +430,23 @@ static json_value *jp_string(jparser *j) {
 
 static json_value *jp_number(jparser *j) {
     const char *start = j->p;
-    if (j->p < j->end && (*j->p == '-' || *j->p == '+')) j->p++;
+    /* RFC 8259 grammar: no leading '+'. Accepting it round-tripped numbers
+     * json_serialize would never emit (B-ID84). */
+    if (j->p < j->end && *j->p == '-') j->p++;
     while (j->p < j->end &&
            (isdigit((unsigned char)*j->p) || *j->p == '.' ||
             *j->p == 'e' || *j->p == 'E' || *j->p == '+' || *j->p == '-'))
         j->p++;
     char tmp[64];
     size_t n = (size_t)(j->p - start);
-    if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+    if (n >= sizeof(tmp)) {
+        /* A token this long does not fit the strtod buffer. Silent
+         * truncation used to hand back a confidently wrong value (a
+         * 70-digit integer lost its tail); treat the magnitude as
+         * overflowing, the same path strtod already takes for 1e999
+         * (B-ID84). */
+        return json_new_num(*start == '-' ? -HUGE_VAL : HUGE_VAL);
+    }
     memcpy(tmp, start, n);
     tmp[n] = '\0';
     return json_new_num(strtod(tmp, NULL));
