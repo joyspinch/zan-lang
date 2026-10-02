@@ -26,8 +26,10 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
 6. **动包的公共 API 前全仓查消费方，grep 必须含 templates/ examples/**：包内
    类型被模板与服务端样例跨包消费是常态（2026-10-02 CSV 合并成包，两份旧
    `Csv` 共 8 处消费方，其中 4 处在 templates/ 里，漏一处 = templates_build 红）。
-   删除/搬家包文件后用 `ctest -R templates_build` 收口——它是唯一编译全部
-   模板的验收门。
+   改 Gui/stdlib 公共 API 同理——gui/async 重构给 gui-wechat 模板写了不存在的
+   `Form.Close()`，模板自此编译不过，直到模板门复跑才暴露（2026-10-02）。
+   删除/搬家包文件、改公共 API 之后用 `ctest -R templates_build` 收口——它是
+   唯一编译全部模板的验收门。
 7. **禁止手搓简化版复刻仓库验收脚手架**（run_templates.cmake 这类）：{{NAME}}
    内容替换、App→项目名重命名、manifest 三键（type/target/entry）解析、
    target 分支参数，少搬一步就是整批假阳性（2026-10-02 复刻缺 {{NAME}} 替换
