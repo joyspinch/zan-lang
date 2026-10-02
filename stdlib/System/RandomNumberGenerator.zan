@@ -10,13 +10,22 @@ namespace System;
 
 /// <summary>跨平台的加密安全随机字节。
 /// Windows 使用系统 CSPRNG（RtlGenRandom / SystemFunction036）；POSIX 从
-/// /dev/urandom 读取（Linux、macOS、BSD）。无弱回退：请求
+/// /dev/urandom 读取（Linux、macOS、BSD）；wasm32 走 WASI preview1 的
+/// random_get（宿主——浏览器/Node——注入的 CSPRNG；wasm 沙箱里没有
+/// /dev/urandom，必须走宿主调用）。无弱回退：请求
 /// N 字节却得到更少字节的调用方会收到明确失败（null / 字节数不足），
 /// 绝不会返回可预测或未初始化的数据。</summary>
 class RandomNumberGenerator {
     #if WINDOWS
     [DllImport("advapi32")]
     static extern int SystemFunction036(string buf, int len);
+    #elif WASM32
+    // random_get(buf, len) -> errno（0 = 成功）。wasi-libc（zig 构建，
+    // 本仓 build/wasm32/libc.a）不导出裸 random_get：预览一系统调用的
+    // 导入桩按 __wasi_<name> 命名（getentropy.o 即经它取随机），
+    // EntryPoint 写全名，wasm-ld 才在最终模块里生成这条宿主导入。
+    [DllImport("crt", EntryPoint = "__wasi_random_get")]
+    static extern int WasiRandomGet(string buf, int len);
     #else
     // 基于 FILE* 的 I/O 能完整保留 64 位返回值（指针 / size_t），
     // 避免 open()/read() 返回值被截断为 32 位 int 的风险。
@@ -37,6 +46,11 @@ class RandomNumberGenerator {
         #if WINDOWS
         int ok = SystemFunction036(buf, n);
         if (ok == 0) { return 0; }
+        return n;
+        #elif WASM32
+        // errno != 0 一律按失败处理：绝不能把未填充的缓冲区当随机数
+        // 返回（无弱回退）。
+        if (WasiRandomGet(buf, n) != 0) { return 0; }
         return n;
         #else
         nint fp = urandOpen("/dev/urandom", "rb");
