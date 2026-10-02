@@ -3077,16 +3077,18 @@ static LLVMValueRef emit_to_cstr_of(zan_irgen_t *g, LLVMValueRef val,
 
 /* Byte length of the C string `s` produced by `ast`. A string literal's length
  * is known at compile time (the same length string interpolation already uses),
- * so the byte-level string machinery never runs strlen over it. */
+ * so the byte-level string machinery never runs strlen over it. Non-literals
+ * measure length-aware (cached ARC header length / byte[] element count, strlen
+ * only for a bare extern char*): a managed payload with an embedded NUL
+ * (`Encoding.Utf8FromCodePoint(0)`, binary frames) would otherwise shrink to
+ * the bytes before that NUL and the concat would silently drop its tail --
+ * same class as strcmp-vs-__zan_str_ocmp and A279's UrlDecode `%00` (B-ID56). */
 static LLVMValueRef emit_cstr_len_of(zan_irgen_t *g, LLVMValueRef s,
                                      zan_ast_node_t *ast) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     if (ast && ast->kind == AST_STRING_LITERAL)
         return LLVMConstInt(i64, (uint64_t)ast->str_val.len, 0);
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    return zan_call2(g->builder,
-        LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0),
-        g->fn_strlen, &s, 1, "cslen");
+    return emit_string_length(g, s, ast ? ast->loc : (zan_loc_t){0});
 }
 
 /* Emit `a + b` for two string (i8*) operands as a heap-allocated concatenation:
