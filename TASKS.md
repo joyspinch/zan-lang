@@ -128,15 +128,24 @@
   access_token GET query 传输与无刷新互斥（协议固有+多实例部署提示）。
   已闭账：runtime/common 子项（539d72f1）、加密子项（e4da88ba）、格式包子项（c45d8efe）、
   stdlib GenDbEmit/GenForm/GenRoute/Interop（d16977d5）、JsonValue/JsonTape \u0000 统一。
-- [ ] **B-ID87【代理·实测】（P2）zanc stdlib 内联 File.ReadAllText 依赖宿主 using 面**——
-  宿主程序不含 `using System.IO` 时，stdlib 内部 File.ReadAllText 调用点落进编译器内联版
-  （irgen_call.c:2627），对 /proc 伪文件 abort "cannot read file"；musl 下 AppPath.Pid 的
-  LINUX /proc 分支因此不可用（a738a0d0 验证期发现，WSL 实测）。stdlib 内部调用不应随宿主
-  using 集合改变落到不同实现；需最小探针定根因（怀疑内联判定按调用点可见性而非来源分层）。
-- [ ] **B-ID85【代理·对照实锤】（P1）zanc 语句 lambda 经泛型委托转换静默出错**——语句形态
-  lambda（含 if+多 return）作为 OrderBy/泛型委托实参时静默产出错误行为（null 字符串比较
-  崩溃）；stash 对照证明系既有问题、与 B-ID83 改动无关（发现于 b4ee0a62 验证期）。需最小
-  探针定根因（怀疑语句体 lambda 的续体/返回路径发射），探针形态随发现会话未留存、需重建。
+- [x] **B-ID87【代理·实测】（P2）zanc stdlib 内联 File.ReadAllText 依赖宿主 using 面**——
+  已闭账 d3e4418a（2026-10-03）。根因：拉入闭包 reach 集只由 using 指令驱动，stdlib 内部
+  成员访问根（AppPath.zan 的 `File`）被标记 live 但 System/IO 从未 reach，File.zan 不入编，
+  binder 兜底解析后 irgen_call.c:2627 内联版接管。修法：闭包收敛后仍有 stdlib 来源未满足
+  live 名（flagged_stdlib 门控）→ repair walk 元数据扫树一次、只 reach 命中名的声明目录
+  （pi_note_using 在 repair 扫描中静音，pkg 目录 reached 即无条件入编故绝不 reach-all）。
+  实测：WSL musl AppPath.Pid=780 正常；hello 13 文件不膨胀；15 项 conformance 全过；
+  Windows 探针 BOM 分叉（无 using len=8/有 using len=5）同根同修（stdlib 内部mention）。
+  残项：宿主侧无 using 直接拼 `File.ReadAllText` 仍走内联版（不剥 BOM、abort 代替
+  FileNotFoundException）——既有"零拉入轻程序"契约，收敛需改内联语义或报错，另议。
+- [x] **B-ID85【代理·对照实锤】（P1）zanc 语句 lambda 经泛型委托转换静默出错**——
+  已闭账 0d5486e7（2026-10-03）。根因不在发射而在重载排名：lambda_body_type 对块体返回
+  NULL（irgen_expr_core.c 原 :803/:1228），delegate 候选全在 arity 平局 +2，声明序选中
+  string 键 OrderBy，int 返回被当 string 指针重解（崩或静默错键）。修法：按 C# 自然类型
+  规则新增 stmt_collect_return_types/stmt_lambda_return_type（直线语句+if/else 臂收集
+  return 公共类型、循环/switch/try 保守放弃、嵌套 lambda 不越界），new 与调用两个排名点
+  接线；conformance lambda_stmt_overload（conformance/determinism/leakcheck/arcguard
+  四形态）+ 15 项 lambda/linq 窄回归全过。
 - [ ] **B-ID86（P2·工具链）GUI 驱动平台 builder**——4 平台驱动重建（B-ID82 残项）+
   B-ID81(b)(c) win-arm64/ohos-arm64 payload 补齐，需 CI drivers.yml 扩展（现只有 win 驱动
   job）；本机 zig 可作 fallback 但 GUI 驱动依赖平台窗口库，非纯 zig 可造。
