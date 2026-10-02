@@ -564,6 +564,15 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   3. 落地重构：解码帧头时严格按 RFC 7540 §6 校验各帧长度与 streamId 边界，违规帧立即拦截并返回 `null`，确保协议层快速失败（Fail-Fast）。
 - **回归锁定**：`ctest -R "http2"` 4 项全套孪生测试（conformance/determinism/leakcheck/arcguard）100% 全部通过。
 
+## SSE 流式写入兜底防护：未显式限制下的 1GB 边界与防溢出（SseSink）
+
+- **病灶**：在 `SseSink.TryWrite(string piece)` 中，原先仅在 `this.maxBytes > 0` 时检查 `this.total > this.maxBytes - piece.Length`；若未配置外部调用限额策略，`maxBytes` 默认为 0。
+- **危害**：
+  1. 恶意的 SSE 服务端或异常大模型生成流如果发送无限多或者超大事件，且调用方未显式设置 `maxBytes`，`this.total` 会在达到 2GB（$2^{31}-1$）时发生 32 位有符号整型溢出回绕为负数；
+  2. 回绕后 `total` 变为负值，下游文件落盘、GUI 轮询或协程消费将获取错误的长度或产生异常截断；
+  3. 落地重构：引入 `maxCap = this.maxBytes > 0 ? this.maxBytes : 1073741824`（1GB 兜底），在无显式配置时同样提供 1GB 绝对安全限额，超限立即进入 `overflowed` 终态并通知调用方，杜绝整型溢出与 OOM 风险。
+- **回归锁定**：`ctest -R "policy_sse_sink|sse_stream"` 5 项全套测试 100% 全部通过。
+
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
 - **症状**：浏览器 `WebAssembly.instantiate` 报 `Compiling function #N:"X"
