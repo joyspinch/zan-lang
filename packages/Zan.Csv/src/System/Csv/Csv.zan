@@ -19,6 +19,13 @@ namespace System.Csv;
 /// 写出与解析严格互逆：含分隔符、引号或换行的字段加引号，
 /// 字段内引号翻倍；Serialize 每条记录以 '\n' 结尾。
 ///
+/// 安全提示（CSV 公式注入）：Parse 不做任何中和——以 = + - @ 起头
+/// 的字段原样保留，是数据还是公式属于调用方的 API 决策。把含不可信
+/// 数据的 CSV 直接导入 Excel/WPS/LibreOffice 时，这些单元格会被当
+/// 公式执行（历史上有 =CMD|'/C calc'!A0 一类 DDE 攻击）。不可信数据
+/// 勿直接进电子表格：落表前先审计/转义这些前缀，或导出为带前导
+/// 撇号等中性形式。
+///
 ///   CsvTable t = Csv.Parse(File.ReadAllText("data.csv"));
 ///   CsvTable tsv = Csv.ParseSep(text, "\t");
 ///   List<string> cells = Csv.ParseRow("1,\"a,b\",3");
@@ -26,6 +33,35 @@ namespace System.Csv;
 ///   string all = Csv.Serialize(rows);
 /// </summary>
 class Csv {
+    /// 单条记录的字段数上限：超出抛 ArgumentException（防畸形/恶意
+    /// 输入按字节膨胀撑爆内存）。公开可调——确有超宽记录的场景在
+    /// 解析前调大。
+    public static int MaxFieldsPerRecord = 1000000;
+
+    /// 一次解析的总记录数上限（表头不计）：超出抛 ArgumentException。
+    /// 对齐 d4139b46 反序列化侧的 100 万量级防线。公开可调。
+    public static int MaxRecords = 1000000;
+
+    /// 记录收口：字段数/总记录数超上限抛 ArgumentException，然后
+    /// 首记录归表头、其余归 rows。
+    static void FinishRecord(CsvTable t, List<string> rec) {
+        if (rec.Count > Csv.MaxFieldsPerRecord) {
+            throw new ArgumentException("CSV record has too many fields ("
+                + Convert.ToString(rec.Count) + " > "
+                + Convert.ToString(Csv.MaxFieldsPerRecord) + ")");
+        }
+        if (t.header.Count == 0 && t.rows.Count == 0) {
+            t.header = rec;                         // 首记录即表头
+            return;
+        }
+        if (t.rows.Count >= Csv.MaxRecords) {
+            throw new ArgumentException("CSV input has too many records ("
+                + Convert.ToString(t.rows.Count + 1) + " > "
+                + Convert.ToString(Csv.MaxRecords) + ")");
+        }
+        t.rows.Add(rec);
+    }
+
     /// <summary>解析整段 CSV 文本为表：调用方约定首记录为表头
     /// （本层不做该假设）。空文本返回零行表。</summary>
     static CsvTable Parse(string text) {
@@ -99,11 +135,7 @@ class Csv {
                 }
                 rec.Add(sb.ToString());
                 sb.Clear();
-                if (t.header.Count == 0 && t.rows.Count == 0) {
-                    t.header = rec;                 // 首记录即表头
-                } else {
-                    t.rows.Add(rec);
-                }
+                Csv.FinishRecord(t, rec);
                 rec = new List<string>();
                 dirty = false;
                 continue;
@@ -119,11 +151,7 @@ class Csv {
         }
         if (dirty) {
             rec.Add(sb.ToString());
-            if (t.header.Count == 0 && t.rows.Count == 0) {
-                t.header = rec;                     // 无换行收尾的单记录文本
-            } else {
-                t.rows.Add(rec);
-            }
+            Csv.FinishRecord(t, rec);               // 无换行收尾的单记录文本
         }
         return t;
     }

@@ -32,6 +32,9 @@ class TomlParser {
     Dict<string, bool> headers;
     /// 整数解析溢出哨兵（ParseIntBase 设置，调用方核对后报错）。
     bool intOverflow;
+    /// 整数解析非法数字位哨兵（0xGG、0b12 这类；ParseIntBase 设置）。
+    /// 旧实现静默返 0，调用方把畸形整数当 0 收下。
+    bool intBadDigit;
 
     /// <summary>解析入口。格式非法抛 TomlException（带行列号）。</summary>
     static JsonValue Parse(string src) {
@@ -224,8 +227,10 @@ class TomlParser {
         bool isInt = TomlParser.IntShape(t);
         if (isInt) {
             this.intOverflow = false;
+            this.intBadDigit = false;
             long v = this.ParseIntBase(t);
             if (this.intOverflow) { Err("integer out of 64-bit range: " + tok); }
+            if (this.intBadDigit) { Err("invalid digit for base in integer: " + tok); }
             return JsonValue.NewInt(v);
         }
         if (t == "inf" || t == "+inf") { return JsonValue.NewNum("Infinity"); }
@@ -234,6 +239,9 @@ class TomlParser {
         if (t.Length > 0 && (t[0] & 255) == 43) {
             t = t.Substring(1, t.Length - 1);                 // DoubleOf 不收 '+'
         }
+        // 尾部垃圾校验：JsonValue.DoubleOf 遇非数字即停，"1abc" 会
+        // 静默变 1.0——TOML 规范本就禁止，改为整段必须吃完。
+        if (!TomlParser.FloatShapeStrict(t)) { Err("malformed number: " + tok); }
         double d = JsonValue.DoubleOf(t);
         return JsonValue.NewDouble(d);
     }
@@ -345,6 +353,8 @@ class TomlParser {
     }
 
     /// 把 path 各段在 owner 下导航/创建（中间段必须是表），写入末段。
+    /// 同表内重复键（a=1\na=2）抛错——对齐表头查重行为与 TOML 规范；
+    /// 旧实现 Set 静默后写胜。
     void SetValue(JsonValue owner, List<string> path, JsonValue v) {
         JsonValue t = owner;
         for (int i = 0; i < path.Count - 1; i = i + 1) {
@@ -357,7 +367,9 @@ class TomlParser {
             }
             t = nxt;
         }
-        t.Set(path[path.Count - 1], v);
+        string last = path[path.Count - 1];
+        if (t.Has(last)) { Err("key defined twice: " + last); }
+        t.Set(last, v);
     }
 
     /// 表头导航：中间段沿表走（遇数组取末元素——[[fruit]] 后的
@@ -497,8 +509,11 @@ class TomlParser {
                 cp = cp * 16 + d;
             }
             pos = pos + digits;
-            if (cp == 0 || (cp >= 55296 && cp <= 57343)) {
-                Err("escape cannot be represented");
+            // 控制字符（U+0000..U+001F）转义全拒：TOML 规范本就禁止
+            // 控制字符出现在键/基本串中；且 \u0001 会与表头查重键的
+            // 段分隔符（字节 1）碰撞，伪造"表头重复定义"。
+            if (cp < 32 || (cp >= 55296 && cp <= 57343)) {
+                Err("escape cannot be represented (control characters not allowed)");
             }
             sb.Append(Encoding.Utf8FromCodePoint(cp));
         } else {
@@ -602,7 +617,10 @@ class TomlParser {
         long acc = 0;
         while (i < t.Length) {
             int d = TomlParser.HexVal(t[i] & 255);
-            if (d < 0 || d >= baseN) { return 0; }
+            if (d < 0 || d >= baseN) {
+                this.intBadDigit = true;                     // 0xGG / 0b12：置哨兵让调用方抛
+                return 0;
+            }
             if (acc > (TomlParser.MaxLong - d) / baseN) {
                 this.intOverflow = true;
                 return 0;
@@ -611,6 +629,41 @@ class TomlParser {
             i = i + 1;
         }
         return neg ? -acc : acc;
+    }
+
+    /// TOML 浮点形态（严格版）：[+-]? 前导数字 [ '.' 数字+ ] [ ('e'|'E')
+    /// [+-]? 数字+ ]，整段吃完。ReadNumberOrDatetime 用它把关后才交给
+    /// DoubleOf 求值。
+    static bool FloatShapeStrict(string t) {
+        int i = 0;
+        int n = t.Length;
+        if (i < n && ((t[i] & 255) == 43 || (t[i] & 255) == 45)) { i = i + 1; }
+        int digits = 0;
+        while (i < n && (t[i] & 255) >= 48 && (t[i] & 255) <= 57) {
+            i = i + 1;
+            digits = digits + 1;
+        }
+        if (digits == 0) { return false; }
+        if (i < n && (t[i] & 255) == 46) {                    // '.'
+            i = i + 1;
+            int frac = 0;
+            while (i < n && (t[i] & 255) >= 48 && (t[i] & 255) <= 57) {
+                i = i + 1;
+                frac = frac + 1;
+            }
+            if (frac == 0) { return false; }
+        }
+        if (i < n && ((t[i] & 255) == 101 || (t[i] & 255) == 69)) {  // e/E
+            i = i + 1;
+            if (i < n && ((t[i] & 255) == 43 || (t[i] & 255) == 45)) { i = i + 1; }
+            int exp = 0;
+            while (i < n && (t[i] & 255) >= 48 && (t[i] & 255) <= 57) {
+                i = i + 1;
+                exp = exp + 1;
+            }
+            if (exp == 0) { return false; }
+        }
+        return i == n;
     }
 
     static string Strip(string t, string cut) {

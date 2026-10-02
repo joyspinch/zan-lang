@@ -118,6 +118,11 @@ class RegexProgram {
     int marks;
     /// (?i)：ASCII 大小写折叠比较。
     bool ignoreCase;
+
+    /// 回溯递归深度上限（Step 的 depth 参数）。预算 2M 步只限总步数
+    /// 不限深度，深递归先撞线程栈——超帽抛 RegexBudgetException。
+    /// 量级对照 parser 深度帽（512~10000 档）；调大以线程栈余量为界。
+    static int MaxRecursionDepth = 10000;
     /// (?m)：^ $ 也匹配行边界
     bool multiline;
     /// (?s)：. 也匹配 \n
@@ -1406,7 +1411,13 @@ class RegexProgram {
     /// <summary>从 `start` 运行程序。成功后 `caps` 保存
     /// 2 * GroupCount() 个偏移（组未参与时为 -1），返回值为匹配
     /// 结束位置；-1 表示此处无匹配，-2 表示回溯预算耗尽
-    /// （调用方应把它与"无匹配"区分开）。</summary>
+    /// （调用方应把它与"无匹配"区分开）。
+    ///
+    /// 预算语义（ScanFrom 约定）：budget 在每次 RunAt 重新置
+    /// 2000000，即按起始位置重置——从不同起点出发的尝试各自享有
+    /// 完整预算，不是整段扫描共享一个预算。长输入的失败扫描因此
+    /// 最坏是 O(起点数 × 预算)；这是有意的取舍：起点推进本身廉价，
+    /// 共享预算会把靠后起点可匹配的模式误报成预算耗尽。</summary>
     int RunAt(nint input, int len, int start, int origin, List<int> caps) {
         int slots = this.groups * 2;
         caps.Clear();
@@ -1423,7 +1434,7 @@ class RegexProgram {
         for (int i = 0; i < this.marks; i = i + 1) {
             run.marks.Add(-1);
         }
-        if (this.Step(run, 0, start)) {
+        if (this.Step(run, 0, start, 0)) {
             return run.end;
         }
         if (run.overflow) { return -2; }
@@ -1432,8 +1443,21 @@ class RegexProgram {
 
     /// <summary>回溯解释器：每走一个分支递归调用一次。`budget`
     /// 限制总步数；耗尽时置 `overflow` 并一路返回失败，让调用方
-    /// 能报告"预算耗尽"而不是把超时伪装成"无匹配"。</summary>
-    bool Step(RegexRun run, int pc, int sp) {
+    /// 能报告"预算耗尽"而不是把超时伪装成"无匹配"。
+    ///
+    /// `depth` 是递归路径深度：Split 的首选臂、Save/Mark、环视每
+    /// 嵌套一层 +1（while 循环的顺序推进不计）。预算限步数不限
+    /// 深度——`(a*)` 这类模式每次循环迭代都经一次真递归，深输入会
+    /// 先于预算撞爆线程栈；超过 <see cref="MaxRecursionDepth"/> 直接
+    /// 抛 RegexBudgetException（与预算耗尽同型报错，不静默）。代价：
+    /// 单个量词在一段输入上的连续迭代数受此帽约束，确需更深的场景
+    /// 调大 MaxRecursionDepth（线程栈允许时）。</summary>
+    bool Step(RegexRun run, int pc, int sp, int depth) {
+        if (depth > RegexProgram.MaxRecursionDepth) {
+            throw new RegexBudgetException("regular expression recursion deeper than "
+                + Convert.ToString(RegexProgram.MaxRecursionDepth)
+                + " (pattern quantifier nesting on long input)");
+        }
         bool running = true;
         while (running) {
             if (run.overflow) { return false; }
@@ -1469,21 +1493,21 @@ class RegexProgram {
             } else if (o == RegexProgram.OpJmp()) {
                 pc = this.ax[pc];
             } else if (o == RegexProgram.OpSplit()) {
-                if (this.Step(run, this.ax[pc], sp)) { return true; }
+                if (this.Step(run, this.ax[pc], sp, depth + 1)) { return true; }
                 if (run.overflow) { return false; }
                 pc = this.ay[pc];
             } else if (o == RegexProgram.OpSave()) {
                 int slot = this.ax[pc];
                 int old = run.caps[slot];
                 run.caps[slot] = sp;
-                if (this.Step(run, pc + 1, sp)) { return true; }
+                if (this.Step(run, pc + 1, sp, depth + 1)) { return true; }
                 run.caps[slot] = old;
                 return false;
             } else if (o == RegexProgram.OpMark()) {
                 int slot = this.ax[pc];
                 int old = run.marks[slot];
                 run.marks[slot] = sp;
-                if (this.Step(run, pc + 1, sp)) { return true; }
+                if (this.Step(run, pc + 1, sp, depth + 1)) { return true; }
                 run.marks[slot] = old;
                 return false;
             } else if (o == RegexProgram.OpEmptyChk()) {
@@ -1509,7 +1533,7 @@ class RegexProgram {
                 }
                 int savedEnd = run.subEnd;
                 run.subEnd = -1;
-                bool ok = this.Step(run, pc + 1, at);
+                bool ok = this.Step(run, pc + 1, at, depth + 1);
                 if (run.overflow) { return false; }
                 int subEnd = run.subEnd;
                 run.subEnd = savedEnd;
