@@ -28,7 +28,10 @@ class UpdateFileEntry {
         return e;
     }
 
-    /// <summary>统一路径分隔符为正斜杠，去除开头的斜杠。</summary>
+    /// <summary>统一路径分隔符为正斜杠，去除开头的斜杠。
+    /// 压缩包内来自不可信来源的路径可能携带 ".." 段、盘符等逃逸
+    /// 构造（zip-slip），归一化结果不满足 SafeRelPath 时一律返回
+    /// 空串 fail-closed，调用方必须把空串当作非法条目拒绝。</summary>
     static string NormalizePath(string p) {
         if (p == null) { return ""; }
         string res = "";
@@ -43,7 +46,31 @@ class UpdateFileEntry {
         while (res.StartsWith("/")) {
             res = res.Substring(1);
         }
+        if (!UpdateFileEntry.SafeRelPath(res)) { return ""; }
         return res;
+    }
+
+    /// <summary>归档内相对路径防逃逸检查（与 stdlib Tar.SafeName 同
+    /// 规则）：必须非空、相对、无盘符、不含 ".." 段。注意 "\\" 仅在
+    /// 段边界处当分隔符参与 ".." 判定，段内反斜杠在 Windows 上原样
+    /// 成为文件名的一部分，不额外拒绝。非法时返回 false。</summary>
+    static bool SafeRelPath(string p) {
+        if (p == null || p.Length == 0) { return false; }
+        int c0 = p[0] & 255;
+        if (c0 == 47 || c0 == 92) { return false; }                      // 绝对路径
+        if (p.Length >= 2 && (p[1] & 255) == 58) { return false; }       // "C:" 盘符
+        int n = p.Length;
+        int seg = 0;
+        for (int i = 0; i <= n; i = i + 1) {
+            int c = i < n ? (p[i] & 255) : 47;
+            if (c == 47 || c == 92) {
+                if (i - seg == 2 && (p[seg] & 255) == 46 && (p[seg + 1] & 255) == 46) {
+                    return false;                                        // ".." 段
+                }
+                seg = i + 1;
+            }
+        }
+        return true;
     }
 
     /// <summary>转换为 Json 节点。</summary>

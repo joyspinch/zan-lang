@@ -230,16 +230,23 @@ class TamperDetector {
         }
         int restoredCount = 0;
         int issueTotal = report.issues.Count;
+        // 临时名 token：不可预测 + 同轮唯一，写完原子 rename 发布
+        string token = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
 
         for (int i = 0; i < issueTotal; i = i + 1) {
             TamperFileIssue issue = report.issues[i];
+            if (issue.path == null || issue.path.Length == 0 || !UpdateFileEntry.SafeRelPath(issue.path)) {
+                // 路径逃逸条目（zip-slip 形态）绝不落盘写
+                continue;
+            }
             string normPath = UpdateFileEntry.NormalizePath(issue.path);
 
             // 在 Zip 中查找对应的条目
             ZipEntry targetEntry = null;
             for (int k = 0; k < entries.Count; k = k + 1) {
                 ZipEntry ze = entries[k];
-                if (UpdateFileEntry.NormalizePath(ze.name) == normPath) {
+                string zeName = UpdateFileEntry.NormalizePath(ze.name);
+                if (zeName.Length > 0 && zeName == normPath) {
                     targetEntry = ze;
                     break;
                 }
@@ -256,8 +263,15 @@ class TamperDetector {
                     Directory.CreateDirectory(dir);
                 }
 
-                // 覆盖写入被篡改文件
-                File.WriteAllBytes(fullPath, originalBytes);
+                // 原子覆盖写入被篡改文件：临时文件写全后 rename 替换
+                string tmpFile = fullPath + "." + token + ".tmp";
+                try {
+                    File.WriteAllBytes(tmpFile, originalBytes);
+                    File.Move(tmpFile, fullPath);
+                } catch (Exception ex) {
+                    if (File.Exists(tmpFile)) { File.Delete(tmpFile); }
+                    throw ex;
+                }
                 AppUpdater.RestoreExecutablePermissionIfNeeded(fullPath, originalBytes);
 
                 // 二次校验恢复后的 MD5

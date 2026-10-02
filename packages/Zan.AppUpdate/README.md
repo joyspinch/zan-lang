@@ -137,6 +137,40 @@ class IntegrityCheckDemo {
 
 ---
 
+### 4. 发行方签名（防更新链劫持，生产必配）
+
+整包 MD5 只保证**完整性**不保证**真实性**——能同时替换清单与 Zip 的通道攻击者可以
+两者一起换。清单签名把信任锚定在发行方私钥上：
+
+```zan
+using System;
+using System.Security.Cryptography;
+using Zan.AppUpdate;
+
+// 发布端：打包后用 RSA 私钥签清单（密钥为 hex 大端字符串，可由 PEM 导出）
+UpdateManifest m = ReleasePackager.Pack(...);
+ReleasePackager.SignManifest(m, nHex, dHex);   // 签名写入 m.signature
+m.SaveToFile(manifestPath);                    // 签名后重新保存清单
+
+// 客户端：启动时配置发行方公钥（hex 模数、hex 指数）
+AppUpdater.SetTrustedSigner(nHex, "010001");
+// 之后所有 UpdateTo 强制验签：清单无签名或验签失败直接中止（fail-closed）。
+// 不配置公钥则维持"仅整包 MD5"的兼容模式——仅供开发环境使用。
+```
+
+安全基线（本包内置，无需配置）：
+
+- **zip-slip 防护**：更新包/恢复包内条目路径经 `UpdateFileEntry.SafeRelPath`
+  检查，含 `..` 段、盘符或绝对路径的条目一律拒绝并中止整包（fail-closed），
+  与 stdlib `Tar.SafeName` 同规则。
+- **原子覆盖**：所有覆盖写先落同目录随机 token 临时文件再 rename 替换
+  （`MOVEFILE_REPLACE_EXISTING`），断电/崩溃不会截断活文件，只可能留下
+  可清理的 `.tmp`。
+- **真备份**：`backupOld=true` 时，每个将被覆盖的旧文件先复制进
+  `_backup/<原相对路径>`，回滚可用（`_backup` 不参与打包扫描）。
+
+---
+
 ## 清单文件（Manifest）规范样例
 
 ```json
