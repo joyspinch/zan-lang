@@ -152,11 +152,28 @@ class BsonReader {
         if (t == 4) { return ReadDocument(depth + 1, true); }    // array
         if (t == 5) {                                   // binary
             int n = S32LE();
-            U8();                                       // 子类型丢弃（值模型无二进制）
+            int subtype = U8();
+            if (subtype == 2) {
+                // 过时的 subtype 0x02：payload 前置 int32 内嵌长度，
+                // 必须与外层一致（n = 4 + inner），不符即畸形。
+                if (n < 4 || S32LE() != n - 4) {
+                    throw new BsonException("binary subtype 0x02 embedded"
+                        + " length mismatch at byte " + Convert.ToString(pos));
+                }
+                return JsonValue.NewStr(DecodedText(Take(n - 4)));
+            }
             return JsonValue.NewStr(DecodedText(Take(n)));
         }
         if (t == 7) { return JsonValue.NewStr(HexOf(Take(12))); } // ObjectId
-        if (t == 8) { return JsonValue.NewBool(U8() != 0); }      // bool
+        if (t == 8) {                                   // bool
+            int bv = U8();
+            if (bv != 0 && bv != 1) {
+                throw new BsonException("boolean value must be 0x00 or 0x01,"
+                    + " got 0x" + HexByte(bv) + " at byte "
+                    + Convert.ToString(pos - 1));
+            }
+            return JsonValue.NewBool(bv != 0);
+        }
         if (t == 9) { return JsonValue.NewStr(IsoFromMs(U64LE())); } // datetime
         if (t == 10) { return JsonValue.NewNull(); }              // null
         if (t == 16) { return JsonValue.NewInt(S32LE()); }        // int32
