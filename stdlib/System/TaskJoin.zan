@@ -23,12 +23,20 @@ class TaskJoin {
     /// 轮询退避上限（毫秒）。
     static int MAX_BACKOFF = 4;
 
+    /// 汇合前先用 Task.Yield 轮询的圈数上限。一次让渡 = 重排到就绪环尾，
+    /// 排到队首时本批任务恰好又跑过了一轮——轮询节奏与排水节奏天然同步，
+    /// 快批次（亚毫秒扇出，服务端常态）在 1-2 圈内即完成汇合，不再吃
+    /// Delay 的 1-4ms 睡眠窗口。预算耗尽说明批次是长任务（IO/定时器），
+    /// 让渡会变成空转烧核，此时退回 Delay 指数退避。
+    static int YIELD_SPINS = 8;
+
     /// <summary>挂起直到 `handles` 中每个句柄都已完成（或被取消），
     /// 返回汇合的句柄个数。空列表立即返回 0，已完成的批次
     /// 不会挂起。</summary>
     static async int WhenAll(List<long> handles) {
         int n = handles.Count;
         if (n == 0) { return 0; }
+        int spins = 0;
         int wait = 1;
         while (true) {
             bool pending = false;
@@ -36,8 +44,13 @@ class TaskJoin {
                 if (Task.IsDone(handles[i]) == 0) { pending = true; break; }
             }
             if (!pending) { return n; }
-            await Task.Delay(wait);
-            if (wait < TaskJoin.MAX_BACKOFF) { wait = wait * 2; }
+            if (spins < TaskJoin.YIELD_SPINS) {
+                spins = spins + 1;
+                await Task.Yield();
+            } else {
+                await Task.Delay(wait);
+                if (wait < TaskJoin.MAX_BACKOFF) { wait = wait * 2; }
+            }
         }
         return n;
     }
@@ -45,17 +58,24 @@ class TaskJoin {
     /// <summary>挂起直到 `handles` 中任一句柄完成，返回其下标；
     /// 同一轮里多个都已完成时返回最小下标。空列表返回 -1。
     /// 其余协程继续运行——需要一起收尾就先
-    /// <see cref="CancelAll"/> 再 <see cref="WhenAll"/>。</summary>
+    /// <see cref="CancelAll"/> 再 <see cref="WhenAll"/>。
+    /// 让渡/退避混合策略同 <see cref="WhenAll"/>。</summary>
     static async int WhenAny(List<long> handles) {
         int n = handles.Count;
         if (n == 0) { return -1; }
+        int spins = 0;
         int wait = 1;
         while (true) {
             for (int i = 0; i < n; i = i + 1) {
                 if (Task.IsDone(handles[i]) != 0) { return i; }
             }
-            await Task.Delay(wait);
-            if (wait < TaskJoin.MAX_BACKOFF) { wait = wait * 2; }
+            if (spins < TaskJoin.YIELD_SPINS) {
+                spins = spins + 1;
+                await Task.Yield();
+            } else {
+                await Task.Delay(wait);
+                if (wait < TaskJoin.MAX_BACKOFF) { wait = wait * 2; }
+            }
         }
         return -1;
     }
