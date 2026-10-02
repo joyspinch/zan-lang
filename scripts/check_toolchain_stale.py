@@ -370,7 +370,10 @@ def rebuild_cmd(artifact, zig, ndk):
         if name == "zanrt_syncw.o":
             return [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11",
                     "-I", rt, "-O2", "-c", f"{rt}/rt_sync_wasm.c"]
-        return ([zig, "cc", "-target", "wasm32-wasi", "-g0"] + std
+        # c11, not `std` (only bound in the linux/macos branches below --
+        # NameError'd the moment a wasm object went date-stale): the .cmd's
+        # wasm block builds file/timer/wasm with -std=c11.
+        return ([zig, "cc", "-target", "wasm32-wasi", "-g0"] + c11
                 + ["-I", rt, "-O2", "-c", f"{rt}/{src}"])
     elif d.startswith("linux-"):
         arch = {"linux-musl": "x86_64", "linux-arm64": "aarch64",
