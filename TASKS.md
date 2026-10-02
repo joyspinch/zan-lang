@@ -24,7 +24,7 @@
 
 > 2026-10-02 平账：**B-ID52 闭账随本批提交**——zanc 发布装运（--publish）驱动拷贝诊断加固：重构 `zan_copy_file_ex`，在拷贝失败时详细捕获 errno 与 Windows GetLastError() 系统错误代码；普通驱动条目与 `@driver/` 依赖条目拷贝失败时均输出具体 warning（含源/目标路径与系统错误码）；聚合警告精准区分"目录中没有运行时库"与"目标文件被占用或写权限不足导致拷贝失败"，消灭运行中残留进程持 DLL 锁导致误导用户补清单的伪报错。测试验证：已通过 SqliteConnection 实体实机构建并对目标 DLL 实施独占锁定探针验证，准确捕获 winerr 32（ERROR_SHARING_VIOLATION）并输出准确诊断。条目移出。
 
-> 2026-10-02 平账：**B-ID51 闭账随本批提交**——PostgreSQL win-x64 pq 驱动装运与 OpenSSL 依赖消除伪告警：实测证明 Windows 预编译  的 PE 静态导入表硬性包含  与 （若缺失会导致目标机启动报找不到依赖 DLL）；由于此前纯 Zan Tls 重构剥离了 stdlib 的 OpenSSL 原生驱动，win-x64 pq.bundle 引用的  与  成为空悬引用。修复方案：将对应版本的  与  收敛内置进  驱动实体目录，更新 win-x64  直接声明打包此二件 DLL。实机验证：使用  实体进行  构建，192 个文件完整装运，消灭 2 条  缺失告警，产物目录具备完整的 libpq/libcrypto/libssl/libiconv/libintl 5 件套，实机运行正常握手建连退出。条目移出。
+> 2026-10-02 平账：**B-ID51 闭账随本批提交**——PostgreSQL win-x64 pq 驱动装运与 OpenSSL 依赖消除伪告警：实测证明 Windows 预编译 `libpq.dll` 的 PE 静态导入表硬性包含 `libcrypto-3-x64.dll` 与 `libssl-3-x64.dll`（若缺失会导致目标机启动报找不到依赖 DLL）；由于此前纯 Zan Tls 重构剥离了 stdlib 的 OpenSSL 原生驱动，win-x64 pq.bundle 引用的 `@driver/crypto` 与 `@driver/ssl` 成为空悬引用。修复方案：将对应版本的 `libcrypto-3-x64.dll` 与 `libssl-3-x64.dll` 收敛内置进 `packages/Zan.Data/.../drivers/win-x64/` 驱动实体目录，更新 win-x64 `pq.bundle` 直接声明打包此二件 DLL。实机验证：使用 `PgConnection` 实体进行 `--publish` 构建，192 个文件完整装运，消灭 2 条 `@driver` 缺失告警，产物目录具备完整的 libpq/libcrypto/libssl/libiconv/libintl 5 件套，实机运行正常握手建连退出。条目移出。
 
 ## 未完成 · IDE / 编译器
 
