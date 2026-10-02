@@ -156,6 +156,14 @@ rem live in libc.a), so they are not committed. zap_main.o, zan_inflate.o
 rem and the libEGL/libGLESv3 stub .so are built here but also stay
 rem uncommitted (zanc needs them in toolchain\ohos-<arch> at cross-link
 rem time; rerun this script on a fresh checkout).
+rem NDK-free fallback (proven 2026-10-02, see TASKS.md B-ID44/B-ID53): zig cc
+rem has no OHOS libc headers, so build against its bundled musl with the OS
+rem define added back -- `zig cc --target=<arch>-linux-musl -D__OHOS__ ...`
+rem (zig 0.14 predefines nothing OHOS-specific; the flag selects rt_sync.c's
+rem file-backed shm shim exactly like the NDK target). arm64 timer keeps the
+rem march flag as `-mcpu=generic+sha2`. Objects link clean against the
+rem committed OHOS musl libc.a subset (task_yield/vprobe probes pass on both
+rem arches); swap back to NDK clang when the SDK is available.
 if "%OHOS_NDK%"=="" set OHOS_NDK=%ZAN_OHOS_SDK%
 if not exist "%OHOS_NDK%\native\llvm\bin\clang.exe" (
   echo OHOS NDK not found: set OHOS_NDK to the OHOS SDK directory containing native

@@ -1928,6 +1928,49 @@ static int get_simd_array_element_size(zan_irgen_t *g, zan_ast_node_t *arg, loca
     }
 }
 
+/* Whether the codegen target is x86/x86-64: the SSE/AVX intrinsics are only
+ * selectable by the x86 backends — a call that survives to AArch64/RISCV
+ * codegen aborts with "LLVM ERROR: Cannot select". Cross builds always carry
+ * the triple; an empty triple means the native host build. */
+static bool emit_target_is_x86(const zan_irgen_t *g)
+{
+    if (g->target_triple[0] == '\0') {
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__arm__)
+        return false;
+#else
+        return true;
+#endif
+    }
+    return strstr(g->target_triple, "x86") != NULL ||
+           (g->target_triple[0] == 'i' && strstr(g->target_triple, "86") != NULL);
+}
+
+/* Portable pmovmskb: bit i of the i32 result is the sign bit of byte i of the
+ * <lanes x i8> vector. Vector compares + lane extracts lower everywhere
+ * (AArch64 CMTST, wasm, RISCV) — used instead of llvm.x86.*.pmovmskb on
+ * non-x86 targets. */
+static LLVMValueRef emit_pmovmskb_portable(zan_irgen_t *g, LLVMValueRef v,
+                                           unsigned lanes)
+{
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef vt = LLVMVectorType(LLVMInt8TypeInContext(g->ctx), lanes);
+    LLVMValueRef signs = LLVMBuildICmp(g->builder, LLVMIntSGT, v,
+        LLVMConstNull(vt), "vsigns");
+    LLVMValueRef acc = LLVMConstInt(i32t, 0, 0);
+    for (unsigned i = 0; i < lanes; i++) {
+        LLVMValueRef bit = LLVMBuildExtractElement(g->builder, signs,
+            LLVMConstInt(i32t, i, 0), "vbit");
+        LLVMValueRef ext = LLVMBuildZExt(g->builder, bit, i32t, "vbitz");
+        if (i == 0)
+            acc = ext;
+        else
+            acc = LLVMBuildOr(g->builder, acc,
+                LLVMBuildShl(g->builder, ext, LLVMConstInt(i32t, i, 0), "vbitsh"),
+                "vbits");
+    }
+    return acc;
+}
+
 static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 local_scope_t *locals, LLVMValueRef *out) {
     if (expr->kind != AST_CALL) return false;
@@ -2327,10 +2370,14 @@ static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
         (method.len == 8 && memcmp(method.str, "MoveMask", 8) == 0)) {
         if (argc == 1) {
             LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
-            LLVMTypeRef fty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ v16i8 }, 1, 0);
-            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse2.pmovmskb.128");
-            if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse2.pmovmskb.128", fty);
-            *out = zan_call2(g->builder, fty, fn, &a16, 1, "pmovmskb");
+            if (emit_target_is_x86(g)) {
+                LLVMTypeRef fty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ v16i8 }, 1, 0);
+                LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse2.pmovmskb.128");
+                if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse2.pmovmskb.128", fty);
+                *out = zan_call2(g->builder, fty, fn, &a16, 1, "pmovmskb");
+            } else {
+                *out = emit_pmovmskb_portable(g, a16, 16);
+            }
             return true;
         }
     }
@@ -2647,10 +2694,14 @@ static bool emit_vector256_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
     if (method.len == 26 && memcmp(method.str, "ExtractMostSignificantBits", 26) == 0 && argc == 1) {
         LLVMValueRef a32 = vec256_to_v32i8(g, emit_expr(g, expr->call.args.items[0], locals));
-        LLVMTypeRef fty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ v32i8 }, 1, 0);
-        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.avx2.pmovmskb");
-        if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.avx2.pmovmskb", fty);
-        *out = zan_call2(g->builder, fty, fn, &a32, 1, "vpmovmskb");
+        if (emit_target_is_x86(g)) {
+            LLVMTypeRef fty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ v32i8 }, 1, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.avx2.pmovmskb");
+            if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.avx2.pmovmskb", fty);
+            *out = zan_call2(g->builder, fty, fn, &a32, 1, "vpmovmskb");
+        } else {
+            *out = emit_pmovmskb_portable(g, a32, 32);
+        }
         return true;
     }
 
