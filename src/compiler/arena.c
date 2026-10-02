@@ -38,6 +38,7 @@ static int g_top_size_count = 0;
 
 void *zan_arena_alloc(zan_arena_t *arena, size_t size) {
     /* align to 8 bytes */
+    if (size > SIZE_MAX - 7) return NULL;   /* the alignment add would wrap */
     size = (size + 7) & ~(size_t)7;
 
     g_arena_total_requested += size;
@@ -64,7 +65,9 @@ void *zan_arena_alloc(zan_arena_t *arena, size_t size) {
         g_top_size_count++;
     }
 
-    if (arena->used + size > arena->cap) {
+    /* Overflow-free fit check: used <= cap always holds, so the subtraction
+     * cannot underflow, whereas `used + size` could wrap past a huge size. */
+    if (arena->cap - arena->used < size) {
         /* allocate new block. An oversized request (bigger than the 1 MB
          * standard block) gets a block of EXACTLY its own size: sizing it
          * 2x left half of the block permanently unused whenever the next

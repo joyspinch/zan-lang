@@ -968,7 +968,9 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
     if (lit_truncated) {
         /* Silently keeping the first 127 digits would make the literal a
          * DIFFERENT number than the one written. */
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc, "integer literal is too long");
+        zan_diag_emit(lex->diag, DIAG_ERROR, loc, is_float
+                      ? "floating-point literal is too long"
+                      : "integer literal is too long");
     }
 
     if (is_float) {
@@ -1179,6 +1181,11 @@ static char *zan_lex_strbuf_take(zan_lexer_t *lex, zan_lex_strbuf_t *sb,
     if (sb->oom) {
         zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
                       "out of memory while lexing string literal");
+        /* A failed realloc leaves the old block allocated; init failure
+         * leaves NULL, and free(NULL) is a no-op -- releasing unconditionally
+         * covers both without a second flag. */
+        free(sb->buf);
+        sb->buf = NULL;
         *out_len = 0;
         return zan_arena_strdup(lex->arena, "", 0);
     }
@@ -1311,7 +1318,15 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
     } else {
         /* Closing " or EOF. The hole this segment followed was already popped
          * by its `}`, so the depth is that of the enclosing hole, if any. */
-        if (!lexer_at_end(lex)) lexer_advance(lex); /* " */
+        if (!lexer_at_end(lex)) {
+            lexer_advance(lex); /* " */
+        } else {
+            /* EOF where the closing quote belongs: without this the file
+             * would lex clean and the error would surface (if at all) as a
+             * confusing parser complaint past the string. */
+            zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                          "unterminated interpolated string");
+        }
         kind = (start_kind == TK_INTERP_START) ? TK_STRING_LIT : TK_INTERP_END;
     }
 
@@ -1338,6 +1353,10 @@ static zan_token_t lexer_interp_format(zan_lexer_t *lex, zan_loc_t loc) {
         zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                       "interpolation format specifier exceeds %d characters and was truncated",
                       (int)sizeof(buf) - 1);
+    }
+    if (lexer_at_end(lex)) {
+        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                      "unterminated interpolated string");
     }
     zan_token_t tok = lexer_make(lex, TK_INTERP_FMT, loc);
     tok.str_val.str = zan_arena_strdup(lex->arena, buf, bi);
@@ -1369,6 +1388,13 @@ static zan_token_t lexer_verbatim_string(zan_lexer_t *lex) {
         } else {
             zan_lex_strbuf_push(&sb, lexer_advance(lex));
         }
+    }
+    if (lexer_at_end(lex)) {
+        /* @"..." runs to EOF with no closing quote (and verbatim strings
+         * span newlines, so unlike the plain literal there is no newline
+         * stop to catch it earlier). */
+        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                      "unterminated verbatim string literal");
     }
 
     size_t bi = 0;

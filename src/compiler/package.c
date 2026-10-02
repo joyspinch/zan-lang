@@ -497,63 +497,123 @@ static bool pkg_dir_in_list(const char (*out_dirs)[1024], int count, const char 
     return false;
 }
 
+/* ---- sorted directory enumeration ----
+ * The OS hands out directory entries in no contracted order (NTFS sorts by
+ * name, ext4 by hash), so discovery order leaked into the source join order
+ * and two machines compiled identical inputs to different bytes. Every
+ * enumeration that feeds source discovery iterates the name-sorted
+ * snapshot this helper returns. */
+
+static int pkg_names_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static char **pkg_dir_names_sorted(const char *dir, int *out_count) {
+    *out_count = 0;
+    int cap = 64, count = 0;
+    char **names = (char **)malloc((size_t)cap * sizeof(char *));
+    if (!names) return NULL;
+#ifdef _WIN32
+    char pattern[1024]; WIN32_FIND_DATAA fd;
+    if (snprintf(pattern, sizeof(pattern), "%s\\*", dir) < (int)sizeof(pattern)) {
+        HANDLE h = FindFirstFileA(pattern, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (strcmp(fd.cFileName, ".") == 0 ||
+                    strcmp(fd.cFileName, "..") == 0) continue;
+                if (count == cap) {
+                    int ncap = cap * 2;
+                    char **grown = (char **)realloc(names,
+                        (size_t)ncap * sizeof(char *));
+                    if (!grown) break;
+                    names = grown;
+                    cap = ncap;
+                }
+                size_t len = strlen(fd.cFileName);
+                names[count] = (char *)malloc(len + 1);
+                if (!names[count]) break;
+                memcpy(names[count], fd.cFileName, len + 1);
+                count++;
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+    }
+#else
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 ||
+                strcmp(e->d_name, "..") == 0) continue;
+            if (count == cap) {
+                int ncap = cap * 2;
+                char **grown = (char **)realloc(names,
+                    (size_t)ncap * sizeof(char *));
+                if (!grown) break;
+                names = grown;
+                cap = ncap;
+            }
+            size_t len = strlen(e->d_name);
+            names[count] = (char *)malloc(len + 1);
+            if (!names[count]) break;
+            memcpy(names[count], e->d_name, len + 1);
+            count++;
+        }
+        closedir(d);
+    }
+#endif
+    if (count > 1) qsort(names, (size_t)count, sizeof(char *), pkg_names_cmp);
+    *out_count = count;
+    return names;
+}
+
+static void pkg_dir_names_free(char **names, int count) {
+    if (!names) return;
+    for (int i = 0; i < count; i++) free(names[i]);
+    free(names);
+}
+
 static int pkg_scan_store(const char *store, const char *namespace_path,
                           char (*out_dirs)[1024], int count, int max_dirs) {
     if (!pkg_is_dir(store)) return count;
+    int n = 0;
+    char **names = pkg_dir_names_sorted(store, &n);
+    if (!names) return count;
+    for (int i = 0; i < n; i++) {
+        const char *name = names[i];
+        if (!pkg_safe_component(name)) continue;
+        char root[1024], cand[1024];
+        if (snprintf(root, sizeof(root), "%s" PATH_SEP "%s", store, name)
+            >= (int)sizeof(root)) continue;
 #ifdef _WIN32
-    char pattern[1024]; WIN32_FIND_DATAA fd;
-    snprintf(pattern, sizeof(pattern), "%s\\*", store);
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return count;
-    do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
-            (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
-            !pkg_safe_component(fd.cFileName)) continue;
-        char cand[1024];
-        /* 1. Prefer standard source package layout: <pkg>/src/<namespace_path> */
-        snprintf(cand, sizeof(cand), "%s\\%s\\src\\%s", store,
-                 fd.cFileName, namespace_path);
-        if (!pkg_is_dir(cand)) {
-            /* 2. Legacy package layout: <pkg>/stdlib/<namespace_path> */
-            snprintf(cand, sizeof(cand), "%s\\%s\\stdlib\\%s", store,
-                     fd.cFileName, namespace_path);
-        }
-        if (!pkg_is_dir(cand)) {
-            /* 3. Flat package layout: <pkg>/<namespace_path> */
-            snprintf(cand, sizeof(cand), "%s\\%s\\%s", store,
-                     fd.cFileName, namespace_path);
-        }
-        if (pkg_is_dir(cand) && count < max_dirs && !pkg_dir_in_list(out_dirs, count, cand)) {
-            snprintf(out_dirs[count++], 1024, "%s", cand);
-            zan_pkg_note_usage(store, fd.cFileName);
-        }
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+        DWORD attr = GetFileAttributesA(root);
+        if (attr == INVALID_FILE_ATTRIBUTES ||
+            (attr & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
 #else
-    DIR *d = opendir(store); if (!d) return count;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        if (!pkg_safe_component(e->d_name)) continue;
-        char root[1024], cand[1024]; struct stat st;
-        snprintf(root, sizeof(root), "%s/%s", store, e->d_name);
-        if (lstat(root, &st) != 0 || !S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) continue;
+        struct stat st;
+        if (lstat(root, &st) != 0 || !S_ISDIR(st.st_mode) ||
+            S_ISLNK(st.st_mode)) continue;
+#endif
         /* 1. Prefer standard source package layout: <pkg>/src/<namespace_path> */
-        snprintf(cand, sizeof(cand), "%s/src/%s", root, namespace_path);
+        snprintf(cand, sizeof(cand), "%s" PATH_SEP "src" PATH_SEP "%s",
+                 root, namespace_path);
         if (!pkg_is_dir(cand)) {
             /* 2. Legacy package layout: <pkg>/stdlib/<namespace_path> */
-            snprintf(cand, sizeof(cand), "%s/stdlib/%s", root, namespace_path);
+            snprintf(cand, sizeof(cand), "%s" PATH_SEP "stdlib" PATH_SEP "%s",
+                     root, namespace_path);
         }
         if (!pkg_is_dir(cand)) {
             /* 3. Flat package layout: <pkg>/<namespace_path> */
-            snprintf(cand, sizeof(cand), "%s/%s", root, namespace_path);
+            snprintf(cand, sizeof(cand), "%s" PATH_SEP "%s",
+                     root, namespace_path);
         }
-        if (pkg_is_dir(cand) && count < max_dirs && !pkg_dir_in_list(out_dirs, count, cand)) {
+        if (pkg_is_dir(cand) && count < max_dirs &&
+            !pkg_dir_in_list(out_dirs, count, cand)) {
             snprintf(out_dirs[count++], 1024, "%s", cand);
-            zan_pkg_note_usage(store, e->d_name);
+            zan_pkg_note_usage(store, name);
         }
     }
-    closedir(d);
-#endif
+    pkg_dir_names_free(names, n);
     return count;
 }
 
@@ -603,53 +663,34 @@ static int pkg_visit_source_tree(const char *dir, const char *target_ns,
                                  int hierarchical) {
     if (depth > 64) return 0;
     int found = 0;
-#ifdef _WIN32
-    char pattern[1024]; WIN32_FIND_DATAA fd;
-    if (snprintf(pattern, sizeof(pattern), "%s\\*", dir) >= (int)sizeof(pattern)) return 0;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    do {
-        if (!pkg_safe_component(fd.cFileName) ||
-            (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+    int n = 0;
+    char **names = pkg_dir_names_sorted(dir, &n);
+    if (!names) return 0;
+    for (int i = 0; i < n; i++) {
+        const char *name = names[i];
+        if (!pkg_safe_component(name)) continue;
         char path[1024];
-        if (snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName) >= (int)sizeof(path)) continue;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            found += pkg_visit_source_tree(path, target_ns, probe, visitor, context,
-                                           depth + 1, src_root, hierarchical);
-        } else {
-            size_t n = strlen(fd.cFileName);
-            if (n < 5 || strcmp(fd.cFileName + n - 4, ".zan") != 0) continue;
-            char declared[256] = {0};
-            int ok;
-            if (probe(path, declared, sizeof(declared)) && declared[0]) {
-                ok = pkg_ns_match(declared, target_ns, hierarchical);
-            } else {
-                char relns[256];
-                pkg_rel_dir_ns(dir, src_root, relns, sizeof(relns));
-                ok = relns[0] != '\0' && strcmp(relns, target_ns) == 0;
-            }
-            if (ok) {
-                visitor(path, context);
-                found++;
-            }
-        }
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+        if (snprintf(path, sizeof(path), "%s" PATH_SEP "%s", dir, name)
+            >= (int)sizeof(path)) continue;
+        int is_dir = 0, is_reg = 0;
+#ifdef _WIN32
+        DWORD attr = GetFileAttributesA(path);
+        if (attr == INVALID_FILE_ATTRIBUTES ||
+            (attr & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        is_dir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        is_reg = !is_dir;
 #else
-    DIR *d = opendir(dir);
-    if (!d) return 0;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        if (!pkg_safe_component(e->d_name)) continue;
-        char path[1024]; struct stat st;
-        if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= (int)sizeof(path) ||
-            lstat(path, &st) != 0 || S_ISLNK(st.st_mode)) continue;
-        if (S_ISDIR(st.st_mode)) {
+        struct stat st;
+        if (lstat(path, &st) != 0 || S_ISLNK(st.st_mode)) continue;
+        is_dir = S_ISDIR(st.st_mode) != 0;
+        is_reg = S_ISREG(st.st_mode) != 0;
+#endif
+        if (is_dir) {
             found += pkg_visit_source_tree(path, target_ns, probe, visitor, context,
                                            depth + 1, src_root, hierarchical);
-        } else if (S_ISREG(st.st_mode)) {
-            size_t n = strlen(e->d_name);
-            if (n < 5 || strcmp(e->d_name + n - 4, ".zan") != 0) continue;
+        } else if (is_reg) {
+            size_t len = strlen(name);
+            if (len < 5 || strcmp(name + len - 4, ".zan") != 0) continue;
             char declared[256] = {0};
             int ok;
             if (probe(path, declared, sizeof(declared)) && declared[0]) {
@@ -665,8 +706,7 @@ static int pkg_visit_source_tree(const char *dir, const char *target_ns,
             }
         }
     }
-    closedir(d);
-#endif
+    pkg_dir_names_free(names, n);
     return found;
 }
 
@@ -697,51 +737,38 @@ static int pkg_visit_store(const char *store, const char *target_ns,
                            pkg_seen_names_t *seen, int hierarchical) {
     if (!pkg_is_dir(store)) return 0;
     int found = 0;
-#ifdef _WIN32
-    char pattern[1024]; WIN32_FIND_DATAA fd;
-    if (snprintf(pattern, sizeof(pattern), "%s\\*", store) >= (int)sizeof(pattern)) return 0;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
-            (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
-            !pkg_safe_component(fd.cFileName)) continue;
+    int n = 0;
+    char **names = pkg_dir_names_sorted(store, &n);
+    if (!names) return 0;
+    for (int i = 0; i < n; i++) {
+        const char *name = names[i];
+        if (!pkg_safe_component(name)) continue;
         char root[1024], source[1024];
-        if (snprintf(root, sizeof(root), "%s\\%s", store, fd.cFileName) >= (int)sizeof(root)) continue;
-        if (snprintf(source, sizeof(source), "%s\\src", root) >= (int)sizeof(source)) continue;
-        if (!pkg_is_dir(source)) {
-            if (snprintf(source, sizeof(source), "%s\\stdlib", root) >= (int)sizeof(source)) continue;
-            if (!pkg_is_dir(source)) snprintf(source, sizeof(source), "%s", root);
-        }
-        if (!pkg_mark_seen(seen, fd.cFileName)) continue;
-        int hits = pkg_visit_source_tree(source, target_ns, probe, visitor, context, 0,
-                                         source, hierarchical);
-        if (hits) zan_pkg_note_usage(store, fd.cFileName);
-        found += hits;
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+        if (snprintf(root, sizeof(root), "%s" PATH_SEP "%s", store, name)
+            >= (int)sizeof(root)) continue;
+#ifdef _WIN32
+        DWORD attr = GetFileAttributesA(root);
+        if (attr == INVALID_FILE_ATTRIBUTES ||
+            (attr & FILE_ATTRIBUTE_REPARSE_POINT) ||
+            !(attr & FILE_ATTRIBUTE_DIRECTORY)) continue;
 #else
-    DIR *d = opendir(store);
-    if (!d) return 0;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        if (!pkg_safe_component(e->d_name)) continue;
-        char root[1024], source[1024]; struct stat st;
-        if (snprintf(root, sizeof(root), "%s/%s", store, e->d_name) >= (int)sizeof(root) ||
-            lstat(root, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-        if (snprintf(source, sizeof(source), "%s/src", root) >= (int)sizeof(source)) continue;
+        struct stat st;
+        if (lstat(root, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+#endif
+        if (snprintf(source, sizeof(source), "%s" PATH_SEP "src", root)
+            >= (int)sizeof(source)) continue;
         if (!pkg_is_dir(source)) {
-            if (snprintf(source, sizeof(source), "%s/stdlib", root) >= (int)sizeof(source)) continue;
+            if (snprintf(source, sizeof(source), "%s" PATH_SEP "stdlib", root)
+                >= (int)sizeof(source)) continue;
             if (!pkg_is_dir(source)) snprintf(source, sizeof(source), "%s", root);
         }
-        if (!pkg_mark_seen(seen, e->d_name)) continue;
+        if (!pkg_mark_seen(seen, name)) continue;
         int hits = pkg_visit_source_tree(source, target_ns, probe, visitor, context, 0,
                                          source, hierarchical);
-        if (hits) zan_pkg_note_usage(store, e->d_name);
+        if (hits) zan_pkg_note_usage(store, name);
         found += hits;
     }
-    closedir(d);
-#endif
+    pkg_dir_names_free(names, n);
     return found;
 }
 
@@ -827,33 +854,29 @@ static int pkg_store_source_roots(const char *store,
                                   char (*out_roots)[1024], int count,
                                   int max_roots) {
     if (!pkg_is_dir(store)) return count;
+    int n = 0;
+    char **names = pkg_dir_names_sorted(store, &n);
+    if (!names) return count;
+    for (int i = 0; i < n; i++) {
+        const char *name = names[i];
+        if (!pkg_safe_component(name)) continue;
+        char pkg[1024];
+        if (snprintf(pkg, sizeof(pkg), "%s" PATH_SEP "%s", store, name)
+            >= (int)sizeof(pkg)) continue;
 #ifdef _WIN32
-    char pattern[1024]; WIN32_FIND_DATAA fd;
-    snprintf(pattern, sizeof(pattern), "%s\\*", store);
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return count;
-    do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
-            (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
-            !pkg_safe_component(fd.cFileName)) continue;
-        count = pkg_add_package_root(store, fd.cFileName, out_roots,
-                                     count, max_roots);
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+        DWORD attr = GetFileAttributesA(pkg);
+        if (attr == INVALID_FILE_ATTRIBUTES ||
+            (attr & FILE_ATTRIBUTE_REPARSE_POINT) ||
+            !(attr & FILE_ATTRIBUTE_DIRECTORY)) continue;
 #else
-    DIR *d = opendir(store); if (!d) return count;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        if (!pkg_safe_component(e->d_name)) continue;
-        char pkg[1024]; struct stat st;
-        snprintf(pkg, sizeof(pkg), "%s/%s", store, e->d_name);
+        struct stat st;
         if (lstat(pkg, &st) != 0 || !S_ISDIR(st.st_mode) ||
             S_ISLNK(st.st_mode)) continue;
-        count = pkg_add_package_root(store, e->d_name, out_roots,
+#endif
+        count = pkg_add_package_root(store, name, out_roots,
                                      count, max_roots);
     }
-    closedir(d);
-#endif
+    pkg_dir_names_free(names, n);
     return count;
 }
 
