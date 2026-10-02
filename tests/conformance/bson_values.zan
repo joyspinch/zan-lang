@@ -1,0 +1,190 @@
+// BSON test: little-endian wire vectors for every mapped type (empty
+// document, bool, null, int32, string, float64 bit pattern, int64 both
+// sides of the int32 boundary with sign extension, nested document,
+// array with generated numeric keys), read-side conversions (ObjectId
+// → 24-hex, datetime ms → ISO 8601 with sub-second digits, binary →
+// UTF-8), canonical int-width selection, form preservation, JSON
+// round-trip, Save/Load, slice Unpack, multi-document stream, and
+// error paths (non-document root, NUL in key, truncation, length
+// below minimum, declared-length mismatch, missing string NUL,
+// unsupported type 0x0B).
+using System;
+using System.Bson;
+using System.IO;
+using System.Json;
+using System.Text;
+
+namespace Conf;
+
+class Prog {
+    static int bad = 0;
+
+    static string Hex(byte[] b) {
+        StringBuilder sb = new StringBuilder();
+        string hex = "0123456789abcdef";
+        int i = 0;
+        while (i < b.Length) {
+            if (i > 0) { sb.Append(" "); }
+            int v = b[i] & 255;
+            sb.Append(hex.Substring(v >> 4, 1));
+            sb.Append(hex.Substring(v & 15, 1));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static void Chk(string label, string got, string want) {
+        if (got != want) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static string S(JsonValue v, string d) {
+        if (v == null) { return d; }
+        return v.AsString(d);
+    }
+
+    static long L(JsonValue v, long d) {
+        if (v == null) { return d; }
+        return v.AsLong(d);
+    }
+
+    static void Main() {
+        // ---- 写侧线上向量（小端） ----
+        Chk("empty", Hex(Bson.Pack(JsonValue.Parse("{}"))), "05 00 00 00 00");
+        Chk("bool", Hex(Bson.Pack(JsonValue.Parse("{\"a\":true}"))),
+            "09 00 00 00 08 61 00 01 00");
+        Chk("null", Hex(Bson.Pack(JsonValue.Parse("{\"a\":null}"))),
+            "08 00 00 00 0a 61 00 00");
+        Chk("int32", Hex(Bson.Pack(JsonValue.Parse("{\"a\":1}"))),
+            "0c 00 00 00 10 61 00 01 00 00 00 00");
+        Chk("negint32", Hex(Bson.Pack(JsonValue.Parse("{\"n\":-5}"))),
+            "0c 00 00 00 10 6e 00 fb ff ff ff 00");
+        Chk("string", Hex(Bson.Pack(JsonValue.Parse("{\"a\":\"hi\"}"))),
+            "0f 00 00 00 02 61 00 03 00 00 00 68 69 00 00");
+        Chk("double", Hex(Bson.Pack(JsonValue.Parse("{\"a\":1.5}"))),
+            "10 00 00 00 01 61 00 00 00 00 00 00 00 f8 3f 00");
+        // int32 上边界之上换 int64（2^31 = 0x80000000，小端低位先）。
+        Chk("int64-hi", Hex(Bson.Pack(JsonValue.Parse("{\"a\":2147483648}"))),
+            "10 00 00 00 12 61 00 00 00 00 80 00 00 00 00 00");
+        Chk("int64-lo", Hex(Bson.Pack(JsonValue.Parse("{\"a\":-2147483649}"))),
+            "10 00 00 00 12 61 00 ff ff ff 7f ff ff ff ff 00");
+        // 嵌套文档：内层先成形（自带长度头），外层整体拼接。
+        Chk("nested", Hex(Bson.Pack(JsonValue.Parse("{\"o\":{\"b\":2}}"))),
+            "14 00 00 00 03 6f 00 0c 00 00 00 10 62 00 02 00 00 00 00 00");
+        // 数组：写出自动生成 "0","1",… 数字键。
+        Chk("array", Hex(Bson.Pack(JsonValue.Parse("{\"r\":[1,\"x\"]}"))),
+            "1d 00 00 00 04 72 00 15 00 00 00 10 30 00 01 00 00 00"
+            + " 02 31 00 02 00 00 00 78 00 00 00");
+
+        // ---- 读侧还原约定 ----
+        // ObjectId（12 字节）→ 24 位小写十六进制。
+        JsonValue oid = Bson.Unpack(new byte[] {
+            22, 0, 0, 0, 7, 95, 105, 100, 0,
+            95, 31, 58, 27, 141, 46, 79, 96, 154, 123, 140, 157, 0 });
+        Chk("oid", S(oid.Get("_id"), ""), "5f1f3a1b8d2e4f609a7b8c9d");
+        // datetime（UTC 毫秒）→ ISO 8601，整秒不带小数节。
+        JsonValue dt = Bson.Unpack(new byte[] {
+            16, 0, 0, 0, 9, 116, 0, 232, 3, 0, 0, 0, 0, 0, 0, 0 });
+        Chk("dt", S(dt.Get("t"), ""), "1970-01-01T00:00:01Z");
+        // 非整秒毫秒 → 三位小数。
+        JsonValue dt2 = Bson.Unpack(new byte[] {
+            16, 0, 0, 0, 9, 116, 0, 220, 5, 0, 0, 0, 0, 0, 0, 0 });
+        Chk("dt-ms", S(dt2.Get("t"), ""), "1970-01-01T00:00:01.500Z");
+        // binary（子类型字节丢弃）→ UTF-8 尽力。
+        JsonValue bin = Bson.Unpack(new byte[] {
+            16, 0, 0, 0, 5, 98, 0, 3, 0, 0, 0, 0, 97, 98, 99, 0 });
+        Chk("bin", S(bin.Get("b"), ""), "abc");
+
+        // ---- 规范整宽选择与形态保持 ----
+        Chk("i32-max", Hex(Bson.Pack(JsonValue.Parse("{\"a\":2147483647}"))).Substring(0, 14),
+            "0c 00 00 00 10");
+        Chk("i64-min", Hex(Bson.Pack(JsonValue.Parse("{\"a\":2147483648}"))).Substring(0, 14),
+            "10 00 00 00 12");
+        JsonValue backMax = Bson.Unpack(Bson.Pack(JsonValue.Parse("{\"a\":2147483648}")));
+        if (L(backMax.Get("a"), 0) != 2147483648) {
+            bad = bad + 1; Console.WriteLine("FAIL i64-roundtrip");
+        }
+        JsonValue vi = Bson.Unpack(Bson.Pack(JsonValue.Parse("{\"a\":7}")));
+        JsonValue ia = vi.Get("a");
+        if (ia == null || !ia.IsInt()) { bad = bad + 1; Console.WriteLine("FAIL int-form"); }
+        JsonValue vd = Bson.Unpack(Bson.Pack(JsonValue.Parse("{\"a\":7.0}")));
+        JsonValue da = vd.Get("a");
+        if (da != null && da.IsInt()) { bad = bad + 1; Console.WriteLine("FAIL float-form"); }
+
+        // ---- 语义往返：Parse JSON → Pack → Unpack → ToJson 相等 ----
+        string json = "{\"n\":-5,\"s\":\"héllo\",\"f\":2.25,"
+            + "\"arr\":[1,true,null,\"x\"],\"o\":{\"k\":42}}";
+        JsonValue jv = JsonValue.Parse(json);
+        JsonValue back = Bson.Unpack(Bson.Pack(jv));
+        if (back.ToJson() != jv.ToJson()) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL roundtrip");
+        }
+
+        // ---- 文件往返 ----
+        Bson.Save(jv, "_scratch/bs_roundtrip.bin");
+        JsonValue fromFile = Bson.Load("_scratch/bs_roundtrip.bin");
+        if (fromFile.ToJson() != jv.ToJson()) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL file-roundtrip");
+        }
+
+        // ---- 切片解码与多文档流（取首个文档） ----
+        byte[] one = Bson.Pack(JsonValue.Parse("{\"a\":1}"));
+        byte[] two = Bson.Pack(JsonValue.Parse("{\"b\":2}"));
+        byte[] both = new byte[2 + one.Length + two.Length];
+        both[0] = 1;
+        both[1] = 2;
+        NativeMemory.Copy((nint)both + 2, (nint)one, one.Length);
+        NativeMemory.Copy((nint)both + 2 + one.Length, (nint)two, two.Length);
+        JsonValue first = Bson.Unpack(both, 2, both.Length - 2);
+        if (L(first.Get("a"), 0) != 1) {
+            bad = bad + 1; Console.WriteLine("FAIL slice-stream");
+        }
+
+        // ---- 错误路径 ----
+        try {
+            Bson.Pack(JsonValue.NewInt(1));
+            Console.WriteLine("root NOT THROWN");
+            bad = bad + 1;
+        } catch (BsonException) { }
+        try {
+            JsonValue badKey = JsonValue.NewObject();
+            badKey.Put("a" + Encoding.Utf8FromCodePoint(0) + "b", JsonValue.NewInt(1));
+            Bson.Pack(badKey);
+            Console.WriteLine("nul-key NOT THROWN");
+            bad = bad + 1;
+        } catch (BsonException) { }
+        try {
+            Bson.Unpack(new byte[] { 10, 0, 0, 0, 8, 97, 0 });
+            Console.WriteLine("trunc NOT THROWN");
+            bad = bad + 1;
+        } catch (BsonException) { }
+        try {
+            Bson.Unpack(new byte[] { 3, 0, 0, 0, 0 });
+            Console.WriteLine("short-len NOT THROWN");
+            bad = bad + 1;
+        } catch (BsonException) { }
+        try {
+            // 声明 13 字节，实际 12 字节处就有终止符——长度不符。
+            Bson.Unpack(new byte[] { 13, 0, 0, 0, 16, 97, 0, 1, 0, 0, 0, 0, 0 });
+            Console.WriteLine("len-mismatch NOT THROWN");
+            bad = bad + 1;
+        } catch (BsonException) { }
+        try {
+            Bson.Unpack(new byte[] { 15, 0, 0, 0, 2, 97, 0, 3, 0, 0, 0, 97, 98, 99, 97 });
+            Console.WriteLine("str-nul NOT THROWN");
+            bad = bad + 1;
+        } catch (BsonException) { }
+        try {
+            // regex 值（cstring 模式 + cstring 选项）：值模型外类型。
+            Bson.Unpack(new byte[] { 11, 0, 0, 0, 11, 114, 0, 97, 0, 0, 0 });
+            Console.WriteLine("regex NOT THROWN");
+            bad = bad + 1;
+        } catch (BsonException) { }
+
+        Console.WriteLine("bson-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

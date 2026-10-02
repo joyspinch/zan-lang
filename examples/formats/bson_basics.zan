@@ -1,0 +1,90 @@
+// ============================================================================
+// BSON 基础 —— Zan.Bson：MongoDB 文档格式，编解码与体量对比
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. Bson.Pack / Unpack：JsonValue ↔ BSON 字节（小端、文档自带长度头）
+//   2. 整数规范宽度：int32 装得下走 0x10，否则 0x12；浮点走 0x01
+//   3. Bson.Load / Save：直接读写文件
+//   4. 体量对比：同一段数据 JSON 文本 vs BSON 字节数
+//
+// 运行：zanc examples/formats/bson_basics.zan --auto-stdlib -o bs.exe && ./bs.exe
+// ============================================================================
+using System;
+using System.Json;
+using System.Bson;
+
+class Program {
+    static string S(JsonValue v, string d) {
+        if (v == null) { return d; }
+        return v.AsString(d);
+    }
+
+    static long L(JsonValue v, long d) {
+        if (v == null) { return d; }
+        return v.AsLong(d);
+    }
+
+    static double D(JsonValue v, double d) {
+        if (v == null) { return d; }
+        return v.AsDouble(d);
+    }
+
+    /// 字节数组 → 十六进制（演示用，长串截断）。
+    static string Hex(byte[] b) {
+        string digits = "0123456789abcdef";
+        string out2 = "";
+        int i = 0;
+        while (i < b.Length && i < 24) {
+            int v = b[i] & 255;
+            if (i > 0) { out2 = out2 + " "; }
+            out2 = out2 + digits.Substring(v >> 4, 1) + digits.Substring(v & 15, 1);
+            i = i + 1;
+        }
+        if (b.Length > 24) { out2 = out2 + " ..."; }
+        return out2;
+    }
+
+    static void Main() {
+        JsonValue v = JsonValue.NewObject();
+        v.Put("id", JsonValue.NewInt(1234));
+        v.Put("name", JsonValue.NewStr("sensor"));
+        v.Put("ok", JsonValue.NewBool(true));
+        v.Put("gain", JsonValue.NewDouble(0.5));
+        JsonValue tags = JsonValue.NewArray();
+        tags.Append(JsonValue.NewStr("a"));
+        tags.Append(JsonValue.NewStr("b"));
+        v.Put("tags", tags);
+
+        // ---- 编码：int32 总长度头 + 元素流 + 终止 0x00（小端） ----
+        byte[] bin = Bson.Pack(v);
+        Console.WriteLine("bson      = " + Hex(bin) + " (" + bin.Length + " bytes)");
+
+        // ---- 解码：回来的树与原值相等 ----
+        JsonValue back = Bson.Unpack(bin);
+        Console.WriteLine("id        = " + L(back.Get("id"), 0));
+        Console.WriteLine("name      = " + S(back.Get("name"), ""));
+        Console.WriteLine("ok        = " + (L(back.Get("ok"), 0) == 1));
+        Console.WriteLine("gain      = " + D(back.Get("gain"), 0));
+        JsonValue tagsBack = back.Get("tags");
+        Console.WriteLine("tags      = " + (tagsBack == null ? 0 : tagsBack.Count()));
+
+        // ---- 体量：JSON 文本 vs BSON ----
+        string json = v.ToJson();
+        Console.WriteLine("size      = json " + json.Length + " chars vs bson " + bin.Length + " bytes");
+
+        // ---- 文件：Save/Load 对称 ----
+        Bson.Save(v, "_bs_demo.bin");
+        JsonValue disk = Bson.Load("_bs_demo.bin");
+        Console.WriteLine("disk      = " + (L(disk.Get("id"), -1) == 1234));
+        File.Delete("_bs_demo.bin");
+
+        // ---- 错误路径：文档声明长度与实际元素不符抛 BsonException ----
+        try {
+            // 头部声明 13 字节，int32 元素后终止符提前出现。
+            Bson.Unpack(new byte[] { 13, 0, 0, 0, 16, 97, 0, 1, 0, 0, 0, 0, 0 });
+            Console.WriteLine("length    = NOT THROWN");
+        } catch (BsonException e) {
+            Console.WriteLine("length    = " + e.Message);
+        }
+    }
+}

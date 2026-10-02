@@ -1,0 +1,131 @@
+using System;
+using System.Text;
+
+namespace System.Bson;
+
+/// <summary>
+/// BSON 编码原语：往可增长的 byte[] 里写小端 32/64 位整数、
+/// IEEE-754 double、cstring（键）、string（长度前缀 + NUL 终止）。
+/// 字节缓冲倍增扩容整块 NativeMemory.Copy 搬移（与 MsgPackWriter
+/// 同形）。BSON 线上格式为小端（区别于 MessagePack 的大端）。
+/// 嵌套文档/数组先编码进子缓冲得到完整字节（自带长度头与终止符），
+/// 再作为元素值整体拼接——长度头因此天然自洽，无需回填。
+/// </summary>
+class BsonWriter {
+    byte[] buf;
+    int len;
+
+    public BsonWriter() {
+        buf = new byte[64];
+        len = 0;
+    }
+
+    /// 已编码字节数。
+    int Length() { return len; }
+
+    void EnsureRoom(int extra) {
+        if (len + extra <= buf.Length) { return; }
+        int c = buf.Length * 2;
+        if (c < 16) { c = 16; }
+        while (c < len + extra) { c = c * 2; }
+        byte[] grown = new byte[c];
+        NativeMemory.Copy((nint)grown, (nint)buf, len);
+        buf = grown;
+    }
+
+    /// 追加 1 字节。
+    void RawU8(int b) {
+        EnsureRoom(1);
+        buf[len] = (byte)b;
+        len = len + 1;
+    }
+
+    void RawU32LE(long v) {
+        EnsureRoom(4);
+        buf[len] = (byte)v;
+        buf[len + 1] = (byte)(v >> 8);
+        buf[len + 2] = (byte)(v >> 16);
+        buf[len + 3] = (byte)(v >> 24);
+        len = len + 4;
+    }
+
+    void RawU64LE(long v) {
+        EnsureRoom(8);
+        int i = 0;
+        while (i < 8) {
+            buf[len + i] = (byte)v;
+            v = v >> 8;
+            i = i + 1;
+        }
+        len = len + 8;
+    }
+
+    /// 追加一段已编码字节（嵌套文档/数组整体拼接用）。
+    void RawBytes(byte[] b) {
+        EnsureRoom(b.Length);
+        NativeMemory.Copy((nint)buf + len, (nint)b, b.Length);
+        len = len + b.Length;
+    }
+
+    /// <summary>元素类型字节（0x01 double … 0x12 int64）。
+    /// 供门面在拼接嵌套值前写类型用。</summary>
+    void RawType(int t) { RawU8(t); }
+
+    /// <summary>cstring（元素名）：字节后补一个 NUL。键含 NUL
+    /// 无法在线上表示，抛 BsonException。</summary>
+    void CStr(string s) {
+        byte[] b = Encoding.GetBytes(s);
+        int n = b.Length;
+        int i = 0;
+        while (i < n) {
+            if ((b[i] & 255) == 0) {
+                throw new BsonException("key contains NUL: " + s);
+            }
+            i = i + 1;
+        }
+        RawBytes(b);
+        RawU8(0);
+    }
+
+    /// <summary>string 值：int32 字节数（含终止 NUL）+ UTF-8 字节 +
+    /// NUL。值内 NUL 一并拒绝（驱动与服务端同款约束）。</summary>
+    void WriteString(string s) {
+        byte[] b = Encoding.GetBytes(s);
+        int n = b.Length;
+        int i = 0;
+        while (i < n) {
+            if ((b[i] & 255) == 0) {
+                throw new BsonException("string value contains NUL");
+            }
+            i = i + 1;
+        }
+        RawU32LE(n + 1);
+        RawBytes(b);
+        RawU8(0);
+    }
+
+    void WriteDouble(double d) {
+        RawU64LE(NativeMemory.AsI64(d));
+    }
+
+    /// bool：规范要求 0x00/0x01 单字节。
+    void WriteBool(bool b) { RawU8(b ? 1 : 0); }
+
+    void WriteInt32(int v) { RawU32LE(v & 4294967295); }
+
+    void WriteInt64(long v) { RawU64LE(v); }
+
+    /// <summary>收尾成一个完整文档：前置 int32 总长（含自身与终止
+    /// NUL）+ 主体 + 0x00，整体拷出。</summary>
+    byte[] FinishDocument() {
+        int total = len + 5;
+        byte[] out2 = new byte[total];
+        out2[0] = (byte)total;
+        out2[1] = (byte)(total >> 8);
+        out2[2] = (byte)(total >> 16);
+        out2[3] = (byte)(total >> 24);
+        NativeMemory.Copy((nint)out2 + 4, (nint)buf, len);
+        out2[total - 1] = 0;
+        return out2;
+    }
+}
