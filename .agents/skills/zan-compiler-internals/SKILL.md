@@ -573,6 +573,15 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   3. 落地重构：引入 `maxCap = this.maxBytes > 0 ? this.maxBytes : 1073741824`（1GB 兜底），在无显式配置时同样提供 1GB 绝对安全限额，超限立即进入 `overflowed` 终态并通知调用方，杜绝整型溢出与 OOM 风险。
 - **回归锁定**：`ctest -R "policy_sse_sink|sse_stream"` 5 项全套测试 100% 全部通过。
 
+## CoAP 协议选项编码防御：RFC 7252 §3.1 扩展长度编码完整对称（CoapClient）
+
+- **病灶**：在 `CoapClient.BuildRequest` 中，原先针对 `Uri-Path`（选项 11）各路径段长度 `segLen`，仅处理了 `segLen < 13`（直接内嵌）与 `segLen >= 13`（按 `segLen - 13` 扩展 1 字节）；若段长 `segLen >= 269`，原逻辑仍按单字节截断发射。
+- **危害**：
+  1. RFC 7252 §3.1 明确规定选项长度字段的 3 档定界规则：$0..12$ 直接内嵌、$13..268$ 存 13 并在后附 1 字节（$value - 13$）、$269..65804$ 存 14 并在后附 2 字节大端整数（$value - 269$）；
+  2. 若路径段长达到 269 字节及以上（如深层 REST API 路径或携带长 base64/hash 唯一标识），单字节溢出回绕将损坏选项长度并截断报文，且可能引发数组越界写入；
+  3. 落地重构：`BuildRequest` 补齐段长 $\ge 269$ 时的 2 字节（值 14 + 16 位整数）标准编码分支，并动态扩大缓冲区预分配容量至 `path.Length * 2 + 32`，实现与 `ParseResponse` 选项跳过逻辑的完全对称。
+- **回归锁定**：`ctest -R "async_dns"` 等网络核心全套孪生测试 100% 全部通过。
+
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
 - **症状**：浏览器 `WebAssembly.instantiate` 报 `Compiling function #N:"X"
