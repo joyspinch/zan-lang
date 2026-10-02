@@ -2106,6 +2106,34 @@ int64_t zan_monotonic_ns(void) {
 #endif
 }
 
+int64_t zan_stopwatch_ticks(void) {
+#ifdef _WIN32
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+#else
+    return zan_monotonic_ns();
+#endif
+}
+
+int64_t zan_stopwatch_frequency(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER frequency;
+    if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+    return frequency.QuadPart;
+#else
+    return 1000000000;
+#endif
+}
+
+int64_t zan_monotonic_ticks(void) {
+    return zan_stopwatch_ticks();
+}
+
+int64_t zan_monotonic_frequency(void) {
+    return zan_stopwatch_frequency();
+}
+
 /* ---- the same operations against a caller-computed hash ---- */
 
 int64_t zan_shared_table_hash(const char *value) {

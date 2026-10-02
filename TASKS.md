@@ -35,6 +35,12 @@
 > 2. 跨进程孤儿 worker 残留清理：Windows 下 `stop_server` 在杀主进程树后追加基于可执行文件名的 `/IM` 强杀保底，杜绝孤儿 worker 攥住 8090 端口并向后续测试进程注入脏响应；
 > 3. 自动化测试探针与代理绕过加固：`e2e_realtime.py`、`e2e_collab.py`、`e2e_im.py` 增补本地环回 `NO_PROXY` 隔离，重连接收帧采用 deadline 轮询窗口（消除测试侧对单拍抵达时刻的刚性假设）。
 > 验证证据：`e2e_realtime` 实机连续 50 轮高强度压测 100% 满分通过（50/50 runs, 25/25 checks 全绿，零 transport anomaly）；`e2e_collab` 113 项全绿；`e2e_im` 31 项全绿。条目移出未完成区。
+>
+> 2026-10-02 平账：**B-ID55 闭账随本批提交**——stdlib Stopwatch.NowTicks 与 Frequency 消除 NativeMemory.Alloc(8)/Free 堆分配：
+> 1. C 运行时 `rt_sync.c` / `rt_sync.h` 增补 `zan_stopwatch_ticks`（Windows 栈局部 `LARGE_INTEGER` 直读 QPC、POSIX 走 `zan_monotonic_ns`）、`zan_stopwatch_frequency` 及同义别名 `zan_monotonic_ticks` / `zan_monotonic_frequency`；
+> 2. `Stopwatch.zan` 静态缓存 `cachedFrequency`，`NowTicks()` 与 `Frequency()` 全面接入 C 原生直读，彻底消除每拍读钟调用对 CRT 堆锁的竞争与多核串行化；
+> 3. `src/compiler/irgen_emit.c` 增补 `zan_stopwatch_` 符号前缀绑定规则，与 `toolchain/win-x64/zanrt_sync.o` 重新编译同步。
+> 验证证据：`stopwatch_timer`、`crossplat_stdlib`、`ffi_widths`、`bytebuffer` 四族共 24 项全套孪生测试（conformance/determinism/leakcheck/arcguard）100% 全部通过。条目移出未完成区。
 
 ## 未完成 · 语义决策（审计批遗留，待拍板）
 

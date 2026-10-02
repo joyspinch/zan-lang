@@ -1315,6 +1315,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                     strncmp(ext_name, "zan_thread_", 11) == 0 ||
                     strncmp(ext_name, "zan_dispatch_", 13) == 0 ||
                     strncmp(ext_name, "zan_monotonic_", 14) == 0 ||
+                    strncmp(ext_name, "zan_stopwatch_", 14) == 0 ||
                     strncmp(ext_name, "zan_monitor_", 12) == 0 ||
                     strncmp(ext_name, "zan_mmap_", 9) == 0 ||
                     strncmp(ext_name, "zan_exe_dir_", 12) == 0 ||

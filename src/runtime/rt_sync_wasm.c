@@ -142,6 +142,22 @@ i64 zan_monotonic_ns(void) {
     return (i64)ts.tv_sec * 1000000000 + (i64)ts.tv_nsec;
 }
 
+i64 zan_stopwatch_ticks(void) {
+    return zan_monotonic_ns();
+}
+
+i64 zan_stopwatch_frequency(void) {
+    return 1000000000;
+}
+
+i64 zan_monotonic_ticks(void) {
+    return zan_monotonic_ns();
+}
+
+i64 zan_monotonic_frequency(void) {
+    return 1000000000;
+}
+
 /* ---- shared table (cross-process; impossible here -> graceful stubs) ----- */
 
 #define ZAN_TABLE_MAX_STRING 1048576

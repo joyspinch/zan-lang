@@ -20,16 +20,13 @@ namespace System;
 ///   long ms = sw.ElapsedMilliseconds();
 /// </summary>
 class Stopwatch {
-    #if WINDOWS
-    [DllImport("kernel32", EntryPoint = "QueryPerformanceFrequency")]
-    static extern int PlatQueryPerformanceFrequency(nint freq);
+    [DllImport("crt", EntryPoint = "zan_stopwatch_frequency")]
+    static extern long ZanStopwatchFrequency();
 
-    [DllImport("kernel32", EntryPoint = "QueryPerformanceCounter")]
-    static extern int PlatQueryPerformanceCounter(nint count);
-    #else
-    [DllImport("crt", EntryPoint = "zan_monotonic_ns")]
-    static extern long ZanMonotonicNs();
-    #endif
+    [DllImport("crt", EntryPoint = "zan_stopwatch_ticks")]
+    static extern long ZanStopwatchTicks();
+
+    static long cachedFrequency = 0;
 
     /// 最近一次 Start 时的单调时钟读数（频率单位）。
     long startTicks;
@@ -98,15 +95,10 @@ class Stopwatch {
 
     /// <summary>高分辨率时钟每秒的 tick 数。</summary>
     static long Frequency() {
-        #if WINDOWS
-        nint buf = NativeMemory.Alloc(8);
-        PlatQueryPerformanceFrequency(buf);
-        long f = new Span<long>(buf, 1)[0];
-        NativeMemory.Free(buf);
-        return f;
-        #else
-        return 1000000000;   // clock_gettime 以纳秒计
-        #endif
+        if (cachedFrequency <= 0) {
+            cachedFrequency = ZanStopwatchFrequency();
+        }
+        return cachedFrequency;
     }
 
     /// <summary>单调微秒读数。不分配内存，能分辨单个请求，因此可用在请求
@@ -129,18 +121,8 @@ class Stopwatch {
         return (t / f) * unit + (t % f) * unit / f;
     }
 
-    /// <summary>当前单调时钟读数（频率单位）。</summary>
+    /// <summary>当前单调时钟读数（频率单位）。零堆分配，避免多线程热循环争抢 CRT 堆锁。</summary>
     static long NowTicks() {
-        #if WINDOWS
-        nint buf = NativeMemory.Alloc(8);
-        PlatQueryPerformanceCounter(buf);
-        long t = new Span<long>(buf, 1)[0];
-        NativeMemory.Free(buf);
-        return t;
-        #else
-        // C 端 zan_monotonic_ns 使用编译期的 CLOCK_MONOTONIC 宏和原生
-        // struct timespec 布局——Linux 的时钟 id 是 1 而 macOS 是 6。
-        return Stopwatch.ZanMonotonicNs();
-        #endif
+        return ZanStopwatchTicks();
     }
 }

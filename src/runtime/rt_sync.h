@@ -62,6 +62,12 @@ int64_t zan_monotonic_us(void);
 /* Monotonic nanoseconds, for System.Diagnostics.Stopwatch (no allocation). */
 int64_t zan_monotonic_ns(void);
 
+/* Direct Stopwatch primitives without heap allocations (QPC ticks on Windows, monotonic ns on POSIX) */
+int64_t zan_stopwatch_ticks(void);
+int64_t zan_stopwatch_frequency(void);
+int64_t zan_monotonic_ticks(void);
+int64_t zan_monotonic_frequency(void);
+
 int64_t zan_shared_table_create(
     const char *name, int32_t capacity, int32_t key_size, const char *schema);
 int64_t zan_shared_table_open(const char *name);
