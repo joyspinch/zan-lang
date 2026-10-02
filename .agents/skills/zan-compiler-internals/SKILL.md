@@ -582,6 +582,21 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   3. 落地重构：`BuildRequest` 补齐段长 $\ge 269$ 时的 2 字节（值 14 + 16 位整数）标准编码分支，并动态扩大缓冲区预分配容量至 `path.Length * 2 + 32`，实现与 `ParseResponse` 选项跳过逻辑的完全对称。
 - **回归锁定**：`ctest -R "async_dns"` 等网络核心全套孪生测试 100% 全部通过。
 
+## MessagePack / BSON 序列化防线：容器尺寸整型溢出回绕与 512MB 载荷上限
+
+- **病灶**：
+  1. `MsgPackReader` 中 `ArrayOf((int)U32BE(), depth)` 与 `MapOf((int)U32BE(), depth)` 原先将无符号 32 位整数直接强转为 `(int)`。当恶意报文声明 `0xFFFFFFFF` 时，数值回绕为 `-1`。在 `while (i < n)` 中，由于 `-1 <= 0`，循环直接跳出，**静默将超大非法容器解析为空数组或空对象**；
+  2. 若 `U32BE()` 为较大的正数（如 20 亿），解析器会尝试在内存中无节制分配 20 亿个 `JsonValue` 实例，引发长时间 CPU 停顿与 OOM；
+  3. `BsonReader` 中文档总长度 `total` 与字符串/二进制载荷长度未设硬上限，且在 `total > len - lenAt` 校验前计算 `bodyEnd = lenAt + total` 存在 `int` 加法溢出风险。
+- **危害**：
+  1. 恶意输入可通过伪造 32 位整型溢出绕过格式校验，误导业务层得到假空数据；
+  2. 极易被利用发起反序列化 DoS / 慢消耗攻击（OOM）。
+- **落地重构**：
+  1. `MsgPackReader` 对 `array32`、`map32` 容器声明数量进行有符号 64 位防回绕检查，并设定 1,000,000 最大元素数量硬防线；
+  2. 对 `str32`、`bin32`、`ext32` 设置 512MB 载荷上限，超限立即抛出 `MsgPackException`；
+  3. `BsonReader` 严格先以减法校验 `total > len - lenAt` 并设定 512MB 绝对上限，对 `binary` 与 `string` 增加 512MB 边界守护，超限抛出 `BsonException`。
+- **回归锁定**：`ctest -R "msgpack|bson"` 16 项全套孪生测试（conformance/determinism/leakcheck/arcguard）100% 全部通过。
+
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
 - **症状**：浏览器 `WebAssembly.instantiate` 报 `Compiling function #N:"X"
