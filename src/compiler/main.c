@@ -3664,8 +3664,10 @@ static bool zan_resolve_gui_resource_dir(const char *stdlib_root,
     return false;
 }
 
-/* Copy a file byte-for-byte (portable; no shell). Returns 0 on success. */
-static int zan_copy_file(const char *src, const char *dst) {
+/* Copy a file byte-for-byte (portable; no shell). Returns 0 on success.
+ * When err_buf is non-NULL and copy fails, populates err_buf with failure details. */
+static int zan_copy_file_ex(const char *src, const char *dst, char *err_buf, size_t err_cap) {
+    if (err_buf && err_cap > 0) err_buf[0] = '\0';
     /* Copying a file onto itself (e.g. the output dir IS the driver dir, as
      * when tests build into the CMake build tree) would truncate it to zero
      * bytes: fopen(dst, "wb") empties the file before the source is read. */
@@ -3700,16 +3702,70 @@ static int zan_copy_file(const char *src, const char *dst) {
           return 0; }
 #endif
     FILE *in = fopen(src, "rb");
-    if (!in) return -1;
+    if (!in) {
+        if (err_buf && err_cap > 0) {
+#ifdef _WIN32
+            DWORD err = GetLastError();
+            snprintf(err_buf, err_cap, "cannot open source '%s' (errno %d, winerr %lu)",
+                     src, errno, (unsigned long)err);
+#else
+            snprintf(err_buf, err_cap, "cannot open source '%s' (errno %d: %s)",
+                     src, errno, strerror(errno));
+#endif
+        }
+        return -1;
+    }
     FILE *out = fopen(dst, "wb");
-    if (!out) { fclose(in); return -1; }
+    if (!out) {
+        if (err_buf && err_cap > 0) {
+#ifdef _WIN32
+            DWORD err = GetLastError();
+            snprintf(err_buf, err_cap, "cannot open destination '%s' for writing (errno %d, winerr %lu)",
+                     dst, errno, (unsigned long)err);
+#else
+            snprintf(err_buf, err_cap, "cannot open destination '%s' for writing (errno %d: %s)",
+                     dst, errno, strerror(errno));
+#endif
+        }
+        fclose(in);
+        return -1;
+    }
     char buf[65536]; size_t n; int rc = 0;
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
-        if (fwrite(buf, 1, n, out) != n) { rc = -1; break; }
+        if (fwrite(buf, 1, n, out) != n) {
+            rc = -1;
+            if (err_buf && err_cap > 0) {
+#ifdef _WIN32
+                DWORD err = GetLastError();
+                snprintf(err_buf, err_cap, "failed writing to destination '%s' (errno %d, winerr %lu)",
+                         dst, errno, (unsigned long)err);
+#else
+                snprintf(err_buf, err_cap, "failed writing to destination '%s' (errno %d: %s)",
+                         dst, errno, strerror(errno));
+#endif
+            }
+            break;
+        }
     }
     fclose(in);
-    if (fclose(out) != 0) rc = -1;
+    if (fclose(out) != 0) {
+        rc = -1;
+        if (err_buf && err_cap > 0 && err_buf[0] == '\0') {
+#ifdef _WIN32
+            DWORD err = GetLastError();
+            snprintf(err_buf, err_cap, "failed flushing/closing destination '%s' (errno %d, winerr %lu)",
+                     dst, errno, (unsigned long)err);
+#else
+            snprintf(err_buf, err_cap, "failed flushing/closing destination '%s' (errno %d: %s)",
+                     dst, errno, strerror(errno));
+#endif
+        }
+    }
     return rc;
+}
+
+static int zan_copy_file(const char *src, const char *dst) {
+    return zan_copy_file_ex(src, dst, NULL, 0);
 }
 
 /* A driver-bundle manifest lists runtime libraries to copy next to the
@@ -8964,6 +9020,7 @@ int main(int argc, char **argv) {
 
                 int copied = 0;
                 int dself = 0; /* files copied from this driver's own dir */
+                int copy_failed_count = 0;
                 for (int c = 0; c < ncand; c++) {
                     char src[1300], dst[1300];
                     if (used_driver_embedded[d] &&
@@ -9009,13 +9066,25 @@ int main(int argc, char **argv) {
                                              depdir, dline);
                                     snprintf(dst, sizeof(dst), "%s/%s",
                                              outdir, dline);
-                                    if (zan_file_exists(dst) ||
-                                        zan_copy_file(src, dst) == 0) {
+                                    if (zan_file_exists(dst)) {
                                         if (!quiet)
                                             printf("  bundled driver '%s' ? %s"
-                                                   " (via @driver/%s)\n",
+                                                   " (via @driver/%s, already present)\n",
                                                    dep, dline, dep);
                                         got = true;
+                                    } else {
+                                        char errbuf[256];
+                                        if (zan_copy_file_ex(src, dst, errbuf, sizeof(errbuf)) == 0) {
+                                            if (!quiet)
+                                                printf("  bundled driver '%s' ? %s"
+                                                       " (via @driver/%s)\n",
+                                                       dep, dline, dep);
+                                            got = true;
+                                        } else {
+                                            fprintf(stderr, "warning: failed to copy bundled driver file "
+                                                    "'%s' -> '%s': %s\n", src, dst, errbuf);
+                                            copy_failed_count++;
+                                        }
                                     }
                                 }
                                 fclose(df);
@@ -9028,8 +9097,17 @@ int main(int argc, char **argv) {
                     } else {
                         snprintf(src, sizeof(src), "%s/%s", driver_dir, cands[c]);
                         snprintf(dst, sizeof(dst), "%s/%s", outdir, cands[c]);
-                        got = zan_copy_file(src, dst) == 0;
-                        if (got) dself++;
+                        if (zan_file_exists(src)) {
+                            char errbuf[256];
+                            if (zan_copy_file_ex(src, dst, errbuf, sizeof(errbuf)) == 0) {
+                                got = true;
+                                dself++;
+                            } else {
+                                fprintf(stderr, "warning: failed to copy driver '%s' file "
+                                        "'%s' -> '%s': %s\n", drv, src, dst, errbuf);
+                                copy_failed_count++;
+                            }
+                        }
                     }
                     if (got) {
                         if (!quiet)
@@ -9047,11 +9125,18 @@ int main(int argc, char **argv) {
                                "program will use a system-installed %s\n",
                                drv, driver_dir, drv);
                 } else if (copied == 0 && dself == 0 && !used_driver_runtime[d]) {
-                    fprintf(stderr,
-                        "warning: driver '%s' was not bundled (no runtime library "
-                        "found in %s). The published program will require '%s' to "
-                        "be installed on the target, or add a %s/%s.bundle manifest.\n",
-                        drv, driver_dir, drv, driver_dir, drv);
+                    if (copy_failed_count > 0) {
+                        fprintf(stderr,
+                            "warning: driver '%s' was not bundled because copy operation(s) failed "
+                            "(target file(s) in %s may be locked by another running process, or write permission denied).\n",
+                            drv, outdir);
+                    } else {
+                        fprintf(stderr,
+                            "warning: driver '%s' was not bundled (no runtime library "
+                            "found in %s). The published program will require '%s' to "
+                            "be installed on the target, or add a %s/%s.bundle manifest.\n",
+                            drv, driver_dir, drv, driver_dir, drv);
+                    }
                 }
             }
         }

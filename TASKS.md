@@ -22,10 +22,11 @@
 
 > 2026-10-01 平账：**B-ID37 闭账随本批提交**——server 四模板全部再生为 Zan.Mvc 包消费形态（删平行框架副本/sys Model·Dao/包已接管屏，控制器改包基类+包服务，视图双键并存，rbac 归零=路由类公共 static 助手私有化）：collab c2056371（e2e_collab 113×3、e2e_im 31、e2e_realtime 25）、legend 947aebb2+2078d51e（e2e_legend 135、e2e 138、sec_probe 22）、licensing f4deaebc（activate 契约/admin 302/仪表盘与 codes 渲染）、iot b70b7b93（health/登录发 token/Bearer 全端点/kick/stats，mqtt+http 双 worker）。平台连带修复：GenRoute 路由键去重先声明者胜（包默认屏不再顶掉应用同键路由，100525a0，conformance web_route_duplicate_key 钉行为+collab 113 回归）。发布契约实测：iot fresh-dir --publish 331 文件全装运（pq 三件+sqlite3+zan_gui），发布产物净目录实机 boot（mqtt 1883+http 8080、SQLite 自动建库）、/health 200、/admin/stats 未认证 302、bootstrap 登录发 token 后 Bearer 打通 me/stats/clients。排查记录：曾现 "driver 'sqlite3' was not bundled" 系床目录残留 e2e 服务器进程（legend_r9.exe）持自身导入 DLL 的拒绝写句柄，zanc 普通条目拷贝失败静默（装运循环无失败输出），聚合警告误指"清单缺失"——杀进程即全绿，非编译器正确性缺陷，诊断口径缺口挂 B-ID52。余账拆条：collab e2e_realtime 线上帧 ~1/3 偶发丢失挂 B-ID50；pq.bundle @driver/ssl+crypto 在 win-x64 无对应 bundle 挂 B-ID51。另记：台账 B-ID48 现被两条占用（OCR 撤案存档/定时器期限钟），B-ID49 已被闭账提交 61ac40e3 占用——历史条目不改号，新条目自 B-ID50 起。
 
+> 2026-10-02 平账：**B-ID52 闭账随本批提交**——zanc 发布装运（--publish）驱动拷贝诊断加固：重构 `zan_copy_file_ex`，在拷贝失败时详细捕获 errno 与 Windows GetLastError() 系统错误代码；普通驱动条目与 `@driver/` 依赖条目拷贝失败时均输出具体 warning（含源/目标路径与系统错误码）；聚合警告精准区分"目录中没有运行时库"与"目标文件被占用或写权限不足导致拷贝失败"，消灭运行中残留进程持 DLL 锁导致误导用户补清单的伪报错。测试验证：已通过 SqliteConnection 实体实机构建并对目标 DLL 实施独占锁定探针验证，准确捕获 winerr 32（ERROR_SHARING_VIOLATION）并输出准确诊断。条目移出。
+
 ## 未完成 · IDE / 编译器
 
 - [ ] **B-ID50** server-collab e2e_realtime 线上帧 ~1/3 概率偶发丢失：collab 再生批（c2056371）三连跑中 e2e_realtime 25 项断言偶有 online 帧缺失/迟到，复跑即绿——relay 中转逻辑本片零改动，属既有 relay 基建缺陷（在线状态帧的时序窗口）。方向：复跑采样定位丢帧环节（worker 总线/前端轮询窗口/心跳周期对齐），先钉最小复现频率再修。
-- [ ] **B-ID52** zanc 发布装运的逐文件拷贝失败静默：main.c 驱动装运循环的普通条目分支 zan_copy_file 失败无任何输出，聚合警告把原因误报为 "no runtime library found / add a manifest"——实测案例：目标目录被运行中进程持 DLL 拒绝写句柄（床目录残留 legend_r9.exe），真因是 dst 不可写却引导用户去补清单，排查耗一小时。方向：普通分支失败补一条 stderr（src/dst 路径+errno/GetLastError），聚合警告措辞区分"目录里没有库"与"库在但拷不动"。挂账原因：属诊断质量非正确性，且重链 zanc 会作废共享测试工件（规则 8），待无并行会话窗口时顺手修。
 
 ## 未完成 · 语义决策（审计批遗留，待拍板）
 
