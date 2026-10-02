@@ -85,6 +85,7 @@ class TaskScheduler {
     /// <summary>按名称获取单个任务；不存在时返回 null。</summary>
     static TaskInfo Get(string name) {
         #if WINDOWS
+        if (!TaskScheduler.ValidName(name)) { return null; }
         List<string> lines = Process.RunCapture(
             "schtasks /query /tn " + TaskScheduler.Quote(name) + " /fo LIST /v");
         TaskInfo t = new TaskInfo();
@@ -136,6 +137,78 @@ class TaskScheduler {
         return TaskScheduler.Get(name) != null;
     }
 
+    // ---- 输入白名单（名字/触发器/时间最终都会拼进 cmd.exe /c 命令行
+    // ---- （Windows）或 crontab 标记行（POSIX），先验后拼，绝不自由放行）
+
+    /// <summary>任务名白名单：字母/数字/空格/._- 与 \（schtasks 的
+    /// 文件夹式 "Folder\Task" 名）。名字会进 cmd.exe /c 命令行
+    /// （Windows）和 crontab 标记行（POSIX，名字里换行即注入任意
+    /// cron 条目），引号与一切 shell 元字符都在白名单外。
+    /// 非 ASCII 名字一律拒绝——执行通道按代码页转发，保不了的
+    /// 字面量不进命令行。非法返回 false。</summary>
+    static bool ValidName(string name) {
+        if (name == null) { return false; }
+        string t = TaskScheduler.Trim(name);
+        if (t.Length == 0 || t.Length > 200) { return false; }
+        for (int i = 0; i < t.Length; i = i + 1) {
+            int c = t[i] & 255;
+            bool ok = (c >= 48 && c <= 57)            // 0-9
+                || (c >= 65 && c <= 90)               // A-Z
+                || (c >= 97 && c <= 122)              // a-z
+                || c == 32                            // 空格
+                || c == 46 || c == 95 || c == 45      // . _ -
+                || c == 92;                           // \ 文件夹分隔
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+
+    /// <summary>触发器枚举校验：只放行类文档列出的 schtasks /sc 值。
+    /// 大小写不敏感；其余（含任何元字符）拒绝。</summary>
+    static bool ValidTrigger(string trigger) {
+        if (trigger == null) { return false; }
+        string kind = TaskScheduler.Trim(trigger).ToUpper();
+        return kind == "ONLOGON" || kind == "ONSTART" || kind == "ONIDLE"
+            || kind == "ONCE" || kind == "DAILY" || kind == "WEEKLY"
+            || kind == "MONTHLY";
+    }
+
+    /// <summary>"HH:MM" 严格校验（5 字符、冒号分隔、时分在界内）。
+    /// POSIX 端 CronExpr 还会做第二次范围检查，这里是同一规则的前门。</summary>
+    static bool ValidTime(string time) {
+        if (time == null) { return false; }
+        string t = TaskScheduler.Trim(time);
+        if (t.Length != 5) { return false; }
+        if ((t[2] & 255) != 58) { return false; }     // ':'
+        int hh = TaskScheduler.TwoDigit(t, 0);
+        int mm = TaskScheduler.TwoDigit(t, 3);
+        return hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59;
+    }
+
+    /// 从下标 at 起解析两位十进制数字；含非数字返回 -1。
+    static int TwoDigit(string s, int at) {
+        int v = 0;
+        for (int i = at; i < at + 2; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { return 0 - 1; }
+            v = v * 10 + (c - 48);
+        }
+        return v;
+    }
+
+    /// 32 hex 字符的 CSPRNG token（临时文件名用，两平台共用；
+    /// 不引 Zan.Security，就地编码）。
+    static string RandomToken() {
+        byte[] b = RandomNumberGenerator.GetBytes(16);
+        string digits = "0123456789abcdef";
+        string res = "";
+        for (int i = 0; i < 16; i = i + 1) {
+            int v = b[i] & 255;
+            res = res + digits.Substring(v >> 4, 1) + digits.Substring(v & 15, 1);
+        }
+        return res;
+    }
+
     /// <summary>
     /// 创建任务。`command` 为要运行的程序（及参数）；
     /// 含空格的路径请自行加引号，例如
@@ -145,14 +218,21 @@ class TaskScheduler {
     /// </summary>
     static bool Create(string name, string command, string trigger, string time) {
         #if WINDOWS
+        // 白名单前置：名字/触发器/时间未过校验一律不拼命令。
+        if (!TaskScheduler.ValidName(name) || !TaskScheduler.ValidTrigger(trigger)) {
+            return false;
+        }
+        if (time != "" && !TaskScheduler.ValidTime(time)) { return false; }
         string cmd = "schtasks /create /tn " + TaskScheduler.Quote(name) +
             " /tr " + TaskScheduler.Quote(command) +
-            " /sc " + trigger;
-        if (time != "") { cmd = cmd + " /st " + time; }
+            " /sc " + TaskScheduler.Trim(trigger).ToUpper();
+        if (time != "") { cmd = cmd + " /st " + TaskScheduler.Trim(time); }
         cmd = cmd + " /f";
         return TaskScheduler.SchtasksOk(cmd);
         #else
-        if (name == "" || command == "") { return false; }
+        if (!TaskScheduler.ValidName(name) || command == "") { return false; }
+        // command 会整行写进 crontab：换行即注入任意条目，拒绝。
+        if (command.IndexOf("\n") >= 0 || command.IndexOf("\r") >= 0) { return false; }
         if (TaskScheduler.MarkerName("# zan-task: " + name) == "") { return false; }
         string schedule = TaskScheduler.CronExpr(trigger, time);
         if (schedule == "") { return false; }
@@ -167,9 +247,11 @@ class TaskScheduler {
     /// <summary>删除任务（需管理员权限）。成功返回 True。</summary>
     static bool Delete(string name) {
         #if WINDOWS
+        if (!TaskScheduler.ValidName(name)) { return false; }
         return TaskScheduler.SchtasksOk(
             "schtasks /delete /tn " + TaskScheduler.Quote(name) + " /f");
         #else
+        if (!TaskScheduler.ValidName(name)) { return false; }
         List<string> lines = TaskScheduler.CrontabLines();
         List<string> kept = TaskScheduler.WithoutTask(lines, name);
         if (kept.Count == lines.Count) { return false; }
@@ -180,9 +262,11 @@ class TaskScheduler {
     /// <summary>立即运行任务。运行被接受时返回 True。</summary>
     static bool Run(string name) {
         #if WINDOWS
+        if (!TaskScheduler.ValidName(name)) { return false; }
         return TaskScheduler.SchtasksOk(
             "schtasks /run /tn " + TaskScheduler.Quote(name));
         #else
+        if (!TaskScheduler.ValidName(name)) { return false; }
         TaskInfo t = TaskScheduler.Get(name);
         if (t == null || t.command == "") { return false; }
         // cron 本身没有“立即运行”接口，直接异步启动它的命令行。
@@ -194,9 +278,11 @@ class TaskScheduler {
     /// 任务未在运行也返回 true（与 schtasks /end 语义一致）。</summary>
     static bool End(string name) {
         #if WINDOWS
+        if (!TaskScheduler.ValidName(name)) { return false; }
         return TaskScheduler.SchtasksOk(
             "schtasks /end /tn " + TaskScheduler.Quote(name));
         #else
+        if (!TaskScheduler.ValidName(name)) { return false; }
         TaskInfo t = TaskScheduler.Get(name);
         if (t == null || t.command == "") { return false; }
         // pkill 的退出码：0 杀死了进程，1 没有匹配的进程（已经停了）。
@@ -227,15 +313,25 @@ class TaskScheduler {
     }
 
     /// 把行列表整体写回当前用户的 crontab（经临时文件加
-    /// `crontab <file>`）；任一步失败返回 false。
+    /// `crontab <file>`）；任一步失败返回 false。临时名带 CSPRNG
+    /// token（不可预测，防预置符号链接劫持写穿），存在即换名重试
+    /// （CreateNew 语义；运行时 fopen 暂不支持 "x" 独占模式）。
     static bool WriteCrontab(List<string> lines) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < lines.Count; i = i + 1) {
             sb.Append(lines[i]);
             sb.Append("\n");
         }
-        string tmp = Path.GetTempPath() + "zan_crontab_"
-            + Convert.ToString(ProcessHost.Pid()) + ".tmp";
+        string tmp = "";
+        for (int attempt = 0; attempt < 8; attempt = attempt + 1) {
+            string cand = Path.GetTempPath() + "zan_crontab_"
+                + Convert.ToString(ProcessHost.Pid()) + "_"
+                + TaskScheduler.RandomToken() + ".tmp";
+            if (File.Exists(cand)) { continue; }
+            tmp = cand;
+            break;
+        }
+        if (tmp == "") { return false; }
         try {
             File.WriteAllText(tmp, sb.ToString());
         } catch (IOException e) {
