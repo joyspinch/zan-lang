@@ -1,6 +1,7 @@
 using System;
 using System.Data;
 using System.Diagnostics;
+using System.Text;
 using System.Web;
 using ZanWeb.Security;
 using ZanWeb.Services;
@@ -107,9 +108,18 @@ class Boot {
         app.AuthResolver(AuthToken.Resolve);
         app.PermissionResolver(AuthUser.Allow);
         app.LoginPath(Routes.Login);
+        /* 全站安全响应头，放在一切可能短路应答的中间件之前，让 403/204
+           也带着这些头出门。 */
+        app.Before(Boot.SecurityHeaders);
         /* Cookie 写入必须有同源证据；不要求无 cookie 的 API 客户端
-           伪造浏览器头。double-submit token 仍可按需升级注册。 */
+           伪造浏览器头。double-submit CSRF 默认关闭——框架页面/脚本
+           尚未产出 _csrf 字段与 X-CSRF-Token 头，默认打开 = 全站表单
+           403；应用页面按 Csrf 类注释配齐 token 回显后，在 main.zan
+           调 Boot.EnableCsrf() 一行开启。 */
         app.Before(Boot.OriginGuard);
+        if (Boot.csrfEnabled) {
+            app.Before(Boot.CsrfGuard);
+        }
         /* 运行模式判断：mode=api 时跳过 HTML 视图载入与静态目录挂载（纯 API 轻量模式） */
         if (Cfg.Server.mode != "api") {
             /* 视图从磁盘读取一次，之后从内存渲染 */
@@ -126,6 +136,11 @@ class Boot {
         /* 跨域资源共享（CORS）与预检阻断 */
         if (Cfg.Cors.enabled) {
             app.Before(Boot.CorsFilter);
+            /* CORS 放行的具体 Origin 同样允许发起 WS 升级；"*" 不登记
+               （带 cookie 的升级不适用通配凭据语义）。 */
+            if (Cfg.Cors.allowOrigin != "*") {
+                WebWs.AllowOrigin(Cfg.Cors.allowOrigin);
+            }
         }
 
         /* 生命周期钩子 */
@@ -208,6 +223,43 @@ class Boot {
         int r = await WebServer.RunCommand(app, Cfg.Worker.count,
             Cfg.Worker.daemon);
         return r;
+    }
+
+    /* double-submit CSRF 默认关闭（见 Run 内注释）。 */
+    static bool csrfEnabled = false;
+
+    /// <summary>一行开启 double-submit CSRF（须在 Boot.Run() 之前调用）。
+    /// 只拦浏览器形态的请求（携带 zsession/csrf cookie 的不安全方法）；
+    /// bearer 与无 cookie 的 API 客户端没有可被跨站滥用的环境凭证，
+    /// 不拦。开启后应用页面的表单须带 _csrf 隐藏域、ajax 须回显
+    /// X-CSRF-Token（Csrf 类注释），否则这些请求会被 403。</summary>
+    static void EnableCsrf() {
+        Boot.csrfEnabled = true;
+    }
+
+    /// double-submit 闸的浏览器形态过滤：真闸在 Csrf.Guard。
+    static bool CsrfGuard(HttpContext ctx) {
+        bool safe = ctx.method == "GET" || ctx.method == "HEAD"
+            || ctx.method == "OPTIONS";
+        if (!safe) {
+            bool bearer = ctx.Header("Authorization").StartsWith("Bearer ");
+            bool browser = ctx.Cookie("zsession").Length > 0
+                || ctx.Cookie("csrf_token").Length > 0;
+            if (bearer || !browser) { return true; }
+        }
+        return Csrf.Guard(ctx);
+    }
+
+    /* 全站安全响应头：nosniff 关 MIME 嗅探；DENY 禁被嵌（管理台弹窗走
+       ajax 注入，无 iframe 需求）；Referrer-Policy 收敛外链引泄。CSP
+       暂缓：框架视图与生成器仍依赖内联 style= 属性与 javascript: 伪
+       协议（tab 条），default-src 'self' 会破页面——上 CSP 须先做
+       视图去内联改造。 */
+    static bool SecurityHeaders(HttpContext ctx) {
+        ctx.SetHeader("X-Content-Type-Options", "nosniff");
+        ctx.SetHeader("X-Frame-Options", "DENY");
+        ctx.SetHeader("Referrer-Policy", "no-referrer");
+        return true;
     }
 
     /* 慢 SQL 追踪：记录归一化语句、归档到 metrics.db、超过阈值时写日志 */
@@ -355,6 +407,7 @@ class Boot {
         if (traceId.Length == 0) {
             traceId = ctx.Header("X-Request-Id");
         }
+        traceId = Boot.CleanTraceId(traceId);
         if (traceId.Length == 0) {
             Boot.traceSeq = Boot.traceSeq + 1;
             traceId = "tr_" + Convert.ToString(DateTime.UtcNow().ToUnixSeconds())
@@ -363,6 +416,24 @@ class Boot {
         ctx.SetHeader("X-Request-Id", traceId);
         Console.WriteLine("[req] [" + traceId + "] " + ctx.method + " " + ctx.path);
         return true;
+    }
+
+    /* 客户端可伪造 x-request-id：头里夹带换行即能伪造整行访问日志
+       （或塞进控制台转义序列）。traceId 只放行白名单 [A-Za-z0-9._-]，
+       不合法字符一律丢弃，洗完为空按缺失处理（本地再生成）；上限 64
+       字符防超长头撑爆日志行。洗过的 id 同时用于日志与回显头。 */
+    static string CleanTraceId(string raw) {
+        if (raw == null) { return ""; }
+        int n = raw.Length;
+        if (n > 64) { n = 64; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i = i + 1) {
+            int c = raw[i] & 255;
+            bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122) || c == 46 || c == 45 || c == 95;
+            if (ok) { sb.Append(raw[i]); }
+        }
+        return sb.ToString();
     }
 
     /* 请求指标：按毫秒统计，流式连接只计推送量 */
