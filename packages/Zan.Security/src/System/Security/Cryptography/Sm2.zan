@@ -6,7 +6,11 @@ namespace System.Security.Cryptography;
 /// 标准 256 位素数曲线，构建于 BigInt 之上。提供密钥派生
 /// （d*G）、SM2 数字签名（用 ZA 用户哈希签名/验签）以及
 /// C1C3C2 形式的 SM2 公钥加密。点以 Jacobian 坐标存储，
-/// 因此每次标量乘法只需一次模逆。</summary>
+/// 因此每次标量乘法只需一次模逆。
+///
+/// 安全注意：Sign 的秘密数 k 必须不可预测——生产调用方应传
+/// zero() 让内部以 CSPRNG 选取；自管 k 时复用/可预测的 k 会
+/// 直接泄露私钥。</summary>
 class Sm2 {
 
     static string PHEX  = "FFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000FFFFFFFFFFFFFFFF";
@@ -167,15 +171,44 @@ class Sm2 {
     }
 
     /// <summary>SM2 签名。e 为 ZA||M 摘要；k 为每次签名使用的秘密数，
-    /// 取值 [1, n-1]。将 r 写入 out[0..31]，s 写入 out[32..63]。</summary>
+    /// 取值 [1, n-1]。k 必须不可预测——复用或可预测的 k 会直接泄露
+    /// 私钥，生产调用方应传 zero() 由内部以 CSPRNG 随机选取
+    /// （32 字节随机数 mod (n-1) + 1）；显式传入的 k 由调用方对
+    /// 不可预测性负责。r 或 s 算出 0 时（GB/T 32918 要求重选）以
+    /// k+1 重试，至多 100 次；仍失败写出全零 (r,s)——Verify 会
+    /// 拒绝它，调用方可据此察觉。将 r 写入 out[0..31]，s 写入
+    /// out[32..63]。</summary>
     static void Sign(BigInt e, BigInt d, BigInt k, string outSig) {
         init();
-        List<BigInt> P1 = toAffine(scalarMul(k, gPoint()));
-        BigInt r = nmod(BigInt.add(e, P1[0]));
-        BigInt inv1d = ninv(nmod(BigInt.add(BigInt.one(), d)));
-        BigInt s = nmul(inv1d, nsub(k, nmul(r, d)));
-        writeBE32(outSig, 0, r);
-        writeBE32(outSig, 32, s);
+        if (k.isZero()) {
+            byte[] rb = RandomNumberGenerator.GetBytes(32);
+            if (rb == null) {
+                // CSPRNG 不可用：绝不退化为可预测的 k，写出全零签名
+                // （非法值，Verify 拒绝）让失败可见。
+                writeBE32(outSig, 0, BigInt.zero());
+                writeBE32(outSig, 32, BigInt.zero());
+                return;
+            }
+            k = BigInt.add(BigInt.mod(BigInt.FromBytesBE(rb, 32),
+                                      BigInt.sub(N, BigInt.one())), BigInt.one());
+        }
+        int tries = 0;
+        while (tries < 100) {
+            List<BigInt> P1 = toAffine(scalarMul(k, gPoint()));
+            BigInt r = nmod(BigInt.add(e, P1[0]));
+            BigInt inv1d = ninv(nmod(BigInt.add(BigInt.one(), d)));
+            BigInt s = nmul(inv1d, nsub(k, nmul(r, d)));
+            if (!(r.isZero()) && !(s.isZero())) {
+                writeBE32(outSig, 0, r);
+                writeBE32(outSig, 32, s);
+                return;
+            }
+            k = nmod(BigInt.add(k, BigInt.one()));
+            if (k.isZero()) { k = BigInt.one(); }
+            tries = tries + 1;
+        }
+        writeBE32(outSig, 0, BigInt.zero());
+        writeBE32(outSig, 32, BigInt.zero());
     }
 
     /// <summary>用公钥 (px,py) 校验摘要 e 上的 SM2 签名 (r,s)。

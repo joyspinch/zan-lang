@@ -5,7 +5,13 @@ namespace System.Security.Cryptography;
 /// <summary>RSA（RFC 8017 / PKCS#1）：原始公/私钥运算以及 PKCS#1
 /// v1.5 和 OAEP 加密填充。大整数运算来自 BigInt；哈希
 /// （OAEP 的 MGF1 用）来自本命名空间。所有缓冲区都显式携带长度，
-/// 因为 String.Length 基于 strlen，对二进制数据不安全。</summary>
+/// 因为 String.Length 基于 strlen，对二进制数据不安全。
+///
+/// 解密侧（DecryptOaep/DecryptPkcs1）的填充校验为常数时间：扫满
+/// 整个缓冲区、以累积差汇合所有判定，不因字节值提前退出。
+/// 已知限制（P3 挂账）：ModExp 的纯 BigInt 回退路径未做盲化
+/// （blinding），不防御能精确测量模幂耗时的本机侧信道——工程量大，
+/// 本机进程内调用场景暂不处理。</summary>
 class Rsa {
     /// 哈希分发：0=SHA-256，1=SHA-1，2=SM3
     static int hLen(int algo) { if (algo == 1) { return 20; } return 32; }
@@ -110,20 +116,35 @@ class Rsa {
         i = 0; while (i < dbLen) { db[i] = (maskedDb[i] & 255) ^ (dbMask[i] & 255); i = i + 1; }
 
         // 完整校验编码结构（RFC 8017 §7.1.2 步骤 3.g）：Y==0、lHash 相等、
-        // PS 全零后紧跟 0x01。先用常数时间比较校验 Y 与 lHash，再扫描 PS。
-        // PS 必须全零，第一个非零字节必须是 0x01 分隔符，其后即消息。
+        // PS 全零后紧跟 0x01。Y 与 lHash 用常数时间累积差；PS 与分隔符
+        // 扫满整个 PS 区、不因字节值提前退出——首个 0x01 的下标以算术
+        // 方式选出，分隔符不存在也汇成同一条失败路径。
         byte[] lHash = hashOf(algo, "", 0);
         int diff = (em[0] & 255);
         i = 0;
         while (i < hl) { diff = diff | ((db[i] & 255) ^ (lHash[i] & 255)); i = i + 1; }
-        // 跳过零字节（PS），定位 0x01 分隔符。
+        int seen = 0;
+        int found = 0;
+        int pos = hl;
         int p = hl;
-        while (p < dbLen && (db[p] & 255) == 0) { p = p + 1; }
-        if (p >= dbLen || (db[p] & 255) != 1 || diff != 0) {
+        while (p < dbLen) {
+            int b = db[p] & 255;
+            // 无分支谓词：((x)+255)>>8 对 x∈[0,255] 是"非零"检测，
+            // b==0x01 ⟺ (b^1)==0，取反得等值命中。
+            int isOne = 1 - (((b ^ 1) + 255) >> 8);
+            // 分隔符之前必须全 0（分隔符自身的 0x01 用 1-isOne 排除）。
+            diff = diff | (b & (1 - seen) & (1 - isOne));
+            found = found | isOne;
+            pos = pos + (isOne & (1 - seen)) * (p - pos); // 首个 0x01 的下标
+            seen = seen | isOne;
+            p = p + 1;
+        }
+        diff = diff | (1 - found);                        // 分隔符必须存在
+        if (diff != 0) {
             outLen[0] = -1;
             return null;
         }
-        p = p + 1;
+        p = pos + 1;
         int mlen = dbLen - p;
         byte[] outb = new byte[dbLen];
         for (int j = 0; j < mlen; j = j + 1) { outb[j] = db[p + j] & 255; }
@@ -151,21 +172,39 @@ class Rsa {
     }
 
     /// <summary>RSA PKCS#1 v1.5 解密。<paramref name="outLen"/>[0] 接收
-    /// 消息长度（填充错误时为 -1）。</summary>
+    /// 消息长度（填充错误时为 -1）。填充校验为常数时间：头部
+    /// （0x00 0x02）、0x00 分隔符存在性、PS 长度下限全部扫满缓冲区
+    /// 以累积差汇合，不因字节值提前退出（防 Bleichenbacher 填充
+    /// oracle 的时序侧）。</summary>
     static byte[] DecryptPkcs1(string cph, string n, int k, string d, int dLen, List<int> outLen) {
         if (k < 11) { outLen[0] = -1; return null; }
         byte[] em = ModExp(cph, k, n, k, d, dLen);
         int mlen = -1;
         byte[] outb = new byte[k];
-        if ((em[0] & 255) == 0 && (em[1] & 255) == 2) {
-            int p = 2;
-            // PS 至少 8 字节且不能为 0x00；定位 0x00 分隔符。
-            while (p < k && (em[p] & 255) != 0) { p = p + 1; }
-            if (p < k && p - 2 >= 8) {
-                p = p + 1;
-                mlen = k - p;
-                 for (int j = 0; j < mlen; j = j + 1) { outb[j] = em[p + j] & 255; }
-            }
+        int diff = ((em[0] & 255)) | ((em[1] & 255) ^ 2);
+        // 全长扫描定位首个 0x00（分隔符）；分隔符前的 PS 非零性由
+        // "首个 0" 的定义保证，无需逐字节判定。
+        int seen = 0;
+        int found = 0;
+        int pos = 2;
+        int p = 2;
+        while (p < k) {
+            int b = em[p] & 255;
+            int isZero = 1 - ((b + 255) >> 8);            // b==0x00 时为 1
+            found = found | isZero;
+            pos = pos + (isZero & (1 - seen)) * (p - pos); // 首个 0x00 的下标
+            seen = seen | isZero;
+            p = p + 1;
+        }
+        diff = diff | (1 - found);                        // 分隔符必须存在
+        // PS = pos - 2 至少 8 字节：不足时 psLen-8 为负，算术右移 31 位
+        // 得全 1，汇入 diff（psLen 恒 >= 0，不会溢出误判）。
+        int psLen = pos - 2;
+        diff = diff | (((psLen - 8) >> 31) & 1);
+        if (diff == 0) {
+            p = pos + 1;
+            mlen = k - p;
+            for (int j = 0; j < mlen; j = j + 1) { outb[j] = em[p + j] & 255; }
         }
         outLen[0] = mlen;
         return outb;
