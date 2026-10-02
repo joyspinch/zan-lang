@@ -154,18 +154,24 @@ class Lua {
     /// 收紧脚本环境（沙箱，A291①）：移除可逃逸宿主的全局入口——
     /// <c>os.execute/remove/rename/exit</c>（进程与文件系统）、<c>io</c>
     /// 整库、<c>dofile/loadfile</c>（文件加载）、<c>require/package</c>
-    /// （模块加载同样落盘）。宿主在 <see cref="Initialize"/> 之后对不可信
-    /// 脚本调用一次即可；幂等。保留 <c>os.time/clock/date/getenv</c>、
+    /// （模块加载同样落盘）、<c>load</c>（预编译 chunk 是 Lua 字节码
+    /// 逃逸的惯用门：伪造的字节码可绕过语言级不变式直取 C 栈，沙箱
+    /// 内不得加载任何预编译 chunk，文本片段除外也无必要——不可信
+    /// 脚本拼源码再加载的场景应改由宿主 <see cref="Exec"/> 承担）。
+    /// 宿主在 <see cref="Initialize"/> 之后对不可信脚本调用一次即可；
+    /// 幂等。保留 <c>os.time/clock/date/getenv</c>、
     /// <c>math/string/table</c> 等纯计算库。
     /// </summary>
     static void Sandbox() {
         Lua.EnsureReady();
         // 用受信设置脚本实现，零新 extern；置 nil 等价于不存在
-        // （Lua 取不存在的全局同样得 nil）。
+        // （Lua 取不存在的全局同样得 nil）。宿主自己的 Exec/ExecBytes
+        // 走 C API（luaL_loadstring / luaL_loadbufferx），不经全局 load，
+        // 置 nil 不影响宿主装载。
         Lua.Exec("os.execute = nil; os.remove = nil; os.rename = nil;" +
                  " os.exit = nil\n" +
                  "io = nil\n" +
-                 "dofile = nil; loadfile = nil\n" +
+                 "dofile = nil; loadfile = nil; load = nil\n" +
                  "require = nil; package = nil\n");
     }
 
@@ -530,6 +536,10 @@ class Lua {
     /// chunk 压栈（编译失败时抛出异常）。缓冲在加载后被立即清零，
     /// 供"密文随包、明文只在内存存活一瞬"的内嵌脚本方案使用。
     /// 字节码必须与运行时主次版本一致（5.4.x）。
+    ///
+    /// mode 保持 NULL（文本与字节码都收）：这是全 API 唯一的预编译
+    /// chunk 入口，仅宿主可达——沙箱已把脚本侧 <c>load</c> 置 nil，
+    /// 不可信脚本拿不到任何装载预编译 chunk 的口子。
     /// </summary>
     static void LoadBytes(byte[] chunk, string chunkName) {
         if (chunk == null || chunk.Length == 0) {

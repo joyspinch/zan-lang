@@ -14,16 +14,37 @@ namespace System.Web;
 /// 升级前路由/权限已生效的语义不变（ctx 的握手/劫持状态经公开成员操作）。
 /// </summary>
 class WebWs {
+    /// 跨域部署的升级白名单：同源之外还允许发起 WS 握手的 Origin
+    /// （原样串比较）。应用在装配期经 <see cref="AllowOrigin"/> 登记。
+    static List<string> extraOrigins;
+
+    /// <summary>登记一个允许升级的跨域 Origin（如 "https://app.example.com"，
+    /// 与 CORS allowOrigin 同形）。同源本身始终放行，无需登记。</summary>
+    static void AllowOrigin(string origin) {
+        if (origin.Length == 0) { return; }
+        if (WebWs.extraOrigins == null) {
+            WebWs.extraOrigins = new List<string>();
+        }
+        WebWs.extraOrigins.Add(origin);
+    }
+
     /// <summary>Completes the RFC 6455 handshake and hands the connection to
     /// a <see cref="WsSession"/>. The upgrade runs AFTER routing and
     /// authorization, so a WebSocket session on the MVC port inherits the
     /// route's full permission semantics — the part a standalone WS port
     /// cannot give you.
     ///
+    /// Before the handshake the request passes a cross-site check (CSWSH):
+    /// the pipeline origin guards only stop unsafe methods and an upgrade
+    /// is a GET, so a malicious page could otherwise open a WebSocket with
+    /// the victim's ambient session cookie. Browsers attach Origin to the
+    /// handshake automatically; see <see cref="OriginOk"/>.
+    ///
     /// Session lifetime follows the SSE hijack contract: the handler that
     /// called Upgrade owns the connection until it returns; the connection
     /// loop then sees hijacked and tears down without writing a response.
-    /// null = not an upgrade request (answer normally) or the 101 write
+    /// null = not an upgrade request (answer normally), rejected by the
+    /// origin check (a 403 has been answered), or the 101 write
     /// failed (peer gone).
     ///
     /// An idle session is cut by the connection sweeper at the request
@@ -32,6 +53,11 @@ class WebWs {
     /// pushes.</summary>
     static async WsSession Upgrade(HttpContext ctx) {
         if (ctx == null || !WsHandshake.Valid(ctx.request)) { return null; }
+        if (!WebWs.OriginOk(ctx)) {
+            ctx.Status(403, "Forbidden");
+            ctx.Text("websocket origin rejected");
+            return null;
+        }
         string key = ctx.request.GetHeader("Sec-WebSocket-Key");
         StringBuilder sb = new StringBuilder();
         sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
@@ -64,5 +90,24 @@ class WebWs {
         WsWriter writer = new WsWriter();
         WsAssembler asm = new WsAssembler(reader.MaxLen());
         return new WsSession(ctx.conn, reader, writer, asm, ctx);
+    }
+
+    /// <summary>升级前的跨站闸：语义与 <see cref="Csrf.OriginCheck"/> 对齐——
+    /// Sec-Fetch-Site: cross-site 直接拒；带 Origin 且 authority 与 Host
+    /// 不符也拒（浏览器对 WS 握手自动附带 Origin，伪造不了同源值）；
+    /// 两样皆缺或无 Origin 的客户端（非浏览器）没有可被借用的跨站页，
+    /// 放行。白名单命中视同同源。</summary>
+    static bool OriginOk(HttpContext ctx) {
+        if (ctx.Header("Sec-Fetch-Site") == "cross-site") { return false; }
+        string origin = ctx.Header("Origin");
+        if (origin.Length == 0) { return true; }
+        if (Csrf.SameAuthority(origin, ctx.Header("Host"))) { return true; }
+        if (WebWs.extraOrigins != null) {
+            int n = WebWs.extraOrigins.Count;
+            for (int i = 0; i < n; i = i + 1) {
+                if (WebWs.extraOrigins[i] == origin) { return true; }
+            }
+        }
+        return false;
     }
 }
