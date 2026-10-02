@@ -180,6 +180,7 @@ static void WINAPI zan_mem_fls_cb(void *p) {
 }
 #else
 #include <pthread.h>
+#include <sched.h>
 static __thread zan_mem_cache *t_cache;
 static pthread_key_t g_exit_key;
 /* 0 = not created, 1 = being created on this thread, 2 = usable. Never held
@@ -194,13 +195,28 @@ static void zan_mem_thread_exit(void *p) {
 
 static volatile int g_slab_lock;
 
-static void zan_mem_lock(void) {
-    while (__sync_lock_test_and_set(&g_slab_lock, 1)) {
-        while (g_slab_lock) {
+/* Bounded TTAS backoff (B-ID74f), same shape as rt_timer.c's live_lock:
+ * pause-spin a few rounds, then hand the core back -- a preempted holder
+ * otherwise costs every contender a full timeslice, and non-x86 targets
+ * have no pause at all. */
+static void zan_mem_backoff(int spins) {
+    if (spins < 64) {
 #if defined(__i386__) || defined(__x86_64__)
-            __builtin_ia32_pause();
+        __builtin_ia32_pause();
 #endif
-        }
+        return;
+    }
+#if defined(_WIN32)
+    SwitchToThread();
+#else
+    sched_yield();
+#endif
+}
+
+static void zan_mem_lock(void) {
+    for (int spins = 0;; spins++) {
+        if (!__sync_lock_test_and_set(&g_slab_lock, 1)) return;
+        zan_mem_backoff(spins);
     }
 }
 

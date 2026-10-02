@@ -844,6 +844,7 @@ int zan_timer_cancel_delay(void *frame) {
      * shifts entries into different parent/child slots, so the residual
      * array is NOT still a heap). g_dispatching is safe from the frees: it
      * was popped from the heap before its dispatch window opened. */
+    size_t old_len = g_heap_len;
     size_t w = 0;
     for (size_t i = 0; i < g_heap_len; i++) {
         if (g_heap[i]->removed && g_heap[i]->kind == ZAN_TIMER_DELAY) {
@@ -854,8 +855,11 @@ int zan_timer_cancel_delay(void *frame) {
     }
     g_heap_len = w;
     /* Restore the heap invariant: after compaction the array is a permutation
-     * of live entries, so a full heapify (Floyd) is O(n). */
-    if (g_heap_len > 1) {
+     * of live entries, so a full heapify (Floyd) is O(n). When nothing was
+     * purged the heap was never disturbed -- reordering it anyway both wasted
+     * the O(n) walk on every no-op cancel and shuffled timer deadlines
+     * between heap slots for nothing (B-ID74b). */
+    if (w != old_len && g_heap_len > 1) {
         for (size_t i = g_heap_len / 2; i-- > 0;) {
             size_t index = i;
             for (;;) {
@@ -1174,13 +1178,30 @@ static size_t   g_colive_dead;   /* tombstones */
 
 static volatile int g_colive_lock;
 
-static void live_lock(void) {
-    while (__sync_lock_test_and_set(&g_colive_lock, 1)) {
-        while (g_colive_lock) {
+/* Bounded TTAS backoff (B-ID74f): pause-spin a few rounds, then hand the
+ * core back. A pure pause-spin burns a whole timeslice when the lock holder
+ * is preempted, stalling every worker that touches the live registry; and
+ * the pause itself is x86-only, so non-x86 targets get the yield too. */
+static void zan_lock_backoff(int spins) {
+    if (spins < 64) {
 #if defined(__i386__) || defined(__x86_64__)
-            __builtin_ia32_pause();
+        __builtin_ia32_pause();
 #endif
-        }
+        return;
+    }
+#if defined(_WIN32)
+    SwitchToThread();
+#elif defined(__wasm__) || defined(ZAN_BARE_METAL)
+    /* single-threaded: the holder cannot be preempted, no yield exists */
+#else
+    sched_yield();
+#endif
+}
+
+static void live_lock(void) {
+    for (int spins = 0;; spins++) {
+        if (!__sync_lock_test_and_set(&g_colive_lock, 1)) return;
+        zan_lock_backoff(spins);
     }
 }
 
@@ -1353,6 +1374,12 @@ typedef struct zan_join {
     zan_timer_step_t joiner_step;
     int              npairs;  /* bound pairs, filled during the bind phase */
     int              winner;  /* any mode: first completed pair's index    */
+    /* B-ID74c: bound pairs not yet marked done. Every mutation site (bind,
+     * the two done hooks, wait2, fire) already runs under live_lock, so a
+     * plain int is exact -- and the all-mode fire test collapses from a
+     * rescan of all N pairs on EVERY completion (O(N^2) under the global
+     * lock) to this counter hitting zero. */
+    int              remaining;
     zan_join_pair_t  pairs[]; /* flexible array, one allocation            */
 } zan_join_t;
 
@@ -1432,15 +1459,13 @@ static void joinmap_remove(void *frame, zan_join_pair_t *pr) {
 static int join_pair_done(const zan_join_pair_t *pr) {
     if (pr->done) return 1;
     if (!live_has_nolock(pr->frame)) return 1;   /* untracked: completed */
-    int32_t done;
-    memcpy(&done, (const unsigned char *)pr->frame + JOIN_OFF_DONE, sizeof(done));
+    /* The emitter publishes DONE with a release xchg (irgen_async.c); read
+     * it acquire so the dependent RESULT store cannot slide under the probe
+     * on arm64/wasm32 -- a plain memcpy left that to luck (B-ID74e). */
+    int32_t done = __atomic_load_n(
+        (const volatile int32_t *)((const unsigned char *)pr->frame + JOIN_OFF_DONE),
+        __ATOMIC_ACQUIRE);
     return done != 0;
-}
-
-static int join_all_done(zan_join_t *j) {
-    for (int i = 0; i < j->npairs; i++)
-        if (!join_pair_done(&j->pairs[i])) return 0;
-    return 1;
 }
 
 static int join_any_done(zan_join_t *j) {
@@ -1455,7 +1480,10 @@ static int join_any_done(zan_join_t *j) {
 static void join_fire_locked(zan_join_t *j, void **out_joiner, zan_timer_step_t *out_step) {
     *out_joiner = NULL;
     if (j->fired) return;
-    int trig = j->any ? join_any_done(j) : join_all_done(j);
+    /* all mode: `remaining` is exactly the bound-not-done count (both done
+     * hooks decrement it once, mutually exclusive via joinmap removal), so
+     * zero means every pair fired -- no O(N) rescan per completion. */
+    int trig = j->any ? join_any_done(j) : (j->remaining == 0);
     if (!trig) return;
     j->fired = 1;
     *out_joiner = j->joiner;
@@ -1468,6 +1496,7 @@ static void join_on_untrack(void *frame, void **out_joiner, zan_timer_step_t *ou
     zan_join_pair_t *pr = joinmap_get(frame);
     if (!pr) return;
     pr->done = 1;
+    pr->owner->remaining--;
     joinmap_remove(frame, pr);
     join_fire_locked(pr->owner, out_joiner, out_step);
 }
@@ -1488,6 +1517,7 @@ void zan_join_complete(void *frame) {
     zan_join_pair_t *pr = joinmap_get(frame);
     if (pr && !pr->done) {
         pr->done = 1;
+        pr->owner->remaining--;
         joinmap_remove(frame, pr);
         join_fire_locked(pr->owner, &fire_joiner, &fire_step);
     }
@@ -1512,8 +1542,12 @@ int zan_join_bind(long long entry, void *frame, int idx) {
     int bound = 0;
     live_lock();
     if (live_has_nolock(frame) && !joinmap_get(frame)) {
-        int32_t done;
-        memcpy(&done, (const unsigned char *)frame + JOIN_OFF_DONE, sizeof(done));
+        /* acquire, same reason as join_pair_done: the emitter publishes DONE
+         * with a release xchg, and a stale 0 read here binds a completed
+         * frame whose hook already ran (B-ID74e). */
+        int32_t done = __atomic_load_n(
+            (const volatile int32_t *)((const unsigned char *)frame + JOIN_OFF_DONE),
+            __ATOMIC_ACQUIRE);
         if (!done) {
             zan_join_pair_t *pr = &j->pairs[j->npairs];
             pr->frame = frame;
@@ -1521,6 +1555,7 @@ int zan_join_bind(long long entry, void *frame, int idx) {
             pr->idx = idx;
             pr->done = 0;
             j->npairs++;
+            j->remaining++;
             joinmap_put(pr);
             bound = 1;
         }
@@ -1537,7 +1572,7 @@ int zan_join_wait2(long long entry, void *frame, zan_timer_step_t step) {
     if (!j || !g_ready_hook || !frame || !step) return 2;
     int satisfied;
     live_lock();
-    satisfied = j->fired || (j->any ? join_any_done(j) : join_all_done(j));
+    satisfied = j->fired || (j->any ? join_any_done(j) : j->remaining == 0);
     if (!satisfied) { j->joiner = frame; j->joiner_step = step; }
     live_unlock();
     return satisfied ? 1 : 0;
