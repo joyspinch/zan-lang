@@ -128,16 +128,32 @@ size_t zan_mem_slabs(void) {
  * data structure holds them. Retired caches go on a global list and are
  * adopted by the next thread that needs one, so a thread-per-request program
  * reuses caches instead of accumulating one per thread. */
+/* Foreign-free stripe count: 8 keeps 32-worker shapes off each other's
+ * stripe line while drain only walks 8 heads. Power of two (mask select). */
+#define ZAN_MEM_REMOTE_STRIPES 8
+
 typedef struct zan_mem_cache {
     void  *free_list[ZAN_MEM_NCLASS];   /* owner-only */
     char  *bump;                        /* owner-only */
     char  *bump_end;                    /* owner-only */
-    void  *remote;                      /* atomic stack of foreign frees */
+    /* Foreign-free stacks, striped to separate cache lines: every foreign
+     * free CASes one stripe head, and a block owner freed by many workers
+     * (a 10k-spawn x 32-worker batch) otherwise CAS-pounds one pointer and
+     * loses to the platform heap. A freer with its own cache always maps to
+     * the same stripe, so the common case is one writer per line. */
+    struct {
+        void *head;
+        char pad[64 - sizeof(void *)];  /* one stripe per cache line */
+    } remote[ZAN_MEM_REMOTE_STRIPES];
     struct zan_mem_cache *next_free;    /* retired-cache list, under the lock */
 } zan_mem_cache;
 
 /* Retired caches waiting to be adopted. */
 static zan_mem_cache *g_cache_pool;
+
+/* Round-robin stripe selector for cache-less freeing threads (CRT threads
+ * that never allocated through us). Relaxed: any spread will do. */
+static unsigned g_remote_rr;
 
 /* On MinGW (Windows) __thread is emulated by libgcc's emutls, whose first
  * access runs pthread_once(emutls_init) -- and emutls_init calls malloc. A
@@ -298,16 +314,18 @@ static zan_mem_cache *zan_mem_cache_get(void) {
  * One exchange takes the whole stack, so the owner pays a single atomic no
  * matter how many blocks arrived. */
 static void zan_mem_drain_remote(zan_mem_cache *c) {
-    void *p = __atomic_exchange_n(&c->remote, NULL, __ATOMIC_ACQUIRE);
-    while (p) {
-        void *next = *(void **)p;
-        zan_mem_hdr_t *h = (zan_mem_hdr_t *)((char *)p - ZAN_MEM_HDR);
-        uint32_t cls = __atomic_load_n(&h->cls, __ATOMIC_RELAXED);
-        if (cls < (uint32_t)ZAN_MEM_NCLASS) {
-            *(void **)p = c->free_list[cls];
-            c->free_list[cls] = p;
+    for (int s = 0; s < ZAN_MEM_REMOTE_STRIPES; s++) {
+        void *p = __atomic_exchange_n(&c->remote[s].head, NULL, __ATOMIC_ACQUIRE);
+        while (p) {
+            void *next = *(void **)p;
+            zan_mem_hdr_t *h = (zan_mem_hdr_t *)((char *)p - ZAN_MEM_HDR);
+            uint32_t cls = __atomic_load_n(&h->cls, __ATOMIC_RELAXED);
+            if (cls < (uint32_t)ZAN_MEM_NCLASS) {
+                *(void **)p = c->free_list[cls];
+                c->free_list[cls] = p;
+            }
+            p = next;
         }
-        p = next;
     }
 }
 
@@ -551,13 +569,22 @@ void __wrap_free(void *p) {
     }
     /* Foreign free: push onto the owner's remote stack. The owner is still
      * reachable (caches are never freed), and this thread may not even have a
-     * cache of its own -- freeing must not create one. */
+     * cache of its own -- freeing must not create one. Stripes: a freer with
+     * its own cache maps to one stripe (pointer-derived, so it stays put and
+     * the stripe line stays in its cache); cache-less threads round-robin. */
     if (!owner) return;                  /* header garbage we already refused */
-    void *head = __atomic_load_n(&owner->remote, __ATOMIC_RELAXED);
+    unsigned s;
+    if (self)
+        s = (unsigned)(((uintptr_t)self >> 4) & (ZAN_MEM_REMOTE_STRIPES - 1));
+    else
+        s = (unsigned)(__atomic_fetch_add(&g_remote_rr, 1, __ATOMIC_RELAXED)
+                       & (ZAN_MEM_REMOTE_STRIPES - 1));
+    void **slot = &owner->remote[s].head;
+    void *head = __atomic_load_n(slot, __ATOMIC_RELAXED);
     do {
         *(void **)p = head;
-    } while (!__atomic_compare_exchange_n(&owner->remote, &head, p, 1,
-                                         __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+    } while (!__atomic_compare_exchange_n(slot, &head, p, 1,
+                                          __ATOMIC_RELEASE, __ATOMIC_RELAXED));
 }
 
 void *__wrap_calloc(size_t n, size_t m) {
