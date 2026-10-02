@@ -4750,11 +4750,19 @@ int zan_co_poll(void) {
     return (now - w->slice_start_us >= q * 1000) ? 1 : 0;
 }
 
+static void co_stats_dump(void);
+
 void zan_co_sched_init(void) {
     if (!g_co_inited) {
         InitializeCriticalSection(&g_co_lock);
         InitializeCriticalSection(&g_inj_lock);
         g_co_tls = TlsAlloc();
+        /* Process-exit dump: Task.Spawn keeps a background pool alive across
+         * the whole run, so the root await returns through
+         * zan_co_sched_run_until's wait-for-one-frame branch and sched_run's
+         * teardown (and its stats dump) never executes. Exit time is the one
+         * point every driver path passes; the dump self-gates on the env. */
+        atexit(co_stats_dump);
         g_co_inited = 1;
     }
     g_co_workers = co_worker_count();
