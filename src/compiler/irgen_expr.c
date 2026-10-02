@@ -1971,6 +1971,55 @@ static LLVMValueRef emit_pmovmskb_portable(zan_irgen_t *g, LLVMValueRef v,
     return acc;
 }
 
+/* Portable pshufb (SSSE3 byte shuffle): per lane i the result is 0 when
+ * mask[i] has bit 7 set, else value[mask[i] & 0x0f]. Lane extracts lower
+ * everywhere — the intrinsic is x86-only (see emit_target_is_x86). */
+static LLVMValueRef emit_pshufb_portable(zan_irgen_t *g, LLVMValueRef v,
+                                         LLVMValueRef m, unsigned lanes)
+{
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef vt = LLVMVectorType(i8t, lanes);
+    LLVMValueRef res = LLVMGetUndef(vt);
+    LLVMValueRef c128 = LLVMConstInt(i8t, 0x80, 0);
+    LLVMValueRef c15 = LLVMConstInt(i8t, 0x0f, 0);
+    LLVMValueRef c0 = LLVMConstInt(i8t, 0, 0);
+    for (unsigned i = 0; i < lanes; i++) {
+        LLVMValueRef lane = LLVMConstInt(i32t, i, 0);
+        LLVMValueRef mi = LLVMBuildExtractElement(g->builder, m, lane, "pshufb_mi");
+        LLVMValueRef hi = LLVMBuildAnd(g->builder, mi, c128, "pshufb_hi");
+        LLVMValueRef pick = LLVMBuildICmp(g->builder, LLVMIntEQ, hi, c0, "pshufb_pick");
+        LLVMValueRef idx = LLVMBuildZExt(g->builder,
+            LLVMBuildAnd(g->builder, mi, c15, "pshufb_idx"), i32t, "pshufb_idxw");
+        LLVMValueRef gathered = LLVMBuildExtractElement(g->builder, v, idx, "pshufb_got");
+        LLVMValueRef laneval = LLVMBuildSelect(g->builder, pick, gathered, c0, "pshufb_lane");
+        res = LLVMBuildInsertElement(g->builder, res, laneval, lane, "pshufb_ins");
+    }
+    return res;
+}
+
+/* Portable pavg.b (rounding byte average): per lane (a + b + 1) >> 1 via the
+ * carry-safe identity (a & b) + ((a ^ b) >> 1) + ((a ^ b) & 1) — the sum in
+ * every lane equals (a + b + 1) >> 1 <= 255, so no byte ever carries into its
+ * neighbour. */
+static LLVMValueRef emit_pavg_portable(zan_irgen_t *g, LLVMValueRef a,
+                                       LLVMValueRef b)
+{
+    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+    unsigned lanes = LLVMGetVectorSize(LLVMTypeOf(a));
+    LLVMValueRef one = LLVMConstInt(i8t, 1, 0);
+    LLVMValueRef ones[64];
+    for (unsigned i = 0; i < lanes; i++)
+        ones[i] = one;
+    LLVMValueRef ones_v = LLVMConstVector(ones, lanes);
+    LLVMValueRef and_ab = LLVMBuildAnd(g->builder, a, b, "pavg_and");
+    LLVMValueRef xor_ab = LLVMBuildXor(g->builder, a, b, "pavg_xor");
+    LLVMValueRef half = LLVMBuildLShr(g->builder, xor_ab, ones_v, "pavg_half");
+    LLVMValueRef odd = LLVMBuildAnd(g->builder, xor_ab, ones_v, "pavg_odd");
+    LLVMValueRef sum = LLVMBuildAdd(g->builder, and_ab, half, "pavg_sum");
+    return LLVMBuildAdd(g->builder, sum, odd, "pavg_r");
+}
+
 static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 local_scope_t *locals, LLVMValueRef *out) {
     if (expr->kind != AST_CALL) return false;
@@ -2159,12 +2208,15 @@ static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
         if (method.len == 7 && memcmp(method.str, "Shuffle", 7) == 0) {
             LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
             LLVMValueRef m16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
-            LLVMTypeRef fty = LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8, v16i8 }, 2, 0);
-            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.ssse3.pshuf.b.128");
-            if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.ssse3.pshuf.b.128", fty);
-            LLVMValueRef args[2] = { a16, m16 };
-            LLVMValueRef r = zan_call2(g->builder, fty, fn, args, 2, "pshufb");
-            *out = v16i8_to_vec128(g, r);
+            if (emit_target_is_x86(g)) {
+                LLVMTypeRef fty = LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8, v16i8 }, 2, 0);
+                LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.ssse3.pshuf.b.128");
+                if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.ssse3.pshuf.b.128", fty);
+                LLVMValueRef args[2] = { a16, m16 };
+                *out = v16i8_to_vec128(g, zan_call2(g->builder, fty, fn, args, 2, "pshufb"));
+            } else {
+                *out = v16i8_to_vec128(g, emit_pshufb_portable(g, a16, m16, 16));
+            }
             return true;
         }
         if (method.len == 3 && memcmp(method.str, "Add", 3) == 0) {
@@ -2222,11 +2274,15 @@ static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
         if (method.len == 7 && memcmp(method.str, "Average", 7) == 0) {
             LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
             LLVMValueRef b16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
-            LLVMTypeRef fty = LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8, v16i8 }, 2, 0);
-            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse2.pavg.b");
-            if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse2.pavg.b", fty);
-            LLVMValueRef args[2] = { a16, b16 };
-            *out = v16i8_to_vec128(g, zan_call2(g->builder, fty, fn, args, 2, "pavgb"));
+            if (emit_target_is_x86(g)) {
+                LLVMTypeRef fty = LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8, v16i8 }, 2, 0);
+                LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse2.pavg.b");
+                if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse2.pavg.b", fty);
+                LLVMValueRef args[2] = { a16, b16 };
+                *out = v16i8_to_vec128(g, zan_call2(g->builder, fty, fn, args, 2, "pavgb"));
+            } else {
+                *out = v16i8_to_vec128(g, emit_pavg_portable(g, a16, b16));
+            }
             return true;
         }
         if (method.len == 9 && memcmp(method.str, "UnpackLow", 9) == 0) {
@@ -2641,11 +2697,15 @@ static bool emit_vector256_call(zan_irgen_t *g, zan_ast_node_t *expr,
         if (method.len == 7 && memcmp(method.str, "Average", 7) == 0) {
             LLVMValueRef a32 = vec256_to_v32i8(g, emit_expr(g, expr->call.args.items[0], locals));
             LLVMValueRef b32 = vec256_to_v32i8(g, emit_expr(g, expr->call.args.items[1], locals));
-            LLVMTypeRef fty = LLVMFunctionType(v32i8, (LLVMTypeRef[]){ v32i8, v32i8 }, 2, 0);
-            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.avx2.pavg.b");
-            if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.avx2.pavg.b", fty);
-            LLVMValueRef args[2] = { a32, b32 };
-            *out = v32i8_to_vec256(g, zan_call2(g->builder, fty, fn, args, 2, "vpavgb"));
+            if (emit_target_is_x86(g)) {
+                LLVMTypeRef fty = LLVMFunctionType(v32i8, (LLVMTypeRef[]){ v32i8, v32i8 }, 2, 0);
+                LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.avx2.pavg.b");
+                if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.avx2.pavg.b", fty);
+                LLVMValueRef args[2] = { a32, b32 };
+                *out = v32i8_to_vec256(g, zan_call2(g->builder, fty, fn, args, 2, "vpavgb"));
+            } else {
+                *out = v32i8_to_vec256(g, emit_pavg_portable(g, a32, b32));
+            }
             return true;
         }
     }
