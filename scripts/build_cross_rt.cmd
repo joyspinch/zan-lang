@@ -156,16 +156,26 @@ rem live in libc.a), so they are not committed. zap_main.o, zan_inflate.o
 rem and the libEGL/libGLESv3 stub .so are built here but also stay
 rem uncommitted (zanc needs them in toolchain\ohos-<arch> at cross-link
 rem time; rerun this script on a fresh checkout).
-rem NDK-free fallback: scripts\build_ohos_rt_zig.sh rebuilds the same objects
-rem with zig (its bundled musl supplies the headers; -D__OHOS__ re-adds the OS
+rem NDK-free fallback (automated below): without OHOS_NDK the build delegates
+rem to scripts\build_ohos_rt_zig.sh, which rebuilds the same objects with zig
+rem (its bundled musl supplies the headers; -D__OHOS__ re-adds the OS
 rem define, arm64 timer uses -mcpu=generic+sha2). Objects link clean against
 rem the committed OHOS musl libc.a subset -- proven 2026-10-02, see TASKS.md
 rem B-ID44/B-ID53. Swap back to NDK clang when the SDK is available.
 if "%OHOS_NDK%"=="" set OHOS_NDK=%ZAN_OHOS_SDK%
-if not exist "%OHOS_NDK%\native\llvm\bin\clang.exe" (
-  echo OHOS NDK not found: set OHOS_NDK to the OHOS SDK directory containing native
-  exit /b 1
-)
+if exist "%OHOS_NDK%\native\llvm\bin\clang.exe" goto :ohos_ndk
+echo OHOS NDK not found - falling back to scripts\build_ohos_rt_zig.sh
+rem zig's bundled musl supplies the headers; -D__OHOS__ re-adds the OS
+rem define (file-backed shm shim in rt_sync.c); arm64 timer uses
+rem -mcpu=generic+sha2. Objects link clean against the committed OHOS musl
+rem libc.a subset -- proven 2026-10-02, see TASKS.md B-ID44/B-ID53. Swap
+rem back to NDK clang when the SDK is available.
+rem ZIGFWD must be set OUTSIDE a parenthesized block: %-expansion inside a
+rem block reads the parse-time value (empty here), a classic cmd trap.
+set ZIGFWD=%ZIG:\=/%
+bash scripts/build_ohos_rt_zig.sh "%ZIGFWD%" || exit /b 1
+goto :ohos_done
+:ohos_ndk
 set OHOSBIN=%OHOS_NDK%\native\llvm\bin
 set OHOSSYS=%OHOS_NDK%\native\sysroot
 for %%P in (ohos-x64:x86_64-unknown-linux-ohos ohos-arm64:aarch64-unknown-linux-ohos) do (
@@ -198,3 +208,6 @@ rem crypto feature macro so arm_neon.h declares the SHA-2 intrinsics. Runtime
 rem dispatch is unaffected -- the HWCAP_SHA2 gate plus KAT still decide per CPU.
 "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target aarch64-unknown-linux-ohos -g0 -std=c11 -fPIC -march=armv8-a+crypto -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\ohos-arm64\zanrt_timer.o || exit /b 1
 echo built toolchain\ohos-arm64\zanrt_timer.o +crypto
+
+:ohos_done
+exit /b 0
