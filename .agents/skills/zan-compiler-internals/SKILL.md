@@ -340,8 +340,10 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
        "named void value"，如 `call void @f()` 带名即拒）；定位用
        `ZANC_DUMP_BAD_IR=1`，自动 dump 被拒函数 IR。
      - 附：交叉目标的运行时 .o，zanc 从 **exe 旁捆绑副本**（`build/<target>/`）
-       链接而非仓库 `toolchain/<target>/`——重建 toolchain 后不同步 cp 过去，
-       新符号照样 undefined symbol，像修复没生效。
+       链接而非仓库 `toolchain/<target>/`——2026-10-02 已根治（CMakeLists 的
+       cross_sysroots staging 改为 zanc 的前置依赖 + 目的地去 TARGET_FILE_DIR
+       生成器表达式防环），`--target zanc` 快速迭代也会自动同步；旧构建树或
+       SDK dist 里仍可能陈旧，undefined symbol 时先比对两边 .o 的 mtime。
 
 ## stdlib 肥边治理：独立类分片 + 槽反转 + 实例方法组注入（A332 肥边③④，2026-09-17）
 

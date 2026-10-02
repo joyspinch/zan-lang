@@ -441,19 +441,19 @@ foreach(_linux_sub linux-musl linux-arm64 linux-riscv64)
     set(_linux_sys "${CMAKE_SOURCE_DIR}/toolchain/${_linux_sub}")
     if(EXISTS "${_linux_sys}/libc.a")
         list(APPEND _cross_sysroot_cmds
-            COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:zanc>/${_linux_sub}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/${_linux_sub}
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${_linux_sys}/crt1.o" "${_linux_sys}/crti.o"
                     "${_linux_sys}/crtn.o" "${_linux_sys}/libc.a"
                     "${_linux_sys}/zanrt_io.o" "${_linux_sys}/zanrt_sync.o"
                     "${_linux_sys}/zanrt_timer.o"
-                    $<TARGET_FILE_DIR:zanc>/${_linux_sub}/)
+                    ${CMAKE_BINARY_DIR}/${_linux_sub}/)
         foreach(_linux_opt zanrt_file.o zanrt_mem.o libgcc.a)
             if(EXISTS "${_linux_sys}/${_linux_opt}")
                 list(APPEND _cross_sysroot_cmds
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different
                             "${_linux_sys}/${_linux_opt}"
-                            $<TARGET_FILE_DIR:zanc>/${_linux_sub}/)
+                            ${CMAKE_BINARY_DIR}/${_linux_sub}/)
             endif()
         endforeach()
     endif()
@@ -468,7 +468,7 @@ foreach(_win_sub win-x64 win-arm64)
     if(EXISTS "${_win_sys}/mingw/lib/crt2.o")
         list(APPEND _cross_sysroot_cmds
             COMMAND ${CMAKE_COMMAND} -E copy_directory
-                    "${_win_sys}" $<TARGET_FILE_DIR:zanc>/${_win_sub})
+                    "${_win_sys}" ${CMAKE_BINARY_DIR}/${_win_sub})
     endif()
 endforeach()
 
@@ -477,7 +477,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/macos/libSystem.tbd")
     list(APPEND _cross_sysroot_cmds
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_SOURCE_DIR}/toolchain/macos"
-                $<TARGET_FILE_DIR:zanc>/macos)
+                ${CMAKE_BINARY_DIR}/macos)
 endif()
 
 # ---- iOS libSystem stub (ios-arm64 cross-compilation) ----
@@ -485,7 +485,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/ios/libSystem.tbd")
     list(APPEND _cross_sysroot_cmds
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_SOURCE_DIR}/toolchain/ios"
-                $<TARGET_FILE_DIR:zanc>/ios)
+                ${CMAKE_BINARY_DIR}/ios)
 endif()
 
 # ---- WASI sysroot (wasm32 cross-compilation) ----
@@ -493,7 +493,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/wasm32/libc.a")
     list(APPEND _cross_sysroot_cmds
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_SOURCE_DIR}/toolchain/wasm32"
-                $<TARGET_FILE_DIR:zanc>/wasm32)
+                ${CMAKE_BINARY_DIR}/wasm32)
 endif()
 
 # ---- Android bionic sysroot subset (android-x64/arm64 cross-compilation) ----
@@ -501,13 +501,13 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/android-x64/libc.a")
     list(APPEND _cross_sysroot_cmds
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_SOURCE_DIR}/toolchain/android-x64"
-                $<TARGET_FILE_DIR:zanc>/android-x64)
+                ${CMAKE_BINARY_DIR}/android-x64)
 endif()
 if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/android-arm64/libc.a")
     list(APPEND _cross_sysroot_cmds
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_SOURCE_DIR}/toolchain/android-arm64"
-                $<TARGET_FILE_DIR:zanc>/android-arm64)
+                ${CMAKE_BINARY_DIR}/android-arm64)
 endif()
 
 # ---- HarmonyOS sysroot subset (ohos-x64/arm64 cross-compilation) ----
@@ -518,13 +518,13 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/ohos-x64/libc.a")
     list(APPEND _cross_sysroot_cmds
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_SOURCE_DIR}/toolchain/ohos-x64"
-                $<TARGET_FILE_DIR:zanc>/ohos-x64)
+                ${CMAKE_BINARY_DIR}/ohos-x64)
 endif()
 if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/ohos-arm64/libc.a")
     list(APPEND _cross_sysroot_cmds
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_SOURCE_DIR}/toolchain/ohos-arm64"
-                $<TARGET_FILE_DIR:zanc>/ohos-arm64)
+                ${CMAKE_BINARY_DIR}/ohos-arm64)
 endif()
 
 # ---- NativeActivity APK shell (--emit-apk packaging assets) ----
@@ -532,16 +532,26 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/apk-shell/classes.dex")
     list(APPEND _cross_sysroot_cmds
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_SOURCE_DIR}/toolchain/apk-shell"
-                $<TARGET_FILE_DIR:zanc>/apk-shell)
+                ${CMAKE_BINARY_DIR}/apk-shell)
 endif()
 
 # Stage every cross sysroot on each build, so a rebuilt runtime object reaches
 # the copy zanc actually links against (see the Linux sysroot note above).
+# Destinations use CMAKE_BINARY_DIR, not $<TARGET_FILE_DIR:zanc>: a target
+# genex in a custom target's COMMAND makes CMake infer a strong
+# cross_sysroots -> zanc edge, which cycles with the explicit
+# zanc -> cross_sysroots edge below. Ninja single-config: zanc's dir IS
+# ${CMAKE_BINARY_DIR}.
 if(_cross_sysroot_cmds)
     add_custom_target(cross_sysroots ALL ${_cross_sysroot_cmds}
         COMMENT "Staging cross-compilation sysroots next to zanc"
         VERBATIM)
-    add_dependencies(cross_sysroots zanc)
+    # zanc depends on the staging, not the other way around: a quick
+    # `cmake --build build --target zanc` must stage too, or a rebuilt
+    # toolchain/<t>/ object keeps linking from the stale copy next to zanc
+    # ("undefined symbol" with a fix that looks already applied — the exact
+    # failure this staging was added to fix; an ALL-only target skipped it).
+    add_dependencies(zanc cross_sysroots)
 endif()
 
 # ---- Native database drivers (publish-time bundling) ----
