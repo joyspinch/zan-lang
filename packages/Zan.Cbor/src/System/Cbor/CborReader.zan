@@ -74,6 +74,18 @@ class CborReader {
             + Convert.ToString(ai) + " at byte " + Convert.ToString(pos));
     }
 
+    /// 定长 argument → int 长度/元素数：>512MB（对齐 MsgPack/BSON
+    /// 读侧载荷上限；输入缓冲本身不超过 2^31，合法值不可能触线）
+    /// 即抛。直接 (int) 截断会把 2^32+5 静默变成 5，把畸形流"解析"
+    /// 成错误但合法的结果。
+    int ArgLen(long v) {
+        if (v > 536870912) {
+            throw new CborException("length " + Convert.ToString(v)
+                + " exceeds 512MB limit at byte " + Convert.ToString(pos));
+        }
+        return (int)v;
+    }
+
     byte[] Take(int n) {
         if (n < 0 || n > len - pos) {
             throw new CborException("truncated at byte "
@@ -108,11 +120,11 @@ class CborReader {
         }
         if (major == 2) {                                     // byte string
             if (ai == 31) { return JsonValue.NewStr(TextOf(TakeChunks(2))); }
-            return JsonValue.NewStr(TextOf(Take((int)Arg(ai))));
+            return JsonValue.NewStr(TextOf(Take(ArgLen(Arg(ai)))));
         }
         if (major == 3) {                                     // text string
             if (ai == 31) { return JsonValue.NewStr(TextOf(TakeChunks(3))); }
-            return JsonValue.NewStr(TextOf(Take((int)Arg(ai))));
+            return JsonValue.NewStr(TextOf(Take(ArgLen(Arg(ai)))));
         }
         if (major == 4) {                                     // array
             JsonValue arr = JsonValue.NewArray();
@@ -120,7 +132,7 @@ class CborReader {
                 while (!AtBreak()) { arr.Append(ReadValue(depth + 1)); }
                 return arr;
             }
-            int n = (int)Arg(ai);
+            int n = ArgLen(Arg(ai));
             int i = 0;
             while (i < n) {
                 arr.Append(ReadValue(depth + 1));
@@ -136,7 +148,7 @@ class CborReader {
                 }
                 return obj;
             }
-            int n = (int)Arg(ai);
+            int n = ArgLen(Arg(ai));
             int i = 0;
             while (i < n) {
                 PutEntry(obj, depth);
@@ -181,11 +193,14 @@ class CborReader {
                 throw new CborException("bad chunk header at byte "
                     + Convert.ToString(pos));
             }
-            byte[] chunk = Take((int)Arg(ai));
-            if (n + chunk.Length > acc.Length) {
-                int c = acc.Length * 2;
-                while (c < n + chunk.Length) { c = c * 2; }
-                byte[] grown = new byte[c];
+            byte[] chunk = Take(ArgLen(Arg(ai)));
+            // 64 位容量算术：n + chunk.Length 的 int 加法在输入趋近
+            // 2^31 时回绕，倍增循环随之死循环。
+            long need = (long)n + chunk.Length;
+            if (need > acc.Length) {
+                long c = acc.Length;
+                while (c < need) { c = c * 2; }
+                byte[] grown = new byte[(int)c];
                 NativeMemory.Copy((nint)grown, (nint)acc, n);
                 acc = grown;
             }

@@ -10,6 +10,12 @@ namespace System.Cbor;
 /// NativeMemory.Copy 搬移，数值大端。
 /// </summary>
 class CborWriter {
+    /// 写侧总量上限：对齐读侧 512MB 载荷上限，超限抛 CborException。
+    /// 容量算术全程 64 位——旧的 int 算术在 len+extra ≥ 2^31 时首判据
+    /// 回绕误判"有空间"直接写穿，倍增循环在 >1GB 时同样回绕成死循环
+    /// （indefinite 分片绕开此限是后续台账项，本轮不做）。
+    static long MaxTotalBytes = 536870912;
+
     byte[] buf;
     int len;
 
@@ -22,11 +28,16 @@ class CborWriter {
     int Length() { return len; }
 
     void EnsureRoom(int extra) {
-        if (len + extra <= buf.Length) { return; }
-        int c = buf.Length * 2;
+        long need = (long)len + (long)extra;
+        if (need > CborWriter.MaxTotalBytes) {
+            throw new CborException("encoded size "
+                + Convert.ToString(need) + " exceeds 512MB write limit");
+        }
+        if (need <= buf.Length) { return; }
+        long c = (long)buf.Length * 2;
         if (c < 16) { c = 16; }
-        while (c < len + extra) { c = c * 2; }
-        byte[] grown = new byte[c];
+        while (c < need) { c = c * 2; }
+        byte[] grown = new byte[(int)c];
         NativeMemory.Copy((nint)grown, (nint)buf, len);
         buf = grown;
     }

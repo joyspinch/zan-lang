@@ -12,6 +12,12 @@ namespace System.Bson;
 /// 再作为元素值整体拼接——长度头因此天然自洽，无需回填。
 /// </summary>
 class BsonWriter {
+    /// 写侧总量上限：对齐读侧（BsonReader 拒绝 >512MB 的文档），
+    /// 超限抛 BsonException。容量算术全程 64 位——旧的 int 算术在
+    /// len+extra ≥ 2^31 时首判据回绕误判"有空间"直接写穿，倍增循环
+    /// 在 >1GB 时同样回绕成死循环。
+    static long MaxTotalBytes = 536870912;
+
     byte[] buf;
     int len;
 
@@ -24,11 +30,16 @@ class BsonWriter {
     int Length() { return len; }
 
     void EnsureRoom(int extra) {
-        if (len + extra <= buf.Length) { return; }
-        int c = buf.Length * 2;
+        long need = (long)len + (long)extra;
+        if (need > BsonWriter.MaxTotalBytes) {
+            throw new BsonException("encoded size "
+                + Convert.ToString(need) + " exceeds 512MB write limit");
+        }
+        if (need <= buf.Length) { return; }
+        long c = (long)buf.Length * 2;
         if (c < 16) { c = 16; }
-        while (c < len + extra) { c = c * 2; }
-        byte[] grown = new byte[c];
+        while (c < need) { c = c * 2; }
+        byte[] grown = new byte[(int)c];
         NativeMemory.Copy((nint)grown, (nint)buf, len);
         buf = grown;
     }

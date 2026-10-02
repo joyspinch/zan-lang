@@ -39,17 +39,39 @@ class ProtoReader {
     int WireType() { return curWire; }
 
     /// <summary>前进到下一个字段；输入耗尽返回假。tag 非法（字段号
-    /// 0 或 varint 截断）即抛 ProtoException。</summary>
+    /// 0、超 2^29-1 或 varint 截断）即抛 ProtoException。</summary>
     bool Next() {
         if (pos >= len) { return false; }
         long tag = ReadVarint();
-        curField = (int)(tag >> 3);
+        curField = FieldOf(tag);
         curWire = (int)(tag & 7);
         if (curField == 0) {
             throw new ProtoException("field number 0 at byte "
                 + Convert.ToString(pos));
         }
         return true;
+    }
+
+    /// tag 高位 → 字段号，拒绝 > 536870911（对齐写侧 Tag 的上限）：
+    /// 直接 (int)(tag >> 3) 截断会把畸形大 tag 静默变成合法小字段号。
+    static int FieldOf(long tag) {
+        long f = tag >> 3;
+        if (f > 536870911) {
+            throw new ProtoException("field number out of range: "
+                + Convert.ToString(f));
+        }
+        return (int)f;
+    }
+
+    /// 长度界定字段的 varint 长度 → int：> int.Max 即抛。直接 (int)
+    /// 截断会把 2^32 静默变成 0，把截断的载荷当空字段收下。
+    int LenOf(long v) {
+        if (v > 2147483647) {
+            throw new ProtoException("length-delimited length "
+                + Convert.ToString(v) + " exceeds 32-bit range at byte "
+                + Convert.ToString(pos));
+        }
+        return (int)v;
     }
 
     long ReadVarint() {
@@ -171,7 +193,7 @@ class ProtoReader {
     /// bytes 字段（复制成新 byte[]）。
     byte[] ReadBytes() {
         ExpectWire(2, "length-delimited");
-        int n = (int)ReadVarint();
+        int n = LenOf(ReadVarint());
         Need(n);
         byte[] out2 = new byte[n];
         NativeMemory.Copy((nint)out2, (nint)buf + pos, n);
@@ -201,14 +223,14 @@ class ProtoReader {
         if (w == 0) { ReadVarint(); }
         else if (w == 1) { Need(8); pos = pos + 8; }
         else if (w == 2) {
-            int n = (int)ReadVarint();
+            int n = LenOf(ReadVarint());
             Need(n);
             pos = pos + n;
         } else if (w == 3) {
             bool closed = false;
             while (pos < len) {
                 long tag = ReadVarint();
-                int f = (int)(tag >> 3);
+                int f = ProtoReader.FieldOf(tag);
                 int g = (int)(tag & 7);
                 if (f == 0) {
                     throw new ProtoException("field number 0 in group at byte "
