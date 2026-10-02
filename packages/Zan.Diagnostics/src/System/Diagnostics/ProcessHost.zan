@@ -18,8 +18,11 @@ namespace System.Diagnostics;
 ///
 /// 平台支持：
 ///   - Pid / Env / SelfExe / WorkerId / IsWorker：所有平台。
-///   - Daemonize（setsid 分离）：仅 Linux；其他平台为 no-op，返回 false，
-///     调用方继续在前台运行。
+///   - Daemonize（后台分离）：Linux 用 setsid（新会话、无控制终端）；
+///     macOS 没有 setsid(1)（util-linux 独有），退化为 nohup——忽略
+///     SIGHUP，终端关闭后进程存活，但会话仍附着，需要完整 daemon
+///     语义（开机自启、崩溃重启）时请交给 launchd；其余平台为
+///     no-op，返回 false，调用方继续在前台运行。
 ///   - SpawnWorkers（SO_REUSEPORT 多进程）：Linux/macOS。Windows 没有
 ///     SO_REUSEPORT 连接负载均衡，因此 SpawnWorkers 在 Windows 上是 no-op，
 ///     MultiProcessSupported() 返回 false；调用方应运行单进程
@@ -160,10 +163,12 @@ class ProcessHost {
     }
 
     /// <summary>
-    /// 在 Linux 上通过 setsid 分离为后台守护进程。
+    /// 分离为后台守护进程：Linux 通过 setsid（新会话、无控制终端），
+    /// macOS 通过 nohup（忽略 SIGHUP，终端关闭后存活；无 setsid(1)，
+    /// 会话仍附着——完整 daemon 语义请交给 launchd）。
     /// 在原始前台进程中返回 TRUE，随后应退出；
     /// 分离出的子进程带 ZAN_DAEMON=1 重新运行程序，使此调用
-    /// 第二次成为 no-op。在非 Linux 平台，或可执行文件路径
+    /// 第二次成为 no-op。在其他平台，或可执行文件路径
     /// 无法找到时，返回 FALSE，调用方继续正常运行。
     /// </summary>
     static bool Daemonize() {
@@ -179,20 +184,25 @@ class ProcessHost {
     /// 未捕获的致命信号）现场什么都不留，所以后台模式应当给出一个文件。
     /// </summary>
     static bool DaemonizeTo(string logPath, string logDir) {
-        #if LINUX
         if (ProcessHost.IsWorker()) { return false; }
         if (ProcessHost.Env("ZAN_DAEMON") != "") { return false; }
         string exe = ProcessHost.SelfExe();
         if (exe == "") { return false; }
         string cmd = "ZAN_DAEMON=1";
         if (logDir != "") { cmd = cmd + " ZAN_LOG_DIR=\"" + logDir + "\""; }
+        #if LINUX
         cmd = cmd + " setsid \"" + exe + "\"";
-        if (logPath != "") { cmd = cmd + " >> \"" + logPath + "\" 2>&1"; }
-        Process.RunDetached(cmd);
-        return true;
+        #elif MACOS
+        // macOS 没有 setsid(1)（util-linux 独有），用 nohup 让后台进程
+        // 忽略 SIGHUP——终端关闭后守护进程存活；会话仍附着（无控制
+        // 终端的完整 daemon 语义请交给 launchd）。见类文档的平台矩阵。
+        cmd = cmd + " nohup \"" + exe + "\"";
         #else
         return false;
         #endif
+        if (logPath != "") { cmd = cmd + " >> \"" + logPath + "\" 2>&1"; }
+        Process.RunDetached(cmd);
+        return true;
     }
 
     /// <summary>
