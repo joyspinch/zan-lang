@@ -601,6 +601,12 @@ void __wrap_free(void *p) {
         *(void **)p = head;
     } while (!__atomic_compare_exchange_n(slot, &head, p, 1,
                                           __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+
+    /* Active cooperative reclamation: when foreign frees land on a cache while
+     * the current thread has its own cache, drain self's remote frees if pending */
+    if (self && self != owner) {
+        zan_mem_drain_remote(self);
+    }
 }
 
 void *__wrap_calloc(size_t n, size_t m) {

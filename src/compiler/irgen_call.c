@@ -51,6 +51,218 @@ static LLVMValueRef emit_detach_async_call(zan_irgen_t *g, LLVMValueRef sub,
     return sub_i8;
 }
 
+static LLVMTypeRef get_task_action_frame_type(zan_irgen_t *g) {
+    LLVMTypeRef ty = LLVMGetTypeByName2(g->ctx, "zan.co.task_action_frame");
+    if (ty) return ty;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef fields[] = {
+        i64, g->co_step_ptr,                           /* SCHED, SCHED_STEP */
+        i32, i32,                                     /* STATE, DONE */
+        i8ptr, g->co_step_ptr, i64,                   /* AWAITER, AWAITER_STEP, RESULT */
+        g->co_step_ptr, i32,                          /* CLEANUP, HCOUNT */
+        g->co_step_ptr,                               /* SELF_STEP */
+        i8ptr, i8ptr, i32,                            /* EXC, TID, EXC_OWNED */
+        i32,                                          /* CANCEL */
+        i8ptr,                                        /* CHILD */
+        i8ptr,                                        /* LNEXT */
+        i8ptr                                         /* DELEGATE (slot 16) */
+    };
+    ty = LLVMStructCreateNamed(g->ctx, "zan.co.task_action_frame");
+    LLVMStructSetBody(ty, fields, 17, 0);
+    return ty;
+}
+
+static LLVMValueRef get_task_action_cleanup_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_task_action_cleanup");
+    if (fn) return fn;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_task_action_cleanup", fn_ty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef saved_fn = g->current_fn;
+    g->current_fn = fn;
+
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    di_clear(g);
+    LLVMValueRef arg = LLVMGetParam(fn, 0);
+    LLVMTypeRef ft = get_task_action_frame_type(g);
+    LLVMValueRef frame = LLVMBuildBitCast(g->builder, arg, LLVMPointerType(ft, 0), "fr");
+    LLVMValueRef dlg_p = LLVMBuildStructGEP2(g->builder, ft, frame, 16, "dlg.p");
+    LLVMValueRef dlg = LLVMBuildLoad2(g->builder, i8ptr, dlg_p, "dlg");
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), dlg_p);
+    emit_closure_release(g, dlg);
+    zan_emit_frame_free(g, arg);
+    LLVMBuildRetVoid(g->builder);
+
+    g->current_fn = saved_fn;
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
+}
+
+static LLVMValueRef get_task_action_step_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_task_action_step");
+    if (fn) return fn;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_task_action_step", fn_ty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef saved_fn = g->current_fn;
+    g->current_fn = fn;
+
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef exec_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "exec");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    di_clear(g);
+    LLVMValueRef arg = LLVMGetParam(fn, 0);
+    LLVMTypeRef ft = get_task_action_frame_type(g);
+    LLVMValueRef frame = LLVMBuildBitCast(g->builder, arg, LLVMPointerType(ft, 0), "fr");
+
+    /* Check cancellation */
+    LLVMValueRef cancel_p = LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_CANCEL, "cancel.p");
+    LLVMValueRef cancel = LLVMBuildLoad2(g->builder, i32, cancel_p, "cancel");
+    LLVMValueRef is_cancelled = zan_icmp(g->builder, LLVMIntNE, cancel, LLVMConstInt(i32, 0, 0), "is_cancelled");
+    LLVMBuildCondBr(g->builder, is_cancelled, done_bb, exec_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, exec_bb);
+    LLVMValueRef dlg_p = LLVMBuildStructGEP2(g->builder, ft, frame, 16, "dlg.p");
+    LLVMValueRef dlg = LLVMBuildLoad2(g->builder, i8ptr, dlg_p, "dlg");
+    LLVMValueRef has_dlg = zan_icmp(g->builder, LLVMIntNE, dlg, LLVMConstNull(i8ptr), "has.dlg");
+
+    LLVMBasicBlockRef invoke_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "invoke");
+    LLVMBasicBlockRef after_invoke_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "after_invoke");
+    LLVMBuildCondBr(g->builder, has_dlg, invoke_bb, after_invoke_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, invoke_bb);
+    LLVMTypeRef void_fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+    emit_delegate_invoke(g, dlg, void_fn_ty, LLVMVoidTypeInContext(g->ctx), NULL, 0, "");
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), dlg_p);
+    emit_closure_release(g, dlg);
+    LLVMBuildBr(g->builder, after_invoke_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, after_invoke_bb);
+    LLVMBuildBr(g->builder, done_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, done_bb);
+    emit_co_cancel_delay(g, arg);
+
+    LLVMValueRef res_ptr = LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_RESULT, "fr.result");
+    LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), res_ptr);
+
+    LLVMValueRef done_ptr = LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_DONE, "fr.done");
+    LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpXchg, done_ptr,
+        LLVMConstInt(i32, 1, 0), LLVMAtomicOrderingRelease, 0);
+    LLVMBuildStore(g->builder, LLVMConstInt(i32, -1, 1),
+        LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_STATE, "fr.state"));
+
+    {
+        LLVMTypeRef jc_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+            (LLVMTypeRef[]){ i8ptr }, 1, 0);
+        LLVMValueRef jc = LLVMGetNamedFunction(g->mod, "zan_join_complete");
+        if (!jc) jc = LLVMAddFunction(g->mod, "zan_join_complete", jc_type);
+        zan_call2(g->builder, jc_type, jc, &arg, 1, "");
+    }
+
+    LLVMTypeRef ptr_int_ty = g->target_is_wasm ? i32 : i64;
+    LLVMValueRef aw_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
+        ASYNC_FRAME_AWAITER, "fr.awaiter");
+    LLVMValueRef aw_iptr = LLVMBuildBitCast(g->builder, aw_ptr,
+        LLVMPointerType(ptr_int_ty, 0), "fr.aw.iptr");
+    LLVMValueRef old_aw = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpXchg,
+        aw_iptr, LLVMConstInt(ptr_int_ty, 1, 0),
+        LLVMAtomicOrderingSequentiallyConsistent, 0);
+    LLVMValueRef has_awaiter = zan_icmp(g->builder, LLVMIntUGT, old_aw,
+        LLVMConstInt(ptr_int_ty, 1, 0), "has.awaiter");
+
+    LLVMBasicBlockRef wake_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.wake");
+    LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.ret");
+    LLVMBuildCondBr(g->builder, has_awaiter, wake_bb, ret_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, wake_bb);
+    LLVMValueRef awaiter = LLVMBuildIntToPtr(g->builder, old_aw, i8ptr, "awaiter");
+    LLVMValueRef aws_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
+        ASYNC_FRAME_AWAITER_STEP, "fr.awaiter.step");
+    LLVMValueRef aw_step = LLVMBuildLoad2(g->builder, g->co_step_ptr, aws_ptr, "awaiter.step");
+    LLVMValueRef wake_args[] = { awaiter, aw_step };
+    zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, wake_args, 2, "");
+    LLVMBuildBr(g->builder, ret_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, ret_bb);
+    LLVMBuildRetVoid(g->builder);
+
+    g->current_fn = saved_fn;
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
+}
+
+static LLVMValueRef emit_task_action_run(zan_irgen_t *g, LLVMValueRef lv,
+                                         zan_ast_node_t *sub_arg,
+                                         local_scope_t *locals) {
+    LLVMTypeRef sp_i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef lv_i8 = LLVMBuildBitCast(g->builder, lv, i8ptr, "task.del");
+
+    /* Retain closure reference so it survives while executing on background worker */
+    emit_closure_retain(g, lv_i8);
+
+    /* Allocate TaskActionFrame */
+    LLVMTypeRef ft = get_task_action_frame_type(g);
+    LLVMTypeRef malloc_ty = LLVMGlobalGetValueType(g->fn_malloc);
+    LLVMValueRef fsize = LLVMSizeOf(ft);
+    LLVMValueRef raw = zan_call2(g->builder, malloc_ty, g->fn_malloc, &fsize, 1, "task.raw");
+    zan_irgen_emit_oom_check(g, g->current_fn, raw);
+
+    /* Zero the allocated frame */
+    {
+        LLVMTypeRef memset_ty = LLVMFunctionType(i8ptr,
+            (LLVMTypeRef[]){ i8ptr, i32, sp_i64 }, 3, 0);
+        LLVMValueRef memset_fn = LLVMGetNamedFunction(g->mod, "memset");
+        if (!memset_fn) memset_fn = LLVMAddFunction(g->mod, "memset", memset_ty);
+        zan_call2(g->builder, memset_ty, memset_fn,
+            (LLVMValueRef[]){ raw, LLVMConstInt(i32, 0, 0), fsize }, 3, "");
+    }
+
+    LLVMValueRef rframe = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(ft, 0), "task.frame");
+
+    LLVMValueRef step_fn = get_task_action_step_fn(g);
+    LLVMValueRef cleanup_fn = get_task_action_cleanup_fn(g);
+    LLVMValueRef reap_fn = get_co_reap_fn(g);
+
+    LLVMBuildStore(g->builder, cleanup_fn,
+        LLVMBuildStructGEP2(g->builder, ft, rframe, ASYNC_FRAME_CLEANUP, "task.cl"));
+    LLVMBuildStore(g->builder, step_fn,
+        LLVMBuildStructGEP2(g->builder, ft, rframe, ASYNC_FRAME_SELF_STEP, "task.selfstep"));
+    LLVMBuildStore(g->builder, lv_i8,
+        LLVMBuildStructGEP2(g->builder, ft, rframe, 16, "task.dlg"));
+
+    /* Self-awaiter with reaper so detached task cleans up after completion */
+    LLVMBuildStore(g->builder, raw,
+        LLVMBuildStructGEP2(g->builder, ft, rframe, ASYNC_FRAME_AWAITER, "task.aw"));
+    LLVMBuildStore(g->builder, reap_fn,
+        LLVMBuildStructGEP2(g->builder, ft, rframe, ASYNC_FRAME_AWAITER_STEP, "task.aws"));
+
+    /* Release caller temporary */
+    emit_release_owned_call_temp(g, sub_arg, lv, locals);
+
+    /* Enqueue to background worker pool */
+    LLVMValueRef sched_args[] = { raw, step_fn };
+    zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
+
+    /* Track in live frame registry */
+    LLVMValueRef track = get_co_track_fn(g);
+    zan_call2(g->builder, LLVMGlobalGetValueType(track), track, &raw, 1, "");
+
+    return LLVMBuildPtrToInt(g->builder, raw, sp_i64, "task.h");
+}
+
 /* True when the identifier names a field of the class being compiled -- an
  * instance field (it reads as `this.<name>`) or a static one. Such a field
  * shadows a type of the same name wherever a receiver is resolved. Statics
@@ -634,17 +846,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                  * diagnostic fires instead of silently lowering to 0 */
             } else {
 
-            /* Task.Run(<delegate>) / Task.Spawn(<delegate>): the body runs to
-             * completion right here and the task is done before Run returns.
-             * Any awaits inside it pump the driver via the root-await path, so
-             * this is observably identical to scheduling it on the pool in the
-             * cooperative single-threaded model. The handle 0 is "already
-             * done": __zan_co_isdone(0) returns 1 because no live frame
-             * matches it, so Wait()/IsCompleted return at once. */
+            /* Task.Run(<delegate>) / Task.Spawn(<delegate>): schedule the delegate
+             * on the runtime worker pool as a detached background task frame.
+             * The task handle returned names the live frame, so Wait(), IsDone,
+             * and Cancel() operate across threads. */
             if (sub_arg->kind == AST_LAMBDA || is_del) {
-                int pc = 0;
                 LLVMValueRef lv = NULL;
-                LLVMTypeRef vret = LLVMVoidTypeInContext(g->ctx);
                 if (sub_arg->kind == AST_LAMBDA) {
                     if (sub_arg->lambda.params.count != 0 ||
                         lambda_body_has_value_return(sub_arg->lambda.body)) {
@@ -669,14 +876,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         return LLVMConstInt(sp_i64, 0, 0);
                     }
                     lv = emit_expr(g, sub_arg, locals);
-                    vret = sub_ty->delegate_ret_type
-                        ? map_type(g, sub_ty->delegate_ret_type)
-                        : vret;
                 }
-                LLVMTypeRef fn_type = LLVMFunctionType(vret, NULL, 0, 0);
-                emit_delegate_invoke(g, lv, fn_type, vret, NULL, 0, "");
-                emit_release_owned_call_temp(g, sub_arg, lv, locals);
-                return LLVMConstInt(sp_i64, 0, 0);
+                return emit_task_action_run(g, lv, sub_arg, locals);
             }
             LLVMValueRef sub = emit_expr(g, sub_arg, locals);
             /* A result-carrying Task.Run keeps its frame: it must stay alive

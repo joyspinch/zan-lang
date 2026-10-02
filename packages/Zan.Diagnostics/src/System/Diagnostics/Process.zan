@@ -48,6 +48,12 @@ class Process {
     [DllImport("kernel32", EntryPoint = "CreateFileW")]
     static extern nint WinCreateFile(nint path, int access, int share, byte[] sa,
                                      int disposition, int flags, nint template);
+    [DllImport("kernel32", EntryPoint = "CreatePipe")]
+    static extern int WinCreatePipe(byte[] hReadPipe, byte[] hWritePipe, byte[] sa, int size);
+    [DllImport("kernel32", EntryPoint = "SetHandleInformation")]
+    static extern int WinSetHandleInformation(nint handle, int mask, int flags);
+    [DllImport("kernel32", EntryPoint = "ReadFile")]
+    static extern int WinReadFile(nint handle, byte[] buf, int numToRead, byte[] numRead, nint overlapped);
     #else
     // Linux、macOS 等 POSIX 系统都在 libc 中提供 popen/pclose。
     [DllImport("crt", EntryPoint = "popen")]
@@ -401,6 +407,177 @@ class Process {
         if (logPath != "") { redirect = " >>\"" + logPath + "\" 2>&1"; }
         return system("\"" + exe + "\"" + redirect + " &");
         #endif
+    }
+
+    /// <summary>
+    /// 安全转义单个命令行参数，防止参数被拆分或注入（符合 Windows 命令行解析规则）。
+    /// </summary>
+    static string QuoteArg(string arg) {
+        if (arg == null || arg.Length == 0) { return "\"\""; }
+        bool needQuotes = false;
+        int len = arg.Length;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = arg[i] & 255;
+            if (c == 32 || c == 9 || c == 34 || c == 10 || c == 13) { // space, tab, quote, newline
+                needQuotes = true;
+                break;
+            }
+        }
+        if (!needQuotes) { return arg; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("\"");
+        int backslashes = 0;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = arg[i] & 255;
+            if (c == 92) { // '\\'
+                backslashes = backslashes + 1;
+            } else if (c == 34) { // '\"'
+                for (int b = 0; b < backslashes * 2 + 1; b = b + 1) {
+                    sb.Append("\\");
+                }
+                sb.Append("\"");
+                backslashes = 0;
+            } else {
+                for (int b = 0; b < backslashes; b = b + 1) {
+                    sb.Append("\\");
+                }
+                backslashes = 0;
+                sb.Append(arg.Substring(i, 1));
+            }
+        }
+        for (int b = 0; b < backslashes * 2; b = b + 1) {
+            sb.Append("\\");
+        }
+        sb.Append("\"");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 将命令行程序路径与安全参数数组构造为规范的 Windows 命令行。
+    /// </summary>
+    static string BuildCommandLine(string exe, List<string> args) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(QuoteArg(exe));
+        if (args != null) {
+            for (int i = 0; i < args.Count; i = i + 1) {
+                sb.Append(" ");
+                sb.Append(QuoteArg(args[i]));
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 直接执行指定的程序及参数数组，不经过 shell，安全无命令注入风险。
+    /// </summary>
+    static int RunSafe(string exe, List<string> args) {
+        #if WINDOWS
+        string cmdline = BuildCommandLine(exe, args);
+        byte[] si = new byte[128];
+        si[0] = 104;
+        byte[] pi = new byte[32];
+        int CREATE_NO_WINDOW = 134217728;
+        nint wcmd = Wide.Of(cmdline);
+        int ok = WinCreateProcess(0, wcmd, 0, 0, 0, CREATE_NO_WINDOW, 0, 0, si, pi);
+        Wide.Free(wcmd);
+        if (ok == 0) { return 0 - 1; }
+        nint hProc = WinHandleAt(pi, 0);
+        nint hThread = WinHandleAt(pi, 8);
+        WinWaitForSingleObject(hProc, 0 - 1);
+        byte[] cb = new byte[8];
+        WinGetExitCodeProcess(hProc, cb);
+        int code = cb[0] + cb[1] * 256 + cb[2] * 65536 + cb[3] * 16777216;
+        WinCloseHandle(hProc);
+        WinCloseHandle(hThread);
+        return code;
+        #else
+        string cmdline = BuildCommandLine(exe, args);
+        return system(cmdline);
+        #endif
+    }
+
+    /// <summary>
+    /// 通过直接进程管道启动程序并捕获 stdout/stderr 输出（不经过 shell，绝对安全）。
+    /// </summary>
+    static ProcessResult CaptureSafe(string exe, List<string> args) {
+        ProcessResult r = new ProcessResult();
+        r.lines = new List<string>();
+        #if WINDOWS
+        byte[] sa = new byte[24];
+        WinPutInt(sa, 0, 24);
+        WinPutInt(sa, 16, 1); // bInheritHandle = TRUE
+        byte[] hRead = new byte[8];
+        byte[] hWrite = new byte[8];
+        if (WinCreatePipe(hRead, hWrite, sa, 0) == 0) {
+            r.exitCode = 0 - 1;
+            return r;
+        }
+        nint hReadPipe = WinHandleAt(hRead, 0);
+        nint hWritePipe = WinHandleAt(hWrite, 0);
+        int HANDLE_FLAG_INHERIT = 1;
+        WinSetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+        byte[] si = new byte[128];
+        si[0] = 104;
+        int STARTF_USESTDHANDLES = 256;
+        WinPutInt(si, 60, STARTF_USESTDHANDLES);
+        WinPutHandle(si, 88, hWritePipe); // hStdOutput
+        WinPutHandle(si, 96, hWritePipe); // hStdError
+
+        byte[] pi = new byte[32];
+        int CREATE_NO_WINDOW = 134217728;
+        string cmdline = BuildCommandLine(exe, args);
+        nint wcmd = Wide.Of(cmdline);
+        int ok = WinCreateProcess(0, wcmd, 0, 0, 1, CREATE_NO_WINDOW, 0, 0, si, pi);
+        Wide.Free(wcmd);
+        WinCloseHandle(hWritePipe); // Close write end in parent so ReadFile hits EOF
+
+        if (ok == 0) {
+            WinCloseHandle(hReadPipe);
+            r.exitCode = 0 - 1;
+            return r;
+        }
+
+        nint hProc = WinHandleAt(pi, 0);
+        nint hThread = WinHandleAt(pi, 8);
+
+        StringBuilder sb = new StringBuilder();
+        byte[] readBuf = new byte[4096];
+        byte[] numRead = new byte[8];
+        for (;;) {
+            int readOk = WinReadFile(hReadPipe, readBuf, 4096, numRead, 0);
+            int bytesRead = numRead[0] + numRead[1] * 256 + numRead[2] * 65536 + numRead[3] * 16777216;
+            if (readOk == 0 || bytesRead <= 0) { break; }
+            sb.Append(readBuf.ToStr(0, bytesRead));
+        }
+        WinCloseHandle(hReadPipe);
+
+        WinWaitForSingleObject(hProc, 0 - 1);
+        byte[] cb = new byte[8];
+        WinGetExitCodeProcess(hProc, cb);
+        r.exitCode = cb[0] + cb[1] * 256 + cb[2] * 65536 + cb[3] * 16777216;
+        WinCloseHandle(hProc);
+        WinCloseHandle(hThread);
+
+        r.lines = SplitLines(sb.ToString());
+        return r;
+        #else
+        string cmdline = BuildCommandLine(exe, args);
+        return Capture(cmdline);
+        #endif
+    }
+
+    /// <summary>
+    /// 异步安全执行并读取完整输出，不占用调用线程，不依赖渲染帧推进。
+    /// </summary>
+    static async Task<ProcessResult> CaptureSafeAsync(string exe, List<string> args) {
+        ProcessResult res = null;
+        Task t = Task.Run(delegate () {
+            res = CaptureSafe(exe, args);
+        });
+        await Task.Yield();
+        t.Wait();
+        return res;
     }
 
     /// <summary>按换行符拆分文本。</summary>

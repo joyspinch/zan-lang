@@ -70,19 +70,20 @@ class Thread {
 /// </summary>
 class Mutex {
     #if WINDOWS
-    // name 以 nint 传 NULL：传 "" 是合法的命名对象名，会让本进程所有
-    // 实例共享同一个内核互斥体（B-ID75g）。
-    [DllImport("kernel32", EntryPoint = "CreateMutexA")]
-    static extern nint WinCreateMutex(nint secAttrs, int initialOwner, nint name);
+    [DllImport("crt", EntryPoint = "calloc")]
+    static extern nint WinCalloc(long count, long size);
 
-    [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
-    static extern int WinWaitForSingleObject(nint handle, int milliseconds);
+    [DllImport("crt", EntryPoint = "free")]
+    static extern void WinFree(nint ptr);
 
-    [DllImport("kernel32", EntryPoint = "ReleaseMutex")]
-    static extern int WinReleaseMutex(nint handle);
+    [DllImport("kernel32", EntryPoint = "InitializeSRWLock")]
+    static extern void WinInitializeSRWLock(nint srwLock);
 
-    [DllImport("kernel32", EntryPoint = "CloseHandle")]
-    static extern int WinCloseHandle(nint handle);
+    [DllImport("kernel32", EntryPoint = "AcquireSRWLockExclusive")]
+    static extern void WinAcquireSRWLockExclusive(nint srwLock);
+
+    [DllImport("kernel32", EntryPoint = "ReleaseSRWLockExclusive")]
+    static extern void WinReleaseSRWLockExclusive(nint srwLock);
     #else
     /* The pthread mutex lives in a 64-byte calloc'd block; the block address
      * travels as an nint so the whole Mutex API shares one handle type with
@@ -107,24 +108,30 @@ class Mutex {
     #endif
 
     #if WINDOWS
-    /// 创建 Win32 互斥锁（匿名——name 传 NULL，非初始占有）。
+    /// 创建轻量用户态 SRWLOCK 互斥锁（无需进入内核态创建内核对象，性能极高且无跨进程命名冲突）。
     static nint Create() {
-        return WinCreateMutex(0, 0, 0);
+        nint lockPtr = WinCalloc(1, 8);
+        WinInitializeSRWLock(lockPtr);
+        return lockPtr;
     }
 
-    /// 无限阻塞加锁（配对 Unlock）。
+    /// 独占加锁（用户态快速路径，配对 Unlock）。
     static void Lock(nint handle) {
-        WinWaitForSingleObject(handle, -1);
+        if (handle == 0) { return; }
+        WinAcquireSRWLockExclusive(handle);
     }
 
-    /// 解锁。
+    /// 释放独占锁。
     static void Unlock(nint handle) {
-        WinReleaseMutex(handle);
+        if (handle == 0) { return; }
+        WinReleaseSRWLockExclusive(handle);
     }
 
-    /// 销毁并关闭句柄。
+    /// 销毁并释放内存。
     static void Destroy(nint handle) {
-        WinCloseHandle(handle);
+        if (handle != 0) {
+            WinFree(handle);
+        }
     }
     #else
     /// 创建 POSIX 互斥锁；句柄是内联存放 pthread_mutex_t 的
@@ -137,18 +144,22 @@ class Mutex {
 
     /// 无限阻塞加锁（配对 Unlock）。
     static void Lock(nint handle) {
+        if (handle == 0) { return; }
         PthreadMutexLock(handle);
     }
 
     /// 解锁。
     static void Unlock(nint handle) {
+        if (handle == 0) { return; }
         PthreadMutexUnlock(handle);
     }
 
     /// 销毁并释放内存。
     static void Destroy(nint handle) {
-        PthreadMutexDestroy(handle);
-        PthreadFree(handle);
+        if (handle != 0) {
+            PthreadMutexDestroy(handle);
+            PthreadFree(handle);
+        }
     }
     #endif
 }
