@@ -166,14 +166,15 @@ static char g_wasm_shared_string[ZAN_TABLE_MAX_STRING + 1];
 
 i64 zan_shared_table_hash(const char *value) {
     /* FNV-1a, same as zan_hash_bytes in rt_sync.c -- callers may persist
-     * hashes, keep the algorithm identical. */
+     * hashes, keep the algorithm identical. Remap 0 to 1 like the native
+     * side: a persisted 0 doubles as "no hash" downstream (B-ID81f). */
     if (!value) return 0;
     uint64_t h = 1469598103934665603ull;
     for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
         h ^= *p;
         h *= 1099511628211ull;
     }
-    return (i64)h;
+    return (i64)(h ? h : 1);
 }
 
 i64 zan_shared_table_create(const char *name, int32_t capacity,
