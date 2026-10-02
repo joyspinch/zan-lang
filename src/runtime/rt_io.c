@@ -4291,6 +4291,10 @@ static volatile LONG    g_co_stop;
 static int              g_co_inited;
 static int              g_co_workers;
 static DWORD            g_co_tls = TLS_OUT_OF_INDEXES;
+/* NOTE: a C11 _Thread_local worker pointer was tried here to shave the
+ * TlsGetValue call off zan_co_poll's fast path -- this toolchain (clang,
+ * mingw target) compiles it to __emutls_get_address, a ~10ns call on every
+ * back-edge, and the whole async suite slowed 5x. The TLS API it is. */
 static zan_co_worker_t  g_wk[ZAN_CO_MAXW];
 
 /* ---- background pool (Task-anywhere liveness) ----
@@ -4732,14 +4736,16 @@ static int co_worker_count(void) {
  * (zan_co_precise_us): the ms wall clock ticks at ~15.6ms on Windows and
  * would stretch the default 2ms quantum to a clock tick. */
 int zan_co_poll(void) {
-    long long q = zan_co_quantum_ms();
-    if (q <= 0) return 0;
     zan_co_worker_t *w = co_self();
-    if (!w || w->slice_start_us <= 0) return 0;
-    /* Gate the clock read: at 2ms quanta and ns-grade iterations a skipped
-     * check costs a few microseconds of overshoot, while an unchecked read on
-     * every back-edge dominated compute loops (see ZAN_POLL_GATE). */
+    if (!w) return 0;
+    /* Gate first, on the worker-local counter alone: 255 of 256 calls must
+     * cost no more than the TLS read plus this RMW -- a quantum global or a
+     * clock read in the fast path multiplied back into every iteration of
+     * compute-bound loops and degraded worse as workers filled the machine
+     * (the quantum ladder experiment, B-ID54). */
     if ((++w->poll_tick & (ZAN_POLL_GATE - 1)) != 0) return 0;
+    long long q = zan_co_quantum_ms();
+    if (q <= 0 || w->slice_start_us <= 0) return 0;
     long long now = zan_co_precise_us();
     return (now - w->slice_start_us >= q * 1000) ? 1 : 0;
 }

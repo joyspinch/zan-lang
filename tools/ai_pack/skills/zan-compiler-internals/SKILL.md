@@ -293,6 +293,17 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
        同样仅在 `(++w->poll_tick & (ZAN_POLL_GATE - 1)) == 0` 时才读时钟；
   2. 误差可控性：在 2ms 量子下，跳过 255 次纳秒级循环至多产生数微秒的量化过冲，
      但换取了紧凑计算循环 6.2 倍的吞吐提升，彻底消除了回边抢占对 CPU 密集循环的性能惩罚。
+  3. **门控必须在一切函数调用之前——包括配置全局读（B-ID54，2026-10-02）**：时钟门控落地后
+     量子阶梯实验（quantum=0/2/10000 × k=1/32）反转了归因：让渡路径本身零开销
+     （q=10000 与 q=2 几乎重合），残余 +86%（k=32）来自 poll 快路径**每次回边的
+     `zan_co_quantum_ms()` 跨编译单元调用**（量子全局读住在 rt_timer.c）。修法=门控前移：
+     先动 worker 本地计数器，255/256 次仅 TLS 读+RMW 即返回，量子/片/时钟全部挪进
+     1/256 命中分支；修后开销入噪声。热路径上的"只是读个全局"若隔着编译单元就是一次真实调用。
+  4. **C11 `_Thread_local` 在本工具链（clang，mingw 目标）= emutls，热路径禁用**：
+     想把 worker 指针换成 thread_local 直读省掉 TlsGetValue 调用，结果 clang 把它编成
+     `__emutls_get_address`（~10ns/次的真调用，obj 内实锤），q=0 探针全套 5× 变慢
+     （793ms→3.9s）。Windows 上 TlsGetValue（读 TEB→TLS 数组，无系统调用）反而是快路径；
+     POSIX 的 pthread_getspecific 同理不可热路径化。换 TLS 机制前后必须重跑热探针对拍绝对值。
 
 ## stdlib 肥边治理：独立类分片 + 槽反转 + 实例方法组注入（A332 肥边③④，2026-09-17）
 
@@ -2814,7 +2825,8 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
 - **交叉目标 zanrt 对象是提交进仓库的预编译二进制，运行时源码每次变更都要重跑 `scripts\build_cross_rt.cmd <zig>`**：新增符号（如 zan_co_quantum_ms）只在原生目标练过，交叉链接才爆 undefined；linux/macos/android/ios/wasm32 全部 zig 可达（OHOS 需 NDK）。重编后 toolchain/ 与 build/<tsub>/（zanc exe 旁）双份都要刷新——zanc 从 exe 旁读对象。
 - **wasm32 产物可以 node 实跑，但 node:wasi 有两个静默坑**（2026-10-01 验证）：① 默认 args 会害 `args_get` 返回 28(NAMETOOLONG)，libc 初始化即 `proc_exit(71)` 且**无任何输出**——构造时必须显式 `args:['prog'], preopens:{}`；② 默认 returnOnExit=false 把 proc_exit 吞成异常、stdout 接死管道，表现为"静默 exit 0"。可用 returnOnExit:true 拿退出码 + 包一层 import 调用日志定位；或自写 Proxy 桩 runner（fd_write 直连 process.stdout；fd_prestat_get 必须返回 8(BADF) 结束 preopen 循环，返回 0 会死循环）。修好后 M:1 内联驱动、poll 发射等"只有 wasm 走的路径"有运行时验证，不再止步 LLVM module verify。
 - **mt 驱动自建重排路径必须带 co_submit 的全套记账（g_co_outstanding+g_co_activity）**（2026-10-02）：步返回重排若绕过 co_submit 直呼 lq_push，帧在环里排队但 outstanding=0——zan_co_sched_run 后台池等待循环只凭 running/outstanding/io/timer 判静默，会提前返回，@main 退出清扫把 RC 静态字段清零，后台 worker 随后读静态即 "null reference: receiver ... is null"（~1/3 复现、exit 0 静默截断，极易误归因到用户代码）。凡是新增"把帧放回队列"的路径，先对 co_submit 抄账。
-- **Windows 停车原语的等待粒度按系统 tick 取整，微秒期限钟必须配 timeBeginPeriod 才可见**（2026-10-02）：期限堆切 µs 后 Delay(50) 仍超期 13ms——GQCS 超时参数不走微秒堆的精度，实睡 63.2ms for 50ms（trace 铁证）；修法是调度器 worker 入口动态加载 winmm timeBeginPeriod(1)（LoadLibrary 零硬导入，控制台链接表没有 winmm；Win10 2004+ 请求进程内生效，不调 EndPeriod 因 worker 池重启使 Begin/End 跨线程配对成竞态）。POSIX 无此问题（poll/sleep 走 CLOCK_MONOTONIC 内核粒度），平台分支用空静态函数让 -O2 消除——linux 侧运行时对象重编后与旧对象字节一致即是"POSIX 零代码生成"的免费强校验。
-- **发布装运（--publish）逐文件拷贝失败绝不能静默，聚合警告要区分原因**（B-ID52，2026-10-02）：驱动装运循环 `zan_copy_file` 失败若静默吞掉，最外层聚合警告统一把原因归结为 "no runtime library found in ... add a manifest"，极具误导性——实测案例：输出目录有残留运行中进程锁持其导入的 DLL（winerr 32 ERROR_SHARING_VIOLATION），库实体存在但目标不可写，用户却被引导去查清单和搜索路径。定式：文件拷贝封装 `zan_copy_file_ex` 带出详细错误码（Windows 下 GetLastError/errno，Unix 下 strerror/errno），逐文件失败立即输出告警定位 src/dst 与真因；聚合警告细分为"无运行时库"与"拷贝操作失败（目标文件可能被占用或权限拒绝）"，让排查秒级定位。
+- **Windows 停车原语的等待粒度按系统 tick 取整，微秒期限钟必须配 timeBeginPeriod 才可见**（2026-10-02 B-ID48）：期限堆切 µs 后 Delay(50) 仍超期 13ms——GQCS 超时参数不走微秒堆的精度，实睡 63.2ms for 50ms（trace 铁证）；修法是调度器 worker 入口动态加载 winmm timeBeginPeriod(1)（LoadLibrary 零硬导入，控制台链接表没有 winmm；Win10 2004+ 请求进程内生效，不调 EndPeriod 因 worker 池重启使 Begin/End 跨线程配对成竞态）。POSIX 无此问题（poll/sleep 走 CLOCK_MONOTONIC 内核粒度），平台分支用空静态函数让 -O2 消除——linux zanrt_io 重编后与旧对象字节一致即是"POSIX 零代码生成"的免费强校验。
 - **循环回边埋点的逐迭代成本会吞掉整个热循环——时钟读必须门控**（2026-10-02）：协作抢占的 zan_co_poll 埋在每个 async 循环回边，原实现每次调用读一次钟（QPC），实测占计算循环逐迭代成本的 ~85%（23ns/iter→3.7ns/iter，k=1 总墙钟 6.2×）；修法=worker 本地计数器每 256 次放行一次读钟（2ms 量子最多超冲 256 次 ns 级迭代，微秒诚实保留），M:1 内联发射体同款（模块级计数全局，单线程无需原子）。教训：凡是"每迭代都执行"的埋点（统计、断言、采样），成本按乘在最大迭代数上估，先门控再上线。
 - **A/B 对拍运行时行为时，换对象必须重编探针**（2026-10-02）：`git stash` 运行时源→重 build→跑**旧探针 exe**（链接的还是改动后对象）当"基线"，得出 5/10 复现的假结论——基线与实验二进制必须都从当前对象重链，否则 A/B 测的是同一个东西。
+- **发布装运（--publish）逐文件拷贝失败绝不能静默，聚合警告要区分原因**（B-ID52，2026-10-02）：驱动装运循环 `zan_copy_file` 失败若静默吞掉，最外层聚合警告统一把原因归结为 "no runtime library found in ... add a manifest"，极具误导性——实测案例：输出目录有残留运行中进程锁持其导入的 DLL（winerr 32 ERROR_SHARING_VIOLATION），库实体存在但目标不可写，用户却被引导去查清单和搜索路径。定式：文件拷贝封装 `zan_copy_file_ex` 带出详细错误码（Windows 下 GetLastError/errno，Unix 下 strerror/errno），逐文件失败立即输出告警定位 src/dst 与真因；聚合警告细分为"无运行时库"与"拷贝操作失败（目标文件可能被占用或权限拒绝）"，让排查秒级定位。
+- **发布装运对 C 原生库间接依赖必须以 DLL 静态导入表为唯一事实依据**（B-ID51，2026-10-02）：跨平台 C 原生客户端（如 PostgreSQL `libpq.dll`）不可想当然假设"某平台不需要某底层库"——必须用 pefile/dumpbin 严格反查 PE 静态导入表（`DIRECTORY_ENTRY_IMPORT`）；实测 Windows 版 `libpq.dll` 硬性依赖 `libcrypto-3-x64.dll` 与 `libssl-3-x64.dll`。若标准库拆分或重构移除了上层原生模块，底层 C 驱动模块必须在其平台 driver 目录内置该套 DLL 并更新 `pq.bundle`，禁止在驱动清单中留下 `@driver/` 空悬引用产生伪告警或目标机缺 DLL 启动崩溃。
