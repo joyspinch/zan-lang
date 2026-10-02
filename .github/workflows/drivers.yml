@@ -21,6 +21,15 @@ on:
       - 'src/runtime/gui_runtime.c'
       - 'src/runtime/gui_runtime.h'
       - 'src/runtime/gui_runtime_mac.m'
+      # The rest of the GUI driver's unity sources. zan_audio.c missing here
+      # is exactly how the committed GUI bundles went stale across the B-ID71
+      # WAV/mixer fixes: the workflow never re-triggered (B-ID86).
+      - 'src/runtime/gui_runtime_text.c'
+      - 'src/runtime/gui_runtime_font.c'
+      - 'src/runtime/gui_runtime_tray.c'
+      - 'src/runtime/gui_runtime_sdl.c'
+      - 'src/runtime/gui_runtime_shims.c'
+      - 'src/runtime/zan_audio.c'
       # The linux static GUI driver archive (libzan_gui.a) is glibc-host-built
       # and merged with distro X11 objects; any of its inputs reruns the job
       # and re-commits both flavor archives.
@@ -40,6 +49,12 @@ on:
       - 'src/runtime/gui_runtime.c'
       - 'src/runtime/gui_runtime.h'
       - 'src/runtime/gui_runtime_mac.m'
+      - 'src/runtime/gui_runtime_text.c'
+      - 'src/runtime/gui_runtime_font.c'
+      - 'src/runtime/gui_runtime_tray.c'
+      - 'src/runtime/gui_runtime_sdl.c'
+      - 'src/runtime/gui_runtime_shims.c'
+      - 'src/runtime/zan_audio.c'
       - 'packages/Zan.Data/**'
       - 'scripts/stage_*'
 
@@ -343,24 +358,34 @@ jobs:
       - name: Build cross runtime objects
         run: bash scripts/build_win_rt.sh "${{ matrix.target }}"
 
-      # The GUI runtime DLL a published Windows program links against. The
-      # committed win-x64 copy comes from the CMake build on a developer's
-      # machine; win-arm64 has no such host, so it is built here from the same
-      # source with the same Win32 backend, and the import library is derived
-      # from the DLL's export table exactly like scripts/build_gui_driver.ps1.
+      # The GUI runtime DLL a published Windows program links against, built
+      # for both legs (B-ID86): win-x64 used to depend on a developer's CMake
+      # build, so a GUI runtime change that nobody rebuilt locally shipped
+      # stale forever. gui_runtime_dwrite.cpp is a required TU (the CMake
+      # zan_gui target links it beside gui_runtime.c) -- after zan_dw_* became
+      # mandatory the old single-file recipe could no longer link at all, and
+      # step-level continue-on-error silently kept the stale DLL.
       - name: Stage GUI driver
-        if: matrix.target == 'win-arm64'
         # Same reason the build step sits ahead of this one: a missing
-        # CLANGARM64 package here must not stop the runtime objects from being
-        # committed below.
+        # CLANGARM64 package here must not stop the runtime objects from
+        # being committed below.
         continue-on-error: true
         run: |
           set -eux
           DEST="packages/Zan.Gui/src/Gui/drivers/${{ matrix.target }}"
           mkdir -p "$DEST"
-          cc -O2 -shared -o "$DEST/zan_gui.dll" src/runtime/gui_runtime.c \
-            -Wl,--out-implib,"$DEST/libzan_gui.dll.a" -static-libgcc \
+          # C first, then the C++ DirectWrite TU, exactly like the CMake
+          # zan_gui target (gui_runtime.c compiled as C++; unity-included
+          # COM headers misparse). -static-libstdc++ keeps the DLL's import
+          # table system-only (USER32/GDI32/ole32/KERNEL32).
+          cc -O2 -c src/runtime/gui_runtime.c -o zan_gui_core.o
+          c++ -O2 -fno-exceptions -fno-rtti -c src/runtime/gui_runtime_dwrite.cpp \
+            -o zan_gui_dwrite.o
+          c++ -O2 -shared -o "$DEST/zan_gui.dll" zan_gui_core.o zan_gui_dwrite.o \
+            -Wl,--out-implib,"$DEST/libzan_gui.dll.a" \
+            -static-libgcc -static-libstdc++ \
             -luser32 -lgdi32 -ldwmapi -lshcore -limm32 -lole32 -lrpcrt4
+          rm -f zan_gui_core.o zan_gui_dwrite.o
           # WebView2Loader: the WebView widget resolves it at run time, so the
           # matching arch has to travel with the program.
           curl -fsSL -o wv2.zip \
@@ -394,9 +419,9 @@ jobs:
           $sub = 'toolchain/${{ matrix.target }}'
           git add -f "$sub/zanrt_io.o" "$sub/zanrt_io_mt.o" "$sub/zanrt_sync.o" `
                      "$sub/zanrt_file.o" "$sub/zanrt_timer.o"
-          if ('${{ matrix.target }}' -eq 'win-arm64' -and
-              (Test-Path 'packages/Zan.Gui/src/Gui/drivers/win-arm64')) {
-            git add 'packages/Zan.Gui/src/Gui/drivers/win-arm64'
+          # Both legs build the GUI DLL (B-ID86); commit whichever staged.
+          if (Test-Path 'packages/Zan.Gui/src/Gui/drivers/${{ matrix.target }}') {
+            git add 'packages/Zan.Gui/src/Gui/drivers/${{ matrix.target }}'
           }
           git diff --cached --quiet
           if ($LASTEXITCODE -eq 0) {
