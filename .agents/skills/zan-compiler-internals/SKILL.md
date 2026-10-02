@@ -546,6 +546,15 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   3. 落地重构：设置 1GB（1,073,741,824 字节）绝对安全防线，倍增超过 512MB 时平滑钳制到 1GB，`EnsureRoom` 严格校验 `extra >= 0` 与 `this.length > 1GB - extra`，杜绝一切整型溢出攻击。
 - **回归锁定**：`ctest -R "bytebuffer"` 12 项全套孪生测试 100% 全部通过。
 
+## WebSocket 帧缓冲扩容边界：maxLen 上限约束与整型回绕防线（WsReader）
+
+- **病灶**：`WsReader.Ensure(int need)` 负责为分片或大帧累积缓冲区扩容，原先采用 `int nc = this.cap * 2; while (nc < need) { nc = nc * 2; }`；
+- **危害**：
+  1. `WsReader` 内部虽然为单帧设定了 `maxLen`（默认 16MB）上限，但在 `Ensure` 扩容方法中并未将 `maxCap = this.maxLen + 65536` 作为硬上限锚定，若上游传入恶意超大 `need`，`nc` 会持续翻倍直至突破整型上限并回绕为负数；
+  2. 若 `nc` 无界增长，恶意客户端可通过慢滴发送超大非闭合帧撑爆堆内存触发 OOM；
+  3. 落地重构：`Ensure` 将目标请求与扩容容量统一限制在 `maxCap` 与 1GB 整型安全边界以内，超过 512MB 阶段停止倍增平滑钳制，有效抵御畸形超大帧探测攻击。
+- **回归锁定**：`ctest -R "websocket_fragment_cost"` 4 项全套孪生测试（conformance/determinism/leakcheck/arcguard）100% 全部通过。
+
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
 - **症状**：浏览器 `WebAssembly.instantiate` 报 `Compiling function #N:"X"
