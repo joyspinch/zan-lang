@@ -606,6 +606,15 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   3. 落地重构：将指数 `e` 钳制在 IEEE 754 极值区间 `[-350, 350]` 内，常规浮点数计算精度位级不变，超限极值浮点仅需十余次常数级缩放即可收敛至 `Infinity` 或 `0.0`，从根本上根除 CPU 拒绝服务漏洞。
 - **回归锁定**：`ctest -R "json_number_precision|json_tape_roundtrip|json_depth|json_errors"` 16 项孪生测试 100% 全部通过。
 
+## HTTP 连接循环正文定界防线：Content-Length 与头部长度加法防溢出
+
+- **病灶**：在 `HttpServer.ServeFramedInner` 中，原先针对请求总长度限额的判定采用 `if (headerEnd + bodyLen > maxRequestBytes) { reject = 413; break; }`；
+- **危害**：
+  1. 若攻击者构造恶意报文，传入接近 32 位有符号整数上限的超大 `Content-Length`（如 `2147483500`），`headerEnd + bodyLen` 在 32 位有符号整数加法中将直接产生整型正溢出回绕为负数（如 `-2147483648`）；
+  2. 负数恒小于 `maxRequestBytes`，导致限额判定被直接穿透，进而触发后续向底层缓冲区无节制追加数据引发 OOM 或协议混乱；
+  3. 落地重构：改用减法防溢出安全比较 `if (bodyLen > maxRequestBytes - headerEnd) { reject = 413; break; }`，彻底杜绝加法回绕溢出漏洞。
+- **回归锁定**：`ctest -R "http_framing"` 4 项全套孪生测试（conformance/determinism/leakcheck/arcguard）100% 全部通过。
+
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
 - **症状**：浏览器 `WebAssembly.instantiate` 报 `Compiling function #N:"X"
