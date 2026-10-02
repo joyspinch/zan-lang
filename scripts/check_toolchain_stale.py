@@ -117,14 +117,14 @@ ARTIFACTS = [
     ("toolchain/macos/x64/zan_embed_api.o", EMBED, "runtime"),
     ("toolchain/macos/x64/zan_inflate.o", INFLATE, "runtime"),
     ("toolchain/ios/arm64/zanrt_gui.o", RT_GUI_MAC, "runtime"),
-    # The other five ios objects came from the ios pipeline commit (3e284401),
-    # built off-host with no committed recipe -- zig's ios target ships no libc
-    # headers on Windows, so no local builder exists; report staleness only.
-    ("toolchain/ios/arm64/zanrt_io.o", RT_IO, "manual"),
-    ("toolchain/ios/arm64/zanrt_io_mt.o", RT_IO, "manual"),
-    ("toolchain/ios/arm64/zanrt_sync.o", RT_SYNC, "manual"),
-    ("toolchain/ios/arm64/zanrt_file.o", RT_FILE, "manual"),
-    ("toolchain/ios/arm64/zanrt_timer.o", RT_TIMER, "manual"),
+    # The five companions rebuild locally via zig's ios target plus zig's
+    # bundled Darwin headers (-I lib/libc/include/any-macos-any -- the ios
+    # os-tag does not wire them the way macos does; 2026-10-02 recipe).
+    ("toolchain/ios/arm64/zanrt_io.o", RT_IO, "runtime"),
+    ("toolchain/ios/arm64/zanrt_io_mt.o", RT_IO, "runtime"),
+    ("toolchain/ios/arm64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/ios/arm64/zanrt_file.o", RT_FILE, "runtime"),
+    ("toolchain/ios/arm64/zanrt_timer.o", RT_TIMER, "runtime"),
     ("toolchain/ios/libSystem.tbd", ZIG_BUNDLED, "manual"),
     ("toolchain/wasm32/zanrt_wasm.o", RT_WASM, "runtime"),
     ("toolchain/wasm32/zanrt_file.o", RT_FILE, "runtime"),
@@ -338,10 +338,10 @@ def _find_ndk():
 
 def rebuild_cmd(artifact, zig, ndk):
     """The exact compile that (re)produces `artifact` locally, or None when
-    this machine has no builder for it (GUI drivers and the ios objects have
-    off-host builders; win-* needs the matching MSYS2 arch clang of
-    build_win_rt.sh; the ohos stub .so pair is NDK-built by hand). Mirrors
-    do_rebuild / build_cross_rt.cmd flag for flag."""
+    this machine has no builder for it (GUI drivers have off-host builders;
+    win-* is CI-built with the matching MSYS2 arch clang of build_win_rt.sh;
+    the ohos stub .so pair is NDK-built by hand). Mirrors do_rebuild /
+    build_cross_rt.cmd flag for flag."""
     rt = "src/runtime"
     d, name = os.path.split(artifact.replace("\\", "/"))
     if d.startswith("toolchain/"):
@@ -437,9 +437,32 @@ def rebuild_cmd(artifact, zig, ndk):
             return None  # stub libEGL.so/libGLESv3.so: NDK-built by hand
         return ([zig, "cc", "-target", f"{arch}-linux-musl", "-D__OHOS__",
                  "-g0", "-fPIC", "-O2"] + table[name])
+    elif d.startswith("ios/"):
+        # zig's ios os-tag wires no libc include dir; the Darwin headers ship
+        # as any-macos-any, so hand them in (-I). Same flags as the macos
+        # block, target aarch64-ios.14.0 (matches LC_BUILD_VERSION).
+        if not zig:
+            return None
+        zroot = os.path.dirname(zig)
+        base = [zig, "cc", "-target", "aarch64-ios.14.0",
+                "-I", os.path.join(zroot, "lib", "libc", "include", "any-macos-any"),
+                "-g0", "-fPIC", "-I", rt, "-O2"]
+        if name == "zanrt_io.o":
+            return base + ["-DZAN_IO_STACKLESS_ONLY", "-c", f"{rt}/rt_io.c"]
+        if name == "zanrt_io_mt.o":
+            return base + ["-DZAN_IO_STACKLESS_ONLY", "-DZAN_CO_DRIVER",
+                           "-c", f"{rt}/rt_io.c"]
+        if name == "zanrt_gui.o":
+            # gui_compat_mac.c is self-contained -- no libc headers needed.
+            return ([zig, "cc", "-target", "aarch64-ios.14.0", "-g0",
+                     "-std=c11", "-fPIC", "-I", rt, "-O2",
+                     "-c", f"{rt}/gui_compat_mac.c"])
+        return base + c11 + ["-c", f"{rt}/{src}"]
     else:
-        # ios/*: built off-host by the ios pipeline, no committed recipe.
-        # win-*: needs the matching MSYS2 arch clang (build_win_rt.sh).
+        # win-*: CI builds these with the matching MSYS2 arch clang
+        # (build_win_rt.sh, drivers.yml). zig -windows-gnu produces
+        # ABI-identical objects with a different byte flavor, so no local
+        # byte-verifying builder is assumed here.
         return None
     # The embedded-resource pair for linux/macos: names the zanrt_*→rt_*
     # mapping accidentally gets right, but whose flags the generic tail gets
@@ -580,6 +603,18 @@ def do_rebuild():
         # its flag table here (same call shape as build_cross_rt.cmd's fallback).
         print("Building ohos (via scripts/build_ohos_rt_zig.sh)...")
         subprocess.run(["bash", "scripts/build_ohos_rt_zig.sh", zig.replace("\\", "/")], check=True)
+
+        # ios: the ios os-tag wires no libc headers -- hand in zig's bundled
+        # Darwin set (any-macos-any). The GUI shim keeps its off-host flavor.
+        zroot = os.path.dirname(zig)
+        zhdr = os.path.join(zroot, "lib", "libc", "include", "any-macos-any")
+        os.makedirs("toolchain/ios/arm64", exist_ok=True)
+        print("Building ios/arm64...")
+        subprocess.run([zig, "cc", "-target", "aarch64-ios.14.0", "-I", zhdr, "-g0", "-DZAN_IO_STACKLESS_ONLY", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_io.c", "-o", "toolchain/ios/arm64/zanrt_io.o"], check=True)
+        subprocess.run([zig, "cc", "-target", "aarch64-ios.14.0", "-I", zhdr, "-g0", "-DZAN_IO_STACKLESS_ONLY", "-DZAN_CO_DRIVER", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_io.c", "-o", "toolchain/ios/arm64/zanrt_io_mt.o"], check=True)
+        for src in ["rt_sync.c", "rt_file.c", "rt_timer.c"]:
+            obj = "zanrt_" + src[3:-2] + ".o"
+            subprocess.run([zig, "cc", "-target", "aarch64-ios.14.0", "-I", zhdr, "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/{src}", "-o", f"toolchain/ios/arm64/{obj}"], check=True)
 
     if ndk:
         clang = os.path.join(ndk, r"toolchains\llvm\prebuilt\windows-x86_64\bin\clang.exe")

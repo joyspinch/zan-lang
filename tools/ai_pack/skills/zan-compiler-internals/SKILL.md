@@ -737,11 +737,20 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   和「真缺符号」（macos timer 0 个 zan_join_*=重刷批次只刷部分目标漏网）混
   在一起；常驻告警没人分流就退化成壁纸——macos io/sync/timer 的陈旧报告
   挂了很久无人处理，2026-10-02 全量入册+字节裁定才定性（同日修掉 macos 八
-  对象、钉出 ios/win 欠账）。手搓重建或补 rebuild_cmd 都必须逐字镜像
-  .cmd 旗标，三个已踩坑：linux/macos 的 zanrt_io/io_mt 编 rt_io.c 用默认
-  gnu 方言（-std=c11 会藏掉 sigemptyset/clock_gettime，字节全变）、io_mt
-  只加 -DZAN_CO_DRIVER（没有 rt_io_mt.c 这个文件）、wasm32 对象一律无
-  -fPIC。
+  对象、ios 六对象、win 双架构十对象）。手搓重建或补 rebuild_cmd 都必须
+  逐字镜像旗标，三个已踩坑：linux/macos 的 zanrt_io/io_mt 编 rt_io.c 用
+  默认 gnu 方言（-std=c11 会藏掉 sigemptyset/clock_gettime，字节全变）、
+  io_mt 只加 -DZAN_CO_DRIVER（没有 rt_io_mt.c 这个文件）、wasm32 对象一律
+  无 -fPIC。
+- **zig 交叉目标的 libc 头按 os-tag 接线，ios 要手动喂**：macos 目标自动接
+  lib/libc/include/any-macos-any（Darwin 头集），ios 是独立 os-tag 什么都不
+  接——报 stdio.h not found 不是没环境，把 any-macos-any -I 进去即可
+  （target 写 aarch64-ios.14.0 与对象 LC_BUILD_VERSION 对齐）。同理 win 系
+  可 zig -windows-gnu 本地造 ABI 等价对象（CI 的 MSYS2 clang 字节风味不同，
+  toolchain 的 win 对象因此保持 report-only 不做本地字节验证）。「本机没
+  这个环境」的结论前先做对象指纹考古：llvm-readobj/nm 看 producer 串、
+  git log 看提交时区（github-actions[bot]/-0700=CI 产物，+0800=本机产物），
+  别把 CI 产物当成本机能力边界。
 - toolchain/** 的 *.o 命中 gitignore，提交要 `git add -f`。
 
 ## win-arm64 交叉 rt：setjmp 降层与 rt_crash 架构门

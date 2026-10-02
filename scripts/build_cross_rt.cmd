@@ -53,10 +53,19 @@ for %%P in (arm64:aarch64 x64:x86_64) do (
   )
 )
 
-rem iOS
+rem iOS. The ios os-tag wires no libc headers (unlike macos), so the runtime
+rem objects hand in zig's bundled Darwin set (any-macos-any); the .14.0 suffix
+rem matches the objects' LC_BUILD_VERSION. gui_compat_mac.c is self-contained.
 if not exist toolchain\ios\arm64 mkdir toolchain\ios\arm64
-"%ZIG%" cc -target aarch64-ios -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\gui_compat_mac.c -o toolchain\ios\arm64\zanrt_gui.o || exit /b 1
-echo built toolchain\ios\arm64\zanrt_gui.o
+"%ZIG%" cc -target aarch64-ios.14.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\gui_compat_mac.c -o toolchain\ios\arm64\zanrt_gui.o || exit /b 1
+for %%Z in ("%ZIG%") do set ZROOT=%%~dpZ
+set IOSHDR=%ZROOT%lib\libc\include\any-macos-any
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -c %RT%\rt_io.c    -o toolchain\ios\arm64\zanrt_io.o    || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -fPIC -I %RT% -O2 -c %RT%\rt_io.c -o toolchain\ios\arm64\zanrt_io_mt.o || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\ios\arm64\zanrt_sync.o  || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\ios\arm64\zanrt_file.o  || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\ios\arm64\zanrt_timer.o || exit /b 1
+echo built toolchain\ios\arm64
 
 rem wasm32 (WASI): single-threaded, so no rt_io / rt_sync -- the wasm link
 rem rejects those programs before the object would be needed (see main.c's
