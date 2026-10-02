@@ -4525,6 +4525,7 @@ static int lq_pop(zan_co_worker_t *w, zan_co_task *out) {
  * victim's head is touched once instead of per task). */
 static int lq_steal(zan_co_worker_t *v, zan_co_worker_t *w, zan_co_task *out) {
     zan_co_task tmp[ZAN_LQ_CAP / 2];
+    int attempts = 0;
     for (;;) {
         long long h = __atomic_load_n(&v->head, __ATOMIC_ACQUIRE);
         long long t = __atomic_load_n(&v->tail, __ATOMIC_ACQUIRE);
@@ -4535,8 +4536,18 @@ static int lq_steal(zan_co_worker_t *v, zan_co_worker_t *w, zan_co_task *out) {
         for (long long i = 0; i < n; i++)
             tmp[i] = v->buf[(unsigned long long)(h + i) & ZAN_LQ_MASK];
         if (!__atomic_compare_exchange_n(&v->head, &h, h + n, 0,
-                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            attempts++;
+            if (attempts > 16) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+                _mm_pause();
+#endif
+            }
+            if (attempts > 64) {
+                return 0; /* back off under severe contention to prevent stealing starvation */
+            }
             continue;
+        }
         *out = tmp[0];
         for (long long i = 1; i < n; i++) lq_push(w, tmp[i]);
         return 1;
