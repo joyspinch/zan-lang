@@ -146,6 +146,15 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   数组比"逻辑数据"多 1 个收尾 0 字节（既有契约，bytebuffer_bounds 金样钉死）。
   拿 `.Length` 当数据长度喂底层（实例：RSA hex 密钥按字节数传参）会多传一个 0
   而被拒或错算；真实长度用写入/转换时记下的 n 传递，不反查数组。
+- **语言事实第十则（2026-10-04 异步调度与高并发进程/同步原语重构踩出）**：
+  ① `Task.Run(Action/delegate)` 下发给 Worker Pool 时必须生成独立堆帧
+  （TaskActionFrame）并绑定 `zan_co_ready`，不能在当前调用线程同步 invoke；
+  ② 跨线程运行的委托闭包记录必须通过 `emit_closure_retain/release` 保活，
+  完成后写入 DONE 原子状态并唤醒 awaiter，不能直接返回 0；
+  ③ 进程启动严禁直接调用系统的 `popen/system` 拼接裸命令，必须提供直接调用
+  `CreateProcessW` / `execve` 并进行参数转义的 argv[] 机制，以杜绝命令注入；
+  ④ 同步原语 Mutex 应优先使用用户态轻量化 `SRWLOCK` / `futex`，避免进入内核态
+  创建具名或匿名内核互斥体造成的调度与争用开销。
 
 - **文本格式包的 BOM 防线（2026-10-01 Yaml/Toml/Xml 跨平台审计踩出）**：
   `File.ReadAllText` 已在文件层剥 UTF-8 BOM，但 `Parse(src)` 收网络报文/
