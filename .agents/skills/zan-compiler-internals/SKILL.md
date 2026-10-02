@@ -537,6 +537,15 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   4. 落地防御：严格钳制 `blen <= 536870912`（512MB），数组元素数 `count <= 1048576`（100 万），超限立即返回 protocol error 并安全切断连接，从源头封堵 OOM 慢滴与超大畸形包攻击。
 - **回归锁定**：`ctest -R "redis_client|redis_pool|redis_tls"` 12 项全套孪生测试 100% 全部通过。
 
+## 堆外缓冲区扩容防溢出：1GB 硬上限与倍增步长回绕防护（ByteBuffer）
+
+- **病灶**：`ByteBuffer.EnsureCapacity(int cap)` 在请求扩容时，内部倍增步长采用 `int c = this.capacity * 2; while (c < cap) { c = c * 2; }`；`EnsureRoom(int extra)` 直接执行 `this.EnsureCapacity(this.length + extra)`。
+- **危害**：
+  1. 32 位有符号整型上限为 $2^{31}-1 \approx 2.14\text{GB}$；当缓冲区接收大数据量或突发大流导致容量接近 1GB 时，下一次 `c = c * 2` 会发生整型有符号回绕变成负数，导致死循环或向下溢出；
+  2. 若 `extra` 较大，`this.length + extra` 会在加法阶段溢出为负数，绕过 `cap > this.capacity` 检查，导致向非法/越界指针写入；
+  3. 落地重构：设置 1GB（1,073,741,824 字节）绝对安全防线，倍增超过 512MB 时平滑钳制到 1GB，`EnsureRoom` 严格校验 `extra >= 0` 与 `this.length > 1GB - extra`，杜绝一切整型溢出攻击。
+- **回归锁定**：`ctest -R "bytebuffer"` 12 项全套孪生测试 100% 全部通过。
+
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
 - **症状**：浏览器 `WebAssembly.instantiate` 报 `Compiling function #N:"X"
