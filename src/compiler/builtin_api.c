@@ -323,6 +323,10 @@ static const zan_builtin_member_t members_task[] = {
     { "IsDone", 'M', "int IsDone(long handle)" },
     { "Cancel", 'M', "void Cancel(long handle)" },
     { "IsCancellationRequested", 'M', "int IsCancellationRequested()" },
+    { "JoinNew",   'M', "long JoinNew(int npairs, int any)" },
+    { "JoinBind",  'M', "int JoinBind(long entry, long handle, int idx)" },
+    { "JoinWait",  'M', "await int JoinWait(long entry)" },
+    { "JoinCancel",'M', "void JoinCancel(long entry)" },
 };
 
 static const zan_builtin_member_t members_pixelops[] = {

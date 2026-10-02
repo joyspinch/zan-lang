@@ -14,26 +14,64 @@ namespace System;
 ///   int n = await Task.WhenAll(hs);      // 全部完成后返回句柄个数
 ///   int i = await Task.WhenAny(hs);      // 最先完成者的下标
 ///
-/// 完成性由 <c>Task.IsDone(handle)</c> 观察（协程完成或被取消后为真），
-/// 等待期间用 <c>Task.Delay</c> 让出：汇合方挂起到 reactor，不占线程、
-/// 也不忙等。轮询间隔从 1 毫秒起指数退避到 4 毫秒——短任务几乎立即
-/// 汇合，长任务不会每毫秒都唤醒一次。
+/// 快路径是事件驱动（B-ID56）：<c>Task.JoinNew/JoinBind/JoinWait</c> 把
+/// 每个句柄登记进运行时的 join 表，汇合方挂起（Delay 形，不占线程也不
+/// 轮询）；任一扇出协程被回收（untrack）时由完成路径精确唤醒——真正的
+/// "完成即就绪"，唤醒延迟与批次规模无关。轮询实现保留为
+/// <see cref="WhenAllPoll"/> / <see cref="WhenAnyPoll"/>：事件路径不可用
+/// （宿主缺 ready 钩子或不在协程内）时的回退，行为与旧版一致。
 /// </summary>
 class TaskJoin {
-    /// 轮询退避上限（毫秒）。
+    /// 轮询退避上限（毫秒）——仅 Poll 回退路径使用。
     static int MAX_BACKOFF = 4;
 
-    /// 汇合前先用 Task.Yield 轮询的圈数上限。一次让渡 = 重排到就绪环尾，
-    /// 排到队首时本批任务恰好又跑过了一轮——轮询节奏与排水节奏天然同步，
-    /// 快批次（亚毫秒扇出，服务端常态）在 1-2 圈内即完成汇合，不再吃
-    /// Delay 的 1-4ms 睡眠窗口。预算耗尽说明批次是长任务（IO/定时器），
-    /// 让渡会变成空转烧核，此时退回 Delay 指数退避。
+    /// Poll 回退路径：汇合前先用 Task.Yield 轮询的圈数上限。一次让渡 =
+    /// 重排到就绪环尾，排到队首时本批任务恰好又跑过了一轮——轮询节奏与
+    /// 排水节奏天然同步，快批次（亚毫秒扇出，服务端常态）在 1-2 圈内即
+    /// 完成汇合，不再吃 Delay 的 1-4ms 睡眠窗口。预算耗尽说明批次是长
+    /// 任务（IO/定时器），让渡会变成空转烧核，此时退回 Delay 指数退避。
     static int YIELD_SPINS = 8;
 
     /// <summary>挂起直到 `handles` 中每个句柄都已完成（或被取消），
     /// 返回汇合的句柄个数。空列表立即返回 0，已完成的批次
     /// 不会挂起。</summary>
     static async int WhenAll(List<long> handles) {
+        int n = handles.Count;
+        if (n == 0) { return 0; }
+        long entry = Task.JoinNew(n, 0);
+        for (int i = 0; i < n; i = i + 1) {
+            Task.JoinBind(entry, handles[i], i);
+        }
+        int r = await Task.JoinWait(entry);
+        Task.JoinCancel(entry);
+        if (r == 2) { return await TaskJoin.WhenAllPoll(handles); }
+        return n;
+    }
+
+    /// <summary>挂起直到 `handles` 中任一句柄完成，返回其下标；
+    /// 同一轮里多个都已完成时返回最小下标。空列表返回 -1。
+    /// 其余协程继续运行——需要一起收尾就先
+    /// <see cref="CancelAll"/> 再 <see cref="WhenAll"/>。</summary>
+    static async int WhenAny(List<long> handles) {
+        int n = handles.Count;
+        if (n == 0) { return -1; }
+        long entry = Task.JoinNew(n, 1);
+        for (int i = 0; i < n; i = i + 1) {
+            Task.JoinBind(entry, handles[i], i);
+        }
+        int r = await Task.JoinWait(entry);
+        Task.JoinCancel(entry);
+        if (r == 2) { return await TaskJoin.WhenAnyPoll(handles); }
+        for (int i = 0; i < n; i = i + 1) {
+            if (Task.IsDone(handles[i]) != 0) { return i; }
+        }
+        return -1;
+    }
+
+    /// <summary>轮询回退版 <see cref="WhenAll"/>：让渡/退避混合轮询。
+    /// 仅当事件路径不可用（无 ready 钩子/非协程上下文）时由
+    /// <see cref="WhenAll"/> 自动退到此处。</summary>
+    static async int WhenAllPoll(List<long> handles) {
         int n = handles.Count;
         if (n == 0) { return 0; }
         int spins = 0;
@@ -55,12 +93,9 @@ class TaskJoin {
         return n;
     }
 
-    /// <summary>挂起直到 `handles` 中任一句柄完成，返回其下标；
-    /// 同一轮里多个都已完成时返回最小下标。空列表返回 -1。
-    /// 其余协程继续运行——需要一起收尾就先
-    /// <see cref="CancelAll"/> 再 <see cref="WhenAll"/>。
-    /// 让渡/退避混合策略同 <see cref="WhenAll"/>。</summary>
-    static async int WhenAny(List<long> handles) {
+    /// <summary>轮询回退版 <see cref="WhenAny"/>。让渡/退避混合策略同
+    /// <see cref="WhenAllPoll"/>。</summary>
+    static async int WhenAnyPoll(List<long> handles) {
         int n = handles.Count;
         if (n == 0) { return -1; }
         int spins = 0;

@@ -1241,9 +1241,20 @@ void zan_co_live_add(void *frame) {
     live_unlock();
 }
 
+static void join_on_untrack(void *frame, void **out_joiner,
+                            zan_timer_step_t *out_step);
+
 void zan_co_live_del(void *frame) {
     if (!frame || !g_colive_cap) return;
+    /* B-ID56: untrack is the one universal pre-free point every detached
+     * frame passes (reap fn -> untrack -> cancel_delay -> frame_free), so it
+     * is the completion-notification point for event-driven joins. The hook
+     * runs under live_lock; the ready call fires only after unlock so the
+     * joiner never wakes while we still hold the lock. */
+    void *fire_joiner = NULL;
+    zan_timer_step_t fire_step = NULL;
     live_lock();
+    join_on_untrack(frame, &fire_joiner, &fire_step);
     size_t mask = g_colive_cap - 1;
     size_t i = live_hash(frame) & mask;
     for (;;) {
@@ -1258,6 +1269,7 @@ void zan_co_live_del(void *frame) {
         i = (i + 1) & mask;
     }
     live_unlock();
+    if (fire_joiner && fire_step && g_ready_hook) g_ready_hook(fire_joiner, fire_step);
 }
 
 int zan_co_live_count(void) {
@@ -1268,18 +1280,23 @@ int zan_co_live_count(void) {
     return n;
 }
 
+/* lock-free core: caller must hold live_lock (join paths re-check liveness
+ * while already holding it) */
+static int live_has_nolock(void *frame) {
+    size_t mask = g_colive_cap - 1;
+    size_t i = live_hash(frame) & mask;
+    for (;;) {
+        void *cur = g_colive_slots[i];
+        if (!cur) return 0;
+        if (cur == frame) return 1;
+        i = (i + 1) & mask;
+    }
+}
+
 int zan_co_live_has(void *frame) {
     if (!frame || !g_colive_cap) return 0;
     live_lock();
-    size_t mask = g_colive_cap - 1;
-    size_t i = live_hash(frame) & mask;
-    int found = 0;
-    for (;;) {
-        void *cur = g_colive_slots[i];
-        if (!cur) break;
-        if (cur == frame) { found = 1; break; }
-        i = (i + 1) & mask;
-    }
+    int found = live_has_nolock(frame);
     live_unlock();
     return found;
 }
@@ -1290,6 +1307,223 @@ void zan_co_live_reset(void) {
     g_colive_slots = NULL;
     g_colive_cap = g_colive_live = g_colive_dead = 0;
     live_unlock();
+}
+
+/* ---- event-driven join (Task.WhenAll / Task.WhenAny fast path, B-ID56) ----
+ * Replaces the yield-hybrid polling of WhenAll/WhenAny with a suspension that
+ * is readied by the completion itself. Design constraints that shaped it:
+ *
+ *  - A spawn ("fire-and-forget") frame is born with awaiter=self and
+ *    awaiter_step=reap_fn (emit_detach_async_call): those two frame slots
+ *    BELONG to the spawn/reap lifecycle and may not be borrowed. The old
+ *    CAS-on-awaiter join design could never match on them.
+ *  - The one universal point every detached frame passes before free is the
+ *    untrack call inside the reap fn (untrack -> cancel_delay -> frame_free),
+ *    so completion notification hooks there (see zan_co_live_del).
+ *  - The joiner suspends with the Delay shape: the runtime keeps
+ *    (frame, step) and readies it later; the suspend path must NOT self-ready
+ *    (a stray self-ready means an immediate empty resume and a broken wait).
+ *
+ * Bookkeeping is a global open-addressed map frame -> pair behind the live
+ * registry's spin lock (same lock, no new synchronization). A pair records
+ * {frame, owner, idx, done}; bind inserts it only while the frame is live,
+ * NOT done, and not already bound — the frame is never dereferenced beyond
+ * reading its done flag, and cancel/untrack remove by exact pointer + value
+ * match, so a recycled address can never be touched. Firing goes through
+ * g_ready_hook AFTER live_unlock (set by both drivers: the mt scheduler's
+ * init and the M:1 timer loop via zan_timer_set_ready_hook). */
+
+#define JOIN_OFF_DONE (12 + (int)sizeof(void *)) /* co_header: done field */
+
+typedef struct zan_join_pair {
+    void            *frame;
+    struct zan_join *owner;
+    int              idx;
+    int              done;    /* set by the untrack hook */
+} zan_join_pair_t;
+
+typedef struct zan_join {
+    int              any;     /* fire on first completion (WhenAny)        */
+    int              fired;   /* exactly one fire per entry                */
+    void            *joiner;  /* suspended WhenAll/WhenAny frame           */
+    zan_timer_step_t joiner_step;
+    int              npairs;  /* bound pairs, filled during the bind phase */
+    int              winner;  /* any mode: first completed pair's index    */
+    zan_join_pair_t  pairs[]; /* flexible array, one allocation            */
+} zan_join_t;
+
+static zan_join_pair_t **g_joinmap_slots;
+static size_t   g_joinmap_cap;   /* power of two, 0 until first insert */
+static size_t   g_joinmap_live;
+static size_t   g_joinmap_dead;
+#define JOINMAP_TOMB ((zan_join_pair_t *)(uintptr_t)1)
+
+static void joinmap_rehash(size_t ncap) {
+    zan_join_pair_t **nslots = calloc(ncap, sizeof(*nslots));
+    if (!nslots) { zan_rt_fatal("oom", "joinmap: rehash failed"); return; }
+    size_t nmask = ncap - 1;
+    for (size_t i = 0; i < g_joinmap_cap; i++) {
+        zan_join_pair_t *cur = g_joinmap_slots[i];
+        if (!cur || cur == JOINMAP_TOMB) continue;
+        size_t j = live_hash(cur->frame) & nmask;
+        while (nslots[j]) j = (j + 1) & nmask;
+        nslots[j] = cur;
+    }
+    free(g_joinmap_slots);
+    g_joinmap_slots = nslots;
+    g_joinmap_cap = ncap;
+    g_joinmap_dead = 0;
+}
+
+static void joinmap_put(zan_join_pair_t *pr) {
+    if ((g_joinmap_live + g_joinmap_dead + 1) * 4 >= g_joinmap_cap * 3)
+        joinmap_rehash(g_joinmap_cap ? g_joinmap_cap * 2 : 64);
+    size_t mask = g_joinmap_cap - 1;
+    size_t i = live_hash(pr->frame) & mask;
+    for (;;) {
+        zan_join_pair_t *cur = g_joinmap_slots[i];
+        if (!cur || cur == JOINMAP_TOMB) {
+            if (cur == JOINMAP_TOMB) g_joinmap_dead--;
+            g_joinmap_slots[i] = pr;
+            g_joinmap_live++;
+            return;
+        }
+        if (cur != JOINMAP_TOMB && cur->frame == pr->frame) return; /* already bound */
+        i = (i + 1) & mask;
+    }
+}
+
+static zan_join_pair_t *joinmap_get(void *frame) {
+    if (!g_joinmap_cap) return NULL;
+    size_t mask = g_joinmap_cap - 1;
+    size_t i = live_hash(frame) & mask;
+    for (;;) {
+        zan_join_pair_t *cur = g_joinmap_slots[i];
+        if (!cur) return NULL;
+        if (cur != JOINMAP_TOMB && cur->frame == frame) return cur;
+        i = (i + 1) & mask;
+    }
+}
+
+/* remove by exact pointer whose frame still matches: a recycled address that
+ * re-bound to the map must never be evicted by a stale entry's removal */
+static void joinmap_remove(void *frame, zan_join_pair_t *pr) {
+    if (!g_joinmap_cap) return;
+    size_t mask = g_joinmap_cap - 1;
+    size_t i = live_hash(frame) & mask;
+    for (;;) {
+        zan_join_pair_t *cur = g_joinmap_slots[i];
+        if (!cur) return;
+        if (cur == pr) {
+            if (cur->frame != frame) return; /* recycled: someone else owns it now */
+            g_joinmap_slots[i] = JOINMAP_TOMB;
+            g_joinmap_live--;
+            g_joinmap_dead++;
+            return;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+static int join_pair_done(const zan_join_pair_t *pr) {
+    if (pr->done) return 1;
+    if (!live_has_nolock(pr->frame)) return 1;   /* untracked: completed */
+    int32_t done;
+    memcpy(&done, (const unsigned char *)pr->frame + JOIN_OFF_DONE, sizeof(done));
+    return done != 0;
+}
+
+static int join_all_done(zan_join_t *j) {
+    for (int i = 0; i < j->npairs; i++)
+        if (!join_pair_done(&j->pairs[i])) return 0;
+    return 1;
+}
+
+static int join_any_done(zan_join_t *j) {
+    /* no bound pairs = every frame was already done (or gone) when bound:
+     * the join is satisfied, the joiner's own scan picks the winner */
+    if (j->npairs == 0) return 1;
+    for (int i = 0; i < j->npairs; i++)
+        if (join_pair_done(&j->pairs[i])) { j->winner = j->pairs[i].idx; return 1; }
+    return 0;
+}
+
+static void join_fire_locked(zan_join_t *j, void **out_joiner, zan_timer_step_t *out_step) {
+    *out_joiner = NULL;
+    if (j->fired) return;
+    int trig = j->any ? join_any_done(j) : join_all_done(j);
+    if (!trig) return;
+    j->fired = 1;
+    *out_joiner = j->joiner;
+    *out_step = j->joiner_step;
+}
+
+/* untrack hook: frame just completed and is leaving the live registry */
+static void join_on_untrack(void *frame, void **out_joiner, zan_timer_step_t *out_step) {
+    *out_joiner = NULL;
+    zan_join_pair_t *pr = joinmap_get(frame);
+    if (!pr) return;
+    pr->done = 1;
+    joinmap_remove(frame, pr);
+    join_fire_locked(pr->owner, out_joiner, out_step);
+}
+
+long long zan_join_new(int npairs, int any) {
+    size_t sz = sizeof(zan_join_t) + (size_t)npairs * sizeof(zan_join_pair_t);
+    zan_join_t *j = malloc(sz);
+    if (!j) zan_rt_fatal("oom", "join: entry alloc failed");
+    memset(j, 0, sz);
+    j->any = (any != 0);
+    return (long long)(intptr_t)j;
+}
+
+/* bind one handle to the join. Returns 1 bound, 0 skipped (frame already
+ * done, reaped, or bound twice — all benign: the scan below still sees it). */
+int zan_join_bind(long long entry, void *frame, int idx) {
+    zan_join_t *j = (zan_join_t *)(intptr_t)entry;
+    if (!j || !frame) return 0;
+    int bound = 0;
+    live_lock();
+    if (live_has_nolock(frame) && !joinmap_get(frame)) {
+        int32_t done;
+        memcpy(&done, (const unsigned char *)frame + JOIN_OFF_DONE, sizeof(done));
+        if (!done) {
+            zan_join_pair_t *pr = &j->pairs[j->npairs];
+            pr->frame = frame;
+            pr->owner = j;
+            pr->idx = idx;
+            pr->done = 0;
+            j->npairs++;
+            joinmap_put(pr);
+            bound = 1;
+        }
+    }
+    live_unlock();
+    return bound;
+}
+
+/* suspend the caller until the join fires. Returns 1 satisfied (return
+ * immediately), 0 suspended (runtime will ready (frame, step) on fire),
+ * 2 unsupported here (no hook / not a coroutine — caller falls back). */
+int zan_join_wait2(long long entry, void *frame, zan_timer_step_t step) {
+    zan_join_t *j = (zan_join_t *)(intptr_t)entry;
+    if (!j || !g_ready_hook || !frame || !step) return 2;
+    int satisfied;
+    live_lock();
+    satisfied = j->fired || (j->any ? join_any_done(j) : join_all_done(j));
+    if (!satisfied) { j->joiner = frame; j->joiner_step = step; }
+    live_unlock();
+    return satisfied ? 1 : 0;
+}
+
+void zan_join_cancel(long long entry) {
+    zan_join_t *j = (zan_join_t *)(intptr_t)entry;
+    if (!j) return;
+    live_lock();
+    for (int i = 0; i < j->npairs; i++)
+        joinmap_remove(j->pairs[i].frame, &j->pairs[i]);
+    live_unlock();
+    free(j);
 }
 
 /* ---- async runtime configuration ----

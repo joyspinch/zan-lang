@@ -10367,6 +10367,71 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             return LLVMConstInt(di64, 0, 0);
         }
 
+        /* await Task.JoinWait(entry) — event-driven join suspension (B-ID56).
+         * zan_join_wait2 returns 0 = suspended (runtime readies us via the
+         * untrack hook when the join fires), 1 = already satisfied (fall
+         * through to the resume state), 2 = unsupported (no ready hook or not
+         * inside a coroutine — caller falls back to polling). The join
+         * return value rides the ASYNC_FRAME_RESULT slot (same channel as
+         * RecvToOv) so both paths converge on resume-k, which reloads slots
+         * and returns the value — never a mid-body return that would skip
+         * the statements after the await. Suspension uses the Delay shape:
+         * NO self-ready, the runtime owns the (frame, step) pair. */
+        if (is_call_to(expr->await_expr.expr, "Task", "JoinWait") &&
+            expr->await_expr.expr->call.args.count == 1) {
+            LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMValueRef entry = emit_expr(g, expr->await_expr.expr->call.args.items[0], locals);
+            if (LLVMTypeOf(entry) != di64)
+                entry = LLVMBuildIntCast2(g->builder, entry, di64, 1, "join64");
+            LLVMTypeRef jw_type = LLVMFunctionType(di32,
+                (LLVMTypeRef[]){ di64, di8ptr, g->co_step_ptr }, 3, 0);
+            LLVMValueRef jw = LLVMGetNamedFunction(g->mod, "zan_join_wait2");
+            if (!jw) jw = LLVMAddFunction(g->mod, "zan_join_wait2", jw_type);
+            if (g->current_async_frame && g->current_async_switch) {
+                int k = g->current_async_next_state++;
+                LLVMValueRef selfframe = g->current_async_frame;
+                LLVMTypeRef self_ft = g->current_async_frame_type;
+                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe,
+                    di8ptr, "self");
+                LLVMValueRef r = zan_call2(g->builder, jw_type, jw,
+                    (LLVMValueRef[]){ entry, self_i8, g->current_async_resume_fn },
+                    3, "join.wait");
+                /* stash the wait result where resume-k can find it */
+                LLVMBuildStore(g->builder,
+                    LLVMBuildZExt(g->builder, r, di64, "join.r"),
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                        ASYNC_FRAME_RESULT, "self.joinres"));
+                LLVMValueRef must_suspend = zan_icmp(g->builder, LLVMIntEQ, r,
+                    LLVMConstInt(di32, 0, 0), "join.susp");
+                LLVMValueRef fn = g->current_fn;
+                LLVMBasicBlockRef susp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "join.park");
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+                    g->current_async_resume_fn, "co.resume");
+                emit_async_save_slots(g);
+                LLVMBuildCondBr(g->builder, must_suspend, susp_bb, rk);
+                LLVMPositionBuilderAtEnd(g->builder, susp_bb);
+                zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0),
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                        ASYNC_FRAME_STATE, "self.state"));
+                /* no self-ready: Delay shape — the untrack hook readies us */
+                emit_async_eh_unarm(g);
+                LLVMBuildRetVoid(g->builder);
+                LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
+                LLVMPositionBuilderAtEnd(g->builder, rk);
+                emit_async_reload_slots(g);
+                LLVMValueRef res_slot = LLVMBuildStructGEP2(g->builder, self_ft,
+                    selfframe, ASYNC_FRAME_RESULT, "self.joinres2");
+                return LLVMBuildLoad2(g->builder, di64, res_slot, "join.r2");
+            }
+            /* not inside a suspendable frame: probe-only wait */
+            LLVMValueRef r2 = zan_call2(g->builder, jw_type, jw,
+                (LLVMValueRef[]){ entry, LLVMConstNull(di8ptr),
+                                  LLVMConstNull(g->co_step_ptr) }, 3, "join.wait.root");
+            return LLVMBuildZExt(g->builder, r2, di64, "join.r");
+        }
+
         /* await Socket.ReadReady(fd) / Socket.WriteReady(fd) — readiness-based
          * suspension driven by the IO reactor (S4b-2, path A). Inside an async
          * body: register a one-shot fd watcher via zan_io_wait_co that re-readies

@@ -738,6 +738,64 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                              idf, &h, 1, "isdone");
         }
 
+        /* Task.JoinNew(npairs, any) — create a join entry (B-ID56). any != 0
+         * fires on the FIRST completed pair (WhenAny), otherwise when all
+         * pairs complete (WhenAll). Returns an opaque entry handle. */
+        if (is_call_to(expr, "Task", "JoinNew") && expr->call.args.count == 2) {
+            LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMValueRef a0 = emit_expr(g, expr->call.args.items[0], locals);
+            LLVMValueRef a1 = emit_expr(g, expr->call.args.items[1], locals);
+            if (LLVMTypeOf(a0) != di32) a0 = LLVMBuildTrunc(g->builder, a0, di32, "join.n");
+            if (LLVMTypeOf(a1) != di32) a1 = LLVMBuildTrunc(g->builder, a1, di32, "join.any");
+            LLVMTypeRef jn_type = LLVMFunctionType(di64,
+                (LLVMTypeRef[]){ di32, di32 }, 2, 0);
+            LLVMValueRef jn = LLVMGetNamedFunction(g->mod, "zan_join_new");
+            if (!jn) jn = LLVMAddFunction(g->mod, "zan_join_new", jn_type);
+            return zan_call2(g->builder, jn_type, jn,
+                (LLVMValueRef[]){ a0, a1 }, 2, "join.new");
+        }
+
+        /* Task.JoinBind(entry, handle, idx) — attach a task handle to the
+         * join. Skips handles already completed/reaped (benign: the join
+         * still sees them as done). */
+        if (is_call_to(expr, "Task", "JoinBind") && expr->call.args.count == 3) {
+            LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMValueRef a0 = emit_expr(g, expr->call.args.items[0], locals);
+            if (LLVMTypeOf(a0) != di64) a0 = LLVMBuildIntCast2(g->builder, a0, di64, 1, "join64");
+            LLVMValueRef a1 = emit_expr(g, expr->call.args.items[1], locals);
+            if (LLVMTypeOf(a1) == di64)
+                a1 = LLVMBuildIntToPtr(g->builder, a1, di8ptr, "join.h");
+            else
+                a1 = LLVMBuildBitCast(g->builder, a1, di8ptr, "join.h");
+            LLVMValueRef a2 = emit_expr(g, expr->call.args.items[2], locals);
+            if (LLVMTypeOf(a2) != di32) a2 = LLVMBuildTrunc(g->builder, a2, di32, "join.i");
+            LLVMTypeRef jb_type = LLVMFunctionType(di32,
+                (LLVMTypeRef[]){ di64, di8ptr, di32 }, 3, 0);
+            LLVMValueRef jb = LLVMGetNamedFunction(g->mod, "zan_join_bind");
+            if (!jb) jb = LLVMAddFunction(g->mod, "zan_join_bind", jb_type);
+            return zan_call2(g->builder, jb_type, jb,
+                (LLVMValueRef[]){ a0, a1, a2 }, 3, "join.bind");
+        }
+
+        /* Task.JoinCancel(entry) — detach all pairs and free the entry
+         * (unhappy paths: exception unwinding through the wait, early
+         * return). Safe to call on a fired/waited entry too. */
+        if (is_call_to(expr, "Task", "JoinCancel") && expr->call.args.count == 1) {
+            LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMTypeRef dvoid = LLVMVoidTypeInContext(g->ctx);
+            LLVMValueRef a0 = emit_expr(g, expr->call.args.items[0], locals);
+            if (LLVMTypeOf(a0) != di64) a0 = LLVMBuildIntCast2(g->builder, a0, di64, 1, "join64");
+            LLVMTypeRef jc_type = LLVMFunctionType(dvoid, (LLVMTypeRef[]){ di64 }, 1, 0);
+            LLVMValueRef jc = LLVMGetNamedFunction(g->mod, "zan_join_cancel");
+            if (!jc) jc = LLVMAddFunction(g->mod, "zan_join_cancel", jc_type);
+            /* void call: must stay unnamed — LLVM rejects named void values */
+            zan_call2(g->builder, jc_type, jc, (LLVMValueRef[]){ a0 }, 1, "");
+            return LLVMConstInt(di64, 0, 0);
+        }
+
         /* Task.IsCancellationRequested() — inside an async body, whether this
          * coroutine has been cancelled, so a long-running body can bail out at
          * a point of its own choosing. Always 0 outside one. */
