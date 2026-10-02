@@ -36,7 +36,7 @@
  * bytes (clamped 64 KB..16 MB). The number is address-space/commit, not
  * resident -- stacks are mmap'd / CreateFiber'd lazily, so a shallow coroutine
  * touches only a few pages. Resolved once on first use; the scheduler is
- * single-threaded (M:1), so no lock is needed.
+ * single-threaded (M:1), so no lock is needed. */
 #define ZAN_CO_STACK_DEFAULT (128 * 1024)
 
 static size_t co_stack_size(void) {
@@ -186,7 +186,7 @@ static void *plat_fiber_new(zan_co_t *co) {
     if (!pf->stack) zan_rt_fatal("oom", "scheduler: fiber stack alloc failed");
     getcontext(&pf->ctx);
     pf->ctx.uc_stack.ss_sp = pf->stack;
-    pf->ctx.uc_stack.ss_size = ZAN_CO_STACK;
+    pf->ctx.uc_stack.ss_size = co_stack_size();
     pf->ctx.uc_link = &g_sched_ctx;
     /* makecontext passes int-sized args; split the co pointer across two on 64-bit.
      * The trampoline reconstructs it, so each fiber runs its own body. */
