@@ -73,212 +73,70 @@
 > HTML 原语、许可证客户端此前从未入册。新挂账 B-ID60..B-ID84。标注约定：
 > 【实锤】=主会话读码/探针亲证；【代理】=审计代理读码确认（抽样校准 15/15）；
 > 【疑似】=需探针定案。
+>
+> 2026-10-03 平账：**深度审计批 B-ID60..B-ID84 闭账**（6 路修复代理+主会话编译器自修并行，29 提交，逐项验证证据见对应提交正文）——
+> 编译器 B-ID60/61/76（ba32a189）：枚举初始化 binder 一次性折叠归一（负数/兄弟引用/算术组合，无符号回绕算术+int32 域诊断；原三消费端只认整字面量静默回落运行计数器，irgen 计数器 int64 化消除编译器自身 UB）；插值装配 strcpy/strcat→逐段 memcpy（嵌入 NUL 不再丢字节长垃圾，B-ID58 同族收口）；插值格式符数字饱和+`{v:x2}` 小写；链接命令行 157 处静默截断→cmd_appendf 带截断报告；行内闭合块注释吞同行 #endif 修复。conformance 新增 enum_negative_init/string_interp_nul，窄回归 6/6。
+> stdlib B-ID62/63（eb64f58a readdir 改 nint 修 POSIX 枚举恒空+删树不跟随 symlink/junction）、B-ID64（f885c5a5 Gate 看门狗代际校验）、B-ID75 十四项（c8cbe3b8：SHA1 长度 i32 溢出/Mutex "" 具名共享/localtime 可重入/EINTR 重试/FromBase64 64 位+1GB 帽/FromHexString 严格化/WriteAllLines 二进制语义等）、B-ID81aceh 平台覆盖（a738a0d0 Pid/Platform/CSPRNG wasm32）。
+> runtime C B-ID71（bdd0a6a1 WAV u32/int64+混音三段钳制）、B-ID72（9a45a015 孤儿文件宏统一）、B-ID73（1745aa39 前台准入 CAS 根治双 owner 破环协议）、B-ID74 b/c/e/f（14f4f1f8 WhenAll 归零计数 O(N²)→O(1)、cancel Floyd 死重排守卫、DONE 探针 acquire、TTAS 让渡退避）、B-ID81f（624c706d wasm 哈希 0→1 重映射）、B-ID84 runtime/common（539d72f1 inflate 32 位回绕/文件锁 gen 退役/json 溢出化+拒前导 +）。
+> 包安全 B-ID65/66（80a83dd2 zip-slip fail-closed+清单 RSA 验签+原子覆盖+backupOld 真备份）、B-ID67（daa61dc4 Wiki 七 Inline 先 Esc）、B-ID68（9ff778eb license.json HMAC+signed 公钥验签双门槛 fail-closed）、B-ID69（529e53fd name 白名单+trigger/time 枚举校验+CSPRNG 临时名）、B-ID70（278609f3 响应验签默认 fail-closed+通知 300s 新鲜度+空 token 拒绝+常数时间比较+msgLen 上溢改减法）。
+> 解析器 B-ID77（7779081c 溢出阈值/空 rest 越界/深度帽/O(n²) 拼接 14×）、B-ID78（49b2b5c9 四写侧 64 位化+512MB 上限+读侧定长 argument/varint 截断拒绝）、B-ID79（2824550d Toml 五项/Csv 上限+注入警告/Regex 递归深度帽/Xml 写侧帽）、B-ID84 格式包（c45d8efe Proto 切片减法比较/CBOR tag1 拒非数值/Yaml 指数钳制）。
+> Mvc/Web B-ID80 a-h（e20c1e68 CSRF 文档化开关/traceId 清洗/表元数据转义/安全响应头；b037adbf WS 升级 Origin 闸/HtmlEscape 单引号/Lua 沙箱禁预编译 chunk；d59a6e2a DesignerHtml 三汇点收口）。
+> xplat/Linq/加密 B-ID83cd（b4ee0a62 OrderBy 双键单趟归并/三键型省 n 槽拷贝/Distinct(eq) O(N²) 文档声明）、B-ID81d（38f00e2f ios embed/inflate 对象入册）+g（9c36cdfe DaemonizeTo macOS nohup 分支）、B-ID84 加密（e4da88ba X25519 全零共享密钥拒收/RSA 填充校验常数化/SM2 随机 k+r/s 重试）。
+> stdlib B-ID84 子项（d16977d5 GenDbEmit 特性文本全过 Esc/GenForm 数值按 ToJson 字符集分流 AsDouble/AsInt/GenRoute.Atoi long 累加/Interop EnvVar 按需重试+Wide.Of(null)+Com.Guid 抛错）。
+> 工具链 B-ID82：全目标对象重建矩阵——build_cross_rt.cmd zig 全段 exit 0+win 双架构 zig -windows-gnu 重编，30 个 .o 入库；`--verify` runtime 组 0 陈旧、28 项字节级验证最新、余 8 项 report-only（win io/embed 4 项字节已证最新无法记录、GUI 驱动 4 件待平台 builder）；check_toolchain_stale wasm32 分支 NameError 顺修（2b80ce8e）。
+> 审计期新发现挂账：B-ID85（语句 lambda 经泛型委托转换静默出错，编译器，发现于 b4ee0a62 验证期）、B-ID86（GUI 驱动平台 builder）、B-ID87（stdlib 内联 File.ReadAllText 随宿主 using 面切换实现，发现于 a738a0d0 验证期）；各批残项缩条重挂于下。
 
 ## 未完成
 
-- [ ] **B-ID60【实锤·探针】（P1）zanc 枚举初始化器只认纯整字面量，静默折叠错误值**——
-  `enum Color { Red = -5, Green }` 实测 `(int)Color.Red`=0、Green=1（应 -5/-4）；
-  `enum Mul { X = 5, Y = X * 2 }` 实测 Y=6（应 10，回落运行计数器）。根因：三处消费点
-  （irgen_expr.c:7078 成员折叠、irgen_call.c:404 反射表、irgen_reflect.c:324）只认
-  `AST_INT_LITERAL`，而 parser 不折叠负号/表达式（parser.c:1889 产生 UNARY）；checker
-  不校验枚举值形态。附带 `(int)int_val+1` 在 INT_MAX 有符号溢出 UB。修法：checker 期用
-  既有 const_int_expr（irgen_expr_core.c:283）统一折叠回写 AST_INT_LITERAL + int 域宽校验；
-  非常量报错。探针形态：`_scratch/audit_enum_neg.zan`（已删，本条含全部触发形态）。
-- [ ] **B-ID61【实锤·探针】（P1）zanc 字符串插值 `$"{...}"` 丢内嵌 NUL + 长度头虚报带出堆垃圾**——
-  B-ID58 修 `+`/concat_n 路的同族漏网：emit_expr_string_interp（irgen_expr.c:6572-6585）用
-  strcpy/strcat 逐段拼（首 NUL 截断），而 total_len 走 emit_string_length（NUL 计入）→
-  头长>实写字节，Substring/GetBytes 读到 malloc 未清零垃圾。探针实测 `$"v={含NUL};"` →
-  `76 3d 61 3b 00 00`（'b' 丢失 + 2 字节垃圾）。修法：照搬 emit_str_concat_n 的
-  memcpy 逐叶拷贝。
-- [ ] **B-ID62【实锤】（P1）stdlib Directory POSIX 目录枚举恒返回空**——
-  Directory.zan:124 `readdir` 误声明为返回 `string`：extern 裸 char* 的 Length=strlen(偏移0)，
-  struct dirent 首字段 d_ino/d_reclen 必含 0x00 → Length≤17 < nameOff(19/21) →
-  posixName(:379) 循环体零执行恒返回 ""。GetFiles/GetDirectories/GetPaths 在
-  linux/macos/ios/ohos/android/wasm32 全部静默空列表；DeleteRecursive 因此什么都不删。
-  编译器注释（irgen_call.c:1946-1950）正好拿 struct dirent* 当不可靠字符串典型。
-  修法：readdir 返 nint + 按 d_reclen/d_name 偏移取字节复制（≤256）。
-- [ ] **B-ID63【实锤】（P1）stdlib Directory.DeleteRecursive 跟随符号链接删除越出目标树**——
-  posixList(:415)/DeleteRecursive(:581) 用 opendir 探目录性（follow symlink），指向树外
-  目录的 symlink 被递归进入逐个 unlink；Windows junction 同型。与 B-ID62 联动：62 修复
-  （枚举恢复工作）即激活本洞，必须同修。修法：lstat/fstatat(AT_SYMLINK_NOFOLLOW) 判定，
-  symlink 一律 unlink 本身不递归。
-- [ ] **B-ID64【实锤】（P1）stdlib Gate.Wait(timeout) 看门狗对已 Close 句柄发信号 = UAF 写**——
-  Gate.zan:54 Spawn(Watchdog(handle))，:64 延迟后 zan_gate_signal(裸 long 句柄)；Wait 被
-  Signal 提前唤醒后调用方 Close()（:76 zan_gate_free），看门狗到点仍写已释放 reactor 对象。
-  文档只论证"盈余信号无副作用"，未论证"已释放句柄无副作用"。修法：Close 递增代际、
-  runtime signal 前校验，或超时内建进 gate 生命周期。
-- [ ] **B-ID65【代理·实锤级】（P0）Zan.AppUpdate zip-slip 任意文件写**——
-  UpdateFileEntry.NormalizePath(:32) 只换分隔符剥前导斜杠、不滤 `..` 段；
-  AppUpdater.ApplyPackage(:137-146) `destFile = targetAppDir + "/" + rel` 直写；
-  TamperDetector.RestoreFromZip 同型。恶意/被劫持更新包 `../../x` 条目即可写应用目录外
-  （配合 B-ID66 无签名=更新即 RCE）。Zan.IO 的 Tar.SafeName 安全原语已存在被绕开。
-  修法：复用 SafeName 判定，`..` 段 fail-closed。
-- [ ] **B-ID66【代理】（P1）Zan.AppUpdate 更新链完整性三缺口**——
-  (a) manifest+zip 零签名：MD5-only 只是完整性非真实性（expectedMd5 来自未签名本地清单，
-  通道攻击者同时替换两者即可）；stdlib Ed25519/Rsa 已可用未用。(b) 覆盖写非原子：
-  ApplyPackage 直写活文件，断电即截断可执行、连自愈都起不来；应临时名+原子 rename
-  （CoderController.WriteSources 有范本）。(c) backupOld 只建目录不拷贝，回滚不可能。
-- [ ] **B-ID67【实锤】（P0）Zan.Mvc Admin Wiki Markdown 渲染存储型 XSS**——
-  WikiController.Html(:456) 头注释承诺"先整行转义再叠加标记"，实际仅代码围栏分支转义
-  （:479）；标题/列表/引用/有序/段落 7 个 Inline 调用点（:488/:494/:500/:511/:522/:535/:539）
-  全部直传原始行，Inline 注释自认"输入应先经过 Esc"（:566）。持 wiki 编辑权者保存
-  `<img onerror=...>` 即对每个查看者执行（含 AI 整理内容同一出口）；HttpOnly 挡 cookie
-  外带但脚本可同源调管理 API。修法：7 处调用先 Esc（与代码块一致）。
-- [ ] **B-ID68【实锤】（P0）Zan.Commercial 许可证状态零认证，"signed"模式整体可伪造**——
-  LicenseClient.zan:124-145 状态文件 ~/.zan-license/**/license.json 明文 JSON 无 HMAC/签名；
-  Check()(:207) `mode=="signed"` 仅判本地明文字符串即放行（手写 JSON=终身授权）；
-  online 宽限（last_seen/grace_seconds 可改）与 device_fp 比对同样落在可编辑明文上。
-  全文件无任何验签调用。修法：状态文件 HMAC（派生自本机不可移植因子）或 signed 模式
-  内嵌证书 + Rsa/Ed25519 验签取 expiresAt。
-- [ ] **B-ID69【代理·实锤级】（P1）Zan.Desktop TaskScheduler Windows 命令注入**——
-  TaskScheduler.zan:382 Quote() 不转义内嵌 `"`，:146-184 name/trigger/time 未验字符集直拼
-  schtasks 命令；执行通道 Process.zan:156/257 走 `cmd.exe /c`（类文档自认 shell 语义）。
-  name=`x" & calc.exe & rem` 即 RCE；Quote 的存在诱调用方误信已消毒。连带：预测名临时
-  文件（zan_cap_<pid>_<tick>.tmp / zan_crontab_<pid>.tmp，cmd `>` 重定向跟随 symlink）。
-  修法：name 白名单字符集、trigger/time 枚举校验、临时名加随机 token+CreateNew。
-- [ ] **B-ID70【代理】（P1）Zan.Sdk.Wechat 验签面四缺口**——
-  (a) WechatPayV3 响应验签默认 fail-open：WechatPayConfig.zan:48 RequireResponseSignature
-  默认 false，缺头/缺平台密钥时静默放行（可注入平台证书扩大成回调伪造链）。
-  (b) 通知验签无时间戳新鲜度（WechatPayV3Client.zan:134-140），截获"支付成功"通知可任意
-  时刻重放。 (c) CheckSignature.zan:16 DefaultToken="weixin" 公开常量回落，token 忘配即
-  签名形同虚设。 (d) 三处签名比较非常数时间（WXBizMsgCrypt:70/CheckSignature:21/
-  WechatPayV2:94）+ WXBizMsgCrypt:148 `20+msgLen` i32 上溢绕过边界检查（需合法对端前置）。
-  修法：(a) 默认 true fail-closed；(b) 内置 |now-ts|≤300s；(c) 空 token 拒绝；(d) 换
-  fixed-time 比较（Jwt.fixedEquals 范本）+减法比较。
-- [ ] **B-ID71【实锤】（P1）runtime zan_audio.c 两处内存不安全**——
-  (a) WAV 解析 chunk 长度 (int) 截断（zan_audio.c:321-332）：len≥2^31 时
-  `pos += 8 + (int)((len+1)&~1u)` 变负 → pos≈-2GiB 继续循环 memcmp 野读；fmt 分支
-  `pos+8+(int)len<=n` 对负 len 恒真 → fmt 指针出界读 ≤16 字节。≥20 字节恶意 WAV 即触发。
-  (b) WASAPI 混音声道数未钳上限（:435-441）：devch 只钳下限，>8 声道设备（空间音频/
-  虚拟声卡）memset/累加写穿 4096×8 静态 acc；姊妹函数 mix_s16/mix_f32 都有钳制，唯独
-  此路径漏。修法：(a) 全程 u32/int64 比较+拒 len≥2^31；(b) 补同款三段钳制。
-- [ ] **B-ID72【实锤】（P2）runtime rt_sched.c 是编不过的孤儿文件仍在 staleness 入册**——
-  :35 未闭合 `/*` 吞掉 :40 `#define ZAN_CO_STACK_DEFAULT` 与 co_stack_size()（终止符在
-  :61）；:189 引用的 ZAN_CO_STACK 全仓无定义——任何非 ZAN_IO_STACKLESS_ONLY 形态编译
-  即炸；check_toolchain_stale.py:36 仍列为 RT_IO 输入。修法：补 `*/` 并统一宏名（文档
-  ZANC_CLI.md 用 ZAN_CO_STACK），或删文件并同步删入册条目。
-- [ ] **B-ID73【代理·疑似】（P2）zan_co_sched_run 入口 TOCTOU 双 owner**——
-  rt_io.c:5377 普通读检查 live/fg 后 :5421 无条件 InterlockedExchange 置位：两线程同窗口
-  通过检查 → 各建一套 worker 落同一 g_wk[i]，环协议被破（丢任务/协程不恢复）。root-await
-  形态（Thread.Start 内 Task.Wait）是文档支持入口。修法：入口 InterlockedCompareExchange
-  准入，输者走等待分支。
-- [ ] **B-ID74【代理】（P2·性能）runtime 调度热点六项**——
-  (a) POSIX mt 驱动整个 reactor 在一把全局互斥内 epoll_wait（rt_io.c:229-236,1561-1566），
-  注册新 await 最长顶 20ms、其余 worker 全排队（Windows 有分片，POSIX 无）。
-  (b) zan_timer_cancel_delay 每帧释放路径 O(n) 全堆扫描+无条件 Floyd heapify
-  （rt_timer.c:847-873，w==len 一个没删也全跑；`if (w != g_heap_len)` 一行可省）。
-  (c) WhenAll(N) 完成通知在全局自旋锁内 O(N²) 全对扫描（:1440-1453,1483-1496）。
-  (d) g_co_activity/g_co_outstanding 全局单点缓存行 RMW（spawn k=32 残留争用点）。
-  (e) join_pair_done 对 DONE 朴素 memcpy 读（:1436，与完成线程 release xchg 构成 C11
-  竞争，ARM64 可陈旧读；一行 __atomic_load_n ACQUIRE）。
-  (f) live/slab 自旋锁 TTAS 无退避无让渡（非 x86 满核空转风险）。
-- [ ] **B-ID75【代理·抽实锤】（P2批）stdlib 正确性十四项**——
-  (a) ByteBuffer.Str/CmpRangeRaw `start+n` i32 溢出跳过钳制 → 越界读（:281-289,424-435）。
-  (b) JsonValue.Get 重复键语义随成员数翻转：≤8 线性扫首键胜、>8 keyIndex 覆盖写末键胜
-  （:218-239，校验读 A 取值读 B 走私向量）。(c) PathSetValue 非对象根丢写/NPE（:292-316）。
-  (d) NaN/Infinity 经 ToJson/GenJson 输出裸字面量=非法 JSON（JsonValue:481-482、GenJson:291）
-  ——自家 Parse 认所以自测测不出，外界全拒。(e) WriteAllLines 用 fputs：内嵌 NUL 截断+
-  "w" 文本模式 CRLF 翻译（File.zan:375-388），与 WriteAllText 二进制语义不一致。
-  (f) ftell 声明 int：>2GiB 文件 GetSize 负值/Copy 静默空文件（File.zan:29-32,290-292），
-  GetSize64 存在未接线。(g) Windows Mutex.Create 传 "" 而非 NULL：全部实例共享同一命名
-  互斥体互相阻塞（Threading.zan:107-111）。(h) DateTime 用非可重入 localtime，多线程
-  转换互踩静态缓冲（DateTime.zan:29-35,137），换 localtime_r/localtime_s。
-  (i) SHA-1 位长 len*8 i32 溢出：≥256MiB 输入摘要错（Encoding.zan:640-706）。
-  (j) sem_wait/sem_timedwait 无 EINTR 重试（疑似，Threading.zan:202-300）。
-  (k) Random 墙钟种子 MMIX LCG 无"非加密"警示（Random.zan:20-68）——类名/API 与 .NET
-  同形极易被误用于 token；RandomNumberGenerator 已验证真 CSPRNG。修法：文档强警示+
-  考虑 Secure 工厂。(l) Convert.FromBase64String `(len*3)/4` i32 回绕：>715MB 输入得
-  0 字节缓冲喂原生解码=堆越界写（Convert.zan:75）。(m) MemoryExtensions
-  `startIndex+count` 溢出 → 误报未找到（:45-48）。(n) FromHexString 非法字符静默按 0 解、
-  奇数长度丢尾（Convert.zan:145-149）——宽松度是否合意待拍板。
-- [ ] **B-ID76【代理】（P2批）zanc 三项**——
-  (a) 插值格式说明符数字累加 `digits*10` 有符号溢出 UB（irgen_expr.c:6318，超 10 位数字），
-  且 'X' 分支无 digits<=0 守卫 → 生成负宽度 printf 格式。(b) system() 链接分支
-  4096 字节命令静默截断（main.c:8676-8860，无 argv 分支的 link_cap_exceeded 机制）
-  → 链接报错与真因脱节。(c) 同行块注释后的 #endif 被吞（lexer.c:360-381，`#ifdef X /*n*/ #endif`
-  条件永不闭合，声明被静默跳过）。
-- [ ] **B-ID77【代理】（P1批）Zan.Yaml 四项**——
-  (a) hex 整数溢出钳制阈值错 4 倍（YamlParser.zan:786 用 2^61-1，应为 (2^63-1-15)/16）
-  → 大数静默变负（0x1FFFFFFFFFFFFFFF0 → -16）。(b) 序列项 `"- "` 空串 rest[0] 越界
-  （:258-263，同文件其余取首字符处都有 Length 前置）→ 致命报告/进程退出。
-  (c) 块嵌套 ParseBlock↔ParseMap 互递归无深度上限（:161-237；flow 有 512、同批
-  Toml/Xml/Bson/Cbor/MsgPack 全有）→ 深嵌套输入栈溢出进程死。
-  (d) 块标量/flow 跨行 O(n²) 字符串累加（:384-408,432）→ 线性输入平方级 CPU。
-- [ ] **B-ID78【代理】（P1批）四二进制包写侧 EnsureRoom i32 回绕 + 读侧定长截断**——
-  (a) BsonWriter/CborWriter/MsgPackWriter/ProtoWriter 四处同段复制的 EnsureRoom：
-  总量>1GB 翻倍到 2^31 回绕负数恒小于 → 死循环；单次 append 使 len+extra≥2^31 首判据
-  回绕提前 return → NativeMemory.Copy 写穿小缓冲。读侧 d4139b46 已加固、写侧裸奔。
-  (b) CborReader.TakeChunks 扩容循环同型回绕（:186-187）。(c) CborReader 定长 argument
-  (int) 截断：>4GB 长度静默按低位解析（:111-139）。(d) ProtoReader.ReadBytes/Skip
-  varint (int) 截断：声明 2^32 截成 0 → 空载荷继续按字段对齐静默错解（:174,204）。
-  修法：(a) 容量运算升 64 位+写侧总量上限（对齐读侧 512MB）+超长分片；(c)(d) Arg/varint
-  > int.Max 即抛。
-- [ ] **B-ID79【代理】（P2批）其余格式包正确性/资源上限**——
-  (a) Toml：非法进制数字静默解析为 0 不置溢出哨兵（TomlParser.zan:605，`port=0xGG`→0）；
-  WriteTable 递归无深度上限（Toml.zan:74,83，读侧可造万层树→ToToml 栈溢出）；
-  键重复静默后写胜+点键覆子表、查重键 U+0001 可与键内容碰撞、数字尾部垃圾静默截断
-  （三项宽松度待拍板声明）。(b) Csv：行数/字段数无上限，1GB 逗号密集文本内存放大约
-  30 倍 OOM（Csv.zan:54-127，d4139b46 容器上限未跟随）；公式注入（=`+`-@ 开头单元格
-  不中和，Excel 执行）标安全误用。(c) Regex：星号循环 Split/Mark 每圈递归一层，
-  预算限总步数不限深度（RegexProgram.zan:1475-1491,588）→ 长匹配可栈溢出（疑似）；
-  回溯预算按起始位置重置，超大输入总功 O(n×2M)（缓解完备性）。(d) Xml 写侧
-  WriteNode 递归无上限（XmlDocument.zan:81）。
-- [ ] **B-ID80【代理】（P2批）Mvc/Web/Scripting 纵深加固**——
-  (a) CSRF double-submit 实现存在（Csrf.Guard 含常时比较）但 Boot:112 默认只注册
-  OriginGuard，未注册前者（现代浏览器 SameSite=Lax 已挡，老浏览器残余面）。
-  (b) AccessLog 回显客户端 x-request-id 未清洗进控制台日志 → 日志注入伪造请求行
-  （Boot.zan:353-365）。(c) DataController 表元数据拼 HTML 属性未转义（:111-126，
-  当前有 Gen.Safe 白名单前置，直改库即逃逸）。(d) 全站无 CSP/X-Frame-Options/
-  X-Content-Type-Options（管理台 clickjacking、上传 nosniff 纵深缺）。
-  (e) WS 升级无 Origin 校验（WebWs.zan:36-42，CSWSH 残余面同 (a)）。
-  (f) View.zan HtmlEscape 漏 '（当前无单引号属性模板，防纵深）。(g) Zan.Scripting
-  Lua 沙箱：Sandbox() 未移 load 且 LoadBufferX mode=null 允许字节码 chunk →
-  预编译字节码绕过 _ENV 防线（Lua.zan:159-170,534-543）；修法：load=nil 或限 mode="t"。
-  (h) DesignerHtml 三处未转义 sink：Element tag 原样拼（DesignerHtml.zan:124,129）、
-  属性值 rv 原样（:233）、属性名 key/KebabKey 未过滤（:490-517）——设计器文档
-  （模板/市场来源）不可信即注入；修法：tag 走 IsNameChar 校验、键值全过 EscapeAttr、
-  KebabKey 丢非字母数字。
-- [ ] **B-ID81【代理·部分实测】（P2批）跨平台缺口九项**——
-  (a) AppPath.Pid() 无 Apple 分支：macos/ios 上 Environment.ProcessId 恒 0
-  （AppPath.zan:58-79，ProcessHost.Pid 有 getpid 范本）。(b) Zan.Gui win-arm64 驱动
-  只有 libzan_gui.dll.a 导入库、无 static/dll/bundle payload（B-ID51 同型）。
-  (c) Zan.Gui 只有 ohos-x64 驱动、ohos-arm64（真机）缺失。(d) toolchain/ios/arm64 缺
-  zan_embed_api.o+zan_inflate.o（其余全目标都有，引用嵌入资源 API 的 iOS 程序链接响亮失败）。
-  (e) OperatingSystem.Platform 对 ios/ohos/android 报 "linux"、IsOSPlatform 不识别三者
-  （OperatingSystem.zan:74-97，编译器宏已定义）。(f) rt_sync_wasm shared-table 哈希漏
-  0→1 重映射（:171-181 vs rt_sync.c:233-242，注释声称 identical）。
-  (g) ProcessHost.DaemonizeTo 仅 LINUX，macOS 静默 false。(h) RandomNumberGenerator 无
-  wasm32 random_get 分支，WASI 无 /dev/urandom 时静默 null（疑似）。
-  (i) Zan.Desktop System.Management 族 macOS 全落空值（半文档化，包内口径不一致）。
-- [ ] **B-ID82【实测】（P2·工具链）check_toolchain_stale --verify 实测 6 项真陈旧待重交**——
-  toolchain/win-x64 与 win-arm64 的 zan_embed_api.o（落后 rt_timer.h）；Zan.Gui 驱动
-  win-x64/zan_gui.dll、linux-arm64/static/libzan_gui.a、macos-arm64/macos-x64 两
-  libzan_gui.dylib（落后 gui_runtime_x11.c/text/font/shims）。linux/android/macos 的
-  rt 族对象日期过期但 --verify 字节一致=实为最新（B-ID59 机制在位）。需对应平台重建提交。
-- [ ] **B-ID83【代理】（P2·性能）Zan.Data/Linq 热点**——
-  (a) 四驱动每行每列无条件字符串物化+数值重复解析：SqliteConnection.zan:344-373 每格
-  column_text 强制 int→text 再 text→int、PostgresConnection/MySqlConnection 同型、
-  DbResult.GetInt/GetLong/GetDouble 每次重新 strtoll 无缓存；20 列×1 万行=20 万次串
-  分配/查询。修法：惰性列物化/类型化直取（sqlite3_column_int64）。(b) Linq
-  Distinct(eq) 比较器版 O(N²)（Enumerable.zan:376-382，哈希版已有）。(c)
-  OrderBy(k1,k2) 两次全排序（:447-450，可合成单次双键比较省一半）。(d) MergeSort
-  每次排序多一份全量输入拷贝。
-- [ ] **B-ID84（P3批·卫生汇总，修时可批量）**——
-  runtime：zan_inflate zan_embed_rawlen 缺 total≥4 下限、32 位目标 raw_len+1 回绕
-  （:25-49）；rt_file.c:879 文件锁 gen 回绕重置为 1（应退役）；common/json.c:439 超长
-  数字字面量静默截断变值+接受前导 +；libwebp 1.4.0→例行升级；Windows g_fls DWORD
-  跨线程读/pthread key 失败不回收。zanc：verbatim/插值字符串 EOF 未终止无诊断
-  （lexer.c:1335,1288）；浮点字面量超长误报 integer 措辞（:945）；arena 尺寸算术无溢出
-  守卫（arena.c:41,67）；目录枚举序进发射序=跨机字节不可复现（package.c 十处
-  FindFirstFileA/readdir 无排序，同机确定性无碍）；OOM 分支 strbuf 泄漏（lexer.c:1154）。
-  stdlib：GenDbEmit 属性串插值未过 Esc（:272，开发期暴露）；GenForm 数值属性 AsInt 截断
-  小数（:1449）；GenRoute Opt 默认值 Atoi 10 位回绕（:187）；EscapeAttr 漏 '（双引号
-  包裹下无触达，防纵深）；ByteBuffer.ToBytes 多一尾随 NUL（:76-82）；Interop EnvVar
-  1023 截断静默/Wide.Of(null) NPE/Com.Guid 畸形文本裸异常；JsonValue 与 JsonTape 对
-  \u0000/孤立代理对行为分歧（:1082）；Encoding.IntToString 死代码/ParseDouble 位数无钳/
-  GetByteCount 按 strlen。SDK：Sm2.Sign k 由调用方传入无 r/s==0 重试（Ecdsa 已 RFC 6979
-  对照）；Curve25519 未拒全零共享密钥；Rsa OAEP/v1.5 PS 扫描变长时间（疑似，Bleichenbacher
-  前提）+ModExp 无盲化；access_token GET query 传输与无刷新互斥（协议固有+多实例部署提示）。
-  格式包：ProtoWriter.WriteBytesField 切片校验加法可回绕（:154，读侧已减法）；Proto 读侧
-  字段号>2^29-1 宽松收；CBOR tag1 内层非数值伪造纪元零值；YAML 浮点指数循环最多 2^31
-  次乘（秒级有界）。
+- [ ] **B-ID74 残项（P2·性能）runtime 调度热点二项**——(a) POSIX mt 驱动整个 reactor 在
+  一把全局互斥内 epoll_wait（rt_io.c:229-236,1561-1566），注册新 await 最长顶 20ms、其余
+  worker 全排队（Windows 有分片，POSIX 无）；(d) g_co_activity/g_co_outstanding 全局单点
+  缓存行 RMW（spawn k=32 残留争用点）。需 POSIX reactor 分片设计，非低成本，单独批次。
+  （b/c/e/f 已随 14f4f1f8 闭账。）
+- [ ] **B-ID78 残项（P3）四二进制包写侧超长分片**——CBOR indefinite/str 分片本轮未做
+  （49b2b5c9 提交信息已记）；写侧 512MB 总量上限已立，分片是超限后的正确形态问题。
+- [ ] **B-ID79 残项（P3）Csv 公式注入**——（=`+-@ 开头单元格不中和，Excel 执行）行为未改，
+  Csv 类文档已补安全警告（2824550d）；根治需导出侧中和选项，涉 API 面，待议。
+- [ ] **B-ID80 残项（P2）**——(d) CSP：框架视图 10+ 处内联 style=、1 处内联 script、生成器
+  产 javascript:void(0) tab 条，default-src 'self' 必破页——需先视图去内联改造再挂 CSP
+  （nosniff/XFO/Referrer-Policy 已随 SecurityHeaders 默认带上，e20c1e68）；(g 附注) Lua 公共
+  字符串 Load 限文本未做：luaL_loadstring mode 固化在 lauxlib 需新 extern（def 文件清单外），
+  且输入是宿主自著代码非脚本可达面——以 Sandbox 禁预编译 chunk（load=nil）+LoadBytes
+  宿主专用注释立约（b037adbf）。
+- [ ] **B-ID81 残项（P2）跨平台二项半**——(b) Zan.Gui win-arm64 驱动只有导入库无 payload、
+  (c) ohos-arm64（真机）驱动缺失（二者归 B-ID86 平台 builder 批次）；(i) Zan.Desktop
+  System.Management 族 macOS 全落空值（半文档化，包内口径不一致，需统一文档或补实现）。
+  （a/c/e/h 随 a738a0d0、d 随 38f00e2f、f 随 624c706d、g 随 9c36cdfe 闭账。）
+- [ ] **B-ID82 残项（P2·工具链）GUI 四驱动重建**——win-x64 dll/linux-arm64 a/macos 两
+  dylib 落后 gui_runtime_*.c（含本轮 zan_audio 修复），无本机平台 builder，待 B-ID86 CI
+  重建；win 双架构 io/embed 4 对象 rebuild 字节一致=内容已证最新（git 无法记录同字节提交，
+  report-only）。runtime 组 28 项已字节级验证最新（B-ID82 主体随对象矩阵闭账）。
+- [ ] **B-ID83 残项（P2·性能）Data 惰性列物化**——四驱动每行每列无条件字符串物化+数值
+  重复解析（SqliteConnection.zan:344-373、PostgresConnection/MySqlConnection 同型，
+  DbResult.GetInt/GetLong/GetDouble 无缓存；20 列×1 万行=20 万次串分配/查询）：惰性列
+  物化/类型化直取（sqlite3_column_int64），涉四驱动读取面，单独批次。（b/c/d 随 b4ee0a62
+  闭账，Distinct(eq) O(N²) 已文档声明。）
+- [ ] **B-ID84 残项（P3批·卫生汇总）**——runtime：libwebp 1.4.0→例行升级、Windows g_fls
+  DWORD 跨线程读/pthread key 失败不回收。zanc：verbatim/插值字符串 EOF 未终止无诊断
+  （lexer.c:1335,1288）、浮点字面量超长误报 integer 措辞（:945）、arena 尺寸算术无溢出
+  守卫（arena.c:41,67）、目录枚举序进发射序=跨机字节不可复现（package.c 十处无排序，
+  同机确定性无碍）、OOM 分支 strbuf 泄漏（lexer.c:1154）。stdlib：GenJson NaN/Inf 与
+  B-ID75(d) 同病（ToJson 已修、GenJson.zan 未在清单，d16977d5 遗留）、EscapeAttr 漏 '
+  （防纵深，DesignerHtml 侧已补）、Encoding.GetByteCount strlen 语义仅加文档（无低成本
+  修法）；已裁决保留：ByteBuffer.ToBytes 尾随 NUL 系 bytebuffer_bounds 金样钉死的既有
+  契约（注释已声明，改动需先拍板更新金样）。SDK：ModExp 无盲化（类文档已注 P3）、
+  access_token GET query 传输与无刷新互斥（协议固有+多实例部署提示）。
+  已闭账：runtime/common 子项（539d72f1）、加密子项（e4da88ba）、格式包子项（c45d8efe）、
+  stdlib GenDbEmit/GenForm/GenRoute/Interop（d16977d5）、JsonValue/JsonTape \u0000 统一。
+- [ ] **B-ID87【代理·实测】（P2）zanc stdlib 内联 File.ReadAllText 依赖宿主 using 面**——
+  宿主程序不含 `using System.IO` 时，stdlib 内部 File.ReadAllText 调用点落进编译器内联版
+  （irgen_call.c:2627），对 /proc 伪文件 abort "cannot read file"；musl 下 AppPath.Pid 的
+  LINUX /proc 分支因此不可用（a738a0d0 验证期发现，WSL 实测）。stdlib 内部调用不应随宿主
+  using 集合改变落到不同实现；需最小探针定根因（怀疑内联判定按调用点可见性而非来源分层）。
+- [ ] **B-ID85【代理·对照实锤】（P1）zanc 语句 lambda 经泛型委托转换静默出错**——语句形态
+  lambda（含 if+多 return）作为 OrderBy/泛型委托实参时静默产出错误行为（null 字符串比较
+  崩溃）；stash 对照证明系既有问题、与 B-ID83 改动无关（发现于 b4ee0a62 验证期）。需最小
+  探针定根因（怀疑语句体 lambda 的续体/返回路径发射），探针形态随发现会话未留存、需重建。
+- [ ] **B-ID86（P2·工具链）GUI 驱动平台 builder**——4 平台驱动重建（B-ID82 残项）+
+  B-ID81(b)(c) win-arm64/ohos-arm64 payload 补齐，需 CI drivers.yml 扩展（现只有 win 驱动
+  job）；本机 zig 可作 fallback 但 GUI 驱动依赖平台窗口库，非纯 zig 可造。

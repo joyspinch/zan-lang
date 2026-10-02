@@ -141,6 +141,12 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   误绕，证伪撤案）；④ 可空返回链式取成员（`Get().Get()`）检查器
   强制"先落地局部 + 判空"，测试代码给一个永非 null 的哨兵 helper
   （缺失返 `NewNull`）一次消音全部链式断言。
+- **语言事实第九则（2026-10-03 深审修复批连踩两次）**：转出型 `byte[]` 的
+  `Length` 含尾随 NUL 槽——`ByteBuffer.ToBytes`、hex/字符串转字节这类 API 产出的
+  数组比"逻辑数据"多 1 个收尾 0 字节（既有契约，bytebuffer_bounds 金样钉死）。
+  拿 `.Length` 当数据长度喂底层（实例：RSA hex 密钥按字节数传参）会多传一个 0
+  而被拒或错算；真实长度用写入/转换时记下的 n 传递，不反查数组。
+
 - **文本格式包的 BOM 防线（2026-10-01 Yaml/Toml/Xml 跨平台审计踩出）**：
   `File.ReadAllText` 已在文件层剥 UTF-8 BOM，但 `Parse(src)` 收网络报文/
   内嵌资源时没有这层兜底——Windows 工具产出的文本常带 EF BB BF，不剥
