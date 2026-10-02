@@ -107,10 +107,11 @@
   (c) ohos-arm64（真机）驱动缺失（二者归 B-ID86 平台 builder 批次）；(i) Zan.Desktop
   System.Management 族 macOS 全落空值（半文档化，包内口径不一致，需统一文档或补实现）。
   （a/c/e/h 随 a738a0d0、d 随 38f00e2f、f 随 624c706d、g 随 9c36cdfe 闭账。）
-- [ ] **B-ID82 残项（P2·工具链）GUI 四驱动重建**——win-x64 dll/linux-arm64 a/macos 两
-  dylib 落后 gui_runtime_*.c（含本轮 zan_audio 修复），无本机平台 builder，待 B-ID86 CI
-  重建；win 双架构 io/embed 4 对象 rebuild 字节一致=内容已证最新（git 无法记录同字节提交，
-  report-only）。runtime 组 28 项已字节级验证最新（B-ID82 主体随对象矩阵闭账）。
+- [x] **B-ID82 残项（P2·工具链）GUI 四驱动重建**——随 B-ID86（c2de7a95）闭账：
+  过期根因是 drivers.yml 触发列表缺 zan_audio.c 等 unity TU；触发修正后 workflow 自动
+  重跑回写四件驱动（win-x64 dll/win-arm64 dll/linux 双架构 a/macos 双 dylib），以 CI
+  回写提交为准。win 双架构 io/embed 4 对象 rebuild 字节一致=内容已证最新（git 无法记录
+  同字节提交，report-only）。runtime 组 28 项已字节级验证最新（主体随对象矩阵闭账）。
 - [ ] **B-ID83 残项（P2·性能）Data 惰性列物化**——四驱动每行每列无条件字符串物化+数值
   重复解析（SqliteConnection.zan:344-373、PostgresConnection/MySqlConnection 同型，
   DbResult.GetInt/GetLong/GetDouble 无缓存；20 列×1 万行=20 万次串分配/查询）：惰性列
@@ -146,6 +147,12 @@
   return 公共类型、循环/switch/try 保守放弃、嵌套 lambda 不越界），new 与调用两个排名点
   接线；conformance lambda_stmt_overload（conformance/determinism/leakcheck/arcguard
   四形态）+ 15 项 lambda/linq 窄回归全过。
-- [ ] **B-ID86（P2·工具链）GUI 驱动平台 builder**——4 平台驱动重建（B-ID82 残项）+
-  B-ID81(b)(c) win-arm64/ohos-arm64 payload 补齐，需 CI drivers.yml 扩展（现只有 win 驱动
-  job）；本机 zig 可作 fallback 但 GUI 驱动依赖平台窗口库，非纯 zig 可造。
+- [x] **B-ID86（P2·工具链）GUI 驱动平台 builder**——已闭账 c2de7a95（2026-10-03）。
+  drivers.yml 触发 paths 补齐 gui_runtime_{text,font,tray,sdl,shims}.c 与 zan_audio.c
+  （B-ID71 音频修复不在旧触发列表、workflow 从未重跑，是四件驱动静默过期的根因）；
+  win GUI DLL 改双腿 CI 构建+回写（win-x64 此前靠开发者本机 CMake 产物）；配方补
+  gui_runtime_dwrite.cpp 必需 TU（旧单文件配方在 zan_dw_* 成硬依赖后已链不开，
+  continue-on-error 掩盖）。本 workflow 随该提交自动重跑并回写四件驱动
+  （win-x64/win-arm64 dll、linux 双架构 a、macos 双 dylib，B-ID82 残项随之清零，
+  以 CI 回写提交为准）。残项：ohos-arm64 GUI 驱动——需 OHOS SDK（native_window 等
+  平台窗口库）builder，当前 GitHub runner 无法产出，另行立项。
