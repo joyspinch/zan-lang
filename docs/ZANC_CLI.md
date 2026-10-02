@@ -130,7 +130,7 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `--list-targets` | 列出全部目标 |
 | `--subsystem <console\|windows>` | PE 子系统；GUI 程序用 windows（仅 Windows） |
 | （无旗标，按目标自动） | Windows/Linux/macOS 的 x64/arm64 目标自动链入多 worker 协程调度器（`zanrt_io_mt`）；worker 数解析顺序：`System.Threading.AsyncRuntime.SetWorkers`（Main 内设置）→ `ZAN_CO_WORKERS` 环境变量 → 逻辑核数。IO 分片与同步完成快路径同理由 `AsyncRuntime` 优先于 `ZAN_IO_SHARDS`/`ZAN_IO_SYNCFAST` |
-| `--fast-alloc` | 前端 malloc 换每线程小对象分配器（服务端负载，native） |
+| `--fast-alloc` | 前端 malloc 换每线程小对象分配器（`rt_mem.c`：≤2048B 尺寸分级无锁缓存，`ld --wrap` 全图接管）。native 可用——Windows 链接自动改走捆绑 GNU ld（lld 的 PE `--wrap` 改写导入槽，程序加载即死 exit 127）；linux-musl 交叉默认即链；Apple/Android 不链。实测 win-x64：k=1 spawn_us -31%。调试：`ZAN_LINK_ECHO=1` 回显链接命令 |
 | `--no-runtime-checks` | 关运行时守卫（如除零） |
 | `--strict-runtime` | 守卫失败直接 exit(70)（否则受 ZAN_RT_HARD 控制） |
 | `--link-mode <shared\|static>` | 发布时原生驱动链接方式（默认 shared：拷驱动在 exe 旁） |

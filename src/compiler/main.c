@@ -6584,7 +6584,11 @@ int main(int argc, char **argv) {
          * realloc for the whole image, so it is only linked when asked for. */
         const char *rt_mem_obj = NULL;
 #ifdef ZAN_RT_MEM_OBJ
-        if (fast_alloc && !cross_compiling) {
+        /* ld64 has no --wrap, so Mach-O native builds never link the
+         * allocator (mirrors the shared-lib link guard); the warning below
+         * tells the user instead of failing the link. */
+        if (fast_alloc && !cross_compiling &&
+            target.os != ZAN_OS_MACOS && target.os != ZAN_OS_IOS) {
             snprintf(rt_mem_buf, sizeof(rt_mem_buf), "%s/%s",
                      link_exe_dir, zan_path_basename(ZAN_RT_MEM_OBJ));
             if (zan_file_exists(rt_mem_buf)) rt_mem_obj = rt_mem_buf;
@@ -8642,9 +8646,21 @@ int main(int argc, char **argv) {
             argv[a] = NULL;
             char lld_path[1200];
             snprintf(lld_path, sizeof(lld_path), "%s\\ld.lld.exe", exe_dir);
-            const char *linker = zan_utf8_get_file_attributes(lld_path) != INVALID_FILE_ATTRIBUTES
-                                     ? lld_path : ld_path;
+            /* Prefer GNU ld when the small-object allocator is linked: lld's
+             * --wrap on PE/COFF rewrites the import slots into __wrap aliases
+             * that never engage the wrap and kill the process before main
+             * (lld 20.1.8: silent exit 127 at load; GNU ld links the same
+             * objects and CRT correctly). lld stays the default otherwise --
+             * GNU ld mishandles large non-fast-alloc links (REL32 overflow). */
+            const char *linker = rt_mem_obj ? ld_path
+                                 : (zan_utf8_get_file_attributes(lld_path) != INVALID_FILE_ATTRIBUTES
+                                    ? lld_path : ld_path);
             argv[0] = linker;
+            if (getenv("ZAN_LINK_ECHO")) {
+                fprintf(stderr, "[link]");
+                for (int i = 1; i < a; i++) fprintf(stderr, " %s", argv[i]);
+                fprintf(stderr, "\n");
+            }
             link_ret = (int)zan_utf8_spawnv(_P_WAIT, linker, argv);
         } else {
             char link_cmd[4096];
@@ -8730,6 +8746,7 @@ int main(int argc, char **argv) {
                 snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " %s",
                          static_driver_libs[li]);
             }
+            if (getenv("ZAN_LINK_ECHO")) fprintf(stderr, "[link] %s\n", link_cmd);
             link_ret = system(link_cmd);
         }
 #else

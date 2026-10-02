@@ -1,6 +1,6 @@
 ---
 name: zan-compiler-internals
-description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、限定名简单名回退（错命名空间的发射被用户同名类击穿）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑（AST 真引用闭包、stdlib 输入自我遮蔽、潜伏缺 using、重臂 Bootstrap 注册制）、LLVMIsConstant/llvm.global_ctors/PE 数据分节 $ 命名等发布体积分节陷阱、GNU ld PE 把 .pdata 当 GC 根、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden、追发布体积、动 stdlib 重组件目录或 ControlFactory/App 拉入面时使用。
+description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、限定名简单名回退（错命名空间的发射被用户同名类击穿）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑（AST 真引用闭包、stdlib 输入自我遮蔽、潜伏缺 using、重臂 Bootstrap 注册制）、LLVMIsConstant/llvm.global_ctors/PE 数据分节 $ 命名等发布体积分节陷阱、GNU ld PE 把 .pdata 当 GC 根、lld PE --wrap 改写导入槽（--fast-alloc 链接改走 GNU ld）、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden、追发布体积、动 stdlib 重组件目录或 ControlFactory/App 拉入面时使用。
 ---
 
 # zanc 编译器内部定式与坑
@@ -120,6 +120,15 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   `ZAN_PULLIN_DEBUG` 两态 diff。注意 `-DFOO=1` 第二跑 hit 是命中同 key
   自己写的缓存（正确），别误读成"define 没进 key"——看缓存目录文件
   总数是否按批次增长。
+
+- **lld 的 PE `--wrap` 与导入符号不兼容（2026-10-02）**：`--fast-alloc` 靠
+  `ld --wrap=malloc/free/calloc/realloc` 全图接管分配，lld 20.1.8（GNU 仿真
+  `-m i386pep`）把导入槽改写成 `__imp___wrap_malloc` 别名——wrap 实际不生效，
+  程序在 main 之前加载即死（msys 报 exit 127、零输出）；GNU ld 2.36 链同样
+  对象与 CRT 全绿。定式："启动即死零输出"先怀疑加载失败而非代码；链接器疑点
+  用同一批对象换链接器 A/B，别先改代码。zanc 在链 `--fast-alloc` 时自动改用
+  捆绑 GNU ld（大对象 REL32 风险只落在 opt-in 分配器的链接上）；
+  `ZAN_LINK_ECHO=1` 回显完整链接命令，供手工重放二分。
 
 ## 发布体积：数据逐符号分节与链接器 GC 的边界（2026-09-15）
 
