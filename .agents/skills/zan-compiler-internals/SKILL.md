@@ -597,6 +597,15 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   3. `BsonReader` 严格先以减法校验 `total > len - lenAt` 并设定 512MB 绝对上限，对 `binary` 与 `string` 增加 512MB 边界守护，超限抛出 `BsonException`。
 - **回归锁定**：`ctest -R "msgpack|bson"` 16 项全套孪生测试（conformance/determinism/leakcheck/arcguard）100% 全部通过。
 
+## JSON 浮点解析超大指数防御：FloatDoS 防挂死与 [-350, 350] 钳制（JsonTape / JsonValue）
+
+- **病灶**：在 `JsonDoc.DoubleInRange` 与 `JsonValue.DoubleOf` 中，原先针对 `e` 指数缩放循环采用 `while (e > 22) { v = v * 1e22; e = e - 22; }` 与 `while (e < -22) { v = v / 1e22; e = e + 22; }`；
+- **危害**：
+  1. JSON 规范允许任意长度的指数（如 `1e99999999` 或 `1e-99999999`），解析器将 `ex` 累加至最大 100,000,000；
+  2. 进入 `while (e > 22)` 循环后，虽然在十几次倍乘后 IEEE 754 已经溢出为 `Infinity` 或下溢为 `0.0`，但循环必须空转 **4,545,454 次**，导致单条恶意数字挂起 CPU 数十至数百毫秒，构成经典的 FloatDoS 算法复杂度消耗攻击；
+  3. 落地重构：将指数 `e` 钳制在 IEEE 754 极值区间 `[-350, 350]` 内，常规浮点数计算精度位级不变，超限极值浮点仅需十余次常数级缩放即可收敛至 `Infinity` 或 `0.0`，从根本上根除 CPU 拒绝服务漏洞。
+- **回归锁定**：`ctest -R "json_number_precision|json_tape_roundtrip|json_depth|json_errors"` 16 项孪生测试 100% 全部通过。
+
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
 - **症状**：浏览器 `WebAssembly.instantiate` 报 `Compiling function #N:"X"
