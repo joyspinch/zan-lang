@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 
 namespace System.IO;
 
@@ -121,8 +122,16 @@ class Directory {
     [DllImport("crt", EntryPoint = "opendir")]
     static extern nint opendir(string name);
 
+    // readdir 返回 struct dirent*（B-ID62：误声明成 string 时 ARC 会
+    // 把 dirent 首字节当长度、按 C 字符串读，而 d_name 在 19/21 字节
+    // 偏移上——名字永远读不到，GetFiles/GetDirectories 恒空）。
     [DllImport("crt", EntryPoint = "readdir")]
-    static extern string readdir(nint dirp);
+    static extern nint readdir(nint dirp);
+
+    // readlink 成功返回写入的字节数（ssize_t），失败返回 -1：
+    // 不引入 struct stat 布局依赖即可判定符号链接（B-ID63）。
+    [DllImport("crt", EntryPoint = "readlink")]
+    static extern long ReadLink(string path, byte[] buf, int size);
 
     [DllImport("crt", EntryPoint = "closedir")]
     static extern int closedir(nint dirp);
@@ -329,7 +338,10 @@ class Directory {
                 string fname = winName(findData);
                 Span<byte> attr = new Span<byte>(findData, 4);
                 int attrs = attr[0] + attr[1] * 256 + attr[2] * 65536 + attr[3] * 16777216;
-                bool isDir = (attrs & 16) != 0;
+                // reparse point（junction/符号链接）：按文件收，删除方
+                // 删链接本身，绝不递归进指向的树（B-ID63，与 POSIX 的
+                // readlink 判定同语义）。
+                bool isDir = (attrs & 1024) == 0 && (attrs & 16) != 0;
                 bool hidden = (attrs & 2) != 0;
                 if (fname != "." && fname != ".."
                     && isDir == wantDirs
@@ -375,20 +387,39 @@ class Directory {
     static int direntDirType() { return 4; }
     #endif
 
-    /// 从 struct dirent* 读取以 NUL 结尾的 d_name。
-    static string posixName(string ent) {
-        if (ent == null) { return ""; }
+    /// 从 struct dirent* 读取以 NUL 结尾的 d_name：dirent 是 extern
+    /// 裸内存，按平台偏移手工取字节（上限 255，遇 0 止），再经
+    /// Encoding.GetString 校验拷出。ent == 0（枚举结束）返回 ""。
+    static string posixName(nint ent) {
+        if (ent == 0) { return ""; }
         int nameOff = direntNameOffset();
-        int end = nameOff;
-        while (end < ent.Length && end - nameOff < 255 && (ent[end] & 255) != 0) {
-            end = end + 1;
-        }
-        return ent.Substring(nameOff, end - nameOff);
+        // POSIX/WASI 的 d_name 都声明为 char[256]（Darwin 更大），
+        // nameOff + 256 不会越过条目边界。
+        Span<byte> sp = new Span<byte>(ent, nameOff + 256);
+        int n = 0;
+        while (n < 255 && (sp[nameOff + n] & 255) != 0) { n = n + 1; }
+        byte[] buf = new byte[n];
+        for (int i = 0; i < n; i = i + 1) { buf[i] = sp[nameOff + i]; }
+        return Encoding.GetString(buf, 0, n);
+    }
+
+    /// 路径本身是符号链接时返回 true（readlink 成功即链接）。WASI 的
+    /// 预开沙箱里链接本就指不出树外，无需这层防护；wasm32 的 ssize_t
+    /// 是 32 位，也不适合按 long 读返回值。
+    static bool IsSymlink(string path) {
+        #if WASI
+        return false;
+        #else
+        byte[] buf = new byte[8];
+        return ReadLink(path, buf, 8) >= 0;
+        #endif
     }
 
     /// opendir/readdir 枚举一层：wantDirs 决定收文件还是目录，
-    /// includeHidden=false 时跳过 "." 开头的条目。d_type 未知或为
-    /// 符号链接时用 opendir 探测真身，返回条目名（不含路径）。
+    /// includeHidden=false 时跳过 "." 开头的条目。符号链接一律按
+    /// 文件收（删除方 unlink 链接本身，不递归进目标，见 B-ID63）；
+    /// 只有 d_type 未知（DT_UNKNOWN）时才探测真身。返回条目名
+    /// （不含路径）。
     static List<string> posixList(
         string path,
         bool wantDirs,
@@ -397,23 +428,33 @@ class Directory {
         List<string> result = new List<string>();
         nint d = opendir(path);
         if (d == 0) { return result; }
-        string ent = readdir(d);
-        while (ent != null) {
+        nint ent = readdir(d);
+        while (ent != 0) {
             string name = posixName(ent);
             if (name != "" && name != "." && name != "..") {
                 bool hidden = (name[0] & 255) == 46; // '.'
-                int dtype = ent[direntTypeOffset()] & 255;   // d_type
+                Span<byte> entBytes = new Span<byte>(ent, direntTypeOffset() + 1);
+                int dtype = entBytes[direntTypeOffset()] & 255;   // d_type
                 bool isDir = false;
                 if (dtype == direntDirType()) {   // DT_DIR（WASI 下是 filetype 3）
                     isDir = true;
-                } else if (dtype == 0 || dtype == 10) {
-                    // DT_UNKNOWN（文件系统不填 d_type）或 DT_LNK：探测该
-                    // 条目。指向目录的符号链接要算目录——Windows 上
-                    // FILE_ATTRIBUTE_DIRECTORY 对目录联接同样置位，
-                    // 而 /sys、/proc 下几乎全是这种链接。
+                } else if (dtype == 10 || dtype == 7) {
+                    // DT_LNK（POSIX 10）/ WASI filetype 7（SYMBOLIC_LINK）：
+                    // 链接按文件收——DeleteRecursive 会 unlink 链接本身，
+                    // 绝不递归进指向的树（B-ID63：旧实现 opendir 探测真身，
+                    // 指向树外目录的链接被连根拔掉）。
+                    isDir = false;
+                } else if (dtype == 0) {
+                    // DT_UNKNOWN（文件系统不填 d_type）：先 readlink 判
+                    // 链接（同上按文件收），非链接才 opendir 探真身——
+                    // 普通目录必须能被 GetDirectories 枚举到。
                     string full = path + "/" + name;
-                    nint sub = opendir(full);
-                    if (sub != 0) { isDir = true; closedir(sub); }
+                    if (Directory.IsSymlink(full)) {
+                        isDir = false;
+                    } else {
+                        nint sub = opendir(full);
+                        if (sub != 0) { isDir = true; closedir(sub); }
+                    }
                 }
                 if (isDir == wantDirs
                     && (includeHidden || !hidden)) {
@@ -564,6 +605,19 @@ class Directory {
     /// <summary>递归删除目录及其全部内容。目录本来就不存在时返回 true；
     /// 任何一项删不掉（占用/权限）时返回 false，其余项仍会尽力删除。</summary>
     static bool DeleteRecursive(string path) {
+        // 顶层本身是链接（Windows junction/符号链接、POSIX 符号链接）
+        // 时只删链接本身，绝不递归进指向的树——B-ID63。
+        #if WINDOWS
+        if (File.IsReparsePoint(path)) {
+            File.Delete(path);
+            return !File.Exists(path);
+        }
+        #else
+        if (Directory.IsSymlink(path)) {
+            File.Delete(path);
+            return !File.Exists(path);
+        }
+        #endif
         if (!ExistsOnDisk(path)) { return true; }
         string dir = path;
         if (dir.EndsWith("/") || dir.EndsWith("\\")) {

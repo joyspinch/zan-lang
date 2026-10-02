@@ -269,8 +269,35 @@ class File {
         #endif
     }
 
-    /// <summary>删除指定路径的文件。</summary>
+    #if WINDOWS
+    /// UTF-8 路径的 Win32 文件属性；路径不存在（INVALID_FILE_ATTRIBUTES）
+    /// 与查询失败统一归 -1。
+    static int AttrsOfUtf8(string path) {
+        nint wpath = Wide.Of(path);
+        int attrs = GetFileAttributesW(wpath);
+        Wide.Free(wpath);
+        if (attrs == -1 || attrs == 4294967295) { return -1; }
+        return attrs;
+    }
+    #endif
+
+    /// <summary>删除指定路径的文件。路径是 reparse point（目录
+    /// junction、符号链接）时删链接本身：junction/symlink-to-dir 带
+    /// 目录位，remove() 把它当目录拒绝、DeleteFileW 又会拒绝目录位，
+    /// 只有 RemoveDirectoryW/DeleteFileW 按位二选一才能拆掉 reparse
+    /// point 而不进入目标（POSIX 的 remove/unlink 本来就只摘链接，
+    /// 无需特判）。</summary>
     static void Delete(string path) {
+        #if WINDOWS
+        int attrs = File.AttrsOfUtf8(path);
+        if (attrs >= 0 && (attrs & 0x400) != 0) {
+            nint wpath = Wide.Of(path);
+            if ((attrs & 16) != 0) { WinRemoveDirectory(wpath); }
+            else { WinDeleteFile(wpath); }
+            Wide.Free(wpath);
+            return;
+        }
+        #endif
         remove(path);
     }
 
@@ -553,6 +580,12 @@ class File {
 
     [DllImport("kernel32", EntryPoint = "GetFileAttributesW")]
     static extern int GetFileAttributesW(nint path);
+
+    [DllImport("kernel32", EntryPoint = "DeleteFileW")]
+    static extern int WinDeleteFile(nint path);
+
+    [DllImport("kernel32", EntryPoint = "RemoveDirectoryW")]
+    static extern int WinRemoveDirectory(nint path);
     #endif
 
     #if !WINDOWS
