@@ -1,14 +1,15 @@
 # Zan.DataFrame
 
-纯 Zan 表格数据核心：RFC 4180 CSV 解析/写出 + 列式 DataFrame
-（类型推断、过滤、稳定排序、分组聚合、哈希内连接）。零原生依赖、
-零反射——`using System.Data;` 按需拉入，命名空间与 Zan.Data 共存。
+纯 Zan 表格数据核心：列式 DataFrame（类型推断、过滤、稳定排序、
+分组聚合、哈希内连接），CSV 读写消费 `Zan.Csv`（`System.Csv`）。
+零原生依赖、零反射——`using System.Data;` 按需拉入，命名空间与
+Zan.Data 共存。
 
 ## 内容（namespace → 内容）
 
-- `System.Data` — `Csv`（Parse/ParseRow/Escape/RowToText）、
-  `CsvTable`、`DataFrame`（列存 + 查询原语）、`DataCol`、`RowGroup`、
-  `ColKind`/`Agg` 枚举
+- `System.Data` — `DataFrame`（列存 + 查询原语）、`DataCol`、
+  `RowGroup`、`ColKind`/`Agg` 枚举（CSV 的 `Csv`/`CsvTable` 已迁至
+  `packages/Zan.Csv` 的 `System.Csv`）
 
 ## 快速上手
 
@@ -33,9 +34,9 @@ string text = big.ToCsv();                          // 往返无损
   空列推断为 Str）。
 - **跨类型访问自动转换**：Int 列 `GetStr` 得十进制文本，Float 列
   `GetInt` 截断；double ↔ 文本走最短往返格式，`Parse(ToCsv())` 等价。
-- **CSV 方言**：RFC 4180——引号字段可含逗号/换行，`""` 转义，
-  CRLF/LF/CR 记录分隔，开头 UTF-8 BOM 剥除；字段两侧空白属字段
-  本身不裁剪。写出与解析严格互逆。
+- **CSV 方言**（经 `Zan.Csv`）：RFC 4180——引号字段可含逗号/换行，
+  `""` 转义，CRLF/LF/CR 记录分隔，开头 UTF-8 BOM 剥除；字段两侧
+  空白属字段本身不裁剪。写出与解析严格互逆。
 - **稳定排序**：归并实现，相等键保持原相对顺序。
 - **Join**：内连接哈希实现；右表键列不进结果，其余右表列与左表
   撞名时加 `_1` 后缀。
@@ -45,7 +46,7 @@ string text = big.ToCsv();                          // 往返无损
 ## 消费者
 
 - `packages/Zan.Desktop` 的 `TaskScheduler.ParseCsv`（schtasks
-  CSV 输出行解析，已收编为本包 `Csv.ParseRow`）
+  CSV 输出行解析，经 `Zan.Csv` 的 `Csv.ParseRow`）
 - 需要表格数据解析的任何程序（报表、日志归并、数据导出）
 
 ## 已知边界

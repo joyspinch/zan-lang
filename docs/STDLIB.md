@@ -125,16 +125,10 @@ stdlib/
 │   │   ├── Queue.zan                # FIFO queue
 │   │   └── Stack.zan                # LIFO stack
 │   │
-│   ├── Text/                        # System.Text
-│   │   ├── Encoding.zan             # UTF-8/16/32 encoding
-│   │   ├── TextTable.zan            # aligned text tables
-│   │   ├── Pinyin.zan               # pinyin conversion
-│   │   ├── Bm25Index.zan            # BM25 full-text index
-│   │   ├── Csv.zan                  # CSV read/write
-│   │   ├── Markdown.zan             # Markdown parsing
-│   │   ├── Template.zan             # text templates
-│   │   ├── FuzzyMatching.zan        # fuzzy string matching
-│   │   └── RegularExpressions/      # Match.zan, Regex.zan, RegexProgram.zan
+│   ├── Text/                        # System.Text (encoding only; text
+│   │   │                            # processing lives in packages/Zan.Text,
+│   │   │                            # CSV in packages/Zan.Csv)
+│   │   └── Encoding.zan             # UTF-8/16/32 encoding
 │   │
 │   ├── Net/                         # System.Net
 │   │   ├── Net.zan / NetworkInterface.zan / ServerBanner.zan

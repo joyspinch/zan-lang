@@ -1,30 +1,47 @@
 using System;
 
-namespace System.Data;
+namespace System.Csv;
 
 /// <summary>
-/// RFC 4180 CSV 解析与写出。
+/// RFC 4180 CSV 解析与写出（原先分散在 System.Text / System.Data 的
+/// 两份实现合并于此，API 取两者并集）。
 ///
 /// 解析按字节进行（Zan 字符串即 UTF-8 字节），多字节字符原样保留：
-///  - 字段分隔符为逗号；记录分隔符为 CRLF、LF 或 CR；
-///  - 引号字段（以 '"' 起始）可包含逗号与换行，'"' 转义为两个 '"'；
+///  - 字段分隔符默认逗号（ParseSep 可指定，如 TSV 用制表符）；
+///    记录分隔符为 CRLF、LF 或 CR；
+///  - 引号字段（以 '"' 起始）可包含分隔符与换行，'"' 转义为两个 '"'；
+///    字段中途出现的引号（ab"cd）按字面字符收下（宽松解析）；
 ///  - 输入开头的 UTF-8 BOM（EF BB BF）被剥除；
 ///  - 末尾的记录分隔符不产生空记录；文本结束后无换行的最后一条
 ///    记录正常收尾；
 ///  - 字段两侧的空白按规范属于字段本身，不做裁剪。
 ///
-/// 写出（Escape/RowToText）与解析严格互逆：含逗号、引号或换行的
-/// 字段加引号，字段内引号翻倍。
+/// 写出与解析严格互逆：含分隔符、引号或换行的字段加引号，
+/// 字段内引号翻倍；Serialize 每条记录以 '\n' 结尾。
 ///
 ///   CsvTable t = Csv.Parse(File.ReadAllText("data.csv"));
+///   CsvTable tsv = Csv.ParseSep(text, "\t");
 ///   List<string> cells = Csv.ParseRow("1,\"a,b\",3");
 ///   string line = Csv.RowToText(fields);
+///   string all = Csv.Serialize(rows);
 /// </summary>
 class Csv {
     /// <summary>解析整段 CSV 文本为表：调用方约定首记录为表头
     /// （本层不做该假设）。空文本返回零行表。</summary>
     static CsvTable Parse(string text) {
+        return Csv.ParseSep(text, ",");
+    }
+
+    /// <summary>使用自定义分隔符（单个字符）解析；分隔符为空或
+    /// 是引号/换行这类会破坏语法的字符时回退为逗号。</summary>
+    static CsvTable ParseSep(string text, string separator) {
         CsvTable t = new CsvTable();
+        if (text == null) { return t; }
+        int sep = 44;
+        if (separator != null && separator.Length > 0) {
+            sep = separator[0] & 255;
+            if (sep == 34 || sep == 13 || sep == 10) { sep = 44; }
+        }
         int n = text.Length;
         int i = 0;
         if (n >= 3 && (text[0] & 255) == 239 && (text[1] & 255) == 187
@@ -67,7 +84,7 @@ class Csv {
                 }
                 continue;
             }
-            if (c == 44) {                          // ',' 字段结束
+            if (c == sep) {                         // 字段结束
                 rec.Add(sb.ToString());
                 sb.Clear();
                 dirty = true;
@@ -94,7 +111,7 @@ class Csv {
             int begin = i;
             while (i < n) {
                 int d = text[i] & 255;
-                if (d == 44 || d == 13 || d == 10 || d == 34) { break; }
+                if (d == sep || d == 13 || d == 10 || d == 34) { break; }
                 i = i + 1;
             }
             sb.Append(text.Substring(begin, i - begin));
@@ -123,37 +140,74 @@ class Csv {
     }
 
     /// <summary>写出单个字段：含逗号、引号或换行时加引号，
-    /// 字段内引号翻倍；其余原样返回。</summary>
+    /// 字段内引号翻倍；其余原样返回。null 视为空字段。</summary>
     static string Escape(string field) {
-        bool need = false;
-        int n = field.Length;
-        for (int i = 0; i < n; i = i + 1) {
-            int c = field[i] & 255;
-            if (c == 44 || c == 34 || c == 13 || c == 10) {
-                need = true;
-                break;
+        return Csv.EscapeSep(field, ",");
+    }
+
+    /// <summary>同 Escape，但针对自定义分隔符判断是否需要加引号
+    /// （多字符分隔符用子串匹配）。</summary>
+    static string EscapeSep(string field, string separator) {
+        if (field == null) { return ""; }
+        int flen = field.Length;
+        int sepChar = (separator != null && separator.Length == 1) ? (separator[0] & 255) : -1;
+        bool needQuote = false;
+        if (sepChar >= 0) {
+            for (int i = 0; i < flen; i = i + 1) {
+                int c = field[i] & 255;
+                if (c == sepChar || c == 34 || c == 10 || c == 13) {
+                    needQuote = true;
+                    break;
+                }
             }
+        } else {
+            if (separator != null && field.IndexOf(separator, 0) >= 0) { needQuote = true; }
+            else if (field.IndexOf("\"", 0) >= 0 || field.IndexOf("\n", 0) >= 0 || field.IndexOf("\r", 0) >= 0) { needQuote = true; }
         }
-        if (!need) { return field; }
+        if (!needQuote) { return field; }
         StringBuilder sb = new StringBuilder();
         sb.Append("\"");
-        for (int i = 0; i < n; i = i + 1) {
+        int last = 0;
+        for (int i = 0; i < flen; i = i + 1) {
             if ((field[i] & 255) == 34) {
+                if (i > last) { sb.Append(field.Substring(last, i - last)); }
                 sb.Append("\"\"");
-            } else {
-                sb.Append(field.Substring(i, 1));
+                last = i + 1;
             }
         }
+        if (last < flen) { sb.Append(field.Substring(last, flen - last)); }
         sb.Append("\"");
         return sb.ToString();
     }
 
-    /// <summary>把一条记录写为一行（不含行尾换行符）。</summary>
+    /// <summary>把一条记录写为一行（逗号分隔，不含行尾换行符）。</summary>
     static string RowToText(List<string> fields) {
+        return Csv.RowToTextSep(fields, ",");
+    }
+
+    /// <summary>把一条记录写为一行（自定义分隔符，不含行尾换行符）。</summary>
+    static string RowToTextSep(List<string> fields, string separator) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < fields.Count; i = i + 1) {
-            if (i > 0) { sb.Append(","); }
-            sb.Append(Csv.Escape(fields[i]));
+            if (i > 0) { sb.Append(separator); }
+            sb.Append(Csv.EscapeSep(fields[i], separator));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>把行列表序列化为 CSV 文本（逗号分隔），每条记录
+    /// 以 '\n' 结尾。</summary>
+    static string Serialize(List<List<string>> rows) {
+        return Csv.SerializeSep(rows, ",");
+    }
+
+    /// <summary>把行列表序列化为 CSV 文本（自定义分隔符），每条
+    /// 记录以 '\n' 结尾。</summary>
+    static string SerializeSep(List<List<string>> rows, string separator) {
+        StringBuilder sb = new StringBuilder();
+        for (int r = 0; r < rows.Count; r = r + 1) {
+            sb.Append(Csv.RowToTextSep(rows[r], separator));
+            sb.Append("\n");
         }
         return sb.ToString();
     }

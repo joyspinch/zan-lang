@@ -8,7 +8,6 @@
 | 文件 | 内容 |
 |---|---|
 | `Markdown.zan` | Markdown → HTML 渲染 |
-| `Csv.zan` | CSV 读写（引号/转义往返） |
 | `Pinyin.zan` | 汉字转拼音（`data/pinyin.txt` 数据表） |
 | `Bm25Index.zan` | BM25 全文检索 |
 | `FuzzyMatching.zan` | 模糊匹配 |
