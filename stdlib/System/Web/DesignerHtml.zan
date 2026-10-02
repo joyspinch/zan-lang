@@ -35,7 +35,7 @@ namespace System.Web;
 ///     字符串值不作数字/布尔嗅探，props 的 "min":"0" 不会漂成数字。
 ///   - options（字符串数组）→ data-options="a|b|c"（与 JoinOpts 同
 ///     分隔，| 内嵌限制相同）。
-///   - 属性值统一实体转义（& < > "）；原生语义发原生形态——img 的
+///   - 属性值统一实体转义（& < > " '）；原生语义发原生形态——img 的
 ///     src/alt、input/textarea 的 placeholder/value 发真属性，
 ///     button/label/textarea 的 text 发元素文本（读端与 data-* 通道
 ///     等价），其余键全在属性里，规避 HTML 空白塌缩。
@@ -122,7 +122,7 @@ class DesignerHtml {
             // Element 的真实标签在 "tag" 键（div/span/template...），
             // 键本身不入属性循环——它已经是元素名。
             tag = o.Str("tag", "");
-            if (tag == "") { tag = "div"; }
+            if (!DesignerHtml.IsTagName(tag)) { tag = "div"; }
         }
         string pad = "";
         for (int i = 0; i < depth; i = i + 1) { pad = pad + "  "; }
@@ -173,13 +173,13 @@ class DesignerHtml {
             // 的 text 发元素文本（收尾）——文档读起来就是真 HTML。
             if (kind == "Image" && (key == "src" || key == "alt")) {
                 string nv = v.IsString() ? v.AsString("") : "";
-                if (nv != "") { b.Append(" " + key + "=\"" + EscapeAttr(nv) + "\""); }
+                if (nv != "") { b.Append(" " + EscapeAttr(key) + "=\"" + EscapeAttr(nv) + "\""); }
                 continue;
             }
             if ((kind == "Input" || kind == "TextArea")
                 && (key == "placeholder" || key == "value")) {
                 string pv = v.IsString() ? v.AsString("") : "";
-                if (pv != "") { b.Append(" " + key + "=\"" + EscapeAttr(pv) + "\""); }
+                if (pv != "") { b.Append(" " + EscapeAttr(key) + "=\"" + EscapeAttr(pv) + "\""); }
                 continue;
             }
             if ((kind == "Button" || kind == "Label" || kind == "TextArea"
@@ -230,7 +230,9 @@ class DesignerHtml {
                     || key == "value")) {
                 string rv = v.IsString() ? v.AsString("")
                     : (v.IsNumber() ? Convert.ToString(v.AsInt(0)) : "");
-                if (rv != "") { b.Append(" " + key + "=\"" + rv + "\""); }
+                // B-ID80：rv 与属性名 key 都过 EscapeAttr（key 此处虽已
+                // 与字面量判等，转义为零开销防御；rv 来自设计稿可注入）。
+                if (rv != "") { b.Append(" " + EscapeAttr(key) + "=\"" + EscapeAttr(rv) + "\""); }
                 continue;
             }
             if ((kind == "ColorPicker" || kind == "DatePicker")
@@ -508,11 +510,6 @@ class DesignerHtml {
             }
             return;
         }
-        if (v.IsString()) {
-            string s = v.AsString("");
-            if (s != "") { b.Append(" data-" + KebabKey(key) + "=\"" + EscapeAttr(s) + "\""); }
-            return;
-        }
         // 复合值（数组/对象）：紧凑 JSON 进 x- 属性
         b.Append(" data-x-" + KebabKey(key) + "=\""
                  + EscapeAttr(v.ToJson()) + "\"");
@@ -522,6 +519,11 @@ class DesignerHtml {
 
     /// "winW" → "win-w"；"onClick" → "on-click" 由调用方拆 on 前缀后
     /// 调用（这里只处理纯 Pascal/camel 段）。
+    /// 键名会拼进属性名位置（data-<kebab>），不可信设计稿的键不得
+    /// 携带引号/等号/空白等注入字符（B-ID80）：非字母数字的字节一律
+    /// 丢弃（kebab 连字符除外，由本函数的大写转换自己产生）。常规
+    /// camelCase 键不受影响；含 _ . : 等的历史键往返会归并——读端
+    /// Unkebab 只为文档可读性，不承担安全语义。
     static string KebabKey(string s) {
         string outp = "";
         for (int i = 0; i < s.Length; i = i + 1) {
@@ -529,9 +531,11 @@ class DesignerHtml {
             if (c >= 65 && c <= 90) {
                 if (i > 0) { outp = outp + "-"; }
                 outp = outp + (char)(c + 32);
-            } else {
+            } else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)
+                       || c == 45) {
                 outp = outp + s.Substring(i, 1);
             }
+            // 其余字节丢弃：属性名位置的注入面在此收口。
         }
         return outp;
     }
@@ -568,7 +572,8 @@ class DesignerHtml {
         return digits > 0 && dots <= 1;
     }
 
-    /// 属性值实体转义。
+    /// 属性值实体转义。' 也转（&#39;）：属性虽统一双引号包裹，
+    /// 单引号转义是纵深防御——防止未来某个调用点改用单引号包裹。
     static string EscapeAttr(string s) {
         string outp = "";
         for (int i = 0; i < s.Length; i = i + 1) {
@@ -577,9 +582,23 @@ class DesignerHtml {
             else if (ch == "<") { outp = outp + "&lt;"; }
             else if (ch == ">") { outp = outp + "&gt;"; }
             else if (ch == "\"") { outp = outp + "&quot;"; }
+            else if (ch == "'") { outp = outp + "&#39;"; }
             else { outp = outp + ch; }
         }
         return outp;
+    }
+
+    /// tag 值合法性（B-ID80）：设计稿 JSON 可以来自不可信的 .html，
+    /// tag 会原样拼进 "<" + tag，必须钳在 HTML 标签名字符集内
+    /// （首字母字母 + HtmlText.IsNameChar 同款字符集），否则回落
+    /// "div"——注入字符在此处断路，不靠下游转义兜底。
+    static bool IsTagName(string s) {
+        if (s.Length == 0) { return false; }
+        if (!HtmlText.IsAlpha(s[0])) { return false; }
+        for (int i = 1; i < s.Length; i = i + 1) {
+            if (!HtmlText.IsNameChar(s[i])) { return false; }
+        }
+        return true;
     }
 
     /// kind → 存储 tag。有 HTML 原生等价物的走原生标签；Panel 走裸
