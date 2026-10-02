@@ -317,7 +317,31 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
      即汇合；`await Task.Delay(1)` 保底吃 1-2ms 睡眠。定式=先让渡 N 圈再退避
      Delay（N=8 足够；预算耗尽说明批次是 IO/定时器长任务，让渡会空转烧核）。
      小扇出实测每批 62-212µs→6-26µs。同二进制 A/B 技巧：预算做成静态字段，
-     探针置 0 即回退旧行为。
+     探针置 0 即回退旧行为。**2026-10-02 起此定式只剩手写轮询场景**：
+     `Task.WhenAll/WhenAny` 已事件化（见下条 B-ID56），标准库扇出汇合不再轮询。
+
+  7. **async 完成通知与挂起的三条铁律（B-ID56 事件驱动 join，2026-10-02）**：
+     - **借帧槽前必查 emit_detach_async_call**：spawn 帧的
+       `awaiter/awaiter_step` 槽在创建时就被预填 `self+reap_fn`（spawn/reap
+       生命周期自用，完成 epilogue xchg 后 ready(self,reap)→reap 释放）——
+       "spawn 帧无人 await、槽位空闲"是错觉，挂账时的 aw 槽 CAS join 设计
+       因此整体否决。
+     - **完成通知主点=完成 epilogue，不是 untrack**：每个 async 帧在
+       `emit_async_complete`（DONE 发布之后）恰过一次，这是唯一普适钩点；
+       untrack（`zan_co_live_del`）不是——`Task.Run` 结果帧 keep_result：
+       完成后只置 done、留在 live 表直到 Result/Wait 回收，untrack 永不
+       触发，只挂 untrack 的等待会挂到调度器无定时器可排、静默排水退出
+       （rc=0 无输出，极难归因）。untrack 只留作异常路径兜底。
+     - **挂起内建两形状**：Delay 形（运行时持有 (frame,step)，到期/事件
+       ready；挂起路径**禁 self-ready**）vs Yield 形（self-ready 重排环尾）。
+       事件等待必须 Delay 形——误抄 Yield 形加一个 self-ready，挂起立即
+       空转假醒，等价于没挂起。
+     - 附：irgen 发出的 **void 调用不得命名**（LLVM verifier 拒
+       "named void value"，如 `call void @f()` 带名即拒）；定位用
+       `ZANC_DUMP_BAD_IR=1`，自动 dump 被拒函数 IR。
+     - 附：交叉目标的运行时 .o，zanc 从 **exe 旁捆绑副本**（`build/<target>/`）
+       链接而非仓库 `toolchain/<target>/`——重建 toolchain 后不同步 cp 过去，
+       新符号照样 undefined symbol，像修复没生效。
 
 ## stdlib 肥边治理：独立类分片 + 槽反转 + 实例方法组注入（A332 肥边③④，2026-09-17）
 
