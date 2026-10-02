@@ -615,6 +615,15 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   3. 落地重构：改用减法防溢出安全比较 `if (bodyLen > maxRequestBytes - headerEnd) { reject = 413; break; }`，彻底杜绝加法回绕溢出漏洞。
 - **回归锁定**：`ctest -R "http_framing"` 4 项全套孪生测试（conformance/determinism/leakcheck/arcguard）100% 全部通过。
 
+## MQTT 帧累积扩容防线：MqttReader.Ensure 钳制 maxPacketLen 与 1GB 整型防溢出
+
+- **病灶**：在 `packages/Zan.Net/src/System/Net/Mqtt/MqttReader.zan` 中，原先针对累积缓冲区的动态倍增扩容直接采用无上限循环 `while (nc < need) { nc = nc * 2; }`；
+- **危害**：
+  1. 当对端发送异常或恶意的变长剩余长度报文，或者网络突发堆积时，`nc * 2` 在接近 32 位有符号整数上限（$2^{31}-1$）时会发生整型符号反转变为负数；
+  2. 产生负数容量后，`new byte[nc + 1]` 会抛出非法内存分配异常导致进程崩溃；且原扩容未受 `maxPacketLen`（16MB）约束，恶意对端可通过大报文打满服务器物理内存（OOM）；
+  3. 落地重构：引入 `maxCap = this.maxPacketLen + 65536` 限制，将扩容上限严格钳制在 `maxCap` 与 1 GiB（1073741824）整型安全上限之内，超过安全上限停止翻倍倍增，彻底杜绝整数回绕与无界堆分配。
+- **回归锁定**：`ctest -R "mqtt"` 12 项全套孪生测试（conformance/determinism/leakcheck/arcguard）100% 全部通过。
+
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
 - **症状**：浏览器 `WebAssembly.instantiate` 报 `Compiling function #N:"X"
