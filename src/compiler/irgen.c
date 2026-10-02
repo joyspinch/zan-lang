@@ -2303,6 +2303,14 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
          * Windows and would stretch the 2ms default to a clock tick. */
         LLVMValueRef g_slice_start = LLVMAddGlobal(g->mod, i64t, "__zan_co_slice_start");
         LLVMSetInitializer(g_slice_start, LLVMConstInt(i64t, 0, 0));
+        /* Poll clock-read gate (B-ID44(4)): zan_co_poll runs at every loop
+         * back-edge, and the per-iteration clock call was ~85% of a compute
+         * loop's cost (probe: 23ns/iter -> 3.7ns/iter gated). The M:1 driver
+         * is single-threaded, so a plain global counter skips 255 of 256
+         * polls; the 2ms quantum overshoots by at most 256 iterations of
+         * ns-grade work. */
+        LLVMValueRef g_poll_tick = LLVMAddGlobal(g->mod, i64t, "__zan_co_poll_tick");
+        LLVMSetInitializer(g_poll_tick, LLVMConstInt(i64t, 0, 0));
         LLVMSetLinkage(g_slice_start, LLVMInternalLinkage);
         LLVMValueRef g_quantum = LLVMAddGlobal(g->mod, i64t, "__zan_co_quantum_us");
         LLVMSetInitializer(g_quantum, LLVMConstInt(i64t, 0, 0));
@@ -2400,12 +2408,14 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         }
 
         /* i32 zan_co_poll(void): 1 when the running frame has held the
-         * worker past its quantum. One clock call per back-edge iteration
-         * (QPC / vDSO grade); the dispatch path restamps
-         * __zan_co_slice_start, so a requeued frame gets a fresh slice. */
+         * worker past its quantum. The clock call is gated to every 256th
+         * back-edge (__zan_co_poll_tick, see the global above); the dispatch
+         * path restamps __zan_co_slice_start, so a requeued frame gets a
+         * fresh slice. */
         {
             LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_poll, "entry");
             LLVMBasicBlockRef check = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_poll, "check");
+            LLVMBasicBlockRef gate  = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_poll, "gate");
             LLVMBasicBlockRef yes   = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_poll, "yes");
             LLVMBasicBlockRef no    = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_poll, "no");
             LLVMPositionBuilderAtEnd(g->builder, entry);
@@ -2415,6 +2425,16 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildCondBr(g->builder, enabled, check, no);
 
             LLVMPositionBuilderAtEnd(g->builder, check);
+            LLVMValueRef tick = LLVMBuildLoad2(g->builder, i64t, g_poll_tick, "tick");
+            LLVMValueRef tick1 = LLVMBuildAdd(g->builder, tick,
+                LLVMConstInt(i64t, 1, 0), "tick1");
+            LLVMBuildStore(g->builder, tick1, g_poll_tick);
+            LLVMValueRef hit = zan_icmp(g->builder, LLVMIntEQ,
+                LLVMBuildAnd(g->builder, tick1, LLVMConstInt(i64t, 255, 0), "tick.lo"),
+                LLVMConstInt(i64t, 0, 0), "gate.hit");
+            LLVMBuildCondBr(g->builder, hit, gate, no);
+
+            LLVMPositionBuilderAtEnd(g->builder, gate);
             LLVMValueRef now = zan_call2(g->builder, now_type, precise_now, NULL, 0, "now");
             LLVMValueRef start = LLVMBuildLoad2(g->builder, i64t, g_slice_start, "start");
             LLVMValueRef elapsed = LLVMBuildSub(g->builder, now, start, "elapsed");

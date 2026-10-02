@@ -280,6 +280,20 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   /subsystem 方向猜。另注意成员名比较的 `len` 要与字面量同步
   （"__DesignMain" 是 12 字节，写 13 永不命中——静默失配无任何诊断）。
 
+- **async 循环回边协作抢占与 QPC 时钟读节流门控（B-ID44(4)，2026-10-02）**：
+  为防止计算密集型 async 协程独占 worker，编译器在 async 函数的所有 `while`/`for`/`do`
+  回边注入 `zan_co_poll()`（当运行时间超量子时自动 `Task.Yield()` 让渡）。但实测发现：
+  若在每次回边无条件调用 `zan_co_precise_us()`（QPC/单调时钟读取），时钟调用的 CPU
+  开销占纳秒级紧凑计算循环的 ~85%（探针 23ns/iter 降到跳过时钟时的 3.7ns/iter）。
+  治理定式：
+  1. 引入 256 次节流门控（`ZAN_POLL_GATE = 256`）：
+     - M:1 内联驱动：在 LLVM IR 的 poll check 块维护全局 `__zan_co_poll_tick` 计数器，
+       仅在 `(tick & 255) == 0` 时才向下跳转至 `gate` 块读时钟；其余 255 次直接 `br %no`；
+     - 多 worker 驱动（`zanrt_io_mt`）：在 worker 局部结构体维护 `w->poll_tick`，
+       同样仅在 `(++w->poll_tick & (ZAN_POLL_GATE - 1)) == 0` 时才读时钟；
+  2. 误差可控性：在 2ms 量子下，跳过 255 次纳秒级循环至多产生数微秒的量化过冲，
+     但换取了紧凑计算循环 6.2 倍的吞吐提升，彻底消除了回边抢占对 CPU 密集循环的性能惩罚。
+
 ## stdlib 肥边治理：独立类分片 + 槽反转 + 实例方法组注入（A332 肥边③④，2026-09-17）
 
 - **重文件被"字段类型"钉进图，与被调用钉进同罪**：`HttpFramer` 有个

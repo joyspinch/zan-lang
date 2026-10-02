@@ -4194,6 +4194,12 @@ typedef void* HANDLE;
 #define ZAN_LQ_MASK      (ZAN_LQ_CAP - 1u)
 #define ZAN_LIFO_BUDGET  3           /* consecutive LIFO-cell resumes */
 #define ZAN_GLOBAL_TICK  61          /* injector fairness poll (Go's number) */
+/* zan_co_poll clock-read gate: the poll runs at EVERY loop back-edge of every
+ * async frame, and the QPC read was ~85% of a compute loop's per-iteration
+ * cost (probe: 23ns/iter -> 3.7ns/iter with the read skipped). A worker-local
+ * counter skips 255 of 256 polls; the 2ms quantum then overshoots by at most
+ * 256 iterations' worth of ns-grade work -- microsecond honesty kept. */
+#define ZAN_POLL_GATE     256u
 #define ZAN_STEAL_ROUNDS 2           /* randomized victim scans per search */
 #define ZAN_WAKE_KEY     ((ULONG_PTR)-3)  /* scheduler wake packet (DNS is -2) */
 
@@ -4262,6 +4268,7 @@ typedef struct {
     void              *cur;
     volatile LONG      parked;
     unsigned           tick;
+    unsigned           poll_tick;    /* zan_co_poll clock-read gate counter */
     unsigned           rng;
     /* Scheduling counters, written only by the owning worker (plain adds, no
      * atomics) and read once at shutdown. They exist so a scheduler change can
@@ -4729,6 +4736,10 @@ int zan_co_poll(void) {
     if (q <= 0) return 0;
     zan_co_worker_t *w = co_self();
     if (!w || w->slice_start_us <= 0) return 0;
+    /* Gate the clock read: at 2ms quanta and ns-grade iterations a skipped
+     * check costs a few microseconds of overshoot, while an unchecked read on
+     * every back-edge dominated compute loops (see ZAN_POLL_GATE). */
+    if ((++w->poll_tick & (ZAN_POLL_GATE - 1)) != 0) return 0;
     long long now = zan_co_precise_us();
     return (now - w->slice_start_us >= q * 1000) ? 1 : 0;
 }
