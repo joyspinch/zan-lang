@@ -372,7 +372,13 @@ class Enumerable {
     }
 
     /// <summary>在给定相等比较器下去重，保留
-    /// 首次出现（对引用类型采用 Equals 风格语义）。</summary>
+    /// 首次出现（对引用类型采用 Equals 风格语义）。
+    ///
+    /// 复杂度 O(N²)：比较器是裸委托，只有相等判断、拿不到哈希值，
+    /// 无法像 == 版 Distinct 那样用 Dict 桶化——比较器判定相等的两个
+    /// 元素可以落在任意桶里，跨桶仍要两两比较。大序列（几千元素
+    /// 以上）且元素的 == 恰好就是想要的结构相等时，请改用
+    /// 无比较器的 Distinct()（O(N) 哈希实现）。</summary>
     static List<T> Distinct<T>(this List<T> src, EqualityComparer<T> eq) {
         List<T> outp = new List<T>();
         for (int i = 0; i < src.Count; i = i + 1) {
@@ -434,10 +440,12 @@ class Enumerable {
         return Enumerable.MergeSortInt<T>(src, key, 1);
     }
 
-    /// <summary>按主、次两个整数键升序排序（稳定）。</summary>
+    /// <summary>按主、次两个整数键升序排序（稳定）。单趟归并同时
+    /// 比较两键：主键相等时按次键定序，两键都相等时保留原有相对
+    /// 顺序——与"先按次键、再按主键各做一次稳定排序"等价，但键
+    /// 预计算与归并都只做一遍。</summary>
     static List<T> OrderBy<T>(this List<T> src, KeySelector<T> key1, KeySelector<T> key2) {
-        List<T> pass1 = Enumerable.MergeSortInt<T>(src, key2, 1);
-        return Enumerable.MergeSortInt<T>(pass1, key1, 1);
+        return Enumerable.MergeSortInt2<T>(src, key1, key2);
     }
 
     /// <summary>按整数键降序排序（稳定归并排序）。</summary>
@@ -465,16 +473,18 @@ class Enumerable {
         return Enumerable.MergeSortNum<T>(src, key, true);
     }
 
-    /* 基于预计算 int 键的自底向上稳定归并排序；sign 翻转排序方向。 */
+    /* 基于预计算 int 键的自底向上稳定归并排序；sign 翻转排序方向。
+     * 工作缓冲用 T[]/int[] 定长数组：每一轮归并都把 b/kb 的 [0,n) 整段
+     * 重写完才会被读，n 槽未初始化缓冲就够——不再需要 ToList(src)
+     * 那份把元素逐个 Add 的全量拷贝。 */
     static List<T> MergeSortInt<T>(List<T> src, KeySelector<T> key, int sign) {
-        List<T> a = Enumerable.ToList<T>(src);
-        int n = a.Count;
-        if (n < 2) { return a; }
-        List<int> ka = new List<int>();
-        for (int i = 0; i < n; i = i + 1) { ka.Add(sign * key(a[i])); }
-        List<T> b = Enumerable.ToList<T>(src);
-        List<int> kb = new List<int>();
-        for (int i = 0; i < n; i = i + 1) { kb.Add(0); }
+        int n = src.Count;
+        if (n < 2) { return Enumerable.ToList<T>(src); }
+        T[] a = new T[n];
+        T[] b = new T[n];
+        int[] ka = new int[n];
+        int[] kb = new int[n];
+        for (int i = 0; i < n; i = i + 1) { a[i] = src[i]; ka[i] = sign * key(src[i]); }
         int width = 1;
         while (width < n) {
             int lo = 0;
@@ -495,23 +505,77 @@ class Enumerable {
                 while (r < hi) { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; o = o + 1; }
                 lo = hi;
             }
-            List<T> tl = a; a = b; b = tl;
-            List<int> tk = ka; ka = kb; kb = tk;
+            T[] tl = a; a = b; b = tl;
+            int[] tk = ka; ka = kb; kb = tk;
             width = width + width;
         }
-        return a;
+        List<T> outp = new List<T>();
+        outp.Reserve(n);
+        for (int i = 0; i < n; i = i + 1) { outp.Add(a[i]); }
+        return outp;
     }
 
-    /* 基于预计算 string 键的自底向上稳定归并排序。 */
+    /* 双 int 键版：主键相等时比较次键；两键都相等取左（先到的元素在
+     * a 侧），稳定性与"先次键、后主键两次稳定排序"一致。 */
+    static List<T> MergeSortInt2<T>(List<T> src, KeySelector<T> key1, KeySelector<T> key2) {
+        int n = src.Count;
+        if (n < 2) { return Enumerable.ToList<T>(src); }
+        T[] a = new T[n];
+        T[] b = new T[n];
+        int[] k1a = new int[n];
+        int[] k1b = new int[n];
+        int[] k2a = new int[n];
+        int[] k2b = new int[n];
+        for (int i = 0; i < n; i = i + 1) {
+            a[i] = src[i];
+            k1a[i] = key1(src[i]);
+            k2a[i] = key2(src[i]);
+        }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width + width;
+                if (hi > n) { hi = n; }
+                int l = lo;
+                int r = mid;
+                int o = lo;
+                while (l < mid && r < hi) {
+                    int k1l = k1a[l];
+                    int k1r = k1a[r];
+                    bool takeLeft;
+                    if (k1l != k1r) { takeLeft = k1l < k1r; }
+                    else { takeLeft = k2a[l] <= k2a[r]; }
+                    if (takeLeft) { b[o] = a[l]; k1b[o] = k1l; k2b[o] = k2a[l]; l = l + 1; }
+                    else { b[o] = a[r]; k1b[o] = k1r; k2b[o] = k2a[r]; r = r + 1; }
+                    o = o + 1;
+                }
+                while (l < mid) { b[o] = a[l]; k1b[o] = k1a[l]; k2b[o] = k2a[l]; l = l + 1; o = o + 1; }
+                while (r < hi) { b[o] = a[r]; k1b[o] = k1a[r]; k2b[o] = k2a[r]; r = r + 1; o = o + 1; }
+                lo = hi;
+            }
+            T[] tl = a; a = b; b = tl;
+            int[] t1 = k1a; k1a = k1b; k1b = t1;
+            int[] t2 = k2a; k2a = k2b; k2b = t2;
+            width = width + width;
+        }
+        List<T> outp = new List<T>();
+        outp.Reserve(n);
+        for (int i = 0; i < n; i = i + 1) { outp.Add(a[i]); }
+        return outp;
+    }
+
+    /* 基于预计算 string 键的自底向上稳定归并排序。缓冲形态见 MergeSortInt。 */
     static List<T> MergeSortStr<T>(List<T> src, StrKeySelector<T> key, bool desc) {
-        List<T> a = Enumerable.ToList<T>(src);
-        int n = a.Count;
-        if (n < 2) { return a; }
-        List<string> ka = new List<string>();
-        for (int i = 0; i < n; i = i + 1) { ka.Add(key(a[i])); }
-        List<T> b = Enumerable.ToList<T>(src);
-        List<string> kb = new List<string>();
-        for (int i = 0; i < n; i = i + 1) { kb.Add(""); }
+        int n = src.Count;
+        if (n < 2) { return Enumerable.ToList<T>(src); }
+        T[] a = new T[n];
+        T[] b = new T[n];
+        string[] ka = new string[n];
+        string[] kb = new string[n];
+        for (int i = 0; i < n; i = i + 1) { a[i] = src[i]; ka[i] = key(src[i]); }
         int width = 1;
         while (width < n) {
             int lo = 0;
@@ -536,23 +600,25 @@ class Enumerable {
                 while (r < hi) { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; o = o + 1; }
                 lo = hi;
             }
-            List<T> tl = a; a = b; b = tl;
-            List<string> tk = ka; ka = kb; kb = tk;
+            T[] tl = a; a = b; b = tl;
+            string[] tk = ka; ka = kb; kb = tk;
             width = width + width;
         }
-        return a;
+        List<T> outp = new List<T>();
+        outp.Reserve(n);
+        for (int i = 0; i < n; i = i + 1) { outp.Add(a[i]); }
+        return outp;
     }
 
-    /* 基于预计算 double 键的自底向上稳定归并排序。 */
+    /* 基于预计算 double 键的自底向上稳定归并排序。缓冲形态见 MergeSortInt。 */
     static List<T> MergeSortNum<T>(List<T> src, NumKeySelector<T> key, bool desc) {
-        List<T> a = Enumerable.ToList<T>(src);
-        int n = a.Count;
-        if (n < 2) { return a; }
-        List<double> ka = new List<double>();
-        for (int i = 0; i < n; i = i + 1) { ka.Add(key(a[i])); }
-        List<T> b = Enumerable.ToList<T>(src);
-        List<double> kb = new List<double>();
-        for (int i = 0; i < n; i = i + 1) { kb.Add(0.0); }
+        int n = src.Count;
+        if (n < 2) { return Enumerable.ToList<T>(src); }
+        T[] a = new T[n];
+        T[] b = new T[n];
+        double[] ka = new double[n];
+        double[] kb = new double[n];
+        for (int i = 0; i < n; i = i + 1) { a[i] = src[i]; ka[i] = key(src[i]); }
         int width = 1;
         while (width < n) {
             int lo = 0;
@@ -577,11 +643,14 @@ class Enumerable {
                 while (r < hi) { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; o = o + 1; }
                 lo = hi;
             }
-            List<T> tl = a; a = b; b = tl;
-            List<double> tk = ka; ka = kb; kb = tk;
+            T[] tl = a; a = b; b = tl;
+            double[] tk = ka; ka = kb; kb = tk;
             width = width + width;
         }
-        return a;
+        List<T> outp = new List<T>();
+        outp.Reserve(n);
+        for (int i = 0; i < n; i = i + 1) { outp.Add(a[i]); }
+        return outp;
     }
 
     /* --- query-expression lowering helpers (B17) ---------------------------
