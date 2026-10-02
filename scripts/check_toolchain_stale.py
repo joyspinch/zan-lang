@@ -40,8 +40,15 @@ RT_TIMER = ["src/runtime/rt_timer.c"]
 RT_WASM = ["src/runtime/rt_wasm.c"]   # zanrt_wasm.o compiles rt_wasm.c only; rt_file.c
                                      # links alongside as its own object (build_cross_rt.cmd)
 RT_GUI_MAC = ["src/runtime/gui_compat_mac.c"]
+RT_MEM = ["src/runtime/rt_mem.c"]
+EMBED = ["src/runtime/zan_embed_api.c", "src/runtime/rt_timer.h",
+         "src/common/host_oom.h"]
+INFLATE = ["src/runtime/zan_inflate.c", "src/common/miniz_tinfl.c",
+           "src/common/miniz.h"]
+WASM_GUI = ["src/runtime/gui_runtime.c", "src/runtime/libwebp"]  # unity object
 ANDROID_NDK = []  # NDK-derived: no repo source drives it; never "stale" by src
 OHOS_NDK = []     # same for the OHOS SDK sysroot subset (libc.a, crt*, builtins)
+ZIG_BUNDLED = []  # zig/wasi/musl sysroot subsets + external prebuilts: no repo source
 GUI = ["src/runtime/gui_runtime.c", "src/runtime/gui_runtime_text.c",
        "src/runtime/gui_runtime_font.c", "src/runtime/gui_runtime_x11.c",
        "src/runtime/gui_runtime_tray.c", "src/runtime/gui_runtime_sdl.c",
@@ -64,6 +71,35 @@ ARTIFACTS = [
     ("toolchain/linux-riscv64/zanrt_io_mt.o", RT_IO, "runtime"),
     ("toolchain/linux-riscv64/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/linux-riscv64/zanrt_file.o", RT_FILE, "runtime"),
+    # The rest of each linux bundle (build_cross_rt.cmd's zig block): the timer
+    # object every program links, the embedded-resource pair, and --fast-alloc's
+    # allocator object (musl-only so far).
+    ("toolchain/linux-musl/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/linux-musl/zan_embed_api.o", EMBED, "runtime"),
+    ("toolchain/linux-musl/zan_inflate.o", INFLATE, "runtime"),
+    ("toolchain/linux-musl/zanrt_mem.o", RT_MEM, "runtime"),
+    ("toolchain/linux-arm64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/linux-arm64/zan_embed_api.o", EMBED, "runtime"),
+    ("toolchain/linux-arm64/zan_inflate.o", INFLATE, "runtime"),
+    ("toolchain/linux-riscv64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/linux-riscv64/zan_embed_api.o", EMBED, "runtime"),
+    ("toolchain/linux-riscv64/zan_inflate.o", INFLATE, "runtime"),
+    # musl sysroot subset (crt + libc.a; libgcc.a on arm64/riscv64) tracks the
+    # external sysroot, not repo sources.
+    ("toolchain/linux-musl/crt1.o", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-musl/crti.o", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-musl/crtn.o", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-musl/libc.a", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-arm64/crt1.o", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-arm64/crti.o", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-arm64/crtn.o", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-arm64/libc.a", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-arm64/libgcc.a", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-riscv64/crt1.o", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-riscv64/crti.o", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-riscv64/crtn.o", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-riscv64/libc.a", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-riscv64/libgcc.a", ZIG_BUNDLED, "manual"),
     ("toolchain/macos/arm64/zanrt_io.o", RT_IO, "runtime"),
     ("toolchain/macos/arm64/zanrt_io_mt.o", RT_IO, "runtime"),
     ("toolchain/macos/arm64/zanrt_sync.o", RT_SYNC, "runtime"),
@@ -76,7 +112,20 @@ ARTIFACTS = [
     ("toolchain/macos/x64/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/macos/x64/zanrt_timer.o", RT_TIMER, "runtime"),
     ("toolchain/macos/x64/zanrt_gui.o", RT_GUI_MAC, "runtime"),
+    ("toolchain/macos/arm64/zan_embed_api.o", EMBED, "runtime"),
+    ("toolchain/macos/arm64/zan_inflate.o", INFLATE, "runtime"),
+    ("toolchain/macos/x64/zan_embed_api.o", EMBED, "runtime"),
+    ("toolchain/macos/x64/zan_inflate.o", INFLATE, "runtime"),
     ("toolchain/ios/arm64/zanrt_gui.o", RT_GUI_MAC, "runtime"),
+    # The other five ios objects came from the ios pipeline commit (3e284401),
+    # built off-host with no committed recipe -- zig's ios target ships no libc
+    # headers on Windows, so no local builder exists; report staleness only.
+    ("toolchain/ios/arm64/zanrt_io.o", RT_IO, "manual"),
+    ("toolchain/ios/arm64/zanrt_io_mt.o", RT_IO, "manual"),
+    ("toolchain/ios/arm64/zanrt_sync.o", RT_SYNC, "manual"),
+    ("toolchain/ios/arm64/zanrt_file.o", RT_FILE, "manual"),
+    ("toolchain/ios/arm64/zanrt_timer.o", RT_TIMER, "manual"),
+    ("toolchain/ios/libSystem.tbd", ZIG_BUNDLED, "manual"),
     ("toolchain/wasm32/zanrt_wasm.o", RT_WASM, "runtime"),
     ("toolchain/wasm32/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/wasm32/zanrt_timer.o", RT_TIMER, "runtime"),
@@ -85,6 +134,18 @@ ARTIFACTS = [
     # below it keeps the artifact fresh by hand -- see build_cross_rt.cmd.
     ("toolchain/wasm32/zanrt_ehtag.o",
      ["toolchain/wasm32/zanrt_ehtag.c"], "manual"),
+    # GUI software rasterizer as one unity object (gui_runtime.c pulls text/
+    # font/shims and the libwebp tree via #include), plus rt_sync_wasm for
+    # GUI-sized thread/atomic pull-ins. Both built by build_cross_rt.cmd.
+    ("toolchain/wasm32/zanrt_gui.o", WASM_GUI, "runtime"),
+    ("toolchain/wasm32/zanrt_syncw.o", ["src/runtime/rt_sync_wasm.c"], "runtime"),
+    # wasi-libc subset + external prebuilts (freetype archive): no repo source.
+    ("toolchain/wasm32/crt1.o", ZIG_BUNDLED, "manual"),
+    ("toolchain/wasm32/libc.a", ZIG_BUNDLED, "manual"),
+    ("toolchain/wasm32/libm.a", ZIG_BUNDLED, "manual"),
+    ("toolchain/wasm32/libzigc.a", ZIG_BUNDLED, "manual"),
+    ("toolchain/wasm32/libclang_rt.builtins-wasm32.a", ZIG_BUNDLED, "manual"),
+    ("toolchain/wasm32/libfreetype.a", ZIG_BUNDLED, "manual"),
     # Android (bionic) runtime objects: built with the NDK's clang per the
     # recipe in build_cross_rt.cmd -- zig cc has no bionic target.
     ("toolchain/android-x64/zanrt_io.o", RT_IO, "manual"),
@@ -95,6 +156,48 @@ ARTIFACTS = [
     ("toolchain/android-arm64/zanrt_sync.o", RT_SYNC, "manual"),
     ("toolchain/android-arm64/zanrt_file.o", RT_FILE, "manual"),
     ("toolchain/android-arm64/zanrt_timer.o", RT_TIMER, "manual"),
+    # Embedded-resource pair, NDK clang recipe (same block as above).
+    ("toolchain/android-x64/zan_embed_api.o", EMBED, "manual"),
+    ("toolchain/android-x64/zan_inflate.o", INFLATE, "manual"),
+    ("toolchain/android-arm64/zan_embed_api.o", EMBED, "manual"),
+    ("toolchain/android-arm64/zan_inflate.o", INFLATE, "manual"),
+    # app-glue object + dynamic crt + the NDK stub/link .so set: NDK-derived.
+    ("toolchain/android-x64/android_native_app_glue.o", ANDROID_NDK, "manual"),
+    ("toolchain/android-x64/crtbegin_dynamic.o", ANDROID_NDK, "manual"),
+    ("toolchain/android-x64/libc.so", ANDROID_NDK, "manual"),
+    ("toolchain/android-x64/libdl.so", ANDROID_NDK, "manual"),
+    ("toolchain/android-x64/libm.so", ANDROID_NDK, "manual"),
+    ("toolchain/android-x64/liblog.so", ANDROID_NDK, "manual"),
+    ("toolchain/android-x64/libEGL.so", ANDROID_NDK, "manual"),
+    ("toolchain/android-x64/libGLESv2.so", ANDROID_NDK, "manual"),
+    ("toolchain/android-x64/libaaudio.so", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/android_native_app_glue.o", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/crtbegin_dynamic.o", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/libc.so", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/libdl.so", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/libm.so", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/liblog.so", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/libEGL.so", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/libGLESv2.so", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/libaaudio.so", ANDROID_NDK, "manual"),
+    # win-arm64/win-x64 PE objects: built by scripts/build_win_rt.sh with the
+    # matching MSYS2 CLANGARM64/MINGW64 clang of the CI drivers.yml job (mingw
+    # ABI; zig's own mingw headers are a different vintage, so no byte-stable
+    # local builder). Report staleness; rebuild in that environment.
+    ("toolchain/win-arm64/zanrt_io.o", RT_IO, "manual"),
+    ("toolchain/win-arm64/zanrt_io_mt.o", RT_IO, "manual"),
+    ("toolchain/win-arm64/zanrt_sync.o", RT_SYNC, "manual"),
+    ("toolchain/win-arm64/zanrt_file.o", RT_FILE, "manual"),
+    ("toolchain/win-arm64/zanrt_timer.o", RT_TIMER, "manual"),
+    ("toolchain/win-arm64/zan_embed_api.o", EMBED, "manual"),
+    ("toolchain/win-arm64/zan_inflate.o", INFLATE, "manual"),
+    ("toolchain/win-x64/zanrt_io.o", RT_IO, "manual"),
+    ("toolchain/win-x64/zanrt_io_mt.o", RT_IO, "manual"),
+    ("toolchain/win-x64/zanrt_sync.o", RT_SYNC, "manual"),
+    ("toolchain/win-x64/zanrt_file.o", RT_FILE, "manual"),
+    ("toolchain/win-x64/zanrt_timer.o", RT_TIMER, "manual"),
+    ("toolchain/win-x64/zan_embed_api.o", EMBED, "manual"),
+    ("toolchain/win-x64/zan_inflate.o", INFLATE, "manual"),
     # The NDK sysroot subset (crt + libc/libm/libdl + compiler-rt builtins)
     # tracks the NDK itself, not repo sources -- report-only, refreshed by hand.
     ("toolchain/android-x64/libc.a", ANDROID_NDK, "manual"),
@@ -235,9 +338,10 @@ def _find_ndk():
 
 def rebuild_cmd(artifact, zig, ndk):
     """The exact compile that (re)produces `artifact` locally, or None when
-    this machine has no builder for it (GUI drivers need the target platform;
-    the ohos stub .so pair is NDK-built by hand). Mirrors do_rebuild /
-    build_cross_rt.cmd flag for flag."""
+    this machine has no builder for it (GUI drivers and the ios objects have
+    off-host builders; win-* needs the matching MSYS2 arch clang of
+    build_win_rt.sh; the ohos stub .so pair is NDK-built by hand). Mirrors
+    do_rebuild / build_cross_rt.cmd flag for flag."""
     rt = "src/runtime"
     d, name = os.path.split(artifact.replace("\\", "/"))
     if d.startswith("toolchain/"):
@@ -245,7 +349,27 @@ def rebuild_cmd(artifact, zig, ndk):
     src = name.replace("zanrt_", "rt_").replace(".o", ".c")
     c11 = ["-std=c11"]
     if d == "wasm32":
-        target, std = "wasm32-wasi", c11
+        # wasi objects are built WITHOUT -fPIC (build_cross_rt.cmd's wasm
+        # block; a PIC rebuild differs byte-wise even when semantically same).
+        # zanrt_ehtag.o needs mozbuild clang's wasm EH backend -- no builder.
+        if not zig or name == "zanrt_ehtag.o":
+            return None
+        if name == "zanrt_gui.o":
+            # Unity GUI object; the freetype variant only when both inputs the
+            # .cmd checks are present, else the bitmap-font fallback build.
+            cmd = [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11",
+                   "-I", rt, "-I", f"{rt}/libwebp/src", "-O2", "-DZAN_GUI_WASM"]
+            ft_inc = os.environ.get("FREETYPE_INC") or "D:/project/firefox/modules/freetype2/include"
+            if (os.path.isfile(os.path.join(ft_inc, "ft2build.h"))
+                    and os.path.isfile("toolchain/wasm32/libfreetype.a")):
+                cmd += ["-I", ft_inc, "-I", "toolchain/wasm32/freetype-shim",
+                        "-DZAN_GUI_FREETYPE"]
+            return cmd + ["-c", f"{rt}/gui_runtime.c"]
+        if name == "zanrt_syncw.o":
+            return [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11",
+                    "-I", rt, "-O2", "-c", f"{rt}/rt_sync_wasm.c"]
+        return ([zig, "cc", "-target", "wasm32-wasi", "-g0"] + std
+                + ["-I", rt, "-O2", "-c", f"{rt}/{src}"])
     elif d.startswith("linux-"):
         arch = {"linux-musl": "x86_64", "linux-arm64": "aarch64",
                 "linux-riscv64": "riscv64"}[d]
@@ -261,10 +385,23 @@ def rebuild_cmd(artifact, zig, ndk):
         sysroot = os.path.join(ndk, r"toolchains\llvm\prebuilt\windows-x86_64\sysroot")
         if not os.path.isfile(clang):
             return None
-        return ([clang, "--sysroot", sysroot, "-target",
-                 f"{arch}-linux-android28", "-g0", "-fPIC", "-I", rt, "-O2"]
-                + ([] if src == "rt_io.c" else c11)
-                + (["-DZAN_IO_STACKLESS_ONLY"] if src == "rt_io.c" else [])
+        if name == "zan_embed_api.o":
+            return [clang, "--sysroot", sysroot, "-target", f"{arch}-linux-android28",
+                    "-g0", "-std=c11", "-fPIC", "-I", rt, "-I", "src/common",
+                    "-O2", "-c", f"{rt}/zan_embed_api.c"]
+        if name == "zan_inflate.o":
+            return [clang, "--sysroot", sysroot, "-target", f"{arch}-linux-android28",
+                    "-g0", "-std=c11", "-fPIC", "-DMINIZ_NO_ARCHIVE_APIS",
+                    "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME",
+                    "-I", rt, "-I", "src/common", "-O2", "-c", f"{rt}/zan_inflate.c"]
+        base = [clang, "--sysroot", sysroot, "-target", f"{arch}-linux-android28"]
+        if src == "rt_io.c":
+            # io_mt compiles rt_io.c (+ZAN_CO_DRIVER), never rt_io_mt.c.
+            cmd = base + ["-g0", "-fPIC", "-I", rt, "-O2", "-DZAN_IO_STACKLESS_ONLY"]
+            if name == "zanrt_io_mt.o":
+                cmd += ["-DZAN_CO_DRIVER"]
+            return cmd + ["-c", f"{rt}/rt_io.c"]
+        return (base + ["-g0", "-fPIC", "-I", rt, "-O2"] + c11
                 + ["-c", f"{rt}/{src}"])
     elif d.startswith("ohos-"):
         # Mirror scripts/build_ohos_rt_zig.sh flag for flag (the NDK path in
@@ -301,15 +438,38 @@ def rebuild_cmd(artifact, zig, ndk):
         return ([zig, "cc", "-target", f"{arch}-linux-musl", "-D__OHOS__",
                  "-g0", "-fPIC", "-O2"] + table[name])
     else:
+        # ios/*: built off-host by the ios pipeline, no committed recipe.
+        # win-*: needs the matching MSYS2 arch clang (build_win_rt.sh).
         return None
+    # The embedded-resource pair for linux/macos: names the zanrt_*→rt_*
+    # mapping accidentally gets right, but whose flags the generic tail gets
+    # wrong -- inflate drops -I rt and adds -DMINIZ_NO_ARCHIVE_WRITERS.
     if not zig:
         return None
-    cmd = [zig, "cc", "-target", target, "-g0", "-fPIC", "-I", rt, "-O2"] + std
-    if src == "rt_io.c":
+    if d.startswith("macos/") and name == "zanrt_gui.o":
+        # macOS GUI shim object compiles gui_compat_mac.c, not rt_gui.c.
+        return [zig, "cc", "-target", target, "-g0", "-std=c11", "-fPIC",
+                "-I", rt, "-O2", "-c", f"{rt}/gui_compat_mac.c"]
+    if name == "zan_embed_api.o":
+        return [zig, "cc", "-target", target, "-g0", "-std=c11", "-fPIC",
+                "-I", rt, "-O2", "-c", f"{rt}/zan_embed_api.c"]
+    if name == "zan_inflate.o":
+        return [zig, "cc", "-target", target, "-g0", "-std=c11", "-fPIC", "-O2",
+                "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO",
+                "-DMINIZ_NO_TIME", "-DMINIZ_NO_ARCHIVE_WRITERS", "-I", "src/common",
+                "-c", f"{rt}/zan_inflate.c"]
+    if not zig:
+        return None
+    cmd = [zig, "cc", "-target", target, "-g0", "-fPIC", "-I", rt, "-O2"]
+    if name in ("zanrt_io.o", "zanrt_io_mt.o"):
+        # io/io_mt compile rt_io.c with the default gnu dialect -- -std=c11
+        # hides the POSIX decls (sigemptyset, clock_gettime) and shifts every
+        # byte; io_mt only adds -DZAN_CO_DRIVER (never an rt_io_mt.c).
         cmd += ["-DZAN_IO_STACKLESS_ONLY"]
-    if name == "zanrt_io_mt.o":
-        cmd += ["-DZAN_CO_DRIVER"]
-    return cmd + ["-c", f"{rt}/{src}"]
+        if name == "zanrt_io_mt.o":
+            cmd += ["-DZAN_CO_DRIVER"]
+        return cmd + ["-c", f"{rt}/rt_io.c"]
+    return cmd + std + ["-c", f"{rt}/{src}"]
 
 
 def do_verify(stale_entries):
@@ -388,6 +548,10 @@ def do_rebuild():
             subprocess.run([zig, "cc", "-target", f"{arch}-linux-musl", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_sync.c", "-o", f"{outdir}/zanrt_sync.o"], check=True)
             subprocess.run([zig, "cc", "-target", f"{arch}-linux-musl", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_file.c", "-o", f"{outdir}/zanrt_file.o"], check=True)
             subprocess.run([zig, "cc", "-target", f"{arch}-linux-musl", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_timer.c", "-o", f"{outdir}/zanrt_timer.o"], check=True)
+            subprocess.run([zig, "cc", "-target", f"{arch}-linux-musl", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/zan_embed_api.c", "-o", f"{outdir}/zan_embed_api.o"], check=True)
+            subprocess.run([zig, "cc", "-target", f"{arch}-linux-musl", "-g0", "-std=c11", "-fPIC", "-O2", "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME", "-DMINIZ_NO_ARCHIVE_WRITERS", "-I", "src/common", "-c", f"{rt}/zan_inflate.c", "-o", f"{outdir}/zan_inflate.o"], check=True)
+            if name == "linux-musl":
+                subprocess.run([zig, "cc", "-target", "x86_64-linux-musl", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_mem.c", "-o", f"{outdir}/zanrt_mem.o"], check=True)
 
         for name, arch in [("arm64", "aarch64"), ("x64", "x86_64")]:
             outdir = f"toolchain/macos/{name}"
@@ -398,6 +562,9 @@ def do_rebuild():
             subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_sync.c", "-o", f"{outdir}/zanrt_sync.o"], check=True)
             subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_file.c", "-o", f"{outdir}/zanrt_file.o"], check=True)
             subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_timer.c", "-o", f"{outdir}/zanrt_timer.o"], check=True)
+            subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/gui_compat_mac.c", "-o", f"{outdir}/zanrt_gui.o"], check=True)
+            subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/zan_embed_api.c", "-o", f"{outdir}/zan_embed_api.o"], check=True)
+            subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-O2", "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME", "-DMINIZ_NO_ARCHIVE_WRITERS", "-I", "src/common", "-c", f"{rt}/zan_inflate.c", "-o", f"{outdir}/zan_inflate.o"], check=True)
 
         outdir = "toolchain/wasm32"
         os.makedirs(outdir, exist_ok=True)
