@@ -65,6 +65,10 @@ set IOSHDR=%ZROOT%lib\libc\include\any-macos-any
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\ios\arm64\zanrt_sync.o  || exit /b 1
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\ios\arm64\zanrt_file.o  || exit /b 1
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\ios\arm64\zanrt_timer.o || exit /b 1
+rem Embedded-resource API + decoder for the auto-embed path (GUI skins/icons),
+rem same pair the linux/macos/android blocks above build.
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\zan_embed_api.c -o toolchain\ios\arm64\zan_embed_api.o || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -O2 -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS -I src\common -c %RT%\zan_inflate.c -o toolchain\ios\arm64\zan_inflate.o || exit /b 1
 echo built toolchain\ios\arm64
 
 rem wasm32 (WASI): single-threaded, so no rt_io / rt_sync -- the wasm link

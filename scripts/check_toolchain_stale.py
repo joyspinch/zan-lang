@@ -125,6 +125,8 @@ ARTIFACTS = [
     ("toolchain/ios/arm64/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/ios/arm64/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/ios/arm64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/ios/arm64/zan_embed_api.o", EMBED, "runtime"),
+    ("toolchain/ios/arm64/zan_inflate.o", INFLATE, "runtime"),
     ("toolchain/ios/libSystem.tbd", ZIG_BUNDLED, "manual"),
     ("toolchain/wasm32/zanrt_wasm.o", RT_WASM, "runtime"),
     ("toolchain/wasm32/zanrt_file.o", RT_FILE, "runtime"),
@@ -457,6 +459,18 @@ def rebuild_cmd(artifact, zig, ndk):
             return ([zig, "cc", "-target", "aarch64-ios.14.0", "-g0",
                      "-std=c11", "-fPIC", "-I", rt, "-O2",
                      "-c", f"{rt}/gui_compat_mac.c"])
+        if name == "zan_embed_api.o":
+            return base + c11 + ["-c", f"{rt}/zan_embed_api.c"]
+        if name == "zan_inflate.o":
+            # Same flag set as build_cross_rt.cmd's ios line: no -I rt,
+            # miniz trim defines + -DMINIZ_NO_ARCHIVE_WRITERS, -I src/common.
+            return ([zig, "cc", "-target", "aarch64-ios.14.0",
+                     "-I", os.path.join(zroot, "lib", "libc", "include", "any-macos-any"),
+                     "-g0", "-std=c11", "-fPIC", "-O2",
+                     "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS",
+                     "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME",
+                     "-DMINIZ_NO_ARCHIVE_WRITERS",
+                     "-I", "src/common", "-c", f"{rt}/zan_inflate.c"])
         return base + c11 + ["-c", f"{rt}/{src}"]
     else:
         # win-*: CI builds these with the matching MSYS2 arch clang
