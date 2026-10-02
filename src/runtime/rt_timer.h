@@ -116,7 +116,10 @@ long long zan_co_quantum_ms(void);
  * above is wall-deadline grade: on Windows GetTickCount64 ticks at ~15.6ms,
  * which would turn a 2ms quantum into a ~15ms slice and a 1ms pump throttle
  * into ~15ms. QPC is sub-microsecond on every supported Windows; POSIX
- * CLOCK_MONOTONIC already is. Timer DEADLINES stay on zan_timer_now_ms. */
+ * CLOCK_MONOTONIC already is. The timer heap's deadlines run here too
+ * (B-ID48): due_us is zan_co_precise_us-based, so Delay precision no longer
+ * carries the wall clock's tick granularity. zan_timer_next_timeout still
+ * ANSWERS in ms (round-up) because its callers park on ms waits. */
 long long zan_co_precise_us(void);
 /* These return counts; `long long` (not size_t) because the compiler's IR
  * declares them with Zan's 64-bit int and wasm32's size_t is 32-bit. */

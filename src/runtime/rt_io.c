@@ -5103,7 +5103,35 @@ static int co_all_idle(void) {
 
 static void co_pool_retire(zan_co_worker_t *w);
 
+/* B-ID48: the timer heap's deadlines are microseconds, but the PARK must be
+ * equally precise or the precision is invisible. A GQCS timeout rounds up to
+ * the system tick (~15.6ms without a raised resolution): a 50ms Delay sleeps
+ * ~62ms no matter what the heap says (traced: slept 63184us for to=50).
+ * Raise the wait resolution to 1ms for the process once a scheduler worker
+ * exists. Since Windows 10 2004 the request is process-scoped; loaded
+ * dynamically so zanrt_io keeps no hard winmm import (console links don't
+ * carry it) and degrades to the old tick behavior where the API is absent.
+ * Never lowered: worker pools restart freely and pairing Begin/End across
+ * threads races; a timer-using process holding a 1ms tick is the standard
+ * runtime trade (Go/.NET do the same while timers are live). */
+#if defined(_WIN32)
+static volatile LONG g_co_timeperiod_done = 0;
+static void co_timeperiod_raise(void) {
+    if (InterlockedExchange(&g_co_timeperiod_done, 1)) return;
+    HMODULE mm = LoadLibraryA("winmm.dll");
+    if (!mm) return;
+    ULONG (WINAPI *begin)(UINT) =
+        (ULONG (WINAPI *)(UINT))(void *)GetProcAddress(mm, "timeBeginPeriod");
+    if (begin) begin(1);
+}
+#else
+/* POSIX parks poll/sleep against CLOCK_MONOTONIC with kernel granularity;
+ * there is no system tick to raise, and deadlines are already microseconds. */
+static void co_timeperiod_raise(void) { }
+#endif
+
 static void co_worker(int worker) {
+    co_timeperiod_raise();
     zan_co_worker_t *w = &g_wk[worker];
     w->bg_gen = g_co_pool_gen;
     if (g_co_tls != TLS_OUT_OF_INDEXES) TlsSetValue(g_co_tls, w);

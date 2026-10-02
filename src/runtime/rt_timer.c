@@ -551,7 +551,11 @@ typedef enum zan_timer_kind {
     ZAN_TIMER_PUBLIC = 1
 } zan_timer_kind;
 typedef struct zan_timer_entry {
-    long long due_ms;
+    /* Microsecond deadline on zan_co_precise_us (B-ID48): the ms wall clock
+     * quantizes to the OS tick (~15.6ms on Windows), and every Delay
+     * overshoot carried that granularity. zan_timer_next_timeout still
+     * ANSWERS in ms (round-up) because its callers park on ms waits. */
+    long long due_us;
     long long id;
     long long interval;
     long long exec_msec;
@@ -658,8 +662,8 @@ long long zan_co_precise_us(void) {
 }
 
 static int timer_less(const zan_timer_entry *a, const zan_timer_entry *b) {
-    return a->due_ms < b->due_ms ||
-           (a->due_ms == b->due_ms && a->sequence < b->sequence);
+    return a->due_us < b->due_us ||
+           (a->due_us == b->due_us && a->sequence < b->sequence);
 }
 
 static void heap_swap(size_t a, size_t b) {
@@ -747,12 +751,28 @@ long long zan_timer_saturating_due(long long now_ms, long long delay_ms) {
     return now_ms + delay_ms;
 }
 
+/* Microsecond deadline arithmetic (B-ID48): same saturation rule as the ms
+ * helper, plus the ms->us lift every public timer API needs (the public
+ * surface stays milliseconds; only the heap runs in microseconds). */
+long long zan_timer_saturating_due_us(long long now_us, long long delay_us) {
+    if (delay_us < 0) return now_us;
+    if (delay_us > LLONG_MAX - now_us) return LLONG_MAX;
+    return now_us + delay_us;
+}
+
+static long long delay_ms_to_us(long long ms) {
+    if (ms < 0) return 0;
+    if (ms > LLONG_MAX / 1000) return LLONG_MAX;
+    return ms * 1000;
+}
+
 void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
     if (!step) return;
     zan_timer_entry *entry = (zan_timer_entry *)calloc(1, sizeof(*entry));
     if (!entry) return;   /* OOM: the await never fires; frame release still
                              cancels nothing since no entry exists (soft). */
-    entry->due_ms = zan_timer_saturating_due(zan_timer_now_ms(), ms);
+    entry->due_us = zan_timer_saturating_due_us(zan_co_precise_us(),
+                                                               delay_ms_to_us(ms));
     entry->kind = ZAN_TIMER_DELAY;
     entry->frame = frame;
     entry->step = step;
@@ -867,7 +887,8 @@ static long long timer_add(long long ms, zan_timer_callback_t callback, int repe
     entry->id = g_next_id++;
     if (entry->id <= 0) entry->id = g_next_id = 1;
     entry->interval = repeat ? ms : 0;
-    entry->due_ms = zan_timer_saturating_due(zan_timer_now_ms(), ms);
+    entry->due_us = zan_timer_saturating_due_us(zan_co_precise_us(),
+                                                               delay_ms_to_us(ms));
     entry->sequence = ++g_sequence;
     entry->kind = ZAN_TIMER_PUBLIC;
     if (heap_push(entry) != 0) {
@@ -892,8 +913,12 @@ long long zan_timer_next_timeout(void) {
     timer_lock();
     while (g_heap_len > 0 && g_heap[0]->removed) free(heap_pop());
     if (g_heap_len > 0) {
-        timeout = g_heap[0]->due_ms - zan_timer_now_ms();
-        if (timeout < 0) timeout = 0;
+        /* Microsecond heap, millisecond answer: the callers park on ms waits
+         * (GQCS timeout / Sleep / poll). Round UP so a park never overshoots
+         * the deadline on conversion; sub-millisecond remainders become a
+         * 1ms park, whose lateness is the wait granularity, not clock error. */
+        long long rem_us = g_heap[0]->due_us - zan_co_precise_us();
+        timeout = (rem_us <= 0) ? 0 : (rem_us + 999) / 1000;
     }
     timer_unlock();
     return timeout;
@@ -902,10 +927,10 @@ long long zan_timer_next_timeout(void) {
 long long zan_timer_dispatch_due(void) {
     size_t dispatched = 0;
     for (;;) {
-        long long now = zan_timer_now_ms();
+        long long now = zan_co_precise_us();
         timer_lock();
         while (g_heap_len > 0 && g_heap[0]->removed) free(heap_pop());
-        if (g_heap_len == 0 || g_heap[0]->due_ms > now) {
+        if (g_heap_len == 0 || g_heap[0]->due_us > now) {
             timer_unlock();
             return dispatched;
         }
@@ -922,7 +947,7 @@ long long zan_timer_dispatch_due(void) {
         g_dispatching = entry;
         timer_unlock();
 
-        long long started = zan_timer_now_ms();
+        long long started_us = zan_co_precise_us();
         if (entry->kind == ZAN_TIMER_DELAY) {
             /* The frame may have been released after this entry was pushed
              * (zan_timer_cancel_delay marks entries it cannot reach in the
@@ -946,7 +971,7 @@ long long zan_timer_dispatch_due(void) {
                 else entry->step(entry->frame);
             }
         } else entry->callback();
-        long long elapsed = zan_timer_now_ms() - started;
+        long long elapsed = zan_co_precise_us() - started_us;
         dispatched++;
 
         timer_lock();
@@ -956,21 +981,23 @@ long long zan_timer_dispatch_due(void) {
          * (or the pointer moved past this entry). */
         entry->waking = 0;
         g_dispatching = prev;
-        if (entry->kind == ZAN_TIMER_PUBLIC) entry->exec_msec = elapsed;
+        if (entry->kind == ZAN_TIMER_PUBLIC) entry->exec_msec = elapsed / 1000;
         if (entry->kind == ZAN_TIMER_PUBLIC && entry->interval > 0 && !entry->removed) {
-            long long cur_now = zan_timer_now_ms();
-            entry->due_ms = zan_timer_saturating_due(entry->due_ms, entry->interval);
-            if (entry->due_ms < cur_now) {
+            long long cur_now = zan_co_precise_us();
+            long long interval_us = delay_ms_to_us(entry->interval);
+            entry->due_us = zan_timer_saturating_due_us(entry->due_us, interval_us);
+            if (entry->due_us < cur_now) {
                 /* If delayed, allow catch-up for moderate lag, but prevent
                  * unbounded catch-up loops when delayed by more than one interval
                  * (e.g. process freeze, long blocking operation). Resynchronize
-                 * due_ms to the periodic grid. */
-                if (cur_now - entry->due_ms > entry->interval) {
-                    long long lag = cur_now - entry->due_ms;
-                    long long skips = lag / entry->interval;
-                    entry->due_ms = zan_timer_saturating_due(entry->due_ms, skips * entry->interval);
-                    if (entry->due_ms <= cur_now) {
-                        entry->due_ms = zan_timer_saturating_due(entry->due_ms, entry->interval);
+                 * due_us to the periodic grid. skips * interval_us cannot
+                 * overflow: skips is only taken while lag > interval_us. */
+                if (cur_now - entry->due_us > interval_us) {
+                    long long lag = cur_now - entry->due_us;
+                    long long skips = lag / interval_us;
+                    entry->due_us = zan_timer_saturating_due_us(entry->due_us, skips * interval_us);
+                    if (entry->due_us <= cur_now) {
+                        entry->due_us = zan_timer_saturating_due_us(entry->due_us, interval_us);
                     }
                 }
             }

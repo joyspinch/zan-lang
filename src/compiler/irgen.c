@@ -2309,8 +2309,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMSetLinkage(g_quantum, LLVMInternalLinkage);
         /* extern long long zan_co_quantum_ms(void) / zan_co_precise_us(void):
          * both resolved from the linked timer runtime, which the driver
-         * already depends on for zan_timer_delay. Deadlines keep the ms
-         * clock (zan_timer_delay's heap); slice bookkeeping uses precise_us. */
+         * already depends on for zan_timer_delay. The timer heap's deadlines
+         * AND slice bookkeeping both run on precise_us (B-ID48). */
         LLVMTypeRef now_type = LLVMFunctionType(i64t, NULL, 0, 0);
         LLVMValueRef co_quantum = LLVMAddFunction(g->mod, "zan_co_quantum_ms", now_type);
         LLVMValueRef precise_now = LLVMAddFunction(g->mod, "zan_co_precise_us", now_type);
