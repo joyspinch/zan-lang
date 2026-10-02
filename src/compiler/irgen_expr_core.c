@@ -793,14 +793,79 @@ static bool str_and_byte_buffer(zan_type_t *s, zan_type_t *b) {
                  e->kind == TYPE_CHAR);
 }
 
+/* A block-bodied lambda's natural return type: the one type all of its
+ * `return` expressions agree on (C#'s natural-type rule). Walks the
+ * straight-line statements and if/else arms, registering local declarations
+ * so later returns can reference them; a loop/switch/try anywhere makes the
+ * walk give up (NULL — the caller keeps today's neutral ranking rather than
+ * guessing), and a nested lambda's returns belong to that lambda, not this
+ * one. This is what lets a statement lambda rank delegate overloads that
+ * differ only in return type: without it every candidate tied and
+ * declaration order decided, which bound `x => { return x.Length; }` to the
+ * string-key OrderBy and reinterpreted the int as a string pointer
+ * (B-ID85). */
+static void stmt_collect_return_types(zan_irgen_t *g, zan_ast_node_t *stmt,
+                                      local_scope_t *locals,
+                                      zan_type_t **found, int *mixed) {
+    if (!stmt || *mixed) return;
+    switch (stmt->kind) {
+    case AST_RETURN_STMT:
+        if (!stmt->ret.value) { *mixed = 1; return; } /* `return;` is void */
+        {
+            zan_type_t *t = infer_expr_type(g, stmt->ret.value, locals);
+            if (!t) { *mixed = 1; return; }
+            if (!*found) { *found = t; return; }
+            if (!types_concrete_equal(*found, t)) *mixed = 1;
+        }
+        return;
+    case AST_BLOCK:
+        for (int i = 0; i < stmt->block.stmts.count; i++)
+            stmt_collect_return_types(g, stmt->block.stmts.items[i],
+                                      locals, found, mixed);
+        return;
+    case AST_IF_STMT:
+        stmt_collect_return_types(g, stmt->if_stmt.then_body, locals, found, mixed);
+        if (stmt->if_stmt.else_body)
+            stmt_collect_return_types(g, stmt->if_stmt.else_body, locals,
+                                      found, mixed);
+        return;
+    case AST_VAR_DECL:
+        /* a local the trailing returns may reference: type its initializer
+         * with what is in scope so far and add it, mirroring emission order */
+        if (stmt->var_decl.initializer) {
+            zan_type_t *t = infer_expr_type(g, stmt->var_decl.initializer, locals);
+            if (t) local_add(locals, stmt->var_decl.name, NULL, t);
+        }
+        return;
+    case AST_LAMBDA:
+        return;                    /* inner lambda's returns are its own */
+    case AST_WHILE_STMT: case AST_DO_WHILE_STMT: case AST_FOR_STMT:
+    case AST_FOREACH_STMT: case AST_SWITCH_STMT: case AST_TRY_STMT:
+        *mixed = 1;                /* returns may hide in arms we don't model */
+        return;
+    default:
+        return;
+    }
+}
+
+static zan_type_t *stmt_lambda_return_type(zan_irgen_t *g, zan_ast_node_t *body,
+                                           local_scope_t *locals) {
+    if (!body || body->kind != AST_BLOCK) return NULL;
+    zan_type_t *found = NULL;
+    int mixed = 0;
+    stmt_collect_return_types(g, body, locals, &found, &mixed);
+    return mixed ? NULL : found;
+}
+
 /* Type of an expression-bodied lambda read against a delegate signature: its
  * parameters take the delegate's types, so `i => Wrap(i.name)` types as what
- * Wrap returns. NULL when the body is a block or nothing resolves. */
+ * Wrap returns. A block body types through its return statements instead
+ * (stmt_lambda_return_type). NULL when nothing resolves. */
 static zan_type_t *lambda_body_type(zan_irgen_t *g, zan_ast_node_t *lam,
                                     zan_type_t *dt, local_scope_t *locals) {
     if (!lam || !dt || !locals) return NULL;
     zan_ast_node_t *body = lam->lambda.body;
-    if (!body || body->kind == AST_BLOCK) return NULL;
+    if (!body) return NULL;
     int mark = locals->count;
     for (int k = 0; k < lam->lambda.params.count; k++) {
         zan_ast_node_t *p = lam->lambda.params.items[k];
@@ -808,7 +873,9 @@ static zan_type_t *lambda_body_type(zan_irgen_t *g, zan_ast_node_t *lam,
             ? dt->delegate_param_types[k] : NULL;
         local_add(locals, p->param.name, NULL, pt);
     }
-    zan_type_t *bt = infer_expr_type(g, body, locals);
+    zan_type_t *bt = (body->kind == AST_BLOCK)
+        ? stmt_lambda_return_type(g, body, locals)
+        : infer_expr_type(g, body, locals);
     locals->count = mark;
     return bt;
 }
@@ -1225,7 +1292,7 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
             if (!dp || dp->kind != TYPE_DELEGATE) continue;
             if (a->lambda.params.count != dp->delegate_param_count) return -1;
             zan_ast_node_t *body = a->lambda.body;
-            if (!body || body->kind == AST_BLOCK) continue;
+            if (!body) continue;
             int mark = locals->count;
             for (int k = 0; k < a->lambda.params.count; k++) {
                 zan_ast_node_t *lp = a->lambda.params.items[k];
@@ -1234,7 +1301,17 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
                     : dp->delegate_param_types[k];
                 local_add(locals, lp->param.name, NULL, lpt);
             }
-            int bf = expr_family(g, body, locals);
+            /* Block bodies rank by their return statements' common type
+             * (B-ID85): without it every delegate overload tied and
+             * declaration order decided, binding `x => { return x.Length; }`
+             * to the string-key overload. NULL keeps the neutral score. */
+            int bf = FAM_UNKNOWN;
+            if (body->kind == AST_BLOCK) {
+                zan_type_t *bt = stmt_lambda_return_type(g, body, locals);
+                if (bt) bf = type_family(bt);
+            } else {
+                bf = expr_family(g, body, locals);
+            }
             locals->count = mark;
             int df = type_family(dp->delegate_ret_type);
             if (bf != FAM_UNKNOWN && df != FAM_UNKNOWN) {
