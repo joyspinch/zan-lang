@@ -706,3 +706,44 @@ void zan_proc_free_buf(char *buf) {
     if (buf) free(buf);
 }
 
+/* ---- memory mapped file stubs (WASM browser/sandbox has no mmap/shm) --- */
+long long zan_mmap_create(const char *name, long long size) {
+    (void)name; (void)size;
+    return 0;
+}
+
+long long zan_mmap_open(const char *name, long long size) {
+    (void)name; (void)size;
+    return 0;
+}
+
+long long zan_mmap_from_file(const char *path, long long size) {
+    (void)path; (void)size;
+    return 0;
+}
+
+long long zan_mmap_map(long long handle, long long size) {
+    (void)handle; (void)size;
+    return 0;
+}
+
+long long zan_mmap_unmap(long long ptr, long long size) {
+    (void)ptr; (void)size;
+    return 0;
+}
+
+long long zan_mmap_flush(long long ptr, long long size) {
+    (void)ptr; (void)size;
+    return 0;
+}
+
+long long zan_mmap_close(long long handle) {
+    (void)handle;
+    return 0;
+}
+
+long long zan_mmap_unlink(const char *name) {
+    (void)name;
+    return 0;
+}
+
