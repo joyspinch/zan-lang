@@ -123,20 +123,23 @@
   AddRowNulls legacy 通道留给 Firebird/TDengine/ODBC/Excel）。实测 10k 行×21 列 ：memory:
   sqlite：build 26ms→20ms、8 整数列+12 文本列类型化读 12ms→2ms（acc 逐位一致）；新增
   tests/conformance/db_cell_types（28 检，含 >2^53 精度、负数、NULL、RowAt、GetRow 串化）。
-- [ ] **B-ID84 残项（P3批·卫生汇总）**——runtime：libwebp 1.4.0→例行升级、Windows g_fls
-  DWORD 跨线程读/pthread key 失败不回收。stdlib：GenJson NaN/Inf 与
-  B-ID75(d) 同病（ToJson 已修、GenJson.zan 未在清单，d16977d5 遗留）、EscapeAttr 漏 '
-  （防纵深，DesignerHtml 侧已补）、Encoding.GetByteCount strlen 语义仅加文档（无低成本
-  修法）；已裁决保留：ByteBuffer.ToBytes 尾随 NUL 系 bytebuffer_bounds 金样钉死的既有
-  契约（注释已声明，改动需先拍板更新金样）。SDK：ModExp 无盲化（类文档已注 P3）、
-  access_token GET query 传输与无刷新互斥（协议固有+多实例部署提示）。
+- [ ] **B-ID84 残项（P3批·卫生汇总）**——runtime：libwebp 1.4.0→例行升级（整包换血，
+  单独批次）。stdlib：Encoding.GetByteCount strlen 语义——复核时文档已在位
+  （"底层走 strlen，内嵌 NUL 只数到第一个 NUL"，无需再改）；已裁决保留：
+  ByteBuffer.ToBytes 尾随 NUL 系 bytebuffer_bounds 金样钉死的既有契约（注释已声明，
+  改动需先拍板更新金样）。SDK：ModExp 无盲化（类文档已注 P3）、access_token GET query
+  传输与无刷新互斥（协议固有+多实例部署提示）。
   已闭账：runtime/common 子项（539d72f1）、加密子项（e4da88ba）、格式包子项（c45d8efe）、
   stdlib GenDbEmit/GenForm/GenRoute/Interop（d16977d5）、JsonValue/JsonTape \u0000 统一、
-  zanc 卫生五项（lexer EOF 诊断×3——verbatim/插值段/插值格式各自补
-  "unterminated ..." 且合法路径无回归；浮点超长措辞按 is_float 分流；arena
-  对齐加法与 used+size 两处溢出守卫；strbuf OOM 分支补 free 旧块；package.c
-  四处源发现枚举改"名排序快照"共享助手——NTFS 名序/ext4 哈希序不再进发射序，
-  copy/remove 树序无可观察效应保持原样）。
+  zanc 卫生五项（4e31a537——lexer EOF 诊断×3、浮点超长措辞分流、arena 溢出守卫×2、
+  strbuf OOM 补 free、package.c 四处源发现枚举名排序快照）、runtime/stdlib 残四项
+  ——rt_mem Windows g_fls 改全程 __atomic 访问（free 路径双重读一并收敛为单次载入）；
+  rt_mem POSIX pthread key 创建失败改永久缓存-less（state 3，与 Windows FlsAlloc
+  失败同型），原先失败后仍发放无 exit 钩子的缓存=线程死时整缓存连带 free list
+  搁浅；GenJson 生成 writer 的 double 标量/数组元素（W_ 与 T_ 两形态共六处模板）
+  改走 N_/T_Num NaN/±Inf→null 守卫（生成类脚手架带助手，与 JsonValue.NumText
+  同语义；探针 10 检钉死）；Zan.Xml EscapeAttr 补 &#39;（防纵深，writer 本身
+  只用双引号，roundtrip 金样不受扰）。
 - [x] **B-ID87【代理·实测】（P2）zanc stdlib 内联 File.ReadAllText 依赖宿主 using 面**——
   已闭账 d3e4418a（2026-10-03）。根因：拉入闭包 reach 集只由 using 指令驱动，stdlib 内部
   成员访问根（AppPath.zan 的 `File`）被标记 live 但 System/IO 从未 reach，File.zan 不入编，

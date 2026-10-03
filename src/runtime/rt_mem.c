@@ -278,14 +278,17 @@ static zan_mem_cache *zan_mem_cache_get(void) {
                                                 __ATOMIC_ACQ_REL,
                                                 __ATOMIC_ACQUIRE)) {
         DWORD idx = FlsAlloc(zan_mem_fls_cb);
-        g_fls = idx;
+        /* Plain loads/stores on g_fls would be a C data race: the winning
+         * thread writes it once and every other thread reads it after. */
+        __atomic_store_n(&g_fls, idx, __ATOMIC_RELEASE);
         __atomic_store_n(&g_fls_state, idx == FLS_OUT_OF_INDEXES ? 3 : 2,
                          __ATOMIC_RELEASE);
         fst = idx == FLS_OUT_OF_INDEXES ? 3 : 2;
     }
     if (fst != 2) return NULL;      /* still being created, or unavailable */
-    DWORD fls = g_fls;
-    zan_mem_cache *c = (zan_mem_cache *)FlsGetValue(fls);
+    DWORD fls = __atomic_load_n(&g_fls, __ATOMIC_ACQUIRE);
+    zan_mem_cache *c = (fls == FLS_OUT_OF_INDEXES)
+                       ? NULL : (zan_mem_cache *)FlsGetValue(fls);
     if (c) return c;
 #else
     zan_mem_cache *c = t_cache;
@@ -295,14 +298,20 @@ static zan_mem_cache *zan_mem_cache_get(void) {
                                                __ATOMIC_ACQ_REL,
                                                __ATOMIC_ACQUIRE)) {
         int ok = pthread_key_create(&g_exit_key, zan_mem_thread_exit) == 0;
-        __atomic_store_n(&g_exit_key_state, ok ? 2 : 0, __ATOMIC_RELEASE);
+        /* 3 = key unavailable, permanently. Handing out a cache without the
+         * exit hook would strand it -- and every block sitting in its free
+         * lists -- when the thread dies; cache-less mode is correct, just
+         * slower (the Windows side lands there on FlsAlloc failure too). */
+        __atomic_store_n(&g_exit_key_state, ok ? 2 : 3, __ATOMIC_RELEASE);
+        st = ok ? 2 : 3;
     } else {
-        while (__atomic_load_n(&g_exit_key_state, __ATOMIC_ACQUIRE) == 1) {
+        while ((st = __atomic_load_n(&g_exit_key_state, __ATOMIC_ACQUIRE)) == 1) {
 #if defined(__i386__) || defined(__x86_64__)
             __builtin_ia32_pause();
 #endif
         }
     }
+    if (st != 2) return NULL;       /* key unavailable: no cache, no leak */
 #endif
     zan_mem_lock();
     c = g_cache_pool;
@@ -573,8 +582,11 @@ void __wrap_free(void *p) {
     }
     zan_mem_cache *owner = __atomic_load_n(&h->owner, __ATOMIC_RELAXED);
 #if defined(_WIN32)
-    zan_mem_cache *self = (g_fls == FLS_OUT_OF_INDEXES)
-                          ? NULL : (zan_mem_cache *)FlsGetValue(g_fls);
+    /* Single atomic load: two plain reads of g_fls were both a data race
+     * and a re-read between the check and FlsGetValue. */
+    DWORD fls = __atomic_load_n(&g_fls, __ATOMIC_ACQUIRE);
+    zan_mem_cache *self = (fls == FLS_OUT_OF_INDEXES)
+                          ? NULL : (zan_mem_cache *)FlsGetValue(fls);
 #else
     zan_mem_cache *self = t_cache;
 #endif
