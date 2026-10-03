@@ -5,6 +5,38 @@ using Gui;
 
 namespace Game.Scene;
 
+enum SceneScaleMode {
+    Fit = 0,
+    Fill = 1,
+    Stretch = 2,
+    None = 3
+}
+
+enum SceneAnchor {
+    None = 0,
+    TopLeft = 1,
+    TopCenter = 2,
+    TopRight = 3,
+    CenterLeft = 4,
+    Center = 5,
+    CenterRight = 6,
+    BottomLeft = 7,
+    BottomCenter = 8,
+    BottomRight = 9,
+    Stretch = 10
+}
+
+/// 强类型事件动作实体：代替弱类型 JsonValue 键值对
+class SceneActionBinding {
+    string event;
+    string action;
+
+    SceneActionBinding(string evt, string act) {
+        this.event = evt;
+        this.action = act;
+    }
+}
+
 /// <summary>
 /// 作者定义的设计分辨率如何映射到实际窗口/后备缓冲区。
 /// 取值：Fit 等比缩放信箱式（保持宽高比，可能黑边）、Fill 等比
@@ -144,12 +176,12 @@ class SceneElement {
     // 归属层名（"" = 基础层）。同一层的元素作为一个浮层整体
     // 显隐（弹窗/菜单页/对话框），运行时按激活层集合过滤渲染。
     string layer;
-    // 声明式事件绑定（on* 键，如 "onClick"），值是动作串。动作串
-    // 可以是内置动作（"ShowLayer:bag"、"HideLayer:self"、
-    // "ToggleLayer:equip"、"CloseTopLayer"）或代码后置方法名
-    // （"OnBuyClicked"，经 handlers 注册的 Action 触发）。
-    // 多个动作用 ';' 串接，按序执行。与 Gui.Designer 的 on<Event>
-    // 键同一形状：存储动作名，运行时解释，设计器只管编辑。
+    string cssClass;     // CSS 样式类名（如 "game-btn gold-border inventory-slot"）
+    int position;        // 定位模式：0 = flow (Flex弹性流式), 1 = float (脱离文档流浮动/锚定定位)
+    int flexGrow;        // 弹性权重（0 = 不伸展，>0 弹性分配）
+    // 强类型声明式事件动作实体列表
+    List<SceneActionBinding> actionList;
+    // 声明式事件绑定（on* 键，如 "onClick"），兼容旧反射通道
     JsonValue actions;
     // 设计器未建模的键（未来版本/手写设计稿的额外声明）。
     // 往返时原样写回，使旧运行时打开新设计稿不丢数据——
@@ -172,6 +204,10 @@ class SceneElement {
         this.items = "";
         this.locked = false;
         this.layer = "";
+        this.cssClass = "";
+        this.position = 1; // 默认 float 浮动/锚定定位
+        this.flexGrow = 0;
+        this.actionList = new List<SceneActionBinding>();
         this.actions = null;
     }
 
@@ -209,18 +245,45 @@ class SceneElement {
     SceneElement SetLocked(bool v) { this.locked = v; return this; }
     /// 设置归属层名（"" = 基础层），返回自身以链式调用。
     SceneElement SetLayer(string layer) { this.layer = layer; return this; }
+    /// 设置 CSS 类名（皮肤与样式美化），返回自身以链式调用。
+    SceneElement SetCssClass(string cls) { this.cssClass = cls; return this; }
+    /// 设置定位模式（0 = flow Flex弹性流式, 1 = float 浮动/锚定定位），返回自身以链式调用。
+    SceneElement SetPosition(int pos) { this.position = pos; return this; }
+    /// 设置弹性权重（0 = 不伸展），返回自身以链式调用。
+    SceneElement SetFlexGrow(int g) { this.flexGrow = g; return this; }
 
     /// 绑定一个 on* 动作串（如 On("onClick", "ShowLayer:bag")）。
+    /// 同时记录强类型 SceneActionBinding 实体与 JsonValue 兼容通道。
     /// 空值清除该事件的绑定。
     SceneElement On(string evt, string actions) {
+        if (this.actionList == null) { this.actionList = new List<SceneActionBinding>(); }
+        // 清理同名旧事件
+        int i = 0;
+        while (i < this.actionList.Count) {
+            if (this.actionList[i].event == evt) {
+                this.actionList.RemoveAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+        if (actions != null && actions.Length > 0) {
+            this.actionList.Add(new SceneActionBinding(evt, actions));
+        }
+
         if (this.actions == null) { this.actions = JsonValue.NewObject(); }
         this.actions.Set(evt, JsonValue.NewStr(actions == null ? "" : actions));
         return this;
     }
 
-    /// 绑定到 `evt` 的动作串（如 "onClick" -> "ShowLayer:bag"），
-    /// 无绑定为 ""。空串视为未绑定。
+    /// 绑定到 `evt` 的动作串（优先从强类型 actionList 实体列表读取）。
     string OnAction(string evt) {
+        if (this.actionList != null) {
+            for (int i = 0; i < this.actionList.Count; i = i + 1) {
+                if (this.actionList[i].event == evt) {
+                    return this.actionList[i].action;
+                }
+            }
+        }
         if (this.actions == null) { return ""; }
         JsonValue v = this.actions.Get(evt);
         if (v == null || !v.IsString()) { return ""; }
@@ -275,6 +338,12 @@ class SceneElement {
     bool Locked() { return this.locked; }
     /// 归属层名（"" = 基础层；命名层需被打开才渲染/命中）。
     string Layer() { return this.layer; }
+    /// CSS 样式类名。
+    string CssClass() { return this.cssClass; }
+    /// 定位模式：0 = flow (Flex弹性流式), 1 = float (浮动/锚定定位)。
+    int Position() { return this.position; }
+    /// 弹性权重。
+    int FlexGrow() { return this.flexGrow; }
     /// 是否为网格组（rows 或 cols 大于 1）。
     bool IsGrid() { return this.rows > 1 || this.cols > 1; }
 
@@ -802,7 +871,20 @@ class SceneDoc {
                 e.items = je.Str("items", "");
                 e.locked = je.Bool("locked", false);
                 e.layer = je.Str("layer", "");
+                e.cssClass = je.Str("class", "");
+                e.position = je.Int("position", 1);
+                e.flexGrow = je.Int("flexGrow", 0);
                 e.actions = SceneDoc.OnKeysOf(je);
+                // 同步填充强类型实体列表 actionList
+                if (e.actions != null && e.actions.IsObject()) {
+                    for (int ak = 0; ak < e.actions.Count(); ak = ak + 1) {
+                        string akey = e.actions.KeyAt(ak);
+                        JsonValue aval = e.actions.ValAt(ak);
+                        if (aval != null && aval.IsString()) {
+                            e.actionList.Add(new SceneActionBinding(akey, aval.AsString("")));
+                        }
+                    }
+                }
                 e.extra = SceneDoc.UnmodeledKeys(je);
                 d.elements.Add(e);
             }
@@ -852,7 +934,7 @@ class SceneDoc {
             || k == "z" || k == "image" || k == "text" || k == "color"
             || k == "visible" || k == "rows" || k == "cols" || k == "gapX"
             || k == "gapY" || k == "value" || k == "items" || k == "locked"
-            || k == "layer";
+            || k == "layer" || k == "class" || k == "position" || k == "flexGrow";
     }
 
     /// k 是否为文档级（根对象）已建模的键；ToJson 全量写出，
@@ -927,6 +1009,15 @@ class SceneDoc {
             }
             if (e.Layer().Length > 0) {
                 el.Put("layer", JsonValue.NewStr(e.Layer()));
+            }
+            if (e.CssClass().Length > 0) {
+                el.Put("class", JsonValue.NewStr(e.CssClass()));
+            }
+            if (e.Position() != 1) {
+                el.Put("position", JsonValue.NewNum(Convert.ToString(e.Position())));
+            }
+            if (e.FlexGrow() > 0) {
+                el.Put("flexGrow", JsonValue.NewNum(Convert.ToString(e.FlexGrow())));
             }
             // on* 动作键原样写回（空串跳过，视为未绑定）。
             if (e.actions != null && e.actions.IsObject()) {

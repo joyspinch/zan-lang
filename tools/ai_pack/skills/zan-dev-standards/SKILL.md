@@ -36,6 +36,10 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 
 ## 二、代码规范
 
+- **GUI 与游戏排版及实体建模统一规范（Flex + Float 单轨化，废除双轨与旧式 Dock）**：
+  ① 界面与游戏 HUD 排版模型归一：全面收敛为 `Flow`（参与父级 Flex 弹性盒主轴与交叉轴伸缩、间距 Gap）与 `Float`（脱离文档流绝对/浮动摆位，结合九宫格 Anchor 锚点对齐自适应分辨率）；彻底淘汰传统桌面切边式 Dock 停靠算法与独立的游戏绝对像素画布；
+  ② 游戏 UI 本质即 GUI 皮肤化：游戏世界视口（`GameViewport`）作为 GUI 控件树中的内容节点，上层 HUD、背包、血条、技能栏直接复用标准 GUI 控件（`Button`/`ProgressBar`/`Panel`/`Flex`），视觉差异纯粹通过 CSS 类、主题贴图与九宫格边框（Border-Image）实现；
+  ③ 实体强类型与 Enum 规范：高频渲染、设计器文档模型与动作分发全面采用强类型实体（如 `SceneActionBinding`、`FieldPositionMode`、`SceneAnchor`）替代动态弱类型字典或通用 `JsonValue` 解包，彻底根除高频帧循环中的哈希查找与堆内存浪费；`JsonValue` 仅作为磁盘持久化边缘的序列化载体。
 - **stdlib/Gui 界面禁止自绘**，全部用标准库控件与布局原语完成。
 - 组件写法与同目录既有组件保持一致：命名、事件命名、state 管理同构。
 - 注释只写代码看不出来的约束与"为什么"；不复述代码、不写日期流水、

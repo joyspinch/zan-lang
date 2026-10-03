@@ -616,11 +616,8 @@ partial class Designer {
         winH = newH;
     }
 
-    /// 停靠布局：设了停靠边的组件在所在层里自动吸边——按顺序
-    /// 从剩余矩形上切走一条（厚度沿用组件自己的宽/高），Fill
-    /// 铺满剩下的全部；停靠为「自由」(0) 的组件不参与，保持
-    /// 绝对定位。每帧算一遍并写入运行时矩形，画布和命中测试
-    /// 看到解算结果，而保存的 JSON 仍只看作者矩形。
+    /// 统一排版解算：支持 Flex 流式排列 + 脱离文档流的 Float/Absolute 浮动与锚定定位。
+    /// 兼容旧式 dock 边数据（dockSide > 0 映射为对应锚定定位），彻底淘汰旧式两遍切块 dock 算法。
     void ApplyDockLayout(List<FormField> lst, int ax, int ay, int aw, int ah) {
         for (int i = 0; i < lst.Count; i = i + 1) {
             lst[i].ResetLayout();
@@ -629,10 +626,7 @@ partial class Designer {
         this.ApplyDockNested(lst);
     }
 
-    /// 对每个容器的内容框再停靠一层（与 RenderFreeField 的
-    /// +6 / +26 内边距一致）。标签页容器的每一页各自为一层：
-    /// 否则看不见的页里的停靠组件会吃掉当前页的空间，
-    /// 当前页的 Fill 就只剩 0。
+    /// 对每个容器的内容框解算子层布局。
     void ApplyDockNested(List<FormField> lst) {
         for (int i = 0; i < lst.Count; i = i + 1) {
             FormField f = lst[i];
@@ -653,11 +647,7 @@ partial class Designer {
         }
     }
 
-    /// 把一层停靠组件排进 (ax, ay, aw, ah)。`tabFilter >= 0` 时
-    /// 只排该标签页下的子级。两遍式与运行时 Control.Arrange 同构：
-    /// 第一遍四边停靠按子序切剩余矩形，第二遍 Fill 统一铺最终的
-    /// 剩余矩形——Fill 若内联在切边途中取矩形，会盖住排在其后
-    /// 的边停靠条（运行时不会），画布和发布窗体从此不一致。
+    /// 解算一层组件布局（Flex 流式子项 + Float 浮动/锚定子项）
     void ApplyDockLayer(List<FormField> lst, int ax, int ay, int aw, int ah,
             int tabFilter) {
         int rx = ax;
@@ -666,36 +656,74 @@ partial class Designer {
         int rh = ah;
         if (rw < 0) { rw = 0; }
         if (rh < 0) { rh = 0; }
+
+        // 第一遍：解算参与 Flex 流式排版的组件（position == 0 且 dockSide != 5）
+        int flowY = ry;
         for (int i = 0; i < lst.Count; i = i + 1) {
             FormField f = lst[i];
             if (f.IsNonVisual()) { continue; }
             if (tabFilter >= 0 && f.childTab != tabFilter) { continue; }
+            // 兼容迁移：旧 dockSide 转换为对应排版，若 dockSide == 0 且 position == 0 则走流式
+            if (f.position == 0 && f.dockSide == 0) {
+                int fw = f.FreeW();
+                if (fw > rw || f.flexGrow > 0) { fw = rw; }
+                int fh = f.FreeH();
+                f.SetLayoutRect(rx, flowY, fw, fh);
+                flowY = flowY + fh + 4; // 容器内默认 gap
+            }
+        }
+
+        // 第二遍：解算脱离文档流的 Float/Absolute 浮动与锚定定位组件
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            FormField f = lst[i];
+            if (f.IsNonVisual()) { continue; }
+            if (tabFilter >= 0 && f.childTab != tabFilter) { continue; }
+
+            // 旧 dockSide 兼容通道
             int d = f.dockSide;
+            if (d == 5 || (f.position == 1 && f.anchor == 10)) {
+                // Fill / Stretch 全屏铺满
+                f.SetLayoutRect(rx, ry, rw, rh);
+                continue;
+            }
             if (d == 1 || d == 2) {
                 int th = f.FreeH();
                 if (th > rh) { th = rh; }
-                int fy = ry;
-                if (d == 2) { fy = ry + rh - th; }
+                int fy = (d == 2) ? ry + rh - th : ry;
                 f.SetLayoutRect(rx, fy, rw, th);
-                if (d == 1) { ry = ry + th; }
-                rh = rh - th;
-            } else if (d == 3 || d == 4) {
+                continue;
+            }
+            if (d == 3 || d == 4) {
                 int tw = f.FreeW();
                 if (tw > rw) { tw = rw; }
-                int fx = rx;
-                if (d == 4) { fx = rx + rw - tw; }
+                int fx = (d == 4) ? rx + rw - tw : rx;
                 f.SetLayoutRect(fx, ry, tw, rh);
-                if (d == 3) { rx = rx + tw; }
-                rw = rw - tw;
+                continue;
             }
-            if (rw < 0) { rw = 0; }
-            if (rh < 0) { rh = 0; }
-        }
-        for (int i = 0; i < lst.Count; i = i + 1) {
-            FormField f = lst[i];
-            if (f.IsNonVisual()) { continue; }
-            if (tabFilter >= 0 && f.childTab != tabFilter) { continue; }
-            if (f.dockSide == 5) { f.SetLayoutRect(rx, ry, rw, rh); }
+
+            // 新标准九宫格锚点解算（Anchor 1..9）
+            if (f.position == 1 && f.anchor > 0) {
+                int tw = f.FreeW();
+                int th = f.FreeH();
+                int fx = f.FreeX();
+                int fy = f.FreeY();
+                int anc = f.anchor;
+                // 水平参考点
+                if (anc == 1 || anc == 4 || anc == 7) { fx = rx + fx; }
+                else if (anc == 2 || anc == 5 || anc == 8) { fx = rx + (rw - tw) / 2 + fx; }
+                else if (anc == 3 || anc == 6 || anc == 9) { fx = rx + rw - tw + fx; }
+                // 垂直参考点
+                if (anc == 1 || anc == 2 || anc == 3) { fy = ry + fy; }
+                else if (anc == 4 || anc == 5 || anc == 6) { fy = ry + (rh - th) / 2 + fy; }
+                else if (anc == 7 || anc == 8 || anc == 9) { fy = ry + rh - th + fy; }
+                f.SetLayoutRect(fx, fy, tw, th);
+                continue;
+            }
+
+            // 自由绝对坐标定位（position == 1, anchor == 0）
+            if (f.position == 1 && f.anchor == 0 && f.dockSide == 0) {
+                f.SetLayoutRect(rx + f.FreeX(), ry + f.FreeY(), f.FreeW(), f.FreeH());
+            }
         }
     }
 
@@ -1554,7 +1582,7 @@ partial class Designer {
                 }
             }
             if (!started && preview) {
-                // 预览态：点击走事件分发反馈（B-ID21），不选择、
+                // 预览态：点击走事件分发反馈，不选择、
                 // 不拖拽、不框选；页签翻页属真交互，上一块保留。
                 this.PvPreviewClick(app, ox, oy, psMilli);
                 started = true;
@@ -2882,7 +2910,7 @@ partial class Designer {
         app.metricsScale = czScale;
     }
 
-    /// 预览态画布点击的事件分发反馈（B-ID21）：命中字段若声明了
+    /// 预览态画布点击的事件分发反馈：命中字段若声明了
     /// 事件绑定，状态条闪现 "事件 → 处理器名"（优先 Click，其次
     /// 第一条声明），与真控件预览树的绑定分发走同一 PvFlash。
     /// 仿画字段没有活命中区，这一层点击命中就是它们的预览分发；

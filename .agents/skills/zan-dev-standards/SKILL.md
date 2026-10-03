@@ -39,6 +39,10 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
 
 ## 二、代码规范
 
+- **GUI 与游戏排版及实体建模统一规范（Flex + Float 单轨化，废除双轨与旧式 Dock）**：
+  ① 界面与游戏 HUD 排版模型归一：全面收敛为 `Flow`（参与父级 Flex 弹性盒主轴与交叉轴伸缩、间距 Gap）与 `Float`（脱离文档流绝对/浮动摆位，结合九宫格 Anchor 锚点对齐自适应分辨率）；彻底淘汰传统桌面切边式 Dock 停靠算法与独立的游戏绝对像素画布；
+  ② 游戏 UI 本质即 GUI 皮肤化：游戏世界视口（`GameViewport`）作为 GUI 控件树中的内容节点，上层 HUD、背包、血条、技能栏直接复用标准 GUI 控件（`Button`/`ProgressBar`/`Panel`/`Flex`），视觉差异纯粹通过 CSS 类、主题贴图与九宫格边框（Border-Image）实现；
+  ③ 实体强类型与 Enum 规范：高频渲染、设计器文档模型与动作分发全面采用强类型实体（如 `SceneActionBinding`、`FieldPositionMode`、`SceneAnchor`）替代动态弱类型字典或通用 `JsonValue` 解包，彻底根除高频帧循环中的哈希查找与堆内存浪费；`JsonValue` 仅作为磁盘持久化边缘的序列化载体。
 - **stdlib/Gui 界面禁止自绘**，全部用标准库控件与布局原语完成。
 - 组件写法与同目录既有组件保持一致：命名、事件命名、state 管理同构。
 - 注释只写代码看不出来的约束与"为什么"；不复述代码、不写日期流水、
@@ -262,7 +266,7 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   LISTEN 但请求 000 超时（连接进 backlog 无人应答，两实例先后中招），
   刷视图/配置一律 stop+start；master+worker 常驻时 exe 被运行进程占用，
   zanc 链接 `app.exe` 报 Permission denied，先 stop 并 netstat 复核再编
-  （2026-09-29 SSE 30s 断流修复部署即踩）；⑬ 浏览器整页截图连续超时（30s 连发）先 DOM 快照确认页面没坏再改 clip 小区域出图——是取帧层不稳，不是页面坏了（2026-09-29 仪表盘验收 3 连超时，裁剪即出图）；⑭ 路由按注册串精确匹配，Route("/admin") 不收 /admin/ 尾斜杠——goto 得 {"code":"404"} JSON 先核尾斜杠再怀疑服务挂了；⑮ 浏览器窗口级截屏会把旁边开着的窗口拍进同一张图，图上出现"第二个应用副本/双份侧栏"≠DOM 有两个壳——先 elementFromPoint 或壳计数定真相再动手（2026-09-29 coder 页验收把邻窗 8123 误读成页面复制体）；⑯ CSS 表格自动布局里 td/th 的 width 只是建议，列位紧张时被压到内容宽（zt-cell 定宽 36 被压到 13，勾选列贴死相邻列）——定宽列必须配 min-width 才是硬下限；overflow 容器裁剪绘制但 getBoundingClientRect 仍报全宽，量"是否溢出"要看 scrollWidth>clientWidth 或视觉，别信 rect（2026-09-29 窄视口审计 zt-cell 压缩 + 部门/知识库两页 rect 误报）；⑰ grid 子项的 margin-bottom 参与轨道行高——为去双倍间距把它清零，会把"最后一行卡片借给容器的 12px"一起清掉，网格之间归零贴死；块级兄弟的纵向节奏要给唯一来源 `.parent > * + * { margin-top }`（与卡片残留 margin-bottom 自动折叠取一份），修一处别再靠多层 margin 叠加（2026-09-29 监控页网格间 0 间距回归）；⑱ try 内 return 的返回值遇 finally 含 await 会写坏——返回值溢出到 $resume 入口 alloca，finally 挂起恢复时入口块重执行出未初始化栈格，裸 await/接住结果/循环三形态全坏、返回假 false 不进 catch（2026-09-30 Schema.Ensure 静默失败定位；当晨 46a7e83a 修愈：溢出改走堆 frame RETSPILL 槽，常设用例 async_return_in_awaiting_finally，2026-10-02 疤痕编译器考古独立复证四形全假→HEAD 全绿）。挂账时"裸语句是触发面/接住结果即安全"的归因是形状巧合，勿再引用；写跨 finally 挂起的 async 形态先跑该用例，包侧接住 async 调用结果再分支保留为可读性纪律。
+  （2026-09-29 SSE 30s 断流修复部署即踩）；⑬ 浏览器整页截图连续超时（30s 连发）先 DOM 快照确认页面没坏再改 clip 小区域出图——是取帧层不稳，不是页面坏了（2026-09-29 仪表盘验收 3 连超时，裁剪即出图）；⑭ 路由按注册串精确匹配，Route("/admin") 不收 /admin/ 尾斜杠——goto 得 {"code":"404"} JSON 先核尾斜杠再怀疑服务挂了；⑮ 浏览器窗口级截屏会把旁边开着的窗口拍进同一张图，图上出现"第二个应用副本/双份侧栏"≠DOM 有两个壳——先 elementFromPoint 或壳计数定真相再动手（2026-09-29 coder 页验收把邻窗 8123 误读成页面复制体）；⑯ CSS 表格自动布局里 td/th 的 width 只是建议，列位紧张时被压到内容宽（zt-cell 定宽 36 被压到 13，勾选列贴死相邻列）——定宽列必须配 min-width 才是硬下限；overflow 容器裁剪绘制但 getBoundingClientRect 仍报全宽，量"是否溢出"要看 scrollWidth>clientWidth 或视觉，别信 rect（2026-09-29 窄视口审计 zt-cell 压缩 + 部门/知识库两页 rect 误报）；⑰ grid 子项的 margin-bottom 参与轨道行高——为去双倍间距把它清零，会把"最后一行卡片借给容器的 12px"一起清掉，网格之间归零贴死；块级兄弟的纵向节奏要给唯一来源 `.parent > * + * { margin-top }`（与卡片残留 margin-bottom 自动折叠取一份），修一处别再靠多层 margin 叠加（2026-09-29 监控页网格间 0 间距回归）；⑱ try 内 return 的返回值遇 finally 含 await 会写坏——返回值溢出到 $resume 入口 alloca，finally 挂起恢复时入口块重执行出未初始化栈格，裸 await/接住结果/循环三形态全坏、返回假 false 不进 catch（2026-09-30 Schema.Ensure 静默失败定位；当晨 46a7e83a 修愈：溢出改走堆 frame RETSPILL 槽，常设用例 async_return_in_awaiting_finally，2026-10-02 疤痕编译器考古独立复证四形全假→HEAD 全绿）。挂账时"裸语句是触发面/接住结果即安全"的归因是形状巧合，勿再引用；写跨 finally 挂起的 async 形态先跑该用例，包侧接住 async 调用结果再分支保留为可读性纪律；⑲ GUI 与 Game 排版统一以 Flex 流式与 Float 自由/九宫格锚定定位为唯一模型，彻底移除传统 Dock 停靠：Dock 存在切角顺序耦合且无法做主轴弹性拉伸，现代 UI（Web/Flutter/Game）全部收敛为 Flex 弹性流（Flow，direction/wrap/gap/align/grow）+ Float 脱离文档流浮动（left/top/right/bottom/anchor/z-index），旧 .zform/.zscene 的 dockSide 转换为 Flow/Float 锚定，内部数据结构全面采用强类型实体（SceneDoc/FormField/SceneActionBinding）与枚举（FieldPositionMode/FieldAnchorMode），JsonValue 严格限制在磁盘读写边界，热路径禁止动态哈希查找与装箱分配。
 - **共享工作树上的测试归责：先隔离再定责**。smoke/e2e 结果异常先查
   并发提交时间线（`git log --format="%h %ad %s" -3`）：共享树另一会话
   在途编辑 stdlib/编译器期间跑测试，产物混进 WIP 源，无关测试假挂假绿
