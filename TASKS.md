@@ -208,7 +208,12 @@
   sqlite：build 26ms→20ms、8 整数列+12 文本列类型化读 12ms→2ms（acc 逐位一致）；新增
   tests/conformance/db_cell_types（28 检，含 >2^53 精度、负数、NULL、RowAt、GetRow 串化）。
 - [ ] **B-ID84 残项（P3批·卫生汇总）**——runtime：libwebp 1.4.0→例行升级（整包换血，
-  单独批次）。stdlib：Encoding.GetByteCount strlen 语义——复核时文档已在位
+  单独批次）。**开工前置（2026-10-03 观察）：驱动回写 CI 未证活**——bot 提交自
+  46477da5（10-01）后全腿归零（c2de7a95/c936/1f69 三次应触发零落地，win 腿疑
+  continue-on-error 吞败，本机不可观测日志）；升级会让 gui_runtime.c unity 内联的
+  libwebp 变更同步污染五平台驱动（macos dylib 只能 Mac 造，B-ID82 同款陷阱）——
+  先等一次 bot 提交落地证 CI 活，再动此批。stdlib：Encoding.GetByteCount strlen 语义——
+  复核时文档已在位
   （"底层走 strlen，内嵌 NUL 只数到第一个 NUL"，无需再改）；已裁决保留：
   ByteBuffer.ToBytes 尾随 NUL 系 bytebuffer_bounds 金样钉死的既有契约（注释已声明，
   改动需先拍板更新金样）。SDK：ModExp 无盲化（类文档已注 P3）、access_token GET query
