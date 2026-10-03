@@ -49,10 +49,10 @@ WASM_GUI = ["src/runtime/gui_runtime.c", "src/runtime/libwebp"]  # unity object
 ANDROID_NDK = []  # NDK-derived: no repo source drives it; never "stale" by src
 OHOS_NDK = []     # same for the OHOS SDK sysroot subset (libc.a, crt*, builtins)
 ZIG_BUNDLED = []  # zig/wasi/musl sysroot subsets + external prebuilts: no repo source
-GUI = ["src/runtime/gui_runtime.c", "src/runtime/gui_runtime_text.c",
-       "src/runtime/gui_runtime_font.c", "src/runtime/gui_runtime_x11.c",
-       "src/runtime/gui_runtime_tray.c", "src/runtime/gui_runtime_sdl.c",
-       "src/runtime/gui_runtime_shims.c"]
+GUI = sorted(glob.glob("src/runtime/gui_*")) + [
+    "src/runtime/zan_audio.c", "src/runtime/stb_image.h",
+    "src/runtime/stb_vorbis.c", "src/runtime/libwebp",
+    "src/runtime/rt_crash.h", "src/runtime/zan_fortify_compat.c"]
 
 # (path, sources, group). The groups exist so CI can hold the part it can
 # rebuild -- `--group runtime`, which zig cc produces for every target from one
@@ -262,10 +262,17 @@ ARTIFACTS = [
     ("toolchain/ohos-x64/libclang_rt.builtins.a", OHOS_NDK, "manual"),
     ("toolchain/ohos-x64/libunwind.a", OHOS_NDK, "manual"),
     ("packages/Zan.Gui/src/Gui/drivers/win-x64/zan_gui.dll", GUI, "gui"),
+    ("packages/Zan.Gui/src/Gui/drivers/win-arm64/zan_gui.dll", GUI, "gui"),
     ("packages/Zan.Gui/src/Gui/drivers/linux-x64/static/libzan_gui.a", GUI, "gui"),
     ("packages/Zan.Gui/src/Gui/drivers/linux-arm64/static/libzan_gui.a", GUI, "gui"),
     ("packages/Zan.Gui/src/Gui/drivers/macos-arm64/libzan_gui.dylib", GUI, "gui"),
     ("packages/Zan.Gui/src/Gui/drivers/macos-x64/libzan_gui.dylib", GUI, "gui"),
+    ("packages/Zan.Gui/src/Gui/drivers/android-arm64/static/libzan_gui.a", GUI, "gui"),
+    ("packages/Zan.Gui/src/Gui/drivers/android-x64/static/libzan_gui.a", GUI, "gui"),
+    ("packages/Zan.Gui/src/Gui/drivers/ohos-arm64/libzan_gui.so", GUI, "gui"),
+    ("packages/Zan.Gui/src/Gui/drivers/ohos-arm64/static/libzan_gui.a", GUI, "gui"),
+    ("packages/Zan.Gui/src/Gui/drivers/ohos-x64/libzan_gui.so", GUI, "gui"),
+    ("packages/Zan.Gui/src/Gui/drivers/ohos-x64/static/libzan_gui.a", GUI, "gui"),
 ]
 
 
