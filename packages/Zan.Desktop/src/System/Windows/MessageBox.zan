@@ -82,58 +82,59 @@ class MessageBox {
         return MessageBox.RunOsa(script) && kind != 0;
         #else
         // 文本走参数文件（zenity --text-info / kdialog --textbox 都读文件），
-        // 这样文本内容永远不进命令行
+        // 这样文本内容永远不进命令行，且含 GUID 防止多线程碰撞与符号链接劫持
         string tmp = Path.GetTempPath() + "zan_msg_"
-            + Convert.ToString(ProcessHost.Pid()) + ".txt";
+            + Convert.ToString(ProcessHost.Pid()) + "_"
+            + Guid.New() + ".txt";
         File.WriteAllText(tmp, text);
-        if (MessageBox.Have("zenity")) {
-            List<string> args = new List<string>();
-            if (kind == 1) {
-                args.Add("--question");
-            } else if (kind == 2) {
-                args.Add("--question");
-                args.Add("--ok-label=OK");
-                args.Add("--cancel-label=Cancel");
+        try {
+            if (MessageBox.Have("zenity")) {
+                List<string> args = new List<string>();
+                if (kind == 1) {
+                    args.Add("--question");
+                } else if (kind == 2) {
+                    args.Add("--question");
+                    args.Add("--ok-label=OK");
+                    args.Add("--cancel-label=Cancel");
+                } else {
+                    args.Add("--info");
+                }
+                args.Add("--title=" + caption);
+                args.Add("--text=" + text);
+                int rc = Process.CaptureSafe("zenity", args).exitCode;
+                return rc == 0;
+            } else if (MessageBox.Have("kdialog")) {
+                List<string> args = new List<string>();
+                args.Add("--title");
+                args.Add(caption);
+                if (kind == 1) {
+                    args.Add("--yesno");
+                } else if (kind == 2) {
+                    args.Add("--warningcontinuecancel");
+                } else {
+                    args.Add("--msgbox");
+                }
+                args.Add(text);
+                int rc = Process.CaptureSafe("kdialog", args).exitCode;
+                return rc == 0;
+            } else if (MessageBox.Have("xmessage")) {
+                List<string> args = new List<string>();
+                args.Add("-center");
+                args.Add("-buttons");
+                string btns = kind == 0 ? "OK:0" : "Yes:0,No:1";
+                if (kind == 2) { btns = "OK:0,Cancel:1"; }
+                args.Add(btns);
+                args.Add("-file");
+                args.Add(tmp);
+                int rc = Process.CaptureSafe("xmessage", args).exitCode;
+                return rc == 0;
             } else {
-                args.Add("--info");
+                throw new PlatformNotSupportedException(
+                    "MessageBox needs a desktop dialog tool: install zenity, "
+                    + "kdialog or xmessage");
             }
-            args.Add("--title=" + caption);
-            args.Add("--text=" + text);
-            int rc = Process.CaptureSafe("zenity", args).exitCode;
+        } finally {
             File.Delete(tmp);
-            return rc == 0;
-        } else if (MessageBox.Have("kdialog")) {
-            List<string> args = new List<string>();
-            args.Add("--title");
-            args.Add(caption);
-            if (kind == 1) {
-                args.Add("--yesno");
-            } else if (kind == 2) {
-                args.Add("--warningcontinuecancel");
-            } else {
-                args.Add("--msgbox");
-            }
-            args.Add(text);
-            int rc = Process.CaptureSafe("kdialog", args).exitCode;
-            File.Delete(tmp);
-            return rc == 0;
-        } else if (MessageBox.Have("xmessage")) {
-            List<string> args = new List<string>();
-            args.Add("-center");
-            args.Add("-buttons");
-            string btns = kind == 0 ? "OK:0" : "Yes:0,No:1";
-            if (kind == 2) { btns = "OK:0,Cancel:1"; }
-            args.Add(btns);
-            args.Add("-file");
-            args.Add(tmp);
-            int rc = Process.CaptureSafe("xmessage", args).exitCode;
-            File.Delete(tmp);
-            return rc == 0;
-        } else {
-            File.Delete(tmp);
-            throw new PlatformNotSupportedException(
-                "MessageBox needs a desktop dialog tool: install zenity, "
-                + "kdialog or xmessage");
         }
         #endif
     }
@@ -166,14 +167,20 @@ class MessageBox {
     /// 把脚本写入临时 .applescript 后用 osascript 执行；
     /// 退出码非 0（用户取消/选否）返回 false。
     static bool RunOsa(string script) {
-        string tmp = Path.GetTempPath() + "zan_msg_"
-            + Convert.ToString(ProcessHost.Pid()) + ".applescript";
+        string tmp = Path.GetTempPath() + "zan_msg_osa_"
+            + Convert.ToString(ProcessHost.Pid()) + "_"
+            + Guid.New() + ".applescript";
         File.WriteAllText(tmp, script);
-        List<string> args = new List<string>();
-        args.Add(tmp);
-        ProcessResult res = Process.CaptureSafe("osascript", args);
-        File.Delete(tmp);
-        return res.exitCode == 0;
+        int exitCode = -1;
+        try {
+            List<string> args = new List<string>();
+            args.Add(tmp);
+            ProcessResult res = Process.CaptureSafe("osascript", args);
+            exitCode = res.exitCode;
+        } finally {
+            File.Delete(tmp);
+        }
+        return exitCode == 0;
     }
     #endif
 }

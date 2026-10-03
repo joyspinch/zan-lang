@@ -146,10 +146,11 @@ class Clipboard {
             + "(Wayland), xclip or xsel (X11); macOS uses pbcopy/pbpaste");
     }
 
-    /// <summary>临时文件路径：剪贴板内容走文件而不进命令行。</summary>
+    /// <summary>临时文件路径：剪贴板内容走文件而不进命令行，包含 GUID 防止多线程碰撞与符号链接劫持。</summary>
     static string TempFile(string tag) {
         return Path.GetTempPath() + "zan_clip_" + tag + "_"
-            + Convert.ToString(ProcessHost.Pid()) + ".tmp";
+            + Convert.ToString(ProcessHost.Pid()) + "_"
+            + Guid.New() + ".tmp";
     }
 
     /// <summary>读取 `mime` 目标的剪贴板内容；没有该目标时返回 ""。</summary>
@@ -197,31 +198,35 @@ class Clipboard {
         }
         string tmp = Clipboard.TempFile("in");
         File.WriteAllText(tmp, content);
-        List<string> shArgs = new List<string>();
-        shArgs.Add("-c");
-        if (tool == Clipboard.ToolWayland()) {
-            // wl-copy 自己 fork 出持有进程；--foreground 会阻塞
-            shArgs.Add("wl-copy --type \"$1\" < \"$2\"");
-            shArgs.Add("sh");
-            shArgs.Add(mime);
-            shArgs.Add(tmp);
-        } else if (tool == Clipboard.ToolXclip()) {
-            // xclip 同样 fork 一个持有 CLIPBOARD 选区的后台进程
-            shArgs.Add("xclip -selection clipboard -i -t \"$1\" < \"$2\"");
-            shArgs.Add("sh");
-            shArgs.Add(mime);
-            shArgs.Add(tmp);
-        } else if (tool == Clipboard.ToolXsel()) {
-            shArgs.Add("xsel -b -i < \"$1\"");
-            shArgs.Add("sh");
-            shArgs.Add(tmp);
-        } else {
-            shArgs.Add("pbcopy < \"$1\"");
-            shArgs.Add("sh");
-            shArgs.Add(tmp);
+        int rc = -1;
+        try {
+            List<string> shArgs = new List<string>();
+            shArgs.Add("-c");
+            if (tool == Clipboard.ToolWayland()) {
+                // wl-copy 自己 fork 出持有进程；--foreground 会阻塞
+                shArgs.Add("wl-copy --type \"$1\" < \"$2\"");
+                shArgs.Add("sh");
+                shArgs.Add(mime);
+                shArgs.Add(tmp);
+            } else if (tool == Clipboard.ToolXclip()) {
+                // xclip 同样 fork 一个持有 CLIPBOARD 选区的后台进程
+                shArgs.Add("xclip -selection clipboard -i -t \"$1\" < \"$2\"");
+                shArgs.Add("sh");
+                shArgs.Add(mime);
+                shArgs.Add(tmp);
+            } else if (tool == Clipboard.ToolXsel()) {
+                shArgs.Add("xsel -b -i < \"$1\"");
+                shArgs.Add("sh");
+                shArgs.Add(tmp);
+            } else {
+                shArgs.Add("pbcopy < \"$1\"");
+                shArgs.Add("sh");
+                shArgs.Add(tmp);
+            }
+            rc = Process.RunSafe("/bin/sh", shArgs);
+        } finally {
+            File.Delete(tmp);
         }
-        int rc = Process.RunSafe("/bin/sh", shArgs);
-        File.Delete(tmp);
         return rc == 0;
     }
 
