@@ -160,6 +160,7 @@ long long zan_dir_list_into(const char *pattern, char *out, long long cap);
 /* Cross-platform safe process execution (avoids shell invocation & injection) */
 int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc);
 int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t argc);
+int32_t zan_proc_start_program_safe(const char *exe, const char *log_path);
 int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
                               char **out_buf, int32_t *out_len, int32_t *exit_code);
 void zan_proc_free_buf(char *buf);

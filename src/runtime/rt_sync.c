@@ -3310,6 +3310,104 @@ int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t
 #endif
 }
 
+int32_t zan_proc_start_program_safe(const char *exe, const char *log_path) {
+    if (!exe) return -1;
+#ifdef _WIN32
+    STARTUPINFOW si;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof(pi));
+
+    HANDLE hLog = INVALID_HANDLE_VALUE;
+    DWORD flags = DETACHED_PROCESS;
+    BOOL inherit = TRUE;
+
+    if (log_path && log_path[0]) {
+        int wpath_len = MultiByteToWideChar(CP_UTF8, 0, log_path, -1, NULL, 0);
+        if (wpath_len > 0) {
+            wchar_t *wlog = (wchar_t *)malloc(wpath_len * sizeof(wchar_t));
+            if (wlog) {
+                MultiByteToWideChar(CP_UTF8, 0, log_path, -1, wlog, wpath_len);
+                SECURITY_ATTRIBUTES sa;
+                memset(&sa, 0, sizeof(sa));
+                sa.nLength = sizeof(sa);
+                sa.bInheritHandle = TRUE;
+                hLog = CreateFileW(wlog, FILE_APPEND_DATA | SYNCHRONIZE,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                free(wlog);
+            }
+        }
+    }
+
+    if (hLog != INVALID_HANDLE_VALUE) {
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdOutput = hLog;
+        si.hStdError = hLog;
+        flags = CREATE_NO_WINDOW;
+    }
+
+    /* Wrap exe path in quotes for Windows CreateProcessW */
+    int wexe_len = MultiByteToWideChar(CP_UTF8, 0, exe, -1, NULL, 0);
+    if (wexe_len <= 0) {
+        if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
+        return -1;
+    }
+    wchar_t *wcmd = (wchar_t *)malloc((wexe_len + 4) * sizeof(wchar_t));
+    if (!wcmd) {
+        if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
+        return -1;
+    }
+    wcmd[0] = L'"';
+    MultiByteToWideChar(CP_UTF8, 0, exe, -1, wcmd + 1, wexe_len);
+    /* MultiByteToWideChar includes null terminator, replace with closing quote */
+    wcmd[wexe_len] = L'"';
+    wcmd[wexe_len + 1] = L'\0';
+
+    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, inherit, flags, NULL, NULL, &si, &pi);
+    free(wcmd);
+    if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
+    if (!ok) return -1;
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return 0;
+#else
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        setsid();
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            if (devnull > STDIN_FILENO) close(devnull);
+        }
+        if (log_path && log_path[0]) {
+            int outfd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (outfd >= 0) {
+                dup2(outfd, STDOUT_FILENO);
+                dup2(outfd, STDERR_FILENO);
+                if (outfd > STDERR_FILENO) close(outfd);
+            }
+        } else {
+            int outnull = open("/dev/null", O_WRONLY);
+            if (outnull >= 0) {
+                dup2(outnull, STDOUT_FILENO);
+                dup2(outnull, STDERR_FILENO);
+                if (outnull > STDERR_FILENO) close(outnull);
+            }
+        }
+        char *argv[2];
+        argv[0] = (char *)exe;
+        argv[1] = NULL;
+        execvp(exe, argv);
+        _exit(127);
+    }
+    return 0;
+#endif
+}
+
 int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
                               char **out_buf, int32_t *out_len, int32_t *exit_code) {
     if (!exe || !out_buf || !out_len || !exit_code) return -1;

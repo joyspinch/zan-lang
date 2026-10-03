@@ -268,6 +268,10 @@ class Worker {
     // A291②：收紧记录文件权限用（见 RecordControlPort）。
     [DllImport("crt")]
     static extern int chmod(string path, int mode);
+    [DllImport("crt")]
+    static extern int setenv(string name, string val, int overwrite);
+    [DllImport("crt")]
+    static extern int unsetenv(string name);
     #endif
 
     #if WINDOWS
@@ -1166,9 +1170,10 @@ class Worker {
     static int totalSpawned = 0;
     static int maxTotalSpawns = 512;
 
-    /// Master 派生一个 worker 子进程（wid 从 1 起）：经环境变量（Windows）或
-    /// 命令行前缀（POSIX）传递 worker id、控制端口、统计表句柄、日志目录与
-    /// 共享表句柄；总派生数受 maxTotalSpawns 硬上限保护。
+    /// Master 派生一个 worker 子进程（wid 从 1 起）：经环境变量传递 worker id、
+    /// 控制端口、统计表句柄、日志目录与共享表句柄；通过 Process.StartProgram 直接以
+    /// 原生系统调用（Windows CreateProcessW / POSIX fork+execvp+setsid）安全派生，
+    /// 彻底消除 /bin/sh 或 cmd.exe Shell 逃逸漏洞与管道死锁风险；总派生数受 maxTotalSpawns 硬上限保护。
     static void SpawnChild(int wid) {
         if (totalSpawned >= maxTotalSpawns) {
             Console.WriteLine("[Worker] spawn cap (" + Convert.ToString(maxTotalSpawns)
@@ -1212,29 +1217,27 @@ class Worker {
                 + " failed to start: CreateProcess(" + exe + ") failed");
         }
         #else
-        List<string> shArgs = new List<string>();
-        shArgs.Add("-c");
-        string envPrefix = "ZAN_WORKER_ID=" + Convert.ToString(wid)
-            + " ZAN_CTL_PORT=" + Convert.ToString(ctl)
-            + " ZAN_STATS_HANDLE=" + Convert.ToString(statOsHandle)
-            + " ZAN_LOG_DIR=\"$1\" ";
+        // POSIX 侧同样走 setenv 设置环境变量，子进程通过 fork() 自动继承完整环境块，
+        // 随后由 Process.StartProgram 直接调用 fork+setsid+dup2+execvp 启动，
+        // 彻底消除了原先构造 "/bin/sh -c" 字符串拼接带来的 Shell 命令注入隐患。
+        setenv("ZAN_WORKER_ID", Convert.ToString(wid), 1);
+        setenv("ZAN_CTL_PORT", Convert.ToString(ctl), 1);
+        setenv("ZAN_STATS_HANDLE", Convert.ToString(statOsHandle), 1);
+        setenv("ZAN_LOG_DIR", logDir, 1);
         for (int s = 0; s < shareNames.Count; s = s + 1) {
-            envPrefix = envPrefix + ShareEnv(shareNames[s]) + "="
-                + Convert.ToString(shareHandles[s]) + " ";
+            setenv(ShareEnv(shareNames[s]), Convert.ToString(shareHandles[s]), 1);
         }
-        if (logPath != "") {
-            shArgs.Add(envPrefix + "\"$2\" >> \"$3\" 2>&1");
-            shArgs.Add("sh");
-            shArgs.Add(logDir);
-            shArgs.Add(exe);
-            shArgs.Add(logPath);
-        } else {
-            shArgs.Add(envPrefix + "\"$2\"");
-            shArgs.Add("sh");
-            shArgs.Add(logDir);
-            shArgs.Add(exe);
+        int rc = Process.StartProgram(exe, logPath);
+        unsetenv("ZAN_WORKER_ID");
+        unsetenv("ZAN_CTL_PORT");
+        unsetenv("ZAN_STATS_HANDLE");
+        for (int c = 0; c < shareNames.Count; c = c + 1) {
+            unsetenv(ShareEnv(shareNames[c]));
         }
-        Process.StartDetachedSafe("/bin/sh", shArgs);
+        if (rc != 0) {
+            Log.Error("[Worker] worker " + Convert.ToString(wid)
+                + " failed to start: exec(" + exe + ") failed");
+        }
         #endif
         Log.Info("[Worker] worker " + Convert.ToString(wid) + " spawned");
     }
