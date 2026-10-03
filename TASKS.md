@@ -27,26 +27,12 @@
 
 ## 未完成
 
-- [ ] **B-ID90（P2·工具链）陈旧产物清理：GUI 驱动五件 + 交叉 rt 对象十四件**——GUI 侧：
-  B-ID71 音频修复（bdd0a6a1）与壳层变更未进——win-x64 dll（9/30 产物；重建配方已验
-  =cmake --build build --target zan_gui + scripts/build_gui_driver.ps1，因并行会话
-  gui 源在途编辑暂缓提交，落库后重跑即可）、linux-x64 .a（WSL 已验可行：X11 头+四
-  静态 X11 归档+gcc 13.3 齐，bash scripts/build_linux_gui_static.sh linux-x64）、
-  linux-arm64 .a（WSL 有交叉 gcc 但缺 multiarch 静态 X11 归档，需 apt
-  libx11-dev:arm64 系或等 CI）、macos 双 dylib（仅 Mac runner/CI 可产）。
-  check_toolchain_stale.py gui 组已入册 12 件全驱动（源面 glob
-  gui_*/zan_audio/stb_*/libwebp/rt_crash.h/fortify，提交时间判定、对在途编辑免疫），
-  持续如实报告；win-arm64/android×2/ohos×2 当前 ok。
-  runtime 侧（10-04 首跑曝出）：zanrt_file.o 八目标（linux-musl/arm64/riscv64、
-  macos/arm64、ios、wasm32、ohos 双架构，落后 539d72f1 改 rt_file.c）、
-  zan_embed_api.o 五目标（落后 99428c5b 改 rt_timer.h）、ios zan_inflate.o
-  （落后 539d72f1）——file/embed/inflate 系在这两笔后无重编轮（io/sync/timer
-  系 c936eb03 已刷、zanrt_sync 十二目标 f29fa45d 已清，安全面无欠）。
-  本机 zig+NDK 配方可清（check_toolchain_stale.py --rebuild），但闭包源
-  rt_file.c/rt_timer.h/zan_inflate.c 正被并行会话在途编辑覆盖（工作树 M 状态），
-  现在重建会把未提交内容烤进对象（win-x64 dll 同款陷阱），或 worktree 检出
-  干净 HEAD 旁路重建；与 gui 五件同轮清偿：在途源落库后一轮 --rebuild + gui
-  双平台重建，checker 双组全绿即闭。
+- [ ] **B-ID90（P2·工具链）残余三件：linux-arm64 .a + macos 双 dylib（CI/Mac 闸门）**——
+  win-x64 dll 与 linux-x64 .a 已换血（3922859b，干净 worktree@HEAD 构建，bdd0a6a1
+  音频修复入 unity 面；def/导入库字节零差）；交叉 rt 十四件经重编字节裁定"日期陈旧、
+  字节现役"全部降级 ok，无真实欠账（零对象提交）。残余仅 linux-arm64 .a（WSL 有交叉
+  gcc 缺 multiarch 静态 X11，本机 sudo 需密码装不了，等 CI）与 macos 双 dylib（仅
+  Mac runner 可产）——drivers.yml 复活即随回写清偿，与 B-ID84 同门。
 - [ ] **B-ID84 残项（P3批·卫生汇总）**——仅余 runtime：libwebp 1.4.0→例行升级（整包换血，
   单独批次）。**开工前置（2026-10-03 观察）：驱动回写 CI 未证活**——bot 提交自 46477da5
   （10-01）后全腿归零（c2de7a95/c936/1f69 三次应触发零落地，win 腿疑 continue-on-error
