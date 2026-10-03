@@ -688,6 +688,11 @@ int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
     return -1;
 }
 
+int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t argc) {
+    (void)exe; (void)args; (void)argc;
+    return -1;
+}
+
 int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
                               char **out_buf, int32_t *out_len, int32_t *exit_code) {
     (void)exe; (void)args; (void)argc;

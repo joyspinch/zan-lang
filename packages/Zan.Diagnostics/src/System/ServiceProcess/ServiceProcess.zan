@@ -61,8 +61,14 @@ class ServiceProcess {
     static List<ServiceInfo> List() {
         List<ServiceInfo> list = new List<ServiceInfo>();
         #if WINDOWS
-        List<string> lines = Process.RunCapture(
-            "sc query type= service state= all");
+        List<string> qargs = new List<string>();
+        qargs.Add("query");
+        qargs.Add("type=");
+        qargs.Add("service");
+        qargs.Add("state=");
+        qargs.Add("all");
+        ProcessResult qres = Process.CaptureSafe("sc.exe", qargs);
+        List<string> lines = qres.lines;
         ServiceInfo cur = null;
         for (int i = 0; i < lines.Count; i = i + 1) {
             string line = lines[i];
@@ -99,7 +105,11 @@ class ServiceProcess {
         // its own process; shared svchost services report 0). Single-query
         // output has no DISPLAY_NAME line, so displayName defaults to name;
         // use List() for display names.
-        List<string> lines = Process.RunCapture("sc queryex " + name);
+        List<string> qargs = new List<string>();
+        qargs.Add("queryex");
+        qargs.Add(name);
+        ProcessResult qres = Process.CaptureSafe("sc.exe", qargs);
+        List<string> lines = qres.lines;
         // Successful output always starts with "SERVICE_NAME:" (after a
         // leading blank line); a failed query (service missing, access
         // denied, ...) does not. The error text itself is localized /
@@ -137,7 +147,7 @@ class ServiceProcess {
     /// running).</summary>
     static bool Start(string name) {
         #if WINDOWS
-        return ServiceProcess.ScOk("sc start " + name);
+        return ServiceProcess.ScOk("start", name);
         #elif LINUX
         return ServiceProcess.Systemctl("start", name);
         #else
@@ -149,7 +159,7 @@ class ServiceProcess {
     /// <summary>Stops a running service. True on success.</summary>
     static bool Stop(string name) {
         #if WINDOWS
-        return ServiceProcess.ScOk("sc stop " + name);
+        return ServiceProcess.ScOk("stop", name);
         #elif LINUX
         return ServiceProcess.Systemctl("stop", name);
         #else
@@ -183,7 +193,7 @@ class ServiceProcess {
     /// success.</summary>
     static bool Delete(string name) {
         #if WINDOWS
-        return ServiceProcess.ScOk("sc delete " + name);
+        return ServiceProcess.ScOk("delete", name);
         #elif LINUX
         return ServiceProcess.Systemctl("disable --now", name) ||
                ServiceProcess.Systemctl("stop", name);
@@ -205,8 +215,12 @@ class ServiceProcess {
     #if WINDOWS
     /// sc 命令是否成功：捕获 stderr 后看首行是否含 FAILED
     ///（成功行是 SERVICE_NAME: / STATE: 4 RUNNING 等）。
-    static bool ScOk(string cmd) {
-        List<string> lines = Process.RunCapture(cmd + " 2>&1");
+    static bool ScOk(string verb, string name) {
+        List<string> args = new List<string>();
+        args.Add(verb);
+        args.Add(name);
+        ProcessResult res = Process.CaptureSafe("sc.exe", args);
+        List<string> lines = res.lines;
         if (lines.Count == 0) { return false; }
         string head = ServiceProcess.Trim(lines[0]);
         // Success lines: "SERVICE_NAME:", "STATE: 4 RUNNING", or "[SC]
@@ -293,8 +307,14 @@ class ServiceProcess {
     /// `active`（`activating` 亦匹配）记为 4（running），否则 1（stopped），
     /// PID 由 SystemctlPid 补齐。
     static List<ServiceInfo> SystemctlList(List<ServiceInfo> list) {
-        List<string> lines = Process.RunCapture(
-            "systemctl list-units --type=service --all --no-legend --no-pager");
+        List<string> args = new List<string>();
+        args.Add("list-units");
+        args.Add("--type=service");
+        args.Add("--all");
+        args.Add("--no-legend");
+        args.Add("--no-pager");
+        ProcessResult res = Process.CaptureSafe("systemctl", args);
+        List<string> lines = res.lines;
         int i = 0;
         while (i < lines.Count) {
             string line = lines[i];
@@ -317,17 +337,32 @@ class ServiceProcess {
     /// 查询服务主进程 PID（`systemctl show -p MainPID --value`）；
     /// 服务未运行或查询无输出时返回 0。
     static int SystemctlPid(string name) {
-        List<string> lines = Process.RunCapture(
-            "systemctl show -p MainPID --value " + name + ".service");
-        if (lines.Count > 0) { return ServiceProcess.ParseInt(lines[0]); }
+        List<string> args = new List<string>();
+        args.Add("show");
+        args.Add("-p");
+        args.Add("MainPID");
+        args.Add("--value");
+        args.Add(name + ".service");
+        ProcessResult res = Process.CaptureSafe("systemctl", args);
+        if (res.lines.Count > 0) { return ServiceProcess.ParseInt(res.lines[0]); }
         return 0;
     }
 
     /// 执行 systemctl 子命令；输出首行不含 `error` 或无输出视为成功。
     static bool Systemctl(string verb, string name) {
-        List<string> lines = Process.RunCapture(
-            "systemctl " + verb + " " + name + ".service 2>&1");
+        List<string> args = new List<string>();
+        if (verb == "disable --now") {
+            args.Add("disable");
+            args.Add("--now");
+        } else {
+            args.Add(verb);
+        }
+        args.Add(name + ".service");
+        ProcessResult res = Process.CaptureSafe("systemctl", args);
+        List<string> lines = res.lines;
         return lines.Count == 0 ||
+               ServiceProcess.IndexOf(lines[0], "error", 0) < 0;
+    }
                ServiceProcess.IndexOf(lines[0], "error", 0) < 0;
     }
 

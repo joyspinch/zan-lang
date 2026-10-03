@@ -3255,6 +3255,60 @@ int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
 #endif
 }
 
+int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t argc) {
+    if (!exe) return -1;
+#ifdef _WIN32
+    char *cmdline = zan_win_quote_cmdline(exe, args, argc);
+    if (!cmdline) return -1;
+
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, NULL, 0);
+    if (wlen <= 0) { free(cmdline); return -1; }
+    wchar_t *wcmd = (wchar_t *)malloc(wlen * sizeof(wchar_t));
+    if (!wcmd) { free(cmdline); return -1; }
+    MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, wcmd, wlen);
+    free(cmdline);
+
+    STARTUPINFOW si;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof(pi));
+
+    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE,
+                             CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, NULL, &si, &pi);
+    free(wcmd);
+    if (!ok) return -1;
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return 0;
+#else
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        /* Child */
+        setsid();
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO) close(devnull);
+        }
+        char **argv = (char **)malloc((argc + 2) * sizeof(char *));
+        if (!argv) _exit(127);
+        argv[0] = (char *)exe;
+        for (int32_t i = 0; i < argc; i++) {
+            argv[i + 1] = (char *)args[i];
+        }
+        argv[argc + 1] = NULL;
+        execvp(exe, argv);
+        _exit(127);
+    }
+    return 0;
+#endif
+}
+
 int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
                               char **out_buf, int32_t *out_len, int32_t *exit_code) {
     if (!exe || !out_buf || !out_len || !exit_code) return -1;

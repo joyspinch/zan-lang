@@ -112,8 +112,12 @@ class Clipboard {
 
     /// PATH 里是否存在名为 `name` 的命令。
     static bool HaveCommand(string name) {
-        // 名字是本文件里的字面量，不含用户输入
-        return Process.Capture("command -v " + name + " >/dev/null 2>&1").Ok();
+        List<string> args = new List<string>();
+        args.Add("-c");
+        args.Add("command -v \"$1\" >/dev/null 2>&1");
+        args.Add("sh");
+        args.Add(name);
+        return Process.CaptureSafe("/bin/sh", args).exitCode == 0;
     }
 
     /// <summary>当前平台可用的剪贴板工具；一个都没有时返回 ToolNone。
@@ -151,24 +155,32 @@ class Clipboard {
     /// <summary>读取 `mime` 目标的剪贴板内容；没有该目标时返回 ""。</summary>
     static string PosixRead(int tool, string mime) {
         if (tool == Clipboard.ToolNone()) { Clipboard.NoTool(); }
-        string tmp = Clipboard.TempFile("out");
-        string cmd = "";
+        List<string> args = new List<string>();
+        string exe = "";
         if (tool == Clipboard.ToolWayland()) {
-            cmd = "wl-paste --no-newline --type '" + mime + "'";
+            exe = "wl-paste";
+            args.Add("--no-newline");
+            args.Add("--type");
+            args.Add(mime);
         } else if (tool == Clipboard.ToolXclip()) {
-            cmd = "xclip -selection clipboard -o -t '" + mime + "'";
+            exe = "xclip";
+            args.Add("-selection");
+            args.Add("clipboard");
+            args.Add("-o");
+            args.Add("-t");
+            args.Add(mime);
         } else if (tool == Clipboard.ToolXsel()) {
             if (mime != Clipboard.MimeText()) { return ""; }
-            cmd = "xsel -b -o";
+            exe = "xsel";
+            args.Add("-b");
+            args.Add("-o");
         } else {
             if (mime != Clipboard.MimeText()) { return ""; }
-            cmd = "pbpaste";
+            exe = "pbpaste";
         }
-        int rc = Process.Run(cmd + " > '" + tmp + "' 2>/dev/null");
-        string text = "";
-        if (rc == 0 && File.Exists(tmp)) { text = File.ReadAllText(tmp); }
-        if (File.Exists(tmp)) { File.Delete(tmp); }
-        return text;
+        ProcessResult res = Process.CaptureSafe(exe, args);
+        if (res.exitCode == 0) { return res.Text(); }
+        return "";
     }
 
     /// <summary>把 `content` 作为 `mime` 目标放上剪贴板。</summary>
@@ -185,19 +197,30 @@ class Clipboard {
         }
         string tmp = Clipboard.TempFile("in");
         File.WriteAllText(tmp, content);
-        string cmd = "";
+        List<string> shArgs = new List<string>();
+        shArgs.Add("-c");
         if (tool == Clipboard.ToolWayland()) {
             // wl-copy 自己 fork 出持有进程；--foreground 会阻塞
-            cmd = "wl-copy --type '" + mime + "' < '" + tmp + "'";
+            shArgs.Add("wl-copy --type \"$1\" < \"$2\"");
+            shArgs.Add("sh");
+            shArgs.Add(mime);
+            shArgs.Add(tmp);
         } else if (tool == Clipboard.ToolXclip()) {
             // xclip 同样 fork 一个持有 CLIPBOARD 选区的后台进程
-            cmd = "xclip -selection clipboard -i -t '" + mime + "' < '" + tmp + "'";
+            shArgs.Add("xclip -selection clipboard -i -t \"$1\" < \"$2\"");
+            shArgs.Add("sh");
+            shArgs.Add(mime);
+            shArgs.Add(tmp);
         } else if (tool == Clipboard.ToolXsel()) {
-            cmd = "xsel -b -i < '" + tmp + "'";
+            shArgs.Add("xsel -b -i < \"$1\"");
+            shArgs.Add("sh");
+            shArgs.Add(tmp);
         } else {
-            cmd = "pbcopy < '" + tmp + "'";
+            shArgs.Add("pbcopy < \"$1\"");
+            shArgs.Add("sh");
+            shArgs.Add(tmp);
         }
-        int rc = Process.Run(cmd);
+        int rc = Process.RunSafe("/bin/sh", shArgs);
         File.Delete(tmp);
         return rc == 0;
     }
@@ -287,10 +310,14 @@ class Clipboard {
         #else
         int tool = Clipboard.PosixTool();
         if (tool == Clipboard.ToolWayland()) {
-            Process.Run("wl-copy --clear");
+            List<string> args = new List<string>();
+            args.Add("--clear");
+            Process.RunSafe("wl-copy", args);
         } else if (tool == Clipboard.ToolXsel()) {
             // X11 没有“清空”这个操作：放弃选区所有权就是清空，xsel -c 即如此
-            Process.Run("xsel -bc");
+            List<string> args = new List<string>();
+            args.Add("-bc");
+            Process.RunSafe("xsel", args);
         } else {
             Clipboard.PosixWrite(tool, Clipboard.MimeText(), "");
         }
@@ -462,11 +489,18 @@ class Clipboard {
         }
         #else
         int tool = Clipboard.PosixTool();
-        string cmd = "";
+        List<string> args = new List<string>();
+        string exe = "";
         if (tool == Clipboard.ToolWayland()) {
-            cmd = "wl-paste --list-types";
+            exe = "wl-paste";
+            args.Add("--list-types");
         } else if (tool == Clipboard.ToolXclip()) {
-            cmd = "xclip -selection clipboard -o -t TARGETS";
+            exe = "xclip";
+            args.Add("-selection");
+            args.Add("clipboard");
+            args.Add("-o");
+            args.Add("-t");
+            args.Add("TARGETS");
         } else if (tool == Clipboard.ToolNone()) {
             Clipboard.NoTool();
         } else {
@@ -474,7 +508,7 @@ class Clipboard {
             if (Clipboard.HasText()) { list.Add(Clipboard.MimeText()); }
             return list;
         }
-        ProcessResult r = Process.Capture(cmd);
+        ProcessResult r = Process.CaptureSafe(exe, args);
         for (int i = 0; i < r.lines.Count; i = i + 1) {
             string t = r.lines[i].Trim();
             if (t.Length > 0) { list.Add(t); }

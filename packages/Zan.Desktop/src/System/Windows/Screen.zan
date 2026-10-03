@@ -94,7 +94,8 @@ class Screen {
         return dpi;
         #elif LINUX
         // xdpyinfo: "  resolution:    96x96 dots per inch"
-        ProcessResult r = Process.Capture("xdpyinfo 2>/dev/null");
+        List<string> dargs = new List<string>();
+        ProcessResult r = Process.CaptureSafe("xdpyinfo", dargs);
         if (r.lines != null) {
             for (int i = 0; i < r.lines.Count; i = i + 1) {
                 if (r.lines[i].IndexOf("resolution:") < 0) { continue; }
@@ -201,7 +202,12 @@ class Screen {
 
     /// PATH 里是否存在名为 `tool` 的命令。
     static bool Have(string tool) {
-        return Process.Capture("command -v " + tool + " >/dev/null 2>&1").Ok();
+        List<string> args = new List<string>();
+        args.Add("-c");
+        args.Add("command -v \"$1\" >/dev/null 2>&1");
+        args.Add("sh");
+        args.Add(tool);
+        return Process.CaptureSafe("/bin/sh", args).exitCode == 0;
     }
 
     /// <summary>用平台截图工具把屏幕矩形写成 BMP。w/h 为 0 表示整屏。
@@ -213,50 +219,71 @@ class Screen {
             geom = Convert.ToString(w) + "x" + Convert.ToString(h)
                 + "+" + Convert.ToString(x) + "+" + Convert.ToString(y);
         }
-        string cmd = "";
         #if MACOS
         if (!Screen.Have("screencapture")) {
             throw new PlatformNotSupportedException(
                 "Screen capture needs /usr/sbin/screencapture");
         }
-        cmd = "screencapture -x -t bmp";
+        List<string> scArgs = new List<string>();
+        scArgs.Add("-x");
+        scArgs.Add("-t");
+        scArgs.Add("bmp");
         if (geom.Length > 0) {
-            cmd = cmd + " -R" + Convert.ToString(x) + "," + Convert.ToString(y)
-                + "," + Convert.ToString(w) + "," + Convert.ToString(h);
+            scArgs.Add("-R" + Convert.ToString(x) + "," + Convert.ToString(y)
+                + "," + Convert.ToString(w) + "," + Convert.ToString(h));
         }
-        cmd = cmd + " '" + path + "'";
+        scArgs.Add(path);
+        int rc = Process.CaptureSafe("screencapture", scArgs).exitCode;
+        return rc == 0 && File.Exists(path);
         #else
         bool wayland = ProcessHost.Env("WAYLAND_DISPLAY").Length > 0;
         if (wayland && Screen.Have("grim")) {
             // grim 只写 PNG/PPM，先出 PPM 再自己转 BMP
             string ppm = path + ".ppm";
-            string g = "grim -t ppm";
+            List<string> gArgs = new List<string>();
+            gArgs.Add("-t");
+            gArgs.Add("ppm");
             if (geom.Length > 0) {
-                g = g + " -g '" + Convert.ToString(x) + "," + Convert.ToString(y)
-                    + " " + Convert.ToString(w) + "x" + Convert.ToString(h) + "'";
+                gArgs.Add("-g");
+                gArgs.Add(Convert.ToString(x) + "," + Convert.ToString(y)
+                    + " " + Convert.ToString(w) + "x" + Convert.ToString(h));
             }
-            int grc = Process.Run(g + " '" + ppm + "' 2>/dev/null");
+            gArgs.Add(ppm);
+            int grc = Process.CaptureSafe("grim", gArgs).exitCode;
             bool ok = grc == 0 && Screen.PpmToBmp(ppm, path);
             if (File.Exists(ppm)) { File.Delete(ppm); }
             return ok;
         }
         if (Screen.Have("import")) {
             // ImageMagick：BMP3 是无压缩 24 位，最容易读回
-            cmd = "import -window root";
-            if (geom.Length > 0) { cmd = cmd + " -crop " + geom + " +repage"; }
-            cmd = cmd + " BMP3:'" + path + "'";
+            List<string> imArgs = new List<string>();
+            imArgs.Add("-window");
+            imArgs.Add("root");
+            if (geom.Length > 0) {
+                imArgs.Add("-crop");
+                imArgs.Add(geom);
+                imArgs.Add("+repage");
+            }
+            imArgs.Add("BMP3:" + path);
+            return Process.CaptureSafe("import", imArgs).exitCode == 0 && File.Exists(path);
         } else if (Screen.Have("spectacle")) {
-            cmd = "spectacle -b -n -o '" + path + "'";
+            List<string> spArgs = new List<string>();
+            spArgs.Add("-b");
+            spArgs.Add("-n");
+            spArgs.Add("-o");
+            spArgs.Add(path);
+            return Process.CaptureSafe("spectacle", spArgs).exitCode == 0 && File.Exists(path);
         } else if (Screen.Have("gnome-screenshot")) {
-            cmd = "gnome-screenshot -f '" + path + "'";
+            List<string> gsArgs = new List<string>();
+            gsArgs.Add("-f");
+            gsArgs.Add(path);
+            return Process.CaptureSafe("gnome-screenshot", gsArgs).exitCode == 0 && File.Exists(path);
         } else {
             throw new PlatformNotSupportedException(
                 "Screen capture needs a screenshot tool: install imagemagick "
                 + "(X11) or grim (Wayland)");
         }
         #endif
-        int rc = Process.Run(cmd + " 2>/dev/null");
-        return rc == 0 && File.Exists(path);
     }
 
     /// <summary>P6 PPM -> 24 位 BMP（grim 不会写 BMP）。</summary>

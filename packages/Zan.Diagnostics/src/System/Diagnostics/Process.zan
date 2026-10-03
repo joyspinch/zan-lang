@@ -50,6 +50,8 @@ class Process {
                                   nint overlapped);
     [DllImport("crt", EntryPoint = "zan_proc_run_safe")]
     static extern int PlatProcRunSafe(string exe, nint argsPtr, int argc);
+    [DllImport("crt", EntryPoint = "zan_proc_start_detached_safe")]
+    static extern int PlatProcStartDetachedSafe(string exe, nint argsPtr, int argc);
     [DllImport("crt", EntryPoint = "zan_proc_capture_safe")]
     static extern int PlatProcCaptureSafe(string exe, nint argsPtr, int argc,
                                           byte[] outBufPtr, byte[] outLen, byte[] exitCode);
@@ -72,6 +74,8 @@ class Process {
     // Linux、macOS 等 POSIX 系统都在 libc 中提供 popen/pclose。
     [DllImport("crt", EntryPoint = "zan_proc_run_safe")]
     static extern int PlatProcRunSafe(string exe, nint argsPtr, int argc);
+    [DllImport("crt", EntryPoint = "zan_proc_start_detached_safe")]
+    static extern int PlatProcStartDetachedSafe(string exe, nint argsPtr, int argc);
     [DllImport("crt", EntryPoint = "zan_proc_capture_safe")]
     static extern int PlatProcCaptureSafe(string exe, nint argsPtr, int argc,
                                           byte[] outBufPtr, byte[] outLen, byte[] exitCode);
@@ -533,6 +537,52 @@ class Process {
             }
         }
         int code = PlatProcRunSafe(exe, argv, argc);
+        if (argv != 0) {
+            Span<nint> av = new Span<nint>(argv, argc);
+            for (int i = 0; i < argc; i = i + 1) {
+                if (av[i] != 0) { NativeMemory.Free(av[i]); }
+            }
+            NativeMemory.Free(argv);
+        }
+        return code;
+        #endif
+    }
+
+    /// <summary>
+    /// 独立启动外部进程（不等待其退出，不阻塞当前线程，不经过 shell，安全无注入）。
+    /// </summary>
+    static int StartDetachedSafe(string exe, List<string> args) {
+        #if WINDOWS
+        string cmdline = BuildCommandLine(exe, args);
+        byte[] si = new byte[128];
+        si[0] = 104;
+        byte[] pi = new byte[32];
+        int CREATE_NO_WINDOW = 134217728;
+        int DETACHED_PROCESS = 8;
+        nint wcmd = Wide.Of(cmdline);
+        int ok = WinCreateProcess(0, wcmd, 0, 0, 0, CREATE_NO_WINDOW | DETACHED_PROCESS, 0, 0, si, pi);
+        Wide.Free(wcmd);
+        if (ok == 0) { return 0 - 1; }
+        nint hProc = WinHandleAt(pi, 0);
+        nint hThread = WinHandleAt(pi, 8);
+        WinCloseHandle(hProc);
+        WinCloseHandle(hThread);
+        return 0;
+        #else
+        int argc = args != null ? args.Count : 0;
+        nint argv = 0;
+        if (argc > 0) {
+            argv = NativeMemory.Alloc(argc * 8);
+            Span<nint> av = new Span<nint>(argv, argc);
+            for (int i = 0; i < argc; i = i + 1) {
+                string a = args[i];
+                int blen = a.Length;
+                nint abuf = NativeMemory.Alloc(blen + 1);
+                NativeMemory.PutString(abuf, 0, a, blen);
+                av[i] = abuf;
+            }
+        }
+        int code = PlatProcStartDetachedSafe(exe, argv, argc);
         if (argv != 0) {
             Span<nint> av = new Span<nint>(argv, argc);
             for (int i = 0; i < argc; i = i + 1) {

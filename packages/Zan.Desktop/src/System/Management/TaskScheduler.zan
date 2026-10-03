@@ -44,7 +44,12 @@ class TaskScheduler {
     static List<TaskInfo> List() {
         List<TaskInfo> list = new List<TaskInfo>();
         #if WINDOWS
-        List<string> lines = Process.RunCapture("schtasks /query /fo CSV");
+        List<string> qargs = new List<string>();
+        qargs.Add("/query");
+        qargs.Add("/fo");
+        qargs.Add("CSV");
+        ProcessResult qres = Process.CaptureSafe("schtasks.exe", qargs);
+        List<string> lines = qres.lines;
         // 第一行是表头（"\"TaskName\",\"Next Run Time\",\"Status\""）。
         int i = 1;
         while (i < lines.Count) {
@@ -86,8 +91,15 @@ class TaskScheduler {
     static TaskInfo Get(string name) {
         #if WINDOWS
         if (!TaskScheduler.ValidName(name)) { return null; }
-        List<string> lines = Process.RunCapture(
-            "schtasks /query /tn " + TaskScheduler.Quote(name) + " /fo LIST /v");
+        List<string> qargs = new List<string>();
+        qargs.Add("/query");
+        qargs.Add("/tn");
+        qargs.Add(name);
+        qargs.Add("/fo");
+        qargs.Add("LIST");
+        qargs.Add("/v");
+        ProcessResult qres = Process.CaptureSafe("schtasks.exe", qargs);
+        List<string> lines = qres.lines;
         TaskInfo t = new TaskInfo();
         t.name = name;
         t.status = "";
@@ -223,12 +235,20 @@ class TaskScheduler {
             return false;
         }
         if (time != "" && !TaskScheduler.ValidTime(time)) { return false; }
-        string cmd = "schtasks /create /tn " + TaskScheduler.Quote(name) +
-            " /tr " + TaskScheduler.Quote(command) +
-            " /sc " + TaskScheduler.Trim(trigger).ToUpper();
-        if (time != "") { cmd = cmd + " /st " + TaskScheduler.Trim(time); }
-        cmd = cmd + " /f";
-        return TaskScheduler.SchtasksOk(cmd);
+        List<string> args = new List<string>();
+        args.Add("/create");
+        args.Add("/tn");
+        args.Add(name);
+        args.Add("/tr");
+        args.Add(command);
+        args.Add("/sc");
+        args.Add(TaskScheduler.Trim(trigger).ToUpper());
+        if (time != "") {
+            args.Add("/st");
+            args.Add(TaskScheduler.Trim(time));
+        }
+        args.Add("/f");
+        return TaskScheduler.SchtasksOk(args);
         #else
         if (!TaskScheduler.ValidName(name) || command == "") { return false; }
         // command 会整行写进 crontab：换行即注入任意条目，拒绝。
@@ -248,8 +268,12 @@ class TaskScheduler {
     static bool Delete(string name) {
         #if WINDOWS
         if (!TaskScheduler.ValidName(name)) { return false; }
-        return TaskScheduler.SchtasksOk(
-            "schtasks /delete /tn " + TaskScheduler.Quote(name) + " /f");
+        List<string> args = new List<string>();
+        args.Add("/delete");
+        args.Add("/tn");
+        args.Add(name);
+        args.Add("/f");
+        return TaskScheduler.SchtasksOk(args);
         #else
         if (!TaskScheduler.ValidName(name)) { return false; }
         List<string> lines = TaskScheduler.CrontabLines();
@@ -263,14 +287,20 @@ class TaskScheduler {
     static bool Run(string name) {
         #if WINDOWS
         if (!TaskScheduler.ValidName(name)) { return false; }
-        return TaskScheduler.SchtasksOk(
-            "schtasks /run /tn " + TaskScheduler.Quote(name));
+        List<string> args = new List<string>();
+        args.Add("/run");
+        args.Add("/tn");
+        args.Add(name);
+        return TaskScheduler.SchtasksOk(args);
         #else
         if (!TaskScheduler.ValidName(name)) { return false; }
         TaskInfo t = TaskScheduler.Get(name);
         if (t == null || t.command == "") { return false; }
-        // cron 本身没有“立即运行”接口，直接异步启动它的命令行。
-        return Process.RunDetached(t.command) == 0;
+        // cron 本身没有“立即运行”接口，直接异步安全启动它的命令行。
+        List<string> shArgs = new List<string>();
+        shArgs.Add("-c");
+        shArgs.Add(t.command);
+        return Process.StartDetachedSafe("/bin/sh", shArgs) == 0;
         #endif
     }
 
@@ -279,15 +309,20 @@ class TaskScheduler {
     static bool End(string name) {
         #if WINDOWS
         if (!TaskScheduler.ValidName(name)) { return false; }
-        return TaskScheduler.SchtasksOk(
-            "schtasks /end /tn " + TaskScheduler.Quote(name));
+        List<string> args = new List<string>();
+        args.Add("/end");
+        args.Add("/tn");
+        args.Add(name);
+        return TaskScheduler.SchtasksOk(args);
         #else
         if (!TaskScheduler.ValidName(name)) { return false; }
         TaskInfo t = TaskScheduler.Get(name);
         if (t == null || t.command == "") { return false; }
         // pkill 的退出码：0 杀死了进程，1 没有匹配的进程（已经停了）。
-        ProcessResult r = Process.Capture(
-            "pkill -f " + TaskScheduler.ShellQuote(t.command));
+        List<string> pkArgs = new List<string>();
+        pkArgs.Add("-f");
+        pkArgs.Add(t.command);
+        ProcessResult r = Process.CaptureSafe("pkill", pkArgs);
         return r.exitCode == 0 || r.exitCode == 1;
         #endif
     }
@@ -306,7 +341,9 @@ class TaskScheduler {
 
     /// 当前用户的 crontab 全部行；没有 crontab 时返回空列表。
     static List<string> CrontabLines() {
-        ProcessResult r = Process.Capture("crontab -l");
+        List<string> args = new List<string>();
+        args.Add("-l");
+        ProcessResult r = Process.CaptureSafe("crontab", args);
         // 没有 crontab 时它以非 0 退出并在 stderr 上报 "no crontab for ..."。
         if (r.exitCode != 0) { return new List<string>(); }
         return r.lines;
@@ -337,7 +374,9 @@ class TaskScheduler {
         } catch (IOException e) {
             return false;
         }
-        ProcessResult r = Process.Capture("crontab " + TaskScheduler.ShellQuote(tmp));
+        List<string> cArgs = new List<string>();
+        cArgs.Add(tmp);
+        ProcessResult r = Process.CaptureSafe("crontab", cArgs);
         File.Delete(tmp);
         return r.exitCode == 0;
     }
@@ -459,8 +498,10 @@ class TaskScheduler {
 
     #if WINDOWS
     /// 运行 schtasks 命令并按输出判断成败（含 "ERROR"/"Error" 行即失败）。
-    static bool SchtasksOk(string cmd) {
-        List<string> lines = Process.RunCapture(cmd + " 2>&1");
+    static bool SchtasksOk(List<string> args) {
+        ProcessResult res = Process.CaptureSafe("schtasks.exe", args);
+        if (res.exitCode != 0) { return false; }
+        List<string> lines = res.lines;
         // schtasks 成功时输出 "SUCCESS: ..." / "INFO: ..."，
         // 失败时输出 "ERROR: ..."（本地化前缀可能不同；检查
         // 在所有语言中都保持 ASCII 的标记词）。
