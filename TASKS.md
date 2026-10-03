@@ -22,11 +22,10 @@
 - 2026-10-03 深度审计批 B-ID60..84 闭账（8 领域约 62 万行重审，6 路修复代理+主会话并行 29 提交，25879056 收册）：编译器 ba32a189（枚举折叠/插值 NUL/链接截断）；stdlib eb64f58a、f885c5a5、c8cbe3b8、a738a0d0；runtime bdd0a6a1、9a45a015、1745aa39、14f4f1f8、624c706d、539d72f1；包安全 80a83dd2、daa61dc4、9ff778eb、529e53fd、278609f3；解析器 7779081c、49b2b5c9、2824550d、c45d8efe；Mvc/Web e20c1e68、b037adbf、d59a6e2a；Linq/加密/工具链 b4ee0a62、38f00e2f、9c36cdfe、e4da88ba、d16977d5、4e31a537、2b80ce8e。审计期新发现 B-ID85/86/87/88/89 与各批残项缩条重挂。
 - 2026-10-03 审计期新发现与残项闭账：B-ID85 语句 lambda 重载（0d5486e7）、B-ID87 stdlib 内联 ReadAllText reach（d3e4418a）、B-ID86 GUI 驱动平台 builder（c2de7a95）、B-ID82 对象矩阵（04e68896/c2de7a95，win-arm64 载荷 CI 盲区本机补齐）、B-ID74 残项（c936eb03）、B-ID78 残项（bd1c3508）、B-ID80 残项（d6548ae3+0d4cb1fb）、B-ID81 全子项（a/c/e/h a738a0d0、d 38f00e2f、f 624c706d、g 9c36cdfe、i fb11642e、残项(b) win-arm64 载荷 5524ba94+台账守卫 a48fa5b8；残项(c) ohos-arm64 需 OHOS SDK，归 B-ID86 残项另行立项）、B-ID83 残项（10e1a610）。
 - 2026-10-03 B-ID88 linux 多工 join 假停滞闭账（io 分片静态数组零初始化 fd=0 守卫短路，io_shards_prime -1 根治，1f69ce5a）；B-ID89 win-arm64 PE 消费链接「lld 空白」证伪闭账（幻影符号 zan_gui_init——DLL 导出表 103 项从未含它，真导出符号四路链接+zanc E2E 全通，7f31a251）。
+- 2026-10-03 B-ID79 残项拍板不修闭账：CSV 写出保持数据原样（用户裁决「不能改 CSV 的习惯」——不前置撇号、不改字节，中和与否属调用方决策）；类文档安全提示补写侧明示（本提交）。同批：drivers.yml 触发面改 src/runtime/** 全树通配，堵死 unity 内联面（libwebp/stb_*/gui_* 等）变更不触发驱动重建的 B-ID86 同款缺口，兼作 CI 活性金丝雀（6c25d871）。
 
 ## 未完成
 
-- [ ] **B-ID79 残项（P3）Csv 公式注入**——（=`+-@ 开头单元格不中和，Excel 执行）行为未改，
-  Csv 类文档已补安全警告（2824550d）；根治需导出侧中和选项，涉 API 面，待议。
 - [ ] **B-ID84 残项（P3批·卫生汇总）**——仅余 runtime：libwebp 1.4.0→例行升级（整包换血，
   单独批次）。**开工前置（2026-10-03 观察）：驱动回写 CI 未证活**——bot 提交自 46477da5
   （10-01）后全腿归零（c2de7a95/c936/1f69 三次应触发零落地，win 腿疑 continue-on-error
