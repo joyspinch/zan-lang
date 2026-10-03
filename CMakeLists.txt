@@ -448,7 +448,8 @@ foreach(_linux_sub linux-musl linux-arm64 linux-riscv64)
                     "${_linux_sys}/zanrt_io.o" "${_linux_sys}/zanrt_sync.o"
                     "${_linux_sys}/zanrt_timer.o"
                     ${CMAKE_BINARY_DIR}/${_linux_sub}/)
-        foreach(_linux_opt zanrt_file.o zanrt_mem.o libgcc.a)
+        foreach(_linux_opt zanrt_file.o zanrt_io_mt.o zanrt_mem.o libgcc.a
+                libfreetype.a libfontconfig.a libexpat.a)
             if(EXISTS "${_linux_sys}/${_linux_opt}")
                 list(APPEND _cross_sysroot_cmds
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different

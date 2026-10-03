@@ -100,6 +100,15 @@ ARTIFACTS = [
     ("toolchain/linux-riscv64/crtn.o", ZIG_BUNDLED, "manual"),
     ("toolchain/linux-riscv64/libc.a", ZIG_BUNDLED, "manual"),
     ("toolchain/linux-riscv64/libgcc.a", ZIG_BUNDLED, "manual"),
+    # GUI text engine sysroot libs (B-ID91): built by hand from external
+    # release trees (freetype2/expat/fontconfig) -- no repo source drives
+    # them; registered so their presence and commit state stay checkable.
+    ("toolchain/linux-musl/libfreetype.a", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-musl/libfontconfig.a", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-musl/libexpat.a", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-arm64/libfreetype.a", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-arm64/libfontconfig.a", ZIG_BUNDLED, "manual"),
+    ("toolchain/linux-arm64/libexpat.a", ZIG_BUNDLED, "manual"),
     ("toolchain/macos/arm64/zanrt_io.o", RT_IO, "runtime"),
     ("toolchain/macos/arm64/zanrt_io_mt.o", RT_IO, "runtime"),
     ("toolchain/macos/arm64/zanrt_sync.o", RT_SYNC, "runtime"),

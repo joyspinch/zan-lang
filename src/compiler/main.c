@@ -7919,6 +7919,25 @@ int main(int argc, char **argv) {
             }
             { cmd_appendf(cmd, sizeof(cmd),
                        " --end-group \"%s/crtn.o\"", sys); }
+
+            /* FreeType + fontconfig + expat for the GUI text engine
+             * (gui_runtime_font.c's desktop branch): linked only when
+             * staged next to the other sysroot objects, mirroring the
+             * wasm32 libfreetype.a shape -- an older layout without them
+             * still links text-less GUI programs. */
+            {
+                static const char *const ft_libs[] = {
+                    "libfreetype.a", "libfontconfig.a", "libexpat.a"
+                };
+                for (int li = 0; li < 3; li++) {
+                    char libpath[1300];
+                    snprintf(libpath, sizeof(libpath), "%s/%s", sys,
+                             ft_libs[li]);
+                    if (zan_file_exists(libpath)) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"", libpath);
+                    }
+                }
+            }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_OHOS) {
             /* Cross-link an OpenHarmony executable with ld.lld against a
