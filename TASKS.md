@@ -106,16 +106,26 @@
   io_register 溢出链 calloc 失败路径 io_mark_dead 漂 sh 参（Windows 永不编译故此前不可见）、
   rt_io.c 工作窃取退避 _mm_pause 隐式声明（HEAD 即错，新 clang 拒编——在册交叉对象系旧环境
   产物）、rt_sync.c 补 sys/wait.h（同因）。
-- [ ] **B-ID88（P2·正确性，疑 WSL 环境）linux 多工 join 唤醒停滞**——shard_io_probe
-  （_scratch/async-bench/shard_io_probe.zan：64 并发 loopback echo 客户端×20 回程 +
-  WhenAll，ZAN_CO_WORKERS/ZAN_IO_SHARDS 选档）：workers≥4 时 WhenAll 在全部客户端完成后
-  偶发 13-82s 才返回——每客户端完成时间戳证明 64 客户端 <1s 内全部完成（零错包），停滞在
-  join 唤醒/调度唤醒路径而非 IO。实测 HEAD 旧 rt 对象对照同样停滞（4/6 次），非 B-ID74 批
-  引入；workers≤2 未复现，Windows 未复现，mtscale（纯 spawn+WhenAll）k=32 未复现——需 IO
-  与 join 交错才触发。疑点（未证实）：zan_io_pump_timeout 无 pending 时 nanosleep 停车，
-  co_notify 的 eventfd 唤醒不中断睡眠；多 worker 共享分片时唤醒预算 g_co_wake 会计漂移
-  （POSIX co_wait_io 无条件减账）。附带诊断噪声：musl 静态二进制 atexit 的 ZAN_CO_STATS
-  转储不触发（HEAD 同，Windows 正常）。
+- [x] **B-ID88（P2·正确性）linux 多工 join 唤醒停滞**——闭账，根因与"疑 WSL"归因均破案：
+  `static zan_io_shard_t g_ioshard[256]` 零初始化把 `poll_fd`/`wake_rfd`/`wake_wfd` 置成
+  **0（合法 fd=stdin）**而非 -1。开片守卫 `poll_fd < 0`（io_shards_start 跳过）与
+  `poll_fd >= 0`（io_shard_open 视为已开）双双把从未打开的分片读成"已就绪"——分片 1..n-1
+  携 epfd=0 运行，epoll_ctl/epoll_wait 全 EINVAL(22)，其上每个注册失败、等待者被
+  0 字节假 EOF 唤醒（bad=64 成因）；其中一个 fail-woken 帧滞留一条死账（dead=1，
+  g_io_dead_count>0 不清），`zan_io_has_pending()` 永真 → sched_run 收尾排水循环
+  永不退出 → 进程退出挂死（"join 迟到 13-82s"实为退出挂死）。WSL 无辜，任何 POSIX
+  多分片环境皆可触发，Windows IOCP 无分片数组故幸免。修复：`io_shards_prime()`——
+  一次性把 256 分片三 fd 全部置 -1，epoll/kqueue 两后端 `io_shard_open` 与 POSIX
+  `io_shards_start` 的守卫之前调用（关停路径本就写 -1，语义对齐）。
+  取证链：wchan 采样（主线程 nanosleep=排水循环 Sleep(1)、7 工 futex）→ ZAN_SCHED_TRACE
+  环境门控 STRACE（新增，IOTRACE 同型：park/waitio/epoll/io_arm 失败/mark_dead/
+  flush_dead + rt_timer joincmp）抓到 io_arm ADD fail epfd=0 errno=22 → 零初始化短路定罪。
+  验证：WSL linux-x64 实跑修复后 shard_io_probe 矩阵 w×s∈{4/1,4/4,8/4,8/8,16/8,2/1,1/1,1/4}
+  ×3=24/24 bad=0、w8s8 压力 10/10、w16s16 10/10（修复前 workers≥4 偶发 4/6 滞 stir）；
+  mtscale k=32 正常；Windows 回归 5 探针 + shard_io_probe 10/10 + mtscale k=1/k=32 全绿。
+  交叉 rt 对象全量重编（zig linux/macos/ios/wasm/android/ohos + win-{x64,arm64}
+  windows-gnu 三对象），check_toolchain_stale --verify 我改文件的对象全部 ok。
+  诊断噪声另案：musl 静态二进制 atexit 的 ZAN_CO_STATS 转储不触发（HEAD 同，未查）。
 - [x] **B-ID78 残项（P3）四二进制包写侧超长分片**——闭账：CBOR 是四包中唯一有分片
   形态的格式——CborWriter 超过 ChunkBytes（64MB）的 text/byte 串写 indefinite 分片
   （0x7F/0x5F + 等长定长块 + 0xFF，读侧 TakeChunks 原生支持，对单-item 限更小的对端

@@ -1509,19 +1509,33 @@ static void join_on_untrack(void *frame, void **out_joiner, zan_timer_step_t *ou
  * until the scheduler runs dry. The untrack hook in zan_co_live_del stays as
  * the fallback for a frame that leaves the registry without a normal
  * completion. Lock-free fast path for programs that never join. */
+static int zan_sched_trace(void) {
+    static int t = -1;
+    if (t < 0) { const char *e = getenv("ZAN_SCHED_TRACE"); t = (e && *e && *e != '0') ? 1 : 0; }
+    return t;
+}
+
 void zan_join_complete(void *frame) {
     if (!frame || !g_joinmap_cap) return;
     void *fire_joiner = NULL;
     zan_timer_step_t fire_step = NULL;
+    int rem_dbg = -1, np_dbg = -1, any_dbg = -1, fired_dbg = 0;
     live_lock();
     zan_join_pair_t *pr = joinmap_get(frame);
     if (pr && !pr->done) {
         pr->done = 1;
         pr->owner->remaining--;
+        rem_dbg = pr->owner->remaining;
+        np_dbg = pr->owner->npairs;
+        any_dbg = pr->owner->any;
         joinmap_remove(frame, pr);
         join_fire_locked(pr->owner, &fire_joiner, &fire_step);
+        fired_dbg = (fire_joiner && fire_step) ? 1 : 0;
     }
     live_unlock();
+    if (zan_sched_trace())
+        fprintf(stderr, "[st] joincmp frame=%p rem=%d np=%d any=%d fired=%d\n",
+                frame, rem_dbg, np_dbg, any_dbg, fired_dbg);
     if (fire_joiner && fire_step && g_ready_hook) g_ready_hook(fire_joiner, fire_step);
 }
 

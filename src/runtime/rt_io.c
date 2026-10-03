@@ -44,6 +44,12 @@
 static int zan_io_trace(void){static int t=-1;if(t<0){const char*e=getenv("ZAN_IO_TRACE");t=(e&&*e&&*e!='0')?1:0;}return t;}
 #define IOTRACE(...) do{if(zan_io_trace()){fprintf(stderr,"[iot] " __VA_ARGS__);fprintf(stderr,"\n");fflush(stderr);}}while(0)
 
+/* (B-ID88) scheduler-park trace: one line per park/unpark/pump decision so a
+ * "threads are all asleep on something" state can be attributed to a section
+ * by matching the last line each worker printed against its kernel wchan. */
+static int zan_sched_trace(void){static int t=-1;if(t<0){const char*e=getenv("ZAN_SCHED_TRACE");t=(e&&*e&&*e!='0')?1:0;}return t;}
+#define STRACE(...) do{if(zan_sched_trace()){fprintf(stderr,"[st] " __VA_ARGS__);fprintf(stderr,"\n");fflush(stderr);}}while(0)
+
 
 /* The reactor serves two clients:
  *   - stackless CPS frames (the async/await state machine) via zan_io_wait_co,
@@ -276,6 +282,24 @@ typedef struct zan_io_shard {
 } zan_io_shard_t;
 static zan_io_shard_t g_ioshard[ZAN_IO_MAXSHARD];
 
+/* The static array zero-initializes poll_fd to 0, and 0 is a VALID-looking
+ * fd: every open/skip guard ("poll_fd < 0" in io_shards_start, "poll_fd >= 0"
+ * in io_shard_open) reads a never-opened shard as already-open and the shard
+ * runs with epfd 0 -- epoll_ctl/epoll_wait fail EINVAL, every registration on
+ * it fails, and one of the fail-woken frames can strand a dead entry whose
+ * count pins zan_io_has_pending forever (B-ID88 hang). Prime -1 once, before
+ * any open/skip decision can look at the array. */
+static int g_ioshard_prim;
+static void io_shards_prime(void) {
+    if (g_ioshard_prim) return;
+    for (int i = 0; i < ZAN_IO_MAXSHARD; i++) {
+        g_ioshard[i].poll_fd = -1;
+        g_ioshard[i].wake_rfd = -1;
+        g_ioshard[i].wake_wfd = -1;
+    }
+    g_ioshard_prim = 1;
+}
+
 #if defined(ZAN_CO_DRIVER)
 /* Live shard count, 1 = the single shared reactor. Set once per process by
  * io_shards_start before the workers exist (see the shim section). */
@@ -458,6 +482,8 @@ static void io_mark_dead(zan_io_shard_t *sh, void *co, zan_co_step_t step,
     d->next = sh->dead;
     sh->dead = d;
     InterlockedIncrement(&g_io_dead_count);
+    STRACE("mark_dead sh=%d co=%p dead=%d", (int)(sh - g_ioshard), co,
+           (int)g_io_dead_count);
 }
 
 /* Fail and wake every stranded watcher. recv reports 0 bytes (the end-of-stream
@@ -474,6 +500,8 @@ static int io_flush_dead(zan_io_shard_t *sh) {
         free(d);
         woke++;
     }
+    if (woke) STRACE("flush_dead sh=%d woke=%d dead=%d", (int)(sh - g_ioshard),
+                     woke, (int)g_io_dead_count);
     return woke;
 }
 
@@ -1477,6 +1505,7 @@ static int io_sweep_slots(int idx) {
  * async-DNS wake fd stays registered on shard 0 exactly as in the
  * single-reactor days (dns_drain readies frames from any thread). */
 static int io_shard_open(int i) {
+    io_shards_prime();
     zan_io_shard_t *sh = &g_ioshard[i];
     if (sh->poll_fd >= 0) return 1;
 #if defined(ZAN_CO_DRIVER)
@@ -1605,11 +1634,15 @@ static int io_arm(int fd, zan_io_slot_t *s) {
             }
             if (errno == EINTR) continue;
             if (errno == EEXIST) { s->in_epoll = 1; continue; } /* fall to MOD */
+            STRACE("io_arm ADD fail fd=%d epfd=%d errno=%d", fd,
+                   (int)sh->poll_fd, errno);
             return 0;
         }
         if (epoll_ctl(sh->poll_fd, EPOLL_CTL_MOD, fd, &ev) == 0) return 1;
         if (errno == EINTR) continue;
         if (errno == ENOENT) { s->in_epoll = 0; continue; } /* re-add */
+        STRACE("io_arm MOD fail fd=%d epfd=%d errno=%d", fd,
+               (int)sh->poll_fd, errno);
         return 0;
     }
     return 0;
@@ -1780,7 +1813,10 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
         int64_t wait = dns_wait_ms(timeout_ms);
         int capped = (wait < 0 || wait > ZAN_IO_SWEEP_MS);
         if (capped) wait = ZAN_IO_SWEEP_MS;
+        STRACE("shard%d epoll wait=%lld to=%lld", shard, (long long)wait, (long long)timeout_ms);
         int n = epoll_wait(sh->poll_fd, events, 256, (int)wait);
+        if (n < 0) STRACE("shard%d epoll n=%d errno=%d", shard, n, errno);
+        else STRACE("shard%d epoll n=%d", shard, n);
         shard_lock(sh);
         /* n < 0 (EINTR from a stray signal, or a transient backend error) is
          * NOT quiescence: falling through with 0 would make
@@ -1904,6 +1940,7 @@ void zan_io_close_notify(intptr_t fd) {
  * async-DNS wake pipe stays on shard 0 exactly as in the single-reactor
  * days (dns_drain readies frames from any thread). */
 static int io_shard_open(int i) {
+    io_shards_prime();
     zan_io_shard_t *sh = &g_ioshard[i];
     if (sh->poll_fd >= 0) return 1;
 #if defined(ZAN_CO_DRIVER)
@@ -2093,7 +2130,7 @@ static void io_register_locked(intptr_t fd, int32_t interest, void *co, zan_co_s
              * not park forever. Unlink it from the slot FIRST -- io_mark_dead
              * queues its own delivery, and a waiter still reachable here would
              * let the sweep wake this same frame a second time (an 8-byte UAF
-             * through *out_n/*out_accept) and leak one g_io_count. */
+             * through *out_n or *out_accept) and leak one g_io_count. */
             io_unlink_waiter(s, interest == ZAN_IO_READ ? 1 : 0, w);
             InterlockedDecrement(&g_io_count);
             io_mark_dead(sh, co, step, fail_out_n, fail_accept);
@@ -4388,6 +4425,7 @@ typedef long LONG;
  * escape hatch for comparing the two reactors. A backend that refuses extra
  * shards (select) keeps the count at 1. */
 static void io_shards_start(int n) {
+    io_shards_prime();
     int cfg = zan_async_cfg_io_shards();
     if (cfg > 0 && cfg < n) n = cfg;
     const char *e = getenv("ZAN_IO_SHARDS");
@@ -5495,11 +5533,13 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
     }
 #else
     (void)w;
+    STRACE("w%d waitio enter to=%lld haspend=%d", w->index, (long long)to, zan_io_has_pending());
     int polled = zan_io_pump_timeout(to == INFINITE ? -1 : (int64_t)to);
     BOOL ok = (polled >= 0);
     if (g_co_wake > 0) InterlockedDecrement(&g_co_wake);
     InterlockedExchange(&w->parked, 0);
     InterlockedDecrement(&g_co_parked);
+    STRACE("w%d waitio ret=%d ok=%d", w->index, polled, (int)ok);
     if (!ok) {
         dns_timeout_scan();
         /* recv-to deadlines past their due (this worker's shard; entries on
@@ -5657,8 +5697,17 @@ static void co_worker(int worker) {
         if (tnow == 0 || co_has_runnable()) {
             InterlockedExchange(&w->parked, 0);
             InterlockedDecrement(&g_co_parked);
+            STRACE("w%d park-skip tnow=%lld runnable=%d", w->index, tnow, co_has_runnable());
             continue;
         }
+        STRACE("w%d park to=%lld tnext=%lld io=%d blk=%d dead=%d parked=%d stop=%d",
+               w->index, to, tnext, (int)g_io_count, (int)g_blocking_inflight,
+#if !defined(_WIN32)
+               (int)g_io_dead_count,
+#else
+               -1,   /* no dead queue on the IOCP backend */
+#endif
+               (int)g_co_parked, (int)g_co_stop);
         co_wait_io(w, to);         /* clears parked state on return */
     }
 }
