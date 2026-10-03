@@ -171,8 +171,9 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   的 `assert()` 把 `__FILE__` 编进 .rdata，每个发布 exe 泄漏 31 处构建机
   路径（`D:\<repo>\src\runtime\libwebp/...`）；NDEBUG 后字符串清零且无
   行为风险（gui_runtime.c/zan_audio.c 自身零 assert）。linux/android/
-  ohos 静态驱动脚本已同批加旗子，但它们的提交态归档要等各自平台重跑
-  脚本才换血。
+  ohos 静态驱动脚本已同批加旗子；linux 归档随 CI 换血，android/ohos
+  已于 2026-10-03 本地重跑换血（android build_gui_android_static.sh、
+  ohos build_gui_ohos.sh）。
 - **提交态归档会过期，重建时连环炸**：静态驱动归档落后源码时（如
   dwrite TU 未入归档、脚本里的 `.libs` 清单落后人工补过的提交版），
   下一次重编归档才爆 undefined reference；先 `git show
@@ -886,6 +887,18 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - 重出对象名是 `zanrt_*.o` 前缀（build_win_rt.sh 协议），别把裸 `rt_*.o`
   拷进 toolchain/。OHOS NDK clang 15.0.4 在 DevEco Studio 安装目录的
   native/ 下。
+- **「需要 OHOS SDK」挂账前先翻 DevEco 自带的那份（2026-10-03 B-ID86 残项
+  闭账）**：DevEco Studio 自带完整 OpenHarmony native SDK——
+  `<DevEco>/sdk/default/openharmony/native/`（llvm/clang+llvm-ar、sysroot
+  153 库含 libEGL/libGLESv3/native_window），GUI 驱动双架构配方即仓库
+  `scripts/build_gui_ohos.sh`（freetype 2.14.3 按 INSTALL.ANY 逐文件自源
+  构建；别拼 unity TU——ftgrays/ftsdfcommon 的 ONE_PIXEL、pfr 宏拼接即
+  撞）。DevEco 的 clang.exe 是 Windows 原生二进制，Git Bash 喂 `/d/...`
+  MSYS 路径直接 file not found，脚本里一律盘符路径（D:/...）。静态归档
+  的 ar 命令替换失败不炸 `set -e`，缺 freetype 的 674KB 半成品照样
+  staged——归档后验体积或 `llvm-nm` 验 FT_* 符号（9/16 NewProject.apk
+  dlopen 崩即同族）。本地新产出的驱动二进制受全局 `*.so`/`*.a`/`*.dll`
+  忽略，提交必须 `git add -f`。
 
 ## Linux 构建三断点：feature 宏分层、fortify 契约、死包含（B-ID29）
 

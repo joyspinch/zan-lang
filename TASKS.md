@@ -23,6 +23,7 @@
 - 2026-10-03 审计期新发现与残项闭账：B-ID85 语句 lambda 重载（0d5486e7）、B-ID87 stdlib 内联 ReadAllText reach（d3e4418a）、B-ID86 GUI 驱动平台 builder（c2de7a95）、B-ID82 对象矩阵（04e68896/c2de7a95，win-arm64 载荷 CI 盲区本机补齐）、B-ID74 残项（c936eb03）、B-ID78 残项（bd1c3508）、B-ID80 残项（d6548ae3+0d4cb1fb）、B-ID81 全子项（a/c/e/h a738a0d0、d 38f00e2f、f 624c706d、g 9c36cdfe、i fb11642e、残项(b) win-arm64 载荷 5524ba94+台账守卫 a48fa5b8；残项(c) ohos-arm64 需 OHOS SDK，归 B-ID86 残项另行立项）、B-ID83 残项（10e1a610）。
 - 2026-10-03 B-ID88 linux 多工 join 假停滞闭账（io 分片静态数组零初始化 fd=0 守卫短路，io_shards_prime -1 根治，1f69ce5a）；B-ID89 win-arm64 PE 消费链接「lld 空白」证伪闭账（幻影符号 zan_gui_init——DLL 导出表 103 项从未含它，真导出符号四路链接+zanc E2E 全通，7f31a251）。
 - 2026-10-03 B-ID79 残项拍板不修闭账：CSV 写出保持数据原样（用户裁决「不能改 CSV 的习惯」——不前置撇号、不改字节，中和与否属调用方决策）；类文档安全提示补写侧明示（本提交）。同批：drivers.yml 触发面改 src/runtime/** 全树通配，堵死 unity 内联面（libwebp/stb_*/gui_* 等）变更不触发驱动重建的 B-ID86 同款缺口，兼作 CI 活性金丝雀（6c25d871）。
+- 2026-10-03 B-ID86 残项（ohos-arm64 GUI 驱动）闭账——挂账前提「需 OHOS SDK、GitHub runner 无法产出」对本机已失效：DevEco Studio 自带完整 OpenHarmony native SDK（llvm/clang + sysroot 153 库含 native_window/libEGL/libGLESv3）。ohos-arm64 驱动首建（libzan_gui.so + static/libzan_gui.a，AArch64 ELF、597 导出、NDEBUG 零路径泄漏）；ohos-x64 陈旧产物（9/12 vs 9/30 源）同配方换血；build_gui_ohos.sh 重写为自包含配方（freetype 2.14.3 按 INSTALL.ANY 逐文件自源构建——unity 拼接撞宏；DevEco clang.exe 不认 MSYS 路径）。E2E：zanc --target ohos-arm64 --emit-lib 探针出 AArch64 libmain.so，FT_* 未定义=0（freetype 全静态入档），未定义面=libc/dl/egl*/gl* 设备端加载期解析。连带清偿 6bab35f6 预告的 android 债：双 ABI 静态归档换血（build_gui_android_static.sh，NDK 27.2 本机）。
 
 ## 未完成
 
