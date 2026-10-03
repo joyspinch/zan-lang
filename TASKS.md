@@ -88,11 +88,34 @@
 
 ## 未完成
 
-- [ ] **B-ID74 残项（P2·性能）runtime 调度热点二项**——(a) POSIX mt 驱动整个 reactor 在
-  一把全局互斥内 epoll_wait（rt_io.c:229-236,1561-1566），注册新 await 最长顶 20ms、其余
-  worker 全排队（Windows 有分片，POSIX 无）；(d) g_co_activity/g_co_outstanding 全局单点
-  缓存行 RMW（spawn k=32 残留争用点）。需 POSIX reactor 分片设计，非低成本，单独批次。
-  （b/c/e/f 已随 14f4f1f8 闭账。）
+- [x] **B-ID74 残项（P2·性能）runtime 调度热点二项**——闭账（本批）。(a) POSIX reactor
+  分片：epoll/kqueue 后端每分片独立 poll_fd + 唤醒通道（Linux eventfd / Apple pipe）+
+  rto/dead 队列，分片互斥仅护各自槽表与队列，epoll_wait/kevent 在锁外等待——注册新 await
+  不再排在一把全局互斥后（旧瓶颈：最长顶 20ms、其余 worker 全排队）；fd→分片 fd%n，worker i
+  轮询分片 i%n；ZAN_IO_SHARDS / AsyncRuntime.IoShards 只降不升、上限 256、1 工强制 1 片
+  （无孤儿分片）；select 后端维持单分片，Windows IOCP 分片不动；槽表扩容走全分片锁，
+  g_io_count/g_io_dead_count 改 interlocked 全局；DNS 唤醒 fd 驻分片 0，co_notify 定向唤醒
+  停车 worker 所在分片；ZAN_IO_SHARDS=1 单反应堆退路保留。(d) g_co_activity/g_co_outstanding
+  全局单点 → 每 worker 计数对（cnt_act/cnt_out，仅属主线程序贯）+ 64 字节对齐的非池提交方
+  对；读者跨对求和，事件语义与旧单点逐事件一致（submit=+out+act、arm/requeue=+act、
+  retire=+act−out；activity 和单调不减，不变和仍证静止）——spawn k=32 残留缓存行 RMW 消除。
+  验证：win 构建 + 五探针（bare_await4/whenany/join/spawn_decomp/tick）全过、spawn k=1/k=32
+  A/B 持平、COSTAT 干净退出；zig 交叉 12 目标全绿（epoll/kqueue 首次真编译）；WSL linux-x64
+  实跑 shard_io_probe（64 并发 echo 客户端×20 回程）全 workers×shards 矩阵零错包，分片等速
+  或更快（4工4片 15-56ms vs 4工1片 16.5ms）、=1 退路实测有效。顺修三处交叉断链：kqueue
+  io_register 溢出链 calloc 失败路径 io_mark_dead 漂 sh 参（Windows 永不编译故此前不可见）、
+  rt_io.c 工作窃取退避 _mm_pause 隐式声明（HEAD 即错，新 clang 拒编——在册交叉对象系旧环境
+  产物）、rt_sync.c 补 sys/wait.h（同因）。
+- [ ] **B-ID88（P2·正确性，疑 WSL 环境）linux 多工 join 唤醒停滞**——shard_io_probe
+  （_scratch/async-bench/shard_io_probe.zan：64 并发 loopback echo 客户端×20 回程 +
+  WhenAll，ZAN_CO_WORKERS/ZAN_IO_SHARDS 选档）：workers≥4 时 WhenAll 在全部客户端完成后
+  偶发 13-82s 才返回——每客户端完成时间戳证明 64 客户端 <1s 内全部完成（零错包），停滞在
+  join 唤醒/调度唤醒路径而非 IO。实测 HEAD 旧 rt 对象对照同样停滞（4/6 次），非 B-ID74 批
+  引入；workers≤2 未复现，Windows 未复现，mtscale（纯 spawn+WhenAll）k=32 未复现——需 IO
+  与 join 交错才触发。疑点（未证实）：zan_io_pump_timeout 无 pending 时 nanosleep 停车，
+  co_notify 的 eventfd 唤醒不中断睡眠；多 worker 共享分片时唤醒预算 g_co_wake 会计漂移
+  （POSIX co_wait_io 无条件减账）。附带诊断噪声：musl 静态二进制 atexit 的 ZAN_CO_STATS
+  转储不触发（HEAD 同，Windows 正常）。
 - [x] **B-ID78 残项（P3）四二进制包写侧超长分片**——闭账：CBOR 是四包中唯一有分片
   形态的格式——CborWriter 超过 ChunkBytes（64MB）的 text/byte 串写 indefinite 分片
   （0x7F/0x5F + 等长定长块 + 0xFF，读侧 TakeChunks 原生支持，对单-item 限更小的对端
