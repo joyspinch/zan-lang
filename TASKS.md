@@ -35,20 +35,25 @@
   现役（零提交）。macos 双 dylib 需 ObjC+macOS SDK（gui_runtime_mac.m），zig cc
   不编 ObjC，本机物理不可产，等 Mac runner；drivers.yml 复活即随回写清偿，
   与 B-ID84 同门。
-- [ ] **B-ID91（P1·工具链）linux GUI 带文字交叉链接失败（x64/arm64 同）**——探针
-  _scratch/link-probe/{probe,probe-notext}.zan 定谳矩阵：无文字+--publish 可链
-  （1.97MB 发布成功，10-02 516360bc「musl 可链化」验证的正是此形态）；带文字
+- [x] **B-ID91（P1·工具链）linux GUI 带文字交叉链接失败（x64/arm64 同）**——已闭
+  （10-04 60d7580b）。探针 _scratch/link-probe/{probe,probe-notext}.zan 定谳矩阵：
+  无文字+--publish 可链（10-02 516360bc「musl 可链化」验证的正是此形态）；带文字
   （DrawText 一行）publish 与否都挂，未定义恒为 FT_* 七符号 + Fc* 十三符号
-  （fontconfig）；非 publish 无 gc-sections 全成员拉入也挂。时间线：FT/Fc 引用
-  自 7-12 bcf01de4（字体引擎）入面，带文字形态自那时即断——此后无人交叉发布过
-  带字 linux GUI，静默至今；旧档（9-30 版）nm 实证同样 28 个 FT/Fc 未定义，
-  非 B-ID90 换血引入。根因：驱动档不含 freetype/fontconfig 实现
-  （build_linux_gui_static.sh 只并 X11 系），zanc linux 链接段亦无 libfreetype.a
-  处理（唯一处理在 wasm32 段 main.c:8414）。修复方向：zig cc musl 产
-  libfreetype.a（wasm 配方 build_cross_rt.cmd:98 前车，源树
-  D:/project/firefox/modules/freetype2）+ fontconfig（拉 expat，源树获取是缺口）
-  → 入 toolchain/linux-* 并在 linux 链接段接线，或按 ohos 前车并入驱动档；
-  修后探针矩阵全绿即闭。
+  （fontconfig）。时间线：FT/Fc 引用自 7-12 bcf01de4（字体引擎）入面，带文字形态
+  自那时即断——此后无人交叉发布过带字 linux GUI，静默至今。根因：fontconfig 桌面
+  分支（gui_runtime_font.c #else）无静态供给，zanc linux 链接段亦无 libfreetype.a
+  处理（唯一处理在 wasm32 段 main.c:8414）。修复（按平台分支保留拍板，不并驱动档）：
+  zig cc musl 逐文件产 libfreetype.a（INSTALL.ANY 39 文件表）+ libexpat.a（手写
+  expat_config.h）+ libfontconfig.a（手写 config.h+fcobjshash.h gperf 替代、
+  fcalias 空桩）× x64/arm64 六档入 toolchain/linux-{musl,arm64}；main.c linux 段
+  接线（存在则链，镜像 wasm32）。顺修两处连带发现：① CMake staging 漏
+  zanrt_io_mt.o——linux x64/arm64 external_async_executor=true 链接需它，fresh
+  checkout 必挂 zan_co_ready/zan_co_sched_init 未定义（主树 build/ 靠陈旧手工副本
+  侥幸绿，干净 worktree E2E 当场暴露）→ 入 foreach EXISTS 守卫；② checker 六档
+  入册（ZIG_BUNDLED·external-tree 派生）。验证：干净 worktree（并发会话 21 文件
+  在途）zanc 四探针矩阵全绿——text+pub x64 3.19MB / text 非pub x64 4.53MB /
+  notext+pub x64 1.98MB（回归无劣化）/ text+pub arm64 aarch64 ELF 3.07MB；
+  WSL 实跑 text 探针 DISPLAY= 输出 probe-linked EXIT=0。
 - [ ] **B-ID84 残项（P3批·卫生汇总）**——仅余 runtime：libwebp 1.4.0→例行升级（整包换血，
   单独批次）。**开工前置（2026-10-03 观察）：驱动回写 CI 未证活**——bot 提交自 46477da5
   （10-01）后全腿归零（c2de7a95/c936/1f69 三次应触发零落地，win 腿疑 continue-on-error
