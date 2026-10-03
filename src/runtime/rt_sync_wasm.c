@@ -681,3 +681,23 @@ char *getenv(const char *name) {
     (void)name;
     return 0;
 }
+
+/* ---- safe process execution stubs (cross-platform consistency) --------- */
+int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
+    (void)exe; (void)args; (void)argc;
+    return -1;
+}
+
+int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
+                              char **out_buf, int32_t *out_len, int32_t *exit_code) {
+    (void)exe; (void)args; (void)argc;
+    if (out_buf) *out_buf = NULL;
+    if (out_len) *out_len = 0;
+    if (exit_code) *exit_code = -1;
+    return -1;
+}
+
+void zan_proc_free_buf(char *buf) {
+    if (buf) free(buf);
+}
+
