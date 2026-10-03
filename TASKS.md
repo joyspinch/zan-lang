@@ -165,15 +165,17 @@
   吞掉构建步失败；本机 api.github.com 不可达无法看日志，CI 恢复后以 CI 产物为准重刷。
   （a/c/e/h 随 a738a0d0、d 随 38f00e2f、f 随 624c706d、g 随 9c36cdfe、i 随下条闭账；
   (c) ohos-arm64 仍归 B-ID86 残项——需 OHOS SDK builder，另行立项。）
-- [ ] **B-ID89（P2·工具链）win-arm64 PE 消费链接 lld 空白**——本机全部可用链路对 arm64 PE
-  均不解析 GUI 导入库与直连 DLL：lld-link -lldmingw（zig cc 走此路）、zanc 暂存
-  ld.lld 20.1.8（build/bpkg）`-m arm64pe`、VS ld.lld 同款——dlltool 导入库（armap 209 项
-  齐全）与 `-e main` 直连 zan_gui.dll 都报 undefined zan_gui_init；**同款对照 x64 通过**
-  （ld.lld i386pep + 已提交 libzan_gui.dll.a 解析正常）。本机暂存 GNU ld 2.36 只有 i386pe
-  仿真无 arm64pe。B-ID59 的"win-arm64 严格链接干净"测的是非 GUI 探针（只链 rt 对象），
-  未踩 GUI 导入面。后果：载荷已在（B-ID81(b)），win-arm64 GUI 程序交叉发布链接通路缺。
-  待仲裁：新版 binutils（aarch64-pe 仿真 ≥2.40）或 CI CLANGARM64 真机链路，或 zanc
-  win-arm64 消费链接改走 lld-link 风格 short import lib。
+- [x] **B-ID89（P2·工具链）win-arm64 PE 消费链接 lld 空白**——闭账：**虚惊，挂账前提即
+  幻影**。上一轮的 undefined `zan_gui_init` 是探针自编符号——DLL 从未导出它（导出表
+  103 项无任何 init 类符号），dlltool/lib.exe 导入库与直连 DLL 全部"失败"只是在如实
+  报告符号不存在。用真导出符号（zan_audio_active_voices）重做仲裁：**四路全通**——
+  ld.lld 20.1.8 `-m arm64pe` ×（dlltool GNU 导入库 / 直连 DLL）、zig lld-link
+  -lldmingw ×（GNU 导入库 / lib.exe short import），产物 PE 0xaa64 导入
+  zan_gui.dll 正确。E2E 终审：`zanc --target win-arm64` 真链接 zan_gui 消费探针
+  （[DllImport("zan_gui")]）成功出 261KB ARM64 PE、导入面含 zan_gui.dll——消费
+  通路（驱动发现 → libzan_gui.dll.a → ld.lld arm64pe）完整健康，无任何工具链空白。
+  方法论沉淀 skill：链接疑云先核对被引符号真的在导出表里；对照实验的 x64 对照
+  "通过"同样不可信（它报的是 __main——符号解析顺序掩盖了同一幻影）。
 - [x] **B-ID81(i)（P2）System.Management macOS 全落空值**——闭账：补实现 + 口径统一。
   Cpu 走 sysctl（machdep.cpu.brand_string/vendor、hw.cpufrequency、hw.ncpu、kern.cp_time
   300ms 双采样；Apple Silicon 无 vendor/频率键，返回空/0）；Memory 走 hw.memsize +
