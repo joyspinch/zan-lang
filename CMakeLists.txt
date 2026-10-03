@@ -1650,7 +1650,7 @@ set_tests_properties(server_mvc_readonly_action_lease PROPERTIES TIMEOUT 180
   LABELS "full;standard;smoke")
 
 foreach(_mvc_case security_bootstrap security_verify_code security_routes
-                  security_http_policy verify_code_issuance permission_branches)
+                  security_http_policy verify_code_issuance permission_branches security_csp)
   add_test(NAME server_mvc_${_mvc_case}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

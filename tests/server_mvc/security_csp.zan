@@ -1,0 +1,41 @@
+// Compile with packages/Zan.Mvc/src/**/*.zan and --auto-stdlib.
+// CSP 由 [security].csp 门控：默认关（应用自有视图未去内联时开启会破
+// 页）；置位后 SecurityHeaders 带精确策略 default-src 'self';
+// img-src 'self' data:; base-uri 'self'。nosniff/XFO/Referrer 三头不受
+// 开关影响。
+using System;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Web;
+
+class Program {
+    static int failures;
+    static void Check(bool ok, string label) {
+        if (!ok) { Program.failures = Program.failures + 1; Console.WriteLine("FAIL " + label); }
+    }
+    static HttpContext Ctx() {
+        return new HttpContext(HttpRequest.Parse("GET / HTTP/1.1\r\nHost: blog.test\r\n\r\n"),
+            "127.0.0.1");
+    }
+    static async void Main() {
+        Cfg.Security = SecurityCfg.Defaults();
+        HttpContext off = Program.Ctx();
+        Program.Check(Boot.SecurityHeaders(off), "security headers pass through with csp off");
+        string wireOff = off.BuildResponse(true);
+        Program.Check(wireOff.Contains("X-Content-Type-Options: nosniff"), "nosniff always on");
+        Program.Check(wireOff.Contains("X-Frame-Options: DENY"), "xfo always on");
+        Program.Check(wireOff.Contains("Referrer-Policy: no-referrer"), "referrer policy always on");
+        Program.Check(!wireOff.Contains("Content-Security-Policy:"), "csp header absent by default");
+
+        Cfg.Security.csp = true;
+        HttpContext on = Program.Ctx();
+        Program.Check(Boot.SecurityHeaders(on), "security headers pass through with csp on");
+        string wireOn = on.BuildResponse(true);
+        Program.Check(wireOn.Contains("Content-Security-Policy: default-src 'self';"
+            + " img-src 'self' data:; base-uri 'self'"), "csp policy exact");
+        Program.Check(wireOn.Contains("X-Frame-Options: DENY"), "xfo survives csp on");
+
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        if (Program.failures != 0) { throw new Exception("CSP header regression"); }
+    }
+}
