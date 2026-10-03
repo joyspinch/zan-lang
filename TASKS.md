@@ -151,9 +151,29 @@
   extern（def 文件清单外），且输入是宿主自著代码非脚本可达面——以 Sandbox 禁预编译
   chunk（load=nil）+LoadBytes 宿主专用注释立约（b037adbf）。ws client.html 的 onclick
   内联handler 保留（独立演示页，服务端不发 CSP 头）。
-- [ ] **B-ID81 残项（P2）跨平台二项**——(b) Zan.Gui win-arm64 驱动只有导入库无 payload、
-  (c) ohos-arm64（真机）驱动缺失（二者归 B-ID86 平台 builder 批次）。
-  （a/c/e/h 随 a738a0d0、d 随 38f00e2f、f 随 624c706d、g 随 9c36cdfe、i 随下条闭账。）
+- [x] **B-ID81 残项（P2）跨平台二项**——(b) 闭账（随本条）：win-arm64 驱动自 771479f9
+  （10-01 CI bot 误删 payload）起只剩导入库。本机按 CI drivers.yml 同配方补齐四件：
+  `zig cc/c++ -target aarch64-windows-gnu` 两 TU（gui_runtime.c C 先、gui_runtime_dwrite.cpp
+  C++ 后，-fno-exceptions -fno-rtti）`-shared` 链 zan_gui.dll + `-luser32 -lgdi32 -ldwmapi
+  -lshcore -limm32 -lole32 -lrpcrt4`；`zig dlltool -m arm64` 自 DLL 导出表生成
+  libzan_gui.dll.a；WebView2Loader.dll (arm64) 按 nuget 官方包（sha256 与
+  deps/checksums.txt pin 逐字一致）；zan_gui.bundle 照新配方双行。验证：DLL PE machine
+  0xaa64、导出面 103/103 == zan_gui.def、导入面 = x64 参照同款四系统库 + UCRT apiset
+  （arm64 Windows 恒 Win10+，CLANGARM64 CI 产物同形态）。**CI 盲区观察**：c2de7a95
+  （配方修复，触发 paths 含 workflow 自身）之后 win 双腿零回写——c936eb03/1f69ce5a 两次
+  rt_io.c push 均应触发却无 bot 提交（连应出 diff 的 win rt 对象也没写），疑 continue-on-error
+  吞掉构建步失败；本机 api.github.com 不可达无法看日志，CI 恢复后以 CI 产物为准重刷。
+  （a/c/e/h 随 a738a0d0、d 随 38f00e2f、f 随 624c706d、g 随 9c36cdfe、i 随下条闭账；
+  (c) ohos-arm64 仍归 B-ID86 残项——需 OHOS SDK builder，另行立项。）
+- [ ] **B-ID89（P2·工具链）win-arm64 PE 消费链接 lld 空白**——本机全部可用链路对 arm64 PE
+  均不解析 GUI 导入库与直连 DLL：lld-link -lldmingw（zig cc 走此路）、zanc 暂存
+  ld.lld 20.1.8（build/bpkg）`-m arm64pe`、VS ld.lld 同款——dlltool 导入库（armap 209 项
+  齐全）与 `-e main` 直连 zan_gui.dll 都报 undefined zan_gui_init；**同款对照 x64 通过**
+  （ld.lld i386pep + 已提交 libzan_gui.dll.a 解析正常）。本机暂存 GNU ld 2.36 只有 i386pe
+  仿真无 arm64pe。B-ID59 的"win-arm64 严格链接干净"测的是非 GUI 探针（只链 rt 对象），
+  未踩 GUI 导入面。后果：载荷已在（B-ID81(b)），win-arm64 GUI 程序交叉发布链接通路缺。
+  待仲裁：新版 binutils（aarch64-pe 仿真 ≥2.40）或 CI CLANGARM64 真机链路，或 zanc
+  win-arm64 消费链接改走 lld-link 风格 short import lib。
 - [x] **B-ID81(i)（P2）System.Management macOS 全落空值**——闭账：补实现 + 口径统一。
   Cpu 走 sysctl（machdep.cpu.brand_string/vendor、hw.cpufrequency、hw.ncpu、kern.cp_time
   300ms 双采样；Apple Silicon 无 vendor/频率键，返回空/0）；Memory 走 hw.memsize +
