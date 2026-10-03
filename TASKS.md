@@ -30,7 +30,9 @@
 - [ ] **B-ID90（P2·工具链）GUI 驱动五件落后 10-03 源**——B-ID71 音频修复（bdd0a6a1）
   与壳层变更未进：win-x64 dll（9/30 产物；重建配方已验=cmake --build build --target
   zan_gui + scripts/build_gui_driver.ps1，因并行会话 gui 源在途编辑暂缓提交，落库后
-  重跑即可）、linux 双 static .a（WSL 跑 scripts/build_linux_gui_static.sh 或等 CI）、
+  重跑即可）、linux-x64 .a（WSL 已验可行：X11 头+四静态 X11 归档+gcc 13.3 齐，
+  bash scripts/build_linux_gui_static.sh linux-x64）、linux-arm64 .a（WSL 有交叉
+  gcc 但缺 multiarch 静态 X11 归档，需 apt libx11-dev:arm64 系或等 CI）、
   macos 双 dylib（仅 Mac runner/CI 可产）。check_toolchain_stale.py gui 组已入册
   12 件全驱动（源面 glob gui_*/zan_audio/stb_*/libwebp/rt_crash.h/fortify，提交时间
   判定、对在途编辑免疫），持续如实报告；win-arm64/android×2/ohos×2 当前 ok。
