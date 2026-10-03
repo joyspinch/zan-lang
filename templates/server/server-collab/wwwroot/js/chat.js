@@ -64,7 +64,7 @@
     }
     var last = tr.querySelector('[data-last]');
     if (last) {
-      last.innerHTML = '<span class="muted" style="font-size:12px">'
+      last.innerHTML = '<span class="muted fs12">'
         + esc(stamp(m.createdAt)) + '</span> ' + esc(m.excerpt || '');
     }
   }

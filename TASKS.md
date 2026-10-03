@@ -103,15 +103,21 @@
   字节一致）；cbor_values 金样 diff 一致。
 - [ ] **B-ID79 残项（P3）Csv 公式注入**——（=`+-@ 开头单元格不中和，Excel 执行）行为未改，
   Csv 类文档已补安全警告（2824550d）；根治需导出侧中和选项，涉 API 面，待议。
-- [ ] **B-ID80 残项（P2）**——(d) CSP 框架侧已闭（d6548ae3）：框架视图 177 处内联 style=
-  归零（列宽走 width= 表现属性、色值/间距进 admin.css 工具类）、3 段内联 script 外链
-  /static/js/、生成器 javascript:void(0) 改 href="#"（admin.js 已 preventDefault）、
-  Cfg [security].csp 挂 Content-Security-Policy（default-src 'self'; img-src 'self' data:;
-  base-uri 'self'；默认关——templates 应用 views 尚有 300+ 处 style= 与内联 script，模板
-  清扫后方可默认开；server_mvc_security_csp 单测已入册 ctest）；(g 附注) Lua 公共
-  字符串 Load 限文本未做：luaL_loadstring mode 固化在 lauxlib 需新 extern（def 文件清单外），
-  且输入是宿主自著代码非脚本可达面——以 Sandbox 禁预编译 chunk（load=nil）+LoadBytes
-  宿主专用注释立约（b037adbf）。
+- [x] **B-ID80 残项（P2）**——闭账：(d) CSP 框架侧（d6548ae3）+ 模板清扫（本条）。
+  框架侧：视图 177 处内联 style= 归零（列宽走 width= 表现属性、色值/间距进 admin.css
+  工具类）、3 段内联 script 外链 /static/js/、生成器 javascript:void(0) 改 href="#"
+  （admin.js 已 preventDefault）、Cfg [security].csp 挂 Content-Security-Policy
+  （default-src 'self'; img-src 'self' data:; base-uri 'self'，默认关）、
+  server_mvc_security_csp 单测入册 ctest。模板侧：server 五应用（collab/legend/licensing
+  全部 views + iot/ws 单页）902 处内联 style= 与 14 段内联 script 清零——th 列宽 width=N、
+  组合样式进与框架同名的工具类/语义类（两套 css 同块追加）、{{#if}} 条件样式搬进 class、
+  动态百分比宽高 data-w/data-h 由 admin.js 以 CSSOM 回填（含 admin.js tooltip 色点
+  tipdot 改 CSSOM、chat.js fs12）、脚本外链 wwwroot/js（同文同链：ai-form/send-code/
+  scope-depts 跨应用复用）；实例化 collab 编译 471 文件、登录拉页验证 th width=/静态
+  css/js 服务正常。(g 附注) Lua Load 限文本：luaL_loadstring mode 固化在 lauxlib 需新
+  extern（def 文件清单外），且输入是宿主自著代码非脚本可达面——以 Sandbox 禁预编译
+  chunk（load=nil）+LoadBytes 宿主专用注释立约（b037adbf）。ws client.html 的 onclick
+  内联handler 保留（独立演示页，服务端不发 CSP 头）。
 - [ ] **B-ID81 残项（P2）跨平台二项**——(b) Zan.Gui win-arm64 驱动只有导入库无 payload、
   (c) ohos-arm64（真机）驱动缺失（二者归 B-ID86 平台 builder 批次）。
   （a/c/e/h 随 a738a0d0、d 随 38f00e2f、f 随 624c706d、g 随 9c36cdfe、i 随下条闭账。）

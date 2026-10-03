@@ -1108,12 +1108,16 @@
               ? (sp[idx].t === 0 ? '现在' : (-sp[idx].t) + ' 秒前') : '');
         var html = when ? '<b>' + when + '</b>' : '';
         sv.forEach(function (s) {
-          html += '<div><i style="display:inline-block;width:8px;height:8px;'
-            + 'border-radius:2px;margin-right:6px;background:' + s.color + '"></i>'
+          html += '<div><i class="tipdot" data-c="' + s.color + '"></i>'
             + esc(s.label || '') + ' ' + s.values[idx] + un + '</div>';
         });
         var tip = monTip();
         tip.innerHTML = html;
+        /* CSP：色点颜色走 CSSOM（innerHTML 注入的 style 属性会被 style-src 拦） */
+        var dots = tip.querySelectorAll('.tipdot');
+        for (var di = 0; di < dots.length; di++) {
+          dots[di].style.background = dots[di].getAttribute('data-c');
+        }
         tip.style.display = 'block';
         tip.style.left = (ev.clientX + 12) + 'px';
         tip.style.top = (ev.clientY + 12) + 'px';
@@ -2016,4 +2020,22 @@
     document.addEventListener('DOMContentLoaded', refresh);
   })();
 
+})();
+
+/* ---- CSP：动态宽高经 data-w/data-h 以 CSSOM 回填（内联 style 会被 style-src 拦） ---- */
+(function () {
+  function refill(root) {
+    var els = (root || document).querySelectorAll('[data-w],[data-h]');
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i], v;
+      v = el.getAttribute('data-w');
+      if (v !== null && v !== '') { el.style.width = v + '%'; }
+      v = el.getAttribute('data-h');
+      if (v !== null && v !== '') { el.style.height = v + '%'; }
+    }
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function () { refill(document); });
+  } else { refill(document); }
+  document.addEventListener('htmx:afterSwap', function (e) { refill(e.target); });
 })();
