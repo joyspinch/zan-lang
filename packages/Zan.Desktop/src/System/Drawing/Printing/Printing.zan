@@ -32,19 +32,23 @@ class PrinterSettings {
     static string DefaultPrinterName() {
         #if WINDOWS
         nint charsOut = NativeMemory.Alloc(4);
-        new Span<int>(charsOut, 1)[0] = 0;
-        PrinterSettings.GetDefaultPrinterW(0, charsOut);
-        int chars = new Span<int>(charsOut, 1)[0];
-        if (chars <= 0) {
-            NativeMemory.Free(charsOut);
-            return "";
-        }
-        nint buffer = NativeMemory.Alloc(chars * 2);
-        int ok = PrinterSettings.GetDefaultPrinterW(buffer, charsOut);
         string name = "";
-        if (ok != 0) { name = Wide.Read(buffer); }
-        NativeMemory.Free(buffer);
-        NativeMemory.Free(charsOut);
+        try {
+            new Span<int>(charsOut, 1)[0] = 0;
+            PrinterSettings.GetDefaultPrinterW(0, charsOut);
+            int chars = new Span<int>(charsOut, 1)[0];
+            if (chars > 0) {
+                nint buffer = NativeMemory.Alloc(chars * 2);
+                try {
+                    int ok = PrinterSettings.GetDefaultPrinterW(buffer, charsOut);
+                    if (ok != 0) { name = Wide.Read(buffer); }
+                } finally {
+                    NativeMemory.Free(buffer);
+                }
+            }
+        } finally {
+            NativeMemory.Free(charsOut);
+        }
         return name;
         #else
         // "system default destination: name"，未配置时为
@@ -77,32 +81,34 @@ class PrinterSettings {
         List<string> printers = new List<string>();
         nint neededOut = NativeMemory.Alloc(4);
         nint countOut = NativeMemory.Alloc(4);
-        new Span<int>(neededOut, 1)[0] = 0;
-        new Span<int>(countOut, 1)[0] = 0;
-        // PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS, PRINTER_INFO_4.
-        PrinterSettings.EnumPrintersW(6, 0, 4, 0, 0, neededOut, countOut);
-        int needed = new Span<int>(neededOut, 1)[0];
-        if (needed <= 0) {
+        try {
+            new Span<int>(neededOut, 1)[0] = 0;
+            new Span<int>(countOut, 1)[0] = 0;
+            // PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS, PRINTER_INFO_4.
+            PrinterSettings.EnumPrintersW(6, 0, 4, 0, 0, neededOut, countOut);
+            int needed = new Span<int>(neededOut, 1)[0];
+            if (needed > 0) {
+                nint buffer = NativeMemory.Alloc(needed);
+                try {
+                    int ok = PrinterSettings.EnumPrintersW(
+                        6, 0, 4, buffer, needed, neededOut, countOut);
+                    if (ok != 0) {
+                        int count = new Span<int>(countOut, 1)[0];
+                        // 在 Win64 目标上 PRINTER_INFO_4W 为 24 字节；pPrinterName 是
+                        // 其第一个指针。
+                        for (int i = 0; i < count; i = i + 1) {
+                            nint name = new Span<nint>(buffer + i * 24, 1)[0];
+                            if (name != 0) { printers.Add(Wide.Read(name)); }
+                        }
+                    }
+                } finally {
+                    NativeMemory.Free(buffer);
+                }
+            }
+        } finally {
             NativeMemory.Free(countOut);
             NativeMemory.Free(neededOut);
-            return printers;
         }
-
-        nint buffer = NativeMemory.Alloc(needed);
-        int ok = PrinterSettings.EnumPrintersW(
-            6, 0, 4, buffer, needed, neededOut, countOut);
-        if (ok != 0) {
-            int count = new Span<int>(countOut, 1)[0];
-            // 在 Win64 目标上 PRINTER_INFO_4W 为 24 字节；pPrinterName 是
-            // 其第一个指针。
-            for (int i = 0; i < count; i = i + 1) {
-                nint name = new Span<nint>(buffer + i * 24, 1)[0];
-                if (name != 0) { printers.Add(Wide.Read(name)); }
-            }
-        }
-        NativeMemory.Free(buffer);
-        NativeMemory.Free(countOut);
-        NativeMemory.Free(neededOut);
         return printers;
     }
     #endif
@@ -140,11 +146,15 @@ internal class WinRawPrinterBackend : IRawPrinterBackend {
     bool Open(string printerName) {
         nint printerNameW = Wide.Of(printerName);
         nint handleOut = NativeMemory.Alloc(8);
-        new Span<nint>(handleOut, 1)[0] = 0;
-        int opened = WinRawPrinterBackend.OpenPrinterW(printerNameW, handleOut, 0);
-        Wide.Free(printerNameW);
-        this.handle = new Span<nint>(handleOut, 1)[0];
-        NativeMemory.Free(handleOut);
+        int opened = 0;
+        try {
+            new Span<nint>(handleOut, 1)[0] = 0;
+            opened = WinRawPrinterBackend.OpenPrinterW(printerNameW, handleOut, 0);
+            this.handle = new Span<nint>(handleOut, 1)[0];
+        } finally {
+            Wide.Free(printerNameW);
+            NativeMemory.Free(handleOut);
+        }
         return opened != 0 && this.handle != 0;
     }
 
@@ -153,14 +163,18 @@ internal class WinRawPrinterBackend : IRawPrinterBackend {
         nint documentNameW = Wide.Of(documentName);
         nint rawW = Wide.Of("RAW");
         nint docInfo = NativeMemory.Alloc(24);
-        NativeMemory.Fill(docInfo, 0, 24);
-        Span<nint> info = new Span<nint>(docInfo, 3);
-        info[0] = documentNameW;
-        info[2] = rawW;
-        int job = WinRawPrinterBackend.StartDocPrinterW(this.handle, 1, docInfo);
-        NativeMemory.Free(docInfo);
-        Wide.Free(rawW);
-        Wide.Free(documentNameW);
+        int job = 0;
+        try {
+            NativeMemory.Fill(docInfo, 0, 24);
+            Span<nint> info = new Span<nint>(docInfo, 3);
+            info[0] = documentNameW;
+            info[2] = rawW;
+            job = WinRawPrinterBackend.StartDocPrinterW(this.handle, 1, docInfo);
+        } finally {
+            NativeMemory.Free(docInfo);
+            Wide.Free(rawW);
+            Wide.Free(documentNameW);
+        }
         return job != 0;
     }
 
@@ -172,11 +186,16 @@ internal class WinRawPrinterBackend : IRawPrinterBackend {
     /// WritePrinter 写入 data，返回实际字节数；失败返回 -1。
     int Write(byte[] data) {
         nint writtenOut = NativeMemory.Alloc(4);
-        new Span<int>(writtenOut, 1)[0] = 0;
-        int wrote = WinRawPrinterBackend.WritePrinter(
-            this.handle, data, data.Length, writtenOut);
-        int written = new Span<int>(writtenOut, 1)[0];
-        NativeMemory.Free(writtenOut);
+        int wrote = 0;
+        int written = 0;
+        try {
+            new Span<int>(writtenOut, 1)[0] = 0;
+            wrote = WinRawPrinterBackend.WritePrinter(
+                this.handle, data, data.Length, writtenOut);
+            written = new Span<int>(writtenOut, 1)[0];
+        } finally {
+            NativeMemory.Free(writtenOut);
+        }
         if (wrote == 0) { return -1; }
         return written;
     }

@@ -275,18 +275,22 @@ class Clipboard {
     static bool SetText(string text) {
         #if WINDOWS
         nint wide = Wide.Of(text);
-        int units = Wide.Length(wide);
-        nint mem = Clipboard.WinGlobalAlloc(2 /*GMEM_MOVEABLE*/, (units + 1) * 2);
-        if (mem == 0) { Wide.Free(wide); return false; }
-        nint dst = Clipboard.WinGlobalLock(mem);
-        if (dst == 0) {
-            Clipboard.WinGlobalFree(mem);
+        int units = 0;
+        nint mem = (nint)0;
+        try {
+            units = Wide.Length(wide);
+            mem = Clipboard.WinGlobalAlloc(2 /*GMEM_MOVEABLE*/, (units + 1) * 2);
+            if (mem == 0) { return false; }
+            nint dst = Clipboard.WinGlobalLock(mem);
+            if (dst == 0) {
+                Clipboard.WinGlobalFree(mem);
+                return false;
+            }
+            NativeMemory.Copy(dst, wide, (units + 1) * 2);
+            Clipboard.WinGlobalUnlock(mem);
+        } finally {
             Wide.Free(wide);
-            return false;
         }
-        NativeMemory.Copy(dst, wide, (units + 1) * 2);
-        Clipboard.WinGlobalUnlock(mem);
-        Wide.Free(wide);
         if (Clipboard.WinOpenClipboard(0) == 0) {
             Clipboard.WinGlobalFree(mem);
             return false;
@@ -394,18 +398,24 @@ class Clipboard {
         #if WINDOWS
         if (Clipboard.WinIsClipboardFormatAvailable(15) == 0) { return list; }
         if (Clipboard.WinOpenClipboard(0) == 0) { return list; }
-        nint hdrop = Clipboard.WinGetClipboardData(15);
-        if (hdrop != 0) {
-            int count = Clipboard.WinDragQueryFileW(hdrop, 0xFFFFFFFF, 0, 0);
-            for (int i = 0; i < count; i = i + 1) {
-                int len = Clipboard.WinDragQueryFileW(hdrop, i, 0, 0);
-                nint buf = NativeMemory.Alloc((len + 1) * 2 + 2);
-                Clipboard.WinDragQueryFileW(hdrop, i, buf, len + 1);
-                list.Add(Wide.Read(buf));
-                NativeMemory.Free(buf);
+        try {
+            nint hdrop = Clipboard.WinGetClipboardData(15);
+            if (hdrop != 0) {
+                int count = Clipboard.WinDragQueryFileW(hdrop, 0xFFFFFFFF, 0, 0);
+                for (int i = 0; i < count; i = i + 1) {
+                    int len = Clipboard.WinDragQueryFileW(hdrop, i, 0, 0);
+                    nint buf = NativeMemory.Alloc((len + 1) * 2 + 2);
+                    try {
+                        Clipboard.WinDragQueryFileW(hdrop, i, buf, len + 1);
+                        list.Add(Wide.Read(buf));
+                    } finally {
+                        NativeMemory.Free(buf);
+                    }
+                }
             }
+        } finally {
+            Clipboard.WinCloseClipboard();
         }
-        Clipboard.WinCloseClipboard();
         #else
         string text = Clipboard.PosixRead(Clipboard.PosixTool(),
                                           Clipboard.MimeUriList());
@@ -470,10 +480,13 @@ class Clipboard {
     static string FormatName(int format) {
         #if WINDOWS
         nint buf = NativeMemory.Alloc(512 * 2 + 2);
-        int n = Clipboard.WinGetClipboardFormatName(format, buf, 512);
         string s = "";
-        if (n > 0) { s = Wide.Read(buf); }
-        NativeMemory.Free(buf);
+        try {
+            int n = Clipboard.WinGetClipboardFormatName(format, buf, 512);
+            if (n > 0) { s = Wide.Read(buf); }
+        } finally {
+            NativeMemory.Free(buf);
+        }
         return s;
         #else
         if (format == 13 || format == 1) { return Clipboard.MimeText(); }

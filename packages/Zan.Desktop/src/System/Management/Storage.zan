@@ -93,20 +93,23 @@ class Storage {
         int need = Storage.WinGetLogicalDriveStringsW(0, 0);
         if (need <= 0) { return list; }
         nint buf = NativeMemory.Alloc(need * 2 + 2);
-        Storage.WinGetLogicalDriveStringsW(need, buf);
-        // 缓冲区是一系列以 NUL 结尾的宽字符串，末尾以
-        // 双重 NUL 结束。每个形如 "C:\"。
-        nint p = buf;
-        while (Storage.WideLen(p) > 0) {
-            string root = Wide.Read(p);
-            int type = Storage.WinGetDriveTypeW(p);
-            if (type == 2 /*DRIVE_REMOVABLE*/ || type == 3 /*DRIVE_FIXED*/) {
-                DiskUsage u = Storage.WinUsage(root);
-                if (u.totalBytes > 0) { list.Add(u); }
+        try {
+            Storage.WinGetLogicalDriveStringsW(need, buf);
+            // 缓冲区是一系列以 NUL 结尾的宽字符串，末尾以
+            // 双重 NUL 结束。每个形如 "C:\"。
+            nint p = buf;
+            while (Storage.WideLen(p) > 0) {
+                string root = Wide.Read(p);
+                int type = Storage.WinGetDriveTypeW(p);
+                if (type == 2 /*DRIVE_REMOVABLE*/ || type == 3 /*DRIVE_FIXED*/) {
+                    DiskUsage u = Storage.WinUsage(root);
+                    if (u.totalBytes > 0) { list.Add(u); }
+                }
+                p = p + (Storage.WideLen(p) + 1) * 2;
             }
-            p = p + (Storage.WideLen(p) + 1) * 2;
+        } finally {
+            NativeMemory.Free(buf);
         }
-        NativeMemory.Free(buf);
         return list;
     }
 
@@ -123,18 +126,21 @@ class Storage {
         nint avail = NativeMemory.Alloc(8);
         nint total = NativeMemory.Alloc(8);
         nint free = NativeMemory.Alloc(8);
-        int ok = Storage.WinGetDiskFreeSpaceExW(wroot, avail, total, free);
         DiskUsage u = new DiskUsage();
         u.name = root;
-        if (ok != 0) {
-            u.availBytes = new Span<long>(avail, 1)[0];
-            u.totalBytes = new Span<long>(total, 1)[0];
-            u.freeBytes = new Span<long>(free, 1)[0];
+        try {
+            int ok = Storage.WinGetDiskFreeSpaceExW(wroot, avail, total, free);
+            if (ok != 0) {
+                u.availBytes = new Span<long>(avail, 1)[0];
+                u.totalBytes = new Span<long>(total, 1)[0];
+                u.freeBytes = new Span<long>(free, 1)[0];
+            }
+        } finally {
+            Wide.Free(wroot);
+            NativeMemory.Free(avail);
+            NativeMemory.Free(total);
+            NativeMemory.Free(free);
         }
-        Wide.Free(wroot);
-        NativeMemory.Free(avail);
-        NativeMemory.Free(total);
-        NativeMemory.Free(free);
         return u;
     }
     #endif
@@ -149,20 +155,23 @@ class Storage {
     static DiskUsage Statvfs(string path) {
         // statvfs 接受 UTF-8 的 char*；Zan 字符串本身就是 UTF-8。
         nint st = NativeMemory.Alloc(96);
-        int ok = Storage.StatvfsCall(path, st);
         DiskUsage u = new DiskUsage();
         u.name = path;
-        if (ok == 0) {
-            Span<long> q = new Span<long>(st, 11);
-            long bsize = q[0];
-            long blocks = q[2];
-            long bfree = q[3];
-            long bavail = q[4];
-            u.totalBytes = blocks * bsize;
-            u.freeBytes = bfree * bsize;
-            u.availBytes = bavail * bsize;
+        try {
+            int ok = Storage.StatvfsCall(path, st);
+            if (ok == 0) {
+                Span<long> q = new Span<long>(st, 11);
+                long bsize = q[0];
+                long blocks = q[2];
+                long bfree = q[3];
+                long bavail = q[4];
+                u.totalBytes = blocks * bsize;
+                u.freeBytes = bfree * bsize;
+                u.availBytes = bavail * bsize;
+            }
+        } finally {
+            NativeMemory.Free(st);
         }
-        NativeMemory.Free(st);
         return u;
     }
 
