@@ -5,8 +5,9 @@ namespace System.Management;
 /// <summary>
 /// 机器与操作系统的静态身份信息。Windows 从 Win32 API 读取
 /// 计算机/用户名和版本块；Linux 从
-/// /etc/os-release、/proc/sys/kernel/* 和 USER 环境变量读取。
-/// 其他平台返回空/0 而非抛异常——这些都是纯查询，
+/// /etc/os-release、/proc/sys/kernel/* 和 USER 环境变量读取；macOS 读
+/// sysctl（kern.hostname、kern.osproductversion、kern.boottime）和
+/// USER 环境变量。其他平台返回空/0 而非抛异常——这些都是纯查询，
 /// 安静的返回空结果比抛异常更友好。
 /// </summary>
 class SystemInfo {
@@ -24,6 +25,8 @@ class SystemInfo {
         return s;
         #elif LINUX
         return SystemInfo.ProcText("/proc/sys/kernel/hostname").Trim();
+        #elif MACOS
+        return SystemInfo.SysctlString("kern.hostname");
         #else
         return "";
         #endif
@@ -45,6 +48,11 @@ class SystemInfo {
         string v = Interop.getenv("USER");
         if (v == "") { v = Interop.getenv("LOGNAME"); }
         return v;
+        #elif MACOS
+        // macOS 图形会话不总是导出 USER，用 LOGNAME 兜底。
+        string v = Interop.getenv("USER");
+        if (v == "") { v = Interop.getenv("LOGNAME"); }
+        return v;
         #else
         return "";
         #endif
@@ -60,6 +68,11 @@ class SystemInfo {
         if (name == "") { name = "Linux"; }
         if (ver == "") { return name; }
         return name + " " + ver;
+        #elif MACOS
+        // kern.osproductversion 形如 "14.5"（10.13.4 起可用）。
+        string ver = SystemInfo.SysctlString("kern.osproductversion");
+        if (ver == "") { return "macOS"; }
+        return "macOS " + ver;
         #else
         return "";
         #endif
@@ -71,6 +84,9 @@ class SystemInfo {
         return SystemInfo.WinKernelVersion();
         #elif LINUX
         return SystemInfo.ProcText("/proc/sys/kernel/osrelease").Trim();
+        #elif MACOS
+        // Darwin 内核版本，形如 "23.5.0"。
+        return SystemInfo.SysctlString("kern.osrelease");
         #else
         return "";
         #endif
@@ -81,14 +97,33 @@ class SystemInfo {
         #if WINDOWS
         return SystemInfo.WinGetTickCount64() / 1000;
         #elif LINUX
-        // /proc/uptime: "<seconds> <idle>"
+        // /proc/uptime: "<seconds> <idle>"，秒带小数（如 "1234.56"），
+        // 截断到小数点再按整数解析。
         string t = SystemInfo.ProcText("/proc/uptime");
         int sp = SystemInfo.IndexOf(t, " ", 0);
-        if (sp < 0) { return 0; }
+        if (sp < 0) { sp = t.Length; }
+        int dot = SystemInfo.IndexOf(t, ".", 0);
+        if (dot >= 0 && dot < sp) { sp = dot; }
         string secs = t.Substring(0, sp).Trim();
         long v = SystemInfo.ParseLong(secs);
         if (v < 0) { v = 0; }
         return v;
+        #elif MACOS
+        // kern.boottime：struct timeval { tv_sec(8), tv_usec(8) }，
+        // 运行时间 = 当前墙钟 - 启动时刻。
+        nint buf = NativeMemory.Alloc(16);
+        nint len = NativeMemory.Alloc(8);
+        new Span<long>(len, 1)[0] = 16;
+        long up = 0;
+        if (SystemInfo.SysctlByName("kern.boottime", buf, len, 0, 0) == 0
+            && new Span<long>(len, 1)[0] >= 8) {
+            long boot = new Span<long>(buf, 2)[0];
+            long now = SystemInfo.NowTime(0);
+            if (now > boot) { up = now - boot; }
+        }
+        NativeMemory.Free(buf);
+        NativeMemory.Free(len);
+        return up;
         #else
         return 0;
         #endif
@@ -104,6 +139,9 @@ class SystemInfo {
         NativeMemory.Free(buf);
         return s;
         #elif LINUX
+        return "/usr";
+        #elif MACOS
+        // 与 Linux 口径一致：Unix 系统根。
         return "/usr";
         #else
         return "";
@@ -187,6 +225,33 @@ class SystemInfo {
         NativeMemory.Free(info);
         return Convert.ToString(major) + "." + Convert.ToString(minor)
             + "." + Convert.ToString(build);
+    }
+    #endif
+
+    #if MACOS
+    [DllImport("crt", EntryPoint = "sysctlbyname")]
+    static extern int SysctlByName(string name, nint oldp, nint oldlenp,
+                                    nint newp, int newlen);
+
+    [DllImport("crt", EntryPoint = "time")]
+    static extern long NowTime(nint tloc);
+
+    /// 读取 sysctl 字符串值（UTF-8 C 串）；键不存在返回 ""。
+    static string SysctlString(string name) {
+        nint buf = NativeMemory.Alloc(256);
+        nint len = NativeMemory.Alloc(8);
+        new Span<long>(len, 1)[0] = 256;
+        string s = "";
+        if (SystemInfo.SysctlByName(name, buf, len, 0, 0) == 0) {
+            int n = 0;
+            while (n < 256 && new Span<byte>(buf + n, 1)[0] != 0) {
+                n = n + 1;
+            }
+            if (n > 0) { s = NativeMemory.GetString(buf, 0, n); }
+        }
+        NativeMemory.Free(buf);
+        NativeMemory.Free(len);
+        return s;
     }
     #endif
 

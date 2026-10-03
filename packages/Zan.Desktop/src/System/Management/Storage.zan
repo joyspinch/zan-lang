@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 
 namespace System.Management;
 
@@ -29,16 +30,20 @@ class DiskUsage {
 /// <summary>
 /// 磁盘/分区枚举与容量。Windows 遍历逻辑驱动器
 /// （GetLogicalDriveStringsW + GetDiskFreeSpaceExW）；Linux 解析
-/// /proc/mounts，并对每个挂载点调用 statvfs。其他平台抛出
-/// PlatformNotSupportedException.
+/// /proc/mounts，macOS 解析 `mount` 输出，二者均对每个挂载点调用
+/// statvfs（两平台的 struct statvfs 容量字段布局一致）。未支持的
+/// 平台抛出 PlatformNotSupportedException.
 /// </summary>
 class Storage {
-    /// <summary>所有固定/可移动磁盘（Windows）或已挂载文件系统
-    /// （Linux）。Linux 会跳过伪文件系统（proc、sysfs、tmpfs、devpts、cgroup、
-    /// overlay...）。</summary>
+    /// <summary>所有固定/可移动磁盘（Windows）、真实文件系统挂载点
+    /// （Linux 会跳过 proc、sysfs、tmpfs、devpts、cgroup、overlay...）
+    /// 或真实磁盘文件系统挂载点（macOS 只保留 apfs/hfs/msdos/exfat/
+    /// ntfs/ufs/zfs/udf）。</summary>
     static List<DiskUsage> Drives() {
         #if WINDOWS
         return Storage.WinDrives();
+        #elif MACOS
+        return Storage.MacDrives();
         #elif LINUX
         return Storage.LinuxDrives();
         #else
@@ -47,12 +52,12 @@ class Storage {
         #endif
     }
 
-    /// <summary>系统盘（Windows）或根文件系统（Linux）。
+    /// <summary>系统盘（Windows）或根文件系统（Linux/macOS）。
     /// 读取失败时返回空的 usage 对象。</summary>
     static DiskUsage Root() {
         #if WINDOWS
         return Storage.Usage("C:");
-        #elif LINUX
+        #elif LINUX || MACOS
         return Storage.Usage("/");
         #else
         return new DiskUsage();
@@ -63,7 +68,7 @@ class Storage {
     static DiskUsage Usage(string path) {
         #if WINDOWS
         return Storage.WinUsage(path);
-        #elif LINUX
+        #elif LINUX || MACOS
         return Storage.Statvfs(path);
         #else
         throw new PlatformNotSupportedException(
@@ -134,10 +139,43 @@ class Storage {
     }
     #endif
 
-    #if LINUX
+    #if !WINDOWS
     [DllImport("crt", EntryPoint = "statvfs")]
     static extern int StatvfsCall(nint path, nint stat);
 
+    /// Linux/macOS 实现：statvfs 读取挂载点容量；调用失败时三个字节
+    /// 数保持 0。两平台的 struct statvfs 布局在前五个字段上一致
+    /// （bsize/frsize/blocks/bfree/bavail 均为 64 位 @ 0/8/16/24/32）。
+    static DiskUsage Statvfs(string path) {
+        // statvfs 接受 UTF-8 的 char*；Zan 字符串本身就是 UTF-8。
+        nint st = NativeMemory.Alloc(96);
+        int ok = Storage.StatvfsCall(path, st);
+        DiskUsage u = new DiskUsage();
+        u.name = path;
+        if (ok == 0) {
+            Span<long> q = new Span<long>(st, 11);
+            long bsize = q[0];
+            long blocks = q[2];
+            long bfree = q[3];
+            long bavail = q[4];
+            u.totalBytes = blocks * bsize;
+            u.freeBytes = bfree * bsize;
+            u.availBytes = bavail * bsize;
+        }
+        NativeMemory.Free(st);
+        return u;
+    }
+
+    /// 从 `from` 起查找 `needle` 的首次出现，找不到返回 -1。
+    static int IndexOf(string hay, string needle, int from) {
+        if (hay == null || needle == null) { return -1; }
+        if (from < 0) { from = 0; }
+        if (from > hay.Length) { return -1; }
+        return hay.IndexOf(needle, from);
+    }
+    #endif
+
+    #if LINUX
     /// Linux 实现：解析 /proc/mounts，对每个真实文件系统挂载点调 statvfs；
     /// /proc/mounts 读不到返回空列表。
     static List<DiskUsage> LinuxDrives() {
@@ -189,34 +227,43 @@ class Storage {
         }
         return true;
     }
+    #endif
 
-    /// Linux 实现：statvfs 读取挂载点容量；调用失败时三个字节数保持 0。
-    static DiskUsage Statvfs(string path) {
-        // statvfs 接受 UTF-8 的 char*；Zan 字符串本身就是 UTF-8。
-        nint st = NativeMemory.Alloc(96);
-        int ok = Storage.StatvfsCall(path, st);
-        DiskUsage u = new DiskUsage();
-        u.name = path;
-        if (ok == 0) {
-            Span<long> q = new Span<long>(st, 11);
-            long bsize = q[0];
-            long blocks = q[2];
-            long bfree = q[3];
-            long bavail = q[4];
-            u.totalBytes = blocks * bsize;
-            u.freeBytes = bfree * bsize;
-            u.availBytes = bavail * bsize;
+    #if MACOS
+    /// macOS 实现：`mount` 列出挂载点，对真实磁盘文件系统调 statvfs。
+    /// mount 不可用或无匹配时返回空列表。挂载点路径含 " on " 时
+    /// 解析不可靠（`mount` 不转义空格）——普通路径不受影响。
+    static List<DiskUsage> MacDrives() {
+        List<DiskUsage> list = new List<DiskUsage>();
+        ProcessResult r = Process.Capture("mount");
+        if (!r.Ok() || r.lines == null) { return list; }
+        for (int i = 0; i < r.lines.Count; i = i + 1) {
+            string line = r.lines[i];
+            // <dev> on <mount> (fstype, flags...)
+            int on = Storage.IndexOf(line, " on ", 0);
+            if (on < 0) { continue; }
+            int par = Storage.IndexOf(line, " (", on);
+            if (par < 0) { continue; }
+            if (line.Length < par + 3
+                || (line[line.Length - 1] & 255) != 41 /*')'*/) { continue; }
+            string mount = line.Substring(on + 4, par - on - 4);
+            string types = line.Substring(par + 2, line.Length - par - 3);
+            int comma = Storage.IndexOf(types, ",", 0);
+            if (comma >= 0) { types = types.Substring(0, comma); }
+            if (!Storage.IsMacDiskFs(types)) { continue; }
+            DiskUsage u = Storage.Statvfs(mount);
+            if (u.totalBytes > 0) { list.Add(u); }
         }
-        NativeMemory.Free(st);
-        return u;
+        return list;
     }
 
-    /// 从 `from` 起查找 `needle` 的首次出现，找不到返回 -1。
-    static int IndexOf(string hay, string needle, int from) {
-        if (hay == null || needle == null) { return -1; }
-        if (from < 0) { from = 0; }
-        if (from > hay.Length) { return -1; }
-        return hay.IndexOf(needle, from);
+    /// 是否 macOS 上的真实磁盘文件系统（白名单，排除 devfs/autofs 等）。
+    static bool IsMacDiskFs(string fstype) {
+        return fstype == "apfs" || fstype == "hfs"
+            || fstype == "hfs+" || fstype == "msdos"
+            || fstype == "exfat" || fstype == "ntfs"
+            || fstype == "ufs" || fstype == "zfs"
+            || fstype == "udf";
     }
     #endif
 }

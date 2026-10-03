@@ -7,8 +7,10 @@ namespace System.Management;
 /// （即 Windows 缓存在
 /// HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor 下的 CPUID 值），核心数来自
 /// GetSystemInfo，负载来自 GetSystemTimes。Linux 读取
-/// /proc/cpuinfo 和 /proc/stat。其他平台抛出
-/// PlatformNotSupportedException.
+/// /proc/cpuinfo 和 /proc/stat；macOS 读 sysctl（hw.ncpu、
+/// machdep.cpu.brand_string、kern.cp_time；Apple Silicon 没有
+/// machdep.cpu.vendor / hw.cpufrequency 键，Vendor/FrequencyMHz 返回空/0）。
+/// 所有读取失败均返回空/0，不抛异常。
 /// </summary>
 class Cpu {
     // 采样间隔用的裸睡眠：不走 System.Threading——using System.Threading
@@ -17,7 +19,7 @@ class Cpu {
     #if WINDOWS
     [DllImport("kernel32", EntryPoint = "Sleep")]
     static extern void SleepW(int ms);
-    #elif LINUX
+    #elif LINUX || MACOS
     [DllImport("crt", EntryPoint = "usleep")]
     static extern int Usleep(int us);
     #endif
@@ -32,6 +34,8 @@ class Cpu {
             "ProcessorNameString");
         #elif LINUX
         return Cpu.ProcField("/proc/cpuinfo", "model name");
+        #elif MACOS
+        return Cpu.SysctlString("machdep.cpu.brand_string");
         #else
         return "";
         #endif
@@ -47,6 +51,9 @@ class Cpu {
             "VendorIdentifier");
         #elif LINUX
         return Cpu.ProcField("/proc/cpuinfo", "vendor_id");
+        #elif MACOS
+        // Apple Silicon 没有这个键，返回 ""。
+        return Cpu.SysctlString("machdep.cpu.vendor");
         #else
         return "";
         #endif
@@ -61,7 +68,12 @@ class Cpu {
             "~MHz");
         #elif LINUX
         string mhz = Cpu.ProcField("/proc/cpuinfo", "cpu MHz");
-        return Cpu.ParseInt(mhz);
+        int v = Cpu.ParseInt(mhz);
+        if (v < 0) { return 0; }   // 与文档一致：未知时为 0 而非 -1
+        return v;
+        #elif MACOS
+        // hw.cpufrequency 单位 Hz（Intel；Apple Silicon 无此键返回 0）。
+        return (int)(Cpu.SysctlInt64("hw.cpufrequency") / 1000000);
         #else
         return 0;
         #endif
@@ -81,6 +93,8 @@ class Cpu {
         return n;
         #elif LINUX
         return Cpu.CountCpuLines();
+        #elif MACOS
+        return Cpu.SysctlInt32("hw.ncpu");
         #else
         return 1;
         #endif
@@ -114,6 +128,21 @@ class Cpu {
         long[] b = Cpu.CpuJiffies();
         long busy = (b[0] - a[0]) - (b[1] - a[1]);
         long total = b[0] - a[0];
+        if (total <= 0) { return 0; }
+        long pct = busy * 100 / total;
+        if (pct < 0) { return 0; }
+        if (pct > 100) { return 100; }
+        return (int)pct;
+        #elif MACOS
+        // kern.cp_time：user nice system idle irq 五个 long tick 计数。
+        // Busy = total - idle；间隔 300 ms 采样两次。
+        long[] a = Cpu.CpTime();
+        Usleep(300000);
+        long[] b = Cpu.CpTime();
+        long total = 0;
+        for (int i = 0; i < 5; i = i + 1) { total = total + b[i] - a[i]; }
+        long idle = b[3] - a[3];   // CPU_STATE_IDLE
+        long busy = total - idle;
         if (total <= 0) { return 0; }
         long pct = busy * 100 / total;
         if (pct < 0) { return 0; }
@@ -189,6 +218,76 @@ class Cpu {
         Cpu.RegCloseKey(hKey);
         NativeMemory.Free(hk);
         return v;
+    }
+    #endif
+
+    #if MACOS
+    [DllImport("crt", EntryPoint = "sysctlbyname")]
+    static extern int SysctlByName(string name, nint oldp, nint oldlenp,
+                                    nint newp, int newlen);
+
+    /// 读取 sysctl 字符串值（UTF-8 C 串）；键不存在返回 ""。
+    static string SysctlString(string name) {
+        nint buf = NativeMemory.Alloc(256);
+        nint len = NativeMemory.Alloc(8);
+        new Span<long>(len, 1)[0] = 256;
+        string s = "";
+        if (Cpu.SysctlByName(name, buf, len, 0, 0) == 0) {
+            int n = 0;
+            while (n < 256 && new Span<byte>(buf + n, 1)[0] != 0) {
+                n = n + 1;
+            }
+            if (n > 0) { s = NativeMemory.GetString(buf, 0, n); }
+        }
+        NativeMemory.Free(buf);
+        NativeMemory.Free(len);
+        return s;
+    }
+
+    /// 读取 sysctl 的 32 位整数值；键不存在或长度不符返回 0。
+    static int SysctlInt32(string name) {
+        nint buf = NativeMemory.Alloc(4);
+        nint len = NativeMemory.Alloc(8);
+        new Span<long>(len, 1)[0] = 4;
+        int v = 0;
+        if (Cpu.SysctlByName(name, buf, len, 0, 0) == 0
+            && new Span<long>(len, 1)[0] == 4) {
+            v = new Span<int>(buf, 1)[0];
+        }
+        NativeMemory.Free(buf);
+        NativeMemory.Free(len);
+        return v;
+    }
+
+    /// 读取 sysctl 的 64 位整数值；键不存在或长度不符返回 0。
+    static long SysctlInt64(string name) {
+        nint buf = NativeMemory.Alloc(8);
+        nint len = NativeMemory.Alloc(8);
+        new Span<long>(len, 1)[0] = 8;
+        long v = 0;
+        if (Cpu.SysctlByName(name, buf, len, 0, 0) == 0
+            && new Span<long>(len, 1)[0] == 8) {
+            v = new Span<long>(buf, 1)[0];
+        }
+        NativeMemory.Free(buf);
+        NativeMemory.Free(len);
+        return v;
+    }
+
+    /// kern.cp_time 的五个 tick 计数（user/nice/system/idle/irq）；
+    /// 读取失败时全 0。
+    static long[] CpTime() {
+        long[] r = new long[5];
+        nint buf = NativeMemory.Alloc(40);
+        nint len = NativeMemory.Alloc(8);
+        new Span<long>(len, 1)[0] = 40;
+        if (Cpu.SysctlByName("kern.cp_time", buf, len, 0, 0) == 0) {
+            Span<long> q = new Span<long>(buf, 5);
+            for (int i = 0; i < 5; i = i + 1) { r[i] = q[i]; }
+        }
+        NativeMemory.Free(buf);
+        NativeMemory.Free(len);
+        return r;
     }
     #endif
 

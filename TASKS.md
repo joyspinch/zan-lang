@@ -103,10 +103,26 @@
   字符串 Load 限文本未做：luaL_loadstring mode 固化在 lauxlib 需新 extern（def 文件清单外），
   且输入是宿主自著代码非脚本可达面——以 Sandbox 禁预编译 chunk（load=nil）+LoadBytes
   宿主专用注释立约（b037adbf）。
-- [ ] **B-ID81 残项（P2）跨平台二项半**——(b) Zan.Gui win-arm64 驱动只有导入库无 payload、
-  (c) ohos-arm64（真机）驱动缺失（二者归 B-ID86 平台 builder 批次）；(i) Zan.Desktop
-  System.Management 族 macOS 全落空值（半文档化，包内口径不一致，需统一文档或补实现）。
-  （a/c/e/h 随 a738a0d0、d 随 38f00e2f、f 随 624c706d、g 随 9c36cdfe 闭账。）
+- [ ] **B-ID81 残项（P2）跨平台二项**——(b) Zan.Gui win-arm64 驱动只有导入库无 payload、
+  (c) ohos-arm64（真机）驱动缺失（二者归 B-ID86 平台 builder 批次）。
+  （a/c/e/h 随 a738a0d0、d 随 38f00e2f、f 随 624c706d、g 随 9c36cdfe、i 随下条闭账。）
+- [x] **B-ID81(i)（P2）System.Management macOS 全落空值**——闭账：补实现 + 口径统一。
+  Cpu 走 sysctl（machdep.cpu.brand_string/vendor、hw.cpufrequency、hw.ncpu、kern.cp_time
+  300ms 双采样；Apple Silicon 无 vendor/频率键，返回空/0）；Memory 走 hw.memsize +
+  vm.stats.vm.v_free_count+v_inactive_count 页 + kern.swapusage 解析；SystemInfo 走
+  kern.hostname/osproductversion/osrelease/boottime+time()、USER/LOGNAME 兜底；Storage
+  把 Statvfs 提为 !WINDOWS 共享（两平台容量字段布局一致 @0/8/16/24/32），Drives 解析
+  `mount` 白名单（apfs/hfs/msdos/exfat/ntfs/ufs/zfs/udf）；Power 解析 `pmset -g batt`
+  （无电池桌面机 percent/life=-1）。全族口径统一：查询类（Cpu/Memory/SystemInfo/
+  Storage/Display/Power/TaskScheduler）永不抛、读取失败回空/0；枚举/系统设施类
+  （Device/Registry）未支持平台抛 PNSE——包内文档此前互相矛盾（Cpu 头注释声称抛异常
+  实际静默回空）。链路存量破洞顺修：Process.zan POSIX 分支 `(nint)(&x)` 取地址
+  （Zan 无取地址语法，该包从未被 POSIX 目标编译过）改 Span<nint>/WinHandleAt（挪出
+  WINDOWS 门），ProcessControl Thread.Sleep（非 Windows 无 Thread 类型，且 A56 税）
+  改裸 usleep；两存量 Linux 缺陷：/proc/uptime 带小数秒被整数解析恒为 0、cpu MHz
+  缺失返 -1 违"未知为 0"契约。验证：win 实跑探针 7/0 + process_safe_exec 金样一致；
+  linux-x64 WSL 实跑 7/0；macos-arm64/macos-x64 交叉编译链接成 Mach-O（无 macOS 实机，
+  运行时正确性靠 sysctl/结构布局教科书契约 + Display system_profiler 先例）。
 - [x] **B-ID82 残项（P2·工具链）GUI 四驱动重建**——随 B-ID86（c2de7a95）闭账：
   过期根因是 drivers.yml 触发列表缺 zan_audio.c 等 unity TU；触发修正后 workflow 自动
   重跑回写四件驱动（win-x64 dll/win-arm64 dll/linux 双架构 a/macos 双 dylib），以 CI
