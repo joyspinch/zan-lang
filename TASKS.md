@@ -27,15 +27,24 @@
 
 ## 未完成
 
-- [ ] **B-ID90（P2·工具链）GUI 驱动五件落后 10-03 源**——B-ID71 音频修复（bdd0a6a1）
-  与壳层变更未进：win-x64 dll（9/30 产物；重建配方已验=cmake --build build --target
-  zan_gui + scripts/build_gui_driver.ps1，因并行会话 gui 源在途编辑暂缓提交，落库后
-  重跑即可）、linux-x64 .a（WSL 已验可行：X11 头+四静态 X11 归档+gcc 13.3 齐，
-  bash scripts/build_linux_gui_static.sh linux-x64）、linux-arm64 .a（WSL 有交叉
-  gcc 但缺 multiarch 静态 X11 归档，需 apt libx11-dev:arm64 系或等 CI）、
-  macos 双 dylib（仅 Mac runner/CI 可产）。check_toolchain_stale.py gui 组已入册
-  12 件全驱动（源面 glob gui_*/zan_audio/stb_*/libwebp/rt_crash.h/fortify，提交时间
-  判定、对在途编辑免疫），持续如实报告；win-arm64/android×2/ohos×2 当前 ok。
+- [ ] **B-ID90（P2·工具链）陈旧产物清理：GUI 驱动五件 + 交叉 rt 对象十四件**——GUI 侧：
+  B-ID71 音频修复（bdd0a6a1）与壳层变更未进——win-x64 dll（9/30 产物；重建配方已验
+  =cmake --build build --target zan_gui + scripts/build_gui_driver.ps1，因并行会话
+  gui 源在途编辑暂缓提交，落库后重跑即可）、linux-x64 .a（WSL 已验可行：X11 头+四
+  静态 X11 归档+gcc 13.3 齐，bash scripts/build_linux_gui_static.sh linux-x64）、
+  linux-arm64 .a（WSL 有交叉 gcc 但缺 multiarch 静态 X11 归档，需 apt
+  libx11-dev:arm64 系或等 CI）、macos 双 dylib（仅 Mac runner/CI 可产）。
+  check_toolchain_stale.py gui 组已入册 12 件全驱动（源面 glob
+  gui_*/zan_audio/stb_*/libwebp/rt_crash.h/fortify，提交时间判定、对在途编辑免疫），
+  持续如实报告；win-arm64/android×2/ohos×2 当前 ok。
+  runtime 侧（10-04 首跑曝出）：zanrt_file.o 八目标（linux-musl/arm64/riscv64、
+  macos/arm64、ios、wasm32、ohos 双架构，落后 f5760ef2 改 rt_file.c）、
+  zan_embed_api.o 五目标（落后 rt_timer.h）、ios zan_inflate.o——c936eb03 只重编了
+  自己触及的 io/sync/timer 系，file/embed/inflate 系掉队。本机 zig+NDK 配方可清
+  （check_toolchain_stale.py --rebuild），但闭包源 rt_file.c/rt_timer.h/
+  zan_inflate.c/rt_sync_wasm.c 正被并行会话在途编辑覆盖（工作树 M 状态），现在重建
+  会把未提交内容烤进对象（win-x64 dll 同款陷阱）——与 gui 五件同轮清偿：在途源落库
+  后一轮 --rebuild + gui 双平台重建，checker 双组全绿即闭。
 - [ ] **B-ID84 残项（P3批·卫生汇总）**——仅余 runtime：libwebp 1.4.0→例行升级（整包换血，
   单独批次）。**开工前置（2026-10-03 观察）：驱动回写 CI 未证活**——bot 提交自 46477da5
   （10-01）后全腿归零（c2de7a95/c936/1f69 三次应触发零落地，win 腿疑 continue-on-error
