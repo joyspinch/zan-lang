@@ -27,12 +27,25 @@
 
 ## 未完成
 
-- [ ] **B-ID90（P2·工具链）残余三件：linux-arm64 .a + macos 双 dylib（CI/Mac 闸门）**——
-  win-x64 dll 与 linux-x64 .a 已换血（3922859b，干净 worktree@HEAD 构建，bdd0a6a1
-  音频修复入 unity 面；def/导入库字节零差）；交叉 rt 十四件经重编字节裁定"日期陈旧、
-  字节现役"全部降级 ok，无真实欠账（零对象提交）。残余仅 linux-arm64 .a（WSL 有交叉
-  gcc 缺 multiarch 静态 X11，本机 sudo 需密码装不了，等 CI）与 macos 双 dylib（仅
-  Mac runner 可产）——drivers.yml 复活即随回写清偿，与 B-ID84 同门。
+- [ ] **B-ID90（P2·工具链）残余仅 macos 双 dylib（Mac 独占，无本地路径）**——本批清偿：
+  win-x64 dll 与 linux-x64 .a 换血（3922859b，bdd0a6a1 音频入面）；linux-arm64 .a
+  首建（fe8da32e，noble arm64 dev 包用户态解包免 sudo 取 X11 四静态档 +
+  aarch64-linux-gnu-gcc，官方脚本同旗子；探针定验未定义面恰为 FT/Fc 二十符号、
+  X11 零缺失，符号面与 x64 对齐差集全为 SSE2 变体）；交叉 rt 十四件重编字节裁定
+  现役（零提交）。macos 双 dylib 需 ObjC+macOS SDK（gui_runtime_mac.m），zig cc
+  不编 ObjC，本机物理不可产，等 Mac runner；drivers.yml 复活即随回写清偿，
+  与 B-ID84 同门。
+- [ ] **B-ID91（P1·工具链）linux GUI 交叉链接全量失败（x64/arm64 同）**——探针
+  _scratch/link-probe/{probe,probe-notext}.zan：App.CreateDarkStage+Show 一行
+  DrawText 与不带 DrawText 的对照**都**链接失败，未定义面恒为 FT_* 七符号 +
+  Fc* 十三符号（fontconfig）——文字面从 App/canvas 核心必然可达，gc-sections
+  剪不掉，任何 linux GUI 程序当前不可交叉链接。根因：驱动档不含 freetype 实现
+  （build_linux_gui_static.sh 只并 X11 系），zanc linux 链接段亦无 libfreetype.a
+  处理（唯一处理在 wasm32 段 main.c:8414，仓库入册的也只有
+  toolchain/wasm32/libfreetype.a）。修复方向：zig cc musl 目标产 libfreetype.a
+  （wasm 配方 build_cross_rt.cmd:98 前车，源树 D:/project/firefox/modules/
+  freetype2）+ fontconfig（拉 expat，源树获取是缺口）→ 入 toolchain/linux-* 并
+  在 linux 链接段接线，或按 ohos 前车并入驱动档；修后本探针转绿即闭。
 - [ ] **B-ID84 残项（P3批·卫生汇总）**——仅余 runtime：libwebp 1.4.0→例行升级（整包换血，
   单独批次）。**开工前置（2026-10-03 观察）：驱动回写 CI 未证活**——bot 提交自 46477da5
   （10-01）后全腿归零（c2de7a95/c936/1f69 三次应触发零落地，win 腿疑 continue-on-error
