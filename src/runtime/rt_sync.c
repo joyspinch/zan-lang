@@ -3139,3 +3139,276 @@ int32_t zan_plat_icmp_ping(const char *address, int32_t timeout_ms) {
     }
 #endif
 }
+
+/* ========================================================================
+ * Cross-platform safe process execution (avoids shell invocation & injection)
+ * ======================================================================== */
+
+#ifdef _WIN32
+static void zan_win_append_arg(char *buf, const char *a) {
+    if (!a || !*a) {
+        strcat(buf, "\"\"");
+        return;
+    }
+    int need_q = 0;
+    for (const char *p = a; *p; p++) {
+        if (*p == ' ' || *p == '\t' || *p == '\"' || *p == '\n' || *p == '\r') {
+            need_q = 1;
+            break;
+        }
+    }
+    if (!need_q) {
+        strcat(buf, a);
+        return;
+    }
+    strcat(buf, "\"");
+    int bs = 0;
+    for (const char *p = a; *p; p++) {
+        if (*p == '\\') {
+            bs++;
+        } else if (*p == '\"') {
+            for (int b = 0; b < bs * 2 + 1; b++) strcat(buf, "\\");
+            strcat(buf, "\"");
+            bs = 0;
+        } else {
+            for (int b = 0; b < bs; b++) strcat(buf, "\\");
+            bs = 0;
+            char ch[2] = { *p, '\0' };
+            strcat(buf, ch);
+        }
+    }
+    for (int b = 0; b < bs * 2; b++) strcat(buf, "\\");
+    strcat(buf, "\"");
+}
+
+static char *zan_win_quote_cmdline(const char *exe, const char **args, int32_t argc) {
+    size_t cap = 256;
+    for (int32_t i = 0; i < argc; i++) {
+        if (args[i]) cap += strlen(args[i]) * 2 + 8;
+    }
+    if (exe) cap += strlen(exe) * 2 + 8;
+    char *buf = (char *)malloc(cap);
+    if (!buf) return NULL;
+    buf[0] = '\0';
+
+    zan_win_append_arg(buf, exe);
+    for (int32_t i = 0; i < argc; i++) {
+        strcat(buf, " ");
+        zan_win_append_arg(buf, args[i]);
+    }
+    return buf;
+}
+#endif
+
+int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
+    if (!exe) return -1;
+#ifdef _WIN32
+    char *cmdline = zan_win_quote_cmdline(exe, args, argc);
+    if (!cmdline) return -1;
+
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, NULL, 0);
+    if (wlen <= 0) { free(cmdline); return -1; }
+    wchar_t *wcmd = (wchar_t *)malloc(wlen * sizeof(wchar_t));
+    if (!wcmd) { free(cmdline); return -1; }
+    MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, wcmd, wlen);
+    free(cmdline);
+
+    STARTUPINFOW si;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof(pi));
+
+    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    free(wcmd);
+    if (!ok) return -1;
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (int32_t)code;
+#else
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        /* Child */
+        char **argv = (char **)malloc((argc + 2) * sizeof(char *));
+        if (!argv) _exit(127);
+        argv[0] = (char *)exe;
+        for (int32_t i = 0; i < argc; i++) {
+            argv[i + 1] = (char *)args[i];
+        }
+        argv[argc + 1] = NULL;
+        execvp(exe, argv);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    if (WIFEXITED(status)) return (int32_t)WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + (int32_t)WTERMSIG(status);
+    return -1;
+#endif
+}
+
+int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
+                              char **out_buf, int32_t *out_len, int32_t *exit_code) {
+    if (!exe || !out_buf || !out_len || !exit_code) return -1;
+    *out_buf = NULL;
+    *out_len = 0;
+    *exit_code = -1;
+
+#ifdef _WIN32
+    SECURITY_ATTRIBUTES sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE hRead = NULL;
+    HANDLE hWrite = NULL;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return -1;
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags |= STARTF_USESTDHANDLES;
+    si.hStdOutput = hWrite;
+    si.hStdError = hWrite;
+
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof(pi));
+
+    char *cmdline = zan_win_quote_cmdline(exe, args, argc);
+    if (!cmdline) {
+        CloseHandle(hRead);
+        CloseHandle(hWrite);
+        return -1;
+    }
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, NULL, 0);
+    wchar_t *wcmd = (wchar_t *)malloc(wlen * sizeof(wchar_t));
+    if (!wcmd) {
+        free(cmdline);
+        CloseHandle(hRead);
+        CloseHandle(hWrite);
+        return -1;
+    }
+    MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, wcmd, wlen);
+    free(cmdline);
+
+    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    free(wcmd);
+    CloseHandle(hWrite); /* Close write end in parent so ReadFile returns EOF */
+
+    if (!ok) {
+        CloseHandle(hRead);
+        return -1;
+    }
+
+    size_t cap = 4096;
+    size_t len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) {
+        CloseHandle(hRead);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return -1;
+    }
+
+    DWORD bytesRead = 0;
+    while (ReadFile(hRead, buf + len, (DWORD)(cap - len - 1), &bytesRead, NULL) && bytesRead > 0) {
+        len += bytesRead;
+        if (len + 1024 >= cap) {
+            cap *= 2;
+            char *nb = (char *)realloc(buf, cap);
+            if (!nb) break;
+            buf = nb;
+        }
+    }
+    CloseHandle(hRead);
+    buf[len] = '\0';
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    *out_buf = buf;
+    *out_len = (int32_t)len;
+    *exit_code = (int32_t)code;
+    return 0;
+#else
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        /* Child */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+
+        char **argv = (char **)malloc((argc + 2) * sizeof(char *));
+        if (!argv) _exit(127);
+        argv[0] = (char *)exe;
+        for (int32_t i = 0; i < argc; i++) {
+            argv[i + 1] = (char *)args[i];
+        }
+        argv[argc + 1] = NULL;
+        execvp(exe, argv);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    size_t cap = 4096;
+    size_t len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) {
+        close(pipefd[0]);
+        return -1;
+    }
+
+    ssize_t r;
+    while ((r = read(pipefd[0], buf + len, cap - len - 1)) > 0) {
+        len += (size_t)r;
+        if (len + 1024 >= cap) {
+            cap *= 2;
+            char *nb = (char *)realloc(buf, cap);
+            if (!nb) break;
+            buf = nb;
+        }
+    }
+    close(pipefd[0]);
+    buf[len] = '\0';
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) break;
+    }
+    int code = -1;
+    if (WIFEXITED(status)) code = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status)) code = 128 + WTERMSIG(status);
+
+    *out_buf = buf;
+    *out_len = (int32_t)len;
+    *exit_code = code;
+    return 0;
+#endif
+}
+
+void zan_proc_free_buf(char *buf) {
+    if (buf) free(buf);
+}
+

@@ -39,6 +39,25 @@ class Process {
     static extern int WinGetTickCount();
     [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
     static extern int WinGetCurrentProcessId();
+    // CaptureSafe 的管道捕获三原语（声明缺失会让整包无法编译）。
+    [DllImport("kernel32", EntryPoint = "CreatePipe")]
+    static extern int WinCreatePipe(byte[] hRead, byte[] hWrite, byte[] sa, int nSize);
+    [DllImport("kernel32", EntryPoint = "SetHandleInformation")]
+    static extern int WinSetHandleInformation(nint handle, int mask, int flags);
+    [DllImport("kernel32", EntryPoint = "ReadFile")]
+    static extern int WinReadFile(nint handle, byte[] buf, int nBytes, byte[] numRead,
+                                  nint overlapped);
+    [DllImport("crt", EntryPoint = "zan_proc_run_safe")]
+    static extern int PlatProcRunSafe(string exe, nint argsPtr, int argc);
+    [DllImport("crt", EntryPoint = "zan_proc_capture_safe")]
+    static extern int PlatProcCaptureSafe(string exe, nint argsPtr, int argc,
+                                          byte[] outBufPtr, byte[] outLen, byte[] exitCode);
+    [DllImport("crt", EntryPoint = "zan_proc_free_buf")]
+    static extern void PlatProcFreeBuf(nint buf);
+    [DllImport("crt", EntryPoint = "malloc")]
+    static extern nint PlatMalloc(long size);
+    [DllImport("crt", EntryPoint = "free")]
+    static extern void PlatFree(nint ptr);
     [DllImport("kernel32", EntryPoint = "WideCharToMultiByte")]
     static extern int WinWideToMulti(int page, int flags, nint wide, int wideLen,
                                      nint mb, int mbLen, nint defChar, nint usedDef);
@@ -48,14 +67,20 @@ class Process {
     [DllImport("kernel32", EntryPoint = "CreateFileW")]
     static extern nint WinCreateFile(nint path, int access, int share, byte[] sa,
                                      int disposition, int flags, nint template);
-    [DllImport("kernel32", EntryPoint = "CreatePipe")]
-    static extern int WinCreatePipe(byte[] hReadPipe, byte[] hWritePipe, byte[] sa, int size);
-    [DllImport("kernel32", EntryPoint = "SetHandleInformation")]
-    static extern int WinSetHandleInformation(nint handle, int mask, int flags);
-    [DllImport("kernel32", EntryPoint = "ReadFile")]
-    static extern int WinReadFile(nint handle, byte[] buf, int numToRead, byte[] numRead, nint overlapped);
     #else
     // Linux、macOS 等 POSIX 系统都在 libc 中提供 popen/pclose。
+    [DllImport("crt", EntryPoint = "zan_proc_run_safe")]
+    static extern int PlatProcRunSafe(string exe, nint argsPtr, int argc);
+    [DllImport("crt", EntryPoint = "zan_proc_capture_safe")]
+    static extern int PlatProcCaptureSafe(string exe, nint argsPtr, int argc,
+                                          byte[] outBufPtr, byte[] outLen, byte[] exitCode);
+    [DllImport("crt", EntryPoint = "zan_proc_free_buf")]
+    static extern void PlatProcFreeBuf(nint buf);
+    [DllImport("crt", EntryPoint = "malloc")]
+    static extern nint PlatMalloc(long size);
+    [DllImport("crt", EntryPoint = "free")]
+    static extern void PlatFree(nint ptr);
+
     [DllImport("crt", EntryPoint = "popen")]
     static extern nint plat_popen(string cmd, string mode);
 
@@ -491,8 +516,28 @@ class Process {
         WinCloseHandle(hThread);
         return code;
         #else
-        string cmdline = BuildCommandLine(exe, args);
-        return system(cmdline);
+        int argc = args != null ? args.Count : 0;
+        nint argv = 0;
+        if (argc > 0) {
+            argv = NativeMemory.Alloc(argc * 8);
+            for (int i = 0; i < argc; i = i + 1) {
+                string a = args[i];
+                int blen = a.Length;
+                nint abuf = NativeMemory.Alloc(blen + 1);
+                NativeMemory.PutString(abuf, 0, a, blen);
+                NativeMemory.Copy(argv + (nint)(i * 8), (nint)(&abuf), 8);
+            }
+        }
+        int code = PlatProcRunSafe(exe, argv, argc);
+        if (argv != 0) {
+            for (int i = 0; i < argc; i = i + 1) {
+                nint abuf = 0;
+                NativeMemory.Copy((nint)(&abuf), argv + (nint)(i * 8), 8);
+                if (abuf != 0) { NativeMemory.Free(abuf); }
+            }
+            NativeMemory.Free(argv);
+        }
+        return code;
         #endif
     }
 
@@ -562,8 +607,45 @@ class Process {
         r.lines = SplitLines(sb.ToString());
         return r;
         #else
-        string cmdline = BuildCommandLine(exe, args);
-        return Capture(cmdline);
+        int argc = args != null ? args.Count : 0;
+        nint argv = 0;
+        if (argc > 0) {
+            argv = NativeMemory.Alloc(argc * 8);
+            for (int i = 0; i < argc; i = i + 1) {
+                string a = args[i];
+                int blen = a.Length;
+                nint abuf = NativeMemory.Alloc(blen + 1);
+                NativeMemory.PutString(abuf, 0, a, blen);
+                NativeMemory.Copy(argv + (nint)(i * 8), (nint)(&abuf), 8);
+            }
+        }
+        byte[] outBuf = new byte[8];
+        byte[] outLen = new byte[4];
+        byte[] exitCode = new byte[4];
+        int ret = PlatProcCaptureSafe(exe, argv, argc, outBuf, outLen, exitCode);
+        if (argv != 0) {
+            for (int i = 0; i < argc; i = i + 1) {
+                nint abuf = 0;
+                NativeMemory.Copy((nint)(&abuf), argv + (nint)(i * 8), 8);
+                if (abuf != 0) { NativeMemory.Free(abuf); }
+            }
+            NativeMemory.Free(argv);
+        }
+        if (ret == 0) {
+            nint pBuf = 0;
+            NativeMemory.Copy((nint)(&pBuf), (nint)(&outBuf), 8);
+            int len = outLen[0] + outLen[1] * 256 + outLen[2] * 65536 + outLen[3] * 16777216;
+            int code = exitCode[0] + exitCode[1] * 256 + exitCode[2] * 65536 + exitCode[3] * 16777216;
+            r.exitCode = code;
+            if (pBuf != 0 && len > 0) {
+                string text = NativeMemory.GetString(pBuf, 0, len);
+                r.lines = SplitLines(text);
+            }
+            if (pBuf != 0) { PlatProcFreeBuf(pBuf); }
+        } else {
+            r.exitCode = 0 - 1;
+        }
+        return r;
         #endif
     }
 

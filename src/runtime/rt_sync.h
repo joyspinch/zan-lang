@@ -157,6 +157,12 @@ int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash);
 long long zan_exe_dir_into(char *out, long long cap);
 long long zan_dir_list_into(const char *pattern, char *out, long long cap);
 
+/* Cross-platform safe process execution (avoids shell invocation & injection) */
+int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc);
+int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
+                              char **out_buf, int32_t *out_len, int32_t *exit_code);
+void zan_proc_free_buf(char *buf);
+
 /* file metadata (System.IO.FileInfo) */
 long long zan_file_time(const char *path, int which);
 long long zan_file_length(const char *path);
