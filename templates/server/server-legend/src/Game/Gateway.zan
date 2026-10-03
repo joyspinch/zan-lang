@@ -34,13 +34,26 @@ namespace ZanWeb.Game;
    创建：HTTP 登录的会话无连接（推送通道 attach 后才有），TCP 直连的
    会话连接即通道。密保散列与找回密码的网页（/register、/forgot）共用
    AccountDao。区服 state：0=开放 1=维护（enter/create 被拒）。 */
+/* 客户端连接会话强类型实体（替代平行多字典 buffers/conns/seen/secs）。 */
+class GatewayClient {
+    int cid;
+    Connection conn;
+    string buffer;
+    long lastSeen;
+    ConnSec sec;
+
+    GatewayClient(Connection conn) {
+        this.cid = conn.GetId();
+        this.conn = conn;
+        this.buffer = "";
+        this.lastSeen = WebApp.NowSeconds();
+        this.sec = new ConnSec();
+    }
+}
+
 class Gateway {
-    /* cid → 未凑满一行的字节（不含行尾）；cid → 最近活动时刻（清理闲置连接）；
-       cid → 加密握手状态（Secure.zan）。 */
-    static Dictionary<int, string> buffers = new Dictionary<int, string>();
-    static Dictionary<int, Connection> conns = new Dictionary<int, Connection>();
-    static Dictionary<int, long> seen = new Dictionary<int, long>();
-    static Dictionary<int, ConnSec> secs = new Dictionary<int, ConnSec>();
+    /* 连接实体表：统一管理连接生命周期、分帧缓冲与安全上下文 */
+    static Dictionary<int, GatewayClient> clients = new Dictionary<int, GatewayClient>();
 
     static int MaxLine = 8192;
 
@@ -58,40 +71,33 @@ class Gateway {
 
     static async void OnConnect(Connection conn) {
         int cid = conn.GetId();
-        Gateway.buffers.Add(cid, "");
-        Gateway.conns.Add(cid, conn);
-        Gateway.seen.Add(cid, WebApp.NowSeconds());
-        ConnSec sec = new ConnSec();
-        /* 16 随机字节 → 32 hex；握手本身不含秘密，明文发送无妨。 */
-        sec.snonce = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
-        Gateway.secs.Add(cid, sec);
+        GatewayClient client = new GatewayClient(conn);
+        client.sec.snonce = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+        Gateway.clients.Add(cid, client);
         JsonValue hello = Gateway.Ok();
         hello.Set("proto", JsonValue.NewNum("2"));
         hello.Set("enc", JsonValue.NewStr("aes-gcm"));
-        hello.Set("snonce", JsonValue.NewStr(sec.snonce));
+        hello.Set("snonce", JsonValue.NewStr(client.sec.snonce));
         Gateway.Send(conn, hello);
     }
 
     static async string OnMessage(Connection conn, string data) {
         int cid = conn.GetId();
-        if (Gateway.seen.ContainsKey(cid)) {
-            Gateway.seen.Remove(cid);
-            Gateway.seen.Add(cid, WebApp.NowSeconds());
-        }
-        string buf = "";
-        if (!Gateway.buffers.TryGetValue(cid, out buf)) { return ""; }
-        buf = buf + data;
+        GatewayClient client = null;
+        if (!Gateway.clients.TryGetValue(cid, out client) || client == null) { return ""; }
+        client.lastSeen = WebApp.NowSeconds();
+        client.buffer = client.buffer + data;
         while (true) {
-            int nl = buf.IndexOf("\n");
+            int nl = client.buffer.IndexOf("\n");
             if (nl < 0) {
-                if (buf.Length > Gateway.MaxLine) {
+                if (client.buffer.Length > Gateway.MaxLine) {
                     Gateway.Send(conn, Gateway.Err("消息过长"));
-                    buf = "";
+                    client.buffer = "";
                 }
                 break;
             }
-            string line = buf.Substring(0, nl);
-            buf = buf.Substring(nl + 1);
+            string line = client.buffer.Substring(0, nl);
+            client.buffer = client.buffer.Substring(nl + 1);
             if (line.Length == 0) { continue; }
             if (line.Length > Gateway.MaxLine) {
                 Gateway.Send(conn, Gateway.Err("消息过长"));
@@ -99,19 +105,12 @@ class Gateway {
             }
             await Gateway.Handle(conn, line);
         }
-        if (Gateway.buffers.ContainsKey(cid)) {
-            Gateway.buffers.Remove(cid);
-            Gateway.buffers.Add(cid, buf);
-        }
         return "";
     }
 
     static async void OnClose(Connection conn) {
         int cid = conn.GetId();
-        Gateway.buffers.Remove(cid);
-        Gateway.conns.Remove(cid);
-        Gateway.seen.Remove(cid);
-        Gateway.secs.Remove(cid);
+        Gateway.clients.Remove(cid);
         await Gateway.OnPushClosed(cid);
     }
 
@@ -168,21 +167,16 @@ class Gateway {
        OnClose 与本循环并发窗口里删除条目可能让快照里出现空槽——逐项
        判空跳过（每秒一拍，空槽只出现在跨拍删除的那一轮）。 */
     static void SweepIdle(long now) {
-        List<Connection> rows = new List<Connection>();
-        List<int> ids = new List<int>();
-        for (int i = 0; i < Gateway.conns.Values.Count; i = i + 1) {
-            Connection conn = Gateway.conns.Values[i];
-            if (conn == null) { continue; }
-            rows.Add(conn);
-            ids.Add(conn.GetId());
+        List<GatewayClient> rows = new List<GatewayClient>();
+        for (int i = 0; i < Gateway.clients.Values.Count; i = i + 1) {
+            GatewayClient cl = Gateway.clients.Values[i];
+            if (cl != null) { rows.Add(cl); }
         }
         for (int i = 0; i < rows.Count; i = i + 1) {
-            int cid = ids[i];
-            if (World.ByCid(cid) != null) { continue; }
-            long at = 0;
-            if (!Gateway.seen.TryGetValue(cid, out at)) { continue; }
-            if (now - at <= GameCfg.V().kickSeconds) { continue; }
-            rows[i].Close();
+            GatewayClient cl = rows[i];
+            if (World.ByCid(cl.cid) != null) { continue; }
+            if (now - cl.lastSeen <= GameCfg.V().kickSeconds) { continue; }
+            if (cl.conn != null) { cl.conn.Close(); }
         }
     }
 
@@ -190,8 +184,9 @@ class Gateway {
     static async void Handle(Connection conn, string line) {
         /* 加密会话：非 '{' 开头的行是 Base64 帧，解密后递归走同一条
            分发路径。序号不连续或认证失败 = 重放/注入/坏帧，直接断开。 */
-        ConnSec sec = null;
-        Gateway.secs.TryGetValue(conn.GetId(), out sec);
+        GatewayClient client = null;
+        Gateway.clients.TryGetValue(conn.GetId(), out client);
+        ConnSec sec = client != null ? client.sec : null;
         if (line.Length > 0 && (line[0] & 255) != '{' ) {
             if (sec == null || sec.rx == null) {
                 Gateway.Send(conn, Gateway.Err("请先 hello 协商加密"));
@@ -515,7 +510,7 @@ class Gateway {
         try {
             AccountDao dao = new AccountDao(db);
             Account row = await dao.ByUsername(user);
-            /* 账号级锁定（分布式撞库闸门，A303 建议 ④）：先于密码校验，
+            /* 账号级锁定（分布式撞库闸门）：先于密码校验，
                拒绝文案不带「账号不存在」信息——不向爆破者透露账号存在性。
                row==null 时锁定恒假，走同一条错误文案。 */
             if (dao.LoginLocked(row, now)) {
@@ -567,7 +562,9 @@ class Gateway {
                    不挂上的话 AnnounceAll/聊天等 ev 推送会因 conn==null 被静默
                    丢弃。 */
                 Connection tc = null;
-                Gateway.conns.TryGetValue(cid, out tc);
+                GatewayClient cl = null;
+                Gateway.clients.TryGetValue(cid, out cl);
+                if (cl != null) { tc = cl.conn; }
                 ts.conn = tc;
                 ts.pushCid = cid;
                 ts.accountId = row.id;
@@ -1367,8 +1364,9 @@ class Gateway {
        尚未挂推送通道的会话）——静默跳过，事件只在通道挂上后送达。 */
     static void Send(Connection conn, JsonValue o) {
         if (conn == null) { return; }
-        ConnSec sec = null;
-        Gateway.secs.TryGetValue(conn.GetId(), out sec);
+        GatewayClient cl = null;
+        Gateway.clients.TryGetValue(conn.GetId(), out cl);
+        ConnSec sec = cl != null ? cl.sec : null;
         if (sec != null && sec.tx != null) {
             conn.Send(sec.tx.Seal(o.ToJson()) + "\n");
             return;
