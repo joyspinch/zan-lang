@@ -103,9 +103,12 @@
   字节一致）；cbor_values 金样 diff 一致。
 - [ ] **B-ID79 残项（P3）Csv 公式注入**——（=`+-@ 开头单元格不中和，Excel 执行）行为未改，
   Csv 类文档已补安全警告（2824550d）；根治需导出侧中和选项，涉 API 面，待议。
-- [ ] **B-ID80 残项（P2）**——(d) CSP：框架视图 10+ 处内联 style=、1 处内联 script、生成器
-  产 javascript:void(0) tab 条，default-src 'self' 必破页——需先视图去内联改造再挂 CSP
-  （nosniff/XFO/Referrer-Policy 已随 SecurityHeaders 默认带上，e20c1e68）；(g 附注) Lua 公共
+- [ ] **B-ID80 残项（P2）**——(d) CSP 框架侧已闭（d6548ae3）：框架视图 177 处内联 style=
+  归零（列宽走 width= 表现属性、色值/间距进 admin.css 工具类）、3 段内联 script 外链
+  /static/js/、生成器 javascript:void(0) 改 href="#"（admin.js 已 preventDefault）、
+  Cfg [security].csp 挂 Content-Security-Policy（default-src 'self'; img-src 'self' data:;
+  base-uri 'self'；默认关——templates 应用 views 尚有 300+ 处 style= 与内联 script，模板
+  清扫后方可默认开；server_mvc_security_csp 单测已入册 ctest）；(g 附注) Lua 公共
   字符串 Load 限文本未做：luaL_loadstring mode 固化在 lauxlib 需新 extern（def 文件清单外），
   且输入是宿主自著代码非脚本可达面——以 Sandbox 禁预编译 chunk（load=nil）+LoadBytes
   宿主专用注释立约（b037adbf）。
