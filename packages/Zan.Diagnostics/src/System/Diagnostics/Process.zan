@@ -250,31 +250,41 @@ class Process {
             units = got * 2 + 2;
         }
         nint wide = NativeMemory.Alloc(units * 2 + 2);
-        if (utf16) {
-            for (int k = 0; k < units; k = k + 1) {
-                new Span<ushort>(wide + k * 2, 1)[0] = (ushort)(raw[2 + k * 2] |
-                    (raw[3 + k * 2] << 8));
+        string s = "";
+        try {
+            if (utf16) {
+                for (int k = 0; k < units; k = k + 1) {
+                    new Span<ushort>(wide + k * 2, 1)[0] = (ushort)(raw[2 + k * 2] |
+                        (raw[3 + k * 2] << 8));
+                }
+                new Span<ushort>(wide + units * 2, 1)[0] = 0;
+            } else {
+                nint mb = NativeMemory.Alloc(got);
+                try {
+                    for (int k = 0; k < got; k = k + 1) {
+                        new Span<byte>(mb + k, 1)[0] = raw[k];
+                    }
+                    // 原地转换：wide 存放 UTF-16 结果（units 已按其预留），
+                    // 再为 UTF-8 转换推算真实长度。
+                    int n = Process.WinMultiToWide(0 /*CP_ACP*/, 0, mb, got, wide, units);
+                    if (n > 0) { units = n; }
+                    new Span<ushort>(wide + units * 2, 1)[0] = 0;
+                } finally {
+                    NativeMemory.Free(mb);
+                }
             }
-            new Span<ushort>(wide + units * 2, 1)[0] = 0;
-        } else {
-            nint mb = NativeMemory.Alloc(got);
-            for (int k = 0; k < got; k = k + 1) {
-                new Span<byte>(mb + k, 1)[0] = raw[k];
+            int need = Process.WinWideToMulti(65001, 0, wide, units, 0, 0, 0, 0);
+            if (need <= 0) { need = 1; }
+            nint utf8 = NativeMemory.Alloc(need + 1);
+            try {
+                Process.WinWideToMulti(65001, 0, wide, units, utf8, need + 1, 0, 0);
+                s = NativeMemory.GetString(utf8, 0, need);
+            } finally {
+                NativeMemory.Free(utf8);
             }
-            // 原地转换：wide 存放 UTF-16 结果（units 已按其预留），
-            // 再为 UTF-8 转换推算真实长度。
-            int n = Process.WinMultiToWide(0 /*CP_ACP*/, 0, mb, got, wide, units);
-            if (n > 0) { units = n; }
-            new Span<ushort>(wide + units * 2, 1)[0] = 0;
-            NativeMemory.Free(mb);
+        } finally {
+            NativeMemory.Free(wide);
         }
-        int need = Process.WinWideToMulti(65001, 0, wide, units, 0, 0, 0, 0);
-        if (need <= 0) { need = 1; }
-        nint utf8 = NativeMemory.Alloc(need + 1);
-        Process.WinWideToMulti(65001, 0, wide, units, utf8, need + 1, 0, 0);
-        string s = NativeMemory.GetString(utf8, 0, need);
-        NativeMemory.Free(utf8);
-        NativeMemory.Free(wide);
         return s;
     }
     #endif
@@ -517,34 +527,41 @@ class Process {
         if (ok == 0) { return 0 - 1; }
         nint hProc = WinHandleAt(pi, 0);
         nint hThread = WinHandleAt(pi, 8);
-        WinWaitForSingleObject(hProc, 0 - 1);
-        byte[] cb = new byte[8];
-        WinGetExitCodeProcess(hProc, cb);
-        int code = cb[0] + cb[1] * 256 + cb[2] * 65536 + cb[3] * 16777216;
-        WinCloseHandle(hProc);
-        WinCloseHandle(hThread);
-        return code;
+        try {
+            WinWaitForSingleObject(hProc, 0 - 1);
+            byte[] cb = new byte[8];
+            WinGetExitCodeProcess(hProc, cb);
+            int code = cb[0] + cb[1] * 256 + cb[2] * 65536 + cb[3] * 16777216;
+            return code;
+        } finally {
+            WinCloseHandle(hProc);
+            WinCloseHandle(hThread);
+        }
         #else
         int argc = args != null ? args.Count : 0;
         nint argv = 0;
-        if (argc > 0) {
-            argv = NativeMemory.Alloc(argc * 8);
-            Span<nint> av = new Span<nint>(argv, argc);
-            for (int i = 0; i < argc; i = i + 1) {
-                string a = args[i];
-                int blen = a.Length;
-                nint abuf = NativeMemory.Alloc(blen + 1);
-                NativeMemory.PutString(abuf, 0, a, blen);
-                av[i] = abuf;
+        int code = 0;
+        try {
+            if (argc > 0) {
+                argv = NativeMemory.Alloc(argc * 8);
+                Span<nint> av = new Span<nint>(argv, argc);
+                for (int i = 0; i < argc; i = i + 1) {
+                    string a = args[i];
+                    int blen = a.Length;
+                    nint abuf = NativeMemory.Alloc(blen + 1);
+                    NativeMemory.PutString(abuf, 0, a, blen);
+                    av[i] = abuf;
+                }
             }
-        }
-        int code = PlatProcRunSafe(exe, argv, argc);
-        if (argv != 0) {
-            Span<nint> av = new Span<nint>(argv, argc);
-            for (int i = 0; i < argc; i = i + 1) {
-                if (av[i] != 0) { NativeMemory.Free(av[i]); }
+            code = PlatProcRunSafe(exe, argv, argc);
+        } finally {
+            if (argv != 0) {
+                Span<nint> av = new Span<nint>(argv, argc);
+                for (int i = 0; i < argc; i = i + 1) {
+                    if (av[i] != 0) { NativeMemory.Free(av[i]); }
+                }
+                NativeMemory.Free(argv);
             }
-            NativeMemory.Free(argv);
         }
         return code;
         #endif
@@ -640,62 +657,73 @@ class Process {
 
         nint hProc = WinHandleAt(pi, 0);
         nint hThread = WinHandleAt(pi, 8);
+        try {
+            StringBuilder sb = new StringBuilder();
+            byte[] readBuf = new byte[4096];
+            byte[] numRead = new byte[8];
+            try {
+                for (;;) {
+                    int readOk = WinReadFile(hReadPipe, readBuf, 4096, numRead, 0);
+                    int bytesRead = numRead[0] + numRead[1] * 256 + numRead[2] * 65536 + numRead[3] * 16777216;
+                    if (readOk == 0 || bytesRead <= 0) { break; }
+                    sb.Append(readBuf.ToStr(0, bytesRead));
+                }
+            } finally {
+                WinCloseHandle(hReadPipe);
+            }
 
-        StringBuilder sb = new StringBuilder();
-        byte[] readBuf = new byte[4096];
-        byte[] numRead = new byte[8];
-        for (;;) {
-            int readOk = WinReadFile(hReadPipe, readBuf, 4096, numRead, 0);
-            int bytesRead = numRead[0] + numRead[1] * 256 + numRead[2] * 65536 + numRead[3] * 16777216;
-            if (readOk == 0 || bytesRead <= 0) { break; }
-            sb.Append(readBuf.ToStr(0, bytesRead));
+            WinWaitForSingleObject(hProc, 0 - 1);
+            byte[] cb = new byte[8];
+            WinGetExitCodeProcess(hProc, cb);
+            r.exitCode = cb[0] + cb[1] * 256 + cb[2] * 65536 + cb[3] * 16777216;
+            r.lines = SplitLines(sb.ToString());
+            return r;
+        } finally {
+            WinCloseHandle(hProc);
+            WinCloseHandle(hThread);
         }
-        WinCloseHandle(hReadPipe);
-
-        WinWaitForSingleObject(hProc, 0 - 1);
-        byte[] cb = new byte[8];
-        WinGetExitCodeProcess(hProc, cb);
-        r.exitCode = cb[0] + cb[1] * 256 + cb[2] * 65536 + cb[3] * 16777216;
-        WinCloseHandle(hProc);
-        WinCloseHandle(hThread);
-
-        r.lines = SplitLines(sb.ToString());
-        return r;
         #else
         int argc = args != null ? args.Count : 0;
         nint argv = 0;
-        if (argc > 0) {
-            argv = NativeMemory.Alloc(argc * 8);
-            Span<nint> av = new Span<nint>(argv, argc);
-            for (int i = 0; i < argc; i = i + 1) {
-                string a = args[i];
-                int blen = a.Length;
-                nint abuf = NativeMemory.Alloc(blen + 1);
-                NativeMemory.PutString(abuf, 0, a, blen);
-                av[i] = abuf;
-            }
-        }
         byte[] outBuf = new byte[8];
         byte[] outLen = new byte[4];
         byte[] exitCode = new byte[4];
-        int ret = PlatProcCaptureSafe(exe, argv, argc, outBuf, outLen, exitCode);
-        if (argv != 0) {
-            Span<nint> av = new Span<nint>(argv, argc);
-            for (int i = 0; i < argc; i = i + 1) {
-                if (av[i] != 0) { NativeMemory.Free(av[i]); }
+        int ret = 0;
+        try {
+            if (argc > 0) {
+                argv = NativeMemory.Alloc(argc * 8);
+                Span<nint> av = new Span<nint>(argv, argc);
+                for (int i = 0; i < argc; i = i + 1) {
+                    string a = args[i];
+                    int blen = a.Length;
+                    nint abuf = NativeMemory.Alloc(blen + 1);
+                    NativeMemory.PutString(abuf, 0, a, blen);
+                    av[i] = abuf;
+                }
             }
-            NativeMemory.Free(argv);
+            ret = PlatProcCaptureSafe(exe, argv, argc, outBuf, outLen, exitCode);
+        } finally {
+            if (argv != 0) {
+                Span<nint> av = new Span<nint>(argv, argc);
+                for (int i = 0; i < argc; i = i + 1) {
+                    if (av[i] != 0) { NativeMemory.Free(av[i]); }
+                }
+                NativeMemory.Free(argv);
+            }
         }
         if (ret == 0) {
             nint pBuf = WinHandleAt(outBuf, 0);
-            int len = outLen[0] + outLen[1] * 256 + outLen[2] * 65536 + outLen[3] * 16777216;
-            int code = exitCode[0] + exitCode[1] * 256 + exitCode[2] * 65536 + exitCode[3] * 16777216;
-            r.exitCode = code;
-            if (pBuf != 0 && len > 0) {
-                string text = NativeMemory.GetString(pBuf, 0, len);
-                r.lines = SplitLines(text);
+            try {
+                int len = outLen[0] + outLen[1] * 256 + outLen[2] * 65536 + outLen[3] * 16777216;
+                int code = exitCode[0] + exitCode[1] * 256 + exitCode[2] * 65536 + exitCode[3] * 16777216;
+                r.exitCode = code;
+                if (pBuf != 0 && len > 0) {
+                    string text = NativeMemory.GetString(pBuf, 0, len);
+                    r.lines = SplitLines(text);
+                }
+            } finally {
+                if (pBuf != 0) { PlatProcFreeBuf(pBuf); }
             }
-            if (pBuf != 0) { PlatProcFreeBuf(pBuf); }
         } else {
             r.exitCode = 0 - 1;
         }

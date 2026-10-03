@@ -60,14 +60,16 @@ class Privileges {
     /// 以请求的访问权限打开当前进程的 token；失败返回 0。
     static nint OpenToken(int access) {
         nint slot = NativeMemory.Alloc(8);
-        new Span<nint>(slot, 1)[0] = 0;
-        if (Privileges.WinOpenProcessToken(Privileges.WinGetCurrentProcess(),
-                                           access, slot) == 0) {
+        nint h = 0;
+        try {
+            new Span<nint>(slot, 1)[0] = 0;
+            if (Privileges.WinOpenProcessToken(Privileges.WinGetCurrentProcess(),
+                                               access, slot) != 0) {
+                h = new Span<nint>(slot, 1)[0];
+            }
+        } finally {
             NativeMemory.Free(slot);
-            return 0;
         }
-        nint h = new Span<nint>(slot, 1)[0];
-        NativeMemory.Free(slot);
         return h;
     }
     #else
@@ -84,13 +86,16 @@ class Privileges {
         nint info = NativeMemory.Alloc(8);
         nint ret = NativeMemory.Alloc(4);
         bool elevated = false;
-        if (Privileges.WinGetTokenInformation(token, 20 /*TokenElevation*/,
-                                              info, 8, ret) != 0) {
-            elevated = new Span<int>(info, 2)[0] != 0;
+        try {
+            if (Privileges.WinGetTokenInformation(token, 20 /*TokenElevation*/,
+                                                  info, 8, ret) != 0) {
+                elevated = new Span<int>(info, 2)[0] != 0;
+            }
+        } finally {
+            NativeMemory.Free(info);
+            NativeMemory.Free(ret);
+            Privileges.WinCloseHandle(token);
         }
-        NativeMemory.Free(info);
-        NativeMemory.Free(ret);
-        Privileges.WinCloseHandle(token);
         return elevated;
         #else
         return Privileges.GetEuid() == 0;
@@ -103,13 +108,16 @@ class Privileges {
         #if WINDOWS
         nint buf = NativeMemory.Alloc(256 * 2 + 2);
         nint size = NativeMemory.Alloc(4);
-        new Span<int>(size, 1)[0] = 256;
         string name = "";
-        if (Privileges.WinGetUserNameW(buf, size) != 0) {
-            name = Wide.Read(buf);
+        try {
+            new Span<int>(size, 1)[0] = 256;
+            if (Privileges.WinGetUserNameW(buf, size) != 0) {
+                name = Wide.Read(buf);
+            }
+        } finally {
+            NativeMemory.Free(buf);
+            NativeMemory.Free(size);
         }
-        NativeMemory.Free(buf);
-        NativeMemory.Free(size);
         return name;
         #else
         return Interop.EnvVar("USER");
@@ -126,22 +134,28 @@ class Privileges {
         nint info = NativeMemory.Alloc(256);
         nint ret = NativeMemory.Alloc(4);
         string sid = "";
-        if (Privileges.WinGetTokenInformation(token, 1 /*TokenUser*/,
-                                              info, 256, ret) != 0) {
-            // TOKEN_USER: { SID_AND_ATTRIBUTES { PSID Sid; DWORD Attr } }
-            nint psid = new Span<nint>(info, 32)[0];
-            nint str = NativeMemory.Alloc(8);
-            new Span<nint>(str, 1)[0] = 0;
-            if (Privileges.WinConvertSidToStringSidW(psid, str) != 0) {
-                nint pstr = new Span<nint>(str, 1)[0];
-                sid = Wide.Read(pstr);
-                Privileges.WinLocalFree(pstr);
+        try {
+            if (Privileges.WinGetTokenInformation(token, 1 /*TokenUser*/,
+                                                  info, 256, ret) != 0) {
+                // TOKEN_USER: { SID_AND_ATTRIBUTES { PSID Sid; DWORD Attr } }
+                nint psid = new Span<nint>(info, 32)[0];
+                nint str = NativeMemory.Alloc(8);
+                try {
+                    new Span<nint>(str, 1)[0] = 0;
+                    if (Privileges.WinConvertSidToStringSidW(psid, str) != 0) {
+                        nint pstr = new Span<nint>(str, 1)[0];
+                        sid = Wide.Read(pstr);
+                        Privileges.WinLocalFree(pstr);
+                    }
+                } finally {
+                    NativeMemory.Free(str);
+                }
             }
-            NativeMemory.Free(str);
+        } finally {
+            NativeMemory.Free(info);
+            NativeMemory.Free(ret);
+            Privileges.WinCloseHandle(token);
         }
-        NativeMemory.Free(info);
-        NativeMemory.Free(ret);
-        Privileges.WinCloseHandle(token);
         return sid;
         #else
         return Convert.ToString(Privileges.GetEuid());
@@ -158,20 +172,26 @@ class Privileges {
         nint wname = Wide.Of(name);
         nint luid = NativeMemory.Alloc(8);
         bool ok = false;
-        if (Privileges.WinLookupPrivilegeValueW(0, wname, luid) != 0) {
-            // TOKEN_PRIVILEGES: count@0 (4), pad(4), Luid@8, Attributes@16
-            nint tp = NativeMemory.Alloc(32);
-            new Span<int>(tp, 8)[0] = 1;
-            new Span<long>(tp + 8, 2)[0] = new Span<long>(luid, 1)[0];
-            new Span<int>(tp + 16, 4)[0] = 0x00000002;   // SE_PRIVILEGE_ENABLED
-            int r = Privileges.WinAdjustTokenPrivileges(token, 0, tp, 0, 0, 0);
-            ok = (r != 0) &&
-                 (Privileges.WinGetLastError() == 0 /*ERROR_SUCCESS*/);
-            NativeMemory.Free(tp);
+        try {
+            if (Privileges.WinLookupPrivilegeValueW(0, wname, luid) != 0) {
+                // TOKEN_PRIVILEGES: count@0 (4), pad(4), Luid@8, Attributes@16
+                nint tp = NativeMemory.Alloc(32);
+                try {
+                    new Span<int>(tp, 8)[0] = 1;
+                    new Span<long>(tp + 8, 2)[0] = new Span<long>(luid, 1)[0];
+                    new Span<int>(tp + 16, 4)[0] = 0x00000002;   // SE_PRIVILEGE_ENABLED
+                    int r = Privileges.WinAdjustTokenPrivileges(token, 0, tp, 0, 0, 0);
+                    ok = (r != 0) &&
+                         (Privileges.WinGetLastError() == 0 /*ERROR_SUCCESS*/);
+                } finally {
+                    NativeMemory.Free(tp);
+                }
+            }
+        } finally {
+            NativeMemory.Free(luid);
+            Wide.Free(wname);
+            Privileges.WinCloseHandle(token);
         }
-        NativeMemory.Free(luid);
-        Wide.Free(wname);
-        Privileges.WinCloseHandle(token);
         return ok;
         #else
         throw new PlatformNotSupportedException(
@@ -271,41 +291,50 @@ class Privileges {
         // verb@16 file@24 params@32 dir@40 nShow@48 hInst@56 idList@64
         // class@72 hkey@80 hotkey@88 hIcon/hMonitor@96 hProcess@104
         nint sei = NativeMemory.Alloc(112);
-        Span<long> zero = new Span<long>(sei, 14);
-        for (int zi = 0; zi < 14; zi = zi + 1) { zero[zi] = 0; }
-        new Span<int>(sei, 28)[0] = 112;              // cbSize
-        new Span<int>(sei, 28)[1] = 0x440;            // SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI
         nint wverb = Wide.Of("runas");
         nint wfile = Wide.Of(file);
         nint wargs = Wide.Of(args);
         nint wdir = Wide.Of("");
-        new Span<nint>(sei + 16, 12)[0] = wverb;
-        new Span<nint>(sei + 24, 11)[0] = wfile;
-        new Span<nint>(sei + 32, 10)[0] = wargs;
-        new Span<nint>(sei + 40, 9)[0] = wdir;
-        new Span<int>(sei + 48, 16)[0] = 1;           // SW_SHOWNORMAL
         int code = -1;
-        if (Privileges.WinShellExecuteExW(sei) != 0) {
-            nint hProc = new Span<nint>(sei + 104, 1)[0];
-            if (hProc != 0) {
-                if (wait) {
-                    Privileges.WinWaitForSingleObject(hProc, 0x7FFFFFFF);
-                    nint exit = NativeMemory.Alloc(4);
-                    new Span<int>(exit, 1)[0] = 0;
-                    Privileges.WinGetExitCodeProcess(hProc, exit);
-                    code = new Span<int>(exit, 1)[0];
-                    NativeMemory.Free(exit);
-                } else {
-                    code = 0;
+        try {
+            Span<long> zero = new Span<long>(sei, 14);
+            for (int zi = 0; zi < 14; zi = zi + 1) { zero[zi] = 0; }
+            new Span<int>(sei, 28)[0] = 112;              // cbSize
+            new Span<int>(sei, 28)[1] = 0x440;            // SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI
+            new Span<nint>(sei + 16, 12)[0] = wverb;
+            new Span<nint>(sei + 24, 11)[0] = wfile;
+            new Span<nint>(sei + 32, 10)[0] = wargs;
+            new Span<nint>(sei + 40, 9)[0] = wdir;
+            new Span<int>(sei + 48, 16)[0] = 1;           // SW_SHOWNORMAL
+            if (Privileges.WinShellExecuteExW(sei) != 0) {
+                nint hProc = new Span<nint>(sei + 104, 1)[0];
+                if (hProc != 0) {
+                    try {
+                        if (wait) {
+                            Privileges.WinWaitForSingleObject(hProc, 0x7FFFFFFF);
+                            nint exit = NativeMemory.Alloc(4);
+                            try {
+                                new Span<int>(exit, 1)[0] = 0;
+                                Privileges.WinGetExitCodeProcess(hProc, exit);
+                                code = new Span<int>(exit, 1)[0];
+                            } finally {
+                                NativeMemory.Free(exit);
+                            }
+                        } else {
+                            code = 0;
+                        }
+                    } finally {
+                        Privileges.WinCloseHandle(hProc);
+                    }
                 }
-                Privileges.WinCloseHandle(hProc);
             }
+        } finally {
+            NativeMemory.Free(sei);
+            Wide.Free(wdir);
+            Wide.Free(wargs);
+            Wide.Free(wfile);
+            Wide.Free(wverb);
         }
-        NativeMemory.Free(sei);
-        Wide.Free(wdir);
-        Wide.Free(wargs);
-        Wide.Free(wfile);
-        Wide.Free(wverb);
         return code;
     }
     #endif

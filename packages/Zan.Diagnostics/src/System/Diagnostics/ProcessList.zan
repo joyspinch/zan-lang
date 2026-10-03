@@ -144,27 +144,30 @@ class ProcessList {
         // 完整对齐后的 sizeof，否则 Process32FirstW 会以
         // ERROR_INVALID_DATA 失败。
         nint entry = NativeMemory.Alloc(568);
-        new Span<int>(entry, 2)[0] = 568;   // dwSize
-        bool first = true;
-        int ok = 1;
-        while (ok != 0) {
-            if (first) {
-                ok = ProcessList.WinProcess32FirstW(snap, entry);
-                first = false;
-            } else {
-                ok = ProcessList.WinProcess32NextW(snap, entry);
+        try {
+            new Span<int>(entry, 2)[0] = 568;   // dwSize
+            bool first = true;
+            int ok = 1;
+            while (ok != 0) {
+                if (first) {
+                    ok = ProcessList.WinProcess32FirstW(snap, entry);
+                    first = false;
+                } else {
+                    ok = ProcessList.WinProcess32NextW(snap, entry);
+                }
+                if (ok == 0) { break; }
+                Span<int> w = new Span<int>(entry, 11);
+                ProcessEntry e = new ProcessEntry();
+                e.pid = w[2];
+                e.threads = w[7];
+                e.parentPid = w[8];
+                e.name = ProcessList.BaseName(Wide.Read(entry + 44));
+                list.Add(e);
             }
-            if (ok == 0) { break; }
-            Span<int> w = new Span<int>(entry, 11);
-            ProcessEntry e = new ProcessEntry();
-            e.pid = w[2];
-            e.threads = w[7];
-            e.parentPid = w[8];
-            e.name = ProcessList.BaseName(Wide.Read(entry + 44));
-            list.Add(e);
+        } finally {
+            NativeMemory.Free(entry);
+            ProcessList.WinCloseHandle(snap);
         }
-        NativeMemory.Free(entry);
-        ProcessList.WinCloseHandle(snap);
         return list;
     }
 
@@ -173,14 +176,17 @@ class ProcessList {
         nint proc = ProcessList.WinOpenProcess(0x1000 /*PROCESS_QUERY_LIMITED_INFORMATION*/, 0, pid);
         if (proc == 0) { return -1; }
         nint counters = NativeMemory.Alloc(80);
-        int ok = ProcessList.WinGetProcessMemoryInfo(proc, counters, 80);
         long mem = -1;
-        if (ok != 0) {
-            // PROCESS_MEMORY_COUNTERS (x64): cb(4) pf(4) peakWS(8) ws(8)...
-            mem = new Span<long>(counters + 8, 9)[1];   // WorkingSetSize @ 16
+        try {
+            int ok = ProcessList.WinGetProcessMemoryInfo(proc, counters, 80);
+            if (ok != 0) {
+                // PROCESS_MEMORY_COUNTERS (x64): cb(4) pf(4) peakWS(8) ws(8)...
+                mem = new Span<long>(counters + 8, 9)[1];   // WorkingSetSize @ 16
+            }
+        } finally {
+            NativeMemory.Free(counters);
+            ProcessList.WinCloseHandle(proc);
         }
-        NativeMemory.Free(counters);
-        ProcessList.WinCloseHandle(proc);
         return mem;
     }
 
@@ -190,13 +196,16 @@ class ProcessList {
         if (proc == 0) { return ""; }
         nint buf = NativeMemory.Alloc(512 * 2 + 2);
         nint size = NativeMemory.Alloc(4);
-        new Span<int>(size, 1)[0] = 512;
-        int ok = ProcessList.WinQueryFullProcessImageNameW(proc, 0, buf, size);
         string s = "";
-        if (ok != 0) { s = Wide.Read(buf); }
-        NativeMemory.Free(buf);
-        NativeMemory.Free(size);
-        ProcessList.WinCloseHandle(proc);
+        try {
+            new Span<int>(size, 1)[0] = 512;
+            int ok = ProcessList.WinQueryFullProcessImageNameW(proc, 0, buf, size);
+            if (ok != 0) { s = Wide.Read(buf); }
+        } finally {
+            NativeMemory.Free(buf);
+            NativeMemory.Free(size);
+            ProcessList.WinCloseHandle(proc);
+        }
         return s;
     }
     #endif
