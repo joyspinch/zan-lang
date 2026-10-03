@@ -154,7 +154,10 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   ③ 进程启动严禁直接调用系统的 `popen/system` 拼接裸命令，必须提供直接调用
   `CreateProcessW` / `execve` 并进行参数转义的 argv[] 机制，以杜绝命令注入；
   ④ 同步原语 Mutex 应优先使用用户态轻量化 `SRWLOCK` / `futex`，避免进入内核态
-  创建具名或匿名内核互斥体造成的调度与争用开销。
+  创建具名或匿名内核互斥体造成的调度与争用开销；
+  ⑤ 异步解耦必须彻底独立于 UI/渲染帧：UI 线程专职负责事件分发与绘制，后台任务与 I/O
+  完成后通过 `App.Post` + 线程级 `Wake` 唤醒 UI 消息泵排空回调，严禁后台计算依赖渲染循环推进；
+  跨线程/协程结果传递与协作取消统一使用 `TaskCompletionSource<T>` 与 `CancellationToken` 原语。
 
 - **文本格式包的 BOM 防线（2026-10-01 Yaml/Toml/Xml 跨平台审计踩出）**：
   `File.ReadAllText` 已在文件层剥 UTF-8 BOM，但 `Parse(src)` 收网络报文/

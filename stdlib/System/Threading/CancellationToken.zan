@@ -1,0 +1,121 @@
+using System;
+
+namespace System.Threading;
+
+/// <summary>
+/// 跨平台轻量级取消令牌，提供非阻塞、线程安全且事件驱动的取消通知。
+/// 适用于高并发异步流水线、长时任务协作式中断与网络请求超时。
+/// </summary>
+class CancellationToken {
+    bool isCancellationRequested;
+    Gate waitGate;
+    nint syncLock;
+
+    CancellationToken() {
+        this.isCancellationRequested = false;
+        this.waitGate = new Gate();
+        this.syncLock = Mutex.Create();
+    }
+
+    /// <summary>是否已收到取消请求。</summary>
+    bool IsCancellationRequested {
+        get { return this.isCancellationRequested; }
+    }
+
+    /// <summary>如果已请求取消，抛出异常或中断执行。</summary>
+    void ThrowIfCancellationRequested() {
+        if (this.isCancellationRequested) {
+            throw new Exception("The operation was canceled.");
+        }
+    }
+
+    /// <summary>
+    /// 挂起当前协程直到收到取消请求（完全非阻塞，不占用线程与渲染帧）。
+    /// </summary>
+    async bool WaitHandle() {
+        if (this.isCancellationRequested) { return true; }
+        while (!this.isCancellationRequested) {
+            await this.waitGate.Wait();
+        }
+        return true;
+    }
+
+    /// <summary>触发取消（内部由 CancellationTokenSource 调用）。</summary>
+    void CancelInternal() {
+        Mutex.Lock(this.syncLock);
+        if (this.isCancellationRequested) {
+            Mutex.Unlock(this.syncLock);
+            return;
+        }
+        this.isCancellationRequested = true;
+        Mutex.Unlock(this.syncLock);
+        this.waitGate.Signal();
+    }
+
+    /// <summary>关闭释放底层资源。</summary>
+    void Close() {
+        if (this.waitGate != null) {
+            this.waitGate.Close();
+        }
+        if (this.syncLock != 0) {
+            Mutex.Destroy(this.syncLock);
+            this.syncLock = 0;
+        }
+    }
+}
+
+/// <summary>
+/// 取消令牌源，用于发送取消请求或关联超时取消。
+/// </summary>
+class CancellationTokenSource {
+    CancellationToken token;
+    bool isDisposed;
+
+    CancellationTokenSource() {
+        this.token = new CancellationToken();
+        this.isDisposed = false;
+    }
+
+    /// <summary>创建在指定毫秒后自动触发取消的 CancellationTokenSource。</summary>
+    static CancellationTokenSource CreateAfter(int delayMs) {
+        CancellationTokenSource cts = new CancellationTokenSource();
+        if (delayMs > 0) {
+            Task.Run(delegate () {
+                Thread.Sleep(delayMs);
+                cts.Cancel();
+            });
+        }
+        return cts;
+    }
+
+    /// <summary>获取关联的 CancellationToken。</summary>
+    CancellationToken Token {
+        get { return this.token; }
+    }
+
+    /// <summary>请求取消操作。</summary>
+    void Cancel() {
+        if (this.isDisposed) { return; }
+        this.token.CancelInternal();
+    }
+
+    /// <summary>在指定毫秒后触发取消。</summary>
+    void CancelAfter(int delayMs) {
+        if (this.isDisposed) { return; }
+        if (delayMs <= 0) {
+            this.Cancel();
+            return;
+        }
+        Task.Run(delegate () {
+            Thread.Sleep(delayMs);
+            this.Cancel();
+        });
+    }
+
+    /// <summary>释放关联资源。</summary>
+    void Dispose() {
+        if (this.isDisposed) { return; }
+        this.isDisposed = true;
+        this.token.Close();
+    }
+}
