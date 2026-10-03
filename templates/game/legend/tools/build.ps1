@@ -10,7 +10,7 @@ New-Item -ItemType Directory -Force -Path $Output | Out-Null
 $sources = @(
     'main.zan', 'Spec.zan', 'Tables.zan', 'Data.zan', 'Game.zan',
     'CombatFx.zan', 'BurstDrop.zan', 'Audio.zan',
-    'Save.zan', 'Net.zan', 'Shell.zan', 'PageMap.zan', 'PageMapInner.zan',
+    'Save.zan', 'NetModels.zan', 'Net.zan', 'Shell.zan', 'PageMap.zan', 'PageMapInner.zan',
     'PageRedPack.zan', 'LoginWin.zan',
     'PageArena.zan', 'PageBag.zan', 'PageScene.zan', 'PageBossHome.zan', 'PageEscort.zan', 'PageGuild.zan', 'PageRank.zan', 'PageMarket.zan', 'PageMail.zan', 'PageAch.zan', 'PageRecycle.zan', 'PageTujian.zan', 'PageBasha.zan', 'PageAltar.zan', 'PageElement.zan', 'PageTreasure.zan', 'PageMaster.zan', 'PageHelp.zan', 'PageSettings.zan', 'PageSmithy.zan', 'PageCity.zan', 'PageStar.zan', 'PageSupreme.zan', 'PageTower.zan', 'PageLord.zan', 'PageShop.zan', 'PageTitle.zan', 'Slots.zan', 'TableUi.zan'
 ) | ForEach-Object { "$template/src/$_" }
