@@ -154,9 +154,8 @@ static void link_cap_exceeded(const char *what, int cap) {
 /* Append to a system() link command with a truncation check. Link lines are
  * built by repeated snprintf(cmd + strlen(cmd), ...) appends; a silent
  * truncation dropped the tail arguments (the libc --end-group, crtn.o) and
- * surfaced later as baffling undefined symbols or a broken binary — the
- * command only overflowed on inputs near the cap, so it looked like a
- * program bug (B-ID76). Report and exit, like link_cap_exceeded. */
+ * surfaced later as baffling undefined symbols or a broken binary.
+ * Report and exit, like link_cap_exceeded. */
 static void cmd_appendf(char *cmd, size_t cap, const char *fmt, ...) {
     size_t cur = strlen(cmd);
     int need = -1;
@@ -1158,7 +1157,7 @@ static int pi_filter_active = 0;
  * user shadowing. */
 static int pi_seed_stdlib_input = 0;
 /* 1 while seeding a stdlib-authored source: flag helpers also stamp
- * flagged_stdlib, the repair trigger's source gate (B-ID87). Set by the
+ * flagged_stdlib, the repair trigger's source gate. Set by the
  * parse loops around pi_seed_parsed_unit/pi_seed_source, never nested. */
 static int pi_seeding_stdlib = 0;
 /* 1 while the repair walk metadata-scans a file: pi_note_using must not
@@ -1173,7 +1172,7 @@ typedef struct pi_name {
                                  * such mentions trigger the repair walk,
                                  * whose whole point is that stdlib code
                                  * must bind to the real declaration of
-                                 * what it names (B-ID87); user mentions
+                                 * what it names; user mentions
                                  * keep today's fallback/inline behavior */
     int user_decl;              /* declared as a GLOBAL-scope top-level type
                                  * by an input file: unqualified mentions
@@ -1506,8 +1505,7 @@ static void pi_note_using(pi_file_t *f, const char *subdir) {
     if (!subdir[0]) return;
     /* The repair walk scans files with pi_scan_file purely to read their
      * top-level names; reaching their using-dirs here would widen the reach
-     * set to the whole tree and join every package (B-ID87's first cut
-     * compiled a 13-file hello-world as 122 files). */
+     * set to the whole tree and join every package. */
     if (pi_repair_scanning) return;
     if (!pi_reserve((void *)&f->usings, f->using_count, &f->using_cap,
                     sizeof(char *)))
@@ -2172,8 +2170,8 @@ static void pi_seed_source(const char *source, size_t len) {
                              * TaskJoin rewrite (desugar_task_join): flag
                              * TaskJoin when this bare `Task` is followed by
                              * `.WhenAll`/`.WhenAny`. The chain-based mirror
-                             * further below covers the same shape (A312 gave
-                             * the chain a lifetime); this lookahead is kept
+                             * further below covers the same shape;
+                             * this lookahead is kept
                              * as the shape-only check, independent of whether
                              * `Task` sits under a namespace root. */
                             if (name->len == 4 &&
@@ -2737,7 +2735,7 @@ static int pi_close_once(const char *stdlib_root) {
  * binder's fallback still resolves it, and irgen_call's inline fopen copy
  * fires instead of stdlib File.ReadAllText (no BOM strip, no embedded
  * fallback, abort instead of FileNotFoundException) -- chosen by whichever
- * files the HOST's using set pulled, not by the call site (B-ID87). When
+ * files the HOST's using set pulled, not by the call site. When
  * the closure settles with such a name, reach every stdlib directory whose
  * subtree holds a .zan file once and let the live-name gate re-run:
  * inclusion still requires a real mention, so the cost is one metadata walk
@@ -2762,9 +2760,8 @@ static int pi_name_declared_by_scanned(pi_name_t *n) {
 
 /* 1 when some name flagged by a stdlib-authored source is declared by no
  * scanned file: its declaring directory was never reached, so stdlib code
- * would bind it through the binder's fallback instead of its declaration
- * -- the switching-implementations defect (B-ID87). User-only mentions
- * don't count: their fallback/inline behavior is today's contract. */
+ * would bind it through the binder's fallback instead of its declaration.
+ * User-only mentions don't count: their fallback/inline behavior is today's contract. */
 static int pi_unsatisfied_live_name(void) {
     pi_unsatisfied_count = 0;
     for (unsigned b = 0; b < PI_BUCKETS; b++)
@@ -5157,7 +5154,7 @@ int main(int argc, char **argv) {
             if (!changed && !fresh) {
                 /* A flagged name nothing scanned declares means some parsed
                  * file referenced a stdlib type across a directory no
-                 * `using` names -- widen the reach set once (B-ID87, see
+                 * `using` names -- widen the reach set once (see
                  * pi_reach_all_dirs) and re-run; the live-name gate still
                  * decides inclusion. */
                 if (!pi_repair_done && pi_unsatisfied_live_name()) {
@@ -5263,8 +5260,8 @@ int main(int argc, char **argv) {
                 int fresh = pi_append_included(&input_files, &input_count,
                                                &input_cap);
                 if (!changed && !fresh) {
-                    /* Same repair round as the main parse loop's closure
-                     * (B-ID87): generator texts can name stdlib types no
+                    /* Same repair round as the main parse loop's closure:
+                     * generator texts can name stdlib types no
                      * using-directive reaches. */
                     if (!pi_repair_done && pi_unsatisfied_live_name()) {
                         pi_repair_done = 1;
@@ -7913,13 +7910,6 @@ int main(int argc, char **argv) {
             for (int d = 0; d < cross_archive_count; d++) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", cross_archives[d]);
             }
-            for (int li = 0; li < static_driver_lib_count; li++) {
-                cmd_appendf(cmd, sizeof(cmd), " %s",
-                         static_driver_libs[li]);
-            }
-            { cmd_appendf(cmd, sizeof(cmd),
-                       " --end-group \"%s/crtn.o\"", sys); }
-
             /* FreeType + fontconfig + expat for the GUI text engine
              * (gui_runtime_font.c's desktop branch): linked only when
              * staged next to the other sysroot objects, mirroring the
@@ -7938,6 +7928,12 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+            for (int li = 0; li < static_driver_lib_count; li++) {
+                cmd_appendf(cmd, sizeof(cmd), " %s",
+                         static_driver_libs[li]);
+            }
+            { cmd_appendf(cmd, sizeof(cmd),
+                       " --end-group \"%s/crtn.o\"", sys); }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_OHOS) {
             /* Cross-link an OpenHarmony executable with ld.lld against a
@@ -8145,10 +8141,10 @@ int main(int argc, char **argv) {
                          " --end-group \"%s/libc.so\" \"%s/libm.so\""
                          " \"%s/liblog.so\" \"%s/libdl.so\""
                          " \"%s/libandroid.so\" \"%s/libEGL.so\""
-                         " \"%s/libGLESv2.so\""
+                         " \"%s/libGLESv2.so\" \"%s/libaaudio.so\""
                          " \"%s/crtend_android.o\""
                          " \"%s/libclang_rt.builtins.a\"",
-                         sys, sys, sys, sys, sys, sys, sys, sys, sys);
+                         sys, sys, sys, sys, sys, sys, sys, sys, sys, sys);
             } else {
                 cmd_appendf(cmd, sizeof(cmd),
                          " --end-group \"%s/libdl.a\" \"%s/crtend_android.o\""
@@ -8302,6 +8298,8 @@ int main(int argc, char **argv) {
             }
             { cmd_appendf(cmd, sizeof(cmd),
                        " --end-group \"%s/crtend.o\"", syslib); }
+            if (getenv("ZAN_VERBOSE_LINK"))
+                fprintf(stderr, "[link win] %s\n", cmd);
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_WASI) {
             /* Link a WASI command module with wasm-ld against the bundled
@@ -9287,7 +9285,7 @@ int main(int argc, char **argv) {
             /* default package/label from the input file name unless set.
              * 256 bytes to match proj_android_package/label; over-long CLI
              * values fail loudly here instead of truncating into a
-             * wrong-but-plausible manifest (A349). */
+             * wrong-but-plausible manifest. */
             char pkg[256], lbl[256];
             if (apk_package) {
                 if (strlen(apk_package) >= sizeof(pkg)) {
