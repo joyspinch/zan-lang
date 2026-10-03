@@ -562,8 +562,6 @@ def do_verify(stale_entries):
 
 def do_rebuild():
     import os, glob, shutil
-    with open("_scratch/check_result.txt", "a", encoding="utf-8") as f:
-        f.write("do_rebuild started\n")
     zig = shutil.which("zig")
     if not zig:
         for c in [
@@ -657,14 +655,10 @@ def do_rebuild():
                 subprocess.run(base_cmd + ["-std=c11", "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME", "-I", "src/common", "-c", f"{rt}/zan_inflate.c", "-o", f"{outdir}/zan_inflate.o"], check=True)
 
     print("Rebuild completed successfully.")
-    with open("_scratch/check_result.txt", "a", encoding="utf-8") as f:
-        f.write("do_rebuild finished\n")
     return 0
 
 
 def main():
-    with open("_scratch/check_result.txt", "a", encoding="utf-8") as f:
-        f.write("main called with: " + " ".join(sys.argv) + "\n")
     if "--rebuild" in sys.argv:
         return do_rebuild()
     group = "all"
@@ -710,8 +704,6 @@ def main():
         print(f"(verify verdicts above replace the date findings)")
     if stale:
         print(f"\n{stale} artifact(s) need a rebuild on their own platform.")
-    with open("_scratch/check_result.txt", "w", encoding="utf-8") as f:
-        f.write(f"stale_count={stale}\n")
     return 1 if stale else 0
 
 
