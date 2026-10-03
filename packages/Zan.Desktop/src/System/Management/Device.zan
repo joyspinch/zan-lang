@@ -269,48 +269,55 @@ class Device {
         // SP_DEVINFO_DATA 在 Win64 上为 32 字节：DWORD cbSize、GUID、DWORD
         // DevInst、4 字节对齐、ULONG_PTR Reserved。
         nint data = NativeMemory.Alloc(32);
-        int index = 0;
-        bool done = false;
-        while (!done) {
-            NativeMemory.Fill(data, 0, 32);
-            new Span<int>(data, 1)[0] = 32;
-            if (Device.SetupDiEnumDeviceInfo(devs, index, data) == 0) {
-                done = true;
-            } else {
-                DeviceInfo d = new DeviceInfo();
-                d.instanceId = Device.InstanceId(devs, data);
-                d.classGuid = Device.StringProperty(devs, data, 8);   // SPDRP_CLASSGUID
-                d.className = Device.StringProperty(devs, data, 7);   // SPDRP_CLASS
-                d.friendlyName = Device.StringProperty(devs, data, 12); // SPDRP_FRIENDLYNAME
-                d.description = Device.StringProperty(devs, data, 0); // SPDRP_DEVICEDESC
-                d.manufacturer = Device.StringProperty(devs, data, 11); // SPDRP_MFG
-                d.hardwareIds = Device.MultiStringProperty(devs, data, 1); // SPDRP_HARDWAREID
-                list.Add(d);
-                index = index + 1;
+        try {
+            int index = 0;
+            bool done = false;
+            while (!done) {
+                NativeMemory.Fill(data, 0, 32);
+                new Span<int>(data, 1)[0] = 32;
+                if (Device.SetupDiEnumDeviceInfo(devs, index, data) == 0) {
+                    done = true;
+                } else {
+                    DeviceInfo d = new DeviceInfo();
+                    d.instanceId = Device.InstanceId(devs, data);
+                    d.classGuid = Device.StringProperty(devs, data, 8);   // SPDRP_CLASSGUID
+                    d.className = Device.StringProperty(devs, data, 7);   // SPDRP_CLASS
+                    d.friendlyName = Device.StringProperty(devs, data, 12); // SPDRP_FRIENDLYNAME
+                    d.description = Device.StringProperty(devs, data, 0); // SPDRP_DEVICEDESC
+                    d.manufacturer = Device.StringProperty(devs, data, 11); // SPDRP_MFG
+                    d.hardwareIds = Device.MultiStringProperty(devs, data, 1); // SPDRP_HARDWAREID
+                    list.Add(d);
+                    index = index + 1;
+                }
             }
+        } finally {
+            NativeMemory.Free(data);
+            Device.SetupDiDestroyDeviceInfoList(devs);
         }
-        NativeMemory.Free(data);
-        Device.SetupDiDestroyDeviceInfoList(devs);
         return list;
     }
 
     /// 两段式读取设备实例 ID（先取所需字符数再读缓冲）；失败返回 ""。
     static string InstanceId(nint devs, nint data) {
         nint required = NativeMemory.Alloc(4);
-        new Span<int>(required, 1)[0] = 0;
-        Device.SetupDiGetDeviceInstanceIdW(devs, data, 0, 0, required);
-        int chars = new Span<int>(required, 1)[0];
-        if (chars <= 0) {
-            NativeMemory.Free(required);
-            return "";
-        }
-        nint buffer = NativeMemory.Alloc(chars * 2 + 2);
-        int ok = Device.SetupDiGetDeviceInstanceIdW(
-            devs, data, buffer, chars, required);
         string text = "";
-        if (ok != 0) { text = Wide.Read(buffer); }
-        NativeMemory.Free(buffer);
-        NativeMemory.Free(required);
+        try {
+            new Span<int>(required, 1)[0] = 0;
+            Device.SetupDiGetDeviceInstanceIdW(devs, data, 0, 0, required);
+            int chars = new Span<int>(required, 1)[0];
+            if (chars > 0) {
+                nint buffer = NativeMemory.Alloc(chars * 2 + 2);
+                try {
+                    int ok = Device.SetupDiGetDeviceInstanceIdW(
+                        devs, data, buffer, chars, required);
+                    if (ok != 0) { text = Wide.Read(buffer); }
+                } finally {
+                    NativeMemory.Free(buffer);
+                }
+            }
+        } finally {
+            NativeMemory.Free(required);
+        }
         return text;
     }
 

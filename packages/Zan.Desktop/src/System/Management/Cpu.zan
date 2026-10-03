@@ -83,13 +83,17 @@ class Cpu {
     static int LogicalCores() {
         #if WINDOWS
         nint info = NativeMemory.Alloc(64);
-        Cpu.WinGetSystemInfo(info);
-        // SYSTEM_INFO (x64): arch(4) pageSize(4) minAddr(8) maxAddr(8)
-        // procMask(8) numberOfProcessors(4 @ offset 32) type(4) granularity(4)
-        // level(2) revision(2).
-        Span<int> w = new Span<int>(info, 16);
-        int n = w[8];
-        NativeMemory.Free(info);
+        int n = 1;
+        try {
+            Cpu.WinGetSystemInfo(info);
+            // SYSTEM_INFO (x64): arch(4) pageSize(4) minAddr(8) maxAddr(8)
+            // procMask(8) numberOfProcessors(4 @ offset 32) type(4) granularity(4)
+            // level(2) revision(2).
+            Span<int> w = new Span<int>(info, 16);
+            n = w[8];
+        } finally {
+            NativeMemory.Free(info);
+        }
         return n;
         #elif LINUX
         return Cpu.CountCpuLines();
@@ -106,15 +110,20 @@ class Cpu {
         #if WINDOWS
         nint t1 = NativeMemory.Alloc(24);
         nint t2 = NativeMemory.Alloc(24);
-        Cpu.WinGetSystemTimes(t1);
-        SleepW(300);
-        Cpu.WinGetSystemTimes(t2);
-        Span<long> a = new Span<long>(t1, 3);
-        Span<long> b = new Span<long>(t2, 3);
-        long idle = b[0] - a[0];
-        long busy = (b[1] + b[2]) - (a[1] + a[2]);
-        NativeMemory.Free(t1);
-        NativeMemory.Free(t2);
+        long idle = 0;
+        long busy = 0;
+        try {
+            Cpu.WinGetSystemTimes(t1);
+            SleepW(300);
+            Cpu.WinGetSystemTimes(t2);
+            Span<long> a = new Span<long>(t1, 3);
+            Span<long> b = new Span<long>(t2, 3);
+            idle = b[0] - a[0];
+            busy = (b[1] + b[2]) - (a[1] + a[2]);
+        } finally {
+            NativeMemory.Free(t1);
+            NativeMemory.Free(t2);
+        }
         if (busy <= 0) { return 0; }
         long pct = (busy - idle) * 100 / busy;
         if (pct < 0) { return 0; }
@@ -175,25 +184,34 @@ class Cpu {
     static string RegString(nint root, string subKey, string name) {
         nint wkey = Wide.Of(subKey);
         nint hk = NativeMemory.Alloc(8);
-        int r = Cpu.RegOpenKeyExW(root, wkey, 0, 0x20019 /*KEY_READ*/, hk);
-        Wide.Free(wkey);
-        if (r != 0) { NativeMemory.Free(hk); return ""; }
-        nint hKey = new Span<nint>(hk, 1)[0];
+        nint hKey = 0;
+        int r = -1;
+        try {
+            r = Cpu.RegOpenKeyExW(root, wkey, 0, 0x20019 /*KEY_READ*/, hk);
+            if (r == 0) { hKey = new Span<nint>(hk, 1)[0]; }
+        } finally {
+            Wide.Free(wkey);
+            NativeMemory.Free(hk);
+        }
+        if (r != 0 || hKey == 0) { return ""; }
+
         nint wname = Wide.Of(name);
         nint buf = NativeMemory.Alloc(1024);
         nint size = NativeMemory.Alloc(4);
-        new Span<int>(size, 1)[0] = 512;
-        r = Cpu.RegQueryValueExW(hKey, wname, 0, 0, buf, size);
         string s = "";
-        if (r == 0) {
-            int bytes = new Span<int>(size, 1)[0];
-            if (bytes > 2) { s = Wide.Read(buf); }
+        try {
+            new Span<int>(size, 1)[0] = 512;
+            r = Cpu.RegQueryValueExW(hKey, wname, 0, 0, buf, size);
+            if (r == 0) {
+                int bytes = new Span<int>(size, 1)[0];
+                if (bytes > 2) { s = Wide.Read(buf); }
+            }
+        } finally {
+            NativeMemory.Free(buf);
+            NativeMemory.Free(size);
+            Wide.Free(wname);
+            Cpu.RegCloseKey(hKey);
         }
-        NativeMemory.Free(buf);
-        NativeMemory.Free(size);
-        Wide.Free(wname);
-        Cpu.RegCloseKey(hKey);
-        NativeMemory.Free(hk);
         return s;
     }
 
@@ -201,22 +219,31 @@ class Cpu {
     static int RegDword(nint root, string subKey, string name) {
         nint wkey = Wide.Of(subKey);
         nint hk = NativeMemory.Alloc(8);
-        int r = Cpu.RegOpenKeyExW(root, wkey, 0, 0x20019 /*KEY_READ*/, hk);
-        Wide.Free(wkey);
-        if (r != 0) { NativeMemory.Free(hk); return 0; }
-        nint hKey = new Span<nint>(hk, 1)[0];
+        nint hKey = 0;
+        int r = -1;
+        try {
+            r = Cpu.RegOpenKeyExW(root, wkey, 0, 0x20019 /*KEY_READ*/, hk);
+            if (r == 0) { hKey = new Span<nint>(hk, 1)[0]; }
+        } finally {
+            Wide.Free(wkey);
+            NativeMemory.Free(hk);
+        }
+        if (r != 0 || hKey == 0) { return 0; }
+
         nint wname = Wide.Of(name);
         nint data = NativeMemory.Alloc(4);
         nint size = NativeMemory.Alloc(4);
-        new Span<int>(size, 1)[0] = 4;
-        r = Cpu.RegQueryValueExW(hKey, wname, 0, 0, data, size);
         int v = 0;
-        if (r == 0) { v = new Span<int>(data, 1)[0]; }
-        NativeMemory.Free(data);
-        NativeMemory.Free(size);
-        Wide.Free(wname);
-        Cpu.RegCloseKey(hKey);
-        NativeMemory.Free(hk);
+        try {
+            new Span<int>(size, 1)[0] = 4;
+            r = Cpu.RegQueryValueExW(hKey, wname, 0, 0, data, size);
+            if (r == 0) { v = new Span<int>(data, 1)[0]; }
+        } finally {
+            NativeMemory.Free(data);
+            NativeMemory.Free(size);
+            Wide.Free(wname);
+            Cpu.RegCloseKey(hKey);
+        }
         return v;
     }
     #endif
@@ -230,17 +257,20 @@ class Cpu {
     static string SysctlString(string name) {
         nint buf = NativeMemory.Alloc(256);
         nint len = NativeMemory.Alloc(8);
-        new Span<long>(len, 1)[0] = 256;
         string s = "";
-        if (Cpu.SysctlByName(name, buf, len, 0, 0) == 0) {
-            int n = 0;
-            while (n < 256 && new Span<byte>(buf + n, 1)[0] != 0) {
-                n = n + 1;
+        try {
+            new Span<long>(len, 1)[0] = 256;
+            if (Cpu.SysctlByName(name, buf, len, 0, 0) == 0) {
+                int n = 0;
+                while (n < 256 && new Span<byte>(buf + n, 1)[0] != 0) {
+                    n = n + 1;
+                }
+                if (n > 0) { s = NativeMemory.GetString(buf, 0, n); }
             }
-            if (n > 0) { s = NativeMemory.GetString(buf, 0, n); }
+        } finally {
+            NativeMemory.Free(buf);
+            NativeMemory.Free(len);
         }
-        NativeMemory.Free(buf);
-        NativeMemory.Free(len);
         return s;
     }
 
@@ -248,14 +278,17 @@ class Cpu {
     static int SysctlInt32(string name) {
         nint buf = NativeMemory.Alloc(4);
         nint len = NativeMemory.Alloc(8);
-        new Span<long>(len, 1)[0] = 4;
         int v = 0;
-        if (Cpu.SysctlByName(name, buf, len, 0, 0) == 0
-            && new Span<long>(len, 1)[0] == 4) {
-            v = new Span<int>(buf, 1)[0];
+        try {
+            new Span<long>(len, 1)[0] = 4;
+            if (Cpu.SysctlByName(name, buf, len, 0, 0) == 0
+                && new Span<long>(len, 1)[0] == 4) {
+                v = new Span<int>(buf, 1)[0];
+            }
+        } finally {
+            NativeMemory.Free(buf);
+            NativeMemory.Free(len);
         }
-        NativeMemory.Free(buf);
-        NativeMemory.Free(len);
         return v;
     }
 
@@ -263,14 +296,17 @@ class Cpu {
     static long SysctlInt64(string name) {
         nint buf = NativeMemory.Alloc(8);
         nint len = NativeMemory.Alloc(8);
-        new Span<long>(len, 1)[0] = 8;
         long v = 0;
-        if (Cpu.SysctlByName(name, buf, len, 0, 0) == 0
-            && new Span<long>(len, 1)[0] == 8) {
-            v = new Span<long>(buf, 1)[0];
+        try {
+            new Span<long>(len, 1)[0] = 8;
+            if (Cpu.SysctlByName(name, buf, len, 0, 0) == 0
+                && new Span<long>(len, 1)[0] == 8) {
+                v = new Span<long>(buf, 1)[0];
+            }
+        } finally {
+            NativeMemory.Free(buf);
+            NativeMemory.Free(len);
         }
-        NativeMemory.Free(buf);
-        NativeMemory.Free(len);
         return v;
     }
 
@@ -280,13 +316,16 @@ class Cpu {
         long[] r = new long[5];
         nint buf = NativeMemory.Alloc(40);
         nint len = NativeMemory.Alloc(8);
-        new Span<long>(len, 1)[0] = 40;
-        if (Cpu.SysctlByName("kern.cp_time", buf, len, 0, 0) == 0) {
-            Span<long> q = new Span<long>(buf, 5);
-            for (int i = 0; i < 5; i = i + 1) { r[i] = q[i]; }
+        try {
+            new Span<long>(len, 1)[0] = 40;
+            if (Cpu.SysctlByName("kern.cp_time", buf, len, 0, 0) == 0) {
+                Span<long> q = new Span<long>(buf, 5);
+                for (int i = 0; i < 5; i = i + 1) { r[i] = q[i]; }
+            }
+        } finally {
+            NativeMemory.Free(buf);
+            NativeMemory.Free(len);
         }
-        NativeMemory.Free(buf);
-        NativeMemory.Free(len);
         return r;
     }
     #endif
