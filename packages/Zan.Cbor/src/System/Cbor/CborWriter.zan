@@ -4,17 +4,24 @@ using System.Text;
 namespace System.Cbor;
 
 /// <summary>
-/// CBOR 编码原语（RFC 8949）：确定长度（definite）编码，argument 走
-/// 规范最短形态（additional info 0-23 直接、24-27 定宽）。负整数按
+/// CBOR 编码原语（RFC 8949）：常规项确定长度（definite）编码，argument
+/// 走规范最短形态（additional info 0-23 直接、24-27 定宽）。负整数按
 /// major type 1（值 = -1 - n，n = ~v 免溢出）。字节缓冲倍增扩容整块
-/// NativeMemory.Copy 搬移，数值大端。
+/// NativeMemory.Copy 搬移，数值大端。超过 ChunkBytes 的 text/byte 串
+/// 写成 indefinite 分片（0x7F/0x5F + 定长块 + 0xFF）——读侧
+/// TakeChunks 原生支持，且对有更小单-item 限的对端更友好；阈值以下
+/// 保持 definite，输出与历史逐字节一致。
 /// </summary>
 class CborWriter {
     /// 写侧总量上限：对齐读侧 512MB 载荷上限，超限抛 CborException。
     /// 容量算术全程 64 位——旧的 int 算术在 len+extra ≥ 2^31 时首判据
-    /// 回绕误判"有空间"直接写穿，倍增循环在 >1GB 时同样回绕成死循环
-    /// （indefinite 分片绕开此限是后续台账项，本轮不做）。
+    /// 回绕误判"有空间"直接写穿，倍增循环在 >1GB 时同样回绕成死循环。
+    /// 分片不改此限（缓冲仍整体驻内存），它解决的是形态正确性。
     static long MaxTotalBytes = 536870912;
+
+    /// text/byte 串分片阈值：超过即写 indefinite 分片，每块 ≤ 此值。
+    /// 64MB 在 512MB 单-item 限内留足余量，块头开销可忽略。
+    static long ChunkBytes = 67108864;
 
     byte[] buf;
     int len;
@@ -95,21 +102,47 @@ class CborWriter {
     /// 负整数（major 1，值 = -1 - n；n = ~v 对 long.MinValue 也不溢出）。
     void WriteNeg(long v) { Head(1, ~v); }
 
-    /// text string（major 3）。
+    /// text string（major 3）；超过 ChunkBytes 写 indefinite 分片。
     void WriteString(string s) {
         byte[] b = Encoding.GetBytes(s);
+        if (b.Length > CborWriter.ChunkBytes) {
+            Chunked(3, b);
+            return;
+        }
         Head(3, b.Length);
         EnsureRoom(b.Length);
         NativeMemory.Copy((nint)buf + len, (nint)b, b.Length);
         len = len + b.Length;
     }
 
-    /// byte string（major 2）。
+    /// byte string（major 2）；超过 ChunkBytes 写 indefinite 分片。
     void WriteBytes(byte[] b) {
+        if (b.Length > CborWriter.ChunkBytes) {
+            Chunked(2, b);
+            return;
+        }
         Head(2, b.Length);
         EnsureRoom(b.Length);
         NativeMemory.Copy((nint)buf + len, (nint)b, b.Length);
         len = len + b.Length;
+    }
+
+    /// indefinite 分片主体：起始字节（major|31）、逐块定长编码、
+    /// break（0xFF）。等长分块，仅末块可短。
+    void Chunked(int major, byte[] b) {
+        int m = major << 5;
+        RawU8(m | 31);
+        int off = 0;
+        while (off < b.Length) {
+            int n = b.Length - off;
+            if (n > (int)CborWriter.ChunkBytes) { n = (int)CborWriter.ChunkBytes; }
+            Head(major, n);
+            EnsureRoom(n);
+            NativeMemory.Copy((nint)buf + len, (nint)b + off, n);
+            len = len + n;
+            off = off + n;
+        }
+        RawU8(255);
     }
 
     /// 数组头（major 4，确定长度）。

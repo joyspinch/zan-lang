@@ -93,8 +93,14 @@
   worker 全排队（Windows 有分片，POSIX 无）；(d) g_co_activity/g_co_outstanding 全局单点
   缓存行 RMW（spawn k=32 残留争用点）。需 POSIX reactor 分片设计，非低成本，单独批次。
   （b/c/e/f 已随 14f4f1f8 闭账。）
-- [ ] **B-ID78 残项（P3）四二进制包写侧超长分片**——CBOR indefinite/str 分片本轮未做
-  （49b2b5c9 提交信息已记）；写侧 512MB 总量上限已立，分片是超限后的正确形态问题。
+- [x] **B-ID78 残项（P3）四二进制包写侧超长分片**——闭账：CBOR 是四包中唯一有分片
+  形态的格式——CborWriter 超过 ChunkBytes（64MB）的 text/byte 串写 indefinite 分片
+  （0x7F/0x5F + 等长定长块 + 0xFF，读侧 TakeChunks 原生支持，对单-item 限更小的对端
+  友好）；阈值以下输出与历史逐字节一致。MsgPack/BSON/Proto 的 str/bin 均为定长头、
+  格式无分片形态，512MB 上限即终态（大载荷应用层拆分），写器注释已立约。验证：
+  cbor78 探针 10 项全过（64MB 边界仍 definite、64MB+1 转 indefinite、2*64MB+5 三块
+  64/64/5 与 64MB+3 两块 64/3 的结构断言、Cbor.Decode 回环逐位抽样、小串 IETF 金样
+  字节一致）；cbor_values 金样 diff 一致。
 - [ ] **B-ID79 残项（P3）Csv 公式注入**——（=`+-@ 开头单元格不中和，Excel 执行）行为未改，
   Csv 类文档已补安全警告（2824550d）；根治需导出侧中和选项，涉 API 面，待议。
 - [ ] **B-ID80 残项（P2）**——(d) CSP：框架视图 10+ 处内联 style=、1 处内联 script、生成器
