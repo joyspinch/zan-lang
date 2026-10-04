@@ -246,7 +246,7 @@ st, html, _ = http("/forgot/reset", data={
     "newpass2": "pass123"})
 ok("错误次数过多" in html, "lockout applies even to correct answer")
 
-# 登录密码错限频（账号级，A303 建议 ④）：mallory 连错 10 次后锁定，
+# 登录密码错限频（账号级）：mallory 连错 10 次后锁定，
 # 正确密码也被拒到窗口结束；IP 限流（5/5s）之上叠加的账号维度闸门。
 # mallory 的登录走 TCP：op login 不限 IP（有身份前的按 op 限流只对
 # HTTP），计数落在 game_account 行上。
@@ -843,7 +843,7 @@ ok(m is not None and "push" in m, "attach claims push channel for http session")
 j = api("/api/game/login", {"user": "e2e_push", "pass": "pass123"})
 ok(j.get("ok") == 1 and j.get("token") != tok, "relogin mints a fresh token")
 tok2 = j["token"]
-# relogin revokes the old token immediately (A303 建议 ①)：旧 token 的
+# relogin revokes the old token immediately：旧 token 的
 # HTTP op 拒绝（登录已过期）；新 token 正常。attach 侧由下一段
 # 「old push channel receives relogin kick」+ 拒绝形态覆盖。
 j = api("/api/game/enter", {"op": "enter", "token": tok, "realm": 1})

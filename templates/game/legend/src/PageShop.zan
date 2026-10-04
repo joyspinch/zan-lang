@@ -89,9 +89,9 @@ partial class LegendApp {
     void ShopBuy(int i) {
         int n = ShopCount(i);
         /* 在线：服务端 items 目录（金价计费、直接入背包）。
-           离线：本地 shop.csv 语义（reward 发放）。 */
-        JsonValue live = net.Self() != null ? net.ShopAt(i) : null;
-        if (live != null) { net.ShopBuyItem(live.Int("id", 0), n); return; }
+           离线：本地 shop.csv 语义（reward 发放）。优先使用强类型 ShopItem。 */
+        ShopItem si = net.Self() != null ? net.TypedShopAt(i) : null;
+        if (si != null) { net.ShopBuyItem(si.Id, n); return; }
         if (i < 0 || i >= GameTables.current.shop.rows.Count) { return; }
         for (int k = 0; k < n; k = k + 1) { g.Shop(i); }
         Rebuild();
@@ -163,20 +163,16 @@ partial class LegendApp {
         }
 
         /* 页脚贴页底：左「元宝：N」、右「兑换元宝」+ 标准库 Pagination。
-           必须走 DockBottom（dock=2）：停靠容器**先摆 dock 1..4 再摆 5**，
-           页脚若像普通行那样 With 追加（dock=1），会被摆到卡阵下沿的正下方
-           （实测：页脚落在卡阵下 15 设备、页底空一大块），加个 Grow 的撑条
-           也救不回来——撑条是 dock=5，只会被排到最后。先 Add 的 dock=2 先
-           占底，所以「页脚之下那条底缝」要在页脚之前 Add。 */
+           走 AnchorBottom */
         Panel footPad = Panel.Column(); footPad.Prefer(0, Spec.ShopFootPadB());
-        footPad.DockBottom(); body.Add(footPad);
+        footPad.AnchorBottom(); body.Add(footPad);
         Panel foot = Panel.Row(); foot.Class = "shop-foot";
         foot.Pad(0); foot.Gap(Spec.ShopCurrGap());
         foot.Prefer(0, Spec.ShopFootH());
-        foot.DockBottom(); body.Add(foot);
+        foot.AnchorBottom(); body.Add(foot);
         foot.Padding(0, Spec.ShopFootPadR(), 0, Spec.ShopFootPadL());
-        JsonValue st = net.Self();
-        int yuan = st != null ? st.Int("yuan", 0) : 0;
+        PlayerState ps = net.SelfState();
+        int yuan = ps != null ? Convert.ToInt32(ps.Ingots) : 0;
         Label wallet = Text("元宝：" + Rules.N(yuan), "shop-wallet", 0);
         wallet.Prefer(0, Spec.ShopFootH()); foot.With(wallet);
         Panel ffill = Panel.Row(); ffill.Class = "bag-fill"; foot.With(ffill);
@@ -195,11 +191,12 @@ partial class LegendApp {
         foot.With(pg);
     }
 
-    /// 服务端目录卡：道具号取图、金价胶囊、购买走 buy op。
-    Panel ShopLiveCard(JsonValue row, int slotIdx) {
-        int itemId = row.Int("id", 0);
-        int price = row.Int("price", 0);
+    Panel ShopLiveItemCard(ShopItem item, int slotIdx) {
+        if (item == null) { return ShopCardItem(0, 0, "", slotIdx); }
+        return ShopCardItem(item.Id, item.Price, item.Name, slotIdx);
+    }
 
+    Panel ShopCardItem(int itemId, int price, string name, int slotIdx) {
         Panel card = Panel.Row(); card.Class = "shop-card";
         card.Pad(0); card.Gap(Spec.ShopIconGap());
         card.Prefer(Spec.ShopCardW(), Spec.ShopCardH());
@@ -208,8 +205,8 @@ partial class LegendApp {
 
         Panel box = Panel.Row(); box.Class = "shop-icon";
         box.Pad(Spec.Px(1)); box.Prefer(Spec.ShopIconW(), Spec.ShopIconH());
-        Image ic = new Image(ItemArtById(itemId), row.Str("name", ""), "contain");
-        ic.DockFill(); box.Add(ic);
+        Image ic = new Image(ItemArtById(itemId), name, "contain");
+        ic.Grow(); box.Add(ic);
         card.With(box);
 
         Panel col = Panel.Column(); col.Pad(0); col.Gap(Spec.ShopRowGap()); col.Grow(); card.With(col);
@@ -217,7 +214,7 @@ partial class LegendApp {
         Panel nameRow = Panel.Row(); nameRow.Class = "shop-name-row";
         nameRow.Pad(0); nameRow.Gap(0); nameRow.Prefer(0, Spec.ShopNameH());
         col.With(nameRow);
-        Label nm = Text(row.Str("name", ""), "shop-name", 0);
+        Label nm = Text(name, "shop-name", 0);
         nameRow.With(nm);
         Panel priceP = Panel.Row(); priceP.Class = "shop-price";
         priceP.Pad(Spec.Px(2)); priceP.Gap(Spec.Px(2));
@@ -246,10 +243,10 @@ partial class LegendApp {
     }
 
     /// 一张商品卡：图标石框 + 右上名称/价格 + 右下数量/购买。
-    /// 在线 = 服务端 items 目录（金价胶囊）；离线 = shop.csv reward 语义。
+    /// 在线 = 服务端 items 目录（金价胶囊，走强类型 ShopItem 实体）；离线 = shop.csv reward 语义。
     Panel ShopCard(int i) {
-        JsonValue live = net.Self() != null ? net.ShopAt(i) : null;
-        if (live != null) { return ShopLiveCard(live, i); }
+        ShopItem si = net.Self() != null ? net.TypedShopAt(i) : null;
+        if (si != null) { return ShopCardItem(si.Id, si.Price, si.Name, i); }
         DataRow offer = GameTables.current.shop.rows[i];
         int yuan = offer.Int("yuan");
         int gold = offer.Int("gold");
@@ -264,7 +261,7 @@ partial class LegendApp {
         Panel box = Panel.Row(); box.Class = "shop-icon";
         box.Pad(Spec.Px(1)); box.Prefer(Spec.ShopIconW(), Spec.ShopIconH());
         Image ic = new Image(ShopArtPath(offer.Text("reward")), offer.Text("name"), "contain");
-        ic.DockFill(); box.Add(ic);
+        ic.Grow(); box.Add(ic);
         card.With(box);
 
         Panel col = Panel.Column(); col.Pad(0); col.Gap(Spec.ShopRowGap()); col.Grow(); card.With(col);

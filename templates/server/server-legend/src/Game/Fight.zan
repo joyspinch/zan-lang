@@ -23,6 +23,17 @@ class MonsterInstance {
     }
 }
 
+/// 世界 BOSS 伤害条目强类型实体（替代平行列表 wbBoardNames 与 wbBoardVals）。
+class WbDamageRecord {
+    public string name;
+    public long damage;
+
+    public WbDamageRecord(string name, long damage) {
+        this.name = name != null ? name : "";
+        this.damage = damage;
+    }
+}
+
 /* 战斗闭环：怪物模板/物品模板装载、刷怪实例、一轮战斗（hunt 与
    自动挂机共用）、经验升级、掉落入包、背包与商店结算。
    模板与刷怪实例是进程内只读/运行态，不落库；背包走会话内存副本
@@ -687,6 +698,7 @@ class Fight {
 
     /* 装载进会话（进区时调用；同物品合并）。返回合成包数（诊断用）。 */
     static async int LoadBag(IDbConnection db, Session s) {
+        s.bagSlots.Clear();
         s.bagIds.Clear();
         s.bagCounts.Clear();
         List<ZanWeb.Model.Game.Bag> rows = await db
@@ -700,50 +712,60 @@ class Fight {
     }
 
     static int BagIndexOf(Session s, int itemId) {
+        for (int i = 0; i < s.bagSlots.Count; i = i + 1) {
+            if (s.bagSlots[i].itemId == itemId) { return i; }
+        }
         return s.bagIds.IndexOf(itemId);
     }
 
-    /* 内存加放物品；调用人负责置 bagDirty（本方法统一置）。 */
+    /* 内存加放物品；调用人负责置 bagDirty（本方法统一置）。通过 BagSlot 实体同步。 */
     static void BagAdd(Session s, int itemId, int count) {
         int at = Fight.BagIndexOf(s, itemId);
         if (at >= 0) {
-            s.bagCounts[at] = s.bagCounts[at] + count;
+            if (at < s.bagSlots.Count) {
+                s.bagSlots[at].count = s.bagSlots[at].count + count;
+            }
+            if (at < s.bagCounts.Count) {
+                s.bagCounts[at] = s.bagCounts[at] + count;
+            }
         } else {
+            s.bagSlots.Add(new BagSlot(itemId, count));
             s.bagIds.Add(itemId);
             s.bagCounts.Add(count);
         }
         s.bagDirty = true;
     }
 
-    /* 扣减；数量不足返回 false。 */
+    /* 扣减；数量不足返回 false。通过 BagSlot 实体同步。 */
     static bool BagTake(Session s, int itemId, int count) {
         int at = Fight.BagIndexOf(s, itemId);
-        if (at < 0 || s.bagCounts[at] < count) { return false; }
+        if (at < 0 || at >= s.bagCounts.Count || s.bagCounts[at] < count) { return false; }
         if (s.bagCounts[at] == count) {
+            if (at < s.bagSlots.Count) { s.bagSlots.RemoveAt(at); }
             s.bagIds.RemoveAt(at);
             s.bagCounts.RemoveAt(at);
         } else {
+            if (at < s.bagSlots.Count) { s.bagSlots[at].count = s.bagSlots[at].count - count; }
             s.bagCounts[at] = s.bagCounts[at] - count;
         }
         s.bagDirty = true;
         return true;
     }
 
-    /* 背包整包回写：删掉该玩家旧行再按内存副本插入。行数少（模板
-       物品几十种），比逐行 diff 简单可靠。 */
+    /* 背包整包回写：删掉该玩家旧行再按内存副本插入。使用 BagSlot 实体列表。 */
     static async int PersistBag(IDbConnection db, Session s) {
         int pid = s.row.id;
         await db.Delete<ZanWeb.Model.Game.Bag>()
             .Where(a => a.playerId == pid).ExecuteAffrowsAsync();
-        for (int i = 0; i < s.bagIds.Count; i = i + 1) {
-            if (s.bagCounts[i] <= 0) { continue; }
+        for (int i = 0; i < s.bagSlots.Count; i = i + 1) {
+            if (s.bagSlots[i].count <= 0) { continue; }
             ZanWeb.Model.Game.Bag b = new ZanWeb.Model.Game.Bag();
             b.playerId = pid;
-            b.itemId = s.bagIds[i];
-            b.count = s.bagCounts[i];
+            b.itemId = s.bagSlots[i].itemId;
+            b.count = s.bagSlots[i].count;
             await db.Insert<ZanWeb.Model.Game.Bag>(b).ExecuteAffrowsAsync();
         }
-        return s.bagIds.Count;
+        return s.bagSlots.Count;
     }
 
     /* 登出/换区时的立即回写（自借连接）。 */
@@ -1047,18 +1069,18 @@ class Fight {
         return "";
     }
 
-    /* 背包列表：物品模板信息内联，客户端不用二次查询。 */
+    /* 背包列表：物品模板信息内联，基于 BagSlot 强类型实体遍历。 */
     static JsonValue BagJson(Session s) {
         JsonValue arr = JsonValue.NewArray();
-        for (int i = 0; i < s.bagIds.Count; i = i + 1) {
-            ZanWeb.Model.Game.Item it = Fight.ById(s.bagIds[i]);
+        for (int i = 0; i < s.bagSlots.Count; i = i + 1) {
+            ZanWeb.Model.Game.Item it = Fight.ById(s.bagSlots[i].itemId);
             if (it == null) { continue; }
             JsonValue o = JsonValue.NewObject();
             o.Set("id", JsonValue.NewNum(Convert.ToString(it.id)));
             o.Set("name", JsonValue.NewStr(it.name));
             o.Set("kind", JsonValue.NewNum(Convert.ToString(it.kind)));
             o.Set("slot", JsonValue.NewNum(Convert.ToString(it.slot)));
-            o.Set("count", JsonValue.NewNum(Convert.ToString(s.bagCounts[i])));
+            o.Set("count", JsonValue.NewNum(Convert.ToString(s.bagSlots[i].count)));
             o.Set("atk", JsonValue.NewNum(Convert.ToString(it.atk)));
             o.Set("atkMin", JsonValue.NewNum(Convert.ToString(it.atkMin)));
             o.Set("magic", JsonValue.NewNum(Convert.ToString(it.magic)));
@@ -1277,24 +1299,57 @@ class Fight {
     static long wbRespawnAt = 0;
     static string wbTopName = "";
     static long wbTopDmg = 0;
-    /* 世界BOSS 伤害榜（场景页 dim=3）：本周期按玩家累计的伤害，名字→
-       伤害平行表。内存瞬态——BOSS 重生时清零（世界BOSS 本体也是内存
-       重铺口径，RULES.md §持久化边界）。 */
+    /* 世界BOSS 伤害榜（场景页 dim=3）：本周期按玩家累计的伤害。
+       使用 WbDamageRecord 强类型实体维护，同时同步 wbBoardNames / wbBoardVals 兼容访问。
+       内存瞬态——BOSS 重生时清零（世界BOSS 本体也是内存重铺口径，RULES.md §持久化边界）。 */
+    static List<WbDamageRecord> wbRecords = new List<WbDamageRecord>();
     static List<string> wbBoardNames = new List<string>();
     static List<long> wbBoardVals = new List<long>();
 
     static void WbBoardAdd(string name, long dmg) {
         int at = -1;
-        for (int i = 0; i < wbBoardNames.Count; i = i + 1) {
-            if (wbBoardNames[i] == name) { at = i; break; }
+        for (int i = 0; i < wbRecords.Count; i = i + 1) {
+            if (wbRecords[i].name == name) { at = i; break; }
         }
-        if (at < 0) { wbBoardNames.Add(name); wbBoardVals.Add(dmg); }
-        else { wbBoardVals[at] = wbBoardVals[at] + dmg; }
+        if (at < 0) {
+            wbRecords.Add(new WbDamageRecord(name, dmg));
+            wbBoardNames.Add(name);
+            wbBoardVals.Add(dmg);
+        } else {
+            wbRecords[at].damage = wbRecords[at].damage + dmg;
+            if (at < wbBoardVals.Count) {
+                wbBoardVals[at] = wbBoardVals[at] + dmg;
+            }
+        }
     }
 
     static void WbBoardReset() {
+        wbRecords.Clear();
         wbBoardNames.Clear();
         wbBoardVals.Clear();
+    }
+
+    /// 获取当前周期世界 BOSS 伤害前 N 名（基于 WbDamageRecord 强类型实体，非破坏性排序读取）。
+    public static List<WbDamageRecord> WbTopRecords(int limit) {
+        List<WbDamageRecord> copy = new List<WbDamageRecord>();
+        for (int i = 0; i < wbRecords.Count; i = i + 1) {
+            copy.Add(wbRecords[i]);
+        }
+        for (int i = 1; i < copy.Count; i = i + 1) {
+            WbDamageRecord cur = copy[i];
+            int j = i - 1;
+            while (j >= 0 && copy[j].damage < cur.damage) {
+                copy[j + 1] = copy[j];
+                j = j - 1;
+            }
+            copy[j + 1] = cur;
+        }
+        List<WbDamageRecord> res = new List<WbDamageRecord>();
+        int n = copy.Count < limit ? copy.Count : limit;
+        for (int i = 0; i < n; i = i + 1) {
+            res.Add(copy[i]);
+        }
+        return res;
     }
 
     /* 懒初始化/懒重生共用：到期即满血，旧周期伤害榜随之清零。 */
@@ -1442,11 +1497,11 @@ class Fight {
         long redPackets = 0;
         long gems = 0;
         long points = 0;
-        for (int i = s.bagIds.Count - 1; i >= 0; i = i - 1) {
-            ZanWeb.Model.Game.Item it = Fight.ById(s.bagIds[i]);
+        for (int i = s.bagSlots.Count - 1; i >= 0; i = i - 1) {
+            ZanWeb.Model.Game.Item it = Fight.ById(s.bagSlots[i].itemId);
             if (it == null || it.kind != 3) { continue; }
             if (onlyItem > 0 && it.id != onlyItem) { continue; }
-            long take = s.bagCounts[i];
+            long take = s.bagSlots[i].count;
             if (onlyCount > 0 && onlyCount < take) { take = onlyCount; }
             long price = it.price / 2;
             ZanWeb.RuleRow priced = null;
@@ -1462,11 +1517,13 @@ class Fight {
             redPackets += Fight.Capped(unit, Rules.Recycle().At(4));
             gems += Fight.Capped(unit, Rules.Recycle().At(5));
             points += Fight.Capped(unit, Rules.Recycle().At(6));
-            if (take >= s.bagCounts[i]) {
-                s.bagIds.RemoveAt(i);
-                s.bagCounts.RemoveAt(i);
+            if (take >= s.bagSlots[i].count) {
+                s.bagSlots.RemoveAt(i);
+                if (i < s.bagIds.Count) { s.bagIds.RemoveAt(i); }
+                if (i < s.bagCounts.Count) { s.bagCounts.RemoveAt(i); }
             } else {
-                s.bagCounts[i] = s.bagCounts[i] - (int)take;
+                s.bagSlots[i].count = s.bagSlots[i].count - (int)take;
+                if (i < s.bagCounts.Count) { s.bagCounts[i] = s.bagCounts[i] - (int)take; }
             }
         }
         if (gain <= 0 && exp <= 0 && merit <= 0 && reputation <= 0

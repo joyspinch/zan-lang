@@ -19,6 +19,32 @@ namespace ZanWeb.Game;
    data/RULES.md §3.5。每日次数照 bossTryDate 定式跨天回满；所有可变
    状态改会话内存副本并置 dirty，落库随 World.Flush。图鉴明细（codex）
    按物品/怪物分页，页面一次一页。 */
+/// 场景排行榜条目强类型实体（消除 names/lvls/floors 平行列表反模式）。
+class SceneRankEntry {
+    string name;
+    int level;
+    int floor;
+
+    SceneRankEntry(string name, int level, int floor) {
+        this.name = name != null ? name : "";
+        this.level = level;
+        this.floor = floor;
+    }
+}
+
+/// 宗师结伴聚合条目强类型实体（消除 mNames/mCnts/mLvls 平行列表反模式）。
+class MentorMateEntry {
+    string name;
+    int count;
+    int level;
+
+    MentorMateEntry(string name, int count, int level) {
+        this.name = name != null ? name : "";
+        this.count = count;
+        this.level = level;
+    }
+}
+
 class Play {
     static Random rng = new Random();
 
@@ -136,6 +162,7 @@ class Play {
         a.Set("time", JsonValue.NewNum(Convert.ToString(now)));
         int take = Rules.Val("arena_rival_count");
         JsonValue arr = JsonValue.NewArray();
+        List<ArenaRivalEntry> rivalEntries = new List<ArenaRivalEntry>();
         IDbConnection db = await Gateway.Db();
         if (db != null) {
             try {
@@ -145,15 +172,19 @@ class Play {
                     .OrderByDescending(x => x.merit)
                     .Take(take).ToListAsync();
                 for (int i = 0; i < rows.Count; i = i + 1) {
-                    JsonValue o = JsonValue.NewObject();
-                    o.Set("name", JsonValue.NewStr(rows[i].nickname));
-                    o.Set("rank", JsonValue.NewNum(Convert.ToString(i + 1)));
-                    o.Set("me", JsonValue.NewNum(rows[i].id == s.row.id ? "1" : "0"));
-                    arr.Append(o);
+                    rivalEntries.Add(new ArenaRivalEntry(rows[i].nickname, i + 1, rows[i].id == s.row.id));
                 }
             } finally {
                 Gateway.Give(db);
             }
+        }
+        for (int i = 0; i < rivalEntries.Count; i = i + 1) {
+            ArenaRivalEntry e = rivalEntries[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Set("name", JsonValue.NewStr(e.Name));
+            o.Set("rank", JsonValue.NewNum(Convert.ToString(e.Rank)));
+            o.Set("me", JsonValue.NewNum(e.IsMe ? "1" : "0"));
+            arr.Append(o);
         }
         a.Set("rows", arr);
         return a;
@@ -303,22 +334,27 @@ class Play {
             List<ZanWeb.Model.Game.Guild> rows = await db
                 .Select<ZanWeb.Model.Game.Guild>()
                 .OrderBy(a => a.id).ToListAsync();
-            JsonValue arr = JsonValue.NewArray();
+            List<GuildListItem> guildEntries = new List<GuildListItem>();
             for (int i = 0; i < rows.Count; i = i + 1) {
                 ZanWeb.Model.Game.Guild g = rows[i];
                 int members = await db.Select<ZanWeb.Model.Game.Player>()
                     .Where(a => a.guildId == g.id).CountAsync();
+                guildEntries.Add(new GuildListItem(g.id, g.name, g.leader, members, cap, g.fund, g.id == s.row.guildId));
+            }
+            JsonValue arr = JsonValue.NewArray();
+            for (int i = 0; i < guildEntries.Count; i = i + 1) {
+                GuildListItem g = guildEntries[i];
                 JsonValue o = JsonValue.NewObject();
-                o.Set("id", JsonValue.NewNum(Convert.ToString(g.id)));
-                o.Set("name", JsonValue.NewStr(g.name));
-                o.Set("master", JsonValue.NewStr(g.leader));
-                o.Set("leader", JsonValue.NewStr(g.leader));
-                o.Set("members", JsonValue.NewNum(Convert.ToString(members)));
-                o.Set("memberCap", JsonValue.NewNum(Convert.ToString(cap)));
-                o.Set("goods", JsonValue.NewNum(Convert.ToString(g.fund)));
-                o.Set("fund", JsonValue.NewNum(Convert.ToString(g.fund)));
+                o.Set("id", JsonValue.NewNum(Convert.ToString(g.Id)));
+                o.Set("name", JsonValue.NewStr(g.Name));
+                o.Set("master", JsonValue.NewStr(g.Leader));
+                o.Set("leader", JsonValue.NewStr(g.Leader));
+                o.Set("members", JsonValue.NewNum(Convert.ToString(g.Members)));
+                o.Set("memberCap", JsonValue.NewNum(Convert.ToString(g.MemberCap)));
+                o.Set("goods", JsonValue.NewNum(Convert.ToString(g.Fund)));
+                o.Set("fund", JsonValue.NewNum(Convert.ToString(g.Fund)));
                 o.Set("limitLevel", JsonValue.NewNum("0"));
-                o.Set("mine", JsonValue.NewNum(g.id == s.row.guildId ? "1" : "0"));
+                o.Set("mine", JsonValue.NewNum(g.IsMine ? "1" : "0"));
                 arr.Append(o);
             }
             JsonValue r = Gateway.Ok();
@@ -802,37 +838,38 @@ class Play {
                     .Select<ZanWeb.Model.Game.Player>()
                     .Where(a => a.realmId == s.realmId && a.masterName != "")
                     .ToListAsync();
-                List<string> mNames = new List<string>();
-                List<int> mCnts = new List<int>();
+                List<MentorMateEntry> mateEntries = new List<MentorMateEntry>();
                 for (int i = 0; i < apps.Count; i = i + 1) {
                     string mn = apps[i].masterName != null ? apps[i].masterName : "";
                     if (mn.Length == 0) { continue; }
                     int at = -1;
-                    for (int k = 0; k < mNames.Count; k = k + 1) {
-                        if (mNames[k] == mn) { at = k; break; }
+                    for (int k = 0; k < mateEntries.Count; k = k + 1) {
+                        if (mateEntries[k].name == mn) { at = k; break; }
                     }
-                    if (at < 0) { mNames.Add(mn); mCnts.Add(1); }
-                    else { mCnts[at] = mCnts[at] + 1; }
+                    if (at < 0) {
+                        mateEntries.Add(new MentorMateEntry(mn, 1, 0));
+                    } else {
+                        mateEntries[at].count = mateEntries[at].count + 1;
+                    }
                 }
-                List<int> mLvls = new List<int>();
-                for (int k = 0; k < mNames.Count; k = k + 1) {
+                for (int k = 0; k < mateEntries.Count; k = k + 1) {
                     ZanWeb.Model.Game.Player mm = await dbM
                         .Select<ZanWeb.Model.Game.Player>()
-                        .Where(a => a.nickname == mNames[k] && a.realmId == s.realmId)
+                        .Where(a => a.nickname == mateEntries[k].name && a.realmId == s.realmId)
                         .FirstAsync();
-                    mLvls.Add(mm != null ? mm.level : 0);
+                    mateEntries[k].level = mm != null ? mm.level : 0;
                 }
-                for (int rank = 0; rank < 10 && mNames.Count > 0; rank = rank + 1) {
+                for (int rank = 0; rank < 10 && mateEntries.Count > 0; rank = rank + 1) {
                     int best = 0;
-                    for (int k = 1; k < mCnts.Count; k = k + 1) {
-                        if (mCnts[k] > mCnts[best]) { best = k; }
+                    for (int k = 1; k < mateEntries.Count; k = k + 1) {
+                        if (mateEntries[k].count > mateEntries[best].count) { best = k; }
                     }
                     JsonValue mo = JsonValue.NewObject();
-                    mo.Set("name", JsonValue.NewStr(mNames[best]));
-                    mo.Set("level", JsonValue.NewNum(Convert.ToString(mLvls[best])));
-                    mo.Set("cnt", JsonValue.NewNum(Convert.ToString(mCnts[best])));
+                    mo.Set("name", JsonValue.NewStr(mateEntries[best].name));
+                    mo.Set("level", JsonValue.NewNum(Convert.ToString(mateEntries[best].level)));
+                    mo.Set("cnt", JsonValue.NewNum(Convert.ToString(mateEntries[best].count)));
                     mates.Append(mo);
-                    mNames.RemoveAt(best); mCnts.RemoveAt(best); mLvls.RemoveAt(best);
+                    mateEntries.RemoveAt(best);
                 }
             } finally {
                 Gateway.Give(dbM);
@@ -1599,15 +1636,10 @@ class Play {
                     ZanWeb.Model.Game.Mail row = mails[i];
                     if (!all && row.id != want) { continue; }
                     string itemsCsv = row.items != null ? row.items : "";
-                    List<string> parts = itemsCsv.Split(",");
-                    for (int k = 0; k < parts.Count; k = k + 1) {
-                        string p = parts[k].Trim();
-                        if (p.Length == 0) { continue; }
-                        List<string> kv = p.Split(":");
-                        if (kv.Count != 2) { continue; }
-                        int itemId = Convert.ToInt(kv[0].Trim());
-                        int count = Convert.ToInt(kv[1].Trim());
-                        Fight.BagAdd(s, itemId, count);
+                    List<MailAttachmentItem> attachList = MailAttachmentItem.ParseCsv(itemsCsv);
+                    for (int k = 0; k < attachList.Count; k = k + 1) {
+                        MailAttachmentItem item = attachList[k];
+                        Fight.BagAdd(s, item.ItemId, item.Count);
                         granted = granted + 1;
                     }
                     await db.Update<ZanWeb.Model.Game.Mail>()
@@ -1827,11 +1859,10 @@ class Play {
     /* codexItems CSV（"组:格:itemId,…"）里某格是否已放。 */
     static bool TjHas(string csv, int g, int slot) {
         if (csv == null || csv.Length == 0) { return false; }
-        List<string> parts = csv.Split(",");
-        for (int i = 0; i < parts.Count; i = i + 1) {
-            List<string> kv = parts[i].Trim().Split(":");
-            if (kv.Count != 3) { continue; }
-            if (Convert.ToInt(kv[0]) == g && Convert.ToInt(kv[1]) == slot) {
+        List<TjSlotEntry> slots = TjSlotEntry.ParseCsv(csv);
+        for (int i = 0; i < slots.Count; i = i + 1) {
+            TjSlotEntry e = slots[i];
+            if (e.Group == g && e.Slot == slot) {
                 return true;
             }
         }
@@ -1940,20 +1971,14 @@ class Play {
         int dim = m.Int("dim", 1);
         JsonValue rows = JsonValue.NewArray();
         if (dim == 3) {
-            for (int rank = 0; rank < 10 && Fight.wbBoardNames.Count > 0;
-                    rank = rank + 1) {
-                int best = 0;
-                for (int k = 1; k < Fight.wbBoardVals.Count; k = k + 1) {
-                    if (Fight.wbBoardVals[k] > Fight.wbBoardVals[best]) { best = k; }
-                }
+            List<WbDamageRecord> top = Fight.WbTopRecords(10);
+            for (int rank = 0; rank < top.Count; rank = rank + 1) {
+                WbDamageRecord rec = top[rank];
                 JsonValue o = JsonValue.NewObject();
-                o.Set("name", JsonValue.NewStr(Fight.wbBoardNames[best]));
+                o.Set("name", JsonValue.NewStr(rec.name));
                 o.Set("level", JsonValue.NewNum("0"));
-                o.Set("floor", JsonValue.NewNum(
-                    Convert.ToString(Fight.wbBoardVals[best])));
+                o.Set("floor", JsonValue.NewNum(Convert.ToString(rec.damage)));
                 rows.Append(o);
-                Fight.wbBoardNames.RemoveAt(best);
-                Fight.wbBoardVals.RemoveAt(best);
             }
             JsonValue r3 = Gateway.Ok();
             r3.Set("rows", rows);
@@ -1968,9 +1993,7 @@ class Play {
                 .Select<ZanWeb.Model.Game.Player>()
                 .Where(a => a.realmId == s.realmId)
                 .ToListAsync();
-            List<string> names = new List<string>();
-            List<int> lvls = new List<int>();
-            List<int> floors = new List<int>();
+            List<SceneRankEntry> entries = new List<SceneRankEntry>();
             for (int i = 0; i < all.Count; i = i + 1) {
                 int f = 0;
                 if (dim == 2) {
@@ -1980,23 +2003,19 @@ class Play {
                     f = all[i].mapUnlocked;
                 }
                 if (f <= 0) { continue; }
-                names.Add(all[i].nickname);
-                lvls.Add(all[i].level);
-                floors.Add(f);
+                entries.Add(new SceneRankEntry(all[i].nickname, all[i].level, f));
             }
-            for (int rank = 0; rank < 10 && names.Count > 0; rank = rank + 1) {
+            for (int rank = 0; rank < 10 && entries.Count > 0; rank = rank + 1) {
                 int best = 0;
-                for (int k = 1; k < floors.Count; k = k + 1) {
-                    if (floors[k] > floors[best]) { best = k; }
+                for (int k = 1; k < entries.Count; k = k + 1) {
+                    if (entries[k].floor > entries[best].floor) { best = k; }
                 }
                 JsonValue o = JsonValue.NewObject();
-                o.Set("name", JsonValue.NewStr(names[best]));
-                o.Set("level", JsonValue.NewNum(Convert.ToString(lvls[best])));
-                o.Set("floor", JsonValue.NewNum(Convert.ToString(floors[best])));
+                o.Set("name", JsonValue.NewStr(entries[best].name));
+                o.Set("level", JsonValue.NewNum(Convert.ToString(entries[best].level)));
+                o.Set("floor", JsonValue.NewNum(Convert.ToString(entries[best].floor)));
                 rows.Append(o);
-                names.RemoveAt(best);
-                lvls.RemoveAt(best);
-                floors.RemoveAt(best);
+                entries.RemoveAt(best);
             }
         } finally {
             Gateway.Give(db);

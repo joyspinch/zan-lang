@@ -24,6 +24,7 @@ partial class LegendApp {
     /* ---- 数据 ---- */
     Game g; SaveStore saves; GameNet net;
     DataTable navigationData;
+    List<NavItem> navItems = new List<NavItem>();
     CombatFxEngine combatFx = new CombatFxEngine();
     BurstDropEngine burstDrops = new BurstDropEngine();
 
@@ -62,6 +63,22 @@ partial class LegendApp {
         if (dataDir.Length == 0) { dataDir = "data"; }
         GameTables.Initialize(dataDir);
         navigationData = DataTable.Load(dataDir + "/navigation.csv", "id:0:30,name,icon,label,x,w");
+        navItems.Clear();
+        for (int ni = 0; ni <= 30; ni = ni + 1) {
+            DataRow r = navigationData.At(ni);
+            if (r != null) {
+                navItems.Add(new NavItem(
+                    ni,
+                    r.Text("name"),
+                    r.Text("icon"),
+                    r.Text("label"),
+                    r.Int("x"),
+                    r.Int("w")
+                ));
+            } else {
+                navItems.Add(new NavItem(ni, "", "", "", 0, 0));
+            }
+        }
         saves = new SaveStore(SaveStore.DefaultPath());
         long now = DateTime.UtcNow().epoch;
         g = saves.Read(now); lastTick = now; lastSave = now;
@@ -267,7 +284,7 @@ partial class LegendApp {
     //     里当普通行——左栏要一直铺到 578.7，瓦片行叠在它下半部。
     // =====================================================================
     void BuildShell() {
-        root = Panel.Root("legend-root"); root.Pad(0); root.DockFill();
+        root = Panel.Root("legend-root"); root.Pad(0); root.Grow();
         /* 内容区顶端到第 1 行瓦片的留白 = 瓦片行间距（Spec.ContentTopPad）：
            顶栏上下的留白一个值，下面不再比上面空。 */
         root.Padding(Spec.ContentTopPad(), 0, 0, 0);
@@ -276,14 +293,14 @@ partial class LegendApp {
         /* 右侧先让出 15 逻辑像素的窗口底（原版聊天面板没顶到右缘），
            再放聊天面板——它满高，盖住顶栏两行瓦片的右端。 */
         Panel chatPad = Panel.Row(); chatPad.Prefer(Spec.ChatPadR(), 0);
-        chatPad.DockRight(); root.Add(chatPad);
+        chatPad.AnchorRight(); root.Add(chatPad);
 
         chatPanel = Panel.Column(); chatPanel.Class = "chat-panel";
-        chatPanel.Prefer(Spec.ChatW(), 0); chatPanel.DockRight();
+        chatPanel.Prefer(Spec.ChatW(), 0); chatPanel.AnchorRight();
         root.Add(chatPanel); BuildChat(chatPanel);
 
         mainCol = Panel.Column(); mainCol.Pad(0); mainCol.Gap(0);
-        mainCol.DockFill(); root.Add(mainCol);
+        mainCol.Grow(); root.Add(mainCol);
 
         /* 顶部导航：2 行 × 10 格 + 第 1 行行末的设置齿轮。 */
         Panel topNav = Panel.Column(); topNav.Class = "nav-band";
@@ -305,19 +322,21 @@ partial class LegendApp {
         Panel right = Panel.Column(); right.Gap(0); right.Grow(); body.With(right);
         Panel tileStrip = Panel.Column(); tileStrip.Pad(0); tileStrip.Gap(0);
         tileStrip.Prefer(0, Spec.BotTileRowH() + Spec.BotTileBottom());
-        /* 底瓦片行贴内容区底：必须用 DockBottom（dock=2），不能用 With
-           （dock=1）。停靠容器是「先按顺序摆 1..4，再摆 5」——content 是
-           Grow()（dock=5），若靠 With 追加，瓦片行会被摆到它的**上面**，
-           整个底栏跑到主区顶部去（实测踩过）。 */
-        tileStrip.DockBottom(); right.Add(tileStrip);
+        /* 底瓦片行贴内容区底：AnchorBottom */
+        tileStrip.AnchorBottom(); right.Add(tileStrip);
         tileStrip.With(BottomTileRow());
         Panel tilesFill = Panel.Row(); tilesFill.Grow(); tileStrip.With(tilesFill);
         content = Panel.Column(); content.Class = "page-surface";
         content.Pad(0); content.Gap(0); content.Grow(); right.With(content);
     }
 
-    /* 一行顶部导航瓦片：瓦片宽逐格取实测（navigation.csv），格间隙就是
-       实测的 5..8 逻辑（撑条，一个不动）。行首边距 = LeftPad（用户：
+    NavItem NavAt(int n) {
+        if (n >= 0 && n < navItems.Count) { return navItems[n]; }
+        return null;
+    }
+
+    /* 一排导航瓦片：r=0 或 1。由于原版的第 1 排左侧按钮更靠右（原版
+       第一格是「个人BOSS」，X 在 347，而第 2 排首格在 250，用户：
        「按钮左移，与下面的最左侧对齐」），行末同样留 LeftPad，中间的
        富余宽度由 CSS 的 flex-grow 平分给各瓦片（按钮各宽几个像素）——
        故两排右端都落在「主区右缘 − LeftPad」，与左端间距一致（用户：
@@ -328,15 +347,20 @@ partial class LegendApp {
         int prev = 0;
         for (int c = 0; c < 10; c = c + 1) {
             int n = r * 10 + c;
-            int x = Spec.NavX(navigationData.At(n).Int("x"));
+            NavItem item = NavAt(n);
+            int itemX = item != null ? item.X : 0;
+            int itemW = item != null ? item.W : 0;
+            int x = Spec.NavX(itemX);
             int gap = x - prev;
             if (gap > 0) { row.With(SpacerW(gap)); }
             row.With(NavTile(n));
-            prev = x + Spec.NavTileW(navigationData.At(n).Int("w"));
+            prev = x + Spec.NavTileW(itemW);
         }
         if (r == 0) {
             /* 右上角设置齿轮（= 页 30），右缘与第 2 行末格对齐。 */
-            int gx = Spec.NavX(navigationData.At(30).Int("x"));
+            NavItem item30 = NavAt(30);
+            int gX = item30 != null ? item30.X : 0;
+            int gx = Spec.NavX(gX);
             int gap = gx - prev;
             if (gap > 0) { row.With(SpacerW(gap)); }
             row.With(NavTile(30));
@@ -352,11 +376,14 @@ partial class LegendApp {
         row.Prefer(0, Spec.BotTileRowH());
         int prev = 0;
         for (int i = 20; i < 30; i = i + 1) {
-            int x = Spec.Px(navigationData.At(i).Int("x")) - Spec.LeftPad() - Spec.LeftW();
+            NavItem item = NavAt(i);
+            int itemX = item != null ? item.X : 0;
+            int itemW = item != null ? item.W : 0;
+            int x = Spec.Px(itemX) - Spec.LeftPad() - Spec.LeftW();
             int gap = x - prev;
             if (gap > 0) { row.With(SpacerW(gap)); }
             row.With(NavTile(i));
-            prev = x + Spec.NavTileW(navigationData.At(i).Int("w"));
+            prev = x + Spec.NavTileW(itemW);
         }
         row.With(SpacerW(Spec.LeftPad()));
         return row;
@@ -366,9 +393,8 @@ partial class LegendApp {
     void BuildBottomLeft(Panel side) {
         Panel zone = Panel.Column(); zone.Pad(0); zone.Gap(0);
         zone.Prefer(0, Spec.BotStatBtnH() + Spec.BotStatBottom());
-        /* DockBottom（dock=2）+ Add：With 会把 dock 改成 1，簇就贴到数值区
-           正下方而不是面板底（信息流是 Grow/dock=5，本来就被排到最后）。 */
-        zone.DockBottom(); side.Add(zone);
+        /* AnchorBottom + Add */
+        zone.AnchorBottom(); side.Add(zone);
         Panel row = Panel.Row(); row.Class = "bot-stat-row"; row.Pad(0); row.Gap(0);
         row.Prefer(0, Spec.BotStatBtnH()); zone.With(row);
         row.With(SpacerW(Spec.BotStatBtnX()));
@@ -387,17 +413,21 @@ partial class LegendApp {
        center，不要拿两个 Grow 撑条去凑：撑条本身也要吃一份 gap，四段之间
        三条 9px 的缝把内容挤到溢出，标签反而被省略号截断（实测踩过）。 */
     Panel NavTile(int n) {
-        bool iconOnly = navigationData.At(n).Text("label").Length == 0 || n == 30;
+        NavItem item = NavAt(n);
+        string labelText = item != null ? item.Label : "";
+        string iconPath = item != null ? item.Icon : "";
+        int tileW = item != null ? item.W : 0;
+        bool iconOnly = labelText.Length == 0 || n == 30;
         Panel b = Panel.Row();
         b.Class = n == 30 ? "navtile navtile-gear" : "navtile";
         b.Pad(0); b.Gap(Spec.Px(6));
-        b.Prefer(Spec.NavTileW(navigationData.At(n).Int("w")), Spec.NavTileH());
+        b.Prefer(Spec.NavTileW(tileW), Spec.NavTileH());
         b.Named("nav-" + Rules.N(n));
-        Image icon = new Image(navigationData.At(n).Text("icon"), "", "contain");
+        Image icon = new Image(iconPath, "", "contain");
         icon.Class = "navicon"; icon.Prefer(Spec.NavIconW(), Spec.NavIconH());
         b.With(icon);
         if (!iconOnly) {
-            Label l = Text(navigationData.At(n).Text("label"), "navtext", 0);
+            Label l = Text(labelText, "navtext", 0);
             b.With(l);
         }
         int target = n;
@@ -527,7 +557,7 @@ partial class LegendApp {
 
     // ---------------------------------------------------------------------
     //  抢红包悬浮入口：红包池有余额且本轮没抢过时浮在右下角（任何页面都
-    //  可见）。数据源 = net.PlayRedpack()，红包雨公告到达时自动刷新（Net）。
+    //  可见）。数据源 = net.TypedRedpack()，红包雨公告到达时自动刷新（Net）。
     //  与弹窗同法：挂 root，每次 BuildPage 先摘再挂，画在页面之上。
     // ---------------------------------------------------------------------
     Panel rpGrabHost;
@@ -539,15 +569,13 @@ partial class LegendApp {
             rpGrabHost = null;
         }
         if (net.Self() == null || rpOpen) { return; }
-        /* playRedpack 缓存的就是服务端 redpack 对象（RefreshRedpack 已剥壳），
-           pool/taken 直接读它。 */
-        JsonValue rp = net.PlayRedpack();
+        /* typedRedpack 强类型实体，pool/taken 直接读它。 */
+        RedpackState rp = net.TypedRedpack();
         if (rp == null) { return; }
-        if (rp.Int("pool", 0) <= 0 || rp.Int("taken", 0) == 1) { return; }
+        if (rp.Pool <= 0 || rp.Taken == 1) { return; }
         Panel host = Panel.Row(); host.Class = "rp-grab";
         host.Pad(0); host.NoOverlapCheck();
-        host.DockManual();
-        host.Place(app.ClientWidth() - 232, app.ClientHeight() - app.ContentTop() - 96);
+        host.Float(app.ClientWidth() - 232, app.ClientHeight() - app.ContentTop() - 96);
         host.Prefer(220, 40);
         rpGrabHost = host;
         root.Add(host);
@@ -601,7 +629,8 @@ partial class LegendApp {
     void BuildPlaceholder() {
         Panel p = Panel.Column(); p.Class = "page-surface"; p.Pad(16); p.Gap(8);
         p.Grow(); content.With(p);
-        string label = page >= 0 && page < 31 ? navigationData.At(page).Text("label") : "?";
+        NavItem cur = NavAt(page);
+        string label = cur != null && cur.Label.Length > 0 ? cur.Label : "?";
         p.With(Text(label, "yellow strong", 32));
         p.With(Text("本页尚未按原版还原（占位）。", "secondary", 24));
     }
