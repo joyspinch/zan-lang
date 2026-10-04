@@ -11,6 +11,8 @@
 //
 // Author: Skal (pascal.massimino@gmail.com)
 
+#include "cpu.h"
+#include "../webp/types.h"
 #include "dsp.h"
 
 // define to 0 to have run-time table initialization

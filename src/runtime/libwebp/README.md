@@ -1,35 +1,44 @@
-# Vendored libwebp — decode-only, scalar subset
+# Vendored libwebp — decode-only subset
 
-Source: [libwebp v1.4.0](https://github.com/webmproject/libwebp/releases/tag/v1.4.0)
+Source: [libwebp v1.6.0](https://github.com/webmproject/libwebp/releases/tag/v1.6.0)
 (BSD-3-Clause, see `COPYING`). Used by the `zan_gui` driver for WebP image
 decoding behind `zan_gui_image_load_mem` (see `gui_runtime.c`).
 
 This is **not** the full library. What was dropped and why:
 
-- **Encoder** (`src/enc/*`, `src/dsp/lossless_enc*`, `cost*`, `huffman_encode_utils`,
-  `quant_levels_utils`, `random_utils`, `sharpyuv/`): we only decode.
-- **SIMD files** (`*_sse2.c`, `*_sse41.c`, `*_neon.c`, `*_msa.c`, `*_mips*`):
-  scalar C paths only — keeps the build portable across the three zan_gui
-  targets (Win32 / X11 / Cocoa) without per-arch flags.
+- **Encoder** (`src/enc/*`, `src/dsp/lossless_enc*`, `cost*`,
+  `huffman_encode_utils`, `quant_levels_utils`, `sharpyuv/`): we only decode.
+- **Non-x86 SIMD** (`*_sse41.c`, `*_neon.c`, `*_msa.c`, `*_mips*`, avx2):
+  the `*_sse2.c` files ARE carried — they self-disable unless
+  `WEBP_HAVE_SSE2`, which `src/webp/config.h` sets only for x86-64 — so the
+  same tree compiles scalar on arm64/riscv without per-file flags.
 - **mux / demux / multithreading**: `thread_utils.c` is compiled without
   `WEBP_USE_THREAD`, giving the synchronous no-worker fallback.
-- `HAVE_CONFIG_H` is **not** defined; no `config.h` is generated.
+- `src/webp/config.h` is a **hand stub** (not upstream, not generated):
+  `HAVE_CONFIG_H` is defined by `gui_runtime.c` around the vendored includes;
+  the stub turns SSE2 on for x86-64 and leaves SSE41/threads off (a single-TU
+  compile cannot express per-file `-msse4.1`).
 
 To upgrade: copy the same file set from the new tag (decoder `.c/.h` under
-`src/dec`, scalar `.c` under `src/dsp`, decode-path utils, public headers
-`decode.h encode.h format_constants.h mux_types.h types.h` under `src/webp`) and
-re-apply the two local transformations below. This tree is compiled
-**unity-build style**: `gui_runtime.c` `#include`s every `.c` file here
-directly, so `scripts/build_ide.ps1`, `build_gallery.ps1` and the CMake
+`src/dec`, the carried `.c` set under `src/dsp`, decode-path utils, public
+headers `decode.h encode.h format_constants.h mux_types.h types.h` under
+`src/webp`) and re-apply the local transformations below. This tree is
+compiled **unity-build style**: `gui_runtime.c` `#include`s every `.c` file
+here directly, so `scripts/build_ide.ps1`, `build_gallery.ps1` and the CMake
 `zan_gui` target all keep working from the single `gui_runtime.c` compile.
 
-Local transformations (re-apply on upgrade):
+Local transformations (re-apply on upgrade; all three bit on 1.4.0→1.6.0):
 
 1. **Includes rewritten file-relative.** Upstream uses `"src/dec/..."`-style
    includes that rely on `-I<libwebp root>`; the runtime is compiled with no
-   include flags at all (see the scripts above), so every such include was
-   rewritten to its file-relative form (`src/utils/utils.h` →
-   `../utils/utils.h`, same-directory ones dropped the prefix entirely).
-2. **`src/dsp/lossless.h`**: dropped the unconditional
-   `#include "src/enc/histogram_enc.h"` — the decode path uses no symbol
-   from it (upstream quirk in 1.4.0), and that header drags in the encoder.
+   include flags at all (see the scripts above), so every such include must
+   be rewritten to its file-relative form (`src/utils/utils.h` →
+   `../utils/utils.h`, same-directory ones drop the prefix entirely).
+2. **`src/utils/quant_levels_dec_utils.c`**: rename its `clip_8b` →
+   `clip_8b_ql` (definition + call sites). Since 1.6.0 `src/dsp/dec.c` also
+   defines a static-inline `clip_8b`; separate TUs never see the clash, the
+   unity build does. (The 1.4.0 tree carried the same rename.)
+3. **`src/dsp/lossless.h`**: 1.4.0 unconditionally included
+   `"src/enc/histogram_enc.h"` (decode path uses no symbol from it) and had
+   to be dropped; 1.6.0 no longer has that include — nothing to do unless it
+   reappears.
