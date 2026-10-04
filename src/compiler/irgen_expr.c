@@ -180,6 +180,28 @@ static LLVMValueRef nm_crc32_fn(zan_irgen_t *g) {
     return fn;
 }
 
+/* __zan_crc32c_table: the 256-entry CRC32C table shared by the byte-stream
+ * helper below and the per-step helpers used to lower Sse42.Crc32 on
+ * non-x86 targets (see emit_sse42_call). */
+static LLVMValueRef crc32c_table_global(zan_irgen_t *g) {
+    LLVMValueRef tab = LLVMGetNamedGlobal(g->mod, "__zan_crc32c_table");
+    if (tab) return tab;
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef entries[256];
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++)
+            c = (c & 1) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
+        entries[i] = LLVMConstInt(i32t, c, 0);
+    }
+    LLVMTypeRef tab_ty = LLVMArrayType(i32t, 256);
+    tab = LLVMAddGlobal(g->mod, tab_ty, "__zan_crc32c_table");
+    LLVMSetInitializer(tab, LLVMConstArray(i32t, entries, 256));
+    LLVMSetGlobalConstant(tab, 1);
+    LLVMSetLinkage(tab, LLVMInternalLinkage);
+    return tab;
+}
+
 /* __zan_nm_crc32c(i8*, i64) -> i64: CRC32C (Castagnoli, reflected polynomial
  * 0x82F63B78), table-driven, self-contained internal function. */
 static LLVMValueRef nm_crc32c_fn(zan_irgen_t *g) {
@@ -193,18 +215,8 @@ static LLVMValueRef nm_crc32c_fn(zan_irgen_t *g) {
     fn = LLVMAddFunction(g->mod, "__zan_nm_crc32c", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
 
-    LLVMValueRef entries[256];
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int k = 0; k < 8; k++)
-            c = (c & 1) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
-        entries[i] = LLVMConstInt(i32t, c, 0);
-    }
+    LLVMValueRef tab = crc32c_table_global(g);
     LLVMTypeRef tab_ty = LLVMArrayType(i32t, 256);
-    LLVMValueRef tab = LLVMAddGlobal(g->mod, tab_ty, "__zan_crc32c_table");
-    LLVMSetInitializer(tab, LLVMConstArray(i32t, entries, 256));
-    LLVMSetGlobalConstant(tab, 1);
-    LLVMSetLinkage(tab, LLVMInternalLinkage);
 
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
@@ -247,6 +259,65 @@ static LLVMValueRef nm_crc32c_fn(zan_irgen_t *g) {
     LLVMValueRef fin = zan_xor(g->builder, crc,
         LLVMConstInt(i32t, 0xFFFFFFFFu, 0), "fin");
     LLVMBuildRet(g->builder, LLVMBuildZExt(g->builder, fin, i64t, "fin64"));
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
+}
+
+/* __zan_crc32c_stepN(i32/i64 crc, iN data) -> i32/i64: bit-exact table-driven
+ * lowering of one Sse42.Crc32 step, chaining the operand's bytes from LSB.
+ * Used on non-x86 targets where the llvm.x86.sse42.crc32.* intrinsics are
+ * illegal in SelectionDAG (aarch64 fatal: "Do not know how to promote this
+ * operator's operand"). Call sites on ARM are runtime-dead (Cpu.HasSse42
+ * lowers to 0 there), but the call must still compile. */
+static LLVMValueRef crc32c_step_fn(zan_irgen_t *g, int nbytes) {
+    char name[40];
+    snprintf(name, sizeof(name), "__zan_crc32c_step%d", nbytes);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
+    if (fn) return fn;
+    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i16t = LLVMInt16TypeInContext(g->ctx);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef rt = (nbytes == 8) ? i64t : i32t;
+    LLVMTypeRef dt = (nbytes == 1) ? i8t : (nbytes == 2) ? i16t
+                   : (nbytes == 4) ? i32t : i64t;
+    LLVMTypeRef fnty = LLVMFunctionType(rt, (LLVMTypeRef[]){ rt, dt }, 2, 0);
+    fn = LLVMAddFunction(g->mod, name, fnty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+
+    LLVMValueRef tab = crc32c_table_global(g);
+    LLVMTypeRef tab_ty = LLVMArrayType(i32t, 256);
+
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+
+    LLVMValueRef crc = LLVMBuildTrunc(g->builder, LLVMGetParam(fn, 0), i32t, "crc32");
+    LLVMValueRef data;
+    if (dt == i64t) data = LLVMGetParam(fn, 1);
+    else data = LLVMBuildZExt(g->builder, LLVMGetParam(fn, 1), i64t, "data64");
+
+    for (int k = 0; k < nbytes; k++) {
+        char pn[16];
+        snprintf(pn, sizeof(pn), "b%d", k);
+        LLVMValueRef sh = LLVMConstInt(i64t, 8 * k, 0);
+        LLVMValueRef b64 = zan_and(g->builder,
+            zan_lshr(g->builder, data, sh, pn), LLVMConstInt(i64t, 0xFF, 0), "bm");
+        LLVMValueRef b32 = LLVMBuildTrunc(g->builder, b64, i32t, pn);
+        LLVMValueRef ti = zan_and(g->builder,
+            zan_xor(g->builder, crc, b32, "x"), LLVMConstInt(i32t, 0xFF, 0), "ti");
+        LLVMValueRef ti64 = LLVMBuildZExt(g->builder, ti, i64t, "ti64");
+        LLVMValueRef gep_idx[] = { LLVMConstInt(i64t, 0, 0), ti64 };
+        LLVMValueRef ep = LLVMBuildGEP2(g->builder, tab_ty, tab, gep_idx, 2, "ep");
+        LLVMValueRef te = LLVMBuildLoad2(g->builder, i32t, ep, "te");
+        crc = zan_xor(g->builder, te,
+            zan_lshr(g->builder, crc, LLVMConstInt(i32t, 8, 0), "sh"), "nc");
+    }
+
+    if (nbytes == 8)
+        LLVMBuildRet(g->builder, LLVMBuildZExt(g->builder, crc, i64t, "ret64"));
+    else
+        LLVMBuildRet(g->builder, crc);
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
     return fn;
 }
@@ -2862,6 +2933,11 @@ static bool emit_sse42_call(zan_irgen_t *g, zan_ast_node_t *expr,
     int argc = expr->call.args.count;
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    /* Hardware intrinsics only where the x86 target can select them; every
+     * other arch gets the bit-exact table helper (dead at runtime on ARM,
+     * where Cpu.HasSse42 lowers to 0). */
+    bool hw_crc = strstr(g->target_triple, "x86") != NULL ||
+                  strstr(g->target_triple, "amd64") != NULL;
 
     if (method.len == 5 && memcmp(method.str, "Crc32", 5) == 0 && argc == 2) {
         zan_ast_node_t *arg0 = expr->call.args.items[0];
@@ -2874,8 +2950,11 @@ static bool emit_sse42_call(zan_irgen_t *g, zan_ast_node_t *expr,
         if (arg0_type && (arg0_type->kind == TYPE_LONG || arg0_type->kind == TYPE_ULONG)) {
             /* ulong Crc32(ulong crc, ulong data) -> llvm.x86.sse42.crc32.64.64 */
             LLVMTypeRef fty = LLVMFunctionType(i64t, (LLVMTypeRef[]){ i64t, i64t }, 2, 0);
-            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.64.64");
-            if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse42.crc32.64.64", fty);
+            LLVMValueRef fn = hw_crc
+                ? (LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.64.64")
+                   ? LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.64.64")
+                   : LLVMAddFunction(g->mod, "llvm.x86.sse42.crc32.64.64", fty))
+                : crc32c_step_fn(g, 8);
             LLVMValueRef args[2] = { coerce_int_to(g, crc_val, i64t), coerce_int_to(g, data_val, i64t) };
             *out = zan_call2(g->builder, fty, fn, args, 2, "crc32_64");
             return true;
@@ -2884,32 +2963,44 @@ static bool emit_sse42_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef crc32 = coerce_int_to(g, crc_val, i32t);
             if (arg1_type && (arg1_type->kind == TYPE_LONG || arg1_type->kind == TYPE_ULONG)) {
                 LLVMTypeRef fty = LLVMFunctionType(i64t, (LLVMTypeRef[]){ i64t, i64t }, 2, 0);
-                LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.64.64");
-                if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse42.crc32.64.64", fty);
+                LLVMValueRef fn = hw_crc
+                    ? (LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.64.64")
+                       ? LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.64.64")
+                       : LLVMAddFunction(g->mod, "llvm.x86.sse42.crc32.64.64", fty))
+                    : crc32c_step_fn(g, 8);
                 LLVMValueRef args[2] = { coerce_int_to(g, crc32, i64t), coerce_int_to(g, data_val, i64t) };
                 *out = coerce_int_to(g, zan_call2(g->builder, fty, fn, args, 2, "crc32_64"), i32t);
                 return true;
             } else if (arg1_type && (arg1_type->kind == TYPE_SHORT || arg1_type->kind == TYPE_USHORT || arg1_type->kind == TYPE_CHAR)) {
                 LLVMTypeRef i16t = LLVMInt16TypeInContext(g->ctx);
                 LLVMTypeRef fty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ i32t, i16t }, 2, 0);
-                LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.32.16");
-                if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse42.crc32.32.16", fty);
+                LLVMValueRef fn = hw_crc
+                    ? (LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.32.16")
+                       ? LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.32.16")
+                       : LLVMAddFunction(g->mod, "llvm.x86.sse42.crc32.32.16", fty))
+                    : crc32c_step_fn(g, 2);
                 LLVMValueRef args[2] = { crc32, coerce_int_to(g, data_val, i16t) };
                 *out = zan_call2(g->builder, fty, fn, args, 2, "crc32_16");
                 return true;
             } else if (arg1_type && (arg1_type->kind == TYPE_BYTE || arg1_type->kind == TYPE_SBYTE)) {
                 LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
                 LLVMTypeRef fty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ i32t, i8t }, 2, 0);
-                LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.32.8");
-                if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse42.crc32.32.8", fty);
+                LLVMValueRef fn = hw_crc
+                    ? (LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.32.8")
+                       ? LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.32.8")
+                       : LLVMAddFunction(g->mod, "llvm.x86.sse42.crc32.32.8", fty))
+                    : crc32c_step_fn(g, 1);
                 LLVMValueRef args[2] = { crc32, coerce_int_to(g, data_val, i8t) };
                 *out = zan_call2(g->builder, fty, fn, args, 2, "crc32_8");
                 return true;
             } else {
                 /* default 32-bit data */
                 LLVMTypeRef fty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ i32t, i32t }, 2, 0);
-                LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.32.32");
-                if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse42.crc32.32.32", fty);
+                LLVMValueRef fn = hw_crc
+                    ? (LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.32.32")
+                       ? LLVMGetNamedFunction(g->mod, "llvm.x86.sse42.crc32.32.32")
+                       : LLVMAddFunction(g->mod, "llvm.x86.sse42.crc32.32.32", fty))
+                    : crc32c_step_fn(g, 4);
                 LLVMValueRef args[2] = { crc32, coerce_int_to(g, data_val, i32t) };
                 *out = zan_call2(g->builder, fty, fn, args, 2, "crc32_32");
                 return true;

@@ -74,12 +74,18 @@
   尾随 NUL 金样契约保留；SDK ModExp 无盲化（P3 已注）、access_token GET query（协议固有）；
   runtime/common 539d72f1、加密 e4da88ba、格式包 c45d8efe、stdlib d16977d5、zanc 卫生
   4e31a537、Json \u0000 统一、GenJson NaN 守卫、rt_mem g_fls/pthread-key、Zan.Xml &#39;。
-- [ ] **B-ID92（P1·arm64 GUI 代码生成崩溃，疑似并发会话 irgen 链引入）**——GUI 宿主程序
-  交叉编 android-arm64/ohos-arm64 即 "LLVM ERROR: Do not know how to promote this
-  operator's operand!"（legalizer 崩，无诊断）。复现：干净 HEAD(d58a5c00) 自烤 zanc +
-  `examples/gui_3d_demo/src/main.zan --target android-arm64 --auto-stdlib`（--emit-lib、
-  --emit-apk 同崩；裸探针仅 GuiHost+空 IGuiHostLoop 亦崩，webp 载荷无关）；对照同程序
-  android-x64 链接成功、console hello 三目标全过、windows 档实跑正常。区间
-  3fe0eb8d..d58a5c00 内 irgen_expr.c/irgen_expr_core.c/lexer.c/package.c 有大改
-  （6f6a63c6/1d485d33，非本会话），本会话提交仅 runtime C+链接段。归因与修复待接手
-  （下拉到最小化 IR 用 llc 定位 promote 算子即可收窄）。
+- [x] **B-ID92（P1·arm64 GUI 代码生成崩溃）闭账（2026-10-04）**——根因与 B-ID84 的
+  webp 无关（当初归因 irgen 链系误判）：`Crc32C_Compute`（Gui 宿主路径经 stdlib 拉入）
+  中 `Sse42.Crc32` 被无条件发射成 `llvm.x86.sse42.crc32.*` intrinsic，任何非 x86 目标
+  （android/ohos-arm64）SelectionDAG 无法 promote 直接 fatal。定位法：--emit-ir（尾
+  截断是 emit-ir 另一独立小缺陷，与崩点无关）→ llc 修 extern_weak/attributes 后复现
+  → 二分到 `@Crc32C_Compute`。修法：emit_sse42_call 按目标分流——x86 仍走硬件
+  intrinsic，其余架构落 `__zan_crc32c_step{1,2,4,8}` 表驱动软件链（复用
+  crc32c_table_global，位精确；ARM 上该分支运行时本被 Cpu.HasSse42→0 守死，纯为
+  模块合法化）。验证：裸 GuiHost 探针+3D demo android-arm64/ohos-arm64 链接通过；
+  CRC32C("123456789")=0xE3069283 标准向量 x86 硬件与 ARM 软件路径（qemu-aarch64 实跑）
+  五值全等；x86 新旧 zanc 逐值一致；crc32_hw conformance 金样过。残项：wasm32 拉
+  Crc32C 现前进到 `couldn't allocate output register for constraint '{ax}'`——
+  `__zan_cpu_feature` 非 ARM 分支的 cpuid 内联 asm 在 wasm 后端非法（既有独立缺陷，
+  另批）；--emit-ir 240MB+ 模块尾截断 exit=0（独立小缺陷，另批）；emit_aes_call 的
+  llvm.x86.aesni.* 同类目标失配（ARM 上若被拉入会同样 fatal，待真实复现再修）。
