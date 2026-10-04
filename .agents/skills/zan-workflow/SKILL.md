@@ -128,7 +128,25 @@ description: 版本提交与任务管理规范——提交信息格式（scope: 
 **交付说明只写用户要关心的**：结果、验证证据、影响面、遗留项；
 调试中间产物的路径不进交付说明，只进提交正文（如属必要）。
 
-## 五、版本号
+## 五、CI 黑腿排查定式（push 后 workflow 不落地/腿变红时）
+
+- 判"腿没跑"还是"腿跑了挂"：先看 job 的 steps 时间线——2 秒即终、零 step = 没
+  跑；真跑了才有编译/测试日志。坑出处：额度耗尽期把 "completed failure" 误读成
+  workflow 坏，连修三天方向全错。
+- 没跑的原因看 check-run 注解（GET /repos/{o}/{r}/check-runs/{job_id}/annotations）：
+  "not started because an Actions budget is preventing further use" = 私有仓
+  Actions 额度耗尽（免费 2000 分钟/月，macOS 腿 10× 计费，一次全腿实跑即烧完；
+  run 会永远 queued，六腿包括 ubuntu 全体不动）。根治=转公开或提额，账期重置日期
+  只有仓库设置页可见，API 拿不到。
+- bot 回写是否落地看 API commits（GET /repos/{o}/{r}/commits）而不是本地
+  origin/main——网络差时本地远端 ref 是陈旧的，会把"已回写"看成"没回写"。
+  workflow_dispatch 手动触发不等于 push 事件：带 `github.event_name == 'push'`
+  条件的回写步骤在 dispatch 下按设计跳过，产物只进 artifact。
+- 环境镜像漂移会让昨天绿的步今天红（msys2 剥掉 base 内置 unzip、VS18 clang
+  多输入 -c 产物落点变化、setup 步安装清单缺包），且后一步的坑会遮住前一步的：
+  修一个红点要等下一次实跑暴露下一个，逐层剥。
+
+## 六、版本号
 
 - 面向发布（对外可见的行为变化/API 新增）才动版本文件；
   内部修复不动。版本变更单独提交或随主功能提交，不夹带无关改动。

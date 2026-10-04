@@ -27,14 +27,19 @@
 
 ## 未完成
 
-- [ ] **B-ID90（P2·工具链）残余仅 macos 双 dylib（Mac 独占，无本地路径）**——本批清偿：
-  win-x64 dll 与 linux-x64 .a 换血（3922859b，bdd0a6a1 音频入面）；linux-arm64 .a
-  首建（fe8da32e，noble arm64 dev 包用户态解包免 sudo 取 X11 四静态档 +
-  aarch64-linux-gnu-gcc，官方脚本同旗子；探针定验未定义面恰为 FT/Fc 二十符号、
-  X11 零缺失，符号面与 x64 对齐差集全为 SSE2 变体）；交叉 rt 十四件重编字节裁定
-  现役（零提交）。macos 双 dylib 需 ObjC+macOS SDK（gui_runtime_mac.m），zig cc
-  不编 ObjC，本机物理不可产，等 Mac runner；drivers.yml 复活即随回写清偿，
-  与 B-ID84 同门。
+- [x] **B-ID90（P2·工具链）残余仅 macos 双 dylib（Mac 独占，无本地路径）**——已闭
+  （10-04）。终章：bot 提交 4875bb84（drivers.yml run 195）刷新 macos-arm64+x64
+  libzan_gui.dylib 双件（bdd0a6a1 音频等入面）；win dll 束随后被 run 196/198 bot
+  连续回写（a2fefbb4/94e41c1c/6f9321e6/f2494002/88cd618d/577505e8）。本批更早清偿：
+  win-x64 dll 与 linux-x64 .a 换血（3922859b）；linux-arm64 .a 首建（fe8da32e，
+  noble arm64 dev 包用户态解包免 sudo）；交叉 rt 十四件字节裁定现役（零提交）。
+  CI 复活三连修（同日 deda5d72/f574839d/7c5a5843/1bda212c）：linux 腿补
+  libfreetype-dev/libfontconfig1-dev（桌面字体分支 unity 编译需 FT/Fc 头）、
+  msys2 装 unzip（MSYS2 镜像漂移剥内置，WebView2 解包炸）、win Lua 段逐文件
+  -o luaobj/（VS18 clang 多输入 -c 产物 glob 不可见，lld-link 吃到字面 '*.obj'）、
+  SDEST 未定义引用清理（0bf3950a 9-10 改名残留，set -u 必炸，被 unzip 缺失遮住）。
+  黑腿根因：私有仓 Actions 额度耗尽（2000 分钟/月，macos 10× 计费一次烧完）——
+  转公开根治，run 194 起六腿复活。
 - [x] **B-ID91（P1·工具链）linux GUI 带文字交叉链接失败（x64/arm64 同）**——已闭
   （10-04 60d7580b）。探针 _scratch/link-probe/{probe,probe-notext}.zan 定谳矩阵：
   无文字+--publish 可链（10-02 516360bc「musl 可链化」验证的正是此形态）；带文字
@@ -55,11 +60,12 @@
   notext+pub x64 1.98MB（回归无劣化）/ text+pub arm64 aarch64 ELF 3.07MB；
   WSL 实跑 text 探针 DISPLAY= 输出 probe-linked EXIT=0。
 - [ ] **B-ID84 残项（P3批·卫生汇总）**——仅余 runtime：libwebp 1.4.0→例行升级（整包换血，
-  单独批次）。**开工前置（2026-10-03 观察）：驱动回写 CI 未证活**——bot 提交自 46477da5
-  （10-01）后全腿归零（c2de7a95/c936/1f69 三次应触发零落地，win 腿疑 continue-on-error
-  吞败，本机不可观测日志）；升级会让 gui_runtime.c unity 内联的 libwebp 变更同步污染
-  五平台驱动（macos dylib 只能 Mac 造，B-ID82 同款陷阱）——先等一次 bot 提交落地证 CI 活，
-  再动此批。其余子项均已闭账/裁决：Encoding.GetByteCount 文档已在位、ByteBuffer.ToBytes
+  单独批次）。**开工前置已解除（2026-10-04）：驱动回写 CI 已证活**——黑腿根因定性为
+  私有仓 Actions 额度耗尽（非 workflow 坏、非腿吞败；check-run 注解原文
+  "not started because an Actions budget is preventing further use"），转公开后
+  bot 提交链连续落地（4875bb84 mac dylib / 94e41c1c 等 win 束），B-ID90 随之闭账。
+  升级会让 gui_runtime.c unity 内联的 libwebp 变更同步污染五平台驱动——CI 现已
+  全绿可自动回写（macos 含 x64 交叉代产），可按批动工。其余子项均已闭账/裁决：Encoding.GetByteCount 文档已在位、ByteBuffer.ToBytes
   尾随 NUL 金样契约保留；SDK ModExp 无盲化（P3 已注）、access_token GET query（协议固有）；
   runtime/common 539d72f1、加密 e4da88ba、格式包 c45d8efe、stdlib d16977d5、zanc 卫生
   4e31a537、Json \u0000 统一、GenJson NaN 守卫、rt_mem g_fls/pthread-key、Zan.Xml &#39;。
