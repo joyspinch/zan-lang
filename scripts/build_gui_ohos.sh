@@ -25,7 +25,7 @@
 #
 # Usage: scripts/build_gui_ohos.sh [x64|arm64|all]   (default: all)
 set -e
-REPO=D:/project/zan-lang
+REPO=$(cd "$(dirname "$0")/.." && pwd)
 DEVECO="C:/Program Files/Huawei/DevEco Studio"
 LLVM="$DEVECO/sdk/default/openharmony/native/llvm/bin"
 CLANG="$LLVM/clang.exe"

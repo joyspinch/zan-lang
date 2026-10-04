@@ -59,13 +59,27 @@
   在途）zanc 四探针矩阵全绿——text+pub x64 3.19MB / text 非pub x64 4.53MB /
   notext+pub x64 1.98MB（回归无劣化）/ text+pub arm64 aarch64 ELF 3.07MB；
   WSL 实跑 text 探针 DISPLAY= 输出 probe-linked EXIT=0。
-- [ ] **B-ID84 残项（P3批·卫生汇总）**——仅余 runtime：libwebp 1.4.0→例行升级（整包换血，
-  单独批次）。**开工前置已解除（2026-10-04）：驱动回写 CI 已证活**——黑腿根因定性为
-  私有仓 Actions 额度耗尽（非 workflow 坏、非腿吞败；check-run 注解原文
-  "not started because an Actions budget is preventing further use"），转公开后
-  bot 提交链连续落地（4875bb84 mac dylib / 94e41c1c 等 win 束），B-ID90 随之闭账。
-  升级会让 gui_runtime.c unity 内联的 libwebp 变更同步污染五平台驱动——CI 现已
-  全绿可自动回写（macos 含 x64 交叉代产），可按批动工。其余子项均已闭账/裁决：Encoding.GetByteCount 文档已在位、ByteBuffer.ToBytes
+- [x] **B-ID84 残项（P3批·卫生汇总）**——libwebp 1.4.0→1.6.0 整包换血闭账（2026-10-04，
+  a1fd1965 源码+金样：20/20 样张 RGBA CRC 新旧一致；三处本地改造按 README 重放：文件相对
+  include 291 处、quant_levels_dec clip_8b_ql 改名（1.6.0 与 dsp/dec.c unity 冲突复现）、
+  lossless.h enc 头剔除；x64+aarch64 unity 编译净）。驱动全档刷新：macos dylib+win dll 束
+  CI bot 回写（fc808204/13bf2761/d58a5c00）；android×2+ohos×2 本机重刷（NDK/DevEco，
+  nm 面=纯 webp 上游增删：删 VP8LClear/VP8LPredictor{0,1}_C，增 IsValidColorspace/
+  WebPValidateDecoderConfig；每目标 clang 编译+.so 链接+.a 归档步全过；win 侧 webp 解码
+  实跑探针通过）。linux-x64/arm64 .a 本机已烤出 1.6.0 档（3380 面）但因并发会话四档
+  在途（M，1.4.0 时代内容）按规则 11 不越权覆盖，待其落地后按本提交同法重刷。顺修
+  build_gui_ohos.sh REPO 机器绝对路径硬编码→脚本位推导（曾把主树在途 gui_runtime.c
+  烤进产物，已还原重烤）。
+  其余子项均已闭账/裁决：Encoding.GetByteCount 文档已在位、ByteBuffer.ToBytes
   尾随 NUL 金样契约保留；SDK ModExp 无盲化（P3 已注）、access_token GET query（协议固有）；
   runtime/common 539d72f1、加密 e4da88ba、格式包 c45d8efe、stdlib d16977d5、zanc 卫生
   4e31a537、Json \u0000 统一、GenJson NaN 守卫、rt_mem g_fls/pthread-key、Zan.Xml &#39;。
+- [ ] **B-ID92（P1·arm64 GUI 代码生成崩溃，疑似并发会话 irgen 链引入）**——GUI 宿主程序
+  交叉编 android-arm64/ohos-arm64 即 "LLVM ERROR: Do not know how to promote this
+  operator's operand!"（legalizer 崩，无诊断）。复现：干净 HEAD(d58a5c00) 自烤 zanc +
+  `examples/gui_3d_demo/src/main.zan --target android-arm64 --auto-stdlib`（--emit-lib、
+  --emit-apk 同崩；裸探针仅 GuiHost+空 IGuiHostLoop 亦崩，webp 载荷无关）；对照同程序
+  android-x64 链接成功、console hello 三目标全过、windows 档实跑正常。区间
+  3fe0eb8d..d58a5c00 内 irgen_expr.c/irgen_expr_core.c/lexer.c/package.c 有大改
+  （6f6a63c6/1d485d33，非本会话），本会话提交仅 runtime C+链接段。归因与修复待接手
+  （下拉到最小化 IR 用 llc 定位 promote 算子即可收窄）。
