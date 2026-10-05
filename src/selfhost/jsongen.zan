@@ -18,11 +18,20 @@ namespace Zan;
 // and JsonValue-typed fields pass their subtree through untouched. Field
 // types outside the supported set are a compile error unless the field is
 // annotated [JsonIgnore] (fail closed — never silently drop a field).
+class JsonNeedEntry {
+    public string name;
+    public int isRootList;
+
+    public JsonNeedEntry(string name, int isRootList) {
+        this.name = name != null ? name : "";
+        this.isRootList = isRootList;
+    }
+}
+
 class Jsongen {
     Node unit;
     Diags diags;
-    List<string> needNames;
-    List<int> needRootList;
+    List<JsonNeedEntry> needs;
     bool any;
 
     // field-kind classification (mirrors jg_fk_t)
@@ -43,8 +52,7 @@ class Jsongen {
     public Jsongen() {
         unit = null;
         diags = null;
-        needNames = new List<string>();
-        needRootList = new List<int>();
+        needs = new List<JsonNeedEntry>();
         any = false;
         elemName = "";
         elemKind = 0;
@@ -103,8 +111,8 @@ class Jsongen {
 
     int NeedFind(string name) {
         int i = 0;
-        while (i < needNames.Count) {
-            if (needNames[i] == name) { return i; }
+        while (i < needs.Count) {
+            if (needs[i].name == name) { return i; }
             i = i + 1;
         }
         return 0 - 1;
@@ -113,9 +121,8 @@ class Jsongen {
     int NeedAdd(string name) {
         int at = NeedFind(name);
         if (at >= 0) { return at; }
-        needNames.Add(name);
-        needRootList.Add(0);
-        return needNames.Count - 1;
+        needs.Add(new JsonNeedEntry(name, 0));
+        return needs.Count - 1;
     }
 
     // ---- call-site scan + rewrite ----
@@ -164,7 +171,7 @@ class Jsongen {
             return;
         }
         int at = NeedAdd(cls);
-        if (asList) { needRootList[at] = 1; }
+        if (asList) { needs[at].isRootList = 1; }
         any = true;
 
         string prefix = "S_";
@@ -408,7 +415,7 @@ class Jsongen {
     }
 
     string GenClass(int idx) {
-        string cls = needNames[idx];
+        string cls = needs[idx].name;
         Node decl = FindDecl(cls, AK.ClassDecl());
         if (decl == null) { return ""; }
         string s = "";
@@ -439,7 +446,7 @@ class Jsongen {
         s = s + "    static " + cls + " D_" + cls + "(string s) { return __JsonBind.B_" + cls + "(JsonValue.ParseLenient(s)); }\n";
         s = s + "    static string S_" + cls + "(" + cls + " o) { StringBuilder sb = new StringBuilder(); __JsonBind.W_" + cls + "(sb, o); return sb.ToString(); }\n";
 
-        if (needRootList[idx] == 1) {
+        if (needs[idx].isRootList == 1) {
             s = s + "    static List<" + cls + "> DL_" + cls + "(string s) {\n";
             s = s + "        JsonValue v = JsonValue.ParseLenient(s);\n";
             s = s + "        List<" + cls + "> r = new List<" + cls + ">();\n";
@@ -496,8 +503,8 @@ class Jsongen {
         // [JsonIgnore]; anything else aborts compilation rather than emitting
         // a serializer that silently omits the field.
         int vi = 0;
-        while (vi < needNames.Count) {
-            ValidateClass(needNames[vi]);
+        while (vi < needs.Count) {
+            ValidateClass(needs[vi].name);
             vi = vi + 1;
         }
         if (diags.HasErrors()) { return; }
@@ -505,9 +512,9 @@ class Jsongen {
         string src = "class __JsonBind {\n";
         src = src + "    static JsonValue T_Str(string s) { if (s == null) { return JsonValue.NewNull(); } return JsonValue.NewStr(s); }\n";
         src = src + "    static JsonValue T_Jv(JsonValue x) { if (x == null) { return JsonValue.NewNull(); } return x; }\n";
-        // GenClass may append to needNames while generating (nested classes)
+        // GenClass may append to needs while generating (nested classes)
         int gi = 0;
-        while (gi < needNames.Count) {
+        while (gi < needs.Count) {
             src = src + GenClass(gi);
             gi = gi + 1;
         }

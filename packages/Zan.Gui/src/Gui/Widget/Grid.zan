@@ -3,6 +3,19 @@ using Gui;
 
 namespace Gui.Widget;
 
+/// <summary>强类型栅格单元槽位实体：把子项的行、起始列、跨列记录在单一结构体中，消除 rowOf/colOf/spanOf 平行列表。</summary>
+class GridSlotPlacement {
+    public int row;
+    public int col;
+    public int span;
+
+    public GridSlotPlacement(int row, int col, int span) {
+        this.row = row;
+        this.col = col;
+        this.span = span;
+    }
+}
+
 /// 等宽栅格容器（Naive UI n-grid）：把子控件铺进 N 等宽列，
 /// 列宽自适应容器宽度，行高按每行最高的格子决定。
 ///
@@ -121,12 +134,8 @@ class Grid : Control {
         return w;
     }
 
-    /// 把可见子项分配到各行：返回每个子项所在的行号写入 `rowOf`、
-    /// 起始列写入 `colOf`、实际跨列写入 `spanOf`，并返回行数。
-    /// 一行放不下当前格时换行；跨列超过总列数的格子按总列数截断，
-    /// 因此不会出现放不进任何一行的死格。
-    int Place(int n, List<Control> items, List<int> rowOf, List<int> colOf,
-              List<int> spanOf) {
+    /// 强类型实体主方法：把可见子项分配到各行各列，生成 GridSlotPlacement 列表并返回行数。
+    int PlaceSlots(int n, List<Control> items, List<GridSlotPlacement> outSlots) {
         int row = 0;
         int cursor = 0;
         for (int i = 0; i < items.Count; i = i + 1) {
@@ -143,9 +152,9 @@ class Grid : Control {
                 if (off > n - span) { off = n - span; }
                 if (off < 0) { off = 0; }
             }
-            rowOf.Add(row);
-            colOf.Add(cursor + off);
-            spanOf.Add(span);
+            if (outSlots != null) {
+                outSlots.Add(new GridSlotPlacement(row, cursor + off, span));
+            }
             cursor = cursor + off + span;
             if (cursor >= n) {
                 row = row + 1;
@@ -154,6 +163,19 @@ class Grid : Control {
         }
         if (cursor > 0) { row = row + 1; }
         return row;
+    }
+
+    /// 把可见子项分配到各行（兼容入口）：内部调用 PlaceSlots 强类型实体生成。
+    int Place(int n, List<Control> items, List<int> rowOf, List<int> colOf,
+              List<int> spanOf) {
+        List<GridSlotPlacement> slots = new List<GridSlotPlacement>();
+        int rows = this.PlaceSlots(n, items, slots);
+        for (int i = 0; i < slots.Count; i = i + 1) {
+            if (rowOf != null) { rowOf.Add(slots[i].row); }
+            if (colOf != null) { colOf.Add(slots[i].col); }
+            if (spanOf != null) { spanOf.Add(slots[i].span); }
+        }
+        return rows;
     }
 
     /// 当前可见（StyleVisible）的子项。
@@ -194,13 +216,21 @@ class Grid : Control {
             cw = prefW - this.StylePadL() - this.StylePadR();
         }
         int n = this.ResolvedCols(cw);
-        List<int> rowOf = new List<int>();
-        List<int> colOf = new List<int>();
-        List<int> spanOf = new List<int>();
-        int rows = this.Place(n, items, rowOf, colOf, spanOf);
-        List<int> hs = this.RowHeights(rows, items, rowOf);
+        List<GridSlotPlacement> slots = new List<GridSlotPlacement>();
+        int rows = this.PlaceSlots(n, items, slots);
+        List<int> rowHeights = new List<int>();
+        for (int r = 0; r < rows; r = r + 1) { rowHeights.Add(0); }
+        for (int i = 0; i < items.Count; i = i + 1) {
+            int r = slots[i].row;
+            int h = items[i].prefH;
+            if (h > rowHeights[r]) { rowHeights[r] = h; }
+        }
+        int declared = this.StyleLineHeight();
+        if (declared > 0) {
+            for (int r = 0; r < rows; r = r + 1) { rowHeights[r] = declared; }
+        }
         int total = 0;
-        for (int r = 0; r < rows; r = r + 1) { total = total + hs[r]; }
+        for (int r = 0; r < rows; r = r + 1) { total = total + rowHeights[r]; }
         if (rows > 1) { total = total + this.RowGapPx() * (rows - 1); }
         if (prefH <= 0 && total > 0) {
             prefH = total + this.StylePadT() + this.StylePadB();
@@ -236,11 +266,19 @@ class Grid : Control {
         int xg = this.ColGapPx();
         int yg = this.RowGapPx();
 
-        List<int> rowOf = new List<int>();
-        List<int> colOf = new List<int>();
-        List<int> spanOf = new List<int>();
-        int rows = this.Place(n, items, rowOf, colOf, spanOf);
-        List<int> hs = this.RowHeights(rows, items, rowOf);
+        List<GridSlotPlacement> slots = new List<GridSlotPlacement>();
+        int rows = this.PlaceSlots(n, items, slots);
+        List<int> hs = new List<int>();
+        for (int r = 0; r < rows; r = r + 1) { hs.Add(0); }
+        for (int i = 0; i < items.Count; i = i + 1) {
+            int r = slots[i].row;
+            int h = items[i].prefH;
+            if (h > hs[r]) { hs[r] = h; }
+        }
+        int declared = this.StyleLineHeight();
+        if (declared > 0) {
+            for (int r = 0; r < rows; r = r + 1) { hs[r] = declared; }
+        }
 
         // 行的纵向起点：逐行累加，行间插 row-gap。
         List<int> tops = new List<int>();
@@ -252,9 +290,9 @@ class Grid : Control {
 
         for (int i = 0; i < items.Count; i = i + 1) {
             Control c = items[i];
-            int left = Grid.ColEdge(cw, xg, n, colOf[i]);
-            int w = Grid.SpanWidth(cw, xg, n, colOf[i], spanOf[i]);
-            c.Arrange(cx + left, cy + tops[rowOf[i]], w, hs[rowOf[i]]);
+            int left = Grid.ColEdge(cw, xg, n, slots[i].col);
+            int w = Grid.SpanWidth(cw, xg, n, slots[i].col, slots[i].span);
+            c.Arrange(cx + left, cy + tops[slots[i].row], w, hs[slots[i].row]);
         }
     }
 

@@ -12,6 +12,19 @@ using ZanWeb.Web;
 
 namespace ZanWeb.Security;
 
+/// <summary>强类型 Token 版本缓存条目实体：将 uid、版本号与到期时间绑定，消除平行列表反模式。</summary>
+class AuthTokenVersionEntry {
+    public string uid;
+    public int version;
+    public int goodUntil;
+
+    public AuthTokenVersionEntry(string uid, int version, int goodUntil) {
+        this.uid = uid != null ? uid : "";
+        this.version = version;
+        this.goodUntil = goodUntil;
+    }
+}
+
 class AuthUser {
     /* 可登录账号的状态值。*/
     static int Active = 1;
@@ -164,16 +177,15 @@ class AuthUser {
        后旧 token 最迟再有效 VerTtlSec 秒——对管理动作足够快，且 Forget 时主动失效。*/
     static int VerTtlSec = 30;
 
-    static List<string> verUids = new List<string>();
-    static List<int> verVals = new List<int>();
-    static List<int> verGoodUntil = new List<int>();
+    static List<AuthTokenVersionEntry> verEntries = new List<AuthTokenVersionEntry>();
 
     /* 命中返回缓存的版本号，过期/缺失返回 -1。 */
     static int CachedVersion(string uid, int now) {
-        lock (AuthUser.verUids) {
-            for (int i = 0; i < AuthUser.verUids.Count; i = i + 1) {
-                if (AuthUser.verUids[i] == uid && AuthUser.verGoodUntil[i] > now) {
-                    return AuthUser.verVals[i];
+        lock (AuthUser.verEntries) {
+            for (int i = 0; i < AuthUser.verEntries.Count; i = i + 1) {
+                AuthTokenVersionEntry e = AuthUser.verEntries[i];
+                if (e != null && e.uid == uid && e.goodUntil > now) {
+                    return e.version;
                 }
             }
         }
@@ -181,32 +193,28 @@ class AuthUser {
     }
 
     static void StoreVersion(string uid, int version, int now) {
-        lock (AuthUser.verUids) {
+        lock (AuthUser.verEntries) {
             /* 顺带清扫过期项：倒序安全移除，永不漏项或死循环。 */
-            for (int i = AuthUser.verUids.Count - 1; i >= 0; i = i - 1) {
-                if (AuthUser.verGoodUntil[i] <= now) {
-                    AuthUser.verUids.RemoveAt(i);
-                    AuthUser.verVals.RemoveAt(i);
-                    AuthUser.verGoodUntil.RemoveAt(i);
-                } else if (AuthUser.verUids[i] == uid) {
-                    AuthUser.verVals[i] = version;
-                    AuthUser.verGoodUntil[i] = now + AuthUser.VerTtlSec;
+            for (int i = AuthUser.verEntries.Count - 1; i >= 0; i = i - 1) {
+                AuthTokenVersionEntry e = AuthUser.verEntries[i];
+                if (e == null || e.goodUntil <= now) {
+                    AuthUser.verEntries.RemoveAt(i);
+                } else if (e.uid == uid) {
+                    e.version = version;
+                    e.goodUntil = now + AuthUser.VerTtlSec;
                     return;
                 }
             }
-            AuthUser.verUids.Add(uid);
-            AuthUser.verVals.Add(version);
-            AuthUser.verGoodUntil.Add(now + AuthUser.VerTtlSec);
+            AuthUser.verEntries.Add(new AuthTokenVersionEntry(uid, version, now + AuthUser.VerTtlSec));
         }
     }
 
     static void DropCachedVersion(string uid) {
-        lock (AuthUser.verUids) {
-            for (int i = 0; i < AuthUser.verUids.Count; i = i + 1) {
-                if (AuthUser.verUids[i] == uid) {
-                    AuthUser.verUids.RemoveAt(i);
-                    AuthUser.verVals.RemoveAt(i);
-                    AuthUser.verGoodUntil.RemoveAt(i);
+        lock (AuthUser.verEntries) {
+            for (int i = 0; i < AuthUser.verEntries.Count; i = i + 1) {
+                AuthTokenVersionEntry e = AuthUser.verEntries[i];
+                if (e != null && e.uid == uid) {
+                    AuthUser.verEntries.RemoveAt(i);
                     return;
                 }
             }
@@ -252,10 +260,8 @@ class AuthUser {
     }
 
     static void ForgetAllLocal() {
-        lock (AuthUser.verUids) {
-            AuthUser.verUids.Clear();
-            AuthUser.verVals.Clear();
-            AuthUser.verGoodUntil.Clear();
+        lock (AuthUser.verEntries) {
+            AuthUser.verEntries.Clear();
         }
         PermTable.ForgetAll();
     }
