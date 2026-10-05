@@ -1372,6 +1372,24 @@ void zan_co_live_reset(void) {
  * init and the M:1 timer loop via zan_timer_set_ready_hook). */
 
 #define JOIN_OFF_DONE (12 + (int)sizeof(void *)) /* co_header: done field */
+/* Cross-boundary ABI contract: the emitter lays every async frame out as
+ * { i64 sched; void(i8*) *sched_step; i32 state; i32 done; ... } (the
+ * ASYNC_FRAME_* indices in src/compiler/irgen_expr_core.c) while this object
+ * probes DONE behind the runtime's back (join_pair_done / zan_join_bind).
+ * Mirror the header prefix and pin the offsets at compile time so a layout
+ * change on either side -- which would silently break every WhenAll/WhenAny
+ * -- fails the build instead. */
+typedef struct zan_co_header_probe {
+    long long sched;                /* ASYNC_FRAME_SCHED (i64)      */
+    void (*sched_step)(void *);     /* ASYNC_FRAME_SCHED_STEP (ptr) */
+    int state;                      /* ASYNC_FRAME_STATE (i32)      */
+    int done;                       /* ASYNC_FRAME_DONE (i32)       */
+} zan_co_header_probe;
+_Static_assert(offsetof(zan_co_header_probe, done) == JOIN_OFF_DONE,
+               "JOIN_OFF_DONE drifts from the emitter's ASYNC_FRAME_DONE "
+               "(see irgen_expr_core.c)");
+_Static_assert(offsetof(zan_co_header_probe, state) == JOIN_OFF_DONE - (int)sizeof(int),
+               "co header state/done pair out of order vs JOIN_OFF_DONE");
 
 typedef struct zan_join_pair {
     void            *frame;

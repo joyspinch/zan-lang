@@ -41,13 +41,13 @@
 #include <errno.h>
 #include "rt_crash.h"
 
-static int zan_io_trace(void){static int t=-1;if(t<0){const char*e=getenv("ZAN_IO_TRACE");t=(e&&*e&&*e!='0')?1:0;}return t;}
+static int zan_io_trace(void){static volatile int t=-1;int c=__atomic_load_n(&t,__ATOMIC_RELAXED);if(c<0){const char*e=getenv("ZAN_IO_TRACE");c=(e&&*e&&*e!='0')?1:0;__atomic_store_n(&t,c,__ATOMIC_RELAXED);}return c;}
 #define IOTRACE(...) do{if(zan_io_trace()){fprintf(stderr,"[iot] " __VA_ARGS__);fprintf(stderr,"\n");fflush(stderr);}}while(0)
 
 /* scheduler-park trace: one line per park/unpark/pump decision so a
  * "threads are all asleep on something" state can be attributed to a section
  * by matching the last line each worker printed against its kernel wchan. */
-static int zan_sched_trace(void){static int t=-1;if(t<0){const char*e=getenv("ZAN_SCHED_TRACE");t=(e&&*e&&*e!='0')?1:0;}return t;}
+static int zan_sched_trace(void){static volatile int t=-1;int c=__atomic_load_n(&t,__ATOMIC_RELAXED);if(c<0){const char*e=getenv("ZAN_SCHED_TRACE");c=(e&&*e&&*e!='0')?1:0;__atomic_store_n(&t,c,__ATOMIC_RELAXED);}return c;}
 #define STRACE(...) do{if(zan_sched_trace()){fprintf(stderr,"[st] " __VA_ARGS__);fprintf(stderr,"\n");fflush(stderr);}}while(0)
 
 
@@ -1140,7 +1140,7 @@ int32_t zan_io_crypto_windows_ssl_policy(const unsigned char *certs, int32_t tot
     status.cbSize = sizeof(status);
     if (!verify_policy(CERT_CHAIN_POLICY_SSL, chain, &policy, &status)) { result = -9; goto cleanup; }
     if (status.dwError != 0) {
-        result = (status.dwError == CERT_E_CN_NO_MATCH) ? -8 : -9;
+        result = ((HRESULT)status.dwError == CERT_E_CN_NO_MATCH) ? -8 : -9;
         goto cleanup;
     }
     result = 1;
