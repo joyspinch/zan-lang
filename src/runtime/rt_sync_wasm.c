@@ -436,9 +436,9 @@ int zan_io_socket_peer_ip_into(long long sock, char *buf, int cap) {
 
 void zan_io_socket_cleanup(void) {}
 
-int zan_io_resolve_ipv4(const char *hostname) {
+int32_t zan_io_resolve_ipv4(const char *hostname) {
     (void)hostname;
-    return -1;
+    return 0;
 }
 
 int zan_io_resolve_sa(const char *name, int port, void *buf, int cap) {

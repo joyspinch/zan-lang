@@ -824,10 +824,12 @@ int32_t zan_io_resolve_ipv4(const char *hostname) {
     struct addrinfo *res = NULL;
     if (getaddrinfo(hostname, NULL, &hints, &res) != 0 || !res) return 0;
     struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
-    int32_t addr = 0;
+    uint32_t addr_bits = 0;
     if (res->ai_family == AF_INET && sin->sin_family == AF_INET)
-        addr = (int32_t)sin->sin_addr.s_addr;
+        addr_bits = sin->sin_addr.s_addr;
     freeaddrinfo(res);
+    int32_t addr;
+    memcpy(&addr, &addr_bits, sizeof(addr));
     return addr;
 }
 

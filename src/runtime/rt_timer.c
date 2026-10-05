@@ -188,13 +188,25 @@ static int g_soft_seen_count;
 static int g_soft_strict;
 
 static int zan_soft_is_hard(void) {
+    /* Same lazy-init shape as zan_rt_soft_scratch below: the guards test this
+     * on any worker thread under multi-worker builds, and a plain first-write
+     * to a shared static is a C data race even when both racers store the
+     * same value. The computation is idempotent (the getenv result and
+     * g_soft_strict -- set once by the main prologue -- are process-stable),
+     * so the timer lock is pure race removal. It is never called with that
+     * lock held: guard_fail2/guard_fail3 test it before the note/report
+     * entry points take it, and the emitted guards calling
+     * zan_rt_soft_is_hard hold no runtime lock. */
+    timer_lock();
     static int hard = -1;
     if (hard < 0) {
         const char *env = getenv("ZAN_RT_HARD");
         hard = (env && *env && *env != '0') ? 1 : 0;
         if (!hard && !env) hard = g_soft_strict;
     }
-    return hard;
+    int v = hard;
+    timer_unlock();
+    return v;
 }
 
 int zan_rt_soft_is_hard(void) { return zan_soft_is_hard(); }
@@ -247,6 +259,15 @@ static void store_u64_le(unsigned char *p, uint64_t v) {
 }
 
 unsigned char *zan_rt_soft_scratch(void) {
+    /* Guard paths fire on any worker thread under multi-worker builds, and
+     * the old lazy init was a plain check-then-write: two first callers
+     * could race the memset + store_u64_le sequence, and a third could
+     * observe g_soft_scratch non-null while the ARC header words in front
+     * of the payload were still being written -- retain/release on a
+     * half-built page is exactly the heap corruption this page exists to
+     * prevent. Cold path (a null reference already happened), so the timer
+     * lock costs nothing and needs no new per-platform atomic plumbing. */
+    timer_lock();
     if (!g_soft_scratch) {
         unsigned char *hdr = g_soft_scratch_store.bytes;
         memset(hdr, 0, sizeof(g_soft_scratch_store.bytes));
@@ -256,7 +277,9 @@ unsigned char *zan_rt_soft_scratch(void) {
         store_u64_le(hdr + 24, ZAN_ARRAY_MAGIC);        /* P-8:  discriminator */
         g_soft_scratch = hdr + 32;
     }
-    return g_soft_scratch;
+    unsigned char *scratch = g_soft_scratch;
+    timer_unlock();
+    return scratch;
 }
 
 /* One message per site per process: the same null field hit in a loop would
@@ -1279,7 +1302,8 @@ void zan_co_live_del(void *frame) {
         i = (i + 1) & mask;
     }
     live_unlock();
-    if (fire_joiner && fire_step && g_ready_hook) g_ready_hook(fire_joiner, fire_step);
+    void (*_hook)(void *, zan_timer_step_t) = g_ready_hook;
+    if (fire_joiner && fire_step && _hook) _hook(fire_joiner, fire_step);
 }
 
 int zan_co_live_count(void) {
@@ -1369,6 +1393,7 @@ typedef struct zan_join {
      * rescan of all N pairs on EVERY completion (O(N^2) under the global
      * lock) to this counter hitting zero. */
     int              remaining;
+    int              capacity; /* elements allocated in pairs[]             */
     zan_join_pair_t  pairs[]; /* flexible array, one allocation            */
 } zan_join_t;
 
@@ -1506,9 +1531,14 @@ static void join_on_untrack(void *frame, void **out_joiner, zan_timer_step_t *ou
  * the fallback for a frame that leaves the registry without a normal
  * completion. Lock-free fast path for programs that never join. */
 static int zan_sched_trace(void) {
-    static int t = -1;
-    if (t < 0) { const char *e = getenv("ZAN_SCHED_TRACE"); t = (e && *e && *e != '0') ? 1 : 0; }
-    return t;
+    static volatile int t = -1;
+    int cur = __atomic_load_n(&t, __ATOMIC_RELAXED);
+    if (cur < 0) {
+        const char *e = getenv("ZAN_SCHED_TRACE");
+        cur = (e && *e && *e != '0') ? 1 : 0;
+        __atomic_store_n(&t, cur, __ATOMIC_RELAXED);
+    }
+    return cur;
 }
 
 void zan_join_complete(void *frame) {
@@ -1532,7 +1562,8 @@ void zan_join_complete(void *frame) {
     if (zan_sched_trace())
         fprintf(stderr, "[st] joincmp frame=%p rem=%d np=%d any=%d fired=%d\n",
                 frame, rem_dbg, np_dbg, any_dbg, fired_dbg);
-    if (fire_joiner && fire_step && g_ready_hook) g_ready_hook(fire_joiner, fire_step);
+    void (*_hook)(void *, zan_timer_step_t) = g_ready_hook;
+    if (fire_joiner && fire_step && _hook) _hook(fire_joiner, fire_step);
 }
 
 long long zan_join_new(int npairs, int any) {
@@ -1541,6 +1572,7 @@ long long zan_join_new(int npairs, int any) {
     if (!j) zan_rt_fatal("oom", "join: entry alloc failed");
     memset(j, 0, sz);
     j->any = (any != 0);
+    j->capacity = npairs;
     return (long long)(intptr_t)j;
 }
 
@@ -1559,6 +1591,7 @@ int zan_join_bind(long long entry, void *frame, int idx) {
             (const volatile int32_t *)((const unsigned char *)frame + JOIN_OFF_DONE),
             __ATOMIC_ACQUIRE);
         if (!done) {
+            if (j->npairs >= j->capacity) { live_unlock(); return 0; }
             zan_join_pair_t *pr = &j->pairs[j->npairs];
             pr->frame = frame;
             pr->owner = j;
@@ -1614,13 +1647,13 @@ static volatile int g_cfg_workers   = 0;    /* 0  = unset (CPU count) */
 static volatile int g_cfg_io_shards = 0;    /* 0  = unset (one per worker) */
 static volatile int g_cfg_sync_fast = -1;   /* -1 = unset */
 
-void zan_async_set_workers(int32_t n)    { g_cfg_workers = (n > 0) ? (int)n : 0; }
-void zan_async_set_io_shards(int32_t n)  { g_cfg_io_shards = (n > 0) ? (int)n : 0; }
-void zan_async_set_sync_fast(int32_t on) { g_cfg_sync_fast = on ? 1 : 0; }
+void zan_async_set_workers(int32_t n)    { __atomic_store_n(&g_cfg_workers, (n > 0) ? (int)n : 0, __ATOMIC_RELEASE); }
+void zan_async_set_io_shards(int32_t n)  { __atomic_store_n(&g_cfg_io_shards, (n > 0) ? (int)n : 0, __ATOMIC_RELEASE); }
+void zan_async_set_sync_fast(int32_t on) { __atomic_store_n(&g_cfg_sync_fast, on ? 1 : 0, __ATOMIC_RELEASE); }
 
-int32_t zan_async_cfg_workers(void)   { return (int32_t)g_cfg_workers; }
-int32_t zan_async_cfg_io_shards(void) { return (int32_t)g_cfg_io_shards; }
-int32_t zan_async_cfg_sync_fast(void) { return (int32_t)g_cfg_sync_fast; }
+int32_t zan_async_cfg_workers(void)   { return (int32_t)__atomic_load_n(&g_cfg_workers, __ATOMIC_ACQUIRE); }
+int32_t zan_async_cfg_io_shards(void) { return (int32_t)__atomic_load_n(&g_cfg_io_shards, __ATOMIC_ACQUIRE); }
+int32_t zan_async_cfg_sync_fast(void) { return (int32_t)__atomic_load_n(&g_cfg_sync_fast, __ATOMIC_ACQUIRE); }
 
 /* ---- shortest round-trip double formatting (audit D6/D25) --------------
  * zan_rt_dbl_str writes `v` in the C# default ("G") layout: the shortest

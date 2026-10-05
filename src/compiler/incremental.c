@@ -516,6 +516,13 @@ static DWORD WINAPI compile_worker(LPVOID arg) {
         }
     }
 
+    if (strchr(task->source_path, '"') || strchr(obj_path, '"')) {
+        task->result->source_path = zan_strdup(task->source_path);
+        task->result->object_path = NULL;
+        task->result->exit_code = -1;
+        task->result->error_msg = zan_strdup("path contains embedded quote");
+        return 1;
+    }
     char cmd[2048];
     snprintf(cmd, sizeof(cmd), "zanc \"%s\" --emit-obj -o \"%s\" 2>&1", task->source_path, obj_path);
 
@@ -610,6 +617,13 @@ static void *compile_worker_posix(void *arg) {
         }
     }
 
+    if (strchr(task->source_path, '"') || strchr(obj_path, '"')) {
+        task->result->source_path = zan_strdup(task->source_path);
+        task->result->object_path = NULL;
+        task->result->exit_code = -1;
+        task->result->error_msg = zan_strdup("path contains embedded quote");
+        return NULL;
+    }
     char cmd[2048];
     snprintf(cmd, sizeof(cmd), "zanc \"%s\" --emit-obj -o \"%s\" 2>&1", task->source_path, obj_path);
 

@@ -30,16 +30,21 @@ zan_diag_t *zan_diag_new(zan_arena_t *arena) {
 void zan_diag_add_file(zan_diag_t *diag, const char *name, const char *source) {
     /* simple dynamic array for file list */
     int idx = diag->file_count;
-    diag->file_count++;
+    int new_count = idx + 1;
 
     const char **names = (const char **)realloc((void *)diag->file_names,
-                                                 sizeof(char *) * (size_t)diag->file_count);
+                                                 sizeof(char *) * (size_t)new_count);
+    if (!names) return;
+    diag->file_names = names;
+
     const char **sources = (const char **)realloc((void *)diag->file_sources,
-                                                   sizeof(char *) * (size_t)diag->file_count);
+                                                   sizeof(char *) * (size_t)new_count);
+    if (!sources) return;
+    diag->file_sources = sources;
+
     names[idx] = name;
     sources[idx] = source;
-    diag->file_names = names;
-    diag->file_sources = sources;
+    diag->file_count = new_count;
 }
 
 /* find the line containing `offset` in `source` and return its start */

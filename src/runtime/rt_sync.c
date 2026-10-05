@@ -61,16 +61,28 @@ static const char *zan_android_shm_dir(void) {
     const char *d = getenv("ZAN_SHM_DIR");
     return (d && d[0]) ? d : "/data/local/tmp";
 }
-static int zan_android_shm_open(const char *name, int flags, mode_t mode) {
-    char path[288];
+/* Formats <dir>/<name> and fails loudly (ENAMETOOLONG) when it does not fit:
+ * the old 288-byte buffer + unchecked snprintf silently truncated -- an app
+ * file dir on Android (getFilesDir + a long package name) already clears
+ * 250 bytes, and a truncated path makes open() succeed on the WRONG file or
+ * unlink() miss the one that matters. */
+static int zan_android_shm_path(const char *name, char *path, size_t cap) {
     if (name[0] == '/') name++;
-    snprintf(path, sizeof(path), "%s/%s", zan_android_shm_dir(), name);
+    int n = snprintf(path, cap, "%s/%s", zan_android_shm_dir(), name);
+    if (n < 0 || (size_t)n >= cap) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+static int zan_android_shm_open(const char *name, int flags, mode_t mode) {
+    char path[1024];
+    if (zan_android_shm_path(name, path, sizeof(path)) != 0) return -1;
     return open(path, flags | O_CLOEXEC, mode);
 }
 static int zan_android_shm_unlink(const char *name) {
-    char path[288];
-    if (name[0] == '/') name++;
-    snprintf(path, sizeof(path), "%s/%s", zan_android_shm_dir(), name);
+    char path[1024];
+    if (zan_android_shm_path(name, path, sizeof(path)) != 0) return -1;
     return unlink(path);
 }
 #define shm_open(n, f, m) zan_android_shm_open((n), (f), (m))
@@ -423,10 +435,19 @@ static void zan_lock_word_acquire(volatile uint32_t *word) {
         } else {
             LONG held = InterlockedCompareExchange((volatile LONG *)word,
                                                    0, 0);
-            if ((held & (LONG)ZAN_LOCK_HELD_BIT) &&
-                !zan_pid_alive((uint32_t)held & ZAN_LOCK_PID_MASK) &&
-                !zan_pid_alive((uint32_t)held & ZAN_LOCK_PID_MASK)) {
-                InterlockedCompareExchange((volatile LONG *)word, 0, held);
+            LONG hpid = held & (LONG)ZAN_LOCK_PID_MASK;
+            if ((held & (LONG)ZAN_LOCK_HELD_BIT) && hpid &&
+                !zan_pid_alive((uint32_t)hpid)) {
+                /* Re-read before the second probe so it tests the word as it
+                 * is NOW, not this spin loop's stale snapshot: probe and CAS
+                 * are far apart in wall time, and a lock released and
+                 * re-acquired in between must not be reclaimed. The CAS
+                 * still requires the word to be bit-identical at commit. */
+                LONG now = InterlockedCompareExchange((volatile LONG *)word,
+                                                      0, 0);
+                if (now == held && !zan_pid_alive((uint32_t)hpid)) {
+                    InterlockedCompareExchange((volatile LONG *)word, 0, held);
+                }
             }
             SwitchToThread();
         }
@@ -448,12 +469,17 @@ static void zan_lock_word_acquire(volatile uint32_t *word) {
             sched_yield();
         } else {
             uint32_t held = __atomic_load_n(word, __ATOMIC_RELAXED);
-            if ((held & ZAN_LOCK_HELD_BIT) &&
-                !zan_pid_alive(held & ZAN_LOCK_PID_MASK) &&
-                !zan_pid_alive(held & ZAN_LOCK_PID_MASK)) {
-                __atomic_compare_exchange_n(word, &held, 0, 0,
-                                            __ATOMIC_RELEASE,
-                                            __ATOMIC_RELAXED);
+            uint32_t hpid = held & ZAN_LOCK_PID_MASK;
+            if ((held & ZAN_LOCK_HELD_BIT) && hpid &&
+                !zan_pid_alive(hpid)) {
+                /* Same re-read-then-reprobe as the Windows side above. */
+                uint32_t now = __atomic_load_n(word, __ATOMIC_ACQUIRE);
+                if (now == held && !zan_pid_alive(hpid)) {
+                    uint32_t expected = held;
+                    __atomic_compare_exchange_n(word, &expected, 0, 0,
+                                                __ATOMIC_RELEASE,
+                                                __ATOMIC_RELAXED);
+                }
             }
             sched_yield();
         }
@@ -2779,9 +2805,6 @@ long long zan_mmap_from_file(const char *path, long long size) {
 #else
     int fd = open(path, O_RDWR);
     if (fd < 0) return 0;
-    if (size > 0) {
-        if (ftruncate(fd, (off_t)size) != 0) { close(fd); return 0; }
-    }
     zan_mmap_handle *h = (zan_mmap_handle *)calloc(1, sizeof(zan_mmap_handle));
     if (!h) { close(fd); return 0; }
     h->fd = fd;
@@ -2908,6 +2931,7 @@ static char *zan_get_plat_text(void) {
     char *buffer = (char *)pthread_getspecific(zan_plat_text_key);
     if (!buffer) {
         buffer = (char *)calloc(ZAN_PLAT_TEXT_MAX, 1);
+        if (!buffer) zan_rt_fatal("oom", "sync: text TLS alloc failed");
         if (pthread_setspecific(zan_plat_text_key, buffer) != 0) {
             free(buffer);
             zan_rt_fatal("oom", "sync: text TLS set failed");
