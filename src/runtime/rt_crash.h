@@ -1237,8 +1237,11 @@ static void zan__crash_cache_handler_state(void) {
     time_t now = time(NULL);
     struct tm g, l;
     if (gmtime_r(&now, &g) && localtime_r(&now, &l)) {
+        long day_diff = (long)l.tm_yday - (long)g.tm_yday;
+        if (l.tm_year > g.tm_year) day_diff = 1;
+        else if (l.tm_year < g.tm_year) day_diff = -1;
         zan__crash_tz_off =
-            ((long)(l.tm_yday) - (long)(g.tm_yday)) * 86400L +
+            day_diff * 86400L +
             ((long)(l.tm_hour) - (long)(g.tm_hour)) * 3600L +
             ((long)(l.tm_min) - (long)(g.tm_min)) * 60L +
             ((long)(l.tm_sec) - (long)(g.tm_sec));

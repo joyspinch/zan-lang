@@ -91,6 +91,20 @@ static void zan_io_ignore_sigpipe(void) {
     sigaction(SIGPIPE, &sa, NULL);
 }
 #endif
+
+/* Mark an fd close-on-exec so a child spawned by the program (Process.Spawn
+ * and friends) does not inherit the reactor's internal fds: an inherited wake
+ * pipe write end keeps the pipe alive after shutdown, and an inherited
+ * epoll/kqueue fd is pure leakage. Best effort -- a failure leaves the fd
+ * inheritable, which is today's behaviour anyway. */
+static void zan_io_fd_cloexec(int fd) {
+#if defined(FD_CLOEXEC)
+    if (fd >= 0) fcntl(fd, F_SETFD, FD_CLOEXEC);
+#else
+    (void)fd;
+#endif
+}
+
 #if defined(__linux__)
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -1540,7 +1554,9 @@ static int io_shard_open(int i) {
     if (sh->poll_fd >= 0) return 1;
     sh->poll_fd = epoll_create1(0);
     if (sh->poll_fd < 0) return 0;
+    zan_io_fd_cloexec(sh->poll_fd);
     sh->wake_rfd = sh->wake_wfd = eventfd(0, EFD_NONBLOCK);
+    zan_io_fd_cloexec(sh->wake_rfd);
     if (sh->wake_rfd >= 0) {
         struct epoll_event ev;
         memset(&ev, 0, sizeof(ev));
@@ -1553,6 +1569,7 @@ static int io_shard_open(int i) {
          * EPOLLIN member of shard 0, so a worker thread's eventfd write wakes
          * its poll even when no socket watcher is ready. */
         g_dns_wake_fd = eventfd(0, EFD_NONBLOCK);
+        zan_io_fd_cloexec(g_dns_wake_fd);
         if (g_dns_wake_fd >= 0) {
             struct epoll_event ev;
             memset(&ev, 0, sizeof(ev));
@@ -1974,11 +1991,14 @@ static int io_shard_open(int i) {
     if (sh->poll_fd >= 0) return 1;
     sh->poll_fd = kqueue();
     if (sh->poll_fd < 0) return 0;
+    zan_io_fd_cloexec(sh->poll_fd);
     int pfd[2];
     if (pipe(pfd) == 0) {
         sh->wake_rfd = pfd[0];
         sh->wake_wfd = pfd[1];
         fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+        zan_io_fd_cloexec(pfd[0]);
+        zan_io_fd_cloexec(pfd[1]);
         struct kevent kev;
         EV_SET(&kev, (uintptr_t)pfd[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
         kevent(sh->poll_fd, &kev, 1, NULL, 0, NULL);
@@ -1991,6 +2011,8 @@ static int io_shard_open(int i) {
             g_dns_wake_fd = pfd[0];
             g_dns_wake_wfd = pfd[1];
             fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+            zan_io_fd_cloexec(pfd[0]);
+            zan_io_fd_cloexec(pfd[1]);
             struct kevent kev;
             EV_SET(&kev, (uintptr_t)pfd[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
             kevent(sh->poll_fd, &kev, 1, NULL, 0, NULL);
@@ -3390,6 +3412,8 @@ static void io_init_locked(void) {
             g_dns_wake_fd = pfd[0];
             g_dns_wake_wfd = pfd[1];
             fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+            zan_io_fd_cloexec(pfd[0]);
+            zan_io_fd_cloexec(pfd[1]);
         }
     }
     g_io_started = 1;
@@ -3459,6 +3483,20 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     int32_t woke = io_poll_shard_locked(idx, timeout_ms);
     shard_unlock(sh);
     return woke;
+}
+
+static long long rto_wait_ms(long long caller_ms) {
+    zan_io_shard_t *sh = &g_ioshard[0];
+    if (!sh->rto) return caller_ms;
+    long long now = dns_now_ms();
+    long long nearest = -1;
+    for (zan_io_rto_t *e = sh->rto; e; e = e->next)
+        if (nearest < 0 || e->due_ms < nearest) nearest = e->due_ms;
+    if (nearest < 0) return caller_ms;
+    long long wait = nearest - now;
+    if (wait < 0) wait = 0;
+    if (caller_ms < 0) return wait;
+    return wait < caller_ms ? wait : caller_ms;
 }
 
 static int32_t io_poll_shard_locked(int shard, int64_t timeout_ms) {
@@ -5812,18 +5850,37 @@ static void co_pool_start_background(void) {
     g_co_pool_gen = g_co_pool_gen + 1;
     g_co_pool_out = w;
     co_trace("start", NULL);
+    int made = 0;
     for (int i = 0; i < w; i++) {
         g_wk[i].bg_gen = g_co_pool_gen;
 #if defined(_WIN32)
         HANDLE th = CreateThread(NULL, 0, co_worker_thunk,
                                  (LPVOID)(uintptr_t)i, 0, NULL);
-        if (th) CloseHandle(th);   /* detached: joined only by the exit handshake */
+        if (th) { CloseHandle(th); made++; }   /* detached: joined only by the exit handshake */
 #else
         pthread_t th;
         if (pthread_create(&th, NULL, (void*(*)(void*))co_worker_thunk, (void*)(uintptr_t)i) == 0) {
             pthread_detach(th);
+            made++;
         }
 #endif
+    }
+    /* Account for reality: retire counts down to the number of workers that
+     * actually exist. Publishing w left g_co_pool_out forever positive when a
+     * creation failed, so the last retire never cleared g_co_pool_live and
+     * every later task found the ensure-gate closed with no worker alive. A
+     * created worker cannot retire during this loop (g_co_stop was cleared
+     * above and only foreground quiescence sets it, which cannot run while
+     * the live gate is up), so publishing the true count here is race-free. */
+    g_co_pool_out = made;
+    if (made == 0) {
+        /* Nothing started: hand the liveness gate back so the next ready's
+         * ensure can retry. No g_inj_lock here: this path is reachable from
+         * completion delivery under a shard lock, and taking the injector
+         * lock while holding a shard lock would invert against
+         * zan_co_sched_run's tail, which holds g_inj_lock across
+         * zan_io_shutdown (and therefore the shard locks). */
+        g_co_pool_live = 0;
     }
 }
 
@@ -5943,18 +6000,36 @@ void zan_co_sched_run(void) {
         pthread_join(th[i], NULL);
     }
 #endif
-    InterlockedExchange(&g_co_pool_fg, 0);
     /* A frame readied between the last worker's final quiescence check and
      * this point found co_pool_ensure closed (fg flag up) with no worker left
      * alive to serve it. Re-run the workers' own idle predicate and hand any
      * straggler to a fresh background pool instead of tearing the port down
-     * underneath it. */
-    if (!co_all_idle()) {
-        co_pool_ensure();
+     * underneath it.
+     * The handoff against a concurrent co_pool_ensure must stay lock-free:
+     * zan_co_ready -> co_pool_ensure also runs from completion delivery while
+     * a shard lock is held (io_wake under the poll loop's shard_lock), so
+     * taking g_inj_lock here and then the shard locks inside
+     * zan_io_shutdown would invert against it -- and the lock would not stop
+     * a start anyway, because ensure's gate transition is an unlocked CAS.
+     * Instead claim the same gate (live 0->1) before releasing fg: while it
+     * is held, every ensure sees live == 1 and keeps out; losing the CAS
+     * means a background generation appeared and owns the port now. */
+    if (InterlockedCompareExchange(&g_co_pool_live, 1, 0) != 0) {
         return;             /* the background pool owns the port now */
+    }
+    InterlockedExchange(&g_co_pool_fg, 0);
+    if (!co_all_idle() || g_inj_len > 0) {
+        g_co_pool_live = 0;     /* hand the gate back; the next ready re-ensures */
+        co_pool_ensure();
+        return;
     }
     co_stats_dump();
     zan_io_shutdown();
+    g_co_pool_live = 0;
+    /* Retire-style final re-check: a frame readied while this thread held the
+     * gate saw live == 1 in its ensure and returned unserved -- re-arm here,
+     * or it sits in the injector until some unrelated future ready. */
+    if (g_inj_len > 0 || !co_all_idle()) co_pool_ensure();
 }
 
 /* The multi-worker driver owns the whole thread pool for the duration of a run,

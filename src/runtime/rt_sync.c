@@ -3243,20 +3243,28 @@ int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
     CloseHandle(pi.hThread);
     return (int32_t)code;
 #else
+    /* Build argv before fork: malloc between fork and exec is not
+     * async-signal-safe, and in a multithreaded parent the child can
+     * deadlock on an arena lock held by a thread that no longer exists. */
+    char **argv = (char **)malloc(((size_t)argc + 2) * sizeof(char *));
+    if (!argv) return -1;
+    argv[0] = (char *)exe;
+    for (int32_t i = 0; i < argc; i++) {
+        argv[i + 1] = (char *)args[i];
+    }
+    argv[argc + 1] = NULL;
+
     pid_t pid = fork();
-    if (pid < 0) return -1;
+    if (pid < 0) {
+        free(argv);
+        return -1;
+    }
     if (pid == 0) {
-        /* Child */
-        char **argv = (char **)malloc((argc + 2) * sizeof(char *));
-        if (!argv) _exit(127);
-        argv[0] = (char *)exe;
-        for (int32_t i = 0; i < argc; i++) {
-            argv[i + 1] = (char *)args[i];
-        }
-        argv[argc + 1] = NULL;
+        /* Child: exec only, the parent's free below cannot touch this COW copy */
         execvp(exe, argv);
         _exit(127);
     }
+    free(argv);
     int status = 0;
     while (waitpid(pid, &status, 0) < 0) {
         if (errno != EINTR) return -1;
@@ -3295,8 +3303,20 @@ int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t
     CloseHandle(pi.hThread);
     return 0;
 #else
+    /* argv before fork, same async-signal-safe reasoning as start_sync */
+    char **argv = (char **)malloc(((size_t)argc + 2) * sizeof(char *));
+    if (!argv) return -1;
+    argv[0] = (char *)exe;
+    for (int32_t i = 0; i < argc; i++) {
+        argv[i + 1] = (char *)args[i];
+    }
+    argv[argc + 1] = NULL;
+
     pid_t pid = fork();
-    if (pid < 0) return -1;
+    if (pid < 0) {
+        free(argv);
+        return -1;
+    }
     if (pid == 0) {
         /* Intermediate child: fork again and exit at once so the actual
          * process is reparented to init and reaped there. A single fork
@@ -3313,18 +3333,12 @@ int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t
                 dup2(devnull, STDERR_FILENO);
                 if (devnull > STDERR_FILENO) close(devnull);
             }
-            char **argv = (char **)malloc((argc + 2) * sizeof(char *));
-            if (!argv) _exit(127);
-            argv[0] = (char *)exe;
-            for (int32_t i = 0; i < argc; i++) {
-                argv[i + 1] = (char *)args[i];
-            }
-            argv[argc + 1] = NULL;
             execvp(exe, argv);
             _exit(127);
         }
         _exit(0);
     }
+    free(argv);
     /* Reap the intermediate; it exits immediately after the second fork. */
     int st;
     while (waitpid(pid, &st, 0) < 0) {
@@ -3537,9 +3551,25 @@ int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
 #else
     int pipefd[2];
     if (pipe(pipefd) < 0) return -1;
+    fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
+    fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
+
+    /* argv before fork (async-signal-safe; see start_sync) */
+    char **argv = (char **)malloc(((size_t)argc + 2) * sizeof(char *));
+    if (!argv) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+    argv[0] = (char *)exe;
+    for (int32_t i = 0; i < argc; i++) {
+        argv[i + 1] = (char *)args[i];
+    }
+    argv[argc + 1] = NULL;
 
     pid_t pid = fork();
     if (pid < 0) {
+        free(argv);
         close(pipefd[0]);
         close(pipefd[1]);
         return -1;
@@ -3550,17 +3580,10 @@ int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
-
-        char **argv = (char **)malloc((argc + 2) * sizeof(char *));
-        if (!argv) _exit(127);
-        argv[0] = (char *)exe;
-        for (int32_t i = 0; i < argc; i++) {
-            argv[i + 1] = (char *)args[i];
-        }
-        argv[argc + 1] = NULL;
         execvp(exe, argv);
         _exit(127);
     }
+    free(argv);
 
     close(pipefd[1]);
     size_t cap = 4096;
@@ -3572,13 +3595,16 @@ int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
     }
 
     ssize_t r;
-    while ((r = read(pipefd[0], buf + len, cap - len - 1)) > 0) {
-        len += (size_t)r;
-        if (len + 1024 >= cap) {
-            cap *= 2;
-            char *nb = (char *)realloc(buf, cap);
-            if (!nb) break;
-            buf = nb;
+    while ((r = read(pipefd[0], buf + len, cap - len - 1)) > 0 ||
+           (r < 0 && errno == EINTR)) {
+        if (r > 0) {
+            len += (size_t)r;
+            if (len + 1024 >= cap) {
+                cap *= 2;
+                char *nb = (char *)realloc(buf, cap);
+                if (!nb) break;
+                buf = nb;
+            }
         }
     }
     close(pipefd[0]);

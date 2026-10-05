@@ -7,5 +7,3 @@
 > 平账纪律：闭账条目当批移出
 
 ## 未完成
-
-- [ ] **B-ID114（P3·运行时杂项批）**：fork 前 argv 置空（rt_sync.c ~3250）；capture 循环 EINTR（~3548）；reactor fd CLOEXEC；线程池创建失败记账（rt_io.c ~5769）；shutdown 竞态（~5904）；select 后端 rto_wait_ms 桩；rt_file.c ~723 gen 回绕退役；rt_timer POSIX hard-mode 打印（~466）；rt_crash.h tm_yday 时区回绕（~1239）。

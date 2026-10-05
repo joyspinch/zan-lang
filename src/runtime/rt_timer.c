@@ -465,12 +465,6 @@ void zan_rt_soft_note3(const char *file, unsigned line, unsigned col,
 
 void zan_rt_guard_fail2(const char *prefix, const char *msg) {
     if (zan_soft_is_hard()) {
-#if defined(_WIN32)
-        /* Same contract as the old inline hard path in generated code: print
-         * prefix+msg, then raise the fault-message record so the crash filter
-         * appends it to zan_crash.log. The filter resumes this thread
-         * (CONTINUE_EXECUTION for 0xE0A2C010), so the exit below still runs --
-         * same exit status, same atexit reports. */
         char buf[1400];
         size_t n = prefix ? strlen(prefix) : 0;
         if (n >= sizeof buf) n = sizeof buf - 1;
@@ -484,6 +478,10 @@ void zan_rt_guard_fail2(const char *prefix, const char *msg) {
         buf[n] = '\0';
         fprintf(stderr, "%s", buf);
         fflush(stderr);
+#if defined(_WIN32)
+        /* Raise the fault-message record so the crash filter appends it to
+         * zan_crash.log. The filter resumes this thread (CONTINUE_EXECUTION for
+         * 0xE0A2C010), so the exit below still runs. */
         void (WINAPI *raise)(DWORD, DWORD, DWORD, const ULONG_PTR *) =
             RaiseException;
         unsigned long code = 0xE0A2C010u; /* ZAN_RT_FAULT_MESSAGE (keep in sync

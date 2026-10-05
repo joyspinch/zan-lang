@@ -619,8 +619,10 @@ long long zan_file_open(const char *path, const char *mode) {
                 zan_fh_slot *s = &g_fh_table[i];
                 /* A slot holding a dying FILE* (a closed handle an operation
                  * is still using) must not be claimed: the fclose still has
-                 * to happen and its reader still holds the old handle. */
-                if (!s->open && !s->dying) {
+                 * to happen and its reader still holds the old handle.
+                 * Likewise, a slot whose generation wrapped to UINT32_MAX
+                 * is retired to prevent reviving old handle copies. */
+                if (!s->open && !s->dying && s->gen != UINT32_MAX) {
                     if (s->gen == 0) { s->gen = 1; }   /* keep slot 0's handle nonzero */
                     s->fp = f;
                     s->open = 1;
