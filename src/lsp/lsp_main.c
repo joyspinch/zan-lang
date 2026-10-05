@@ -31,6 +31,7 @@
 
 #include "intellisense.h"
 #include "zan_version.h"
+#include "package.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1128,15 +1129,30 @@ static bool lsp_stdlib_root(char *out, size_t cap) {
 
 /* Parse the toolchain stdlib into the shared project index, once per
  * session, right after the workspace scan. Reuses the same recursive
- * walker, so skip-lists and file-size caps apply unchanged. */
-static void ensure_stdlib_indexed(void) {
+ * walker, so skip-lists and file-size caps apply unchanged.
+ * Packages (Zan.Gui, Zan.Data, ...) are indexed here too, because they
+ * ship Zan source just like the stdlib and their types must complete in
+ * user code. The workspace root is the anchor: `zan_pkg_all_source_roots`
+ * uses the same search order as zanc (project packages/ first, then the
+ * toolchain-relative packages/, then the global store). */
+static void ensure_stdlib_indexed(lsp_server_t *s) {
     static bool stdlib_indexed = false;
     if (stdlib_indexed) { return; }
     stdlib_indexed = true;
     if (!g_project_intel) { return; }
     char root[1024];
-    if (!lsp_stdlib_root(root, sizeof(root))) { return; }
-    intel_index_project(g_project_intel, root);
+    if (lsp_stdlib_root(root, sizeof(root))) {
+        intel_index_project(g_project_intel, root);
+    }
+
+    /* Index every package source root the compiler would see. */
+    const char *project_dir = s->workspace_root[0] ? s->workspace_root : ".";
+    char pkg_roots[32][1024];
+    int pkg_n = zan_pkg_all_source_roots(project_dir, pkg_roots, 32);
+    for (int i = 0; i < pkg_n; i++) {
+        if (!intel_cancel_flag)
+            intel_index_project(g_project_intel, pkg_roots[i]);
+    }
 }
 
 static void ensure_project_indexed(lsp_server_t *s) {
@@ -1156,7 +1172,7 @@ static void ensure_project_indexed(lsp_server_t *s) {
         s->project_indexed = false;
         return;
     }
-    ensure_stdlib_indexed();
+    ensure_stdlib_indexed(s);
 }
 
 /* Native filesystem path for a file:// URI (mirrors handle_initialize's
