@@ -9489,6 +9489,13 @@ int main(int argc, char **argv) {
     zan_arena_free(arena);
     free(source);
 #ifdef _WIN32
+    /* ExitProcess skips CRT teardown, so any bytes still sitting in the C
+     * stdio buffers are silently dropped (--emit-ir streams megabytes
+     * through stdout and lost its tail this way, exit code 0). exit() would
+     * flush, but the point of ExitProcess here is skipping the slow CRT
+     * teardown of the compiler's heaps -- flush by hand and keep it. */
+    fflush(stdout);
+    fflush(stderr);
     ExitProcess(0);
 #else
     LLVMShutdown();

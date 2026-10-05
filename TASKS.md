@@ -86,7 +86,7 @@
   CRC32C("123456789")=0xE3069283 标准向量 x86 硬件与 ARM 软件路径（qemu-aarch64 实跑）
   五值全等；x86 新旧 zanc 逐值一致；crc32_hw conformance 金样过。两条残项已闭：
   wasm32 段归 B-ID93、emit_aes_call 段归 B-ID94（均见下）。--emit-ir 240MB+ 模块
-  尾截断 exit=0 仍开放（独立小缺陷，另批）。
+  尾截断 exit=0 已由 B-ID95 闭账（见下）。
 - [x] **B-ID93（P2·wasm32 cpuid 内联 asm 非法）闭账（2026-10-04）**——B-ID92 残项：
   `__zan_cpu_feature` 非 ARM 分支无条件发射 x86 cpuid 内联 asm（`{ax}` 约束），
   wasm32/riscv 后端 SelectionDAG 无法分配输出寄存器，编译期 fatal。修法：
@@ -109,3 +109,13 @@
   `+aes`（llvm.aarch64.crypto.* 选择的前提）；len 18→17 双处修正（ARM 新码 +
   x86 旧码）。验证：b94 六方法金样 x86 硬件与 qemu-aarch64 逐字节全等（imc2 自
   检=Involution 成立）；win-arm64/linux-arm64 链接通过；t3/t4 单方法探针 x86 过。
+- [x] **B-ID95（P2·--emit-ir 大模块尾部静默截断）闭账（2026-10-05）**——gui_3d_demo
+  `--emit-ir` 出 204MB IR，文件停在函数中段且 exit=0 无告警；截点逐字节确定但随模块
+  内容漂移，两次运行完全一致。根因：main.c 收尾 `ExitProcess(0)` 跳过 CRT 退出——
+  stdio 缓冲里最后不足 4KB 的残余（实测一轮恰丢 1415 字节）静默蒸发；fputs/rc=0/
+  ferror=0 全程健康，正常编译 stdout 不载货故从未暴露，小模块同样丢尾巴只是没人
+  验尾。修法：ExitProcess 前手工 `fflush(stdout)+fflush(stderr)`（保留跳过 CRT
+  慢销毁的初衷）。诊断法：worktree 插探针对拍 strlen/fflush/ferror 三值分清
+  生产端 vs 写端，再以「探针版恒全量、无 fflush 版恒截」锁定退出路径。验证：
+  gui_3d_demo 全量 203730994 字节、attributes 页脚完整、两次运行逐字节一致；
+  crc32_hw conformance 10.8MB 页脚完整。
