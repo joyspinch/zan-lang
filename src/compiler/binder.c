@@ -1516,17 +1516,24 @@ static bool method_signature_equal(zan_binder_t *b, zan_ast_node_t *a,
     /* A use-site instantiation (`class Range : IEnumerable<int>`) binds the
      * interface's parameters to concrete arguments; the declared signatures
      * are re-resolved with those bindings so `IEnumerator<T> GetEnumerator()`
-     * compares as IEnumerator<int>. */
+     * compares as IEnumerator<int>. When the substitution actually replaced
+     * something, the wanted type is concrete and comparable -- only a
+     * still-unsubstituted interface parameter (recursive walk with no
+     * binding, or the bare-template fallback) stays a wildcard. Treating a
+     * substituted type parameter as a wildcard would accept any signature
+     * (`class Repo<T> : IStore<T> { string Get() }` implementing `TVal
+     * Get()`) and turn the contract check into a no-op for generic classes. */
+    bool ret_subst = false;
     if (bind_tps && bind_tps->count > 0 && bind_args) {
         zan_type_t *sr = zan_binder_subst_named(b, br, bind_tps, bind_args);
-        if (sr) br = sr;
+        if (sr && sr != br) { br = sr; ret_subst = true; }
     }
     /* An interface method may be phrased in the interface's own type
      * parameters (`interface I<T> { T Get(); }`). Against an implementing
      * type's concrete signature the parameter is a wildcard -- `int Get()`
      * implements `T Get()` for the binding `T := int`. */
     bool a_tp = ar && ar->kind == TYPE_TYPE_PARAM;
-    bool b_tp = br && br->kind == TYPE_TYPE_PARAM;
+    bool b_tp = br && br->kind == TYPE_TYPE_PARAM && !ret_subst;
     if (!(a_tp || b_tp) && !binder_type_equal(ar, br, 0) &&
         !binder_type_derives(ar, br, 0))
         return false;
@@ -1540,12 +1547,13 @@ static bool method_signature_equal(zan_binder_t *b, zan_ast_node_t *a,
             return false;
         zan_type_t *at = zan_binder_resolve_type(b, ap->param.type);
         zan_type_t *bt = zan_binder_resolve_type(b, bp->param.type);
+        bool param_subst = false;
         if (bind_tps && bind_tps->count > 0 && bind_args) {
             zan_type_t *st = zan_binder_subst_named(b, bt, bind_tps, bind_args);
-            if (st) bt = st;
+            if (st && st != bt) { bt = st; param_subst = true; }
         }
         bool at_tp = at && at->kind == TYPE_TYPE_PARAM;
-        bool bt_tp = bt && bt->kind == TYPE_TYPE_PARAM;
+        bool bt_tp = bt && bt->kind == TYPE_TYPE_PARAM && !param_subst;
         if (!(at_tp || bt_tp) && !binder_type_equal(at, bt, 0)) return false;
     }
     return true;
@@ -1888,6 +1896,16 @@ void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit) {
     /* pass 1: collect type declarations */
     bind_type_decls(b, &unit->comp_unit.decls);
 
+    /* type parameters must be resolvable by every later pass: pass 1.5
+     * re-resolves signatures when folding default methods, pass 3
+     * instantiates `class Repo<T> : IStore<T>` (with the params unregistered
+     * the edge silently degraded to the bare interface template, and the
+     * contract check below then compared against an unsubstituted wildcard),
+     * and the contract validation itself re-resolves the implementing
+     * method's declared types at global scope. Registering them once here,
+     * right after the types themselves exist, keeps all of that name-complete. */
+    register_type_params(b, &unit->comp_unit.decls);
+
     /* pass 1.5: give every implementing type a copy of the default interface
      * methods it does not override, before members are bound */
     bind_default_interface_methods(b, &unit->comp_unit.decls);
@@ -1915,9 +1933,6 @@ void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit) {
      * methods are known, so a class method with the right name but the wrong
      * signature cannot silently satisfy the interface. */
     validate_interface_contracts(b, &unit->comp_unit.decls);
-
-    /* keep generic type parameters resolvable for the checker / irgen passes */
-    register_type_params(b, &unit->comp_unit.decls);
 
     b->binding_done = true;
 }

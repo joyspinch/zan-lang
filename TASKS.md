@@ -13,10 +13,10 @@
 - B-ID100（P2·irgen）foreach 中途回返的集合临时/枚举器泄漏（集合临时注册为 owning 局部，复用 locals+EH 释放机制）——0ab8ac0e，probe_foreach_ret `--check-leaks` 零泄漏。
 - B-ID101（P2·irgen）元组字面量/解构的 rc 元素所有权归一（按「返回结构体」+1/字段契约，decon 按来源所有权移交/保留，多余字段释放）——0ab8ac0e，probe_tuple `--check-leaks` 零泄漏（含 `_` 丢弃与调用返回元组）。
 - B-ID102（P2·irgen）MoveMask 便携版 SGT→SLT 反相（Vector.Equals 全等通道掩码在非 x86 恒为 0）——0ab8ac0e。
+- B-ID103（P2·binder）泛型类实现泛型接口的契约校验失效（`class Repo<T> : IStore<T>` 里错签名零诊断通过）：类型参数注册提前到 pass 1.5 前（resolve_bases 能真正实例化 `IStore<T>` 而非退化为模板）+ 通配符仅在接口参数未被替换时生效（替换后的类型参数按结构比较）——探针矩阵 5 例（错返回/错参数/非泛型回归/两组合法实现）+ conformance interface_assignability|interface_dispatch|generic_constraint 17 例全过。
 
 ## 未完成
 
-- [ ] **B-ID103（P2·binder）validate_interface_contracts 先于 register_type_params 执行**，接口契约验证看不到本类型刚注册的类型参数，泛型实现接口时可能误报/漏报。位置 binder.c ~1917。修法：调序 + 探针（泛型类实现含自引用参数的接口）。
 - [ ] **B-ID104（P2·checker）struct 循环检测 DFS 无 visited 集**，菱形依赖 DAG 上指数级重访，深结构编译卡死。位置 checker.c ~4402。修法：三色标记 + 探针（菱形结构链）。
 - [ ] **B-ID105（P2·门控）ReciprocalSqrt / Aes.Encrypt/Decrypt 等 SIMD 内建在 wasm32/riscv 落空**（无门控回退，错译或误算）。MoveMask 已随 B-ID102 修。位置 irgen_expr.c ~2436/~3128。修法：镜像 x86 门控模式 + 非 x86 回退实现，wasm32 交叉编译探针。
 - [ ] **B-ID106（P2·irgen）GetValueOrDefault 缓冲长度 16 应为 17**（NUL 截断边界）+ 查询表达式 float 槽装载未走 load_collection_slot_value。位置 irgen_expr_core.c ~2138 / irgen_expr.c ~8154。
