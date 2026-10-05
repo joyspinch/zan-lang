@@ -1185,6 +1185,14 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                 parser_advance(p);
                 for (int c = 1; c < rank; c++) parser_advance(p);
                 parser_advance(p);
+                if (rank > 16) {
+                    /* same cap the type-reference path enforces: a raw rank
+                     * past 16 flows into fixed-size rank tables downstream
+                     * (irgen keeps sizes in dims[16]) */
+                    zan_diag_emit(p->diag, DIAG_ERROR, loc,
+                                  "array rank specifier is too deep (max 16)");
+                    continue;
+                }
                 zan_ast_node_t *w = zan_ast_new(p->arena, AST_TYPE_REF, loc);
                 w->type_ref.name = type->type_ref.name;
                 w->type_ref.is_array = true;
@@ -2236,7 +2244,21 @@ static void parse_block_stmts(zan_parser_t *p, zan_ast_list_t *stmts_list) {
         if (parser_check(p, TK_DEFER)) {
             zan_loc_t defer_loc = p->current.loc;
             parser_advance(p); /* defer */
+            /* the deferred statement recurses parse_statement without passing
+             * parse_block/parse_embedded_stmt, so `defer defer defer ...`
+             * chains exhausted the C stack before any diagnostic; count the
+             * nesting with the same statement depth */
+            if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
+                zan_diag_emit(p->diag, DIAG_ERROR, defer_loc,
+                              "statement nesting too deep (max %d)",
+                              ZAN_PARSER_MAX_STMT_DEPTH);
+                if (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF))
+                    parser_advance(p);
+                break;
+            }
+            p->stmt_depth++;
             zan_ast_node_t *defer_stmt = parse_statement(p);
+            p->stmt_depth--;
             zan_ast_node_t *fin_body = defer_stmt;
             if (!fin_body || fin_body->kind != AST_BLOCK) {
                 zan_ast_node_t *fb = zan_ast_new(p->arena, AST_BLOCK, defer_loc);
@@ -2325,6 +2347,19 @@ static zan_token_t lexer_peek_n(zan_parser_t *p, int k) {
     zan_interp_level_t istack[ZAN_MAX_INTERP_DEPTH];
     if (nsave > 0)
         memcpy(istack, p->lex->interp_stack, sizeof(istack[0]) * (size_t)nsave);
+    /* A speculative peek can also cross a conditional directive: the walk
+     * mutates cond_depth/cond_overflow/cond_stack/cond_seen_true, and leaving
+     * that behind permanently shifts every later #else/#endif (same
+     * restore-on-snapshot contract as lexer.c's own peek helper). */
+    int cdep = p->lex->cond_depth;
+    int cover = p->lex->cond_overflow;
+    int cstack[ZAN_PP_MAX_COND_DEPTH];
+    int cseen[ZAN_PP_MAX_COND_DEPTH];
+    int csave = cdep < ZAN_PP_MAX_COND_DEPTH ? cdep : ZAN_PP_MAX_COND_DEPTH;
+    if (csave > 0) {
+        memcpy(cstack, p->lex->cond_stack, sizeof(cstack[0]) * (size_t)csave);
+        memcpy(cseen, p->lex->cond_seen_true, sizeof(cseen[0]) * (size_t)csave);
+    }
     zan_token_t tok = {0};
     for (int i = 0; i < k; i++) tok = zan_lexer_next(p->lex);
     p->lex->pos = pos;
@@ -2334,6 +2369,12 @@ static zan_token_t lexer_peek_n(zan_parser_t *p, int k) {
     p->lex->define_count = dcount;
     if (nsave > 0)
         memcpy(p->lex->interp_stack, istack, sizeof(istack[0]) * (size_t)nsave);
+    p->lex->cond_depth = cdep;
+    p->lex->cond_overflow = cover;
+    if (csave > 0) {
+        memcpy(p->lex->cond_stack, cstack, sizeof(cstack[0]) * (size_t)csave);
+        memcpy(p->lex->cond_seen_true, cseen, sizeof(cseen[0]) * (size_t)csave);
+    }
     return tok;
 }
 
@@ -2780,7 +2821,20 @@ static zan_ast_node_t *parse_if_stmt(zan_parser_t *p) {
     zan_ast_node_t *else_body = NULL;
     if (parser_match(p, TK_ELSE)) {
         if (parser_check(p, TK_IF)) {
-            else_body = parse_if_stmt(p);
+            /* the else-if chain recurses parse_if_stmt directly without
+             * passing parse_block/parse_embedded_stmt, so `else if(a) else
+             * if(a)...` thousands deep exhausted the C stack before any
+             * diagnostic; count the chain with the same statement depth */
+            if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
+                zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                              "statement nesting too deep (max %d)",
+                              ZAN_PARSER_MAX_STMT_DEPTH);
+                parser_advance(p); /* consume the `if` so parsing resumes */
+            } else {
+                p->stmt_depth++;
+                else_body = parse_if_stmt(p);
+                p->stmt_depth--;
+            }
         } else {
             else_body = parse_embedded_stmt(p);
         }
@@ -3122,6 +3176,8 @@ static bool skip_angle_group(zan_parser_t *p) {
         zan_token_t gt = zan_lexer_next(p->lex);
         if (gt.kind == TK_LESS) depth++;
         else if (gt.kind == TK_GREATER) depth--;
+        else if (gt.kind == TK_GREATER_GREATER) depth -= 2;
+        else if (gt.kind == TK_GREATER_GREATER_GREATER) depth -= 3;
         else if (gt.kind == TK_EOF || gt.kind == TK_SEMICOLON) return false;
         if (depth <= 0) return true;
     }
@@ -3401,8 +3457,23 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         return parse_try_stmt(p);
     case TK_DEFER: {
         zan_loc_t loc = p->current.loc;
+        /* `defer defer defer ...` chains recurse parse_statement directly
+         * without passing parse_block, so the block-level depth guard in
+         * parse_block_stmts never sees the nested levels; count each defer
+         * here or the C stack dies before any diagnostic */
+        if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
+            zan_diag_emit(p->diag, DIAG_ERROR, loc,
+                          "statement nesting too deep (max %d)",
+                          ZAN_PARSER_MAX_STMT_DEPTH);
+            parser_advance(p); /* consume the `defer` so parsing resumes */
+            zan_ast_node_t *fb = zan_ast_new(p->arena, AST_BLOCK, loc);
+            zan_ast_list_init(&fb->block.stmts);
+            return fb;
+        }
+        p->stmt_depth++;
         parser_advance(p); /* defer */
         zan_ast_node_t *stmt = parse_statement(p);
+        p->stmt_depth--;
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_BLOCK, loc);
         zan_ast_list_init(&n->block.stmts);
         zan_ast_node_t *try_node = zan_ast_new(p->arena, AST_TRY_STMT, loc);
