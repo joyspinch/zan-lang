@@ -2398,7 +2398,27 @@ static bool looks_like_decon_decl(zan_parser_t *p) {
     zan_token_t b = lexer_peek_n(p, 2);
     if (b.kind != TK_IDENT) return false;
     zan_token_t c = lexer_peek_n(p, 3);
-    return c.kind == TK_COMMA || c.kind == TK_RPAREN;
+    if (c.kind != TK_COMMA && c.kind != TK_RPAREN) return false;
+
+    /* Verify that the closing paren is followed by `=` (deconstruction),
+     * not a variable name like in `(int a, int b) t = rhs;` (which is a
+     * tuple-typed variable declaration handled by parse_var_decl). */
+    int depth = 0;
+    for (int k = 1; k < 64; k++) {
+        zan_token_t tk = lexer_peek_n(p, k);
+        if (tk.kind == TK_LPAREN) {
+            depth++;
+        } else if (tk.kind == TK_RPAREN) {
+            if (depth == 0) {
+                zan_token_t after = lexer_peek_n(p, k + 1);
+                return after.kind == TK_EQ;
+            }
+            depth--;
+        } else if (tk.kind == TK_SEMICOLON || tk.kind == TK_EOF) {
+            return false;
+        }
+    }
+    return false;
 }
 
 /* Parse the `(a, b) = rhs;` / `(int a, string b) = rhs;` statement body,
