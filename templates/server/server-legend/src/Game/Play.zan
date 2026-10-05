@@ -1352,40 +1352,21 @@ class Play {
         int total = Play.titleDefs.Count;
         int pages = (total + per - 1) / per;
         if (page >= pages && pages > 0) { page = pages - 1; }
-        JsonValue arr = JsonValue.NewArray();
+        List<TitleItemModel> titles = new List<TitleItemModel>();
         int from = page * per;
         for (int i = from; i < total && i < from + per; i = i + 1) {
             TitleDef t = Play.titleDefs[i];
-            JsonValue o = JsonValue.NewObject();
-            o.Set("id", JsonValue.NewNum(Convert.ToString(t.id)));
-            o.Set("name", JsonValue.NewStr(t.name));
-            o.Set("fame", JsonValue.NewNum(Convert.ToString(t.rep)));
-            o.Set("gold", JsonValue.NewNum(Convert.ToString(t.money)));
-            o.Set("rebirth", JsonValue.NewNum(Convert.ToString(t.met)));
-            o.Set("level", JsonValue.NewNum(Convert.ToString(t.lvl)));
-            o.Set("atkMin", JsonValue.NewNum(Convert.ToString(t.a1)));
-            o.Set("atkMax", JsonValue.NewNum(Convert.ToString(t.a2)));
-            o.Set("magMin", JsonValue.NewNum(Convert.ToString(t.b1)));
-            o.Set("magMax", JsonValue.NewNum(Convert.ToString(t.b2)));
-            o.Set("taoMin", JsonValue.NewNum(Convert.ToString(t.c1)));
-            o.Set("taoMax", JsonValue.NewNum(Convert.ToString(t.c2)));
-            o.Set("defMin", JsonValue.NewNum(Convert.ToString(t.d1)));
-            o.Set("defMax", JsonValue.NewNum(Convert.ToString(t.d2)));
-            o.Set("mdefMin", JsonValue.NewNum(Convert.ToString(t.e1)));
-            o.Set("mdefMax", JsonValue.NewNum(Convert.ToString(t.e2)));
-            o.Set("owned", JsonValue.NewNum(
-                Play.TitleOwned(s.row.titlesUnlocked, t.id) ? "1" : "0"));
-            o.Set("worn", JsonValue.NewNum(
-                s.row.title != null && s.row.title == t.name ? "1" : "0"));
-            arr.Append(o);
+            bool owned = Play.TitleOwned(s.row.titlesUnlocked, t.id);
+            bool worn = s.row.title != null && s.row.title == t.name;
+            titles.Add(new TitleItemModel(
+                t.id, t.name, t.rep, t.money, t.met, t.lvl,
+                t.a1, t.a2, t.b1, t.b2, t.c1, t.c2, t.d1, t.d2, t.e1, t.e2,
+                owned, worn
+            ));
         }
+        TitleStateModel model = new TitleStateModel(page, pages, total, s.row.merit, s.row.reputation, titles);
         JsonValue r = Gateway.Ok();
-        r.Set("rows", arr);
-        r.Set("page", JsonValue.NewNum(Convert.ToString(page)));
-        r.Set("pages", JsonValue.NewNum(Convert.ToString(pages)));
-        r.Set("total", JsonValue.NewNum(Convert.ToString(total)));
-        r.Set("pts", JsonValue.NewNum(Convert.ToString(s.row.merit)));
-        r.Set("fame", JsonValue.NewNum(Convert.ToString(s.row.reputation)));
+        model.IntoJson(r);
         Gateway.SelfInto(r, s);
         return r;
     }
@@ -1527,19 +1508,15 @@ class Play {
             s.row.achClaimed = Play.AchIdsJoin(owned);
             s.dirty = true;
         }
-        JsonValue arr = JsonValue.NewArray();
+        List<AchRowModel> rows = new List<AchRowModel>();
         for (int i = 0; i < defs.Count; i = i + 1) {
             AchDef d = defs[i];
-            JsonValue o = JsonValue.NewObject();
-            o.Set("name", JsonValue.NewStr(d.name));
-            o.Set("req", JsonValue.NewStr(d.req));
-            o.Set("ok", JsonValue.NewNum(Play.AchEligible(s, d) ? "1" : "0"));
-            o.Set("claimed", JsonValue.NewNum(
-                Play.AchOwned(s.row.achClaimed, i + 1) ? "1" : "0"));
-            JsonValue rw = JsonValue.NewArray();
-            if (d.gold > 0) { Play.AchRewardCell(rw, 116, d.gold); }
-            if (d.gems > 0) { Play.AchRewardCell(rw, 1121, d.gems); }
-            if (d.exp > 0) { Play.AchRewardCell(rw, 1187, d.exp); }
+            bool ok = Play.AchEligible(s, d);
+            bool claimed = Play.AchOwned(s.row.achClaimed, i + 1);
+            List<AchRewardCellModel> rw = new List<AchRewardCellModel>();
+            if (d.gold > 0) { rw.Add(new AchRewardCellModel(116, Play.AchBadge(d.gold))); }
+            if (d.gems > 0) { rw.Add(new AchRewardCellModel(1121, Play.AchBadge(d.gems))); }
+            if (d.exp > 0) { rw.Add(new AchRewardCellModel(1187, Play.AchBadge(d.exp))); }
             string[] names = new string[] { d.i1, d.i2, d.i3 };
             long[] counts = new long[] { d.c1, d.c2, d.c3 };
             for (int k = 0; k < 3; k = k + 1) {
@@ -1550,13 +1527,13 @@ class Play {
                 if (it.picture != null && it.picture.Length > 0) {
                     pic = Convert.ToInt(it.picture);
                 }
-                Play.AchRewardCell(rw, pic, counts[k]);
+                rw.Add(new AchRewardCellModel(pic, Play.AchBadge(counts[k])));
             }
-            o.Set("rewards", rw);
-            arr.Append(o);
+            rows.Add(new AchRowModel(d.name, d.req, ok, claimed, rw));
         }
+        AchStateModel model = new AchStateModel(rows);
         JsonValue r = Gateway.Ok();
-        r.Set("rows", arr);
+        r.Set("rows", model.ToJson());
         Gateway.SelfInto(r, s);
         return r;
     }
@@ -1785,6 +1762,30 @@ class Play {
         return t[i];
     }
 
+    static string SupSub(int i) {
+        string[] s = new string[] {
+            "武器（攻击天赋>总系数>攻击值）",
+            "武器（魔法天赋>总系数>魔法值）",
+            "武器（道术天赋>总系数>道术值）",
+            "铠甲（防御天赋>总系数>防御值）",
+            "头盔（防御天赋>总系数>防御值）",
+            "项链（主属性>总系数）",
+            "手镯（主属性>总系数）",
+            "戒指（主属性>总系数）"
+        };
+        return s[i];
+    }
+
+    static bool SupCopyable(int i) {
+        return i >= 4;
+    }
+
+    static int SupFee(int i) {
+        if (i >= 4 && i <= 6) { return 100; }
+        if (i == 7) { return 10; }
+        return 0;
+    }
+
     /* 登记格 → 玩家装备位：0..2 武器、3 铠甲、4 头盔、5 项链、6 手镯、7 戒指。 */
     static int SupSlotItem(Session s, int i) {
         if (i <= 2) { return s.row.weaponId; }
@@ -1841,23 +1842,28 @@ class Play {
             WorldState.SetNum(key + ".value", score);
             WorldState.SetNum(key + ".item", itemId);
         }
-        JsonValue arr = JsonValue.NewArray();
+        List<SupremeSlotModel> rows = new List<SupremeSlotModel>();
         for (int i = 0; i < keys.Length; i = i + 1) {
             string key = "sup." + keys[i];
-            JsonValue o = JsonValue.NewObject();
-            o.Set("title", JsonValue.NewStr(Play.SupTitle(i)));
-            o.Set("owner", JsonValue.NewStr(WorldState.Get(key + ".owner", "")));
+            string owner = WorldState.Get(key + ".owner", "");
             long itemId = WorldState.GetNum(key + ".item", 0);
-            o.Set("itemId", JsonValue.NewNum(Convert.ToString(itemId)));
-            o.Set("value", JsonValue.NewNum(Convert.ToString(
-                WorldState.GetNum(key + ".value", 0))));
+            long val = WorldState.GetNum(key + ".value", 0);
             ZanWeb.Model.Game.Item it = itemId > 0 ? Fight.ById((int)itemId) : null;
-            o.Set("itemName", JsonValue.NewStr(it != null ? it.name : ""));
-            arr.Append(o);
+            string itemName = it != null ? it.name : "";
+            rows.Add(new SupremeSlotModel(
+                Play.SupTitle(i),
+                Play.SupSub(i),
+                owner,
+                itemId,
+                itemName,
+                val,
+                Play.SupCopyable(i),
+                Play.SupFee(i)
+            ));
         }
+        SupremeStateModel model = new SupremeStateModel(Play.SupBonusPct(s), rows);
         JsonValue r = Gateway.Ok();
-        r.Set("rows", arr);
-        r.Set("bonus", JsonValue.NewNum(Convert.ToString(Play.SupBonusPct(s))));
+        model.IntoJson(r);
         Gateway.SelfInto(r, s);
         return r;
     }
