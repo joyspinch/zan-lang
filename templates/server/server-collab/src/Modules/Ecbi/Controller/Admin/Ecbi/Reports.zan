@@ -7,6 +7,23 @@ using ZanWeb.Model.Ecbi;
 
 namespace ZanWeb.Admin.Ecbi;
 
+/// <summary>
+/// 报表聚合计算维度行强类型实体（消除 keys / sales / counts / adCost 平行列表反模式）。
+/// </summary>
+class ReportDimRow {
+    public string key;
+    public long sales;
+    public int orders;
+    public long adCost;
+
+    public ReportDimRow(string key, long sales, int orders, long adCost) {
+        this.key = key != null ? key : "";
+        this.sales = sales;
+        this.orders = orders;
+        this.adCost = adCost;
+    }
+}
+
 /* /admin/ecbi/reports 报表编排：定义「维度 × 指标 × 图表」，运行时按定义聚合订单/推广数据并渲染。外部数据先落到 ods_order/ods_ad，再由报表消费。 */
 [Route("admin/ecbi/reports/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
@@ -175,10 +192,8 @@ class Reports : AdminController {
                 .Where(a => a.tenantId == Tenant.Cur()).ToListAsync();
         }
 
-        /* 维度桶：key → 行号。桶内累加销售额/订单数。 */
-        List<string> keys = new List<string>();
-        List<long> sales = new List<long>();
-        List<int> counts = new List<int>();
+        /* 维度桶：基于 ReportDimRow 强类型实体维护，消除平行列表反模式。 */
+        List<ReportDimRow> dimRows = new List<ReportDimRow>();
 
         long now = WebApp.NowSeconds();
         for (int i = 0; i < orders.Count; i = i + 1) {
@@ -197,20 +212,19 @@ class Reports : AdminController {
                 key = key + Fmt.Day(o.payAt) + " / ";
             }
             if (key.EndsWith(" / ")) { key = key.Substring(0, key.Length - 3); }
-            int at = keys.IndexOf(key);
+            int at = -1;
+            for (int k = 0; k < dimRows.Count; k = k + 1) {
+                if (dimRows[k].key == key) { at = k; break; }
+            }
             if (at < 0) {
-                keys.Add(key);
-                sales.Add(o.amount);
-                counts.Add(1);
+                dimRows.Add(new ReportDimRow(key, o.amount, 1, 0));
             } else {
-                sales[at] = sales[at] + o.amount;
-                counts[at] = counts[at] + 1;
+                dimRows[at].sales = dimRows[at].sales + o.amount;
+                dimRows[at].orders = dimRows[at].orders + 1;
             }
         }
 
         /* 推广花费按相同维度并入（仅平台/店铺/日期维度可对齐）。 */
-        List<long> adCost = new List<long>();
-        for (int i = 0; i < keys.Count; i = i + 1) { adCost.Add(0); }
         if (hasAd) {
             for (int i = 0; i < ads.Count; i = i + 1) {
                 OdsAd a = ads[i];
@@ -225,8 +239,13 @@ class Reports : AdminController {
                 if (dims.Contains("category")) { key = key + "未分类 / "; }
                 if (dims.Contains("day")) { key = key + Fmt.Day(a.day) + " / "; }
                 if (key.EndsWith(" / ")) { key = key.Substring(0, key.Length - 3); }
-                int at = keys.IndexOf(key);
-                if (at >= 0) { adCost[at] = adCost[at] + a.cost; }
+                int at = -1;
+                for (int k = 0; k < dimRows.Count; k = k + 1) {
+                    if (dimRows[k].key == key) { at = k; break; }
+                }
+                if (at >= 0) {
+                    dimRows[at].adCost = dimRows[at].adCost + a.cost;
+                }
             }
         }
 
@@ -234,30 +253,31 @@ class Reports : AdminController {
         long sumSales = 0;
         int sumOrders = 0;
         long sumAdCost = 0;
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            sumSales = sumSales + sales[i];
-            sumOrders = sumOrders + counts[i];
-            sumAdCost = sumAdCost + adCost[i];
+        for (int i = 0; i < dimRows.Count; i = i + 1) {
+            sumSales = sumSales + dimRows[i].sales;
+            sumOrders = sumOrders + dimRows[i].orders;
+            sumAdCost = sumAdCost + dimRows[i].adCost;
         }
         d.Set("sumSales", Convert.ToString(sumSales));
         d.Set("sumOrders", Convert.ToString(sumOrders));
         d.Set("sumAdCost", Convert.ToString(sumAdCost));
         d.Set("sumRoi", sumAdCost > 0
             ? Convert.ToString(sumSales * 100 / sumAdCost) + "%" : "—");
-        d.Set("rowCount", Convert.ToString(keys.Count));
+        d.Set("rowCount", Convert.ToString(dimRows.Count));
 
         /* 行集：按所选指标输出。 */
         List<StrMap> rows = d.AddList("rows");
-        for (int i = 0; i < keys.Count; i = i + 1) {
+        for (int i = 0; i < dimRows.Count; i = i + 1) {
+            ReportDimRow r = dimRows[i];
             StrMap row = new StrMap();
-            row.Set("dim", keys[i]);
-            row.Set("sales", Convert.ToString(sales[i]));
-            row.Set("orders", Convert.ToString(counts[i]));
-            row.Set("aov", counts[i] > 0
-                ? Convert.ToString(sales[i] / counts[i]) : "0");
-            row.Set("adcost", Convert.ToString(adCost[i]));
-            row.Set("roi", adCost[i] > 0
-                ? Convert.ToString(sales[i] * 100 / adCost[i]) + "%" : "—");
+            row.Set("dim", r.key);
+            row.Set("sales", Convert.ToString(r.sales));
+            row.Set("orders", Convert.ToString(r.orders));
+            row.Set("aov", r.orders > 0
+                ? Convert.ToString(r.sales / r.orders) : "0");
+            row.Set("adcost", Convert.ToString(r.adCost));
+            row.Set("roi", r.adCost > 0
+                ? Convert.ToString(r.sales * 100 / r.adCost) + "%" : "—");
             rows.Add(row);
         }
         d.Set("showSales", metrics.Contains("sales") ? "1" : "");
@@ -265,19 +285,19 @@ class Reports : AdminController {
         d.Set("showAov", metrics.Contains("aov") ? "1" : "");
         d.Set("showAdCost", metrics.Contains("adcost") ? "1" : "");
         d.Set("showRoi", metrics.Contains("roi") ? "1" : "");
-        d.Set("empty", keys.Count == 0 ? "1" : "");
+        d.Set("empty", dimRows.Count == 0 ? "1" : "");
 
         /* 图表数据：柱/线图取 sales 比例（无 sales 则取 orders）。 */
         long maxV = 1;
         List<StrMap> bars = d.AddList("bars");
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            long v = metrics.Contains("sales") ? sales[i] : counts[i];
+        for (int i = 0; i < dimRows.Count; i = i + 1) {
+            long v = metrics.Contains("sales") ? dimRows[i].sales : (long)dimRows[i].orders;
             if (v > maxV) { maxV = v; }
         }
-        for (int i = 0; i < keys.Count; i = i + 1) {
+        for (int i = 0; i < dimRows.Count; i = i + 1) {
             StrMap b = new StrMap();
-            b.Set("dim", keys[i]);
-            long v = metrics.Contains("sales") ? sales[i] : counts[i];
+            b.Set("dim", dimRows[i].key);
+            long v = metrics.Contains("sales") ? dimRows[i].sales : (long)dimRows[i].orders;
             b.Set("value", Convert.ToString(v));
             b.Set("pct", Convert.ToString(v * 100 / maxV));
             bars.Add(b);

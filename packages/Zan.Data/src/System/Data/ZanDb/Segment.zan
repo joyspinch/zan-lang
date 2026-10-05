@@ -7,6 +7,17 @@ namespace System.Data.ZanDb;
 /// 合并时用于压掉旧段同名键）。返回 false 停止扫描。</summary>
 delegate bool SegVisit(string key, string val, int op);
 
+/// <summary>稀疏索引写入项实体（消除 sparseOff / sparseKey 平行列表反模式）。</summary>
+class SegmentSparseWriteEntry {
+    public long offset;
+    public string key;
+
+    SegmentSparseWriteEntry(long offset, string key) {
+        this.offset = offset;
+        this.key = key != null ? key : "";
+    }
+}
+
 /// <summary>
 /// 不可变有序段文件的写入端：调用方按
 /// <see cref="String.CompareOrdinal"/> 升序逐条 <see cref="Add"/>，
@@ -37,15 +48,13 @@ class SegmentWriter {
     ByteBuffer buf;
     long fileLen;
     long recCount;
-    List<long> sparseOff;
-    List<string> sparseKey;
+    List<SegmentSparseWriteEntry> sparseEntries;
     bool failed;
     string lastError;
 
     SegmentWriter() {
         this.buf = ByteBuffer.Alloc(SegmentWriter.WRITE_BUF);
-        this.sparseOff = new List<long>();
-        this.sparseKey = new List<string>();
+        this.sparseEntries = new List<SegmentSparseWriteEntry>();
         this.fileLen = 0;
         this.recCount = 0;
         this.failed = false;
@@ -86,8 +95,7 @@ class SegmentWriter {
     void Add(string key, string val, int op) {
         if (this.failed) { return; }
         if (this.recCount % SegmentWriter.SPARSE_EVERY == 0) {
-            this.sparseOff.Add(this.fileLen + this.buf.Length());
-            this.sparseKey.Add(key);
+            this.sparseEntries.Add(new SegmentSparseWriteEntry(this.fileLen + this.buf.Length(), key));
         }
         this.buf.WriteU8(op);
         this.buf.WriteString(key);
@@ -118,18 +126,18 @@ class SegmentWriter {
         if (this.failed) { return false; }
         long indexStart = this.fileLen;
         // 索引块以条目数开头，与 SegmentFile.Open 的解析对齐。
-        this.buf.WriteU32(this.sparseOff.Count);
+        this.buf.WriteU32(this.sparseEntries.Count);
 
         ByteBuffer block = ByteBuffer.Alloc(256);
-        int n = this.sparseOff.Count;
+        int n = this.sparseEntries.Count;
         for (int i = 0; i < n; i = i + 1) {
             long end = indexStart;
-            if (i + 1 < n) { end = this.sparseOff[i + 1]; }
-            int len = (int)(end - this.sparseOff[i]);
+            if (i + 1 < n) { end = this.sparseEntries[i + 1].offset; }
+            int len = (int)(end - this.sparseEntries[i].offset);
             long crc = 0;
             if (len > 0) {
                 block.EnsureCapacity(len);
-                int got = this.file.ReadAt(this.sparseOff[i], block, len);
+                int got = this.file.ReadAt(this.sparseEntries[i].offset, block, len);
                 if (got == len) { crc = block.Crc32(len); }
                 else {
                     this.failed = true;
@@ -137,9 +145,9 @@ class SegmentWriter {
                     break;
                 }
             }
-            this.buf.EnsureRoom(24 + this.sparseKey[i].Length);
-            this.buf.WriteU64(this.sparseOff[i]);
-            this.buf.WriteString(this.sparseKey[i]);
+            this.buf.EnsureRoom(24 + this.sparseEntries[i].key.Length);
+            this.buf.WriteU64(this.sparseEntries[i].offset);
+            this.buf.WriteString(this.sparseEntries[i].key);
             this.buf.WriteU32(crc);
         }
         block.Free();
@@ -178,6 +186,21 @@ class SegmentWriter {
     }
 }
 
+/// <summary>稀疏索引读取项实体（消除 sparseOff / sparseKey / sparseCrc / blockVerified 四组平行列表反模式）。</summary>
+class SegmentIndexEntry {
+    public long offset;
+    public string key;
+    public long crc;
+    public int verified;
+
+    SegmentIndexEntry(long offset, string key, long crc) {
+        this.offset = offset;
+        this.key = key != null ? key : "";
+        this.crc = crc;
+        this.verified = 0;
+    }
+}
+
 /// <summary>
 /// 不可变有序段文件的读取端：稀疏索引二分定位块（一次块读 +
 /// CRC 校验），块内顺序解析。点查与范围扫描共用同一套块读取。
@@ -187,10 +210,7 @@ class SegmentFile {
 
     PageFile file;
     string path;
-    List<long> sparseOff;
-    List<string> sparseKey;
-    List<long> sparseCrc;
-    List<int> blockVerified;
+    List<SegmentIndexEntry> entries;
     long indexStart;
     long recordCount;
     string lastError;
@@ -200,10 +220,7 @@ class SegmentFile {
         this.indexStart = 0;
         this.recordCount = 0;
         this.lastError = "";
-        this.sparseOff = new List<long>();
-        this.sparseKey = new List<string>();
-        this.sparseCrc = new List<long>();
-        this.blockVerified = new List<int>();
+        this.entries = new List<SegmentIndexEntry>();
     }
 
     /// <summary>打开并校验一个已完成的段：读尾部定位索引区，
@@ -283,10 +300,7 @@ class SegmentFile {
             long off = idx.ReadU64();
             string key = idx.ReadString();
             long crc = idx.ReadU32();
-            sf.sparseOff.Add(off);
-            sf.sparseKey.Add(key);
-            sf.sparseCrc.Add(crc);
-            sf.blockVerified.Add(0);
+            sf.entries.Add(new SegmentIndexEntry(off, key, crc));
         }
         idx.Free();
         return sf;
@@ -305,11 +319,11 @@ class SegmentFile {
     /// 块首键 &lt;= key 的块；key 小于所有块首键时返回 0。</summary>
     int BlockFor(string key) {
         int lo = 0;
-        int hi = this.sparseKey.Count - 1;
+        int hi = this.entries.Count - 1;
         int ans = 0;
         while (lo <= hi) {
             int mid = (lo + hi) / 2;
-            if (String.CompareOrdinal(this.sparseKey[mid], key) <= 0) {
+            if (String.CompareOrdinal(this.entries[mid].key, key) <= 0) {
                 ans = mid;
                 lo = mid + 1;
             } else {
@@ -320,7 +334,7 @@ class SegmentFile {
     }
 
     /// 稀疏索引覆盖的块数（0 = 空段）。
-    int BlockCount() { return this.sparseOff.Count; }
+    int BlockCount() { return this.entries.Count; }
 
     /// <summary>块跨度整读：把块 [fromBlock, toBlock) 的文件区间
     /// 一次 ReadAt 读入（块在段文件里物理连续），供块级内核跨块
@@ -329,13 +343,13 @@ class SegmentFile {
     /// 对缓冲内子区间算，不复制）。未固化校验的块标记为已验。
     /// 失败返回 null 并在 GetError 留痕；缓冲归调用方 Free。</summary>
     ByteBuffer LoadBlockSpan(int fromBlock, int toBlock, ByteBuffer reuse) {
-        if (fromBlock < 0 || toBlock > this.sparseOff.Count || fromBlock >= toBlock) {
+        if (fromBlock < 0 || toBlock > this.entries.Count || fromBlock >= toBlock) {
             this.lastError = "segment block span out of range";
             return null;
         }
-        long start = this.sparseOff[fromBlock];
+        long start = this.entries[fromBlock].offset;
         long end = this.indexStart;
-        if (toBlock < this.sparseOff.Count) { end = this.sparseOff[toBlock]; }
+        if (toBlock < this.entries.Count) { end = this.entries[toBlock].offset; }
         int len = (int)(end - start);
         if (len <= 0) {
             this.lastError = "segment block span empty";
@@ -350,17 +364,17 @@ class SegmentFile {
             return null;
         }
         for (int i = fromBlock; i < toBlock; i = i + 1) {
-            if (this.blockVerified[i] == 0) {
+            if (this.entries[i].verified == 0) {
                 long bend = this.indexStart;
-                if (i + 1 < this.sparseOff.Count) { bend = this.sparseOff[i + 1]; }
-                int blen = (int)(bend - this.sparseOff[i]);
-                int boff = (int)(this.sparseOff[i] - start);
-                if (NativeMemory.Crc32(b.Raw() + boff, blen) != this.sparseCrc[i]) {
+                if (i + 1 < this.entries.Count) { bend = this.entries[i + 1].offset; }
+                int blen = (int)(bend - this.entries[i].offset);
+                int boff = (int)(this.entries[i].offset - start);
+                if (NativeMemory.Crc32(b.Raw() + boff, blen) != this.entries[i].crc) {
                     this.lastError = "segment block corrupt";
                     if (reuse == null) { b.Free(); }
                     return null;
                 }
-                this.blockVerified[i] = 1;
+                this.entries[i].verified = 1;
             }
         }
         b.SeekRead(0);
@@ -368,13 +382,13 @@ class SegmentFile {
     }
 
     /// 块 i 的文件偏移（块跨度整读用）。
-    long BlockFileOff(int i) { return this.sparseOff[i]; }
+    long BlockFileOff(int i) { return this.entries[i].offset; }
 
     /// 块 i 的字节长度（块跨度整读用）。
     int BlockLen(int i) {
         long end = this.indexStart;
-        if (i + 1 < this.sparseOff.Count) { end = this.sparseOff[i + 1]; }
-        return (int)(end - this.sparseOff[i]);
+        if (i + 1 < this.entries.Count) { end = this.entries[i + 1].offset; }
+        return (int)(end - this.entries[i].offset);
     }
 
     /// <summary>加载块 i 并校验 CRC；失败（越界/腐坏/短读）返回 null
@@ -389,33 +403,33 @@ class SegmentFile {
     /// Alloc/Free。段不可变——CRC 每块只在首次加载时校验一次，
     /// 之后同一打开会话内的重复读取免 CRC（读时不算派生数）。</summary>
     ByteBuffer LoadBlockReuse(int i, ByteBuffer reuse) {
-        if (i < 0 || i >= this.sparseOff.Count) {
+        if (i < 0 || i >= this.entries.Count) {
             // 空段（0 条记录）或越界：返回「未命中」而不是索引崩。
             this.lastError = "segment block out of range";
             return null;
         }
         long end = this.indexStart;
-        if (i + 1 < this.sparseOff.Count) { end = this.sparseOff[i + 1]; }
-        int len = (int)(end - this.sparseOff[i]);
+        if (i + 1 < this.entries.Count) { end = this.entries[i + 1].offset; }
+        int len = (int)(end - this.entries[i].offset);
         if (len <= 0) {
             this.lastError = "segment block empty";
             return null;
         }
         ByteBuffer b = reuse;
         if (b == null) { b = ByteBuffer.Alloc(len); }
-        int got = this.file.ReadAt(this.sparseOff[i], b, len);
+        int got = this.file.ReadAt(this.entries[i].offset, b, len);
         if (got != len) {
             this.lastError = "segment block short read";
             if (reuse == null) { b.Free(); }
             return null;
         }
-        if (this.blockVerified[i] == 0) {
-            if (b.Crc32(len) != this.sparseCrc[i]) {
+        if (this.entries[i].verified == 0) {
+            if (b.Crc32(len) != this.entries[i].crc) {
                 this.lastError = "segment block corrupt";
                 if (reuse == null) { b.Free(); }
                 return null;
             }
-            this.blockVerified[i] = 1;
+            this.entries[i].verified = 1;
         }
         b.SeekRead(0);
         return b;
@@ -546,7 +560,7 @@ class SegmentFile {
     int Scan(string fromKey, SegVisit visit) {
         int bi = this.BlockFor(fromKey);
         int added = 0;
-        while (bi < this.sparseOff.Count) {
+        while (bi < this.entries.Count) {
             ByteBuffer b = this.LoadBlock(bi);
             if (b == null) { return added; }
             while (true) {
@@ -688,7 +702,7 @@ class SegCursor {
         this.curVal = "";
         this.valMat = false;
         this.curOp = 0;
-        if (this.blockIdx >= this.seg.sparseOff.Count) { return false; }
+        if (this.blockIdx >= this.seg.BlockCount()) { return false; }
         ByteBuffer b;
         if (this.buf != null) {
             // 复用现有缓冲：LoadBlockReuse 失败时不动调用方缓冲，

@@ -125,6 +125,17 @@ class Route {
     string Key() { return this.key; }
 }
 
+/// <summary>扁平路由统计键元数据条目实体（消除 flatKeys / flatHashes 平行列表反模式）。</summary>
+class RouteStatEntry {
+    public string key;
+    public long hash;
+
+    public RouteStatEntry(string key, long hash) {
+        this.key = key;
+        this.hash = hash;
+    }
+}
+
 /// <summary>
 /// HTTP router with static-first matching and {param} segments. Routes are
 /// bucketed by method and static routes are checked with a direct string
@@ -146,13 +157,8 @@ class Router {
     int hashMask;
     // Every route by Route.idx (registration order).
     List<Route> flat;
-    // Precomputed key string for each route in flat order.
-    // Stored separately so RecordHit never touches a Route object (no ARC).
-    List<string> flatKeys;
-    // The same keys hashed once, at InitStats. Rows in the shared table are
-    // addressed by this hash, so recording a hit neither re-hashes the key
-    // string nor copies it into shared memory.
-    List<long> flatHashes;
+    // 路由统计键元数据实体列表（结构化管理，消除平行列表）。
+    List<RouteStatEntry> statEntries;
     // Cross-process shared stats table. Columns: "hits" (int), "total_us"
     // (int). Keyed by route.key. Null until InitStatsShared is called. All
     // workers share the same table so /admin/stats reflects the aggregate
@@ -166,8 +172,7 @@ class Router {
         this.hashSlots = null;
         this.hashMask = 0;
         this.flat = new List<Route>();
-        this.flatKeys = new List<string>();
-        this.flatHashes = new List<long>();
+        this.statEntries = new List<RouteStatEntry>();
         this.routeStats = null;
     }
 
@@ -188,16 +193,17 @@ class Router {
         }
         r.idx = this.flat.Count;
         this.flat.Add(r);
-        this.flatKeys.Add(r.key);
         return r;
     }
 
     /// Rows are addressed by the hash of the route key, so hash every key once
     /// here instead of on the request path.
     void HashRouteKeys() {
-        this.flatHashes = new List<long>();
-        for (int h = 0; h < this.flatKeys.Count; h = h + 1) {
-            this.flatHashes.Add(SharedTable.Hash(this.flatKeys[h]));
+        this.statEntries = new List<RouteStatEntry>();
+        for (int h = 0; h < this.flat.Count; h = h + 1) {
+            string rk = this.flat[h].key;
+            long hash = SharedTable.Hash(rk);
+            this.statEntries.Add(new RouteStatEntry(rk, hash));
         }
     }
 
@@ -214,9 +220,9 @@ class Router {
     /// Increment on a pre-existing row without triggering a capacity-limited
     /// auto-create under concurrent first requests.
     void SeedStats(SharedTable t) {
-        for (int i = 0; i < this.flatHashes.Count; i = i + 1) {
-            t.SetIntAt(this.flatHashes[i], "hits", 0);
-            t.SetIntAt(this.flatHashes[i], "total_us", 0);
+        for (int i = 0; i < this.statEntries.Count; i = i + 1) {
+            t.SetIntAt(this.statEntries[i].hash, "hits", 0);
+            t.SetIntAt(this.statEntries[i].hash, "total_us", 0);
         }
     }
 
@@ -260,8 +266,8 @@ class Router {
     /// computation.</summary>
     void RecordHit(int idx, long us) {
         if (this.routeStats == null) { return; }
-        if (idx < 0 || idx >= this.flatHashes.Count) { return; }
-        long key = this.flatHashes[idx];
+        if (this.statEntries == null || idx < 0 || idx >= this.statEntries.Count) { return; }
+        long key = this.statEntries[idx].hash;
         this.routeStats.IncrementAt(key, "hits", 1);
         this.routeStats.IncrementAt(key, "total_us", us);
     }
@@ -285,17 +291,19 @@ class Router {
     List<RouteHitDoc> Stats() {
         List<RouteHitDoc> outp = new List<RouteHitDoc>();
         if (this.routeStats == null) { return outp; }
-        for (int i = 0; i < this.flatHashes.Count; i = i + 1) {
-            long key = this.flatHashes[i];
-            long hits = this.routeStats.GetIntAt(key, "hits");
-            if (hits > 0) {
-                long totalUs = this.routeStats.GetIntAt(key, "total_us");
-                long avgUs = totalUs / hits;
-                RouteHitDoc o = new RouteHitDoc();
-                o.route = this.flatKeys[i];
-                o.count = hits;
-                o.avg_us = avgUs;
-                outp.Add(o);
+        if (this.statEntries != null) {
+            for (int i = 0; i < this.statEntries.Count; i = i + 1) {
+                RouteStatEntry entry = this.statEntries[i];
+                long hits = this.routeStats.GetIntAt(entry.hash, "hits");
+                if (hits > 0) {
+                    long totalUs = this.routeStats.GetIntAt(entry.hash, "total_us");
+                    long avgUs = totalUs / hits;
+                    RouteHitDoc o = new RouteHitDoc();
+                    o.route = entry.key;
+                    o.count = hits;
+                    o.avg_us = avgUs;
+                    outp.Add(o);
+                }
             }
         }
         return outp;

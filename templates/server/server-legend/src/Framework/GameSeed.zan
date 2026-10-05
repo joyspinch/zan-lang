@@ -291,14 +291,14 @@ class GameSeed {
         if (n > 0) { return true; }
         DbResult mons = await GameSnapshot.Table("gamemonster");
         DbResult maps = await GameSnapshot.Table("gamemap");
-        DbResult snapItems = await GameSnapshot.Table("gameitem");
-        List<int> snapIds = new List<int>();
-        List<string> snapNames = new List<string>();
-        List<string> snapClass = new List<string>();
-        for (int i = 0; i < snapItems.RowCount(); i = i + 1) {
-            snapIds.Add(GameSnapshot.Int(snapItems, i, "id"));
-            snapNames.Add(GameSnapshot.Str(snapItems, i, "name"));
-            snapClass.Add(GameSnapshot.Str(snapItems, i, "aclass"));
+        DbResult snapTable = await GameSnapshot.Table("gameitem");
+        List<SnapItem> snapItems = new List<SnapItem>();
+        for (int i = 0; i < snapTable.RowCount(); i = i + 1) {
+            snapItems.Add(new SnapItem(
+                GameSnapshot.Int(snapTable, i, "id"),
+                GameSnapshot.Str(snapTable, i, "name"),
+                GameSnapshot.Str(snapTable, i, "aclass")
+            ));
         }
         List<Item> items = await db.Select<Item>().ToListAsync();
         List<GameMap> rtMaps = await db.Select<GameMap>().ToListAsync();
@@ -313,8 +313,8 @@ class GameSeed {
             List<string> names = GameSeed.SplitList(
                 GameSnapshot.Str(maps, i, "present"), 124 /* '|' */);
             for (int k = 0; k < names.Count; k = k + 1) {
-                if (!await GameSeed.SeedSpawn(db, mons, snapIds, snapNames,
-                        snapClass, items, names[k], mapId, mapLvl,
+                if (!await GameSeed.SeedSpawn(db, mons, snapItems,
+                        items, names[k], mapId, mapLvl,
                         exp, money, mapDrop, false)) { return false; }
             }
             string boss = GameSnapshot.Str(maps, i, "boss");
@@ -322,7 +322,7 @@ class GameSeed {
                 int bossRow = GameSeed.MonsterRow(mons, "",
                     Convert.ToInt(boss));
                 if (bossRow >= 0 && !await GameSeed.SeedSpawn(db, mons,
-                        snapIds, snapNames, snapClass, items,
+                        snapItems, items,
                         GameSnapshot.Str(mons, bossRow, "name"), mapId,
                         mapLvl, exp, money, mapDrop, true)) { return false; }
             }
@@ -336,8 +336,7 @@ class GameSeed {
        攻=8+1.8·lvl 防=2+0.9·lvl；BOSS hp=400+42·lvl 攻=10+3·lvl
        防=5+0.8·lvl。 */
     static async bool SeedSpawn(IDbConnection db, DbResult mons,
-            List<int> snapIds, List<string> snapNames,
-            List<string> snapClass, List<Item> items, string name,
+            List<SnapItem> snapItems, List<Item> items, string name,
             int mapId, int mapLvl, int exp, long money, string mapDrop,
             bool boss) {
         int row = GameSeed.MonsterRow(mons, name, 0);
@@ -396,23 +395,21 @@ class GameSeed {
         m.status = 1;
         int _id = await db.Insert<Mob>(m).ExecuteIdentityAsync();
         if (_id <= 0) { return false; }
-        return await GameSeed.SeedDrops(db, drops, snapIds, snapNames,
-            snapClass, items, _id);
+        return await GameSeed.SeedDrops(db, drops, snapItems, items, _id);
     }
 
     /* 爆率种子：掉落串 "快照id|数量|?|权重/..." 的全部条目逐条写入
        game_drop（权重×10 = 万分比，封顶 5000；含消耗品——原表就有，
-       GM 可在爆率管理页删改）。 */
+       GM 可在爆率管理页删改）。通过 SnapItem 强类型实体映射。 */
     static async bool SeedDrops(IDbConnection db, string drops,
-            List<int> snapIds, List<string> snapNames,
-            List<string> snapClass, List<Item> items, int mobId) {
+            List<SnapItem> snapItems, List<Item> items, int mobId) {
         List<string> entries = GameSeed.SplitList(drops, 47 /* '/' */);
         int sort = 0;
         for (int i = 0; i < entries.Count; i = i + 1) {
             List<string> f = GameSeed.SplitList(entries[i], 124 /* '|' */);
             if (f.Count < 4) { continue; }
             int snapId = Convert.ToInt(f[0]);
-            string nm = GameSeed.SnapAt(snapIds, snapNames, snapId);
+            string nm = GameSeed.SnapItemName(snapItems, snapId);
             if (nm.Length == 0) { continue; }
             int rtId = GameSeed.ItemIdByName(items, nm);
             if (rtId == 0) { continue; }
@@ -465,10 +462,10 @@ class GameSeed {
         return GameSnapshot.Int(mons, row, lo);
     }
 
-    /* 快照 id → 并列表取值（缺 → 空串）。 */
-    static string SnapAt(List<int> ids, List<string> vals, int id) {
-        for (int i = 0; i < ids.Count; i = i + 1) {
-            if (ids[i] == id) { return vals[i]; }
+    /* 快照道具 id → 取道具名（缺 → 空串）。基于 SnapItem 强类型实体。 */
+    static string SnapItemName(List<SnapItem> items, int id) {
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (items[i].id == id) { return items[i].name; }
         }
         return "";
     }

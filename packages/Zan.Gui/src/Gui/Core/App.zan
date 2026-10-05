@@ -3,6 +3,19 @@ using Gui.Backend;
 
 namespace Gui;
 
+/// 模糊缓存槽状态实体（消除 blurSlotKey / blurSlotUse / blurSlotNew 平行列表反模式）。
+class BlurSlot {
+    int key;    // 占用槽的元素身份（0=空槽）
+    int lastUse; // 最后被用到的帧号
+    int lastNew; // 最后一次换手（分配给新身份）的帧号
+
+    BlurSlot() {
+        this.key = 0;
+        this.lastUse = 0;
+        this.lastNew = -1;
+    }
+}
+
 /// App 保留动画存储中的一个带键补间/状态槽。取代了
 /// 六个按索引对齐的 animKeys/animVals/animTarget/animFrom/animStart/animDur
 /// 并行列表：`键`=稳定 id，`cur`=当前值，`dst`=目标值，
@@ -599,19 +612,14 @@ class App {
     // 在 BeginFrame 中重置；由 NextBlurSlot() 递增。
     int blurSlotSeq;
 
-    // 模糊缓存槽的常驻分配表：blurSlotKey[i] 是占用第 i 槽的
-    // 元素身份（0=空槽），blurSlotUse[i] 是它最后被用到的帧号。
+    // 模糊缓存槽的常驻分配表：每项记录占用该槽的元素身份（0=空槽）、
+    // 最后使用的帧号以及最后一次换手的帧号（以 BlurSlot 实体承载，消除平行列表）。
     // 槽位过去按绘制顺序逐帧发放，于是某一帧多画/少画一个玻璃
     // 面板，它后面所有面板都会平移一格，各自捡到别人的缓存——
     // 几何不符 => 全部重新模糊。改为按身份查表后，同一元素每帧
     // 拿回同一槽，与绘制顺序和邻居的出现/消失无关；表满时淘汰
     // 最久未用的槽。
-    List<int> blurSlotKey;
-    List<int> blurSlotUse;
-    // blurSlotNew[i] 是第 i 槽最后一次换手（分配给新身份）的帧号：
-    // 换手的槽里是别的元素的像素，本帧必须当作脏区重算一次（几何
-    // 恰好相同时运行时的几何校验发现不了）。
-    List<int> blurSlotNew;
+    List<BlurSlot> blurSlots;
 
     // 壁纸背景缓存失效。渐变 + 柔和色块
     // 是静态的：它们只取决于窗口大小和当前皮肤，而不取决于
@@ -976,14 +984,10 @@ class App {
         this.fxTouchedFull = false;
         this.backdropDirty = true;
         this.blurSlotSeq = 0;
-        this.blurSlotKey = new List<int>();
-        this.blurSlotUse = new List<int>();
-        this.blurSlotNew = new List<int>();
+        this.blurSlots = new List<BlurSlot>();
         int bs = 0;
         while (bs < 64) {
-            this.blurSlotKey.Add(0);
-            this.blurSlotUse.Add(0);
-            this.blurSlotNew.Add(-1);
+            this.blurSlots.Add(new BlurSlot());
             bs = bs + 1;
         }
         // gen != snapGen 时壁纸只绘制（并快照）一次，
@@ -1305,12 +1309,10 @@ class App {
         // 主题变量（<a> 的链接主色）——过去 UA 层用裸 FromCss 解析，
         // var() 展开为空、整条声明消失。皮肤 :root 的继承变量随后
         // 叠加，appCss 的展开名单不受影响。
-        List<string> vn = new List<string>();
-        List<string> vv = new List<string>();
-        Css.CollectVars(Style.RootFromTheme(theme), vn, vv);
+        List<CssVarDecl> varList = Css.CollectVarDecls(Style.RootFromTheme(theme));
         // UA 样式表垫底（WEB_GUI_ROADMAP P0）：web 元素缺省语义，
         // 皮肤与应用样式按层叠覆盖。UseCss 隔离皮肤时 UA 仍然在。
-        fresh.MergeSheet(Css.ParseWithSources(Style.UaCss(), vn, vv, 0));
+        fresh.MergeSheet(Css.ParseWithSources(Style.UaCss(), varList, 0));
         if (skinName != "") {
             Skin s = Skin.Load(skinName);
             if (s.IsLoaded()) { fresh.MergeSheet(s.sheet); }
@@ -1322,16 +1324,15 @@ class App {
         // 展开成空值（var() 过去只在同一份源文本内查找）。这些外来
         // 变量只用于展开，不写进 sheet.vars——那份表代表皮肤自己声明
         // 了什么（Skin.ThemeOf 按它推导主题）。
-        int themeVarCount = vn.Count;
+        int themeVarCount = varList.Count;
         if (fresh.vars != null) {
             for (int i = 0; i < fresh.vars.Count(); i = i + 1) {
-                vn.Add(fresh.vars.KeyAt(i));
-                vv.Add(fresh.vars.ValAt(i).AsString(""));
+                varList.Add(new CssVarDecl(fresh.vars.KeyAt(i), fresh.vars.ValAt(i).AsString("")));
             }
         }
         // Theme metrics are physical; inherited skin declarations are logical.
         if (appCss != "") {
-            fresh.MergeSheet(Css.ParseWithSources(appCss, vn, vv, themeVarCount));
+            fresh.MergeSheet(Css.ParseWithSources(appCss, varList, themeVarCount));
         }
         sheet = fresh;
     }
@@ -3864,7 +3865,7 @@ class App {
         if (slot < 0) { return true; }
         bool clipCovers = !partialFrame || this.RectInDamage(x, y, w, h);
         if (freezeAnimClock) { return clipCovers; }
-        if (slot < blurSlotNew.Count && blurSlotNew[slot] == frameCount) {
+        if (slot < blurSlots.Count && blurSlots[slot].lastNew == frameCount) {
             return true;
         }
         if (glassRefreshOwe && partialFrame && !this.ScrollBurstActive()
@@ -3958,19 +3959,20 @@ class App {
         int lruUse = -1;
         int i = 0;
         while (i < 64) {
-            if (blurSlotKey[i] == key) {
-                blurSlotUse[i] = frameCount;
+            BlurSlot s = blurSlots[i];
+            if (s.key == key) {
+                s.lastUse = frameCount;
                 return i;
             }
-            if (blurSlotKey[i] == 0) {
+            if (s.key == 0) {
                 if (free < 0) { free = i; }
-            } else if (blurSlotUse[i] != frameCount
-                       && (lruUse < 0 || blurSlotUse[i] < lruUse)) {
+            } else if (s.lastUse != frameCount
+                       && (lruUse < 0 || s.lastUse < lruUse)) {
                 // 本帧已经用过的槽不参与淘汰：否则一屏超过 64 块
                 // 玻璃时，后面的面板会抢走前面面板刚拿到的槽，
                 // 每帧互相踢来踢去，谁的缓存都留不住。
                 lru = i;
-                lruUse = blurSlotUse[i];
+                lruUse = s.lastUse;
             }
             i = i + 1;
         }
@@ -3979,9 +3981,10 @@ class App {
             if (lruUse < 0) { return -1; }
             slot = lru;
         }
-        blurSlotKey[slot] = key;
-        blurSlotUse[slot] = frameCount;
-        blurSlotNew[slot] = frameCount;
+        BlurSlot target = blurSlots[slot];
+        target.key = key;
+        target.lastUse = frameCount;
+        target.lastNew = frameCount;
         return slot;
     }
 

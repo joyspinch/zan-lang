@@ -34,6 +34,19 @@ public class WebCookie {
     }
 }
 
+/// <summary>
+/// 挂起的脚本注入项强类型实体（消除 "0"/"1" + js 字符串拼接反模式）。
+/// </summary>
+public class PendingScriptItem {
+    public string script;
+    public bool atDocumentEnd;
+
+    public PendingScriptItem(string script, bool atDocumentEnd) {
+        this.script = script != null ? script : "";
+        this.atDocumentEnd = atDocumentEnd;
+    }
+}
+
 /// 内嵌的原生 Web 视图（浏览器控件）。
 ///
 /// 由平台浏览器引擎（WebViewBackend）支撑：Windows 上是 Edge WebView2
@@ -79,7 +92,7 @@ class WebView {
     // 原生视图创建前登记的桥接内容，创建时补上（宿主通常在构造后、
     // 第一帧之前就注册 handler / 注入脚本）。
     List<string> pendingHandlers;
-    List<string> pendingScripts;   // 每项 "0"/"1" + js，前缀是注入时机
+    List<PendingScriptItem> pendingScripts;
     List<string> pendingStyles;
     bool pendingDevTools;
     bool devToolsEnabled;
@@ -120,7 +133,7 @@ class WebView {
         this.lastSeenTitle = "";
         this.lastSeenLoading = false;
         this.pendingHandlers = new List<string>();
-        this.pendingScripts = new List<string>();
+        this.pendingScripts = new List<PendingScriptItem>();
         this.pendingStyles = new List<string>();
         this.pendingDevTools = false;
         this.devToolsEnabled = true;
@@ -163,11 +176,10 @@ class WebView {
         }
         pendingHandlers = new List<string>();
         for (int i = 0; i < pendingScripts.Count; i = i + 1) {
-            string spec = pendingScripts[i];
-            WebViewBackend.AddScript(handle, spec.Substring(1, spec.Length - 1),
-                                     spec[0] == '1');
+            PendingScriptItem it = pendingScripts[i];
+            WebViewBackend.AddScript(handle, it.script, it.atDocumentEnd);
         }
-        pendingScripts = new List<string>();
+        pendingScripts = new List<PendingScriptItem>();
         for (int i = 0; i < pendingStyles.Count; i = i + 1) {
             WebViewBackend.AddStyle(handle, pendingStyles[i]);
         }
@@ -342,9 +354,7 @@ class WebView {
     void InjectScript(string js, bool atDocumentEnd) {
         if (js == "") { return; }
         if (!created || !supported || handle == 0) {
-            string tag = "0";
-            if (atDocumentEnd) { tag = "1"; }
-            pendingScripts.Add(tag + js);
+            pendingScripts.Add(new PendingScriptItem(js, atDocumentEnd));
             return;
         }
         WebViewBackend.AddScript(handle, js, atDocumentEnd);
@@ -362,7 +372,7 @@ class WebView {
 
     /// 撤掉此前注入的所有脚本/样式（下一次导航起生效）。
     void ClearInjected() {
-        pendingScripts = new List<string>();
+        pendingScripts = new List<PendingScriptItem>();
         pendingStyles = new List<string>();
         if (supported && handle != 0) { WebViewBackend.RemoveScripts(handle); }
     }

@@ -4,6 +4,61 @@ using Gui.Widget;
 
 namespace Gui.Component.DataTable;
 
+/// <summary>
+/// DataTable 列级条件格式规则实体（消除 menuCfMode/menuCfColor 等平行列表反模式）。
+/// </summary>
+class ColumnCfRule {
+    public int mode;
+    public int color;
+    public int color2;
+    public int threshold;
+    public bool rankPct;
+    public bool off;
+
+    public ColumnCfRule() {
+        this.mode = 0;
+        this.color = 0;
+        this.color2 = 0;
+        this.threshold = 0;
+        this.rankPct = false;
+        this.off = false;
+    }
+
+    public static ColumnCfRule Create() {
+        return new ColumnCfRule();
+    }
+}
+
+/// <summary>
+/// 条件格式清除项实体（消除 cfClearCols/cfClearSel 平行列表反模式）。
+/// </summary>
+class CfClearItem {
+    public int column;
+    public bool selected;
+
+    public CfClearItem(int column, bool selected) {
+        this.column = column;
+        this.selected = selected;
+    }
+}
+
+/// <summary>
+/// 单元格多选矩形选区强类型实体（消除 multiRanges 四元整数列表反模式）。
+/// </summary>
+class TableCellRange {
+    public int row0;
+    public int col0;
+    public int row1;
+    public int col1;
+
+    public TableCellRange(int r0, int c0, int r1, int c1) {
+        this.row0 = r0;
+        this.col0 = c0;
+        this.row1 = r1;
+        this.col1 = c1;
+    }
+}
+
 /// DataTable 的列描述符。
 /// cellType：0 文本，1 链接，2 标签，3 进度，4 徽章，5 图片，
 /// 6 图标，7 按钮，8 图表，9 组件
@@ -1083,13 +1138,25 @@ class TreeAdapter {
     virtual void LoadChildren(DataSource src, int row) { }
 }
 
+/// <summary>
+/// 分组行逐列聚合汇总条目实体（消除 GroupRow 中 aggValues/aggTexts 平行列表反模式）。
+/// </summary>
+class GroupAggregateEntry {
+    public int value;
+    public string text;
+
+    public GroupAggregateEntry(int v, string t) {
+        this.value = v;
+        this.text = t;
+    }
+}
+
 /// 分组表格中的一行分组标题：标题文本、嵌套层级、所含
 /// 数据行数、完整路径键（折叠查找）和折叠快照。
 /// 取代旧的按索引对齐的 grpLabel/grpLevel/grpCount/grpKey/grpCollapsed
 /// 并行列表。
 ///
-/// `aggValues` / `aggTexts` 是该组自身成员行的逐列小计
-/// （与表格列列表按索引对齐），在
+/// `aggregates` 是该组自身成员行的逐列小计（与表格列列表按索引对齐），在
 /// BuildDisplay 中一次性计算，让分组标题能显示 DevExpress 风格的分组汇总
 /// （例如 "Category: Electronics (42)  Revenue: \u00a51,234,567"）而无需额外
 /// 每帧开销。
@@ -1099,8 +1166,7 @@ class GroupRow {
     int count;
     string key;
     bool collapsed;
-    List<int> aggValues;
-    List<string> aggTexts;
+    List<GroupAggregateEntry> aggregates; // 强类型分组逐列聚合实体列表
     /// 最内层（叶子）分组的成员源行（st.order 的连续片段），
     /// BuildDisplay 关组时填充。最外层组不物化成员（每行
     /// 只会记一次，嵌套层级不重复占内存）；组表头三态
@@ -1113,8 +1179,7 @@ class GroupRow {
         count = cnt;
         key = k;
         collapsed = coll;
-        aggValues = new List<int>();
-        aggTexts = new List<string>();
+        aggregates = new List<GroupAggregateEntry>();
         members = new List<int>();
     }
 }
@@ -1292,20 +1357,11 @@ class DataTableState {
     // 写进列对象的改动会在下一帧丢失。规则因此落在状态槽里，
     // EnsureColumnSlots 每帧回写到当前列集：mode 0 表示"菜单
     // 未启用"，列上工厂预设的规则照常生效；用户清除只清菜单槽。
-    List<int> menuCfMode;       // 每列：0 无，同 cfMode 取值
-    List<int> menuCfColor;
-    List<int> menuCfColor2;
-    List<int> menuCfThreshold;
-    List<bool> menuCfRankPct;
-    // 每列：用户显式清除过规则（清除弹窗）。置位后压制列上
-    // 工厂预设——否则每帧重建的列会把预设带回来。菜单重新
-    // 设置规则时自动复位。
-    List<bool> menuCfOff;
+    List<ColumnCfRule> cfRules; // 强类型列级条件格式规则实体（消除旧 menuCfMode/menuCfColor 等平行列表）
 
     // ---- 清除条件格式规则弹窗 ----
     bool cfClearOpen;           // 弹窗打开中
-    List<int> cfClearCols;      // 打开时枚举的带规则列
-    List<bool> cfClearSel;      // 与 cfClearCols 对齐的勾选
+    List<CfClearItem> cfClearItems; // 强类型清除选择项实体（替代旧 cfClearCols/cfClearSel 平行列表）
     int cfClearScroll;          // 规则多到超出弹窗高度时的滚动
 
     // ---- 分页 ----
@@ -1336,11 +1392,10 @@ class DataTableState {
     bool rangeDrag;            // 正在拖拽选择单元格范围
     List<int> rangeSelTouched; // 本手势勾选的显示槽位（范围缩小时退勾用）
     // Excel 式多区域选区：Ctrl+点击/拖拽把已固化的范围归档到
-    // multiRanges 后再开新区域，选区=已归档区域+当前 range 的并集。
-    // 每个区域存 4 个 int（r0,c0,r1,c1 顺序索引/列索引）；普通
-    // （无 Ctrl）选择会清空归档——单矩形仍是主路径，多区域只在
-    // Ctrl 参与时出现。r1<0 的条目是正在拖拽中的活动区域占位。
-    List<int> multiRanges;
+    // cellRanges 后再开新区域，选区=已归档区域+当前 range 的并集。
+    // 普通（无 Ctrl）选择会清空归档——单矩形仍是主路径，多区域只在
+    // Ctrl 参与时出现。
+    List<TableCellRange> cellRanges; // 强类型多区域选区实体（消除旧 multiRanges 扁平四元整数列表）
     // 当前范围/活动区域是否属于一个多区域选区（Ctrl 追加过）。
     // true 时状态栏、复制、清空按全部区域并集取数。
     bool multiActive;
@@ -1675,7 +1730,7 @@ class DataTableState {
         this.resizeStartX = 0;
         this.resizeStartW = 0;
         this.dirty = true;
-        this.multiRanges = new List<int>();
+        this.cellRanges = new List<TableCellRange>();
         this.multiActive = false;
         this.keyProvider = null;
         this.cellWidgets = null;
@@ -1720,15 +1775,9 @@ class DataTableState {
         this.cfRank = new List<int>();
         this.cfOrderPos = null;
         this.formulaSeen = null;
-        this.menuCfMode = new List<int>();
-        this.menuCfColor = new List<int>();
-        this.menuCfColor2 = new List<int>();
-        this.menuCfThreshold = new List<int>();
-        this.menuCfRankPct = new List<bool>();
-        this.menuCfOff = new List<bool>();
+        this.cfRules = new List<ColumnCfRule>();
         this.cfClearOpen = false;
-        this.cfClearCols = new List<int>();
-        this.cfClearSel = new List<bool>();
+        this.cfClearItems = new List<CfClearItem>();
         this.cfClearScroll = 0;
         this.paged = false;
         this.pageModel = new SignalInt(1);

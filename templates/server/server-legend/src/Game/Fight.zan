@@ -699,8 +699,6 @@ class Fight {
     /* 装载进会话（进区时调用；同物品合并）。返回合成包数（诊断用）。 */
     static async int LoadBag(IDbConnection db, Session s) {
         s.bagSlots.Clear();
-        s.bagIds.Clear();
-        s.bagCounts.Clear();
         List<ZanWeb.Model.Game.Bag> rows = await db
             .Select<ZanWeb.Model.Game.Bag>()
             .Where(a => a.playerId == s.row.id).ToListAsync();
@@ -715,38 +713,28 @@ class Fight {
         for (int i = 0; i < s.bagSlots.Count; i = i + 1) {
             if (s.bagSlots[i].itemId == itemId) { return i; }
         }
-        return s.bagIds.IndexOf(itemId);
+        return -1;
     }
 
-    /* 内存加放物品；调用人负责置 bagDirty（本方法统一置）。通过 BagSlot 实体同步。 */
+    /* 内存加放物品；调用人负责置 bagDirty（本方法统一置）。通过 BagSlot 强类型实体维护。 */
     static void BagAdd(Session s, int itemId, int count) {
         int at = Fight.BagIndexOf(s, itemId);
         if (at >= 0) {
-            if (at < s.bagSlots.Count) {
-                s.bagSlots[at].count = s.bagSlots[at].count + count;
-            }
-            if (at < s.bagCounts.Count) {
-                s.bagCounts[at] = s.bagCounts[at] + count;
-            }
+            s.bagSlots[at].count = s.bagSlots[at].count + count;
         } else {
             s.bagSlots.Add(new BagSlot(itemId, count));
-            s.bagIds.Add(itemId);
-            s.bagCounts.Add(count);
         }
         s.bagDirty = true;
     }
 
-    /* 扣减；数量不足返回 false。通过 BagSlot 实体同步。 */
+    /* 扣减；数量不足返回 false。通过 BagSlot 强类型实体维护。 */
     static bool BagTake(Session s, int itemId, int count) {
         int at = Fight.BagIndexOf(s, itemId);
-        if (at < 0 || at >= s.bagCounts.Count || s.bagCounts[at] < count) { return false; }
-        if (s.bagCounts[at] == count) {
-            if (at < s.bagSlots.Count) { s.bagSlots.RemoveAt(at); }
-            s.bagIds.RemoveAt(at);
-            s.bagCounts.RemoveAt(at);
+        if (at < 0 || at >= s.bagSlots.Count || s.bagSlots[at].count < count) { return false; }
+        if (s.bagSlots[at].count == count) {
+            s.bagSlots.RemoveAt(at);
         } else {
-            if (at < s.bagSlots.Count) { s.bagSlots[at].count = s.bagSlots[at].count - count; }
-            s.bagCounts[at] = s.bagCounts[at] - count;
+            s.bagSlots[at].count = s.bagSlots[at].count - count;
         }
         s.bagDirty = true;
         return true;
@@ -1300,11 +1288,9 @@ class Fight {
     static string wbTopName = "";
     static long wbTopDmg = 0;
     /* 世界BOSS 伤害榜（场景页 dim=3）：本周期按玩家累计的伤害。
-       使用 WbDamageRecord 强类型实体维护，同时同步 wbBoardNames / wbBoardVals 兼容访问。
+       使用 WbDamageRecord 强类型实体维护（已彻底消除旧平行列表 wbBoardNames 与 wbBoardVals）。
        内存瞬态——BOSS 重生时清零（世界BOSS 本体也是内存重铺口径，RULES.md §持久化边界）。 */
     static List<WbDamageRecord> wbRecords = new List<WbDamageRecord>();
-    static List<string> wbBoardNames = new List<string>();
-    static List<long> wbBoardVals = new List<long>();
 
     static void WbBoardAdd(string name, long dmg) {
         int at = -1;
@@ -1313,20 +1299,13 @@ class Fight {
         }
         if (at < 0) {
             wbRecords.Add(new WbDamageRecord(name, dmg));
-            wbBoardNames.Add(name);
-            wbBoardVals.Add(dmg);
         } else {
             wbRecords[at].damage = wbRecords[at].damage + dmg;
-            if (at < wbBoardVals.Count) {
-                wbBoardVals[at] = wbBoardVals[at] + dmg;
-            }
         }
     }
 
     static void WbBoardReset() {
         wbRecords.Clear();
-        wbBoardNames.Clear();
-        wbBoardVals.Clear();
     }
 
     /// 获取当前周期世界 BOSS 伤害前 N 名（基于 WbDamageRecord 强类型实体，非破坏性排序读取）。
@@ -1455,23 +1434,21 @@ class Fight {
         if (s.row.gold < cost) {
             return "金币不够（每次寻宝需 " + Convert.ToString(cost) + "）";
         }
-        List<int> ids = new List<int>();
-        List<int> weights = new List<int>();
+        List<DrawPrizeEntry> prizes = new List<DrawPrizeEntry>();
         foreach (ZanWeb.RuleRow prize in Rules.DrawPool().All()) {
             if (Fight.ById(prize.Int("item_id")) == null) { continue; }
-            ids.Add(prize.Int("item_id"));
-            weights.Add(prize.Int("weight"));
+            prizes.Add(new DrawPrizeEntry(prize.Int("item_id"), prize.Int("weight")));
         }
         int total = 0;
-        for (int i = 0; i < weights.Count; i = i + 1) { total += weights[i]; }
+        for (int i = 0; i < prizes.Count; i = i + 1) { total += prizes[i].weight; }
         if (total <= 0) { return "奖池为空"; }
         int roll = Fight.rng.NextBelow(total);
         int pick = 0;
-        for (int i = 0; i < weights.Count; i = i + 1) {
-            if (roll < weights[i]) { pick = i; break; }
-            roll -= weights[i];
+        for (int i = 0; i < prizes.Count; i = i + 1) {
+            if (roll < prizes[i].weight) { pick = i; break; }
+            roll -= prizes[i].weight;
         }
-        ZanWeb.Model.Game.Item it = Fight.ById(ids[pick]);
+        ZanWeb.Model.Game.Item it = Fight.ById(prizes[pick].itemId);
         if (it == null) { return "奖池物品缺失"; }
         s.row.gold = s.row.gold - cost;
         Fight.BagAdd(s, it.id, 1);
@@ -1519,11 +1496,8 @@ class Fight {
             points += Fight.Capped(unit, Rules.Recycle().At(6));
             if (take >= s.bagSlots[i].count) {
                 s.bagSlots.RemoveAt(i);
-                if (i < s.bagIds.Count) { s.bagIds.RemoveAt(i); }
-                if (i < s.bagCounts.Count) { s.bagCounts.RemoveAt(i); }
             } else {
                 s.bagSlots[i].count = s.bagSlots[i].count - (int)take;
-                if (i < s.bagCounts.Count) { s.bagCounts[i] = s.bagCounts[i] - (int)take; }
             }
         }
         if (gain <= 0 && exp <= 0 && merit <= 0 && reputation <= 0

@@ -591,17 +591,28 @@ partial class CodeEditor {
     // 区间由宿主从 LSP textDocument/foldingRange 注入；编辑器的职责只有
     // 折叠状态、行布局过滤与槽内点击，不重复实现语法扫描。
 
-    /// 注入折叠区间（0 起行号、闭区间，end 行保持可见）。
+    /// 注入折叠区间（使用 CodeFoldRegion 强类型实体集合）。
+    void SetFoldRegions(List<CodeFoldRegion> regions) {
+        if (foldRegions == null) {
+            foldRegions = new List<CodeFoldRegion>();
+        } else {
+            foldRegions.Clear();
+        }
+        if (regions == null) { return; }
+        for (int i = 0; i < regions.Count; i = i + 1) {
+            CodeFoldRegion r = regions[i];
+            if (r == null || r.startLine < 0 || r.endLine < r.startLine) { continue; }
+            foldRegions.Add(new CodeFoldRegion(r.startLine, r.endLine, r.folded));
+        }
+    }
+
+    /// 注入折叠区间（兼容接口，0 起行号、闭区间，end 行保持可见）。
     /// 覆盖上一次注入；当前折叠状态一并复位。
     void SetFoldRanges(List<int> starts, List<int> ends) {
-        if (foldStart == null) {
-            foldStart = new List<int>();
-            foldEnd = new List<int>();
-            foldFolded = new List<bool>();
+        if (foldRegions == null) {
+            foldRegions = new List<CodeFoldRegion>();
         } else {
-            foldStart.Clear();
-            foldEnd.Clear();
-            foldFolded.Clear();
+            foldRegions.Clear();
         }
         if (starts == null || ends == null) { return; }
         int n = starts.Count < ends.Count ? starts.Count : ends.Count;
@@ -609,23 +620,21 @@ partial class CodeEditor {
             // 只收区间起点非负的条目并保持按起点有序（LSP 栈扫描
             // 天然有序，这里只做防御性过滤）。
             if (starts[i] < 0 || ends[i] < starts[i]) { continue; }
-            foldStart.Add(starts[i]);
-            foldEnd.Add(ends[i]);
-            foldFolded.Add(false);
+            foldRegions.Add(new CodeFoldRegion(starts[i], ends[i], false));
         }
     }
 
     /// 已注入的折叠区间数。
     int FoldRegionCount() {
-        if (foldStart == null) { return 0; }
-        return foldStart.Count;
+        if (foldRegions == null) { return 0; }
+        return foldRegions.Count;
     }
 
     /// 有区间处于折叠状态时为 true；此时行布局/滚动按可见行解释。
     bool AnyFolded() {
-        if (foldFolded == null) { return false; }
-        for (int i = 0; i < foldFolded.Count; i = i + 1) {
-            if (foldFolded[i]) { return true; }
+        if (foldRegions == null) { return false; }
+        for (int i = 0; i < foldRegions.Count; i = i + 1) {
+            if (foldRegions[i].folded) { return true; }
         }
         return false;
     }
@@ -633,8 +642,9 @@ partial class CodeEditor {
     /// 区间 `i` 在当前缓冲区内仍然成立：行号在界内且首尾行带花括号。
     /// 文本编辑会让行号漂移，失效区间不得再隐藏内容。
     bool FoldRegionValid(int i) {
-        int s = foldStart[i];
-        int e = foldEnd[i];
+        if (foldRegions == null || i < 0 || i >= foldRegions.Count) { return false; }
+        int s = foldRegions[i].startLine;
+        int e = foldRegions[i].endLine;
         if (s < 0 || e < s || e >= lines.Count) { return false; }
         return lines[s].IndexOf("{") >= 0 && lines[e].IndexOf("}") >= 0;
     }
@@ -642,7 +652,7 @@ partial class CodeEditor {
     /// `line`（0 起）是某个有效区间的折叠起点时返回 true（槽位画标记）。
     bool FoldableAt(int line) {
         for (int i = 0; i < FoldRegionCount(); i = i + 1) {
-            if (foldStart[i] == line && FoldRegionValid(i)) { return true; }
+            if (foldRegions[i].startLine == line && FoldRegionValid(i)) { return true; }
         }
         return false;
     }
@@ -650,7 +660,7 @@ partial class CodeEditor {
     /// `line` 是折叠中（有效且已折叠）区间的起点时返回 true。
     bool FoldedAt(int line) {
         for (int i = 0; i < FoldRegionCount(); i = i + 1) {
-            if (foldStart[i] == line && foldFolded[i] && FoldRegionValid(i)) { return true; }
+            if (foldRegions[i].startLine == line && foldRegions[i].folded && FoldRegionValid(i)) { return true; }
         }
         return false;
     }
@@ -658,8 +668,8 @@ partial class CodeEditor {
     /// `line` 被某个已折叠的有效区间隐藏（起点行本身可见）时返回 true。
     bool FoldHides(int line) {
         for (int i = 0; i < FoldRegionCount(); i = i + 1) {
-            if (foldFolded[i] && FoldRegionValid(i)
-                && line > foldStart[i] && line <= foldEnd[i]) { return true; }
+            if (foldRegions[i].folded && FoldRegionValid(i)
+                && line > foldRegions[i].startLine && line <= foldRegions[i].endLine) { return true; }
         }
         return false;
     }
@@ -667,8 +677,8 @@ partial class CodeEditor {
     /// 切换以 `line` 为起点的折叠；该行不是有效折叠起点时无操作。
     void ToggleFold(int line) {
         for (int i = 0; i < FoldRegionCount(); i = i + 1) {
-            if (foldStart[i] == line && FoldRegionValid(i)) {
-                foldFolded[i] = !foldFolded[i];
+            if (foldRegions[i].startLine == line && FoldRegionValid(i)) {
+                foldRegions[i].folded = !foldRegions[i].folded;
                 return;
             }
         }
@@ -676,18 +686,18 @@ partial class CodeEditor {
 
     /// 全部展开（编辑后行号漂移的安全态；BumpTextVersion 已自动调用）。
     void UnfoldAll() {
-        if (foldFolded == null) { return; }
-        for (int i = 0; i < foldFolded.Count; i = i + 1) {
-            foldFolded[i] = false;
+        if (foldRegions == null) { return; }
+        for (int i = 0; i < foldRegions.Count; i = i + 1) {
+            foldRegions[i].folded = false;
         }
     }
 
     /// `line` 落在隐藏区时展开覆盖它的区间（光标/执行行落点保护）。
     void UnfoldContaining(int line) {
         for (int i = 0; i < FoldRegionCount(); i = i + 1) {
-            if (foldFolded[i] && FoldRegionValid(i)
-                && line > foldStart[i] && line <= foldEnd[i]) {
-                foldFolded[i] = false;
+            if (foldRegions[i].folded && FoldRegionValid(i)
+                && line > foldRegions[i].startLine && line <= foldRegions[i].endLine) {
+                foldRegions[i].folded = false;
             }
         }
     }
@@ -701,10 +711,10 @@ partial class CodeEditor {
         int ri = 0;
         for (int ln = 0; ln < lines.Count; ln = ln + 1) {
             if (ln > hideEnd) { visible = visible + 1; }
-            while (ri < FoldRegionCount() && foldStart[ri] < ln) { ri = ri + 1; }
-            if (ri < FoldRegionCount() && foldStart[ri] == ln
-                && foldFolded[ri] && FoldRegionValid(ri) && foldEnd[ri] > hideEnd) {
-                hideEnd = foldEnd[ri];
+            while (ri < FoldRegionCount() && foldRegions[ri].startLine < ln) { ri = ri + 1; }
+            if (ri < FoldRegionCount() && foldRegions[ri].startLine == ln
+                && foldRegions[ri].folded && FoldRegionValid(ri) && foldRegions[ri].endLine > hideEnd) {
+                hideEnd = foldRegions[ri].endLine;
             }
         }
         return visible;
@@ -722,10 +732,10 @@ partial class CodeEditor {
                 row = row - 1;
                 lastVis = ln;
             }
-            while (ri < FoldRegionCount() && foldStart[ri] < ln) { ri = ri + 1; }
-            if (ri < FoldRegionCount() && foldStart[ri] == ln
-                && foldFolded[ri] && FoldRegionValid(ri) && foldEnd[ri] > hideEnd) {
-                hideEnd = foldEnd[ri];
+            while (ri < FoldRegionCount() && foldRegions[ri].startLine < ln) { ri = ri + 1; }
+            if (ri < FoldRegionCount() && foldRegions[ri].startLine == ln
+                && foldRegions[ri].folded && FoldRegionValid(ri) && foldRegions[ri].endLine > hideEnd) {
+                hideEnd = foldRegions[ri].endLine;
             }
         }
         return lastVis;
@@ -739,10 +749,10 @@ partial class CodeEditor {
         int ri = 0;
         for (int ln = 0; ln < docLine && ln < lines.Count; ln = ln + 1) {
             if (ln > hideEnd) { row = row + 1; }
-            while (ri < FoldRegionCount() && foldStart[ri] < ln) { ri = ri + 1; }
-            if (ri < FoldRegionCount() && foldStart[ri] == ln
-                && foldFolded[ri] && FoldRegionValid(ri) && foldEnd[ri] > hideEnd) {
-                hideEnd = foldEnd[ri];
+            while (ri < FoldRegionCount() && foldRegions[ri].startLine < ln) { ri = ri + 1; }
+            if (ri < FoldRegionCount() && foldRegions[ri].startLine == ln
+                && foldRegions[ri].folded && FoldRegionValid(ri) && foldRegions[ri].endLine > hideEnd) {
+                hideEnd = foldRegions[ri].endLine;
             }
         }
         return row;
@@ -755,9 +765,9 @@ partial class CodeEditor {
         while (again) {
             again = false;
             for (int i = 0; i < FoldRegionCount(); i = i + 1) {
-                if (foldFolded[i] && FoldRegionValid(i)
-                    && ln2 > foldStart[i] && ln2 <= foldEnd[i]) {
-                    ln2 = foldEnd[i] + 1;
+                if (foldRegions[i].folded && FoldRegionValid(i)
+                    && ln2 > foldRegions[i].startLine && ln2 <= foldRegions[i].endLine) {
+                    ln2 = foldRegions[i].endLine + 1;
                     again = true;
                 }
             }

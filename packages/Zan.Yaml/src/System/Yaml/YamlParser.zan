@@ -4,6 +4,19 @@ using System.Json;
 
 namespace System.Yaml;
 
+/// YAML 词法行实体（消除 indents / texts / lineNos 三组平行列表反模式）。
+class YamlLine {
+    public int indent;
+    public string text;
+    public int lineNo;
+
+    YamlLine(int indent, string text, int lineNo) {
+        this.indent = indent;
+        this.text = text != null ? text : "";
+        this.lineNo = lineNo;
+    }
+}
+
 /// <summary>
 /// YAML core 子集解析器：按行游标递归下降。块映射/块序列（含
 /// `- key: v` 压缩嵌套——用"虚拟行回灌"统一处理）、流式集合（可跨
@@ -13,26 +26,22 @@ namespace System.Yaml;
 /// 按普通键，见 README）。
 /// </summary>
 class YamlParser {
-    List<int> indents;                    // 每行缩进（虚拟回灌行也存这里）
-    List<string> texts;                   // 剥缩进后的行文本
-    List<int> lineNos;                    // 每行原始行号（报错用）
+    List<YamlLine> lines;                 // 词法行实体列表（含虚拟回灌行）
     Dict<string, JsonValue> anchors;
     int cur;
     int lineCount;
     int lastLineNo;                       // 刚消费行的行号（cur 推进后报错用）
 
     /// 推进游标：先记行号再前进，之后的报错引用 lastLineNo——
-    /// 直接写 lineNos[cur] 会越界（键在最后一行时 cur == lineCount）。
+    /// 直接写 lines[cur].lineNo 会越界（键在最后一行时 cur == lineCount）。
     void Advance() {
-        lastLineNo = lineNos[cur];
+        lastLineNo = lines[cur].lineNo;
         cur = cur + 1;
     }
 
     /// 构造并做行切分与前导处理（BOM/指令/前导注释/一个 --- 起始符）。
     public YamlParser(string src) {
-        indents = new List<int>();
-        texts = new List<string>();
-        lineNos = new List<int>();
+        lines = new List<YamlLine>();
         anchors = new Dict<string, JsonValue>();
         // BOM 是编码标记不是内容：文件路径已由 File.ReadAllText 剥过，
         // 网络/内嵌文本（Windows 工具常带 EF BB BF）在这里兜底，不剥
@@ -68,7 +77,7 @@ class YamlParser {
                 i = i + 1;
             }
         }
-        lineCount = texts.Count;
+        lineCount = lines.Count;
     }
 
     void PushLine(StringBuilder sb, int lineNo) {
@@ -96,16 +105,14 @@ class YamlParser {
                     + Convert.ToString(lineNo) + ")");
             }
         }
-        indents.Add(ind);
-        texts.Add(t.Substring(ind, m - ind));
-        lineNos.Add(lineNo);
+        lines.Add(new YamlLine(ind, t.Substring(ind, m - ind), lineNo));
     }
 
     /// 前导：指令行（%）、注释、空行，以及一个 --- 起始符（带内联
     /// 内容时回灌为普通行）。
     void SkipPrologue() {
         while (cur < lineCount) {
-            string t = texts[cur];
+            string t = lines[cur].text;
             if (t.Length == 0 || t[0] == 35 || t[0] == 37) {          // 空/#/%
                 cur = cur + 1;
                 continue;
@@ -113,8 +120,8 @@ class YamlParser {
             if (t == "---") { cur = cur + 1; continue; }
             if (t.Length >= 4 && t[0] == 45 && t[1] == 45 && t[2] == 45
                 && t[3] == 32) {                                      // "--- x"
-                indents[cur] = indents[cur] + 4;
-                texts[cur] = t.Substring(4);
+                lines[cur].indent = lines[cur].indent + 4;
+                lines[cur].text = t.Substring(4);
                 continue;
             }
             break;
@@ -128,15 +135,15 @@ class YamlParser {
         JsonValue v = ParseBlock(0, 0);
         SkipIgnorable();
         if (cur < lineCount) {
-            string t = texts[cur];
+            string t = lines[cur].text;
             if (t == "---" || (t.Length >= 4 && t[0] == 45 && t[1] == 45
                 && t[2] == 45 && t[3] == 32)) {
                 throw new YamlException("multi-document input is not supported"
-                    + " (line " + Convert.ToString(lineNos[cur]) + ")");
+                    + " (line " + Convert.ToString(lines[cur].lineNo) + ")");
             }
             if (t == "...") { return v; }
             throw new YamlException("unexpected content after document (line "
-                + Convert.ToString(lineNos[cur]) + ")");
+                + Convert.ToString(lines[cur].lineNo) + ")");
         }
         return v;
     }
@@ -144,7 +151,7 @@ class YamlParser {
     /// 跳过空行与纯注释行；`...` 文档结束符停在这里由调用方判。
     void SkipIgnorable() {
         while (cur < lineCount) {
-            string t = texts[cur];
+            string t = lines[cur].text;
             if (t.Length == 0 || t[0] == 35) { cur = cur + 1; }
             else { break; }
         }
@@ -152,7 +159,7 @@ class YamlParser {
 
     bool AtDocMarker() {
         if (cur >= lineCount) { return true; }
-        string t = texts[cur];
+        string t = lines[cur].text;
         return t == "..." || t == "---";
     }
 
@@ -164,16 +171,16 @@ class YamlParser {
         SkipIgnorable();
         if (AtDocMarker()) { return null; }
         if (cur >= lineCount) { return null; }
-        if (indents[cur] < minIndent) { return null; }
+        if (lines[cur].indent < minIndent) { return null; }
         if (depth > 512) {
             throw new YamlException("block nesting too deep (line "
-                + Convert.ToString(lineNos[cur]) + ")");
+                + Convert.ToString(lines[cur].lineNo) + ")");
         }
-        string t = texts[cur];
+        string t = lines[cur].text;
         if (t == "-" || (t.Length >= 2 && t[0] == 45 && t[1] == 32)) {
-            return ParseSeq(indents[cur], depth);
+            return ParseSeq(lines[cur].indent, depth);
         }
-        if (FindKeyColon(t) >= 0) { return ParseMap(indents[cur], depth); }
+        if (FindKeyColon(t) >= 0) { return ParseMap(lines[cur].indent, depth); }
         return ParseBareNode(depth);
     }
 
@@ -185,16 +192,16 @@ class YamlParser {
             SkipIgnorable();
             if (AtDocMarker()) { break; }
             if (cur >= lineCount) { break; }
-            if (indents[cur] != indent) {
-                if (indents[cur] < indent) { break; }
+            if (lines[cur].indent != indent) {
+                if (lines[cur].indent < indent) { break; }
                 throw new YamlException("bad indentation in mapping (line "
-                    + Convert.ToString(lineNos[cur]) + ")");
+                    + Convert.ToString(lines[cur].lineNo) + ")");
             }
-            string t = texts[cur];
+            string t = lines[cur].text;
             int ci = FindKeyColon(t);
             if (ci < 0) {
                 throw new YamlException("expected 'key:' in mapping (line "
-                    + Convert.ToString(lineNos[cur]) + ")");
+                    + Convert.ToString(lines[cur].lineNo) + ")");
             }
             string key = DecodeKey(t.Substring(0, ci));
             string rest = "";
@@ -220,7 +227,7 @@ class YamlParser {
                 if (val == null) {
                     // 序列子节点允许与键同缩进（key:\n- a）。
                     if (!AtDocMarker() && cur < lineCount
-                        && indents[cur] == indent && IsSeqLine(texts[cur])) {
+                        && lines[cur].indent == indent && IsSeqLine(lines[cur].text)) {
                         val = ParseSeq(indent, depth + 1);
                     } else {
                         val = JsonValue.NewNull();
@@ -251,12 +258,12 @@ class YamlParser {
             SkipIgnorable();
             if (AtDocMarker()) { break; }
             if (cur >= lineCount) { break; }
-            if (indents[cur] != indent) { break; }
+            if (lines[cur].indent != indent) { break; }
             if (depth > 512) {
                 throw new YamlException("block nesting too deep (line "
-                    + Convert.ToString(lineNos[cur]) + ")");
+                    + Convert.ToString(lines[cur].lineNo) + ")");
             }
-            string t = texts[cur];
+            string t = lines[cur].text;
             if (!IsSeqLine(t)) { break; }
             if (t.Length == 1) {                                 // "-" 单独一行
                 Advance();
@@ -283,8 +290,8 @@ class YamlParser {
                 continue;
             }
             // 压缩形式：把剩余内容回灌为 contentCol 列的虚拟行。
-            indents[cur] = contentCol;
-            texts[cur] = rest;
+            lines[cur].indent = contentCol;
+            lines[cur].text = rest;
             JsonValue item = ParseBlock(contentCol, depth + 1);
             if (item == null) { item = JsonValue.NewNull(); }
             arr.Append(item);
@@ -295,8 +302,8 @@ class YamlParser {
     // ===== 裸标量节点（根/序列压缩项） =====
 
     JsonValue ParseBareNode(int depth) {
-        string t = texts[cur];
-        int indent = indents[cur];
+        string t = lines[cur].text;
+        int indent = lines[cur].indent;
         Advance();
         if (t.Length > 0 && (t[0] == 124 || t[0] == 62)) {
             return ReadBlockScalar(t, indent - 1);
@@ -371,13 +378,13 @@ class YamlParser {
             }
             hi = hi + 1;
         }
-        List<string> lines = new List<string>();
+        List<string> linesList = new List<string>();
         int blockIndent = 0;
         int trailingBlanks = 0;
         if (explicitInd > 0) { blockIndent = parentIndent + explicitInd; }
         while (cur < lineCount) {
-            string raw = texts[cur];
-            int ind = indents[cur];
+            string raw = lines[cur].text;
+            int ind = lines[cur].indent;
             if (raw.Length == 0) {
                 trailingBlanks = trailingBlanks + 1;
                 cur = cur + 1;
@@ -388,30 +395,30 @@ class YamlParser {
                 blockIndent = ind;
             }
             if (ind < blockIndent) { break; }
-            // texts 存的是剥过行首缩进的文本，这里按"行内相对缩进"再剥
+            // lines 存的是剥过行首缩进的文本，这里按"行内相对缩进"再剥
             // 块公共缩进：更深的续行保留其额外空格。
             int rel = blockIndent - ind;
             if (rel < 0) { rel = 0; }
-            lines.Add(raw.Substring(rel, raw.Length - rel));
+            linesList.Add(raw.Substring(rel, raw.Length - rel));
             trailingBlanks = 0;
             cur = cur + 1;
         }
         // StringBuilder 累加：body = body + x 的每行整串拷贝在大块
         // 标量（万行级）上是 O(n²)。
         StringBuilder body = new StringBuilder();
-        int n = lines.Count;
+        int n = linesList.Count;
         if (style == 124) {                                      // 字面：原样换行
             int i = 0;
             while (i < n) {
                 if (i > 0) { body.Append("\n"); }
-                body.Append(lines[i]);
+                body.Append(linesList[i]);
                 i = i + 1;
             }
         } else {                                                 // 折叠：单换行变空格
             int i = 0;
             int pending = 0;
             while (i < n) {
-                string ln = lines[i];
+                string ln = linesList[i];
                 if (ln.Length == 0) { pending = pending + 1; }
                 else {
                     if (body.Length == 0) { body.Append(ln); }
@@ -451,7 +458,7 @@ class YamlParser {
                 throw new YamlException("unterminated flow collection (line "
                     + Convert.ToString(lastLineNo) + ")");
             }
-            string t = texts[cur];
+            string t = lines[cur].text;
             cur = cur + 1;
             if (t.Length == 0) { continue; }
             string part = StripComment(t);

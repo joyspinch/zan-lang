@@ -9,14 +9,23 @@
 // 调用点的 AST 改写由 C 端按 rewrites 指令执行。
 namespace System.Compiler;
 
+/// Json 绑定需求实体（消除 NeedNames / NeedRootList 平行列表反模式）。
+class GenJsonNeedEntry {
+    string name;
+    bool rootList;
+
+    GenJsonNeedEntry(string name, bool rootList) {
+        this.name = name;
+        this.rootList = rootList;
+    }
+}
+
 /// System.Json 实体映射器: 为 Json.Deserialize/Serialize 生成 __JsonBind 绑定类与重写指令。
 class GenJson {
     /// 类名 → 类 JSON(含 kind/bases/fields)。
     static Dict<string, JsonValue> ClassOf;
-    /// 本单元实际引用到的类（生成 __JsonBind 的顺序）。
-    static List<string> NeedNames;
-    /// 与 NeedNames 平行：该类是否需要 List 根形态（DL_/SL_ 入口）。
-    static List<bool> NeedRootList;
+    /// 本单元实际引用到的类条目（生成 __JsonBind 的顺序与 rootList 标记）。
+    static List<GenJsonNeedEntry> Needs;
     /// 当前编译单元的 reply：诊断与 sources 回填都经它写入。
     static JsonValue Reply;
 
@@ -37,8 +46,7 @@ class GenJson {
     static void Run(JsonValue req, JsonValue reply) {
         GenJson.Reply = reply;
         GenJson.ClassOf = new Dict<string, JsonValue>();
-        GenJson.NeedNames = new List<string>();
-        GenJson.NeedRootList = new List<bool>();
+        GenJson.Needs = new List<GenJsonNeedEntry>();
         JsonValue unit = req.Get("unit");
         if (unit == null) { return; }
         JsonValue classes = unit.Get("classes");
@@ -54,7 +62,7 @@ class GenJson {
                 GenJson.VisitCall(calls.At(i));
             }
         }
-        if (GenJson.NeedNames.Count > 0 && !GenCommon.HasError(GenJson.Reply)) {
+        if (GenJson.Needs.Count > 0 && !GenCommon.HasError(GenJson.Reply)) {
             GenJson.EmitBindClass();
         }
     }
@@ -129,7 +137,7 @@ class GenJson {
             return;
         }
         int at = GenJson.NeedAdd(cls);
-        if (asList) { GenJson.NeedRootList[at] = true; }
+        if (asList) { GenJson.Needs[at].rootList = true; }
         string prefix;
         if (isDeser) { prefix = asList ? "DL_" : "D_"; }
         else { prefix = asList ? "SL_" : "S_"; }
@@ -140,10 +148,10 @@ class GenJson {
         GenCommon.AddRewrite(GenJson.Reply, op);
     }
 
-    /// 类名在 NeedNames 中的下标，未收集过返回 -1。
+    /// 类名在 Needs 中的下标，未收集过返回 -1。
     static int NeedFind(string name) {
-        for (int i = 0; i < GenJson.NeedNames.Count; i = i + 1) {
-            if (GenJson.NeedNames[i] == name) { return i; }
+        for (int i = 0; i < GenJson.Needs.Count; i = i + 1) {
+            if (GenJson.Needs[i].name == name) { return i; }
         }
         return -1;
     }
@@ -152,9 +160,8 @@ class GenJson {
     static int NeedAdd(string name) {
         int at = GenJson.NeedFind(name);
         if (at >= 0) { return at; }
-        GenJson.NeedNames.Add(name);
-        GenJson.NeedRootList.Add(false);
-        return GenJson.NeedNames.Count - 1;
+        GenJson.Needs.Add(new GenJsonNeedEntry(name, false));
+        return GenJson.Needs.Count - 1;
     }
 
     /* ---- 字段分类 ---- */
@@ -551,7 +558,7 @@ class GenJson {
         out0.Append("    }\n");
         out0.Append("    static JsonValue T_Str(string s) { if (s == null) { return JsonValue.NewNull(); } return JsonValue.NewStr(s); }\n");
         out0.Append("    static JsonValue T_Jv(JsonValue x) { if (x == null) { return JsonValue.NewNull(); } return x; }\n");
-        for (int i = 0; i < GenJson.NeedNames.Count; i = i + 1) {
+        for (int i = 0; i < GenJson.Needs.Count; i = i + 1) {
             GenJson.GenClass(out0, i);
         }
         out0.Append("}\n");
@@ -560,9 +567,9 @@ class GenJson {
 
     /// 为一个类生成全部 binder 代码：B_(JsonValue→实体，宽容缺省)、
     /// T_(实体→JsonValue，null→NewNull)、W_(实体→JSON 文本直写，
-    /// 快约 4 倍)、D_/S_ 字符串入口，NeedRootList 时加 DL_/SL_。
+    /// 快约 4 倍)、D_/S_ 字符串入口，rootList 为 true 时加 DL_/SL_。
     static void GenClass(StringBuilder out0, int idx) {
-        string cls = GenJson.NeedNames[idx];
+        string cls = GenJson.Needs[idx].name;
         /* binder: JsonValue -> entity (lenient) */
         out0.Append("    static " + cls + " B_" + cls + "(JsonValue v) {\n");
         out0.Append("        " + cls + " o = new " + cls + "();\n");
@@ -586,7 +593,7 @@ class GenJson {
         /* string-facing entry points */
         out0.Append("    static " + cls + " D_" + cls + "(string s) { return __JsonBind.B_" + cls + "(JsonValue.Parse(s)); }\n");
         out0.Append("    static string S_" + cls + "(" + cls + " o) { StringBuilder sb = new StringBuilder(); __JsonBind.W_" + cls + "(sb, o); return sb.ToString(); }\n");
-        if (GenJson.NeedRootList[idx]) {
+        if (GenJson.Needs[idx].rootList) {
             out0.Append("    static List<" + cls + "> DL_" + cls + "(string s) {\n");
             out0.Append("        JsonValue v = JsonValue.Parse(s);\n");
             out0.Append("        List<" + cls + "> r = new List<" + cls + ">();\n");

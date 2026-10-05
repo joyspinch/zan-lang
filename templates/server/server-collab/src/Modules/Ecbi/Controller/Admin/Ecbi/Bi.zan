@@ -19,6 +19,17 @@ class BiBucketEntry {
     }
 }
 
+/// 每日销售趋势条目实体（消除 dayKeys 与 dayVals 平行列表反模式）。
+class BiDayTrendEntry {
+    string day;
+    long amount;
+
+    BiDayTrendEntry(string day, long amount) {
+        this.day = day != null ? day : "";
+        this.amount = amount;
+    }
+}
+
 /* /admin/ecbi 电商 BI：订单落地(ODS)的汇总看板。聚合在控制器内完成（ORM 无 GROUP BY），模板规模数据量下足够。 */
 [Route("admin/ecbi/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
@@ -73,10 +84,9 @@ class Bi : AdminController {
             chs.Add(r);
         }
 
-        /* 近 14 天销售额趋势 */
+        /* 近 14 天销售额趋势：使用 BiDayTrendEntry 强类型实体维护，消除平行列表反模式 */
         long now = WebApp.NowSeconds();
-        List<string> dayKeys = new List<string>();
-        List<long> dayVals = new List<long>();
+        List<BiDayTrendEntry> dayEntries = new List<BiDayTrendEntry>();
         for (int di = 13; di >= 0; di = di - 1) {
             long dayStart = now - (long)di * 86400;
             string key = Fmt.Day(dayStart);
@@ -84,17 +94,18 @@ class Bi : AdminController {
             for (int k = 0; k < all.Count; k = k + 1) {
                 if (Fmt.Day(all[k].payAt) == key) { sum = sum + all[k].amount; }
             }
-            dayKeys.Add(key);
-            dayVals.Add(sum);
+            dayEntries.Add(new BiDayTrendEntry(key, sum));
         }
         long maxDay = 1;
-        for (int i = 0; i < dayVals.Count; i = i + 1) { if (dayVals[i] > maxDay) { maxDay = dayVals[i]; } }
+        for (int i = 0; i < dayEntries.Count; i = i + 1) {
+            if (dayEntries[i].amount > maxDay) { maxDay = dayEntries[i].amount; }
+        }
         List<StrMap> days = d.AddList("days");
-        for (int i = 0; i < dayKeys.Count; i = i + 1) {
+        for (int i = 0; i < dayEntries.Count; i = i + 1) {
             StrMap r = new StrMap();
-            r.Set("day", dayKeys[i]);
-            r.Set("amount", Convert.ToString(dayVals[i]));
-            long pct = (long)(dayVals[i] * 100 / maxDay);
+            r.Set("day", dayEntries[i].day);
+            r.Set("amount", Convert.ToString(dayEntries[i].amount));
+            long pct = (long)(dayEntries[i].amount * 100 / maxDay);
             r.Set("pct", Convert.ToString(pct));
             days.Add(r);
         }
@@ -204,12 +215,6 @@ class Bi : AdminController {
         else { entries[at].amount = entries[at].amount + amount; }
     }
 
-    static void Bucket(List<string> keys, List<long> vals, string key, long amount) {
-        int at = keys.IndexOf(key);
-        if (at < 0) { keys.Add(key); vals.Add(amount); }
-        else { vals[at] = vals[at] + amount; }
-    }
-
     /* ---- T7 订单导入导出（ExcelIo 公共层）------------------------------- */
 
     private static List<string> Headers() {
@@ -253,24 +258,24 @@ class Bi : AdminController {
         return (era * 146097L + (long)doe - 719468L) * 86400L;
     }
 
-    /* ImportRow 处理器：同步 + 平行 List（ExcelIo.ImportRow 双重约定）。 */
+    /* ImportRow 处理器：同步 + 强类型 ImportRecord 容器。 */
     static string SaveRow(IDbConnection db, int tenantId, SysUser me,
-                          List<string> keys, List<string> vals) {
-        string orderNo = ExcelIo.Rec(keys, vals, "订单号");
+                          ImportRecord rec) {
+        string orderNo = ExcelIo.Rec(rec, "订单号");
         int dup = new OdsOrderDao(db).CountByOrderNoSync(tenantId, orderNo);
         if (dup > 0) { return "订单号=订单已存在：" + orderNo; }
         OdsOrder o = new OdsOrder();
         o.tenantId = tenantId;
         o.orderNo = orderNo;
-        o.customerName = ExcelIo.Rec(keys, vals, "客户");
-        o.productName = ExcelIo.Rec(keys, vals, "商品");
-        o.category = ExcelIo.Rec(keys, vals, "品类");
-        o.channel = ExcelIo.Rec(keys, vals, "渠道");
-        o.province = ExcelIo.Rec(keys, vals, "省份");
-        o.amount = Convert.ToInt64(ExcelIo.Rec(keys, vals, "金额(分)"));
-        int qty = Filter.ToInt(ExcelIo.Rec(keys, vals, "数量"), 1);
+        o.customerName = ExcelIo.Rec(rec, "客户");
+        o.productName = ExcelIo.Rec(rec, "商品");
+        o.category = ExcelIo.Rec(rec, "品类");
+        o.channel = ExcelIo.Rec(rec, "渠道");
+        o.province = ExcelIo.Rec(rec, "省份");
+        o.amount = Convert.ToInt64(ExcelIo.Rec(rec, "金额(分)"));
+        int qty = Filter.ToInt(ExcelIo.Rec(rec, "数量"), 1);
         o.qty = qty > 0 ? qty : 1;
-        o.payAt = Bi.PayAt(ExcelIo.Rec(keys, vals, "支付日期"));
+        o.payAt = Bi.PayAt(ExcelIo.Rec(rec, "支付日期"));
         o.createdAt = WebApp.NowSeconds();
         new OdsOrderDao(db).InsertSync(o);
         return null;

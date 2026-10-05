@@ -48,21 +48,54 @@ class FieldRule {
     int MaxLen() { return maxLen; }
 }
 
-/* 行处理器：拿到已过列校验的一行（recKeys/recVals 平行表，键=模板列
-   名、值=单元格文本缺列补空串；取值用 ExcelIo.Rec 线性扫描）。业务侧
+/* 导入行单个字段强类型实体（消除 recKeys / recVals 平行列表反模式）。 */
+class ImportField {
+    string key;
+    string val;
+
+    static ImportField Make(string key, string val) {
+        ImportField f = new ImportField();
+        f.key = key;
+        f.val = val;
+        return f;
+    }
+
+    string Key() { return key; }
+    string Val() { return val; }
+}
+
+/* 导入行数据强类型容器实体。包装已校验字段，提供根据键名的线性安全读取。 */
+class ImportRecord {
+    List<ImportField> fields;
+
+    ImportRecord() {
+        this.fields = new List<ImportField>();
+    }
+
+    void Add(string key, string val) {
+        this.fields.Add(ImportField.Make(key, val));
+    }
+
+    string Get(string key) {
+        for (int i = 0; i < this.fields.Count; i = i + 1) {
+            ImportField f = this.fields[i];
+            if (f.Key() == key) { return f.Val(); }
+        }
+        return "";
+    }
+}
+
+/* 行处理器：拿到已过列校验的强类型行数据 ImportRecord。业务侧
    在此完成查重、外键解析与插入；返回 null/""=成功，非空=错误文本
    （约定 "字段=消息" 格式，无 "=" 时字段记空——见 ExcelIo.Import）。
    重要约定 1：handler 必须是同步函数（内部用同步 ORM：Count() /
    ExecuteAffrows()），不得 await——async delegate 的续体在"await 之后
    携带非空返回值提前结束"路径上触发空指针崩溃（zan_crash.log 取证 +
    DWARF 定位 ExcelIoSmoke_SaveCustomer$resume，已记入偏差）。
-   重要约定 2：行数据不用 Dict 承载——Dict<string,string> 在 Import
-   特定校验分支组合下出现内部指针为 null 的空指针崩溃（梯度二分取证：
-   1~4 条规则稳定、同内容 5 条规则崩溃；故障指令 mov rax,[rax] rax=0，
-   行级定位 TestIo.zan 处理器首条 TryGetValue），平行 List 全程稳定，
-   故改为键值平行表 + Rec 线性扫描（列数 ≤20，开销可忽略）。 */
+   重要约定 2：行数据以强类型 ImportRecord 承载，内部各字段为 ImportField
+   强类型实体，彻底消除平行 List 反模式，同时规避早期 Dict 崩溃问题。 */
 delegate string ImportRow(IDbConnection db, int tenantId, SysUser me,
-                          List<string> recKeys, List<string> recVals);
+                          ImportRecord rec);
 
 /* 导入导出公共层（架构 §2.6 WP-6 / T6）：全站唯一的表格进出入口。
    导出 CSV（Csv.Serialize）与 XLSX（XlsxBook，stdlib 仅写侧）双格式；
@@ -186,9 +219,8 @@ class ExcelIo {
             int rowNo = i + 2;   /* 含表头的 1-based 行号，对齐 Excel */
             List<string> cells = rows[i];
 
-            /* 取列值 + 通用列校验（平行表：keys/vals 每行重建）。 */
-            List<string> keys = new List<string>();
-            List<string> vals = new List<string>();
+            /* 取列值 + 通用列校验（强类型实体容器 rec，消除 keys/vals 平行列表）。 */
+            ImportRecord rec = new ImportRecord();
             string bad = "";
             for (int r = 0; r < rules.Count && bad.Length == 0; r = r + 1) {
                 FieldRule ru = rules[r];
@@ -214,8 +246,7 @@ class ExcelIo {
                             "超过 " + Convert.ToString(ru.MaxLen()) + " 字");
                     }
                 }
-                keys.Add(ru.Name());
-                vals.Add(v);
+                rec.Add(ru.Name(), v);
             }
 
             /* 错行跳过不回滚好行；不用 continue 包结构（async 状态机
@@ -230,7 +261,7 @@ class ExcelIo {
                 }
                 /* 同步调用 handler（见 ImportRow 注：async delegate
                    续体缺陷规避）。handler 不抛异常的约定不变。 */
-                string rowErr = handler(db, tenantId, me, keys, vals);
+                string rowErr = handler(db, tenantId, me, rec);
                 if (rowErr != null && rowErr.Length > 0) {
                     int eq = rowErr.IndexOf("=");
                     string f = eq > 0 ? rowErr.Substring(0, eq) : "";
@@ -271,12 +302,10 @@ class ExcelIo {
         return await new OaImportBatchDao(db).Insert(b);
     }
 
-    /* 行数据取值：平行表线性扫描（键即模板列名，缺列值为空串）。 */
-    static string Rec(List<string> keys, List<string> vals, string key) {
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            if (keys[i] == key) { return vals[i]; }
-        }
-        return "";
+    /* 行数据取值：从强类型 ImportRecord 中安全提取指定列名文本。 */
+    static string Rec(ImportRecord rec, string key) {
+        if (rec == null) { return ""; }
+        return rec.Get(key);
     }
 
     /* 导入结果 JSON（Ok 的 data 体）：批次计数 + 行级错误报告，

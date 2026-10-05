@@ -56,17 +56,30 @@ class Css {
         return Css.ParseWith(src, null, null);
     }
 
-    /// 同 Parse，但额外认得 `extraNames`/`extraVals` 里的自定义属性
+    /// 同 Parse，但额外认得 `extraVars` 里的自定义属性实体列表
     /// （当前皮肤的 `:root` 变量与主题 token）：应用自己的 CSS 里
     /// 写 `var(--accent)`、`var(--bg-primary)` 因此能解析到当前皮肤/
     /// 主题（以前展开为空，因为只看得见同一份源文本里的变量）。
     /// 外来变量只参与展开，不会写进结果表的 vars：sheet.vars 仍然
     /// 只代表这份 CSS 自己声明了什么（Skin.ThemeOf 按它推导主题，
     /// 掺进主题 token 就成了自我喂养）。同名时本身的变量胜出。
+    static StyleSheet ParseWith(string src, List<CssVarDecl> extraVars) {
+        int physicalCount = extraVars == null ? 0 : extraVars.Count;
+        return Css.ParseWithSources(src, extraVars, physicalCount);
+    }
+
+    /// 兼容旧版平行列表调用（内部转换后走强类型实体）。
     static StyleSheet ParseWith(string src, List<string> extraNames,
                                 List<string> extraVals) {
-        int physicalCount = extraNames == null ? 0 : extraNames.Count;
-        return Css.ParseWithSources(src, extraNames, extraVals, physicalCount);
+        List<CssVarDecl> decls = new List<CssVarDecl>();
+        if (extraNames != null && extraVals != null) {
+            int ei = 0;
+            while (ei < extraNames.Count && ei < extraVals.Count) {
+                decls.Add(new CssVarDecl(extraNames[ei], extraVals[ei]));
+                ei = ei + 1;
+            }
+        }
+        return Css.ParseWith(src, decls);
     }
 
     /// 读取 CSS 文件并把其中的 `@import "x.css";` / `@import url("x.css");`
@@ -232,31 +245,24 @@ class Css {
 
     /// External theme tokens precede inherited logical skin variables. Keep
     /// the boundary explicit so app CSS does not mistake skin sizes for pixels.
-    static StyleSheet ParseWithSources(string src, List<string> extraNames,
-                                       List<string> extraVals, int physicalCount) {
+    static StyleSheet ParseWithSources(string src, List<CssVarDecl> extraVars,
+                                       int physicalCount) {
         StyleSheet sheet = new StyleSheet();
         string s = Css.StripComments(src);
         // 第 1 遍：`:root` 自定义属性，便于值引用它们。
-        List<string> ownNames = new List<string>();
-        List<string> ownVals = new List<string>();
-        Css.CollectVars(s, ownNames, ownVals);
+        List<CssVarDecl> ownVars = Css.CollectVarDecls(s);
         // 展开用的名单：外来变量在前、本身变量在后（ExpandVars 取
         // 最后一个同名命中，因此这份 CSS 自己的声明覆盖皮肤/主题）。
-        List<string> varNames = new List<string>();
-        List<string> varVals = new List<string>();
-        if (extraNames != null && extraVals != null) {
-            int ei = 0;
-            while (ei < extraNames.Count && ei < extraVals.Count) {
-                varNames.Add(extraNames[ei]);
-                varVals.Add(extraVals[ei]);
-                ei = ei + 1;
+        List<CssVarDecl> allVars = new List<CssVarDecl>();
+        if (extraVars != null) {
+            for (int ei = 0; ei < extraVars.Count; ei = ei + 1) {
+                allVars.Add(extraVars[ei]);
             }
         }
-        int externalCount = physicalCount < varNames.Count ? physicalCount : varNames.Count;
-        for (int vi = 0; vi < ownNames.Count; vi = vi + 1) {
-            sheet.vars.Set(ownNames[vi], JsonValue.NewStr(ownVals[vi]));
-            varNames.Add(ownNames[vi]);
-            varVals.Add(ownVals[vi]);
+        int externalCount = physicalCount < allVars.Count ? physicalCount : allVars.Count;
+        for (int vi = 0; vi < ownVars.Count; vi = vi + 1) {
+            sheet.vars.Set(ownVars[vi].name, JsonValue.NewStr(ownVars[vi].val));
+            allVars.Add(ownVars[vi]);
         }
         // 第 2 遍：所有规则块。
         //
@@ -265,29 +271,50 @@ class Css {
         // ——这条 at-rule 连同紧随其后的第一条规则一起消失，中间那个
         // `x` 还会被当成声明表。样式表里出现一条媒体查询就悄悄吃掉
         // 相邻规则，是这套解析器最贵的一个坑。
-        Css.ParseRulesInto(sheet, s, varNames, varVals, externalCount);
+        Css.ParseRulesInto(sheet, s, allVars, externalCount);
         return sheet;
+    }
+
+    /// 兼容旧版调用（内部桥接为强类型实体）。
+    static StyleSheet ParseWithSources(string src, List<string> extraNames,
+                                       List<string> extraVals, int physicalCount) {
+        List<CssVarDecl> decls = new List<CssVarDecl>();
+        if (extraNames != null && extraVals != null) {
+            int ei = 0;
+            while (ei < extraNames.Count && ei < extraVals.Count) {
+                decls.Add(new CssVarDecl(extraNames[ei], extraVals[ei]));
+                ei = ei + 1;
+            }
+        }
+        return Css.ParseWithSources(src, decls, physicalCount);
     }
 
     /// 把一段样式表文本里的规则块解析进 `sheet`（供顶层与
     /// `@supports` 的内层递归调用）。
-    ///
-    /// 配对必须按括号深度做，不能取「下一个 }」：`@media (...){a{x}}`
-    /// 的第一个 `}` 是内层 `a` 的，用它会得到选择器 `@media (...){a`
-    /// ——这条 at-rule 连同紧随其后的第一条规则一起消失，中间那个
-    /// `x` 还会被当成声明表。样式表里出现一条媒体查询就悄悄吃掉
-    /// 相邻规则，是这套解析器最贵的一个坑。
+    static void ParseRulesInto(StyleSheet sheet, string s, List<CssVarDecl> allVars,
+                               int externalCount) {
+        Css.ParseRulesIntoM(sheet, s, allVars, externalCount, null);
+    }
+
+    /// 兼容旧版平行列表调用。
     static void ParseRulesInto(StyleSheet sheet, string s, List<string> varNames,
                                List<string> varVals, int externalCount) {
-        Css.ParseRulesIntoM(sheet, s, varNames, varVals, externalCount, null);
+        List<CssVarDecl> decls = new List<CssVarDecl>();
+        if (varNames != null && varVals != null) {
+            int ei = 0;
+            while (ei < varNames.Count && ei < varVals.Count) {
+                decls.Add(new CssVarDecl(varNames[ei], varVals[ei]));
+                ei = ei + 1;
+            }
+        }
+        Css.ParseRulesInto(sheet, s, decls, externalCount);
     }
 
     /// ParseRulesInto 的媒体上下文版本：`outer` 非空表示正在
     /// `@media` 块内解析，普通规则带着条件进 mediaRules（运行期
     /// 按窗口/主题求值），不再进常驻级联。
-    static void ParseRulesIntoM(StyleSheet sheet, string s, List<string> varNames,
-                                List<string> varVals, int externalCount,
-                                MediaCond outer) {
+    static void ParseRulesIntoM(StyleSheet sheet, string s, List<CssVarDecl> allVars,
+                                int externalCount, MediaCond outer) {
         int i = 0;
         while (i < s.Length) {
             int open = Css.IndexFrom(s, "{", i);
@@ -320,7 +347,7 @@ class Css {
                     // NoteGuard 按条件原文报出（不是"不支持 @supports"）。
                     string cond = Css.AtPrelude(selectors);
                     if (Css.SupportsCondition(cond)) {
-                        Css.ParseRulesIntoM(sheet, body, varNames, varVals,
+                        Css.ParseRulesIntoM(sheet, body, allVars,
                                             externalCount, outer);
                     } else {
                         sheet.NoteGuard(cond);
@@ -336,16 +363,16 @@ class Css {
                         sheet.NoteGuard(mcond);
                     } else if (outer != null) {
                         mc = MediaCond.And(outer, mc);
-                        Css.ParseRulesIntoM(sheet, body, varNames, varVals,
+                        Css.ParseRulesIntoM(sheet, body, allVars,
                                             externalCount, mc);
                     } else {
-                        Css.ParseRulesIntoM(sheet, body, varNames, varVals,
+                        Css.ParseRulesIntoM(sheet, body, allVars,
                                             externalCount, mc);
                     }
                 } else if (at == "layer") {
                     // 走到这里必然带块（`@layer a, b;` 语句式已被上面的
                     // `;` 剥离吃掉），匿名 `@layer { ... }` 同样摊平。
-                    Css.ParseRulesIntoM(sheet, body, varNames, varVals,
+                    Css.ParseRulesIntoM(sheet, body, allVars,
                                         externalCount, outer);
                 } else {
                     sheet.NoteAtRule(at);
@@ -356,7 +383,7 @@ class Css {
             // 里的逗号不是分隔符，用朴素的 String.Split 会把一条规则
             // 劈成两条都解析失败的选择器。
             List<string> sels = Css.SplitTopTrim(selectors, ",");
-            JsonValue block = Css.ParseBlockWithSources(body, varNames, varVals, externalCount);
+            JsonValue block = Css.ParseBlockWithSources(body, allVars, externalCount);
             if (block.Count() == 0) { continue; }
             int k = 0;
             while (k < sels.Count) {
@@ -371,6 +398,21 @@ class Css {
                 }
             }
         }
+    }
+
+    /// 兼容旧版平行列表调用。
+    static void ParseRulesIntoM(StyleSheet sheet, string s, List<string> varNames,
+                                List<string> varVals, int externalCount,
+                                MediaCond outer) {
+        List<CssVarDecl> decls = new List<CssVarDecl>();
+        if (varNames != null && varVals != null) {
+            int ei = 0;
+            while (ei < varNames.Count && ei < varVals.Count) {
+                decls.Add(new CssVarDecl(varNames[ei], varVals[ei]));
+                ei = ei + 1;
+            }
+        }
+        Css.ParseRulesIntoM(sheet, s, decls, externalCount, outer);
     }
 
     /// `@supports` / `@media` 等 at-rule 的名字（去掉 `@`，转小写）。
@@ -711,13 +753,26 @@ class Css {
 
     /// 单个块的声明，`var(--x)` 已解析，自定义
     /// 属性被丢弃（它们只用于被引用）。
-    static JsonValue ParseBlock(string body, List<string> varNames,
-                                List<string> varVals) {
-        return Css.ParseBlockWithSources(body, varNames, varVals, 0);
+    static JsonValue ParseBlock(string body, List<CssVarDecl> vars) {
+        return Css.ParseBlockWithSources(body, vars, 0);
     }
 
-    static JsonValue ParseBlockWithSources(string body, List<string> varNames,
-                                           List<string> varVals, int externalCount) {
+    /// 兼容旧版平行列表调用。
+    static JsonValue ParseBlock(string body, List<string> varNames,
+                                List<string> varVals) {
+        List<CssVarDecl> decls = new List<CssVarDecl>();
+        if (varNames != null && varVals != null) {
+            int ei = 0;
+            while (ei < varNames.Count && ei < varVals.Count) {
+                decls.Add(new CssVarDecl(varNames[ei], varVals[ei]));
+                ei = ei + 1;
+            }
+        }
+        return Css.ParseBlock(body, decls);
+    }
+
+    static JsonValue ParseBlockWithSources(string body, List<CssVarDecl> vars,
+                                           int externalCount) {
         JsonValue block = JsonValue.NewObject();
         JsonValue source = JsonValue.NewObject();
         JsonValue important = JsonValue.NewObject();
@@ -734,7 +789,7 @@ class Css {
             if (key.Length == 0 || val.Length == 0) { continue; }
             if (key.Length > 2 && key.Substring(0, 2) == "--") { continue; }
             string lowerKey = Css.Lower(key);
-            string plain = Css.StripImportant(Css.ExpandVars(val, varNames, varVals));
+            string plain = Css.StripImportant(Css.ExpandVars(val, vars));
             bool imp = Css.HasImportant(val);
             // 带 !important 的声明进 `__zan_important`；不带的照旧。
             // 同一键在块内被两种写法各写一次时，important 的那条胜出
@@ -746,7 +801,7 @@ class Css {
             // `__zan_prescaled` 是 per-key 的，important/普通两处都要
             // 记：ApplyImportant 靠它决定是否跳过 DPI 缩放。
             source.Set(lowerKey, JsonValue.NewBool(
-                Css.IsPrescaledValue(val, varNames, varVals, externalCount)));
+                Css.IsPrescaledValue(val, vars, externalCount)));
         }
         if (source.Count() > 0) {
             block.Set("__zan_prescaled", source);
@@ -757,11 +812,24 @@ class Css {
         return block;
     }
 
+    /// 兼容旧版平行列表调用。
+    static JsonValue ParseBlockWithSources(string body, List<string> varNames,
+                                           List<string> varVals, int externalCount) {
+        List<CssVarDecl> decls = new List<CssVarDecl>();
+        if (varNames != null && varVals != null) {
+            int ei = 0;
+            while (ei < varNames.Count && ei < varVals.Count) {
+                decls.Add(new CssVarDecl(varNames[ei], varVals[ei]));
+                ei = ei + 1;
+            }
+        }
+        return Css.ParseBlockWithSources(body, decls, externalCount);
+    }
+
     /// Only externally supplied theme font metrics are physical pixels. Local
     /// :root declarations remain logical, even when they shadow a theme token.
     /// Follow aliases with the same bounded expansion used by ExpandVars.
-    static bool IsPrescaledValue(string val, List<string> names,
-                                List<string> vals, int externalCount) {
+    static bool IsPrescaledValue(string val, List<CssVarDecl> vars, int externalCount) {
         string value = val;
         for (int guard = 0; guard < 8; guard = guard + 1) {
             int at = Css.IndexFrom(value, "var(", 0);
@@ -770,16 +838,32 @@ class Css {
             if (close < 0) { return false; }
             string name = Css.Trim(value.Substring(at + 4, close - at - 4));
             int found = -1;
-            for (int i = 0; i < names.Count; i = i + 1) {
-                if (names[i] == name) { found = i; }
+            if (vars != null) {
+                for (int i = 0; i < vars.Count; i = i + 1) {
+                    if (vars[i].name == name) { found = i; }
+                }
             }
             if (found < 0) { return false; }
             if (found < externalCount && Css.IndexFrom(name, "--font-size-", 0) == 0) {
                 return true;
             }
-            value = vals[found];
+            value = vars[found].val;
         }
         return false;
+    }
+
+    /// 兼容旧版平行列表调用。
+    static bool IsPrescaledValue(string val, List<string> names,
+                                List<string> vals, int externalCount) {
+        List<CssVarDecl> decls = new List<CssVarDecl>();
+        if (names != null && vals != null) {
+            int ei = 0;
+            while (ei < names.Count && ei < vals.Count) {
+                decls.Add(new CssVarDecl(names[ei], vals[ei]));
+                ei = ei + 1;
+            }
+        }
+        return Css.IsPrescaledValue(val, decls, externalCount);
     }
 
     /// 去掉结尾的 `!important`（此处的级联本就是"后规则
@@ -891,8 +975,8 @@ class Css {
         }
     }
 
-    /// 替换 `val` 中的每个 `var(--name)`；未知名称展开为 ""。
-    static string ExpandVars(string val, List<string> names, List<string> vals) {
+    /// 替换 `val` 中的每个 `var(--name)`；未知名称展开为 ""（实体版本）。
+    static string ExpandVars(string val, List<CssVarDecl> vars) {
         string s = val;
         for (int guard = 0; guard < 8; guard = guard + 1) {
             int at = Css.IndexFrom(s, "var(", 0);
@@ -915,8 +999,10 @@ class Css {
             }
             string rep = "";
             bool found = false;
-            for (int i = 0; i < names.Count; i = i + 1) {
-                if (names[i] == name) { rep = vals[i]; found = true; }
+            if (vars != null) {
+                for (int i = 0; i < vars.Count; i = i + 1) {
+                    if (vars[i].name == name) { rep = vars[i].val; found = true; }
+                }
             }
             // 未定义（含空值）时用回退值：这是 `var(--x, 8px)` 的全部
             // 意义，也是「换肤时少给一个令牌就整条声明消失」的解法。
@@ -931,6 +1017,19 @@ class Css {
             s = s.Substring(0, at) + rep + s.Substring(close + 1, s.Length - close - 1);
         }
         return s;
+    }
+
+    /// 替换 `val` 中的每个 `var(--name)`；未知名称展开为 ""（兼容旧接口）。
+    static string ExpandVars(string val, List<string> names, List<string> vals) {
+        List<CssVarDecl> decls = new List<CssVarDecl>();
+        if (names != null && vals != null) {
+            int ei = 0;
+            while (ei < names.Count && ei < vals.Count) {
+                decls.Add(new CssVarDecl(names[ei], vals[ei]));
+                ei = ei + 1;
+            }
+        }
+        return Css.ExpandVars(val, decls);
     }
 
     /// 与 `open`（一个 `(` 的下标）配对的那个 `)`，按嵌套深度找；

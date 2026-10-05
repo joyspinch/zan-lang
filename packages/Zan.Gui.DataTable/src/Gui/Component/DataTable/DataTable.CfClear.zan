@@ -13,9 +13,9 @@ partial class DataTable {
 
     /// 列的生效条件格式模式：显式清除 > 菜单槽位 > 列工厂预设。
     static int CfEffectiveMode(DataTableState st, DataColumn dc, int col) {
-        if (col >= 0 && col < st.menuCfOff.Count && st.menuCfOff[col]) { return 0; }
-        if (col >= 0 && col < st.menuCfMode.Count && st.menuCfMode[col] != 0) {
-            return st.menuCfMode[col];
+        if (st.cfRules != null && col >= 0 && col < st.cfRules.Count) {
+            if (st.cfRules[col].off) { return 0; }
+            if (st.cfRules[col].mode != 0) { return st.cfRules[col].mode; }
         }
         return dc.cfMode;
     }
@@ -23,8 +23,8 @@ partial class DataTable {
     /// 列的生效规则的可读名（数据条 / 色阶 / 大于均值 / …）。
     static string CfRuleLabel(DataTableState st, DataColumn dc, int col) {
         int mode = DataTable.CfEffectiveMode(st, dc, col);
-        bool slot = col >= 0 && col < st.menuCfMode.Count && st.menuCfMode[col] != 0;
-        bool pct = slot ? st.menuCfRankPct[col] : dc.cfRankPct;
+        bool slot = st.cfRules != null && col >= 0 && col < st.cfRules.Count && st.cfRules[col].mode != 0;
+        bool pct = slot ? st.cfRules[col].rankPct : dc.cfRankPct;
         if (mode == 1) { return DataTable.T("Data bar", "数据条"); }
         if (mode == 2) { return DataTable.T("Color scale", "色阶"); }
         if (mode == 3) { return DataTable.T("Greater than average", "大于均值"); }
@@ -42,8 +42,8 @@ partial class DataTable {
 
     /// 列的生效规则主色（色板 chip 用；槽位优先）。
     static int CfRuleColor(DataTableState st, DataColumn dc, int col) {
-        if (col >= 0 && col < st.menuCfMode.Count && st.menuCfMode[col] != 0) {
-            return st.menuCfColor[col];
+        if (st.cfRules != null && col >= 0 && col < st.cfRules.Count && st.cfRules[col].mode != 0) {
+            return st.cfRules[col].color;
         }
         return dc.cfColor;
     }
@@ -51,16 +51,14 @@ partial class DataTable {
     /// 打开弹窗：枚举全表生效规则，默认全选。没有规则时提示
     /// 并且不打开。
     static void OpenCfClear(DataTableState st, List<DataColumn> cols) {
-        st.cfClearCols = new List<int>();
-        st.cfClearSel = new List<bool>();
+        st.cfClearItems = new List<CfClearItem>();
         st.cfClearScroll = 0;
         for (int c = 0; c < cols.Count; c = c + 1) {
             if (DataTable.CfEffectiveMode(st, cols[c], c) != 0) {
-                st.cfClearCols.Add(c);
-                st.cfClearSel.Add(true);
+                st.cfClearItems.Add(new CfClearItem(c, true));
             }
         }
-        if (st.cfClearCols.Count == 0) {
+        if (st.cfClearItems.Count == 0) {
             DataTable.Flash(st, DataTable.T("No conditional formatting rules",
                                             "没有条件格式规则"));
             return;
@@ -69,24 +67,21 @@ partial class DataTable {
     }
 
     /// 应用清除：`all` 时忽略勾选整表清（全部清除按钮），否则
-    /// 只清勾选列。被清列写入 menuCfOff（压制工厂预设）并清掉
+    /// 只清勾选列。被清列写入 cfRules[col].off（压制工厂预设）并清掉
     /// 菜单槽；名次缓存随 st.dirty 由下一帧 Recompute 重建。
     static void ApplyCfClear(DataTableState st, bool all) {
         int n = 0;
-        for (int i = 0; i < st.cfClearCols.Count; i = i + 1) {
-            if (!all && !st.cfClearSel[i]) { continue; }
-            int col = st.cfClearCols[i];
-            while (st.menuCfOff.Count <= col) { st.menuCfOff.Add(false); }
-            while (st.menuCfMode.Count <= col) {
-                st.menuCfMode.Add(0);
-                st.menuCfColor.Add(0);
-                st.menuCfColor2.Add(0);
-                st.menuCfThreshold.Add(0);
-                st.menuCfRankPct.Add(false);
+        if (st.cfRules == null) { st.cfRules = new List<ColumnCfRule>(); }
+        for (int i = 0; i < st.cfClearItems.Count; i = i + 1) {
+            CfClearItem it = st.cfClearItems[i];
+            if (!all && !it.selected) { continue; }
+            int col = it.column;
+            while (st.cfRules.Count <= col) {
+                st.cfRules.Add(ColumnCfRule.Create());
             }
-            st.menuCfOff[col] = true;
-            st.menuCfMode[col] = 0;
-            st.menuCfRankPct[col] = false;
+            st.cfRules[col].off = true;
+            st.cfRules[col].mode = 0;
+            st.cfRules[col].rankPct = false;
             n = n + 1;
         }
         st.cfClearOpen = false;
@@ -116,7 +111,7 @@ partial class DataTable {
         int rowH = t.heightMedium;
         int btnH = t.heightSmall;
         int titleH = t.heightMedium;
-        int listH = st.cfClearCols.Count * rowH;
+        int listH = st.cfClearItems.Count * rowH;
         int needH = pad + titleH + app.Scale(10) + listH + app.Scale(10)
                     + btnH + pad;
         int margin = app.Scale(8);
@@ -162,21 +157,22 @@ partial class DataTable {
         c.PushClip(px + app.Scale(4), listTop, pw - app.Scale(8), listView);
         int first = scrollY / rowH;
         int idx = first;
-        while (idx < st.cfClearCols.Count
+        while (idx < st.cfClearItems.Count
                && listTop + idx * rowH - scrollY < listBot) {
-            int col = st.cfClearCols[idx];
+            CfClearItem it = st.cfClearItems[idx];
+            int col = it.column;
             int ry = listTop + idx * rowH - scrollY;
             int box = app.Scale(15);
             int bx = tx;
             int by = ry + (rowH - box) / 2;
-            bool on = idx < st.cfClearSel.Count && st.cfClearSel[idx];
+            bool on = it.selected;
             Checkbox.PaintBox(app, bx, by, box, on ? 1000 : 0);
             int cbId = app.focus.AllocId();
             app.hitTester.RegisterRect(cbId, bx - app.Scale(4), ry,
                                        rowH, rowH, 0);
             if (app.EventKind() == 3 && app.window.EventButton() == 0
                 && app.hitTester.HitTest(app.mouseX, app.mouseY) == cbId) {
-                st.cfClearSel[idx] = !on;
+                it.selected = !on;
                 app.RequestRedraw();
             }
             // 行内任意点击同样切换（大目标，弹窗不挤）
@@ -185,7 +181,7 @@ partial class DataTable {
                                        pw - pad * 2 - rowH, rowH, 0);
             if (app.EventKind() == 3 && app.window.EventButton() == 0
                 && app.hitTester.HitTest(app.mouseX, app.mouseY) == rowId) {
-                st.cfClearSel[idx] = !on;
+                it.selected = !on;
                 app.RequestRedraw();
             }
             int chipX = tx + rowH + app.Scale(4);

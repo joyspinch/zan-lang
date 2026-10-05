@@ -60,6 +60,17 @@ class SelectOption {
     }
 }
 
+/// <summary>下拉表格列定义强类型实体（消除 headers 与 colWidths 平行列表反模式）。</summary>
+class SelectBoxColumn {
+    public string title;
+    public int width;
+
+    public SelectBoxColumn(string title, int width) {
+        this.title = title;
+        this.width = width;
+    }
+}
+
 /// <summary>
 /// 高层、自包含的 select / 下拉框。
 ///
@@ -195,11 +206,8 @@ class SelectBox : Control {
     /// 弹层列数：0 = 自动（多选框选项多于一屏时分成等宽多列，
     /// 而不是拉成一条长条），否则固定列数。
     int cols;
-    /// 表格式下拉的列标题；null = 普通单列列表。首列对应选项的
-    /// label，其余对应 SelectOption.cells。
-    List<string> headers;
-    /// 各列宽度（设备像素）。与 headers 一一对应。
-    List<int> colWidths;
+    /// 表格式下拉列定义实体列表（强类型实体承载，消除平行列表反模式）。
+    List<SelectBoxColumn> tableColumns;
     /// 搜索框里的提示文字（filterable）。空则用 "Search"。
     string filterHint;
     /// 弹层宽度缓存。量一次即可：逐帧测量每条标签在上万条选项时
@@ -247,8 +255,7 @@ class SelectBox : Control {
         this.wiresOwnEvents = true;
         this.lastModel = 0 - 1;
         this.lastData = 0 - 1;
-        this.headers = null;
-        this.colWidths = null;
+        this.tableColumns = null;
         this.filterHint = "";
         this.cascade = false;
         this.cascadePath = null;
@@ -317,6 +324,20 @@ class SelectBox : Control {
         return this;
     }
 
+    /// 表格式下拉（强类型实体入参）：弹层变成一张带列标题的表。
+    SelectBox Table(List<SelectBoxColumn> columns) {
+        if (columns == null) {
+            this.tableColumns = null;
+            this.scrollY = 0;
+            this.popupWDirty = true;
+            return this;
+        }
+        this.tableColumns = columns;
+        this.scrollY = 0;
+        this.popupWDirty = true;
+        return this;
+    }
+
     /// 表格式下拉：弹层变成一张带列标题的表，每个选项占一行、
     /// 每行按 `widths` 分列。首列是选项的 label（Text() 仍然返回它），
     /// 其余列由 AddRow 提供。
@@ -328,8 +349,17 @@ class SelectBox : Control {
     ///
     /// 传 null 恢复普通列表。
     SelectBox Table(List<string> titles, List<int> widths) {
-        headers = titles;
-        colWidths = widths;
+        if (titles == null || widths == null) {
+            this.tableColumns = null;
+            this.scrollY = 0;
+            this.popupWDirty = true;
+            return this;
+        }
+        this.tableColumns = new List<SelectBoxColumn>();
+        int count = titles.Count < widths.Count ? titles.Count : widths.Count;
+        for (int i = 0; i < count; i = i + 1) {
+            this.tableColumns.Add(new SelectBoxColumn(titles[i], widths[i]));
+        }
         scrollY = 0;
         popupWDirty = true;
         return this;
@@ -337,7 +367,7 @@ class SelectBox : Control {
 
     /// 是否处于表格式下拉模式。
     bool IsTable() {
-        return headers != null && colWidths != null && colWidths.Count > 0;
+        return tableColumns != null && tableColumns.Count > 0;
     }
 
     /// 表格式下拉的一行。`cells[0]` 是 label（首列），其余为后续列。
@@ -696,7 +726,7 @@ class SelectBox : Control {
             if (opts[i].grp) { pendingGrp = i; continue; }
             bool hit = opts[i].label.ToLower().Contains(q);
             if (!hit && tbl) {
-                for (int j = 1; j < colWidths.Count; j = j + 1) {
+                for (int j = 1; j < this.tableColumns.Count; j = j + 1) {
                     if (opts[i].Cell(j).ToLower().Contains(q)) { hit = true; break; }
                 }
             }
@@ -1095,8 +1125,8 @@ class SelectBox : Control {
     int PopupWidth(App app, Theme t, int trigWidth, int fs, int arrowSlot) {
         if (this.IsTable()) {
             int sum = t.paddingSmall * 2;
-            for (int i = 0; i < colWidths.Count; i = i + 1) {
-                sum = sum + colWidths[i];
+            for (int i = 0; i < this.tableColumns.Count; i = i + 1) {
+                sum = sum + this.tableColumns[i].width;
             }
             if (sum < trigWidth) { sum = trigWidth; }
             int roomT = app.canvas.Width() - app.Scale(8);
@@ -1302,13 +1332,13 @@ class SelectBox : Control {
             int hdFs = hdStyle.FontOr(fs);
             int hdPad = hdStyle.PadLOr(t.paddingSmall);
             int cx = popX + hdPad;
-            for (int ci = 0; ci < colWidths.Count; ci = ci + 1) {
-                string title = "";
-                if (ci < headers.Count) { title = headers[ci]; }
+            for (int ci = 0; ci < this.tableColumns.Count; ci = ci + 1) {
+                string title = this.tableColumns[ci].title;
+                int cw = this.tableColumns[ci].width;
                 c.DrawText(cx, Canvas.CenterTextY(headerY, hdH, hdFs),
-                    Ellipsis.Fit(title, colWidths[ci] - app.Scale(6), hdFs),
+                    Ellipsis.Fit(title, cw - app.Scale(6), hdFs),
                     hdStyle.FgOr(pop.fg), hdFs);
-                cx = cx + colWidths[ci];
+                cx = cx + cw;
             }
         }
 
@@ -1362,12 +1392,13 @@ class SelectBox : Control {
                     // 一行按列宽切开，每格自己收省略号 —— 列因此是对齐的，
                     // 而不是把整行拼成一个长字符串再统一截断。
                     int cellX = ox + rowPad;
-                    for (int ci = 0; ci < colWidths.Count; ci = ci + 1) {
+                    for (int ci = 0; ci < this.tableColumns.Count; ci = ci + 1) {
+                        int cw = this.tableColumns[ci].width;
                         c.DrawText(cellX, Canvas.CenterTextY(oy, optH, rowFs),
                             Ellipsis.Fit(opts[realIdx].Cell(ci),
-                                         colWidths[ci] - app.Scale(6), rowFs),
+                                         cw - app.Scale(6), rowFs),
                             row.fg, rowFs);
-                        cellX = cellX + colWidths[ci];
+                        cellX = cellX + cw;
                     }
                 } else {
                     int oMaxW = colW - rowPad - arrowSlot - t.paddingSmall;

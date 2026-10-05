@@ -3,6 +3,36 @@ using System.Json;
 
 namespace Gui;
 
+/// <summary>样式规则索引条目实体（消除 selText/selObjs/selBlock/selImportant 平行列表反模式）。</summary>
+class StyleRuleEntry {
+    public string text;
+    public Selector selector;
+    public JsonValue block;
+    public JsonValue important;
+
+    public StyleRuleEntry(string text, Selector selector, JsonValue block, JsonValue important) {
+        this.text = text;
+        this.selector = selector;
+        this.block = block;
+        this.important = important;
+    }
+}
+
+/// <summary>媒体规则条目实体（消除 mediaSels/mediaBlocks/mediaImportants/mediaConds 平行列表反模式）。</summary>
+class StyleMediaEntry {
+    public Selector selector;
+    public JsonValue block;
+    public JsonValue important;
+    public MediaCond condition;
+
+    public StyleMediaEntry(Selector selector, JsonValue block, JsonValue important, MediaCond condition) {
+        this.selector = selector;
+        this.block = block;
+        this.important = important;
+        this.condition = condition;
+    }
+}
+
 /// CSS 声明级联，应用于已解析的 StyleBox（
 /// 皮肤路径，每个控件通过 Style 使用）或 retained-mode Control
 /// （在 UiDoc 构建期间）。
@@ -34,17 +64,8 @@ class StyleSheet {
     // 解析器认为值得尝试的选择器拼写。这正是
     // 复合选择器（`button.ghost.primary:hover`）能生效，以及
     // 组件默认外观可以放在样式表而非代码中的原因。
-    List<string> selText;
-    /// 已解析的选择器对象（与 selText/selBlock 对齐）。选择器语法
-    /// （`*`、属性条件、`:not()/:is()`）全在 Selector 里求值，
-    /// 这里不再维护平行的手抄字段。
-    List<Selector> selObjs;
+    List<StyleRuleEntry> ruleEntries;
     int indexedCount;
-    /// 每条规则的声明块，索引与上面的选择器表对齐：匹配后直接取，
-    /// 不再按选择器文本回查 rules（一次首帧解析要按名字查上百次）。
-    List<JsonValue> selBlock;
-    /// 每条规则里 `!important` 那部分声明（无则 null），与 selBlock 对齐。
-    List<JsonValue> selImportant;
     /// 按类型名分桶的规则下标（升序，因此与 anyType 归并后仍是级联顺序）。
     /// 一个控件只需看自己类型那一桶加上无类型的那些规则，
     /// 而不是每次解析都扫全表——冷解析（首帧、换肤）的主要成本在此。
@@ -89,14 +110,8 @@ class StyleSheet {
 
     // ---- @media 规则（运行期按窗口/主题求值）----
     // 与 rules 分开存：同一选择器可能同时有守卫/无守卫两份声明，
-    // 键控表无法表达；平行表按文档序线性扫，只在 HasMedia 时付出代价。
-    /// 已解析选择器（与 mediaBlocks/mediaConds 对齐）。
-    List<Selector> mediaSels;
-    /// 各条媒体规则的声明块与 !important 部分。
-    List<JsonValue> mediaBlocks;
-    List<JsonValue> mediaImportants;
-    /// 各条媒体规则的守卫条件。
-    List<MediaCond> mediaConds;
+    // 键控表无法表达；按文档序线性扫，只在 HasMedia 时付出代价。
+    List<StyleMediaEntry> mediaEntries;
     /// 收到的媒体块数（含内层规则展开前的块数口径不好对齐，
     /// 这里计"带条件的规则条数"）。
     int mediaCount;
@@ -158,22 +173,17 @@ class StyleSheet {
             return;
         }
         if (p.Relational()) { this.relational = true; }
-        if (this.mediaSels == null) {
-            this.mediaSels = new List<Selector>();
-            this.mediaBlocks = new List<JsonValue>();
-            this.mediaImportants = new List<JsonValue>();
-            this.mediaConds = new List<MediaCond>();
+        if (this.mediaEntries == null) {
+            this.mediaEntries = new List<StyleMediaEntry>();
         }
-        this.mediaSels.Add(p);
-        this.mediaBlocks.Add(block);
-        this.mediaImportants.Add(block.Get("__zan_important"));
-        this.mediaConds.Add(cond);
+        JsonValue imp = block == null ? null : block.Get("__zan_important");
+        this.mediaEntries.Add(new StyleMediaEntry(p, block, imp, cond));
         this.mediaCount = this.mediaCount + 1;
     }
 
     /// 表里是否有需要运行期求值的媒体规则。
     bool HasMedia() {
-        return this.mediaSels != null && this.mediaSels.Count > 0;
+        return this.mediaEntries != null && this.mediaEntries.Count > 0;
     }
 
     /// 在 ApplyCascade/ApplyImportant 的主循环之后套用媒体规则：
@@ -182,24 +192,25 @@ class StyleSheet {
     void ApplyMedia(StyleBox b, string type, List<string> want, string cls,
                     string id, string part, int stateBits, Control node,
                     bool importantPass) {
-        if (this.mediaSels == null) { return; }
-        for (int i = 0; i < this.mediaSels.Count; i = i + 1) {
-            if (!this.mediaConds[i].True(b)) { continue; }
-            if (!this.mediaSels[i].MatchNodeCtx(type, want, cls, id, part,
+        if (this.mediaEntries == null) { return; }
+        for (int i = 0; i < this.mediaEntries.Count; i = i + 1) {
+            StyleMediaEntry entry = this.mediaEntries[i];
+            if (!entry.condition.True(b)) { continue; }
+            if (!entry.selector.MatchNodeCtx(type, want, cls, id, part,
                                                 stateBits, node)) {
                 continue;
             }
             if (importantPass) {
-                JsonValue imp = this.mediaImportants[i];
+                JsonValue imp = entry.important;
                 if (imp == null || !imp.IsObject()) { continue; }
                 for (int k = 0; k < imp.Count(); k = k + 1) {
                     string key = imp.KeyAt(k);
                     StyleSheet.DeclSource(b, key, StyleSheet.ValStr(imp.ValAt(k)),
                                           StyleSheet.IsPrescaled(
-                                              this.mediaBlocks[i], key));
+                                              entry.block, key));
                 }
             } else {
-                this.ApplyDecls(b, this.mediaBlocks[i]);
+                this.ApplyDecls(b, entry.block);
             }
         }
     }
@@ -245,18 +256,13 @@ class StyleSheet {
                 }
             }
         }
-        if (other.mediaSels != null && other.mediaSels.Count > 0) {
-            if (this.mediaSels == null) {
-                this.mediaSels = new List<Selector>();
-                this.mediaBlocks = new List<JsonValue>();
-                this.mediaImportants = new List<JsonValue>();
-                this.mediaConds = new List<MediaCond>();
+        if (other.mediaEntries != null && other.mediaEntries.Count > 0) {
+            if (this.mediaEntries == null) {
+                this.mediaEntries = new List<StyleMediaEntry>();
             }
-            for (int m = 0; m < other.mediaSels.Count; m = m + 1) {
-                this.mediaSels.Add(other.mediaSels[m]);
-                this.mediaBlocks.Add(other.mediaBlocks[m]);
-                this.mediaImportants.Add(other.mediaImportants[m]);
-                this.mediaConds.Add(other.mediaConds[m]);
+            for (int m = 0; m < other.mediaEntries.Count; m = m + 1) {
+                StyleMediaEntry me = other.mediaEntries[m];
+                this.mediaEntries.Add(new StyleMediaEntry(me.selector, me.block, me.important, me.condition));
             }
             this.mediaCount = this.mediaCount + other.mediaCount;
             if (other.relational) { this.relational = true; }
@@ -380,7 +386,9 @@ class StyleSheet {
                 if (ic < 0 || (ia >= 0 && ia < ic)) { i = ia; a = a + 1; }
                 else { i = ic; c = c + 1; }
                 if (this.MatchesCtx(i, type, want, id, part, stateBits, cls, node)) {
-                    this.ApplyDecls(b, selBlock[i]);
+                    if (this.ruleEntries != null && i < this.ruleEntries.Count) {
+                        this.ApplyDecls(b, this.ruleEntries[i].block);
+                    }
                 }
             }
         }
@@ -419,12 +427,16 @@ class StyleSheet {
                                      node)) {
                     continue;
                 }
-                JsonValue imp = selImportant[i];
+                if (this.ruleEntries == null || i >= this.ruleEntries.Count) {
+                    continue;
+                }
+                JsonValue imp = this.ruleEntries[i].important;
+                JsonValue blk = this.ruleEntries[i].block;
                 if (imp == null || !imp.IsObject()) { continue; }
                 for (int k = 0; k < imp.Count(); k = k + 1) {
                     string key = imp.KeyAt(k);
                     StyleSheet.DeclSource(b, key, StyleSheet.ValStr(imp.ValAt(k)),
-                                          StyleSheet.IsPrescaled(selBlock[i], key));
+                                          StyleSheet.IsPrescaled(blk, key));
                 }
             }
         }
@@ -453,8 +465,11 @@ class StyleSheet {
     /// Matches 的树上下文版本（组合器链/结构性伪类在 retained 树上求值）。
     bool MatchesCtx(int i, string type, List<string> classes, string id,
                     string part, int stateBits, string cls, Control node) {
-        return selObjs[i].MatchNodeCtx(type, classes, cls, id, part,
-                                       stateBits, node);
+        if (this.ruleEntries != null && i < this.ruleEntries.Count) {
+            return this.ruleEntries[i].selector.MatchNodeCtx(type, classes, cls, id, part,
+                                                            stateBits, node);
+        }
+        return false;
     }
 
     /// 表里是否有依赖树上下文的选择器（首次调用建立索引）。
@@ -476,8 +491,7 @@ class StyleSheet {
     void Index() {
         if (rules == null) { return; }
         if (indexedCount == rules.Count()) { return; }
-        selText = new List<string>();
-        selObjs = new List<Selector>();
+        ruleEntries = new List<StyleRuleEntry>();
         List<int> selSpecs = new List<int>();
         this.relational = false;
         int i = 0;
@@ -491,20 +505,16 @@ class StyleSheet {
             // 在权重相同的规则中插入到最后（保持文档顺序）。
             int at = selSpecs.Count;
             while (at > 0 && selSpecs[at - 1] > spec) { at = at - 1; }
-            selText.Insert(at, sel);
-            selObjs.Insert(at, p);
+            JsonValue blk = this.Block(sel);
+            JsonValue imp = blk == null ? null : blk.Get("__zan_important");
+            ruleEntries.Insert(at, new StyleRuleEntry(sel, p, blk, imp));
             selSpecs.Insert(at, spec);
         }
         // 分桶要等排序完成再做：上面的 Insert 会挪动下标。
-        this.selBlock = new List<JsonValue>();
-        this.selImportant = new List<JsonValue>();
         this.byType = new Dict<string, List<int>>();
         this.anyType = new List<int>();
-        for (int k = 0; k < selText.Count; k = k + 1) {
-            JsonValue blk = this.Block(selText[k]);
-            selBlock.Add(blk);
-            selImportant.Add(blk == null ? null : blk.Get("__zan_important"));
-            string ty = selObjs[k].type;
+        for (int k = 0; k < ruleEntries.Count; k = k + 1) {
+            string ty = ruleEntries[k].selector.type;
             if (ty == "") {
                 anyType.Add(k);
             } else {
@@ -564,9 +574,9 @@ class StyleSheet {
             outR.Add("accepted but has no effect here: " + lintInert[m]);
         }
         int relCount = 0;
-        if (selObjs != null) {
-            for (int r = 0; r < selObjs.Count; r = r + 1) {
-                if (selObjs[r].Relational()) { relCount = relCount + 1; }
+        if (ruleEntries != null) {
+            for (int r = 0; r < ruleEntries.Count; r = r + 1) {
+                if (ruleEntries[r].selector.Relational()) { relCount = relCount + 1; }
             }
         }
         if (relCount > 0) {
@@ -586,13 +596,12 @@ class StyleSheet {
         lintNever = new List<string>();
         lintValue = new List<string>();
         // 未能进入选择器索引的规则 = Selector.Parse 返回 null 的那些。
-        // selText 是已索引子集，用一张名字集合反查缺了谁；同时留一份
-        // 选择器对象，好把"永不匹配"的规则连同原因报出来。
+        // 用一张名字集合反查缺了谁；同时留一份选择器对象，好把"永不匹配"的规则连同原因报出来。
         Dict<string, Selector> indexed = new Dict<string, Selector>();
-        if (selText != null) {
-            for (int s = 0; s < selText.Count; s = s + 1) {
-                if (!indexed.ContainsKey(selText[s])) {
-                    indexed.Add(selText[s], selObjs[s]);
+        if (ruleEntries != null) {
+            for (int s = 0; s < ruleEntries.Count; s = s + 1) {
+                if (!indexed.ContainsKey(ruleEntries[s].text)) {
+                    indexed.Add(ruleEntries[s].text, ruleEntries[s].selector);
                 }
             }
         }

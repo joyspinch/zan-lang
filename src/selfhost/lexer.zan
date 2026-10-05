@@ -2,6 +2,19 @@ using System;
 using System.Collections;
 namespace Zan;
 
+/// <summary>条件编译栈帧实体（消除 ppActive/ppParent/ppTaken 平行列表反模式）。</summary>
+class PpFrame {
+    public int active;
+    public int parent;
+    public int taken;
+
+    public PpFrame(int active, int parent, int taken) {
+        this.active = active;
+        this.parent = parent;
+        this.taken = taken;
+    }
+}
+
 // Faithful port of src/compiler/lexer.c (bootstrap subset). Produces a
 // List<Token> covering identifiers/keywords, int/float/string/char literals,
 // comments and the operator/punctuation set the compiler itself uses.
@@ -16,18 +29,14 @@ class Lexer {
     // nested #if/#else conditional stack. Only the target-platform macros the
     // stdlib tests are predefined.
     public List<string> ppName;
-    public List<int> ppActive;   // this frame emits tokens (accounts for ancestors)
-    public List<int> ppParent;   // enclosing region was active when frame pushed
-    public List<int> ppTaken;    // some branch of this frame has been taken
+    public List<PpFrame> ppFrames;
     public int ppTop;            // logical conditional-stack depth (no List.RemoveAt)
     string peSrc; int pePos; int peN;   // scratch for #if expression evaluation
 
     public Lexer(string s) {
         src = s; pos = 0; n = s.Length; line = 1; col = 1;
         ppName = new List<string>();
-        ppActive = new List<int>();
-        ppParent = new List<int>();
-        ppTaken = new List<int>();
+        ppFrames = new List<PpFrame>();
         ppTop = 0;
         peSrc = ""; pePos = 0; peN = 0;
         ppName.Add("WINDOWS"); ppName.Add("WIN32"); ppName.Add("X86_64"); ppName.Add("ZAN");
@@ -47,14 +56,19 @@ class Lexer {
         }
     }
     void PpPush(int pa, int c, int t) {
-        if (ppTop < ppActive.Count) { ppActive[ppTop] = c; ppParent[ppTop] = pa; ppTaken[ppTop] = t; }
-        else { ppActive.Add(c); ppParent.Add(pa); ppTaken.Add(t); }
+        if (ppTop < ppFrames.Count) {
+            ppFrames[ppTop].active = c;
+            ppFrames[ppTop].parent = pa;
+            ppFrames[ppTop].taken = t;
+        } else {
+            ppFrames.Add(new PpFrame(c, pa, t));
+        }
         ppTop = ppTop + 1;
     }
     void PpPop() { if (ppTop > 0) { ppTop = ppTop - 1; } }
     bool PpActiveNow() {
         if (ppTop == 0) { return true; }
-        return ppActive[ppTop - 1] == 1;
+        return ppFrames[ppTop - 1].active == 1;
     }
 
     // ---- #if expression evaluation (bare ident = defined?1:0, ints, defined(),
@@ -147,14 +161,20 @@ class Lexer {
         } else if (dir == "elif") {
             int top = ppTop - 1;
             if (top >= 0) {
-                if (ppTaken[top] == 0 && ppParent[top] == 1 && PeEval(rest) != 0) { ppActive[top] = 1; ppTaken[top] = 1; }
-                else { ppActive[top] = 0; }
+                if (ppFrames[top].taken == 0 && ppFrames[top].parent == 1 && PeEval(rest) != 0) {
+                    ppFrames[top].active = 1; ppFrames[top].taken = 1;
+                } else {
+                    ppFrames[top].active = 0;
+                }
             }
         } else if (dir == "else") {
             int top = ppTop - 1;
             if (top >= 0) {
-                if (ppParent[top] == 1 && ppTaken[top] == 0) { ppActive[top] = 1; ppTaken[top] = 1; }
-                else { ppActive[top] = 0; }
+                if (ppFrames[top].parent == 1 && ppFrames[top].taken == 0) {
+                    ppFrames[top].active = 1; ppFrames[top].taken = 1;
+                } else {
+                    ppFrames[top].active = 0;
+                }
             }
         } else if (dir == "endif") {
             PpPop();

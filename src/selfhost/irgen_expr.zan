@@ -50,8 +50,8 @@ partial class Irgen {
     ExprVal GenIdent(Node e) {
         int li = LocalIdx(e.sval);
         if (li >= 0) {
-            Node ty = locType[li];
-            string reg = locReg[li];
+            Node ty = locals[li].type;
+            string reg = locals[li].reg;
             string lt = MapType(ty);
             string t = NT();
             L("  " + t + " = load " + lt + ", " + lt + "* " + reg);
@@ -262,8 +262,8 @@ partial class Irgen {
             return new ExprVal("" + EvalConstInt(e), MkType("int"));
         }
         if (op == TK.AmpAmp() || op == TK.PipePipe()) {
-            List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
-            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+            List<StmtTempEntry> svT = stmtTemps;
+            stmtTemps = new List<StmtTempEntry>();
             bool isAnd = (op == TK.AmpAmp());
             int lrhs = NL(); int lend = NL();
             string la = GenCond(e.a);
@@ -280,7 +280,7 @@ partial class Irgen {
             L("  " + r + " = phi i1 [ " + dflt + ", %" + bpre + " ], [ " + lb + ", %" + bpost + " ]");
             string z = NT();
             L("  " + z + " = zext i1 " + r + " to i64");
-            stmtTemps = svT; stmtTempTypes = svTT;
+            stmtTemps = svT;
             return new ExprVal(z, MkType("bool"));
         }
         // null-coalescing "a ?? b": if a is non-null use a, else b. Result is
@@ -301,8 +301,8 @@ partial class Irgen {
             // a null: evaluate b in an isolated temp scope, retain the chosen
             // value, release bs own temporaries within the branch.
             Label(lb);
-            List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
-            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+            List<StmtTempEntry> svT = stmtTemps;
+            stmtTemps = new List<StmtTempEntry>();
             ExprVal b = GenExpr(e.b);
             EmitArcRetain(b.op, b.ty);
             string bop = b.op;
@@ -312,7 +312,7 @@ partial class Irgen {
                 bop = bc;
             }
             EmitTempReleases();
-            stmtTemps = svT; stmtTempTypes = svTT;
+            stmtTemps = svT;
             string bpost = curLbl;
             L("  br label %L" + lend);
             Label(lend);
@@ -559,7 +559,7 @@ partial class Irgen {
         if (e.kind == AK.StringLit()) { return true; }
         if (e.kind == AK.Ident()) {
             int li = LocalIdx(e.sval);
-            if (li >= 0) { return IsStr(locType[li]); }
+            if (li >= 0) { return IsStr(locals[li].type); }
             return false;
         }
         if (e.kind == AK.Binary() && e.op == TK.Plus()) {
@@ -705,21 +705,21 @@ partial class Irgen {
         if (lhs.kind == AK.Ident()) {
             int li = LocalIdx(lhs.sval);
             if (li >= 0) {
-                Node lty = locType[li];
+                Node lty = locals[li].type;
                 if (IsNullableValue(lty)) {
-                    L("  store i8* " + BoxFor(v, lty) + ", i8** " + locReg[li]);
+                    L("  store i8* " + BoxFor(v, lty) + ", i8** " + locals[li].reg);
                     return;
                 }
                 string lt = MapType(lty);
                 if (ArcManaged(lty)) {
                     string old = NT();
-                    L("  " + old + " = load " + lt + ", " + lt + "* " + locReg[li]);
+                    L("  " + old + " = load " + lt + ", " + lt + "* " + locals[li].reg);
                     string sv = Coerce(v, lt);
-                    L("  store " + lt + " " + sv + ", " + lt + "* " + locReg[li]);
+                    L("  store " + lt + " " + sv + ", " + lt + "* " + locals[li].reg);
                     EmitArcRetain(sv, lty);
                     EmitArcRelease(old, lty);
                 } else {
-                    L("  store " + lt + " " + Coerce(v, lt) + ", " + lt + "* " + locReg[li]);
+                    L("  store " + lt + " " + Coerce(v, lt) + ", " + lt + "* " + locals[li].reg);
                 }
                 return;
             }
@@ -1022,12 +1022,12 @@ partial class Irgen {
         string bpre = curLbl;
         L("  br i1 " + isn + ", label %L" + lend + ", label %L" + lthen);
         Label(lthen);
-        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
-        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+        List<StmtTempEntry> svT = stmtTemps;
+        stmtTemps = new List<StmtTempEntry>();
         ExprVal v = GenExpr(full);
         EmitArcRetain(v.op, v.ty);
         EmitTempReleases();
-        stmtTemps = svT; stmtTempTypes = svTT;
+        stmtTemps = svT;
         qmem.a = saved; qmem.ival = 1;
         string bthen = curLbl;
         L("  br label %L" + lend);
@@ -1437,7 +1437,7 @@ partial class Irgen {
     // switch statement: case bodies as an if-else cascade; `break` jumps to
     // the end label (C# switch cases cannot fall through).
     void GenSwitchStmt(Node s) {
-        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+        stmtTemps = new List<StmtTempEntry>();
         ExprVal subj = GenExpr(s.a);
         int lend = NL();
         int sBrk = brkTarget; int sLoop = loopScopeBase;
@@ -1481,8 +1481,8 @@ partial class Irgen {
     }
 
     ExprVal GenSwitchExpr(Node e) {
-        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
-        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+        List<StmtTempEntry> svT = stmtTemps;
+        stmtTemps = new List<StmtTempEntry>();
         ExprVal subj = GenExpr(e.a);
         int nend = NL();
         List<string> vals = new List<string>();
@@ -1552,7 +1552,7 @@ partial class Irgen {
         if (vals.Count > 0) { phi = phi + ", [ " + zero + ", %" + fbLbl + " ]"; }
         else { phi = phi + " [ " + zero + ", %" + fbLbl + " ]"; }
         L("  " + phi);
-        stmtTemps = svT; stmtTempTypes = svTT;
+        stmtTemps = svT;
         return new ExprVal(t, resTy);
     }
 
@@ -1603,7 +1603,7 @@ partial class Irgen {
             string nm = used[j];
             if (!Contains(declared, nm) && !Contains(caps, nm)) {
                 int li = LocalIdx(nm);
-                if (li >= 0) { caps.Add(nm); capTy.Add(locType[li]); }
+                if (li >= 0) { caps.Add(nm); capTy.Add(locals[li].type); }
             }
             j = j + 1;
         }
@@ -1787,17 +1787,19 @@ partial class Irgen {
         StringBuilder savedBody = body;
         int sTmp = tmp; int sLbl = lbl; bool sTerm = term; string sCurLbl = curLbl;
         string sRet = curRet; string sClass = curClass; bool sHasThis = curHasThis;
+        List<LocalBinding> sLocals = locals;
         List<string> sLocName = locName; List<Node> sLocType = locType;
         List<string> sLocReg = locReg; int sLocSeq = locSeq;
         int sBrk = brkTarget; int sCont = contTarget;
         int sLoopScope = loopScopeBase;
-        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
+        List<StmtTempEntry> svT = stmtTemps;
 
         StringBuilder sEa = entryAllocas; bool sEaAct = eaActive;
         bool sAsync = curAsync;
         body = new StringBuilder();
         entryAllocas = new StringBuilder(); eaActive = true;
         tmp = 0; lbl = 0; term = false; curLbl = "entry"; curAsync = false;
+        locals = new List<LocalBinding>();
         locName = new List<string>(); locType = new List<Node>(); locReg = new List<string>(); locSeq = 0;
         curRet = MapType(retTy); curClass = ""; curHasThis = false; brkTarget = 0; contTarget = 0;
 
@@ -1842,7 +1844,7 @@ partial class Irgen {
                 else { L("  ret " + curRet + " null"); }
             }
         } else {
-            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+            stmtTemps = new List<StmtTempEntry>();
             ExprVal rv = GenExpr(lam.a);
             if (curRet == "void") {
                 EmitTempReleases();
@@ -1877,10 +1879,11 @@ partial class Irgen {
         body = savedBody;
         tmp = sTmp; lbl = sLbl; term = sTerm; curLbl = sCurLbl;
         curRet = sRet; curClass = sClass; curHasThis = sHasThis;
+        locals = sLocals;
         locName = sLocName; locType = sLocType; locReg = sLocReg; locSeq = sLocSeq;
         brkTarget = sBrk; contTarget = sCont;
         loopScopeBase = sLoopScope;
-        stmtTemps = svT; stmtTempTypes = svTT;
+        stmtTemps = svT;
 
         // build closure { i8* fn, i8* env }
         string clo = NT();
@@ -2122,7 +2125,7 @@ partial class Irgen {
                     EA(outp, MapType(oty));
                 } else {
                     int li = LocalIdx(oa.sval);
-                    if (li >= 0) { oty = locType[li]; outp = locReg[li]; }
+                    if (li >= 0) { oty = locals[li].type; outp = locals[li].reg; }
                 }
                 string endp = NT();
                 EA(endp, "i8*");
@@ -2283,8 +2286,8 @@ partial class Irgen {
             string name = callee.sval;
             // delegate invocation: a local of Func/Action type
             int dli = LocalIdx(name);
-            if (dli >= 0 && IsDelegate(locType[dli])) {
-                return EmitDelegateCall(callee, locType[dli], e);
+            if (dli >= 0 && IsDelegate(locals[dli].type)) {
+                return EmitDelegateCall(callee, locals[dli].type, e);
             }
             if (curHasThis) {
                 Node cls = binder.FindType(curClass);
@@ -2386,7 +2389,7 @@ partial class Irgen {
                     if (la.kind == AK.NewExpr()) { passthrough = true; }
                     if (la.kind == AK.Ident()) {
                         int li = LocalIdx(la.sval);
-                        if (li >= 0 && IsListType(locType[li])) { passthrough = true; }
+                        if (li >= 0 && IsListType(locals[li].type)) { passthrough = true; }
                     }
                 }
                 if (!passthrough) {
@@ -2568,19 +2571,21 @@ partial class Irgen {
                     Node drt = SubstTP(dd.type, dtn, DelegTArgs(dd, pty, dtn));
                     if (drt != null && !MentionsTypeParam(drt)) {
                         List<Node> dps = DelegParams(pty);
-                        int mark = locName.Count;
+                        int mark = locals.Count;
                         int pi = 0; int j = 0;
                         while (j < arg.kids.Count) {
                             if (arg.kids[j].kind == AK.Param()) {
                                 Node pt2 = null;
                                 if (pi < dps.Count) { pt2 = dps[pi]; }
+                                locals.Add(new LocalBinding(arg.kids[j].sval, pt2, ""));
                                 locName.Add(arg.kids[j].sval); locType.Add(pt2); locReg.Add("");
                                 pi = pi + 1;
                             }
                             j = j + 1;
                         }
                         Node lrt = ArgTypeNode(arg.a);
-                        while (locName.Count > mark) {
+                        while (locals.Count > mark) {
+                            locals.RemoveAt(locals.Count - 1);
                             locName.RemoveAt(locName.Count - 1);
                             locType.RemoveAt(locType.Count - 1);
                             locReg.RemoveAt(locReg.Count - 1);
@@ -2687,13 +2692,17 @@ partial class Irgen {
     string SpecQueue(string owner, Node m, List<string> tns, List<Node> trs, string tag) {
         string sname = m.sval + "__SP" + tag;
         string sym = owner + "_" + sname;
-        if (IndexOfStr(specSyms, sym) < 0) {
-            specSyms.Add(sym);
+        int i = 0;
+        bool found = false;
+        while (i < specEntries.Count) {
+            if (specEntries[i].symbol == sym) { found = true; break; }
+            i = i + 1;
+        }
+        if (!found) {
             Node clone = CloneSubst(m, tns, trs);
             if (clone == null) { throw new Exception("clone failed for " + m.sval); }
             clone.sval = sname;
-            specMs.Add(clone);
-            specClss.Add(binder.FindType(owner));
+            specEntries.Add(new SpecializedMethodEntry(clone, binder.FindType(owner), sym));
         }
         return sym;
     }
@@ -2701,19 +2710,21 @@ partial class Irgen {
     // infer the static type of an expression-bodied lambda's result with its
     // parameters bound to the delegate's (possibly substituted) param types
     Node LambdaBodyType(Node lam, List<Node> dps) {
-        int mark = locName.Count;
+        int mark = locals.Count;
         int pi = 0; int j = 0;
         while (j < lam.kids.Count) {
             if (lam.kids[j].kind == AK.Param()) {
                 Node pt2 = lam.kids[j].type;
                 if (pt2 == null && pi < dps.Count) { pt2 = dps[pi]; }
+                locals.Add(new LocalBinding(lam.kids[j].sval, pt2, ""));
                 locName.Add(lam.kids[j].sval); locType.Add(pt2); locReg.Add("");
                 pi = pi + 1;
             }
             j = j + 1;
         }
         Node lrt = ArgTypeNode(lam.a);
-        while (locName.Count > mark) {
+        while (locals.Count > mark) {
+            locals.RemoveAt(locals.Count - 1);
             locName.RemoveAt(locName.Count - 1);
             locType.RemoveAt(locType.Count - 1);
             locReg.RemoveAt(locReg.Count - 1);

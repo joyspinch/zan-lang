@@ -49,6 +49,70 @@ class HitRegion {
     }
 }
 
+/// 目标锚点信息实体（消除 anchorId / anchorX / anchorY / anchorW / anchorH / anchorType / anchorSet 平行列表反模式）。
+class HitAnchor {
+    int id;
+    int x;
+    int y;
+    int width;
+    int height;
+    int widgetType;
+    int isSet;
+
+    HitAnchor() {
+        this.id = -1;
+        this.x = 0;
+        this.y = 0;
+        this.width = 0;
+        this.height = 0;
+        this.widgetType = 0;
+        this.isSet = 0;
+    }
+
+    void Set(int id, int x, int y, int w, int h, int wtype) {
+        this.id = id;
+        this.x = x;
+        this.y = y;
+        this.width = w;
+        this.height = h;
+        this.widgetType = wtype;
+        this.isSet = 1;
+    }
+
+    void Clear() {
+        this.id = -1;
+        this.isSet = 0;
+    }
+}
+
+/// 整帧命中区快照项实体（消除 snapId / snapX / snapY / snapW / snapH / snapType 平行列表反模式）。
+class HitSnapshotItem {
+    int id;
+    int x;
+    int y;
+    int width;
+    int height;
+    int widgetType;
+
+    HitSnapshotItem(int id, int x, int y, int w, int h, int wtype) {
+        this.id = id;
+        this.x = x;
+        this.y = y;
+        this.width = w;
+        this.height = h;
+        this.widgetType = wtype;
+    }
+
+    void Set(int id, int x, int y, int w, int h, int wtype) {
+        this.id = id;
+        this.x = x;
+        this.y = y;
+        this.width = w;
+        this.height = h;
+        this.widgetType = wtype;
+    }
+}
+
 /// 每帧命中区注册表：控件渲染时登记矩形，鼠标/触摸事件据此
 /// 解析目标。附带阻挡区（模态遮罩）、事件锚点（按下/点击的
 /// 跨帧目标重绑定）与整帧快照（条带帧的事件解析基准）。
@@ -79,27 +143,16 @@ class HitTester {
     // 于是上一帧解析出的 id 在本帧落到了另一个控件上——这就是
     // “开过右键菜单后信号乱串”的根源。矩形来自布局，不随 id 平移，
     // 因此锚点同时记住命中区的矩形；本帧哪个控件注册到同一个矩形，
-    // 哪个才是真正的目标，注册时就地把锚点 id 改写过去。
-    List<int> anchorId;
-    List<int> anchorX;
-    List<int> anchorY;
-    List<int> anchorW;
-    List<int> anchorH;
-    List<int> anchorType;
-    List<int> anchorSet;
+    // 哪个才是真正的目标，注册时就地把锚点 id 改写过去（以 HitAnchor 实体承载，消除平行列表）。
+    List<HitAnchor> anchors;
 
     // 事件解析基准：最近一个完整帧的命中区快照。局部帧只渲染损伤
     // 条带，条带外的控件本帧不注册命中区；若事件按「上一帧」解析，
     // 上一帧恰好是条带帧时，条带外的点击会全部扑空（表现为点击
     // 无响应/迟钝）。条带裁剪的前提是条带外像素与控件均未变化，
     // 所以最近一次整帧的命中区对条带外依然正确——整帧结束时由
-    // App 拷贝一份（KeepFullSnapshot）作为解析基准。
-    List<int> snapId;
-    List<int> snapX;
-    List<int> snapY;
-    List<int> snapW;
-    List<int> snapH;
-    List<int> snapType;
+    // App 拷贝一份（KeepFullSnapshot）作为解析基准（以 HitSnapshotItem 实体承载，消除平行列表）。
+    List<HitSnapshotItem> snapshots;
     int snapUsed;
 
     // 按压状态的持有者（App 构造后 BindFocus）：按下锚点按矩形重绑
@@ -121,19 +174,8 @@ class HitTester {
         regions = poolA;
         blockers = new List<HitRegion>();
         prevBlockers = new List<HitRegion>();
-        anchorId = new List<int>{ -1, -1, -1, -1 };
-        anchorX = new List<int>{ 0, 0, 0, 0 };
-        anchorY = new List<int>{ 0, 0, 0, 0 };
-        anchorW = new List<int>{ 0, 0, 0, 0 };
-        anchorH = new List<int>{ 0, 0, 0, 0 };
-        anchorType = new List<int>{ 0, 0, 0, 0 };
-        anchorSet = new List<int>{ 0, 0, 0, 0 };
-        snapId = new List<int>();
-        snapX = new List<int>();
-        snapY = new List<int>();
-        snapW = new List<int>();
-        snapH = new List<int>();
-        snapType = new List<int>();
+        anchors = new List<HitAnchor>{ new HitAnchor(), new HitAnchor(), new HitAnchor(), new HitAnchor() };
+        snapshots = new List<HitSnapshotItem>();
         snapUsed = 0;
     }
 
@@ -146,20 +188,12 @@ class HitTester {
     /// 必须按值拷贝（AnchorAt 只用到这六个 int）。
     void KeepFullSnapshot() {
         int n = used;
-        snapId.Clear();
-        snapX.Clear();
-        snapY.Clear();
-        snapW.Clear();
-        snapH.Clear();
-        snapType.Clear();
+        while (snapshots.Count < n) {
+            snapshots.Add(new HitSnapshotItem(0, 0, 0, 0, 0, 0));
+        }
         for (int i = 0; i < n; i = i + 1) {
             HitRegion r = regions[i];
-            snapId.Add(r.id);
-            snapX.Add(r.x);
-            snapY.Add(r.y);
-            snapW.Add(r.width);
-            snapH.Add(r.height);
-            snapType.Add(r.widgetType);
+            snapshots[i].Set(r.id, r.x, r.y, r.width, r.height, r.widgetType);
         }
         snapUsed = n;
     }
@@ -179,18 +213,13 @@ class HitTester {
     int AnchorAt(int k, int px, int py, bool below) {
         int i = snapUsed - 1;
         while (i >= 0) {
-            int wtype = snapType[i];
+            HitSnapshotItem sn = snapshots[i];
+            int wtype = sn.widgetType;
             bool skip = below && wtype == -1;
-            if (!skip && px >= snapX[i] && px < snapX[i] + snapW[i]
-                && py >= snapY[i] && py < snapY[i] + snapH[i]) {
-                anchorId[k] = snapId[i];
-                anchorX[k] = snapX[i];
-                anchorY[k] = snapY[i];
-                anchorW[k] = snapW[i];
-                anchorH[k] = snapH[i];
-                anchorType[k] = wtype;
-                anchorSet[k] = 1;
-                return snapId[i];
+            if (!skip && px >= sn.x && px < sn.x + sn.width
+                && py >= sn.y && py < sn.y + sn.height) {
+                anchors[k].Set(sn.id, sn.x, sn.y, sn.width, sn.height, wtype);
+                return sn.id;
             }
             i = i - 1;
         }
@@ -200,17 +229,16 @@ class HitTester {
 
     /// 作废锚点 `k`（id 复位为 -1）。
     void ClearAnchor(int k) {
-        anchorId[k] = -1;
-        anchorSet[k] = 0;
+        anchors[k].Clear();
     }
 
     /// 锚点 `k` 最近一次 AnchorAt 命中的区域类型
     /// （HitRegion.widgetType，-1 = 阻挡区）。仅在 AnchorAt 返回
     /// id >= 0（命中）后读取才有意义；ClearAnchor 不重置类型。
-    int AnchorTypeOf(int k) { return anchorType[k]; }
+    int AnchorTypeOf(int k) { return anchors[k].widgetType; }
 
     /// 锚点 `k` 当前对应的控件 id（本帧已按矩形改写过）。
-    int AnchorIdOf(int k) { return anchorId[k]; }
+    int AnchorIdOf(int k) { return anchors[k].id; }
 
     /// 本帧已注册的命中区数量（`regions` 是复用池，末尾
     /// 可能残留上一帧的对象，遍历要以此为界）。
@@ -245,18 +273,19 @@ class HitTester {
         // 的按钮/拖动全部失效。持续扫到最后一个匹配，与一次全新
         // AnchorAt 在同一点上的解析结果一致。
         for (int k = 0; k < 4; k = k + 1) {
-            if (anchorSet[k] == 1
-                && anchorType[k] == wtype
-                && anchorX[k] == x && anchorY[k] == y
-                && anchorW[k] == w && anchorH[k] == h) {
+            HitAnchor a = anchors[k];
+            if (a.isSet == 1
+                && a.widgetType == wtype
+                && a.x == x && a.y == y
+                && a.width == w && a.height == h) {
                 // 按下锚点（k==0）换了 id 且按压还握在旧 id 上：把
                 // 按压一并带到新 id（见 focus 字段的注释）。释放后
                 // pressedId 为 -1，不会被锚点的滞留值重新点亮。
-                if (k == 0 && focus != null && anchorId[k] >= 0
-                    && anchorId[k] != id && focus.pressedId == anchorId[k]) {
+                if (k == 0 && focus != null && a.id >= 0
+                    && a.id != id && focus.pressedId == a.id) {
                     focus.SetPressed(id);
                 }
-                anchorId[k] = id;
+                a.id = id;
             }
         }
     }

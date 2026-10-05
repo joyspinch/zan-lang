@@ -1861,18 +1861,31 @@ class AiAgent {
     static string gLimits;
     static string gChatModel;
 
+/// <summary>成员上下文压缩与定型摘要记录实体（消除 gCompRoles/gCompCount/gCompDrop/gCompFrom/gCompText 平行列表反模式）。</summary>
+class AiAgentCompactionRecord {
+    public string role;
+    public int count;
+    public int lastDrop;
+    public int stickyFrom;
+    public string stickyText;
+
+    public AiAgentCompactionRecord(string role) {
+        this.role = role;
+        this.count = 0;
+        this.lastDrop = 0;
+        this.stickyFrom = 0;
+        this.stickyText = "";
+    }
+}
+
     // 每个成员各自的压缩记录：谁的上下文被折叠过几次、最近那次折掉了几轮。
-    // 一个成员因为自己的窗口小而压缩，不该显示成全队都压缩了。下标一一对应，
+    // 一个成员因为自己的窗口小而压缩，不该显示成全队都压缩了。
     // 空成员名（"" ）就是单人模式那一份。
-    static List<string> gCompRoles;
-    static List<int> gCompCount;
-    static List<int> gCompDrop;
+    static List<AiAgentCompactionRecord> gCompRecords;
 
     static void EnsureCompRoles() {
-        if (AiAgent.gCompRoles == null) {
-            AiAgent.gCompRoles = new List<string>();
-            AiAgent.gCompCount = new List<int>();
-            AiAgent.gCompDrop = new List<int>();
+        if (AiAgent.gCompRecords == null) {
+            AiAgent.gCompRecords = new List<AiAgentCompactionRecord>();
         }
     }
 
@@ -1881,93 +1894,77 @@ class AiAgent {
         AiAgent.EnsureCompRoles();
         string who = agent;
         if (who == null) { who = ""; }
-        for (int i = 0; i < AiAgent.gCompRoles.Count; i = i + 1) {
-            if (AiAgent.gCompRoles[i] == who) { return i; }
+        for (int i = 0; i < AiAgent.gCompRecords.Count; i = i + 1) {
+            if (AiAgent.gCompRecords[i].role == who) { return i; }
         }
         if (!make) { return 0 - 1; }
-        AiAgent.gCompRoles.Add(who);
-        AiAgent.gCompCount.Add(0);
-        AiAgent.gCompDrop.Add(0);
-        return AiAgent.gCompRoles.Count - 1;
+        AiAgent.gCompRecords.Add(new AiAgentCompactionRecord(who));
+        return AiAgent.gCompRecords.Count - 1;
     }
 
     static void NoteCompaction(string agent, int dropped) {
         int s = AiAgent.CompSlot(agent, true);
-        AiAgent.gCompCount[s] = AiAgent.gCompCount[s] + 1;
-        AiAgent.gCompDrop[s] = dropped;
+        AiAgent.gCompRecords[s].count = AiAgent.gCompRecords[s].count + 1;
+        AiAgent.gCompRecords[s].lastDrop = dropped;
     }
 
     /// 这个成员的上下文被折叠过几次请求，以及最近那次折掉了几轮。
     static int CompactionsOf(string agent) {
         int s = AiAgent.CompSlot(agent, false);
         if (s < 0) { return 0; }
-        return AiAgent.gCompCount[s];
+        return AiAgent.gCompRecords[s].count;
     }
 
     static int LastDroppedOf(string agent) {
         int s = AiAgent.CompSlot(agent, false);
         if (s < 0) { return 0; }
-        return AiAgent.gCompDrop[s];
+        return AiAgent.gCompRecords[s].lastDrop;
     }
 
     /// 全队一共压缩过几次（本次会话的总数）。
     static int Compactions() {
         AiAgent.EnsureCompRoles();
         int acc = 0;
-        for (int i = 0; i < AiAgent.gCompCount.Count; i = i + 1) {
-            acc = acc + AiAgent.gCompCount[i];
+        for (int i = 0; i < AiAgent.gCompRecords.Count; i = i + 1) {
+            acc = acc + AiAgent.gCompRecords[i].count;
         }
         return acc;
     }
 
     static void ResetCompaction() {
-        AiAgent.gCompRoles = new List<string>();
-        AiAgent.gCompCount = new List<int>();
-        AiAgent.gCompDrop = new List<int>();
-        AiAgent.gCompFrom = new List<int>();
-        AiAgent.gCompText = new List<string>();
+        AiAgent.gCompRecords = new List<AiAgentCompactionRecord>();
     }
 
-    // 已经定型的那份摘要：折掉了前 `gCompFrom` 轮，正文是 `gCompText`。留着它
+    // 已经定型的那份摘要：折掉了前 `stickyFrom` 轮，正文是 `stickyText`。留着它
     // 是为了让摘要**逐字节不变**：摘要在消息序列里排在最前面，改一个字就等于
     // 换掉整份前缀，它后面的每一条历史在供应商那边都要重新计费（prompt 缓存按
     // 前缀匹配），命中率于是永远归零。
-    static List<int> gCompFrom;
-    static List<string> gCompText;
 
     static void EnsureSticky() {
         AiAgent.EnsureCompRoles();
-        if (AiAgent.gCompFrom == null) {
-            AiAgent.gCompFrom = new List<int>();
-            AiAgent.gCompText = new List<string>();
-        }
-        while (AiAgent.gCompFrom.Count < AiAgent.gCompRoles.Count) {
-            AiAgent.gCompFrom.Add(0);
-            AiAgent.gCompText.Add("");
-        }
     }
 
     /// 这个成员已经定型的摘要折掉了前几轮（0 = 还没折过）。
     static int StickyFrom(string agent) {
         AiAgent.EnsureSticky();
         int s = AiAgent.CompSlot(agent, false);
-        if (s < 0 || s >= AiAgent.gCompFrom.Count) { return 0; }
-        return AiAgent.gCompFrom[s];
+        if (s < 0 || s >= AiAgent.gCompRecords.Count) { return 0; }
+        return AiAgent.gCompRecords[s].stickyFrom;
     }
 
     /// 这个成员已经定型的摘要正文（"" = 还没折过）。
     static string StickyText(string agent) {
         AiAgent.EnsureSticky();
         int s = AiAgent.CompSlot(agent, false);
-        if (s < 0 || s >= AiAgent.gCompText.Count) { return ""; }
-        return AiAgent.gCompText[s];
+        if (s < 0 || s >= AiAgent.gCompRecords.Count) { return ""; }
+        return AiAgent.gCompRecords[s].stickyText;
     }
 
     static void SetSticky(string agent, int from, string text) {
         int s = AiAgent.CompSlot(agent, true);
         AiAgent.EnsureSticky();
-        AiAgent.gCompFrom[s] = from;
-        AiAgent.gCompText[s] = text;
+        AiAgent.gCompRecords[s].stickyFrom = from;
+        AiAgent.gCompRecords[s].stickyText = text;
     }
 
     /// Records the enabled provider's per-model limits table and the model the

@@ -411,6 +411,17 @@ class RadioOption {
 ///   * `g.Buttons = true` 切成连体按钮段形态（Element Plus 按钮组）；
 ///   * `g.Size = "large"` 一次作用到整组（tiny/small/medium/large）；
 ///   * 组级 `Change` 事件：任一选项被用户切换时触发（`g.OnChange(h)`）。
+/// 单个单选选项的配置实体（消除 optionValues / optionDisabled 平行列表反模式）。
+class RadioOptionMeta {
+    public int value;
+    public bool disabled;
+
+    RadioOptionMeta(int value, bool disabled) {
+        this.value = value;
+        this.disabled = disabled;
+    }
+}
+
 class RadioGroup : ChoiceGroup {
     /// 组真相：当前选中选项的 value。
     SignalInt model;
@@ -420,9 +431,8 @@ class RadioGroup : ChoiceGroup {
     Binding<bool> Buttons;
     /// 尺寸档位（Naive UI size prop）。
     Binding<string> Size;
-    /// 与 children 对齐的选项元数据（label 由基类 labels 承担）。
-    List<int> optionValues;
-    List<bool> optionDisabled;
+    /// 与 children 对齐的选项元数据实体列表（消除 optionValues / optionDisabled 平行列表反模式）。
+    List<RadioOptionMeta> optionMetas;
     /// 组事件：任一选项被用户切换时触发。
     UiEvent Change;
     /// 按钮形态的承载控件（懒建，作为组的唯一子项）。
@@ -432,8 +442,7 @@ class RadioGroup : ChoiceGroup {
     RadioGroup() {
         this.InitChoice();
         this.model = new SignalInt(0);
-        this.optionValues = new List<int>();
-        this.optionDisabled = new List<bool>();
+        this.optionMetas = new List<RadioOptionMeta>();
         this.Buttons = false;
         this.Size = "medium";
         this.Change = new UiEvent();
@@ -452,25 +461,25 @@ class RadioGroup : ChoiceGroup {
     /// 越界时收进最后一项；自定义 value 而无匹配才是 -1。
     int SelectedIndex() {
         int v = this.model.Get();
-        for (int i = 0; i < this.optionValues.Count; i = i + 1) {
-            if (this.optionValues[i] == v) { return i; }
+        for (int i = 0; i < this.optionMetas.Count; i = i + 1) {
+            if (this.optionMetas[i].value == v) { return i; }
         }
-        if (this.optionValues.Count == 0) { return 0 - 1; }
+        if (this.optionMetas.Count == 0) { return 0 - 1; }
         bool custom = false;
-        for (int i = 0; i < this.optionValues.Count; i = i + 1) {
-            if (this.optionValues[i] != i) { custom = true; }
+        for (int i = 0; i < this.optionMetas.Count; i = i + 1) {
+            if (this.optionMetas[i].value != i) { custom = true; }
         }
         if (!custom) {
-            if (v >= 0 && v < this.optionValues.Count) { return v; }
-            return this.optionValues.Count - 1;
+            if (v >= 0 && v < this.optionMetas.Count) { return v; }
+            return this.optionMetas.Count - 1;
         }
         return 0 - 1;
     }
 
     /// value 对应的选项下标；无此 value 时 -1。
     int IndexOfValue(int v) {
-        for (int i = 0; i < this.optionValues.Count; i = i + 1) {
-            if (this.optionValues[i] == v) { return i; }
+        for (int i = 0; i < this.optionMetas.Count; i = i + 1) {
+            if (this.optionMetas[i].value == v) { return i; }
         }
         return 0 - 1;
     }
@@ -480,7 +489,7 @@ class RadioGroup : ChoiceGroup {
     void SetSelectedValue(int v) {
         int i = this.IndexOfValue(v);
         if (i < 0) { return; }
-        if (i < this.optionDisabled.Count && this.optionDisabled[i]) { return; }
+        if (i < this.optionMetas.Count && this.optionMetas[i].disabled) { return; }
         if (this.model.Get() == v) { return; }
         this.model.Set(v);
         if (data != null) { data.Set(v); }
@@ -488,9 +497,9 @@ class RadioGroup : ChoiceGroup {
 
     /// 程序化选中第 index 个选项（静默）。越界 / 禁用无操作。
     void SetSelectedIndex(int index) {
-        if (index < 0 || index >= this.optionValues.Count) { return; }
-        if (index < this.optionDisabled.Count && this.optionDisabled[index]) { return; }
-        this.SetSelectedValue(this.optionValues[index]);
+        if (index < 0 || index >= this.optionMetas.Count) { return; }
+        if (index < this.optionMetas.Count && this.optionMetas[index].disabled) { return; }
+        this.SetSelectedValue(this.optionMetas[index].value);
     }
 
     /// 追加一个带自定义 value 的选项（Element Plus options 的对应物；
@@ -504,8 +513,7 @@ class RadioGroup : ChoiceGroup {
         if (text == "") { return null; }
         // 元数据入列后再交给基类：基类 AddOption 只做 MakeItem +
         // labels/children 对齐，MakeItem 里按下标取这里的值。
-        this.optionValues.Add(value);
-        this.optionDisabled.Add(disabled);
+        this.optionMetas.Add(new RadioOptionMeta(value, disabled));
         Control item = base.AddOption(text);
         return item;
     }
@@ -527,17 +535,16 @@ class RadioGroup : ChoiceGroup {
     void SyncGroup() {
         // 文本/JSON 路径（SetOptionsText）只经基类 AddOption，元数据
         // 在这里补齐：value = 下标、不禁用。
-        while (this.optionValues.Count < this.children.Count) {
-            this.optionValues.Add(this.optionValues.Count);
-            this.optionDisabled.Add(false);
+        while (this.optionMetas.Count < this.children.Count) {
+            this.optionMetas.Add(new RadioOptionMeta(this.optionMetas.Count, false));
         }
         if (data != null) {
             int cur = data.Get();
             if (cur != this.model.Get()) {
                 int i = this.IndexOfValue(cur);
                 bool ok = this.children.Count == 0;
-                if (i >= 0 && i < this.optionDisabled.Count
-                    && !this.optionDisabled[i]) { ok = true; }
+                if (i >= 0 && i < this.optionMetas.Count
+                    && !this.optionMetas[i].disabled) { ok = true; }
                 if (ok) { this.model.Set(cur); }
                 else {
                     // 绑定字段里是脏值（无此选项/禁用）：回写 model 现值。
@@ -551,8 +558,10 @@ class RadioGroup : ChoiceGroup {
                 Control c = this.children[i];
                 if (!(c is Radio)) { continue; }
                 Radio r = (Radio)c;
-                if (i < this.optionValues.Count) { r.optionValue = this.optionValues[i]; }
-                if (i < this.optionDisabled.Count) { r.Disabled = this.optionDisabled[i]; }
+                if (i < this.optionMetas.Count) {
+                    r.optionValue = this.optionMetas[i].value;
+                    r.Disabled = this.optionMetas[i].disabled;
+                }
                 if (sizeCls != "") { r.AddClass(sizeCls); }
             }
             return;
@@ -583,12 +592,12 @@ class RadioGroup : ChoiceGroup {
     string labelOf(int i) { return this.labels[i]; }
     /// 第 i 个选项的 value（缺元数据时 = 下标）。
     int valueAt(int i) {
-        if (i < this.optionValues.Count) { return this.optionValues[i]; }
+        if (i < this.optionMetas.Count) { return this.optionMetas[i].value; }
         return i;
     }
     /// 第 i 个选项是否禁用（缺元数据 false）。
     bool optionDisabledAt(int i) {
-        if (i < this.optionDisabled.Count) { return this.optionDisabled[i]; }
+        if (i < this.optionMetas.Count) { return this.optionMetas[i].disabled; }
         return false;
     }
 
@@ -619,8 +628,7 @@ class RadioGroup : ChoiceGroup {
     override void ClearOptions() {
         this.children.Clear();
         this.labels.Clear();
-        this.optionValues.Clear();
-        this.optionDisabled.Clear();
+        this.optionMetas.Clear();
         buttonGroup = null;
     }
 
@@ -630,13 +638,12 @@ class RadioGroup : ChoiceGroup {
         // 基类 AddOption 先 MakeItem 再挂子项；子类三参 AddOption 已把
         // 元数据入列，基类单参路径（SetOptionsText）则没有——落后的
         // 下标就地补一条默认元数据（value = 下标、不禁用），此后所有
-        // 路径的 optionValues/optionDisabled 都与 children 对齐。
-        while (this.optionValues.Count <= index) {
-            this.optionValues.Add(this.optionValues.Count);
-            this.optionDisabled.Add(false);
+        // 路径的 optionMetas 都与 children 对齐。
+        while (this.optionMetas.Count <= index) {
+            this.optionMetas.Add(new RadioOptionMeta(this.optionMetas.Count, false));
         }
-        Radio r = new Radio(this.model, this.optionValues[index], text);
-        r.Disabled = this.optionDisabled[index];
+        Radio r = new Radio(this.model, this.optionMetas[index].value, text);
+        r.Disabled = this.optionMetas[index].disabled;
         // 组级联动经 OnChildEvent 冒泡（见下），不再挂捕获组的闭包
         // ——组→子→事件表→闭包→组是 ARC 不回收的引用环。
         return r;
@@ -709,13 +716,13 @@ class RadioGroup : ChoiceGroup {
     }
 
     /// 选项文本带禁用位：`A|B!|C` 的 `!` 后缀把 B 标成不可点
-    /// （与 optionDisabled 元数据一一对应）。
+    /// （与 optionMetas 元数据一一对应）。
     override string OptionsText() {
         string outp = "";
         for (int i = 0; i < this.labels.Count; i = i + 1) {
             if (i > 0) { outp = outp + "|"; }
             outp = outp + this.labels[i];
-            if (i < this.optionDisabled.Count && this.optionDisabled[i]) {
+            if (i < this.optionMetas.Count && this.optionMetas[i].disabled) {
                 outp = outp + "!";
             }
         }

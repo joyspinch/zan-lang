@@ -9,6 +9,80 @@ class ExprVal {
     public ExprVal(string o, Node t) { op = o; ty = t; }
 }
 
+// A local variable binding: its source name, AST type node, and allocated LLVM register.
+class LocalBinding {
+    public string name;
+    public Node type;
+    public string reg;
+
+    public LocalBinding(string n, Node t, string r) {
+        name = n;
+        type = t;
+        reg = r;
+    }
+}
+
+// A per-function goto label mapping: its source label name and stable integer id.
+class GotoLabelEntry {
+    public string name;
+    public int id;
+
+    public GotoLabelEntry(string n, int i) {
+        name = n;
+        id = i;
+    }
+}
+
+/// 泛型方法单态化特化待发射条目实体（消除 specMs/specClss/specSyms 隐式平行列表）。
+class SpecializedMethodEntry {
+    public Node method;
+    public Node ownerClass;
+    public string symbol;
+
+    public SpecializedMethodEntry(Node m, Node clss, string sym) {
+        this.method = m;
+        this.ownerClass = clss;
+        this.symbol = sym;
+    }
+}
+
+/// 语句临时 ARC 管理值条目实体（消除 stmtTemps/stmtTempTypes 隐式平行列表）。
+class StmtTempEntry {
+    public string op;
+    public Node type;
+
+    public StmtTempEntry(string o, Node t) {
+        this.op = o;
+        this.type = t;
+    }
+}
+
+/// 异步状态机栈槽映射条目实体（消除 asyncSlotReg/asyncSlotTy/asyncSlotIdx 隐式平行列表）。
+class AsyncSlotEntry {
+    public string reg;
+    public Node type;
+    public int slotIdx;
+
+    public AsyncSlotEntry(string r, Node t, int idx) {
+        this.reg = r;
+        this.type = t;
+        this.slotIdx = idx;
+    }
+}
+
+/// 类字段描述实体（消除 CollectFields 中 names/types 平行列表反模式）。
+class ClassFieldEntry {
+    public string name;
+    public Node type;
+    public Node decl;
+
+    public ClassFieldEntry(string name, Node type, Node decl) {
+        this.name = name;
+        this.type = type;
+        this.decl = decl;
+    }
+}
+
 // IR backend: lowers the bound AST to LLVM IR text. Mirrors src/compiler/
 // irgen.c for the bootstrap subset. Integer/bool/char/enum are i64; string is
 // i8*; class/struct instances are heap objects referenced by %Name*; List<T>
@@ -30,6 +104,8 @@ partial class Irgen {
     public string curClass;
     public string curRet;
     public bool curHasThis;
+    public List<LocalBinding> locals;
+    // 编译器后端局部变量表：统一使用 LocalBinding 实体管理，保留 locName/locType/locReg 为列式视图（热路径快速索引与作用域边界）。
     public List<string> locName;
     public List<Node> locType;
     public List<string> locReg;
@@ -40,15 +116,12 @@ partial class Irgen {
     public int contTarget;
     public List<string> tparamNames;
     // method-level monomorphization: specialized clones pending emission
-    public List<Node> specMs;
-    public List<Node> specClss;
-    public List<string> specSyms;
+    public List<SpecializedMethodEntry> specEntries;
     public StringBuilder deferred; // hoisted lambda function definitions
     public StringBuilder entryAllocas; // per-function allocas hoisted to entry
     public bool eaActive;
     public int lamCount;
-    public List<string> stmtTemps;
-    public List<Node> stmtTempTypes;
+    public List<StmtTempEntry> stmtTemps;
     public int loopScopeBase;
     public List<string> externDecls; // extern C symbols already `declare`d
     public bool curAsync;
@@ -59,14 +132,11 @@ partial class Irgen {
     public bool usesDirList;
     public bool usesStrOps; // Trim/ToUpper/ToLower/Replace/LastIndexOf helpers
     List<string> mgTargets; // method-group thunks already emitted
-    public List<string> asyncSlotReg;
-    public List<Node> asyncSlotTy;
-    public List<int> asyncSlotIdx;
+    public List<AsyncSlotEntry> asyncSlots;
     public bool curAsyncThis;
     public int curAsyncThisSlot;
     public Node curAsyncThisTy;
-    public List<string> gotoNames; // per-function goto label name -> id
-    public List<int> gotoIds;
+    public List<GotoLabelEntry> gotoLabels;
     public bool crcEmitted; // NativeMemory.Crc32 helper+table emitted once
 
     public Irgen(Binder b, Diags d) {
@@ -76,9 +146,11 @@ partial class Irgen {
         entryAllocas = new StringBuilder(); eaActive = false;
         tmp = 0; lbl = 0; strn = 0; term = false;
         curClass = ""; curRet = "void"; curHasThis = false;
+        locals = new List<LocalBinding>();
         locName = new List<string>();
         locType = new List<Node>();
         locReg = new List<string>();
+        gotoLabels = new List<GotoLabelEntry>();
         locSeq = 0;
         qdotSeq = 0;
         curAsync = false; usesAsync = false; usesDirList = false; usesStrOps = false;
@@ -86,11 +158,9 @@ partial class Irgen {
         curLbl = "entry";
         brkTarget = 0; contTarget = 0;
         tparamNames = new List<string>();
-        specMs = new List<Node>();
-        specClss = new List<Node>();
-        specSyms = new List<string>();
-        stmtTemps = new List<string>();
-        stmtTempTypes = new List<Node>();
+        specEntries = new List<SpecializedMethodEntry>();
+        stmtTemps = new List<StmtTempEntry>();
+        asyncSlots = new List<AsyncSlotEntry>();
         loopScopeBase = 0;
         externDecls = new List<string>();
         crcEmitted = false;
@@ -543,13 +613,13 @@ partial class Irgen {
     bool WeakTy(Node t) { if (t == null) { return false; } int b = t.mods / 1024; return b - (b / 2) * 2 == 1; }
 
     // ordered fields, base classes first (layout-compatible with base pointers)
-    void CollectFields(Node cls, List<string> names, List<Node> types) {
+    void CollectFields(Node cls, List<ClassFieldEntry> fields) {
         if (cls == null) { return; }
-        CollectFields(BaseClassOf(cls), names, types);
+        CollectFields(BaseClassOf(cls), fields);
         int i = 0;
         while (i < cls.kids.Count) {
             Node m = cls.kids[i];
-            if (m.kind == AK.FieldDecl() && !IsStatic(m)) { names.Add(m.sval); types.Add(m.type); }
+            if (m.kind == AK.FieldDecl() && !IsStatic(m)) { fields.Add(new ClassFieldEntry(m.sval, m.type, m)); }
             i = i + 1;
         }
     }
@@ -658,24 +728,22 @@ partial class Irgen {
     }
 
     int FieldIndex(Node cls, string name) {
-        List<string> names = new List<string>();
-        List<Node> types = new List<Node>();
-        CollectFields(cls, names, types);
+        List<ClassFieldEntry> fields = new List<ClassFieldEntry>();
+        CollectFields(cls, fields);
         int i = 0;
-        while (i < names.Count) {
-            if (names[i] == name) { return FieldBase(cls) + i; }
+        while (i < fields.Count) {
+            if (fields[i].name == name) { return FieldBase(cls) + i; }
             i = i + 1;
         }
         return -1;
     }
 
     Node FieldType(Node cls, string name) {
-        List<string> names = new List<string>();
-        List<Node> types = new List<Node>();
-        CollectFields(cls, names, types);
+        List<ClassFieldEntry> fields = new List<ClassFieldEntry>();
+        CollectFields(cls, fields);
         int i = 0;
-        while (i < names.Count) {
-            if (names[i] == name) { return types[i]; }
+        while (i < fields.Count) {
+            if (fields[i].name == name) { return fields[i].type; }
             i = i + 1;
         }
         return null;
@@ -685,13 +753,21 @@ partial class Irgen {
     string AddLocal(string name, Node ty) {
         locSeq = locSeq + 1;
         string r = "%v." + name + "." + locSeq;
+        locals.Add(new LocalBinding(name, ty, r));
         locName.Add(name); locType.Add(ty); locReg.Add(r);
         return r;
     }
-    string RegOf(string name) { int i = LocalIdx(name); if (i < 0) { return "%v." + name; } return locReg[i]; }
+    string RegOf(string name) {
+        int i = LocalIdx(name);
+        if (i < 0) { return "%v." + name; }
+        return locals[i].reg;
+    }
     int LocalIdx(string name) {
-        int i = locName.Count - 1;
-        while (i >= 0) { if (locName[i] == name) { return i; } i = i - 1; }
+        int i = locals.Count - 1;
+        while (i >= 0) {
+            if (locals[i].name == name) { return i; }
+            i = i - 1;
+        }
         return -1;
     }
 
@@ -851,8 +927,8 @@ partial class Irgen {
         // emit queued generic-method specializations (a specialized body may
         // queue further specializations, so drain until the list stops growing)
         int sp = 0;
-        while (sp < specMs.Count) {
-            GenMethod(specClss[sp], specMs[sp], false);
+        while (sp < specEntries.Count) {
+            GenMethod(specEntries[sp].ownerClass, specEntries[sp].method, false);
             sp = sp + 1;
         }
         if (usesAsync) { EmitAsyncRuntime(); }
@@ -862,16 +938,15 @@ partial class Irgen {
     }
 
     void EmitStruct(Node cls) {
-        List<string> names = new List<string>();
-        List<Node> types = new List<Node>();
-        CollectFields(cls, names, types);
+        List<ClassFieldEntry> fields = new List<ClassFieldEntry>();
+        CollectFields(cls, fields);
         string s = "%" + cls.sval + " = type { ";
         int cnt = 0;
         if (IsPolyClass(cls)) { s = s + "i8*"; cnt = 1; }
         int i = 0;
-        while (i < types.Count) {
+        while (i < fields.Count) {
             if (cnt > 0) { s = s + ", "; }
-            s = s + MapType(types[i]);
+            s = s + MapType(fields[i].type);
             cnt = cnt + 1;
             i = i + 1;
         }
@@ -1220,55 +1295,59 @@ partial class Irgen {
 
     void EmitLocalReleases() {
         int i = 0;
-        while (i < locName.Count) {
-            if (ArcManaged(locType[i])) {
-                string lt = MapType(locType[i]);
+        while (i < locals.Count) {
+            if (ArcManaged(locals[i].type)) {
+                string lt = MapType(locals[i].type);
                 string t = NT();
-                L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
-                EmitArcRelease(t, locType[i]);
+                L("  " + t + " = load " + lt + ", " + lt + "* " + locals[i].reg);
+                EmitArcRelease(t, locals[i].type);
             }
             i = i + 1;
         }
     }
 
     void AddTemp(string op, Node ty) {
-        if (ArcManaged(ty)) { stmtTemps.Add(op); stmtTempTypes.Add(ty); }
+        if (ArcManaged(ty)) { stmtTemps.Add(new StmtTempEntry(op, ty)); }
     }
 
     void EmitTempReleases() {
         int i = 0;
         while (i < stmtTemps.Count) {
-            EmitArcRelease(stmtTemps[i], stmtTempTypes[i]);
+            EmitArcRelease(stmtTemps[i].op, stmtTemps[i].type);
             i = i + 1;
         }
-        stmtTemps = new List<string>();
-        stmtTempTypes = new List<Node>();
+        stmtTemps = new List<StmtTempEntry>();
     }
 
     void ReleaseLocalsFrom(int from) {
         int i = from;
-        while (i < locName.Count) {
+        while (i < locals.Count) {
             // __qdot temps hold a borrowed `?.` receiver: not owned, never released
-            if (locName[i].Length >= 6 && locName[i].Substring(0, 6) == "__qdot") { i = i + 1; continue; }
-            if (ArcManaged(locType[i])) {
-                string lt = MapType(locType[i]);
+            if (locals[i].name.Length >= 6 && locals[i].name.Substring(0, 6) == "__qdot") { i = i + 1; continue; }
+            if (ArcManaged(locals[i].type)) {
+                string lt = MapType(locals[i].type);
                 string t = NT();
-                L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
-                EmitArcRelease(t, locType[i]);
+                L("  " + t + " = load " + lt + ", " + lt + "* " + locals[i].reg);
+                EmitArcRelease(t, locals[i].type);
             }
             i = i + 1;
         }
     }
 
     void TrimLocals(int to) {
+        List<LocalBinding> nl = new List<LocalBinding>();
         List<string> nn = new List<string>();
         List<Node> nt = new List<Node>();
         List<string> nr = new List<string>();
         int i = 0;
         while (i < to) {
-            nn.Add(locName[i]); nt.Add(locType[i]); nr.Add(locReg[i]);
+            nl.Add(locals[i]);
+            nn.Add(locals[i].name);
+            nt.Add(locals[i].type);
+            nr.Add(locals[i].reg);
             i = i + 1;
         }
+        locals = nl;
         locName = nn; locType = nt; locReg = nr;
     }
 
@@ -1278,16 +1357,16 @@ partial class Irgen {
         string cn = cls.sval;
         H("define void @" + cn + "_dtor(i8* %p) {");
         H("  %o = bitcast i8* %p to %" + cn + "*");
-        List<string> names = new List<string>();
-        List<Node> types = new List<Node>();
-        CollectFields(cls, names, types);
+        List<ClassFieldEntry> fields = new List<ClassFieldEntry>();
+        CollectFields(cls, fields);
         int fb = FieldBase(cls);
         int i = 0;
         int seq = 0;
-        while (i < names.Count) {
-            if (ArcManaged(types[i]) && !WeakTy(types[i])) {
+        while (i < fields.Count) {
+            Node fty = fields[i].type;
+            if (ArcManaged(fty) && !WeakTy(fty)) {
                 int idx = fb + i;
-                string lt = MapType(types[i]);
+                string lt = MapType(fty);
                 string fp = "%f" + seq;
                 string fv = "%v" + seq;
                 H("  " + fp + " = getelementptr %" + cn + ", %" + cn + "* %o, i32 0, i32 " + idx);
@@ -2009,28 +2088,26 @@ partial class Irgen {
     void StartFn() {
         tmp = 0; lbl = 0; term = false;
         curLbl = "entry";
+        locals = new List<LocalBinding>();
         locName = new List<string>();
         locType = new List<Node>();
         locReg = new List<string>();
         locSeq = 0;
-        stmtTemps = new List<string>();
-        stmtTempTypes = new List<Node>();
+        stmtTemps = new List<StmtTempEntry>();
         loopScopeBase = 0;
-        gotoNames = new List<string>();
-        gotoIds = new List<int>();
+        gotoLabels = new List<GotoLabelEntry>();
     }
 
     // Resolve a goto label name to a stable per-function label id, allocating
     // one on first use so forward references (goto before label) work.
     int LabelId(string name) {
         int i = 0;
-        while (i < gotoNames.Count) {
-            if (gotoNames[i] == name) { return gotoIds[i]; }
+        while (i < gotoLabels.Count) {
+            if (gotoLabels[i].name == name) { return gotoLabels[i].id; }
             i = i + 1;
         }
         int id = NL();
-        gotoNames.Add(name);
-        gotoIds.Add(id);
+        gotoLabels.Add(new GotoLabelEntry(name, id));
         return id;
     }
 

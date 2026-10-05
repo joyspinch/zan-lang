@@ -25,36 +25,43 @@ namespace Gui;
 ///   · 所有图标均为 24x24 viewBox,IconSvg 据此包装 SVG 文档;
 ///   · body 里的双引号改写为单引号,避免 JSON/Zan 字面量转义;
 ///   · body 保留 currentColor 占位,颜色由 IconSvg 在绘制时替换。
+/// 图标 SVG 条目实体（消除 names / bodies 平行列表反模式）。
+class IconSvgItem {
+    string name;
+    string body;
+
+    IconSvgItem(string name, string body) {
+        this.name = name;
+        this.body = body;
+    }
+}
+
 class IconSvgData {
-    static List<string> names;
-    static List<string> bodies;
+    static List<IconSvgItem> items;
 
     /// 惰性建表：首次访问时按发现顺序合并全部 JSON 包并按名排序；
     /// 无任何包可读时也建立空表，行为与“未知图标名”一致。
     static void Ensure() {
-        if (names != null) { return; }
+        if (items != null) { return; }
         // 主包:内置 tabler.json(可被用户包覆盖/扩充后的合并结果替代)。
         List<string> pkgs = IconSvgData.Packages();
-        List<string> n = new List<string>();
-        List<string> b = new List<string>();
+        List<IconSvgItem> list = new List<IconSvgItem>();
         for (int i = 0; i < pkgs.Count; i = i + 1) {
-            IconSvgData.Merge(n, b, pkgs[i]);
+            IconSvgData.Merge(list, pkgs[i]);
         }
-        if (n.Count == 0) {
+        if (list.Count == 0) {
             // 没有任何包可读时也要保证调用方拿到空表而非 null,
             // IndexOf 恒 -1、Draw 静默跳过,行为与"未知图标名"一致。
-            names = n;
-            bodies = b;
+            items = list;
             return;
         }
-        IconSvgData.SortByNames(n, b);
-        names = n;
-        bodies = b;
+        IconSvgData.SortByNames(list);
+        items = list;
     }
 
-    /// 有序合并一份 JSON 包到 (names, bodies):先二分定位覆盖同名项,
+    /// 有序合并一份 JSON 包到 items:先二分定位覆盖同名项,
     /// 再按序插入新项,调用方最后统一排序由本函数增量维护。
-    static void Merge(List<string> names, List<string> bodies, string json) {
+    static void Merge(List<IconSvgItem> list, string json) {
         if (json == null || json.Length == 0) { return; }
         JsonValue v = JsonValue.ParseLenient(json);
         if (v == null || v.kind != 5) { return; }
@@ -66,20 +73,19 @@ class IconSvgData {
             string body = item.strVal;
             if (body == null || body.Length == 0) { continue; }
             int lo = 0;
-            int hi = names.Count - 1;
+            int hi = list.Count - 1;
             int at = -1;
             while (lo <= hi) {
                 int mid = (lo + hi) / 2;
-                int cmp = keys[i].CompareTo(names[mid]);
+                int cmp = keys[i].CompareTo(list[mid].name);
                 if (cmp == 0) { at = mid; break; }
                 if (cmp < 0) { hi = mid - 1; } else { lo = mid + 1; }
             }
             if (at >= 0) {
-                bodies[at] = body;
+                list[at].body = body;
                 continue;
             }
-            names.Insert(lo, keys[i]);
-            bodies.Insert(lo, body);
+            list.Insert(lo, new IconSvgItem(keys[i], body));
         }
     }
 
@@ -165,21 +171,18 @@ class IconSvgData {
         }
     }
 
-    /// (names, bodies) 按名称升序原地排序(插入排序:包内已经接近有序,
+    /// items 按名称升序原地排序(插入排序:包内已经接近有序,
     /// 合并场景位移量小;表规模 ~1k,构造期一次性成本可忽略)。
-    static void SortByNames(List<string> names, List<string> bodies) {
-        int n = names.Count;
+    static void SortByNames(List<IconSvgItem> list) {
+        int n = list.Count;
         for (int i = 1; i < n; i = i + 1) {
-            string kn = names[i];
-            string kb = bodies[i];
+            IconSvgItem item = list[i];
             int j = i - 1;
-            while (j >= 0 && names[j].CompareTo(kn) > 0) {
-                names[j + 1] = names[j];
-                bodies[j + 1] = bodies[j];
+            while (j >= 0 && list[j].name.CompareTo(item.name) > 0) {
+                list[j + 1] = list[j];
                 j = j - 1;
             }
-            names[j + 1] = kn;
-            bodies[j + 1] = kb;
+            list[j + 1] = item;
         }
     }
 
@@ -218,23 +221,27 @@ class IconSvgData {
     /// 表内图标个数。
     static int Count() {
         IconSvgData.Ensure();
-        return names.Count;
+        return items.Count;
     }
 
     /// 全部图标名(升序)。供画廊、文档工具枚举。
     static List<string> Names() {
         IconSvgData.Ensure();
-        return names;
+        List<string> res = new List<string>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            res.Add(items[i].name);
+        }
+        return res;
     }
 
     /// 二分查找图标名,未命中返回 -1。
     static int IndexOf(string name) {
         IconSvgData.Ensure();
         int lo = 0;
-        int hi = names.Count - 1;
+        int hi = items.Count - 1;
         while (lo <= hi) {
             int mid = (lo + hi) / 2;
-            int cmp = name.CompareTo(names[mid]);
+            int cmp = name.CompareTo(items[mid].name);
             if (cmp == 0) { return mid; }
             if (cmp < 0) { hi = mid - 1; }
             else { lo = mid + 1; }
@@ -245,6 +252,6 @@ class IconSvgData {
     /// 按下标取 SVG body(不含 <svg> 外壳)。
     static string Body(int index) {
         IconSvgData.Ensure();
-        return bodies[index];
+        return items[index].body;
     }
 }

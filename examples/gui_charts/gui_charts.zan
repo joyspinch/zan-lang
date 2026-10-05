@@ -46,6 +46,21 @@ class ChartsNavRow {
     }
 }
 
+/// <summary>
+/// 图表选项缓存槽位强类型实体（消除 optIds / optCache / optPending 平行列表反模式）。
+/// </summary>
+class ChartOptionCacheEntry {
+    public string id;
+    public ChartOption option;
+    public bool pending;
+
+    public ChartOptionCacheEntry(string id, ChartOption option, bool pending) {
+        this.id = id != null ? id : "";
+        this.option = option;
+        this.pending = pending;
+    }
+}
+
 partial class Charts {
     static App app;
     static SignalInt lang;
@@ -108,7 +123,7 @@ partial class Charts {
                         + cs.tree.Count + cs.links.Count + cs.regions.Count
                         + cs.events.Count + cs.geoLines.Count + cs.parRows.Count
                         + cs.matrix.Count;
-                    if (cs.riverVals.Count > 0) { pay = pay + 1; }
+                    if (cs.riverPoints.Count > 0) { pay = pay + 1; }
                     if (pay > 0) { withData = withData + 1; }
                     detail = detail + "[" + Convert.ToString(s2) + "]=" + Convert.ToString(pay) + " ";
                 }
@@ -579,18 +594,17 @@ partial class Charts {
             }
         }
         // 启动参数路径 SelectDemo 早于任何 Draw，缓存列表可能还没建。
-        if (Charts.optIds == null) {
-            Charts.optIds = new List<string>();
-            Charts.optCache = new List<ChartOption>();
+        if (Charts.optEntries == null) {
+            Charts.optEntries = new List<ChartOptionCacheEntry>();
         }
-        for (int i = 0; i < Charts.optIds.Count; i = i + 1) {
-            if (Charts.optIds[i] == "bump-chart") {
-                Charts.optCache[i] = o;
+        for (int i = 0; i < Charts.optEntries.Count; i = i + 1) {
+            if (Charts.optEntries[i].id == "bump-chart") {
+                Charts.optEntries[i].option = o;
+                Charts.optEntries[i].pending = false;
                 return;
             }
         }
-        Charts.optIds.Add("bump-chart");
-        Charts.optCache.Add(o);
+        Charts.optEntries.Add(new ChartOptionCacheEntry("bump-chart", o, false));
     }
 
     static void RenderPreview(App app, Canvas c, Theme t, Rect area, int sw) {
@@ -770,19 +784,15 @@ partial class Charts {
     // ---- option 缓存 + 地图注册 ------------------------------------
     // FromJson 不是免费的（world.json 解析 + BindSeries 几何克隆），
     // 每帧重复会卡顿；ChartOption 交互态全部在 app.State（按 iwid），
-    // option 本体跨帧复用安全。
-    static List<string> optIds;
-    static List<ChartOption> optCache;
-    static List<bool> optPending;
+    // option 本体跨帧复用安全。使用 ChartOptionCacheEntry 强类型实体消除平行列表。
+    static List<ChartOptionCacheEntry> optEntries;
 
     static ChartOption OptionOf(string id) {
-        if (Charts.optIds == null) {
-            Charts.optIds = new List<string>();
-            Charts.optCache = new List<ChartOption>();
-            Charts.optPending = new List<bool>();
+        if (Charts.optEntries == null) {
+            Charts.optEntries = new List<ChartOptionCacheEntry>();
         }
-        for (int i = 0; i < Charts.optIds.Count; i = i + 1) {
-            if (Charts.optIds[i] == id) { return Charts.optCache[i]; }
+        for (int i = 0; i < Charts.optEntries.Count; i = i + 1) {
+            if (Charts.optEntries[i].id == id) { return Charts.optEntries[i].option; }
         }
         // 未内置例（registry ready=false，无 JSON）保持同步空态；
         // 可渲染例走后台装载——UI 线程 FromJson 会卡住交互（geo-svg
@@ -795,18 +805,18 @@ partial class Charts {
                 break;
             }
         }
-        Charts.optIds.Add(id);
-        Charts.optCache.Add(null);
+        ChartOptionCacheEntry entry = new ChartOptionCacheEntry(id, null, false);
+        Charts.optEntries.Add(entry);
+        int slot = Charts.optEntries.Count - 1;
         if (!ready || Charts.nomouse) {
             string src0 = Skin.EmbedRead("options/" + id + ".json");
-            Charts.optCache[Charts.optCache.Count - 1]
-                = src0 == "" ? null : ChartOption.FromJson(src0);
-            Charts.optPending.Add(false);
+            entry.option = src0 == "" ? null : ChartOption.FromJson(src0);
+            entry.pending = false;
         } else {
-            Charts.optPending.Add(true);
-            Charts.KickLoad(id, Charts.optCache.Count - 1);
+            entry.pending = true;
+            Charts.KickLoad(id, slot);
         }
-        return Charts.optCache[Charts.optCache.Count - 1];
+        return entry.option;
     }
 
     /// 后台装载（DataTable.HttpSource / ImageHttp 同款定式）：worker
@@ -818,20 +828,20 @@ partial class Charts {
             string src = Skin.EmbedRead("options/" + id + ".json");
             ChartOption o = src == "" ? null : ChartOption.FromJson(src);
             Charts.app.Post(() => {
-                if (slot < Charts.optCache.Count
-                    && Charts.optIds[slot] == id) {
-                    Charts.optCache[slot] = o;
-                    Charts.optPending[slot] = false;
+                if (slot < Charts.optEntries.Count
+                    && Charts.optEntries[slot].id == id) {
+                    Charts.optEntries[slot].option = o;
+                    Charts.optEntries[slot].pending = false;
                 }
             });
         });
     }
 
     static bool IsPending(string id) {
-        if (Charts.optIds == null) { return false; }
-        for (int i = 0; i < Charts.optIds.Count; i = i + 1) {
-            if (Charts.optIds[i] == id) {
-                return i < Charts.optPending.Count && Charts.optPending[i];
+        if (Charts.optEntries == null) { return false; }
+        for (int i = 0; i < Charts.optEntries.Count; i = i + 1) {
+            if (Charts.optEntries[i].id == id) {
+                return Charts.optEntries[i].pending;
             }
         }
         return false;

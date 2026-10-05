@@ -17,9 +17,8 @@ partial class PlanStrip {
     bool clearWanted;
     /// 绑上去的那份「本轮改动文件」（同样只在换了另一份时重绑）。显示的是
     /// 「路径 +增 -删」那一行，双击要打开的却是路径，所以路径单独留一份
-    /// （同下标）。
-    List<string> boundFiles;
-    List<string> filePaths;
+    /// 记住当前绑定的改动实体列表（消除 boundFiles / filePaths 平行列表反模式）。
+    List<AiFileChange> boundChanges;
     /// 改动文件清单是否收起（默认收起：多数时候只想知道改了几个）。
     bool filesCollapsed;
     /// 本帧用户双击了某个改动文件，外壳取走去打开它。
@@ -30,8 +29,7 @@ partial class PlanStrip {
         bound = null;
         collapsed = false;
         clearWanted = false;
-        boundFiles = null;
-        filePaths = null;
+        boundChanges = null;
         filesCollapsed = true;
         openWanted = "";
         PlanStrip.current = this;
@@ -46,8 +44,10 @@ partial class PlanStrip {
 
     /// 改动文件清单的一行：路径后面跟这一轮的 `+增 -删`（行数未知时只有
     /// 路径），双击那一行由列表的 Activate 事件打开文件。
-    static Control FileRowOf(string label) {
-        Label lbl = new Label(label);
+    static Control FileRowOf(AiFileChange change) {
+        string text = "";
+        if (change != null) { text = change.Label(); }
+        Label lbl = new Label(text);
         lbl.Class = "ai-file secondary";
         return lbl;
     }
@@ -62,14 +62,15 @@ partial class PlanStrip {
     static void FileActivated() {
         PlanStrip p = PlanStrip.current;
         if (p == null || !p.Files.HasSelection()) { return; }
-        // 显示的那一行带着 +增 -删，能打开的只有路径本身。
-        p.openWanted = p.PathAt(p.Files.SelectedIndex());
+        // 从选中的改动实体获取真实文件路径。
+        AiFileChange ch = p.ChangeAt(p.Files.SelectedIndex());
+        if (ch != null) { p.openWanted = ch.path; }
     }
 
-    string PathAt(int i) {
-        if (filePaths == null) { return ""; }
-        if (i < 0 || i >= filePaths.Count) { return ""; }
-        return filePaths[i];
+    AiFileChange ChangeAt(int i) {
+        if (boundChanges == null) { return null; }
+        if (i < 0 || i >= boundChanges.Count) { return null; }
+        return boundChanges[i];
     }
 
     /// 本帧用户要打开的改动文件（取走后清空，"" = 没有）。
@@ -79,25 +80,19 @@ partial class PlanStrip {
         return p;
     }
 
-    /// 本轮改动过的文件（没有交付记录时是空列表，绝不返回 null）。
-    static List<string> FilesOf(AiRun run) {
-        if (run == null) { return new List<string>(); }
-        return run.changedLabels;
-    }
-
-    /// 同一份清单对应的路径（同下标）。
-    static List<string> PathsOf(AiRun run) {
-        if (run == null) { return new List<string>(); }
-        return run.ChangedPaths();
+    /// 本轮改动过的文件变更实体列表（没有交付记录时是空列表，绝不返回 null）。
+    static List<AiFileChange> ChangesOf(AiRun run) {
+        if (run == null || run.changes == null) { return new List<AiFileChange>(); }
+        return run.changes;
     }
 
     /// 改动文件那两块要占多高：一行表头，展开时再加清单（至多六行）。
     int FilesHeight(App app, AiRun run) {
-        List<string> files = PlanStrip.FilesOf(run);
-        if (files.Count == 0) { return 0; }
+        List<AiFileChange> changes = PlanStrip.ChangesOf(run);
+        if (changes.Count == 0) { return 0; }
         int hdr = app.Scale(22);
         if (filesCollapsed) { return hdr; }
-        int rows = files.Count;
+        int rows = changes.Count;
         if (rows > 6) { rows = 6; }
         return hdr + rows * app.Scale(20) + app.Scale(4);
     }
@@ -155,9 +150,9 @@ partial class PlanStrip {
         if (runH > 0) { this.Run.Sync(run, tasks, curTask); }
 
         // 「这轮改了哪些文件」：改动是状态机在每次 write_file / edit_file
-        // 时记下的（AiRun.changedFiles），这里只把它显示出来。
-        List<string> files = PlanStrip.FilesOf(run);
-        bool hasFiles = files.Count > 0;
+        // 时记下的（AiRun.changes），这里只把它显示出来。
+        List<AiFileChange> changes = PlanStrip.ChangesOf(run);
+        bool hasFiles = changes.Count > 0;
         this.FilesHead.SetShown(hasFiles);
         this.Files.SetShown(hasFiles && !filesCollapsed);
         if (hasFiles) {
@@ -165,7 +160,7 @@ partial class PlanStrip {
             if (filesCollapsed) { fcaret = "> "; }
             string ftxt = fcaret
                 + ZanIDE.T("Files changed ", "本轮改动文件 ")
-                + Convert.ToString(files.Count);
+                + Convert.ToString(changes.Count);
             int fadds = run.TotalAdds();
             int fdels = run.TotalDels();
             if (fadds > 0 || fdels > 0) {
@@ -173,10 +168,9 @@ partial class PlanStrip {
                     + " -" + Convert.ToString(fdels);
             }
             this.FilesBtn.Text = ftxt;
-            filePaths = PlanStrip.PathsOf(run);
-            if (boundFiles != files) {
-                this.Files.Bind(files);
-                boundFiles = files;
+            if (boundChanges != changes) {
+                this.Files.Bind(changes);
+                boundChanges = changes;
             }
             this.Files.Refresh();
             int fh = 0;

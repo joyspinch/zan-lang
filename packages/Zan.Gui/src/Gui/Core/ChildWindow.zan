@@ -37,6 +37,50 @@ delegate bool ChildWindowStop();
 /// that detects user edits lives HERE, not on Control — it is a runtime
 /// cache of this render loop, not a declaration. This is the dialog
 /// "state entity" string channel; in-code realtime binding goes through
+/// <summary>控件属性绑定快照实体（消除 boundKeys/boundSnaps 平行列表反模式）。</summary>
+class ChildBoundSnapshot {
+    public Control control;
+    public string snapshot;
+
+    ChildBoundSnapshot(Control control, string snapshot) {
+        this.control = control;
+        this.snapshot = snapshot;
+    }
+}
+
+/// <summary>模板原型展开元数据实体（消除 tmplKeys/tmplCounts 平行列表反模式）。</summary>
+class ChildTemplateMeta {
+    public Control template;
+    public int lastCount;
+
+    ChildTemplateMeta(Control template, int lastCount) {
+        this.template = template;
+        this.lastCount = lastCount;
+    }
+}
+
+/// <summary>展开行与归属模板关联实体（消除 rowRoots/rowTmpl 平行列表反模式）。</summary>
+class ChildExpandedRow {
+    public Control rowRoot;
+    public Control template;
+
+    ChildExpandedRow(Control rowRoot, Control template) {
+        this.rowRoot = rowRoot;
+        this.template = template;
+    }
+}
+
+/// <summary>行内控件绑定作用域实体（消除 scopeKeys/scopeVals 平行列表反模式）。</summary>
+class ChildScopeBinding {
+    public Control control;
+    public JsonValue item;
+
+    ChildScopeBinding(Control control, JsonValue item) {
+        this.control = control;
+        this.item = item;
+    }
+}
+
 /// `Binding<T>` (System/Binding.zan, stdlib standards §6.1).
 class ChildWindow {
     App host;
@@ -47,25 +91,15 @@ class ChildWindow {
     bool destroyed;
     int idBase;
     Action renderCb;
-    /// 绑定快照旁表（`Control.bindSnapshot` 已拆除）：SyncFromNode
-    /// 记录"模型侧确认的控件值"，SyncChangedNode 据此判断用户是否
-    /// 编辑过。按控件引用线性查找——对话框的绑定控件是个位数到
-    /// 几十个，每帧的引用比较是纳秒级。树上移除的控件残留条目
-    /// 永不命中（键是引用），随窗口生命周期一并释放。
-    List<Control> boundKeys;
-    List<string> boundSnaps;
-    /// `<template data-for>` 展开登记（平行列表，按模板控件引用线性
-    /// 查找——与 boundKeys 同一 house pattern）：tmplKeys = 模板原型
-    /// 控件，tmplCounts = 上帧源数组长度（变化才重建行），rowRoots =
-    /// 已展开的行根（原型子项的克隆，插在模板紧后），rowTmpl = 行
-    /// 归属的模板。scopeKeys/scopeVals = 行内绑定作用域（行内声明了
-    /// bind/bindIf 的控件 → 本项 JsonValue；项内命中优先，回落根模型）。
-    List<Control> tmplKeys;
-    List<int> tmplCounts;
-    List<Control> rowRoots;
-    List<Control> rowTmpl;
-    List<Control> scopeKeys;
-    List<JsonValue> scopeVals;
+    /// 绑定快照旁表：SyncFromNode 记录"模型侧确认的控件值"，
+    /// SyncChangedNode 据此判断用户是否编辑过。
+    List<ChildBoundSnapshot> boundSnapshots;
+    /// `<template data-for>` 原型展开状态列表。
+    List<ChildTemplateMeta> tmplMetas;
+    /// 已展开的行根（原型子项克隆）及其归属模板。
+    List<ChildExpandedRow> expandedRows;
+    /// 行内绑定作用域（行内声明了 bind/bindIf 的控件 → 本项 JsonValue）。
+    List<ChildScopeBinding> scopeBindings;
 
     /// 构造：全部字段置空/默认（idBase 基线 900000）。
     ChildWindow() {
@@ -77,14 +111,10 @@ class ChildWindow {
         destroyed = false;
         idBase = 900000;
         renderCb = null;
-        boundKeys = null;
-        boundSnaps = null;
-        tmplKeys = null;
-        tmplCounts = null;
-        rowRoots = null;
-        rowTmpl = null;
-        scopeKeys = null;
-        scopeVals = null;
+        boundSnapshots = null;
+        tmplMetas = null;
+        expandedRows = null;
+        scopeBindings = null;
     }
 
     /// OS window caption.
@@ -275,23 +305,26 @@ class ChildWindow {
     /// 记录（或更新）控件绑定属性的模型侧确认值——上次由模型
     /// 写入/确认时 `BoundValue` 的读数，作为"用户是否编辑过"的基准。
     void RecordSnapshot(Control c, string v) {
-        if (boundKeys == null) {
-            boundKeys = new List<Control>();
-            boundSnaps = new List<string>();
+        if (boundSnapshots == null) {
+            boundSnapshots = new List<ChildBoundSnapshot>();
         }
-        for (int i = 0; i < boundKeys.Count; i = i + 1) {
-            if (boundKeys[i] == c) { boundSnaps[i] = v; return; }
+        for (int i = 0; i < boundSnapshots.Count; i = i + 1) {
+            if (boundSnapshots[i].control == c) {
+                boundSnapshots[i].snapshot = v;
+                return;
+            }
         }
-        boundKeys.Add(c);
-        boundSnaps.Add(v);
+        boundSnapshots.Add(new ChildBoundSnapshot(c, v));
     }
 
     /// 控件的上一次模型侧确认值；从未记录（新绑定控件首次回写
     /// 前的防御路径）按被拆字段的原初始值语义返回 ""。
     string SnapshotOf(Control c) {
-        if (boundKeys == null) { return ""; }
-        for (int i = 0; i < boundKeys.Count; i = i + 1) {
-            if (boundKeys[i] == c) { return boundSnaps[i]; }
+        if (boundSnapshots == null) { return ""; }
+        for (int i = 0; i < boundSnapshots.Count; i = i + 1) {
+            if (boundSnapshots[i].control == c) {
+                return boundSnapshots[i].snapshot;
+            }
         }
         return "";
     }
@@ -343,17 +376,15 @@ class ChildWindow {
     /// SyncFromModel。
     void RegisterTemplates(Control c) {
         if (c.Kind() == "template") {
-            if (tmplKeys == null) {
-                tmplKeys = new List<Control>();
-                tmplCounts = new List<int>();
+            if (tmplMetas == null) {
+                tmplMetas = new List<ChildTemplateMeta>();
             }
             bool known = false;
-            for (int i = 0; i < tmplKeys.Count; i = i + 1) {
-                if (tmplKeys[i] == c) { known = true; break; }
+            for (int i = 0; i < tmplMetas.Count; i = i + 1) {
+                if (tmplMetas[i].template == c) { known = true; break; }
             }
             if (!known) {
-                tmplKeys.Add(c);
-                tmplCounts.Add(0 - 1);  // 强制首帧展开
+                tmplMetas.Add(new ChildTemplateMeta(c, 0 - 1));  // 强制首帧展开
             }
             return;
         }
@@ -365,16 +396,16 @@ class ChildWindow {
     /// 每帧核对各模板的源数组长度；与上帧一致就什么都不做（行是活
     /// 控件，绑定照常同步），变了才整组重建。
     void EnsureExpanded() {
-        if (tmplKeys == null) { return; }
-        for (int i = 0; i < tmplKeys.Count; i = i + 1) {
-            Control t = tmplKeys[i];
+        if (tmplMetas == null) { return; }
+        for (int i = 0; i < tmplMetas.Count; i = i + 1) {
+            Control t = tmplMetas[i].template;
             string path = t.CssAttr("data-for");
             if (path == "" || t.children.Count == 0) { continue; }
             JsonValue arr = model.PathGet(path);
             int n = (arr != null && arr.IsArray()) ? arr.Count() : 0;
-            if (tmplCounts[i] == n) { continue; }
+            if (tmplMetas[i].lastCount == n) { continue; }
             this.RemoveRows(t);
-            tmplCounts[i] = n;
+            tmplMetas[i].lastCount = n;
             if (n == 0) { continue; }
             Control p = t.parent;
             if (p == null) { continue; }
@@ -390,12 +421,10 @@ class ChildWindow {
                     cur = cur + 1;
                     WireNode(row);
                     this.ScopeRow(row, item);
-                    if (rowRoots == null) {
-                        rowRoots = new List<Control>();
-                        rowTmpl = new List<Control>();
+                    if (expandedRows == null) {
+                        expandedRows = new List<ChildExpandedRow>();
                     }
-                    rowRoots.Add(row);
-                    rowTmpl.Add(t);
+                    expandedRows.Add(new ChildExpandedRow(row, t));
                 }
             }
         }
@@ -404,14 +433,13 @@ class ChildWindow {
     /// 撤除模板 `t` 的全部行（数组重建前调）：从各自的父节点摘下
     /// 并清掉行内控件的作用域登记。
     void RemoveRows(Control t) {
-        if (rowRoots == null) { return; }
-        for (int i = rowRoots.Count - 1; i >= 0; i = i - 1) {
-            if (rowTmpl[i] != t) { continue; }
-            Control row = rowRoots[i];
+        if (expandedRows == null) { return; }
+        for (int i = expandedRows.Count - 1; i >= 0; i = i - 1) {
+            if (expandedRows[i].template != t) { continue; }
+            Control row = expandedRows[i].rowRoot;
             this.DetachRow(row);
             this.ScopeDropRow(row);
-            rowRoots.RemoveAt(i);
-            rowTmpl.RemoveAt(i);
+            expandedRows.RemoveAt(i);
         }
     }
 
@@ -438,22 +466,25 @@ class ChildWindow {
     }
 
     void ScopePut(Control c, JsonValue item) {
-        if (scopeKeys == null) {
-            scopeKeys = new List<Control>();
-            scopeVals = new List<JsonValue>();
+        if (scopeBindings == null) {
+            scopeBindings = new List<ChildScopeBinding>();
         }
-        for (int i = 0; i < scopeKeys.Count; i = i + 1) {
-            if (scopeKeys[i] == c) { scopeVals[i] = item; return; }
+        for (int i = 0; i < scopeBindings.Count; i = i + 1) {
+            if (scopeBindings[i].control == c) {
+                scopeBindings[i].item = item;
+                return;
+            }
         }
-        scopeKeys.Add(c);
-        scopeVals.Add(item);
+        scopeBindings.Add(new ChildScopeBinding(c, item));
     }
 
     /// 控件的行作用域；不在任何行里返回 null。
     JsonValue ScopeOf(Control c) {
-        if (scopeKeys == null) { return null; }
-        for (int i = 0; i < scopeKeys.Count; i = i + 1) {
-            if (scopeKeys[i] == c) { return scopeVals[i]; }
+        if (scopeBindings == null) { return null; }
+        for (int i = 0; i < scopeBindings.Count; i = i + 1) {
+            if (scopeBindings[i].control == c) {
+                return scopeBindings[i].item;
+            }
         }
         return null;
     }
@@ -469,20 +500,16 @@ class ChildWindow {
     }
 
     void ScopeDropOne(Control c) {
-        if (scopeKeys == null) { return; }
+        if (scopeBindings == null) { return; }
         int keep = 0;
-        for (int i = 0; i < scopeKeys.Count; i = i + 1) {
-            if (scopeKeys[i] == c) { continue; }
-            scopeKeys[keep] = scopeKeys[i];
-            scopeVals[keep] = scopeVals[i];
+        for (int i = 0; i < scopeBindings.Count; i = i + 1) {
+            if (scopeBindings[i].control == c) { continue; }
+            scopeBindings[keep] = scopeBindings[i];
             keep = keep + 1;
         }
-        if (keep == scopeKeys.Count) { return; }
-        while (scopeKeys.Count > keep) {
-            scopeKeys.RemoveAt(scopeKeys.Count - 1);
-        }
-        while (scopeVals.Count > keep) {
-            scopeVals.RemoveAt(scopeVals.Count - 1);
+        if (keep == scopeBindings.Count) { return; }
+        while (scopeBindings.Count > keep) {
+            scopeBindings.RemoveAt(scopeBindings.Count - 1);
         }
     }
 

@@ -21,6 +21,90 @@ delegate int SetProcessDpiAwarenessFn(int level);
 /// 系统 DPI 感知回退。
 delegate int SetProcessDpiAwareFn();
 
+/// <summary>窗口表面绑定条目实体（消除 surfHwnd 与 surfId 平行列表反模式）。</summary>
+class Win32SurfaceBinding {
+    public nint hwnd;
+    public int surfaceId;
+
+    public Win32SurfaceBinding(nint hwnd, int surfaceId) {
+        this.hwnd = hwnd;
+        this.surfaceId = surfaceId;
+    }
+}
+
+/// <summary>窗口标题栏系统按钮与客户区保护带配置（消除 capHwnd/capCount 与 zoneHwnd/zoneWidth 平行列表）。</summary>
+class Win32CaptionConfig {
+    public nint hwnd;
+    public int capCount;
+    public int zoneWidth;
+
+    public Win32CaptionConfig(nint hwnd, int capCount, int zoneWidth) {
+        this.hwnd = hwnd;
+        this.capCount = capCount;
+        this.zoneWidth = zoneWidth;
+    }
+}
+
+/// <summary>客户端优先命中测试条目实体（消除 hitGuards 与 hitGuardWins 平行列表反模式）。</summary>
+class Win32HitGuardEntry {
+    public nint hwnd;
+    public int x;
+    public int y;
+    public int w;
+    public int h;
+
+    public Win32HitGuardEntry(nint hwnd, int x, int y, int w, int h) {
+        this.hwnd = hwnd;
+        this.x = x;
+        this.y = y;
+        this.w = w;
+        this.h = h;
+    }
+}
+
+/// <summary>Win32 窗口事件队列条目实体（消除 injectQ/injectHwnd 与 postQ/postHwnd 平行队列与扁平六元组展开反模式）。</summary>
+class Win32QueuedEvent {
+    public nint hwnd;
+    public int kind;
+    public int x;
+    public int y;
+    public int button;
+    public int keycode;
+    public int mods;
+
+    public Win32QueuedEvent(nint hwnd, int kind, int x, int y, int button, int keycode, int mods) {
+        this.hwnd = hwnd;
+        this.kind = kind;
+        this.x = x;
+        this.y = y;
+        this.button = button;
+        this.keycode = keycode;
+        this.mods = mods;
+    }
+}
+
+/// <summary>
+/// Win32 异形窗口轮廓区域实体（消除扁平六元组 shapeRegions 整数列表反模式）。
+/// type: 1 = 圆角矩形, 2 = 椭圆, 3 = 阴影带（仅用于分层外扩）
+/// </summary>
+class Win32ShapeRegion {
+    public int kind;
+    public int x;
+    public int y;
+    public int w;
+    public int h;
+    public int r;
+
+    public Win32ShapeRegion(int k, int x, int y, int w, int h, int r) {
+        this.kind = k;
+        this.x = x;
+        this.y = y;
+        this.w = w;
+        this.h = h;
+        this.r = r;
+    }
+}
+
 /// <summary>
 /// Windows 窗口外壳——类注册、窗口过程、
 /// 事件队列、DIB 呈现、亚克力玻璃、IME 定位、剪贴板
@@ -305,13 +389,8 @@ class Win32Shell {
     // 应用据此区分"新事件"与"陈旧回读"——点击的帧绑定只能
     // 由新事件解除，否则一次释放会被每一帧当成新点击。
     static long evSeq;
-    // 窗口过程投递的事件队列（kind,x,y,button,keycode,mods 六元组 +
-    // 平行的 hwnd 列表）。事件不能只存一个槽位：嵌套的消息泵——原生
-    // 子窗口（CEF/WebView 的 Chromium 视图）在一帧里被驱动时，
-    // cef_do_message_loop_work 会顺手把线程队列里的 WM_CHAR/WM_KEYDOWN
-    // 分发给我们的窗口过程——会在应用取走之前覆盖掉槽位，按键就凭空丢了。
-    static List<int> postQ;
-    static List<nint> postHwnd;
+    // 窗口过程投递的事件队列，使用 Win32QueuedEvent 实体消除 postQ/postHwnd 平行列表。
+    static List<Win32QueuedEvent> postEvents;
 
     static int windowWidth;
     static int windowHeight;
@@ -321,14 +400,9 @@ class Win32Shell {
     static int dpi;
     static int titlebarH;
     static int buttonW;
-    // 每个窗口在标题栏右侧保留的客户端绘制标题按钮数，
-    // 按 hwnd 记录：只有一个关闭按钮的对话框不能
-    // 缩小（或加宽）父级预留的条带，否则父级自身的
-    // 系统按钮在子窗口打开的瞬间就不再作为客户区参与命中测试。
-    static List<nint> capHwnd;
-    static List<int> capCount;
-    static List<nint> zoneHwnd;
-    static List<int> zoneWidth;
+    // 每个窗口在标题栏右侧保留的客户端绘制标题按钮数与保护带，
+    // 使用 Win32CaptionConfig 强类型实体统一管理，消除 capHwnd/capCount 与 zoneHwnd/zoneWidth 平行列表。
+    static List<Win32CaptionConfig> captionConfigs;
     // 不可调整大小的窗口（设计里的 resizable = false）。外壳是无
     // 边框的，尺寸手柄全靠 WM_NCHITTEST 给出，所以“不能拉”
     // 就是不再把边缘报成手柄，并挡住双击标题栏 / 最大化。
@@ -344,14 +418,14 @@ class Win32Shell {
     static bool glassOn;
     static int glassTint;
     // 异形窗口模式：0 = 矩形，1 = 异形。异形窗口的
-    // 轮廓是 shapeRegions 的并集（type,x,y,w,h,r 六元组，
-    // 逻辑像素：type 1 = 圆角矩形，type 2 = 椭圆）。
+    // 轮廓是 shapeRegionList 的并集（Win32ShapeRegion 实体，
+    // 逻辑像素：kind 1 = 圆角矩形，kind 2 = 椭圆，kind 3 = 阴影带）。
     // DWM 合成开启（含 Windows 7）时以逐像素 alpha 合成
     // （WS_EX_LAYERED + UpdateLayeredWindow）实现，
     // DWM 关闭时用合并的 SetWindowRgn，因此即使 Win7
     // 没有 DWM 也能工作。所有区域之外的像素点击穿透。
     static int shapeMode;
-    static List<int> shapeRegions;
+    static List<Win32ShapeRegion> shapeRegionList;
     static int winOpacityPercent;
     static bool hasShadowBand;
     // 分层路径缓存的逐像素覆盖掩码（0..255，直通
@@ -361,10 +435,8 @@ class Win32Shell {
     static int shapeMaskH;
     static int shapeMaskGen;
 
-    // 每窗口最近呈现的表面，使 WM_PAINT 重绘属于
-    // *本*窗口的帧，而非最后呈现的那个窗口的帧。
-    static List<nint> surfHwnd;
-    static List<int> surfId;
+    // 每窗口最近呈现的表面（使用 Win32SurfaceBinding 强类型实体消除 surfHwnd/surfId 平行列表）。
+    static List<Win32SurfaceBinding> surfaceBindings;
     static int lastSurface;
 
     // 为下一次呈现声明的脏矩形（x, y, w, h 四元组）。列表是一份，
@@ -395,10 +467,8 @@ class Win32Shell {
     static bool forceFullUpload;
     static nint forceFullHwnd;
 
-    // 自动化驱动排队的合成事件，由临界区
-    // 保护：驱动线程可能在 UI 线程排空时入队。
-    static List<int> injectQ;
-    static List<nint> injectHwnd;
+    // 自动化驱动排队的合成事件，由临界区保护，使用 Win32QueuedEvent 实体消除 injectQ/injectHwnd 平行队列。
+    static List<Win32QueuedEvent> injectEvents;
     static nint injectCs;
 
     // 缓存的分层窗口呈现表面（玻璃），尺寸变化时重建。
@@ -409,13 +479,8 @@ class Win32Shell {
     static int lwW;
     static int lwH;
 
-    // 客户端优先条带（客户端坐标，四元组：x, y, w, h）。
-    // 应用将控件紧贴边框绘制——滚动条就位于最后
-    // 几像素——其上的细边缘手柄会吞掉每个
-    // 发给它的按下。此处注册的条带使边缘手柄让位；
-    // 角手柄仍优先，保证对角缩放可操作。
-    static List<int> hitGuards;
-    static List<nint> hitGuardWins;
+    // 客户端优先条带（使用 Win32HitGuardEntry 强类型实体消除 hitGuards/hitGuardWins 平行列表反模式）。
+    static List<Win32HitGuardEntry> hitGuardEntries;
 
     static nint scratchRect;
     static nint scratchRects;
@@ -440,26 +505,19 @@ class Win32Shell {
         // 均无需同等处理。GUI 进程空闲时本就阻塞等事件，不空转，
         // 1ms 时钟中断的功耗代价可接受（Chrome/SDL 同款取舍）。
         Win32Shell.TimeBeginPeriod(1);
-        Win32Shell.capHwnd = new List<nint>();
-        Win32Shell.capCount = new List<int>();
-        Win32Shell.zoneHwnd = new List<nint>();
-        Win32Shell.zoneWidth = new List<int>();
+        Win32Shell.captionConfigs = new List<Win32CaptionConfig>();
         Win32Shell.fixedHwnd = new List<nint>();
         Win32Shell.dpi = 96;
         Win32Shell.titlebarH = 32;
         Win32Shell.buttonW = 46;
-        Win32Shell.surfHwnd = new List<nint>();
-        Win32Shell.surfId = new List<int>();
+        Win32Shell.surfaceBindings = new List<Win32SurfaceBinding>();
         Win32Shell.dirty = new List<int>();
         Win32Shell.dirtyHwnd = 0;
         Win32Shell.dirtyLost = new List<nint>();
         Win32Shell.presentLog = Win32Shell.getenv("ZAN_PRESENT_LOG") != "";
-        Win32Shell.injectQ = new List<int>();
-        Win32Shell.injectHwnd = new List<nint>();
-        Win32Shell.postQ = new List<int>();
-        Win32Shell.postHwnd = new List<nint>();
-        Win32Shell.hitGuards = new List<int>();
-        Win32Shell.hitGuardWins = new List<nint>();
+        Win32Shell.injectEvents = new List<Win32QueuedEvent>();
+        Win32Shell.postEvents = new List<Win32QueuedEvent>();
+        Win32Shell.hitGuardEntries = new List<Win32HitGuardEntry>();
         Win32Shell.lastSurface = 0 - 1;
         Win32Shell.bgColor = 0;
         Win32Shell.winOpacityPercent = 100;
@@ -541,45 +599,40 @@ class Win32Shell {
     /// 因此子窗口一旦存在，父级点击就被当作"不是我的"丢弃。
     static void Post(nint hwnd, int kind, int x, int y, int button, int keycode,
                      int mods) {
-        if (Win32Shell.postQ == null) {
-            Win32Shell.postQ = new List<int>();
-            Win32Shell.postHwnd = new List<nint>();
+        if (Win32Shell.postEvents == null) {
+            Win32Shell.postEvents = new List<Win32QueuedEvent>();
         }
-        int n = Win32Shell.postHwnd.Count;
+        int n = Win32Shell.postEvents.Count;
         // 鼠标移动（kind 1）只有最新位置有意义：与队尾的移动合并，
         // 免得一次嵌套泵攒出几十帧的陈旧轨迹。
-        if (kind == 1 && n > 0 && Win32Shell.postQ[(n - 1) * 6] == 1
-            && Win32Shell.postHwnd[n - 1] == hwnd) {
-            Win32Shell.postQ[(n - 1) * 6 + 1] = x;
-            Win32Shell.postQ[(n - 1) * 6 + 2] = y;
-            Win32Shell.postQ[(n - 1) * 6 + 3] = button;
-            Win32Shell.postQ[(n - 1) * 6 + 4] = keycode;
-            Win32Shell.postQ[(n - 1) * 6 + 5] = mods;
-            return;
+        if (kind == 1 && n > 0) {
+            Win32QueuedEvent last = Win32Shell.postEvents[n - 1];
+            if (last.kind == 1 && last.hwnd == hwnd) {
+                last.x = x;
+                last.y = y;
+                last.button = button;
+                last.keycode = keycode;
+                last.mods = mods;
+                return;
+            }
         }
         // 鼠标滚轮（kind 13）高频到达时：同窗口同修饰键合并累加 delta 并更新位置，
         // 免得触控板平滑滚动或无级滚轮一瞬间产生几十帧排队重绘导致严重滞后与 CPU 飙满。
-        if (kind == 13 && n > 0 && Win32Shell.postQ[(n - 1) * 6] == 13
-            && Win32Shell.postHwnd[n - 1] == hwnd
-            && Win32Shell.postQ[(n - 1) * 6 + 5] == mods) {
-            Win32Shell.postQ[(n - 1) * 6 + 1] = x;
-            Win32Shell.postQ[(n - 1) * 6 + 2] = y;
-            Win32Shell.postQ[(n - 1) * 6 + 4] = Win32Shell.postQ[(n - 1) * 6 + 4] + keycode;
-            return;
+        if (kind == 13 && n > 0) {
+            Win32QueuedEvent last = Win32Shell.postEvents[n - 1];
+            if (last.kind == 13 && last.hwnd == hwnd && last.mods == mods) {
+                last.x = x;
+                last.y = y;
+                last.keycode = last.keycode + keycode;
+                return;
+            }
         }
         // 应用长时间不取（例如卡在一次很慢的绘制里）时丢最老的，
         // 队列有界优先于无限增长。
         if (n >= 512) {
-            for (int i = 0; i < 6; i = i + 1) { Win32Shell.postQ.RemoveAt(0); }
-            Win32Shell.postHwnd.RemoveAt(0);
+            Win32Shell.postEvents.RemoveAt(0);
         }
-        Win32Shell.postQ.Add(kind);
-        Win32Shell.postQ.Add(x);
-        Win32Shell.postQ.Add(y);
-        Win32Shell.postQ.Add(button);
-        Win32Shell.postQ.Add(keycode);
-        Win32Shell.postQ.Add(mods);
-        Win32Shell.postHwnd.Add(hwnd);
+        Win32Shell.postEvents.Add(new Win32QueuedEvent(hwnd, kind, x, y, button, keycode, mods));
     }
 
     /// 收集文件拖放的路径，并在
@@ -930,15 +983,13 @@ class Win32Shell {
     /// 条带行为与普通窗口一致。
     static int ShapeBandPx() {
         if (Win32Shell.shapeMode == 0) { return 0; }
-        List<int> regs = Win32Shell.shapeRegions;
-        if (regs == null || regs.Count < 12 || regs[0] != 3) { return 0; }
+        List<Win32ShapeRegion> regs = Win32Shell.shapeRegionList;
+        if (regs == null || regs.Count < 2 || regs[0].kind != 3) { return 0; }
         int minX = 2147483647;
         int minY = 2147483647;
-        int i = 6;
-        while (i + 5 < regs.Count) {
-            if (regs[i + 1] < minX) { minX = regs[i + 1]; }
-            if (regs[i + 2] < minY) { minY = regs[i + 2]; }
-            i = i + 6;
+        for (int i = 1; i < regs.Count; i = i + 1) {
+            if (regs[i].x < minX) { minX = regs[i].x; }
+            if (regs[i].y < minY) { minY = regs[i].y; }
         }
         if (minY < minX) { minX = minY; }
         if (minX == 2147483647 || minX < 0) { return 0; }
@@ -949,21 +1000,15 @@ class Win32Shell {
     /// 仍在屏幕上的条带之前，每帧调用一次。
     static void ClearHitGuards(nint hwnd) {
         Win32Shell.Init();
-        List<int> g = Win32Shell.hitGuards;
-        List<nint> ws = Win32Shell.hitGuardWins;
-        List<int> keep = new List<int>();
-        List<nint> keepW = new List<nint>();
-        for (int i = 0; i < ws.Count; i = i + 1) {
-            if (ws[i] != hwnd) {
-                keepW.Add(ws[i]);
-                keep.Add(g[i * 4]);
-                keep.Add(g[i * 4 + 1]);
-                keep.Add(g[i * 4 + 2]);
-                keep.Add(g[i * 4 + 3]);
+        if (Win32Shell.hitGuardEntries != null) {
+            List<Win32HitGuardEntry> keepEntries = new List<Win32HitGuardEntry>();
+            for (int e = 0; e < Win32Shell.hitGuardEntries.Count; e = e + 1) {
+                if (Win32Shell.hitGuardEntries[e].hwnd != hwnd) {
+                    keepEntries.Add(Win32Shell.hitGuardEntries[e]);
+                }
             }
+            Win32Shell.hitGuardEntries = keepEntries;
         }
-        Win32Shell.hitGuards = keep;
-        Win32Shell.hitGuardWins = keepW;
     }
 
     /// 以客户端坐标在 (`x`, `y`) 处为客户端区域抢占 `w` x `h`，
@@ -971,26 +1016,22 @@ class Win32Shell {
     static void AddHitGuard(nint hwnd, int x, int y, int w, int h) {
         Win32Shell.Init();
         if (w <= 0 || h <= 0) { return; }
-        Win32Shell.hitGuardWins.Add(hwnd);
-        Win32Shell.hitGuards.Add(x);
-        Win32Shell.hitGuards.Add(y);
-        Win32Shell.hitGuards.Add(w);
-        Win32Shell.hitGuards.Add(h);
+        if (Win32Shell.hitGuardEntries == null) {
+            Win32Shell.hitGuardEntries = new List<Win32HitGuardEntry>();
+        }
+        Win32Shell.hitGuardEntries.Add(new Win32HitGuardEntry(hwnd, x, y, w, h));
     }
 
     /// 只有 `hwnd` 自己的条带有效：每个窗口以自身的
     /// 客户端坐标注册矩形，否则子窗口的条带会以相同的偏移
     /// 遮蔽父窗口的边框。
     static bool InHitGuard(nint hwnd, int x, int y) {
-        List<int> g = Win32Shell.hitGuards;
-        List<nint> ws = Win32Shell.hitGuardWins;
-        if (g == null || ws == null) { return false; }
-        for (int i = 0; i < ws.Count; i = i + 1) {
-            int o = i * 4;
-            if (ws[i] == hwnd
-                && x >= g[o] && x < g[o] + g[o + 2]
-                && y >= g[o + 1] && y < g[o + 1] + g[o + 3]) {
-                return true;
+        if (Win32Shell.hitGuardEntries != null && Win32Shell.hitGuardEntries.Count > 0) {
+            for (int i = 0; i < Win32Shell.hitGuardEntries.Count; i = i + 1) {
+                Win32HitGuardEntry hg = Win32Shell.hitGuardEntries[i];
+                if (hg.hwnd == hwnd && x >= hg.x && x < hg.x + hg.w && y >= hg.y && y < hg.y + hg.h) {
+                    return true;
+                }
             }
         }
         return false;
@@ -1047,8 +1088,12 @@ class Win32Shell {
 
     /// `hwnd` 最近一次 Present 使用的表面 id；从未呈现过返回 -1。
     static int SurfaceOf(nint hwnd) {
-        for (int i = 0; i < Win32Shell.surfHwnd.Count; i = i + 1) {
-            if (Win32Shell.surfHwnd[i] == hwnd) { return Win32Shell.surfId[i]; }
+        if (Win32Shell.surfaceBindings != null) {
+            for (int i = 0; i < Win32Shell.surfaceBindings.Count; i = i + 1) {
+                if (Win32Shell.surfaceBindings[i].hwnd == hwnd) {
+                    return Win32Shell.surfaceBindings[i].surfaceId;
+                }
+            }
         }
         return 0 - 1;
     }
@@ -1056,14 +1101,16 @@ class Win32Shell {
     /// 记录 `hwnd` 与其当前表面 id 的对应关系，使 WM_PAINT/WM_SIZE
     /// 重绘属于本窗口的帧，而非最后呈现的那个窗口的帧。
     static void RememberSurface(nint hwnd, int surface) {
-        for (int i = 0; i < Win32Shell.surfHwnd.Count; i = i + 1) {
-            if (Win32Shell.surfHwnd[i] == hwnd) {
-                Win32Shell.surfId[i] = surface;
+        if (Win32Shell.surfaceBindings == null) {
+            Win32Shell.surfaceBindings = new List<Win32SurfaceBinding>();
+        }
+        for (int i = 0; i < Win32Shell.surfaceBindings.Count; i = i + 1) {
+            if (Win32Shell.surfaceBindings[i].hwnd == hwnd) {
+                Win32Shell.surfaceBindings[i].surfaceId = surface;
                 return;
             }
         }
-        Win32Shell.surfHwnd.Add(hwnd);
-        Win32Shell.surfId.Add(surface);
+        Win32Shell.surfaceBindings.Add(new Win32SurfaceBinding(hwnd, surface));
     }
 
     /// 描述所呈现表面的自上而下 32bpp BI_RGB 头。
@@ -1735,8 +1782,12 @@ class Win32Shell {
     /// 为 `hwnd` 注册的标题按钮数量（在设置前默认为 5）。
     static int CaptionButtonsOf(nint hwnd) {
         Win32Shell.Init();
-        for (int i = 0; i < Win32Shell.capHwnd.Count; i = i + 1) {
-            if (Win32Shell.capHwnd[i] == hwnd) { return Win32Shell.capCount[i]; }
+        if (Win32Shell.captionConfigs != null) {
+            for (int i = 0; i < Win32Shell.captionConfigs.Count; i = i + 1) {
+                if (Win32Shell.captionConfigs[i].hwnd == hwnd) {
+                    return Win32Shell.captionConfigs[i].capCount;
+                }
+            }
         }
         return 5;
     }
@@ -1748,21 +1799,27 @@ class Win32Shell {
     static void SetCaptionZone(nint hwnd, int width) {
         Win32Shell.Init();
         if (width < 0) { width = 0; }
-        for (int i = 0; i < Win32Shell.zoneHwnd.Count; i = i + 1) {
-            if (Win32Shell.zoneHwnd[i] == hwnd) {
-                Win32Shell.zoneWidth[i] = width;
+        if (Win32Shell.captionConfigs == null) {
+            Win32Shell.captionConfigs = new List<Win32CaptionConfig>();
+        }
+        for (int i = 0; i < Win32Shell.captionConfigs.Count; i = i + 1) {
+            if (Win32Shell.captionConfigs[i].hwnd == hwnd) {
+                Win32Shell.captionConfigs[i].zoneWidth = width;
                 return;
             }
         }
-        Win32Shell.zoneHwnd.Add(hwnd);
-        Win32Shell.zoneWidth.Add(width);
+        Win32Shell.captionConfigs.Add(new Win32CaptionConfig(hwnd, 5, width));
     }
 
     /// `hwnd` 的标题栏客户区保护带宽度（未登记默认 0）。
     static int CaptionZoneOf(nint hwnd) {
         Win32Shell.Init();
-        for (int i = 0; i < Win32Shell.zoneHwnd.Count; i = i + 1) {
-            if (Win32Shell.zoneHwnd[i] == hwnd) { return Win32Shell.zoneWidth[i]; }
+        if (Win32Shell.captionConfigs != null) {
+            for (int i = 0; i < Win32Shell.captionConfigs.Count; i = i + 1) {
+                if (Win32Shell.captionConfigs[i].hwnd == hwnd) {
+                    return Win32Shell.captionConfigs[i].zoneWidth;
+                }
+            }
         }
         return 0;
     }
@@ -1880,31 +1937,27 @@ class Win32Shell {
     static void SetCaptionButtons(nint hwnd, int count) {
         Win32Shell.Init();
         if (count < 0 || count > 8) { return; }
-        for (int i = 0; i < Win32Shell.capHwnd.Count; i = i + 1) {
-            if (Win32Shell.capHwnd[i] == hwnd) {
-                Win32Shell.capCount[i] = count;
+        if (Win32Shell.captionConfigs == null) {
+            Win32Shell.captionConfigs = new List<Win32CaptionConfig>();
+        }
+        for (int i = 0; i < Win32Shell.captionConfigs.Count; i = i + 1) {
+            if (Win32Shell.captionConfigs[i].hwnd == hwnd) {
+                Win32Shell.captionConfigs[i].capCount = count;
                 return;
             }
         }
-        Win32Shell.capHwnd.Add(hwnd);
-        Win32Shell.capCount.Add(count);
+        Win32Shell.captionConfigs.Add(new Win32CaptionConfig(hwnd, count, 0));
     }
 
     /// 遗忘已关闭窗口的标题按钮条带。
     static void ForgetCaptionButtons(nint hwnd) {
         Win32Shell.Init();
-        for (int i = 0; i < Win32Shell.capHwnd.Count; i = i + 1) {
-            if (Win32Shell.capHwnd[i] == hwnd) {
-                Win32Shell.capHwnd.RemoveAt(i);
-                Win32Shell.capCount.RemoveAt(i);
-                return;
-            }
-        }
-        for (int i = 0; i < Win32Shell.zoneHwnd.Count; i = i + 1) {
-            if (Win32Shell.zoneHwnd[i] == hwnd) {
-                Win32Shell.zoneHwnd.RemoveAt(i);
-                Win32Shell.zoneWidth.RemoveAt(i);
-                return;
+        if (Win32Shell.captionConfigs != null) {
+            for (int i = 0; i < Win32Shell.captionConfigs.Count; i = i + 1) {
+                if (Win32Shell.captionConfigs[i].hwnd == hwnd) {
+                    Win32Shell.captionConfigs.RemoveAt(i);
+                    break;
+                }
             }
         }
         if (Win32Shell.toolHwnd != null) {
@@ -2118,18 +2171,20 @@ class Win32Shell {
     static void SetShape(nint hwnd, string spec) {
         Win32Shell.Init();
         if (hwnd == 0) { return; }
-        List<int> regs = new List<int>();
+        List<Win32ShapeRegion> regs = new List<Win32ShapeRegion>();
         if (spec.Length > 0) {
             List<string> parts = spec.Split(";");
             for (int i = 0; i < parts.Count; i = i + 1) {
                 List<string> nums = parts[i].Split(",");
                 if (nums.Count >= 6) {
-                    regs.Add(Convert.ToInt32(nums[0]));
-                    regs.Add(Convert.ToInt32(nums[1]));
-                    regs.Add(Convert.ToInt32(nums[2]));
-                    regs.Add(Convert.ToInt32(nums[3]));
-                    regs.Add(Convert.ToInt32(nums[4]));
-                    regs.Add(Convert.ToInt32(nums[5]));
+                    regs.Add(new Win32ShapeRegion(
+                        Convert.ToInt32(nums[0]),
+                        Convert.ToInt32(nums[1]),
+                        Convert.ToInt32(nums[2]),
+                        Convert.ToInt32(nums[3]),
+                        Convert.ToInt32(nums[4]),
+                        Convert.ToInt32(nums[5])
+                    ));
                 }
             }
         }
@@ -2143,17 +2198,15 @@ class Win32Shell {
                 Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
             }
             Win32Shell.shapeMode = 0;
-            Win32Shell.shapeRegions = new List<int>();
+            Win32Shell.shapeRegionList = new List<Win32ShapeRegion>();
             Win32Shell.shapeMask = new List<byte>();
             Win32Shell.glassOn = false;
             return;
         }
-        Win32Shell.shapeRegions = regs;
+        Win32Shell.shapeRegionList = regs;
         bool sb = false;
-        int si = 0;
-        while (si + 5 < regs.Count) {
-            if (regs[si] == 3) { sb = true; }
-            si = si + 6;
+        for (int si = 0; si < regs.Count; si = si + 1) {
+            if (regs[si].kind == 3) { sb = true; }
         }
         Win32Shell.hasShadowBand = sb;
         Win32Shell.shapeMask = new List<byte>();
@@ -2191,25 +2244,23 @@ class Win32Shell {
     /// 轮廓尺寸也会出错。保持窗口居中。
     /// 区域预期为窗口相对坐标（最小 x/y >= 0）；
     /// 超出窗口上方/左方的形状保持不变。
-    static void FitShapeWindow(nint hwnd, List<int> regs) {
+    static void FitShapeWindow(nint hwnd, List<Win32ShapeRegion> regs) {
         if (regs.Count == 0) { return; }
         int minX = 2147483647;
         int minY = 2147483647;
         int maxX = 0 - 2147483647 - 1;
         int maxY = 0 - 2147483647 - 1;
-        int i = 0;
-        while (i + 5 < regs.Count) {
-            int x = regs[i + 1];
-            int y = regs[i + 2];
-            int w = regs[i + 3];
-            int h = regs[i + 4];
+        for (int i = 0; i < regs.Count; i = i + 1) {
+            int x = regs[i].x;
+            int y = regs[i].y;
+            int w = regs[i].w;
+            int h = regs[i].h;
             if (x < minX) { minX = x; }
             if (y < minY) { minY = y; }
             int x2 = x + w;
             if (x2 > maxX) { maxX = x2; }
             int y2 = y + h;
             if (y2 > maxY) { maxY = y2; }
-            i = i + 6;
         }
         if (minX < 0 || minY < 0) { return; }
         int scale = Win32Shell.DpiScale();
@@ -2254,22 +2305,21 @@ class Win32Shell {
 
     /// 经典区域回退（Win7 无 DWM）：圆角矩形与
     /// 椭圆区域的并集。SetWindowRgn 之后窗口拥有合并区域。
-    static void SetShapeRgn(nint hwnd, List<int> regs) {
+    static void SetShapeRgn(nint hwnd, List<Win32ShapeRegion> regs) {
         int scale = Win32Shell.DpiScale();
         nint merged = 0;
-        int i = 0;
-        while (i + 5 < regs.Count) {
-            int t = regs[i];
+        for (int i = 0; i < regs.Count; i = i + 1) {
+            Win32ShapeRegion reg = regs[i];
+            int t = reg.kind;
             if (t == 3) {
                 // 类型 3（阴影带）仅用于分层外扩，不属于窗口可交互实体区域
-                i = i + 6;
                 continue;
             }
-            int x = regs[i + 1] * scale / 100;
-            int y = regs[i + 2] * scale / 100;
-            int w = regs[i + 3] * scale / 100;
-            int h = regs[i + 4] * scale / 100;
-            int r = regs[i + 5] * scale / 100;
+            int x = reg.x * scale / 100;
+            int y = reg.y * scale / 100;
+            int w = reg.w * scale / 100;
+            int h = reg.h * scale / 100;
+            int r = reg.r * scale / 100;
             nint rgn = 0;
             if (t == 2) {
                 rgn = Win32Shell.CreateEllipticRgn(x, y, x + w, y + h);
@@ -2284,7 +2334,6 @@ class Win32Shell {
                     Win32Shell.DeleteObject(rgn);
                 }
             }
-            i = i + 6;
         }
         if (merged != 0) { Win32Shell.SetWindowRgn(hwnd, merged, true); }
     }
@@ -2294,21 +2343,20 @@ class Win32Shell {
     /// 圆角矩形使用标准 SDF；椭圆使用
     /// 精确 SDF。所有运算为 64 位，大窗口不会
     /// 使距离平方溢出。
-    static long ShapeSdfFp(List<int> regs, long sx, long sy, int scale) {
+    static long ShapeSdfFp(List<Win32ShapeRegion> regs, long sx, long sy, int scale) {
         long best = 9223372036854775807;
-        int i = 0;
-        while (i + 5 < regs.Count) {
-            int t = regs[i];
+        for (int i = 0; i < regs.Count; i = i + 1) {
+            Win32ShapeRegion reg = regs[i];
+            int t = reg.kind;
             if (t != 1 && t != 2) {
                 // 类型 3（阴影带）仅用于分层表面柔和阴影透出，不计入实体内容轮廓 SDF
-                i = i + 6;
                 continue;
             }
-            long x = (long)(regs[i + 1] * scale / 100) * 16;
-            long y = (long)(regs[i + 2] * scale / 100) * 16;
-            long w = (long)(regs[i + 3] * scale / 100) * 16;
-            long h = (long)(regs[i + 4] * scale / 100) * 16;
-            long r = (long)(regs[i + 5] * scale / 100) * 16;
+            long x = (long)(reg.x * scale / 100) * 16;
+            long y = (long)(reg.y * scale / 100) * 16;
+            long w = (long)(reg.w * scale / 100) * 16;
+            long h = (long)(reg.h * scale / 100) * 16;
+            long r = (long)(reg.r * scale / 100) * 16;
             long d = 0;
             if (t == 2) {
                 long rx = w / 2;
@@ -2395,7 +2443,7 @@ class Win32Shell {
                 for (int sb = 0; sb < 4; sb = sb + 1) {
                     long sx = (long)px * 16 + sa * 4 + 2;
                     long sy = (long)py * 16 + sb * 4 + 2;
-                    long d = Win32Shell.ShapeSdfFp(Win32Shell.shapeRegions,
+                    long d = Win32Shell.ShapeSdfFp(Win32Shell.shapeRegionList,
                                                    sx, sy, scale);
                     // 以 1/16 像素为单位：coverage = clamp(0.5 - sdf, 0, 1)：
                     // 0.5px = 8/16，因此斜坡为 cov = 8 - d，范围 [0,16]。
@@ -2515,18 +2563,16 @@ class Win32Shell {
     static bool DrainInjected() {
         bool got = false;
         Win32Shell.EnterCriticalSection(Win32Shell.injectCs);
-        if (Win32Shell.injectQ.Count >= 6) {
-            Win32Shell.evKind = Win32Shell.injectQ[0];
-            Win32Shell.evX = Win32Shell.injectQ[1];
-            Win32Shell.evY = Win32Shell.injectQ[2];
-            Win32Shell.evButton = Win32Shell.injectQ[3];
-            Win32Shell.evKeyCode = Win32Shell.injectQ[4];
-            Win32Shell.evMods = Win32Shell.injectQ[5];
-            for (int i = 0; i < 6; i = i + 1) {
-                Win32Shell.injectQ.RemoveAt(0);
-            }
-            nint target = Win32Shell.injectHwnd[0];
-            Win32Shell.injectHwnd.RemoveAt(0);
+        if (Win32Shell.injectEvents != null && Win32Shell.injectEvents.Count > 0) {
+            Win32QueuedEvent ev = Win32Shell.injectEvents[0];
+            Win32Shell.injectEvents.RemoveAt(0);
+            Win32Shell.evKind = ev.kind;
+            Win32Shell.evX = ev.x;
+            Win32Shell.evY = ev.y;
+            Win32Shell.evButton = ev.button;
+            Win32Shell.evKeyCode = ev.keycode;
+            Win32Shell.evMods = ev.mods;
+            nint target = ev.hwnd;
             if (target == 0) { target = Win32Shell.mainHwnd; }
             Win32Shell.evHwnd = target;
             Win32Shell.hasEvent = true;
@@ -2539,18 +2585,18 @@ class Win32Shell {
 
     /// 取出窗口过程排队的一个事件（队列空则 false）。
     static bool DrainPosted() {
-        if (Win32Shell.postHwnd == null || Win32Shell.postHwnd.Count == 0) {
+        if (Win32Shell.postEvents == null || Win32Shell.postEvents.Count == 0) {
             return false;
         }
-        Win32Shell.evKind = Win32Shell.postQ[0];
-        Win32Shell.evX = Win32Shell.postQ[1];
-        Win32Shell.evY = Win32Shell.postQ[2];
-        Win32Shell.evButton = Win32Shell.postQ[3];
-        Win32Shell.evKeyCode = Win32Shell.postQ[4];
-        Win32Shell.evMods = Win32Shell.postQ[5];
-        for (int i = 0; i < 6; i = i + 1) { Win32Shell.postQ.RemoveAt(0); }
-        Win32Shell.evHwnd = Win32Shell.postHwnd[0];
-        Win32Shell.postHwnd.RemoveAt(0);
+        Win32QueuedEvent ev = Win32Shell.postEvents[0];
+        Win32Shell.postEvents.RemoveAt(0);
+        Win32Shell.evKind = ev.kind;
+        Win32Shell.evX = ev.x;
+        Win32Shell.evY = ev.y;
+        Win32Shell.evButton = ev.button;
+        Win32Shell.evKeyCode = ev.keycode;
+        Win32Shell.evMods = ev.mods;
+        Win32Shell.evHwnd = ev.hwnd;
         Win32Shell.hasEvent = true;
         Win32Shell.evSeq = Win32Shell.evSeq + 1;
         return true;
@@ -2629,19 +2675,16 @@ class Win32Shell {
     }
 
     /// 把一个合成事件排队（临界区保护，可从任意线程调用），编码
-    /// 与窗口过程 Post 的事件六元组一致；hwnd 为 0 时投给主窗口。
+    /// 与窗口过程 Post 的事件一致；hwnd 为 0 时投给主窗口。
     /// 入队后 Wake 主线程。
     static void InjectEvent(nint hwnd, int kind, int x, int y, int button,
                             int keycode, int mods) {
         Win32Shell.Init();
         Win32Shell.EnterCriticalSection(Win32Shell.injectCs);
-        Win32Shell.injectQ.Add(kind);
-        Win32Shell.injectQ.Add(x);
-        Win32Shell.injectQ.Add(y);
-        Win32Shell.injectQ.Add(button);
-        Win32Shell.injectQ.Add(keycode);
-        Win32Shell.injectQ.Add(mods);
-        Win32Shell.injectHwnd.Add(hwnd);
+        if (Win32Shell.injectEvents == null) {
+            Win32Shell.injectEvents = new List<Win32QueuedEvent>();
+        }
+        Win32Shell.injectEvents.Add(new Win32QueuedEvent(hwnd, kind, x, y, button, keycode, mods));
         Win32Shell.LeaveCriticalSection(Win32Shell.injectCs);
         Win32Shell.Wake();
     }
@@ -2650,7 +2693,10 @@ class Win32Shell {
     static int InjectPending() {
         Win32Shell.Init();
         Win32Shell.EnterCriticalSection(Win32Shell.injectCs);
-        int n = Win32Shell.injectHwnd.Count;
+        int n = 0;
+        if (Win32Shell.injectEvents != null) {
+            n = Win32Shell.injectEvents.Count;
+        }
         Win32Shell.LeaveCriticalSection(Win32Shell.injectCs);
         return n;
     }

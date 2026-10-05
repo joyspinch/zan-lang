@@ -2,6 +2,30 @@ using System;
 using System.Collections;
 namespace Zan;
 
+/// <summary>实体属性元数据模型（消除 fNames/fTypes/fKinds 平行列表反模式）。</summary>
+class DbFieldInfo {
+    public string name;
+    public string typeName;
+    public int kind;
+
+    public DbFieldInfo(string name, string typeName, int kind) {
+        this.name = name;
+        this.typeName = typeName;
+        this.kind = kind;
+    }
+}
+
+/// <summary>SQL 参数绑定条目实体（消除 bindKinds/bindExprs 平行列表反模式）。</summary>
+class DbBindEntry {
+    public int kind;
+    public Node expr;
+
+    public DbBindEntry(int kind, Node expr) {
+        this.kind = kind;
+        this.expr = expr;
+    }
+}
+
 // Compile-time typed ORM queries for System.Data. Mirrors the C host pass
 // in src/compiler/dbgen.c.
 //
@@ -71,10 +95,7 @@ class Dbgen {
     }
 
     // ---- entity field model ----
-    // Parallel lists (bootstrap subset: no small struct types).
-    List<string> fNames;
-    List<string> fTypes;
-    List<int> fKinds;
+    List<DbFieldInfo> fields;
 
     void CollectFields(Node cls, int depth) {
         if (cls == null || depth > 8) { return; }
@@ -91,23 +112,19 @@ class Dbgen {
             if (k == Dbgen.DfSkip()) { continue; }
             string tn = "?";
             if (m.type != null && m.type.kind == AK.TypeRef()) { tn = m.type.sval; }
-            fNames.Add(m.sval);
-            fTypes.Add(tn);
-            fKinds.Add(k);
+            fields.Add(new DbFieldInfo(m.sval, tn, k));
         }
     }
 
     void LoadFields(string cls) {
-        fNames = new List<string>();
-        fTypes = new List<string>();
-        fKinds = new List<int>();
+        fields = new List<DbFieldInfo>();
         CollectFields(FindDecl(cls, AK.ClassDecl()), 0);
     }
 
     int FieldFind(string name) {
         int i = 0;
-        while (i < fNames.Count) {
-            if (fNames[i] == name) { return i; }
+        while (i < fields.Count) {
+            if (fields[i].name == name) { return i; }
             i = i + 1;
         }
         return 0 - 1;
@@ -185,8 +202,7 @@ class Dbgen {
     int wLine;
     int wCol;
     string wParam;        // lambda parameter name
-    List<int> bindKinds;  // 1=P 2=Pi 3=Pd 4=InI 5=InS 6=InD
-    List<Node> bindExprs;
+    List<DbBindEntry> binds; // 强类型绑定条目
     bool wOk;
 
     void WfText(string s) { wLit = wLit + s; }
@@ -204,8 +220,8 @@ class Dbgen {
     }
 
     void WfBind(int kind, Node expr) {
-        bindKinds.Add(kind);
-        bindExprs.Add(expr);
+        if (binds == null) { binds = new List<DbBindEntry>(); }
+        binds.Add(new DbBindEntry(kind, expr));
     }
 
     void WfErr(string msg, int line, int col) {
@@ -236,7 +252,7 @@ class Dbgen {
         return FieldFind(e.sval);
     }
 
-    void WfCol(int fi) { WfText("t." + fNames[fi]); }
+    void WfCol(int fi) { WfText("t." + fields[fi].name); }
 
     // Compile-time literal/field type matching: catches the common
     // `p.name == 123` / `p.num == "abc"` mistakes with a clear diagnostic.
@@ -247,7 +263,7 @@ class Dbgen {
         if (e.kind == AK.Unary() && (e.op == TK.Minus() || e.op == TK.Plus())) {
             lit = e.a;
         }
-        int k = fKinds[fi];
+        int k = fields[fi].kind;
         if (lit.kind == AK.IntLit() || lit.kind == AK.CharLit()) {
             if (k == Dbgen.DfInt() || k == Dbgen.DfEnum() || k == Dbgen.DfDouble()) { return ""; }
             if (k == Dbgen.DfString()) { return "type mismatch: string column compared to an int value"; }
@@ -273,7 +289,7 @@ class Dbgen {
         string msg = LiteralMismatch(fi, e);
         if (msg != "") { WfErr(msg, e.line, e.col); return; }
         WfText("?");
-        int k = fKinds[fi];
+        int k = fields[fi].kind;
         if (k == Dbgen.DfInt()) { WfBind(2, e); }
         else if (k == Dbgen.DfEnum()) { WfBind(2, NbCastInt(e)); }
         else if (k == Dbgen.DfDouble()) {
@@ -353,13 +369,13 @@ class Dbgen {
             return fn;
         }
         int ci = FieldFind(body.sval);
-        if (ci < 0 || fKinds[ci] == Dbgen.DfNav()) {
+        if (ci < 0 || fields[ci].kind == Dbgen.DfNav()) {
             WfErr(fn + " expects a scalar column", e.line, e.col);
             return fn;
         }
         WfText(fn + "(t." + body.sval + ")");
         if (mn == "Avg") { outKind = Dbgen.DfDouble(); }
-        else { outKind = fKinds[ci]; }
+        else { outKind = fields[ci].kind; }
         return fn;
     }
 
@@ -380,7 +396,7 @@ class Dbgen {
         // WhereCond. Mirrors `new[]{1,2,3}.Contains(a.Id)` from the docs.
         if (col < 0 && mn == "Contains" && e.kids.Count == 1) {
             int inner = AsColumn(e.kids[0]);
-            if (inner >= 0 && fKinds[inner] != Dbgen.DfBool()) {
+            if (inner >= 0 && fields[inner].kind != Dbgen.DfBool()) {
                 Node list = callee.a;
                 if (MentionsParam(list)) {
                     WfErr("the list receiver must not reference the lambda parameter", list.line, list.col);
@@ -392,7 +408,7 @@ class Dbgen {
                 Node m = NbCall1(NbMember(NbIdent("__DbBind", list.line, list.col), "M", list.line, list.col), cnt, list.line, list.col);
                 WfExpr(m);
                 WfText(")");
-                int k = fKinds[inner];
+                int k = fields[inner].kind;
                 if (k == Dbgen.DfInt() || k == Dbgen.DfEnum()) { WfBind(4, list); }
                 else if (k == Dbgen.DfString()) { WfBind(5, list); }
                 else if (k == Dbgen.DfDouble()) { WfBind(6, list); }
@@ -418,8 +434,8 @@ class Dbgen {
                 WfErr("Between/NotBetween take exactly two arguments", e.line, e.col);
                 return true;
             }
-            if (fKinds[col] != Dbgen.DfInt() && fKinds[col] != Dbgen.DfEnum()
-                && fKinds[col] != Dbgen.DfDouble()) {
+            if (fields[col].kind != Dbgen.DfInt() && fields[col].kind != Dbgen.DfEnum()
+                && fields[col].kind != Dbgen.DfDouble()) {
                 WfErr("Between requires an int/double/enum column", e.line, e.col);
                 return true;
             }
@@ -450,7 +466,7 @@ class Dbgen {
                 WfErr("comparison method takes exactly one argument", e.line, e.col);
                 return true;
             }
-            if (fKinds[col] == Dbgen.DfBool()) {
+            if (fields[col].kind == Dbgen.DfBool()) {
                 WfErr("bool columns compare with == / !=", e.line, e.col);
                 return true;
             }
@@ -474,7 +490,7 @@ class Dbgen {
             return true;
         }
         if (mn == "Like" || mn == "NotLike") {
-            if (fKinds[col] != Dbgen.DfString()) {
+            if (fields[col].kind != Dbgen.DfString()) {
                 WfErr("Like requires a string column", e.line, e.col);
                 return true;
             }
@@ -484,7 +500,7 @@ class Dbgen {
             return true;
         }
         if (mn == "Contains" || mn == "StartsWith" || mn == "EndsWith") {
-            if (fKinds[col] != Dbgen.DfString()) {
+            if (fields[col].kind != Dbgen.DfString()) {
                 WfErr("string matching requires a string column", e.line, e.col);
                 return true;
             }
@@ -506,7 +522,7 @@ class Dbgen {
             Node m = NbCall1(NbMember(NbIdent("__DbBind", arg.line, arg.col), "M", arg.line, arg.col), cnt, arg.line, arg.col);
             WfExpr(m);
             WfText(")");
-            int k = fKinds[col];
+            int k = fields[col].kind;
             if (k == Dbgen.DfInt() || k == Dbgen.DfEnum()) { WfBind(4, arg); }
             else if (k == Dbgen.DfString()) { WfBind(5, arg); }
             else if (k == Dbgen.DfDouble()) { WfBind(6, arg); }
@@ -529,7 +545,7 @@ class Dbgen {
         }
         if (e.kind == AK.Unary() && e.op == TK.Bang()) {
             int col = AsColumn(e.a);
-            if (col >= 0 && fKinds[col] == Dbgen.DfBool()) {
+            if (col >= 0 && fields[col].kind == Dbgen.DfBool()) {
                 WfCol(col);
                 WfText(" = 0");
                 return;
@@ -541,7 +557,7 @@ class Dbgen {
         }
         if (e.kind == AK.MemberAccess()) {
             int col = AsColumn(e);
-            if (col >= 0 && fKinds[col] == Dbgen.DfBool()) {
+            if (col >= 0 && fields[col].kind == Dbgen.DfBool()) {
                 WfCol(col);
                 WfText(" = 1");
                 return;
@@ -622,7 +638,7 @@ class Dbgen {
                 }
                 return;
             }
-            if (fKinds[col] == Dbgen.DfBool()) {
+            if (fields[col].kind == Dbgen.DfBool()) {
                 if (val.kind != AK.BoolLit() || (e.op != TK.EqEq() && e.op != TK.BangEq())) {
                     WfErr("bool columns only compare to true/false literals", e.line, e.col);
                     return;
@@ -728,8 +744,7 @@ class Dbgen {
         wLine = call.line;
         wCol = call.col;
         wParam = LambdaParamName(lambda, 0);
-        bindKinds = new List<int>();
-        bindExprs = new List<Node>();
+        binds = new List<DbBindEntry>();
         wOk = true;
         WhereCond(body);
         if (!wOk) { return; }
@@ -740,8 +755,8 @@ class Dbgen {
         Node recv = call.a.a;
         Node node = NbCall1(NbMember(recv, "__Frag", call.line, call.col), frag, call.line, call.col);
         int i = 0;
-        while (i < bindKinds.Count) {
-            node = NbCall1(NbMember(node, BindMethod(bindKinds[i]), call.line, call.col), bindExprs[i], call.line, call.col);
+        while (i < binds.Count) {
+            node = NbCall1(NbMember(node, BindMethod(binds[i].kind), call.line, call.col), binds[i].expr, call.line, call.col);
             i = i + 1;
         }
         CopyInto(call, node);
@@ -784,11 +799,11 @@ class Dbgen {
 
     void RewriteOrderBy(Node call, string cls, bool desc) {
         int col = LambdaFieldFind(call, cls);
-        if (col < 0 || fKinds[col] == Dbgen.DfNav()) {
+        if (col < 0 || fields[col].kind == Dbgen.DfNav()) {
             diags.Error("OrderBy expects p => p.<scalar field>", call.line, call.col);
             return;
         }
-        Node arg = NbStr("t." + fNames[col], call.line, call.col);
+        Node arg = NbStr("t." + fields[col].name, call.line, call.col);
         if (desc) { call.a.sval = "__OBD"; } else { call.a.sval = "__OB"; }
         call.kids = new List<Node>();
         call.Add(arg);
@@ -796,12 +811,12 @@ class Dbgen {
 
     void RewriteInclude(Node call, string cls) {
         int col = LambdaFieldFind(call, cls);
-        if (col < 0 || fKinds[col] != Dbgen.DfNav()) {
+        if (col < 0 || fields[col].kind != Dbgen.DfNav()) {
             diags.Error("Include expects p => p.<navigation field>", call.line, call.col);
             return;
         }
-        NeedAdd(fTypes[col]);
-        call.a.sval = "Inc_" + fNames[col];
+        NeedAdd(fields[col].typeName);
+        call.a.sval = "Inc_" + fields[col].name;
         call.kids = new List<Node>();
     }
 
@@ -822,8 +837,7 @@ class Dbgen {
         wLine = call.line;
         wCol = call.col;
         wParam = LambdaParamName(lambda, 0);
-        bindKinds = new List<int>();
-        bindExprs = new List<Node>();
+        binds = new List<DbBindEntry>();
         wOk = true;
         WhereCond(body);
         if (!wOk) { return; }
@@ -833,8 +847,8 @@ class Dbgen {
         Node recv = call.a.a;
         Node node = NbCall1(NbMember(recv, "__H", call.line, call.col), frag, call.line, call.col);
         int i = 0;
-        while (i < bindKinds.Count) {
-            node = NbCall1(NbMember(node, BindMethod(bindKinds[i]), call.line, call.col), bindExprs[i], call.line, call.col);
+        while (i < binds.Count) {
+            node = NbCall1(NbMember(node, BindMethod(binds[i].kind), call.line, call.col), binds[i].expr, call.line, call.col);
             i = i + 1;
         }
         CopyInto(call, node);
@@ -856,12 +870,12 @@ class Dbgen {
                 if (arg.kind == AK.MemberAccess() && arg.a.kind == AK.Ident() && arg.a.sval == pname) {
                     ci = FieldFind(arg.sval);
                 }
-                if (ci < 0 || fKinds[ci] == Dbgen.DfNav()) {
+                if (ci < 0 || fields[ci].kind == Dbgen.DfNav()) {
                     diags.Error("GroupBy member must be p => p.<scalar field>", arg.line, arg.col);
                     return;
                 }
                 if (gb.Length > 0) { gb = gb + ", "; }
-                gb = gb + "t." + fNames[ci];
+                gb = gb + "t." + fields[ci].name;
                 i = i + 1;
             }
             if (gb.Length == 0) {
@@ -872,11 +886,11 @@ class Dbgen {
             int col = FieldFind(body.sval);
             if (body == null || body.kind != AK.MemberAccess() || body.a == null
                 || body.a.kind != AK.Ident() || body.a.sval != pname
-                || col < 0 || fKinds[col] == Dbgen.DfNav()) {
+                || col < 0 || fields[col].kind == Dbgen.DfNav()) {
                 diags.Error("GroupBy expects p => p.<scalar field>", call.line, call.col);
                 return;
             }
-            gb = "t." + fNames[col];
+            gb = "t." + fields[col].name;
         }
         Node arg = NbStr(gb, call.line, call.col);
         call.a.sval = "__GB";
@@ -953,14 +967,17 @@ class Dbgen {
         if (decl == null) { return ""; }
         LoadFields(cls);
         // snapshot (LoadFields is reused for nav classes below)
-        List<string> ns = fNames;
-        List<string> ts = fTypes;
-        List<int> ks = fKinds;
+        List<DbFieldInfo> fs = new List<DbFieldInfo>();
+        int fi = 0;
+        while (fi < fields.Count) {
+            fs.Add(new DbFieldInfo(fields[fi].name, fields[fi].typeName, fields[fi].kind));
+            fi = fi + 1;
+        }
 
         int nbase = 0;
         int i = 0;
-        while (i < ks.Count) {
-            if (ks[i] != Dbgen.DfNav()) { nbase = nbase + 1; }
+        while (i < fs.Count) {
+            if (fs[i].kind != Dbgen.DfNav()) { nbase = nbase + 1; }
             i = i + 1;
         }
 
@@ -968,8 +985,8 @@ class Dbgen {
         string s = "class " + q + " {\n";
         s = s + "    IDbExecutor db;\n    string w;\n    DbParams ps;\n    string ob;\n    string gb;\n    string h;\n    bool distinct;\n    int limN;\n    int offN;\n";
         i = 0;
-        while (i < ks.Count) {
-            if (ks[i] == Dbgen.DfNav()) { s = s + "    bool j_" + ns[i] + ";\n"; }
+        while (i < fs.Count) {
+            if (fs[i].kind == Dbgen.DfNav()) { s = s + "    bool j_" + fs[i].name + ";\n"; }
             i = i + 1;
         }
         s = s + "    static " + q + " Create(IDbExecutor db) {\n";
@@ -1000,9 +1017,9 @@ class Dbgen {
         s = s + "    " + q + " Take(int n) { this.limN = n; return this; }\n";
         s = s + "    " + q + " Skip(int n) { this.offN = n; return this; }\n";
         i = 0;
-        while (i < ks.Count) {
-            if (ks[i] == Dbgen.DfNav()) {
-                s = s + "    " + q + " Inc_" + ns[i] + "() { this.j_" + ns[i] + " = true; return this; }\n";
+        while (i < fs.Count) {
+            if (fs[i].kind == Dbgen.DfNav()) {
+                s = s + "    " + q + " Inc_" + fs[i].name + "() { this.j_" + fs[i].name + " = true; return this; }\n";
             }
             i = i + 1;
         }
@@ -1015,36 +1032,36 @@ class Dbgen {
         string cols = "";
         bool first = true;
         i = 0;
-        while (i < ks.Count) {
-            if (ks[i] != Dbgen.DfNav()) {
+        while (i < fs.Count) {
+            if (fs[i].kind != Dbgen.DfNav()) {
                 if (!first) { cols = cols + ", "; }
-                cols = cols + "t." + ns[i];
+                cols = cols + "t." + fs[i].name;
                 first = false;
             }
             i = i + 1;
         }
         s = s + "        sb.Append(\"" + cols + "\");\n";
         i = 0;
-        while (i < ks.Count) {
-            if (ks[i] == Dbgen.DfNav()) {
-                LoadFields(ts[i]);
+        while (i < fs.Count) {
+            if (fs[i].kind == Dbgen.DfNav()) {
+                LoadFields(fs[i].typeName);
                 string jcols = "";
                 int k = 0;
-                while (k < fKinds.Count) {
-                    if (fKinds[k] != Dbgen.DfNav()) {
-                        jcols = jcols + ", j_" + ns[i] + "." + fNames[k];
+                while (k < fields.Count) {
+                    if (fields[k].kind != Dbgen.DfNav()) {
+                        jcols = jcols + ", j_" + fs[i].name + "." + fields[k].name;
                     }
                     k = k + 1;
                 }
-                s = s + "        if (this.j_" + ns[i] + ") { sb.Append(\"" + jcols + "\"); }\n";
+                s = s + "        if (this.j_" + fs[i].name + ") { sb.Append(\"" + jcols + "\"); }\n";
             }
             i = i + 1;
         }
         s = s + "        sb.Append(\" FROM " + cls + " t\");\n";
         i = 0;
-        while (i < ks.Count) {
-            if (ks[i] == Dbgen.DfNav()) {
-                s = s + "        if (this.j_" + ns[i] + ") { sb.Append(\" LEFT JOIN " + ts[i] + " j_" + ns[i] + " ON t." + ns[i] + "Id = j_" + ns[i] + ".id\"); }\n";
+        while (i < fs.Count) {
+            if (fs[i].kind == Dbgen.DfNav()) {
+                s = s + "        if (this.j_" + fs[i].name + ") { sb.Append(\" LEFT JOIN " + fs[i].typeName + " j_" + fs[i].name + " ON t." + fs[i].name + "Id = j_" + fs[i].name + ".id\"); }\n";
             }
             i = i + 1;
         }
@@ -1065,13 +1082,13 @@ class Dbgen {
         s = s + "            " + cls + " o = new " + cls + "();\n";
         int ci = 0;
         i = 0;
-        while (i < ks.Count) {
-            if (ks[i] != Dbgen.DfNav()) {
-                if (ks[i] == Dbgen.DfEnum()) {
+        while (i < fs.Count) {
+            if (fs[i].kind != Dbgen.DfNav()) {
+                if (fs[i].kind == Dbgen.DfEnum()) {
                     // enum casts are not parseable; int -> enum is implicit
-                    s = s + "            o." + ns[i] + " = r.GetInt(row, " + Convert.ToString(ci) + ");\n";
+                    s = s + "            o." + fs[i].name + " = r.GetInt(row, " + Convert.ToString(ci) + ");\n";
                 } else {
-                    s = s + "            o." + ns[i] + " = r." + Getter(ks[i]) + "(row, " + Convert.ToString(ci) + ");\n";
+                    s = s + "            o." + fs[i].name + " = r." + Getter(fs[i].kind) + "(row, " + Convert.ToString(ci) + ");\n";
                 }
                 ci = ci + 1;
             }
@@ -1079,38 +1096,38 @@ class Dbgen {
         }
         s = s + "            int ci = " + Convert.ToString(nbase) + ";\n";
         i = 0;
-        while (i < ks.Count) {
-            if (ks[i] == Dbgen.DfNav()) {
-                LoadFields(ts[i]);
+        while (i < fs.Count) {
+            if (fs[i].kind == Dbgen.DfNav()) {
+                LoadFields(fs[i].typeName);
                 int nn = 0;
                 int pk = 0 - 1;
                 int k = 0;
-                while (k < fKinds.Count) {
-                    if (fKinds[k] != Dbgen.DfNav()) {
-                        if (fNames[k] == "id") { pk = nn; }
+                while (k < fields.Count) {
+                    if (fields[k].kind != Dbgen.DfNav()) {
+                        if (fields[k].name == "id") { pk = nn; }
                         nn = nn + 1;
                     }
                     k = k + 1;
                 }
                 if (pk < 0) { pk = 0; }
-                s = s + "            if (this.j_" + ns[i] + ") {\n";
+                s = s + "            if (this.j_" + fs[i].name + ") {\n";
                 s = s + "                if (!r.IsNull(row, ci + " + Convert.ToString(pk) + ")) {\n";
-                s = s + "                    " + ts[i] + " nv = new " + ts[i] + "();\n";
+                s = s + "                    " + fs[i].typeName + " nv = new " + fs[i].typeName + "();\n";
                 int nk = 0;
                 k = 0;
-                while (k < fKinds.Count) {
-                    if (fKinds[k] != Dbgen.DfNav()) {
-                        if (fKinds[k] == Dbgen.DfEnum()) {
+                while (k < fields.Count) {
+                    if (fields[k].kind != Dbgen.DfNav()) {
+                        if (fields[k].kind == Dbgen.DfEnum()) {
                             // enum casts are not parseable; int -> enum is implicit
-                            s = s + "                    nv." + fNames[k] + " = r.GetInt(row, ci + " + Convert.ToString(nk) + ");\n";
+                            s = s + "                    nv." + fields[k].name + " = r.GetInt(row, ci + " + Convert.ToString(nk) + ");\n";
                         } else {
-                            s = s + "                    nv." + fNames[k] + " = r." + Getter(fKinds[k]) + "(row, ci + " + Convert.ToString(nk) + ");\n";
+                            s = s + "                    nv." + fields[k].name + " = r." + Getter(fields[k].kind) + "(row, ci + " + Convert.ToString(nk) + ");\n";
                         }
                         nk = nk + 1;
                     }
                     k = k + 1;
                 }
-                s = s + "                    o." + ns[i] + " = nv;\n";
+                s = s + "                    o." + fs[i].name + " = nv;\n";
                 s = s + "                }\n";
                 s = s + "                ci = ci + " + Convert.ToString(nn) + ";\n";
                 s = s + "            }\n";

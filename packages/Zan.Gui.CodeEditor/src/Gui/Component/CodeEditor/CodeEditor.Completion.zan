@@ -104,30 +104,30 @@ partial class CodeEditor {
         }
     }
 
-    /// 通过应用当前种类过滤器，从 acAllItems/acAllKinds 重建可见的
+    /// 通过应用当前种类过滤器，从 acAllCandidates 实体列表重建可见的
     /// acItems/acKinds，然后更新弹窗激活状态。
     void ApplyKindFilter() {
         acItems = new List<string>();
         acKinds = new List<string>();
         int i = 0;
-        for (; i < acAllItems.Count; i = i + 1) {
-            string k = "";
-            if (i < acAllKinds.Count) { k = acAllKinds[i]; }
+        for (; i < acAllCandidates.Count; i = i + 1) {
+            CeCandidateItem cand = acAllCandidates[i];
+            string k = cand.kind;
             if (acFilter == "" || acFilter == k) {
-                acItems.Add(acAllItems[i]);
+                acItems.Add(cand.item);
                 acKinds.Add(k);
             }
         }
-        if (acItems.Count == 0 && acAllItems.Count > 0) {
+        if (acItems.Count == 0 && acAllCandidates.Count > 0) {
             // 用户保留的种类过滤器对正在输入的字词没有候选项，
             // 保留它只会显示空弹窗（且 Enter/Tab
             // 会接受并不存在的行），因此丢弃该过滤器。
             acFilter = "";
             i = 0;
-            while (i < acAllItems.Count) {
-                acItems.Add(acAllItems[i]);
-                if (i < acAllKinds.Count) { acKinds.Add(acAllKinds[i]); }
-                else { acKinds.Add("W"); }
+            while (i < acAllCandidates.Count) {
+                CeCandidateItem cand = acAllCandidates[i];
+                acItems.Add(cand.item);
+                acKinds.Add(cand.kind);
                 i = i + 1;
             }
         }
@@ -144,8 +144,8 @@ partial class CodeEditor {
     /// 未过滤的候选列表至少包含一个
     /// 指定种类条目时返回 true（用于灰显不可用的过滤按钮）。
     bool HasKind(string kind) {
-        for (int i = 0; i < acAllKinds.Count; i = i + 1) {
-            if (acAllKinds[i] == kind) { return true; }
+        for (int i = 0; i < acAllCandidates.Count; i = i + 1) {
+            if (acAllCandidates[i].kind == kind) { return true; }
         }
         return false;
     }
@@ -205,64 +205,54 @@ partial class CodeEditor {
         return CodeEditor.StartsWithI(a, b) && a.Length == b.Length;
     }
 
-    /// 按相关度降序原地排序候选/种类列表。
-    static void SortByScore(List<string> items, List<string> kinds, List<int> scores) {
+    /// 按相关度降序原地排序候选实体列表。
+    static void SortCandidatesByScore(List<CeCandidateItem> items, List<int> scores) {
         int i = 1;
         while (i < items.Count) {
-            string it = items[i];
-            string kd = kinds[i];
+            CeCandidateItem it = items[i];
             int sc = scores[i];
             int j = i - 1;
             while (j >= 0 && scores[j] < sc) {
                 items[j + 1] = items[j];
-                kinds[j + 1] = kinds[j];
                 scores[j + 1] = scores[j];
                 j = j - 1;
             }
             items[j + 1] = it;
-            kinds[j + 1] = kd;
             scores[j + 1] = sc;
             i = i + 1;
         }
     }
 
-    /// 按相关度降序保留最好的 `limit` 个候选。弹窗只显示前几十个，而
+    /// 按相关度降序保留最好的 `limit` 个候选实体。弹窗只显示前几十个，而
     /// 一次击键的候选可能上千：对全部候选做插入排序是平方级的，这里
     /// 只维护一个长度有界的有序前缀，代价降到 候选数×limit。
-    /// 与 SortByScore 一样是稳定的（同分保持收集顺序）。
-    static void SortByScoreTop(List<string> items, List<string> kinds,
-                               List<int> scores, int limit) {
-        List<string> ti = new List<string>();
-        List<string> tk = new List<string>();
+    /// 与 SortCandidatesByScore 一样是稳定的（同分保持收集顺序）。
+    static void SortCandidatesByScoreTop(List<CeCandidateItem> items,
+                                        List<int> scores, int limit) {
+        List<CeCandidateItem> ti = new List<CeCandidateItem>();
         List<int> ts = new List<int>();
         for (int i = 0; i < items.Count; i = i + 1) {
             int sc = scores[i];
             if (ts.Count >= limit && sc <= ts[ts.Count - 1]) { continue; }
             ti.Add(items[i]);
-            tk.Add(kinds[i]);
             ts.Add(sc);
             int j = ts.Count - 2;
             while (j >= 0 && ts[j] < sc) {
                 ti[j + 1] = ti[j];
-                tk[j + 1] = tk[j];
                 ts[j + 1] = ts[j];
                 j = j - 1;
             }
             ti[j + 1] = items[i];
-            tk[j + 1] = kinds[i];
             ts[j + 1] = sc;
             if (ts.Count > limit) {
                 ti.RemoveAt(ti.Count - 1);
-                tk.RemoveAt(tk.Count - 1);
                 ts.RemoveAt(ts.Count - 1);
             }
         }
         items.Clear();
-        kinds.Clear();
         scores.Clear();
         for (int k = 0; k < ti.Count; k = k + 1) {
             items.Add(ti[k]);
-            kinds.Add(tk[k]);
             scores.Add(ts[k]);
         }
     }
@@ -288,19 +278,17 @@ partial class CodeEditor {
         if (acDot) {
             if (acStart > curCol || acStart < 0) { acActive = false; acDot = false; return; }
             string prefix = ln.Substring(acStart, curCol - acStart);
-            acAllItems = new List<string>();
-            acAllKinds = new List<string>();
+            acAllCandidates = new List<CeCandidateItem>();
             List<int> dscores = new List<int>();
             for (int fi = 0; fi < acFull.Count; fi = fi + 1) {
                 int sc = CodeEditor.MatchScore(acFull[fi], prefix);
                 if (sc >= 0) {
-                    acAllItems.Add(acFull[fi]);
-                    acAllKinds.Add(CodeEditor.MemberKind(acFull[fi]));
+                    acAllCandidates.Add(new CeCandidateItem(acFull[fi], CodeEditor.MemberKind(acFull[fi])));
                     dscores.Add(sc);
                 }
             }
-            if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
-            CodeEditor.SortByScore(acAllItems, acAllKinds, dscores);
+            if (acAllCandidates.Count == 0) { acActive = false; acDot = false; return; }
+            CodeEditor.SortCandidatesByScore(acAllCandidates, dscores);
             acSel = 0;
             ApplyKindFilter();
             return;
@@ -315,29 +303,26 @@ partial class CodeEditor {
         string pfx = ln.Substring(st, curCol - st);
         if (pfx.Length < 1 && !acForced) { acActive = false; return; }
 
-        List<string> cand;
-        List<string> candKinds;
+        List<CeCompletionCandidate> cands;
         List<string> words = new List<string>();
         if (InAttributeContext()) {
             // 在 `[ ... ]` 内：这里只有真正的特性。编译器
             // 只识别 DllImport 和 StructLayout（见 parser.c）。
-            cand = new List<string>();
-            candKinds = new List<string>();
-            CodeEditor.AddKindWords(cand, candKinds, "DllImport StructLayout", "M");
+            cands = new List<CeCompletionCandidate>();
+            cands.Add(new CeCompletionCandidate("DllImport", "M"));
+            cands.Add(new CeCompletionCandidate("StructLayout", "M"));
         } else {
             EnsureCandBase();
-            cand = cbItems;
-            candKinds = cbKinds;
+            cands = cbCandidates;
             int radius = CodeEditor.WordScanRadius();
             CodeEditor.CollectWordsRange(lines, curLine - radius,
                                          curLine + radius, words);
         }
-        acAllItems = new List<string>();
-        acAllKinds = new List<string>();
+        acAllCandidates = new List<CeCandidateItem>();
         List<int> scores = new List<int>();
         Dict<string, bool> taken = new Dict<string, bool>();
-        ScoreCandidates(cand, candKinds, "W", pfx, taken, scores);
-        ScoreCandidates(words, null, "W", pfx, taken, scores);
+        ScoreCandidateEntities(cands, pfx, taken, scores);
+        ScoreWords(words, "W", pfx, taken, scores);
         if (pfx.Length >= 1 && externalCompletion != null && documentPath.Length > 0) {
             List<CodeCompletionItem> lspItems = externalCompletion(documentPath, curLine, curCol);
             if (lspItems != null && lspItems.Count > 0) {
@@ -347,22 +332,51 @@ partial class CodeEditor {
                         int sc = CodeEditor.MatchScore(lab, pfx);
                         if (sc >= 0) {
                             taken[lab] = true;
-                            acAllItems.Add(lab);
                             string k = lspItems[li].kind;
                             if (k.Length == 0) { k = "M"; }
-                            acAllKinds.Add(k);
+                            acAllCandidates.Add(new CeCandidateItem(lab, k));
                             scores.Add(sc + 500);
                         }
                     }
                 }
             }
         }
-        if (acAllItems.Count == 0) { acActive = false; return; }
+        if (acAllCandidates.Count == 0) { acActive = false; return; }
         // 排序后保留最优的少数：按收集顺序截断会
         // 在明显候选项扫描较晚时将其丢弃。
-        CodeEditor.SortByScoreTop(acAllItems, acAllKinds, scores, 60);
+        CodeEditor.SortCandidatesByScoreTop(acAllCandidates, scores, 60);
         acSel = 0;
         ApplyKindFilter();
+    }
+
+    /// 把实体列表 `cands` 中匹配 `pfx` 的候选追加到弹窗列表（消除平行列表反模式）。
+    void ScoreCandidateEntities(List<CeCompletionCandidate> cands,
+                                string pfx, Dict<string, bool> taken, List<int> scores) {
+        if (cands == null) { return; }
+        for (int i = 0; i < cands.Count; i = i + 1) {
+            string w = cands[i].item;
+            int sc = CodeEditor.MatchScore(w, pfx);
+            if (w != pfx && sc >= 0 && !taken.ContainsKey(w)) {
+                taken.Add(w, true);
+                acAllCandidates.Add(new CeCandidateItem(w, cands[i].kind));
+                scores.Add(sc);
+            }
+        }
+    }
+
+    /// 把单词列表 `words` 中匹配 `pfx` 的候选追加到弹窗列表，统一赋予 `defKind` 种类。
+    void ScoreWords(List<string> words, string defKind,
+                    string pfx, Dict<string, bool> taken, List<int> scores) {
+        if (words == null) { return; }
+        for (int i = 0; i < words.Count; i = i + 1) {
+            string w = words[i];
+            int sc = CodeEditor.MatchScore(w, pfx);
+            if (w != pfx && sc >= 0 && !taken.ContainsKey(w)) {
+                taken.Add(w, true);
+                acAllCandidates.Add(new CeCandidateItem(w, defKind));
+                scores.Add(sc);
+            }
+        }
     }
 
     /// 把 `items` 中匹配 `pfx` 的候选追加到弹窗列表，`taken` 跟踪已入选的
@@ -374,9 +388,9 @@ partial class CodeEditor {
             int sc = CodeEditor.MatchScore(w, pfx);
             if (w != pfx && sc >= 0 && !taken.ContainsKey(w)) {
                 taken.Add(w, true);
-                acAllItems.Add(w);
-                if (kinds != null && i < kinds.Count) { acAllKinds.Add(kinds[i]); }
-                else { acAllKinds.Add(defKind); }
+                string k = defKind;
+                if (kinds != null && i < kinds.Count) { k = kinds[i]; }
+                acAllCandidates.Add(new CeCandidateItem(w, k));
                 scores.Add(sc);
             }
         }
@@ -388,13 +402,17 @@ partial class CodeEditor {
     void EnsureCandBase() {
         EnsureProjectScan();
         EnsureBufTypes();
-        if (cbItems != null && cbGen == candBaseGen) { return; }
-        cbItems = new List<string>();
-        cbKinds = new List<string>();
-        CodeEditor.SnippetListK(cbItems, cbKinds);
-        CodeEditor.KeywordListK(cbItems, cbKinds);
-        AddStdlibCandidates(cbItems, cbKinds);
-        AddProjectCandidates(cbItems, cbKinds);
+        if (cbCandidates != null && cbGen == candBaseGen) { return; }
+        List<string> items = new List<string>();
+        List<string> kinds = new List<string>();
+        CodeEditor.SnippetListK(items, kinds);
+        CodeEditor.KeywordListK(items, kinds);
+        AddStdlibCandidates(items, kinds);
+        AddProjectCandidates(items, kinds);
+        cbCandidates = new List<CeCompletionCandidate>();
+        for (int i = 0; i < items.Count && i < kinds.Count; i = i + 1) {
+            cbCandidates.Add(new CeCompletionCandidate(items[i], kinds[i]));
+        }
         cbGen = candBaseGen;
     }
 
@@ -643,10 +661,8 @@ partial class CodeEditor {
     /// 开始一轮跨文件统计：收集本缓冲区的声明，计数清零。
     void BeginExternRefs() {
         extRefDirty = false;
-        extRefKeys = new List<string>();
-        extRefVals = new List<int>();
-        extRefDeclOwner = new List<string>();
-        extRefDeclName = new List<string>();
+        extRefCounts = new List<CeExtRefCount>();
+        extRefDecls = new List<CeExtRefDecl>();
         // 上一轮可能停在某个文件中间，那份进度对新一轮无效。
         extRefFileIdx = null;
         extRefDeclAt = 0;
@@ -661,14 +677,16 @@ partial class CodeEditor {
                 continue;
             }
             string key = refIdx.owners[li] + "." + dn;
-            if (CodeEditor.Has(extRefKeys, key)) { continue; }
-            extRefKeys.Add(key);
-            extRefVals.Add(0);
-            extRefDeclOwner.Add(refIdx.owners[li]);
-            extRefDeclName.Add(dn);
+            bool exists = false;
+            for (int k = 0; k < extRefCounts.Count; k = k + 1) {
+                if (extRefCounts[k].key == key) { exists = true; break; }
+            }
+            if (exists) { continue; }
+            extRefCounts.Add(new CeExtRefCount(key, 0));
+            extRefDecls.Add(new CeExtRefDecl(refIdx.owners[li], dn));
         }
         extRefAt = 0;
-        if (extRefDeclName.Count == 0) { extRefAt = 0 - 1; }
+        if (extRefDecls.Count == 0) { extRefAt = 0 - 1; }
     }
 
     /// 跨文件统计推进至多 `kbBudget` KB 的扫描量（一个声明扫一个
@@ -696,13 +714,13 @@ partial class CodeEditor {
                 // 建索引要拆行、抹除、划分 owner、逐行取声明名。
                 spent = spent + kb * 4;
             }
-            while (extRefDeclAt < extRefDeclName.Count) {
+            while (extRefDeclAt < extRefDecls.Count) {
                 if (kbBudget > 0 && spent >= kbBudget) { return; }
                 // 同一声明类型的接收者在一个文件里只收集一次
                 // （声明按行序归类，同类型的连成一段）。
                 if (extRefFamily == null
-                    || extRefDeclOwner[extRefDeclAt] != extRefOwnerCur) {
-                    extRefOwnerCur = extRefDeclOwner[extRefDeclAt];
+                    || extRefDecls[extRefDeclAt].owner != extRefOwnerCur) {
+                    extRefOwnerCur = extRefDecls[extRefDeclAt].owner;
                     extRefFamily = new List<string>();
                     extRefRecvs = new List<string>();
                     CodeEditor.MemberRecvsPre(extRefFileIdx.stripped,
@@ -710,10 +728,10 @@ partial class CodeEditor {
                     // 收集接收者要为类型家族的每个成员扫一遍本文件。
                     spent = spent + kb * extRefFamily.Count;
                 }
-                extRefVals[extRefDeclAt] = extRefVals[extRefDeclAt]
+                extRefCounts[extRefDeclAt].count = extRefCounts[extRefDeclAt].count
                     + CodeEditor.CountMemberRefsWith(extRefFileIdx,
                         extRefFamily, extRefRecvs,
-                        extRefDeclName[extRefDeclAt], null);
+                        extRefDecls[extRefDeclAt].name, null);
                 extRefDeclAt = extRefDeclAt + 1;
                 spent = spent + kb;
             }
@@ -732,8 +750,8 @@ partial class CodeEditor {
         StepExternRefs(512);
         if (extRefAt >= 0) { return 0 - 1; }
         string key = owner + "." + member;
-        for (int i = 0; i < extRefKeys.Count; i = i + 1) {
-            if (extRefKeys[i] == key) { return extRefVals[i]; }
+        for (int i = 0; i < extRefCounts.Count; i = i + 1) {
+            if (extRefCounts[i].key == key) { return extRefCounts[i].count; }
         }
         return 0;
     }
@@ -764,12 +782,12 @@ partial class CodeEditor {
     /// 未经统计的数字。
     int LensRefCountBudgeted(string name, int declLine) {
         int at = 0 - 1;
-        for (int k = 0; k < lensKeys.Count; k = k + 1) {
-            if (lensKeys[k] == name) { at = k; break; }
+        for (int k = 0; k < lensMemos.Count; k = k + 1) {
+            if (lensMemos[k].name == name) { at = k; break; }
         }
-        if (at >= 0 && lensFresh[at] == 1) { return lensVals[at]; }
+        if (at >= 0 && lensMemos[at].fresh == 1) { return lensMemos[at].count; }
         if (lensBudget <= 0) {
-            if (at >= 0) { return lensVals[at]; }
+            if (at >= 0) { return lensMemos[at].count; }
             lensPending = true;
             return 0 - 1;
         }
@@ -779,23 +797,19 @@ partial class CodeEditor {
         // 保留上次的值（或先不画），下一帧接着算。
         if (v < 0) {
             lensPending = true;
-            if (at >= 0) { return lensVals[at]; }
+            if (at >= 0) { return lensMemos[at].count; }
             return 0 - 1;
         }
         if (at >= 0) {
-            lensVals[at] = v;
-            lensFresh[at] = 1;
+            lensMemos[at].count = v;
+            lensMemos[at].fresh = 1;
             return v;
         }
         // 浏览大型项目时记忆表不能无界增长。
-        if (lensKeys.Count >= 512) {
-            lensKeys = new List<string>();
-            lensVals = new List<int>();
-            lensFresh = new List<int>();
+        if (lensMemos.Count >= 512) {
+            lensMemos = new List<CeLensMemo>();
         }
-        lensKeys.Add(name);
-        lensVals.Add(v);
-        lensFresh.Add(1);
+        lensMemos.Add(new CeLensMemo(name, v, 1));
         return v;
     }
 
@@ -813,7 +827,7 @@ partial class CodeEditor {
         if (lensStamp != stamp) {
             lensStamp = stamp;
             lensQuietMs = app.nowMs;
-            for (int i = 0; i < lensFresh.Count; i = i + 1) { lensFresh[i] = 0; }
+            for (int i = 0; i < lensMemos.Count; i = i + 1) { lensMemos[i].fresh = 0; }
         }
         // 滚动中或刚停止滚动（200ms 内）：视口正在移动，
         // 优先保证 60fps 丝滑滚动体验，暂停重度符号扫描。
@@ -1164,13 +1178,11 @@ partial class CodeEditor {
         }
 
         acFilter = "";
-        acAllItems = new List<string>();
-        acAllKinds = new List<string>();
+        acAllCandidates = new List<CeCandidateItem>();
         for (int fi = 0; fi < acFull.Count; fi = fi + 1) {
-            acAllItems.Add(acFull[fi]);
-            acAllKinds.Add(CodeEditor.MemberKind(acFull[fi]));
+            acAllCandidates.Add(new CeCandidateItem(acFull[fi], CodeEditor.MemberKind(acFull[fi])));
         }
-        if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
+        if (acAllCandidates.Count == 0) { acActive = false; acDot = false; return; }
         acSel = 0;
         ApplyKindFilter();
     }
@@ -1202,13 +1214,11 @@ partial class CodeEditor {
         CodeEditor.ChildNamespaces(prefix, kids);
         for (int ki = 0; ki < kids.Count; ki = ki + 1) { acFull.Add(kids[ki]); }
         acFilter = "";
-        acAllItems = new List<string>();
-        acAllKinds = new List<string>();
+        acAllCandidates = new List<CeCandidateItem>();
         for (int fi = 0; fi < acFull.Count; fi = fi + 1) {
-            acAllItems.Add(acFull[fi]);
-            acAllKinds.Add("M");
+            acAllCandidates.Add(new CeCandidateItem(acFull[fi], "M"));
         }
-        if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
+        if (acAllCandidates.Count == 0) { acActive = false; acDot = false; return; }
         acSel = 0;
         ApplyKindFilter();
     }
@@ -1769,40 +1779,36 @@ partial class CodeEditor {
         }
     }
 
-    static List<string> nsTypeNames;
-    static List<string> nsTypeNs;
+    static List<CeStdlibTypeEntry> nsTypeTable;
 
     /// Builds the name -> namespace table once. It used to be rebuilt as a
     /// dozen packed strings on every lookup, and the lookup runs for every
     /// capitalised identifier in the buffer each time the diagnostics rerun.
     static void EnsureNsTable() {
-        if (CodeEditor.nsTypeNames != null) { return; }
-        List<string> names = new List<string>();
-        List<string> nss = new List<string>();
-        CodeEditor.AddNsGroup(names, nss, "System.IO", "File Directory Path");
-        CodeEditor.AddNsGroup(names, nss, "System.Diagnostics", "Process");
-        CodeEditor.AddNsGroup(names, nss, "System.Text", "Encoding");
-        CodeEditor.AddNsGroup(names, nss, "System.Json", "JsonValue");
-        CodeEditor.AddNsGroup(names, nss, "System.Threading",
+        if (CodeEditor.nsTypeTable != null) { return; }
+        List<CeStdlibTypeEntry> table = new List<CeStdlibTypeEntry>();
+        CodeEditor.AddNsGroup(table, "System.IO", "File Directory Path");
+        CodeEditor.AddNsGroup(table, "System.Diagnostics", "Process");
+        CodeEditor.AddNsGroup(table, "System.Text", "Encoding");
+        CodeEditor.AddNsGroup(table, "System.Json", "JsonValue");
+        CodeEditor.AddNsGroup(table, "System.Threading",
             "Thread Mutex Semaphore Stopwatch AtomicInt SharedTable");
-        CodeEditor.AddNsGroup(names, nss, "System.Net.Sockets",
+        CodeEditor.AddNsGroup(table, "System.Net.Sockets",
             "Socket TcpListener TcpClient UdpClient AsyncSocket");
-        CodeEditor.AddNsGroup(names, nss, "System.Net.Http",
+        CodeEditor.AddNsGroup(table, "System.Net.Http",
             "HttpClient HttpRequest HttpResponse HttpServer HttpRouter");
-        CodeEditor.AddNsGroup(names, nss, "System.Net.WebSocket",
+        CodeEditor.AddNsGroup(table, "System.Net.WebSocket",
             "WebSocketClient");
-        CodeEditor.AddNsGroup(names, nss, "System.Data", "DbConnection DbResult");
-        CodeEditor.AddNsGroup(names, nss, "System.Data.Orm", "QueryBuilder");
-        CodeEditor.AddNsGroup(names, nss, "Gui", "App Canvas Theme");
-        CodeEditor.AddNsGroup(names, nss, "Gui.Widget",
+        CodeEditor.AddNsGroup(table, "System.Data", "DbConnection DbResult");
+        CodeEditor.AddNsGroup(table, "System.Data.Orm", "QueryBuilder");
+        CodeEditor.AddNsGroup(table, "Gui", "App Canvas Theme");
+        CodeEditor.AddNsGroup(table, "Gui.Widget",
             "CodeEditor TreeView Ribbon Modal DataTable Dropdown Carousel Pagination");
-        CodeEditor.nsTypeNs = nss;
-        CodeEditor.nsTypeNames = names;
+        CodeEditor.nsTypeTable = table;
     }
 
     /// Appends every space-separated name in `words` with namespace `ns`.
-    static void AddNsGroup(List<string> names, List<string> nss, string ns,
-                           string words) {
+    static void AddNsGroup(List<CeStdlibTypeEntry> table, string ns, string words) {
         int i = 0;
         int n = words.Length;
         while (i < n) {
@@ -1810,8 +1816,7 @@ partial class CodeEditor {
             int s2 = i;
             while (i < n && words[i] != 32) { i = i + 1; }
             if (i > s2) {
-                names.Add(words.Substring(s2, i - s2));
-                nss.Add(ns);
+                table.Add(new CeStdlibTypeEntry(words.Substring(s2, i - s2), ns));
             }
         }
     }
@@ -1822,10 +1827,9 @@ partial class CodeEditor {
     /// 误报在用户自己的标识符上。
     static string NsForStdlibType(string name) {
         CodeEditor.EnsureNsTable();
-        List<string> names = CodeEditor.nsTypeNames;
-        List<string> nss = CodeEditor.nsTypeNs;
-        for (int i = 0; i < names.Count; i = i + 1) {
-            if (names[i] == name) { return nss[i]; }
+        List<CeStdlibTypeEntry> table = CodeEditor.nsTypeTable;
+        for (int i = 0; i < table.Count; i = i + 1) {
+            if (table[i].name == name) { return table[i].ns; }
         }
         return "";
     }
@@ -1836,7 +1840,10 @@ partial class CodeEditor {
         EnsureProjectScan();
         if (CodeEditor.HasProjType(projTypes, name)) { return true; }
         EnsureBufTypes();
-        return CodeEditor.Has(muTypeNames, name);
+        for (int i = 0; i < muTypes.Count; i = i + 1) {
+            if (muTypes[i].name == name) { return true; }
+        }
+        return false;
     }
 
     /// 查找用户类型 `typeName` 的声明成员（先项目文件，后
@@ -1850,11 +1857,9 @@ partial class CodeEditor {
             }
         }
         EnsureBufTypes();
-        List<string> tn = muTypeNames;
-        List<string> tm = muTypeMembers;
-        for (int j = 0; j < tn.Count; j = j + 1) {
-            if (tn[j] == typeName) {
-                CodeEditor.AddWords(outMem, tm[j]);
+        for (int j = 0; j < muTypes.Count; j = j + 1) {
+            if (muTypes[j].name == typeName) {
+                CodeEditor.AddWords(outMem, muTypes[j].members);
                 return true;
             }
         }
@@ -1964,12 +1969,10 @@ partial class CodeEditor {
             }
         }
         EnsureBufTypes();
-        List<string> tn = muTypeNames;
-        List<string> tm = muTypeMembers;
-        for (int a = 0; a < tn.Count; a = a + 1) {
-            CodeEditor.AddCand(cand, kinds, seen, tn[a], "T");
+        for (int a = 0; a < muTypes.Count; a = a + 1) {
+            CodeEditor.AddCand(cand, kinds, seen, muTypes[a].name, "T");
             List<string> mem2 = new List<string>();
-            CodeEditor.AddWords(mem2, tm[a]);
+            CodeEditor.AddWords(mem2, muTypes[a].members);
             for (int b = 0; b < mem2.Count; b = b + 1) {
                 CodeEditor.AddCand(cand, kinds, seen, mem2[b], "M");
             }
@@ -1998,10 +2001,14 @@ partial class CodeEditor {
     /// 每次光标移动都要用到它，而重扫是一整篇解析，因此只在结构
     /// 真的变了时重扫（见 BufTypesStructuralChange）。
     void EnsureBufTypes() {
-        if (muTypeNames != null && !BufTypesStructuralChange()) { return; }
-        muTypeNames = new List<string>();
-        muTypeMembers = new List<string>();
-        CodeEditor.ScanTypeLinesInto(lines, muTypeNames, muTypeMembers);
+        if (muTypes != null && !BufTypesStructuralChange()) { return; }
+        List<string> names = new List<string>();
+        List<string> membersJoined = new List<string>();
+        CodeEditor.ScanTypeLinesInto(lines, names, membersJoined);
+        muTypes = new List<CeBufType>();
+        for (int k = 0; k < names.Count && k < membersJoined.Count; k = k + 1) {
+            muTypes.Add(new CeBufType(names[k], membersJoined[k]));
+        }
         candBaseGen = candBaseGen + 1;
         btLineSrc = new List<string>();
         for (int i = 0; i < lines.Count; i = i + 1) { btLineSrc.Add(lines[i]); }
@@ -2069,37 +2076,30 @@ partial class CodeEditor {
         // change here (a new using, a type declared elsewhere) drops the
         // per-line cache.
         string ctx = fileNs + "|" + string.Join(",", usings) + "|"
-            + Convert.ToString(muTypeNames.Count) + ":"
+            + Convert.ToString(muTypes.Count) + ":"
             + Convert.ToString(projTypes.Count);
-        if (muCtx != ctx || muLineSrc == null) {
+        if (muCtx != ctx || muLineCaches == null) {
             muCtx = ctx;
-            muLineSrc = new List<string>();
-            muLineNs = new List<string>();
-            muLineWord = new List<string>();
+            muLineCaches = new List<CeMissingUsingLine>();
         }
         fixes = new List<QuickFix>();
-        List<string> tn = muTypeNames;
         int li = 0;
         while (li < lines.Count) {
-            while (muLineSrc.Count <= li) {
-                muLineSrc.Add(null);
-                muLineNs.Add("");
-                muLineWord.Add("");
+            while (muLineCaches.Count <= li) {
+                muLineCaches.Add(new CeMissingUsingLine(null, "", ""));
             }
-            if (muLineSrc[li] != lines[li]) {
-                ScanLineMissingUsing(li, usings, fileNs, tn);
+            if (muLineCaches[li].src != lines[li]) {
+                ScanLineMissingUsing(li, usings, fileNs);
             }
-            if (muLineNs[li].Length > 0) {
-                errors.Add(new Diagnostic(li, "'" + muLineWord[li]
-                    + "' needs 'using " + muLineNs[li] + ";'"));
-                fixes.Add(new QuickFix(li, muLineNs[li]));
+            if (muLineCaches[li].ns.Length > 0) {
+                errors.Add(new Diagnostic(li, "'" + muLineCaches[li].word
+                    + "' needs 'using " + muLineCaches[li].ns + ";'"));
+                fixes.Add(new QuickFix(li, muLineCaches[li].ns));
             }
             li = li + 1;
         }
-        while (muLineSrc.Count > lines.Count) {
-            muLineSrc.RemoveAt(muLineSrc.Count - 1);
-            muLineNs.RemoveAt(muLineNs.Count - 1);
-            muLineWord.RemoveAt(muLineWord.Count - 1);
+        while (muLineCaches.Count > lines.Count) {
+            muLineCaches.RemoveAt(muLineCaches.Count - 1);
         }
         muStamp = TextStamp();
     }
@@ -2108,16 +2108,16 @@ partial class CodeEditor {
     /// every line still holds the text it was scanned from. Returns false
     /// when the buffer moved on and a real scan is needed.
     bool ReplayMissingUsings() {
-        if (muLineSrc == null || muLineSrc.Count != lines.Count) { return false; }
+        if (muLineCaches == null || muLineCaches.Count != lines.Count) { return false; }
         for (int i = 0; i < lines.Count; i = i + 1) {
-            if (muLineSrc[i] != lines[i]) { return false; }
+            if (muLineCaches[i].src != lines[i]) { return false; }
         }
         fixes = new List<QuickFix>();
         for (int j = 0; j < lines.Count; j = j + 1) {
-            if (muLineNs[j].Length > 0) {
-                errors.Add(new Diagnostic(j, "'" + muLineWord[j]
-                    + "' needs 'using " + muLineNs[j] + ";'"));
-                fixes.Add(new QuickFix(j, muLineNs[j]));
+            if (muLineCaches[j].ns.Length > 0) {
+                errors.Add(new Diagnostic(j, "'" + muLineCaches[j].word
+                    + "' needs 'using " + muLineCaches[j].ns + ";'"));
+                fixes.Add(new QuickFix(j, muLineCaches[j].ns));
             }
         }
         return true;
@@ -2126,11 +2126,10 @@ partial class CodeEditor {
     /// Scans one line for the first stdlib type used without its `using` and
     /// records the answer (namespace + type name, both "" for none) in the
     /// per-line cache.
-    void ScanLineMissingUsing(int li, List<string> usings, string fileNs,
-                              List<string> tn) {
-        muLineSrc[li] = lines[li];
-        muLineNs[li] = "";
-        muLineWord[li] = "";
+    void ScanLineMissingUsing(int li, List<string> usings, string fileNs) {
+        muLineCaches[li].src = lines[li];
+        muLineCaches[li].ns = "";
+        muLineCaches[li].word = "";
         string tr = CodeEditor.TrimStr(lines[li]);
         if (tr.Length == 0 || tr.Substring(0, 1) == "/" || tr.Substring(0, 1) == "*"
             || CodeEditor.StartsWithP(tr, "using ") || CodeEditor.StartsWithP(tr, "namespace ")) {
@@ -2156,10 +2155,10 @@ partial class CodeEditor {
                             if (fileNs == ns) { imported = true; }
                             else if (fileNs.Length > ns.Length && CodeEditor.StartsWithP(fileNs, ns + ".")) { imported = true; }
                         }
-                        bool userType = CodeEditor.Has(tn, w) || CodeEditor.HasProjType(projTypes, w);
+                        bool userType = IsProjectType(w);
                         if (!imported && !userType) {
-                            muLineNs[li] = ns;
-                            muLineWord[li] = w;
+                            muLineCaches[li].ns = ns;
+                            muLineCaches[li].word = w;
                             return;
                         }
                     }

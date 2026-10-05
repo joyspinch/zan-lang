@@ -23,6 +23,19 @@ delegate int WvGetVersionFn(nint folder, nint version);
 delegate int WvPutZoomFn(nint self, double zoom);
 
 /// <summary>
+/// WebView2 消息通道与注入脚本绑定实体（消除 handlerNames/shimIds 平行列表反模式）。
+/// </summary>
+class WebViewHandlerEntry {
+    public string name;
+    public string shimId;
+
+    public WebViewHandlerEntry(string name, string shimId) {
+        this.name = name != null ? name : "";
+        this.shimId = shimId != null ? shimId : "";
+    }
+}
+
+/// <summary>
 /// Edge WebView2，由 Zan 直接驱动。
 ///
 /// WebView2 是 COM API：除加载器唯一的扁平导出外，其余都是
@@ -108,12 +121,9 @@ class WebView2 {
     string cookieDetailsResult;
     List<WebCookie> cookieListResult;
     // JS→native 消息桥：页面 postMessage 进入有界队列，宿主逐帧取走。
-    // handlerNames/shimIds 平行——每个通道一条 window.webkit shim 注入脚本，
-    // 记录其脚本 id 以便撤通道时一并移除。
     List<string> msgQ;
     int msgDrops;
-    List<string> handlerNames;
-    List<string> shimIds;
+    List<WebViewHandlerEntry> handlers;
     // InjectScript/InjectStyle 注册的文档级脚本 id（ClearInjected 撤用）。
     List<string> scriptIds;
     string pendingScriptId;
@@ -363,8 +373,7 @@ class WebView2 {
         w.cookieResult = "";
         w.msgQ = new List<string>();
         w.msgDrops = 0;
-        w.handlerNames = new List<string>();
-        w.shimIds = new List<string>();
+        w.handlers = new List<WebViewHandlerEntry>();
         w.scriptIds = new List<string>();
         w.pendingScriptId = "";
         w.pendingWindowNav = "";
@@ -474,9 +483,9 @@ class WebView2 {
         }
 
         // 刷新在就绪前添加的 message handler
-        if (handlerNames.Count > 0) {
-            for (int i = 0; i < handlerNames.Count; i = i + 1) {
-                this.AddDocScript(WebView2.ShimScript(handlerNames[i]));
+        if (handlers != null && handlers.Count > 0) {
+            for (int i = 0; i < handlers.Count; i = i + 1) {
+                this.AddDocScript(WebView2.ShimScript(handlers[i].name));
             }
         }
 
@@ -1026,26 +1035,33 @@ class WebView2 {
     // 每注册一个通道就注入一条 shim 脚本做形变；消息正文带 "名\t正文"
     // 前缀入队，TakeMessage 逐条取走。
 
+    int HandlerIndex(string name) {
+        if (handlers == null) { return -1; }
+        for (int i = 0; i < handlers.Count; i = i + 1) {
+            if (handlers[i].name == name) { return i; }
+        }
+        return -1;
+    }
+
     /// 注册消息通道（原生视图创建前后皆可调用；创建前由 WebView 控件
     /// 挂起，创建时补上）。同一通道重复注册为幂等成功。
     bool AddHandler(string name) {
         if (core == 0 || name == "") { return false; }
-        if (handlerNames.IndexOf(name) >= 0) { return true; }
+        if (HandlerIndex(name) >= 0) { return true; }
         string id = this.AddDocScript(WebView2.ShimScript(name));
         if (id == "") { return false; }
-        handlerNames.Add(name);
-        shimIds.Add(id);
+        if (handlers == null) { handlers = new List<WebViewHandlerEntry>(); }
+        handlers.Add(new WebViewHandlerEntry(name, id));
         return true;
     }
 
     /// 撤掉消息通道：移除 shim 脚本（对之后的页面生效），名字出活跃表
     /// （当前页残留的 shim 再 postMessage 也会被名字检查挡下）。
     void RemoveHandler(string name) {
-        int i = handlerNames.IndexOf(name);
+        int i = HandlerIndex(name);
         if (i < 0) { return; }
-        string id = shimIds[i];
-        handlerNames.RemoveAt(i);
-        shimIds.RemoveAt(i);
+        string id = handlers[i].shimId;
+        handlers.RemoveAt(i);
         if (core != 0 && id != "") {
             nint sid = Wide.Of(id);
             Com.Call1(core, WebView2.SlotRemoveDocScript(), sid);
