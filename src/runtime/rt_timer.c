@@ -1398,8 +1398,15 @@ static void joinmap_rehash(size_t ncap) {
 }
 
 static void joinmap_put(zan_join_pair_t *pr) {
+    /* Same policy as zan_co_live_add: double only when live entries alone
+     * would overflow, otherwise rehash in place -- a churn burst of
+     * completions must compact its tombstones, not ratchet the cap upward
+     * (high-throughput timers never shrink back otherwise). */
     if ((g_joinmap_live + g_joinmap_dead + 1) * 4 >= g_joinmap_cap * 3)
-        joinmap_rehash(g_joinmap_cap ? g_joinmap_cap * 2 : 64);
+        joinmap_rehash(g_joinmap_cap
+                           ? (g_joinmap_live * 4 > g_joinmap_cap ? g_joinmap_cap * 2
+                                                                 : g_joinmap_cap)
+                           : 64);
     size_t mask = g_joinmap_cap - 1;
     size_t i = live_hash(pr->frame) & mask;
     for (;;) {
