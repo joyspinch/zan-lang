@@ -130,12 +130,17 @@
   （fields.keys，语义自 GenForm/Designer.Inspector 实读代码钉死）+
   gen_knowledge.ps1 -WriteControls 重刷清单。教训：改契约必须同提交改契约测试，
   full 档半年不跑就攒 6 天盲区。
-- [ ] **B-ID97（P3·perf_frame_budget 像素确定性偶发）挂账（2026-10-05）**——full 档
-  发布门禁收敛后补验：帧预算数值全过（FRAME_BUDGET measured vs budget 无告警），像素
-  确定性检查 6 对里 5 对逐字节全等，仅 after-scroll A_vs_B 一对差一帧
-  （first_diff_byte=1817844 → 行 234 列 14，资源树区域；同帧三次重绘应全同，疑似
-  墙钟驱动的局部重绘漏进冻结时钟窗口）。复验两次均被并发会话的 build/ZanIDE.exe
-  增删循环打断（一次 Failed 后随删档转 Skipped，失败点是否漂移无法定论）。需静机
-  连跑三次取证：失败点固定=IDE 墙钟重绘泄漏（修 IDE，改用驱动冻结钟）；漂移=环境
-  噪声（改测试容差或加点稳定性等待）。复现配方：cmake 构建后 ctest -R
-  perf_frame_budget --output-on-failure（需 build/ZanIDE.exe 存在且无并发构建）。
+- [x] **B-ID97（P3·perf_frame_budget 像素确定性偶发）闭账（2026-10-05）**——根因两层：
+  ① 冻结测试钟不冻结样式补间——`AnimToIn` 在补间未落定时每帧重武装控件矩形条带帧，
+  冻结钟下 elapsed 恒定 → 永不落定 → 筛选框条带（27,234+333x51）永动；② 每个这种条带帧
+  都因 `BackdropDirtyIn` 的 `freezeAnimClock → return true` 豁免，把跨出条带的玻璃面板
+  模糊现场重算，卷积源混入条带外上一帧已合成像素（与整帧渲染不等价，C 层 miss=1 自认），
+  于是 A dump（条带帧后）与 B/C dump（整帧后）色调差一档。修复：判定从「与条带相交」
+  收紧为「完整落在条带内」（新 `RectInDamage`），跨条带玻璃一律欠账还账，冻结钟不再豁免。
+  证据链：uidrv 脚本二分定位（4 move+2 scroll 复现、无 move/整帧路径不复现）+ pframe
+  日志 `present=27,282+333x51 miss=1 ↔ 0,237+360x400 miss=0` 振荡。修复后修复版 IDE
+  复现脚本 A vs B 全 surface 逐字节全等，门禁脚本三连跑 6 对像素比较全绿（附带收益：
+  blend/restore 计数较修复前 dist 实测 1134/965 → 659/548，振荡消除）。
+  残留：blend/restore 预算（260/220）在并发会话高负载下两侧二进制都超标（像素计数
+  不随负载变，但帧混合变；静机门禁以下次 release gate 为准，超了就 -DCALIBRATE=1 重标）。
+  教训已入 zan-dev-standards（冻结钟永动诊断 + 局部帧玻璃源约束）。
