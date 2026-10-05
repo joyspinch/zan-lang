@@ -4,6 +4,21 @@ using Gui;
 
 namespace Gui.Component.Chart;
 
+/// <summary>强类型断轴解算项实体：将单断带配置与其实际 gapReal 像素/数据跨度绑定，消除平行列表反模式。</summary>
+class ChartBreakResolvedItem {
+    public ChartBreak brk;
+    public double gapReal;
+
+    public ChartBreakResolvedItem(ChartBreak brk, double gapReal) {
+        this.brk = brk;
+        this.gapReal = gapReal;
+    }
+
+    public static ChartBreakResolvedItem Of(ChartBreak brk, double gapReal) {
+        return new ChartBreakResolvedItem(brk, gapReal);
+    }
+}
+
 /// 纯 Zan 图表库 —— ECharts 2.2.x 的声明性子集，全部用
 /// stdlib 组件与确定性的整数几何绘制，无 JS / DOM / WebView：
 ///   · 17 种原生 series.type：line / bar / pie / scatter / k /
@@ -2220,49 +2235,46 @@ class Chart {
         return plotX + (int)(((long)v - (long)lo * (long)g) * (long)plotW / span);
     }
 
-    /// 定点数值 → 垂直像素（ValueXF 的纵轴对偶）。
-    /// ---- A15 axis breaks（scale/breakImpl.ts BreakScaleMapperImpl）----
-    /// elapsed 映射：把数据值映进“抽掉断带、铺平 gapReal”的线性空间。
-    /// breaks 已升序去重叠；gapReal 已解算（BrkGapReal）。链式扫描：
-    ///   v ≤ brk.vmax 且 v > brk.vmin → 断带内线性映射进 gapReal 停；
-    ///   v ≤ brk.vmin → 加 (v - lastBreakEnd) 停；否则跳过整个断带
-    ///   （加 vmin-lastBreakEnd+gapReal）。断带外尾部补 (v-lastBreakEnd)。
-    static double BrkElapsed(List<ChartBreak> breaks, List<double> gapReals,
-                             double v) {
+    /// 强类型实体主方法：elapsed 映射。
+    static double BrkElapsedItems(List<ChartBreakResolvedItem> items, double v) {
+        if (items == null) { return v; }
         double elapsed = 0.0;
         double lastEnd = 0.0;
-        for (int i = 0; i < breaks.Count; i = i + 1) {
-            ChartBreak b = breaks[i];
+        for (int i = 0; i < items.Count; i = i + 1) {
+            ChartBreakResolvedItem it = items[i];
+            if (it == null || it.brk == null) { continue; }
+            ChartBreak b = it.brk;
             double vmin = b.startD;
             double vmax = b.endD;
             if (v <= vmax) {
                 if (v > vmin) {
                     double span = vmax - vmin;
-                    double gr = gapReals[i];
+                    double gr = it.gapReal;
                     elapsed = elapsed + vmin - lastEnd + (v - vmin) / span * gr;
                 } else {
                     elapsed = elapsed + v - lastEnd;
                 }
                 return elapsed;
             }
-            elapsed = elapsed + vmin - lastEnd + gapReals[i];
+            elapsed = elapsed + vmin - lastEnd + it.gapReal;
             lastEnd = vmax;
         }
         return elapsed + v - lastEnd;
     }
 
-    /// elapsed 的逆映射（breakImpl.ts transformOut）：elapsedVal 落在某
-    /// 断带的 gapReal 段内 → 按比例折回数据空间；落在段外 → 段间线性。
-    static double BrkUnelapsed(List<ChartBreak> breaks, List<double> gapReals,
-                               double e) {
+    /// 强类型实体主方法：逆映射。
+    static double BrkUnelapsedItems(List<ChartBreakResolvedItem> items, double e) {
+        if (items == null) { return e; }
         double lastElapsedEnd = 0.0;
         double lastBreakEnd = 0.0;
-        for (int i = 0; i < breaks.Count; i = i + 1) {
-            ChartBreak b = breaks[i];
+        for (int i = 0; i < items.Count; i = i + 1) {
+            ChartBreakResolvedItem it = items[i];
+            if (it == null || it.brk == null) { continue; }
+            ChartBreak b = it.brk;
             double vmin = b.startD;
             double vmax = b.endD;
             double elapsedStart = lastElapsedEnd + vmin - lastBreakEnd;
-            double elapsedEnd = elapsedStart + gapReals[i];
+            double elapsedEnd = elapsedStart + it.gapReal;
             if (e <= elapsedEnd) {
                 if (e > elapsedStart) {
                     return vmin + (e - elapsedStart) / (elapsedEnd - elapsedStart) * (vmax - vmin);
@@ -2273,6 +2285,37 @@ class Chart {
             lastBreakEnd = vmax;
         }
         return lastBreakEnd + e - lastElapsedEnd;
+    }
+
+    /// 定点数值 → 垂直像素（ValueXF 的纵轴对偶）。
+    /// ---- A15 axis breaks（scale/breakImpl.ts BreakScaleMapperImpl）----
+    /// elapsed 映射：把数据值映进“抽掉断带、铺平 gapReal”的线性空间。
+    /// breaks 已升序去重叠；gapReal 已解算（BrkGapReal）。链式扫描：
+    ///   v ≤ brk.vmax 且 v > brk.vmin → 断带内线性映射进 gapReal 停；
+    ///   v ≤ brk.vmin → 加 (v - lastBreakEnd) 停；否则跳过整个断带
+    ///   （加 vmin-lastBreakEnd+gapReal）。断带外尾部补 (v-lastBreakEnd)。
+    static double BrkElapsed(List<ChartBreak> breaks, List<double> gapReals,
+                             double v) {
+        if (breaks == null || gapReals == null) { return v; }
+        List<ChartBreakResolvedItem> items = new List<ChartBreakResolvedItem>();
+        for (int i = 0; i < breaks.Count; i = i + 1) {
+            double gr = (i < gapReals.Count) ? gapReals[i] : 0.0;
+            items.Add(new ChartBreakResolvedItem(breaks[i], gr));
+        }
+        return Chart.BrkElapsedItems(items, v);
+    }
+
+    /// elapsed 的逆映射（breakImpl.ts transformOut）：elapsedVal 落在某
+    /// 断带的 gapReal 段内 → 按比例折回数据空间；落在段外 → 段间线性。
+    static double BrkUnelapsed(List<ChartBreak> breaks, List<double> gapReals,
+                               double e) {
+        if (breaks == null || gapReals == null) { return e; }
+        List<ChartBreakResolvedItem> items = new List<ChartBreakResolvedItem>();
+        for (int i = 0; i < breaks.Count; i = i + 1) {
+            double gr = (i < gapReals.Count) ? gapReals[i] : 0.0;
+            items.Add(new ChartBreakResolvedItem(breaks[i], gr));
+        }
+        return Chart.BrkUnelapsedItems(items, e);
     }
 
     /// 断带 gapReal 解算（updateAxisBreakGapReal 的静帧近似——本引擎
