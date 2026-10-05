@@ -454,6 +454,17 @@ class AtomicInt {
     }
 }
 
+/// 共享表进程登记项实体（消除 openHandles / openLabels 平行列表反模式）
+class SharedTableEntry {
+    public nint handle;
+    public string label;
+
+    public SharedTableEntry(nint handle, string label) {
+        this.handle = handle;
+        this.label = label;
+    }
+}
+
 /// <summary>
 /// 由命名共享内存支持的固定容量、固定模式的哈希表。
 /// 每个操作在线程与进程间都是原子的。
@@ -467,10 +478,9 @@ class SharedTable {
     string tableLabel;
 
     // Every table this process has mapped, by handle, so the server can report
-    // what shared memory it is holding. Only the handle is kept: holding the
+    // what shared memory it is holding. Only the handle and label are kept: holding the
     // object would keep the mapping alive for the life of the process.
-    static List<string> openLabels = null;
-    static List<nint> openHandles = null;
+    static List<SharedTableEntry> openEntries = null;
 
     [DllImport("crt", EntryPoint = "zan_shared_table_create")]
     static extern nint NativeCreate(string name, int capacity, int keySize, string schema);
@@ -607,29 +617,26 @@ class SharedTable {
     /// 都会走到；重复登记只更新标签）。
     static void Track(SharedTable table) {
         if (table.handle == 0) { return; }
-        if (SharedTable.openHandles == null) {
-            SharedTable.openHandles = new List<nint>();
-            SharedTable.openLabels = new List<string>();
+        if (SharedTable.openEntries == null) {
+            SharedTable.openEntries = new List<SharedTableEntry>();
         }
         string label = table.tableLabel;
         if (label == "") { label = "(anonymous)"; }
-        for (int i = 0; i < SharedTable.openHandles.Count; i = i + 1) {
-            if (SharedTable.openHandles[i] == table.handle) {
-                SharedTable.openLabels[i] = label;
+        for (int i = 0; i < SharedTable.openEntries.Count; i = i + 1) {
+            if (SharedTable.openEntries[i].handle == table.handle) {
+                SharedTable.openEntries[i].label = label;
                 return;
             }
         }
-        SharedTable.openHandles.Add(table.handle);
-        SharedTable.openLabels.Add(label);
+        SharedTable.openEntries.Add(new SharedTableEntry(table.handle, label));
     }
 
     /// 把句柄从本进程的打开表列表移除。
     static void Untrack(nint handle) {
-        if (SharedTable.openHandles == null) { return; }
-        for (int i = 0; i < SharedTable.openHandles.Count; i = i + 1) {
-            if (SharedTable.openHandles[i] == handle) {
-                SharedTable.openHandles.RemoveAt(i);
-                SharedTable.openLabels.RemoveAt(i);
+        if (SharedTable.openEntries == null) { return; }
+        for (int i = 0; i < SharedTable.openEntries.Count; i = i + 1) {
+            if (SharedTable.openEntries[i].handle == handle) {
+                SharedTable.openEntries.RemoveAt(i);
                 return;
             }
         }
@@ -898,22 +905,22 @@ class SharedTable {
 
     /// <summary>本进程当前映射着的共享表数量。</summary>
     static int OpenCount() {
-        if (SharedTable.openHandles == null) { return 0; }
-        return SharedTable.openHandles.Count;
+        if (SharedTable.openEntries == null) { return 0; }
+        return SharedTable.openEntries.Count;
     }
 
     /// 第 `index` 张表的标签（Label() 设置的名字）。
     static string OpenLabel(int index) {
-        if (SharedTable.openLabels == null) { return ""; }
-        if (index < 0 || index >= SharedTable.openLabels.Count) { return ""; }
-        return SharedTable.openLabels[index];
+        if (SharedTable.openEntries == null) { return ""; }
+        if (index < 0 || index >= SharedTable.openEntries.Count) { return ""; }
+        return SharedTable.openEntries[index].label;
     }
 
     /// <summary>第 `index` 张表的某项统计，取值见 STAT_* 常量。</summary>
     static long OpenStat(int index, int what) {
-        if (SharedTable.openHandles == null) { return 0; }
-        if (index < 0 || index >= SharedTable.openHandles.Count) { return 0; }
-        return NativeStat(SharedTable.openHandles[index], what);
+        if (SharedTable.openEntries == null) { return 0; }
+        if (index < 0 || index >= SharedTable.openEntries.Count) { return 0; }
+        return NativeStat(SharedTable.openEntries[index].handle, what);
     }
 
     /// 左对齐补空格到 width 宽，再追加一个空格作列间隔。
