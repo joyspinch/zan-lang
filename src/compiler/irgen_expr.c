@@ -1499,6 +1499,8 @@ static LLVMValueRef cpu_feature_fn(zan_irgen_t *g) {
 
     bool is_arm = (strstr(g->target_triple, "aarch64") != NULL ||
                    strstr(g->target_triple, "arm64") != NULL);
+    bool is_x86 = (strstr(g->target_triple, "x86") != NULL ||
+                   strstr(g->target_triple, "amd64") != NULL);
 
     if (is_arm) {
         LLVMValueRef is_neon = zan_icmp(g->builder, LLVMIntEQ, id, LLVMConstInt(i32t, 6, 0), "is_neon");
@@ -1506,7 +1508,7 @@ static LLVMValueRef cpu_feature_fn(zan_irgen_t *g) {
         LLVMValueRef is_lz = zan_icmp(g->builder, LLVMIntEQ, id, LLVMConstInt(i32t, 2, 0), "is_lz");
         LLVMValueRef ok = zan_or(g->builder, is_neon, zan_or(g->builder, is_pop, is_lz, "pop_or_lz"), "ok");
         LLVMBuildRet(g->builder, LLVMBuildZExt(g->builder, ok, i32t, "res"));
-    } else {
+    } else if (is_x86) {
         LLVMBasicBlockRef b_neon = LLVMAppendBasicBlockInContext(g->ctx, fn, "b_neon");
         LLVMBasicBlockRef b_cpuid = LLVMAppendBasicBlockInContext(g->ctx, fn, "b_cpuid");
 
@@ -1555,6 +1557,13 @@ static LLVMValueRef cpu_feature_fn(zan_irgen_t *g) {
         LLVMValueRef reg = LLVMBuildSelect(g->builder, is_id4, ebx, ecx, "reg");
         LLVMValueRef bit = zan_and(g->builder, zan_lshr(g->builder, reg, shift, "s"), LLVMConstInt(i32t, 1, 0), "bit");
         LLVMBuildRet(g->builder, bit);
+    } else {
+        /* Other targets (wasm32, riscv32, ...): the cpuid inline asm above is
+         * x86-only ("couldn't allocate output register for constraint '{ax}'"
+         * on the wasm backend). No hardware feature probes exist there —
+         * every Cpu.Has* reports 0 and guarded fast paths stay on the
+         * portable software path. */
+        LLVMBuildRet(g->builder, LLVMConstInt(i32t, 0, 0));
     }
 
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
@@ -3011,6 +3020,99 @@ static bool emit_sse42_call(zan_irgen_t *g, zan_ast_node_t *expr,
     return false;
 }
 
+/* ARM64 crypto-intrinsic declaration lookup/create (all <16 x i8>). */
+static LLVMValueRef aes_crypto_fn(zan_irgen_t *g, const char *name, int two_args) {
+    LLVMTypeRef v16i8 = LLVMVectorType(LLVMInt8TypeInContext(g->ctx), 16);
+    LLVMTypeRef fty = two_args
+        ? LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8, v16i8 }, 2, 0)
+        : LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8 }, 1, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
+    if (!fn) fn = LLVMAddFunction(g->mod, name, fty);
+    return fn;
+}
+
+/* Aes.* lowering for aarch64, algebraically equal to the x86 AESENC family.
+ * ARM's crypto AES ops XOR the round key FIRST, then run SubBytes/ShiftRows
+ * (the reverse of the FIPS/textbook order — ARM ARM shared pseudocode), i.e.
+ *   AESE(a,k)  = ShiftRows(SubBytes(a ^ k))    AESD(a,k)  = InvShiftRows(InvSubBytes(a ^ k))
+ *   AESMC(x)   = MixColumns(x)                 AESIMC(x)  = InvMixColumns(x)
+ * while x86 AESENC(a,k) = MC(SR(SB(a))) ^ k. SubBytes is nonlinear so a bare
+ * AESE can never yield SR(SB(a)) ^ w; instead run AESE against a zero key and
+ * fold the key through the GF(2)-linear MixColumns:
+ *   AESENC  = aesmc ( aese(a, 0) ^ aesimc(k) )   [MC(x^y)=MC(x)^MC(y), MC(IMC(k))=k]
+ *   AESENCLAST = aese(a, 0) ^ k
+ *   AESDEC  = aesimc( aesd(a, 0) ^ aesmc(k) )     [IMC(MC(k))=k]
+ *   AESDECLAST = aesd(a, 0) ^ k
+ *   InverseMixColumns = aesimc(a)   (AESIMC is its own inverse)
+ * Aes.KeygenAssist has no ARM counterpart and returns false -> clean
+ * unresolved-call diagnostic. */
+static bool emit_aes_arm(zan_irgen_t *g, zan_ast_node_t *expr,
+                         local_scope_t *locals, zan_istr_t method, int argc,
+                         LLVMValueRef *out) {
+    LLVMTypeRef v16i8 = LLVMVectorType(LLVMInt8TypeInContext(g->ctx), 16);
+    LLVMValueRef zero = LLVMConstNull(v16i8);
+
+    if (method.len == 7 && memcmp(method.str, "Encrypt", 7) == 0 && argc == 2) {
+        LLVMValueRef a = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMValueRef k = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
+        LLVMValueRef kimc = zan_call2(g->builder,
+            LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8 }, 1, 0),
+            aes_crypto_fn(g, "llvm.aarch64.crypto.aesimc", 0), (LLVMValueRef[]){ k }, 1, "kimc");
+        LLVMValueRef e = zan_call2(g->builder,
+            LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8, v16i8 }, 2, 0),
+            aes_crypto_fn(g, "llvm.aarch64.crypto.aese", 1), (LLVMValueRef[]){ a, zero }, 2, "aese");
+        LLVMValueRef x = zan_xor(g->builder, e, kimc, "encx");
+        LLVMValueRef em = zan_call2(g->builder,
+            LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8 }, 1, 0),
+            aes_crypto_fn(g, "llvm.aarch64.crypto.aesmc", 0), (LLVMValueRef[]){ x }, 1, "emc");
+        *out = v16i8_to_vec128(g, em);
+        return true;
+    }
+    if (method.len == 11 && memcmp(method.str, "EncryptLast", 11) == 0 && argc == 2) {
+        LLVMValueRef a = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMValueRef k = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
+        LLVMValueRef e = zan_call2(g->builder,
+            LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8, v16i8 }, 2, 0),
+            aes_crypto_fn(g, "llvm.aarch64.crypto.aese", 1), (LLVMValueRef[]){ a, zero }, 2, "aese");
+        *out = v16i8_to_vec128(g, zan_xor(g->builder, e, k, "elast"));
+        return true;
+    }
+    if (method.len == 7 && memcmp(method.str, "Decrypt", 7) == 0 && argc == 2) {
+        LLVMValueRef a = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMValueRef k = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
+        LLVMValueRef kmc = zan_call2(g->builder,
+            LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8 }, 1, 0),
+            aes_crypto_fn(g, "llvm.aarch64.crypto.aesmc", 0), (LLVMValueRef[]){ k }, 1, "kmc");
+        LLVMValueRef d = zan_call2(g->builder,
+            LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8, v16i8 }, 2, 0),
+            aes_crypto_fn(g, "llvm.aarch64.crypto.aesd", 1), (LLVMValueRef[]){ a, zero }, 2, "aesd");
+        LLVMValueRef x = zan_xor(g->builder, d, kmc, "decx");
+        LLVMValueRef dm = zan_call2(g->builder,
+            LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8 }, 1, 0),
+            aes_crypto_fn(g, "llvm.aarch64.crypto.aesimc", 0), (LLVMValueRef[]){ x }, 1, "dimc");
+        *out = v16i8_to_vec128(g, dm);
+        return true;
+    }
+    if (method.len == 11 && memcmp(method.str, "DecryptLast", 11) == 0 && argc == 2) {
+        LLVMValueRef a = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMValueRef k = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
+        LLVMValueRef d = zan_call2(g->builder,
+            LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8, v16i8 }, 2, 0),
+            aes_crypto_fn(g, "llvm.aarch64.crypto.aesd", 1), (LLVMValueRef[]){ a, zero }, 2, "aesd");
+        *out = v16i8_to_vec128(g, zan_xor(g->builder, d, k, "dlast"));
+        return true;
+    }
+    if (method.len == 17 && memcmp(method.str, "InverseMixColumns", 17) == 0 && argc == 1) {
+        LLVMValueRef a = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMValueRef im = zan_call2(g->builder,
+            LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8 }, 1, 0),
+            aes_crypto_fn(g, "llvm.aarch64.crypto.aesimc", 0), (LLVMValueRef[]){ a }, 1, "imc");
+        *out = v16i8_to_vec128(g, im);
+        return true;
+    }
+    return false;
+}
+
 static bool emit_aes_call(zan_irgen_t *g, zan_ast_node_t *expr,
                           local_scope_t *locals, LLVMValueRef *out) {
     if (expr->kind != AST_CALL) return false;
@@ -3022,6 +3124,11 @@ static bool emit_aes_call(zan_irgen_t *g, zan_ast_node_t *expr,
     zan_istr_t method = callee->member.name;
     int argc = expr->call.args.count;
     LLVMTypeRef v2i64 = LLVMVectorType(LLVMInt64TypeInContext(g->ctx), 2);
+
+    if (strstr(g->target_triple, "aarch64") != NULL ||
+        strstr(g->target_triple, "arm64") != NULL) {
+        return emit_aes_arm(g, expr, locals, method, argc, out);
+    }
 
     if (method.len == 7 && memcmp(method.str, "Encrypt", 7) == 0 && argc == 2) {
         LLVMValueRef v_val = vec128_to_v2i64(g, emit_expr(g, expr->call.args.items[0], locals));
@@ -3073,7 +3180,7 @@ static bool emit_aes_call(zan_irgen_t *g, zan_ast_node_t *expr,
         *out = v2i64_to_vec128(g, r);
         return true;
     }
-    if (method.len == 18 && memcmp(method.str, "InverseMixColumns", 18) == 0 && argc == 1) {
+    if (method.len == 17 && memcmp(method.str, "InverseMixColumns", 17) == 0 && argc == 1) {
         LLVMValueRef v_val = vec128_to_v2i64(g, emit_expr(g, expr->call.args.items[0], locals));
         LLVMTypeRef fty = LLVMFunctionType(v2i64, (LLVMTypeRef[]){ v2i64 }, 1, 0);
         LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.aesni.aesimc");

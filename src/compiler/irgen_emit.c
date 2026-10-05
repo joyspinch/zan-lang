@@ -3402,6 +3402,10 @@ static zan_status_t zan_bind_target_layout(zan_irgen_t *g,
     } else if (strncmp(triple, "x86_64", 6) == 0) {
         tm_cpu = "x86-64";
         tm_features = "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi";
+    } else if (strncmp(triple, "aarch64", 7) == 0) {
+        /* mirrors crosscomp.c: gates the llvm.aarch64.crypto.aes* selection
+         * used by emit_aes_call's ARM lowering */
+        tm_features = "+aes";
     }
     /* Machine codegen dominates compile time. Development builds (no
      * --publish / -O) use the fast path (FastISel, no machine-level

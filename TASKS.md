@@ -84,8 +84,28 @@
   crc32c_table_global，位精确；ARM 上该分支运行时本被 Cpu.HasSse42→0 守死，纯为
   模块合法化）。验证：裸 GuiHost 探针+3D demo android-arm64/ohos-arm64 链接通过；
   CRC32C("123456789")=0xE3069283 标准向量 x86 硬件与 ARM 软件路径（qemu-aarch64 实跑）
-  五值全等；x86 新旧 zanc 逐值一致；crc32_hw conformance 金样过。残项：wasm32 拉
-  Crc32C 现前进到 `couldn't allocate output register for constraint '{ax}'`——
-  `__zan_cpu_feature` 非 ARM 分支的 cpuid 内联 asm 在 wasm 后端非法（既有独立缺陷，
-  另批）；--emit-ir 240MB+ 模块尾截断 exit=0（独立小缺陷，另批）；emit_aes_call 的
-  llvm.x86.aesni.* 同类目标失配（ARM 上若被拉入会同样 fatal，待真实复现再修）。
+  五值全等；x86 新旧 zanc 逐值一致；crc32_hw conformance 金样过。两条残项已闭：
+  wasm32 段归 B-ID93、emit_aes_call 段归 B-ID94（均见下）。--emit-ir 240MB+ 模块
+  尾截断 exit=0 仍开放（独立小缺陷，另批）。
+- [x] **B-ID93（P2·wasm32 cpuid 内联 asm 非法）闭账（2026-10-04）**——B-ID92 残项：
+  `__zan_cpu_feature` 非 ARM 分支无条件发射 x86 cpuid 内联 asm（`{ax}` 约束），
+  wasm32/riscv 后端 SelectionDAG 无法分配输出寄存器，编译期 fatal。修法：
+  irgen_expr.c cpu_feature_fn 三分支化——x86/amd64 三连走原 cpuid asm，ARM 保持
+  既有读寄存器路径，**其余架构直接 `ret i32 0`**（wasm/riscv 无 cpuid 概念，全部
+  特性位恒不支持，与 ARM 守门语义一致）。验证：crc32_hw conformance 探针
+  wasm32 编译通过（原 `couldn't allocate output register for constraint '{ax}'`
+  fatal 消失）；IR 中 `@__zan_cpu_feature` 退化为 `ret i32 0`，模块零内联 asm。
+- [x] **B-ID94（P2·Aes.* aesni intrinsic 目标失配 + InverseMixColumns 静默漏接）闭账
+  （2026-10-04）**——两个叠加缺陷：① emit_aes_call 无目标分流，ARM 上六方法全部
+  发射 `llvm.x86.aesni.*` 直接 fatal（B-ID92 同类）；② x86 路径 InverseMixColumns
+  分支长度常量写错（`len==18`，实长 17），从未匹配过——调用静默漏到 DllImport
+  外部路径，链接期 `undefined reference to 'InverseMixColumns'`（无人调用过故从未
+  暴露）。修法：aarch64 分流进 emit_aes_arm，按 ARM AES 语义代数重构（**ARM
+  AESE/AESD 是先 XOR 轮密钥再 SubBytes/ShiftRows，与教科书相反**，单条 AESE 永远
+  出不了 `SR(SB(a))^k`）：AESENC=aesmc(aese(a,0)⊕aesimc(k))、AESENCLAST=aese(a,0)⊕k、
+  AESDEC=aesimc(aesd(a,0)⊕aesmc(k))、AESDECLAST=aesd(a,0)⊕k、IMC=aesimc(a)（五式
+  Python 对 x86 硬件金样+200 组随机数验证后才落码）；KeygenAssist ARM 无对应，
+  返回 false 走干净未解析诊断；crosscomp.c 与 irgen_emit.c aarch64 特性表补
+  `+aes`（llvm.aarch64.crypto.* 选择的前提）；len 18→17 双处修正（ARM 新码 +
+  x86 旧码）。验证：b94 六方法金样 x86 硬件与 qemu-aarch64 逐字节全等（imc2 自
+  检=Involution 成立）；win-arm64/linux-arm64 链接通过；t3/t4 单方法探针 x86 过。
