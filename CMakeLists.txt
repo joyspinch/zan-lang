@@ -1333,6 +1333,17 @@ add_test(NAME diag_access_internal_module
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_access_internal_module PROPERTIES TIMEOUT 60)
 
+# goto into a try/catch/finally/lock region is illegal in C# and the lowering
+# cannot honor it either (the handler is not armed on the jump path).
+add_test(NAME diag_goto_into_try
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/goto_into_try.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_goto_into_try${_exe_ext}
+    "-DEXPECT_REGEX=jumps into a try/catch/finally or lock block"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_goto_into_try PROPERTIES TIMEOUT 60)
+
 
 # A cast is the one expression whose operand and target the checker used to
 # skip entirely, so an impossible conversion reinterpreted the operand's bits

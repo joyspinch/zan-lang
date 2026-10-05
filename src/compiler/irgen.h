@@ -94,6 +94,31 @@ typedef struct zan_goto_label_rec {
     int               locals_owned;  /* owning locals in scope */
 } zan_goto_label_rec_t;
 
+/* One `catch` body being emitted: the handler owns the caught exception (see
+ * the exc.push/exc.hrel pair in the try lowering) and releases it in the try's
+ * epilogue -- which `return`, `break`, `continue` and `throw` jump past, so
+ * those paths release it from here instead. */
+typedef struct zan_irgen_catch_cleanup {
+    LLVMValueRef exc_slot;   /* i8* slot holding the caught exception */
+    LLVMValueRef owned_slot; /* i32 slot: non-zero when the handler owns it */
+    LLVMValueRef tid_slot;   /* i8* slot: its class type descriptor, used by
+                              * a bare `throw;` to rethrow with the original
+                              * dynamic type */
+} zan_irgen_catch_cleanup_t;
+
+/* One `finally` (or `lock`) region being emitted. */
+typedef struct zan_irgen_finally_entry {
+    zan_ast_node_t *body;   /* the finally block's AST */
+    LLVMValueRef monitor_obj; /* set instead of `body` by `lock (obj)`: the
+                               * alloca holding the locked object, whose
+                               * monitor every exit path must release */
+    bool in_try_body;       /* emitting the guarded body: a throw here is
+                             * taken by this try's own handler, which runs
+                             * the finally itself. False while emitting a
+                             * catch (or the finally), where a throw leaves
+                             * the region and must run it at the throw site. */
+} zan_irgen_finally_entry_t;
+
 typedef struct zan_goto_fixup {
     zan_istr_t   name;
     LLVMValueRef fn;
@@ -104,6 +129,16 @@ typedef struct zan_goto_fixup {
     int          locals_base;
     int          locals_owned;
     int          resolved;
+    LLVMBasicBlockRef from_bb;  /* block holding this goto's forward branch */
+    /* Cleanup stacks at the goto site. At label definition the live stacks
+     * only reach the label's depth, so the popped entries the jump must run
+     * (skipped finallys/monitor exits, owned catch exceptions) are replayed
+     * from these copies; eh needs none (the disarm reads armed[base]'s
+     * old-top alloca, whose stale occupant still holds the right value). */
+    int finally_snap_n;
+    struct zan_irgen_finally_entry *finally_snap;
+    int catch_snap_n;
+    struct zan_irgen_catch_cleanup *catch_snap;
 } zan_goto_fixup_t;
 
 struct zan_irgen {
@@ -225,13 +260,7 @@ struct zan_irgen {
      * caught exception (see the exc.push/exc.hrel pair in the try lowering) and
      * releases it in the try's epilogue -- which `return`, `break`, `continue`
      * and `throw` jump past, so those paths release it from here instead. */
-    struct {
-        LLVMValueRef exc_slot;   /* i8* slot holding the caught exception */
-        LLVMValueRef owned_slot; /* i32 slot: non-zero when the handler owns it */
-        LLVMValueRef tid_slot;   /* i8* slot: its class type descriptor, used by
-                                  * a bare `throw;` to rethrow with the original
-                                  * dynamic type */
-    } *catch_cleanups;
+    zan_irgen_catch_cleanup_t *catch_cleanups;
     int catch_cleanup_count;
     int catch_cleanup_cap;
     /* catch_cleanups entries entered inside the innermost loop: `break` and
@@ -247,17 +276,7 @@ struct zan_irgen {
      * body inline: `return` runs all of them, `break`/`continue` the ones
      * entered inside the loop (from finally_loop_base up), and an exception
      * with no matching clause runs this try's own before rethrowing. */
-    struct {
-        zan_ast_node_t *body;   /* the finally block's AST */
-        LLVMValueRef monitor_obj; /* set instead of `body` by `lock (obj)`: the
-                                   * alloca holding the locked object, whose
-                                   * monitor every exit path must release */
-        bool in_try_body;       /* emitting the guarded body: a throw here is
-                                 * taken by this try's own handler, which runs
-                                 * the finally itself. False while emitting a
-                                 * catch (or the finally), where a throw leaves
-                                 * the region and must run it at the throw site. */
-    } finallys[ZAN_MAX_FINALLY_DEPTH];
+    zan_irgen_finally_entry_t finallys[ZAN_MAX_FINALLY_DEPTH];
     int finally_count;
     /* finallys entered inside the innermost loop: break/continue run only those */
     int finally_loop_base;

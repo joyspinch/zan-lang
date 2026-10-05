@@ -3468,32 +3468,90 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             g->goto_labels[li].locals_owned =
                 irgen_goto_count_owned_locals(locals);
             LLVMValueRef lfn = g->goto_labels[li].fn;
+            int lab_fin = g->goto_labels[li].fin_depth;
+            int lab_eh = g->goto_labels[li].eh_armed_base;
+            int lab_catch = g->goto_labels[li].catch_base;
+            LLVMBasicBlockRef resume_bb = LLVMGetInsertBlock(g->builder);
             for (int fi = 0; fi < g->goto_fixup_count; fi++) {
-                if (g->goto_fixups[fi].resolved ||
-                    g->goto_fixups[fi].fn != lfn ||
-                    g->goto_fixups[fi].name.len != stmt->ident.name.len ||
-                    memcmp(g->goto_fixups[fi].name.str, stmt->ident.name.str,
+                struct zan_goto_fixup *f = &g->goto_fixups[fi];
+                if (f->resolved || f->fn != lfn ||
+                    f->name.len != stmt->ident.name.len ||
+                    memcmp(f->name.str, stmt->ident.name.str,
                            (size_t)stmt->ident.name.len) != 0)
                     continue;
-                g->goto_fixups[fi].resolved = 1;
-                if (g->goto_fixups[fi].fin_depth != g->finally_count ||
-                    g->goto_fixups[fi].eh_armed_base != g->eh_armed_count ||
-                    g->goto_fixups[fi].catch_base != g->catch_cleanup_count) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, g->goto_fixups[fi].loc,
-                        "goto '%.*s' crosses a try/catch/finally or lock "
-                        "boundary; the skipped finallys and monitor exits "
-                        "cannot be run -- restructure with break/return",
+                f->resolved = 1;
+                if (f->fin_depth < lab_fin || f->eh_armed_base < lab_eh ||
+                    f->catch_base < lab_catch) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, f->loc,
+                        "goto '%.*s' jumps into a try/catch/finally or lock "
+                        "block; C# forbids jumping into one -- restructure "
+                        "with break/return",
                         (int)stmt->ident.name.len, stmt->ident.name.str);
-                } else if (g->goto_fixups[fi].locals_base < locals->count ||
-                           g->goto_fixups[fi].locals_owned !=
+                } else if (f->locals_base < locals->count ||
+                           f->locals_owned !=
                                g->goto_labels[li].locals_owned) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, g->goto_fixups[fi].loc,
+                    zan_diag_emit(g->diag, DIAG_ERROR, f->loc,
                         "goto '%.*s' leaves (or enters) a scope with owning "
                         "locals; the abandoned references would leak -- "
                         "restructure with break/return",
                         (int)stmt->ident.name.len, stmt->ident.name.str);
+                } else if (f->fin_depth > lab_fin || f->catch_base > lab_catch ||
+                           f->eh_armed_base > lab_eh) {
+                    /* C#-legal jump OUT of try/catch/finally/lock: a landing
+                     * chain in the goto's own block replays the cleanups the
+                     * jump skips -- the same exit sequence a backward goto
+                     * runs, rebuilt from the goto-site snapshots (the live
+                     * stacks have been popped past these depths by now; only
+                     * the popped range is overwritten, the label's own live
+                     * entries below it stay intact). The label's emission
+                     * continues from where it was. */
+                    LLVMPositionBuilderAtEnd(g->builder, f->from_bb);
+                    if (LLVMGetBasicBlockTerminator(f->from_bb))
+                        LLVMInstructionEraseFromParent(
+                            LLVMGetBasicBlockTerminator(f->from_bb));
+                    if (f->fin_depth > lab_fin && f->finally_snap &&
+                        f->finally_snap_n >= f->fin_depth) {
+                        memcpy(g->finallys + lab_fin,
+                               f->finally_snap + lab_fin,
+                               sizeof(g->finallys[0]) *
+                                   (size_t)(f->fin_depth - lab_fin));
+                        g->finally_count = f->fin_depth;
+                        emit_pending_finallys(g, locals, lab_fin);
+                        g->finally_count = lab_fin;
+                    } else if (f->fin_depth > lab_fin) {
+                        zan_diag_emit(g->diag, DIAG_ERROR, f->loc,
+                            "goto '%.*s' leaves %d finally/lock region(s) "
+                            "whose exits cannot be run -- restructure with "
+                            "break/return",
+                            (int)stmt->ident.name.len, stmt->ident.name.str,
+                            f->fin_depth - lab_fin);
+                    }
+                    if (!LLVMGetBasicBlockTerminator(
+                            LLVMGetInsertBlock(g->builder)) &&
+                        f->catch_base > lab_catch) {
+                        if (f->catch_snap && f->catch_snap_n >= f->catch_base) {
+                            memcpy(g->catch_cleanups + lab_catch,
+                                   f->catch_snap + lab_catch,
+                                   sizeof(g->catch_cleanups[0]) *
+                                       (size_t)(f->catch_base - lab_catch));
+                            g->catch_cleanup_count = f->catch_base;
+                            emit_release_active_catch_excs(g, lab_catch);
+                            g->catch_cleanup_count = lab_catch;
+                        }
+                    }
+                    if (!LLVMGetBasicBlockTerminator(
+                            LLVMGetInsertBlock(g->builder)) &&
+                        f->eh_armed_base > lab_eh) {
+                        g->eh_armed_count = f->eh_armed_base;
+                        emit_eh_disarm_from(g, lab_eh);
+                        g->eh_armed_count = lab_eh;
+                    }
+                    if (!LLVMGetBasicBlockTerminator(
+                            LLVMGetInsertBlock(g->builder)))
+                        LLVMBuildBr(g->builder, g->goto_labels[li].bb);
                 }
             }
+            LLVMPositionBuilderAtEnd(g->builder, resume_bb);
         }
         LLVMBasicBlockRef bb = g->goto_labels[li].bb;
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
@@ -3522,8 +3580,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             }
         } else {
             /* forward jump: the label's depth is not known yet, so record the
-             * jump for validation at the definition. A forward goto within
-             * the same block (no boundary crossing) stays a plain branch. */
+             * jump for validation and cleanup at the definition. A forward
+             * goto within the same block (no boundary crossing) stays a
+             * plain branch. The cleanup stacks are snapshotted here: by the
+             * time the label is seen these entries are popped (and their
+             * slots possibly reused), but a jump out of the try region must
+             * still run them -- C#-legal -- so the definition replays them
+             * from these copies (B-ID112 landing chains). */
             if (ZAN_TAB_ENSURE(g->goto_fixups, g->goto_fixup_count,
                                g->goto_fixup_cap, 8)) {
                 struct zan_goto_fixup *f =
@@ -3537,6 +3600,24 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 f->catch_base = g->catch_cleanup_count;
                 f->locals_base = locals->count;
                 f->locals_owned = irgen_goto_count_owned_locals(locals);
+                f->from_bb = LLVMGetInsertBlock(g->builder);
+                f->finally_snap_n = g->finally_count;
+                if (f->finally_snap_n > 0) {
+                    f->finally_snap = zan_arena_alloc(g->arena,
+                        sizeof(*f->finally_snap) * (size_t)f->finally_snap_n);
+                    if (f->finally_snap)
+                        memcpy(f->finally_snap, g->finallys,
+                               sizeof(*f->finally_snap) *
+                                   (size_t)f->finally_snap_n);
+                }
+                f->catch_snap_n = g->catch_cleanup_count;
+                if (f->catch_snap_n > 0) {
+                    f->catch_snap = zan_arena_alloc(g->arena,
+                        sizeof(*f->catch_snap) * (size_t)f->catch_snap_n);
+                    if (f->catch_snap)
+                        memcpy(f->catch_snap, g->catch_cleanups,
+                               sizeof(*f->catch_snap) * (size_t)f->catch_snap_n);
+                }
             }
             LLVMBuildBr(g->builder, bb);
         }
