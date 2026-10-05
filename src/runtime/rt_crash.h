@@ -1493,6 +1493,34 @@ static void zan__crash_install(void) {
      * -std=c11 compile that reaches here. */
 #define SA_ONSTACK 0x08000000
 #endif
+#if defined(__OHOS__) && !defined(SS_DISABLE)
+    /* OHOS's musl subset omits sigaltstack/SS_DISABLE from signal.h under
+     * the feature set this header compiles with, yet the libc exports the
+     * symbol (POSIX ABI; verified in the committed libc.a). Declare what
+     * the headers hide rather than lose the altstack on OHOS. */
+#define SS_DISABLE 2
+int sigaltstack(const stack_t *__restrict, stack_t *__restrict);
+#endif
+    /* The handler is registered with SA_ONSTACK below, so it needs an
+     * alternative stack to run on: a SIGSEGV from stack exhaustion cannot
+     * deliver onto the overflowed stack it faulted on -- without this the
+     * handler itself faults and the crash report never happens. Fixed size
+     * because SIGSTKSZ is sysconf() (not a constant) on glibc >= 2.34 and
+     * this header must survive strict -std=c11. Leave an altstack the host
+     * program installed for itself untouched. */
+    {
+        stack_t cur;
+        if (sigaltstack(NULL, &cur) == 0 &&
+            (cur.ss_flags & SS_DISABLE || cur.ss_size == 0)) {
+            static char zan__crash_altstack[64 * 1024];
+            stack_t ss;
+            memset(&ss, 0, sizeof ss);
+            ss.ss_sp = zan__crash_altstack;
+            ss.ss_size = sizeof zan__crash_altstack;
+            ss.ss_flags = 0;
+            sigaltstack(&ss, NULL);
+        }
+    }
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = zan__crash_handler;
