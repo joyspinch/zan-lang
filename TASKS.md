@@ -16,10 +16,10 @@
 - B-ID103（P2·binder）泛型类实现泛型接口的契约校验失效（`class Repo<T> : IStore<T>` 里错签名零诊断通过）：类型参数注册提前到 pass 1.5 前（resolve_bases 能真正实例化 `IStore<T>` 而非退化为模板）+ 通配符仅在接口参数未被替换时生效（替换后的类型参数按结构比较）——探针矩阵 5 例（错返回/错参数/非泛型回归/两组合法实现）+ conformance interface_assignability|interface_dispatch|generic_constraint 17 例全过。
 - B-ID104（P2·checker）struct 循环检测 DFS 补三色 visited 集（原仅有路径栈，菱形依赖 DAG 指数重访挂死编译）——探针 25 层菱形 2.5s 编译完（旧版需走 2^25 条子树）、400 层直链无诊断、自环+双环反例照常报错；conformance struct|layout 29 例全过。
 - B-ID105（P2·门控）SIMD 内建非 x86 落空修复：Vector128.ReciprocalSqrt 门控 x86（RSQRTP）+ 非 x86 便携 1/sqrt；Sse2.MoveMask 门控 + 便携 pmovmskb；Aes.* 非 x86 非 ARM 落到清晰编译诊断（原先 wasm32/riscv 直接炸 LLVM ISel "Cannot select"）——native 语义逐字节不变（debug 探针 + vector128_simd conformance/determinism/leakcheck 三孪绿）、wasm32 交叉编译两探针出 .wasm、Aes wasm32 得干净报错。已知独立缺陷：Vector128.Create(float) 在 wasm32 的 f64→f32 常量 bitcast 不可选，另案处理。
+- B-ID106（P2·irgen）槽字装载阶梯缺 float 分支的三个副本一次修齐：① GetValueOrDefault 推断 len==16→17（原死分支永不生效，全仓扫描确认仅此一处 off-by-one）；② 查询表达式 query_loop_load 换用 load_collection_slot_value；③ foreach 元素装载（计数路径补 float 分支 + 协议路径补擦除 i64 字转换守卫）——List<float> 索引读正确而 foreach 把 3.5f 读成 1069547520.0（sitofp 数值转换而非按位重解释）暴露的根因。探针：float/double/byte/string foreach 全对 + --check-leaks 零泄漏 + 查询 where/select 3.5/4.5 + GetValueOrDefault 推断 3.5/42；nullable_value_types|null_conditional_value 六孪绿。
 
 ## 未完成
 
-- [ ] **B-ID106（P2·irgen）GetValueOrDefault 缓冲长度 16 应为 17**（NUL 截断边界）+ 查询表达式 float 槽装载未走 load_collection_slot_value。位置 irgen_expr_core.c ~2138 / irgen_expr.c ~8154。
 - [ ] **B-ID107（P2·parser）批量**：lexer_peek_n 条件栈回滚缺守卫（~2318，镜像 lexer.c:1603）；defer/else-if 链缺 stmt_depth 防护；skip_angle_group 对 `>>` 的处理（~3119）；数组 rank>16 未 clamp；clone_ast_subst 浅拷贝别名（~5494）；union str_val 未判空。逐项最小探针。
 - [ ] **B-ID108（P2·rt_io）首次初始化竞态**：init 检查无专用互斥，双线程首用可能双重初始化；且 pthread_mutex_init 对已持有互斥重初始化（~1511）。修法：专用 init 锁 + once。
 - [ ] **B-ID109（P2·rt_sync）分离式 spawn 僵尸进程**：无 double-fork，detached 子进程变 zombie 常驻。位置 rt_sync.c ~3298。修法：grandchild 收养。

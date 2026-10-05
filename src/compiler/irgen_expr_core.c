@@ -2135,7 +2135,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 if (bot && bot->kind == TYPE_STRING)
                     return zan_binder_make_array_type(g->binder, g->binder->type_byte);
             }
-            if (mm.len == 16 && memcmp(mm.str, "GetValueOrDefault", 17) == 0) {
+            if (mm.len == 17 && memcmp(mm.str, "GetValueOrDefault", 17) == 0) {
                 zan_type_t *nvt = infer_expr_type(g, callee->member.object, locals);
                 if (nvt && nvt->kind == TYPE_NULLABLE) return nvt->element_type;
             }

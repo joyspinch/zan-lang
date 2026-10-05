@@ -3197,6 +3197,19 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             else
                 cur = emit_property_getter_call(g, fe_cur_getter, fe_enum_ty,
                                                 fev, NULL, locals);
+            /* An erased enumerator hands Current back as the raw i64 slot
+             * word; convert it to the declared element type exactly like the
+             * collection-slot read (floats are bit-reinterpreted, never
+             * sitofp'd) before it reaches the iteration slot. */
+            if (cur && elem_type &&
+                LLVMGetTypeKind(LLVMTypeOf(cur)) == LLVMIntegerTypeKind &&
+                LLVMGetIntTypeWidth(LLVMTypeOf(cur)) == 64 &&
+                LLVMGetTypeKind(elem_llvm) != LLVMIntegerTypeKind) {
+                LLVMValueRef cslot = emit_entry_alloca(g,
+                    LLVMTypeOf(cur), "fe.curs");
+                zan_store_fit(g, cur, cslot);
+                cur = load_collection_slot_value(g, elem_type, cslot);
+            }
             zan_store_fit(g, cur, iter_alloc);
 
             emit_stmt(g, stmt->foreach_stmt.body, locals);
@@ -3319,6 +3332,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             elem = LLVMBuildIntToPtr(g->builder, elem, elem_llvm, "elp");
         else if (ek == LLVMDoubleTypeKind)
             elem = LLVMBuildBitCast(g->builder, elem, elem_llvm, "elf");
+        else if (ek == LLVMFloatTypeKind) {
+            /* the slot word carries the f32 BITS in its low half: the same
+             * trunc+bitcast the collection-slot read uses. Falling through to
+             * zan_store_fit sitofp'd the raw word's integer VALUE, so a
+             * foreach var over List<float> read 3.5f as 1069547520.0 */
+            LLVMValueRef nb = LLVMBuildTrunc(g->builder, elem,
+                LLVMInt32TypeInContext(g->ctx), "elf32");
+            elem = LLVMBuildBitCast(g->builder, nb, elem_llvm, "elf32b");
+        }
         else if (ek == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(elem_llvm) < 64)
             elem = LLVMBuildTrunc(g->builder, elem, elem_llvm, "elt");
         zan_store_fit(g, elem, iter_alloc);

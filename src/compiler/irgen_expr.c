@@ -8185,16 +8185,11 @@ static LLVMValueRef query_loop_load(zan_irgen_t *g, query_loop_t *l,
     LLVMTypeRef elm = map_type(g, elem);
     LLVMValueRef qwidx = slot_word_index(g, iv, elem_slot_words(g, elem));
     LLVMValueRef ep = LLVMBuildGEP2(g->builder, i64, l->data, &qwidx, 1, "qlep");
-    LLVMTypeKind ek = LLVMGetTypeKind(elm);
-    LLVMValueRef ev = (ek == LLVMStructTypeKind)
-        ? load_struct_from_slot(g, ep, elm)
-        : LLVMBuildLoad2(g->builder, i64, ep, "qlel");
-    if (ek == LLVMPointerTypeKind)
-        ev = LLVMBuildIntToPtr(g->builder, ev, elm, "qelp");
-    else if (ek == LLVMDoubleTypeKind)
-        ev = LLVMBuildBitCast(g->builder, ev, elm, "qelf");
-    else if (ek == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(elm) < 64)
-        ev = LLVMBuildTrunc(g->builder, ev, elm, "qelt");
+    /* slot loads share the collection-slot ladder (ptr/double/FLOAT/int
+     * narrowing): the inlined copy here lacked the float branch, so a query
+     * over a List<float> left the raw i64 in the slot and every element
+     * read as garbage */
+    LLVMValueRef ev = load_collection_slot_value(g, elem, ep);
     LLVMValueRef slot = emit_entry_alloca(g, elm, "qels");
     zan_store_fit(g, ev, slot);
     return slot;
