@@ -3298,24 +3298,37 @@ int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        /* Child */
-        setsid();
-        int devnull = open("/dev/null", O_RDWR);
-        if (devnull >= 0) {
-            dup2(devnull, STDIN_FILENO);
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            if (devnull > STDERR_FILENO) close(devnull);
+        /* Intermediate child: fork again and exit at once so the actual
+         * process is reparented to init and reaped there. A single fork
+         * left the child a zombie for as long as this process lived. */
+        if (setsid() < 0) _exit(127);
+        pid_t gc = fork();
+        if (gc < 0) _exit(127);
+        if (gc == 0) {
+            /* Grandchild: the detached process itself. */
+            int devnull = open("/dev/null", O_RDWR);
+            if (devnull >= 0) {
+                dup2(devnull, STDIN_FILENO);
+                dup2(devnull, STDOUT_FILENO);
+                dup2(devnull, STDERR_FILENO);
+                if (devnull > STDERR_FILENO) close(devnull);
+            }
+            char **argv = (char **)malloc((argc + 2) * sizeof(char *));
+            if (!argv) _exit(127);
+            argv[0] = (char *)exe;
+            for (int32_t i = 0; i < argc; i++) {
+                argv[i + 1] = (char *)args[i];
+            }
+            argv[argc + 1] = NULL;
+            execvp(exe, argv);
+            _exit(127);
         }
-        char **argv = (char **)malloc((argc + 2) * sizeof(char *));
-        if (!argv) _exit(127);
-        argv[0] = (char *)exe;
-        for (int32_t i = 0; i < argc; i++) {
-            argv[i + 1] = (char *)args[i];
-        }
-        argv[argc + 1] = NULL;
-        execvp(exe, argv);
-        _exit(127);
+        _exit(0);
+    }
+    /* Reap the intermediate; it exits immediately after the second fork. */
+    int st;
+    while (waitpid(pid, &st, 0) < 0) {
+        if (errno != EINTR) return -1;
     }
     return 0;
 #endif
@@ -3388,32 +3401,46 @@ int32_t zan_proc_start_program_safe(const char *exe, const char *log_path) {
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        setsid();
-        int devnull = open("/dev/null", O_RDONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDIN_FILENO);
-            if (devnull > STDIN_FILENO) close(devnull);
-        }
-        if (log_path && log_path[0]) {
-            int outfd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (outfd >= 0) {
-                dup2(outfd, STDOUT_FILENO);
-                dup2(outfd, STDERR_FILENO);
-                if (outfd > STDERR_FILENO) close(outfd);
+        /* Intermediate child: fork again and exit at once so the actual
+         * process is reparented to init and reaped there (same zombie
+         * reasoning as zan_proc_start_detached_safe). */
+        if (setsid() < 0) _exit(127);
+        pid_t gc = fork();
+        if (gc < 0) _exit(127);
+        if (gc == 0) {
+            /* Grandchild: the detached process itself. */
+            int devnull = open("/dev/null", O_RDONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDIN_FILENO);
+                if (devnull > STDIN_FILENO) close(devnull);
             }
-        } else {
-            int outnull = open("/dev/null", O_WRONLY);
-            if (outnull >= 0) {
-                dup2(outnull, STDOUT_FILENO);
-                dup2(outnull, STDERR_FILENO);
-                if (outnull > STDERR_FILENO) close(outnull);
+            if (log_path && log_path[0]) {
+                int outfd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (outfd >= 0) {
+                    dup2(outfd, STDOUT_FILENO);
+                    dup2(outfd, STDERR_FILENO);
+                    if (outfd > STDERR_FILENO) close(outfd);
+                }
+            } else {
+                int outnull = open("/dev/null", O_WRONLY);
+                if (outnull >= 0) {
+                    dup2(outnull, STDOUT_FILENO);
+                    dup2(outnull, STDERR_FILENO);
+                    if (outnull > STDERR_FILENO) close(outnull);
+                }
             }
+            char *argv[2];
+            argv[0] = (char *)exe;
+            argv[1] = NULL;
+            execvp(exe, argv);
+            _exit(127);
         }
-        char *argv[2];
-        argv[0] = (char *)exe;
-        argv[1] = NULL;
-        execvp(exe, argv);
-        _exit(127);
+        _exit(0);
+    }
+    /* Reap the intermediate; it exits immediately after the second fork. */
+    int st;
+    while (waitpid(pid, &st, 0) < 0) {
+        if (errno != EINTR) return -1;
     }
     return 0;
 #endif
