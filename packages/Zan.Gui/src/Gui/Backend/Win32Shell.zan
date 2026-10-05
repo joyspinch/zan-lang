@@ -454,9 +454,8 @@ class Win32Shell {
     static List<Win32SurfaceBinding> surfaceBindings;
     static int lastSurface;
 
-    // 为下一次呈现声明的脏矩形（使用 Win32DirtyRect 实体集合主表示，消除四元组平铺反模式）。
+    // 为下一次呈现声明的脏矩形（使用 Win32DirtyRect 实体集合为唯一主表示，彻底消除平行四元组反模式）。
     static List<Win32DirtyRect> dirtyRects;
-    static List<int> dirty; // 兼容底层 zan_gui_gdi_present 扁平 int* 内存块视图
     static bool dirtyOverflow;
     static nint dirtyHwnd;
     static List<nint> dirtyLost;
@@ -523,7 +522,6 @@ class Win32Shell {
         Win32Shell.buttonW = 46;
         Win32Shell.surfaceBindings = new List<Win32SurfaceBinding>();
         Win32Shell.dirtyRects = new List<Win32DirtyRect>();
-        Win32Shell.dirty = new List<int>();
         Win32Shell.dirtyHwnd = 0;
         Win32Shell.dirtyLost = new List<nint>();
         Win32Shell.presentLog = Win32Shell.getenv("ZAN_PRESENT_LOG") != "";
@@ -1150,7 +1148,6 @@ class Win32Shell {
             // 内容贴到窗口上。丢掉为旧几何声明的脏矩形，等应用画完。
             if (Win32Shell.dirtyHwnd == hwnd) {
                 if (Win32Shell.dirtyRects != null) { Win32Shell.dirtyRects.Clear(); }
-                Win32Shell.dirty.Clear();
                 Win32Shell.dirtyOverflow = false;
             }
             return;
@@ -1166,7 +1163,6 @@ class Win32Shell {
             if (gpu == 1) {
                 if (Win32Shell.dirtyHwnd == hwnd) {
                     if (Win32Shell.dirtyRects != null) { Win32Shell.dirtyRects.Clear(); }
-                    Win32Shell.dirty.Clear();
                     Win32Shell.dirtyOverflow = false;
                     Win32Shell.forceFullUpload = false;
                 }
@@ -1180,7 +1176,6 @@ class Win32Shell {
             // 玻璃也留在 GDI 路径上——ULW 呈现会让子窗口消失。
             if (Win32Shell.dirtyHwnd == hwnd) {
                 if (Win32Shell.dirtyRects != null) { Win32Shell.dirtyRects.Clear(); }
-                Win32Shell.dirty.Clear();
                 Win32Shell.dirtyOverflow = false;
                 Win32Shell.forceFullUpload = false;
             }
@@ -1202,13 +1197,17 @@ class Win32Shell {
         // 且正确性不依赖任何损伤声明——漏报最多多传几块瓦片，绝不花屏。
         int rects = 0;
         int ret = 0;
-        if (owned && !lost && Win32Shell.dirty.Count > 0
+        int dirtyCount = Win32Shell.dirtyRects != null ? Win32Shell.dirtyRects.Count : 0;
+        if (owned && !lost && dirtyCount > 0
             && !Win32Shell.dirtyOverflow) {
-            int n = Win32Shell.dirty.Count / 4;
-            Span<int> buf = new Span<int>(Win32Shell.scratchRects,
-                Win32Shell.dirty.Count);
-            for (int i = 0; i < Win32Shell.dirty.Count; i = i + 1) {
-                buf[i] = Win32Shell.dirty[i];
+            int n = dirtyCount;
+            Span<int> buf = new Span<int>(Win32Shell.scratchRects, n * 4);
+            for (int i = 0; i < n; i = i + 1) {
+                Win32DirtyRect dr = Win32Shell.dirtyRects[i];
+                buf[i * 4] = dr.x;
+                buf[i * 4 + 1] = dr.y;
+                buf[i * 4 + 2] = dr.w;
+                buf[i * 4 + 3] = dr.h;
             }
             ret = Win32Shell.zan_gui_gdi_present(hwnd, surface,
                 Win32Shell.scratchRects, n);
@@ -1225,7 +1224,7 @@ class Win32Shell {
             rects = ret > 0 ? ret : 0;
         }
         if (Win32Shell.presentLog) {
-            int n = owned ? Win32Shell.dirty.Count : 0 - 1;
+            int n = owned ? dirtyCount : 0 - 1;
             File.AppendAllText("present_log.txt",
                 "blit t=" + Convert.ToString(Window.GetTickMs())
                 + " hwnd=" + Convert.ToString(hwnd)
@@ -1240,7 +1239,6 @@ class Win32Shell {
         }
         if (owned) {
             if (Win32Shell.dirtyRects != null) { Win32Shell.dirtyRects.Clear(); }
-            Win32Shell.dirty.Clear();
             Win32Shell.dirtyOverflow = false;
         }
         if (Win32Shell.windowWidth > sw || Win32Shell.windowHeight > sh) {
@@ -2504,38 +2502,36 @@ class Win32Shell {
     static void PresentDirty(nint hwnd, int x, int y, int w, int h) {
         Win32Shell.Init();
         if (w <= 0 || h <= 0) { return; }
+        int curCount = Win32Shell.dirtyRects != null ? Win32Shell.dirtyRects.Count : 0;
         if (Win32Shell.dirtyHwnd != hwnd) {
             // 另一个窗口接手了还没被呈现的矩形：旧主人这一次改过
             // 的像素已无法逐矩形上传，记下欠账。
-            if (Win32Shell.dirty.Count > 0 && Win32Shell.dirtyHwnd != 0) {
+            if (curCount > 0 && Win32Shell.dirtyHwnd != 0) {
                 Win32Shell.NoteDirtyLost(Win32Shell.dirtyHwnd);
             }
             if (Win32Shell.dirtyRects != null) { Win32Shell.dirtyRects.Clear(); }
-            Win32Shell.dirty.Clear();
             Win32Shell.dirtyOverflow = false;
             Win32Shell.dirtyHwnd = hwnd;
+            curCount = 0;
         }
-        if (Win32Shell.dirty.Count >= 2048) {
+        if (curCount >= 2048) {
             Win32Shell.dirtyOverflow = true;
             return;
         }
         if (Win32Shell.dirtyRects == null) { Win32Shell.dirtyRects = new List<Win32DirtyRect>(); }
         Win32Shell.dirtyRects.Add(new Win32DirtyRect(x, y, w, h));
-        Win32Shell.dirty.Add(x);
-        Win32Shell.dirty.Add(y);
-        Win32Shell.dirty.Add(w);
-        Win32Shell.dirty.Add(h);
     }
 
     /// 整窗帧的呈现声明：这一帧重画了窗口的每个像素，下一次 Blit
     /// 对它整窗上传（rectCount=-1），不做任何差分。见 forceFullUpload。
     static void PresentFull(nint hwnd) {
         Win32Shell.Init();
+        int curCount = Win32Shell.dirtyRects != null ? Win32Shell.dirtyRects.Count : 0;
         if (Win32Shell.dirtyHwnd != hwnd) {
-            if (Win32Shell.dirty.Count > 0 && Win32Shell.dirtyHwnd != 0) {
+            if (curCount > 0 && Win32Shell.dirtyHwnd != 0) {
                 Win32Shell.NoteDirtyLost(Win32Shell.dirtyHwnd);
             }
-            Win32Shell.dirty.Clear();
+            if (Win32Shell.dirtyRects != null) { Win32Shell.dirtyRects.Clear(); }
             Win32Shell.dirtyOverflow = false;
             Win32Shell.dirtyHwnd = hwnd;
         }

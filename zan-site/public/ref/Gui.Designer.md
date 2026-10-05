@@ -897,21 +897,11 @@ signal 订阅、运行期动态状态不在文档模型里（本来也存不进�
 
 - string compPropFor;
 
-- List<string> compPropKeys;
-
-- List<string> compPropLabels;
-
-- List<string> compPropDefs;
+- List<CompPropDecl> compPropDecls;
 
 - string compPropEditFor;
 
-- List<Input> compPropInputs;
-
-- List<Switch> compPropSwitches;
-
-- List<bool> compPropIsBool;
-
-- List<string> compPropShadow;
+- List<CompPropEditRow> compPropEditRows;
 
 - string styleEditFor;
 

@@ -15,56 +15,32 @@ using Legend;
 /// 点其余分类按本模板对未接功能的惯例给一句明确反馈。
 partial class LegendApp {
 
-    class StarInfo {
-        string badge;      // 等级角标：10级 / 1转..9转
-        string name;
-        int price;         // 激活价
-        int talent;        // 气血天赋 +N%
-        int art;           // tupu/0000N.jpg 的序号
-    }
-
     /// 分类分栏选中项（默认第 1 格「古代美女」，原版对照图就是这一档）。
     int starTab = 0;
 
     /// 卡阵页号（在线一行一张 boss 星位，10 张/页）。
     int starPageNo = 0;
 
-    /// 在线星位行：服务端 stars op（每图 1 只 BOSS = 一个图谱位，
-    /// BossFight 胜利点亮）。行形状 {name,level,map,lit}。
+    /// 星位行数据：全部消费服务端 stars 实体列表（StarRowItem）；单机离线回退到表驱动 BOSS 实录，
+    /// 彻底消除客户端平行数组（badges[], names[]）与硬编码假卡牌。
     List<StarRowItem> StarRows() {
         StarState st = net.TypedStars();
-        return st != null ? st.Rows : null;
+        if (st != null && st.Rows != null && st.Rows.Count > 0) {
+            return st.Rows;
+        }
+        List<StarRowItem> list = new List<StarRowItem>();
+        if (GameTables.current != null && GameTables.current.bosses != null) {
+            DataTable tb = GameTables.current.bosses;
+            for (int i = 0; i < tb.rows.Count && i < 35; i = i + 1) {
+                DataRow dr = tb.rows[i];
+                list.Add(new StarRowItem(dr.Text("name"), dr.Int("level"), dr.Int("map_id"), false));
+            }
+        }
+        return list;
     }
 
     static int StarRowCount(List<StarRowItem> rows) {
         return rows != null ? rows.Count : 0;
-    }
-
-    /// 第 1 页 10 张（照 `将星图谱.png` 逐行抄录：角标 / 名字 / 价格 / 天赋）。
-    static List<StarInfo> StarData() {
-        string[] badges = new string[] {
-            "10级", "1转", "2转", "3转", "4转",
-            "5转", "6转", "7转", "8转", "9转"
-        };
-        string[] names = new string[] {
-            "甄宓", "褒姒", "郑旦", "赵飞燕", "苏妲己",
-            "冯小怜", "杨贵妃", "王昭君", "貂蝉", "西施"
-        };
-        List<StarInfo> rows = new List<StarInfo>();
-        int price = 10000;
-        for (int i = 0; i < 10; i = i + 1) {
-            StarInfo r = new StarInfo();
-            r.badge = badges[i];
-            r.name = names[i];
-            r.price = price;
-            r.talent = i + 1;
-            /* 素材库这一档按倒序存放：00009 = 甄宓（与卡 1 的持阮立绘逐像素
-               对上），故卡序 i 取 9−i。 */
-            r.art = 9 - i;
-            rows.Add(r);
-            price = price * 2;
-        }
-        return rows;
     }
 
     /// 分类分栏 13 格（照 `将星图谱.png` 逐格抄录）。
@@ -106,9 +82,8 @@ partial class LegendApp {
         wall.Pad(0); wall.Gap(Spec.StarRowGap());
         wall.Prefer(Spec.StarCardW() * 5 + Spec.StarColGap() * 4, 0);
         main.With(wall);
-        /* 卡阵数据：在线 = 服务端星位（按页切 10 张），离线 = 原版
-           「古代美女」对照抄录。 */
-        List<StarRowItem> rows = net.Self() != null ? StarRows() : null;
+        /* 卡阵数据：全面使用真实星位实体（按页切 10 张），杜绝硬编码假卡牌。 */
+        List<StarRowItem> rows = StarRows();
         int nRows = StarRowCount(rows);
         int pages = (nRows + 9) / 10;
         if (pages < 1) { pages = 1; }
@@ -119,15 +94,9 @@ partial class LegendApp {
             row.Prefer(0, Spec.StarCardH()); wall.With(row);
             for (int c = 0; c < 5; c = c + 1) {
                 int i = r * 5 + c;
-                if (rows != null) {
-                    int k = this.starPageNo * 10 + i;
-                    if (k >= nRows) { break; }
-                    row.With(StarLiveCard(k, rows[k]));
-                    continue;
-                }
-                List<StarInfo> data = StarData();
-                if (i >= data.Count) { break; }
-                row.With(StarCard(i, data[i]));
+                int k = this.starPageNo * 10 + i;
+                if (k >= nRows) { break; }
+                row.With(StarLiveCard(k, rows[k]));
             }
         }
 
@@ -235,67 +204,19 @@ partial class LegendApp {
         BuildPage(); Refresh();
     }
 
-    /// 一张图谱卡：卡面（立绘 + 三层压图文字）+ 价格条。
-    Panel StarCard(int i, StarInfo r) {
-        Panel card = Panel.Column(); card.Class = "star-card";
-        card.Pad(0); card.Gap(Spec.StarArtGap());
-        card.Prefer(Spec.StarCardW(), Spec.StarCardH());
-        card.Named("star-card-" + Rules.N(i));
-
-        /* 卡面：银框素材 00257.png 铺满，立绘压在框内（star-inner-layer 是
-           left/right/top/bottom 四边都给的绝对定位块，尺寸由父盒反推），
-           三层文字再压在上面（left:0;right:0 居中，同经验条数值的套路）。 */
-        Panel art = Panel.Column(); art.Class = "star-art";
-        art.Pad(0); art.Prefer(Spec.StarCardW(), Spec.StarArtH());
-        Image frame = new Image("assets/ui/00257.png", r.name, "fill");
-        frame.Grow(); art.Add(frame);
-        Panel inner = Panel.Column(); inner.Class = "star-inner-layer";
-        inner.Pad(0);
-        Image pic = new Image(StarArtPath(r.art), r.name, "cover");
-        pic.Grow(); inner.Add(pic);
-        art.With(inner);
-        /* 三层压图文字对卡面中线齐（原版角标 / 气血天赋 / 名字都是居中
-           的）——Label 不吃 CSS text-align，居中交给 CenterRow 的 flex 容器；
-           这三行是绝对定位满宽，宽度由 left/right 反推，故 w 传 0。 */
-        art.With(CenterRow(r.badge, "star-ov star-ov-badge", "star-badge",
-            0, Spec.Px(13)));
-        art.With(CenterRow("气血天赋：+" + Rules.N(r.talent) + "%",
-            "star-ov star-ov-talent", "star-talent", 0, Spec.Px(13)));
-        art.With(CenterRow(r.name, "star-ov star-ov-name", "star-name",
-            0, Spec.Px(14)));
-        card.With(art);
-
-        Panel price = Panel.Row(); price.Class = "star-price";
-        price.Pad(0); price.Gap(0); price.Prefer(Spec.StarCardW(), Spec.StarPriceH());
-        /* 价格格：黄字在深蓝框里居中（原版实测字心 = 框心）。 */
-        price.With(CenterRow(Rules.N(r.price), "star-price-v", "star-price-t",
-            Spec.StarPriceNumW(), Spec.StarPriceH()));
-        int pick = i;
-        price.With(BtnDev("激活", "star-act", Spec.StarPriceBtnW(), Spec.StarPriceH(),
-            () => { StarAct(pick); }));
-        card.With(price);
-        return card;
-    }
-
     // ------------------------------------------------------------------
-    //  动作（玩法未接：按本模板惯例给明确反馈，不假装已实现）
+    //  动作（玩法说明与反馈）
     // ------------------------------------------------------------------
     void StarSay() {
         if (net.Self() != null) {
             StarSay2("每张地图的BOSS是一个图谱位，讨伐胜利即点亮；点亮的图谱是征战足迹。");
             return;
         }
-        StarSay2("图谱积分由收集图谱获得，激活图谱可以提升气血天赋，每人每档只能激活一次。");
+        StarSay2("每张地图的BOSS是一个图谱位，击败BOSS后点亮图谱。");
     }
 
     void StarSay2(string msg) {
         if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
         g.Log(msg);
-    }
-
-    void StarAct(int i) {
-        List<StarInfo> rows = StarData();
-        if (i < 0 || i >= rows.Count) { return; }
-        StarSay2("激活「" + rows[i].name + "」（玩法未接，激活价 " + Rules.N(rows[i].price) + "）");
     }
 }
