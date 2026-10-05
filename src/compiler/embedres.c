@@ -143,8 +143,11 @@ static void embed_walk_impl(zan_embed_list_t *l, const char *dir, const char *na
         free(file_name);
         if (!sub) continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
-                embed_walk_impl(l, path, sub, depth + 1);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                free(sub);
+                continue;
+            }
+            embed_walk_impl(l, path, sub, depth + 1);
         } else {
             embed_add_file(l, path, sub);
         }

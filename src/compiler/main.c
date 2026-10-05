@@ -6448,7 +6448,7 @@ int main(int argc, char **argv) {
                          * Skin.Load's EmbedRead("skins/<name>/skin.css") */
                         snprintf(skin_spec, strlen(skins_dir) + 32,
                                  "%s=skins", skins_dir);
-                        if (embed_spec_count < 64) {
+                        if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
                             int spec_at = embed_spec_count++;
                             embed_specs[spec_at] = skin_spec;
                             /* Project skin selection (zan.proj skins/skinlist,

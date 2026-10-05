@@ -486,7 +486,7 @@ static void check_member_name_clash(zan_binder_t *b, zan_symbol_t *type_sym,
 
 /* ---- type resolution ---- */
 
-static bool istr_eq(zan_istr_t a, const char *b, int len) {
+static bool istr_eq(zan_istr_t a, const char *b, uint32_t len) {
     return a.len == len && memcmp(a.str, b, (size_t)len) == 0;
 }
 
@@ -814,6 +814,14 @@ zan_type_t *zan_binder_make_nullable_type(zan_binder_t *b, zan_type_t *elem) {
     return t;
 }
 
+/* Type-parameter count of a declared type: class/struct/interface/enum keep
+ * their own list, a delegate declaration reuses method_decl. */
+static inline int binder_decl_type_param_count(const zan_ast_node_t *d) {
+    if (!d) return 0;
+    if (d->kind == AST_DELEGATE_DECL) return d->method_decl.type_params.count;
+    return d->type_decl.type_params.count;
+}
+
 zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     if (!type_ref) return b->type_error;
     if (type_ref->kind == AST_TUPLE_TYPE) {
@@ -954,6 +962,21 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
              base->kind == TYPE_INTERFACE);
         if (builtin_generic || user_generic) {
             int nargs = type_ref->type_ref.type_args.count;
+            int expected_tps = -1;
+            if (istr_eq(name, "List", 4) || istr_eq(name, "Span", 4) || istr_eq(name, "Task", 4))
+                expected_tps = 1;
+            else if (istr_eq(name, "Dict", 4) || istr_eq(name, "Dictionary", 10))
+                expected_tps = 2;
+            else if (user_generic && base->sym && base->sym->decl)
+                expected_tps = binder_decl_type_param_count(base->sym->decl);
+
+            if (expected_tps >= 0 && nargs != expected_tps) {
+                zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
+                              "using the generic type '%.*s' requires %d type arguments (got %d)",
+                              (int)name.len, name.str, expected_tps, nargs);
+                return b->type_error;
+            }
+
             zan_type_t *inst = base;
             if (user_generic) {
                 inst = make_type(b->arena, base->kind, base->name.str, base->name.len);
@@ -969,6 +992,20 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
                     b, type_ref->type_ref.type_args.items[i]);
             }
             base = inst;
+        } else if (base->sym && base->sym->decl) {
+            int expected_tps = binder_decl_type_param_count(base->sym->decl);
+            if (expected_tps == 0) {
+                zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
+                              "the non-generic type '%.*s' cannot be used with type arguments",
+                              (int)name.len, name.str);
+                return b->type_error;
+            } else if (type_ref->type_ref.type_args.count != expected_tps) {
+                zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
+                              "using the generic type '%.*s' requires %d type arguments (got %d)",
+                              (int)name.len, name.str, expected_tps,
+                              type_ref->type_ref.type_args.count);
+                return b->type_error;
+            }
         }
     }
 

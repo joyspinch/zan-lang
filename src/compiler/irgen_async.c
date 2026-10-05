@@ -1728,6 +1728,18 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
         LLVMBuildStore(g->builder,
             zan_add(g->builder, ksafe, LLVMConstInt(i32, 1, 0), "eh.land.hc"),
             LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "hc.l"));
+        /* Release the temps stacked above the catching handler: the async
+         * throw site skips __zan_eh_tmp_unwind (it must not touch the frames
+         * that await us), so this invocation's expression temporaries --
+         * delegates, boxed values, concat strings -- stay on the unwind stack
+         * otherwise. The mark recorded when this handler was (re-)armed is
+         * the exact boundary; everything above it belongs to the interrupted
+         * segment alone. Plain frames that threw below already released
+         * their own entries at their throw sites. */
+        emit_eh_unwind_to_handler(g,
+            zan_add(g->builder,
+                zan_add(g->builder, e, LLVMConstInt(i32, 2, 0), "eh.land.a2"),
+                ksafe, "eh.land.arm"));
     }
     /* No reload here: a longjmp only ever reaches a handler armed by the
      * invocation it is raised in (handlers of finished invocations are unarmed
@@ -1755,6 +1767,15 @@ static void emit_async_exc_epilogue(zan_irgen_t *g, local_scope_t *locals) {
     get_eh_globals(g, &top_g, &bufs_g, &exc_g);
 
     LLVMPositionBuilderAtEnd(g->builder, g->current_async_exc_bb);
+    /* No handler caught: release everything this invocation stacked since it
+     * last resumed (same contract as the eh.land unwind above, bounded by the
+     * trampoline's entry-time mark). */
+    if (g->current_async_eh_entry) {
+        LLVMValueRef e0 = LLVMBuildLoad2(g->builder, i32,
+            g->current_async_eh_entry, "eh.exc.entry");
+        emit_eh_unwind_to_handler(g,
+            zan_add(g->builder, e0, LLVMConstInt(i32, 1, 0), "eh.exc.tr"));
+    }
     /* the allocas are the live copy here too (see eh.land above): the cleanup
      * emit_async_complete runs must see the locals this invocation assigned */
     LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr, exc_g, "exc.v"),

@@ -137,8 +137,13 @@ bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
             else if (strcmp(key, "plugin_id") == 0) strncpy(pkg->plugin_id, val, sizeof(pkg->plugin_id) - 1);
         } else {
             if (pkg->dep_count >= pkg->dep_cap) {
-                pkg->dep_cap *= 2;
-                pkg->deps = (zan_dependency_t *)realloc(pkg->deps, sizeof(zan_dependency_t) * (size_t)pkg->dep_cap);
+                int ncap = pkg->dep_cap * 2;
+                zan_dependency_t *grown = (zan_dependency_t *)realloc(pkg->deps, sizeof(zan_dependency_t) * (size_t)ncap);
+                if (!grown) {
+                    zan_host_oom();
+                }
+                pkg->deps = grown;
+                pkg->dep_cap = ncap;
             }
             zan_dependency_t *dep = &pkg->deps[pkg->dep_count];
             memset(dep, 0, sizeof(*dep));
@@ -215,8 +220,13 @@ void zan_pkg_new(zan_package_t *pkg, const char *name, const char *version) {
 
 void zan_pkg_add_dep(zan_package_t *pkg, const char *name, const char *source, const char *version_constraint) {
     if (pkg->dep_count >= pkg->dep_cap) {
-        pkg->dep_cap *= 2;
-        pkg->deps = (zan_dependency_t *)realloc(pkg->deps, sizeof(zan_dependency_t) * (size_t)pkg->dep_cap);
+        int ncap = pkg->dep_cap * 2;
+        zan_dependency_t *grown = (zan_dependency_t *)realloc(pkg->deps, sizeof(zan_dependency_t) * (size_t)ncap);
+        if (!grown) {
+            zan_host_oom();
+        }
+        pkg->deps = grown;
+        pkg->dep_cap = ncap;
     }
     zan_dependency_t *dep = &pkg->deps[pkg->dep_count++];
     memset(dep, 0, sizeof(*dep));
@@ -282,13 +292,21 @@ bool zan_pkg_version_satisfies(const zan_dependency_t *dep, const zan_version_t 
 /* A dependency source and version are interpolated into a shell command below.
  * They originate from an untrusted zan.pkg manifest, so anything outside the
  * character set legitimately used by git remote URLs / semver strings is
- * rejected to prevent OS command injection. */
+ * rejected to prevent OS command injection. When '%' is present, require that
+ * it is part of a valid URL percent-encoded sequence (%[0-9a-fA-F]{2}). */
 static bool pkg_token_is_shell_safe(const char *s) {
     if (!s) return true;
     for (const char *p = s; *p; p++) {
         unsigned char c = (unsigned char)*p;
         if (isalnum(c)) continue;
-        if (strchr(":/@._~%+-", c) != NULL) continue;
+        if (c == '%') {
+            if (isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])) {
+                p += 2;
+                continue;
+            }
+            return false;
+        }
+        if (strchr(":/@._~+-", c) != NULL) continue;
         return false;
     }
     return true;
@@ -721,7 +739,11 @@ static bool pkg_mark_seen(pkg_seen_names_t *seen, const char *name) {
         if (strcmp(seen->names[i], name) == 0) return false;
     if (seen->count == seen->capacity) {
         int cap = seen->capacity ? seen->capacity * 2 : 16;
-        seen->names = (char **)realloc(seen->names, (size_t)cap * sizeof(*seen->names));
+        char **grown = (char **)realloc(seen->names, (size_t)cap * sizeof(*seen->names));
+        if (!grown) {
+            zan_host_oom();
+        }
+        seen->names = grown;
         seen->capacity = cap;
     }
     seen->names[seen->count++] = strdup(name);

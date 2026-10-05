@@ -1237,13 +1237,16 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
     nr_ctx_t c;
     memset(&c, 0, sizeof(c));
     c.arena = arena;
-    c.diag = diag;
+    c.diag = NULL; /* Prune is purely for reachability: suppress duplicate diagnostics */
     c.items = items;
     c.count = n;
     /* nr_walk's resolution paths call find_full/count_simple, which read
      * these indexes: build them like zan_nsresolve_run does. */
     nr_index_build(&c.by_full, items, n, 1, arena);
     nr_index_build(&c.by_simple, items, n, 0, arena);
+    zp_refs_t refs;
+    memset(&refs, 0, sizeof(refs));
+    c.refs = &refs;
     for (;;) {
         int before = 0;
         for (int i = 0; i < n; i++) before += kept[i];
@@ -1251,9 +1254,7 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
             if (!kept[i] || walked[i]) continue;
             walked[i] = 1;
             zan_ast_node_t *d = items[i].decl;
-            zp_refs_t refs;
-            memset(&refs, 0, sizeof(refs));
-            c.refs = &refs;
+            refs.count = 0;
             nr_walk(&c, d, zan_ast_ns_name(d), zan_ast_ns_usings(d));
             /* Recorded names are FINAL simple names (t->final), so resolve
              * them against the simple-name index: a by_full lookup would

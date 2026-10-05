@@ -898,6 +898,7 @@ static void emit_leak_report_support(zan_irgen_t *g) {
 
 /* defined in later-included parts of this translation unit */
 static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind);
+static void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj);
 static void emit_eh_tmp_pop(zan_irgen_t *g);
 static void emit_eh_tmp_drop(zan_irgen_t *g, LLVMValueRef obj);
 static zan_type_t *method_ret_type_at(zan_irgen_t *g, zan_symbol_t *msym,
@@ -3008,8 +3009,13 @@ static LLVMValueRef emit_char_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
     zan_call2(bd, memcpy_type, memcpy_fn, (LLVMValueRef[]){ buf, tmp, len }, 3, "");
     LLVMValueRef endp = LLVMBuildGEP2(bd, i8t, buf, &len, 1, "ch.end");
     LLVMBuildStore(bd, LLVMConstInt(i8t, 0, 0), endp);
-    /* no length stamp: char 0 encodes as one NUL byte, whose string length is
-     * 0, not `len` */
+    /* stamp the exact byte length: char 0 encodes as one NUL byte, whose
+     * string length is 0, not `len` -- select the corrected value rather
+     * than leaving the header unmeasured (the first reader would strlen). */
+    emit_string_len_set(g, buf,
+        LLVMBuildSelect(bd, LLVMBuildICmp(bd, LLVMIntEQ, cp,
+            LLVMConstInt(i64t, 0, 0), "ch.z"),
+            LLVMConstInt(i64t, 0, 0), len, "ch.stamp"));
     return buf;
 }
 
@@ -3178,6 +3184,21 @@ static LLVMValueRef emit_str_concat_n(zan_irgen_t *g, zan_ast_node_t *expr,
         vals[i] = s;
         owned[i] = !is_string_expr(g, ops[i], locals) ||
                    expr_yields_owned_rc_value(g, ops[i], locals);
+        /* An owned operand evaluated before a later one throws would be
+         * abandoned: this loop releases only on the normal path, so the
+         * operand rides the unwind stack until then (popped again below once
+         * the buffer is built). Same flavour split as call arguments: the
+         * plain-object releaser cannot free a string/delegate/array header. */
+        if (owned[i]) {
+            int ehk = eh_slot_kind_of(infer_expr_type(g, ops[i], locals));
+            if (ehk == ZAN_EH_SLOT_OBJ) {
+                emit_eh_tmp_push(g, s);
+            } else {
+                LLVMValueRef slot = emit_entry_alloca(g, LLVMTypeOf(s), "ct.eh");
+                LLVMBuildStore(g->builder, s, slot);
+                emit_eh_tmp_push_slot(g, slot, ehk);
+            }
+        }
         lens[i] = emit_cstr_len_of(g, s, ops[i]);
         total = zan_add(g->builder, total, lens[i], "ct");
     }
@@ -3193,7 +3214,13 @@ static LLVMValueRef emit_str_concat_n(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMBuildStore(g->builder, LLVMConstInt(i8t, 0, 0), endp);
     emit_string_len_set(g, buf, off);
     for (int i = 0; i < n; i++) {
-        if (owned[i]) emit_string_release(g, vals[i]);
+        if (owned[i]) {
+            /* take the operand's unwind entry back off the stack (count pop:
+             * these pushes are the topmost ones) before releasing it, so the
+             * normal path leaves the stack exactly as it found it */
+            emit_eh_tmp_pop(g);
+            emit_string_release(g, vals[i]);
+        }
     }
     return buf;
 }

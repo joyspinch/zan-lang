@@ -874,7 +874,6 @@ static bool ast_call_triggers(zan_ast_node_t *call) {
             strcmp(name, "SyncStructureAsync") == 0 ||
             strcmp(name, "SyncStructureAll") == 0 ||
             strcmp(name, "SyncStructureAllAsync") == 0) {
-            fprintf(stderr, "TRIGGER by ORM generic: %s\n", name);
             return true;
         }
     }

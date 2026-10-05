@@ -889,7 +889,7 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
         if (!edata) {
             fprintf(stderr, "error: cannot read bundled library '%s'\n",
                     extra_libs[i]);
-            free(edata); buf_free(&z.out); free(man2); free(arsc);
+            free(edata); buf_free(&z.out); free(z.ents); free(man2); free(arsc);
             free(dex); free(lib); return 1;
         }
         const char *base = strrchr(extra_libs[i], '/');

@@ -234,6 +234,30 @@ static void sh_build_body_index(sh_body_index_t *idx, const char *buf, size_t bu
         if (key) {
             memcpy(key, name_start, name_len);
             key[name_len] = '\0';
+            /* Expand when load factor reaches 75% to prevent infinite probe loop */
+            if ((idx->count + 1) * 4 >= (idx->mask + 1) * 3) {
+                int old_cap = idx->mask + 1;
+                int new_cap = old_cap * 2;
+                char **new_keys = (char **)calloc((size_t)new_cap, sizeof(char *));
+                sh_body_slice_t *new_vals = (sh_body_slice_t *)calloc((size_t)new_cap, sizeof(sh_body_slice_t));
+                if (new_keys && new_vals) {
+                    int new_mask = new_cap - 1;
+                    for (int i = 0; i < old_cap; i++) {
+                        if (idx->keys[i]) {
+                            size_t kl = strlen(idx->keys[i]);
+                            size_t nh = sh_hash_str(idx->keys[i], kl) & (size_t)new_mask;
+                            while (new_keys[nh]) nh = (nh + 1) & (size_t)new_mask;
+                            new_keys[nh] = idx->keys[i];
+                            new_vals[nh] = idx->vals[i];
+                        }
+                    }
+                    free(idx->keys);
+                    free(idx->vals);
+                    idx->keys = new_keys;
+                    idx->vals = new_vals;
+                    idx->mask = new_mask;
+                }
+            }
             size_t h = sh_hash_str(key, name_len) & (size_t)idx->mask;
             while (idx->keys[h]) {
                 h = (h + 1) & (size_t)idx->mask;

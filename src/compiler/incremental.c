@@ -137,10 +137,16 @@ void zan_incr_init(zan_incr_cache_t *cache, const char *project_dir) {
     zan_incr_lock_init((zan_incr_lock_t *)&cache->lock);
     size_t dlen = strlen(project_dir);
     cache->cache_dir = (char *)malloc(dlen + 16);
+    if (!cache->cache_dir) {
+        zan_host_oom();
+    }
     snprintf(cache->cache_dir, dlen + 16, "%s" PATH_SEP ".zan-cache", project_dir);
     ensure_cache_dir(cache->cache_dir);
     cache->unit_cap = 64;
     cache->units = (zan_compile_unit_t *)calloc((size_t)cache->unit_cap, sizeof(zan_compile_unit_t));
+    if (!cache->units) {
+        zan_host_oom();
+    }
     cache->cache_valid = false;
 }
 
@@ -362,9 +368,15 @@ void zan_incr_register(zan_incr_cache_t *cache, const char *source_path,
         unit = existing;
     } else {
         if (cache->unit_count >= cache->unit_cap) {
-            cache->unit_cap *= 2;
-            cache->units = (zan_compile_unit_t *)realloc(cache->units,
-                sizeof(zan_compile_unit_t) * (size_t)cache->unit_cap);
+            int ncap = cache->unit_cap * 2;
+            zan_compile_unit_t *grown = (zan_compile_unit_t *)realloc(cache->units,
+                sizeof(zan_compile_unit_t) * (size_t)ncap);
+            if (!grown) {
+                zan_incr_unlock(cache);
+                zan_host_oom();
+            }
+            cache->units = grown;
+            cache->unit_cap = ncap;
         }
         unit = &cache->units[cache->unit_count++];
         memset(unit, 0, sizeof(*unit));

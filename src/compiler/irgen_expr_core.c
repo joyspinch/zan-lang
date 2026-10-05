@@ -2396,6 +2396,22 @@ static bool expr_is_ulong(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *loca
     return t && t->kind == TYPE_ULONG;
 }
 
+/* True when an expression's static type is the unsigned 32-bit `uint`:
+ * selects unsigned division/remainder/shift/compare and, under `checked`,
+ * trapping against the uint32 range (C# checked wraps uint too). */
+static bool expr_is_uint(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
+    zan_type_t *t = infer_expr_type(g, e, locals);
+    return t && t->kind == TYPE_UINT;
+}
+
+/* True when an expression's static type is 64-bit (either flavor): such an
+ * operand promotes a mixed-width pair to i64 math, so a uint on the other
+ * side must not drive u32-range trapping. */
+static bool expr_is_longish(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
+    zan_type_t *t = infer_expr_type(g, e, locals);
+    return t && (t->kind == TYPE_LONG || t->kind == TYPE_ULONG);
+}
+
 /* True when an expression's static type is 32-bit int (the C# `int`). Checked
  * arithmetic on such operands must detect overflow against the INT32 range:
  * literal operands are widened to i64 before the add (coerce_int_pair), so

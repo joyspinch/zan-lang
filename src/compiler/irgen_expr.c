@@ -868,16 +868,35 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMValueRef off = nm_arg(g, expr, 1, locals);
         LLVMValueRef b = nm_arg(g, expr, 2, locals);
         LLVMValueRef n = nm_arg(g, expr, 3, locals);
-        /* accept = [b, 0]: a two-byte NUL-terminated set holding only the
-         * scanned byte (b == 0 would make an empty set and strspn 0; the
-         * caller never scans for NUL). */
         LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
         LLVMTypeRef arr2 = LLVMArrayType(i8, 2);
-        LLVMValueRef accept = LLVMAddGlobal(g->mod, arr2, "nm.scan.accept");
-        LLVMSetLinkage(accept, LLVMPrivateLinkage);
-        LLVMSetInitializer(accept, LLVMConstArray(i8, (LLVMValueRef[]){
-            LLVMBuildTrunc(g->builder, b, i8, "nm.scan.b"),
-            LLVMConstInt(i8, 0, 0) }, 2));
+        LLVMValueRef accept;
+        if (LLVMIsConstant(b)) {
+            /* accept = [b, 0]: a two-byte NUL-terminated set holding only the
+             * scanned byte (b == 0 would make an empty set and strspn 0; the
+             * caller never scans for NUL). A constant b folds the trunc into
+             * a ConstantExpr, which a global initializer accepts. */
+            accept = LLVMAddGlobal(g->mod, arr2, "nm.scan.accept");
+            LLVMSetLinkage(accept, LLVMPrivateLinkage);
+            LLVMSetInitializer(accept, LLVMConstArray(i8, (LLVMValueRef[]){
+                LLVMBuildTrunc(g->builder, b, i8, "nm.scan.b"),
+                LLVMConstInt(i8, 0, 0) }, 2));
+        } else {
+            /* a runtime byte would leave an instruction inside a constant
+             * initializer (verifier: "invalid initializer"): build the same
+             * two-byte set on the stack for the call's duration */
+            accept = emit_entry_alloca(g, arr2, "nm.scan.acc");
+            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+            LLVMValueRef b8 = LLVMBuildTrunc(g->builder, b, i8, "nm.scan.b");
+            LLVMValueRef e0 = LLVMBuildGEP2(g->builder, i8, accept,
+                (LLVMValueRef[]){ LLVMConstInt(i32t, 0, 0),
+                                  LLVMConstInt(i32t, 0, 0) }, 2, "nm.scan.a0");
+            LLVMBuildStore(g->builder, b8, e0);
+            LLVMValueRef e1 = LLVMBuildGEP2(g->builder, i8, accept,
+                (LLVMValueRef[]){ LLVMConstInt(i32t, 0, 0),
+                                  LLVMConstInt(i32t, 1, 0) }, 2, "nm.scan.a1");
+            LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), e1);
+        }
         LLVMTypeRef ty = LLVMFunctionType(i64t,
             (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
         LLVMValueRef fn = get_libc_fn(g, "strspn", ty);
@@ -2502,7 +2521,21 @@ static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
         if (argc == 2) {
             LLVMValueRef off_val = coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t);
-            base = LLVMBuildGEP2(g->builder, i8, base, &off_val, 1, "pfetch_gep");
+            /* the offset is an ELEMENT index for array sources, mirroring
+             * arr[i] indexing: GEP with the declared element width. A byte[]
+             * keeps the i8 GEP; wider elements used to land the prefetch
+             * off-element (byte-scaled into an element-indexed API). */
+            zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
+            zan_type_t *et = at ? container_elem_type(at) : NULL;
+            if (at && (at->kind == TYPE_ARRAY || is_span_type(at)) && et) {
+                LLVMTypeRef etl = map_type(g, et);
+                base = LLVMBuildGEP2(g->builder, etl,
+                    LLVMBuildBitCast(g->builder, base,
+                        LLVMPointerType(etl, 0), "pfetch_t"), &off_val, 1,
+                    "pfetch_gep");
+            } else {
+                base = LLVMBuildGEP2(g->builder, i8, base, &off_val, 1, "pfetch_gep");
+            }
         }
         LLVMTypeRef void_ty = LLVMVoidTypeInContext(g->ctx);
         LLVMTypeRef ptr_ty = LLVMPointerType(i8, 0);
@@ -2833,7 +2866,19 @@ static bool emit_vector256_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
         if (argc == 2) {
             LLVMValueRef off_val = coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t);
-            base = LLVMBuildGEP2(g->builder, i8, base, &off_val, 1, "pfetch256_gep");
+            /* element index for array sources, mirroring arr[i] indexing
+             * (same fix as the Vector128 dispatcher above) */
+            zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
+            zan_type_t *et = at ? container_elem_type(at) : NULL;
+            if (at && (at->kind == TYPE_ARRAY || is_span_type(at)) && et) {
+                LLVMTypeRef etl = map_type(g, et);
+                base = LLVMBuildGEP2(g->builder, etl,
+                    LLVMBuildBitCast(g->builder, base,
+                        LLVMPointerType(etl, 0), "pfetch_t"), &off_val, 1,
+                    "pfetch256_gep");
+            } else {
+                base = LLVMBuildGEP2(g->builder, i8, base, &off_val, 1, "pfetch256_gep");
+            }
         }
         LLVMTypeRef void_ty = LLVMVoidTypeInContext(g->ctx);
         LLVMTypeRef ptr_ty = LLVMPointerType(i8, 0);
@@ -4105,10 +4150,12 @@ static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
                          LLVMGetTypeKind(LLVMTypeOf(right)) == LLVMDoubleTypeKind ||
                          LLVMGetTypeKind(LLVMTypeOf(right)) == LLVMFloatTypeKind);
 
-        /* ulong operands select unsigned division/remainder/shift/compare */
+        /* ulong/uint operands select unsigned division/remainder/shift/compare */
         bool is_unsigned = !is_float &&
             (expr_is_ulong(g, expr->binary.left, locals) ||
-             expr_is_ulong(g, expr->binary.right, locals));
+             expr_is_ulong(g, expr->binary.right, locals) ||
+             expr_is_uint(g, expr->binary.left, locals) ||
+             expr_is_uint(g, expr->binary.right, locals));
 
         /* Integer overflow trap under `checked(...)`: decided from both the
          * per-node stamp the parser put on the arithmetic operator and the
@@ -4120,7 +4167,7 @@ static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
         int check_ctx = expr->binary.checked
             ? (expr->binary.checked > 0 ? 1 : -1)
             : (g->irgen_checked_depth > 0 ? 1 : 0);
-        bool want_overflow_check = check_ctx > 0 && !is_float && !is_unsigned;
+        bool want_overflow_check = check_ctx > 0 && !is_float;
         LLVMTypeRef res_ty = LLVMTypeOf(left);
         if (want_overflow_check &&
             !(LLVMGetTypeKind(res_ty) == LLVMIntegerTypeKind &&
@@ -4287,8 +4334,17 @@ static LLVMValueRef emit_checked_int_arith(zan_irgen_t *g, zan_ast_node_t *expr,
                                            int kind, local_scope_t *locals) {
     LLVMTypeRef ty = LLVMTypeOf(left);
     unsigned bits = LLVMGetIntTypeWidth(ty);
-    bool is_unsigned = expr_is_ulong(g, expr->binary.left, locals) ||
-                       expr_is_ulong(g, expr->binary.right, locals);
+    bool is_u64 = expr_is_ulong(g, expr->binary.left, locals) ||
+                  expr_is_ulong(g, expr->binary.right, locals);
+    /* uint traps against the uint32 range only when both operands stay in the
+     * 32-bit family -- a 64-bit operand promotes the pair to i64 math, where
+     * C# computes in 64 bits and no u32-range trap applies. */
+    bool is_u32 = !is_u64 &&
+        (expr_is_uint(g, expr->binary.left, locals) ||
+         expr_is_uint(g, expr->binary.right, locals)) &&
+        !expr_is_longish(g, expr->binary.left, locals) &&
+        !expr_is_longish(g, expr->binary.right, locals);
+    bool is_unsigned = is_u64 || is_u32;
     /* `int` operands compute in i64 here (literal widening in coerce_int_pair
      * reconciles an int local against an int literal by sext), but the
      * overflow contract is C#'s: the trap range is the declared operand
@@ -4301,7 +4357,31 @@ static LLVMValueRef emit_checked_int_arith(zan_irgen_t *g, zan_ast_node_t *expr,
                    expr_is_int32(g, expr->binary.left, locals) &&
                    expr_is_int32(g, expr->binary.right, locals);
     LLVMValueRef res, ovf;
-    if (kind == CHK_ADD) {
+    if (is_u32) {
+        /* uint math: operands may compute in i64 (coerce_int_pair sign-extends
+         * the i32 bit pattern), so recover the true unsigned values, compute
+         * in zero-extended i64, and trap outside the uint32 range. */
+        LLVMTypeRef i32t = LLVMIntTypeInContext(g->ctx, 32);
+        LLVMTypeRef i64t = LLVMIntTypeInContext(g->ctx, 64);
+        LLVMValueRef l64 = LLVMBuildZExt(g->builder,
+            LLVMBuildTrunc(g->builder, left, i32t, "ck.u32l"), i64t, "ck.u32lz");
+        LLVMValueRef r64 = LLVMBuildZExt(g->builder,
+            LLVMBuildTrunc(g->builder, right, i32t, "ck.u32r"), i64t, "ck.u32rz");
+        LLVMValueRef u32max = LLVMConstInt(i64t, 0xFFFFFFFFULL, 0);
+        if (kind == CHK_ADD) {
+            res = zan_add(g->builder, l64, r64, "ck.u32.add");
+            ovf = zan_icmp(g->builder, LLVMIntUGT, res, u32max, "ck.u32.ovf");
+        } else if (kind == CHK_SUB) {
+            res = zan_sub(g->builder, l64, r64, "ck.u32.sub");
+            /* wrapping below zero is exactly the overflow */
+            ovf = zan_icmp(g->builder, LLVMIntSLT, res,
+                LLVMConstInt(i64t, 0, 0), "ck.u32.ovf");
+        } else {
+            res = zan_mul(g->builder, l64, r64, "ck.u32.mul");
+            ovf = zan_icmp(g->builder, LLVMIntUGT, res, u32max, "ck.u32.ovf");
+        }
+        res = LLVMBuildTrunc(g->builder, res, ty, "ck.u32.res");
+    } else if (kind == CHK_ADD) {
         res = zan_add(g->builder, left, right, "ck.add");
         if (is_unsigned)
             ovf = zan_icmp(g->builder, LLVMIntULT, res, left, "ck.add.ovf");
@@ -6704,10 +6784,12 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
                         "blen");
                     owns[i] = 0;
                 } else if (expr_is_char(g, part, locals)) {
-                    /* char interpolates as the character (C#), not its code. */
+                    /* char interpolates as the character (C#), not its code.
+                     * emit_char_to_cstr stamps the exact byte length, so the
+                     * length read is the stamp, not a runtime strlen. */
                     LLVMValueRef buf = emit_char_to_cstr(g, val);
                     strs[i] = buf;
-                    lens[i] = zan_call2(g->builder, strlen_type, g->fn_strlen, &buf, 1, "clen");
+                    lens[i] = emit_string_length(g, buf, expr->loc);
                     owns[i] = 1;
                 } else if (llvm_is_nullable(vt)) {
                     /* T? interpolates through the same coercion as `+` concat
@@ -6715,7 +6797,8 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
                      * text for a some, "" for a none (C#). emit_to_cstr_u
                      * allocates both arms, so the owned release below is
                      * exact. Passing the struct to the integer branch's itoa
-                     * made the LLVM verifier reject the call. */
+                     * made the LLVM verifier reject the call. The strlen here
+                     * is exact: both arms are NUL-free digits or empty. */
                     zan_type_t *st = infer_expr_type(g, part, locals);
                     bool uns = st && st->element_type &&
                                (st->element_type->kind == TYPE_UINT ||
@@ -7071,20 +7154,37 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                     if (is_double) return LLVMConstReal(LLVMDoubleTypeInContext(g->ctx), -1.7976931348623157e+308);
                 }
                 if (is_double || is_float) {
+                    /* Bit-exact constants: a constant int->float bitcast
+                     * preserves the payload exactly. The old path punned the
+                     * bits through a host float/double and handed the value
+                     * to LLVMConstReal, which is free to canonicalize a NaN
+                     * payload. */
                     if (m.len == 3 && memcmp(m.str, "NaN", 3) == 0) {
-                        unsigned long long nan_bits = 0x7FF8000000000000ULL;
-                        return LLVMConstReal(LLVMDoubleTypeInContext(g->ctx),
-                            *(double *)&nan_bits);
+                        if (is_float)
+                            return LLVMConstBitCast(
+                                LLVMConstInt(i32, 0x7FC00000U, 0),
+                                LLVMFloatTypeInContext(g->ctx));
+                        return LLVMConstBitCast(
+                            LLVMConstInt(i64, 0x7FF8000000000000ULL, 0),
+                            LLVMDoubleTypeInContext(g->ctx));
                     }
                     if (m.len == 16 && memcmp(m.str, "PositiveInfinity", 16) == 0) {
-                        unsigned long long pinf_bits = 0x7FF0000000000000ULL;
-                        return LLVMConstReal(LLVMDoubleTypeInContext(g->ctx),
-                            *(double *)&pinf_bits);
+                        if (is_float)
+                            return LLVMConstBitCast(
+                                LLVMConstInt(i32, 0x7F800000U, 0),
+                                LLVMFloatTypeInContext(g->ctx));
+                        return LLVMConstBitCast(
+                            LLVMConstInt(i64, 0x7FF0000000000000ULL, 0),
+                            LLVMDoubleTypeInContext(g->ctx));
                     }
                     if (m.len == 16 && memcmp(m.str, "NegativeInfinity", 16) == 0) {
-                        unsigned long long ninf_bits = 0xFFF0000000000000ULL;
-                        return LLVMConstReal(LLVMDoubleTypeInContext(g->ctx),
-                            *(double *)&ninf_bits);
+                        if (is_float)
+                            return LLVMConstBitCast(
+                                LLVMConstInt(i32, 0xFF800000U, 0),
+                                LLVMFloatTypeInContext(g->ctx));
+                        return LLVMConstBitCast(
+                            LLVMConstInt(i64, 0xFFF0000000000000ULL, 0),
+                            LLVMDoubleTypeInContext(g->ctx));
                     }
                 }
                 if (is_float && m.len == 7 && memcmp(m.str, "Epsilon", 7) == 0)
