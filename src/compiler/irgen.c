@@ -3363,6 +3363,9 @@ void zan_irgen_release_llvm(zan_irgen_t *g) {
     free(g->goto_labels);
     g->goto_labels = NULL;
     g->goto_label_count = g->goto_label_cap = 0;
+    free(g->goto_fixups);
+    g->goto_fixups = NULL;
+    g->goto_fixup_count = g->goto_fixup_cap = 0;
     free(g->bind_accs);
     g->bind_accs = NULL;
     g->bind_acc_count = g->bind_acc_cap = 0;
@@ -3393,6 +3396,9 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     free(g->goto_labels);
     g->goto_labels = NULL;
     g->goto_label_count = g->goto_label_cap = 0;
+    free(g->goto_fixups);
+    g->goto_fixups = NULL;
+    g->goto_fixup_count = g->goto_fixup_cap = 0;
     free(g->bind_accs);
     g->bind_accs = NULL;
     g->bind_acc_count = g->bind_acc_cap = 0;

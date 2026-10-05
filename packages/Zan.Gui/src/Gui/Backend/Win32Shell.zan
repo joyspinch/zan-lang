@@ -105,6 +105,21 @@ class Win32ShapeRegion {
     }
 }
 
+/// <summary>Win32 窗口脏矩形条目实体（消除 dirty 平铺四元组整数列表反模式）。</summary>
+class Win32DirtyRect {
+    public int x;
+    public int y;
+    public int w;
+    public int h;
+
+    public Win32DirtyRect(int x, int y, int w, int h) {
+        this.x = x;
+        this.y = y;
+        this.w = w;
+        this.h = h;
+    }
+}
+
 /// <summary>
 /// Windows 窗口外壳——类注册、窗口过程、
 /// 事件队列、DIB 呈现、亚克力玻璃、IME 定位、剪贴板
@@ -439,13 +454,9 @@ class Win32Shell {
     static List<Win32SurfaceBinding> surfaceBindings;
     static int lastSurface;
 
-    // 为下一次呈现声明的脏矩形（x, y, w, h 四元组）。列表是一份，
-    // 而窗口不止一个（主窗、设置对话框、原生下拉层……），所以它记着
-    // 自己属于哪个窗口：矩形按各自表面的坐标算，谁先呈现谁就把别人
-    // 的矩形消费掉的话，那个窗口改过的条带永远传不上去，屏上就一直
-    // 留着旧像素，直到某次整窗重绘。换主人时旧主人记进 dirtyLost，
-    // 它下一次呈现整窗上传，把欠的账一次补齐。
-    static List<int> dirty;
+    // 为下一次呈现声明的脏矩形（使用 Win32DirtyRect 实体集合主表示，消除四元组平铺反模式）。
+    static List<Win32DirtyRect> dirtyRects;
+    static List<int> dirty; // 兼容底层 zan_gui_gdi_present 扁平 int* 内存块视图
     static bool dirtyOverflow;
     static nint dirtyHwnd;
     static List<nint> dirtyLost;
@@ -511,6 +522,7 @@ class Win32Shell {
         Win32Shell.titlebarH = 32;
         Win32Shell.buttonW = 46;
         Win32Shell.surfaceBindings = new List<Win32SurfaceBinding>();
+        Win32Shell.dirtyRects = new List<Win32DirtyRect>();
         Win32Shell.dirty = new List<int>();
         Win32Shell.dirtyHwnd = 0;
         Win32Shell.dirtyLost = new List<nint>();
@@ -1137,6 +1149,7 @@ class Win32Shell {
             // 还没有任何一帧画到这块表面上：呈现它就是把分配器里的旧
             // 内容贴到窗口上。丢掉为旧几何声明的脏矩形，等应用画完。
             if (Win32Shell.dirtyHwnd == hwnd) {
+                if (Win32Shell.dirtyRects != null) { Win32Shell.dirtyRects.Clear(); }
                 Win32Shell.dirty.Clear();
                 Win32Shell.dirtyOverflow = false;
             }
@@ -1152,6 +1165,7 @@ class Win32Shell {
             int gpu = Win32Shell.zan_gui_present_window(surface, hwnd);
             if (gpu == 1) {
                 if (Win32Shell.dirtyHwnd == hwnd) {
+                    if (Win32Shell.dirtyRects != null) { Win32Shell.dirtyRects.Clear(); }
                     Win32Shell.dirty.Clear();
                     Win32Shell.dirtyOverflow = false;
                     Win32Shell.forceFullUpload = false;
@@ -1165,6 +1179,7 @@ class Win32Shell {
             // 别人的矩形不得顺手清掉。宿主了原生子窗口的窗口即便开着
             // 玻璃也留在 GDI 路径上——ULW 呈现会让子窗口消失。
             if (Win32Shell.dirtyHwnd == hwnd) {
+                if (Win32Shell.dirtyRects != null) { Win32Shell.dirtyRects.Clear(); }
                 Win32Shell.dirty.Clear();
                 Win32Shell.dirtyOverflow = false;
                 Win32Shell.forceFullUpload = false;
@@ -1224,6 +1239,7 @@ class Win32Shell {
                 + Convert.ToString(sh) + "\n");
         }
         if (owned) {
+            if (Win32Shell.dirtyRects != null) { Win32Shell.dirtyRects.Clear(); }
             Win32Shell.dirty.Clear();
             Win32Shell.dirtyOverflow = false;
         }
@@ -2494,6 +2510,7 @@ class Win32Shell {
             if (Win32Shell.dirty.Count > 0 && Win32Shell.dirtyHwnd != 0) {
                 Win32Shell.NoteDirtyLost(Win32Shell.dirtyHwnd);
             }
+            if (Win32Shell.dirtyRects != null) { Win32Shell.dirtyRects.Clear(); }
             Win32Shell.dirty.Clear();
             Win32Shell.dirtyOverflow = false;
             Win32Shell.dirtyHwnd = hwnd;
@@ -2502,6 +2519,8 @@ class Win32Shell {
             Win32Shell.dirtyOverflow = true;
             return;
         }
+        if (Win32Shell.dirtyRects == null) { Win32Shell.dirtyRects = new List<Win32DirtyRect>(); }
+        Win32Shell.dirtyRects.Add(new Win32DirtyRect(x, y, w, h));
         Win32Shell.dirty.Add(x);
         Win32Shell.dirty.Add(y);
         Win32Shell.dirty.Add(w);

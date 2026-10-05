@@ -220,7 +220,8 @@ class App {
     // hasSkinDensity：当前皮肤包声明过 `--density`（跟随皮肤，用户
     // 抽屉选择被皮肤切换覆盖）；false = 用户自主档位。
     int density;
-    List<int> densityBase;
+    ThemeMetricsSnapshot densitySnapshot; // 强类型主题度量基线快照（主表示）
+    List<int> densityBase;                 // 兼容视图：24 项扁平整数度量基线
     bool hasSkinDensity;
     // 皮肤切换：当 autoSkins 开启时，标题栏主题按钮是一个菜单
     // 其中列出磁盘上的皮肤（Skin.Names），由 App 自行应用所选皮肤
@@ -743,10 +744,11 @@ class App {
     int presentY;
     int presentW;
     int presentH;
-    // 本帧画过的玻璃面板矩形（x,y,w,h 四元组，NoteGlassRect 记录，
-    // BeginFrame 清空）。损伤条带跨出某块玻璃时（模糊只能拿条带外
+    // 本帧画过的玻璃面板矩形（glassPanels 强类型 Rect 实体列表为主表示，NoteGlassRect 记录，
+    // BeginFrame 清空；glassRects 保留为兼容底层四元组视图）。损伤条带跨出某块玻璃时（模糊只能拿条带外
     // 的旧合成像素充数），下一帧把裁剪扩到相交面板的并集：模糊从
     // 一整块本帧新画的背景重算，比整窗重绘便宜一个量级。
+    List<Rect> glassPanels;
     List<int> glassRects;
     // 滚动串里玻璃模糊的延迟刷新：最近一次滚动损伤的截止时刻
     // （nowMs < 它 = 串还在进行）、本帧是否有面板暂用了旧模糊、
@@ -756,6 +758,7 @@ class App {
     bool glassDeferred;
     bool glassRefreshOwe;
     int glassRefreshArmedAt;
+    List<Rect> glassDeferredPanels;
     List<int> glassDeferredRects;
     // 损伤裁剪帧玻璃模糊连续 miss 的帧数。扩裁剪（widen）重算过
     // 的帧若仍报 miss，说明模糊核的采样边缘超出了任何条带，widen
@@ -954,7 +957,9 @@ class App {
         this.frameWhy = "";
         this.frameWhyN = 0;
         this.fullWhy = new List<WhyTally>();
+        this.glassPanels = new List<Rect>();
         this.glassRects = new List<int>();
+        this.glassDeferredPanels = new List<Rect>();
         this.glassDeferredRects = new List<int>();
         this.glassRefreshArmedAt = 0 - 1;
         this.phaseMarkTop = "";
@@ -1123,11 +1128,12 @@ class App {
         // Skin/调用方重建，所以快照此刻的度量即为未缩放的基线；
         // 若 theme 被复用（理论上的调用方误用），快照取自
         // densityBase 仍成立——只在基线缺失时重新记录。
-        if (densityBase == null || densityBase.Count < 24) {
+        if (densitySnapshot == null) {
+            densitySnapshot = theme.Snapshot();
             densityBase = theme.SnapshotMetrics();
             if (density == 1) { theme.ScaleByDpi(dpiScale); return; }
         }
-        theme.ApplyDensityScaled(densityBase, density);
+        theme.ApplyDensitySnapshot(densitySnapshot, density);
         theme.ScaleByDpi(dpiScale);
     }
 
@@ -1139,7 +1145,8 @@ class App {
         if (d > 2) { d = 2; }
         if (d == density) { return; }
         density = d;
-        if (densityBase == null && theme != null) {
+        if (densitySnapshot == null && theme != null) {
+            densitySnapshot = theme.Snapshot();
             densityBase = theme.SnapshotMetrics();
         }
         this.ScaleThemeMetrics();
@@ -1485,8 +1492,12 @@ class App {
         hasSkinDensity = true;
         if (sd == density) { return; }
         density = sd;
-        if (densityBase != null && densityBase.Count >= 24 && theme != null) {
-            theme.ApplyDensityScaled(densityBase, density);
+        if (theme != null) {
+            if (densitySnapshot != null) {
+                theme.ApplyDensitySnapshot(densitySnapshot, density);
+            } else if (densityBase != null && densityBase.Count >= 24) {
+                theme.ApplyDensityScaled(densityBase, density);
+            }
             theme.ScaleByDpi(dpiScale);
             bgThemeGen = bgThemeGen + 1;
             backdropDirty = true;
@@ -2736,15 +2747,19 @@ class App {
     /// 计算指定整数 key 在当前作用域下的唯一哈希 ID。
     int GetId(int intKey) { return focus.GetId(intKey); }
 
-    /// StyleBox 在画玻璃时登记面板矩形（本帧内有效）。见 glassRects。
+    /// StyleBox 在画玻璃时登记面板矩形（本帧内有效）。见 glassPanels 与 glassRects。
     void NoteGlassRect(int x, int y, int w, int h) {
         // 一屏玻璃面板的合理上限；超过就不再登记——损伤扩展退化成
         // 整窗帧，正确性不受影响。
-        if (glassRects.Count >= 256) { return; }
-        glassRects.Add(x);
-        glassRects.Add(y);
-        glassRects.Add(w);
-        glassRects.Add(h);
+        if (glassPanels != null && glassPanels.Count >= 64) { return; }
+        if (glassPanels == null) { glassPanels = new List<Rect>(); }
+        glassPanels.Add(new Rect(x, y, w, h));
+        if (glassRects.Count < 256) {
+            glassRects.Add(x);
+            glassRects.Add(y);
+            glassRects.Add(w);
+            glassRects.Add(h);
+        }
     }
 
     /// 损伤条带跨出了玻璃面板：把下一帧的裁剪从条带扩到
@@ -2757,20 +2772,38 @@ class App {
         int x1 = dmgX + dmgW;
         int y1 = dmgY + dmgH;
         bool any = false;
-        int i = 0;
-        while (i + 3 < glassRects.Count) {
-            int gx = glassRects[i];
-            int gy = glassRects[i + 1];
-            int gw = glassRects[i + 2];
-            int gh = glassRects[i + 3];
-            i = i + 4;
-            if (gx + gw <= x0 || x1 <= gx) { continue; }
-            if (gy + gh <= y0 || y1 <= gy) { continue; }
-            if (gx < x0) { x0 = gx; }
-            if (gy < y0) { y0 = gy; }
-            if (gx + gw > x1) { x1 = gx + gw; }
-            if (gy + gh > y1) { y1 = gy + gh; }
-            any = true;
+        if (glassPanels != null && glassPanels.Count > 0) {
+            for (int p = 0; p < glassPanels.Count; p = p + 1) {
+                Rect r = glassPanels[p];
+                if (r == null) { continue; }
+                int gx = r.x;
+                int gy = r.y;
+                int gw = r.width;
+                int gh = r.height;
+                if (gx + gw <= x0 || x1 <= gx) { continue; }
+                if (gy + gh <= y0 || y1 <= gy) { continue; }
+                if (gx < x0) { x0 = gx; }
+                if (gy < y0) { y0 = gy; }
+                if (gx + gw > x1) { x1 = gx + gw; }
+                if (gy + gh > y1) { y1 = gy + gh; }
+                any = true;
+            }
+        } else {
+            int i = 0;
+            while (i + 3 < glassRects.Count) {
+                int gx = glassRects[i];
+                int gy = glassRects[i + 1];
+                int gw = glassRects[i + 2];
+                int gh = glassRects[i + 3];
+                i = i + 4;
+                if (gx + gw <= x0 || x1 <= gx) { continue; }
+                if (gy + gh <= y0 || y1 <= gy) { continue; }
+                if (gx < x0) { x0 = gx; }
+                if (gy < y0) { y0 = gy; }
+                if (gx + gw > x1) { x1 = gx + gw; }
+                if (gy + gh > y1) { y1 = gy + gh; }
+                any = true;
+            }
         }
         if (!any) { return false; }
         if (x0 < 0) { x0 = 0; }
@@ -2799,6 +2832,7 @@ class App {
         if (!partialFrame) {
             glassRefreshOwe = false;
             glassRefreshArmedAt = 0 - 1;
+            if (glassDeferredPanels != null) { glassDeferredPanels.Clear(); }
             glassDeferredRects.Clear();
             glassDeferred = false;
             return;
@@ -2812,6 +2846,7 @@ class App {
                 // 已把 armedAt 拍回 -1，走不到这里。
                 glassRefreshOwe = false;
                 glassRefreshArmedAt = 0 - 1;
+                if (glassDeferredPanels != null) { glassDeferredPanels.Clear(); }
                 glassDeferredRects.Clear();
             }
             return;
@@ -2820,17 +2855,32 @@ class App {
         int y0 = dmgY;
         int x1 = dmgX + dmgW;
         int y1 = dmgY + dmgH;
-        int i = 0;
-        while (i + 3 < glassDeferredRects.Count) {
-            int gx = glassDeferredRects[i];
-            int gy = glassDeferredRects[i + 1];
-            int gw = glassDeferredRects[i + 2];
-            int gh = glassDeferredRects[i + 3];
-            i = i + 4;
-            if (gx < x0) { x0 = gx; }
-            if (gy < y0) { y0 = gy; }
-            if (gx + gw > x1) { x1 = gx + gw; }
-            if (gy + gh > y1) { y1 = gy + gh; }
+        if (glassDeferredPanels != null && glassDeferredPanels.Count > 0) {
+            for (int p = 0; p < glassDeferredPanels.Count; p = p + 1) {
+                Rect r = glassDeferredPanels[p];
+                if (r == null) { continue; }
+                int gx = r.x;
+                int gy = r.y;
+                int gw = r.width;
+                int gh = r.height;
+                if (gx < x0) { x0 = gx; }
+                if (gy < y0) { y0 = gy; }
+                if (gx + gw > x1) { x1 = gx + gw; }
+                if (gy + gh > y1) { y1 = gy + gh; }
+            }
+        } else {
+            int i = 0;
+            while (i + 3 < glassDeferredRects.Count) {
+                int gx = glassDeferredRects[i];
+                int gy = glassDeferredRects[i + 1];
+                int gw = glassDeferredRects[i + 2];
+                int gh = glassDeferredRects[i + 3];
+                i = i + 4;
+                if (gx < x0) { x0 = gx; }
+                if (gy < y0) { y0 = gy; }
+                if (gx + gw > x1) { x1 = gx + gw; }
+                if (gy + gh > y1) { y1 = gy + gh; }
+            }
         }
         if (x0 < 0) { x0 = 0; }
         if (y0 < 0) { y0 = 0; }

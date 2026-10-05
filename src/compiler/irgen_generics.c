@@ -443,6 +443,12 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
      * contract is whatever its operand's is. */
     if (e->kind == AST_POSTFIX_UNARY && e->unary.op == TK_BANG)
         return expr_yields_owned_rc_value(g, e->unary.operand, locals);
+    /* A tuple literal carries +1 per rc-managed field: emit_expr_tuple
+     * retains borrowed rc elements so the value owns every rc field
+     * uniformly -- the same contract a returned struct has. Consumers move
+     * the fields into owning slots or release the whole value; without this
+     * the literal's call-result elements (moved in raw) leaked. */
+    if (e->kind == AST_TUPLE_EXPR) return 1;
     /* A bare weak field inside an instance method (`up.tag` spelled just
      * `up`) hands out +1 like its `this.up` spelling: the implicit-this read
      * goes through the same weak handshake. Skipped when a local of the same

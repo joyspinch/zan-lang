@@ -71,6 +71,22 @@ class SelectBoxColumn {
     }
 }
 
+/// <summary>级联下列滚动状态强类型实体（消除 cascadeScroll 与 cascadeScrollSig 平行列表反模式）。</summary>
+class CascadeColumnScroll {
+    public int offset;
+    public SignalInt signal;
+
+    public CascadeColumnScroll() {
+        this.offset = 0;
+        this.signal = new SignalInt(0);
+    }
+
+    public CascadeColumnScroll(int offset, SignalInt signal) {
+        this.offset = offset;
+        this.signal = signal != null ? signal : new SignalInt(offset);
+    }
+}
+
 /// <summary>
 /// 高层、自包含的 select / 下拉框。
 ///
@@ -170,9 +186,11 @@ class SelectBox : Control {
     bool hoverExpand;
     /// 从过滤结果选中后清掉搜索词（默认清）。
     bool clearFilterAfter;
-    /// 级联各列的滚动偏移（按下标取，多退少补）。
+    /// 级联各列的滚动状态实体集合（主表示，消除平行列表反模式）。
+    List<CascadeColumnScroll> cascadeCols;
+    /// 兼容视图：级联各列的滚动偏移（按下标取，多退少补）。
     List<int> cascadeScroll;
-    /// 各列内嵌 Scrollbar 的信号视图，懒建，与 cascadeScroll 同步。
+    /// 兼容视图：各列内嵌 Scrollbar 的信号视图，懒建，与 cascadeCols 同步。
     List<SignalInt> cascadeScrollSig;
     /// 树形模式：弹层内嵌一颗真 TreeView，展开/折叠、滚动、悬停
     /// 全部由 TreeView 自持，SelectBox 只负责摆位与收值。
@@ -266,6 +284,7 @@ class SelectBox : Control {
         this.showPath = true;
         this.hoverExpand = false;
         this.clearFilterAfter = true;
+        this.cascadeCols = null;
         this.cascadeScroll = null;
         this.cascadeScrollSig = null;
         this.treeMode = false;
@@ -465,7 +484,9 @@ class SelectBox : Control {
             // 级联弹层回到第一列；单选已有选中值时把它的祖先链展开，
             // 重开弹层能直接看到选中路径（多选没有单一选中，回第一列）。
             cascadePath = new List<int>();
+            cascadeCols = null;
             cascadeScroll = null;
+            cascadeScrollSig = null;
             if (cascade && !multi && selected >= 0 && selected < opts.Count) {
                 List<int> chain = new List<int>();
                 int walk = opts[selected].parentIdx;
@@ -715,7 +736,9 @@ class SelectBox : Control {
                 if (opts[i].label.ToLower().Contains(q)) { r.Add(i); }
             }
             cascadeFilter = r;
+            cascadeCols = null;
             cascadeScroll = null;
+            cascadeScrollSig = null;
             return;
         }
         bool tbl = this.IsTable();
@@ -787,7 +810,9 @@ class SelectBox : Control {
         selected = 0 - 1;
         pathText = "";
         treeSelSeen = 0 - 1;
+        cascadeCols = null;
         cascadeScroll = null;
+        cascadeScrollSig = null;
         if (treeBox != null) { treeBox.ClearSelection(); }
         for (int i = 0; i < opts.Count; i = i + 1) {
             opts[i].chosen = false;
@@ -1735,16 +1760,19 @@ class SelectBox : Control {
                     this.SetColScroll(col, v - d * app.scrollSpeed / 120);
                     app.RequestRedraw();
                 }
+                if (cascadeCols == null) { cascadeCols = new List<CascadeColumnScroll>(); }
+                while (cascadeCols.Count <= col) { cascadeCols.Add(new CascadeColumnScroll(0, null)); }
                 if (cascadeScrollSig == null) {
                     cascadeScrollSig = new List<SignalInt>();
                 }
                 while (cascadeScrollSig.Count <= col) {
                     cascadeScrollSig.Add(null);
                 }
-                if (cascadeScrollSig[col] == null) {
-                    cascadeScrollSig[col] = new SignalInt(0);
+                if (cascadeCols[col].signal == null) {
+                    cascadeCols[col].signal = new SignalInt(0);
                 }
-                SignalInt sig = cascadeScrollSig[col];
+                cascadeScrollSig[col] = cascadeCols[col].signal;
+                SignalInt sig = cascadeCols[col].signal;
                 sig.Set(this.ColScroll(col, count * optH, rowsH));
                 Scrollbar.RenderVerticalScroll(app,
                     cx + colW - app.Scale(12), rowsY + app.Scale(2),
@@ -1780,6 +1808,11 @@ class SelectBox : Control {
 
     /// 设第 col 列滚动偏移（列表按需扩容）。
     void SetColScroll(int col, int v) {
+        if (cascadeCols == null) { cascadeCols = new List<CascadeColumnScroll>(); }
+        while (cascadeCols.Count <= col) { cascadeCols.Add(new CascadeColumnScroll(0, null)); }
+        cascadeCols[col].offset = v;
+        if (cascadeCols[col].signal != null) { cascadeCols[col].signal.Set(v); }
+
         if (cascadeScroll == null) { cascadeScroll = new List<int>(); }
         while (cascadeScroll.Count <= col) { cascadeScroll.Add(0); }
         cascadeScroll[col] = v;
@@ -2005,13 +2038,16 @@ class SelectBox : Control {
 
     /// 第 `col` 列的滚动偏移（像素），按内容高度钳制。
     int ColScroll(int col, int contentH, int viewH) {
+        if (cascadeCols == null) { cascadeCols = new List<CascadeColumnScroll>(); }
+        while (cascadeCols.Count <= col) { cascadeCols.Add(new CascadeColumnScroll(0, null)); }
         if (cascadeScroll == null) { cascadeScroll = new List<int>(); }
         while (cascadeScroll.Count <= col) { cascadeScroll.Add(0); }
         int maxOff = contentH - viewH;
         if (maxOff < 0) { maxOff = 0; }
-        int v = cascadeScroll[col];
+        int v = cascadeCols[col].offset;
         if (v > maxOff) { v = maxOff; }
         if (v < 0) { v = 0; }
+        cascadeCols[col].offset = v;
         cascadeScroll[col] = v;
         return v;
     }

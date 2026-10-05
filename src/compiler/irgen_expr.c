@@ -2034,7 +2034,11 @@ static LLVMValueRef emit_pmovmskb_portable(zan_irgen_t *g, LLVMValueRef v,
 {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef vt = LLVMVectorType(LLVMInt8TypeInContext(g->ctx), lanes);
-    LLVMValueRef signs = LLVMBuildICmp(g->builder, LLVMIntSGT, v,
+    /* bit i of the result is the SIGN bit of byte i: a set bit means the byte
+     * is negative, exactly like x86 pmovmskb. An SGT compare inverted the
+     * mask -- the canonical MoveMask(Vector.Equals(a, b)) pattern (equal
+     * lanes are 0xFF) produced 0 on every non-x86 target. */
+    LLVMValueRef signs = LLVMBuildICmp(g->builder, LLVMIntSLT, v,
         LLVMConstNull(vt), "vsigns");
     LLVMValueRef acc = LLVMConstInt(i32t, 0, 0);
     for (unsigned i = 0; i < lanes; i++) {
@@ -9035,6 +9039,22 @@ static LLVMValueRef emit_expr_tuple(zan_irgen_t *g, zan_ast_node_t *expr,
         if (fi < 0) fi = i;
         LLVMValueRef fptr = emit_field_ptr(g, ttype->sym, st, alloca, fi, "tf");
         LLVMValueRef fval = emit_arg_typed(g, item, fsym->type, locals);
+        /* Normalize ownership to the returned-struct contract: the literal's
+         * value carries +1 per rc-managed field. A borrowed rc element (a
+         * local, a field load, a string literal) is retained here; an owned
+         * one (call/new result, nested tuple) moves its existing +1 in. The
+         * consumers -- `var t = (...)`, deconstruction targets, argument
+         * sites, `return` -- all key off expr_yields_owned_rc_value, which
+         * reports tuple literals as owned since this loop guarantees it. */
+        if (fsym->type && is_rc_managed_type(fsym->type) &&
+            LLVMGetTypeKind(LLVMTypeOf(fval)) == LLVMPointerTypeKind &&
+            !expr_yields_owned_rc_value(g, item, locals)) {
+            emit_rc_retain_for_type(g, fsym->type, fval);
+        } else if (fsym->type && fsym->type->kind == TYPE_STRUCT &&
+                   type_contains_collection_rc(g, fsym->type, 0) &&
+                   !expr_yields_owned_rc_value(g, item, locals)) {
+            emit_collection_value_retain(g, fsym->type, fval, 0);
+        }
         zan_store_fit(g, fval, fptr);
     }
     return alloca;

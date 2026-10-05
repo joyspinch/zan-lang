@@ -82,6 +82,30 @@ static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
  * it never restores a wrong depth. */
 #define ZAN_MAX_ARMED_TRY 1024
 
+typedef struct zan_goto_label_rec {
+    zan_istr_t        name;
+    LLVMValueRef      fn;
+    LLVMBasicBlockRef bb;
+    int               defined;       /* a label statement emitted here */
+    int               fin_depth;     /* finally/lock stack depth */
+    int               eh_armed_base; /* armed-handler stack depth */
+    int               catch_base;    /* active-catch depth */
+    int               locals_base;   /* locals scope depth */
+    int               locals_owned;  /* owning locals in scope */
+} zan_goto_label_rec_t;
+
+typedef struct zan_goto_fixup {
+    zan_istr_t   name;
+    LLVMValueRef fn;
+    zan_loc_t    loc;
+    int          fin_depth;
+    int          eh_armed_base;
+    int          catch_base;
+    int          locals_base;
+    int          locals_owned;
+    int          resolved;
+} zan_goto_fixup_t;
+
 struct zan_irgen {
     zan_arena_t *arena;
     zan_diag_t *diag;
@@ -645,14 +669,22 @@ struct zan_irgen {
     bool         uses_embed_api;    /* set by zan_embed_* extern references */
     bool         uses_inflate;      /* set by zan_embed_decode/rawlen (compressed payloads) */
     /* goto/label support: label blocks keyed by (function, name), created on
-     * first reference from either the label statement or a goto */
-    struct {
-        zan_istr_t        name;
-        LLVMValueRef      fn;
-        LLVMBasicBlockRef bb;
-    } *goto_labels;
+     * first reference from either the label statement or a goto. The depth
+     * fields are recorded at the label statement (definition): a backward
+     * goto runs the full exit sequence down to them; a forward goto is
+     * validated against them there, because the cleanup a jump must run is
+     * only known once the label's nesting depth is. */
+    zan_goto_label_rec_t *goto_labels;
     int goto_label_count;
     int goto_label_cap;
+    /* forward gotos waiting for their label's definition. A jump that would
+     * cross a try/lock boundary or leave owning locals behind can neither run
+     * the skipped finallys at the jump site (the label's depth is unknown
+     * there) nor have them retro-fitted at the label, so those are diagnosed
+     * instead of silently mis-lowered. */
+    zan_goto_fixup_t *goto_fixups;
+    int goto_fixup_count;
+    int goto_fixup_cap;
     /* exception class-name registry: one {descriptor address, name} pair per
      * class that got a __zan_tid_<Class> descriptor. The unhandled-exception
      * reporter walks the thrown object's descriptor chain and matches
