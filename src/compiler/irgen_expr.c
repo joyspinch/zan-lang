@@ -2441,10 +2441,25 @@ static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMTypeRef f32t = LLVMFloatTypeInContext(g->ctx);
         LLVMTypeRef v4f32 = LLVMVectorType(f32t, 4);
         LLVMValueRef a = vec128_to_v4f32(g, emit_expr(g, expr->call.args.items[0], locals));
+        if (emit_target_is_x86(g)) {
+            /* RSQRTP is approximate (~12 bits) but keeps the codegen this
+             * builtin has always emitted on x86 */
+            LLVMTypeRef fty = LLVMFunctionType(v4f32, (LLVMTypeRef[]){ v4f32 }, 1, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse.rsqrt.ps");
+            if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse.rsqrt.ps", fty);
+            *out = v4f32_to_vec128(g, zan_call2(g->builder, fty, fn, &a, 1, "vrsqrt"));
+            return true;
+        }
+        /* llvm.x86.sse.rsqrt.ps is not selectable by the wasm32/RISCV/AArch64
+         * backends (the call aborted ISel with "Cannot select"); 1/sqrt is
+         * IEEE-exact and lowers everywhere */
         LLVMTypeRef fty = LLVMFunctionType(v4f32, (LLVMTypeRef[]){ v4f32 }, 1, 0);
-        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse.rsqrt.ps");
-        if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse.rsqrt.ps", fty);
-        *out = v4f32_to_vec128(g, zan_call2(g->builder, fty, fn, &a, 1, "vrsqrt"));
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.sqrt.v4f32");
+        if (!fn) fn = LLVMAddFunction(g->mod, "llvm.sqrt.v4f32", fty);
+        LLVMValueRef sq = zan_call2(g->builder, fty, fn, &a, 1, "vsqrt");
+        LLVMValueRef one = LLVMConstReal(f32t, 1.0);
+        LLVMValueRef ones = LLVMConstVector((LLVMValueRef[]){ one, one, one, one }, 4);
+        *out = v4f32_to_vec128(g, LLVMBuildFDiv(g->builder, ones, sq, "vrsqrt"));
         return true;
     }
 
@@ -2924,10 +2939,14 @@ static bool emit_sse2_call(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
         LLVMTypeRef v16i8 = LLVMVectorType(LLVMInt8TypeInContext(g->ctx), 16);
         LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
-        LLVMTypeRef fty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ v16i8 }, 1, 0);
-        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse2.pmovmskb.128");
-        if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse2.pmovmskb.128", fty);
-        *out = zan_call2(g->builder, fty, fn, &a16, 1, "pmovmskb");
+        if (emit_target_is_x86(g)) {
+            LLVMTypeRef fty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ v16i8 }, 1, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse2.pmovmskb.128");
+            if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse2.pmovmskb.128", fty);
+            *out = zan_call2(g->builder, fty, fn, &a16, 1, "pmovmskb");
+        } else {
+            *out = emit_pmovmskb_portable(g, a16, 16);
+        }
         return true;
     }
 
@@ -3133,6 +3152,11 @@ static bool emit_aes_call(zan_irgen_t *g, zan_ast_node_t *expr,
         strstr(g->target_triple, "arm64") != NULL) {
         return emit_aes_arm(g, expr, locals, method, argc, out);
     }
+    /* The AESENC-family intrinsics are x86-only: a wasm32/RISCV call used to
+     * survive this far and abort ISel with "LLVM ERROR: Cannot select".
+     * Return false so the site falls through to the normal unresolved-call
+     * diagnostic instead — the same treatment KeygenAssist gets on ARM. */
+    if (!emit_target_is_x86(g)) return false;
 
     if (method.len == 7 && memcmp(method.str, "Encrypt", 7) == 0 && argc == 2) {
         LLVMValueRef v_val = vec128_to_v2i64(g, emit_expr(g, expr->call.args.items[0], locals));

@@ -15,10 +15,10 @@
 - B-ID102（P2·irgen）MoveMask 便携版 SGT→SLT 反相（Vector.Equals 全等通道掩码在非 x86 恒为 0）——0ab8ac0e。
 - B-ID103（P2·binder）泛型类实现泛型接口的契约校验失效（`class Repo<T> : IStore<T>` 里错签名零诊断通过）：类型参数注册提前到 pass 1.5 前（resolve_bases 能真正实例化 `IStore<T>` 而非退化为模板）+ 通配符仅在接口参数未被替换时生效（替换后的类型参数按结构比较）——探针矩阵 5 例（错返回/错参数/非泛型回归/两组合法实现）+ conformance interface_assignability|interface_dispatch|generic_constraint 17 例全过。
 - B-ID104（P2·checker）struct 循环检测 DFS 补三色 visited 集（原仅有路径栈，菱形依赖 DAG 指数重访挂死编译）——探针 25 层菱形 2.5s 编译完（旧版需走 2^25 条子树）、400 层直链无诊断、自环+双环反例照常报错；conformance struct|layout 29 例全过。
+- B-ID105（P2·门控）SIMD 内建非 x86 落空修复：Vector128.ReciprocalSqrt 门控 x86（RSQRTP）+ 非 x86 便携 1/sqrt；Sse2.MoveMask 门控 + 便携 pmovmskb；Aes.* 非 x86 非 ARM 落到清晰编译诊断（原先 wasm32/riscv 直接炸 LLVM ISel "Cannot select"）——native 语义逐字节不变（debug 探针 + vector128_simd conformance/determinism/leakcheck 三孪绿）、wasm32 交叉编译两探针出 .wasm、Aes wasm32 得干净报错。已知独立缺陷：Vector128.Create(float) 在 wasm32 的 f64→f32 常量 bitcast 不可选，另案处理。
 
 ## 未完成
 
-- [ ] **B-ID105（P2·门控）ReciprocalSqrt / Aes.Encrypt/Decrypt 等 SIMD 内建在 wasm32/riscv 落空**（无门控回退，错译或误算）。MoveMask 已随 B-ID102 修。位置 irgen_expr.c ~2436/~3128。修法：镜像 x86 门控模式 + 非 x86 回退实现，wasm32 交叉编译探针。
 - [ ] **B-ID106（P2·irgen）GetValueOrDefault 缓冲长度 16 应为 17**（NUL 截断边界）+ 查询表达式 float 槽装载未走 load_collection_slot_value。位置 irgen_expr_core.c ~2138 / irgen_expr.c ~8154。
 - [ ] **B-ID107（P2·parser）批量**：lexer_peek_n 条件栈回滚缺守卫（~2318，镜像 lexer.c:1603）；defer/else-if 链缺 stmt_depth 防护；skip_angle_group 对 `>>` 的处理（~3119）；数组 rank>16 未 clamp；clone_ast_subst 浅拷贝别名（~5494）；union str_val 未判空。逐项最小探针。
 - [ ] **B-ID108（P2·rt_io）首次初始化竞态**：init 检查无专用互斥，双线程首用可能双重初始化；且 pthread_mutex_init 对已持有互斥重初始化（~1511）。修法：专用 init 锁 + once。
