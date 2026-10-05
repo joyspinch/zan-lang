@@ -4399,8 +4399,72 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     c->in_ctor = saved_ctor;
 }
 
+/* Completed-subtree set for the struct-cycle walk. Path membership
+ * (`stack[]`) alone decides cycle reporting, but without a visited set the
+ * walk re-explores shared subtrees: a diamond (`A embeds B and C, both embed
+ * D`) doubles per level and a chain of such diamonds hangs the compile.
+ * Skipping a finished subtree is the classic three-color DFS argument: if a
+ * finished node could reach a node currently on the path, its own walk would
+ * have found that cycle before finishing. */
+typedef struct {
+    zan_ast_node_t **slots;      /* open addressing, NULL = empty */
+    int cap;                     /* power of two, 0 = unset */
+    int count;
+} zan_struct_visited_t;
+
+static size_t struct_visit_hash(zan_ast_node_t *n) {
+    uintptr_t h = (uintptr_t)n;
+    h ^= h >> 33;
+    h *= (uintptr_t)0xff51afd7ed558ccdULL;
+    h ^= h >> 29;
+    return (size_t)h;
+}
+
+static bool struct_visit_seen(const zan_struct_visited_t *v,
+                              zan_ast_node_t *n) {
+    if (!v->cap) return false;
+    size_t mask = (size_t)v->cap - 1;
+    for (size_t i = struct_visit_hash(n) & mask; v->slots[i];
+         i = (i + 1) & mask) {
+        if (v->slots[i] == n) return true;
+    }
+    return false;
+}
+
+static void struct_visit_add(zan_checker_t *c, zan_struct_visited_t *v,
+                             zan_ast_node_t *n) {
+    if (v->count * 2 + 1 >= v->cap) {
+        int ncap = v->cap ? v->cap * 2 : 64;
+        zan_ast_node_t **nslots = (zan_ast_node_t **)zan_arena_alloc(
+            c->arena, sizeof(zan_ast_node_t *) * (size_t)ncap);
+        memset(nslots, 0, sizeof(zan_ast_node_t *) * (size_t)ncap);
+        int ocap = v->cap;
+        zan_ast_node_t **oslots = v->slots;
+        v->slots = nslots;
+        v->cap = ncap;
+        v->count = 0;
+        for (int i = 0; i < ocap; i++) {
+            if (!oslots[i]) continue;
+            size_t mask = (size_t)ncap - 1;
+            size_t j = struct_visit_hash(oslots[i]) & mask;
+            while (nslots[j]) j = (j + 1) & mask;
+            nslots[j] = oslots[i];
+            v->count++;
+        }
+    }
+    size_t mask = (size_t)v->cap - 1;
+    size_t i = struct_visit_hash(n) & mask;
+    while (v->slots[i]) {
+        if (v->slots[i] == n) return;
+        i = (i + 1) & mask;
+    }
+    v->slots[i] = n;
+    v->count++;
+}
+
 static bool check_struct_cycle_dfs(zan_checker_t *c, zan_ast_node_t *struct_decl,
-                                   zan_ast_node_t **stack, int depth) {
+                                   zan_ast_node_t **stack, int depth,
+                                   zan_struct_visited_t *visited) {
     if (!struct_decl || struct_decl->kind != AST_STRUCT_DECL) return false;
     if (depth >= 512) {
         zan_diag_emit(c->diag, DIAG_ERROR, struct_decl->loc,
@@ -4409,6 +4473,8 @@ static bool check_struct_cycle_dfs(zan_checker_t *c, zan_ast_node_t *struct_decl
                       struct_decl->type_decl.name.str);
         return false;
     }
+    /* already walked to completion without a cycle below: skip */
+    if (struct_visit_seen(visited, struct_decl)) return false;
     stack[depth] = struct_decl;
 
     for (int j = 0; j < struct_decl->type_decl.members.count; j++) {
@@ -4435,21 +4501,24 @@ static bool check_struct_cycle_dfs(zan_checker_t *c, zan_ast_node_t *struct_decl
                     return true;
                 }
             }
-            if (check_struct_cycle_dfs(c, fsym->decl, stack, depth + 1)) {
+            if (check_struct_cycle_dfs(c, fsym->decl, stack, depth + 1,
+                                       visited)) {
                 return true;
             }
         }
     }
+    struct_visit_add(c, visited, struct_decl);
     return false;
 }
 
 static void check_all_struct_cycles(zan_checker_t *c, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
+    zan_struct_visited_t visited = { NULL, 0, 0 };
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
         if (decl && decl->kind == AST_STRUCT_DECL) {
             zan_ast_node_t *stack[512];
-            check_struct_cycle_dfs(c, decl, stack, 0);
+            check_struct_cycle_dfs(c, decl, stack, 0, &visited);
         }
     }
 }
