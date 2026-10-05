@@ -18,12 +18,12 @@
 - B-ID105（P2·门控）SIMD 内建非 x86 落空修复：Vector128.ReciprocalSqrt 门控 x86（RSQRTP）+ 非 x86 便携 1/sqrt；Sse2.MoveMask 门控 + 便携 pmovmskb；Aes.* 非 x86 非 ARM 落到清晰编译诊断（原先 wasm32/riscv 直接炸 LLVM ISel "Cannot select"）——native 语义逐字节不变（debug 探针 + vector128_simd conformance/determinism/leakcheck 三孪绿）、wasm32 交叉编译两探针出 .wasm、Aes wasm32 得干净报错。已知独立缺陷：Vector128.Create(float) 在 wasm32 的 f64→f32 常量 bitcast 不可选，另案处理。
 - B-ID106（P2·irgen）槽字装载阶梯缺 float 分支的三个副本一次修齐：① GetValueOrDefault 推断 len==16→17（原死分支永不生效，全仓扫描确认仅此一处 off-by-one）；② 查询表达式 query_loop_load 换用 load_collection_slot_value；③ foreach 元素装载（计数路径补 float 分支 + 协议路径补擦除 i64 字转换守卫）——List<float> 索引读正确而 foreach 把 3.5f 读成 1069547520.0（sitofp 数值转换而非按位重解释）暴露的根因。探针：float/double/byte/string foreach 全对 + --check-leaks 零泄漏 + 查询 where/select 3.5/4.5 + GetValueOrDefault 推断 3.5/42；nullable_value_types|null_conditional_value 六孪绿。
 - B-ID107（P2·parser）批量五项：lexer_peek_n 补条件栈字段级回滚（窥探跨 #if/#else 残留压栈）；defer 链块级入口 + TK_DEFER 递归点双防护；else-if 链 parse_if_stmt 递归点防护；skip_angle_group 计 `>>`=2/`>>>=3` 闭角（嵌套泛型局部函数探测跑飞）；new T[…] 尾随 rank>16 clamp——08bcd45f。探针：p_cond3 元组括号组内嵌 #if/#else（±D 双跑 1020/23 分支均正确）、p_defer_chain 6000 层恰 1 条深度诊断、p_elseif_chain 4096 处触发不崩、p_localfunc_gen 返回 7、p_rank 恰 1 条 rank 诊断。两项审计疑点核实为无需修：union str_val 全部读点 kind 守卫在前且 lexer_make 对 token memset 清零（失败 expect 后 previous 为关键字/标点 token，str_val={NULL,0}；数字 token 原子消耗到不了名字读点）；clone_ast_subst 浅别名 probe_gspec 全对（2/1/99/2/hello），现实形状下共享安全。副产品：发现 B-ID115。
+- B-ID108（P2·rt_io）首次初始化竞态：POSIX 三后端 zan_io_init 改专用 g_io_init_mx（静态初始化），分片互斥由 io_shard_mutexes_prime 在首个 init 一次性 prime（原 io_shard_open 持 sh->mx 时对它 re-init 是 UB，阻塞线程等状态被抹；首次 shard_lock 落在静态数组全零字节上仅 glibc/musl 凑效）；Windows IOCP 补 SRWLOCK 双检，g_rto_lock 改 one-shot——e2c5adab，十六件交叉 zanrt_io{,_mt}.o 全部重编（linux×3/macos×2/ios/ohos×2 经 WSL zig、android×2 经 NDK clang）；async_asocket_echo 新旧运行时各出 PING，musl ±CO_DRIVER 编译过，zanrt_io_addr_test 过。
 
 ## 未完成
 
 - [ ] **B-ID115（P3·parser）具名元组元素变量声明解析失败**：`(int a, int b) t = G(10);` 在 `=` 处报 expected '='，匿名形式 `(int, int) t = G(10);` 与 `var (a,b) = ...` 均正常（探针 p_cond_nodir/p_cond2）。B-ID107 探针设计时发现，属能力缺口非回归，待定性后修。
-- [ ] **B-ID108（P2·rt_io）首次初始化竞态**：init 检查无专用互斥，双线程首用可能双重初始化；且 pthread_mutex_init 对已持有互斥重初始化（~1511）。修法：专用 init 锁 + once。
-- [ ] **B-ID109（P2·rt_sync）分离式 spawn 僵尸进程**：无 double-fork，detached 子进程变 zombie 常驻。位置 rt_sync.c ~3298。修法：grandchild 收养。
+- [ ] **B-ID109（P2·rt_sync）分离式 spawn 僵尸进程**：无 double-fork，detached 子进程变 zombie 常驻。位置 rt_sync.c ~3298。修法：grandchild 收养。：无 double-fork，detached 子进程变 zombie 常驻。位置 rt_sync.c ~3298。修法：grandchild 收养。
 - [ ] **B-ID110（P2·rt_timer）joinmap 墓碑无收缩**，长时高吞吐定时器下表慢性膨胀。位置 rt_timer.c ~1400，镜像 zan_co_live_add 的收缩策略。
 - [ ] **B-ID111（P2·rt_crash）sigaltstack 未安装**，栈溢出时信号处理器自身无栈可用，崩溃报告失效。位置 rt_crash.h ~1499。
 - [ ] **B-ID112（P2·irgen）goto 出 try 的落地链降级**（B-ID99 的保守诊断改为完整降级）：goto 站点快照 finallys/armed/catch/locals，标号定义时发射清理链。外部用户代码目前会误报。
