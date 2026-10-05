@@ -1441,14 +1441,14 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
         }
 
         if (resolve_type[0]) {
-            count = intel_complete_members(is, resolve_type, effective);
+            count = intel_complete_members_at(is, resolve_type, effective, line);
             /* Augment with project-wide members of the same type. The
              * receiver name must be resolved against the OPEN DOCUMENT
              * first — handing the raw name to the project index resolves
              * it against identically-named variables from unrelated files
              * and floods the list with a stranger type's members. */
             if (g_project_intel) {
-                const char *local_t = intel_resolve_type(is, resolve_type);
+                const char *local_t = intel_resolve_type_at(is, resolve_type, line);
                 const char *query_t = (local_t && local_t[0]) ? local_t
                                                               : resolve_type;
                 int before = count;
@@ -1548,11 +1548,11 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
 
     intellisense_t *is = doc_intel_for(s, uri);
     if (!is) { send_response(s, id, json_new_null()); return; }
-    hover_info_t h = intel_hover(is, word);
+    hover_info_t h = intel_hover_at(is, word, line);
     /* cross-file symbols (e.g. a design-doc-projected widget field referenced
      * from the business file) live in the project index */
     if (!h.valid && g_project_intel)
-        h = intel_hover(g_project_intel, word);
+        h = intel_hover_at(g_project_intel, word, -1);
     if (!h.valid) { send_response(s, id, json_new_null()); return; }
 
     char md[1024];

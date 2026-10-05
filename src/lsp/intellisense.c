@@ -51,12 +51,13 @@ static const char *builtin_keywords[] = {
     NULL
 };
 
-/* Console built-in methods */
+/* Console built-in methods (aligned with builtin_api.c) */
 static const char *console_methods[] = {
-    "WriteLine", "Write", "ReadLine", "Read", "Clear", NULL
+    "WriteLine", "Write", "PrintLine", "ReadLine", "Read", "ReadKey",
+    "Clear", "ResetColor", "ForegroundColor", "BackgroundColor", "Title", NULL
 };
 
-/* Stdlib static class members for semantic autocomplete */
+/* Stdlib static class members for semantic autocomplete (aligned with builtin_api.c) */
 typedef struct {
     const char *class_name;
     const char *methods[24];
@@ -66,10 +67,9 @@ static const stdlib_class_t stdlib_classes[] = {
     {"File", {"ReadAllText", "WriteAllText", "AppendAllText", "Exists", "Delete",
               "Move", "Copy", "GetSize", NULL}},
     {"Path", {"GetFileName", "GetExtension", "Combine", "GetDirectoryName",
-              "HasExtension", "ChangeExtension", "GetFileNameWithoutExtension",
-              "GetTempPath", NULL}},
+              "HasExtension", "GetFileNameWithoutExtension", "GetTempPath", NULL}},
     {"Directory", {"Exists", "CreateDirectory", "Delete", "GetCurrentDirectory",
-                   "SetCurrentDirectory", "GetFiles", "GetDirectories", NULL}},
+                   "SetCurrentDirectory", "ListNames", NULL}},
     {"Thread", {"Sleep", "CurrentId", NULL}},
     {"Stopwatch", {"GetMilliseconds", NULL}},
     {"Mutex", {"Create", "Lock", "Unlock", "Destroy", NULL}},
@@ -80,12 +80,12 @@ static const stdlib_class_t stdlib_classes[] = {
                      "GetInt", "SetFloat", "GetFloat", "SetString", "GetString",
                      "Increment", "Decrement", "Delete", "Exists", "Count",
                      "Clear", "IsOpen", NULL}},
-    {"Encoding", {"IntToString", "ParseInt", "ParseDouble", "GetByteCount", NULL}},
-    {"Convert", {"ToInt32", "ToString", NULL}},
+    {"Encoding", {"ParseInt", "ParseDouble", "GetByteCount", NULL}},
+    {"Convert", {"ToDouble", "ToInt32", "ToInt64", NULL}},
     {"Math", {"Sqrt", "Abs", "Max", "Min", "Pow", "Floor", "Ceiling", "Round",
-              "Sin", "Cos", "Tan", "Log", "Exp", "PI", "E", NULL}},
-    {"Environment", {"ArgCount", "ArgAt", "Exit", "GetEnvironmentVariable", NULL}},
-    {"String", {"IsNullOrEmpty", "Format", "Join", "Split", "Concat", NULL}},
+              "Sin", "Cos", "Tan", "Atan2", "Atan", "Asin", "Acos", "PI", "E", NULL}},
+    {"Environment", {"ArgCount", "ArgAt", "ExeDir", NULL}},
+    {"String", {"IsNullOrEmpty", "Format", "Join", "CompareOrdinal", NULL}},
     /* ---- Gui widget API (from packages/Zan.Gui/src/Gui; Control's fluent event/style
      * setters are inherited by every widget) ---- */
     {"Control", {"OnClick", "OnChange", "OnFocus", "OnBlur", "OnKeyDown",
@@ -113,10 +113,10 @@ static const stdlib_class_t stdlib_classes[] = {
     {NULL, {NULL}}
 };
 
-/* List<T> instance methods */
+/* List<T> instance methods (aligned with builtin_api.c) */
 static const char *list_methods[] = {
-    "Add", "Clear", "RemoveAt", "IndexOf", "Contains", "Insert", "Reverse",
-    "Count", "Sort", "ToArray", "ForEach", "Find", "FindAll", "Remove", NULL
+    "Add", "AddRange", "Reserve", "Clear", "RemoveAt", "IndexOf", "LastIndexOf",
+    "Contains", "Insert", "Reverse", "Count", "ToArray", NULL
 };
 
 /* Dict<K,V> instance methods */
@@ -1127,8 +1127,41 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
     }
 }
 
-/* Resolve the type of a variable from the symbol table */
-const char *intel_resolve_type(intellisense_t *is, const char *var_name) {
+/* Resolve the type of a variable from the symbol table.
+ * If line >= 0, prioritize locals/parameters declared in the enclosing method. */
+const char *intel_resolve_type_at(intellisense_t *is, const char *var_name, int line) {
+    if (!is || !var_name || !var_name[0]) return NULL;
+
+    if (line >= 0) {
+        /* Find enclosing method */
+        int m = -1;
+        for (int i = 0; i < is->method_count; i++) {
+            if (line >= is->methods[i].start_line && line <= is->methods[i].end_line) {
+                m = i;
+                break;
+            }
+        }
+        if (m >= 0) {
+            /* Look for a local/parameter in this method */
+            for (int i = is->symbol_count - 1; i >= 0; i--) {
+                isym_t *sym = &is->symbols[i];
+                if (strcmp(sym->name, var_name) != 0) continue;
+                if (sym->kind == ISYM_VARIABLE) {
+                    if (sym->line >= is->methods[m].start_line &&
+                        sym->line <= is->methods[m].end_line) {
+                        return sym->type_name;
+                    }
+                } else if (sym->kind == ISYM_PARAMETER) {
+                    if (sym->line <= is->methods[m].end_line &&
+                        sym->line >= is->methods[m].start_line - 16) {
+                        return sym->type_name;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Fallback: document-wide lookup backwards (most recent declaration) */
     for (int i = is->symbol_count - 1; i >= 0; i--) {
         if ((is->symbols[i].kind == ISYM_VARIABLE ||
              is->symbols[i].kind == ISYM_PARAMETER ||
@@ -1139,6 +1172,10 @@ const char *intel_resolve_type(intellisense_t *is, const char *var_name) {
         }
     }
     return NULL;
+}
+
+const char *intel_resolve_type(intellisense_t *is, const char *var_name) {
+    return intel_resolve_type_at(is, var_name, -1);
 }
 
 /* Return the base type of a user-defined class/struct, or NULL. */
@@ -1154,9 +1191,10 @@ static const char *class_base(intellisense_t *is, const char *cls) {
     return NULL;
 }
 
-/* Complete members of a given type */
-int intel_complete_members(intellisense_t *is, const char *type_name,
-                           const char *prefix) {
+/* Complete members of a given type.
+ * If line >= 0, resolves type_name as a variable in the enclosing method scope first. */
+int intel_complete_members_at(intellisense_t *is, const char *type_name,
+                              const char *prefix, int line) {
     is->completion_count = 0;
     is->completion_selected = 0;
 
@@ -1183,7 +1221,7 @@ int intel_complete_members(intellisense_t *is, const char *type_name,
         }
     }
     if (!is_known_type) {
-        const char *rv = intel_resolve_type(is, type_name);
+        const char *rv = intel_resolve_type_at(is, type_name, line);
         if (rv && rv[0]) type_name = rv;
     }
 
@@ -1277,40 +1315,35 @@ int intel_complete_members(intellisense_t *is, const char *type_name,
     }
 
     /* List/Dict/StringBuilder instance methods (declared or resolved type) */
-    const char *resolved = type_name;
-    if (resolved) {
-        if (strstr(resolved, "List") != NULL) {
-            for (int i = 0; list_methods[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-                if (plen > 0 && _strnicmp(list_methods[i], prefix, plen) != 0) continue;
-                completion_t *c = &is->completions[is->completion_count++];
-                strncpy(c->label, list_methods[i], sizeof(c->label) - 1);
-                strncpy(c->insert_text, list_methods[i], sizeof(c->insert_text) - 1);
-                snprintf(c->detail, sizeof(c->detail), "List.%s", list_methods[i]);
-                c->kind = ISYM_METHOD;
-                c->sort_priority = 1;
-            }
+    if (strcmp(bare_type, "List") == 0) {
+        for (int i = 0; list_methods[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
+            if (plen > 0 && _strnicmp(list_methods[i], prefix, plen) != 0) continue;
+            completion_t *c = &is->completions[is->completion_count++];
+            strncpy(c->label, list_methods[i], sizeof(c->label) - 1);
+            strncpy(c->insert_text, list_methods[i], sizeof(c->insert_text) - 1);
+            snprintf(c->detail, sizeof(c->detail), "List.%s", list_methods[i]);
+            c->kind = ISYM_METHOD;
+            c->sort_priority = 1;
         }
-        if (strstr(resolved, "Dict") != NULL) {
-            for (int i = 0; dict_methods[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-                if (plen > 0 && _strnicmp(dict_methods[i], prefix, plen) != 0) continue;
-                completion_t *c = &is->completions[is->completion_count++];
-                strncpy(c->label, dict_methods[i], sizeof(c->label) - 1);
-                strncpy(c->insert_text, dict_methods[i], sizeof(c->insert_text) - 1);
-                snprintf(c->detail, sizeof(c->detail), "Dict.%s", dict_methods[i]);
-                c->kind = ISYM_METHOD;
-                c->sort_priority = 1;
-            }
+    } else if (strcmp(bare_type, "Dict") == 0) {
+        for (int i = 0; dict_methods[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
+            if (plen > 0 && _strnicmp(dict_methods[i], prefix, plen) != 0) continue;
+            completion_t *c = &is->completions[is->completion_count++];
+            strncpy(c->label, dict_methods[i], sizeof(c->label) - 1);
+            strncpy(c->insert_text, dict_methods[i], sizeof(c->insert_text) - 1);
+            snprintf(c->detail, sizeof(c->detail), "Dict.%s", dict_methods[i]);
+            c->kind = ISYM_METHOD;
+            c->sort_priority = 1;
         }
-        if (strstr(resolved, "StringBuilder") != NULL) {
-            for (int i = 0; sb_methods[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-                if (plen > 0 && _strnicmp(sb_methods[i], prefix, plen) != 0) continue;
-                completion_t *c = &is->completions[is->completion_count++];
-                strncpy(c->label, sb_methods[i], sizeof(c->label) - 1);
-                strncpy(c->insert_text, sb_methods[i], sizeof(c->insert_text) - 1);
-                snprintf(c->detail, sizeof(c->detail), "StringBuilder.%s", sb_methods[i]);
-                c->kind = ISYM_METHOD;
-                c->sort_priority = 1;
-            }
+    } else if (strcmp(bare_type, "StringBuilder") == 0) {
+        for (int i = 0; sb_methods[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
+            if (plen > 0 && _strnicmp(sb_methods[i], prefix, plen) != 0) continue;
+            completion_t *c = &is->completions[is->completion_count++];
+            strncpy(c->label, sb_methods[i], sizeof(c->label) - 1);
+            strncpy(c->insert_text, sb_methods[i], sizeof(c->insert_text) - 1);
+            snprintf(c->detail, sizeof(c->detail), "StringBuilder.%s", sb_methods[i]);
+            c->kind = ISYM_METHOD;
+            c->sort_priority = 1;
         }
     }
 
@@ -1334,42 +1367,13 @@ int intel_complete_members(intellisense_t *is, const char *type_name,
         }
     }
 
-    /* LINQ extension methods for List/IEnumerable/Array types */
-    if (strcmp(type_name, "List") == 0 || strcmp(type_name, "IEnumerable") == 0 ||
-        strcmp(type_name, "Array") == 0 || strstr(type_name, "List<") != NULL ||
-        strstr(type_name, "IEnumerable<") != NULL) {
-        static const char *linq_ext[] = {
-            "Where", "Select", "SelectMany", "OrderBy", "OrderByDescending",
-            "ThenBy", "GroupBy", "Join",
-            "Take", "TakeWhile", "Skip", "SkipWhile",
-            "First", "FirstOrDefault", "Last", "LastOrDefault",
-            "Single", "SingleOrDefault", "ElementAt",
-            "Any", "All", "Count", "Sum", "Min", "Max", "Average",
-            "Distinct", "Union", "Intersect", "Except",
-            "Concat", "Zip", "Aggregate", "Contains",
-            "ToList", "ToArray", "ToDictionary", "ToHashSet",
-            "Reverse", "OfType", "Cast", "AsEnumerable",
-            NULL
-        };
-        for (int i = 0; linq_ext[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-            if (plen > 0 && _strnicmp(linq_ext[i], prefix, plen) != 0) continue;
-            /* Avoid duplicates from stdlib_classes */
-            bool dup = false;
-            for (int d = 0; d < is->completion_count; d++) {
-                if (strcmp(is->completions[d].label, linq_ext[i]) == 0) { dup = true; break; }
-            }
-            if (dup) continue;
-            completion_t *c = &is->completions[is->completion_count++];
-            strncpy(c->label, linq_ext[i], sizeof(c->label) - 1);
-            snprintf(c->insert_text, sizeof(c->insert_text), "%s(", linq_ext[i]);
-            snprintf(c->detail, sizeof(c->detail), "%s.%s() (LINQ)", type_name, linq_ext[i]);
-            c->kind = ISYM_METHOD;
-            c->sort_priority = 2;
-        }
-    }
-
     is->completion_active = is->completion_count > 0;
     return is->completion_count;
+}
+
+int intel_complete_members(intellisense_t *is, const char *type_name,
+                           const char *prefix) {
+    return intel_complete_members_at(is, type_name, prefix, -1);
 }
 
 /* Generate completions matching prefix */
@@ -1464,9 +1468,45 @@ int intel_complete(intellisense_t *is, const char *prefix,
     return is->completion_count;
 }
 
-hover_info_t intel_hover(intellisense_t *is, const char *word) {
+hover_info_t intel_hover_at(intellisense_t *is, const char *word, int line) {
     hover_info_t info = {0};
+    if (!is || !word || !word[0]) return info;
 
+    /* If line >= 0, check for local variable or parameter in the enclosing method first */
+    if (line >= 0) {
+        int m = -1;
+        for (int i = 0; i < is->method_count; i++) {
+            if (line >= is->methods[i].start_line && line <= is->methods[i].end_line) {
+                m = i;
+                break;
+            }
+        }
+        if (m >= 0) {
+            for (int i = is->symbol_count - 1; i >= 0; i--) {
+                isym_t *sym = &is->symbols[i];
+                if (strcmp(sym->name, word) != 0) continue;
+                if (sym->kind == ISYM_VARIABLE) {
+                    if (sym->line >= is->methods[m].start_line &&
+                        sym->line <= is->methods[m].end_line) {
+                        snprintf(info.text, sizeof(info.text), "%s : %s", sym->name, sym->type_name);
+                        strncpy(info.doc, sym->doc, sizeof(info.doc) - 1);
+                        info.valid = true;
+                        return info;
+                    }
+                } else if (sym->kind == ISYM_PARAMETER) {
+                    if (sym->line <= is->methods[m].end_line &&
+                        sym->line >= is->methods[m].start_line - 16) {
+                        snprintf(info.text, sizeof(info.text), "%s : %s", sym->name, sym->type_name);
+                        strncpy(info.doc, sym->doc, sizeof(info.doc) - 1);
+                        info.valid = true;
+                        return info;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Fallback: standard symbol lookup */
     for (int i = 0; i < is->symbol_count; i++) {
         if (strcmp(is->symbols[i].name, word) == 0) {
             isym_kind_t hk = is->symbols[i].kind;
@@ -1513,6 +1553,10 @@ hover_info_t intel_hover(intellisense_t *is, const char *word) {
     }
 
     return info;
+}
+
+hover_info_t intel_hover(intellisense_t *is, const char *word) {
+    return intel_hover_at(is, word, -1);
 }
 
 goto_def_t intel_goto_def(intellisense_t *is, const char *word) {
@@ -1763,43 +1807,6 @@ static const method_return_t method_returns[] = {
     {"string", "LastIndexOf", "int"},
     {"string", "Length",      "int"},
 
-    /* List<T> - LINQ-style methods */
-    {"List", "Where",         "List"},
-    {"List", "Select",        "List"},
-    {"List", "OrderBy",       "List"},
-    {"List", "OrderByDescending", "List"},
-    {"List", "ThenBy",        "List"},
-    {"List", "Take",          "List"},
-    {"List", "Skip",          "List"},
-    {"List", "Distinct",      "List"},
-    {"List", "Reverse",       "List"},
-    {"List", "ToList",        "List"},
-    {"List", "ToArray",       "Array"},
-    {"List", "First",         "object"},
-    {"List", "Last",          "object"},
-    {"List", "FirstOrDefault","object"},
-    {"List", "LastOrDefault", "object"},
-    {"List", "Count",         "int"},
-    {"List", "Any",           "bool"},
-    {"List", "All",           "bool"},
-    {"List", "Sum",           "int"},
-    {"List", "Max",           "int"},
-    {"List", "Min",           "int"},
-    {"List", "Average",       "double"},
-
-    /* IEnumerable / Queryable (same as List for LINQ) */
-    {"IEnumerable", "Where",    "IEnumerable"},
-    {"IEnumerable", "Select",   "IEnumerable"},
-    {"IEnumerable", "OrderBy",  "IEnumerable"},
-    {"IEnumerable", "Take",     "IEnumerable"},
-    {"IEnumerable", "Skip",     "IEnumerable"},
-    {"IEnumerable", "Distinct", "IEnumerable"},
-    {"IEnumerable", "ToList",   "List"},
-    {"IEnumerable", "ToArray",  "Array"},
-    {"IEnumerable", "Count",    "int"},
-    {"IEnumerable", "Any",      "bool"},
-    {"IEnumerable", "First",    "object"},
-
     /* Dict */
     {"Dict", "Keys",    "List"},
     {"Dict", "Values",  "List"},
@@ -1825,21 +1832,6 @@ static const method_return_t method_returns[] = {
     {NULL, NULL, NULL}
 };
 
-/* LINQ extension methods available on any List/IEnumerable */
-static const char *linq_methods[] = {
-    "Where", "Select", "SelectMany", "OrderBy", "OrderByDescending",
-    "ThenBy", "ThenByDescending", "GroupBy", "Join",
-    "Take", "TakeWhile", "Skip", "SkipWhile",
-    "First", "FirstOrDefault", "Last", "LastOrDefault",
-    "Single", "SingleOrDefault", "ElementAt",
-    "Any", "All", "Count", "Sum", "Min", "Max", "Average",
-    "Distinct", "Union", "Intersect", "Except",
-    "Concat", "Zip", "Aggregate", "Contains",
-    "ToList", "ToArray", "ToDictionary", "ToHashSet",
-    "Reverse", "OfType", "Cast",
-    NULL
-};
-
 const char *intel_resolve_method_return(intellisense_t *is, const char *type_name,
                                         const char *method_name) {
     /* Check static return type table */
@@ -1859,31 +1851,6 @@ const char *intel_resolve_method_return(intellisense_t *is, const char *type_nam
             if (sym->type_name[0]) return sym->type_name;
             /* If return type is same as parent class, it's fluent */
             return type_name;
-        }
-    }
-
-    /* LINQ methods on List/IEnumerable return List */
-    if (strcmp(type_name, "List") == 0 || strcmp(type_name, "IEnumerable") == 0 ||
-        strstr(type_name, "List<") != NULL) {
-        for (int i = 0; linq_methods[i]; i++) {
-            if (strcmp(method_name, linq_methods[i]) == 0) {
-                if (strcmp(method_name, "Count") == 0 || strcmp(method_name, "Sum") == 0 ||
-                    strcmp(method_name, "Min") == 0 || strcmp(method_name, "Max") == 0)
-                    return "int";
-                if (strcmp(method_name, "Any") == 0 || strcmp(method_name, "All") == 0 ||
-                    strcmp(method_name, "Contains") == 0)
-                    return "bool";
-                if (strcmp(method_name, "Average") == 0)
-                    return "double";
-                if (strcmp(method_name, "First") == 0 || strcmp(method_name, "Last") == 0 ||
-                    strcmp(method_name, "Single") == 0)
-                    return "object";
-                if (strcmp(method_name, "ToArray") == 0)
-                    return "Array";
-                if (strcmp(method_name, "ToDictionary") == 0)
-                    return "Dict";
-                return "List";
-            }
         }
     }
 

@@ -184,7 +184,10 @@ int intel_complete(intellisense_t *is, const char *prefix,
                    const char *context_class);
 
 /* Request member completions for a specific type.
- * Called when user types "varName." or "ClassName." */
+ * Called when user types "varName." or "ClassName."
+ * If line >= 0, resolves varName using the enclosing method scope. */
+int intel_complete_members_at(intellisense_t *is, const char *type_name,
+                              const char *prefix, int line);
 int intel_complete_members(intellisense_t *is, const char *type_name,
                            const char *prefix);
 
@@ -195,7 +198,9 @@ int intel_complete_members(intellisense_t *is, const char *type_name,
 int intel_complete_usings(intellisense_t *is, intellisense_t *project,
                           const char *ns_prefix);
 
-/* Get hover info for a symbol at the given name */
+/* Get hover info for a symbol at the given name.
+ * If line >= 0, resolves locals/parameters within the method enclosing line. */
+hover_info_t intel_hover_at(intellisense_t *is, const char *word, int line);
 hover_info_t intel_hover(intellisense_t *is, const char *word);
 
 /* Go to definition of a symbol */
@@ -232,7 +237,9 @@ bool intel_local_extent(intellisense_t *is, const char *word, int line,
                         int *out_start_line, int *out_end_line,
                         int *out_decl_line);
 
-/* Resolve the type of a variable name from context */
+/* Resolve the type of a variable name from context.
+ * If line >= 0, resolves locals/parameters within the enclosing method first. */
+const char *intel_resolve_type_at(intellisense_t *is, const char *var_name, int line);
 const char *intel_resolve_type(intellisense_t *is, const char *var_name);
 
 /* Resolve the return type of a method call on a given type.
