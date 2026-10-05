@@ -119,3 +119,14 @@
   生产端 vs 写端，再以「探针版恒全量、无 fflush 版恒截」锁定退出路径。验证：
   gui_3d_demo 全量 203730994 字节、attributes 页脚完整、两次运行逐字节一致；
   crc32_hw conformance 10.8MB 页脚完整。
+- [x] **B-ID96（P2·发布门禁修复：full 档 11 失败收敛到 0 真缺陷）闭账（2026-10-05）**——
+  本轮 full 档（release gate）11 例失败，窄复跑定性：6 例瞬时（DAP/GUI conformance/
+  ORM diag×3/帧预算，满载竞争误伤，单跑全过）；5 例真问题两类：① publish_obf_ctor×4
+  平台——b945acdc 把字符串混淆改成显式 opt-in（publish 默认关，启动页脏内存 +220MB
+  理由）但测试没跟上，仍按旧契约断言 --publish 必混淆；修法：配方显式传
+  --obfuscate-strings（测试意图本就是验反混淆构造器的各平台注册机制，头注释同步）。
+  ② policy_zform_schema——59be9aa1 给 GenForm 加读 position/anchor/flexGrow 三键但
+  未入 zform.doc.json，且 Gui 重构后控件清单陈旧（AlertBox）；修法：三键补文档
+  （fields.keys，语义自 GenForm/Designer.Inspector 实读代码钉死）+
+  gen_knowledge.ps1 -WriteControls 重刷清单。教训：改契约必须同提交改契约测试，
+  full 档半年不跑就攒 6 天盲区。

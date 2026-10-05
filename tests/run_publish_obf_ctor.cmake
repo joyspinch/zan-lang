@@ -1,10 +1,13 @@
-# --publish string de-obfuscation: how the startup constructor is registered.
+# --obfuscate-strings string de-obfuscation: how the startup constructor is
+# registered.
 #
 # Invoked by ctest as:
 #   cmake -DZANC=<zanc> -DSRC=<case.zan> -DTARGET=<cross target> -DKIND=<init_array|global_ctors> \
 #         -DWORKDIR=<dir> -P run_publish_obf_ctor.cmake
 #
-# --publish XORs every string literal in the image and restores it before main
+# --obfuscate-strings XORs every string literal in the image and restores it
+# before main (the flag is passed explicitly: publish alone no longer enables
+# scrambling -- it is opt-in since b945acdc for startup-page memory reasons)
 # from `@__zan.deobf`. If that constructor never runs the program prints pure
 # garbage, so the registration mechanism has to match what the target's startup
 # path actually iterates:
@@ -19,7 +22,7 @@
 # Checked on the IR rather than a linked image so it runs on every host.
 
 execute_process(
-  COMMAND "${ZANC}" "${SRC}" --target "${TARGET}" --publish --emit-ir
+  COMMAND "${ZANC}" "${SRC}" --target "${TARGET}" --publish --obfuscate-strings --emit-ir
   OUTPUT_VARIABLE _ir
   ERROR_VARIABLE _err
   RESULT_VARIABLE _rc
