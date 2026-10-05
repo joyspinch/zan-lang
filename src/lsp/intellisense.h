@@ -51,6 +51,15 @@ typedef enum {
     ISYM_CONSTRUCTOR
 } isym_kind_t;
 
+/* Member visibility, as declared. An unmarked member is public (docs/SPEC.md
+ * "未加修饰符的成员完全公开"); `internal` is treated as public here because
+ * deciding it needs the module of every use site. */
+typedef enum {
+    IVIS_PUBLIC = 0,
+    IVIS_PROTECTED,
+    IVIS_PRIVATE
+} ivis_t;
+
 /* A symbol entry */
 typedef struct {
     char        name[128];
@@ -63,6 +72,7 @@ typedef struct {
     int         line;               /* 0-based line number */
     int         col;                /* 0-based column */
     bool        is_static;
+    ivis_t      visibility;
     int         param_count;        /* number of parameters (methods) */
 } isym_t;
 

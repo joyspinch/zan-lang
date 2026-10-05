@@ -10,6 +10,9 @@
  */
 #include "intellisense.h"
 #include "../common/json.h"
+/* The compiler's own table of built-in type members: irgen and this server
+ * must not disagree about what `string`, `List<T>` or `Console` support. */
+#include "../compiler/builtin_api.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -51,93 +54,57 @@ static const char *builtin_keywords[] = {
     NULL
 };
 
-/* Console built-in methods (aligned with builtin_api.c) */
-static const char *console_methods[] = {
-    "WriteLine", "Write", "PrintLine", "ReadLine", "Read", "ReadKey",
-    "Clear", "ResetColor", "ForegroundColor", "BackgroundColor", "Title", NULL
-};
+/* The member surface of the compiler's built-in types (string, List<T>,
+ * Dictionary<K,V>, Console, Math, File, ...) is NOT described here: those
+ * types are lowered by irgen instead of being declared in the standard
+ * library, and src/compiler/builtin_api.c is the single table that says what
+ * they support. A hand-maintained copy in this file drifted from it and
+ * offered members the compiler rejects (`string.PadLeft`, `string.PadRight`,
+ * `List.Sort`, ... were deliberately removed from builtin_api.c because they
+ * compiled to a wrong result) while hiding real ones (`File.GetSize`).
+ * Completion, hover and signature help below query that table directly. */
 
-/* Stdlib static class members for semantic autocomplete (aligned with builtin_api.c) */
-typedef struct {
-    const char *class_name;
-    const char *methods[24];
-} stdlib_class_t;
+/* Resolves a receiver name as spelled in source to its built-in type entry.
+ * `List<int>` and `byte[]` arrive with their decoration, and the language
+ * spells some entries differently from irgen's internal name
+ * (`Dictionary` -> "Dict", `string` -> "string"). */
+static const zan_builtin_type_t *builtin_receiver(const char *type_name) {
+    if (!type_name || !type_name[0]) return NULL;
+    char bare[64];
+    snprintf(bare, sizeof(bare), "%s", type_name);
+    char *lt = strchr(bare, '<');
+    if (lt) *lt = '\0';
+    char *br = strstr(bare, "[]");
+    if (br) *br = '\0';
 
-static const stdlib_class_t stdlib_classes[] = {
-    {"File", {"ReadAllText", "WriteAllText", "AppendAllText", "Exists", "Delete",
-              "Move", "Copy", "GetSize", NULL}},
-    {"Path", {"GetFileName", "GetExtension", "Combine", "GetDirectoryName",
-              "HasExtension", "GetFileNameWithoutExtension", "GetTempPath", NULL}},
-    {"Directory", {"Exists", "CreateDirectory", "Delete", "GetCurrentDirectory",
-                   "SetCurrentDirectory", "ListNames", NULL}},
-    {"Thread", {"Sleep", "CurrentId", NULL}},
-    {"Stopwatch", {"GetMilliseconds", NULL}},
-    {"Mutex", {"Create", "Lock", "Unlock", "Destroy", NULL}},
-    {"AtomicInt", {"Load", "Store", "Exchange", "CompareExchange", "Add",
-                   "Increment", "Decrement", "IsValid", NULL}},
-    {"SharedTable", {"Open", "KeySize", "ColumnInt", "ColumnFloat",
-                     "ColumnString", "Create", "Close", "Destroy", "SetInt",
-                     "GetInt", "SetFloat", "GetFloat", "SetString", "GetString",
-                     "Increment", "Decrement", "Delete", "Exists", "Count",
-                     "Clear", "IsOpen", NULL}},
-    {"Encoding", {"ParseInt", "ParseDouble", "GetByteCount", NULL}},
-    {"Convert", {"ToDouble", "ToInt32", "ToInt64", NULL}},
-    {"Math", {"Sqrt", "Abs", "Max", "Min", "Pow", "Floor", "Ceiling", "Round",
-              "Sin", "Cos", "Tan", "Atan2", "Atan", "Asin", "Acos", "PI", "E", NULL}},
-    {"Environment", {"ArgCount", "ArgAt", "ExeDir", NULL}},
-    {"String", {"IsNullOrEmpty", "Format", "Join", "CompareOrdinal", NULL}},
-    /* ---- Gui widget API (from packages/Zan.Gui/src/Gui; Control's fluent event/style
-     * setters are inherited by every widget) ---- */
-    {"Control", {"OnClick", "OnChange", "OnFocus", "OnBlur", "OnKeyDown",
-                 "OnMouseDown", "OnMouseUp", "OnEnter", "OnLeave", "OnWheel",
-                 "IsDisabled", "Bg", "Gradient", "Radius", "Border", "Shadow",
-                 "TextColor", "FontPx", "Transition", NULL}},
-    {"Input", {"GetText", "SetText", "HasSel", "SelText", "OnChange", "OnFocus",
-               "OnBlur", "OnKeyDown", "OnEnter", "OnLeave", "IsDisabled", "Bg",
-               "Radius", "Border", "TextColor", "FontPx", NULL}},
-    {"TextArea", {"GetText", "SetText", "OnChange", "OnFocus", "OnBlur",
-                  "IsDisabled", "Bg", "TextColor", NULL}},
-    {"Button", {"Label", "IsChecked", "IsToggle", "WasClicked", "TipText",
-                "OnClick", "OnDoubleClick", "OnRightClick", "IsDisabled", "Bg",
-                "Radius", "TextColor", "FontPx", NULL}},
-    {"Checkbox", {"IsChecked", "SetChecked", "OnChange", "OnClick", "OnFocus",
-                  "IsDisabled", "Bg", NULL}},
-    {"Switch", {"IsOn", "SetOn", "OnChange", "OnClick", "IsDisabled", "Bg",
-                NULL}},
-    {"SelectBox", {"Value", "SetOptionsText", "OptionsText", "AddOption",
-                   "Choose", "Selected", "HasValue", "Clear", "IsOpen",
-                   "SetOpen", "Text", "OnChange", "OnClick", "IsDisabled",
-                   "Bg", NULL}},
-    {"Radio", {"IsSelected", "OnChange", "OnClick", "IsDisabled", "Bg", NULL}},
-    {"Form", {"Ctl", "Get", "Handle", "On", "Call", "GetApp", NULL}},
-    {NULL, {NULL}}
-};
+    const zan_builtin_type_t *bt = zan_builtin_find(bare);
+    if (bt) return bt;
 
-/* List<T> instance methods (aligned with builtin_api.c) */
-static const char *list_methods[] = {
-    "Add", "AddRange", "Reserve", "Clear", "RemoveAt", "IndexOf", "LastIndexOf",
-    "Contains", "Insert", "Reverse", "Count", "ToArray", NULL
-};
+    int count = 0;
+    const zan_builtin_type_t *all = zan_builtin_types(&count);
+    for (int i = 0; i < count; i++) {
+        if (strcmp(all[i].name_public, bare) == 0) return &all[i];
+    }
+    return NULL;
+}
 
-/* Dict<K,V> instance methods */
-static const char *dict_methods[] = {
-    "Add", "ContainsKey", "Remove", "Clear", "Count", "TryGetValue",
-    "Keys", "Values", NULL
-};
+/* Whether the pending completion list already carries `label`. */
+static bool already_offered(const intellisense_t *is, const char *label) {
+    for (int i = 0; i < is->completion_count; i++) {
+        if (strcmp(is->completions[i].label, label) == 0) return true;
+    }
+    return false;
+}
 
-/* StringBuilder instance methods */
-static const char *sb_methods[] = {
-    "Append", "AppendLine", "ToString", "Clear", "Length", "Insert",
-    "Remove", "Replace", NULL
-};
-
-/* string instance methods */
-static const char *string_methods[] = {
-    "Length", "Substring", "Contains", "StartsWith", "EndsWith",
-    "IndexOf", "LastIndexOf", "Replace", "Trim", "TrimStart", "TrimEnd",
-    "Split", "ToLower", "ToUpper", "PadLeft", "PadRight", "Insert",
-    "Remove", "Equals", "CompareTo", NULL
-};
+/* The standard library is NOT tabulated here. Thread, Stopwatch, Mutex,
+ * SharedTable, Encoding, Convert's Zan-side neighbours and every GUI widget
+ * (Control/Input/Button/...) are ordinary Zan types with real source in
+ * stdlib/ and packages/, so their members come from the same index as the
+ * user's own classes -- see intel_index_project / ensure_stdlib_indexed.
+ * Copies of those members used to live here and drifted: they listed
+ * `File.OpenRead`, `Math.Clamp`, `Convert.ToDecimal` (none of which exist)
+ * while hiding `File.GetSize`, and they froze the GUI widget surface at
+ * whatever it looked like the day they were written. */
 
 /* Grows the symbol table to hold at least `need` entries. */
 static bool reserve_symbols(intellisense_t *is, int need) {
@@ -639,6 +606,18 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
     int class_brace = -1;
     int line_num = 0;
 
+    /* Access modifiers seen since the last member. They arrive as separate
+     * identifier tokens (`public`, `private`, `protected`) before the type,
+     * so they are collected here and applied to the member they precede --
+     * reading them at the declaration site misses them, because the scanner
+     * only recognises a member when it reaches the type token. Unmarked
+     * members are public (docs/SPEC.md). `internal` stays public: deciding it
+     * needs the module of every use site. */
+    ivis_t pending_vis = IVIS_PUBLIC;
+    bool pending_static = false;
+    bool pending_async = false;
+    bool pending_override = false;
+
     /* Method-body extent tracking. A method's body '{' is the first brace
      * after its signature; it opens exactly one level deeper than the class
      * body, and its matching '}' returns to the class level. Zan has no
@@ -800,6 +779,11 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
                 current_class[nlen] = '\0';
                 class_brace = brace_depth;
 
+                /* A type modifier (`private class Helper`) belongs to the type,
+                 * not to the first member inside it. */
+                pending_vis = IVIS_PUBLIC;
+                pending_static = pending_async = pending_override = false;
+
                 /* Capture the first base type after optional generic params
                  * and a ':' so member completion can walk the inheritance
                  * chain. Stored in the class symbol's type_name field. */
@@ -868,25 +852,35 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
 
             /* method detection: type name(...) pattern */
             if (current_class[0] && brace_depth == class_brace + 1) {
-                /* skip modifiers */
-                bool is_static_m = false;
-                bool is_async_m = false;
-                bool is_override = false;
-                const char *saved_p = p;
-                char type[64] = {0};
-
-                if (strcmp(word, "static") == 0 || strcmp(word, "public") == 0 ||
-                    strcmp(word, "private") == 0 || strcmp(word, "protected") == 0 ||
-                    strcmp(word, "virtual") == 0 || strcmp(word, "override") == 0 ||
-                    strcmp(word, "abstract") == 0 || strcmp(word, "async") == 0 ||
-                    strcmp(word, "internal") == 0 || strcmp(word, "sealed") == 0 ||
-                    strcmp(word, "readonly") == 0 || strcmp(word, "new") == 0) {
-                    if (strcmp(word, "static") == 0) is_static_m = true;
-                    if (strcmp(word, "async") == 0) is_async_m = true;
-                    if (strcmp(word, "override") == 0) is_override = true;
-                    last_doc_comment[0] = '\0'; /* don't clear yet */
+                /* A modifier token is not a type name: record it for the member
+                 * that follows instead of letting it be read as one. */
+                if (strcmp(word, "public") == 0 || strcmp(word, "private") == 0 ||
+                    strcmp(word, "protected") == 0) {
+                    pending_vis = (strcmp(word, "public") == 0)   ? IVIS_PUBLIC
+                                : (strcmp(word, "protected") == 0) ? IVIS_PROTECTED
+                                                                   : IVIS_PRIVATE;
                     continue;
                 }
+                if (strcmp(word, "static") == 0 || strcmp(word, "virtual") == 0 ||
+                    strcmp(word, "override") == 0 || strcmp(word, "abstract") == 0 ||
+                    strcmp(word, "async") == 0 || strcmp(word, "internal") == 0 ||
+                    strcmp(word, "sealed") == 0 || strcmp(word, "readonly") == 0 ||
+                    strcmp(word, "extern") == 0 || strcmp(word, "unsafe") == 0) {
+                    if (strcmp(word, "static") == 0) pending_static = true;
+                    else if (strcmp(word, "async") == 0) pending_async = true;
+                    else if (strcmp(word, "override") == 0) pending_override = true;
+                    continue;
+                }
+
+                /* skip modifiers */
+                bool is_static_m = pending_static;
+                bool is_async_m = pending_async;
+                bool is_override = pending_override;
+                ivis_t vis = pending_vis;
+                pending_vis = IVIS_PUBLIC;
+                pending_static = pending_async = pending_override = false;
+                const char *saved_p = p;
+                char type[64] = {0};
 
                 /* word might be a type name; look for identifier after it */
                 strncpy(type, word, sizeof(type) - 1);
@@ -957,6 +951,8 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
                                      ISYM_METHOD, line_num,
                                      (int)(name_start - content),
                                      is_static_m, param_count);
+                        if (is->symbol_count > 0)
+                            is->symbols[is->symbol_count - 1].visibility = vis;
                         /* the body '{' (if any) follows the signature */
                         snprintf(pending_method, sizeof(pending_method), "%s", method_name);
 
@@ -1018,6 +1014,8 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
                                      fkind, line_num,
                                      (int)(name_start - content),
                                      is_static_m, 0);
+                        if (is->symbol_count > 0)
+                            is->symbols[is->symbol_count - 1].visibility = vis;
                     } else {
                         p = saved_p;
                     }
@@ -1191,6 +1189,37 @@ static const char *class_base(intellisense_t *is, const char *cls) {
     return NULL;
 }
 
+/* Whether a member declared at `vis` may be offered to a receiver used from
+ * inside `from_class`. Private members are only visible inside their own
+ * type: that is what used to fill `Stopwatch.` with `running`, `accumulated`
+ * and `cachedFrequency`. */
+static bool member_visible(const intellisense_t *is, ivis_t vis,
+                           const char *parent, const char *from_class) {
+    if (vis == IVIS_PUBLIC) return true;
+    if (!parent[0]) return vis == IVIS_PROTECTED;
+    if (!from_class || !from_class[0]) return false;
+    if (strcmp(parent, from_class) == 0) return true;
+    if (vis == IVIS_PROTECTED) {
+        int guard = 0;
+        const char *base = from_class;
+        while (base && base[0] && guard++ < 16) {
+            if (strcmp(base, parent) == 0) return true;
+            base = class_base((intellisense_t *)is, base);
+        }
+    }
+    return false;
+}
+
+/* The class whose body contains `line`, or "" outside any type. */
+static const char *enclosing_class_at(intellisense_t *is, int line) {
+    if (line < 0) return "";
+    for (int i = 0; i < is->method_count; i++) {
+        if (line >= is->methods[i].start_line && line <= is->methods[i].end_line)
+            return is->methods[i].parent;
+    }
+    return "";
+}
+
 /* Complete members of a given type.
  * If line >= 0, resolves type_name as a variable in the enclosing method scope first. */
 int intel_complete_members_at(intellisense_t *is, const char *type_name,
@@ -1212,14 +1241,7 @@ int intel_complete_members_at(intellisense_t *is, const char *type_name,
             break;
         }
     }
-    if (!is_known_type) {
-        for (int ci = 0; stdlib_classes[ci].class_name; ci++) {
-            if (strcmp(type_name, stdlib_classes[ci].class_name) == 0) {
-                is_known_type = true;
-                break;
-            }
-        }
-    }
+    if (!is_known_type && builtin_receiver(type_name)) is_known_type = true;
     if (!is_known_type) {
         const char *rv = intel_resolve_type_at(is, type_name, line);
         if (rv && rv[0]) type_name = rv;
@@ -1231,6 +1253,10 @@ int intel_complete_members_at(intellisense_t *is, const char *type_name,
     snprintf(bare_type, sizeof(bare_type), "%s", type_name);
     { char *lt = strchr(bare_type, '<'); if (lt) *lt = '\0';
       char *br = strstr(bare_type, "[]"); if (br) *br = '\0'; }
+
+    /* Whose body the request comes from: a class sees its own privates and
+     * its bases' protected members, callers see only the public surface. */
+    const char *from_class = enclosing_class_at(is, line);
 
     /* Check user-defined type members, walking the inheritance chain so
      * inherited members from base classes are offered too. */
@@ -1244,6 +1270,8 @@ int intel_complete_members_at(intellisense_t *is, const char *type_name,
             if (strcmp(sym->parent, cls) != 0) continue;
             if (sym->kind != ISYM_METHOD && sym->kind != ISYM_FIELD &&
                 sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER)
+                continue;
+            if (!member_visible(is, sym->visibility, sym->parent, from_class))
                 continue;
 
             if (plen > 0 && _strnicmp(sym->name, prefix, plen) != 0) continue;
@@ -1273,76 +1301,26 @@ int intel_complete_members_at(intellisense_t *is, const char *type_name,
         guard++;
     }
 
-    /* Check stdlib classes */
-    for (int ci = 0; stdlib_classes[ci].class_name; ci++) {
-        if (strcmp(bare_type, stdlib_classes[ci].class_name) != 0) continue;
-        for (int mi = 0; stdlib_classes[ci].methods[mi] && is->completion_count < INTEL_MAX_COMPLETIONS; mi++) {
-            if (plen > 0 && _strnicmp(stdlib_classes[ci].methods[mi], prefix, plen) != 0) continue;
+    /* Member surface of a compiler built-in type (string, List<T>, Console,
+     * Math, File, ...): every entry comes from builtin_api.c, the table irgen
+     * itself uses, so completion can no longer offer a member the compiler
+     * rejects. */
+    const zan_builtin_type_t *bt = builtin_receiver(bare_type);
+    if (bt) {
+        for (int i = 0; i < bt->member_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
+            const zan_builtin_member_t *m = &bt->members[i];
+            if (plen > 0 && _strnicmp(m->name, prefix, plen) != 0) continue;
+            if (already_offered(is, m->name)) continue;
             completion_t *c = &is->completions[is->completion_count++];
-            strncpy(c->label, stdlib_classes[ci].methods[mi], sizeof(c->label) - 1);
-            snprintf(c->insert_text, sizeof(c->insert_text), "%s(", stdlib_classes[ci].methods[mi]);
-            snprintf(c->detail, sizeof(c->detail), "%s.%s()", type_name, stdlib_classes[ci].methods[mi]);
-            c->kind = ISYM_METHOD;
-            c->sort_priority = 1;
-        }
-        break;
-    }
-
-    /* Console methods */
-    if (strcmp(bare_type, "Console") == 0) {
-        for (int i = 0; console_methods[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-            if (plen > 0 && _strnicmp(console_methods[i], prefix, plen) != 0) continue;
-            completion_t *c = &is->completions[is->completion_count++];
-            strncpy(c->label, console_methods[i], sizeof(c->label) - 1);
-            snprintf(c->insert_text, sizeof(c->insert_text), "%s(", console_methods[i]);
-            snprintf(c->detail, sizeof(c->detail), "Console.%s()", console_methods[i]);
-            c->kind = ISYM_METHOD;
-            c->sort_priority = 1;
-        }
-    }
-
-    /* string instance methods */
-    if (strcmp(bare_type, "string") == 0 || strcmp(bare_type, "String") == 0) {
-        for (int i = 0; string_methods[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-            if (plen > 0 && _strnicmp(string_methods[i], prefix, plen) != 0) continue;
-            completion_t *c = &is->completions[is->completion_count++];
-            strncpy(c->label, string_methods[i], sizeof(c->label) - 1);
-            strncpy(c->insert_text, string_methods[i], sizeof(c->insert_text) - 1);
-            snprintf(c->detail, sizeof(c->detail), "string.%s", string_methods[i]);
-            c->kind = ISYM_METHOD;
-            c->sort_priority = 1;
-        }
-    }
-
-    /* List/Dict/StringBuilder instance methods (declared or resolved type) */
-    if (strcmp(bare_type, "List") == 0) {
-        for (int i = 0; list_methods[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-            if (plen > 0 && _strnicmp(list_methods[i], prefix, plen) != 0) continue;
-            completion_t *c = &is->completions[is->completion_count++];
-            strncpy(c->label, list_methods[i], sizeof(c->label) - 1);
-            strncpy(c->insert_text, list_methods[i], sizeof(c->insert_text) - 1);
-            snprintf(c->detail, sizeof(c->detail), "List.%s", list_methods[i]);
-            c->kind = ISYM_METHOD;
-            c->sort_priority = 1;
-        }
-    } else if (strcmp(bare_type, "Dict") == 0) {
-        for (int i = 0; dict_methods[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-            if (plen > 0 && _strnicmp(dict_methods[i], prefix, plen) != 0) continue;
-            completion_t *c = &is->completions[is->completion_count++];
-            strncpy(c->label, dict_methods[i], sizeof(c->label) - 1);
-            strncpy(c->insert_text, dict_methods[i], sizeof(c->insert_text) - 1);
-            snprintf(c->detail, sizeof(c->detail), "Dict.%s", dict_methods[i]);
-            c->kind = ISYM_METHOD;
-            c->sort_priority = 1;
-        }
-    } else if (strcmp(bare_type, "StringBuilder") == 0) {
-        for (int i = 0; sb_methods[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-            if (plen > 0 && _strnicmp(sb_methods[i], prefix, plen) != 0) continue;
-            completion_t *c = &is->completions[is->completion_count++];
-            strncpy(c->label, sb_methods[i], sizeof(c->label) - 1);
-            strncpy(c->insert_text, sb_methods[i], sizeof(c->insert_text) - 1);
-            snprintf(c->detail, sizeof(c->detail), "StringBuilder.%s", sb_methods[i]);
-            c->kind = ISYM_METHOD;
+            snprintf(c->label, sizeof(c->label), "%s", m->name);
+            if (m->kind == 'M')
+                snprintf(c->insert_text, sizeof(c->insert_text), "%s(", m->name);
+            else
+                snprintf(c->insert_text, sizeof(c->insert_text), "%s", m->name);
+            /* detail carries the real signature from builtin_api.c, so hover
+             * and the completion tooltip agree with what irgen accepts. */
+            snprintf(c->detail, sizeof(c->detail), "%s", m->sig);
+            c->kind = (m->kind == 'M') ? ISYM_METHOD : ISYM_FIELD;
             c->sort_priority = 1;
         }
     }
@@ -1464,6 +1442,26 @@ int intel_complete(intellisense_t *is, const char *prefix,
         c->sort_priority = 1;
     }
 
+    /* The compiler's built-in static classes (Console, Math, File,
+     * NativeMemory, Vector128, ...). They have no declaration in any source
+     * file, so neither the project index nor a keyword list can produce
+     * them -- builtin_api.c is the only place that knows they exist. */
+    {
+        int btcount = 0;
+        const zan_builtin_type_t *all = zan_builtin_types(&btcount);
+        for (int i = 0; i < btcount && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
+            const char *tname = all[i].name_public;
+            if (_strnicmp(tname, prefix, plen) != 0) continue;
+            if (already_offered(is, tname)) continue;
+            completion_t *c = &is->completions[is->completion_count++];
+            snprintf(c->label, sizeof(c->label), "%s", tname);
+            snprintf(c->insert_text, sizeof(c->insert_text), "%s", tname);
+            snprintf(c->detail, sizeof(c->detail), "%s", all[i].display);
+            c->kind = ISYM_TYPE;
+            c->sort_priority = 1;
+        }
+    }
+
     is->completion_active = is->completion_count > 0;
     return is->completion_count;
 }
@@ -1543,6 +1541,29 @@ hover_info_t intel_hover_at(intellisense_t *is, const char *word, int line) {
         }
     }
 
+    /* check the compiler's built-in type members (`File.GetSize`, `Math.Abs`,
+     * `s.Substring`): hover must describe the same surface completion offers
+     * and irgen accepts. */
+    {
+        int btcount = 0;
+        const zan_builtin_type_t *all = zan_builtin_types(&btcount);
+        for (int i = 0; i < btcount; i++) {
+            const zan_builtin_type_t *bt = &all[i];
+            if (strcmp(bt->name_public, word) == 0 || strcmp(bt->type, word) == 0) {
+                snprintf(info.text, sizeof(info.text), "class %s (built-in)", bt->display);
+                info.valid = true;
+                return info;
+            }
+            for (int mi = 0; mi < bt->member_count; mi++) {
+                if (strcmp(bt->members[mi].name, word) != 0) continue;
+                snprintf(info.text, sizeof(info.text), "%s", bt->members[mi].sig);
+                snprintf(info.doc, sizeof(info.doc), "%s.%s", bt->name_public, word);
+                info.valid = true;
+                return info;
+            }
+        }
+    }
+
     /* check keywords */
     for (int i = 0; builtin_keywords[i]; i++) {
         if (strcmp(builtin_keywords[i], word) == 0) {
@@ -1581,6 +1602,66 @@ goto_def_t intel_goto_def(intellisense_t *is, const char *word) {
     return result;
 }
 
+/* Splits the parameter list inside a signature's parentheses into
+ * name/type pairs, for signature help's active-parameter display. */
+static void sig_param_list(param_info_t *params, int *count, int max,
+                           const char *signature) {
+    const char *pstart = strchr(signature, '(');
+    const char *pend = pstart ? strchr(pstart, ')') : NULL;
+    if (!pstart || !pend) return;
+    pstart++;
+    char params_copy[512];
+    int plen2 = (int)(pend - pstart);
+    if (plen2 > 510) plen2 = 510;
+    memcpy(params_copy, pstart, (size_t)plen2);
+    params_copy[plen2] = '\0';
+
+    /* Split by top-level commas (ignore commas nested in generics,
+     * arrays/blocks, or parentheses so param types like
+     * Dictionary<string,int> stay intact). */
+    char *tok = params_copy;
+    while (*tok && *count < max) {
+        while (*tok == ' ') tok++;
+        char *comma = NULL;
+        int nest = 0;
+        for (char *q = tok; *q; q++) {
+            if (*q == '(' || *q == '[' || *q == '{') nest++;
+            else if (*q == ')' || *q == ']' || *q == '}') { if (nest > 0) nest--; }
+            else if (*q == '<' && q > tok &&
+                     (isalnum((unsigned char)q[-1]) || q[-1] == '_')) nest++;
+            else if (*q == '>' && nest > 0) nest--;
+            else if (*q == ',' && nest == 0) { comma = q; break; }
+        }
+        int tlen = comma ? (int)(comma - tok) : (int)strlen(tok);
+        if (tlen > 0) {
+            char param_str[128];
+            if (tlen > 127) tlen = 127;
+            memcpy(param_str, tok, (size_t)tlen);
+            param_str[tlen] = '\0';
+
+            /* drop a default value if present ("Type name = expr") */
+            char *eq = strchr(param_str, '=');
+            if (eq) {
+                while (eq > param_str && eq[-1] == ' ') eq--;
+                *eq = '\0';
+            }
+
+            /* split "Type name" */
+            char *space = strrchr(param_str, ' ');
+            if (space) {
+                *space = '\0';
+                strncpy(params[*count].type, param_str, sizeof(params[*count].type) - 1);
+                strncpy(params[*count].label, space + 1, sizeof(params[*count].label) - 1);
+            } else {
+                strncpy(params[*count].label, param_str, sizeof(params[*count].label) - 1);
+            }
+            (*count)++;
+        }
+        if (comma) tok = comma + 1;
+        else break;
+    }
+}
+
 /* Signature help: provide info about method parameters */
 signature_info_t intel_signature_help(intellisense_t *is, const char *method_name,
                                       const char *class_context) {
@@ -1617,69 +1698,36 @@ signature_info_t intel_signature_help(intellisense_t *is, const char *method_nam
 
         strncpy(sig.label, sym->signature, sizeof(sig.label) - 1);
         strncpy(sig.doc, sym->doc, sizeof(sig.doc) - 1);
-
-        /* Parse parameters from signature: extract between ( and ) */
-        const char *pstart = strchr(sym->signature, '(');
-        const char *pend = pstart ? strchr(pstart, ')') : NULL;
-        if (pstart && pend) {
-            pstart++;
-            char params_copy[256];
-            int plen2 = (int)(pend - pstart);
-            if (plen2 > 254) plen2 = 254;
-            memcpy(params_copy, pstart, (size_t)plen2);
-            params_copy[plen2] = '\0';
-
-            /* Split by top-level commas (ignore commas nested in generics,
-             * arrays/blocks, or parentheses so param types like
-             * Dictionary<string,int> stay intact). */
-            char *tok = params_copy;
-            while (*tok && sig.param_count < INTEL_MAX_PARAMS) {
-                while (*tok == ' ') tok++;
-                char *comma = NULL;
-                int nest = 0;
-                for (char *q = tok; *q; q++) {
-                    if (*q == '(' || *q == '[' || *q == '{') nest++;
-                    else if (*q == ')' || *q == ']' || *q == '}') { if (nest > 0) nest--; }
-                    else if (*q == '<' && q > tok &&
-                             (isalnum((unsigned char)q[-1]) || q[-1] == '_')) nest++;
-                    else if (*q == '>' && nest > 0) nest--;
-                    else if (*q == ',' && nest == 0) { comma = q; break; }
-                }
-                int tlen = comma ? (int)(comma - tok) : (int)strlen(tok);
-                if (tlen > 0) {
-                    char param_str[128];
-                    if (tlen > 127) tlen = 127;
-                    memcpy(param_str, tok, (size_t)tlen);
-                    param_str[tlen] = '\0';
-
-                    /* drop a default value if present ("Type name = expr") */
-                    char *eq = strchr(param_str, '=');
-                    if (eq) {
-                        while (eq > param_str && eq[-1] == ' ') eq--;
-                        *eq = '\0';
-                    }
-
-                    /* split "Type name" */
-                    char *space = strrchr(param_str, ' ');
-                    if (space) {
-                        *space = '\0';
-                        strncpy(sig.params[sig.param_count].type, param_str,
-                                sizeof(sig.params[sig.param_count].type) - 1);
-                        strncpy(sig.params[sig.param_count].label, space + 1,
-                                sizeof(sig.params[sig.param_count].label) - 1);
-                    } else {
-                        strncpy(sig.params[sig.param_count].label, param_str,
-                                sizeof(sig.params[sig.param_count].label) - 1);
-                    }
-                    sig.param_count++;
-                }
-                if (comma) tok = comma + 1;
-                else break;
-            }
-        }
+        sig_param_list(sig.params, &sig.param_count, INTEL_MAX_PARAMS, sym->signature);
 
         sig.valid = true;
         return sig;
+    }
+
+    /* A built-in member (`s.Substring(`, `Console.WriteLine(`): the signature
+     * comes from builtin_api.c, the same text irgen type-checks against. */
+    {
+        int btcount = 0;
+        const zan_builtin_type_t *all = zan_builtin_types(&btcount);
+        for (int i = 0; i < btcount; i++) {
+            const zan_builtin_type_t *bt = &all[i];
+            bool receiver_ok = true;
+            if (class_context && class_context[0]) {
+                const zan_builtin_type_t *want = builtin_receiver(class_context);
+                receiver_ok = want && want->members == bt->members;
+            }
+            if (!receiver_ok) continue;
+            for (int mi = 0; mi < bt->member_count; mi++) {
+                const zan_builtin_member_t *m = &bt->members[mi];
+                if (m->kind != 'M') continue;
+                if (strcmp(m->name, method_name) != 0) continue;
+                snprintf(sig.label, sizeof(sig.label), "%s", m->sig);
+                snprintf(sig.doc, sizeof(sig.doc), "%s.%s", bt->name_public, m->name);
+                sig_param_list(sig.params, &sig.param_count, INTEL_MAX_PARAMS, m->sig);
+                sig.valid = true;
+                return sig;
+            }
+        }
     }
 
     return sig;
@@ -1929,14 +1977,9 @@ const char *intel_resolve_chain(intellisense_t *is, const char *chain,
                 break;
             }
         }
-        /* Check stdlib classes */
-        if (!current_type) {
-            for (int ci2 = 0; stdlib_classes[ci2].class_name; ci2++) {
-                if (strcmp(first_name, stdlib_classes[ci2].class_name) == 0) {
-                    current_type = stdlib_classes[ci2].class_name;
-                    break;
-                }
-            }
+        /* A built-in static class (Console.WriteLine(...), File.Exists(...)) */
+        if (!current_type && builtin_receiver(first_name)) {
+            current_type = first_name;
         }
         if (!current_type) return NULL;
     }
