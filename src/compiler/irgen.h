@@ -400,7 +400,7 @@ struct zan_irgen {
     int static_field_count;
     int static_field_cap;
     LLVMValueRef g_live;          /* i64 global: net live ARC allocations */
-    /* check-leaks site tables (B-ID17): the arrays are created at finalize
+    /* check-leaks site tables: the arrays are created at finalize
      * with the exact site count -- unknown during emission, and LLVM fixes a
      * global's type at creation -- so instrumentation reaches them through
      * these pointer globals, and __zan_site_count carries the bound for every
@@ -771,6 +771,11 @@ struct zan_irgen {
     bool mf_native;           /* codegen-manifest policy: the target is a
                                * native host (not wasm32/RV32 cross) — set by
                                * zan_irgen_manifest_build from the driver. */
+
+    /* Cached results of prefix queries (e.g. WebView, CEF, icons, etc.) */
+    char prefix_cache[32][64];
+    bool prefix_cache_val[32];
+    int  prefix_cache_count;
 
     /* DWARF debug info (opt-in via `zanc -g`). When emit_debug is false these
      * remain NULL and no debug metadata is produced (default/--publish builds

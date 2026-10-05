@@ -85,7 +85,7 @@ static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
     default:
         /* No encoding exists for this value in the one-word slot. The aggregate
          * case is already reported once, at the declaration, by the async
-         * prologue (A273); this fallback only keeps the encoder from handing
+         * prologue; this fallback only keeps the encoder from handing
          * LLVM a wrong-typed value. */
         return LLVMConstInt(i64, 0, 0);
     }
@@ -245,7 +245,7 @@ static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals, LLVMValue
     LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0),
         LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "fr.hc"));
 
-    /* B-ID56: completion notification for event-driven joins (Task.WhenAll /
+    /* Completion notification for event-driven joins (Task.WhenAll /
      * WhenAny). Every async frame passes here exactly once after DONE is
      * published, INCLUDING result-carrying Task.Run frames that stay tracked
      * (done=1, not reaped) until Result/Wait reads them — those never reach
@@ -595,7 +595,7 @@ static void emit_async_reload_slots(zan_irgen_t *g) {
     }
 }
 
-/* Cooperative preemption site (B-ID44). Planted by the loop emitters at every
+/* Cooperative preemption site. Planted by the loop emitters at every
  * back-edge of an async function: poll the driver; when the slice is up,
  * requeue this frame with the exact `await Task.Yield()` sequence and re-enter
  * the loop at resume_target once the scheduler gets back to it. This is what
@@ -1628,7 +1628,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
          * reads this mark to release only the temps stacked above it.
          * Leaving it zero made __zan_eh_tmp_unwind(0) release *every*
          * registered local of every frame between the thrower and here --
-         * the awaiter's locals came back null after its catch (A293). */
+         * the awaiter's locals came back null after its catch. */
         LLVMBuildStore(g->builder,
             LLVMBuildLoad2(g->builder, i32, get_eh_tmp_top_global(g), "eh.t0"),
             emit_eh_mark_ptr(g, t1));
@@ -1666,7 +1666,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
         LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t2");
         LLVMValueRef t1 = zan_add(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t3");
         LLVMBuildStore(g->builder, t1, top_g);
-        /* same mark contract as the trampoline arm above (A293) */
+        /* same mark contract as the trampoline arm above */
         LLVMBuildStore(g->builder,
             LLVMBuildLoad2(g->builder, i32, get_eh_tmp_top_global(g), "eh.t3m"),
             emit_eh_mark_ptr(g, t1));
@@ -1885,7 +1885,7 @@ static void emit_eh_rethrow_current(zan_irgen_t *g) {
  * other coroutines on this same thread-global stack, and an exception inside
  * them leaves their temp registrations above this handler's mark with nobody
  * left to pop them -- releasing them here, while they are still alive, keeps
- * the catch-entry unwind from releasing long-dead entries (A318). */
+ * the catch-entry unwind from releasing long-dead entries. */
 static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
                                      LLVMValueRef tmp_mark) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);

@@ -69,7 +69,7 @@ typedef enum {
 #define ZGL_K_UNION   7   /* sample completed polyline coverage */
 #define ZGL_K_TEXTRGBA 9 /* color glyph tile: own BGRA + straight alpha */
 #define ZGL_K_SURFACE 8   /* combined rounded fill and border */
-#define ZGL_K_SPRITE  10  /* textured quad from the sprite registry (A356) */
+#define ZGL_K_SPRITE  10  /* textured quad from the sprite registry */
 
 /* Tile side for the upload comparison below: 64x64 is 16 KiB of pixels, small
  * enough that a scrolled list or a hovered button touches few tiles, large
@@ -1669,7 +1669,7 @@ static void gl_drop_tex(unsigned int tex) {
     }
 }
 
-/* ---- textured sprite batch (A356 P0) -----------------------------------*/
+/* ---- textured sprite batch -----------------------------------*/
 
 /* Upload the handle's image once; the texture lives in the sprite registry
  * entry, so decode-cache eviction + re-decode does not re-create it. */

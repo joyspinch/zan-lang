@@ -44,7 +44,7 @@
 static int zan_io_trace(void){static int t=-1;if(t<0){const char*e=getenv("ZAN_IO_TRACE");t=(e&&*e&&*e!='0')?1:0;}return t;}
 #define IOTRACE(...) do{if(zan_io_trace()){fprintf(stderr,"[iot] " __VA_ARGS__);fprintf(stderr,"\n");fflush(stderr);}}while(0)
 
-/* (B-ID88) scheduler-park trace: one line per park/unpark/pump decision so a
+/* scheduler-park trace: one line per park/unpark/pump decision so a
  * "threads are all asleep on something" state can be attributed to a section
  * by matching the last line each worker printed against its kernel wchan. */
 static int zan_sched_trace(void){static int t=-1;if(t<0){const char*e=getenv("ZAN_SCHED_TRACE");t=(e&&*e&&*e!='0')?1:0;}return t;}
@@ -125,7 +125,7 @@ extern void *zan_io_get_current_co(void);   /* implemented in rt_sched.c */
 
 #if !defined(_WIN32)
 /* Minimal interlocked RMW shims, defined early so the POSIX backends can keep
- * g_io_count / g_io_dead_count atomic without "the" reactor mutex -- (B-ID74a)
+ * g_io_count / g_io_dead_count atomic without "the" reactor mutex --
  * shards turn concurrently, so plain ++/-- under a per-shard lock no longer
  * serializes these process-wide counters. The full compatibility block further
  * down repeats the definitions under #ifndef guards. */
@@ -151,7 +151,7 @@ typedef long LONG;
 /* ZAN_IO_READ / ZAN_IO_WRITE come from rt_io.h. */
 
 /* Number of in-flight watchers / operations; used by zan_io_has_pending()
- * and to short-circuit an empty poll on every backend. (B-ID74a) interlocked:
+ * and to short-circuit an empty poll on every backend. Interlocked:
  * per-shard reactors turn concurrently, so this is no longer guarded by any
  * single lock. */
 static volatile LONG g_io_count;
@@ -164,7 +164,7 @@ static int g_io_started;
  * instead of parking a coroutine that nothing will ever wake -- the old
  * behaviour was every await in the process hanging silently forever. */
 static int g_io_broken;
-/* (B-ID74a) reactor sharded exactly once per process (the pool start paths;
+/* Reactor sharded exactly once per process (the pool start paths;
  * Windows: IOCP ports, POSIX: per-worker poll sets). */
 static int g_io_shards_live;
 
@@ -186,8 +186,7 @@ static int32_t g_dns_wake_fd = -1;    /* reactor-visible wake fd (POSIX) */
 /* Set when a blocking/DNS completion packet could not be posted. That packet
  * is the only notification that a worker's job finished, so a failed Post must
  * not park the pool with the result sitting unread in g_blocking_done: the
- * multi-worker wait loop takes one non-blocking drain pass when it sees this
- * (A285). */
+ * multi-worker wait loop takes one non-blocking drain pass when it sees this. */
 static volatile LONG g_blocking_wake_lost;
 #endif
 #if !defined(__linux__) && !defined(_WIN32)
@@ -253,7 +252,7 @@ static _Thread_local int64_t *g_pending_out_n;
 static _Thread_local intptr_t *g_pending_accept_out;
 
 /* The reactor state below (slot table, entry list, dead queue, rto lists) is
- * sharded on the multi-worker POSIX driver (B-ID74a): each worker polls its
+ * sharded on the multi-worker POSIX driver: each worker polls its
  * own poll fd -- one epoll/kqueue instance and one wake channel per shard --
  * and every watcher belongs to the shard its fd hashes to, so an fd's
  * register/arm/deliver/close all run under that one shard's mutex. This is
@@ -287,7 +286,7 @@ static zan_io_shard_t g_ioshard[ZAN_IO_MAXSHARD];
  * in io_shard_open) reads a never-opened shard as already-open and the shard
  * runs with epfd 0 -- epoll_ctl/epoll_wait fail EINVAL, every registration on
  * it fails, and one of the fail-woken frames can strand a dead entry whose
- * count pins zan_io_has_pending forever (B-ID88 hang). Prime -1 once, before
+ * count pins zan_io_has_pending forever. Prime -1 once, before
  * any open/skip decision can look at the array. */
 static int g_ioshard_prim;
 static void io_shards_prime(void) {
@@ -391,7 +390,7 @@ typedef struct zan_io_dead {
  * whole burst. */
 #define ZAN_IO_FAST_BURST 64
 
-/* (B-ID74a) the dead queue itself lives per shard (g_ioshard[].dead); this
+/* The dead queue itself lives per shard (g_ioshard[].dead); this
  * interlocked global count still feeds zan_io_has_pending from any thread. */
 static volatile LONG g_io_dead_count;
 /* Per-thread: each worker's speculative-recv budget refills when THAT worker
@@ -855,7 +854,7 @@ int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
         /* Teredo (2001::/32, RFC 4380) carries two IPv4 addresses: the server
          * at bytes 4..7 and the client at 12..15, the latter obfuscated with
          * XOR 0xffffffff. Both must pass the IPv4 rules -- a Teredo answer that
-         * tunneled to 10.0.0.1 otherwise came back "safe" (A286). */
+         * tunneled to 10.0.0.1 otherwise came back "safe". */
         if (b[0] == 0x20u && b[1] == 0x01u && b[2] == 0x00u && b[3] == 0x00u) {
             struct sockaddr_in t4;
             unsigned char cli[4];
@@ -872,7 +871,7 @@ int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
          * 6to4 (2002::/16) at bytes 2..5, NAT64 (64:ff9b::/96) and the
          * deprecated IPv4-compatible (::a.b.c.d) at 12..15. Judging the
          * embedded address by the IPv4 rules is what closes the private-range
-         * filter for them; falling through to `return 1` did not (A286). */
+         * filter for them; falling through to `return 1` did not. */
         int v4_off = -1;
         if (b[0] == 0x20u && b[1] == 0x02u)
             v4_off = 2;
@@ -1287,7 +1286,7 @@ static zan_io_slot_t *io_slot(int fd) {
     return &g_slots[fd];
 }
 
-/* Grow the slot table. (B-ID74a) a poll turn on shard X holds pointers into
+/* Grow the slot table. A poll turn on shard X holds pointers into
  * the table only inside its own shard lock, so a realloc must be excluded
  * against EVERY shard's turn at once: take all shard locks (index order, the
  * same order zan_io_shutdown uses), swap, release. Callers drop their own
@@ -1461,7 +1460,7 @@ static int io_fail_slot_waiters(int fd, zan_io_slot_t *s) {
 /* Fail every waiter parked on an fd that has since been closed. Closing an fd
  * removes it from the poll set without any event, so such waiters are
  * invisible to epoll_wait/kevent and would otherwise never be resumed.
- * (B-ID74a) each shard's turn sweeps only the fds it owns. */
+ * Each shard's turn sweeps only the fds it owns. */
 static int io_sweep_slots(int idx) {
     int woke = 0;
     for (int fd = 0; fd < g_slots_cap; fd++) {
@@ -1501,7 +1500,7 @@ static int io_sweep_slots(int idx) {
  * ADD + DEL pair (and none of the list walking) the previous version needed.
  */
 
-/* (B-ID74a) one epoll instance + one eventfd wake channel per shard; the
+/* One epoll instance + one eventfd wake channel per shard; the
  * async-DNS wake fd stays registered on shard 0 exactly as in the
  * single-reactor days (dns_drain readies frames from any thread). */
 static int io_shard_open(int i) {
@@ -1600,6 +1599,7 @@ static void io_shutdown_locked(void) {
     }
     if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
     g_io_started = 0;
+    g_ioshard_prim = 0;
     /* Back to a single reactor; the next pool start re-shards. */
 #if defined(ZAN_CO_DRIVER)
     InterlockedExchange(&g_shards, 1);
@@ -1780,7 +1780,7 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     return io_poll_shard(io_thread_shard(), timeout_ms);
 }
 
-/* One turn of ONE shard (B-ID74a). The wait itself runs WITHOUT the shard
+/* One turn of ONE shard. The wait itself runs WITHOUT the shard
  * lock -- the lock would re-create the global-queueing this sharding exists
  * to remove -- which is safe because a shard has (at most) one parked waiter
  * and epoll tolerates concurrent epoll_ctl from registering threads; the
@@ -1876,7 +1876,7 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
          * can keep turning indefinitely (capped 20ms waits with io in flight
          * and an infinite caller timeout), so due recv-to entries must be
          * delivered HERE too or a timed-out recv parks until some external
-         * event happens to wake the reactor (A268(b) Linux hang). */
+         * event happens to wake the reactor. */
         int w5 = w4 ? 0 : rto_timeout_scan(sh);
         int done = 1, val = 0;
         if      (w2) val = w2;
@@ -1891,7 +1891,7 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
     }
 }
 
-/* See rt_io.h: the close-notification hook (A291-5). Called by Socket.Close
+/* See rt_io.h: the close-notification hook. Called by Socket.Close
  * BEFORE the descriptor is closed, so no waiter can outlive the socket it
  * registered against and be served by (or deliver into) a recycled fd. */
 static void io_close_notify_slots(intptr_t fdp) {
@@ -1936,7 +1936,7 @@ void zan_io_close_notify(intptr_t fd) {
 #elif defined(__APPLE__) || defined(__FreeBSD__)
 /* ==================== KQUEUE ==================== */
 
-/* (B-ID74a) one kqueue instance + one pipe wake channel per shard; the
+/* One kqueue instance + one pipe wake channel per shard; the
  * async-DNS wake pipe stays on shard 0 exactly as in the single-reactor
  * days (dns_drain readies frames from any thread). */
 static int io_shard_open(int i) {
@@ -2038,6 +2038,7 @@ static void io_shutdown_locked(void) {
     if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
     if (g_dns_wake_wfd >= 0) { close(g_dns_wake_wfd); g_dns_wake_wfd = -1; }
     g_io_started = 0;
+    g_ioshard_prim = 0;
     /* Back to a single reactor; the next pool start re-shards. */
 #if defined(ZAN_CO_DRIVER)
     InterlockedExchange(&g_shards, 1);
@@ -2179,7 +2180,7 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     return io_poll_shard(io_thread_shard(), timeout_ms);
 }
 
-/* One turn of ONE shard (B-ID74a). The wait itself runs WITHOUT the shard
+/* One turn of ONE shard. The wait itself runs WITHOUT the shard
  * lock -- the lock would re-create the global-queueing this sharding exists
  * to remove -- which is safe because a shard has (at most) one parked waiter
  * and kqueue tolerates concurrent EV_ADD from registering threads; the slot
@@ -2306,7 +2307,7 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
     }
 }
 
-/* See rt_io.h: the close-notification hook (A291-5). Called by Socket.Close
+/* See rt_io.h: the close-notification hook. Called by Socket.Close
  * BEFORE the descriptor is closed, so no waiter can outlive the socket it
  * registered against and be served by (or deliver into) a recycled fd. */
 static void io_close_notify_slots(intptr_t fdp) {
@@ -3314,7 +3315,7 @@ void zan_io_close_notify(intptr_t fd) {
 #else
 /* ==================== FALLBACK SELECT (POSIX) ==================== */
 
-/* (B-ID74a) select stays a single reactor: FD_SETSIZE bounds it anyway and
+/* select stays a single reactor: FD_SETSIZE bounds it anyway and
  * extra shards would poll dead fds, so only shard 0 ever opens and
  * io_shards_start keeps the count at 1. */
 static int io_shard_open(int i) {
@@ -3539,7 +3540,7 @@ static int rto_timeout_scan(zan_io_shard_t *sh) {
     return woke;
 }
 
-/* See rt_io.h: the close-notification hook (A291-5); select-backend form.
+/* See rt_io.h: the close-notification hook; select-backend form.
  * The list is walked once; entries naming this fd are unlinked and failed. */
 void zan_io_close_notify(intptr_t fdp) {
     int fd = (int)fdp;
@@ -4418,7 +4419,7 @@ typedef long LONG;
     (long long)__sync_add_and_fetch((long long volatile *)(dst), 1)
 #endif
 #if defined(ZAN_CO_DRIVER)
-/* (B-ID74a) Open shards 1..n-1 (shard 0 exists from zan_io_init) and publish
+/* Open shards 1..n-1 (shard 0 exists from zan_io_init) and publish
  * the live count before the workers start. AsyncRuntime.IoShards set from
  * Main wins; unset (0) falls back to the ZAN_IO_SHARDS env var. Both only
  * lower the default, which keeps "1 restores the single reactor" as the
@@ -4617,7 +4618,7 @@ typedef struct {
      * head and tail live on separate cache lines: thieves CAS the head line
      * while the owner pushes to the tail line, and sharing one line let the
      * steal storm at k=32 slow the producer's pushes 6.5x -- every thief CAS
-     * invalidated the line the owner was writing (B-ID54). The struct is
+     * invalidated the line the owner was writing. The struct is
      * 64-aligned so the split holds for every array element. */
     volatile long long head;
     char pad_head[56];
@@ -4652,7 +4653,7 @@ typedef struct {
      * LIFO cell, drained its queue, stole, or spun searching. Printed when
      * ZAN_CO_STATS is set in the environment. */
     zan_co_stats_t     st;
-    /* (B-ID74d) 记账对：本池线程亲自 charge 的活动/未决份额（submit/arm/
+    /* 记账对：本池线程亲自 charge 的活动/未决份额（submit/arm/
      * retire 都按 co_self() 落到执行线程自己的对上），只由归属线程写、读者
      * 跨对求和。替代所有核挤同一缓存行 RMW 的单全局计数——spawn k=32 高核
      * 数下那对全局量是残留争用点。非池线程（启动/DNS）落 g_co_cnt_ext。 */
@@ -4663,7 +4664,7 @@ typedef struct {
 
 static CRITICAL_SECTION g_co_lock;
 /* A queued task stays outstanding until its step returns; queue length and
- * g_co_running alone miss the dequeue -> running handoff. (B-ID74d) the
+ * g_co_running alone miss the dequeue -> running handoff. The
  * outstanding/activity counters live as per-charge-thread pairs -- each
  * worker's cnt_act/cnt_out below plus g_co_cnt_ext for non-worker threads --
  * summed by co_cnt_outstanding()/co_cnt_activity(); see that declaration. */
@@ -4714,7 +4715,7 @@ static volatile LONG      g_timer_owner;
 static volatile long long g_timer_pumped_us;   /* zan_co_precise_us stamp */
 static volatile long long g_timer_next_ms;
 
-/* (B-ID74d) Work-creation accounting, sharded per charge thread. Each bump
+/* Work-creation accounting, sharded per charge thread. Each bump
  * charges the pair of the thread doing the charge (a worker's cnt_act/
  * cnt_out, or g_co_cnt_ext for non-worker threads: program start-up, DNS
  * workers, timers armed off-pool) instead of one global cache line every
@@ -4732,7 +4733,7 @@ static void co_wake_shard(int shard) {
     HANDLE p = io_shard(shard);
     if (p) PostQueuedCompletionStatus(p, 0, ZAN_WAKE_KEY, NULL);
 #elif defined(__linux__)
-    /* (B-ID74a) each shard has its own wake eventfd; the packet is consumed
+    /* Each shard has its own wake eventfd; the packet is consumed
      * by that shard's poll turn. */
     if (shard >= 0 && shard < (int)g_shards && g_ioshard[shard].wake_wfd >= 0) {
         uint64_t one = 1;
@@ -4783,7 +4784,7 @@ static zan_co_worker_t *co_self(void) {
 }
 
 #if !defined(_WIN32)
-/* (B-ID74a) The shard this thread turns: worker i polls shard i % n, so an
+/* The shard this thread turns: worker i polls shard i % n, so an
  * fd's events are delivered by the same worker whose steps own it (Windows
  * parity -- the LIFO cell keeps the connection on one core). Non-worker pump
  * callers (the single-thread sched loop) poll shard 0. */
@@ -4992,7 +4993,7 @@ static void co_trace_dump(long long live) {
     fflush(stderr);
 }
 
-/* ---- (B-ID74d) cross-pair accounting readers ----
+/* ---- cross-pair accounting readers ----
  * Totals are event-complete across all pairs; the LONG cast preserves the
  * old single-counter wraparound (mod 2^32) semantics. */
 static LONG co_cnt_activity(void) {
@@ -5177,8 +5178,7 @@ int zan_co_poll(void) {
     /* Gate first, on the worker-local counter alone: 255 of 256 calls must
      * cost no more than the TLS read plus this RMW -- a quantum global or a
      * clock read in the fast path multiplied back into every iteration of
-     * compute-bound loops and degraded worse as workers filled the machine
-     * (the quantum ladder experiment, B-ID54). */
+     * compute-bound loops and degraded worse as workers filled the machine. */
     if ((++w->poll_tick & (ZAN_POLL_GATE - 1)) != 0) return 0;
     long long q = zan_co_quantum_ms();
     if (q <= 0 || w->slice_start_us <= 0) return 0;
@@ -5478,8 +5478,7 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
         /* Timeout or error. Deliver DNS timeouts so lookups past their
          * deadline fail instead of parking their coroutines forever, and drain
          * completed blocking jobs: this is the fallback delivery path for a
-         * lost wake packet (the single-threaded path did the same, the
-         * multi-worker one did not -- A285). */
+         * lost wake packet. */
         dns_timeout_scan();
         rto_timeout_scan();   /* recv-to deadlines past their due */
         dns_drain();
@@ -5571,7 +5570,7 @@ static int co_all_idle(void) {
 
 static void co_pool_retire(zan_co_worker_t *w);
 
-/* B-ID48: the timer heap's deadlines are microseconds, but the PARK must be
+/* The timer heap's deadlines are microseconds, but the PARK must be
  * equally precise or the precision is invisible. A GQCS timeout rounds up to
  * the system tick (~15.6ms without a raised resolution): a 50ms Delay sleeps
  * ~62ms no matter what the heap says (traced: slept 63184us for to=50).
@@ -5808,8 +5807,8 @@ static void co_pool_retire(zan_co_worker_t *w) {
 static void co_pool_ensure(void) {
     /* The foreground run counts as a live pool: while zan_co_sched_run's own
      * workers serve the queues, a ready here must not start a second, detached
-     * generation behind their backs (2x workers, interleaved lifecycles --
-     * B-ID30). A pool of either kind re-checks for stragglers on its way out
+     * generation behind their backs (2x workers, interleaved lifecycles).
+     * A pool of either kind re-checks for stragglers on its way out
      * (sched_run's post-join ensure), so closing the gate here never strands a
      * queued frame. */
     if (g_co_pool_live || g_co_pool_fg) return;
@@ -5819,7 +5818,7 @@ static void co_pool_ensure(void) {
 }
 
 void zan_co_sched_run(void) {
-    /* Foreground admission is a CAS, not a check-then-set (B-ID73): two
+    /* Foreground admission is a CAS, not a check-then-set: two
      * threads entering the same window both passed the old plain read of
      * g_co_pool_fg, each built a full worker set, and the second one's
      * CreateThread overwrote the first's g_wk[i] entries -- corrupting the
@@ -5851,7 +5850,7 @@ void zan_co_sched_run(void) {
             Sleep(1);
             /* Per-thread: this loop runs concurrently on every sched_run
              * caller, and a shared static made each writer reset the other's
-             * watchdog (B-ID84 hygiene). */
+             * watchdog. */
             static __thread DWORD stuck_since = 0;
             DWORD nowk = GetTickCount();
             if (stuck_since == 0) { stuck_since = nowk; continue; }
@@ -5873,7 +5872,7 @@ void zan_co_sched_run(void) {
      * in zan_co_ready, whose tail calls co_pool_ensure; without this flag
      * each wake saw g_co_pool_live == 0 there and started a second, detached
      * pool: 2x workers over-subscribed on the same queues, two pool
-     * lifecycles interleaved (B-ID30). */
+     * lifecycles interleaved. */
     /* Shard the reactor before any worker starts: a shard with no waiter would
      * hold completions nobody dequeues. */
     io_shards_start(w);

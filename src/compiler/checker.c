@@ -1440,9 +1440,8 @@ static bool const_integral_value(zan_ast_node_t *expr, int64_t *value) {
 /* C# binary-operator rule for mixed signed/unsigned integrals: neither
  * operand has an implicit conversion to the other, so the operator is an
  * error -- the ulong-wins promotion silently reinterprets the signed
- * operand as unsigned, wrapping negatives into huge magnitudes
- * (`long x = -1; ulong y = 1; x > y` compared true, B-ID32). A non-negative
- * constant on the signed side stays legal (C# implicit constant conversion,
+ * operand as unsigned, wrapping negatives into huge magnitudes.
+ * A non-negative constant on the signed side stays legal (C# implicit constant conversion,
  * so `u > 0` keeps working). */
 static bool mixed_sign_compare_error(zan_binder_t *b, zan_diag_t *diag,
                                      zan_ast_node_t *expr,
@@ -1479,7 +1478,7 @@ static bool integral_conversion_is_safe(zan_type_t *target, zan_type_t *value,
     /* An unsigned constant into a signed target: the int64 view of the
      * constant is not the value written, so `long x = 18446744073709551615;`
      * passed this check with constant == -1 and truncated at run time (C#
-     * rejects it; A275). Judge the raw bit pattern in that direction. */
+     * rejects it). Judge the raw bit pattern in that direction. */
     if (vu && !tu) {
         /* The one unsigned constant that may cross into a signed 64-bit target:
          * C# singles out the literal 2^63 under unary minus as long.MinValue,
@@ -1643,8 +1642,7 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
          * as a binary expression, so both keep working untouched. What this
          * exemption otherwise served was the accidental decimal constant:
          * `int x = 3000000000` silently wrapped. A direct decimal literal
-         * now narrows like C# CS0031 and needs an explicit cast (B-ID24,
-         * user-adjudicated 2026-10-01). */
+         * now narrows like C# CS0031 and needs an explicit cast. */
         bool decimal_radix = expr && expr->kind == AST_INT_LITERAL &&
             expr->lit_radix == 10;
         bool uint32_bit_pattern = value->kind == TYPE_LONG &&

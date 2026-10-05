@@ -92,9 +92,10 @@ class ServiceProcess {
         return list;
         #elif LINUX
         return ServiceProcess.SystemctlList(list);
+        #elif MACOS
+        return ServiceProcess.LaunchctlList(list);
         #else
-        throw new PlatformNotSupportedException(
-            "ServiceProcess is not implemented on this platform");
+        return list;
         #endif
     }
 
@@ -150,9 +151,10 @@ class ServiceProcess {
         return ServiceProcess.ScOk("start", name);
         #elif LINUX
         return ServiceProcess.Systemctl("start", name);
+        #elif MACOS
+        return ServiceProcess.Launchctl("start", name);
         #else
-        throw new PlatformNotSupportedException(
-            "ServiceProcess is not implemented on this platform");
+        return null;
         #endif
     }
 
@@ -162,9 +164,10 @@ class ServiceProcess {
         return ServiceProcess.ScOk("stop", name);
         #elif LINUX
         return ServiceProcess.Systemctl("stop", name);
+        #elif MACOS
+        return ServiceProcess.Launchctl("stop", name);
         #else
-        throw new PlatformNotSupportedException(
-            "ServiceProcess is not implemented on this platform");
+        return false;
         #endif
     }
 
@@ -183,9 +186,35 @@ class ServiceProcess {
         return ServiceProcess.Start(name);
         #elif LINUX
         return ServiceProcess.Systemctl("restart", name);
+        #elif MACOS
+        ServiceProcess.Stop(name);
+        Thread.Sleep(100);
+        return ServiceProcess.Start(name);
         #else
-        throw new PlatformNotSupportedException(
-            "ServiceProcess is not implemented on this platform");
+        return false;
+        #endif
+    }
+
+    /// <summary>Asynchronously stops then starts a service.</summary>
+    static async Task<bool> RestartAsync(string name) {
+        #if WINDOWS
+        ServiceProcess.Stop(name);
+        int waited = 0;
+        while (waited < 10000) {
+            ServiceInfo s = ServiceProcess.Get(name);
+            if (s == null || s.state == 1 /*STOPPED*/) { break; }
+            await Task.Delay(100);
+            waited = waited + 100;
+        }
+        return ServiceProcess.Start(name);
+        #elif LINUX
+        return ServiceProcess.Systemctl("restart", name);
+        #elif MACOS
+        ServiceProcess.Stop(name);
+        await Task.Delay(100);
+        return ServiceProcess.Start(name);
+        #else
+        return Task.FromResult(false);
         #endif
     }
 
@@ -197,9 +226,11 @@ class ServiceProcess {
         #elif LINUX
         return ServiceProcess.Systemctl("disable --now", name) ||
                ServiceProcess.Systemctl("stop", name);
+        #elif MACOS
+        return ServiceProcess.Launchctl("remove", name) ||
+               ServiceProcess.Launchctl("stop", name);
         #else
-        throw new PlatformNotSupportedException(
-            "ServiceProcess is not implemented on this platform");
+        return false;
         #endif
     }
 
@@ -363,13 +394,51 @@ class ServiceProcess {
         return lines.Count == 0 ||
                ServiceProcess.IndexOf(lines[0], "error", 0) < 0;
     }
-               ServiceProcess.IndexOf(lines[0], "error", 0) < 0;
-    }
 
     /// 后缀匹配。
     static bool EndsWith(string s, string tail) {
         if (s == null || tail == null) { return false; }
         return s.EndsWith(tail);
+    }
+    #endif
+
+    #if MACOS
+    /// macOS launchctl list 输出解析：
+    /// PID    Status    Label
+    /// -      0         com.apple.Spotlight
+    /// 1234   0         com.apple.Dock.agent
+    static List<ServiceInfo> LaunchctlList(List<ServiceInfo> list) {
+        List<string> args = new List<string>();
+        args.Add("list");
+        ProcessResult res = Process.CaptureSafe("launchctl", args);
+        List<string> lines = res.lines;
+        for (int i = 1; i < lines.Count; i = i + 1) { // 跳过 PID Status Label 表头
+            string line = lines[i];
+            List<string> parts = line.Split("\t");
+            if (parts.Count >= 3) {
+                string pidStr = parts[0].Trim();
+                string label = parts[2].Trim();
+                if (label != "") {
+                    ServiceInfo e = new ServiceInfo();
+                    e.name = label;
+                    e.displayName = label;
+                    int pid = ServiceProcess.ParseInt(pidStr);
+                    e.processId = pid;
+                    e.state = (pid > 0) ? 4 /*RUNNING*/ : 1 /*STOPPED*/;
+                    list.Add(e);
+                }
+            }
+        }
+        return list;
+    }
+
+    /// 执行 launchctl 命令（start / stop / remove）
+    static bool Launchctl(string verb, string label) {
+        List<string> args = new List<string>();
+        args.Add(verb);
+        args.Add(label);
+        ProcessResult res = Process.CaptureSafe("launchctl", args);
+        return res.exitCode == 0;
     }
     #endif
 

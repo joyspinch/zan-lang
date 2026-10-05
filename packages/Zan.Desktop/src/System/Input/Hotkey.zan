@@ -22,7 +22,7 @@ delegate void HotkeyCallback();
 /// 回调必须是静态方法（不能捕获状态）。
 ///
 /// 非 Windows 版本暴露相同 API 并抛出
-/// PlatformNotSupportedException。
+/// 跨平台原生实现。
 /// </summary>
 class Hotkey {
     /// Register(int, int, ...) 接受的修饰键位 MOD_ALT(0x0001)。
@@ -58,13 +58,29 @@ class Hotkey {
     static int wantExit;
     static int threadFailed;
     static HotkeyCallback callback;
+    #elif LINUX || MACOS
+    [DllImport("zan_gui", EntryPoint = "zan_hotkey_register")]
+    static extern int NativeRegister(int id, int mods, int vk);
+
+    [DllImport("zan_gui", EntryPoint = "zan_hotkey_unregister")]
+    static extern int NativeUnregister(int id);
+
+    [DllImport("zan_gui", EntryPoint = "zan_hotkey_next_event")]
+    static extern int NativeNextEvent(int timeoutMs);
+
+    static int hotkeyId;
+    static int hotkeyMods;
+    static int hotkeyVk;
+    static int registered;
+    static int wantExit;
+    static int threadFailed;
+    static HotkeyCallback callback;
     #endif
 
     /// <summary>从 "Ctrl+Shift+A" 形式的组合键注册热键。组合键生效时
     /// 返回 true；已注册其他热键或组合键格式错误
     /// （或已被其他程序占用）时返回 false。</summary>
     static bool Register(string combo, HotkeyCallback cb) {
-        #if WINDOWS
         int mods = 0;
         string rest = combo;
         int plus = Hotkey.IndexOf(rest, "+", 0);
@@ -82,10 +98,6 @@ class Hotkey {
         int vk = Keyboard.VK(rest);
         if (vk == 0) { return false; }
         return Hotkey.Register(vk, mods, cb);
-        #else
-        throw new PlatformNotSupportedException(
-            "Hotkey.Register is not implemented on this platform");
-        #endif
     }
 
     /// <summary>异步注册全局热键（协程驱动，非阻塞等待）。</summary>
@@ -98,6 +110,24 @@ class Hotkey {
         Hotkey.wantExit = 0;
         Hotkey.threadFailed = 0;
         Thread.Start(Hotkey.HotkeyThreadEntry);
+        int waited = 0;
+        while (Hotkey.registered == 0 && Hotkey.threadFailed == 0 && waited < 2000) {
+            await Task.Delay(10);
+            waited = waited + 10;
+        }
+        if (Hotkey.registered == 0) {
+            Hotkey.callback = null;
+            return false;
+        }
+        return true;
+        #elif LINUX || MACOS
+        if (Hotkey.registered != 0) { return false; }
+        Hotkey.callback = cb;
+        Hotkey.hotkeyVk = vk;
+        Hotkey.hotkeyMods = mods;
+        Hotkey.wantExit = 0;
+        Hotkey.threadFailed = 0;
+        Thread.Start(Hotkey.PosixHotkeyThreadEntry);
         int waited = 0;
         while (Hotkey.registered == 0 && Hotkey.threadFailed == 0 && waited < 2000) {
             await Task.Delay(10);
@@ -133,9 +163,25 @@ class Hotkey {
             return false;   // 组合键已被其他程序占用
         }
         return true;
+        #elif LINUX || MACOS
+        if (Hotkey.registered != 0) { return false; }
+        Hotkey.callback = cb;
+        Hotkey.hotkeyVk = vk;
+        Hotkey.hotkeyMods = mods;
+        Hotkey.wantExit = 0;
+        Hotkey.threadFailed = 0;
+        Thread.Start(Hotkey.PosixHotkeyThreadEntry);
+        for (int waited = 0; Hotkey.registered == 0 && Hotkey.threadFailed == 0
+               && waited < 500; waited = waited + 1) {
+            Thread.Sleep(1);
+        }
+        if (Hotkey.registered == 0) {
+            Hotkey.callback = null;
+            return false;
+        }
+        return true;
         #else
-        throw new PlatformNotSupportedException(
-            "Hotkey.Register is not implemented on this platform");
+        return 0;
         #endif
     }
 
@@ -152,9 +198,47 @@ class Hotkey {
         }
         Hotkey.wantExit = 0;
         Hotkey.callback = null;
+        #elif LINUX || MACOS
+        if (Hotkey.registered == 0) { return; }
+        Hotkey.wantExit = 1;
+        Hotkey.NativeUnregister(Hotkey.hotkeyId);
+        for (int waited = 0; Hotkey.registered != 0 && waited < 500; waited = waited + 1) {
+            Thread.Sleep(1);
+        }
+        Hotkey.wantExit = 0;
+        Hotkey.callback = null;
         #else
-        throw new PlatformNotSupportedException(
-            "Hotkey.Unregister is not implemented on this platform");
+        return;
+        #endif
+    }
+
+    /// <summary>异步注销当前生效的热键并等待其线程退出（协程驱动，非阻塞等待）。</summary>
+    static async Task UnregisterAsync() {
+        #if WINDOWS
+        if (Hotkey.registered == 0) { return; }
+        Hotkey.wantExit = 1;
+        Hotkey.PostThreadMessageW(Hotkey.hotkeyThreadId, 0x0012 /*WM_QUIT*/,
+                                  0, 0);
+        int waited = 0;
+        while (Hotkey.registered != 0 && waited < 2000) {
+            await Task.Delay(10);
+            waited = waited + 10;
+        }
+        Hotkey.wantExit = 0;
+        Hotkey.callback = null;
+        #elif LINUX || MACOS
+        if (Hotkey.registered == 0) { return; }
+        Hotkey.wantExit = 1;
+        Hotkey.NativeUnregister(Hotkey.hotkeyId);
+        int waited = 0;
+        while (Hotkey.registered != 0 && waited < 2000) {
+            await Task.Delay(10);
+            waited = waited + 10;
+        }
+        Hotkey.wantExit = 0;
+        Hotkey.callback = null;
+        #else
+        return Task.CompletedTask;
         #endif
     }
 
@@ -186,6 +270,37 @@ class Hotkey {
         } finally {
             NativeMemory.Free(msg);
             Hotkey.UnregisterHotKey(0, Hotkey.hotkeyId);
+            Hotkey.registered = 0;
+        }
+    }
+
+    /// `needle` 在 `hay` 中从 `from` 起的第一个索引，找不到返回 -1。
+    static int IndexOf(string hay, string needle, int from) {
+        if (hay == null || needle == null) { return -1; }
+        if (from < 0) { from = 0; }
+        if (from > hay.Length) { return -1; }
+        return hay.IndexOf(needle, from);
+    }
+    #elif LINUX || MACOS
+    static void PosixHotkeyThreadEntry() {
+        int id = 0x5A4E;
+        Hotkey.hotkeyId = id;
+        if (Hotkey.NativeRegister(id, Hotkey.hotkeyMods, Hotkey.hotkeyVk) == 0) {
+            Hotkey.threadFailed = 1;
+            return;
+        }
+        Hotkey.registered = 1;
+        try {
+            while (Hotkey.wantExit == 0) {
+                int ev = Hotkey.NativeNextEvent(100);
+                if (ev == id) {
+                    if (Hotkey.callback != null) { Hotkey.callback(); }
+                } else if (ev < 0) {
+                    break;
+                }
+            }
+        } finally {
+            Hotkey.NativeUnregister(Hotkey.hotkeyId);
             Hotkey.registered = 0;
         }
     }

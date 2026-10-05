@@ -429,7 +429,7 @@ static bool arity_matches(const zan_ast_node_t *tr, const nr_type_t *t) {
  * `using System; using Gui;` has one arity-1 candidate (System.Linq.Action<T>)
  * and one arity-0 one (Gui.Action) -- counting by name alone reported a false
  * "ambiguous type" even though exactly one candidate can take the argument
- * list (B-ID38). An arity-matched reference stays untouched and the binder
+ * list. An arity-matched reference stays untouched and the binder
  * resolves it globally, like the qualified paths above already do via
  * arity_matches. A reference without type arguments keeps the name-based
  * count (a bare `Action` with two imported Actions IS ambiguous, C# CS0104). */

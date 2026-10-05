@@ -1,9 +1,9 @@
-"""End-to-end e2e for the server-collab collab-domain slice (A327-02/03/07).
+"""End-to-end e2e for the server-collab collab-domain slice.
 
 Drives /api/collab/* with three accounts and asserts the contract frozen in
-README "协作域契约（A327 提案）":
+README "协作域契约":
 
-  1. fresh DB, boot the exe (ZAN_NO_BG=1 while A321 is open — see e2e_im.py)
+  1. fresh DB, boot the exe (see e2e_im.py)
   2. admin cookie login -> create accounts B, C -> bind roles 1+2
   3. token login A (admin), B, C
   4. A conversations -> empty
@@ -129,8 +129,8 @@ def reset_db():
 def start_server(exe):
     os.makedirs(os.path.join(ROOT, "data"), exist_ok=True)
     log = open(os.path.join(ROOT, "data", "e2e_collab_server.log"), "ab")
-    # ZAN_NO_BG=1：A321（后台 ORM 协程与请求并发的响应损坏）修复前与 e2e_im.py
-    # 同口径；后台协程开启的实时链路验证是 A327-05 的独立脚本，不混在本契约里。
+    # ZAN_NO_BG=1：规避后台协程与请求并发异常，后台协程开启的实时链路验证由
+    # e2e_realtime.py 独立脚本覆盖，不混在本契约里。
     env = dict(os.environ)
     env["ZAN_NO_BG"] = "1"
     proc = subprocess.Popen([exe], cwd=ROOT, stdout=log, stderr=log, env=env)
@@ -341,7 +341,7 @@ def run_flow():
     st, env = call("GET", "/api/collab/members?conversationId=%d" % conv, token=ta)
     ok(len(data_of(env).get("members") or []) == 3, "members count 3 (no duplicate rows)")
 
-    # ---- messages: three-member send/receive (A327-07/08 slice) ----------
+    # ---- messages: three-member send/receive -----------------------------
     st, env = call("POST", "/api/collab/send",
                    {"conversationId": str(conv), "content": "会话消息一号-" + TS,
                     "clientRequestId": crid("m1")}, token=ta)
@@ -424,7 +424,7 @@ def run_flow():
                     "clientRequestId": crid("m5")}, token=ta)
     ok(st != 200 or (env or {}).get("code") != "0000", "empty content rejected")
 
-    # ---- attachments: upload / bind / download (A327-09) ------------------
+    # ---- attachments: upload / bind / download ----------------------------
     png = png_bytes(64, 32)
     k_att = crid("a1")
     st, env = upload("截图" + TS + ".png", png, ta, k_att)
@@ -484,7 +484,7 @@ def run_flow():
     # cross-tenant download（已随包代际退役，同第 7 步；附件租户闸现对
     # Tenant.Cur() 常量门，单租户下恒放行同租户行）
 
-    # ---- tasks: state machine, claim CAS, audit timeline (A327-10) --------
+    # ---- tasks: state machine, claim CAS, audit timeline ------------------
     k_t1 = crid("t1")
     st, env = call("POST", "/api/collab/taskcreate",
                    {"title": "任务一号" + TS, "conversationId": str(conv),
@@ -680,7 +680,7 @@ def run_flow():
                     "clientRequestId": crid("n2")}, token=tc)
     ok(st == 403, "non-member kick -> 403")
 
-    # ---- events: cursor replay + entitlement (A327-04) --------------------
+    # ---- events: cursor replay + entitlement ------------------------------
     st, env = call("GET", "/api/collab/events?after=0", token=ta)
     evs = data_of(env).get("events") or []
     ok(st == 200 and len(evs) > 0, "A events replay non-empty")

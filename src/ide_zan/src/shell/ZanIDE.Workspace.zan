@@ -13,6 +13,23 @@ using Gui.Backend;
 /// ZanIDE part: workspace scaffolding, the New Project template catalog
 /// and bodies, explorer tree scanning, tab management and the zanc
 /// toolchain (build / run / publish process plumbing).
+/// 发布目标平台选项强类型实体（封装目标ID、显示标签与选中状态，彻底消除平行列表）
+class PublishTargetOption {
+    public string id;
+    public string label;
+    public bool selected;
+
+    PublishTargetOption(string id, string label, bool selected) {
+        this.id = id != null ? id : "";
+        this.label = label != null ? label : "";
+        this.selected = selected;
+    }
+
+    static PublishTargetOption Of(string id, string label, bool selected) {
+        return new PublishTargetOption(id, label, selected);
+    }
+}
+
 partial class ZanIDE {
     // ---- workspace / scaffolding ----
 
@@ -1463,31 +1480,46 @@ partial class ZanIDE {
         return "";
     }
 
-    /// Reads persisted platform selection (parallel to PublishTargetIds) from
-    /// zan.proj, defaulting to the first (host-native) target when none match.
-    static List<int> ReadProjectPlatforms(string root) {
+    /// 读取项目中配置的发布目标平台列表，返回强类型 PublishTargetOption 实体列表
+    static List<PublishTargetOption> ReadProjectPlatformOptions(string root) {
         List<string> ids = ZanIDE.PublishTargetIds();
-        List<int> flags = new List<int>();
-        for (int z = 0; z < ids.Count; z = z + 1) { flags.Add(0); }
+        List<PublishTargetOption> opts = new List<PublishTargetOption>();
         string saved = ZanIDE.ProjField(root, "publishPlatforms");
         bool any = false;
-        if (saved != "") {
-            for (int k = 0; k < ids.Count; k = k + 1) {
+        for (int k = 0; k < ids.Count; k = k + 1) {
+            bool sel = false;
+            if (saved != "") {
                 if (ZanIDE.Has("," + saved + ",", "," + ids[k] + ",")) {
-                    flags[k] = 1;
+                    sel = true;
                     any = true;
                 }
             }
+            opts.Add(new PublishTargetOption(ids[k], ZanIDE.PublishTargetLabel(ids[k]), sel));
         }
         if (!any) {
             string content = "";
             string pj = root + "/zan.proj";
             if (File.Exists(pj)) { content = File.ReadAllText(pj); }
-            for (int k = 0; k < ids.Count; k = k + 1) {
-                if (ZanIDE.Has(content, ids[k])) { flags[k] = 1; any = true; }
+            for (int k = 0; k < opts.Count; k = k + 1) {
+                if (ZanIDE.Has(content, opts[k].id)) {
+                    opts[k].selected = true;
+                    any = true;
+                }
             }
         }
-        if (!any && ids.Count > 0) { flags[0] = 1; }
+        if (!any && opts.Count > 0) {
+            opts[0].selected = true;
+        }
+        return opts;
+    }
+
+    /// Reads persisted platform selection from zan.proj (兼容旧调用)
+    static List<int> ReadProjectPlatforms(string root) {
+        List<PublishTargetOption> opts = ZanIDE.ReadProjectPlatformOptions(root);
+        List<int> flags = new List<int>();
+        for (int i = 0; i < opts.Count; i = i + 1) {
+            flags.Add(opts[i].selected ? 1 : 0);
+        }
         return flags;
     }
 
@@ -1823,6 +1855,18 @@ partial class ZanIDE {
     /// list means nothing was started.
     static List<string> PublishPlatformsBegin(string root, List<int> sel,
                                                List<string> log) {
+        List<PublishTargetOption> opts = new List<PublishTargetOption>();
+        List<string> targetIds = ZanIDE.PublishTargetIds();
+        for (int i = 0; i < targetIds.Count; i = i + 1) {
+            bool isSel = i < sel.Count && sel[i] == 1;
+            opts.Add(new PublishTargetOption(targetIds[i], ZanIDE.PublishTargetLabel(targetIds[i]), isSel));
+        }
+        return ZanIDE.PublishPlatformsBeginWithOptions(root, opts, log);
+    }
+
+    /// 使用强类型 PublishTargetOption 实体列表启动发布编译流程
+    static List<string> PublishPlatformsBeginWithOptions(string root, List<PublishTargetOption> options,
+                                                         List<string> log) {
         List<string> exes = new List<string>();
         string p = ZanIDE.ProjectEntryPath(root);
         if (!File.Exists(p)) {
@@ -1889,7 +1933,6 @@ partial class ZanIDE {
         // Each id maps to zanc's supported path for this host: native for the
         // host OS, self-contained musl-static for Linux, --target cross for the
         // remaining arch.
-        List<string> ids = ZanIDE.PublishTargetIds();
         string hostId = ZanIDE.HostTargetId();
         // Items marked "embed" go into every target's executable; the copied
         // ones are staged per target by CopyPayload below.
@@ -1898,9 +1941,9 @@ partial class ZanIDE {
             log.Add(ZanIDE.T("> Embedding project items into the executable.",
                              "> 内嵌项目资源到可执行文件。"));
         }
-        for (int ti = 0; ti < ids.Count; ti = ti + 1) {
-            if (ti < sel.Count && sel[ti] == 1) {
-                string id = ids[ti];
+        for (int ti = 0; ti < options.Count; ti = ti + 1) {
+            if (options[ti].selected) {
+                string id = options[ti].id;
                 // One directory per target: a publish drops driver DLLs /
                 // dylibs and resources next to its executable, so sharing a
                 // directory would mix incompatible binaries of the same name.

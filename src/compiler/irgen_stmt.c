@@ -615,13 +615,12 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * just evaluate the initializer and store into it. */
         if (g->current_async_frame && g->current_async_slot_count > 0) {
             /* Bind this declaration to ITS OWN frame slot, keyed by the AST
-             * node the scan registered (A31x: one slot per declaration). A
+             * node the scan registered: one slot per declaration. A
              * name lookup is wrong whenever more than one same-named
              * declaration is frame-resident; name-dedup also let a `string k`
              * declared after a `foreach (string k ...)` bind through the
              * loop's borrowed-element slot, so its first capture-release
-             * freed the collection's internal key (async_shadow segfault,
-             * A321 transport corruption). */
+             * freed the collection's internal key. */
             local_var_t *pre = local_find_async_decl(locals, stmt);
             if (pre) {
                 int pre_idx = (int)(pre - locals->vars);
@@ -1014,7 +1013,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                                 fval = LLVMBuildFPExt(g->builder, fval, target_t, "ext");
                                             }
                                         }
-                                        /* A341: the object owns its rc fields --
+                                        /* The object owns its rc fields --
                                          * retain a borrowed value / release the
                                          * (null, zero-initialised) old occupant
                                          * instead of storing the pointer raw, and
@@ -1035,7 +1034,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                 }
                             }
                             local_add(locals, stmt->var_decl.name, alloca, type);
-                            /* A341: the constructed value's rc fields (set by
+                            /* The constructed value's rc fields (set by
                              * the ctor / the writes above) are owned here. */
                             if (type && type->kind == TYPE_STRUCT &&
                                 type_contains_collection_rc(g, type, 0))
@@ -1292,7 +1291,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     stmt->var_decl.initializer, locals);
             } else if (type && type->kind == TYPE_STRUCT &&
                        type_contains_collection_rc(g, type, 0)) {
-                /* A341: a struct initializer is a field-wise copy. A call/new
+                /* A struct initializer is a field-wise copy. A call/new
                  * result carries +1 per rc field (return retain) and the slot
                  * takes it over; any other shape (another local, a field
                  * read) is a borrowed copy and must retain its own +1s. */
@@ -1332,7 +1331,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (type && type->kind == TYPE_STRING && stmt->var_decl.initializer &&
             call_targets_extern(g, stmt->var_decl.initializer))
             locals->vars[locals->count - 1].opaque_string = 1;
-        /* A341: an owning struct slot -- scope exit and field writes manage
+        /* An owning struct slot -- scope exit and field writes manage
          * the rc fields inside its aggregate (see the init store above). */
         if (type && type->kind == TYPE_STRUCT &&
             LLVMGetTypeKind(llvm_type) == LLVMStructTypeKind &&
@@ -1533,7 +1532,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * and leaves the SSA value behind. The spill goes to the heap
              * frame's RETSPILL slot: an entry alloca dies here, because the
              * entry block re-executes on the next $resume invocation and the
-             * reload would read a fresh, uninitialized stack slot (B-ID19). */
+             * reload would read a fresh, uninitialized stack slot. */
             if (g->finally_count > 0) {
                 if (ri) {
                     LLVMValueRef ri_slot = LLVMBuildStructGEP2(g->builder,
@@ -1589,7 +1588,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                        type_contains_collection_rc(g, ret_type, 0) &&
                        !expr_yields_owned_rc_value(g, stmt->ret.value, locals) &&
                        !conv_ret) {
-                /* A341: a returned struct must carry +1 per rc field (the
+                /* A returned struct must carry +1 per rc field (the
                  * receiver releases them); a borrowed copy of an owning local
                  * retains here, before the exit release below consumes the
                  * local's own count. A call/new result already owns its +1s
@@ -1761,7 +1760,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         emit_stmt(g, stmt->while_stmt.body, locals);
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
             emit_release_owned_locals_from(g, locals, body_start);
-            /* back-edge cooperative preemption (B-ID44): inside an async fn
+            /* back-edge cooperative preemption: inside an async fn
              * this plants the poll/requeue site; outside it is a no-op. */
             if (!emit_async_preempt_site(g, cond_bb))
                 LLVMBuildBr(g->builder, cond_bb);
@@ -1783,8 +1782,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     case AST_FOR_STMT: {
         int for_start = locals->count;
         if (stmt->for_stmt.init) emit_stmt(g, stmt->for_stmt.init, locals);
-        /* B-ID33: variables declared in the init clause capture per iteration
-         * (Go 1.22). A closure created in the body takes a fresh cell holding
+        /* Variables declared in the init clause capture per iteration.
+         * A closure created in the body takes a fresh cell holding
          * the variable's value at capture time (see emit_closure_record), so
          * storing delegates in a loop captures 0, 1, 2 instead of three
          * references to the one loop-carried cell that ends at 3. The loop
@@ -1841,7 +1840,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         LLVMPositionBuilderAtEnd(g->builder, step_bb);
         if (stmt->for_stmt.step) emit_expr(g, stmt->for_stmt.step, locals);
-        /* back-edge cooperative preemption (B-ID44): the step already ran, so
+        /* back-edge cooperative preemption: the step already ran, so
          * the resume path re-enters at the condition; no-op outside async. */
         if (!emit_async_preempt_site(g, cond_bb))
             LLVMBuildBr(g->builder, cond_bb);
@@ -2377,12 +2376,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMBasicBlockRef re_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
                         re[ri].nm);
                     LLVMPositionBuilderAtEnd(g->builder, re_bb);
-                    /* A300: this edge is a longjmp landing -- control re-enters
+                    /* This edge is a longjmp landing -- control re-enters
                      * the function from OUTSIDE the CFG, so every SSA value
                      * dominating here is unknown to the optimizer and -O2
                      * SROA materializes the catch phi's incoming values on
-                     * this edge as null/undef (observed: `this` = null in the
-                     * catch body, then releases of garbage). The stack allocas
+                     * this edge as null/undef. The stack allocas
                      * PHYSICALLY hold the live values: a plain-frame throw in
                      * this invocation longjmps with them intact, and a child
                      * coroutine's exception re-enters through the resumed
@@ -2391,8 +2389,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                      * this edge instead of folding to undef. This covers ALL
                      * slot types: an int slot (e.g. a loop counter live across
                      * the await) gets the same undef phi incoming, which made
-                     * the enclosing loop condition UB (observed: the loop ran
-                     * unbounded). The copy is refcount-neutral for ARC slots. */
+                     * the enclosing loop condition UB. The copy is refcount-neutral for ARC slots. */
                     {
                         for (int si = 0; si < g->current_async_slot_count; si++) {
                             LLVMTypeRef sty = g->current_async_slots[si].llvm;
@@ -2521,7 +2518,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * suspension the scheduler pump interleaved other coroutines on the
          * same thread-global temp stack — the depth live at re-entry belongs
          * to whoever ran last, and a mark below the real boundary released
-         * the awaiter chain's live registrations (A318). A plain-frame
+         * the awaiter chain's live registrations. A plain-frame
          * thrower already unwound to this same mark before its longjmp
          * (emit_eh_unwind_to_handler), so for it this stays the no-op it
          * always was. */
@@ -2791,7 +2788,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         emit_stmt(g, stmt->while_stmt.body, locals);
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
             emit_release_owned_locals_from(g, locals, body_start);
-            /* back-edge cooperative preemption (B-ID44): resume re-tests the
+            /* back-edge cooperative preemption: resume re-tests the
              * condition; no-op outside async fns. */
             if (!emit_async_preempt_site(g, cond_bb))
                 LLVMBuildBr(g->builder, cond_bb);

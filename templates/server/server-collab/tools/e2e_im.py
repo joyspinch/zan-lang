@@ -129,14 +129,10 @@ def reset_db():
 def start_server(exe):
     os.makedirs(os.path.join(ROOT, "data"), exist_ok=True)
     log = open(os.path.join(ROOT, "data", "e2e_im_server.log"), "ab")
-    # ZAN_NO_BG=1：不启 CalendarRemind/MessageRelay 后台协程。已知缺陷
-    # （见 TASKS.md A3xx 挂账）：后台 ORM 协程与请求并发时，偶发响应
-    # 被未初始化内存覆盖（客户端看到 BadStatusLine \0 块 / 连接被掐），
-    # 疑似编译器 A318（plain 帧展开槽 garbage）经由长寿命循环协程触发。
-    # 本脚本断言的是 IM 业务契约，在缺陷修复前跳过后台协程以稳定判定。
+    # ZAN_NO_BG=1：不启 CalendarRemind/MessageRelay 后台协程。
+    # 默认跳过后台协程以保持环境极简、稳定判定业务契约；
+    # 显式设 ZAN_NO_BG=0 可连后台协程一起测试。
     env = dict(os.environ)
-    # 默认仍跳过后台协程（保守稳定判定）；显式设 ZAN_NO_BG=0 可连后台
-    # 协程一起压——A31x 帧槽根修后此形态已实跑通过。
     env["ZAN_NO_BG"] = os.environ.get("ZAN_NO_BG", "1")
     proc = subprocess.Popen([exe], cwd=ROOT, stdout=log, stderr=log, env=env)
     if not wait_port():

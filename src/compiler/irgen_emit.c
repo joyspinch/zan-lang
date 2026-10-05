@@ -821,7 +821,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMValueRef res_this = NULL;
         if (!is_static) {
             res_this = LLVMBuildAlloca(g->builder, param_types[0], "this");
-            /* defined from entry, same reason as the param allocas (A300):
+            /* defined from entry, same reason as the param allocas:
              * co.exc's cleanup releases `this` from this alloca and the load
              * must not be undef before the first state block reloads it */
             if (LLVMGetTypeKind(param_types[0]) == LLVMPointerTypeKind)
@@ -835,7 +835,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             zan_ast_node_t *param = member->method_decl.params.items[k];
             LLVMTypeRef pty = param_types[k + param_offset];
             LLVMValueRef pa = LLVMBuildAlloca(g->builder, pty, "p");
-            /* pointer-shaped param slots are defined from entry too (A300):
+            /* pointer-shaped param slots are defined from entry too:
              * the ramp stores the incoming args into the frame before the
              * first suspension, so these allocas are always written on the
              * dispatch path -- but co.exc can also fire from the EH re-arm
@@ -886,15 +886,15 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
              * node (local_find_async_decl) instead of by name. */
             locals->vars[locals->count - 1].async_decl = w->alocals[k].decl;
             /* Every pointer-shaped frame slot is null-initialized HERE, in the
-             * entry block, regardless of arc ownership (A300): entry statically
+             * entry block, regardless of arc ownership: entry statically
              * dominates the co.exc landing pad (longjmp is not a CFG edge, so
              * the optimizer cannot assume the landing pad is unreachable from
              * the entry), which means the slot is never undefined there. The
              * co.exc cleanup releases every owned local from these allocas;
              * with no init, -O2 folded the loaded release operand to `ptr
              * undef` whose registers happened to hold system addresses --
-             * free()ing them corrupted the heap and any later malloc crashed
-             * (the publish IDE's startup crash). Owned slots additionally need
+             * free()ing them corrupted the heap and any later malloc crashed.
+             * Owned slots additionally need
              * the init so a `return` lexically preceding the declaration (an
              * early exit at the top of a loop whose body declares the local
              * after an await) still releases the value a prior iteration
@@ -1336,8 +1336,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                 if (strncmp(ext_name, "zan_gate_", 9) == 0) {
                     g->uses_socket_async = true;
                 }
-                if (strncmp(ext_name, "zan_timer_", 10) == 0 ||
-                    strncmp(ext_name, "swoole_timer_", 13) == 0) {
+                if (strncmp(ext_name, "zan_timer_", 10) == 0) {
                     g->uses_timer_runtime = true;
                 }
                 if (strncmp(ext_name, "zan_embed_", 10) == 0) {
@@ -1862,7 +1861,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
             box_captured_parameter(g, locals, param, pt,
                                    param_types[k + param_offset], pv,
                                    member->method_decl.body);
-            /* A341: a struct param is a by-value copy whose rc fields alias
+            /* A struct param is a by-value copy whose rc fields alias
              * the caller's refcounts. Retain them on entry (the copy is an
              * owning borrow) so the scope-exit field release below releases
              * only what this frame took; without it either the copy's writes
@@ -2601,7 +2600,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
         local_add(locals, param->param.name, param_alloca, pt);
         box_captured_parameter(g, locals, param, pt, param_types[pi], pv,
                                member->method_decl.body);
-        /* A341: same by-value struct copy rule as the unspecialized binding
+        /* Same by-value struct copy rule as the unspecialized binding
          * site above -- entry-retain the rc fields the copy aliases. */
         if (!locals->vars[locals->count - 1].box_cell && pt &&
             pt->kind == TYPE_STRUCT &&
@@ -3195,16 +3194,32 @@ int zan_irgen_prune_extern_libs(zan_irgen_t *g) {
 }
 
 bool zan_irgen_defines_prefix(zan_irgen_t *g, const char *prefix) {
+    if (!g || !prefix) return false;
+    for (int i = 0; i < g->prefix_cache_count; i++) {
+        if (strcmp(g->prefix_cache[i], prefix) == 0)
+            return g->prefix_cache_val[i];
+    }
+    if (!g->mod) return false;
     size_t plen = strlen(prefix);
     if (!plen) return false;
+    bool found = false;
     for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
          fn = LLVMGetNextFunction(fn)) {
         if (LLVMCountBasicBlocks(fn) == 0) continue; /* declaration only */
         size_t nlen = 0;
         const char *nm = LLVMGetValueName2(fn, &nlen);
-        if (nm && nlen >= plen && memcmp(nm, prefix, plen) == 0) return true;
+        if (nm && nlen >= plen && memcmp(nm, prefix, plen) == 0) {
+            found = true;
+            break;
+        }
     }
-    return false;
+    if (g->prefix_cache_count < 32) {
+        snprintf(g->prefix_cache[g->prefix_cache_count],
+                 sizeof(g->prefix_cache[0]), "%s", prefix);
+        g->prefix_cache_val[g->prefix_cache_count] = found;
+        g->prefix_cache_count++;
+    }
+    return found;
 }
 
 /* wasm32 libc adapters (see zan_irgen_write_obj): define `fn` (which must be

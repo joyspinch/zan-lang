@@ -1857,8 +1857,8 @@ static zan_ast_node_t *parse_unary_inner(zan_parser_t *p);
 /* Report one expression-nesting trip and return the placeholder error node.
  * The report is emitted only once per translation unit: once the guard trips,
  * error recovery keeps re-descending the same over-deep expression, and one
- * report per descent turned a 30k-deep parenthesis nest into 6 MB of the same
- * error (A280). */
+ * report per descent turned a 30k-deep parenthesis nest into megabytes of the same
+ * error. */
 static zan_ast_node_t *parser_expr_too_deep(zan_parser_t *p) {
     if (!p->expr_depth_reported) {
         p->expr_depth_reported = true;
@@ -2130,9 +2130,9 @@ static zan_ast_node_t *parse_expression(zan_parser_t *p) {
     /* Guard the low-precedence right recursion here: `a = a = ... = 1` and
      * `c ? a : c ? b : ...` re-enter this function directly (for the
      * assignment RHS and the conditional's branches), never through
-     * parse_unary, so expr_depth alone left them unbounded and a 100k-deep
-     * chain killed the compiler with STATUS_STACK_OVERFLOW and no output
-     * (A280). The count is kept apart from expr_depth so the existing
+     * parse_unary, so expr_depth alone left them unbounded and an extreme-depth
+     * chain killed the compiler with STATUS_STACK_OVERFLOW and no output.
+     * The count is kept apart from expr_depth so the existing
      * 256-level parenthesis/unary budget is unchanged. */
     if (p->expr_tail_depth >= ZAN_PARSER_MAX_EXPR_DEPTH)
         return parser_expr_too_deep(p);

@@ -562,7 +562,7 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
          * child inherits our stdout. Its "Compiled N files -> ..." progress
          * line would otherwise land on the caller's stdout -- the machine
          * channel `--emit-ir` writes the IR to -- making two emissions of
-         * the same source differ (A313). */
+         * the same source differ. */
         /* --no-packages: the generator's closure is pinned to the stdlib.
          * Package files skip the pull-in live-name gate, so a user package
          * would join this nested --no-gen compile unconditionally -- and a

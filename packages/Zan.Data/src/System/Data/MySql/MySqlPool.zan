@@ -33,6 +33,7 @@ class MySqlPool {
     string user;
     string password;
     PoolCore<MySqlConnection> core;
+    string lastOpenError;
 
     MySqlPool(string host, int port, string database, string user,
             string password, int maxSize) {
@@ -42,6 +43,7 @@ class MySqlPool {
         this.user = user;
         this.password = password;
         this.core = new PoolCore<MySqlConnection>(maxSize);
+        this.lastOpenError = "";
     }
 
     /// <summary>新建一条 MySQL 连接（池的建连回调）。</summary>
@@ -51,6 +53,7 @@ class MySqlPool {
                                                          this.database, this.user,
                                                          this.password);
         } catch (Exception ex) {
+            this.lastOpenError = ex.Message;
             return null;
         }
     }
@@ -85,19 +88,29 @@ class MySqlPool {
             if (this.core.TryReserve()) {
                 MySqlConnection opened = await this.OpenOne();
                 if (opened == null || !opened.IsConnected()) {
+                    if (opened != null) {
+                        opened.Close();
+                    }
                     /* 契约：借出失败折进 null（下面随即记退避）。根因只在
                        失败 episode 的首条记录诊断，退避期内零星重试静默。 */
                     if (!this.core.OpenFailing()) {
-                        string why = opened.lastError;
+                        string why = opened != null ? opened.lastError : this.lastOpenError;
                         Console.WriteLine("[mysqlpool] connect failed: "
                             + (why.Length > 0 ? why
                                 : "refused, timeout, or auth rejected"));
                     }
+                    this.lastOpenError = "";
                     this.core.NoteOpenFailed();
                     this.core.UndoReserve();
                     return null;
                 }
+                if (this.core.IsClosed()) {
+                    opened.Close();
+                    this.core.UndoReserve();
+                    return null;
+                }
                 this.core.NoteOpenOk();
+                this.lastOpenError = "";
                 this.core.Borrow(opened);
                 return opened;
             }

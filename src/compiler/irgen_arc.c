@@ -348,7 +348,7 @@ static void emit_collection_value_release(zan_irgen_t *g, zan_type_t *type,
     }
 }
 
-/* ---- A341: struct value slots that embed rc-managed fields ----------------
+/* ---- struct value slots that embed rc-managed fields ----------------
  * `is_rc_managed_type` only ever matches pointer shapes, so a value struct
  * holding a `string`/List/delegate field had no lifecycle at all: every field
  * write was a raw store (leaking the old occupant, aliasing a borrowed one)
@@ -953,7 +953,7 @@ static LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
         LLVMValueRef site_iptr = LLVMBuildBitCast(b, site_ptr, LLVMPointerType(i64, 0), "siptr");
         LLVMValueRef site = LLVMBuildLoad2(b, i64, site_iptr, "site");
         /* leak tracking: one fewer live object, and one fewer at this site.
-         * B-ID17: the table is reached through its pointer global. */
+         * The table is reached through its pointer global. */
         emit_leak_counter_add(g, g->g_live, -1);
         LLVMValueRef ltbl = LLVMBuildLoad2(b, LLVMPointerType(i64, 0),
             g->g_site_live, "ltbl");
@@ -1245,7 +1245,7 @@ static void emit_all_class_releases(zan_irgen_t *g) {
 /* Create the live-count and site-name arrays behind their pointer globals and
  * publish the site count for every runtime index check. Both arrays start
  * zeroed -- instrumentation mutates them at run time; nothing to fill here.
- * B-ID17: runs at finalize once leak_site_count is final; check-leaks only. */
+ * Runs at finalize once leak_site_count is final; check-leaks only. */
 static void emit_site_live_tables(zan_irgen_t *g) {
     if (g->desc_hdr || !g->g_site_live || !g->g_site_count) return;
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -1269,7 +1269,7 @@ static void emit_site_live_tables(zan_irgen_t *g) {
 /* Fill the per-site destructor table (reached through the __zan_site_dtors
  * pointer global) with the concrete per-class destructor recorded for that
  * allocation site, so zan_rt_release_dyn can dispatch on runtime type. Must
- * run after emit_all_class_releases (all destructors declared). B-ID17: the
+ * run after emit_all_class_releases (all destructors declared). The
  * array is created here with the real site count -- the pointer global's
  * target could not be typed during emission. Descriptor builds keep no table:
  * the descriptor's dtor field is filled by emit_arc_desc_init below. */
@@ -1306,7 +1306,7 @@ static void emit_site_dtor_table(zan_irgen_t *g) {
  * null. `x is T` (T a strict base of the static type) walks it to test the
  * object's runtime class against the target. Collections contribute their
  * intrinsic name (List/StringBuilder/Dict). Runs at finalize, after all sites
- * are registered; B-ID17 sizes the array to the real site count. */
+ * are registered; sizes the array to the real site count. */
 static void emit_site_tyname_table(zan_irgen_t *g) {
     if (!g->site_syms || g->desc_hdr) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);

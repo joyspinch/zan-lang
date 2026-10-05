@@ -73,7 +73,7 @@ mkdir -p "$X_OBJS_DIR"
 # Locate static archives for X11, Xau, xcb
 find_static_lib() {
     local name="$1"
-    for d in "/usr/lib/$TRIPLET" "/usr/lib" "/usr/local/lib"; do
+    for d in "/tmp/arm64_x11/root/usr/lib/$TRIPLET" "/usr/lib/$TRIPLET" "/usr/lib" "/usr/local/lib"; do
         if [ -f "$d/$name" ]; then
             echo "$d/$name"
             return 0

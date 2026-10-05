@@ -3231,8 +3231,8 @@ static LLVMValueRef emit_property_getter_call(zan_irgen_t *g,
         if (g->functions[fi].sym == getter) {
             LLVMValueRef rval = recv;
             /* An instance accessor reached with no receiver means the caller
-             * failed to resolve implicit `this`; LLVMTypeOf(NULL) crashed the
-             * compiler (A272). Report it instead. */
+             * failed to resolve implicit `this`; LLVMTypeOf(NULL) would crash the
+             * compiler. Report it instead. */
             if (!is_static && !rval) {
                 zan_diag_emit(g->diag, DIAG_ERROR,
                               obj_ast ? obj_ast->loc : zan_loc(0, 0, 0, 0),
@@ -3306,7 +3306,7 @@ static void emit_property_setter_call(zan_irgen_t *g, zan_symbol_t *setter,
             LLVMValueRef rval = recv;
             /* Same NULL-receiver guard as the getter: an instance setter with
              * no receiver would crash LLVMTypeOf and, if it got past, hand a
-             * NULL first argument to the call (A272). */
+             * NULL first argument to the call. */
             if (!is_static && !rval) {
                 zan_diag_emit(g->diag, DIAG_ERROR,
                               obj_ast ? obj_ast->loc : zan_loc(0, 0, 0, 0),
@@ -5331,7 +5331,7 @@ binding_lowered:
                 /* ARC: release the previous occupant and retain the new one. */
                 emit_rc_capture_local(g, local->type, local->alloca, right, expr->binary.right, locals);
             } else if (local && local->struct_rc) {
-                /* A341: whole-struct assignment into an owning value slot --
+                /* Whole-struct assignment into an owning value slot --
                  * field-wise capture (retain borrowed fields, release the old
                  * occupant's fields). */
                 emit_struct_local_capture(g, local->type, local->alloca, right,
@@ -5438,7 +5438,7 @@ binding_lowered:
                                                 (fsym->modifiers & MOD_WEAK) ? 1 : 0);
                         } else if (fst && fst->kind == TYPE_STRUCT &&
                                    type_contains_collection_rc(g, fst, 0)) {
-                            /* A341: `this.inner = v` where inner is a struct
+                            /* `this.inner = v` where inner is a struct
                              * with rc fields -- the storage (borrowed `this`
                              * pointing into the owner's frame) owns the old
                              * occupant's +1s; hand the new value its own. */
@@ -6113,7 +6113,7 @@ binding_lowered:
                                                     (afsym->modifiers & MOD_WEAK) ? 1 : 0);
                             } else if (aft && aft->kind == TYPE_STRUCT &&
                                        type_contains_collection_rc(g, aft, 0)) {
-                                /* A341: `x.inner = v` on a struct/class slot --
+                                /* `x.inner = v` on a struct/class slot --
                                  * the field's +1s belong to the enclosing
                                  * storage, so capture them like a value store. */
                                 emit_struct_field_capture(g, aft, fptr, right,
@@ -6279,8 +6279,8 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
              * accessor is a static method), an *instance* property reached by
              * bare name is `this.Prop` and its getter/setter need the implicit
              * `this` value. Testing the getter first sent instance properties
-             * down the static path with recv == NULL, which crashed the
-             * compiler inside LLVMTypeOf (A272). */
+             * down the static path with recv == NULL, which would crash the
+             * compiler inside LLVMTypeOf. */
             zan_symbol_t *fs = get_field_sym(g->current_type_sym, operand->ident.name);
             LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fs, NULL);
             zan_symbol_t *getter = gv ? property_getter_sym(g, fs) : NULL;
@@ -6516,7 +6516,7 @@ static int interp_format_to_printf(const zan_istr_t *spec, bool is_float,
         if (s[i] >= '0' && s[i] <= '9') {
             /* saturate instead of overflowing `int` — compiler-level UB —
              * on an absurd spec like {v:D99999999999999}; oversize counts
-             * are rejected per code below (B-ID76) */
+             * are rejected per code below */
             if (digits <= 9999) digits = digits * 10 + (s[i] - '0');
         }
     }
@@ -6777,10 +6777,7 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
         /* memcpy each part by its exact managed length. strcpy/strcat stop
          * at the first embedded NUL, but every lens[i] counts the whole
          * part (NUL-aware emit_string_length for string holes) and
-         * total_len is stamped as the result length — a `$"v={raw};"` with
-         * a raw FFI/zero-copy byte in the hole lost everything after the
-         * NUL and grew garbage bytes instead (B-ID61; same family as the
-         * `+` concat fix that introduced emit_str_concat_n). */
+         * total_len is stamped as the result length. */
         LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
         LLVMTypeRef memcpy_type = LLVMFunctionType(i8ptr,
             (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
@@ -7292,7 +7289,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
          * implicit sequence. It runs in int64: the old `(int)int_val + 1`
          * wrapped a member declared at INT32_MAX into signed overflow UB
          * in the compiler itself; the return truncates through uint32 so
-         * the corner wraps like two's complement (C#) instead (B-ID60). */
+         * the corner wraps like two's complement (C#) instead. */
         if (expr->member.object->kind == AST_IDENTIFIER) {
             zan_symbol_t *enum_sym = zan_binder_lookup(g->binder, expr->member.object->ident.name);
             if (enum_sym && enum_sym->kind == SYM_ENUM) {
@@ -9941,7 +9938,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                         }
                                     }
                                     /* ARC: one field-store contract for every
-                                     * object-init write (A341): retain a
+                                     * object-init write: retain a
                                      * borrowed value / release the previous
                                      * occupant (the ctor may have populated RC
                                      * fields: `new Label { Text = "x" }` -- a
@@ -10595,7 +10592,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             return LLVMConstInt(di64, 0, 0);
         }
 
-        /* await Task.JoinWait(entry) — event-driven join suspension (B-ID56).
+        /* await Task.JoinWait(entry) — event-driven join suspension.
          * zan_join_wait2 returns 0 = suspended (runtime readies us via the
          * untrack hook when the join fires), 1 = already satisfied (fall
          * through to the resume state), 2 = unsupported (no ready hook or not
@@ -10772,8 +10769,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
          * reactor races the recv against the deadline and delivers whichever
          * comes first — the byte count (0 = peer close) or -1 for timeout —
          * into the frame's RESULT slot before re-readying. This is what makes
-         * Socket.RecvAsync(sock, size, timeout) event-driven: the old Zan-side
-         * 1→16ms poll loop flooded the ready queue under bursts (A268(b)). */
+         * Socket.RecvAsync(sock, size, timeout) event-driven. */
         {
             if (is_call_to(expr->await_expr.expr, "Socket", "RecvToOv") &&
                 expr->await_expr.expr->call.args.count == 4) {
@@ -11367,27 +11363,53 @@ static LLVMValueRef emit_wasm_cb_thunk(zan_irgen_t *g, LLVMValueRef fn) {
     if (existing && LLVMIsAFunction(existing)) return existing;
     LLVMTypeRef i32T = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64T = LLVMInt64TypeInContext(g->ctx);
-    LLVMTypeRef thunk_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-                                            &i32T, 1, 0);
+    unsigned nparams = LLVMCountParams(fn);
+    LLVMTypeRef *param_types = (LLVMTypeRef *)malloc((nparams > 0 ? nparams : 1) * sizeof(LLVMTypeRef));
+    for (unsigned i = 0; i < nparams; i++) {
+        param_types[i] = i32T;
+    }
+    LLVMTypeRef ret_ty = LLVMGetReturnType(LLVMGlobalGetValueType(fn));
+    LLVMTypeRef thunk_ty = LLVMFunctionType(ret_ty, param_types, nparams, 0);
+    free(param_types);
+
     LLVMValueRef thunk = LLVMAddFunction(g->mod, name, thunk_ty);
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, thunk, "entry");
     LLVMPositionBuilderAtEnd(g->builder, bb);
-    LLVMValueRef arg64 = LLVMBuildZExt(g->builder, LLVMGetParam(thunk, 0),
-                                       i64T, "arg64");
-    unsigned nparams = LLVMCountParams(fn);
+
     LLVMTypeRef fn_ty = LLVMGlobalGetValueType(fn);
-    if (nparams >= 1) {
-        LLVMValueRef args[1];
-        args[0] = (LLVMGetTypeKind(LLVMTypeOf(arg64)) == LLVMIntegerTypeKind &&
-                   LLVMGetIntTypeWidth(LLVMTypeOf(LLVMGetParam(fn, 0))) == 32)
-                      ? LLVMBuildTrunc(g->builder, arg64, i32T, "arg32")
-                      : arg64;
-        LLVMBuildCall2(g->builder, fn_ty, fn, args, 1, "");
-    } else {
-        LLVMBuildCall2(g->builder, fn_ty, fn, NULL, 0, "");
+    LLVMValueRef *call_args = NULL;
+    if (nparams > 0) {
+        call_args = (LLVMValueRef *)malloc(nparams * sizeof(LLVMValueRef));
+        for (unsigned i = 0; i < nparams; i++) {
+            LLVMValueRef p = LLVMGetParam(thunk, i);
+            LLVMTypeRef target_param_ty = LLVMTypeOf(LLVMGetParam(fn, i));
+            if (LLVMGetTypeKind(target_param_ty) == LLVMIntegerTypeKind) {
+                unsigned w = LLVMGetIntTypeWidth(target_param_ty);
+                if (w == 64) {
+                    call_args[i] = LLVMBuildZExt(g->builder, p, i64T, "arg64");
+                } else if (w == 32) {
+                    call_args[i] = p;
+                } else if (w < 32) {
+                    call_args[i] = LLVMBuildTrunc(g->builder, p, target_param_ty, "argtrunc");
+                } else {
+                    call_args[i] = LLVMBuildZExt(g->builder, p, target_param_ty, "argext");
+                }
+            } else if (LLVMGetTypeKind(target_param_ty) == LLVMPointerTypeKind) {
+                call_args[i] = LLVMBuildIntToPtr(g->builder, p, target_param_ty, "argptr");
+            } else {
+                call_args[i] = p;
+            }
+        }
     }
-    LLVMBuildRetVoid(g->builder);
+    LLVMValueRef ret_val = LLVMBuildCall2(g->builder, fn_ty, fn, call_args, nparams, "");
+    if (call_args) free(call_args);
+
+    if (LLVMGetTypeKind(ret_ty) == LLVMVoidTypeKind) {
+        LLVMBuildRetVoid(g->builder);
+    } else {
+        LLVMBuildRet(g->builder, ret_val);
+    }
     LLVMPositionBuilderAtEnd(g->builder, saved_bb);
     return thunk;
 }
@@ -11603,7 +11625,7 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
         LLVMConstInt(i32, 0, 0), "is.seq");
     LLVMBuildCondBr(g->builder, seq, true_bb, false_bb);
 
-    /* out-of-range site index -> not a T. B-ID17: the bound is the published
+    /* out-of-range site index -> not a T. The bound is the published
      * site count loaded at run time (the table is sized at finalize, after
      * this check is emitted; site indices are assigned module-wide across
      * every `new` site). The per-site name list is null for any
@@ -12012,9 +12034,9 @@ typedef struct {
      * reference to its cell, not a copy of its value, so writes on either
      * side are writes to the one variable. */
     int          boxed;
-    /* B-ID33: the boxed local is a `for`-init variable, so the record takes a
+    /* The boxed local is a `for`-init variable, so the record takes a
      * fresh cell holding its value at capture time instead of retaining the
-     * shared loop cell (Go 1.22 per-iteration capture). */
+     * shared loop cell (per-iteration capture). */
     int          per_iter;
 } lambda_capture_t;
 
@@ -12539,8 +12561,8 @@ static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
         if (caps[i].boxed) {
             LLVMValueRef cell = caps[i].slot;
             if (caps[i].per_iter) {
-                /* B-ID33: a `for`-init variable is captured per iteration
-                 * (Go 1.22): build a fresh cell holding the variable's value
+                /* A `for`-init variable is captured per iteration:
+                 * build a fresh cell holding the variable's value
                  * at capture time instead of retaining the one loop-carried
                  * cell, so `for (int i = 0; i < 3; i++) fs.Add(() => i);`
                  * captures 0, 1, 2 rather than three references to a cell

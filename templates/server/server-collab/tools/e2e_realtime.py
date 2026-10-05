@@ -1,7 +1,6 @@
-"""End-to-end e2e for the collab realtime path (A327-05) — PRODUCTION config.
+"""End-to-end e2e for the collab realtime path — PRODUCTION config.
 
-Unlike e2e_im.py / e2e_collab.py (which boot with ZAN_NO_BG=1 while A321 is
-open), this script boots the server WITH background coroutines
+This script boots the server WITH background coroutines
 (CalendarRemind / MessageRelay / CollabEventRelay) and the default 4 workers,
 then asserts the realtime contract:
 
@@ -9,7 +8,7 @@ then asserts the realtime contract:
   2. online delivery: A sends -> B receives `event: collab` frame carrying
      message.created within the 1s relay beat (+ slack)
   3. transport cleanliness: a burst of API calls while relays run must produce
-     zero corrupted responses (this is the A321 probe; anomalies are reported,
+     zero corrupted responses (anomalies are reported,
      never retried away)
   4. disconnect + catch-up: B drops, A sends 2, B reconnects and pulls
      events?after=<cursor> -> exactly the 2 missed message.created events
@@ -60,7 +59,7 @@ anomalies = []
 
 def call(method, path, data=None, token=None):
     """{code,msg,data} envelope -> (status, dict-or-None). One attempt only:
-    transport anomalies must be VISIBLE here (A321 probe), never retried away.
+    transport anomalies must be VISIBLE here, never retried away.
     Returns ("__anomaly__", reason) on transport failure."""
     req = urllib.request.Request(BASE + path, method=method)
     if token:
@@ -80,7 +79,7 @@ def call(method, path, data=None, token=None):
         anomalies.append("%s %s: %r" % (method, path, e))
         return 0, None
     if "\x00" in raw:
-        anomalies.append("%s %s: NUL bytes in response (A321 fingerprint)"
+        anomalies.append("%s %s: NUL bytes in response"
                          % (method, path))
         return st, None
     try:
@@ -177,7 +176,7 @@ def reset_db():
 def start_server(exe):
     """生产配置起服：不注入 ZAN_NO_BG —— 后台协程（CalendarRemind/MessageRelay/
     CollabEventRelay）全部开启，默认 4 worker。传输层异常在上面 call() 里
-    记账，绝不重试掩盖（这就是 A321 的探针口径）。"""
+    记账，绝不重试掩盖。"""
     os.makedirs(os.path.join(ROOT, "data"), exist_ok=True)
     log = open(os.path.join(ROOT, "data", "e2e_realtime_server.log"), "ab")
     env = dict(os.environ)
@@ -257,7 +256,7 @@ def main():
 
     print()
     if anomalies:
-        print("TRANSPORT ANOMALIES (%d) — A321 fingerprint:" % len(anomalies))
+        print("TRANSPORT ANOMALIES (%d):" % len(anomalies))
         for a in anomalies:
             print("  " + a)
     else:
@@ -359,7 +358,7 @@ def run_flow():
        "online frame is message.created with matching excerpt")
     cursor = int(online[0].get("eventId", "0")) if online else 0
 
-    # ---- 3. transport-cleanliness burst (A321 probe) ------------------------
+    # ---- 3. transport-cleanliness burst ------------------------------------
     burst_ok = True
     for i in range(15):
         path = ["/api/collab/conversations",

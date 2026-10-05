@@ -495,7 +495,7 @@ typedef struct {
     int open;
     int inuse;      /* operations that pinned `fp` for use outside the lock */
     FILE *dying;    /* a closed fp still pinned by an in-flight operation;
-                     * fclose'd by the last unpin (A284) */
+                     * fclose'd by the last unpin */
 } zan_fh_slot;
 static zan_fh_slot *g_fh_table = NULL;
 static uint32_t g_fh_cap = 0;
@@ -711,7 +711,7 @@ long long zan_file_close(long long handle) {
         s->open = 0;
         if (s->inuse > 0) {
             /* An operation is using this FILE* outside the lock: closing it
-             * now would be a use-after-free for that reader (A284). Hand it
+             * now would be a use-after-free for that reader. Hand it
              * to `dying`; the last unpin fclose's it. */
             s->dying = s->fp;
             s->fp = NULL;
@@ -878,7 +878,7 @@ long long zan_file_unlock(long long handle) {
     s->used = 0;
     s->gen = s->gen + 1;   /* a second unlock of the same value now fails */
     if (s->gen == 0) {
-        /* Same wrap policy as try_lock (B-ID84): a reset to 1 would
+        /* Same wrap policy as try_lock: a reset to 1 would
          * revalidate a surviving handle minted 2^32 locks ago. Retire the
          * slot instead -- used=2 makes zan_lk_index reject it and the
          * reserve scan skip it, exactly like try_lock's own wrap path.

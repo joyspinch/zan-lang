@@ -19,8 +19,8 @@ struct zan_parser {
                           * `c ? a : c ? b : ...`); those re-enter
                           * parse_expression directly, never through
                           * parse_unary, so expr_depth alone left them
-                          * unguarded and a 100k-deep chain killed the
-                          * compiler with STATUS_STACK_OVERFLOW (A280) */
+                          * unguarded and an extreme-depth chain killed the
+                          * compiler with STATUS_STACK_OVERFLOW */
     bool expr_depth_reported; /* the nesting guard reports once per unit: error
                                * recovery re-parses the same deep expression and
                                * would otherwise repeat it thousands of times

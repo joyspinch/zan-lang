@@ -968,12 +968,9 @@ static zan_irgen_t *g_di_emit_ctx = NULL;
  * one slot; aliasing different shapes would dispatch the wrong destructor.
  *
  * Check-leaks builds used to index fixed [4096 x ...] runtime tables keyed on
- * the site id, which made the number a hard compile-time ceiling (B-ID17: the
- * IDE's full 534-file input blew past it). The tables are now emitted at
- * finalize with the real site count and reached through pointer globals, so
- * nothing bounds the site count here anymore. Every other build (descriptor
- * mode, the default) stores a per-shape descriptor pointer in the object
- * header and its host-side site arrays grow dynamically. */
+ * the site id, which made the number a hard compile-time ceiling.
+ * The tables are now emitted at finalize with the real site count and reached
+ * through pointer globals, so nothing bounds the site count here anymore. */
 
 static bool types_equal(zan_type_t *a, zan_type_t *b);
 static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
@@ -1162,7 +1159,7 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
             if (existing_sym == sym && types_equal(existing_inst, inst)) return i;
         }
     }
-    /* B-ID17: the runtime tables are sized to the real site count at
+    /* The runtime tables are sized to the real site count at
      * finalize, so there is no cap to enforce here anymore; the host-side
      * metadata arrays just grow. */
     if (!site_arrays_reserve(g, g->leak_site_count + 1) ||
@@ -1827,8 +1824,8 @@ static void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn,
 }
 
 /* Emit one __zan_arc_trace_ev call: tag letter, object, post-op refcount,
- * allocation-site index, and the immediate caller's return address (A355
- * diagnostic; the trace function itself gates printing on $ZAN_ARC_TRACE). */
+ * allocation-site index, and the immediate caller's return address
+ * (diagnostic; the trace function itself gates printing on $ZAN_ARC_TRACE). */
 static void emit_arc_trace_call(zan_irgen_t *g, LLVMValueRef ev_fn,
                                 const char *tag, LLVMValueRef obj,
                                 LLVMValueRef rc, LLVMValueRef site) {
@@ -1962,7 +1959,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i8p  = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         if (!g->desc_hdr) {
-            /* B-ID17: the site tables are emitted at finalize with the real
+            /* The site tables are emitted at finalize with the real
              * site count, so instrumentation reaches them through pointer
              * globals (a global's type is fixed at creation, long before the
              * count is known) and every runtime index check loads
@@ -2294,7 +2291,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMSetLinkage(g_nodes, LLVMInternalLinkage);
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
 
-        /* Preemption bookkeeping (B-ID44): __zan_co_quantum_us caches the
+        /* Preemption bookkeeping: __zan_co_quantum_us caches the
          * cooperative slice length (zan_co_quantum_ms * 1000, from the
          * linked timer runtime; 0 = disabled) and __zan_co_slice_start is
          * stamped by the dispatch path below, so zan_co_poll can decide
@@ -2303,12 +2300,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
          * Windows and would stretch the 2ms default to a clock tick. */
         LLVMValueRef g_slice_start = LLVMAddGlobal(g->mod, i64t, "__zan_co_slice_start");
         LLVMSetInitializer(g_slice_start, LLVMConstInt(i64t, 0, 0));
-        /* Poll clock-read gate (B-ID44(4)): zan_co_poll runs at every loop
+        /* Poll clock-read gate: zan_co_poll runs at every loop
          * back-edge, and the per-iteration clock call was ~85% of a compute
-         * loop's cost (probe: 23ns/iter -> 3.7ns/iter gated). The M:1 driver
-         * is single-threaded, so a plain global counter skips 255 of 256
-         * polls; the 2ms quantum overshoots by at most 256 iterations of
-         * ns-grade work. */
+         * loop's cost. The M:1 driver is single-threaded, so a plain global
+         * counter skips 255 of 256 polls; the 2ms quantum overshoots by at
+         * most 256 iterations of ns-grade work. */
         LLVMValueRef g_poll_tick = LLVMAddGlobal(g->mod, i64t, "__zan_co_poll_tick");
         LLVMSetInitializer(g_poll_tick, LLVMConstInt(i64t, 0, 0));
         LLVMSetLinkage(g_slice_start, LLVMInternalLinkage);
@@ -2318,7 +2314,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         /* extern long long zan_co_quantum_ms(void) / zan_co_precise_us(void):
          * both resolved from the linked timer runtime, which the driver
          * already depends on for zan_timer_delay. The timer heap's deadlines
-         * AND slice bookkeeping both run on precise_us (B-ID48). */
+         * AND slice bookkeeping both run on precise_us. */
         LLVMTypeRef now_type = LLVMFunctionType(i64t, NULL, 0, 0);
         LLVMValueRef co_quantum = LLVMAddFunction(g->mod, "zan_co_quantum_ms", now_type);
         LLVMValueRef precise_now = LLVMAddFunction(g->mod, "zan_co_precise_us", now_type);
@@ -2641,8 +2637,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             /* A wake-less pump turn is NOT quiescence while IO ops or
              * blocking jobs are still in flight: their completions (and a
              * blocking worker's wake packet that outlived its already-drained
-             * job) arrive through later pumps. Exiting here silently killed
-             * parked frames mid-program (A298); keep running until nothing is
+             * job) arrive through later pumps. Exiting here would terminate
+             * parked frames mid-program; keep running until nothing is
              * parked anywhere -- no ready work, no timer, no pending IO. */
             LLVMValueRef pend = zan_call2(g->builder,
                 g->rt_io_has_pending_type, g->rt_io_has_pending, NULL, 0,
@@ -2727,7 +2723,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef strcat_type = LLVMFunctionType(i8ptr, strcat_args, 2, 0);
     g->fn_strcat = LLVMAddFunction(g->mod, "strcat", strcat_type);
 
-    /* A355 diagnostic: per-event ARC trace for check-leaks builds. The events
+    /* Per-event ARC trace for check-leaks builds. The events
      * are printed only when ZAN_ARC_TRACE is set in the environment, so plain
      * --check-leaks runs stay quiet. Each event records the tag (A=alloc,
      * R=retain, r=release, D=release-dispatch), the object, its allocation
@@ -2986,7 +2982,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef dpp;
         if (!g->desc_hdr) {
             /* site-index mode (check-leaks): dispatch through the dtor table.
-             * B-ID17: the bound and the table pointer load at runtime -- the
+             * The bound and the table pointer load at runtime -- the
              * table is sized at finalize, after this code is emitted. */
             LLVMValueRef site = LLVMBuildLoad2(g->builder, i64, siptr, "site");
             LLVMValueRef bound = LLVMBuildLoad2(g->builder, i64,
@@ -3081,7 +3077,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
         if (g->check_leaks) {
             /* leak tracking: total + per-site count, and record the site name.
-             * B-ID17: tables are reached through pointer globals -- the arrays
+             * Tables are reached through pointer globals -- the arrays
              * behind them are created at finalize with the real site count. */
             emit_leak_counter_add(g, g->g_live, 1);
             LLVMValueRef ltbl = LLVMBuildLoad2(g->builder,
@@ -4277,15 +4273,15 @@ typedef struct {
      * assignment through the alias must route its capture-release to the slot
      * entry via this index rather than rely on its own ownership flags. */
     int frame_owner;
-    /* A341: 1 for a struct-typed slot whose aggregate embeds rc-managed
+    /* 1 for a struct-typed slot whose aggregate embeds rc-managed
      * fields (directly or through nested value structs). The slot owns its
      * fields' +1s: a write must release the old occupant / retain a borrowed
      * new one, and scope exit releases every field. Only private allocas are
      * flagged -- by-ref params and the borrowed `this` pointer are not. */
     int struct_rc;
-    /* B-ID33: 1 on a variable declared in a `for` init clause: a closure
+    /* 1 on a variable declared in a `for` init clause: a closure
      * capturing it takes a fresh per-iteration cell holding the value at
-     * capture time (Go 1.22), not a reference to the one loop-carried cell. */
+     * capture time, not a reference to the one loop-carried cell. */
     int per_iteration;
 } local_var_t;
 
@@ -4382,14 +4378,13 @@ static LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty, const char
     if (term) LLVMPositionBuilderBefore(g->builder, term);
     else LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMValueRef alloca = LLVMBuildAlloca(g->builder, ty, name);
-    /* Pointer-shaped slots are defined from entry (A320): the entry block
+    /* Pointer-shaped slots are defined from entry: the entry block
      * statically dominates every setjmp landing, so the co.exc cleanup's
      * owned-local release reads at worst null there. Without this, -Os folds
      * the landing load of a slot whose first store sits after an await to
      * `ptr undef`, and release_dyn materializes the undef as whatever the
-     * argument register holds -- a raw heap pointer -- corrupting the heap
-     * (async landing + declared-later local: the server-mvc /admin/wiki
-     * crash). In synchronous functions the extra store is dead the moment
+     * argument register holds -- a raw heap pointer -- corrupting the heap.
+     * In synchronous functions the extra store is dead the moment
      * the declaration stores and the optimizer drops it. */
     if (LLVMGetTypeKind(ty) == LLVMPointerTypeKind)
         LLVMBuildStore(g->builder, LLVMConstNull(ty), alloca);

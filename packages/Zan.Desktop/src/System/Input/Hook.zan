@@ -76,14 +76,73 @@ class Hook {
     static MouseHookCallback mouseCb;
     #endif
 
+    #if LINUX || MACOS
+    [DllImport("zan_gui", EntryPoint = "zan_hook_install")]
+    static extern int NativeHookInstall(int kind);
+
+    [DllImport("zan_gui", EntryPoint = "zan_hook_uninstall")]
+    static extern int NativeHookUninstall();
+
+    [DllImport("zan_gui", EntryPoint = "zan_hook_next_event")]
+    static extern int NativeHookNextEvent(int timeoutMs, nint p1, nint p2, nint p3, nint p4, nint p5);
+
+    static int posixLive = 0;
+    static int posixPumpStop = 0;
+    static KeyboardHookCallback posixKeyboardCb;
+    static MouseHookCallback posixMouseCb;
+    static int posixKind = 0;
+
+    static bool PosixInstall(int kind, KeyboardHookCallback kcb, MouseHookCallback mcb) {
+        if (Hook.posixLive != 0) { return false; }
+        Hook.posixKeyboardCb = kcb;
+        Hook.posixMouseCb = mcb;
+        Hook.posixKind = kind;
+        if (Hook.NativeHookInstall(kind) == 0) {
+            Hook.posixKeyboardCb = null;
+            Hook.posixMouseCb = null;
+            return false;
+        }
+        Hook.posixLive = 1;
+        Hook.posixPumpStop = 0;
+        Thread.Start(Hook.PosixPumpEntry);
+        return true;
+    }
+
+    static void PosixPumpEntry() {
+        nint buf = NativeMemory.Alloc(20);
+        try {
+            while (Hook.posixLive != 0) {
+                int got = Hook.NativeHookNextEvent(100, buf, buf + 4, buf + 8, buf + 12, buf + 16);
+                if (got == 0) { continue; }
+                Span<int> sp = new Span<int>(buf, 5);
+                int p1 = sp[0];
+                int p2 = sp[1];
+                int p3 = sp[2];
+                int p4 = sp[3];
+                int p5 = sp[4];
+                if (p1 == -1) { break; }
+                if (Hook.posixKind == 13 && Hook.posixKeyboardCb != null) {
+                    Hook.posixKeyboardCb(p1, p2, p3, p4 != 0, p5 != 0);
+                } else if (Hook.posixKind == 14 && Hook.posixMouseCb != null) {
+                    Hook.posixMouseCb(p1, p2, p3, p4, p5 != 0);
+                }
+            }
+        } finally {
+            NativeMemory.Free(buf);
+            Hook.posixPumpStop = 1;
+        }
+    }
+    #endif
+
     /// <summary>安装低级键盘钩子。钩子已
     /// 生效时返回 true；若已有钩子安装则返回 false。</summary>
     static bool InstallKeyboard(KeyboardHookCallback cb) {
         #if WINDOWS
         return Hook.Install(13, cb, null);
+        #elif LINUX || MACOS
+        return Hook.PosixInstall(13, cb, null);
         #else
-        throw new PlatformNotSupportedException(
-            "Hook.InstallKeyboard is not implemented on this platform");
+        return false;
         #endif
     }
 
@@ -92,9 +151,10 @@ class Hook {
     static bool InstallMouse(MouseHookCallback cb) {
         #if WINDOWS
         return Hook.Install(14, null, cb);
+        #elif LINUX || MACOS
+        return Hook.PosixInstall(14, null, cb);
         #else
-        throw new PlatformNotSupportedException(
-            "Hook.InstallMouse is not implemented on this platform");
+        return false;
         #endif
     }
 
@@ -112,9 +172,43 @@ class Hook {
         Hook.wantUnhook = 0;
         Hook.keyboardCb = null;
         Hook.mouseCb = null;
-        #else
-        throw new PlatformNotSupportedException(
-            "Hook.Uninstall is not implemented on this platform");
+        #elif LINUX || MACOS
+        if (Hook.posixLive == 0) { return; }
+        Hook.NativeHookUninstall();
+        for (int waited = 0; Hook.posixPumpStop == 0 && waited < 500; waited = waited + 1) {
+            Thread.Sleep(1);
+        }
+        Hook.posixLive = 0;
+        Hook.posixKeyboardCb = null;
+        Hook.posixMouseCb = null;
+        #endif
+    }
+
+    /// <summary>异步卸载钩子并等待钩子线程结束（协程驱动，非阻塞等待）。</summary>
+    static async Task UninstallAsync() {
+        #if WINDOWS
+        if (Hook.hookHandle == 0) { return; }
+        Hook.wantUnhook = 1;
+        Hook.PostThreadMessageW(Hook.hookThreadId, 0x0012 /*WM_QUIT*/, 0, 0);
+        int waited = 0;
+        while (Hook.hookHandle != 0 && waited < 2000) {
+            await Task.Delay(10);
+            waited = waited + 10;
+        }
+        Hook.wantUnhook = 0;
+        Hook.keyboardCb = null;
+        Hook.mouseCb = null;
+        #elif LINUX || MACOS
+        if (Hook.posixLive == 0) { return; }
+        Hook.NativeHookUninstall();
+        int waited = 0;
+        while (Hook.posixPumpStop == 0 && waited < 2000) {
+            await Task.Delay(10);
+            waited = waited + 10;
+        }
+        Hook.posixLive = 0;
+        Hook.posixKeyboardCb = null;
+        Hook.posixMouseCb = null;
         #endif
     }
 

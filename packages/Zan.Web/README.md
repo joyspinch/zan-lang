@@ -29,5 +29,5 @@
 
 - `Zan.Gui`（Designer.Html/DesignExport/Markup.Html 的设计器-服务端桥）
 - ZanIDE（CodeNav/Workspace 的 API 文档/工作区服务）
-- `Zan.Mvc`（ZanWeb 框架包，B-ID36 拆出）与 server-collab 模板同宇宙共存
+- `Zan.Mvc`（ZanWeb 框架包）与 server-collab 模板同宇宙共存
 - zan-mvc 监控/企业部署线（ServerMetrics 数据源在 `Zan.Diagnostics`）

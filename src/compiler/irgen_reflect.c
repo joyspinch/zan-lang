@@ -1457,7 +1457,7 @@ static LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
     LLVMValueRef in_range;
     if (!g->desc_hdr) {
         /* site 0 means "not recorded"; the string magic and any garbage are out
-         * of range for the unsigned compare. B-ID17: the bound is the
+         * of range for the unsigned compare. The bound is the
          * published site count, not a fixed cap. */
         LLVMValueRef bound = LLVMBuildLoad2(g->builder, i64, g->g_site_count,
                                             "refl.bound");
@@ -2681,7 +2681,7 @@ static bool refl_emit_instance_call(zan_irgen_t *g, zan_type_t *rt,
 }
 
 /* Per-allocation-site record table (through the __zan_site_meta pointer
- * global), so GetType() can answer the concrete type. B-ID17: the array is
+ * global), so GetType() can answer the concrete type. The array is
  * created here with the real site count. Emitted only when the module actually
  * reflects. */
 static void emit_site_meta_table(zan_irgen_t *g) {

@@ -802,8 +802,7 @@ static bool str_and_byte_buffer(zan_type_t *s, zan_type_t *b) {
  * one. This is what lets a statement lambda rank delegate overloads that
  * differ only in return type: without it every candidate tied and
  * declaration order decided, which bound `x => { return x.Length; }` to the
- * string-key OrderBy and reinterpreted the int as a string pointer
- * (B-ID85). */
+ * string-key OrderBy and reinterpreted the int as a string pointer. */
 static void stmt_collect_return_types(zan_irgen_t *g, zan_ast_node_t *stmt,
                                       local_scope_t *locals,
                                       zan_type_t **found, int *mixed) {
@@ -1301,10 +1300,10 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
                     : dp->delegate_param_types[k];
                 local_add(locals, lp->param.name, NULL, lpt);
             }
-            /* Block bodies rank by their return statements' common type
-             * (B-ID85): without it every delegate overload tied and
-             * declaration order decided, binding `x => { return x.Length; }`
-             * to the string-key overload. NULL keeps the neutral score. */
+            /* Block bodies rank by their return statements' common type:
+             * without it every delegate overload tied and declaration order
+             * decided, binding `x => { return x.Length; }` to the string-key
+             * overload. NULL keeps the neutral score. */
             int bf = FAM_UNKNOWN;
             if (body->kind == AST_BLOCK) {
                 zan_type_t *bt = stmt_lambda_return_type(g, body, locals);

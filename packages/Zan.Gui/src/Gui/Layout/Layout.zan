@@ -26,6 +26,13 @@ class FlexStyle {
     int marginBottom;
     int marginLeft;
     int gap;
+    int position;     // 0 = relative/flow (流式排列), 1 = absolute/float (脱离文档流浮动定位)
+    int left;         // 浮动左偏移（-999999 = auto）
+    int top;          // 浮动上偏移（-999999 = auto）
+    int right;        // 浮动右偏移（-999999 = auto）
+    int bottom;       // 浮动下偏移（-999999 = auto）
+    int anchor;       // 0=None, 1=TopLeft, 2=TopCenter, 3=TopRight, 4=CenterLeft, 5=Center, 6=CenterRight, 7=BottomLeft, 8=BottomCenter, 9=BottomRight, 10=Stretch
+    int zIndex;       // 浮动层级
 
     /// 全默认样式：水平排列、交叉轴拉伸（align=3）、允许收缩、宽高取容器尺寸（-1）。
     static FlexStyle Default() {
@@ -50,6 +57,13 @@ class FlexStyle {
         s.marginBottom = 0;
         s.marginLeft = 0;
         s.gap = 0;
+        s.position = 0;
+        s.left = -999999;
+        s.top = -999999;
+        s.right = -999999;
+        s.bottom = -999999;
+        s.anchor = 0;
+        s.zIndex = 0;
         return s;
     }
 
@@ -115,6 +129,44 @@ class FlexStyle {
         alignItems = a;
         return this;
     }
+
+    /// 设置定位模式（0=文档流 flow, 1=脱离文档流浮动 float/absolute）。
+    FlexStyle SetPosition(int pos) {
+        position = pos;
+        return this;
+    }
+
+    /// 设置浮动四向偏移（-999999 = auto）。
+    FlexStyle SetOffsets(int l, int t, int r, int b) {
+        left = l;
+        top = t;
+        right = r;
+        bottom = b;
+        return this;
+    }
+
+    /// 快捷设置浮动/绝对定位偏移：left 与 top。
+    FlexStyle SetFloat(int l, int t) {
+        position = 1;
+        left = l;
+        top = t;
+        right = -999999;
+        bottom = -999999;
+        return this;
+    }
+
+    /// 快捷设置锚点/停靠模式（1=TopLeft, 2=TopCenter, 3=TopRight, 4=CenterLeft, 5=Center, 6=CenterRight, 7=BottomLeft, 8=BottomCenter, 9=BottomRight, 10=Stretch）。
+    FlexStyle SetAnchor(int a) {
+        position = 1;
+        anchor = a;
+        return this;
+    }
+
+    /// 设置层级 zIndex。
+    FlexStyle SetZIndex(int z) {
+        zIndex = z;
+        return this;
+    }
 }
 
 /// 解算树的节点：持有一个 FlexStyle、子节点列表，以及
@@ -173,8 +225,7 @@ class FlexNode {
         bool isRow = style.direction == 0;
         int totalFixed = 0;
         int totalGrow = 0;
-        int gaps = 0;
-        if (count > 1) { gaps = (count - 1) * style.gap; }
+        int flowCount = 0;
 
         int i = 0;
         for (; i < count; i = i + 1) {
@@ -188,6 +239,12 @@ class FlexNode {
 
             child.Compute(cw, ch);
 
+            // 脱离文档流的浮动组件（position == 1）不占用主轴弹性空间
+            if (child.style.position == 1) {
+                continue;
+            }
+
+            flowCount = flowCount + 1;
             if (isRow) {
                 totalFixed = totalFixed + child.resultW + child.style.marginLeft + child.style.marginRight;
                 totalGrow = totalGrow + child.style.flexGrow;
@@ -196,6 +253,9 @@ class FlexNode {
                 totalGrow = totalGrow + child.style.flexGrow;
             }
         }
+
+        int gaps = 0;
+        if (flowCount > 1) { gaps = (flowCount - 1) * style.gap; }
 
         int mainSize = innerW;
         if (!isRow) { mainSize = innerH; }
@@ -206,7 +266,7 @@ class FlexNode {
             i = 0;
             while (i < count) {
                 FlexNode child = children[i];
-                if (child.style.flexGrow > 0) {
+                if (child.style.position != 1 && child.style.flexGrow > 0) {
                     int extra = freeSpace * child.style.flexGrow / totalGrow;
                     if (isRow) {
                         child.resultW = child.resultW + extra;
@@ -227,17 +287,17 @@ class FlexNode {
             offset = freeSpace / 2;
         } else if (style.justify == 2) {
             offset = freeSpace;
-        } else if (style.justify == 3 && count > 1) {
-            spaceBetween = freeSpace / (count - 1) + style.gap;
+        } else if (style.justify == 3 && flowCount > 1) {
+            spaceBetween = freeSpace / (flowCount - 1) + style.gap;
         } else if (style.justify == 4) {
-            int totalSpaces = count * 2;
+            int totalSpaces = flowCount * 2;
             if (totalSpaces > 0) {
                 spaceBefore = freeSpace / totalSpaces;
                 spaceBetween = spaceBefore * 2 + style.gap;
                 offset = spaceBefore;
             }
-        } else if (style.justify == 5 && count > 0) {
-            int totalSpaces = count + 1;
+        } else if (style.justify == 5 && flowCount > 0) {
+            int totalSpaces = flowCount + 1;
             spaceBefore = freeSpace / totalSpaces;
             spaceBetween = spaceBefore + style.gap;
             offset = spaceBefore;
@@ -249,6 +309,60 @@ class FlexNode {
             FlexNode child = children[i];
             int mx = style.padLeft;
             int my = style.padTop;
+
+            if (child.style.position == 1) {
+                // 浮动/绝对定位解算：依据 left/top/right/bottom 与 anchor
+                int anc = child.style.anchor;
+                int l = child.style.left;
+                int t = child.style.top;
+                int r = child.style.right;
+                int b = child.style.bottom;
+
+                if (anc == 1) { // TopLeft
+                    child.resultX = mx + (l != -999999 ? l : 0);
+                    child.resultY = my + (t != -999999 ? t : 0);
+                } else if (anc == 2) { // TopCenter (如游戏 Boss 血条)
+                    child.resultX = mx + (innerW - child.resultW) / 2 + (l != -999999 ? l : 0);
+                    child.resultY = my + (t != -999999 ? t : 0);
+                } else if (anc == 3) { // TopRight (如小地图)
+                    child.resultX = mx + innerW - child.resultW - (r != -999999 ? r : 0);
+                    child.resultY = my + (t != -999999 ? t : 0);
+                } else if (anc == 4) { // CenterLeft (如左侧任务栏)
+                    child.resultX = mx + (l != -999999 ? l : 0);
+                    child.resultY = my + (innerH - child.resultH) / 2 + (t != -999999 ? t : 0);
+                } else if (anc == 5) { // Center (居中对话框/弹窗)
+                    child.resultX = mx + (innerW - child.resultW) / 2 + (l != -999999 ? l : 0);
+                    child.resultY = my + (innerH - child.resultH) / 2 + (t != -999999 ? t : 0);
+                } else if (anc == 6) { // CenterRight
+                    child.resultX = mx + innerW - child.resultW - (r != -999999 ? r : 0);
+                    child.resultY = my + (innerH - child.resultH) / 2 + (t != -999999 ? t : 0);
+                } else if (anc == 7) { // BottomLeft (如聊天框)
+                    child.resultX = mx + (l != -999999 ? l : 0);
+                    child.resultY = my + innerH - child.resultH - (b != -999999 ? b : 0);
+                } else if (anc == 8) { // BottomCenter (如技能快捷栏)
+                    child.resultX = mx + (innerW - child.resultW) / 2 + (l != -999999 ? l : 0);
+                    child.resultY = my + innerH - child.resultH - (b != -999999 ? b : 0);
+                } else if (anc == 9) { // BottomRight (如菜单按钮组)
+                    child.resultX = mx + innerW - child.resultW - (r != -999999 ? r : 0);
+                    child.resultY = my + innerH - child.resultH - (b != -999999 ? b : 0);
+                } else if (anc == 10) { // Stretch (全屏覆盖/蒙版)
+                    child.resultX = mx;
+                    child.resultY = my;
+                    child.resultW = innerW;
+                    child.resultH = innerH;
+                } else { // 自由绝对偏移
+                    if (l != -999999) { child.resultX = mx + l; }
+                    else if (r != -999999) { child.resultX = mx + innerW - child.resultW - r; }
+                    else { child.resultX = mx; }
+
+                    if (t != -999999) { child.resultY = my + t; }
+                    else if (b != -999999) { child.resultY = my + innerH - child.resultH - b; }
+                    else { child.resultY = my; }
+                }
+
+                i = i + 1;
+                continue;
+            }
 
             if (isRow) {
                 pos = pos + child.style.marginLeft;
@@ -286,7 +400,7 @@ class FlexNode {
                 pos = pos + child.resultH + child.style.marginBottom;
             }
 
-            if (i < count - 1) { pos = pos + spaceBetween; }
+            pos = pos + spaceBetween;
             i = i + 1;
         }
     }

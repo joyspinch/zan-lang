@@ -11,7 +11,7 @@ Zan 程序的进程内 Lua 嵌入（Lua 5.3 / 5.4）。`using System.Scripting;`
 | `lua54.def` | Windows 链接 lua54.dll 的导出表 |
 | `drivers/` | 六平台原生驱动束（driver.manifest：`lua`），`--publish` 自动捆包 |
 
-驱动束随包走 B-ID25 机制：`drivers/driver.manifest` 在包 src 树内，
+驱动束随包机制：`drivers/driver.manifest` 在包 src 树内，
 zanc 发布时发现并复制 `lua.bundle`（与 Zan.Data 的 Postgres 驱动同构）。
 
 ## 消费者

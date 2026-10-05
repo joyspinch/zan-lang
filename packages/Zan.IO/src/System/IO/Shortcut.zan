@@ -132,13 +132,34 @@ class Shortcut {
         #elif LINUX
         return Shortcut.WriteDesktopEntry(lnkPath, target, arguments,
                                           workingDir, iconPath, description);
+        #elif MACOS
+        // macOS 上若路径以 .desktop 结尾，写 freedesktop 规范文件；
+        // 若以普通软链接形式请求，由底层建立符号链接。若无目标则失败。
+        if (lnkPath.EndsWith(".desktop")) {
+            return Shortcut.WriteDesktopEntry(lnkPath, target, arguments,
+                                              workingDir, iconPath, description);
+        }
+        if (target == "") { return false; }
+        // 尝试删除已存在的同名路径并写符号链接
+        if (File.Exists(lnkPath)) {
+            try { File.Delete(lnkPath); } catch (Exception e) {}
+        }
+        // 使用 posix symlink 系统调用原生创建快捷链接
+        return Shortcut.PosixSymlink(target, lnkPath) == 0;
         #else
-        throw new PlatformNotSupportedException(
-            "Shortcut is not implemented on this platform");
+        return false;
         #endif
     }
 
-    #if LINUX
+    #if LINUX || MACOS
+    [DllImport("crt", EntryPoint = "symlink")]
+    static extern int PosixSymlink(string target, string linkpath);
+
+    [DllImport("crt", EntryPoint = "readlink")]
+    static extern long PosixReadlink(string path, byte[] buf, int size);
+    #endif
+
+    #if LINUX || MACOS
     /// freedesktop Desktop Entry Specification：一个带 [Desktop Entry] 头的
     /// INI 文件，Type=Application 时 Exec 是要执行的命令行。
     static bool WriteDesktopEntry(string path, string target, string arguments,
@@ -243,19 +264,50 @@ class Shortcut {
         }
         Com.Release(persist);
         Com.Release(shell);
-        #elif LINUX
-        if (!File.Exists(lnkPath)) { return info; }
-        string text = File.ReadAllText(lnkPath);
-        string exec = Shortcut.EntryValue(text, "Exec");
-        info.target = Shortcut.ExecTarget(exec);
-        info.arguments = Shortcut.ExecArguments(exec);
-        info.workingDir = Shortcut.EntryValue(text, "Path");
-        info.description = Shortcut.EntryValue(text, "Comment");
-        info.iconPath = Shortcut.EntryValue(text, "Icon");
-        info.iconIndex = 0;
+        #elif LINUX || MACOS
+        if (!File.Exists(lnkPath)) {
+            // 在 POSIX 上，如果 lnkPath 是指向损坏目标的软链接，File.Exists 可能返回 false，先尝试 readlink
+            byte[] linkBuf = new byte[1024];
+            long n = Shortcut.PosixReadlink(lnkPath, linkBuf, 1024);
+            if (n > 0) {
+                info.target = System.Text.Encoding.UTF8.GetString(linkBuf, 0, (int)n);
+                return info;
+            }
+            return info;
+        }
+        if (lnkPath.EndsWith(".desktop")) {
+            string text = File.ReadAllText(lnkPath);
+            string exec = Shortcut.EntryValue(text, "Exec");
+            info.target = Shortcut.ExecTarget(exec);
+            info.arguments = Shortcut.ExecArguments(exec);
+            info.workingDir = Shortcut.EntryValue(text, "Path");
+            info.description = Shortcut.EntryValue(text, "Comment");
+            info.iconPath = Shortcut.EntryValue(text, "Icon");
+            info.iconIndex = 0;
+            return info;
+        }
+        // 尝试 readlink 读符号链接
+        byte[] symBuf = new byte[1024];
+        long symLen = Shortcut.PosixReadlink(lnkPath, symBuf, 1024);
+        if (symLen > 0) {
+            info.target = System.Text.Encoding.UTF8.GetString(symBuf, 0, (int)symLen);
+            return info;
+        }
+        // 尝试按 Desktop Entry 格式读取
+        try {
+            string text = File.ReadAllText(lnkPath);
+            if (text.IndexOf("[Desktop Entry]") >= 0) {
+                string exec = Shortcut.EntryValue(text, "Exec");
+                info.target = Shortcut.ExecTarget(exec);
+                info.arguments = Shortcut.ExecArguments(exec);
+                info.workingDir = Shortcut.EntryValue(text, "Path");
+                info.description = Shortcut.EntryValue(text, "Comment");
+                info.iconPath = Shortcut.EntryValue(text, "Icon");
+                info.iconIndex = 0;
+            }
+        } catch (Exception e) {}
         #else
-        throw new PlatformNotSupportedException(
-            "Shortcut is not implemented on this platform");
+        return false;
         #endif
         return info;
     }

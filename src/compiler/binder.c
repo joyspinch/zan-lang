@@ -1681,7 +1681,7 @@ static void validate_interface_contracts(zan_binder_t *b, zan_ast_list_t *decls)
 }
 
 /* Pass 2: bind member declarations */
-/* Fold an enum member initializer to its integer value (B-ID60). The parser
+/* Fold an enum member initializer to its integer value. The parser
  * stores the initializer expression raw: `Red = -5` is a unary-minus node
  * and `Green = Red + 1` names a sibling member, but every consumer (the
  * irgen emitter, the reflection tables) only understands AST_INT_LITERAL and

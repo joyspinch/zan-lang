@@ -3851,7 +3851,7 @@ EXPORT i32 zan_gui_image_load_svg(const char *key, const char *text, i32 len,
  * i*src/dst pinned destination column 0 to source column 0 and duplicated the
  * left/top edge, so upscaled sprites hugged one corner. 1:1 is exact under
  * both formulas, so unscaled blits are bit-identical to before. */
-/* ---- sprite registry: stable int handles over cached images (A356) ----
+/* ---- sprite registry: stable int handles over cached images ----
  * A game frame submits sprites by handle, not by path, so one packed batch
  * crosses the FFI once per (layer, atlas). Handles index this registry of
  * keys; the decode cache stays free to evict (a sprite whose image was

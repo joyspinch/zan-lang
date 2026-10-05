@@ -625,10 +625,7 @@ static int pkg_scan_store(const char *store, const char *namespace_path,
 /* Namespace match for package source discovery: the declared namespace equals
  * the reached namespace, or — for project-package namespaces only (the caller
  * gates stdlib-rooted ones to exact matching) — lives underneath it
- * (ZanWeb.Controllers under ZanWeb). The pre-2e75673e walker globbed a
- * matching package's whole tree, so hierarchical packages resolved a root
- * `using` to their sub-namespaces; the exact-only rewrite lost those files
- * (route-table-driven MVC controllers never joined the parse, B-ID18). */
+ * (ZanWeb.Controllers under ZanWeb), supporting hierarchical package sub-namespaces. */
 static int pkg_ns_match(const char *declared, const char *target_ns,
                         int hierarchical) {
     if (strcmp(declared, target_ns) == 0) return 1;

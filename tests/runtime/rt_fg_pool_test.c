@@ -1,5 +1,5 @@
 /* rt_fg_pool_test.c -- a ready() during a FOREGROUND multi-worker run must
- * not start a second worker pool (B-ID30).
+ * not start a second worker pool.
  *
  * The foreground branch of zan_co_sched_run starts workers 1..N-1 and runs
  * worker 0 on the calling thread WITHOUT raising g_co_pool_live, so every

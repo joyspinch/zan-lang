@@ -122,14 +122,13 @@ class Directory {
     [DllImport("crt", EntryPoint = "opendir")]
     static extern nint opendir(string name);
 
-    // readdir 返回 struct dirent*（B-ID62：误声明成 string 时 ARC 会
-    // 把 dirent 首字节当长度、按 C 字符串读，而 d_name 在 19/21 字节
-    // 偏移上——名字永远读不到，GetFiles/GetDirectories 恒空）。
+    // readdir 返回 struct dirent* 指针：
+    // dirent 结构体首字节并非字符串长度，d_name 字段位于结构体后部偏移处。
     [DllImport("crt", EntryPoint = "readdir")]
     static extern nint readdir(nint dirp);
 
     // readlink 成功返回写入的字节数（ssize_t），失败返回 -1：
-    // 不引入 struct stat 布局依赖即可判定符号链接（B-ID63）。
+    // 不引入 struct stat 布局依赖即可准确判定符号链接。
     [DllImport("crt", EntryPoint = "readlink")]
     static extern long ReadLink(string path, byte[] buf, int size);
 
@@ -284,9 +283,13 @@ class Directory {
     static string GetCurrentDirectory() {
         #if WINDOWS
         nint wide = NativeMemory.Alloc(8192);
-        WinGetCurrentDirectory(4096, wide);
-        string buf = winUtf8(wide);
-        NativeMemory.Free(wide);
+        string buf = "";
+        try {
+            WinGetCurrentDirectory(4096, wide);
+            buf = winUtf8(wide);
+        } finally {
+            NativeMemory.Free(wide);
+        }
         #else
         byte[] b = new byte[4096];
         getcwd(b, 4096);
@@ -327,32 +330,40 @@ class Directory {
         string pattern = path + "\\*";
         nint widePattern = winWide(pattern);
         nint findData = NativeMemory.Alloc(592);
-        nint handle = -1;
-        if (widePattern != 0) {
-            handle = WinFindFirstFile(widePattern, findData);
-            NativeMemory.Free(widePattern);
-        }
-        if (handle != -1) {
-            bool more = true;
-            while (more) {
-                string fname = winName(findData);
-                Span<byte> attr = new Span<byte>(findData, 4);
-                int attrs = attr[0] + attr[1] * 256 + attr[2] * 65536 + attr[3] * 16777216;
-                // reparse point（junction/符号链接）：按文件收，删除方
-                // 删链接本身，绝不递归进指向的树（B-ID63，与 POSIX 的
-                // readlink 判定同语义）。
-                bool isDir = (attrs & 1024) == 0 && (attrs & 16) != 0;
-                bool hidden = (attrs & 2) != 0;
-                if (fname != "." && fname != ".."
-                    && isDir == wantDirs
-                    && (includeHidden || !hidden)) {
-                    result.Add(fname);
-                }
-                if (WinFindNextFile(handle, findData) == 0) { more = false; }
+        try {
+            nint handle = -1;
+            if (widePattern != 0) {
+                handle = WinFindFirstFile(widePattern, findData);
+                NativeMemory.Free(widePattern);
+                widePattern = 0;
             }
-            WinFindClose(handle);
+            if (handle != -1) {
+                try {
+                    bool more = true;
+                    while (more) {
+                        string fname = winName(findData);
+                        Span<byte> attr = new Span<byte>(findData, 4);
+                        int attrs = attr[0] + attr[1] * 256 + attr[2] * 65536 + attr[3] * 16777216;
+                        // reparse point（junction/符号链接）：按文件收，删除方
+                        // 删链接本身，绝不递归进指向的树（与 POSIX 的
+                        // readlink 判定同语义）。
+                        bool isDir = (attrs & 1024) == 0 && (attrs & 16) != 0;
+                        bool hidden = (attrs & 2) != 0;
+                        if (fname != "." && fname != ".."
+                            && isDir == wantDirs
+                            && (includeHidden || !hidden)) {
+                            result.Add(fname);
+                        }
+                        if (WinFindNextFile(handle, findData) == 0) { more = false; }
+                    }
+                } finally {
+                    WinFindClose(handle);
+                }
+            }
+        } finally {
+            if (widePattern != 0) { NativeMemory.Free(widePattern); }
+            NativeMemory.Free(findData);
         }
-        NativeMemory.Free(findData);
         return result;
     }
     #else
@@ -417,7 +428,7 @@ class Directory {
 
     /// opendir/readdir 枚举一层：wantDirs 决定收文件还是目录，
     /// includeHidden=false 时跳过 "." 开头的条目。符号链接一律按
-    /// 文件收（删除方 unlink 链接本身，不递归进目标，见 B-ID63）；
+    /// 文件收（删除方 unlink 链接本身，不递归进目标）；
     /// 只有 d_type 未知（DT_UNKNOWN）时才探测真身。返回条目名
     /// （不含路径）。
     static List<string> posixList(
@@ -441,8 +452,7 @@ class Directory {
                 } else if (dtype == 10 || dtype == 7) {
                     // DT_LNK（POSIX 10）/ WASI filetype 7（SYMBOLIC_LINK）：
                     // 链接按文件收——DeleteRecursive 会 unlink 链接本身，
-                    // 绝不递归进指向的树（B-ID63：旧实现 opendir 探测真身，
-                    // 指向树外目录的链接被连根拔掉）。
+                    // 绝不递归进指向的树（防止指向树外目录的链接被误删目标）。
                     isDir = false;
                 } else if (dtype == 0) {
                     // DT_UNKNOWN（文件系统不填 d_type）：先 readlink 判
@@ -606,7 +616,7 @@ class Directory {
     /// 任何一项删不掉（占用/权限）时返回 false，其余项仍会尽力删除。</summary>
     static bool DeleteRecursive(string path) {
         // 顶层本身是链接（Windows junction/符号链接、POSIX 符号链接）
-        // 时只删链接本身，绝不递归进指向的树——B-ID63。
+        // 时只删链接本身，绝不递归进指向的树。
         #if WINDOWS
         if (File.IsReparsePoint(path)) {
             File.Delete(path);

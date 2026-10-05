@@ -4,6 +4,27 @@ using Gui.Widget;
 
 namespace Gui.Component;
 
+/// PropertyGrid 属性行编辑器强类型实体（消除平行列表索引对齐反模式）。
+class PropertyGridRow {
+    public Input text;
+    public Switch flag;
+    public SelectBox pick;
+    public List<int> pickSegIds;
+    public int minusId;
+    public int plusId;
+    public string shadow;
+
+    PropertyGridRow() {
+        this.text = null;
+        this.flag = null;
+        this.pick = null;
+        this.pickSegIds = new List<int>();
+        this.minusId = 0;
+        this.plusId = 0;
+        this.shadow = "";
+    }
+}
+
 /// 属性表：把一组 PropSpec 画成可编辑的属性行，值直接读写 spec 绑定
 /// 的字段 / signal。行的标签、编辑器、滚动、裁剪都由控件自己完成，
 /// 宿主只提供 spec 列表：
@@ -16,22 +37,8 @@ namespace Gui.Component;
 class PropertyGrid : Control {
     /// 当前绑定的属性行（Bind 每帧灌入，不拷贝）。
     List<PropSpec> data;
-    /// 每行一个编辑器（按行索引对齐，未用到的槽为 null）。
-    /// 编辑器由属性协议驱动（GetProp/SetProp/GetText/SetText），
-    /// 不再持有任何外部信号——动态宿主没有编译期字段可绑。
-    List<Input> texts;
-    /// 开关行的编辑器（按行索引对齐，非开关行为 null）。
-    List<Switch> flags;
-    /// 下拉行的编辑器（按行索引对齐，非下拉行为 null）。
-    List<SelectBox> picks;
-    /// 选项少于等于 4 个时的分段单选按钮稳定控件 id。
-    List<List<int>> pickSegIds;
-    /// 整数属性行的 -/+ 步进按钮稳定控件 id（按行索引对齐，
-    /// 非整数行也占位）。
-    List<int> minusIds;
-    List<int> plusIds;
-    /// 上一帧的值：用来判断这一帧是外部改了模型还是用户改了编辑器。
-    List<string> shadow;
+    /// 每行一个强类型行编辑器实体（包含对应的 Input/Switch/SelectBox/按键ID/影子值）。
+    List<PropertyGridRow> rows;
     /// 当前绑定对象的标识，变化时重建编辑器。
     string key;
     /// 纵向滚动偏移（像素）。
@@ -49,13 +56,7 @@ class PropertyGrid : Control {
     PropertyGrid() {
         this.InitControl("props", 5);
         data = new List<PropSpec>();
-        texts = new List<Input>();
-        flags = new List<Switch>();
-        picks = new List<SelectBox>();
-        pickSegIds = new List<List<int>>();
-        minusIds = new List<int>();
-        plusIds = new List<int>();
-        shadow = new List<string>();
+        rows = new List<PropertyGridRow>();
         key = "";
         scroll = new SignalInt(0);
         Empty = "";
@@ -95,45 +96,36 @@ class PropertyGrid : Control {
 
     /// 强制丢弃现有编辑器并按当前 specs 重建（切对象后 Bind 会自动调）。
     void Rebuild() {
-        texts = new List<Input>();
-        flags = new List<Switch>();
-        picks = new List<SelectBox>();
-        pickSegIds = new List<List<int>>();
-        minusIds = new List<int>();
-        plusIds = new List<int>();
-        shadow = new List<string>();
+        rows = new List<PropertyGridRow>();
         for (int i = 0; i < data.Count; i = i + 1) {
             PropSpec p = data[i];
             string cur = p.Read();
-            shadow.Add(cur);
-            Input inp = null;
-            Switch sw = null;
-            SelectBox sb = null;
-            List<int> sids = new List<int>();
+            PropertyGridRow r = new PropertyGridRow();
+            r.shadow = cur;
             if (p.kind == 5) {
                 // 分组标题：没有编辑器。
             } else if (p.kind == 2) {
                 // 动态宿主不走 Binding<T>（无编译期字段可指），
                 // 统一经控件的属性协议驱动（§6.1）。
-                sw = new Switch();
+                Switch sw = new Switch();
                 sw.Size = "small";
                 sw.SetOn(PropSpec.IsOn(cur));
+                r.flag = sw;
             } else if (p.kind == 3) {
-                sb = SelectBox.FromOptions(p.options, "");
+                SelectBox sb = SelectBox.FromOptions(p.options, "");
                 sb.SetIndex(this.IndexOfValue(p, cur));
+                r.pick = sb;
                 for (int si = 0; si < p.options.Count; si = si + 1) {
-                    sids.Add(WidgetId.Next());
+                    r.pickSegIds.Add(WidgetId.Next());
                 }
             } else {
-                inp = new Input("");
+                Input inp = new Input("");
                 inp.SetText(cur);
+                r.text = inp;
             }
-            texts.Add(inp);
-            flags.Add(sw);
-            picks.Add(sb);
-            pickSegIds.Add(sids);
-            minusIds.Add(WidgetId.Next());
-            plusIds.Add(WidgetId.Next());
+            r.minusId = WidgetId.Next();
+            r.plusId = WidgetId.Next();
+            rows.Add(r);
         }
         hitRow = 0 - 1;
     }
@@ -177,17 +169,19 @@ class PropertyGrid : Control {
     /// 编辑器当前值的字符串形式（与 PropSpec.Read 同一种表示）。
     string Editor(int i) {
         PropSpec p = data[i];
-        if (p.kind == 2) { return flags[i].IsOn() ? "true" : "false"; }
-        if (p.kind == 3) { return this.PickValue(p, picks[i].Value()); }
-        return texts[i].GetText();
+        PropertyGridRow r = rows[i];
+        if (p.kind == 2) { return r.flag.IsOn() ? "true" : "false"; }
+        if (p.kind == 3) { return this.PickValue(p, r.pick.Value()); }
+        return r.text.GetText();
     }
 
     /// 把模型值灌回编辑器（外部改了属性时）。
     void Load(int i, string val) {
         PropSpec p = data[i];
-        if (p.kind == 2) { flags[i].SetOn(PropSpec.IsOn(val)); return; }
-        if (p.kind == 3) { picks[i].SetIndex(this.IndexOfValue(p, val)); return; }
-        texts[i].SetText(val);
+        PropertyGridRow r = rows[i];
+        if (p.kind == 2) { r.flag.SetOn(PropSpec.IsOn(val)); return; }
+        if (p.kind == 3) { r.pick.SetIndex(this.IndexOfValue(p, val)); return; }
+        r.text.SetText(val);
     }
 
     /// 一行的双向同步：外部改动优先灌回编辑器，否则把编辑器的新值
@@ -197,17 +191,18 @@ class PropertyGrid : Control {
     void Sync(App app, int i) {
         PropSpec p = data[i];
         if (p.kind == 5 || !p.IsBound()) { return; }
+        PropertyGridRow r = rows[i];
         string cur = p.Read();
-        if (cur != shadow[i]) {
+        if (cur != r.shadow) {
             this.Load(i, cur);
-            shadow[i] = cur;
+            r.shadow = cur;
             return;
         }
         string ui = this.Editor(i);
         if (ui == cur) { return; }
         if (p.kind == 1 && !PropertyGrid.IsNumber(ui)) { return; }
         p.Write(ui);
-        shadow[i] = p.Read();
+        r.shadow = p.Read();
         hitRow = i;
         Change.PostS(this);
         app.RequestRedraw();
@@ -218,14 +213,15 @@ class PropertyGrid : Control {
     void Step(App app, int i, int delta) {
         PropSpec p = data[i];
         if (!p.IsBound()) { return; }
+        PropertyGridRow r = rows[i];
         int cur = 0;
-        string r = p.Read();
-        if (PropertyGrid.IsNumber(r)) { cur = Convert.ToInt32(r); }
+        string readVal = p.Read();
+        if (PropertyGrid.IsNumber(readVal)) { cur = Convert.ToInt32(readVal); }
         int nv = p.Clamp(cur + delta);
         string s = Convert.ToString(nv);
         p.Write(s);
-        texts[i].SetText(s);
-        shadow[i] = p.Read();
+        r.text.SetText(s);
+        r.shadow = p.Read();
         hitRow = i;
         Change.PostS(this);
         app.RequestRedraw();
@@ -346,10 +342,11 @@ class PropertyGrid : Control {
                     int ew = rowW - labelW;
                     int eh = app.Scale(24);
                     int ey = y + (rowH - eh) / 2;
+                    PropertyGridRow r = rows[i];
                     if (p.kind == 2) {
                         int swH = app.Scale(18);
                         int swY = y + (rowH - swH) / 2;
-                        flags[i].Render(app, ex, swY);
+                        r.flag.Render(app, ex, swY);
                     } else if (p.kind == 3) {
                         int optCount = p.options.Count;
                         // 选项在 2~4 个之间且宽度充裕时，自动升格为分段单选按钮组，点选更直观快捷
@@ -367,26 +364,26 @@ class PropertyGrid : Control {
                         }
 
                         if (useSegmented) {
-                            int curIdx = picks[i].Value();
+                            int curIdx = r.pick.Value();
                             int segW = ew / optCount;
-                            int r = app.Scale(4);
-                            c.FillRoundRect(ex, ey, ew, eh, r, t.bgSecondary);
-                            c.DrawRoundRect(ex, ey, ew, eh, r, t.borderSecondary, 1);
+                            int br = app.Scale(4);
+                            c.FillRoundRect(ex, ey, ew, eh, br, t.bgSecondary);
+                            c.DrawRoundRect(ex, ey, ew, eh, br, t.borderSecondary, 1);
 
                             for (int si = 0; si < optCount; si = si + 1) {
                                 int sx = ex + si * segW;
                                 int sw = (si == optCount - 1) ? (ex + ew - sx) : segW;
                                 bool isSel = (si == curIdx);
                                 bool segHover = Ui.Over(app, sx, ey, sw, eh);
-                                int segId = (i < pickSegIds.Count && si < pickSegIds[i].Count)
-                                    ? pickSegIds[i][si] : WidgetId.Next();
+                                int segId = (si < r.pickSegIds.Count)
+                                    ? r.pickSegIds[si] : WidgetId.Next();
                                 app.hitTester.RegisterRect(segId, sx, ey, sw, eh, 0);
 
                                 if (Ui.Clicked(app, segId)) {
                                     if (!isSel) {
-                                        picks[i].SetIndex(si);
+                                        r.pick.SetIndex(si);
                                         p.Write(this.PickValue(p, si));
-                                        shadow[i] = p.Read();
+                                        r.shadow = p.Read();
                                         hitRow = i;
                                         Change.PostS(this);
                                         app.RequestRedraw();
@@ -413,7 +410,7 @@ class PropertyGrid : Control {
                                 }
                             }
                         } else {
-                            picks[i].Render(app, ex, ey, ew);
+                            r.pick.Render(app, ex, ey, ew);
                         }
                     } else if (p.kind == 1) {
 	                        // 整数行：[-] [可点击键入的输入框] [+]。
@@ -421,20 +418,20 @@ class PropertyGrid : Control {
 	                        int minStepW = (eh + gap) * 2 + app.Scale(36);
 	                        if (ew >= minStepW) {
 	                            int inW = ew - (eh + gap) * 2;
-	                            if (this.StepBtn(app, minusIds[i], ex, ey, eh, "-",
+	                            if (this.StepBtn(app, r.minusId, ex, ey, eh, "-",
 	                                    stepStyle, stepHoverStyle)) {
 	                                this.Step(app, i, 0 - p.step);
 	                            }
-	                            texts[i].Render(app, ex + eh + gap, ey, inW, eh);
-	                            if (this.StepBtn(app, plusIds[i], ex + ew - eh,
+	                            r.text.Render(app, ex + eh + gap, ey, inW, eh);
+	                            if (this.StepBtn(app, r.plusId, ex + ew - eh,
 	                                    ey, eh, "+", stepStyle, stepHoverStyle)) {
 	                                this.Step(app, i, p.step);
 	                            }
 	                        } else {
-	                            texts[i].Render(app, ex, ey, ew, eh);
+	                            r.text.Render(app, ex, ey, ew, eh);
 	                        }
                     } else {
-                        texts[i].Render(app, ex, ey, ew, eh);
+                        r.text.Render(app, ex, ey, ew, eh);
                     }
                     this.Sync(app, i);
                     // 悬停该行且有说明时请求气泡提示（帧末由宿主 Flush）。

@@ -551,7 +551,7 @@ typedef enum zan_timer_kind {
     ZAN_TIMER_PUBLIC = 1
 } zan_timer_kind;
 typedef struct zan_timer_entry {
-    /* Microsecond deadline on zan_co_precise_us (B-ID48): the ms wall clock
+    /* Microsecond deadline on zan_co_precise_us: the ms wall clock
      * quantizes to the OS tick (~15.6ms on Windows), and every Delay
      * overshoot carried that granularity. zan_timer_next_timeout still
      * ANSWERS in ms (round-up) because its callers park on ms waits. */
@@ -751,7 +751,7 @@ long long zan_timer_saturating_due(long long now_ms, long long delay_ms) {
     return now_ms + delay_ms;
 }
 
-/* Microsecond deadline arithmetic (B-ID48): same saturation rule as the ms
+/* Microsecond deadline arithmetic: same saturation rule as the ms
  * helper, plus the ms->us lift every public timer API needs (the public
  * surface stays milliseconds; only the heap runs in microseconds). */
 long long zan_timer_saturating_due_us(long long now_us, long long delay_us) {
@@ -785,7 +785,7 @@ void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
          * ready it immediately (the delay elapses with zero remaining time
          * from the waiter's perspective; better than a lost coroutine). */
         timer_unlock();
-        free(entry);   /* the entry never entered the heap (A291) */
+        free(entry);   /* the entry never entered the heap */
         step(frame);
         return;
     }
@@ -858,7 +858,7 @@ int zan_timer_cancel_delay(void *frame) {
      * of live entries, so a full heapify (Floyd) is O(n). When nothing was
      * purged the heap was never disturbed -- reordering it anyway both wasted
      * the O(n) walk on every no-op cancel and shuffled timer deadlines
-     * between heap slots for nothing (B-ID74b). */
+     * between heap slots for nothing. */
     if (w != old_len && g_heap_len > 1) {
         for (size_t i = g_heap_len / 2; i-- > 0;) {
             size_t index = i;
@@ -1133,15 +1133,6 @@ void zan_timer_stats(long long *initialized, long long *num, long long *round) {
     timer_unlock();
 }
 
-long long swoole_timer_tick(long long interval, zan_timer_callback_t callback) { return zan_timer_tick(interval, callback); }
-long long swoole_timer_after(long long delay, zan_timer_callback_t callback) { return zan_timer_after(delay, callback); }
-int swoole_timer_clear(long long id) { return zan_timer_clear(id); }
-long long swoole_timer_clear_all(void) { return zan_timer_clear_all(); }
-int swoole_timer_info(long long id, long long *a, long long *b, long long *c, long long *d, int *e) { return zan_timer_info(id, a, b, c, d, e); }
-long long swoole_timer_list_count(void) { return zan_timer_list_count(); }
-long long swoole_timer_list_at(long long index) { return zan_timer_list_at(index); }
-void swoole_timer_stats(long long *a, long long *b, long long *c) { zan_timer_stats(a, b, c); }
-
 /* ---- registry of live detached (Task.Spawn) coroutine frames ----
  *
  * A spawn handle is a raw frame pointer that can outlive the coroutine (the
@@ -1178,7 +1169,7 @@ static size_t   g_colive_dead;   /* tombstones */
 
 static volatile int g_colive_lock;
 
-/* Bounded TTAS backoff (B-ID74f): pause-spin a few rounds, then hand the
+/* Bounded TTAS backoff: pause-spin a few rounds, then hand the
  * core back. A pure pause-spin burns a whole timeslice when the lock holder
  * is preempted, stalling every worker that touches the live registry; and
  * the pause itself is x86-only, so non-x86 targets get the yield too. */
@@ -1267,7 +1258,7 @@ static void join_on_untrack(void *frame, void **out_joiner,
 
 void zan_co_live_del(void *frame) {
     if (!frame || !g_colive_cap) return;
-    /* B-ID56: untrack is the one universal pre-free point every detached
+    /* Untrack is the one universal pre-free point every detached
      * frame passes (reap fn -> untrack -> cancel_delay -> frame_free), so it
      * is the completion-notification point for event-driven joins. The hook
      * runs under live_lock; the ready call fires only after unlock so the
@@ -1330,7 +1321,7 @@ void zan_co_live_reset(void) {
     live_unlock();
 }
 
-/* ---- event-driven join (Task.WhenAll / Task.WhenAny fast path, B-ID56) ----
+/* ---- event-driven join (Task.WhenAll / Task.WhenAny fast path) ----
  * Replaces the yield-hybrid polling of WhenAll/WhenAny with a suspension that
  * is readied by the completion itself. Design constraints that shaped it:
  *
@@ -1374,7 +1365,7 @@ typedef struct zan_join {
     zan_timer_step_t joiner_step;
     int              npairs;  /* bound pairs, filled during the bind phase */
     int              winner;  /* any mode: first completed pair's index    */
-    /* B-ID74c: bound pairs not yet marked done. Every mutation site (bind,
+    /* Bound pairs not yet marked done. Every mutation site (bind,
      * the two done hooks, wait2, fire) already runs under live_lock, so a
      * plain int is exact -- and the all-mode fire test collapses from a
      * rescan of all N pairs on EVERY completion (O(N^2) under the global
@@ -1461,7 +1452,7 @@ static int join_pair_done(const zan_join_pair_t *pr) {
     if (!live_has_nolock(pr->frame)) return 1;   /* untracked: completed */
     /* The emitter publishes DONE with a release xchg (irgen_async.c); read
      * it acquire so the dependent RESULT store cannot slide under the probe
-     * on arm64/wasm32 -- a plain memcpy left that to luck (B-ID74e). */
+     * on arm64/wasm32 -- a plain memcpy left that to luck. */
     int32_t done = __atomic_load_n(
         (const volatile int32_t *)((const unsigned char *)pr->frame + JOIN_OFF_DONE),
         __ATOMIC_ACQUIRE);
@@ -1501,7 +1492,7 @@ static void join_on_untrack(void *frame, void **out_joiner, zan_timer_step_t *ou
     join_fire_locked(pr->owner, out_joiner, out_step);
 }
 
-/* completion hook (B-ID56): called by the emitted completion epilogue of
+/* completion hook: called by the emitted completion epilogue of
  * EVERY async frame right after DONE is published. This is the primary join
  * notification because it also covers result-carrying Task.Run frames, which
  * stay tracked after completion (done=1, not reaped) until Result/Wait reaps
@@ -1558,7 +1549,7 @@ int zan_join_bind(long long entry, void *frame, int idx) {
     if (live_has_nolock(frame) && !joinmap_get(frame)) {
         /* acquire, same reason as join_pair_done: the emitter publishes DONE
          * with a release xchg, and a stale 0 read here binds a completed
-         * frame whose hook already ran (B-ID74e). */
+         * frame whose hook already ran. */
         int32_t done = __atomic_load_n(
             (const volatile int32_t *)((const unsigned char *)frame + JOIN_OFF_DONE),
             __ATOMIC_ACQUIRE);

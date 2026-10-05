@@ -686,7 +686,7 @@ static int expr_member_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
 static void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg,
                                          LLVMValueRef val, local_scope_t *locals) {
     if (!arg || !locals || !val) return;
-    /* A341: a discarded struct call result (`Echo(a);`, `Use(Make())` where
+    /* A discarded struct call result (`Echo(a);`, `Use(Make())` where
      * the callee returned a struct) carries +1 per rc field from the
      * callee's return retain; without this the fields leak. */
     if (LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMStructTypeKind) {
@@ -830,7 +830,7 @@ static void emit_leak_report_support(zan_irgen_t *g) {
     LLVMBuildBr(b, head_bb);
 
     /* iterate the site buckets, printing those with a positive live count.
-     * B-ID17: the bound is the published site count, not a fixed cap. */
+     * The bound is the published site count, not a fixed cap. */
     LLVMPositionBuilderAtEnd(b, head_bb);
     LLVMValueRef idx = LLVMBuildPhi(b, i64, "i");
     LLVMValueRef bound = LLVMBuildLoad2(b, i64, g->g_site_count, "bound");
@@ -989,7 +989,7 @@ static void emit_release_owned_locals_except(zan_irgen_t *g, local_scope_t *loca
         } else if (locals->vars[i].box_cell) {
             release_boxed_local(g, &locals->vars[i]);
         } else if (locals->vars[i].struct_rc) {
-            /* A341: the slot owns the rc fields inside its aggregate. */
+            /* The slot owns the rc fields inside its aggregate. */
             emit_struct_local_release(g, locals->vars[i].type,
                                       locals->vars[i].alloca);
         } else if (local_owns_arc(&locals->vars[i])) {
@@ -1014,7 +1014,7 @@ static void emit_release_owned_locals_range(zan_irgen_t *g, local_scope_t *local
         } else if (locals->vars[i].box_cell) {
             release_boxed_local(g, &locals->vars[i]);
         } else if (locals->vars[i].struct_rc) {
-            /* A341: function-exit / break-continue-edge field release. */
+            /* Function-exit / break-continue-edge field release. */
             emit_struct_local_release(g, locals->vars[i].type,
                                       locals->vars[i].alloca);
         } else if (local_owns_arc(&locals->vars[i])) {
@@ -1070,7 +1070,7 @@ static void emit_clear_owned_locals_range(zan_irgen_t *g, local_scope_t *locals,
             LLVMBuildStore(g->builder, LLVMConstNull(i8ptr),
                            locals->vars[i].alloca);
         } else if (locals->vars[i].struct_rc) {
-            /* A341: a throw released the fields from this slot; zero the
+            /* A throw released the fields from this slot; zero the
              * aggregate so a second cleanup pass (finally, catch) sees null
              * instead of dangling field pointers. */
             LLVMBuildStore(g->builder,
@@ -1097,7 +1097,7 @@ static void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals
         } else if (!terminated && locals->vars[i].box_cell) {
             release_boxed_local(g, &locals->vars[i]);
         } else if (!terminated && locals->vars[i].struct_rc) {
-            /* A341: the slot owns the rc fields inside its aggregate. */
+            /* The slot owns the rc fields inside its aggregate. */
             emit_struct_local_release(g, locals->vars[i].type,
                                       locals->vars[i].alloca);
         } else if (!terminated && local_owns_arc(&locals->vars[i])) {
@@ -3081,8 +3081,7 @@ static LLVMValueRef emit_to_cstr_of(zan_irgen_t *g, LLVMValueRef val,
  * measure length-aware (cached ARC header length / byte[] element count, strlen
  * only for a bare extern char*): a managed payload with an embedded NUL
  * (`Encoding.Utf8FromCodePoint(0)`, binary frames) would otherwise shrink to
- * the bytes before that NUL and the concat would silently drop its tail --
- * same class as strcmp-vs-__zan_str_ocmp and A279's UrlDecode `%00` (B-ID56). */
+ * the bytes before that NUL and the concat would silently drop its tail. */
 static LLVMValueRef emit_cstr_len_of(zan_irgen_t *g, LLVMValueRef s,
                                      zan_ast_node_t *ast) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);

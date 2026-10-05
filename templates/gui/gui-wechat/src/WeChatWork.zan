@@ -7,7 +7,7 @@ using Gui.Backend;
 using Gui.Component;
 using Gui.Widget;
 
-/// 工作台页（A327-14 工作流化）：导轨第五页。左栏 tab（我的待办 /
+/// 工作台页：导轨第五页。左栏 tab（我的待办 /
 /// 待认领 / 待我验收 / 模板）+ 新建模板；中栏行列表；右栏多形态
 /// （流程实例详情 / 模板详情与发起 / 模板编辑器 / 选负责人）。
 /// 数据全走 /api/flow：可定制可复用的流程模板（flow_def + flow_node，
@@ -234,7 +234,7 @@ class WxPageWork : Control {
                         this.Note("详情拉取失败：" + WxNet.ErrOf(r));
                         return;
                     }
-                    this.BuildInstPanel(WxNet.DataOf(r));
+                    this.BuildInstPanelDetail(WxFlowInstDetail.FromJson(WxNet.DataOf(r)));
                 } catch (Exception ex) { this.Note(ex.Message); }
             });
     }
@@ -248,7 +248,7 @@ class WxPageWork : Control {
                         this.Note("模板拉取失败：" + WxNet.ErrOf(r));
                         return;
                     }
-                    this.BuildTplPanel(WxNet.DataOf(r));
+                    this.BuildTplPanelDetail(WxFlowDefDetail.FromJson(WxNet.DataOf(r)));
                 } catch (Exception ex) { this.Note(ex.Message); }
             });
     }
@@ -296,16 +296,16 @@ class WxPageWork : Control {
         Flex head = Wx.Row("wxphead");
         Panel ht = Panel.Column();
         ht.Class = "grow";
+        ht.Grow();
         ht.Add(Wx.Lbl(title, "wxpname"));
         head.Add(ht);
         Button close = Wx.IconBtn("dots");
-        close.dock = 4;
         close.OnClick(() => { this.CloseDetail(); });
         head.Add(close);
         into.Add(head);
         into.Add(Wx.Line());
         Panel body = Wx.Col("wxpbody");
-        body.dock = 5;
+        body.Grow();
         into.Add(body);
         return body;
     }
@@ -313,7 +313,6 @@ class WxPageWork : Control {
     /// 摆一个动作钮。
     void ActBtn(Panel body, string label, Action fire) {
         Button b = new Button(label);
-        b.dock = 1;
         b.OnClick(() => {
             try { fire(); }
             catch (Exception ex) { this.Note(ex.Message); }
@@ -323,36 +322,33 @@ class WxPageWork : Control {
 
     /* ---- 形态一：流程实例详情 ---- */
 
-    void BuildInstPanel(JsonValue d) {
+    void BuildInstPanelDetail(WxFlowInstDetail d) {
         this.EnsureDetailBody();
         detailBody.RemoveAll();
         statusLbl = null;
 
         Panel card = Panel.Root("wxworkcard");
         card.Class = "grow";
-        Panel body = this.CardHead(d.Str("title", ""), card);
-        int st = Convert.ToInt32(d.Str("status", "1"));
+        Panel body = this.CardHead(d.title, card);
+        int st = d.status;
         body.Add(Wx.Lbl(WxPageWork.InstZh(st) + " · 流程 "
-            + d.Str("defName", "") + " · 发起 "
-            + d.Str("startedByName", ""), "wxpsub"));
+            + d.defName + " · 发起 "
+            + d.startedByName, "wxpsub"));
 
         // 节点链：顺序环节 + 最新一次任务状态。
-        JsonValue nodes = d.Get("nodes");
-        int nn = nodes == null ? 0 : nodes.Count();
+        int nn = d.nodes != null ? d.nodes.Count : 0;
         body.Add(Wx.Line());
         for (int i = 0; i < nn; i = i + 1) {
-            JsonValue n = nodes.At(i);
-            string line = Convert.ToString(i + 1) + ". " + n.Str("name", "");
-            JsonValue ts = n.Get("tasks");
-            int tn = ts == null ? 0 : ts.Count();
+            WxFlowNodeItem n = d.nodes[i];
+            string line = Convert.ToString(i + 1) + ". " + n.name;
+            int tn = n.tasks != null ? n.tasks.Count : 0;
             if (tn > 0) {
-                JsonValue t = ts.At(tn - 1);
-                line = line + " —— " + WxPageWork.TaskZh(
-                    Convert.ToInt32(t.Str("status", "0")));
-                string who = WxTaskSheet.Who(t.Str("assignUserId", "0"));
+                WxFlowTaskItem t = n.tasks[tn - 1];
+                line = line + " —— " + WxPageWork.TaskZh(t.status);
+                string who = WxTaskSheet.Who(t.assignUserId);
                 if (who != "-") { line = line + " · " + who; }
-                string res = t.Str("result", "");
-                if (res.Length > 0 && t.Str("status", "0") == "3") {
+                string res = t.result;
+                if (res.Length > 0 && t.status == 3) {
                     line = line + "：" + res;
                 }
             } else {
@@ -364,12 +360,10 @@ class WxPageWork : Control {
         // 动作区：按选中行的上下文（tab × 任务状态 × 发起人）摆钮。
         body.Add(Wx.Line());
         Input noteIn = new Input("汇报 / 驳回理由（动作要填的写这里）");
-        noteIn.dock = 1;
         body.Add(noteIn);
         Switch repool = new Switch();
         Flex pr = Wx.Row("");
         pr.Add(Wx.Lbl("驳回后回部门池重新认领", "wxpsub grow"));
-        repool.dock = 4;
         pr.Add(repool);
         body.Add(pr);
         if (picked != null && st == 1) {
@@ -398,7 +392,7 @@ class WxPageWork : Control {
                         + "&repool=" + (repool.IsOn() ? "1" : "0"));
                 });
             }
-            if (d.Str("startedBy", "0") == myId) {
+            if (d.startedBy == myId) {
                 this.ActBtn(body, "终止流程", () => {
                     this.Act("/api/flow/flowcancel",
                         "instId=" + picked.instId);
@@ -413,14 +407,13 @@ class WxPageWork : Control {
         // 流水（最近 12 条，升序取尾段倒着摆，最新在上）。
         body.Add(Wx.Line());
         body.Add(Wx.Lbl("动态", "wxemotitle"));
-        JsonValue logs = d.Get("logs");
-        int ln = logs == null ? 0 : logs.Count();
+        int ln = d.logs != null ? d.logs.Count : 0;
         int from = ln > 12 ? ln - 12 : 0;
         for (int i = ln - 1; i >= from; i = i - 1) {
-            JsonValue e = logs.At(i);
-            body.Add(Wx.Lbl(e.Str("content", "") + " · "
-                + e.Str("userName", "") + " · "
-                + WxIm.ClockOf(e.Str("at", "0")), "wxpsub"));
+            WxFlowLogItem e = d.logs[i];
+            body.Add(Wx.Lbl(e.content + " · "
+                + e.userName + " · "
+                + WxIm.ClockOf(e.at), "wxpsub"));
         }
         if (ln == 0) { body.Add(Wx.Lbl("暂无动态", "wxpsub")); }
 
@@ -432,26 +425,29 @@ class WxPageWork : Control {
         { if (app != null) { app.RequestRedraw(); } }
     }
 
+    void BuildInstPanel(JsonValue d) {
+        this.BuildInstPanelDetail(WxFlowInstDetail.FromJson(d));
+    }
+
     /* ---- 形态二：模板详情 + 发起 ---- */
 
-    void BuildTplPanel(JsonValue d) {
+    void BuildTplPanelDetail(WxFlowDefDetail d) {
         this.EnsureDetailBody();
         detailBody.RemoveAll();
         statusLbl = null;
 
         Panel card = Panel.Root("wxworkcard");
         card.Class = "grow";
-        Panel body = this.CardHead(d.Str("name", ""), card);
-        string desc = d.Str("description", "");
+        Panel body = this.CardHead(d.name, card);
+        string desc = d.description;
         body.Add(Wx.Lbl("流程模板 · "
             + (desc.Length > 0 ? desc : "（无描述）"), "wxpsub"));
-        JsonValue nodes = d.Get("nodes");
-        int nn = nodes == null ? 0 : nodes.Count();
+        int nn = d.nodes != null ? d.nodes.Count : 0;
         body.Add(Wx.Line());
         for (int i = 0; i < nn; i = i + 1) {
-            JsonValue n = nodes.At(i);
-            string line = Convert.ToString(i + 1) + ". " + n.Str("name", "");
-            string uid = n.Str("assignUserId", "0");
+            WxFlowNodeItem n = d.nodes[i];
+            string line = Convert.ToString(i + 1) + ". " + n.name;
+            string uid = n.assignUserId;
             if (uid != "0") {
                 line = line + " · " + WxTaskSheet.Who(uid);
             } else {
@@ -462,7 +458,6 @@ class WxPageWork : Control {
 
         body.Add(Wx.Line());
         Input title = new Input("实例标题（必填）");
-        title.dock = 1;
         body.Add(title);
         this.ActBtn(body, "发起流程", () => {
             string t = title.GetText();
@@ -472,10 +467,10 @@ class WxPageWork : Control {
             }
             this.SwitchTab(0);
             this.Act("/api/flow/flowstart",
-                "defId=" + d.Str("id", "") + "&title="
+                "defId=" + d.id + "&title="
                 + Encoding.UrlEncode(t));
         });
-        this.ActBtn(body, "编辑模板", () => { this.EditTemplate(d); });
+        this.ActBtn(body, "编辑模板", () => { this.EditTemplateDetail(d); });
 
         statusLbl = Wx.Lbl("", "wxpsub");
         body.Add(statusLbl);
@@ -483,6 +478,10 @@ class WxPageWork : Control {
 
         if (detailCol != null) { detailCol.visible = true; }
         { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    void BuildTplPanel(JsonValue d) {
+        this.BuildTplPanelDetail(WxFlowDefDetail.FromJson(d));
     }
 
     /* ---- 形态三：模板编辑器（新建 / 复用改造）----
@@ -528,15 +527,12 @@ class WxPageWork : Control {
         body.Add(Wx.Lbl("环节按从上到下依次流转；不指派人的环节由所选"
             + "部门整队认领。", "wxpsub"));
         eName = new Input("流程名称（必填）");
-        eName.dock = 1;
         if (edName.Length > 0) { eName.SetText(edName); }
         body.Add(eName);
         eDesc = new Input("描述（选填）");
-        eDesc.dock = 1;
         if (edDesc.Length > 0) { eDesc.SetText(edDesc); }
         body.Add(eDesc);
         stageBox = Panel.Column();
-        stageBox.dock = 1;
         body.Add(stageBox);
         for (int i = 0; i < stages.Count; i = i + 1) {
             this.AddStageRow(stages[i]);
@@ -672,7 +668,6 @@ class WxPageWork : Control {
             WxDept c = contacts[i];
             Button b = new Button(c.name);
             b.Class = "text small";
-            b.dock = 1;
             b.OnClick(() => {
                 picking.userId = c.id;
                 picking.deptId = "0";
@@ -685,7 +680,6 @@ class WxPageWork : Control {
             WxDept dp = depts[i];
             Button b = new Button("部门池：" + dp.name);
             b.Class = "text small";
-            b.dock = 1;
             b.OnClick(() => {
                 picking.userId = "0";
                 picking.deptId = dp.id;
@@ -696,7 +690,6 @@ class WxPageWork : Control {
         }
         Button back = new Button("返回编辑");
         back.Class = "text small";
-        back.dock = 1;
         back.OnClick(() => { this.BuildEditor(); });
         body.Add(back);
         statusLbl = Wx.Lbl("", "wxpsub");
@@ -705,20 +698,19 @@ class WxPageWork : Control {
         { if (app != null) { app.RequestRedraw(); } }
     }
 
-    /// 模板详情卡里的「编辑」入口：详情喂进编辑器状态。
-    void EditTemplate(JsonValue d) {
-        editDefId = d.Str("id", "0");
-        edName = d.Str("name", "");
-        edDesc = d.Str("description", "");
+    /// 模板详情卡里的「编辑」入口：强类型实体喂进编辑器状态。
+    void EditTemplateDetail(WxFlowDefDetail d) {
+        editDefId = d.id;
+        edName = d.name;
+        edDesc = d.description;
         stages = new List<WxStageData>();
-        JsonValue nodes = d.Get("nodes");
-        int nn = nodes == null ? 0 : nodes.Count();
+        int nn = d.nodes != null ? d.nodes.Count : 0;
         for (int i = 0; i < nn; i = i + 1) {
-            JsonValue n = nodes.At(i);
+            WxFlowNodeItem n = d.nodes[i];
             WxStageData sd = new WxStageData();
-            sd.name = n.Str("name", "");
-            sd.userId = n.Str("assignUserId", "0");
-            sd.deptId = n.Str("deptId", "0");
+            sd.name = n.name;
+            sd.userId = n.assignUserId;
+            sd.deptId = n.deptId;
             if (sd.userId != "0") {
                 sd.who = WxTaskSheet.Who(sd.userId);
             } else if (sd.deptId != "0") {
@@ -727,6 +719,11 @@ class WxPageWork : Control {
             stages.Add(sd);
         }
         this.BuildEditor();
+    }
+
+    /// 兼容旧 JsonValue 入口：就地转为 WxFlowDefDetail 实体。
+    void EditTemplate(JsonValue d) {
+        this.EditTemplateDetail(WxFlowDefDetail.FromJson(d));
     }
 
     string DeptName(string id) {
@@ -806,12 +803,11 @@ class WxWorkRow : Control {
         string tint = it.kind == 1 ? "primary"
             : WxPageWork.TaskTint(Convert.ToInt32(it.status));
         Avatar av = Wx.AvaIcon(it.kind == 1 ? "target" : "box", 40, tint);
-        av.dock = 3;
         this.Add(av);
         Flex mid = Flex.Column();
         mid.AddClass("wxmid");
         mid.Justify("center");
-        mid.dock = 5;
+        mid.Grow();
         mid.Add(Wx.Lbl(it.title, "wxfavname"));
         string sub;
         if (it.kind == 1) {
@@ -826,7 +822,6 @@ class WxWorkRow : Control {
         Flex meta = Flex.Column();
         meta.AddClass("wxmeta");
         meta.Justify("center");
-        meta.dock = 4;
         Flex r1 = Wx.Row("");
         r1.Justify("end");
         r1.Add(Wx.Lbl(it.kind == 1 ? it.nodeCount + " 环" : "", "wxworkmeta"));

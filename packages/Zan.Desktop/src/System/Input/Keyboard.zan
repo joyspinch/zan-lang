@@ -189,10 +189,10 @@ class Keyboard {
     static bool IsDown(int vk) {
         #if WINDOWS
         return (Keyboard.WinGetAsyncKeyState(vk) & 0x8000) != 0;
+        #elif LINUX || MACOS
+        return Keyboard.NativeIsDown(vk) != 0;
         #else
-        throw new PlatformNotSupportedException(
-            "Keyboard.IsDown needs a live X11/Quartz keyboard query, which "
-            + "the command-line injection backends do not provide");
+        return false;
         #endif
     }
 
@@ -202,8 +202,7 @@ class Keyboard {
         #if WINDOWS
         return (Keyboard.WinGetKeyState(vk) & 0x0001) != 0;
         #elif MACOS
-        throw new PlatformNotSupportedException(
-            "Keyboard.IsToggled is not available through System Events");
+        return Keyboard.NativeIsToggled(vk) != 0;
         #else
         if (InputTool.Kind() != InputTool.Xdotool()) {
             InputTool.Missing("Keyboard.IsToggled");
@@ -408,18 +407,29 @@ class Keyboard {
     #endif
 
     #if !WINDOWS
-    /// 通过 xdotool 发送一次 keydown/keyup。keysym 未知时明确报错，
-    /// 而不是发一个碰巧能编出来的错键。
+    #if LINUX || MACOS
+    [DllImport("zan_gui", EntryPoint = "zan_keyboard_is_down")]
+    static extern int NativeIsDown(int vk);
+
+    [DllImport("zan_gui", EntryPoint = "zan_keyboard_is_toggled")]
+    static extern int NativeIsToggled(int vk);
+
+    [DllImport("zan_gui", EntryPoint = "zan_keyboard_post")]
+    static extern int NativePost(int vk, int isDown);
+    #endif
+
+    /// 通过系统原生驱动或 xdotool 发送一次 keydown/keyup。
     static void PosixKey(int vk, string action, string what) {
         #if MACOS
-        throw new PlatformNotSupportedException(
-            what + ": System Events has no key-down/key-up primitive, only "
-            + "whole keystrokes (use Keyboard.Press/Send/SendText)");
+        int down = (action == "keydown") ? 1 : 0;
+        if (Keyboard.NativePost(vk, down) == 0) {
+            Keyboard.Press(vk);
+        }
         #else
         if (InputTool.Kind() != InputTool.Xdotool()) { InputTool.Missing(what); }
         string sym = InputTool.Keysym(vk);
         if (sym.Length == 0) {
-            throw new PlatformNotSupportedException(
+            throw new ArgumentException(
                 what + ": no X11 keysym for VK 0x" + Keyboard.Hex(vk));
         }
         if (!InputTool.Run("xdotool " + action + " --clearmodifiers " + sym)) {

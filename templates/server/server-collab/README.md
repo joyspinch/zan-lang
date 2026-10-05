@@ -439,17 +439,16 @@ every sign-in "wrong password").
   转交）/ `taskstart` / `taskprogress` / `taskblock|taskunblock` / `tasksubmit` /
   `taskapprove|taskreject` / `taskcancel`，事件时间线只追加），配额计数器 CAS（`oa_attach_usage`）；
   验证 `tools/e2e_collab.py`（契约 113 项）与 `tools/e2e_realtime.py`（生产配置
-  实时 25 项）；AI 总结仍为提案，契约见下节「协作域契约（A327 提案）」
+  实时 25 项）；AI 总结仍为提案，契约见下节「协作域契约」
 
-## 协作域契约（A327 提案——会话/成员/消息/实时事件/附件/任务已落地，其余端点未实现）
+## 协作域契约（会话/成员/消息/实时事件/附件/任务已落地，其余端点未实现）
 
 gui-wechat（桌面客户端）× server-collab 的闭环改造规划分四期：P0 契约与安全
-基础 → P1 协作 MVP → P2 后台治理 → P3 AI 经验总结，逐卡台账见仓库根
-`TASKS.md` **A327-01..22**。总原则：**旧域只读不动、新域旁路增量、存量零迁移**
+基础 → P1 协作 MVP → P2 后台治理 → P3 AI 经验总结。总原则：**旧域只读不动、新域旁路增量、存量零迁移**
 ——`oa_message` / `oa_attachment` / `flow_task` / `oa_todo` 一律不搬家：私聊
 历史以合成 direct 会话视图呈现，协作附件经引用表指向 `oa_attachment` 原行。
 本节端点与表名均为提案，落地时以路由属性派生的 `/api/docs` 实况为准，并在
-对应台账卡闭账时校准。
+对应功能落地时校准。
 
 ### 领域边界（四种语义不混用）
 
@@ -497,7 +496,7 @@ collab_attachment_link  id, tenantId, attachmentId→oa_attachment,
 |---|---|---|
 | 会话 | conversations / members / 未读摘要 | 创建群聊、加人/移除/退出/改名（成员变更 CAS） |
 | 消息 | 按 conversationId + before/after/limit 游标分页 | 发文本/引用/图片/文件/任务卡片；删除撤回 |
-| 附件 | 缩略图、预览、流式下载 | 单请求流式上传（幂等键重放）→ 绑定到消息（任务随 A327-10） |
+| 附件 | 缩略图、预览、流式下载 | 单请求流式上传（幂等键重放）→ 绑定到消息（任务可绑定附件） |
 | 任务 | 我的任务 / 任务池 / 详情 / 事件时间线 | 创建、分配、认领、进度、阻塞、转交、验收、完成/驳回、取消 |
 | 事件 | events?after=\<eventId\> | 由领域写事务产生，客户端只读 |
 | AI | 总结任务状态、来源引用 | 创建/取消/审核/发布（默认只读，不改任务与结构） |
@@ -523,7 +522,7 @@ WHERE id=? AND tenantId=? AND assigneeId=0 AND status='unassigned' AND version=?
 - payload 只放接收者有权看到的紧凑摘要，长正文留在领域表按权限另取；
 - 多 worker 沿用 MessageRelay 的「表即总线 + 每 worker 水位扫描」定案；
 - **验收纪律：后台协程开启（不设 `ZAN_NO_BG`）下的 e2e 才算实时链路验证**
-  ——现有 `e2e_im.py` 以 `ZAN_NO_BG=1` 起服规避 A321（见 `TASKS.md`），
+  ——`e2e_im.py` 以 `ZAN_NO_BG=1` 起服仅用于单步隔离测试，
   该状态不作为生产实时能力已验证的依据。
 
 ### 权限矩阵（最小规则）
@@ -548,7 +547,7 @@ WHERE id=? AND tenantId=? AND assigneeId=0 AND status='unassigned' AND version=?
 
 ### 明确不纳入 MVP
 
-不重做 A322 已收口的 HTML 骨架；不改 `flow_task` 语义；`oa_todo` 只做个人
+不重做已收口的 HTML 骨架；不改 `flow_task` 语义；`oa_todo` 只做个人
 待办；客户端文件面板弃用假数据改真上传；电话/视频按钮在具备真实能力前隐藏
 或标注未启用；AI 默认只读、不自动 DDL / 改权限 / 改任务状态；
 `ZAN_NO_BG=1` 下的测试不算实时已验证。

@@ -89,8 +89,8 @@ char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len) {
     while (got < content_length) {
         /* The reader ABI takes an int count. With max_len <= 0 ("no limit",
          * which the contract allows) content_length can exceed INT_MAX, and
-         * the plain cast truncated the request to a negative or tiny count
-         * (A291). Cap one read and loop for the rest. */
+         * the plain cast truncated the request to a negative or tiny count.
+         * Cap one read and loop for the rest. */
         long want = content_length - got;
         if (want > 2147483647L) want = 2147483647L;
         int r = reader(ctx, body + got, (int)want);

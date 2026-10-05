@@ -167,7 +167,7 @@ static char g_wasm_shared_string[ZAN_TABLE_MAX_STRING + 1];
 i64 zan_shared_table_hash(const char *value) {
     /* FNV-1a, same as zan_hash_bytes in rt_sync.c -- callers may persist
      * hashes, keep the algorithm identical. Remap 0 to 1 like the native
-     * side: a persisted 0 doubles as "no hash" downstream (B-ID81f). */
+     * side: a persisted 0 doubles as "no hash" downstream. */
     if (!value) return 0;
     uint64_t h = 1469598103934665603ull;
     for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
@@ -411,7 +411,7 @@ int zan_io_socket_alive(long long sock) {
     return 0;
 }
 
-/* A291-5 close-notification hook: wasm32 has no reactor and no waiters to
+/* Close-notification hook: wasm32 has no reactor and no waiters to
  * fail; Socket.Close still calls it, so provide the symbol. */
 void zan_io_close_notify(long long sock) {
     (void)sock;

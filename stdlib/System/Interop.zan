@@ -120,23 +120,28 @@ class Interop {
         if (fn == 0) { return ""; }
         GetEnvironmentVariableWFn call = (GetEnvironmentVariableWFn)fn;
         nint wname = Wide.Of(name);
-        nint buf = NativeMemory.Alloc(2048);
-        new Span<short>(buf, 1)[0] = 0;
-        int size = 1023;
-        int units = call(wname, buf, size);
-        // 截断探测（B-ID84）：值放不下时 Win32 返回所需码元数而非报错，
-        // 静默截断会让长 PATH/TZ 之类的值悄悄缺尾。按所需尺寸重试一次，
-        // 上限 32K 码元，够 Windows 环境变量的实际天花板。
-        if (units >= size && units < 32768) {
-            NativeMemory.Free(buf);
-            size = units + 1;
-            buf = NativeMemory.Alloc(size * 2);
-            units = call(wname, buf, size);
-        }
+        nint buf = 0;
         string text = "";
-        if (units > 0 && units < size) { text = Wide.Read(buf); }
-        NativeMemory.Free(buf);
-        Wide.Free(wname);
+        try {
+            buf = NativeMemory.Alloc(2048);
+            new Span<short>(buf, 1)[0] = 0;
+            int size = 1023;
+            int units = call(wname, buf, size);
+            // 截断探测：值放不下时 Win32 返回所需码元数而非报错，
+            // 避免长 PATH/TZ 环境变量静默截断。按所需尺寸重试一次，
+            // 上限 32K 码元，满足 Windows 环境变量上限要求。
+            if (units >= size && units < 32768) {
+                NativeMemory.Free(buf);
+                buf = 0;
+                size = units + 1;
+                buf = NativeMemory.Alloc(size * 2);
+                units = call(wname, buf, size);
+            }
+            if (units > 0 && units < size) { text = Wide.Read(buf); }
+        } finally {
+            if (buf != 0) { NativeMemory.Free(buf); }
+            Wide.Free(wname);
+        }
         return text;
         #else
         // 非 Windows 平台下 kernel32 导入在链接时被 stub，因此
@@ -178,13 +183,17 @@ class Wide {
         if (s == null) { return 0; }
         int bytes = s.Length;
         nint src = NativeMemory.Alloc(bytes + 1);
-        NativeMemory.PutString(src, 0, s, bytes);
-        new Span<byte>(src + bytes, 1)[0] = 0;
-        int units = Wide.ToWide(Wide.Utf8(), 0, src, bytes + 1, 0, 0);
-        if (units <= 0) { units = 1; }
-        nint dst = NativeMemory.Alloc(units * 2 + 2);
-        Wide.ToWide(Wide.Utf8(), 0, src, bytes + 1, dst, units);
-        NativeMemory.Free(src);
+        nint dst = 0;
+        try {
+            NativeMemory.PutString(src, 0, s, bytes);
+            new Span<byte>(src + bytes, 1)[0] = 0;
+            int units = Wide.ToWide(Wide.Utf8(), 0, src, bytes + 1, 0, 0);
+            if (units <= 0) { units = 1; }
+            dst = NativeMemory.Alloc(units * 2 + 2);
+            Wide.ToWide(Wide.Utf8(), 0, src, bytes + 1, dst, units);
+        } finally {
+            NativeMemory.Free(src);
+        }
         return dst;
     }
 
@@ -194,9 +203,13 @@ class Wide {
         int bytes = Wide.ToMulti(Wide.Utf8(), 0, p, -1, 0, 0, 0, 0);
         if (bytes <= 1) { return ""; }
         nint buf = NativeMemory.Alloc(bytes + 1);
-        Wide.ToMulti(Wide.Utf8(), 0, p, -1, buf, bytes, 0, 0);
-        string s = NativeMemory.GetString(buf, 0, bytes - 1);
-        NativeMemory.Free(buf);
+        string s = "";
+        try {
+            Wide.ToMulti(Wide.Utf8(), 0, p, -1, buf, bytes, 0, 0);
+            s = NativeMemory.GetString(buf, 0, bytes - 1);
+        } finally {
+            NativeMemory.Free(buf);
+        }
         return s;
     }
 
@@ -457,10 +470,8 @@ class Com {
     }
 
     /// 将 `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` 解析为新建的
-    /// 16 字节 GUID（前三个字段为小端，符合 COM 预期）。文本形状
-    /// 不对（长度/连字符位置/十六进制字符）就抛 ArgumentException——
-    /// 原来非法字符静默按 0，排障时只看到"类未注册"这类误导性失败
-    ///（B-ID84）。
+    /// 16 字节 GUID（前三个字段为小端，符合 COM 预期）。文本格式
+    /// 不匹配（长度/连字符位置/十六进制字符）时抛 ArgumentException。
     static nint Guid(string text) {
         if (text.Length != 36) {
             throw new ArgumentException(

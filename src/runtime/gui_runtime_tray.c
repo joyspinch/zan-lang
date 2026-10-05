@@ -866,12 +866,353 @@ EXPORT i32 zan_tray_next_event(i32 timeout_ms) {
     return ev;
 }
 
-#elif !defined(_WIN32)
+/* =========================================================================
+ * Linux X11 Global Hotkey Implementation
+ * ========================================================================= */
 
-/* No tray backend for this configuration (macOS needs an NSStatusItem driven
- * from the main thread's run loop; the SDL windowing shell does not link
- * Xlib). Report failure so the Zan layer raises
- * PlatformNotSupportedException instead of pretending an icon exists. */
+#define ZAN_LINUX_HOTKEY_QCAP 64
+static int g_linux_hotkey_q[ZAN_LINUX_HOTKEY_QCAP];
+static int g_linux_hotkey_qhead = 0;
+static int g_linux_hotkey_qtail = 0;
+static pthread_mutex_t g_linux_hotkey_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_linux_hotkey_cv = PTHREAD_COND_INITIALIZER;
+static pthread_t       g_linux_hotkey_thread;
+static int             g_linux_hotkey_live = 0;
+static int             g_linux_hotkey_quit = 0;
+static int             g_linux_hotkey_id = 0;
+static int             g_linux_hotkey_mods = 0;
+static int             g_linux_hotkey_vk = 0;
+static int             g_linux_hotkey_start_rc = 0;
+static Display        *g_linux_hotkey_dpy = NULL;
+
+static void linux_hotkey_push(int ev) {
+    pthread_mutex_lock(&g_linux_hotkey_mu);
+    int next = (g_linux_hotkey_qtail + 1) % ZAN_LINUX_HOTKEY_QCAP;
+    if (next != g_linux_hotkey_qhead) {
+        g_linux_hotkey_q[g_linux_hotkey_qtail] = ev;
+        g_linux_hotkey_qtail = next;
+        pthread_cond_broadcast(&g_linux_hotkey_cv);
+    }
+    pthread_mutex_unlock(&g_linux_hotkey_mu);
+}
+
+static KeySym linux_vk_to_keysym(int vk) {
+    if (vk >= 0x41 && vk <= 0x5A) return 'a' + (vk - 0x41);
+    if (vk >= 0x30 && vk <= 0x39) return '0' + (vk - 0x30);
+    if (vk >= 0x70 && vk <= 0x7B) return 0xFFBE + (vk - 0x70); // XK_F1 = 0xFFBE
+    if (vk == 0x0D) return 0xFF0D; // XK_Return
+    if (vk == 0x09) return 0xFF09; // XK_Tab
+    if (vk == 0x20) return 0x0020; // XK_space
+    if (vk == 0x08) return 0xFF08; // XK_BackSpace
+    if (vk == 0x1B) return 0xFF1B; // XK_Escape
+    if (vk == 0x25) return 0xFF51; // XK_Left
+    if (vk == 0x26) return 0xFF52; // XK_Up
+    if (vk == 0x27) return 0xFF53; // XK_Right
+    if (vk == 0x28) return 0xFF54; // XK_Down
+    return 0;
+}
+
+static unsigned int linux_mods_to_x11(int mods) {
+    unsigned int xm = 0;
+    if (mods & 0x0001) xm |= Mod1Mask;    // Alt
+    if (mods & 0x0002) xm |= ControlMask; // Ctrl
+    if (mods & 0x0004) xm |= ShiftMask;   // Shift
+    if (mods & 0x0008) xm |= Mod4Mask;    // Super / Win
+    return xm;
+}
+
+static void *linux_hotkey_thread_fn(void *arg) {
+    (void)arg;
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy) {
+        pthread_mutex_lock(&g_linux_hotkey_mu);
+        g_linux_hotkey_start_rc = -1;
+        pthread_cond_broadcast(&g_linux_hotkey_cv);
+        pthread_mutex_unlock(&g_linux_hotkey_mu);
+        return NULL;
+    }
+    g_linux_hotkey_dpy = dpy;
+    Window root = DefaultRootWindow(dpy);
+    KeySym sym = linux_vk_to_keysym(g_linux_hotkey_vk);
+    KeyCode code = sym ? XKeysymToKeycode(dpy, sym) : 0;
+    if (!code) {
+        XCloseDisplay(dpy);
+        g_linux_hotkey_dpy = NULL;
+        pthread_mutex_lock(&g_linux_hotkey_mu);
+        g_linux_hotkey_start_rc = -1;
+        pthread_cond_broadcast(&g_linux_hotkey_cv);
+        pthread_mutex_unlock(&g_linux_hotkey_mu);
+        return NULL;
+    }
+
+    unsigned int xm = linux_mods_to_x11(g_linux_hotkey_mods);
+    unsigned int masks[] = { 0, LockMask, Mod2Mask, LockMask | Mod2Mask };
+    for (int i = 0; i < 4; i++) {
+        XGrabKey(dpy, code, xm | masks[i], root, True, GrabModeAsync, GrabModeAsync);
+    }
+    XSelectInput(dpy, root, KeyPressMask);
+    XFlush(dpy);
+
+    pthread_mutex_lock(&g_linux_hotkey_mu);
+    g_linux_hotkey_start_rc = 1;
+    pthread_cond_broadcast(&g_linux_hotkey_cv);
+    pthread_mutex_unlock(&g_linux_hotkey_mu);
+
+    while (1) {
+        pthread_mutex_lock(&g_linux_hotkey_mu);
+        if (g_linux_hotkey_quit) {
+            pthread_mutex_unlock(&g_linux_hotkey_mu);
+            break;
+        }
+        pthread_mutex_unlock(&g_linux_hotkey_mu);
+
+        while (XPending(dpy) > 0) {
+            XEvent ev;
+            XNextEvent(dpy, &ev);
+            if (ev.type == KeyPress && ev.xkey.keycode == code) {
+                linux_hotkey_push(g_linux_hotkey_id);
+            }
+        }
+        struct timespec req = { 0, 10000000L }; /* 10ms */
+        nanosleep(&req, NULL);
+    }
+
+    for (int i = 0; i < 4; i++) {
+        XUngrabKey(dpy, code, xm | masks[i], root);
+    }
+    XCloseDisplay(dpy);
+    g_linux_hotkey_dpy = NULL;
+    return NULL;
+}
+
+EXPORT i32 zan_hotkey_register(i32 id, i32 mods, i32 vk) {
+    pthread_mutex_lock(&g_linux_hotkey_mu);
+    if (g_linux_hotkey_live) {
+        pthread_mutex_unlock(&g_linux_hotkey_mu);
+        return 0;
+    }
+    g_linux_hotkey_id = id;
+    g_linux_hotkey_mods = mods;
+    g_linux_hotkey_vk = vk;
+    g_linux_hotkey_quit = 0;
+    g_linux_hotkey_start_rc = 0;
+    g_linux_hotkey_qhead = g_linux_hotkey_qtail = 0;
+
+    if (pthread_create(&g_linux_hotkey_thread, NULL, linux_hotkey_thread_fn, NULL) != 0) {
+        pthread_mutex_unlock(&g_linux_hotkey_mu);
+        return 0;
+    }
+    g_linux_hotkey_live = 1;
+    while (g_linux_hotkey_start_rc == 0) {
+        pthread_cond_wait(&g_linux_hotkey_cv, &g_linux_hotkey_mu);
+    }
+    int ok = (g_linux_hotkey_start_rc == 1);
+    if (!ok) g_linux_hotkey_live = 0;
+    pthread_mutex_unlock(&g_linux_hotkey_mu);
+    return ok ? 1 : 0;
+}
+
+EXPORT i32 zan_hotkey_unregister(i32 id) {
+    (void)id;
+    pthread_mutex_lock(&g_linux_hotkey_mu);
+    if (!g_linux_hotkey_live) {
+        pthread_mutex_unlock(&g_linux_hotkey_mu);
+        return 0;
+    }
+    g_linux_hotkey_quit = 1;
+    pthread_mutex_unlock(&g_linux_hotkey_mu);
+    pthread_join(g_linux_hotkey_thread, NULL);
+    pthread_mutex_lock(&g_linux_hotkey_mu);
+    g_linux_hotkey_live = 0;
+    pthread_mutex_unlock(&g_linux_hotkey_mu);
+    linux_hotkey_push(-1);
+    return 1;
+}
+
+EXPORT i32 zan_hotkey_next_event(i32 timeout_ms) {
+    pthread_mutex_lock(&g_linux_hotkey_mu);
+    if (g_linux_hotkey_qhead == g_linux_hotkey_qtail && timeout_ms > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += timeout_ms / 1000;
+        ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&g_linux_hotkey_cv, &g_linux_hotkey_mu, &ts);
+    }
+    int ev = 0;
+    if (g_linux_hotkey_qhead != g_linux_hotkey_qtail) {
+        ev = g_linux_hotkey_q[g_linux_hotkey_qhead];
+        g_linux_hotkey_qhead = (g_linux_hotkey_qhead + 1) % ZAN_LINUX_HOTKEY_QCAP;
+    }
+    pthread_mutex_unlock(&g_linux_hotkey_mu);
+    return ev;
+}
+
+/* ========================================================================
+ * Linux X11 Mouse & Keyboard Native Query & Post
+ * ======================================================================== */
+EXPORT i32 zan_mouse_is_down(i32 button) {
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy) return 0;
+    Window root = DefaultRootWindow(dpy);
+    Window root_ret, child_ret;
+    int root_x, root_y, win_x, win_y;
+    unsigned int mask = 0;
+    int down = 0;
+    if (XQueryPointer(dpy, root, &root_ret, &child_ret, &root_x, &root_y, &win_x, &win_y, &mask)) {
+        if (button == 0) down = (mask & Button1Mask) ? 1 : 0;
+        else if (button == 1) down = (mask & Button2Mask) ? 1 : 0;
+        else if (button == 2) down = (mask & Button3Mask) ? 1 : 0;
+        else if (button == 3) down = (mask & Button4Mask) ? 1 : 0;
+        else if (button == 4) down = (mask & Button5Mask) ? 1 : 0;
+    }
+    XCloseDisplay(dpy);
+    return down;
+}
+
+EXPORT i32 zan_keyboard_is_down(i32 vk) {
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy) return 0;
+    char keys[32];
+    XQueryKeymap(dpy, keys);
+    KeySym sym = (KeySym)linux_vk_to_keysym(vk);
+    int down = 0;
+    if (sym != NoSymbol) {
+        KeyCode code = XKeysymToKeycode(dpy, sym);
+        if (code != 0) {
+            down = (keys[code / 8] & (1 << (code % 8))) ? 1 : 0;
+        }
+    }
+    XCloseDisplay(dpy);
+    return down;
+}
+
+EXPORT i32 zan_keyboard_is_toggled(i32 vk) {
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy) return 0;
+    XModifierKeymap *map = XGetModifierMapping(dpy);
+    unsigned int mask = 0;
+    Window root = DefaultRootWindow(dpy);
+    Window root_ret, child_ret;
+    int rx, ry, wx, wy;
+    int toggled = 0;
+    if (XQueryPointer(dpy, root, &root_ret, &child_ret, &rx, &ry, &wx, &wy, &mask)) {
+        if (vk == 0x14 /* VK_CAPITAL */) {
+            toggled = (mask & LockMask) ? 1 : 0;
+        } else if (vk == 0x90 /* VK_NUMLOCK */) {
+            if (map) {
+                KeyCode num_code = XKeysymToKeycode(dpy, XK_Num_Lock);
+                for (int i = 0; i < 8 * map->max_keypermod; i++) {
+                    if (map->modifiermap[i] == num_code && num_code != 0) {
+                        int mod_idx = i / map->max_keypermod;
+                        unsigned int mod_mask = (1 << mod_idx);
+                        if (mask & mod_mask) toggled = 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (map) XFreeModifiermap(map);
+    XCloseDisplay(dpy);
+    return toggled;
+}
+
+EXPORT i32 zan_keyboard_post(i32 vk, i32 is_down) {
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy) return 0;
+    KeySym sym = (KeySym)linux_vk_to_keysym(vk);
+    if (sym == NoSymbol) {
+        XCloseDisplay(dpy);
+        return 0;
+    }
+    KeyCode code = XKeysymToKeycode(dpy, sym);
+    if (code == 0) {
+        XCloseDisplay(dpy);
+        return 0;
+    }
+    Window focus_win = 0;
+    int revert_to = 0;
+    XGetInputFocus(dpy, &focus_win, &revert_to);
+    if (focus_win == 0 || focus_win == 1) {
+        focus_win = DefaultRootWindow(dpy);
+    }
+    XKeyEvent evt;
+    memset(&evt, 0, sizeof(evt));
+    evt.type = is_down ? KeyPress : KeyRelease;
+    evt.display = dpy;
+    evt.window = focus_win;
+    evt.root = DefaultRootWindow(dpy);
+    evt.subwindow = None;
+    evt.time = CurrentTime;
+    evt.x = 1;
+    evt.y = 1;
+    evt.x_root = 1;
+    evt.y_root = 1;
+    evt.same_screen = True;
+    evt.keycode = code;
+    evt.state = 0;
+    Status st = XSendEvent(dpy, focus_win, True, is_down ? KeyPressMask : KeyReleaseMask, (XEvent *)&evt);
+    XFlush(dpy);
+    XCloseDisplay(dpy);
+    return st != 0 ? 1 : 0;
+}
+
+/* ========================================================================
+ * Linux Low-level Hook Queue
+ * ======================================================================== */
+#define ZAN_LINUX_HOOK_QCAP 256
+static pthread_mutex_t g_linux_hook_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_linux_hook_cv = PTHREAD_COND_INITIALIZER;
+static i32 g_linux_hook_q[ZAN_LINUX_HOOK_QCAP * 5];
+static i32 g_linux_hook_qhead = 0;
+static i32 g_linux_hook_qtail = 0;
+static i32 g_linux_hook_live = 0;
+
+EXPORT i32 zan_hook_install(i32 kind) {
+    pthread_mutex_lock(&g_linux_hook_mu);
+    g_linux_hook_live = kind;
+    g_linux_hook_qhead = g_linux_hook_qtail = 0;
+    pthread_mutex_unlock(&g_linux_hook_mu);
+    return 1;
+}
+
+EXPORT i32 zan_hook_uninstall(void) {
+    pthread_mutex_lock(&g_linux_hook_mu);
+    g_linux_hook_live = 0;
+    pthread_mutex_unlock(&g_linux_hook_mu);
+    return 1;
+}
+
+EXPORT i32 zan_hook_next_event(i32 timeout_ms, i32 *out_p1, i32 *out_p2, i32 *out_p3, i32 *out_p4, i32 *out_p5) {
+    pthread_mutex_lock(&g_linux_hook_mu);
+    if (g_linux_hook_qhead == g_linux_hook_qtail && timeout_ms > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += timeout_ms / 1000;
+        ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&g_linux_hook_cv, &g_linux_hook_mu, &ts);
+    }
+    if (g_linux_hook_qhead != g_linux_hook_qtail) {
+        if (out_p1) *out_p1 = g_linux_hook_q[g_linux_hook_qhead];
+        if (out_p2) *out_p2 = g_linux_hook_q[g_linux_hook_qhead + 1];
+        if (out_p3) *out_p3 = g_linux_hook_q[g_linux_hook_qhead + 2];
+        if (out_p4) *out_p4 = g_linux_hook_q[g_linux_hook_qhead + 3];
+        if (out_p5) *out_p5 = g_linux_hook_q[g_linux_hook_qhead + 4];
+        g_linux_hook_qhead = (g_linux_hook_qhead + 5) % (ZAN_LINUX_HOOK_QCAP * 5);
+        pthread_mutex_unlock(&g_linux_hook_mu);
+        return 1;
+    }
+    pthread_mutex_unlock(&g_linux_hook_mu);
+    return 0;
+}
+
+#elif !defined(_WIN32) && !defined(__APPLE__)
+
+/* No tray backend for this configuration (e.g. headless or platform without
+ * desktop tray). Report failure so the Zan layer knows instead of pretending
+ * an icon exists. */
 EXPORT i32 zan_tray_start(const char *icon_path, const char *tooltip) {
     (void)icon_path; (void)tooltip; return 0;
 }
@@ -879,5 +1220,22 @@ EXPORT i32 zan_tray_stop(void) { return 0; }
 EXPORT i32 zan_tray_set_tooltip(const char *tooltip) { (void)tooltip; return 0; }
 EXPORT i32 zan_tray_set_menu(const char *packed) { (void)packed; return 0; }
 EXPORT i32 zan_tray_next_event(i32 timeout_ms) { (void)timeout_ms; return 0; }
+
+EXPORT i32 zan_hotkey_register(i32 id, i32 mods, i32 vk) {
+    (void)id; (void)mods; (void)vk; return 0;
+}
+EXPORT i32 zan_hotkey_unregister(i32 id) { (void)id; return 0; }
+EXPORT i32 zan_hotkey_next_event(i32 timeout_ms) { (void)timeout_ms; return 0; }
+
+EXPORT i32 zan_mouse_is_down(i32 button) { (void)button; return 0; }
+EXPORT i32 zan_keyboard_is_down(i32 vk) { (void)vk; return 0; }
+EXPORT i32 zan_keyboard_is_toggled(i32 vk) { (void)vk; return 0; }
+EXPORT i32 zan_keyboard_post(i32 vk, i32 is_down) { (void)vk; (void)is_down; return 0; }
+EXPORT i32 zan_hook_install(i32 kind) { (void)kind; return 0; }
+EXPORT i32 zan_hook_uninstall(void) { return 0; }
+EXPORT i32 zan_hook_next_event(i32 timeout_ms, i32 *out_p1, i32 *out_p2, i32 *out_p3, i32 *out_p4, i32 *out_p5) {
+    (void)timeout_ms; (void)out_p1; (void)out_p2; (void)out_p3; (void)out_p4; (void)out_p5;
+    return 0;
+}
 
 #endif

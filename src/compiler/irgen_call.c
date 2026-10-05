@@ -939,7 +939,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                              idf, &h, 1, "isdone");
         }
 
-        /* Task.JoinNew(npairs, any) — create a join entry (B-ID56). any != 0
+        /* Task.JoinNew(npairs, any) — create a join entry. any != 0
          * fires on the FIRST completed pair (WhenAny), otherwise when all
          * pairs complete (WhenAll). Returns an opaque entry handle. */
         if (is_call_to(expr, "Task", "JoinNew") && expr->call.args.count == 2) {
@@ -1090,7 +1090,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                              * strlen: a managed string carries its length in
                              * the ARC header, and a payload with an embedded
                              * NUL (UrlDecode's `%00`, binary frames) otherwise
-                             * shrank to the bytes before that NUL (A279). */
+                             * shrank to the bytes before that NUL. */
                             int str_arg = !char_arg &&
                                 LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind &&
                                 is_string_expr(g, arg0, locals);
@@ -1139,7 +1139,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     /* The buffer count is the exact byte length; stamp it so a
                      * receiver with an embedded NUL keeps its Length (without
                      * this the first reader cached a strlen and `%00` content
-                     * still collapsed at the NUL, A279). */
+                     * still collapsed at the NUL). */
                     emit_string_len_set(g, buf, count);
                     emit_intrinsic_drop_recv(g, sbcallee->member.object, raw,
                                              locals, sb_recv_own);

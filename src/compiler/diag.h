@@ -43,7 +43,7 @@ struct zan_diag {
     int               entry_count;
     int               entry_cap;
 
-    /* Cascade suppression (A280): error recovery re-reports failures at each
+    /* Cascade suppression: error recovery re-reports failures at each
      * successive column while it walks an over-deep or otherwise malformed
      * expression, which turned a single over-deep parenthesis nest into
      * thousands of copies of a handful of messages. At most

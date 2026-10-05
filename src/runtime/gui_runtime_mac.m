@@ -2348,3 +2348,459 @@ EXPORT const char *zan_gui_get_clipboard(void) {
         }
     }
 }
+
+/* =========================================================================
+ * macOS System Tray (NSStatusItem) Implementation
+ * ========================================================================= */
+
+#define ZAN_MAC_TRAY_QCAP 64
+static NSStatusItem *g_mac_tray_item = nil;
+static int g_mac_tray_live = 0;
+static int g_mac_tray_q[ZAN_MAC_TRAY_QCAP];
+static int g_mac_tray_qhead = 0;
+static int g_mac_tray_qtail = 0;
+static pthread_mutex_t g_mac_tray_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_mac_tray_cv = PTHREAD_COND_INITIALIZER;
+
+@interface ZanMacTrayTarget : NSObject
+- (void)onTrayClick:(id)sender;
+- (void)onMenuItem:(NSMenuItem *)sender;
+@end
+
+static ZanMacTrayTarget *g_mac_tray_target = nil;
+
+static void mac_tray_push(int ev) {
+    pthread_mutex_lock(&g_mac_tray_mu);
+    int next = (g_mac_tray_qtail + 1) % ZAN_MAC_TRAY_QCAP;
+    if (next != g_mac_tray_qhead) {
+        g_mac_tray_q[g_mac_tray_qtail] = ev;
+        g_mac_tray_qtail = next;
+        pthread_cond_broadcast(&g_mac_tray_cv);
+    }
+    pthread_mutex_unlock(&g_mac_tray_mu);
+}
+
+@implementation ZanMacTrayTarget
+- (void)onTrayClick:(id)sender {
+    (void)sender;
+    NSEvent *cur = [NSApp currentEvent];
+    if (cur && [cur type] == NSEventTypeRightMouseUp) {
+        mac_tray_push(3); /* right click */
+    } else {
+        mac_tray_push(1); /* left click */
+    }
+}
+
+- (void)onMenuItem:(NSMenuItem *)sender {
+    int tag = (int)[sender tag];
+    mac_tray_push(0x10000 | tag);
+}
+@end
+
+EXPORT i32 zan_tray_start(const char *icon_path, const char *tooltip) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_tray_start(icon_path, tooltip));
+    @autoreleasepool {
+        pthread_mutex_lock(&g_mac_tray_mu);
+        if (g_mac_tray_live) {
+            pthread_mutex_unlock(&g_mac_tray_mu);
+            return 0;
+        }
+        g_mac_tray_qhead = g_mac_tray_qtail = 0;
+        g_mac_tray_live = 1;
+        pthread_mutex_unlock(&g_mac_tray_mu);
+
+        if (!g_mac_tray_target) {
+            g_mac_tray_target = [[ZanMacTrayTarget alloc] init];
+        }
+
+        NSStatusBar *bar = [NSStatusBar systemStatusBar];
+        g_mac_tray_item = [[bar statusItemWithLength:NSSquareStatusItemLength] retain];
+        if (!g_mac_tray_item) {
+            pthread_mutex_lock(&g_mac_tray_mu);
+            g_mac_tray_live = 0;
+            pthread_mutex_unlock(&g_mac_tray_mu);
+            return 0;
+        }
+
+        NSStatusBarButton *btn = [g_mac_tray_item button];
+        if (btn) {
+            [btn setTarget:g_mac_tray_target];
+            [btn setAction:@selector(onTrayClick:)];
+            [btn sendActionOn:(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)];
+            if (tooltip && *tooltip) {
+                [btn setToolTip:[NSString stringWithUTF8String:tooltip]];
+            }
+            if (icon_path && *icon_path) {
+                NSString *p = [NSString stringWithUTF8String:icon_path];
+                NSImage *img = [[[NSImage alloc] initWithContentsOfFile:p] autorelease];
+                if (img) {
+                    [img setSize:NSMakeSize(18, 18)];
+                    [img setTemplate:YES];
+                    [btn setImage:img];
+                }
+            }
+        }
+        return 1;
+    }
+}
+
+EXPORT i32 zan_tray_stop(void) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_tray_stop());
+    @autoreleasepool {
+        pthread_mutex_lock(&g_mac_tray_mu);
+        if (!g_mac_tray_live) {
+            pthread_mutex_unlock(&g_mac_tray_mu);
+            return 0;
+        }
+        g_mac_tray_live = 0;
+        pthread_mutex_unlock(&g_mac_tray_mu);
+
+        mac_tray_push(-1);
+
+        if (g_mac_tray_item) {
+            [[NSStatusBar systemStatusBar] removeStatusItem:g_mac_tray_item];
+            [g_mac_tray_item release];
+            g_mac_tray_item = nil;
+        }
+        return 1;
+    }
+}
+
+EXPORT i32 zan_tray_set_tooltip(const char *tooltip) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_tray_set_tooltip(tooltip));
+    @autoreleasepool {
+        if (!g_mac_tray_item) return 0;
+        NSStatusBarButton *btn = [g_mac_tray_item button];
+        if (btn) {
+            [btn setToolTip:tooltip ? [NSString stringWithUTF8String:tooltip] : @""];
+        }
+        return 1;
+    }
+}
+
+EXPORT i32 zan_tray_set_menu(const char *packed) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_tray_set_menu(packed));
+    @autoreleasepool {
+        if (!g_mac_tray_item) return 0;
+        if (!packed || !*packed) {
+            [g_mac_tray_item setMenu:nil];
+            return 1;
+        }
+        NSMenu *menu = [[[NSMenu alloc] initWithTitle:@""] autorelease];
+        [menu setAutoenablesItems:NO];
+
+        const char *p = packed;
+        while (*p) {
+            int id = 0, flags = 0;
+            char text[256];
+            text[0] = '\0';
+            const char *tab1 = strchr(p, '\t');
+            if (!tab1) break;
+            id = atoi(p);
+            const char *tab2 = strchr(tab1 + 1, '\t');
+            if (!tab2) break;
+            flags = atoi(tab1 + 1);
+            const char *nl = strchr(tab2 + 1, '\n');
+            size_t len = nl ? (size_t)(nl - (tab2 + 1)) : strlen(tab2 + 1);
+            if (len >= sizeof(text)) len = sizeof(text) - 1;
+            memcpy(text, tab2 + 1, len);
+            text[len] = '\0';
+            p = nl ? nl + 1 : tab2 + 1 + len;
+
+            if (flags & 4) {
+                [menu addItem:[NSMenuItem separatorItem]];
+            } else {
+                NSString *title = [NSString stringWithUTF8String:text];
+                NSMenuItem *item = [[[NSMenuItem alloc] initWithTitle:title
+                                                               action:@selector(onMenuItem:)
+                                                        keyEquivalent:@""] autorelease];
+                [item setTag:id];
+                [item setTarget:g_mac_tray_target];
+                [item setEnabled:(flags & 1) ? NO : YES];
+                [item setState:(flags & 2) ? NSControlStateValueOn : NSControlStateValueOff];
+                [menu addItem:item];
+            }
+        }
+        [g_mac_tray_item setMenu:menu];
+        return 1;
+    }
+}
+
+EXPORT i32 zan_tray_next_event(i32 timeout_ms) {
+    pthread_mutex_lock(&g_mac_tray_mu);
+    if (g_mac_tray_qhead == g_mac_tray_qtail && timeout_ms > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += timeout_ms / 1000;
+        ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&g_mac_tray_cv, &g_mac_tray_mu, &ts);
+    }
+    int ev = 0;
+    if (g_mac_tray_qhead != g_mac_tray_qtail) {
+        ev = g_mac_tray_q[g_mac_tray_qhead];
+        g_mac_tray_qhead = (g_mac_tray_qhead + 1) % ZAN_MAC_TRAY_QCAP;
+    }
+    pthread_mutex_unlock(&g_mac_tray_mu);
+    return ev;
+}
+
+/* =========================================================================
+ * macOS Global Hotkey Implementation
+ * ========================================================================= */
+
+#define ZAN_MAC_HOTKEY_QCAP 64
+static int g_mac_hotkey_q[ZAN_MAC_HOTKEY_QCAP];
+static int g_mac_hotkey_qhead = 0;
+static int g_mac_hotkey_qtail = 0;
+static pthread_mutex_t g_mac_hotkey_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_mac_hotkey_cv = PTHREAD_COND_INITIALIZER;
+
+static id g_mac_hotkey_monitor = nil;
+static int g_mac_hotkey_id = 0;
+static int g_mac_hotkey_mods = 0;
+static int g_mac_hotkey_vk = 0;
+
+static int mac_vk_to_keycode(int vk) {
+    if (vk >= 0x41 && vk <= 0x5A) {
+        static const int letters[26] = {
+            0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46, 45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16, 6
+        };
+        return letters[vk - 0x41];
+    }
+    if (vk >= 0x30 && vk <= 0x39) {
+        static const int digits[10] = { 29, 18, 19, 20, 21, 23, 22, 26, 28, 25 };
+        return digits[vk - 0x30];
+    }
+    if (vk >= 0x70 && vk <= 0x7B) {
+        static const int fns[12] = { 122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111 };
+        return fns[vk - 0x70];
+    }
+    if (vk == 0x0D) return 36; // Return
+    if (vk == 0x09) return 48; // Tab
+    if (vk == 0x20) return 49; // Space
+    if (vk == 0x08) return 51; // Delete/Backspace
+    if (vk == 0x1B) return 53; // Escape
+    if (vk == 0x25) return 123; // Left
+    if (vk == 0x27) return 124; // Right
+    if (vk == 0x28) return 125; // Down
+    if (vk == 0x26) return 126; // Up
+    return -1;
+}
+
+static void mac_hotkey_push(int ev) {
+    pthread_mutex_lock(&g_mac_hotkey_mu);
+    int next = (g_mac_hotkey_qtail + 1) % ZAN_MAC_HOTKEY_QCAP;
+    if (next != g_mac_hotkey_qhead) {
+        g_mac_hotkey_q[g_mac_hotkey_qtail] = ev;
+        g_mac_hotkey_qtail = next;
+        pthread_cond_broadcast(&g_mac_hotkey_cv);
+    }
+    pthread_mutex_unlock(&g_mac_hotkey_mu);
+}
+
+EXPORT i32 zan_hotkey_register(i32 id, i32 mods, i32 vk) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_hotkey_register(id, mods, vk));
+    @autoreleasepool {
+        if (g_mac_hotkey_monitor) {
+            [NSEvent removeMonitor:g_mac_hotkey_monitor];
+            g_mac_hotkey_monitor = nil;
+        }
+        int targetCode = mac_vk_to_keycode(vk);
+        if (targetCode < 0) return 0;
+
+        g_mac_hotkey_id = id;
+        g_mac_hotkey_mods = mods;
+        g_mac_hotkey_vk = vk;
+        g_mac_hotkey_qhead = g_mac_hotkey_qtail = 0;
+
+        g_mac_hotkey_monitor = [NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+            handler:^(NSEvent *event) {
+                if ((int)[event keyCode] == targetCode) {
+                    NSUInteger flags = [event modifierFlags];
+                    int m = 0;
+                    if (flags & NSEventModifierFlagOption)  m |= 0x0001; // Alt
+                    if (flags & NSEventModifierFlagControl) m |= 0x0002; // Ctrl
+                    if (flags & NSEventModifierFlagShift)   m |= 0x0004; // Shift
+                    if (flags & NSEventModifierFlagCommand) m |= 0x0008; // Win/Meta
+                    if (m == g_mac_hotkey_mods) {
+                        mac_hotkey_push(g_mac_hotkey_id);
+                    }
+                }
+            }];
+        return g_mac_hotkey_monitor != nil ? 1 : 0;
+    }
+}
+
+EXPORT i32 zan_hotkey_unregister(i32 id) {
+    (void)id;
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_hotkey_unregister(id));
+    @autoreleasepool {
+        if (g_mac_hotkey_monitor) {
+            [NSEvent removeMonitor:g_mac_hotkey_monitor];
+            g_mac_hotkey_monitor = nil;
+        }
+        mac_hotkey_push(-1);
+        return 1;
+    }
+}
+
+EXPORT i32 zan_hotkey_next_event(i32 timeout_ms) {
+    pthread_mutex_lock(&g_mac_hotkey_mu);
+    if (g_mac_hotkey_qhead == g_mac_hotkey_qtail && timeout_ms > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += timeout_ms / 1000;
+        ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&g_mac_hotkey_cv, &g_mac_hotkey_mu, &ts);
+    }
+    int ev = 0;
+    if (g_mac_hotkey_qhead != g_mac_hotkey_qtail) {
+        ev = g_mac_hotkey_q[g_mac_hotkey_qhead];
+        g_mac_hotkey_qhead = (g_mac_hotkey_qhead + 1) % ZAN_MAC_HOTKEY_QCAP;
+    }
+    pthread_mutex_unlock(&g_mac_hotkey_mu);
+    return ev;
+}
+
+/* ========================================================================
+ * Native Mouse & Keyboard Query & Post
+ * ======================================================================== */
+EXPORT i32 zan_mouse_is_down(i32 button) {
+    CGMouseButton b = kCGMouseButtonLeft;
+    if (button == 1) b = kCGMouseButtonCenter;
+    else if (button == 2) b = kCGMouseButtonRight;
+    return CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, b) ? 1 : 0;
+}
+
+EXPORT i32 zan_keyboard_is_down(i32 vk) {
+    int code = mac_vk_to_keycode(vk);
+    if (code < 0) return 0;
+    return CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, (CGKeyCode)code) ? 1 : 0;
+}
+
+EXPORT i32 zan_keyboard_is_toggled(i32 vk) {
+    if (vk == 0x14) { /* VK_CAPITAL */
+        CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
+        return (flags & kCGEventFlagMaskAlphaShift) ? 1 : 0;
+    }
+    return 0;
+}
+
+EXPORT i32 zan_keyboard_post(i32 vk, i32 is_down) {
+    int code = mac_vk_to_keycode(vk);
+    if (code < 0) return 0;
+    CGEventRef ev = CGEventCreateKeyboardEvent(NULL, (CGKeyCode)code, is_down ? true : false);
+    if (!ev) return 0;
+    CGEventPost(kCGHIDEventTap, ev);
+    CFRelease(ev);
+    return 1;
+}
+
+/* ========================================================================
+ * Native Low-level Event Tap Hook
+ * ======================================================================== */
+#define ZAN_MAC_HOOK_QCAP 256
+static id g_mac_hook_monitor = nil;
+static i32 g_mac_hook_kind = 0; /* 13 = keyboard, 14 = mouse */
+static pthread_mutex_t g_mac_hook_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_mac_hook_cv = PTHREAD_COND_INITIALIZER;
+static i32 g_mac_hook_q[ZAN_MAC_HOOK_QCAP * 5];
+static i32 g_mac_hook_qhead = 0;
+static i32 g_mac_hook_qtail = 0;
+
+static void mac_hook_push(i32 p1, i32 p2, i32 p3, i32 p4, i32 p5) {
+    pthread_mutex_lock(&g_mac_hook_mu);
+    int next = (g_mac_hook_qtail + 5) % (ZAN_MAC_HOOK_QCAP * 5);
+    if (next != g_mac_hook_qhead) {
+        g_mac_hook_q[g_mac_hook_qtail]     = p1;
+        g_mac_hook_q[g_mac_hook_qtail + 1] = p2;
+        g_mac_hook_q[g_mac_hook_qtail + 2] = p3;
+        g_mac_hook_q[g_mac_hook_qtail + 3] = p4;
+        g_mac_hook_q[g_mac_hook_qtail + 4] = p5;
+        g_mac_hook_qtail = next;
+        pthread_cond_signal(&g_mac_hook_cv);
+    }
+    pthread_mutex_unlock(&g_mac_hook_mu);
+}
+
+EXPORT i32 zan_hook_install(i32 kind) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_hook_install(kind));
+    @autoreleasepool {
+        if (g_mac_hook_monitor) {
+            [NSEvent removeMonitor:g_mac_hook_monitor];
+            g_mac_hook_monitor = nil;
+        }
+        g_mac_hook_kind = kind;
+        g_mac_hook_qhead = g_mac_hook_qtail = 0;
+
+        NSEventMask mask = 0;
+        if (kind == 13) {
+            mask = NSEventMaskKeyDown | NSEventMaskKeyUp;
+        } else if (kind == 14) {
+            mask = NSEventMaskLeftMouseDown | NSEventMaskLeftMouseUp |
+                   NSEventMaskRightMouseDown | NSEventMaskRightMouseUp |
+                   NSEventMaskOtherMouseDown | NSEventMaskOtherMouseUp |
+                   NSEventMaskMouseMoved | NSEventMaskScrollWheel;
+        } else {
+            return 0;
+        }
+
+        g_mac_hook_monitor = [NSEvent addGlobalMonitorForEventsMatchingMask:mask
+            handler:^(NSEvent *event) {
+                if (g_mac_hook_kind == 13) {
+                    int kc = (int)[event keyCode];
+                    int isUp = ([event type] == NSEventTypeKeyUp) ? 1 : 0;
+                    mac_hook_push(kc, 0, 0, 0, isUp);
+                } else if (g_mac_hook_kind == 14) {
+                    NSPoint loc = [NSEvent mouseLocation];
+                    int msg = (int)[event type];
+                    int data = 0;
+                    if ([event type] == NSEventTypeScrollWheel) {
+                        data = (int)([event deltaY] * 120);
+                    }
+                    mac_hook_push((int)loc.x, (int)loc.y, msg, data, 0);
+                }
+            }];
+        return g_mac_hook_monitor != nil ? 1 : 0;
+    }
+}
+
+EXPORT i32 zan_hook_uninstall(void) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_hook_uninstall());
+    @autoreleasepool {
+        if (g_mac_hook_monitor) {
+            [NSEvent removeMonitor:g_mac_hook_monitor];
+            g_mac_hook_monitor = nil;
+        }
+        mac_hook_push(-1, 0, 0, 0, 0);
+        return 1;
+    }
+}
+
+EXPORT i32 zan_hook_next_event(i32 timeout_ms, i32 *out_p1, i32 *out_p2, i32 *out_p3, i32 *out_p4, i32 *out_p5) {
+    pthread_mutex_lock(&g_mac_hook_mu);
+    if (g_mac_hook_qhead == g_mac_hook_qtail && timeout_ms > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += timeout_ms / 1000;
+        ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&g_mac_hook_cv, &g_mac_hook_mu, &ts);
+    }
+    if (g_mac_hook_qhead != g_mac_hook_qtail) {
+        if (out_p1) *out_p1 = g_mac_hook_q[g_mac_hook_qhead];
+        if (out_p2) *out_p2 = g_mac_hook_q[g_mac_hook_qhead + 1];
+        if (out_p3) *out_p3 = g_mac_hook_q[g_mac_hook_qhead + 2];
+        if (out_p4) *out_p4 = g_mac_hook_q[g_mac_hook_qhead + 3];
+        if (out_p5) *out_p5 = g_mac_hook_q[g_mac_hook_qhead + 4];
+        g_mac_hook_qhead = (g_mac_hook_qhead + 5) % (ZAN_MAC_HOOK_QCAP * 5);
+        pthread_mutex_unlock(&g_mac_hook_mu);
+        return 1;
+    }
+    pthread_mutex_unlock(&g_mac_hook_mu);
+    return 0;
+}
+
+

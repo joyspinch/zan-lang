@@ -56,8 +56,8 @@ int32_t zan_io_socket_alive(intptr_t fd);
  * (recv 0 / accept -1) and drops the fd from the readiness set. Closing an
  * fd without this hook leaves its waiters parked on a slot keyed by the raw
  * fd number; when the kernel recycles that number for a new socket the old
- * waiter is served by (or delivers into) the new connection. With the hook,
- * no waiter outlives the identity it registered against (A291-5). No-op on
+ * waiter is served by (or delivers into) a recycled fd. With the hook,
+ * no waiter outlives the identity it registered against. No-op on
  * Windows, whose overlapped path already completes pending ops via
  * CancelIoEx on shutdown. */
 void zan_io_close_notify(intptr_t fd);

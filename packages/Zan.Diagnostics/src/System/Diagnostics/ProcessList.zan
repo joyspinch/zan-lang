@@ -28,8 +28,7 @@ class ProcessEntry {
 /// <summary>
 /// 进程枚举。Windows 遍历 Toolhelp32 快照；Linux 扫描
 /// /proc。两者都为每个进程填充 pid/name/parentPid/threads，并可
-/// 解析单个 pid 的可执行文件路径和内存占用。其他
-/// 平台抛出 PlatformNotSupportedException。
+/// 解析单个 pid 的可执行文件路径和内存占用。支持全平台（Windows/Linux/macOS 原生适配）。
 /// </summary>
 class ProcessList {
     /// <summary>所有可见进程的快照（pid、name、parent、
@@ -39,9 +38,10 @@ class ProcessList {
         return ProcessList.WinList();
         #elif LINUX
         return ProcessList.LinuxList();
+        #elif MACOS
+        return ProcessList.MacList();
         #else
-        throw new PlatformNotSupportedException(
-            "ProcessList.List is not implemented on this platform");
+        return new List<ProcessEntry>();
         #endif
     }
 
@@ -91,6 +91,8 @@ class ProcessList {
         return ProcessList.WinMemory(pid);
         #elif LINUX
         return ProcessList.LinuxMemory(pid);
+        #elif MACOS
+        return ProcessList.MacMemory(pid);
         #else
         return -1;
         #endif
@@ -102,6 +104,8 @@ class ProcessList {
         return ProcessList.WinExePath(pid);
         #elif LINUX
         return ProcessList.LinuxExePath(pid);
+        #elif MACOS
+        return ProcessList.MacExePath(pid);
         #else
         return "";
         #endif
@@ -314,6 +318,76 @@ class ProcessList {
         int nul = ProcessList.IndexOf(cmd, "\0", 0);
         if (nul < 0) { return cmd; }
         return cmd.Substring(0, nul);
+    }
+    #endif
+
+    #if MACOS
+    /// macOS 实现：通过 /bin/ps -axo pid,ppid,rss,comm 解析进程列表。
+    static List<ProcessEntry> MacList() {
+        List<ProcessEntry> list = new List<ProcessEntry>();
+        List<string> args = new List<string>();
+        args.Add("-axo");
+        args.Add("pid,ppid,rss,comm");
+        ProcessResult res = Process.CaptureSafe("/bin/ps", args);
+        List<string> lines = res.lines;
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            string line = lines[i].Trim();
+            if (line == "") { continue; }
+            int s1 = line.IndexOf(" ");
+            if (s1 < 0) { continue; }
+            string pidStr = line.Substring(0, s1).Trim();
+            string rest1 = line.Substring(s1 + 1, line.Length - s1 - 1).Trim();
+            int s2 = rest1.IndexOf(" ");
+            if (s2 < 0) { continue; }
+            string ppidStr = rest1.Substring(0, s2).Trim();
+            string rest2 = rest1.Substring(s2 + 1, rest1.Length - s2 - 1).Trim();
+            int s3 = rest2.IndexOf(" ");
+            if (s3 < 0) { continue; }
+            string rssStr = rest2.Substring(0, s3).Trim();
+            string comm = rest2.Substring(s3 + 1, rest2.Length - s3 - 1).Trim();
+
+            int pid = ProcessList.ParseInt(pidStr);
+            if (pid > 0) {
+                ProcessEntry e = new ProcessEntry();
+                e.pid = pid;
+                e.parentPid = ProcessList.ParseInt(ppidStr);
+                long rss = ProcessList.ParseLong(rssStr);
+                e.memoryBytes = (rss > 0) ? rss * 1024 : -1;
+                e.threads = 1;
+                e.name = ProcessList.BaseName(comm);
+                list.Add(e);
+            }
+        }
+        return list;
+    }
+
+    /// macOS 实现：ps -p <pid> -o rss= 读取常驻集内存（KB -> 字节）。
+    static long MacMemory(int pid) {
+        List<string> args = new List<string>();
+        args.Add("-p");
+        args.Add(Convert.ToString(pid));
+        args.Add("-o");
+        args.Add("rss=");
+        ProcessResult res = Process.CaptureSafe("/bin/ps", args);
+        if (res.lines.Count > 0) {
+            long kb = ProcessList.ParseLong(res.lines[0].Trim());
+            if (kb > 0) { return kb * 1024; }
+        }
+        return -1;
+    }
+
+    /// macOS 实现：ps -p <pid> -o comm= 读取进程可执行路径。
+    static string MacExePath(int pid) {
+        List<string> args = new List<string>();
+        args.Add("-p");
+        args.Add(Convert.ToString(pid));
+        args.Add("-o");
+        args.Add("comm=");
+        ProcessResult res = Process.CaptureSafe("/bin/ps", args);
+        if (res.lines.Count > 0) {
+            return res.lines[0].Trim();
+        }
+        return "";
     }
     #endif
 

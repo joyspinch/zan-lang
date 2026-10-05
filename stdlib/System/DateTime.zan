@@ -20,15 +20,15 @@ class DateTime {
     #if WINDOWS
     [DllImport("kernel32", EntryPoint = "GetSystemTimeAsFileTime")]
     static extern void GetSystemTimeAsFileTime(nint lpFileTime);
+    #else
+    [DllImport("crt", EntryPoint = "clock_gettime")]
+    static extern int clock_gettime(int clkId, nint tp);
     #endif
 
-    /// 本机时区换算全部交给 libc 的时区库：localtime_r（POSIX）/
-    /// _localtime64_s（Windows，msvcrt 只导出这个名字；参序为
-    /// (tm, time)，成功返回 0）把纪元秒展开进调用方提供的 struct tm
-    /// 缓冲——线程局部，替代旧 localtime 的共享静态缓冲（多线程并发
-    /// 取本地时间会互踩字段，B-ID75h）。再用 timegm（Windows 上是
-    /// _mkgmtime）把这组字段当作 UTC 折回纪元秒，两者之差就是该时刻
-    /// 的实际偏移（自带夏令时）。
+    /// 本机时区换算：localtime_r（POSIX）/ _localtime64_s（Windows）
+    /// 将纪元秒展开进线程局部 struct tm 缓冲，避免并发冲突。
+    /// 再用 timegm / _mkgmtime 将其当作 UTC 折回纪元秒，两者的差值
+    /// 即为该时刻的实际本地偏移（包含夏令时）。
     #if WINDOWS
     [DllImport("crt", EntryPoint = "_localtime64_s")]
     static extern int plat_localtime(nint tmOut, nint tptr);
@@ -66,13 +66,32 @@ class DateTime {
     static long GetCurrentUnixMilliseconds() {
         #if WINDOWS
         nint p = NativeMemory.Alloc(8);
-        GetSystemTimeAsFileTime(p);
-        long ft = new Span<long>(p, 1)[0];
-        NativeMemory.Free(p);
+        long ft = 0;
+        try {
+            GetSystemTimeAsFileTime(p);
+            ft = new Span<long>(p, 1)[0];
+        } finally {
+            NativeMemory.Free(p);
+        }
         // 100ns 刻度折算为毫秒，减去 1601 到 1970 偏移 (11644473600000 ms)
         return (ft / 10000) - 11644473600000;
         #else
-        return time(0) * 1000;
+        nint ts = NativeMemory.Alloc(16);
+        long ms = 0;
+        try {
+            // CLOCK_REALTIME = 0 on POSIX
+            int r = clock_gettime(0, ts);
+            if (r == 0) {
+                long sec = new Span<long>(ts, 1)[0];
+                long nsec = new Span<long>(ts + 8, 1)[0];
+                ms = sec * 1000 + (nsec / 1000000);
+            } else {
+                ms = time(0) * 1000;
+            }
+        } finally {
+            NativeMemory.Free(ts);
+        }
+        return ms;
         #endif
     }
 
@@ -137,20 +156,35 @@ class DateTime {
     /// </summary>
     static int LocalOffsetMinutesAt(long unixSeconds) {
         nint tbuf = NativeMemory.Alloc(8);
-        new Span<long>(tbuf, 1)[0] = unixSeconds;
-        // struct tm 布局平台各异（glibc/Darwin 56 字节、MSVC 36 字节），
-        // 给 128 字节清零缓冲；读端只经 plat_timegm（libc 自己解释布局）。
-        nint tm = NativeMemory.Alloc(128);
-        NativeMemory.Fill(tm, 0, 128);
-        #if WINDOWS
-        bool ok = plat_localtime(tm, tbuf) == 0;
-        #else
-        bool ok = plat_localtime(tbuf, tm) != 0;
-        #endif
-        NativeMemory.Free(tbuf);
-        if (!ok) { NativeMemory.Free(tm); return 0; }
-        long wall = plat_timegm(tm);
-        NativeMemory.Free(tm);
+        nint tm = 0;
+        bool ok = false;
+        try {
+            new Span<long>(tbuf, 1)[0] = unixSeconds;
+            // struct tm 布局平台各异（glibc/Darwin 56 字节、MSVC 36 字节），
+            // 给 128 字节清零缓冲；读端只经 plat_timegm（libc 自己解释布局）。
+            tm = NativeMemory.Alloc(128);
+            NativeMemory.Fill(tm, 0, 128);
+            #if WINDOWS
+            ok = plat_localtime(tm, tbuf) == 0;
+            #else
+            ok = plat_localtime(tbuf, tm) != 0;
+            #endif
+        } finally {
+            NativeMemory.Free(tbuf);
+        }
+
+        if (!ok || tm == 0) {
+            if (tm != 0) { NativeMemory.Free(tm); }
+            return 0;
+        }
+
+        long wall = 0;
+        try {
+            wall = plat_timegm(tm);
+        } finally {
+            NativeMemory.Free(tm);
+        }
+
         if (wall == 0 - 1) { return 0; }
         return (int)((wall - unixSeconds) / 60);
     }

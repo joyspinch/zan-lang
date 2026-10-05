@@ -438,7 +438,7 @@ static int run_extended_checks(child_t *child) {
     return ext_fails ? 1 : 0;
 }
 
-/* --------- scope-aware rename/references + engine cache (B-ID3/B-ID5) ---- */
+/* --------- scope-aware rename/references + engine cache ---- */
 
 #define SC_URI "file:///lsp_scope_test.zan"
 /* Two methods each with a local `count`: scope-aware rename of the one in
@@ -565,7 +565,7 @@ static int run_scope_checks(child_t *child) {
     return ext_fails ? 1 : 0;
 }
 
-/* --------- semanticTokens and inlay hints checks (B-ID4) --------- */
+/* --------- semanticTokens and inlay hints checks --------- */
 #define HINT_URI "file:///lsp_hint_test.zan"
 static const char *HINT_DOC =
     "class Greeter {\n"
@@ -625,7 +625,7 @@ static int run_semantic_and_hint_checks(child_t *child) {
     return ext_fails ? 1 : 0;
 }
 
-/* --------- $/cancelRequest checks (B-ID6: reader/worker split) ---------
+/* --------- $/cancelRequest checks (reader/worker split) ---------
  *
  * A second server rooted at a generated workspace of ~300 files, so project
  * indexing and the references file walk take seconds. The reader thread must

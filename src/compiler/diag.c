@@ -122,8 +122,8 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
 
     /* Collapse cascade noise: error recovery walks a malformed expression one
      * token at a time re-reporting the same handful of failures at each
-     * successive column, which produced tens of megabytes for one
-     * pathological line (A280). Cap the errors printed per line; error_count
+     * successive column, which produced massive logs for one
+     * pathological line. Cap the errors printed per line; error_count
      * has already counted them, so the compile still fails. */
     if (level == DIAG_ERROR) {
         if (diag->dup_line != loc.line || diag->dup_file_id != loc.file_id) {
@@ -169,8 +169,7 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
             /* Window the excerpt around the error column. Echoing the whole
              * line is fine for hand-written code but a pathological one-liner
              * (a 100k-character paren nest) repeats the full line for every
-             * diagnostic, which was the bulk of the tens of megabytes A280
-             * produced. Long lines are shown as an excerpt with a caret that
+             * diagnostic. Long lines are shown as an excerpt with a caret that
              * lands on the right character. */
             int col0 = loc.col > 0 ? (int)loc.col - 1 : 0;
             int vis_start = 0;

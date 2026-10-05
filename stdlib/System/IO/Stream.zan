@@ -67,12 +67,15 @@ class Stream : IDisposable {
             return "";
         }
         nint buf = NativeMemory.Alloc(count + 1);
-        int n = this.ReadInto(buf, count);
         string s = "";
-        if (n > 0) {
-            s = NativeMemory.GetString(buf, 0, n);
+        try {
+            int n = this.ReadInto(buf, count);
+            if (n > 0) {
+                s = NativeMemory.GetString(buf, 0, n);
+            }
+        } finally {
+            NativeMemory.Free(buf);
         }
-        NativeMemory.Free(buf);
         return s;
     }
 
@@ -104,9 +107,13 @@ class Stream : IDisposable {
             return 0;
         }
         nint buf = NativeMemory.Alloc(count + 1);
-        NativeMemory.PutString(buf, 0, data, count);
-        int w = this.WriteFromAll(buf, count);
-        NativeMemory.Free(buf);
+        int w = 0;
+        try {
+            NativeMemory.PutString(buf, 0, data, count);
+            w = this.WriteFromAll(buf, count);
+        } finally {
+            NativeMemory.Free(buf);
+        }
         return w;
     }
 
@@ -121,21 +128,27 @@ class Stream : IDisposable {
     /// <summary>读取一个字节，流结束时返回 -1。</summary>
     int ReadByte() {
         nint buf = NativeMemory.Alloc(1);
-        int n = this.ReadInto(buf, 1);
         int v = -1;
-        if (n == 1) {
-            v = new Span<byte>(buf, 1)[0];
+        try {
+            int n = this.ReadInto(buf, 1);
+            if (n == 1) {
+                v = new Span<byte>(buf, 1)[0];
+            }
+        } finally {
+            NativeMemory.Free(buf);
         }
-        NativeMemory.Free(buf);
         return v;
     }
 
     /// <summary>写入一个字节（`b` 的低 8 位）。</summary>
     void WriteByte(int b) {
         nint buf = NativeMemory.Alloc(1);
-        new Span<byte>(buf, 1)[0] = b & 255;
-        this.WriteFrom(buf, 1);
-        NativeMemory.Free(buf);
+        try {
+            new Span<byte>(buf, 1)[0] = b & 255;
+            this.WriteFrom(buf, 1);
+        } finally {
+            NativeMemory.Free(buf);
+        }
     }
 
     /// <summary>读取流中剩余的全部内容（二进制安全）。</summary>
@@ -143,14 +156,18 @@ class Stream : IDisposable {
         ByteBuffer acc = ByteBuffer.Alloc(4096);
         int chunk = 65536;
         nint buf = NativeMemory.Alloc(chunk);
-        int n = this.ReadInto(buf, chunk);
-        while (n > 0) {
-            acc.WriteBytes(buf, n);
-            n = this.ReadInto(buf, chunk);
+        string all = "";
+        try {
+            int n = this.ReadInto(buf, chunk);
+            while (n > 0) {
+                acc.WriteBytes(buf, n);
+                n = this.ReadInto(buf, chunk);
+            }
+            all = acc.ToStr();
+        } finally {
+            NativeMemory.Free(buf);
+            acc.Free();
         }
-        NativeMemory.Free(buf);
-        string all = acc.ToStr();
-        acc.Free();
         return all;
     }
 
@@ -160,23 +177,26 @@ class Stream : IDisposable {
         int chunk = 65536;
         nint buf = NativeMemory.Alloc(chunk);
         long total = 0;
-        int n = this.ReadInto(buf, chunk);
-        while (n > 0) {
-            int off = 0;
-            while (off < n) {
-                int w = dest.WriteFrom(buf + off, n - off);
-                if (w <= 0) {
+        try {
+            int n = this.ReadInto(buf, chunk);
+            while (n > 0) {
+                int off = 0;
+                while (off < n) {
+                    int w = dest.WriteFrom(buf + off, n - off);
+                    if (w <= 0) {
+                        break;
+                    }
+                    off = off + w;
+                    total = total + w;
+                }
+                if (off < n) {
                     break;
                 }
-                off = off + w;
-                total = total + w;
+                n = this.ReadInto(buf, chunk);
             }
-            if (off < n) {
-                break;
-            }
-            n = this.ReadInto(buf, chunk);
+        } finally {
+            NativeMemory.Free(buf);
         }
-        NativeMemory.Free(buf);
         return total;
     }
 

@@ -195,7 +195,7 @@ static void zan_mem_thread_exit(void *p) {
 
 static volatile int g_slab_lock;
 
-/* Bounded TTAS backoff (B-ID74f), same shape as rt_timer.c's live_lock:
+/* Bounded TTAS backoff, same shape as rt_timer.c's live_lock:
  * pause-spin a few rounds, then hand the core back -- a preempted holder
  * otherwise costs every contender a full timeslice, and non-x86 targets
  * have no pause at all. */
@@ -568,7 +568,7 @@ void __wrap_free(void *p) {
     zan_mem_hdr_t *h = (zan_mem_hdr_t *)((char *)p - ZAN_MEM_HDR);
     /* Claim the block: exactly one freer sees MAGIC and flips it to FREED. The
      * old load-then-store let two threads freeing the same pointer both pass
-     * the check and both push the block onto a free list (A291). The loser of
+     * the check and both push the block onto a free list. The loser of
      * the exchange must not touch the block at all. */
     uint32_t expect = ZAN_MEM_MAGIC;
     if (!__atomic_compare_exchange_n(&h->magic, &expect, ZAN_MEM_FREED, 0,

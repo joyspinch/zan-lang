@@ -116,8 +116,8 @@ long long zan_co_quantum_ms(void);
  * above is wall-deadline grade: on Windows GetTickCount64 ticks at ~15.6ms,
  * which would turn a 2ms quantum into a ~15ms slice and a 1ms pump throttle
  * into ~15ms. QPC is sub-microsecond on every supported Windows; POSIX
- * CLOCK_MONOTONIC already is. The timer heap's deadlines run here too
- * (B-ID48): due_us is zan_co_precise_us-based, so Delay precision no longer
+ * CLOCK_MONOTONIC already is. The timer heap's deadlines run here too:
+ * due_us is zan_co_precise_us-based, so Delay precision no longer
  * carries the wall clock's tick granularity. zan_timer_next_timeout still
  * ANSWERS in ms (round-up) because its callers park on ms waits. */
 long long zan_co_precise_us(void);
@@ -135,17 +135,6 @@ int zan_timer_info(long long id, long long *exec_msec, long long *exec_count,
 long long zan_timer_list_count(void);
 long long zan_timer_list_at(long long index);
 void zan_timer_stats(long long *initialized, long long *num, long long *round);
-
-/* Swoole-compatible native aliases. */
-long long swoole_timer_tick(long long interval, zan_timer_callback_t callback);
-long long swoole_timer_after(long long delay, zan_timer_callback_t callback);
-int swoole_timer_clear(long long id);
-long long swoole_timer_clear_all(void);
-int swoole_timer_info(long long id, long long *exec_msec, long long *exec_count,
-                      long long *interval, long long *round, int *removed);
-long long swoole_timer_list_count(void);
-long long swoole_timer_list_at(long long index);
-void swoole_timer_stats(long long *initialized, long long *num, long long *round);
 
 #include "rt_hw_accel.h"
 

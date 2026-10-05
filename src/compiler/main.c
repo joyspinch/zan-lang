@@ -6688,6 +6688,41 @@ int main(int argc, char **argv) {
         generated_object_vec_add(&generated_objects, obj_tmp);
         phase("write obj");
         probe_phase_mem("write obj");
+
+        /* Pre-cache driver bundle condition prefixes before releasing LLVM module */
+        if (publish_mode || target.os == ZAN_OS_WINDOWS) {
+            for (int d = 0; d < used_driver_count; d++) {
+                const char *driver_dir = driver_dirs[d];
+                if (!driver_dir[0]) continue;
+                char drv[64];
+                snprintf(drv, sizeof(drv), "%.*s", used_driver_len[d], used_drivers[d]);
+                char manifest[1200];
+                snprintf(manifest, sizeof(manifest), "%s/%s.bundle", driver_dir, drv);
+                FILE *mf = fopen(manifest, "rb");
+                if (mf) {
+                    char line[128];
+                    while (fgets(line, sizeof(line), mf)) {
+                        char *cond = strstr(line, " if ");
+                        if (cond) {
+                            const char *pfx = cond + 4;
+                            while (*pfx == ' ' || *pfx == '\t') pfx++;
+                            char pfx_buf[64];
+                            size_t pl = 0;
+                            while (pfx[pl] && pfx[pl] != '\r' && pfx[pl] != '\n' &&
+                                   pfx[pl] != ' ' && pfx[pl] != '\t' &&
+                                   pl < sizeof(pfx_buf) - 1) {
+                                pfx_buf[pl] = pfx[pl];
+                                pl++;
+                            }
+                            pfx_buf[pl] = '\0';
+                            if (pl > 0) zan_irgen_defines_prefix(&irgen, pfx_buf);
+                        }
+                    }
+                    fclose(mf);
+                }
+            }
+        }
+
         zan_irgen_release_llvm(&irgen);
         probe_phase_mem("free llvm");
 
@@ -9081,6 +9116,10 @@ int main(int argc, char **argv) {
                 char cands[64][128]; int ncand = 0;
                 char manifest[1200];
                 snprintf(manifest, sizeof(manifest), "%s/%s.bundle", driver_dir, drv);
+                if (getenv("ZAN_DEBUG_LINK")) {
+                    fprintf(stderr, "[DEBUG] checking manifest %s\n", manifest);
+                    fflush(stderr);
+                }
                 FILE *mf = fopen(manifest, "rb");
                 if (mf) {
                     char line[128];
@@ -9156,6 +9195,10 @@ int main(int argc, char **argv) {
                 int copy_failed_count = 0;
                 for (int c = 0; c < ncand; c++) {
                     char src[1300], dst[1300];
+                    if (getenv("ZAN_DEBUG_LINK")) {
+                        fprintf(stderr, "[DEBUG] candidate[%d] = %s\n", c, cands[c]);
+                        fflush(stderr);
+                    }
                     if (used_driver_embedded[d] &&
                         strcmp(cands[c], embedded_driver_file[d]) == 0) {
                         if (!quiet)
@@ -9435,6 +9478,8 @@ int main(int argc, char **argv) {
                 printf("%s %d files ? '%s'\n", publish_mode ? "Published" : "Compiled", input_count, final_out);
             }
         }
+        fflush(stdout);
+        fflush(stderr);
     }
 
     zan_diag_free_buffers(irgen.diag);
@@ -9443,13 +9488,11 @@ int main(int argc, char **argv) {
     zan_arena_free(ir_arena);
     zan_arena_free(arena);
     free(source);
-    /* LLVM statics registered in the CRT exit table (an LLVMContext teardown
-     * thunk at LLVMStopMultithreaded+0x10 over a static context whose pImpl is
-     * garbage) fault with c0000005 in ~LLVMContextImpl after the whole compile
-     * has churned the heap, even though the output was fully written (TASKS.md
-     * A80). llvm_shutdown clears the ManagedStatic registry the exit path
-     * would otherwise walk, so common_exit tears down nothing. */
+#ifdef _WIN32
+    ExitProcess(0);
+#else
     LLVMShutdown();
     return 0;
+#endif
 }
 

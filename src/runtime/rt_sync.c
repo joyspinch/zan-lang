@@ -2689,9 +2689,10 @@ long long zan_mmap_create(const char *name, long long size) {
     MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, wlen);
     HANDLE named = CreateFileMappingW(
         INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, hi, lo, wname);
+    DWORD err = GetLastError();
     free(wname);
     if (!named) return 0;
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    if (err == ERROR_ALREADY_EXISTS) {
         CloseHandle(named);
         return 0;
     }
@@ -2720,6 +2721,7 @@ long long zan_mmap_create(const char *name, long long size) {
 long long zan_mmap_open(const char *name, long long size) {
     if (!name || !name[0]) return 0;
 #ifdef _WIN32
+    (void)size;
     int wlen = MultiByteToWideChar(CP_UTF8, 0, name, -1, NULL, 0);
     if (wlen <= 0) return 0;   /* invalid UTF-8: see zan_mmap_create */
     wchar_t *wname = (wchar_t *)calloc((size_t)wlen, sizeof(wchar_t));
@@ -2794,9 +2796,7 @@ long long zan_mmap_map(long long handle, long long size) {
     if (!handle || size <= 0) return 0;
 #ifdef _WIN32
     HANDLE h = (HANDLE)(intptr_t)handle;
-    DWORD hi = (DWORD)(((unsigned long long)size) >> 32);
-    DWORD lo = (DWORD)((unsigned long long)size & 0xFFFFFFFFULL);
-    void *p = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, size);
+    void *p = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, (size_t)size);
     return p ? (long long)(intptr_t)p : 0;
 #else
     zan_mmap_handle *h = (zan_mmap_handle *)(intptr_t)handle;
@@ -2811,6 +2811,7 @@ long long zan_mmap_map(long long handle, long long size) {
 long long zan_mmap_unmap(long long ptr, long long size) {
     if (!ptr) return 0;
 #ifdef _WIN32
+    (void)size;
     return UnmapViewOfFile((void *)(intptr_t)ptr) ? 1 : 0;
 #else
     return munmap((void *)(intptr_t)ptr, (size_t)size) == 0 ? 1 : 0;
@@ -3146,9 +3147,18 @@ int32_t zan_plat_icmp_ping(const char *address, int32_t timeout_ms) {
  * ======================================================================== */
 
 #ifdef _WIN32
-static void zan_win_append_arg(char *buf, const char *a) {
+static void zan_win_buf_append(char *buf, size_t cap, size_t *len, const char *s) {
+    if (!s) return;
+    size_t slen = strlen(s);
+    if (*len + slen >= cap) return;
+    memcpy(buf + *len, s, slen);
+    *len += slen;
+    buf[*len] = '\0';
+}
+
+static void zan_win_append_arg(char *buf, size_t cap, size_t *len, const char *a) {
     if (!a || !*a) {
-        strcat(buf, "\"\"");
+        zan_win_buf_append(buf, cap, len, "\"\"");
         return;
     }
     int need_q = 0;
@@ -3159,27 +3169,27 @@ static void zan_win_append_arg(char *buf, const char *a) {
         }
     }
     if (!need_q) {
-        strcat(buf, a);
+        zan_win_buf_append(buf, cap, len, a);
         return;
     }
-    strcat(buf, "\"");
+    zan_win_buf_append(buf, cap, len, "\"");
     int bs = 0;
     for (const char *p = a; *p; p++) {
         if (*p == '\\') {
             bs++;
         } else if (*p == '\"') {
-            for (int b = 0; b < bs * 2 + 1; b++) strcat(buf, "\\");
-            strcat(buf, "\"");
+            for (int b = 0; b < bs * 2 + 1; b++) zan_win_buf_append(buf, cap, len, "\\");
+            zan_win_buf_append(buf, cap, len, "\"");
             bs = 0;
         } else {
-            for (int b = 0; b < bs; b++) strcat(buf, "\\");
+            for (int b = 0; b < bs; b++) zan_win_buf_append(buf, cap, len, "\\");
             bs = 0;
             char ch[2] = { *p, '\0' };
-            strcat(buf, ch);
+            zan_win_buf_append(buf, cap, len, ch);
         }
     }
-    for (int b = 0; b < bs * 2; b++) strcat(buf, "\\");
-    strcat(buf, "\"");
+    for (int b = 0; b < bs * 2; b++) zan_win_buf_append(buf, cap, len, "\\");
+    zan_win_buf_append(buf, cap, len, "\"");
 }
 
 static char *zan_win_quote_cmdline(const char *exe, const char **args, int32_t argc) {
@@ -3191,11 +3201,12 @@ static char *zan_win_quote_cmdline(const char *exe, const char **args, int32_t a
     char *buf = (char *)malloc(cap);
     if (!buf) return NULL;
     buf[0] = '\0';
+    size_t len = 0;
 
-    zan_win_append_arg(buf, exe);
+    zan_win_append_arg(buf, cap, &len, exe);
     for (int32_t i = 0; i < argc; i++) {
-        strcat(buf, " ");
-        zan_win_append_arg(buf, args[i]);
+        zan_win_buf_append(buf, cap, &len, " ");
+        zan_win_append_arg(buf, cap, &len, args[i]);
     }
     return buf;
 }

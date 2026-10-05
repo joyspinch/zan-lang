@@ -169,8 +169,8 @@ class Mutex {
 /// </summary>
 class Semaphore {
     #if WINDOWS
-    // name 以 nint 传 NULL（与 Mutex 同因："" 是合法命名对象，
-    // 会让全部实例共享同一信号量，B-ID75g 同型）。
+    // name 以 nint 传 NULL（与 Mutex 同理：空字符串仍是合法命名对象，
+    // 传空串会让全部实例共享同一个内核信号量导致意外碰撞）。
     [DllImport("kernel32", EntryPoint = "CreateSemaphoreA")]
     static extern nint WinCreateSemaphore(nint secAttrs, int initialCount, int maxCount, nint name);
 
@@ -230,7 +230,7 @@ class Semaphore {
     static extern int SemClockGettime(int clkId, nint tp);
 
     // errno 读取（线程局部）：sem_wait/sem_timedwait 被 signal 打断时
-    // 返回 -1 + EINTR，必须重试而不是当成失败/超时（B-ID75j）。
+    // 返回 -1 + EINTR，必须重试而不是当成失败/超时。
     // Darwin 的 errno 是宏，真身是 __error()；glibc/musl/WASI 都是
     // __errno_location()。EINTR 在这些平台都是 4。
     #if MACOS
@@ -318,7 +318,7 @@ class Semaphore {
     }
 
     /// 无限阻塞获取一个许可（配对 Release）。EINTR（被 signal 打断）
-    /// 重试，其它错误返回（与旧实现同样不报错，语义不变）。
+    /// 重试，其它错误直接返回。
     static void Wait(string handle) {
         while (SemWait(handle) != 0) {
             if (SemErrno() != Semaphore.SemEintr()) { return; }
@@ -336,16 +336,19 @@ class Semaphore {
         }
         nint ts = NativeMemory.Alloc(16);
         bool ok = false;
-        while (true) {
-            SemClockGettime(0, ts);
-            Span<long> f = new Span<long>(ts, 2);
-            long ns = f[1] + (long)timeoutMs * 1000000;
-            f[0] = f[0] + ns / 1000000000;
-            f[1] = ns % 1000000000;
-            if (SemTimedWait(handle, ts) == 0) { ok = true; break; }
-            if (SemErrno() != Semaphore.SemEintr()) { ok = false; break; }
+        try {
+            while (true) {
+                SemClockGettime(0, ts);
+                Span<long> f = new Span<long>(ts, 2);
+                long ns = f[1] + (long)timeoutMs * 1000000;
+                f[0] = f[0] + ns / 1000000000;
+                f[1] = ns % 1000000000;
+                if (SemTimedWait(handle, ts) == 0) { ok = true; break; }
+                if (SemErrno() != Semaphore.SemEintr()) { ok = false; break; }
+            }
+        } finally {
+            NativeMemory.Free(ts);
         }
-        NativeMemory.Free(ts);
         return ok;
     }
 
@@ -1146,5 +1149,13 @@ class Channel {
         int v = this.buffer.Count;
         Mutex.Unlock(this.lockHandle);
         return v;
+    }
+
+    /// 析构兜底：释放底层互斥锁资源。
+    ~Channel() {
+        if (this.lockHandle != 0) {
+            Mutex.Destroy(this.lockHandle);
+            this.lockHandle = 0;
+        }
     }
 }

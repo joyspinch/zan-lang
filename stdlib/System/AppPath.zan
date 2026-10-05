@@ -3,11 +3,9 @@ using System;
 namespace System;
 
 /// <summary>
-/// 自进程两原语：本进程可执行文件的绝对路径与当前 PID（A332 肥边⑤）。
+/// 自进程两原语：本进程可执行文件的绝对路径与当前 PID。
 /// 独立小文件——Gui 的图标/Skin/错误日志只要"自己 exe 在哪"一句话，
-/// 过去拼 ProcessHost/ProcessList 会把进程管理全家（1100+ 行）拉进
-/// 每个 GUI 程序；原语落这里，重家族委托回本类保持各自 API，
-/// 拼 AppPath 只拉这几十行。
+/// 避免引入完整进程管理组件；原语落这里，轻量依赖只拉这几十行。
 ///
 /// 平台支持：Windows（kernel32）/ Linux（/proc）/ macOS（crt），
 /// 其余平台返回 ""/0，调用方按无法确定处理。
@@ -36,10 +34,13 @@ class AppPath {
     static string Exe() {
         #if WINDOWS
         nint buf = NativeMemory.Alloc(8192);
-        int n = GetModuleFileNameW(0, buf, 4096);
         string exe = "";
-        if (n > 0 && n < 4096) { exe = Wide.Read(buf); }
-        NativeMemory.Free(buf);
+        try {
+            int n = GetModuleFileNameW(0, buf, 4096);
+            if (n > 0 && n < 4096) { exe = Wide.Read(buf); }
+        } finally {
+            NativeMemory.Free(buf);
+        }
         return exe;
         #elif LINUX
         byte[] buf = new byte[4097];
@@ -48,18 +49,22 @@ class AppPath {
         return buf.ToStr(0, n);
         #elif MACOS
         nint sizeBuf = NativeMemory.Alloc(4);
-        new Span<int>(sizeBuf, 1)[0] = 4096;
-        nint pathBuf = NativeMemory.Alloc(4096);
-        NativeMemory.Fill(pathBuf, 0, 4096);
-        int ok = NSGetExecutablePath(pathBuf, sizeBuf);
+        nint pathBuf = 0;
         string exe = "";
-        if (ok == 0) {
-            // 成功时 _NSGetExecutablePath 不更新 *bufsize，实际长度按 NUL 查找。
-            int len = NativeMemory.Find(pathBuf, 0, 0, 4096);
-            if (len >= 0 && len < 4096) { exe = NativeMemory.GetString(pathBuf, 0, len); }
+        try {
+            new Span<int>(sizeBuf, 1)[0] = 4096;
+            pathBuf = NativeMemory.Alloc(4096);
+            NativeMemory.Fill(pathBuf, 0, 4096);
+            int ok = NSGetExecutablePath(pathBuf, sizeBuf);
+            if (ok == 0) {
+                // 成功时 _NSGetExecutablePath 不更新 *bufsize，实际长度按 NUL 查找。
+                int len = NativeMemory.Find(pathBuf, 0, 0, 4096);
+                if (len >= 0 && len < 4096) { exe = NativeMemory.GetString(pathBuf, 0, len); }
+            }
+        } finally {
+            if (pathBuf != 0) { NativeMemory.Free(pathBuf); }
+            NativeMemory.Free(sizeBuf);
         }
-        NativeMemory.Free(pathBuf);
-        NativeMemory.Free(sizeBuf);
         return exe;
         #else
         return "";
