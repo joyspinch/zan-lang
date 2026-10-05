@@ -130,3 +130,12 @@
   （fields.keys，语义自 GenForm/Designer.Inspector 实读代码钉死）+
   gen_knowledge.ps1 -WriteControls 重刷清单。教训：改契约必须同提交改契约测试，
   full 档半年不跑就攒 6 天盲区。
+- [ ] **B-ID97（P3·perf_frame_budget 像素确定性偶发）挂账（2026-10-05）**——full 档
+  发布门禁收敛后补验：帧预算数值全过（FRAME_BUDGET measured vs budget 无告警），像素
+  确定性检查 6 对里 5 对逐字节全等，仅 after-scroll A_vs_B 一对差一帧
+  （first_diff_byte=1817844 → 行 234 列 14，资源树区域；同帧三次重绘应全同，疑似
+  墙钟驱动的局部重绘漏进冻结时钟窗口）。复验两次均被并发会话的 build/ZanIDE.exe
+  增删循环打断（一次 Failed 后随删档转 Skipped，失败点是否漂移无法定论）。需静机
+  连跑三次取证：失败点固定=IDE 墙钟重绘泄漏（修 IDE，改用驱动冻结钟）；漂移=环境
+  噪声（改测试容差或加点稳定性等待）。复现配方：cmake 构建后 ctest -R
+  perf_frame_budget --output-on-failure（需 build/ZanIDE.exe 存在且无并发构建）。
