@@ -336,8 +336,9 @@ class ForceLayout {
     int iterations;   // 实际执行轮数
     // 入场动画补间的初始位（圆周初值的快照，与 nodes 同序）；
     // iterations==0（单节点/退化）或模拟后为空时为 null。
-    List<int> startX;
-    List<int> startY;
+    List<ChartNodeCoord> startCoords; // 初始位强类型实体列表（主表示）
+    List<int> startX; // 兼容视图
+    List<int> startY; // 兼容视图
 
     /// 在**局部坐标**里模拟：绘图区左上角为原点，中心在
     /// (w/2, h/2)，钳制到 [0..w]×[0..h]。调用方绘制时再平移到
@@ -373,9 +374,11 @@ class ForceLayout {
         }
         // 圆周初值快照：入场补间从这份坐标出发按进度插值到终态，
         // 复刻 ECharts force「节点自初始位收敛」的入场观感。
+        l.startCoords = new List<ChartNodeCoord>();
         l.startX = new List<int>();
         l.startY = new List<int>();
         for (int i = 0; i < nn; i = i + 1) {
+            l.startCoords.Add(new ChartNodeCoord(l.nodes[i].x, l.nodes[i].y));
             l.startX.Add(l.nodes[i].x);
             l.startY.Add(l.nodes[i].y);
         }
@@ -573,11 +576,10 @@ class ForceLayout {
         return l;
     }
 
-    /// 固定坐标布局（ECharts graph layout:'none'）：节点按声明
-    /// 序取数据坐标 (xs[i], ys[i])，逐轴线性映射进绘图区（留
-    /// pad 边距）。数据坐标缺失/退化为一点时该轴回落圆周。
-    static ForceLayout FixedOf(List<ChartLink> links, List<string> nodeNames,
-                               List<int> xs, List<int> ys, int w, int h) {
+    /// 固定坐标布局（ECharts graph layout:'none'）：按强类型
+    /// 坐标实体列表 coords[i] 映射进绘图区（优先使用）。
+    static ForceLayout FixedOfCoords(List<ChartLink> links, List<string> nodeNames,
+                                     List<ChartNodeCoord> coords, int w, int h) {
         ForceLayout l = ForceLayout.Build(links, nodeNames);
         int nn = l.nodes.Count;
         if (nn < 1) { return l; }
@@ -589,15 +591,18 @@ class ForceLayout {
         bool gotX = false;
         bool gotY = false;
         int valid = 0;
-        for (int i = 0; i < nn && i < xs.Count && i < ys.Count; i = i + 1) {
-            if (xs[i] < 0 || ys[i] < 0) { continue; }
-            valid = valid + 1;
-            if (!gotX) { loX = xs[i]; hiX = xs[i]; gotX = true; }
-            if (xs[i] < loX) { loX = xs[i]; }
-            if (xs[i] > hiX) { hiX = xs[i]; }
-            if (!gotY) { loY = ys[i]; hiY = ys[i]; gotY = true; }
-            if (ys[i] < loY) { loY = ys[i]; }
-            if (ys[i] > hiY) { hiY = ys[i]; }
+        if (coords != null) {
+            for (int i = 0; i < nn && i < coords.Count; i = i + 1) {
+                ChartNodeCoord pt = coords[i];
+                if (pt == null || pt.x < 0 || pt.y < 0) { continue; }
+                valid = valid + 1;
+                if (!gotX) { loX = pt.x; hiX = pt.x; gotX = true; }
+                if (pt.x < loX) { loX = pt.x; }
+                if (pt.x > hiX) { hiX = pt.x; }
+                if (!gotY) { loY = pt.y; hiY = pt.y; gotY = true; }
+                if (pt.y < loY) { loY = pt.y; }
+                if (pt.y > hiY) { hiY = pt.y; }
+            }
         }
         if (valid == 0) { return ForceLayout.CircularOf(links, nodeNames, w, h); }
         int spanX = hiX - loX;
@@ -605,9 +610,9 @@ class ForceLayout {
         if (spanX < 1) { spanX = 1; }
         if (spanY < 1) { spanY = 1; }
         for (int i = 0; i < nn; i = i + 1) {
-            if (i < xs.Count && i < ys.Count && xs[i] >= 0 && ys[i] >= 0) {
-                l.nodes[i].x = pad + (w - pad * 2) * (xs[i] - loX) / spanX;
-                l.nodes[i].y = pad + (h - pad * 2) * (ys[i] - loY) / spanY;
+            if (coords != null && i < coords.Count && coords[i] != null && coords[i].x >= 0 && coords[i].y >= 0) {
+                l.nodes[i].x = pad + (w - pad * 2) * (coords[i].x - loX) / spanX;
+                l.nodes[i].y = pad + (h - pad * 2) * (coords[i].y - loY) / spanY;
             } else {
                 int ang = i * 360 / nn;
                 int rad = (w < h ? w : h) * 2 / 5;
@@ -617,6 +622,20 @@ class ForceLayout {
             }
         }
         return l;
+    }
+
+    /// 固定坐标布局（ECharts graph layout:'none'）：节点按声明
+    /// 序取数据坐标 (xs[i], ys[i])，逐轴线性映射进绘图区（留
+    /// pad 边距）。数据坐标缺失/退化为一点时该轴回落圆周。
+    static ForceLayout FixedOf(List<ChartLink> links, List<string> nodeNames,
+                               List<int> xs, List<int> ys, int w, int h) {
+        List<ChartNodeCoord> coords = new List<ChartNodeCoord>();
+        int count = xs != null ? xs.Count : 0;
+        if (ys != null && ys.Count < count) { count = ys.Count; }
+        for (int i = 0; i < count; i = i + 1) {
+            coords.Add(new ChartNodeCoord(xs[i], ys[i]));
+        }
+        return ForceLayout.FixedOfCoords(links, nodeNames, coords, w, h);
     }
 
     /// ECharts force 的 symbol/symbolSize 是**逐节点**声明：调用方把

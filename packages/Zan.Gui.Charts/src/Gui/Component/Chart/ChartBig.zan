@@ -4,6 +4,21 @@ using Gui;
 
 namespace Gui.Component.Chart;
 
+/// <summary>大数据量图表抽取列的 [min, max] 范围实体（消除 colMin 与 colMax 平行列表反模式）。</summary>
+class ChartBigColExtents {
+    public int min;
+    public int max;
+
+    public ChartBigColExtents(int min, int max) {
+        this.min = min;
+        this.max = max;
+    }
+
+    public static ChartBigColExtents Of(int min, int max) {
+        return new ChartBigColExtents(min, max);
+    }
+}
+
 /// 高性能图表路径的缓存 min/max 抽取。每个大图表
 /// 持有一个（类似 DataTableState）；底层数据变化时
 /// 调用 Invalidate()。ChartBig 惰性填充并在帧间复用。
@@ -15,8 +30,9 @@ class ChartState {
     int cols;           // 缓存中每个系列最宽的列数
     int axisLo;         // 解析后的数值轴边界
     int axisHi;
-    List<List<int>> colMin;   // 每系列：每个抽取列的最小值
-    List<List<int>> colMax;   // 每系列：每个抽取列的最大值
+    List<List<ChartBigColExtents>> seriesCols; // 每系列：每个抽取列的强类型 [min, max] 实体（主表示）
+    List<List<int>> colMin;   // 兼容视图
+    List<List<int>> colMax;   // 兼容视图
     int animationKey;   // 显式实例键（0 = legacy fallback）
     bool animationKeySet;
 
@@ -29,6 +45,7 @@ class ChartState {
         this.cols = 0;
         this.axisLo = 0;
         this.axisHi = 0;
+        this.seriesCols = new List<List<ChartBigColExtents>>();
         this.colMin = new List<List<int>>();
         this.colMax = new List<List<int>>();
         this.animationKey = 0;
@@ -39,6 +56,7 @@ class ChartState {
     ChartState(int key) {
         this.version = 1; this.builtVersion = 0; this.builtW = -1;
         this.builtSeries = -1; this.cols = 0; this.axisLo = 0; this.axisHi = 0;
+        this.seriesCols = new List<List<ChartBigColExtents>>();
         this.colMin = new List<List<int>>(); this.colMax = new List<List<int>>();
         this.animationKey = key; this.animationKeySet = key != 0;
     }
@@ -83,6 +101,7 @@ class ChartBig {
     /// 每次数据/尺寸变化运行一次，复杂度 O(总点数)。
     static void Build(ChartState st, ChartSource src, int target) {
         if (target < 2) { target = 2; }
+        st.seriesCols = new List<List<ChartBigColExtents>>();
         st.colMin = new List<List<int>>();
         st.colMax = new List<List<int>>();
         int ns = src.SeriesCount();
@@ -93,6 +112,7 @@ class ChartBig {
 
         for (int s = 0; s < ns; s = s + 1) {
             int n = src.PointCount(s);
+            List<ChartBigColExtents> sExt = new List<ChartBigColExtents>();
             List<int> mn = new List<int>();
             List<int> mx = new List<int>();
             if (n > 0) {
@@ -106,6 +126,7 @@ class ChartBig {
                     int col = i * C / n;
                     int v = src.ValueAt(s, i);
                     if (col != curCol) {
+                        sExt.Add(new ChartBigColExtents(cMin, cMax));
                         mn.Add(cMin);
                         mx.Add(cMax);
                         curCol = col;
@@ -117,18 +138,20 @@ class ChartBig {
                     }
                     i = i + 1;
                 }
+                sExt.Add(new ChartBigColExtents(cMin, cMax));
                 mn.Add(cMin);
                 mx.Add(cMax);
             }
 
-            for (int j = 0; j < mn.Count; j = j + 1) {
-                int a = mn[j];
-                int b = mx[j];
+            for (int j = 0; j < sExt.Count; j = j + 1) {
+                int a = sExt[j].min;
+                int b = sExt[j].max;
                 if (!seen) { lo = a; hi = b; seen = true; }
                 if (a < lo) { lo = a; }
                 if (b > hi) { hi = b; }
             }
-            if (mn.Count > cols) { cols = mn.Count; }
+            if (sExt.Count > cols) { cols = sExt.Count; }
+            st.seriesCols.Add(sExt);
             st.colMin.Add(mn);
             st.colMax.Add(mx);
         }
@@ -237,16 +260,19 @@ class ChartBig {
         for (int s = 0; s < ns; s = s + 1) {
             int color = src.SeriesColor(s);
             if (color == 0) { color = Chart.Palette(t, s); }
-            List<int> mn = st.colMin[s];
-            List<int> mx = st.colMax[s];
-            int cn = mn.Count;
+            List<ChartBigColExtents> sExt = (st.seriesCols != null && s < st.seriesCols.Count)
+                ? st.seriesCols[s] : null;
+            int cn = sExt != null ? sExt.Count
+                : (st.colMin != null && s < st.colMin.Count ? st.colMin[s].Count : 0);
 
             List<int> lx = new List<int>();
             List<int> ly = new List<int>();
             for (int cc = 0; cc < cn; cc = cc + 1) {
                 int px = plotX + cc * plotW / cn;
-                int vTop = (int)((long)mx[cc] * g / 1000L);
-                int vBot = (int)((long)mn[cc] * g / 1000L);
+                int mnVal = sExt != null ? sExt[cc].min : st.colMin[s][cc];
+                int mxVal = sExt != null ? sExt[cc].max : st.colMax[s][cc];
+                int vTop = (int)((long)mxVal * g / 1000L);
+                int vBot = (int)((long)mnVal * g / 1000L);
                 // 大数据量程大，(v - lo) × plotH 会超 int32，乘法走 long。
                 int yTop = plotY + plotH - (int)(((long)vTop - (long)st.axisLo) * (long)plotH / (long)span);
                 int yBot = plotY + plotH - (int)(((long)vBot - (long)st.axisLo) * (long)plotH / (long)span);
