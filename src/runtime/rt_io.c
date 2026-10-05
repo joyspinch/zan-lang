@@ -300,6 +300,37 @@ static void io_shards_prime(void) {
 }
 
 #if defined(ZAN_CO_DRIVER)
+/* Shard mutexes are primed exactly once per process, under the dedicated
+ * init lock below, BEFORE any thread can shard_lock one. Priming anywhere
+ * else is a race: io_shard_open(0) used to pthread_mutex_init sh->mx while
+ * zan_io_init itself held that mutex (re-init of a held lock is undefined,
+ * and a second thread blocked in shard_lock on the same mutex lost its wait
+ * state mid-reinit), and the very first shard_lock ran on the static
+ * array's all-zero bytes, which only works by glibc/musl accident. The
+ * first zan_io_init is the only path that can touch a shard mutex before
+ * the pool starts, so priming there covers every shard; shutdown/re-init
+ * cycles must not re-init live mutexes, hence the one-shot flag. */
+static int g_shard_mx_ready;
+static void io_shard_mutexes_prime(void) {
+    if (g_shard_mx_ready) return;
+    for (int i = 0; i < ZAN_IO_MAXSHARD; i++)
+        pthread_mutex_init(&g_ioshard[i].mx, NULL);
+    g_shard_mx_ready = 1;
+}
+/* Init guard of its own, statically initialized: the init path can never
+ * run under a shard mutex (poll turns hold those), so a process-wide lock
+ * with a static initializer is both sufficient and free of the
+ * bootstrap problem that made shard-mutex priming special. */
+static pthread_mutex_t g_io_init_mx = PTHREAD_MUTEX_INITIALIZER;
+#define IO_INIT_LOCK()    pthread_mutex_lock(&g_io_init_mx)
+#define IO_INIT_UNLOCK()  pthread_mutex_unlock(&g_io_init_mx)
+#else
+static void io_shard_mutexes_prime(void) { }
+#define IO_INIT_LOCK()    ((void)0)
+#define IO_INIT_UNLOCK()  ((void)0)
+#endif
+
+#if defined(ZAN_CO_DRIVER)
 /* Live shard count, 1 = the single shared reactor. Set once per process by
  * io_shards_start before the workers exist (see the shim section). */
 static volatile LONG g_shards = 1;
@@ -1507,9 +1538,6 @@ static int io_shard_open(int i) {
     io_shards_prime();
     zan_io_shard_t *sh = &g_ioshard[i];
     if (sh->poll_fd >= 0) return 1;
-#if defined(ZAN_CO_DRIVER)
-    pthread_mutex_init(&sh->mx, NULL);
-#endif
     sh->poll_fd = epoll_create1(0);
     if (sh->poll_fd < 0) return 0;
     sh->wake_rfd = sh->wake_wfd = eventfd(0, EFD_NONBLOCK);
@@ -1538,6 +1566,7 @@ static int io_shard_open(int i) {
 
 static void io_init_locked(void) {
     if (g_io_started) return;
+    io_shard_mutexes_prime();
     zan_io_ignore_sigpipe();
     /* A fresh reactor lifetime clears any poison from a failed previous one:
      * shutdown+re-init is real (schedulers and embedded hosts do it). */
@@ -1555,16 +1584,16 @@ static void io_init_locked(void) {
 }
 
 void zan_io_init(void) {
-    /* Fast path first, WITHOUT the shard lock: zan_co_ready ->
+    /* Fast path first, WITHOUT the init lock: zan_co_ready ->
      * co_pool_ensure -> co_pool_start_background calls this from inside a
      * poll turn (io_wake readied a frame while a shard turn held the
-     * mutex), and a non-recursive re-lock there would self-deadlock. The
-     * flag read is benign: a simultaneous first init still serializes on
-     * the lock, and io_init_locked re-checks g_io_started under it. */
+     * mutex). The flag read is benign: a simultaneous first init still
+     * serializes on the dedicated init lock, and io_init_locked re-checks
+     * g_io_started under it. */
     if (g_io_started) return;
-    shard_lock(&g_ioshard[0]);
+    IO_INIT_LOCK();
     io_init_locked();
-    shard_unlock(&g_ioshard[0]);
+    IO_INIT_UNLOCK();
 }
 
 static void io_shutdown_locked(void) {
@@ -1943,9 +1972,6 @@ static int io_shard_open(int i) {
     io_shards_prime();
     zan_io_shard_t *sh = &g_ioshard[i];
     if (sh->poll_fd >= 0) return 1;
-#if defined(ZAN_CO_DRIVER)
-    pthread_mutex_init(&sh->mx, NULL);
-#endif
     sh->poll_fd = kqueue();
     if (sh->poll_fd < 0) return 0;
     int pfd[2];
@@ -1975,6 +2001,7 @@ static int io_shard_open(int i) {
 
 static void io_init_locked(void) {
     if (g_io_started) return;
+    io_shard_mutexes_prime();
     zan_io_ignore_sigpipe();
     /* Fresh reactor lifetime: clear any poison from a failed previous one. */
     g_io_broken = 0;
@@ -1989,16 +2016,16 @@ static void io_init_locked(void) {
 }
 
 void zan_io_init(void) {
-    /* Fast path first, WITHOUT the shard lock: zan_co_ready ->
+    /* Fast path first, WITHOUT the init lock: zan_co_ready ->
      * co_pool_ensure -> co_pool_start_background calls this from inside a
      * poll turn (io_wake readied a frame while a shard turn held the
-     * mutex), and a non-recursive re-lock there would self-deadlock. The
-     * flag read is benign: a simultaneous first init still serializes on
-     * the lock, and io_init_locked re-checks g_io_started under it. */
+     * mutex). The flag read is benign: a simultaneous first init still
+     * serializes on the dedicated init lock, and io_init_locked re-checks
+     * g_io_started under it. */
     if (g_io_started) return;
-    shard_lock(&g_ioshard[0]);
+    IO_INIT_LOCK();
     io_init_locked();
-    shard_unlock(&g_ioshard[0]);
+    IO_INIT_UNLOCK();
 }
 
 void zan_io_shutdown(void) {
@@ -2601,8 +2628,18 @@ static int ensure_assoc(SOCKET s) {
 #endif
 }
 
+/* Init guard of its own, statically initialized: first use of the IO
+ * backend is lazy (zan_io_wait_co), so two coroutines on two workers can
+ * reach zan_io_init on the same tick and would otherwise double-create the
+ * completion port (one leaked, waiters split across ports) and re-initialize
+ * a live critical section. SRWLOCK_INIT needs no bootstrap of its own. */
+static SRWLOCK g_io_init_srw = SRWLOCK_INIT;
+static int g_rto_lock_ready;
+
 void zan_io_init(void) {
     if (g_io_started) return;
+    AcquireSRWLockExclusive(&g_io_init_srw);
+    if (g_io_started) { ReleaseSRWLockExclusive(&g_io_init_srw); return; }
     zan__crash_install();
     g_io_count = 0;
     /* Fresh reactor lifetime; and if the port itself cannot be created
@@ -2614,11 +2651,15 @@ void zan_io_init(void) {
     WSAStartup(MAKEWORD(2, 2), &wsa);
     g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (g_iocp == NULL) g_io_broken = 1;
-    InitializeCriticalSection(&g_rto_lock);
+    if (!g_rto_lock_ready) {
+        InitializeCriticalSection(&g_rto_lock);
+        g_rto_lock_ready = 1;
+    }
 #if defined(ZAN_CO_DRIVER)
     InitializeSListHead(&g_op_slist);   /* lock-free op pool for the workers */
 #endif
     g_io_started = 1;
+    ReleaseSRWLockExclusive(&g_io_init_srw);
 }
 
 void zan_io_shutdown(void) {
@@ -3323,20 +3364,21 @@ static int io_shard_open(int i) {
 }
 
 void zan_io_init(void) {
-    /* Fast path first, WITHOUT the shard lock: zan_co_ready ->
+    /* Fast path first, WITHOUT the init lock: zan_co_ready ->
      * co_pool_ensure -> co_pool_start_background calls this from inside a
      * poll turn (io_wake readied a frame while a shard turn held the
-     * mutex), and a non-recursive re-lock there would self-deadlock. The
-     * flag read is benign: a simultaneous first init still serializes on
-     * the lock, and io_init_locked re-checks g_io_started under it. */
+     * mutex). The flag read is benign: a simultaneous first init still
+     * serializes on the dedicated init lock, and io_init_locked re-checks
+     * g_io_started under it. */
     if (g_io_started) return;
-    shard_lock(&g_ioshard[0]);
+    IO_INIT_LOCK();
     io_init_locked();
-    shard_unlock(&g_ioshard[0]);
+    IO_INIT_UNLOCK();
 }
 
 static void io_init_locked(void) {
     if (g_io_started) return;
+    io_shard_mutexes_prime();
     zan_io_ignore_sigpipe();
     g_io_entries = NULL;
     g_io_count = 0;
