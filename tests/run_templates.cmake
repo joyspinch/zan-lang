@@ -45,6 +45,11 @@ foreach(_proj IN LISTS _projs)
   set(_out ${WORK}/${_slug})
 
   file(READ ${_proj} _manifest)
+  # Platform selection belongs to the scaffolded project, not the reusable template.
+  if(_manifest MATCHES "(^|[;\r\n])[ \t]*(platform|publishPlatforms)[ \t]*=[ \t]*[^; \t\r\n]")
+    list(APPEND _failed "${_rel}: template must not pin a platform; the wizard writes the selected targets")
+    continue()
+  endif()
   set(_type "")
   set(_target "exe")
   set(_entry "")
