@@ -38,6 +38,18 @@
 #ifndef ZAN_RT_CRASH_H
 #define ZAN_RT_CRASH_H
 
+/* Same source, many configurations: runtime objects like rt_io.c compile
+ * under every reactor backend and driver combination, so a static helper can
+ * be legitimately unreferenced in some of them. Mark those instead of
+ * platform-guarding each definition -- the guards would fragment the file. */
+#ifndef ZAN_MAYBE_UNUSED
+#  if defined(__GNUC__) || defined(__clang__)
+#    define ZAN_MAYBE_UNUSED __attribute__((unused))
+#  else
+#    define ZAN_MAYBE_UNUSED
+#  endif
+#endif
+
 #if defined(_WIN32)
 #include <windows.h>
 /* GetTickCount64 (used below): some MinGW header sets (TDM-GCC with the
@@ -911,7 +923,7 @@ static void zan__guard_log_deferred(zan__thread_slot *s, zan__fault_t *flt) {
 
 /* Run fn(arg) with a recovery point for this thread. Returns 1 when it
  * returned normally, 0 when a fault inside it was recovered from. */
-static int zan__guard_call(void (*fn)(void *), void *arg) {
+static ZAN_MAYBE_UNUSED int zan__guard_call(void (*fn)(void *), void *arg) {
     if (!fn) return 1;
     zan__thread_slot *s = zan__slot(1);
     if (!s) { fn(arg); return 1; } /* out of slots: unguarded, as before */
@@ -1012,7 +1024,7 @@ static LONG CALLBACK zan__crash_veh(EXCEPTION_POINTERS *ep) {
 }
 
 /* Number of faults the guard has absorbed so far (a UI can surface it). */
-static LONG zan__guard_recovered_count(void) {
+static ZAN_MAYBE_UNUSED LONG zan__guard_recovered_count(void) {
     return zan__guard_recovered;
 }
 

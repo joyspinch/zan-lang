@@ -28,6 +28,15 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# The CRT's _s-function deprecation warnings fire on deliberately-audited
+# getenv/fopen/strncpy call sites across the tree. Opt out once, globally:
+# the historical per-target if(MSVC) definitions never fired under the clang
+# toolchain mandated by docs/BUILD_TOOLCHAIN.md (CMAKE_C_COMPILER_ID is Clang
+# there, so the MSVC variable is false). Windows-only: a no-op elsewhere.
+if(WIN32)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+endif()
+
 # ---- Version (single source of truth: the root VERSION file) ----
 # Every binary reports this string (zanc --version, LSP serverInfo, About box).
 # Edit VERSION only; the generated zan_version.h propagates it into the build.

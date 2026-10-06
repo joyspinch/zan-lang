@@ -47,7 +47,7 @@ static int zan_io_trace(void){static volatile int t=-1;int c=__atomic_load_n(&t,
 /* scheduler-park trace: one line per park/unpark/pump decision so a
  * "threads are all asleep on something" state can be attributed to a section
  * by matching the last line each worker printed against its kernel wchan. */
-static int zan_sched_trace(void){static volatile int t=-1;int c=__atomic_load_n(&t,__ATOMIC_RELAXED);if(c<0){const char*e=getenv("ZAN_SCHED_TRACE");c=(e&&*e&&*e!='0')?1:0;__atomic_store_n(&t,c,__ATOMIC_RELAXED);}return c;}
+static ZAN_MAYBE_UNUSED int zan_sched_trace(void){static volatile int t=-1;int c=__atomic_load_n(&t,__ATOMIC_RELAXED);if(c<0){const char*e=getenv("ZAN_SCHED_TRACE");c=(e&&*e&&*e!='0')?1:0;__atomic_store_n(&t,c,__ATOMIC_RELAXED);}return c;}
 #define STRACE(...) do{if(zan_sched_trace()){fprintf(stderr,"[st] " __VA_ARGS__);fprintf(stderr,"\n");fflush(stderr);}}while(0)
 
 
@@ -97,7 +97,7 @@ static void zan_io_ignore_sigpipe(void) {
  * pipe write end keeps the pipe alive after shutdown, and an inherited
  * epoll/kqueue fd is pure leakage. Best effort -- a failure leaves the fd
  * inheritable, which is today's behaviour anyway. */
-static void zan_io_fd_cloexec(int fd) {
+static ZAN_MAYBE_UNUSED void zan_io_fd_cloexec(int fd) {
 #if defined(FD_CLOEXEC)
     if (fd >= 0) fcntl(fd, F_SETFD, FD_CLOEXEC);
 #else
@@ -180,7 +180,7 @@ static int g_io_started;
 static int g_io_broken;
 /* Reactor sharded exactly once per process (the pool start paths;
  * Windows: IOCP ports, POSIX: per-worker poll sets). */
-static int g_io_shards_live;
+static ZAN_MAYBE_UNUSED int g_io_shards_live;
 
 /* ---- async hostname resolution (shared by all backends) ----
  * zan_io_resolve_co runs the lookup on a worker thread so the reactor never
@@ -195,7 +195,7 @@ static int g_io_shards_live;
  * itself lives in the coroutine-facing ABI section at the bottom; these are
  * the pieces the platform backends must see. */
 static int32_t g_blocking_inflight;
-static int32_t g_dns_wake_fd = -1;    /* reactor-visible wake fd (POSIX) */
+static ZAN_MAYBE_UNUSED int32_t g_dns_wake_fd = -1;    /* reactor-visible wake fd (POSIX) */
 #if defined(_WIN32)
 /* Set when a blocking/DNS completion packet could not be posted. That packet
  * is the only notification that a worker's job finished, so a failed Post must
@@ -631,7 +631,7 @@ static int io_sweep_entries(int fd_limit) {
 #endif
 
 #if defined(_WIN32)
-static volatile LONG g_socket_cleanup_requested;
+static ZAN_MAYBE_UNUSED volatile LONG g_socket_cleanup_requested;
 
 void zan_io_socket_cleanup(void) {
 #if defined(ZAN_CO_DRIVER)
@@ -2587,7 +2587,7 @@ static void op_free(zan_io_op_t *op) {
  * cheap ERROR_INVALID_PARAMETER no-op), which is correct and race-free. */
 
 /* Associate a brand-new kernel socket with the port. */
-static void mark_assoc(SOCKET s) {
+static ZAN_MAYBE_UNUSED void mark_assoc(SOCKET s) {
 #if defined(ZAN_CO_DRIVER)
     HANDLE port = io_shard_of(s);
 #else
@@ -2776,7 +2776,7 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
 
     int skip = ensure_assoc(s);
     (void)skip;   /* only the multi-worker driver completes inline */
-    IOTRACE("io_register(READY) fd=%lld interest=%d cnt=%d", (long long)s, interest, g_io_count);
+    IOTRACE("io_register(READY) fd=%lld interest=%d cnt=%ld", (long long)s, interest, g_io_count);
 
     zan_io_op_t *op = op_alloc();
     if (!op) {   /* out of memory: resume the waiter rather than park it forever */
@@ -2808,7 +2808,7 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     } else {
         r = WSASend(s, &b, 1, NULL, 0, &op->ov, NULL);
     }
-    IOTRACE("ready_co fd=%lld interest=%d op=%p -> r=%d err=%d cnt=%d",
+    IOTRACE("ready_co fd=%lld interest=%d op=%p -> r=%d err=%d cnt=%ld",
             (long long)s, interest, (void*)op, r, r?WSAGetLastError():0, g_io_count);
     if (r == 0) {
 #if defined(ZAN_CO_DRIVER)
@@ -2890,7 +2890,7 @@ void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
     b.buf = (char *)buf;
     DWORD flags = 0, got = 0;
     int r = WSARecv(s, &b, 1, &got, &flags, &op->ov, NULL);
-    IOTRACE("recv_co fd=%lld len=%d op=%p -> r=%d got=%lu err=%d cnt=%d", (long long)fd, len, (void*)op, r, (unsigned long)got, r?WSAGetLastError():0, g_io_count);
+    IOTRACE("recv_co fd=%lld len=%d op=%p -> r=%d got=%lu err=%d cnt=%ld", (long long)fd, len, (void*)op, r, (unsigned long)got, r?WSAGetLastError():0, g_io_count);
     if (r == 0) {
 #if defined(ZAN_CO_DRIVER)
         /* Immediate completion. With skip-on-success no packet is queued, so
@@ -3094,7 +3094,7 @@ void zan_io_recv_to_co(intptr_t fd, void *buf, int32_t len, int64_t timeout_ms,
     b.buf = (char *)buf;
     DWORD flags = 0, got = 0;
     int r = WSARecv(s, &b, 1, &got, &flags, &op->ov, NULL);
-    IOTRACE("recv_to_co fd=%lld len=%d to=%lld op=%p -> r=%d got=%lu err=%d cnt=%d",
+    IOTRACE("recv_to_co fd=%lld len=%d to=%lld op=%p -> r=%d got=%lu err=%d cnt=%ld",
             (long long)fd, len, (long long)timeout_ms, (void*)op, r,
             (unsigned long)got, r ? WSAGetLastError() : 0, g_io_count);
     if (r == 0) {
@@ -3211,7 +3211,7 @@ void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
     got = 0;
     BOOL ok = accept_ex(listener, accepted, op->accept_buf, 0,
                         addr_len, addr_len, &got, &op->ov);
-    IOTRACE("accept_co listener=%lld op=%p ok=%d err=%d cnt=%d", (long long)listener, (void*)op, (int)ok, WSAGetLastError(), g_io_count);
+    IOTRACE("accept_co listener=%lld op=%p ok=%d err=%d cnt=%ld", (long long)listener, (void*)op, (int)ok, WSAGetLastError(), g_io_count);
 #if defined(ZAN_CO_DRIVER)
     /* Inline accept, no packet coming: deliver it here (as for recv above). */
     if (ok && skip) {
@@ -3314,14 +3314,14 @@ int32_t zan_io_poll(int64_t timeout_ms) {
 #else
     if (!GetQueuedCompletionStatusEx(g_iocp, entries, 64, &removed, to, FALSE)) {
 #endif
-        IOTRACE("poll GQCS=0 err=%lu to=%lu cnt=%d", (unsigned long)GetLastError(), (unsigned long)to, g_io_count);
+        IOTRACE("poll GQCS=0 err=%lu to=%lu cnt=%ld", (unsigned long)GetLastError(), (unsigned long)to, g_io_count);
         int w = dns_timeout_scan();
         if (w) return w;
         int wr = rto_timeout_scan();
         if (wr) return wr;
         return dns_drain();
     }
-    IOTRACE("poll removed=%lu cnt=%d", (unsigned long)removed, g_io_count);
+    IOTRACE("poll removed=%lu cnt=%ld", (unsigned long)removed, g_io_count);
     int woke = 0;
     for (ULONG i = 0; i < removed; i++) {
         if (!entries[i].lpOverlapped) {
@@ -3976,7 +3976,7 @@ static void dns_wake_notify(void) {
 #endif
 }
 
-static void dns_wake_read(void) {
+static ZAN_MAYBE_UNUSED void dns_wake_read(void) {
 #if defined(__linux__)
     uint64_t v;
     ssize_t r = read(g_dns_wake_fd, &v, sizeof(v));

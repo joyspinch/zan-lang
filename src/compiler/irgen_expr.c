@@ -4441,10 +4441,18 @@ static LLVMValueRef emit_checked_int_arith(zan_irgen_t *g, zan_ast_node_t *expr,
         }
     } else { /* CHK_MUL */
         if (is_unsigned) {
-            /* left != 0 && res / left != right */
+            /* left != 0 && res / left != right -- the wrapping narrow product
+             * is both the check's dividend and the (wrapped) result. The
+             * divide-back runs unconditionally, so divide by 1 whenever
+             * left == 0: the machine divide must never see a zero divisor
+             * (#DE), and the bogus quotient is masked by the nonzero
+             * conjunct below (0 * right is in range, never a trap). */
+            res = zan_mul(g->builder, left, right, "ck.mul");
             LLVMValueRef nonzero = zan_icmp(g->builder, LLVMIntNE, left,
                 LLVMConstInt(ty, 0, 0), "ck.nz");
-            LLVMValueRef q = zan_udiv(g->builder, res, left, "ck.mul.q");
+            LLVMValueRef dvs = LLVMBuildSelect(g->builder, nonzero, left,
+                LLVMConstInt(ty, 1, 0), "ck.mul.dv");
+            LLVMValueRef q = zan_udiv(g->builder, res, dvs, "ck.mul.q");
             LLVMValueRef back = zan_icmp(g->builder, LLVMIntNE, q, right,
                 "ck.mul.back");
             ovf = zan_and(g->builder, nonzero, back, "ck.mul.ovf");
