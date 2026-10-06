@@ -1,0 +1,806 @@
+using System;
+using Gui;
+
+namespace Coreforge;
+
+class ForgeCamera {
+    int viewportX;
+    int viewportY;
+    int viewportW;
+    int viewportH;
+    double x;
+    double y;
+    double zoom;
+
+    ForgeCamera() { zoom = 1.0; }
+
+    // x/y denote the viewport center in tiles; simulation coordinates use 1000 units per tile.
+    int ScreenX(int world1000) {
+        return viewportX + (int)Math.Round(viewportW * 0.5 + (world1000 / 1000.0 - x) * ForgeGrid.TileSize() * zoom);
+    }
+    int ScreenY(int world1000) {
+        return viewportY + (int)Math.Round(viewportH * 0.5 + (world1000 / 1000.0 - y) * ForgeGrid.TileSize() * zoom);
+    }
+    int CellAt(ForgeWorld w, int mx, int my) {
+        if (viewportW <= 0 || viewportH <= 0 || mx < viewportX || my < viewportY ||
+            mx >= viewportX + viewportW || my >= viewportY + viewportH) { return -1; }
+        double pixels = ForgeGrid.TileSize() * zoom;
+        int tx = (int)Math.Floor(x + (mx - viewportX - viewportW * 0.5) / pixels);
+        int ty = (int)Math.Floor(y + (my - viewportY - viewportH * 0.5) / pixels);
+        return w.Index(tx, ty);
+    }
+    void Pan(double dxPixels, double dyPixels) {
+        double pixels = ForgeGrid.TileSize() * zoom;
+        x = x - dxPixels / pixels;
+        y = y - dyPixels / pixels;
+    }
+    void ZoomAt(double factor, int mx, int my) {
+        if (!(factor > 0.0)) { return; }
+        double pixels = ForgeGrid.TileSize() * zoom;
+        double anchorX = x + (mx - viewportX - viewportW * 0.5) / pixels;
+        double anchorY = y + (my - viewportY - viewportH * 0.5) / pixels;
+        zoom = Math.Max(0.45, Math.Min(2.2, zoom * factor));
+        pixels = ForgeGrid.TileSize() * zoom;
+        x = anchorX - (mx - viewportX - viewportW * 0.5) / pixels;
+        y = anchorY - (my - viewportY - viewportH * 0.5) / pixels;
+    }
+    void SetViewport(int x, int y, int w, int h) {
+        viewportX = x; viewportY = y;
+        viewportW = ForgeGrid.Max(0, w); viewportH = ForgeGrid.Max(0, h);
+    }
+    void Focus(ForgeWorld w) {
+        x = w.coreCell % w.width + 0.5;
+        y = w.coreCell / w.width + 0.5;
+    }
+}
+
+class ForgeRenderer {
+    Canvas canvas;
+    int originX;
+    int originY;
+    double scale;
+    bool ghost;
+    int ghostTint;
+    int aimBudget;
+    int[] aimCell;
+    int[] aimTarget;
+    int[] aimGeneration;
+    int[] aimTick;
+
+    ForgeRenderer() {
+        aimCell = new int[1024]; aimTarget = new int[1024];
+        aimGeneration = new int[1024]; aimTick = new int[1024];
+        for (int i = 0; i < 1024; i = i + 1) { aimCell[i] = -1; aimTarget[i] = -1; aimTick[i] = -1; }
+    }
+
+    int S(int value) { return (int)Math.Round(value * scale); }
+    int Stroke(int value) { return ForgeGrid.Max(1, S(value)); }
+    int Ink(int color) {
+        if (!ghost) { return color; }
+        int red = (((color >> 16) & 255) + ((ghostTint >> 16) & 255)) / 2;
+        int green = (((color >> 8) & 255) + ((ghostTint >> 8) & 255)) / 2;
+        int blue = ((color & 255) + (ghostTint & 255)) / 2;
+        return 0x99000000 | (red << 16) | (green << 8) | blue;
+    }
+    void Rect(int x, int y, int w, int h, int color) {
+        canvas.FillRect(originX + S(x), originY + S(y), ForgeGrid.Max(1, S(x + w) - S(x)), ForgeGrid.Max(1, S(y + h) - S(y)), Ink(color));
+    }
+    void Frame(int x, int y, int w, int h, int color, int thickness) {
+        canvas.DrawRect(originX + S(x), originY + S(y), ForgeGrid.Max(1, S(x + w) - S(x)), ForgeGrid.Max(1, S(y + h) - S(y)), Ink(color), Stroke(thickness));
+    }
+    void Line(int x0, int y0, int x1, int y1, int color, int thickness) {
+        canvas.DrawLine(originX + S(x0), originY + S(y0), originX + S(x1), originY + S(y1), Ink(color), Stroke(thickness));
+    }
+    void Disc(int x, int y, int radius, int color) {
+        canvas.FillCircle(originX + S(x), originY + S(y), Stroke(radius), Ink(color));
+    }
+    void Ring(int x, int y, int radius, int color, int thickness) {
+        canvas.DrawCircle(originX + S(x), originY + S(y), Stroke(radius), Ink(color), Stroke(thickness));
+    }
+    void Sector(int x, int y, int inner, int outer, int start, int end, int color) {
+        canvas.FillSector(originX + S(x), originY + S(y), S(inner), Stroke(outer), start, end, Ink(color));
+    }
+    void Glow(int x, int y, int radius, int color, int alpha) {
+        if (!ghost) { canvas.FillRadial(originX + S(x), originY + S(y), Stroke(radius), color, alpha); }
+    }
+    void AtCell(ForgeWorld w, ForgeCamera camera, int cell) {
+        scale = camera.zoom;
+        originX = camera.ScreenX((cell % w.width) * 1000);
+        originY = camera.ScreenY((cell / w.width) * 1000);
+    }
+    bool Visible(ForgeCamera camera, int x, int y, int margin) {
+        return x + margin >= camera.viewportX && y + margin >= camera.viewportY &&
+            x - margin < camera.viewportX + camera.viewportW && y - margin < camera.viewportY + camera.viewportH;
+    }
+    int RotX(int x, int y, int direction) {
+        if (direction == 1) { return 32 - y; }
+        if (direction == 2) { return 32 - x; }
+        if (direction == 3) { return y; }
+        return x;
+    }
+    int RotY(int x, int y, int direction) {
+        if (direction == 1) { return x; }
+        if (direction == 2) { return 32 - y; }
+        if (direction == 3) { return 32 - x; }
+        return y;
+    }
+    void TurnRect(int x, int y, int w, int h, int direction, int color) {
+        int x0 = RotX(x, y, direction); int y0 = RotY(x, y, direction);
+        int x1 = RotX(x + w, y + h, direction); int y1 = RotY(x + w, y + h, direction);
+        Rect(ForgeGrid.Min(x0, x1), ForgeGrid.Min(y0, y1), ForgeGrid.Abs(x1 - x0), ForgeGrid.Abs(y1 - y0), color);
+    }
+    void TurnLine(int x0, int y0, int x1, int y1, int direction, int color, int thickness) {
+        Line(RotX(x0, y0, direction), RotY(x0, y0, direction), RotX(x1, y1, direction), RotY(x1, y1, direction), color, thickness);
+    }
+    void Arrow(int x, int y, int direction, int color) {
+        TurnLine(x - 3, y - 3, x, y, direction, color, 1);
+        TurnLine(x, y, x - 3, y + 3, direction, color, 1);
+    }
+    int ItemColor(int item) {
+        if (item == 0) { return 0xFFE8A05D; }
+        if (item == 1) { return 0xFFB5A3C9; }
+        if (item == 2) { return 0xFF7C8792; }
+        if (item == 3) { return 0xFF9DE8CA; }
+        if (item == 4) { return 0xFFC0CCD3; }
+        if (item == 5) { return 0xFF7ECAEC; }
+        return 0xFFE2D5B5;
+    }
+    int TurretRange(ForgeWorld w) { return w.researched[3] ? 7 : 6; }
+
+    void Plate(int color) {
+        Rect(4, 6, 27, 26, 0x70202628);
+        Rect(4, 2, 24, 28, 0xFF182529);
+        Rect(2, 5, 28, 22, 0xFF182529);
+        Rect(5, 4, 22, 24, color);
+        Rect(4, 7, 24, 17, color);
+        Line(6, 4, 25, 4, 0xFF8C998E, 1);
+        Line(4, 7, 4, 23, 0xFF586A67, 1);
+        Line(6, 28, 26, 28, 0xFF101E23, 2);
+        if (scale >= 0.7) {
+            Rect(6, 6, 2, 2, 0xFFB1B4A1); Rect(24, 6, 2, 2, 0xFFB1B4A1);
+            Rect(6, 24, 2, 2, 0xFF17252A); Rect(24, 24, 2, 2, 0xFF17252A);
+        }
+    }
+    void Corners(int color, int inset) {
+        int high = 32 - inset;
+        Line(inset, inset + 6, inset, inset, color, 2); Line(inset, inset, inset + 6, inset, color, 2);
+        Line(high - 6, inset, high, inset, color, 2); Line(high, inset, high, inset + 6, color, 2);
+        Line(inset, high - 6, inset, high, color, 2); Line(inset, high, inset + 6, high, color, 2);
+        Line(high - 6, high, high, high, color, 2); Line(high, high, high, high - 6, color, 2);
+    }
+
+    void Terrain(ForgeWorld w, ForgeCamera camera, int cell) {
+        ForgeTile tile = w.tiles[cell];
+        int tx = cell % w.width; int ty = cell / w.width;
+        int hash = (tx * 7349 + ty * 9151 + (w.seed & 65535) * 31) & 1023;
+        AtCell(w, camera, cell);
+        int width = camera.ScreenX((tx + 1) * 1000) - originX;
+        int height = camera.ScreenY((ty + 1) * 1000) - originY;
+        int ground = 0xFF484838;
+        if (hash % 5 == 0) { ground = 0xFF4C4939; }
+        if (hash % 5 == 1) { ground = 0xFF444638; }
+        if (hash % 11 == 0) { ground = 0xFF50483A; }
+        canvas.FillRect(originX, originY, width, height, ground);
+        if (tile.terrain == TerrainKind.Water || tile.terrain == TerrainKind.Oil) {
+            bool water = tile.terrain == TerrainKind.Water;
+            int liquid = water ? 0xFF244C50 : 0xFF272432;
+            if (hash % 3 == 0) { liquid = water ? 0xFF285357 : 0xFF2C2638; }
+            canvas.FillRect(originX, originY, width, height, liquid);
+            for (int d = 0; d < 4; d = d + 1) {
+                int adjacent = w.Neighbor(cell, d);
+                if (adjacent < 0 || w.tiles[adjacent].terrain != tile.terrain) {
+                    TurnRect(29, 0, 3, 32, d, water ? 0xFF526557 : 0xFF544745);
+                    TurnLine(28, 2, 28, 29, d, water ? 0xFF559B91 : 0xFF716176, 1);
+                }
+            }
+            if (hash % 3 == 0 && scale >= 0.6) {
+                int ripple = (w.tick / 12 + hash) % 7;
+                if (water) {
+                    Line(5, 9 + ripple, 14, 9 + ripple, 0xFF427874, 1);
+                    Line(17, 18 + ripple, 25, 18 + ripple, 0xFF366B69, 1);
+                } else {
+                    Sector(15, 17, 7, 8, 195 + ripple, 285 + ripple, 0xFF68506E);
+                    Line(11, 11, 17, 9, 0xFF80705E, 1);
+                }
+            }
+        } else if (scale >= 0.65) {
+            int gritX = 4 + hash % 23; int gritY = 4 + (hash / 7) % 23;
+            Rect(gritX, gritY, 2, 1, 0xFF69604A);
+            if (hash % 4 == 0) {
+                Line(3, 24, 12, 21, 0xFF393E33, 1);
+                Line(12, 21, 17, 22, 0xFF393E33, 1);
+            }
+        }
+        if (tile.terrain == TerrainKind.Rock) { Rock(hash); }
+        if (tile.ore >= 0 && tile.reserve > 0) { Ore(tile.ore, hash); }
+    }
+    void Rock(int hash) {
+        int offset = hash % 3;
+        Disc(18, 20, 13, 0x7030392F);
+        Rect(8, 7, 18, 20, 0xFF343E3C);
+        Rect(5, 11, 24, 11, 0xFF343E3C);
+        Sector(16, 16, 0, 12, 195, 305, 0xFF788073);
+        Sector(16, 16, 0, 12, 305, 360, 0xFF56665D);
+        Sector(16, 16, 0, 12, 0, 100, 0xFF56665D);
+        Sector(16, 16, 0, 12, 100, 195, 0xFF46544C);
+        Line(5, 13, 13 + offset, 5, 0xFF95947C, 1);
+        Line(13 + offset, 5, 22, 8, 0xFF93947E, 1);
+        Line(16, 16, 25, 10, 0xFF8A8F7A, 1);
+        Line(16, 16, 19, 26, 0xFF2A3734, 1);
+        Rect(3, 25, 5, 3, 0xFF5C6657);
+        if (hash % 2 == 0) { Rect(25, 3, 4, 3, 0xFF707465); }
+    }
+    void Ore(int item, int hash) {
+        int color = ItemColor(item);
+        for (int i = 0; i < 4; i = i + 1) {
+            int px = 6 + (hash + i * 13) % 20;
+            int py = 6 + (hash / 5 + i * 11) % 19;
+            Rect(px - 3, py - 2, 7, 6, 0xFF303936);
+            if (item == 2) {
+                Rect(px - 2, py - 3, 4, 6, 0xFF384451);
+                Line(px - 2, py - 3, px + 1, py - 4, color, 1);
+                Line(px + 1, py - 4, px + 3, py - 1, 0xFF9EA9AD, 1);
+            } else {
+                Rect(px - 2, py - 2, 5, 4, color);
+                Rect(px - 1, py - 3, 3, 2, item == 0 ? 0xFFFFC880 : 0xFFDEE9DC);
+                Line(px, py + 1, px + 3, py, item == 0 ? 0xFF976746 : 0xFF566270, 1);
+            }
+        }
+    }
+    void Grid(ForgeWorld w, ForgeCamera camera, int left, int top, int right, int bottom) {
+        if (scale < 0.6) { return; }
+        int x0 = camera.ScreenX(left * 1000); int y0 = camera.ScreenY(top * 1000);
+        int x1 = camera.ScreenX((right + 1) * 1000); int y1 = camera.ScreenY((bottom + 1) * 1000);
+        for (int tx = left; tx <= right + 1; tx = tx + 1) {
+            int px = camera.ScreenX(tx * 1000);
+            canvas.DrawLine(px, y0, px, y1, 0x14202929, 1);
+        }
+        for (int ty = top; ty <= bottom + 1; ty = ty + 1) {
+            int py = camera.ScreenY(ty * 1000);
+            canvas.DrawLine(x0, py, x1, py, 0x14202929, 1);
+        }
+    }
+
+    void Belt(ForgeWorld w, int direction) {
+        TurnRect(0, 7, 32, 21, direction, 0x80232A28);
+        TurnRect(0, 5, 32, 22, direction, 0xFF293738);
+        TurnRect(0, 9, 32, 14, direction, 0xFF182B2D);
+        TurnRect(0, 5, 32, 3, direction, 0xFF9F966E);
+        TurnRect(0, 25, 32, 2, direction, 0xFF6A7058);
+        int phase = w.tick % 8;
+        for (int tx = phase; tx < 32; tx = tx + 8) {
+            TurnRect(tx, 10, 1, 12, direction, 0xFF415353);
+        }
+        int chevron = (w.tick / 2) % 16;
+        Arrow(chevron, 16, direction, 0xFFA8A66C); Arrow(chevron + 16, 16, direction, 0xFFA8A66C);
+        TurnRect(2, 5, 3, 2, direction, 0xFFDBBA70);
+    }
+    void Drill(ForgeWorld w, ForgeBuilding b, int direction) {
+        Plate(0xFF74735C);
+        Rect(8, 7, 16, 18, 0xFF253839);
+        Line(6, 9, 25, 24, 0xFFD5AE63, 3);
+        Line(6, 24, 25, 9, 0xFFAD8750, 3);
+        Disc(16, 16, 9, 0xFF172B31);
+        double angle = (b.efficiency > 0 || ghost) ? w.tick * 0.16 : 0.4;
+        for (int tooth = 0; tooth < 4; tooth = tooth + 1) {
+            double theta = angle + tooth * 1.57079632679;
+            int dx = (int)Math.Round(Math.Cos(theta) * 7.0);
+            int dy = (int)Math.Round(Math.Sin(theta) * 7.0);
+            Line(16 + dx / 3, 16 + dy / 3, 16 + dx, 16 + dy, 0xFFBACAC0, 3);
+        }
+        Disc(16, 16, 3, 0xFF6DD4BC);
+        TurnRect(27, 12, 5, 8, direction, 0xFF1E3133);
+        Arrow(31, 16, direction, 0xFFE0B263);
+    }
+    void Router(ForgeBuilding b, int direction) {
+        Plate(0xFF7E7354);
+        for (int d = 0; d < 4; d = d + 1) { TurnRect(23, 12, 9, 8, d, 0xFF293B3B); }
+        Disc(16, 16, 8, 0xFFB4985E);
+        Disc(16, 16, 5, 0xFF253C3F);
+        Line(12, 16, 20, 16, 0xFFE3CE8A, 2); Line(16, 12, 16, 20, 0xFFE3CE8A, 2);
+        Arrow(29, 16, direction, 0xFFF0BE64);
+        Arrow(29, 16, (direction + 1) % 4, 0xFF7CADA0);
+        Arrow(29, 16, (direction + 3) % 4, 0xFF7CADA0);
+        Disc(16, 16, 2, b.roundRobin % 2 == 0 ? 0xFFFFD78B : 0xFFE8B96A);
+    }
+    void Furnace(ForgeWorld w, ForgeBuilding b, int direction) {
+        Plate(0xFF6F6260);
+        Rect(7, 6, 18, 19, 0xFF232D34);
+        Rect(10, 8, 12, 14, 0xFF59383A);
+        bool active = b.efficiency > 0 && b.progress > 0;
+        if (active || ghost) {
+            Glow(16, 15, 19, 0xFFE8A062, 60);
+            Rect(11, 10, 10, 10, 0xFFD37648);
+            Rect(13, 12, 6, 6, 0xFFFFD997);
+            Line(9, 9, 13, 13 + w.tick % 3, 0xFFE8EDBA, 1);
+            Line(24, 9, 19, 14, 0xFFE8EDBA, 1);
+        } else { Rect(12, 11, 8, 8, 0xFF8B5844); }
+        Rect(5, 7, 4, 17, 0xFF9AA397); Rect(23, 7, 4, 17, 0xFF9AA397);
+        Rect(5, 10, 4, 3, 0xFF444D4F); Rect(23, 10, 4, 3, 0xFF444D4F);
+        Rect(7, 25, 18, 3, 0xFFC29658);
+        TurnRect(27, 12, 5, 8, direction, 0xFF314244);
+        Arrow(31, 16, direction, 0xFFDFC18A);
+    }
+    void Assembler(ForgeWorld w, ForgeBuilding b, int direction) {
+        Plate(0xFF526B70);
+        Rect(8, 8, 16, 16, 0xFF20363F);
+        Frame(10, 10, 12, 12, 0xFF82C6C4, 1);
+        Rect(13, 12, 7, 8, b.progress > 0 ? 0xFF9DE2D4 : 0xFF507C83);
+        Line(13, 12, 19, 18, 0xFFDBF1DF, 1);
+        int slide = b.progress > 0 && b.efficiency > 0 ? (w.tick / 3) % 6 : 2;
+        Rect(6, 6, 4, 8 + slide, 0xFFB7B792);
+        Rect(8, 11 + slide, 7, 3, 0xFFD0C9A1);
+        Rect(22, 18 - slide, 4, 9, 0xFF9CAAAA);
+        Rect(17, 18 - slide, 8, 3, 0xFFCDCEA8);
+        Rect(7, 26, 18, 2, b.water > 0 ? 0xFF73C6C1 : 0xFF344B55);
+        TurnRect(27, 12, 5, 8, direction, 0xFF283F44);
+        Arrow(31, 16, direction, 0xFFBBDCCE);
+    }
+    void Generator(ForgeWorld w, ForgeBuilding b) {
+        Plate(0xFF74785C);
+        Rect(8, 6, 16, 20, 0xFF263B3C);
+        Rect(10, 7, 12, 18, 0xFFB58E52);
+        for (int i = 0; i < 4; i = i + 1) {
+            Rect(7, 8 + i * 5, 18, 2, 0xFFD0B878);
+            Rect(7, 10 + i * 5, 3, 2, 0xFF5C7367);
+        }
+        int pulse = (w.tick / 6) % 3;
+        Rect(14, 7, 4, 19, b.fuelTicks > 0 ? 0xFFACEDBC : 0xFF80BCA4);
+        Rect(14, 10 + pulse * 5, 4, 3, 0xFFE1F0BE);
+        Rect(26, 10, 3, 12, 0xFF283B3D);
+        Rect(26, 12, 3, 3, 0xFF7FE0C1);
+    }
+    void Battery(ForgeBuilding b) {
+        Plate(0xFF5B7268);
+        Rect(8, 5, 5, 3, 0xFFCCBD8F); Rect(19, 5, 5, 3, 0xFFCCBD8F);
+        Rect(7, 9, 18, 15, 0xFF1F3439);
+        int charge = (int)Math.Min(4.0, b.energy / 3000000.0);
+        for (int i = 0; i < 4; i = i + 1) {
+            Rect(9 + i * 4, 11, 3, 10, i < charge ? 0xFF9FD9A7 : 0xFF43584D);
+            if (i < charge) { Rect(9 + i * 4, 11, 3, 2, 0xFFD4EDB5); }
+        }
+        Line(11, 26, 21, 26, 0xFFB4AB70, 2);
+    }
+    void Core(ForgeWorld w) {
+        int pulse = (w.tick / 5) % 12;
+        if (pulse > 6) { pulse = 12 - pulse; }
+        Glow(16, 16, 34 + pulse, 0xFFE9B45F, 42);
+        Ring(16, 16, 22, 0x506EC7B8, 1);
+        Plate(0xFF947C52);
+        Rect(7, 5, 18, 22, 0xFF273B3F);
+        Rect(5, 9, 22, 14, 0xFF273B3F);
+        Ring(16, 16, 10, 0xFFBE985A, 3);
+        Sector(16, 16, 8, 10, w.tick % 360, w.tick % 360 + 105, 0xFFB6E8CF);
+        Disc(16, 16, 6, 0xFFEDA65B);
+        Disc(15, 15, 4, 0xFFFFDA8F);
+        Disc(15, 14, 2, 0xFFFFF2C1);
+        Rect(13, 2, 6, 4, 0xFFC6B180); Rect(13, 26, 6, 4, 0xFFC6B180);
+        Rect(2, 13, 4, 6, 0xFF7CC6B4); Rect(26, 13, 4, 6, 0xFF7CC6B4);
+    }
+    void Wall(ForgeWorld w, int cell, ForgeBuilding b) {
+        Rect(2, 5, 30, 27, 0x80262A25);
+        Rect(1, 1, 30, 28, 0xFF303D3B);
+        Rect(2, 2, 28, 23, 0xFF92947A);
+        Rect(4, 4, 24, 17, 0xFFA0A089);
+        Line(4, 4, 27, 4, 0xFFD0C6A0, 1);
+        Rect(2, 24, 28, 5, 0xFF626E59);
+        for (int d = 0; d < 4; d = d + 1) {
+            int other = w.Neighbor(cell, d);
+            if (!ghost && other >= 0 && w.buildings[other].kind == BlockKind.Wall) {
+                TurnRect(27, 7, 5, 17, d, 0xFF92947A);
+            } else { TurnLine(28, 7, 28, 23, d, 0xFF596754, 1); }
+        }
+        Line(12, 5, 12, 19, 0xFF79856D, 1);
+        Line(12, 13, 27, 13, 0xFF79856D, 1);
+        if (b.hp > 0 && b.hp < w.catalog.blocks[(int)BlockKind.Wall].hp / 2 && !ghost) {
+            Line(21, 3, 17, 11, 0xFF394C44, 2); Line(17, 11, 20, 18, 0xFF394C44, 1);
+        }
+    }
+    void Pump(ForgeWorld w, ForgeBuilding b, bool oil) {
+        Plate(oil ? 0xFF635A69 : 0xFF557F79);
+        Rect(4, 13, 24, 7, oil ? 0xFF312B40 : 0xFF23454D);
+        Disc(16, 16, 10, 0xFF243941);
+        Ring(16, 16, 8, oil ? 0xFFB49BBB : 0xFF9CCABC, 2);
+        if (oil) {
+            Line(8, 24, 16, 8, 0xFFA3ACA0, 3);
+            Line(24, 24, 16, 8, 0xFF6D8B80, 3);
+            int bob = b.efficiency > 0 ? (w.tick / 5) % 4 : 1;
+            Line(8, 9 + bob, 26, 7 - bob, 0xFFDCB97A, 3);
+            Line(25, 8 - bob, 25, 22, 0xFFDBBD91, 1);
+            Disc(16, 10, 2, 0xFFE5CEA2);
+        } else {
+            int angle = b.efficiency > 0 ? (w.tick * 5) % 360 : 20;
+            Sector(16, 16, 2, 7, angle, angle + 90, 0xFF78C9C0);
+            Sector(16, 16, 2, 7, angle + 180, angle + 270, 0xFF78C9C0);
+            Disc(16, 16, 2, 0xFFE0DDAD);
+        }
+    }
+    bool FluidBlock(BlockKind kind) {
+        return kind == BlockKind.Pipe || kind == BlockKind.Pump || kind == BlockKind.OilPump ||
+            kind == BlockKind.Generator || kind == BlockKind.Furnace || kind == BlockKind.Assembler || kind == BlockKind.Turret;
+    }
+    void Pipe(ForgeWorld w, int cell, ForgeBuilding b) {
+        for (int d = 0; d < 4; d = d + 1) {
+            int other = w.Neighbor(cell, d);
+            if (ghost || (other >= 0 && FluidBlock(w.buildings[other].kind))) {
+                TurnRect(14, 10, 18, 15, d, 0x70232F30);
+                TurnRect(14, 9, 18, 13, d, 0xFF3B5454);
+                TurnRect(16, 11, 16, 3, d, b.water > 0 ? 0xFF68BEB5 : 0xFF617C72);
+                TurnRect(16, 17, 16, 3, d, b.oil > 0 ? 0xFFAF86BE : 0xFF626570);
+                TurnRect(25, 9, 3, 13, d, 0xFF9A9F86);
+            }
+        }
+        Rect(9, 9, 14, 14, 0xFF263F43);
+        Frame(10, 10, 12, 12, 0xFF9AA998, 2);
+        Rect(13, 12, 6, 3, b.water > 0 ? 0xFF85D9C8 : 0xFF4E6A65);
+        Rect(13, 17, 6, 3, b.oil > 0 ? 0xFFB797CB : 0xFF5A5A69);
+    }
+    void Relay(ForgeWorld w, ForgeBuilding b) {
+        Rect(10, 12, 18, 18, 0x60222C2B);
+        Disc(16, 19, 10, 0xFF354B49);
+        Ring(16, 19, 8, 0xFF9B9675, 2);
+        Rect(13, 7, 6, 15, 0xFF839888);
+        Line(9, 8, 23, 8, 0xFFD1C69B, 3);
+        Line(9, 8, 9, 14, 0xFF354B4D, 2); Line(23, 8, 23, 14, 0xFF354B4D, 2);
+        Disc(9, 6, 3, b.network >= 0 ? 0xFF8FD9C1 : 0xFFAB8E58);
+        Disc(23, 6, 3, b.network >= 0 ? 0xFF8FD9C1 : 0xFFAB8E58);
+        if (b.network >= 0 && w.tick % 60 < 20) { Line(11, 5, 21, 5, 0x9093D8BF, 1); }
+    }
+
+    int Aim(ForgeWorld w, int cell, bool priority) {
+        int slot = cell % 1024;
+        if (aimCell[slot] != cell) { aimCell[slot] = cell; aimTarget[slot] = -1; aimTick[slot] = -1; }
+        int previous = aimTarget[slot];
+        if (previous >= 0 && (!w.enemies[previous].active || w.enemies[previous].generation != aimGeneration[slot])) { aimTarget[slot] = -1; }
+        if (w.enemyCount == 0) { aimTarget[slot] = -1; return -1; }
+        // Only a bounded number of visible turrets refresh nearest targets; the fixed cache never allocates during Draw.
+        bool due = aimTick[slot] < 0 || aimTick[slot] > w.tick || w.tick - aimTick[slot] >= 7;
+        if (due && (priority || aimBudget > 0)) {
+            aimBudget = aimBudget - 1;
+            aimTick[slot] = w.tick;
+            int wx = ForgeGrid.Center(cell % w.width); int wy = ForgeGrid.Center(cell / w.width);
+            double range = TurretRange(w) * 1000.0;
+            double nearest = range * range;
+            int target = -1;
+            for (int i = 0; i < w.enemies.Length; i = i + 1) {
+                ForgeEnemy e = w.enemies[i];
+                if (!e.active) { continue; }
+                double dx = e.x - wx; double dy = e.y - wy;
+                double distance = dx * dx + dy * dy;
+                if (distance <= nearest) { nearest = distance; target = i; }
+            }
+            aimTarget[slot] = target;
+            if (target >= 0) { aimGeneration[slot] = w.enemies[target].generation; }
+        }
+        return aimTarget[slot];
+    }
+    void Turret(ForgeWorld w, int cell, ForgeBuilding b, int direction) {
+        Plate(0xFF6E7970);
+        Disc(16, 17, 10, 0xFF1E3138);
+        Ring(16, 16, 8, 0xFFB5A579, 2);
+        double dx = ForgeGrid.Dx(direction); double dy = ForgeGrid.Dy(direction);
+        if (!ghost) {
+            int target = Aim(w, cell, false);
+            if (target >= 0) {
+                dx = w.enemies[target].x - ForgeGrid.Center(cell % w.width);
+                dy = w.enemies[target].y - ForgeGrid.Center(cell / w.width);
+                double distance = Math.Sqrt(dx * dx + dy * dy);
+                if (distance > 0.0) { dx = dx / distance; dy = dy / distance; }
+                else { dx = ForgeGrid.Dx(direction); dy = ForgeGrid.Dy(direction); }
+            }
+        }
+        int muzzleX = 16 + (int)Math.Round(dx * 16.0); int muzzleY = 16 + (int)Math.Round(dy * 16.0);
+        int breechX = 16 - (int)Math.Round(dx * 4.0); int breechY = 16 - (int)Math.Round(dy * 4.0);
+        Line(breechX + 2, breechY + 3, muzzleX + 2, muzzleY + 3, 0x70222D2C, 7);
+        Line(breechX, breechY, muzzleX, muzzleY, 0xFF172D36, 7);
+        Line(breechX - 1, breechY - 1, muzzleX - 1, muzzleY - 1, 0xFFB9BC97, 4);
+        Line(16, 16, muzzleX, muzzleY, 0xFF617E7B, 2);
+        Disc(15, 15, 5, 0xFF85988A);
+        Disc(14, 14, 2, b.stock.Get(0) + b.stock.Get(1) > 0 ? 0xFFCBDBA3 : 0xFFC88E56);
+        Line(muzzleX - (int)Math.Round(dy * 3.0), muzzleY + (int)Math.Round(dx * 3.0),
+            muzzleX + (int)Math.Round(dy * 3.0), muzzleY - (int)Math.Round(dx * 3.0), 0xFF2C484F, 2);
+    }
+    void Building(ForgeWorld w, ForgeCamera camera, int cell, BlockKind kind, ForgeBuilding b, int direction) {
+        AtCell(w, camera, cell);
+        if (kind == BlockKind.Core) { Core(w); }
+        else if (kind == BlockKind.Belt) { Belt(w, direction); }
+        else if (kind == BlockKind.Drill) { Drill(w, b, direction); }
+        else if (kind == BlockKind.Router) { Router(b, direction); }
+        else if (kind == BlockKind.Furnace) { Furnace(w, b, direction); }
+        else if (kind == BlockKind.Assembler) { Assembler(w, b, direction); }
+        else if (kind == BlockKind.Generator) { Generator(w, b); }
+        else if (kind == BlockKind.Battery) { Battery(b); }
+        else if (kind == BlockKind.Turret) { Turret(w, cell, b, direction); }
+        else if (kind == BlockKind.Wall) { Wall(w, cell, b); }
+        else if (kind == BlockKind.Pump) { Pump(w, b, false); }
+        else if (kind == BlockKind.OilPump) { Pump(w, b, true); }
+        else if (kind == BlockKind.Pipe) { Pipe(w, cell, b); }
+        else if (kind == BlockKind.Relay) { Relay(w, b); }
+        if (!ghost && kind != BlockKind.Empty && w.catalog.blocks[(int)kind].powerUse > 0) {
+            int status = b.efficiency >= 1000 ? 0xFF8EDDAD : (b.efficiency > 0 ? 0xFFE2BB6F : 0xFFDC805F);
+            Rect(23, 24, 4, 2, 0xFF1E3033); Rect(24, 24, 2, 2, status);
+        }
+    }
+    void Cargo(ForgeWorld w, ForgeCamera camera, int cell) {
+        ForgeBuilding b = w.buildings[cell];
+        int dx = ForgeGrid.Dx(b.direction); int dy = ForgeGrid.Dy(b.direction);
+        for (int slot = 0; slot < b.cargo.Length; slot = slot + 1) {
+            if (b.cargo[slot] <= 0) { continue; }
+            // Slots are stable containers, not positions; travel spans the complete input-to-output lane.
+            int travel = ForgeGrid.Max(0, ForgeGrid.Min(999, b.travel[slot]));
+            int wx = ForgeGrid.Center(cell % w.width) + dx * (travel - 500);
+            int wy = ForgeGrid.Center(cell / w.width) + dy * (travel - 500);
+            int px = camera.ScreenX(wx); int py = camera.ScreenY(wy);
+            int size = ForgeGrid.Max(3, (int)Math.Round(6.0 * camera.zoom));
+            int edge = ForgeGrid.Max(1, (int)Math.Round(camera.zoom));
+            int half = size / 2;
+            canvas.FillRect(px - half, py - half + edge, size + edge, size + edge, 0xC018292D);
+            canvas.FillRect(px - half, py - half, size, size, ItemColor(b.cargo[slot] - 1));
+            canvas.FillRect(px - half, py - half, size - edge, edge, 0xFFDCE2C8);
+            if (b.cargo[slot] == 3 && size >= 4) {
+                canvas.DrawLine(px - half, py + half - 1, px + half - 1, py - half + 1, 0xFF384651, 1);
+            }
+        }
+    }
+
+    void Health(ForgeCamera camera, int px, int py, int width, int hp, int maxHp, int color) {
+        if (maxHp <= 0) { return; }
+        int fill = (int)(width * Math.Max(0.0, Math.Min(1.0, hp / (double)maxHp)));
+        int height = ForgeGrid.Max(2, (int)Math.Round(camera.zoom * 2.0));
+        canvas.FillRect(px - width / 2 - 1, py - 1, width + 2, height + 2, 0xDD17282D);
+        canvas.FillRect(px - width / 2, py, width, height, 0xFF534D42);
+        if (fill > 0) { canvas.FillRect(px - width / 2, py, fill, height, color); }
+    }
+    void Enemy(ForgeWorld w, ForgeCamera camera, ForgeEnemy e, int index) {
+        int px = camera.ScreenX(e.x); int py = camera.ScreenY(e.y);
+        double size = e.kind == 2 ? 1.6 : (e.kind == 1 ? 1.0 : 0.7);
+        scale = camera.zoom * size;
+        if (!Visible(camera, px, py, Stroke(23))) { return; }
+        originX = px - S(16); originY = py - S(16);
+        int centerX = ForgeGrid.Center(w.coreCell % w.width); int centerY = ForgeGrid.Center(w.coreCell / w.width);
+        double angle = Math.Atan2(centerY - e.y, centerX - e.x);
+        double forwardX = Math.Cos(angle); double forwardY = Math.Sin(angle);
+        double sideX = -forwardY; double sideY = forwardX;
+        int gait = (w.tick / 3 + index * 7) % 8;
+        if (gait > 4) { gait = 8 - gait; }
+        Disc(18, 21, 12, 0x60202B29);
+        for (int leg = 0; leg < 3; leg = leg + 1) {
+            for (int side = -1; side <= 1; side = side + 2) {
+                double fore = (leg - 1) * 7.0;
+                double stride = ((leg + index) % 2 == 0 ? gait - 2 : 2 - gait) * 1.0;
+                int rootX = 16 + (int)Math.Round(forwardX * fore + sideX * 5.0 * side);
+                int rootY = 16 + (int)Math.Round(forwardY * fore + sideY * 5.0 * side);
+                int kneeX = 16 + (int)Math.Round(forwardX * (fore + stride - 2.0) + sideX * 12.0 * side);
+                int kneeY = 16 + (int)Math.Round(forwardY * (fore + stride - 2.0) + sideY * 12.0 * side);
+                int footX = kneeX - (int)Math.Round(forwardX * 5.0) + (int)Math.Round(sideX * 2.0 * side);
+                int footY = kneeY - (int)Math.Round(forwardY * 5.0) + (int)Math.Round(sideY * 2.0 * side);
+                Line(rootX, rootY, kneeX, kneeY, e.kind == 0 ? 0xFF513D40 : 0xFF36343F, 3);
+                Line(kneeX, kneeY, footX, footY, e.kind == 0 ? 0xFFB58868 : 0xFFA49D98, 2);
+            }
+        }
+        Disc(16, 16, 10, 0xFF312E39);
+        Sector(16, 15, 0, 9, 190, 320, e.kind == 0 ? 0xFFAD7863 : 0xFF808189);
+        Sector(16, 15, 0, 9, 320, 360, e.kind == 0 ? 0xFF79544F : 0xFF565767);
+        Sector(16, 15, 0, 9, 0, 190, e.kind == 0 ? 0xFF79544F : 0xFF565767);
+        if (e.kind >= 1) {
+            for (int plate = -1; plate <= 1; plate = plate + 1) {
+                int armorX = 16 + (int)Math.Round(forwardX * plate * 5.0);
+                int armorY = 15 + (int)Math.Round(forwardY * plate * 5.0);
+                Line(armorX - (int)Math.Round(sideX * 6.0), armorY - (int)Math.Round(sideY * 6.0),
+                    armorX + (int)Math.Round(sideX * 6.0), armorY + (int)Math.Round(sideY * 6.0), 0xFFB4B1A3, 2);
+            }
+        }
+        int headX = 16 + (int)Math.Round(forwardX * 8.0); int headY = 16 + (int)Math.Round(forwardY * 8.0);
+        Disc(headX, headY, 5, e.kind == 2 ? 0xFF3A2D44 : 0xFF49353D);
+        Disc(headX + (int)Math.Round(sideX * 2.0), headY + (int)Math.Round(sideY * 2.0), 1, 0xFFF8BC86);
+        Disc(headX - (int)Math.Round(sideX * 2.0), headY - (int)Math.Round(sideY * 2.0), 1, 0xFFF8BC86);
+        if (e.kind == 2) {
+            Glow(16, 16, 18, 0xFFB888B3, 42);
+            Disc(16, 15, 4, 0xFFBA7DA3); Disc(15, 14, 2, 0xFFF5C5CB);
+            Ring(16, 16, 13, 0x80C7979D, 1);
+        }
+        if (e.hp < e.maxHp || e.kind == 2) {
+            Health(camera, px, py - Stroke(19), Stroke(25), e.hp, e.maxHp, e.kind == 2 ? 0xFFD896B5 : 0xFFE1AD7B);
+        }
+    }
+    void Bullets(ForgeWorld w, ForgeCamera camera) {
+        int radius = ForgeGrid.Max(1, (int)Math.Round(camera.zoom * 2.0));
+        for (int i = 0; i < w.bullets.Length; i = i + 1) {
+            ForgeBullet bullet = w.bullets[i];
+            if (!bullet.active) { continue; }
+            int px = camera.ScreenX(bullet.x); int py = camera.ScreenY(bullet.y);
+            if (!Visible(camera, px, py, radius * 5)) { continue; }
+            int endX = px; int endY = py;
+            if (bullet.target >= 0 && bullet.target < w.enemies.Length) {
+                ForgeEnemy e = w.enemies[bullet.target];
+                if (e.active && e.generation == bullet.generation) {
+                    double dx = e.x - bullet.x; double dy = e.y - bullet.y;
+                    double distance = Math.Sqrt(dx * dx + dy * dy);
+                    if (distance > 0.0) {
+                        endX = px - (int)Math.Round(dx / distance * camera.zoom * 8.0);
+                        endY = py - (int)Math.Round(dy / distance * camera.zoom * 8.0);
+                    }
+                }
+            }
+            canvas.DrawLine(endX, endY, px, py, 0x90F3CB8B, ForgeGrid.Max(1, radius));
+            canvas.FillCircle(px, py, radius + 1, 0xA0C88F5A);
+            canvas.FillCircle(px, py, radius, 0xFFFFEDBF);
+        }
+    }
+
+    void Portals(ForgeWorld w, ForgeCamera camera) {
+        for (int lane = 0; lane < 3; lane = lane + 1) {
+            int cell = ForgeMap.SpawnCell(w, lane);
+            if (cell < 0 || cell >= w.width * w.height) { continue; }
+            int direction = lane == 0 ? 0 : (lane == 1 ? 1 : 2);
+            int dx = ForgeGrid.Dx(direction); int dy = ForgeGrid.Dy(direction);
+            for (int step = 1; step <= 4; step = step + 1) {
+                int mark = w.Index(cell % w.width + dx * step, cell / w.width + dy * step);
+                if (mark < 0) { continue; }
+                AtCell(w, camera, mark);
+                if (!Visible(camera, originX + S(16), originY + S(16), S(24))) { continue; }
+                TurnLine(2, 7, 15, 7, direction, 0x407E7160, 1);
+                TurnLine(2, 25, 15, 25, direction, 0x407E7160, 1);
+                Arrow(18, 16, direction, w.waveActive ? 0xA0CF9070 : 0x60997F68);
+            }
+            AtCell(w, camera, cell);
+            if (!Visible(camera, originX + S(16), originY + S(16), S(35))) { continue; }
+            int spin = (w.tick / 2 + lane * 40) % 360;
+            Glow(16, 16, 30, 0xFFC7828C, w.waveActive ? 55 : 25);
+            Disc(16, 16, 18, 0xFF302C35);
+            Ring(16, 16, 17, 0xFF765562, 2);
+            for (int rim = 0; rim < 3; rim = rim + 1) {
+                Sector(16, 16, 15, 17, spin + rim * 120, spin + rim * 120 + 68, w.waveActive ? 0xFFE1A5A5 : 0xFFAF818A);
+            }
+            Disc(16, 16, 11, 0xFF1F2630);
+            TurnLine(8, 9, 14, 16, direction, 0xFFAD7A88, 2);
+            TurnLine(14, 16, 8, 23, direction, 0xFFAD7A88, 2);
+            TurnLine(18, 9, 24, 16, direction, 0xFFD1A19C, 2);
+            TurnLine(24, 16, 18, 23, direction, 0xFFD1A19C, 2);
+        }
+    }
+    void Range(ForgeWorld w, ForgeCamera camera, int cell, BlockKind kind, int color) {
+        if (cell < 0 || cell >= w.width * w.height) { return; }
+        int radius = 0;
+        if (kind == BlockKind.Turret) { radius = TurretRange(w); }
+        if (radius <= 0) { return; }
+        int px = camera.ScreenX(ForgeGrid.Center(cell % w.width));
+        int py = camera.ScreenY(ForgeGrid.Center(cell / w.width));
+        int size = (int)Math.Round(radius * ForgeGrid.TileSize() * camera.zoom);
+        canvas.FillCircle(px, py, size, (color & 0x00FFFFFF) | 0x09000000);
+        canvas.DrawCircle(px, py, size, (color & 0x00FFFFFF) | 0x85000000, 1);
+        int notch = ForgeGrid.Max(3, (int)Math.Round(5.0 * camera.zoom));
+        canvas.DrawLine(px - notch, py - size, px + notch, py - size, color, 1);
+        canvas.DrawLine(px - notch, py + size, px + notch, py + size, color, 1);
+        canvas.DrawLine(px - size, py - notch, px - size, py + notch, color, 1);
+        canvas.DrawLine(px + size, py - notch, px + size, py + notch, color, 1);
+    }
+    void Power(ForgeWorld w, ForgeCamera camera, int cell, bool selected) {
+        ForgeBuilding b = w.buildings[cell];
+        BlockDef def = w.catalog.blocks[(int)b.kind];
+        if (def.powerRadius <= 0) { return; }
+        AtCell(w, camera, cell);
+        int color = b.network >= 0 ? 0xFF83CFAE : 0xFFDBAA68;
+        Rect(1, 1, 30, 30, (color & 0x00FFFFFF) | 0x18000000);
+        Frame(1, 1, 30, 30, (color & 0x00FFFFFF) | 0x65000000, 1);
+        if (selected) {
+            Ring(16, 16, def.powerRadius * 32, (color & 0x00FFFFFF) | 0x65000000, 1);
+        }
+    }
+    void Events(ForgeWorld w, ForgeCamera camera) {
+        for (int i = 0; i < w.events.entries.Length; i = i + 1) {
+            ForgeEvent effect = w.events.entries[i];
+            int age = w.tick - effect.tick;
+            if (effect.tick < 0 || age < 0 || age > 20 || effect.cell < 0 || effect.cell >= w.width * w.height) { continue; }
+            if (effect.kind != ForgeEventKind.Built && effect.kind != ForgeEventKind.Removed && effect.kind != ForgeEventKind.EnemyKilled) { continue; }
+            AtCell(w, camera, effect.cell);
+            if (!Visible(camera, originX + S(16), originY + S(16), S(40))) { continue; }
+            int alpha = (20 - age) * 8;
+            int color = effect.kind == ForgeEventKind.EnemyKilled ? 0x00D0A488 : 0x00A6DAC0;
+            if (effect.kind == ForgeEventKind.Removed) { color = 0x00D6B77B; }
+            Ring(16, 16, 8 + age, color | (alpha << 24), 1);
+            if (effect.kind == ForgeEventKind.EnemyKilled || effect.kind == ForgeEventKind.Removed) {
+                for (int spark = 0; spark < 4; spark = spark + 1) {
+                    int d = 5 + age;
+                    int dx = ForgeGrid.Dx(spark); int dy = ForgeGrid.Dy(spark);
+                    Line(16 + dx * d, 16 + dy * d, 16 + dx * (d + 3), 16 + dy * (d + 3), color | (alpha << 24), 1);
+                }
+            }
+        }
+    }
+    void Placement(ForgeWorld w, ForgeCamera camera, int cell, BlockKind selected, int direction, bool erase) {
+        if (cell < 0 || cell >= w.width * w.height) { return; }
+        AtCell(w, camera, cell);
+        ForgeBuilding existing = w.buildings[cell];
+        if (erase) {
+            bool removable = existing.kind != BlockKind.Empty && existing.kind != BlockKind.Core;
+            int color = removable ? 0xFFEFA37B : 0xFF938A7B;
+            Rect(0, 0, 32, 32, removable ? 0x45D88760 : 0x259D9485);
+            Corners(color, 1);
+            if (removable) { Line(10, 10, 22, 22, color, 2); Line(22, 10, 10, 22, color, 2); }
+            return;
+        }
+        if (selected == BlockKind.Empty || selected == BlockKind.Core) { Corners(0xFFD5D4AC, 1); return; }
+        bool valid = w.BuildError(cell, selected) == "";
+        int tint = valid ? 0xFF9DE4C2 : 0xFFEF967C;
+        Rect(0, 0, 32, 32, valid ? 0x304DBF93 : 0x45CF765A);
+        ghost = true; ghostTint = tint;
+        Building(w, camera, cell, selected, existing, direction);
+        ghost = false;
+        Corners(tint, 0);
+        // The elbow makes the cardinal output unambiguous even over a round machine.
+        TurnLine(7, 25, 18, 25, direction, 0xDD223538, 4);
+        TurnLine(18, 25, 18, 16, direction, 0xDD223538, 4);
+        TurnLine(18, 16, 30, 16, direction, 0xDD223538, 4);
+        TurnLine(7, 25, 18, 25, direction, tint, 2);
+        TurnLine(18, 25, 18, 16, direction, tint, 2);
+        TurnLine(18, 16, 30, 16, direction, tint, 2);
+        Arrow(30, 16, direction, tint);
+    }
+
+    void Draw(Canvas c, ForgeWorld w, ForgeCamera camera, int hoverCell, BlockKind selected, int direction, bool erase, int inspectCell, bool powerOverlay) {
+        if (camera.viewportW <= 0 || camera.viewportH <= 0 || w.width <= 0 || w.height <= 0) { return; }
+        canvas = c; scale = camera.zoom; ghost = false; aimBudget = 12;
+        c.PushClip(camera.viewportX, camera.viewportY, camera.viewportW, camera.viewportH);
+        c.FillRect(camera.viewportX, camera.viewportY, camera.viewportW, camera.viewportH, 0xFF202D30);
+        double pixels = ForgeGrid.TileSize() * camera.zoom;
+        int left = ForgeGrid.Max(0, (int)Math.Floor(camera.x - camera.viewportW * 0.5 / pixels) - 2);
+        int top = ForgeGrid.Max(0, (int)Math.Floor(camera.y - camera.viewportH * 0.5 / pixels) - 2);
+        int right = ForgeGrid.Min(w.width - 1, (int)Math.Ceiling(camera.x + camera.viewportW * 0.5 / pixels) + 2);
+        int bottom = ForgeGrid.Min(w.height - 1, (int)Math.Ceiling(camera.y + camera.viewportH * 0.5 / pixels) + 2);
+        for (int ty = top; ty <= bottom; ty = ty + 1) {
+            for (int tx = left; tx <= right; tx = tx + 1) { Terrain(w, camera, ty * w.width + tx); }
+        }
+        if (left <= right && top <= bottom) { Grid(w, camera, left, top, right, bottom); }
+        int mapX = camera.ScreenX(0); int mapY = camera.ScreenY(0);
+        c.DrawRect(mapX, mapY, camera.ScreenX(w.width * 1000) - mapX, camera.ScreenY(w.height * 1000) - mapY, 0xFF716E55, 1);
+        Portals(w, camera);
+        if (inspectCell >= 0 && inspectCell < w.buildings.Length) {
+            Range(w, camera, inspectCell, w.buildings[inspectCell].kind, 0xFF9BCABC);
+            if (w.buildings[inspectCell].kind == BlockKind.Turret) { Aim(w, inspectCell, true); }
+        }
+        if (hoverCell >= 0 && hoverCell < w.buildings.Length && !erase) {
+            BlockKind rangeKind = selected == BlockKind.Empty ? w.buildings[hoverCell].kind : selected;
+            if (hoverCell != inspectCell || selected != BlockKind.Empty) { Range(w, camera, hoverCell, rangeKind, 0xFFE0C58B); }
+            if (w.buildings[hoverCell].kind == BlockKind.Turret) { Aim(w, hoverCell, true); }
+        }
+        if (powerOverlay) {
+            for (int ty = top; ty <= bottom; ty = ty + 1) {
+                for (int tx = left; tx <= right; tx = tx + 1) {
+                    int cell = ty * w.width + tx;
+                    if (w.buildings[cell].kind != BlockKind.Empty) { Power(w, camera, cell, cell == hoverCell || cell == inspectCell); }
+                }
+            }
+        }
+        for (int ty = top; ty <= bottom; ty = ty + 1) {
+            for (int tx = left; tx <= right; tx = tx + 1) {
+                int cell = ty * w.width + tx;
+                ForgeBuilding b = w.buildings[cell];
+                if (b.kind != BlockKind.Empty) { Building(w, camera, cell, b.kind, b, b.direction); }
+            }
+        }
+        for (int ty = top; ty <= bottom; ty = ty + 1) {
+            for (int tx = left; tx <= right; tx = tx + 1) {
+                int cell = ty * w.width + tx;
+                ForgeBuilding b = w.buildings[cell];
+                if (b.kind == BlockKind.Empty) { continue; }
+                Cargo(w, camera, cell);
+                int maxHp = b.kind == BlockKind.Core ? w.coreMaxHp : w.catalog.blocks[(int)b.kind].hp;
+                if (b.hp < maxHp || cell == inspectCell) {
+                    Health(camera, camera.ScreenX(ForgeGrid.Center(tx)), camera.ScreenY(ty * 1000) - ForgeGrid.Max(3, (int)(camera.zoom * 4.0)),
+                        ForgeGrid.Max(12, (int)(camera.zoom * 26.0)), b.hp, maxHp, b.hp * 3 < maxHp ? 0xFFE39B78 : 0xFFA5D3A9);
+                }
+            }
+        }
+        for (int i = 0; i < w.enemies.Length; i = i + 1) {
+            if (w.enemies[i].active) { Enemy(w, camera, w.enemies[i], i); }
+        }
+        Bullets(w, camera);
+        Events(w, camera);
+        if (inspectCell >= 0 && inspectCell < w.buildings.Length) {
+            AtCell(w, camera, inspectCell); Corners(0xFFB4DCCE, -2);
+        }
+        Placement(w, camera, hoverCell, selected, direction, erase);
+        c.PopClip();
+    }
+}

@@ -1,0 +1,438 @@
+using System;
+using System.IO;
+using System.Json;
+
+namespace Coreforge;
+
+class CoreforgeLogicTests {
+    int assertions;
+    CoreforgeLogicTests() { assertions = 0; }
+    void Check(bool condition, string label) {
+        assertions = assertions + 1;
+        if (!condition) { throw new Exception("ASSERT_FAIL " + label); }
+    }
+    ForgeWorld Empty() {
+        ForgeWorld w = new ForgeWorld(48, 36, 17);
+        w.Place(w.coreCell, BlockKind.Core, 0);
+        for (int i = 0; i < 6; i = i + 1) { w.researched[i] = true; w.resources.amount[i] = 1000; }
+        w.coreMaxHp = 3600; w.buildings[w.coreCell].hp = 3600;
+        return w;
+    }
+    void FactoryTicks(ForgeWorld w, ForgeFactory factory, int count) {
+        for (int i = 0; i < count; i = i + 1) { w.tick = w.tick + 1; factory.Step(); }
+    }
+    int Cargo(ForgeBuilding b) {
+        int total = 0;
+        for (int i = 0; i < 4; i = i + 1) { if (b.cargo[i] > 0) { total = total + 1; } }
+        return total;
+    }
+    int CargoItem(ForgeBuilding b, int item) {
+        int total = 0;
+        for (int i = 0; i < 4; i = i + 1) { if (b.cargo[i] == item + 1) { total = total + 1; } }
+        return total;
+    }
+    int Material(ForgeWorld w, int item) {
+        int total = w.resources.Get(item);
+        for (int i = 0; i < 1728; i = i + 1) {
+            total = total + w.buildings[i].stock.Get(item) + CargoItem(w.buildings[i], item);
+        }
+        return total;
+    }
+    void Fill(ForgeBuilding b, int item) {
+        for (int i = 0; i < 4; i = i + 1) { b.cargo[i] = item + 1; b.travel[i] = i * 250 + 249; b.received[i] = -1; }
+    }
+    void Conveyors() {
+        for (int direction = 0; direction < 4; direction = direction + 1) {
+            ForgeWorld w = Empty(); int a = w.Index(10, 10); int b = w.Neighbor(a, direction);
+            w.Place(a, BlockKind.Belt, direction); w.Place(b, BlockKind.Belt, direction);
+            w.buildings[a].cargo[0] = 1; w.buildings[a].travel[0] = 999;
+            ForgeFactory f = new ForgeFactory(w); FactoryTicks(w, f, 1);
+            Check(Cargo(w.buildings[a]) == 0 && Cargo(w.buildings[b]) == 1, "belt follows direction " + Convert.ToString(direction));
+            Check(Material(w, 0) == 1001, "directed transfer conserves copper");
+        }
+        ForgeWorld line = Empty(); int a = line.Index(10, 10); int b = a + 1; int c = a + 2;
+        line.Place(a, BlockKind.Belt, 0); line.Place(b, BlockKind.Belt, 0); line.Place(c, BlockKind.Belt, 0);
+        line.buildings[a].cargo[0] = 2; line.buildings[a].travel[0] = 999;
+        ForgeFactory flow = new ForgeFactory(line); FactoryTicks(line, flow, 1);
+        Check(Cargo(line.buildings[b]) == 1 && Cargo(line.buildings[c]) == 0, "cargo cannot cross two cells in one step");
+        bool receipt = false;
+        for (int i = 0; i < 4; i = i + 1) { if (line.buildings[b].cargo[i] > 0) { receipt = line.buildings[b].received[i] == line.tick; } }
+        Check(receipt, "receiving tick is recorded");
+        FactoryTicks(line, flow, 200);
+        Check(Cargo(line.buildings[c]) == 1 && Material(line, 1) == 1001, "cargo traverses line without duplication");
+        ForgeWorld blocked = Empty(); a = blocked.Index(10, 10); b = a + 1;
+        blocked.Place(a, BlockKind.Belt, 0); blocked.Place(b, BlockKind.Belt, 0);
+        Fill(blocked.buildings[b], 0); blocked.buildings[a].cargo[0] = 2; blocked.buildings[a].travel[0] = 999;
+        ForgeFactory jam = new ForgeFactory(blocked); FactoryTicks(blocked, jam, 100);
+        Check(Cargo(blocked.buildings[b]) == 4 && Cargo(blocked.buildings[a]) == 1, "four-slot capacity applies backpressure");
+        Check(Material(blocked, 0) == 1004 && Material(blocked, 1) == 1001, "backpressure conserves each item");
+        blocked.buildings[b].cargo[0] = 0;
+        FactoryTicks(blocked, jam, 50);
+        Check(Cargo(blocked.buildings[a]) == 0 && Cargo(blocked.buildings[b]) == 4, "capacity released resumes transfer");
+        ForgeWorld wrong = Empty(); a = wrong.Index(10, 10); b = a + 48;
+        wrong.Place(a, BlockKind.Belt, 0); wrong.Place(b, BlockKind.Belt, 0);
+        wrong.buildings[a].cargo[0] = 1; wrong.buildings[a].travel[0] = 999;
+        ForgeFactory directional = new ForgeFactory(wrong); FactoryTicks(wrong, directional, 40);
+        Check(Cargo(wrong.buildings[a]) == 1 && Cargo(wrong.buildings[b]) == 0, "belt does not leak sideways");
+        ForgeWorld router = Empty(); a = router.Index(10, 10);
+        router.Place(a, BlockKind.Router, 0);
+        for (int d = 0; d < 4; d = d + 1) { router.Place(router.Neighbor(a, d), BlockKind.Belt, d); }
+        Fill(router.buildings[router.Neighbor(a, 0)], 0);
+        ForgeFactory route = new ForgeFactory(router);
+        for (int n = 0; n < 4; n = n + 1) {
+            router.buildings[a].cargo[0] = 2; router.buildings[a].travel[0] = 999; router.buildings[a].received[0] = -1;
+            FactoryTicks(router, route, 40);
+            Check(Cargo(router.buildings[a]) == 0, "router finds an unblocked exit");
+        }
+        int south = Cargo(router.buildings[router.Neighbor(a, 1)]); int north = Cargo(router.buildings[router.Neighbor(a, 3)]);
+        Check(south > 0 && north > 0 && south + north == 4, "router round-robin uses both free exits");
+        Check(Cargo(router.buildings[router.Neighbor(a, 2)]) == 0, "router does not output into its input side");
+        Check(Material(router, 0) == 1004 && Material(router, 1) == 1004, "router cargo conservation");
+        Console.WriteLine("CORE conveyors passed");
+    }
+    void RecipesAndPower() {
+        ForgeWorld inputs = Empty(); int cell = inputs.coreCell + 48;
+        inputs.Place(cell, BlockKind.Furnace, 0); inputs.buildings[cell].stock.Add(0, 2);
+        ForgeFactory fi = new ForgeFactory(inputs); FactoryTicks(inputs, fi, 120);
+        Check(inputs.buildings[cell].progress == 0 && inputs.produced == 0, "recipe waits for every input");
+        Check(inputs.buildings[cell].stock.Get(0) == 2, "missing input consumes nothing");
+        inputs.buildings[cell].stock.Add(1, 1); FactoryTicks(inputs, fi, 100);
+        Check(inputs.produced == 2 && CargoItem(inputs.buildings[cell], 4) == 2, "powered steel recipe produces exact output");
+        Check(inputs.buildings[cell].stock.Total() == 0, "successful recipe consumes exact input");
+        ForgeWorld noPower = Empty(); cell = noPower.Index(5, 5);
+        noPower.Place(cell, BlockKind.Furnace, 0); noPower.Place(noPower.Index(40, 28), BlockKind.Generator, 0);
+        noPower.buildings[cell].stock.Add(0, 2); noPower.buildings[cell].stock.Add(1, 1);
+        ForgeFactory fn = new ForgeFactory(noPower); FactoryTicks(noPower, fn, 150);
+        Check(noPower.buildings[cell].efficiency == 0 && noPower.buildings[cell].progress == 0, "disconnected generator supplies no factory power");
+        Check(noPower.buildings[cell].stock.Total() == 3 && noPower.produced == 0, "unpowered recipe conserves inputs");
+        int generator = noPower.Index(9, 5); noPower.Place(generator, BlockKind.Generator, 0);
+        FactoryTicks(noPower, fn, 100);
+        Check(noPower.buildings[cell].efficiency == 1000 && noPower.produced == 2, "generator radius connects a consumer");
+        ForgeWorld relay = Empty(); int g = relay.Index(5, 5); int r = relay.Index(10, 5); int m = relay.Index(15, 5);
+        relay.Place(g, BlockKind.Generator, 0); relay.Place(r, BlockKind.Relay, 0); relay.Place(m, BlockKind.Furnace, 0);
+        ForgeFactory fr = new ForgeFactory(relay); FactoryTicks(relay, fr, 1);
+        Check(relay.buildings[m].efficiency == 1000, "relay connects using either endpoint radius");
+        relay.Remove(r, false); FactoryTicks(relay, fr, 1);
+        Check(relay.buildings[m].efficiency == 0, "removing relay splits the power network");
+        ForgeWorld battery = Empty(); g = battery.Index(6, 6); int b = battery.Index(7, 6);
+        battery.Place(g, BlockKind.Generator, 0); battery.Place(b, BlockKind.Battery, 0);
+        ForgeFactory fb = new ForgeFactory(battery); FactoryTicks(battery, fb, 10);
+        Check(battery.buildings[b].energy == 320000, "battery stores only connected generator surplus");
+        Check(battery.batteryStored == 320, "battery HUD units match milli-energy storage");
+        battery.Remove(g, false); m = battery.Index(6, 7); battery.Place(m, BlockKind.Furnace, 0);
+        int before = battery.buildings[b].energy; FactoryTicks(battery, fb, 1);
+        Check(battery.buildings[m].efficiency == 1000, "battery supplies disconnected demand");
+        Check(before - battery.buildings[b].energy == 12000, "battery discharge equals delivered energy");
+        FactoryTicks(battery, fb, 40);
+        Check(battery.buildings[b].energy < 12 && battery.buildings[m].efficiency == 0, "exhausted battery retains only undeliverable rounding remainder");
+        int remainder = battery.buildings[b].energy; FactoryTicks(battery, fb, 5);
+        Check(battery.buildings[b].energy == remainder, "battery does not invent or discard fractional remainder");
+        ForgeWorld fuel = Empty(); g = fuel.Index(6, 6); b = g + 1;
+        fuel.Place(g, BlockKind.Generator, 0); fuel.Place(b, BlockKind.Battery, 0);
+        fuel.buildings[g].stock.Add(2, 1); fuel.buildings[g].water = 4;
+        ForgeFactory ff = new ForgeFactory(fuel); FactoryTicks(fuel, ff, 1);
+        Check(fuel.buildings[g].stock.Get(2) == 0 && fuel.buildings[g].water == 0, "generator boost pays graphite and water");
+        Check(fuel.buildings[g].fuelTicks > 0 && fuel.buildings[g].fuelTicks <= 500, "generator fuel lifetime is bounded");
+        ForgeWorld full = Empty(); m = full.coreCell + 48; full.Place(m, BlockKind.Furnace, 0);
+        full.buildings[m].stock.Add(0, 2); full.buildings[m].stock.Add(1, 1); Fill(full.buildings[m], 4);
+        ForgeFactory blockedFactory = new ForgeFactory(full); FactoryTicks(full, blockedFactory, 150);
+        Check(full.produced == 0 && full.buildings[m].stock.Total() == 3 && full.buildings[m].progress == 100000, "blocked recipe retains inputs and completed work");
+        full.buildings[m].cargo[0] = 0; FactoryTicks(full, blockedFactory, 1);
+        Check(full.produced == 0 && full.buildings[m].stock.Total() == 3, "recipe reserves capacity for complete output batch");
+        full.buildings[m].cargo[1] = 0; FactoryTicks(full, blockedFactory, 1);
+        Check(full.produced == 2 && full.buildings[m].stock.Total() == 0 && Cargo(full.buildings[m]) == 4, "unblocked recipe commits one exact batch");
+        FactoryTicks(full, blockedFactory, 20);
+        Check(full.produced == 2, "completed batch cannot be paid or produced twice");
+        ForgeWorld drill = Empty(); m = drill.coreCell + 48;
+        drill.tiles[m].ore = 0; drill.tiles[m].reserve = 2; drill.Place(m, BlockKind.Drill, 0);
+        ForgeFactory mining = new ForgeFactory(drill); FactoryTicks(drill, mining, 300);
+        Check(drill.tiles[m].reserve == 0 && drill.produced == 2 && CargoItem(drill.buildings[m], 0) == 2, "drill depletes exactly the available reserve");
+        Check(Material(drill, 0) == 1002, "mined output accounts for complete ore depletion");
+        Console.WriteLine("CORE recipes and power passed");
+    }
+    int Liquid(ForgeWorld w, bool oil) {
+        int amount = 0;
+        for (int i = 0; i < 1728; i = i + 1) { amount = amount + (oil ? w.buildings[i].oil : w.buildings[i].water); }
+        return amount;
+    }
+    void Fluids() {
+        ForgeWorld w = Empty(); int a = w.Index(8, 8);
+        w.Place(a, BlockKind.Pipe, 0); w.Place(a + 1, BlockKind.Pipe, 0); w.Place(a + 2, BlockKind.Pipe, 0);
+        w.buildings[a].water = 73; w.buildings[a].oil = 45;
+        ForgeFactory f = new ForgeFactory(w); FactoryTicks(w, f, 80);
+        Check(Liquid(w, false) == 73 && Liquid(w, true) == 45, "pipes conserve both independent fluids");
+        Check(w.buildings[a + 2].water > 0 && w.buildings[a + 2].oil > 0, "both fluids traverse connected pipes");
+        for (int i = 0; i < 3; i = i + 1) { Check(w.buildings[a + i].water <= 100 && w.buildings[a + i].oil <= 100, "pipe capacity remains bounded"); }
+        ForgeWorld pump = Empty(); a = pump.coreCell + 48;
+        pump.tiles[a].terrain = TerrainKind.Water; pump.Place(a, BlockKind.Pump, 0); pump.Place(a + 1, BlockKind.Pipe, 0);
+        ForgeFactory fp = new ForgeFactory(pump); FactoryTicks(pump, fp, 80);
+        Check(Liquid(pump, false) > 0 && pump.buildings[a + 1].water > 0, "powered water pump fills pipes");
+        Check(Liquid(pump, true) == 0, "water pump does not create oil");
+        ForgeWorld oil = Empty(); a = oil.coreCell + 48;
+        oil.tiles[a].terrain = TerrainKind.Oil; oil.Place(a, BlockKind.OilPump, 0); oil.Place(a + 1, BlockKind.Pipe, 0);
+        ForgeFactory fo = new ForgeFactory(oil); FactoryTicks(oil, fo, 80);
+        Check(Liquid(oil, true) > 0 && oil.buildings[a + 1].oil > 0, "powered oil pump fills pipes");
+        ForgeWorld titanium = Empty(); a = titanium.coreCell + 48;
+        titanium.Place(a, BlockKind.Assembler, 0); titanium.Place(a + 1, BlockKind.Generator, 0);
+        titanium.buildings[a].stock.Add(4, 2); titanium.buildings[a].stock.Add(3, 2);
+        ForgeFactory ft = new ForgeFactory(titanium); FactoryTicks(titanium, ft, 190);
+        Check(titanium.produced == 0 && titanium.buildings[a].stock.Total() == 4, "titanium waits for coolant without consuming solids");
+        titanium.buildings[a].water = 12; FactoryTicks(titanium, ft, 180);
+        Check(titanium.produced == 1 && CargoItem(titanium.buildings[a], 5) == 1, "water-cooled titanium production succeeds");
+        Check(titanium.buildings[a].water == 0 && titanium.buildings[a].stock.Total() == 0, "titanium consumes exact water and solids");
+        ForgeWorld cracking = Empty(); a = cracking.coreCell + 48;
+        cracking.Place(a, BlockKind.Assembler, 0); cracking.Place(a + 1, BlockKind.Generator, 0);
+        cracking.buildings[a].recipe = 3; cracking.buildings[a].oil = 12;
+        ForgeFactory fc = new ForgeFactory(cracking); FactoryTicks(cracking, fc, 100);
+        Check(cracking.produced == 3 && CargoItem(cracking.buildings[a], 2) == 3 && cracking.buildings[a].oil == 0, "oil cracking exchanges exact liquid for graphite");
+        Console.WriteLine("CORE fluids passed");
+    }
+    void BuildingAndResearch() {
+        ForgeWorld w = Empty(); int cell = w.coreCell + 48;
+        Check(!w.Build(-1, BlockKind.Belt, 0) && !w.Build(1728, BlockKind.Belt, 0), "build rejects out-of-map cells");
+        Check(w.Build(cell, BlockKind.Generator, 1), "affordable building succeeds");
+        Check(w.resources.Get(0) == 982 && w.resources.Get(1) == 992, "build pays catalog cost once");
+        Check(!w.Build(cell, BlockKind.Belt, 0) && w.resources.Get(0) == 982, "occupied build cannot spend resources");
+        w.buildings[cell].stock.Add(1, 2); w.buildings[cell].cargo[0] = 4;
+        Check(w.Remove(cell, true), "demolition succeeds");
+        Check(w.resources.Get(0) == 991 && w.resources.Get(1) == 998 && w.resources.Get(3) == 1001, "demolition refunds half cost plus complete inventory and cargo");
+        Check(!w.Remove(cell, true) && !w.Remove(w.coreCell, true), "demolition cannot refund twice or destroy core");
+        Check(w.buildings[cell].kind == BlockKind.Empty && w.buildings[cell].stock.Total() == 0 && Cargo(w.buildings[cell]) == 0, "demolition clears cell state");
+        for (int i = 1; i < 6; i = i + 1) { w.researched[i] = false; }
+        w.coreMaxHp = 2400; w.buildings[w.coreCell].hp = 2400;
+        int copper = w.resources.Get(0);
+        Check(!w.Research(2) && w.resources.Get(0) == copper, "research requires parent and does not charge failure");
+        w.resources.amount[2] = 0;
+        Check(!w.Research(1) && w.resources.Get(0) == copper, "research requires all materials transactionally");
+        w.resources.amount[2] = 1000;
+        Check(w.Research(1), "research unlocks thermal technology");
+        Check(w.resources.Get(0) == copper - 35 && w.resources.Get(1) == 973 && w.resources.Get(2) == 992, "research consumes exact cost");
+        copper = w.resources.Get(0);
+        Check(!w.Research(1) && w.resources.Get(0) == copper, "already researched technology cannot charge twice");
+        Check(w.Research(2) && w.Research(5), "research follows prerequisite chain");
+        Check(w.coreMaxHp == 3600 && w.buildings[w.coreCell].hp == 3600, "core expansion raises current and maximum health");
+        w.resources.Clear();
+        Check(!w.Build(cell, BlockKind.Generator, 0) && w.resources.Total() == 0, "insufficient building funds never underflow");
+        Console.WriteLine("CORE building and research passed");
+    }
+    bool SameInts(int[] a, int[] b) {
+        if (a.Length != b.Length) { return false; }
+        for (int i = 0; i < a.Length; i = i + 1) { if (a[i] != b[i]) { return false; } }
+        return true;
+    }
+    bool Same(ForgeWorld a, ForgeWorld b) {
+        if (a.width != b.width || a.height != b.height || a.seed != b.seed || a.tick != b.tick || a.coreCell != b.coreCell || a.coreMaxHp != b.coreMaxHp) { return false; }
+        if (a.wave != b.wave || a.nextWaveTicks != b.nextWaveTicks || a.spawnRemaining != b.spawnRemaining || a.spawnCooldown != b.spawnCooldown || a.bossPending != b.bossPending || a.waveActive != b.waveActive || a.defeated != b.defeated || a.victory != b.victory) { return false; }
+        if (a.enemyCount != b.enemyCount || a.kills != b.kills || a.produced != b.produced || a.powerSupply != b.powerSupply || a.powerDemand != b.powerDemand || a.batteryStored != b.batteryStored || a.topologyDirty != b.topologyDirty || a.pathsDirty != b.pathsDirty) { return false; }
+        if (!SameInts(a.resources.amount, b.resources.amount)) { return false; }
+        for (int i = 0; i < 6; i = i + 1) { if (a.researched[i] != b.researched[i]) { return false; } }
+        for (int i = 0; i < 1728; i = i + 1) {
+            ForgeTile x = a.tiles[i]; ForgeTile y = b.tiles[i];
+            if (x.terrain != y.terrain || x.ore != y.ore || x.reserve != y.reserve) { return false; }
+            ForgeBuilding p = a.buildings[i]; ForgeBuilding q = b.buildings[i];
+            if (p.kind != q.kind || p.direction != q.direction || p.hp != q.hp || p.progress != q.progress || p.recipe != q.recipe || p.cooldown != q.cooldown || p.energy != q.energy || p.water != q.water || p.oil != q.oil || p.efficiency != q.efficiency || p.network != q.network || p.roundRobin != q.roundRobin || p.targetMode != q.targetMode || p.fuelTicks != q.fuelTicks) { return false; }
+            if (!SameInts(p.stock.amount, q.stock.amount) || !SameInts(p.cargo, q.cargo) || !SameInts(p.travel, q.travel) || !SameInts(p.received, q.received)) { return false; }
+        }
+        for (int i = 0; i < 192; i = i + 1) {
+            ForgeEnemy p = a.enemies[i]; ForgeEnemy q = b.enemies[i];
+            if (p.active != q.active || p.kind != q.kind || p.x != q.x || p.y != q.y || p.hp != q.hp || p.maxHp != q.maxHp || p.cooldown != q.cooldown || p.generation != q.generation) { return false; }
+        }
+        for (int i = 0; i < 384; i = i + 1) {
+            ForgeBullet p = a.bullets[i]; ForgeBullet q = b.bullets[i];
+            if (p.active != q.active || p.x != q.x || p.y != q.y || p.target != q.target || p.generation != q.generation || p.damage != q.damage || p.life != q.life) { return false; }
+        }
+        if (a.events.sequence != b.events.sequence) { return false; }
+        for (int i = 0; i < 64; i = i + 1) {
+            ForgeEvent p = a.events.entries[i]; ForgeEvent q = b.events.entries[i];
+            if (p.kind != q.kind || p.cell != q.cell || p.value != q.value || p.tick != q.tick) { return false; }
+        }
+        return true;
+    }
+    ForgeWorld Snapshot() {
+        ForgeWorld w = Empty(); w.seed = -37; w.tick = 12345;
+        w.wave = 5; w.nextWaveTicks = 2333; w.spawnRemaining = 3; w.spawnCooldown = 17;
+        w.bossPending = true; w.waveActive = true; w.kills = 91; w.produced = 237;
+        w.powerSupply = 64; w.powerDemand = 40; w.batteryStored = 12000;
+        w.topologyDirty = false; w.pathsDirty = false;
+        for (int i = 0; i < 1728; i = i + 1) {
+            w.tiles[i].terrain = (TerrainKind)(i % 4); w.tiles[i].ore = i % 7 - 1; w.tiles[i].reserve = i * 3;
+        }
+        for (int k = 2; k < 15; k = k + 1) {
+            int cell = w.Index(10 + k, 10); w.Place(cell, (BlockKind)k, k % 4);
+            ForgeBuilding b = w.buildings[cell]; b.hp = b.hp - 3; b.cooldown = k;
+            b.water = 23 + k; b.oil = 17 + k; b.efficiency = 700 + k; b.network = 31;
+            b.roundRobin = k % 4; b.targetMode = k % 3;
+            for (int i = 0; i < 6; i = i + 1) { b.stock.amount[i] = i % 3; }
+            for (int i = 0; i < 4; i = i + 1) { b.cargo[i] = (k + i) % 6 + 1; b.travel[i] = i * 250 + 99; b.received[i] = w.tick - i; }
+        }
+        w.buildings[w.Index(12, 10)].progress = 1723;
+        w.buildings[w.Index(15, 10)].progress = 99000;
+        w.buildings[w.Index(16, 10)].progress = 179000;
+        w.buildings[w.Index(17, 10)].fuelTicks = 397;
+        w.buildings[w.Index(18, 10)].energy = 12000000;
+        for (int i = 0; i < 192; i = i + 1) {
+            ForgeEnemy e = w.enemies[i]; e.kind = i % 3; e.x = i * 177 % 48000; e.y = i * 149 % 36000;
+            e.maxHp = w.catalog.enemies[e.kind].hp; e.hp = e.maxHp - 7; e.cooldown = i % 35; e.generation = i + 9;
+            e.active = i == 3 || i == 191;
+        }
+        w.enemyCount = 2;
+        for (int i = 0; i < 384; i = i + 1) {
+            ForgeBullet b = w.bullets[i]; b.active = i == 7 || i == 383;
+            b.x = i * 89 % 48000; b.y = i * 71 % 36000; b.target = i % 192;
+            b.generation = i + 4; b.damage = 36; b.life = i % 159 + 1;
+        }
+        for (int i = 0; i < 89; i = i + 1) { w.events.Emit((ForgeEventKind)(i % 8), i * 11, i * 7, w.tick - 90 + i); }
+        w.topologyDirty = false; w.pathsDirty = false;
+        return w;
+    }
+    void Reject(JsonValue document, string label) {
+        File.WriteAllText("test-saves/invalid.json", document.ToJson());
+        ForgeWorld? loaded = ForgeSave.Load("test-saves/invalid.json");
+        Check(loaded == null, "reject " + label);
+    }
+    void Persistence() {
+        ForgeWorld source = Snapshot(); string path = "test-saves/roundtrip.json";
+        Check(ForgeSave.Save(source, path), "complete snapshot saves");
+        Check(!File.Exists(path + ".tmp"), "successful replacement consumes temporary file");
+        ForgeWorld? loaded = ForgeSave.Load(path);
+        Check(loaded != null, "complete snapshot loads");
+        if (loaded != null) { Check(Same(source, loaded), "all fields independently match after roundtrip"); }
+        source.seed = 991;
+        Check(ForgeSave.Save(source, path), "existing save is atomically replaced");
+        loaded = ForgeSave.Load(path);
+        if (loaded != null) { Check(Same(source, loaded), "replacement contains new state"); } else { Check(false, "replacement loads"); }
+        string original = File.ReadAllText(path);
+        source.tick = -1;
+        Check(!ForgeSave.Save(source, path), "invalid in-memory state cannot overwrite save");
+        Check(File.ReadAllText(path) == original, "failed save preserves original destination");
+        source.tick = 12345;
+        Check(!ForgeSave.Save(source, "test-saves/no-such-directory/save.json"), "save I/O failure returns false");
+        Check(ForgeSave.Load("test-saves/no-such-save.json") == null, "missing save returns null");
+        JsonValue root = JsonValue.Parse(original);
+        JsonValue bad = root.Clone(); bad.Set("version", JsonValue.NewInt(2)); Reject(bad, "unsupported version");
+        bad = root.Clone(); bad.Set("width", JsonValue.NewInt(47)); Reject(bad, "wrong dimensions");
+        bad = root.Clone(); bad.Set("height", JsonValue.NewInt(2147483647)); Reject(bad, "allocation overflow dimension");
+        bad = root.Clone(); bad.Set("coreCell", JsonValue.NewInt(1728)); Reject(bad, "core index outside map");
+        bad = root.Clone(); bad.Set("tick", JsonValue.NewInt(2147483648)); Reject(bad, "integer overflow");
+        bad = root.Clone(); bad.Set("tick", JsonValue.NewDouble(1.5)); Reject(bad, "fractional integer");
+        bad = root.Clone(); bad.Set("tick", JsonValue.NewStr("12345")); Reject(bad, "string coerced to integer");
+        bad = root.Clone(); bad.Set("waveActive", JsonValue.NewInt(1)); Reject(bad, "integer coerced to boolean");
+        bad = root.Clone(); bad.Set("enemyCount", JsonValue.NewInt(3)); Reject(bad, "enemy count inconsistent with pool");
+        bad = root.Clone(); bad.Set("resources", JsonValue.NewArray()); Reject(bad, "short inventory");
+        bad = root.Clone(); bad.Set("tiles", JsonValue.NewObject()); Reject(bad, "object passed as tile array");
+        bad = root.Clone(); bad.PutInt("tick", 99); Reject(bad, "duplicate field");
+        bad = root.Clone(); bad.PutInt("unknown", 1); Reject(bad, "unknown field");
+        bad = JsonValue.NewObject();
+        for (int i = 0; i < root.Count(); i = i + 1) { if (root.KeyAt(i) != "seed") { bad.Put(root.KeyAt(i), root.ValAt(i)); } }
+        Reject(bad, "missing required field");
+        bad = root.Clone(); JsonValue buildings = ForgeSave.Member(bad, "buildings");
+        buildings.At(12 + 10 * 48).Set("direction", JsonValue.NewInt(4)); Reject(bad, "invalid direction");
+        bad = root.Clone(); buildings = ForgeSave.Member(bad, "buildings");
+        buildings.At(12 + 10 * 48).Set("kind", JsonValue.NewInt(15)); Reject(bad, "invalid building kind");
+        bad = root.Clone(); buildings = ForgeSave.Member(bad, "buildings");
+        buildings.At(12 + 10 * 48).Set("network", JsonValue.NewInt(1728)); Reject(bad, "invalid power component");
+        bad = root.Clone(); buildings = ForgeSave.Member(bad, "buildings");
+        JsonValue cargo = JsonValue.NewArray(); cargo.AppendInt(7); cargo.AppendInt(0); cargo.AppendInt(0); cargo.AppendInt(0);
+        buildings.At(12 + 10 * 48).Set("cargo", cargo); Reject(bad, "invalid cargo item");
+        bad = root.Clone(); buildings = ForgeSave.Member(bad, "buildings");
+        JsonValue travel = JsonValue.NewArray(); travel.AppendInt(1000); travel.AppendInt(0); travel.AppendInt(0); travel.AppendInt(0);
+        buildings.At(12 + 10 * 48).Set("travel", travel); Reject(bad, "out-of-cell travel");
+        bad = root.Clone(); buildings = ForgeSave.Member(bad, "buildings");
+        buildings.At(16 + 10 * 48).Set("recipe", JsonValue.NewInt(0)); Reject(bad, "recipe incompatible with machine");
+        bad = root.Clone(); JsonValue bullets = ForgeSave.Member(bad, "bullets");
+        bullets.At(7).Set("target", JsonValue.NewInt(192)); Reject(bad, "bullet target outside pool");
+        bad = root.Clone(); JsonValue enemies = ForgeSave.Member(bad, "enemies");
+        enemies.At(3).Set("x", JsonValue.NewInt(-1)); Reject(bad, "enemy outside map");
+        File.WriteAllText("test-saves/invalid.json", original.Substring(0, original.Length - 1));
+        Check(ForgeSave.Load("test-saves/invalid.json") == null, "strict parser rejects truncated document");
+        File.WriteAllText("test-saves/invalid.json", original + "x");
+        Check(ForgeSave.Load("test-saves/invalid.json") == null, "strict parser rejects trailing junk");
+        loaded = ForgeSave.Load(path);
+        if (loaded != null) { Check(Same(source, loaded), "malformed loads do not mutate surviving world or save"); }
+        Console.WriteLine("CORE persistence passed");
+    }
+    void CombatAndWaves() {
+        ForgeWorld w = Empty(); ForgeCombat combat = new ForgeCombat(w); combat.StartWave();
+        Check(w.wave == 1 && w.waveActive && w.spawnRemaining > 0, "wave starts with catalog spawn schedule");
+        for (int i = 0; i < 250; i = i + 1) { w.tick = w.tick + 1; combat.Step(); }
+        Check(w.enemyCount == w.catalog.waves[0].count && w.spawnRemaining == 0, "wave spawns all enemies without forced injection");
+        Check(w.enemies[0].active && w.enemies[0].generation > 0, "spawned enemy has valid pool generation");
+        ForgeWorld boss = Empty(); boss.wave = 4; ForgeCombat cb = new ForgeCombat(boss); cb.StartWave();
+        bool foundBoss = false;
+        for (int i = 0; i < 1000; i = i + 1) {
+            boss.tick = boss.tick + 1; cb.Step();
+            for (int j = 0; j < 192; j = j + 1) { if (boss.enemies[j].active && boss.enemies[j].kind == 2) { foundBoss = true; } }
+        }
+        Check(foundBoss && boss.wave == 5, "fifth wave actually spawns a Boss");
+        ForgeWorld lost = Empty(); lost.buildings[lost.coreCell].hp = 1;
+        ForgeCombat defeat = new ForgeCombat(lost); defeat.StartWave();
+        int steps = 0;
+        while (!lost.defeated && steps < 6000) { lost.tick = lost.tick + 1; defeat.Step(); steps = steps + 1; }
+        Check(lost.defeated && lost.buildings[lost.coreCell].hp <= 0, "actual attackers destroy undefended core");
+        ForgeWorld defended = Empty(); int cx = defended.coreCell % 48; int cy = defended.coreCell / 48;
+        for (int dy = -2; dy <= 2; dy = dy + 1) {
+            for (int dx = -2; dx <= 2; dx = dx + 1) {
+                if (dx == 0 && dy == 0) { continue; }
+                int cell = defended.Index(cx + dx, cy + dy); defended.Place(cell, BlockKind.Turret, 0); defended.buildings[cell].stock.Add(1, 24);
+            }
+        }
+        ForgeCombat battle = new ForgeCombat(defended); ForgeFactory power = new ForgeFactory(defended); battle.StartWave(); steps = 0;
+        while (defended.waveActive && !defended.defeated && steps < 6000) {
+            defended.tick = defended.tick + 1; power.Step(); battle.Step(); steps = steps + 1;
+        }
+        Check(!defended.defeated && !defended.waveActive, "turrets clear a real wave before core defeat");
+        Check(defended.kills == defended.catalog.waves[0].count && defended.enemyCount == 0, "actual projectile kills account for wave clear");
+        Check(defended.nextWaveTicks > 0, "wave clear schedules next wave");
+        int spent = 0;
+        for (int i = 0; i < 1728; i = i + 1) { if (defended.buildings[i].kind == BlockKind.Turret) { spent = spent + 24 - defended.buildings[i].stock.Get(1); } }
+        Check(spent > 0, "battle consumes physical turret ammunition");
+        ForgeWorld generation = Empty(); ForgeEnemy target = generation.enemies[0];
+        target.active = true; target.kind = 0; target.hp = 65; target.maxHp = 65; target.generation = 7;
+        target.x = ForgeGrid.Center(generation.coreCell % 48 + 4); target.y = ForgeGrid.Center(generation.coreCell / 48);
+        ForgeCombat guarded = new ForgeCombat(generation); ForgeBullet shot = generation.bullets[0];
+        shot.active = true; shot.target = 0; shot.generation = 6; shot.damage = 54; shot.life = 160; shot.x = target.x; shot.y = target.y;
+        generation.tick = generation.tick + 1; guarded.Step();
+        Check(!shot.active && target.hp == 65, "stale projectile cannot damage reused enemy slot");
+        shot.active = true; shot.generation = 7; shot.life = 160; shot.x = target.x; shot.y = target.y;
+        generation.tick = generation.tick + 1; guarded.Step();
+        Check(!shot.active && target.hp == 11, "matching projectile generation applies exact damage");
+        Console.WriteLine("CORE combat and waves passed");
+    }
+    void Integration() {
+        int[] seeds = new int[4]; seeds[0] = 1; seeds[1] = 7; seeds[2] = 42; seeds[3] = 2026;
+        for (int s = 0; s < seeds.Length; s = s + 1) {
+            ForgeSimulation first = new ForgeSimulation(seeds[s]); ForgeSimulation second = new ForgeSimulation(seeds[s]);
+            Check(Same(first.world, second.world), "same seed produces identical complete starting worlds");
+            first.world.nextWaveTicks = 1; second.world.nextWaveTicks = 1;
+            for (int tick = 0; tick < 1200; tick = tick + 1) {
+                first.Step(); second.Step();
+                if (tick % 200 == 0) { Check(Same(first.world, second.world), "same seed and steps remain deterministic"); }
+                if (tick == 599) {
+                    Check(ForgeSave.Save(second.world, "test-saves/integration.json"), "live multi-seed integration saves");
+                    ForgeWorld? loaded = ForgeSave.Load("test-saves/integration.json");
+                    Check(loaded != null, "live multi-seed integration loads");
+                    if (loaded != null) {
+                        Check(Same(second.world, loaded), "live save preserves complete state before rebuilding caches");
+                        second = new ForgeSimulation(loaded);
+                    }
+                }
+            }
+            Check(Same(first.world, second.world), "save-resumed simulation exactly matches uninterrupted run");
+            Check(first.world.tick > 0 && first.world.wave > 0, "integration executes simulation and waves");
+        }
+        ForgeSimulation a = new ForgeSimulation(1); ForgeSimulation b = new ForgeSimulation(7); bool mapDiffers = false;
+        for (int i = 0; i < 1728; i = i + 1) {
+            if (a.world.tiles[i].terrain != b.world.tiles[i].terrain || a.world.tiles[i].ore != b.world.tiles[i].ore || a.world.tiles[i].reserve != b.world.tiles[i].reserve) { mapDiffers = true; }
+        }
+        Check(mapDiffers, "different seeds generate different maps");
+        Console.WriteLine("CORE deterministic multi-seed integration passed");
+    }
+    void Run() {
+        Conveyors(); RecipesAndPower(); Fluids(); BuildingAndResearch(); Persistence(); CombatAndWaves(); Integration();
+        Console.WriteLine("COREFORGE_TESTS_OK assertions=" + Convert.ToString(assertions));
+    }
+    static void Main() {
+        try { CoreforgeLogicTests tests = new CoreforgeLogicTests(); tests.Run(); }
+        catch (Exception e) { Console.WriteLine("COREFORGE_TESTS_FAIL " + e.Message); }
+    }
+}

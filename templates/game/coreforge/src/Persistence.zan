@@ -1,0 +1,305 @@
+using System;
+using System.IO;
+using System.Json;
+
+namespace Coreforge;
+
+class ForgeSave {
+    static int Version() { return 1; }
+    static int MaxBytes() { return 4194304; }
+
+    static void Require(bool valid) {
+        if (!valid) { throw new JsonException("Invalid Coreforge save"); }
+    }
+    static JsonValue Member(JsonValue obj, string key) {
+        JsonValue value = obj.Get(key);
+        if (value == null) { throw new JsonException("Missing Coreforge field: " + key); }
+        return value;
+    }
+    static void Object(JsonValue value, int count) {
+        ForgeSave.Require(value.IsObject());
+        ForgeSave.Require(value.Count() == count);
+        // Get returns the first duplicate; reject duplicates before any field reads.
+        for (int i = 0; i < count; i = i + 1) {
+            for (int j = 0; j < i; j = j + 1) {
+                ForgeSave.Require(value.KeyAt(i) != value.KeyAt(j));
+            }
+        }
+    }
+    static void Array(JsonValue value, int count) {
+        ForgeSave.Require(value.IsArray());
+        ForgeSave.Require(value.Count() == count);
+    }
+    static int Integer(JsonValue value, long minimum, long maximum) {
+        ForgeSave.Require(value.IsNumber() && value.numIsInt);
+        long number = value.AsLong(0);
+        ForgeSave.Require(number >= minimum && number <= maximum);
+        return (int)number;
+    }
+    static int Int(JsonValue obj, string key, long minimum, long maximum) {
+        return ForgeSave.Integer(ForgeSave.Member(obj, key), minimum, maximum);
+    }
+    static bool Boolean(JsonValue value) {
+        ForgeSave.Require(value.IsBool());
+        return value.AsBool(false);
+    }
+    static bool Bool(JsonValue obj, string key) {
+        return ForgeSave.Boolean(ForgeSave.Member(obj, key));
+    }
+    static JsonValue Ints(int[] values) {
+        JsonValue result = JsonValue.NewArray();
+        for (int i = 0; i < values.Length; i = i + 1) { result.AppendInt(values[i]); }
+        return result;
+    }
+    static void ReadInts(JsonValue value, int[] target, int minimum, int maximum) {
+        ForgeSave.Array(value, target.Length);
+        for (int i = 0; i < target.Length; i = i + 1) {
+            target[i] = ForgeSave.Integer(value.At(i), minimum, maximum);
+        }
+    }
+    static JsonValue WriteBuilding(ForgeBuilding b) {
+        JsonValue value = JsonValue.NewObject();
+        value.PutInt("kind", (int)b.kind); value.PutInt("direction", b.direction);
+        value.PutInt("hp", b.hp); value.PutInt("progress", b.progress);
+        value.PutInt("recipe", b.recipe); value.PutInt("cooldown", b.cooldown);
+        value.PutInt("energy", b.energy); value.PutInt("water", b.water); value.PutInt("oil", b.oil);
+        value.PutInt("efficiency", b.efficiency); value.PutInt("network", b.network);
+        value.PutInt("roundRobin", b.roundRobin); value.PutInt("targetMode", b.targetMode);
+        value.PutInt("fuelTicks", b.fuelTicks);
+        // Round-robin cursors and the recipe-change guard are continuation state.
+        value.PutInt("mergeCursor", b.mergeCursor); value.PutInt("feedCursor", b.feedCursor);
+        value.PutInt("lastRecipe", b.lastRecipe);
+        value.Put("stock", ForgeSave.Ints(b.stock.amount));
+        value.Put("cargo", ForgeSave.Ints(b.cargo)); value.Put("travel", ForgeSave.Ints(b.travel));
+        value.Put("received", ForgeSave.Ints(b.received));
+        return value;
+    }
+    static void ReadBuilding(JsonValue value, ForgeBuilding b, ForgeWorld world) {
+        ForgeSave.Object(value, 21);
+        b.kind = (BlockKind)ForgeSave.Int(value, "kind", 0, 14);
+        b.direction = ForgeSave.Int(value, "direction", 0, 3);
+        b.hp = ForgeSave.Int(value, "hp", -1000000, 3600);
+        b.progress = ForgeSave.Int(value, "progress", 0, 200000);
+        b.recipe = ForgeSave.Int(value, "recipe", 0, 3);
+        b.cooldown = ForgeSave.Int(value, "cooldown", 0, 90);
+        b.energy = ForgeSave.Int(value, "energy", 0, 12000000);
+        b.water = ForgeSave.Int(value, "water", 0, 100);
+        b.oil = ForgeSave.Int(value, "oil", 0, 100);
+        b.efficiency = ForgeSave.Int(value, "efficiency", 0, 1000);
+        b.network = ForgeSave.Int(value, "network", -1, 1727);
+        b.roundRobin = ForgeSave.Int(value, "roundRobin", 0, 3);
+        b.targetMode = ForgeSave.Int(value, "targetMode", 0, 2);
+        b.fuelTicks = ForgeSave.Int(value, "fuelTicks", 0, 500);
+        b.mergeCursor = ForgeSave.Int(value, "mergeCursor", 0, 3);
+        b.feedCursor = ForgeSave.Int(value, "feedCursor", 0, 5);
+        b.lastRecipe = ForgeSave.Int(value, "lastRecipe", 0, 3);
+        ForgeSave.ReadInts(ForgeSave.Member(value, "stock"), b.stock.amount, 0, 24);
+        ForgeSave.Require(b.stock.Total() <= 24);
+        ForgeSave.ReadInts(ForgeSave.Member(value, "cargo"), b.cargo, 0, 6);
+        ForgeSave.ReadInts(ForgeSave.Member(value, "travel"), b.travel, 0, 999);
+        ForgeSave.ReadInts(ForgeSave.Member(value, "received"), b.received, -1, world.tick);
+        if (b.kind == BlockKind.Furnace || b.kind == BlockKind.Assembler) {
+            ForgeSave.Require(world.catalog.recipes[b.recipe].machine == b.kind);
+            ForgeSave.Require(b.progress <= world.catalog.recipes[b.recipe].ticks * 1000);
+        }
+        if (b.kind == BlockKind.Pump || b.kind == BlockKind.OilPump) { ForgeSave.Require(b.progress < 1000); }
+        if (b.kind != BlockKind.Empty && b.kind != BlockKind.Core) {
+            ForgeSave.Require(b.hp > 0 && b.hp <= world.catalog.blocks[(int)b.kind].hp);
+        }
+    }
+    static JsonValue Encode(ForgeWorld world) {
+        JsonValue root = JsonValue.NewObject();
+        root.PutInt("version", ForgeSave.Version());
+        root.PutInt("width", world.width); root.PutInt("height", world.height);
+        root.PutInt("seed", world.seed); root.PutInt("tick", world.tick);
+        root.PutInt("coreCell", world.coreCell); root.PutInt("coreMaxHp", world.coreMaxHp);
+        root.PutInt("wave", world.wave); root.PutInt("nextWaveTicks", world.nextWaveTicks);
+        root.PutInt("spawnRemaining", world.spawnRemaining); root.PutInt("spawnCooldown", world.spawnCooldown);
+        root.PutInt("bulletCursor", world.bulletCursor);
+        root.PutBool("bossPending", world.bossPending); root.PutBool("waveActive", world.waveActive);
+        root.PutBool("defeated", world.defeated); root.PutBool("victory", world.victory);
+        root.PutInt("enemyCount", world.enemyCount); root.PutInt("kills", world.kills);
+        root.PutInt("produced", world.produced); root.PutInt("powerSupply", world.powerSupply);
+        root.PutInt("powerDemand", world.powerDemand); root.PutInt("batteryStored", world.batteryStored);
+        root.PutBool("topologyDirty", world.topologyDirty); root.PutBool("pathsDirty", world.pathsDirty);
+        root.Put("resources", ForgeSave.Ints(world.resources.amount));
+        JsonValue tech = JsonValue.NewArray();
+        for (int i = 0; i < 6; i = i + 1) { tech.AppendBool(world.researched[i]); }
+        root.Put("researched", tech);
+        JsonValue tiles = JsonValue.NewArray();
+        JsonValue buildings = JsonValue.NewArray();
+        for (int i = 0; i < world.width * world.height; i = i + 1) {
+            ForgeTile t = world.tiles[i];
+            JsonValue tile = JsonValue.NewObject();
+            tile.PutInt("terrain", (int)t.terrain); tile.PutInt("ore", t.ore); tile.PutInt("reserve", t.reserve);
+            tiles.Append(tile); buildings.Append(ForgeSave.WriteBuilding(world.buildings[i]));
+        }
+        root.Put("tiles", tiles); root.Put("buildings", buildings);
+        JsonValue enemies = JsonValue.NewArray();
+        for (int i = 0; i < 192; i = i + 1) {
+            ForgeEnemy e = world.enemies[i];
+            JsonValue enemy = JsonValue.NewObject();
+            enemy.PutBool("active", e.active); enemy.PutInt("kind", e.kind);
+            enemy.PutInt("x", e.x); enemy.PutInt("y", e.y); enemy.PutInt("hp", e.hp);
+            enemy.PutInt("maxHp", e.maxHp); enemy.PutInt("cooldown", e.cooldown);
+            enemy.PutInt("generation", e.generation); enemies.Append(enemy);
+        }
+        root.Put("enemies", enemies);
+        JsonValue bullets = JsonValue.NewArray();
+        for (int i = 0; i < 384; i = i + 1) {
+            ForgeBullet b = world.bullets[i];
+            JsonValue bullet = JsonValue.NewObject();
+            bullet.PutBool("active", b.active); bullet.PutInt("x", b.x); bullet.PutInt("y", b.y);
+            bullet.PutInt("target", b.target); bullet.PutInt("generation", b.generation);
+            bullet.PutInt("damage", b.damage); bullet.PutInt("life", b.life); bullets.Append(bullet);
+        }
+        root.Put("bullets", bullets);
+        root.PutInt("eventSequence", world.events.sequence);
+        JsonValue events = JsonValue.NewArray();
+        for (int i = 0; i < 64; i = i + 1) {
+            ForgeEvent e = world.events.entries[i];
+            JsonValue entry = JsonValue.NewObject();
+            entry.PutInt("kind", (int)e.kind); entry.PutInt("cell", e.cell);
+            entry.PutInt("value", e.value); entry.PutInt("tick", e.tick); events.Append(entry);
+        }
+        root.Put("events", events);
+        return root;
+    }
+    static ForgeWorld Decode(JsonValue root) {
+        ForgeSave.Object(root, 32);
+        ForgeSave.Require(ForgeSave.Int(root, "version", 1, 1) == ForgeSave.Version());
+        ForgeSave.Require(ForgeSave.Int(root, "width", 48, 48) == 48);
+        ForgeSave.Require(ForgeSave.Int(root, "height", 36, 36) == 36);
+        int seed = ForgeSave.Int(root, "seed", -2147483648, 2147483647);
+        // Dimensions are checked before allocation; no live world participates in loading.
+        ForgeWorld world = new ForgeWorld(48, 36, seed);
+        world.tick = ForgeSave.Int(root, "tick", 0, 1000000000);
+        world.coreCell = ForgeSave.Int(root, "coreCell", 0, 1727);
+        world.coreMaxHp = ForgeSave.Int(root, "coreMaxHp", 2400, 3600);
+        world.wave = ForgeSave.Int(root, "wave", 0, 20);
+        world.nextWaveTicks = ForgeSave.Int(root, "nextWaveTicks", 0, 3500);
+        world.spawnRemaining = ForgeSave.Int(root, "spawnRemaining", 0, 42);
+        world.spawnCooldown = ForgeSave.Int(root, "spawnCooldown", 0, 45);
+        world.bulletCursor = ForgeSave.Int(root, "bulletCursor", 0, 383);
+        world.bossPending = ForgeSave.Bool(root, "bossPending");
+        world.waveActive = ForgeSave.Bool(root, "waveActive");
+        world.defeated = ForgeSave.Bool(root, "defeated"); world.victory = ForgeSave.Bool(root, "victory");
+        world.enemyCount = ForgeSave.Int(root, "enemyCount", 0, 192);
+        world.kills = ForgeSave.Int(root, "kills", 0, 1000000000);
+        world.produced = ForgeSave.Int(root, "produced", 0, 1000000000);
+        world.powerSupply = ForgeSave.Int(root, "powerSupply", 0, 100000000);
+        world.powerDemand = ForgeSave.Int(root, "powerDemand", 0, 100000000);
+        world.batteryStored = ForgeSave.Int(root, "batteryStored", 0, 1000000000);
+        world.topologyDirty = ForgeSave.Bool(root, "topologyDirty"); world.pathsDirty = ForgeSave.Bool(root, "pathsDirty");
+        ForgeSave.ReadInts(ForgeSave.Member(root, "resources"), world.resources.amount, 0, 100000000);
+        JsonValue tech = ForgeSave.Member(root, "researched"); ForgeSave.Array(tech, 6);
+        for (int i = 0; i < 6; i = i + 1) { world.researched[i] = ForgeSave.Boolean(tech.At(i)); }
+        ForgeSave.Require(world.researched[0]);
+        for (int i = 1; i < 6; i = i + 1) {
+            if (world.researched[i]) { ForgeSave.Require(world.researched[world.catalog.techs[i].parent]); }
+        }
+        ForgeSave.Require(world.coreMaxHp == (world.researched[5] ? 3600 : 2400));
+        JsonValue tiles = ForgeSave.Member(root, "tiles"); ForgeSave.Array(tiles, 1728);
+        JsonValue buildings = ForgeSave.Member(root, "buildings"); ForgeSave.Array(buildings, 1728);
+        int coreCount = 0;
+        for (int i = 0; i < 1728; i = i + 1) {
+            JsonValue tile = tiles.At(i); ForgeSave.Object(tile, 3);
+            world.tiles[i].terrain = (TerrainKind)ForgeSave.Int(tile, "terrain", 0, 3);
+            world.tiles[i].ore = ForgeSave.Int(tile, "ore", -1, 5);
+            world.tiles[i].reserve = ForgeSave.Int(tile, "reserve", 0, 100000000);
+            ForgeSave.ReadBuilding(buildings.At(i), world.buildings[i], world);
+            if (world.buildings[i].kind == BlockKind.Core) {
+                coreCount = coreCount + 1; ForgeSave.Require(i == world.coreCell);
+            }
+        }
+        ForgeSave.Require(coreCount == 1);
+        ForgeSave.Require(world.buildings[world.coreCell].hp <= world.coreMaxHp);
+        ForgeSave.Require(world.defeated == (world.buildings[world.coreCell].hp <= 0));
+        ForgeSave.Require(!(world.defeated && world.victory));
+        JsonValue enemies = ForgeSave.Member(root, "enemies"); ForgeSave.Array(enemies, 192);
+        int activeEnemies = 0;
+        for (int i = 0; i < 192; i = i + 1) {
+            JsonValue value = enemies.At(i); ForgeSave.Object(value, 8);
+            ForgeEnemy e = world.enemies[i];
+            e.active = ForgeSave.Bool(value, "active"); e.kind = ForgeSave.Int(value, "kind", 0, 2);
+            e.x = ForgeSave.Int(value, "x", 0, 47999); e.y = ForgeSave.Int(value, "y", 0, 35999);
+            int maximumHp = world.catalog.enemies[e.kind].hp * world.catalog.waves[19].strength / 100;
+            e.hp = ForgeSave.Int(value, "hp", -54, maximumHp);
+            e.maxHp = ForgeSave.Int(value, "maxHp", 0, maximumHp);
+            e.cooldown = ForgeSave.Int(value, "cooldown", 0, 45);
+            e.generation = ForgeSave.Int(value, "generation", 0, 1000000000);
+            if (e.active) {
+                ForgeSave.Require(e.hp > 0 && e.hp <= e.maxHp && e.generation > 0);
+                activeEnemies = activeEnemies + 1;
+            }
+        }
+        ForgeSave.Require(activeEnemies == world.enemyCount);
+        if (world.waveActive) {
+            ForgeSave.Require(world.wave > 0 && !world.defeated && !world.victory);
+            ForgeSave.Require(world.spawnRemaining <= world.catalog.waves[world.wave - 1].count);
+            if (world.bossPending) { ForgeSave.Require(world.catalog.waves[world.wave - 1].boss >= 0); }
+        } else { ForgeSave.Require(world.spawnRemaining == 0 && !world.bossPending); }
+        if (world.victory) { ForgeSave.Require(world.wave == 20 && world.enemyCount == 0); }
+        JsonValue bullets = ForgeSave.Member(root, "bullets"); ForgeSave.Array(bullets, 384);
+        for (int i = 0; i < 384; i = i + 1) {
+            JsonValue value = bullets.At(i); ForgeSave.Object(value, 7);
+            ForgeBullet b = world.bullets[i];
+            b.active = ForgeSave.Bool(value, "active");
+            b.x = ForgeSave.Int(value, "x", 0, 47999); b.y = ForgeSave.Int(value, "y", 0, 35999);
+            b.target = ForgeSave.Int(value, "target", 0, 191);
+            b.generation = ForgeSave.Int(value, "generation", 0, 1000000000);
+            b.damage = ForgeSave.Int(value, "damage", 0, 54);
+            b.life = ForgeSave.Int(value, "life", 0, 160);
+            // A stale target generation is legitimate: combat expires that shot on its next tick.
+            if (b.active) { ForgeSave.Require(b.damage > 0 && b.life > 0 && b.generation > 0); }
+        }
+        world.events.sequence = ForgeSave.Int(root, "eventSequence", 0, 1000000000);
+        JsonValue events = ForgeSave.Member(root, "events"); ForgeSave.Array(events, 64);
+        for (int i = 0; i < 64; i = i + 1) {
+            JsonValue value = events.At(i); ForgeSave.Object(value, 4);
+            ForgeEvent e = world.events.entries[i];
+            e.kind = (ForgeEventKind)ForgeSave.Int(value, "kind", 0, 7);
+            e.cell = ForgeSave.Int(value, "cell", -1, 1727);
+            e.value = ForgeSave.Int(value, "value", -1000000000, 1000000000);
+            e.tick = ForgeSave.Int(value, "tick", -1, world.tick);
+        }
+        return world;
+    }
+    static bool Save(ForgeWorld world, string path) {
+        if (world == null || path == null || path == "") { return false; }
+        string temporary = path + ".tmp";
+        try {
+            JsonValue root = ForgeSave.Encode(world);
+            ForgeSave.Decode(root);
+            string text = root.ToJson();
+            if (text.Length > ForgeSave.MaxBytes()) { return false; }
+            File.WriteAllText(temporary, text);
+            ForgeSave.Require(File.ReadAllText(temporary) == text);
+            // File.Move uses replacement rename on both supported native platforms.
+            // Its void API requires verifying the postcondition before reporting success.
+            File.Move(temporary, path);
+            ForgeSave.Require(!File.Exists(temporary) && File.Exists(path));
+            ForgeSave.Require(File.ReadAllText(path) == text);
+            return true;
+        } catch (Exception e) {
+            // Save's public failure contract is false; the previous destination is never deleted.
+            File.Delete(temporary);
+            return false;
+        }
+    }
+    static ForgeWorld? Load(string path) {
+        if (path == null || path == "") { return null; }
+        try {
+            if (!File.Exists(path)) { return null; }
+            int size = File.GetSize(path);
+            if (size < 2 || size > ForgeSave.MaxBytes()) { return null; }
+            string text = File.ReadAllText(path);
+            if (text.Length < 2 || text.Length > ForgeSave.MaxBytes()) { return null; }
+            JsonValue root = JsonValue.Parse(text);
+            return ForgeSave.Decode(root);
+        } catch (Exception e) {
+            // Corruption and I/O errors implement the documented null result contract.
+            return null;
+        }
+    }
+}

@@ -1,0 +1,530 @@
+using System;
+
+namespace Coreforge;
+
+class ForgeFactory {
+    public const int Scale = 1000;
+    public const int BeltSpacing = 250;
+    public const int BeltSpeed = 50;
+    public const int LiquidCapacity = 100;
+    public const int LiquidFlow = 8;
+    public const int BatteryCapacity = 12000000;
+    public const int BatteryRate = 32000;
+    public const int FuelDuration = 500;
+    public const int FuelWater = 4;
+    public const int CoreSupply = 16;
+    public const int GeneratorSupply = 32;
+    public const int FueledSupply = 64;
+
+    ForgeWorld world;
+    int networkCount;
+    int[] parent;
+    int[] rank;
+    int[] rootNetwork;
+    long[] gridSupply;
+    long[] gridDemand;
+    long[] gridDischarge;
+    long[] gridBalance;
+    int[] gridEfficiency;
+    int[] headSlot;
+    int[] offerTarget;
+    int[] offerDirection;
+    int[] triedDirections;
+    int[] grantSource;
+    bool[] sent;
+    bool[] accepted;
+    int[] liquidSnapshot;
+    int[] liquidIncoming;
+    int[] liquidOutgoing;
+
+    ForgeFactory(ForgeWorld world) {
+        this.world = world;
+        int n = world.buildings.Length;
+        parent = new int[n]; rank = new int[n]; rootNetwork = new int[n];
+        gridSupply = new long[n]; gridDemand = new long[n];
+        gridDischarge = new long[n]; gridBalance = new long[n]; gridEfficiency = new int[n];
+        headSlot = new int[n];
+        offerTarget = new int[n]; offerDirection = new int[n]; triedDirections = new int[n];
+        grantSource = new int[n]; sent = new bool[n]; accepted = new bool[n];
+        liquidSnapshot = new int[n];
+        liquidIncoming = new int[n]; liquidOutgoing = new int[n];
+        world.topologyDirty = true;
+    }
+
+    // Simulation owns the 50 Hz clock and increments world.tick before this call.
+    void Step() {
+        if (world.defeated || world.victory) { return; }
+        if (world.topologyDirty) { RebuildNetworks(); }
+        SyncRecipes();
+        AdvanceCargo();
+        TransferCargo();
+        FeedTransport();
+        StepPower();
+        PumpLiquids();
+        FlowLiquid(false);
+        FlowLiquid(true);
+        Produce();
+    }
+
+    bool Alive(ForgeBuilding b) { return b.kind != BlockKind.Empty && b.hp > 0; }
+    bool Transport(ForgeBuilding b) { return b.kind == BlockKind.Belt || b.kind == BlockKind.Router; }
+    bool Machine(ForgeBuilding b) { return b.kind == BlockKind.Furnace || b.kind == BlockKind.Assembler; }
+
+    bool ValidRecipe(ForgeBuilding b) {
+        if (!Machine(b) || b.recipe < 0 || b.recipe >= world.catalog.recipes.Length) { return false; }
+        RecipeDef recipe = world.catalog.recipes[b.recipe];
+        return recipe.machine == b.kind && world.researched[recipe.tech];
+    }
+
+    void SyncRecipes() {
+        for (int i = 0; i < world.buildings.Length; i = i + 1) {
+            ForgeBuilding b = world.buildings[i];
+            // Inputs are paid on completion, so changing a recipe can discard work safely.
+            // lastRecipe lives on the building so a loaded save keeps its progress.
+            if (Machine(b) && b.lastRecipe != b.recipe) { b.progress = 0; }
+            b.lastRecipe = b.recipe;
+        }
+    }
+
+    int FreeCargo(ForgeBuilding b) {
+        int n = 0;
+        for (int s = 0; s < 4; s = s + 1) { if (b.cargo[s] == 0) { n = n + 1; } }
+        return n;
+    }
+
+    int EntrySlot(ForgeBuilding b) {
+        int slot = -1;
+        for (int s = 0; s < 4; s = s + 1) {
+            if (b.cargo[s] == 0) { if (slot < 0) { slot = s; } }
+            else if (b.travel[s] < ForgeFactory.BeltSpacing) { return -1; }
+        }
+        return slot;
+    }
+
+    void AdvanceCargo() {
+        int speed = ForgeFactory.BeltSpeed;
+        if (world.researched[4]) { speed = speed * 3 / 2; }
+        for (int i = 0; i < world.buildings.Length; i = i + 1) {
+            ForgeBuilding b = world.buildings[i];
+            headSlot[i] = -1;
+            if (!Alive(b)) { continue; }
+            if (Transport(b)) {
+                // Slots are stable identities; travel, not slot number, orders the queue.
+                int visited = 0;
+                int limit = 999;
+                for (int order = 0; order < 4; order = order + 1) {
+                    int slot = -1;
+                    int farthest = -1;
+                    for (int s = 0; s < 4; s = s + 1) {
+                        if (b.cargo[s] != 0 && (visited & (1 << s)) == 0 && b.travel[s] > farthest) {
+                            slot = s; farthest = b.travel[s];
+                        }
+                    }
+                    if (slot < 0) { break; }
+                    visited = visited | (1 << slot);
+                    if (b.received[slot] != world.tick) {
+                        int next = b.travel[slot] + speed;
+                        if (next > limit) { next = limit; }
+                        if (next > b.travel[slot]) { b.travel[slot] = next; }
+                    }
+                    limit = b.travel[slot] - ForgeFactory.BeltSpacing;
+                }
+            }
+            if (Transport(b) || b.kind == BlockKind.Drill || Machine(b)) {
+                int bestTravel = -1;
+                int oldest = world.tick;
+                for (int s = 0; s < 4; s = s + 1) {
+                    if (b.cargo[s] <= 0 || b.received[s] == world.tick || b.travel[s] < 999) { continue; }
+                    if (b.travel[s] > bestTravel || (b.travel[s] == bestTravel && b.received[s] < oldest)) {
+                        headSlot[i] = s; bestTravel = b.travel[s]; oldest = b.received[s];
+                    }
+                }
+            }
+        }
+    }
+
+    bool CanReceive(int cell, int item, int side) {
+        if (cell < 0 || item < 0 || item >= 6) { return false; }
+        ForgeBuilding b = world.buildings[cell];
+        if (!Alive(b)) { return false; }
+        if (b.kind == BlockKind.Core) { return true; }
+        if (Transport(b)) {
+            if (b.kind == BlockKind.Belt && side == b.direction) { return false; }
+            return EntrySlot(b) >= 0;
+        }
+        int capacity = world.catalog.blocks[(int)b.kind].capacity;
+        if (b.stock.Total() >= capacity) { return false; }
+        if (b.kind == BlockKind.Generator) { return item == (int)ItemKind.Graphite; }
+        if (b.kind == BlockKind.Turret) { return item == (int)ItemKind.Copper || item == (int)ItemKind.Lead; }
+        if (!ValidRecipe(b)) { return false; }
+        RecipeDef recipe = world.catalog.recipes[b.recipe];
+        int need = recipe.input.Get(item);
+        if (need <= 0) { return false; }
+        // Reserve room for every ingredient; a copper stream cannot fill out the lead input.
+        int batch = recipe.input.Total();
+        int batches = capacity / batch;
+        if (batches < 1) { batches = 1; }
+        return b.stock.Get(item) < need * batches;
+    }
+
+    bool Receive(int cell, int item, int side) {
+        if (!CanReceive(cell, item, side)) { return false; }
+        ForgeBuilding b = world.buildings[cell];
+        if (b.kind == BlockKind.Core) { world.resources.Add(item, 1); return true; }
+        if (Transport(b)) {
+            int slot = EntrySlot(b);
+            if (slot < 0) { return false; }
+            b.cargo[slot] = item + 1; b.travel[slot] = 0; b.received[slot] = world.tick;
+        } else { b.stock.Add(item, 1); }
+        return true;
+    }
+
+    void TransferCargo() {
+        for (int i = 0; i < world.buildings.Length; i = i + 1) {
+            sent[i] = false; accepted[i] = false; triedDirections[i] = 0;
+        }
+        // Each receiver arbitrates its own inputs. Rejected routers can try another exit.
+        // Grants are chosen before any write, so cell scan order cannot duplicate an item.
+        for (int round = 0; round < 4; round = round + 1) {
+            for (int i = 0; i < world.buildings.Length; i = i + 1) {
+                offerTarget[i] = -1; grantSource[i] = -1;
+                if (sent[i] || headSlot[i] < 0) { continue; }
+                ForgeBuilding b = world.buildings[i];
+                int item = b.cargo[headSlot[i]] - 1;
+                if (b.kind == BlockKind.Router) {
+                    for (int step = 0; step < 4; step = step + 1) {
+                        int dir = (b.roundRobin + step) % 4;
+                        if (dir == (b.direction + 2) % 4 || (triedDirections[i] & (1 << dir)) != 0) { continue; }
+                        triedDirections[i] = triedDirections[i] | (1 << dir);
+                        int target = world.Neighbor(i, dir);
+                        if (target >= 0 && !accepted[target] && CanReceive(target, item, (dir + 2) % 4)) {
+                            offerTarget[i] = target; offerDirection[i] = dir; break;
+                        }
+                    }
+                } else if (round == 0) {
+                    int target = world.Neighbor(i, b.direction);
+                    if (target >= 0 && CanReceive(target, item, (b.direction + 2) % 4)) {
+                        offerTarget[i] = target; offerDirection[i] = b.direction;
+                    }
+                }
+            }
+            for (int target = 0; target < world.buildings.Length; target = target + 1) {
+                if (accepted[target]) { continue; }
+                ForgeBuilding receiver = world.buildings[target];
+                for (int step = 0; step < 4; step = step + 1) {
+                    int side = (receiver.mergeCursor + step) % 4;
+                    int source = world.Neighbor(target, side);
+                    if (source >= 0 && offerTarget[source] == target) {
+                        grantSource[target] = source;
+                        receiver.mergeCursor = (side + 1) % 4;
+                        break;
+                    }
+                }
+            }
+            for (int target = 0; target < world.buildings.Length; target = target + 1) {
+                int source = grantSource[target];
+                if (source < 0) { continue; }
+                ForgeBuilding b = world.buildings[source];
+                int slot = headSlot[source];
+                int dir = offerDirection[source];
+                if (Receive(target, b.cargo[slot] - 1, (dir + 2) % 4)) {
+                    b.cargo[slot] = 0; b.travel[slot] = 0; b.received[slot] = -1;
+                    sent[source] = true; accepted[target] = true;
+                    if (b.kind == BlockKind.Router) { b.roundRobin = (dir + 1) % 4; }
+                }
+            }
+        }
+    }
+
+    void FeedTransport() {
+        // ForgeWorld.Feed deposits into Stock, including when the player feeds a belt.
+        for (int i = 0; i < world.buildings.Length; i = i + 1) {
+            ForgeBuilding b = world.buildings[i];
+            if (!Alive(b) || !Transport(b)) { continue; }
+            int slot = EntrySlot(b);
+            if (slot < 0) { continue; }
+            for (int step = 0; step < 6; step = step + 1) {
+                int item = (b.feedCursor + step) % 6;
+                if (b.stock.Take(item, 1)) {
+                    b.cargo[slot] = item + 1; b.travel[slot] = 0; b.received[slot] = world.tick;
+                    b.feedCursor = (item + 1) % 6; break;
+                }
+            }
+        }
+    }
+
+    int Root(int cell) {
+        int root = cell;
+        while (parent[root] != root) { root = parent[root]; }
+        while (parent[cell] != cell) {
+            int next = parent[cell]; parent[cell] = root; cell = next;
+        }
+        return root;
+    }
+
+    void Join(int a, int b) {
+        int ra = Root(a); int rb = Root(b);
+        if (ra == rb) { return; }
+        if (rank[ra] < rank[rb]) { parent[ra] = rb; }
+        else {
+            parent[rb] = ra;
+            if (rank[ra] == rank[rb]) { rank[ra] = rank[ra] + 1; }
+        }
+    }
+
+    void RebuildNetworks() {
+        networkCount = 0;
+        for (int i = 0; i < world.buildings.Length; i = i + 1) {
+            parent[i] = i; rank[i] = 0; rootNetwork[i] = -1;
+            world.buildings[i].network = -1;
+        }
+        for (int i = 0; i < world.buildings.Length; i = i + 1) {
+            ForgeBuilding b = world.buildings[i];
+            int radius = world.catalog.blocks[(int)b.kind].powerRadius;
+            if (!Alive(b) || radius <= 0) { continue; }
+            int x = i % world.width; int y = i / world.width;
+            // A link is undirected if either endpoint reaches the other. Scanning each
+            // endpoint's own disk finds that union without an all-pairs topology pass.
+            for (int dy = -radius; dy <= radius; dy = dy + 1) {
+                for (int dx = -radius; dx <= radius; dx = dx + 1) {
+                    if (dx * dx + dy * dy > radius * radius) { continue; }
+                    int other = world.Index(x + dx, y + dy);
+                    if (other < 0 || other == i) { continue; }
+                    ForgeBuilding neighbor = world.buildings[other];
+                    if (Alive(neighbor) && world.catalog.blocks[(int)neighbor.kind].powerRadius > 0) { Join(i, other); }
+                }
+            }
+        }
+        for (int i = 0; i < world.buildings.Length; i = i + 1) {
+            ForgeBuilding b = world.buildings[i];
+            if (!Alive(b) || world.catalog.blocks[(int)b.kind].powerRadius <= 0) { continue; }
+            int root = Root(i);
+            if (rootNetwork[root] < 0) { rootNetwork[root] = networkCount; networkCount = networkCount + 1; }
+            b.network = rootNetwork[root];
+        }
+        world.topologyDirty = false;
+    }
+
+    void StepPower() {
+        world.powerSupply = 0; world.powerDemand = 0; world.batteryStored = 0;
+        for (int grid = 0; grid < networkCount; grid = grid + 1) {
+            gridSupply[grid] = 0; gridDemand[grid] = 0; gridDischarge[grid] = 0;
+            gridBalance[grid] = 0; gridEfficiency[grid] = 0;
+        }
+        for (int i = 0; i < world.buildings.Length; i = i + 1) {
+            ForgeBuilding b = world.buildings[i];
+            b.efficiency = 0;
+            if (!Alive(b)) { continue; }
+            int grid = b.network;
+            if (grid < 0) { b.efficiency = 1000; continue; }
+            int generated = 0;
+            if (b.kind == BlockKind.Core) { generated = ForgeFactory.CoreSupply; }
+            if (b.kind == BlockKind.Generator) {
+                generated = ForgeFactory.GeneratorSupply;
+                if (b.fuelTicks <= 0 && b.water >= ForgeFactory.FuelWater && b.stock.Take((int)ItemKind.Graphite, 1)) {
+                    b.water = b.water - ForgeFactory.FuelWater;
+                    b.fuelTicks = ForgeFactory.FuelDuration;
+                }
+                if (b.fuelTicks > 0) { generated = ForgeFactory.FueledSupply; b.fuelTicks = b.fuelTicks - 1; }
+            }
+            int draw = world.catalog.blocks[(int)b.kind].powerUse;
+            gridSupply[grid] = gridSupply[grid] + (long)generated * ForgeFactory.Scale;
+            gridDemand[grid] = gridDemand[grid] + (long)draw * ForgeFactory.Scale;
+            world.powerSupply = world.powerSupply + generated;
+            world.powerDemand = world.powerDemand + draw;
+            if (b.kind == BlockKind.Battery) {
+                int available = b.energy;
+                if (available > ForgeFactory.BatteryRate) { available = ForgeFactory.BatteryRate; }
+                gridDischarge[grid] = gridDischarge[grid] + available;
+            }
+        }
+        for (int grid = 0; grid < networkCount; grid = grid + 1) {
+            long available = gridSupply[grid] + gridDischarge[grid];
+            int efficiency = 1000;
+            if (gridDemand[grid] > 0 && available < gridDemand[grid]) {
+                efficiency = (int)(available * ForgeFactory.Scale / gridDemand[grid]);
+            }
+            gridEfficiency[grid] = efficiency;
+            // All consumers share this fraction. Demand is rated draw, including idle
+            // machines; the unallocated fractional remainder stays in the battery.
+            long consumed = gridDemand[grid] * efficiency / ForgeFactory.Scale;
+            gridBalance[grid] = gridSupply[grid] - consumed;
+        }
+        long stored = 0;
+        long discharged = 0;
+        int n = world.buildings.Length;
+        int start = world.tick % n;
+        for (int offset = 0; offset < n; offset = offset + 1) {
+            int i = (start + offset) % n;
+            ForgeBuilding b = world.buildings[i];
+            if (!Alive(b)) { continue; }
+            int grid = b.network;
+            if (grid >= 0) {
+                int fraction = gridEfficiency[grid];
+                b.efficiency = fraction;
+                // Natural drilling is free; only its remaining 75% depends on the grid.
+                if (b.kind == BlockKind.Drill) { b.efficiency = 250 + fraction * 750 / 1000; }
+                if (b.kind == BlockKind.Battery) {
+                    long balance = gridBalance[grid];
+                    if (balance < 0) {
+                        int take = b.energy;
+                        if (take > ForgeFactory.BatteryRate) { take = ForgeFactory.BatteryRate; }
+                        if ((long)take > -balance) { take = (int)(-balance); }
+                        b.energy = b.energy - take;
+                        gridBalance[grid] = balance + take;
+                        discharged = discharged + take;
+                    } else if (balance > 0) {
+                        int add = ForgeFactory.BatteryCapacity - b.energy;
+                        if (add > ForgeFactory.BatteryRate) { add = ForgeFactory.BatteryRate; }
+                        if ((long)add > balance) { add = (int)balance; }
+                        b.energy = b.energy + add;
+                        gridBalance[grid] = balance - add;
+                    }
+                }
+            }
+            if (b.kind == BlockKind.Battery) { stored = stored + b.energy; }
+        }
+        // UI totals use whole energy units; building.energy retains the exact milli-units.
+        world.powerSupply = world.powerSupply + (int)(discharged / ForgeFactory.Scale);
+        world.batteryStored = (int)(stored / ForgeFactory.Scale);
+    }
+
+    bool LiquidPort(ForgeBuilding b, bool oil) {
+        if (!Alive(b)) { return false; }
+        if (b.kind == BlockKind.Pipe || b.kind == BlockKind.Assembler) { return true; }
+        if (oil) { return b.kind == BlockKind.OilPump; }
+        return b.kind == BlockKind.Pump || b.kind == BlockKind.Generator || b.kind == BlockKind.Furnace || b.kind == BlockKind.Turret;
+    }
+
+    bool LiquidSource(ForgeBuilding b, bool oil) {
+        if (b.kind == BlockKind.Pipe) { return true; }
+        if (oil) { return b.kind == BlockKind.OilPump; }
+        return b.kind == BlockKind.Pump;
+    }
+
+    bool LiquidSink(ForgeBuilding b) { return b.kind != BlockKind.Pump && b.kind != BlockKind.OilPump; }
+
+    void PumpLiquids() {
+        for (int i = 0; i < world.buildings.Length; i = i + 1) {
+            ForgeBuilding b = world.buildings[i];
+            if (!Alive(b) || (b.kind != BlockKind.Pump && b.kind != BlockKind.OilPump)) { continue; }
+            bool oil = b.kind == BlockKind.OilPump;
+            if (oil && world.tiles[i].terrain != TerrainKind.Oil) { continue; }
+            if (!oil && world.tiles[i].terrain != TerrainKind.Water) { continue; }
+            int amount = oil ? b.oil : b.water;
+            if (amount >= ForgeFactory.LiquidCapacity) { continue; }
+            int rate = oil ? 2 : 4;
+            int work = b.progress + b.efficiency * rate;
+            int add = work / ForgeFactory.Scale;
+            b.progress = work % ForgeFactory.Scale;
+            if (add > ForgeFactory.LiquidCapacity - amount) { add = ForgeFactory.LiquidCapacity - amount; }
+            if (oil) { b.oil = b.oil + add; }
+            else { b.water = b.water + add; }
+        }
+    }
+
+    void LiquidEdge(int a, int b, bool oil) {
+        if (b < 0) { return; }
+        ForgeBuilding left = world.buildings[a];
+        ForgeBuilding right = world.buildings[b];
+        if (!LiquidPort(left, oil) || !LiquidPort(right, oil)) { return; }
+        int source = a; int target = b;
+        if (liquidSnapshot[a] < liquidSnapshot[b]) { source = b; target = a; }
+        int difference = liquidSnapshot[source] - liquidSnapshot[target];
+        if (difference <= 0 || !LiquidSource(world.buildings[source], oil) || !LiquidSink(world.buildings[target])) { return; }
+        int flow = difference / 4;
+        if (flow < 1) { flow = 1; }
+        if (flow > ForgeFactory.LiquidFlow) { flow = ForgeFactory.LiquidFlow; }
+        int available = liquidSnapshot[source] - liquidOutgoing[source];
+        int room = ForgeFactory.LiquidCapacity - liquidSnapshot[target] - liquidIncoming[target];
+        if (flow > available) { flow = available; }
+        if (flow > room) { flow = room; }
+        if (flow <= 0) { return; }
+        liquidOutgoing[source] = liquidOutgoing[source] + flow;
+        liquidIncoming[target] = liquidIncoming[target] + flow;
+    }
+
+    void FlowLiquid(bool oil) {
+        int n = world.buildings.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            ForgeBuilding b = world.buildings[i];
+            liquidSnapshot[i] = oil ? b.oil : b.water;
+            liquidIncoming[i] = 0; liquidOutgoing[i] = 0;
+        }
+        int start = world.tick % n;
+        for (int offset = 0; offset < n; offset = offset + 1) {
+            int cell = (start + offset) % n;
+            if (!LiquidPort(world.buildings[cell], oil)) { continue; }
+            for (int axis = 0; axis < 2; axis = axis + 1) {
+                int dir = (axis + world.tick % 2) % 2;
+                LiquidEdge(cell, world.Neighbor(cell, dir), oil);
+            }
+        }
+        // Incoming fluid is never eligible to leave in this phase. Separately bounding
+        // snapshot outflow and snapshot free space keeps every reservoir within 0..100.
+        for (int i = 0; i < n; i = i + 1) {
+            ForgeBuilding b = world.buildings[i];
+            int amount = liquidSnapshot[i] + liquidIncoming[i] - liquidOutgoing[i];
+            if (oil) { b.oil = amount; }
+            else { b.water = amount; }
+        }
+    }
+
+    int DrillTicks(int item) {
+        if (item == (int)ItemKind.Copper) { return 100; }
+        if (item == (int)ItemKind.Lead) { return 120; }
+        if (item == (int)ItemKind.Graphite) { return 150; }
+        if (item == (int)ItemKind.Titanium) { return 200; }
+        return 0;
+    }
+
+    void QueueProducts(int cell, int item, int quantity) {
+        ForgeBuilding b = world.buildings[cell];
+        int remaining = quantity;
+        for (int slot = 0; slot < 4 && remaining > 0; slot = slot + 1) {
+            if (b.cargo[slot] == 0) {
+                b.cargo[slot] = item + 1; b.travel[slot] = 999; b.received[slot] = world.tick;
+                remaining = remaining - 1;
+            }
+        }
+        world.produced = world.produced + quantity;
+        world.events.Emit(ForgeEventKind.Produced, cell, item, world.tick);
+    }
+
+    void Produce() {
+        for (int i = 0; i < world.buildings.Length; i = i + 1) {
+            ForgeBuilding b = world.buildings[i];
+            if (!Alive(b)) { continue; }
+            if (b.kind == BlockKind.Drill) {
+                ForgeTile tile = world.tiles[i];
+                int ticks = DrillTicks(tile.ore);
+                if (ticks <= 0 || tile.reserve <= 0) { b.progress = 0; continue; }
+                int speed = b.efficiency;
+                if (world.researched[4]) { speed = speed * 3 / 2; }
+                int threshold = ticks * ForgeFactory.Scale;
+                b.progress = b.progress + speed;
+                if (b.progress >= threshold) {
+                    if (FreeCargo(b) == 0) { b.progress = threshold; continue; }
+                    tile.reserve = tile.reserve - 1;
+                    b.progress = b.progress - threshold;
+                    QueueProducts(i, tile.ore, 1);
+                }
+                continue;
+            }
+            if (!ValidRecipe(b)) { continue; }
+            RecipeDef recipe = world.catalog.recipes[b.recipe];
+            if (recipe.quantity < 1 || recipe.quantity > 4 || recipe.ticks <= 0) { continue; }
+            if (!b.stock.Has(recipe.input) || b.water < recipe.water || b.oil < recipe.oil) { continue; }
+            int threshold = recipe.ticks * ForgeFactory.Scale;
+            b.progress = b.progress + b.efficiency;
+            if (b.progress < threshold) { continue; }
+            if (FreeCargo(b) < recipe.quantity) { b.progress = threshold; continue; }
+            // Capacity, ingredients and liquid are checked before the atomic batch. A
+            // blocked outlet retains cargo; retrying it never pays or produces a batch twice.
+            if (!b.stock.Pay(recipe.input)) { continue; }
+            b.water = b.water - recipe.water; b.oil = b.oil - recipe.oil;
+            b.progress = b.progress - threshold;
+            QueueProducts(i, recipe.output, recipe.quantity);
+        }
+    }
+}

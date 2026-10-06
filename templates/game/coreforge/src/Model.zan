@@ -1,0 +1,365 @@
+using System;
+
+namespace Coreforge;
+
+enum ItemKind { Copper, Lead, Graphite, Silicon, Steel, Titanium }
+enum TerrainKind { Ground, Rock, Water, Oil }
+enum BlockKind { Empty, Core, Drill, Belt, Router, Furnace, Assembler, Generator, Battery, Turret, Wall, Pump, Pipe, Relay, OilPump }
+enum ForgeEventKind { Built, Removed, Produced, WaveStarted, WaveCleared, EnemyKilled, Researched, CoreLost }
+
+class Stock {
+    int[] amount;
+    Stock() { amount = new int[6]; }
+    int Get(int item) { return amount[item]; }
+    void Add(int item, int n) { amount[item] = amount[item] + n; }
+    bool Take(int item, int n) {
+        if (n < 0 || amount[item] < n) { return false; }
+        amount[item] = amount[item] - n;
+        return true;
+    }
+    bool Has(Stock cost) {
+        for (int i = 0; i < 6; i = i + 1) { if (amount[i] < cost.amount[i]) { return false; } }
+        return true;
+    }
+    bool Pay(Stock cost) {
+        if (!Has(cost)) { return false; }
+        for (int i = 0; i < 6; i = i + 1) { amount[i] = amount[i] - cost.amount[i]; }
+        return true;
+    }
+    int Total() {
+        int n = 0;
+        for (int i = 0; i < 6; i = i + 1) { n = n + amount[i]; }
+        return n;
+    }
+    void Clear() { for (int i = 0; i < 6; i = i + 1) { amount[i] = 0; } }
+}
+
+class BlockDef {
+    BlockKind kind;
+    string name;
+    string help;
+    int hp;
+    int tech;
+    int powerUse;
+    int powerRadius;
+    int capacity;
+    Stock cost;
+    BlockDef(BlockKind k, string title, string description, int health, int unlock, int draw, int radius, int copper, int lead, int steel) {
+        kind = k; name = title; help = description; hp = health; tech = unlock;
+        powerUse = draw; powerRadius = radius; capacity = 24;
+        cost = new Stock(); cost.Add(0, copper); cost.Add(1, lead); cost.Add(4, steel);
+    }
+}
+
+class RecipeDef {
+    string name;
+    BlockKind machine;
+    int tech;
+    Stock input;
+    int output;
+    int quantity;
+    int ticks;
+    int water;
+    int oil;
+    RecipeDef(string title, BlockKind block, int unlock, int a, int an, int b, int bn, int result, int n, int duration, int waterCost, int oilCost) {
+        name = title; machine = block; tech = unlock; input = new Stock();
+        input.Add(a, an); input.Add(b, bn); output = result; quantity = n;
+        ticks = duration; water = waterCost; oil = oilCost;
+    }
+}
+
+class TechDef {
+    string name;
+    string help;
+    int parent;
+    Stock cost;
+    TechDef(string title, string description, int before, int copper, int lead, int graphite, int silicon, int steel, int titanium) {
+        name = title; help = description; parent = before; cost = new Stock();
+        cost.Add(0, copper); cost.Add(1, lead); cost.Add(2, graphite);
+        cost.Add(3, silicon); cost.Add(4, steel); cost.Add(5, titanium);
+    }
+}
+
+class EnemyDef {
+    string name;
+    int hp;
+    int speed;
+    int damage;
+    int cooldown;
+    int reward;
+    EnemyDef(string title, int health, int movement, int attack, int interval, int bounty) {
+        name = title; hp = health; speed = movement; damage = attack; cooldown = interval; reward = bounty;
+    }
+}
+
+class WaveDef {
+    int count;
+    int interval;
+    int strength;
+    int boss;
+    WaveDef(int units, int cadence, int scaling, int bossType) {
+        count = units; interval = cadence; strength = scaling; boss = bossType;
+    }
+}
+
+class ForgeCatalog {
+    BlockDef[] blocks;
+    RecipeDef[] recipes;
+    TechDef[] techs;
+    EnemyDef[] enemies;
+    WaveDef[] waves;
+    string[] items;
+    ForgeCatalog() {
+        items = new string[6];
+        items[0] = "铜"; items[1] = "铅"; items[2] = "石墨";
+        items[3] = "硅"; items[4] = "钢"; items[5] = "钛";
+        blocks = new BlockDef[15];
+        blocks[0] = new BlockDef(BlockKind.Empty, "选择", "点击建筑查看运行状态。", 0, 0, 0, 0, 0, 0, 0);
+        blocks[1] = new BlockDef(BlockKind.Core, "炉心", "储存输送来的物品；保护它并研究扩张。", 2400, 0, 0, 4, 0, 0, 0);
+        blocks[2] = new BlockDef(BlockKind.Drill, "矿脉钻头", "建在矿脉上，沿箭头输出矿石；无电也能低速运转。", 180, 0, 4, 3, 12, 0, 0);
+        blocks[3] = new BlockDef(BlockKind.Belt, "传送带", "每格四个物品位；朝向决定输出，相邻支路可合流。", 80, 0, 0, 0, 1, 0, 0);
+        blocks[4] = new BlockDef(BlockKind.Router, "分流器", "在可接收的三个出口间轮流分配，堵塞时自动换路。", 130, 0, 0, 0, 5, 2, 0);
+        blocks[5] = new BlockDef(BlockKind.Furnace, "电弧熔炉", "消耗电力：铜铅合成钢，石墨和铜合成硅。", 220, 1, 12, 3, 22, 12, 0);
+        blocks[6] = new BlockDef(BlockKind.Assembler, "晶格装配机", "水冷钢硅结晶制钛；石油裂解制石墨。", 240, 2, 20, 3, 30, 20, 12);
+        blocks[7] = new BlockDef(BlockKind.Generator, "热差发电机", "基础产能 32；每次耗 1 石墨与水可提高到 64。", 240, 0, 0, 4, 18, 8, 0);
+        blocks[8] = new BlockDef(BlockKind.Battery, "蓄电池", "存储电网余能，在供不应求时自动补充。", 200, 1, 0, 4, 12, 22, 0);
+        blocks[9] = new BlockDef(BlockKind.Turret, "脉冲炮塔", "传送带供铜或铅弹药；通电提高射速，水冷进一步提速。", 300, 0, 6, 3, 22, 12, 0);
+        blocks[10] = new BlockDef(BlockKind.Wall, "合金墙", "阻挡敌人并吸收攻击；敌人被封路后会拆墙。", 650, 0, 0, 0, 5, 5, 0);
+        blocks[11] = new BlockDef(BlockKind.Pump, "取水泵", "建在水面上，向四周管道与工厂输水。", 160, 1, 4, 3, 14, 8, 0);
+        blocks[12] = new BlockDef(BlockKind.Pipe, "双通道管道", "相邻连通，各自运输水和石油，容量 100。", 90, 1, 0, 0, 2, 1, 0);
+        blocks[13] = new BlockDef(BlockKind.Relay, "电力中继", "连接半径五格内的电力建筑，延伸电网。", 120, 0, 0, 5, 5, 8, 0);
+        blocks[14] = new BlockDef(BlockKind.OilPump, "油井", "建在油层上，为装配机供给石油。", 190, 2, 8, 3, 20, 16, 8);
+        recipes = new RecipeDef[4];
+        recipes[0] = new RecipeDef("合金钢", BlockKind.Furnace, 1, 0, 2, 1, 1, 4, 2, 100, 0, 0);
+        recipes[1] = new RecipeDef("精炼硅", BlockKind.Furnace, 1, 2, 2, 0, 1, 3, 2, 140, 0, 0);
+        recipes[2] = new RecipeDef("水冷钛晶", BlockKind.Assembler, 2, 4, 2, 3, 2, 5, 1, 180, 12, 0);
+        recipes[3] = new RecipeDef("石油裂解", BlockKind.Assembler, 2, 0, 0, 0, 0, 2, 3, 100, 0, 12);
+        techs = new TechDef[6];
+        techs[0] = new TechDef("基础工程", "钻采、运输、发电和防御已就绪。", 0, 0, 0, 0, 0, 0, 0);
+        techs[1] = new TechDef("热工学", "解锁熔炉、钢/硅配方、取水、管道与蓄电池。", 0, 35, 25, 8, 0, 0, 0);
+        techs[2] = new TechDef("晶格工程", "解锁装配机、油井、钛晶与石油裂解配方。", 1, 40, 30, 0, 12, 15, 0);
+        techs[3] = new TechDef("弹道校准", "炮塔伤害增加 50%，射程增加 1 格。", 1, 30, 30, 0, 12, 20, 0);
+        techs[4] = new TechDef("物流增压", "传送带与矿机效率增加 50%。", 2, 40, 20, 10, 20, 20, 5);
+        techs[5] = new TechDef("炉心扩张", "建造半径从 15 增至全地图，核心耐久增加 1200。", 2, 80, 60, 0, 25, 40, 12);
+        enemies = new EnemyDef[3];
+        enemies[0] = new EnemyDef("裂壳游兽", 65, 28, 12, 35, 3);
+        enemies[1] = new EnemyDef("穿岩重兽", 200, 18, 28, 45, 8);
+        enemies[2] = new EnemyDef("玄岩巨像", 1800, 12, 70, 40, 50);
+        waves = new WaveDef[20];
+        for (int i = 0; i < 20; i = i + 1) {
+            int boss = (i + 1) % 5 == 0 ? 2 : -1;
+            waves[i] = new WaveDef(4 + i * 2, ForgeGrid.Max(12, 45 - i), 100 + i * 12, boss);
+        }
+    }
+}
+
+class ForgeTile {
+    TerrainKind terrain;
+    int ore;
+    int reserve;
+    ForgeTile() { terrain = TerrainKind.Ground; ore = -1; reserve = 0; }
+}
+
+class ForgeBuilding {
+    BlockKind kind;
+    int direction;
+    int hp;
+    int progress;
+    int recipe;
+    int cooldown;
+    int energy;
+    int water;
+    int oil;
+    int efficiency;
+    int network;
+    int roundRobin;
+    int targetMode;
+    int fuelTicks;
+    int mergeCursor;
+    int feedCursor;
+    int lastRecipe;
+    Stock stock;
+    int[] cargo;
+    int[] travel;
+    int[] received;
+    ForgeBuilding() {
+        stock = new Stock(); cargo = new int[4]; travel = new int[4]; received = new int[4]; Reset();
+    }
+    void Reset() {
+        kind = BlockKind.Empty; direction = 0; hp = 0; progress = 0; recipe = 0;
+        cooldown = 0; energy = 0; water = 0; oil = 0; efficiency = 0; network = -1;
+        roundRobin = 0; targetMode = 0; fuelTicks = 0; mergeCursor = 0; feedCursor = 0;
+        lastRecipe = 0; stock.Clear();
+        for (int i = 0; i < 4; i = i + 1) { cargo[i] = 0; travel[i] = 0; received[i] = -1; }
+    }
+}
+
+class ForgeEnemy {
+    bool active;
+    int kind;
+    int x;
+    int y;
+    int hp;
+    int maxHp;
+    int cooldown;
+    int generation;
+    ForgeEnemy() { active = false; generation = 0; }
+}
+
+class ForgeBullet {
+    bool active;
+    int x;
+    int y;
+    int target;
+    int generation;
+    int damage;
+    int life;
+    ForgeBullet() { active = false; }
+}
+
+class ForgeEvent {
+    ForgeEventKind kind;
+    int cell;
+    int value;
+    int tick;
+    ForgeEvent() { tick = -1; }
+}
+
+class ForgeEvents {
+    ForgeEvent[] entries;
+    int sequence;
+    ForgeEvents() {
+        entries = new ForgeEvent[64]; sequence = 0;
+        for (int i = 0; i < 64; i = i + 1) { entries[i] = new ForgeEvent(); }
+    }
+    void Emit(ForgeEventKind kind, int cell, int value, int tick) {
+        ForgeEvent e = entries[sequence % 64];
+        e.kind = kind; e.cell = cell; e.value = value; e.tick = tick;
+        sequence = sequence + 1;
+    }
+}
+
+class ForgeGrid {
+    static int TileSize() { return 32; }
+    static int Unit() { return 1000; }
+    static int Dx(int direction) { if (direction == 0) { return 1; } if (direction == 2) { return -1; } return 0; }
+    static int Dy(int direction) { if (direction == 1) { return 1; } if (direction == 3) { return -1; } return 0; }
+    static int WorldToCell(int world) { return world < 0 ? -1 : world / 1000; }
+    static int Center(int cell) { return cell * 1000 + 500; }
+    static int Max(int a, int b) { return a > b ? a : b; }
+    static int Min(int a, int b) { return a < b ? a : b; }
+    static int Abs(int v) { return v < 0 ? -v : v; }
+    static int Clamp(int v, int lo, int hi) { if (v < lo) { return lo; } if (v > hi) { return hi; } return v; }
+}
+
+class ForgeWorld {
+    int width;
+    int height;
+    int seed;
+    int tick;
+    int coreCell;
+    int coreMaxHp;
+    int wave;
+    int nextWaveTicks;
+    int spawnRemaining;
+    int spawnCooldown;
+    int bulletCursor;
+    bool bossPending;
+    bool waveActive;
+    bool defeated;
+    bool victory;
+    int enemyCount;
+    int kills;
+    int produced;
+    int powerSupply;
+    int powerDemand;
+    int batteryStored;
+    bool topologyDirty;
+    bool pathsDirty;
+    ForgeCatalog catalog;
+    ForgeTile[] tiles;
+    ForgeBuilding[] buildings;
+    ForgeEnemy[] enemies;
+    ForgeBullet[] bullets;
+    Stock resources;
+    bool[] researched;
+    ForgeEvents events;
+    ForgeWorld(int mapWidth, int mapHeight, int mapSeed) {
+        width = mapWidth; height = mapHeight; seed = mapSeed; catalog = new ForgeCatalog();
+        tiles = new ForgeTile[width * height]; buildings = new ForgeBuilding[width * height];
+        for (int i = 0; i < width * height; i = i + 1) { tiles[i] = new ForgeTile(); buildings[i] = new ForgeBuilding(); }
+        enemies = new ForgeEnemy[192]; bullets = new ForgeBullet[384];
+        for (int i = 0; i < 192; i = i + 1) { enemies[i] = new ForgeEnemy(); }
+        for (int i = 0; i < 384; i = i + 1) { bullets[i] = new ForgeBullet(); }
+        resources = new Stock(); researched = new bool[6]; researched[0] = true;
+        events = new ForgeEvents(); coreCell = (height / 2) * width + width / 2;
+        coreMaxHp = 2400; nextWaveTicks = 3500; topologyDirty = true; pathsDirty = true;
+    }
+    int Index(int x, int y) { if (x < 0 || y < 0 || x >= width || y >= height) { return -1; } return y * width + x; }
+    int Neighbor(int cell, int dir) { return Index(cell % width + ForgeGrid.Dx(dir), cell / width + ForgeGrid.Dy(dir)); }
+    bool Unlocked(BlockKind kind) { return researched[catalog.blocks[(int)kind].tech]; }
+    bool InBuildRange(int cell) {
+        if (researched[5]) { return true; }
+        return ForgeGrid.Abs(cell % width - coreCell % width) <= 15 && ForgeGrid.Abs(cell / width - coreCell / width) <= 15;
+    }
+    string BuildError(int cell, BlockKind kind) {
+        if (defeated || victory) { return "本局已结束，请开始新的远征。"; }
+        if (cell < 0 || cell >= width * height) { return "超出地图边界。"; }
+        if (kind == BlockKind.Empty || kind == BlockKind.Core) { return "请选择建造项目。"; }
+        if (!Unlocked(kind)) { return "请先在科技面板完成前置研究。"; }
+        if (!InBuildRange(cell)) { return "超出建造半径，研究炉心扩张可解锁。"; }
+        if (buildings[cell].kind != BlockKind.Empty) { return "这里已有建筑。"; }
+        ForgeTile t = tiles[cell];
+        if (kind == BlockKind.Pump) { if (t.terrain != TerrainKind.Water) { return "取水泵需要建在水面。"; } }
+        else if (kind == BlockKind.OilPump) { if (t.terrain != TerrainKind.Oil) { return "油井需要建在油层。"; } }
+        else if (t.terrain == TerrainKind.Rock || t.terrain == TerrainKind.Water) { return "该地形不可建造。"; }
+        if (kind == BlockKind.Drill && (t.ore < 0 || t.reserve <= 0)) { return "钻头需要未耗尽的矿脉。"; }
+        if (cell % width <= 1 || cell % width >= width - 2 || cell / width <= 1 || cell / width >= height - 2) { return "敌军入口需要保持畅通。"; }
+        for (int i = 0; i < 192; i = i + 1) {
+            ForgeEnemy e = enemies[i];
+            if (e.active && Index(ForgeGrid.WorldToCell(e.x), ForgeGrid.WorldToCell(e.y)) == cell) { return "敌人占据此处，无法建造。"; }
+        }
+        if (!resources.Has(catalog.blocks[(int)kind].cost)) { return "核心资源不足，请接通矿脉输送线。"; }
+        return "";
+    }
+    bool Build(int cell, BlockKind kind, int direction) {
+        if (BuildError(cell, kind) != "") { return false; }
+        if (!resources.Pay(catalog.blocks[(int)kind].cost)) { return false; }
+        Place(cell, kind, direction);
+        events.Emit(ForgeEventKind.Built, cell, (int)kind, tick);
+        return true;
+    }
+    void Place(int cell, BlockKind kind, int direction) {
+        ForgeBuilding b = buildings[cell]; b.Reset(); b.kind = kind;
+        b.direction = direction % 4; b.hp = catalog.blocks[(int)kind].hp;
+        if (kind == BlockKind.Assembler) { b.recipe = 2; }
+        topologyDirty = true; pathsDirty = true;
+    }
+    bool Remove(int cell, bool refund) {
+        if (cell < 0 || cell >= width * height) { return false; }
+        ForgeBuilding b = buildings[cell];
+        if (b.kind == BlockKind.Empty || b.kind == BlockKind.Core) { return false; }
+        if (refund) {
+            Stock cost = catalog.blocks[(int)b.kind].cost;
+            for (int i = 0; i < 6; i = i + 1) { resources.Add(i, cost.Get(i) / 2 + b.stock.Get(i)); }
+            for (int i = 0; i < 4; i = i + 1) { if (b.cargo[i] > 0) { resources.Add(b.cargo[i] - 1, 1); } }
+        }
+        b.Reset(); topologyDirty = true; pathsDirty = true;
+        events.Emit(ForgeEventKind.Removed, cell, 0, tick); return true;
+    }
+    bool Research(int tech) {
+        if (tech <= 0 || tech >= 6 || researched[tech] || defeated || victory) { return false; }
+        TechDef def = catalog.techs[tech];
+        if (!researched[def.parent] || !resources.Pay(def.cost)) { return false; }
+        researched[tech] = true;
+        if (tech == 5) { coreMaxHp = coreMaxHp + 1200; buildings[coreCell].hp = buildings[coreCell].hp + 1200; }
+        events.Emit(ForgeEventKind.Researched, coreCell, tech, tick); return true;
+    }
+    bool Feed(int cell, int item, int quantity) {
+        if (cell < 0 || cell >= width * height || item < 0 || item >= 6 || quantity < 1) { return false; }
+        ForgeBuilding b = buildings[cell];
+        if (b.kind == BlockKind.Empty || b.kind == BlockKind.Core || b.stock.Total() + quantity > 24) { return false; }
+        if (!resources.Take(item, quantity)) { return false; }
+        b.stock.Add(item, quantity); return true;
+    }
+}

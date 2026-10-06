@@ -1,0 +1,194 @@
+using System;
+
+namespace Coreforge;
+
+class ForgeMap {
+    ForgeWorld world;
+    long randomState;
+
+    ForgeMap(ForgeWorld state) {
+        world = state;
+        randomState = (long)state.seed & 2147483647L;
+        if (randomState == 0) { randomState = 1; }
+    }
+
+    int Next(int limit) {
+        randomState = randomState * 48271L % 2147483647L;
+        return (int)(randomState % (long)limit);
+    }
+
+    // Shared by generation, combat, and the map's visible entrance markers.
+    static int SpawnCell(ForgeWorld state, int lane) {
+        long s = (long)state.seed & 2147483647L;
+        int cx = state.width / 2;
+        int cy = state.height / 2;
+        if (lane == 0) { return state.Index(0, ForgeGrid.Max(2, ForgeGrid.Min(state.height - 3, cy - 3 + (int)(s % 7L)))); }
+        if (lane == 1) { return state.Index(ForgeGrid.Max(2, ForgeGrid.Min(state.width - 3, cx - 6 + (int)((s / 7L) % 13L))), 0); }
+        return state.Index(state.width - 1, ForgeGrid.Max(2, ForgeGrid.Min(state.height - 3, cy - 5 + (int)((s / 91L) % 11L))));
+    }
+
+    void Ground(int x, int y) {
+        int cell = world.Index(x, y);
+        if (cell >= 0) { world.tiles[cell].terrain = TerrainKind.Ground; }
+    }
+
+    void Patch(int x, int y, int radius, TerrainKind terrain) {
+        for (int dy = -radius; dy <= radius; dy = dy + 1) {
+            for (int dx = -radius; dx <= radius; dx = dx + 1) {
+                int cell = world.Index(x + dx, y + dy);
+                if (cell >= 0 && dx * dx + dy * dy <= radius * radius + Next(3)) {
+                    ForgeTile tile = world.tiles[cell];
+                    tile.terrain = terrain; tile.ore = -1; tile.reserve = 0;
+                }
+            }
+        }
+    }
+
+    void OrePatch(int x, int y, int ore, int reserve, bool clear) {
+        for (int dy = -1; dy <= 1; dy = dy + 1) {
+            for (int dx = -2; dx <= 2; dx = dx + 1) {
+                int cell = world.Index(x + dx, y + dy);
+                if (cell < 0 || dx * dx + dy * dy > 4) { continue; }
+                ForgeTile tile = world.tiles[cell];
+                if (clear) { tile.terrain = TerrainKind.Ground; }
+                if (tile.terrain != TerrainKind.Ground) { continue; }
+                tile.ore = ore;
+                tile.reserve = reserve + Next(600);
+            }
+        }
+    }
+
+    void Corridor(int x1, int y1, int x2, int y2) {
+        int x = x1;
+        int y = y1;
+        while (x != x2 || y != y2) {
+            for (int d = -1; d <= 1; d = d + 1) { Ground(x + d, y); Ground(x, y + d); }
+            if (x != x2) { x = x + (x < x2 ? 1 : -1); }
+            else { y = y + (y < y2 ? 1 : -1); }
+        }
+        for (int d = -1; d <= 1; d = d + 1) { Ground(x + d, y); Ground(x, y + d); }
+    }
+
+    void Generate() {
+        int cx = world.width / 2;
+        int cy = world.height / 2;
+        world.coreCell = world.Index(cx, cy);
+        for (int i = 0; i < 30; i = i + 1) {
+            Patch(3 + Next(world.width - 6), 3 + Next(world.height - 6), 1 + Next(3), TerrainKind.Rock);
+        }
+        for (int i = 0; i < 4; i = i + 1) {
+            Patch(3 + Next(world.width - 6), 3 + Next(world.height - 6), 1 + Next(2), TerrainKind.Water);
+            Patch(3 + Next(world.width - 6), 3 + Next(world.height - 6), 1 + Next(2), TerrainKind.Oil);
+        }
+        for (int i = 0; i < 30; i = i + 1) {
+            OrePatch(3 + Next(world.width - 6), 3 + Next(world.height - 6), i % 3, 1200 + Next(1800), false);
+        }
+        for (int y = cy - 7; y <= cy + 7; y = y + 1) {
+            for (int x = cx - 9; x <= cx + 9; x = x + 1) { Ground(x, y); }
+        }
+        Patch(cx + 5, cy + 5, 2, TerrainKind.Water);
+        Patch(cx - 8, cy + 6, 1, TerrainKind.Oil);
+        OrePatch(cx - 7, cy + 3, 0, 4800, true);
+        OrePatch(cx + 7, cy - 1, 1, 3600, true);
+        OrePatch(cx - 6, cy - 4, 2, 3000, true);
+
+        // Entrances are seed-relative. Clear their approach before adding buildings.
+        int west = ForgeMap.SpawnCell(world, 0);
+        int north = ForgeMap.SpawnCell(world, 1);
+        int east = ForgeMap.SpawnCell(world, 2);
+        Corridor(0, west / world.width, cx - 10, west / world.width);
+        Corridor(cx - 10, west / world.width, cx - 10, cy - 2);
+        Corridor(cx - 10, cy - 2, cx, cy - 2);
+        Corridor(cx, cy - 2, cx, cy);
+        Corridor(north % world.width, 0, north % world.width, cy - 8);
+        Corridor(north % world.width, cy - 8, cx + 1, cy - 8);
+        Corridor(cx + 1, cy - 8, cx + 1, cy);
+        Corridor(cx + 1, cy, cx, cy);
+        Corridor(world.width - 1, east / world.width, cx + 9, east / world.width);
+        Corridor(cx + 9, east / world.width, cx + 9, cy + 1);
+        Corridor(cx + 9, cy + 1, cx, cy + 1);
+        Corridor(cx, cy + 1, cx, cy);
+        Starter(cx, cy);
+    }
+
+    void Put(int x, int y, BlockKind kind, int direction) {
+        Ground(x, y);
+        world.Place(world.Index(x, y), kind, direction);
+    }
+
+    void Starter(int cx, int cy) {
+        Put(cx, cy, BlockKind.Core, 0);
+        world.coreMaxHp = world.catalog.blocks[(int)BlockKind.Core].hp;
+        world.resources.Clear();
+        world.resources.Add(0, 180); world.resources.Add(1, 120); world.resources.Add(2, 30);
+
+        Put(cx - 7, cy + 3, BlockKind.Drill, 0);
+        for (int x = cx - 6; x < cx; x = x + 1) { Put(x, cy + 3, BlockKind.Belt, 0); }
+        Put(cx - 3, cy + 3, BlockKind.Router, 0);
+        Put(cx, cy + 3, BlockKind.Belt, 3);
+        Put(cx, cy + 2, BlockKind.Belt, 3);
+        Put(cx, cy + 1, BlockKind.Belt, 3);
+        for (int y = cy + 2; y >= cy; y = y - 1) { Put(cx - 3, y, BlockKind.Belt, 3); }
+
+        Put(cx + 7, cy - 1, BlockKind.Drill, 2);
+        for (int x = cx + 6; x > cx; x = x - 1) { Put(x, cy - 1, BlockKind.Belt, 2); }
+        Put(cx + 3, cy - 1, BlockKind.Router, 2);
+        Put(cx, cy - 1, BlockKind.Belt, 1);
+
+        Put(cx - 6, cy - 4, BlockKind.Drill, 1);
+        Put(cx - 6, cy - 3, BlockKind.Belt, 0);
+        Put(cx - 5, cy - 3, BlockKind.Belt, 0);
+        Put(cx - 4, cy - 3, BlockKind.Router, 0);
+        Put(cx - 3, cy - 3, BlockKind.Belt, 0);
+        Put(cx - 2, cy - 3, BlockKind.Belt, 1);
+        Put(cx - 4, cy - 2, BlockKind.Belt, 1);
+        Put(cx - 4, cy - 1, BlockKind.Belt, 0);
+        Put(cx - 3, cy - 1, BlockKind.Router, 0);
+        Put(cx - 2, cy - 1, BlockKind.Belt, 0);
+        Put(cx - 1, cy - 1, BlockKind.Belt, 0);
+
+        Put(cx - 2, cy - 2, BlockKind.Generator, 0);
+        Put(cx - 3, cy - 2, BlockKind.Turret, 0);
+        Put(cx + 3, cy - 2, BlockKind.Turret, 2);
+        world.buildings[world.Index(cx - 3, cy - 2)].stock.Add(0, 18);
+        world.buildings[world.Index(cx + 3, cy - 2)].stock.Add(0, 18);
+        world.buildings[world.Index(cx - 7, cy + 3)].stock.Add(0, 2);
+        world.buildings[world.Index(cx + 7, cy - 1)].stock.Add(1, 2);
+        world.buildings[world.Index(cx - 6, cy - 4)].stock.Add(2, 1);
+        // Seed the real belt slots; normal factory steps move these very same items.
+        for (int x = cx - 6; x <= cx; x = x + 2) {
+            ForgeBuilding belt = world.buildings[world.Index(x, cy + 3)];
+            belt.cargo[0] = 1; belt.travel[0] = (x - cx + 7) * 90; belt.received[0] = 0;
+        }
+        world.nextWaveTicks = ForgeCombat.FirstWaveTicks();
+        world.topologyDirty = true; world.pathsDirty = true;
+    }
+}
+
+class ForgeSimulation {
+    ForgeWorld world;
+    ForgeFactory factory;
+    ForgeCombat combat;
+
+    ForgeSimulation(int seed) {
+        world = new ForgeWorld(48, 36, seed);
+        ForgeMap map = new ForgeMap(world);
+        map.Generate();
+        factory = new ForgeFactory(world);
+        combat = new ForgeCombat(world);
+    }
+
+    ForgeSimulation(ForgeWorld loaded) {
+        world = loaded;
+        world.topologyDirty = true; world.pathsDirty = true;
+        factory = new ForgeFactory(world);
+        combat = new ForgeCombat(world);
+    }
+
+    void Step() {
+        if (world.defeated || world.victory) { return; }
+        world.tick = world.tick + 1;
+        factory.Step();
+        combat.Step();
+    }
+}

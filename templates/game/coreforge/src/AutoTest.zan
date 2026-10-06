@@ -1,0 +1,210 @@
+using System;
+using System.IO;
+using Coreforge;
+
+// 无头交互自测：合成事件走与真人完全相同的 Input() 入口，
+// 验证建造、选择、暂停、缩放、平移、存档、读档全链路。
+// COREFORGE_AUTOTEST=1 启用；全部通过打印 COREFORGE_AUTOTEST_OK。
+class CoreforgeAutoTest {
+    static ForgeInterface g;
+    static int step;
+    static int nextFrame;
+    static int drillCell = -1;
+    static int beltCell = -1;
+    static double zoom0;
+    static double camX0;
+    static double camY0;
+    static bool passed = true;
+
+    static bool done;
+    static int[] kindCount = new int[16];
+    static int lastKind;
+    static int lastCode;
+    static int lastMods;
+
+    // smoke 模式的事件审计：进入 Input 的每个真实事件计数。
+    static void NoteEvent(int kind, int code, int mods) {
+        if (kind >= 0 && kind < 16) { kindCount[kind] = kindCount[kind] + 1; }
+        lastKind = kind;
+        lastCode = code;
+        lastMods = mods;
+    }
+
+    static void DumpEvents() {
+        string text = "COREFORGE_EVENTS";
+        for (int k = 0; k < 16; k = k + 1) {
+            if (kindCount[k] > 0) { text = text + " k" + Convert.ToString(k) + "=" + Convert.ToString(kindCount[k]); }
+        }
+        Console.WriteLine(text + " last=" + Convert.ToString(lastKind) + "/" + Convert.ToString(lastCode) + "/" + Convert.ToString(lastMods));
+    }
+
+    static void Fail(string what) {
+        Console.WriteLine("COREFORGE_AUTOTEST_FAIL " + what);
+        passed = false;
+        done = true;
+    }
+
+    static void Key(int code) {
+        g.Input(4, 0, 0, 0, code, 0, 0);
+        g.Input(5, 0, 0, 0, code, 0, 0);
+    }
+
+    static void Click(int x, int y) {
+        g.Input(1, x, y, 0, 0, 0, 0);
+        g.Input(2, x, y, 0, 0, 0, 0);
+        g.Input(3, x, y, 0, 0, 0, 0);
+    }
+
+    static int ScreenX(int cell) {
+        return g.camera.ScreenX(cell % g.sim.world.width * 1000 + 500);
+    }
+    static int ScreenY(int cell) {
+        return g.camera.ScreenY(cell / g.sim.world.width * 1000 + 500);
+    }
+
+    static void ClickZone(int id) {
+        for (int i = 0; i < g.zones.Count; i = i + 1) {
+            HudZone z = g.zones[i];
+            if (z.id == id) {
+                Click(z.x + z.w / 2, z.y + z.h / 2);
+                return;
+            }
+        }
+        Fail("zone " + Convert.ToString(id) + " not registered");
+    }
+
+    static int FindOre() {
+        // 选距核心最近的可用矿：建造受半径限制（研究炉心扩张前 Chebyshev<=15），
+        // 全图首扫可能选到半径外被 BuildError 拒绝的格子。
+        ForgeWorld w = g.sim.world;
+        int best = -1;
+        int bestDist = 2147483647;
+        int cx = w.coreCell % w.width;
+        int cy = w.coreCell / w.width;
+        for (int i = 0; i < w.tiles.Length; i = i + 1) {
+            if (w.tiles[i].ore < 0 || w.buildings[i].kind != BlockKind.Empty) { continue; }
+            int dist = ForgeGrid.Max(ForgeGrid.Abs(i % w.width - cx), ForgeGrid.Abs(i / w.width - cy));
+            // 留 1 格给传送带邻位：钻头 ≤14 ⇒ 邻格 ≤15 仍在建造半径内。
+            if (dist < bestDist && dist <= 14) { bestDist = dist; best = i; }
+        }
+        return best;
+    }
+
+    static int EmptyNeighbor(int cell) {
+        ForgeWorld w = g.sim.world;
+        int x = cell % w.width;
+        int y = cell / w.width;
+        if (x + 1 < w.width && FreeAt(w, w.Index(x + 1, y))) { return w.Index(x + 1, y); }
+        if (y + 1 < w.height && FreeAt(w, w.Index(x, y + 1))) { return w.Index(x, y + 1); }
+        if (x - 1 >= 0 && FreeAt(w, w.Index(x - 1, y))) { return w.Index(x - 1, y); }
+        if (y - 1 >= 0 && FreeAt(w, w.Index(x, y - 1))) { return w.Index(x, y - 1); }
+        return -1;
+    }
+    static bool FreeAt(ForgeWorld w, int cell) {
+        // 复用游戏自己的建造规则：空地 + 地形可建 + 半径内，避免自测选到会被拒的格子。
+        return w.buildings[cell].kind == BlockKind.Empty && w.BuildError(cell, BlockKind.Belt) == "";
+    }
+
+    static string SaveFile() {
+        string overridden = Environment.GetEnvironmentVariable("COREFORGE_SAVE");
+        return overridden != "" ? overridden : "expedition.json";
+    }
+
+    // 每帧推进一步；帧间隔给真实事件泵与渲染留出节奏。
+    static void Step(int frame) {
+        switch (step) {
+            case 0: {
+                drillCell = FindOre();
+                if (drillCell < 0) { Fail("no free ore cell"); return; }
+                beltCell = EmptyNeighbor(drillCell);
+                if (beltCell < 0) { Fail("no free neighbor for belt"); return; }
+                Key(49); // 选择矿脉钻头
+                break;
+            }
+            case 1: {
+                Click(ScreenX(drillCell), ScreenY(drillCell));
+                break;
+            }
+            case 2: {
+                if (g.sim.world.buildings[drillCell].kind != BlockKind.Drill) {
+                    int sx = ScreenX(drillCell);
+                    int sy = ScreenY(drillCell);
+                    Console.WriteLine("diag cell=" + Convert.ToString(drillCell)
+                      + " screen=" + Convert.ToString(sx) + "," + Convert.ToString(sy)
+                      + " err=" + g.sim.world.BuildError(drillCell, BlockKind.Drill)
+                      + " zone=" + Convert.ToString(g.ZoneAt(sx, sy))
+                      + " hover=" + Convert.ToString(g.camera.CellAt(g.sim.world, sx, sy))
+                      + " copper=" + Convert.ToString(g.sim.world.resources.Get(0)));
+                    Fail("drill not placed");
+                    return;
+                }
+                Key(50); // 选择传送带
+                break;
+            }
+            case 3: {
+                Click(ScreenX(beltCell), ScreenY(beltCell));
+                break;
+            }
+            case 4: {
+                if (g.sim.world.buildings[beltCell].kind != BlockKind.Belt) { Fail("belt not placed"); return; }
+                Click(ScreenX(g.sim.world.coreCell), ScreenY(g.sim.world.coreCell));
+                break;
+            }
+            case 5: {
+                if (g.inspectCell != g.sim.world.coreCell) { Fail("core click did not inspect"); return; }
+                Key(32); // 暂停
+                break;
+            }
+            case 6: {
+                if (!g.paused) { Fail("space did not pause"); return; }
+                Key(32); // 继续
+                break;
+            }
+            case 7: {
+                if (g.paused) { Fail("space did not resume"); return; }
+                zoom0 = g.camera.zoom;
+                g.Input(13, ScreenX(g.sim.world.coreCell), ScreenY(g.sim.world.coreCell), 0, 120, 0, 0);
+                break;
+            }
+            case 8: {
+                if (g.camera.zoom <= zoom0) { Fail("wheel did not zoom in"); return; }
+                camX0 = g.camera.x;
+                camY0 = g.camera.y;
+                int cx = ScreenX(g.sim.world.coreCell);
+                int cy = ScreenY(g.sim.world.coreCell);
+                g.Input(2, cx, cy, 1, 0, 0, 0);
+                g.Input(1, cx + 60, cy + 40, 0, 0, 0, 0);
+                g.Input(3, cx + 60, cy + 40, 1, 0, 0, 0);
+                break;
+            }
+            case 9: {
+                if (g.camera.x == camX0 && g.camera.y == camY0) { Fail("right drag did not pan"); return; }
+                ClickZone(6); // 保存
+                break;
+            }
+            case 10: {
+                if (!File.Exists(SaveFile())) { Fail("save file missing"); return; }
+                ClickZone(7); // 读档
+                break;
+            }
+            case 11: {
+                if (!g.paused) { Fail("load did not pause for review"); return; }
+                Key(32);
+                break;
+            }
+            default: {
+                done = true;
+                return;
+            }
+        }
+        step = step + 1;
+        nextFrame = frame + 12;
+    }
+
+    // main 每帧调用；到点才走一步。
+    static void Run(ForgeInterface game, int frame) {
+        g = game;
+        if (done || frame < nextFrame) { return; }
+        Step(frame);
+    }
+}

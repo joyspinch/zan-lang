@@ -1,0 +1,77 @@
+using System;
+using System.IO;
+using Gui;
+using Game.Foundation;
+using Coreforge;
+
+// 炉心边境 · Coreforge —— 自有帧循环宿主。
+// 事件 → 世界步进 → 场景绘制 → HUD 合成（ForgeInterface.Render）
+// → 帧尾 pacing。循环自持 RequestRedraw 空转节流，失焦不冻结
+// （游戏动画连续）；窗口 chrome 由 RenderChrome 叠画。
+class CoreforgeProgram {
+    static string SavePath() {
+        string overridden = Environment.GetEnvironmentVariable("COREFORGE_SAVE");
+        if (overridden != "") { return overridden; }
+        string basePath = Environment.GetEnvironmentVariable("LOCALAPPDATA");
+        if (basePath == "") { basePath = Environment.GetEnvironmentVariable("HOME"); }
+        if (basePath == "") { basePath = Directory.GetCurrentDirectory(); }
+        string directory = basePath + "/Coreforge";
+        Directory.CreateDirectoryRecursive(directory);
+        return directory + "/expedition.json";
+    }
+
+    static void Main() {
+        Environment.SetEnvironmentVariable("ZAN_GUI_TOUCH_GAME", "1");
+        App app = App.CreateDark("炉心边境 · COREFORGE", 1280, 860);
+        app.Show();
+        ForgeInterface game = new ForgeInterface(app, CoreforgeProgram.SavePath());
+        FixedStepClock clock = new FixedStepClock(20, 12);
+        int previous = Window.GetTickMs();
+        int frames = 0;
+        string capture = Environment.GetEnvironmentVariable("COREFORGE_CAPTURE");
+        string smoke = Environment.GetEnvironmentVariable("COREFORGE_SMOKE");
+        string autotest = Environment.GetEnvironmentVariable("COREFORGE_AUTOTEST");
+        bool running = true;
+        app.RequestRedraw();
+        while (running) {
+            int got = app.PollOneEvent();
+            if (got < 0) { running = false; break; }
+            if (got == 1 && smoke != "1" && autotest != "1") {
+                // 桌面转发仅正常游玩；smoke/autotest 里弹出的窗口可能
+                // 吃到真实桌面滚轮/拖动，会污染确定性截图与自测。
+                game.Input(app.window.EventKind(), app.window.EventX(), app.window.EventY(),
+                    app.window.EventButton(), app.window.EventKeyCode(), app.window.EventMods(), app.window.EventFlag());
+            }
+            int now = Window.GetTickMs();
+            int elapsed = ForgeGrid.Clamp(now - previous, 0, 100); previous = now;
+            game.TickCamera(elapsed);
+            clock.SetPaused(game.paused); clock.SetTimeScale((double)game.speed);
+            clock.Advance(elapsed);
+            while (clock.HasStep()) { clock.ConsumeStep(); game.sim.Step(); }
+            game.TickUi();
+            if (autotest == "1") { CoreforgeAutoTest.Run(game, frames); }
+            app.BeginFrame(); game.Render(); app.RenderChrome(game.title);
+            frames = frames + 1;
+            if (capture != "" && frames == 120) {
+                app.canvas.WritePixels(capture, 0, 0, app.ClientWidth(), app.ClientHeight());
+                Console.WriteLine("COREFORGE_CAPTURE " + Convert.ToString(app.ClientWidth()) + "x" + Convert.ToString(app.ClientHeight()));
+            }
+            app.PresentFrame();
+            if (smoke == "1" && frames >= 125) {
+                Console.WriteLine("COREFORGE_GUI_PASS frames=" + Convert.ToString(frames) + " tick=" + Convert.ToString(game.sim.world.tick));
+                Console.WriteLine("COREFORGE_CAM zoom=" + Convert.ToString(game.camera.zoom) + " x=" + Convert.ToString(game.camera.x) + " y=" + Convert.ToString(game.camera.y)
+                  + " map=" + Convert.ToString(game.sim.world.width) + "x" + Convert.ToString(game.sim.world.height)
+                  + " client=" + Convert.ToString(app.ClientWidth()) + "x" + Convert.ToString(app.ClientHeight()));
+                CoreforgeAutoTest.DumpEvents();
+                running = false;
+            }
+            if (autotest == "1" && CoreforgeAutoTest.done) {
+                Console.WriteLine(CoreforgeAutoTest.passed
+                  ? "COREFORGE_AUTOTEST_OK frames=" + Convert.ToString(frames)
+                  : "COREFORGE_AUTOTEST_FAIL");
+                running = false;
+            }
+            app.RequestRedraw();
+        }
+    }
+}

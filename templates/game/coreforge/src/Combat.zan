@@ -1,0 +1,406 @@
+using System;
+using Game.Core;
+
+namespace Coreforge;
+
+class ForgeCombat {
+    ForgeWorld world;
+    SpatialHash2D enemyHash;
+    int[] candidates;
+    int[] seen;
+    int querySequence;
+    int[] distance;
+    int[] nextCell;
+    int[] heap;
+    int[] heapPosition;
+    int heapCount;
+    bool allowOffGrid;
+
+    static int FirstWaveTicks() { return 3500; }
+    static int BetweenWaveTicks() { return 1750; }
+    static int BaseRange() { return 6000; }
+    static int UpgradedRange() { return 7000; }
+    static int HashCellSize() { return 4000; }
+    static int BulletSpeed() { return 650; }
+    static int BulletLifetime() { return 160; }
+    static int AttackRange() { return 900; }
+    static int CopperDamage() { return 24; }
+    static int LeadDamage() { return 36; }
+    static int PoweredCooldown() { return 30; }
+    static int CooledCooldown() { return 22; }
+    static int OffGridCooldown() { return 90; }
+    static int Unreachable() { return 1000000000; }
+
+    ForgeCombat(ForgeWorld state) {
+        world = state;
+        int total = world.width * world.height;
+        distance = new int[total]; nextCell = new int[total];
+        heap = new int[total]; heapPosition = new int[total];
+        seen = new int[world.enemies.Length];
+        enemyHash = SpatialHash2D.Create(ForgeCombat.HashCellSize(), world.enemies.Length);
+        // Hash bucket collisions can repeat IDs across queried buckets. Keep room
+        // for every visit, then deduplicate before comparing target priorities.
+        int side = ForgeCombat.UpgradedRange() * 2 / ForgeCombat.HashCellSize() + 3;
+        candidates = new int[world.enemies.Length * side * side];
+        allowOffGrid = true; querySequence = 0;
+        world.enemyCount = 0;
+        for (int i = 0; i < world.enemies.Length; i = i + 1) {
+            if (world.enemies[i].active) { world.enemyCount = world.enemyCount + 1; }
+        }
+        RebuildPaths();
+        RebuildHash();
+    }
+
+    int SpawnCell(int lane) { return ForgeMap.SpawnCell(world, lane); }
+    int TurretRange() { return world.researched[3] ? ForgeCombat.UpgradedRange() : ForgeCombat.BaseRange(); }
+
+    bool Solid(BlockKind kind) {
+        return kind != BlockKind.Empty && kind != BlockKind.Belt && kind != BlockKind.Router && kind != BlockKind.Pipe;
+    }
+
+    bool TerrainOpen(int cell) {
+        TerrainKind terrain = world.tiles[cell].terrain;
+        return terrain != TerrainKind.Rock && terrain != TerrainKind.Water;
+    }
+
+    int EntryCost(int cell) {
+        ForgeBuilding b = world.buildings[cell];
+        if (cell == world.coreCell || !Solid(b.kind)) { return 10; }
+        // Destructible structures are expensive, never impassable. A sealed maze
+        // therefore yields a finite route through the cheapest breach.
+        return 30 + world.catalog.blocks[(int)b.kind].hp / 12;
+    }
+
+    bool Before(int a, int b) {
+        if (distance[a] == distance[b]) { return a < b; }
+        return distance[a] < distance[b];
+    }
+
+    void HeapOffer(int cell) {
+        int at = heapPosition[cell];
+        if (at == -2) { return; }
+        if (at < 0) {
+            at = heapCount; heapCount = heapCount + 1;
+            heap[at] = cell; heapPosition[cell] = at;
+        }
+        while (at > 0) {
+            int parent = (at - 1) / 2;
+            int other = heap[parent];
+            if (!Before(cell, other)) { break; }
+            heap[at] = other; heapPosition[other] = at;
+            at = parent;
+        }
+        heap[at] = cell; heapPosition[cell] = at;
+    }
+
+    int HeapPop() {
+        int result = heap[0];
+        heapCount = heapCount - 1;
+        heapPosition[result] = -2;
+        if (heapCount == 0) { return result; }
+        int cell = heap[heapCount];
+        int at = 0;
+        while (at * 2 + 1 < heapCount) {
+            int child = at * 2 + 1;
+            if (child + 1 < heapCount && Before(heap[child + 1], heap[child])) { child = child + 1; }
+            int other = heap[child];
+            if (!Before(other, cell)) { break; }
+            heap[at] = other; heapPosition[other] = at;
+            at = child;
+        }
+        heap[at] = cell; heapPosition[cell] = at;
+        return result;
+    }
+
+    void RebuildPaths() {
+        for (int i = 0; i < distance.Length; i = i + 1) {
+            distance[i] = ForgeCombat.Unreachable(); nextCell[i] = -1; heapPosition[i] = -1;
+        }
+        heapCount = 0;
+        distance[world.coreCell] = 0;
+        HeapOffer(world.coreCell);
+        while (heapCount > 0) {
+            int cell = HeapPop();
+            int cost = distance[cell] + EntryCost(cell);
+            for (int d = 0; d < 4; d = d + 1) {
+                int neighbor = world.Neighbor(cell, d);
+                if (neighbor < 0 || !TerrainOpen(neighbor) || cost >= distance[neighbor]) { continue; }
+                distance[neighbor] = cost;
+                nextCell[neighbor] = cell;
+                HeapOffer(neighbor);
+            }
+        }
+        world.pathsDirty = false;
+    }
+
+    void RebuildHash() {
+        enemyHash.Clear();
+        for (int i = 0; i < world.enemies.Length; i = i + 1) {
+            ForgeEnemy e = world.enemies[i];
+            if (e.active && e.hp > 0) { enemyHash.Insert(i, (double)e.x, (double)e.y, 0.0); }
+        }
+    }
+
+    int Strength() {
+        if (world.wave <= 0) { return 100; }
+        int waveIndex = ForgeGrid.Min(world.wave, world.catalog.waves.Length) - 1;
+        return ForgeGrid.Max(1, world.catalog.waves[waveIndex].strength);
+    }
+
+    void StartWave() {
+        if (world.defeated || world.victory || world.waveActive || world.enemyCount > 0 || world.wave >= world.catalog.waves.Length) { return; }
+        if (world.buildings[world.coreCell].hp <= 0) { LoseCore(); return; }
+        WaveDef wave = world.catalog.waves[world.wave];
+        world.wave = world.wave + 1;
+        world.waveActive = true; world.nextWaveTicks = 0;
+        world.spawnRemaining = wave.count; world.spawnCooldown = 0;
+        world.bossPending = wave.boss >= 0;
+        world.events.Emit(ForgeEventKind.WaveStarted, world.coreCell, world.wave, world.tick);
+    }
+
+    int FreeEnemy() {
+        for (int i = 0; i < world.enemies.Length; i = i + 1) {
+            if (!world.enemies[i].active) { return i; }
+        }
+        return -1;
+    }
+
+    void Spawn() {
+        if (world.spawnRemaining <= 0 && !world.bossPending) { return; }
+        int slot = FreeEnemy();
+        if (slot < 0) { return; }
+        WaveDef wave = world.catalog.waves[world.wave - 1];
+        int ordinal = wave.count - world.spawnRemaining;
+        int kind = 0;
+        if (world.spawnRemaining > 0) {
+            if (world.wave >= 3 && ((ordinal + world.wave) % 4 == 0 || (world.wave >= 12 && ordinal % 2 == 1))) { kind = 1; }
+            world.spawnRemaining = world.spawnRemaining - 1;
+        } else {
+            kind = wave.boss;
+            world.bossPending = false;
+        }
+        EnemyDef def = world.catalog.enemies[kind];
+        ForgeEnemy e = world.enemies[slot];
+        int cell = SpawnCell((ordinal + (world.wave - 1) / 2) % 3);
+        e.kind = kind; e.active = true;
+        e.generation = e.generation >= 2147483647 ? 1 : e.generation + 1;
+        e.x = ForgeGrid.Center(cell % world.width); e.y = ForgeGrid.Center(cell / world.width);
+        e.maxHp = ForgeGrid.Max(1, def.hp * Strength() / 100); e.hp = e.maxHp; e.cooldown = 0;
+        world.enemyCount = world.enemyCount + 1;
+        world.spawnCooldown = ForgeGrid.Max(1, wave.interval);
+    }
+
+    void AdvanceWave() {
+        if (!world.waveActive) {
+            if (world.wave >= world.catalog.waves.Length) { return; }
+            if (world.nextWaveTicks > 0) { world.nextWaveTicks = world.nextWaveTicks - 1; }
+            if (world.nextWaveTicks <= 0) { StartWave(); }
+        }
+        if (!world.waveActive) { return; }
+        if (world.spawnCooldown > 0) { world.spawnCooldown = world.spawnCooldown - 1; }
+        if (world.spawnCooldown <= 0) { Spawn(); }
+    }
+
+    void LoseCore() {
+        if (world.defeated) { return; }
+        world.buildings[world.coreCell].hp = 0;
+        world.defeated = true; world.waveActive = false;
+        world.nextWaveTicks = 0; world.spawnRemaining = 0; world.bossPending = false;
+        world.events.Emit(ForgeEventKind.CoreLost, world.coreCell, world.wave, world.tick);
+    }
+
+    void Attack(ForgeEnemy e, int cell) {
+        if (e.cooldown > 0) { return; }
+        ForgeBuilding b = world.buildings[cell];
+        if (!Solid(b.kind)) { return; }
+        EnemyDef def = world.catalog.enemies[e.kind];
+        b.hp = b.hp - ForgeGrid.Max(1, def.damage * Strength() / 100);
+        e.cooldown = ForgeGrid.Max(1, def.cooldown);
+        // Entry costs price building hp, so any damage invalidates cached routes;
+        // a loaded save rebuilds from current hp and must follow the same route.
+        world.pathsDirty = true;
+        if (b.hp <= 0) {
+            if (cell == world.coreCell) { LoseCore(); }
+            else { world.Remove(cell, false); }
+        }
+    }
+
+    void MoveEnemies() {
+        for (int i = 0; i < world.enemies.Length; i = i + 1) {
+            ForgeEnemy e = world.enemies[i];
+            if (!e.active) { continue; }
+            if (e.hp <= 0) { Kill(i); continue; }
+            if (e.cooldown > 0) { e.cooldown = e.cooldown - 1; }
+            int cell = world.Index(ForgeGrid.WorldToCell(e.x), ForgeGrid.WorldToCell(e.y));
+            if (cell < 0) { continue; }
+            if (cell == world.coreCell) {
+                Attack(e, cell);
+                if (world.defeated) { return; }
+                continue;
+            }
+            int target = nextCell[cell];
+            if (target < 0) { continue; }
+            int centerX = ForgeGrid.Center(cell % world.width);
+            int centerY = ForgeGrid.Center(cell / world.width);
+            int tx = ForgeGrid.Center(target % world.width);
+            int ty = ForgeGrid.Center(target / world.width);
+            bool blocked = Solid(world.buildings[target].kind);
+            // Finish the current centerline before turning. Positions alone encode
+            // movement, so loading a save needs no private waypoint state.
+            if ((tx != centerX && e.y != centerY) || (ty != centerY && e.x != centerX)) {
+                tx = centerX; ty = centerY; blocked = false;
+            }
+            int dx = tx - e.x;
+            int dy = ty - e.y;
+            long square = (long)dx * (long)dx + (long)dy * (long)dy;
+            int reach = blocked ? ForgeCombat.AttackRange() : 0;
+            if (blocked && square <= (long)reach * (long)reach) {
+                Attack(e, target);
+                if (world.defeated) { return; }
+                continue;
+            }
+            double length = Math.Sqrt((double)square);
+            int step = ForgeGrid.Max(1, world.catalog.enemies[e.kind].speed);
+            if (blocked && length - (double)reach < (double)step) { step = ForgeGrid.Max(1, (int)length - reach); }
+            if (length <= (double)step && !blocked) {
+                e.x = tx; e.y = ty;
+            } else if (length > 0.0) {
+                e.x = e.x + (int)((double)dx * (double)step / length);
+                e.y = e.y + (int)((double)dy * (double)step / length);
+            }
+        }
+    }
+
+    void Kill(int slot) {
+        ForgeEnemy e = world.enemies[slot];
+        if (!e.active) { return; }
+        e.active = false; e.hp = 0;
+        world.enemyCount = ForgeGrid.Max(0, world.enemyCount - 1);
+        world.kills = world.kills + 1;
+        world.resources.Add(0, world.catalog.enemies[e.kind].reward);
+        int cell = world.Index(ForgeGrid.WorldToCell(e.x), ForgeGrid.WorldToCell(e.y));
+        world.events.Emit(ForgeEventKind.EnemyKilled, cell, e.kind, world.tick);
+    }
+
+    void MoveBullets() {
+        for (int i = 0; i < world.bullets.Length; i = i + 1) {
+            ForgeBullet b = world.bullets[i];
+            if (!b.active) { continue; }
+            if (b.life <= 0 || b.target < 0 || b.target >= world.enemies.Length) { b.active = false; continue; }
+            ForgeEnemy e = world.enemies[b.target];
+            if (!e.active || e.generation != b.generation || e.hp <= 0) { b.active = false; continue; }
+            b.life = b.life - 1;
+            int dx = e.x - b.x;
+            int dy = e.y - b.y;
+            long square = (long)dx * (long)dx + (long)dy * (long)dy;
+            int speed = ForgeCombat.BulletSpeed();
+            if (square <= (long)speed * (long)speed) {
+                b.x = e.x; b.y = e.y; b.active = false;
+                e.hp = e.hp - b.damage;
+                if (e.hp <= 0) { Kill(b.target); }
+            } else {
+                double length = Math.Sqrt((double)square);
+                b.x = b.x + (int)((double)dx * (double)speed / length);
+                b.y = b.y + (int)((double)dy * (double)speed / length);
+                if (b.life <= 0) { b.active = false; }
+            }
+        }
+    }
+
+    int FindTarget(int x, int y, int range, int mode) {
+        if (querySequence >= 2147483647) {
+            for (int i = 0; i < seen.Length; i = i + 1) { seen[i] = 0; }
+            querySequence = 0;
+        }
+        querySequence = querySequence + 1;
+        int count = enemyHash.QueryRange((double)x, (double)y, (double)range, candidates, candidates.Length);
+        int best = -1;
+        long bestDistance = (long)range * (long)range + 1L;
+        int bestHp = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            int slot = candidates[i];
+            if (seen[slot] == querySequence) { continue; }
+            seen[slot] = querySequence;
+            ForgeEnemy e = world.enemies[slot];
+            if (!e.active || e.hp <= 0) { continue; }
+            int dx = e.x - x;
+            int dy = e.y - y;
+            long square = (long)dx * (long)dx + (long)dy * (long)dy;
+            if (square > (long)range * (long)range) { continue; }
+            bool better = best < 0;
+            if (mode == 1 && best >= 0) { better = e.hp < bestHp || (e.hp == bestHp && square < bestDistance); }
+            else if (mode == 2 && best >= 0) { better = e.hp > bestHp || (e.hp == bestHp && square < bestDistance); }
+            else if (best >= 0) { better = square < bestDistance; }
+            if (!better && square == bestDistance && slot < best && (mode == 0 || e.hp == bestHp)) { better = true; }
+            if (better) { best = slot; bestDistance = square; bestHp = e.hp; }
+        }
+        return best;
+    }
+
+    int FreeBullet() {
+        for (int i = 0; i < world.bullets.Length; i = i + 1) {
+            int slot = (world.bulletCursor + i) % world.bullets.Length;
+            if (!world.bullets[slot].active) {
+                world.bulletCursor = (slot + 1) % world.bullets.Length;
+                return slot;
+            }
+        }
+        return -1;
+    }
+
+    void FireTurrets() {
+        int range = TurretRange();
+        for (int cell = 0; cell < world.buildings.Length; cell = cell + 1) {
+            ForgeBuilding tower = world.buildings[cell];
+            if (tower.kind != BlockKind.Turret || tower.hp <= 0) { continue; }
+            if (tower.cooldown > 0) { tower.cooldown = tower.cooldown - 1; }
+            if (tower.cooldown > 0 || world.enemyCount <= 0) { continue; }
+            int power = ForgeGrid.Max(0, ForgeGrid.Min(1000, tower.efficiency));
+            if (world.catalog.blocks[(int)BlockKind.Turret].powerUse == 0) { power = 1000; }
+            if (power == 0 && !allowOffGrid) { continue; }
+            int ammo = tower.stock.Get(1) > 0 ? 1 : 0;
+            if (tower.stock.Get(ammo) <= 0) { continue; }
+            int x = ForgeGrid.Center(cell % world.width);
+            int y = ForgeGrid.Center(cell / world.width);
+            int target = FindTarget(x, y, range, tower.targetMode);
+            if (target < 0) { continue; }
+            int slot = FreeBullet();
+            if (slot < 0 || !tower.stock.Take(ammo, 1)) { continue; }
+            ForgeBullet b = world.bullets[slot];
+            ForgeEnemy enemy = world.enemies[target];
+            b.active = true; b.x = x; b.y = y; b.target = target; b.generation = enemy.generation;
+            b.damage = ammo == 1 ? ForgeCombat.LeadDamage() : ForgeCombat.CopperDamage();
+            if (world.researched[3]) { b.damage = b.damage * 3 / 2; }
+            b.life = ForgeCombat.BulletLifetime();
+            int powered = ForgeCombat.PoweredCooldown();
+            if (power > 0 && tower.water >= 2) {
+                tower.water = tower.water - 2; powered = ForgeCombat.CooledCooldown();
+            }
+            tower.cooldown = ForgeCombat.OffGridCooldown() - (ForgeCombat.OffGridCooldown() - powered) * power / 1000;
+        }
+    }
+
+    void ClearWave() {
+        if (!world.waveActive || world.spawnRemaining > 0 || world.bossPending || world.enemyCount > 0) { return; }
+        world.waveActive = false;
+        world.resources.Add(0, 20 + world.wave * 3);
+        world.resources.Add(1, 10 + world.wave * 2);
+        world.events.Emit(ForgeEventKind.WaveCleared, world.coreCell, world.wave, world.tick);
+        if (world.wave >= world.catalog.waves.Length) {
+            world.victory = true; world.nextWaveTicks = 0;
+        } else { world.nextWaveTicks = ForgeCombat.BetweenWaveTicks(); }
+    }
+
+    void Step() {
+        if (world.defeated || world.victory) { return; }
+        if (world.buildings[world.coreCell].hp <= 0) { LoseCore(); return; }
+        if (world.pathsDirty) { RebuildPaths(); }
+        AdvanceWave();
+        MoveEnemies();
+        if (world.defeated) { return; }
+        MoveBullets();
+        RebuildHash();
+        FireTurrets();
+        ClearWave();
+    }
+}
