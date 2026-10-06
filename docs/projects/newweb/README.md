@@ -1,9 +1,13 @@
-> **Status:** 设计稿 + 框架现状说明 —— 文中"NewWeb 模板骨架"（模板本身：
-> config/控制器/视图的落地目录）**未实现**；所描述的 Web MVC 框架能力
-> （路由属性、声明式 CRUD、Worker/控制端口、ServerMetrics 等）以 Zan.Mvc
-> 包与标准库的当前实现为准。原文件自 templates/gui/gui-free/NewWeb/README.md
-> 迁入（2026-10-06）：该占位目录没有源码，却会被脚手架原样复制进每个
-> gui-free 新项目，故移出 templates/。
+> **Status: 已被 server-collab 实体化并随 B-ID37 迁包闭账，勿按此再建模板。**
+> 本文描述的骨架已由 `templates/server/server-collab` 落地（B-ID37 四切片再生为
+> Zan.Mvc 包消费形态，e4e850236 闭账；CSP/CSRF 等加固见 B-ID80/d67），博客
+> 示例（Blog 控制器与 DAO）也在包的 `src/ZanWeb/Modules/Sys/` 下——另建一
+> 个 "NewWeb" 模板只会得到平行副本。正文保留作设计记录，其中"框架位于标准库 `System.Web`"是
+> 拆包前的旧定位：框架现居 `packages/Zan.Mvc`（`ZanWeb` 命名空间），标准库
+> `System.Web` 只剩 Html/DesignerHtml/HtmlScope 视图助手。
+> 原文件自 templates/gui/gui-free/NewWeb/README.md 迁入（2026-10-06）：该
+> 占位目录没有源码，却会被脚手架原样复制进每个 gui-free 新项目，故移出
+> templates/。
 
 # NewWeb — ZanWeb Web MVC Framework
 
