@@ -231,6 +231,22 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
 - **trace 打点必须带绝对时刻，成对相对量串不成时间线**：`late_us` 只能回答"迟了几多"，回答不了"第几段路迟的"；push/fire/park/slept 各打点带 `zan_co_precise_us()` 绝对值，一轮就能定位迟滞在停车原语还是派发路径。
 - **脚本批量改文件必须读原文→逐处断言命中→写回→复验大小**：`open(p,"w").write(变量.replace(...))` 里变量不是文件内容时写出 0 字节（本轮两个运行时源文件被截断，靠会话内 grep 证据+HEAD 重建）；写完 `len(...)` 不对就停，别继续跑。
 
+### IDE 内部逻辑的无头探针验证配方（2026-10-06 模板 platforms= 打磨沉淀）
+
+- **探针作 paths[0]，全量 IDE 源一起编**：zanc 只给首个输入发 Main（genrun.c
+  的 emitMain 仅 paths[0]），探针文件带 `static void Main()` 放首位，后接
+  `src/ide_zan/src/IdeForm.html @build/ide_files.rsp`，即可在命令行无头驱动
+  IDE 内部任何静态方法（CreateProjectT / WizTemplates 这类），不必起窗口；
+  ide_files.rsp 已含 packages/Zan.Gui 源码，改 Gui 包组件同样被这把编译覆盖。
+- **链接集照抄 scripts/build_ide.ps1**：`--no-arc-guard --no-check-leaks
+  --libpath build --link-lib zan_gui_ide_gnu --link-input build/embed_gen.o`
+  + ws2_32/mswsock/psapi/advapi32/dwmapi/gdi32/imm32/ole32/user32/rpcrt4；
+  探针不要 `--subsystem windows`——console 子系统才吃得到 println 断言输出。
+- **夹具走真文件，断言读回盘上字节**：给 CreateProjectT 这类有文件副作用的
+  函数喂 _scratch 下的真模板目录（template.manifest + src/），事后把脚手架
+  产物按字节读回断言（zan.proj 平台行、.gitignore、README 命令行），别在
+  内存里 mock 文件系统。
+
 - **截图必须锚定进程 PID、按窗口抓取**，禁止全屏抓图后肉眼找窗口——
   全屏抓到的是最前面的任意窗口（编辑器/旧实例），拿错误窗口的像素做判断
   会得出"程序坏了"或"修好了"的假结论。先记录启动 PID，再按 PID 枚举顶层窗口
