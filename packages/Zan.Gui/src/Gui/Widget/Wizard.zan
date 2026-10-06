@@ -116,11 +116,22 @@ class WizardTemplate {
 class WizardTarget {
     string name;
     int selected;
+    /// 目标平台 id（如 "windows-x64"，与宿主的 id 列表同位）。
+    /// 空串 = 无 id：不参与"按模板支持平台置灰"的判定。
+    string id;
 
     /// 构建目标标签。
     WizardTarget(string n, int s) {
         name = n;
         selected = s;
+        id = "";
+    }
+
+    /// 带平台 id 的构建（New Project 向导用）。
+    WizardTarget(string n, int s, string tid) {
+        name = n;
+        selected = s;
+        id = tid;
     }
 }
 
@@ -177,6 +188,32 @@ class Wizard : Control {
         return Lang.Tr(en, zh);
     }
 
+    /// 目标 id 的 OS 前缀（"windows-x64" -> "windows"，无 - 则原样）。
+    static string OsOf(string tid) {
+        for (int j = 0; j < tid.Length; j = j + 1) {
+            if (tid.Substring(j, 1) == "-") { return tid.Substring(0, j); }
+        }
+        return tid;
+    }
+
+    /// 该模板是否支持目标平台 id：按 OS 前缀在模板声明的
+    /// `platforms=`（逗号分隔）里找。模板未声明、或 chip 没有
+    /// id 时视为不限，一律可勾。
+    static bool TplSupports(WizardTemplate tpl, string tid) {
+        if (tpl == null || tpl.plats == "" || tid == "") { return true; }
+        string wrapped = "," + tpl.plats + ",";
+        string needle = "," + Wizard.OsOf(tid) + ",";
+        // stdlib string 无子串查找，朴素匹配（plats 最长几十字节）。
+        for (int k = 0; k + needle.Length <= wrapped.Length; k = k + 1) {
+            bool hit = true;
+            for (int m = 0; m < needle.Length; m = m + 1) {
+                if (wrapped.Substring(k + m, 1) != needle.Substring(m, 1)) { hit = false; break; }
+            }
+            if (hit) { return true; }
+        }
+        return false;
+    }
+
     /// `platforms=` 里 OS 前缀的显示名。专有名词两种语言同形，
     /// 不走 TW。
     static string OsName(string os) {
@@ -201,12 +238,8 @@ class Wizard : Control {
             if (i < spec.Length) { ch = spec.Substring(i, 1); }
             if (ch == ",") {
                 if (cur != "") {
-                    string os = cur;
-                    for (int j = 0; j < cur.Length; j = j + 1) {
-                        if (cur.Substring(j, 1) == "-") { os = cur.Substring(0, j); break; }
-                    }
                     if (pretty != "") { pretty = pretty + " / "; }
-                    pretty = pretty + Wizard.OsName(os);
+                    pretty = pretty + Wizard.OsName(Wizard.OsOf(cur));
                 }
                 cur = "";
             } else {
@@ -1438,13 +1471,19 @@ class Wizard : Control {
             int ox = fx + coli * (obw + colGap);
             int oyy = chipsY + rowi * (obh + chipGap);
             bool osel = tgt.selected == 1;
+            bool odis = !Wizard.TplSupports(selTpl, tgt.id);
             int obg = targetStyle.BgOr(0);
             int otc = targetStyle.FgOr(0);
             if (osel) {
                 obg = targetActiveStyle.BgOr(0);
                 otc = targetActiveStyle.FgOr(0);
-            } else if (app.focus.IsHovered(oid)) {
+            } else if (!odis && app.focus.IsHovered(oid)) {
                 obg = targetHoverStyle.BgOr(0);
+            }
+            if (odis && !osel) {
+                // 置灰 = 文字走半透明 alpha（0x88），原生后端逐像素
+                // 混合；底色不动，已选中的不置灰（还能点掉）。
+                otc = (otc & 0x00FFFFFF) | (int)0x88000000;
             }
             c.FillRoundRect(ox, oyy, obw, obh, t.borderRadiusMedium, obg);
             int targetFont = targetStyle.FontOr(
@@ -1485,8 +1524,23 @@ class Wizard : Control {
                 tplSel.Set(vis[tplIdx]);
                 app.RequestRedraw();
             } else if (tgtOn && tgtIdx >= 0 && tgtIdx < nTgt) {
-                targets[tgtIdx].selected = 1 - targets[tgtIdx].selected;
-                app.RequestRedraw();
+                WizardTarget tgtc = targets[tgtIdx];
+                if (tgtc.selected == 1) {
+                    // 取消勾选永远允许（换模板前先松手）。
+                    tgtc.selected = 0;
+                    app.RequestRedraw();
+                } else if (!Wizard.TplSupports(selTpl, tgtc.id)) {
+                    // 模板 platforms= 不含此 OS：当场拒绝并说明，
+                    // 不让用户到创建时才被 CreateProjectT 拦下。
+                    string osn = Wizard.OsName(Wizard.OsOf(tgtc.id));
+                    Wizard.notice = Wizard.TW(
+                        "Template '" + selTpl.name + "' doesn't run on " + osn + ".",
+                        "模板 '" + selTpl.name + "' 不支持 " + osn + "。");
+                    app.RequestRedraw();
+                } else {
+                    tgtc.selected = 1;
+                    app.RequestRedraw();
+                }
             }
         }
 
