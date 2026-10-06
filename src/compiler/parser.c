@@ -594,7 +594,7 @@ static bool paren_is_named_cast(zan_parser_t *p) {
         switch (zan_lexer_peek(p->lex).kind) {
         case TK_IDENT: case TK_INT_LIT: case TK_FLOAT_LIT:
         case TK_STRING_LIT: case TK_CHAR_LIT:
-        case TK_THIS: case TK_NEW:
+        case TK_THIS: case TK_NEW: case TK_LPAREN:
             result = true;
             break;
         default:
