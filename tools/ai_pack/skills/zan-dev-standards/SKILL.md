@@ -239,6 +239,17 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **夹具走真文件，断言读回盘上字节**：给有文件副作用的函数（项目脚手架、
   导出器这类）喂临时目录下的真实输入树，事后把产物按字节读回断言
   （工程文件关键字段、忽略表、README 命令行），别在内存里 mock 文件系统。
+- **App 级全窗控件用独立宿主探针驱动**（2026-10-06 向导芯片实机验证）：
+  WizardHost 这类宿主是独立顶层窗口、自带事件泵，主窗的 ZAN_UI_SCRIPT
+  dump/clickid 够不到内部——别硬掰驱动，直接给控件搭一个
+  `App.CreateDarkStage(标题, 宽, 高)` 探针宿主，帧循环里 `控件.Show(app)`，
+  ZAN_UI_SCRIPT 就能在该窗口内 dump/clickid/截图。夹具坑：向导
+  catSel/tplSel 必须同指一个模板——tplSel 会被钳回当前分类的可见集合，
+  分类停错时右栏静默换模板、置灰判定全部落空。
+- **外部截图进程先声明 DPI 感知**（同上）：PowerShell 默认不感知 DPI，
+  GetWindowRect 被 OS 虚拟化，量出的矩形比真实窗口小，PrintWindow 的
+  DC 跟着小——截图被裁角还以为窗口没建对。截图脚本开头调一次
+  `SetProcessDpiAwarenessContext(-4)` 再量再抓。
 
 - **截图必须锚定进程 PID、按窗口抓取**，禁止全屏抓图后肉眼找窗口——
   全屏抓到的是最前面的任意窗口（编辑器/旧实例），拿错误窗口的像素做判断
