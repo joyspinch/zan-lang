@@ -25,12 +25,10 @@ file(MAKE_DIRECTORY ${WORK})
 # picker exactly -- LoadDiskTemplates (src/ide_zan/src/shell) scans
 # <category>/<template>/template.manifest, two levels, nothing deeper -- so a
 # two-level glob here keeps this gate as strong as the picker, and no
-# stronger: a nested spec directory that carries a zan.proj but no sources
-# (gui/gui-free/NewWeb -- its README is the design for a future template,
-# the entry it names was never materialized) cannot be scaffolded by the
-# picker, so compiling it here would only gate on something no user can
-# reach.  A future materialized NewWeb enters the gate automatically by
-# being promoted to a real two-level template directory.
+# stronger: a nested directory that carries a zan.proj but no template
+# manifest cannot be scaffolded by the picker, so compiling it here would
+# only gate on something no user can reach.  A future template promoted into
+# a real two-level directory enters the gate automatically.
 file(GLOB _projs ${TEMPLATES}/*/*/zan.proj)
 list(SORT _projs)
 if(_projs STREQUAL "")

@@ -1,3 +1,10 @@
+> **Status:** 设计稿 + 框架现状说明 —— 文中"NewWeb 模板骨架"（模板本身：
+> config/控制器/视图的落地目录）**未实现**；所描述的 Web MVC 框架能力
+> （路由属性、声明式 CRUD、Worker/控制端口、ServerMetrics 等）以 Zan.Mvc
+> 包与标准库的当前实现为准。原文件自 templates/gui/gui-free/NewWeb/README.md
+> 迁入（2026-10-06）：该占位目录没有源码，却会被脚手架原样复制进每个
+> gui-free 新项目，故移出 templates/。
+
 # NewWeb — ZanWeb Web MVC Framework
 
 Enterprise web application skeleton modeled on a production swoole (ZxPHP)
