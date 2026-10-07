@@ -1,0 +1,388 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Gui.Component;
+
+class Program {
+    static void Assert(bool condition, string message) {
+        if (!condition) { Console.WriteLine("FAIL: " + message); Environment.Exit(1); }
+    }
+
+    static void TestSemanticMemos() {
+        CodeEditor signature = new CodeEditor();
+        signature.documentPath = "signature.zan";
+        signature.LoadText("foo("); signature.curCol = 4;
+        int signatureCalls = 0;
+        signature.externalSignature = (string path, int line, int col, string name) => {
+            signatureCalls = signatureCalls + 1;
+            return signature.GetText() + ":" + Convert.ToString(col);
+        };
+        Assert(signature.SigHelpFor("foo") == "foo(:4", "signature response");
+        Assert(signature.SigHelpFor("foo") == "foo(:4" && signatureCalls == 1, "idle signature cache");
+        signature.lines[0] = "foo(1"; signature.curCol = 5; signature.BumpTextVersion();
+        Assert(signature.SigHelpFor("foo") == "foo(1:5" && signatureCalls == 2, "same-line signature refresh");
+        signature.curCol = 4;
+        Assert(signature.SigHelpFor("foo") == "foo(1:4" && signatureCalls == 3, "signature caret refresh");
+        signature.externalSignature = (string path, int line, int col, string name) => {
+            signature.LoadText("other("); return "poison signature";
+        };
+        signature.curCol = 5;
+        Assert(signature.SigHelpFor("foo") == "" && signature.signatureLspMemo == null, "stale signature rejected");
+        signature.externalSignature = (string path, int line, int col, string name) => {
+            signature.documentPath = "other.zan"; return "poison signature";
+        };
+        Assert(signature.SigHelpFor("other") == "", "signature file switch rejected");
+
+        CodeEditor hover = new CodeEditor(); hover.documentPath = "hover.zan";
+        hover.LoadText("foo bar"); hover.curCol = 7;
+        int hoverCalls = 0;
+        hover.externalHover = (string path, int line, int col, string name) => {
+            hoverCalls = hoverCalls + 1;
+            return name == "foo" ? path + ":" + Convert.ToString(col) : "";
+        };
+        Assert(hover.LspHoverFor("foo", 0, 1) == "hover.zan:1", "hover uses mouse column");
+        Assert(hover.LspHoverFor("foo", 0, 1) == "hover.zan:1" && hoverCalls == 1, "idle hover cache");
+        hover.documentPath = "second.zan";
+        Assert(hover.LspHoverFor("foo", 0, 1) == "second.zan:1" && hoverCalls == 2, "hover path cache key");
+        Assert(hover.LspHoverFor("bar", 0, 5) == "", "empty hover");
+        Assert(hover.LspHoverFor("bar", 0, 5) == "" && hoverCalls == 3, "empty hover cached");
+        hover.externalHover = (string path, int line, int col, string name) => {
+            hover.LoadText("new buffer"); return "poison hover";
+        };
+        Assert(hover.LspHoverFor("foo", 0, 1) == "" && hover.hoverLspMemo == null, "stale hover rejected");
+        hover.externalHover = (string path, int line, int col, string name) => {
+            hover.documentPath = "third.zan"; return "poison hover";
+        };
+        Assert(hover.LspHoverFor("foo", 0, 1) == "", "hover file switch rejected");
+    }
+
+    static void TestCompletionGuards() {
+        CodeEditor e = new CodeEditor(); e.documentPath = "guard.zan";
+        e.LoadText("fo"); e.curCol = 2;
+        e.externalCompletion = (string path, int line, int col) => {
+            e.documentPath = "second.zan";
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            items.Add(new CodeCompletionItem("foo", "M", "", "")); return items;
+        };
+        e.UpdateCompletion();
+        Assert(!e.acActive && e.GetText() == "fo", "completion file switch rejected");
+        e.externalCompletion = (string path, int line, int col) => {
+            e.curCol = 1;
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            items.Add(new CodeCompletionItem("foo", "M", "", "")); return items;
+        };
+        e.curCol = 2; e.UpdateCompletion();
+        Assert(!e.acActive, "completion caret move rejected");
+
+        e.externalCompletion = (string path, int line, int col) => {
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            CodeCompletionItem item = new CodeCompletionItem("foo", "M", "", "");
+            item.hasTextEdit = true; item.insertText = "foo";
+            item.startLine = 0; item.endLine = 0; item.startCol = 1; item.endCol = 5;
+            items.Add(item); return items;
+        };
+        e.LoadText("中fo"); e.curCol = 5; e.UpdateCompletion();
+        int version = e.TextStamp();
+        e.AcceptCompletion(true);
+        Assert(e.GetText() == "中fo" && e.TextStamp() == version && e.undoStack.Count == 0,
+            "textEdit cannot split UTF-8");
+        e.LoadText("foTAIL"); e.curCol = 2;
+        e.externalCompletion = (string path, int line, int col) => {
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            CodeCompletionItem item = new CodeCompletionItem("foo", "M", "", "");
+            item.hasTextEdit = true; item.insertText = "foo";
+            item.startLine = 0; item.endLine = 0; item.startCol = 3; item.endCol = 6;
+            items.Add(item); return items;
+        };
+        e.UpdateCompletion(); e.AcceptCompletion(true);
+        Assert(e.GetText() == "foTAIL" && e.undoStack.Count == 0, "textEdit must contain caret");
+
+        e.LoadText("fo;"); e.curCol = 2;
+        e.externalCompletion = (string path, int line, int col) => {
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            CodeCompletionItem item = new CodeCompletionItem("foo", "M", "", "");
+            item.hasTextEdit = true; item.insertText = "";
+            item.startLine = 0; item.endLine = 0; item.startCol = 0; item.endCol = 2;
+            items.Add(item); return items;
+        };
+        e.UpdateCompletion(); e.AcceptCompletion(true);
+        Assert(e.GetText() == ";" && e.curCol == 0, "empty textEdit deletes prefix");
+        e.Undo(); Assert(e.GetText() == "fo;", "empty textEdit undo");
+
+        e.LoadText("Fo"); e.curCol = 2;
+        e.externalCompletion = (string path, int line, int col) => {
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            CodeCompletionItem field = new CodeCompletionItem("FooField", "F", "", "");
+            field.insertText = "field"; items.Add(field);
+            CodeCompletionItem prop = new CodeCompletionItem("FooProp", "P", "", "");
+            prop.insertText = "property"; items.Add(prop); return items;
+        };
+        e.UpdateCompletion(); e.acFilter = "P"; e.ApplyKindFilter(); e.AcceptCompletion(true);
+        Assert(e.GetText() == "property", "kind filter retains semantic item");
+        e.LoadText("Fo"); e.curCol = 2; e.UpdateCompletion();
+        e.documentPath = "third.zan"; e.ApplyKindFilter();
+        Assert(!e.acActive, "kind filter cannot revive stale completion");
+    }
+
+    static App guiApp;
+    static CodeEditor guiEditor;
+    static Rect guiArea;
+
+    static void GuiBody() {
+        guiEditor.Render(guiApp, guiArea);
+    }
+
+    static void GuiFrame() {
+        Assert(guiApp.FrameGuarded(Program.GuiBody), "GUI frame guard");
+    }
+
+    static void GuiEvent(int kind, int x, int y, int code, int mods) {
+        guiApp.window.InjectEvent(kind, x, y, 0, code, mods);
+        guiApp.SetPollEventMode();
+        Assert(guiApp.PumpGuarded(), "GUI event pump");
+        Assert(guiApp.EventKind() == kind, "injected event dispatched");
+        GuiFrame();
+    }
+
+    // 只推进标准测试时钟，保留渲染登记的 deadline；不注入第二次 move。
+    static void GuiIdleAt(int now) {
+        Window.FreezeTick(now);
+        guiApp.nowMs = now;
+        guiApp.SetPollEventMode();
+        Assert(guiApp.PumpGuarded(), "GUI idle pump");
+    }
+
+    static void TestGuiSemanticEvents() {
+        guiApp = new App("codeeditor-lsp", 500, 300);
+        guiApp.SetBackdropFx(false);
+        guiApp.FreezeAnimClock(10000);
+        guiApp.Show();
+        guiArea = new Rect(0, 0, 480, 260);
+        guiEditor = new CodeEditor();
+        guiEditor.documentPath = "event.zan";
+        guiEditor.LoadText("obj"); guiEditor.curCol = 3;
+        bool ready = false;
+        guiEditor.externalCompletion = (string path, int line, int col) => {
+            if (!ready) { return null; }
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            items.Add(new CodeCompletionItem("WriteLine", "M", "", ""));
+            return items;
+        };
+        GuiEvent(1, 400, 220, 0, 0);
+        guiApp.focus.SetFocused(guiEditor.LastWidgetId());
+
+        GuiEvent(6, 400, 220, 46, 0);
+        int dotToken = guiEditor.SemanticCompletionToken();
+        Assert(dotToken >= 0 && guiEditor.GetText() == "obj.", "dot creates pending intent");
+        GuiEvent(5, 400, 220, 190, 0);
+        Assert(guiEditor.SemanticCompletionToken() == dotToken, "dot keyup preserves intent");
+        ready = true;
+        Assert(guiEditor.RefreshSemanticResult("textDocument/completion", "event.zan",
+            guiEditor.TextStamp(), 0, 4, "", dotToken), "dot result after keyup accepted");
+        Assert(guiEditor.acActive && guiEditor.acItems[0] == "WriteLine", "dot popup after keyup");
+
+        guiEditor.LoadText(""); ready = false;
+        GuiEvent(6, 400, 220, 0, Modifiers.Ctrl());
+        int forcedToken = guiEditor.SemanticCompletionToken();
+        Assert(forcedToken >= 0, "Ctrl+Space creates pending intent without prefix");
+        GuiEvent(5, 400, 220, 32, Modifiers.Ctrl());
+        GuiEvent(5, 400, 220, 17, 0);
+        Assert(guiEditor.SemanticCompletionToken() == forcedToken, "Space/Ctrl keyup preserves intent");
+        ready = true;
+        Assert(guiEditor.RefreshSemanticResult("textDocument/completion", "event.zan",
+            guiEditor.TextStamp(), 0, 0, "", forcedToken), "forced result after keyup accepted");
+        Assert(guiEditor.acActive, "forced popup after keyup");
+
+        guiEditor.LoadText("obj."); guiEditor.curCol = 4; ready = false;
+        GuiEvent(6, 400, 220, 0, Modifiers.Ctrl());
+        GuiEvent(4, 400, 220, 37, 0);
+        Assert(guiEditor.SemanticCompletionToken() < 0, "navigation cancels pending intent");
+        GuiEvent(6, 400, 220, 0, Modifiers.Ctrl());
+        GuiEvent(2, 400, 220, 0, 0);
+        Assert(guiEditor.SemanticCompletionToken() < 0, "mouse press cancels pending intent");
+        GuiEvent(3, 400, 220, 0, 0);
+        guiApp.focus.SetFocused(guiEditor.LastWidgetId());
+        GuiEvent(6, 400, 220, 0, Modifiers.Ctrl());
+        guiApp.focus.SetFocused(-1);
+        GuiEvent(5, 400, 220, 32, 0);
+        Assert(guiEditor.SemanticCompletionToken() < 0, "blur cancels pending intent");
+
+        guiEditor.externalCompletion = null;
+        guiEditor.documentPath = "idle.zan";
+        string hoverText = "foo bar";
+        for (int i = 0; i < 30; i = i + 1) { hoverText = hoverText + "\nfoo bar"; }
+        guiEditor.LoadText(hoverText);
+        int hoverCalls = 0;
+        string hoveredWord = "";
+        guiEditor.externalHover = (string path, int line, int col, string name) => {
+            hoverCalls = hoverCalls + 1; hoveredWord = name; return "hover " + name;
+        };
+        Window.FreezeTick(20000); guiApp.nowMs = 20000;
+        int fontSize = guiEditor.FontSize(guiApp.theme);
+        int textX = guiApp.Scale(48) + guiApp.theme.paddingSmall;
+        int fooX = textX + Canvas.MeasureText("f", fontSize) / 2;
+        int fooY = Canvas.FontHeight(fontSize) / 2;
+        GuiEvent(1, fooX, fooY, 0, 0);
+        Assert(hoverCalls == 0 && guiApp.wakeFrameNextMs == 20450, "hover reserves idle deadline");
+        GuiIdleAt(20100);
+        Assert(!guiApp.needsRedraw && hoverCalls == 0, "hover waits without input");
+        GuiFrame();
+        Assert(guiApp.wakeFrameNextMs == 20450, "intermediate frame re-arms remaining delay");
+        GuiIdleAt(20449);
+        Assert(!guiApp.needsRedraw && hoverCalls == 0, "hover not before deadline");
+        GuiIdleAt(20450);
+        Assert(guiApp.needsRedraw, "idle deadline wakes page frame");
+        GuiFrame();
+        Assert(hoverCalls == 1 && hoveredWord == "foo", "idle hover starts without another move");
+        Assert(guiApp.wakeFrameNextMs < 0, "expired hover does not perpetually schedule");
+
+        Window.FreezeTick(21000); guiApp.nowMs = 21000;
+        int barX = textX + Canvas.MeasureText("foo b", fontSize);
+        GuiEvent(1, barX, fooY, 0, 0);
+        Assert(guiApp.wakeFrameNextMs == 21450, "moved identifier gets new deadline");
+        guiEditor.documentPath = "changed.zan";
+        guiEditor.LoadText(hoverText.Replace("bar", "baz"));
+        GuiIdleAt(21450); GuiFrame();
+        Assert(hoverCalls == 1 && guiApp.wakeFrameNextMs == 21900,
+            "document change at deadline restarts dwell");
+        GuiIdleAt(21900); GuiFrame();
+        Assert(hoverCalls == 2 && hoveredWord == "baz", "deadline re-hits changed document");
+
+        Window.FreezeTick(22000); guiApp.nowMs = 22000;
+        GuiEvent(1, fooX, fooY, 0, 0);
+        guiEditor.SetScrollY(1);
+        GuiIdleAt(22450); GuiFrame();
+        Assert(hoverCalls == 2 && guiApp.wakeFrameNextMs == 22900,
+            "viewport change at deadline restarts dwell");
+        // 跳出文本、装订线、行尾空白都不得预约无效位置的下一帧。
+        GuiEvent(1, 490, 280, 0, 0);
+        Assert(guiApp.wakeFrameNextMs < 0 && hoverCalls == 2, "leave editor cancels hover wake");
+        GuiEvent(1, 20, fooY, 0, 0);
+        Assert(guiApp.wakeFrameNextMs < 0, "gutter has no hover wake");
+        GuiEvent(1, 400, fooY, 0, 0);
+        Assert(guiApp.wakeFrameNextMs < 0, "trailing whitespace has no hover wake");
+        guiApp.UnfreezeAnimClock();
+        guiApp.window.Destroy();
+    }
+
+    static void Main() {
+        string unicode = "a中𐐀z";
+        Assert(CodeEditor.ByteColumnToUtf16(unicode, 8) == 4, "UTF-8 to UTF-16");
+        Assert(CodeEditor.Utf16ColumnToByte(unicode, 4) == 8, "UTF-16 to UTF-8");
+        Assert(CodeEditor.Utf16ColumnToByte(unicode, 3) == 4, "surrogate boundary");
+        Assert(CodeEditor.ByteColumnToUtf16(unicode, 2) == 1, "partial BMP byte boundary");
+        Assert(CodeEditor.ByteColumnToUtf16(unicode, 7) == 2, "partial supplementary byte boundary");
+        Assert(CodeEditor.ByteColumnToUtf16(unicode, -1) == 0, "negative byte column");
+        Assert(CodeEditor.Utf16ColumnToByte(unicode, -1) == 0, "negative UTF-16 column");
+        Assert(CodeEditor.ByteColumnToUtf16(unicode, 100) == 5, "byte column clamps to end");
+        Assert(CodeEditor.Utf16ColumnToByte(unicode, 100) == unicode.Length, "UTF-16 column clamps to end");
+        Assert(CodeEditor.Utf16ColumnToByte(unicode, CodeEditor.ByteColumnToUtf16(unicode, 4)) == 4,
+            "BMP boundary round trip");
+        Assert(CodeEditor.Utf16ColumnToByte(unicode, CodeEditor.ByteColumnToUtf16(unicode, 8)) == 8,
+            "supplementary boundary round trip");
+
+        CodeEditor e = new CodeEditor();
+        e.documentPath = "buffer.zan";
+        e.LoadText("obj.");
+        e.curCol = 4;
+        int calls = 0;
+        e.externalCompletion = (string path, int line, int col) => {
+            calls = calls + 1;
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            CodeCompletionItem item = new CodeCompletionItem("WriteLine", "M", "signature", "docs");
+            item.hasTextEdit = true;
+            item.insertText = "WriteLine()";
+            item.startLine = 0; item.startCol = 4;
+            item.endLine = 0; item.endCol = e.LineAt(0).Length - 1;
+            items.Add(item);
+            return items;
+        };
+        e.DotCompletion();
+        e.lines[0] = "obj.WrTail;";
+        e.curCol = 6;
+        e.UpdateCompletion();
+        Assert(calls == 2, "dot completion refreshes semantic range");
+        Assert(e.acItems[0] == "WriteLine", "semantic candidate");
+        int version = e.TextStamp();
+        e.AcceptCompletion(true);
+        Assert(e.GetText() == "obj.WriteLine();", "Tab applies textEdit, replaces suffix");
+        Assert(e.curCol == 15 && e.TextStamp() > version, "caret and version");
+        Assert(e.undoStack.Count == 1, "one undo snapshot");
+        e.Undo();
+        Assert(e.GetText() == "obj.WrTail;" && e.curCol == 6, "undo restores buffer and caret");
+        e.Redo();
+        Assert(e.GetText() == "obj.WriteLine();", "redo completion");
+
+        CodeEditor insert = new CodeEditor();
+        insert.documentPath = "insert.zan";
+        insert.LoadText("pr;"); insert.curCol = 2;
+        insert.externalCompletion = (string path, int line, int col) => {
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            CodeCompletionItem item = new CodeCompletionItem("print", "M", "", "");
+            item.insertText = "print()";
+            items.Add(item); return items;
+        };
+        insert.UpdateCompletion(); insert.AcceptCompletion(false);
+        Assert(insert.GetText() == "print();", "Enter applies insertText");
+
+        CodeEditor block = new CodeEditor();
+        block.documentPath = "block.zan";
+        block.LoadText("foTAIL\nEND!"); block.curCol = 2;
+        block.externalCompletion = (string path, int line, int col) => {
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            CodeCompletionItem item = new CodeCompletionItem("foo", "M", "", "");
+            item.hasTextEdit = true; item.insertText = "foo\nbar";
+            item.startLine = 0; item.startCol = 0; item.endLine = 1; item.endCol = 3;
+            items.Add(item); return items;
+        };
+        block.UpdateCompletion(); block.AcceptCompletion(true);
+        Assert(block.GetText() == "foo\nbar!" && block.curLine == 1 && block.curCol == 3, "multiline textEdit");
+        block.Undo(); Assert(block.GetText() == "foTAIL\nEND!", "multiline undo");
+
+        insert.LoadText("pr"); insert.curCol = 2; insert.UpdateCompletion();
+        insert.lines[0] = "changed";
+        insert.AcceptCompletion(true);
+        Assert(insert.GetText() == "changed" && !insert.acActive, "stale acceptance rejected");
+        insert.LoadText("pr"); insert.curCol = 2;
+        insert.externalCompletion = (string path, int line, int col) => {
+            insert.LoadText("new file");
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            items.Add(new CodeCompletionItem("print", "M", "", "")); return items;
+        };
+        insert.UpdateCompletion();
+        Assert(!insert.acActive && insert.GetText() == "new file", "stale provider response rejected");
+
+        CodeEditor forced = new CodeEditor(); forced.documentPath = "empty.zan";
+        bool requested = false;
+        forced.externalCompletion = (string path, int line, int col) => {
+            requested = true; return new List<CodeCompletionItem>();
+        };
+        forced.ForceCompletion(); Assert(requested, "Ctrl+Space without prefix calls provider");
+        forced.LoadText("obj.Wr;"); forced.curCol = 6;
+        forced.externalCompletion = (string path, int line, int col) => {
+            Assert(path == "empty.zan" && line == 0 && col == 6, "member trigger position");
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            CodeCompletionItem item = new CodeCompletionItem("WriteLine", "M", "", "");
+            item.insertText = "WriteLine()"; items.Add(item); return items;
+        };
+        forced.ForceCompletion();
+        Assert(forced.acDot && forced.acStart == 4, "Ctrl+Space keeps member context");
+        forced.AcceptCompletion(true);
+        Assert(forced.GetText() == "obj.WriteLine();", "forced member Tab acceptance");
+        forced.LoadText("using System.Te"); forced.curCol = forced.LineAt(0).Length;
+        requested = false;
+        forced.externalCompletion = (string path, int line, int col) => {
+            requested = true;
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            items.Add(new CodeCompletionItem("Text", "M", "", "")); return items;
+        };
+        forced.ForceCompletion();
+        Assert(requested && forced.acDot && forced.acStart == 13, "namespace trigger reaches provider");
+        forced.AcceptCompletion(true);
+        Assert(forced.GetText() == "using System.Text", "namespace prefix replacement");
+        TestCompletionGuards();
+        TestSemanticMemos();
+        TestGuiSemanticEvents();
+        Console.WriteLine("PASS codeeditor LSP completion");
+    }
+}
