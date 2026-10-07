@@ -23,6 +23,9 @@ class CodeSpan {
 /// 和主渲染路径（装订线、文本、光标、弹窗、缩略图）。
 partial class CodeEditor {
     static List<string> s_lineNumPool;
+    string hoverDwellPath;
+    int hoverDwellStamp;
+    int hoverDwellScrollY;
     static string GetLineNumStr(int line1) {
         if (s_lineNumPool == null) {
             s_lineNumPool = new List<string>();
@@ -448,6 +451,9 @@ partial class CodeEditor {
         int id = app.focus.AllocId();
         lastId = id;
         bool focused = app.focus.IsFocused(id);
+        if (!focused || app.EventKind() == 2 || app.EventKind() == 3) {
+            CancelSemanticCompletion();
+        }
         // 获得焦点时占用 Tab，防止 App 移走键盘焦点；
         // 编辑器改用 Tab/Shift+Tab 缩进。
         if (focused) { app.tabHoldId = id; }
@@ -638,8 +644,12 @@ partial class CodeEditor {
                     textStyle.FgOr(0));
         // 本帧预算不足未完成的计数：在视口稳定后（滚动或编辑静默期结束）才继续请求下一帧，
         // 确保滚动时完全零多余重绘，帧率极致稳定。
-        if (LensPending() && app.nowMs - lastScrollMs >= 200 && app.nowMs - lensQuietMs >= 250) {
-            app.RequestRedraw();
+        if (LensPending() && app.nowMs - lastScrollMs >= 200) {
+            if (app.nowMs - lensQuietMs >= 250) {
+                app.RequestRedraw();
+            } else {
+                app.RequestWakeFrameIn(250 - (app.nowMs - lensQuietMs));
+            }
         }
 
         // ---- 右侧诊断 / 滚动条（VS 风格概览标尺） ----
@@ -833,6 +843,15 @@ partial class CodeEditor {
             app.RequestRedraw();
         }
 
+        // 文档或视口变化后，同一屏幕坐标也必须重新等待静止期。
+        if (hoverDwellPath != documentPath || hoverDwellStamp != TextStamp()
+            || hoverDwellScrollY != scrollY) {
+            hoverDwellPath = documentPath;
+            hoverDwellStamp = TextStamp();
+            hoverDwellScrollY = scrollY;
+            lastHoverMoveMs = app.nowMs;
+        }
+
         // ---- 悬停：指针静止防抖后才触发重绘以展示符号提示，避免高速滑过引发整窗无效重绘 ----
         if (app.EventKind() == 1 && !mouseSelecting && !acActive && ptrFree) {
             if (app.mouseX >= area.x && app.mouseX < area.x + area.width
@@ -1024,15 +1043,36 @@ partial class CodeEditor {
         }
 
         // ---- 符号悬停提示（方法/属性签名 + 文档）：滚动中严格抑制，需滚动与鼠标均彻底静止 450ms 后才解析显示 ----
-        if (!acActive && !ctxOpen && execLine < 0 && ptrFree && !isScrolling
+        if (!acActive && !ctxOpen && !refPopOpen && !mouseSelecting
+            && execLine < 0 && ptrFree && !isScrolling
             && (app.nowMs - lastHoverMoveMs >= 450)) {
             string hw = WordAtMouse(app, area, gutterW, fontSize);
             if (hw.Length > 0) {
-                string hsig = SigHelpForHover(hw);
-                string hdoc = CodeEditor.DescDoc(hw);
-                if (hdoc.Length == 0) { hdoc = CodeEditor.DescKeyword(hw); }
-                if (hsig.Length == 0 && hdoc.Length > 0) { hsig = hw; }
-                if (hsig.Length > 0) {
+                string hsig = "";
+                string hdoc = "";
+                int hln = LineAtY(lineH, app.mouseY);
+                int hcol = 0;
+                if (hln >= 0 && hln < lines.Count) {
+                    hcol = CodeEditor.ColFromX(lines[hln], app.mouseX - textX, fontSize);
+                }
+                string hoverPath = documentPath;
+                int hoverVersion = TextStamp();
+                int hoverX = app.mouseX;
+                int hoverY = app.mouseY;
+                int hoverScrollY = scrollY;
+                int hoverTargetScrollY = targetScrollY;
+                if (hln >= 0 && hln < lines.Count) { hsig = LspHoverFor(hw, hln, hcol); }
+                bool hoverCurrent = documentPath == hoverPath && TextStamp() == hoverVersion
+                    && app.mouseX == hoverX && app.mouseY == hoverY
+                    && scrollY == hoverScrollY && targetScrollY == hoverTargetScrollY
+                    && !barDragging && !mouseSelecting && !app.PointerCaptured();
+                if (hoverCurrent && hsig.Length == 0) {
+                    hsig = SigHelpForHover(hw);
+                    hdoc = CodeEditor.DescDoc(hw);
+                    if (hdoc.Length == 0) { hdoc = CodeEditor.DescKeyword(hw); }
+                    if (hsig.Length == 0 && hdoc.Length > 0) { hsig = hw; }
+                }
+                if (hoverCurrent && hsig.Length > 0) {
                     int hpad = app.Scale(8);
                     int hfh = Canvas.FontHeight(fontSize);
                     int sfh = Canvas.FontHeight(Style.FontFallback(app, "small"));
@@ -1130,6 +1170,17 @@ partial class CodeEditor {
             }
         }
 
+        // BeginFrame 会清掉预约；有效标识符只为尚未到期的静止期预约一帧。
+        // 到期帧重新命中当前鼠标/文档/视口，空白处及已到期位置不续约。
+        if (!acActive && !ctxOpen && !refPopOpen && !mouseSelecting
+            && execLine < 0 && !app.PointerCaptured() && !barDragging
+            && scrollY == targetScrollY
+            && WordAtMouse(app, area, gutterW, fontSize).Length > 0) {
+            int hoverWait = 450 - (app.nowMs - lastHoverMoveMs);
+            int scrollWait = 450 - (app.nowMs - lastScrollMs);
+            if (scrollWait > hoverWait) { hoverWait = scrollWait; }
+            if (hoverWait > 0) { app.RequestWakeFrameIn(hoverWait); }
+        }
         return id;
     }
 
@@ -1228,6 +1279,15 @@ partial class CodeEditor {
                     int cxp = textX + Canvas.MeasureText(upto, fontSize);
                     c.FillRect(cxp, rowY + app.Scale(2), 1,
                                lineH - app.Scale(4), caretColor);
+                    // Tab 预测：弹窗选中项在已输入前缀之外的
+                    // 部分，以暗色幽灵文本紧随光标显示。
+                    if (acActive && !selActive) {
+                        string ghost = GhostExtension();
+                        if (ghost.Length > 0) {
+                            c.DrawText(cxp + app.Scale(2), textY, ghost,
+                                       lineNumberColor, fontSize);
+                        }
+                    }
                 }
 
                 // CodeLens：此处声明成员的引用计数，位于
@@ -1484,8 +1544,11 @@ partial class CodeEditor {
                 string dName = acItems[acSel];
                 string dKind = "";
                 if (acSel < acKinds.Count) { dKind = acKinds[acSel]; }
-                string dSig = SigHelpFor(dName);
-                string dDoc = CodeEditor.DescDoc(dName);
+                CodeCompletionItem semantic = acVisibleCandidates[acSel].semantic;
+                string dSig = semantic != null ? semantic.detail : "";
+                string dDoc = semantic != null ? semantic.doc : "";
+                if (dSig.Length == 0) { dSig = SigHelpFor(dName); }
+                if (dDoc.Length == 0) { dDoc = CodeEditor.DescDoc(dName); }
                 if (dDoc.Length == 0) { dDoc = CodeEditor.DescKeyword(dName); }
                 string sigLine = dSig;
                 if (sigLine.Length == 0) { sigLine = dName; }

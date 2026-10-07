@@ -1,6 +1,6 @@
 using System;
 using Gui;
-using Gui.Widget;
+using Gui.Component.CodeEditor;
 
 namespace CodeEditorTest;
 
@@ -15,7 +15,150 @@ class Program {
         return false;
     }
 
+    static void Require(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+
+    static void CheckSemanticCompletion() {
+        CodeEditor e = new CodeEditor();
+        e.documentPath = "completion.zan";
+        e.LoadText("abTail");
+        e.curCol = 2;
+        e.externalCompletion = (string path, int line, int col) => {
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            CodeCompletionItem item = new CodeCompletionItem("abDisplay", "M", "", "");
+            item.insertText = "actual\nnext";
+            item.hasTextEdit = true;
+            item.startLine = 0; item.startCol = 0;
+            item.endLine = 0; item.endCol = 6;
+            items.Add(item);
+            return items;
+        };
+        e.UpdateCompletion();
+        Require(e.CompletionItem(0) == "abDisplay", "semantic candidate order");
+        int before = e.TextStamp();
+        e.AcceptCompletion(true);
+        Require(e.GetText() == "actual\nnext", "Tab uses textEdit newText and suffix range");
+        Require(e.CurLine() == 1 && e.CurCol() == 4 && e.TextStamp() > before, "completion caret and version");
+        e.Undo();
+        Require(e.GetText() == "abTail", "completion is one undo action");
+
+        e.UpdateCompletion();
+        e.BumpTextVersion();
+        e.ApplyKindFilter();
+        Require(!e.acActive, "filter must not renew a stale candidate version");
+        e.AcceptCompletion(true);
+        Require(e.GetText() == "abTail", "stale completion cannot edit text");
+
+        e.externalCompletion = (string path, int line, int col) => {
+            e.BumpTextVersion();
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            items.Add(new CodeCompletionItem("abLate", "M", "", ""));
+            return items;
+        };
+        e.UpdateCompletion();
+        Require(!e.acActive, "provider result is stale after a same-text version change");
+        e.externalCompletion = (string path, int line, int col) => {
+            e.curCol = col + 1;
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            items.Add(new CodeCompletionItem("abMoved", "M", "", ""));
+            return items;
+        };
+        e.UpdateCompletion();
+        Require(!e.acActive && e.GetText() == "abTail", "provider result is stale after caret movement");
+
+        string unicode = "中𠮷ab";
+        Require(CodeEditor.ByteColumnToUtf16(unicode, 7) == 3
+            && CodeEditor.Utf16ColumnToByte(unicode, 3) == 7, "completion UTF-16 positions");
+
+        CodeEditor dot = new CodeEditor();
+        dot.documentPath = "dot.zan";
+        dot.LoadText("obj.");
+        dot.curCol = 4;
+        dot.externalCompletion = (string path, int line, int col) => {
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            CodeCompletionItem item = new CodeCompletionItem("Run", "M", "", "");
+            item.insertText = "Run()";
+            items.Add(item);
+            return items;
+        };
+        dot.DotCompletion();
+        dot.AcceptCompletion(true);
+        Require(dot.GetText() == "obj.Run()", "dot completion retains insertText");
+    }
+
+    static void SelectItem(CodeEditor e, string label) {
+        int i = 0;
+        while (i < e.acItems.Count) {
+            if (e.acItems[i] == label) { e.acSel = i; return; }
+            i = i + 1;
+        }
+        throw new Exception("SelectItem: missing " + label);
+    }
+
+    /// Tab 无弹窗时的词补全，以及弹窗选中项的行内幽灵预测。
+    /// 全部用 Require 断言，不产出新的黄金输出行。
+    static void CheckTabCompletionAndGhost() {
+        CodeEditor tc = new CodeEditor();
+        tc.lines[0] = "    someLongName someLo";
+        tc.curLine = 0;
+        tc.curCol = tc.lines[0].Length;
+        Require(tc.TryCompleteWord(), "Tab completes the word before the caret");
+        Require(tc.lines[0] == "    someLongName someLongName",
+            "word completion inserts the shared extension");
+        Require(tc.curCol == tc.lines[0].Length, "word completion moves the caret");
+        Require(!tc.acActive, "word completion does not open the popup");
+
+        CodeEditor tn = new CodeEditor();
+        tn.lines[0] = "zzqq";
+        tn.curLine = 0;
+        tn.curCol = 4;
+        Require(!tn.TryCompleteWord(), "no candidate falls back");
+        Require(tn.lines[0] == "zzqq", "failed word completion does not edit");
+
+        CodeEditor tm = new CodeEditor();
+        tm.lines[0] = "someLongName";
+        tm.curLine = 0;
+        tm.curCol = 6;
+        Require(!tm.TryCompleteWord(), "caret inside a word does not complete");
+
+        CodeEditor g = new CodeEditor();
+        g.lines[0] = "fro";
+        g.curLine = 0;
+        g.curCol = 3;
+        g.UpdateCompletion();
+        Require(g.acActive, "ghost: popup open");
+        SelectItem(g, "from");
+        Require(g.GhostExtension() == "m", "ghost extends the typed prefix");
+
+        CodeEditor gs = new CodeEditor();
+        gs.lines[0] = "whi";
+        gs.curLine = 0;
+        gs.curCol = 3;
+        gs.UpdateCompletion();
+        Require(gs.acActive, "ghost snippet: popup open");
+        SelectItem(gs, "while");
+        Require(gs.GhostExtension() == "", "snippets have no inline prediction");
+
+        CodeEditor ge = new CodeEditor();
+        ge.documentPath = "ghost.zan";
+        ge.LoadText("ab");
+        ge.curCol = 2;
+        ge.externalCompletion = (string path, int line, int col) => {
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            CodeCompletionItem item = new CodeCompletionItem("abX", "M", "", "");
+            item.insertText = "actual";
+            items.Add(item);
+            return items;
+        };
+        ge.UpdateCompletion();
+        Require(ge.acActive, "ghost semantic: popup open");
+        Require(ge.GhostExtension() == "", "semantic insertText has no inline prediction");
+    }
+
     static void Main() {
+        CheckSemanticCompletion();
+        CheckTabCompletionAndGhost();
         // ---- word completion candidates ----
         CodeEditor e = new CodeEditor();
         e.lines[0] = "    fo";
@@ -102,11 +245,11 @@ class Program {
         Rect area = new Rect(0, 100, 400, 300);
         sc.BuildRowLayout(area, 20, 0);
         Console.WriteLine(sc.ScrollY());
-        Console.WriteLine(sc.rowLine[0]);
-        Console.WriteLine(sc.rowTop[0]);
+        Console.WriteLine(sc.visibleRows[0].line);
+        Console.WriteLine(sc.visibleRows[0].top);
         sc.SetScrollY(205);
         sc.BuildRowLayout(area, 20, 0);
-        Console.WriteLine(sc.rowLine[0]);
-        Console.WriteLine(sc.rowTop[0]);
+        Console.WriteLine(sc.visibleRows[0].line);
+        Console.WriteLine(sc.visibleRows[0].top);
     }
 }

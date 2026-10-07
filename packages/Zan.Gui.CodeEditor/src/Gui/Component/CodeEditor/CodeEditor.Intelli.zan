@@ -95,10 +95,30 @@ partial class CodeEditor {
         return "";
     }
 
+    string LspHoverFor(string name, int line, int col) {
+        if (externalHover == null || documentPath.Length == 0) { return ""; }
+        string path = documentPath;
+        int stamp = TextStamp();
+        int caretLine = curLine;
+        int caretCol = curCol;
+        if (hoverLspMemo != null && hoverLspMemo.Matches(path, stamp, line, col, name)) {
+            return hoverLspMemo.text;
+        }
+        string source = GetText();
+        string text = externalHover(path, line, col, name);
+        if (documentPath != path || TextStamp() != stamp || GetText() != source
+            || curLine != caretLine || curCol != caretCol) { return ""; }
+        CeSemanticTextMemo memo = new CeSemanticTextMemo();
+        memo.path = path; memo.version = stamp;
+        memo.line = line; memo.col = col; memo.name = name; memo.text = text;
+        hoverLspMemo = memo;
+        return text;
+    }
+
     /// 鼠标悬停时的符号签名查询：优先查内置标准库与项目源码声明，
     /// 绝不触发光标位置的 LSP 同步调用，避免光标与鼠标分离时的错误请求与主线程卡顿。
     string SigHelpForHover(string name) {
-        int stamp = lines.Count;
+        int stamp = TextStamp();
         if (sigMemoName == name && sigMemoStamp == stamp) { return sigMemoText; }
         string sig = CodeEditor.DescSig(name);
         if (sig.Length == 0) { sig = RealSigFor(name); }
@@ -115,18 +135,31 @@ partial class CodeEditor {
     /// 改变提示所描述的声明。缓冲区被替换（见 LoadText）
     /// 或行数变化时丢弃记忆，
     /// 这对签名而言已足够精细。
+    /// 文本版本变更也使本地缓存失效，防止同一行声明修改后仍显示旧签名。
+    /// 语义提供者还依赖光标位置，独立缓存避免复用旧实参上下文。
     string SigHelpFor(string name) {
-        int stamp = lines.Count;
-        if (sigMemoName == name && sigMemoStamp == stamp) { return sigMemoText; }
+        int stamp = TextStamp();
         if (externalSignature != null && documentPath.Length > 0) {
-            string lspSig = externalSignature(documentPath, curLine, curCol, name);
-            if (lspSig.Length > 0) {
-                sigMemoName = name;
-                sigMemoStamp = stamp;
-                sigMemoText = lspSig;
-                return lspSig;
+            string path = documentPath;
+            int line = curLine;
+            int col = curCol;
+            string lspSig = "";
+            if (signatureLspMemo != null && signatureLspMemo.Matches(path, stamp, line, col, name)) {
+                lspSig = signatureLspMemo.text;
+            } else {
+                string source = GetText();
+                lspSig = externalSignature(path, line, col, name);
+                // 提供者可能泵事件，旧调用的结果不能污染新文档的缓存。
+                if (documentPath != path || TextStamp() != stamp || GetText() != source
+                    || curLine != line || curCol != col) { return ""; }
+                CeSemanticTextMemo memo = new CeSemanticTextMemo();
+                memo.path = path; memo.version = stamp;
+                memo.line = line; memo.col = col; memo.name = name; memo.text = lspSig;
+                signatureLspMemo = memo;
             }
+            if (lspSig.Length > 0) { return lspSig; }
         }
+        if (sigMemoName == name && sigMemoStamp == stamp) { return sigMemoText; }
         string sig = RealSigFor(name);
         if (sig.Length == 0) { sig = CodeEditor.DescSig(name); }
         sigMemoName = name;
@@ -229,45 +262,72 @@ partial class CodeEditor {
         if (name == "ReadLine") { return "string ReadLine()"; }
         if (name == "Write") { return "void Write(object value)"; }
         if (name == "Add") { return "void Add(T item)"; }
-        if (name == "Remove") { return "bool Remove(T item)"; }
+        if (name == "Remove") { return "void Remove(K key)"; }
         if (name == "RemoveAt") { return "void RemoveAt(int index)"; }
         if (name == "Insert") { return "void Insert(int index, T item)"; }
-        if (name == "Count") { return "int Count { get; }"; }
-        if (name == "Length") { return "int Length { get; }"; }
+        if (name == "Count") { return "int Count"; }
+        if (name == "Length") { return "int Length"; }
         if (name == "Clear") { return "void Clear()"; }
         if (name == "Contains") { return "bool Contains(T item)"; }
         if (name == "IndexOf") { return "int IndexOf(T item)"; }
+        if (name == "LastIndexOf") { return "int LastIndexOf(T item)"; }
+        if (name == "Reverse") { return "void Reverse()"; }
+        if (name == "ToArray") { return "T[] ToArray()"; }
         if (name == "Substring") { return "string Substring(int start, int len)"; }
-        if (name == "Replace") { return "string Replace(string old, string new)"; }
-        if (name == "Split") { return "string[] Split(string separator)"; }
-        if (name == "Join") { return "string Join(string sep, IEnumerable values)"; }
+        if (name == "Replace") { return "string Replace(string from, string to)"; }
+        if (name == "Split") { return "List<string> Split(string separator)"; }
+        if (name == "Join") { return "string Join(string separator, List<string> values)"; }
         if (name == "Trim") { return "string Trim()"; }
         if (name == "ToUpper") { return "string ToUpper()"; }
         if (name == "ToLower") { return "string ToLower()"; }
-        if (name == "StartsWith") { return "bool StartsWith(string value)"; }
-        if (name == "EndsWith") { return "bool EndsWith(string value)"; }
+        if (name == "StartsWith") { return "bool StartsWith(string prefix)"; }
+        if (name == "EndsWith") { return "bool EndsWith(string suffix)"; }
         if (name == "ToString") { return "string ToString()"; }
-        if (name == "Parse") { return "T Parse(string s)"; }
-        if (name == "TryParse") { return "bool TryParse(string s, out T result)"; }
-        if (name == "Where") { return "IEnumerable<T> Where(Func<T,bool> predicate)"; }
-        if (name == "Select") { return "IEnumerable<R> Select(Func<T,R> selector)"; }
-        if (name == "OrderBy") { return "IEnumerable<T> OrderBy(Func<T,K> key)"; }
-        if (name == "First") { return "T First()"; }
-        if (name == "Last") { return "T Last()"; }
-        if (name == "Any") { return "bool Any(Func<T,bool> predicate)"; }
-        if (name == "All") { return "bool All(Func<T,bool> predicate)"; }
-        if (name == "Sum") { return "N Sum()"; }
-        if (name == "Max") { return "T Max()"; }
-        if (name == "Min") { return "T Min()"; }
+        if (name == "Equals") { return "bool Equals(object other)"; }
+        if (name == "Max") { return "double Max(double a, double b)"; }
+        if (name == "Min") { return "double Min(double a, double b)"; }
         if (name == "Abs") { return "double Abs(double value)"; }
+        if (name == "Pow") { return "double Pow(double x, double y)"; }
         if (name == "Sqrt") { return "double Sqrt(double value)"; }
+        if (name == "Round") { return "double Round(double value)"; }
+        if (name == "Floor") { return "double Floor(double value)"; }
+        if (name == "Ceiling") { return "double Ceiling(double value)"; }
+        if (name == "Sin") { return "double Sin(double value)"; }
+        if (name == "Cos") { return "double Cos(double value)"; }
+        if (name == "Tan") { return "double Tan(double value)"; }
+        if (name == "Atan2") { return "double Atan2(double y, double x)"; }
+        if (name == "Atan") { return "double Atan(double value)"; }
+        if (name == "Asin") { return "double Asin(double value)"; }
+        if (name == "Acos") { return "double Acos(double value)"; }
+        if (name == "Exists") { return "bool Exists(string path)"; }
         if (name == "ReadAllText") { return "string ReadAllText(string path)"; }
         if (name == "WriteAllText") { return "void WriteAllText(string path, string text)"; }
-        if (name == "Format") { return "string Format(string fmt, params object[] args)"; }
+        if (name == "AppendAllText") { return "void AppendAllText(string path, string text)"; }
+        if (name == "Delete") { return "void Delete(string path)"; }
+        if (name == "Copy") { return "void Copy(string from, string to)"; }
+        if (name == "Move") { return "void Move(string from, string to)"; }
+        if (name == "GetSize") { return "long GetSize(string path)"; }
+        if (name == "CreateDirectory") { return "void CreateDirectory(string path)"; }
+        if (name == "ListNames") { return "string ListNames(string globPattern)"; }
+        if (name == "GetCurrentDirectory") { return "string GetCurrentDirectory()"; }
+        if (name == "SetCurrentDirectory") { return "void SetCurrentDirectory(string path)"; }
+        if (name == "Combine") { return "string Combine(string a, string b)"; }
+        if (name == "GetFileName") { return "string GetFileName(string path)"; }
+        if (name == "GetFileNameWithoutExtension") { return "string GetFileNameWithoutExtension(string path)"; }
+        if (name == "GetDirectoryName") { return "string GetDirectoryName(string path)"; }
+        if (name == "GetExtension") { return "string GetExtension(string path)"; }
+        if (name == "HasExtension") { return "bool HasExtension(string path)"; }
+        if (name == "GetTempPath") { return "string GetTempPath()"; }
+        if (name == "ToInt32") { return "int ToInt32(string text)"; }
+        if (name == "ToInt64") { return "long ToInt64(string text)"; }
+        if (name == "ToDouble") { return "double ToDouble(string text)"; }
+        if (name == "Format") { return "string Format(string format, params object[] args)"; }
+        if (name == "IsNullOrEmpty") { return "bool IsNullOrEmpty(string value)"; }
+        if (name == "CompareOrdinal") { return "int CompareOrdinal(string a, string b)"; }
         if (name == "ContainsKey") { return "bool ContainsKey(K key)"; }
         if (name == "TryGetValue") { return "bool TryGetValue(K key, out V value)"; }
-        if (name == "Append") { return "StringBuilder Append(object value)"; }
-        if (name == "AppendLine") { return "StringBuilder AppendLine(object value)"; }
+        if (name == "Append") { return "void Append(object value)"; }
+        if (name == "AppendLine") { return "void AppendLine(object value)"; }
         return "";
     }
 
@@ -277,7 +337,7 @@ partial class CodeEditor {
         if (name == "ReadLine") { return "Reads the next line of characters from standard input."; }
         if (name == "Write") { return "Writes the value to standard output (no line terminator)."; }
         if (name == "Add") { return "Adds an item to the end of the collection."; }
-        if (name == "Remove") { return "Removes the first occurrence of the item; returns whether it was found."; }
+        if (name == "Remove") { return "Removes the key/item from the collection."; }
         if (name == "RemoveAt") { return "Removes the item at the given zero-based index."; }
         if (name == "Insert") { return "Inserts an item at the given index, shifting later items."; }
         if (name == "Count") { return "Number of elements currently in the collection."; }
@@ -285,9 +345,12 @@ partial class CodeEditor {
         if (name == "Clear") { return "Removes all elements."; }
         if (name == "Contains") { return "Returns whether the item is present."; }
         if (name == "IndexOf") { return "Zero-based index of the first matching item, or -1."; }
+        if (name == "LastIndexOf") { return "Zero-based index of the last matching item, or -1."; }
+        if (name == "Reverse") { return "Reverses the order of elements."; }
+        if (name == "ToArray") { return "Copies elements to a new array."; }
         if (name == "Substring") { return "Returns a portion of the string starting at start."; }
         if (name == "Replace") { return "Returns a copy with all occurrences of old replaced by new."; }
-        if (name == "Split") { return "Splits the string into an array around the separator."; }
+        if (name == "Split") { return "Splits the string into a List<string> around the separator."; }
         if (name == "Join") { return "Concatenates values, inserting the separator between them."; }
         if (name == "Trim") { return "Removes leading and trailing whitespace."; }
         if (name == "ToUpper") { return "Returns an uppercase copy of the string."; }
@@ -295,23 +358,39 @@ partial class CodeEditor {
         if (name == "StartsWith") { return "Returns whether the string begins with the given value."; }
         if (name == "EndsWith") { return "Returns whether the string ends with the given value."; }
         if (name == "ToString") { return "Returns the text representation of this object."; }
-        if (name == "Parse") { return "Converts the string to the target type; throws on failure."; }
-        if (name == "TryParse") { return "Attempts to convert the string; returns success without throwing."; }
-        if (name == "Where") { return "Filters a sequence by a predicate."; }
-        if (name == "Select") { return "Projects each element into a new form."; }
-        if (name == "OrderBy") { return "Sorts elements in ascending order by a key."; }
-        if (name == "First") { return "Returns the first element (throws if empty)."; }
-        if (name == "Last") { return "Returns the last element (throws if empty)."; }
-        if (name == "Any") { return "Returns whether any element satisfies the predicate."; }
-        if (name == "All") { return "Returns whether every element satisfies the predicate."; }
-        if (name == "Sum") { return "Computes the sum of the sequence."; }
         if (name == "Max") { return "Returns the maximum value."; }
         if (name == "Min") { return "Returns the minimum value."; }
         if (name == "Abs") { return "Returns the absolute value."; }
+        if (name == "Pow") { return "Returns base raised to the specified power."; }
         if (name == "Sqrt") { return "Returns the square root."; }
+        if (name == "Round") { return "Rounds a value to the nearest integer."; }
+        if (name == "Floor") { return "Returns the largest integer less than or equal to value."; }
+        if (name == "Ceiling") { return "Returns the smallest integer greater than or equal to value."; }
+        if (name == "Exists") { return "Returns whether the file or directory exists."; }
         if (name == "ReadAllText") { return "Opens a file, reads all text, then closes it."; }
         if (name == "WriteAllText") { return "Creates or overwrites a file with the given text."; }
+        if (name == "AppendAllText") { return "Appends the given text to a file."; }
+        if (name == "Delete") { return "Deletes the specified file or directory."; }
+        if (name == "Copy") { return "Copies a file to a new location."; }
+        if (name == "Move") { return "Moves a file to a new location."; }
+        if (name == "GetSize") { return "Gets the size of the file in bytes."; }
+        if (name == "CreateDirectory") { return "Creates all directories and subdirectories in the specified path."; }
+        if (name == "ListNames") { return "Lists matching file names for a glob pattern."; }
+        if (name == "GetCurrentDirectory") { return "Gets the current working directory."; }
+        if (name == "SetCurrentDirectory") { return "Sets the current working directory."; }
+        if (name == "Combine") { return "Combines two path strings."; }
+        if (name == "GetFileName") { return "Returns the file name and extension of the specified path string."; }
+        if (name == "GetFileNameWithoutExtension") { return "Returns the file name of the specified path string without the extension."; }
+        if (name == "GetDirectoryName") { return "Returns the directory information for the specified path string."; }
+        if (name == "GetExtension") { return "Returns the extension of the specified path string."; }
+        if (name == "HasExtension") { return "Determines whether a path includes a file name extension."; }
+        if (name == "GetTempPath") { return "Returns the path of the current user's temporary folder."; }
+        if (name == "ToInt32") { return "Converts the string representation of a number to an equivalent 32-bit signed integer."; }
+        if (name == "ToInt64") { return "Converts the string representation of a number to an equivalent 64-bit signed integer."; }
+        if (name == "ToDouble") { return "Converts the string representation of a number to an equivalent double-precision floating-point number."; }
         if (name == "Format") { return "Replaces format items in a string with argument values."; }
+        if (name == "IsNullOrEmpty") { return "Indicates whether the specified string is null or an empty string."; }
+        if (name == "CompareOrdinal") { return "Compares two specified string objects by evaluating the numeric values of the corresponding Char objects."; }
         if (name == "ContainsKey") { return "Returns whether the dictionary contains the key."; }
         if (name == "TryGetValue") { return "Gets the value for a key without throwing if absent."; }
         if (name == "Append") { return "Appends the value to this builder."; }
@@ -794,6 +873,7 @@ partial class CodeEditor {
         // Ctrl 组合已经在 kind==4 里处理过：Windows 之后还会送一个
         // 控制字符（Ctrl+V = 22），再处理一次就粘贴两遍。
         if (ate && code < 32) { return; }
+        CancelSemanticCompletion();
         // Ctrl+A = 全选（code 1）
         if (code == 1) {
             SelectAll();
@@ -895,9 +975,14 @@ partial class CodeEditor {
                 CheckErrors();
             }
             else {
-                if (selActive) { ClearExtraCarets(); DeleteSelection(); }
-                if (carets.Count > 0) { McInsertStr("    "); }
-                else { InsertStr("    "); }
+                // 无弹窗：先把光标前的标识符前缀补全成词
+                // （实体候选 + 文档词，取最长公共前缀），
+                // 补不上才退回缩进空格。
+                if (!TryCompleteWord()) {
+                    if (selActive) { ClearExtraCarets(); DeleteSelection(); }
+                    if (carets.Count > 0) { McInsertStr("    "); }
+                    else { InsertStr("    "); }
+                }
             }
             app.RequestRedraw();
         } else if (code == 27) {
@@ -938,6 +1023,7 @@ partial class CodeEditor {
     /// kind==4：导航 / 选择 / 多光标移动键。
     void HandleNavKey(App app) {
         int kc = app.window.EventKeyCode();
+        if (!(acActive && (kc == 38 || kc == 40))) { CancelSemanticCompletion(); }
         // 剪贴板与全选按虚拟键处理。只认控制字符（Ctrl+C = 3）在
         // 中文输入法开着、或键盘布局不产生控制字符时会整个丢掉，
         // 于是复制粘贴时灵时不灵。

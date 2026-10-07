@@ -221,17 +221,53 @@ class CodeCompletionItem {
     string kind;
     string detail;
     string doc;
+    string insertText;
+    bool hasTextEdit;
+    int startLine;
+    int startCol;
+    int endLine;
+    int endCol;
 
     CodeCompletionItem(string label, string kind, string detail, string doc) {
         this.label = label;
         this.kind = kind;
         this.detail = detail;
         this.doc = doc;
+        this.insertText = "";
     }
+}
+
+class CeSemanticTextMemo {
+    string path;
+    int version;
+    int line;
+    int col;
+    string name;
+    string text;
+
+    bool Matches(string path, int version, int line, int col, string name) {
+        return this.path == path && this.version == version
+            && this.line == line && this.col == col && this.name == name;
+    }
+}
+
+class CodeSemanticProviderLease { }
+
+class CeSemanticCompletionIntent {
+    int token;
+    string path;
+    string text;
+    int stamp;
+    int line;
+    int col;
+    int start;
+    bool dot;
+    bool forced;
 }
 
 delegate List<CodeCompletionItem> CodeCompletionProvider(string path, int line0, int col0);
 delegate string CodeSignatureProvider(string path, int line0, int col0, string callee);
+delegate string CodeHoverProvider(string path, int line0, int col0, string word);
 
 /// 右键菜单的一项：标签、右侧显示的快捷键提示，以及动作编号
 /// （0 = 分隔行，其余由编辑器的菜单执行器解释）。
@@ -252,6 +288,7 @@ class ContextMenuItem {
 class CeCandidateItem {
     string item;
     string kind;
+    CodeCompletionItem semantic;
 
     CeCandidateItem(string item, string kind) {
         this.item = item;
@@ -320,6 +357,8 @@ partial class CodeEditor {
     public CodeCompletionProvider externalCompletion;
     /// 外部参数签名提示提供者（如 LSP）
     public CodeSignatureProvider externalSignature;
+    /// 外部悬停文档/签名提示提供者（如 LSP）
+    public CodeHoverProvider externalHover;
 
     // ---- 本帧的行布局 ----
     // CodeLens 标注位于其装饰的声明上方独占的一行
@@ -333,6 +372,12 @@ partial class CodeEditor {
 
     // ---- 自动补全弹窗状态 ----
     List<string> acItems;   // 当前候选列表（已按前缀 + 种类过滤）
+    List<CeCandidateItem> acVisibleCandidates;
+    string acSourceText;
+    int acSourceVersion;
+    string acSourcePath;
+    int acSourceLine;
+    int acSourceCol;
     List<CeCandidateItem> acAllCandidates; // 应用种类过滤器之前的候选（以 CeCandidateItem 实体承载，消除平行列表）
     string acFilter;        // "" = 显示所有种类；否则为单个种类字母
     // 弹窗种类过滤条的几何（供点击命中测试）。
@@ -480,6 +525,11 @@ partial class CodeEditor {
     string sigMemoName;
     string sigMemoText;
     int sigMemoStamp;
+    CeSemanticTextMemo signatureLspMemo;
+    CeSemanticTextMemo hoverLspMemo;
+    CodeSemanticProviderLease semanticProviderLease;
+    CeSemanticCompletionIntent semanticCompletionIntent;
+    int semanticCompletionEpoch;
     // CodeLens 计数，按成员名对照缓冲区指纹记忆化（以 CeLensMemo 实体承载，消除平行列表）。
     List<CeLensMemo> lensMemos;
     int lensStamp;
@@ -747,6 +797,8 @@ partial class CodeEditor {
         targetScrollY = 0;
         ensuredCaretLine = -1;
         lastDiagLine = -1;  // 强制对新内容重新计算诊断
+        acActive = false;
+        acDot = false;
         BumpTextVersion();
     }
 
@@ -754,7 +806,10 @@ partial class CodeEditor {
     /// 编辑会让折叠区间的行号漂移，因此顺带全部展开，
     /// 由宿主在语义刷新后重新注入区间。
     void BumpTextVersion() {
+        CancelSemanticCompletion();
         textVersion = textVersion + 1;
+        hoverLspMemo = null;
+        signatureLspMemo = null;
         if (foldRegions != null) {
             for (int i = 0; i < foldRegions.Count; i = i + 1) {
                 foldRegions[i].folded = false;
@@ -782,6 +837,32 @@ partial class CodeEditor {
     /// 彻底消除每帧遍历全文件所有行统计长度的巨大卡顿。
     int TextStamp() {
         return textVersion;
+    }
+
+    /// 编辑器列是 UTF-8 字节偏移，LSP 列是 UTF-16 码元数。
+    static int ByteColumnToUtf16(string text, int byteCol) {
+        int pos = 0;
+        int units = 0;
+        while (pos < text.Length && pos < byteCol) {
+            int next = Text.NextCharEnd(text, pos);
+            if (next > byteCol) { break; }
+            units = units + (next - pos == 4 ? 2 : 1);
+            pos = next;
+        }
+        return units;
+    }
+
+    static int Utf16ColumnToByte(string text, int column) {
+        int pos = 0;
+        int units = 0;
+        while (pos < text.Length && units < column) {
+            int next = Text.NextCharEnd(text, pos);
+            int width = next - pos == 4 ? 2 : 1;
+            if (units + width > column) { break; }
+            units = units + width;
+            pos = next;
+        }
+        return pos;
     }
 
     /// 缓冲区行数。
@@ -873,6 +954,7 @@ partial class CodeEditor {
 
     /// 跳到某行行首（钳制行号、清除选区）。
     void GoToLine(int line) {
+        CancelSemanticCompletion();
         if (line < 0) { line = 0; }
         if (line >= lines.Count) { line = lines.Count - 1; }
         curLine = line;
@@ -1007,6 +1089,7 @@ partial class CodeEditor {
 
     /// 左移一字符；行首时退到上一行行尾。
     void MoveLeft() {
+        CancelSemanticCompletion();
         if (curCol > 0) {
             curCol = Text.PrevCharStart(lines[curLine], curCol);
         } else if (curLine > 0) {
@@ -1017,6 +1100,7 @@ partial class CodeEditor {
 
     /// 右移一字符；行尾时进到下一行行首。
     void MoveRight() {
+        CancelSemanticCompletion();
         string ln = lines[curLine];
         if (curCol < ln.Length) {
             curCol = Text.NextCharEnd(ln, curCol);
@@ -1028,6 +1112,7 @@ partial class CodeEditor {
 
     /// 上移一行（列号钳制到新行长）。
     void MoveUp() {
+        CancelSemanticCompletion();
         if (curLine > 0) {
             curLine = curLine - 1;
             ClampCol();
@@ -1036,6 +1121,7 @@ partial class CodeEditor {
 
     /// 下移一行（列号钳制到新行长）。
     void MoveDown() {
+        CancelSemanticCompletion();
         if (curLine + 1 < lines.Count) {
             curLine = curLine + 1;
             ClampCol();
@@ -1044,6 +1130,7 @@ partial class CodeEditor {
 
     /// 将光标移到上一个单词开头（Ctrl+Left）。
     void MoveWordLeft() {
+        CancelSemanticCompletion();
         if (curCol == 0) {
             if (curLine > 0) { curLine = curLine - 1; curCol = lines[curLine].Length; }
             return;
@@ -1408,6 +1495,19 @@ partial class CodeEditor {
     int VisibleRowCount() {
         if (visibleRows.Count < 1) { return 1; }
         return visibleRows.Count;
+    }
+
+    /// 屏幕可见行索引列表（兼容层，映射至 visibleRows 实体中的 line 字段）。
+    List<int> rowLine {
+        get {
+            List<int> res = new List<int>();
+            if (visibleRows != null) {
+                for (int i = 0; i < visibleRows.Count; i = i + 1) {
+                    res.Add(visibleRows[i].line);
+                }
+            }
+            return res;
+        }
     }
 
     /// 绝对坐标 `yPix` 所在的行；该点不在已布局行内时返回 -1。
