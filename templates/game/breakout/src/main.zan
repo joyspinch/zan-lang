@@ -5,8 +5,9 @@
 // Floating score popups, particle bursts, screen shake and encouraging toasts
 // provide the juice; best score / highest level / max combo persist.
 // Esc back/exit.
-// GuiHost+Canvas 版：窗口/事件/呈现由 Gui 原生外壳承担（Game.Foundation.Gui），
-// 绘制走 Game.Kit.CanvasPrims 直绘，不依赖 SDL。
+// SceneRouter 版：场景切换走 Game.Foundation.Gui.SceneRouter——主菜单/
+// 结算整屏 HTML+CSS（assets/scenes/*.html + data-on-click），对局世界
+// 在 BkPlayScene.Render 里走 Game.Kit.CanvasPrims 直绘。
 using System;
 using System.IO;
 using Gui;
@@ -103,6 +104,9 @@ class Popup {
     int cb;
 }
 
+// 对局世界引擎：只负责"打砖块本身"（模拟 + 直绘）。菜单/结算屏在
+// HTML 场景里，本类不再持有 scene 整数——失守置 over，清屏的过场
+// 闪光（clearing）是对局内部状态，不出场景。
 class BkGame {
     GuiHost host;
     Canvas c;
@@ -115,7 +119,8 @@ class BkGame {
     List<Particle> parts;
     List<Popup> pops;
 
-    int scene;        // 0 menu, 1 play, 2 over, 3 level-clear flash
+    bool over;        // 三条命耗尽，BkPlayScene 据此路由到结算场景
+    bool clearing;    // 清屏过场闪光（进下一关前停 1.4s）
     int clearAt;
     int score;
     int level;
@@ -134,8 +139,7 @@ class BkGame {
     string toastText;
     int shakeUntil;
     bool wasRecord;
-    string menuBg;    // asset paths (null = 画布回退画法)
-    string titlePath;
+    string menuBg;    // 对局背景资产（null = 画布回退画法）
     bool texTried;
     bool demo;
     int demoJitter;
@@ -147,7 +151,7 @@ class BkGame {
     static int H() { return bh > 0 ? bh : 720; }
     static int PadY() { return 660; }
 
-    // 帧首对齐宿主延展舞台（GuiHost.Render 回调开头调用）。
+    // 帧首对齐宿主延展舞台（渲染回调开头调用）。
     void SyncStage(GuiHost host) {
         BkGame.bw = host.StageWidth();
         BkGame.bh = host.StageHeight();
@@ -162,10 +166,12 @@ class BkGame {
     static BkGame Create(GuiHost h) {
         BkGame g = new BkGame();
         g.host = h;
-        g.c = h.App().canvas;
+        // 画布引用不在这里抓：宿主 App 在 Run 后才存在，且场景 Render
+        // 每帧用宿主传入的当前画布对齐（App.SwapCanvas 契约）。
         g.prof = Profile.Load();
         g.rng = Rng.Seed((long)Window.GetTickMs() + 24681357);
-        g.scene = 0;
+        g.over = false;
+        g.clearing = false;
         g.mouseX = 640;
         g.mouseY = 360;
         g.demo = File.Exists("breakout_demo.txt");
@@ -177,7 +183,6 @@ class BkGame {
         if (this.texTried) { return; }
         this.texTried = true;
         this.menuBg = BkGame.FindAsset("assets/menu_bg.png");
-        this.titlePath = BkGame.FindAsset("assets/title.png");
     }
     static string FindAsset(string path) {
         string p = Assets.Find(path);
@@ -292,7 +297,8 @@ class BkGame {
         this.pops = new List<Popup>();
         this.toastAt = -9999;
         this.wasRecord = false;
-        this.scene = 1;
+        this.over = false;
+        this.clearing = false;
         this.lastTick = now;
     }
 
@@ -421,7 +427,7 @@ class BkGame {
         this.padW = 150;
         this.shakeUntil = now + 350;
         if (this.lives <= 0) {
-            this.scene = 2;
+            this.over = true;
             this.prof.games = this.prof.games + 1;
             if (this.score > this.prof.high) { this.prof.high = this.score; }
             if (this.level > this.prof.bestLevel) { this.prof.bestLevel = this.level; }
@@ -534,13 +540,13 @@ class BkGame {
         if (this.padX < pw / 2 + 10) { this.padX = pw / 2 + 10; }
         if (this.padX > BkGame.W() - pw / 2 - 10) { this.padX = BkGame.W() - pw / 2 - 10; }
 
-        if (this.scene == 3) {
+        if (this.clearing) {
             if (now >= this.clearAt) {
                 this.level = this.level + 1;
                 this.BuildLevel(this.level);
                 this.ResetBall();
                 this.drops = new List<Drop>();
-                this.scene = 1;
+                this.clearing = false;
                 this.Toast("第 " + this.level + " 关！球速提升", now);
             }
             return;
@@ -608,8 +614,8 @@ class BkGame {
             if (!this.bricks[i].steel) { breakable = breakable + 1; }
             i = i + 1;
         }
-        if (breakable == 0 && this.scene == 1) {
-            this.scene = 3;
+        if (breakable == 0 && !this.clearing) {
+            this.clearing = true;
             this.clearAt = now + 1400;
             this.Toast("清屏！漂亮！", now);
             this.Burst(640, 300, 30, now, 255, 230, 120);
@@ -617,6 +623,11 @@ class BkGame {
     }
 
     // ----- rendering -------------------------------------------------------
+
+    // 固定步长推进（BkPlayScene.FixedStep 调用）；失守后停步，画面定格。
+    void Tick(int now) {
+        if (!this.over) { this.Step(now); }
+    }
 
     void DrawScene(int now) {
         this.EnsureTex();
@@ -780,107 +791,78 @@ class BkGame {
     void DrawPlay(int now) {
         this.DrawScene(now);
     }
+}
 
-    void DrawMenu(int now) {
-        this.EnsureTex();
-        CDraw.Clear(this.c, BkGame.W(), BkGame.H(), CDraw.Argb(255, 12, 10, 28));
-        CKitUi.Backdrop(this.c, this.menuBg, BkGame.W(), BkGame.H());
-        CDraw.FillRect(this.c, 0, 0, BkGame.W(), BkGame.H(), CDraw.Argb(130, 8, 8, 24));
-        if (this.titlePath != null) {
-            CDraw.BlitImage(this.c, this.titlePath, 640 - 300, 40, 600, 200);
-        } else {
-            CText.DrawCenteredShadow(this.c, "打砖块", 640, 80, 9, 245, 238, 220, 255);
-        }
-        CText.DrawCenteredShadow(this.c, "霓虹碎砖 · 连击倍增 · 道具连锁", 640, 268, 3, 255, 214, 150, 255);
-        CKitUi.Button(this.c, this.mouseX, this.mouseY, 460, 380, 360, 88, "开始弹射", 4, 1);
-        CText.DrawCenteredShadow(this.c, "最高分 " + this.prof.high + " · 最高 " + this.prof.bestLevel + " 关 · 最长连击 " + this.prof.bestCombo, 640, 520, 2, 255, 224, 130, 255);
-        CText.DrawCenteredShadow(this.c, "鼠标移动挡板 · 点击发射 · Esc 退出", 640, 600, 2, 185, 195, 220, 255);
+// ----- HTML 场景层（SceneRouter）--------------------------------------------
+
+// 主菜单：整屏 HTML+CSS，data-on-click="start" 直达处理器，
+// 档案成绩在 OnEnter 里回填到 id="stats"。
+class BkMenuScene : HtmlScene {
+    BkGame g;
+    Element stats;
+
+    BkMenuScene(BkGame g) { this.g = g; }
+
+    override string HtmlFile() { return "assets/scenes/menu.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("start", () => this.router.Go("play"));
     }
 
-    void DrawOver(int now) {
-        this.DrawScene(now);
-        CDraw.FillRect(this.c, 0, 0, BkGame.W(), BkGame.H(), CDraw.Argb(185, 6, 8, 18));
-        int by = 190;
-        CDraw.RoundRectFill(this.c, 390, by, 500, 320, 20, 16, 20, 40, 240);
-        CDraw.RingRect(this.c, 390, by, 500, 320, 2, 190, 120, 255, 120);
-        bool record = this.score >= this.prof.high && this.score > 0;
-        if (record) {
-            CText.DrawCenteredShadow(this.c, "新纪录！", 640, by + 30, 6, 255, 220, 100, 255);
-        } else {
-            CText.DrawCenteredShadow(this.c, "挡板失守", 640, by + 34, 4, 235, 140, 150, 255);
+    override void OnEnter(Control root) {
+        this.stats = null;
+        if (root != null) {
+            Control el = root.Find("stats");
+            if (el != null && el is Element) { this.stats = (Element)el; }
         }
-        CText.DrawCentered(this.c, "得分 " + this.score, 640, by + 100, 5, 255, 225, 110, 255);
-        CText.DrawCentered(this.c, "第 " + this.level + " 关 · 最长连击 " + this.bestCombo, 640, by + 156, 2, 175, 200, 235, 255);
-        string cheer = "再来一局，打出更高连击！";
-        if (record) { cheer = "砖块粉碎机就是你！"; }
-        CText.DrawCentered(this.c, cheer, 640, by + 196, 2, 150, 230, 190, 255);
-        CKitUi.Button(this.c, this.mouseX, this.mouseY, 420, by + 236, 210, 60, "再来一局", 3, 1);
-        CKitUi.Button(this.c, this.mouseX, this.mouseY, 650, by + 236, 210, 60, "回到菜单", 3, 0);
-    }
-
-    // ----- input -----------------------------------------------------------
-
-    void OnKey(int key, int now) {
-        if (key == 27) { if (this.scene == 0) { this.host.RequestStop(); } else { this.scene = 0; } return; }
-        if (this.scene == 0 || this.scene == 2) {
-            if (key == 13 || key == 32) { this.StartGame(now); }
-            return;
-        }
-        if (key == 32) { this.LaunchBall(now); }
-    }
-    void OnDown(int cx, int cy, int now) {
-        if (this.scene == 0) {
-            if (CDraw.PointIn(cx, cy, 460, 380, 360, 88)) { this.StartGame(now); }
-            return;
-        }
-        if (this.scene == 1 || this.scene == 3) { this.LaunchBall(now); return; }
-        if (this.scene == 2) {
-            if (CDraw.PointIn(cx, cy, 420, 426, 210, 60)) { this.StartGame(now); return; }
-            if (CDraw.PointIn(cx, cy, 650, 426, 210, 60)) { this.scene = 0; return; }
+        if (this.stats != null) {
+            this.stats.SetText("最高分 " + this.g.prof.high + " · 最高 " + this.g.prof.bestLevel
+                + " 关 · 最长连击 " + this.g.prof.bestCombo);
         }
     }
 
-    void Tick(int now) {
-        if (this.scene == 1 || this.scene == 3) { this.Step(now); }
-    }
-    void Render(int now) {
-        if (this.scene == 0) { this.DrawMenu(now); }
-        else if (this.scene == 2) { this.DrawOver(now); }
-        else { this.DrawPlay(now); }
+    override void Event(int kind, int key) {
+        if (kind != 4) { return; }
+        if (key == 27) { this.router.Exit(); }
+        if (key == 13 || key == 32) { this.router.Go("play"); }
     }
 }
 
-// GuiHost 主循环回调：事件 → 固定步长模拟（16ms，追帧上限内多次）→
-// 渲染（BeginFrame/PresentFrame 由宿主包好；帧预算自限速约 60fps）。
-class BkLoop : IGuiHostLoop {
+// 对局：纯 canvas 场景（HtmlFile 为空，无 HTML 层）。每次进场开新局
+// （菜单开始 / 结算再来一局都走这里），失守后路由到结算场景。
+class BkPlayScene : HtmlScene {
     BkGame g;
 
-    public void Start(GuiHost host) {
-        this.g = BkGame.Create(host);
+    BkPlayScene(BkGame g) { this.g = g; }
+
+    override void OnEnter(Control root) {
+        this.g.StartGame(Window.GetTickMs());
     }
-    public void Event(GuiHost host, int kind, int code) {
-        int now = Window.GetTickMs();
+
+    override void Event(int kind, int key) {
+        GuiHost host = this.router.Host();
         // 指针坐标经 host.MouseX/Y 反变换回舞台逻辑坐标（桌面视口
         // letterbox / 手机驱动反变换都在宿主之下完成）。
-        if (kind == 4) {
-            this.g.OnKey(code, now);
-        // 鼠标 kind:1=移动 2=按下 3=释放(Win32Shell 契约)。
-        } else if (kind == 1) {
+        if (kind == 1) {
             this.g.mouseX = host.MouseX();
             this.g.mouseY = host.MouseY();
-        } else if (kind == 2) {
-            if (code == 0) {
-                this.g.mouseX = host.MouseX();
-                this.g.mouseY = host.MouseY();
-                this.g.OnDown(this.g.mouseX, this.g.mouseY, now);
-            }
+        } else if (kind == 2 && key == 0) {
+            this.g.mouseX = host.MouseX();
+            this.g.mouseY = host.MouseY();
+            this.g.LaunchBall(Window.GetTickMs());
+        } else if (kind == 4) {
+            if (key == 27) { this.router.Go("menu"); }
+            if (key == 32) { this.g.LaunchBall(Window.GetTickMs()); }
         }
     }
-    public void FixedUpdate(GuiHost host, int dt) {
+
+    override void FixedStep(int dtMs) {
         this.g.Tick(Window.GetTickMs());
+        if (this.g.over) { this.router.Go("over"); }
     }
-    public void Update(GuiHost host, int dt) { }
-    public void Render(GuiHost host, Canvas c, double alpha) {
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
         // Android 上表面晚于 Start 到达(转向/后台往返亦然),App 会整体
         // 换新画布对象(App.SwapCanvas);Start 时抓的引用画进已销毁的
         // 旧表面,永不 present。每帧对齐到宿主传入的当前画布。
@@ -890,14 +872,84 @@ class BkLoop : IGuiHostLoop {
         // 布局才能铺满整窗（宽窗多看宽度，不落 margin 空条）。
         this.g.SyncStage(host);
         CDraw.Origin(0, host.ContentTop());
-        this.g.Render(Window.GetTickMs());
+        this.g.DrawPlay(Window.GetTickMs());
     }
-    public void Stop(GuiHost host) { }
+}
+
+// 结算：HTML 面板叠在定格的对局画面上——Render 继续画最后一帧世界
+// （对局已停步，画面定格），body 透明，只有中央面板不透明。
+class BkOverScene : HtmlScene {
+    BkGame g;
+    Element headline;
+    Element scoreEl;
+    Element subEl;
+    Element cheerEl;
+
+    BkOverScene(BkGame g) { this.g = g; }
+
+    override string HtmlFile() { return "assets/scenes/over.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("retry", () => this.router.Go("play"));
+        handlers.Add("menu", () => this.router.Go("menu"));
+    }
+
+    override void OnEnter(Control root) {
+        this.headline = null;
+        this.scoreEl = null;
+        this.subEl = null;
+        this.cheerEl = null;
+        if (root != null) {
+            this.headline = BkOverScene.AsElement(root, "headline");
+            this.scoreEl = BkOverScene.AsElement(root, "score");
+            this.subEl = BkOverScene.AsElement(root, "sub");
+            this.cheerEl = BkOverScene.AsElement(root, "cheer");
+        }
+        // prof.high 已在 LoseBall 里更新，record 判定与旧版 DrawOver 同基准。
+        bool record = this.g.score >= this.g.prof.high && this.g.score > 0;
+        if (this.headline != null) {
+            this.headline.SetText(record ? "新纪录！" : "挡板失守");
+        }
+        if (this.scoreEl != null) {
+            this.scoreEl.SetText("得分 " + this.g.score);
+        }
+        if (this.subEl != null) {
+            this.subEl.SetText("第 " + this.g.level + " 关 · 最长连击 " + this.g.bestCombo);
+        }
+        if (this.cheerEl != null) {
+            this.cheerEl.SetText(record ? "砖块粉碎机就是你！" : "再来一局，打出更高连击！");
+        }
+    }
+
+    static Element AsElement(Control root, string id) {
+        Control c = root.Find(id);
+        if (c != null && c is Element) { return (Element)c; }
+        return null;
+    }
+
+    override void Event(int kind, int key) {
+        if (kind != 4) { return; }
+        if (key == 27) { this.router.Go("menu"); }
+        if (key == 13 || key == 32) { this.router.Go("play"); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
+        this.g.c = c;
+        this.g.SyncStage(host);
+        CDraw.Origin(0, host.ContentTop());
+        this.g.DrawPlay(Window.GetTickMs());
+    }
 }
 
 class BkApp {
     static void Main() {
-        GuiHost host = new GuiHost("打砖块", 1280, 720, 16);
-        host.Run(new BkLoop());
+        SceneRouter router = SceneRouter.CreateFixed("打砖块", 1280, 720, 16);
+        BkGame g = BkGame.Create(router.Host());
+        router.Register("menu", new BkMenuScene(g));
+        router.Register("play", new BkPlayScene(g));
+        router.Register("over", new BkOverScene(g));
+        // demo 标记（breakout_demo.txt）直接进对局供截图/无头验证。
+        router.Run(g.demo ? "play" : "menu");
     }
 }
