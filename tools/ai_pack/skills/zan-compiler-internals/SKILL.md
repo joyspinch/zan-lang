@@ -131,6 +131,17 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   捆绑 GNU ld（大对象 REL32 风险只落在 opt-in 分配器的链接上）；
   `ZAN_LINK_ECHO=1` 回显完整链接命令，供手工重放二分。
 
+- **shard 发布下按"extern 声明还在协调 module 里"判库死活必然误杀——
+  `shard_n == 0` prune 门是承重墙（2026-10-07，同一场发布实录）**：
+  `--publish` 分片后函数体已搬进 .shard<k>.o，只剩 shard 体调用的驱动声明
+  （sqlite3_reset/SQLAllocHandle）在协调 module 里看着是死的；LLVM 扫掉这些
+  声明后，zan_irgen_prune_extern_libs 按"声明没了"顺手删 -l，链接死于 shard
+  对象的 `undefined reference to sqlite3_reset`。为修幻影 ssl/crypto 而摘掉
+  main.c 两处调用点的 `if (shard_n == 0)` 门，sqlite/odbc 立刻以同样方式炸
+  ——门必须保留（两处已补注释说明）。幻影库的正解在上游：让幻影 DllImport
+  压根不进编译（SDK 包店精确匹配，见"auto-stdlib 拉入"节 2026-10-07 条），
+  不是在链接期删库。
+
 ## 发布体积：数据逐符号分节与链接器 GC 的边界（2026-09-15）
 
 irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名>` /
@@ -202,6 +213,20 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   豁免活名门，否则任何 codegen 驱动的包（MVC 控制器、生成器宿主）都会
   静默脱图。归因四步：无包探针 ROUTES=1 → 带包探针 __AttrRoutes 未合成 →
   垃圾探针（编译必错）证明包文件未进解析 → 活引用探针 ROUTES=1。
+- **pkg_ns_match 的层级展开只是项目包店特权（2026-10-07，真实工程双目标发布实录）**：
+  stdlib 瘦身把 System.Data/Gui 移出 stdlib 后，"stdlib 目录还在才精确匹配"的
+  调用侧门（stdlib_has_dir）对 SDK/exe 旁/全局包店翻转成层级匹配——一条只为
+  IDbConnection/ORM 元数据写的 `using System.Data;` 把 Postgres/Firebird/
+  SqlServer 整包族拉进编译；接口分派表（IDbConnection itables）把 PgConnection
+  钉活，libpq 的 DllImport 落上链接行，pq.libs 再索要仓库里没有的静态
+  libssl.a/libcrypto.a，`--publish --link-mode static` 链接死于
+  `cannot find -lssl`（共享/DLL 发布没事，所以平时不炸）。修法：
+  zan_pkg_visit_namespace 的层级展开只给项目自有包店（<root>/packages、
+  .zan-packages——ZanWeb.Controllers 这类"只被生成代码点名"仍需前缀到达，
+  上一条的豁免活名门语义不变），SDK/exe 旁/全局店一律精确匹配。实测 894→836
+  文件、bundle 只剩 zan_gui/sqlite3/WebView2Loader。验收定式：拿真实工程发布
+  rsp 重放 `--publish --link-mode static`，双目标各跑一遍，驱动告警里不该再
+  出现 -lpq/-lssl/-lcrypto。
 - **按需拉取=死代码屏蔽罩（2026-10-01 模板普查实证）**：从未被任何编译
   单元引用的基建文件（Zan.Game 的 GameViewport/SceneManager/BulletPool
   等"引擎管线"批）**从不进编译集，坏了也不响**——出生即坏的多参

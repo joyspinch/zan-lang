@@ -1865,12 +1865,29 @@ partial class ZanIDE {
     /// exactly how a publish came to hang on "Publishing ..." forever.
     static void ScriptSeqDetach(List<string> steps, string logPath, string donePath,
                                 string bd, string name) {
+        ZanIDE.ScriptSeqDetachMarked(steps, null, logPath, donePath, bd, name);
+    }
+
+    /// Same, with one log line per step BEFORE it starts: "[i/N] mark @ time".
+    /// A publish chains several minutes-long compiles and zanc prints nothing
+    /// until a target finishes, so without these markers the Output tab shows
+    /// every "> Publishing ..." line up front and then minutes of silence --
+    /// which reads exactly like a hang. `marks` (when not null) is parallel to
+    /// `steps`; entries must be plain text (no quotes, no cmd metacharacters).
+    static void ScriptSeqDetachMarked(List<string> steps, List<string> marks,
+                                      string logPath, string donePath,
+                                      string bd, string name) {
         StringBuilder sb = new StringBuilder();
         #if WINDOWS
         // This file is placed in the ASCII IDE cache below. Switch cmd.exe to
         // UTF-8 before it parses any project paths contained in later lines.
         sb.Append("@echo off\r\nchcp 65001>nul\r\nset ZANFAIL=0\r\n");
         for (int i = 0; i < steps.Count; i = i + 1) {
+            if (marks != null && i < marks.Count) {
+                sb.Append("echo [" + Convert.ToString(i + 1) + "/"
+                    + Convert.ToString(steps.Count) + "] %time% "
+                    + marks[i] + " >> \"" + logPath + "\"\r\n");
+            }
             sb.Append("(" + steps[i] + ") >> \"" + logPath + "\" 2>&1\r\n");
             sb.Append("if errorlevel 1 set ZANFAIL=1\r\n");
         }
@@ -1895,14 +1912,19 @@ partial class ZanIDE {
         #else
         sb.Append("#!/bin/sh\nfail=0\n");
         for (int i = 0; i < steps.Count; i = i + 1) {
+            if (marks != null && i < marks.Count) {
+                sb.Append("echo [" + Convert.ToString(i + 1) + "/"
+                    + Convert.ToString(steps.Count) + "] $(date +%H:%M:%S) "
+                    + marks[i] + " >> \"" + logPath + "\"\n");
+            }
             sb.Append("(" + steps[i] + ") >> \"" + logPath + "\" 2>&1 || fail=1\n");
         }
         sb.Append("if [ $fail -eq 0 ] ; then echo ok > \"" + donePath + "\" ;"
             + " else echo fail > \"" + donePath + "\" ; fi\n");
-        string path = bd + "/" + name + ".sh";
-        File.WriteAllText(path, sb.ToString());
-        int rc = Process.RunDetached("sh \"" + path + "\"");
-        if (rc != 0) { File.WriteAllText(donePath, "fail"); }
+        string path2 = bd + "/" + name + ".sh";
+        File.WriteAllText(path2, sb.ToString());
+        int rc2 = Process.RunDetached("sh \"" + path2 + "\"");
+        if (rc2 != 0) { File.WriteAllText(donePath, "fail"); }
         #endif
     }
 
@@ -1985,6 +2007,11 @@ partial class ZanIDE {
         string projName = ZanIDE.ProjField(root, "name");
         string baseName = projName != "" ? projName : Path.GetFileName(root);
         List<string> steps = new List<string>();
+        // One log marker per step, echoed by the detached script right before
+        // the step runs: "[1/4] Publishing windows-x64 @ 12:03:11". The
+        // upfront "> Publishing ..." log lines could not say progress -- they
+        // all printed before step one started, then minutes of silence.
+        List<string> marks = new List<string>();
         bool isLib = ZanIDE.IsLibraryProject(root);
         // "Single file" means the resources travel INSIDE the executable
         // (zanc --embed, read straight from the exe image) -- never a
@@ -2066,7 +2093,7 @@ partial class ZanIDE {
                     steps.Add(zc + pubFlag + ct + " " + inputs
                         + " -o \"" + lib + "\"");
                     exes.Add(lib);
-                    log.Add("> Publishing " + id + " library ...");
+                    marks.Add("Publishing " + id + " library");
                     // Optional static archive next to the shared library
                     // (zan.proj `staticLib = true`; zanc picks the archive
                     // format from the .a / .lib output extension).
@@ -2076,7 +2103,7 @@ partial class ZanIDE {
                         steps.Add(zc + pubFlag + ct + " "
                             + inputs + " -o \"" + slib + "\"");
                         exes.Add(slib);
-                        log.Add("> Publishing " + id + " static library ...");
+                        marks.Add("Publishing " + id + " static library");
                     }
                 } else if (id == "windows-x64") {
                     string exe = outDir + "/" + baseName + ".exe";
@@ -2096,7 +2123,7 @@ partial class ZanIDE {
                         steps.Add(ZanIDE.CompileToExe(root, p, inputs, ll, exe, !dbg, dbg) + emb);
                     }
                     exes.Add(exe);
-                    log.Add("> Publishing windows-x64 ...");
+                    marks.Add("Publishing windows-x64");
                 } else if (id == "windows-arm64") {
                     string exe = outDir + "/" + baseName + ".exe";
                     // Cross-compile ARM64 through zanc's bundled toolchain
@@ -2111,7 +2138,7 @@ partial class ZanIDE {
                         steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, exe, "win-arm64", dbg) + emb);
                     }
                     exes.Add(exe);
-                    log.Add("> Publishing windows-arm64 ...");
+                    marks.Add("Publishing windows-arm64");
                 } else if (id == "macos-x64" || id == "macos-arm64") {
                     // macOS: the host's own arch builds natively; every other
                     // host cross-links a Mach-O through zanc's own toolchain
@@ -2130,7 +2157,7 @@ partial class ZanIDE {
                         steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, exe, id, dbg) + emb);
                     }
                     exes.Add(exe);
-                    log.Add("> Publishing " + id + " ...");
+                    marks.Add("Publishing " + id);
                 } else if (id == "linux-x64") {
                     // Self-contained musl static single file (cross from any host).
                     string exe = outDir + "/" + baseName;
@@ -2138,7 +2165,7 @@ partial class ZanIDE {
                     steps.Add(zc + pubFlag + " " + inputs
                         + " --target linux-musl --link-mode static -o \"" + exe + "\"" + emb);
                     exes.Add(exe);
-                    log.Add("> Publishing linux-x64 ...");
+                    marks.Add("Publishing linux-x64");
                 } else if (id == "linux-arm64") {
                     // Same musl static path as linux-x64; only triple/sysroot differ.
                     string exe = outDir + "/" + baseName;
@@ -2146,7 +2173,7 @@ partial class ZanIDE {
                     steps.Add(zc + pubFlag + " " + inputs
                         + " --target linux-arm64 --link-mode static -o \"" + exe + "\"" + emb);
                     exes.Add(exe);
-                    log.Add("> Publishing linux-arm64 ...");
+                    marks.Add("Publishing linux-arm64");
                 } else if (id == "android-x64" || id == "android-arm64") {
                     // One signed NativeActivity APK per ABI. zanc --emit-apk
                     // compiles, links libmain.so, packages the NativeActivity
@@ -2155,7 +2182,7 @@ partial class ZanIDE {
                     steps.Add(zc + pubFlag + " " + inputs
                         + " --target " + id + " --emit-apk \"" + apk + "\"" + emb);
                     exes.Add(apk);
-                    log.Add("> Publishing " + id + " APK ...");
+                    marks.Add("Publishing " + id + " APK");
                 } else if (id == "ohos-x64" || id == "ohos-arm64") {
                     // One HAP per ABI, mirroring the Android APK path: zanc
                     // --emit-hap compiles, links libmain.so and packages the
@@ -2175,7 +2202,7 @@ partial class ZanIDE {
                             + inputs + " --target " + id + " --emit-hap \""
                             + hap + "\"" + emb);
                         exes.Add(hap);
-                        log.Add("> Publishing " + id + " HAP ...");
+                        marks.Add("Publishing " + id + " HAP");
                     }
                 }
             }
@@ -2196,8 +2223,8 @@ partial class ZanIDE {
         // chaining every target into a single command line adds up, and a
         // truncated command line fails silently (no log, no marker, a publish
         // that never finishes).
-        ZanIDE.ScriptSeqDetach(steps, ZanIDE.PubLogPath(), ZanIDE.PubDonePath(),
-                               bd, "zanpub");
+        ZanIDE.ScriptSeqDetachMarked(steps, marks, ZanIDE.PubLogPath(),
+                                     ZanIDE.PubDonePath(), bd, "zanpub");
         return exes;
     }
 
@@ -2443,10 +2470,24 @@ partial class ZanIDE {
     static void CopyThemeSkins(string root, string outDir, string sourcePath,
                               List<string> log) {
         if (!ZanIDE.IsGuiTarget(root, sourcePath)) { return; }
+        // Baseline skins (base.css, dark, light) used to live only in
+        // stdlib/Gui/skins; the stdlib slimming moved them into the Zan.Gui
+        // package, while the optional theme packs live in Zan.Gui.Themes. An
+        // installed SDK stages packages\ beside the exe, one level up from
+        // stdlib -- hence the ../packages fallbacks.
         string src = ZanIDE.StdlibDir() + "/Gui/skins";
         if (!Directory.Exists(src)) {
-            log.Add("> WARNING: skins requested but stdlib skins folder not found.");
+            src = ZanIDE.StdlibDir() + "/../packages/Zan.Gui/src/Gui/skins";
+        }
+        if (!Directory.Exists(src)) {
+            log.Add("> WARNING: skins requested but no baseline skins folder "
+                + "found (looked in stdlib/Gui/skins and "
+                + "packages/Zan.Gui/src/Gui/skins).");
             return;
+        }
+        string packSrc = ZanIDE.StdlibDir() + "/Gui/skins";
+        if (!Directory.Exists(packSrc)) {
+            packSrc = ZanIDE.StdlibDir() + "/../packages/Zan.Gui.Themes/skins";
         }
         string dst = outDir + "/skins";
         Directory.CreateDirectoryRecursive(dst);
@@ -2476,7 +2517,7 @@ partial class ZanIDE {
             List<string> want = ZanIDE.ProjSkinList(root);
             for (int i = 0; i < want.Count; i = i + 1) {
                 if (bundled.Contains(want[i])) { continue; }
-                string sd = src + "/" + want[i];
+                string sd = packSrc + "/" + want[i];
                 if (Directory.Exists(sd)) {
                     AssetManager.copyTree(sd, dst + "/" + want[i]);
                     bundled.Add(want[i]);

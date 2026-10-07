@@ -5766,6 +5766,15 @@ int main(int argc, char **argv) {
         zan_opt_report_print(&opt_report);
         phase("optimize");
         probe_phase_mem("optimize");
+        /* Shard-aware gate, not an over-sight: existence in the coordinator
+         * module is only a valid liveness signal while every body lives
+         * there. A sharded publish has already moved bodies into .shard<k>.o
+         * objects, so a driver declaration whose only callers are shard
+         * bodies looks dead in-module, the sweep erases it, and an
+         * unconditional prune would drop the -l -- the link then dies on
+         * `undefined reference to sqlite3_reset` from a shard object for a
+         * driver the program genuinely calls. Unsharded publishes (and every
+         * dev build) keep the whole program in one module and prune here. */
         if (shard_n == 0)
             zan_irgen_prune_extern_libs(&irgen);
     } else {
@@ -5787,7 +5796,9 @@ int main(int argc, char **argv) {
             /* The sweep just erased the imports nothing calls; drop their
              * libraries too, or the link line keeps asking for native
              * libraries (openssl for a globbed-in TlsStream, ...) that this
-             * program never calls. */
+             * program never calls. Same shard gate as the optimized branch:
+             * with bodies moved into shard objects, in-module existence stops
+             * being the liveness signal this prune reads. */
             if (shard_n == 0)
                 zan_irgen_prune_extern_libs(&irgen);
         }

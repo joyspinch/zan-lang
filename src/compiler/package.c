@@ -807,6 +807,16 @@ int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
         target_ns[i] = (namespace_path[i] == '/' || namespace_path[i] == '\\') ? '.' : namespace_path[i];
     char store[1024]; int found = 0;
     pkg_seen_names_t seen = {0};
+    /* Hierarchy expansion is a project-package privilege: `using ZanWeb;`
+     * in a project that owns the ZanWeb package must reach
+     * ZanWeb.Controllers underneath it. An installed/SDK package must stay
+     * exact-match, or one ubiquitous parent `using` (System.Data beside the
+     * ORM) sweeps EVERY sibling namespace of the package into the compile --
+     * Postgres/Firebird/SqlServer included, each dragging its native driver
+     * onto the publish link line. The old stdlib_has_dir caller-side gate
+     * said "exact while stdlib owns the directory"; once a namespace family
+     * moved out of stdlib into a package the gate flipped to hierarchical
+     * for code that only ever wanted the exact namespace. */
     snprintf(store, sizeof(store), "%s" PATH_SEP "packages", project_dir);
     found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
     snprintf(store, sizeof(store), "%s" PATH_SEP ".zan-packages", project_dir);
@@ -816,16 +826,16 @@ int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
     if (GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir))) {
         char *sep = strrchr(exe_dir, '\\'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s\\..\\packages", exe_dir);
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, 0);
         snprintf(store, sizeof(store), "%s\\packages", exe_dir);
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, 0);
     }
 #elif defined(__APPLE__)
     uint32_t size = sizeof(exe_dir);
     if (_NSGetExecutablePath(exe_dir, &size) == 0) {
         char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s/../packages", exe_dir);
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, 0);
     }
 #else
     ssize_t len = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
@@ -833,11 +843,11 @@ int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
         exe_dir[len] = 0;
         char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s/../packages", exe_dir);
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, 0);
     }
 #endif
     if (zan_pkg_global_store(store, sizeof(store)))
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
+        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, 0);
     for (int i = 0; i < seen.count; i++) free(seen.names[i]);
     free(seen.names);
     return found;

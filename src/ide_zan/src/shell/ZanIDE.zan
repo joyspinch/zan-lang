@@ -272,7 +272,9 @@ partial class ZanIDE {
                 // F5 = Start Debug (same as clicking Debug button). The
                 // `-g` build runs DETACHED; the poll opens the debugger on
                 // success so F5 never freezes the window during compilation.
-                if (!buildBusy) {
+                if (pubBusy) {
+                    Layer.Msg(ZanIDE.T("Publish in progress…", "发布进行中…"), 2);
+                } else if (!buildBusy) {
                     this.SaveActiveTab();
                     string dExe = ZanIDE.DebugBuildBegin(tabs, activeTab, root, log);
                     if (dExe != "") {
@@ -1515,7 +1517,10 @@ partial class ZanIDE {
             // completion, exactly like the Run action.
             if (hotReloadReq) {
                 hotReloadReq = false;
-                if (!buildBusy) {
+                // A publish owns the compiler and the output tree right now;
+                // silently skipping keeps save-triggered reload from
+                // stamping on it (the next save after it finishes reloads).
+                if (!buildBusy && !pubBusy) {
                     int atHr = activeTab.Get();
                     string apHr = "";
                     if (atHr >= 0 && atHr < tabs.Count) { apHr = tabs[atHr].path; }
@@ -1835,9 +1840,21 @@ partial class ZanIDE {
                     this.PollNextIn(app, 250, null);
                 }
             } else if (pubBusy) {
+                int beforePoll = log.Count;
                 int pubConsumed = ZanIDE.PubPoll(pubLogLen, log);
                 if (pubConsumed != pubLogLen) {
                     pubLogLen = pubConsumed;
+                    // Track "[i/N] ..." step markers so the status bar can
+                    // name the target that is compiling right now.
+                    for (int mli = beforePoll; mli < log.Count; mli = mli + 1) {
+                        string mln = log[mli];
+                        if (mln.Length > 3 && mln[0] == '[') {
+                            int mslash = mln.IndexOf('/');
+                            if (mslash > 1 && mln.IndexOf(']') > mslash) {
+                                pubStep = mln;
+                            }
+                        }
+                    }
                     coLog.Reset();
                     app.RequestRedraw();
                 }
@@ -2298,7 +2315,16 @@ partial class ZanIDE {
             if (editor.SyntaxLang() == 1) { modeInfo = "Lua"; }
             if (editor.SyntaxLang() == 2) { modeInfo = "Python"; }
             if (designerMode) { modeInfo = ZanIDE.T("Designer", "设计器"); }
-            if (pubBusy) { modeInfo = ZanIDE.T("Publishing...", "发布中..."); }
+            if (pubBusy) {
+                // Which target + how long: "[2/4] Publishing macos-arm64 · 65s"
+                // turns a silent minutes-long publish into visible progress.
+                string pubLbl = pubStep != null && pubStep.Length > 0
+                    ? pubStep + " · " : "";
+                int pubSecs = pubStartMs != 0
+                    ? (int)((Window.GetTickMs() - pubStartMs) / 1000) : 0;
+                modeInfo = ZanIDE.T("Publishing ", "发布中 ")
+                    + pubLbl + Convert.ToString(pubSecs) + "s";
+            }
             if (pubPacking) { modeInfo = ZanIDE.T("Packaging...", "打包中..."); }
             if (sbDebug) { modeInfo = ZanIDE.T("Debugging", "调试中"); }
             int sbTint = 0;
@@ -2553,12 +2579,12 @@ partial class ZanIDE {
                             bool rtReal = rtrn.path != "" && !ZanIDE.StartsWith(rtrn.path, "@");
                             if (!rtrn.isDir && rtReal) {
                                 if (chosen == 0) {
-                                    ZanIDE.OpenPath(tabs, activeTab, rtrn.path, rtrn.label);
-                                    log.Add("> Opened " + rtrn.path + ".");
+                                    ZanIDE.OpenPath(tabs, activeTab, rtrn.path, Path.GetFileName(rtrn.path));
+                                    log.Add("> Opened tool: " + rtrn.path + ".");
                                 } else if (chosen == 1) {
                                     string rtcT = ZanIDE.RunTarget(rtrn.path, root);
-                                    if (buildBusy) {
-                                        Layer.Msg(ZanIDE.T("Build already running…", "构建进行中…"), 2);
+                                    if (buildBusy || pubBusy) {
+                                        Layer.Msg(ZanIDE.T("Build or publish already running…", "构建或发布进行中…"), 2);
                                     } else if (rtcT != "") {
                                         log.Add(ZanIDE.T("> Running tool ", "> 运行工具 ") + rtrn.path + " ...");
                                         buildBusy = true;
@@ -2628,13 +2654,22 @@ partial class ZanIDE {
             // their own top-level child windows (App.CreateDark) -- see the
             // pumps right after the main frame below. Only the deferred
             // publish kick-off (started once the window has closed) stays here.
-            if (pubPending && !pubBusy) {
+            if (pubPending && !pubBusy && !buildBusy) {
                 pubPending = false;
+                pubStep = "";
                 pubExes = ZanIDE.PublishPlatformsBeginWithOptions(pubRoot, pubPlatformOptions, log);
                 pubBusy = pubExes.Count > 0;
                 pubStartMs = Window.GetTickMs();
                 pubPackStartMs = 0;
                 pubLogLen = 0;
+                app.RequestRedraw();
+            } else if (pubPending && (pubBusy || buildBusy)) {
+                // The publish window armed a publish while a build or another
+                // publish owns the compiler. Drop it with a log line instead
+                // of silently queueing a duplicate that fires later.
+                pubPending = false;
+                log.Add(ZanIDE.T("> Task already running; publish not started.",
+                                 "> 已有任务进行中，发布未开始。"));
                 app.RequestRedraw();
             }
             string windowTitle = IdeVersion.Product();
@@ -2673,6 +2708,7 @@ partial class ZanIDE {
             this.PromptPublishComplete();
         }
         pubBusy = false;
+        pubStep = null;
         pubPacking = false;
         pubPackStartMs = 0;
         pubExes = new List<string>();
