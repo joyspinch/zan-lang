@@ -256,8 +256,12 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   会得出"程序坏了"或"修好了"的假结论。先记录启动 PID，再按 PID 枚举顶层窗口
   逐个抓取；抓不到目标窗口就重试，不要让工具猜。
 - **UI 驱动用合成事件，不用真实 OS 点击**：driver 的 `clickid` 在点击时刻
-  解析命中区中心并注入，天然免疫窗口框偏移；hit id 只在**同一次构建的
-  同一次运行内**有效（控件增删会整体移位），点击前当场 dump。
+  解析命中区中心并注入，天然免疫窗口框偏移。数字 hit id 顺序发号、控件
+  增删即整体移位（曾在 ListView 拖动停摆、菜单滚动条跳跃上爆过），脚本
+  别握数字号——用 `clickid @语义名`：驱动按**本帧命中区的语义标签**当场
+  解析（后注册者=顶层优先），标签在就永远点得中。新控件注册命中区时用
+  `RegisterRectL` 带上数据键标签（向导行/平台芯片已接，芯片标签=
+  "linux-x64" 这类平台 id），没标签才退宿主 probe "id.<name>" 旧通道。
 - **ZanWeb 模板实机核对坑清单**（2026-09-25 ListPage/FormPage/视觉重绘验证起，每条都白折腾过一轮）：
   ① 静态资产挂在 `/static/*`（`StaticFiles.Mount(app, "/static", "wwwroot")`），
   curl `/js/x.js` 拿到的是 API 层 `{"code":"404"}` JSON——不是"服务了旧文件"，
