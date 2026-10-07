@@ -5,9 +5,13 @@ using Game.Foundation;
 using Coreforge;
 
 // 炉心边境 · Coreforge —— 自有帧循环宿主。
-// 事件 → 世界步进 → 场景绘制 → HUD 合成（ForgeInterface.Render）
-// → 帧尾 pacing。循环自持 RequestRedraw 空转节流，失焦不冻结
-// （游戏动画连续）；窗口 chrome 由 RenderChrome 叠画。
+// 界面 chrome 全部由 src/App.html 设计稿声明（GenForm 展开成 partial
+// 类 CoreforgeHud 的类型化字段），外观由 skins/coreforge/skin.css
+// 提供（游戏自己的熔核皮肤，UseSkin 挂载；标题栏无皮肤选择钮）。
+// 每帧：事件 → 世界步进 → 世界直绘（游戏本体）→ 控件树叠加
+// （MeasureTree/Arrange/RenderTree 手动组合，跳过 RenderBackground
+// 以免盖住世界）→ 窗口 chrome。循环自持 RequestRedraw 空转节流，
+// 失焦不冻结（游戏动画连续）。
 class CoreforgeProgram {
     static string SavePath() {
         string overridden = Environment.GetEnvironmentVariable("COREFORGE_SAVE");
@@ -22,9 +26,17 @@ class CoreforgeProgram {
 
     static void Main() {
         Environment.SetEnvironmentVariable("ZAN_GUI_TOUCH_GAME", "1");
-        App app = App.CreateDark("炉心边境 · COREFORGE", 1280, 860);
-        app.Show();
+        Form window = Form.CreateDark("炉心边境 · COREFORGE", 1280, 860);
+        App app = window.GetApp();
+        // 游戏自己的皮肤；不需要全局皮肤切换器。
+        app.UseSkin("coreforge");
+        app.SetChromeButtons(false, false, true, true);
+        Gui.Control root = CoreforgeHud.__BuildForm();
+        window.Add(root);
+        CoreforgeHud.__WireForm(window);
         ForgeInterface game = new ForgeInterface(app, CoreforgeProgram.SavePath());
+        game.Attach(window);
+        app.Show();
         FixedStepClock clock = new FixedStepClock(20, 12);
         int previous = Window.GetTickMs();
         int frames = 0;
@@ -39,6 +51,8 @@ class CoreforgeProgram {
             if (got == 1 && smoke != "1" && autotest != "1") {
                 // 桌面转发仅正常游玩；smoke/autotest 里弹出的窗口可能
                 // 吃到真实桌面滚轮/拖动，会污染确定性截图与自测。
+                // HUD 上的桌面事件由控件树自行处理（PollOneEvent 内部
+                // 已路由），这里只喂世界输入。
                 game.Input(app.window.EventKind(), app.window.EventX(), app.window.EventY(),
                     app.window.EventButton(), app.window.EventKeyCode(), app.window.EventMods(), app.window.EventFlag());
             }
@@ -50,7 +64,15 @@ class CoreforgeProgram {
             while (clock.HasStep()) { clock.ConsumeStep(); game.sim.Step(); }
             game.TickUi();
             if (autotest == "1") { CoreforgeAutoTest.Run(game, frames); }
-            app.BeginFrame(); game.Render(); app.RenderChrome(game.title);
+            app.BeginFrame();
+            game.Render();
+            // 控件树叠加在世界之上：手动组合 RenderFrame 的布局三步，
+            // 不调 RenderBackground（它会用皮肤底色盖掉世界画面）。
+            window.MeasureTree(app);
+            window.Arrange(app.ShapeOffX(), app.ContentTop() + app.ShapeOffY(),
+              app.ClientWidth(), app.ClientHeight() - app.ContentTop());
+            window.RenderTree(app);
+            app.RenderChrome(game.title);
             frames = frames + 1;
             if (capture != "" && frames == 120) {
                 app.canvas.WritePixels(capture, 0, 0, app.ClientWidth(), app.ClientHeight());

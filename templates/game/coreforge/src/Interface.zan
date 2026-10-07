@@ -1,74 +1,38 @@
 using System;
 using System.Collections.Generic;
 using Gui;
+using Gui.Widget;
 using Game.Core;
 
 namespace Coreforge;
 
-// 炉心边境 · 直绘 HUD。RTS/动作类的每帧热 HUD 走代码直绘
-// （game-dev skill 的性能边界）：世界全屏铺底，半透明熔核面板
-// 叠加其上，零原生控件。命中区域表在绘制时重建（immediate-mode
-// 登记），Input 按区域分发；图元只来自 Canvas 标准绘制原语。
+// 炉心边境 · HUD code-behind。
+// chrome（顶栏/工具栏/目标/详情/科技/建造栏/状态栏/波幅横幅/结算幕）
+// 全部由 src/App.html 设计稿 + skins/coreforge/skin.css 声明式绘制，
+// 编译期由 GenForm 生成 partial class CoreforgeHud；本文件负责把
+// 生成的静态控件树接进游戏：Attach 注册表单事件，RefreshHud 每帧
+// 把模拟状态回写到控件（wuwei 式 .Text/.visible 习惯），HudConsumes
+// 为世界输入划出遮蔽区。世界画面（游戏本体）仍由 Renderer 直绘；
+// 小地图与边缘预警是画布上仅剩的两块热 HUD——它们是每帧变化
+// 的游戏坐标内容，进控件树反而要每帧重建。
 
-/// HUD 命中区域（绘制期登记，输入期查询）。
-class HudZone {
-    public int id;
-    public int x;
-    public int y;
-    public int w;
-    public int h;
-    public bool enabled;
-    public bool active;
-
-    HudZone(int id, int x, int y, int w, int h, bool enabled, bool active) {
-        this.id = id; this.x = x; this.y = y; this.w = w; this.h = h;
-        this.enabled = enabled; this.active = active;
-    }
-    static HudZone Create(int id, int x, int y, int w, int h, bool enabled, bool active) {
-        return new HudZone(id, x, y, w, h, enabled, active);
+partial class CoreforgeHud {
+    /// 生成器装载钩子：动态面板初始全部隐藏，RefreshHud 按状态显隐。
+    static void OnLoad(Form form) {
+        EndVeil.visible = false;
+        Banner.visible = false;
+        Tech.visible = false;
+        Detail.visible = false;
+        Objectives.visible = false;
     }
 }
 
 class ForgeInterface {
-    // ---- 区域 id（0 = 无） ----
-    const int ZPause = 1;
-    const int ZSpeed = 2;
-    const int ZLaunch = 3;
-    const int ZTech = 4;
-    const int ZPower = 5;
-    const int ZSave = 6;
-    const int ZLoad = 7;
-    const int ZFocus = 8;
-    const int ZNew = 9;
-    const int ZRotate = 10;
-    const int ZDemolish = 11;
-    const int ZCancel = 12;
-    const int ZBuildBase = 16;   // + 方块 id（2..14）
-    const int ZTechBase = 32;    // + 科技 id（1..5）
-    const int ZRecipe = 40;
-    const int ZTarget = 41;
-    const int ZFeed = 42;
-
-    // ---- 熔核配色（与 Renderer.ItemColor 同源的物品色） ----
-    const int CPanel = 0xB4140F0A;
-    const int CPanelBorder = 0xFF4D3D24;
-    const int CAmber = 0xFFE08A3C;
-    const int CAmberHi = 0xFFF2A558;
-    const int CText = 0xFFF3EAD9;
-    const int CSecondary = 0xFFCDBB97;
-    const int CTertiary = 0xFF93825F;
-    const int CDanger = 0xFFCF5A35;
-    const int COk = 0xFF8FAE4E;
-    const int COnAmber = 0xFF1A130A;
-    const int CBtn = 0xD9221B10;
-    const int CBtnHover = 0xFF2C2417;
-    const int CBtnBorder = 0xFF3D3019;
-
     App app;
+    Form hud;
     ForgeSimulation sim;
     ForgeCamera camera;
     ForgeRenderer renderer;
-    List<HudZone> zones;
     BlockKind selected;
     int direction;
     int inspectCell;
@@ -81,7 +45,7 @@ class ForgeInterface {
     bool newRunArmed;
     bool leftDown;
     bool rightDown;
-    int pressedZone;
+    bool miniArmed;
     int downCell;
     int lastCell;
     int mouseX;
@@ -100,70 +64,198 @@ class ForgeInterface {
     int clientW;
     int clientH;
     int chromeTop;
+    int miniX;
+    int miniY;
+    int miniW;
+    int miniH;
 
     ForgeInterface(App host, string path) {
         app = host; savePath = path; title = "炉心边境 · COREFORGE";
         sim = new ForgeSimulation(1709); camera = new ForgeCamera(); camera.Focus(sim.world);
         renderer = new ForgeRenderer(); selected = BlockKind.Empty; speed = 1;
         inspectCell = sim.world.coreCell; hoverCell = -1; lastCell = -1; downCell = -1;
-        zones = new List<HudZone>();
         keys = new bool[256];
         status = "从铜矿到炮塔：沿箭头连接输送线，守住炉心。";
         mouseX = -1; mouseY = -1;
     }
 
-    // ---- 单一缩放 helper：自绘路径的一切尺寸过它（D16 纪律） ----
+    // ---- 单一缩放 helper：小地图等画布 HUD 的一切尺寸过它（D16 纪律） ----
     int S(int v) { return ForgeGrid.Max(1, (int)(v * uiScale + 0.5)); }
     int Sx(int v) { return (int)(v * uiScale + 0.5); }
 
     string N(int v) { return Convert.ToString(v); }
 
-    // ================= 帧绘制 =================
+    // ================= 事件接线 =================
+
+    /// 把设计稿声明的 data-on-click 处理器接到模拟动作上。
+    void Attach(Form form) {
+        hud = form;
+        form.On("hudPause", () => TogglePause());
+        form.On("hudSpeed", () => { speed = speed == 1 ? 2 : speed == 2 ? 4 : 1; newRunArmed = false; });
+        form.On("hudLaunch", () => { if (!sim.world.waveActive && !sim.world.defeated && !sim.world.victory) { sim.combat.StartWave(); } });
+        form.On("hudPower", () => powerOverlay = !powerOverlay);
+        form.On("hudTech", () => showTech = !showTech);
+        form.On("hudSave", () => Save());
+        form.On("hudLoad", () => Load());
+        form.On("hudHome", () => camera.Focus(sim.world));
+        form.On("hudNew", () => NewRun());
+        form.On("hudRecipe", () => CycleRecipe());
+        form.On("hudTarget", () => CycleTarget());
+        form.On("hudFeed", () => Feed());
+        form.On("hudRotate", () => Rotate());
+        form.On("hudDemolish", () => { erase = !erase; selected = BlockKind.Empty; });
+        form.On("hudCancel", () => Cancel());
+        form.On("hudAgain", () => RestartRun());
+        form.On("hudLoad2", () => Load());
+        form.On("hudTech1", () => Research(1));
+        form.On("hudTech2", () => Research(2));
+        form.On("hudTech3", () => Research(3));
+        form.On("hudTech4", () => Research(4));
+        form.On("hudTech5", () => Research(5));
+        form.On("hudB2", () => SelectBlock(2));
+        form.On("hudB3", () => SelectBlock(3));
+        form.On("hudB4", () => SelectBlock(4));
+        form.On("hudB5", () => SelectBlock(5));
+        form.On("hudB6", () => SelectBlock(6));
+        form.On("hudB7", () => SelectBlock(7));
+        form.On("hudB8", () => SelectBlock(8));
+        form.On("hudB9", () => SelectBlock(9));
+        form.On("hudB10", () => SelectBlock(10));
+        form.On("hudB11", () => SelectBlock(11));
+        form.On("hudB12", () => SelectBlock(12));
+        form.On("hudB13", () => SelectBlock(13));
+        form.On("hudB14", () => SelectBlock(14));
+    }
+
+    void SelectBlock(int id) {
+        selected = (BlockKind)id;
+        erase = false;
+        showTech = false;
+        newRunArmed = false;
+    }
+
+    void TogglePause() {
+        paused = !paused;
+        newRunArmed = false;
+    }
+
+    /// 结算幕里的"再度远征"：已终局，无需两次点击确认。
+    void RestartRun() {
+        newRunArmed = false;
+        sim = new ForgeSimulation(sim.world.seed + 37);
+        camera.Focus(sim.world);
+        inspectCell = sim.world.coreCell;
+        selected = BlockKind.Empty;
+        erase = false;
+        paused = false;
+        lastEvent = 0;
+        leftDown = false;
+        rightDown = false;
+        Message("新的荒原已就绪。先规划运输，再扩张防线。");
+    }
+
+    // ================= 帧渲染 =================
+
     void Render() {
         Canvas c = app.canvas;
         clientW = app.ClientWidth(); clientH = app.ClientHeight();
         chromeTop = app.ContentTop();
         uiScale = clientW / 1280.0;
-        zones.Clear();
-        // 世界全屏铺底（chrome 之下）——游戏画面本体。
+        // 世界全屏铺底（HUD 控件树之下）——游戏画面本体。
         camera.SetViewport(0, chromeTop, clientW, clientH - chromeTop);
+        ApplyShake();
         renderer.Draw(c, sim.world, camera, hoverCell, selected, direction, erase, inspectCell, powerOverlay);
-        TopBar(c);
-        if (showTech) { TechPanel(c); }
-        else { BuildPalette(c); }
-        DetailPanel(c);
-        StatusRow(c);
-        WaveBanner(c);
-        Tooltip(c);
+        ThreatArrows(c);
+        Minimap(c);
+        RefreshHud();
     }
 
-    void Panel(Canvas c, int x, int y, int w, int h) {
-        c.FillRect(x, y, w, h, CPanel);
-        c.DrawRect(x, y, w, h, CPanelBorder, 1);
+    /// 屏震衰减：确定性位移（取 world.tick 哈希），无随机数。
+    void ApplyShake() {
+        int mag = sim.world.shake;
+        if (mag <= 0) { camera.SetShake(0, 0); return; }
+        int sx = ((sim.world.tick * 73 + 31) % 17 - 8) * mag / 8;
+        int sy = ((sim.world.tick * 137 + 71) % 13 - 6) * mag / 8;
+        camera.SetShake(sx, sy);
     }
 
-    /// 画一个按钮并登记命中区域。返回区域右边界 x。
-    int Button(Canvas c, int id, int x, int y, int w, int h, string label,
-               bool enabled, bool active, int textColor) {
-        bool hover = enabled && InRect(mouseX, mouseY, x, y, w, h);
-        int bg = active ? CAmber : hover ? CBtnHover : CBtn;
-        int border = active ? CAmber : hover ? 0xFF6B5327 : CBtnBorder;
-        c.FillRect(x, y, w, h, bg);
-        c.DrawRect(x, y, w, h, border, 1);
-        int fs = S(13);
-        int tx = x + (w - Canvas.MeasureText(label, fs)) / 2;
-        int ty = y + (h - Canvas.FontHeight(fs)) / 2;
-        int fg = !enabled ? CTertiary : active ? COnAmber : textColor;
-        c.DrawText(tx, ty, label, fg, fs);
-        if (!enabled) { c.DrawRect(x, y, w, h, 0x3093825F, 1); }
-        zones.Add(HudZone.Create(id, x, y, w, h, enabled, active));
-        return x + w;
+    // ---- 小地图：画布上唯一的战略视图，点击跳转视角 ----
+    void Minimap(Canvas c) {
+        ForgeWorld w = sim.world;
+        int tile = S(4);
+        miniW = w.width * tile;
+        miniH = w.height * tile;
+        miniX = clientW - miniW - S(12);
+        miniY = clientH - S(28) - miniH - S(12);
+        c.FillRect(miniX - S(3), miniY - S(3), miniW + S(6), miniH + S(6), 0xB4140F0A);
+        c.DrawRect(miniX - S(3), miniY - S(3), miniW + S(6), miniH + S(6), 0xFF4D3D24, 1);
+        for (int cell = 0; cell < w.width * w.height; cell = cell + 1) {
+            ForgeBuilding b = w.buildings[cell];
+            int color;
+            if (b.kind != BlockKind.Empty) { color = BlockAccent((int)b.kind); }
+            else {
+                ForgeTile t = w.tiles[cell];
+                if (t.ore >= 0) { color = ChipColor(t.ore); }
+                else if (t.terrain == TerrainKind.Water) { color = 0xFF2E5F63; }
+                else if (t.terrain == TerrainKind.Oil) { color = 0xFF332A44; }
+                else { color = 0xFF37321F; }
+            }
+            c.FillRect(miniX + (cell % w.width) * tile, miniY + (cell / w.width) * tile, tile, tile, color);
+        }
+        // 敌情红点。
+        for (int i = 0; i < w.enemies.Length; i = i + 1) {
+            ForgeEnemy e = w.enemies[i];
+            if (!e.active) { continue; }
+            int px = miniX + e.x / (1000 / tile);
+            int py = miniY + e.y / (1000 / tile);
+            c.FillRect(px - 1, py - 1, tile + 1, tile + 1, 0xFFFF6A4A);
+        }
+        // 炉心亮点。
+        int corePx = miniX + (w.coreCell % w.width) * tile;
+        int corePy = miniY + (w.coreCell / w.width) * tile;
+        c.FillRect(corePx, corePy, tile, tile, 0xFFFFD98F);
+        // 视口框。
+        int vw = (int)(clientW / (ForgeGrid.TileSize() * camera.zoom)) * tile;
+        int vh = (int)((clientH - chromeTop) / (ForgeGrid.TileSize() * camera.zoom)) * tile;
+        int vx = miniX + (int)(camera.x * tile) - vw / 2;
+        int vy = miniY + (int)(camera.y * tile) - vh / 2;
+        c.DrawRect(vx, vy, vw, vh, 0x90F3EAD9, 1);
     }
 
-    bool InRect(int px, int py, int x, int y, int w, int h) {
-        return px >= x && py >= y && px < x + w && py < y + h;
+    // ---- 边缘预警：进攻或临近时指向三条敌军通道 ----
+    void ThreatArrows(Canvas c) {
+        ForgeWorld w = sim.world;
+        if (w.defeated || w.victory) { return; }
+        if (!w.waveActive && w.nextWaveTicks > 1500) { return; }
+        int alpha = 150 + (int)(w.tick % 40) * 2;
+        if (alpha > 235) { alpha = 235; }
+        int color = (alpha << 24) | 0xCF5A35;
+        for (int lane = 0; lane < 3; lane = lane + 1) {
+            int cell = ForgeMap.SpawnCell(w, lane);
+            int cx = camera.ScreenX((cell % w.width) * 1000 + 500);
+            int cy = camera.ScreenY((cell / w.width) * 1000 + 500);
+            // 出生口在视口内就不必预警；在视口外则把箭头钳到视口边缘。
+            int mx = ForgeGrid.Clamp(cx, chromeTop + S(26), clientW - S(26));
+            int my = ForgeGrid.Clamp(cy, chromeTop + S(56), clientH - S(46));
+            if (cx == mx && cy == my) { continue; }
+            int a = S(11);
+            if (cx < mx) {          // 西通道：箭头朝左
+                c.DrawLine(mx + a, my - a, mx, my, color, S(3));
+                c.DrawLine(mx, my, mx + a, my + a, color, S(3));
+            } else if (cx > mx) {   // 东通道：箭头朝右
+                c.DrawLine(mx - a, my - a, mx, my, color, S(3));
+                c.DrawLine(mx, my, mx - a, my + a, color, S(3));
+            } else if (cy < my) {   // 北通道：箭头朝上
+                c.DrawLine(mx - a, my + a, mx, my, color, S(3));
+                c.DrawLine(mx, my, mx + a, my + a, color, S(3));
+            } else {
+                c.DrawLine(mx - a, my - a, mx, my, color, S(3));
+                c.DrawLine(mx, my, mx + a, my - a, color, S(3));
+            }
+        }
     }
 
+    // ---- 建造栏图标的强调色（与世界美术同族，小地图/预警共用） ----
     int ChipColor(int item) {
         if (item == 0) { return 0xFFE8A05D; }
         if (item == 1) { return 0xFFB5A3C9; }
@@ -174,7 +266,6 @@ class ForgeInterface {
         return 0xFFE2D5B5;
     }
 
-    /// 方块图标的强调色（与世界美术同族的简化映射）。
     int BlockAccent(int id) {
         if (id == 2) { return 0xFFE8A05D; }   // 钻头：铜
         if (id == 3) { return 0xFFC0CCD3; }   // 传送带：钢
@@ -189,258 +280,125 @@ class ForgeInterface {
         if (id == 12) { return 0xFF587D8B; }  // 管道：深青
         if (id == 13) { return 0xFFD9A13C; }  // 中继：警示金
         if (id == 14) { return 0xFF9A7DB8; }  // 油井：油紫
-        return CTertiary;
+        return 0xFF93825F;
     }
 
-    /// 建筑小图形：调色板图标与世界美术同族的极简字形。
-    /// 全部用标准图元，(x,y) 为 size×size 瓦片左上角。
-    void BlockIcon(Canvas c, int id, int x, int y, int size, int color) {
-        int cx = x + size / 2;
-        int cy = y + size / 2;
-        int u = ForgeGrid.Max(2, size / 8);
-        if (id == 2) {          // 钻头：下三角 + 顶杆
-            c.DrawLine(cx, y + u, cx, cy - u, color, u);
-            c.FillRect(cx - size / 4, cy - u, size / 2, u * 2, color);
-            c.FillRect(cx - size / 4 + u, cy + u, size / 2 - u * 2, u * 2, color);
-        } else if (id == 3) {   // 传送带：两道人字箭头
-            for (int k = 0; k < 2; k = k + 1) {
-                int ax = x + u + k * (size / 2);
-                c.DrawLine(ax, y + u * 2, ax + size / 4, cy, color, u);
-                c.DrawLine(ax + size / 4, cy, ax, y + size - u * 2, color, u);
-            }
-        } else if (id == 4) {   // 分流器：中心点 + 三向短线
-            c.FillRect(cx - u, cy - u, u * 2, u * 2, color);
-            c.DrawLine(cx, cy, cx, y + u, color, u);
-            c.DrawLine(cx, cy, x + u, y + size - u, color, u);
-            c.DrawLine(cx, cy, x + size - u, y + size - u, color, u);
-        } else if (id == 5) {   // 熔炉：炉口火苗
-            c.DrawRect(x + u * 2, y + u, size - u * 4, size - u * 2, color, u);
-            c.FillRect(cx - u, cy, u * 2, size / 4, color);
-            c.FillRect(cx - u * 2, cy + size / 4, u * 4, u, color);
-        } else if (id == 6) {   // 装配机：四点晶格
-            c.FillRect(x + u * 2, y + u * 2, u * 2, u * 2, color);
-            c.FillRect(x + size - u * 4, y + u * 2, u * 2, u * 2, color);
-            c.FillRect(x + u * 2, y + size - u * 4, u * 2, u * 2, color);
-            c.FillRect(x + size - u * 4, y + size - u * 4, u * 2, u * 2, color);
-            c.DrawRect(cx - u, cy - u, u * 2, u * 2, color, 1);
-        } else if (id == 7) {   // 发电机：闪电
-            c.DrawLine(cx + u * 2, y + u, cx - u * 2, cy, color, u);
-            c.DrawLine(cx - u * 2, cy, cx + u * 2, cy + u, color, u);
-            c.DrawLine(cx + u * 2, cy + u, cx - u, y + size - u, color, u);
-        } else if (id == 8) {   // 蓄电池：电池壳 + 电平
-            c.DrawRect(x + u * 2, y + u * 2, size - u * 4, size - u * 3, color, u);
-            c.FillRect(cx - u, y + u, u * 2, u, color);
-            c.FillRect(x + u * 3, y + size - u * 4, size - u * 6, u * 2, color);
-        } else if (id == 9) {   // 炮塔：圆座 + 炮管
-            c.DrawCircle(cx, cy, size / 3, color, u);
-            c.FillCircle(cx, cy, u + 1, color);
-            c.DrawLine(cx, cy, cx + size / 2 - u, cy, color, u + 1);
-        } else if (id == 10) {  // 合金墙：砖缝
-            c.DrawRect(x + u, y + u, size - u * 2, size - u * 2, color, u);
-            c.DrawLine(x + u, cy, x + size - u, cy, color, 1);
-            c.DrawLine(cx, y + u, cx, cy, color, 1);
-            c.DrawLine(x + u * 2, cy, x + u * 2, y + size - u, color, 1);
-        } else if (id == 11) {  // 取水泵：水滴
-            c.FillCircle(cx, cy + u, size / 3, color);
-            c.FillRect(cx - u, y + u * 2, u * 2, u * 2, color);
-        } else if (id == 12) {  // 管道：双平行管
-            c.DrawLine(x + u, cy - u, x + size - u, cy - u, color, u);
-            c.DrawLine(x + u, cy + u * 2, x + size - u, cy + u * 2, color, u);
-        } else if (id == 13) {  // 电力中继：塔架
-            c.DrawLine(cx, y + u, cx, y + size - u, color, u);
-            c.DrawLine(cx - size / 3, y + size - u, cx, cy - u, color, u);
-            c.DrawLine(cx + size / 3, y + size - u, cx, cy - u, color, u);
-            c.FillCircle(cx, y + u, u, color);
-        } else if (id == 14) {  // 油井：井架 + 油滴
-            c.DrawLine(x + u, y + size - u, cx, y + u, color, u);
-            c.DrawLine(cx, y + u, x + size - u, y + size - u, color, u);
-            c.FillCircle(cx, y + size - u * 3, u + 1, color);
-        }
-    }
+    // ================= 每帧 HUD 回写 =================
 
-    void TopBar(Canvas c) {
-        int h = S(72) + chromeTop;
-        c.FillRect(0, chromeTop, clientW, h - chromeTop, 0xE6140F0A);
-        int fsBrand = S(20);
-        c.DrawText(S(16), chromeTop + S(10), "炉心边境", CAmber, fsBrand);
-        int brandW = Canvas.MeasureText("炉心边境", fsBrand);
-        c.DrawText(S(16) + brandW + S(14), chromeTop + S(18), "C O R E F O R G E", CTertiary, S(11));
-
-        // 资源芯片：主线库存一排，色块与世界物品同源。
-        int cx = Sx(310);
-        int chipFs = S(13);
-        int[] chipItems = new int[] { 0, 1, 2, 5 };
-        for (int i = 0; i < chipItems.Length; i = i + 1) {
-            int item = chipItems[i];
-            int amount = sim.world.resources.Get(item);
-            string text = sim.world.catalog.items[item] + " " + N(amount);
-            c.FillRect(cx, chromeTop + S(16), S(12), S(12), ChipColor(item));
-            c.DrawRect(cx, chromeTop + S(16), S(12), S(12), 0x40000000, 1);
-            c.DrawText(cx + S(18), chromeTop + S(14), text, amount > 0 ? CText : CTertiary, chipFs);
-            cx = cx + S(18) + Canvas.MeasureText(text, chipFs) + S(18);
-        }
-
-        // 炉心耐久条。
+    void RefreshHud() {
         ForgeWorld w = sim.world;
-        int hpBarX = Sx(310);
-        int hpBarY = chromeTop + S(44);
-        c.FillRect(hpBarX, hpBarY, S(220), S(10), 0xFF221B10);
-        int hpPct = ForgeGrid.Max(0, w.buildings[w.coreCell].hp) * 100 / w.coreMaxHp;
-        int hpFill = S(220) * hpPct / 100;
-        c.FillRect(hpBarX, hpBarY, hpFill, S(10), hpPct > 40 ? CAmber : CDanger);
-        c.DrawRect(hpBarX, hpBarY, S(220), S(10), CBtnBorder, 1);
-        string hpText = "炉心 " + N(hpPct) + "% · 电力 " + N(w.powerSupply) + " / " + N(w.powerDemand)
-          + " · 储能 " + N(w.batteryStored / 1000) + "k";
-        c.DrawText(hpBarX + S(228), hpBarY - S(3), hpText, CSecondary, S(12));
-
-        // 右侧两排工具按钮（自右向左排布）。
-        int bh = S(26);
-        int bx = clientW - S(16);
-        bx = ButtonRow2(c, bx, chromeTop + S(40), bh);
-        bx = ButtonRow1(c, bx, chromeTop + S(8), bh);
-        int row1Left = clientW - S(16) - (S(72) * 3 + S(6) * 2);
-        DrawWaveText(c, row1Left - S(14), chromeTop + S(14));
-
-        // 熔线（签名位）：两段渐弱的琥珀细线。
-        c.FillRect(0, h, clientW / 3, S(2), CAmber);
-        c.FillRect(clientW / 3, h, clientW - clientW / 3, S(2), 0x50E08A3C);
-    }
-
-    int ButtonRow1(Canvas c, int right, int y, int h) {
-        int w = S(72);
-        int gap = S(6);
-        int x = right - w;
-        string pauseLabel = paused ? "继续" : "暂停";
-        Button(c, ZPause, x, y, w, h, pauseLabel, true, paused, CSecondary); x = x - gap - w;
-        Button(c, ZSpeed, x, y, w, h, "×" + N(speed), true, speed > 1, CSecondary); x = x - gap - w;
-        bool canLaunch = !sim.world.waveActive && !sim.world.defeated && !sim.world.victory;
-        return Button(c, ZLaunch, x, y, w, h, "迎敌", canLaunch, false, 0xFFD9A13C);
-    }
-
-    int ButtonRow2(Canvas c, int right, int y, int h) {
-        int w = S(66);
-        int gap = S(6);
-        int x = right - w;
-        Button(c, ZNew, x, y, w, h, "新远征", true, newRunArmed, CDanger); x = x - gap - w;
-        Button(c, ZFocus, x, y, w, h, "回炉心", true, false, CSecondary); x = x - gap - w;
-        Button(c, ZLoad, x, y, w, h, "读档", true, false, CSecondary); x = x - gap - w;
-        Button(c, ZSave, x, y, w, h, "保存", true, false, CSecondary); x = x - gap - w;
-        Button(c, ZTech, x, y, w, h, "科技", true, showTech, CSecondary); x = x - gap - w;
-        Button(c, ZPower, x, y, w, h, "电网", true, powerOverlay, CSecondary);
-        return x;
-    }
-
-    void DrawWaveText(Canvas c, int right, int y) {
-        ForgeWorld w = sim.world;
-        string text;
-        int color;
-        if (w.defeated) { text = "炉心失守"; color = CDanger; }
-        else if (w.victory) { text = "远征胜利"; color = CAmber; }
+        // 顶栏资源。
+        CoreforgeHud.rCopper.Text = w.catalog.items[0] + " " + N(w.resources.Get(0));
+        CoreforgeHud.rLead.Text = w.catalog.items[1] + " " + N(w.resources.Get(1));
+        CoreforgeHud.rGraphite.Text = w.catalog.items[2] + " " + N(w.resources.Get(2));
+        CoreforgeHud.rTitanium.Text = w.catalog.items[5] + " " + N(w.resources.Get(5));
+        // 波次文案：进攻期换热色。
+        bool hot = false;
+        string waveLabel;
+        if (w.defeated) { waveLabel = "炉心失守"; }
+        else if (w.victory) { waveLabel = "远征胜利"; }
         else if (w.waveActive) {
-            text = "第 " + N(w.wave) + " 波 · 敌军 " + N(w.enemyCount) + " · 待抵达 " + N(w.spawnRemaining);
-            color = CDanger;
+            hot = true;
+            waveLabel = "第 " + N(w.wave) + " 波 · 敌军 " + N(w.enemyCount) + " · 待抵达 " + N(w.spawnRemaining);
         } else {
-            text = "第 " + N(w.wave) + " / 20 波 · 准备 " + N((w.nextWaveTicks + 49) / 50) + " 秒";
-            color = CSecondary;
+            waveLabel = "第 " + N(w.wave) + " / 20 波 · 准备 " + N((w.nextWaveTicks + 49) / 50) + " 秒";
         }
-        int fs = S(14);
-        c.DrawText(right - Canvas.MeasureText(text, fs) - S(14), y, text, color, fs);
-    }
-
-    void BuildPalette(Canvas c) {
-        int bw = S(88);
-        int bh = S(66);
-        int gap = S(4);
-        int count = 13;
-        int total = count * bw + (count - 1) * gap;
-        int x0 = (clientW - total) / 2;
-        int y = clientH - S(104);
-        c.FillRect(0, y - S(6), clientW, S(110), 0x80100C07);
+        CoreforgeHud.waveText.Text = waveLabel;
+        CoreforgeHud.waveText.SetClassIn("cf-wave cf-wave-hot", hot ? "cf-wave-hot" : "cf-wave");
+        // 炉心耐久与电网。
+        int hpPct = ForgeGrid.Max(0, w.buildings[w.coreCell].hp) * 100 / w.coreMaxHp;
+        CoreforgeHud.hpBar.SetPercent(hpPct);
+        CoreforgeHud.hpText.Text = "炉心 " + N(hpPct) + "% · 电力 " + N(w.powerSupply) + " / " + N(w.powerDemand)
+          + " · 储能 " + N(w.batteryStored / 1000) + "k";
+        // 节奏按钮。
+        CoreforgeHud.btnPause.Text = paused ? "继续" : "暂停";
+        CoreforgeHud.btnPause.SetClassIn("cf-on", paused ? "cf-on" : "");
+        CoreforgeHud.btnSpeed.Text = "×" + N(speed);
+        CoreforgeHud.btnSpeed.SetClassIn("cf-on", speed > 1 ? "cf-on" : "");
+        CoreforgeHud.btnLaunch.Disabled = w.waveActive || w.defeated || w.victory;
+        // 全局开关态。
+        CoreforgeHud.btnPower.SetClassIn("cf-mini-on", powerOverlay ? "cf-mini-on" : "");
+        CoreforgeHud.btnTech.SetClassIn("cf-mini-on", showTech ? "cf-mini-on" : "");
+        CoreforgeHud.btnDemolish.SetClassIn("cf-mini-on", erase ? "cf-mini-on" : "");
+        CoreforgeHud.btnNew.Text = newRunArmed ? "确认重启？" : "新远征";
+        // 建造栏：只显示已解锁的方块，选中态换底色。
+        Button[] palette = new Button[13] { CoreforgeHud.pb2, CoreforgeHud.pb3, CoreforgeHud.pb4, CoreforgeHud.pb5, CoreforgeHud.pb6,
+          CoreforgeHud.pb7, CoreforgeHud.pb8, CoreforgeHud.pb9, CoreforgeHud.pb10, CoreforgeHud.pb11,
+          CoreforgeHud.pb12, CoreforgeHud.pb13, CoreforgeHud.pb14 };
         for (int k = 2; k < 15; k = k + 1) {
-            int x = x0 + (k - 2) * (bw + gap);
+            Button pb = palette[k - 2];
             bool unlocked = sim.world.Unlocked((BlockKind)k);
-            bool active = !erase && selected == (BlockKind)k;
-            bool hover = unlocked && InRect(mouseX, mouseY, x, y, bw, bh);
-            int bg = active ? CAmber : hover ? CBtnHover : CBtn;
-            c.FillRect(x, y, bw, bh, bg);
-            c.DrawRect(x, y, bw, bh, active ? CAmber : hover ? 0xFF6B5327 : CBtnBorder, 1);
-            int icon = S(28);
-            int ix = x + (bw - icon) / 2;
-            int iy = y + S(6);
-            c.FillRect(ix, iy, icon, icon, 0xFF251E14);
-            c.DrawRect(ix, iy, icon, icon, active ? COnAmber : BlockAccent(k), 1);
-            BlockIcon(c, k, ix + S(3), iy + S(3), icon - S(6),
-              active ? COnAmber : BlockAccent(k));
-            string name = sim.world.catalog.blocks[k].name;
-            int fs = S(12);
-            int label = active ? COnAmber : unlocked ? CSecondary : CTertiary;
-            c.DrawText(x + (bw - Canvas.MeasureText(name, fs)) / 2, y + bh - S(18), name, label, fs);
-            zones.Add(HudZone.Create(ZBuildBase + k, x, y, bw, bh, unlocked, active));
+            pb.visible = unlocked;
+            pb.SetClassIn("cf-build-on", !erase && selected == (BlockKind)k ? "cf-build-on" : "");
         }
-    }
-
-    void TechPanel(Canvas c) {
-        int w = S(380);
-        int x = S(16);
-        int y = chromeTop + S(88);
-        int rowH = S(42);
-        int h = S(46) + 5 * rowH + S(30);
-        Panel(c, x, y, w, h);
-        c.FillRect(x, y, w, S(2), CAmber);
-        c.DrawText(x + S(14), y + S(10), "研究与扩张", CAmber, S(15));
-        for (int i = 1; i < 6; i = i + 1) {
-            TechDef t = sim.world.catalog.techs[i];
-            int ry = y + S(40) + (i - 1) * rowH;
-            bool done = sim.world.researched[i];
-            bool enabled = !done && sim.world.researched[t.parent] && sim.world.resources.Has(t.cost);
-            bool hover = enabled && InRect(mouseX, mouseY, x + S(12), ry, w - S(24), rowH - S(6));
-            c.FillRect(x + S(12), ry, w - S(24), rowH - S(6),
-              done ? 0xFF1D2412 : hover ? CBtnHover : CBtn);
-            c.DrawRect(x + S(12), ry, w - S(24), rowH - S(6),
-              done ? 0xFF3A4A22 : hover ? 0xFF6B5327 : CBtnBorder, 1);
-            string head = (done ? "已完成 · " : enabled ? "研究 · " : "锁定 · ") + t.name;
-            c.DrawText(x + S(24), ry + S(6), head, done ? COk : enabled ? CText : CTertiary, S(13));
-            c.DrawText(x + S(24), ry + S(22), Cost(t.cost), CTertiary, S(11));
-            zones.Add(HudZone.Create(ZTechBase + i, x + S(12), ry, w - S(24), rowH - S(6), enabled, false));
+        // 远征目标（完成即收起，让位科技面板）。
+        int belts = 0; int drills = 0; int furnaces = 0; int turrets = 0; int power = 0;
+        for (int i = 0; i < w.buildings.Length; i = i + 1) {
+            BlockKind k = w.buildings[i].kind;
+            if (k == BlockKind.Belt) { belts = belts + 1; }
+            else if (k == BlockKind.Drill) { drills = drills + 1; }
+            else if (k == BlockKind.Furnace) { furnaces = furnaces + 1; }
+            else if (k == BlockKind.Turret) { turrets = turrets + 1; }
+            else if (k == BlockKind.Generator || k == BlockKind.Battery) { power = power + 1; }
         }
-        c.DrawText(x + S(14), y + h - S(24), "前置完成后，用核心库存换取扩张。", CTertiary, S(12));
-    }
-
-    void DetailPanel(Canvas c) {
+        bool[] done = new bool[5];
+        done[0] = belts >= 6;
+        done[1] = drills >= 6;
+        done[2] = furnaces >= 1;
+        done[3] = turrets >= 4 && power >= 1;
+        done[4] = w.wave > 3 || w.victory;
+        Label[] obj = new Label[5] { CoreforgeHud.obj0, CoreforgeHud.obj1, CoreforgeHud.obj2, CoreforgeHud.obj3, CoreforgeHud.obj4 };
+        string[] objText = new string[5] {
+            "铺设 6 段传送带（" + N(ForgeGrid.Min(belts, 6)) + "/6）",
+            "运行 6 座钻头（" + N(ForgeGrid.Min(drills, 6)) + "/6）",
+            "建造 1 座熔炉" + (done[2] ? "" : "，把矿石炼成建材"),
+            "4 座炮塔 + 1 座供电（" + N(ForgeGrid.Min(turrets, 4)) + "/4）",
+            "打退第 3 波进攻" + (done[4] ? "" : "，迎敌按钮提前开战"),
+        };
+        bool allDone = true;
+        for (int i = 0; i < 5; i = i + 1) {
+            if (!done[i]) { allDone = false; }
+            obj[i].Text = (done[i] ? "✔ " : "· ") + objText[i];
+            obj[i].SetClassIn("cf-obj cf-obj-done", done[i] ? "cf-obj-done" : "cf-obj");
+        }
+        CoreforgeHud.Objectives.visible = !allDone && !showTech && !w.defeated && !w.victory;
+        // 科技面板。
+        CoreforgeHud.Tech.visible = showTech && !w.defeated && !w.victory;
+        Button[] techRow = new Button[5] { CoreforgeHud.tech1, CoreforgeHud.tech2, CoreforgeHud.tech3, CoreforgeHud.tech4, CoreforgeHud.tech5 };
+        for (int i = 1; i <= 5; i = i + 1) {
+            TechDef t = w.catalog.techs[i];
+            bool finished = w.researched[i];
+            bool ready = !finished && w.researched[t.parent] && w.resources.Has(t.cost);
+            techRow[i - 1].Text = (finished ? "✔ 已完成 · " : ready ? "▶ 研究 · " : "🔒 锁定 · ") + t.name + "　" + Cost(t.cost);
+            techRow[i - 1].Disabled = !ready;
+        }
+        // 选中/点检详情。
         string body = DetailBody();
-        if (body == "") { return; }
-        int wpx = S(292);
-        int x = clientW - wpx - S(12);
-        int y = chromeTop + S(88);
-        int pad = S(12);
-        int fs = S(13);
-        int textW = wpx - pad * 2;
-        List<string> lines = TextWrap.Lines(body, textW, fs);
-        bool hasContext = RecipeBtn() != "" || TargetBtn() || FeedBtn();
-        int h = pad * 2 + Canvas.FontHeight(S(15)) + S(4) + lines.Count * Canvas.FontHeight(fs)
-          + (hasContext ? S(30) : 0);
-        Panel(c, x, y, wpx, h);
-        c.FillRect(x, y, wpx, S(2), CAmber);
-        c.DrawText(x + pad, y + pad - S(2), DetailTitle(), CAmber, S(15));
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            c.DrawText(x + pad, y + pad + Canvas.FontHeight(S(15)) + S(4) + i * Canvas.FontHeight(fs),
-              lines[i], CText, fs);
-        }
-        if (hasContext) {
-            int by = y + h - S(30);
-            int bw = S(84);
-            int bx = x + wpx - pad - bw;
-            if (FeedBtn()) {
-                Button(c, ZFeed, bx, by, bw, S(24), FeedLabel(), true, false, CSecondary);
-                bx = bx - S(4) - bw;
-            }
-            if (TargetBtn()) {
-                Button(c, ZTarget, bx, by, bw, S(24), TargetLabel(), true, false, CSecondary);
-                bx = bx - S(4) - bw;
-            }
-            if (RecipeBtn() != "") { Button(c, ZRecipe, bx, by, bw, S(24), RecipeBtn(), true, false, CSecondary); }
+        CoreforgeHud.Detail.visible = body != "";
+        CoreforgeHud.detTitle.Text = DetailTitle();
+        CoreforgeHud.detBody.Text = body;
+        CoreforgeHud.btnRecipe.visible = RecipeBtn() != "";
+        CoreforgeHud.btnTarget.visible = TargetBtn();
+        CoreforgeHud.btnFeed.visible = FeedBtn();
+        // 波幅横幅。
+        bool bannerOn = w.waveActive && !w.defeated && !w.victory;
+        CoreforgeHud.Banner.visible = bannerOn;
+        CoreforgeHud.bannerText.Text = "⚑ 第 " + N(w.wave) + " 波 · 守住炉心";
+        // 状态栏。
+        CoreforgeHud.statusText.Text = paused ? "已暂停 · 可以规划、建造和研究。" : status;
+        // 结算幕。
+        bool ended = w.defeated || w.victory;
+        CoreforgeHud.EndVeil.visible = ended;
+        if (ended) {
+            CoreforgeHud.endTitle.Text = w.victory ? "远征胜利" : "炉心失守";
+            int minutes = w.tick / 50 / 60;
+            int seconds = w.tick / 50 % 60;
+            CoreforgeHud.endStats.Text = "坚守 " + N(ForgeGrid.Max(0, w.wave - 1)) + " 波 · 击杀 " + N(w.kills)
+              + " · 生产 " + N(w.produced) + " · 历时 " + N(minutes) + " 分 " + N(seconds) + " 秒";
         }
     }
+
+    // ================= 详情文案 =================
 
     string DetailTitle() {
         ForgeWorld w = sim.world;
@@ -468,9 +426,10 @@ class ForgeInterface {
             ForgeBuilding b = w.buildings[inspectCell];
             ForgeTile t = w.tiles[inspectCell];
             if (b.kind != BlockKind.Empty) {
+                string stockLine = Cost(b.stock);
                 string details = "HP " + N(b.hp) + " · 效率 " + N(b.efficiency / 10) + "%"
-                  + "\n水 " + N(b.water) + " / 油 " + N(b.oil)
-                  + "\n库存 " + Cost(b.stock);
+                  + "\n水 " + N(b.water) + " / 油 " + N(b.oil);
+                if (stockLine != "") { details = details + "\n库存 " + stockLine; }
                 if (b.kind == BlockKind.Furnace || b.kind == BlockKind.Assembler) {
                     RecipeDef recipe = w.catalog.recipes[b.recipe];
                     details = details + "\n" + recipe.name + "：" + Cost(recipe.input)
@@ -513,57 +472,6 @@ class ForgeInterface {
         return "投入原料";
     }
 
-    void StatusRow(Canvas c) {
-        int y = clientH - S(28);
-        c.FillRect(0, y, clientW, S(28), 0xE6140F0A);
-        c.FillRect(0, y, clientW, 1, CBtnBorder);
-        string text = paused ? "已暂停 · 可以规划、建造和研究。" : status;
-        c.DrawText(S(16), y + S(7), text, CSecondary, S(13));
-        int bw = S(88);
-        int bh = S(22);
-        int bx = clientW - S(16) - bw;
-        Button(c, ZCancel, bx, y + S(3), bw, bh, "取消 Q", true, false, CSecondary);
-        bx = bx - S(6) - bw;
-        Button(c, ZDemolish, bx, y + S(3), bw, bh, "拆除 X", true, erase, CSecondary);
-        bx = bx - S(6) - bw;
-        Button(c, ZRotate, bx, y + S(3), bw, bh, "旋转 R", true, false, CSecondary);
-    }
-
-    void WaveBanner(Canvas c) {
-        ForgeWorld w = sim.world;
-        if (!w.waveActive || w.defeated || w.victory) { return; }
-        int pulse = 0xB4 + (w.tick % 50) * 50 / 50;
-        string text = "⚑ 第 " + N(w.wave) + " 波 · 守住炉心";
-        int fs = S(16);
-        int tw = Canvas.MeasureText(text, fs);
-        int x = (clientW - tw) / 2;
-        int y = chromeTop + S(84);
-        c.FillRect(x - S(14), y - S(4), tw + S(28), Canvas.FontHeight(fs) + S(8), (pulse << 24) | 0x140F0A);
-        c.DrawText(x, y, text, 0xFFCF5A35, fs);
-    }
-
-    void Tooltip(Canvas c) {
-        if (showTech) { return; }
-        int zone = ZoneAt(mouseX, mouseY);
-        if (zone < ZBuildBase || zone >= ZBuildBase + 15) { return; }
-        int id = zone - ZBuildBase;
-        BlockDef def = sim.world.catalog.blocks[id];
-        string text = def.name + "\n" + def.help + "\n建造消耗：" + Cost(def.cost);
-        int w = S(270);
-        int fs = S(12);
-        List<string> lines = TextWrap.Lines(text, w - S(20), fs);
-        int h = S(10) + lines.Count * Canvas.FontHeight(fs) + S(10);
-        int x = mouseX + S(14);
-        int y = mouseY + S(14);
-        if (x + w > clientW) { x = mouseX - w - S(10); }
-        if (y + h > clientH - S(104)) { y = mouseY - h - S(10); }
-        Panel(c, x, y, w, h);
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            c.DrawText(x + S(10), y + S(10) + i * Canvas.FontHeight(fs), lines[i],
-              i == 0 ? CAmber : CSecondary, fs);
-        }
-    }
-
     string Cost(Stock stock) {
         string text = "";
         for (int i = 0; i < 6; i = i + 1) {
@@ -582,38 +490,50 @@ class ForgeInterface {
         return "向北 ↑";
     }
 
-    // ================= 命中与动作 =================
-    int ZoneAt(int x, int y) {
-        for (int i = 0; i < zones.Count; i = i + 1) {
-            HudZone z = zones[i];
-            if (InRect(x, y, z.x, z.y, z.w, z.h)) { return z.id; }
-        }
-        return 0;
+    // ================= HUD 遮蔽与控件点击 =================
+
+    /// 世界输入的遮蔽区：chrome 容器（控件树已接管命中与处理）
+    /// 加上画布小地图。返回 true 的点不再进入世界绘制逻辑。
+    bool HudConsumes(int x, int y) {
+        if (x < 0 || y < 0) { return false; }
+        if (InRect(x, y, CoreforgeHud.Topbar.bx, CoreforgeHud.Topbar.by, CoreforgeHud.Topbar.bw, CoreforgeHud.Topbar.bh)) { return true; }
+        if (InRect(x, y, CoreforgeHud.Toolbar.bx, CoreforgeHud.Toolbar.by, CoreforgeHud.Toolbar.bw, CoreforgeHud.Toolbar.bh)) { return true; }
+        if (CoreforgeHud.Objectives.visible && InRect(x, y, CoreforgeHud.Objectives.bx, CoreforgeHud.Objectives.by, CoreforgeHud.Objectives.bw, CoreforgeHud.Objectives.bh)) { return true; }
+        if (CoreforgeHud.Detail.visible && InRect(x, y, CoreforgeHud.Detail.bx, CoreforgeHud.Detail.by, CoreforgeHud.Detail.bw, CoreforgeHud.Detail.bh)) { return true; }
+        if (CoreforgeHud.Tech.visible && InRect(x, y, CoreforgeHud.Tech.bx, CoreforgeHud.Tech.by, CoreforgeHud.Tech.bw, CoreforgeHud.Tech.bh)) { return true; }
+        if (CoreforgeHud.Banner.visible && InRect(x, y, CoreforgeHud.Banner.bx, CoreforgeHud.Banner.by, CoreforgeHud.Banner.bw, CoreforgeHud.Banner.bh)) { return true; }
+        if (InRect(x, y, CoreforgeHud.Palette.bx, CoreforgeHud.Palette.by, CoreforgeHud.Palette.bw, CoreforgeHud.Palette.bh)) { return true; }
+        if (InRect(x, y, CoreforgeHud.Statusbar.bx, CoreforgeHud.Statusbar.by, CoreforgeHud.Statusbar.bw, CoreforgeHud.Statusbar.bh)) { return true; }
+        if (CoreforgeHud.EndVeil.visible) { return true; }
+        if (InRect(x, y, miniX, miniY, miniW, miniH)) { return true; }
+        return false;
     }
 
-    void Activate(int id) {
-        if (id == ZPause) { paused = !paused; newRunArmed = false; }
-        else if (id == ZSpeed) { speed = speed == 1 ? 2 : speed == 2 ? 4 : 1; }
-        else if (id == ZLaunch) { sim.combat.StartWave(); }
-        else if (id == ZTech) { showTech = !showTech; }
-        else if (id == ZPower) { powerOverlay = !powerOverlay; }
-        else if (id == ZSave) { Save(); }
-        else if (id == ZLoad) { Load(); }
-        else if (id == ZFocus) { camera.Focus(sim.world); }
-        else if (id == ZNew) { NewRun(); }
-        else if (id == ZRotate) { Rotate(); }
-        else if (id == ZDemolish) { erase = !erase; selected = BlockKind.Empty; }
-        else if (id == ZCancel) { Cancel(); }
-        else if (id == ZRecipe) { CycleRecipe(); }
-        else if (id == ZTarget) { CycleTarget(); }
-        else if (id == ZFeed) { Feed(); }
-        else if (id >= ZTechBase && id < ZTechBase + 6) { Research(id - ZTechBase); }
-        else if (id >= ZBuildBase && id < ZBuildBase + 15) {
-            selected = (BlockKind)(id - ZBuildBase);
-            erase = false;
-            showTech = false;
-        }
+    /// 自测通道：按控件名找节点并触发它的 click 处理器——与真实
+    /// 鼠标点击走同一条 form.Call 路径。
+    void ClickHud(string controlName) {
+        if (hud == null) { return; }
+        Control target = FindNamed(hud, controlName);
+        if (target == null) { Console.WriteLine("ClickHud " + controlName + " not found"); return; }
+        string handler = target.GetHandler("Click");
+        if (handler == "") { Console.WriteLine("ClickHud " + controlName + " no handler"); return; }
+        hud.Call(handler);
     }
+
+    Control FindNamed(Control node, string name) {
+        if (node.name == name) { return node; }
+        for (int i = 0; i < node.children.Count; i = i + 1) {
+            Control found = FindNamed(node.children[i], name);
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+
+    bool InRect(int px, int py, int x, int y, int w, int h) {
+        return px >= x && py >= y && px < x + w && py < y + h;
+    }
+
+    // ================= 动作 =================
 
     void Message(string text) {
         status = text;
@@ -711,7 +631,8 @@ class ForgeInterface {
         Message("新的荒原已就绪。先规划运输，再扩张防线。");
     }
 
-    // ================= 输入 =================
+    // ================= 世界输入 =================
+
     bool OverWorld(int x, int y) {
         return x >= 0 && y >= chromeTop && x < clientW && y < clientH;
     }
@@ -745,30 +666,40 @@ class ForgeInterface {
         }
     }
 
+    /// 小地图跳转：把视口中心移到 cell。
+    void JumpToCell(int cell) {
+        if (cell < 0) { return; }
+        ForgeWorld w = sim.world;
+        double tx = cell % w.width + 0.5;
+        double ty = cell / w.width + 0.5;
+        double pixels = ForgeGrid.TileSize() * camera.zoom;
+        camera.Pan((camera.x - tx) * pixels, (camera.y - ty) * pixels);
+    }
+
     void Input(int kind, int x, int y, int button, int code, int mods, int flag) {
         previousX = mouseX; previousY = mouseY;
         mouseX = x; mouseY = y;
         clientW = app.ClientWidth(); clientH = app.ClientHeight();
         uiScale = clientW / 1280.0;
-        if (zones.Count == 0 && app.canvas != null) { Render(); }
         bool over = OverWorld(x, y);
-        hoverCell = over ? camera.CellAt(sim.world, x, y) : -1;
+        bool hud = HudConsumes(x, y);
+        hoverCell = over && !hud ? camera.CellAt(sim.world, x, y) : -1;
         if (kind == 4 || kind == 5) {
             if (code >= 0 && code < 256) {
                 bool repeat = keys[code];
                 keys[code] = kind == 4;
                 if (kind == 4 && !repeat) {
-                    if (code == 32) { paused = !paused; newRunArmed = false; }
+                    if (code == 32) { TogglePause(); }
                     else if (code == 82) { Rotate(); }
                     else if (code == 81 || code == 27) { Cancel(); }
                     else if (code == 88) { erase = !erase; selected = BlockKind.Empty; }
                     else if (code == 84) { showTech = !showTech; }
-                    else if (code == 49) { selected = BlockKind.Drill; erase = false; showTech = false; }
-                    else if (code == 50) { selected = BlockKind.Belt; erase = false; showTech = false; }
-                    else if (code == 51) { selected = BlockKind.Turret; erase = false; showTech = false; }
+                    else if (code == 49) { SelectBlock((int)BlockKind.Drill); }
+                    else if (code == 50) { SelectBlock((int)BlockKind.Belt); }
+                    else if (code == 51) { SelectBlock((int)BlockKind.Turret); }
                 }
             }
-        } else if (kind == 13 && over) {
+        } else if (kind == 13 && over && !hud) {
             // 桌面滚轮：每 ±120 格 1.12 倍。原生捏合（mods=1）携带
             // 120*log2(距离比)，2^(code/120) 与手指距离精确一致。
             double factor = mods == 1 ? Math.Pow(2.0, (double)code / 120.0)
@@ -776,15 +707,16 @@ class ForgeInterface {
             camera.ZoomAt(factor, x, y);
         } else if (kind == 2) {
             if (button == 0) {
-                int zone = ZoneAt(x, y);
-                if (zone != 0) { pressedZone = zone; }
-                else if (over) { leftDown = true; downCell = hoverCell; lastCell = -1; }
+                if (hud) { miniArmed = false; }
+                else if (InRect(x, y, miniX, miniY, miniW, miniH)) { miniArmed = true; }
+                else { leftDown = true; downCell = hoverCell; lastCell = -1; }
             }
-            if (button == 1 && over && ZoneAt(x, y) == 0) { rightDown = true; }
+            if (button == 1 && over && !hud) { rightDown = true; }
         } else if (kind == 1) {
             if (flag > 0) {
-                // 每个手势的第一个事件是基准点，不是位移。
-                if (flag == gestureFlag && over) { camera.Pan(x - previousX, y - previousY); }
+                // 每个手势的第一个事件是基准点，不是位移；
+                // 起点压在 chrome/小地图上的手势不拖世界。
+                if (flag == gestureFlag && over && !hud && !HudConsumes(previousX, previousY)) { camera.Pan(x - previousX, y - previousY); }
                 gestureFlag = flag;
                 leftDown = false;
             } else if (rightDown) { camera.Pan(x - previousX, y - previousY); }
@@ -798,17 +730,27 @@ class ForgeInterface {
             }
         } else if (kind == 3) {
             if (button == 0) {
-                int zone = ZoneAt(x, y);
-                if (pressedZone != 0 && zone == pressedZone) { Activate(pressedZone); }
-                else if (pressedZone == 0 && flag == 0 && over) { PaintCell(hoverCell); }
+                if (miniArmed && InRect(x, y, miniX, miniY, miniW, miniH)) {
+                    int cell = MiniCellAt(x, y);
+                    if (cell >= 0) { JumpToCell(cell); }
+                } else if (!hud && flag == 0 && over) { PaintCell(hoverCell); }
             }
-            pressedZone = 0;
+            miniArmed = false;
             leftDown = false;
             rightDown = false;
             gestureFlag = 0;
             downCell = -1;
             lastCell = -1;
         }
+    }
+
+    int MiniCellAt(int x, int y) {
+        ForgeWorld w = sim.world;
+        int tile = S(4);
+        int tx = (x - miniX) / tile;
+        int ty = (y - miniY) / tile;
+        if (tx < 0 || ty < 0 || tx >= w.width || ty >= w.height) { return -1; }
+        return w.Index(tx, ty);
     }
 
     void TickCamera(int deltaMs) {

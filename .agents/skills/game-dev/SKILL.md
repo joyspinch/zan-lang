@@ -114,6 +114,44 @@ description: Zan 2D 游戏(templates/game/* 与 stdlib/Game)的帧循环、HUD �
   alike 回落 auto=100% 母宽）——P8 已修（StyleDeclaresWidth 认 Pm、
   包含块未定的测量路径回落 fb），血条宽度可直接 `width:X%` 驱动。
 
+### 世界画布 + 声明式 HUD 叠加定式（coreforge 2026-10-07 全链路验证）
+
+RTS/工厂类也能吃声明式 HUD：每帧变的游戏坐标内容（小地图/边缘预警/
+粒子）留在画布直绘，chrome（顶栏/面板/建造栏/结算幕）全部进
+App.html + 游戏自己的皮肤。坑与定式，每条都是踩过才成立的：
+
+- **每帧组合不要调 RenderFrame**：它内部先 RenderBackground（主题
+  底色+壁纸），会把世界整个盖掉。手动走三步
+  `MeasureTree → Arrange(ShapeOffX, ContentTop+ShapeOffY, clientW, clientH-ContentTop) → RenderTree`，
+  世界画在其前。
+- **游戏皮肤的 `window { background }` 必须透明**：RenderTree 先画
+  Form 自身的 window 样式表面——写 opaque 底色就是全屏遮罩，表现为
+  "HUD 在、世界全黑"。根 Panel（Panel.Root，style=3）天然透明，别画蛇添足。
+- **自由几何要 `data-position="1"`**（+`data-anchor`，10=stretch）：
+  缺了 pos=0 一律 Dock(Top) 通栏堆叠——面板全宽、层层压顶，整屏像
+  工具表单（用户："这是要把游戏改成工具吗"）。且 body 直接子级只吃
+  dock；悬浮面板必须包进一个 `data-dock="5"` 的裸 div 宿主再写 fx/fy
+  （wuwei Menu 同款）。
+- **裸 `<stack>` 标签不是 Stack 控件**：TagKind 兜底成自由 Panel，
+  子级全叠原点。纵列用 `<zan-flex class="column">`。
+- **事件键是 `"Click"` 不是 `"click"`**：生成器发
+  `SetHandler(key.Substring(2))`，模型键 onClick 截出 Click。
+  自测合成点击走 `form.Call(control.GetHandler("Click"))`，与真实
+  点击同一条 form.Call 分发路径。
+- **设计文档必须显式列进 zanc 命令行**（App.html 与 main.zan 同目录
+  也不会被自动捡起；漏了就是生成字段全体缺失，报
+  "partial class has no member rXxx" 满屏）。
+- **皮肤从 cwd 解析**（`./skins` walk，其次 $ZAN_GUI_SKINS，再次
+  exe 内嵌）：开发期从模板目录运行；发布 `--publish --embed
+  skins=skins`。皮肤没加载时回落内置暗色主题——"界面突然变灰"先查 cwd。
+- **code-behind 每帧回写习惯**：文案 `.Text =`（Binding<string> 存常
+  量）、进度 `SetPercent`、禁用 `Disabled =`（` :disabled` 样式）、
+  显隐 `visible`（子树整体退出测量/布局/命中）、互斥选中态
+  `SetClassIn("cf-a cf-b", ...)`。事件接线一次性 `form.On(name, () => …)`。
+- **双通道输入的分工**：自有循环里 PollOneEvent→ProcessEvent 已把
+  真实点击路由进控件树；世界输入通道（game.Input）按容器
+  bx/by/bw/bh + visible 做 HudConsumes 遮蔽，HUD 上的桌面事件不进世界。
+
 ## 立即模式直绘 HUD（RTS/工厂类的全图形化热 HUD）
 
 - 全图形化 HUD（画面上零原生控件）的定式：渲染帧清空 zone 表 → 各
@@ -122,9 +160,11 @@ description: Zan 2D 游戏(templates/game/* 与 stdlib/Game)的帧循环、HUD �
   **返回右缘 x+w**；向左链式排布必须显式两步 `Button(...); bx = bx
   - gap - w;`——写成 `bx = Button(...) - gap - w` 丢了 w，按钮会叠在
   一起（coreforge 实测间距只剩 9px）。
-- 游戏的式样是游戏自己的：调色板/面板/图标常量写在游戏源码里，不走
-  Gui 皮肤系统、不设皮肤选择按钮（2026-10-06 用户裁决）；HUD 里出现
-  原生按钮即返工。
+- 游戏的式样是游戏自己的：不走全局皮肤系统、标题栏不设皮肤选择按钮
+  （2026-10-06 用户裁决；SetChromeButtons 关掉选择器）。游戏自己的
+  皮肤文件（`UseSkin("游戏名")` + `skins/<名>/skin.css`）是 2026-10-07
+  用户裁决认可的正道——HTML+CSS 声明式 chrome 配游戏专属皮肤，见上
+  一节"世界画布 + 声明式 HUD 叠加定式"。
 
 ## 游戏界面设计方案：菜单/面板走 .html 设计稿 + Nav 出口
 

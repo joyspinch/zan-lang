@@ -11,17 +11,22 @@ class ForgeCamera {
     double x;
     double y;
     double zoom;
+    int shakeX;
+    int shakeY;
 
-    ForgeCamera() { zoom = 1.0; }
+    ForgeCamera() { zoom = 1.0; shakeX = 0; shakeY = 0; }
+
+    void SetShake(int sx, int sy) { shakeX = sx; shakeY = sy; }
 
     // x/y denote the viewport center in tiles; simulation coordinates use 1000 units per tile.
     int ScreenX(int world1000) {
-        return viewportX + (int)Math.Round(viewportW * 0.5 + (world1000 / 1000.0 - x) * ForgeGrid.TileSize() * zoom);
+        return viewportX + shakeX + (int)Math.Round(viewportW * 0.5 + (world1000 / 1000.0 - x) * ForgeGrid.TileSize() * zoom);
     }
     int ScreenY(int world1000) {
-        return viewportY + (int)Math.Round(viewportH * 0.5 + (world1000 / 1000.0 - y) * ForgeGrid.TileSize() * zoom);
+        return viewportY + shakeY + (int)Math.Round(viewportH * 0.5 + (world1000 / 1000.0 - y) * ForgeGrid.TileSize() * zoom);
     }
     int CellAt(ForgeWorld w, int mx, int my) {
+        mx = mx - shakeX; my = my - shakeY;
         if (viewportW <= 0 || viewportH <= 0 || mx < viewportX || my < viewportY ||
             mx >= viewportX + viewportW || my >= viewportY + viewportH) { return -1; }
         double pixels = ForgeGrid.TileSize() * zoom;
@@ -176,39 +181,49 @@ class ForgeRenderer {
         AtCell(w, camera, cell);
         int width = camera.ScreenX((tx + 1) * 1000) - originX;
         int height = camera.ScreenY((ty + 1) * 1000) - originY;
-        int ground = 0xFF484838;
-        if (hash % 5 == 0) { ground = 0xFF4C4939; }
-        if (hash % 5 == 1) { ground = 0xFF444638; }
-        if (hash % 11 == 0) { ground = 0xFF50483A; }
+        // 地面三层变化：区域基色（大尺度色块）→ 格内抖动 → 碎屑装饰，
+        // 让地图读起来是"地貌"而不是棋盘。
+        int region = ((tx / 5) * 73856093 ^ (ty / 5) * 19349663 ^ (w.seed & 65535)) & 1023;
+        int ground = region % 3 == 0 ? 0xFF5A5340 : region % 3 == 1 ? 0xFF524C3A : 0xFF5E5743;
+        if (hash % 7 == 0) { ground = 0xFF605845; }
+        else if (hash % 7 == 1) { ground = 0xFF4E4938; }
         canvas.FillRect(originX, originY, width, height, ground);
         if (tile.terrain == TerrainKind.Water || tile.terrain == TerrainKind.Oil) {
             bool water = tile.terrain == TerrainKind.Water;
-            int liquid = water ? 0xFF244C50 : 0xFF272432;
-            if (hash % 3 == 0) { liquid = water ? 0xFF285357 : 0xFF2C2638; }
+            int liquid = water ? 0xFF2E5F63 : 0xFF332A44;
+            if (hash % 3 == 0) { liquid = water ? 0xFF33686C : 0xFF3A2F4E; }
             canvas.FillRect(originX, originY, width, height, liquid);
             for (int d = 0; d < 4; d = d + 1) {
                 int adjacent = w.Neighbor(cell, d);
                 if (adjacent < 0 || w.tiles[adjacent].terrain != tile.terrain) {
-                    TurnRect(29, 0, 3, 32, d, water ? 0xFF526557 : 0xFF544745);
-                    TurnLine(28, 2, 28, 29, d, water ? 0xFF559B91 : 0xFF716176, 1);
+                    TurnRect(29, 0, 3, 32, d, water ? 0xFF5C6E58 : 0xFF5A4B55);
+                    TurnLine(28, 2, 28, 29, d, water ? 0xFF7FB8A8 : 0xFF8A7492, 1);
                 }
             }
             if (hash % 3 == 0 && scale >= 0.6) {
                 int ripple = (w.tick / 12 + hash) % 7;
                 if (water) {
-                    Line(5, 9 + ripple, 14, 9 + ripple, 0xFF427874, 1);
-                    Line(17, 18 + ripple, 25, 18 + ripple, 0xFF366B69, 1);
+                    Line(5, 9 + ripple, 14, 9 + ripple, 0xFF4E8A84, 1);
+                    Line(17, 18 + ripple, 25, 18 + ripple, 0xFF427A76, 1);
                 } else {
-                    Sector(15, 17, 7, 8, 195 + ripple, 285 + ripple, 0xFF68506E);
-                    Line(11, 11, 17, 9, 0xFF80705E, 1);
+                    Sector(15, 17, 7, 8, 195 + ripple, 285 + ripple, 0xFF7A5F84);
+                    Line(11, 11, 17, 9, 0xFF8A7A66, 1);
                 }
             }
         } else if (scale >= 0.65) {
-            int gritX = 4 + hash % 23; int gritY = 4 + (hash / 7) % 23;
-            Rect(gritX, gritY, 2, 1, 0xFF69604A);
+            int gritX = 3 + hash % 24; int gritY = 3 + (hash / 7) % 24;
+            Rect(gritX, gritY, 3, 1, 0xFF6E6450);
+            if (hash % 3 == 0) { Rect((gritX + 11) % 27, (gritY + 9) % 27, 2, 2, 0xFF69614C); }
             if (hash % 4 == 0) {
-                Line(3, 24, 12, 21, 0xFF393E33, 1);
-                Line(12, 21, 17, 22, 0xFF393E33, 1);
+                Line(3, 24, 12, 21, 0xFF3E4436, 1);
+                Line(12, 21, 17, 22, 0xFF3E4436, 1);
+            }
+            if (hash % 6 == 0) {
+                // 草簇：三短笔的暗绿，让荒原有一丝生机。
+                int gx = 5 + hash % 20; int gy = 5 + (hash / 3) % 20;
+                Line(gx, gy, gx - 2, gy - 4, 0xFF6E7A46, 1);
+                Line(gx, gy, gx, gy - 5, 0xFF7A8550, 1);
+                Line(gx, gy, gx + 2, gy - 4, 0xFF646F40, 1);
             }
         }
         if (tile.terrain == TerrainKind.Rock) { Rock(hash); }
@@ -232,18 +247,22 @@ class ForgeRenderer {
     }
     void Ore(int item, int hash) {
         int color = ItemColor(item);
-        for (int i = 0; i < 4; i = i + 1) {
-            int px = 6 + (hash + i * 13) % 20;
-            int py = 6 + (hash / 5 + i * 11) % 19;
-            Rect(px - 3, py - 2, 7, 6, 0xFF303936);
+        // 矿脉底光：整格淡淡的物品色，缩放再小也能读出矿脉走向。
+        Rect(1, 1, 30, 30, ((color & 0x00FFFFFF) | 0x2E000000));
+        for (int i = 0; i < 5; i = i + 1) {
+            int px = 5 + (hash + i * 13) % 22;
+            int py = 5 + (hash / 5 + i * 11) % 21;
+            Rect(px - 4, py - 3, 9, 8, 0xFF2E3734);
             if (item == 2) {
-                Rect(px - 2, py - 3, 4, 6, 0xFF384451);
-                Line(px - 2, py - 3, px + 1, py - 4, color, 1);
-                Line(px + 1, py - 4, px + 3, py - 1, 0xFF9EA9AD, 1);
+                Rect(px - 3, py - 4, 5, 8, 0xFF3E4C5C);
+                Line(px - 3, py - 4, px + 1, py - 6, color, 2);
+                Line(px + 1, py - 6, px + 4, py - 1, 0xFFAEB9BD, 1);
+                Rect(px - 2, py - 1, 2, 2, color);
             } else {
-                Rect(px - 2, py - 2, 5, 4, color);
-                Rect(px - 1, py - 3, 3, 2, item == 0 ? 0xFFFFC880 : 0xFFDEE9DC);
-                Line(px, py + 1, px + 3, py, item == 0 ? 0xFF976746 : 0xFF566270, 1);
+                Rect(px - 3, py - 3, 7, 6, color);
+                Rect(px - 2, py - 4, 4, 3, item == 0 ? 0xFFFFCE8E : 0xFFE4EEE0);
+                Line(px, py + 2, px + 4, py + 1, item == 0 ? 0xFF976746 : 0xFF566270, 1);
+                if (i == 2) { Rect(px + 2, py - 1, 3, 3, color); }
             }
         }
     }
@@ -364,8 +383,9 @@ class ForgeRenderer {
     void Core(ForgeWorld w) {
         int pulse = (w.tick / 5) % 12;
         if (pulse > 6) { pulse = 12 - pulse; }
-        Glow(16, 16, 34 + pulse, 0xFFE9B45F, 42);
-        Ring(16, 16, 22, 0x506EC7B8, 1);
+        Glow(16, 16, 44 + pulse * 2, 0xFFE9B45F, 66);
+        Glow(16, 16, 24, 0xFFFFD98F, 60);
+        Ring(16, 16, 22, 0x606EC7B8, 1);
         Plate(0xFF947C52);
         Rect(7, 5, 18, 22, 0xFF273B3F);
         Rect(5, 9, 22, 14, 0xFF273B3F);
@@ -625,6 +645,45 @@ class ForgeRenderer {
             canvas.DrawLine(endX, endY, px, py, 0x90F3CB8B, ForgeGrid.Max(1, radius));
             canvas.FillCircle(px, py, radius + 1, 0xA0C88F5A);
             canvas.FillCircle(px, py, radius, 0xFFFFEDBF);
+            Glow(px, py, radius * 5, 0xFFE8B06A, 46);
+        }
+    }
+
+    void Effects(ForgeWorld w, ForgeCamera camera) {
+        int fs = ForgeGrid.Max(9, (int)Math.Round(11.0 * camera.zoom));
+        for (int i = 0; i < w.effects.Length; i = i + 1) {
+            ForgeEffect e = w.effects[i];
+            if (!e.active) { continue; }
+            int px = camera.ScreenX(e.x); int py = camera.ScreenY(e.y);
+            if (!Visible(camera, px, py, S(40))) { continue; }
+            int alpha = ForgeGrid.Max(0, ForgeGrid.Min(255, e.life * 255 / ForgeGrid.Max(1, e.maxLife)));
+            int tint = e.color & 0x00FFFFFF;
+            if (e.kind == 0) {
+                // 枪口焰：亮核 + 外圈，一拍即散。
+                Glow(px, py, S(14), tint, alpha * 60 / 255);
+                canvas.FillCircle(px, py, Stroke(e.size + 2), ((alpha * 220 / 255) << 24) | tint);
+                canvas.FillCircle(px, py, ForgeGrid.Max(1, Stroke(e.size) / 2), ((alpha) << 24) | 0xFFFFF3CE);
+            } else if (e.kind == 1) {
+                // 火花：速度方向的短射线。
+                int len = ForgeGrid.Max(2, e.size + 2);
+                canvas.DrawLine(px, py, px - e.vx * len / 240, py - e.vy * len / 240 - 1, ((alpha) << 24) | tint, ForgeGrid.Max(1, Stroke(1)));
+                canvas.FillCircle(px, py, ForgeGrid.Max(1, Stroke(e.size) / 2), ((alpha) << 24) | tint);
+            } else if (e.kind == 2) {
+                // 爆炸：扩张环 + 闪光核。
+                int age = e.maxLife - e.life;
+                int radius = Stroke(e.size + age * 3);
+                Glow(px, py, radius + S(10), tint, alpha * 70 / 255);
+                canvas.DrawCircle(px, py, radius, ((alpha * 200 / 255) << 24) | tint, ForgeGrid.Max(1, Stroke(2)));
+                if (alpha > 120) { canvas.FillCircle(px, py, Stroke(e.size), ((alpha) << 24) | 0xFFFFE9B8); }
+            } else if (e.kind == 3) {
+                // 烟尘：渐大渐淡的灰团。
+                int grow = (e.maxLife - e.life) / 4;
+                canvas.FillCircle(px, py, Stroke(e.size + grow), ((alpha * 130 / 255) << 24) | tint);
+            } else if (e.kind == 4) {
+                // 浮动奖励：+N 随高度淡出。
+                string text = "+" + Convert.ToString(e.value);
+                canvas.DrawText(px - Canvas.MeasureText(text, fs) / 2, py, text, ((alpha) << 24) | tint, fs);
+            }
         }
     }
 
@@ -796,6 +855,7 @@ class ForgeRenderer {
             if (w.enemies[i].active) { Enemy(w, camera, w.enemies[i], i); }
         }
         Bullets(w, camera);
+        Effects(w, camera);
         Events(w, camera);
         if (inspectCell >= 0 && inspectCell < w.buildings.Length) {
             AtCell(w, camera, inspectCell); Corners(0xFFB4DCCE, -2);
