@@ -227,6 +227,21 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   文件、bundle 只剩 zan_gui/sqlite3/WebView2Loader。验收定式：拿真实工程发布
   rsp 重放 `--publish --link-mode static`，双目标各跑一遍，驱动告警里不该再
   出现 -lpq/-lssl/-lcrypto。
+- **包源豁免活名门之后，命名空间就是拉入单位——FFI 实现类必须与公共契约
+  分命名空间住（2026-10-08，oneplus 补刀）**：包源文件按"声明命名空间与
+  using 名精确相等即无条件入解析集"（上一条 2026-09-29 的豁免），所以一条
+  `using System.Data;` 把核心命名空间**全部文件**整批带进编译——Zan.Data
+  曾把 ODBC 万能连接类（13 个 odbc DllImport + 全部实现）与几乎所有 ORM
+  文件都要引用的 DbProvider 常量放在同一命名空间，任何只用 SQLite 的程序
+  都背上 odbc 导入（win 链系统 odbc32、macos 发布冒十几个 stub 告警）。光拆
+  文件没用（DbProvider 拆成 DbProvider.zan 后 DbConnection.zan 照样整批进），
+  必须拆**命名空间**：DbConnection+OdbcConnector 搬去 System.Data.Odbc，
+  核心只留契约/池/常量（纯 Zan）。真实代码引用面很小（MySqlConnector 一处、
+  odbc_multidb 示例、conformance odbc_buffers），各加一行 using；IDE 补全表
+  同步挪条目。验收：oneplus rsp 重放 837→830 文件、odbc 提及清零、exe 导入
+  表无 ODBC32、odbc_buffers 用例照常过。定式：包里"人人要用的常量/接口"
+  与"某后端的 FFI/重实现"永远分命名空间住；动手前 `ZAN_PULLIN_DEBUG=1`
+  看 INCL 清单里有没有与业务无关的后端子树。
 - **按需拉取=死代码屏蔽罩（2026-10-01 模板普查实证）**：从未被任何编译
   单元引用的基建文件（Zan.Game 的 GameViewport/SceneManager/BulletPool
   等"引擎管线"批）**从不进编译集，坏了也不响**——出生即坏的多参
