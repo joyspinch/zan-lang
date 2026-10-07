@@ -4,7 +4,8 @@
 // Wins earn rank points toward titles (棋童→棋圣), streaks bring cheering
 // toasts, defeats get an encouraging review line. Esc back/exit.
 // GuiHost+Canvas 版：窗口/事件/呈现由 Gui 原生外壳承担（Game.Foundation.Gui），
-// 绘制走 Game.Kit.CanvasPrims 直绘，不依赖 SDL。
+// 绘制走 Game.Kit.CanvasPrims 直绘，不依赖 SDL；主菜单/对局/结算由
+// SceneRouter 路由三个场景（菜单与结算的按钮/文案在 HTML 层）。
 using System;
 using System.IO;
 using Gui;
@@ -85,13 +86,11 @@ class GmPopup {
 }
 
 class GmGame {
-    GuiHost host;
     Canvas c;
     GmProfile prof;
     Rng rng;
 
     int[] board;      // 15*15: 0 empty, 1 black (player), 2 white (AI)
-    int scene;        // 0 menu, 1 play, 2 over
     int diff;         // 0 easy, 1 normal, 2 hard
     int moves;
     int lastX;
@@ -115,7 +114,6 @@ class GmGame {
     string menuBg2;   // 手绘美术资产（新名，绝不覆盖旧素材）
     string playBg;
     string boardArt;
-    string panel;
     string blackPath2;
     string whitePath2;
     bool texTried;
@@ -158,11 +156,8 @@ class GmGame {
 
     static GmGame Create(GuiHost h) {
         GmGame g = new GmGame();
-        g.host = h;
-        g.c = h.App().canvas;
         g.prof = GmProfile.Load();
         g.rng = Rng.Seed((long)Window.GetTickMs() + 1357924);
-        g.scene = 0;
         g.diff = 1;
         g.mouseX = 640;
         g.mouseY = 360;
@@ -170,7 +165,7 @@ class GmGame {
         g.pops = new List<GmPopup>();
         g.toastAt = -9999;
         g.demo = File.Exists("gomoku_demo.txt");
-        if (g.demo) { g.diff = 2; g.StartGame(Window.GetTickMs()); }
+        if (g.demo) { g.diff = 2; }
         return g;
     }
 
@@ -185,7 +180,6 @@ class GmGame {
         this.menuBg2 = GmGame.FindAsset("assets/menu_bg2.png");
         this.playBg = GmGame.FindAsset("assets/play_bg.png");
         this.boardArt = GmGame.FindAsset("assets/board_wood2.png");
-        this.panel = GmGame.FindAsset("assets/panel.png");
         this.blackPath2 = GmGame.FindAsset("assets/stone_black2.png");
         this.whitePath2 = GmGame.FindAsset("assets/stone_white2.png");
     }
@@ -253,7 +247,6 @@ class GmGame {
         this.parts = new List<GmParticle>();
         this.pops = new List<GmPopup>();
         this.toastAt = -9999;
-        this.scene = 1;
         this.Toast("执黑先行，五连制胜", now);
     }
 
@@ -295,7 +288,6 @@ class GmGame {
         else { this.Burst(sx, sy, 5, now, 255, 210, 140); }
         if (this.IsWin(x, y, c)) {
             this.winner = c;
-            this.scene = 2;
             if (c == 1) {
                 int gain = 10 + this.diff * 10;
                 this.prof.pts = this.prof.pts + gain;
@@ -315,7 +307,6 @@ class GmGame {
         }
         if (this.moves >= GmGame.N() * GmGame.N()) {
             this.winner = 3;
-            this.scene = 2;
             this.prof.Save();
             return;
         }
@@ -407,7 +398,7 @@ class GmGame {
         // emotional beats: praise the player's threats we had to answer
         int pThreat = this.ScoreCell(bestX, bestY, 1);
         this.Place(bestX, bestY, 2, now);
-        if (this.scene == 1 && pThreat >= 12000) {
+        if (pThreat >= 12000) {
             this.AddPop(GmGame.BX() + bestX * GmGame.Cell(),
                 GmGame.BY() + bestY * GmGame.Cell() - 30, "好棋，只能挡了", now, 255, 214, 150);
         }
@@ -415,36 +406,9 @@ class GmGame {
 
     // ----- input -----------------------------------------------------------
 
-    void OnDown(int cx, int cy, int now) {
-        if (this.scene == 0) {
-            if (GmGame.Portrait()) {
-                // 竖屏菜单：单列居中（与 DrawMenu 同矩形）
-                if (CDraw.PointIn(cx, cy, GmGame.VW() / 2 - 180, 360, 360, 78)) { this.diff = 0; this.StartGame(now); }
-                if (CDraw.PointIn(cx, cy, GmGame.VW() / 2 - 180, 454, 360, 78)) { this.diff = 1; this.StartGame(now); }
-                if (CDraw.PointIn(cx, cy, GmGame.VW() / 2 - 180, 548, 360, 78)) { this.diff = 2; this.StartGame(now); }
-                return;
-            }
-            if (CDraw.PointIn(cx, cy, 460, 350, 360, 78)) { this.diff = 0; this.StartGame(now); }
-            if (CDraw.PointIn(cx, cy, 460, 444, 360, 78)) { this.diff = 1; this.StartGame(now); }
-            if (CDraw.PointIn(cx, cy, 460, 538, 360, 78)) { this.diff = 2; this.StartGame(now); }
-            return;
-        }
-        if (this.scene == 2) {
-            // 结算面板按钮（与 DrawOver 同矩形：竖屏面板在屏中央，横屏靠上）
-            int oby = GmGame.Portrait() ? GmGame.VH() / 2 - 170 : 190;
-            int obx = GmGame.VW() / 2 - 250;
-            if (CDraw.PointIn(cx, cy, obx + 30, oby + 240, 210, 60)) { this.StartGame(now); return; }
-            if (CDraw.PointIn(cx, cy, obx + 260, oby + 240, 210, 60)) { this.scene = 0; return; }
-            return;
-        }
+    // 对局内落子（竖屏底部按钮行在 GmPlayScene 处理：需要路由器）。
+    void OnDownPlay(int cx, int cy, int now) {
         if (this.aiTurn || this.winner != 0) { return; }
-        // 竖屏底部按钮行：菜单（去场景 0）与重玩（重开当前难度）
-        if (GmGame.Portrait()) {
-            int vw = GmGame.VW();
-            int by = GmGame.VH() - 110;
-            if (CDraw.PointIn(cx, cy, vw / 2 - 212, by, 200, 64)) { this.scene = 0; return; }
-            if (CDraw.PointIn(cx, cy, vw / 2 + 12, by, 200, 64)) { this.StartGame(now); return; }
-        }
         int gx = (cx - GmGame.BX() + GmGame.Cell() / 2) / GmGame.Cell();
         int gy = (cy - GmGame.BY() + GmGame.Cell() / 2) / GmGame.Cell();
         if (gx < 0 || gy < 0 || gx >= GmGame.N() || gy >= GmGame.N()) { return; }
@@ -452,17 +416,12 @@ class GmGame {
         this.Place(gx, gy, 1, now);
     }
 
-    void OnKey(int key, int now) {
-        if (key == 27) { if (this.scene == 0) { this.host.RequestStop(); } else { this.scene = 0; } return; }
-        if (this.scene == 2 && (key == 13 || key == 32)) { this.StartGame(now); }
-    }
-
     void Tick(int now) {
-        if (this.scene == 1 && this.aiTurn && now >= this.aiThinkAt) {
+        if (this.aiTurn && now >= this.aiThinkAt) {
             this.AiMove(now);
             this.demoAt = now + 420;
         }
-        if (this.demo && this.scene == 1 && !this.aiTurn && now >= this.demoAt) {
+        if (this.demo && !this.aiTurn && now >= this.demoAt) {
             this.DemoMove(now);
         }
     }
@@ -572,7 +531,7 @@ class GmGame {
             }
         }
         // hover ghost stone
-        if (this.scene == 1 && !this.aiTurn) {
+        if (this.winner == 0 && !this.aiTurn) {
             int gx = (this.mouseX - x0 + c / 2) / c;
             int gy = (this.mouseY - y0 + c / 2) / c;
             if (gx >= 0 && gy >= 0 && gx < n && gy < n && this.At(gx, gy) == 0) {
@@ -684,7 +643,8 @@ class GmGame {
         this.DrawFx(now);
     }
 
-    void DrawMenu(int now) {
+    // 菜单画布层：美术背景 + 标题（难度按钮与战绩行走 GmMenuScene 的 HTML 层）。
+    void DrawMenuArt() {
         this.EnsureTex();
         int vw = GmGame.VW();
         int vh = GmGame.VH();
@@ -702,99 +662,102 @@ class GmGame {
         } else {
             CText.DrawCenteredShadow(this.c, "五子棋", vw / 2, 80, 9, 245, 232, 205, 255);
         }
-        CText.DrawCenteredShadow(this.c, "落子生根 · 五连制胜 · 段位成长", vw / 2, 262, 3, 255, 218, 160, 255);
-        CFx.Rule(this.c, vw / 2, 298, 150, 226, 186, 128, 190);
-        if (GmGame.Portrait()) {
-            // 竖屏菜单：单列居中（命中区见 OnDown）
-            CFx.GoldButton(this.c, this.mouseX, this.mouseY, vw / 2 - 180, 360, 360, 78, "初学对弈", 3, 1);
-            CFx.GoldButton(this.c, this.mouseX, this.mouseY, vw / 2 - 180, 454, 360, 78, "棋士对弈", 3, 1);
-            CFx.GoldButton(this.c, this.mouseX, this.mouseY, vw / 2 - 180, 548, 360, 78, "棋圣对弈", 3, 0);
-            CText.DrawCenteredShadow(this.c, "段位 " + this.prof.Title() + " · " + this.prof.pts
-                + " 分 · 胜 " + this.prof.wins + " 负 " + this.prof.losses
-                + " · 最佳连胜 " + this.prof.bestStreak, vw / 2, 672, 2, 230, 210, 180, 255);
-            return;
-        }
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, 460, 350, 360, 78, "初学对弈", 3, 1);
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, 460, 444, 360, 78, "棋士对弈", 3, 1);
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, 460, 538, 360, 78, "棋圣对弈", 3, 0);
-        CText.DrawCenteredShadow(this.c, "段位 " + this.prof.Title() + " · " + this.prof.pts
-            + " 分 · 胜 " + this.prof.wins + " 负 " + this.prof.losses
-            + " · 最佳连胜 " + this.prof.bestStreak, vw / 2, vh - 74, 2, 230, 210, 180, 255);
-    }
-
-    void DrawOver(int now) {
-        CDraw.Clear(this.c, GmGame.VW(), GmGame.VH(), CDraw.Argb(255, 38, 26, 18));
-        this.DrawAmbient();
-        this.DrawBoard(now);
-        this.DrawSide(now);
-        CDraw.FillRect(this.c, 0, 0, GmGame.VW(), GmGame.VH(), CDraw.Argb(165, 18, 12, 6));
-        int by = GmGame.Portrait() ? GmGame.VH() / 2 - 170 : 190;
-        int bx = GmGame.VW() / 2 - 250;
-        if (this.panel != null) {
-            CFx.ShadowRect(this.c, bx, by, 500, 320, 18, 16, 0, 0, 0, 120);
-            CDraw.BlitImage(this.c, this.panel, bx, by, 500, 320);
-            CFx.Ring(this.c, bx, by, 500, 320, 18, 1, 226, 186, 128, 180);
-        } else {
-            CFx.Card(this.c, bx, by, 500, 320, 20, 40, 28, 16, 30, 20, 12, 245, 226, 186, 128, 160, 1);
-        }
-        CFx.Rule(this.c, GmGame.VW() / 2, by + 26, 150, 226, 186, 128, 190);
-        if (this.winner == 1) {
-            CText.DrawCenteredShadow(this.c, "妙手连珠，胜！", GmGame.VW() / 2, by + 34, 5, 255, 220, 110, 255);
-            CText.DrawCentered(this.c, "+" + (10 + this.diff * 10) + " 段位分 · 现 " + this.prof.Title(), GmGame.VW() / 2, by + 110, 3, 240, 225, 200, 255);
-            string cheer = "棋风正盛，再下一城！";
-            if (this.prof.streak >= 3) { cheer = this.prof.streak + " 连胜！势不可挡"; }
-            CText.DrawCentered(this.c, cheer, GmGame.VW() / 2, by + 166, 2, 150, 230, 190, 255);
-        } else if (this.winner == 2) {
-            CText.DrawCenteredShadow(this.c, "惜败半目间", GmGame.VW() / 2, by + 34, 5, 235, 160, 150, 255);
-            CText.DrawCentered(this.c, "第 " + this.moves + " 手告负", GmGame.VW() / 2, by + 110, 3, 220, 205, 185, 255);
-            CText.DrawCentered(this.c, "复盘一手，下局翻盘！", GmGame.VW() / 2, by + 166, 2, 255, 214, 150, 255);
-        } else {
-            CText.DrawCenteredShadow(this.c, "满盘和棋", GmGame.VW() / 2, by + 34, 5, 220, 210, 190, 255);
-            CText.DrawCentered(this.c, "势均力敌，罕见的对局", GmGame.VW() / 2, by + 130, 2, 220, 205, 185, 255);
-        }
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, bx + 30, by + 240, 210, 60, "再来一局", 3, 1);
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, bx + 260, by + 240, 210, 60, "回到菜单", 3, 0);
-        this.DrawFx(now);
-    }
-
-    void Render(int now) {
-        if (this.scene == 0) { this.DrawMenu(now); }
-        else if (this.scene == 2) { this.DrawOver(now); }
-        else { this.DrawPlay(now); }
     }
 }
 
-// GuiHost 主循环回调：事件 → 固定步长模拟（16ms，追帧上限内多次）→
-// 渲染（BeginFrame/PresentFrame 由宿主包好；帧预算自限速约 60fps）。
-class GmLoop : IGuiHostLoop {
+// 主菜单：画布层只画美术背景与标题（GmGame.DrawMenuArt），难度按钮与
+// 战绩行走 HTML 层；每次进场由 GmPlayScene.OnEnter 开新局。
+class GmMenuScene : HtmlScene {
     GmGame g;
 
-    public void Start(GuiHost host) {
-        this.g = GmGame.Create(host);
+    GmMenuScene(GmGame g) { this.g = g; }
+
+    override string HtmlFile() { return "assets/scenes/menu.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("easy", () => this.Pick(0));
+        handlers.Add("normal", () => this.Pick(1));
+        handlers.Add("hard", () => this.Pick(2));
     }
-    public void Event(GuiHost host, int kind, int code) {
-        int now = Window.GetTickMs();
-        // 指针坐标经 host.MouseX/Y 反变换回舞台逻辑坐标（桌面视口
-        // letterbox / 手机驱动反变换都在宿主之下完成）。
-        if (kind == 4) {
-            this.g.OnKey(code, now);
-        // 鼠标 kind:1=移动 2=按下 3=释放(Win32Shell 契约)。
-        } else if (kind == 1) {
-            this.g.mouseX = host.MouseX();
-            this.g.mouseY = host.MouseY();
-        } else if (kind == 2) {
-            if (code == 0) {
-                this.g.mouseX = host.MouseX();
-                this.g.mouseY = host.MouseY();
-                this.g.OnDown(this.g.mouseX, this.g.mouseY, now);
-            }
+
+    void Pick(int d) {
+        this.g.diff = d;
+        this.router.Go("play");
+    }
+
+    override void OnEnter(Control root) {
+        Element stats = GmMenuScene.AsElement(root, "stats");
+        if (stats != null) {
+            stats.SetText("段位 " + this.g.prof.Title() + " · " + this.g.prof.pts
+                + " 分 · 胜 " + this.g.prof.wins + " 负 " + this.g.prof.losses
+                + " · 最佳连胜 " + this.g.prof.bestStreak);
         }
     }
-    public void FixedUpdate(GuiHost host, int dt) {
-        this.g.Tick(Window.GetTickMs());
+
+    static Element AsElement(Control root, string id) {
+        Control c = root.Find(id);
+        if (c != null && c is Element) { return (Element)c; }
+        return null;
     }
-    public void Update(GuiHost host, int dt) { }
-    public void Render(GuiHost host, Canvas c, double alpha) {
+
+    override void Event(int kind, int key) {
+        if (kind == 4 && key == 27) { this.router.Exit(); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
+        this.g.c = c;
+        this.g.SyncStage(host);
+        CDraw.Origin(0, host.ContentTop());
+        this.g.DrawMenuArt();
+    }
+}
+
+// 对局：纯 canvas 场景（HtmlFile 为空，无 HTML 层）。每次进场开新局
+// （菜单选难度 / 结算再来一局都走这里），分出胜负后路由到结算场景。
+class GmPlayScene : HtmlScene {
+    GmGame g;
+
+    GmPlayScene(GmGame g) { this.g = g; }
+
+    override void OnEnter(Control root) {
+        this.g.StartGame(Window.GetTickMs());
+    }
+
+    override void Event(int kind, int key) {
+        GuiHost host = this.router.Host();
+        // 指针坐标经 host.MouseX/Y 反变换回舞台逻辑坐标（桌面视口
+        // letterbox / 手机驱动反变换都在宿主之下完成）。
+        if (kind == 1) {
+            this.g.mouseX = host.MouseX();
+            this.g.mouseY = host.MouseY();
+        } else if (kind == 2 && key == 0) {
+            this.g.mouseX = host.MouseX();
+            this.g.mouseY = host.MouseY();
+            if (this.g.aiTurn || this.g.winner != 0) { return; }
+            int cx = this.g.mouseX;
+            int cy = this.g.mouseY;
+            // 竖屏底部按钮行（与 DrawTopBar 同矩形）：菜单 / 重玩
+            if (GmGame.Portrait()) {
+                int vw = GmGame.VW();
+                int by = GmGame.VH() - 110;
+                if (CDraw.PointIn(cx, cy, vw / 2 - 212, by, 200, 64)) { this.router.Go("menu"); return; }
+                if (CDraw.PointIn(cx, cy, vw / 2 + 12, by, 200, 64)) { this.g.StartGame(Window.GetTickMs()); return; }
+            }
+            this.g.OnDownPlay(cx, cy, Window.GetTickMs());
+        } else if (kind == 4) {
+            if (key == 27) { this.router.Go("menu"); }
+        }
+    }
+
+    override void FixedStep(int dtMs) {
+        this.g.Tick(Window.GetTickMs());
+        // 分出胜负（含和棋）后切结算；切换在帧首应用，本场景随即使停。
+        if (this.g.winner != 0) { this.router.Go("over"); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
         // Android 上表面晚于 Start 到达(转向/后台往返亦然),App 会整体
         // 换新画布对象(App.SwapCanvas);Start 时抓的引用画进已销毁的
         // 旧表面,永不 present。每帧对齐到宿主传入的当前画布。
@@ -804,15 +767,81 @@ class GmLoop : IGuiHostLoop {
         // 布局才能铺满整窗（宽窗多看宽度，不落 margin 空条）。
         this.g.SyncStage(host);
         CDraw.Origin(0, host.ContentTop());
-        this.g.Render(Window.GetTickMs());
+        this.g.DrawPlay(Window.GetTickMs());
     }
-    public void Stop(GuiHost host) { }
+}
+
+// 结算：HTML 面板叠在定格的棋局上——Render 继续画对局画面（棋局已停，
+// 画面定格），body 半透明压暗，按钮/文案由 HTML 层承担。
+class GmOverScene : HtmlScene {
+    GmGame g;
+    Element headline;
+    Element subEl;
+    Element cheerEl;
+
+    GmOverScene(GmGame g) { this.g = g; }
+
+    override string HtmlFile() { return "assets/scenes/over.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("again", () => this.router.Go("play"));
+        handlers.Add("menu", () => this.router.Go("menu"));
+    }
+
+    override void OnEnter(Control root) {
+        this.headline = GmOverScene.AsElement(root, "headline");
+        this.subEl = GmOverScene.AsElement(root, "sub");
+        this.cheerEl = GmOverScene.AsElement(root, "cheer");
+        string head; string sub; string cheer;
+        if (this.g.winner == 1) {
+            head = "妙手连珠，胜！";
+            sub = "+" + (10 + this.g.diff * 10) + " 段位分 · 现 " + this.g.prof.Title();
+            cheer = "棋风正盛，再下一城！";
+            if (this.g.prof.streak >= 3) { cheer = this.g.prof.streak + " 连胜！势不可挡"; }
+        } else if (this.g.winner == 2) {
+            head = "惜败半目间";
+            sub = "第 " + this.g.moves + " 手告负";
+            cheer = "复盘一手，下局翻盘！";
+        } else {
+            head = "满盘和棋";
+            sub = "势均力敌，罕见的对局";
+            cheer = "换个思路，再来一盘？";
+        }
+        if (this.headline != null) { this.headline.SetText(head); }
+        if (this.subEl != null) { this.subEl.SetText(sub); }
+        if (this.cheerEl != null) { this.cheerEl.SetText(cheer); }
+    }
+
+    static Element AsElement(Control root, string id) {
+        Control c = root.Find(id);
+        if (c != null && c is Element) { return (Element)c; }
+        return null;
+    }
+
+    override void Event(int kind, int key) {
+        if (kind != 4) { return; }
+        if (key == 27) { this.router.Go("menu"); }
+        if (key == 13 || key == 32) { this.router.Go("play"); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
+        this.g.c = c;
+        this.g.SyncStage(host);
+        CDraw.Origin(0, host.ContentTop());
+        this.g.DrawPlay(Window.GetTickMs());
+    }
 }
 
 class GmApp {
     static void Main() {
         // 手机竖屏：GuiHost 逻辑宽高比定外壳方向（见 xiangqi 同注）。
-        GuiHost host = new GuiHost("五子棋", 720, 1280, 16);
-        host.Run(new GmLoop());
+        SceneRouter router = SceneRouter.CreateFixed("五子棋", 720, 1280, 16);
+        GmGame g = GmGame.Create(router.Host());
+        router.Register("menu", new GmMenuScene(g));
+        router.Register("play", new GmPlayScene(g));
+        router.Register("over", new GmOverScene(g));
+        // demo 标记（gomoku_demo.txt）直接进对局自弈供截图/无头验证。
+        router.Run(g.demo ? "play" : "menu");
     }
 }
