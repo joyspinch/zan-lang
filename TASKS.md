@@ -20,6 +20,6 @@
 ### B-ID121 [ ] SpriteBatch 运行时批量提交后端（每类型一次 FFI）
 Game.Kit.SpriteBatch 命令缓冲已落地（预分配 SOA、类型归组、零分配），但提交侧仍是每图元一次 Canvas 调用——运行时没有纯色图元批量入口（Gui.Rendering 的 DrawSprites 只覆盖纹理四边形）。缺：`zan_canvas_fill_rects/fill_circles/fill_radials(canvas, data, count)` 批量 FFI + Canvas 包装，End() 改每类型一次提交。未做原因同 B-ID118（不动在途运行时）；落地后 GPU 后端只需在批量入口处接顶点批。
 
-### B-ID122 [ ] 静态发布（--link-mode static）真用 Postgres 的程序仍缺 OpenSSL 静态库
-pq 静态驱动的 pq.libs 声明依赖 `-lssl -lcrypto`，但 `packages/Zan.Data/src/System/Data/Postgres/drivers/win-x64/static/` 下没有 libssl.a/libcrypto.a（此前的修复只覆盖了共享/DLL 链接路径），所以真引用 Postgres 的程序 `--publish --link-mode static` 在 win-x64 链接时死于 `cannot find -lssl`。幻影拉入已修（SDK 包按精确命名空间匹配，package.c——不再因一个 `using System.Data;` 把 Postgres/Firebird/SqlServer 全拖进发布），普通应用已不再触碰这条链（oneplus app 双目标发布验收通过）；剩余缺口只影响真的用 Postgres 做静态发布的程序，需为各发布目标补 OpenSSL 静态库或在静态模式下改用系统 libpq。2026-10-07，oneplus app 发布失败排查中发现。
+### B-ID122 [~] 静态发布（--link-mode static）Postgres 驱动的 OpenSSL 静态库：win-x64 已补，linux-x64/macos 待补
+真引用 Postgres 的程序静态发布时，libpq.a 的 pq.libs 索要 `-lssl -lcrypto`（libpq 这个第三方 C 库内部用 OpenSSL 做 TLS，与 Zan 自身的纯 Zan TLS 无关），缺档即链接死于 `cannot find -lssl`。**win-x64 已解决（2026-10-08）**：vendored MSYS2 `mingw-w64-x86_64-openssl 3.6.5-1`（msvcrt ABI，Apache-2.0）的 libssl.a/libcrypto.a 入 `drivers/win-x64/static/`，llvm-nm 符号预检 17/17 覆盖，`--publish --link-mode static` 探针链接过、运行优雅（详见 zan-compiler-internals 的补档定式）。剩余：**linux-x64**（libpq.a 是 musl 构建，须配 Alpine 静态 OpenSSL，glibc 源不通用）、**macos**（连静态 libpq.a 本身都缺，只有 dylib，需先出静态 libpq + krb5 全套）。2026-10-07，oneplus app 发布排查中发现（当时与幻影拉入混叠，幻影已根治）。
 

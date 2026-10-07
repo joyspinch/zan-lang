@@ -793,6 +793,17 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   git log 看提交时区（github-actions[bot]/-0700=CI 产物，+0800=本机产物），
   别把 CI 产物当成本机能力边界。
 - toolchain/** 的 *.o 命中 gitignore，提交要 `git add -f`。
+- **静态驱动的 .libs 需求必须在同目录兑现，先符号预检再提交**（2026-10-08，
+  PostgreSQL 静态发布实录）：`pq.libs` 索要 `-lssl -lcrypto` 时解析器在驱动
+  static/ 下按 `lib<name>.a` 找，缺档就是发布期 `cannot find -lssl`。补档
+  定式：① ABI 匹配看现有 libpq.a 的出处——win 用 MSYS2 `mingw64`
+  （msvcrt）包，别拿 clang64（ucrt）或 musl 源；linux-x64 的 libpq.a 是
+  musl 构建，得配 Alpine 的静态 OpenSSL，glibc 源不通用。② 提交前
+  `llvm-nm --undefined-only libpq.a` 与候选档案 defined 符号做差集预检
+  （libpq 16.4 只引用 17 个 OpenSSL 符号，3.6.5 全覆盖）。③ 链接可能还要
+  档案自己的系统库（OpenSSL/mingw 用 crypt32/ws2_32，pq.libs 已列则不加）。
+  ④ 验收看端到端：`--publish --link-mode static` 真用该驱动的探针，链接
+  过 + 运行优雅（连不上服务器的错误文本 = 代码路径活着）。
 
 ## win-arm64 交叉 rt：setjmp 降层与 rt_crash 架构门
 
