@@ -7,7 +7,9 @@
 // grow fast, a fever meter with rainbow double-score, length titles, floating
 // score popups and particle bursts. The camera follows the head; a minimap
 // shows everyone. Text uses the Gui canvas system font stack.
-// 无 SDL：窗口/事件/呈现走 Game.Foundation.Gui.GuiHost（packages/Zan.Gui/src/Gui 原生
+// SceneRouter 版：主菜单/结算整屏 HTML+CSS（assets/scenes/*.html +
+// data-on-click），无边画布对局在 SnPlayScene 里走 CanvasPrims 直绘。
+// 无 SDL：窗口/事件/呈现走 Game.Foundation.Gui（packages/Zan.Gui/src/Gui 原生
 // 外壳），绘制直接落在 Gui.Canvas 上（Game.Kit.CanvasPrims 提供与
 // Game.Kit SDL 版等价的光晕/圆盘/圆角矩形/文字/UI 套件）。
 using System;
@@ -247,7 +249,7 @@ class SnGame {
     List<Particle> parts;
     List<Popup> pops;
 
-    int scene;         // 0 menu, 1 play, 2 over
+    bool over;         // 死亡即置位，SnPlayScene 据此路由到结算场景
     Protected score;
     int kills;
     int lastTick;
@@ -263,9 +265,6 @@ class SnGame {
     int shakeUntil;
     string deathBy;
     bool wasRecord;
-    string menuBgPath;    // resolved asset paths (BlitImage caches the decode)
-    string titlePath;
-    bool texTried;
     bool demo;
 
     // world (torus) and view sizes, px — a 5x5-screen arena so the endless
@@ -338,7 +337,8 @@ class SnGame {
     static SnGame Create(GuiHost h) {
         SnGame g = new SnGame();
         g.host = h;
-        g.c = h.App().canvas;
+        // 画布引用不在这里抓：宿主 App 在 Run 后才存在，且场景 Render
+        // 每帧用宿主传入的当前画布对齐（App.SwapCanvas 契约）。
         g.prof = Profile.Load();
         g.rng = Rng.Seed((long)Window.GetTickMs() + 987654321);
         g.me = Worm.Make(0, 90, 235, 190);
@@ -346,23 +346,12 @@ class SnGame {
         g.orbs = new List<Orb>();
         g.parts = new List<Particle>();
         g.pops = new List<Popup>();
-        g.scene = 0;
+        g.over = false;
         g.mouseX = 900;
         g.mouseY = 360;
         g.demo = File.Exists("snake_demo.txt");
         if (g.demo) { g.StartGame(Window.GetTickMs()); }
         return g;
-    }
-
-    // Resolve the decorative background / title art once; Canvas.BlitImage
-    // keeps its own decode cache, so only the path is stored.
-    void EnsureTex() {
-        if (this.texTried) { return; }
-        this.texTried = true;
-        string p = Assets.Find("assets/menu_bg.png");
-        if (File.Exists(p)) { this.menuBgPath = p; }
-        p = Assets.Find("assets/title.png");
-        if (File.Exists(p)) { this.titlePath = p; }
     }
 
     // ----- setup ---------------------------------------------------------
@@ -437,7 +426,7 @@ class SnGame {
         this.titleTier = 0;
         this.toastAt = -9999;
         this.wasRecord = false;
-        this.scene = 1;
+        this.over = false;
         this.lastTick = now;
         this.boostHeld = false;
         this.boostKey = false;
@@ -535,7 +524,7 @@ class SnGame {
 
     void Die(int now, string why) {
         this.me.alive = false;
-        this.scene = 2;
+        this.over = true;
         this.deathBy = why;
         this.shakeUntil = now + 450;
         this.prof.games = this.prof.games + 1;
@@ -658,7 +647,7 @@ class SnGame {
 
     void StepFoe(Worm w, int dt, int now) {
         if (!w.alive) {
-            if (now >= w.respawnAt && this.scene == 1) { this.SpawnFoe(w, now); }
+            if (now >= w.respawnAt && !this.over) { this.SpawnFoe(w, now); }
             return;
         }
         this.AiThink(w, now);
@@ -849,7 +838,6 @@ class SnGame {
     }
 
     void DrawScene(int now) {
-        this.EnsureTex();
         int shX = 0; int shY = 0;
         if (now < this.shakeUntil) {
             int left = this.shakeUntil - now;
@@ -980,121 +968,91 @@ class SnGame {
         this.DrawScene(now);
     }
 
-    void DrawMenu(int now) {
-        this.EnsureTex();
-        CKitUi.Backdrop(this.c, this.menuBgPath, SnGame.VW(), SnGame.VH());
-        CDraw.FillRect(this.c, 0, 0, SnGame.VW(), SnGame.VH(), CDraw.Argb(130, 8, 10, 22));
-        if (this.titlePath != null) {
-            CDraw.BlitImage(this.c, this.titlePath, 640 - 300, 40, 600, 200);
-        } else {
-            CText.DrawCenteredShadow(this.c, "蛇蛇乐", 640, 80, 9, 245, 238, 220, 255);
-        }
-        CText.DrawCenteredShadow(this.c, "无边画布 · 吞豆成长 · 猎食小蛇 · 智斗大蛇", 640, 268, 3, 255, 214, 150, 255);
-        CKitUi.Button(this.c, this.mouseX, this.mouseY, 460, 380, 360, 88, "开始滑行", 4, 1);
-        CText.DrawCenteredShadow(this.c, "最高分 " + this.prof.high + " · 最长 " + this.prof.longest + " · 累计击败 " + this.prof.kills, 640, 520, 2, 255, 224, 130, 255);
-        CText.DrawCenteredShadow(this.c, "鼠标转向 · 按住左键/空格冲刺 · Esc 退出 · 分数越高猎手越凶", 640, 600, 2, 185, 195, 220, 255);
-    }
-
-    void DrawOver(int now) {
-        this.DrawScene(now);
-        CDraw.FillRect(this.c, 0, 0, SnGame.VW(), SnGame.VH(), CDraw.Argb(185, 6, 8, 18));
-        int by = 190;
-        CDraw.RoundRectFill(this.c, 390, by, 500, 320, 20, 16, 20, 40, 240);
-        CDraw.RingRect(this.c, 390, by, 500, 320, 2, 190, 120, 255, 120);
-        if (this.wasRecord) {
-            CText.DrawCenteredShadow(this.c, "新纪录！", 640, by + 30, 6, 255, 220, 100, 255);
-        } else {
-            CText.DrawCenteredShadow(this.c, this.deathBy, 640, by + 34, 4, 235, 140, 150, 255);
-        }
-        CText.DrawCentered(this.c, "得分 " + this.score.Get(), 640, by + 100, 5, 255, 225, 110, 255);
-        CText.DrawCentered(this.c, "长度 " + this.me.length + " · 击败 " + this.kills + " · " + SnGame.TierName(this.titleTier), 640, by + 156, 2, 175, 200, 235, 255);
-        string cheer = "再来一局，超越自己！";
-        if (this.wasRecord) { cheer = "你就是新的贪吃王！"; }
-        if (this.kills >= 3) { cheer = "猎蛇高手，名不虚传！"; }
-        CText.DrawCentered(this.c, cheer, 640, by + 196, 2, 150, 230, 190, 255);
-        CKitUi.Button(this.c, this.mouseX, this.mouseY, 420, by + 236, 210, 60, "再滑一次", 3, 1);
-        CKitUi.Button(this.c, this.mouseX, this.mouseY, 650, by + 236, 210, 60, "回到菜单", 3, 0);
-    }
-
     // ----- input -----------------------------------------------------------
     // 键码是 Gui 键码空间：27=Esc、13=回车、32=空格。
-
-    void OnKey(int key, int now) {
-        if (key == 27) { if (this.scene == 0) { this.host.RequestStop(); } else { this.scene = 0; } return; }
-        if (this.scene == 0) {
-            if (key == 13 || key == 32) { this.StartGame(now); }
-            return;
-        }
-        if (this.scene == 2) {
-            if (key == 13 || key == 32) { this.StartGame(now); }
-            return;
-        }
-        if (key == 32) { this.boostKey = true; }
-    }
-    void OnKeyUp(int key) {
-        if (key == 32) { this.boostKey = false; }
-    }
-    void OnDown(int cx, int cy, int now) {
-        if (this.scene == 0) {
-            if (CDraw.PointIn(cx, cy, 460, 380, 360, 88)) { this.StartGame(now); }
-            return;
-        }
-        if (this.scene == 1) { this.boostHeld = true; return; }
-        if (this.scene == 2) {
-            if (CDraw.PointIn(cx, cy, 420, 426, 210, 60)) { this.StartGame(now); return; }
-            if (CDraw.PointIn(cx, cy, 650, 426, 210, 60)) { this.scene = 0; return; }
-        }
-    }
-    void OnUp() {
-        this.boostHeld = false;
-    }
+    // 菜单/结算的按键与按钮在 HTML 场景类里（SnMenuScene/SnOverScene），
+    // 对局的转向/冲刺输入在 SnPlayScene.Event。
 
     void Tick(int now) {
-        if (this.scene != 1) { return; }
+        if (this.over) { return; }
         this.Step(now);
-    }
-    void Render(int now) {
-        if (this.scene == 0) { this.DrawMenu(now); }
-        else if (this.scene == 2) { this.DrawOver(now); }
-        else { this.DrawPlay(now); }
     }
 }
 
-// GuiHost 主循环回调：事件 → 固定步长模拟（16ms，追帧上限内多次）→
-// 渲染（BeginFrame/PresentFrame 由宿主包好；帧预算自限速约 60fps）。
-class SnLoop : IGuiHostLoop {
-    SnGame g;
+// ----- HTML 场景层（SceneRouter）--------------------------------------------
 
-    public void Start(GuiHost host) {
-        this.g = SnGame.Create(host);
+// 主菜单：整屏 HTML+CSS，data-on-click="start" 直达处理器，
+// 档案成绩在 OnEnter 里回填到 id="stats"。
+class SnMenuScene : HtmlScene {
+    SnGame g;
+    Element stats;
+
+    SnMenuScene(SnGame g) { this.g = g; }
+
+    override string HtmlFile() { return "assets/scenes/menu.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("start", () => this.router.Go("play"));
     }
-    public void Event(GuiHost host, int kind, int code) {
-        int now = Window.GetTickMs();
-        // 指针坐标经 host.MouseX/Y 反变换回舞台逻辑坐标（桌面视口
-        // letterbox / 手机驱动反变换都在宿主之下完成）。
-        if (kind == 4) {
-            this.g.OnKey(code, now);
-        } else if (kind == 5) {
-            this.g.OnKeyUp(code);
-        // 鼠标 kind:1=移动 2=按下 3=释放(Win32Shell 契约)。
-        } else if (kind == 1) {
-            this.g.mouseX = host.MouseX();
-            this.g.mouseY = host.MouseY();
-        } else if (kind == 2) {
-            if (code == 0) {
-                this.g.mouseX = host.MouseX();
-                this.g.mouseY = host.MouseY();
-                this.g.OnDown(this.g.mouseX, this.g.mouseY, now);
-            }
-        } else if (kind == 3) {
-            if (code == 0) { this.g.OnUp(); }
+
+    override void OnEnter(Control root) {
+        this.stats = null;
+        if (root != null) {
+            Control el = root.Find("stats");
+            if (el != null && el is Element) { this.stats = (Element)el; }
+        }
+        if (this.stats != null) {
+            this.stats.SetText("最高分 " + this.g.prof.high + " · 最长 " + this.g.prof.longest
+                + " · 累计击败 " + this.g.prof.kills);
         }
     }
-    public void FixedUpdate(GuiHost host, int dt) {
-        this.g.Tick(Window.GetTickMs());
+
+    override void Event(int kind, int key) {
+        if (kind != 4) { return; }
+        if (key == 27) { this.router.Exit(); }
+        if (key == 13 || key == 32) { this.router.Go("play"); }
     }
-    public void Update(GuiHost host, int dt) { }
-    public void Render(GuiHost host, Canvas c, double alpha) {
+}
+
+// 对局：纯 canvas 场景（HtmlFile 为空，无边画布世界直绘）。
+// 转向跟随鼠标，按住左键/空格冲刺；死亡后路由到结算场景。
+class SnPlayScene : HtmlScene {
+    SnGame g;
+
+    SnPlayScene(SnGame g) { this.g = g; }
+
+    override void OnEnter(Control root) {
+        this.g.StartGame(Window.GetTickMs());
+    }
+
+    override void Event(int kind, int key) {
+        GuiHost host = this.router.Host();
+        // 指针坐标经 host.MouseX/Y 反变换回舞台逻辑坐标（桌面视口
+        // letterbox / 手机驱动反变换都在宿主之下完成）。
+        if (kind == 1) {
+            this.g.mouseX = host.MouseX();
+            this.g.mouseY = host.MouseY();
+        } else if (kind == 2 && key == 0) {
+            this.g.mouseX = host.MouseX();
+            this.g.mouseY = host.MouseY();
+            this.g.boostHeld = true;
+        } else if (kind == 3 && key == 0) {
+            this.g.boostHeld = false;
+        } else if (kind == 4) {
+            if (key == 27) { this.router.Go("menu"); }
+            if (key == 32) { this.g.boostKey = true; }
+        } else if (kind == 5) {
+            if (key == 32) { this.g.boostKey = false; }
+        }
+    }
+
+    override void FixedStep(int dtMs) {
+        this.g.Tick(Window.GetTickMs());
+        if (this.g.over) { this.router.Go("over"); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
         // Android 上表面晚于 Start 到达(转向/后台往返亦然),App 会整体
         // 换新画布对象(App.SwapCanvas);Start 时抓的引用画进已销毁的
         // 旧表面,永不 present。每帧对齐到宿主传入的当前画布。
@@ -1105,14 +1063,87 @@ class SnLoop : IGuiHostLoop {
         this.g.SyncStage(host);
         CDraw.Origin(0, host.ContentTop());
         CDraw.Clear(c, SnGame.VW(), SnGame.VH(), CDraw.Argb(255, 10, 13, 26));
-        this.g.Render(Window.GetTickMs());
+        this.g.DrawPlay(Window.GetTickMs());
     }
-    public void Stop(GuiHost host) { }
+}
+
+// 结算：HTML 面板叠在定格的对局画面上——Render 继续画最后一帧世界
+// （对局已停步），body 半透明，死因/成绩在 OnEnter 里回填。
+class SnOverScene : HtmlScene {
+    SnGame g;
+    Element headline;
+    Element scoreEl;
+    Element subEl;
+    Element cheerEl;
+
+    SnOverScene(SnGame g) { this.g = g; }
+
+    override string HtmlFile() { return "assets/scenes/over.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("retry", () => this.router.Go("play"));
+        handlers.Add("menu", () => this.router.Go("menu"));
+    }
+
+    override void OnEnter(Control root) {
+        this.headline = null;
+        this.scoreEl = null;
+        this.subEl = null;
+        this.cheerEl = null;
+        if (root != null) {
+            this.headline = SnOverScene.AsElement(root, "headline");
+            this.scoreEl = SnOverScene.AsElement(root, "score");
+            this.subEl = SnOverScene.AsElement(root, "sub");
+            this.cheerEl = SnOverScene.AsElement(root, "cheer");
+        }
+        if (this.headline != null) {
+            this.headline.SetText(this.g.wasRecord ? "新纪录！" : this.g.deathBy);
+        }
+        if (this.scoreEl != null) {
+            this.scoreEl.SetText("得分 " + this.g.score.Get());
+        }
+        if (this.subEl != null) {
+            this.subEl.SetText("长度 " + this.g.me.length + " · 击败 " + this.g.kills
+                + " · " + SnGame.TierName(this.g.titleTier));
+        }
+        if (this.cheerEl != null) {
+            string cheer = "再来一局，超越自己！";
+            if (this.g.wasRecord) { cheer = "你就是新的贪吃王！"; }
+            if (this.g.kills >= 3) { cheer = "猎蛇高手，名不虚传！"; }
+            this.cheerEl.SetText(cheer);
+        }
+    }
+
+    static Element AsElement(Control root, string id) {
+        Control c = root.Find(id);
+        if (c != null && c is Element) { return (Element)c; }
+        return null;
+    }
+
+    override void Event(int kind, int key) {
+        if (kind != 4) { return; }
+        if (key == 27) { this.router.Go("menu"); }
+        if (key == 13 || key == 32) { this.router.Go("play"); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
+        this.g.c = c;
+        this.g.SyncStage(host);
+        CDraw.Origin(0, host.ContentTop());
+        CDraw.Clear(c, SnGame.VW(), SnGame.VH(), CDraw.Argb(255, 10, 13, 26));
+        this.g.DrawPlay(Window.GetTickMs());
+    }
 }
 
 class SnApp {
     static void Main() {
-        GuiHost host = new GuiHost("蛇蛇乐", 1280, 720, 16);
-        host.Run(new SnLoop());
+        SceneRouter router = SceneRouter.CreateFixed("蛇蛇乐", 1280, 720, 16);
+        SnGame g = SnGame.Create(router.Host());
+        router.Register("menu", new SnMenuScene(g));
+        router.Register("play", new SnPlayScene(g));
+        router.Register("over", new SnOverScene(g));
+        // demo 标记（snake_demo.txt）直接进对局供截图/无头验证。
+        router.Run(g.demo ? "play" : "menu");
     }
 }
