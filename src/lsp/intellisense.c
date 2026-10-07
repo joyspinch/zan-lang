@@ -2116,14 +2116,12 @@ hover_info_t intel_hover_at(intellisense_t *is, const char *word, int line) {
     return intel_hover_pos(is, word, line, -1);
 }
 
-/* Hover for `receiver.member` where the receiver's type is already resolved:
- * describe the member of THAT type (walking its base chain, then the
- * compiler's builtin table), not a namesake that merely shares the member
- * name in some unrelated indexed class. */
-hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
-                                const char *member) {
-    hover_info_t info = {0};
-    if (!is || !type_name || !type_name[0] || !member || !member[0]) return info;
+/* The member symbol declared on type_name (walking its base chain); NULL
+ * when this index knows neither the type nor the member. Shared by member
+ * hover and member go-to-definition. */
+static const isym_t *intel_member_sym(intellisense_t *is, const char *type_name,
+                                      const char *member) {
+    if (!is || !type_name || !type_name[0] || !member || !member[0]) return NULL;
 
     char bare[64];
     snprintf(bare, sizeof(bare), "%s", type_name);
@@ -2144,21 +2142,41 @@ hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
             if (sym->kind != ISYM_METHOD && sym->kind != ISYM_FIELD &&
                 sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER)
                 continue;
-            if (sym->signature[0])
-                strncpy(info.text, sym->signature, sizeof(info.text) - 1);
-            else
-                snprintf(info.text, sizeof(info.text), "%s : %s",
-                         sym->name, sym->type_name);
-            strncpy(info.doc, sym->doc, sizeof(info.doc) - 1);
-            info.valid = true;
-            return info;
+            return sym;
         }
         cls = class_base(is, cls);
+    }
+    return NULL;
+}
+
+/* Hover for `receiver.member` where the receiver's type is already resolved:
+ * describe the member of THAT type (walking its base chain, then the
+ * compiler's builtin table), not a namesake that merely shares the member
+ * name in some unrelated indexed class. */
+hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
+                                const char *member) {
+    hover_info_t info = {0};
+    if (!is) return info;
+
+    const isym_t *sym = intel_member_sym(is, type_name, member);
+    if (sym) {
+        if (sym->signature[0])
+            strncpy(info.text, sym->signature, sizeof(info.text) - 1);
+        else
+            snprintf(info.text, sizeof(info.text), "%s : %s",
+                     sym->name, sym->type_name);
+        strncpy(info.doc, sym->doc, sizeof(info.doc) - 1);
+        info.valid = true;
+        return info;
     }
 
     /* No user-declared owner: the receiver may be a compiler builtin
      * (string, List<T>, Console, ...) whose member surface lives in
      * builtin_api.c. */
+    char bare[64];
+    snprintf(bare, sizeof(bare), "%s", type_name);
+    { char *lt = strchr(bare, '<'); if (lt) *lt = '\0';
+      char *br = strstr(bare, "[]"); if (br) *br = '\0'; }
     const zan_builtin_type_t *bt = builtin_receiver(bare);
     if (bt) {
         for (int mi = 0; mi < bt->member_count; mi++) {
@@ -2170,6 +2188,21 @@ hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
         }
     }
     return info;
+}
+
+/* Go-to-definition for `receiver.member` with the receiver's type resolved:
+ * jump to the member declared on that type (base walk), not to a namesake
+ * that the name-only index walk happens to reach first. */
+bool intel_goto_member(intellisense_t *is, const char *type_name,
+                       const char *member, goto_def_t *out) {
+    if (!out) return false;
+    const isym_t *sym = intel_member_sym(is, type_name, member);
+    if (!sym) return false;
+    strncpy(out->file, sym->file, sizeof(out->file) - 1);
+    out->line = sym->line;
+    out->col = sym->col;
+    out->found = true;
+    return true;
 }
 
 hover_info_t intel_hover(intellisense_t *is, const char *word) {

@@ -1701,6 +1701,28 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
     intellisense_t *is = doc_intel_for(s, uri);
     if (!is) { send_response(s, id, json_new_null()); return; }
     goto_def_t g = intel_goto_def(is, word);
+
+    /* `receiver.word`: resolve the receiver's type first. The name-only
+     * index walk would jump to whichever same-named member it reaches first
+     * (NumPad.SetText instead of StatusBar.SetText). */
+    if (!g.found) {
+        char chain[256];
+        if (receiver_chain_before(doc->text, off, chain, sizeof(chain))) {
+            char fm[64];
+            const char *rt = intel_resolve_chain_pos(is, g_project_intel, chain,
+                                                     fm, sizeof(fm), line, character);
+            if (!rt || !rt[0]) {
+                /* retry with the engines swapped: designer-projected fields
+                 * exist only in the project index, so the root may resolve
+                 * there while the enclosing class comes from the document */
+                rt = intel_resolve_chain_pos(g_project_intel, is, chain,
+                                             fm, sizeof(fm), line, character);
+            }
+            if (rt && rt[0] && g_project_intel)
+                intel_goto_member(g_project_intel, rt, word, &g);
+        }
+    }
+
     if (!g.found && g_project_intel)
         g = intel_goto_def(g_project_intel, word);
     if (!g.found) { send_response(s, id, json_new_null()); return; }

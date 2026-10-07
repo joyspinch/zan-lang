@@ -256,6 +256,11 @@ hover_info_t intel_hover(intellisense_t *is, const char *word);
  * name-sharing symbol from an unrelated class. */
 hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
                                 const char *member);
+/* Go-to-definition for `receiver.member` with the receiver's type resolved:
+ * jumps to the member declared on that type (base walk) rather than a
+ * name-sharing symbol the index walk reaches first. */
+bool intel_goto_member(intellisense_t *is, const char *type_name,
+                       const char *member, goto_def_t *out);
 
 /* Go to definition of a symbol */
 goto_def_t intel_goto_def(intellisense_t *is, const char *word);
