@@ -1,0 +1,179 @@
+// HTML 场景路由演示 —— 一个窗口三个场景（menu / play / over），
+// 每个场景 = 一个 .html 文件（assets/scenes/）+ 一个 Zan 场景类。
+// UI 屏（主菜单/结算）整屏由 HTML+CSS 描述；玩法场景 Canvas 直绘
+// 弹球世界、HTML 只叠一条 HUD 工具栏。SceneRouter 负责「换 HTML、
+// 换每帧回调」的切换，见 Game.Foundation.Gui。
+// Esc：菜单=退出，玩法=回主菜单。
+using System;
+using Gui;
+using Gui.Widget;
+using Game.Kit;
+using Game.Foundation.Gui;
+
+namespace SceneRouterDemo;
+
+/// 跨场景共享状态。场景对象整个游戏期常驻，共享对象跟着活。
+class DemoState {
+    int score;
+    bool paused;
+}
+
+/// 主菜单：整屏 HTML。data-on-click 的名字在这里注册成处理器。
+class MenuScene : HtmlScene {
+    DemoState st;
+
+    MenuScene(DemoState st) { this.st = st; }
+
+    override string HtmlFile() { return "assets/scenes/menu.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("start", () => this.router.Go("play"));
+        handlers.Add("quit", () => this.router.Exit());
+    }
+
+    override void OnEnter(Control root) {
+        this.st.paused = false;
+    }
+
+    override void Event(int kind, int key) {
+        if (kind == 4 && key == 27) { this.router.Exit(); }
+    }
+}
+
+/// 玩法：Canvas 直绘弹球（世界层）+ 顶部 HTML HUD（UI 层）。
+/// 球碰底即掉落 → 路由到结算场景。
+class PlayScene : HtmlScene {
+    DemoState st;
+    Button pauseBtn;
+    double bx;
+    double by;
+    double vx;
+    double vy;
+    double paddleX;
+
+    PlayScene(DemoState st) { this.st = st; }
+
+    override string HtmlFile() { return "assets/scenes/play_hud.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("pause", () => this.TogglePause());
+        handlers.Add("menu", () => this.router.Go("menu"));
+        handlers.Add("quit", () => this.router.Exit());
+    }
+
+    override void OnEnter(Control root) {
+        int sw = this.router.Host().StageWidth();
+        int sh = this.router.Host().StageHeight();
+        if (sw <= 0) { sw = 1280; sh = 720; }
+        this.bx = sw / 2;
+        this.by = sh * 0.3;
+        this.vx = 260;
+        this.vy = 300;
+        this.paddleX = sw / 2;
+        this.st.score = 0;
+        this.st.paused = false;
+        // HUD 按钮要在每次进场抓一次：上一场的树已随 HTML 卸载释放。
+        this.pauseBtn = null;
+        if (root != null) {
+            Control pc = root.Find("pause");
+            if (pc != null && pc is Button) { this.pauseBtn = (Button)pc; }
+            if (this.pauseBtn != null) { this.pauseBtn.Text = "暂停"; }
+        }
+    }
+
+    void TogglePause() {
+        this.st.paused = !this.st.paused;
+        if (this.pauseBtn != null) {
+            this.pauseBtn.Text = this.st.paused ? "继续" : "暂停";
+        }
+    }
+
+    override void Event(int kind, int key) {
+        if (kind == 4 && key == 27) { this.router.Go("menu"); }
+    }
+
+    override void Update(int dtMs) {
+        if (this.st.paused) { return; }
+        GuiHost host = this.router.Host();
+        int sw = host.StageWidth();
+        int sh = host.StageHeight();
+        if (sw <= 0) { return; }   // 首帧 Update 早于舞台映射建立
+        double dt = dtMs / 1000.0;
+        this.paddleX = host.MouseX();
+        this.bx = this.bx + this.vx * dt;
+        this.by = this.by + this.vy * dt;
+        int r = 10;
+        if (this.bx < r) { this.bx = r; this.vx = 0 - this.vx; }
+        if (this.bx > sw - r) { this.bx = sw - r; this.vx = 0 - this.vx; }
+        if (this.by < r) { this.by = r; this.vy = 0 - this.vy; }
+        // 挡板碰撞：接住 +1 分，越接越快
+        double padTop = sh - 44;
+        if (this.vy > 0 && this.by + r >= padTop && this.by + r < padTop + 26
+            && this.bx > this.paddleX - 70 && this.bx < this.paddleX + 70) {
+            this.by = padTop - r;
+            this.vy = 0 - this.vy * 1.04;
+            this.vx = this.vx + (this.bx - this.paddleX) * 2.0;
+            if (this.vx > 420) { this.vx = 420; }
+            if (this.vx < 0 - 420) { this.vx = 0 - 420; }
+            this.st.score = this.st.score + 1;
+        }
+        // 掉底 → 切结算场景（Go 入队，帧首生效）
+        if (this.by > sh + 30) { this.router.Go("over"); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
+        int sw = host.StageWidth();
+        int sh = host.StageHeight();
+        if (sw <= 0) { return; }
+        // 挡板
+        CDraw.FillRect(c, (int)this.paddleX - 70, sh - 44, 140, 14,
+                       CDraw.Argb(255, 126, 231, 135));
+        // 球
+        CDraw.FillCircle(c, (int)this.bx, (int)this.by, 10, 255, 209, 102, 255);
+        // 分数画在 HUD 工具栏中段（左按钮区与右按钮区之间）
+        CText.DrawCenteredShadow(c, "得分 " + Convert.ToString(this.st.score),
+                                 sw / 2, 14, 3, 255, 255, 255, 255);
+    }
+}
+
+/// 结算：整屏 HTML，得分经 Element.SetText 回填到 id="score" 节点。
+class OverScene : HtmlScene {
+    DemoState st;
+    Element scoreEl;
+
+    OverScene(DemoState st) { this.st = st; }
+
+    override string HtmlFile() { return "assets/scenes/over.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("retry", () => this.router.Go("play"));
+        handlers.Add("menu", () => this.router.Go("menu"));
+    }
+
+    override void OnEnter(Control root) {
+        this.scoreEl = null;
+        if (root != null) {
+            Control sc = root.Find("score");
+            if (sc != null && sc is Element) { this.scoreEl = (Element)sc; }
+        }
+        if (this.scoreEl != null) {
+            this.scoreEl.SetText("得分 " + Convert.ToString(this.st.score));
+        }
+    }
+
+    override void Event(int kind, int key) {
+        if (kind == 4 && key == 27) { this.router.Go("menu"); }
+    }
+}
+
+class DemoApp {
+    static void Main() {
+        DemoState st = new DemoState();
+        SceneRouter router = SceneRouter.Create("HTML 场景路由演示", 1280, 720);
+        router.Register("menu", new MenuScene(st));
+        router.Register("play", new PlayScene(st));
+        router.Register("over", new OverScene(st));
+        router.Run("menu");
+    }
+}

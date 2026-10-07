@@ -1,0 +1,278 @@
+using System;
+using System.IO;
+using Gui;
+using Game.Kit;
+
+namespace Game.Foundation.Gui;
+
+/// <summary>
+/// HTML 场景基类：一个场景 = 一个 .html 文件 + 一个 Zan 子类。
+/// UI 屏（主菜单、设置、结算、视觉小说、棋类）整屏由 HTML+CSS 描述，
+/// 逻辑与事件接线写在场景类里；实时玩法场景 HTML 只描述 HUD 叠层，
+/// 游戏世界在 Render 里用 CDraw 直绘——两层在同一帧内合成
+/// （先世界后 HUD，见 SceneRouter.Render）。
+/// 生命周期与 GuiHost 回调同构：装载时 OnWire（注册 data-on-*
+/// 处理器，必须先于装载）→ OnEnter（root 可 Find(id) 抓控件），
+/// 每帧 Event/FixedStep/Update/Render，切走时 OnExit。
+/// 场景对象在 Register 时入册、整个游戏期复用——切走再切回是同一
+/// 个实例的再次 OnEnter，跨场景共享的状态放场景字段或自备的
+/// 共享状态对象（构造时传入）。
+/// </summary>
+class HtmlScene {
+    /// 所属路由器，Register 时回填——任何钩子里都能 this.router.Go(..)。
+    SceneRouter router;
+
+    /// <summary>
+    /// 场景的 HTML 文件路径（相对资源路径，经 Assets.Find 解析、
+    /// File.ReadAllText 读取——发布包内自动命中 --publish 嵌入的
+    /// assets 资源）。返回空串 = 纯 canvas 场景，不装载 UI。
+    /// </summary>
+    virtual string HtmlFile() { return ""; }
+
+    /// <summary>装载前注册 data-on-* 处理器。每次进场景都会调一次，
+    /// 处理器注册表是新建的，不会累积上次进场的闭包。</summary>
+    virtual void OnWire(HtmlHandlers handlers) { }
+
+    /// <summary>装载完成后回调。root 是 body 根（HtmlFile 为空时
+    /// 为 null）；用 root.Find(id) 定位控件、Element.SetText 改文案。</summary>
+    virtual void OnEnter(Control root) { }
+
+    /// <summary>卸载前回调（切到别的场景或主循环结束时）。</summary>
+    virtual void OnExit() { }
+
+    /// <summary>原始输入回调：kind 1=鼠标移动 2=左键按下 3=左键释放
+    /// 4=键按下 5=键抬起，keycode 为 Gui 键码（VK_ESCAPE=27 等）。
+    /// HTML 控件的点击不经过这里——data-on-* 经命中区域机制直达
+    /// OnWire 注册的处理器。</summary>
+    virtual void Event(int kind, int key) { }
+
+    /// <summary>固定步长回调（步长毫秒 = GuiHost 构造参数），一帧内
+    /// 可能多次。需要确定性的玩法物理写这里。</summary>
+    virtual void FixedStep(int dtMs) { }
+
+    /// <summary>每帧可变更新，dtMs 是真实帧间隔。</summary>
+    virtual void Update(int dtMs) { }
+
+    /// <summary>每帧绘制：游戏世界直绘层。画布已由宿主设好舞台映射
+    /// （CDraw.StageViewport），一律用 CDraw.*（坐标是逻辑舞台坐标）；
+    /// 不要在这里直接用 canvas 原语——HTML HUD 是之后由路由在设备
+    /// 像素空间画的，两层坐标空间不同。</summary>
+    virtual void Render(Canvas c, double alpha) { }
+}
+
+/// <summary>
+/// HTML 场景路由器：游戏 = 一个窗口 + 若干场景，切换场景 = 卸载旧
+/// HTML、装载新 HTML、换掉每帧回调的当前场景（Vue Router 的心智
+/// 模型）。SceneRouter 自己就是 IGuiHostLoop——创建、注册场景、
+/// Run 即得完整游戏主循环；需要全局钩子（开局存档恢复、统一按键）
+/// 就派生并重写 On* 系列。
+///
+/// 用法：
+///   SceneRouter router = SceneRouter.Create("我的游戏", 1280, 720);
+///   router.Register("menu", new MenuScene());
+///   router.Register("play", new PlayScene());
+///   router.Run("menu");
+///
+/// 切换时机：Go() 只入队，帧首（Update 之前）才真正卸载/装载——
+/// 点击处理器是在事件/渲染路径里触发的，当场换树会释放正在绘制的
+/// 控件树；这也是场景 OnEnter 里再 Go 不会同帧连环切换的原因。
+/// </summary>
+class SceneRouter : IGuiHostLoop {
+    GuiHost host;
+    Dict<string, HtmlScene> scenes;
+    HtmlScene current;
+    string currentName;
+    string pendingName;
+    Control hudRoot;
+    string baseDir;
+    bool installTried;
+
+    /// <summary>创建路由器并持有宿主（约 60fps 固定步长）。</summary>
+    static SceneRouter Create(string title, int w, int h) {
+        return new SceneRouter(new GuiHost(title, w, h, 0));
+    }
+
+    /// <summary>指定固定步长毫秒的版本（0 取 16ms）。</summary>
+    static SceneRouter CreateFixed(string title, int w, int h, int stepMs) {
+        return new SceneRouter(new GuiHost(title, w, h, stepMs));
+    }
+
+    SceneRouter(GuiHost host) {
+        this.host = host;
+        this.scenes = new Dict<string, HtmlScene>();
+        this.current = null;
+        this.currentName = "";
+        this.pendingName = "";
+        this.hudRoot = null;
+        this.baseDir = "";
+        this.installTried = false;
+    }
+
+    /// <summary>注册场景。名字即 Go 的目标；重名覆盖（后注册者胜）。</summary>
+    void Register(string name, HtmlScene scene) {
+        if (scene == null) { return; }
+        scene.router = this;
+        this.scenes.Add(name, scene);
+    }
+
+    /// <summary>
+    /// HTML 里 <link rel=stylesheet> 的解析基目录（默认空 = 不解析
+    /// link）。场景 HTML 建议内联 <style> 自包含，发布包才无外部
+    /// 文件可丢。
+    /// </summary>
+    void SetBaseDir(string dir) { this.baseDir = dir; }
+
+    /// <summary>
+    /// 请求切换到指定场景（下一帧帧首应用，见类注释）。未知名字
+    /// 返回 false 并保持当前场景——名字打错表现为原地不动而非崩溃。
+    /// </summary>
+    bool Go(string name) {
+        if (name == null || name.Length == 0) { return false; }
+        HtmlScene s = null;
+        if (!this.scenes.TryGetValue(name, out s)) {
+            Console.WriteLine("SCENE ?" + name + " (not registered)");
+            return false;
+        }
+        this.pendingName = name;
+        return true;
+    }
+
+    /// <summary>请求退出主循环（下一圈生效）——「退出游戏」按钮用。</summary>
+    void Exit() { this.host.RequestStop(); }
+
+    /// <summary>阻塞运行主循环，initial 是首个场景名。窗口关闭或
+    /// Exit() 后返回。</summary>
+    bool Run(string initial) {
+        this.pendingName = initial;
+        return this.host.Run(this);
+    }
+
+    /// 当前场景实例（Start 前为 null）。
+    HtmlScene Current() { return this.current; }
+    /// 当前场景名。
+    string CurrentName() { return this.currentName; }
+    /// 宿主（一般只为了 Input()/MouseX()/StageWidth() 这类查询才用）。
+    GuiHost Host() { return this.host; }
+
+    // ---- IGuiHostLoop：固定顺序转发给全局钩子 + 当前场景 ----
+
+    void Start(GuiHost host) {
+        this.host = host;
+        this.OnStart(host);
+        this.ApplyPending();
+    }
+
+    void Event(GuiHost host, int kind, int key) {
+        this.OnEvent(kind, key);
+        if (this.current != null) { this.current.Event(kind, key); }
+    }
+
+    void FixedUpdate(GuiHost host, int deltaMilliseconds) {
+        this.OnFixedStep(deltaMilliseconds);
+        if (this.current != null) { this.current.FixedStep(deltaMilliseconds); }
+    }
+
+    void Update(GuiHost host, int deltaMilliseconds) {
+        this.ApplyPending();
+        this.OnFrameUpdate(deltaMilliseconds);
+        if (this.current != null) { this.current.Update(deltaMilliseconds); }
+    }
+
+    void Render(GuiHost host, Canvas c, double alpha) {
+        // 1. 游戏世界（舞台逻辑坐标，宿主已设 StageViewport 映射）
+        if (this.current != null) { this.current.Render(c, alpha); }
+        // 2. HTML HUD/整屏（设备像素空间，鼠标 1:1）。保留树每帧
+        //    MeasureTree → Arrange → RenderTree，与 ChildWindow 的
+        //    独立泵同一契约；命中区域随 RenderTree 登记，data-on-*
+        //    点击经 App 的事件分发直达处理器。Arrange 从
+        //    App.ContentTop() 之下开始：桌面带标题栏时顶部一条被
+        //    chrome 覆盖，全屏/手机为 0 满画布。
+        Control root = this.hudRoot;
+        if (root != null) {
+            App app = host.App();
+            int top = app.ContentTop();
+            root.MeasureTree(app);
+            root.Arrange(0, top, c.Width(), c.Height() - top);
+            root.RenderTree(app);
+        }
+    }
+
+    void Stop(GuiHost host) {
+        if (this.current != null) {
+            this.current.OnExit();
+            this.current = null;
+        }
+        this.hudRoot = null;
+        this.OnStop(host);
+    }
+
+    /// <summary>
+    /// 应用挂起的切换：OnExit(旧) → 装载 HTML → OnEnter(新)。每帧
+    /// 至多一次：OnEnter 里再 Go 留到下一帧，A/B 互相 Go 不会死循环。
+    /// </summary>
+    void ApplyPending() {
+        if (this.pendingName.Length == 0) { return; }
+        string name = this.pendingName;
+        this.pendingName = "";
+        HtmlScene next = null;
+        if (!this.scenes.TryGetValue(name, out next)) { return; }
+        if (this.current != null) { this.current.OnExit(); }
+        this.current = next;
+        this.currentName = name;
+        this.hudRoot = null;
+        string file = next.HtmlFile();
+        if (file != null && file.Length > 0) {
+            this.hudRoot = this.LoadSceneHtml(file, next);
+        }
+        next.OnEnter(this.hudRoot);
+        Console.WriteLine("SCENE -> " + name);
+    }
+
+    /// 装载一个场景的 HTML：Assets.Find 定位（开发期磁盘布局），
+    /// File.ReadAllText 读取（发布包自动命中嵌入资源）。返回 body
+    /// 根；失败返回 null 并打日志（场景仍进 Update/Render，纯黑屏
+    /// 比崩溃好排查——日志里有 SCENE HTML FAILED 行）。
+    Control LoadSceneHtml(string file, HtmlScene scene) {
+        if (!this.installTried) {
+            this.installTried = true;
+            Html.Install();
+        }
+        string path = Assets.Find(file);
+        string html = "";
+        if (File.Exists(path)) {
+            html = File.ReadAllText(path);
+        } else {
+            html = File.ReadAllText(file);
+        }
+        if (html == null || html.Length == 0) {
+            Console.WriteLine("SCENE HTML FAILED " + file);
+            return null;
+        }
+        HtmlHandlers handlers = new HtmlHandlers();
+        scene.OnWire(handlers);
+        Control root = this.host.App().LoadHtmlWith(html, handlers, this.baseDir);
+        if (root == null) {
+            Console.WriteLine("SCENE HTML FAILED " + file + " (loader)");
+        }
+        return root;
+    }
+
+    // ---- 全局钩子：派生 SceneRouter 重写这些，不必碰接口形态 ----
+
+    /// 主循环开始前（窗口就绪、首场景装载前）。想按存档决定进哪个
+    /// 场景，在这里 Go() 覆盖 Run(initial) 的入队即可。
+    virtual void OnStart(GuiHost host) { }
+
+    /// 原始输入（切场景级：暂停键、全局快捷键）。kind/keycode 语义
+    /// 见 HtmlScene.Event。
+    virtual void OnEvent(int kind, int key) { }
+
+    /// 固定步长全局钩子。
+    virtual void OnFixedStep(int dtMs) { }
+
+    /// 每帧全局钩子（在场景切换应用之后、场景 Update 之前）。
+    virtual void OnFrameUpdate(int dtMs) { }
+
+    /// 主循环结束后（窗口即将销毁）。
+    virtual void OnStop(GuiHost host) { }
+}

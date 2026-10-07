@@ -162,7 +162,9 @@ App.html + 游戏自己的皮肤。坑与定式，每条都是踩过才成立的
   一起（工厂塔防模板实测间距只剩 9px）。
 - 游戏的式样是游戏自己的：调色板/面板/图标常量写在游戏源码里，不走
   Gui 皮肤系统、不设皮肤选择按钮（2026-10-06 用户裁决）；HUD 里出现
-  原生按钮即返工。
+  原生按钮即返工。游戏专属皮肤文件（`UseSkin("游戏名")` +
+  `skins/<名>/skin.css`）是 2026-10-07 用户裁决认可的正道——
+  HTML+CSS 声明式 chrome 配游戏专属皮肤。
 
 ## 游戏界面设计方案：菜单/面板走 .html 设计稿 + Nav 出口
 
@@ -279,6 +281,27 @@ WM_MOUSEMOVE 就放一钩），gomoku/ddz 真机鼠标操作等于乱落子/乱�
 （WM_KEYDOWN wParam）：空格 32、回车 13、Esc 27、方向键 37..40、
 字母=大写 ASCII（P=80、Q=81、C=67）。接输入前先对 Win32Shell 的
 Post 调用核对编码，别信二手注释。
+
+## 游戏窗口保留树收不到点击：排空清掉事件状态（已修）+ UiDriver 点击验证配方
+
+- **坑（勿回退修复）**：GuiHost.Run 排空事件循环的最后一次"队列已空"轮询
+  会经 `Win32Shell.ClearEvent()` 清掉原生"正在处理的事件"状态，之后整个
+  渲染帧 `app.EventKind()==0`——保留树控件在渲染期才读它，`Ui.Clicked`
+  的 kind==3 永不成立，**游戏窗口里 HUD 挂件/HTML 场景按钮全部点不动**
+  （HudLayer 同样中招；正常 GUI 循环每次迭代只泵一个事件紧跟渲染，踩不到）。
+  症状：UiDriver 点击坐标全对、results.log 全部执行、场景纹丝不动、每帧
+  EventKind 打印恒 0。修法：`App.HoldEventKind(kind)` + GuiHost 每帧排空后
+  挂载本帧最后分发的事件 kind（无事件帧挂 0，不泄漏）——普通 GUI 应用
+  从不武装该路径，行为零变化。
+- **UiDriver 在游戏窗口的点击验证配方**：普通 Button 命中区走
+  `RegisterRect`（无语义标签），`clickid @按钮文字` 解析不到（@label 只认
+  RegisterRectL 自报标签的控件，如 Wizard 行）；数字 id 跨构建漂移（同一
+  源码重编后 1000018 → 1000004）。定式：先 `dump hitregions` 拿按钮几何
+  中心，再用 `click x y` 几何点击；场景切换断言看 stdout 的 `SCENE ->` 行
+  （SceneRouter）+ 各阶段 dump 的区域布局比对。
+- **HTML HUD 的 flex row 别写 align-items:center**：body 满画布时它把按钮
+  条垂直居中到整屏中央（工具栏跑到 y=382）；顶部工具栏用
+  `align-items:flex-start`。
 
 ## 追逐平衡：吸力/拉力必须压过目标速度
 
