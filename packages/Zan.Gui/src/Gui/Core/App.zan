@@ -5903,6 +5903,97 @@ class App {
         }
     }
 
+    // ---- 控件级内容哈希（partialFrames 损伤上报自动化） --------------------
+    //
+    // partialFrames 的正确性前提是"每处状态变化都声明自己改了哪些像素"，
+    // 漏报的像素留在屏上直到下一次整窗重绘——这正是它默认关闭的原因。
+    // 这组设施把上报自动化：RenderTreeInner 把每个控件自段
+    // （SyncBinding+PaintStyleBox+OnPaint）发出的绘制命令流折进
+    // paintHashAcc（Canvas 每个绘制原语入口喂一次 PaintHashOp/Text/List），
+    // 自段结束与上一帧的存档比对——不同说明这块内容变了；当前条带没
+    // 盖住它时像素还是旧的，NoteDamage 控件矩形补进下一帧条带
+    // （needsRedraw 同时被点亮，空闲等事件的 App 也会被推着走完补画帧）。
+    //
+    // 累加器是静态的：Canvas 绘制原语是静态薄封装拿不到实例，而 UI 单
+    // 线程、任一时刻只有一个 App 在渲染帧。每帧 BeginFrame 随
+    // PartialFrames() 置/清 paintHashOn——默认关闭的 App 每原语只多一次
+    // 静态布尔读。哈希对"会被画出来的命令"敏感、与条带无关（条带只是
+    // 裁剪，不改变控件将发出的命令流），因此整帧与条带帧的存档可比。
+
+    static bool paintHashOn;
+    static long paintHashAcc;
+    static long paintHashSaved;
+    Dictionary<int, long> paintHashStore;
+
+    /// RenderTreeInner 自段开始时调用。返回是否处于哈希计数中
+    /// （false = 本应用未开 partialFrames，调用方跳过自段结束的比对）。
+    bool PaintHashBegin() {
+        if (!paintHashOn) { return false; }
+        paintHashSaved = paintHashAcc;
+        paintHashAcc = 5381;
+        return true;
+    }
+
+    /// 自段结束：比对命令流哈希。变了且条带没盖住 → NoteDamage。
+    void PaintHashEndSelf(int id, int x, int y, int w, int h) {
+        long cur = paintHashAcc;
+        paintHashAcc = paintHashSaved;
+        if (paintHashStore == null) {
+            paintHashStore = new Dictionary<int, long>();
+        }
+        long prev = 0;
+        bool had = paintHashStore.TryGetValue(id, out prev);
+        if (had && prev == cur) { return; }
+        if (had) { paintHashStore.Remove(id); }
+        paintHashStore.Add(id, cur);
+        // 整帧（或控件完整落在条带内）时像素已经画对了，只更新存档；
+        // 条带外的控件本帧被裁剪、屏上还是旧像，补进下一帧条带。
+        if (!partialFrame || this.RectInDamage(x, y, w, h)) { return; }
+        this.NoteDamage(x, y, w, h);
+    }
+
+    /// 绘制原语的哈希喂入口（Render.zan 各原语入口调用）。
+    /// 前 4 个参数折几何/主色，宽原语的其余参数用 op=0 续折一次。
+    static void PaintHashOp(int op, int a, int b, int c, int d) {
+        if (!paintHashOn) { return; }
+        long h = paintHashAcc;
+        h = (h * 1099511628211) ^ op;
+        h = (h * 1099511628211) ^ a;
+        h = (h * 1099511628211) ^ b;
+        h = (h * 1099511628211) ^ c;
+        h = (h * 1099511628211) ^ d;
+        paintHashAcc = h;
+    }
+
+    /// 文本类原语：除位置/颜色/字号外，内容逐字符折入。
+    static void PaintHashText(int op, int a, int b, int c, int d, string text) {
+        if (!paintHashOn) { return; }
+        long h = paintHashAcc;
+        h = (h * 1099511628211) ^ op;
+        h = (h * 1099511628211) ^ a;
+        h = (h * 1099511628211) ^ b;
+        h = (h * 1099511628211) ^ c;
+        h = (h * 1099511628211) ^ d;
+        int n = text.Length;
+        h = (h * 1099511628211) ^ n;
+        for (int i = 0; i < n; i = i + 1) {
+            h = (h * 1099511628211) ^ text[i];
+        }
+        paintHashAcc = h;
+    }
+
+    /// 折线/批量路径：顶点值逐个折入（同点数不同值也判得出变化）。
+    static void PaintHashList(List<int> xs) {
+        if (!paintHashOn) { return; }
+        long h = paintHashAcc;
+        int n = xs.Count;
+        h = (h * 1099511628211) ^ n;
+        for (int i = 0; i < n; i = i + 1) {
+            h = (h * 1099511628211) ^ xs[i];
+        }
+        paintHashAcc = h;
+    }
+
     /// 本应用要求的光栅器（`RenderBackend.Cpu/Gpu/Auto`）。要看实际生效的
     /// 那个用 <see cref="RenderBackendName"/>：要了 GPU 而这台机器给不出 GL
     /// 上下文时，画面照旧由 CPU 光栅出来。
@@ -6090,6 +6181,8 @@ class App {
         partialFrame = false;
         partialBlocked = false;
         glassDeferred = false;
+        // 控件内容哈希只在本应用开了局部帧时计数（B-ID119）。
+        paintHashOn = this.PartialFrames();
         // 输入事件（按下/释放/按键）触发的帧不得继承上一帧遗留的
         // 条带裁剪：条带外的控件本帧不渲染、不注册命中区，锚点认领
         // 与 Ui.Clicked 都会落空——表现为点击无响应/迟钝。条带是
