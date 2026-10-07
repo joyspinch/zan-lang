@@ -348,7 +348,9 @@ static int intel_doc_name_lines(const char *text, size_t len,
 
 /* Read attr="value" off one HTML line. `attr` must sit at a tag boundary
  * (start of line, or preceded by space/tab/'<') so "id" does not match
- * inside "data-id". */
+ * inside "data-id". Entity-decoded via intel_html_decode. */
+static size_t intel_html_decode(const char *v, size_t n, char *out,
+                                size_t cap);
 static bool intel_html_attr(const char *line, size_t len, const char *attr,
                             char *out, size_t cap) {
     size_t al = strlen(attr);
@@ -361,12 +363,53 @@ static bool intel_html_attr(const char *line, size_t len, const char *attr,
         const char *v = line + i + al + 2;
         size_t n = 0;
         while (v + n < line + len && v[n] != '"') n++;
-        if (n >= cap) return false;
-        memcpy(out, v, n);
-        out[n] = '\0';
+        if (intel_html_decode(v, n, out, cap) == 0 && n > 0) return false;
         return true;
     }
     return false;
+}
+
+/* Decode the entities the design encoder emits (&amp; &lt; &gt; &quot;
+ * &#39; and numeric &#NN;) so hand-authored attrs like id="A&amp;B" index
+ * under the real name. Attr values the indexer consumes are identifiers,
+ * so this is a no-op on designer-written docs. Returns the decoded length,
+ * or 0 when the value does not fit `cap` (empty values decode to 0 too,
+ * which is valid). */
+static size_t intel_html_decode(const char *v, size_t n, char *out,
+                                size_t cap) {
+    size_t r = 0, w = 0;
+    while (r < n) {
+        if (v[r] == '&') {
+            const char *semi = memchr(v + r, ';', n - r);
+            size_t el = semi ? (size_t)(semi - (v + r)) + 1 : 0;
+            if (el >= 4 && el <= 8) {
+                char c = 0;
+                if (el == 5 && memcmp(v + r, "&amp;", 5) == 0) c = '&';
+                else if (el == 4 && memcmp(v + r, "&lt;", 4) == 0) c = '<';
+                else if (el == 4 && memcmp(v + r, "&gt;", 4) == 0) c = '>';
+                else if (el == 6 && memcmp(v + r, "&quot;", 6) == 0) c = '"';
+                else if (el == 5 && memcmp(v + r, "&apos;", 5) == 0) c = '\'';
+                else if (v[r + 1] == '#') {
+                    int code = 0, ok = 1;
+                    for (size_t k = r + 2; k + 1 < r + el; k++) {
+                        if (v[k] < '0' || v[k] > '9') { ok = 0; break; }
+                        code = code * 10 + (v[k] - '0');
+                    }
+                    if (ok && code > 0 && code < 128) c = (char)code;
+                }
+                if (c != 0) {
+                    if (w + 1 >= cap) return 0;
+                    out[w++] = c;
+                    r += el;
+                    continue;
+                }
+            }
+        }
+        if (w + 1 >= cap) return 0;
+        out[w++] = v[r++];
+    }
+    out[w] = '\0';
+    return w;
 }
 
 static bool intel_html_has(const char *line, size_t len, const char *needle) {

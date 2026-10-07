@@ -147,104 +147,143 @@ class DesignerHtml {
         if (argv != "") {
             b.Append(" data-arg=\"" + EscapeAttr(argv) + "\"");
         }
+        // ---- 固定序属性区 ------------------------------------------------
+        // class/style/各 kind 的原生语义属性一律按下面这个固定顺序发射，
+        // 不随模型键序走。模型键序是读端按文件序回填的：发射序若随模型
+        // 序，异序文档（手写/旧版生成，如 coreforge 的 value/max/style）
+        // 每读存一代就换一次属性位置，永不确定型。固定序让 FromJsonDoc
+        // 成为 (kind, 键集) 的纯函数——异序文档读存一代即收敛。
+        JsonValue cv = o.Get("class");
+        if (cv != null && cv.IsString() && cv.AsString("") != "") {
+            b.Append(" class=\"" + EscapeAttr(cv.AsString("")) + "\"");
+        }
+        JsonValue sv = o.Get("style");
+        if (sv != null && sv.IsString() && sv.AsString("") != "") {
+            // 内联声明走真 style 属性：.html 设计稿因此就是合法的
+            // 运行时 HTML（App.LoadHtml 直接吃同一语义）。
+            b.Append(" style=\"" + EscapeAttr(sv.AsString("")) + "\"");
+        }
+        // 原生语义键发原生属性：img 的 src/alt、input/textarea 的
+        // placeholder/value——文档读起来就是真 HTML。
+        if (kind == "Image") {
+            JsonValue nv = o.Get("src");
+            if (nv != null && nv.IsString() && nv.AsString("") != "") {
+                b.Append(" src=\"" + EscapeAttr(nv.AsString("")) + "\"");
+            }
+            JsonValue nv2 = o.Get("alt");
+            if (nv2 != null && nv2.IsString() && nv2.AsString("") != "") {
+                b.Append(" alt=\"" + EscapeAttr(nv2.AsString("")) + "\"");
+            }
+        }
+        if (kind == "Input" || kind == "TextArea") {
+            JsonValue pv = o.Get("placeholder");
+            if (pv != null && pv.IsString() && pv.AsString("") != "") {
+                b.Append(" placeholder=\"" + EscapeAttr(pv.AsString("")) + "\"");
+            }
+            JsonValue vv = o.Get("value");
+            if (vv != null && vv.IsString() && vv.AsString("") != "") {
+                b.Append(" value=\"" + EscapeAttr(vv.AsString("")) + "\"");
+            }
+        }
+        // range/number 的取值与范围就是原生属性（固定 min/max/step/value 序）。
+        if (kind == "Slider" || kind == "InputNumber") {
+            JsonValue mn = o.Get("min");
+            if (mn != null) {
+                string ms = mn.IsString() ? mn.AsString("")
+                    : (mn.IsNumber() ? Convert.ToString(mn.AsInt(0)) : "");
+                if (ms != "") { b.Append(" min=\"" + EscapeAttr(ms) + "\""); }
+            }
+            JsonValue mx = o.Get("max");
+            if (mx != null) {
+                string xs = mx.IsString() ? mx.AsString("")
+                    : (mx.IsNumber() ? Convert.ToString(mx.AsInt(0)) : "");
+                if (xs != "") { b.Append(" max=\"" + EscapeAttr(xs) + "\""); }
+            }
+            JsonValue sp = o.Get("step");
+            if (sp != null) {
+                string ss = sp.IsString() ? sp.AsString("")
+                    : (sp.IsNumber() ? Convert.ToString(sp.AsInt(0)) : "");
+                if (ss != "") { b.Append(" step=\"" + EscapeAttr(ss) + "\""); }
+            }
+            JsonValue vv2 = o.Get("value");
+            if (vv2 != null) {
+                string vs = vv2.IsString() ? vv2.AsString("")
+                    : (vv2.IsNumber() ? Convert.ToString(vv2.AsInt(0)) : "");
+                if (vs != "") { b.Append(" value=\"" + EscapeAttr(vs) + "\""); }
+            }
+        }
+        if (kind == "ColorPicker" || kind == "DatePicker") {
+            JsonValue cvv = o.Get("value");
+            if (cvv != null && cvv.IsString() && cvv.AsString("") != "") {
+                b.Append(" value=\"" + EscapeAttr(cvv.AsString("")) + "\"");
+            }
+        }
+        // checkbox/radio 的原生 value 是可视文案；checked 是初始勾选。
+        if (kind == "Checkbox" || kind == "Radio") {
+            JsonValue lv = o.Get("label");
+            if (lv != null && lv.IsString() && lv.AsString("") != "") {
+                b.Append(" value=\"" + EscapeAttr(lv.AsString("")) + "\"");
+            }
+            JsonValue don = o.Get("defOn");
+            if (don != null && don.IsBool() && don.AsBool(false)) {
+                b.Append(" checked=\"true\"");
+            }
+        }
+        // <progress value="72" max="100">：percent 折回原生双属性。
+        if (kind == "Progress") {
+            JsonValue pc = o.Get("percent");
+            if (pc != null) {
+                int pci = pc.IsNumber() ? pc.AsInt(0)
+                    : Convert.ToInt32(pc.AsString("0"));
+                if (pci < 0) { pci = 0; }
+                if (pci > 100) { pci = 100; }
+                b.Append(" value=\"" + Convert.ToString(pci) + "\" max=\"100\"");
+            }
+        }
+        // 文本键通道判定：<hr> 无正文，Divider 的标题一律走 data-text；
+        // button/label 一族安全文本走元素正文（收尾），含易折叠空白
+        // （首尾空白/换行/制表）的改走 data-text——EscapeAttr 实体转义
+        // 后逐字节往返，元素正文通道会被解析器 Trim/折叠，丢内容。
+        bool textIsBody = kind == "Button" || kind == "Label"
+            || kind == "TextArea" || kind == "Typography";
+        if (kind == "Divider") {
+            JsonValue dv = o.Get("text");
+            if (dv != null && dv.IsString() && dv.AsString("") != "") {
+                b.Append(" data-text=\"" + EscapeAttr(dv.AsString("")) + "\"");
+            }
+        } else if (textIsBody) {
+            JsonValue tv = o.Get("text");
+            if (tv != null && tv.IsString()
+                && !DesignerHtml.TextIsHtmlSafe(tv.AsString(""))) {
+                b.Append(" data-text=\"" + EscapeAttr(tv.AsString("")) + "\"");
+            }
+        }
+        // 其余键按模型序走通用通道（读端同序回填，模型序即文件序，稳定）。
         for (int i = 0; i < o.Count(); i = i + 1) {
             string key = o.KeyAt(i);
             JsonValue v = o.ValAt(i);
             if (v == null) { continue; }
-            if (key == "kind" || key == "name") { continue; }
+            if (key == "kind" || key == "name" || key == "class"
+                || key == "style" || key == "arg" || key == "kids") {
+                continue;   // 头部/固定区已发，kids 收尾统一发子元素
+            }
             if (kind == "Element" && key == "tag") { continue; }
-            if (key == "class") {
-                string cv = v.IsString() ? v.AsString("") : "";
-                if (cv != "") { b.Append(" class=\"" + EscapeAttr(cv) + "\""); }
-                continue;
-            }
-            if (key == "style") {
-                // 内联声明走真 style 属性：.html 设计稿因此就是合法的
-                // 运行时 HTML（App.LoadHtml 直接吃同一语义）。
-                string sv = v.IsString() ? v.AsString("") : "";
-                if (sv != "") { b.Append(" style=\"" + EscapeAttr(sv) + "\""); }
-                continue;
-            }
-            if (key == "kids") {
-                continue;   // 收尾统一发子元素
-            }
-            // 原生语义键发原生属性/文本：img 的 src/alt、input/textarea
-            // 的 placeholder/value 发真 HTML 属性；button/label/textarea
-            // 的 text 发元素文本（收尾）——文档读起来就是真 HTML。
-            if (kind == "Image" && (key == "src" || key == "alt")) {
-                string nv = v.IsString() ? v.AsString("") : "";
-                if (nv != "") { b.Append(" " + EscapeAttr(key) + "=\"" + EscapeAttr(nv) + "\""); }
-                continue;
-            }
+            if (kind == "Image" && (key == "src" || key == "alt")) { continue; }
             if ((kind == "Input" || kind == "TextArea")
-                && (key == "placeholder" || key == "value")) {
-                string pv = v.IsString() ? v.AsString("") : "";
-                if (pv != "") { b.Append(" " + EscapeAttr(key) + "=\"" + EscapeAttr(pv) + "\""); }
-                continue;
-            }
+                && (key == "placeholder" || key == "value")) { continue; }
             if ((kind == "Button" || kind == "Label" || kind == "TextArea"
-                || kind == "Typography") && key == "text") {
-                continue;   // 收尾发元素文本
-            }
-            // <hr> 是 void 元素没有正文：Divider 的标题走
-            // data-text 通用通道（导入端 PutAttr 原样读回 text 键）。
-            if (kind == "Divider" && key == "text") {
-                string dv = v.IsString() ? v.AsString("") : "";
-                if (dv != "") {
-                    b.Append(" data-text=\"" + EscapeAttr(dv) + "\"");
-                }
-                continue;
-            }
-            // <progress value="72" max="100">：percent 折回原生双属性。
-            if (kind == "Progress" && key == "percent") {
-                int pc = v.IsNumber() ? v.AsInt(0)
-                    : Convert.ToInt32(v.AsString("0"));
-                if (pc < 0) { pc = 0; }
-                if (pc > 100) { pc = 100; }
-                b.Append(" value=\"" + Convert.ToString(pc)
-                         + "\" max=\"100\"");
-                continue;
-            }
-            // <select> 的候选在收尾发 <option> 子元素；value（选中
-            // 下标）折成 selected 标记，不进通用属性。
+                || kind == "Typography" || kind == "Divider")
+                && key == "text") { continue; }
+            if (kind == "Progress" && key == "percent") { continue; }
             if (kind == "SelectBox"
-                && (key == "options" || key == "value")) {
-                continue;
-            }
-            // checkbox/radio 的原生 value 是可视文案；checked 是
-            // 初始勾选。导入端按同一约定读回。
-            if ((kind == "Checkbox" || kind == "Radio") && key == "label") {
-                string lv = v.IsString() ? v.AsString("") : "";
-                if (lv != "") { b.Append(" value=\"" + EscapeAttr(lv) + "\""); }
-                continue;
-            }
-            if (kind == "Checkbox" && key == "defOn") {
-                if (v.IsBool() && v.AsBool(false)) {
-                    b.Append(" checked=\"true\"");
-                }
-                continue;
-            }
-            // range/number/color/date 的取值与范围就是原生属性。
+                && (key == "options" || key == "value")) { continue; }
+            if ((kind == "Checkbox" || kind == "Radio")
+                && (key == "label" || key == "defOn")) { continue; }
             if ((kind == "Slider" || kind == "InputNumber")
                 && (key == "min" || key == "max" || key == "step"
-                    || key == "value")) {
-                string rv = v.IsString() ? v.AsString("")
-                    : (v.IsNumber() ? Convert.ToString(v.AsInt(0)) : "");
-                // rv 与属性名 key 都过 EscapeAttr 防御注入（rv 来自设计稿可能被注入）。
-                if (rv != "") { b.Append(" " + EscapeAttr(key) + "=\"" + EscapeAttr(rv) + "\""); }
-                continue;
-            }
+                    || key == "value")) { continue; }
             if ((kind == "ColorPicker" || kind == "DatePicker")
-                && key == "value") {
-                string cvv = v.IsString() ? v.AsString("") : "";
-                if (cvv != "") {
-                    b.Append(" value=\"" + EscapeAttr(cvv) + "\"");
-                }
-                continue;
-            }
-            if (key == "arg") {
-                continue;   // 已在属性头发 data-arg，通用通道跳过
-            }
+                && key == "value") { continue; }
             AppendKey(b, v, key, 1);
         }
         // <select>：候选发 <option> 子元素，value 下标标 selected。
@@ -283,7 +322,9 @@ class DesignerHtml {
         JsonValue tv = o.Get("text");
         if (tv != null && tv.IsString()) {
             string ts = tv.AsString("");
-            if (ts != "") {
+            // 元素正文通道只发安全文本；含易折叠空白的已在固定区走
+            // data-text，这里再发一份会被解析器 Trim/折叠成两份不一致。
+            if (ts != "" && DesignerHtml.TextIsHtmlSafe(ts)) {
                 b.Append(">" + EscapeAttr(ts) + "</" + tag + ">\n");
                 return;
             }
@@ -347,11 +388,12 @@ class DesignerHtml {
             // 原生 HTML 属性 → 建模键：<img src/alt>、input/textarea
             // 的 placeholder/value、表单族的 min/max/step。与 data-*
             // 通道写进同一个键空间（src="x" ≡ data-src="x"），读端
-            // 不分来源。
+            // 不分来源。Has 守卫：手写文档两通道同键并发时只取先到的，
+            // 否则 Put 追加出重复键。
             if (a == "src" || a == "alt" || a == "placeholder"
                 || a == "value" || a == "min" || a == "max"
                 || a == "step") {
-                if (v != "") { o.Put(a, JsonValue.NewStr(v)); }
+                if (v != "" && !o.Has(a)) { o.Put(a, JsonValue.NewStr(v)); }
                 continue;
             }
             if (a.Length > 5 && HtmlText.StartsWith(a, "data-")) {
@@ -426,7 +468,9 @@ class DesignerHtml {
                 }
             }
             txt = txt.Trim();
-            if (txt != "") { o.Put("text", JsonValue.NewStr(txt)); }
+            // data-text 通道已写入 text 键时以它为准（逐字节精确）；
+            // 元素正文是被解析器 Trim/折叠过的近似值，不再覆盖。
+            if (txt != "" && !o.Has("text")) { o.Put("text", JsonValue.NewStr(txt)); }
         }
         // select 的子元素已在上面折成 options，不再当容器 kids 递归。
         if (kind == "SelectBox") { return o; }
@@ -582,9 +626,28 @@ class DesignerHtml {
             else if (ch == ">") { outp = outp + "&gt;"; }
             else if (ch == "\"") { outp = outp + "&quot;"; }
             else if (ch == "'") { outp = outp + "&#39;"; }
+            else if (ch == "\n") { outp = outp + "&#10;"; }
+            else if (ch == "\r") { outp = outp + "&#13;"; }
+            else if (ch == "\t") { outp = outp + "&#9;"; }
             else { outp = outp + ch; }
         }
         return outp;
+    }
+
+    /// 元素正文通道安全判定：不含换行/回车/制表且首尾无空白。HTML
+    /// 解析器会 Trim 元素文本首尾、把正文里的空白规范化——不安全的
+    /// 文本必须走 data-text 属性通道（EscapeAttr 实体转义）才能
+    /// 逐字节往返，否则多行文案一次读存就塌成单行。
+    static bool TextIsHtmlSafe(string s) {
+        if (s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i];
+            if (c == 10 || c == 13 || c == 9) { return false; }
+        }
+        int c0 = s[0];
+        int cl = s[s.Length - 1];
+        if (c0 == 32 || cl == 32) { return false; }
+        return true;
     }
 
     /// tag 值合法性：设计稿 JSON 可以来自不可信的 .html，
