@@ -305,6 +305,58 @@ Post 调用核对编码，别信二手注释。
 - **HTML HUD 的 flex row 别写 align-items:center**：body 满画布时它把按钮
   条垂直居中到整屏中央（工具栏跑到 y=382）；顶部工具栏用
   `align-items:flex-start`。
+- **画布层点击 = dump 坐标 +48px Y**：UiDriver `click x y` 注入的是客户区
+  像素事件。HTML 层命中区与点击坐标 1:1，直接用 `dump hitregions` 的几何
+  中心；但 canvas 游戏收到的是舞台坐标 = 客户 Y − 48（标题栏），点舞台
+  (sx,sy) 要发 `click sx (sy+48)`。实测：instrument OnDown 打印，设备
+  (582,918) → 游戏 (582,870)（棋盘 74px 格阵差出一整格）。
+- **dump 命令恰好两个参数**：`dump pixels a.png` / `dump hitregions a.json`，
+  多塞 token（`dump hitregions 3 a.json`）整条静默不执行——后续断言全空
+  时先查这个。
+- **首击前等菜单装载完成**：启动后立刻 click 会跑在 HTML 命中区注册之前，
+  这一击会整个丢失，下一击落在菜单上可能误触别的按钮（实测 1.2s 时首个
+  按钮点击丢失、下一击误开了另一菜单项）。定式：launch 后 `wait 2500`，
+  再 `dump hitregions` 门控（HTML 菜单 ≈15 个含 1000018+；纯 canvas 对局
+  4 个仅 chrome 990001-990004），确认场景对了再点。
+- **`SCENE ->` 行第一条是启动场景**：`Run("menu")` 也打一行，数"切了几次
+  场景"要把它减掉，否则断言恒差一。
+- **验证"Esc 退出进程"看 results.log 断尾**：驱动脚本活在游戏进程里，键
+  真把进程退了，后续命令（含 quit）不再出现于 `ZAN_UI_OUT/results.log`
+  且 exit 仍 0——"日志停在 keydown 那行"就是退出成功的证据。
+- **随机种子的局，交互坐标不可跨运行复用**：发牌/布阵随 `Window.GetTickMs`
+  种子变（斗地主每局牌序不同，固定下标点选两次拿到不同牌），点选目标要么
+  当运行内 dump 后人工换算再发第二轮探针，要么选与布局无关的必然合法动作
+  （如"单张领出"）；菜单/结算这类静态布局例外，坐标可跨运行复用。
+
+## Zan 游戏模板迁 SceneRouter/HtmlScene 定式（menu/play/over 三场景）
+
+批次实证（打砖块/贪吃蛇/五子棋/围棋/象棋/斗地主/黄金矿工七个模板，2026-10）：
+
+- **引擎类只留仿真**：删 `host`/`scene` 字段与 OnKey/Render 分发；**Create
+  里 `g.c = h.App().canvas` 必须删**——Register 阶段 App() 还是 null，留着
+  即启动 NRE（画布每帧由场景 Render 对齐传入，Android 换面也顺带解决）。
+- **OnDown 拆两半**：棋盘/牌桌/出牌等玩法点击留引擎（OnDownPlay），菜单/
+  重玩/底排/Esc 升到场景层 `Event`（kind 2 = 按下，指针坐标
+  `host.MouseX/Y()`；kind 4 key 27 → menu 场景 `router.Exit()`、其余场景
+  `Go("menu")`）。
+- **DrawMenu → DrawMenuArt**：只画背景+标题贴图，副标题/按钮/战绩行全部
+  归 HTML（body 透明扁平列）；**DrawOver 删除**——OverScene.Render 继续
+  画定格的对局画面，body `rgba` 半透明压暗，按钮文案走 HTML。
+- **Main 四行**：`SceneRouter.CreateFixed(题名, w, h, 16)` → `Create(router.Host())`
+  → `Register("menu"/"play"/"over", ...)` → `Run(g.demo ? "play" : "menu")`
+  （demo 标记文件直接进对局自弈，截图/无头验证通道）。
+- **结算场景有确认冷却就必须续推世界**：OverScene.FixedStep 继续调引擎
+  Tick/Step（黄金矿工 ConfirmResult 的 600ms resultWait 只在 Step 里累计，
+  停推则按钮永远无效）；纯棋类无此需求。
+- **存档挂 OnExit**：切场景（ApplyPending）与退应用（SceneRouter.Stop）都
+  会调当前场景 OnExit，旧主循环 Stop 里的落盘搬到这里。
+- **`<button>` 生成 Gui Button 控件，不是文本 Element**：`root.Find(id)` 认
+  **显式 `id=` 属性**（`data-on-click` 值不是 Find 键，漏 id 静默拿 null）；
+  动态改按钮标签走 `Button.Text = "..."`（Binding 字段，Label() 每帧重读，
+  已实机验证）；<p>/<h1> 才是 `Element.SetText`。
+- **handler 写 expression lambda**：`handlers.Add("x", () => this.Pick(0))`，
+  语句块 lambda 不用（提炼成方法）；按钮多的菜单显式逐条注册，不靠循环变
+  量闭包。
 
 ## 追逐平衡：吸力/拉力必须压过目标速度
 
