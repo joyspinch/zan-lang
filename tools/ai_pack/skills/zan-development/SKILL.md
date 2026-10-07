@@ -65,6 +65,13 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 * No C#-style collection initializers: `string[] xs = { "a", "b" };` fails
   to parse (`unexpected token '{'`). Build a `List<string>` with `Add`
   calls instead. (2026-10-07, test-probe compile)
+* `new T[N]` is zero-initialized — a non-zero sentinel needs an explicit
+  constructor pass. Every slot reads `0` right after allocation; if an
+  incremental `Clear()` only resets slots it has recorded (dirty buckets,
+  a used-slots list), the constructor — where nothing is recorded yet —
+  must loop-initialize all N slots itself, or the first insert chains onto
+  slot 0: self-loops, duplicated query hits, nearest-search hangs.
+  (2026-10-07, spatial-hash probe hang)
 
 ## 4. Edit
 

@@ -266,6 +266,30 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   DC 跟着小——截图被裁角还以为窗口没建对。截图脚本开头调一次
   `SetProcessDpiAwarenessContext(-4)` 再量再抓。
 
+### GUI 保留树事件路径的真实点击验证（2026-10-07 事件门控验证沉淀）
+
+- **先分清事件通道，再声明"路径已被点击验证"**：控件事件是双通道。Button
+  这类控件有专属 `UiEvent Click` 字段（Button.zan:64），处理器经重载的
+  AddByName 路由进专属字段，点击在 `Ui.Activate` 命中后 `Click.PostS(this)`
+  直发（:248）；`On.Fire(app, wid, this)`（:262）只广播通用 hub
+  （WidgetEvents），对 Button 永远空转——hub 里没有订阅者。走 hub 的是
+  FireCommon 自动接线、FireOn，以及 Checkbox/Dropdown/Input/InputNumber/
+  FloatButton/ChoiceGroup/ColorPicker 的 hub 事件与 HTML 元素 data-on-click。
+  把"点了 Button"当"hub 路径已验证"是假阳性（2026-10-07 门控提交的验证
+  描述即含此错）；gui_gallery 导航项这类立即模式行是 `RegisterRect`+
+  `ClickAvailable` 几何热区，根本不是控件，点它等于什么事件路径都没碰。
+- **hub 路径的探针夹具用"无专属字段、只订 hub"的控件**：Panel 订
+  `root.On.Click`（Panel 没有专属 Click 字段，点击只能经 FireCommon→
+  WidgetEvents.Fire 的门控分支到达），宿主用 ChildWindow 独立窗口。
+- **ChildWindow 独立窗口探针配方**：子类 override `Title()/Width()/
+  Height()/ShowMaximize()/IdBase()`（同进程多窗 IdBase 分段防撞号），主流程
+  `w.SetRoot(root, null); w.Wire(); w.OpenStandalone();
+  w.PumpStandaloneUntil(stop)`，stop 是 `delegate bool Xxx()`、返回 true 停泵。
+  驱动 `ZAN_UI_SCRIPT`：`wait 2500`（等首帧）/ `click x y`（保留树命中区
+  客户区 1:1）/ `wait 800` / `quit`（兜底防点空挂死），断言读 stdout 的
+  处理器输出。事件成员名以 Event.zan 为准（是 `Enter` 不是 `EnterS`——
+  编不过先 grep 成员表再猜）。
+
 - **截图必须锚定进程 PID、按窗口抓取**，禁止全屏抓图后肉眼找窗口——
   全屏抓到的是最前面的任意窗口（编辑器/旧实例），拿错误窗口的像素做判断
   会得出"程序坏了"或"修好了"的假结论。先记录启动 PID，再按 PID 枚举顶层窗口
