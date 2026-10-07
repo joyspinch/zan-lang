@@ -30,6 +30,19 @@ class ForgeCombat {
     static int CooledCooldown() { return 22; }
     static int OffGridCooldown() { return 90; }
     static int Unreachable() { return 1000000000; }
+    static int BlastRadius() { return 1800; }   // 臼炮溅射半径（世界单位，1.8 格）
+    static int ScatterDamage() { return 16; }
+    static int ScatterCooldown() { return 16; }
+    static int SniperDamage() { return 96; }
+    static int SniperCooldown() { return 120; }
+    static int MortarDamage() { return 44; }
+    static int MortarCooldown() { return 80; }
+
+    /// 四种炮塔共用开火循环；分派差异在弹药/伤害/冷却参数表里。
+    static bool TurretFamily(BlockKind kind) {
+        return kind == BlockKind.Turret || kind == BlockKind.Scatter
+          || kind == BlockKind.Sniper || kind == BlockKind.Mortar;
+    }
 
     ForgeCombat(ForgeWorld state) {
         world = state;
@@ -173,7 +186,12 @@ class ForgeCombat {
         int ordinal = wave.count - world.spawnRemaining;
         int kind = 0;
         if (world.spawnRemaining > 0) {
-            if (world.wave >= 3 && ((ordinal + world.wave) % 4 == 0 || (world.wave >= 12 && ordinal % 2 == 1))) { kind = 1; }
+            // 波次混编（确定性公式）：3 波起混重兽，5 波起混自爆奔兽，
+            // 7 波起混飞虫——迫使防线同时备好对地纵深与对空火力。
+            int roll = (ordinal * 7 + world.wave * 3) % 10;
+            if (world.wave >= 7 && roll >= 8) { kind = 3; }
+            else if (world.wave >= 5 && roll >= 6) { kind = 4; }
+            else if (world.wave >= 3 && (roll >= 4 || (world.wave >= 12 && ordinal % 2 == 1))) { kind = 1; }
             world.spawnRemaining = world.spawnRemaining - 1;
         } else {
             kind = wave.boss;
@@ -225,6 +243,13 @@ class ForgeCombat {
         }
         if (cell == world.coreCell) { world.Shake(4); }
         else if (def.damage >= 25) { world.Shake(2); }
+        // 奔兽是消耗品：一次撞击后自爆消失，不计击杀与奖励。
+        bool suicide = e.kind == 4;
+        if (suicide) {
+            e.active = false; e.hp = 0;
+            world.enemyCount = ForgeGrid.Max(0, world.enemyCount - 1);
+            world.SpawnEffect(2, e.x, e.y, 0, 0, 16, 10, 0xFFE8935A, 0);
+        }
         // Entry costs price building hp, so any damage invalidates cached routes;
         // a loaded save rebuilds from current hp and must follow the same route.
         world.pathsDirty = true;
@@ -251,6 +276,23 @@ class ForgeCombat {
             if (cell == world.coreCell) {
                 Attack(e, cell);
                 if (world.defeated) { return; }
+                continue;
+            }
+            if (e.kind == 3) {
+                // 掠翼飞虫无视地形与建筑，直线扑向炉心；抵达即啃咬。
+                int tx = ForgeGrid.Center(world.coreCell % world.width);
+                int ty = ForgeGrid.Center(world.coreCell / world.width);
+                int dx = tx - e.x; int dy = ty - e.y;
+                long square = (long)dx * (long)dx + (long)dy * (long)dy;
+                if (square <= 900L * 900L) {
+                    Attack(e, world.coreCell);
+                    if (world.defeated) { return; }
+                    continue;
+                }
+                double length = Math.Sqrt((double)square);
+                int step = ForgeGrid.Max(1, world.catalog.enemies[e.kind].speed);
+                e.x = e.x + (int)((double)dx * (double)step / length);
+                e.y = e.y + (int)((double)dy * (double)step / length);
                 continue;
             }
             int target = nextCell[cell];
@@ -333,6 +375,7 @@ class ForgeCombat {
                     int sy = ((world.tick * 23 + i * 59) % 27 - 15) * 10 - 12;
                     world.SpawnEffect(1, e.x, e.y, dx / 4 + sx, dy / 4 + sy, 9 + i * 2, 2 + i % 2, i == 0 ? 0xFFF5D9A0 : 0xFFD98E4A, 0);
                 }
+                if (b.blast > 0) { Splash(b.x, b.y, b.damage / 2, b.target); }
                 if (e.hp <= 0) { Kill(b.target); }
             } else {
                 double length = Math.Sqrt((double)square);
@@ -343,7 +386,7 @@ class ForgeCombat {
         }
     }
 
-    int FindTarget(int x, int y, int range, int mode) {
+    int FindTarget(int x, int y, int range, int mode, bool antiAir) {
         if (querySequence >= 2147483647) {
             for (int i = 0; i < seen.Length; i = i + 1) { seen[i] = 0; }
             querySequence = 0;
@@ -359,6 +402,7 @@ class ForgeCombat {
             seen[slot] = querySequence;
             ForgeEnemy e = world.enemies[slot];
             if (!e.active || e.hp <= 0) { continue; }
+            if (!antiAir && e.kind == 3) { continue; }
             int dx = e.x - x;
             int dy = e.y - y;
             long square = (long)dx * (long)dx + (long)dy * (long)dy;
@@ -384,39 +428,98 @@ class ForgeCombat {
         return -1;
     }
 
+    /// 各炮塔的弹药类型：脉冲/散射吃铜铅（铅优先高伤），狙击纯铅，臼炮吃石墨。
+    int AmmoItem(ForgeBuilding tower) {
+        if (tower.kind == BlockKind.Sniper) { return (int)ItemKind.Lead; }
+        if (tower.kind == BlockKind.Mortar) { return (int)ItemKind.Graphite; }
+        return tower.stock.Get(1) > 0 ? 1 : 0;
+    }
+
+    int BaseDamage(ForgeBuilding tower, int ammoItem) {
+        if (tower.kind == BlockKind.Scatter) { return ForgeCombat.ScatterDamage(); }
+        if (tower.kind == BlockKind.Sniper) { return ForgeCombat.SniperDamage(); }
+        if (tower.kind == BlockKind.Mortar) { return ForgeCombat.MortarDamage(); }
+        return ammoItem == 1 ? ForgeCombat.LeadDamage() : ForgeCombat.CopperDamage();
+    }
+
+    int BaseCooldown(ForgeBuilding tower) {
+        if (tower.kind == BlockKind.Scatter) { return ForgeCombat.ScatterCooldown(); }
+        if (tower.kind == BlockKind.Sniper) { return ForgeCombat.SniperCooldown(); }
+        if (tower.kind == BlockKind.Mortar) { return ForgeCombat.MortarCooldown(); }
+        return ForgeCombat.PoweredCooldown();
+    }
+
+    int IdleCooldown(ForgeBuilding tower) {
+        if (tower.kind == BlockKind.Scatter) { return 24; }
+        if (tower.kind == BlockKind.Sniper) { return 150; }
+        if (tower.kind == BlockKind.Mortar) { return 100; }
+        return ForgeCombat.OffGridCooldown();
+    }
+
     void FireTurrets() {
         int range = TurretRange();
         for (int cell = 0; cell < world.buildings.Length; cell = cell + 1) {
             ForgeBuilding tower = world.buildings[cell];
-            if (tower.kind != BlockKind.Turret || tower.hp <= 0) { continue; }
+            if (!ForgeCombat.TurretFamily(tower.kind) || tower.hp <= 0) { continue; }
             if (tower.cooldown > 0) { tower.cooldown = tower.cooldown - 1; }
             if (tower.cooldown > 0 || world.enemyCount <= 0) { continue; }
             int power = ForgeGrid.Max(0, ForgeGrid.Min(1000, tower.efficiency));
-            if (world.catalog.blocks[(int)BlockKind.Turret].powerUse == 0) { power = 1000; }
+            if (world.catalog.blocks[(int)tower.kind].powerUse == 0) { power = 1000; }
             if (power == 0 && !allowOffGrid) { continue; }
-            int ammo = tower.stock.Get(1) > 0 ? 1 : 0;
+            int ammo = AmmoItem(tower);
             if (tower.stock.Get(ammo) <= 0) { continue; }
             int x = ForgeGrid.Center(cell % world.width);
             int y = ForgeGrid.Center(cell / world.width);
-            int target = FindTarget(x, y, range, tower.targetMode);
+            // 臼炮无法对空；其余炮塔一视同仁。
+            bool antiAir = tower.kind != BlockKind.Mortar;
+            int target = FindTarget(x, y, range, tower.targetMode, antiAir);
             if (target < 0) { continue; }
-            int slot = FreeBullet();
-            if (slot < 0 || !tower.stock.Take(ammo, 1)) { continue; }
-            ForgeBullet b = world.bullets[slot];
+            if (!tower.stock.Take(ammo, 1)) { continue; }
             ForgeEnemy enemy = world.enemies[target];
-            b.active = true; b.x = x; b.y = y; b.target = target; b.generation = enemy.generation;
-            b.damage = ammo == 1 ? ForgeCombat.LeadDamage() : ForgeCombat.CopperDamage();
-            if (world.researched[3]) { b.damage = b.damage * 3 / 2; }
-            b.life = ForgeCombat.BulletLifetime();
+            int damage = BaseDamage(tower, ammo);
+            if (world.researched[3]) { damage = damage * 3 / 2; }
+            int shots = tower.kind == BlockKind.Scatter ? 2 : 1;
+            for (int s = 0; s < shots; s = s + 1) {
+                int slot = FreeBullet();
+                if (slot < 0) { break; }
+                ForgeBullet b = world.bullets[slot];
+                b.active = true; b.x = x; b.y = y; b.target = target; b.generation = enemy.generation;
+                b.damage = damage;
+                b.blast = tower.kind == BlockKind.Mortar ? 1 : 0;
+                b.life = ForgeCombat.BulletLifetime();
+            }
             // 枪口焰：炮口方向的短促亮斑。
             int mdx = enemy.x - x; int mdy = enemy.y - y;
             int mlen = ForgeGrid.Max(1, (int)Math.Sqrt((double)mdx * mdx + (double)mdy * mdy));
             world.SpawnEffect(0, x + mdx * 700 / mlen, y + mdy * 700 / mlen, mdx * 30 / mlen, mdy * 30 / mlen, 5, 5, 0xFFFFE2A0, 0);
-            int powered = ForgeCombat.PoweredCooldown();
-            if (power > 0 && tower.water >= 2) {
+            int powered = BaseCooldown(tower);
+            if (tower.kind == BlockKind.Turret && power > 0 && tower.water >= 2) {
                 tower.water = tower.water - 2; powered = ForgeCombat.CooledCooldown();
             }
-            tower.cooldown = ForgeCombat.OffGridCooldown() - (ForgeCombat.OffGridCooldown() - powered) * power / 1000;
+            tower.cooldown = IdleCooldown(tower) - (IdleCooldown(tower) - powered) * power / 1000;
+        }
+    }
+
+    /// 臼炮落点溅射：半径内其他敌人吃一半伤害。hash 是本 tick 开头的快照，
+    /// 溅射用它粗查再做圆形精查；桶冲突会重复 ID，沿用 seen 去重。
+    void Splash(int x, int y, int damage, int exclude) {
+        if (querySequence >= 2147483647) {
+            for (int i = 0; i < seen.Length; i = i + 1) { seen[i] = 0; }
+            querySequence = 0;
+        }
+        querySequence = querySequence + 1;
+        int count = enemyHash.QueryRange((double)x, (double)y, (double)ForgeCombat.BlastRadius(), candidates, candidates.Length);
+        long square = (long)ForgeCombat.BlastRadius() * (long)ForgeCombat.BlastRadius();
+        for (int i = 0; i < count; i = i + 1) {
+            int slot = candidates[i];
+            if (slot == exclude || seen[slot] == querySequence) { continue; }
+            seen[slot] = querySequence;
+            ForgeEnemy e = world.enemies[slot];
+            if (!e.active || e.hp <= 0) { continue; }
+            int dx = e.x - x; int dy = e.y - y;
+            if ((long)dx * dx + (long)dy * dy > square) { continue; }
+            e.hp = e.hp - ForgeGrid.Max(1, damage);
+            if (e.hp <= 0) { Kill(slot); }
         }
     }
 
