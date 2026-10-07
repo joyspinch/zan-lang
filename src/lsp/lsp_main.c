@@ -540,6 +540,13 @@ static void extract_chain_expr(const char *text, size_t offset,
             else break;
         } else if (ch == '.' && paren_depth == 0 && angle_depth == 0) {
             start--;
+        } else if (ch == '"' || ch == '\'') {
+            /* A string/char literal chain root: consume back to the opening
+             * quote so `"abc".ToUpper()` arrives whole at the resolver. */
+            char q = ch;
+            start--;
+            while (start > 0 && text[start - 1] != q) start--;
+            if (start > 0) start--;
         } else if ((is_ident_char(ch) || ch == '_') && paren_depth == 0 && angle_depth == 0) {
             start--;
         } else if (paren_depth > 0 || angle_depth > 0) {
@@ -621,6 +628,17 @@ static void member_context(const char *text, size_t offset, char *out, size_t ca
     char chain_expr[1024];
     extract_chain_expr(text, offset, chain_expr, sizeof(chain_expr));
 
+    /* Literal roots ("text", 'c', 123) cannot be expressed as a bare
+     * identifier: hand the whole chain to the resolver, whose literal-root
+     * branches type them (string/int). */
+    if (chain_expr[0] == '"' || chain_expr[0] == '\'' ||
+        (chain_expr[0] >= '0' && chain_expr[0] <= '9')) {
+        if (strlen(chain_expr) + 7 < cap) {
+            snprintf(out, cap, "CHAIN:%s", chain_expr);
+            return;
+        }
+    }
+
     /* Check if it's a multi-dot chain */
     int dot_count = 0;
     int pd = 0;
@@ -660,6 +678,14 @@ static void member_context(const char *text, size_t offset, char *out, size_t ca
     }
     while (obj_start > 0 && is_ident_char(text[obj_start - 1])) obj_start--;
     size_t n = obj_end - obj_start;
+    if (n == 0 && chain_expr[0]) {
+        /* Nothing identifier-shaped before the dot (a call chain or other
+         * expression): the resolver handles the whole chain. */
+        if (strlen(chain_expr) + 7 < cap) {
+            snprintf(out, cap, "CHAIN:%s", chain_expr);
+            return;
+        }
+    }
     if (n >= cap) n = cap - 1;
     memcpy(out, text + obj_start, n);
     out[n] = '\0';
@@ -943,6 +969,8 @@ static int lsp_symbol_kind(isym_kind_t k) {
 
 /* ============================ handlers =============================== */
 
+static void ensure_project_indexed(lsp_server_t *s);
+
 static void handle_initialize(lsp_server_t *s, json_value *id, json_value *params) {
     /* Extract workspace root for project indexing */
     if (params) {
@@ -964,6 +992,8 @@ static void handle_initialize(lsp_server_t *s, json_value *id, json_value *param
             strncpy(s->workspace_root, root_path, sizeof(s->workspace_root) - 1);
         }
     }
+
+    ensure_project_indexed(s);
 
     json_value *caps = json_new_obj();
     /* Incremental document sync: clients may send range-based edits.
@@ -1437,12 +1467,14 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
         /* Handle chain expressions (CHAIN:prefix) */
         if (strncmp(context, "CHAIN:", 6) == 0) {
             const char *chain_expr = context + 6;
-            /* Use intel_resolve_chain to get the type at end of chain */
-            const char *chain_type = intel_resolve_chain(is, chain_expr,
-                                                         chain_prefix, sizeof(chain_prefix));
+            /* Use intel_resolve_chain_pos to get the type at end of chain, with cursor line */
+            const char *chain_type = intel_resolve_chain_pos(is, g_project_intel, chain_expr,
+                                                             chain_prefix, sizeof(chain_prefix),
+                                                             line, character);
             if (!chain_type && g_project_intel) {
-                chain_type = intel_resolve_chain(g_project_intel, chain_expr,
-                                                 chain_prefix, sizeof(chain_prefix));
+                chain_type = intel_resolve_chain_pos(g_project_intel, NULL, chain_expr,
+                                                     chain_prefix, sizeof(chain_prefix),
+                                                     line, character);
             }
             if (chain_type) {
                 resolve_type = chain_type;
@@ -1492,9 +1524,14 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
         }
     } else if (!ns_mode && effective[0]) {
         count = intel_complete(is, effective, NULL);
-        /* Supplement with project-wide symbols if we have few results */
+        /* Supplement with project-wide symbols if we have few results.
+         * The enclosing class comes from the live buffer: designer-projected
+         * widget fields live only in the index as members of the partial
+         * class, and member symbols need their owner on record to pass the
+         * bare-symbol rank guard. */
         if (g_project_intel && count < 20) {
-            int proj_count = intel_complete(g_project_intel, effective, NULL);
+            const char *encl = intel_enclosing_type_at(is, line, character);
+            int proj_count = intel_complete_bare(g_project_intel, effective, encl);
             /* Merge project completions into local list, avoiding duplicates */
             for (int pi = 0; pi < proj_count && count < INTEL_MAX_COMPLETIONS; pi++) {
                 bool dup = false;
@@ -1548,6 +1585,45 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
     send_response(s, id, items);
 }
 
+/* The dotted receiver expression immediately before a member word: for
+ * `MainStatusBar.SetText` with the cursor inside SetText this yields
+ * "MainStatusBar". `offset` is the cursor offset; the word start is found
+ * with the same backward scan word_at uses (the cursor may sit mid-word).
+ * The scan stops at any character a simple receiver chain cannot contain
+ * (whitespace, parens, operators); returns false when the character before
+ * the word is not a dot. */
+static bool receiver_chain_before(const char *text, size_t offset,
+                                  char *out, size_t cap) {
+    size_t start = offset;
+    while (start > 0 && is_ident_char(text[start - 1])) start--;
+    if (start == 0 || text[start - 1] != '.') return false;
+    size_t end = start - 1; /* at the dot */
+    size_t from = end;
+    for (;;) {
+        while (from > 0) {
+            char c = text[from - 1];
+            if (isalnum((unsigned char)c) || c == '_' || c == '.' ||
+                c == '<' || c == '>' || c == '?') from--;
+            else break;
+        }
+        if (from > 0 && (text[from - 1] == '"' || text[from - 1] == '\'')) {
+            /* string/char literal in the chain: consume back to the opening
+             * quote and keep collecting (`"abc".ToUpper` -> `"abc".ToUpper`) */
+            char q = text[from - 1];
+            from--;
+            while (from > 0 && text[from - 1] != q) from--;
+            if (from > 0) from--;
+            continue;
+        }
+        break;
+    }
+    size_t len = end - from;
+    if (len == 0 || len >= cap) return false;
+    memcpy(out, text + from, len);
+    out[len] = '\0';
+    return true;
+}
+
 static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
     const char *uri; int line, character;
     if (!get_position(params, &uri, &line, &character)) {
@@ -1565,6 +1641,29 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
     intellisense_t *is = doc_intel_for(s, uri);
     if (!is) { send_response(s, id, json_new_null()); return; }
     hover_info_t h = intel_hover_at(is, word, line);
+
+    /* `receiver.word`: resolve the receiver's type first. The name-only
+     * fallback below would describe whichever indexed class with a member
+     * of the same name was indexed last (NumPad.SetText instead of
+     * StatusBar.SetText). */
+    if (!h.valid) {
+        char chain[256];
+        if (receiver_chain_before(doc->text, off, chain, sizeof(chain))) {
+            char fm[64];
+            const char *rt = intel_resolve_chain_pos(is, g_project_intel, chain,
+                                                     fm, sizeof(fm), line, character);
+            if (!rt || !rt[0]) {
+                /* retry with the engines swapped: designer-projected fields
+                 * exist only in the project index, so the root may resolve
+                 * there while the enclosing class comes from the document */
+                rt = intel_resolve_chain_pos(g_project_intel, is, chain,
+                                             fm, sizeof(fm), line, character);
+            }
+            if (rt && rt[0] && g_project_intel)
+                h = intel_hover_member(g_project_intel, rt, word);
+        }
+    }
+
     /* cross-file symbols (e.g. a design-doc-projected widget field referenced
      * from the business file) live in the project index */
     if (!h.valid && g_project_intel)
@@ -1614,7 +1713,8 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
         dl = g.line;
         dc = 0;
     } else {
-        offset_to_linecol(doc->text, g.col, &dl, &dc);
+        dl = g.line;
+        dc = g.col;
     }
 
     json_value *loc = json_new_obj();
