@@ -5,12 +5,15 @@ using System.Json;
 namespace Coreforge;
 
 class ForgeSave {
-    // v4：新增无尽坚守（endless）——第 20 波胜利后继续，波次转公式生成。
+    // v5：开局难度（difficulty）、支援三塔（kind 20..22）、建筑盾值（shield）、
+    // 科技扩到 15 项。
+    // v4：无尽坚守（endless）——第 20 波胜利后继续，波次转公式生成。
     // v3：铁蜂机巢/棱镜塔（kind 18..19）、无人机（units）、敌巢（nests）、
-    // 铁蜂模式（droneMode）、科技扩到 12 项、NestDestroyed 事件（kind 8）。
-    // 读取仍接受 v1/v2/v3 档：researched 长度按版本区分，v3 以下无 endless
-    // 且波次锁在目录内，旧档无无人机、敌巢按 seed 全量重建、blast 视为 0。
-    static int Version() { return 4; }
+    // 铁蜂模式（droneMode）、NestDestroyed 事件（kind 8）。
+    // 读取仍接受 v1-v4 档：researched 长度按版本区分，v4 以下无 difficulty
+    //（按标准难度 1 处理）、无盾值（按 0 处理），旧档无无人机、敌巢按 seed
+    // 全量重建、blast 视为 0。
+    static int Version() { return 5; }
     static int MaxBytes() { return 4194304; }
 
     static void Require(bool valid) {
@@ -74,15 +77,18 @@ class ForgeSave {
         // Round-robin cursors and the recipe-change guard are continuation state.
         value.PutInt("mergeCursor", b.mergeCursor); value.PutInt("feedCursor", b.feedCursor);
         value.PutInt("lastRecipe", b.lastRecipe);
+        // v5 起保存力场护盾的屏障值；旧档按 0 读取。
+        value.PutInt("shield", b.shield);
         value.Put("stock", ForgeSave.Ints(b.stock.amount));
         value.Put("cargo", ForgeSave.Ints(b.cargo)); value.Put("travel", ForgeSave.Ints(b.travel));
         value.Put("received", ForgeSave.Ints(b.received));
         return value;
     }
     static void ReadBuilding(JsonValue value, ForgeBuilding b, ForgeWorld world, int version) {
-        ForgeSave.Object(value, 21);
-        // v3 才引入机巢(18)/棱镜(19)；旧档出现即视为损坏。
-        b.kind = (BlockKind)ForgeSave.Int(value, "kind", 0, version >= 3 ? 19 : 17);
+        // v5 加 shield 键（22）；v3/v4 为 21；v1/v2 为 21（同键集，无盾）。
+        ForgeSave.Object(value, version >= 5 ? 22 : 21);
+        // v3 才引入机巢(18)/棱镜(19)，v5 引入支援三塔(20..22)；旧档出现即视为损坏。
+        b.kind = (BlockKind)ForgeSave.Int(value, "kind", 0, version >= 5 ? 22 : version >= 3 ? 19 : 17);
         b.direction = ForgeSave.Int(value, "direction", 0, 3);
         b.hp = ForgeSave.Int(value, "hp", -1000000, 3600);
         b.progress = ForgeSave.Int(value, "progress", 0, 300000);
@@ -99,6 +105,7 @@ class ForgeSave {
         b.mergeCursor = ForgeSave.Int(value, "mergeCursor", 0, 3);
         b.feedCursor = ForgeSave.Int(value, "feedCursor", 0, 5);
         b.lastRecipe = ForgeSave.Int(value, "lastRecipe", 0, 3);
+        b.shield = version >= 5 ? ForgeSave.Int(value, "shield", 0, 900) : 0;
         ForgeSave.ReadInts(ForgeSave.Member(value, "stock"), b.stock.amount, 0, 24);
         ForgeSave.Require(b.stock.Total() <= 24);
         ForgeSave.ReadInts(ForgeSave.Member(value, "cargo"), b.cargo, 0, 6);
@@ -125,13 +132,14 @@ class ForgeSave {
         root.PutBool("bossPending", world.bossPending); root.PutBool("waveActive", world.waveActive);
         root.PutBool("defeated", world.defeated); root.PutBool("victory", world.victory);
         root.PutBool("endless", world.endless);
+        root.PutInt("difficulty", world.difficulty);
         root.PutInt("enemyCount", world.enemyCount); root.PutInt("kills", world.kills);
         root.PutInt("produced", world.produced); root.PutInt("powerSupply", world.powerSupply);
         root.PutInt("powerDemand", world.powerDemand); root.PutInt("batteryStored", world.batteryStored);
         root.PutBool("topologyDirty", world.topologyDirty); root.PutBool("pathsDirty", world.pathsDirty);
         root.Put("resources", ForgeSave.Ints(world.resources.amount));
         JsonValue tech = JsonValue.NewArray();
-        for (int i = 0; i < 12; i = i + 1) { tech.AppendBool(world.researched[i]); }
+        for (int i = 0; i < 15; i = i + 1) { tech.AppendBool(world.researched[i]); }
         root.Put("researched", tech);
         JsonValue tiles = JsonValue.NewArray();
         JsonValue buildings = JsonValue.NewArray();
@@ -195,13 +203,15 @@ class ForgeSave {
         return root;
     }
     static ForgeWorld Decode(JsonValue root) {
-        // v4 固定 36 键；v3 固定 35 键；v1/v2 旧档没有 units/nests/droneMode（32 键）。
+        // v5 固定 37 键；v4 固定 36 键；v3 固定 35 键；v1/v2 旧档没有 units/nests/droneMode（32 键）。
         bool hasUnits = root.Get("units") != null;
         bool hasEndless = root.Get("endless") != null;
-        ForgeSave.Object(root, hasEndless ? 36 : hasUnits ? 35 : 32);
+        bool hasDifficulty = root.Get("difficulty") != null;
+        ForgeSave.Object(root, hasDifficulty ? 37 : hasEndless ? 36 : hasUnits ? 35 : 32);
         int version = ForgeSave.Int(root, "version", 1, ForgeSave.Version());
         ForgeSave.Require(hasUnits == (version >= 3));
         ForgeSave.Require(hasEndless == (version >= 4));
+        ForgeSave.Require(hasDifficulty == (version >= 5));
         ForgeSave.Require(ForgeSave.Int(root, "width", 48, 48) == 48);
         ForgeSave.Require(ForgeSave.Int(root, "height", 36, 36) == 36);
         int seed = ForgeSave.Int(root, "seed", -2147483648, 2147483647);
@@ -221,6 +231,8 @@ class ForgeSave {
         world.defeated = ForgeSave.Bool(root, "defeated"); world.victory = ForgeSave.Bool(root, "victory");
         world.endless = hasEndless && ForgeSave.Boolean(root.Get("endless"));
         if (world.wave > 20) { ForgeSave.Require(world.endless); }
+        // 难度随档走；v4 及以下的旧档一律按标准难度处理。
+        world.difficulty = hasDifficulty ? ForgeSave.Int(root, "difficulty", 0, 2) : 1;
         world.enemyCount = ForgeSave.Int(root, "enemyCount", 0, 192);
         world.kills = ForgeSave.Int(root, "kills", 0, 1000000000);
         world.produced = ForgeSave.Int(root, "produced", 0, 1000000000);
@@ -230,11 +242,11 @@ class ForgeSave {
         world.topologyDirty = ForgeSave.Bool(root, "topologyDirty"); world.pathsDirty = ForgeSave.Bool(root, "pathsDirty");
         ForgeSave.ReadInts(ForgeSave.Member(root, "resources"), world.resources.amount, 0, 100000000);
         JsonValue tech = ForgeSave.Member(root, "researched");
-        int techCount = version == 1 ? 6 : version == 2 ? 10 : 12;
+        int techCount = version == 1 ? 6 : version == 2 ? 10 : version <= 4 ? 12 : 15;
         ForgeSave.Array(tech, techCount);
-        for (int i = 0; i < 12; i = i + 1) { world.researched[i] = i < techCount && ForgeSave.Boolean(tech.At(i)); }
+        for (int i = 0; i < 15; i = i + 1) { world.researched[i] = i < techCount && ForgeSave.Boolean(tech.At(i)); }
         ForgeSave.Require(world.researched[0]);
-        for (int i = 1; i < 12; i = i + 1) {
+        for (int i = 1; i < 15; i = i + 1) {
             if (world.researched[i]) { ForgeSave.Require(world.researched[world.catalog.techs[i].parent]); }
         }
         ForgeSave.Require(world.coreMaxHp == (world.researched[5] ? 3600 : 2400));

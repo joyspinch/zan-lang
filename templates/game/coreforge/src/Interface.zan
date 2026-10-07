@@ -20,6 +20,7 @@ partial class CoreforgeHud {
     /// 生成器装载钩子：动态面板初始全部隐藏，RefreshHud 按状态显隐。
     static void OnLoad(Form form) {
         EndVeil.visible = false;
+        BriefVeil.visible = false;
         Banner.visible = false;
         Tech.visible = false;
         Detail.visible = false;
@@ -79,6 +80,11 @@ class ForgeInterface {
     int[] bpKind;
     int[] bpDir;
     bool rightPanned;
+    // 开局简报幕：新远征/再度远征后先选难度再出发。首启不弹（冒烟与自动测试确定性）。
+    bool briefing;
+    int pendingDifficulty;
+    // 下一波兵种构成缓存（Preview 填充，画布预告条读取）。
+    int[] preview;
 
     ForgeInterface(App host, string path) {
         app = host; savePath = path; title = "炉心边境 · COREFORGE";
@@ -87,6 +93,7 @@ class ForgeInterface {
         inspectCell = sim.world.coreCell; hoverCell = -1; lastCell = -1; downCell = -1;
         keys = new bool[256];
         bpDX = new int[256]; bpDY = new int[256]; bpKind = new int[256]; bpDir = new int[256];
+        preview = new int[5];
         status = "从铜矿到炮塔：沿箭头连接输送线，守住炉心。";
         mouseX = -1; mouseY = -1;
     }
@@ -130,9 +137,16 @@ class ForgeInterface {
         form.On("hudTech9", () => Research(9));
         form.On("hudTech10", () => Research(10));
         form.On("hudTech11", () => Research(11));
+        form.On("hudTech12", () => Research(12));
+        form.On("hudTech13", () => Research(13));
+        form.On("hudTech14", () => Research(14));
         form.On("hudDrones", () => CycleDrones());
         form.On("hudBlueprint", () => ToggleBlueprint());
         form.On("hudEndless", () => ContinueEndless());
+        form.On("hudDiff0", () => { pendingDifficulty = 0; });
+        form.On("hudDiff1", () => { pendingDifficulty = 1; });
+        form.On("hudDiff2", () => { pendingDifficulty = 2; });
+        form.On("hudDepart", () => DepartBriefing());
         // 蓝图数组是引用：让渲染器直接读同一份存储，避免每帧拷贝。
         renderer.bpDX = bpDX; renderer.bpDY = bpDY; renderer.bpKind = bpKind; renderer.bpDir = bpDir;
         form.On("hudB2", () => SelectBlock(2));
@@ -153,6 +167,9 @@ class ForgeInterface {
         form.On("hudB17", () => SelectBlock(17));
         form.On("hudB18", () => SelectBlock(18));
         form.On("hudB19", () => SelectBlock(19));
+        form.On("hudB20", () => SelectBlock(20));
+        form.On("hudB21", () => SelectBlock(21));
+        form.On("hudB22", () => SelectBlock(22));
     }
 
     /// 铁蜂全军模式切换：守卫（拦截来犯）↔ 进攻（拔除敌巢出兵口）。
@@ -258,20 +275,41 @@ class ForgeInterface {
         newRunArmed = false;
     }
 
-    /// 结算幕里的"再度远征"：已终局，无需两次点击确认。
+    /// 结算幕里的"再度远征"：跳过二次确认，直接进入开局简报选难度。
     void RestartRun() {
         newRunArmed = false;
-        sim = new ForgeSimulation(sim.world.seed + 37);
+        ArmBriefing(sim.world.seed + 37);
+    }
+
+    /// 重置一局并在简报幕上待命：世界已就绪但暂停，出发按钮落难度开战。
+    void ArmBriefing(int seed) {
+        sim = new ForgeSimulation(seed);
         camera.Focus(sim.world);
         inspectCell = sim.world.coreCell;
         selected = BlockKind.Empty;
         erase = false;
-        paused = false;
+        paused = true;
+        briefing = true;
+        pendingDifficulty = 1;
         lastEvent = 0;
         leftDown = false;
         rightDown = false;
         bpState = 0; bpDrag = false; bpCount = 0;
-        Message("新的荒原已就绪。先规划运输，再扩张防线。");
+    }
+
+    /// 简报幕"出发"：难度生效，撤幕开战。
+    void DepartBriefing() {
+        briefing = false;
+        sim.world.difficulty = pendingDifficulty;
+        paused = false;
+        lastEvent = sim.world.events.sequence;
+        Message(difficultyLabel(pendingDifficulty) + "远征出发：先接通铜矿运输线，炉心交给你了。");
+    }
+
+    string difficultyLabel(int d) {
+        if (d <= 0) { return "平静 · "; }
+        if (d >= 2) { return "严酷 · "; }
+        return "标准 · ";
     }
 
     // ================= 帧渲染 =================
@@ -290,6 +328,7 @@ class ForgeInterface {
         renderer.Draw(c, sim.world, camera, hoverCell, selected, direction, erase, inspectCell, powerOverlay);
         ThreatArrows(c);
         Minimap(c);
+        WavePreview(c);
         RefreshHud();
     }
 
@@ -309,7 +348,8 @@ class ForgeInterface {
         miniW = w.width * tile;
         miniH = w.height * tile;
         miniX = clientW - miniW - S(12);
-        miniY = clientH - S(28) - miniH - S(12);
+        // 底部 HUD 共 102 设计像素（建造栏 74 + 状态栏 28），小地图必须收在其上。
+        miniY = clientH - S(102) - miniH - S(12);
         c.FillRect(miniX - S(3), miniY - S(3), miniW + S(6), miniH + S(6), 0xB4140F0A);
         c.DrawRect(miniX - S(3), miniY - S(3), miniW + S(6), miniH + S(6), 0xFF4D3D24, 1);
         for (int cell = 0; cell < w.width * w.height; cell = cell + 1) {
@@ -373,7 +413,7 @@ class ForgeInterface {
             int cy = camera.ScreenY((cell / w.width) * 1000 + 500);
             // 出生口在视口内就不必预警；在视口外则把箭头钳到视口边缘。
             int mx = ForgeGrid.Clamp(cx, chromeTop + S(26), clientW - S(26));
-            int my = ForgeGrid.Clamp(cy, chromeTop + S(56), clientH - S(46));
+            int my = ForgeGrid.Clamp(cy, chromeTop + S(56), clientH - S(112));
             if (cx == mx && cy == my) { continue; }
             int a = S(11);
             if (cx < mx) {          // 西通道：箭头朝左
@@ -390,6 +430,58 @@ class ForgeInterface {
                 c.DrawLine(mx, my, mx + a, my - a, color, S(3));
             }
         }
+    }
+
+    // ---- 波次预告条：准备期挂在 HUD 两行之下（顶栏46+工具栏34）， ----
+    // 兵种构成 + 数量 + 倒计时；不能画在 chromeTop+8 以内，会被控件树盖住。
+    // 与出兵共用 ForgeCombat.Preview 公式，预告即真相；难度标签随档显示。
+    void WavePreview(Canvas c) {
+        ForgeWorld w = sim.world;
+        if (briefing || w.defeated || w.victory || w.waveActive) { return; }
+        int nests = 0;
+        for (int i = 0; i < w.nests.Length; i = i + 1) { if (w.nests[i].active) { nests = nests + 1; } }
+        if (nests == 0) { return; }   // 出兵口已全拔除：无波可预告
+        int next = w.wave + 1;
+        ForgeCombat.Preview(w, next, preview);
+        bool boss = ForgeCombat.WaveBoss(w, next) >= 0;
+        int used = 0;
+        for (int k = 0; k < 5; k = k + 1) { if (preview[k] > 0) { used = used + 1; } }
+        int pad = S(14);
+        int chip = S(52);
+        int headW = S(96) + (w.difficulty == 1 ? 0 : S(52));
+        int countdownW = S(48);
+        int width = pad + headW + used * chip + (boss ? S(56) : 0) + countdownW + pad;
+        int height = S(38);
+        int x = clientW / 2 - width / 2;
+        int y = chromeTop + S(92);
+        c.FillRect(x, y, width, height, 0xE01A130A);
+        c.DrawRect(x, y, width, height, 0xFF4D3D24, 1);
+        int cy = y + height / 2 + S(5);
+        string tag = w.difficulty == 0 ? " · 平静" : w.difficulty == 2 ? " · 严酷" : "";
+        c.DrawText(x + pad, cy, "第 " + N(next) + " 波来袭" + tag, 0xFFF2A558, S(14));
+        int cx = x + pad + headW;
+        int midY = y + height / 2;
+        for (int k = 0; k < 5; k = k + 1) {
+            if (preview[k] <= 0) { continue; }
+            c.FillCircle(cx + S(5), midY, S(4), KindColor(k));
+            c.DrawCircle(cx + S(5), midY, S(4), 0xFF14100B, 1);
+            c.DrawText(cx + S(13), cy, "×" + N(preview[k]), 0xFFF3EAD9, S(13));
+            cx = cx + chip;
+        }
+        if (boss) {
+            c.DrawText(cx, cy, "⚠ 首领压阵", 0xFFFF9D6C, S(13));
+            cx = cx + S(56);
+        }
+        string countdown = N((w.nextWaveTicks + 49) / 50) + "s";
+        c.DrawText(x + width - pad - Canvas.MeasureText(countdown, S(14)), cy, countdown, 0xFFCDBB97, S(14));
+    }
+
+    int KindColor(int kind) {
+        if (kind == 0) { return 0xFFC9A06A; }
+        if (kind == 1) { return 0xFF9F8AC9; }
+        if (kind == 2) { return 0xFFE86A8A; }
+        if (kind == 3) { return 0xFF8FC9E8; }
+        return 0xFFE89A5A;
     }
 
     // ---- 建造栏图标的强调色（与世界美术同族，小地图/预警共用） ----
@@ -422,6 +514,9 @@ class ForgeInterface {
         if (id == 17) { return 0xFFB0894A; }  // 臼炮：臼身土金
         if (id == 18) { return 0xFF7FBF9E; }  // 铁蜂机巢：坪面青绿
         if (id == 19) { return 0xFFB9A8E8; }  // 棱镜塔：水晶紫
+        if (id == 20) { return 0xFF8FD9A8; }  // 修复投影：医疗绿
+        if (id == 21) { return 0xFFF2C06A; }  // 过护投影：过载琥珀
+        if (id == 22) { return 0xFF7ECAEC; }  // 力场护盾：力场青
         return 0xFF93825F;
     }
 
@@ -473,11 +568,11 @@ class ForgeInterface {
         CoreforgeHud.btnDemolish.SetClassIn("cf-mini-on", erase ? "cf-mini-on" : "");
         CoreforgeHud.btnNew.Text = newRunArmed ? "确认重启？" : "新远征";
         // 建造栏：只显示已解锁的方块，选中态换底色。
-        Button[] palette = new Button[18] { CoreforgeHud.pb2, CoreforgeHud.pb3, CoreforgeHud.pb4, CoreforgeHud.pb5, CoreforgeHud.pb6,
+        Button[] palette = new Button[21] { CoreforgeHud.pb2, CoreforgeHud.pb3, CoreforgeHud.pb4, CoreforgeHud.pb5, CoreforgeHud.pb6,
           CoreforgeHud.pb7, CoreforgeHud.pb8, CoreforgeHud.pb9, CoreforgeHud.pb10, CoreforgeHud.pb11,
           CoreforgeHud.pb12, CoreforgeHud.pb13, CoreforgeHud.pb14, CoreforgeHud.pb15, CoreforgeHud.pb16, CoreforgeHud.pb17,
-          CoreforgeHud.pb18, CoreforgeHud.pb19 };
-        for (int k = 2; k < 20; k = k + 1) {
+          CoreforgeHud.pb18, CoreforgeHud.pb19, CoreforgeHud.pb20, CoreforgeHud.pb21, CoreforgeHud.pb22 };
+        for (int k = 2; k < 23; k = k + 1) {
             Button pb = palette[k - 2];
             bool unlocked = sim.world.Unlocked((BlockKind)k);
             pb.visible = unlocked;
@@ -516,9 +611,10 @@ class ForgeInterface {
         CoreforgeHud.Objectives.visible = !allDone && !showTech && !w.defeated && !w.victory;
         // 科技面板。
         CoreforgeHud.Tech.visible = showTech && !w.defeated && !w.victory;
-        Button[] techRow = new Button[11] { CoreforgeHud.tech1, CoreforgeHud.tech2, CoreforgeHud.tech3, CoreforgeHud.tech4, CoreforgeHud.tech5,
-          CoreforgeHud.tech6, CoreforgeHud.tech7, CoreforgeHud.tech8, CoreforgeHud.tech9, CoreforgeHud.tech10, CoreforgeHud.tech11 };
-        for (int i = 1; i <= 11; i = i + 1) {
+        Button[] techRow = new Button[14] { CoreforgeHud.tech1, CoreforgeHud.tech2, CoreforgeHud.tech3, CoreforgeHud.tech4, CoreforgeHud.tech5,
+          CoreforgeHud.tech6, CoreforgeHud.tech7, CoreforgeHud.tech8, CoreforgeHud.tech9, CoreforgeHud.tech10, CoreforgeHud.tech11,
+          CoreforgeHud.tech12, CoreforgeHud.tech13, CoreforgeHud.tech14 };
+        for (int i = 1; i <= 14; i = i + 1) {
             TechDef t = w.catalog.techs[i];
             bool finished = w.researched[i];
             bool ready = !finished && w.researched[t.parent] && w.resources.Has(t.cost);
@@ -549,6 +645,16 @@ class ForgeInterface {
             CoreforgeHud.endStats.Text = "坚守 " + N(ForgeGrid.Max(0, w.wave - 1)) + " 波 · 击杀 " + N(w.kills)
               + " · 生产 " + N(w.produced) + " · 历时 " + N(minutes) + " 分 " + N(seconds) + " 秒";
             CoreforgeHud.btnEndless.visible = w.victory;
+        }
+        // 开局简报幕：新远征/再度远征后选难度；出发前世界已就绪并暂停。
+        CoreforgeHud.BriefVeil.visible = briefing;
+        if (briefing) {
+            CoreforgeHud.diff0.SetClassIn("cf-diff-on", pendingDifficulty == 0 ? "cf-diff-on" : "");
+            CoreforgeHud.diff1.SetClassIn("cf-diff-on", pendingDifficulty == 1 ? "cf-diff-on" : "");
+            CoreforgeHud.diff2.SetClassIn("cf-diff-on", pendingDifficulty == 2 ? "cf-diff-on" : "");
+            CoreforgeHud.briefHint.Text = pendingDifficulty == 0 ? "敌军数量 85% · 强度 80% —— 熟悉生产线的好时机"
+              : pendingDifficulty == 2 ? "敌军数量 120% · 强度 130% —— 老兵的试炼场"
+              : "敌军数量与强度均为基准值";
         }
     }
 
@@ -583,6 +689,11 @@ class ForgeInterface {
                 string stockLine = Cost(b.stock);
                 string details = "HP " + N(b.hp) + " · 效率 " + N(b.efficiency / 10) + "%"
                   + "\n水 " + N(b.water) + " / 油 " + N(b.oil);
+                if (b.kind == BlockKind.Shield) {
+                    details = "力场 " + N(ForgeGrid.Max(0, b.shield)) + " / " + N(w.catalog.blocks[(int)BlockKind.Shield].hp * 3)
+                      + " · 效率 " + N(b.efficiency / 10) + "%"
+                      + "\n" + (b.efficiency > 0 ? "供电正常，力场缓慢重张。" : "断电中：力场不再恢复。");
+                }
                 if (stockLine != "") { details = details + "\n库存 " + stockLine; }
                 if (b.kind == BlockKind.Furnace || b.kind == BlockKind.Assembler) {
                     RecipeDef recipe = w.catalog.recipes[b.recipe];
@@ -661,6 +772,7 @@ class ForgeInterface {
         if (InRect(x, y, CoreforgeHud.Palette.bx, CoreforgeHud.Palette.by, CoreforgeHud.Palette.bw, CoreforgeHud.Palette.bh)) { return true; }
         if (InRect(x, y, CoreforgeHud.Statusbar.bx, CoreforgeHud.Statusbar.by, CoreforgeHud.Statusbar.bw, CoreforgeHud.Statusbar.bh)) { return true; }
         if (CoreforgeHud.EndVeil.visible) { return true; }
+        if (CoreforgeHud.BriefVeil.visible) { return true; }
         if (InRect(x, y, miniX, miniY, miniW, miniH)) { return true; }
         return false;
     }
@@ -714,7 +826,7 @@ class ForgeInterface {
     }
 
     void Research(int id) {
-        if (id < 1 || id > 11) { return; }
+        if (id < 1 || id > 14) { return; }
         if (sim.world.Research(id)) { Message("研究完成：" + sim.world.catalog.techs[id].name); }
         else { Message("研究条件未满足，请检查前置科技与核心库存。"); }
     }
@@ -774,6 +886,7 @@ class ForgeInterface {
         rightDown = false;
         lastCell = -1;
         bpState = 0; bpDrag = false; bpCount = 0;
+        briefing = false;
         paused = true;
         lastEvent = loaded.events.sequence;
         Message("存档已恢复，当前暂停；按空格继续。");
@@ -788,17 +901,7 @@ class ForgeInterface {
             return;
         }
         newRunArmed = false;
-        sim = new ForgeSimulation(sim.world.seed + 37);
-        camera.Focus(sim.world);
-        inspectCell = sim.world.coreCell;
-        selected = BlockKind.Empty;
-        erase = false;
-        paused = false;
-        lastEvent = 0;
-        leftDown = false;
-        rightDown = false;
-        bpState = 0; bpDrag = false; bpCount = 0;
-        Message("新的荒原已就绪。先规划运输，再扩张防线。");
+        ArmBriefing(sim.world.seed + 37);
     }
 
     // ================= 世界输入 =================

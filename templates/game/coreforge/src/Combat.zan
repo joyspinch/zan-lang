@@ -184,10 +184,25 @@ class ForgeCombat {
     }
 
     // ---- 波表：20 波内读目录，之后转公式无尽生成 ----
+    // 难度只作用于数量与强度两个乘区；出兵、存档校验与 UI 预告共用同一公式。
+
+    public static int CountScale(int difficulty) {
+        if (difficulty <= 0) { return 85; }
+        if (difficulty >= 2) { return 120; }
+        return 100;
+    }
+
+    public static int StrengthScale(int difficulty) {
+        if (difficulty <= 0) { return 80; }
+        if (difficulty >= 2) { return 130; }
+        return 100;
+    }
 
     public static int WaveCount(ForgeWorld world, int wave) {
-        if (wave <= world.catalog.waves.Length) { return world.catalog.waves[wave - 1].count; }
-        return 44 + (wave - world.catalog.waves.Length) * 3;
+        int count = wave <= world.catalog.waves.Length
+            ? world.catalog.waves[wave - 1].count
+            : 44 + (wave - world.catalog.waves.Length) * 3;
+        return ForgeGrid.Max(1, count * CountScale(world.difficulty) / 100);
     }
 
     public static int WaveInterval(ForgeWorld world, int wave) {
@@ -197,14 +212,34 @@ class ForgeCombat {
 
     public static int WaveStrength(ForgeWorld world, int wave) {
         if (wave <= 0) { return 100; }
-        if (wave <= world.catalog.waves.Length) { return ForgeGrid.Max(1, world.catalog.waves[wave - 1].strength); }
-        // 每波 +12%：无尽模式下敌人的血量与攻击无限爬升。
-        return 100 + wave * 12;
+        int strength = wave <= world.catalog.waves.Length
+            ? world.catalog.waves[wave - 1].strength
+            // 每波 +12%：无尽模式下敌人的血量与攻击无限爬升。
+            : 100 + wave * 12;
+        return ForgeGrid.Max(1, strength * StrengthScale(world.difficulty) / 100);
     }
 
     public static int WaveBoss(ForgeWorld world, int wave) {
         if (wave <= world.catalog.waves.Length) { return world.catalog.waves[wave - 1].boss; }
         return wave % 5 == 0 ? 2 : -1;
+    }
+
+    /// 下一波构成预告：按 Spawn 的混编公式离线推算各兵种数量。
+    /// counts 长度必须为 5（敌方兵种数）；与出兵共用同一公式，预告即真相。
+    public static void Preview(ForgeWorld world, int wave, int[] counts) {
+        for (int i = 0; i < counts.Length; i = i + 1) { counts[i] = 0; }
+        if (wave <= 0) { return; }
+        int total = WaveCount(world, wave);
+        for (int ordinal = 0; ordinal < total; ordinal = ordinal + 1) {
+            int roll = (ordinal * 7 + wave * 3) % 10;
+            int kind = 0;
+            if (wave >= 7 && roll >= 8) { kind = 3; }
+            else if (wave >= 5 && roll >= 6) { kind = 4; }
+            else if (wave >= 3 && (roll >= 4 || (wave >= 12 && ordinal % 2 == 1))) { kind = 1; }
+            counts[kind] = counts[kind] + 1;
+        }
+        int boss = WaveBoss(world, wave);
+        if (boss >= 0) { counts[boss] = counts[boss] + 1; }
     }
 
     void StartWave() {
@@ -293,7 +328,10 @@ class ForgeCombat {
         ForgeBuilding b = world.buildings[cell];
         if (!Solid(b.kind)) { return; }
         EnemyDef def = world.catalog.enemies[e.kind];
-        b.hp = b.hp - ForgeGrid.Max(1, def.damage * Strength() / 100);
+        int damage = ForgeGrid.Max(1, def.damage * Strength() / 100);
+        // 力场优先：目标处在盾圈内时火力先砸在屏障上，余量才落到墙体。
+        damage = Absorb(cell, damage);
+        if (damage > 0) { b.hp = b.hp - damage; }
         e.cooldown = ForgeGrid.Max(1, def.cooldown);
         // 受击尘土与震屏：炉心受击最重，玩家必须立刻感知。
         world.SpawnEffect(1, e.x, e.y, 0, 0, 10, 5, 0xFFC8A06A, 0);
@@ -747,6 +785,88 @@ class ForgeCombat {
         } else { world.nextWaveTicks = ForgeCombat.BetweenWaveTicks(); }
     }
 
+    // ---- 支援三塔：修复投影 / 过护投影 / 力场护盾 ----
+    // 覆盖判定统一用欧氏距离（圆形罩），与渲染的范围圈、护盾泡一致。
+
+    bool Powered(ForgeBuilding tower) { return tower.efficiency > 0; }
+
+    bool Covers(ForgeBuilding tower, int towerCell, int cell, int radius) {
+        int dx = cell % world.width - towerCell % world.width;
+        int dy = cell / world.width - towerCell / world.width;
+        return dx * dx + dy * dy <= radius * radius;
+    }
+
+    int ShieldMax(ForgeBuilding tower) { return world.catalog.blocks[(int)BlockKind.Shield].hp * 3; }
+
+    /// 把伤害先记在覆盖目标的存活盾上；返回穿透后仍要落在建筑上的余量。
+    int Absorb(int cell, int damage) {
+        int remaining = damage;
+        for (int i = 0; i < world.buildings.Length; i = i + 1) {
+            ForgeBuilding tower = world.buildings[i];
+            if (tower.kind != BlockKind.Shield || tower.shield <= 0 || !Powered(tower)) { continue; }
+            if (!Covers(tower, i, cell, world.catalog.blocks[(int)BlockKind.Shield].powerRadius)) { continue; }
+            int soaked = ForgeGrid.Min(remaining, tower.shield);
+            tower.shield = tower.shield - soaked;
+            remaining = remaining - soaked;
+            world.SpawnEffect(1, ForgeGrid.Center(cell % world.width), ForgeGrid.Center(cell / world.width),
+                0, -30, 12, 6, 0xFF7ECAEC, 0);
+            if (remaining <= 0) { break; }
+        }
+        return remaining;
+    }
+
+    void StepSupport() {
+        bool healed = false;
+        for (int i = 0; i < world.buildings.Length; i = i + 1) {
+            ForgeBuilding tower = world.buildings[i];
+            if (tower.kind != BlockKind.Repair && tower.kind != BlockKind.Overdrive && tower.kind != BlockKind.Shield) { continue; }
+            if (tower.hp <= 0 || !Powered(tower)) { continue; }
+            int radius = world.catalog.blocks[(int)tower.kind].powerRadius;
+            if (tower.kind == BlockKind.Overdrive) {
+                // 增益写缓存：工厂读 (boostTick, boostPow)；重叠取最大，断供 3 tick 后失效。
+                int pow = 1000 + 650 * tower.efficiency / 1000;
+                int ox = i % world.width; int oy = i / world.width;
+                for (int dy = -radius; dy <= radius; dy = dy + 1) {
+                    int y = oy + dy;
+                    if (y < 0 || y >= world.height) { continue; }
+                    for (int dx = -radius; dx <= radius; dx = dx + 1) {
+                        int x = ox + dx;
+                        if (x < 0 || x >= world.width) { continue; }
+                        if (dx * dx + dy * dy > radius * radius) { continue; }
+                        int cell = y * world.width + x;
+                        if (world.boostPow[cell] < pow) { world.boostPow[cell] = pow; }
+                        world.boostTick[cell] = world.tick;
+                    }
+                }
+            } else if (tower.kind == BlockKind.Repair) {
+                int heal = ForgeGrid.Max(1, 2 * tower.efficiency / 1000);
+                int ox = i % world.width; int oy = i / world.width;
+                for (int dy = -radius; dy <= radius; dy = dy + 1) {
+                    int y = oy + dy;
+                    if (y < 0 || y >= world.height) { continue; }
+                    for (int dx = -radius; dx <= radius; dx = dx + 1) {
+                        int x = ox + dx;
+                        if (x < 0 || x >= world.width) { continue; }
+                        if (dx * dx + dy * dy > radius * radius) { continue; }
+                        int cell = y * world.width + x;
+                        ForgeBuilding b = world.buildings[cell];
+                        if (b.kind == BlockKind.Empty || b.hp <= 0 || b.kind == BlockKind.Repair) { continue; }
+                        int maxHp = b.kind == BlockKind.Core ? world.coreMaxHp : world.catalog.blocks[(int)b.kind].hp;
+                        if (b.hp < maxHp) {
+                            b.hp = ForgeGrid.Min(maxHp, b.hp + heal);
+                            healed = true;
+                        }
+                    }
+                }
+            } else {
+                int maxShield = ShieldMax(tower);
+                if (tower.shield < maxShield) { tower.shield = ForgeGrid.Min(maxShield, tower.shield + 1); }
+            }
+        }
+        // EntryCost 计入建筑耐久：任何修复都会改路径账面，路由必须重算。
+        if (healed) { world.pathsDirty = true; }
+    }
+
     void Step() {
         if (world.defeated || world.victory) { return; }
         if (world.buildings[world.coreCell].hp <= 0) { LoseCore(); return; }
@@ -759,6 +879,7 @@ class ForgeCombat {
         FireTurrets();
         FirePrisms();
         StepUnits();
+        StepSupport();
         ClearWave();
     }
 }

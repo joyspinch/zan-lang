@@ -180,6 +180,14 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   ⑤ 异步解耦必须彻底独立于 UI/渲染帧：UI 线程专职负责事件分发与绘制，后台任务与 I/O
   完成后通过 `App.Post` + 线程级 `Wake` 唤醒 UI 消息泵排空回调，严禁后台计算依赖渲染循环推进；
   跨线程/协程结果传递与协作取消统一使用 `TaskCompletionSource<T>` 与 `CancellationToken` 原语。
+- **语言事实第十一则（2026-10-07 Coreforge 存档迁移连踩两次）**：
+  `JsonValue` 对象上 `Put(key, value)` 对**已存在的键是追加重复键**（序列化
+  产出两份同名键，读档端 `Get` 只见其一、`Count` 虚高），`Set(key, value)`
+  才是**原位替换**——改写从旧档剥出来的字段（如给 buildings 列表元素剥
+  旧字段、裁 researched 长度后写回）必须用 `Set`；数组元素没有原位写，要
+  重建数组再 `Set` 整个键。踩坑实锤：探针证明 `Put` 后对象含两个同名
+  `"list"` 键（Count 4→Set 后 3），存档迁移测试两次因 `Put` 写回被
+  Require 拒收。
 
 - **文本格式包的 BOM 防线（2026-10-01 Yaml/Toml/Xml 跨平台审计踩出）**：
   `File.ReadAllText` 已在文件层剥 UTF-8 BOM，但 `Parse(src)` 收网络报文/
