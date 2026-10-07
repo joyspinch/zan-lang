@@ -72,7 +72,6 @@ class XqPopup {
 }
 
 class XqGame {
-    GuiHost host;
     Canvas c;
     XqProfile prof;
     Rng rng;
@@ -80,7 +79,6 @@ class XqGame {
     // board[y*9+x]; 0 empty. red: 1帅 2仕 3相 4马 5车 6炮 7兵
     // black: 8将 9士 10象 11马 12车 13炮 14卒. Red at bottom (y7..9 palace).
     int[] board;
-    int scene;      // 0 menu, 1 play, 2 over
     int mode;       // 0 full game, 1..10 endgame drills
     bool redTurn;
     int selSq;      // selected square or -1
@@ -107,7 +105,6 @@ class XqGame {
     string boardArt;
     string pieceRed;
     string pieceBlack;
-    string panel;
     bool texTried;
     bool demo;
     int demoAt;
@@ -142,11 +139,8 @@ class XqGame {
 
     static XqGame Create(GuiHost h) {
         XqGame g = new XqGame();
-        g.host = h;
-        g.c = h.App().canvas;
         g.prof = XqProfile.Load();
         g.rng = Rng.Seed((long)Window.GetTickMs() + 8642097);
-        g.scene = 0;
         g.mouseX = 640;
         g.mouseY = 360;
         g.parts = new List<XqParticle>();
@@ -155,7 +149,6 @@ class XqGame {
         g.selSq = -1;
         g.demo = File.Exists("xiangqi_demo.txt");
         if (g.demo) { g.maxMoves = 6; }   // demo ends after this many red moves
-        if (g.demo) { g.StartGame(0, Window.GetTickMs()); }
         return g;
     }
 
@@ -171,7 +164,6 @@ class XqGame {
         this.boardArt = XqGame.FindAsset("assets/board_wood2.png");
         this.pieceRed = XqGame.FindAsset("assets/piece_red.png");
         this.pieceBlack = XqGame.FindAsset("assets/piece_black.png");
-        this.panel = XqGame.FindAsset("assets/panel.png");
     }
     static string FindAsset(string path) {
         string p = Assets.Find(path);
@@ -310,7 +302,6 @@ class XqGame {
         if (mode > 0) { this.Toast("残局·" + XqGame.DrillName(mode) + "：红先取胜", now); }
         this.redTurn = true;
         this.aiTurn = false;
-        this.scene = 1;
         this.legal = this.LegalMoves(true);
         if (this.demo) { this.demoAt = now + 500; }
     }
@@ -656,7 +647,6 @@ class XqGame {
 
     void Win(int who, int now) {
         this.winner = who;
-        this.scene = 2;
         if (who == 1) {
             int gain = 15;
             if (this.mode > 0) { gain = 20; this.prof.drills = this.prof.drills + 1; }
@@ -694,49 +684,9 @@ class XqGame {
 
     // ----- input -----------------------------------------------------------
 
-    void OnDown(int cx, int cy, int now) {
-        if (this.scene == 0) {
-            if (XqGame.Portrait()) {
-                // 竖屏菜单：单列居中（与 DrawMenu 同矩形）
-                if (CDraw.PointIn(cx, cy, XqGame.VW() / 2 - 200, 300, 400, 74)) { this.StartGame(0, now); return; }
-                int d = 1;
-                while (d <= 10) {
-                    int row = d - 1;
-                    if (CDraw.PointIn(cx, cy, XqGame.VW() / 2 - 200, 396 + row * 62, 400, 52)) {
-                        this.StartGame(d, now);
-                        return;
-                    }
-                    d = d + 1;
-                }
-                return;
-            }
-            if (CDraw.PointIn(cx, cy, 430, 268, 420, 64)) { this.StartGame(0, now); return; }
-            int d2 = 1;
-            while (d2 <= 10) {
-                int col = (d2 - 1) % 2;
-                int row = (d2 - 1) / 2;
-                if (CDraw.PointIn(cx, cy, 330 + col * 330, 356 + row * 62, 290, 52)) {
-                    this.StartGame(d2, now);
-                    return;
-                }
-                d2 = d2 + 1;
-            }
-            return;
-        }
-        if (this.scene == 2) {
-            int oby = XqGame.Portrait() ? XqGame.VH() / 2 - 170 : 190;
-            int obx = XqGame.VW() / 2 - 250;
-            if (CDraw.PointIn(cx, cy, obx + 30, oby + 240, 210, 60)) { this.StartGame(this.mode, now); return; }
-            if (CDraw.PointIn(cx, cy, obx + 260, oby + 240, 210, 60)) { this.scene = 0; return; }
-            return;
-        }
+    // 对局内落子/选子（竖屏底部 菜单/重玩 行由 XqPlayScene 处理：需要路由器）。
+    void OnDownPlay(int cx, int cy, int now) {
         if (this.aiTurn || this.winner != 0) { return; }
-        // 竖屏底部按钮行：菜单（去场景 0）与重玩（重开当前局）
-        bool menu;
-        if (this.BottomRowHit(cx, cy, out menu)) {
-            if (menu) { this.scene = 0; } else { this.StartGame(this.mode, now); }
-            return;
-        }
         int gx = (cx - XqGame.BX() + XqGame.Cell() / 2) / XqGame.Cell();
         int gy = (cy - XqGame.BY() + XqGame.Cell() / 2) / XqGame.Cell();
         if (gx < 0 || gy < 0 || gx > 8 || gy > 9) { return; }
@@ -761,16 +711,11 @@ class XqGame {
         }
     }
 
-    void OnKey(int key, int now) {
-        if (key == 27) { if (this.scene == 0) { this.host.RequestStop(); } else { this.scene = 0; } return; }
-        if (this.scene == 2 && (key == 13 || key == 32)) { this.StartGame(this.mode, now); }
-    }
-
     void Tick(int now) {
-        if (this.scene == 1 && this.aiTurn && now >= this.aiThinkAt) {
+        if (this.aiTurn && now >= this.aiThinkAt) {
             this.AiMove(now);
         }
-        if (this.demo && this.scene == 1 && !this.aiTurn && now >= this.demoAt) {
+        if (this.demo && !this.aiTurn && now >= this.demoAt) {
             this.DemoMove(now);
         }
     }
@@ -1028,7 +973,9 @@ class XqGame {
         this.DrawFx(now);
     }
 
-    void DrawMenu(int now) {
+    // 菜单画布层：美术背景 + 标题（经典/残局按钮与战绩行走 XqMenuScene 的
+    // HTML 层）。
+    void DrawMenuArt() {
         this.EnsureTex();
         CDraw.Clear(this.c, XqGame.VW(), XqGame.VH(), CDraw.Argb(255, 28, 18, 12));
         if (this.menuBg2 != null) {
@@ -1044,114 +991,110 @@ class XqGame {
         } else {
             CText.DrawCenteredShadow(this.c, "象棋", XqGame.VW() / 2, 70, 9, 245, 230, 200, 255);
         }
-        CText.DrawCenteredShadow(this.c, "楚河汉界 · 经典残局 · 段位成长", XqGame.VW() / 2, 232, 3, 255, 216, 155, 255);
-        CFx.Rule(this.c, XqGame.VW() / 2, 268, 150, 226, 186, 128, 190);
-        if (XqGame.Portrait()) {
-            // 竖屏菜单：单列居中，10 个残局竖排（命中区见 OnDown）
-            CFx.GoldButton(this.c, this.mouseX, this.mouseY, XqGame.VW() / 2 - 200, 300, 400, 74, "经典对弈", 3, 1);
-            int d = 1;
-            while (d <= 10) {
-                int row = d - 1;
-                int kind = 0;
-                if (d % 2 == 1) { kind = 1; }
-                CFx.GoldButton(this.c, this.mouseX, this.mouseY, XqGame.VW() / 2 - 200, 396 + row * 62, 400, 52,
-                    "残局 · " + XqGame.DrillName(d), 2, kind);
-                d = d + 1;
-            }
-            CText.DrawCenteredShadow(this.c, "段位 " + this.prof.Title() + " · " + this.prof.pts
-                + " 分 · 胜 " + this.prof.wins + " 负 " + this.prof.losses
-                + " · 残局通关 " + this.prof.drills, XqGame.VW() / 2, 1078, 2, 230, 210, 180, 255);
-            return;
-        }
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, 430, 268, 420, 64, "经典对弈", 3, 1);
-        int d = 1;
-        while (d <= 10) {
-            int col = (d - 1) % 2;
-            int row = (d - 1) / 2;
-            int kind = 0;
-            if (d % 2 == 1) { kind = 1; }
-            CFx.GoldButton(this.c, this.mouseX, this.mouseY, 330 + col * 330, 356 + row * 62, 290, 52,
-                "残局 · " + XqGame.DrillName(d), 2, kind);
-            d = d + 1;
-        }
-        CText.DrawCenteredShadow(this.c, "段位 " + this.prof.Title() + " · " + this.prof.pts
-            + " 分 · 胜 " + this.prof.wins + " 负 " + this.prof.losses
-            + " · 残局通关 " + this.prof.drills, XqGame.VW() / 2, XqGame.VH() - 32, 2, 230, 210, 180, 255);
-    }
-
-    void DrawOver(int now) {
-        CDraw.Clear(this.c, XqGame.VW(), XqGame.VH(), CDraw.Argb(255, 34, 22, 14));
-        this.DrawAmbient();
-        this.DrawBoard(now);
-        this.DrawSide(now);
-        CDraw.FillRect(this.c, 0, 0, XqGame.VW(), XqGame.VH(), CDraw.Argb(165, 16, 10, 6));
-        int by = XqGame.Portrait() ? XqGame.VH() / 2 - 170 : 190;
-        int bx = XqGame.VW() / 2 - 250;
-        if (this.panel != null) {
-            CFx.ShadowRect(this.c, bx, by, 500, 320, 18, 16, 0, 0, 0, 120);
-            CDraw.BlitImage(this.c, this.panel, bx, by, 500, 320);
-            CFx.Ring(this.c, bx, by, 500, 320, 18, 1, 226, 186, 128, 180);
-        } else {
-            CFx.Card(this.c, bx, by, 500, 320, 22, 58, 34, 20, 32, 19, 12, 250, 226, 186, 128, 160, 1);
-        }
-        CFx.Rule(this.c, XqGame.VW() / 2, by + 26, 150, 226, 186, 128, 190);
-        if (this.winner == 1) {
-            CText.DrawCenteredShadow(this.c, "绝杀！红方胜", XqGame.VW() / 2, by + 44, 5, 255, 218, 110, 255);
-            int gain = 15;
-            if (this.mode > 0) { gain = 20; }
-            CText.DrawCentered(this.c, "+" + gain + " 段位分 · 现 " + this.prof.Title(), XqGame.VW() / 2, by + 118, 3, 240, 225, 200, 255);
-            string cheer = "棋高一着，再战一盘！";
-            if (this.prof.streak >= 3) { cheer = this.prof.streak + " 连胜！杀伐果断"; }
-            if (this.mode > 0) { cheer = "残局功力见涨！"; }
-            CText.DrawCentered(this.c, cheer, XqGame.VW() / 2, by + 170, 2, 150, 230, 190, 255);
-        } else {
-            CText.DrawCenteredShadow(this.c, "黑方得手", XqGame.VW() / 2, by + 44, 5, 235, 160, 150, 255);
-            CText.DrawCentered(this.c, "第 " + this.moveCount + " 手告负", XqGame.VW() / 2, by + 118, 3, 220, 205, 185, 255);
-            CText.DrawCentered(this.c, "复盘关键一手，卷土重来！", XqGame.VW() / 2, by + 170, 2, 255, 214, 150, 255);
-        }
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, bx + 30, by + 240, 210, 60, "再来一局", 3, 1);
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, bx + 260, by + 240, 210, 60, "回到菜单", 3, 0);
-        this.DrawFx(now);
-    }
-
-    void Render(int now) {
-        if (this.scene == 0) { this.DrawMenu(now); }
-        else if (this.scene == 2) { this.DrawOver(now); }
-        else { this.DrawPlay(now); }
     }
 }
 
-// GuiHost 主循环回调：事件 → 固定步长模拟（16ms，追帧上限内多次）→
-// 渲染（BeginFrame/PresentFrame 由宿主包好；帧预算自限速约 60fps）。
-class XqLoop : IGuiHostLoop {
+// 主菜单：画布层只画美术背景与标题（XqMenuScene.Render → DrawMenuArt），
+// 经典对弈 + 10 个残局按钮与战绩行走 HTML 层；每次进场由
+// XqPlayScene.OnEnter 开新局。
+class XqMenuScene : HtmlScene {
     XqGame g;
 
-    public void Start(GuiHost host) {
-        this.g = XqGame.Create(host);
+    XqMenuScene(XqGame g) { this.g = g; }
+
+    override string HtmlFile() { return "assets/scenes/menu.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("classic", () => this.Pick(0));
+        handlers.Add("drill1", () => this.Pick(1));
+        handlers.Add("drill2", () => this.Pick(2));
+        handlers.Add("drill3", () => this.Pick(3));
+        handlers.Add("drill4", () => this.Pick(4));
+        handlers.Add("drill5", () => this.Pick(5));
+        handlers.Add("drill6", () => this.Pick(6));
+        handlers.Add("drill7", () => this.Pick(7));
+        handlers.Add("drill8", () => this.Pick(8));
+        handlers.Add("drill9", () => this.Pick(9));
+        handlers.Add("drill10", () => this.Pick(10));
     }
-    public void Event(GuiHost host, int kind, int code) {
-        int now = Window.GetTickMs();
-        // 指针坐标经 host.MouseX/Y 反变换回舞台逻辑坐标（桌面视口
-        // letterbox / 手机驱动反变换都在宿主之下完成）。
-        if (kind == 4) {
-            this.g.OnKey(code, now);
-        // 鼠标 kind:1=移动 2=按下 3=释放(Win32Shell 契约)。
-        } else if (kind == 1) {
-            this.g.mouseX = host.MouseX();
-            this.g.mouseY = host.MouseY();
-        } else if (kind == 2) {
-            if (code == 0) {
-                this.g.mouseX = host.MouseX();
-                this.g.mouseY = host.MouseY();
-                this.g.OnDown(this.g.mouseX, this.g.mouseY, now);
-            }
+
+    void Pick(int m) {
+        this.g.mode = m;
+        this.router.Go("play");
+    }
+
+    override void OnEnter(Control root) {
+        Element stats = XqMenuScene.AsElement(root, "stats");
+        if (stats != null) {
+            stats.SetText("段位 " + this.g.prof.Title() + " · " + this.g.prof.pts
+                + " 分 · 胜 " + this.g.prof.wins + " 负 " + this.g.prof.losses
+                + " · 残局通关 " + this.g.prof.drills);
         }
     }
-    public void FixedUpdate(GuiHost host, int dt) {
-        this.g.Tick(Window.GetTickMs());
+
+    static Element AsElement(Control root, string id) {
+        Control c = root.Find(id);
+        if (c != null && c is Element) { return (Element)c; }
+        return null;
     }
-    public void Update(GuiHost host, int dt) { }
-    public void Render(GuiHost host, Canvas c, double alpha) {
+
+    override void Event(int kind, int key) {
+        if (kind == 4 && key == 27) { this.router.Exit(); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
+        this.g.c = c;
+        this.g.SyncStage(host);
+        CDraw.Origin(0, host.ContentTop());
+        this.g.DrawMenuArt();
+    }
+}
+
+// 对局：纯 canvas 场景（HtmlFile 为空，无 HTML 层）。每次进场开新局
+// （菜单选模式 / 结算再来一局都走这里），分出胜负后路由到结算场景。
+class XqPlayScene : HtmlScene {
+    XqGame g;
+
+    XqPlayScene(XqGame g) { this.g = g; }
+
+    override void OnEnter(Control root) {
+        this.g.StartGame(this.g.mode, Window.GetTickMs());
+    }
+
+    override void Event(int kind, int key) {
+        GuiHost host = this.router.Host();
+        // 指针坐标经 host.MouseX/Y 反变换回舞台逻辑坐标（桌面视口
+        // letterbox / 手机驱动反变换都在宿主之下完成）。
+        if (kind == 1) {
+            this.g.mouseX = host.MouseX();
+            this.g.mouseY = host.MouseY();
+        } else if (kind == 2 && key == 0) {
+            this.g.mouseX = host.MouseX();
+            this.g.mouseY = host.MouseY();
+            int cx = this.g.mouseX;
+            int cy = this.g.mouseY;
+            // 竖屏底部按钮行：菜单（回主菜单）与重玩（重开当前局）
+            bool menu;
+            if (this.g.BottomRowHit(cx, cy, out menu)) {
+                if (menu) { this.router.Go("menu"); }
+                else { this.g.StartGame(this.g.mode, Window.GetTickMs()); }
+                return;
+            }
+            this.g.OnDownPlay(cx, cy, Window.GetTickMs());
+        } else if (kind == 4) {
+            if (key == 27) { this.router.Go("menu"); }
+        }
+    }
+
+    override void FixedStep(int dtMs) {
+        this.g.Tick(Window.GetTickMs());
+        // 分出胜负（绝杀 / 无子可动）后切结算。
+        if (this.g.winner != 0) { this.router.Go("over"); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
         // Android 上表面晚于 Start 到达(转向/后台往返亦然),App 会整体
         // 换新画布对象(App.SwapCanvas);Start 时抓的引用画进已销毁的
         // 旧表面,永不 present。每帧对齐到宿主传入的当前画布。
@@ -1161,9 +1104,69 @@ class XqLoop : IGuiHostLoop {
         // 布局才能铺满整窗（宽窗多看宽度，不落 margin 空条）。
         this.g.SyncStage(host);
         CDraw.Origin(0, host.ContentTop());
-        this.g.Render(Window.GetTickMs());
+        this.g.DrawPlay(Window.GetTickMs());
     }
-    public void Stop(GuiHost host) { }
+}
+
+// 结算：HTML 面板叠在定格的棋局上——Render 继续画对局画面（棋局已停，
+// 画面定格），body 半透明压暗，按钮/文案由 HTML 层承担。
+class XqOverScene : HtmlScene {
+    XqGame g;
+    Element headline;
+    Element subEl;
+    Element cheerEl;
+
+    XqOverScene(XqGame g) { this.g = g; }
+
+    override string HtmlFile() { return "assets/scenes/over.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("again", () => this.router.Go("play"));
+        handlers.Add("menu", () => this.router.Go("menu"));
+    }
+
+    override void OnEnter(Control root) {
+        this.headline = XqOverScene.AsElement(root, "headline");
+        this.subEl = XqOverScene.AsElement(root, "sub");
+        this.cheerEl = XqOverScene.AsElement(root, "cheer");
+        string head; string sub; string cheer;
+        if (this.g.winner == 1) {
+            head = "绝杀！红方胜";
+            int gain = 15;
+            if (this.g.mode > 0) { gain = 20; }
+            sub = "+" + gain + " 段位分 · 现 " + this.g.prof.Title();
+            cheer = "棋高一着，再战一盘！";
+            if (this.g.prof.streak >= 3) { cheer = this.g.prof.streak + " 连胜！杀伐果断"; }
+            if (this.g.mode > 0) { cheer = "残局功力见涨！"; }
+        } else {
+            head = "黑方得手";
+            sub = "第 " + this.g.moveCount + " 手告负";
+            cheer = "复盘关键一手，卷土重来！";
+        }
+        if (this.headline != null) { this.headline.SetText(head); }
+        if (this.subEl != null) { this.subEl.SetText(sub); }
+        if (this.cheerEl != null) { this.cheerEl.SetText(cheer); }
+    }
+
+    static Element AsElement(Control root, string id) {
+        Control c = root.Find(id);
+        if (c != null && c is Element) { return (Element)c; }
+        return null;
+    }
+
+    override void Event(int kind, int key) {
+        if (kind != 4) { return; }
+        if (key == 27) { this.router.Go("menu"); }
+        if (key == 13 || key == 32) { this.router.Go("play"); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
+        this.g.c = c;
+        this.g.SyncStage(host);
+        CDraw.Origin(0, host.ContentTop());
+        this.g.DrawPlay(Window.GetTickMs());
+    }
 }
 
 class XqApp {
@@ -1171,7 +1174,12 @@ class XqApp {
         // 手机竖屏：GuiHost 以逻辑宽高比定外壳方向（宽>高横屏，反之
         // 竖屏）。竖长逻辑舞台在桌面宽窗里经 StageViewport 居中留灰，
         // 手机上则满屏竖向铺满——两态共用一套 Portrait() 布局。
-        GuiHost host = new GuiHost("象棋", 720, 1280, 16);
-        host.Run(new XqLoop());
+        SceneRouter router = SceneRouter.CreateFixed("象棋", 720, 1280, 16);
+        XqGame g = XqGame.Create(router.Host());
+        router.Register("menu", new XqMenuScene(g));
+        router.Register("play", new XqPlayScene(g));
+        router.Register("over", new XqOverScene(g));
+        // demo 标记（xiangqi_demo.txt）直接进对局自弈供截图/无头验证。
+        router.Run(g.demo ? "play" : "menu");
     }
 }
