@@ -62,6 +62,9 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 * Never list attribute names with `*/` inside a `/* ... */` comment —
   `data-on-*/data-if` closes the comment mid-sentence and the rest becomes
   code (209 cascading errors). Separate with `、` or spaces.
+* No C#-style collection initializers: `string[] xs = { "a", "b" };` fails
+  to parse (`unexpected token '{'`). Build a `List<string>` with `Add`
+  calls instead. (2026-10-07, test-probe compile)
 
 ## 4. Edit
 
