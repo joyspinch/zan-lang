@@ -5,8 +5,9 @@
 // cards with smooth TTF ranks (no pixel text); menu/table/panel/cards/avatars
 // are gpt-image-2 painted assets under full-bleed cover (new *2.png names,
 // old asset files untouched) with fallback chain to canvas primitives.
-// GuiHost+Canvas 版：窗口/事件/呈现由 Gui 原生外壳承担（Game.Foundation.Gui），
-// 绘制走 Game.Kit.CanvasPrims 直绘，不依赖 SDL。
+// SceneRouter+HtmlScene 版：菜单/对局/结算三个场景由 SceneRouter 路由，
+// 菜单与结算的按钮/文案走 HTML 层（assets/scenes/*.html），牌桌与手牌
+// 走 Game.Kit.CanvasPrims 直绘，不依赖 SDL。
 using System;
 using System.IO;
 using Gui;
@@ -87,7 +88,6 @@ class Combo {
 }
 
 class DdzGame {
-    GuiHost host;
     Canvas c;
     DdzProfile prof;
     Rng rng;
@@ -175,11 +175,9 @@ class DdzGame {
 
     static DdzGame Create(GuiHost h) {
         DdzGame g = new DdzGame();
-        g.host = h;
-        g.c = h.App().canvas;
         g.prof = DdzProfile.Load();
         g.rng = Rng.Seed((long)Window.GetTickMs() + 97531246);
-        g.scene = 0;
+        g.scene = 1;
         g.mouseX = DdzGame.CX();
         g.mouseY = 360;
         g.pops = new List<DdzPopup>();
@@ -188,7 +186,6 @@ class DdzGame {
         g.table = Combo.None();
         g.diff = 1;
         g.demo = File.Exists("ddz_demo.txt");
-        if (g.demo) { g.StartRound(Window.GetTickMs()); }
         return g;
     }
 
@@ -852,19 +849,9 @@ class DdzGame {
         return DdzGame.CX() - total / 2 + i * gap;
     }
 
+    // 牌桌画布点击：叫分按钮（scene 1）与出牌/不出/取消 + 手牌选牌
+    // （scene 2）。菜单/结算按钮走 HTML 场景层，不经过这里。
     void OnDown(int cx, int cy, int now) {
-        if (this.scene == 0) {
-            if (CDraw.PointIn(cx, cy, DdzGame.CX() - 210, DdzGame.VH() / 2 - 30, 420, 84)) { this.StartRound(now); }
-            if (CDraw.PointIn(cx, cy, DdzGame.CX() - 210, DdzGame.VH() / 2 + 92, 130, 54)) { this.diff = 0; }
-            if (CDraw.PointIn(cx, cy, DdzGame.CX() - 65, DdzGame.VH() / 2 + 92, 130, 54)) { this.diff = 1; }
-            if (CDraw.PointIn(cx, cy, DdzGame.CX() + 80, DdzGame.VH() / 2 + 92, 130, 54)) { this.diff = 2; }
-            return;
-        }
-        if (this.scene == 3) {
-            if (CDraw.PointIn(cx, cy, DdzGame.CX() - 230, DdzGame.VH() / 2 + 70, 210, 60)) { this.StartRound(now); return; }
-            if (CDraw.PointIn(cx, cy, DdzGame.CX() + 20, DdzGame.VH() / 2 + 70, 210, 60)) { this.scene = 0; return; }
-            return;
-        }
         if (this.scene == 1) {
             if (this.bidTurn == 0) {
                 int ay = DdzGame.BidY();
@@ -898,14 +885,6 @@ class DdzGame {
             }
             i = i - 1;
         }
-    }
-
-    void OnKey(int key, int now) {
-        if (key == 27) { if (this.scene == 0) { this.host.RequestStop(); } else { this.scene = 0; } return; }
-        if (key == 13 && this.scene == 2) { this.TryPlaySelected(now); }
-        if (key == 32 && this.scene == 2) { this.TryPass(now); }
-        if (key == 67 && this.scene == 2) { this.ClearSelection(now); }
-        if (this.scene == 3 && key == 13) { this.StartRound(now); }
     }
 
     void Tick(int now) {
@@ -1252,69 +1231,6 @@ class DdzGame {
         }
     }
 
-    void DrawMenu(int now) {
-        this.EnsureTex();
-        CDraw.Clear(this.c, DdzGame.VW(), DdzGame.VH(), CDraw.Argb(255, 24, 16, 10));
-        if (this.menuBg2 != null) {
-            DdzGame.BlitCover(this.c, this.menuBg2, DdzGame.VW(), DdzGame.VH());
-            CDraw.FillRect(this.c, 0, 0, DdzGame.VW(), DdzGame.VH(), CDraw.Argb(110, 18, 10, 6));
-        } else {
-            CKitUi.Backdrop(this.c, this.menuBg, DdzGame.VW(), DdzGame.VH());
-            CDraw.FillRect(this.c, 0, 0, DdzGame.VW(), DdzGame.VH(), CDraw.Argb(120, 14, 10, 6));
-        }
-        CFx.Vignette(this.c, DdzGame.VW(), DdzGame.VH(), 90);
-        if (this.title2Path != null) {
-            CDraw.BlitImage(this.c, this.title2Path, DdzGame.CX() - 300, 30, 600, 200);
-        } else if (this.titlePath != null) {
-            CDraw.BlitImage(this.c, this.titlePath, DdzGame.CX() - 300, 30, 600, 200);
-        } else {
-            CText.DrawCenteredShadow(this.c, "斗地主", DdzGame.CX(), 70, 9, 245, 232, 205, 255);
-        }
-        CText.DrawCenteredShadow(this.c, "叫分抢庄 · 炸弹翻倍 · 连胜赢豆", DdzGame.CX(), 244, 3, 255, 218, 160, 255);
-        CFx.Rule(this.c, DdzGame.CX(), 288, 150, 226, 186, 128, 190);
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, DdzGame.CX() - 210, 330, 420, 84, "开始斗地主", 3, 1);
-        CText.DrawCenteredShadow(this.c, "难度", DdzGame.CX(), 430, 2, 230, 212, 182, 255);
-        int kE = 0; int kN = 0; int kH = 0;
-        if (this.diff == 0) { kE = 1; }
-        if (this.diff == 1) { kN = 1; }
-        if (this.diff == 2) { kH = 1; }
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, DdzGame.CX() - 210, 452, 130, 54, "简单", 2, kE);
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, DdzGame.CX() - 65, 452, 130, 54, "普通", 2, kN);
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, DdzGame.CX() + 80, 452, 130, 54, "困难", 2, kH);
-        CText.DrawCenteredShadow(this.c, this.prof.Title() + " · 豆 " + this.prof.beans
-            + " · 胜 " + this.prof.wins + " 负 " + this.prof.losses
-            + " · 最长连胜 " + this.prof.bestStreak, DdzGame.CX(), DdzGame.VH() - 52, 2, 230, 212, 182, 255);
-    }
-
-    void DrawOver(int now) {
-        this.DrawTableBase(now);
-        CDraw.FillRect(this.c, 0, 0, DdzGame.VW(), DdzGame.VH(), CDraw.Argb(165, 12, 10, 6));
-        int by = DdzGame.VH() / 2 - 170;
-        int bx = DdzGame.CX() - 250;
-        if (this.panel2 != null) {
-            CFx.ShadowRect(this.c, bx, by, 500, 320, 18, 16, 0, 0, 0, 120);
-            CDraw.BlitImage(this.c, this.panel2, bx, by, 500, 320);
-            CFx.Ring(this.c, bx, by, 500, 320, 18, 1, 226, 186, 128, 180);
-        } else {
-            CDraw.RoundRectFill(this.c, bx, by, 500, 320, 20, 36, 26, 14, 245);
-            CDraw.RingRect(this.c, bx, by, 500, 320, 2, 214, 178, 120, 140);
-        }
-        CFx.Rule(this.c, DdzGame.CX(), by + 26, 150, 226, 186, 128, 190);
-        if (this.winner == 1) {
-            CText.DrawCenteredShadow(this.c, "胜利！赢 " + this.deltaBeans + " 豆", DdzGame.CX(), by + 34, 5, 255, 218, 110, 255);
-            string cheer = "手气正旺，再来一局！";
-            if (this.prof.streak >= 3) { cheer = this.prof.streak + " 连胜！豆子滚滚来"; }
-            CText.DrawCentered(this.c, cheer, DdzGame.CX(), by + 120, 3, 150, 230, 190, 255);
-        } else {
-            CText.DrawCenteredShadow(this.c, "惜败，输 " + this.deltaBeans + " 豆", DdzGame.CX(), by + 34, 5, 235, 165, 150, 255);
-            CText.DrawCentered(this.c, "记牌回想一下，翻盘就在下局", DdzGame.CX(), by + 120, 3, 225, 210, 190, 255);
-        }
-        CText.DrawCentered(this.c, "豆 " + this.prof.beans + " · 倍数 x" + this.mult, DdzGame.CX(), by + 170, 2, 230, 214, 185, 255);
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, bx + 30, by + 240, 210, 60, "再来一局", 3, 1);
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, bx + 260, by + 240, 210, 60, "回到菜单", 3, 0);
-        this.DrawFx(now);
-    }
-
     // table base so the over screen can overlay it
     void DrawTableBase(int now) {
         this.EnsureTex();
@@ -1330,63 +1246,190 @@ class DdzGame {
         this.DrawShown(this.shown0, DdzGame.CX(), 360);
     }
 
-    void Render(int now) {
-        if (this.scene == 0) { this.DrawMenu(now); }
-        else if (this.scene == 3) { this.DrawOver(now); }
-        else { this.DrawTable(now); }
+    // 菜单画布层：美术背景 + 标题（开始/难度按钮与战绩行走 DzMenuScene 的
+    // HTML 层）。
+    void DrawMenuArt() {
+        this.EnsureTex();
+        int vw = DdzGame.VW();
+        int vh = DdzGame.VH();
+        CDraw.Clear(this.c, vw, vh, CDraw.Argb(255, 24, 16, 10));
+        if (this.menuBg2 != null) {
+            DdzGame.BlitCover(this.c, this.menuBg2, vw, vh);
+            CDraw.FillRect(this.c, 0, 0, vw, vh, CDraw.Argb(110, 18, 10, 6));
+        } else {
+            CKitUi.Backdrop(this.c, this.menuBg, vw, vh);
+            CDraw.FillRect(this.c, 0, 0, vw, vh, CDraw.Argb(120, 14, 10, 6));
+        }
+        CFx.Vignette(this.c, vw, vh, 90);
+        if (this.title2Path != null) {
+            CDraw.BlitImage(this.c, this.title2Path, vw / 2 - 300, 30, 600, 200);
+        } else if (this.titlePath != null) {
+            CDraw.BlitImage(this.c, this.titlePath, vw / 2 - 300, 30, 600, 200);
+        } else {
+            CText.DrawCenteredShadow(this.c, "斗地主", vw / 2, 70, 9, 245, 232, 205, 255);
+        }
     }
 }
 
-// GuiHost 主循环回调：事件 → 固定步长模拟（16ms，追帧上限内多次）→
-// 渲染（BeginFrame/PresentFrame 由宿主包好；帧预算自限速约 60fps）。
-class DzLoop : IGuiHostLoop {
+// 主菜单：画布层只画美术背景与标题（DdzGame.DrawMenuArt），开始/难度
+// 按钮与战绩行走 HTML 层；难度按钮选定即开局，开始按钮沿用当前难度。
+class DzMenuScene : HtmlScene {
     DdzGame g;
 
-    public void Start(GuiHost host) {
-        this.g = DdzGame.Create(host);
+    DzMenuScene(DdzGame g) { this.g = g; }
+
+    override string HtmlFile() { return "assets/scenes/menu.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("start", () => this.router.Go("play"));
+        handlers.Add("easy", () => this.Pick(0));
+        handlers.Add("normal", () => this.Pick(1));
+        handlers.Add("hard", () => this.Pick(2));
     }
-    public void Event(GuiHost host, int kind, int code) {
-        int now = Window.GetTickMs();
-        // 指针坐标经 host.MouseX/Y 反变换回舞台逻辑坐标（桌面视口
-        // letterbox / 手机驱动反变换都在宿主之下完成）。
-        if (kind == 4) {
-            this.g.OnKey(code, now);
-        // 鼠标 kind:1=移动 2=按下 3=释放(Win32Shell 契约)。
-        } else if (kind == 1) {
-            this.g.mouseX = host.MouseX();
-            this.g.mouseY = host.MouseY();
-        } else if (kind == 2) {
-            if (code == 0) {
-                this.g.mouseX = host.MouseX();
-                this.g.mouseY = host.MouseY();
-                this.g.OnDown(this.g.mouseX, this.g.mouseY, now);
-            }
+
+    void Pick(int d) {
+        this.g.diff = d;
+        this.router.Go("play");
+    }
+
+    override void OnEnter(Control root) {
+        Element stats = DzMenuScene.AsElement(root, "stats");
+        if (stats != null) {
+            stats.SetText(this.g.prof.Title() + " · 豆 " + this.g.prof.beans
+                + " · 胜 " + this.g.prof.wins + " 负 " + this.g.prof.losses
+                + " · 最长连胜 " + this.g.prof.bestStreak);
         }
     }
-    public void FixedUpdate(GuiHost host, int dt) {
-        this.g.Tick(Window.GetTickMs());
+
+    static Element AsElement(Control root, string id) {
+        Control c = root.Find(id);
+        if (c != null && c is Element) { return (Element)c; }
+        return null;
     }
-    public void Update(GuiHost host, int dt) { }
-    public void Render(GuiHost host, Canvas c, double alpha) {
-        // Android 上表面晚于 Start 到达(转向/后台往返亦然),App 会整体
-        // 换新画布对象(App.SwapCanvas);Start 时抓的引用画进已销毁的
-        // 旧表面,永不 present。每帧对齐到宿主传入的当前画布。
+
+    override void Event(int kind, int key) {
+        if (kind == 4 && key == 27) { this.router.Exit(); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
         this.g.c = c;
-        // 舞台 0 基绘制：原点落到标准标题栏之下，chrome 由宿主在
-        // 内容之上叠画。帧首先把宿主延展后的舞台尺寸同步进 VW/VH，
-        // 布局才能铺满整窗（宽窗多看宽度，不落 margin 空条）。
         this.g.SyncStage(host);
         CDraw.Origin(0, host.ContentTop());
-        this.g.Render(Window.GetTickMs());
+        this.g.DrawMenuArt();
     }
-    public void Stop(GuiHost host) { }
+}
+
+// 牌桌：纯 canvas 场景（HtmlFile 为空，无 HTML 层）——叫分、出牌、手牌
+// 选牌都在画布上。每次进场开新局（菜单入场 / 结算再来一局都走这里），
+// 一局分出胜负后路由到结算场景。
+class DzPlayScene : HtmlScene {
+    DdzGame g;
+
+    DzPlayScene(DdzGame g) { this.g = g; }
+
+    override void OnEnter(Control root) {
+        this.g.StartRound(Window.GetTickMs());
+    }
+
+    override void Event(int kind, int key) {
+        GuiHost host = this.router.Host();
+        // 指针坐标经 host.MouseX/Y 反变换回舞台逻辑坐标（桌面视口
+        // letterbox / 手机驱动反变换都在宿主之下完成）。
+        if (kind == 1) {
+            this.g.mouseX = host.MouseX();
+            this.g.mouseY = host.MouseY();
+        } else if (kind == 2 && key == 0) {
+            this.g.mouseX = host.MouseX();
+            this.g.mouseY = host.MouseY();
+            this.g.OnDown(this.g.mouseX, this.g.mouseY, Window.GetTickMs());
+        } else if (kind == 4) {
+            if (key == 27) { this.router.Go("menu"); }
+            else if (key == 13) { this.g.TryPlaySelected(Window.GetTickMs()); }
+            else if (key == 32) { this.g.TryPass(Window.GetTickMs()); }
+            else if (key == 67) { this.g.ClearSelection(Window.GetTickMs()); }
+        }
+    }
+
+    override void FixedStep(int dtMs) {
+        this.g.Tick(Window.GetTickMs());
+        // 一局分出胜负（Finish 置 scene=3）后切结算；切换在帧首应用，
+        // 本场景随即使停。
+        if (this.g.scene == 3) { this.router.Go("over"); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
+        this.g.c = c;
+        this.g.SyncStage(host);
+        CDraw.Origin(0, host.ContentTop());
+        this.g.DrawTable(Window.GetTickMs());
+    }
+}
+
+// 结算：HTML 面板叠在定格的牌桌上——Render 继续画 DrawTableBase（牌局
+// 已停，画面定格），body 半透明压暗，按钮/文案由 HTML 层承担。
+class DzOverScene : HtmlScene {
+    DdzGame g;
+
+    DzOverScene(DdzGame g) { this.g = g; }
+
+    override string HtmlFile() { return "assets/scenes/over.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("again", () => this.router.Go("play"));
+        handlers.Add("menu", () => this.router.Go("menu"));
+    }
+
+    override void OnEnter(Control root) {
+        Element headline = DzOverScene.AsElement(root, "headline");
+        Element subEl = DzOverScene.AsElement(root, "sub");
+        Element cheerEl = DzOverScene.AsElement(root, "cheer");
+        string head; string cheer;
+        if (this.g.winner == 1) {
+            head = "胜利！赢 " + this.g.deltaBeans + " 豆";
+            cheer = "手气正旺，再来一局！";
+            if (this.g.prof.streak >= 3) { cheer = this.g.prof.streak + " 连胜！豆子滚滚来"; }
+        } else {
+            head = "惜败，输 " + this.g.deltaBeans + " 豆";
+            cheer = "记牌回想一下，翻盘就在下局";
+        }
+        if (headline != null) { headline.SetText(head); }
+        if (subEl != null) { subEl.SetText("豆 " + this.g.prof.beans + " · 倍数 x" + this.g.mult); }
+        if (cheerEl != null) { cheerEl.SetText(cheer); }
+    }
+
+    static Element AsElement(Control root, string id) {
+        Control c = root.Find(id);
+        if (c != null && c is Element) { return (Element)c; }
+        return null;
+    }
+
+    override void Event(int kind, int key) {
+        if (kind != 4) { return; }
+        if (key == 27) { this.router.Go("menu"); }
+        if (key == 13 || key == 32) { this.router.Go("play"); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
+        this.g.c = c;
+        this.g.SyncStage(host);
+        CDraw.Origin(0, host.ContentTop());
+        this.g.DrawTableBase(Window.GetTickMs());
+    }
 }
 
 class DzApp {
     static void Main() {
-        // 手机竖屏：GuiHost 逻辑宽高比定外壳方向（见 xiangqi 同注）。
-        // 斗地主手牌带较宽，竖屏舞台给到 760 宽防手牌挤压。
-        GuiHost host = new GuiHost("斗地主", 760, 1280, 16);
-        host.Run(new DzLoop());
+        // 手机竖屏：GuiHost 逻辑宽高比定外壳方向。斗地主手牌带较宽，
+        // 竖屏舞台给到 760 宽防手牌挤压。
+        SceneRouter router = SceneRouter.CreateFixed("斗地主", 760, 1280, 16);
+        DdzGame g = DdzGame.Create(router.Host());
+        router.Register("menu", new DzMenuScene(g));
+        router.Register("play", new DzPlayScene(g));
+        router.Register("over", new DzOverScene(g));
+        // demo 标记（ddz_demo.txt）直接进牌桌自弈供截图/无头验证。
+        router.Run(g.demo ? "play" : "menu");
     }
 }
