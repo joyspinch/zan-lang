@@ -4,7 +4,8 @@
 // Kaya board and slate/clamshell stone textures, capture bursts, floating
 // "提子" popups, rank progression (布衣→棋圣). Esc back/exit.
 // GuiHost+Canvas 版：窗口/事件/呈现由 Gui 原生外壳承担（Game.Foundation.Gui），
-// 绘制走 Game.Kit.CanvasPrims 直绘，不依赖 SDL。
+// 绘制走 Game.Kit.CanvasPrims 直绘，不依赖 SDL；主菜单/对局/结算由
+// SceneRouter 路由三个场景（菜单与结算的按钮/文案在 HTML 层）。
 using System;
 using System.IO;
 using Gui;
@@ -72,13 +73,11 @@ class WqPopup {
 }
 
 class WqGame {
-    GuiHost host;
     Canvas c;
     WqProfile prof;
     Rng rng;
 
     int[] board;      // 9x9: 0 empty, 1 black (player), 2 white (AI)
-    int scene;        // 0 menu, 1 play, 2 over
     int mode;         // 0 game, 1..3 drills
     int moves;
     int lastSq;
@@ -106,7 +105,6 @@ class WqGame {
     string menuBg2;   // 手绘美术资产（新名，绝不覆盖旧素材）
     string playBg;
     string boardArt;
-    string panel;
     string blackPath2;
     string whitePath2;
     bool texTried;
@@ -149,18 +147,14 @@ class WqGame {
 
     static WqGame Create(GuiHost h) {
         WqGame g = new WqGame();
-        g.host = h;
-        g.c = h.App().canvas;
         g.prof = WqProfile.Load();
         g.rng = Rng.Seed((long)Window.GetTickMs() + 24680135);
-        g.scene = 0;
         g.mouseX = 640;
         g.mouseY = 360;
         g.parts = new List<WqParticle>();
         g.pops = new List<WqPopup>();
         g.toastAt = -9999;
         g.demo = File.Exists("weiqi_demo.txt");
-        if (g.demo) { g.StartGame(0, Window.GetTickMs()); }
         return g;
     }
 
@@ -175,7 +169,6 @@ class WqGame {
         this.menuBg2 = WqGame.FindAsset("assets/menu_bg2.png");
         this.playBg = WqGame.FindAsset("assets/play_bg.png");
         this.boardArt = WqGame.FindAsset("assets/board_wood2.png");
-        this.panel = WqGame.FindAsset("assets/panel.png");
         this.blackPath2 = WqGame.FindAsset("assets/stone_black2.png");
         this.whitePath2 = WqGame.FindAsset("assets/stone_white2.png");
     }
@@ -275,7 +268,6 @@ class WqGame {
         } else {
             this.Toast("黑先，围地多者胜（贴七目）", now);
         }
-        this.scene = 1;
         if (this.demo) { this.demoAt = now + 500; }
     }
 
@@ -466,7 +458,6 @@ class WqGame {
 
     void Win(int who, int now) {
         this.winner = who;
-        this.scene = 2;
         if (who == 1) {
             int gain = 15;
             if (this.mode > 0) { gain = 18; this.prof.drills = this.prof.drills + 1; }
@@ -510,7 +501,7 @@ class WqGame {
     }
 
     void PlayerPass(int now) {
-        if (this.aiTurn || this.scene != 1) { return; }
+        if (this.aiTurn || this.winner != 0) { return; }
         this.passes = this.passes + 1;
         this.moves = this.moves + 1;
         this.koSq = -1;
@@ -612,27 +603,8 @@ class WqGame {
 
     // ----- input -----------------------------------------------------------
 
-    void OnDown(int cx, int cy, int now) {
-        if (this.scene == 0) {
-            if (WqGame.Portrait()) {
-                // 竖屏菜单：单列居中（与 DrawMenu 同矩形）
-                if (CDraw.PointIn(cx, cy, WqGame.VW() / 2 - 210, 330, 420, 74)) { this.StartGame(0, now); }
-                if (CDraw.PointIn(cx, cy, WqGame.VW() / 2 - 210, 420, 420, 74)) { this.StartGame(1, now); }
-                if (CDraw.PointIn(cx, cy, WqGame.VW() / 2 - 210, 510, 420, 74)) { this.StartGame(2, now); }
-                if (CDraw.PointIn(cx, cy, WqGame.VW() / 2 - 210, 600, 420, 74)) { this.StartGame(3, now); }
-                return;
-            }
-            if (CDraw.PointIn(cx, cy, 430, 300, 420, 74)) { this.StartGame(0, now); }
-            if (CDraw.PointIn(cx, cy, 430, 390, 420, 74)) { this.StartGame(1, now); }
-            if (CDraw.PointIn(cx, cy, 430, 480, 420, 74)) { this.StartGame(2, now); }
-            if (CDraw.PointIn(cx, cy, 430, 570, 420, 74)) { this.StartGame(3, now); }
-            return;
-        }
-        if (this.scene == 2) {
-            if (CDraw.PointIn(cx, cy, 420, 430, 210, 60)) { this.StartGame(this.mode, now); return; }
-            if (CDraw.PointIn(cx, cy, 650, 430, 210, 60)) { this.scene = 0; return; }
-            return;
-        }
+    // 对局内输入（停一手按钮与落子；场景切换由 WqPlayScene 处理）。
+    void OnDownPlay(int cx, int cy, int now) {
         // pass button（竖屏 = 底部按钮行）
         if (WqGame.Portrait()) {
             int vw = WqGame.VW();
@@ -651,18 +623,12 @@ class WqGame {
         this.Place(gx, gy, 1, now);
     }
 
-    void OnKey(int key, int now) {
-        if (key == 27) { if (this.scene == 0) { this.host.RequestStop(); } else { this.scene = 0; } return; }
-        if (key == 80 && this.scene == 1) { this.PlayerPass(now); return; }   // P
-        if (this.scene == 2 && (key == 13 || key == 32)) { this.StartGame(this.mode, now); }
-    }
-
     void Tick(int now) {
-        if (this.scene == 1 && this.aiTurn && now >= this.aiThinkAt) {
+        if (this.aiTurn && now >= this.aiThinkAt) {
             this.AiMove(now);
             this.demoAt = now + 420;
         }
-        if (this.demo && this.scene == 1 && !this.aiTurn && now >= this.demoAt) {
+        if (this.demo && !this.aiTurn && now >= this.demoAt) {
             this.DemoMove(now);
         }
     }
@@ -787,7 +753,7 @@ class WqGame {
             CDraw.RingRect(this.c, kx - km, ky - km, km * 2, km * 2, 2, 220, 90, 80, 200);
         }
         // hover ghost
-        if (this.scene == 1 && !this.aiTurn) {
+        if (this.winner == 0 && !this.aiTurn) {
             int gx = (this.mouseX - x0 + c / 2) / c;
             int gy = (this.mouseY - y0 + c / 2) / c;
             if (gx >= 0 && gy >= 0 && gx < n && gy < n && this.At(gx, gy) == 0) {
@@ -878,7 +844,8 @@ class WqGame {
         this.DrawFx(now);
     }
 
-    void DrawMenu(int now) {
+    // 菜单画布层：美术背景 + 标题（模式按钮与战绩行走 WqMenuScene 的 HTML 层）。
+    void DrawMenuArt() {
         this.EnsureTex();
         int vw = WqGame.VW();
         int vh = WqGame.VH();
@@ -896,105 +863,94 @@ class WqGame {
         } else {
             CText.DrawCenteredShadow(this.c, "围棋", vw / 2, 70, 9, 245, 232, 205, 255);
         }
-        CText.DrawCenteredShadow(this.c, "黑白之间 · 死活经典 · 段位成长", vw / 2, 244, 3, 255, 218, 160, 255);
-        CFx.Rule(this.c, vw / 2, 280, 150, 226, 186, 128, 190);
-        if (WqGame.Portrait()) {
-            CFx.GoldButton(this.c, this.mouseX, this.mouseY, vw / 2 - 210, 330, 420, 74, "九路对弈", 3, 1);
-            CFx.GoldButton(this.c, this.mouseX, this.mouseY, vw / 2 - 210, 420, 420, 74, "死活题 · 征子", 3, 0);
-            CFx.GoldButton(this.c, this.mouseX, this.mouseY, vw / 2 - 210, 510, 420, 74, "死活题 · 直三杀", 3, 1);
-            CFx.GoldButton(this.c, this.mouseX, this.mouseY, vw / 2 - 210, 600, 420, 74, "死活题 · 关门吃", 3, 0);
-            CText.DrawCenteredShadow(this.c, "段位 " + this.prof.Title() + " · " + this.prof.pts
-                + " 分 · 胜 " + this.prof.wins + " 负 " + this.prof.losses
-                + " · 死活通关 " + this.prof.drills, vw / 2, 704, 2, 230, 212, 182, 255);
-            return;
-        }
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, 430, 300, 420, 74, "九路对弈", 3, 1);
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, 430, 390, 420, 74, "死活题 · 征子", 3, 0);
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, 430, 480, 420, 74, "死活题 · 直三杀", 3, 1);
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, 430, 570, 420, 74, "死活题 · 关门吃", 3, 0);
-        CText.DrawCenteredShadow(this.c, "段位 " + this.prof.Title() + " · " + this.prof.pts
-            + " 分 · 胜 " + this.prof.wins + " 负 " + this.prof.losses
-            + " · 死活通关 " + this.prof.drills, WqGame.VW() / 2, WqGame.VH() - 52, 2, 230, 212, 182, 255);
-    }
-
-    void DrawOver(int now) {
-        CDraw.Clear(this.c, WqGame.VW(), WqGame.VH(), CDraw.Argb(255, 30, 22, 14));
-        this.DrawAmbient();
-        this.DrawBoard(now);
-        this.DrawSide(now);
-        CDraw.FillRect(this.c, 0, 0, WqGame.VW(), WqGame.VH(), CDraw.Argb(165, 12, 10, 6));
-        int by = WqGame.Portrait() ? WqGame.VH() / 2 - 170 : 190;
-        int bx = WqGame.VW() / 2 - 250;
-        if (this.panel != null) {
-            CFx.ShadowRect(this.c, bx, by, 500, 320, 18, 16, 0, 0, 0, 120);
-            CDraw.BlitImage(this.c, this.panel, bx, by, 500, 320);
-            CFx.Ring(this.c, bx, by, 500, 320, 18, 1, 226, 186, 128, 180);
-        } else {
-            CFx.Card(this.c, bx, by, 500, 320, 22, 36, 26, 14, 26, 18, 10, 250, 226, 186, 128, 160, 1);
-        }
-        CFx.Rule(this.c, WqGame.VW() / 2, by + 26, 150, 226, 186, 128, 190);
-        if (this.winner == 1) {
-            CText.DrawCenteredShadow(this.c, "妙手成局，黑胜！", WqGame.VW() / 2, by + 34, 5, 255, 218, 110, 255);
-            if (this.mode == 0) {
-                CText.DrawCentered(this.c, "黑 " + this.scoreB + " · 白 " + this.scoreW + "（含贴目）", WqGame.VW() / 2, by + 110, 3, 240, 226, 200, 255);
-            } else {
-                CText.DrawCentered(this.c, "死活要点，一击即中", WqGame.VW() / 2, by + 110, 3, 240, 226, 200, 255);
-            }
-            string cheer = "棋形优美，再来一盘！";
-            if (this.prof.streak >= 3) { cheer = this.prof.streak + " 连胜！势不可挡"; }
-            CText.DrawCentered(this.c, cheer, WqGame.VW() / 2, by + 166, 2, 150, 230, 190, 255);
-        } else {
-            CText.DrawCenteredShadow(this.c, "白棋略胜半子", WqGame.VW() / 2, by + 34, 5, 235, 165, 150, 255);
-            if (this.mode == 0) {
-                CText.DrawCentered(this.c, "黑 " + this.scoreB + " · 白 " + this.scoreW + "（含贴目）", WqGame.VW() / 2, by + 110, 3, 225, 210, 190, 255);
-            } else {
-                CText.DrawCentered(this.c, "差一步之遥，再试一次", WqGame.VW() / 2, by + 110, 3, 225, 210, 190, 255);
-            }
-            CText.DrawCentered(this.c, "复盘一手，胜负手就在眼前", WqGame.VW() / 2, by + 166, 2, 255, 216, 152, 255);
-        }
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, bx + 30, by + 240, 210, 60, "再来一局", 3, 1);
-        CFx.GoldButton(this.c, this.mouseX, this.mouseY, bx + 260, by + 240, 210, 60, "回到菜单", 3, 0);
-        this.DrawFx(now);
-    }
-
-    void Render(int now) {
-        if (this.scene == 0) { this.DrawMenu(now); }
-        else if (this.scene == 2) { this.DrawOver(now); }
-        else { this.DrawPlay(now); }
     }
 }
 
-// GuiHost 主循环回调：事件 → 固定步长模拟（16ms，追帧上限内多次）→
-// 渲染（BeginFrame/PresentFrame 由宿主包好；帧预算自限速约 60fps）。
-class WqLoop : IGuiHostLoop {
+// 主菜单：画布层只画美术背景与标题（WqMenuScene.Render → DrawMenuArt），
+// 四个模式按钮与战绩行走 HTML 层；每次进场由 WqPlayScene.OnEnter 开新局。
+class WqMenuScene : HtmlScene {
     WqGame g;
 
-    public void Start(GuiHost host) {
-        this.g = WqGame.Create(host);
+    WqMenuScene(WqGame g) { this.g = g; }
+
+    override string HtmlFile() { return "assets/scenes/menu.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("game", () => this.Pick(0));
+        handlers.Add("drill1", () => this.Pick(1));
+        handlers.Add("drill2", () => this.Pick(2));
+        handlers.Add("drill3", () => this.Pick(3));
     }
-    public void Event(GuiHost host, int kind, int code) {
-        int now = Window.GetTickMs();
-        // 指针坐标经 host.MouseX/Y 反变换回舞台逻辑坐标（桌面视口
-        // letterbox / 手机驱动反变换都在宿主之下完成）。
-        if (kind == 4) {
-            this.g.OnKey(code, now);
-        // 鼠标 kind:1=移动 2=按下 3=释放(Win32Shell 契约)。
-        } else if (kind == 1) {
-            this.g.mouseX = host.MouseX();
-            this.g.mouseY = host.MouseY();
-        } else if (kind == 2) {
-            if (code == 0) {
-                this.g.mouseX = host.MouseX();
-                this.g.mouseY = host.MouseY();
-                this.g.OnDown(this.g.mouseX, this.g.mouseY, now);
-            }
+
+    void Pick(int m) {
+        this.g.mode = m;
+        this.router.Go("play");
+    }
+
+    override void OnEnter(Control root) {
+        Element stats = WqMenuScene.AsElement(root, "stats");
+        if (stats != null) {
+            stats.SetText("段位 " + this.g.prof.Title() + " · " + this.g.prof.pts
+                + " 分 · 胜 " + this.g.prof.wins + " 负 " + this.g.prof.losses
+                + " · 死活通关 " + this.g.prof.drills);
         }
     }
-    public void FixedUpdate(GuiHost host, int dt) {
-        this.g.Tick(Window.GetTickMs());
+
+    static Element AsElement(Control root, string id) {
+        Control c = root.Find(id);
+        if (c != null && c is Element) { return (Element)c; }
+        return null;
     }
-    public void Update(GuiHost host, int dt) { }
-    public void Render(GuiHost host, Canvas c, double alpha) {
+
+    override void Event(int kind, int key) {
+        if (kind == 4 && key == 27) { this.router.Exit(); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
+        this.g.c = c;
+        this.g.SyncStage(host);
+        CDraw.Origin(0, host.ContentTop());
+        this.g.DrawMenuArt();
+    }
+}
+
+// 对局：纯 canvas 场景（HtmlFile 为空，无 HTML 层）。每次进场开新局
+// （菜单选模式 / 结算再来一局都走这里），分出胜负后路由到结算场景。
+class WqPlayScene : HtmlScene {
+    WqGame g;
+
+    WqPlayScene(WqGame g) { this.g = g; }
+
+    override void OnEnter(Control root) {
+        this.g.StartGame(this.g.mode, Window.GetTickMs());
+    }
+
+    override void Event(int kind, int key) {
+        GuiHost host = this.router.Host();
+        // 指针坐标经 host.MouseX/Y 反变换回舞台逻辑坐标（桌面视口
+        // letterbox / 手机驱动反变换都在宿主之下完成）。
+        if (kind == 1) {
+            this.g.mouseX = host.MouseX();
+            this.g.mouseY = host.MouseY();
+        } else if (kind == 2 && key == 0) {
+            this.g.mouseX = host.MouseX();
+            this.g.mouseY = host.MouseY();
+            this.g.OnDownPlay(this.g.mouseX, this.g.mouseY, Window.GetTickMs());
+        } else if (kind == 4) {
+            if (key == 27) { this.router.Go("menu"); }
+            if (key == 80) { this.g.PlayerPass(Window.GetTickMs()); }   // P
+        }
+    }
+
+    override void FixedStep(int dtMs) {
+        this.g.Tick(Window.GetTickMs());
+        // 分出胜负（提子达标 / 双停一手数子）后切结算。
+        if (this.g.winner != 0) { this.router.Go("over"); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
         // Android 上表面晚于 Start 到达(转向/后台往返亦然),App 会整体
         // 换新画布对象(App.SwapCanvas);Start 时抓的引用画进已销毁的
         // 旧表面,永不 present。每帧对齐到宿主传入的当前画布。
@@ -1004,15 +960,81 @@ class WqLoop : IGuiHostLoop {
         // 布局才能铺满整窗（宽窗多看宽度，不落 margin 空条）。
         this.g.SyncStage(host);
         CDraw.Origin(0, host.ContentTop());
-        this.g.Render(Window.GetTickMs());
+        this.g.DrawPlay(Window.GetTickMs());
     }
-    public void Stop(GuiHost host) { }
+}
+
+// 结算：HTML 面板叠在定格的棋局上——Render 继续画对局画面（棋局已停，
+// 画面定格），body 半透明压暗，按钮/文案由 HTML 层承担。
+class WqOverScene : HtmlScene {
+    WqGame g;
+    Element headline;
+    Element scoreEl;
+    Element cheerEl;
+
+    WqOverScene(WqGame g) { this.g = g; }
+
+    override string HtmlFile() { return "assets/scenes/over.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("again", () => this.router.Go("play"));
+        handlers.Add("menu", () => this.router.Go("menu"));
+    }
+
+    override void OnEnter(Control root) {
+        this.headline = WqOverScene.AsElement(root, "headline");
+        this.scoreEl = WqOverScene.AsElement(root, "score");
+        this.cheerEl = WqOverScene.AsElement(root, "cheer");
+        string head; string sub; string cheer;
+        if (this.g.winner == 1) {
+            head = "妙手成局，黑胜！";
+            sub = this.g.mode == 0
+                ? "黑 " + this.g.scoreB + " · 白 " + this.g.scoreW + "（含贴目）"
+                : "死活要点，一击即中";
+            cheer = "棋形优美，再来一盘！";
+            if (this.g.prof.streak >= 3) { cheer = this.g.prof.streak + " 连胜！势不可挡"; }
+        } else {
+            head = "白棋略胜半子";
+            sub = this.g.mode == 0
+                ? "黑 " + this.g.scoreB + " · 白 " + this.g.scoreW + "（含贴目）"
+                : "差一步之遥，再试一次";
+            cheer = "复盘一手，胜负手就在眼前";
+        }
+        if (this.headline != null) { this.headline.SetText(head); }
+        if (this.scoreEl != null) { this.scoreEl.SetText(sub); }
+        if (this.cheerEl != null) { this.cheerEl.SetText(cheer); }
+    }
+
+    static Element AsElement(Control root, string id) {
+        Control c = root.Find(id);
+        if (c != null && c is Element) { return (Element)c; }
+        return null;
+    }
+
+    override void Event(int kind, int key) {
+        if (kind != 4) { return; }
+        if (key == 27) { this.router.Go("menu"); }
+        if (key == 13 || key == 32) { this.router.Go("play"); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        GuiHost host = this.router.Host();
+        this.g.c = c;
+        this.g.SyncStage(host);
+        CDraw.Origin(0, host.ContentTop());
+        this.g.DrawPlay(Window.GetTickMs());
+    }
 }
 
 class WqApp {
     static void Main() {
         // 手机竖屏：GuiHost 逻辑宽高比定外壳方向（见 xiangqi 同注）。
-        GuiHost host = new GuiHost("围棋", 720, 1280, 16);
-        host.Run(new WqLoop());
+        SceneRouter router = SceneRouter.CreateFixed("围棋", 720, 1280, 16);
+        WqGame g = WqGame.Create(router.Host());
+        router.Register("menu", new WqMenuScene(g));
+        router.Register("play", new WqPlayScene(g));
+        router.Register("over", new WqOverScene(g));
+        // demo 标记（weiqi_demo.txt）直接进对局自弈供截图/无头验证。
+        router.Run(g.demo ? "play" : "menu");
     }
 }
