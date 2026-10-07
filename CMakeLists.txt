@@ -4549,6 +4549,15 @@ else()
 endif()
 add_test(NAME lsp_integration_utf16
   COMMAND lsp_integration_test $<TARGET_FILE:zan-lsp>)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME lsp_session_editor
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lsp/run_lsp_session_test.py
+      --zanc $<TARGET_FILE:zanc>
+      --server $<TARGET_FILE:zan-lsp>
+      --client ${CMAKE_BINARY_DIR}/lsp_session_regression${_exe_ext})
+  set_tests_properties(lsp_session_editor PROPERTIES TIMEOUT 300)
+endif()
 
 # ---- zanfmt (code formatter, written in Zan) ----
 set(_zanfmt_exe ${CMAKE_BINARY_DIR}/zanfmt${_exe_ext})

@@ -1020,23 +1020,76 @@ static int lsp_symbol_kind(isym_kind_t k) {
 
 static void ensure_project_indexed(lsp_server_t *s);
 
+/* Percent-decodes `in` into `out` (NUL-terminated, `cap`-bounded). Each %XX
+ * hex pair becomes its byte; a '%' not followed by two hex digits is kept
+ * literally, so paths that arrive already decoded pass through unchanged. */
+static void uri_percent_decode(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (size_t i = 0; in[i] && o + 1 < cap; i++) {
+        if (in[i] == '%' && isxdigit((unsigned char)in[i + 1])
+            && isxdigit((unsigned char)in[i + 2])) {
+            char hex[3] = { in[i + 1], in[i + 2], '\0' };
+            out[o++] = (char)strtol(hex, NULL, 16);
+            i += 2;
+        } else {
+            out[o++] = in[i];
+        }
+    }
+    out[o] = '\0';
+}
+
+/* Percent-encodes a native path into URI path form: unreserved bytes plus
+ * '/' and the drive-letter ':' stay raw, everything else (space, '%',
+ * '"#&<>[\]^`{|}', control and every non-ASCII byte) becomes %XX with
+ * uppercase hex, matching what standard clients emit for these paths. */
+static void uri_percent_encode_path(const char *in, char *out, size_t cap) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    for (size_t i = 0; in[i] && o + 3 < cap; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+            || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.'
+            || c == '~' || c == '/' || c == ':') {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '%';
+            out[o++] = hex[c >> 4];
+            out[o++] = hex[c & 15];
+        }
+    }
+    out[o] = '\0';
+}
+
+/* Native filesystem path for a file:// URI (percent-decoded, separators
+ * native), so a document update can replace the project index's entry for
+ * the same file instead of adding a duplicate keyed by URI. */
+static void uri_to_native_path(const char *uri, char *out, size_t cap) {
+    const char *rest = NULL;
+    if (strncmp(uri, "file:///", 8) == 0) rest = uri + 8;   /* file:///C:/... */
+    else if (strncmp(uri, "file://", 7) == 0) rest = uri + 7; /* file://host/... */
+    if (rest) {
+        char decoded[1200];
+        uri_percent_decode(rest, decoded, sizeof(decoded));
+        strncpy(out, decoded, cap - 1);
+        out[cap - 1] = '\0';
+#ifdef _WIN32
+        for (char *p = out; *p; p++) {
+            if (*p == '/') *p = '\\';
+        }
+#endif
+    } else {
+        strncpy(out, uri, cap - 1);
+        out[cap - 1] = '\0';
+    }
+}
+
 static void handle_initialize(lsp_server_t *s, json_value *id, json_value *params) {
     /* Extract workspace root for project indexing */
     if (params) {
         const char *root_uri = json_get_str(json_obj_get(params, "rootUri"));
         const char *root_path = json_get_str(json_obj_get(params, "rootPath"));
-        if (root_uri && strncmp(root_uri, "file:///", 8) == 0) {
-            /* Windows URIs carry a drive letter ("file:///C:/..."); POSIX
-             * paths keep the leading slash ("file:///home/..." -> "/home"). */
-#ifdef _WIN32
-            strncpy(s->workspace_root, root_uri + 8, sizeof(s->workspace_root) - 1);
-            /* Convert URI encoding: forward slash -> backslash on Windows */
-            for (char *p = s->workspace_root; *p; p++) {
-                if (*p == '/') *p = '\\';
-            }
-#else
-            strncpy(s->workspace_root, root_uri + 7, sizeof(s->workspace_root) - 1);
-#endif
+        if (root_uri && strncmp(root_uri, "file://", 7) == 0) {
+            uri_to_native_path(root_uri, s->workspace_root, sizeof(s->workspace_root));
         } else if (root_path) {
             strncpy(s->workspace_root, root_path, sizeof(s->workspace_root) - 1);
         }
@@ -1252,27 +1305,6 @@ static void ensure_project_indexed(lsp_server_t *s) {
         return;
     }
     ensure_stdlib_indexed(s);
-}
-
-/* Native filesystem path for a file:// URI (mirrors handle_initialize's
- * root conversion), so a document update can replace the project index's
- * entry for the same file instead of adding a duplicate keyed by URI. */
-static void uri_to_native_path(const char *uri, char *out, size_t cap) {
-    if (strncmp(uri, "file:///", 8) == 0) {
-#ifdef _WIN32
-        strncpy(out, uri + 8, cap - 1);
-        out[cap - 1] = '\0';
-        for (char *p = out; *p; p++) {
-            if (*p == '/') *p = '\\';
-        }
-#else
-        strncpy(out, uri + 7, cap - 1);
-        out[cap - 1] = '\0';
-#endif
-    } else {
-        strncpy(out, uri, cap - 1);
-        out[cap - 1] = '\0';
-    }
 }
 
 /* Re-index one changed document into the shared project index so completion
@@ -1491,6 +1523,10 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
     char prefix[128], context[128];
     prefix_before(doc->text, off, prefix, sizeof(prefix));
     member_context(doc->text, off, context, sizeof(context));
+    if (getenv("ZAN_LSP_DUMP_SYMS")) {
+        fprintf(stderr, "COMPLETION line=%d char=%d off=%zu prefix='%s' context='%s'\n",
+                line, character, off, prefix, context);
+    }
 
     /* intellisense_t is large (~2 MB); keep it off the stack. The engine is
      * cached per (uri, doc version) and reused across requests instead of
@@ -1545,7 +1581,11 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
              * it against identically-named variables from unrelated files
              * and floods the list with a stranger type's members. */
             if (g_project_intel) {
-                const char *local_t = intel_resolve_type_at(is, resolve_type, line);
+                /* Resolve the receiver name at the real cursor column (see
+                 * the hover call site: column-less lookup hides a method's
+                 * parameters behind any smaller earlier method body). */
+                const char *local_t = intel_resolve_type_pos(is, resolve_type,
+                                                             line, character);
                 const char *query_t = (local_t && local_t[0]) ? local_t
                                                               : resolve_type;
                 int before = count;
@@ -1650,29 +1690,50 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
 
     intellisense_t *is = doc_intel_for(s, uri);
     if (!is) { send_response(s, id, json_new_null()); return; }
-    hover_info_t h = intel_hover_at(is, word, line);
 
-    /* `receiver.word`: resolve the receiver's type first. The name-only
-     * fallback below would describe whichever indexed class with a member
-     * of the same name was indexed last (NumPad.SetText instead of
-     * StatusBar.SetText). */
-    if (!h.valid) {
-        char chain[256];
-        if (receiver_chain_before(doc->text, off, chain, sizeof(chain))) {
-            char fm[64];
-            const char *rt = intel_resolve_chain_pos(is, g_project_intel, chain,
-                                                     fm, sizeof(fm), line, character);
-            if (!rt || !rt[0]) {
-                /* retry with the engines swapped: designer-projected fields
-                 * exist only in the project index, so the root may resolve
-                 * there while the enclosing class comes from the document */
-                rt = intel_resolve_chain_pos(g_project_intel, is, chain,
-                                             fm, sizeof(fm), line, character);
-            }
-            if (rt && rt[0] && g_project_intel)
-                h = intel_hover_member(g_project_intel, rt, word);
+    if (getenv("ZAN_LSP_DUMP_SYMS")) {
+        fprintf(stderr, "DUMP %s symbols=%d methods=%d\n", uri, is->symbol_count, is->method_count);
+        for (int i = 0; i < is->symbol_count; i++) {
+            isym_t *y = &is->symbols[i];
+            fprintf(stderr, "  [%d] '%s' kind=%d type='%s' parent='%s' line=%d col=%d mo=%d scope=%d,%d-%d,%d\n",
+                    i, y->name, (int)y->kind, y->type_name, y->parent, y->line, y->col,
+                    y->method_offset, y->scope_start_line, y->scope_start_col,
+                    y->scope_end_line, y->scope_end_col);
+        }
+        for (int i = 0; i < is->method_count; i++) {
+            imethod_t *m = &is->methods[i];
+            fprintf(stderr, "  M[%d] %s.%s decl=%d span=%d,%d-%d,%d\n", i, m->parent, m->name,
+                    m->decl_offset, m->start_line, m->start_col, m->end_line, m->end_col);
         }
     }
+    /* `receiver.word` resolves first: the member of the receiver's type is
+     * the correct description even when a same-named local shadows the word
+     * in the document (cursor on `Visible` of `a.Visible` with a local
+     * `string Visible` in scope). The plain name lookup below is the
+     * fallback for words that are not member accesses. */
+    hover_info_t h = {0};
+    char chain[256];
+    if (receiver_chain_before(doc->text, off, chain, sizeof(chain))) {
+        char fm[64];
+        const char *rt = intel_resolve_chain_pos(is, g_project_intel, chain,
+                                                 fm, sizeof(fm), line, character);
+        if (!rt || !rt[0]) {
+            /* retry with the engines swapped: designer-projected fields
+             * exist only in the project index, so the root may resolve
+             * there while the enclosing class comes from the document */
+            rt = intel_resolve_chain_pos(g_project_intel, is, chain,
+                                         fm, sizeof(fm), line, character);
+        }
+        if (rt && rt[0] && g_project_intel)
+            h = intel_hover_member(g_project_intel, rt, word);
+    }
+
+    /* Resolve the plain word against the real cursor column. Column-less
+     * lookups make intel_method_at match every method on the line (the
+     * smallest span wins), which hides Run's parameters behind an earlier
+     * small method and sends the name to the project-index sewer. */
+    if (!h.valid)
+        h = intel_hover_pos(is, word, line, character);
 
     /* cross-file symbols (e.g. a design-doc-projected widget field referenced
      * from the business file) live in the project index */
@@ -1694,6 +1755,11 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
     send_response(s, id, result);
 }
 
+/* Native path <-> file:// URI conversion; defined further below alongside
+ * the reference-walking helpers that share them. */
+static void fspath_to_uri(const char *path, char *out, size_t cap);
+static bool same_uri_ci(const char *a, const char *b);
+
 static void handle_definition(lsp_server_t *s, json_value *id, json_value *params) {
     const char *uri; int line, character;
     if (!get_position(params, &uri, &line, &character)) {
@@ -1710,47 +1776,62 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
 
     intellisense_t *is = doc_intel_for(s, uri);
     if (!is) { send_response(s, id, json_new_null()); return; }
-    goto_def_t g = intel_goto_def(is, word);
+    goto_def_t g = {0};
+    char chain[256];
+    bool member_ctx = receiver_chain_before(doc->text, off, chain, sizeof(chain));
 
-    /* `receiver.word`: resolve the receiver's type first. The name-only
-     * index walk would jump to whichever same-named member it reaches first
-     * (NumPad.SetText instead of StatusBar.SetText). */
-    if (!g.found) {
-        char chain[256];
-        if (receiver_chain_before(doc->text, off, chain, sizeof(chain))) {
-            char fm[64];
-            const char *rt = intel_resolve_chain_pos(is, g_project_intel, chain,
-                                                     fm, sizeof(fm), line, character);
-            if (!rt || !rt[0]) {
-                /* retry with the engines swapped: designer-projected fields
-                 * exist only in the project index, so the root may resolve
-                 * there while the enclosing class comes from the document */
-                rt = intel_resolve_chain_pos(g_project_intel, is, chain,
-                                             fm, sizeof(fm), line, character);
-            }
-            if (rt && rt[0] && g_project_intel)
-                intel_goto_member(g_project_intel, rt, word, &g);
+    /* `receiver.word` resolves first: the member of the receiver's type is
+     * the correct target even when a same-named local shadows the word in
+     * the document (cursor on `Visible` of `a.Visible` with a local
+     * `string Visible` in scope). The name-only walk is the fallback for
+     * words that are not member accesses. */
+    if (member_ctx) {
+        char fm[64];
+        const char *rt = intel_resolve_chain_pos(is, g_project_intel, chain,
+                                                 fm, sizeof(fm), line, character);
+        if (!rt || !rt[0]) {
+            /* retry with the engines swapped: designer-projected fields
+             * exist only in the project index, so the root may resolve
+             * there while the enclosing class comes from the document */
+            rt = intel_resolve_chain_pos(g_project_intel, is, chain,
+                                         fm, sizeof(fm), line, character);
         }
+        if (rt && rt[0] && g_project_intel)
+            intel_goto_member(g_project_intel, rt, word, &g);
     }
-
+    if (!g.found)
+        g = intel_goto_def(is, word);
     if (!g.found && g_project_intel)
         g = intel_goto_def(g_project_intel, word);
     if (!g.found) { send_response(s, id, json_new_null()); return; }
 
+    /* The target file may be recorded as a native path (project index) or as
+     * the document URI (doc engine); always answer with a proper file:// URI
+     * so clients can open it, and compare through same_uri_ci, which decodes
+     * and case-folds both sides. */
+    char target_uri[1800];
+    if (g.file[0] && strncmp(g.file, "file://", 7) == 0) {
+        snprintf(target_uri, sizeof(target_uri), "%s", g.file);
+    } else if (g.file[0]) {
+        fspath_to_uri(g.file, target_uri, sizeof(target_uri));
+    } else {
+        snprintf(target_uri, sizeof(target_uri), "%s", uri);
+    }
+    bool same_doc = same_uri_ci(target_uri, uri);
     int dl, dc;
-    if (g.file[0] && strcmp(g.file, uri) != 0) {
+    if (same_doc) {
+        dl = g.line;
+        dc = g.col;
+    } else {
         /* cross-file symbol (e.g. a design-doc-projected field): the target
          * file is not open here, so use the recorded line directly; design-doc
          * symbols carry their definition line. */
         dl = g.line;
         dc = 0;
-    } else {
-        dl = g.line;
-        dc = g.col;
     }
 
     json_value *loc = json_new_obj();
-    json_obj_set(loc, "uri", json_new_str(g.file[0] ? g.file : uri));
+    json_obj_set(loc, "uri", json_new_str(target_uri));
     json_value *range = json_new_obj();
     json_value *start = json_new_obj();
     json_value *endp  = json_new_obj();
@@ -1824,22 +1905,34 @@ static char *read_file_all(const char *path) {
     return buf;
 }
 
-/* file:// URI for a native path, separators normalized to '/'. */
+/* file:// URI for a native path, separators normalized to '/' and percent-
+ * encoded, so echoed URIs match the encoded forms clients send for the
+ * same files (spaces, '%', non-ASCII). */
 static void fspath_to_uri(const char *path, char *out, size_t cap) {
     if (strncmp(path, "file://", 7) == 0) {
         snprintf(out, cap, "%s", path);
-    } else if (path[0] == '/') {
-        snprintf(out, cap, "file://%s", path);
-    } else {
-        snprintf(out, cap, "file:///%s", path);
+        return;
     }
-    for (char *p = out; *p; p++) if (*p == '\\') *p = '/';
+    char raw[1800];
+    if (path[0] == '/') {
+        snprintf(raw, sizeof(raw), "file://%s", path);
+    } else {
+        snprintf(raw, sizeof(raw), "file:///%s", path);
+    }
+    for (char *p = raw; *p; p++) if (*p == '\\') *p = '/';
+    uri_percent_encode_path(raw, out, cap);
 }
 
 /* Two URIs naming the same file: separators and case are irrelevant on the
  * platforms zan targets (Windows paths differ in drive-letter case, and the
- * client may send either separator). */
+ * client may send either separator). Both sides are percent-decoded first,
+ * so a client-encoded URI matches the same file however we spell it. */
 static bool same_uri_ci(const char *a, const char *b) {
+    char da[1800], db[1800];
+    uri_percent_decode(a, da, sizeof(da));
+    uri_percent_decode(b, db, sizeof(db));
+    a = da;
+    b = db;
     while (*a && *b) {
         char ca = *a == '\\' ? '/' : (char)tolower((unsigned char)*a);
         char cb = *b == '\\' ? '/' : (char)tolower((unsigned char)*b);
@@ -1900,7 +1993,7 @@ static void for_each_unopened_project_file(lsp_server_t *s, void *ctx,
         if (lsp_cancel_hit(s)) return;
         const char *fp = g_project_intel->indexed_files[f];
         if (!fp[0]) continue;
-        char furi[600];
+        char furi[1800];
         fspath_to_uri(fp, furi, sizeof(furi));
         if (uri_is_open(s, furi)) continue;
         char *text = read_file_all(fp);
@@ -2137,6 +2230,82 @@ static void rename_visit(void *ctx, const char *uri, const char *text) {
     if (edits) json_obj_set(rc->changes, uri, edits);
 }
 
+/* Two resolved type names name the same type when their simple names
+ * (namespace, generics and arrays stripped) match — the same pairing
+ * intel_member_sym uses to walk a receiver type to its declaring class. */
+static bool type_simple_same(const char *a, const char *b) {
+    char sa[128], sb[128];
+    snprintf(sa, sizeof(sa), "%s", a ? a : "");
+    snprintf(sb, sizeof(sb), "%s", b ? b : "");
+    sa[strcspn(sa, "<?")] = '\0';
+    sb[strcspn(sb, "<?")] = '\0';
+    const char *pa = strrchr(sa, '.'); pa = pa ? pa + 1 : sa;
+    const char *pb = strrchr(sb, '.'); pb = pb ? pb + 1 : sb;
+    return strcmp(pa, pb) == 0;
+}
+
+/* Occurrences of `word` in `text` that belong to the member being renamed:
+ * a member access whose preceding receiver resolves to the same type, or the
+ * member's own declaration recorded in this engine's symbol table. NULL when
+ * no occurrence qualifies. */
+static json_value *member_rename_edits_for(const char *text, intellisense_t *de,
+                                           intellisense_t *project,
+                                           const char *rt, const char *word,
+                                           const char *new_name) {
+    size_t offsets[512];
+    int n = find_text_references(text, word, offsets, 512);
+    if (n == 0 || !de) return NULL;
+
+    char decl_simple[128];
+    snprintf(decl_simple, sizeof(decl_simple), "%s", rt);
+    decl_simple[strcspn(decl_simple, "<?")] = '\0';
+    const char *dsp = strrchr(decl_simple, '.');
+    dsp = dsp ? dsp + 1 : decl_simple;
+
+    json_value *edits = NULL;
+    for (int i = 0; i < n; i++) {
+        int rl, rc;
+        offset_to_linecol(text, (int)offsets[i], &rl, &rc);
+        bool keep = false;
+        /* the declaration itself: a symbol of this type carrying the member
+         * name whose recorded position is exactly this occurrence */
+        for (int k = 0; k < de->symbol_count && !keep; k++) {
+            const isym_t *sym = &de->symbols[k];
+            if (!sym->parent[0] || strcmp(sym->parent, dsp) != 0) continue;
+            if (strcmp(sym->name, word) != 0) continue;
+            if (sym->kind != ISYM_METHOD && sym->kind != ISYM_FIELD &&
+                sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER)
+                continue;
+            if (sym->line == rl && sym->col == rc) keep = true;
+        }
+        /* otherwise a typed member access through the receiver */
+        if (!keep) {
+            char chain[256];
+            if (!receiver_chain_before(text, offsets[i], chain, sizeof(chain)))
+                continue;
+            char fm[64];
+            const char *t2 = intel_resolve_chain_pos(de, project, chain, fm,
+                                                     sizeof(fm), rl, rc);
+            if (!t2 || !t2[0] || !type_simple_same(t2, rt)) continue;
+        }
+        if (!edits) edits = json_new_arr();
+        json_value *edit = json_new_obj();
+        json_value *range = json_new_obj();
+        json_value *start = json_new_obj();
+        json_value *endp  = json_new_obj();
+        json_obj_set(start, "line", json_new_num(rl));
+        json_obj_set(start, "character", json_new_num(rc));
+        json_obj_set(endp, "line", json_new_num(rl));
+        json_obj_set(endp, "character", json_new_num(rc + (int)strlen(word)));
+        json_obj_set(range, "start", start);
+        json_obj_set(range, "end", endp);
+        json_obj_set(edit, "range", range);
+        json_obj_set(edit, "newText", json_new_str(new_name));
+        json_arr_add(edits, edit);
+    }
+    return edits;
+}
+
 /* Rename handler: whole-word, comment/string-aware textual rename across
  * every open document, returned as a WorkspaceEdit. */
 static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
@@ -2176,6 +2345,81 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
         json_obj_set(we, "changes", changes);
         send_response(s, id, we);
         return;
+    }
+
+    /* Member-aware path: the cursor sits on `recv.word`, so this is a member
+     * use, not a local. The whole-project textual walk below would rename
+     * every unrelated same-named identifier in every indexed file (an entire
+     * toolchain flood), so a member rename instead touches the member's
+     * declaration plus the occurrences reached through the receiver's type in
+     * open documents. References in files never opened here are left to a
+     * future member-aware reference index — a missed rename beats a wrong
+     * one. */
+    char chain[256];
+    if (receiver_chain_before(doc->text, off, chain, sizeof(chain))) {
+        char fm[64];
+        const char *rt = intel_resolve_chain_pos(is, g_project_intel, chain,
+                                                 fm, sizeof(fm), line, character);
+        if (!rt || !rt[0]) {
+            /* swapped-engine retry, same as hover/definition: the receiver
+             * root may live only in the project index */
+            rt = intel_resolve_chain_pos(g_project_intel, is, chain,
+                                         fm, sizeof(fm), line, character);
+        }
+        if (rt && rt[0] && g_project_intel) {
+            goto_def_t decl;
+            memset(&decl, 0, sizeof(decl));
+            intel_goto_member(g_project_intel, rt, word, &decl);
+
+            json_value *changes = json_new_obj();
+            /* the declaration target in URI form (passthrough when the index
+             * already recorded a file:// string) */
+            char duri[1800];
+            bool have_decl = false;
+            if (decl.found && decl.file[0]) {
+                if (strncmp(decl.file, "file://", 7) == 0)
+                    snprintf(duri, sizeof(duri), "%s", decl.file);
+                else
+                    fspath_to_uri(decl.file, duri, sizeof(duri));
+                have_decl = true;
+            }
+            bool decl_open = false;
+            for (int d = 0; d < s->doc_count; d++) {
+                lsp_doc_t *dd = &s->docs[d];
+                intellisense_t *de = (strcmp(dd->uri, uri) == 0)
+                                     ? is : doc_intel_for(s, dd->uri);
+                json_value *edits = de ? member_rename_edits_for(dd->text, de,
+                                        g_project_intel, rt, word, new_name)
+                                       : NULL;
+                if (edits) json_obj_set(changes, dd->uri, edits);
+                /* an open declaration file is covered by the scan above: its
+                 * declaration occurrence is kept by position/parent match */
+                if (have_decl && same_uri_ci(dd->uri, duri)) decl_open = true;
+            }
+            /* the member may be declared in a file never opened here */
+            if (have_decl && !decl_open) {
+                json_value *edits = json_new_arr();
+                json_value *edit = json_new_obj();
+                json_value *range = json_new_obj();
+                json_value *start = json_new_obj();
+                json_value *endp  = json_new_obj();
+                json_obj_set(start, "line", json_new_num(decl.line));
+                json_obj_set(start, "character", json_new_num(decl.col));
+                json_obj_set(endp, "line", json_new_num(decl.line));
+                json_obj_set(endp, "character",
+                             json_new_num(decl.col + (int)strlen(word)));
+                json_obj_set(range, "start", start);
+                json_obj_set(range, "end", endp);
+                json_obj_set(edit, "range", range);
+                json_obj_set(edit, "newText", json_new_str(new_name));
+                json_arr_add(edits, edit);
+                json_obj_set(changes, duri, edits);
+            }
+            json_value *we = json_new_obj();
+            json_obj_set(we, "changes", changes);
+            send_response(s, id, we);
+            return;
+        }
     }
 
     /* Every open document (their unsaved text wins) plus every indexed project
@@ -3020,29 +3264,12 @@ static void handle_semantic_tokens_full(lsp_server_t *s, json_value *id, json_va
 
 /* ========================= leak checking ============================ */
 
-/* Convert a file:// URI to a native filesystem path. */
+/* Convert a file:// URI to a native filesystem path. Delegates to
+ * uri_to_native_path so the decode rules live in exactly one place. */
 static void uri_to_fspath(const char *uri, char *out, size_t cap) {
     out[0] = '\0';
     if (!uri) return;
-    const char *p = uri;
-    if (strncmp(p, "file:///", 8) == 0) p += 8;       /* file:///C:/... */
-    else if (strncmp(p, "file://", 7) == 0) p += 7;   /* file://host/... */
-    size_t o = 0;
-    while (*p && o + 1 < cap) {
-        if (p[0] == '%' && isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])) {
-            char hex[3] = { p[1], p[2], 0 };
-            out[o++] = (char)strtol(hex, NULL, 16);
-            p += 3;
-            continue;
-        }
-#ifdef _WIN32
-        out[o++] = (*p == '/') ? '\\' : *p;
-#else
-        out[o++] = *p;
-#endif
-        p++;
-    }
-    out[o] = '\0';
+    uri_to_native_path(uri, out, cap);
 }
 
 /* Compile the given source with --check-leaks, run it, and publish any

@@ -1,0 +1,307 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+// 本测试通过 Open 连接假服务器，Start 的 IDE 路径依赖不参与测试。
+class ZanIDE {
+    static string ToolchainDir() { return ""; }
+    static string ExeDir() { return ""; }
+    static string ExeSuffix() { return ""; }
+}
+
+// DebugSession 的传输辅助函数来自真实源码；DAP 面板实体只用于类型检查。
+class DbgFrame {
+    string name;
+    int line;
+    static DbgFrame Create(string name, int line) {
+        DbgFrame frame = new DbgFrame(); frame.name = name; frame.line = line; return frame;
+    }
+}
+class DbgBreakpoint {
+    int line;
+    string cond;
+}
+
+// 只记录真实 Form.Run 的绘制与无事件超时，不制造输入或 UI 定时任务。
+class IdleProbe {
+    LspPendingRequest request;
+    int paints;
+    int timeouts;
+}
+
+class Program {
+    static void Assert(bool condition, string message) {
+        if (!condition) { Console.WriteLine("FAIL: " + message); Environment.Exit(1); }
+    }
+
+    static void AwaitCompletion(LspSession session, CodeEditor editor, string label) {
+        long deadline = System.Diagnostics.Stopwatch.GetMilliseconds() + 20000;
+        while (System.Diagnostics.Stopwatch.GetMilliseconds() < deadline) {
+            session.Poll();
+            if (editor.acActive) {
+                for (int i = 0; i < editor.acItems.Count; i = i + 1) {
+                    CodeCompletionItem semantic = editor.acVisibleCandidates[i].semantic;
+                    if (editor.acItems[i] == label && semantic != null) { return; }
+                }
+            }
+            System.Threading.Thread.Sleep(2);
+        }
+        Assert(false, "completion response timeout: " + label);
+    }
+
+    static void AwaitRequest(LspSession session, LspPendingRequest request) {
+        long deadline = System.Diagnostics.Stopwatch.GetMilliseconds() + 20000;
+        while (request.state == LspPendingState.Pending && System.Diagnostics.Stopwatch.GetMilliseconds() < deadline) {
+            session.Poll();
+            if (request.state == LspPendingState.Pending) { System.Threading.Thread.Sleep(2); }
+        }
+        Assert(request.state != LspPendingState.Pending, "request did not reach terminal state");
+    }
+
+    static string SemanticText(CodeEditor editor, bool signature) {
+        if (signature) { return editor.externalSignature(editor.documentPath, 0, editor.curCol, "WriteLine"); }
+        return editor.externalHover(editor.documentPath, 0, editor.curCol, "WriteLine");
+    }
+
+    static void CheckSemanticText(LspSession session, CodeEditor editor, bool signature, string expected) {
+        int serial = session.seq;
+        long began = System.Diagnostics.Stopwatch.GetMilliseconds();
+        Assert(Program.SemanticText(editor, signature) == "", "new semantic query must not return stale text");
+        Assert(System.Diagnostics.Stopwatch.GetMilliseconds() - began < 200, "signature/hover must not wait for delayed response");
+        Assert(session.seq == serial + 1 && session.HasPendingWork(), "semantic query enqueued exactly once");
+        LspPendingRequest request = session.pending[serial];
+        Assert(request.state == LspPendingState.Pending, "signature/hover response remains pending before Poll");
+        Assert(Program.SemanticText(editor, signature) == "" && session.seq == serial + 1,
+            "pending signature/hover query deduplicated");
+        Program.AwaitRequest(session, request);
+        Assert(request.state == LspPendingState.Ready && Program.SemanticText(editor, signature) == expected,
+            "signature/hover returns current response");
+        Assert(Program.SemanticText(editor, signature) == expected && session.seq == serial + 1,
+            "ready signature/hover query reuses cached response");
+    }
+
+    static void TerminalCache(LspSession session, CodeEditor editor) {
+        editor.LoadText("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrst");
+        editor.curLine = 0; editor.curCol = 0;
+        Assert(editor.externalHover(editor.documentPath, 0, 0, "limit") == "", "held hover starts pending");
+        LspPendingRequest held = session.cache[0];
+        LspPendingRequest oldest = null;
+        LspPendingRequest newest = null;
+        for (int col = 1; col <= 65; col = col + 1) {
+            int serial = session.seq;
+            Assert(editor.externalHover(editor.documentPath, 0, col, "limit") == "", "new cache entry has no response yet");
+            LspPendingRequest request = session.pending[serial];
+            Program.AwaitRequest(session, request);
+            LspPendingState expected = LspPendingState.Ready;
+            if (col % 3 == 1) { expected = LspPendingState.Empty; }
+            if (col % 3 == 2) { expected = LspPendingState.Error; }
+            Assert(request.state == expected, "ready/empty/error cache terminal state");
+            int next = session.seq;
+            string text = editor.externalHover(editor.documentPath, 0, col, "limit");
+            string expectedText = expected == LspPendingState.Ready ? "cache-" + Convert.ToString(col) : "";
+            Assert(session.seq == next && text == expectedText, "terminal cache suppresses repeated wire requests");
+            if (col == 1) { oldest = request; }
+            newest = request;
+        }
+        Assert(session.cache.Count == 65 && session.cache.Contains(held) && session.cache.Contains(newest)
+            && !session.cache.Contains(oldest), "64 terminals retained, oldest evicted, pending preserved");
+        Assert(held.state == LspPendingState.Pending && session.pending.ContainsKey(held.id), "pending survives terminal trim");
+        int serial = session.seq;
+        Assert(editor.externalHover(editor.documentPath, 0, 0, "limit") == "" && session.seq == serial,
+            "held request remains deduplicated after trim");
+        Assert(editor.externalHover(editor.documentPath, 0, 1, "limit") == "" && session.seq == serial + 1,
+            "evicted terminal issues a new request");
+        Program.AwaitRequest(session, session.pending[serial]);
+        Assert(session.cache.Count == 65 && session.cache.Contains(held), "new terminal trims without removing pending");
+        Assert(session.RequestWait("probeRelease", "{}").IndexOf("released") >= 0, "release held response");
+        Assert(held.state == LspPendingState.Ready && held.hover == "cache-0" && session.cache.Count == 64
+            && !session.cache.Contains(held), "held response dispatched, oldest terminal evicted after becoming Ready");
+    }
+
+    static void Idle(int port) {
+        LspSession session = LspSession.Open(port, "D:/workspace");
+        Assert(session != null, "idle initialize");
+        Form form = Form.Create("LspSession idle regression", 320, 180);
+        App app = form.GetApp();
+        app.SetBackdropFx(false);
+        Panel panel = new Panel("idle");
+        panel.Dock(Dock.Fill());
+        form.With(panel);
+        IdleProbe probe = new IdleProbe();
+        form.FrameHook(() => {
+            if (probe.request != null && app.lastPollResult == 1) { probe.timeouts = probe.timeouts + 1; }
+            session.Poll();
+            if (session.ConsumeEditorRefresh()) { app.RequestRedraw(); }
+            if (session.HasPendingWork()) { app.RequestAnimationFrame(40); }
+        });
+        panel.Paint.Add(() => {
+            probe.paints = probe.paints + 1;
+            // 请求必须晚于首次 BeginFrame，避免启动绘制掩盖丢失的续帧。
+            if (probe.request == null) {
+                probe.request = session.NewRequest("probeIdle");
+                session.SendRequest(probe.request, "{}");
+            }
+            if (probe.request.state != LspPendingState.Pending) { app.StopLoop(); }
+            // BeginFrame 会消费预约，标准组件 Paint 末尾必须重新预约。
+            if (session.HasPendingWork()) { app.RequestAnimationFrame(40); }
+        });
+        form.Run();
+        Assert(probe.request != null && probe.request.state == LspPendingState.Ready
+            && probe.request.message.IndexOf("idle-ok") >= 0, "idle delayed fragmented response Ready");
+        Assert(probe.timeouts >= 2 && probe.paints >= 2, "idle timeout >=2 and paints >=2");
+        session.Shutdown();
+        Console.WriteLine("PASS LspSession idle Ready timeouts=" + Convert.ToString(probe.timeouts)
+            + " paints=" + Convert.ToString(probe.paints));
+    }
+
+    static LspRenameEdit Edit(string path, int startLine, int startCol, int endLine, int endCol, string text) {
+        LspRenameEdit edit = new LspRenameEdit(); edit.path = path;
+        edit.start = LspSession.PosObj(startLine, startCol);
+        edit.end = LspSession.PosObj(endLine, endCol); edit.newText = text;
+        return edit;
+    }
+
+    static void NavigationParsing() {
+        string uri = "file:///D:/work%20space/%E4%B8%AD+file.zan";
+        string range = "{\"start\":{\"line\":2,\"character\":9},\"end\":{\"line\":2,\"character\":12}}";
+        LspDefinitionTarget single = LspSession.ParseDefinition("{\"result\":{\"uri\":\"" + uri + "\",\"range\":" + range + "}}");
+        Assert(single != null && single.path == "D:/work space/中+file.zan" && single.column == 9 && single.line == 2,
+            "single Location and URI Unicode decoding");
+        LspDefinitionTarget array = LspSession.ParseDefinition("{\"result\":[{\"uri\":\"" + uri + "\",\"range\":" + range + "}]}");
+        Assert(array != null && array.column == 9, "Location array");
+        LspDefinitionTarget link = LspSession.ParseDefinition("{\"result\":[{\"targetUri\":\"" + uri + "\",\"targetSelectionRange\":" + range + "}]}");
+        Assert(link != null && link.column == 9, "LocationLink selection range");
+        Assert(LspSession.ParseDefinition("{\"error\":{\"code\":-1},\"result\":null}") == null, "definition error rejected");
+        Assert(LspSession.UriToPath("file:///tmp/a%20b.zan") == "/tmp/a b.zan", "Unix path preserved");
+        Assert(LspSession.UriToPath("file://server/share/a%20b.zan") == "//server/share/a b.zan", "UNC path preserved");
+        string path = "D:/workspace/unsaved.zan";
+        List<LspRenameEdit> edits = new List<LspRenameEdit>();
+        edits.Add(Program.Edit(path, 0, 12, 0, 15, "b"));
+        edits.Add(Program.Edit(path, 0, 8, 0, 11, "a"));
+        LspEditApplication result = LspSession.ApplyTextEdits("/*中𐐀*/ foo foo\r\nnext", edits, path);
+        Assert(result.valid && result.text == "/*中𐐀*/ a b\r\nnext", "unordered UTF-16 edits preserve CRLF");
+        edits.Clear(); edits.Add(Program.Edit(path, 0, 4, 0, 5, "bad"));
+        result = LspSession.ApplyTextEdits("/*中𐐀*/ foo", edits, path);
+        Assert(!result.valid && result.text == "/*中𐐀*/ foo", "surrogate split edit rejected");
+        edits.Clear(); edits.Add(Program.Edit(path, 0, 0, 0, 2, "a"));
+        edits.Add(Program.Edit(path, 0, 1, 0, 3, "b"));
+        result = LspSession.ApplyTextEdits("foo", edits, path);
+        Assert(!result.valid && result.text == "foo", "overlapping edits reject entire batch");
+        edits.Clear(); edits.Add(Program.Edit(path, 0, 1, 1, 1, ""));
+        result = LspSession.ApplyTextEdits("ab\r\ncd", edits, path);
+        Assert(result.valid && result.text == "ad", "multiline deletion");
+        Assert(LspSession.ParseWorkspaceEdit("{\"result\":{\"documentChanges\":[{\"kind\":\"delete\",\"uri\":\"" + uri + "\"}]}}") == null,
+            "resource operation rejected");
+    }
+
+    static void RealServer(int port, string workspace) {
+        LspSession session = null;
+        for (int retry = 0; retry < 100 && session == null; retry = retry + 1) {
+            session = LspSession.Open(port, workspace);
+            if (session == null) { System.Threading.Thread.Sleep(20); }
+        }
+        Assert(session != null, "real server initialize");
+        CodeEditor editor = new CodeEditor();
+        editor.documentPath = workspace + "/unsaved.zan";
+        string source = "class RealBox {\n    public string Multi\n        (int value) { return \"ok\"; }\n}\n"
+            + "class RealProgram {\n    static void Main() { /*中𐐀*/ var box = new RealBox(); box.Multi(1).Le; }\n}\n";
+        editor.LoadText(source); editor.curLine = 5;
+        if (editor.curLine >= editor.lines.Count) { editor.curLine = editor.lines.Count - 1; }
+        editor.curCol = editor.LineAt(editor.curLine).IndexOf("Le;") + 2;
+        session.BindToEditor(editor);
+        editor.UpdateCompletion();
+        Program.AwaitCompletion(session, editor, "Length");
+        bool found = false;
+        for (int i = 0; i < editor.acItems.Count; i = i + 1) {
+            if (editor.acItems[i] == "Length") { editor.acSel = i; found = true; }
+        }
+        Assert(editor.acActive && found, "real parser return-chain completion");
+        editor.AcceptCompletion(true);
+        Assert(editor.GetText() == source.Replace(".Le;", ".Length;"), "real Tab insertText acceptance");
+        source = "class RealProgram { static void Main() { string value = \"x\"; value.ToU; } }";
+        editor.LoadText(source); editor.curCol = source.IndexOf("ToU;") + 3;
+        editor.UpdateCompletion();
+        Program.AwaitCompletion(session, editor, "ToUpper");
+        found = false;
+        for (int i = 0; i < editor.acItems.Count; i = i + 1) {
+            if (editor.acItems[i] == "ToUpper") { found = true; }
+        }
+        Assert(editor.acActive && found && session.DocVersion(editor.documentPath) == 2,
+            "real unsaved text synchronized before completion");
+        int useColumn = source.IndexOf("value.ToU");
+        LspDefinitionTarget definition = session.Definition(editor.documentPath, 0, useColumn);
+                Console.WriteLine("DEBUG DEF: definition=" + (definition != null ? ("line=" + Convert.ToString(definition.line) + " col=" + Convert.ToString(definition.column) + " path=" + definition.path) : "null") + " expected_col=" + Convert.ToString(source.IndexOf("value =")));
+Assert(definition != null && definition.line == 0 && definition.column == source.IndexOf("value ="),
+            "real single Location definition preserves declaration column");
+        List<LspRenameEdit> edits = session.Rename(editor.documentPath, 0, useColumn, "renamed");
+        Assert(edits != null && edits.Count == 2, "real WorkspaceEdit parsed");
+        LspEditApplication renamed = LspSession.ApplyTextEdits(source, edits, editor.documentPath);
+        Assert(renamed.valid && renamed.text == source.Replace("value", "renamed"), "real rename applies server ranges");
+        session.Shutdown();
+        Console.WriteLine("PASS real CodeEditor LspSession zan-lsp");
+    }
+
+    static void Main(string[] args) {
+        Program.NavigationParsing();
+        int port = Convert.ToInt32(args[0]);
+        if (args.Length > 1 && args[1] == "idle") { Program.Idle(port); return; }
+        if (args.Length > 2) { Program.RealServer(port, args[2]); return; }
+        LspSession session = LspSession.Open(port, "D:/workspace");
+        Assert(session != null, "initialize");
+        CodeEditor editor = new CodeEditor();
+        editor.documentPath = "D:/workspace/unsaved.zan";
+        string prefix = "/*中𐐀*/ obj.";
+        string original = prefix + "WrTail;";
+        editor.LoadText(original); editor.curCol = prefix.Length + 2;
+        session.SyncDoc(editor.documentPath, original);
+        session.SyncDoc(editor.documentPath, original);
+        session.BindToEditor(editor);
+        long began = System.Diagnostics.Stopwatch.GetMilliseconds();
+        editor.UpdateCompletion();
+        Assert(System.Diagnostics.Stopwatch.GetMilliseconds() - began < 200, "completion must not wait for delayed response");
+        session.Poll();
+        Assert(session.HasPendingWork(), "first completion remains pending before text changes");
+        editor.LoadText(original + " "); editor.curCol = prefix.Length + 2;
+        began = System.Diagnostics.Stopwatch.GetMilliseconds();
+        editor.UpdateCompletion();
+        Assert(System.Diagnostics.Stopwatch.GetMilliseconds() - began < 200, "replacement completion must not wait for fragmented response");
+        Program.AwaitCompletion(session, editor, "WriteLine");
+        bool selected = false;
+        for (int i = 0; i < editor.acItems.Count; i = i + 1) {
+            Assert(editor.acItems[i] != "PoisonStale", "cancelled response must not reach popup");
+            if (editor.acItems[i] == "WriteLine") { editor.acSel = i; selected = true; }
+        }
+        Assert(editor.acActive && selected, "completion list and exact response ID active=" + Convert.ToString(editor.acActive)
+            + " selected=" + Convert.ToString(selected) + " count=" + Convert.ToString(editor.acItems.Count));
+        CodeCompletionItem item = editor.acVisibleCandidates[editor.acSel].semantic;
+        Assert(item != null && item.doc == "server docs" && item.detail == "server signature", "completion metadata");
+        editor.AcceptCompletion(true);
+        Assert(editor.GetText() == prefix + "WriteLine(); ", "UTF-16 textEdit mapping");
+        string dependency = "D:/workspace/dependency.zan";
+        session.SyncDoc(dependency, "class Dependency { int value; }");
+        Program.CheckSemanticText(session, editor, true, "void WriteLine(string value)");
+        Program.CheckSemanticText(session, editor, false, "hover text\nhover details");
+        int sameColumn = editor.curCol;
+        int version = session.DocVersion(editor.documentPath);
+        editor.LoadText(prefix + "WriteLine(); edited"); editor.curCol = sameColumn;
+        Program.CheckSemanticText(session, editor, true, "void WriteLine(int edited)");
+        Program.CheckSemanticText(session, editor, false, "edited hover");
+        Assert(editor.curCol == sameColumn && session.DocVersion(editor.documentPath) == version + 1,
+            "same-position edit invalidates signature and hover");
+        session.SyncDoc(dependency, "class Dependency { string value; }");
+        version = session.DocVersion(editor.documentPath);
+        Program.CheckSemanticText(session, editor, true, "void WriteLine(string dependency)");
+        Program.CheckSemanticText(session, editor, false, "dependency hover");
+        Assert(session.DocVersion(editor.documentPath) == version && session.DocVersion(dependency) == 2,
+            "other-document change invalidates semantic cache without changing active document version");
+        Program.TerminalCache(session, editor);
+        editor.LoadText("last unsaved buffer");
+        session.SyncDoc(editor.documentPath, editor.GetText());
+        session.waitBudget = 1;
+        Assert(session.RequestWait("probeTimeout", "{}") == "" && session.Alive(), "timeout retains connection");
+        Assert(session.RequestWait("probeNext", "{}").IndexOf("fresh") >= 0, "late response ignored");
+        session.Shutdown();
+        Console.WriteLine("PASS LspSession protocol");
+    }
+}

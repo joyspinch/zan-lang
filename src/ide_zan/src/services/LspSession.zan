@@ -2,8 +2,10 @@ using System;
 using System.IO;
 using System.Diagnostics;
 using System.Json;
+using System.Text;
 using Platform;
 using Gui.Component;
+using System.Net.Sockets;
 
 // ---- LSP protocol entities ------------------------------------------------
 // Request/notification envelopes and payloads are serialized via
@@ -46,6 +48,26 @@ class LspTextDocumentIdentifier {
     string uri;
 }
 
+class LspVersionedDocument {
+    string uri;
+    int version;
+}
+
+class LspContentChange {
+    string text;
+}
+
+class LspDidChangeParams {
+    LspVersionedDocument textDocument;
+    List<LspContentChange> contentChanges;
+}
+
+class LspOpenDocument {
+    string text;
+    int version;
+    List<string> lines;
+}
+
 class LspPosition {
     int line;
     int character;
@@ -79,6 +101,31 @@ class LspRenameParams {
 
 // ---- LSP response entities (parsed with Json.Deserialize<T>) -------------
 
+class LspDefinitionTarget {
+    string path;
+    int line;
+    int column;  // UTF-16 码元列，载入目标文本后再转换为字节列。
+}
+
+class LspRenameEdit {
+    string path;
+    LspPosition start;
+    LspPosition end;
+    string newText;
+    int version;  // -1 表示 changes 或未带版本的 TextDocumentEdit。
+}
+
+class LspEditApplication {
+    bool valid;
+    string text;
+}
+
+class LspEditSpan {
+    int start;
+    int end;
+    string newText;
+}
+
 class LspLocation {
     string uri;
     JsonValue range;
@@ -100,6 +147,7 @@ class LspCompletionItem {
     string insertText;
     int insertTextFormat;
     string sortText;
+    JsonValue textEdit;
 }
 
 class LspCompletionsResult {
@@ -127,75 +175,72 @@ class LspSignatureHelpResult {
     LspSignatureHelp result;
 }
 
+enum LspPendingState { Pending, Ready, Empty, Error, Timeout, Cancelled }
+
+class LspSendFrame {
+    string data;
+    int offset;
+    int requestId;
+}
+
+// 同一个实体同时由 ID 分发表和语义缓存引用，终态也保留以抑制重复请求。
+class LspPendingRequest {
+    int id;
+    string method;
+    string path;
+    string name;
+    int version;
+    int documentGeneration;
+    int generation;
+    int line;
+    int col;
+    long deadline;
+    LspPendingState state;
+    string message;
+    List<LspCompletionItem> completions;
+    LspSignatureHelp signature;
+    string hover;
+    CodeEditor editor;
+    string text;
+    int stamp;
+    int caretLine;
+    int caretCol;
+    int completionToken;
+}
+
 /// A live Language Server Protocol client that drives a spawned `zan-lsp`
 /// over a loopback TCP socket (127.0.0.1), mirroring DebugSession's
 /// transport. Serves semantic go-to-definition, find-references and hover
 /// from the compiler front-end (binder/checker) instead of text scanning.
-/// The request/response model is synchronous, matching the IDE event loop.
+/// 日常提示由 UI 线程 Poll 推进；显式导航复用同一响应分发器等待结果。
 class LspSession {
     #if WINDOWS
-    [DllImport("ws2_32", EntryPoint = "WSAStartup")]
-    static extern int ws_startup(int version, string data);
-    [DllImport("ws2_32", EntryPoint = "socket")]
-    static extern int ws_socket(int af, int type, int proto);
-    [DllImport("ws2_32", EntryPoint = "connect")]
-    static extern int ws_connect(int s, string addr, int len);
-    [DllImport("ws2_32", EntryPoint = "closesocket")]
-    static extern int ws_close(int s);
-    [DllImport("ws2_32", EntryPoint = "send")]
-    static extern int ws_send(int s, string buf, int len, int flags);
-    [DllImport("ws2_32", EntryPoint = "recv")]
-    static extern int ws_recv(int s, string buf, int len, int flags);
-    [DllImport("ws2_32", EntryPoint = "setsockopt")]
-    static extern int ws_setsockopt(int s, int level, int opt, string val, int len);
     [DllImport("ws2_32", EntryPoint = "ioctlsocket")]
-    static extern int ws_ioctl(int s, int cmd, string argp);
-    [DllImport("ws2_32", EntryPoint = "WSAGetLastError")]
-    static extern int ws_lasterr();
-    [DllImport("ws2_32", EntryPoint = "htons")]
-    static extern int ws_htons(int v);
-    [DllImport("ws2_32", EntryPoint = "inet_addr")]
-    static extern int ws_inet_addr(string cp);
+    static extern int ws_ioctl(nint s, int cmd, string argp);
     [DllImport("kernel32", EntryPoint = "Sleep")]
     static extern void plat_sleep(int ms);
     #else
-    [DllImport("crt", EntryPoint = "socket")]
-    static extern int ws_socket(int af, int type, int proto);
-    [DllImport("crt", EntryPoint = "connect")]
-    static extern int ws_connect(int s, string addr, int len);
-    [DllImport("crt", EntryPoint = "close")]
-    static extern int ws_close(int s);
-    [DllImport("crt", EntryPoint = "send")]
-    static extern int ws_send(int s, string buf, int len, int flags);
-    [DllImport("crt", EntryPoint = "recv")]
-    static extern int ws_recv(int s, string buf, int len, int flags);
-    [DllImport("crt", EntryPoint = "setsockopt")]
-    static extern int ws_setsockopt(int s, int level, int opt, string val, int len);
-    [DllImport("crt", EntryPoint = "htons")]
-    static extern int ws_htons(int v);
-    [DllImport("crt", EntryPoint = "inet_addr")]
-    static extern int ws_inet_addr(string cp);
     [DllImport("crt", EntryPoint = "usleep")]
     static extern int plat_usleep(int us);
     #endif
-    [DllImport("crt")]
-    static extern int strlen(string str);
 
-    int sock;
+    nint sock;
     int seq;
     bool alive;
+    bool nonBlocking;
+    bool polling;
+    bool editorRefreshNeeded;
     string rbuf;
-    /// -1 when the last recv timed out, 0 when the peer closed, else the byte
-    /// count. A timeout must not be mistaken for a dead server: the language
-    /// server can simply be busy indexing.
-    int lastRecv;
-    /// Remaining recv timeouts the current request may absorb before it gives
-    /// up. Bounded so a hung or slow server can never freeze the event loop:
-    /// go-to-definition falls back to the text scan instead.
-    int waitsLeft;
-    /// Recv timeouts a request may absorb. Raised for the initialize handshake,
-    /// which indexes the whole workspace before it answers.
     int waitBudget;
+    List<LspSendFrame> sendQueue;
+    int queuedBytes;
+    long sendProgressMs;
+    Dict<int, LspPendingRequest> pending;
+    List<LspPendingRequest> cache;
+    CodeEditor boundEditor;
+    int generation;
+    Dict<string, LspOpenDocument> documents;
+    int documentGeneration;
 
     /// Spawns `zan-lsp --port N`, connects and runs the LSP initialize
     /// handshake with `root` as the workspace root (enables project-wide
@@ -227,16 +272,13 @@ class LspSession {
         d.seq = 1;
         d.alive = false;
         d.rbuf = "";
-        d.lastRecv = 0;
-        d.waitsLeft = LspSession.RequestWaits();
         d.waitBudget = LspSession.RequestWaits();
+        d.sendQueue = new List<LspSendFrame>();
+        d.pending = new Dict<int, LspPendingRequest>();
+        d.cache = new List<LspPendingRequest>();
+        d.generation = 1;
 
-        #if WINDOWS
-        byte[] wsa = new byte[512];
-        ws_startup(514, wsa);
-        #endif
-
-        int s = ws_socket(2, 1, 6);
+        nint s = Socket.CreateTcp();
         if (s < 0) { return null; }
         d.sock = s;
 
@@ -247,17 +289,12 @@ class LspSession {
         // socket in SYN_SENT for minutes). Drive it non-blocking instead:
         // repeated connect() calls report WSAEISCONN once the handshake lands,
         // so the wait stays inside our own bounded loop.
-        {
-            byte[] one = new byte[4];
-            one[0] = 1;
-            ws_ioctl(s, 0 - 2147195266, one);
-        }
+        if (Socket.SetNonBlocking(s) != 0) { Socket.Close(s); return null; }
         int tries = 0;
         while (tries < 25 && !connected) {
-            byte[] addr = d.BuildAddr(port);
-            int r = ws_connect(s, addr, 16);
+            int r = Socket.Connect(s, "127.0.0.1", port);
             // 0 = connected, WSAEISCONN = already connected.
-            if (r == 0 || ws_lasterr() == 10056) { connected = true; }
+            if (r == 0 || Socket.LastSocketError() == 10056) { connected = true; }
             else { d.SnoozeMs(20); tries = tries + 1; }
         }
         if (connected) {
@@ -267,19 +304,17 @@ class LspSession {
         #else
         int tries = 0;
         while (tries < 100 && !connected) {
-            byte[] addr = d.BuildAddr(port);
-            int r = ws_connect(s, addr, 16);
+            int r = Socket.Connect(s, "127.0.0.1", port);
             if (r == 0) { connected = true; }
             else { d.SnoozeMs(20); tries = tries + 1; }
         }
         #endif
-        if (!connected) { ws_close(s); return null; }
-        d.SetRecvTimeout(LspSession.RecvTimeoutMs());
+        if (!connected) { Socket.Close(s); return null; }
         d.alive = true;
 
         // The handshake indexes the workspace, so allow it a minute before
         // deciding the server is unusable; ordinary requests stay snappy.
-        d.waitBudget = 40;
+        d.waitBudget = 240;
         LspInitParams init = new LspInitParams();
         init.processId = JsonValue.NewNull();
         init.rootUri = LspSession.PathToUri(root);
@@ -287,6 +322,8 @@ class LspSession {
         string m = d.RequestWait("initialize", Json.Serialize<LspInitParams>(init));
         if (m.Length == 0) { d.Shutdown(); return null; }
         d.waitBudget = LspSession.RequestWaits();
+        if (Socket.SetNonBlocking(d.sock) != 0) { d.Disconnect(); return null; }
+        d.nonBlocking = true;
         d.Notify("initialized", "{}");
         return d;
     }
@@ -294,52 +331,173 @@ class LspSession {
     bool Alive() { return this.alive; }
 
     void Shutdown() {
-        if (this.sock >= 0) {
-            if (this.alive) {
-                this.RequestWait("shutdown", "");
-                this.Notify("exit", "");
-            }
-            ws_close(this.sock);
-            this.sock = 0 - 1;
+        if (alive) {
+            this.RequestWait("shutdown", "");
+            this.Notify("exit", "");
+            if (nonBlocking) { FlushSendQueue(); }
         }
-        this.alive = false;
+        Disconnect();
     }
 
-    /// Pushes the full current buffer for `path` so subsequent semantic
-    /// queries see unsaved edits (full-sync didOpen upserts the document).
+    /// 同一文档只打开一次，后续未保存修改走递增版本的全量 didChange。
     void SyncDoc(string path, string text) {
-        LspDidOpenParams p = new LspDidOpenParams();
-        p.textDocument = new LspTextDocumentItem();
-        p.textDocument.uri = LspSession.PathToUri(path);
-        p.textDocument.languageId = "zan";
-        p.textDocument.version = 1;
-        p.textDocument.text = text;
-        this.Notify("textDocument/didOpen", Json.Serialize<LspDidOpenParams>(p));
+        if (!this.alive || path.Length == 0) { return; }
+        if (documents == null) { documents = new Dict<string, LspOpenDocument>(); }
+        string uri = this.DocumentUri(path);
+        LspOpenDocument doc = null;
+        if (documents.ContainsKey(uri)) { doc = documents[uri]; }
+        if (doc != null && doc.text == text) { return; }
+        if (doc == null) {
+            doc = new LspOpenDocument();
+            doc.version = 1;
+            LspDidOpenParams p = new LspDidOpenParams();
+            p.textDocument = new LspTextDocumentItem();
+            p.textDocument.uri = uri;
+            p.textDocument.languageId = "zan";
+            p.textDocument.version = doc.version;
+            p.textDocument.text = text;
+            this.Notify("textDocument/didOpen", Json.Serialize<LspDidOpenParams>(p));
+        } else {
+            doc.version = doc.version + 1;
+            LspDidChangeParams p = new LspDidChangeParams();
+            p.textDocument = new LspVersionedDocument();
+            p.textDocument.uri = uri;
+            p.textDocument.version = doc.version;
+            p.contentChanges = new List<LspContentChange>();
+            LspContentChange change = new LspContentChange();
+            change.text = text;
+            p.contentChanges.Add(change);
+            this.Notify("textDocument/didChange", Json.Serialize<LspDidChangeParams>(p));
+        }
+        doc.text = text;
+        doc.lines = CodeEditor.SplitLines(text);
+        documents[uri] = doc;
+        documentGeneration = documentGeneration + 1;
+        if (cache != null) { cache.Clear(); }
+        if (boundEditor != null) {
+            if (LspSession.SameDocumentPath(boundEditor.documentPath, path)) {
+                boundEditor.ClearSemanticTextMemos();
+            } else { boundEditor.ResetSemanticProviders(); }
+        }
     }
 
-    /// Semantic go-to-definition. Returns "path\tline0" (0-based line) or "".
-    string Definition(string path, int line0, int col0) {
-        string m = this.RequestWait("textDocument/definition",
-            LspSession.PosParams(path, line0, col0));
-        if (m.Length == 0) { return ""; }
-        LspLocationsResult r = Json.Deserialize<LspLocationsResult>(m);
-        if (r == null || r.result == null || r.result.Count == 0) { return ""; }
-        string uri = r.result[0].uri;
-        if (uri.Length == 0) { return ""; }
-        int ln = 0;
-        if (r.result[0].range != null) {
-            JsonValue start = r.result[0].range.Get("start");
-            if (start != null) { ln = start.Int("line", 0); }
+    string DocumentUri(string path) {
+        string uri = LspSession.PathToUri(path);
+        if (documents == null || documents.ContainsKey(uri)) { return uri; }
+        List<string> keys = documents.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (LspSession.SameDocumentPath(LspSession.UriToPath(keys[i]), path)) { return keys[i]; }
         }
-        return LspSession.UriToPath(uri) + "\t" + Convert.ToString(ln);
+        return uri;
+    }
+
+    int DocVersion(string path) {
+        string uri = this.DocumentUri(path);
+        if (documents == null || !documents.ContainsKey(uri)) { return 0; }
+        return documents[uri].version;
+    }
+
+    bool DocTextMatches(string path, string text) {
+        string uri = this.DocumentUri(path);
+        return documents == null || !documents.ContainsKey(uri) || documents[uri].text == text;
+    }
+
+    LspPosition DocPosObj(string path, int line0, int byteCol) {
+        string uri = this.DocumentUri(path);
+        if (documents != null && documents.ContainsKey(uri)) {
+            LspOpenDocument doc = documents[uri];
+            if (line0 >= 0 && line0 < doc.lines.Count) {
+                return LspSession.PosObj(line0, CodeEditor.ByteColumnToUtf16(doc.lines[line0], byteCol));
+            }
+        }
+        return LspSession.PosObj(line0, byteCol);
+    }
+
+    LspTextDocumentIdentifier DocUriObj(string path) {
+        LspTextDocumentIdentifier document = new LspTextDocumentIdentifier();
+        document.uri = this.DocumentUri(path);
+        return document;
+    }
+
+    string DocPosParams(string path, int line0, int byteCol) {
+        LspDocPosParams p = new LspDocPosParams();
+        p.textDocument = this.DocUriObj(path);
+        p.position = this.DocPosObj(path, line0, byteCol);
+        return Json.Serialize<LspDocPosParams>(p);
+    }
+
+    /// Semantic go-to-definition. null 表示无目标、失败或文档已变更。
+    LspDefinitionTarget Definition(string path, int line0, int col0) {
+        int version = this.DocVersion(path);
+        int generation = documentGeneration;
+        string m = this.RequestWait("textDocument/definition",
+            this.DocPosParams(path, line0, col0));
+        if (m.Length == 0 || this.DocVersion(path) != version
+            || documentGeneration != generation) { return null; }
+        return LspSession.ParseDefinition(m);
+    }
+
+    static LspPosition ParsePosition(JsonValue value) {
+        if (value == null || !value.IsObject()) { return null; }
+        JsonValue lineValue = value.Get("line");
+        JsonValue characterValue = value.Get("character");
+        if (lineValue == null || characterValue == null || !lineValue.IsInt() || !characterValue.IsInt()) { return null; }
+        int line = lineValue.AsInt(-1);
+        int character = characterValue.AsInt(-1);
+        if (line < 0 || character < 0) { return null; }
+        return LspSession.PosObj(line, character);
+    }
+
+    static LspDefinitionTarget ParseDefinitionLocation(JsonValue value) {
+        if (value == null || !value.IsObject()) { return null; }
+        string uri = value.Str("uri", "");
+        JsonValue range = value.Get("range");
+        if (uri.Length == 0) {
+            uri = value.Str("targetUri", "");
+            range = value.Get("targetSelectionRange");
+            if (range == null) { range = value.Get("targetRange"); }
+        }
+        if (uri.Length == 0 || range == null || !range.IsObject()) { return null; }
+        LspPosition start = LspSession.ParsePosition(range.Get("start"));
+        LspPosition end = LspSession.ParsePosition(range.Get("end"));
+        if (start == null || end == null || end.line < start.line
+            || (end.line == start.line && end.character < start.character)) { return null; }
+        LspDefinitionTarget target = new LspDefinitionTarget();
+        target.path = LspSession.UriToPath(uri);
+        if (target.path.Length == 0) { return null; }
+        target.line = start.line;
+        target.column = start.character;
+        return target;
+    }
+
+    static JsonValue ParseResponse(string message) {
+        JsonValue root = null;
+        // 协议解析的错误值契约：坏响应返回 null，调用方拒绝导航或编辑。
+        try { root = JsonValue.ParseLenient(message); } catch (Exception) { return null; }
+        if (root == null || !root.IsObject() || root.Has("error")) { return null; }
+        return root;
+    }
+
+    /// 接受单个 Location、Location[] 与 LocationLink[]，优先使用目标选择范围。
+    static LspDefinitionTarget ParseDefinition(string message) {
+        JsonValue root = LspSession.ParseResponse(message);
+        if (root == null) { return null; }
+        JsonValue result = root.Get("result");
+        if (result == null || result.IsNull()) { return null; }
+        if (!result.IsArray()) { return LspSession.ParseDefinitionLocation(result); }
+        for (int i = 0; i < result.Count(); i = i + 1) {
+            LspDefinitionTarget target = LspSession.ParseDefinitionLocation(result.At(i));
+            if (target != null) { return target; }
+        }
+        return null;
     }
 
     /// Semantic find-references. Returns "path\tline0" rows.
     List<string> References(string path, int line0, int col0) {
         List<string> outp = new List<string>();
         LspReferenceParams p = new LspReferenceParams();
-        p.textDocument = LspSession.UriObj(path);
-        p.position = LspSession.PosObj(line0, col0);
+        p.textDocument = this.DocUriObj(path);
+        p.position = this.DocPosObj(path, line0, col0);
         p.context = new LspReferenceContext();
         p.context.includeDeclaration = true;
         string m = this.RequestWait("textDocument/references",
@@ -360,72 +518,186 @@ class LspSession {
         return outp;
     }
 
-    /// Semantic rename. Returns one "path\tline0\tcol0" row per edit the
-    /// server produced, project-wide -- including files that are not open in
-    /// the editor. Empty when the server refused the rename.
-    List<string> Rename(string path, int line0, int col0, string newName) {
-        List<string> outp = new List<string>();
+    /// Semantic rename. null 表示失败/过期；空列表表示服务端未给出编辑。
+    List<LspRenameEdit> Rename(string path, int line0, int col0, string newName) {
+        int version = this.DocVersion(path);
+        int generation = documentGeneration;
         LspRenameParams p = new LspRenameParams();
-        p.textDocument = LspSession.UriObj(path);
-        p.position = LspSession.PosObj(line0, col0);
+        p.textDocument = this.DocUriObj(path);
+        p.position = this.DocPosObj(path, line0, col0);
         p.newName = newName;
         string m = this.RequestWait("textDocument/rename",
             Json.Serialize<LspRenameParams>(p));
-        if (m.Length == 0) { return outp; }
-        return LspSession.ParseWorkspaceEdit(m);
+        if (m.Length == 0 || this.DocVersion(path) != version
+            || documentGeneration != generation) { return null; }
+        List<LspRenameEdit> edits = LspSession.ParseWorkspaceEdit(m);
+        if (edits == null) { return null; }
+        for (int i = 0; i < edits.Count; i = i + 1) {
+            if (edits[i].version >= 0 && this.DocVersion(edits[i].path) != edits[i].version) { return null; }
+        }
+        return edits;
     }
 
-    /// Flattens a WorkspaceEdit response into "path\tline0\tcol0" rows.
+    static bool AppendRenameEdits(List<LspRenameEdit> output, string uri, JsonValue edits, int version) {
+        if (uri.Length == 0 || edits == null || !edits.IsArray()) { return false; }
+        string path = LspSession.UriToPath(uri);
+        if (path.Length == 0) { return false; }
+        for (int i = 0; i < edits.Count(); i = i + 1) {
+            JsonValue edit = edits.At(i);
+            if (edit == null || !edit.IsObject()) { return false; }
+            JsonValue range = edit.Get("range");
+            JsonValue newText = edit.Get("newText");
+            if (range == null || !range.IsObject() || newText == null || !newText.IsString()) { return false; }
+            LspPosition start = LspSession.ParsePosition(range.Get("start"));
+            LspPosition end = LspSession.ParsePosition(range.Get("end"));
+            if (start == null || end == null || end.line < start.line
+                || (end.line == start.line && end.character < start.character)) { return false; }
+            LspRenameEdit item = new LspRenameEdit();
+            item.path = path; item.start = start; item.end = end;
+            item.newText = newText.AsString(""); item.version = version;
+            output.Add(item);
+        }
+        return true;
+    }
+
     /// 树解析：changes 里文件 URI 是对象 key（不是 "uri" 字段），逐 key
-    /// 取出 edits 数组读 line/character；不再按引号子串扫描文本。
-    static List<string> ParseWorkspaceEdit(string m) {
-        List<string> outp = new List<string>();
-        JsonValue root = null;
-        try { root = JsonValue.ParseLenient(m); } catch (Exception) { root = null; }
-        JsonValue changes = root != null ? root.Get("changes") : null;
-        if (changes == null || !changes.IsObject()) { return outp; }
-        for (int f = 0; f < changes.Count(); f = f + 1) {
-            string fp = LspSession.UriToPath(changes.KeyAt(f));
-            JsonValue edits = changes.ValAt(f);
-            if (edits == null || !edits.IsArray()) { continue; }
-            for (int e = 0; e < edits.Count(); e = e + 1) {
-                JsonValue edit = edits.At(e);
-                if (edit == null) { continue; }
-                outp.Add(fp + "\t" + Convert.ToString(edit.Int("line", 0))
-                    + "\t" + Convert.ToString(edit.Int("character", 0)));
+    /// 取出 edits 数组读 range.start/end；不再按引号子串扫描文本。
+    /// 不支持的资源操作或任何坏编辑使整批失败，禁止应用部分重命名。
+    static List<LspRenameEdit> ParseWorkspaceEdit(string m) {
+        List<LspRenameEdit> output = new List<LspRenameEdit>();
+        JsonValue root = LspSession.ParseResponse(m);
+        if (root == null) { return null; }
+        JsonValue result = root.Get("result");
+        if (result == null) { return null; }
+        if (result.IsNull()) { return output; }
+        if (!result.IsObject()) { return null; }
+        JsonValue changes = result.Get("changes");
+        JsonValue documentChanges = result.Get("documentChanges");
+        if (changes != null && documentChanges != null) { return null; }
+        if (changes != null) {
+            if (!changes.IsObject()) { return null; }
+            for (int f = 0; f < changes.Count(); f = f + 1) {
+                if (!LspSession.AppendRenameEdits(output, changes.KeyAt(f), changes.ValAt(f), -1)) { return null; }
+            }
+        } else if (documentChanges != null) {
+            if (!documentChanges.IsArray()) { return null; }
+            for (int f = 0; f < documentChanges.Count(); f = f + 1) {
+                JsonValue entry = documentChanges.At(f);
+                if (entry == null || !entry.IsObject() || entry.Has("kind")) { return null; }
+                JsonValue document = entry.Get("textDocument");
+                if (document == null || !document.IsObject()) { return null; }
+                JsonValue versionValue = document.Get("version");
+                int version = -1;
+                if (versionValue != null && !versionValue.IsNull()) {
+                    if (!versionValue.IsInt()) { return null; }
+                    version = versionValue.AsInt(-1);
+                    if (version < 0) { return null; }
+                }
+                if (!LspSession.AppendRenameEdits(output, document.Str("uri", ""), entry.Get("edits"), version)) { return null; }
             }
         }
-        return outp;
+        return output;
+    }
+
+    /// 保留原文换行；返回 -1 表示越界或 UTF-16 列切在代理对中间。
+    static int PositionOffset(string text, LspPosition position) {
+        if (position == null || position.line < 0 || position.character < 0) { return -1; }
+        int start = 0;
+        for (int line = 0; line < position.line; line = line + 1) {
+            int next = text.IndexOf("\n", start);
+            if (next < 0) { return -1; }
+            start = next + 1;
+        }
+        int end = text.IndexOf("\n", start);
+        if (end < 0) { end = text.Length; }
+        if (end > start && (text[end - 1] & 255) == 13) { end = end - 1; }
+        string source = text.Substring(start, end - start);
+        int col = CodeEditor.Utf16ColumnToByte(source, position.character);
+        if (CodeEditor.ByteColumnToUtf16(source, col) != position.character) { return -1; }
+        return start + col;
+    }
+
+    /// 全部偏移基于同一原文，排序后倒序应用；重叠/越界使整份文本失败。
+    static LspEditApplication ApplyTextEdits(string text, List<LspRenameEdit> edits, string path) {
+        LspEditApplication result = new LspEditApplication();
+        result.text = text;
+        if (edits == null) { return result; }
+        List<LspEditSpan> spans = new List<LspEditSpan>();
+        for (int i = 0; i < edits.Count; i = i + 1) {
+            LspRenameEdit edit = edits[i];
+            if (edit == null) { return result; }
+            if (!LspSession.SameDocumentPath(edit.path, path)) { continue; }
+            int start = LspSession.PositionOffset(text, edit.start);
+            int end = LspSession.PositionOffset(text, edit.end);
+            if (start < 0 || end < start) { return result; }
+            LspEditSpan span = new LspEditSpan();
+            span.start = start; span.end = end; span.newText = edit.newText;
+            int at = 0;
+            while (at < spans.Count && (spans[at].start > start
+                || (spans[at].start == start && spans[at].end > end))) { at = at + 1; }
+            spans.Insert(at, span);
+        }
+        for (int i = 1; i < spans.Count; i = i + 1) {
+            if (spans[i].end > spans[i - 1].start) { return result; }
+        }
+        string output = text;
+        for (int i = 0; i < spans.Count; i = i + 1) {
+            LspEditSpan span = spans[i];
+            output = output.Substring(0, span.start) + span.newText
+                + output.Substring(span.end, output.Length - span.end);
+        }
+        result.valid = true;
+        result.text = output;
+        return result;
+    }
+
+    static bool SameDocumentPath(string left, string right) {
+        left = left.Replace("\\", "/");
+        right = right.Replace("\\", "/");
+        #if WINDOWS
+        left = left.ToLower(); right = right.ToLower();
+        #endif
+        return left == right;
     }
 
     /// Hover text for the symbol at the position ("" when none).
     string Hover(string path, int line0, int col0) {
+        int version = this.DocVersion(path);
         string m = this.RequestWait("textDocument/hover",
-            LspSession.PosParams(path, line0, col0));
-        if (m.Length == 0) { return ""; }
+            this.DocPosParams(path, line0, col0));
+        if (m.Length == 0 || this.DocVersion(path) != version) { return ""; }
         LspHoverResult r = Json.Deserialize<LspHoverResult>(m);
         if (r == null || r.result == null) { return ""; }
         JsonValue contents = r.result.Get("contents");
         if (contents == null) { return ""; }
-        return contents.Str("value", "");
+        return LspSession.MarkupText(contents);
     }
 
     /// Semantic completion items at the position (empty list when none).
     List<LspCompletionItem> Completion(string path, int line0, int col0) {
         List<LspCompletionItem> empty = new List<LspCompletionItem>();
+        int version = this.DocVersion(path);
         string m = this.RequestWait("textDocument/completion",
-            LspSession.PosParams(path, line0, col0));
-        if (m.Length == 0) { return empty; }
-        LspCompletionsResult r = Json.Deserialize<LspCompletionsResult>(m);
-        if (r == null || r.result == null) { return empty; }
-        return r.result;
+            this.DocPosParams(path, line0, col0));
+        if (m.Length == 0 || this.DocVersion(path) != version) { return empty; }
+        JsonValue root = JsonValue.ParseLenient(m);
+        JsonValue result = root != null ? root.Get("result") : null;
+        if (result == null) { return empty; }
+        if (result.IsObject()) { result = result.Get("items"); }
+        if (result == null || !result.IsArray()) { return empty; }
+        for (int i = 0; i < result.Count(); i = i + 1) {
+            LspCompletionItem item = Json.Deserialize<LspCompletionItem>(result.At(i).ToJson());
+            if (item != null) { empty.Add(item); }
+        }
+        return empty;
     }
 
     /// Signature help for the call at the position (null when none).
     LspSignatureHelp SignatureHelp(string path, int line0, int col0) {
+        int version = this.DocVersion(path);
         string m = this.RequestWait("textDocument/signatureHelp",
-            LspSession.PosParams(path, line0, col0));
-        if (m.Length == 0) { return null; }
+            this.DocPosParams(path, line0, col0));
+        if (m.Length == 0 || this.DocVersion(path) != version) { return null; }
         LspSignatureHelpResult r = Json.Deserialize<LspSignatureHelpResult>(m);
         if (r == null || r.result == null) { return null; }
         return r.result;
@@ -436,7 +708,7 @@ class LspSession {
     List<string> FoldingRanges(string path) {
         List<string> outp = new List<string>();
         LspDocParams p = new LspDocParams();
-        p.textDocument = LspSession.UriObj(path);
+        p.textDocument = this.DocUriObj(path);
         string m = this.RequestWait("textDocument/foldingRange",
             Json.Serialize<LspDocParams>(p));
         if (m.Length == 0) { return outp; }
@@ -482,27 +754,25 @@ class LspSession {
             string ch = path.Substring(i, 1);
             if (ch == "\\") { p = p + "/"; } else { p = p + ch; }
         }
-        if (p.Length > 0 && p.Substring(0, 1) == "/") { return "file://" + p; }
+        // URL 编码器按表单编码空格；文件 URI 保留路径分隔符并使用 %20。
+        p = Encoding.UrlEncode(p).Replace("+", "%20").Replace("%2f", "/").Replace("%3a", ":");
+        if (p.StartsWith("//")) { return "file:" + p; }
+        if (p.StartsWith("/")) { return "file://" + p; }
         return "file:///" + p;
     }
 
     static string UriToPath(string uri) {
-        string p = uri;
-        if (p.Length > 8 && p.Substring(0, 8) == "file:///") { p = p.Substring(8, p.Length - 8); }
-        else if (p.Length > 7 && p.Substring(0, 7) == "file://") { p = p.Substring(7, p.Length - 7); }
+        if (!uri.StartsWith("file://")) { return ""; }
+        string p = uri.Substring(7);
+        if (p.StartsWith("localhost/")) { p = p.Substring(9); }
+        else if (!p.StartsWith("/")) { p = "//" + p; }
         // %3A -> ':' (some servers percent-encode the drive colon)
-        string res = "";
-        int i = 0;
-        while (i < p.Length) {
-            if (i + 3 <= p.Length && (p.Substring(i, 3) == "%3A" || p.Substring(i, 3) == "%3a")) {
-                res = res + ":";
-                i = i + 3;
-            } else {
-                res = res + p.Substring(i, 1);
-                i = i + 1;
-            }
-        }
-        return res;
+        // 文件路径里的 '+' 是字面量，不能按表单解码为空格。
+        p = Encoding.UrlDecode(p.Replace("+", "%2b"));
+        if (p.Length >= 3 && (p[0] & 255) == 47 && (p[2] & 255) == 58
+            && (((p[1] & 255) >= 65 && (p[1] & 255) <= 90)
+                || ((p[1] & 255) >= 97 && (p[1] & 255) <= 122))) { p = p.Substring(1); }
+        return p;
     }
 
     // ---- transport ----
@@ -515,157 +785,387 @@ class LspSession {
         #endif
     }
 
-    byte[] BuildAddr(int port) {
-        byte[] addr = new byte[16];
-        #if MACOS
-        addr[0] = 16;
-        addr[1] = 2;
-        #else
-        addr[0] = 2;
-        addr[1] = 0;
-        #endif
-        int nport = ws_htons(port);
-        addr[2] = (byte)(nport & 255);
-        addr[3] = (byte)((nport >> 8) & 255);
-        int ip = ws_inet_addr("127.0.0.1");
-        addr[4] = (byte)(ip & 255);
-        addr[5] = (byte)((ip >> 8) & 255);
-        addr[6] = (byte)((ip >> 16) & 255);
-        addr[7] = (byte)((ip >> 24) & 255);
-        return addr;
-    }
+    static int RecvTimeoutMs() { return 250; }
+    static int RequestWaits() { return 60; }
+    static int PollIoBudget() { return 8; }
+    static int PollFrameBudget() { return 16; }
+    static int MaxFrameBytes() { return 16777216; }
+    static int MaxQueuedBytes() { return 33554432; }
+    static int SendStallMs() { return LspSession.RequestWaits() * LspSession.RecvTimeoutMs(); }
 
-    void SendAll(string data) {
-        int total = strlen(data);
-        int off = 0;
-        while (off < total) {
-            string chunk = data;
-            if (off > 0) { chunk = data.Substring(off, total - off); }
-            int n = ws_send(this.sock, chunk, total - off, 0);
-            if (n <= 0) { this.alive = false; return; }
-            off = off + n;
+    void Disconnect() {
+        if (sock >= 0) { Socket.Close(sock); sock = -1; }
+        alive = false;
+        generation = generation + 1;
+        rbuf = "";
+        if (sendQueue != null) { sendQueue.Clear(); }
+        queuedBytes = 0;
+        if (boundEditor != null) { boundEditor.ResetSemanticProviders(); }
+        if (pending != null) {
+            List<int> ids = pending.Keys;
+            for (int i = 0; i < ids.Count; i = i + 1) {
+                pending[ids[i]].state = LspPendingState.Error;
+            }
+            pending.Clear();
         }
+        if (cache != null) { cache.Clear(); }
     }
 
-    void SendMsg(string body) {
-        string msg = "Content-Length: " + Convert.ToString(strlen(body))
-            + "\r\n\r\n" + body;
-        this.SendAll(msg);
+    static bool RetrySocket() {
+        // Send/Recv 的 raw API 不缓存错误；必须紧跟失败点捕获。
+        Socket.CaptureLastError();
+        int error = Socket.LastSocketError();
+        #if WINDOWS
+        return error == 10035 || error == 10004;
+        #else
+        return error == 11 || error == 35 || error == 4;
+        #endif
+    }
+
+    void SendMsg(string body, int requestId = 0) {
+        if (!alive) { return; }
+        string data = "Content-Length: " + Convert.ToString(body.Length) + "\r\n\r\n" + body;
+        if (!nonBlocking) {
+            // 只有 initialize 握手允许同步传输；日常请求只保存 frame。
+            int offset = 0;
+            while (offset < data.Length) {
+                int n = Socket.Send(sock, data.Substring(offset), data.Length - offset);
+                if (n <= 0) { Disconnect(); return; }
+                offset = offset + n;
+            }
+            return;
+        }
+        if (data.Length > LspSession.MaxQueuedBytes() - queuedBytes) { Disconnect(); return; }
+        if (sendQueue.Count == 0) { sendProgressMs = Stopwatch.GetMilliseconds(); }
+        LspSendFrame frame = new LspSendFrame();
+        frame.data = data;
+        frame.offset = 0;
+        frame.requestId = requestId;
+        sendQueue.Add(frame);
+        queuedBytes = queuedBytes + data.Length;
+    }
+
+    bool DropUnsentRequest(int requestId) {
+        for (int i = 0; i < sendQueue.Count; i = i + 1) {
+            LspSendFrame frame = sendQueue[i];
+            if (frame.requestId == requestId && frame.offset == 0) {
+                queuedBytes = queuedBytes - frame.data.Length;
+                sendQueue.RemoveAt(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void FlushSendQueue() {
+        if (sendQueue.Count > 0 && Stopwatch.GetMilliseconds() - sendProgressMs >= LspSession.SendStallMs()) {
+            Disconnect(); return;
+        }
+        for (int i = 0; alive && sendQueue.Count > 0 && i < LspSession.PollIoBudget(); i = i + 1) {
+            bool writable = Socket.IsWritable(sock);
+                        if (!writable) { return; }
+            LspSendFrame frame = sendQueue[0];
+            int remaining = frame.data.Length - frame.offset;
+            int count = remaining < 65536 ? remaining : 65536;
+                        int n = Socket.Send(sock, frame.data.Substring(frame.offset, count), count);
+            if (n < 0 && LspSession.RetrySocket()) { return; }
+            if (n <= 0) { Disconnect(); return; }
+            frame.offset = frame.offset + n;
+            queuedBytes = queuedBytes - n;
+            sendProgressMs = Stopwatch.GetMilliseconds();
+            if (frame.offset == frame.data.Length) {
+                sendQueue.RemoveAt(0);
+            }
+        }
     }
 
     void Notify(string method, string paramsJson) {
         LspNotification o = new LspNotification();
         o.jsonrpc = "2.0";
         o.method = method;
-        if (paramsJson.Length > 0) {
-            o.params = JsonValue.ParseLenient(paramsJson);
-        }
+        if (paramsJson.Length > 0) { o.params = JsonValue.ParseLenient(paramsJson); }
         this.SendMsg(Json.Serialize<LspNotification>(o));
     }
 
-    /// Sends a request and blocks until its response arrives (notifications
-    /// such as publishDiagnostics that arrive in between are skipped).
+    LspPendingRequest NewRequest(string method) {
+        LspPendingRequest request = new LspPendingRequest();
+        request.id = seq;
+        seq = seq + 1;
+        request.method = method;
+        request.generation = generation;
+        request.state = LspPendingState.Pending;
+        request.message = "";
+        request.hover = "";
+        request.deadline = Stopwatch.GetMilliseconds() + waitBudget * LspSession.RecvTimeoutMs();
+        pending[request.id] = request;
+        return request;
+    }
+
+    void SendRequest(LspPendingRequest request, string paramsJson) {
+        LspRequest envelope = new LspRequest();
+        envelope.jsonrpc = "2.0";
+        envelope.id = request.id;
+        envelope.method = request.method;
+        if (paramsJson.Length > 0) { envelope.params = JsonValue.ParseLenient(paramsJson); }
+        this.SendMsg(Json.Serialize<LspRequest>(envelope), request.id);
+    }
+
+    /// 显式导航等待也分发所有 ID，不会吞掉在途的日常提示响应。
     string RequestWait(string method, string paramsJson) {
-        if (!this.alive) { return ""; }
-        int id = this.seq;
-        this.seq = this.seq + 1;
-        LspRequest o = new LspRequest();
-        o.jsonrpc = "2.0";
-        o.id = id;
-        o.method = method;
-        if (paramsJson.Length > 0) {
-            o.params = JsonValue.ParseLenient(paramsJson);
+        if (!alive) { return ""; }
+        LspPendingRequest request = NewRequest(method);
+        SendRequest(request, paramsJson);
+        WaitRequest(request);
+        return request.state == LspPendingState.Ready ? request.message : "";
+    }
+
+    void WaitRequest(LspPendingRequest request) {
+        if (!alive || request == null) { return; }
+        while (alive && request.state == LspPendingState.Pending) {
+            Poll();
+            if (request.state == LspPendingState.Pending) { SnoozeMs(2); }
         }
-        this.SendMsg(Json.Serialize<LspRequest>(o));
-        this.waitsLeft = this.waitBudget;
-        int guard = 0;
-        while (guard < 100000) {
-            guard = guard + 1;
-            string m = this.ReadMsg();
-            if (m.Length == 0) { return ""; }
-            if (DebugSession.IndexOf(m, "\"id\":" + Convert.ToString(id), 0) >= 0
-                && DebugSession.IndexOf(m, "\"result\"", 0) >= 0) {
-                return m;
-            }
+    }
+
+    /// 只取完整 frame；分片头、分片 body 和后续 frame 一律留在 rbuf。
+    string TakeFrame() {
+        int headerEnd = rbuf.IndexOf("\r\n\r\n");
+        if (headerEnd < 0) {
+            if (rbuf.Length > 8192) { Disconnect(); }
+            return "";
         }
-        return "";
+        if (headerEnd > 8192) { Disconnect(); return ""; }
+        int length = DebugSession.HeaderLen(rbuf.Substring(0, headerEnd));
+        if (length <= 0 || length > LspSession.MaxFrameBytes()) { Disconnect(); return ""; }
+        int start = headerEnd + 4;
+        if (rbuf.Length - start < length) { return ""; }
+        string message = rbuf.Substring(start, length);
+        rbuf = rbuf.Substring(start + length);
+        return message;
     }
 
-    /// One blocking recv's worth of milliseconds. Short enough that the IDE
-    /// notices a wedged server quickly, long enough that a busy one still wins.
-    static int RecvTimeoutMs() { return 250; }
-
-    /// Recv timeouts one request may absorb (250ms each) before falling back.
-    static int RequestWaits() { return 24; }
-
-    /// Bounds every blocking recv so the UI thread cannot park in the kernel
-    /// forever when the server stops answering.
-    void SetRecvTimeout(int ms) {
-        #if WINDOWS
-        // Winsock takes a DWORD of milliseconds.
-        byte[] v = new byte[4];
-        v[0] = (byte)(ms & 255);
-        v[1] = (byte)((ms >> 8) & 255);
-        v[2] = (byte)((ms >> 16) & 255);
-        v[3] = (byte)((ms >> 24) & 255);
-        ws_setsockopt(this.sock, 65535, 4102, v, 4);
-        #else
-        // POSIX takes a struct timeval { time_t sec; suseconds_t usec; }.
-        byte[] v = new byte[16];
-        int us = (ms % 1000) * 1000;
-        v[0] = (byte)((ms / 1000) & 255);
-        v[8] = (byte)(us & 255);
-        v[9] = (byte)((us >> 8) & 255);
-        v[10] = (byte)((us >> 16) & 255);
-        v[11] = (byte)((us >> 24) & 255);
-        ws_setsockopt(this.sock, 1, 20, v, 16);
-        #endif
-    }
-
-    string RecvChunk() {
-        int cap = 65536;
-        byte[] buf = new byte[cap + 1];
-        int n = ws_recv(this.sock, buf, cap, 0);
-        this.lastRecv = n;
-        if (n <= 0) { return ""; }
-        return buf.ToStr(0, n);
-    }
-
-    string ReadMsg() {
-        int guard = 0;
-        while (guard < 1000000) {
-            guard = guard + 1;
-            int he = DebugSession.IndexOf(this.rbuf, "\r\n\r\n", 0);
-            if (he >= 0) {
-                string header = this.rbuf.Substring(0, he);
-                int cl = DebugSession.HeaderLen(header);
-                int start = he + 4;
-                if (cl >= 0 && this.rbuf.Length >= start + cl) {
-                    string body = this.rbuf.Substring(start, cl);
-                    int rest = this.rbuf.Length - start - cl;
-                    this.rbuf = this.rbuf.Substring(start + cl, rest);
-                    return body;
+    void DispatchResponse(string message) {
+        JsonValue root = null;
+        try { root = JsonValue.ParseLenient(message); } catch (Exception) { return; }
+        if (root == null || !root.IsObject()) { return; }
+        JsonValue id = root.Get("id");
+                if (id == null || !id.IsInt() || !pending.ContainsKey(id.AsInt(-1))) { return; }
+        LspPendingRequest request = pending[id.AsInt(-1)];
+        pending.Remove(request.id);
+        if (Stopwatch.GetMilliseconds() >= request.deadline) {
+            request.state = LspPendingState.Timeout;
+            return;
+        }
+        if (root.Has("error") || !root.Has("result")) {
+            request.state = LspPendingState.Error;
+            return;
+        }
+        request.state = LspPendingState.Ready;
+        if (request.editor == null) { request.message = message; return; }
+        JsonValue result = root.Get("result");
+        if (request.method == "textDocument/completion") {
+            request.completions = new List<LspCompletionItem>();
+            if (result != null && result.IsObject()) { result = result.Get("items"); }
+            if (result != null && result.IsArray()) {
+                for (int i = 0; i < result.Count(); i = i + 1) {
+                    LspCompletionItem item = Json.Deserialize<LspCompletionItem>(result.At(i).ToJson());
+                    if (item != null) { request.completions.Add(item); }
                 }
             }
-            string chunk = this.RecvChunk();
-            if (chunk.Length == 0) {
-                if (this.lastRecv == 0) { this.alive = false; return ""; }
-                // Timed out: the server is alive but has not answered yet.
-                this.waitsLeft = this.waitsLeft - 1;
-                if (this.waitsLeft <= 0) { return ""; }
+            if (request.completions.Count == 0) { request.state = LspPendingState.Empty; }
+        } else if (request.method == "textDocument/signatureHelp") {
+            if (result != null && result.IsObject()) {
+                request.signature = Json.Deserialize<LspSignatureHelp>(result.ToJson());
+            }
+            if (request.signature == null || request.signature.signatures == null
+                || request.signature.signatures.Count == 0) { request.state = LspPendingState.Empty; }
+        } else if (request.method == "textDocument/hover") {
+            if (result != null && result.IsObject()) { request.hover = LspSession.MarkupText(result.Get("contents")); }
+            if (request.hover.Length == 0) { request.state = LspPendingState.Empty; }
+        }
+        RefreshEditor(request);
+    }
+
+    /// 单 UI 线程调用：每拍最多 8 次收/发和 16 个完整响应，不等待网络。
+    void Poll() {
+        if (!alive || polling) { return; }
+        polling = true;
+        CancelStaleEditorRequests();
+        if (nonBlocking) { FlushSendQueue(); }
+        int frames = 0;
+        int reads = 0;
+        while (alive && frames < LspSession.PollFrameBudget()) {
+            string message = TakeFrame();
+            if (message.Length > 0) {
+                frames = frames + 1;
+                try { DispatchResponse(message); } catch (Exception) { }
                 continue;
             }
-            this.rbuf = this.rbuf + chunk;
+            bool readable = Socket.IsReadable(sock);
+            if (!readable) {
+                                break;
+            }
+            if (!alive || reads >= LspSession.PollIoBudget()) { break; }
+            reads = reads + 1;
+            byte[] buffer = new byte[65536];
+            int n = Socket.Recv(sock, buffer, buffer.Length);
+                        if (n < 0 && LspSession.RetrySocket()) { break; }
+            if (n <= 0) { Disconnect(); break; }
+            rbuf = rbuf + buffer.ToStr(0, n);
         }
-        return "";
+        long now = Stopwatch.GetMilliseconds();
+        List<int> ids = pending.Keys;
+        for (int i = ids.Count - 1; i >= 0; i = i - 1) {
+            LspPendingRequest request = pending[ids[i]];
+            if (now >= request.deadline) {
+                request.state = LspPendingState.Timeout;
+                pending.Remove(request.id);
+                DropUnsentRequest(request.id);
+            }
+        }
+        TrimTerminalCache();
+        polling = false;
+    }
+
+    void TrimTerminalCache() {
+        int terminalCount = 0;
+        for (int i = 0; i < cache.Count; i = i + 1) {
+            if (cache[i].state != LspPendingState.Pending) { terminalCount = terminalCount + 1; }
+        }
+        // 保留最近 64 个终态抑制重复查询，pending 不能因缓存上限被移除。
+        int index = 0;
+        while (terminalCount > 64 && index < cache.Count) {
+            if (cache[index].state == LspPendingState.Pending) { index = index + 1; }
+            else { cache.RemoveAt(index); terminalCount = terminalCount - 1; }
+        }
+    }
+
+    void CancelStaleEditorRequests() {
+        List<int> ids = pending.Keys;
+        for (int i = ids.Count - 1; i >= 0; i = i - 1) {
+            LspPendingRequest request = pending[ids[i]];
+            CodeEditor editor = request.editor;
+            if (editor == null) { continue; }
+            bool keep = (editor == boundEditor && request.generation == generation
+                && request.documentGeneration == documentGeneration && DocVersion(request.path) == request.version
+                && editor.documentPath == request.path && editor.TextStamp() == request.stamp
+                && editor.CurLine() == request.caretLine && editor.CurCol() == request.caretCol
+                && editor.GetText() == request.text
+                && (request.method != "textDocument/completion"
+                    || editor.SemanticCompletionToken() == request.completionToken));
+
+            if (keep) { continue; }
+            request.state = LspPendingState.Cancelled;
+            pending.Remove(request.id);
+            cache.Remove(request);
+            editor.ClearSemanticTextMemo(request.method, request.path, request.stamp,
+                request.line, request.col, request.name);
+            if (!DropUnsentRequest(request.id)) {
+                JsonValue cancellation = JsonValue.NewObject();
+                cancellation.PutInt("id", request.id);
+                Notify("$/cancelRequest", cancellation.ToJson());
+            }
+        }
+    }
+
+    bool HasPendingWork() {
+        if (!alive) { return false; }
+        if (sendQueue.Count > 0 || pending.Count > 0) { return true; }
+        // 完整缓冲响应需要下一拍；无人等待的半包不能造成永久唤醒。
+        int headerEnd = rbuf.IndexOf("\r\n\r\n");
+        if (headerEnd < 0) { return false; }
+        int length = DebugSession.HeaderLen(rbuf.Substring(0, headerEnd));
+        return length <= 0 || rbuf.Length - headerEnd - 4 >= length;
+    }
+
+    bool ConsumeEditorRefresh() {
+        bool changed = editorRefreshNeeded;
+        editorRefreshNeeded = false;
+        return changed;
+    }
+
+    LspPendingRequest CachedRequest(CodeEditor editor, string method, string path,
+        int line, int col, string name) {
+        if (!alive || editor != boundEditor || path != editor.documentPath
+            || line < 0 || line >= editor.LineCount() || col < 0 || col > editor.LineAt(line).Length) { return null; }
+        string text = editor.GetText();
+        SyncDoc(path, text);
+        CancelStaleEditorRequests();
+        int version = DocVersion(path);
+        LspPendingRequest request = null;
+        for (int i = 0; i < cache.Count; i = i + 1) {
+            LspPendingRequest candidate = cache[i];
+            if (candidate.method == method && candidate.path == path && candidate.line == line
+                && candidate.col == col && candidate.name == name && candidate.version == version
+                && candidate.generation == generation && candidate.documentGeneration == documentGeneration) {
+                request = candidate;
+                break;
+            }
+        }
+                if (request == null) {
+            request = NewRequest(method);
+            request.path = path;
+            request.name = name;
+            request.line = line;
+            request.col = col;
+            request.version = version;
+            request.documentGeneration = documentGeneration;
+            cache.Add(request);
+            SendRequest(request, DocPosParams(path, line, col));
+        }
+        request.editor = editor;
+        request.text = text;
+        request.stamp = editor.TextStamp();
+        request.caretLine = editor.CurLine();
+        request.caretCol = editor.CurCol();
+        request.completionToken = editor.SemanticCompletionToken();
+        // pending 和空/失败终态只用于去重，provider 只读取已就绪的结果。
+        return request.state == LspPendingState.Ready ? request : null;
+    }
+
+    void RefreshEditor(LspPendingRequest request) {
+        CodeEditor editor = request.editor;
+        if (editor == null || editor != boundEditor || request.generation != generation
+            || request.documentGeneration != documentGeneration || DocVersion(request.path) != request.version
+            || editor.documentPath != request.path || editor.TextStamp() != request.stamp
+            || editor.CurLine() != request.caretLine || editor.CurCol() != request.caretCol
+            || editor.GetText() != request.text) { return; }
+        if (editor.RefreshSemanticResult(request.method, request.path, request.stamp,
+            request.line, request.col, request.name, request.completionToken)) {
+            editorRefreshNeeded = true;
+        }
+    }
+
+    static string MarkupText(JsonValue value) {
+        if (value == null) { return ""; }
+        if (value.IsString()) { return value.AsString(""); }
+        if (value.IsArray()) {
+            List<string> parts = new List<string>();
+            for (int i = 0; i < value.Count(); i = i + 1) {
+                parts.Add(LspSession.MarkupText(value.At(i)));
+            }
+            return string.Join("\n", parts);
+        }
+        return value.Str("value", "");
     }
 
     /// 把当前 LSP 会话挂载到 CodeEditor 上，接管智能补全与参数签名帮助
     void BindToEditor(CodeEditor editor) {
         if (editor == null) { return; }
+        if (boundEditor != null) { boundEditor.CancelSemanticCompletion(); }
+        boundEditor = editor;
+        generation = generation + 1;
+        cache.Clear();
+        editor.ResetSemanticProviders();
         LspSession self = this;
         editor.externalCompletion = (string path, int line0, int col0) => {
-            List<LspCompletionItem> items = self.Completion(path, line0, col0);
+            string text = editor.GetText();
+            int stamp = editor.TextStamp();
+            LspPendingRequest request = self.CachedRequest(editor, "textDocument/completion", path, line0, col0, "");
+            List<LspCompletionItem> items = request != null ? request.completions : null;
+            if (editor.documentPath != path || editor.TextStamp() != stamp
+                || editor.CurLine() != line0 || editor.CurCol() != col0
+                || editor.GetText() != text) { return null; }
             if (items == null || items.Count == 0) { return null; }
             List<CodeCompletionItem> res = new List<CodeCompletionItem>();
             for (int i = 0; i < items.Count; i = i + 1) {
@@ -674,18 +1174,68 @@ class LspSession {
                 else if (items[i].kind == 5) { k = "F"; }
                 else if (items[i].kind == 10) { k = "P"; }
                 else if (items[i].kind == 14) { k = "K"; }
-                res.Add(new CodeCompletionItem(items[i].label, k, items[i].detail, ""));
+                // 客户端未声明 snippetSupport，不能把占位符作为普通文本插入。
+                if (items[i].insertTextFormat == 2) { continue; }
+                CodeCompletionItem item = new CodeCompletionItem(items[i].label, k,
+                    items[i].detail, LspSession.MarkupText(items[i].documentation));
+                item.insertText = items[i].insertText != null ? items[i].insertText : "";
+                JsonValue edit = items[i].textEdit;
+                if (edit != null && !edit.IsNull()) {
+                    JsonValue range = edit.Get("range");
+                    if (range == null) { range = edit.Get("replace"); }
+                    if (range == null || !range.IsObject()) { continue; }
+                    JsonValue start = range.Get("start");
+                    JsonValue end = range.Get("end");
+                    JsonValue newText = edit.Get("newText");
+                    if (start == null || end == null || !start.IsObject() || !end.IsObject()
+                        || newText == null || !newText.IsString()) { continue; }
+                    item.startLine = start.Int("line", -1);
+                    item.endLine = end.Int("line", -1);
+                    // Completion 的编辑范围必须在请求行内并包含请求光标。
+                    if (item.startLine != line0 || item.endLine != line0) { continue; }
+                    string line = editor.LineAt(line0);
+                    int startUtf16 = start.Int("character", -1);
+                    int endUtf16 = end.Int("character", -1);
+                    int lineUtf16 = CodeEditor.ByteColumnToUtf16(line, line.Length);
+                    if (startUtf16 < 0 || endUtf16 < startUtf16 || endUtf16 > lineUtf16) { continue; }
+                    item.startCol = CodeEditor.Utf16ColumnToByte(line, startUtf16);
+                    item.endCol = CodeEditor.Utf16ColumnToByte(line, endUtf16);
+                    if (CodeEditor.ByteColumnToUtf16(line, item.startCol) != startUtf16
+                        || CodeEditor.ByteColumnToUtf16(line, item.endCol) != endUtf16
+                        || item.startCol > col0 || item.endCol < col0) { continue; }
+                    item.hasTextEdit = true;
+                    item.insertText = edit.Str("newText", "");
+                }
+                res.Add(item);
             }
             return res;
         };
         editor.externalSignature = (string path, int line0, int col0, string callee) => {
-            LspSignatureHelp sh = self.SignatureHelp(path, line0, col0);
+            string text = editor.GetText();
+            int stamp = editor.TextStamp();
+            LspPendingRequest request = self.CachedRequest(editor, "textDocument/signatureHelp", path, line0, col0, callee);
+            LspSignatureHelp sh = request != null ? request.signature : null;
+            if (editor.documentPath != path || editor.TextStamp() != stamp
+                || editor.CurLine() != line0 || editor.CurCol() != col0
+                || editor.GetText() != text) { return ""; }
             if (sh == null || sh.signatures == null || sh.signatures.Count == 0) {
                 return "";
             }
             int actSig = sh.activeSignature;
             if (actSig < 0 || actSig >= sh.signatures.Count) { actSig = 0; }
             return sh.signatures[actSig].label;
+        };
+        editor.externalHover = (string path, int line0, int col0, string word) => {
+            string text = editor.GetText();
+            int stamp = editor.TextStamp();
+            int caretLine = editor.CurLine();
+            int caretCol = editor.CurCol();
+            LspPendingRequest request = self.CachedRequest(editor, "textDocument/hover", path, line0, col0, word);
+            string hover = request != null ? request.hover : "";
+            if (editor.documentPath != path || editor.TextStamp() != stamp
+                || editor.CurLine() != caretLine || editor.CurCol() != caretCol
+                || editor.GetText() != text) { return ""; }
+            return hover;
         };
     }
 }

@@ -44,11 +44,27 @@ class LegacyFormDoc {
     List<FormFieldDoc> fields;
 }
 
+class IdeDefinitionCaret {
+    string body;
+    string word;
+    int line;
+    int column;
+}
+
+class IdeRenameDocument {
+    string path;
+    string originalText;
+    string newText;
+    TabRecord tab;
+    int version;
+}
+
 /// ZanIDE part: code navigation (go to definition / find references,
 /// text-scan fallback + LSP-backed), the code outline, and the designer
 /// <-> code form serialization (.html model + code-behind emitter).
 partial class ZanIDE {
     // ---- code navigation (go to definition / find references) ----
+    static IdeDefinitionCaret definitionCaret;
 
     static string RTrimS(string s) {
         int e = s.Length;
@@ -463,6 +479,10 @@ partial class ZanIDE {
     /// caret in the destination line's indentation, so the next command asked
     /// about whatever word the line started with instead of the symbol.
     static int ColOfWordAt(string body, int ln, string word) {
+        // shell 的 ApplyGotoResult 仍用此接口；一次性消费已验证的语义目标列。
+        IdeDefinitionCaret caret = ZanIDE.definitionCaret;
+        ZanIDE.definitionCaret = null;
+        if (caret != null && caret.body == body && caret.line == ln && caret.word == word) { return caret.column; }
         if (word.Length == 0) { return 0; }
         List<string> ls = CodeEditor.SplitLines(body);
         if (ln < 0 || ln >= ls.Count) { return 0; }
@@ -750,35 +770,57 @@ partial class ZanIDE {
     /// binder/checker accuracy), with the text-scan heuristic as fallback.
     static int GoToDefinitionSmart(LspSession lsp, CodeEditor editor, List<TabRecord> tabs,
                                    SignalInt active, string root, List<string> log) {
+        ZanIDE.definitionCaret = null;
         int a = active.Get();
         // The server indexes the project root only; querying it about a file
         // outside that root (a stdlib source, say) costs a round trip that can
         // never answer, so go straight to the text scan there.
-        bool inRoot = a >= 0 && a < tabs.Count
-            && ZanIDE.NormPath(tabs[a].path).StartsWith(ZanIDE.NormPath(root));
+        string normalizedRoot = ZanIDE.NormPath(root);
+        while (normalizedRoot.EndsWith("/")) { normalizedRoot = normalizedRoot.Substring(0, normalizedRoot.Length - 1); }
+        bool inRoot = a >= 0 && a < tabs.Count && normalizedRoot.Length > 0
+            && ZanIDE.NormPath(tabs[a].path).StartsWith(normalizedRoot + "/");
         if (lsp != null && lsp.Alive() && inRoot && tabs[a].path.Length > 0) {
-            tabs[a].body = editor.GetText();
-            lsp.SyncDoc(tabs[a].path, tabs[a].body);
-            string hit = lsp.Definition(tabs[a].path, editor.CurLine(), editor.CurCol());
-            int sep = ZanIDE.IndexOfStr(hit, "\t");
-            if (sep > 0) {
-                string defPath = hit.Substring(0, sep);
-                int ln = ZanIDE.ParseInt(hit.Substring(sep + 1, hit.Length - sep - 1));
-                if (ZanIDE.SamePath(defPath, tabs[a].path)) {
-                    log.Add("> Definition at line " + Convert.ToString(ln + 1) + " (this file).");
-                    return ln;
-                }
-                for (int ti = 0; ti < tabs.Count; ti = ti + 1) {
-                    if (ZanIDE.SamePath(defPath, tabs[ti].path)) {
-                        active.Set(ti);
-                        log.Add("> Definition in " + tabs[ti].name + " at line " + Convert.ToString(ln + 1) + ".");
-                        return ln;
+            string source = editor.GetText();
+            int stamp = editor.TextStamp();
+            int line = editor.CurLine();
+            int col = editor.CurCol();
+            string word = editor.WordAtCaret();
+            TabRecord origin = tabs[a];
+            origin.body = source;
+            List<IdeRenameDocument> snapshots = ZanIDE.SyncNavigationDocuments(lsp, tabs);
+            LspDefinitionTarget hit = lsp.Definition(origin.path, line, col);
+            if (active.Get() != a || a >= tabs.Count || tabs[a] != origin
+                || editor.TextStamp() != stamp || editor.GetText() != source
+                || editor.CurLine() != line || editor.CurCol() != col
+                || !ZanIDE.NavigationDocumentsCurrent(lsp, tabs, snapshots)) {
+                log.Add("> Go to Definition: document changed during request.");
+                return -1;
+            }
+            if (hit != null) {
+                int target = ZanIDE.FindNavigationTab(tabs, hit.path);
+                string body = target >= 0 ? tabs[target].body : "";
+                if (target < 0 && File.Exists(hit.path)) { body = File.ReadAllText(hit.path); }
+                List<string> ls = CodeEditor.SplitLines(body);
+                if (hit.line >= 0 && hit.line < ls.Count) {
+                    int byteCol = CodeEditor.Utf16ColumnToByte(ls[hit.line], hit.column);
+                    if (CodeEditor.ByteColumnToUtf16(ls[hit.line], byteCol) == hit.column
+                        && (target >= 0 || File.Exists(hit.path))) {
+                        if (target < 0) {
+                            ZanIDE.OpenPath(tabs, active, hit.path, Path.GetFileName(hit.path));
+                            target = active.Get();
+                        } else { active.Set(target); }
+                        if (target >= 0 && target < tabs.Count && tabs[target].body == body) {
+                            IdeDefinitionCaret caret = new IdeDefinitionCaret();
+                            caret.body = body; caret.word = word;
+                            caret.line = hit.line; caret.column = byteCol;
+                            ZanIDE.definitionCaret = caret;
+                            tabs[target].caretLine = hit.line;
+                            tabs[target].caretCol = byteCol;
+                            log.Add("> Definition in " + tabs[target].name + " at line "
+                                + Convert.ToString(hit.line + 1) + ".");
+                            return hit.line;
+                        }
                     }
-                }
-                if (File.Exists(defPath)) {
-                    ZanIDE.OpenPath(tabs, active, defPath, Path.GetFileName(defPath));
-                    log.Add("> Definition in " + Path.GetFileName(defPath) + " at line " + Convert.ToString(ln + 1) + ".");
-                    return ln;
                 }
             }
         }
@@ -1114,11 +1156,50 @@ partial class ZanIDE {
         return s.Substring(i, s.Length - i);
     }
 
+    static int FindNavigationTab(List<TabRecord> tabs, string path) {
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            if (LspSession.SameDocumentPath(tabs[i].path, path)) { return i; }
+        }
+        return -1;
+    }
+
+    /// 请求前同步每个打开的源码缓冲区，各自版本与原文用实体记录。
+    static List<IdeRenameDocument> SyncNavigationDocuments(LspSession lsp, List<TabRecord> tabs) {
+        List<IdeRenameDocument> snapshots = new List<IdeRenameDocument>();
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            TabRecord tab = tabs[i];
+            if (tab.path.Length == 0 || tab.designDoc || !tab.path.ToLower().EndsWith(".zan")) { continue; }
+            lsp.SyncDoc(tab.path, tab.body);
+            IdeRenameDocument snapshot = new IdeRenameDocument();
+            snapshot.path = tab.path; snapshot.originalText = tab.body;
+            snapshot.tab = tab; snapshot.version = lsp.DocVersion(tab.path);
+            snapshots.Add(snapshot);
+        }
+        return snapshots;
+    }
+
+    static bool NavigationDocumentsCurrent(LspSession lsp, List<TabRecord> tabs, List<IdeRenameDocument> snapshots) {
+        int sourceTabs = 0;
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            if (tabs[i].path.Length > 0 && !tabs[i].designDoc && tabs[i].path.ToLower().EndsWith(".zan")) {
+                sourceTabs = sourceTabs + 1;
+            }
+        }
+        if (sourceTabs != snapshots.Count) { return false; }
+        for (int i = 0; i < snapshots.Count; i = i + 1) {
+            IdeRenameDocument snapshot = snapshots[i];
+            int tab = ZanIDE.FindNavigationTab(tabs, snapshot.path);
+            if (tab < 0 || tabs[tab] != snapshot.tab || tabs[tab].body != snapshot.originalText
+                || lsp.DocVersion(snapshot.path) != snapshot.version) { return false; }
+        }
+        return true;
+    }
+
     /// Rename Symbol (F2) backed by zan-lsp: the server answers with a
     /// project-wide WorkspaceEdit, so occurrences in files that were never
     /// opened are rewritten on disk too. Open tabs are edited in their buffers
-    /// (save to persist); everything else is written immediately. Falls back to
-    /// the buffer-only textual rename when no language server is available.
+    /// (save to persist); everything else is written immediately.
+    /// 无有效语义结果时拒绝修改，文本替换无法区分同名但不同绑定的符号。
     static int RenameSymbolSmart(LspSession lsp, CodeEditor editor,
                                  List<TabRecord> tabs, SignalInt active,
                                  List<string> log, string word, string newName) {
@@ -1126,68 +1207,92 @@ partial class ZanIDE {
         int a = active.Get();
         if (lsp == null || !lsp.Alive() || a < 0 || a >= tabs.Count
             || tabs[a].path.Length == 0) {
-            return ZanIDE.RenameSymbol(editor, tabs, active, log, word, newName);
+            log.Add("> Rename: semantic service unavailable; no files changed.");
+            return 0;
+        }
+        string source = editor.GetText();
+        int stamp = editor.TextStamp();
+        int line = editor.CurLine();
+        int col = editor.CurCol();
+        TabRecord origin = tabs[a];
+        origin.body = source;
+        List<IdeRenameDocument> snapshots = ZanIDE.SyncNavigationDocuments(lsp, tabs);
+        List<LspRenameEdit> edits = lsp.Rename(origin.path, line, col, newName);
+        if (active.Get() != a || a >= tabs.Count || tabs[a] != origin
+            || editor.TextStamp() != stamp || editor.GetText() != source
+            || editor.CurLine() != line || editor.CurCol() != col
+            || !ZanIDE.NavigationDocumentsCurrent(lsp, tabs, snapshots)) {
+            log.Add("> Rename: document changed during request; no files changed.");
+            return 0;
+        }
+        if (edits == null || edits.Count == 0) {
+            log.Add("> Rename: no valid semantic edits; no files changed.");
+            return 0;
         }
 
-        tabs[a].body = editor.GetText();
-        lsp.SyncDoc(tabs[a].path, tabs[a].body);
-        List<string> rows = lsp.Rename(tabs[a].path, editor.CurLine(),
-            editor.CurCol(), newName);
-        if (rows.Count == 0) {
-            return ZanIDE.RenameSymbol(editor, tabs, active, log, word, newName);
-        }
-
-        // Group the edits by file, keeping the server's ascending order.
+        // 按文件先准备和验证整批编辑，再改缓冲区或磁盘，避免半份重命名。
+        List<IdeRenameDocument> plans = new List<IdeRenameDocument>();
         List<string> files = new List<string>();
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            string fp = ZanIDE.RenameRowPath(rows[i]);
-            if (fp != "" && ZanIDE.IndexOfPath(files, fp) < 0) { files.Add(fp); }
+        for (int i = 0; i < edits.Count; i = i + 1) {
+            string path = edits[i].path;
+            if (ZanIDE.IndexOfPath(files, path) >= 0) { continue; }
+            files.Add(path);
+            int tab = ZanIDE.FindNavigationTab(tabs, path);
+            if (tab < 0 && !File.Exists(path)) {
+                log.Add("> Rename: target file unavailable; no files changed."); return 0;
+            }
+            string text = tab >= 0 ? tabs[tab].body : File.ReadAllText(path);
+            if (!lsp.DocTextMatches(path, text)) {
+                log.Add("> Rename: target differs from synchronized text; no files changed."); return 0;
+            }
+            LspEditApplication applied = ZanIDE.ApplyRenameEdits(text, edits, path);
+            if (!applied.valid) {
+                log.Add("> Rename: invalid or overlapping edit ranges; no files changed."); return 0;
+            }
+            IdeRenameDocument plan = new IdeRenameDocument();
+            plan.path = path; plan.originalText = text; plan.newText = applied.text;
+            plan.tab = tab >= 0 ? tabs[tab] : null;
+            plan.version = lsp.DocVersion(path);
+            plans.Add(plan);
+        }
+        for (int i = 0; i < plans.Count; i = i + 1) {
+            IdeRenameDocument plan = plans[i];
+            int tab = ZanIDE.FindNavigationTab(tabs, plan.path);
+            bool current = plan.tab != null
+                ? tab >= 0 && tabs[tab] == plan.tab && tabs[tab].body == plan.originalText
+                : tab < 0 && File.Exists(plan.path) && File.ReadAllText(plan.path) == plan.originalText;
+            if (!current || lsp.DocVersion(plan.path) != plan.version) {
+                log.Add("> Rename: target changed before apply; no files changed."); return 0;
+            }
         }
 
         int bufs = 0;
         int disk = 0;
-        int fi = 0;
-        while (fi < files.Count) {
-            string fp = files[fi];
-            int tab = ZanIDE.FindTabByPath(tabs, fp);
-            string text = "";
-            if (tab >= 0) {
-                text = tabs[tab].body;
-            } else if (File.Exists(fp)) {
-                text = File.ReadAllText(fp);
+        bool activeChanged = false;
+        for (int i = 0; i < plans.Count; i = i + 1) {
+            IdeRenameDocument plan = plans[i];
+            if (plan.newText == plan.originalText) { continue; }
+            if (plan.tab != null) {
+                if (plan.tab == origin) { editor.SaveUndo(); activeChanged = true; }
+                plan.tab.body = plan.newText;
+                bufs = bufs + 1;
             } else {
-                fi = fi + 1;
-                continue;
+                File.WriteAllText(plan.path, plan.newText);
+                disk = disk + 1;
             }
-            string nt = ZanIDE.ApplyRenameEdits(text, rows, fp, word, newName);
-            if (nt != text) {
-                if (tab >= 0) {
-                    tabs[tab].body = nt;
-                    bufs = bufs + 1;
-                } else {
-                    File.WriteAllText(fp, nt);
-                    disk = disk + 1;
-                }
-            }
-            fi = fi + 1;
         }
-
-        if (a >= 0 && a < tabs.Count) {
-            int keepLine = editor.CurLine();
-            editor.LoadText(tabs[a].body);
-            editor.GoToLine(keepLine);
+        if (activeChanged) {
+            editor.LoadText(origin.body);
+            editor.GoToLine(line);
+        }
+        for (int i = 0; i < plans.Count; i = i + 1) {
+            IdeRenameDocument plan = plans[i];
+            if (plan.newText != plan.originalText) { lsp.SyncDoc(plan.path, plan.newText); }
         }
         log.Add("> Renamed '" + word + "' -> '" + newName + "' (semantic): "
             + Convert.ToString(bufs) + " open tab(s), "
             + Convert.ToString(disk) + " file(s) on disk.");
         return bufs + disk;
-    }
-
-    /// Path part of a "path\tline\tcol" rename row.
-    static string RenameRowPath(string row) {
-        int sep = ZanIDE.IndexOfStr(row, "\t");
-        if (sep <= 0) { return ""; }
-        return row.Substring(0, sep);
     }
 
     /// Index of `path` in `paths` comparing with SamePath, or -1.
@@ -1198,39 +1303,9 @@ partial class ZanIDE {
         return 0 - 1;
     }
 
-    /// Applies the rename rows belonging to `path` to `text`. Rows are walked
-    /// back to front so an earlier edit never shifts a later column, and a row
-    /// is only honoured when `word` really sits at its position (a stale
-    /// position from an edit that raced the request is skipped, not corrupted).
-    static string ApplyRenameEdits(string text, List<string> rows, string path,
-                                   string word, string newName) {
-        List<string> ls = CodeEditor.SplitLines(text);
-        for (int i = rows.Count - 1; i >= 0; i = i - 1) {
-            string row = rows[i];
-            int s1 = ZanIDE.IndexOfStr(row, "\t");
-            if (s1 > 0 && ZanIDE.SamePath(row.Substring(0, s1), path)) {
-                string rest = row.Substring(s1 + 1, row.Length - s1 - 1);
-                int s2 = ZanIDE.IndexOfStr(rest, "\t");
-                if (s2 > 0) {
-                    int ln = ZanIDE.ParseInt(rest.Substring(0, s2));
-                    int co = ZanIDE.ParseInt(rest.Substring(s2 + 1, rest.Length - s2 - 1));
-                    if (ln >= 0 && ln < ls.Count && co >= 0
-                        && co + word.Length <= ls[ln].Length
-                        && ls[ln].Substring(co, word.Length) == word) {
-                        string line = ls[ln];
-                        ls[ln] = line.Substring(0, co) + newName
-                            + line.Substring(co + word.Length,
-                                line.Length - co - word.Length);
-                    }
-                }
-            }
-        }
-        string outp = "";
-        for (int k = 0; k < ls.Count; k = k + 1) {
-            if (k > 0) { outp = outp + "\n"; }
-            outp = outp + ls[k];
-        }
-        return outp;
+    /// 按服务端完整 range/newText 应用语义编辑；非法范围使整份文本失败。
+    static LspEditApplication ApplyRenameEdits(string text, List<LspRenameEdit> edits, string path) {
+        return LspSession.ApplyTextEdits(text, edits, path);
     }
 
     /// Rename Symbol (F2): whole-word, comment/string-aware rename of the

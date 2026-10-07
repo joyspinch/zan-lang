@@ -178,6 +178,7 @@ partial class ZanIDE {
     /// events addressed to other windows, handle the debug shortcuts, pump
     /// the secondary windows and rescan the tree when requested.
     void FrameTick() {
+        this.SyncEditorDocument();
         // Advance any active AI automation script (ZAN_UI_SCRIPT). This
         // it injects synthetic events this loop then polls & dispatches.
         FilePicker.lang = ZanIDE.uiLang;
@@ -524,6 +525,11 @@ partial class ZanIDE {
         }
         // 商业插件使用账目：攒批/到点异步上报一轮（fire-and-forget，失败留队）。
         PluginUsage.Poll();
+        if (lspSess != null && lspSess.Alive()) {
+            lspSess.Poll();
+            if (lspSess.ConsumeEditorRefresh()) { app.RequestRedraw(); }
+            if (lspSess.HasPendingWork()) { app.RequestAnimationFrame(16); }
+        }
         app.PerfMark("sh.children");
 
         // Deferred AI-settings open (see aiCfgPending). Creating a top-level
@@ -766,6 +772,7 @@ partial class ZanIDE {
             // polled for outside changes a few times a second.
             this.TrackOpenTabs();
             this.PollDiskChanges();
+            this.SyncEditorDocument();
 
             this.SyncEditorTabs();
             editorTabs.Select(activeTab.Get());
@@ -799,10 +806,14 @@ partial class ZanIDE {
                 // Only sync editor text for code tabs; design tabs are owned by
                 // the designer and must not be overwritten with editor contents.
                 if (lastActive >= 0 && lastActive < tabs.Count
+                    && tabs[lastActive].path == editor.documentPath
                     && !ZanIDE.IsFormPath(tabs[lastActive].path)
                     && !tabs[lastActive].designDoc
                     && !ZanIDE.IsScenePath(tabs[lastActive].path)) {
                     tabs[lastActive].body = editor.GetText();
+                    if (lspSess != null && lspSess.Alive()) {
+                        lspSess.SyncDoc(tabs[lastActive].path, tabs[lastActive].body);
+                    }
                     // Leaving a tab remembers where it was being read.
                     tabs[lastActive].caretLine = editor.CurLine();
                     tabs[lastActive].caretCol = editor.CurCol();
@@ -1161,6 +1172,7 @@ partial class ZanIDE {
                 else { editor.SetDebugVars(new List<DbgVar>()); }
                 ZanIDE.ApplyEditorTheme(app, editor, edThemeIdx, edFontPx);
                 editor.Render(app, edRect);
+                this.SyncEditorDocument();
                 // Publish live editor state to the AI automation driver
                 // (ZAN_UI_SCRIPT) so scripts can assert buffer/caret and the
                 // completion popup without screen-scraping. Inert otherwise.
@@ -2619,6 +2631,7 @@ partial class ZanIDE {
             // top of everything they would otherwise hide behind.
             Tooltip.Flush(app);
             app.EndIdScope();
+            if (lspSess != null && lspSess.HasPendingWork()) { app.RequestAnimationFrame(16); }
         } catch (Exception frameEx) {
             app.NoteFrameError("ide-frame", frameEx.Message);
             app.CancelPartialFrame();
@@ -2738,6 +2751,29 @@ partial class ZanIDE {
                 this.RefreshFoldRanges();
             }
         }
+    }
+
+    string syncedEditorPath;
+    int syncedEditorStamp;
+    LspSession syncedEditorSession;
+
+    /// 关闭/保存/切换可能先改活动下标，旧缓冲须按实际文档路径同步。
+    void SyncEditorDocument() {
+        if (editor == null || !DocBaseline.IsFileTab(editor.documentPath)) { return; }
+        int i = lastActive;
+        if (i < 0 || i >= tabs.Count || tabs[i].path != editor.documentPath
+            || tabs[i].designDoc || ZanIDE.IsFormPath(tabs[i].path)
+            || ZanIDE.IsScenePath(tabs[i].path)) { return; }
+        int stamp = editor.TextStamp();
+        if (syncedEditorPath == editor.documentPath && syncedEditorStamp == stamp
+            && syncedEditorSession == lspSess) { return; }
+        tabs[i].body = editor.GetText();
+        if (lspSess != null && lspSess.Alive()) {
+            lspSess.SyncDoc(tabs[i].path, tabs[i].body);
+        }
+        syncedEditorPath = editor.documentPath;
+        syncedEditorStamp = stamp;
+        syncedEditorSession = lspSess;
     }
 
     /// 把当前代码标签页的折叠区间从 zan-lsp 拉给编辑器

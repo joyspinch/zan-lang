@@ -2507,6 +2507,13 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
 
 ## 编译期生成器（GenRoute/GenDb）：合成源码的三类坑（2026-09-25）
 
+- **Controller 纯基类必须显式声明为 abstract**（2026-09-25 实证）：GenRoute
+  识别控制器的规则是 `cls.Bool("abstract", false)` 返回 false 时，只要以 `Controller`
+  结尾或继承 `Controller` 就会被视为具体控制器。若框架抽象基类（如 `AppController`、
+  `AdminController`）未加 `abstract` 修饰符，其内部暴露给派生类继承的公开方法与
+  生命周期钩子（如 `OnBeforeAsync`、`InAny` 等）会被自动注册为公网路由（例如
+  `/zanweb/app/onbeforeasync`），导致意外暴露未防护端点。所有不承载独立路由的
+  控制器外壳/脚手架基类必须显式声明为 `abstract class`。
 - **表单类绑定不得写静态字段**：GenRoute 对类参数逐字段生成
   `sc.<F> = __c.InInt(...)`，genmeta 字段元数据带 `"static"` 布尔
   （genmeta.c），绑定循环必须先跳过它，否则合成源码必炸（静态字段经
@@ -3041,3 +3048,9 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
 - **EH 临时栈注册条目必须带对 flavour，字符串走 plain push 会段错误**（2026-10-06 B-ID113）：`emit_eh_tmp_push` 的 plain 对象 flavour 走 `rel_dyn`/`zan_rt_release_dyn`，它假定对象带分配头；Zan string/delegate/数组若是裸指针没有头，抛异常清栈时直接崩（concat 抛出探针 rc=139 就是这么来的）。非 OBJ 类型必须镜像 `emit_call_arg_eh_push`：entry alloca + 存值 + `emit_eh_tmp_push_slot(slot, eh_slot_kind_of(t))`；配对的普通路径弹出用 `emit_eh_tmp_pop` 计数弹（drop-by-identity 只置空不弹栈，LIFO 深度会错位）。新注册点先想清楚操作数的静态类型，`eh_slot_kind_of` 是唯一权威。
 - **fork 到 exec 之间只准 async-signal-safe，malloc 会死锁**（2026-10-06 B-ID114）：多线程父进程 fork 后，子进程内 malloc 可能拿到一把「持锁线程已不存在」的 arena 锁直接死锁——POSIX 只保证 fork/exec 间隙的 async-signal-safe 函数。argv 一类 exec 参数必须在 fork 前在父进程建好，子进程只 exec；父进程 fork 后即可 free（子用的是 COW 拷贝）。同类：read/waitpid 把 EINTR 当终局会把健康流剪断（capture 循环曾把信号中断当 EOF 截断输出），读循环必须显式重试 EINTR；reactor 内部 fd（epoll/kqueue/eventfd/唤醒管道）建好立刻 FD_CLOEXEC，否则子进程继承唤醒管道写端，shutdown 等不到 EOF。
 - **协程池门的握手必须 lock-free，锁拦不住无锁 CAS**（2026-10-06 B-ID114）：io_wake→zan_co_ready→co_pool_ensure 在 poll 循环的 shard 锁内运行，所以（a）任何「先 g_inj_lock 再 shard 锁」的路径（如 sched_run 尾部持 injector 锁调 zan_io_shutdown）都与它反序，可能死锁；（b）ensure 的门变迁本身是无锁 CAS，持锁者拦不住并发 start——shutdown 与 pool start 的互斥只能靠对同一个门（g_co_pool_live）做 CAS 占用：先 claim（0→1）再放 fg 标志，输家直接退出；后台池创建计数要按实际创建数（made）发布，发布 w 而有创建失败时 retire 永远减不到 0，g_co_pool_live 永不清零，后续任务全部搁浅。
+
+## zan-lsp 智能感知：列缺失的位置查找与 file:// URI 往返（2026-10-07，LspSession 集成实测）
+
+- **位置型符号查找必须带真实光标列，col<0 会掉进"名字下水道"**：`intel_position_in` 对 col<0 一律返回 true（为无列调用留的兼容分支），于是 `intel_method_at`/`intel_resolve_type_at` 在无列时匹配该行**所有**方法、最小跨距者胜——同一行上更早的小方法体（如 `void Pick(string s) {}`）把后面方法的参数全部判为不可见，查找落进项目索引的按名首中（任意索引文件里第一个同名符号），hover/补全/goto-def 整条线给出无关结果。实测：探针里 `a.` 补全返回另一类的 VennCircle 成员，根因是补全走了无列的 resolve_type_at。修法：hover/补全/定义/重命名的位置参数全部透传真实 (line, character)；接收者链解析（`a.Visible`）先按接收者类型找成员，按名兜底放最后。
+- **file:// URI 不做 percent decode/encode，跨文件智能感知静默全废**：客户端发来的 rootUri/textDocument.uri 是 percent-encoded（空格 %20、中文 %E4..、字面 % 是 %25）；不 decode 就当磁盘路径用 → 工作区与依赖文件从未被索引，补全/悬浮全部退化成按名匹配，且无任何报错。回写 Location/Rename 的 uri 时要 encode（unreserved 与 `/`、`:` 直通，十六进制大写）。decode/encode 只实现一份、全仓复用：曾有 uri_to_fspath 的第二份拷贝漏掉解码规则，同文件两种行为；same_uri_ci 比较前双方先 decode。
+- **冷启动的 initialize 是同步索引，超时要按 tens-of-seconds 放**：zan-lsp 应答 initialize 前同步索引工具链 stdlib 与包，实测 ~22s（构建竞争下更慢）；测试/探针把读超时设 20s 会把慢应答误判成挂死。另：didOpen/didChange 是通知没有应答，探针按请求 id 等回复时别把它们当请求发。
