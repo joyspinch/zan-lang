@@ -523,6 +523,7 @@ static void extract_chain_expr(const char *text, size_t offset,
     size_t start = end;
     int paren_depth = 0;
     int angle_depth = 0;
+    int bracket_depth = 0;
 
     while (start > 0) {
         char ch = text[start - 1];
@@ -532,13 +533,22 @@ static void extract_chain_expr(const char *text, size_t offset,
         } else if (ch == '(') {
             if (paren_depth > 0) { paren_depth--; start--; }
             else break;
+        } else if (ch == ']') {
+            /* `items[Index()]` / `map["a"][0]`: subscripts belong to the
+             * receiver chain like calls do */
+            bracket_depth++;
+            start--;
+        } else if (ch == '[') {
+            if (bracket_depth > 0) { bracket_depth--; start--; }
+            else break;
         } else if (ch == '>') {
             angle_depth++;
             start--;
         } else if (ch == '<') {
             if (angle_depth > 0) { angle_depth--; start--; }
             else break;
-        } else if (ch == '.' && paren_depth == 0 && angle_depth == 0) {
+        } else if (ch == '.' && paren_depth == 0 && angle_depth == 0 &&
+                   bracket_depth == 0) {
             start--;
         } else if (ch == '"' || ch == '\'') {
             /* A string/char literal chain root: consume back to the opening
@@ -549,8 +559,8 @@ static void extract_chain_expr(const char *text, size_t offset,
             if (start > 0) start--;
         } else if ((is_ident_char(ch) || ch == '_') && paren_depth == 0 && angle_depth == 0) {
             start--;
-        } else if (paren_depth > 0 || angle_depth > 0) {
-            /* Inside parens/angles, accept anything */
+        } else if (paren_depth > 0 || angle_depth > 0 || bracket_depth > 0) {
+            /* Inside parens/angles/brackets, accept anything */
             start--;
         } else {
             break;
@@ -1290,19 +1300,25 @@ static void ensure_stdlib_indexed(lsp_server_t *s) {
 static void ensure_project_indexed(lsp_server_t *s) {
     if (s->project_indexed) return;
     s->project_indexed = true;
-    if (!s->workspace_root[0]) return;
 
     if (!g_project_intel) {
         g_project_intel = (intellisense_t *)malloc(sizeof(intellisense_t));
         if (!g_project_intel) return;
         intel_init(g_project_intel);
     }
-    intel_index_project(g_project_intel, s->workspace_root);
-    if (intel_cancel_flag) {
-        /* Aborted mid-scan by $/cancelRequest: retry from scratch on the
-         * next request rather than trusting a partial index. */
-        s->project_indexed = false;
-        return;
+    /* No workspace root: still keep the aggregate index alive — every
+     * open/change feeds it (update_project_index), so cross-file member
+     * chains and statics between open documents keep working (tests, and
+     * clients that open files without a root). Only the disk scan is
+     * workspace-bound. */
+    if (s->workspace_root[0]) {
+        intel_index_project(g_project_intel, s->workspace_root);
+        if (intel_cancel_flag) {
+            /* Aborted mid-scan by $/cancelRequest: retry from scratch on the
+             * next request rather than trusting a partial index. */
+            s->project_indexed = false;
+            return;
+        }
     }
     ensure_stdlib_indexed(s);
 }
@@ -1325,6 +1341,12 @@ static void handle_did_open(lsp_server_t *s, json_value *params) {
     const char *text = json_get_str(json_obj_get(td, "text"));
     if (!uri || !text) return;
     lsp_set_doc(s, uri, text);
+
+    /* the open version anchors didChange staleness checks */
+    json_value *ver_j = json_obj_get(td, "version");
+    int over = ver_j ? (int)json_get_num(ver_j, 0) : 0;
+    lsp_doc_t *d = lsp_find_doc(s, uri);
+    if (d && over > 0) d->version = over;
 
     /* Index the project on first file open */
     ensure_project_indexed(s);
@@ -1379,6 +1401,13 @@ static void handle_did_change(lsp_server_t *s, json_value *params) {
     int n = json_arr_count(changes);
     if (n <= 0) return;
 
+    /* Versions are monotonic per document: a change whose version is not
+     * newer than the last applied one is the client racing itself (a retried
+     * change, or an undo that re-sent an older edit). Applying it would roll
+     * the document text back, so drop it. */
+    json_value *ver_j = json_obj_get(td, "version");
+    int incoming = ver_j ? (int)json_get_num(ver_j, 0) : 0;
+
     lsp_doc_t *d = lsp_find_doc(s, uri);
     if (!d) {
         /* Edit for a document we never saw opened: recover from a
@@ -1395,12 +1424,13 @@ static void handle_did_change(lsp_server_t *s, json_value *params) {
         }
         if (!d) return;
     } else {
+        if (incoming > 0 && incoming <= d->version) return;
         /* LSP: changes apply in order, each to the result of the previous */
         for (int i = 0; i < n; i++)
             lsp_doc_apply_change(d, json_arr_at(changes, i));
     }
 
-    d->version++;
+    d->version = incoming > 0 ? incoming : d->version + 1;
     d->last_change_ms = lsp_now_ms();
     d->diag_pending = true;
 
@@ -1510,8 +1540,66 @@ static bool get_position(json_value *params, const char **uri,
     return *uri != NULL;
 }
 
-static void handle_completion(lsp_server_t *s, json_value *id, json_value *params) {
-    const char *uri; int line, character;
+/* Member completion for `x.` where x is a `var` local whose initializer the
+ * doc engine could not type at parse time because the provider class lives
+ * in another file (`var product = ProjectFactory.Fetch();`). The initializer
+ * is re-resolved against the aggregate index at request time, so a provider
+ * edit under any URI alias retypes the receiver immediately. */
+static int complete_var_init_members(const lsp_doc_t *doc, intellisense_t *is,
+                                     const char *name, int line, int character,
+                                     const char *prefix) {
+    if (!g_project_intel || !doc || !is || !name[0]) return 0;
+    const isym_t *sym = intel_lookup_symbol_at(is, name, line, character);
+    if (!sym || sym->kind != ISYM_VARIABLE) return 0;
+    if (sym->type_name[0] && strcmp(sym->type_name, "var") != 0) return 0;
+
+    size_t i = pos_to_offset(doc->text, sym->line, sym->col);
+    while (doc->text[i] && doc->text[i] != '=') i++;
+    if (!doc->text[i]) return 0;
+    i++;
+    while (doc->text[i] == ' ' || doc->text[i] == '\t') i++;
+    size_t e = i, pd = 0, bd = 0, ad = 0;
+    char q = 0;
+    while (doc->text[e]) {
+        char ch = doc->text[e];
+        if (q) {
+            if (ch == '\\' && doc->text[e + 1]) e++;
+            else if (ch == q) q = 0;
+            e++;
+            continue;
+        }
+        if (ch == '"' || ch == '\'') { q = ch; e++; continue; }
+        if (ch == '(') pd++;
+        else if (ch == ')') { if (pd) pd--; }
+        else if (ch == '[') bd++;
+        else if (ch == ']') { if (bd) bd--; }
+        else if (ch == '<' && !pd && !bd) ad++;
+        else if (ch == '>' && !pd && !bd) { if (ad) ad--; }
+        else if ((ch == ';' || ch == ',') && !pd && !bd && !ad) break;
+        e++;
+    }
+    while (e > i && (doc->text[e - 1] == ' ' || doc->text[e - 1] == '\t')) e--;
+    if (e <= i || e - i >= 256) return 0;
+    char init[256];
+    memcpy(init, doc->text + i, e - i);
+    init[e - i] = '\0';
+
+    char fm[64];
+    /* the resolver treats everything after the last dot as the completion
+     * prefix, not a chain segment — append a dot so the final call is
+     * resolved for its return type */
+    char dotted[300];
+    snprintf(dotted, sizeof(dotted), "%s.", init);
+    const char *ct = intel_resolve_chain_pos(is, g_project_intel, dotted, fm,
+                                             sizeof(fm), sym->line, sym->col);
+    if ((!ct || !ct[0]) && g_project_intel)
+        ct = intel_resolve_chain_pos(g_project_intel, NULL, dotted, fm,
+                                     sizeof(fm), sym->line, sym->col);
+    if (!ct || !ct[0] || strcmp(ct, "var") == 0) return 0;
+    return intel_complete_members_pos(is, ct, prefix, line, character);
+}
+
+static void handle_completion(lsp_server_t *s, json_value *id, json_value *params) {    const char *uri; int line, character;
     if (!get_position(params, &uri, &line, &character)) {
         send_response(s, id, json_new_null());
         return;
@@ -1523,10 +1611,6 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
     char prefix[128], context[128];
     prefix_before(doc->text, off, prefix, sizeof(prefix));
     member_context(doc->text, off, context, sizeof(context));
-    if (getenv("ZAN_LSP_DUMP_SYMS")) {
-        fprintf(stderr, "COMPLETION line=%d char=%d off=%zu prefix='%s' context='%s'\n",
-                line, character, off, prefix, context);
-    }
 
     /* intellisense_t is large (~2 MB); keep it off the stack. The engine is
      * cached per (uri, doc version) and reused across requests instead of
@@ -1574,7 +1658,16 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
         }
 
         if (resolve_type[0]) {
-            count = intel_complete_members_at(is, resolve_type, effective, line);
+            /* column-aware: mid-line a same-named inner local may shadow the
+             * receiver, or an expired block local must not resolve at all —
+             * the col-less resolution would answer for the whole line */
+            count = intel_complete_members_pos(is, resolve_type, effective,
+                                               line, character);
+            if (count == 0 && strncmp(context, "CHAIN:", 6) != 0) {
+                /* cross-file `var` initializer: see complete_var_init_members */
+                count = complete_var_init_members(doc, is, context, line,
+                                                  character, effective);
+            }
             /* Augment with project-wide members of the same type. The
              * receiver name must be resolved against the OPEN DOCUMENT
              * first — handing the raw name to the project index resolves
@@ -1612,7 +1705,10 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
             }
         }
     } else if (!ns_mode && effective[0]) {
-        count = intel_complete(is, effective, NULL);
+        /* column-aware bare-prefix completion: a block local must show up
+         * inside its block and vanish the moment the block closes, even
+         * when everything shares one physical line */
+        count = intel_complete_pos(is, effective, NULL, line, character);
         /* Supplement with project-wide symbols if we have few results.
          * The enclosing class comes from the live buffer: designer-projected
          * widget fields live only in the index as members of the partial
@@ -1796,8 +1892,23 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
             rt = intel_resolve_chain_pos(g_project_intel, is, chain,
                                          fm, sizeof(fm), line, character);
         }
-        if (rt && rt[0] && g_project_intel)
+        if (rt && rt[0] && g_project_intel) {
             intel_goto_member(g_project_intel, rt, word, &g);
+        }
+    }
+    if (!g.found) {
+        /* scope-aware local: shadowing and block expiry are column-sensitive
+         * on a same-line block (`} same` is the outer local again), so the
+         * lexical lookup with the real column wins before any name-only
+         * walk — which would answer with the first same-named symbol in the
+         * file (often a field) regardless of scope */
+        const isym_t *loc = intel_lookup_symbol_at(is, word, line, character);
+        if (loc && (loc->kind == ISYM_VARIABLE || loc->kind == ISYM_PARAMETER)) {
+            g.found = true;
+            g.line = loc->line;
+            g.col = loc->col;
+            g.file[0] = '\0'; /* same document */
+        }
     }
     if (!g.found)
         g = intel_goto_def(is, word);
@@ -1819,7 +1930,7 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
     }
     bool same_doc = same_uri_ci(target_uri, uri);
     int dl, dc;
-    if (same_doc) {
+    if (same_doc || (g.file[0] && lsp_find_doc(s, target_uri))) {
         dl = g.line;
         dc = g.col;
     } else {
@@ -1845,8 +1956,75 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
     send_response(s, id, loc);
 }
 
-/* Scan document text for whole-word occurrences of `word`, skipping string and
- * char literals and line/block comments so matches are real code references. */
+/* Scan document text for whole-word occurrences of `word`, skipping plain
+ * string/char literals and line/block comments so matches are real code
+ * references. Interpolated strings ($"...", with nested holes) contribute
+ * the identifiers inside their {holes}: those are code — {{ and }} are
+ * escaped braces, and everything after `:` or `,` inside a hole is format
+ * text, not expression. */
+static void scan_string_refs(const char *text, size_t *ip, const char *word,
+                             size_t wlen, size_t *offsets, int *count,
+                             int max, int depth) {
+    size_t i = *ip;
+    char q = text[i];
+    bool interp = false;
+    if (q == '"' && depth < 4) {
+        size_t b = i;
+        if (b > 0 && text[b - 1] == '$') interp = true;
+        else if (b > 1 && ((text[b - 1] == '@' && text[b - 2] == '$') ||
+                           (text[b - 1] == '$' && text[b - 2] == '@')))
+            interp = true;
+    }
+    i++;
+    if (!interp) {
+        while (text[i] && text[i] != q) {
+            if (text[i] == '\\' && text[i + 1]) i++;
+            i++;
+        }
+        if (text[i]) i++;
+        *ip = i;
+        return;
+    }
+    /* interpolated: {hole} contents are code. The loop must not stop at a
+     * bare `"` — inside a hole that quote opens a nested string (recurse);
+     * only a `"` at hole==0 closes this string. */
+    int hole = 0;
+    bool fmt = false;
+    while (text[i]) {
+        char d = text[i];
+        if (hole == 0) {
+            if (d == '"') break; /* real closing quote */
+            if (d == '{') {
+                if (text[i + 1] == '{') { i += 2; continue; } /* escaped */
+                hole = 1;
+                fmt = false;
+                i++;
+                continue;
+            }
+            i++;
+            continue;
+        }
+        if (d == '}') { hole = 0; fmt = false; i++; continue; }
+        if (d == '"' || d == '\'') {
+            scan_string_refs(text, &i, word, wlen, offsets, count, max, depth + 1);
+            continue;
+        }
+        if (!fmt && (d == ':' || d == ',')) { fmt = true; i++; continue; }
+        if (!fmt && is_ident_char(d) && (i == 0 || !is_ident_char(text[i - 1]))) {
+            size_t j = i;
+            while (text[j] && is_ident_char(text[j])) j++;
+            if ((j - i) == wlen && strncmp(text + i, word, wlen) == 0 &&
+                *count < max)
+                offsets[(*count)++] = i;
+            i = j;
+            continue;
+        }
+        i++;
+    }
+    if (text[i]) i++;
+    *ip = i;
+}
+
 static int find_text_references(const char *text, const char *word,
                                 size_t *offsets, int max) {
     int count = 0;
@@ -1867,13 +2045,7 @@ static int find_text_references(const char *text, const char *word,
             continue;
         }
         if (c == '"' || c == '\'') {
-            char q = c;
-            i++;
-            while (text[i] && text[i] != q) {
-                if (text[i] == '\\' && text[i + 1]) i++;
-                i++;
-            }
-            if (text[i]) i++;
+            scan_string_refs(text, &i, word, wlen, offsets, &count, max, 0);
             continue;
         }
         if (is_ident_char(c) && (i == 0 || !is_ident_char(text[i - 1]))) {
@@ -1978,6 +2150,242 @@ static int add_locations(json_value *arr, const char *uri,
     return n;
 }
 
+/* Two resolved type names name the same type when their simple names
+ * (namespace, generics and arrays stripped) match — the same pairing
+ * intel_member_sym uses to walk a receiver type to its declaring class. */
+static bool type_simple_same(const char *a, const char *b) {
+    char sa[128], sb[128];
+    snprintf(sa, sizeof(sa), "%s", a ? a : "");
+    snprintf(sb, sizeof(sb), "%s", b ? b : "");
+    sa[strcspn(sa, "<?")] = '\0';
+    sb[strcspn(sb, "<?")] = '\0';
+    const char *pa = strrchr(sa, '.'); pa = pa ? pa + 1 : sa;
+    const char *pb = strrchr(sb, '.'); pb = pb ? pb + 1 : sb;
+    return strcmp(pa, pb) == 0;
+}
+
+/* The symbol a references/rename request targets, resolved at the cursor:
+ * a member access resolves through the receiver's type, otherwise the word
+ * is looked up scope-aware (a local beats a same-named field only when the
+ * local is actually visible there). Occurrences are then accepted only when
+ * they resolve back to this same target — the textual whole-word walks
+ * would conflate shadowing locals, same-named fields of other classes and
+ * interpolation/literal text. */
+typedef struct {
+    bool ok;
+    bool is_local;
+    char rt_simple[128]; /* member owner, simple name */
+    bool have_decl;
+    char decl_ref[512];  /* declaration file (native path or file://) */
+    int decl_line, decl_col; /* member declaration position */
+    int ldecl_line, ldecl_col; /* local declaration position */
+    const char *origin_uri;
+    char word[128];
+} sym_target_t;
+
+static bool sym_target_is_decl(const sym_target_t *t, const char *doc_uri,
+                               int rl, int rc) {
+    if (t->is_local)
+        return strcmp(doc_uri, t->origin_uri) == 0 &&
+               rl == t->ldecl_line && rc == t->ldecl_col;
+    return t->have_decl && same_uri_ci(doc_uri, t->decl_ref) &&
+           rl == t->decl_line && rc == t->decl_col;
+}
+
+static bool occurrence_matches(const sym_target_t *t, const char *text,
+                               intellisense_t *de, intellisense_t *project,
+                               const char *doc_uri, size_t off, int rl, int rc) {
+    if (t->is_local) {
+        /* a local never escapes its file; identity is its declaration
+         * position, NOT an engine pointer — asking another document for its
+         * engine may evict and rebuild the origin engine mid-request, so
+         * anything captured earlier by address is stale by the time the
+         * per-occurrence checks run */
+        if (!de || strcmp(doc_uri, t->origin_uri) != 0) return false;
+        /* `recv.word` is a member access, never a use of the local — the
+         * lookup here would still return the same-named visible local */
+        if (off > 0 && text[off - 1] == '.') return false;
+        const isym_t *s2 = intel_lookup_symbol_at(de, t->word, rl, rc);
+        return s2 && (s2->kind == ISYM_VARIABLE || s2->kind == ISYM_PARAMETER) &&
+               s2->line == t->ldecl_line && s2->col == t->ldecl_col;
+    }
+    if (sym_target_is_decl(t, doc_uri, rl, rc)) return true;
+    char chain[256];
+    if (receiver_chain_before(text, off, chain, sizeof(chain))) {
+        char fm[64];
+        const char *rt2 = de ? intel_resolve_chain_pos(de, project, chain, fm,
+                                                       sizeof(fm), rl, rc)
+                             : NULL;
+        if ((!rt2 || !rt2[0]) && project)
+            rt2 = intel_resolve_chain_pos(project, de, chain, fm, sizeof(fm),
+                                          rl, rc);
+        if (rt2 && rt2[0] && type_simple_same(rt2, t->rt_simple)) return true;
+    }
+    /* a bare use of a field inside its own class resolves lexically to the
+     * member (the enclosing-type branch of intel_lookup_symbol_at) */
+    if (de) {
+        const isym_t *s2 = intel_lookup_symbol_at(de, t->word, rl, rc);
+        if (s2 && s2->parent[0] && type_simple_same(s2->parent, t->rt_simple))
+            return true;
+    }
+    return false;
+}
+
+static bool resolve_sym_target(intellisense_t *is, intellisense_t *project,
+                               const char *text, size_t off, const char *uri,
+                               const char *word, int line, int character,
+                               sym_target_t *t) {
+    memset(t, 0, sizeof(*t));
+    snprintf(t->word, sizeof(t->word), "%s", word);
+    t->origin_uri = uri;
+
+    /* `receiver.word`: the member of the receiver's type */
+    char chain[256];
+    if (receiver_chain_before(text, off, chain, sizeof(chain))) {
+        char fm[64];
+        const char *rt = is ? intel_resolve_chain_pos(is, project, chain, fm,
+                                                      sizeof(fm), line, character)
+                            : NULL;
+        if ((!rt || !rt[0]) && project)
+            rt = intel_resolve_chain_pos(project, is, chain, fm, sizeof(fm),
+                                         line, character);
+        if (rt && rt[0] && project) {
+            goto_def_t decl;
+            memset(&decl, 0, sizeof(decl));
+            if (intel_goto_member(project, rt, word, &decl) && decl.file[0]) {
+                char duri[512];
+                fspath_to_uri(decl.file, duri, sizeof(duri));
+                t->ok = true;
+                t->is_local = false;
+                snprintf(t->rt_simple, sizeof(t->rt_simple), "%s", rt);
+                t->have_decl = true;
+                snprintf(t->decl_ref, sizeof(t->decl_ref), "%s", duri);
+                t->decl_line = decl.line;
+                t->decl_col = decl.col;
+                return true;
+            }
+        }
+    }
+
+    if (!is) return false;
+    const isym_t *sym = intel_lookup_symbol_at(is, word, line, character);
+    if (!sym) return false;
+    if (sym->kind == ISYM_VARIABLE || sym->kind == ISYM_PARAMETER) {
+        if (sym->line < 0) return false; /* synthesized (implicit setter value) */
+        /* the recorded declaration must really spell the word: a synthesized
+         * symbol points at the property line, not at any declaration of this
+         * name in the text */
+        char dcheck[128];
+        word_at(text, pos_to_offset(text, sym->line, sym->col), dcheck,
+                sizeof(dcheck));
+        if (strcmp(dcheck, word) != 0) return false;
+        t->ok = true;
+        t->is_local = true;
+        t->ldecl_line = sym->line;
+        t->ldecl_col = sym->col;
+        return true;
+    }
+    if ((sym->kind == ISYM_FIELD || sym->kind == ISYM_PROPERTY ||
+         sym->kind == ISYM_EVENT || sym->kind == ISYM_METHOD) &&
+        sym->parent[0]) {
+        /* a member reached without a receiver: its declaration carries the
+         * owner (cursor on the field's own declaration, or a bare use) */
+        t->ok = true;
+        t->is_local = false;
+        snprintf(t->rt_simple, sizeof(t->rt_simple), "%s", sym->parent);
+        t->have_decl = true;
+        {
+            char duri[512];
+            fspath_to_uri(sym->file[0] ? sym->file : uri, duri, sizeof(duri));
+            snprintf(t->decl_ref, sizeof(t->decl_ref), "%s", duri);
+        }
+        t->decl_line = sym->line;
+        t->decl_col = sym->col;
+        return true;
+    }
+    return false;
+}
+
+/* Locations for a resolved target across one document: only occurrences that
+ * resolve back to the target, honoring includeDeclaration. */
+static int add_scoped_locations(json_value *arr, const char *doc_uri,
+                                const char *text, intellisense_t *de,
+                                intellisense_t *project, const sym_target_t *t,
+                                bool include_decl) {
+    size_t offsets[512];
+    int n = find_text_references(text, t->word, offsets, 512);
+    int added = 0;
+    for (int i = 0; i < n; i++) {
+        int rl, rc;
+        offset_to_linecol(text, (int)offsets[i], &rl, &rc);
+        if (!occurrence_matches(t, text, de, project, doc_uri, offsets[i],
+                                rl, rc))
+            continue;
+        if (!include_decl && sym_target_is_decl(t, doc_uri, rl, rc)) continue;
+        json_value *loc = json_new_obj();
+        json_obj_set(loc, "uri", json_new_str(doc_uri));
+        json_value *range = json_new_obj();
+        json_value *start = json_new_obj();
+        json_value *endp  = json_new_obj();
+        json_obj_set(start, "line", json_new_num(rl));
+        json_obj_set(start, "character", json_new_num(rc));
+        json_obj_set(endp, "line", json_new_num(rl));
+        json_obj_set(endp, "character", json_new_num(rc + (int)strlen(t->word)));
+        json_obj_set(range, "start", start);
+        json_obj_set(range, "end", endp);
+        json_obj_set(loc, "range", range);
+        json_arr_add(arr, loc);
+        added++;
+    }
+    return added;
+}
+
+/* Scoped walk over unopened project files. The name-only flood used to
+ * answer these textually; the scoped walk keeps the same per-occurrence
+ * identity by building one process-lifetime scratch engine per file. */
+static intellisense_t *g_unopened_intel = NULL;
+
+typedef struct {
+    json_value *out;      /* locations array (references) or changes object (rename) */
+    const sym_target_t *t;
+    const char *new_name; /* rename mode when non-NULL */
+    bool include_decl;
+    bool covered_decl;
+    intellisense_t *scratch;
+} scoped_unopened_ctx_t;
+
+static json_value *scoped_rename_edits(const char *doc_uri, const char *text,
+                                       intellisense_t *de, intellisense_t *project,
+                                       const sym_target_t *t,
+                                       const char *new_name);
+
+static void scoped_unopened_visit(void *ctx, const char *uri, const char *text) {
+    scoped_unopened_ctx_t *uc = (scoped_unopened_ctx_t *)ctx;
+    if (!uc->scratch) return;
+    intel_clear(uc->scratch);
+    intel_parse_file(uc->scratch, uri, text, strlen(text));
+    if (!uc->t->is_local && uc->t->have_decl &&
+        same_uri_ci(uri, uc->t->decl_ref))
+        uc->covered_decl = true;
+    if (uc->new_name) {
+        json_value *edits = scoped_rename_edits(uri, text, uc->scratch,
+                                                g_project_intel, uc->t,
+                                                uc->new_name);
+        if (edits) json_obj_set(uc->out, uri, edits);
+    } else {
+        add_scoped_locations(uc->out, uri, text, uc->scratch,
+                             g_project_intel, uc->t, uc->include_decl);
+    }
+}
+
+static intellisense_t *unopened_scratch(void) {
+    if (!g_unopened_intel) {
+        g_unopened_intel = (intellisense_t *)malloc(sizeof(*g_unopened_intel));
+        if (g_unopened_intel) intel_init(g_unopened_intel);
+    }
+    return g_unopened_intel;
+}
+
 /* Runs `visit` over every project file that is not currently open, reading it
  * from disk. Open documents are skipped because their in-memory text (which
  * includes unsaved edits) is authoritative. */
@@ -2030,19 +2438,95 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
     word_at(doc->text, off, word, sizeof(word));
     if (!word[0]) { send_response(s, id, json_new_arr()); return; }
 
-    /* scope-aware fast path: a local/parameter cannot escape its method body,
-     * so references are bounded to it — same-named identifiers in other
-     * methods or files are unrelated */
-    int ms = -1, me = -1, dl = -1;
+    /* Symbol-scoped path: locals, fields, properties and methods resolve to
+     * a concrete target at the cursor, and only occurrences that resolve back
+     * to the same target are reported — a textual walk would conflate a
+     * shadowing local, same-named members of other classes and literal text. */
     intellisense_t *is = doc_intel_for(s, uri);
-    if (is && intel_local_extent(is, word, line, &ms, &me, &dl)) {
+    sym_target_t t;
+    bool resolved = resolve_sym_target(is, g_project_intel, doc->text, off, uri, word,
+                                       line, character, &t);
+    if (resolved) {
         json_value *arr = json_new_arr();
-        add_locations(arr, uri, doc->text, word,
-                      ms < dl ? ms : dl, me);
+        bool include_decl = true;
+        json_value *ctxj = json_obj_get(params, "context");
+        if (ctxj) {
+            json_value *idj = json_obj_get(ctxj, "includeDeclaration");
+            /* clients send a real false; json_get_num would default a bool
+             * to the fallback, so read booleans as booleans */
+            if (idj) include_decl = json_get_bool(idj, json_get_num(idj, 1) != 0.0);
+        }
+        /* origin document first: doc_intel_for for another document can
+         * evict and rebuild this request's own engine from the small cache */
+        int od = -1;
+        for (int d = 0; d < s->doc_count; d++)
+            if (strcmp(s->docs[d].uri, uri) == 0) { od = d; break; }
+        for (int pass = 0; pass < s->doc_count; pass++) {
+            if (lsp_cancel_hit(s)) break;
+            int d = pass;
+            if (od >= 0) d = (pass == 0) ? od : (pass <= od ? pass - 1 : pass);
+            lsp_doc_t *dd = &s->docs[d];
+            intellisense_t *de = (d == od)
+                                 ? is : doc_intel_for(s, dd->uri);
+            add_scoped_locations(arr, dd->uri, dd->text, de, g_project_intel,
+                                 &t, include_decl);
+        }
+        /* unopened project files: same per-occurrence identity, one scratch
+         * engine reused across files */
+        bool covered_decl = false;
+        if (!lsp_cancel_hit(s) && g_project_intel) {
+            intellisense_t *scratch = unopened_scratch();
+            if (scratch) {
+                scoped_unopened_ctx_t uc;
+                uc.out = arr;
+                uc.t = &t;
+                uc.new_name = NULL;
+                uc.include_decl = include_decl;
+                uc.covered_decl = false;
+                uc.scratch = scratch;
+                for_each_unopened_project_file(s, &uc, scoped_unopened_visit);
+                covered_decl = uc.covered_decl;
+            }
+        }
+        /* the member may be declared in a file never opened here */
+        if (!t.is_local && t.have_decl && include_decl && !covered_decl) {
+            bool covered = false;
+            for (int d = 0; d < s->doc_count; d++)
+                if (same_uri_ci(s->docs[d].uri, t.decl_ref)) covered = true;
+            if (!covered && !lsp_cancel_hit(s)) {
+                char duri[1800];
+                if (strncmp(t.decl_ref, "file://", 7) == 0)
+                    snprintf(duri, sizeof(duri), "%s", t.decl_ref);
+                else
+                    fspath_to_uri(t.decl_ref, duri, sizeof(duri));
+                json_value *loc = json_new_obj();
+                json_obj_set(loc, "uri", json_new_str(duri));
+                json_value *range = json_new_obj();
+                json_value *start = json_new_obj();
+                json_value *endp  = json_new_obj();
+                json_obj_set(start, "line", json_new_num(t.decl_line));
+                json_obj_set(start, "character", json_new_num(t.decl_col));
+                json_obj_set(endp, "line", json_new_num(t.decl_line));
+                json_obj_set(endp,
+                             "character",
+                             json_new_num(t.decl_col + (int)strlen(t.word)));
+                json_obj_set(range, "start", start);
+                json_obj_set(range, "end", endp);
+                json_obj_set(loc, "range", range);
+                json_arr_add(arr, loc);
+            }
+        }
+        if (lsp_cancel_hit(s)) {
+            json_free(arr);
+            send_response_error(s, id, -32800, "Request cancelled");
+            return;
+        }
         send_response(s, id, arr);
         return;
     }
 
+    /* Name-only fallback (type names and words no index knows): every open
+     * document plus every indexed project file on disk. */
     json_value *arr = json_new_arr();
     for (int d = 0; d < s->doc_count; d++) {
         if (lsp_cancel_hit(s)) break;
@@ -2233,61 +2717,22 @@ static void rename_visit(void *ctx, const char *uri, const char *text) {
 /* Two resolved type names name the same type when their simple names
  * (namespace, generics and arrays stripped) match — the same pairing
  * intel_member_sym uses to walk a receiver type to its declaring class. */
-static bool type_simple_same(const char *a, const char *b) {
-    char sa[128], sb[128];
-    snprintf(sa, sizeof(sa), "%s", a ? a : "");
-    snprintf(sb, sizeof(sb), "%s", b ? b : "");
-    sa[strcspn(sa, "<?")] = '\0';
-    sb[strcspn(sb, "<?")] = '\0';
-    const char *pa = strrchr(sa, '.'); pa = pa ? pa + 1 : sa;
-    const char *pb = strrchr(sb, '.'); pb = pb ? pb + 1 : sb;
-    return strcmp(pa, pb) == 0;
-}
-
-/* Occurrences of `word` in `text` that belong to the member being renamed:
- * a member access whose preceding receiver resolves to the same type, or the
- * member's own declaration recorded in this engine's symbol table. NULL when
- * no occurrence qualifies. */
-static json_value *member_rename_edits_for(const char *text, intellisense_t *de,
-                                           intellisense_t *project,
-                                           const char *rt, const char *word,
-                                           const char *new_name) {
+/* TextEdit list for the occurrences of a resolved target in one document,
+ * each rewritten to `new_name`. NULL when nothing in this document matches. */
+static json_value *scoped_rename_edits(const char *doc_uri, const char *text,
+                                       intellisense_t *de, intellisense_t *project,
+                                       const sym_target_t *t,
+                                       const char *new_name) {
     size_t offsets[512];
-    int n = find_text_references(text, word, offsets, 512);
-    if (n == 0 || !de) return NULL;
-
-    char decl_simple[128];
-    snprintf(decl_simple, sizeof(decl_simple), "%s", rt);
-    decl_simple[strcspn(decl_simple, "<?")] = '\0';
-    const char *dsp = strrchr(decl_simple, '.');
-    dsp = dsp ? dsp + 1 : decl_simple;
-
+    int n = find_text_references(text, t->word, offsets, 512);
     json_value *edits = NULL;
     for (int i = 0; i < n; i++) {
         int rl, rc;
         offset_to_linecol(text, (int)offsets[i], &rl, &rc);
-        bool keep = false;
-        /* the declaration itself: a symbol of this type carrying the member
-         * name whose recorded position is exactly this occurrence */
-        for (int k = 0; k < de->symbol_count && !keep; k++) {
-            const isym_t *sym = &de->symbols[k];
-            if (!sym->parent[0] || strcmp(sym->parent, dsp) != 0) continue;
-            if (strcmp(sym->name, word) != 0) continue;
-            if (sym->kind != ISYM_METHOD && sym->kind != ISYM_FIELD &&
-                sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER)
-                continue;
-            if (sym->line == rl && sym->col == rc) keep = true;
-        }
-        /* otherwise a typed member access through the receiver */
-        if (!keep) {
-            char chain[256];
-            if (!receiver_chain_before(text, offsets[i], chain, sizeof(chain)))
-                continue;
-            char fm[64];
-            const char *t2 = intel_resolve_chain_pos(de, project, chain, fm,
-                                                     sizeof(fm), rl, rc);
-            if (!t2 || !t2[0] || !type_simple_same(t2, rt)) continue;
-        }
+        bool keep = occurrence_matches(t, text, de, project, doc_uri,
+                                       offsets[i], rl, rc);
+        if (!keep)
+            continue;
         if (!edits) edits = json_new_arr();
         json_value *edit = json_new_obj();
         json_value *range = json_new_obj();
@@ -2296,7 +2741,7 @@ static json_value *member_rename_edits_for(const char *text, intellisense_t *de,
         json_obj_set(start, "line", json_new_num(rl));
         json_obj_set(start, "character", json_new_num(rc));
         json_obj_set(endp, "line", json_new_num(rl));
-        json_obj_set(endp, "character", json_new_num(rc + (int)strlen(word)));
+        json_obj_set(endp, "character", json_new_num(rc + (int)strlen(t->word)));
         json_obj_set(range, "start", start);
         json_obj_set(range, "end", endp);
         json_obj_set(edit, "range", range);
@@ -2307,8 +2752,7 @@ static json_value *member_rename_edits_for(const char *text, intellisense_t *de,
 }
 
 /* Rename handler: whole-word, comment/string-aware textual rename across
- * every open document, returned as a WorkspaceEdit. */
-static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
+ * every open document, returned as a WorkspaceEdit. */static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
     const char *uri; int line, character;
     const char *new_name = json_get_str(json_obj_get(params, "newName"));
     if (!get_position(params, &uri, &line, &character) || !new_name || !new_name[0]) {
@@ -2323,6 +2767,12 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
     for (const char *p = new_name + 1; *p; p++) {
         if (!is_ident_char(*p)) { send_response(s, id, json_new_null()); return; }
     }
+    /* a keyword parses as an identifier-shaped token but is not one — the
+     * renamed code would not compile */
+    if (intel_is_keyword(new_name)) {
+        send_response_error(s, id, -32602, "newName is a keyword");
+        return;
+    }
     lsp_doc_t *doc = lsp_find_doc(s, uri);
     if (!doc) { send_response(s, id, json_new_null()); return; }
 
@@ -2331,95 +2781,94 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
     word_at(doc->text, off, word, sizeof(word));
     if (!word[0]) { send_response(s, id, json_new_null()); return; }
 
-    /* scope-aware fast path: renaming a local/parameter only touches its own
-     * method body — the whole-project textual rename would wrongly rename
-     * unrelated same-named identifiers everywhere */
-    int ms = -1, me = -1, dl = -1;
     intellisense_t *is = doc_intel_for(s, uri);
-    if (is && intel_local_extent(is, word, line, &ms, &me, &dl)) {
+    sym_target_t t;
+    bool resolved = resolve_sym_target(is, g_project_intel, doc->text, off, uri,
+                                       word, line, character, &t);
+    if (resolved) {
+        /* renaming a local onto the name of another local/parameter in the
+         * same file would capture or be captured — refuse instead of
+         * producing code whose meaning silently changes */
+        if (t.is_local && strcmp(word, new_name) != 0 && is) {
+            for (int i = 0; i < is->symbol_count; i++) {
+                const isym_t *sym = &is->symbols[i];
+                if ((sym->kind == ISYM_VARIABLE || sym->kind == ISYM_PARAMETER) &&
+                    strcmp(sym->name, new_name) == 0) {
+                    send_response_error(s, id, -32602,
+                                        "newName collides with an existing local");
+                    return;
+                }
+            }
+        }
         json_value *changes = json_new_obj();
-        json_value *edits = rename_edits_for(doc->text, word, new_name,
-                                             ms < dl ? ms : dl, me);
-        if (edits) json_obj_set(changes, uri, edits);
+        /* an open declaration file is covered by the scan: its declaration
+         * occurrence resolves back to the target like any other use */
+        bool decl_open = false;
+        /* origin document first: asking another document for its engine can
+         * evict and rebuild this request's own engine from the small cache,
+         * so the origin pass must run while `is` is still live */
+        int od = -1;
+        for (int d = 0; d < s->doc_count; d++)
+            if (strcmp(s->docs[d].uri, uri) == 0) { od = d; break; }
+        for (int pass = 0; pass < s->doc_count; pass++) {
+            if (lsp_cancel_hit(s)) break;
+            int d = pass;
+            if (od >= 0) d = (pass == 0) ? od : (pass <= od ? pass - 1 : pass);
+            lsp_doc_t *dd = &s->docs[d];
+            intellisense_t *de = (d == od)
+                                 ? is : doc_intel_for(s, dd->uri);
+            json_value *edits = de ? scoped_rename_edits(dd->uri, dd->text, de,
+                                                         g_project_intel, &t,
+                                                         new_name)
+                                   : NULL;
+            if (edits) json_obj_set(changes, dd->uri, edits);
+            if (t.have_decl && same_uri_ci(dd->uri, t.decl_ref)) decl_open = true;
+        }
+        /* unopened project files: same per-occurrence identity for the edits */
+        bool covered_decl = decl_open;
+        if (!lsp_cancel_hit(s) && g_project_intel) {
+            intellisense_t *scratch = unopened_scratch();
+            if (scratch) {
+                scoped_unopened_ctx_t uc;
+                uc.out = changes;
+                uc.t = &t;
+                uc.new_name = new_name;
+                uc.include_decl = true;
+                uc.covered_decl = false;
+                uc.scratch = scratch;
+                for_each_unopened_project_file(s, &uc, scoped_unopened_visit);
+                covered_decl = covered_decl || uc.covered_decl;
+            }
+        }
+        /* the member may be declared in a file never opened here */
+        if (!t.is_local && t.have_decl && !covered_decl) {
+            json_value *edits = json_new_arr();
+            json_value *edit = json_new_obj();
+            json_value *range = json_new_obj();
+            json_value *start = json_new_obj();
+            json_value *endp  = json_new_obj();
+            json_obj_set(start, "line", json_new_num(t.decl_line));
+            json_obj_set(start, "character", json_new_num(t.decl_col));
+            json_obj_set(endp, "line", json_new_num(t.decl_line));
+            json_obj_set(endp,
+                         "character",
+                         json_new_num(t.decl_col + (int)strlen(t.word)));
+            json_obj_set(range, "start", start);
+            json_obj_set(range, "end", endp);
+            json_obj_set(edit, "range", range);
+            json_obj_set(edit, "newText", json_new_str(new_name));
+            json_arr_add(edits, edit);
+            char duri[1800];
+            if (strncmp(t.decl_ref, "file://", 7) == 0)
+                snprintf(duri, sizeof(duri), "%s", t.decl_ref);
+            else
+                fspath_to_uri(t.decl_ref, duri, sizeof(duri));
+            json_obj_set(changes, duri, edits);
+        }
         json_value *we = json_new_obj();
         json_obj_set(we, "changes", changes);
         send_response(s, id, we);
         return;
-    }
-
-    /* Member-aware path: the cursor sits on `recv.word`, so this is a member
-     * use, not a local. The whole-project textual walk below would rename
-     * every unrelated same-named identifier in every indexed file (an entire
-     * toolchain flood), so a member rename instead touches the member's
-     * declaration plus the occurrences reached through the receiver's type in
-     * open documents. References in files never opened here are left to a
-     * future member-aware reference index — a missed rename beats a wrong
-     * one. */
-    char chain[256];
-    if (receiver_chain_before(doc->text, off, chain, sizeof(chain))) {
-        char fm[64];
-        const char *rt = intel_resolve_chain_pos(is, g_project_intel, chain,
-                                                 fm, sizeof(fm), line, character);
-        if (!rt || !rt[0]) {
-            /* swapped-engine retry, same as hover/definition: the receiver
-             * root may live only in the project index */
-            rt = intel_resolve_chain_pos(g_project_intel, is, chain,
-                                         fm, sizeof(fm), line, character);
-        }
-        if (rt && rt[0] && g_project_intel) {
-            goto_def_t decl;
-            memset(&decl, 0, sizeof(decl));
-            intel_goto_member(g_project_intel, rt, word, &decl);
-
-            json_value *changes = json_new_obj();
-            /* the declaration target in URI form (passthrough when the index
-             * already recorded a file:// string) */
-            char duri[1800];
-            bool have_decl = false;
-            if (decl.found && decl.file[0]) {
-                if (strncmp(decl.file, "file://", 7) == 0)
-                    snprintf(duri, sizeof(duri), "%s", decl.file);
-                else
-                    fspath_to_uri(decl.file, duri, sizeof(duri));
-                have_decl = true;
-            }
-            bool decl_open = false;
-            for (int d = 0; d < s->doc_count; d++) {
-                lsp_doc_t *dd = &s->docs[d];
-                intellisense_t *de = (strcmp(dd->uri, uri) == 0)
-                                     ? is : doc_intel_for(s, dd->uri);
-                json_value *edits = de ? member_rename_edits_for(dd->text, de,
-                                        g_project_intel, rt, word, new_name)
-                                       : NULL;
-                if (edits) json_obj_set(changes, dd->uri, edits);
-                /* an open declaration file is covered by the scan above: its
-                 * declaration occurrence is kept by position/parent match */
-                if (have_decl && same_uri_ci(dd->uri, duri)) decl_open = true;
-            }
-            /* the member may be declared in a file never opened here */
-            if (have_decl && !decl_open) {
-                json_value *edits = json_new_arr();
-                json_value *edit = json_new_obj();
-                json_value *range = json_new_obj();
-                json_value *start = json_new_obj();
-                json_value *endp  = json_new_obj();
-                json_obj_set(start, "line", json_new_num(decl.line));
-                json_obj_set(start, "character", json_new_num(decl.col));
-                json_obj_set(endp, "line", json_new_num(decl.line));
-                json_obj_set(endp, "character",
-                             json_new_num(decl.col + (int)strlen(word)));
-                json_obj_set(range, "start", start);
-                json_obj_set(range, "end", endp);
-                json_obj_set(edit, "range", range);
-                json_obj_set(edit, "newText", json_new_str(new_name));
-                json_arr_add(edits, edit);
-                json_obj_set(changes, duri, edits);
-            }
-            json_value *we = json_new_obj();
-            json_obj_set(we, "changes", changes);
-            send_response(s, id, we);
-            return;
-        }
     }
 
     /* Every open document (their unsaved text wins) plus every indexed project
@@ -2793,6 +3242,16 @@ static void handle_prepare_rename(lsp_server_t *s, json_value *id, json_value *p
     if (n >= sizeof(word)) n = sizeof(word) - 1;
     memcpy(word, doc->text + start, n);
     word[n] = '\0';
+
+    /* Only offer a range when the word resolves to something with a real
+     * declaration: an implicit setter `value` (or any word no index knows)
+     * has nothing to rename, and renaming it would be a lie. The decl-text
+     * verification lives inside resolve_sym_target, so both paths share it. */
+    intellisense_t *is = doc_intel_for(s, uri);
+    sym_target_t t;
+    bool renamable = resolve_sym_target(is, g_project_intel, doc->text, off,
+                                        uri, word, line, character, &t);
+    if (!renamable) { send_response(s, id, json_new_null()); return; }
 
     json_value *result = json_new_obj();
     json_value *range = json_new_obj();

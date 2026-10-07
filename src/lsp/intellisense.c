@@ -1876,6 +1876,13 @@ static int intel_bare_symbol_rank(intellisense_t *is, const isym_t *sym,
     }
 }
 
+bool intel_is_keyword(const char *word) {
+    if (!word || !word[0]) return false;
+    for (int i = 0; builtin_keywords[i]; i++)
+        if (strcmp(builtin_keywords[i], word) == 0) return true;
+    return false;
+}
+
 /* Generate completions matching prefix.
  * `from_class_override` lets a caller supply the enclosing class from the
  * OPEN document (the index's own copy may be stale, or lack the class when

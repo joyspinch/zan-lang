@@ -196,7 +196,7 @@ static bool lsp_recv(child_t *c, char *buf, int cap) {
 static void send_message(child_t *c, json_value *root) {
     char *body = json_serialize(root);
     lsp_send(c, body);
-    json_free(body);
+    free(body);
     json_free(root);
 }
 
@@ -277,6 +277,30 @@ static bool fold_contains(const char *body, int s0, int e0) {
     char pat[96];
     snprintf(pat, sizeof(pat), "\"startLine\":%d,\"endLine\":%d", s0, e0);
     return strstr(body, pat) != NULL;
+}
+
+/* 同一声明在文档索引和项目索引中有不同副本；两种查询都应返回这两个范围。 */
+static bool helper_highlights_exact(const char *body) {
+    json_value *root = body ? json_parse(body) : NULL;
+    json_value *result = json_obj_get(root, "result");
+    bool declaration = false, call = false;
+    bool valid = json_is(result, JSON_ARR) && json_arr_count(result) == 2;
+    for (int i = 0; valid && i < json_arr_count(result); i++) {
+        json_value *highlight = json_arr_at(result, i);
+        json_value *range = json_obj_get(highlight, "range");
+        json_value *start = json_obj_get(range, "start");
+        json_value *end = json_obj_get(range, "end");
+        int line = (int)json_get_num(json_obj_get(start, "line"), -1);
+        int col = (int)json_get_num(json_obj_get(start, "character"), -1);
+        valid = json_get_num(json_obj_get(highlight, "kind"), -1) == 1 &&
+                json_get_num(json_obj_get(end, "line"), -1) == line &&
+                json_get_num(json_obj_get(end, "character"), -1) == col + 6;
+        if (line == 2 && col == 31) declaration = true;
+        else if (line == 4 && col == 39) call = true;
+        else valid = false;
+    }
+    json_free(root);
+    return valid && declaration && call;
 }
 
 static int run_extended_checks(child_t *child) {
@@ -386,13 +410,23 @@ static int run_extended_checks(child_t *child) {
         ext_check(false, "foldingRange: no response");
     }
 
-    /* documentHighlight: every whole-word occurrence of Helper */
-    if (r[1]) {
-        int hits = 0;
-        for (const char *p = r[1]; (p = strstr(p, "\"kind\":1")) != NULL; p++) hits++;
-        ext_check(hits >= 2, "documentHighlight: >= 2 occurrences highlighted");
-    } else {
-        ext_check(false, "documentHighlight: no response");
+    /* BAD_URI 打开后缓存已失效，调用和声明必须仍映射到同一声明身份。 */
+    ext_check(helper_highlights_exact(r[1]),
+              "documentHighlight: 调用处查询返回两个精确 UTF-16 范围");
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(TEST_URI));
+        json_value *pos = json_new_obj();
+        json_obj_set(pos, "line", json_new_num(2));
+        json_obj_set(pos, "character", json_new_num(31));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        json_obj_set(params, "position", pos);
+        send_message(child, mk_request(15, "textDocument/documentHighlight", params));
+        char *response = recv_until_id(child, 15);
+        ext_check(helper_highlights_exact(response),
+                  "documentHighlight: 声明处查询返回两个精确 UTF-16 范围");
+        free(response);
     }
 
     /* prepareRename: exact word range + placeholder */
@@ -435,6 +469,471 @@ static int run_extended_checks(child_t *child) {
     for (int i = 0; i < 5; i++) free(r[i]);
     free(diag_bad);
     printf("\n%d extended failure(s)\n", ext_fails);
+    return ext_fails ? 1 : 0;
+}
+
+static void completion_document(child_t *child, const char *uri,
+                                const char *text, int version, bool open) {
+    json_value *td = json_new_obj();
+    json_obj_set(td, "uri", json_new_str(uri));
+    json_obj_set(td, "version", json_new_num(version));
+    json_value *params = json_new_obj();
+    json_obj_set(params, "textDocument", td);
+    if (open) {
+        json_obj_set(td, "languageId", json_new_str("zan"));
+        json_obj_set(td, "text", json_new_str(text));
+    } else {
+        json_value *changes = json_new_arr();
+        json_value *change = json_new_obj();
+        json_obj_set(change, "text", json_new_str(text));
+        json_arr_add(changes, change);
+        json_obj_set(params, "contentChanges", changes);
+    }
+    send_message(child, mk_request(-1, open ? "textDocument/didOpen"
+                                          : "textDocument/didChange", params));
+}
+
+static char *request_at_marker_ex(child_t *child, const char *uri, const char *text,
+                                  const char *receiver, const char *method,
+                                  const char *new_name, bool include_decl) {
+    static int request_id = 60;
+    const char *at = strstr(text, receiver);
+    if (!at) return NULL;
+    at += strlen(receiver);
+    int line = 0, column = 0;
+    for (const char *p = text; p < at; p++) {
+        if (*p == '\n') { line++; column = 0; }
+        else {
+            unsigned char ch = (unsigned char)*p;
+            if ((ch & 0xc0) != 0x80) column += ch >= 0xf0 ? 2 : 1;
+        }
+    }
+    json_value *td = json_new_obj();
+    json_obj_set(td, "uri", json_new_str(uri));
+    json_value *pos = json_new_obj();
+    json_obj_set(pos, "line", json_new_num(line));
+    json_obj_set(pos, "character", json_new_num(column));
+    json_value *params = json_new_obj();
+    json_obj_set(params, "textDocument", td);
+    json_obj_set(params, "position", pos);
+    if (new_name) json_obj_set(params, "newName", json_new_str(new_name));
+    if (strcmp(method, "textDocument/references") == 0) {
+        json_value *context = json_new_obj();
+        json_obj_set(context, "includeDeclaration", json_new_bool(include_decl));
+        json_obj_set(params, "context", context);
+    }
+    int id = request_id++;
+    send_message(child, mk_request(id, method, params));
+    return recv_until_id(child, id);
+}
+
+static char *request_at_marker(child_t *child, const char *uri, const char *text,
+                               const char *receiver, const char *method, const char *new_name) {
+    return request_at_marker_ex(child, uri, text, receiver, method, new_name, true);
+}
+
+static bool completion_has(child_t *child, const char *uri, const char *text,
+                           const char *receiver, const char *label) {
+    char *response = request_at_marker(child, uri, text, receiver,
+                                       "textDocument/completion", NULL);
+    if (!response) { ext_check(false, "completion response received"); return false; }
+    json_value *root = json_parse(response);
+    free(response);
+    json_value *items = json_obj_get(root, "result");
+    if (!items || items->type != JSON_ARR) {
+        ext_check(false, "completion result is an array");
+        json_free(root);
+        return false;
+    }
+    bool found = false;
+    for (int i = 0; i < json_arr_count(items); i++) {
+        const char *name = json_get_str(json_obj_get(json_arr_at(items, i), "label"));
+        if (name && strcmp(name, label) == 0) found = true;
+    }
+    json_free(root);
+    return found;
+}
+
+/* Check every returned occurrence, so correct counts cannot hide a literal
+ * fragment being edited in place of a real (possibly nested) hole. */
+static bool interpolation_ranges_exact(json_value *items, const char *text,
+                                        const char *uri, bool rename) {
+    const char *markers[] = {
+        "int interpolated", " {interpolated", "{$\"{interpolated", "\"} {interpolated"
+    };
+    int first = rename ? 0 : 1;
+    if (!json_is(items, JSON_ARR) || json_arr_count(items) != 4 - first) return false;
+    unsigned seen = 0;
+    for (int i = 0; i < json_arr_count(items); i++) {
+        json_value *item = json_arr_at(items, i);
+        const char *value = json_get_str(json_obj_get(item, rename ? "newText" : "uri"));
+        if (!value || strcmp(value, rename ? "formattedValue" : uri) != 0) return false;
+        json_value *range = json_obj_get(item, "range");
+        json_value *start = json_obj_get(range, "start");
+        json_value *end = json_obj_get(range, "end");
+        if (json_get_num(json_obj_get(start, "line"), -1) != 0 ||
+            json_get_num(json_obj_get(end, "line"), -1) != 0) return false;
+        int col = (int)json_get_num(json_obj_get(start, "character"), -1);
+        if (json_get_num(json_obj_get(end, "character"), -1) != col + 12) return false;
+        bool matched = false;
+        for (int m = first; m < 4; m++) {
+            const char *at = strstr(text, markers[m]);
+            if (at && col == (int)(at + strlen(markers[m]) - 12 - text) && !(seen & (1u << m))) {
+                seen |= 1u << m;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) return false;
+    }
+    return true;
+}
+
+static int run_completion_checks(child_t *child) {
+    const char *uri = "file:///lsp_ast_completion.zan";
+    const char *text =
+        "class AstBox {\n"
+        "    public string Text;\n"
+        "    public string Multi\n"
+        "        (int value)\n"
+        "        { return \"ok\"; }\n"
+        "}\n"
+        "class AstProgram {\n"
+        "    static void Other(int item) { item.ToString(); }\n"
+        "    static void Main() {\n"
+        "        var item = new AstBox();\n"
+        "        item.Text = \"x\";\n"
+        "        item.Multi(1).Length;\n"
+        "        { string innerOnly = \"x\"; innerOnly.Length; }\n"
+        "        innerOnly.Length;\n"
+        "    }\n"
+        "}\n";
+    completion_document(child, uri, text, 1, true);
+    ext_check(completion_has(child, uri, text, "        item.", "Text"),
+              "completion: var new uses its AST type across same-named parameter");
+    ext_check(completion_has(child, uri, text, "        item.", "Multi"),
+              "completion: multi-line method declaration is indexed");
+    ext_check(completion_has(child, uri, text, "item.Multi(1).", "Length"),
+              "completion: multi-line method return resolves member chain");
+    ext_check(completion_has(child, uri, text, "{ string innerOnly = \"x\"; innerOnly.", "Length"),
+              "completion: single-line nested block local is indexed");
+    ext_check(!completion_has(child, uri, text, "        innerOnly.", "Length"),
+              "completion: local cannot escape its nested block");
+
+    const char *scope_uri = "file:///lsp_column_scope.zan";
+    const char *scope_text =
+        "class ColumnP { static void Main() {\n"
+        "    string same = \"outer\"; { int same = 1; same.ToString(); } same.ToUpper();\n"
+        "    { string scoped = \"x\"; scoped.Length; } scoped.Length;\n"
+        "    { string prefixOnly = \"x\"; pref; } pref;\n"
+        "    /* \xE4\xB8\xAD\xF0\x9F\x98\x80 */ { string wide = \"x\"; wide.Length; } wide.Length;\n"
+        "    for (string loopOnly = \"x\"; false;) { loopOnly.Length; } loopOnly.Length;\n"
+        "} }\n";
+    completion_document(child, scope_uri, scope_text, 1, true);
+    ext_check(!completion_has(child, scope_uri, scope_text, "same = 1; same.", "ToUpper"),
+              "completion: inner same-line declaration shadows outer string");
+    ext_check(completion_has(child, scope_uri, scope_text, "} same.", "ToUpper"),
+              "completion: outer declaration returns after same-line block");
+    ext_check(completion_has(child, scope_uri, scope_text, "scoped = \"x\"; scoped.", "Length"),
+              "completion: same-line block local is visible inside");
+    ext_check(!completion_has(child, scope_uri, scope_text, "} scoped.", "Length"),
+              "completion: same-line block local is invisible outside");
+    ext_check(completion_has(child, scope_uri, scope_text, "prefixOnly = \"x\"; pref", "prefixOnly"),
+              "completion: ordinary prefix includes visible block local");
+    ext_check(!completion_has(child, scope_uri, scope_text, "} pref", "prefixOnly"),
+              "completion: ordinary prefix excludes expired block local");
+    ext_check(completion_has(child, scope_uri, scope_text, "wide = \"x\"; wide.", "Length"),
+              "completion: UTF-16 columns preserve block-local visibility");
+    ext_check(!completion_has(child, scope_uri, scope_text, "} wide.", "Length"),
+              "completion: UTF-16 columns preserve block end");
+    ext_check(completion_has(child, scope_uri, scope_text, "{ loopOnly.", "Length"),
+              "completion: for initializer is visible inside loop");
+    ext_check(!completion_has(child, scope_uri, scope_text, "} loopOnly.", "Length"),
+              "completion: for initializer cannot escape loop");
+
+    const char *identity_uri = "file:///lsp_local_identity.zan";
+    const char *identity_text =
+        "class IdentityP { int same; static void Main() {\n"
+        "    string same = \"x\"; same.Length; { int same = 1; same.ToString(); } same.Length;\n"
+        "    IdentityP obj = new IdentityP(); obj.same = 1;\n"
+        "} }\n";
+    completion_document(child, identity_uri, identity_text, 1, true);
+    char *response = request_at_marker(child, identity_uri, identity_text, "\"x\"; same",
+                                       "textDocument/references", NULL);
+    json_value *root = response ? json_parse(response) : NULL;
+    if (root && json_arr_count(json_obj_get(root, "result")) != 3) {
+        fprintf(stderr, "DEBUG outer local references response (count=%d): %s\n",
+                json_arr_count(json_obj_get(root, "result")), response ? response : "(null)");
+    }
+    ext_check(root && json_arr_count(json_obj_get(root, "result")) == 3,
+              "references: outer local excludes shadow and member access");
+    json_free(root); free(response);
+    response = request_at_marker(child, identity_uri, identity_text, "1; same",
+                                  "textDocument/rename", "innerRenamed");
+    root = response ? json_parse(response) : NULL;
+    json_value *changes = json_obj_get(json_obj_get(root, "result"), "changes");
+    ext_check(changes && json_arr_count(json_obj_get(changes, identity_uri)) == 2,
+              "rename: inner local edits only its declaration and use");
+    json_free(root); free(response);
+    response = request_at_marker(child, identity_uri, identity_text, "} same",
+                                  "textDocument/definition", NULL);
+    root = response ? json_parse(response) : NULL;
+    json_value *start = json_obj_get(json_obj_get(json_obj_get(root, "result"), "range"), "start");
+    ext_check(start && json_get_num(json_obj_get(start, "line"), -1) == 1 &&
+              json_get_num(json_obj_get(start, "character"), -1) == 11,
+              "definition: same-line outer use selects outer declaration");
+    json_free(root); free(response);
+
+    const char *owners_uri = "file:///lsp_completion_owners.zan";
+    const char *owners_text =
+        "class OwnerA { private int Secret; public string value; void Tiny() {} void Pick(int correct) {} } "
+        "class OwnerB { void Pick(string wrong) {} void Run(OwnerA a, OwnerA[] items) { "
+        "int value = 0; a.value.Length; items[0].value.Length; this.Pick(\"x\"); a.Pick(1); a.Secret; hiddenOnly; } } "
+        "class Foreign { private int hiddenOnly; }\n";
+    completion_document(child, owners_uri, owners_text, 1, true);
+    ext_check(!completion_has(child, owners_uri, owners_text, "a.", "Secret"),
+              "completion: same-line unrelated type cannot access private");
+    ext_check(completion_has(child, owners_uri, owners_text, "items[0].", "value"),
+              "completion: array subscript reaches element members");
+    ext_check(completion_has(child, owners_uri, owners_text, "this.", "Pick"),
+              "completion: this resolves enclosing type");
+    ext_check(!completion_has(child, owners_uri, owners_text, "hidden", "hiddenOnly"),
+              "completion: ordinary prefix cannot expose foreign private");
+    response = request_at_marker(child, owners_uri, owners_text, "a.value",
+                                  "textDocument/definition", NULL);
+    root = response ? json_parse(response) : NULL;
+    start = json_obj_get(json_obj_get(json_obj_get(root, "result"), "range"), "start");
+    ext_check(start && json_get_num(json_obj_get(start, "character"), -1) ==
+              (double)(strstr(owners_text, "value;") - owners_text),
+              "definition: receiver member cannot select same-named local");
+    json_free(root); free(response);
+    response = request_at_marker(child, owners_uri, owners_text, "a.Pick(",
+                                  "textDocument/signatureHelp", NULL);
+    root = response ? json_parse(response) : NULL;
+    json_value *signatures = json_obj_get(json_obj_get(root, "result"), "signatures");
+    const char *signature = json_get_str(json_obj_get(json_arr_at(signatures, 0), "label"));
+    ext_check(signature && strstr(signature, "int correct") && !strstr(signature, "string wrong"),
+              "signature: local receiver selects exact method owner");
+    json_free(root); free(response);
+
+    const char *generics_uri = "file:///lsp_generic_chain.zan";
+    const char *generics_text =
+        "class GenericBox<T> { public T Fetch() { return default(T); } }\n"
+        "class GenericProgram { static void Main() { var later = Later(); later.Length; "
+        "GenericBox<string> box = new GenericBox<string>(); box.Fetch().Length; "
+        "List<int> numbers = new List<int>(); numbers.ToArray().Length; "
+        "Dictionary<string,List<string>> map = new Dictionary<string,List<string>>(); map[\"a\"][0].Length; "
+        "StringBuilder builder = new StringBuilder(); builder.Append(\"x\").Length; "
+        "box.Missing().Fetch(); } static string Later() { return \"x\"; } }\n";
+    completion_document(child, generics_uri, generics_text, 1, true);
+    ext_check(completion_has(child, generics_uri, generics_text, "later.", "Length"),
+              "completion: var initializer resolves later-declared method");
+    ext_check(completion_has(child, generics_uri, generics_text, "box.Fetch().", "Length"),
+              "completion: generic method return substitutes receiver arguments");
+    ext_check(completion_has(child, generics_uri, generics_text, "numbers.ToArray().", "Length"),
+              "completion: builtin collection return exposes array members");
+    ext_check(completion_has(child, generics_uri, generics_text, "map[\"a\"][0].", "Length"),
+              "completion: nested dictionary and list subscript resolves element");
+    ext_check(!completion_has(child, generics_uri, generics_text, "builder.Append(\"x\").", "Length"),
+              "completion: void builtin result cannot create fluent chain");
+    ext_check(!completion_has(child, generics_uri, generics_text, "box.Missing().", "Fetch"),
+              "completion: unknown method cannot retain receiver type");
+
+    const char *suffix_uri = "file:///lsp_receiver_suffix.zan";
+    const char *suffix_text =
+        "class StaticBox<T> { public static T Make() { return default(T); } public T Fetch() { return default(T); } }\n"
+        "class StringBox : StaticBox<string> { void Check() { base.Fetch().Length; } }\n"
+        "class SuffixHolder { public string[] Values; }\n"
+        "class SuffixP { static int Index() { return 0; } static void Main() { "
+        "string[] items = new string[1]; items[Index()].Length; "
+        "SuffixHolder holder = new SuffixHolder(); holder.Values[Index()].Length; "
+        "Dictionary<string,string> map = new Dictionary<string,string>(); map[\"(\"].Length; "
+        "StaticBox<string>.Make().Length; } }\n";
+    completion_document(child, suffix_uri, suffix_text, 1, true);
+    ext_check(completion_has(child, suffix_uri, suffix_text, "items[Index()].", "Length"),
+              "completion: index argument call does not turn array root into call");
+    ext_check(completion_has(child, suffix_uri, suffix_text, "holder.Values[Index()].", "Length"),
+              "completion: member index argument call does not alter member identity");
+    ext_check(completion_has(child, suffix_uri, suffix_text, "map[\"(\"].", "Length"),
+              "completion: parenthesis in dictionary key is literal text");
+    ext_check(completion_has(child, suffix_uri, suffix_text, "StaticBox<string>.", "Make"),
+              "completion: generic static receiver resolves its bare declaration");
+    ext_check(completion_has(child, suffix_uri, suffix_text, "StaticBox<string>.Make().", "Length"),
+              "completion: generic static call retains concrete type argument");
+    ext_check(completion_has(child, suffix_uri, suffix_text, "base.Fetch().", "Length"),
+              "completion: base receiver retains generic argument");
+
+    const char *factory_uri = "file:///lsp_project_factory.zan";
+    const char *factory_text = "class ProjectFactory { public static string Fetch() { return \"x\"; } }\n";
+    const char *consumer_uri = "file:///lsp_factory_consumer.zan";
+    const char *consumer_text =
+        "class FactoryConsumer { static void Main() { var product = ProjectFactory.Fetch(); product.ToString(); } }\n";
+    completion_document(child, factory_uri, factory_text, 1, true);
+    completion_document(child, consumer_uri, consumer_text, 1, true);
+    ext_check(completion_has(child, consumer_uri, consumer_text, "product.", "ToUpper"),
+              "completion: cross-file static factory infers var initializer");
+    const char *factory_v2 = "class ProjectFactory { public static int Fetch() { return 1; } }\n";
+#ifdef _WIN32
+    const char *factory_alias = "file:///LSP_PROJECT_FACTORY.zan";
+#else
+    const char *factory_alias = factory_uri;
+#endif
+    completion_document(child, factory_alias, factory_v2, 2, false);
+    ext_check(!completion_has(child, consumer_uri, consumer_text, "product.", "ToUpper"),
+              "completion: provider edit invalidates consumer initializer cache");
+    ext_check(completion_has(child, consumer_uri, consumer_text, "product.", "ToString"),
+              "completion: edited provider still infers a concrete scalar type");
+    response = request_at_marker(child, consumer_uri, consumer_text, "ProjectFactory.Fetch",
+                                  "textDocument/definition", NULL);
+    root = response ? json_parse(response) : NULL;
+    ext_check(root && json_is(json_obj_get(root, "result"), JSON_OBJ),
+              "definition: provider case alias replaces its declaration identity");
+    json_free(root); free(response);
+
+    const char *implicit_uri = "file:///lsp_implicit_parameter.zan";
+    const char *implicit_text = "class ImplicitP { int P { set { Console.WriteLine(value); } } }\n";
+    completion_document(child, implicit_uri, implicit_text, 1, true);
+    response = request_at_marker(child, implicit_uri, implicit_text, "(value",
+                                  "textDocument/prepareRename", NULL);
+    root = response ? json_parse(response) : NULL;
+    ext_check(root && json_obj_get(root, "result") && json_obj_get(root, "result")->type == JSON_NULL,
+              "rename: implicit setter value has no source declaration");
+    json_free(root); free(response);
+
+    const char *rename_uri = "file:///lsp_member_identity.zan";
+    const char *rename_text =
+        "class RenameA { int count; void F() { count = 1; } } "
+        "class RenameB { int count; void F() { int count = 0; } }\n";
+    completion_document(child, rename_uri, rename_text, 1, true);
+    response = request_at_marker(child, rename_uri, rename_text, "RenameA { int count",
+                                  "textDocument/rename", "total");
+    root = response ? json_parse(response) : NULL;
+    changes = json_obj_get(json_obj_get(root, "result"), "changes");
+    bool member_rename_safe = root && (json_obj_get(root, "error") ||
+                             json_is(json_obj_get(root, "result"), JSON_NULL));
+    if (changes) {
+        json_value *edits = json_obj_get(changes, rename_uri);
+        member_rename_safe = json_arr_count(edits) == 2;
+        for (int i = 0; i < json_arr_count(edits); i++) {
+            json_value *edit_start = json_obj_get(json_obj_get(json_arr_at(edits, i), "range"), "start");
+            if (json_get_num(json_obj_get(edit_start, "character"), -1) >=
+                (double)(strstr(rename_text, "class RenameB") - rename_text)) member_rename_safe = false;
+        }
+    }
+    ext_check(member_rename_safe, "rename: member cannot edit unrelated type or local");
+    json_free(root); free(response);
+
+    const char *refs_uri = "file:///lsp_reference_consumer.zan";
+    const char *refs_text =
+        "class ReferenceConsumer { void Use(RenameA a, RenameB b) { a.count = 2; b.count = 3; int count = 4; } }\n";
+    completion_document(child, refs_uri, refs_text, 1, true);
+    for (int include_decl = 0; include_decl < 2; include_decl++) {
+        response = request_at_marker_ex(child, rename_uri, rename_text, "RenameA { int count",
+                                         "textDocument/references", NULL, include_decl != 0);
+        root = response ? json_parse(response) : NULL;
+        json_value *locations = json_obj_get(root, "result");
+        ext_check(locations && json_arr_count(locations) == 2 + include_decl,
+                  include_decl ? "references: exact member identity includes declaration"
+                               : "references: exact member identity excludes declaration");
+        int consumer_hits = 0;
+        for (int i = 0; i < json_arr_count(locations); i++) {
+            json_value *location = json_arr_at(locations, i);
+            const char *location_uri = json_get_str(json_obj_get(location, "uri"));
+            if (location_uri && strcmp(location_uri, refs_uri) == 0) {
+                consumer_hits++;
+                start = json_obj_get(json_obj_get(location, "range"), "start");
+                ext_check(json_get_num(json_obj_get(start, "character"), -1) ==
+                          (double)(strstr(refs_text, "a.count") + 2 - refs_text),
+                          "references: cross-file receiver excludes unrelated member and local");
+            }
+        }
+        ext_check(consumer_hits == 1, "references: cross-file occurrence resolves exact declaration");
+        json_free(root); free(response);
+    }
+
+    response = request_at_marker_ex(child, identity_uri, identity_text, "\"x\"; same",
+                                     "textDocument/references", NULL, false);
+    root = response ? json_parse(response) : NULL;
+    ext_check(root && json_arr_count(json_obj_get(root, "result")) == 2,
+              "references: local includeDeclaration false excludes exact declaration");
+    json_free(root); free(response);
+
+    const char *interp_uri = "file:///lsp_interpolation_identity.zan";
+    const char *interp_text =
+        "class InterpolationP { void Use() { int interpolated = 1; "
+        "string literal = \"interpolated\"; "
+        "string message = $\"interpolated {{interpolated}} {interpolated} {$\"{interpolated}\"} {interpolated:D4}\"; } }\n";
+    completion_document(child, interp_uri, interp_text, 1, true);
+    response = request_at_marker(child, interp_uri, interp_text, "int interpolated",
+                                  "textDocument/rename", "formattedValue");
+    root = response ? json_parse(response) : NULL;
+    changes = json_obj_get(json_obj_get(root, "result"), "changes");
+    bool interpolation_rename = changes && interpolation_ranges_exact(json_obj_get(changes, interp_uri),
+                                                                       interp_text, interp_uri, true);
+    ext_check(interpolation_rename,
+              "rename: nested interpolation holes are code and literal fragments stay untouched");
+    if (!interpolation_rename) fprintf(stderr, "插值重命名响应: %s\n", response ? response : "(null)");
+    json_free(root); free(response);
+    response = request_at_marker_ex(child, interp_uri, interp_text, " {interpolated",
+                                     "textDocument/references", NULL, false);
+    root = response ? json_parse(response) : NULL;
+    bool interpolation_refs = root && interpolation_ranges_exact(json_obj_get(root, "result"),
+                                                                   interp_text, interp_uri, false);
+    ext_check(interpolation_refs,
+              "references: interpolation target excludes declaration and literal names");
+    if (!interpolation_refs) fprintf(stderr, "插值引用响应: %s\n", response ? response : "(null)");
+    json_free(root); free(response);
+    response = request_at_marker(child, interp_uri, interp_text, "int interpolated",
+                                  "textDocument/rename", "class");
+    root = response ? json_parse(response) : NULL;
+    ext_check(root && json_obj_get(root, "error") && !json_obj_get(root, "result"),
+              "rename: lexer keyword cannot be a replacement identifier");
+    json_free(root); free(response);
+
+    const char *capture_uri = "file:///lsp_rename_capture.zan";
+    const char *capture_text =
+        "class CaptureP { void Use() { int outerValue = 1; "
+        "{ int nestedValue = 2; outerValue += nestedValue; } outerValue++; "
+        "Func<int,int> mapper = (int lambdaValue) => outerValue + lambdaValue; } }\n";
+    completion_document(child, capture_uri, capture_text, 1, true);
+    response = request_at_marker(child, capture_uri, capture_text, "int outerValue",
+                                  "textDocument/rename", "nestedValue");
+    root = response ? json_parse(response) : NULL;
+    ext_check(root && json_obj_get(root, "error") && !json_obj_get(root, "result"),
+              "rename: nested declaration cannot capture renamed outer uses");
+    json_free(root); free(response);
+    response = request_at_marker(child, capture_uri, capture_text, "int nestedValue",
+                                  "textDocument/rename", "outerValue");
+    root = response ? json_parse(response) : NULL;
+    ext_check(root && json_obj_get(root, "error") && !json_obj_get(root, "result"),
+              "rename: nested local cannot capture pre-existing outer references");
+    json_free(root); free(response);
+    response = request_at_marker(child, capture_uri, capture_text, "int outerValue",
+                                  "textDocument/rename", "lambdaValue");
+    root = response ? json_parse(response) : NULL;
+    ext_check(root && json_obj_get(root, "error") && !json_obj_get(root, "result"),
+              "rename: lambda parameter cannot capture renamed outer references");
+    json_free(root); free(response);
+
+    const char *version_uri = "file:///lsp_version_completion.zan";
+    const char *v1 = "class VersionP { static void Main() { string value = \"x\"; value.ToString(); } }\n";
+    const char *v2 = "class VersionP { static void Main() { int    value = 1  ; value.ToString(); } }\n";
+    completion_document(child, version_uri, v1, 10, true);
+    ext_check(completion_has(child, version_uri, v1, "value.", "ToUpper"),
+              "completion: single-line method local is available");
+    completion_document(child, version_uri, v2, 12, false);
+    ext_check(!completion_has(child, version_uri, v2, "value.", "ToUpper"),
+              "completion: latest unsaved text replaces cached type");
+    completion_document(child, version_uri, v1, 11, false);
+    ext_check(!completion_has(child, version_uri, v2, "value.", "ToUpper"),
+              "completion: stale document version cannot replace newer text");
+    completion_document(child, version_uri, v1, 12, false);
+    ext_check(!completion_has(child, version_uri, v2, "value.", "ToUpper"),
+              "completion: duplicate document version cannot replace newer text");
+    completion_document(child, version_uri, v1, 13, false);
+    ext_check(completion_has(child, version_uri, v1, "value.", "ToUpper"),
+              "completion: newer document version invalidates cached type");
+    printf("\n%d completion failure(s)\n", ext_fails);
     return ext_fails ? 1 : 0;
 }
 
@@ -509,6 +1008,9 @@ static int run_scope_checks(child_t *child) {
         json_value *params = json_new_obj();
         json_obj_set(params, "textDocument", td);
         json_obj_set(params, "position", scope_position(8, 12));
+        json_value *context = json_new_obj();
+        json_obj_set(context, "includeDeclaration", json_new_bool(true));
+        json_obj_set(params, "context", context);
         send_message(child, mk_request(21, "textDocument/references", params));
         char *r = recv_until_id(child, 21);
         if (r) {
@@ -646,6 +1148,9 @@ static json_value *mk_refs_params(const char *doc_uri) {
     json_value *params = json_new_obj();
     json_obj_set(params, "textDocument", td);
     json_obj_set(params, "position", pos);
+    json_value *context = json_new_obj();
+    json_obj_set(context, "includeDeclaration", json_new_bool(false));
+    json_obj_set(params, "context", context);
     return params;
 }
 
@@ -667,8 +1172,8 @@ static int run_cancel_checks(const char *exe) {
     mkdir(root, 0755);
 #endif
 
-    /* Generated project: each file mentions `cancelMe` exactly once, so a
-     * full references walk reports one location per file. */
+    /* Each generated file references the same Doc.cancelMe declaration, so
+     * the semantic references walk must still report one location per file. */
     for (int i = 0; i < CANCEL_FILES; i++) {
         char path[700];
         snprintf(path, sizeof(path), "%s%cGen%d.zan", root,
@@ -683,7 +1188,7 @@ static int run_cancel_checks(const char *exe) {
         fprintf(f, "class Gen%d {\n", i);
         for (int l = 0; l < CANCEL_FILLER_LINES; l++)
             fprintf(f, "    int pad%d = %d;\n", l, l);
-        fprintf(f, "    int cancelMe;\n}\n");
+        fprintf(f, "    void Use(Doc doc) { doc.cancelMe = 1; }\n}\n");
         fclose(f);
     }
 
@@ -786,6 +1291,11 @@ static int run_cancel_checks(const char *exe) {
               "cancel: pipeline still serves requests after cancellations");
     ext_check(r102 && strstr(r102, "Gen1") != NULL,
               "cancel: post-cancel walk still scans project files");
+    json_value *refs_response = r102 ? json_parse(r102) : NULL;
+    int got_count = refs_response ? json_arr_count(json_obj_get(refs_response, "result")) : -1;
+    ext_check(refs_response && got_count == CANCEL_FILES,
+              "cancel: reopened pipeline resolves one exact declaration across all unopened files");
+    json_free(refs_response);
     free(r102);
 
     /* shutdown + exit */
@@ -851,7 +1361,7 @@ int main(int argc, char **argv) {
         child_close(&child);
         return 1;
     }
-    json_free(resp);
+    free(resp);
 
     /* textDocument/didOpen -- registers the doc and triggers diagnostics */
     {
@@ -891,7 +1401,7 @@ int main(int argc, char **argv) {
 
     int rc = 1;
     json_value *root = json_parse(def);
-    json_free(def);
+    free(def);
     if (!root) {
         fprintf(stderr, "FAIL: unparseable definition response\n");
         child_close(&child);
@@ -930,6 +1440,9 @@ int main(int argc, char **argv) {
 
     if (rc == 0)
         rc = run_scope_checks(&child);
+
+    if (rc == 0)
+        rc = run_completion_checks(&child);
 
     if (rc == 0)
         rc = run_semantic_and_hint_checks(&child);

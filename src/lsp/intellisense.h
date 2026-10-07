@@ -306,6 +306,9 @@ bool intel_local_extent(intellisense_t *is, const char *word, int line,
 bool intel_same_file(const char *a, const char *b);
 const isym_t *intel_lookup_symbol_at(intellisense_t *is, const char *word,
                                     int line, int col);
+/* True when the word is one of the language keywords — never a legal
+ * replacement identifier for rename. */
+bool intel_is_keyword(const char *word);
 /* Name-only lookup across an aggregate index (project/stdlib/packages):
  * ignores current_file/position, prefers type members over declarations. */
 const isym_t *intel_lookup_symbol_any(intellisense_t *is, const char *word);
