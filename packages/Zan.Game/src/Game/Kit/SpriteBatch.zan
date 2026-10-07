@@ -38,6 +38,13 @@ class SpriteBatch {
     int drawCalls;   // End() 实际提交的类型组数（0..3）
     int globalAlpha; // 0..255
 
+    // B-ID121 打包缓冲：每类型组一条持久原生缓冲（按容量预分配，
+    // 帧间零分配），End() 把 SOA 命令按提交映射（CDraw 坐标映射 +
+    // ARGB 折色）写进去，每类型一次 FFI 提交。
+    nint bufRects;
+    nint bufBalls;
+    nint bufGlows;
+
     SpriteBatch() {
         this.capacity = 1024;
         this.allocCommands();
@@ -103,43 +110,75 @@ class SpriteBatch {
         this.culledCount = 0;
     }
 
-    /// <summary>结束批处理阶段：按类型归组一次性提交命令缓冲。</summary>
+    /// <summary>结束批处理阶段：按类型归组一次性提交命令缓冲。
+    /// B-ID121：每类型把 SOA 命令打包进持久原生缓冲（帧间零分配），
+    /// 一次 FFI 提交整组——打包时的坐标映射（CDraw 逻辑→设备）与
+    /// ARGB 折色和逐条 CDraw/CSprite 提交逐像素等价。</summary>
     void End() {
         this.inBatch = false;
         if (this.canvas != null) {
-            bool any = false;
+            this.ensurePackBuffers();
+            Span<int> rp = new Span<int>(this.bufRects, this.capacity * 5);
+            int nr = 0;
             for (int i = 0; i < this.count; i = i + 1) {
-                if (this.cmdType[i] == CmdRect) {
-                    CDraw.FillRect(this.canvas, this.cmdX[i], this.cmdY[i],
-                                   this.cmdW[i], this.cmdH[i],
-                                   CDraw.Argb(this.cmdA[i], this.cmdR[i],
-                                              this.cmdG[i], this.cmdB[i]));
-                    any = true;
-                }
+                if (this.cmdType[i] != CmdRect) { continue; }
+                int b = nr * 5;
+                rp[b] = CDraw.MapX(this.cmdX[i] + CDraw.originX);
+                rp[b + 1] = CDraw.MapY(this.cmdY[i] + CDraw.originY);
+                rp[b + 2] = CDraw.MapW(this.cmdW[i]);
+                rp[b + 3] = CDraw.MapW(this.cmdH[i]);
+                rp[b + 4] = CDraw.Argb(this.cmdA[i], this.cmdR[i],
+                                       this.cmdG[i], this.cmdB[i]);
+                nr = nr + 1;
             }
-            if (any) { this.drawCalls = this.drawCalls + 1; }
-            any = false;
+            if (nr > 0) {
+                this.canvas.FillRects(this.bufRects, nr);
+                this.drawCalls = this.drawCalls + 1;
+            }
+            Span<int> bp = new Span<int>(this.bufBalls, this.capacity * 4);
+            int nb = 0;
             for (int i = 0; i < this.count; i = i + 1) {
-                if (this.cmdType[i] == CmdBall) {
-                    CSprite.Ball(this.canvas, this.cmdX[i], this.cmdY[i],
-                                 this.cmdW[i], this.cmdR[i], this.cmdG[i],
-                                 this.cmdB[i], this.cmdA[i]);
-                    any = true;
-                }
+                if (this.cmdType[i] != CmdBall) { continue; }
+                int b = nb * 4;
+                bp[b] = CDraw.MapX(this.cmdX[i] + CDraw.originX);
+                bp[b + 1] = CDraw.MapY(this.cmdY[i] + CDraw.originY);
+                bp[b + 2] = CDraw.MapW(this.cmdW[i]);
+                bp[b + 3] = CDraw.Argb(this.cmdA[i], this.cmdR[i],
+                                       this.cmdG[i], this.cmdB[i]);
+                nb = nb + 1;
             }
-            if (any) { this.drawCalls = this.drawCalls + 1; }
-            any = false;
+            if (nb > 0) {
+                this.canvas.FillCircles(this.bufBalls, nb);
+                this.drawCalls = this.drawCalls + 1;
+            }
+            Span<int> gp = new Span<int>(this.bufGlows, this.capacity * 5);
+            int ng = 0;
             for (int i = 0; i < this.count; i = i + 1) {
-                if (this.cmdType[i] == CmdGlow) {
-                    CSprite.Glow(this.canvas, this.cmdX[i], this.cmdY[i],
-                                 this.cmdW[i], this.cmdR[i], this.cmdG[i],
-                                 this.cmdB[i], this.cmdA[i]);
-                    any = true;
-                }
+                if (this.cmdType[i] != CmdGlow) { continue; }
+                int b = ng * 5;
+                gp[b] = CDraw.MapX(this.cmdX[i] + CDraw.originX);
+                gp[b + 1] = CDraw.MapY(this.cmdY[i] + CDraw.originY);
+                gp[b + 2] = CDraw.MapW(this.cmdW[i]);
+                gp[b + 3] = CDraw.Argb(255, this.cmdR[i],
+                                       this.cmdG[i], this.cmdB[i]);
+                gp[b + 4] = this.cmdA[i];
+                ng = ng + 1;
             }
-            if (any) { this.drawCalls = this.drawCalls + 1; }
+            if (ng > 0) {
+                this.canvas.FillRadials(this.bufGlows, ng);
+                this.drawCalls = this.drawCalls + 1;
+            }
         }
         this.canvas = null;
+    }
+
+    /// 首次带画布的 End() 时按容量分配三段持久打包缓冲；
+    /// 只增不清（批处理上下文与游戏同生命周期）。
+    void ensurePackBuffers() {
+        if (this.bufRects != 0) { return; }
+        this.bufRects = NativeMemory.Alloc(this.capacity * 5 * 4);
+        this.bufBalls = NativeMemory.Alloc(this.capacity * 4 * 4);
+        this.bufGlows = NativeMemory.Alloc(this.capacity * 5 * 4);
     }
 
     /// <summary>批量绘制实心矩形。</summary>

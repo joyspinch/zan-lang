@@ -2927,6 +2927,83 @@ EXPORT void zan_gui_fill_radial(i32 surface_id, i32 cx, i32 cy, i32 radius, i32 
                                          (u32)color, (int)inner_a);
 }
 
+/* B-ID121: batch fill primitives -- one FFI crossing per type group instead of
+ * one per primitive. `data` is a packed i32 buffer with a fixed stride:
+ * rects = x,y,w,h,argb (5), circles = cx,cy,r,argb (4),
+ * radials = cx,cy,r,argb,inner_a (5). Each primitive takes the exact same
+ * rasterization path as its single-primitive entry point (backend dispatch
+ * with its automatic CPU/GPU sync per call). Game.Kit.SpriteBatch's command
+ * buffer submits one call per type group through these. */
+EXPORT void zan_gui_fill_rects(i32 surface_id, const i32 *data, i32 count) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || !data || count < 1) return;
+    for (i32 i = 0; i < count; i++) {
+        const i32 *d = data + i * 5;
+        ZAN_IMPL(s, fill_rect)->fill_rect(s, (int)d[0], (int)d[1], (int)d[2],
+                                          (int)d[3], (u32)d[4]);
+    }
+}
+
+EXPORT void zan_gui_fill_circles(i32 surface_id, const i32 *data, i32 count) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || !data || count < 1) return;
+    for (i32 i = 0; i < count; i++) {
+        const i32 *d = data + i * 4;
+        ZAN_IMPL(s, fill_circle)->fill_circle(s, (int)d[0], (int)d[1],
+                                              (int)d[2], (u32)d[3]);
+    }
+}
+
+EXPORT void zan_gui_fill_radials(i32 surface_id, const i32 *data, i32 count) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || !data || count < 1) return;
+    for (i32 i = 0; i < count; i++) {
+        const i32 *d = data + i * 5;
+        ZAN_IMPL(s, fill_radial)->fill_radial(s, (int)d[0], (int)d[1],
+                                              (int)d[2], (u32)d[3], (int)d[4]);
+    }
+}
+
+/* B-ID118: opaque surface-to-surface blit (game viewport offscreen
+ * compositing). Copies src's (src_x,src_y,w,h) verbatim onto dst at
+ * (dst_x,dst_y). Formats are identical 32bpp, so rows memcpy straight across.
+ * Clamped to src bounds and to dst's active clip window, so partial-frame
+ * band clipping applies to the composite exactly as to any primitive.
+ * Like the other NULL-vtable ops this runs on CPU pixels: sync_to_cpu pulls
+ * both surfaces' current frames in first, sync_from_cpu pushes the result
+ * back so the next GPU primitive and the present see the blitted rows. */
+EXPORT void zan_gui_blit_surface(i32 dst_id, i32 src_id, i32 dst_x, i32 dst_y,
+                                 i32 src_x, i32 src_y, i32 w, i32 h) {
+    if (dst_id < 0 || dst_id >= g_surface_count) return;
+    if (src_id < 0 || src_id >= g_surface_count) return;
+    zan_surface_t *d = g_surfaces[dst_id];
+    zan_surface_t *s = g_surfaces[src_id];
+    if (!d || !s || !d->pixels || !s->pixels) return;
+    if (w <= 0 || h <= 0) return;
+    if (s->be && s->be->sync_to_cpu) s->be->sync_to_cpu(s);
+    if (d->be && d->be->sync_to_cpu) d->be->sync_to_cpu(d);
+    int sx = (int)src_x, sy = (int)src_y, dx = (int)dst_x, dy = (int)dst_y;
+    int cw = (int)w, ch = (int)h;
+    if (sx < 0) { dx -= sx; cw += sx; sx = 0; }
+    if (sy < 0) { dy -= sy; ch += sy; sy = 0; }
+    if (sx + cw > s->width) cw = s->width - sx;
+    if (sy + ch > s->height) ch = s->height - sy;
+    if (dx < d->clip_x0) { int cut = d->clip_x0 - dx; dx += cut; sx += cut; cw -= cut; }
+    if (dy < d->clip_y0) { int cut = d->clip_y0 - dy; dy += cut; sy += cut; ch -= cut; }
+    if (dx + cw > d->clip_x1) cw = d->clip_x1 - dx;
+    if (dy + ch > d->clip_y1) ch = d->clip_y1 - dy;
+    if (cw <= 0 || ch <= 0) return;
+    for (int row = 0; row < ch; row++) {
+        u32 *from = s->pixels + (size_t)(sy + row) * (size_t)s->stride + (size_t)sx;
+        u32 *to = d->pixels + (size_t)(dy + row) * (size_t)d->stride + (size_t)dx;
+        memcpy(to, from, (size_t)cw * sizeof(u32));
+    }
+    if (d->be && d->be->sync_from_cpu) d->be->sync_from_cpu(d);
+}
+
 /* Anti-aliased filled ring sector (pie / donut slice). Angles in degrees with
  * 0 at 12 o'clock, increasing clockwise. r_inner=0 gives a solid pie slice.
  *

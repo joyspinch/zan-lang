@@ -24,6 +24,14 @@ class GameViewport : Control {
     // 部分重绘导致一帧多次 OnPaint 时，逻辑与输入边沿不会被重复推进/
     // 提前清掉，逻辑帧率也不被渲染帧率门死
     bool hostDriven;
+    // B-ID118 离屏位图：世界渲染进这块持久表面，OnPaint 只做贴图
+    // 合成（BlitSurface 遵守宿主当前裁剪条带，局部帧下贴图被裁成
+    // 条带）。世界代数没变且尺寸没变时整块复用上帧离屏像素——静态
+    // 场景（菜单/暂停）的 GUI 帧零世界渲染开销；动态世界每个逻辑
+    // 帧照常重渲染，插值平滑不受影响。表面与宿主画布同为 32bpp。
+    Canvas off;
+    int offWorldGen;
+    bool offValid;
 
     GameViewport(Scene scene, int dockMode) {
         this.InitControl("game_viewport", dockMode > 0 ? dockMode : 5); // 默认 dock=5 铺满剩余空间
@@ -35,6 +43,9 @@ class GameViewport : Control {
         // 物理逻辑、网络与异步任务由独立的固定步长时钟 (StepLogic / FixedStepClock) 或后台调度器驱动。
         this.autoDriveClock = false;
         this.hostDriven = false;
+        this.off = null;
+        this.offWorldGen = 0;
+        this.offValid = false;
     }
 
     static GameViewport Create(Scene scene) {
@@ -93,10 +104,26 @@ class GameViewport : Control {
             activeScene.Tick();
         }
 
-        // 3. 游戏场景世界渲染（自动包含视锥剔除与 YSort 动态遮挡排序）
-        activeScene.Render(c);
+        // 3. 世界渲染进持久离屏表面，再整块贴到宿主画布。
+        //    世界代数变了（或表面刚重建）才重渲染：先清成不透明黑
+        //    （场景背景契约——想要背景色的场景画一块满屏背景实体），
+        //    再走正常的视锥剔除 + 插值 + YSort 渲染。
+        if (this.bw > 0 && this.bh > 0) {
+            if (this.off == null || this.off.Width() != this.bw
+                || this.off.Height() != this.bh) {
+                this.RecreateOff(this.bw, this.bh);
+            }
+            if (!this.offValid || activeScene.WorldGen() != this.offWorldGen) {
+                this.off.Clear(-16777216);
+                activeScene.Render(this.off);
+                this.offWorldGen = activeScene.WorldGen();
+                this.offValid = true;
+            }
+            c.BlitSurface(this.off, this.bx, this.by, 0, 0, this.bw, this.bh);
+        }
 
-        // 4. 顶层游戏 HUD 叠加绘制（小地图、状态槽、技能快捷栏）
+        // 4. 顶层游戏 HUD 叠加绘制（小地图、状态槽、技能快捷栏）——
+        //    HUD 直接画宿主画布：它跟 GUI 状态走，不进离屏。
         if (onRenderHudCallback != null) {
             onRenderHudCallback(c, this.bw, this.bh);
         }
@@ -106,5 +133,14 @@ class GameViewport : Control {
         if (autoDriveClock && !hostDriven) {
             input.FlushFrameEvents();
         }
+    }
+
+    /// 重建离屏表面（首帧或视口尺寸变化）。先建新再销旧，
+    /// 防表面 id 被立刻复用读到旧内容；重建后强制重渲染。
+    void RecreateOff(int w, int h) {
+        Canvas old = this.off;
+        this.off = new Canvas(w, h);
+        if (old != null) { old.Destroy(); }
+        this.offValid = false;
     }
 }
