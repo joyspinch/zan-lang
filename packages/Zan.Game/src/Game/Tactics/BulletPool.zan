@@ -36,6 +36,14 @@ class BulletPool {
     double[] splashRadius;
     double[] lifeTime;
 
+    // 空闲槽位栈 + 活跃槽位紧凑表：Spawn O(1) 弹栈、Kill O(1) 归还，
+    // Update 只遍历活跃段——替换"Spawn 线性扫全容量、Update 空转全容量"的
+    // 每帧固定开销（容量 512、活跃 10 颗时原先每帧仍检查 512 槽）
+    int[] freeStack;    // [capacity] 空闲槽位号栈
+    int freeTop;        // 栈内元素数
+    int[] activeList;   // [activeCount] 活跃槽位紧凑表
+    int[] activePos;    // [capacity] 槽位在 activeList 中的下标，-1=不活跃
+
     BulletPool(int cap) {
         this.capacity = cap > 0 ? cap : 512;
         this.activeCount = 0;
@@ -52,6 +60,17 @@ class BulletPool {
         this.damage = new double[capacity];
         this.splashRadius = new double[capacity];
         this.lifeTime = new double[capacity];
+
+        this.freeStack = new int[capacity];
+        for (int i = 0; i < capacity; i = i + 1) {
+            this.freeStack[i] = capacity - 1 - i;
+        }
+        this.freeTop = capacity;
+        this.activeList = new int[capacity];
+        this.activePos = new int[capacity];
+        for (int i = 0; i < capacity; i = i + 1) {
+            this.activePos[i] = -1;
+        }
     }
 
     static BulletPool Create(int capacity) {
@@ -70,15 +89,10 @@ class BulletPool {
 
     /// <summary>发射一枚直线或追踪子弹。</summary>
     int Spawn(BulletType type, double spawnX, double spawnY, int tgtId, double tgtX, double tgtY, double speed, double dmg, double splashR, double maxLife) {
-        // 查找空闲槽位
-        int slot = -1;
-        for (int i = 0; i < capacity; i = i + 1) {
-            if (!active[i]) {
-                slot = i;
-                break;
-            }
-        }
-        if (slot < 0) { return -1; }
+        // 从空闲栈弹出槽位（O(1)，替换线性扫描）
+        if (freeTop <= 0) { return -1; }
+        freeTop = freeTop - 1;
+        int slot = freeStack[freeTop];
 
         active[slot] = true;
         bulletType[slot] = (int)type;
@@ -102,22 +116,26 @@ class BulletPool {
             velY[slot] = 0.0;
         }
 
+        activePos[slot] = activeCount;
+        activeList[activeCount] = slot;
         activeCount = activeCount + 1;
         return slot;
     }
 
     /// <summary>
-    /// 逐物理步长更新所有活动子弹位置，返回命中目标的子弹索引委托回调。
+    /// 逐物理步长更新所有活动子弹位置，命中目标时回调。
+    /// 只遍历活跃段（activeList），消亡槽位 swap-with-last 移出，
+    /// 换上来的槽位当帧继续处理。
     /// </summary>
     void Update(double dt, BulletHitFn onHitCallback) {
-        for (int i = 0; i < capacity; i = i + 1) {
-            if (!active[i]) { continue; }
+        int ai = 0;
+        while (ai < activeCount) {
+            int i = activeList[ai];
 
             lifeTime[i] = lifeTime[i] - dt;
             if (lifeTime[i] <= 0.0) {
                 // 超时消亡
-                active[i] = false;
-                activeCount = activeCount - 1;
+                DespawnAt(ai);
                 continue;
             }
 
@@ -131,16 +149,30 @@ class BulletPool {
                 if (onHitCallback != null) {
                     onHitCallback(i, posX[i], posY[i], damage[i], splashRadius[i]);
                 }
-                active[i] = false;
-                activeCount = activeCount - 1;
+                DespawnAt(ai);
+                continue;
             }
+            ai = ai + 1;
         }
+    }
+
+    /// <summary>把 activeList[ai] 的槽位归还空闲栈（swap-with-last，O(1)）。</summary>
+    void DespawnAt(int ai) {
+        int slot = activeList[ai];
+        int last = activeCount - 1;
+        int moving = activeList[last];
+        activeList[ai] = moving;
+        activePos[moving] = ai;
+        activeCount = last;
+        active[slot] = false;
+        activePos[slot] = -1;
+        freeStack[freeTop] = slot;
+        freeTop = freeTop + 1;
     }
 
     void Kill(int idx) {
         if (idx >= 0 && idx < capacity && active[idx]) {
-            active[idx] = false;
-            activeCount = activeCount - 1;
+            DespawnAt(activePos[idx]);
         }
     }
 }

@@ -5,27 +5,86 @@ namespace Game.Kit;
 
 /// <summary>
 /// 2D 游戏批量图元与精灵渲染上下文。
-/// 封装批量绘制指令流、全局颜色/Alpha 混合与视口映射，提供绘图统计以指导性能调优。
+/// 命令缓冲架构：DrawXxx 只把图元写入预分配的 SOA 命令缓冲（热路径
+/// 零分配、零底层调用），End() 按类型归组（矩形 → 圆盘 → 光晕）提交，
+/// 同类型提交保持记录顺序；跨类型的提交顺序与记录顺序可能不同，
+/// 依赖严格混排绘制序的半透明叠加场景直接用 Canvas。全局 Alpha 在
+/// 记录期折算进命令，逐条提交的观感与立即模式一致。
+/// 命令缓冲写满时静默丢弃（容量在 Create 时定）。
 /// </summary>
 class SpriteBatch {
+    // 命令类型：提交按 矩形 → 圆盘 → 光晕 归组
+    const int CmdRect = 0;
+    const int CmdBall = 1;
+    const int CmdGlow = 2;
+
+    int capacity;
+    int count;
+    int culledCount; // 记录期剔除的无效命令（零透明度/零半径）
+
+    // SOA 命令缓冲：x/y 定位；w/h 是矩形尺寸，圆盘/光晕复用 w=半径
+    int[] cmdType;
+    int[] cmdX;
+    int[] cmdY;
+    int[] cmdW;
+    int[] cmdH;
+    int[] cmdR;
+    int[] cmdG;
+    int[] cmdB;
+    int[] cmdA;
+
     Canvas canvas;
     bool inBatch;
-    int drawCalls;
-    int itemCount;
+    int drawCalls;   // End() 实际提交的类型组数（0..3）
     int globalAlpha; // 0..255
 
     SpriteBatch() {
-        this.globalAlpha = 255;
+        this.capacity = 1024;
+        this.allocCommands();
+        this.canvas = null;
         this.inBatch = false;
         this.drawCalls = 0;
-        this.itemCount = 0;
+        this.count = 0;
+        this.culledCount = 0;
+        this.globalAlpha = 255;
     }
 
-    /// <summary>当前已提交的批次绘制调用数（DrawCalls）。</summary>
+    SpriteBatch(int cap) {
+        this.capacity = cap > 0 ? cap : 1024;
+        this.allocCommands();
+        this.canvas = null;
+        this.inBatch = false;
+        this.drawCalls = 0;
+        this.count = 0;
+        this.culledCount = 0;
+        this.globalAlpha = 255;
+    }
+
+    void allocCommands() {
+        this.cmdType = new int[capacity];
+        this.cmdX = new int[capacity];
+        this.cmdY = new int[capacity];
+        this.cmdW = new int[capacity];
+        this.cmdH = new int[capacity];
+        this.cmdR = new int[capacity];
+        this.cmdG = new int[capacity];
+        this.cmdB = new int[capacity];
+        this.cmdA = new int[capacity];
+    }
+
+    /// <summary>分配可容纳 capacity 条命令的批处理上下文。</summary>
+    static SpriteBatch Create(int capacity) {
+        return new SpriteBatch(capacity);
+    }
+
+    /// <summary>当前已提交的批次类型组数（End 后有效）。</summary>
     int DrawCalls() { return this.drawCalls; }
 
-    /// <summary>本帧批量绘制的项目（图元/精灵）总数。</summary>
-    int ItemCount() { return this.itemCount; }
+    /// <summary>本批记录的图元命令总数。</summary>
+    int ItemCount() { return this.count; }
+
+    /// <summary>本批记录期被剔除的无效命令数（零透明度/零半径）。</summary>
+    int CulledCount() { return this.culledCount; }
 
     /// <summary>设置全局 Alpha 透明度乘数（0~255）。</summary>
     void SetGlobalAlpha(int alpha) {
@@ -34,51 +93,110 @@ class SpriteBatch {
         this.globalAlpha = alpha;
     }
 
-    /// <summary>开始一个精灵批处理阶段。</summary>
+    /// <summary>开始一个精灵批处理阶段。canvas 为 null 时只记录不提交
+    /// （供无头逻辑测试与统计）。</summary>
     void Begin(Canvas c) {
         this.canvas = c;
         this.inBatch = true;
         this.drawCalls = 0;
-        this.itemCount = 0;
+        this.count = 0;
+        this.culledCount = 0;
     }
 
-    /// <summary>结束批处理阶段。</summary>
+    /// <summary>结束批处理阶段：按类型归组一次性提交命令缓冲。</summary>
     void End() {
         this.inBatch = false;
+        if (this.canvas != null) {
+            bool any = false;
+            for (int i = 0; i < this.count; i = i + 1) {
+                if (this.cmdType[i] == CmdRect) {
+                    CDraw.FillRect(this.canvas, this.cmdX[i], this.cmdY[i],
+                                   this.cmdW[i], this.cmdH[i],
+                                   CDraw.Argb(this.cmdA[i], this.cmdR[i],
+                                              this.cmdG[i], this.cmdB[i]));
+                    any = true;
+                }
+            }
+            if (any) { this.drawCalls = this.drawCalls + 1; }
+            any = false;
+            for (int i = 0; i < this.count; i = i + 1) {
+                if (this.cmdType[i] == CmdBall) {
+                    CSprite.Ball(this.canvas, this.cmdX[i], this.cmdY[i],
+                                 this.cmdW[i], this.cmdR[i], this.cmdG[i],
+                                 this.cmdB[i], this.cmdA[i]);
+                    any = true;
+                }
+            }
+            if (any) { this.drawCalls = this.drawCalls + 1; }
+            any = false;
+            for (int i = 0; i < this.count; i = i + 1) {
+                if (this.cmdType[i] == CmdGlow) {
+                    CSprite.Glow(this.canvas, this.cmdX[i], this.cmdY[i],
+                                 this.cmdW[i], this.cmdR[i], this.cmdG[i],
+                                 this.cmdB[i], this.cmdA[i]);
+                    any = true;
+                }
+            }
+            if (any) { this.drawCalls = this.drawCalls + 1; }
+        }
         this.canvas = null;
     }
 
     /// <summary>批量绘制实心矩形。</summary>
     void DrawRect(int x, int y, int w, int h, int color) {
-        if (!this.inBatch || this.canvas == null) { return; }
-        if (this.globalAlpha < 255) {
-            int a = ((color >> 24) & 255) * this.globalAlpha / 255;
-            color = (a << 24) | (color & 16777215);
+        if (!this.inBatch || this.count >= this.capacity) { return; }
+        int a = ((color >> 24) & 255) * this.globalAlpha / 255;
+        if (a <= 0) {
+            this.culledCount = this.culledCount + 1;
+            return;
         }
-        CDraw.FillRect(this.canvas, x, y, w, h, color);
-        this.itemCount = this.itemCount + 1;
-        this.drawCalls = this.drawCalls + 1;
+        this.cmdType[this.count] = CmdRect;
+        this.cmdX[this.count] = x;
+        this.cmdY[this.count] = y;
+        this.cmdW[this.count] = w;
+        this.cmdH[this.count] = h;
+        this.cmdR[this.count] = (color >> 16) & 255;
+        this.cmdG[this.count] = (color >> 8) & 255;
+        this.cmdB[this.count] = color & 255;
+        this.cmdA[this.count] = a;
+        this.count = this.count + 1;
     }
 
     /// <summary>批量绘制实心圆盘。</summary>
     void DrawBall(int cx, int cy, int rad, int r, int g, int b, int a) {
-        if (!this.inBatch || this.canvas == null) { return; }
-        if (this.globalAlpha < 255) {
-            a = a * this.globalAlpha / 255;
+        if (!this.inBatch || this.count >= this.capacity) { return; }
+        a = a * this.globalAlpha / 255;
+        if (a <= 0 || rad <= 0) {
+            this.culledCount = this.culledCount + 1;
+            return;
         }
-        CSprite.Ball(this.canvas, cx, cy, rad, r, g, b, a);
-        this.itemCount = this.itemCount + 1;
-        this.drawCalls = this.drawCalls + 1;
+        this.cmdType[this.count] = CmdBall;
+        this.cmdX[this.count] = cx;
+        this.cmdY[this.count] = cy;
+        this.cmdW[this.count] = rad;
+        this.cmdR[this.count] = r;
+        this.cmdG[this.count] = g;
+        this.cmdB[this.count] = b;
+        this.cmdA[this.count] = a;
+        this.count = this.count + 1;
     }
 
     /// <summary>批量绘制柔和径向光晕。</summary>
     void DrawGlow(int cx, int cy, int rad, int r, int g, int b, int a) {
-        if (!this.inBatch || this.canvas == null) { return; }
-        if (this.globalAlpha < 255) {
-            a = a * this.globalAlpha / 255;
+        if (!this.inBatch || this.count >= this.capacity) { return; }
+        a = a * this.globalAlpha / 255;
+        if (a <= 0 || rad <= 0) {
+            this.culledCount = this.culledCount + 1;
+            return;
         }
-        CSprite.Glow(this.canvas, cx, cy, rad, r, g, b, a);
-        this.itemCount = this.itemCount + 1;
-        this.drawCalls = this.drawCalls + 1;
+        this.cmdType[this.count] = CmdGlow;
+        this.cmdX[this.count] = cx;
+        this.cmdY[this.count] = cy;
+        this.cmdW[this.count] = rad;
+        this.cmdR[this.count] = r;
+        this.cmdG[this.count] = g;
+        this.cmdB[this.count] = b;
+        this.cmdA[this.count] = a;
+        this.count = this.count + 1;
     }
 }

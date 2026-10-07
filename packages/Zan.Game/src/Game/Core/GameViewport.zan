@@ -19,6 +19,11 @@ class GameViewport : Control {
     InputMapper input;
     HudRenderFn onRenderHudCallback;
     bool autoDriveClock;
+    // 经 GuiHost.AttachViewport 挂载后为 true：逻辑由宿主帧循环的
+    // 固定步长阶段统一推进，OnPaint 不再 Tick/FlushFrameEvents——
+    // 部分重绘导致一帧多次 OnPaint 时，逻辑与输入边沿不会被重复推进/
+    // 提前清掉，逻辑帧率也不被渲染帧率门死
+    bool hostDriven;
 
     GameViewport(Scene scene, int dockMode) {
         this.InitControl("game_viewport", dockMode > 0 ? dockMode : 5); // 默认 dock=5 铺满剩余空间
@@ -29,6 +34,7 @@ class GameViewport : Control {
         // 默认 autoDriveClock 为 false，渲染帧仅负责提交世界与 HUD 画面；
         // 物理逻辑、网络与异步任务由独立的固定步长时钟 (StepLogic / FixedStepClock) 或后台调度器驱动。
         this.autoDriveClock = false;
+        this.hostDriven = false;
     }
 
     static GameViewport Create(Scene scene) {
@@ -39,14 +45,20 @@ class GameViewport : Control {
     InputMapper Input { get { return input; } }
     bool AutoDriveClock { get { return autoDriveClock; } set { autoDriveClock = value; } }
 
+    /// <summary>由 GuiHost.AttachViewport 调用：声明逻辑由宿主帧循环驱动。</summary>
+    void MarkHostDriven() {
+        this.hostDriven = true;
+    }
+
     /// <summary>注册顶层 HUD / UI 绘制回调（在场景世界渲染完成后叠加）。</summary>
     void SetHudRenderer(HudRenderFn hudCallback) {
         this.onRenderHudCallback = hudCallback;
     }
 
     /// <summary>
-    /// 推进一次游戏世界物理与逻辑步进（可由后台固定步长定时器/独立循环驱动，
-    /// 确保物理与异步逻辑完全不依赖界面渲染帧率）。
+    /// 推进一次游戏世界物理与逻辑步进（由宿主帧循环的固定步长阶段、
+    /// 后台定时器或独立循环驱动，确保物理与异步逻辑完全不依赖界面
+    /// 渲染帧率）。经 GuiHost.AttachViewport 挂载的视口由宿主自动调用。
     /// </summary>
     void StepLogic() {
         if (activeScene != null) {
@@ -75,8 +87,9 @@ class GameViewport : Control {
             activeScene.Camera.Resize(this.bw, this.bh);
         }
 
-        // 2. 推进游戏时钟步进与实体物理（兼容单管线简易模式；若外部定时驱动则 autoDriveClock=false）
-        if (autoDriveClock) {
+        // 2. 推进游戏时钟步进与实体物理（兼容单管线简易模式；
+        //    挂宿主或外部定时驱动则走 StepLogic，渲染帧不推进逻辑）
+        if (autoDriveClock && !hostDriven) {
             activeScene.Tick();
         }
 
@@ -88,8 +101,9 @@ class GameViewport : Control {
             onRenderHudCallback(c, this.bw, this.bh);
         }
 
-        // 5. 刷新单帧输入击发事件（单管线模式下刷新）
-        if (autoDriveClock) {
+        // 5. 刷新单帧输入击发事件（单管线简易模式；挂宿主后由 StepLogic 刷新，
+        //    避免一帧多次 OnPaint 把还没读到的输入边沿提前清掉）
+        if (autoDriveClock && !hostDriven) {
             input.FlushFrameEvents();
         }
     }
