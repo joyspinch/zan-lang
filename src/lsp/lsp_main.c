@@ -618,6 +618,45 @@ static bool using_ns_context(const char *text, size_t off,
     return true;
 }
 
+/* The dotted receiver expression immediately before a member word: for
+ * `MainStatusBar.SetText` with the cursor inside SetText this yields
+ * "MainStatusBar". `offset` is the cursor offset; the word start is found
+ * with the same backward scan word_at uses (the cursor may sit mid-word).
+ * The scan stops at any character a simple receiver chain cannot contain
+ * (whitespace, parens, operators); returns false when the character before
+ * the word is not a dot. */
+static bool receiver_chain_before(const char *text, size_t offset,
+                                  char *out, size_t cap) {
+    size_t start = offset;
+    while (start > 0 && is_ident_char(text[start - 1])) start--;
+    if (start == 0 || text[start - 1] != '.') return false;
+    size_t end = start - 1; /* at the dot */
+    size_t from = end;
+    for (;;) {
+        while (from > 0) {
+            char c = text[from - 1];
+            if (isalnum((unsigned char)c) || c == '_' || c == '.' ||
+                c == '<' || c == '>' || c == '?') from--;
+            else break;
+        }
+        if (from > 0 && (text[from - 1] == '"' || text[from - 1] == '\'')) {
+            /* string/char literal in the chain: consume back to the opening
+             * quote and keep collecting (`"abc".ToUpper` -> `"abc".ToUpper`) */
+            char q = text[from - 1];
+            from--;
+            while (from > 0 && text[from - 1] != q) from--;
+            if (from > 0) from--;
+            continue;
+        }
+        break;
+    }
+    size_t len = end - from;
+    if (len == 0 || len >= cap) return false;
+    memcpy(out, text + from, len);
+    out[len] = '\0';
+    return true;
+}
+
 static void member_context(const char *text, size_t offset, char *out, size_t cap) {
     out[0] = '\0';
     size_t start = offset;
@@ -696,9 +735,11 @@ static void member_context(const char *text, size_t offset, char *out, size_t ca
 static void method_call_context(const char *text, size_t offset,
                                 char *method_out, size_t method_cap,
                                 char *class_out, size_t class_cap,
-                                int *active_param) {
+                                int *active_param,
+                                char *recv_chain_out, size_t recv_chain_cap) {
     method_out[0] = '\0';
     class_out[0] = '\0';
+    if (recv_chain_out && recv_chain_cap > 0) recv_chain_out[0] = '\0';
     *active_param = 0;
 
     int paren_depth = 0;
@@ -754,6 +795,12 @@ static void method_call_context(const char *text, size_t offset,
 
     /* check for class.method pattern */
     if (end > 0 && text[end - 1] == '.') {
+        /* the full receiver chain behind the dot (literals and multi-hop
+         * chains included) for receiver-typed signature resolution */
+        if (recv_chain_out && recv_chain_cap > 0) {
+            recv_chain_out[0] = '\0';
+            receiver_chain_before(text, end, recv_chain_out, recv_chain_cap);
+        }
         size_t dot_pos = end - 1;
         size_t cls_end = dot_pos;
         size_t cls_start = cls_end;
@@ -762,6 +809,8 @@ static void method_call_context(const char *text, size_t offset,
         if (cn >= class_cap) cn = class_cap - 1;
         memcpy(class_out, text + cls_start, cn);
         class_out[cn] = '\0';
+    } else if (recv_chain_out && recv_chain_cap > 0) {
+        recv_chain_out[0] = '\0';
     }
 }
 
@@ -1585,45 +1634,6 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
     send_response(s, id, items);
 }
 
-/* The dotted receiver expression immediately before a member word: for
- * `MainStatusBar.SetText` with the cursor inside SetText this yields
- * "MainStatusBar". `offset` is the cursor offset; the word start is found
- * with the same backward scan word_at uses (the cursor may sit mid-word).
- * The scan stops at any character a simple receiver chain cannot contain
- * (whitespace, parens, operators); returns false when the character before
- * the word is not a dot. */
-static bool receiver_chain_before(const char *text, size_t offset,
-                                  char *out, size_t cap) {
-    size_t start = offset;
-    while (start > 0 && is_ident_char(text[start - 1])) start--;
-    if (start == 0 || text[start - 1] != '.') return false;
-    size_t end = start - 1; /* at the dot */
-    size_t from = end;
-    for (;;) {
-        while (from > 0) {
-            char c = text[from - 1];
-            if (isalnum((unsigned char)c) || c == '_' || c == '.' ||
-                c == '<' || c == '>' || c == '?') from--;
-            else break;
-        }
-        if (from > 0 && (text[from - 1] == '"' || text[from - 1] == '\'')) {
-            /* string/char literal in the chain: consume back to the opening
-             * quote and keep collecting (`"abc".ToUpper` -> `"abc".ToUpper`) */
-            char q = text[from - 1];
-            from--;
-            while (from > 0 && text[from - 1] != q) from--;
-            if (from > 0) from--;
-            continue;
-        }
-        break;
-    }
-    size_t len = end - from;
-    if (len == 0 || len >= cap) return false;
-    memcpy(out, text + from, len);
-    out[len] = '\0';
-    return true;
-}
-
 static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
     const char *uri; int line, character;
     if (!get_position(params, &uri, &line, &character)) {
@@ -1970,10 +1980,11 @@ static void handle_signature_help(lsp_server_t *s, json_value *id, json_value *p
 
     size_t off = pos_to_offset(doc->text, line, character);
 
-    char method_name[128], class_context[128];
+    char method_name[128], class_context[128], recv_chain[256];
     int active_param = 0;
     method_call_context(doc->text, off, method_name, sizeof(method_name),
-                        class_context, sizeof(class_context), &active_param);
+                        class_context, sizeof(class_context), &active_param,
+                        recv_chain, sizeof(recv_chain));
 
     if (!method_name[0]) { send_response(s, id, json_new_null()); return; }
 
@@ -1982,6 +1993,24 @@ static void handle_signature_help(lsp_server_t *s, json_value *id, json_value *p
 
     signature_info_t sig = intel_signature_help(is, method_name,
                                                  class_context[0] ? class_context : NULL);
+
+    /* Receiver-typed fallback: `MainStatusBar.SetText(` — the bare receiver
+     * name is a field, not a type, so the context lookup above comes back
+     * empty and the signature would be null. Resolve the receiver's type
+     * (designer fields live in the project index) and ask again with the
+     * concrete type. */
+    if (!sig.valid && recv_chain[0]) {
+        char fm[64];
+        const char *rt = intel_resolve_chain_pos(is, g_project_intel, recv_chain,
+                                                 fm, sizeof(fm), line, character);
+        if (!rt || !rt[0]) {
+            rt = intel_resolve_chain_pos(g_project_intel, is, recv_chain,
+                                         fm, sizeof(fm), line, character);
+        }
+        if (rt && rt[0])
+            sig = intel_signature_help_pos_ex(is, g_project_intel, method_name,
+                                              rt, line, character);
+    }
 
     if (!sig.valid) { send_response(s, id, json_new_null()); return; }
 
