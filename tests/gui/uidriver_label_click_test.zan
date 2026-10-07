@@ -1,0 +1,107 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// UiDriver `clickid @语义名` 回归：命中区注册时带的语义标签
+/// （HitRegion.label，RegisterRectL 标注）在点击时刻由驱动当场
+/// 解析为区域中心并注入——脚本从此不持有数字 id。数字 id 逐帧
+/// 由 AllocId 顺序发号，前方控件增减即整体移位（ListView 拖动
+/// 停摆、菜单滚动条跳跃都曾是这个冲突），脚本若握着旧号必然
+/// 点错；按名解析以"当帧注册表即真相"根除它。三件事：
+/// ①按名点击落在带标签的控件上、同名者后注册（顶层）优先、
+/// 未标签兄弟不受牵连；②前方多注册一个命中区把数字 id 顶漂
+/// 后按名点击仍然命中（漂移对标签通道不可见）；③未知名字
+/// 被拒绝且不注入任何事件。驱动状态白盒最小初始化（app/
+/// resultsPath/probes），Exec 直接喂命令行，与真实会话同一
+/// 执行路径。
+class UiDriverLabelClickTest {
+    static int fails;
+    static App app;
+    static bool driftGate;
+    static bool clickedAlpha;
+    static bool clickedGamma;
+    static int betaClicks;
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got "
+            + Convert.ToString(got) + " want " + Convert.ToString(want));
+    }
+
+    static void Body() {
+        // 漂移源：开启后抢走第一个号，其后所有 id 每帧移位
+        // （弹层开合、列表可见行数抖动的同款场景）。
+        if (driftGate) {
+            int d = app.focus.AllocId();
+            app.hitTester.RegisterRect(d, 0, 290, 10, 10, 0);
+        }
+        int a = app.focus.AllocId();
+        int b = app.focus.AllocId();
+        int g = app.focus.AllocId();
+        app.hitTester.RegisterRectL(a, 10, 10, 80, 40, 0, "alpha");
+        app.hitTester.RegisterRectL(b, 200, 10, 80, 40, 0, "beta");
+        app.hitTester.RegisterRectL(g, 10, 200, 80, 40, 0, "gamma");
+        if (Ui.Clicked(app, a)) { clickedAlpha = true; }
+        if (Ui.Clicked(app, b)) { betaClicks = betaClicks + 1; }
+        if (Ui.Clicked(app, g)) { clickedGamma = true; }
+    }
+
+    /// 消费一帧（事件泵 + 重建命中注册表）。
+    static void Frame() {
+        app.PumpGuarded();
+        app.FrameGuarded(UiDriverLabelClickTest.Body);
+    }
+
+    static void Main() {
+        fails = 0;
+        driftGate = false;
+        clickedAlpha = false;
+        clickedGamma = false;
+        betaClicks = 0;
+        app = new App("uidrv-label-click", 400, 300);
+        app.Show();
+        app.RequestAnimationFrame(16);
+        Frame();
+        Frame();
+
+        // 驱动白盒最小初始化：Exec 路径需要 app（注入/命中表）、
+        // resultsPath（结果日志）与非空 probes（probe 兜底查询）。
+        UiDriver.app = app;
+        UiDriver.resultsPath = "build/uidrv_lbl_results.log";
+        UiDriver.probes = new List<UiProbe>();
+        if (File.Exists(UiDriver.resultsPath)) {
+            File.Delete(UiDriver.resultsPath);
+        }
+
+        // ① 按名点击：注入 move+press+release 三事件，逐帧消费。
+        bool ok = UiDriver.Exec("clickid @beta");
+        EqInt("exec @beta accepted", ok ? 1 : 0, 1);
+        for (int i = 0; i < 4; i = i + 1) { Frame(); }
+        EqInt("beta clicked via label", betaClicks, 1);
+        EqInt("alpha not clicked", clickedAlpha ? 1 : 0, 0);
+        EqInt("gamma not clicked", clickedGamma ? 1 : 0, 0);
+
+        // ② 前方多注册一个命中区（数字 id 顶漂一位）后按名点击：
+        //    标签在当帧注册表里重查，漂移不可见。
+        driftGate = true;
+        Frame();
+        ok = UiDriver.Exec("clickid @beta");
+        EqInt("exec @beta after drift accepted", ok ? 1 : 0, 1);
+        for (int i = 0; i < 4; i = i + 1) { Frame(); }
+        EqInt("beta clicked via label after drift", betaClicks, 2);
+        EqInt("alpha not clicked after drift", clickedAlpha ? 1 : 0, 0);
+        EqInt("gamma not clicked after drift", clickedGamma ? 1 : 0, 0);
+        driftGate = false;
+
+        // ③ 未知名字：当场拒绝、不注入，任何控件都收不到点击。
+        bool okNope = UiDriver.Exec("clickid @no-such-widget");
+        EqInt("unknown label refused", okNope ? 1 : 0, 0);
+        Frame();
+        EqInt("no click after refused name", betaClicks, 2);
+
+        File.Delete(UiDriver.resultsPath);
+        Console.WriteLine(fails == 0 ? "UIDRVLBL PASS"
+            : "UIDRVLBL FAIL " + Convert.ToString(fails));
+    }
+}

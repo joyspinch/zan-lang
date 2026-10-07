@@ -404,8 +404,9 @@ with `app.hitTester` each frame. The driver reuses exactly this path:
 - It **injects synthetic events** into the native queue (`Window.InjectEvent`),
   so dispatch, focus, hit-testing and click targets behave identically to real
   input.
-- It can **target a widget by its registered hit-region id** (`clickid`), so no
-  screen coordinates need to be discovered.
+- It can **target a widget by its registered hit-region id** (`clickid <id>`)
+  or, preferably, by its **semantic name** (`clickid @name`), so no screen
+  coordinates need to be discovered.
 - It exposes **machine-readable introspection**: a JSON dump of all hit regions,
   and named probes for editor/completion/log state.
 
@@ -442,7 +443,8 @@ so use the `log` command for annotations.
 | `move <x> <y>` | Inject a mouse-move to `(x,y)` |
 | `click <x> <y>` | Inject move+press+release (left) at `(x,y)` |
 | `rclick <x> <y>` | Right-button click at `(x,y)` |
-| `clickid <hitId>` | Look up the hit region with id `<hitId>` and click its center — **preferred, coordinate-free** |
+| `clickid <hitId>` | Look up the hit region with id `<hitId>` and click its center — coordinate-free |
+| `clickid @<name>` | Resolve `<name>` at click time — first by the hit region's semantic **label** (`RegisterRectL`-annotated widgets; last-registration-wins, same as pointer hit-testing), falling back to the host probe `id.<name>`. **Preferred**: labels are re-read from the current frame's registry, so the click never drifts when widgets appear/disappear and ids shift |
 | `scroll <x> <y> <delta>` | Inject a wheel event at `(x,y)` |
 | `char <code>` | Inject a character/text event (kind 6) with the given code (e.g. `9` = Tab, `13` = Enter, `27` = Esc) |
 | `type "<text>"` | Inject one `char` per ASCII byte of `<text>` |
@@ -458,6 +460,9 @@ so use the `log` command for annotations.
 
 `clickid` resolves the id with **last-registration-wins** precedence, matching
 `HitTester.HitTest`, so it clicks the top-most (overlay) region for that id.
+`@name` labels resolve the same way — widgets that register with a semantic
+label (Wizard rows/platform chips, list rows, …) are addressable by their data
+key (e.g. `clickid @linux-x64`), which survives any renumbering.
 
 #### Event kinds (for `char`/`ev`)
 

@@ -2578,6 +2578,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_listview_scrollbar_drag${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # UiDriver `clickid @语义名` 回归：命中区注册时带的语义标签在点击
+  # 时刻当场解析（后注册者=顶层优先），脚本不再持有逐帧漂移的数字
+  # id——前方控件增减（顶漂）后按名点击仍然命中，未知名字被拒绝且
+  # 不注入。数字 id 漂移曾是 ListView 拖动停摆/菜单滚动条跳跃的冲突
+  # 源，这是它的脚本侧根治通道。
+  add_test(NAME conformance_gui_uidriver_label_click
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/uidriver_label_click_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_uidriver_label_click.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_uidriver_label_click${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # ChatView 气泡模式回归（桌面 IM 客户端实机反馈“消息乱码、滚动条方向
   # 反了、已读标记看不见”）：(1) bscr 的语义是“离底部多少像素”，滚轮
   # 向上=看更旧=离底部更远=加；写成减号时向上滚被钳在 0，界面纹丝

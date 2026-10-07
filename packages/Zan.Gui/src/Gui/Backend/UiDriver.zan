@@ -138,8 +138,10 @@ class UiProbe {
 ///   move &lt;x&gt; &lt;y&gt; — 合成鼠标移动
 ///   click &lt;x&gt; &lt;y&gt; — 在 x,y 处移动+按下+释放（左键）
 ///   clickid &lt;hitId&gt; — 点击指定 id 命中区域的中心
-///   clickid @&lt;name&gt; — 经宿主 probe "id.&lt;name&gt;" 当场解析后点击
-///   （widget id 逐进程分配、跨运行不稳定，脚本应优先用 @name 形式）
+///   clickid @&lt;name&gt; — 按语义名当场解析后点击：先查本帧命中区的
+///   语义标签（RegisterRectL 标注的控件，后注册者=顶层优先），无此
+///   标签再退宿主 probe "id.&lt;name&gt;"。脚本优先用 @name——命中区
+///   逐帧重建，标签在就永远点得中，不随控件增减漂移
 ///   rclick &lt;x&gt; &lt;y&gt; — 在 x,y 处右键点击
 ///   scroll &lt;x&gt; &lt;y&gt; &lt;delta&gt; — 在 x,y 处滚轮滚动
 ///   char &lt;code&gt; — 一个文本输入字符（Tab=9/Enter=13/Esc=27）
@@ -368,11 +370,22 @@ class UiDriver {
             string target = t.Count > 1 ? t[1] : "";
             int id = -1;
             if (UiDriver.StartsWith(target, "@")) {
-                id = UiDriver.ParseProbeId(UiDriver.GetProbe("id." + UiDriver.Trim(target.Substring(1))));
-                if (id < 0) {
-                    UiDriver.Note("clickid " + target + " -> probe id."
-                        + UiDriver.Trim(target.Substring(1)) + " missing or not a positive integer");
-                    return false;
+                // 语义名：优先按本帧命中区的标签解析（点击时刻的
+                // 注册表即真相，天然免疫控件增减导致的 id 漂移）；
+                // 未标注的控件走宿主 probe "id.<name>" 旧通道。
+                string nm = UiDriver.Trim(target.Substring(1));
+                HitRegion lr = UiDriver.FindRegionByLabel(nm);
+                if (lr != null) {
+                    id = lr.id;
+                    UiDriver.Note("clickid " + target + " -> id "
+                        + Convert.ToString(id) + " (label)");
+                } else {
+                    id = UiDriver.ParseProbeId(UiDriver.GetProbe("id." + nm));
+                    if (id < 0) {
+                        UiDriver.Note("clickid " + target + " -> no label, probe id."
+                            + nm + " missing or not a positive integer");
+                        return false;
+                    }
                 }
             } else {
                 id = UiDriver.ArgI(t, 1, -1);
@@ -472,6 +485,19 @@ class UiDriver {
         while (i >= 0) {
             HitRegion r = app.hitTester.RegionAt(i);
             if (r.id == id) { return r; }
+            i = i - 1;
+        }
+        return null;
+    }
+
+    /// 将命中区域语义标签解析为区域（后注册者优先，与
+    /// HitTester 的逆序命中优先级一致——同名标签叠放时顶层
+    /// 拥有点击，与指针语义相同）。未标注或无此标签返回 null。
+    static HitRegion FindRegionByLabel(string name) {
+        int i = app.hitTester.RegionCount() - 1;
+        while (i >= 0) {
+            HitRegion r = app.hitTester.RegionAt(i);
+            if (r.label == name) { return r; }
             i = i - 1;
         }
         return null;
