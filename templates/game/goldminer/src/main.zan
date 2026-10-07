@@ -1,11 +1,10 @@
 // Gold Miner — 黄金矿工:数据/渲染/输入与无头自测。
-// GuiHost 版:窗口/事件/呈现走 Game.Foundation.Gui,场景与兜底 HUD
-// 全部经 Canvas 直绘(Game.Kit CDraw/CText,自带 SDL 版曾用的
-// 超采样离屏一概不需要);顶栏/结算/拆弹走场景层自绘(原 Gui 控件
-// 树 HUD 依赖 GameHud 的 SDL 合成链路,画布版统一收敛到兜底 HUD,
-// 信息两档:厘秒倒计时 + 结算后续提示)。音频走原生 zan_audio
-// (System.Audio/AudioClip,P2 原生音频已落地,与 wuwei
-// AudioService 同一先例),Snd.Open 失败自动哑火不碍运行。
+// SceneRouter 版:对局与结算两个场景路由(Game.Foundation.Gui
+// SceneRouter/HtmlScene),对局场景与兜底 HUD 全部 Canvas 直绘
+// (Game.Kit CDraw/CText),结算面板走 HTML 层(assets/scenes/
+// result.html);音频走原生 zan_audio(System.Audio/AudioClip,P2
+// 原生音频已落地,与 wuwei AudioService 同一先例),Snd.Open 失败
+// 自动哑火不碍运行。
 using System;
 using System.IO;
 using Gui;
@@ -117,7 +116,6 @@ class Snd {
 }
 
 class MinerApp {
-    public GuiHost host;
     public Canvas c;
     public World w;
     public Snd snd;
@@ -132,7 +130,6 @@ class MinerApp {
     public string campPath2;            // 天空带画面(0..SKY_H)
     public string minePath2;            // 地层画面(SKY_H..H)
     public string topPath2;             // 顶栏木牌横幅
-    public string resultPath2;          // 结算羊皮纸面板
     public string glowPath2;            // 柔光晕(拆弹警示底光)
     public string dynPath2;             // 炸药随身包图标(顶栏)
     public string bombPath2;            // 拆弹弹体(拆弹面板)
@@ -149,8 +146,6 @@ class MinerApp {
 
     public static MinerApp Create(GuiHost h) {
         MinerApp a = new MinerApp();
-        a.host = h;
-        a.c = h.App().canvas;
         // 首帧前先按宿主真实舞台同步 W/HOOK_X：此前 NewRun 的 Populate
         // 用的是 W=960 默认值，而手机舞台已延展到 ~1600，首关道具全铺
         // 在实际场地左侧 960 内，看起来"道具都在左边"。
@@ -163,7 +158,6 @@ class MinerApp {
         a.campPath2 = MinerApp.FindAsset("assets/camp2.png");
         a.minePath2 = MinerApp.FindAsset("assets/mine2.png");
         a.topPath2 = MinerApp.FindAsset("assets/top2.png");
-        a.resultPath2 = MinerApp.FindAsset("assets/result2.png");
         a.glowPath2 = MinerApp.FindAsset("assets/glow2.png");
         a.dynPath2 = MinerApp.FindAsset("assets/dyn2.png");
         a.bombPath2 = MinerApp.FindAsset("assets/bomb2.png");
@@ -481,38 +475,8 @@ class MinerApp {
                                      tx, oy + 312, 2,
                                      232, 226, 212, 255);
         }
-        // 结算覆盖
-        if (wo.state == World.ST_RESULT) {
-            bool win = wo.levelResult > 0;
-            if (this.resultPath2 != null) {
-                // 羊皮纸面板打底(460x210 ≈ 1024x468 实比),轻压暗保文字
-                CDraw.BlitImage(rd, this.resultPath2, ox + Data.W / 2 - 230,
-                                oy + 200, 460, 210);
-                CDraw.FillRect(rd, ox + Data.W / 2 - 230, oy + 200, 460, 210,
-                               CDraw.Argb(60, 10, 12, 17));
-            } else {
-                CDraw.FillRect(rd, ox + Data.W / 2 - 230, oy + 200, 460, 210,
-                               CDraw.Argb(205, 10, 12, 17));
-            }
-            CDraw.FillRect(rd, ox + Data.W / 2 - 230, oy + 200, 460, 3,
-                           CDraw.Argb(255, win ? 111 : 192,
-                                      win ? 170 : 85, win ? 94 : 63));
-            CText.DrawCenteredShadow(rd, win ? "过关!" : "时间到!",
-                                     ox + Data.W / 2, oy + 224, 4,
-                                     232, 226, 212, 255);
-            CText.DrawCenteredShadow(rd, "本关 $" + Convert.ToString(wo.gold)
-                                     + " / 目标 $" + Convert.ToString(wo.Target()),
-                                     ox + Data.W / 2, oy + 296, 2,
-                                     244, 208, 120, 255);
-            CText.DrawCenteredShadow(rd, "累计 $" + Convert.ToString(wo.totalGold),
-                                     ox + Data.W / 2, oy + 334, 2,
-                                     232, 226, 212, 255);
-            CText.DrawCenteredShadow(rd, win
-                                     ? "点击继续 → 第 " + Convert.ToString(wo.level + 1) + " 关"
-                                     : "点击重新开始",
-                                     ox + Data.W / 2, oy + 372, 2,
-                                     200, 194, 178, 255);
-        }
+        // 结算画面走 MnOverScene 的 HTML 层(assets/scenes/result.html),
+        // 画布只保留定格的对局画面,不再叠画结算面板。
     }
 
     // 爪与绳。画布没有旋转贴图,爪改为随摆角旋转的矢量三爪钩
@@ -656,8 +620,12 @@ class MinerApp {
         if (ProcessHost.Env("MINER_SIM") == "1") {
             return MinerApp.SimRun();
         }
-        GuiHost host = new GuiHost("黄金矿工", Data.W, Data.H, 16);
-        host.Run(new MnLoop());
+        SceneRouter router = SceneRouter.CreateFixed("黄金矿工", Data.W, Data.H,
+                                                     16);
+        MinerApp a = MinerApp.Create(router.Host());
+        router.Register("play", new MnPlayScene(a));
+        router.Register("over", new MnOverScene(a));
+        router.Run("play");
         return 0;
     }
 
@@ -807,41 +775,39 @@ class MinerApp {
     }
 }
 
-// GuiHost 主循环回调：事件 → 固定步长模拟（16ms，追帧上限内多次）→
-// 渲染（BeginFrame/PresentFrame 由宿主包好；帧预算自限速约 60fps）。
-class MnLoop : IGuiHostLoop {
+// 对局：纯 canvas 场景（HtmlFile 为空，无 HTML 层）。世界由
+// MinerApp.Create 开好第一关，进场即玩；结算状态（ST_RESULT）在
+// FixedStep 里路由到结算场景。
+class MnPlayScene : HtmlScene {
     MinerApp a;
 
-    public void Start(GuiHost host) {
-        this.a = MinerApp.Create(host);
-    }
-    public void Event(GuiHost host, int kind, int code) {
+    MnPlayScene(MinerApp a) { this.a = a; }
+
+    override void Event(int kind, int key) {
         // Gui 键码 = WM_KEYDOWN wParam(Windows VK)。放钩/节拍:空格 32、
-        // 下 40、回车 13、鼠标左键;炸药:Q 81 / E 69;Esc 27 只在结算
-        // 画面退出并存档(Stop 里落盘)。鼠标 kind:1=移动 2=按下 3=释放
-        // (Win32Shell 契约,与 App 控件分发同一套)。
+        // 下 40、回车 13、鼠标左键;炸药:Q 81 / E 69。鼠标 kind:1=移动
+        // 2=按下 3=释放(Win32Shell 契约,与 App 控件分发同一套)。
         if (kind == 4) {
-            if (code == 27) {
-                if (this.a.w.state == World.ST_RESULT) { host.RequestStop(); }
-                return;
-            }
-            if (code == 32 || code == 40 || code == 13) {
+            if (key == 32 || key == 40 || key == 13) {
                 this.a.OnActionKey();
-            } else if (code == 81 || code == 69) {
+            } else if (key == 81 || key == 69) {
                 this.a.OnDynamiteKey();
             }
-        } else if (kind == 2 && code == 0) {
-            // 左键按下:放钩 / QTE 节拍 / 拆弹连点 / 结算确认(触屏由
-            // Gui 运行时合成鼠标点击,同一路径)。
+        } else if (kind == 2 && key == 0) {
+            // 左键按下:放钩 / QTE 节拍 / 拆弹连点(触屏由 Gui 运行时
+            // 合成鼠标点击,同一路径)。
             this.a.OnActionKey();
         }
     }
-    public void FixedUpdate(GuiHost host, int dt) {
+
+    override void FixedStep(int dtMs) {
         this.a.now = Window.GetTickMs();
-        this.a.StepFrame(dt);
+        this.a.StepFrame(dtMs);
+        // 本关结束 → 结算场景；切换在帧首应用，本场景随即使停。
+        if (this.a.w.state == World.ST_RESULT) { this.router.Go("over"); }
     }
-    public void Update(GuiHost host, int dt) { }
-    public void Render(GuiHost host, Canvas c, double alpha) {
+
+    override void Render(Canvas c, double alpha) {
         this.a.now = Window.GetTickMs();
         // Android 上表面晚于 Start 到达(转向/后台往返亦然),App 会整体
         // 换新画布对象(App.SwapCanvas);Start 时抓的引用画进已销毁的
@@ -849,6 +815,7 @@ class MnLoop : IGuiHostLoop {
         this.a.c = c;
         // 窗口跟随：宿主视口已按窗口比例延展逻辑舞台（宽窗多看宽度，
         // 零黑边），取当帧值并让锚点跟随，布局锚定 Data.W 即自适应。
+        GuiHost host = this.router.Host();
         Data.W = host.StageWidth();
         Data.HOOK_X = Data.W / 2;
         // 注意：这里绝不归位/钳制任何物理状态（摆角、爪长……）。
@@ -859,7 +826,85 @@ class MnLoop : IGuiHostLoop {
         CDraw.Clear(c, Data.W, Data.H, CDraw.Argb(255, 12, 10, 8));
         this.a.DrawAll();
     }
-    public void Stop(GuiHost host) {
+
+    override void OnExit() {
+        // 进度落盘时机与旧 GuiHost Stop 一致：离开对局（进结算/退应用）
+        // 时保存。
         this.a.w.Save();
+    }
+}
+
+// 结算：HTML 面板叠在定格的对局画面上——Render 继续画 DrawAll（世界
+// 已停在 ST_RESULT），body 半透明压暗；FixedStep 继续推世界（结算
+// 确认的 600ms 冷却 resultWait 靠它累计，飘字/白闪收尾也靠它）。
+class MnOverScene : HtmlScene {
+    MinerApp a;
+
+    MnOverScene(MinerApp a) { this.a = a; }
+
+    override string HtmlFile() { return "assets/scenes/result.html"; }
+
+    override void OnWire(HtmlHandlers handlers) {
+        handlers.Add("next", () => this.Next());
+    }
+
+    // ConfirmResult 内部分流：赢 → level+1 开下一关，输 → 重开；
+    // 600ms 冷却未到时返回 false，点击无效（防误触秒过）。
+    void Next() {
+        if (this.a.w.ConfirmResult()) {
+            if (this.a.w.levelResult > 0) {
+                this.a.snd.Play(this.a.snd.levelup, 0.7);
+            }
+            this.router.Go("play");
+        }
+    }
+
+    override void OnEnter(Control root) {
+        Element headline = MnOverScene.AsElement(root, "headline");
+        Element subEl = MnOverScene.AsElement(root, "sub");
+        Element totalEl = MnOverScene.AsElement(root, "total");
+        bool win = this.a.w.levelResult > 0;
+        if (headline != null) { headline.SetText(win ? "过关!" : "时间到!"); }
+        if (subEl != null) {
+            subEl.SetText("本关 $" + Convert.ToString(this.a.w.gold)
+                + " / 目标 $" + Convert.ToString(this.a.w.Target()));
+        }
+        if (totalEl != null) {
+            totalEl.SetText("累计 $" + Convert.ToString(this.a.w.totalGold));
+        }
+        // 按钮标签随胜负分流：<button> 生成的是 Gui Button 控件
+        // （不是文本 Element），改标签走 Binding 字段 Button.Text。
+        Control nextBtn = root.Find("next");
+        if (nextBtn != null && nextBtn is Button) {
+            Button b = (Button)nextBtn;
+            b.Text = win ? "继续 → 第 " + Convert.ToString(this.a.w.level + 1)
+                                   + " 关" : "重新开始";
+        }
+    }
+
+    static Element AsElement(Control root, string id) {
+        Control c = root.Find(id);
+        if (c != null && c is Element) { return (Element)c; }
+        return null;
+    }
+
+    override void FixedStep(int dtMs) {
+        this.a.now = Window.GetTickMs();
+        this.a.StepFrame(dtMs);
+    }
+
+    override void Event(int kind, int key) {
+        if (kind == 4 && key == 27) { this.router.Exit(); }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        this.a.now = Window.GetTickMs();
+        this.a.c = c;
+        GuiHost host = this.router.Host();
+        Data.W = host.StageWidth();
+        Data.HOOK_X = Data.W / 2;
+        CDraw.Origin(0, host.ContentTop());
+        CDraw.Clear(c, Data.W, Data.H, CDraw.Argb(255, 12, 10, 8));
+        this.a.DrawAll();
     }
 }
