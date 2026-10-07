@@ -116,6 +116,9 @@ class ForgeInterface {
         form.On("hudTech7", () => Research(7));
         form.On("hudTech8", () => Research(8));
         form.On("hudTech9", () => Research(9));
+        form.On("hudTech10", () => Research(10));
+        form.On("hudTech11", () => Research(11));
+        form.On("hudDrones", () => CycleDrones());
         form.On("hudB2", () => SelectBlock(2));
         form.On("hudB3", () => SelectBlock(3));
         form.On("hudB4", () => SelectBlock(4));
@@ -132,6 +135,16 @@ class ForgeInterface {
         form.On("hudB15", () => SelectBlock(15));
         form.On("hudB16", () => SelectBlock(16));
         form.On("hudB17", () => SelectBlock(17));
+        form.On("hudB18", () => SelectBlock(18));
+        form.On("hudB19", () => SelectBlock(19));
+    }
+
+    /// 铁蜂全军模式切换：守卫（拦截来犯）↔ 进攻（拔除敌巢出兵口）。
+    void CycleDrones() {
+        sim.world.droneMode = !sim.world.droneMode;
+        Message(sim.world.droneMode
+          ? "铁蜂转入进攻：将飞向最近的存活敌巢并拔除出兵口。"
+          : "铁蜂转入守卫：拦截逼近炉心的来犯敌人。");
     }
 
     void SelectBlock(int id) {
@@ -217,6 +230,19 @@ class ForgeInterface {
             int py = miniY + e.y / (1000 / tile);
             c.FillRect(px - 1, py - 1, tile + 1, tile + 1, 0xFFFF6A4A);
         }
+        // 敌巢（出兵口）：紫红大点，拔除后消失——战略一目了然。
+        for (int lane = 0; lane < 3; lane = lane + 1) {
+            ForgeNest n = w.nests[lane];
+            if (!n.active) { continue; }
+            c.FillRect(miniX + n.x * tile - 1, miniY + n.y * tile - 1, tile + 2, tile + 2, 0xFFE86A6A);
+            c.DrawRect(miniX + n.x * tile - 1, miniY + n.y * tile - 1, tile + 2, tile + 2, 0xFFFFD2B8, 1);
+        }
+        // 铁蜂：友军青点。
+        for (int i = 0; i < w.units.Length; i = i + 1) {
+            ForgeUnit u = w.units[i];
+            if (!u.active) { continue; }
+            c.FillRect(miniX + u.x / (1000 / tile), miniY + u.y / (1000 / tile), tile, tile, 0xFF8FD9C1);
+        }
         // 炉心亮点。
         int corePx = miniX + (w.coreCell % w.width) * tile;
         int corePy = miniY + (w.coreCell / w.width) * tile;
@@ -238,6 +264,7 @@ class ForgeInterface {
         if (alpha > 235) { alpha = 235; }
         int color = (alpha << 24) | 0xCF5A35;
         for (int lane = 0; lane < 3; lane = lane + 1) {
+            if (!w.nests[lane].active) { continue; }   // 巢穴已拔除的通道永绝敌人，无需预警
             int cell = ForgeMap.SpawnCell(w, lane);
             int cx = camera.ScreenX((cell % w.width) * 1000 + 500);
             int cy = camera.ScreenY((cell / w.width) * 1000 + 500);
@@ -290,6 +317,8 @@ class ForgeInterface {
         if (id == 15) { return 0xFFC9836A; }  // 散射：双管铜棕
         if (id == 16) { return 0xFF7FA8D9; }  // 狙击：镜筒青蓝
         if (id == 17) { return 0xFFB0894A; }  // 臼炮：臼身土金
+        if (id == 18) { return 0xFF7FBF9E; }  // 铁蜂机巢：坪面青绿
+        if (id == 19) { return 0xFFB9A8E8; }  // 棱镜塔：水晶紫
         return 0xFF93825F;
     }
 
@@ -319,7 +348,11 @@ class ForgeInterface {
         int hpPct = ForgeGrid.Max(0, w.buildings[w.coreCell].hp) * 100 / w.coreMaxHp;
         CoreforgeHud.hpBar.SetPercent(hpPct);
         CoreforgeHud.hpText.Text = "炉心 " + N(hpPct) + "% · 电力 " + N(w.powerSupply) + " / " + N(w.powerDemand)
-          + " · 储能 " + N(w.batteryStored / 1000) + "k";
+          + " · 储能 " + N(w.batteryStored / 1000) + "k · 铁蜂 " + N(w.ActiveUnits()) + "/" + N(ForgeGrid.DroneLimit());
+        // 铁蜂模式按钮：守卫/进攻全局切换。
+        CoreforgeHud.btnDrones.Text = w.droneMode ? "铁蜂·进攻" : "铁蜂·守卫";
+        CoreforgeHud.btnDrones.SetClassIn("cf-mini-on", w.droneMode ? "cf-mini-on" : "");
+        CoreforgeHud.btnDrones.visible = w.researched[10] && !w.defeated && !w.victory;
         // 节奏按钮。
         CoreforgeHud.btnPause.Text = paused ? "继续" : "暂停";
         CoreforgeHud.btnPause.SetClassIn("cf-on", paused ? "cf-on" : "");
@@ -332,10 +365,11 @@ class ForgeInterface {
         CoreforgeHud.btnDemolish.SetClassIn("cf-mini-on", erase ? "cf-mini-on" : "");
         CoreforgeHud.btnNew.Text = newRunArmed ? "确认重启？" : "新远征";
         // 建造栏：只显示已解锁的方块，选中态换底色。
-        Button[] palette = new Button[16] { CoreforgeHud.pb2, CoreforgeHud.pb3, CoreforgeHud.pb4, CoreforgeHud.pb5, CoreforgeHud.pb6,
+        Button[] palette = new Button[18] { CoreforgeHud.pb2, CoreforgeHud.pb3, CoreforgeHud.pb4, CoreforgeHud.pb5, CoreforgeHud.pb6,
           CoreforgeHud.pb7, CoreforgeHud.pb8, CoreforgeHud.pb9, CoreforgeHud.pb10, CoreforgeHud.pb11,
-          CoreforgeHud.pb12, CoreforgeHud.pb13, CoreforgeHud.pb14, CoreforgeHud.pb15, CoreforgeHud.pb16, CoreforgeHud.pb17 };
-        for (int k = 2; k < 18; k = k + 1) {
+          CoreforgeHud.pb12, CoreforgeHud.pb13, CoreforgeHud.pb14, CoreforgeHud.pb15, CoreforgeHud.pb16, CoreforgeHud.pb17,
+          CoreforgeHud.pb18, CoreforgeHud.pb19 };
+        for (int k = 2; k < 20; k = k + 1) {
             Button pb = palette[k - 2];
             bool unlocked = sim.world.Unlocked((BlockKind)k);
             pb.visible = unlocked;
@@ -374,9 +408,9 @@ class ForgeInterface {
         CoreforgeHud.Objectives.visible = !allDone && !showTech && !w.defeated && !w.victory;
         // 科技面板。
         CoreforgeHud.Tech.visible = showTech && !w.defeated && !w.victory;
-        Button[] techRow = new Button[9] { CoreforgeHud.tech1, CoreforgeHud.tech2, CoreforgeHud.tech3, CoreforgeHud.tech4, CoreforgeHud.tech5,
-          CoreforgeHud.tech6, CoreforgeHud.tech7, CoreforgeHud.tech8, CoreforgeHud.tech9 };
-        for (int i = 1; i <= 9; i = i + 1) {
+        Button[] techRow = new Button[11] { CoreforgeHud.tech1, CoreforgeHud.tech2, CoreforgeHud.tech3, CoreforgeHud.tech4, CoreforgeHud.tech5,
+          CoreforgeHud.tech6, CoreforgeHud.tech7, CoreforgeHud.tech8, CoreforgeHud.tech9, CoreforgeHud.tech10, CoreforgeHud.tech11 };
+        for (int i = 1; i <= 11; i = i + 1) {
             TechDef t = w.catalog.techs[i];
             bool finished = w.researched[i];
             bool ready = !finished && w.researched[t.parent] && w.resources.Has(t.cost);
@@ -463,13 +497,14 @@ class ForgeInterface {
     }
     bool TargetBtn() {
         if (inspectCell < 0 || inspectCell >= sim.world.width * sim.world.height) { return false; }
-        return ForgeCombat.TurretFamily(sim.world.buildings[inspectCell].kind);
+        BlockKind k = sim.world.buildings[inspectCell].kind;
+        return ForgeCombat.TurretFamily(k) || k == BlockKind.Prism;
     }
     bool FeedBtn() {
         if (inspectCell < 0 || inspectCell >= sim.world.width * sim.world.height) { return false; }
         BlockKind k = sim.world.buildings[inspectCell].kind;
         return ForgeCombat.TurretFamily(k) || k == BlockKind.Generator
-          || k == BlockKind.Furnace || k == BlockKind.Assembler;
+          || k == BlockKind.Furnace || k == BlockKind.Assembler || k == BlockKind.DroneFab;
     }
     string TargetLabel() {
         ForgeBuilding b = sim.world.buildings[inspectCell];
@@ -480,6 +515,7 @@ class ForgeInterface {
         ForgeBuilding b = sim.world.buildings[inspectCell];
         if (b.kind == BlockKind.Generator) { return "投入石墨"; }
         if (ForgeCombat.TurretFamily(b.kind)) { return "投入弹药"; }
+        if (b.kind == BlockKind.DroneFab) { return "投入机体材料"; }
         return "投入原料";
     }
 
@@ -567,7 +603,7 @@ class ForgeInterface {
     }
 
     void Research(int id) {
-        if (id < 1 || id > 9) { return; }
+        if (id < 1 || id > 11) { return; }
         if (sim.world.Research(id)) { Message("研究完成：" + sim.world.catalog.techs[id].name); }
         else { Message("研究条件未满足，请检查前置科技与核心库存。"); }
     }
@@ -595,6 +631,14 @@ class ForgeInterface {
         else if (b.kind == BlockKind.Mortar) { ok = sim.world.Feed(inspectCell, 2, 4); }
         else if (ForgeCombat.TurretFamily(b.kind)) { ok = sim.world.Feed(inspectCell, 0, 6); }
         else if (b.kind == BlockKind.Generator) { ok = sim.world.Feed(inspectCell, 2, 4); }
+        else if (b.kind == BlockKind.DroneFab) {
+            // 一次投足一架机体的全套材料；不足一套时提示走输送带。
+            Stock droneCost = ForgeFactory.DroneCost();
+            if (b.stock.Total() + droneCost.Total() <= 24 && sim.world.resources.Has(droneCost)) {
+                ok = sim.world.resources.Pay(droneCost);
+                if (ok) { for (int i = 0; i < 6; i = i + 1) { b.stock.Add(i, droneCost.Get(i)); } }
+            }
+        }
         else if (b.kind == BlockKind.Furnace || b.kind == BlockKind.Assembler) {
             Stock inputs = sim.world.catalog.recipes[b.recipe].input;
             if (b.stock.Total() + inputs.Total() <= 24 && sim.world.resources.Has(inputs)) {

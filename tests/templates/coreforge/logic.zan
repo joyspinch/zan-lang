@@ -15,7 +15,12 @@ class CoreforgeLogicTests {
         ForgeWorld w = new ForgeWorld(48, 36, 17);
         w.Place(w.coreCell, BlockKind.Core, 0);
         for (int i = 0; i < 6; i = i + 1) { w.resources.amount[i] = 1000; }
-        for (int i = 0; i < 10; i = i + 1) { w.researched[i] = true; }
+        for (int i = 0; i < 12; i = i + 1) { w.researched[i] = true; }
+        for (int i = 0; i < 3; i = i + 1) {
+            ForgeNest n = w.nests[i];
+            n.active = true; n.hp = 1600; n.maxHp = 1600;
+            n.x = ForgeMap.NestX(w, i); n.y = ForgeMap.NestY(w, i);
+        }
         w.coreMaxHp = 3600; w.buildings[w.coreCell].hp = 3600;
         return w;
     }
@@ -226,7 +231,16 @@ class CoreforgeLogicTests {
         if (a.wave != b.wave || a.nextWaveTicks != b.nextWaveTicks || a.spawnRemaining != b.spawnRemaining || a.spawnCooldown != b.spawnCooldown || a.bossPending != b.bossPending || a.waveActive != b.waveActive || a.defeated != b.defeated || a.victory != b.victory) { return false; }
         if (a.enemyCount != b.enemyCount || a.kills != b.kills || a.produced != b.produced || a.powerSupply != b.powerSupply || a.powerDemand != b.powerDemand || a.batteryStored != b.batteryStored || a.topologyDirty != b.topologyDirty || a.pathsDirty != b.pathsDirty) { return false; }
         if (!SameInts(a.resources.amount, b.resources.amount)) { return false; }
-        for (int i = 0; i < 10; i = i + 1) { if (a.researched[i] != b.researched[i]) { return false; } }
+        for (int i = 0; i < 12; i = i + 1) { if (a.researched[i] != b.researched[i]) { return false; } }
+        if (a.droneMode != b.droneMode) { return false; }
+        for (int i = 0; i < 24; i = i + 1) {
+            ForgeUnit p = a.units[i]; ForgeUnit q = b.units[i];
+            if (p.active != q.active || p.x != q.x || p.y != q.y || p.hp != q.hp || p.maxHp != q.maxHp || p.cooldown != q.cooldown || p.generation != q.generation) { return false; }
+        }
+        for (int i = 0; i < 3; i = i + 1) {
+            ForgeNest p = a.nests[i]; ForgeNest q = b.nests[i];
+            if (p.active != q.active || p.x != q.x || p.y != q.y || p.hp != q.hp || p.maxHp != q.maxHp) { return false; }
+        }
         for (int i = 0; i < 1728; i = i + 1) {
             ForgeTile x = a.tiles[i]; ForgeTile y = b.tiles[i];
             if (x.terrain != y.terrain || x.ore != y.ore || x.reserve != y.reserve) { return false; }
@@ -258,7 +272,7 @@ class CoreforgeLogicTests {
         for (int i = 0; i < 1728; i = i + 1) {
             w.tiles[i].terrain = (TerrainKind)(i % 4); w.tiles[i].ore = i % 7 - 1; w.tiles[i].reserve = i * 3;
         }
-        for (int k = 2; k < 18; k = k + 1) {
+        for (int k = 2; k < 20; k = k + 1) {
             int cell = w.Index(10 + k, 10); w.Place(cell, (BlockKind)k, k % 4);
             ForgeBuilding b = w.buildings[cell]; b.hp = b.hp - 3; b.cooldown = k;
             b.water = 23 + k; b.oil = 17 + k; b.efficiency = 700 + k; b.network = 31;
@@ -283,6 +297,16 @@ class CoreforgeLogicTests {
             b.generation = i + 4; b.damage = 36; b.life = i % 159 + 1; b.blast = i % 2;
         }
         for (int i = 0; i < 89; i = i + 1) { w.events.Emit((ForgeEventKind)(i % 8), i * 11, i * 7, w.tick - 90 + i); }
+        w.droneMode = true;
+        for (int i = 0; i < 24; i = i + 1) {
+            ForgeUnit u = w.units[i]; u.active = i < 5; u.x = i * 913 % 48000; u.y = i * 631 % 36000;
+            u.maxHp = 60; u.hp = 53; u.cooldown = i % 20; u.generation = i + 1;
+        }
+        for (int i = 0; i < 3; i = i + 1) {
+            ForgeNest n = w.nests[i]; n.active = i < 2;
+            n.x = ForgeMap.NestX(w, i); n.y = ForgeMap.NestY(w, i);
+            n.hp = 1600 - i * 500; n.maxHp = 1600;
+        }
         w.topologyDirty = false; w.pathsDirty = false;
         return w;
     }
@@ -299,6 +323,8 @@ class CoreforgeLogicTests {
         Check(loaded != null, "complete snapshot loads");
         if (loaded != null) { Check(Same(source, loaded), "all fields independently match after roundtrip"); }
         source.seed = 991;
+        // 巢位由 seed 唯一确定：换 seed 后重摆巢位，存档校验才自洽。
+        for (int i = 0; i < 3; i = i + 1) { source.nests[i].x = ForgeMap.NestX(source, i); source.nests[i].y = ForgeMap.NestY(source, i); }
         Check(ForgeSave.Save(source, path), "existing save is atomically replaced");
         loaded = ForgeSave.Load(path);
         if (loaded != null) { Check(Same(source, loaded), "replacement contains new state"); } else { Check(false, "replacement loads"); }
@@ -310,7 +336,7 @@ class CoreforgeLogicTests {
         Check(!ForgeSave.Save(source, "test-saves/no-such-directory/save.json"), "save I/O failure returns false");
         Check(ForgeSave.Load("test-saves/no-such-save.json") == null, "missing save returns null");
         JsonValue root = JsonValue.Parse(original);
-        JsonValue bad = root.Clone(); bad.Set("version", JsonValue.NewInt(3)); Reject(bad, "unsupported version");
+        JsonValue bad = root.Clone(); bad.Set("version", JsonValue.NewInt(4)); Reject(bad, "unsupported version");
         bad = root.Clone(); bad.Set("width", JsonValue.NewInt(47)); Reject(bad, "wrong dimensions");
         bad = root.Clone(); bad.Set("height", JsonValue.NewInt(2147483647)); Reject(bad, "allocation overflow dimension");
         bad = root.Clone(); bad.Set("coreCell", JsonValue.NewInt(1728)); Reject(bad, "core index outside map");
@@ -329,7 +355,7 @@ class CoreforgeLogicTests {
         bad = root.Clone(); JsonValue buildings = ForgeSave.Member(bad, "buildings");
         buildings.At(12 + 10 * 48).Set("direction", JsonValue.NewInt(4)); Reject(bad, "invalid direction");
         bad = root.Clone(); buildings = ForgeSave.Member(bad, "buildings");
-        buildings.At(12 + 10 * 48).Set("kind", JsonValue.NewInt(18)); Reject(bad, "invalid building kind");
+        buildings.At(12 + 10 * 48).Set("kind", JsonValue.NewInt(20)); Reject(bad, "invalid building kind");
         bad = root.Clone(); buildings = ForgeSave.Member(bad, "buildings");
         buildings.At(12 + 10 * 48).Set("network", JsonValue.NewInt(1728)); Reject(bad, "invalid power component");
         bad = root.Clone(); buildings = ForgeSave.Member(bad, "buildings");
@@ -344,6 +370,42 @@ class CoreforgeLogicTests {
         bullets.At(7).Set("target", JsonValue.NewInt(192)); Reject(bad, "bullet target outside pool");
         bad = root.Clone(); JsonValue enemies = ForgeSave.Member(bad, "enemies");
         enemies.At(3).Set("x", JsonValue.NewInt(-1)); Reject(bad, "enemy outside map");
+        bad = root.Clone(); JsonValue nests = ForgeSave.Member(bad, "nests");
+        nests.At(0).Set("x", JsonValue.NewInt(20)); Reject(bad, "relocated nest");
+        bad = root.Clone(); nests = ForgeSave.Member(bad, "nests");
+        nests.At(0).Set("hp", JsonValue.NewInt(0)); Reject(bad, "dead but active nest");
+        // 旧档兼容：剥掉 v3 字段并把版本降回 2，敌巢按 seed 全量重建。
+        JsonValue legacy = JsonValue.NewObject();
+        for (int i = 0; i < root.Count(); i = i + 1) {
+            string key = root.KeyAt(i);
+            if (key == "units" || key == "nests" || key == "droneMode") { continue; }
+            if (key == "version") { legacy.PutInt("version", 2); continue; }
+            if (key == "researched") {
+                JsonValue tech = JsonValue.NewArray();
+                for (int k = 0; k < 10; k = k + 1) { tech.AppendBool(source.researched[k]); }
+                legacy.Put("researched", tech); continue;
+            }
+            legacy.Put(key, root.ValAt(i));
+        }
+        JsonValue legacyBuildings = ForgeSave.Member(legacy, "buildings");
+        for (int i = 0; i < 1728; i = i + 1) {
+            JsonValue entry = legacyBuildings.At(i);
+            if (ForgeSave.Int(entry, "kind", 0, 19) >= 18) { entry.Set("kind", JsonValue.NewInt(10)); }
+        }
+        File.WriteAllText("test-saves/v2.json", legacy.ToJson());
+        ForgeWorld? old = ForgeSave.Load("test-saves/v2.json");
+        Check(old != null, "v2 save without drone fields loads");
+        if (old != null) {
+            Check(!old.droneMode && old.ActiveUnits() == 0, "v2 save has no drones");
+            Check(old.nests[0].active && old.nests[1].active && old.nests[2].active, "v2 save rebuilds all three nests");
+            Check(old.nests[0].x == ForgeMap.NestX(old, 0) && old.nests[0].y == ForgeMap.NestY(old, 0), "v2 rebuilt nest sits on its lane");
+            Check(!old.researched[10] && !old.researched[11], "v2 save lacks v3 techs");
+        }
+        legacy.Set("version", JsonValue.NewInt(2));
+        legacyBuildings = ForgeSave.Member(legacy, "buildings");
+        legacyBuildings.At(10 + 18 + 10 * 48).Set("kind", JsonValue.NewInt(18));
+        File.WriteAllText("test-saves/invalid.json", legacy.ToJson());
+        Check(ForgeSave.Load("test-saves/invalid.json") == null, "v2 save cannot contain v3 building kinds");
         File.WriteAllText("test-saves/invalid.json", original.Substring(0, original.Length - 1));
         Check(ForgeSave.Load("test-saves/invalid.json") == null, "strict parser rejects truncated document");
         File.WriteAllText("test-saves/invalid.json", original + "x");
@@ -477,6 +539,70 @@ class CoreforgeLogicTests {
         mend.tick = mend.tick + 240;
         fm.Step();
         Check(mend.buildings[hurt].hp == 102, "nano repair heals researched structures");
+        // 反击战：铁蜂进攻模式拔除敌巢，重赏到账，出兵口停摆。
+        ForgeWorld nest = Empty();
+        Check(nest.nests[0].active && nest.nests[1].active && nest.nests[2].active, "map generation seeds three nests");
+        ForgeUnit u = nest.units[0];
+        u.active = true; u.hp = 60; u.maxHp = 60; u.generation = 1;
+        u.x = ForgeGrid.Center(5); u.y = ForgeGrid.Center(nest.nests[0].y);
+        nest.nests[0].hp = 20;
+        nest.droneMode = true;
+        ForgeCombat bite = new ForgeCombat(nest);
+        int copperBefore = nest.resources.Get(0);
+        int bites = 0;
+        while (nest.nests[0].active && bites < 900) { nest.tick = nest.tick + 1; bite.Step(); bites = bites + 1; }
+        Check(!nest.nests[0].active, "attack-mode drones dismantle a nest");
+        Check(nest.resources.Get(0) == copperBefore + 100, "nest demolition pays the promised bounty");
+        Check(bite.SpawnLane(0) != 0 && bite.SpawnLane(3) != 0, "a demolished nest lane stops spawning");
+        // 铁蜂守卫模式：拦截警戒半径内的来犯敌人并击杀。
+        ForgeWorld watch = Empty();
+        ForgeEnemy raider = watch.enemies[0];
+        raider.active = true; raider.kind = 0; raider.hp = 24; raider.maxHp = 65; raider.generation = 2;
+        raider.x = ForgeGrid.Center(cx + 3); raider.y = ForgeGrid.Center(cy);
+        watch.enemyCount = 1;
+        ForgeUnit d = watch.units[0];
+        d.active = true; d.hp = 60; d.maxHp = 60; d.generation = 1;
+        d.x = ForgeGrid.Center(cx); d.y = ForgeGrid.Center(cy + 2);
+        ForgeCombat defend = new ForgeCombat(watch);
+        int watches = 0;
+        while (raider.active && watches < 600) { watch.tick = watch.tick + 1; defend.Step(); watches = watches + 1; }
+        Check(!raider.active && watch.kills == 1, "guard-mode drones intercept and kill a raider");
+        // 棱镜聚焦塔：通电光束持续灼蚀直到目标蒸发。
+        ForgeWorld laser = Empty();
+        int pcell = laser.coreCell + 48;
+        laser.Place(pcell, BlockKind.Prism, 0);
+        laser.Place(pcell - 4, BlockKind.Generator, 0);
+        ForgeEnemy mote = laser.enemies[0];
+        mote.active = true; mote.kind = 0; mote.hp = 10; mote.maxHp = 65; mote.generation = 5;
+        mote.x = ForgeGrid.Center(cx + 3); mote.y = ForgeGrid.Center(cy);
+        laser.enemyCount = 1;
+        ForgeCombat beam = new ForgeCombat(laser); ForgeFactory grid = new ForgeFactory(laser);
+        int burns = 0;
+        while (mote.active && burns < 60) { laser.tick = laser.tick + 1; grid.Step(); beam.Step(); burns = burns + 1; }
+        Check(!mote.active && laser.kills == 1, "powered prism beam burns its target down");
+        // 铁蜂机巢：备料组装一架，满编自动停工不再吃料。
+        ForgeWorld fab = Empty();
+        int fcell = fab.coreCell + 48;
+        fab.Place(fcell, BlockKind.DroneFab, 0);
+        fab.Place(fcell - 4, BlockKind.Generator, 0);
+        ForgeFactory line = new ForgeFactory(fab);
+        Check(line.CanReceive(fcell, (int)ItemKind.Copper, 0) && line.CanReceive(fcell, (int)ItemKind.Lead, 0)
+          && line.CanReceive(fcell, (int)ItemKind.Silicon, 0) && !line.CanReceive(fcell, (int)ItemKind.Graphite, 0),
+          "drone fab accepts copper, lead and silicon only");
+        Stock airframe = ForgeFactory.DroneCost();
+        fab.buildings[fcell].stock.Add(0, airframe.Get(0));
+        fab.buildings[fcell].stock.Add(1, airframe.Get(1));
+        fab.buildings[fcell].stock.Add(3, airframe.Get(3));
+        FactoryTicks(fab, line, 301);
+        Check(fab.ActiveUnits() == 1, "drone fab assembles a drone from materials");
+        Check(fab.buildings[fcell].stock.Total() == 0, "assembly consumes the full airframe cost");
+        for (int i = 0; i < 23; i = i + 1) { fab.SpawnUnit(ForgeGrid.Center(fcell % 48), ForgeGrid.Center(fcell / 48)); }
+        fab.buildings[fcell].stock.Add(0, airframe.Get(0));
+        fab.buildings[fcell].stock.Add(1, airframe.Get(1));
+        fab.buildings[fcell].stock.Add(3, airframe.Get(3));
+        FactoryTicks(fab, line, 400);
+        Check(fab.ActiveUnits() == ForgeGrid.DroneLimit() && fab.buildings[fcell].stock.Total() == airframe.Total(),
+          "full roster parks the assembly line without consuming stock");
         Console.WriteLine("CORE defense matrix passed");
     }
     void Integration() {

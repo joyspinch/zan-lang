@@ -5,10 +5,11 @@ using System.Json;
 namespace Coreforge;
 
 class ForgeSave {
-    // v2：新增散射/狙击/臼炮（kind 15..17）、飞虫/奔兽（enemy kind 3..4）、
-    // 科技扩到 10 项、子弹携带 blast 溅射旗标。读取仍接受 v1 档
-    //（researched 长度按版本区分，缺省科技视为未研究，blast 视为 0）。
-    static int Version() { return 2; }
+    // v3：新增铁蜂机巢/棱镜塔（kind 18..19）、无人机（units）、敌巢（nests）、
+    // 铁蜂模式（droneMode）、科技扩到 12 项、NestDestroyed 事件（kind 8）。
+    // 读取仍接受 v1/v2 档：researched 长度按版本区分，旧档无无人机、
+    // 敌巢按 seed 全量重建、blast 视为 0。
+    static int Version() { return 3; }
     static int MaxBytes() { return 4194304; }
 
     static void Require(bool valid) {
@@ -77,12 +78,13 @@ class ForgeSave {
         value.Put("received", ForgeSave.Ints(b.received));
         return value;
     }
-    static void ReadBuilding(JsonValue value, ForgeBuilding b, ForgeWorld world) {
+    static void ReadBuilding(JsonValue value, ForgeBuilding b, ForgeWorld world, int version) {
         ForgeSave.Object(value, 21);
-        b.kind = (BlockKind)ForgeSave.Int(value, "kind", 0, 17);
+        // v3 才引入机巢(18)/棱镜(19)；旧档出现即视为损坏。
+        b.kind = (BlockKind)ForgeSave.Int(value, "kind", 0, version >= 3 ? 19 : 17);
         b.direction = ForgeSave.Int(value, "direction", 0, 3);
         b.hp = ForgeSave.Int(value, "hp", -1000000, 3600);
-        b.progress = ForgeSave.Int(value, "progress", 0, 200000);
+        b.progress = ForgeSave.Int(value, "progress", 0, 300000);
         b.recipe = ForgeSave.Int(value, "recipe", 0, 3);
         b.cooldown = ForgeSave.Int(value, "cooldown", 0, 200);
         b.energy = ForgeSave.Int(value, "energy", 0, 12000000);
@@ -127,7 +129,7 @@ class ForgeSave {
         root.PutBool("topologyDirty", world.topologyDirty); root.PutBool("pathsDirty", world.pathsDirty);
         root.Put("resources", ForgeSave.Ints(world.resources.amount));
         JsonValue tech = JsonValue.NewArray();
-        for (int i = 0; i < 10; i = i + 1) { tech.AppendBool(world.researched[i]); }
+        for (int i = 0; i < 12; i = i + 1) { tech.AppendBool(world.researched[i]); }
         root.Put("researched", tech);
         JsonValue tiles = JsonValue.NewArray();
         JsonValue buildings = JsonValue.NewArray();
@@ -159,6 +161,26 @@ class ForgeSave {
             bullets.Append(bullet);
         }
         root.Put("bullets", bullets);
+        root.PutBool("droneMode", world.droneMode);
+        JsonValue units = JsonValue.NewArray();
+        for (int i = 0; i < 24; i = i + 1) {
+            ForgeUnit u = world.units[i];
+            JsonValue unit = JsonValue.NewObject();
+            unit.PutBool("active", u.active); unit.PutInt("x", u.x); unit.PutInt("y", u.y);
+            unit.PutInt("hp", u.hp); unit.PutInt("maxHp", u.maxHp);
+            unit.PutInt("cooldown", u.cooldown); unit.PutInt("generation", u.generation);
+            units.Append(unit);
+        }
+        root.Put("units", units);
+        JsonValue nests = JsonValue.NewArray();
+        for (int i = 0; i < 3; i = i + 1) {
+            ForgeNest n = world.nests[i];
+            JsonValue nest = JsonValue.NewObject();
+            nest.PutBool("active", n.active); nest.PutInt("x", n.x); nest.PutInt("y", n.y);
+            nest.PutInt("hp", n.hp); nest.PutInt("maxHp", n.maxHp);
+            nests.Append(nest);
+        }
+        root.Put("nests", nests);
         root.PutInt("eventSequence", world.events.sequence);
         JsonValue events = JsonValue.NewArray();
         for (int i = 0; i < 64; i = i + 1) {
@@ -171,8 +193,11 @@ class ForgeSave {
         return root;
     }
     static ForgeWorld Decode(JsonValue root) {
-        ForgeSave.Object(root, 32);
+        // v3 起固定 35 键；v1/v2 旧档没有 units/nests/droneMode（32 键）。
+        bool hasUnits = root.Get("units") != null;
+        ForgeSave.Object(root, hasUnits ? 35 : 32);
         int version = ForgeSave.Int(root, "version", 1, ForgeSave.Version());
+        ForgeSave.Require(hasUnits == (version >= 3));
         ForgeSave.Require(ForgeSave.Int(root, "width", 48, 48) == 48);
         ForgeSave.Require(ForgeSave.Int(root, "height", 36, 36) == 36);
         int seed = ForgeSave.Int(root, "seed", -2147483648, 2147483647);
@@ -198,11 +223,11 @@ class ForgeSave {
         world.topologyDirty = ForgeSave.Bool(root, "topologyDirty"); world.pathsDirty = ForgeSave.Bool(root, "pathsDirty");
         ForgeSave.ReadInts(ForgeSave.Member(root, "resources"), world.resources.amount, 0, 100000000);
         JsonValue tech = ForgeSave.Member(root, "researched");
-        int techCount = version == 1 ? 6 : 10;
+        int techCount = version == 1 ? 6 : version == 2 ? 10 : 12;
         ForgeSave.Array(tech, techCount);
-        for (int i = 0; i < 10; i = i + 1) { world.researched[i] = i < techCount && ForgeSave.Boolean(tech.At(i)); }
+        for (int i = 0; i < 12; i = i + 1) { world.researched[i] = i < techCount && ForgeSave.Boolean(tech.At(i)); }
         ForgeSave.Require(world.researched[0]);
-        for (int i = 1; i < 10; i = i + 1) {
+        for (int i = 1; i < 12; i = i + 1) {
             if (world.researched[i]) { ForgeSave.Require(world.researched[world.catalog.techs[i].parent]); }
         }
         ForgeSave.Require(world.coreMaxHp == (world.researched[5] ? 3600 : 2400));
@@ -214,7 +239,7 @@ class ForgeSave {
             world.tiles[i].terrain = (TerrainKind)ForgeSave.Int(tile, "terrain", 0, 3);
             world.tiles[i].ore = ForgeSave.Int(tile, "ore", -1, 5);
             world.tiles[i].reserve = ForgeSave.Int(tile, "reserve", 0, 100000000);
-            ForgeSave.ReadBuilding(buildings.At(i), world.buildings[i], world);
+            ForgeSave.ReadBuilding(buildings.At(i), world.buildings[i], world, version);
             if (world.buildings[i].kind == BlockKind.Core) {
                 coreCount = coreCount + 1; ForgeSave.Require(i == world.coreCell);
             }
@@ -264,11 +289,52 @@ class ForgeSave {
             if (b.active) { ForgeSave.Require(b.damage > 0 && b.life > 0 && b.generation > 0); }
         }
         world.events.sequence = ForgeSave.Int(root, "eventSequence", 0, 1000000000);
+        if (hasUnits) {
+            world.droneMode = ForgeSave.Bool(root, "droneMode");
+            JsonValue units = ForgeSave.Member(root, "units"); ForgeSave.Array(units, 24);
+            for (int i = 0; i < 24; i = i + 1) {
+                JsonValue value = units.At(i); ForgeSave.Object(value, 7);
+                ForgeUnit u = world.units[i];
+                u.active = ForgeSave.Bool(value, "active");
+                u.x = ForgeSave.Int(value, "x", 0, 47999);
+                u.y = ForgeSave.Int(value, "y", 0, 35999);
+                u.maxHp = ForgeSave.Int(value, "maxHp", 0, 60);
+                u.hp = ForgeSave.Int(value, "hp", 0, 60);
+                u.cooldown = ForgeSave.Int(value, "cooldown", 0, 200);
+                u.generation = ForgeSave.Int(value, "generation", 0, 1000000000);
+                if (u.active) {
+                    ForgeSave.Require(u.hp > 0 && u.hp <= u.maxHp && u.generation > 0);
+                }
+            }
+            JsonValue nests = ForgeSave.Member(root, "nests"); ForgeSave.Array(nests, 3);
+            for (int i = 0; i < 3; i = i + 1) {
+                JsonValue value = nests.At(i); ForgeSave.Object(value, 5);
+                ForgeNest n = world.nests[i];
+                n.active = ForgeSave.Bool(value, "active");
+                n.x = ForgeSave.Int(value, "x", 0, 47);
+                n.y = ForgeSave.Int(value, "y", 0, 35);
+                n.maxHp = ForgeSave.Int(value, "maxHp", 0, 1600);
+                n.hp = ForgeSave.Int(value, "hp", 0, 1600);
+                if (n.active) {
+                    ForgeSave.Require(n.hp > 0 && n.hp <= n.maxHp);
+                    // 巢位由 seed 唯一确定，拒绝手改档挪巢。
+                    ForgeSave.Require(n.x == ForgeMap.NestX(world, i) && n.y == ForgeMap.NestY(world, i));
+                }
+            }
+        } else {
+            // v1/v2 旧档：无无人机，铁蜂守卫；敌巢按当前 seed 全量重建。
+            world.droneMode = false;
+            for (int i = 0; i < 3; i = i + 1) {
+                ForgeNest n = world.nests[i];
+                n.active = true; n.hp = 1600; n.maxHp = 1600;
+                n.x = ForgeMap.NestX(world, i); n.y = ForgeMap.NestY(world, i);
+            }
+        }
         JsonValue events = ForgeSave.Member(root, "events"); ForgeSave.Array(events, 64);
         for (int i = 0; i < 64; i = i + 1) {
             JsonValue value = events.At(i); ForgeSave.Object(value, 4);
             ForgeEvent e = world.events.entries[i];
-            e.kind = (ForgeEventKind)ForgeSave.Int(value, "kind", 0, 7);
+            e.kind = (ForgeEventKind)ForgeSave.Int(value, "kind", 0, 8);
             e.cell = ForgeSave.Int(value, "cell", -1, 1727);
             e.value = ForgeSave.Int(value, "value", -1000000000, 1000000000);
             e.tick = ForgeSave.Int(value, "tick", -1, world.tick);
