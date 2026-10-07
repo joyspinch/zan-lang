@@ -68,6 +68,17 @@ class ForgeInterface {
     int miniY;
     int miniW;
     int miniH;
+    // 蓝图：0=未启用，1=框选中，2=已捕获待粘贴。会话态，不入存档。
+    int bpState;
+    bool bpDrag;
+    int bpAnchor;
+    int bpCursor;
+    int bpCount;
+    int[] bpDX;
+    int[] bpDY;
+    int[] bpKind;
+    int[] bpDir;
+    bool rightPanned;
 
     ForgeInterface(App host, string path) {
         app = host; savePath = path; title = "炉心边境 · COREFORGE";
@@ -75,6 +86,7 @@ class ForgeInterface {
         renderer = new ForgeRenderer(); selected = BlockKind.Empty; speed = 1;
         inspectCell = sim.world.coreCell; hoverCell = -1; lastCell = -1; downCell = -1;
         keys = new bool[256];
+        bpDX = new int[256]; bpDY = new int[256]; bpKind = new int[256]; bpDir = new int[256];
         status = "从铜矿到炮塔：沿箭头连接输送线，守住炉心。";
         mouseX = -1; mouseY = -1;
     }
@@ -119,6 +131,10 @@ class ForgeInterface {
         form.On("hudTech10", () => Research(10));
         form.On("hudTech11", () => Research(11));
         form.On("hudDrones", () => CycleDrones());
+        form.On("hudBlueprint", () => ToggleBlueprint());
+        form.On("hudEndless", () => ContinueEndless());
+        // 蓝图数组是引用：让渲染器直接读同一份存储，避免每帧拷贝。
+        renderer.bpDX = bpDX; renderer.bpDY = bpDY; renderer.bpKind = bpKind; renderer.bpDir = bpDir;
         form.On("hudB2", () => SelectBlock(2));
         form.On("hudB3", () => SelectBlock(3));
         form.On("hudB4", () => SelectBlock(4));
@@ -147,6 +163,89 @@ class ForgeInterface {
           : "铁蜂转入守卫：拦截逼近炉心的来犯敌人。");
     }
 
+    // ================= 蓝图复制/粘贴 =================
+
+    /// B 键 / 工具栏：未启用→进入框选；已捕获→收起。
+    void ToggleBlueprint() {
+        if (bpState == 0) {
+            bpState = 1; bpCount = 0; bpDrag = false;
+            selected = BlockKind.Empty; erase = false; showTech = false;
+            Message("蓝图框选：按住左键框住要复制的建筑，松开完成捕获。");
+        } else {
+            bpState = 0; bpCount = 0; bpDrag = false;
+            Message("蓝图工具已收起。");
+        }
+    }
+
+    /// 松开左键：框内所有非炉心建筑按相对左上角的偏移记入蓝图。
+    void CaptureRegion() {
+        ForgeWorld w = sim.world;
+        bpDrag = false;
+        int ax = bpAnchor % w.width; int ay = bpAnchor / w.width;
+        int cx = bpCursor % w.width; int cy = bpCursor / w.width;
+        int x0 = ForgeGrid.Min(ax, cx); int x1 = ForgeGrid.Max(ax, cx);
+        int y0 = ForgeGrid.Min(ay, cy); int y1 = ForgeGrid.Max(ay, cy);
+        bpCount = 0;
+        for (int y = y0; y <= y1; y = y + 1) {
+            for (int x = x0; x <= x1; x = x + 1) {
+                if (bpCount >= 256) { break; }
+                ForgeBuilding b = w.buildings[w.Index(x, y)];
+                if (b.kind == BlockKind.Empty || b.kind == BlockKind.Core) { continue; }
+                bpDX[bpCount] = x - x0; bpDY[bpCount] = y - y0;
+                bpKind[bpCount] = (int)b.kind; bpDir[bpCount] = b.direction;
+                bpCount = bpCount + 1;
+            }
+        }
+        if (bpCount == 0) { Message("框内没有建筑：按住左键框住要复制的部分。"); return; }
+        bpState = 2;
+        Message("蓝图已捕获 " + N(bpCount) + " 座建筑：左键粘贴（可多处粘贴），R 旋转，Q 收起。");
+    }
+
+    /// 把蓝图粘到以 anchor 为左上角的区域；越界/占位/缺资源的格子跳过。
+    void PasteAt(int anchor) {
+        if (bpCount == 0 || anchor < 0) { return; }
+        ForgeWorld w = sim.world;
+        int ax = anchor % w.width; int ay = anchor / w.width;
+        int placed = 0; int skipped = 0;
+        for (int i = 0; i < bpCount; i = i + 1) {
+            int x = ax + bpDX[i]; int y = ay + bpDY[i];
+            if (x < 0 || y < 0 || x >= w.width || y >= w.height) { skipped = skipped + 1; continue; }
+            BlockKind kind = (BlockKind)bpKind[i];
+            if (w.BuildError(w.Index(x, y), kind) != "") { skipped = skipped + 1; continue; }
+            w.Build(w.Index(x, y), kind, bpDir[i]);
+            placed = placed + 1;
+        }
+        Message("蓝图粘贴 " + N(placed) + " 座" + (skipped > 0 ? "，跳过 " + N(skipped) + " 处（占位或资源不足）。" : "。"));
+    }
+
+    /// R 键：顺时针旋转 90°——位移向量与建筑朝向同步旋转，再归到非负象限。
+    void RotateBlueprint() {
+        for (int i = 0; i < bpCount; i = i + 1) {
+            int dx = bpDX[i]; int dy = bpDY[i];
+            bpDX[i] = -dy; bpDY[i] = dx;
+            bpDir[i] = (bpDir[i] + 1) % 4;
+        }
+        int minX = 0; int minY = 0;
+        for (int i = 0; i < bpCount; i = i + 1) {
+            if (bpDX[i] < minX) { minX = bpDX[i]; }
+            if (bpDY[i] < minY) { minY = bpDY[i]; }
+        }
+        for (int i = 0; i < bpCount; i = i + 1) {
+            bpDX[i] = bpDX[i] - minX; bpDY[i] = bpDY[i] - minY;
+        }
+        Message("蓝图已旋转 90°。");
+    }
+
+    /// 结算幕"无尽坚守"：撤下胜利幕，波表转公式生成、强度无限爬升。
+    void ContinueEndless() {
+        sim.world.victory = false;
+        sim.world.endless = true;
+        sim.world.nextWaveTicks = ForgeCombat.BetweenWaveTicks();
+        paused = false;
+        lastEvent = sim.world.events.sequence;
+        Message("无尽坚守已开启：波次不再有终点，敌军将持续变强。");
+    }
+
     void SelectBlock(int id) {
         selected = (BlockKind)id;
         erase = false;
@@ -171,6 +270,7 @@ class ForgeInterface {
         lastEvent = 0;
         leftDown = false;
         rightDown = false;
+        bpState = 0; bpDrag = false; bpCount = 0;
         Message("新的荒原已就绪。先规划运输，再扩张防线。");
     }
 
@@ -184,6 +284,9 @@ class ForgeInterface {
         // 世界全屏铺底（HUD 控件树之下）——游戏画面本体。
         camera.SetViewport(0, chromeTop, clientW, clientH - chromeTop);
         ApplyShake();
+        // 蓝图会话态喂给渲染器画框选矩形与幽灵预览（数组已在 Attach 共享）。
+        renderer.bpState = bpState; renderer.bpCount = bpCount;
+        renderer.bpAnchor = bpAnchor; renderer.bpDrag = bpDrag;
         renderer.Draw(c, sim.world, camera, hoverCell, selected, direction, erase, inspectCell, powerOverlay);
         ThreatArrows(c);
         Minimap(c);
@@ -340,7 +443,9 @@ class ForgeInterface {
             hot = true;
             waveLabel = "第 " + N(w.wave) + " 波 · 敌军 " + N(w.enemyCount) + " · 待抵达 " + N(w.spawnRemaining);
         } else {
-            waveLabel = "第 " + N(w.wave) + " / 20 波 · 准备 " + N((w.nextWaveTicks + 49) / 50) + " 秒";
+            waveLabel = w.endless
+              ? "第 " + N(w.wave + 1) + " 波 · 无尽 · 准备 " + N((w.nextWaveTicks + 49) / 50) + " 秒"
+              : "第 " + N(w.wave) + " / 20 波 · 准备 " + N((w.nextWaveTicks + 49) / 50) + " 秒";
         }
         CoreforgeHud.waveText.Text = waveLabel;
         CoreforgeHud.waveText.SetClassIn("cf-wave cf-wave-hot", hot ? "cf-wave-hot" : "cf-wave");
@@ -353,6 +458,9 @@ class ForgeInterface {
         CoreforgeHud.btnDrones.Text = w.droneMode ? "铁蜂·进攻" : "铁蜂·守卫";
         CoreforgeHud.btnDrones.SetClassIn("cf-mini-on", w.droneMode ? "cf-mini-on" : "");
         CoreforgeHud.btnDrones.visible = w.researched[10] && !w.defeated && !w.victory;
+        // 蓝图按钮：常驻文案避免工具栏回流；状态靠高亮与世界叠加层表达。
+        CoreforgeHud.btnBlueprint.SetClassIn("cf-mini-on", bpState != 0 ? "cf-mini-on" : "");
+        CoreforgeHud.btnBlueprint.Disabled = w.defeated;
         // 节奏按钮。
         CoreforgeHud.btnPause.Text = paused ? "继续" : "暂停";
         CoreforgeHud.btnPause.SetClassIn("cf-on", paused ? "cf-on" : "");
@@ -440,6 +548,7 @@ class ForgeInterface {
             int seconds = w.tick / 50 % 60;
             CoreforgeHud.endStats.Text = "坚守 " + N(ForgeGrid.Max(0, w.wave - 1)) + " 波 · 击杀 " + N(w.kills)
               + " · 生产 " + N(w.produced) + " · 历时 " + N(minutes) + " 分 " + N(seconds) + " 秒";
+            CoreforgeHud.btnEndless.visible = w.victory;
         }
     }
 
@@ -592,9 +701,11 @@ class ForgeInterface {
         erase = false;
         leftDown = false;
         newRunArmed = false;
+        if (bpState != 0) { bpState = 0; bpDrag = false; bpCount = 0; }
     }
 
     void Rotate() {
+        if (bpState == 2) { RotateBlueprint(); return; }
         direction = (direction + 1) % 4;
         if (selected == BlockKind.Empty && inspectCell >= 0) {
             ForgeBuilding b = sim.world.buildings[inspectCell];
@@ -662,6 +773,7 @@ class ForgeInterface {
         leftDown = false;
         rightDown = false;
         lastCell = -1;
+        bpState = 0; bpDrag = false; bpCount = 0;
         paused = true;
         lastEvent = loaded.events.sequence;
         Message("存档已恢复，当前暂停；按空格继续。");
@@ -685,6 +797,7 @@ class ForgeInterface {
         lastEvent = 0;
         leftDown = false;
         rightDown = false;
+        bpState = 0; bpDrag = false; bpCount = 0;
         Message("新的荒原已就绪。先规划运输，再扩张防线。");
     }
 
@@ -751,6 +864,7 @@ class ForgeInterface {
                     else if (code == 81 || code == 27) { Cancel(); }
                     else if (code == 88) { erase = !erase; selected = BlockKind.Empty; }
                     else if (code == 84) { showTech = !showTech; }
+                    else if (code == 66) { ToggleBlueprint(); }
                     else if (code == 49) { SelectBlock((int)BlockKind.Drill); }
                     else if (code == 50) { SelectBlock((int)BlockKind.Belt); }
                     else if (code == 51) { SelectBlock((int)BlockKind.Turret); }
@@ -766,9 +880,12 @@ class ForgeInterface {
             if (button == 0) {
                 if (hud) { miniArmed = false; }
                 else if (InRect(x, y, miniX, miniY, miniW, miniH)) { miniArmed = true; }
-                else { leftDown = true; downCell = hoverCell; lastCell = -1; }
+                else {
+                    leftDown = true; downCell = hoverCell; lastCell = -1;
+                    if (bpState == 1 && hoverCell >= 0) { bpAnchor = hoverCell; bpCursor = hoverCell; bpDrag = true; }
+                }
             }
-            if (button == 1 && over && !hud) { rightDown = true; }
+            if (button == 1 && over && !hud) { rightDown = true; rightPanned = false; }
         } else if (kind == 1) {
             if (flag > 0) {
                 // 每个手势的第一个事件是基准点，不是位移；
@@ -776,7 +893,11 @@ class ForgeInterface {
                 if (flag == gestureFlag && over && !hud && !HudConsumes(previousX, previousY)) { camera.Pan(x - previousX, y - previousY); }
                 gestureFlag = flag;
                 leftDown = false;
-            } else if (rightDown) { camera.Pan(x - previousX, y - previousY); }
+            } else if (rightDown) {
+                camera.Pan(x - previousX, y - previousY);
+                rightPanned = true;
+            }
+            else if (leftDown && bpState == 1 && hoverCell >= 0) { bpCursor = hoverCell; }
             else if (leftDown && over && hoverCell != downCell) {
                 if (selected == BlockKind.Belt || selected == BlockKind.Pipe
                   || selected == BlockKind.Wall || erase) {
@@ -790,8 +911,12 @@ class ForgeInterface {
                 if (miniArmed && InRect(x, y, miniX, miniY, miniW, miniH)) {
                     int cell = MiniCellAt(x, y);
                     if (cell >= 0) { JumpToCell(cell); }
-                } else if (!hud && flag == 0 && over) { PaintCell(hoverCell); }
+                } else if (!hud && flag == 0 && over && bpState == 2) { PasteAt(hoverCell); }
+                else if (!hud && flag == 0 && over && bpState == 0) { PaintCell(hoverCell); }
             }
+            if (bpState == 1 && bpDrag) { CaptureRegion(); }
+            if (button == 1 && rightDown && bpState != 0 && !rightPanned) { ToggleBlueprint(); }
+            rightPanned = false;
             miniArmed = false;
             leftDown = false;
             rightDown = false;

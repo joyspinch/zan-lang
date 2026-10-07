@@ -180,19 +180,40 @@ class ForgeCombat {
     }
 
     int Strength() {
-        if (world.wave <= 0) { return 100; }
-        int waveIndex = ForgeGrid.Min(world.wave, world.catalog.waves.Length) - 1;
-        return ForgeGrid.Max(1, world.catalog.waves[waveIndex].strength);
+        return WaveStrength(world, world.wave);
+    }
+
+    // ---- 波表：20 波内读目录，之后转公式无尽生成 ----
+
+    public static int WaveCount(ForgeWorld world, int wave) {
+        if (wave <= world.catalog.waves.Length) { return world.catalog.waves[wave - 1].count; }
+        return 44 + (wave - world.catalog.waves.Length) * 3;
+    }
+
+    public static int WaveInterval(ForgeWorld world, int wave) {
+        if (wave <= world.catalog.waves.Length) { return world.catalog.waves[wave - 1].interval; }
+        return ForgeGrid.Max(10, 33 - (wave - world.catalog.waves.Length));
+    }
+
+    public static int WaveStrength(ForgeWorld world, int wave) {
+        if (wave <= 0) { return 100; }
+        if (wave <= world.catalog.waves.Length) { return ForgeGrid.Max(1, world.catalog.waves[wave - 1].strength); }
+        // 每波 +12%：无尽模式下敌人的血量与攻击无限爬升。
+        return 100 + wave * 12;
+    }
+
+    public static int WaveBoss(ForgeWorld world, int wave) {
+        if (wave <= world.catalog.waves.Length) { return world.catalog.waves[wave - 1].boss; }
+        return wave % 5 == 0 ? 2 : -1;
     }
 
     void StartWave() {
-        if (world.defeated || world.victory || world.waveActive || world.enemyCount > 0 || world.wave >= world.catalog.waves.Length) { return; }
+        if (world.defeated || world.victory || world.waveActive || world.enemyCount > 0) { return; }
         if (world.buildings[world.coreCell].hp <= 0) { LoseCore(); return; }
-        WaveDef wave = world.catalog.waves[world.wave];
         world.wave = world.wave + 1;
         world.waveActive = true; world.nextWaveTicks = 0;
-        world.spawnRemaining = wave.count; world.spawnCooldown = 0;
-        world.bossPending = wave.boss >= 0;
+        world.spawnRemaining = ForgeCombat.WaveCount(world, world.wave); world.spawnCooldown = 0;
+        world.bossPending = ForgeCombat.WaveBoss(world, world.wave) >= 0;
         world.events.Emit(ForgeEventKind.WaveStarted, world.coreCell, world.wave, world.tick);
     }
 
@@ -222,8 +243,7 @@ class ForgeCombat {
         if (world.spawnRemaining <= 0 && !world.bossPending) { return; }
         int slot = FreeEnemy();
         if (slot < 0) { return; }
-        WaveDef wave = world.catalog.waves[world.wave - 1];
-        int ordinal = wave.count - world.spawnRemaining;
+        int ordinal = ForgeCombat.WaveCount(world, world.wave) - world.spawnRemaining;
         int kind = 0;
         if (world.spawnRemaining > 0) {
             // 波次混编（确定性公式）：3 波起混重兽，5 波起混自爆奔兽，
@@ -234,7 +254,7 @@ class ForgeCombat {
             else if (world.wave >= 3 && (roll >= 4 || (world.wave >= 12 && ordinal % 2 == 1))) { kind = 1; }
             world.spawnRemaining = world.spawnRemaining - 1;
         } else {
-            kind = wave.boss;
+            kind = ForgeCombat.WaveBoss(world, world.wave);
             world.bossPending = false;
         }
         int lane = SpawnLane(ordinal);
@@ -247,12 +267,11 @@ class ForgeCombat {
         e.x = ForgeGrid.Center(cell % world.width); e.y = ForgeGrid.Center(cell / world.width);
         e.maxHp = ForgeGrid.Max(1, def.hp * Strength() / 100); e.hp = e.maxHp; e.cooldown = 0;
         world.enemyCount = world.enemyCount + 1;
-        world.spawnCooldown = ForgeGrid.Max(1, wave.interval);
+        world.spawnCooldown = ForgeGrid.Max(1, ForgeCombat.WaveInterval(world, world.wave));
     }
 
     void AdvanceWave() {
         if (!world.waveActive) {
-            if (world.wave >= world.catalog.waves.Length) { return; }
             if (world.nextWaveTicks > 0) { world.nextWaveTicks = world.nextWaveTicks - 1; }
             if (world.nextWaveTicks <= 0) { StartWave(); }
         }
@@ -722,7 +741,8 @@ class ForgeCombat {
         world.resources.Add(0, 20 + world.wave * 3);
         world.resources.Add(1, 10 + world.wave * 2);
         world.events.Emit(ForgeEventKind.WaveCleared, world.coreCell, world.wave, world.tick);
-        if (world.wave >= world.catalog.waves.Length) {
+        // 第 20 波清完即远征胜利；无尽坚守选择后不再触发。
+        if (world.wave >= world.catalog.waves.Length && !world.endless) {
             world.victory = true; world.nextWaveTicks = 0;
         } else { world.nextWaveTicks = ForgeCombat.BetweenWaveTicks(); }
     }

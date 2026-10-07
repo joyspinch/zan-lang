@@ -228,7 +228,7 @@ class CoreforgeLogicTests {
     }
     bool Same(ForgeWorld a, ForgeWorld b) {
         if (a.width != b.width || a.height != b.height || a.seed != b.seed || a.tick != b.tick || a.coreCell != b.coreCell || a.coreMaxHp != b.coreMaxHp) { return false; }
-        if (a.wave != b.wave || a.nextWaveTicks != b.nextWaveTicks || a.spawnRemaining != b.spawnRemaining || a.spawnCooldown != b.spawnCooldown || a.bossPending != b.bossPending || a.waveActive != b.waveActive || a.defeated != b.defeated || a.victory != b.victory) { return false; }
+        if (a.wave != b.wave || a.nextWaveTicks != b.nextWaveTicks || a.spawnRemaining != b.spawnRemaining || a.spawnCooldown != b.spawnCooldown || a.bossPending != b.bossPending || a.waveActive != b.waveActive || a.defeated != b.defeated || a.victory != b.victory || a.endless != b.endless) { return false; }
         if (a.enemyCount != b.enemyCount || a.kills != b.kills || a.produced != b.produced || a.powerSupply != b.powerSupply || a.powerDemand != b.powerDemand || a.batteryStored != b.batteryStored || a.topologyDirty != b.topologyDirty || a.pathsDirty != b.pathsDirty) { return false; }
         if (!SameInts(a.resources.amount, b.resources.amount)) { return false; }
         for (int i = 0; i < 12; i = i + 1) { if (a.researched[i] != b.researched[i]) { return false; } }
@@ -336,7 +336,7 @@ class CoreforgeLogicTests {
         Check(!ForgeSave.Save(source, "test-saves/no-such-directory/save.json"), "save I/O failure returns false");
         Check(ForgeSave.Load("test-saves/no-such-save.json") == null, "missing save returns null");
         JsonValue root = JsonValue.Parse(original);
-        JsonValue bad = root.Clone(); bad.Set("version", JsonValue.NewInt(4)); Reject(bad, "unsupported version");
+        JsonValue bad = root.Clone(); bad.Set("version", JsonValue.NewInt(5)); Reject(bad, "unsupported version");
         bad = root.Clone(); bad.Set("width", JsonValue.NewInt(47)); Reject(bad, "wrong dimensions");
         bad = root.Clone(); bad.Set("height", JsonValue.NewInt(2147483647)); Reject(bad, "allocation overflow dimension");
         bad = root.Clone(); bad.Set("coreCell", JsonValue.NewInt(1728)); Reject(bad, "core index outside map");
@@ -378,7 +378,7 @@ class CoreforgeLogicTests {
         JsonValue legacy = JsonValue.NewObject();
         for (int i = 0; i < root.Count(); i = i + 1) {
             string key = root.KeyAt(i);
-            if (key == "units" || key == "nests" || key == "droneMode") { continue; }
+            if (key == "units" || key == "nests" || key == "droneMode" || key == "endless") { continue; }
             if (key == "version") { legacy.PutInt("version", 2); continue; }
             if (key == "researched") {
                 JsonValue tech = JsonValue.NewArray();
@@ -406,6 +406,18 @@ class CoreforgeLogicTests {
         legacyBuildings.At(10 + 18 + 10 * 48).Set("kind", JsonValue.NewInt(18));
         File.WriteAllText("test-saves/invalid.json", legacy.ToJson());
         Check(ForgeSave.Load("test-saves/invalid.json") == null, "v2 save cannot contain v3 building kinds");
+        // v3 档：剥掉 endless 键并把版本降回 3，上一版存档照常读取。
+        JsonValue v3 = JsonValue.NewObject();
+        for (int i = 0; i < root.Count(); i = i + 1) {
+            string key = root.KeyAt(i);
+            if (key == "endless") { continue; }
+            if (key == "version") { v3.PutInt("version", 3); continue; }
+            v3.Put(key, root.ValAt(i));
+        }
+        File.WriteAllText("test-saves/v3.json", v3.ToJson());
+        ForgeWorld? previous = ForgeSave.Load("test-saves/v3.json");
+        Check(previous != null, "v3 save without endless loads");
+        if (previous != null) { Check(!previous.endless && previous.wave == 5, "v3 save stays inside the catalog"); }
         File.WriteAllText("test-saves/invalid.json", original.Substring(0, original.Length - 1));
         Check(ForgeSave.Load("test-saves/invalid.json") == null, "strict parser rejects truncated document");
         File.WriteAllText("test-saves/invalid.json", original + "x");
@@ -460,6 +472,60 @@ class CoreforgeLogicTests {
         generation.tick = generation.tick + 1; guarded.Step();
         Check(!shot.active && target.hp == 11, "matching projectile generation applies exact damage");
         Console.WriteLine("CORE combat and waves passed");
+    }
+    void Endless() {
+        // 波表公式：目录内读表，目录外线性爬升；Boss 每 5 波一次。
+        ForgeWorld w = Empty();
+        Check(ForgeCombat.WaveCount(w, 1) == w.catalog.waves[0].count, "wave table reads the catalog inside");
+        Check(ForgeCombat.WaveCount(w, 20) == w.catalog.waves[19].count, "wave table covers wave 20");
+        Check(ForgeCombat.WaveCount(w, 21) == 47 && ForgeCombat.WaveCount(w, 24) == 56, "endless wave count follows the formula");
+        Check(ForgeCombat.WaveStrength(w, 21) == 352, "endless strength climbs per wave");
+        Check(ForgeCombat.WaveBoss(w, 25) == 2 && ForgeCombat.WaveBoss(w, 26) == -1, "endless boss returns every fifth wave");
+        Check(ForgeCombat.WaveInterval(w, 30) == 23 && ForgeCombat.WaveInterval(w, 60) == 10, "endless spawn interval tightens then floors at ten ticks");
+        // 第 20 波清空即远征胜利；选择无尽后第 21 波照常生成、强度按公式爬升。
+        ForgeWorld victor = Empty(); ForgeCombat cv = new ForgeCombat(victor);
+        victor.wave = 20; victor.waveActive = true;
+        cv.ClearWave();
+        Check(victor.victory && !victor.waveActive, "clearing wave 20 triggers victory");
+        victor.victory = false; victor.endless = true; victor.nextWaveTicks = 1;
+        for (int i = 0; i < 3; i = i + 1) { victor.tick = victor.tick + 1; cv.Step(); }
+        Check(victor.wave == 21 && victor.waveActive && !victor.victory, "endless continues past the catalog");
+        Check(victor.spawnRemaining > 0 && victor.spawnRemaining < ForgeCombat.WaveCount(victor, 21), "endless wave uses the formula count");
+        int spawned = -1;
+        for (int j = 0; j < victor.enemies.Length; j = j + 1) {
+            if (victor.enemies[j].active) {
+                spawned = j;
+                Check(victor.enemies[j].maxHp == ForgeGrid.Max(1, victor.catalog.enemies[victor.enemies[j].kind].hp
+                  * ForgeCombat.WaveStrength(victor, 21) / 100), "endless enemies scale with the wave formula");
+                break;
+            }
+        }
+        Check(spawned >= 0, "endless wave actually spawns");
+        // 清掉第 21 波不再回到胜利，间歇照常排下一波。
+        victor.spawnRemaining = 0; victor.enemyCount = 0; victor.bossPending = false;
+        for (int j = 0; j < victor.enemies.Length; j = j + 1) { victor.enemies[j].active = false; }
+        cv.ClearWave();
+        Check(!victor.victory && victor.nextWaveTicks > 0 && !victor.waveActive, "endless clearing never re-triggers victory");
+        // 无尽中盘存档往返：endless 与公式波次完整保真。
+        ForgeWorld endlessSave = Empty(); endlessSave.endless = true; endlessSave.wave = 23;
+        endlessSave.waveActive = true; endlessSave.spawnRemaining = 50; endlessSave.bossPending = false;
+        endlessSave.nextWaveTicks = 0; endlessSave.spawnCooldown = 12; endlessSave.enemyCount = 0;
+        Check(50 <= ForgeCombat.WaveCount(endlessSave, 23), "mid-endless in-flight count stays inside the formula bound");
+        Check(ForgeSave.Save(endlessSave, "test-saves/endless.json"), "endless state saves");
+        ForgeWorld? endlessLoad = ForgeSave.Load("test-saves/endless.json");
+        Check(endlessLoad != null, "endless state loads");
+        if (endlessLoad != null) {
+            Check(endlessLoad.endless && endlessLoad.wave == 23, "endless flag and wave survive the roundtrip");
+            Check(Same(endlessSave, endlessLoad), "endless world matches after the roundtrip");
+        }
+        // 防篡改：目录外的波次必须携带 endless；波次钳在防御上限内。
+        JsonValue doc = JsonValue.Parse(File.ReadAllText("test-saves/endless.json"));
+        doc.Set("endless", JsonValue.NewBool(false));
+        Reject(doc, "post-catalog wave without endless");
+        doc = JsonValue.Parse(File.ReadAllText("test-saves/endless.json"));
+        doc.Set("wave", JsonValue.NewInt(1001));
+        Reject(doc, "wave beyond the defensive cap");
+        Console.WriteLine("CORE endless passed");
     }
     void Defense() {
         // 臼炮溅射：主目标全伤，1.8 格内邻居吃一半。
@@ -635,7 +701,7 @@ class CoreforgeLogicTests {
         Console.WriteLine("CORE deterministic multi-seed integration passed");
     }
     void Run() {
-        Conveyors(); RecipesAndPower(); Fluids(); BuildingAndResearch(); Persistence(); CombatAndWaves(); Defense(); Integration();
+        Conveyors(); RecipesAndPower(); Fluids(); BuildingAndResearch(); Persistence(); CombatAndWaves(); Endless(); Defense(); Integration();
         Console.WriteLine("COREFORGE_TESTS_OK assertions=" + Convert.ToString(assertions));
     }
     static void Main() {

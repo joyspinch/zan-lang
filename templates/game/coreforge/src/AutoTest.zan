@@ -14,6 +14,10 @@ class CoreforgeAutoTest {
     static double zoom0;
     static double camX0;
     static double camY0;
+    static int beltCount0;
+    static int bpSumX0;
+    static int bpSumY0;
+    static int pasteCell = -1;
     static bool passed = true;
 
     static bool done;
@@ -66,6 +70,69 @@ class CoreforgeAutoTest {
         g.ClickHud(controlName);
     }
 
+    static int CountKind(BlockKind kind) {
+        int n = 0;
+        for (int i = 0; i < g.sim.world.buildings.Length; i = i + 1) {
+            if (g.sim.world.buildings[i].kind == kind) { n = n + 1; }
+        }
+        return n;
+    }
+
+    static int bpA = -1;
+    static int bpB = -1;
+
+    // 相邻两座建筑、屏幕位置都不被 HUD 遮蔽（波次横幅/详情面板会压住世界）。
+    static bool PickPair() {
+        ForgeWorld w = g.sim.world;
+        for (int i = 0; i < w.buildings.Length; i = i + 1) {
+            if (w.buildings[i].kind == BlockKind.Empty || w.buildings[i].kind == BlockKind.Core) { continue; }
+            int x = i % w.width; int y = i / w.width;
+            if (x + 1 >= w.width) { continue; }
+            int j = w.Index(x + 1, y);
+            if (w.buildings[j].kind == BlockKind.Empty || w.buildings[j].kind == BlockKind.Core) { continue; }
+            if (g.HudConsumes(ScreenX(i), ScreenY(i)) || g.HudConsumes(ScreenX(j), ScreenY(j))) { continue; }
+            bpA = i; bpB = j;
+            return true;
+        }
+        return false;
+    }
+
+    // 没有现成相邻对时，在炉心正下方现建两段带子（资源充足、必在屏内）。
+    static bool MakePair() {
+        ForgeWorld w = g.sim.world;
+        int cx = w.coreCell % w.width; int cy = w.coreCell / w.width;
+        for (int dy = 1; dy <= 3; dy = dy + 1) {
+            for (int dx = -2; dx <= 2; dx = dx + 1) {
+                int ax = cx + dx; int ay = cy + dy;
+                if (ax < 0 || ax + 1 >= w.width || ay >= w.height) { continue; }
+                int a = w.Index(ax, ay); int b = w.Index(ax + 1, ay);
+                if (!FreeAt(w, a) || !FreeAt(w, b)) { continue; }
+                if (g.HudConsumes(ScreenX(a), ScreenY(a)) || g.HudConsumes(ScreenX(b), ScreenY(b))) { continue; }
+                w.Build(a, BlockKind.Belt, 0);
+                w.Build(b, BlockKind.Belt, 0);
+                if (w.buildings[a].kind == BlockKind.Belt && w.buildings[b].kind == BlockKind.Belt) { bpA = a; bpB = b; return true; }
+            }
+        }
+        return false;
+    }
+
+    // 粘贴锚点：炉心附近、anchor/东邻/南邻都可直接建带（旋转后蓝图占 L 形）。
+    static int PickPasteCell() {
+        ForgeWorld w = g.sim.world;
+        int cx = w.coreCell % w.width; int cy = w.coreCell / w.width;
+        for (int dy = -4; dy <= 4; dy = dy + 1) {
+            for (int dx = -4; dx <= 4; dx = dx + 1) {
+                int x = cx + dx; int y = cy + dy;
+                if (x < 0 || y < 0 || x + 1 >= w.width || y + 1 >= w.height) { continue; }
+                int cell = w.Index(x, y);
+                if (!FreeAt(w, cell) || !FreeAt(w, w.Index(x + 1, y)) || !FreeAt(w, w.Index(x, y + 1))) { continue; }
+                if (g.HudConsumes(ScreenX(cell), ScreenY(cell))) { continue; }
+                return cell;
+            }
+        }
+        return -1;
+    }
+
     static int FindOre() {
         // 选距核心最近的可用矿：建造受半径限制（研究炉心扩张前 Chebyshev<=15），
         // 全图首扫可能选到半径外被 BuildError 拒绝的格子。
@@ -99,8 +166,13 @@ class CoreforgeAutoTest {
     }
 
     static string SaveFile() {
+        // 与 main.SavePath() 同源：默认档在用户目录，不在进程 cwd。
         string overridden = Environment.GetEnvironmentVariable("COREFORGE_SAVE");
-        return overridden != "" ? overridden : "expedition.json";
+        if (overridden != "") { return overridden; }
+        string basePath = Environment.GetEnvironmentVariable("LOCALAPPDATA");
+        if (basePath == "") { basePath = Environment.GetEnvironmentVariable("HOME"); }
+        if (basePath == "") { basePath = Directory.GetCurrentDirectory(); }
+        return basePath + "/Coreforge/expedition.json";
     }
 
     // 每帧推进一步；帧间隔给真实事件泵与渲染留出节奏。
@@ -206,6 +278,40 @@ class CoreforgeAutoTest {
             }
             case 16: {
                 if (g.sim.world.droneMode) { Fail("drone toggle did not switch back"); return; }
+                ClickHud("btnBlueprint"); // 蓝图工具：进入框选
+                break;
+            }
+            case 17: {
+                if (g.bpState != 1) { Fail("blueprint toggle did not arm marquee"); return; }
+                if (!PickPair() && !MakePair()) { Fail("no adjacent building pair for blueprint"); return; }
+                // 左键从第一座拖到第二座：框住相邻两座建筑。
+                g.Input(2, ScreenX(bpA), ScreenY(bpA), 0, 0, 0, 0);
+                g.Input(1, ScreenX(bpB), ScreenY(bpB), 0, 0, 0, 0);
+                g.Input(3, ScreenX(bpB), ScreenY(bpB), 0, 0, 0, 0);
+                break;
+            }
+            case 18: {
+                if (g.bpState != 2 || g.bpCount != 2) { Fail("marquee did not capture two buildings"); return; }
+                bpSumX0 = g.bpDX[0] + g.bpDX[1];
+                bpSumY0 = g.bpDY[0] + g.bpDY[1];
+                Key(82); // R：蓝图旋转 90°
+                break;
+            }
+            case 19: {
+                if (g.bpDX[0] + g.bpDX[1] != bpSumY0 || g.bpDY[0] + g.bpDY[1] != bpSumX0) { Fail("blueprint rotate did not swap extents"); return; }
+                pasteCell = PickPasteCell();
+                if (pasteCell < 0) { Fail("no free cell to paste blueprint"); return; }
+                beltCount0 = CountKind(BlockKind.Belt);
+                Click(ScreenX(pasteCell), ScreenY(pasteCell)); // 左键粘贴
+                break;
+            }
+            case 20: {
+                if (CountKind(BlockKind.Belt) <= beltCount0) { Fail("blueprint paste did not place belt"); return; }
+                Key(66); // B：收起蓝图
+                break;
+            }
+            case 21: {
+                if (g.bpState != 0 || g.bpCount != 0) { Fail("blueprint did not collapse"); return; }
                 break;
             }
             default: {

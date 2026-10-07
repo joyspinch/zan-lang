@@ -148,6 +148,9 @@ App.html + 游戏自己的皮肤。坑与定式，每条都是踩过才成立的
   量）、进度 `SetPercent`、禁用 `Disabled =`（` :disabled` 样式）、
   显隐 `visible`（子树整体退出测量/布局/命中）、互斥选中态
   `SetClassIn("cf-a cf-b", ...)`。事件接线一次性 `form.On(name, () => …)`。
+  状态按钮文案要**常驻**（如"蓝图 B"）：宽度随状态变化的 `.Text` 会让
+  flex 工具栏整行回流、按钮左右跳动；状态用 `SetClassIn` 高亮 + 世界
+  叠加层/状态栏表达（实测：三态文案按钮把整条工具栏反复重排）。
 - **双通道输入的分工**：自有循环里 PollOneEvent→ProcessEvent 已把
   真实点击路由进控件树；世界输入通道（game.Input）按容器
   bx/by/bw/bh + visible 做 HudConsumes 遮蔽，HUD 上的桌面事件不进世界。

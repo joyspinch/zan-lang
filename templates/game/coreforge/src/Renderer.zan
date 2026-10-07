@@ -71,6 +71,15 @@ class ForgeRenderer {
     int[] aimTarget;
     int[] aimGeneration;
     int[] aimTick;
+    // 蓝图会话态：标量由 Interface 每帧写入；数组在 Attach 时共享同一存储。
+    int bpState;
+    bool bpDrag;
+    int bpAnchor;
+    int bpCount;
+    int[] bpDX;
+    int[] bpDY;
+    int[] bpKind;
+    int[] bpDir;
 
     ForgeRenderer() {
         aimCell = new int[1024]; aimTarget = new int[1024];
@@ -1070,6 +1079,52 @@ class ForgeRenderer {
             }
         }
     }
+    // ---- 蓝图叠加层：框选矩形与粘贴幽灵预览 ----
+
+    void Marquee(ForgeWorld w, ForgeCamera camera, int anchor, int cursor) {
+        int ax = anchor % w.width; int ay = anchor / w.width;
+        int cx = cursor % w.width; int cy = cursor / w.width;
+        int x0 = ForgeGrid.Min(ax, cx); int y0 = ForgeGrid.Min(ay, cy);
+        scale = camera.zoom;
+        originX = camera.ScreenX(x0 * 1000); originY = camera.ScreenY(y0 * 1000);
+        double pixels = ForgeGrid.TileSize() * camera.zoom;
+        int pw = ForgeGrid.Max(1, (int)Math.Round((ForgeGrid.Abs(ax - cx) + 1) * pixels));
+        int ph = ForgeGrid.Max(1, (int)Math.Round((ForgeGrid.Abs(ay - cy) + 1) * pixels));
+        canvas.FillRect(originX, originY, pw, ph, 0x244DBF93);
+        canvas.DrawRect(originX, originY, pw, ph, 0xB44DBF93, Stroke(1));
+    }
+
+    void Blueprint(ForgeWorld w, ForgeCamera camera, int anchor) {
+        int ax = anchor % w.width; int ay = anchor / w.width;
+        for (int i = 0; i < bpCount; i = i + 1) {
+            int x = ax + bpDX[i]; int y = ay + bpDY[i];
+            if (x < 0 || y < 0 || x >= w.width || y >= w.height) { continue; }
+            int cell = y * w.width + x;
+            BlockKind kind = (BlockKind)bpKind[i];
+            bool ok = w.BuildError(cell, kind) == "";
+            AtCell(w, camera, cell);
+            if (!Visible(camera, originX + S(16), originY + S(16), S(40))) { continue; }
+            ghost = true; ghostTint = ok ? 0xFF9DE4C2 : 0xFFEF967C;
+            Rect(0, 0, 32, 32, ok ? 0x244DBF93 : 0x30CF765A);
+            Building(w, camera, cell, kind, w.buildings[cell], bpDir[i]);
+            Corners(ghostTint, 0);
+            ghost = false;
+        }
+        // 蓝图包围框：一眼看清粘贴的占地范围。
+        int minX = 0; int minY = 0; int maxX = 0; int maxY = 0;
+        for (int i = 0; i < bpCount; i = i + 1) {
+            if (bpDX[i] < minX) { minX = bpDX[i]; }
+            if (bpDY[i] < minY) { minY = bpDY[i]; }
+            if (bpDX[i] > maxX) { maxX = bpDX[i]; }
+            if (bpDY[i] > maxY) { maxY = bpDY[i]; }
+        }
+        scale = camera.zoom;
+        originX = camera.ScreenX((ax + minX) * 1000); originY = camera.ScreenY((ay + minY) * 1000);
+        double pixels = ForgeGrid.TileSize() * camera.zoom;
+        canvas.DrawRect(originX, originY, (int)Math.Round((maxX - minX + 1) * pixels),
+          (int)Math.Round((maxY - minY + 1) * pixels), 0xCC9DE4C2, Stroke(1));
+    }
+
     void Placement(ForgeWorld w, ForgeCamera camera, int cell, BlockKind selected, int direction, bool erase) {
         if (cell < 0 || cell >= w.width * w.height) { return; }
         AtCell(w, camera, cell);
@@ -1166,6 +1221,8 @@ class ForgeRenderer {
         if (inspectCell >= 0 && inspectCell < w.buildings.Length) {
             AtCell(w, camera, inspectCell); Corners(0xFFB4DCCE, -2);
         }
+        if (bpState == 2 && bpCount > 0 && hoverCell >= 0 && hoverCell < w.width * w.height) { Blueprint(w, camera, hoverCell); }
+        if (bpState == 1 && bpDrag && bpAnchor >= 0 && hoverCell >= 0 && hoverCell < w.width * w.height) { Marquee(w, camera, bpAnchor, hoverCell); }
         Placement(w, camera, hoverCell, selected, direction, erase);
         c.PopClip();
     }

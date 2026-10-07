@@ -5,11 +5,12 @@ using System.Json;
 namespace Coreforge;
 
 class ForgeSave {
-    // v3：新增铁蜂机巢/棱镜塔（kind 18..19）、无人机（units）、敌巢（nests）、
+    // v4：新增无尽坚守（endless）——第 20 波胜利后继续，波次转公式生成。
+    // v3：铁蜂机巢/棱镜塔（kind 18..19）、无人机（units）、敌巢（nests）、
     // 铁蜂模式（droneMode）、科技扩到 12 项、NestDestroyed 事件（kind 8）。
-    // 读取仍接受 v1/v2 档：researched 长度按版本区分，旧档无无人机、
-    // 敌巢按 seed 全量重建、blast 视为 0。
-    static int Version() { return 3; }
+    // 读取仍接受 v1/v2/v3 档：researched 长度按版本区分，v3 以下无 endless
+    // 且波次锁在目录内，旧档无无人机、敌巢按 seed 全量重建、blast 视为 0。
+    static int Version() { return 4; }
     static int MaxBytes() { return 4194304; }
 
     static void Require(bool valid) {
@@ -123,6 +124,7 @@ class ForgeSave {
         root.PutInt("bulletCursor", world.bulletCursor);
         root.PutBool("bossPending", world.bossPending); root.PutBool("waveActive", world.waveActive);
         root.PutBool("defeated", world.defeated); root.PutBool("victory", world.victory);
+        root.PutBool("endless", world.endless);
         root.PutInt("enemyCount", world.enemyCount); root.PutInt("kills", world.kills);
         root.PutInt("produced", world.produced); root.PutInt("powerSupply", world.powerSupply);
         root.PutInt("powerDemand", world.powerDemand); root.PutInt("batteryStored", world.batteryStored);
@@ -193,11 +195,13 @@ class ForgeSave {
         return root;
     }
     static ForgeWorld Decode(JsonValue root) {
-        // v3 起固定 35 键；v1/v2 旧档没有 units/nests/droneMode（32 键）。
+        // v4 固定 36 键；v3 固定 35 键；v1/v2 旧档没有 units/nests/droneMode（32 键）。
         bool hasUnits = root.Get("units") != null;
-        ForgeSave.Object(root, hasUnits ? 35 : 32);
+        bool hasEndless = root.Get("endless") != null;
+        ForgeSave.Object(root, hasEndless ? 36 : hasUnits ? 35 : 32);
         int version = ForgeSave.Int(root, "version", 1, ForgeSave.Version());
         ForgeSave.Require(hasUnits == (version >= 3));
+        ForgeSave.Require(hasEndless == (version >= 4));
         ForgeSave.Require(ForgeSave.Int(root, "width", 48, 48) == 48);
         ForgeSave.Require(ForgeSave.Int(root, "height", 36, 36) == 36);
         int seed = ForgeSave.Int(root, "seed", -2147483648, 2147483647);
@@ -206,14 +210,17 @@ class ForgeSave {
         world.tick = ForgeSave.Int(root, "tick", 0, 1000000000);
         world.coreCell = ForgeSave.Int(root, "coreCell", 0, 1727);
         world.coreMaxHp = ForgeSave.Int(root, "coreMaxHp", 2400, 3600);
-        world.wave = ForgeSave.Int(root, "wave", 0, 20);
+        // 无尽档的波次与在途敌人数没有目录上限，钳到防御性上限即可。
+        world.wave = ForgeSave.Int(root, "wave", 0, 999);
         world.nextWaveTicks = ForgeSave.Int(root, "nextWaveTicks", 0, 3500);
-        world.spawnRemaining = ForgeSave.Int(root, "spawnRemaining", 0, 42);
+        world.spawnRemaining = ForgeSave.Int(root, "spawnRemaining", 0, 3200);
         world.spawnCooldown = ForgeSave.Int(root, "spawnCooldown", 0, 45);
         world.bulletCursor = ForgeSave.Int(root, "bulletCursor", 0, 383);
         world.bossPending = ForgeSave.Bool(root, "bossPending");
         world.waveActive = ForgeSave.Bool(root, "waveActive");
         world.defeated = ForgeSave.Bool(root, "defeated"); world.victory = ForgeSave.Bool(root, "victory");
+        world.endless = hasEndless && ForgeSave.Boolean(root.Get("endless"));
+        if (world.wave > 20) { ForgeSave.Require(world.endless); }
         world.enemyCount = ForgeSave.Int(root, "enemyCount", 0, 192);
         world.kills = ForgeSave.Int(root, "kills", 0, 1000000000);
         world.produced = ForgeSave.Int(root, "produced", 0, 1000000000);
@@ -255,7 +262,7 @@ class ForgeSave {
             ForgeEnemy e = world.enemies[i];
             e.active = ForgeSave.Bool(value, "active"); e.kind = ForgeSave.Int(value, "kind", 0, 4);
             e.x = ForgeSave.Int(value, "x", 0, 47999); e.y = ForgeSave.Int(value, "y", 0, 35999);
-            int maximumHp = world.catalog.enemies[e.kind].hp * world.catalog.waves[19].strength / 100;
+            int maximumHp = world.catalog.enemies[e.kind].hp * ForgeCombat.WaveStrength(world, ForgeGrid.Max(1, world.wave)) / 100;
             e.hp = ForgeSave.Int(value, "hp", -54, maximumHp);
             e.maxHp = ForgeSave.Int(value, "maxHp", 0, maximumHp);
             e.cooldown = ForgeSave.Int(value, "cooldown", 0, 90);
@@ -268,8 +275,8 @@ class ForgeSave {
         ForgeSave.Require(activeEnemies == world.enemyCount);
         if (world.waveActive) {
             ForgeSave.Require(world.wave > 0 && !world.defeated && !world.victory);
-            ForgeSave.Require(world.spawnRemaining <= world.catalog.waves[world.wave - 1].count);
-            if (world.bossPending) { ForgeSave.Require(world.catalog.waves[world.wave - 1].boss >= 0); }
+            ForgeSave.Require(world.spawnRemaining <= ForgeCombat.WaveCount(world, world.wave));
+            if (world.bossPending) { ForgeSave.Require(ForgeCombat.WaveBoss(world, world.wave) >= 0); }
         } else { ForgeSave.Require(world.spawnRemaining == 0 && !world.bossPending); }
         if (world.victory) { ForgeSave.Require(world.wave == 20 && world.enemyCount == 0); }
         JsonValue bullets = ForgeSave.Member(root, "bullets"); ForgeSave.Array(bullets, 384);
