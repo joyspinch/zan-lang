@@ -7,6 +7,17 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
 
 > 每条都是踩过坑、探针验证过的契约。
 
+## 扩展方法的接口接收者
+
+- 接收者兼容性要同时用于候选筛选与重载评分。具体类实现接口、派生接口
+  继承接口时，非泛型接口扩展应可调用；精确类型匹配优先于接口兼容，接口
+  兼容优先于裸类型参数。为什么：只按 kind/sym 相等筛候选会漏掉实现类，
+  只放宽筛选又会被评分中的精确相等判定拒绝；ORM 连接访问器在接口变量上
+  能用、在具体连接上报缺成员就是这两个门共同造成的。
+- 按符号遍历 implements 不能区分泛型接口的实参；不要用这种判定放行
+  `I<int>` 与 `I<string>`。保留原泛型匹配路径。验证同时覆盖接口/基类继承、
+  具体类型重载优先、不实现接口的接收者，以及连接访问器的事务回滚。
+
 ## Dict 内建（irgen.c 布局注释 = 契约）
 
 - 布局 8 字段：`{i64 count, i64 capacity, i8** keys, i64* values, i64* index,
@@ -2402,14 +2413,166 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   名**——foreach 降级按名找 `$fe.c%d` 接 col_slot，改名后 col_slot=NULL，
   cond 块跨挂起复用集合 SSA，LLVM 验证报 "does not dominate all uses"
   （三个 await-in-foreach 用例全红）。
-- **别名赋值的 capture-release 必须门在 rc 托管指针类型上**：标量槽走普
-  通存储。无门时 `i = i + 1` 的 i64 中间值 store 进 i32 alloca——越界砸
-  邻槽，且 `emit_rc_release_for_type(int,...)` 形同虚设。
+- **别名赋值按槽类型选择 capture-release**：rc 指针使用引用 capture，
+  含强引用字段的结构体使用逐字段 capture；标量仍要按槽宽度转换后存储。
+  无宽度转换时 `i = i + 1` 的 i64 中间值 store 进 i32 alloca——越界砸邻槽；
+  把结构体当标量直接存储则漏掉旧字段释放与借用字段 retain。
 - **判定手法**：段错误先 cdb 看现场（strcmp 解引用 rcx=0 → 字典内部 key
   被野释放 → 往 ARC 所有权簿记查）；IR 存疑用 `--emit-ir` + 
   `ZANC_DUMP_BAD_IR=1` 落盘坏函数；归因用 targeted stash（只 stash 自己
   的文件）重编基线 zanc 跑同用例。契约用例
   conformance/async_shadow_same_name_across_await 四形态绿为准。
+
+## async 局部委托初始化：目标签名也是所有权契约（2026-10-08）
+
+- **帧局部声明沿用目标委托类型发射 lambda**：`ReadText read = () => text`
+  要走 `emit_lambda_typed(..., declared_type, ...)`，不能直接 `emit_expr`。
+  普通表达式路径缺少目标签名，会把字符串返回值按默认 `i64` 发射，并漏掉
+  借用返回值的 retain；委托调用方仍按 string 结果拥有 +1 释放，第一次调用
+  就释放了捕获单元中的字符串。后续循环分配复用那块内存，看似遮蔽变量
+  覆盖外层，退出时又会 double free。`async_frame_storage` 的运行与 leakcheck
+  已复现并验证修复；判断是否槽位串用，应同时看地址和 retain/release。
+- **参数和返回类型一起验证**：目标委托的未注解参数也决定实参 ABI。用浮点
+  参数、引用返回、多次调用及跨协程完成后逃逸的闭包锁住契约；只测返回 int
+  的 lambda 会让默认 i64 路径伪装成正确。
+
+## await 消费尾段合并：先合子帧句柄，再转移结果（2026-10-08）
+
+- **fast 与 resume 在子帧指针上合流**：DONE acquire 与 awaiter CAS 握手保持
+  原有顺序；恢复块只加载保存的子帧句柄，随后与立即完成句柄组成 phi。异常
+  检查、结果解码、子帧释放只发射一份。此前两路重复这一整段，既扩大每个
+  resume，又扩大异常传播控制流；`async_await_shared_tail` 用直接/间接调用、
+  即时/挂起、引用/浮点/聚合/void/丢弃结果与 awaiting catch/finally 锁住契约。
+- **聚合结果先解码，再释放子帧**：结果 i64 可保存子帧内部聚合字段的地址。
+  指针 phi 后先完成 aggregate load，才释放子帧；异常分支先转移异常及 owned
+  标志，再释放并重抛。合并已解码的值或提前 free 都不能替代这项顺序检查。
+
+## async 聚合值：帧存储与逐字段所有权一起规划（2026-10-08）
+
+- **结构体也能跨挂起**：局部帧扫描必须包含 LLVM struct，不能假定值聚合
+  不会跨 await。三 long 探针的 awaited 结果首次读取正确，再 Yield 后变成零
+  或随机值；原因是原 alloca 随 resume 调用结束而失效。与标量一样保留类型化
+  proxy，最终替换为帧地址；不得靠提前使用或改成引用对象避开缺陷。
+- **前缀条目是唯一所有者**：非 boxed 结构体含强引用字段时标记 `struct_rc`；
+  可见别名借用该槽，初始化/整值重赋走逐字段 capture。by-value 参数在 ramp
+  retain 字段，返回借用聚合先 retain 字段，completion/abandonment 释放字段，
+  丢弃 owned 聚合也要释放。只补持久存储会暴露返回悬空或字段泄漏。
+- **捕获值的生命周期归 cell**：捕获结构体使用预规划 cell；词法别名只借用。
+  清槽遍历跳过 cell payload，不能清空仍被逃逸闭包使用的字段。
+  `async_aggregate_frame` 覆盖嵌套字符串/对象/数组、赋值、参数、返回、循环、
+  丢弃结果与协程结束后的闭包访问，并用 leakcheck 检验所有权。
+
+## 嵌套结构体写入：递归解析 place 地址（2026-10-08）
+
+- **写接收者不能先读取成聚合值**：`outer.inner.value = v` 若先 load inner，
+  再只接受 pointer 接收者，会静默不发射 store；最小探针在 Yield 前就读回零。
+  从 local/static/class/array 元素的实际槽递归形成字段地址，复用 field capture
+  与 ref/out 地址解析。不能写入临时副本。`nested_struct_place` 检验这些根形态
+  和有副作用的数组下标仅执行一次；含引用的嵌套替换仍走逐字段 capture。
+
+## async finally 异常槽：扫描深度、工作项和实际数组类型一致（2026-10-08）
+
+- **容量沿完整管线传递**：扫描器的 `fin_depth_max` 必须落到 async 工作项，
+  再用它定义 FINEXC / FINEXC_OWNED / FINEXC_TID。只改帧构造、不传扫描值，
+  零初始化的工作项会把任意嵌套都缩成容量 1；访问时从帧成员取实际数组类型，
+  不能保留旧的固定 256 项 GEP 类型。发射时检查 `fin_idx < capacity`，让规划
+  漂移变成诊断，避免继续越界写临近状态。
+- **共享栈索引按发射语义计数**：lock 的 monitor exit 也占 finally 栈条目，
+  扫描只数 try/finally 会漏掉 lock 内的高位异常槽。await 检测、ANF、transfer
+  计数和帧局部扫描要同步遍历 lock/checked 的子节点，否则局部槽与挂起点规划
+  仍可能缺失。`async_finally_frame_capacity` 已用三层 awaiting finally、lock
+  内嵌两层 finally、checked 内跨 await 局部验证普通/发布运行及 leakcheck；
+  单层 finally 用例无法锁住这类容量错配。
+
+## async finally 共享发射：按入口契约分组，存储按节点定位（2026-10-08）
+
+- **先区分入口的 EH 状态**：提前 return 的 handler 仍可能处于 armed 状态，
+  正常离开 try 与异常入口则已弹出所属 handler。只按 finally AST 合并会改变
+  throw 的目标。当前 pending-exit 共享按局部/模式绑定、catch cleanup、armed
+  slot、外层 region、循环目标及 checked/throw 基线匹配；入口不兼容就分别发射。
+  normal/unwind 共享要先统一 region 退出协议，不能因为体相同就接到同一入口。
+- **await 后的去向要在帧里**：每个 try AST 规划 storage-only i32 continuation
+  槽，原出口存 selector，公共 body 末尾 switch 回各自 continuation；phi/private
+  alloca 跨 resume 不存活。返回值仍走 RETSPILL，各出口自己的后续释放保持独立。
+- **截断 finally 栈时保存整个隐藏后缀**：body 内的嵌套 try 可以复用被隐藏的
+  任意栈位，发射完只恢复 finally_count 或单个描述符会将外层换成内层 region，
+  后续出口漏执行清理。保存/恢复所有暂时隐藏的条目，同时保留当前 region 新增的
+  shared group。两层活动 region 内再嵌两层的回归才能覆盖高位被覆盖的形态。
+- **不要以扫描/发射次数对应定位 foreach 槽**：保守扫描仍重复 finally，共享
+  发射会跳过兼容副本；$fe.N 的两个 ordinal 因此漂移，后续 protocol foreach
+  会找不到 enumerator。按 foreach AST + element/index/collection/enumerator
+  用途定位槽；互斥 body 副本复用同一节点存储，嵌套不同节点保持独立。
+- **扫描去重返回准确槽位**：add-local 命中已有节点时仍应返回已有 index。
+  storage-only 包装器不能盲改最后一个 local.no_arc：重复扫描嵌套 selector
+  会误清后续 RC 结构体的 owner，普通输出正确而 leakcheck 报漏。回归须含
+  嵌套 try 后声明的动态字符串字段聚合，并跨 await 检查字段及退出释放。
+- **规模门禁同时扩大出口和 body**：只增 await 数量捕不到出口×体积的乘法
+  展开。finally scaling 使用 16/32 个 return 站点及清理语句，校验执行计数、
+  完整 stdout/stderr 与 manifest 指令增长；旧实现增长 340%，共享后 178%，
+  校准 250% 上限。leakcheck 可能报告泄漏但 exit=0，不能只断言退出码。
+
+## async finally：持久 owner 与执行中清理边界（2026-10-08）
+
+- **退出协议分级 disarm 与 owner 递减**：离开 awaiting try 区域时，必须将
+  armed exception handlers 逐级弹出至该区域外层 armed 深度，再发射其 finally
+  清理体。若未及时 disarm，finally 体内抛出的 replacement 异常会错判为仍受本层
+  handler 保护而陷入自重入循环。
+- **持久 pending owner 账本取代单例与全局暂存**：跨挂起运行的 return 值、
+  rethrow 异常与 pending unwind payload 必须统一记录在帧常驻的 PENDING 账本中。
+  通过 snapshot HPENDING 标记各级 try 的清理边界；循环 break/continue 与跨作用域
+  goto 在跨越 executing finally 边界时，需将多余的 pending owners 规范化裁切至
+  共同祖先深度，防止 ARC 资源泄漏。
+- **嵌套 lambda 编译必须完全隔离外层 finally 与 pending 上下文**：`emit_lambda_typed`
+  发射闭包或方法组时切换至独立的 `lambda_fn`。若未对 `finally_count`、`finally_loop_base`、
+  `g->pending`、active finally/catch 描述符快照以及循环目标（break/continue）做严格的
+  保存、清零与恢复，lambda 内部的普通 `return` 语句会误判为属于外层 async 方法，
+  从而提前执行外层方法的 finally 块导致二次执行与逻辑破坏。
+
+## 拥有引用字段的结构体局部必须先初始化（2026-10-08）
+
+- **局部聚合槽位声明即零初始化**：包含 RC 字段的结构体局部变量在栈上分配时必须
+  通过 `zan_store_fit(LLVMConstNull)` 立即清零。由于结构体字段替换与赋值逻辑默认
+  先释放原有字段内容，未初始化的栈垃圾会被 `zan_rt_str_release` 或对象 release 误
+  作为旧引用释放，引发 ARC double free / over-release。
+
+## async 循环 continue 目标与 ANF Await 规整契约（2026-10-08）
+
+- **症状**：在含 `await` 的 `for` 步进（如 `for (...; ...; i = await Next(i))`）或
+  `do-while` 条件（如 `do { ...; continue; } while (await More())`）中执行 `continue`
+  时，循环陷入死循环（步进未执行、条件未重新求值挂死）。
+- **根因**：
+  1. ANF 规范化阶段原先将 `for` 步进中提升出来的声明和残余表达式强行塞入循环体末尾，
+     并将 `stmt->for_stmt.step` 置空；但 `continue` 的跳转目标是 `for.step`（`step_bb`），
+     导致 `continue` 直接跳过塞在循环体末尾的步进，造成死循环；
+  2. 原 `do-while` 条件中的提升也将条件残余替换为静态字面量 `true`，`continue`
+     跳转至 `do.cond`（`cond_bb`）时条件恒真。
+- **定式**：
+  1. 将提升后的前置语句与残余表达式打包为 `AST_BLOCK` 挂载在原 `for_stmt.step` 与
+     `while_stmt.cond` 位置；
+  2. `irgen_stmt.c` 的 `step_bb` 针对 `AST_BLOCK` / `AST_EXPR_STMT` 放行并调用 `emit_stmt`；
+  3. `cond_bb` 针对 `AST_BLOCK` 执行块内前置语句，以末尾表达式语句作为分支条件，
+     并在跳转前规范释放块内临时局部；
+  4. 保证 `continue_target` 自然跳入包含完整提升操作的 step/cond 块，严格维持语义。
+- **回归锁定**：`tests/conformance/async_loop_continue.zan`（`ctest -R conformance_async_loop_continue`
+  4 孪生全部通过）。
+
+## async foreach 临时集合所有权与 SSA 跨挂起支配规则（2026-10-08）
+
+- **症状**：在 `foreach (int x in MakeArray())` 或 `foreach (char c in MakeString())`
+  循环体包含 `await` 挂起点时，LLVM verifier 报错 `Instruction does not dominate all uses!`，
+  指向 preheader 中的函数调用返回值在循环尾释放点使用非法；或在循环结束时报 double free。
+- **根因**：临时数组与临时字符串作为调用表达式，其生命周期所有权在 preheader 中已被登记为局部
+  （`fe_coll_registered = true`）并落入帧槽 `col_slot`。但原 `irgen_stmt.c` 循环退出块
+  `end_bb` 对数组与字符串无条件调用 `emit_release_owned_call_temp(..., collection, ...)`，
+  直接使用了 preheader 的 SSA 寄存器；当循环体发生协程挂起恢复后，preheader SSA 寄存器
+  不再支配恢复后的基本块；且 `fe_coll_registered` 为真时该局部在作用域退出时会被统一释放，
+  导致双重释放。
+- **定式**：
+  1. 循环退出块 `end_bb` 优先执行 `emit_release_owned_locals_from(g, locals, fe_start)` 清理作用域；
+  2. 仅当 `!fe_coll_registered` 时才释放临时调用值，且若存在 `col_slot` 则从帧槽中加载
+     重载指针，彻底解决跨挂起非支配 SSA 引用与重复释放问题。
+- **回归锁定**：`tests/conformance/async_foreach_owner.zan`（`ctest -R conformance_async_foreach_owner`
+  4 孪生全部通过）。
 
 ## 二进制格式补丁器（APK AXML axml_patch）：改解析先写 walk 探针（2026-09-23）
 

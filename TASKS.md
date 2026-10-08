@@ -8,6 +8,30 @@
 
 ## 未完成
 
+### B-ID126 [ ] 派生类内裸名访问继承静态字段静默读出 null
+2026-10-08 在 Mvc 自限定调用重构的探针中发现。下列行存为 `_scratch/static_inherited_probe.zan`，`build/zanc.exe _scratch/static_inherited_probe.zan --auto-stdlib -o _scratch/static_inherited_probe.exe` 后运行：预期两行 `base`/`b:base`，实际实例方法内裸名 `Tag` 打印 `(null)`、静态方法内打印 `/b:base`（Tag 为空）——类型检查全程无诊断。
+
+```zan
+using System;
+
+class Base {
+    static string Tag = "base";
+    static string Build() { return "b:" + Tag; }
+}
+
+class Derived : Base {
+    static string Make() { return Build(); }
+    void Inst() { Console.WriteLine(Tag); Console.WriteLine(Build()); }
+    static void Stat() { Console.WriteLine(Tag + "/" + Make()); }
+}
+
+class Program {
+    static void Main() { new Derived().Inst(); Derived.Stat(); }
+}
+```
+
+边界：`this.Tag` 编译报 `'Derived' has no member 'Tag'`；同类内裸名静态字段正常；基类静态**方法**裸名调用正常——只有"基类静态**字段**的裸名标识符"这一形态坏：checker 把名字解析到了继承的静态字段，irgen 未按静态存储装载（疑似按 this 布局偏移取值），静默产出 null。修复方向：裸名解析到非本类静态字段时要么正确发射静态装载，要么像实例接收者访问静态字段一样报错要求类型名限定；补正反 conformance。Mvc 重构（62d7390e）的变换脚本以"只剥本类声明成员"从源头规避了该形态。
+
 ### B-ID124 [ ] `new object()` 条件表达式产生 ptr/i32 PHI 类型不一致
 2026-10-08 在 nullable lock 回归夹具中独立复现；与 `AST_LOCK_STMT` 空值扫描修复无关，不在本轮扩展 irgen。将下列 8 行保存到 `_scratch/null_guard_lock_object_ternary.zan`，运行 `build/zanc.exe _scratch/null_guard_lock_object_ternary.zan --no-packages -o _scratch/null_guard_lock_object_ternary.exe`：类型检查通过，LLVM verifier 报 `PHI node operands are not the same type as the result`，指纹 `%tern = phi ptr [ %load3, %tern.then ], [ 0, %tern.else ]`。
 
