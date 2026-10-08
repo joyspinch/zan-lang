@@ -1,0 +1,97 @@
+// A lock is transparent to nullable-return and null-guard scans. Exercise
+// guards in its body/header, across its boundary, and inside nested locks.
+using System;
+
+class Cfg {
+    bool IsString() { return true; }
+    string AsString(string fallback) { return "id"; }
+}
+
+class Store {
+    Cfg Find(bool hit) {
+        if (hit) { return new Cfg(); }
+        return null;
+    }
+
+    Cfg FindLocked(object sync, bool hit) {
+        lock (sync) {
+            if (hit) { return new Cfg(); }
+            return null;
+        }
+    }
+}
+
+class Program {
+    static bool SafeId(string id) { return id == "id"; }
+
+    static string GuardedBody(Store wire, object sync, bool hit) {
+        lock (sync) {
+            Cfg id = wire.Find(hit);
+            string generated = "";
+            if (id == null) { generated = "read"; }
+            if (id != null) {
+                if (!id.IsString() || !SafeId(id.AsString(""))) {
+                    return "invalid";
+                }
+                return id.AsString("");
+            }
+            return generated;
+        }
+    }
+
+    static string GuardBeforeLock(Store wire, object sync, bool hit) {
+        Cfg id = wire.Find(hit);
+        if (id == null) { return "none"; }
+        lock (sync) { return id.AsString(""); }
+    }
+
+    static string GuardInsideLock(Store wire, object sync, bool hit) {
+        Cfg id = wire.Find(hit);
+        lock (sync) {
+            if (id == null) { return "none"; }
+        }
+        return id.AsString("");
+    }
+
+    static string NestedLocks(Store wire, object sync, object inner, bool hit) {
+        lock (sync) {
+            lock (inner) {
+                Cfg id = wire.Find(hit);
+                if (id == null) { return "none"; }
+                return id.AsString("");
+            }
+        }
+    }
+
+    static string GuardInHeader(Store wire, object sync, object inner, bool hit) {
+        Cfg id = wire.Find(hit);
+        lock (id != null && id.IsString() ? sync : inner) {
+            return id == null ? "none" : "id";
+        }
+    }
+
+    static string GuardedLockedReturn(Store wire, object sync, bool hit) {
+        Cfg id = wire.FindLocked(sync, hit);
+        if (id == null) { return "none"; }
+        return id.AsString("");
+    }
+
+    static void Main() {
+        Store wire = new Store();
+        object sync = new object();
+        object inner = new object();
+        Console.WriteLine(GuardedBody(wire, sync, true));
+        Console.WriteLine(GuardedBody(wire, sync, false));
+        Console.WriteLine(GuardBeforeLock(wire, sync, true));
+        Console.WriteLine(GuardBeforeLock(wire, sync, false));
+        Console.WriteLine(GuardInsideLock(wire, sync, true));
+        Console.WriteLine(GuardInsideLock(wire, sync, false));
+        Console.WriteLine(NestedLocks(wire, sync, inner, true));
+        Console.WriteLine(NestedLocks(wire, sync, inner, false));
+        Console.WriteLine(GuardInHeader(wire, sync, inner, true));
+        Console.WriteLine(GuardInHeader(wire, sync, inner, false));
+        Console.WriteLine(GuardedLockedReturn(wire, sync, true));
+        Console.WriteLine(GuardedLockedReturn(wire, sync, false));
+        Console.WriteLine("GUARD-LOCK-OK");
+    }
+}

@@ -142,6 +142,55 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   压根不进编译（SDK 包店精确匹配，见"auto-stdlib 拉入"节 2026-10-07 条），
   不是在链接期删库。
 
+## 驱动按活性发布与跨包依赖
+
+- **库活性在完整 module 上判定**：先 strip 死函数、prune 无引用 extern 库，
+  再优化和拆 shard；分片后的协调 module 已不含全部调用，后续 prune 仍须
+  保留 `shard_n == 0` 门。坑出处：Canvas 同类中的未用图片/游戏方法会先
+  登记 DllImport，只看拉入类型会让普通绘图程序携带所有驱动；反过来在
+  分片后剪库又会误删 shard 真引用。验证 shared/static 的独立功能程序，
+  同时断言运行结果、导入表和随行文件，不能只看链接成功。
+- **条件前缀在 strip 后、优化与分片前留快照**：`-Os` 可内联并删掉活跃
+  包装函数，后查函数名会漏资源；分片同样会搬走定义。坑出处：普通发布
+  的 live wrapper 已执行，条件 asset 却没随行。条件表和包根表动态扩容，
+  不用固定 24/32 项缓冲；边界回归须超过旧上限。
+- **递归 driver 依赖按每个 driver 自己的 owner 根解析**：每层都应用条件、
+  校验相对文件名并检测循环；已有目标文件也须刷新。坑出处：跨包游戏
+  bundle 的 GUI/image 依赖不与父 driver 同根，且跳过已有文件会把过期
+  DLL 留在重复发布目录。用异根依赖、嵌套条件及预置旧文件的夹具验证。
+
+- **测试缓存必须跟踪所有库源根**：编译输入含包源时，mtime/stamp 依赖
+  不能只枚举 stdlib；新文件加入也须触发重新枚举。坑出处：包内设计器
+  已改，缓存程序仍显示旧版本通过。验证前刷新包含包源的 stamp，并
+  确认受影响用例确实以当前输入重新编译，避免把缓存命中当成新验证。
+
+## 静态库归档与运行时符号边界
+
+- **归档必须带符号索引，替换旧输出前先生成完整新归档**：使用 LLVM
+  archiver 的 `rcsD`，按目标选择 GNU/Darwin 格式；SDK 同步携带工具。
+  坑出处：手写 ar 只有对象成员，`nm` 能看到公共函数，普通 `-l` 链接却
+  报未定义。验收用真实 Zan producer 和普通链接，不能靠 whole-archive
+  或测试夹具补索引掩盖编译器缺陷。
+- **只处理编译器持有句柄所指的 runtime 定义**：静态库的 ARC 辅助函数
+  保留本地定义，模块自己的析构/诊断表保持私有；跨模块 weak 登记表及
+  锁/计数必须共享，COFF 的弱 fallback 用 COMDAT。坑出处：补索引后
+  抽取对象暴露重复辅助符号，全部私有化又会让应用析构无法清除库内
+  weak 槽。验收覆盖对象/数组、跨模块 weak 清除和 C 消费者；真实用户
+  公共导出保持 strong，两个库同名公共函数仍须报重复符号。
+
+## 32 位 native 指针适配与 Wasm 驱动闭包
+
+- **按 native ABI 区分指针与整数句柄**：Zan `nint` IR 是 i64，wasm32
+  native 指针是 i32，新 FFI 须加入 `w32adapt` 的参数及返回值适配；
+  native 本来就是 int64 的句柄不能误转指针。参数缓冲按实际参数数
+  分配，不能默默跳过超过八参的入口。坑出处：十参像素 blit 与图片
+  view 在 Wasm 链接报 signature mismatch，链接成功也须实际读像素。
+- **独立对象按未定义符号选取并补全传递依赖**：game 拉 GUI/image，
+  内嵌压缩资源拉 inflate，构建配方与 stale 源闭包同步。坑出处：原
+  unity 拆开后 SVG 图标缺 `zan_embed_decode`。用离屏 WASI 真运行基础
+  绘图、图片、音频解码、sprite 和图标；窗口 host 调用应显式失败，
+  离屏成功不能当作浏览器窗口或音频设备验收。
+
 ## 发布体积：数据逐符号分节与链接器 GC 的边界（2026-09-15）
 
 irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名>` /
@@ -170,15 +219,12 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   接后 obj_tmp 会删）→ `llvm-ar x` → 用 build/ld.exe（PE）或 ld.lld
   （ELF）手动重链，加 `--print-gc-sections`；缺驱动符号时补
   `-z undefs --noinhibit-exec`（ELF）即可只量回收不产出可执行。
-- **PE 的真按需粒度 = 归档成员，不是 gc**（2026-09-27 落地）：既然
-  .pdata/.xdata 钉死分节回收，PE 上想要"用到才导入"就把子系统拆成静态
-  归档的独立成员——GNU ld 按符号需求拉成员，无需 gc。zan_audio（+
-  stb_vorbis，unity 尾部 `#include`）经 `ZAN_GUI_AUDIO_SEPARATE` 拆成
-  `libzan_gui.a` 第三成员后，不用 stdlib/System/Media 的程序静态发布
-  实测 −103KB、vorbis/OggS 字符串清零；音频程序（Audio.zan 引
-  zan_audio_*）成员照常拉入、WASAPI 实开验证通过。共享 DLL 保持 unity
-  （CMake 目标不动）。函数分节在 PE 上白给 BSS +133KB（每节对齐垫），
-  别顺手加。
+- **PE 按需携带须覆盖归档成员与独立 driver**：`.pdata/.xdata` 会钉住
+  GNU ld 的函数分节，不能依赖 GC 从 unity 对象删掉未用子系统；静态
+  链接用独立归档成员，共享发布用独立 DLL 和活性判定。坑出处：音频
+  只拆成 GUI 静态库成员时，GUI DLL 仍带解码与设备实现。当前图片、
+  游戏和音频各有自己的 shared/static driver，纯绘图工具仅携带 GUI；
+  验收应检查两种链接模式的运行结果和依赖，不能只测静态体积。
 - **发布档必须 `-DNDEBUG`（2026-09-27）**：vendored C 库（libwebp/stb）
   的 `assert()` 把 `__FILE__` 编进 .rdata，每个发布 exe 泄漏 31 处构建机
   路径（`D:\<repo>\src\runtime\libwebp/...`）；NDEBUG 后字符串清零且无
@@ -905,6 +951,17 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   修后绿不能证明探针有效。线程峰值从 /proc/self/status 的 Threads 采样；
   前台池要靠「arm 住 pending 工作但不触发 ready」的定时器撑住（arm 不
   走 ready，dispatch 才走），否则 ensure 在起前台池前就被先触发。
+
+## nullable 接收者扫描必须穿透 lock（2026-10-08）
+
+- **同步维护守卫、可空返回和位置裁剪三个遍历表**：`node_guards_null` 对
+  `AST_LOCK_STMT` 要扫描锁表达式和 body，`stmt_returns_null` 要扫描 body，
+  `node_loc_prunable` 要把 lock 当作带可靠起点的语句。漏守卫子树会误拒
+  `lock (sync) { T x = Find(); if (x != null) x.Member(); }`；只补这一处，
+  则锁内 `return null` 仍会逃过诊断，或后置锁头的空值比较会错误放行前置
+  解引用。原因不是同步语义，而是辅助 AST 扫描与正常语句检查漏了同一种节点。
+  回归用 guarded/nested lock 正例和未守卫、后置 body/header 守卫、锁内可空
+  返回负例成对锁住；`null_guard_lock` 与 `diag_null_guard_lock_*` 已验证。
 
 ## conformance 处置四分法
 
@@ -2666,6 +2723,28 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   906 闭包、3.2M IR 指令、峰值 ~1.2GB、`--publish` 后可做
   IDE_RUNNING_OK 启动冒烟，是阶段 3-5 分片/manifest 工作的现成验收器。
 
+## 包命名空间发现的编译内索引（2026-10-08）
+
+- **metadata cache 命中不代表包发现已经缓存**：namespace probe 会单独打开包内
+  每个源文件；逐个 `using` 重扫所有包，让 423 文件 GUI 的暖 parse 花十余秒，
+  即使 metadata 全命中仍慢。按一次编译拥有一个索引：目录枚举和 namespace
+  probe 各源只做一次，后续命中与缺失查询都只访问内存，最后一次生成器依赖
+  拉入完成后释放；新编译重建，避免跨编译缓存漏掉改名和新增源。
+- **索引必须复现发现顺序和权限**：首店同名包在未命中时仍遮蔽后店；布局
+  `src > stdlib > flat`、店顺序、包名排序与逐层排序 DFS 都不可变。只有项目
+  包的真实声明可进入父命名空间桶；SDK/global 和 namespace-less/失败 probe
+  的目录 fallback 只精确匹配。按遍历顺序追加引用，不能改成 hash 桶遍历
+  发射；否则输入顺序改变会影响命名空间冲突改名，耗时下降并不能证明等价。
+- **副作用和禁用门保留在查询边界**：商业插件 usage 只在查询实际命中包后
+  记录，建索引时不可把所有枚举过的包记为使用。NULL/空项目根仍关闭包发现，
+  包括生成器子编译；非法、超长查询要在探测前返回，兼容 API 也不能漏掉。
+  用 probe 次数、精确 callback 序列、A/B 索引隔离和销毁重建断言这些契约。
+- **共享工作树上的性能 A/B 固定源码字节和编译器差量**：本次基准两次被并发
+  修改污染，随后 GUI 的中间改动又让两版编译器都失败。用同一份不可变源码
+  快照、相同其余编译器对象和各自预热的缓存，交换运行顺序复测，并核对源码
+  拉入顺序及 AST/IR 统计；失败用例先在基线对照诊断，避免误归因或以失败
+  提前退出的时长宣称提速。只复制实验输入，不把旧快照覆盖回共享工作树。
+
 ## LLVM 文本往返分片的坑：GetValueName 悬垂、平方级打印与元数据门（阶段 4，2026-09-28）
 
 - **LLVMGetValueName 返回的指针在改名瞬间失效**：`LLVMSetValueName2(v, new)`
@@ -2731,10 +2810,10 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   `../stdlib`；独立子目录（如 build/bpkg）里的 zanc 解析到 build/stdlib 不
   存在，stdlib 整体不拉入，错误形态是 App/Form 全 undefined——极易误归因
   为"包发现坏了"。独立构建树验证编译器改动必须显式 `--stdlib-path`。
-- 坑（"if 前缀"驱动不随行 ≠ 发现断了）：`"<lib> if <prefix>"` 驱动随行
-  条件是映像真的发射了该前缀函数；程序闭包不发射（gui_cef_browser 的映像
-  零个 CefBackend_ 函数）时 zan_cef 不随行，是既有语义非回归。排查随行
-  问题先用 HEAD worktree + 旧工具链发布同物 A/B，再谈归因。
+- **"if 前缀"按完整 live IR 的快照判断**：`"<lib> if <prefix>"` 只认
+  strip 死函数后仍活跃的前缀；闭包中未使用的驱动不随行。不能改查最终
+  映像的函数名：内联和分片会删除或搬走 live 定义，造成条件文件漏打包。
+  排查先分别核对优化前活性、driver owner 与随行结果，再做同物 A/B。
 - 坑（ctest 案例的编译工作目录）：run_case 里 zanc 编译调用不设
   WORKING_DIRECTORY（继承 ctest 的 build 目录），只有运行产物回落仓库根
   ——包命名空间案例编译期解析不到包。已修：编译统一补

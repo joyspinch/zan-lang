@@ -3965,6 +3965,8 @@ static bool stmt_returns_null(zan_ast_node_t *n, int depth) {
         return stmt_returns_null(n->for_stmt.body, depth + 1);
     case AST_FOREACH_STMT:
         return stmt_returns_null(n->foreach_stmt.body, depth + 1);
+    case AST_LOCK_STMT:
+        return stmt_returns_null(n->lock_stmt.body, depth + 1);
     case AST_TRY_STMT: {
         if (stmt_returns_null(n->try_stmt.try_body, depth + 1)) return true;
         for (int i = 0; i < n->try_stmt.catches.count; i++) {
@@ -4018,7 +4020,8 @@ static bool node_loc_prunable(zan_ast_kind_t k) {
     case AST_BLOCK: case AST_EXPR_STMT: case AST_RETURN_STMT:
     case AST_THROW_STMT: case AST_VAR_DECL: case AST_IF_STMT:
     case AST_WHILE_STMT: case AST_DO_WHILE_STMT: case AST_FOR_STMT:
-    case AST_FOREACH_STMT: case AST_TRY_STMT: case AST_SWITCH_STMT:
+    case AST_FOREACH_STMT: case AST_LOCK_STMT:
+    case AST_TRY_STMT: case AST_SWITCH_STMT:
         return true;
     default:
         return false;
@@ -4111,6 +4114,9 @@ static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth,
     case AST_FOREACH_STMT:
         return node_guards_null(n->foreach_stmt.collection, name, depth + 1, use) ||
                node_guards_null(n->foreach_stmt.body, name, depth + 1, use);
+    case AST_LOCK_STMT:
+        return node_guards_null(n->lock_stmt.expr, name, depth + 1, use) ||
+               node_guards_null(n->lock_stmt.body, name, depth + 1, use);
     case AST_TRY_STMT: {
         if (node_guards_null(n->try_stmt.try_body, name, depth + 1, use)) return true;
         for (int i = 0; i < n->try_stmt.catches.count; i++) {
