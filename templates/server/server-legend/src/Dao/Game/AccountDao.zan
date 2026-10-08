@@ -7,9 +7,9 @@ using ZanWeb.Model.Game;
 namespace ZanWeb.Dao.Game;
 
 /* game_account 的读写入口：TCP 网关（register/login/forgot/reset）与
-   网页注册/找回密码共用同一套校验与散列，两侧行为永远一致。DAO 由
-   调用方连接构造，无独立生命周期。 */
-class AccountDao {
+   网页注册/找回密码共用同一套校验与散列，两侧行为永远一致。DAO 继承
+   BaseRepository<Account>，支持 IFreeSql 注入与 IDbConnection 兼容。 */
+class AccountDao : BaseRepository<Account> {
     /* 密保答错锁定：1 小时窗口内错满 5 次，本小时窗口结束前拒绝再试。 */
     static int AnswerLimit = 5;
     static int AnswerWindowSec = 3600;
@@ -20,19 +20,16 @@ class AccountDao {
     static int LoginLimit = 10;
     static int LoginWindowSec = 3600;
 
-    IDbConnection db;
-
-    AccountDao(IDbConnection db) {
-        this.db = db;
-    }
+    AccountDao(IFreeSql fsql) : base(fsql) {}
+    AccountDao(IDbConnection db) : base(FreeSql.FromConnection(db)) {}
 
     async Account ByUsername(string username) {
-        return await this.db.Select<Account>()
+        return await this.GetExecutor().Select<Account>()
             .Where(a => a.username == username).FirstAsync();
     }
 
     async Account ById(int id) {
-        return await this.db.Select<Account>()
+        return await this.GetExecutor().Select<Account>()
             .Where(a => a.id == id).FirstAsync();
     }
 
@@ -56,7 +53,7 @@ class AccountDao {
         row.banReason = "";
         row.lastLoginAt = 0;
         row.createdAt = WebApp.NowSeconds();
-        return await this.db.Insert<Account>(row).ExecuteIdentityAsync();
+        return await this.GetExecutor().Insert<Account>(row).ExecuteIdentityAsync();
     }
 
     /* 密码校验（只比散列；状态/封禁语义由调用方处理，便于区分文案）。 */
@@ -84,7 +81,7 @@ class AccountDao {
     async int SetPassword(int accountId, string password) {
         string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
         string hash = AuthUser.PasswordHash(password, salt);
-        return await this.db.Update<Account>()
+        return await this.GetExecutor().Update<Account>()
             .Set(a => a.passwordSalt, salt)
             .Set(a => a.passwordHash, hash)
             .Where(a => a.id == accountId)
@@ -102,7 +99,7 @@ class AccountDao {
         /* 窗口过期则从零计。 */
         int fails = row.answerFails;
         if (now - row.answerFailAt >= AccountDao.AnswerWindowSec) { fails = 0; }
-        int _n = await this.db.Update<Account>()
+        int _n = await this.GetExecutor().Update<Account>()
             .Set(a => a.answerFails, fails + 1)
             .Set(a => a.answerFailAt, now)
             .Where(a => a.id == row.id)
@@ -110,7 +107,7 @@ class AccountDao {
     }
 
     async void ClearAnswerFails(int accountId) {
-        int _n = await this.db.Update<Account>()
+        int _n = await this.GetExecutor().Update<Account>()
             .Set(a => a.answerFails, 0)
             .Where(a => a.id == accountId)
             .ExecuteAffrowsAsync();
@@ -130,7 +127,7 @@ class AccountDao {
         /* 窗口过期则从零计。 */
         int fails = row.loginFails;
         if (now - row.loginFailAt >= AccountDao.LoginWindowSec) { fails = 0; }
-        int _n = await this.db.Update<Account>()
+        int _n = await this.GetExecutor().Update<Account>()
             .Set(a => a.loginFails, fails + 1)
             .Set(a => a.loginFailAt, now)
             .Where(a => a.id == row.id)
@@ -138,7 +135,7 @@ class AccountDao {
     }
 
     async void ClearLoginFails(int accountId) {
-        int _n = await this.db.Update<Account>()
+        int _n = await this.GetExecutor().Update<Account>()
             .Set(a => a.loginFails, 0)
             .Where(a => a.id == accountId)
             .ExecuteAffrowsAsync();
@@ -146,7 +143,7 @@ class AccountDao {
 
     /* 封禁/解封账号：封禁必须留原因（登录时展示给玩家）。返回影响行数。 */
     async int SetStatus(int id, int status, string banReason) {
-        return await this.db.Update<Account>()
+        return await this.GetExecutor().Update<Account>()
             .Set(a => a.status, status)
             .Set(a => a.banReason, banReason)
             .Where(a => a.id == id)
@@ -154,7 +151,7 @@ class AccountDao {
     }
 
     async int TouchLogin(int id, long now) {
-        return await this.db.Update<Account>()
+        return await this.GetExecutor().Update<Account>()
             .Set(a => a.lastLoginAt, now)
             .Where(a => a.id == id)
             .ExecuteAffrowsAsync();
