@@ -354,7 +354,7 @@ class MySqlConnection : IDbConnection {
             string database, string user, string password) {
         Socket.Initialize();
         MySqlConnection conn = new MySqlConnection();
-        bool ok = await conn.doConnect(host, port, database, user, password, false);
+        bool ok = await conn.doConnect(host, port, database, user, password, false, "");
         conn.connected = ok;
         return conn;
     }
@@ -377,9 +377,20 @@ class MySqlConnection : IDbConnection {
     /// 口令与查询不再走明文信道。</summary>
     static async MySqlConnection OpenSecureParamsAsync(string host, int port,
             string database, string user, string password) {
+        return await MySqlConnection.OpenSecureParamsAsync(host, port,
+            database, user, password, "");
+    }
+
+    /// <summary>与五参重载相同，另把 <paramref name="sslCa"/> 指向的 PEM
+    /// CA 证书/证书束追加为信任锚——自签或私有 CA 部署在各平台保留完整
+    /// 证书链与主机名校验（等价 Postgres 连接串的 sslrootcert；非
+    /// Windows 平台缺系统信任根时这是正路，而非关闭校验）。空串表示
+    /// 只用系统信任根。文件不可读即显式失败，绝不静默退回系统根。</summary>
+    static async MySqlConnection OpenSecureParamsAsync(string host, int port,
+            string database, string user, string password, string sslCa) {
         Socket.Initialize();
         MySqlConnection conn = new MySqlConnection();
-        bool ok = await conn.doConnect(host, port, database, user, password, true);
+        bool ok = await conn.doConnect(host, port, database, user, password, true, sslCa);
         conn.connected = ok;
         return conn;
     }
@@ -387,7 +398,9 @@ class MySqlConnection : IDbConnection {
     /// 完整握手与认证（协程版）：解析握手包、发送握手响应，
     /// 处理 OK / ERR / AuthMoreData（快速成功与 RSA 全量认证）/
     /// AuthSwitch。返回认证是否成功；失败原因写入 lastError。
-    internal async bool doConnect(string host, int port, string db, string user, string pw, bool secure) {
+    /// <paramref name="sslCa"/> 为 TLS 升级时的 PEM CA 束路径（空串 =
+    /// 只用系统信任根），仅 secure=true 时生效。
+    internal async bool doConnect(string host, int port, string db, string user, string pw, bool secure, string sslCa) {
         this.sock = Socket.CreateTcp();
         if (this.sock < 0) { this.lastError = "socket create failed"; return false; }
         Socket.SetNonBlocking(this.sock);
@@ -461,6 +474,10 @@ class MySqlConnection : IDbConnection {
                 return false;
             }
             if (!MySqlConnection.verifyTls) { tlsCtx.DisableVerify(); }
+            if (sslCa.Length > 0 && !tlsCtx.AddTrustedCert(sslCa)) {
+                this.lastError = "TLS CA bundle unreadable: " + sslCa;
+                return false;
+            }
             this.tls = await TlsStream.ConnectAsync(tlsCtx, this.sock, host, 15000);
             if (this.tls == null) {
                 this.lastError = "TLS handshake failed: " + TlsStream.LastError();

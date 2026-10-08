@@ -72,6 +72,16 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   must loop-initialize all N slots itself, or the first insert chains onto
   slot 0: self-loops, duplicated query hits, nearest-search hangs.
   (2026-10-07, spatial-hash probe hang)
+* TLS client trust roots differ per platform (2026-10-08, MySQL/PG self-signed
+  interop): Windows verifies via Crypt32 SSL chain policy against the system
+  store; Linux auto-loads the distro CA bundle (`/etc/ssl/certs/
+  ca-certificates.crt` and siblings); macOS loads the system bundle
+  (`/etc/ssl/cert.pem` + Homebrew OpenSSL copies). Self-signed / private-CA
+  servers should use an explicit anchor, not disabled verification: PG
+  connection string `sslrootcert=`, `MySqlConnection.OpenSecureParamsAsync`
+  sixth arg `sslCa` (PEM path; unreadable file fails explicitly).
+  `HttpClient` has only a verify on/off switch and no CA hook yet — against
+  self-signed servers its only option is disabling verification.
 
 ## 4. Edit
 

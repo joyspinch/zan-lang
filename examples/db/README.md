@@ -41,7 +41,9 @@ ORM（`System.Data.Orm` 的 `Model` / `QueryBuilder`）通过 `IDbExecutor`
 - 单机/嵌入式关系存储、测试 → SQLite（`SqliteConnection`）
 - 本地文档/配置/状态，不想写 SQL → ZanDb（`ZanDatabase`）
 - 生产 PostgreSQL 系 → `PgConnection`（纯 Zan 线协议，SCRAM/TLS 全支持）
-- 生产 MySQL 系 → `MySqlConnection`（原生协议、预处理语句、协程异步）
+- 生产 MySQL 系 → `MySqlConnection`（原生协议、预处理语句、协程异步；TLS 走
+  `OpenSecureParamsAsync`，自签/私有 CA 用第六参 `sslCa` 指定 PEM 锚，
+  与 PG `sslrootcert` 同语义）
 - 其它引擎（SQL Server/Oracle/达梦/金仓/ClickHouse…） → `DbConnection`（ODBC）
 - 缓存、计数、队列 → Redis（`RedisClient`）
 - 结构化模型 + 自动 SQL → `Model`；手写复杂 SQL 但要安全拼接 → `QueryBuilder`
