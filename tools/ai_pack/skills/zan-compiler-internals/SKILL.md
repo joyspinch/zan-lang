@@ -3286,3 +3286,14 @@ namespace）：一个引用它的探针工程与示例能编过，另一个引�
 imported and registered in the stdlib map?)`——同一份源码、同一台机器，
 差别只是入口文件的 using 集合。给包内新文件第一行写上 namespace 声明，
 让类走常规命名空间拉入解析，不靠注册顺序的侥幸。
+
+## 表访问器打到非 IDbConnection 接收者：codegen 报错错挂到无关文件 0:0（FreeSql 迁移实测，2026-10-09）
+
+把 `db.<Entity>` 表访问器批量改写成 `fsql.Select<Entity>()` 时，漏改一
+处（如 `db.Realm` 漏出 `fsql.Realm`）不会在那一行报错——框架代码生成器
+在降低访问器语法时发现接收者不是 `IDbConnection`，抛 `this call could
+not be resolved to any callable`，且**位置错挂到项目里另一个文件的
+0:0**。全项目逐文件二分（快照副本 + 逐文件换回旧版）才定位到真正站点。
+定式：访问器机械改写必须以 grep 收尾——`grep -nE "fsql\.[A-Z][A-Za-z]*\.(Count|ToList|Insert|Update)"`
+（大写开头的访问器形态）必须零命中；见到"任意文件 0:0 的 callable
+解析失败"先怀疑某处访问器/降级语法打在错误接收者类型上，别信报错位置。
