@@ -5495,7 +5495,7 @@ binding_lowered:
                         expr->binary.right, locals);
                 } else {
                 LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fs, NULL);
-                if (fs->type && is_rc_managed_type(fs->type)) {
+                if (fs->type && (is_rc_managed_type(fs->type) || fs->type->kind == TYPE_OBJECT)) {
                     emit_rc_store_field(g, fs->type, gv, right, expr->binary.right, locals,
                                         (fs->modifiers & MOD_WEAK) ? 1 : 0);
                 } else if (fs->type && fs->type->kind == TYPE_STRUCT &&
@@ -6188,7 +6188,7 @@ binding_lowered:
                     LLVMValueRef gv = get_static_field_global(g, cs, fs,
                         static_access_inst(g, obj_expr));
                     if (gv) {
-                        if (fs->type && is_rc_managed_type(fs->type)) {
+                        if (fs->type && (is_rc_managed_type(fs->type) || fs->type->kind == TYPE_OBJECT)) {
                             emit_rc_store_field(g, fs->type, gv, right,
                                                 expr->binary.right, locals,
                                                 (fs->modifiers & MOD_WEAK) ? 1 : 0);

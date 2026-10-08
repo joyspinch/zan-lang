@@ -80,6 +80,12 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   - **消灭 `await.fast` 空跳板块**：在 `emit_expr_await_expr` 中，原先快路径（`is_done != 0`）与 CAS 竞争失败（`cas.won == 0`）均跳转至仅包含一条 `br label %await.cont` 的空基本块 `await.fast`。直接将两处条件分支目标直连 `cont_bb`，并将 `cont_bb` 中的 `completed_sub` PHI 节点由 2 臂（`await.fast` 槽、`rk` 槽）改由 3 臂（`probe_bb` 的 `sub_i8`、`prep_bb` 的 `sub_i8`、`rk` 的 `sub_rl`）显式合流，每个 await 点直接消除 1 个冗余 BasicBlock 与 1 条无条件跳转。
   - **共享挂起退场块 `co.suspend.ret`**：在协程 resume 方法内，全部 11 处挂起终结点（Task.Delay, Gate.Park, Task.JoinWait, Socket.Read/WriteReady, Socket.RecvOv, Socket.RecvToOv, Socket.AcceptOv, Socket.ResolveAsync, Socket.ResolveSockAddr, 子任务挂起 suspend_bb, 以及协同抢占 requeue_bb）原先均就地展开 `emit_async_eh_unarm(g); LLVMBuildRetVoid(g->builder);`（重复发射 load/store 恢复 `__zan_eh_top` 及 ret）。改用惰性初始化的共享 `co.suspend.ret` 基本块统一退场（各挂起点发射一条 `br label %co.suspend.ret`），大幅消除重复的 EH unarm 指令与分支扇出。
 
+- **`static object` 静态字段的 RC 根注册与动态析构契约（2026-10-09 落地）**：
+  在 Zan 编译器中，`TYPE_OBJECT` 不属于静态编译期的强类型类（`is_arc_managed_type` 为 false），但其运行时持有的可能是通过 `zan_rt_alloc` 分配的堆类实例（如 `new object()`）或堆字符串。
+  ① **静态根注册**：`get_static_field_global` 在向 `g->static_fields` 追加退出清理根时，必须显式覆盖 `fsym->type->kind == TYPE_OBJECT`，否则静态 `object` 字段（如单例锁 `static object lock = new object();`）不会登记为全局根；
+  ② **写入托管**：静态字段初始化器（`emit_main_method`）与静态字段赋值（`emit_expr`）对 `TYPE_OBJECT` 必须走 `emit_rc_store_field` 维持 RC 占有权转移，不能直通无托管 store；
+  ③ **释放分派**：`emit_rc_release_for_type` 遇到 `TYPE_OBJECT` 须调用 `emit_release_obj_value`，通过负 8 字节 header word 动态探测堆字符串还是类实例并分派正确析构，保证 Main 退出时静态 `object` 被正确清零释放，彻底消除 `--check-leaks` 假阳性/假泄漏。
+
 ## 大型 Windows 发布的链接与编译内存（2026-09-28）
 
 - 数万节的单一 COFF 对象（OnePlus 实测 47,411 节）交给捆绑 GNU ld 会报

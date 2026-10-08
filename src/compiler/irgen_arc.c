@@ -269,6 +269,8 @@ static void emit_rc_retain_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueR
         emit_array_retain(g, v);
     } else if (is_arc_managed_type(type)) {
         emit_arc_retain(g, v);
+    } else if (type->kind == TYPE_OBJECT) {
+        emit_arc_retain(g, v);
     }
 }
 
@@ -282,6 +284,8 @@ static void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValue
         emit_array_release(g, type, v);
     } else if (is_arc_managed_type(type)) {
         emit_arc_release_typed(g, type, v);
+    } else if (type->kind == TYPE_OBJECT) {
+        emit_release_obj_value(g, v);
     }
 }
 

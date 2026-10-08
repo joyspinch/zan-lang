@@ -243,7 +243,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                     ? emit_lambda_typed(g, m->field_decl.initializer,
                                         fs->type, sf_locals)
                     : emit_expr(g, m->field_decl.initializer, sf_locals);
-                if (fs->type && is_rc_managed_type(fs->type)) {
+                if (fs->type && (is_rc_managed_type(fs->type) || fs->type->kind == TYPE_OBJECT)) {
                     emit_rc_store_field(g, fs->type, gv, v, m->field_decl.initializer, sf_locals,
                                         (fs->modifiers & MOD_WEAK) ? 1 : 0);
                 } else {

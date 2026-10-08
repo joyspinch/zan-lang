@@ -10,6 +10,7 @@
  */
 
 #include "irgen.h"
+#include "irgen_compact.h"
 #include "optimizer.h"
 #include "builtin_api.h"
 #include "reflect_api.h"
@@ -3337,6 +3338,8 @@ void zan_irgen_release_llvm(zan_irgen_t *g) {
     if (!g) return;
     if (s_current_irgen == g) s_current_irgen = NULL;
     if (g_di_emit_ctx == g) g_di_emit_ctx = NULL;
+    zan_irgen_compactor_destroy((zan_irgen_compactor_t *)g->function_compactor);
+    g->function_compactor = NULL;
     if (g->builder) {
         LLVMDisposeBuilder(g->builder);
         g->builder = NULL;
@@ -3418,6 +3421,8 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     free(g->string_literals);
     g->string_literals = NULL;
     g->string_literal_count = g->string_literal_cap = 0;
+    zan_irgen_compactor_destroy((zan_irgen_compactor_t *)g->function_compactor);
+    g->function_compactor = NULL;
     if (g->builder) LLVMDisposeBuilder(g->builder);
     if (g->mod) LLVMDisposeModule(g->mod);
     /* Keep the context alive past main(): its ~LLVMContextImpl frees LiveInfo
@@ -4299,6 +4304,7 @@ typedef struct {
      * storage. Reads resolve by name through the runtime entry each
      * declaration adds when it binds, keeping scope truncation semantics. */
     zan_ast_node_t *async_decl;
+    int async_role; /* separates iteration state slots belonging to one AST node */
     /* Index of the pre-added frame-slot entry a bind-time name entry aliases,
      * -1 otherwise. The alias itself is release-inert (arc_owned stays 0: the
      * frame protocol owns the storage and releases it exactly once), so an
@@ -4383,6 +4389,7 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].alloca = alloca;
     scope->vars[scope->count].type = type;
     scope->vars[scope->count].arc_owned = 0;
+    scope->vars[scope->count].byref_slot = 0;
     scope->vars[scope->count].eh_slot = 0;
     scope->vars[scope->count].arr_len_slot = NULL;
     scope->vars[scope->count].box_cell = NULL;
@@ -4392,6 +4399,7 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].obj_rc_flag = NULL;
     scope->vars[scope->count].binding_decl = NULL;
     scope->vars[scope->count].async_decl = NULL;
+    scope->vars[scope->count].async_role = 0;
     scope->vars[scope->count].frame_owner = -1;
     scope->vars[scope->count].struct_rc = 0;
     scope->vars[scope->count].per_iteration = 0;
@@ -4438,12 +4446,25 @@ static local_var_t *local_find(local_scope_t *scope, zan_istr_t name) {
  * local_var_t.async_decl). A name lookup cannot serve here: two same-named
  * declarations each pre-add their own entry, and picking by name would hand
  * the emit whichever entry happens to sit last in the flat list. */
-static local_var_t *local_find_async_decl(local_scope_t *scope, zan_ast_node_t *decl) {
+enum {
+    ASYNC_LOCAL_VALUE = 0,
+    ASYNC_FOREACH_INDEX,
+    ASYNC_FOREACH_COLLECTION,
+    ASYNC_FOREACH_ENUMERATOR
+};
+
+static local_var_t *local_find_async_role(local_scope_t *scope,
+                                         zan_ast_node_t *decl, int role) {
     if (!decl) return NULL;
     for (int i = scope->count - 1; i >= 0; i--) {
-        if (scope->vars[i].async_decl == decl) return &scope->vars[i];
+        if (scope->vars[i].async_decl == decl && scope->vars[i].async_role == role)
+            return &scope->vars[i];
     }
     return NULL;
+}
+
+static local_var_t *local_find_async_decl(local_scope_t *scope, zan_ast_node_t *decl) {
+    return local_find_async_role(scope, decl, ASYNC_LOCAL_VALUE);
 }
 
 /* Find a live binding entry synthesized from one declaration node. The switch
@@ -4557,6 +4578,7 @@ static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMV
 static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMValueRef col);
 static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
                                      LLVMValueRef arr, LLVMValueRef len);
+static void emit_release_obj_value(zan_irgen_t *g, LLVMValueRef cur);
 static void emit_release_obj_local(zan_irgen_t *g, local_var_t *v);
 static void emit_struct_local_release(zan_irgen_t *g, zan_type_t *type,
                                       LLVMValueRef slot);
@@ -4876,6 +4898,18 @@ static void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap,
         arg = LLVMBuildFPExt(g->builder, v, dbl, "dbl.ext");
     LLVMValueRef args[] = { buf, cap, arg };
     zan_call2(g->builder, fn_ty, fn, args, 3, "");
+}
+
+/* The emitter must stop using instruction/block handles before this call;
+ * function and global identities remain stable through these local passes. */
+static void zan_irgen_compact_completed(zan_irgen_t *g, LLVMValueRef fn) {
+    if (!g->function_compactor || zan_diag_has_errors(g->diag)) return;
+    char error[4096];
+    if (!zan_irgen_compactor_run((zan_irgen_compactor_t *)g->function_compactor,
+                                 fn, error, sizeof(error))) {
+        zan_diag_emit(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0),
+                      "LLVM function compaction failed: %s", error);
+    }
 }
 
 /* ---- irgen translation-unit parts (order matters) ---------------------
