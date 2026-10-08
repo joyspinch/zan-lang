@@ -1,4 +1,5 @@
 using System;
+using System.Drawing.Imaging;
 using Gui.Backend;
 
 namespace Gui;
@@ -188,46 +189,31 @@ class Canvas {
     #endif
 
     [DllImport("zan_gui")]
-    static extern int zan_gui_image_width(string path);
-
-    [DllImport("zan_gui")]
-    static extern int zan_gui_image_height(string path);
-
-    [DllImport("zan_gui")]
-    static extern void zan_gui_image_evict(string path);
-
-    [DllImport("zan_gui")]
-    static extern void zan_gui_blit_image(int surfaceId, string path,
+    static extern void zan_gui_blit_pixels(int surfaceId, nint bitmap,
         int dx, int dy, int dw, int dh,
         int sx, int sy, int sw, int sh);
 
-    [DllImport("zan_gui")]
-    static extern int zan_gui_sprite_handle(string key);
+    [DllImport("zan_game")]
+    static extern int zan_game_sprite_handle(string key);
 
-    [DllImport("zan_gui")]
-    static extern int zan_gui_bake_sprite(string key, int surfaceId,
+    [DllImport("zan_game")]
+    static extern int zan_game_bake_sprite(string key, int surfaceId,
         int x, int y, int w, int h);
 
-    [DllImport("zan_gui")]
-    static extern void zan_gui_sprite_batch(int surfaceId, int handle,
+    [DllImport("zan_game")]
+    static extern void zan_game_sprite_batch(int surfaceId, int handle,
         nint quads, int count);
 
     [DllImport("zan_gui")]
     static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
 
     [DllImport("zan_gui")]
-    static extern int zan_gui_image_load_mem(string key, string data, int len);
+    static extern nint zan_gui_get_pixels(int surfaceId);
 
-    [DllImport("zan_gui", EntryPoint = "zan_gui_image_load_mem")]
-    static extern int zan_gui_image_load_mem_bytes(string key, byte[] data, int len);
-
-    [DllImport("zan_gui")]
-    static extern int zan_gui_image_load_svg(string key, string text, int len,
-        int rasterW, int rasterH);
-
-    [DllImport("zan_gui", EntryPoint = "zan_gui_image_load_svg")]
-    static extern int zan_gui_image_load_svg_bytes(string key, byte[] text,
-        int len, int rasterW, int rasterH);
+    // 已有图片注册 ABI 会同步复制并替换 key；不借用或改写 surface。
+    [DllImport("zan_image")]
+    static extern int zan_image_register_argb(string key, nint pixels,
+        int width, int height, int stride);
 
     [DllImport("zan_gui")]
     static extern void zan_gui_push_clip(int surfaceId, int x, int y, int w, int h);
@@ -277,9 +263,9 @@ class Canvas {
         return zan_gui_write_pixels(surfaceId, path, x, y, w, h);
     }
 
-    /// <summary>把整个 surface 转存到 .raw（BGRA + 24 字节头），
-    /// 用于 toolbox 工具箱的"保存图片"。rect 为 0 0 0 0 时转存
-    /// 整张画布；非空时仅取该矩形。返回 0=成功，非 0=错误。</summary>
+    /// <summary>把整张画布保存为 24 位 BMP。当前忽略矩形参数；
+    /// 需要指定矩形的 BGRA 原始像素时用 WritePixels。
+    /// 返回 1=成功，0=错误。</summary>
     int DumpRaw(string path, int x, int y, int w, int h) {
         return zan_gui_surface_dump(surfaceId, path);
     }
@@ -346,7 +332,7 @@ class Canvas {
     /// 再放开门控），其余平台返回空串。</summary>
     static string MemReport() {
         #if ANDROID || OHOS
-        return zan_gui_mem_report();
+        return zan_gui_mem_report() + " " + ImageCodec.MemReport();
         #else
         return "";
         #endif
@@ -457,6 +443,8 @@ class Canvas {
     /// 背景）。先画背景，再模糊，然后叠一层半透明
     /// 色调。`radius` 为模糊强度（px，上限 40）。</summary>
     void BlurRect(int x, int y, int w, int h, int radius) {
+        App.PaintHashOp(34, x, y, w, h);
+        App.PaintHashOp(0, radius, 0, 0, 0);
         zan_gui_blur_rect(surfaceId, x, y, w, h, radius);
     }
 
@@ -471,6 +459,8 @@ class Canvas {
                         int slot, bool dirty) {
         int d = 0;
         if (dirty) { d = 1; }
+        App.PaintHashOp(35, x, y, w, h);
+        App.PaintHashOp(0, radius, slot, d, 0);
         zan_gui_blur_rect_cached(surfaceId, x, y, w, h, radius, slot, d);
     }
 
@@ -484,6 +474,9 @@ class Canvas {
                          int slot, bool dirty, int cornerRadius, int cornerMask) {
         int d = 0;
         if (dirty) { d = 1; }
+        App.PaintHashOp(36, x, y, w, h);
+        App.PaintHashOp(0, radius, slot, d, 0);
+        App.PaintHashOp(0, cornerRadius, cornerMask, 0, 0);
         zan_gui_blur_round_cached(surfaceId, x, y, w, h, radius, slot, d,
                                   cornerRadius, cornerMask);
     }
@@ -502,6 +495,8 @@ class Canvas {
     /// 背景（如壁纸），使纯动画帧跳过
     /// 重绘。</summary>
     void SnapshotRect(int x, int y, int w, int h, int slot) {
+        App.PaintHashOp(37, x, y, w, h);
+        App.PaintHashOp(0, slot, 0, 0, 0);
         zan_gui_snapshot_rect(surfaceId, x, y, w, h, slot);
     }
 
@@ -511,6 +506,8 @@ class Canvas {
     /// RestoreRect(0,0,W,H)）继续几何匹配。槽里没有本表面的有效
     /// 快照、或矩形越出快照范围时为空操作。</summary>
     void SnapshotPatchRect(int x, int y, int w, int h, int slot) {
+        App.PaintHashOp(38, x, y, w, h);
+        App.PaintHashOp(0, slot, 0, 0, 0);
         zan_gui_snapshot_patch_rect(surfaceId, x, y, w, h, slot);
     }
 
@@ -519,6 +516,8 @@ class Canvas {
     /// 则返回 true；若调用方必须正常绘制它
     /// 则返回 false。</summary>
     bool RestoreRect(int x, int y, int w, int h, int slot) {
+        App.PaintHashOp(39, x, y, w, h);
+        App.PaintHashOp(0, slot, 0, 0, 0);
         return zan_gui_restore_rect(surfaceId, x, y, w, h, slot) != 0;
     }
 
@@ -527,6 +526,8 @@ class Canvas {
     /// 区域无需整体拷贝回快照即可被修复。
     /// slot 中无有效快照时返回 false。</summary>
     bool RestoreSubRect(int x, int y, int w, int h, int slot) {
+        App.PaintHashOp(40, x, y, w, h);
+        App.PaintHashOp(0, slot, 0, 0, 0);
         return zan_gui_restore_sub_rect(surfaceId, x, y, w, h, slot) != 0;
     }
 
@@ -872,18 +873,18 @@ class Canvas {
     /// 的内存图像 key 的像素宽度，首次使用时解码并缓存。无法加载时
     /// 返回 0。</summary>
     static int ImageWidth(string path) {
-        return zan_gui_image_width(path);
+        return ImageCodec.Width(path);
     }
 
     /// <summary>图像文件或内存图像 key 的像素高度。参见 ImageWidth。</summary>
     static int ImageHeight(string path) {
-        return zan_gui_image_height(path);
+        return ImageCodec.Height(path);
     }
 
     /// <summary>丢弃缓存的解码图像（文件路径或 ImageLoadMem /
     /// ImageLoadSvg 注册的内存 key），使下次绘制重新加载源。</summary>
     static void EvictImage(string path) {
-        zan_gui_image_evict(path);
+        ImageCodec.Evict(path);
     }
 
     /// <summary>把一段原始图像字节注册到 `key` 下并返回图像宽度，失败
@@ -892,12 +893,12 @@ class Canvas {
     /// 文件路径一样传给 ImageWidth/ImageHeight/BlitImage/EvictImage；
     /// 重复注册同一个活跃 key 是无操作。key 约定用 `mem:` 前缀。</summary>
     static int ImageLoadMem(string key, string data, int len) {
-        return zan_gui_image_load_mem(key, data, len);
+        return ImageCodec.LoadMem(key, data, len);
     }
 
     /// <summary>byte[] 重载，参见 ImageLoadMem(string, string, int)。</summary>
     static int ImageLoadMem(string key, byte[] data, int len) {
-        return zan_gui_image_load_mem_bytes(key, data, len);
+        return ImageCodec.LoadMem(key, data, len);
     }
 
     /// <summary>把 SVG 文本光栅化到 `key` 下并返回光栅宽度，失败返回
@@ -905,7 +906,7 @@ class Canvas {
     /// <= 0 时用文档固有尺寸。之后这个 key 同样可以像文件路径一样
     /// 使用（key 约定用 `mem:` 前缀）。</summary>
     static int ImageLoadSvg(string key, string svg, int rasterW, int rasterH) {
-        return zan_gui_image_load_svg(key, svg, -1, rasterW, rasterH);
+        return ImageCodec.LoadSvg(key, svg, rasterW, rasterH);
     }
 
     /// <summary>byte[] 重载（二进制安全的 SVG 源，例如 base64 data URI
@@ -913,7 +914,7 @@ class Canvas {
     /// `len` 是字节数。</summary>
     static int ImageLoadSvg(string key, byte[] svg, int len, int rasterW,
                             int rasterH) {
-        return zan_gui_image_load_svg_bytes(key, svg, len, rasterW, rasterH);
+        return ImageCodec.LoadSvg(key, svg, len, rasterW, rasterH);
     }
 
     /// <summary>读一帧里的一个像素（0xAARRGGBB），越界返回 -1。
@@ -922,20 +923,73 @@ class Canvas {
         return zan_gui_read_pixel(surfaceId, x, y);
     }
 
+    /// <summary>只读捕获已绘制的整表面，按最终窗口轮廓注册 straight-alpha
+    /// 内存图片到稳定的 mem: key。mask 由调用方跨帧保活；regions 为已平移
+    /// 好的逻辑窗形，dpiScale 为百分比。GPU 会先 flush/readback。
+    /// 返回 false 时不得绘制 key（它可能仍是上一帧）；空轮廓直接走
+    /// BlitSurfaceScaled。成功后可 BlitImage，销毁预览时 EvictImage(key)。
+    /// 不修改原表面，也不裁切 retained tree 中途的绘制。</summary>
+    bool SnapshotWindowShape(string key, WindowShapeMask mask,
+                             List<WindowShapeRegion> regions, int dpiScale) {
+        return this.SnapshotWindowShape(key, mask, regions, dpiScale, 100);
+    }
+
+    /// 窗口整体透明度与系统 SourceConstantAlpha 使用同一 0..255 取整。
+    /// 无轮廓而透明度低于 100 时捕获完整矩形。
+    bool SnapshotWindowShape(string key, WindowShapeMask mask,
+                             List<WindowShapeRegion> regions, int dpiScale,
+                             int opacityPercent) {
+        bool shaped = regions != null && regions.Count > 0;
+        if (mask == null || (!shaped && opacityPercent >= 100)
+                || !key.StartsWith("mem:")) { return false; }
+        if (opacityPercent < 10) { opacityPercent = 10; }
+        if (opacityPercent > 100) { opacityPercent = 100; }
+        int opacity = opacityPercent * 255 / 100;
+        int width = this.Width();
+        int height = this.Height();
+        long count = (long)width * height;
+        if (width <= 0 || height <= 0 || count > 536870911) { return false; }
+        byte[] coverage = shaped ? mask.Coverage(width, height, dpiScale, regions) : null;
+        if (shaped && coverage == null) { return false; }
+        nint source = zan_gui_get_pixels(surfaceId);
+        if (source == 0) { return false; }
+        int n = (int)count;
+        nint copy = NativeMemory.Alloc(n * 4);
+        if (copy == 0) { return false; }
+        try {
+            NativeMemory.Copy(copy, source, n * 4);
+            Span<int> pixels = new Span<int>(copy, n);
+            bool shadowBand = shaped && mask.HasShadowBand();
+            for (int i = 0; i < n; i = i + 1) {
+                int cov = shaped ? coverage[i] : 255;
+                int pixel = WindowShapeMask.SnapshotStraightArgb(pixels[i], cov, shadowBand);
+                int alpha = ((pixel >> 24) & 255) * opacity / 255;
+                pixels[i] = (alpha << 24) | (pixel & 0x00FFFFFF);
+            }
+            return zan_image_register_argb(key, copy, width, height, width) == width;
+        } finally {
+            NativeMemory.Free(copy);
+        }
+    }
+
     /// <summary>把图像文件的矩形区域绘制到画布（按路径解码一次并
     /// 缓存）并缩放到 (dw,dh)：缩小时对覆盖到的源像素做面积平均
     /// （box filter，避免 nearest 丢列/丢行的闪烁），放大或 1:1 时
     /// 按目标像素中心最近邻采样。传 sw=0,sh=0 以整幅图像为源。</summary>
     void BlitImage(string path, int dx, int dy, int dw, int dh,
                    int sx, int sy, int sw, int sh) {
-        zan_gui_blit_image(surfaceId, path, dx, dy, dw, dh, sx, sy, sw, sh);
+        App.PaintHashText(23, dx, dy, dw, dh, path);
+        App.PaintHashOp(0, sx, sy, sw, sh);
+        // View 返回借用描述符，仅供本次同步绘制使用。
+        zan_gui_blit_pixels(surfaceId, ImageCodec.View(path),
+                            dx, dy, dw, dh, sx, sy, sw, sh);
     }
 
     /// <summary>注册精灵图源（图像路径，或 ImageLoadMem 的 "mem:" key），
     /// 返回稳定句柄（>0，0 = 解码失败）。同一 key 幂等返回同句柄。
     /// 句柄供 <see cref="DrawSprites"/> 批量提交，避免每精灵跨一次 FFI。</summary>
     public int SpriteHandle(string key) {
-        return zan_gui_sprite_handle(key);
+        return zan_game_sprite_handle(key);
     }
 
     /// <summary>把本画布的指定矩形区域（或整画布）烘焙成精灵图集条目
@@ -944,11 +998,11 @@ class Canvas {
     /// 返回 sprite handle（可在 DrawSprites / SpriteBatch.Draw 中使用）。
     /// </summary>
     public int BakeSprite(string key, int x, int y, int w, int h) {
-        return zan_gui_bake_sprite(key, surfaceId, x, y, w, h);
+        return zan_game_bake_sprite(key, surfaceId, x, y, w, h);
     }
 
     public int BakeSprite(string key) {
-        return zan_gui_bake_sprite(key, surfaceId, 0, 0, this.Width(), this.Height());
+        return zan_game_bake_sprite(key, surfaceId, 0, 0, this.Width(), this.Height());
     }
 
     /// <summary>提交打包精灵批（批量贴图通路）：quads 每精灵
@@ -958,15 +1012,15 @@ class Canvas {
     /// 打包缓冲由 <c>SpriteBatch</c> 维护，跨帧复用。</summary>
     public void DrawSprites(int handle, nint quads, int count) {
         if (handle <= 0 || count <= 0) { return; }
-        zan_gui_sprite_batch(surfaceId, handle, quads, count);
+        App.PaintHashOp(41, handle, count, 0, 0);
+        zan_game_sprite_batch(surfaceId, handle, quads, count);
     }
 
     /// <summary>在 (x,y) 处不缩放地绘制整幅图像文件。</summary>
     void DrawImage(string path, int x, int y) {
-        App.PaintHashText(23, x, y, 0, 0, path);
         int w = Canvas.ImageWidth(path);
         int h = Canvas.ImageHeight(path);
-        zan_gui_blit_image(surfaceId, path, x, y, w, h, 0, 0, 0, 0);
+        this.BlitImage(path, x, y, w, h, 0, 0, 0, 0);
     }
 
     /// <summary>绘制水平分隔线（1px 高）。</summary>
@@ -994,6 +1048,10 @@ class Canvas {
     [DllImport("zan_gui")]
     static extern void zan_gui_blit_surface(int dstId, int srcId, int dstX,
         int dstY, int srcX, int srcY, int w, int h);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_blit_surface_scaled(int dstId, int srcId,
+        int dstX, int dstY, int dstW, int dstH,
+        int srcX, int srcY, int srcW, int srcH);
 
     /// 批量原语的哈希喂入口：内容逐条折入——与逐原语路径同敏感度，
     /// 同条数不同内容也判得出变化（漏喂的后果是局部帧下内容变化不声明
@@ -1044,6 +1102,19 @@ class Canvas {
                              srcX, srcY, w, h);
     }
 
+    /// 将离屏表面的源矩形缩放合成到本画布，采样与裁剪遵循 BlitImage。
+    /// 源 Canvas 由调用方保活；直接使用 surface，不注册图片或游戏贴图。
+    /// 与 BlitSurface 一样，源内容变化由同段内的离屏绘制哈希承载。
+    void BlitSurfaceScaled(Canvas src, int dstX, int dstY, int dstW, int dstH,
+                           int srcX, int srcY, int srcW, int srcH) {
+        if (src == null) { return; }
+        App.PaintHashOp(33, dstX, dstY, dstW, dstH);
+        App.PaintHashOp(0, src.surfaceId, srcX, srcY, 0);
+        App.PaintHashOp(0, srcW, srcH, 0, 0);
+        zan_gui_blit_surface_scaled(surfaceId, src.surfaceId,
+            dstX, dstY, dstW, dstH, srcX, srcY, srcW, srcH);
+    }
+
     /// <summary>DrawText 的 Color 对象重载。</summary>
     void DrawTextColor(int x, int y, string text, Color col, int fontSize) {
         App.PaintHashText(19, x, y, col.ToARGB(), fontSize, text);
@@ -1069,12 +1140,12 @@ class Canvas {
     // 实现 3D；CPU 兜底档上 DrawMesh3D 返回 0 且不落像素，应用据此换
     // 2D 表示（例如投影多边形）或直接留空。
 
-    [DllImport("zan_gui")]
-    static extern int zan_gui_mesh_create(int surfaceId, nint verts,
+    [DllImport("zan_game")]
+    static extern int zan_game_mesh_create(int surfaceId, nint verts,
         int count, nint indices, int indexCount);
 
-    [DllImport("zan_gui")]
-    static extern int zan_gui_draw3d(int surfaceId, int mesh, nint mvp,
+    [DllImport("zan_game")]
+    static extern int zan_game_draw3d(int surfaceId, int mesh, nint mvp,
         int color, string texture);
 
     /// <summary>上传网格，返回 mesh id（0 = 失败/当前后端不支持）。
@@ -1092,7 +1163,7 @@ class Canvas {
         nint ip = NativeMemory.Alloc(ni * 2);
         Span<ushort> ispan = new Span<ushort>(ip, ni);
         for (int i = 0; i < ni; i = i + 1) { ispan[i] = indices[i]; }
-        int id = zan_gui_mesh_create(surfaceId, vp, nv, ip, ni);
+        int id = zan_game_mesh_create(surfaceId, vp, nv, ip, ni);
         NativeMemory.Free(vp);
         NativeMemory.Free(ip);
         return id;
@@ -1109,7 +1180,7 @@ class Canvas {
         nint mp = NativeMemory.Alloc(64);
         Span<float> ms = new Span<float>(mp, 16);
         for (int i = 0; i < 16; i = i + 1) { ms[i] = mvpColumnMajor[i]; }
-        int ok = zan_gui_draw3d(surfaceId, mesh, mp, color, texture);
+        int ok = zan_game_draw3d(surfaceId, mesh, mp, color, texture);
         NativeMemory.Free(mp);
         return ok;
     }

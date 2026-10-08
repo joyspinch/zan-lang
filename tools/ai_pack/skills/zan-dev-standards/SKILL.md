@@ -44,6 +44,15 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
    （`auto_stdlib` 全仓无消费方）与手搓平台 API（kernel32 设环境变量在非
    Windows 静默失效，stdlib 已有跨平台对应物时必须换）都是同族债。
 
+9. **跨平台基础能力在库内统一，宿主系统不决定应用目标**：先查已有门面，缺后端
+   时补库；公共参数和返回类型不能随平台变化，应用侧不为同一能力复制系统调用。
+   为什么：信号量句柄曾在 Windows 返回 nint、POSIX 返回 string，使用者被迫写
+   平台分支；统一为不参与 ARC 的句柄后，同一用例可直接在两端编译运行。
+10. **跨平台回归验证语义，不复制宿主金样**：覆盖 Unicode、空格、系统工具缺失
+    和平台合法的文件名；启动成功只证明 exec/系统处理器被启动，不证明目标完成。
+    为什么：反斜杠在 POSIX 是合法文件名字符，Windows 金样会误报；双 fork 只等
+    中间子进程会把最终 exec 失败误报成功。交叉编译与目标实机运行分开报告。
+
 ## 二、代码规范
 
 - **GUI 与游戏排版及实体建模统一规范（Flex + Float 单轨化，废除双轨与旧式 Dock）**：
@@ -425,13 +434,18 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   再 Render()。断言像素画在画布 (0,0) 会被根面板的裁剪裁掉（读数像
   "没画"），要画进控件带内。
 - **哈希损伤与绘制同段共生，"漏喂哈希"类缺陷往往探针不可观测**
-  （2026-10-08 B-ID118/121 补喂实测）：控件的命令流哈希求值发生在
+  （2026-10-08 B-ID118/121/119 补喂实测）：控件的命令流哈希求值发生在
   OnPaint 里——控件被条带裁掉时两者都不发生；而内容变化帧在动画/游戏
   循环里总是 `RequestRedraw` 整帧（idle/GuiHost 每帧都 RequestRedraw）。
   因此"批量原语漏喂哈希"即使真实违反契约，红/绿对照也双双全绿
   （B-ID119 的 hover-label 流程才可观测）。新增 Canvas 原语补喂哈希
   入口靠台账规则与评审守住，探针只能验证修好的行为、守不住不变量；
   红对照全绿 ≠ 改动无意义，先分清"契约对齐"还是"缺陷修复"再写提交。
+  Canvas 所有图元入口须 100% 接入命令流哈希：BlitImage（op 23 携目标与
+  源矩形及路径）、Blur 族（op 34~36）、Snapshot/Restore 族（op 37~40）、
+  DrawSprites（op 41）；其中毛玻璃卷积跨条带取样失真由
+  Canvas.TakeBlurPartialMiss 驱动 forceFullNext 整窗升级，自段命令流哈希
+  则保证面板自身几何/半径参数变更能被局部帧检出并自动 NoteDamage 补画。
 - **dock=5（fill）子控件放 Panel.Root，不放 Panel.Column/Row**
   （2026-10-08 B-ID118 E2E）：Column/Row 是流式容器、按子控件 pref 尺寸
   排布——只设 grow 没有首选尺寸的控件（如 GameViewport）在 Column 里
