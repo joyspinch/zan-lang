@@ -52,13 +52,6 @@ class GenRoute {
     static int ConstKind;
     static string ConstSval;
 
-    /* 模块单一初始化发现与继承 */
-    static Dict<string, string> ModTitle;
-    static Dict<string, string> ModIcon;
-    static Dict<string, string> ModOrder;
-    static Dict<string, string> ModNs;
-    static List<string> ModKeys;
-
     /* 已发出的路由键(verb + " " + path -> 先声明者)。重复键只发第一条：
        编译单元声明序里应用源文件先于按需拉入的包源文件，应用屏因此
        覆盖包默认屏——与视图合并"应用 layout.html 胜出"同一语义。没有
@@ -85,11 +78,6 @@ class GenRoute {
     static void Run(JsonValue req, JsonValue reply) {
         GenRoute.Reply = reply;
         GenRoute.ClassOf = new Dict<string, JsonValue>();
-        GenRoute.ModTitle = new Dict<string, string>();
-        GenRoute.ModIcon = new Dict<string, string>();
-        GenRoute.ModOrder = new Dict<string, string>();
-        GenRoute.ModNs = new Dict<string, string>();
-        GenRoute.ModKeys = new List<string>();
         GenRoute.RouteKeys = new Dict<string, string>();
 
         GenRoute.Unit = req.Get("unit");
@@ -99,35 +87,6 @@ class GenRoute {
             for (int i = 0; i < classes.Count(); i = i + 1) {
                 JsonValue c = classes.At(i);
                 GenRoute.ClassOf.Add(c.Str("name", ""), c);
-
-                // 模块声明自动发现：凡标注 [AdminModule] 的类（模块清单类或模块级控制器）均作为模块事实源登记
-                if (GenRoute.AttrNamed(c, "AdminModule")) {
-                    string mkey = GenRoute.AttrNamedArg(c, "AdminModule", "Key");
-                    if (mkey.Length == 0) {
-                        mkey = GenRoute.AttrStringArg(c, "AdminModule");
-                    }
-                    if (mkey.Length == 0) {
-                        string cn = c.Str("name", "");
-                        if (cn.EndsWith("Module")) {
-                            mkey = GenRoute.Lower(cn.Substring(0, cn.Length - 6));
-                        } else {
-                            mkey = GenRoute.ControllerToken(c);
-                        }
-                    }
-                    if (mkey.Length > 0 && !GenRoute.ModTitle.ContainsKey(mkey)) {
-                        string mtitle = GenRoute.AttrNamedArg(c, "AdminModule", "Title");
-                        if (mtitle.Length == 0) { mtitle = GenRoute.AttrStringArg(c, "Description"); }
-                        string micon = GenRoute.AttrNamedArg(c, "AdminModule", "Icon");
-                        string morder = GenRoute.AttrNamedArg(c, "AdminModule", "Order");
-                        string mns = c.Str("ns", "");
-
-                        GenRoute.ModTitle.Add(mkey, mtitle);
-                        GenRoute.ModIcon.Add(mkey, micon);
-                        GenRoute.ModOrder.Add(mkey, morder);
-                        GenRoute.ModNs.Add(mkey, mns);
-                        GenRoute.ModKeys.Add(mkey);
-                    }
-                }
             }
         }
         StringBuilder handlers = new StringBuilder();
@@ -323,18 +282,15 @@ class GenRoute {
         if (cls.Bool("generic", false)) { return false; }
         string nm = cls.Str("name", "");
         if (nm == "Controller" || nm == "ApiController" ||
-            nm == "CrudController" || nm == "CurdController" ||
-            nm == "BaseAdminController") {
+            nm == "CrudController" || nm == "CurdController") {
             return false;
         }
         if (GenRoute.DerivesFrom(cls, "Controller")) { return true; }
         if (GenRoute.DerivesFrom(cls, "ApiController")) { return true; }
         if (GenRoute.DerivesFrom(cls, "CrudController")) { return true; }
         if (GenRoute.DerivesFrom(cls, "CurdController")) { return true; }
-        if (GenRoute.DerivesFrom(cls, "BaseAdminController")) { return true; }
         if (GenRoute.AttrNamed(cls, "Route")) { return true; }
         if (GenRoute.AttrNamed(cls, "ApiController")) { return true; }
-        if (GenRoute.AttrNamed(cls, "AdminAction")) { return true; }
         if (nm.EndsWith("Controller")) {
             string ns = cls.Str("ns", "");
             if (ns.StartsWith("Gui.") || ns.StartsWith("Game.") || ns == "Gui" || ns == "Game") {
@@ -382,56 +338,6 @@ class GenRoute {
         return GenRoute.Lower(nm);
     }
 
-    /// 自动解析控制器所属的管理模块（支持类自身标记、单一模块声明类匹配、命名空间与类名前缀匹配）
-    static void ResolveModule(JsonValue cls, out string modKey, out string modTitle, out string modIcon, out string modOrder) {
-        modKey = GenRoute.AttrNamedArg(cls, "AdminModule", "Key");
-        if (modKey.Length == 0) { modKey = GenRoute.AttrStringArg(cls, "AdminModule"); }
-        modTitle = GenRoute.AttrNamedArg(cls, "AdminModule", "Title");
-        modIcon = GenRoute.AttrNamedArg(cls, "AdminModule", "Icon");
-        modOrder = GenRoute.AttrNamedArg(cls, "AdminModule", "Order");
-
-        if (modKey.Length > 0) { return; }
-
-        string ns = cls.Str("ns", "");
-        string cname = cls.Str("name", "");
-
-        for (int i = 0; i < GenRoute.ModKeys.Count; i = i + 1) {
-            string k = GenRoute.ModKeys[i];
-            string mns;
-            GenRoute.ModNs.TryGetValue(k, out mns);
-
-            // 1. 同命名空间或子命名空间匹配 (如 Zan.Mvc.Admin.Web 归属于 Zan.Mvc.Admin)
-            if (mns.Length > 0 && (ns == mns || ns.StartsWith(mns + "."))) {
-                modKey = k;
-                GenRoute.ModTitle.TryGetValue(k, out modTitle);
-                GenRoute.ModIcon.TryGetValue(k, out modIcon);
-                GenRoute.ModOrder.TryGetValue(k, out modOrder);
-                return;
-            }
-
-            // 2. 命名空间段包含模块名 (如 App.Controller.Sys)
-            string lns = GenRoute.Lower(ns);
-            string lk = GenRoute.Lower(k);
-            if (lns.IndexOf("." + lk) >= 0 || lns.EndsWith("." + lk)) {
-                modKey = k;
-                GenRoute.ModTitle.TryGetValue(k, out modTitle);
-                GenRoute.ModIcon.TryGetValue(k, out modIcon);
-                GenRoute.ModOrder.TryGetValue(k, out modOrder);
-                return;
-            }
-
-            // 3. 类名前缀匹配 (如 SysUserController 匹配 sys 模块)
-            string lcname = GenRoute.Lower(cname);
-            if (lcname.StartsWith(lk) && lcname.Length > lk.Length) {
-                modKey = k;
-                GenRoute.ModTitle.TryGetValue(k, out modTitle);
-                GenRoute.ModIcon.TryGetValue(k, out modIcon);
-                GenRoute.ModOrder.TryGetValue(k, out modOrder);
-                return;
-            }
-        }
-    }
-
     /// 计算控制器的约定路由前缀 (namespace + class 组合，零注解按约定生效)
     static string DefaultClassRoute(JsonValue cls) {
         string explicitRoute = GenRoute.AttrStringArg(cls, "Route");
@@ -454,26 +360,6 @@ class GenRoute {
                     }
                 }
                 start = i + 1;
-            }
-        }
-
-        string modKey;
-        string modTitle;
-        string modIcon;
-        string modOrder;
-        GenRoute.ResolveModule(cls, out modKey, out modTitle, out modIcon, out modOrder);
-        if (modKey.Length > 0) {
-            segs.Clear();
-            segs.Add("admin");
-            segs.Add(GenRoute.Lower(modKey));
-        } else if (GenRoute.AttrNamed(cls, "AdminModule") ||
-            GenRoute.DerivesFrom(cls, "BaseAdminController")) {
-            bool hasAdmin = false;
-            for (int si = 0; si < segs.Count; si = si + 1) {
-                if (segs[si] == "admin") { hasAdmin = true; break; }
-            }
-            if (!hasAdmin) {
-                segs.Insert(0, "admin");
             }
         }
 
@@ -1084,60 +970,6 @@ class GenRoute {
         string cact = GenRoute.ControllerActionName(cls, cdisp, cmod);
         string clsTpl = GenRoute.DefaultClassRoute(cls);
         string clsDesc = GenRoute.AttrStringArg(cls, "Description");
-        string modKey;
-        string modTitle;
-        string modIcon;
-        string modOrder;
-        GenRoute.ResolveModule(cls, out modKey, out modTitle, out modIcon, out modOrder);
-
-        string clsActionKey = GenRoute.AttrNamedArg(cls, "AdminAction", "Key");
-        if (clsActionKey.Length == 0) {
-            clsActionKey = GenRoute.AttrStringArg(cls, "AdminAction");
-        }
-        if (clsActionKey.Length == 0) {
-            clsActionKey = GenRoute.AttrNamedArg(cls, "Menu", "Key");
-        }
-        if (clsActionKey.Length == 0 && modKey.Length > 0) {
-            string lastTok = ctrltok;
-            if (lastTok.StartsWith(modKey) && lastTok.Length > modKey.Length) {
-                lastTok = lastTok.Substring(modKey.Length);
-            }
-            if (lastTok == "department") { lastTok = "dept"; }
-            else if (lastTok == "operationlog") { lastTok = "log"; }
-            clsActionKey = modKey + ":" + lastTok;
-        }
-
-        string clsActionTitle = GenRoute.AttrNamedArg(cls, "AdminAction", "Title");
-        if (clsActionTitle.Length == 0) {
-            clsActionTitle = GenRoute.AttrNamedArg(cls, "Menu", "Title");
-        }
-        if (clsActionTitle.Length == 0) {
-            clsActionTitle = clsDesc;
-        }
-        string clsActionIcon = GenRoute.AttrNamedArg(cls, "AdminAction", "Icon");
-        if (clsActionIcon.Length == 0) {
-            clsActionIcon = GenRoute.AttrNamedArg(cls, "Menu", "Icon");
-        }
-        if (clsActionIcon.Length == 0) {
-            clsActionIcon = GenRoute.AttrStringArg(cls, "Menu");
-        }
-        string clsActionOrder = GenRoute.AttrNamedArg(cls, "AdminAction", "Order");
-        if (clsActionOrder.Length == 0) {
-            clsActionOrder = GenRoute.AttrNamedArg(cls, "Menu", "Order");
-        }
-        if (clsActionOrder.Length == 0) {
-            clsActionOrder = GenRoute.AttrNamedArg(cls, "Custom", "Rank");
-        }
-        string clsActionIsMenu = GenRoute.AttrNamedArg(cls, "AdminAction", "IsMenu");
-        if (clsActionIsMenu.Length == 0) {
-            clsActionIsMenu = GenRoute.AttrNamedArg(cls, "Menu", "IsMenu");
-        }
-        /* 菜单是显式选择（[Menu]/[AdminAction]，或任意 [Custom(IsMenu=true)]）：
-         * 类级 [Description] 只做文档与标题回退，不能把整个控制器默认刷进
-         * 侧边栏——登录页、健康检查这类有描述的前台端点不是菜单项。 */
-        if (clsActionIsMenu.Length == 0 && (GenRoute.AttrNamed(cls, "Menu") || GenRoute.AttrNamed(cls, "AdminAction"))) {
-            clsActionIsMenu = "true";
-        }
         int nroutes = 0;
 
         JsonValue methods = cls.Get("methods");
@@ -1210,40 +1042,20 @@ class GenRoute {
             bool methodTouchedMenu = GenRoute.MetaGetKind("IsMenu") != menuKind0 ||
                 GenRoute.MetaGetVal("IsMenu") != menuVal0;
 
-            // 模块元数据自动注入路由 StrMap meta
-            if (modKey.Length > 0) {
-                GenRoute.MetaSetDirect("ModuleKey", modKey, 2);
-                if (modTitle.Length > 0) { GenRoute.MetaSetDirect("ModuleTitle", modTitle, 2); }
-                if (modIcon.Length > 0) { GenRoute.MetaSetDirect("ModuleIcon", modIcon, 2); }
-                if (modOrder.Length > 0) { GenRoute.MetaSetDirect("ModuleOrder", modOrder, 0); }
-            }
-
-            // 控制器根动作（Index 或与控制器同名动作）自动继承类级菜单配置
-            if (actiontok == "index") {
-                if (clsActionKey.Length > 0) { GenRoute.MetaSetDirect("Key", clsActionKey, 2); }
-                if (clsActionTitle.Length > 0) { GenRoute.MetaSetDirect("Title", clsActionTitle, 2); }
-                if (clsActionIcon.Length > 0) { GenRoute.MetaSetDirect("Icon", clsActionIcon, 2); }
-                if (clsActionOrder.Length > 0) { GenRoute.MetaSetDirect("Order", clsActionOrder, 0); }
-                if (clsActionIsMenu == "true" && !methodTouchedMenu) {
-                    GenRoute.MetaSetDirect("IsMenu", "true", 1);
-                }
-            } else {
-                // 非根动作：只有方法自身显式标注菜单（[Custom(IsMenu=true)]、
-                // [Menu]、[AdminAction(IsMenu=true)]）才进菜单；类级菜单配置
-                // 只作用于根动作，方法未标注时强制不进，防止整组动作被
-                // 批量刷成菜单项。
-                bool methodHasMenu = (methodTouchedMenu &&
-                        GenRoute.MetaGetKind("IsMenu") == 1 &&
-                        GenRoute.MetaGetVal("IsMenu") == "true") ||
-                    GenRoute.AttrNamed(m, "Menu") ||
-                    (GenRoute.AttrNamed(m, "AdminAction") && GenRoute.AttrNamedArg(m, "AdminAction", "IsMenu") == "true");
+            // 菜单唯一声明轨：[Custom(IsMenu=true)]（方法级）。类级或方法级
+            // 显式 [Custom(IsMenu=false)] 均原样生效；未表态的非根动作强制
+            // 不进菜单，防止整组动作被批量刷成菜单项。
+            if (actiontok != "index") {
+                bool methodHasMenu = methodTouchedMenu &&
+                    GenRoute.MetaGetKind("IsMenu") == 1 &&
+                    GenRoute.MetaGetVal("IsMenu") == "true";
                 if (!methodHasMenu) {
                     GenRoute.MetaSetDirect("IsMenu", "false", 1);
                 }
             }
 
             string mDesc = GenRoute.AttrStringArg(m, "Description");
-            string title = mDesc.Length > 0 ? mDesc : (actiontok == "index" && clsActionTitle.Length > 0 ? clsActionTitle : clsDesc);
+            string title = mDesc.Length > 0 ? mDesc : clsDesc;
 
             bool isStatic = m.Bool("static", false);
             bool isAsync = m.Bool("async", false);
@@ -1416,11 +1228,7 @@ class GenRoute {
                     reg.Append(GenRoute.Esc(clsTpl + "/index"));
                     reg.Append("\", __AttrRoutes." + hname + ")\n            .Named(\"");
                     reg.Append(GenRoute.Esc(cact));
-                    reg.Append(".IndexAlias\")");
-                    if (modKey.Length > 0) {
-                        reg.Append("\n            .Meta(\"ModuleKey\", \"" + GenRoute.Esc(modKey) + "\")");
-                    }
-                    reg.Append(";\n");
+                    reg.Append(".IndexAlias\");\n");
                 }
             }
             nroutes = nroutes + 1;
