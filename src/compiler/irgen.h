@@ -782,6 +782,7 @@ struct zan_irgen {
     int          current_async_frame_local_count;
     LLVMBasicBlockRef current_async_complete_bb;
     LLVMValueRef current_async_result_phi;
+    LLVMBasicBlockRef current_async_suspend_ret_bb; /* shared async suspension exit block */
     LLVMBasicBlockRef current_async_requeue_bb; /* shared Task.Yield/preempt ready-and-ret block */
     LLVMBasicBlockRef current_async_cancel_bb;  /* shared top-level cancel exit block */
     LLVMBasicBlockRef current_async_rethrow_bb; /* shared sub-task exception rethrow block */
@@ -808,6 +809,7 @@ struct zan_irgen {
      * the body lowers (counted by the async scan, which sees the finally-body
      * copies too), so `current_async_handler_next` can never run past it */
     int          current_async_handler_cap;
+    int          current_async_try_count;    /* 0 if the async body has no lexical try statements */
     /* per-function id of the next `foreach` emitted inside an async body;
      * indexes its frame-resident iteration state (see AST_FOREACH_STMT) */
     int          current_async_foreach_next;

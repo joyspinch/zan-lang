@@ -1023,6 +1023,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_frame_local_count = locals->count;
         g->current_async_complete_bb = NULL;
         g->current_async_result_phi = NULL;
+        g->current_async_suspend_ret_bb = NULL;
         g->current_async_requeue_bb = NULL;
         g->current_async_cancel_bb = NULL;
         g->current_async_rethrow_bb = NULL;

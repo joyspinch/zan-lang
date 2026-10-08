@@ -841,8 +841,7 @@ static LLVMBasicBlockRef get_async_requeue_bb(zan_irgen_t *g) {
     LLVMValueRef self_i8 = get_async_self_i8(g);
     zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready,
         (LLVMValueRef[]){ self_i8, g->current_async_resume_fn }, 2, "");
-    emit_async_eh_unarm(g);
-    LLVMBuildRetVoid(g->builder);
+    LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
     if (here) LLVMPositionBuilderAtEnd(g->builder, here);
     g->current_async_requeue_bb = bb;
     return bb;
@@ -923,6 +922,20 @@ static void emit_async_eh_unarm(zan_irgen_t *g) {
     LLVMValueRef entry = LLVMBuildLoad2(g->builder, i32,
         g->current_async_eh_entry, "eh.entry");
     LLVMBuildStore(g->builder, entry, top_g);
+}
+
+static LLVMBasicBlockRef get_async_suspend_ret_bb(zan_irgen_t *g) {
+    if (!g->current_async_frame || !g->current_async_resume_fn) return NULL;
+    if (g->current_async_suspend_ret_bb) return g->current_async_suspend_ret_bb;
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_async_resume_fn, "co.suspend.ret");
+    LLVMPositionBuilderAtEnd(g->builder, bb);
+    emit_async_eh_unarm(g);
+    LLVMBuildRetVoid(g->builder);
+    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    g->current_async_suspend_ret_bb = bb;
+    return bb;
 }
 
 /* Typed-address inspection must finish before replacing the proxy allocas:

@@ -151,6 +151,7 @@ static LLVMValueRef get_co_track_fn(zan_irgen_t *g);
 static LLVMValueRef get_co_untrack_fn(zan_irgen_t *g);
 static bool anf_stmt_contains_await(zan_ast_node_t *s);
 static void emit_async_eh_unarm(zan_irgen_t *g);
+static LLVMBasicBlockRef get_async_suspend_ret_bb(zan_irgen_t *g);
 static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub, LLVMValueRef tmp_mark);
 
 /* Shared lowering for the Task instance members (`t.Wait()`, `t.Result`,

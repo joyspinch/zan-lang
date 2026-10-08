@@ -10617,8 +10617,7 @@ static LLVMValueRef emit_await_blocking_extern(zan_irgen_t *g,
     };
     zan_call2(g->builder, g->rt_blocking_co_type, g->rt_blocking_co,
               rt_args, 9, "");
-    emit_async_eh_unarm(g);
-    LLVMBuildRetVoid(g->builder);
+    LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
 
     LLVMBasicBlockRef resume = LLVMAppendBasicBlockInContext(g->ctx,
         g->current_async_resume_fn, "co.blocking.resume");
@@ -10680,8 +10679,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0), get_async_state_ptr(g));
                 zan_call2(g->builder, g->rt_co_delay_type, g->rt_co_delay,
                     (LLVMValueRef[]){ ms, self_i8, g->current_async_resume_fn }, 3, "");
-                emit_async_eh_unarm(g);
-                LLVMBuildRetVoid(g->builder);
+                LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
                     g->current_async_resume_fn, "co.resume");
@@ -10747,8 +10745,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
             zan_call2(g->builder, gate_park_type, gate_park,
                 (LLVMValueRef[]){ handle, self_i8, g->current_async_resume_fn }, 3, "");
-            emit_async_eh_unarm(g);
-            LLVMBuildRetVoid(g->builder);
+            LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
 
             LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
                 g->current_async_resume_fn, "co.resume");
@@ -10805,8 +10802,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
                         ASYNC_FRAME_STATE, "self.state"));
                 /* no self-ready: Delay shape — the untrack hook readies us */
-                emit_async_eh_unarm(g);
-                LLVMBuildRetVoid(g->builder);
+                LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
                 LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
                 LLVMPositionBuilderAtEnd(g->builder, rk);
                 LLVMValueRef res_slot = LLVMBuildStructGEP2(g->builder, self_ft,
@@ -10856,8 +10852,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
                 zan_call2(g->builder, g->rt_io_wait_co_type, g->rt_io_wait_co,
                     (LLVMValueRef[]){ fd, interest, self_i8, g->current_async_resume_fn }, 4, "");
-                emit_async_eh_unarm(g);
-                LLVMBuildRetVoid(g->builder);
+                LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
                     g->current_async_resume_fn, "co.resume");
@@ -10908,8 +10903,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_call2(g->builder, g->rt_io_recv_co_type, g->rt_io_recv_co,
                     (LLVMValueRef[]){ fd, buf, len, self_i8,
                         g->current_async_resume_fn, out_n }, 6, "");
-                emit_async_eh_unarm(g);
-                LLVMBuildRetVoid(g->builder);
+                LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
                     g->current_async_resume_fn, "co.resume");
@@ -10966,8 +10960,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_call2(g->builder, g->rt_io_recv_to_co_type, g->rt_io_recv_to_co,
                     (LLVMValueRef[]){ fd, buf, len, tmo, self_i8,
                         g->current_async_resume_fn, out_n }, 7, "");
-                emit_async_eh_unarm(g);
-                LLVMBuildRetVoid(g->builder);
+                LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
                     g->current_async_resume_fn, "co.resume");
@@ -11012,8 +11005,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_call2(g->builder, g->rt_io_accept_co_type,
                     g->rt_io_accept_co, (LLVMValueRef[]){ fd, self_i8,
                         g->current_async_resume_fn, out_fd }, 4, "");
-                emit_async_eh_unarm(g);
-                LLVMBuildRetVoid(g->builder);
+                LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
                     g->current_async_resume_fn, "co.resume");
@@ -11065,8 +11057,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_call2(g->builder, g->rt_io_resolve_co_type,
                     g->rt_io_resolve_co, (LLVMValueRef[]){ host, self_i8,
                         g->current_async_resume_fn, out32 }, 4, "");
-                emit_async_eh_unarm(g);
-                LLVMBuildRetVoid(g->builder);
+                LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
                     g->current_async_resume_fn, "co.resume");
@@ -11128,8 +11119,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_call2(g->builder, g->rt_io_resolve_sa_co_type,
                     g->rt_io_resolve_sa_co, (LLVMValueRef[]){ name, port, buf,
                         cap, self_i8, g->current_async_resume_fn, out32 }, 7, "");
-                emit_async_eh_unarm(g);
-                LLVMBuildRetVoid(g->builder);
+                LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
                     g->current_async_resume_fn, "co.resume");
@@ -11220,7 +11210,6 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef ptr_int_ty = g->target_is_wasm ? i32 : i64;
                 LLVMValueRef fn = g->current_async_resume_fn;
 
-                LLVMBasicBlockRef fast_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "await.fast");
                 LLVMBasicBlockRef prep_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "await.prep");
                 LLVMBasicBlockRef suspend_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "await.suspend");
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.resume");
@@ -11237,7 +11226,8 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMSetOrdering(is_done, LLVMAtomicOrderingAcquire);
                 LLVMValueRef fast_cond = zan_icmp(g->builder, LLVMIntNE, is_done,
                     LLVMConstInt(i32, 0, 0), "sub.already_done");
-                LLVMBuildCondBr(g->builder, fast_cond, fast_bb, prep_bb);
+                LLVMBasicBlockRef probe_bb = LLVMGetInsertBlock(g->builder);
+                LLVMBuildCondBr(g->builder, fast_cond, cont_bb, prep_bb);
 
                 /* ---- await.prep: atomic handshake with sub ---- */
                 LLVMPositionBuilderAtEnd(g->builder, prep_bb);
@@ -11253,7 +11243,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMAtomicOrderingSequentiallyConsistent,
                     LLVMAtomicOrderingSequentiallyConsistent, 0);
                 LLVMValueRef won = LLVMBuildExtractValue(g->builder, cas_res, 1, "cas.won");
-                LLVMBuildCondBr(g->builder, won, suspend_bb, fast_bb);
+                LLVMBuildCondBr(g->builder, won, suspend_bb, cont_bb);
 
                 /* ---- await.suspend: caller suspends ---- */
                 LLVMPositionBuilderAtEnd(g->builder, suspend_bb);
@@ -11264,8 +11254,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_store_fit(g, LLVMConstInt(i32, (unsigned)k, 0), get_async_state_ptr(g));
                 LLVMValueRef sched_args[] = { sub_i8, sub_resume };
                 zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
-                emit_async_eh_unarm(g);
-                LLVMBuildRetVoid(g->builder);
+                LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
 
                 /* ---- co.resume (rk): re-entered by driver once sub completes ---- */
                 LLVMPositionBuilderAtEnd(g->builder, rk);
@@ -11274,14 +11263,11 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef sub_rl = LLVMBuildLoad2(g->builder, i8ptr, sub_slot, "sub.rl");
                 LLVMBuildBr(g->builder, cont_bb);
 
-                LLVMPositionBuilderAtEnd(g->builder, fast_bb);
-                LLVMBuildBr(g->builder, cont_bb);
-
                 LLVMPositionBuilderAtEnd(g->builder, cont_bb);
                 LLVMValueRef completed_sub = LLVMBuildPhi(g->builder, i8ptr, "sub.completed");
-                LLVMValueRef sub_vals[] = { sub_i8, sub_rl };
-                LLVMBasicBlockRef sub_bbs[] = { fast_bb, rk };
-                LLVMAddIncoming(completed_sub, sub_vals, sub_bbs, 2);
+                LLVMValueRef sub_vals[] = { sub_i8, sub_i8, sub_rl };
+                LLVMBasicBlockRef sub_bbs[] = { probe_bb, prep_bb, rk };
+                LLVMAddIncoming(completed_sub, sub_vals, sub_bbs, 3);
                 emit_async_check_sub_exc(g, completed_sub, NULL);
                 LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, hdr, completed_sub,
                     ASYNC_FRAME_RESULT, "sub.result");
