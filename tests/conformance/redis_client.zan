@@ -45,9 +45,6 @@ class Program {
     // Mock Redis: for each client request, drain it then send the next scripted
     // RESP reply. The client issues its commands in this exact order.
     static async void MockServer(nint listener) {
-        nint client = await AsyncSocket.Accept(listener);
-        Socket.SetNonBlocking(client);
-
         List<string> replies = new List<string>();
         // 原有 10 个回复
         replies.Add("+PONG\r\n");                               // 1. PING
@@ -86,12 +83,31 @@ class Program {
         replies.Add(":1\r\n");                                  // 32. LPushAsync<User>
         replies.Add("$6\r\nBob:25\r\n");                        // 33. LPopAsync<User>
         replies.Add("*1\r\n$6\r\nBob:25\r\n");                  // 34. LRangeAsync<User>
+        replies.Add("$6\r\nBob:25\r\n");                        // 36. RPopAsync<User>
 
-        for (int i = 0; i < replies.Count; i = i + 1) {
+        // 第二条连接（RedisPool 借还）：开连 PING + 池级钩子对象读写
+        replies.Add("+PONG\r\n");                               // 37. 池 OpenOne PING
+        replies.Add("+OK\r\n");                                 // 38. 池 SetAsync<User>
+        replies.Add("$6\r\nBob:25\r\n");                        // 39. 池 GetAsync<User>
+
+        // 第一条连接：直连客户端的 33 次一问一答（24/25/35 无网络 IO）
+        int directCount = 33;
+        nint client = await AsyncSocket.Accept(listener);
+        Socket.SetNonBlocking(client);
+        for (int i = 0; i < directCount; i = i + 1) {
             string _req = await AsyncSocket.Receive(client, 1024);
             int _s = await AsyncSocket.SendString(client, replies[i]);
         }
         Socket.Close(client);
+
+        // 第二条连接：池建连接（OpenOne PING + SET + GET）
+        nint client2 = await AsyncSocket.Accept(listener);
+        Socket.SetNonBlocking(client2);
+        for (int i = directCount; i < replies.Count; i = i + 1) {
+            string _req2 = await AsyncSocket.Receive(client2, 1024);
+            int _s2 = await AsyncSocket.SendString(client2, replies[i]);
+        }
+        Socket.Close(client2);
     }
 
     static async void RunClient() {
@@ -279,7 +295,26 @@ class Program {
             done = done + 1;
         }
 
+        // 36. RPopAsync<User>
+        User rpUser = await r.RPopAsync<User>("user:list");
+        if (rpUser != null && rpUser.Name == "Bob" && rpUser.Age == 25) {
+            done = done + 1;
+        }
+
         r.Close();
+
+        // 37/38. 池级序列化钩子：pool.Serialize/Deserialize 在开连时下沉
+        // 拷贝到物理连接（开连 PING + SET + GET 共 3 次问答）。
+        RedisPool pool = new RedisPool("127.0.0.1", PORT, 2);
+        pool.Serialize = obj => DummySerialize(obj);
+        pool.Deserialize = (txt, type) => DummyDeserialize(txt, type);
+        bool poolSetOk = await pool.SetAsync<User>("pool:u", u1);
+        if (poolSetOk) { done = done + 1; }
+        User poolUser = await pool.GetAsync<User>("pool:u");
+        if (poolUser != null && poolUser.Name == "Bob" && poolUser.Age == 25) {
+            done = done + 1;
+        }
+        pool.Close();
     }
 
     static void TestOptions() {

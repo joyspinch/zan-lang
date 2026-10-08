@@ -94,6 +94,13 @@ class RedisPool {
                     return null;
                 }
             }
+            /* 池级钩子下沉拷贝到物理连接（开连时快照）。物理连接绝不能回绑
+             * pool：pool != null 的客户端是借还门面，CommandAsync 会把每条
+             * 命令重新走 pool.AcquireAsync——物理连接带上 pool 后连自己的
+             * 验活 PING 都会递归开连挂死。 */
+            client.Serialize = this.Serialize;
+            client.Deserialize = this.Deserialize;
+            client.Notice = this.Notice;
             if (!await client.PingAsync()) {
                 string why = client.GetLastError();
                 this.NoteOpenEpisode("ping failed"
@@ -813,6 +820,13 @@ class RedisPool {
 
     /// <summary>RPOP 弹出右端元素并反序列化为对象类型 T。不存在返回 null/default。</summary>
     public async T RPopObjectAsync<T>(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return (T)(object)null; }
+        try { return await c.RPopObjectAsync<T>(key); } finally { this.Release(c); }
+    }
+
+    /// <summary>RPOP 弹出右端元素并反序列化为 T（FreeRedis cli.RPop&lt;T&gt; 规范）。</summary>
+    public async T RPopAsync<T>(string key) {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return (T)(object)null; }
         try { return await c.RPopObjectAsync<T>(key); } finally { this.Release(c); }
