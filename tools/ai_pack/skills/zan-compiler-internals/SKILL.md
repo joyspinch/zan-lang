@@ -480,6 +480,14 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
      - **恢复函数作用域清理与重置**：每个 `$resume` 函数开始前必须将 `current_async_requeue_bb`、
        `current_async_cancel_bb`、`current_async_rethrow_bb` 及缓存指针清空（使用保存-恢复栈保护嵌套/闭包），
        防止上一个 async 方法的基本块引用泄漏至下一个函数引发 LLVM verifier 报错。
+     - **零 try 协程旁路 EH 序言重防（`try_count == 0`）**：
+       绝大多数 async 方法体内并无词法 `try` 块（`try_count == 0`）。历史实现无论协程内是否有 `try`，
+       均无条件在 `$resume` 序言中生成 `eh.rearm`、`eh.arm`、`eh.init`、`eh.next`、`eh.land` 等 5 个基本块、
+       两个局部 alloca 变量（`eh.co.i`、`eh.co.id`）以及两套多路 switch。
+       通过语法扫描识别 `scan.try_count == 0` 并穿透传递至工作队列 `method_body_work_t.try_count` 和 `g->current_async_try_count`，
+       蹦床 setjmp 成功后直接 `br label %co.dispatch`。直接消灭约 90% async 方法中 5 个死块及几十条死指令。
+       （注意：在 `emit_async_method_ir` 入口与恢复栈中必须完整暂存与更新 `g->current_async_try_count = w->try_count`，
+       切忌漏传导致有 try 的方法被误判跳过 catch handler 重防引发未捕获异常）。
 
 ## stdlib 肥边治理：独立类分片 + 槽反转 + 实例方法组注入（A332 肥边③④，2026-09-17）
 

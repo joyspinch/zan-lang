@@ -465,6 +465,7 @@ typedef struct {
     int             sub_base;       /* frame index of the first sub-task slot */
     int             ret_agg_slot;   /* frame index of aggregate return slot (-1 if none) */
     int             handler_cap;    /* per-handler slots in the frame */
+    int             try_count;      /* lexical try blocks in the body (0 if none) */
     /* Lexical cleanup depth bounds pending owners after abandoned scopes
      * are discarded; the frame allows one extra selected return record. */
     int             fin_depth_max;
@@ -571,6 +572,7 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         w->alocals = scan.locals;
         w->alocal_count = scan.local_count;
         w->fin_depth_max = scan.fin_depth_max;
+        w->try_count = scan.try_count;
         /* One per-handler slot group per try the body lowers. LLVM
          * rejects a zero-length array member, so a body with no try at
          * all still gets one unused slot. */
@@ -972,6 +974,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMValueRef saved_rearm = g->current_async_rearm_switch;
         int saved_handler_next = g->current_async_handler_next;
         int saved_handler_cap = g->current_async_handler_cap;
+        int saved_try_count = g->current_async_try_count;
         int saved_foreach_next = g->current_async_foreach_next;
         int saved_this_owned = g->current_async_this_owned;
         zan_type_t *saved_this_owned_type = g->current_async_this_type;
@@ -1033,6 +1036,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_rearm_switch = NULL;
         g->current_async_handler_next = 0;
         g->current_async_handler_cap = w->handler_cap;
+        g->current_async_try_count = w->try_count;
         g->current_async_foreach_next = 0;
         g->current_async_this_owned = this_owned;
         g->current_async_this_type = this_owned_type;
@@ -1139,6 +1143,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_rearm_switch = saved_rearm;
         g->current_async_handler_next = saved_handler_next;
         g->current_async_handler_cap = saved_handler_cap;
+        g->current_async_try_count = saved_try_count;
         g->current_async_foreach_next = saved_foreach_next;
         g->current_async_this_owned = saved_this_owned;
         g->current_async_this_type = saved_this_owned_type;
@@ -1583,33 +1588,35 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
             async_local_t *a_locals = NULL;
             int a_local_count = 0;
             int a_sub_base = 0;
-            int a_ret_agg_slot = -1;
-            int a_handler_cap = 1;
+	            int a_ret_agg_slot = -1;
+	            int a_handler_cap = 1;
+	            int a_try_count = 0;
 
-            if (is_async) {
-                g->has_async_work = true;
-                method_body_work_t adecl;
-                memset(&adecl, 0, sizeof(adecl));
-                adecl.member = member;
-                adecl.type_sym = type_sym;
-                adecl.is_static = is_static;
-                adecl.param_types = param_types;
-                adecl.param_count = param_count;
-                adecl.param_offset = param_offset;
-                adecl.ret_type = ret_type;
-                adecl.llvm_ret = llvm_ret;
-                adecl.cur_inst = cur_variant;
-                declare_async_method(g, &adecl, fn_name);
-                fn = adecl.fn;
-                fn_type = adecl.fn_type;
-                resume_fn = adecl.resume_fn;
-                frame_type = adecl.frame_type;
-                a_await_count = adecl.await_count;
-                a_locals = adecl.alocals;
-                a_local_count = adecl.alocal_count;
-                a_sub_base = adecl.sub_base;
-                a_ret_agg_slot = adecl.ret_agg_slot;
-                a_handler_cap = adecl.handler_cap;
+	            if (is_async) {
+	                g->has_async_work = true;
+	                method_body_work_t adecl;
+	                memset(&adecl, 0, sizeof(adecl));
+	                adecl.member = member;
+	                adecl.type_sym = type_sym;
+	                adecl.is_static = is_static;
+	                adecl.param_types = param_types;
+	                adecl.param_count = param_count;
+	                adecl.param_offset = param_offset;
+	                adecl.ret_type = ret_type;
+	                adecl.llvm_ret = llvm_ret;
+	                adecl.cur_inst = cur_variant;
+	                declare_async_method(g, &adecl, fn_name);
+	                fn = adecl.fn;
+	                fn_type = adecl.fn_type;
+	                resume_fn = adecl.resume_fn;
+	                frame_type = adecl.frame_type;
+	                a_await_count = adecl.await_count;
+	                a_locals = adecl.alocals;
+	                a_local_count = adecl.alocal_count;
+	                a_sub_base = adecl.sub_base;
+	                a_ret_agg_slot = adecl.ret_agg_slot;
+	                a_handler_cap = adecl.handler_cap;
+	                a_try_count = adecl.try_count;
             } else {
                 fn_type = LLVMFunctionType(llvm_ret, param_types, (unsigned)total_params, 0);
                 fn = LLVMAddFunction(g->mod, fn_name, fn_type);
@@ -1680,10 +1687,11 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                 work[work_count].await_count = a_await_count;
                 work[work_count].alocals = a_locals;
                 work[work_count].alocal_count = a_local_count;
-                work[work_count].sub_base = a_sub_base;
-                work[work_count].ret_agg_slot = a_ret_agg_slot;
-                work[work_count].handler_cap = a_handler_cap;
-                work[work_count].cur_inst = cur_variant;
+	                work[work_count].sub_base = a_sub_base;
+	                work[work_count].ret_agg_slot = a_ret_agg_slot;
+	                work[work_count].handler_cap = a_handler_cap;
+	                work[work_count].try_count = a_try_count;
+	                work[work_count].cur_inst = cur_variant;
                 work_count++;
             } else {
                 free(param_types);

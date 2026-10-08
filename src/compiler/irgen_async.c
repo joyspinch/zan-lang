@@ -2017,7 +2017,6 @@ static void emit_eh_hook_call(zan_irgen_t *g, const char *name);
  * each $resume invocation, after the frame slots have been set up. */
 static void emit_async_eh_prologue(zan_irgen_t *g) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef fn = g->current_async_resume_fn;
     LLVMValueRef frame = g->current_async_frame;
     LLVMTypeRef ft = g->current_async_frame_type;
@@ -2026,21 +2025,42 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
     LLVMValueRef zero = LLVMConstInt(i32, 0, 0);
 
     LLVMValueRef entry_slot = LLVMBuildAlloca(g->builder, i32, "eh.co.entry");
-    LLVMValueRef idx_slot = LLVMBuildAlloca(g->builder, i32, "eh.co.i");
-    LLVMValueRef id_slot = LLVMBuildAlloca(g->builder, i32, "eh.co.id");
     g->current_async_eh_entry = entry_slot;
     LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i32, top_g, "eh.top0"),
         entry_slot);
-    LLVMBuildStore(g->builder, zero, idx_slot);
 
     LLVMBasicBlockRef exc_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.exc");
+    LLVMBasicBlockRef disp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.dispatch");
+    g->current_async_exc_bb = exc_bb;
+
+    if (g->current_async_try_count == 0) {
+        /* Trampoline only: no inner try statements exist in this coroutine, so
+         * no handlers will ever be re-armed upon resumption. Branching took directly
+         * to co.dispatch eliminates 5 unreachable basic blocks, 2 frame allocas,
+         * and the rearm switches. */
+        LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t");
+        LLVMValueRef t1 = zan_add(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t1");
+        LLVMBuildStore(g->builder, t1, top_g);
+        LLVMBuildStore(g->builder,
+            LLVMBuildLoad2(g->builder, i32, get_eh_tmp_top_global(g), "eh.t0"),
+            emit_eh_mark_ptr(g, t1));
+        LLVMValueRef r = emit_eh_setjmp(g, emit_eh_buf_ptr(g, t1));
+        LLVMValueRef took = zan_icmp(g->builder, LLVMIntEQ, r, zero, "eh.took");
+        LLVMBuildCondBr(g->builder, took, disp_bb, exc_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, disp_bb);
+        return;
+    }
+
+    LLVMValueRef idx_slot = LLVMBuildAlloca(g->builder, i32, "eh.co.i");
+    LLVMValueRef id_slot = LLVMBuildAlloca(g->builder, i32, "eh.co.id");
+    LLVMBuildStore(g->builder, zero, idx_slot);
+
     LLVMBasicBlockRef head_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.rearm");
     LLVMBasicBlockRef arm_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.arm");
     LLVMBasicBlockRef init_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.init");
     LLVMBasicBlockRef next_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.next");
     LLVMBasicBlockRef land_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.land");
-    LLVMBasicBlockRef disp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.dispatch");
-    g->current_async_exc_bb = exc_bb;
 
     /* trampoline: the outermost handler of this invocation */
     {
