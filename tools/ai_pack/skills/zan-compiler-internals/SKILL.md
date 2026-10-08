@@ -464,13 +464,22 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
        更使最终 `%co.result` 的 PHI 节点输入边急剧膨胀。引入 `scope_has_owned_cleanups` 精确探测
        是否存在 ARC 变量、EH slot、Box cell 或 struct RC；凡无作用域托管清理的取消检查点，
        统统合流至唯一的 `co.cancelled`，使 PHI 节点输入度坍缩至 1，基本块大幅削减。
-     - **帧字段 GEP 句柄与 bitcast 缓存（`get_async_state_ptr` / `get_async_cancel_ptr` / `get_async_self_i8`）**：
-       在 async 函数 entry 块缓存 `ASYNC_FRAME_STATE`、`ASYNC_FRAME_CANCEL` 的 StructGEP2
-       以及 `(i8*)self` 的 BitCast。避免在每一个挂起点、恢复点、回边轮询点重复发射相同的
-       指针算术指令。注意 GEP 命名契约（如 `self.state`）需与 golden 测试子串期望精确匹配。
+     - **帧字段 GEP 句柄与 bitcast 缓存（`get_async_state_ptr` / `get_async_cancel_ptr` / `get_async_self_i8` / `get_async_self_int` / `get_async_child_ptr`）**：
+       在 async 函数 entry 块缓存 `ASYNC_FRAME_STATE`、`ASYNC_FRAME_CANCEL`、`ASYNC_FRAME_CHILD` 的 StructGEP2
+       以及 `(i8*)self` 的 BitCast 和 `(uintptr_t)(i8*)self` 的 PtrToInt。
+       统一通过 `position_before_entry_terminator(g)` 将惰性发射的缓存指令安全放置在 entry 块已有的指令之后、
+       且在 entry 块最后的 `switch` terminator 之前，消除多个 await/yield 重复发射指针算术并杜绝指令次序倒挂。
+       注意 GEP 命名契约（如 `self.state`）需与 golden 测试子串期望精确匹配。
+     - **子任务恢复探测瘦身与共享重抛块（`get_async_rethrow_bb`）**：
+       过去在每个 `await sub` 恢复点无条件在主路径读取子任务的 `sub.exc.tid` 与 `sub.exc.own`，推迟至 `sub.rethrow`
+       冷分支按需加载，主路径直接消除 4 条冗余指令。
+       更严重的历史债务是每个 `await sub` 的异常重抛原本就地内联一整套 `emit_eh_rethrow_current`（包含未捕获异常
+       类型解析、printf、longjmp 以及 7 个独立的异常分支基本块），导致 20 个 await 凭空产生 140 个仅用于异常
+       重抛的基本块。引入 `$resume` 级惰性单例 `co.rethrow` 块，子任务捕获异常并释放 frame 后统一 `br label %co.rethrow`，
+       消灭每个 await 点在异常展开上的几何级代码复制。
      - **恢复函数作用域清理与重置**：每个 `$resume` 函数开始前必须将 `current_async_requeue_bb`、
-       `current_async_cancel_bb` 及缓存指针清空（使用保存-恢复栈保护嵌套/闭包），防止上一个
-       async 方法的基本块引用泄漏至下一个函数引发 LLVM verifier 报错。
+       `current_async_cancel_bb`、`current_async_rethrow_bb` 及缓存指针清空（使用保存-恢复栈保护嵌套/闭包），
+       防止上一个 async 方法的基本块引用泄漏至下一个函数引发 LLVM verifier 报错。
 
 ## stdlib 肥边治理：独立类分片 + 槽反转 + 实例方法组注入（A332 肥边③④，2026-09-17）
 

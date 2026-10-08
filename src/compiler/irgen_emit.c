@@ -965,6 +965,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMValueRef saved_state_ptr = g->current_async_state_ptr;
         LLVMValueRef saved_cancel_ptr = g->current_async_cancel_ptr;
         LLVMValueRef saved_self_i8 = g->current_async_self_i8;
+        LLVMValueRef saved_self_int = g->current_async_self_int;
+        LLVMValueRef saved_child_ptr = g->current_async_child_ptr;
         LLVMValueRef saved_eh_entry = g->current_async_eh_entry;
         LLVMBasicBlockRef saved_exc_bb = g->current_async_exc_bb;
         LLVMValueRef saved_rearm = g->current_async_rearm_switch;
@@ -1020,9 +1022,12 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_result_phi = NULL;
         g->current_async_requeue_bb = NULL;
         g->current_async_cancel_bb = NULL;
+        g->current_async_rethrow_bb = NULL;
         g->current_async_state_ptr = NULL;
         g->current_async_cancel_ptr = NULL;
         g->current_async_self_i8 = NULL;
+        g->current_async_self_int = NULL;
+        g->current_async_child_ptr = NULL;
         g->current_async_eh_entry = NULL;
         g->current_async_exc_bb = NULL;
         g->current_async_rearm_switch = NULL;
@@ -1044,11 +1049,10 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
          * chain, and a stale entry would point at freed memory. */
         LLVMBuildStore(g->builder,
             LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0)),
-            LLVMBuildStructGEP2(g->builder, frame_type, sframe,
-                ASYNC_FRAME_CHILD, "fr.child"));
+            get_async_child_ptr(g));
 
         LLVMValueRef state = LLVMBuildLoad2(g->builder, i32,
-            LLVMBuildStructGEP2(g->builder, frame_type, sframe, ASYNC_FRAME_STATE, "st.ptr"),
+            get_async_state_ptr(g),
             "state");
         LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "co.start");
         /* switch(state): case 0 (start) -> body; each await point appends a
@@ -1128,6 +1132,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_state_ptr = saved_state_ptr;
         g->current_async_cancel_ptr = saved_cancel_ptr;
         g->current_async_self_i8 = saved_self_i8;
+        g->current_async_self_int = saved_self_int;
+        g->current_async_child_ptr = saved_child_ptr;
         g->current_async_eh_entry = saved_eh_entry;
         g->current_async_exc_bb = saved_exc_bb;
         g->current_async_rearm_switch = saved_rearm;

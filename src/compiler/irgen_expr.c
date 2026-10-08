@@ -11247,8 +11247,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     ASYNC_FRAME_AWAITER, "sub.aw");
                 LLVMValueRef aw_iptr = LLVMBuildBitCast(g->builder, aw_ptr,
                     LLVMPointerType(ptr_int_ty, 0), "sub.aw.iptr");
-                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, i8ptr, "self");
-                LLVMValueRef self_int = LLVMBuildPtrToInt(g->builder, self_i8, ptr_int_ty, "self.int");
+                LLVMValueRef self_int = get_async_self_int(g, ptr_int_ty);
                 LLVMValueRef cas_res = LLVMBuildAtomicCmpXchg(g->builder, aw_iptr,
                     LLVMConstInt(ptr_int_ty, 0, 0), self_int,
                     LLVMAtomicOrderingSequentiallyConsistent,
@@ -11261,9 +11260,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_store_fit(g, sub_i8,
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
                         (unsigned)(g->current_async_sub_base + j), "sub.slot"));
-                zan_store_fit(g, sub_i8,
-                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
-                        ASYNC_FRAME_CHILD, "self.child"));
+                zan_store_fit(g, sub_i8, get_async_child_ptr(g));
                 zan_store_fit(g, LLVMConstInt(i32, (unsigned)k, 0), get_async_state_ptr(g));
                 LLVMValueRef sched_args[] = { sub_i8, sub_resume };
                 zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");

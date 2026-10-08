@@ -759,14 +759,22 @@ static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g) {
     return fn;
 }
 
+static void position_before_entry_terminator(zan_irgen_t *g) {
+    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(g->current_async_resume_fn);
+    if (!entry) return;
+    LLVMValueRef term = LLVMGetBasicBlockTerminator(entry);
+    if (term) {
+        LLVMPositionBuilderBefore(g->builder, term);
+    } else {
+        LLVMPositionBuilderAtEnd(g->builder, entry);
+    }
+}
+
 static LLVMValueRef get_async_self_i8(zan_irgen_t *g) {
     if (g->current_async_self_i8) return g->current_async_self_i8;
     if (!g->current_async_frame) return NULL;
     LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
-    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(g->current_async_resume_fn);
-    if (entry && LLVMGetFirstInstruction(entry)) {
-        LLVMPositionBuilderBefore(g->builder, LLVMGetFirstInstruction(entry));
-    }
+    position_before_entry_terminator(g);
     LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     g->current_async_self_i8 = LLVMBuildBitCast(g->builder,
         g->current_async_frame, di8ptr, "self.i8");
@@ -778,10 +786,7 @@ static LLVMValueRef get_async_state_ptr(zan_irgen_t *g) {
     if (g->current_async_state_ptr) return g->current_async_state_ptr;
     if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
     LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
-    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(g->current_async_resume_fn);
-    if (entry && LLVMGetFirstInstruction(entry)) {
-        LLVMPositionBuilderBefore(g->builder, LLVMGetFirstInstruction(entry));
-    }
+    position_before_entry_terminator(g);
     g->current_async_state_ptr = LLVMBuildStructGEP2(g->builder,
         g->current_async_frame_type, g->current_async_frame,
         ASYNC_FRAME_STATE, "self.state");
@@ -793,15 +798,35 @@ static LLVMValueRef get_async_cancel_ptr(zan_irgen_t *g) {
     if (g->current_async_cancel_ptr) return g->current_async_cancel_ptr;
     if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
     LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
-    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(g->current_async_resume_fn);
-    if (entry && LLVMGetFirstInstruction(entry)) {
-        LLVMPositionBuilderBefore(g->builder, LLVMGetFirstInstruction(entry));
-    }
+    position_before_entry_terminator(g);
     g->current_async_cancel_ptr = LLVMBuildStructGEP2(g->builder,
         g->current_async_frame_type, g->current_async_frame,
         ASYNC_FRAME_CANCEL, "fr.cancel.p");
     if (here) LLVMPositionBuilderAtEnd(g->builder, here);
     return g->current_async_cancel_ptr;
+}
+
+static LLVMValueRef get_async_self_int(zan_irgen_t *g, LLVMTypeRef ptr_int_ty) {
+    if (g->current_async_self_int) return g->current_async_self_int;
+    LLVMValueRef self_i8 = get_async_self_i8(g);
+    if (!self_i8) return NULL;
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    position_before_entry_terminator(g);
+    g->current_async_self_int = LLVMBuildPtrToInt(g->builder, self_i8, ptr_int_ty, "self.int");
+    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    return g->current_async_self_int;
+}
+
+static LLVMValueRef get_async_child_ptr(zan_irgen_t *g) {
+    if (g->current_async_child_ptr) return g->current_async_child_ptr;
+    if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    position_before_entry_terminator(g);
+    g->current_async_child_ptr = LLVMBuildStructGEP2(g->builder,
+        g->current_async_frame_type, g->current_async_frame,
+        ASYNC_FRAME_CHILD, "self.child");
+    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    return g->current_async_child_ptr;
 }
 
 /* Cooperative preemption and Task.Yield requeue block. Shared across all
@@ -2294,6 +2319,23 @@ static void emit_eh_rethrow_current(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, cont);
 }
 
+/* Shared rethrow block for all child-coroutine exception propagation points
+ * within a single $resume invocation. */
+static LLVMBasicBlockRef get_async_rethrow_bb(zan_irgen_t *g) {
+    if (!g->current_async_resume_fn) return NULL;
+    if (g->current_async_rethrow_bb) return g->current_async_rethrow_bb;
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_async_resume_fn, "co.rethrow");
+    LLVMPositionBuilderAtEnd(g->builder, bb);
+    emit_eh_rethrow_current(g);
+    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+        LLVMBuildUnreachable(g->builder);
+    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    g->current_async_rethrow_bb = bb;
+    return bb;
+}
+
 /* At an await resume point: if the awaited coroutine completed by throwing,
  * move its exception back into the globals and re-throw it here, inside a live
  * invocation of this frame. `sub` is the (still owned) sub-frame handle.
@@ -2314,10 +2356,6 @@ static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
 
     LLVMValueRef ep = LLVMBuildStructGEP2(g->builder, hdr, sub, ASYNC_FRAME_EXC, "sub.exc.p");
     LLVMValueRef ev = LLVMBuildLoad2(g->builder, i8ptr, ep, "sub.exc");
-    LLVMValueRef tp = LLVMBuildStructGEP2(g->builder, hdr, sub, ASYNC_FRAME_EXC_TID, "sub.exc.tid.p");
-    LLVMValueRef tv = LLVMBuildLoad2(g->builder, i8ptr, tp, "sub.exc.tid");
-    LLVMValueRef op = LLVMBuildStructGEP2(g->builder, hdr, sub, ASYNC_FRAME_EXC_OWNED, "sub.exc.own.p");
-    LLVMValueRef ov = LLVMBuildLoad2(g->builder, i32, op, "sub.exc.own");
     LLVMValueRef threw = zan_icmp(g->builder, LLVMIntNE, ev,
         LLVMConstNull(i8ptr), "sub.threw");
     LLVMBasicBlockRef thr_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sub.rethrow");
@@ -2325,6 +2363,10 @@ static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
     LLVMBuildCondBr(g->builder, threw, thr_bb, ok_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, thr_bb);
+    LLVMValueRef tp = LLVMBuildStructGEP2(g->builder, hdr, sub, ASYNC_FRAME_EXC_TID, "sub.exc.tid.p");
+    LLVMValueRef tv = LLVMBuildLoad2(g->builder, i8ptr, tp, "sub.exc.tid");
+    LLVMValueRef op = LLVMBuildStructGEP2(g->builder, hdr, sub, ASYNC_FRAME_EXC_OWNED, "sub.exc.own.p");
+    LLVMValueRef ov = LLVMBuildLoad2(g->builder, i32, op, "sub.exc.own");
     LLVMBuildStore(g->builder, ev, exc_g);
     LLVMBuildStore(g->builder, tv, get_eh_exc_tid_global(g));
     LLVMBuildStore(g->builder, ov, get_eh_exc_owned_global(g));
@@ -2335,9 +2377,14 @@ static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
     }
     /* the sub-frame is dead once its exception has been taken over */
     zan_emit_frame_free(g, sub);
-    emit_eh_rethrow_current(g);
-    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
-        LLVMBuildUnreachable(g->builder);
+    LLVMBasicBlockRef rethrow_bb = get_async_rethrow_bb(g);
+    if (rethrow_bb) {
+        LLVMBuildBr(g->builder, rethrow_bb);
+    } else {
+        emit_eh_rethrow_current(g);
+        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+            LLVMBuildUnreachable(g->builder);
+    }
 
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }

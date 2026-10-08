@@ -784,9 +784,12 @@ struct zan_irgen {
     LLVMValueRef current_async_result_phi;
     LLVMBasicBlockRef current_async_requeue_bb; /* shared Task.Yield/preempt ready-and-ret block */
     LLVMBasicBlockRef current_async_cancel_bb;  /* shared top-level cancel exit block */
+    LLVMBasicBlockRef current_async_rethrow_bb; /* shared sub-task exception rethrow block */
     LLVMValueRef current_async_state_ptr;       /* cached &frame->state GEP */
     LLVMValueRef current_async_cancel_ptr;      /* cached &frame->cancel GEP */
     LLVMValueRef current_async_self_i8;         /* cached (i8*)frame bitcast */
+    LLVMValueRef current_async_self_int;        /* cached (uintptr_t)(i8*)frame */
+    LLVMValueRef current_async_child_ptr;       /* cached &frame->child GEP */
     /* Persistent per-function IR compaction state (owned by irgen.c). */
     void        *function_compactor;
     /* async exception handling: the eh-stack depth on entry to the $resume
