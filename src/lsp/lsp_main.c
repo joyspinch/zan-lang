@@ -2702,18 +2702,6 @@ static json_value *rename_edits_for(const char *text, const char *word,
     return edits;
 }
 
-typedef struct {
-    json_value *changes;
-    const char *word;
-    const char *new_name;
-} rename_ctx_t;
-
-static void rename_visit(void *ctx, const char *uri, const char *text) {
-    rename_ctx_t *rc = (rename_ctx_t *)ctx;
-    json_value *edits = rename_edits_for(text, rc->word, rc->new_name, -1, -1);
-    if (edits) json_obj_set(rc->changes, uri, edits);
-}
-
 /* Two resolved type names name the same type when their simple names
  * (namespace, generics and arrays stripped) match — the same pairing
  * intel_member_sym uses to walk a receiver type to its declaring class. */
@@ -2751,8 +2739,10 @@ static json_value *scoped_rename_edits(const char *doc_uri, const char *text,
     return edits;
 }
 
-/* Rename handler: whole-word, comment/string-aware textual rename across
- * every open document, returned as a WorkspaceEdit. */static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
+/* Rename handler: symbol-scoped WorkspaceEdit when the word under the cursor
+ * resolves to a declaration; otherwise a lexical whole-word rename confined to
+ * the origin document. */
+static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
     const char *uri; int line, character;
     const char *new_name = json_get_str(json_obj_get(params, "newName"));
     if (!get_position(params, &uri, &line, &character) || !new_name || !new_name[0]) {
@@ -2871,29 +2861,14 @@ static json_value *scoped_rename_edits(const char *doc_uri, const char *text,
         return;
     }
 
-    /* Every open document (their unsaved text wins) plus every indexed project
-     * file on disk, so a rename also lands in files the editor never opened. */
+    /* Unresolved word: fall back to a lexical rename, but only in the
+     * document the request came from. Without a resolved identity there is
+     * no way to tell same-named occurrences in other files apart, so a
+     * cross-file textual flood would rewrite provably different symbols —
+     * prepareRename already refuses unresolved words for the same reason. */
     json_value *changes = json_new_obj();
-    bool cancelled = false;
-    for (int d = 0; d < s->doc_count && !cancelled; d++) {
-        if (lsp_cancel_hit(s)) { cancelled = true; break; }
-        lsp_doc_t *dd = &s->docs[d];
-        json_value *edits = rename_edits_for(dd->text, word, new_name, -1, -1);
-        if (edits) json_obj_set(changes, dd->uri, edits);
-    }
-    if (!cancelled) {
-        rename_ctx_t rctx;
-        rctx.changes = changes;
-        rctx.word = word;
-        rctx.new_name = new_name;
-        for_each_unopened_project_file(s, &rctx, rename_visit);
-        cancelled = lsp_cancel_hit(s);
-    }
-    if (cancelled) {
-        json_free(changes);
-        send_response_error(s, id, -32800, "Request cancelled");
-        return;
-    }
+    json_value *edits = rename_edits_for(doc->text, word, new_name, -1, -1);
+    if (edits) json_obj_set(changes, doc->uri, edits);
 
     json_value *we = json_new_obj();
     json_obj_set(we, "changes", changes);

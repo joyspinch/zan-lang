@@ -823,6 +823,24 @@ static int run_completion_checks(child_t *child) {
     ext_check(member_rename_safe, "rename: member cannot edit unrelated type or local");
     json_free(root); free(response);
 
+    /* Unresolved word: the lexical fallback must stay in the origin document —
+     * same-named text in other files has no proven identity to rename. */
+    const char *fb_a_uri = "file:///lsp_rename_fallback_a.zan";
+    const char *fb_a_text = "class FallbackA { void F() { mystery = 1; } }\n";
+    const char *fb_b_uri = "file:///lsp_rename_fallback_b.zan";
+    const char *fb_b_text = "class FallbackB { void F() { mystery = 2; } }\n";
+    completion_document(child, fb_a_uri, fb_a_text, 1, true);
+    completion_document(child, fb_b_uri, fb_b_text, 1, true);
+    response = request_at_marker(child, fb_a_uri, fb_a_text, "mystery",
+                                  "textDocument/rename", "solved");
+    root = response ? json_parse(response) : NULL;
+    changes = json_obj_get(json_obj_get(root, "result"), "changes");
+    ext_check(changes && json_obj_get(changes, fb_a_uri) &&
+              json_arr_count(json_obj_get(changes, fb_a_uri)) == 1 &&
+              !json_obj_get(changes, fb_b_uri),
+              "rename: unresolved word stays in the origin document");
+    json_free(root); free(response);
+
     const char *refs_uri = "file:///lsp_reference_consumer.zan";
     const char *refs_text =
         "class ReferenceConsumer { void Use(RenameA a, RenameB b) { a.count = 2; b.count = 3; int count = 4; } }\n";
