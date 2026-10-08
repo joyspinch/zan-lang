@@ -365,7 +365,7 @@ class Gen {
             if (c.dictType.Length > 0 && Safe(c.dictType)) {
                 b.Append("        string " + c.name + "Opts = \"\";\n");
                 b.Append("        List<SysDictItem> " + c.name
-                    + "Items = await new SysDictItemDao(this).ByTypeCodeActive(\""
+                    + "Items = await this.SysDictItem.ByTypeCodeActive(\""
                     + Literal(c.dictType) + "\");\n");
                 b.Append("        for (int i = 0; i < " + c.name
                     + "Items.Count; i = i + 1) {\n");
@@ -507,7 +507,7 @@ class Gen {
             b.Append("\n    /* 字典值合法性：空值看必填，非空必须命中该字典类型的活动项。 */\n");
             b.Append("    async string CheckDict(string typeCode, string label, string value, bool required) {\n");
             b.Append("        if (value.Length == 0) { return required ? \"请选择\" + label : \"\"; }\n");
-            b.Append("        List<SysDictItem> items = await new SysDictItemDao(this).ByTypeCodeActive(typeCode);\n");
+            b.Append("        List<SysDictItem> items = await this.SysDictItem.ByTypeCodeActive(typeCode);\n");
             b.Append("        for (int i = 0; i < items.Count; i = i + 1) {\n");
             b.Append("            if (items[i].value == value) { return \"\"; }\n");
             b.Append("        }\n");
@@ -548,7 +548,7 @@ class Gen {
                 b.Append("        if (tabCur == \"0\") { tabN.Set(\"selected\", \"1\"); }\n");
                 b.Append("        tabItems.Add(tabN);\n");
             } else {
-                b.Append("        List<SysDictItem> tabDict = await new SysDictItemDao(this).ByTypeCodeActive(\""
+                b.Append("        List<SysDictItem> tabDict = await this.SysDictItem.ByTypeCodeActive(\""
                     + Literal(tabC.dictType) + "\");\n");
                 b.Append("        for (int i = 0; i < tabDict.Count; i = i + 1) {\n");
                 b.Append("            StrMap o = new StrMap();\n");
@@ -627,7 +627,7 @@ class Gen {
                 if (c.dictType.Length > 0 && Safe(c.dictType)) {
                     b.Append("        StrMap " + c.name + "Map = new StrMap();\n");
                     b.Append("        List<SysDictItem> " + c.name
-                        + "Items = await new SysDictItemDao(this).ByTypeCodeActive(\""
+                        + "Items = await this.SysDictItem.ByTypeCodeActive(\""
                         + Literal(c.dictType) + "\");\n");
                     b.Append("        for (int i = 0; i < " + c.name
                         + "Items.Count; i = i + 1) {\n");
@@ -787,7 +787,7 @@ class Gen {
             if (dictFed) {
                 b.Append("        List<StrMap> " + c.name + "Opts = d.AddList(\"" + c.name + "Opts\");\n");
                 b.Append("        List<SysDictItem> " + c.name
-                    + "Items = await new SysDictItemDao(this).ByTypeCodeActive(\""
+                    + "Items = await this.SysDictItem.ByTypeCodeActive(\""
                     + Literal(c.dictType) + "\");\n");
                 count = c.name + "Items.Count";
                 vexpr = c.name + "Items[i].value";
@@ -1108,7 +1108,7 @@ class Gen {
         }
     }
 
-    /* 生成数据访问网关（{Entity}Dao），与手写 DAO 结构一致。 */
+    /* 生成数据访问网关（{Entity}Dao），继承 FreeSql BaseRepository 范式。 */
     static string DaoSource(SysGenTable t, List<SysGenColumn> cols) {
         string ent = t.entityName;
         StringBuilder b = new StringBuilder();
@@ -1117,47 +1117,21 @@ class Gen {
         b.Append("using ZanWeb.Model.Gen;\n\n");
         b.Append("namespace ZanWeb.Dao.Gen;\n\n");
         b.Append("/// <summary>" + Comment(t.title)
-            + " 的数据网关。由表设计器生成，可直接修改。</summary>\n");
-        b.Append("class " + ent + "Dao {\n");
-        b.Append("    IDbConnection db;\n\n");
-        b.Append("    " + ent + "Dao(IDbConnection db) {\n");
-        b.Append("        this.db = db;\n    }\n\n");
+            + " 的数据网关。继承 BaseRepository 通用仓储，由表设计器生成，可直接修改扩展。</summary>\n");
+        b.Append("class " + ent + "Dao : BaseRepository<" + ent + "> {\n");
+        b.Append("    " + ent + "Dao(IFreeSql fsql) : base(fsql) {}\n");
+        b.Append("    " + ent + "Dao(IDbConnection db) : base(FreeSql.FromConnection(db)) {}\n\n");
 
         b.Append("    async " + ent + " ById(int id) {\n");
-        b.Append("        return await this.db.Select<" + ent
+        b.Append("        return await this.GetExecutor().Select<" + ent
             + ">().Where(a => a.id == id).FirstAsync();\n    }\n\n");
 
         b.Append("    async List<" + ent + "> All() {\n");
-        b.Append("        return await this.db.Select<" + ent
+        b.Append("        return await this.GetExecutor().Select<" + ent
             + ">().OrderByDescending(a => a.id).ToListAsync();\n    }\n\n");
 
-        b.Append("    async int Count() {\n");
-        b.Append("        return await this.db.Select<" + ent
-            + ">().CountAsync();\n    }\n\n");
-
-        b.Append("    async int Insert(" + ent + " e) {\n");
-        b.Append("        return await this.db.Insert<" + ent
-            + ">(e).ExecuteIdentityAsync();\n    }\n\n");
-
-        b.Append("    async int Update(" + ent + " e) {\n");
-        string sets = "";
-        for (int i = 0; i < cols.Count; i = i + 1) {
-            SysGenColumn c = cols[i];
-            if (c.name == "id") { continue; }
-            sets = sets + "            .Set(a => a." + c.name + ", e." + c.name
-                + ")\n";
-        }
-        if (sets.Length == 0) {
-            b.Append("        return 0;\n    }\n\n");
-        } else {
-            b.Append("        return await this.db.Update<" + ent + ">()\n");
-            b.Append(sets);
-            b.Append("            .Where(a => a.id == e.id).ExecuteAffrowsAsync();\n");
-            b.Append("    }\n\n");
-        }
-
         b.Append("    async int Delete(int id) {\n");
-        b.Append("        return await this.db.Delete<" + ent
+        b.Append("        return await this.GetExecutor().Delete<" + ent
             + ">().Where(a => a.id == id).ExecuteAffrowsAsync();\n    }\n}\n");
         return b.ToString();
     }

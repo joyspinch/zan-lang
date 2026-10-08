@@ -4,70 +4,60 @@ using System.Data.Orm;
 using System.Web;
 using ZanWeb.Model;
 using ZanWeb.Core;
-using ZanWeb.Web;
 
 namespace ZanWeb.Dao;
 
-/* sys_user 的读写入口；登录、令牌解析和管理后台都经此路由，账号表唯一网关。DAO 由调用方连接构造，无独立生命周期。所有方法异步，认证解析器也在请求协程上运行，不阻塞工作线程。 */
-class SysUserDao {
-    IDbConnection db;
-
-    SysUserDao(AppController host) {
-        /* 请求作用域：连接取宿主控制器的请求租约——事务与只读从库口径一致。 */
-        this.db = host.__Conn();
-    }
-
-    /* 非请求场景（种子、后台任务）显式给连接。 */
-    SysUserDao(IDbConnection db) {
-        this.db = db;
-    }
+/* sys_user 的读写入口；继承 BaseRepository<SysUser>，登录、令牌解析和管理后台都经此路由，账号表唯一网关。DAO 自动复用调用方连接或 FreeSql 门面。所有方法异步，认证解析器也在请求协程上运行，不阻塞工作线程。 */
+class SysUserDao : BaseRepository<SysUser> {
+    SysUserDao(IFreeSql fsql) : base(fsql) {}
+    SysUserDao(IDbConnection db) : base(FreeSql.FromConnection(db)) {}
 
     async SysUser ByUsername(string username) {
-        return await this.db.Select<SysUser>()
+        return await this.GetExecutor().Select<SysUser>()
             .Where(a => a.username == username)
             .FirstAsync();
     }
 
     async SysUser ByEmail(string email) {
-        return await this.db.Select<SysUser>()
+        return await this.GetExecutor().Select<SysUser>()
             .Where(a => a.email == email)
             .FirstAsync();
     }
 
     async int CountByUsername(string username) {
-        return await this.db.Select<SysUser>()
+        return await this.GetExecutor().Select<SysUser>()
             .Where(a => a.username == username)
             .CountAsync();
     }
 
     async int CountByEmail(string email) {
-        return await this.db.Select<SysUser>()
+        return await this.GetExecutor().Select<SysUser>()
             .Where(a => a.email == email)
             .CountAsync();
     }
 
     async SysUser ById(int id) {
-        return await this.db.Select<SysUser>().Where(a => a.id == id).FirstAsync();
+        return await this.GetExecutor().Select<SysUser>().Where(a => a.id == id).FirstAsync();
     }
 
     /* 返回所有账号实体列表（FreeSql 风格直接操作/返回实体） */
     async List<SysUser> All() {
-        return await this.db.Select<SysUser>()
+        return await this.GetExecutor().Select<SysUser>()
             .OrderBy(a => a.id)
             .ToListAsync();
     }
 
     async int Count() {
-        return await this.db.Select<SysUser>().CountAsync();
+        return await this.GetExecutor().Select<SysUser>().CountAsync();
     }
 
     async int Insert(SysUser user) {
-        return await this.db.Insert<SysUser>(user).ExecuteIdentityAsync();
+        return await this.GetExecutor().Insert<SysUser>(user).ExecuteIdentityAsync();
     }
 
     /* 启用(1)/禁用(0)账号；禁用后无法登录，已发令牌也失效。返回影响行数。 */
     async int SetStatus(int id, int status) {
-        return await this.db.Update<SysUser>()
+        return await this.GetExecutor().Update<SysUser>()
             .Set(a => a.status, status)
             .Where(a => a.id == id)
             .ExecuteAffrowsAsync();
@@ -75,7 +65,7 @@ class SysUserDao {
 
     /* 更新账号基本属性 */
     async int UpdateProfile(int id, string username, string nickname, string email, string mobile, int departmentId, int status, long updatedAt) {
-        return await this.db.Update<SysUser>()
+        return await this.GetExecutor().Update<SysUser>()
             .Set(a => a.username, username)
             .Set(a => a.nickname, nickname)
             .Set(a => a.email, email)
@@ -89,7 +79,7 @@ class SysUserDao {
 
     /* 更新个人资料 */
     async int UpdatePersonal(int id, string nickname, string email, string mobile, long updatedAt) {
-        return await this.db.Update<SysUser>()
+        return await this.GetExecutor().Update<SysUser>()
             .Set(a => a.nickname, nickname)
             .Set(a => a.email, email)
             .Set(a => a.mobile, mobile)
@@ -100,12 +90,12 @@ class SysUserDao {
 
     /* 删除账号，返回影响行数。 */
     async int Delete(int id) {
-        return await this.db.Delete<SysUser>().Where(a => a.id == id).ExecuteAffrowsAsync();
+        return await this.GetExecutor().Delete<SysUser>().Where(a => a.id == id).ExecuteAffrowsAsync();
     }
 
     /* 重置密码 */
     async int ResetPassword(int id, string salt, string hash, long updatedAt) {
-        return await this.db.Update<SysUser>()
+        return await this.GetExecutor().Update<SysUser>()
             .Set(a => a.passwordSalt, salt)
             .Set(a => a.passwordHash, hash)
             .SetIncr(a => a.tokenVersion, 1)
@@ -116,7 +106,7 @@ class SysUserDao {
 
     /* 数据库内原子递增，不能先读再写，否则并发撤销会丢更新。 */
     async int BumpTokenVersion(int id) {
-        return await this.db.Update<SysUser>()
+        return await this.GetExecutor().Update<SysUser>()
             .SetIncr(a => a.tokenVersion, 1)
             .Where(a => a.id == id)
             .ExecuteAffrowsAsync();
@@ -125,7 +115,7 @@ class SysUserDao {
     /* 登录成功后的哈希格式升级（遗留链 → pbkdf2$）。只改凭证材料，
        不 bump tokenVersion——已发会话与口令哈希无关。 */
     async int UpgradeHash(int id, string hash, long updatedAt) {
-        return await this.db.Update<SysUser>()
+        return await this.GetExecutor().Update<SysUser>()
             .Set(a => a.passwordHash, hash)
             .Set(a => a.updatedAt, updatedAt)
             .Where(a => a.id == id)
@@ -134,7 +124,7 @@ class SysUserDao {
 
     /* 范围计数：数据权限过滤。 */
     async int CountScoped(bool byDept, List<int> depts, bool mine, int myId) {
-        return await this.db.Select<SysUser>()
+        return await this.GetExecutor().Select<SysUser>()
             .WhereIf(byDept, a => depts.Contains(a.departmentId))
             .WhereIf(mine, a => a.id == myId)
             .CountAsync();
@@ -143,7 +133,7 @@ class SysUserDao {
     /* 管理后台分页计数 */
     async int CountPaged(string kw, int status, bool byDept, List<int> scoped, bool mine, int myId) {
         bool hasKw = kw != null && kw.Length > 0;
-        return await this.db.Select<SysUser>()
+        return await this.GetExecutor().Select<SysUser>()
             .WhereIf(hasKw, a => a.username.Contains(kw))
             .WhereIf(status >= 0, a => a.status == status)
             .WhereIf(byDept, a => scoped.Contains(a.departmentId))
@@ -154,7 +144,7 @@ class SysUserDao {
     /* 管理后台分页列表 */
     async List<SysUser> PagedList(string kw, int status, bool byDept, List<int> scoped, bool mine, int myId, int skip, int limit) {
         bool hasKw = kw != null && kw.Length > 0;
-        return await this.db.Select<SysUser>()
+        return await this.GetExecutor().Select<SysUser>()
             .WhereIf(hasKw, a => a.username.Contains(kw))
             .WhereIf(status >= 0, a => a.status == status)
             .WhereIf(byDept, a => scoped.Contains(a.departmentId))
@@ -165,7 +155,7 @@ class SysUserDao {
     }
 
     async List<SysUser> ByDeptIds(List<int> depts) {
-        return await this.db.Select<SysUser>()
+        return await this.GetExecutor().Select<SysUser>()
             .Where(a => depts.Contains(a.departmentId))
             .ToListAsync();
     }
@@ -174,14 +164,14 @@ class SysUserDao {
        成参数化绑定，调用方保证 ids 非空。 */
     async List<SysUser> ByIds(List<int> ids) {
         if (ids.Count == 0) { return new List<SysUser>(); }
-        return await this.db.Select<SysUser>()
+        return await this.GetExecutor().Select<SysUser>()
             .Where(a => ids.Contains(a.id))
             .ToListAsync();
     }
 
     async int SetStatusByIds(List<int> ids, int status) {
         if (ids.Count == 0) { return 0; }
-        return await this.db.Update<SysUser>()
+        return await this.GetExecutor().Update<SysUser>()
             .Set(a => a.status, status)
             .Set(a => a.updatedAt, WebApp.NowSeconds())
             .Where(a => ids.Contains(a.id))
@@ -190,7 +180,7 @@ class SysUserDao {
 
     async int DeleteByIds(List<int> ids) {
         if (ids.Count == 0) { return 0; }
-        return await this.db.Delete<SysUser>()
+        return await this.GetExecutor().Delete<SysUser>()
             .Where(a => ids.Contains(a.id))
             .ExecuteAffrowsAsync();
     }
@@ -200,7 +190,7 @@ class SysUserDao {
      * 接触 SQL 文本。数据边界（部门/本人范围）用类型化条件表达，仍由
      * 本 DAO 掌握，界面声明越不过权限。 */
     async int CountBy(List<OrmCond> conds, bool byDept, List<int> scoped, bool mine, int myId) {
-        return await this.db.Select<SysUser>()
+        return await this.GetExecutor().Select<SysUser>()
             .WhereConds(conds)
             .WhereIf(byDept, a => scoped.Contains(a.departmentId))
             .WhereIf(mine, a => a.id == myId)
@@ -208,7 +198,7 @@ class SysUserDao {
     }
 
     async List<SysUser> PagedListBy(List<OrmCond> conds, bool byDept, List<int> scoped, bool mine, int myId, int skip, int limit) {
-        return await this.db.Select<SysUser>()
+        return await this.GetExecutor().Select<SysUser>()
             .WhereConds(conds)
             .WhereIf(byDept, a => scoped.Contains(a.departmentId))
             .WhereIf(mine, a => a.id == myId)

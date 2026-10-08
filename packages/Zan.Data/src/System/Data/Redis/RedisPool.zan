@@ -19,6 +19,15 @@ class RedisPool {
     RedisOptions options;
     PoolCore<RedisClient> core;
 
+    /// <summary>对象序列化委托（例如 obj => Json.Serialize(obj)）。</summary>
+    public RedisSerializer Serialize;
+
+    /// <summary>对象反序列化委托（例如 (json, type) => Json.Deserialize(json, type)）。</summary>
+    public RedisDeserializer Deserialize;
+
+    /// <summary>命令执行日志与审计通知事件（FreeRedis Notice 规范）。</summary>
+    public NoticeEventHandler Notice;
+
     /// <summary>通过连接字符串构造连接池（FreeRedis 规范）。</summary>
     public RedisPool(string connectionString) : this(RedisOptions.Parse(connectionString)) {
     }
@@ -234,6 +243,13 @@ class RedisPool {
         try { return await c.GetAsync(key); } finally { this.Release(c); }
     }
 
+    /// <summary>GET key 并自动反序列化为对象类型 T。键不存在或反序列化失败返回 null/default。</summary>
+    public async T GetObjectAsync<T>(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return (T)(object)null; }
+        try { return await c.GetObjectAsync<T>(key); } finally { this.Release(c); }
+    }
+
     public async byte[] GetBytesAsync(string key) {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return null; }
@@ -258,10 +274,24 @@ class RedisPool {
         try { return await c.SetAsync(key, val); } finally { this.Release(c); }
     }
 
+    /// <summary>SET key value 将对象序列化后存入 Redis。成功返回 true。</summary>
+    public async bool SetAsync<T>(string key, T val) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SetAsync<T>(key, val); } finally { this.Release(c); }
+    }
+
     public async bool SetAsync(string key, string val, int expireSeconds) {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return false; }
         try { return await c.SetAsync(key, val, expireSeconds); } finally { this.Release(c); }
+    }
+
+    /// <summary>SET key value EX seconds 将对象序列化后带过期时间存入 Redis。</summary>
+    public async bool SetAsync<T>(string key, T val, int expireSeconds) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SetAsync<T>(key, val, expireSeconds); } finally { this.Release(c); }
     }
 
     public async bool SetAsync(string key, string val, int expireSeconds, bool nx, bool xx) {
@@ -270,10 +300,24 @@ class RedisPool {
         try { return await c.SetAsync(key, val, expireSeconds, nx, xx); } finally { this.Release(c); }
     }
 
+    /// <summary>SET key value [EX seconds] [NX|XX] 对象全功能重载。</summary>
+    public async bool SetAsync<T>(string key, T val, int expireSeconds, bool nx, bool xx) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SetAsync<T>(key, val, expireSeconds, nx, xx); } finally { this.Release(c); }
+    }
+
     public async bool SetExAsync(string key, int seconds, string val) {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return false; }
         try { return await c.SetExAsync(key, seconds, val); } finally { this.Release(c); }
+    }
+
+    /// <summary>SETEX key seconds value 对象存入并设置过期时间。</summary>
+    public async bool SetExAsync<T>(string key, int seconds, T val) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SetExAsync<T>(key, seconds, val); } finally { this.Release(c); }
     }
 
     public async bool SetNxAsync(string key, string val) {
@@ -282,10 +326,24 @@ class RedisPool {
         try { return await c.SetNxAsync(key, val); } finally { this.Release(c); }
     }
 
+    /// <summary>SETNX key value 对象键不存在时才设置，成功返回 true。</summary>
+    public async bool SetNxAsync<T>(string key, T val) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SetNxAsync<T>(key, val); } finally { this.Release(c); }
+    }
+
     public async bool SetNxAsync(string key, string val, int expireSeconds) {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return false; }
         try { return await c.SetNxAsync(key, val, expireSeconds); } finally { this.Release(c); }
+    }
+
+    /// <summary>SETNX 带过期时间设置（原子锁常用）。</summary>
+    public async bool SetNxAsync<T>(string key, T val, int expireSeconds) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SetNxAsync<T>(key, val, expireSeconds); } finally { this.Release(c); }
     }
 
     public async bool SetXxAsync(string key, string val) {
@@ -300,6 +358,13 @@ class RedisPool {
         try { return await c.SetBytesAsync(key, val); } finally { this.Release(c); }
     }
 
+    /// <summary>MGET 批量获取（变长参数平铺）。</summary>
+    public async List<string> MGetAsync(params string[] keys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.MGetAsync(keys); } finally { this.Release(c); }
+    }
+
     public async List<string> MGetAsync(List<string> keys) {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return new List<string>(); }
@@ -310,6 +375,13 @@ class RedisPool {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return false; }
         try { return await c.MSetAsync(entries); } finally { this.Release(c); }
+    }
+
+    /// <summary>MSET 批量设置（变长平铺参数：key1, val1, key2, val2, ...）。</summary>
+    public async bool MSetAsync(params string[] keyValues) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.MSetAsync(keyValues); } finally { this.Release(c); }
     }
 
     public async bool MSetAsync(Dictionary<string, string> dict) {
@@ -506,16 +578,37 @@ class RedisPool {
         try { return await c.HSetAsync(key, field, value); } finally { this.Release(c); }
     }
 
+    /// <summary>HSET 将对象序列化后存入哈希字段。</summary>
+    public async long HSetAsync<T>(string key, string field, T value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.HSetAsync<T>(key, field, value); } finally { this.Release(c); }
+    }
+
     public async bool HSetNxAsync(string key, string field, string value) {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return false; }
         try { return await c.HSetNxAsync(key, field, value); } finally { this.Release(c); }
     }
 
+    /// <summary>HSETNX 仅当字段不存在时设置对象。</summary>
+    public async bool HSetNxAsync<T>(string key, string field, T value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.HSetNxAsync<T>(key, field, value); } finally { this.Release(c); }
+    }
+
     public async string HGetAsync(string key, string field) {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return ""; }
         try { return await c.HGetAsync(key, field); } finally { this.Release(c); }
+    }
+
+    /// <summary>HGET 获取哈希字段值并反序列化为对象类型 T。键/字段不存在返回 null/default。</summary>
+    public async T HGetObjectAsync<T>(string key, string field) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return (T)(object)null; }
+        try { return await c.HGetObjectAsync<T>(key, field); } finally { this.Release(c); }
     }
 
     public async byte[] HGetBytesAsync(string key, string field) {
@@ -540,6 +633,13 @@ class RedisPool {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return false; }
         try { return await c.HMSetAsync(key, fields, values); } finally { this.Release(c); }
+    }
+
+    /// <summary>HMGET 批量获取指定字段（变长参数平铺）。</summary>
+    public async List<string> HMGetAsync(string key, params string[] fields) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.HMGetAsync(key, fields); } finally { this.Release(c); }
     }
 
     public async List<string> HMGetAsync(string key, List<string> fields) {
@@ -621,6 +721,13 @@ class RedisPool {
         try { return await c.LPushAsync(key, value); } finally { this.Release(c); }
     }
 
+    /// <summary>LPUSH 将对象序列化后推入列表左端。</summary>
+    public async long LPushAsync<T>(string key, T value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.LPushAsync<T>(key, value); } finally { this.Release(c); }
+    }
+
     public async long LPushMultipleAsync(string key, List<string> values) {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return 0; }
@@ -631,6 +738,13 @@ class RedisPool {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return 0; }
         try { return await c.RPushAsync(key, value); } finally { this.Release(c); }
+    }
+
+    /// <summary>RPUSH 将对象序列化后推入列表右端。</summary>
+    public async long RPushAsync<T>(string key, T value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.RPushAsync<T>(key, value); } finally { this.Release(c); }
     }
 
     public async long RPushMultipleAsync(string key, List<string> values) {
@@ -657,6 +771,13 @@ class RedisPool {
         try { return await c.LPopAsync(key); } finally { this.Release(c); }
     }
 
+    /// <summary>LPOP 弹出左端元素并反序列化为对象类型 T。不存在返回 null/default。</summary>
+    public async T LPopObjectAsync<T>(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return (T)(object)null; }
+        try { return await c.LPopObjectAsync<T>(key); } finally { this.Release(c); }
+    }
+
     public async byte[] LPopBytesAsync(string key) {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return null; }
@@ -667,6 +788,13 @@ class RedisPool {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return ""; }
         try { return await c.RPopAsync(key); } finally { this.Release(c); }
+    }
+
+    /// <summary>RPOP 弹出右端元素并反序列化为对象类型 T。不存在返回 null/default。</summary>
+    public async T RPopObjectAsync<T>(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return (T)(object)null; }
+        try { return await c.RPopObjectAsync<T>(key); } finally { this.Release(c); }
     }
 
     public async byte[] RPopBytesAsync(string key) {
@@ -691,6 +819,13 @@ class RedisPool {
         RedisClient c = await this.AcquireAsync();
         if (c == null) { return new List<string>(); }
         try { return await c.LRangeAsync(key, start, stop); } finally { this.Release(c); }
+    }
+
+    /// <summary>LRANGE 获取指定闭区间元素并反序列化为对象列表 List&lt;T&gt;。</summary>
+    public async List<T> LRangeObjectsAsync<T>(string key, long start, long stop) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<T>(); }
+        try { return await c.LRangeObjectsAsync<T>(key, start, stop); } finally { this.Release(c); }
     }
 
     public async bool LSetAsync(string key, long index, string value) {

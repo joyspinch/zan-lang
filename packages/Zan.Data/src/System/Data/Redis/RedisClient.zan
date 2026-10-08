@@ -43,6 +43,15 @@ class RedisClient {
     // 当作为池化客户端使用时，委托至该连接池执行
     RedisPool pool;
 
+    /// <summary>对象序列化委托（例如 obj => Json.Serialize(obj)）。</summary>
+    public RedisSerializer Serialize;
+
+    /// <summary>对象反序列化委托（例如 (json, type) => Json.Deserialize(json, type)）。</summary>
+    public RedisDeserializer Deserialize;
+
+    /// <summary>命令执行日志与审计通知事件（FreeRedis Notice 规范）。</summary>
+    public NoticeEventHandler Notice;
+
     static bool verifyTls = true;
 
     /// <summary>切换后续 ConnectSecureAsync 的证书与主机名校验。</summary>
@@ -86,6 +95,63 @@ class RedisClient {
         this.busy = false;
         this.waiters = new List<AsyncGate>();
         this.pool = null;
+        this.Serialize = null;
+        this.Deserialize = null;
+        this.Notice = null;
+    }
+
+    void FireNotice(string logText, long elapsedMs, Exception ex) {
+        if (this.Notice != null) {
+            NoticeEventArgs e = new NoticeEventArgs(logText, elapsedMs, ex);
+            this.Notice(this, e);
+        }
+        if (this.pool != null && this.pool.Notice != null) {
+            NoticeEventArgs e2 = new NoticeEventArgs(logText, elapsedMs, ex);
+            this.pool.Notice(this, e2);
+        }
+    }
+
+    string formatCmdLog(List<string> args) {
+        if (args == null || args.Count == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < args.Count; i = i + 1) {
+            if (i > 0) { sb.Append(" "); }
+            string a = args[i];
+            if (a.Length > 80) {
+                sb.Append(a.Substring(0, 77) + "...");
+            } else {
+                sb.Append(a);
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>使用绑定的序列化器将对象转为字符串。</summary>
+    public string SerializeObject(object obj) {
+        if (obj == null) { return ""; }
+        if (this.Serialize != null) {
+            return this.Serialize(obj);
+        }
+        if (this.pool != null && this.pool.Serialize != null) {
+            return this.pool.Serialize(obj);
+        }
+        return Convert.ToString(obj);
+    }
+
+    /// <summary>使用绑定的反序列化器将字符串解析为指定类型。</summary>
+    public T DeserializeObject<T>(string val) {
+        if (val == null) {
+            return (T)(object)null;
+        }
+        if (this.Deserialize != null) {
+            object obj = this.Deserialize(val, typeof(T));
+            return (T)obj;
+        }
+        if (this.pool != null && this.pool.Deserialize != null) {
+            object obj2 = this.pool.Deserialize(val, typeof(T));
+            return (T)obj2;
+        }
+        return (T)(object)val;
     }
 
     void initPool(RedisOptions opt) {
@@ -437,25 +503,42 @@ class RedisClient {
 
     /// <summary>发送命令（参数向量）并等待其回复。自动支持池化透明路由。</summary>
     async RedisReply CommandAsync(List<string> args) {
-        if (this.pool != null) {
-            RedisClient c = await this.pool.AcquireAsync();
-            if (c == null) {
-                RedisReply err = new RedisReply();
-                err.kind = RedisReply.ERROR;
-                err.str = "failed to acquire redis client from pool";
-                return err;
-            }
-            try {
-                return await c.CommandAsync(args);
-            } finally {
-                this.pool.Release(c);
-            }
-        }
-        await this.AcquireLock();
+        long start = Environment.TickCount64;
+        Exception errEx = null;
+        RedisReply r = null;
         try {
-            return await this.CommandInternalAsync(args);
+            if (this.pool != null) {
+                RedisClient c = await this.pool.AcquireAsync();
+                if (c == null) {
+                    RedisReply err = new RedisReply();
+                    err.kind = RedisReply.ERROR;
+                    err.str = "failed to acquire redis client from pool";
+                    r = err;
+                    return err;
+                }
+                try {
+                    r = await c.CommandAsync(args);
+                    return r;
+                } finally {
+                    this.pool.Release(c);
+                }
+            }
+            await this.AcquireLock();
+            try {
+                r = await this.CommandInternalAsync(args);
+                return r;
+            } finally {
+                this.ReleaseLock();
+            }
+        } catch (Exception ex) {
+            errEx = ex;
+            throw ex;
         } finally {
-            this.ReleaseLock();
+            if (this.Notice != null || (this.pool != null && this.pool.Notice != null)) {
+                long el = Environment.TickCount64 - start;
+                string log = this.formatCmdLog(args);
+                this.FireNotice(log, el, errEx);
+            }
         }
     }
 
@@ -477,25 +560,42 @@ class RedisClient {
 
     /// <summary>发送带二进制参数的命令（如 SET key <byte[]>）并等待回复。</summary>
     async RedisReply CommandBytesAsync(List<string> prefixArgs, byte[] binaryArg) {
-        if (this.pool != null) {
-            RedisClient c = await this.pool.AcquireAsync();
-            if (c == null) {
-                RedisReply err = new RedisReply();
-                err.kind = RedisReply.ERROR;
-                err.str = "failed to acquire redis client from pool";
-                return err;
-            }
-            try {
-                return await c.CommandBytesAsync(prefixArgs, binaryArg);
-            } finally {
-                this.pool.Release(c);
-            }
-        }
-        await this.AcquireLock();
+        long start = Environment.TickCount64;
+        Exception errEx = null;
+        RedisReply r = null;
         try {
-            return await this.CommandBytesInternalAsync(prefixArgs, binaryArg);
+            if (this.pool != null) {
+                RedisClient c = await this.pool.AcquireAsync();
+                if (c == null) {
+                    RedisReply err = new RedisReply();
+                    err.kind = RedisReply.ERROR;
+                    err.str = "failed to acquire redis client from pool";
+                    r = err;
+                    return err;
+                }
+                try {
+                    r = await c.CommandBytesAsync(prefixArgs, binaryArg);
+                    return r;
+                } finally {
+                    this.pool.Release(c);
+                }
+            }
+            await this.AcquireLock();
+            try {
+                r = await this.CommandBytesInternalAsync(prefixArgs, binaryArg);
+                return r;
+            } finally {
+                this.ReleaseLock();
+            }
+        } catch (Exception ex) {
+            errEx = ex;
+            throw ex;
         } finally {
-            this.ReleaseLock();
+            if (this.Notice != null || (this.pool != null && this.pool.Notice != null)) {
+                long el = Environment.TickCount64 - start;
+                string log = this.formatCmdLog(prefixArgs) + " <bytes:" + Convert.ToString(binaryArg != null ? binaryArg.Length : 0) + ">";
+                this.FireNotice(log, el, errEx);
+            }
         }
     }
 
@@ -635,6 +735,15 @@ class RedisClient {
         return r.AsString();
     }
 
+    /// <summary>GET key 并自动反序列化为对象类型 T。键不存在或反序列化失败返回 null/default。</summary>
+    async T GetObjectAsync<T>(string key) {
+        string raw = await this.GetAsync(key);
+        if (raw == null || raw == "") {
+            return (T)(object)null;
+        }
+        return this.DeserializeObject<T>(raw);
+    }
+
     /// <summary>二进制安全的 GET：返回原始字节数组。键不存在返回 null。</summary>
     async byte[] GetBytesAsync(string key) {
         RedisReply r = await this.CommandAsync2("GET", key);
@@ -709,12 +818,58 @@ class RedisClient {
         return await this.SetAsync(key, val, 0, false, true);
     }
 
+    /// <summary>SET key value 将对象序列化后存入 Redis。成功返回 true。</summary>
+    async bool SetAsync<T>(string key, T val) {
+        string s = this.SerializeObject((object)val);
+        return await this.SetAsync(key, s);
+    }
+
+    /// <summary>SET key value EX seconds 将对象序列化后带过期时间存入 Redis。</summary>
+    async bool SetAsync<T>(string key, T val, int expireSeconds) {
+        string s = this.SerializeObject((object)val);
+        return await this.SetAsync(key, s, expireSeconds);
+    }
+
+    /// <summary>SET key value [EX seconds] [NX|XX] 对象全功能重载。</summary>
+    async bool SetAsync<T>(string key, T val, int expireSeconds, bool nx, bool xx) {
+        string s = this.SerializeObject((object)val);
+        return await this.SetAsync(key, s, expireSeconds, nx, xx);
+    }
+
+    /// <summary>SETEX key seconds value 对象存入并设置过期时间。</summary>
+    async bool SetExAsync<T>(string key, int seconds, T val) {
+        string s = this.SerializeObject((object)val);
+        return await this.SetExAsync(key, seconds, s);
+    }
+
+    /// <summary>SETNX key value 对象键不存在时才设置，成功返回 true。</summary>
+    async bool SetNxAsync<T>(string key, T val) {
+        string s = this.SerializeObject((object)val);
+        return await this.SetNxAsync(key, s);
+    }
+
+    /// <summary>SETNX 带过期时间设置（原子锁常用）。</summary>
+    async bool SetNxAsync<T>(string key, T val, int expireSeconds) {
+        string s = this.SerializeObject((object)val);
+        return await this.SetNxAsync(key, s, expireSeconds);
+    }
+
     /// <summary>二进制安全 SET。</summary>
     async bool SetBytesAsync(string key, byte[] val) {
         if (val == null) { return false; }
         List<string> args = new List<string>{ "SET", key };
         RedisReply r = await this.CommandBytesAsync(args, val);
         return r.IsString() && r.AsString() == "OK";
+    }
+
+    /// <summary>MGET 批量获取（变长参数平铺）。</summary>
+    async List<string> MGetAsync(params string[] keys) {
+        List<string> list = new List<string>();
+        if (keys == null) { return list; }
+        for (int i = 0; i < keys.Length; i = i + 1) {
+            list.Add(keys[i]);
+        }
+        return await this.MGetAsync(list);
     }
 
     /// <summary>MGET 批量获取。</summary>
@@ -732,6 +887,16 @@ class RedisClient {
 
     /// <summary>MSET 批量设置实体列表。</summary>
     async bool MSetAsync(List<RedisEntry> entries) {
+        return await this.MSetEntriesAsync(entries);
+    }
+
+    /// <summary>MSET 批量设置（变长平铺参数：key1, val1, key2, val2, ...）。</summary>
+    async bool MSetAsync(params string[] keyValues) {
+        if (keyValues == null || keyValues.Length < 2) { return false; }
+        List<RedisEntry> entries = new List<RedisEntry>();
+        for (int i = 0; i + 1 < keyValues.Length; i = i + 2) {
+            entries.Add(new RedisEntry(keyValues[i], keyValues[i + 1]));
+        }
         return await this.MSetEntriesAsync(entries);
     }
 
@@ -1003,6 +1168,12 @@ class RedisClient {
         return r.AsLong();
     }
 
+    /// <summary>HSET 将对象序列化后存入哈希字段。</summary>
+    async long HSetAsync<T>(string key, string field, T value) {
+        string s = this.SerializeObject((object)value);
+        return await this.HSetAsync(key, field, s);
+    }
+
     /// <summary>HSETNX 仅当字段不存在时设置。</summary>
     async bool HSetNxAsync(string key, string field, string value) {
         List<string> args = new List<string>{ "HSETNX", key, field, value };
@@ -1010,11 +1181,26 @@ class RedisClient {
         return r.AsInt() == 1;
     }
 
+    /// <summary>HSETNX 仅当字段不存在时设置对象。</summary>
+    async bool HSetNxAsync<T>(string key, string field, T value) {
+        string s = this.SerializeObject((object)value);
+        return await this.HSetNxAsync(key, field, s);
+    }
+
     /// <summary>HGET 获取字段值。</summary>
     async string HGetAsync(string key, string field) {
         RedisReply r = await this.CommandAsync3("HGET", key, field);
         if (r.IsNil()) { return ""; }
         return r.AsString();
+    }
+
+    /// <summary>HGET 获取哈希字段值并反序列化为对象类型 T。键/字段不存在返回 null/default。</summary>
+    async T HGetObjectAsync<T>(string key, string field) {
+        string raw = await this.HGetAsync(key, field);
+        if (raw == null || raw == "") {
+            return (T)(object)null;
+        }
+        return this.DeserializeObject<T>(raw);
     }
 
     /// <summary>HGET 二进制安全获取。</summary>
@@ -1065,6 +1251,16 @@ class RedisClient {
         }
         RedisReply r = await this.CommandAsync(args);
         return r.AsString() == "OK";
+    }
+
+    /// <summary>HMGET 批量获取指定字段（变长参数平铺）。</summary>
+    async List<string> HMGetAsync(string key, params string[] fields) {
+        List<string> list = new List<string>();
+        if (fields == null) { return list; }
+        for (int i = 0; i < fields.Length; i = i + 1) {
+            list.Add(fields[i]);
+        }
+        return await this.HMGetAsync(key, list);
     }
 
     /// <summary>HMGET 批量获取指定字段。</summary>
@@ -1176,6 +1372,12 @@ class RedisClient {
         return r.AsLong();
     }
 
+    /// <summary>LPUSH 将对象序列化后推入列表左端。</summary>
+    async long LPushAsync<T>(string key, T value) {
+        string s = this.SerializeObject((object)value);
+        return await this.LPushAsync(key, s);
+    }
+
     /// <summary>LPUSH 批量推入多个元素到左端。</summary>
     async long LPushMultipleAsync(string key, List<string> values) {
         if (values == null || values.Count == 0) { return 0; }
@@ -1191,6 +1393,12 @@ class RedisClient {
     async long RPushAsync(string key, string value) {
         RedisReply r = await this.CommandAsync3("RPUSH", key, value);
         return r.AsLong();
+    }
+
+    /// <summary>RPUSH 将对象序列化后推入列表右端。</summary>
+    async long RPushAsync<T>(string key, T value) {
+        string s = this.SerializeObject((object)value);
+        return await this.RPushAsync(key, s);
     }
 
     /// <summary>RPUSH 批量推入多个元素到右端。</summary>
@@ -1223,6 +1431,15 @@ class RedisClient {
         return r.AsString();
     }
 
+    /// <summary>LPOP 弹出左端元素并反序列化为对象类型 T。不存在返回 null/default。</summary>
+    async T LPopObjectAsync<T>(string key) {
+        string raw = await this.LPopAsync(key);
+        if (raw == null || raw == "") {
+            return (T)(object)null;
+        }
+        return this.DeserializeObject<T>(raw);
+    }
+
     /// <summary>LPOP 二进制安全弹出。</summary>
     async byte[] LPopBytesAsync(string key) {
         RedisReply r = await this.CommandAsync2("LPOP", key);
@@ -1235,6 +1452,15 @@ class RedisClient {
         RedisReply r = await this.CommandAsync2("RPOP", key);
         if (r.IsNil()) { return ""; }
         return r.AsString();
+    }
+
+    /// <summary>RPOP 弹出右端元素并反序列化为对象类型 T。不存在返回 null/default。</summary>
+    async T RPopObjectAsync<T>(string key) {
+        string raw = await this.RPopAsync(key);
+        if (raw == null || raw == "") {
+            return (T)(object)null;
+        }
+        return this.DeserializeObject<T>(raw);
     }
 
     /// <summary>RPOP 二进制安全弹出。</summary>
@@ -1263,6 +1489,22 @@ class RedisClient {
         List<string> args = new List<string>{ "LRANGE", key, Convert.ToString(start), Convert.ToString(stop) };
         RedisReply r = await this.CommandAsync(args);
         return r.AsListString();
+    }
+
+    /// <summary>LRANGE 获取指定闭区间元素并反序列化为对象列表 List&lt;T&gt;。</summary>
+    async List<T> LRangeObjectsAsync<T>(string key, long start, long stop) {
+        List<string> rawList = await this.LRangeAsync(key, start, stop);
+        List<T> res = new List<T>();
+        if (rawList == null) { return res; }
+        for (int i = 0; i < rawList.Count; i = i + 1) {
+            string raw = rawList[i];
+            if (raw == null || raw == "") {
+                res.Add((T)(object)null);
+            } else {
+                res.Add(this.DeserializeObject<T>(raw));
+            }
+        }
+        return res;
     }
 
     /// <summary>LSET 设置指定索引处的元素值。</summary>
