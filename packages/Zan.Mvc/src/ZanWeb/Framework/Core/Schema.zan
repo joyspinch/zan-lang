@@ -12,7 +12,7 @@ using ZanWeb.Security;
 namespace ZanWeb.Core;
 
 /* 表结构 + 种子数据，启动时由 ZanWeb.Boot 一次性应用。CodeFirst (SyncStructure) 读取数据库目录发 DDL，不做每次请求触发。种子带计数保护，重复启动不变。权限仅 seed 内置角色持有哪些 action，其余从路由表派生。业务表的种子经 OnSeed 挂点由应用侧注册——模型与 DAO 都在应用里，框架不预设任何业务。*/
-async delegate bool SeedFn(IDbConnection db);
+async delegate bool SeedFn(IFreeSql fsql);
 
 class Schema {
     /* 迁移互斥租约与等待参数。租约有效期必须远大于一次完整迁移的
@@ -49,7 +49,9 @@ class Schema {
     }
 
     /* Apply 是 Ensure 的租约内主体：WAL → 全量 CodeFirst → 标志回填 →
-       种子。每一步都幂等，等待租约的 worker 轮到后重跑一遍是快速 no-op。*/
+       种子。每一步都幂等，等待租约的 worker 轮到后重跑一遍是快速 no-op。
+       WAL/CodeFirst/锁表是引导协议，留在引导连接上；种子查询走同一连接
+       派生的 FreeSql 门面。*/
     static async bool Apply(IDbConnection db) {
         /* SQLite 启用 WAL（其他引擎无操作）：多 worker 共享文件时避免写者阻塞读者。*/
         await DbSchema.UseWriteAheadLogAsync(db);
@@ -57,13 +59,14 @@ class Schema {
         await db.SyncStructureAllAsync();
         await BackfillGenFlags(db);
 
-        if (!await SeedAdmin(db)) { return false; }
-        if (!await SeedRoles(db)) { return false; }
-        if (!await SeedDepartments(db)) { return false; }
-        if (!await SeedDicts(db)) { return false; }
-        if (!await SeedSettings(db)) { return false; }
-        if (!await SeedJobs(db)) { return false; }
-        if (!await RunSeed(db)) { return false; }
+        IFreeSql fsql = FreeSql.FromConnection(db);
+        if (!await SeedAdmin(fsql)) { return false; }
+        if (!await SeedRoles(fsql)) { return false; }
+        if (!await SeedDepartments(fsql)) { return false; }
+        if (!await SeedDicts(fsql)) { return false; }
+        if (!await SeedSettings(fsql)) { return false; }
+        if (!await SeedJobs(fsql)) { return false; }
+        if (!await RunSeed(fsql)) { return false; }
         return true;
     }
 
@@ -165,19 +168,20 @@ class Schema {
     }
 
     /* 空库仅在明确配置强口令时创建引导账号；无配置则拒绝启动。*/
-    static async bool SeedAdmin(IDbConnection db) {
-        SysUserDao users = new SysUserDao(db);
-        int have = await users.Count();
+    static async bool SeedAdmin(IFreeSql fsql) {
+        int have = await fsql.Select<SysUser>().CountAsync();
         string password = Cfg.Auth.bootstrapPassword;
         if (have > 0) {
             /* 旧部署若仍使用公开的初始密码，必须更换后才能继续服务。*/
-            SysUser legacy = await users.ByUsername("admin");
+            SysUserDao dao = new SysUserDao(fsql);
+            SysUser legacy = await dao.ByUsername("admin");
             if (legacy != null && legacy.isSuper == 1 &&
                 AuthUser.Verify("admin1234", legacy.passwordSalt, legacy.passwordHash)) {
                 if (password == null || password.Length < 12 || password == "admin1234") {
                     throw new Exception("legacy admin password must be rotated with auth.bootstrapPassword or ZAN_BOOTSTRAP_ADMIN_PASSWORD");
                 }
-                int changed = await users.ResetPassword(legacy.id, "", AuthUser.NewHash(password), WebApp.NowSeconds());
+                int changed = await dao.ResetPassword(legacy.id, "",
+                    AuthUser.NewHash(password), WebApp.NowSeconds());
                 if (changed < 1) { throw new Exception("legacy admin password rotation failed"); }
             }
             return true;
@@ -194,22 +198,22 @@ class Schema {
         admin.isSuper = 1;
         admin.tokenVersion = 1;
         admin.createdAt = WebApp.NowSeconds();
-        int _id = await users.Insert(admin);
+        int _id = await fsql.Insert<SysUser>(admin).ExecuteIdentityAsync();
         return _id > 0;
     }
 
     /* 两个内置角色：admin（全部管理）和 editor（仅内容管理）。bootstrap 账号绕过角色表，防止误操作锁死。具体权限由 SyncRoleGrants 从路由表填充。*/
-    static async bool SeedRoles(IDbConnection db) {
-        int have = await db.Select<SysRole>().CountAsync();
+    static async bool SeedRoles(IFreeSql fsql) {
+        int have = await fsql.Select<SysRole>().CountAsync();
         if (have > 0) { return true; }
-        int _admin = await AddRole(db, "系统管理员", "admin", 1,
+        int _admin = await AddRole(fsql, "系统管理员", "admin", 1,
             "除超级管理员外的全部管理权限", DataScope.RoleAll);
-        int _editor = await AddRole(db, "内容编辑", "editor", 10,
+        int _editor = await AddRole(fsql, "内容编辑", "editor", 10,
             "只能管理博客内容", DataScope.RoleAll);
         return _admin > 0 && _editor > 0;
     }
 
-    static async int AddRole(IDbConnection db, string name, string code, int rank,
+    static async int AddRole(IFreeSql fsql, string name, string code, int rank,
                           string description, int dataScope) {
         SysRole r = new SysRole();
         r.name = name;
@@ -222,29 +226,29 @@ class Schema {
         r.scopeDepts = "";
         r.createdAt = WebApp.NowSeconds();
         r.updatedAt = r.createdAt;
-        return await db.Insert<SysRole>(r).ExecuteIdentityAsync();
+        return await fsql.Insert<SysRole>(r).ExecuteIdentityAsync();
     }
 
-    static async bool Grant(IDbConnection db, int roleId, string screen, int mask,
+    static async bool Grant(IFreeSql fsql, int roleId, string screen, int mask,
                             long now) {
         SysRoleGrant g = new SysRoleGrant();
         g.roleId = roleId;
         g.action = screen;
         g.mask = mask;
         g.createdAt = now;
-        int _id = await db.Insert<SysRoleGrant>(g).ExecuteIdentityAsync();
+        int _id = await fsql.Insert<SysRoleGrant>(g).ExecuteIdentityAsync();
         return _id > 0;
     }
 
-    static async bool SeedDepartments(IDbConnection db) {
-        int have = await db.Select<SysDepartment>().CountAsync();
+    static async bool SeedDepartments(IFreeSql fsql) {
+        int have = await fsql.Select<SysDepartment>().CountAsync();
         if (have > 0) { return true; }
-        if (!await AddDept(db, 0, "总部", "root", 1)) { return false; }
-        if (!await AddDept(db, 1, "技术部", "tech", 2)) { return false; }
-        return await AddDept(db, 1, "内容运营", "content", 3);
+        if (!await AddDept(fsql, 0, "总部", "root", 1)) { return false; }
+        if (!await AddDept(fsql, 1, "技术部", "tech", 2)) { return false; }
+        return await AddDept(fsql, 1, "内容运营", "content", 3);
     }
 
-    static async bool AddDept(IDbConnection db, int parentId, string name,
+    static async bool AddDept(IFreeSql fsql, int parentId, string name,
                            string code, int sortOrder) {
         SysDepartment d = new SysDepartment();
         d.parentId = parentId;
@@ -253,22 +257,22 @@ class Schema {
         d.leaderUserId = 0;
         d.sortOrder = sortOrder;
         d.status = 1;
-        int _id = await db.Insert<SysDepartment>(d).ExecuteIdentityAsync();
+        int _id = await fsql.Insert<SysDepartment>(d).ExecuteIdentityAsync();
         return _id > 0;
     }
 
-    static async bool SeedDicts(IDbConnection db) {
-        int have = await db.Select<SysDictType>().CountAsync();
+    static async bool SeedDicts(IFreeSql fsql) {
+        int have = await fsql.Select<SysDictType>().CountAsync();
         if (have > 0) { return true; }
-        if (!await AddDictType(db, "user_status", "账号状态")) { return false; }
-        if (!await AddDictItem(db, "user_status", "1", "启用", 1)) { return false; }
-        if (!await AddDictItem(db, "user_status", "0", "禁用", 2)) { return false; }
-        if (!await AddDictType(db, "post_status", "文章状态")) { return false; }
-        if (!await AddDictItem(db, "post_status", "1", "已发布", 1)) { return false; }
-        return await AddDictItem(db, "post_status", "0", "草稿", 2);
+        if (!await AddDictType(fsql, "user_status", "账号状态")) { return false; }
+        if (!await AddDictItem(fsql, "user_status", "1", "启用", 1)) { return false; }
+        if (!await AddDictItem(fsql, "user_status", "0", "禁用", 2)) { return false; }
+        if (!await AddDictType(fsql, "post_status", "文章状态")) { return false; }
+        if (!await AddDictItem(fsql, "post_status", "1", "已发布", 1)) { return false; }
+        return await AddDictItem(fsql, "post_status", "0", "草稿", 2);
     }
 
-    static async bool AddDictType(IDbConnection db, string code, string name) {
+    static async bool AddDictType(IFreeSql fsql, string code, string name) {
         SysDictType t = new SysDictType();
         t.code = code;
         t.name = name;
@@ -276,11 +280,11 @@ class Schema {
         t.description = "";
         t.createdAt = WebApp.NowSeconds();
         t.updatedAt = t.createdAt;
-        int _id = await db.Insert<SysDictType>(t).ExecuteIdentityAsync();
+        int _id = await fsql.Insert<SysDictType>(t).ExecuteIdentityAsync();
         return _id > 0;
     }
 
-    static async bool AddDictItem(IDbConnection db, string typeCode, string value,
+    static async bool AddDictItem(IFreeSql fsql, string typeCode, string value,
                             string label, int sortOrder) {
         SysDictItem it = new SysDictItem();
         it.typeCode = typeCode;
@@ -290,98 +294,99 @@ class Schema {
         it.status = 1;
         it.createdAt = WebApp.NowSeconds();
         it.updatedAt = it.createdAt;
-        int _id = await db.Insert<SysDictItem>(it).ExecuteIdentityAsync();
+        int _id = await fsql.Insert<SysDictItem>(it).ExecuteIdentityAsync();
         return _id > 0;
     }
 
-    static async bool SeedSettings(IDbConnection db) {
-        int have = await db.Select<SysSiteSetting>().CountAsync();
+    static async bool SeedSettings(IFreeSql fsql) {
+        int have = await fsql.Select<SysSiteSetting>().CountAsync();
         if (have > 0) {
-            return await SeedFeatureSettings(db);
+            return await SeedFeatureSettings(fsql);
         }
-        if (!await AddSetting(db, "基本", "site.title", "站点名称", "Zan",
+        if (!await AddSetting(fsql, "基本", "site.title", "站点名称", "Zan",
             "text", "浏览器标题与页脚使用", 1)) { return false; }
-        if (!await AddSetting(db, "基本", "site.subtitle", "副标题",
+        if (!await AddSetting(fsql, "基本", "site.subtitle", "副标题",
             "熟悉的语法，原生的速度", "text", "", 2)) { return false; }
-        if (!await AddSetting(db, "基本", "site.description", "站点描述", "",
+        if (!await AddSetting(fsql, "基本", "site.description", "站点描述", "",
             "textarea", "写入首页 meta description", 3)) { return false; }
-        if (!await AddSetting(db, "基本", "site.keywords", "关键词", "Zan,编译型语言,ZanWeb",
+        if (!await AddSetting(fsql, "基本", "site.keywords", "关键词", "Zan,编译型语言,ZanWeb",
             "text", "逗号分隔，写入 meta keywords", 4)) { return false; }
-        if (!await AddSetting(db, "备案", "site.icp", "ICP 备案号", "",
+        if (!await AddSetting(fsql, "备案", "site.icp", "ICP 备案号", "",
             "text", "显示在页脚并链接到工信部查询页", 10)) { return false; }
-        if (!await AddSetting(db, "备案", "site.police", "公安备案号", "",
+        if (!await AddSetting(fsql, "备案", "site.police", "公安备案号", "",
             "text", "", 11)) { return false; }
-        if (!await AddSetting(db, "页脚", "site.copyright", "版权信息", "",
+        if (!await AddSetting(fsql, "页脚", "site.copyright", "版权信息", "",
             "text", "", 20)) { return false; }
-        if (!await AddSetting(db, "页脚", "site.contact", "联系方式", "",
+        if (!await AddSetting(fsql, "页脚", "site.contact", "联系方式", "",
             "text", "", 21)) { return false; }
-        if (!await AddSetting(db, "统计", "site.analytics", "统计代码", "",
+        if (!await AddSetting(fsql, "统计", "site.analytics", "统计代码", "",
             "textarea", "原样输出到页面底部，只接受可信来源的脚本", 30)) { return false; }
-        return await SeedFeatureSettings(db);
+        return await SeedFeatureSettings(fsql);
     }
 
-    static async bool SeedFeatureSettings(IDbConnection db) {
-        if (!await EnsureSetting(db, "内容与评论", "blog.comment.enabled",
+    static async bool SeedFeatureSettings(IFreeSql fsql) {
+        if (!await EnsureSetting(fsql, "内容与评论", "blog.comment.enabled",
             "开放评论", "1", "switch", "关闭后前台不再显示评论框，已有评论仍可在后台查看", 40)) { return false; }
-        if (!await EnsureSetting(db, "内容与评论", "blog.comment.review",
+        if (!await EnsureSetting(fsql, "内容与评论", "blog.comment.review",
             "评论需审核", "1", "switch", "开启时新评论要在后台通过后才公开显示", 41)) { return false; }
-        if (!await EnsureSetting(db, "基本", "site.timezone", "时区偏移",
+        if (!await EnsureSetting(fsql, "基本", "site.timezone", "时区偏移",
             "480", "text",
             "与 UTC 的分钟偏移，例如 480 表示 UTC+8（北京时间）；服务器在境外时按此换算显示",
             5)) { return false; }
-        if (!await EnsureSetting(db, "基本", "site.language", "界面语言",
+        if (!await EnsureSetting(fsql, "基本", "site.language", "界面语言",
             "zh-CN", "text",
             "管理后台界面语言：zh-CN 或 en-US；语言包在部署目录 i18n/ 下", 6)) { return false; }
-        if (!await EnsureSetting(db, "基本", "site.url", "站点地址",
+        if (!await EnsureSetting(fsql, "基本", "site.url", "站点地址",
             "", "text",
             "如 https://example.com；RSS、sitemap、robots 用它拼绝对链接，留空则按请求的 Host 推导",
             7)) { return false; }
-        if (!await EnsureSetting(db, "注册登录", "auth.register.enabled",
+        if (!await EnsureSetting(fsql, "注册登录", "auth.register.enabled",
             "开放注册", "0", "switch", "关闭后前台隐藏注册入口并拒绝注册请求", 50)) { return false; }
-        if (!await EnsureSetting(db, "注册登录", "auth.register.verify",
+        if (!await EnsureSetting(fsql, "注册登录", "auth.register.verify",
             "注册需邮箱验证码", "1", "switch", "需要先配置好邮件服务", 51)) { return false; }
-        if (!await EnsureSetting(db, "注册登录", "auth.reset.enabled",
+        if (!await EnsureSetting(fsql, "注册登录", "auth.reset.enabled",
             "允许找回密码", "1", "switch", "通过邮箱验证码重设密码", 52)) { return false; }
-        if (!await EnsureSetting(db, "邮件服务", "mail.host", "SMTP 主机", "",
+        if (!await EnsureSetting(fsql, "邮件服务", "mail.host", "SMTP 主机", "",
             "text", "例如 smtp.qq.com", 60)) { return false; }
-        if (!await EnsureSetting(db, "邮件服务", "mail.port", "端口", "465",
+        if (!await EnsureSetting(fsql, "邮件服务", "mail.port", "端口", "465",
             "text", "465 直连 TLS，587 STARTTLS，25 明文", 61)) { return false; }
-        if (!await EnsureSetting(db, "邮件服务", "mail.ssl", "使用 TLS", "1",
+        if (!await EnsureSetting(fsql, "邮件服务", "mail.ssl", "使用 TLS", "1",
             "switch", "465 端口保持开启", 62)) { return false; }
-        if (!await EnsureSetting(db, "邮件服务", "mail.user", "账号", "",
+        if (!await EnsureSetting(fsql, "邮件服务", "mail.user", "账号", "",
             "text", "", 63)) { return false; }
-        if (!await EnsureSetting(db, "邮件服务", "mail.pass", "密码 / 授权码", "",
+        if (!await EnsureSetting(fsql, "邮件服务", "mail.pass", "密码 / 授权码", "",
             "password", "多数邮箱要求使用授权码而不是登录密码", 64)) { return false; }
-        if (!await EnsureSetting(db, "邮件服务", "mail.from", "发件邮箱", "",
+        if (!await EnsureSetting(fsql, "邮件服务", "mail.from", "发件邮箱", "",
             "text", "留空则使用账号", 65)) { return false; }
-        if (!await EnsureSetting(db, "邮件服务", "mail.fromName", "发件人名称", "",
+        if (!await EnsureSetting(fsql, "邮件服务", "mail.fromName", "发件人名称", "",
             "text", "", 66)) { return false; }
-        if (!await EnsureSetting(db, "AI 助手", "ai.enabled", "启用助手", "0",
+        if (!await EnsureSetting(fsql, "AI 助手", "ai.enabled", "启用助手", "0",
             "switch", "开启后右下角的助手可以对话", 70)) { return false; }
-        if (!await EnsureSetting(db, "AI 助手", "ai.provider", "服务商", "deepseek",
+        if (!await EnsureSetting(fsql, "AI 助手", "ai.provider", "服务商", "deepseek",
             "text", "从下方预设中选择后自动填写", 71)) { return false; }
-        if (!await EnsureSetting(db, "AI 助手", "ai.baseUrl", "接口地址",
+        if (!await EnsureSetting(fsql, "AI 助手", "ai.baseUrl", "接口地址",
             "https://api.deepseek.com/v1", "text",
             "OpenAI 兼容协议，末尾不带 /chat/completions", 72)) { return false; }
-        if (!await EnsureSetting(db, "AI 助手", "ai.apiKey", "API Key", "",
+        if (!await EnsureSetting(fsql, "AI 助手", "ai.apiKey", "API Key", "",
             "password", "只保存在服务端，页面不回显", 73)) { return false; }
-        if (!await EnsureSetting(db, "AI 助手", "ai.model", "模型",
+        if (!await EnsureSetting(fsql, "AI 助手", "ai.model", "模型",
             "deepseek-chat", "text", "", 74)) { return false; }
-        if (!await EnsureSetting(db, "AI 助手", "ai.temperature", "温度", "0.3",
+        if (!await EnsureSetting(fsql, "AI 助手", "ai.temperature", "温度", "0.3",
             "number", "0 更稳定，1 更发散", 75)) { return false; }
-        return await EnsureSetting(db, "开发", "gen.root", "源码目录", "..",
+        return await EnsureSetting(fsql, "开发", "gen.root", "源码目录", "..",
             "text", "生成代码写入此目录，相对服务进程工作目录解释；需为包含 src 与 views 的应用源码根目录，生产发布建议填绝对路径", 80);
     }
 
-    static async bool EnsureSetting(IDbConnection db, string groupName, string name,
+    static async bool EnsureSetting(IFreeSql fsql, string groupName, string name,
                                 string label, string value, string kind,
                                 string tip, int sortOrder) {
-        int have = await db.Select<SysSiteSetting>().Where(a => a.name == name).CountAsync();
+        int have = await fsql.Select<SysSiteSetting>()
+            .Where(a => a.name == name).CountAsync();
         if (have > 0) { return true; }
-        return await AddSetting(db, groupName, name, label, value, kind, tip, sortOrder);
+        return await AddSetting(fsql, groupName, name, label, value, kind, tip, sortOrder);
     }
 
-    static async bool AddSetting(IDbConnection db, string groupName, string name,
+    static async bool AddSetting(IFreeSql fsql, string groupName, string name,
                              string label, string value, string kind,
                              string tip, int sortOrder) {
         SysSiteSetting s = new SysSiteSetting();
@@ -393,7 +398,7 @@ class Schema {
         s.tip = tip;
         s.sortOrder = sortOrder;
         s.updatedAt = WebApp.NowSeconds();
-        int _id = await db.Insert<SysSiteSetting>(s).ExecuteIdentityAsync();
+        int _id = await fsql.Insert<SysSiteSetting>(s).ExecuteIdentityAsync();
         return _id > 0;
     }
 
@@ -402,16 +407,16 @@ class Schema {
        启动时在系统种子之后、同一连接上执行；未注册即 no-op。 */
     static SeedFn onSeed;
 
-    /* 注册业务种子。fn 收到与系统种子相同的连接；返回 false 视为种子未完成
-       （服务器仍启动，与库不可达同语义）。 */
+    /* 注册业务种子。fn 收到与系统种子相同的 FreeSql 门面（同一引导连接派生）；
+       返回 false 视为种子未完成（服务器仍启动，与库不可达同语义）。 */
     static void OnSeed(SeedFn fn) {
         onSeed = fn;
     }
 
     /* 供 Ensure 调用：未注册业务种子时直接成功。 */
-    static async bool RunSeed(IDbConnection db) {
+    static async bool RunSeed(IFreeSql fsql) {
         if (onSeed == null) { return true; }
-        return await onSeed(db);
+        return await onSeed(fsql);
     }
 
     
@@ -419,8 +424,8 @@ class Schema {
     /* 存在的权限 = 路由表。部署决策写入 sys_role_grant 行。内置 admin 始终覆盖全部管理屏，内置 editor 始终覆盖内容屏。本方法只 INSERT，操作者撤销的权限不会被重新添加。*/
 
     /* 将 mask=0 的旧授权行按 screen 合并为一条屏掩码行；仅 mask=0 的行参与，第二次启动起即 no-op。未声明位的 action 丢弃并在 Perm.Index boot 行提示。*/
-    static async bool MigrateGrants(IDbConnection db) {
-        List<SysRoleGrant> old = await db.Select<SysRoleGrant>()
+    static async bool MigrateGrants(IFreeSql fsql) {
+        List<SysRoleGrant> old = await fsql.Select<SysRoleGrant>()
             .Where(a => a.mask == 0).ToListAsync();
         if (old.Count == 0) { return true; }
 
@@ -437,7 +442,7 @@ class Schema {
             else { masks[at] = masks[at] | bit; }
         }
 
-        int _gone = await db.Delete<SysRoleGrant>().Where(a => a.mask == 0)
+        int _gone = await fsql.Delete<SysRoleGrant>().Where(a => a.mask == 0)
             .ExecuteAffrowsAsync();
         long now = WebApp.NowSeconds();
         for (int i = 0; i < keys.Count; i = i + 1) {
@@ -445,17 +450,17 @@ class Schema {
             int bar = key.IndexOf("|");
             int roleId = Convert.ToInt32(key.Substring(0, bar));
             string screen = key.Substring(bar + 1);
-            SysRoleGrant have = await db.Select<SysRoleGrant>()
+            SysRoleGrant have = await fsql.Select<SysRoleGrant>()
                 .Where(a => a.roleId == roleId && a.action == screen)
                 .FirstAsync();
             if (have != null) {
                 int merged = have.mask | masks[i];
-                int _n = await db.Update<SysRoleGrant>()
+                int _n = await fsql.Update<SysRoleGrant>()
                     .Set(a => a.mask, merged)
                     .Where(a => a.id == have.id).ExecuteAffrowsAsync();
                 continue;
             }
-            if (!await Grant(db, roleId, screen, masks[i], now)) { return false; }
+            if (!await Grant(fsql, roleId, screen, masks[i], now)) { return false; }
         }
         Console.WriteLine("[rbac] 旧授权已合并为 "
             + Convert.ToString(keys.Count) + " 条屏掩码");
@@ -463,8 +468,8 @@ class Schema {
     }
 
     /* 将不再存在的旧屏键迁移到带模块前缀的新键；无匹配或多匹配的不动并在日志中标出。*/
-    static async bool MigrateGrantKeys(IDbConnection db) {
-        List<SysRoleGrant> rows = await db.Select<SysRoleGrant>()
+    static async bool MigrateGrantKeys(IFreeSql fsql) {
+        List<SysRoleGrant> rows = await fsql.Select<SysRoleGrant>()
             .Where(a => a.mask != 0).ToListAsync();
         int moved = 0;
         List<string> stray = new List<string>();
@@ -474,7 +479,7 @@ class Schema {
             string now = Perm.Qualify(g.action);
             if (now.Length == 0) { stray.Add(g.action); continue; }
             int gid = g.id;
-            int _n = await db.Update<SysRoleGrant>().Set(a => a.action, now)
+            int _n = await fsql.Update<SysRoleGrant>().Set(a => a.action, now)
                 .Where(a => a.id == gid).ExecuteAffrowsAsync();
             moved = moved + 1;
         }
@@ -494,16 +499,17 @@ class Schema {
     static async bool SyncRoleGrants(WebApp app) {
         IDbConnection db = await AuthUser.Lease();
         if (db == null) { return false; }
+        IFreeSql fsql = FreeSql.FromConnection(db);
         try {
-            if (!await MigrateGrants(db)) { return false; }
-            if (!await MigrateGrantKeys(db)) { return false; }
-            SysRole admin = await db.Select<SysRole>()
+            if (!await MigrateGrants(fsql)) { return false; }
+            if (!await MigrateGrantKeys(fsql)) { return false; }
+            SysRole admin = await fsql.Select<SysRole>()
                 .Where(a => a.code == "admin").FirstAsync();
-            SysRole editor = await db.Select<SysRole>()
+            SysRole editor = await fsql.Select<SysRole>()
                 .Where(a => a.code == "editor").FirstAsync();
             if (admin == null && editor == null) { return true; }
 
-            List<SysRoleGrant> rows = await db.Select<SysRoleGrant>().ToListAsync();
+            List<SysRoleGrant> rows = await fsql.Select<SysRoleGrant>().ToListAsync();
             string adminHas = ",";
             string editorHas = ",";
             for (int i = 0; i < rows.Count; i = i + 1) {
@@ -542,11 +548,11 @@ class Schema {
                 }
             }
             for (int i = 0; i < screens.Count; i = i + 1) {
-                if (fillAdmin && !await Grant(db, admin.id, screens[i], masks[i], now)) {
+                if (fillAdmin && !await Grant(fsql, admin.id, screens[i], masks[i], now)) {
                     return false;
                 }
                 if (fillEditor && content[i] &&
-                    !await Grant(db, editor.id, screens[i], masks[i], now)) {
+                    !await Grant(fsql, editor.id, screens[i], masks[i], now)) {
                     return false;
                 }
             }
@@ -562,8 +568,8 @@ class Schema {
 
     /* 内置定时任务种子：日志清理默认启用（每天一次、保留 30 天），
        心跳为示例任务默认停用；只在空表时插入，管理员改动不被覆盖。 */
-    static async bool SeedJobs(IDbConnection db) {
-        int have = await db.Select<SysJob>().CountAsync();
+    static async bool SeedJobs(IFreeSql fsql) {
+        int have = await fsql.Select<SysJob>().CountAsync();
         if (have > 0) { return true; }
         long now = WebApp.NowSeconds();
         SysJob cleanup = new SysJob();
@@ -579,7 +585,7 @@ class Schema {
         cleanup.runCount = 0;
         cleanup.createdAt = now;
         cleanup.updatedAt = now;
-        int a = await db.Insert<SysJob>(cleanup).ExecuteIdentityAsync();
+        int a = await fsql.Insert<SysJob>(cleanup).ExecuteIdentityAsync();
         SysJob ping = new SysJob();
         ping.name = "存活心跳";
         ping.kind = "ping";
@@ -593,7 +599,7 @@ class Schema {
         ping.runCount = 0;
         ping.createdAt = now;
         ping.updatedAt = now;
-        int b = await db.Insert<SysJob>(ping).ExecuteIdentityAsync();
+        int b = await fsql.Insert<SysJob>(ping).ExecuteIdentityAsync();
         return a > 0 && b > 0;
     }
 

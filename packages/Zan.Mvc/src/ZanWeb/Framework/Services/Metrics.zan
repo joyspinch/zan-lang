@@ -127,10 +127,11 @@ class MetricsStore {
             /* 旧版使用不同键（route 列 + 毫秒单位），新表独立创建，旧数据归档为 _legacy。 */
             await RetireLegacyMinutes(db);
             /* CodeFirst 建表/加列/建索引；SQL 统计按天聚合，分钟仅用于刷新时机。 */
-            await db.SyncStructureAsync<MetricMinute>();
-            await db.SyncStructureAsync<MetricError>();
-            await db.SyncStructureAsync<MetricSql>();
-            await db.SyncStructureAsync<MetricLive>();
+            IFreeSql fsql = FreeSql.FromConnection(db);
+            await fsql.SyncStructureAsync<MetricMinute>();
+            await fsql.SyncStructureAsync<MetricError>();
+            await fsql.SyncStructureAsync<MetricSql>();
+            await fsql.SyncStructureAsync<MetricLive>();
         } finally {
             Give(db);
         }
@@ -416,12 +417,13 @@ class MetricsStore {
             }
             db = await Lease();
             if (db != null) {
+                IFreeSql fsql = FreeSql.FromConnection(db);
                 if (!await db.BeginTransactionAsync()) {
                     throw new Exception("begin transaction failed");
                 }
                 /* 写入时按复合键合并：冲突时累加计数器、取最大 maxUs，最终每桶一行。 */
                 if (mine.Count > 0) {
-                    written = written + await db.Insert<MetricMinute>(mine)
+                    written = written + await fsql.Insert<MetricMinute>(mine)
                         .OnConflict(a => new { a.minute, a.method, a.path })
                         .SetIncr(a => a.calls)
                         .SetIncr(a => a.errors)
@@ -434,7 +436,7 @@ class MetricsStore {
                 }
                 /* 按 (day, sql) 合并，所有工作进程累积到同一行。 */
                 if (retrySqlBuckets.Count > 0) {
-                    written = written + await db.Insert<MetricSql>(retrySqlBuckets)
+                    written = written + await fsql.Insert<MetricSql>(retrySqlBuckets)
                         .OnConflict(a => new { a.day, a.sql })
                         .SetIncr(a => a.calls)
                         .SetIncr(a => a.slow)
@@ -444,7 +446,7 @@ class MetricsStore {
                 }
                 /* 错误为事件记录，每条独立一行。 */
                 if (retryErrors.Count > 0) {
-                    written = written + await db.Insert<MetricError>(retryErrors)
+                    written = written + await fsql.Insert<MetricError>(retryErrors)
                         .ExecuteAffrowsAsync();
                 }
                 if (!await db.CommitAsync()) {
@@ -457,7 +459,7 @@ class MetricsStore {
                     retrySqlBuckets = new List<MetricSql>();
                 }
                 try {
-                    await Sweep(db);
+                    await Sweep(fsql);
                 } catch (Exception sweepEx) {
                     Console.WriteLine("[metrics] sweep failed: " + sweepEx.Message);
                 }
@@ -509,17 +511,17 @@ class MetricsStore {
     }
 
     /* 按保留天数清理过期数据，每小时最多执行一次。 */
-    static async void Sweep(IDbConnection db) {
+    static async void Sweep(IFreeSql fsql) {
         long now = (long)WebApp.NowSeconds();
         if (now - lastSweep < 3600) { return; }
         lastSweep = now;
         long cut = now - (long)Cfg.Metrics.keepDays * 86400;
         long dayCut = Day(cut);
-        int _a = await db.Delete<MetricMinute>()
+        int _a = await fsql.Delete<MetricMinute>()
             .Where(a => a.minute < cut).ExecuteAffrowsAsync();
-        int _b = await db.Delete<MetricError>()
+        int _b = await fsql.Delete<MetricError>()
             .Where(a => a.ts < cut).ExecuteAffrowsAsync();
-        int _c = await db.Delete<MetricSql>()
+        int _c = await fsql.Delete<MetricSql>()
             .Where(a => a.day < dayCut).ExecuteAffrowsAsync();
     }
 
@@ -530,6 +532,7 @@ class MetricsStore {
         if (!ready) { return outp; }
         IDbConnection db = await Lease();
         if (db == null) { return outp; }
+        IFreeSql fsql = FreeSql.FromConnection(db);
         long a0 = Day(from);
         long b0 = Day(to);
         int order = 2;
@@ -545,7 +548,7 @@ class MetricsStore {
             + " DESC LIMIT " + Convert.ToString(limit);
         DbParams prms = new DbParams().AddLong(a0).AddLong(b0);
         try {
-            DbResult r = await db.QueryAsync(sql, prms);
+            DbResult r = await fsql.QueryAsync(sql, prms);
             for (int i = 0; i < r.RowCount(); i = i + 1) {
                 MetricSql e = new MetricSql();
                 e.day = a0;
@@ -568,6 +571,7 @@ class MetricsStore {
         if (!ready || shape.Length == 0) { return null; }
         IDbConnection db = await Lease();
         if (db == null) { return null; }
+        IFreeSql fsql = FreeSql.FromConnection(db);
         MetricSql outp = null;
         long a0 = Day(from);
         long b0 = Day(to);
@@ -576,7 +580,7 @@ class MetricsStore {
             + "AND sql = ? GROUP BY sql LIMIT 1";
         DbParams prms = new DbParams().AddLong(a0).AddLong(b0).Add(shape);
         try {
-            DbResult r = await db.QueryAsync(sql, prms);
+            DbResult r = await fsql.QueryAsync(sql, prms);
             if (r.RowCount() > 0) {
                 outp = new MetricSql();
                 outp.day = a0;
@@ -617,8 +621,9 @@ class MetricsStore {
         if (!ready) { return outp; }
         IDbConnection db = await Lease();
         if (db == null) { return outp; }
+        IFreeSql fsql = FreeSql.FromConnection(db);
         try {
-            DbResult r = await db.QueryAsync(sql, prms);
+            DbResult r = await fsql.QueryAsync(sql, prms);
             for (int i = 0; i < r.RowCount(); i = i + 1) {
                 MetricMinute b = new MetricMinute();
                 b.minute = r.GetLong(i, 0);
@@ -677,8 +682,9 @@ class MetricsStore {
         if (!ready) { return outp; }
         IDbConnection db = await Lease();
         if (db == null) { return outp; }
+        IFreeSql fsql = FreeSql.FromConnection(db);
         try {
-            DbResult r = await db.QueryAsync(sql, prms);
+            DbResult r = await fsql.QueryAsync(sql, prms);
             for (int i = 0; i < r.RowCount(); i = i + 1) {
                 MetricMinute e = new MetricMinute();
                 e.minute = 0;
@@ -721,8 +727,9 @@ class MetricsStore {
         }
         IDbConnection db = await Lease();
         if (db == null) { return b; }
+        IFreeSql fsql = FreeSql.FromConnection(db);
         try {
-            DbResult r = await db.QueryAsync(sql, prms);
+            DbResult r = await fsql.QueryAsync(sql, prms);
             if (r.RowCount() > 0) {
                 b.calls = r.GetLong(0, 0);
                 b.errors = r.GetLong(0, 1);
@@ -743,8 +750,9 @@ class MetricsStore {
         if (!ready) { return outp; }
         IDbConnection db = await Lease();
         if (db == null) { return outp; }
+        IFreeSql fsql = FreeSql.FromConnection(db);
         try {
-            outp = await db.Select<MetricError>()
+            outp = await fsql.Select<MetricError>()
                 .Where(a => a.ts >= from && a.ts <= to)
                 .OrderByDescending(a => a.id)
                 .Limit(limit)
@@ -777,6 +785,7 @@ class MetricsCluster {
         if (app == null) { return; }
         IDbConnection db = await MetricsStore.Lease();
         if (db == null) { return; }
+        IFreeSql fsql = FreeSql.FromConnection(db);
         try {
             MetricLive row = new MetricLive();
             row.worker = ProcessHost.WorkerId();
@@ -785,7 +794,7 @@ class MetricsCluster {
             row.snapshot = app.MetricsJson();
             row.series = app.MetricsSeriesJson(120);
             /* 按 worker 主键冲突时覆写非计数列。 */
-            int _n = await db.Insert<MetricLive>(row)
+            int _n = await fsql.Insert<MetricLive>(row)
                 .OnConflict(a => a.worker)
                 .ExecuteAffrowsAsync();
         } catch (Exception ex) {
@@ -801,11 +810,12 @@ class MetricsCluster {
         if (!MetricsStore.ready) { return outp; }
         IDbConnection db = await MetricsStore.Lease();
         if (db == null) { return outp; }
+        IFreeSql fsql = FreeSql.FromConnection(db);
         try {
             long now = (long)WebApp.NowSeconds();
             long cut = now - (long)maxAgeSec;
             bool fresh = maxAgeSec > 0;
-            List<MetricLive> rows = await db.Select<MetricLive>()
+            List<MetricLive> rows = await fsql.Select<MetricLive>()
                 .WhereIf(fresh, a => a.updated >= cut)
                 .OrderBy(a => a.worker)
                 .ToListAsync();
