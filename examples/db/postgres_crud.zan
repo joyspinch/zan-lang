@@ -8,7 +8,7 @@
 //   3. 事务 BeginTransaction / Commit / Rollback
 //   4. 异步 API：OpenParamsAsync / QueryParamsAsync / ExecuteParamsAsync
 //      （挂起在 IO reactor 上，单 worker 可并发成千上万条查询）
-//   5. ORM 同样适用：Model / QueryBuilder 通过 IDbExecutor 直接驱动 PgConnection
+//   5. 强类型 FreeSql ORM：IFreeSql / BaseRepository / Select<T> / CodeFirst
 //
 // 说明：本示例需要一个可连接的 PostgreSQL（或 openGauss/金仓等 PG 协议引擎）。
 //       没有可用服务时会打印提示并跳过，不算失败。同样的写法也适用于
@@ -17,9 +17,44 @@
 // 准备：docker run -e POSTGRES_PASSWORD=secret -p 5432:5432 postgres:16
 // ============================================================================
 using System;
+using System.Collections.Generic;
 using System.Data;
 using System.Data.Orm;
 using System.Data.Postgres;
+
+[Table(Name = "pg_demo_books")]
+class Book {
+    [Column(IsIdentity = true)]
+    int id;
+    [Column(StringLength = 128)]
+    string title;
+    string author;
+    double price;
+
+    static Book Of(string title, string author, double price) {
+        Book b = new Book();
+        b.title = title;
+        b.author = author;
+        b.price = price;
+        return b;
+    }
+
+    int Id() { return this.id; }
+    string Title() { return this.title; }
+    string Author() { return this.author; }
+    double Price() { return this.price; }
+}
+
+class BookRepository : BaseRepository<Book> {
+    BookRepository(IFreeSql fsql) : base(fsql) {}
+
+    List<Book> BooksPricedAbove(double minPrice) {
+        return this.GetExecutor().Select<Book>()
+            .Where(a => a.price > minPrice)
+            .OrderBy(a => a.id)
+            .ToList();
+    }
+}
 
 class Program {
     static async int RunAsync() {
@@ -77,13 +112,16 @@ class Program {
         Console.WriteLine("after rollback: "
             + db.ExecuteScalar("SELECT COUNT(*) FROM pg_demo_books"));
 
-        // ---- 4. ORM 直接驱动 PgConnection ------------------------------------------
-        // Model / QueryBuilder 通过 IDbExecutor 工作，换连接不换代码。
-        Model books = Model.FromTable(db, "pg_demo_books");
-        Console.WriteLine("orm columns: " + Convert.ToString(books.ColumnCount())
-            + " pk=" + books.GetPrimaryKey());
-        List<ModelRow> rows = books.Select(db).Where("price > 50").Execute();
-        Console.WriteLine("orm rows: " + Convert.ToString(rows.Count));
+        // ---- 4. 强类型 FreeSql ORM 驱动 PgConnection -----------------------------
+        // IFreeSql 门面与 BaseRepository<Book> 仓储直接管理强类型实体操作。
+        IFreeSql fsql = FreeSql.FromConnection(db);
+        BookRepository repo = new BookRepository(fsql);
+
+        List<Book> expBooks = repo.BooksPricedAbove(50.0);
+        Console.WriteLine("orm books count: " + Convert.ToString(expBooks.Count));
+        if (expBooks.Count > 0) {
+            Console.WriteLine("first: " + expBooks[0].Title() + " by " + expBooks[0].Author());
+        }
 
         // ---- 5. 异步 API ------------------------------------------------------------
         int rc = await RunAsync();
