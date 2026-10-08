@@ -1,0 +1,390 @@
+using System;
+using System.Data;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace System.Data.Postgres;
+
+/// <summary>PostgreSQL 线格式纯函数库：async 与 sync 连接路径共享的
+/// 字节解析/编码、conninfo 解析、SCRAM-SHA-256 与 MD5 口令计算、
+/// 错误响应格式化。只做纯变换、无 IO 无状态——与
+/// <see cref="MySqlWire"/> 同一取舍（stdlib 去重 批D-1 的定式）。</summary>
+class PgWire {
+
+    /// 把缓冲区 <c>[off, off+len)</c> 的字节原样拷出并转为字符串；
+    /// len &lt;= 0 时返回空串。
+    static string bytesToStr(byte[] buf, int off, int len) {
+        if (len <= 0) { return ""; }
+        byte[] t = new byte[len + 1];
+        for (int i = 0; i < len; i = i + 1) { t[i] = (byte)(buf[off + i] & 255); }
+        return t.ToStr(0, len);
+    }
+
+    /// 把字符串的前 len 字节拷入新 byte[]（末尾多留 1 字节便于
+    /// 安全哨兵）；len 用 <c>s.Length</c>（Zan 字符串即 UTF-8 字节串）。
+    static byte[] strToBytes(string s, int len) {
+        byte[] b = new byte[len + 1];
+        for (int i = 0; i < len; i = i + 1) { b[i] = (byte)(s[i] & 255); }
+        return b;
+    }
+
+    /// 复制 4 字节切片（MD5 认证的盐）。
+    static byte[] slice4(byte[] b, int off) {
+        byte[] r = new byte[5];
+        for (int i = 0; i < 4; i = i + 1) { r[i] = (byte)(b[off + i] & 255); }
+        return r;
+    }
+
+    /// 字节前缀判断（SCRAM 服务器随机数须以客户端随机数开头）。
+    static bool hasPrefix(string b, string pre) {
+        int n = pre.Length;
+        if (b.Length < n) { return false; }
+        for (int i = 0; i < n; i = i + 1) {
+            if ((b[i] & 255) != (pre[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    /// 大端 int32 读取（消息长度与认证子码）。
+    static int be32(byte[] b, int off) {
+        return ((b[off] & 255) << 24) | ((b[off + 1] & 255) << 16)
+            | ((b[off + 2] & 255) << 8) | (b[off + 3] & 255);
+    }
+
+    // ============================================================
+    // conninfo 解析（libpq 关键字/值格式）
+    // ============================================================
+
+    /// <summary>解析 libpq 风格 conninfo：空白分隔的 key=value 词，
+    /// 值可用单引号包裹（<c>\' \\</c> 转义）。outs 下标：
+    /// 0=host 1=port 2=dbname 3=user 4=password 5=sslmode
+    /// 6=connect_timeout 7=sslrootcert；未出现的键保持空串。
+    /// 未知键忽略（application_name/options 等无害参数由此容错）。
+    /// 返回 0 成功；-1 语法错误。</summary>
+    static int parseConninfo(string s, List<string> outs) {
+        int i = 0;
+        int n = s.Length;
+        while (i < n) {
+            while (i < n && PgWire.isSpace(s[i])) { i = i + 1; }
+            if (i >= n) { break; }
+            int ks = i;
+            while (i < n && (s[i] & 255) != 61) {
+                if (PgWire.isSpace(s[i])) { return -1; }
+                i = i + 1;
+            }
+            if (i >= n) { return -1; }
+            string key = s.Substring(ks, i - ks);
+            i = i + 1;
+            while (i < n && (s[i] == 32 || s[i] == 9)) { i = i + 1; }
+            string val = "";
+            if (i < n && (s[i] & 255) == 39) {
+                i = i + 1;
+                StringBuilder sb = new StringBuilder();
+                while (i < n) {
+                    int c = s[i] & 255;
+                    if (c == 92 && i + 1 < n) {
+                        sb.Append(s.Substring(i + 1, 1));
+                        i = i + 2;
+                        continue;
+                    }
+                    if (c == 39) { i = i + 1; break; }
+                    sb.Append(s.Substring(i, 1));
+                    i = i + 1;
+                }
+                val = sb.ToString();
+            } else {
+                int vs = i;
+                while (i < n && !PgWire.isSpace(s[i])) { i = i + 1; }
+                val = s.Substring(vs, i - vs);
+            }
+            if (key == "host" || key == "hostaddr") { outs[0] = val; }
+            else if (key == "port") { outs[1] = val; }
+            else if (key == "dbname" || key == "database") { outs[2] = val; }
+            else if (key == "user") { outs[3] = val; }
+            else if (key == "password") { outs[4] = val; }
+            else if (key == "sslmode") { outs[5] = val; }
+            else if (key == "connect_timeout") { outs[6] = val; }
+            else if (key == "sslrootcert") { outs[7] = val; }
+        }
+        return 0;
+    }
+
+    static bool isSpace(int c) {
+        return c == 32 || c == 9 || c == 10 || c == 13;
+    }
+
+    // ============================================================
+    // 结果集组装
+    // ============================================================
+
+    /// <summary>解析 RowDescription('T')：列名收进 result，类型 OID
+    /// 收进 colOids。每列：名字 NUL 结尾、表 OID int32、列号 int16、
+    /// 类型 OID int32、typlen int16、typmod int32、格式 int16——只取
+    /// 名字与类型 OID（文本通道下其余无用）。</summary>
+    static void readRowDescription(DbResult result, byte[] pay, int len,
+            List<int> colOids) {
+        int ncols = (pay[0] & 255) | ((pay[1] & 255) << 8);
+        result.SetColumnCount(ncols);
+        int p = 2;
+        int c = 0;
+        while (c < ncols && p < len) {
+            int ns = p;
+            while (p < len && (pay[p] & 255) != 0) { p = p + 1; }
+            result.AddColumnName(PgWire.bytesToStr(pay, ns, p - ns));
+            p = p + 1;
+            p = p + 6;                          // 表 OID(4) + 列号(2)
+            int oid = PgWire.be32(pay, p);
+            p = p + 4;
+            p = p + 8;                          // typlen(2) + typmod(4) + 格式(2)
+            colOids.Add(oid);
+            c = c + 1;
+        }
+    }
+
+    /// <summary>解析 DataRow('D') 一行（文本格式）并追加到 result。
+    /// int2/int4/int8（OID 21/23/20）解析一次存 ival，不再保留串
+    /// （PG 整型文本是纯十进制，Convert.ToString(ival) 逐字节还原）；
+    /// 其余列走文本通道——NUMERIC 文本形如 "2.0"，与 double 最短
+    /// 往返格式不同，直接存 double 会在 GetString 引入兼容差异。
+    /// 列长 -1 = NULL（kind 0，文本 ""）。</summary>
+    static void readDataRow(DbResult result, byte[] pay, int len,
+            List<int> colOids) {
+        int ncols = (pay[0] & 255) | ((pay[1] & 255) << 8);
+        List<DbCell> cells = new List<DbCell>();
+        List<string> texts = new List<string>();
+        int p = 2;
+        int c = 0;
+        while (c < ncols && p + 4 <= len) {
+            DbCell cell = new DbCell();
+            int clen = PgWire.be32(pay, p);
+            p = p + 4;
+            if (clen == -1) {
+                texts.Add("");
+            } else {
+                if (p + clen > len) { clen = len - p; }
+                int oid = c < colOids.Count ? colOids[c] : 0;
+                if (oid == 20 || oid == 21 || oid == 23) {
+                    cell.kind = 1;
+                    string txt = PgWire.bytesToStr(pay, p, clen);
+                    cell.ival = txt.Length == 0 ? 0 : Convert.ToInt64(txt);
+                    texts.Add("");
+                } else {
+                    cell.kind = 2;
+                    texts.Add(PgWire.bytesToStr(pay, p, clen));
+                }
+                p = p + clen;
+            }
+            cells.Add(cell);
+            c = c + 1;
+        }
+        result.AddRowCells(cells, texts);
+    }
+
+    // ============================================================
+    // 错误与命令标签
+    // ============================================================
+
+    /// <summary>把 ErrorResponse('E')/NoticeResponse('N') 的字段序列
+    /// （字节代码 + NUL 结尾值，空值终止）格式化为 libpq 风格消息：
+    /// "ERROR:  消息"，DETAIL/HINT 存在时追加独立行。</summary>
+    static string formatError(byte[] pay, int len) {
+        string sev = "";
+        string msg = "";
+        string detail = "";
+        string hint = "";
+        int p = 0;
+        while (p < len) {
+            int code = pay[p] & 255;
+            p = p + 1;
+            if (code == 0) { break; }
+            int vs = p;
+            while (p < len && (pay[p] & 255) != 0) { p = p + 1; }
+            string v = PgWire.bytesToStr(pay, vs, p - vs);
+            p = p + 1;
+            if (code == 83) { sev = v; }          // S 严重级别
+            else if (code == 77) { msg = v; }     // M 主消息
+            else if (code == 68) { detail = v; }  // D 明细
+            else if (code == 72) { hint = v; }    // H 提示
+        }
+        string out1 = sev + ":  " + msg;
+        if (detail.Length > 0) { out1 = out1 + "\nDETAIL: " + detail; }
+        if (hint.Length > 0) { out1 = out1 + "\nHINT: " + hint; }
+        return out1;
+    }
+
+    /// <summary>解析 CommandComplete('C') 标签的受影响行数：
+    /// "UPDATE 3"/"INSERT 0 1"/"DELETE 5" 取末尾整数；无数字标签
+    /// （CREATE TABLE/BEGIN 等）返回 0。</summary>
+    static int parseCommandTag(string tag) {
+        int n = tag.Length;
+        int e = n;
+        while (e > 0 && tag[e - 1] >= 48 && tag[e - 1] <= 57) { e = e - 1; }
+        if (e == n || e == 0) { return 0; }
+        if ((tag[e - 1] & 255) == 32) {
+            return Encoding.ParseInt(tag.Substring(e, n - e));
+        }
+        return 0;
+    }
+
+    // ============================================================
+    // `?` → $n 占位符改写
+    // ============================================================
+
+    /// <summary>将 `?` 占位符（SQL 结构位置）改写为 PG 位置参数
+    /// $1..$n 形式。上下文感知：字符串字面量、转义引号、双引号
+    /// 标识符、行/块注释以及美元引用（$$..$$ / $tag$..$tag$）内部的
+    /// `?` 一律原样保留——无脑改写会让 SELECT * FROM t WHERE
+    /// note = 'a?b' 参数错位、注释里的示例 SQL 直接破坏语句。
+    /// 分块游标区间切片，0 单字符堆分配。</summary>
+    static string ToDollarParams(string sql) {
+        if (sql == null || sql.Length == 0) { return ""; }
+        if (sql.IndexOf("?") < 0) { return sql; }
+        StringBuilder sb = new StringBuilder();
+        int n = sql.Length;
+        int next = 1;
+        int i = 0;
+        int last = 0;
+        while (i < n) {
+            int c = sql[i] & 255;
+            if (c == 45 && i + 1 < n && (sql[i + 1] & 255) == 45) {
+                // 行注释：-- 直到换行。
+                i = i + 2;
+                while (i < n && (sql[i] & 255) != 10) { i = i + 1; }
+                continue;
+            }
+            if (c == 47 && i + 1 < n && (sql[i + 1] & 255) == 42) {
+                // 块注释：/* .. */（未闭合则吞到末尾）。
+                i = i + 2;
+                while (i < n) {
+                    if ((sql[i] & 255) == 42 && i + 1 < n && (sql[i + 1] & 255) == 47) {
+                        i = i + 2;
+                        break;
+                    }
+                    i = i + 1;
+                }
+                continue;
+            }
+            if (c == 39 || c == 34) {
+                // 引号区域（'..' 字符串含 '' 转义；".." 标识符）。
+                int q = c;
+                i = i + 1;
+                while (i < n) {
+                    int d = sql[i] & 255;
+                    i = i + 1;
+                    if (d == q) {
+                        if (q == 39 && i < n && (sql[i] & 255) == 39) {
+                            i = i + 1;       // '' 转义
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            if (c == 36) {
+                // 美元引用：$ 后跟 [A-Za-z0-9_]* 再跟 $ 即开标签；
+                // 找不到闭合标签就按开标签吞到串尾。
+                int j = i + 1;
+                while (j < n) {
+                    int d = sql[j] & 255;
+                    bool tagch = (d >= 48 && d <= 57) || (d >= 65 && d <= 90)
+                        || (d >= 97 && d <= 122) || d == 95;
+                    if (!tagch) { break; }
+                    j = j + 1;
+                }
+                if (j < n && (sql[j] & 255) == 36) {
+                    string opener = sql.Substring(i, j - i + 1);
+                    int end = sql.IndexOf(opener, j + 1);
+                    int stop = end < 0 ? n : end + opener.Length;
+                    i = stop;
+                    continue;
+                }
+                i = i + 1;
+                continue;
+            }
+            if (c == 63) {                        // ?
+                if (i > last) { sb.Append(sql.Substring(last, i - last)); }
+                sb.Append("$");
+                sb.Append(Convert.ToString(next));
+                next = next + 1;
+                i = i + 1;
+                last = i;
+                continue;
+            }
+            i = i + 1;
+        }
+        if (last < n) { sb.Append(sql.Substring(last, n - last)); }
+        return sb.ToString();
+    }
+
+    // ============================================================
+    // 认证计算：MD5 与 SCRAM-SHA-256（RFC 5802/7677）
+    // ============================================================
+
+    /// <summary>MD5 认证的口令令牌："md5" + hex(md5(hex(md5(口令+用户))
+    /// . 盐4))。salt 为 AuthenticationMD5Password 里的 4 字节盐。</summary>
+    static string md5PasswordToken(string password, string user, byte[] salt) {
+        string inner = Hex.Encode(
+            Md5.Hash(password + user, password.Length + user.Length), 16);
+        byte[] mid = new byte[37];
+        int i = 0;
+        for (; i < 32; i = i + 1) { mid[i] = (byte)(inner[i] & 255); }
+        for (i = 0; i < 4; i = i + 1) { mid[32 + i] = (byte)(salt[i] & 255); }
+        return "md5" + Hex.Encode(Md5.Hash(mid, 36), 16);
+    }
+
+    /// <summary>SCRAM 客户端随机数：18 字节 CSPRNG → base64（24 字符）。</summary>
+    static string clientNonce() {
+        byte[] raw = RandomNumberGenerator.GetBytes(18);
+        if (raw == null) { return ""; }
+        return Base64.Encode(raw.ToStr(0, 18), 18);
+    }
+
+    /// <summary>从 "k=v,k=v" 形式的 SCRAM 消息取指定键的值；键缺失
+    /// 返回空串。base64 盐的 '=' 填充在值尾，不干扰分段扫描。</summary>
+    static string scramField(string msg, string key) {
+        int i = 0;
+        int n = msg.Length;
+        while (i < n) {
+            int eq = msg.IndexOf("=", i);
+            if (eq < 0) { return ""; }
+            string k = msg.Substring(i, eq - i);
+            int vs = eq + 1;
+            int ve = msg.IndexOf(",", vs);
+            if (ve < 0) { ve = n; }
+            if (k == key) { return msg.Substring(vs, ve - vs); }
+            i = ve + 1;
+        }
+        return "";
+    }
+
+    /// <summary>RFC 5802 Hi()：PBKDF2-HMAC-SHA256——口令是 HMAC 密钥，
+    /// 盐后拼大端块序号 1 作消息，迭代异或折叠出 32 字节 SaltedPassword。
+    /// PG 10+ 默认口令加密即 SCRAM-SHA-256，这是它的全部口令学。</summary>
+    static byte[] pbkdf2Sha256(string password, byte[] salt, int saltLen,
+            int iters) {
+        if (iters < 1) { iters = 1; }
+        byte[] pw = PgWire.strToBytes(password, password.Length);
+        byte[] block = new byte[saltLen + 5];
+        int i = 0;
+        for (; i < saltLen; i = i + 1) { block[i] = (byte)(salt[i] & 255); }
+        block[saltLen + 3] = 1;
+        byte[] u = Hmac.Sha256(pw, pw.Length, block, saltLen + 4);
+        byte[] acc = new byte[33];
+        for (i = 0; i < 32; i = i + 1) { acc[i] = (byte)(u[i] & 255); }
+        int j = 1;
+        while (j < iters) {
+            u = Hmac.Sha256(pw, pw.Length, u, 32);
+            for (i = 0; i < 32; i = i + 1) { acc[i] = (byte)((acc[i] ^ u[i]) & 255); }
+            j = j + 1;
+        }
+        return acc;
+    }
+
+    /// 32 字节按位异或（ClientKey ⊕ ClientSignature → proof）。
+    static byte[] xor32(byte[] a, byte[] b) {
+        byte[] r = new byte[33];
+        for (int i = 0; i < 32; i = i + 1) { r[i] = (byte)((a[i] ^ b[i]) & 255); }
+        return r;
+    }
+}

@@ -3110,3 +3110,14 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
 - **json_get_num 读布尔字段永远拿到默认值**（B-ID117 实测）：`includeDeclaration:false` 经 `json_get_num(v,1)` 得 1（非 NUM 类型直接回退），声明永远被包含；读 LSP 布尔参数用 `json_get_bool(v, json_get_num(v,1)!=0.0)` 兜两种编码。
 - **无工作区根也必须建聚合索引**（B-ID117 实测）：ensure_project_indexed 原来无 rootUri 直接 return，无根会话（测试、无 root 客户端）里跨文件成员链/静态访问/var 初值推断全瞎（definition 落到同名词局部、补全空）。修法：无根也 init 聚合引擎、只跳过磁盘扫描——didOpen/didChange 本来就喂它，打开的文档互相可见。
 - **合成符号（隐式 setter value）的 decl 位置不是声明**（B-ID117 实测）：引擎给 setter 的 value 记 `(body行-1, col0)`，单行文档里 line=-1 直接穿透 `line>=0` 之外的守卫，prepareRename/references 会把它当真参数。判定定式：decl 位置上的文本必须逐字拼出该名字（word_at 比对），合成符号当场排除。
+
+## 包内新类忘写 namespace 声明：同一工程不同入口编译结果不同（PgWire，2026-10-08）
+
+`.zan` 文件里没有 `namespace X;` 行的类落进全局命名空间；它能否被同包
+其他带命名空间的类以简单名解析，取决于是否已注册进 stdlib map——而
+注册与否跟着当次编译的拉入集合/顺序走。实测（纯 Zan PG 驱动的
+PgWire.zan 漏写 namespace）：引用 Postgres 的矩阵探针与示例能编过，
+ORM 示例却报 `'PgWire' is not a known variable, type, or namespace
+(is the class imported and registered in the stdlib map?)`——同一份
+源码、同一台机器，差别只是入口文件的 using 集合。给包内新文件第一行
+写上 namespace 声明，让类走常规命名空间拉入解析，不靠注册顺序的侥幸。

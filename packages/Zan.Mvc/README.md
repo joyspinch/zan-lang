@@ -714,9 +714,8 @@ wwwroot/
 ```
 
 Of the DLLs, only the driver for the database in use is needed: `libsqlite3-0.dll`
-for SQLite, `libpq.dll` + `libssl-3-x64.dll` + `libcrypto-3-x64.dll` +
-`libiconv-2.dll` + `libintl-8.dll` for PostgreSQL (MySQL speaks its protocol
-without a client library). `data/app.db` is not copied — the directory and the
+for SQLite (PostgreSQL and MySQL speak their protocols in pure Zan, no client
+library at all). `data/app.db` is not copied — the directory and the
 database are created on first start, and `Schema` fills in the tables and the
 seed account. Set the session key — `[auth].secret` in `config/app.json`, or the
 `ZAN_AUTH_SECRET` environment variable which overrides it — to 32+ characters,
