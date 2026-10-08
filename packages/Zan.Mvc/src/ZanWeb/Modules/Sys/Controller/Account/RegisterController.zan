@@ -1,6 +1,5 @@
 using System;
 using System.Data.Orm;
-using System.Net.External;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Web;
@@ -119,7 +118,7 @@ class RegisterController : AppController {
         if (!await Mailer.Ready()) {
             c.Fail(400, "0004", "站点尚未配置邮件服务");
         }
-        string ip = IssuanceIp(c.Ctx());
+        string ip = ClientIp.Of(c.Ctx());
         VerifyCodeIssue issued = await VerifyCode.IssueForIp(purpose, email, ip);
         if (issued.status == 0) {
             c.Fail(429, "0429", "验证码发送频繁，请稍后再试");
@@ -137,121 +136,6 @@ class RegisterController : AppController {
             c.Fail(502, "0502", r.Message());
         }
         c.Ok("验证码已发送");
-    }
-
-    /* Strict literals only, without DNS, ports, brackets or zone IDs. Expand IPv6
-       to one spelling so equivalent texts cannot create extra quota buckets.
-       IPv4-mapped IPv6 shares the native IPv4 identity. */
-    static string CanonicalIp(string ip) {
-        if (ip.Length == 0 || ip.Length > 45) { return ""; }
-        if (ExternalTarget.ValidIPv4(ip)) { return ip; }
-        if (!ip.Contains(":")) { return ""; }
-        if (ip.Contains(".")) {
-            int tail = ip.LastIndexOf(":") + 1;
-            string v4 = ip.Substring(tail);
-            if (!ExternalTarget.ValidIPv4(v4)) { return ""; }
-            List<string> octets = v4.Split(".");
-            int high = Convert.ToInt32(octets[0]) * 256 + Convert.ToInt32(octets[1]);
-            int low = Convert.ToInt32(octets[2]) * 256 + Convert.ToInt32(octets[3]);
-            ip = ip.Substring(0, tail) + IpHex(high) + ":" + IpHex(low);
-        }
-        int gap = ip.IndexOf("::");
-        if (gap >= 0 && ip.IndexOf("::", gap + 2) >= 0) { return ""; }
-        string left = ip;
-        string right = "";
-        if (gap >= 0) { left = ip.Substring(0, gap); right = ip.Substring(gap + 2); }
-        List<int> before = new List<int>();
-        List<int> after = new List<int>();
-        if (!IpGroups(left, before) || !IpGroups(right, after)) { return ""; }
-        int count = before.Count + after.Count;
-        if ((gap < 0 && count != 8) || (gap >= 0 && count >= 8)) { return ""; }
-        List<int> words = new List<int>();
-        for (int i = 0; i < before.Count; i = i + 1) { words.Add(before[i]); }
-        for (int i = count; i < 8; i = i + 1) { words.Add(0); }
-        for (int i = 0; i < after.Count; i = i + 1) { words.Add(after[i]); }
-        if (words[0] == 0 && words[1] == 0 && words[2] == 0 && words[3] == 0
-            && words[4] == 0 && words[5] == 65535) {
-            return Convert.ToString(words[6] / 256) + "." + Convert.ToString(words[6] % 256)
-                + "." + Convert.ToString(words[7] / 256) + "." + Convert.ToString(words[7] % 256);
-        }
-        string result = "";
-        for (int i = 0; i < 8; i = i + 1) {
-            if (i > 0) { result = result + ":"; }
-            result = result + IpHex(words[i]);
-        }
-        return result;
-    }
-
-    static bool IpGroups(string part, List<int> words) {
-        if (part.Length == 0) { return true; }
-        int start = 0;
-        for (int i = 0; i <= part.Length; i = i + 1) {
-            if (i == part.Length || part[i] == ':') {
-                int word = ExternalTarget.ParseHex(part.Substring(start, i - start));
-                if (word < 0 || words.Count >= 8) { return false; }
-                words.Add(word);
-                start = i + 1;
-            }
-        }
-        return true;
-    }
-
-    static string IpHex(int word) {
-        string digits = "0123456789abcdef";
-        string result = "";
-        for (int shift = 12; shift >= 0; shift = shift - 4) {
-            result = result + digits.Substring((word >> shift) & 15, 1);
-        }
-        return result;
-    }
-
-    static string IssuanceIp(HttpContext ctx) {
-        string peer = CanonicalIp(ctx.RemoteIp());
-        // Missing/invalid peer identity must not become attacker-selected buckets.
-        if (peer.Length == 0) { return "unknown"; }
-        string configured = Cfg.Server.trustedProxies;
-        if (configured.Length == 0 || configured.Length > 4096) { return peer; }
-        List<string> entries = configured.Split(",");
-        List<string> trusted = new List<string>();
-        for (int i = 0; i < entries.Count; i = i + 1) {
-            string proxy = CanonicalIp(entries[i].Trim());
-            // One invalid entry disables the entire list rather than broadening trust.
-            if (proxy.Length == 0) { return peer; }
-            trusted.Add(proxy);
-        }
-        if (!trusted.Contains(peer)) { return peer; }
-        HttpRequest request = ctx.request;
-        if (request.parseStatus != 0) { return peer; }
-        // GetHeader returns the first field, so reject duplicates before using it.
-        int fields = 0;
-        List<string> lines = request.rawHeaders.Split("\n");
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            string line = lines[i];
-            if (line.Length > 0 && (line[0] == ' ' || line[0] == '\t')) { return peer; }
-            int colon = line.IndexOf(":");
-            if (colon >= 0 && line.Substring(0, colon).Trim().ToLower() == "x-forwarded-for") {
-                fields = fields + 1;
-            }
-        }
-        if (fields != 1) { return peer; }
-        string forwarded = request.GetHeader("X-Forwarded-For");
-        if (forwarded.Length == 0 || forwarded.Length > 2048) { return peer; }
-        List<string> hops = forwarded.Split(",");
-        if (hops.Count > 32) { return peer; }
-        List<string> addresses = new List<string>();
-        for (int i = 0; i < hops.Count; i = i + 1) {
-            string hop = CanonicalIp(hops[i].Trim());
-            if (hop.Length == 0) { return peer; }
-            addresses.Add(hop);
-        }
-        // Only a trusted hop can vouch for the preceding address. Never select the
-        // leftmost item blindly: an untrusted client can prepend arbitrary values.
-        string current = peer;
-        for (int i = addresses.Count - 1; i >= 0; i = i - 1) {
-            if (!trusted.Contains(current)) { return current; }
-            current = addresses[i];
-        }
-        return current;
     }
 
     async void Back(string error, string user, string email) {

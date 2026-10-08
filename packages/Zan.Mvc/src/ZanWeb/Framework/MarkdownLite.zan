@@ -1,0 +1,160 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace ZanWeb.Web;
+
+/* Markdown 轻量渲染：标题/列表/引用/代码围栏/段落 + 行内粗体与代码。
+   先整行转义再叠加标记，保证输出 HTML 安全。纯 string->string，不依赖
+   任何业务类型。不直接用 System.Text.Markdown：那套按标准语义把 "#"
+   渲染为 h1，而本类刻意把 #/##/### 降为 h3/h4/h5——admin.css 的
+   .wiki-page h3/h4 规则按此层级排版，内容标题须让位页面外壳的 h1/h2。 */
+class MarkdownLite {
+
+    static string Html(string md) {
+        string norm = md.Replace("\r\n", "\n").Replace("\r", "\n");
+        List<string> lines = norm.Split("\n");
+        StringBuilder outp = new StringBuilder();
+        bool inCode = false;
+        bool inList = false;
+        bool inOrder = false;
+        bool inQuote = false;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i];
+            string trimmed = line.Trim();
+            if (trimmed.StartsWith("```")) {
+                CloseAll(outp, ref inList, ref inOrder, ref inQuote);
+                if (inCode) {
+                    outp.Append("</code></pre>\n");
+                    inCode = false;
+                } else {
+                    outp.Append("<pre><code>");
+                    inCode = true;
+                }
+                continue;
+            }
+            if (inCode) {
+                outp.Append(Esc(line) + "\n");
+                continue;
+            }
+            if (trimmed.Length == 0) {
+                CloseAll(outp, ref inList, ref inOrder, ref inQuote);
+                continue;
+            }
+            if (trimmed.StartsWith("### ")) {
+                CloseAll(outp, ref inList, ref inOrder, ref inQuote);
+                outp.Append("<h5>" + Inline(Esc(trimmed.Substring(4)))
+                    + "</h5>\n");
+                continue;
+            }
+            if (trimmed.StartsWith("## ")) {
+                CloseAll(outp, ref inList, ref inOrder, ref inQuote);
+                outp.Append("<h4>" + Inline(Esc(trimmed.Substring(3)))
+                    + "</h4>\n");
+                continue;
+            }
+            if (trimmed.StartsWith("# ")) {
+                CloseAll(outp, ref inList, ref inOrder, ref inQuote);
+                outp.Append("<h3>" + Inline(Esc(trimmed.Substring(2)))
+                    + "</h3>\n");
+                continue;
+            }
+            if (trimmed.StartsWith("- ")) {
+                if (inOrder) { outp.Append("</ol>\n"); inOrder = false; }
+                CloseQuote(outp, ref inQuote);
+                if (!inList) {
+                    outp.Append("<ul>\n");
+                    inList = true;
+                }
+                outp.Append("<li>" + Inline(Esc(trimmed.Substring(2)))
+                    + "</li>\n");
+                continue;
+            }
+            if (trimmed.StartsWith("> ")) {
+                if (inList) { outp.Append("</ul>\n"); inList = false; }
+                if (inOrder) { outp.Append("</ol>\n"); inOrder = false; }
+                if (!inQuote) {
+                    outp.Append("<blockquote>");
+                    inQuote = true;
+                }
+                outp.Append("<p>" + Inline(Esc(trimmed.Substring(2)))
+                    + "</p>");
+                continue;
+            }
+            int dot = OrderDot(trimmed);
+            if (dot > 0) {
+                if (inList) { outp.Append("</ul>\n"); inList = false; }
+                CloseQuote(outp, ref inQuote);
+                if (!inOrder) {
+                    outp.Append("<ol>\n");
+                    inOrder = true;
+                }
+                outp.Append("<li>"
+                    + Inline(Esc(trimmed.Substring(dot))) + "</li>\n");
+                continue;
+            }
+            CloseAll(outp, ref inList, ref inOrder, ref inQuote);
+            outp.Append("<p>" + Inline(Esc(trimmed)) + "</p>\n");
+        }
+        CloseAll(outp, ref inList, ref inOrder, ref inQuote);
+        if (inCode) { outp.Append("</code></pre>\n"); }
+        return outp.ToString();
+    }
+
+    /* "1. " 有序列表前缀检测，返回正文起始下标（0=非有序项）。 */
+    static int OrderDot(string s) {
+        int n = 0;
+        while (n < s.Length && s[n] >= 48 && s[n] <= 57) { n = n + 1; }
+        if (n == 0 || n > 4 || n + 1 >= s.Length) { return 0; }
+        if (s.Substring(n, 2) != ". ") { return 0; }
+        return n + 2;
+    }
+
+    static void CloseAll(StringBuilder outp, ref bool inList,
+                         ref bool inOrder, ref bool inQuote) {
+        if (inQuote) { outp.Append("</blockquote>\n"); inQuote = false; }
+        if (inList) { outp.Append("</ul>\n"); inList = false; }
+        if (inOrder) { outp.Append("</ol>\n"); inOrder = false; }
+    }
+
+    static void CloseQuote(StringBuilder outp, ref bool inQuote) {
+        if (inQuote) { outp.Append("</blockquote>\n"); inQuote = false; }
+    }
+
+    /* 行内标记：**粗体** 与 `代码`；输入应先经过 Esc 转义。 */
+    static string Inline(string escaped) {
+        string withBold = Marks(escaped, "**", "<strong>",
+            "</strong>");
+        return Marks(withBold, "`", "<code>", "</code>");
+    }
+
+    /* 成对标记替换：找到一对标记之间的文本包上标签；不成对原样保留。 */
+    static string Marks(string s, string mark, string openTag,
+                        string closeTag) {
+        int from = 0;
+        StringBuilder outp = new StringBuilder();
+        while (from < s.Length) {
+            int at = s.IndexOf(mark, from);
+            if (at < 0) { break; }
+            int end = s.IndexOf(mark, at + mark.Length);
+            if (end < 0) { break; }
+            if (end == at + mark.Length) { from = at + mark.Length; continue; }
+            outp.Append(s.Substring(from, at - from));
+            outp.Append(openTag + s.Substring(at + mark.Length,
+                end - at - mark.Length) + closeTag);
+            from = end + mark.Length;
+        }
+        if (from < s.Length) { outp.Append(s.Substring(from)); }
+        return outp.ToString();
+    }
+
+    /* 与视图引擎一致的转义面（先转义再叠标记，杜绝注入）。 */
+    static string Esc(string s) {
+        if (s.IndexOf("<") < 0 && s.IndexOf(">") < 0
+            && s.IndexOf("&") < 0 && s.IndexOf("\"") < 0) {
+            return s;
+        }
+        return s.Replace("&", "&amp;").Replace("<", "&lt;")
+            .Replace(">", "&gt;").Replace("\"", "&quot;");
+    }
+}
