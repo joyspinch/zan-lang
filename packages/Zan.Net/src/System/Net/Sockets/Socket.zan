@@ -1,6 +1,35 @@
 using System;
+using System.Threading;
 
 namespace System.Net.Sockets;
+
+/// The timer captures this state alone. Finish serializes with a selected late
+/// callback before the operation owner can close and reuse the descriptor.
+class SocketAcceptCancellation {
+    private object sync;
+    private nint socket;
+    private CancellationToken cancellation;
+    private bool active;
+
+    SocketAcceptCancellation(nint socket, CancellationToken cancellation) {
+        this.sync = new object();
+        this.socket = socket;
+        this.cancellation = cancellation;
+        this.active = true;
+    }
+
+    void Check() {
+        lock (this.sync) {
+            if (this.active && this.cancellation.IsCancellationRequested) {
+                Socket.CancelPendingIo(this.socket);
+            }
+        }
+    }
+
+    void Finish() {
+        lock (this.sync) { this.active = false; }
+    }
+}
 
 /// <summary>
 /// 跨平台的低层套接字操作。
@@ -441,12 +470,18 @@ class Socket {
         SysClose(sock);
     }
 
-    /// <summary>双向关闭连接而不释放
-    /// 描述符。IO reactor 中挂起在此套接字上的协程
-    /// 会以 0 字节读（对端关闭语义）被唤醒并正常退出；
-    /// 而直接关闭描述符不会这样：fd 会
-    /// 带着未完成事件离开 reactor 集合，协程将永远
-    /// 无法恢复。用于挂断超限的连接。</summary>
+    /// <summary>唤醒/取消当前挂起的 IO，不 shutdown 或释放描述符。
+    /// POSIX 摘除 reactor 注册并唤醒等待者；Windows 调用 CancelIoEx。
+    /// 调用方必须在恢复后观察取消状态，且保留描述符到操作结束。
+    /// 此通知可能早于 IO 注册，取消方应重复通知直到操作确认结束。</summary>
+    static void CancelPendingIo(nint sock) {
+        if (sock >= 0) { ReactorCloseNotify(sock); }
+    }
+
+    /// <summary>双向关闭已连接套接字但保留描述符，唤醒挂起的 IO。
+    /// Socket.Close 也会通知 reactor；操作所有者仍须在 await 结束后
+    /// 才关闭句柄。监听套接字的 shutdown 在 POSIX 上不可用于取消
+    /// accept；监听器使用取消令牌与 CancelPendingIo。</summary>
     static void ShutdownBoth(nint sock) {
         SysShutdown(sock, 2);   // SD_BOTH / SHUT_RDWR
         #if WINDOWS
@@ -709,26 +744,88 @@ class Socket {
         return client;
     }
 
-    /// <summary>在 IO reactor 上挂起，直到有入站连接
-    /// 待处理，然后接受。要求监听套接字为非阻塞。</summary>
+    /// <summary>在 IO reactor 上等待并接受连接。监听套接字须非阻塞。
+    /// POSIX 只重试瞬时 accept 错误；已 shutdown 但仍分配的 fd 上
+    /// EINVAL 等终止错误直接返回 -1，不因 IsOpen 为真而空转。</summary>
     static async nint AcceptAsync(nint sock) {
-        #if WINDOWS
-        return await Socket.AcceptOv(sock);
-        #else
-        while (true) {
-            await Socket.ReadReady(sock);
-            nint client = Accept(sock);
-            if (client >= 0) {
-                return client;
-            }
-            // accept 挂起期间监听器被关闭（Stop()）：
-            // 它永远不会再就绪，因此直接报告失败，
-            // 而不是永远重新注册监视器。
-            if (!Socket.IsOpen(sock)) {
+        return await Socket.AcceptAsync(sock, null);
+    }
+
+    /// <summary>可取消的 accept；取消/失败返回 -1。调用方必须保留
+    /// sock 到 await 完成，随后才能 close。取消通知重复唤醒以覆盖
+    /// 检查取消状态与 IO 注册之间的竞态；不会 shutdown 监听器。</summary>
+    static async nint AcceptAsync(nint sock, CancellationToken cancellation) {
+        if (sock < 0 || (cancellation != null && cancellation.IsCancellationRequested)) { return -1; }
+        SocketAcceptCancellation state = null;
+        Timer timer = null;
+        if (cancellation != null) {
+            SocketAcceptCancellation callbackState = new SocketAcceptCancellation(sock, cancellation);
+            state = callbackState;
+            timer = new Timer(10, () => { callbackState.Check(); });
+            if (!timer.Start()) {
+                state.Finish();
                 return -1;
             }
+            state.Check();
         }
-        return -1;
+        try {
+            if (cancellation != null && cancellation.IsCancellationRequested) { return -1; }
+            #if WINDOWS
+            nint client = await Socket.AcceptOv(sock);
+            if (client >= 0 && cancellation != null && cancellation.IsCancellationRequested) {
+                Socket.Close(client);
+                return -1;
+            }
+            return client;
+            #elif LINUX || MACOS
+            byte[] clientAddr = new byte[16];
+            byte[] addrLen = new byte[4];
+            byte[] errnoBytes = new byte[4];
+            while (true) {
+                if (cancellation != null && cancellation.IsCancellationRequested) { return -1; }
+                addrLen[0] = 16;
+                // Get the current worker's TLS slot before accept; capture its
+                // result before another FFI call, liveness probe or await.
+                nint errnoSlot = NativeErrnoLocation();
+                nint client = SysAccept(sock, clientAddr, addrLen);
+                if (client >= 0) {
+                    if (cancellation != null && cancellation.IsCancellationRequested) {
+                        Socket.Close(client);
+                        return -1;
+                    }
+                    return client;
+                }
+                PlatMemCopyIn(errnoBytes, errnoSlot, 4);
+                int error = (errnoBytes[0] & 255) + ((errnoBytes[1] & 255) << 8)
+                    + ((errnoBytes[2] & 255) << 16) + ((errnoBytes[3] & 255) << 24);
+                Socket.lastError = error;
+                if (!Socket.IsTransientAcceptError(error)) { return -1; }
+                if (error == 4) { continue; } // EINTR: retry the interrupted syscall.
+                if (cancellation != null && cancellation.IsCancellationRequested) { return -1; }
+                await Socket.ReadReady(sock);
+                if (cancellation != null && cancellation.IsCancellationRequested) { return -1; }
+            }
+            return -1;
+            #else
+            return -1;
+            #endif
+        } finally {
+            if (state != null) { state.Finish(); }
+            if (timer != null) { await timer.StopAsync(); }
+        }
+    }
+
+    /// Platform errno values, not the shared LastSocketError cache. Linux also
+    /// reports pending connection network errors directly from accept(2).
+    static bool IsTransientAcceptError(int error) {
+        #if LINUX
+        return error == 4 || error == 11 || error == 103 || error == 100 ||
+            error == 71 || error == 92 || error == 112 || error == 64 ||
+            error == 113 || error == 95 || error == 101;
+        #elif MACOS
+        return error == 4 || error == 35 || error == 53;
+        #else
+        return false;
         #endif
     }
 

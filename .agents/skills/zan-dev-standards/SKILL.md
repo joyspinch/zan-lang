@@ -230,6 +230,36 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   还要把"静默丢根因"（catch 转 null/默认值且不留任何诊断，如池借出
   null 无日志）与真吞点区分开单独挂账。
 
+- **取消 IO 的顺序是置位、唤醒、确认结束、关闭**：取消通知可能早于 reactor
+  注册，须在取消状态下重复唤醒，保留描述符到 await 完成；停用并排空迟到
+  回调后才允许 close/reuse。显式 stopped 状态禁止 Accept 自动重开。
+  为什么：空闲 accept 停止竞态会挂住关闭流程，迟到通知会误伤复用句柄；
+  POSIX 监听 socket 的 shutdown 不等于取消，仍分配的 fd 上 fatal errno
+  不能按 IsOpen 重试，errno 应在 syscall 后立即保存到局部。Windows
+  取消/复用及真实多进程关闭已验证；POSIX 此次仅静态复核，不冒称实测。
+- **注销后台回调不等于生命周期排空**：进程退出前 await `Timer.StopAsync()`，
+  等已选回调和最后一个共享泵结束；同步 `Stop()` 仍供回调自停。临时批次
+  放同步 helper，返回时释放，不跨后台 Sleep；完成标志须在这些引用释放后发布。
+  为什么：Start/Stop 最小探针五次泄漏临时列表，后台泵还撞上全局析构；
+  排空修正后五次及周期/自停/重启回归均无泄漏。取消回调只捕获独立状态，
+  不捕获持有该 Timer 的 owner，避免 owner→timer→callback→owner 环。
+- **ARC 子助手不要强持有所有者**：构建时短暂传入 owner，勿保存反向字段。
+  为什么：集合持有搜索助手、助手持有集合会把图和倒排表留住，Close 资源
+  不会破环；移除反向引用后重开/检索回归通过泄漏检查。验收须检查 stdout/
+  stderr 的 `memory leak detected`，报告不保证非零退出码，不能只看 exit 0。
+
+- **原生模块拆分先写所有权与内容版本契约**：借用像素须注明有效期、
+  行 stride 的单位和 alpha 格式；接收方要长期持有就用自己的分配器 COPY，
+  不跨独立 CRT 释放。GPU 缓存按内容 serial 更新，不按指针/句柄判断；
+  临时 surface view 不缓存。坑出处：sprite 同 key 重烘焙保留句柄、瞬时
+  view 复用同一地址，只有新 serial 或强制重传才能画出新内容；回归要
+  同时覆盖 padded stride、驱逐重载和稳定句柄换像素。
+- **CPU/GPU 往返要验证方向与提交顺序**：top-down CPU 像素上传到
+  bottom-up framebuffer 时翻转行，readback 做对称变换；dirty shadow
+  首次未初始化时不得比较。坑出处：恢复 CPU 快照后的下一批 GPU 绘图
+  暴露上下倒置，单独 draw/readback 却通过。用无中间读回的
+  2D→batch→snapshot/restore→batch→2D 顺序断言像素；只测单项图元不够。
+
 ## 三、验证纪律（实机/无头通用）
 
 ### 探针测量与脚本改文件的三条硬纪律（2026-10-02 B-ID48 排查沉淀）

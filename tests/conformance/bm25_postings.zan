@@ -1,0 +1,252 @@
+using System;
+using System.Json;
+using System.Text;
+
+namespace Conf;
+
+class OracleDoc {
+    int id;
+    List<TextToken> tokens;
+    int length;
+
+    OracleDoc(int id, List<TextToken> tokens) {
+        this.id = id;
+        this.tokens = tokens;
+        for (int i = 0; i < tokens.Count; i = i + 1) {
+            if (tokens[i].kind == 0) { length = length + 1; }
+        }
+    }
+}
+
+class OracleQueryTerm {
+    string text;
+    double weight;
+
+    OracleQueryTerm(string text, double weight) { this.text = text; this.weight = weight; }
+}
+
+// Exhaustive reference: no postings, reverse frequencies, heaps or BM25 helpers.
+class NaiveBm25 {
+    TextTokenizer tokenizer;
+    List<OracleDoc> docs = new List<OracleDoc>();
+
+    NaiveBm25(TextTokenizer tokenizer) { this.tokenizer = tokenizer; }
+
+    void Add(int id, string text) {
+        OracleDoc doc = new OracleDoc(id, tokenizer.Tokenize(text));
+        for (int i = 0; i < docs.Count; i = i + 1) {
+            if (docs[i].id == id) { docs[i] = doc; return; }
+        }
+        docs.Add(doc);
+    }
+
+    void Remove(int id) {
+        for (int i = 0; i < docs.Count; i = i + 1) {
+            if (docs[i].id == id) { docs.RemoveAt(i); return; }
+        }
+    }
+
+    static double Frequency(OracleDoc doc, string text) {
+        double tf = 0.0;
+        for (int i = 0; i < doc.tokens.Count; i = i + 1) {
+            TextToken token = doc.tokens[i];
+            if (token.text == text) { tf = tf + (token.kind == 0 ? 1.0 : 0.2); }
+        }
+        return tf;
+    }
+
+    List<Bm25Hit> Search(string query, int k, bool evenOnly) {
+        List<Bm25Hit> result = new List<Bm25Hit>();
+        if (k <= 0 || docs.Count == 0) { return result; }
+        List<TextToken> tokens = tokenizer.Tokenize(query);
+        List<OracleQueryTerm> terms = new List<OracleQueryTerm>();
+        for (int i = 0; i < tokens.Count; i = i + 1) {
+            TextToken token = tokens[i];
+            double weight = token.kind == 0 ? 1.0 : 0.2;
+            bool found = false;
+            for (int j = 0; j < terms.Count; j = j + 1) {
+                if (terms[j].text == token.text) {
+                    if (weight > terms[j].weight) { terms[j].weight = weight; }
+                    found = true;
+                }
+            }
+            if (!found) { terms.Add(new OracleQueryTerm(token.text, weight)); }
+        }
+        int total = 0;
+        for (int d = 0; d < docs.Count; d = d + 1) { total = total + docs[d].length; }
+        if (total == 0) { return result; }
+        double avgdl = (double)total / (double)docs.Count;
+        for (int d = 0; d < docs.Count; d = d + 1) {
+            OracleDoc doc = docs[d];
+            if (evenOnly && doc.id % 2 != 0) { continue; }
+            double score = 0.0;
+            for (int t = 0; t < terms.Count; t = t + 1) {
+                OracleQueryTerm term = terms[t];
+                double tf = Frequency(doc, term.text);
+                if (tf == 0.0) { continue; }
+                int df = 0;
+                for (int other = 0; other < docs.Count; other = other + 1) {
+                    if (Frequency(docs[other], term.text) > 0.0) { df = df + 1; }
+                }
+                double idf = Math.Log(1.0 + ((double)(docs.Count - df) + 0.5) / ((double)df + 0.5));
+                double normalization = 1.2 * (0.25 + 0.75 * (double)doc.length / avgdl);
+                score = score + term.weight * idf * tf * 2.2 / (tf + normalization);
+            }
+            if (score > 0.0) {
+                Bm25Hit hit = new Bm25Hit(doc.id, score);
+                int at = result.Count;
+                result.Add(hit);
+                while (at > 0 && result[at - 1].score < score) {
+                    result[at] = result[at - 1]; at = at - 1;
+                }
+                result[at] = hit;
+            }
+        }
+        while (result.Count > k) { result.RemoveAt(result.Count - 1); }
+        return result;
+    }
+}
+
+class Prog {
+    static int bad;
+
+    static void Require(bool condition, string label) {
+        if (!condition) { bad = bad + 1; Console.WriteLine("FAIL " + label); }
+    }
+
+    static bool Even(int id) { return id % 2 == 0; }
+
+    static void Same(List<Bm25Hit> actual, List<Bm25Hit> expected, string label) {
+        Require(actual.Count == expected.Count, label + " count");
+        int n = actual.Count;
+        if (expected.Count < n) { n = expected.Count; }
+        for (int i = 0; i < n; i = i + 1) {
+            double difference = actual[i].score - expected[i].score;
+            if (difference < 0.0) { difference = -difference; }
+            Require(actual[i].id == expected[i].id && difference < 0.0000000001, label + " rank/score");
+        }
+    }
+
+    static void Add(Bm25Index index, NaiveBm25 oracle, int id, string text) {
+        index.Add(id, text); oracle.Add(id, text);
+        Require(index.Count() == oracle.docs.Count, "add count");
+    }
+
+    static void Remove(Bm25Index index, NaiveBm25 oracle, int id) {
+        index.Remove(id); oracle.Remove(id);
+        Require(index.Count() == oracle.docs.Count, "remove count");
+    }
+
+    static void Compare(Bm25Index index, NaiveBm25 oracle, string query) {
+        for (int k = 0; k < 6; k = k + 1) {
+            Same(index.SearchTop(query, k), oracle.Search(query, k, false), query + " top");
+            Same(index.SearchFiltered(query, k, Prog.Even), oracle.Search(query, k, true), query + " filtered");
+        }
+        List<Bm25Hit> expected = oracle.Search(query, oracle.docs.Count, false);
+        List<int> ids = index.Search(query);
+        Require(ids.Count == expected.Count, query + " Search count");
+        for (int i = 0; i < ids.Count && i < expected.Count; i = i + 1) {
+            Require(ids[i] == expected[i].id, query + " Search rank");
+        }
+        Same(index.SearchFiltered(query, 100, null), expected, query + " null filter");
+        Same(index.SearchTop(query, 100), expected, query + " repeat");
+    }
+
+    static void Main() {
+        TextTokenizer latin = new TextTokenizer();
+        Bm25Index index = new Bm25Index(latin);
+        NaiveBm25 oracle = new NaiveBm25(latin);
+        Add(index, oracle, 42, "ALPHA beta beta");
+        Add(index, oracle, 3, "gamma alpha");
+        Add(index, oracle, 19, "");
+        Add(index, oracle, 8, "beta delta");
+        Compare(index, oracle, "alpha beta");
+        Compare(index, oracle, "BETA beta beta");
+        Compare(index, oracle, "delta");
+        Compare(index, oracle, "missing");
+        Compare(index, oracle, "");
+        Add(index, oracle, 42, "gamma delta delta delta");
+        Remove(index, oracle, 3);
+        Remove(index, oracle, -100);
+        Compare(index, oracle, "alpha beta gamma delta");
+        Add(index, oracle, 3, "beta alpha");
+        Compare(index, oracle, "alpha beta");
+
+        TextTokenizer chinese = new TextTokenizer();
+        chinese.AddWord("检索增强生成");
+        chinese.AddWord("大语言模型");
+        Bm25Index zh = new Bm25Index(chinese);
+        NaiveBm25 reference = new NaiveBm25(chinese);
+        Add(zh, reference, 10, "中文数据库全文检索 MySQL");
+        Add(zh, reference, 20, "中文数据库数据库 文档 query");
+        Add(zh, reference, 31, "上海搜索引擎 PostgreSQL");
+        Add(zh, reference, 40, "检索增强生成大语言模型 MySQL");
+        Add(zh, reference, 50, "龘靐齉 quantum");
+        Add(zh, reference, 60, "𠀀𠀁 abc");
+        Add(zh, reference, 70, "中文数据库全文检索 mysql");
+        Add(zh, reference, 80, null);
+        Compare(zh, reference, "中文检索");
+        Compare(zh, reference, "数据库 ＭＹＳＱＬ");
+        Compare(zh, reference, "数据库数据库");
+        Compare(zh, reference, "上海 postgres");
+        Compare(zh, reference, "检索增强生成模型");
+        Compare(zh, reference, "龘靐");
+        Compare(zh, reference, "𠀀𠀁");
+        Add(zh, reference, 20, "MySQL上海文档");
+        Remove(zh, reference, 31);
+        Compare(zh, reference, "数据库上海 mysql");
+        Remove(zh, reference, 10);
+        Add(zh, reference, 10, "中文数据库全文检索 MySQL");
+        Compare(zh, reference, "中文检索 mysql");
+
+        JsonValue state = JsonValue.Parse(zh.ExportState().ToJson());
+        Bm25Index restored = Bm25Index.ImportState(state);
+        Require(restored.Count() == zh.Count(), "snapshot count");
+        Compare(restored, reference, "数据库 mysql");
+        Compare(restored, reference, "检索增强生成");
+        Add(restored, reference, 40, "中文数据库 mysql");
+        Remove(restored, reference, 60);
+        Compare(restored, reference, "数据库 mysql 𠀀");
+        bool rejected = false;
+        state.Set("version", JsonValue.NewInt(2));
+        try { Bm25Index.ImportState(state); }
+        catch (ArgumentException ex) { rejected = true; }
+        Require(rejected, "snapshot version validation");
+        JsonValue corrupt = zh.ExportState();
+        JsonValue docs = corrupt.Get("docs");
+        if (docs != null && docs.IsArray() && docs.Count() > 0) {
+            JsonValue doc = docs.At(0);
+            if (doc != null) { doc.Set("length", JsonValue.NewInt(9999)); }
+        }
+        rejected = false;
+        try { Bm25Index.ImportState(corrupt); }
+        catch (ArgumentException ex) { rejected = true; }
+        Require(rejected, "snapshot length validation");
+
+        Bm25Index ties = new Bm25Index();
+        ties.Add(9, "same"); ties.Add(1, "same"); ties.Add(5, "same");
+        ties.Add(9, "same");
+        List<int> ordered = ties.Search("same");
+        Require(ordered.Count == 3 && ordered[0] == 9 && ordered[1] == 1 && ordered[2] == 5,
+            "stable insertion ties after replacement");
+        List<Bm25Hit> filtered = ties.SearchFiltered("same", 1, id => id != 9);
+        Require(filtered.Count == 1 && filtered[0].id == 1, "filter before top k");
+        ties.Remove(9); ties.Add(9, "same");
+        ordered = ties.Search("same");
+        Require(ordered.Count == 3 && ordered[0] == 1 && ordered[1] == 5 && ordered[2] == 9,
+            "reinsert tie order");
+        Bm25Index sparse = new Bm25Index();
+        for (int i = 0; i < 200; i = i + 1) { sparse.Add(i, "common item" + Convert.ToString(i)); }
+        sparse.Add(1000, "needle needle"); sparse.Add(1001, "needle");
+        Require(sparse.SearchTop("needle needle", 1).Count == 1 && sparse.LastVisitedPostings() == 2,
+            "sparse query visits postings only once");
+        sparse.Add(1000, "replaced");
+        Require(sparse.Search("needle").Count == 1 && sparse.LastVisitedPostings() == 1, "replacement removes posting");
+        sparse.Remove(1001);
+        Require(sparse.Search("needle").Count == 0 && sparse.LastVisitedPostings() == 0, "delete last posting");
+        Require(sparse.SearchTop("common", 0).Count == 0 && sparse.LastVisitedPostings() == 0, "zero top k");
+        Bm25Index blank = new Bm25Index(); blank.Add(1, null); blank.Add(2, "😀");
+        Require(blank.Count() == 2 && blank.Search("数据库").Count == 0, "zero length corpus");
+        Console.WriteLine("bm25-postings-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

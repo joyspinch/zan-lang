@@ -1,0 +1,337 @@
+using System;
+using System.Json;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+/// <summary>A validated request failed without changing committed data.</summary>
+class ZanDbRequestException : Exception {
+    public string code;
+
+    ZanDbRequestException(string code, string message) {
+        this.code = code;
+        this.Message = message;
+    }
+}
+
+/// <summary>The callback owns only this state, which has no timer back-reference.
+/// The monitor prevents a late callback from shutting down a reused handle.</summary>
+class ZanDbIoState {
+    object sync;
+    nint socket;
+    long deadline;
+    CancellationToken cancellation;
+    bool active;
+    bool expired;
+    bool canceled;
+
+    ZanDbIoState(TcpClient client, int timeoutMs, CancellationToken cancellation) {
+        this.sync = new object();
+        this.socket = client.GetSocket();
+        this.deadline = Stopwatch.GetMilliseconds() + timeoutMs;
+        this.cancellation = cancellation;
+        this.active = true;
+        this.expired = false;
+        this.canceled = false;
+    }
+
+    void Check() {
+        lock (this.sync) {
+            if (!this.active) { return; }
+            if (this.cancellation != null && this.cancellation.IsCancellationRequested) {
+                this.canceled = true;
+            }
+            if (Stopwatch.GetMilliseconds() >= this.deadline) { this.expired = true; }
+            if (this.expired || this.canceled) {
+                // Shutdown wakes pending overlapped/readiness IO; only the owner
+                // closes the handle after its awaited operation has completed.
+                Socket.ShutdownBoth(this.socket);
+            }
+        }
+    }
+
+    void Finish() {
+        this.Check();
+        lock (this.sync) { this.active = false; }
+    }
+
+    void ThrowIfAborted() {
+        lock (this.sync) {
+            if (this.canceled) { throw new IOException("ZanDB request canceled; write outcome may be unknown."); }
+            if (this.expired) { throw new TimeoutException("ZanDB frame deadline exceeded; write outcome may be unknown."); }
+        }
+    }
+}
+
+/// <summary>A frame owns its deadline. Finishing disables callbacks before the
+/// socket owner closes the handle; capturing state avoids a Timer/lease cycle.</summary>
+class ZanDbIoLease {
+    ZanDbIoState state;
+    Timer timer;
+
+    ZanDbIoLease(TcpClient client, int timeoutMs, CancellationToken cancellation) {
+        ZanDbIoState state = new ZanDbIoState(client, timeoutMs, cancellation);
+        this.state = state;
+        this.timer = new Timer(10, () => { state.Check(); });
+        if (!this.timer.Start()) {
+            state.Finish();
+            throw new IOException("Cannot start ZanDB frame deadline timer.");
+        }
+        state.Check();
+    }
+
+    async void FinishAsync() {
+        this.state.Finish();
+        await this.timer.StopAsync();
+    }
+
+    void ThrowIfAborted() { this.state.ThrowIfAborted(); }
+}
+
+/// <summary>Version 1: four byte unsigned big endian UTF-8 JSON length, followed
+/// by one JSON object. Version is carried in the required envelope member v.</summary>
+class ZanDbProtocol {
+    static int VERSION = 1;
+    static int MAX_PAYLOAD = 8388608;
+    static int DEFAULT_TIMEOUT_MS = 30000;
+    static int MAX_BATCH = 1000;
+    static int MAX_RESULTS = 1000;
+    static int MAX_VECTOR_DIMENSIONS = 65536;
+    static int MAX_ID = 128;
+    static int MAX_CLIENT = 64;
+
+    static JsonValue Member(JsonValue obj, string key) {
+        JsonValue v = obj.Get(key);
+        return v != null ? v : JsonValue.NewNull();
+    }
+
+    static string RequireString(JsonValue obj, string key) {
+        JsonValue v = ZanDbProtocol.Member(obj, key);
+        if (!v.IsString()) { throw new ZanDbRequestException("invalid_request", key + " must be a string."); }
+        return v.AsString("");
+    }
+
+    static int IntOption(JsonValue obj, string key, int fallback, int lo, int hi) {
+        JsonValue v = obj.Get(key);
+        if (v == null) { return fallback; }
+        if (!v.IsInt()) { throw new ZanDbRequestException("invalid_request", key + " must be an integer."); }
+        long n = v.AsLong(0);
+        if (n < lo || n > hi) { throw new ZanDbRequestException("invalid_request", key + " is out of range."); }
+        return (int)n;
+    }
+
+    static int DocumentId(JsonValue obj) {
+        JsonValue v = ZanDbProtocol.Member(obj, "document_id");
+        if (!v.IsInt()) { throw new ZanDbRequestException("invalid_request", "document_id must be an integer."); }
+        return ZanDbProtocol.IntOption(obj, "document_id", 0, 1, 2147483646);
+    }
+
+    static bool SafeId(string value, int maxBytes) {
+        if (value == null || value.Length == 0 || value.Length > maxBytes) { return false; }
+        for (int i = 0; i < value.Length; i = i + 1) {
+            int c = value[i] & 255;
+            if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) ||
+                (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95) { continue; }
+            return false;
+        }
+        return true;
+    }
+
+    static string Name(JsonValue obj, string key) {
+        string s = ZanDbProtocol.RequireString(obj, key);
+        if (!ZanDbProtocol.SafeId(s, 128)) {
+            throw new ZanDbRequestException("invalid_request", key + " must contain 1..128 ASCII letters, digits, dot, dash or underscore.");
+        }
+        return s;
+    }
+
+    static bool IsWrite(string action) {
+        return action == "insert" || action == "upsert" || action == "update" ||
+            action == "delete" || action == "batch" || action == "ensure_index" ||
+            action == "ensure_text_index" || action == "ensure_vector_index" ||
+            action == "checkpoint_search" || action == "rebuild_search";
+    }
+
+    static bool IsMaintenance(string action) {
+        return action == "ensure_text_index" || action == "ensure_vector_index" ||
+            action == "checkpoint_search" || action == "rebuild_search";
+    }
+
+    static bool IsAction(string action) {
+        return ZanDbProtocol.IsWrite(action) || action == "ping" || action == "get" ||
+            action == "query" || action == "list_indexes" || action == "search_text" ||
+            action == "search_vector" || action == "search_vector_exact" || action == "search_hybrid";
+    }
+
+    /// Reject duplicate keys at every level; otherwise a fingerprint could bind
+    /// different effective requests in clients with different JSON key semantics.
+    static JsonValue Canonical(JsonValue value, int depth) {
+        if (depth > 64) { throw new ZanDbRequestException("invalid_request", "JSON nesting exceeds 64."); }
+        if (value.IsObject()) {
+            List<string> names = new List<string>();
+            Dict<string, JsonValue> values = new Dict<string, JsonValue>();
+            for (int i = 0; i < value.Count(); i = i + 1) {
+                string key = value.KeyAt(i);
+                if (values.ContainsKey(key)) { throw new ZanDbRequestException("invalid_request", "Duplicate JSON member."); }
+                names.Add(key);
+                values.Add(key, value.ValAt(i));
+            }
+            names.Sort();
+            JsonValue sorted = JsonValue.NewObject();
+            for (int i = 0; i < names.Count; i = i + 1) {
+                sorted.Put(names[i], ZanDbProtocol.Canonical(values[names[i]], depth + 1));
+            }
+            return sorted;
+        }
+        if (value.IsArray()) {
+            JsonValue arr = JsonValue.NewArray();
+            for (int i = 0; i < value.Count(); i = i + 1) {
+                arr.Append(ZanDbProtocol.Canonical(value.At(i), depth + 1));
+            }
+            return arr;
+        }
+        return value.Clone();
+    }
+
+    static string Hash(string text) {
+        return Hex.Encode(Sha256.Hash(text, Encoding.GetByteCount(text)), 32);
+    }
+
+    static string Fingerprint(JsonValue request) {
+        JsonValue body = JsonValue.NewObject();
+        for (int i = 0; i < request.Count(); i = i + 1) {
+            string key = request.KeyAt(i);
+            if (key == "token" || key == "client" || key == "id") { continue; }
+            body.Put(key, request.ValAt(i));
+        }
+        return ZanDbProtocol.Hash(ZanDbProtocol.Canonical(body, 0).ToJson());
+    }
+
+    static JsonValue Response(string id, long revision, JsonValue result) {
+        JsonValue r = JsonValue.NewObject();
+        r.PutInt("v", ZanDbProtocol.VERSION);
+        r.PutStr("id", id);
+        r.PutBool("ok", true);
+        r.PutInt("revision", revision);
+        // Detach cache-owned documents while still inside the server gate;
+        // async serialization must not observe a later request's mutations.
+        r.Put("result", result.Clone());
+        return r;
+    }
+
+    static JsonValue Error(string id, long revision, string code, string message) {
+        JsonValue detail = JsonValue.NewObject();
+        detail.PutStr("code", code);
+        detail.PutStr("message", message);
+        JsonValue r = JsonValue.NewObject();
+        r.PutInt("v", ZanDbProtocol.VERSION);
+        r.PutStr("id", id);
+        r.PutBool("ok", false);
+        r.PutInt("revision", revision);
+        r.Put("error", detail);
+        return r;
+    }
+
+    static byte[] Header(int length) {
+        if (length <= 0 || length > ZanDbProtocol.MAX_PAYLOAD) {
+            throw new ZanDbRequestException("frame_too_large", "Payload must contain 1..8388608 bytes.");
+        }
+        byte[] h = new byte[4];
+        h[0] = (byte)((length >> 24) & 255);
+        h[1] = (byte)((length >> 16) & 255);
+        h[2] = (byte)((length >> 8) & 255);
+        h[3] = (byte)(length & 255);
+        return h;
+    }
+
+    static int Length(byte[] header) {
+        long n = ((long)(header[0] & 255) << 24) | ((long)(header[1] & 255) << 16) |
+            ((long)(header[2] & 255) << 8) | (long)(header[3] & 255);
+        if (n <= 0 || n > ZanDbProtocol.MAX_PAYLOAD) {
+            throw new ZanDbRequestException("frame_too_large", "Payload must contain 1..8388608 bytes.");
+        }
+        return (int)n;
+    }
+
+    /// No over-read: each receive is bounded by the remainder of this frame.
+    /// Clean EOF is allowed only before the first byte of the next header.
+    static async bool ReadExact(TcpClient client, byte[] destination, int length, bool allowEof) {
+        client.EnsureNonBlocking();
+        int at = 0;
+        int chunkSize = length < 65536 ? length : 65536;
+        byte[] chunk = new byte[chunkSize];
+        while (at < length) {
+            int remaining = length - at;
+            int take = remaining < chunkSize ? remaining : chunkSize;
+            int n = await Socket.RecvBytesAsync(client.GetSocket(), chunk, take);
+            if (n <= 0) {
+                if (at == 0 && allowEof) { return false; }
+                throw new IOException("Truncated ZanDB frame.");
+            }
+            NativeMemory.Copy((nint)destination + at, (nint)chunk, n);
+            at = at + n;
+        }
+        return true;
+    }
+
+    static async JsonValue ReadAsync(TcpClient client, int timeoutMs, CancellationToken cancellation) {
+        if (timeoutMs <= 0) { throw new ArgumentException("timeoutMs must be positive."); }
+        ZanDbIoLease lease = new ZanDbIoLease(client, timeoutMs, cancellation);
+        JsonValue result = null;
+        try {
+            byte[] header = new byte[4];
+            bool present = await ZanDbProtocol.ReadExact(client, header, 4, true);
+            lease.ThrowIfAborted();
+            if (present) {
+                int length = ZanDbProtocol.Length(header);
+                byte[] body = new byte[length];
+                await ZanDbProtocol.ReadExact(client, body, length, false);
+                lease.ThrowIfAborted();
+                string raw = body.ToStr(0, length);
+                string decoded = Encoding.GetString(body, 0, length);
+                if (Encoding.GetByteCount(raw) != length || decoded != raw) {
+                    throw new ZanDbRequestException("invalid_request", "Frame must contain valid UTF-8 without literal NUL.");
+                }
+                result = JsonValue.Parse(raw);
+                if (!result.IsObject()) { throw new ZanDbRequestException("invalid_request", "Frame must contain a JSON object."); }
+            }
+        } finally {
+            await lease.FinishAsync();
+            // A timeout-triggered shutdown can make ReadExact/WriteExact throw
+            // before returning; preserve the deadline/cancellation diagnosis.
+            lease.ThrowIfAborted();
+        }
+        return result;
+    }
+
+    static async void WriteExact(TcpClient client, byte[] bytes, int length) {
+        int at = 0;
+        while (at < length) {
+            int n = await client.SendBytesAsync(bytes, at, length - at);
+            if (n <= 0) { throw new IOException("Incomplete ZanDB frame write."); }
+            at = at + n;
+        }
+    }
+
+    static async void WriteAsync(TcpClient client, JsonValue value, int timeoutMs, CancellationToken cancellation) {
+        if (timeoutMs <= 0) { throw new ArgumentException("timeoutMs must be positive."); }
+        string text = value.ToJson();
+        int length = Encoding.GetByteCount(text);
+        byte[] header = ZanDbProtocol.Header(length);
+        byte[] body = Encoding.GetBytes(text);
+        ZanDbIoLease lease = new ZanDbIoLease(client, timeoutMs, cancellation);
+        try {
+            await ZanDbProtocol.WriteExact(client, header, 4);
+            lease.ThrowIfAborted();
+            await ZanDbProtocol.WriteExact(client, body, length);
+        } finally {
+            await lease.FinishAsync();
+            // A timeout-triggered shutdown can make ReadExact/WriteExact throw
+            // before returning; preserve the deadline/cancellation diagnosis.
+            lease.ThrowIfAborted();
+        }
+    }
+}

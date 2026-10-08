@@ -229,80 +229,100 @@ class SegmentFile {
     static SegmentFile Open(string segPath) {
         SegmentFile sf = new SegmentFile();
         sf.path = segPath;
-        // 段只读打开；PageFile.Open 有「不存在即创建」的副作用，
-        // 会把拼错/缺失的段名变成空文件，这里先挡掉。
-        if (!File.Exists(segPath)) {
-            sf.lastError = "segment missing: " + segPath;
-            return sf;
-        }
-        sf.file = PageFile.Open(segPath);
-        if (!sf.file.IsOpen()) {
-            sf.lastError = sf.file.GetError();
-            return sf;
-        }
-        long size = sf.file.Size();
-        if (size < 28) {
-            sf.lastError = "segment too short";
-            return sf;
-        }
-        ByteBuffer tail = ByteBuffer.Alloc(12);
-        sf.file.ReadAt(size - 12, tail, 12);
-        tail.SeekRead(0);
-        long indexOff = tail.ReadU64();
-        string magic = tail.Str(8, 4);
-        tail.Free();
-        if (magic != SegmentFile.MAGIC || indexOff < 16 || indexOff >= size - 12) {
-            sf.lastError = "segment footer corrupt";
-            return sf;
-        }
-        ByteBuffer head = ByteBuffer.Alloc(16);
-        sf.file.ReadAt(0, head, 16);
-        head.SeekRead(0);
-        string hmagic = head.Str(0, 4);
-        // Str 是绝对切片、不移动读游标：版本号要从偏移 4 读起。
-        head.SeekRead(4);
-        long ver = head.ReadU32();
-        long count = head.ReadU64();
-        head.Free();
-        if (hmagic != SegmentFile.MAGIC || ver != SegmentWriter.VERSION) {
-            sf.lastError = "segment header corrupt";
-            return sf;
-        }
-        sf.recordCount = count;
-        sf.indexStart = indexOff;
-
-        ByteBuffer idx = ByteBuffer.Alloc(256);
-        int idxLen = (int)(size - 12 - (indexOff + 4));
-        if (idxLen < 0) {
-            sf.lastError = "segment index corrupt";
-            idx.Free();
-            return sf;
-        }
-        idx.EnsureCapacity(idxLen);
-        int got = sf.file.ReadAt(indexOff + 4, idx, idxLen);
-        if (got != idxLen) {
-            sf.lastError = "segment index short read";
-            idx.Free();
-            return sf;
-        }
-        idx.SeekRead(0);
-        ByteBuffer cnt = ByteBuffer.Alloc(4);
-        sf.file.ReadAt(indexOff, cnt, 4);
-        cnt.SeekRead(0);
-        int n = (int)cnt.ReadU32();
-        cnt.Free();
-        for (int i = 0; i < n; i = i + 1) {
-            if (!idx.CanRead(10)) {
-                sf.lastError = "segment index truncated";
-                idx.Free();
+        if (!File.Exists(segPath)) { sf.lastError = "segment missing: " + segPath; return sf; }
+        ByteBuffer tail = null;
+        ByteBuffer head = null;
+        ByteBuffer idx = null;
+        ByteBuffer cnt = null;
+        try {
+            sf.file = PageFile.OpenExisting(segPath);
+            if (!sf.file.IsOpen()) { sf.lastError = sf.file.GetError(); return sf; }
+            long size = sf.file.Size();
+            if (size < 0) { sf.lastError = sf.file.GetError(); return sf; }
+            if (size < 32) { sf.lastError = "segment too short"; return sf; }
+            tail = ByteBuffer.Alloc(12);
+            if (sf.file.ReadAt(size - 12, tail, 12) != 12) {
+                sf.lastError = "segment footer short read";
                 return sf;
             }
-            long off = idx.ReadU64();
-            string key = idx.ReadString();
-            long crc = idx.ReadU32();
-            sf.entries.Add(new SegmentIndexEntry(off, key, crc));
+            tail.SeekRead(0);
+            long indexOff = tail.ReadU64();
+            if (tail.Str(8, 4) != SegmentFile.MAGIC || indexOff < 16 || indexOff > size - 16) {
+                sf.lastError = "segment footer corrupt";
+                return sf;
+            }
+            head = ByteBuffer.Alloc(16);
+            if (sf.file.ReadAt(0, head, 16) != 16) {
+                sf.lastError = "segment header short read";
+                return sf;
+            }
+            head.SeekRead(4);
+            long ver = head.ReadU32();
+            long count = head.ReadU64();
+            if (head.Str(0, 4) != SegmentFile.MAGIC || ver != SegmentWriter.VERSION
+                    || count < 0 || count > 2147483647) {
+                sf.lastError = "segment header corrupt";
+                return sf;
+            }
+            sf.recordCount = count;
+            sf.indexStart = indexOff;
+            long indexBytes = size - 16 - indexOff;
+            if (indexBytes > 2147483647) { sf.lastError = "segment index exceeds bounds"; return sf; }
+            int idxLen = (int)indexBytes;
+            cnt = ByteBuffer.Alloc(4);
+            if (sf.file.ReadAt(indexOff, cnt, 4) != 4) {
+                sf.lastError = "segment index count short read";
+                return sf;
+            }
+            cnt.SeekRead(0);
+            long n = cnt.ReadU32();
+            if (n > idxLen / 13 || (n == 0) != (count == 0)) {
+                sf.lastError = "segment index count corrupt";
+                return sf;
+            }
+            idx = ByteBuffer.Alloc(idxLen);
+            if (sf.file.ReadAt(indexOff + 4, idx, idxLen) != idxLen) {
+                sf.lastError = "segment index short read";
+                return sf;
+            }
+            idx.SeekRead(0);
+            long prevOff = 0;
+            string prevKey = "";
+            for (long i = 0; i < n; i = i + 1) {
+                if (!idx.CanRead(13)) { sf.lastError = "segment index truncated"; return sf; }
+                long off = idx.ReadU64();
+                int at = idx.ReadPos();
+                int keyAt = at;
+                long keyLen = idx.ReadVarIntAt(at, out keyAt);
+                if (keyLen < 0 || keyAt <= at || keyAt - at > 5 || keyLen > idx.Length() - keyAt - 4
+                        || off < 16 || off >= indexOff || (i == 0 && off != 16) || (i > 0 && off <= prevOff)) {
+                    sf.lastError = "segment index entry corrupt";
+                    return sf;
+                }
+                string key = idx.Str(keyAt, (int)keyLen);
+                if (i > 0 && String.CompareOrdinal(prevKey, key) >= 0) {
+                    sf.lastError = "segment index key order corrupt";
+                    return sf;
+                }
+                idx.SeekRead(keyAt + (int)keyLen);
+                long crc = idx.ReadU32();
+                sf.entries.Add(new SegmentIndexEntry(off, key, crc));
+                prevOff = off;
+                prevKey = key;
+            }
+            if (idx.Remaining() != 0 || (n == 0 && indexOff != 16)) {
+                sf.lastError = "segment index trailing data";
+            }
+        } catch (Exception ex) {
+            // Open 的错误值契约：格式/读取异常留诊断，不泄漏内部句柄。
+            sf.lastError = "segment open failed: " + ex.Message;
+        } finally {
+            if (tail != null) { tail.Free(); }
+            if (head != null) { head.Free(); }
+            if (idx != null) { idx.Free(); }
+            if (cnt != null) { cnt.Free(); }
+            if (sf.lastError != "") { sf.Close(); }
         }
-        idx.Free();
         return sf;
     }
 
@@ -563,27 +583,34 @@ class SegmentFile {
         while (bi < this.entries.Count) {
             ByteBuffer b = this.LoadBlock(bi);
             if (b == null) { return added; }
-            while (true) {
-                string rk;
-                string rv;
-                int rop;
-                if (!SegmentFile.NextRecord(b, out rk, out rv, out rop)) { break; }
-                if (String.CompareOrdinal(rk, fromKey) < 0) { continue; }
-                if (!visit(rk, rv, rop)) {
-                    b.Free();
-                    return added;
+            try {
+                while (b.Remaining() > 0) {
+                    string rk;
+                    string rv;
+                    int rop;
+                    if (!SegmentFile.NextRecord(b, out rk, out rv, out rop)) {
+                        this.lastError = "segment record corrupt";
+                        return added;
+                    }
+                    if (String.CompareOrdinal(rk, fromKey) < 0) { continue; }
+                    if (!visit(rk, rv, rop)) { return added; }
+                    added = added + 1;
                 }
-                added = added + 1;
+            } catch (Exception ex) {
+                // 扫描错误值契约：恢复调用方读取 GetError，块缓冲仍释放。
+                this.lastError = "segment scan failed: " + ex.Message;
+                return added;
+            } finally {
+                b.Free();
             }
-            b.Free();
             bi = bi + 1;
         }
         return added;
     }
 
-    /// 关闭底层文件句柄。
+    /// 错误/缺失段也允许幂等关闭。
     void Close() {
-        this.file.Close();
+        if (this.file != null) { this.file.Close(); }
     }
 }
 

@@ -1,270 +1,414 @@
 using System;
+using System.Json;
 
 namespace System.Text;
 
-/// <summary>索引内的一篇文档：id、词频表与总词元长度。</summary>
-class Bm25Document {
-    /// 文档 id（调用方指定）。
-    int id;
-    /// 词元 -> 词频。
-    Dictionary<string, int> terms;
-    /// 词元总数（词频之和），BM25 长度归一用。
-    int length;
+delegate bool Bm25Filter(int id);
 
-    /// 构造文档记录。
-    Bm25Document(int id, Dictionary<string, int> terms, int length) {
+class Bm25Term {
+    string text;
+    int primary;
+    int auxiliary;
+    int slot;
+
+    Bm25Term(string text) { this.text = text; }
+}
+
+class Bm25Document {
+    int id;
+    int length;
+    long order;
+    Dictionary<string, Bm25Term> terms = new Dictionary<string, Bm25Term>();
+    List<Bm25Term> termList = new List<Bm25Term>();
+
+    Bm25Document(int id, long order) {
         this.id = id;
-        this.terms = terms;
-        this.length = length;
+        this.order = order;
     }
 }
 
-/// <summary>一次命中的内部记分记录。</summary>
-class Bm25Hit {
-    /// 文档 id。
+class Bm25Posting {
     int id;
-    /// BM25 分数。
+    Bm25Term frequency;
+
+    Bm25Posting(int id, Bm25Term frequency) {
+        this.id = id;
+        this.frequency = frequency;
+    }
+}
+
+class Bm25PostingList {
+    List<Bm25Posting> entries = new List<Bm25Posting>();
+}
+
+class Bm25Hit {
+    int id;
     double score;
 
-    /// 构造命中记录。
     Bm25Hit(int id, double score) {
         this.id = id;
         this.score = score;
     }
 }
 
-/// <summary>
-/// 一个轻量的内存 BM25（Best Matching 25）文本索引。文档按
-/// 分词（转小写、按非字母数字字符切分），并对照查询
-/// 用标准参数 k1=1.2、b=0.75 打分；返回结果
-/// 为按分数降序排列的文档 id。
-///
-///   Bm25Index idx = new Bm25Index();
-///   idx.Add(1, "the quick brown fox jumps");
-///   idx.Add(2, "lazy dog sleeps all day");
-///   List<int> hits = idx.Search("quick fox");   // [1]
-///
-/// 纯算法实现，无平台依赖；按 IDE 级语料规模设计
-/// （数千文档、小词元）——每次查询都会扫描全部文档。
-/// </summary>
-class Bm25Index {
-    /// 全部已索引文档。
-    List<Bm25Document> documents = new List<Bm25Document>();
-    /// 词元 -> 含它的文档数（文档频率）。
-    Dictionary<string, int> df = new Dictionary<string, int>();
-    /// 全部文档的词元长度之和。
-    int totalLen;
-    /// BM25 饱和参数 k1（1.2）。
-    double k1;
-    /// BM25 长度归一参数 b（0.75）。
-    double b;
+class Bm25Candidate {
+    int id;
+    double score;
+    long order;
 
-    /// 创建空索引，参数取标准值 k1=1.2、b=0.75。
-    Bm25Index() {
-        this.k1 = 1.2;
-        this.b = 0.75;
-        this.totalLen = 0;
-    }
-    /// <summary>添加文档。重复添加同一 id 会替换其内容。</summary>
-    void Add(int docId, string text) {
-        Dictionary<string, int> terms = Bm25Index.Tokenize(text);
-        int len = 0;
-        List<string> keys = terms.Keys;
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            int f = terms[keys[i]];
-            len = len + f;
-        }
-        // 就地替换已存在的 id。
-        int pos = -1;
-        for (int j = 0; j < documents.Count; j = j + 1) {
-            if (documents[j].id == docId) { pos = j; }
-        }
-        if (pos >= 0) {
-            // 从 df 和总计数中减去旧文档。
-            List<string> old = documents[pos].terms.Keys;
-            for (int k = 0; k < old.Count; k = k + 1) {
-                DecDf(old[k]);
-            }
-            totalLen = totalLen - documents[pos].length;
-            documents[pos].terms = terms;
-            documents[pos].length = len;
-        } else {
-            documents.Add(new Bm25Document(docId, terms, len));
-        }
-        totalLen = totalLen + len;
-        // 统计每个词元的文档频率。
-        for (int k = 0; k < keys.Count; k = k + 1) {
-            IncDf(keys[k]);
-        }
-    }
-
-    /// <summary>删除一个文档 id；不存在时不作任何操作。</summary>
-    void Remove(int docId) {
-        int pos = -1;
-        for (int j = 0; j < documents.Count; j = j + 1) {
-            if (documents[j].id == docId) { pos = j; }
-        }
-        if (pos < 0) { return; }
-        List<string> old = documents[pos].terms.Keys;
-        for (int k = 0; k < old.Count; k = k + 1) {
-            DecDf(old[k]);
-        }
-        totalLen = totalLen - documents[pos].length;
-        documents.RemoveAt(pos);
-    }
-
-    /// <summary>已索引的文档数量。</summary>
-    int Count() { return documents.Count; }
-
-    /// <summary>对所有文档按 `query` 打分；分数非零的 id 才会被返回，
-    /// 分数从高到低。空查询返回空结果。</summary>
-    List<int> Search(string query) {
-        List<string> terms = Bm25Index.UniqueTerms(query);
-        List<int> results = new List<int>();
-        if (terms.Count == 0 || documents.Count == 0) { return results; }
-        double avgdl = (double)totalLen / (double)documents.Count;
-        int n = documents.Count;
-        List<Bm25Hit> hits = new List<Bm25Hit>();
-        for (int d = 0; d < documents.Count; d = d + 1) {
-            Bm25Document document = documents[d];
-            double score = 0.0;
-            for (int t = 0; t < terms.Count; t = t + 1) {
-                string term = terms[t];
-                int tf = 0;
-                Dictionary<string, int> dt = document.terms;
-                List<string> dk = dt.Keys;
-                for (int ki = 0; ki < dk.Count; ki = ki + 1) {
-                    if (dk[ki] == term) { tf = dt[term]; }
-                }
-                if (tf > 0) {
-                    int docFreq = DfOf(term);
-                    double idf = Math.Log(1.0 + ((double)(n - docFreq) + 0.5)
-                                                 / ((double)docFreq + 0.5));
-                    double denom = (double)tf
-                        + k1 * (1.0 - b
-                        + b * (double)document.length / avgdl);
-                    score = score + idf * (double)tf * (k1 + 1.0) / denom;
-                }
-            }
-            if (score > 0.0) {
-                // 按分数降序插入排序（同分时保持稳定）。
-                Bm25Hit hit = new Bm25Hit(document.id, score);
-                int ins = hits.Count;
-                hits.Add(hit);
-                while (ins > 0 && hits[ins - 1].score < score) {
-                    hits[ins] = hits[ins - 1];
-                    ins = ins - 1;
-                }
-                hits[ins] = hit;
-            }
-        }
-        for (int r = 0; r < hits.Count; r = r + 1) {
-            results.Add(hits[r].id);
-        }
-        return results;
-    }
-
-    // ---- 辅助 ----
-
-    /// 分词：转小写、按非字母数字字符切分，返回词元 -> 词频。
-    static Dictionary<string, int> Tokenize(string text) {
-        Dictionary<string, int> terms = new Dictionary<string, int>();
-        if (text == null) { return terms; }
-        int len = text.Length;
-        int start = 0;
-        bool inToken = false;
-        for (int i = 0; i < len; i = i + 1) {
-            int c = text[i] & 255;
-            bool alnum = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57);
-            if (alnum) {
-                if (!inToken) {
-                    start = i;
-                    inToken = true;
-                }
-            } else {
-                if (inToken) {
-                    string tok = text.Substring(start, i - start).ToLower();
-                    Bm25Index.AddTerm(terms, tok);
-                    inToken = false;
-                }
-            }
-        }
-        if (inToken) {
-            string tok = text.Substring(start, len - start).ToLower();
-            Bm25Index.AddTerm(terms, tok);
-        }
-        return terms;
-    }
-
-    /// 查询分词并去重（保持首次出现顺序）。
-    static List<string> UniqueTerms(string query) {
-        List<string> terms = new List<string>();
-        Dictionary<string, int> seen = new Dictionary<string, int>();
-        Dictionary<string, int> all = Bm25Index.Tokenize(query);
-        List<string> keys = all.Keys;
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            string k = keys[i];
-            if (Bm25Index.GetSeen(seen, k) == 0) {
-                terms.Add(k);
-                seen[k] = 1;
-            }
-        }
-        return terms;
-    }
-
-    /// seen 字典的取值，缺失为 0。
-    static int GetSeen(Dictionary<string, int> seen, string key) {
-        List<string> keys = seen.Keys;
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            if (keys[i] == key) { return seen[key]; }
-        }
-        return 0;
-    }
-
-    /// 词频表累加一次该词元。
-    static void AddTerm(Dictionary<string, int> terms, string term) {
-        List<string> keys = terms.Keys;
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            if (keys[i] == term) {
-                terms[term] = terms[term] + 1;
-                return;
-            }
-        }
-        terms[term] = 1;
-    }
-
-    /// 词元的文档频率，缺失为 0。
-    int DfOf(string term) {
-        List<string> keys = df.Keys;
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            if (keys[i] == term) { return df[term]; }
-        }
-        return 0;
-    }
-
-    /// 文档频率 +1（不存在则置 1）。
-    void IncDf(string term) {
-        List<string> keys = df.Keys;
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            if (keys[i] == term) {
-                df[term] = df[term] + 1;
-                return;
-            }
-        }
-        df[term] = 1;
-    }
-
-    /// 文档频率 -1，减到 0 时移除。
-    void DecDf(string term) {
-        List<string> keys = df.Keys;
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            if (keys[i] == term) {
-                int v = df[term] - 1;
-                if (v <= 0) { df.Remove(term); }
-                else { df[term] = v; }
-                return;
-            }
-        }
+    Bm25Candidate(int id, long order) {
+        this.id = id;
+        this.order = order;
     }
 }
 
+class Bm25QueryTerm {
+    string text;
+    double weight;
+
+    Bm25QueryTerm(string text, double weight) {
+        this.text = text;
+        this.weight = weight;
+    }
+}
+
+class Bm25Index {
+    Dictionary<int, Bm25Document> documents = new Dictionary<int, Bm25Document>();
+    Dictionary<string, Bm25PostingList> postings = new Dictionary<string, Bm25PostingList>();
+    TextTokenizer tokenizer;
+    long totalLen;
+    long nextOrder;
+    int visitedPostings;
+    double k1 = 1.2;
+    double b = 0.75;
+    double auxiliaryWeight = 0.2;
+
+    Bm25Index() {
+        tokenizer = new TextTokenizer();
+    }
+
+    // Snapshot the lexicon so subsequent AddWord calls cannot mix index configurations.
+    Bm25Index(TextTokenizer tokenizer) {
+        if (tokenizer == null) { this.tokenizer = new TextTokenizer(); }
+        else { this.tokenizer = TextTokenizer.ImportState(tokenizer.ExportState()); }
+    }
+
+    void Add(int id, string text) {
+        long order = nextOrder;
+        bool replacing = documents.ContainsKey(id);
+        if (replacing) { order = documents[id].order; }
+        Bm25Document document = new Bm25Document(id, order);
+        List<TextToken> tokens = tokenizer.Tokenize(text);
+        for (int i = 0; i < tokens.Count; i = i + 1) {
+            TextToken token = tokens[i];
+            Bm25Term frequency;
+            if (document.terms.ContainsKey(token.text)) {
+                frequency = document.terms[token.text];
+            } else {
+                frequency = new Bm25Term(token.text);
+                document.terms[token.text] = frequency;
+                document.termList.Add(frequency);
+            }
+            if (token.kind == 0) {
+                frequency.primary = frequency.primary + 1;
+                document.length = document.length + 1;
+            } else {
+                frequency.auxiliary = frequency.auxiliary + 1;
+            }
+        }
+        if (replacing) { Detach(documents[id]); }
+        else { nextOrder = nextOrder + 1; }
+        documents[id] = document;
+        Attach(document);
+    }
+
+    void Remove(int id) {
+        if (!documents.ContainsKey(id)) { return; }
+        Detach(documents[id]);
+        documents.Remove(id);
+    }
+
+    int Count() { return documents.Count; }
+
+    int LastVisitedPostings() { return visitedPostings; }
+
+    List<int> Search(string query) {
+        List<Bm25Hit> hits = SearchTop(query, documents.Count);
+        List<int> ids = new List<int>();
+        for (int i = 0; i < hits.Count; i = i + 1) { ids.Add(hits[i].id); }
+        return ids;
+    }
+
+    List<Bm25Hit> SearchTop(string query, int k) {
+        return SearchFiltered(query, k, null);
+    }
+
+    // Filtering precedes heap selection; a rejected high score cannot consume a slot.
+    List<Bm25Hit> SearchFiltered(string query, int k, Bm25Filter filter) {
+        visitedPostings = 0;
+        List<Bm25Hit> result = new List<Bm25Hit>();
+        if (k <= 0 || documents.Count == 0 || totalLen == 0) { return result; }
+        List<Bm25QueryTerm> queryTerms = QueryTerms(query);
+        if (queryTerms.Count == 0) { return result; }
+        double avgdl = (double)totalLen / (double)documents.Count;
+        Dictionary<int, Bm25Candidate> scores = new Dictionary<int, Bm25Candidate>();
+        Dictionary<int, int> rejected = new Dictionary<int, int>();
+        List<Bm25Candidate> candidates = new List<Bm25Candidate>();
+        for (int t = 0; t < queryTerms.Count; t = t + 1) {
+            Bm25QueryTerm term = queryTerms[t];
+            if (!postings.ContainsKey(term.text)) { continue; }
+            Bm25PostingList list = postings[term.text];
+            int df = list.entries.Count;
+            double idf = Math.Log(1.0 + ((double)(documents.Count - df) + 0.5)
+                / ((double)df + 0.5));
+            for (int p = 0; p < list.entries.Count; p = p + 1) {
+                visitedPostings = visitedPostings + 1;
+                Bm25Posting posting = list.entries[p];
+                if (rejected.ContainsKey(posting.id)) { continue; }
+                Bm25Document document = documents[posting.id];
+                Bm25Candidate candidate;
+                if (scores.ContainsKey(posting.id)) {
+                    candidate = scores[posting.id];
+                } else {
+                    if (filter != null && !filter(posting.id)) {
+                        rejected[posting.id] = 1;
+                        continue;
+                    }
+                    candidate = new Bm25Candidate(posting.id, document.order);
+                    scores[posting.id] = candidate;
+                    candidates.Add(candidate);
+                }
+                // Auxiliary tf/query weight is 0.2; only primary tokens affect dl/avgdl.
+                Bm25Term frequency = posting.frequency;
+                double tf = (double)frequency.primary + auxiliaryWeight * (double)frequency.auxiliary;
+                double denom = tf + k1 * (1.0 - b + b * (double)document.length / avgdl);
+                candidate.score = candidate.score + term.weight * idf * tf * (k1 + 1.0) / denom;
+            }
+        }
+        if (k > candidates.Count) { k = candidates.Count; }
+        List<Bm25Candidate> heap = new List<Bm25Candidate>();
+        for (int i = 0; i < candidates.Count; i = i + 1) {
+            Bm25Candidate candidate = candidates[i];
+            if (heap.Count < k) { HeapPush(heap, candidate); }
+            else if (k > 0 && Better(candidate, heap[0])) {
+                heap[0] = candidate;
+                HeapDown(heap, 0);
+            }
+        }
+        while (heap.Count > 0) {
+            Bm25Candidate worst = HeapPop(heap);
+            result.Add(new Bm25Hit(worst.id, worst.score));
+        }
+        result.Reverse();
+        return result;
+    }
+
+    JsonValue ExportState() {
+        JsonValue state = JsonValue.NewObject();
+        state.PutInt("version", 1);
+        state.PutInt("nextOrder", nextOrder);
+        state.Put("tokenizer", tokenizer.ExportState());
+        JsonValue docs = JsonValue.NewArray();
+        // Keys is used only to enumerate a snapshot, never to resolve a term or id.
+        List<int> ids = documents.Keys;
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            Bm25Document document = documents[ids[i]];
+            JsonValue doc = JsonValue.NewObject();
+            doc.PutInt("id", document.id);
+            doc.PutInt("order", document.order);
+            doc.PutInt("length", document.length);
+            JsonValue terms = JsonValue.NewArray();
+            for (int t = 0; t < document.termList.Count; t = t + 1) {
+                Bm25Term frequency = document.termList[t];
+                JsonValue term = JsonValue.NewObject();
+                term.PutStr("text", frequency.text);
+                term.PutInt("primary", frequency.primary);
+                term.PutInt("auxiliary", frequency.auxiliary);
+                terms.Append(term);
+            }
+            doc.Put("terms", terms);
+            docs.Append(doc);
+        }
+        state.Put("docs", docs);
+        return state;
+    }
+
+    // Restore reverse frequencies directly; source texts are not needed or retokenized.
+    static Bm25Index ImportState(JsonValue state) {
+        if (state == null || !state.IsObject() || StateInteger(state, "version") != 1) {
+            throw new ArgumentException("Invalid BM25 state/version");
+        }
+        JsonValue tokenizerState = state.Get("tokenizer");
+        JsonValue docs = state.Get("docs");
+        if (tokenizerState == null || docs == null || !docs.IsArray()) {
+            throw new ArgumentException("Invalid BM25 state shape");
+        }
+        Bm25Index result = new Bm25Index();
+        result.tokenizer = TextTokenizer.ImportState(tokenizerState);
+        result.nextOrder = StateInteger(state, "nextOrder");
+        if (result.nextOrder < 0 || result.nextOrder == 9223372036854775807) {
+            throw new ArgumentException("Invalid BM25 order counter");
+        }
+        Dictionary<long, int> orders = new Dictionary<long, int>();
+        for (int i = 0; i < docs.Count(); i = i + 1) {
+            JsonValue doc = docs.At(i);
+            if (doc == null || !doc.IsObject()) { throw new ArgumentException("Invalid BM25 document"); }
+            long id = StateInteger(doc, "id");
+            long order = StateInteger(doc, "order");
+            long length = StateInteger(doc, "length");
+            if (id < -2147483648 || id > 2147483647 || length < 0 || length > 2147483647
+                    || order < 0 || order >= result.nextOrder || orders.ContainsKey(order)
+                    || result.documents.ContainsKey((int)id)) {
+                throw new ArgumentException("Invalid BM25 document id/order/length");
+            }
+            JsonValue terms = doc.Get("terms");
+            if (terms == null || !terms.IsArray()) { throw new ArgumentException("Invalid BM25 terms"); }
+            Bm25Document document = new Bm25Document((int)id, order);
+            document.length = (int)length;
+            long primaryLength = 0;
+            for (int t = 0; t < terms.Count(); t = t + 1) {
+                JsonValue term = terms.At(t);
+                if (term == null || !term.IsObject()) { throw new ArgumentException("Invalid BM25 term"); }
+                JsonValue text = term.Get("text");
+                if (text == null || !text.IsString()) { throw new ArgumentException("Invalid BM25 term text"); }
+                string key = text.AsString("");
+                long primary = StateInteger(term, "primary");
+                long auxiliary = StateInteger(term, "auxiliary");
+                if (key.Length == 0 || primary < 0 || primary > 2147483647 || auxiliary < 0
+                        || auxiliary > 2147483647 || (primary == 0 && auxiliary == 0)
+                        || document.terms.ContainsKey(key) || !ValidStateTerm(key)) {
+                    throw new ArgumentException("Invalid BM25 term frequencies");
+                }
+                Bm25Term frequency = new Bm25Term(key);
+                frequency.primary = (int)primary;
+                frequency.auxiliary = (int)auxiliary;
+                document.terms[key] = frequency;
+                document.termList.Add(frequency);
+                primaryLength = primaryLength + primary;
+                if (primaryLength > length) { throw new ArgumentException("BM25 length mismatch"); }
+            }
+            if (primaryLength != length || (length == 0 && document.termList.Count != 0)) {
+                throw new ArgumentException("BM25 length mismatch");
+            }
+            result.documents[(int)id] = document;
+            orders[order] = 1;
+            result.Attach(document);
+        }
+        return result;
+    }
+
+    static long StateInteger(JsonValue state, string key) {
+        JsonValue value = state.Get(key);
+        if (value == null || !value.IsNumber() || !value.numIsInt) {
+            throw new ArgumentException("Invalid BM25 integer: " + key);
+        }
+        return value.AsLong(0);
+    }
+
+    static bool ValidStateTerm(string text) {
+        int[] scalar = new int[1];
+        int cursor = 0;
+        while (cursor < text.Length) {
+            int used = Encoding.DecodeCodePoint(text, cursor, scalar);
+            int cp = scalar[0];
+            if (!TextTokenizer.IsAsciiWord(cp) && !TextTokenizer.IsCjk(cp)) { return false; }
+            cursor = cursor + used;
+        }
+        return true;
+    }
+
+    List<Bm25QueryTerm> QueryTerms(string query) {
+        List<TextToken> tokens = tokenizer.Tokenize(query);
+        Dictionary<string, Bm25QueryTerm> seen = new Dictionary<string, Bm25QueryTerm>();
+        List<Bm25QueryTerm> terms = new List<Bm25QueryTerm>();
+        for (int i = 0; i < tokens.Count; i = i + 1) {
+            TextToken token = tokens[i];
+            double weight = token.kind == 0 ? 1.0 : auxiliaryWeight;
+            if (seen.ContainsKey(token.text)) {
+                Bm25QueryTerm existing = seen[token.text];
+                if (weight > existing.weight) { existing.weight = weight; }
+            } else {
+                Bm25QueryTerm term = new Bm25QueryTerm(token.text, weight);
+                seen[token.text] = term;
+                terms.Add(term);
+            }
+        }
+        return terms;
+    }
+
+    void Attach(Bm25Document document) {
+        for (int i = 0; i < document.termList.Count; i = i + 1) {
+            Bm25Term frequency = document.termList[i];
+            Bm25PostingList list;
+            if (postings.ContainsKey(frequency.text)) { list = postings[frequency.text]; }
+            else {
+                list = new Bm25PostingList();
+                postings[frequency.text] = list;
+            }
+            frequency.slot = list.entries.Count;
+            list.entries.Add(new Bm25Posting(document.id, frequency));
+        }
+        totalLen = totalLen + (long)document.length;
+    }
+
+    // Reverse tf records own posting slots; swap removal repairs the moved slot in O(1).
+    void Detach(Bm25Document document) {
+        for (int i = 0; i < document.termList.Count; i = i + 1) {
+            Bm25Term frequency = document.termList[i];
+            Bm25PostingList list = postings[frequency.text];
+            int last = list.entries.Count - 1;
+            if (frequency.slot != last) {
+                Bm25Posting moved = list.entries[last];
+                list.entries[frequency.slot] = moved;
+                moved.frequency.slot = frequency.slot;
+            }
+            list.entries.RemoveAt(last);
+            if (list.entries.Count == 0) { postings.Remove(frequency.text); }
+        }
+        totalLen = totalLen - (long)document.length;
+    }
+
+    // Preserve the original Search's insertion-order ties, including in-place updates.
+    static bool Better(Bm25Candidate a, Bm25Candidate b) {
+        if (a.score != b.score) { return a.score > b.score; }
+        if (a.order != b.order) { return a.order < b.order; }
+        return a.id < b.id;
+    }
+
+    static void HeapPush(List<Bm25Candidate> heap, Bm25Candidate candidate) {
+        int child = heap.Count;
+        heap.Add(candidate);
+        while (child > 0) {
+            int parent = (child - 1) / 2;
+            if (!Better(heap[parent], heap[child])) { break; }
+            Bm25Candidate swap = heap[parent];
+            heap[parent] = heap[child];
+            heap[child] = swap;
+            child = parent;
+        }
+    }
+
+    static void HeapDown(List<Bm25Candidate> heap, int parent) {
+        while (parent * 2 + 1 < heap.Count) {
+            int worst = parent;
+            int left = parent * 2 + 1;
+            int right = left + 1;
+            if (Better(heap[worst], heap[left])) { worst = left; }
+            if (right < heap.Count && Better(heap[worst], heap[right])) { worst = right; }
+            if (worst == parent) { break; }
+            Bm25Candidate swap = heap[parent];
+            heap[parent] = heap[worst];
+            heap[worst] = swap;
+            parent = worst;
+        }
+    }
+
+    static Bm25Candidate HeapPop(List<Bm25Candidate> heap) {
+        Bm25Candidate result = heap[0];
+        int last = heap.Count - 1;
+        if (last > 0) { heap[0] = heap[last]; }
+        heap.RemoveAt(last);
+        if (heap.Count > 0) { HeapDown(heap, 0); }
+        return result;
+    }
+}

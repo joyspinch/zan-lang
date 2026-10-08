@@ -1,0 +1,128 @@
+using System;
+using System.Net.Sockets;
+using System.Threading;
+
+class TcpListenerCancelTest {
+    const int PORT = 39745;
+    static object sync = new object();
+    static int canceled = 0;
+    static int checks = 0;
+
+    static void Check(bool condition, string name) {
+        if (!condition) { throw new Exception(name); }
+        checks = checks + 1;
+        Console.WriteLine("ok " + Convert.ToString(checks) + " - " + name);
+    }
+
+    static async void CancelLater(CancellationTokenSource source) {
+        await Task.Delay(30);
+        source.Cancel();
+    }
+
+    static async void Consume(TcpListener listener) {
+        nint client = await listener.AcceptAsync();
+        if (client >= 0) { Socket.Close(client); throw new Exception("Unexpected accepted connection."); }
+        lock (sync) { canceled = canceled + 1; }
+    }
+
+    static async bool ConnectAndAccept(TcpListener listener) {
+        TcpClient peer = await TcpClient.ConnectAsync("127.0.0.1", PORT, 2000);
+        if (peer == null) { return false; }
+        try {
+            TcpClient accepted = await listener.AcceptTcpClientAsync();
+            if (accepted == null) { return false; }
+            accepted.Close();
+            return true;
+        } finally { peer.Close(); }
+    }
+
+    static async int Main() {
+        nint raw = -1;
+        TcpListener listener = new TcpListener("127.0.0.1", PORT);
+        try {
+            Socket.Initialize();
+            raw = Socket.CreateTcp();
+            Socket.SetReuseAddr(raw);
+            if (Socket.Bind(raw, "127.0.0.1", PORT) != 0 || Socket.Listen(raw, 16) != 0 ||
+                Socket.SetNonBlocking(raw) != 0) { throw new Exception("raw listener setup"); }
+
+            CancellationTokenSource before = new CancellationTokenSource();
+            before.Cancel();
+            nint result = await Socket.AcceptAsync(raw, before.Token);
+            Check(result < 0 && Socket.IsOpen(raw), "pre-canceled accept retains descriptor");
+            before.Dispose();
+
+            CancellationTokenSource parked = new CancellationTokenSource();
+            List<long> cancelTasks = new List<long>();
+            cancelTasks.Add(Task.Run(CancelLater(parked)));
+            result = await Socket.AcceptAsync(raw, parked.Token);
+            await Task.WhenAll(cancelTasks);
+            Check(result < 0 && Socket.IsOpen(raw), "registered accept cancellation retains descriptor");
+            parked.Dispose();
+
+            TcpClient peer = await TcpClient.ConnectAsync("127.0.0.1", PORT, 2000);
+            if (peer == null) { throw new Exception("raw reconnect"); }
+            nint accepted = await Socket.AcceptAsync(raw);
+            Check(accepted >= 0 && Socket.IsOpen(raw), "canceled listener accepts with a fresh operation");
+            if (accepted >= 0) { Socket.Close(accepted); }
+            peer.Close();
+            Socket.Close(raw);
+            raw = -1;
+
+            listener.Stop();
+            listener.EnsureStarted();
+            result = await listener.AcceptAsync();
+            Check(result < 0 && listener.Accept() < 0 && !listener.IsRunning() && listener.GetSocket() < 0,
+                "explicit stop prevents implicit startup");
+
+            listener.Start();
+            nint firstSocket = listener.GetSocket();
+            listener.Start();
+            List<long> waiting = new List<long>();
+            for (int i = 0; i < 4; i = i + 1) { waiting.Add(Task.Run(Consume(listener))); }
+            await Task.Delay(30);
+            listener.Stop();
+            await listener.StopAsync();
+            await Task.WhenAll(waiting);
+            Check(canceled == 4 && !listener.IsRunning() && listener.GetSocket() < 0,
+                "stop drains four idle accepts and closes once");
+            listener.EnsureStarted();
+            Check(await listener.AcceptAsync() < 0 && listener.Accept() < 0 && listener.GetSocket() < 0,
+                "stopped sync and async accepts stay stopped");
+            listener.Start();
+            Check(firstSocket >= 0 && await ConnectAndAccept(listener), "explicit restart accepts a new client");
+            await listener.StopAsync();
+
+            bool racesPassed = true;
+            for (int cycle = 0; cycle < 32; cycle = cycle + 1) {
+                listener.Start();
+                List<long> pending = new List<long>();
+                pending.Add(Task.Run(Consume(listener)));
+                listener.Stop();
+                await listener.StopAsync();
+                await Task.WhenAll(pending);
+                listener.Start();
+                if (!await ConnectAndAccept(listener)) { racesPassed = false; }
+                await listener.StopAsync();
+            }
+            Check(racesPassed && canceled == 36, "immediate stop and descriptor reuse survive 32 races");
+
+            bool terminalErrors = !Socket.IsTransientAcceptError(22) && !Socket.IsTransientAcceptError(9);
+            #if LINUX || MACOS
+            nint unbound = Socket.CreateTcp();
+            Socket.SetNonBlocking(unbound);
+            result = await Socket.AcceptAsync(unbound);
+            terminalErrors = terminalErrors && result < 0 && Socket.IsOpen(unbound);
+            Socket.Close(unbound);
+            #endif
+            Check(terminalErrors, "platform terminal accept errors are not retried");
+            return 0;
+        } catch (Exception e) {
+            Console.WriteLine("failed - " + e.Message);
+            return 1;
+        } finally {
+            if (raw >= 0) { Socket.Close(raw); }
+            await listener.StopAsync();
+        }
+    }
+}

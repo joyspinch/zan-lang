@@ -1,0 +1,343 @@
+using System;
+using System.Json;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+/// <summary>Concurrent calls use separate owned TCP connections. This keeps
+/// request/reply frames indivisible without awaiting under an object monitor.
+/// Replies retain ok/error and revision; transport failures throw and leave a
+/// write outcome uncertain until the same client/request id is replayed.</summary>
+class ZanDbClient : IDisposable {
+    private string host;
+    private int port;
+    private string token;
+    private string clientId;
+    private int timeoutMs;
+    private object sync;
+    private List<TcpClient> active;
+    private long readId;
+    private int pending;
+    private bool closed;
+
+    ZanDbClient(string host, int port, string token, string clientId) {
+        this.host = host;
+        this.port = port;
+        this.token = token;
+        this.clientId = clientId;
+        this.timeoutMs = ZanDbProtocol.DEFAULT_TIMEOUT_MS;
+        this.sync = new object();
+        this.active = new List<TcpClient>();
+        this.readId = 0;
+        this.pending = 0;
+        this.closed = false;
+        if (host == null || host.Length == 0 || port < 1 || port > 65535) { throw new ArgumentException("Configure a host and port in 1..65535."); }
+        if (token == null || token.Length < 16 || token.Length > 512) { throw new ArgumentException("Configure a token of 16..512 UTF-8 bytes."); }
+        if (!ZanDbProtocol.SafeId(clientId, ZanDbProtocol.MAX_CLIENT)) { throw new ArgumentException("Invalid client id."); }
+    }
+
+    void SetTimeout(int timeoutMs) {
+        if (timeoutMs <= 0) { throw new ArgumentException("timeoutMs must be positive."); }
+        lock (this.sync) { this.timeoutMs = timeoutMs; }
+    }
+
+    private JsonValue Prepare(JsonValue request) {
+        lock (this.sync) {
+            if (this.closed) { throw new ObjectDisposedException("ZanDbClient"); }
+            if (!request.IsObject()) { throw new ArgumentException("Request must be a JSON object."); }
+            JsonValue wire = ZanDbProtocol.Canonical(request, 0);
+            string action = ZanDbProtocol.RequireString(wire, "action");
+            if (!ZanDbProtocol.IsAction(action)) { throw new ArgumentException("Unknown ZanDB action."); }
+            JsonValue id = wire.Get("id");
+            if (id == null) {
+                if (ZanDbProtocol.IsWrite(action)) { throw new ArgumentException("Every write requires an explicit persistent request id."); }
+                this.readId = this.readId + 1;
+                wire.Set("id", JsonValue.NewStr("read-" + Convert.ToString(this.readId)));
+            }
+            if (id != null) {
+                if (!id.IsString() || !ZanDbProtocol.SafeId(id.AsString(""), ZanDbProtocol.MAX_ID)) {
+                    throw new ArgumentException("Invalid request id.");
+                }
+            }
+            wire.Set("v", JsonValue.NewInt(ZanDbProtocol.VERSION));
+            wire.Set("token", JsonValue.NewStr(this.token));
+            wire.Set("client", JsonValue.NewStr(this.clientId));
+            this.pending = this.pending + 1;
+            return wire;
+        }
+    }
+
+    private int Timeout() {
+        lock (this.sync) { return this.timeoutMs; }
+    }
+
+    private void Track(TcpClient client) {
+        lock (this.sync) {
+            if (this.closed) {
+                client.Close();
+                throw new ObjectDisposedException("ZanDbClient");
+            }
+            this.active.Add(client);
+        }
+    }
+
+    private void Finish(TcpClient client) {
+        lock (this.sync) {
+            if (client != null) {
+                for (int i = 0; i < this.active.Count; i = i + 1) {
+                    if (this.active[i] == client) { this.active.RemoveAt(i); break; }
+                }
+                client.Close();
+            }
+            this.pending = this.pending - 1;
+        }
+    }
+
+    private static int Remaining(long deadline, CancellationToken cancellation) {
+        if (cancellation != null) { cancellation.ThrowIfCancellationRequested(); }
+        long left = deadline - Stopwatch.GetMilliseconds();
+        if (left <= 0) { throw new TimeoutException("ZanDB request deadline exceeded; write outcome may be unknown."); }
+        return (int)left;
+    }
+
+    async JsonValue SendAsync(JsonValue request) {
+        return await this.SendAsync(request, null);
+    }
+
+    /// No implicit retries. A canceled/failed transport is closed in finally;
+    /// only RetryWriteAsync performs an explicitly requested ID-bound retry.
+    async JsonValue SendAsync(JsonValue request, CancellationToken cancellation) {
+        JsonValue wire = this.Prepare(request);
+        TcpClient client = null;
+        long deadline = Stopwatch.GetMilliseconds() + this.Timeout();
+        try {
+            int remaining = ZanDbClient.Remaining(deadline, cancellation);
+            client = await TcpClient.ConnectAsync(this.host, this.port, remaining);
+            if (client == null) { throw new IOException("Cannot connect to ZanDB owner."); }
+            this.Track(client);
+            remaining = ZanDbClient.Remaining(deadline, cancellation);
+            await ZanDbProtocol.WriteAsync(client, wire, remaining, cancellation);
+            remaining = ZanDbClient.Remaining(deadline, cancellation);
+            JsonValue response = await ZanDbProtocol.ReadAsync(client, remaining, cancellation);
+            if (response == null) { throw new IOException("ZanDB owner closed before replying; write outcome may be unknown."); }
+            response = ZanDbProtocol.Canonical(response, 0);
+            JsonValue version = ZanDbProtocol.Member(response, "v");
+            JsonValue ok = ZanDbProtocol.Member(response, "ok");
+            if (!version.IsInt() || version.AsLong(0) != ZanDbProtocol.VERSION || !ok.IsBool() ||
+                ZanDbProtocol.RequireString(response, "id") != ZanDbProtocol.RequireString(wire, "id")) {
+                throw new IOException("Invalid ZanDB response correlation/version.");
+            }
+            return response;
+        } finally {
+            this.Finish(client);
+        }
+    }
+
+    async JsonValue SendWriteAsync(JsonValue request, string requestId) {
+        return await this.RetryWriteAsync(request, requestId, 1, null);
+    }
+
+    /// Reuses the exact body and caller's durable ID. A protocol error envelope
+    /// is returned immediately; only a failed transport can trigger a retry.
+    async JsonValue RetryWriteAsync(JsonValue request, string requestId, int attempts, CancellationToken cancellation) {
+        if (!ZanDbProtocol.SafeId(requestId, ZanDbProtocol.MAX_ID)) { throw new ArgumentException("Invalid write request id."); }
+        if (attempts < 1 || attempts > 5) { throw new ArgumentException("attempts must be in 1..5."); }
+        JsonValue wire = ZanDbProtocol.Canonical(request, 0);
+        if (!ZanDbProtocol.IsWrite(ZanDbProtocol.RequireString(wire, "action"))) { throw new ArgumentException("RetryWriteAsync requires a write action."); }
+        wire.Set("id", JsonValue.NewStr(requestId));
+        for (int attempt = 0; attempt < attempts; attempt = attempt + 1) {
+            try {
+                return await this.SendAsync(wire, cancellation);
+            } catch (IOException e) {
+                // Explicit idempotent retry contract, never a new write ID.
+                if (attempt + 1 == attempts) { throw; }
+            } catch (TimeoutException e) {
+                // A reply lost after commit is resolved by the persisted record.
+                if (attempt + 1 == attempts) { throw; }
+            }
+            if (cancellation != null) { cancellation.ThrowIfCancellationRequested(); }
+            await Task.Delay(50);
+        }
+        throw new IOException("ZanDB retry exhausted.");
+    }
+
+    private static JsonValue Operation(string action, string collection) {
+        JsonValue request = JsonValue.NewObject();
+        request.PutStr("action", action);
+        if (collection.Length > 0) { request.PutStr("collection", collection); }
+        return request;
+    }
+
+    private static JsonValue VectorJson(float[] vector) {
+        JsonValue value = JsonValue.NewArray();
+        for (int i = 0; i < vector.Length; i = i + 1) { value.Append(JsonValue.NewDouble((double)vector[i])); }
+        return value;
+    }
+
+    async JsonValue PingAsync() {
+        return await this.SendAsync(ZanDbClient.Operation("ping", ""));
+    }
+
+    async JsonValue ListIndexesAsync(string collection) {
+        return await this.SendAsync(ZanDbClient.Operation("list_indexes", collection));
+    }
+
+    async JsonValue EnsureIndexAsync(string collection, string field, string requestId) {
+        JsonValue request = ZanDbClient.Operation("ensure_index", collection);
+        request.PutStr("field", field);
+        return await this.SendWriteAsync(request, requestId);
+    }
+
+    async JsonValue EnsureFullTextIndexAsync(string collection, string field, string requestId) {
+        JsonValue request = ZanDbClient.Operation("ensure_text_index", collection);
+        request.PutStr("field", field);
+        return await this.SendWriteAsync(request, requestId);
+    }
+
+    async JsonValue EnsureVectorIndexAsync(string collection, string field, VectorIndexOptions options, string requestId) {
+        JsonValue config = JsonValue.NewObject();
+        config.PutInt("dimensions", options.dimensions);
+        config.PutInt("metric", options.metric);
+        config.PutInt("m", options.m);
+        config.PutInt("efConstruction", options.efConstruction);
+        config.PutInt("efSearch", options.efSearch);
+        config.PutInt("seed", options.seed);
+        JsonValue request = ZanDbClient.Operation("ensure_vector_index", collection);
+        request.PutStr("field", field);
+        request.Put("options", config);
+        return await this.SendWriteAsync(request, requestId);
+    }
+
+    async JsonValue CheckpointSearchIndexesAsync(string collection, string requestId) {
+        return await this.SendWriteAsync(ZanDbClient.Operation("checkpoint_search", collection), requestId);
+    }
+
+    async JsonValue RebuildSearchIndexesAsync(string collection, string requestId) {
+        return await this.SendWriteAsync(ZanDbClient.Operation("rebuild_search", collection), requestId);
+    }
+
+    async JsonValue InsertAsync(string collection, JsonValue document, string requestId) {
+        JsonValue request = ZanDbClient.Operation("insert", collection);
+        request.Put("document", document);
+        return await this.SendWriteAsync(request, requestId);
+    }
+
+    async JsonValue UpsertAsync(string collection, int id, JsonValue document, string requestId) {
+        JsonValue request = ZanDbClient.Operation("upsert", collection);
+        request.PutInt("document_id", id);
+        request.Put("document", document);
+        return await this.SendWriteAsync(request, requestId);
+    }
+
+    async JsonValue UpdateAsync(string collection, int id, JsonValue document, string requestId) {
+        JsonValue request = ZanDbClient.Operation("update", collection);
+        request.PutInt("document_id", id);
+        request.Put("document", document);
+        return await this.SendWriteAsync(request, requestId);
+    }
+
+    async JsonValue DeleteAsync(string collection, int id, string requestId) {
+        JsonValue request = ZanDbClient.Operation("delete", collection);
+        request.PutInt("document_id", id);
+        return await this.SendWriteAsync(request, requestId);
+    }
+
+    async JsonValue GetAsync(string collection, int id) {
+        JsonValue request = ZanDbClient.Operation("get", collection);
+        request.PutInt("document_id", id);
+        return await this.SendAsync(request);
+    }
+
+    async JsonValue QueryAsync(string collection, JsonValue filter, int limit, int skip) {
+        JsonValue request = ZanDbClient.Operation("query", collection);
+        if (filter != null) { request.Put("filter", filter); }
+        request.PutInt("limit", limit);
+        request.PutInt("skip", skip);
+        return await this.SendAsync(request);
+    }
+
+    async JsonValue SearchTextAsync(string collection, string field, string query, int k) {
+        return await this.SearchTextAsync(collection, field, query, k, null);
+    }
+
+    async JsonValue SearchTextAsync(string collection, string field, string query, int k, JsonValue filter) {
+        JsonValue request = ZanDbClient.Operation("search_text", collection);
+        request.PutStr("field", field);
+        request.PutStr("query", query);
+        request.PutInt("k", k);
+        if (filter != null) { request.Put("filter", filter); }
+        return await this.SendAsync(request);
+    }
+
+    private static JsonValue VectorOperation(string action, string collection, string field, float[] vector, int k, int ef) {
+        JsonValue request = ZanDbClient.Operation(action, collection);
+        request.PutStr("field", field);
+        request.Put("vector", ZanDbClient.VectorJson(vector));
+        request.PutInt("k", k);
+        request.PutInt("ef", ef);
+        return request;
+    }
+
+    async JsonValue SearchVectorAsync(string collection, string field, float[] vector, int k, int ef) {
+        return await this.SearchVectorAsync(collection, field, vector, k, ef, null);
+    }
+
+    async JsonValue SearchVectorAsync(string collection, string field, float[] vector, int k, int ef, JsonValue filter) {
+        JsonValue request = ZanDbClient.VectorOperation("search_vector", collection, field, vector, k, ef);
+        if (filter != null) { request.Put("filter", filter); }
+        return await this.SendAsync(request);
+    }
+
+    async JsonValue SearchVectorExactAsync(string collection, string field, float[] vector, int k) {
+        return await this.SearchVectorExactAsync(collection, field, vector, k, null);
+    }
+
+    async JsonValue SearchVectorExactAsync(string collection, string field, float[] vector, int k, JsonValue filter) {
+        JsonValue request = ZanDbClient.VectorOperation("search_vector_exact", collection, field, vector, k, 64);
+        if (filter != null) { request.Put("filter", filter); }
+        return await this.SendAsync(request);
+    }
+
+    async JsonValue SearchHybridAsync(string collection, string textField, string query, string vectorField, float[] vector, int k, int ef) {
+        return await this.SearchHybridAsync(collection, textField, query, vectorField, vector, k, ef, null);
+    }
+
+    async JsonValue SearchHybridAsync(string collection, string textField, string query, string vectorField, float[] vector, int k, int ef, JsonValue filter) {
+        JsonValue request = ZanDbClient.Operation("search_hybrid", collection);
+        request.PutStr("text_field", textField);
+        request.PutStr("vector_field", vectorField);
+        request.PutStr("query", query);
+        request.Put("vector", ZanDbClient.VectorJson(vector));
+        request.PutInt("k", k);
+        request.PutInt("ef", ef);
+        if (filter != null) { request.Put("filter", filter); }
+        return await this.SendAsync(request);
+    }
+
+    async JsonValue BatchAsync(JsonValue operations, string requestId) {
+        JsonValue request = ZanDbClient.Operation("batch", "");
+        request.Put("operations", operations);
+        return await this.SendWriteAsync(request, requestId);
+    }
+
+    /// Wakes in-flight IO without closing handles behind awaited operations.
+    /// CloseAsync additionally waits for their finally blocks to release them.
+    void Close() {
+        lock (this.sync) {
+            this.closed = true;
+            for (int i = 0; i < this.active.Count; i = i + 1) { Socket.ShutdownBoth(this.active[i].GetSocket()); }
+        }
+    }
+
+    private int Pending() {
+        lock (this.sync) { return this.pending; }
+    }
+
+    async void CloseAsync() {
+        this.Close();
+        while (this.Pending() > 0) { await Task.Delay(1); }
+    }
+
+    void Dispose() { this.Close(); }
+}

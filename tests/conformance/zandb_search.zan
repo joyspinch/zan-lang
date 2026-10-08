@@ -1,0 +1,227 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+using System.Data.ZanDb;
+using System.Threading;
+
+class ZanDbSearchTest {
+    static int checks;
+    static void Ok(bool value, string message) {
+        checks = checks + 1;
+        Console.WriteLine((value ? "ok " : "FAIL ") + Convert.ToString(checks) + " - " + message);
+    }
+    static void Clean(string path) {
+        File.Delete(path); File.Delete(path + ".lock");
+        File.Delete(path + ".m0"); File.Delete(path + ".m1");
+        for (int i = 0; i < 100; i = i + 1) { File.Delete(path + ".s" + Convert.ToString(i)); }
+    }
+    static JsonValue Doc(string text, double x, double y) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.PutStr("text", text);
+        JsonValue v = JsonValue.NewArray();
+        v.Append(JsonValue.NewDouble(x)); v.Append(JsonValue.NewDouble(y));
+        doc.Put("embedding", v);
+        doc.PutStr("group", x > 0 ? "a" : "b");
+        return doc;
+    }
+    static float[] Query() { float[] v = new float[2]; v[0] = 1; v[1] = 0; return v; }
+    static string Field(JsonValue doc, string key) {
+        if (doc == null) { return ""; }
+        JsonValue v = doc.Get(key); return v != null ? v.AsString("") : "";
+    }
+    static void GenerationCases(string path) {
+        Clean(path);
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        Collection docs = db.GetCollection("generation");
+        List<JsonValue> bulk = new List<JsonValue>();
+        for (int i = 0; i < 600; i = i + 1) {
+            JsonValue d = Doc("中文知识库资料 " + Convert.ToString(i), 1, 0.1);
+            d.Put("body", i == 300 ? JsonValue.NewInt(7) : JsonValue.NewStr("批次构建资料"));
+            bulk.Add(d);
+        }
+        docs.InsertBulk(bulk);
+        docs.EnsureFullTextIndex("text");
+        VectorIndexOptions options = new VectorIndexOptions(2);
+        docs.EnsureVectorIndex("embedding", options);
+        db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC); docs = db.GetCollection("generation");
+        Ok(docs.SearchText("text", "知识库", 1000).Count == 600, "initial checkpoint across build batches");
+        Ok(docs.SearchVector("embedding", Query(), 10, 64).Count == 10, "initial graph checkpoint reopen");
+        bool failed = false;
+        try { docs.EnsureFullTextIndex("body"); } catch { failed = true; }
+        Ok(failed && docs.ListSearchIndexes().Count() == 2, "failed staged build keeps published catalog");
+        List<KvEntry> abandoned = new List<KvEntry>();
+        db.Kv().ScanPrefix("q:generation:text:body:data:", 0, abandoned);
+        Ok(abandoned.Count == 0, "failed build removes unpublished generation");
+        Ok(docs.SearchText("text", "知识库", 1000).Count == 600, "old index survives failed staged build");
+        JsonValue repaired = docs.FindById(301); repaired.Set("body", JsonValue.NewStr("批次构建资料"));
+        docs.Update(301, repaired);
+        docs.EnsureFullTextIndex("body");
+        Ok(docs.SearchText("body", "构建", 1000).Count == 600, "retry staged build publishes complete generation");
+        bool invalid = false;
+        JsonValue bad = Doc("错误向量", 1, 0); bad.Set("embedding", JsonValue.NewArray());
+        int before = docs.Count();
+        try { docs.Insert(bad); } catch { invalid = true; }
+        Ok(invalid && docs.Count() == before && !db.Kv().InTransaction(), "invalid vector rejects before transaction");
+        db.Begin();
+        bool queryRejected = false; bool maintenanceRejected = false;
+        try { docs.SearchText("text", "知识库", 3); } catch { queryRejected = true; }
+        try { docs.CheckpointSearchIndexes(); } catch { maintenanceRejected = true; }
+        db.Rollback();
+        Ok(queryRejected && maintenanceRejected, "search rejects uncommitted state");
+        docs.CheckpointSearchIndexes();
+        db.Kv().Put("q:generation:text:text:snap:99999999999999999999:??????", "orphan");
+        db.Close();
+        db = ZanDatabase.Open(path); docs = db.GetCollection("generation");
+        Ok(docs.SearchText("text", "知识库", 1000).Count == 600, "unpublished snapshot generation ignored");
+        db.Kv().Put("q:generation:text:text:snapshot", "{}");
+        db.Close();
+        db = ZanDatabase.Open(path); docs = db.GetCollection("generation");
+        bool corrupt = false;
+        try { docs.SearchText("text", "知识库", 3); } catch { corrupt = true; }
+        Ok(corrupt, "corrupt checkpoint rejects partial results");
+        docs.RebuildSearchIndexes();
+        Ok(docs.SearchText("text", "知识库", 1000).Count == 600, "rebuild repairs checkpoint from source documents");
+        Ok(docs.SearchVectorExact("embedding", Query(), 5).Count == 5, "rebuild reconstructs graph from source");
+        db.Close();
+        db = ZanDatabase.Open(path); docs = db.GetCollection("generation");
+        Ok(docs.SearchText("body", "构建", 1000).Count == 600, "rebuilt generation survives reopen");
+        db.Close(); Clean(path);
+    }
+    static void HandleCases(string path) {
+        Clean(path);
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        Collection docs = db.GetCollection("handles");
+        docs.EnsureFullTextIndex("text");
+        docs.EnsureVectorIndex("embedding", new VectorIndexOptions(2));
+        docs.EnsureIndex("group");
+        JsonValue duplicate = Doc("alpha", 1, 0);
+        duplicate.PutStr("text", "beta");
+        JsonValue replacement = JsonValue.NewArray();
+        replacement.Append(JsonValue.NewInt(0)); replacement.Append(JsonValue.NewInt(1));
+        duplicate.Put("embedding", replacement);
+        duplicate.PutStr("group", "b");
+        int id = docs.Insert(duplicate);
+        Ok(Field(docs.FindById(id), "text") == "beta" && Field(duplicate, "_id") == Convert.ToString(id), "duplicate keys canonicalize cached and caller values");
+        Ok(docs.SearchText("text", "alpha", 10).Count == 0 && docs.SearchText("text", "beta", 10).Count == 1, "duplicate keys agree with text postings");
+        Ok(docs.FindByIndex("group", "a").Count == 0 && docs.FindByIndex("group", "b").Count == 1, "duplicate keys agree with field index");
+        Ok(docs.SearchVectorExact("embedding", Query(), 1)[0].distance == 1, "duplicate keys agree with vector input");
+        JsonValue bad = Doc("validfirst", 1, 0); bad.PutInt("text", 7);
+        bool rejected = false;
+        try { docs.Insert(bad); } catch { rejected = true; }
+        Ok(rejected && docs.Count() == 1 && !db.Kv().InTransaction(), "duplicate last value is validated before write");
+        JsonValue update = Doc("oldvalue", 1, 0); update.PutStr("text", "updatedvalue");
+        docs.Update(id, update);
+        JsonValue upsert = Doc("oldvalue", 1, 0); upsert.PutStr("text", "upsertvalue");
+        docs.Upsert(30, upsert);
+        List<JsonValue> batch = new List<JsonValue>();
+        JsonValue bulk = Doc("oldvalue", 1, 0); bulk.PutStr("text", "bulkvalue"); batch.Add(bulk);
+        docs.InsertBulk(batch);
+        Ok(docs.SearchText("text", "oldvalue", 10).Count == 0 && docs.SearchText("text", "updatedvalue", 1)[0].id == id
+            && docs.SearchText("text", "upsertvalue", 1)[0].id == 30 && docs.SearchText("text", "bulkvalue", 10).Count == 1, "duplicate keys canonicalize all write paths");
+        Collection peer = Collection.Attach(db.Kv(), new AsyncRwLock(), "handles");
+        peer.SearchText("text", "updatedvalue", 10);
+        peer.SearchVectorExact("embedding", Query(), 10);
+        docs.Update(id, Doc("freshvalue", -1, 0));
+        docs.CheckpointSearchIndexes();
+        Ok(peer.SearchText("text", "updatedvalue", 10).Count == 0 && peer.SearchText("text", "freshvalue", 1)[0].id == id, "second resident handle reloads pruned text journal");
+        List<VectorHit> results = peer.SearchVectorExact("embedding", Query(), 10);
+        bool changed = false;
+        for (int i = 0; i < results.Count; i = i + 1) { if (results[i].id == id && results[i].distance == 2) { changed = true; } }
+        Ok(changed, "second resident handle reloads pruned vector journal");
+        TextTokenizer first = new TextTokenizer(); first.AddWord("银河资料"); first.AddWord("星际航线");
+        TextTokenizer second = new TextTokenizer(); second.AddWord("星际航线"); second.AddWord("银河资料");
+        docs.EnsureFullTextIndex("text", first);
+        long before = db.GetRevision(); docs.EnsureFullTextIndex("text", second);
+        Ok(db.GetRevision() == before, "equivalent dictionary order avoids full rebuild");
+        JsonValue header = JsonValue.Parse(db.Kv().Get("q:handles:text:text:snapshot"));
+        int revisionKeys = 0;
+        for (int i = 0; i < header.Count(); i = i + 1) { if (header.KeyAt(i) == "revision") { revisionKeys = revisionKeys + 1; } }
+        Ok(revisionKeys == 1 && Field(header, "revision") == db.Kv().Get("q:handles:text:text:last"), "published checkpoint has one correct watermark");
+        JsonValue vectorHeader = JsonValue.Parse(db.Kv().Get("q:handles:vector:embedding:snapshot"));
+        JsonValue vectorRoot = vectorHeader.Get("root");
+        if (vectorRoot != null) { vectorRoot.Set("options", new VectorIndexOptions(2, 1).ToJson()); }
+        db.Kv().Put("q:handles:vector:embedding:snapshot", vectorHeader.ToJson());
+        bool mismatched = false;
+        try { docs.SearchVectorExact("embedding", Query(), 1); } catch { mismatched = true; }
+        Ok(mismatched, "checkpoint configuration mismatch is rejected");
+        docs.RebuildSearchIndexes();
+        Collection schema = db.GetCollection("schema");
+        schema.EnsureVectorIndex("embedding", new VectorIndexOptions(2));
+        int oldId = schema.Insert(Doc("oldgraph", 1, 0)); schema.DeleteById(oldId);
+        List<KvEntry> oldJournal = new List<KvEntry>();
+        db.Kv().ScanPrefix("q:schema:vector:embedding:journal:", 0, oldJournal);
+        schema.EnsureVectorIndex("embedding", new VectorIndexOptions(3));
+        db.Begin();
+        for (int i = 0; i < oldJournal.Count; i = i + 1) { db.Kv().Put(oldJournal[i].key, oldJournal[i].val); }
+        db.Commit();
+        db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC); docs = db.GetCollection("handles"); schema = db.GetCollection("schema");
+        float[] q3 = new float[3]; q3[0] = 1;
+        bool compatible = false;
+        try { compatible = schema.SearchVectorExact("embedding", q3, 10).Count == 0; } catch { }
+        Ok(compatible, "published new configuration skips prepublication journals");
+        Ok(Field(docs.FindById(id), "text") == "freshvalue" && docs.SearchText("text", "freshvalue", 1)[0].id == id, "canonicalized document and search survive reopen");
+        db.Close(); Clean(path);
+    }
+    static void Main() {
+        Directory.CreateDirectory("_scratch");
+        string path = "_scratch/zandb_search_tmp.zdb";
+        Clean(path);
+        for (int durability = 0; durability < 3; durability = durability + 1) {
+            Clean(path);
+            ZanDatabase db = ZanDatabase.Open(path, durability);
+            Collection docs = db.GetCollection("knowledge");
+            db.Kv().SetFlushThreshold(2400);
+            int id1 = docs.Insert(Doc("中文数据库知识库检索", 1, 0));
+            int id2 = docs.Insert(Doc("高性能向量检索", 0.7, 0.7));
+            int id3 = docs.Insert(Doc("其他领域资料", -1, 0));
+            docs.EnsureFullTextIndex("text");
+            VectorIndexOptions options = new VectorIndexOptions(); options.dimensions = 2;
+            docs.EnsureVectorIndex("embedding", options);
+            List<Bm25Hit> zh = docs.SearchText("text", "知识库", 10);
+            Ok(zh.Count > 0 && zh[0].id == id1, "Chinese text retrieval");
+            List<VectorHit> vectors = docs.SearchVector("embedding", Query(), 2, 64);
+            Ok(vectors.Count == 2 && vectors[0].id == id1, "HNSW nearest");
+            List<VectorHit> exact = docs.SearchVectorExact("embedding", Query(), 2);
+            Ok(exact.Count == 2 && exact[0].id == vectors[0].id && exact[1].id == vectors[1].id, "exact reference");
+            List<Bm25Hit> filtered = docs.SearchTextFiltered("text", "检索", 1, (int id) => id == id2);
+            Ok(filtered.Count == 1 && filtered[0].id == id2, "filter before text top k");
+            List<HybridHit> hybrid = docs.SearchHybrid("text", "知识库", "embedding", Query(), 2, 64);
+            Ok(hybrid.Count == 2 && hybrid[0].id == id1, "hybrid rank fusion");
+            docs.CheckpointSearchIndexes();
+            db.Begin();
+            docs.Update(id1, Doc("事务撤销内容", -1, 0));
+            int rolledId = docs.Insert(Doc("撤销文档", 1, 0));
+            Ok(Field(docs.FindById(id1), "text") == "事务撤销内容", "transaction point read");
+            db.Rollback();
+            Ok(Field(docs.FindById(id1), "text") == "中文数据库知识库检索" && docs.FindById(rolledId) == null, "rollback caches");
+            Ok(docs.SearchText("text", "撤销", 10).Count == 0, "rollback search visibility");
+            int next = docs.Insert(Doc("新增中文知识库", 0.9, 0.1));
+            Ok(next == rolledId, "rollback id sequence");
+            docs.Update(id2, Doc("更新后的天文资料", -0.8, 0.2));
+            docs.DeleteById(id3);
+            docs.EnsureIndex("group");
+            Ok(docs.ListSearchIndexes().Count() == 3, "index inventory");
+            db.Checkpoint(); db.Close();
+            db = ZanDatabase.Open(path, durability); docs = db.GetCollection("knowledge");
+            Ok(docs.SearchText("text", "知识库", 10).Count >= 2, "checkpoint and text journal reopen");
+            vectors = docs.SearchVector("embedding", Query(), 4, 64);
+            bool alive = vectors.Count == 3 && vectors[0].id == id1;
+            for (int i = 0; i < vectors.Count; i = i + 1) { if (vectors[i].id == id3) { alive = false; } }
+            Ok(alive, "graph checkpoint and update delete journal reopen");
+            docs.CheckpointSearchIndexes(); db.Flush(); db.MergeSegments(); db.Close();
+            db = ZanDatabase.Open(path, durability); docs = db.GetCollection("knowledge");
+            Ok(docs.SearchText("text", "领域", 10).Count == 0, "no text tombstone resurrection");
+            docs.RebuildSearchIndexes();
+            vectors = docs.SearchVector("embedding", Query(), 3, 64);
+            Ok(vectors.Count == 3 && vectors[0].id == id1, "rebuild and merge stable");
+            db.Close();
+        }
+        GenerationCases(path);
+        HandleCases(path);
+        Clean(path);
+        Console.WriteLine("done " + Convert.ToString(checks) + " checks");
+    }
+}

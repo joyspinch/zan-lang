@@ -1,0 +1,127 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+
+namespace Conf;
+
+class Prog {
+    static int bad;
+
+    static void Require(bool condition, string label) {
+        if (!condition) { bad = bad + 1; Console.WriteLine("FAIL " + label); }
+    }
+
+    static bool Has(List<TextToken> tokens, string text, int kind, int position) {
+        for (int i = 0; i < tokens.Count; i = i + 1) {
+            TextToken token = tokens[i];
+            if (token.text == text && token.kind == kind && token.position == position) { return true; }
+        }
+        return false;
+    }
+
+    static string Primary(List<TextToken> tokens) {
+        StringBuilder result = new StringBuilder();
+        for (int i = 0; i < tokens.Count; i = i + 1) {
+            if (tokens[i].kind != 0) { continue; }
+            if (result.Length > 0) { result.Append("|"); }
+            result.Append(tokens[i].text);
+        }
+        return result.ToString();
+    }
+
+    static bool Same(List<TextToken> a, List<TextToken> b) {
+        if (a.Count != b.Count) { return false; }
+        for (int i = 0; i < a.Count; i = i + 1) {
+            if (a[i].text != b[i].text || a[i].kind != b[i].kind || a[i].position != b[i].position) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static void UniqueAtPosition(List<TextToken> tokens) {
+        for (int i = 0; i < tokens.Count; i = i + 1) {
+            for (int j = i + 1; j < tokens.Count; j = j + 1) {
+                Require(tokens[i].position != tokens[j].position || tokens[i].text != tokens[j].text,
+                    "duplicate token at position");
+            }
+        }
+    }
+
+    static string Invalid(int a, int b, int c, int d, int length) {
+        byte[] bytes = new byte[4];
+        bytes[0] = (byte)a; bytes[1] = (byte)b; bytes[2] = (byte)c; bytes[3] = (byte)d;
+        return bytes.ToStr(0, length);
+    }
+
+    static void Main() {
+        TextTokenizer tokenizer = new TextTokenizer();
+        Require(tokenizer.Tokenize(null).Count == 0 && tokenizer.Tokenize("！ 😀").Count == 0, "empty input");
+        Require(Primary(tokenizer.Tokenize("中文全文检索数据库")) == "中文|全文|检索|数据库", "default lexicon");
+        Require(Same(tokenizer.Tokenize("　ＭｙＳＱＬ１２３，中文！"),
+            tokenizer.Tokenize(" mysql123,中文!")), "ASCII/fullwidth normalization");
+        Require(Primary(tokenizer.Tokenize("Zan中文MySQL数据库")) == "zan|中文|mysql|数据库", "mixed scripts");
+        Require(Primary(tokenizer.Tokenize("南京市长江大桥")) == "南京市|长江大桥", "longest default word");
+        tokenizer.AddWord("星际");
+        tokenizer.AddWord("星际航线");
+        tokenizer.AddWord("星际航线引擎");
+        tokenizer.AddWord("ＺＡＮ数据库");
+        List<TextToken> custom = tokenizer.Tokenize("星际航线引擎ZAN数据库");
+        Require(Primary(custom) == "星际航线引擎|zan数据库", "longest custom word");
+        Require(Has(custom, "星", 1, 0) && Has(custom, "星际", 1, 0)
+            && Has(custom, "zan", 1, 6), "custom auxiliary recall");
+        UniqueAtPosition(custom);
+        List<TextToken> known = tokenizer.Tokenize("中国中国");
+        Require(Has(known, "中国", 0, 0) && Has(known, "中国", 0, 2)
+            && !Has(known, "中国", 1, 0) && !Has(known, "中国", 1, 2), "primary auxiliary dedup");
+        Require(Has(known, "国中", 1, 1), "cross-word bigram");
+        UniqueAtPosition(known);
+        List<TextToken> unknown = tokenizer.Tokenize("龘靐齉");
+        Require(Primary(unknown) == "龘|靐|齉" && Has(unknown, "龘靐", 1, 0)
+            && Has(unknown, "靐齉", 1, 1), "unknown single and bigram");
+        UniqueAtPosition(unknown);
+        List<TextToken> supplementary = tokenizer.Tokenize("𠀀𠀁");
+        Require(Primary(supplementary) == "𠀀|𠀁" && Has(supplementary, "𠀀𠀁", 1, 0)
+            && Has(supplementary, "𠀁", 0, 1), "four-byte CJK");
+        tokenizer.AddWord("𠀀𠀁");
+        Require(Primary(tokenizer.Tokenize("𠀀𠀁")) == "𠀀𠀁", "four-byte dictionary");
+        List<TextToken> emoji = tokenizer.Tokenize("𠀀😀𠀁");
+        Require(Has(emoji, "𠀁", 0, 2) && !Has(emoji, "𠀀𠀁", 1, 0), "emoji separator and scalar positions");
+        string invalid = Invalid(237, 160, 128, 0, 3);
+        Require(Primary(tokenizer.Tokenize("中" + invalid + "文")) == "中|文", "invalid surrogate separator");
+        Require(Primary(tokenizer.Tokenize("中" + Invalid(244, 144, 128, 128, 4) + "文")) == "中|文",
+            "out-of-range scalar separator");
+        Require(Primary(tokenizer.Tokenize("a" + Invalid(224, 128, 128, 0, 3) + "b")) == "a|b",
+            "overlong UTF8 separator");
+        Require(Primary(tokenizer.Tokenize("ok" + Invalid(240, 159, 0, 0, 2))) == "ok", "truncated UTF8");
+        string identity = tokenizer.Fingerprint();
+        tokenizer.AddWord("ZAN数据库");
+        tokenizer.AddWord("中" + invalid + "文");
+        Require(tokenizer.Fingerprint() == identity, "duplicate and invalid words ignored");
+        TextTokenizer first = new TextTokenizer();
+        first.AddWord("航线管理"); first.AddWord("迁跃控制");
+        TextTokenizer second = new TextTokenizer();
+        second.AddWord("迁跃控制"); second.AddWord("航线管理");
+        Require(first.Fingerprint() == second.Fingerprint(), "order-independent fingerprint");
+        Directory.CreateDirectory("_scratch");
+        string path = "_scratch/text_tokenizer_zh.dict";
+        File.WriteAllText(path, Encoding.Utf8FromCodePoint(65279)
+            + "# project words\r\n 航线管理 10\r\n迁跃控制\t20\n航线管理\n\ninvalid-word\n数据库\n");
+        TextTokenizer loaded = new TextTokenizer();
+        int accepted = loaded.LoadDictionary(path);
+        File.Delete(path);
+        Require(accepted == 2 && loaded.Fingerprint() == first.Fingerprint(), "load dictionary count and identity");
+        JsonValue state = JsonValue.Parse(tokenizer.ExportState().ToJson());
+        TextTokenizer restored = TextTokenizer.ImportState(state);
+        Require(restored.Fingerprint() == tokenizer.Fingerprint()
+            && Same(restored.Tokenize("星际航线引擎ＺＡＮ数据库𠀀𠀁"),
+                tokenizer.Tokenize("星际航线引擎ＺＡＮ数据库𠀀𠀁")), "tokenizer snapshot");
+        bool rejected = false;
+        state.Set("fingerprint", JsonValue.NewStr("corrupt"));
+        try { TextTokenizer.ImportState(state); }
+        catch (ArgumentException ex) { rejected = true; }
+        Require(rejected, "tokenizer snapshot validation");
+        Console.WriteLine("text-tokenizer-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

@@ -1,0 +1,272 @@
+using System;
+using System.IO;
+using System.Data.ZanDb;
+
+class ZanDbAtomicTest {
+    static int checks = 0;
+    static string root = "_scratch/zandb_atomic";
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        Console.WriteLine((cond ? "ok " : "FAIL ") + Convert.ToString(checks) + " - " + what);
+    }
+
+    static string DbPath(string name) { return ZanDbAtomicTest.root + "/" + name + ".zdb"; }
+
+    static void Clean(string path) {
+        File.Delete(path);
+        for (int i = 0; i < 2; i = i + 1) {
+            string slot = path + ".m" + Convert.ToString(i);
+            Directory.Delete(slot);
+            File.Delete(slot);
+            File.Delete(slot + ".saved");
+        }
+        for (int i = 0; i < 16; i = i + 1) {
+            File.Delete(path + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static void AddFrame(ByteBuffer wal, ByteBuffer payload) {
+        wal.WriteU32(payload.Length());
+        wal.WriteU32(payload.Crc32(payload.Length()));
+        wal.WriteBytes(payload.Raw(), payload.Length());
+    }
+
+    static void WriteFrame(string path, ByteBuffer payload) {
+        ByteBuffer wal = ByteBuffer.Alloc(payload.Length() + 8);
+        ZanDbAtomicTest.AddFrame(wal, payload);
+        File.WriteBytes(path, wal.ToStr(), wal.Length());
+        wal.Free();
+    }
+
+    static void Batches() {
+        string path = ZanDbAtomicTest.DbPath("batch");
+        string torn = ZanDbAtomicTest.DbPath("torn");
+        ZanDbAtomicTest.Clean(path);
+        ZanDbAtomicTest.Clean(torn);
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        ZanStore kv = db.Kv();
+        Ok(db.IsOpen(), "batch open");
+        long epoch = db.CacheVersion();
+        db.Begin();
+        kv.Put("first", "a");
+        db.Begin();
+        kv.Put("second", "b");
+        Ok(db.Commit() && db.InTransaction() && db.GetRevision() == 0, "nested commit only stages");
+        Ok(db.CacheVersion() == epoch && File.GetSize64(path) == 0, "staging has no epoch or WAL change");
+        Ok(db.Commit() && !db.InTransaction(), "outer batch commits");
+        Ok(db.GetRevision() == 1 && kv.Version() == 1 && db.CacheVersion() == epoch + 1, "one revision per batch");
+        Ok(kv.Get("first") == "a" && kv.Get("second") == "b", "batch values visible");
+        db.Close();
+        PageFile f = PageFile.OpenExisting(path);
+        ByteBuffer b = ByteBuffer.Alloc(256);
+        int bytes = (int)f.Size();
+        f.ReadAt(0, b, bytes);
+        b.SeekRead(0);
+        long payloadLen = b.ReadU32();
+        b.ReadU32();
+        long frameSeq = b.ReadU64();
+        int opcode = b.ReadU8();
+        long version = b.ReadU32();
+        long count = b.ReadU32();
+        Ok(payloadLen + 8 == bytes && frameSeq == 0 && opcode == 3 && version == 1 && count == 2,
+            "batch is one versioned CRC frame");
+        f.Close();
+        // 保留第一个完整记录，截在第二个值内；仍必须整个批次回退。
+        b.ReadU8(); b.ReadString(); b.ReadString();
+        int cut = b.ReadPos() + 3;
+        b.Free();
+        File.Copy(path, torn);
+        PageFile damaged = PageFile.OpenExisting(torn);
+        Ok(damaged.Truncate(cut) && damaged.Sync(), "truncate batch in middle");
+        damaged.Close();
+        ZanStore recovered = ZanStore.Open(torn, ZanStore.DUR_SYNC);
+        Ok(recovered.IsOpen() && !recovered.Contains("first") && !recovered.Contains("second"), "torn batch applies neither key");
+        Ok(recovered.GetRevision() == 0 && recovered.LogBytes() == 0, "torn batch repair keeps revision");
+        recovered.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        kv = db.Kv();
+        Ok(db.IsOpen() && kv.Get("first") == "a" && kv.Get("second") == "b", "complete batch survives reopen");
+        long revision = db.GetRevision();
+        epoch = db.CacheVersion();
+        db.Begin();
+        Ok(db.Commit() && db.GetRevision() == revision && db.CacheVersion() == epoch, "empty outer commit has no revision");
+        db.Begin(); kv.Put("first", "staged"); kv.Delete("second");
+        Ok(kv.Get("first") == "staged" && !kv.Contains("second"), "transaction overlay visible");
+        db.Rollback();
+        Ok(db.GetRevision() == revision && db.CacheVersion() == epoch + 1, "rollback changes cache epoch only");
+        Ok(kv.Get("first") == "a" && kv.Get("second") == "b", "rollback restores committed data");
+        epoch = db.CacheVersion();
+        db.Rollback();
+        Ok(db.CacheVersion() == epoch, "idle rollback does not change epoch");
+        db.Begin(); kv.Put("second", "uncommitted"); db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        kv = db.Kv();
+        Ok(kv.Get("second") == "b" && db.GetRevision() == revision, "close rolls back staged writes");
+        db.Begin(); kv.Put("first", "updated"); kv.Delete("second");
+        Ok(db.Commit() && db.GetRevision() == revision + 1, "put and delete share one revision");
+        db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        kv = db.Kv();
+        Ok(kv.Get("first") == "updated" && !kv.Contains("second"), "mixed batch survives reopen");
+        db.Close();
+    }
+
+    static void Legacy() {
+        string path = ZanDbAtomicTest.DbPath("legacy");
+        ZanDbAtomicTest.Clean(path);
+        ByteBuffer wal = ByteBuffer.Alloc(256);
+        ByteBuffer p = ByteBuffer.Alloc(128);
+        p.WriteU64(0); p.WriteU8(1); p.WriteString("legacy"); p.WriteString("old");
+        ZanDbAtomicTest.AddFrame(wal, p);
+        p.Clear(); p.WriteU64(1); p.WriteU8(1); p.WriteString("gone"); p.WriteString("x");
+        ZanDbAtomicTest.AddFrame(wal, p);
+        p.Clear(); p.WriteU64(2); p.WriteU8(2); p.WriteString("gone");
+        ZanDbAtomicTest.AddFrame(wal, p);
+        File.WriteBytes(path, wal.ToStr(), wal.Length());
+        p.Free(); wal.Free();
+        ZanStore db = ZanStore.Open(path, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen() && db.Get("legacy") == "old" && !db.Contains("gone"), "legacy put delete frames replay");
+        Ok(db.GetRevision() == 3, "legacy sequence retained");
+        db.Begin(); db.Put("legacy", "new"); db.Put("extra", "x");
+        Ok(db.Commit() && db.GetRevision() == 4, "new batch follows legacy sequence");
+        db.Close();
+        db = ZanStore.Open(path, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen() && db.Get("legacy") == "new" && db.Get("extra") == "x" && db.GetRevision() == 4,
+            "mixed legacy batch WAL reopens");
+        db.Close();
+    }
+
+    static void Malformed() {
+        for (int kind = 0; kind < 5; kind = kind + 1) {
+            string path = ZanDbAtomicTest.DbPath("bad" + Convert.ToString(kind));
+            ZanDbAtomicTest.Clean(path);
+            ByteBuffer p = ByteBuffer.Alloc(128);
+            p.WriteU64(0); p.WriteU8(3); p.WriteU32(kind == 1 ? 2 : 1); p.WriteU32(2);
+            p.WriteU8(1); p.WriteString("must-not-apply"); p.WriteString("a");
+            if (kind == 0) { p.WriteU8(9); p.WriteString("invalid-op"); }
+            else if (kind == 2) { p.WriteU8(1); p.WriteVarInt(4294967296); }
+            else if (kind == 3) { p.WriteU8(1); p.WriteString("missing-value"); p.WriteU8(128); }
+            else { p.WriteU8(2); p.WriteString("valid-delete"); }
+            if (kind == 4) { p.WriteU8(99); }
+            ZanDbAtomicTest.WriteFrame(path, p);
+            p.Free();
+            long bytes = File.GetSize64(path);
+            ZanStore db = ZanStore.Open(path, ZanStore.DUR_SYNC);
+            Ok(!db.IsOpen() && db.GetError() != "" && db.memtable.Count == 0 && db.GetRevision() == 0,
+                "malformed batch rejected " + Convert.ToString(kind));
+            Ok(File.GetSize64(path) == bytes, "invalid payload WAL preserved " + Convert.ToString(kind));
+            db.Close();
+            long lockHandle = File.TryLock(path + ".lock");
+            Ok(lockHandle != 0, "failed open releases lock " + Convert.ToString(kind));
+            if (lockHandle != 0) { File.Unlock(lockHandle); }
+        }
+    }
+
+    static void Faults() {
+        string path = ZanDbAtomicTest.DbPath("fault");
+        ZanDbAtomicTest.Clean(path);
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        ZanStore kv = db.Kv();
+        db.Begin(); kv.Put("snapshot", "old"); kv.Put("journal", "old-journal"); db.Commit();
+        long revision = db.GetRevision();
+        long bytes = File.GetSize64(path);
+        db.Begin(); kv.Put("snapshot", "failed"); kv.Put("new-journal", "failed");
+        kv.log.Close(false);
+        Ok(!db.Commit() && !db.IsOpen() && db.GetError() != "", "closed WAL commit fails closed");
+        Ok(!kv.InTransaction() && kv.txPut.Count == 0 && db.GetRevision() == revision, "failed commit discards overlay");
+        bool threw = false;
+        try { kv.Put("after-error", "x"); }
+        catch (IOException ex) { threw = true; }
+        Ok(threw, "void Put reports failed store");
+        db.Close();
+        Ok(File.GetSize64(path) == bytes, "failed close does not flush staged batch");
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        kv = db.Kv();
+        Ok(db.IsOpen() && kv.Get("snapshot") == "old" && kv.Get("journal") == "old-journal"
+            && !kv.Contains("new-journal") && !kv.Contains("after-error"), "failed commit preserves prior snapshot journal");
+        db.Close();
+        LogFile log = LogFile.Open(ZanDbAtomicTest.DbPath("closed-log"));
+        log.Close(false);
+        Ok(!log.IsOpen() && !log.Sync() && log.GetError() != "" && !log.Reset() && log.Size() < 0,
+            "closed log sync reset size report failure");
+    }
+
+    static void Manifests() {
+        string path = ZanDbAtomicTest.DbPath("manifest");
+        ZanDbAtomicTest.Clean(path);
+        ZanStore db = ZanStore.Open(path, ZanStore.DUR_SYNC);
+        db.Put("kept", "value"); db.FlushToSegment();
+        Ok(db.IsOpen() && db.LogBytes() == 0 && db.man.Exists(), "flush publishes manifest before WAL reset");
+        db.Close();
+        Manifest a = Manifest.Load(path);
+        File.WriteAllText(path + ".m0", "broken");
+        db = ZanStore.Open(path, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen() && db.Get("kept") == "value" && db.GetRevision() == a.LogStartSeq(), "fallback slot survives WAL reset");
+        db.Close();
+        File.WriteAllText(path + ".m1", "broken");
+        db = ZanStore.Open(path, ZanStore.DUR_SYNC);
+        Ok(!db.IsOpen() && db.GetError() != "", "both corrupt manifest slots rejected");
+        db.Close();
+        long lockHandle = File.TryLock(path + ".lock");
+        Ok(lockHandle != 0, "manifest open error releases lock");
+        if (lockHandle != 0) { File.Unlock(lockHandle); }
+
+        string merge = ZanDbAtomicTest.DbPath("merge");
+        ZanDbAtomicTest.Clean(merge);
+        db = ZanStore.Open(merge, ZanStore.DUR_SYNC);
+        db.Put("snapshot", "old"); db.FlushToSegment();
+        db.Put("journal", "entry"); db.FlushToSegment();
+        // 每次双槽发布结束于 m1；将第二次保存的目标变成目录使其失败。
+        File.Move(merge + ".m1", merge + ".m1.saved");
+        Directory.CreateDirectory(merge + ".m1");
+        Ok(db.MergeSomeSegments(2) == 0 && !db.IsOpen(), "second manifest publish failure closes merge");
+        Ok(File.Exists(merge + ".s0") && File.Exists(merge + ".s1") && File.Exists(merge + ".s2"),
+            "failed second publish retains all referenced segments");
+        db.Close();
+        Directory.Delete(merge + ".m1");
+        File.Move(merge + ".m1.saved", merge + ".m1");
+        File.WriteAllText(merge + ".m0", "broken");
+        db = ZanStore.Open(merge, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen() && db.Get("snapshot") == "old" && db.Get("journal") == "entry", "old merge fallback remains recoverable");
+        Ok(db.MergeSomeSegments(2) == 2 && db.IsOpen(), "merge succeeds after reopen");
+        db.Close();
+        File.WriteAllText(merge + ".m0", "broken");
+        db = ZanStore.Open(merge, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen() && db.Get("snapshot") == "old" && db.Get("journal") == "entry", "merge fallback never references retired segments");
+        db.Close();
+
+        string flush = ZanDbAtomicTest.DbPath("flush-fault");
+        ZanDbAtomicTest.Clean(flush);
+        db = ZanStore.Open(flush, ZanStore.DUR_SYNC);
+        db.Put("snapshot", "old"); db.FlushToSegment();
+        File.Move(flush + ".m1", flush + ".m1.saved");
+        Directory.CreateDirectory(flush + ".m1");
+        db.SetFlushThreshold(1);
+        db.Begin(); db.Put("snapshot", "new"); db.Put("journal", "new-entry");
+        Ok(!db.Commit() && !db.IsOpen() && db.GetRevision() == 2, "auto flush failure reports committed revision");
+        Ok(File.GetSize64(flush) > 0 && File.Exists(flush + ".s0") && File.Exists(flush + ".s1"),
+            "failed flush preserves WAL and published segment");
+        db.Close();
+        Directory.Delete(flush + ".m1");
+        File.Move(flush + ".m1.saved", flush + ".m1");
+        File.WriteAllText(flush + ".m0", "broken");
+        db = ZanStore.Open(flush, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen() && db.Get("snapshot") == "new" && db.Get("journal") == "new-entry" && db.GetRevision() == 2,
+            "flush failure fallback replays completed batch");
+        db.Close();
+    }
+
+    static void Main() {
+        Directory.CreateDirectory("_scratch");
+        Directory.DeleteRecursive(ZanDbAtomicTest.root);
+        Directory.CreateDirectory(ZanDbAtomicTest.root);
+        ZanDbAtomicTest.Batches();
+        ZanDbAtomicTest.Legacy();
+        ZanDbAtomicTest.Malformed();
+        ZanDbAtomicTest.Faults();
+        ZanDbAtomicTest.Manifests();
+        Console.WriteLine("done " + Convert.ToString(checks) + " checks");
+        Directory.DeleteRecursive(ZanDbAtomicTest.root);
+    }
+}

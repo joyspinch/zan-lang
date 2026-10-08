@@ -1,0 +1,93 @@
+using System;
+using System.Data.ZanDb;
+using System.IO;
+using System.Json;
+
+/// <summary>One process owns the files; clients communicate only through the
+/// framed service. Configuration is JSON and argv comes from Environment.</summary>
+class ZanDbServiceExample {
+    static JsonValue Config(string path) {
+        JsonValue config = ZanDbProtocol.Canonical(JsonValue.Parse(File.ReadAllText(path)), 0);
+        if (!config.IsObject()) { throw new ArgumentException("Configuration must be a JSON object."); }
+        return config;
+    }
+
+    static ZanDbServerOptions Options(JsonValue config) {
+        ZanDbServerOptions options = new ZanDbServerOptions();
+        options.path = ZanDbProtocol.RequireString(config, "path");
+        options.token = ZanDbProtocol.RequireString(config, "token");
+        JsonValue host = config.Get("host");
+        if (host != null) { options.host = ZanDbProtocol.RequireString(config, "host"); }
+        options.port = ZanDbProtocol.IntOption(config, "port", options.port, 1, 65535);
+        options.timeoutMs = ZanDbProtocol.IntOption(config, "timeout_ms", options.timeoutMs, 1, 600000);
+        options.maxConnections = ZanDbProtocol.IntOption(config, "max_connections", options.maxConnections, 1, 10000);
+        return options;
+    }
+
+    static async void SendOne(string configPath, string requestPath) {
+        JsonValue config = ZanDbServiceExample.Config(configPath);
+        ZanDbServerOptions options = ZanDbServiceExample.Options(config);
+        string clientId = ZanDbProtocol.RequireString(config, "client_id");
+        ZanDbClient client = new ZanDbClient(options.host, options.port, options.token, clientId);
+        client.SetTimeout(options.timeoutMs);
+        try {
+            JsonValue request = JsonValue.Parse(File.ReadAllText(requestPath));
+            JsonValue response = await client.SendAsync(request);
+            Console.WriteLine(response.ToJson());
+        } finally {
+            await client.CloseAsync();
+        }
+    }
+
+    static async void Serve(string configPath) {
+        JsonValue config = ZanDbServiceExample.Config(configPath);
+        ZanDbServerOptions options = ZanDbServiceExample.Options(config);
+        string stopFile = ZanDbProtocol.RequireString(config, "stop_file");
+        if (stopFile.Length == 0) { throw new ArgumentException("stop_file is required for graceful shutdown."); }
+        string parent = Path.GetDirectoryName(options.path);
+        if (parent.Length > 0 && !Directory.Exists(parent)) { Directory.CreateDirectory(parent); }
+        ZanDbServer server = new ZanDbServer(options);
+        List<long> tasks = new List<long>();
+        try {
+            server.Start();
+            long runner = Task.Run(server.RunAsync());
+            tasks.Add(runner);
+            JsonValue ready = JsonValue.NewObject();
+            ready.PutBool("ready", true);
+            ready.PutStr("host", options.host);
+            ready.PutInt("port", options.port);
+            Console.WriteLine(ready.ToJson());
+            while (Task.IsDone(runner) == 0 && !File.Exists(stopFile)) { await Task.Delay(50); }
+        } finally {
+            await server.StopAsync();
+            if (tasks.Count > 0) { await Task.WhenAll(tasks); }
+        }
+        JsonValue stopped = JsonValue.NewObject();
+        stopped.PutBool("stopped", true);
+        Console.WriteLine(stopped.ToJson());
+    }
+
+    static async void Main() {
+        try {
+            int argc = Environment.ArgCount();
+            if (argc == 1) {
+                string configPath = Environment.ArgAt(0);
+                await ZanDbServiceExample.Serve(configPath);
+            } else if (argc == 3 && Environment.ArgAt(0) == "--request") {
+                string configPath = Environment.ArgAt(1);
+                string requestPath = Environment.ArgAt(2);
+                await ZanDbServiceExample.SendOne(configPath, requestPath);
+            } else {
+                Console.WriteLine("Usage: zandb_server <config.json>");
+                Console.WriteLine("       zandb_server --request <config.json> <request.json>");
+            }
+        } catch (Exception e) {
+            // Executable boundary: startup/owner-lock rejection is observable
+            // even on hosts where a void Main cannot return an exit status.
+            JsonValue error = JsonValue.NewObject();
+            error.PutBool("ready", false);
+            error.PutStr("error", e.Message);
+            Console.WriteLine(error.ToJson());
+        }
+    }
+}

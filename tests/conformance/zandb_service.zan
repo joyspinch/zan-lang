@@ -1,0 +1,263 @@
+using System;
+using System.Data.ZanDb;
+using System.IO;
+using System.Json;
+
+class ZanDbServiceTest {
+    static int checks = 0;
+    static string token = "conformance-token-2026";
+
+    static void Check(bool condition, string name) {
+        ZanDbServiceTest.checks = ZanDbServiceTest.checks + 1;
+        Console.WriteLine((condition ? "ok " : "FAIL ") + Convert.ToString(ZanDbServiceTest.checks) + " - " + name);
+    }
+
+    static JsonValue Request(string action, string id) {
+        JsonValue request = JsonValue.NewObject();
+        request.PutInt("v", 1);
+        request.PutStr("token", ZanDbServiceTest.token);
+        request.PutStr("client", "conformance");
+        request.PutStr("id", id);
+        request.PutStr("action", action);
+        request.PutStr("collection", "docs");
+        return request;
+    }
+
+    static JsonValue Document(string title, string tag) {
+        JsonValue vector = JsonValue.NewArray();
+        vector.Append(JsonValue.NewInt(1));
+        vector.Append(JsonValue.NewInt(0));
+        JsonValue document = JsonValue.NewObject();
+        document.PutStr("title", title);
+        document.PutStr("tag", tag);
+        document.PutStr("note", "quote \" and slash \\ and newline\n");
+        document.Put("vector", vector);
+        return document;
+    }
+
+    static JsonValue Result(JsonValue response) { return ZanDbProtocol.Member(response, "result"); }
+    static bool Success(JsonValue response) { return ZanDbProtocol.Member(response, "ok").AsBool(false); }
+    static long Revision(JsonValue response) { return ZanDbProtocol.Member(response, "revision").AsLong(-1); }
+    static string Code(JsonValue response) { return ZanDbProtocol.Member(ZanDbProtocol.Member(response, "error"), "code").AsString(""); }
+
+    static JsonValue Get(ZanDbServer server, int id) {
+        JsonValue request = ZanDbServiceTest.Request("get", "read-get");
+        request.PutInt("document_id", id);
+        return ZanDbServiceTest.Result(server.Execute(request));
+    }
+
+    static JsonValue Query(ZanDbServer server, string tag) {
+        JsonValue request = ZanDbServiceTest.Request("query", "read-query");
+        JsonValue filter = JsonValue.NewObject();
+        filter.PutStr("field", "tag");
+        filter.PutStr("eq", tag);
+        request.Put("filter", filter);
+        return ZanDbServiceTest.Result(server.Execute(request));
+    }
+
+    static void FilterBeforeTopK(ZanDbServer server, JsonValue request, string name) {
+        JsonValue all = request.Clone();
+        all.Set("k", JsonValue.NewInt(10));
+        JsonValue baseline = ZanDbServiceTest.Result(server.Execute(all));
+        if (baseline.Count() < 2) { ZanDbServiceTest.Check(false, name); return; }
+        int target = ZanDbProtocol.Member(baseline.At(baseline.Count() - 1), "id").AsInt(0);
+        JsonValue filter = JsonValue.NewObject();
+        filter.PutStr("field", "_id");
+        filter.PutInt("eq", target);
+        all.Set("k", JsonValue.NewInt(1));
+        all.Put("filter", filter);
+        JsonValue reply = server.Execute(all);
+        JsonValue hits = ZanDbServiceTest.Result(reply);
+        bool found = false;
+        if (hits.Count() == 1) { found = ZanDbProtocol.Member(hits.At(0), "id").AsInt(0) == target; }
+        ZanDbServiceTest.Check(ZanDbServiceTest.Success(reply) && found, name);
+    }
+
+    static void Clean(string path) {
+        File.Delete(path);
+        File.Delete(path + ".m0");
+        File.Delete(path + ".m1");
+        for (int i = 0; i < 40; i = i + 1) { File.Delete(path + ".s" + Convert.ToString(i)); }
+    }
+
+    static async void Main() {
+        byte[] header = ZanDbProtocol.Header(66051);
+        ZanDbServiceTest.Check(header[0] == 0 && header[1] == 1 && header[2] == 2 && header[3] == 3 && ZanDbProtocol.Length(header) == 66051, "big endian framing");
+        ZanDbServiceTest.Check(ZanDbProtocol.Length(ZanDbProtocol.Header(8388608)) == 8388608, "payload limit boundary");
+        bool oversized = false;
+        try { ZanDbProtocol.Header(8388609); }
+        catch (ZanDbRequestException e) { oversized = e.code == "frame_too_large"; }
+        ZanDbServiceTest.Check(oversized, "oversized payload rejected");
+        JsonValue duplicate = JsonValue.NewObject();
+        duplicate.PutStr("action", "ping");
+        duplicate.PutStr("action", "insert");
+        bool duplicatesRejected = false;
+        try { ZanDbProtocol.Canonical(duplicate, 0); }
+        catch (ZanDbRequestException e) { duplicatesRejected = e.code == "invalid_request"; }
+        ZanDbServiceTest.Check(duplicatesRejected, "duplicate JSON keys rejected");
+
+        string path = "_scratch/zandb_service_case.zdb";
+        Directory.CreateDirectory("_scratch");
+        ZanDbServiceTest.Clean(path);
+        ZanDbServerOptions options = new ZanDbServerOptions();
+        options.path = path;
+        options.token = ZanDbServiceTest.token;
+        ZanDbServer server = new ZanDbServer(options);
+        JsonValue insert = ZanDbServiceTest.Request("insert", "write-insert");
+        insert.Put("document", ZanDbServiceTest.Document("alpha beta", "first"));
+        JsonValue firstResponse = JsonValue.NewNull();
+        long lastRevision = 0;
+        try {
+            JsonValue ping = server.Execute(ZanDbServiceTest.Request("ping", "ping"));
+            ZanDbServiceTest.Check(ZanDbServiceTest.Success(ping) && ZanDbServiceTest.Revision(ping) == 0, "owner opens with revision zero");
+            JsonValue denied = insert.Clone();
+            denied.Set("token", JsonValue.NewStr("incorrect-token-2026"));
+            ZanDbServiceTest.Check(ZanDbServiceTest.Code(server.Execute(denied)) == "unauthorized", "token checked before write");
+            firstResponse = server.Execute(insert);
+            ZanDbServiceTest.Check(ZanDbServiceTest.Success(firstResponse) && ZanDbServiceTest.Result(firstResponse).AsInt(0) == 1 && ZanDbServiceTest.Revision(firstResponse) == 1, "insert has committed revision");
+            JsonValue first = ZanDbServiceTest.Get(server, 1);
+            ZanDbServiceTest.Check(ZanDbProtocol.Member(first, "note").AsString("") == "quote \" and slash \\ and newline\n", "JSON escaping roundtrip");
+            JsonValue ordered = insert.Clone();
+            JsonValue oldDocument = ZanDbProtocol.Member(insert, "document");
+            JsonValue reverseDocument = JsonValue.NewObject();
+            for (int i = oldDocument.Count() - 1; i >= 0; i = i - 1) { reverseDocument.Put(oldDocument.KeyAt(i), oldDocument.ValAt(i)); }
+            ordered.Set("document", reverseDocument);
+            ZanDbServiceTest.Check(server.Execute(ordered).ToJson() == firstResponse.ToJson(), "canonical idempotent replay");
+            JsonValue conflict = insert.Clone();
+            conflict.Set("document", ZanDbServiceTest.Document("changed", "first"));
+            ZanDbServiceTest.Check(ZanDbServiceTest.Code(server.Execute(conflict)) == "id_conflict" && ZanDbServiceTest.Query(server, "first").Count() == 1, "different body same id rejected");
+
+            JsonValue failed = ZanDbServiceTest.Request("batch", "failed-batch");
+            JsonValue operations = JsonValue.NewArray();
+            JsonValue stage = JsonValue.NewObject();
+            stage.PutStr("action", "insert");
+            stage.PutStr("collection", "docs");
+            JsonValue stagedDocument = ZanDbServiceTest.Document("temporary", "phantom");
+            stagedDocument.PutStr("new_rollback_field", "must disappear");
+            stage.Put("document", stagedDocument);
+            operations.Append(stage);
+            JsonValue absent = JsonValue.NewObject();
+            absent.PutStr("action", "update");
+            absent.PutStr("collection", "docs");
+            absent.PutInt("document_id", 999);
+            absent.Put("document", ZanDbServiceTest.Document("missing", "phantom"));
+            operations.Append(absent);
+            failed.Put("operations", operations);
+            JsonValue failedReply = server.Execute(failed);
+            ZanDbServiceTest.Check(ZanDbServiceTest.Code(failedReply) == "not_found" && ZanDbServiceTest.Revision(failedReply) == 1 && ZanDbServiceTest.Query(server, "phantom").Count() == 0, "failed batch rolls back documents and revision");
+            JsonValue next = ZanDbServiceTest.Request("insert", "failed-batch");
+            next.Put("document", ZanDbServiceTest.Document("gamma", "after"));
+            JsonValue nextReply = server.Execute(next);
+            ZanDbServiceTest.Check(ZanDbServiceTest.Success(nextReply) && ZanDbServiceTest.Result(nextReply).AsInt(0) == 2 && !ZanDbServiceTest.Get(server, 2).Has("new_rollback_field"), "rollback resets sequence metadata cache and request record");
+
+            JsonValue batch = ZanDbServiceTest.Request("batch", "atomic-pair");
+            JsonValue pair = JsonValue.NewArray();
+            for (int i = 10; i <= 11; i = i + 1) {
+                JsonValue step = JsonValue.NewObject();
+                step.PutStr("action", "upsert");
+                step.PutStr("collection", "docs");
+                step.PutInt("document_id", i);
+                step.Put("document", ZanDbServiceTest.Document("alpha atomic", "pair"));
+                pair.Append(step);
+            }
+            batch.Put("operations", pair);
+            JsonValue batchReply = server.Execute(batch);
+            ZanDbServiceTest.Check(ZanDbServiceTest.Success(batchReply) && ZanDbServiceTest.Revision(batchReply) == 3 && ZanDbServiceTest.Result(batchReply).Count() == 2 && ZanDbServiceTest.Query(server, "pair").Count() == 2, "batch commits once for all writes");
+            ZanDbServiceTest.Check(server.Execute(batch).ToJson() == batchReply.ToJson(), "batch retry preserves revision and results");
+
+            JsonValue fieldIndex = ZanDbServiceTest.Request("ensure_index", "index-tag");
+            fieldIndex.PutStr("field", "tag");
+            JsonValue textIndex = ZanDbServiceTest.Request("ensure_text_index", "index-title");
+            textIndex.PutStr("field", "title");
+            ZanDbServiceTest.Check(ZanDbServiceTest.Success(server.Execute(fieldIndex)) && ZanDbServiceTest.Success(server.Execute(textIndex)) && ZanDbServiceTest.Query(server, "pair").Count() == 2, "equality and text indexes created");
+            JsonValue vectorIndex = ZanDbServiceTest.Request("ensure_vector_index", "index-vector");
+            vectorIndex.PutStr("field", "vector");
+            JsonValue vectorOptions = JsonValue.NewObject();
+            vectorOptions.PutInt("dimensions", 2);
+            vectorOptions.PutInt("metric", 0);
+            vectorIndex.Put("options", vectorOptions);
+            ZanDbServiceTest.Check(ZanDbServiceTest.Success(server.Execute(vectorIndex)) && ZanDbServiceTest.Result(server.Execute(ZanDbServiceTest.Request("list_indexes", "list"))).Count() == 3, "index inventory includes field text vector");
+            JsonValue textSearch = ZanDbServiceTest.Request("search_text", "text-query");
+            textSearch.PutStr("field", "title");
+            textSearch.PutStr("query", "alpha");
+            textSearch.PutInt("k", 10);
+            JsonValue textReply = server.Execute(textSearch);
+            ZanDbServiceTest.Check(ZanDbServiceTest.Success(textReply) && ZanDbServiceTest.Result(textReply).Count() == 3, "text search sees committed batch");
+            JsonValue vectorSearch = ZanDbServiceTest.Request("search_vector_exact", "vector-query");
+            vectorSearch.PutStr("field", "vector");
+            vectorSearch.Put("vector", ZanDbProtocol.Member(ZanDbServiceTest.Document("", ""), "vector"));
+            vectorSearch.PutInt("k", 2);
+            JsonValue vectorReply = server.Execute(vectorSearch);
+            JsonValue vectorHits = ZanDbServiceTest.Result(vectorReply);
+            bool distancesValid = false;
+            if (vectorHits.Count() == 2) {
+                distancesValid = vectorHits.At(0).Has("distance") && vectorHits.At(1).Has("distance") &&
+                    !vectorHits.At(0).Has("score") && !vectorHits.At(1).Has("score") &&
+                    ZanDbProtocol.Member(vectorHits.At(0), "distance").AsDouble(-1) == 0 &&
+                    ZanDbProtocol.Member(vectorHits.At(1), "distance").AsDouble(-1) == 0;
+            }
+            ZanDbServiceTest.Check(ZanDbServiceTest.Success(vectorReply) && distancesValid, "exact vector search through allowlist");
+            JsonValue hybrid = ZanDbServiceTest.Request("search_hybrid", "hybrid-query");
+            hybrid.PutStr("text_field", "title");
+            hybrid.PutStr("vector_field", "vector");
+            hybrid.PutStr("query", "alpha");
+            hybrid.Put("vector", ZanDbProtocol.Member(vectorSearch, "vector"));
+            hybrid.PutInt("k", 2);
+            ZanDbServiceTest.Check(ZanDbServiceTest.Success(server.Execute(hybrid)) && ZanDbServiceTest.Result(server.Execute(hybrid)).Count() == 2, "hybrid retrieval uses same owner gate");
+            ZanDbServiceTest.FilterBeforeTopK(server, textSearch, "text equality filter runs before top k");
+            ZanDbServiceTest.FilterBeforeTopK(server, vectorSearch, "exact vector equality filter runs before top k");
+            JsonValue approximate = vectorSearch.Clone();
+            approximate.Set("action", JsonValue.NewStr("search_vector"));
+            approximate.PutInt("ef", 64);
+            ZanDbServiceTest.FilterBeforeTopK(server, approximate, "graph vector equality filter runs before top k");
+            ZanDbServiceTest.FilterBeforeTopK(server, hybrid, "hybrid equality filter runs before top k");
+            JsonValue pairFilter = JsonValue.NewObject();
+            pairFilter.PutStr("field", "tag");
+            pairFilter.PutStr("eq", "pair");
+            JsonValue filteredText = textSearch.Clone();
+            filteredText.Set("k", JsonValue.NewInt(2));
+            filteredText.Put("filter", pairFilter);
+            JsonValue pairHits = ZanDbServiceTest.Result(server.Execute(filteredText));
+            ZanDbServiceTest.Check(pairHits.Count() == 2 && ZanDbProtocol.Member(pairHits.At(0), "id").AsInt(0) >= 10 && ZanDbProtocol.Member(pairHits.At(1), "id").AsInt(0) >= 10, "string equality filter retains eligible hits");
+            pairFilter.Set("eq", JsonValue.NewBool(true));
+            ZanDbServiceTest.Check(ZanDbServiceTest.Code(server.Execute(filteredText)) == "invalid_request", "retrieval filter types validated");
+            JsonValue maintenanceReply = server.Execute(textIndex);
+            long maintenanceRevision = ZanDbServiceTest.Revision(server.Execute(ZanDbServiceTest.Request("ping", "maintenance-revision")));
+            ZanDbServiceTest.Check(ZanDbServiceTest.Success(maintenanceReply) && server.Execute(textIndex).ToJson() == maintenanceReply.ToJson() && ZanDbServiceTest.Revision(server.Execute(ZanDbServiceTest.Request("ping", "maintenance-after"))) == maintenanceRevision, "maintenance replay preserves published revision");
+            lastRevision = ZanDbServiceTest.Revision(server.Execute(ZanDbServiceTest.Request("ping", "revision")));
+            JsonValue unknown = ZanDbServiceTest.Request("sql", "not-allowed");
+            ZanDbServiceTest.Check(ZanDbServiceTest.Code(server.Execute(unknown)) == "unknown_action", "arbitrary commands rejected");
+        } finally {
+            await server.StopAsync();
+        }
+        ZanDbServiceTest.Check(ZanDbServiceTest.Code(server.Execute(insert)) == "service_stopped", "stop closes owner");
+        ZanDbServer reopened = new ZanDbServer(options);
+        try {
+            JsonValue replay = reopened.Execute(insert);
+            ZanDbServiceTest.Check(replay.ToJson() == firstResponse.ToJson() && ZanDbServiceTest.Query(reopened, "first").Count() == 1, "idempotency result survives owner restart");
+            JsonValue ping = reopened.Execute(ZanDbServiceTest.Request("ping", "restart-revision"));
+            ZanDbServiceTest.Check(ZanDbServiceTest.Revision(ping) == lastRevision && ZanDbServiceTest.Result(reopened.Execute(ZanDbServiceTest.Request("list_indexes", "restart-indexes"))).Count() == 3, "revision and indexes survive restart");
+            JsonValue rebuild = ZanDbServiceTest.Request("rebuild_search", "restart-rebuild");
+            JsonValue rebuiltReply = reopened.Execute(rebuild);
+            long rebuiltRevision = ZanDbServiceTest.Revision(rebuiltReply);
+            JsonValue rebuiltText = ZanDbServiceTest.Request("search_text", "rebuilt-text");
+            rebuiltText.PutStr("field", "title");
+            rebuiltText.PutStr("query", "alpha");
+            rebuiltText.PutInt("k", 10);
+            ZanDbServiceTest.Check(ZanDbServiceTest.Success(rebuiltReply) && rebuiltRevision > lastRevision &&
+                reopened.Execute(rebuild).ToJson() == rebuiltReply.ToJson() &&
+                ZanDbServiceTest.Revision(reopened.Execute(ZanDbServiceTest.Request("ping", "rebuild-revision"))) == rebuiltRevision &&
+                ZanDbServiceTest.Result(reopened.Execute(rebuiltText)).Count() == 3 &&
+                ZanDbServiceTest.Result(reopened.Execute(ZanDbServiceTest.Request("list_indexes", "rebuilt-indexes"))).Count() == 3,
+                "source rebuild and replay preserve indexes");
+            lastRevision = rebuiltRevision;
+            JsonValue next = ZanDbServiceTest.Request("insert", "restart-insert");
+            next.Put("document", ZanDbServiceTest.Document("restart", "restart"));
+            JsonValue reply = reopened.Execute(next);
+            ZanDbServiceTest.Check(ZanDbServiceTest.Success(reply) && ZanDbServiceTest.Result(reply).AsInt(0) == 12 && ZanDbServiceTest.Revision(reply) == lastRevision + 1, "recovered owner allocates fresh ids");
+        } finally {
+            await reopened.StopAsync();
+            ZanDbServiceTest.Clean(path);
+        }
+    }
+}

@@ -1,0 +1,77 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Data.ZanDb;
+
+/// Bounded persistence benchmark; compile with --auto-stdlib --publish.
+/// ZAN_SEARCH_PERSIST_N selects 256..20000 documents, default 2000.
+class ZanDbPersistenceBench {
+    static float[] Query() {
+        float[] v = new float[64];
+        for (int d = 0; d < v.Length; d = d + 1) { v[d] = (float)((d * 7 % 31 - 15) * 0.1); }
+        return v;
+    }
+    static JsonValue Doc(int i) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.PutStr("text", "中文数据库知识库资料 检索 " + Convert.ToString(i));
+        JsonValue vector = JsonValue.NewArray();
+        for (int d = 0; d < 64; d = d + 1) {
+            vector.Append(JsonValue.NewDouble(((i * 17 + d * 7) % 101 - 50) * 0.02));
+        }
+        doc.Put("embedding", vector);
+        return doc;
+    }
+    static void Report(string label, long start) {
+        Console.WriteLine(label + "_ms=" + Convert.ToString((double)(Stopwatch.GetMicroseconds() - start) / 1000.0));
+    }
+    static void Clean(string path) {
+        File.Delete(path); File.Delete(path + ".lock");
+        File.Delete(path + ".m0"); File.Delete(path + ".m1");
+        for (int i = 0; i < 1000; i = i + 1) { File.Delete(path + ".s" + Convert.ToString(i)); }
+    }
+    static void Main() {
+        int n = 2000;
+        string configured = Environment.GetEnvironmentVariable("ZAN_SEARCH_PERSIST_N");
+        if (configured != null && configured.Length > 0) { n = Convert.ToInt(configured); }
+        if (n < 256 || n > 20000) { throw new ArgumentException("N must be in [256,20000]"); }
+        Directory.CreateDirectory("_scratch");
+        string path = "_scratch/zandb_persist_bench_tmp.zdb";
+        Clean(path);
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        if (!db.IsOpen()) { throw new IOException(db.GetError()); }
+        Collection docs = db.GetCollection("knowledge");
+        Console.WriteLine("ZanDB persisted search N=" + Convert.ToString(n) + " dims=64 sync=true");
+        long begin = Stopwatch.GetMicroseconds();
+        for (int start = 0; start < n; start = start + 256) {
+            List<JsonValue> batch = new List<JsonValue>();
+            for (int i = start; i < start + 256 && i < n; i = i + 1) { batch.Add(Doc(i)); }
+            docs.InsertBulk(batch);
+        }
+        Report("insert", begin);
+        begin = Stopwatch.GetMicroseconds(); docs.EnsureFullTextIndex("text"); Report("text_build_checkpoint", begin);
+        VectorIndexOptions options = new VectorIndexOptions(64); options.efConstruction = 160; options.efSearch = 256;
+        begin = Stopwatch.GetMicroseconds(); docs.EnsureVectorIndex("embedding", options); Report("vector_build_checkpoint", begin);
+        float[] query = Query();
+        docs.SearchText("text", "知识库", 10); docs.SearchVector("embedding", query, 10, 256);
+        begin = Stopwatch.GetMicroseconds();
+        for (int i = 0; i < 100; i = i + 1) { docs.SearchText("text", "知识库", 10); }
+        Report("text_100_queries", begin);
+        begin = Stopwatch.GetMicroseconds();
+        for (int i = 0; i < 100; i = i + 1) { docs.SearchVector("embedding", query, 10, 256); }
+        Report("vector_100_queries", begin);
+        begin = Stopwatch.GetMicroseconds(); docs.CheckpointSearchIndexes(); Report("checkpoint", begin);
+        db.Flush(); db.Close();
+        begin = Stopwatch.GetMicroseconds(); db = ZanDatabase.Open(path, ZanStore.DUR_SYNC); Report("store_reopen", begin);
+        docs = db.GetCollection("knowledge");
+        begin = Stopwatch.GetMicroseconds(); List<System.Text.Bm25Hit> text = docs.SearchText("text", "知识库", 10); Report("text_checkpoint_load_query", begin);
+        begin = Stopwatch.GetMicroseconds(); List<VectorHit> vector = docs.SearchVector("embedding", query, 10, 256); Report("graph_checkpoint_load_query", begin);
+        Console.WriteLine("reopen_hits=" + Convert.ToString(text.Count) + "," + Convert.ToString(vector.Count));
+        docs.Update(1, Doc(n + 7)); docs.DeleteById(2);
+        db.Close();
+        begin = Stopwatch.GetMicroseconds(); db = ZanDatabase.Open(path, ZanStore.DUR_SYNC); Report("store_reopen_tail", begin);
+        docs = db.GetCollection("knowledge");
+        begin = Stopwatch.GetMicroseconds(); docs.SearchVector("embedding", query, 10, 256); Report("graph_load_two_tail_changes_query", begin);
+        begin = Stopwatch.GetMicroseconds(); docs.RebuildSearchIndexes(); Report("source_rebuild_checkpoint", begin);
+        db.Close(); Clean(path);
+    }
+}

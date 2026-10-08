@@ -1,0 +1,452 @@
+using System;
+using System.Collections.Generic;
+using System.Data.ZanDb;
+using System.Json;
+
+delegate void VectorTestOp();
+
+class VectorTestRandom {
+    long state;
+    VectorTestRandom(int seed) { this.state = seed; }
+    double Unit() {
+        this.state = (this.state * 48271) % 2147483647;
+        return (double)this.state / 2147483647.0;
+    }
+}
+
+class VectorOracleRow {
+    int id;
+    int active;
+    float[] vector;
+    VectorOracleRow(int id, float[] source) {
+        this.id = id;
+        this.active = 1;
+        this.vector = new float[source.Length];
+        for (int i = 0; i < source.Length; i = i + 1) { this.vector[i] = source[i]; }
+    }
+}
+
+class VectorOracleHit {
+    int id;
+    double distance;
+    VectorOracleHit(int id, double distance) { this.id = id; this.distance = distance; }
+}
+
+/// Independent scalar model: original float coordinates widened to double,
+/// every active row evaluated, then a full merge sort (no index heaps/helpers).
+class VectorOracle {
+    List<VectorOracleRow> rows;
+    Dict<int, VectorOracleRow> current;
+    int metric;
+
+    VectorOracle(int metric) {
+        this.metric = metric;
+        this.rows = new List<VectorOracleRow>();
+        this.current = new Dict<int, VectorOracleRow>();
+    }
+
+    void Put(int id, float[] vector) {
+        if (this.current.ContainsKey(id)) { this.current[id].active = 0; }
+        VectorOracleRow row = new VectorOracleRow(id, vector);
+        this.rows.Add(row);
+        this.current[id] = row;
+    }
+
+    void Remove(int id) {
+        if (this.current.ContainsKey(id)) { this.current[id].active = 0; this.current.Remove(id); }
+    }
+
+    static double Scalar(float[] a, float[] b, int metric) {
+        double total = 0;
+        double na = 0;
+        double nb = 0;
+        for (int i = 0; i < a.Length; i = i + 1) {
+            double x = (double)a[i];
+            double y = (double)b[i];
+            if (metric == 1) {
+                double delta = x - y;
+                total = total + delta * delta;
+            } else {
+                total = total + x * y;
+                na = na + x * x;
+                nb = nb + y * y;
+            }
+        }
+        if (metric == 1) { return total; }
+        double distance = 1.0 - total / (Math.Sqrt(na) * Math.Sqrt(nb));
+        if (distance < 0) { distance = 0; }
+        if (distance > 2) { distance = 2; }
+        return distance;
+    }
+
+    List<VectorOracleHit> Search(float[] query, int k, VectorFilter filter) {
+        List<VectorOracleHit> all = new List<VectorOracleHit>();
+        for (int i = 0; i < this.rows.Count; i = i + 1) {
+            VectorOracleRow row = this.rows[i];
+            if (row.active == 0) { continue; }
+            if (filter != null && !filter(row.id)) { continue; }
+            all.Add(new VectorOracleHit(row.id, VectorOracle.Scalar(query, row.vector, this.metric)));
+        }
+        VectorOracleHit[] sorted = all.ToArray();
+        VectorOracleHit[] temporary = new VectorOracleHit[all.Count];
+        for (int width = 1; width < all.Count; width = width * 2) {
+            for (int begin = 0; begin < all.Count; begin = begin + width * 2) {
+                int middle = begin + width;
+                if (middle > all.Count) { middle = all.Count; }
+                int end = begin + width * 2;
+                if (end > all.Count) { end = all.Count; }
+                int left = begin;
+                int right = middle;
+                for (int outPos = begin; outPos < end; outPos = outPos + 1) {
+                    bool takeLeft = false;
+                    if (right >= end) { takeLeft = true; }
+                    else if (left < middle) {
+                        VectorOracleHit a = sorted[left];
+                        VectorOracleHit b = sorted[right];
+                        takeLeft = a.distance < b.distance || (a.distance == b.distance && a.id <= b.id);
+                    }
+                    if (takeLeft) { temporary[outPos] = sorted[left]; left = left + 1; }
+                    else { temporary[outPos] = sorted[right]; right = right + 1; }
+                }
+            }
+            VectorOracleHit[] swap = sorted;
+            sorted = temporary;
+            temporary = swap;
+        }
+        List<VectorOracleHit> hits = new List<VectorOracleHit>();
+        for (int i = 0; i < sorted.Length && i < k; i = i + 1) { hits.Add(sorted[i]); }
+        return hits;
+    }
+}
+
+class ZanDbVectorTest {
+    static int failures = 0;
+
+    static void Check(bool ok, string label) {
+        if (ok) { Console.WriteLine("ok " + label); }
+        else { failures = failures + 1; Console.WriteLine("FAIL " + label); }
+    }
+
+    static bool Throws(VectorTestOp action) {
+        // Argument failures are the documented validation contract.
+        try { action(); return false; } catch (ArgumentException e) { return true; }
+    }
+
+    static float[] Pair(double x, double y) {
+        float[] vector = new float[2];
+        vector[0] = (float)x;
+        vector[1] = (float)y;
+        return vector;
+    }
+
+    static float[] Sample(int ordinal, int dimensions, int distribution, VectorTestRandom random) {
+        float[] vector = new float[dimensions];
+        int cluster = ordinal % 8;
+        for (int i = 0; i < dimensions; i = i + 1) {
+            double noise = random.Unit() * 2.0 - 1.0;
+            double value = noise;
+            if (distribution == 1) { value = ((cluster * (i + 3) * 17) % 23 - 11) * 0.3 + noise * 0.07; }
+            if (distribution == 2) { value = noise * (i < 2 ? 20.0 : 0.2); }
+            if (distribution == 3) { value = noise * 0.03; }
+            vector[i] = (float)value;
+        }
+        if (distribution == 3) { vector[(ordinal * 7) % dimensions] = 2.0 + random.Unit(); }
+        return vector;
+    }
+
+    static bool SameOracle(List<VectorHit> actual, List<VectorOracleHit> expected) {
+        if (actual.Count != expected.Count) { return false; }
+        for (int i = 0; i < actual.Count; i = i + 1) {
+            if (actual[i].id != expected[i].id) { return false; }
+            double scale = 1.0 + Math.Abs(expected[i].distance);
+            if (Math.Abs(actual[i].distance - expected[i].distance) > scale * 1e-10) { return false; }
+        }
+        return true;
+    }
+
+    static bool SameHits(List<VectorHit> a, List<VectorHit> b) {
+        if (a.Count != b.Count) { return false; }
+        for (int i = 0; i < a.Count; i = i + 1) {
+            if (a[i].id != b[i].id || a[i].distance != b[i].distance) { return false; }
+        }
+        return true;
+    }
+
+    static int Overlap(List<VectorHit> actual, List<VectorOracleHit> expected) {
+        int found = 0;
+        for (int i = 0; i < actual.Count; i = i + 1) {
+            for (int j = 0; j < expected.Count; j = j + 1) {
+                if (actual[i].id == expected[j].id) { found = found + 1; break; }
+            }
+        }
+        return found;
+    }
+
+    static string StateText(VectorIndex index) {
+        JsonValue state = index.ExportState();
+        return state.ToJson();
+    }
+
+    static VectorIndex Roundtrip(VectorIndex index) {
+        JsonValue parsed = JsonValue.Parse(StateText(index));
+        // Preserve the validation failure while adding its checkpoint context.
+        try { return VectorIndex.ImportState(parsed); }
+        catch (ArgumentException e) { Console.WriteLine("FAIL checkpoint: " + e.Message); throw e; }
+    }
+
+    static void ValidationAndTies() {
+        VectorIndexOptions defaults = new VectorIndexOptions();
+        Check(defaults.dimensions == 0 && defaults.metric == 0 && defaults.m == 16
+            && defaults.efConstruction == 100 && defaults.efSearch == 64 && defaults.seed == 1729,
+            "options defaults");
+        bool optionsErrors = Throws(() => { VectorIndex invalid = new VectorIndex(defaults); });
+        VectorIndexOptions options = new VectorIndexOptions(2, 0);
+        VectorIndex cosine = new VectorIndex(options);
+        options.dimensions = 999;
+        VectorIndexOptions returned = cosine.Options();
+        returned.dimensions = 999;
+        VectorIndexOptions owned = cosine.Options();
+        Check(owned.dimensions == 2 && owned.m == 16, "options cloned");
+        options = new VectorIndexOptions(2, 2);
+        optionsErrors = optionsErrors && Throws(() => { VectorIndex invalid = new VectorIndex(options); });
+        options.metric = 0; options.m = 1;
+        optionsErrors = optionsErrors && Throws(() => { VectorIndex invalid = new VectorIndex(options); });
+        options.m = 16; options.efConstruction = 15;
+        optionsErrors = optionsErrors && Throws(() => { VectorIndex invalid = new VectorIndex(options); });
+        options.efConstruction = 100; options.efSearch = 0;
+        optionsErrors = optionsErrors && Throws(() => { VectorIndex invalid = new VectorIndex(options); });
+        options.efSearch = 64; options.dimensions = 65537;
+        optionsErrors = optionsErrors && Throws(() => { VectorIndex invalid = new VectorIndex(options); });
+        Check(optionsErrors, "option bounds rejected");
+        JsonValue config = JsonValue.Parse("{\"dimensions\":2}");
+        VectorIndexOptions parsed = VectorIndexOptions.FromJson(config);
+        JsonValue savedOptions = parsed.ToJson();
+        VectorIndexOptions again = VectorIndexOptions.FromJson(savedOptions);
+        Check(again.dimensions == 2 && again.m == 16 && again.seed == 1729, "options JSON defaults roundtrip");
+
+        bool errors = Throws(() => cosine.Add(1, new float[3]));
+        errors = errors && Throws(() => cosine.Add(1, null));
+        errors = errors && Throws(() => cosine.Add(1, Pair(0, 0)));
+        double huge = 1e308;
+        double infinity = huge * huge;
+        float[] nan = Pair(infinity - infinity, 1);
+        float[] inf = Pair(infinity, 1);
+        errors = errors && Throws(() => cosine.Add(1, nan));
+        errors = errors && Throws(() => cosine.Add(1, inf));
+        errors = errors && Throws(() => cosine.SearchExact(new float[1], 1));
+        errors = errors && Throws(() => cosine.Search(Pair(0, 0), 1, 64));
+        errors = errors && Throws(() => cosine.SearchExact(nan, 1));
+        errors = errors && Throws(() => cosine.Search(Pair(1, 0), -1, 64));
+        errors = errors && Throws(() => cosine.Search(Pair(1, 0), 1, -1));
+        errors = errors && Throws(() => cosine.Search(Pair(1, 0), 1, 1000001));
+        errors = errors && Throws(() => cosine.SearchExact(Pair(1, 0), 1000001));
+        Check(errors && cosine.Count() == 0, "dimensions finite norm query bounds rejected");
+
+        float[] caller = Pair(1, 0);
+        cosine.Add(8, caller);
+        caller[0] = -1;
+        cosine.Add(-8, Pair(1, 0));
+        cosine.Add(4, Pair(1, 0));
+        cosine.Add(10, Pair(0, 1));
+        List<VectorHit> exact = cosine.SearchExact(Pair(1, 0), 10);
+        Check(exact.Count == 4 && exact[0].id == -8 && exact[1].id == 4 && exact[2].id == 8
+            && exact[2].distance < 1e-12, "caller ownership and id ties");
+        List<VectorHit> approximate = cosine.Search(Pair(1, 0), 2, 0);
+        Check(approximate.Count == 2 && approximate[0].id == -8 && approximate[1].id == 4, "HNSW id ties and default ef");
+        Check(cosine.SearchExact(Pair(1, 0), 0).Count == 0 && cosine.LastDistanceCount() == 0,
+            "zero k and empty search");
+        VectorIndex empty = new VectorIndex(new VectorIndexOptions(2));
+        VectorIndex emptyCopy = Roundtrip(empty);
+        Check(emptyCopy.Count() == 0 && emptyCopy.Search(Pair(1, 0), 10, 0).Count == 0, "empty checkpoint");
+        string before = StateText(cosine);
+        Check(Throws(() => cosine.Add(8, nan)) && before == StateText(cosine), "invalid replacement preserves old record");
+        VectorIndex l2 = new VectorIndex(new VectorIndexOptions(2, 1));
+        l2.Add(1, Pair(0, 0));
+        List<VectorHit> zero = l2.SearchExact(Pair(0, 0), 1);
+        Check(zero.Count == 1 && zero[0].distance == 0, "L2 accepts zero norm");
+        VectorFilter even = (int id) => id % 2 == 0;
+        VectorFilter none = (int id) => false;
+        List<VectorHit> filtered = cosine.SearchFiltered(Pair(1, 0), 10, 1, even);
+        List<VectorHit> filteredExact = cosine.SearchExactFiltered(Pair(1, 0), 10, even);
+        Check(SameHits(filtered, filteredExact) && cosine.SearchFiltered(Pair(1, 0), 10, 1, none).Count == 0,
+            "filtered traversal and no matches");
+        Check(cosine.Remove(8) && !cosine.Remove(8) && cosine.Count() == 3, "remove return and count");
+    }
+
+    static void Metric(int metric) {
+        string label = metric == 0 ? "cosine" : "L2";
+        VectorIndexOptions options = new VectorIndexOptions(24, metric);
+        options.efConstruction = 160;
+        options.efSearch = 256;
+        VectorIndex index = new VectorIndex(options);
+        VectorOracle oracle = new VectorOracle(metric);
+        VectorTestRandom random = new VectorTestRandom(7919 + metric);
+        for (int i = 0; i < 1200; i = i + 1) {
+            int id = (i * 37) % 1200 + 1;
+            float[] vector = Sample(i, 24, i % 4, random);
+            index.Add(id, vector);
+            oracle.Put(id, vector);
+        }
+        List<float[]> queries = new List<float[]>();
+        random = new VectorTestRandom(104729 + metric);
+        for (int i = 0; i < 32; i = i + 1) { queries.Add(Sample(10000 + i * 47, 24, i % 4, random)); }
+        bool exactOk = true;
+        int overlap = 0;
+        bool fewerDistances = false;
+        for (int i = 0; i < queries.Count; i = i + 1) {
+            List<VectorOracleHit> expected = oracle.Search(queries[i], 10, null);
+            exactOk = exactOk && SameOracle(index.SearchExact(queries[i], 10), expected)
+                && index.LastDistanceCount() == 1200;
+            List<VectorHit> hits = index.Search(queries[i], 10, 256);
+            overlap = overlap + Overlap(hits, expected);
+            if (index.LastDistanceCount() < 1200) { fewerDistances = true; }
+        }
+        Check(exactOk && index.Count() == 1200, label + " exact independent full sort");
+        Check(overlap >= 304, label + " 1200 mixed points recall at 10 >= .95");
+        Check(fewerDistances, label + " HNSW evaluates fewer distances");
+        VectorFilter sparse = (int id) => id % 97 == 0;
+        List<VectorOracleHit> sparseExpected = oracle.Search(queries[1], 10, sparse);
+        Check(SameOracle(index.SearchExactFiltered(queries[1], 10, sparse), sparseExpected)
+            && SameOracle(index.SearchFiltered(queries[1], 10, 256, sparse), sparseExpected),
+            label + " sparse filter traverses excluded nodes");
+
+        random = new VectorTestRandom(15485863 + metric);
+        for (int id = 1; id <= 120; id = id + 1) {
+            float[] vector = Sample(id + 7000, 24, (id + 1) % 4, random);
+            index.Add(id, vector); oracle.Put(id, vector);
+        }
+        for (int id = 301; id <= 370; id = id + 1) { index.Remove(id); oracle.Remove(id); }
+        JsonValue checkpoint = index.ExportState();
+        int entrySlot = VectorStateJson.IntField(checkpoint, "entry");
+        JsonValue records = VectorStateJson.ArrayField(checkpoint, "nodes");
+        JsonValue entryRecord = records.At(entrySlot);
+        int entryId = VectorStateJson.IntField(entryRecord, "id");
+        index.Remove(entryId); oracle.Remove(entryId);
+        bool updatesOk = index.Count() == oracle.current.Count;
+        overlap = 0;
+        for (int i = 0; i < queries.Count; i = i + 1) {
+            List<VectorOracleHit> expected = oracle.Search(queries[i], 10, null);
+            updatesOk = updatesOk && SameOracle(index.SearchExact(queries[i], 10), expected);
+            overlap = overlap + Overlap(index.Search(queries[i], 10, 256), expected);
+        }
+        Check(updatesOk && overlap >= 304, label + " replace delete entry tombstone recall");
+
+        VectorIndex restored = Roundtrip(index);
+        bool snapshotOk = StateText(index) == StateText(restored);
+        for (int i = 0; i < 8; i = i + 1) {
+            snapshotOk = snapshotOk && SameHits(index.Search(queries[i], 10, 256), restored.Search(queries[i], 10, 256))
+                && SameHits(index.SearchExact(queries[i], 10), restored.SearchExact(queries[i], 10));
+        }
+        Check(snapshotOk, label + " checkpoint preserves graph and float answers");
+        float[] tail = Sample(9999, 24, 1, random);
+        index.Add(9999, tail); restored.Add(9999, tail); oracle.Put(9999, tail);
+        index.Remove(500); restored.Remove(500); oracle.Remove(500);
+        Check(StateText(index) == StateText(restored), label + " checkpoint RNG durable tail replay");
+        index.Rebuild();
+        restored.Rebuild();
+        JsonValue rebuilt = index.ExportState();
+        JsonValue compactNodes = VectorStateJson.ArrayField(rebuilt, "nodes");
+        bool rebuildOk = compactNodes.Count() == index.Count() && StateText(index) == StateText(restored);
+        overlap = 0;
+        for (int i = 0; i < queries.Count; i = i + 1) {
+            List<VectorOracleHit> expected = oracle.Search(queries[i], 10, null);
+            rebuildOk = rebuildOk && SameOracle(index.SearchExact(queries[i], 10), expected);
+            overlap = overlap + Overlap(index.Search(queries[i], 10, 256), expected);
+        }
+        Check(rebuildOk && overlap >= 304, label + " deterministic compact rebuild exact and recall");
+        bool bounded = VectorStateJson.IntField(rebuilt, "maxLevel") > 0;
+        for (int i = 0; i < compactNodes.Count(); i = i + 1) {
+            JsonValue node = compactNodes.At(i);
+            JsonValue layers = VectorStateJson.ArrayField(node, "layers");
+            for (int layer = 0; layer < layers.Count(); layer = layer + 1) {
+                JsonValue links = layers.At(layer);
+                if (links.Count() > (layer == 0 ? 32 : 16)) { bounded = false; }
+            }
+        }
+        Check(bounded, label + " multilevel bounded links");
+    }
+
+    static void SnapshotValidation() {
+        VectorIndex small = new VectorIndex(new VectorIndexOptions(2, 1));
+        small.Add(1, Pair(1, 0)); small.Add(2, Pair(0, 1)); small.Add(3, Pair(1, 1));
+        JsonValue good = small.ExportState();
+        JsonValue bad = good.Clone();
+        bad.Set("format", JsonValue.NewInt(2));
+        bool rejects = Throws(() => { VectorIndex invalid = VectorIndex.ImportState(bad); });
+        bad = good.Clone(); bad.Set("rng", JsonValue.NewInt(0));
+        rejects = rejects && Throws(() => { VectorIndex invalid = VectorIndex.ImportState(bad); });
+        bad = good.Clone(); bad.Set("entry", JsonValue.NewInt(-1));
+        rejects = rejects && Throws(() => { VectorIndex invalid = VectorIndex.ImportState(bad); });
+        bad = good.Clone(); bad.Set("maxLevel", JsonValue.NewInt(33));
+        rejects = rejects && Throws(() => { VectorIndex invalid = VectorIndex.ImportState(bad); });
+        bad = good.Clone();
+        JsonValue options = VectorStateJson.Field(bad, "options");
+        options.Set("dimensions", JsonValue.NewDouble(2.5));
+        rejects = rejects && Throws(() => { VectorIndex invalid = VectorIndex.ImportState(bad); });
+        bad = good.Clone();
+        JsonValue nodes = VectorStateJson.ArrayField(bad, "nodes");
+        JsonValue node = nodes.At(0);
+        node.Set("active", JsonValue.NewInt(2));
+        rejects = rejects && Throws(() => { VectorIndex invalid = VectorIndex.ImportState(bad); });
+        bad = good.Clone(); nodes = VectorStateJson.ArrayField(bad, "nodes"); node = nodes.At(1);
+        node.Set("id", JsonValue.NewInt(1));
+        rejects = rejects && Throws(() => { VectorIndex invalid = VectorIndex.ImportState(bad); });
+        bad = good.Clone(); nodes = VectorStateJson.ArrayField(bad, "nodes"); node = nodes.At(0);
+        node.Set("vector", JsonValue.NewArray());
+        rejects = rejects && Throws(() => { VectorIndex invalid = VectorIndex.ImportState(bad); });
+        bad = good.Clone(); nodes = VectorStateJson.ArrayField(bad, "nodes"); node = nodes.At(0);
+        JsonValue layers = VectorStateJson.ArrayField(node, "layers");
+        JsonValue edges = JsonValue.NewArray(); edges.Append(JsonValue.NewInt(999));
+        layers.SetAt(0, edges);
+        rejects = rejects && Throws(() => { VectorIndex invalid = VectorIndex.ImportState(bad); });
+        bad = good.Clone(); nodes = VectorStateJson.ArrayField(bad, "nodes"); node = nodes.At(0);
+        layers = VectorStateJson.ArrayField(node, "layers");
+        edges = JsonValue.NewArray(); edges.Append(JsonValue.NewInt(0)); layers.SetAt(0, edges);
+        rejects = rejects && Throws(() => { VectorIndex invalid = VectorIndex.ImportState(bad); });
+        bad = good.Clone(); nodes = VectorStateJson.ArrayField(bad, "nodes"); node = nodes.At(0);
+        layers = VectorStateJson.ArrayField(node, "layers");
+        edges = JsonValue.NewArray(); edges.Append(JsonValue.NewInt(1)); edges.Append(JsonValue.NewInt(1)); layers.SetAt(0, edges);
+        rejects = rejects && Throws(() => { VectorIndex invalid = VectorIndex.ImportState(bad); });
+        bad = good.Clone(); nodes = VectorStateJson.ArrayField(bad, "nodes"); node = nodes.At(0);
+        JsonValue coordinates = VectorStateJson.ArrayField(node, "vector");
+        double huge = 1e308;
+        coordinates.SetAt(0, JsonValue.NewDouble(huge * huge));
+        rejects = rejects && Throws(() => { VectorIndex invalid = VectorIndex.ImportState(bad); });
+        Check(rejects && small.Count() == 3, "invalid checkpoint metadata vectors edges rejected");
+
+        VectorIndex precision = new VectorIndex(new VectorIndexOptions(5, 1));
+        float[] vector = new float[5];
+        vector[0] = 3.4028234663852886e38;
+        vector[1] = 1.23456789e-37;
+        vector[2] = 1.401298464324817e-45;
+        vector[3] = 0.10000000149011612;
+        vector[4] = -1.23456789;
+        precision.Add(42, vector);
+        VectorIndex copy = Roundtrip(precision);
+        Check(StateText(precision) == StateText(copy)
+            && SameHits(precision.SearchExact(new float[5], 1), copy.SearchExact(new float[5], 1)),
+            "float extrema subnormal JSON precision");
+        VectorIndex a = new VectorIndex(new VectorIndexOptions(2, 1));
+        VectorIndex b = new VectorIndex(new VectorIndexOptions(2, 1));
+        for (int i = 1; i <= 40; i = i + 1) { a.Add(i, Pair(i, i % 7)); }
+        for (int i = 40; i >= 1; i = i - 1) { b.Add(i, Pair(i, i % 7)); }
+        a.Add(7, Pair(7, 0)); a.Remove(11); a.Add(11, Pair(11, 4));
+        a.Rebuild(); b.Rebuild();
+        Check(StateText(a) == StateText(b), "rebuild canonical across insertion histories");
+        for (int i = 1; i <= 40; i = i + 1) { a.Remove(i); }
+        a.Rebuild();
+        JsonValue cleared = a.ExportState();
+        JsonValue emptyNodes = VectorStateJson.ArrayField(cleared, "nodes");
+        Check(a.Count() == 0 && emptyNodes.Count() == 0 && a.Search(Pair(0, 0), 10, 0).Count == 0,
+            "delete all rebuild empty");
+    }
+
+    static void Main() {
+        ValidationAndTies();
+        Metric(0);
+        Metric(1);
+        SnapshotValidation();
+        if (failures == 0) { Console.WriteLine("PASS ZanDb vectors"); }
+        else { Console.WriteLine("FAIL ZanDb vectors " + Convert.ToString(failures)); }
+    }
+}

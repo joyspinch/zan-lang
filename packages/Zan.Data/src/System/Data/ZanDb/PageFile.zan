@@ -31,7 +31,7 @@ class PageFile {
     string path;
     string lastError;
 
-    [DllImport("crt")]
+    [DllImport("crt", EntryPoint = "zan_file_fopen")]
     static extern nint fopen(string path, string mode);
 
     [DllImport("crt")]
@@ -95,19 +95,41 @@ class PageFile {
         this.lastError = "";
     }
 
-    /// <summary>为随机读写打开（或创建）一个文件。</summary>
+    /// <summary>为随机读写打开（或创建）一个文件。创建回退不截断
+    /// 已有路径；追加模式只用于创建，定位写之前重新以 r+b 打开。</summary>
     static PageFile Open(string path) {
+        return PageFile.OpenCore(path, true);
+    }
+
+    /// 只打开已有文件；读取清单时不得创建缺失的槽。
+    static PageFile OpenExisting(string path) {
+        return PageFile.OpenCore(path, false);
+    }
+
+    static PageFile OpenCore(string path, bool create) {
         PageFile f = new PageFile();
         f.path = path;
         f.fp = fopen(path, "r+b");
-        if (f.fp == 0) {
-            f.fp = fopen(path, "w+b");
+        if (f.fp == 0 && create) {
+            nint created = fopen(path, "a+b");
+            if (created != 0) {
+                int rc = fclose(created);
+                if (rc != 0) {
+                    f.lastError = "cannot close created file " + path;
+                    return f;
+                }
+                f.fp = fopen(path, "r+b");
+            }
         }
         if (f.fp == 0) {
             f.lastError = "cannot open " + path;
             return f;
         }
         f.fd = FileNo(f.fp);
+        if (f.fd < 0) {
+            f.lastError = "cannot get descriptor for " + path;
+            f.Close();
+        }
         return f;
     }
 
@@ -120,42 +142,49 @@ class PageFile {
     /// <summary>从 offset 处读取 count 字节到 buf（先清空 buf）。
     /// 返回实际读取的字节数。</summary>
     int ReadAt(long offset, ByteBuffer buf, int count) {
-        if (this.fp == 0) { return -1; }
         buf.Clear();
+        if (count < 0) { this.lastError = "invalid read length"; return -1; }
         buf.EnsureCapacity(count);
         int n = ReadRaw(offset, buf.Raw(), count);
-        if (n < 0) { n = 0; }
-        buf.SetLength(n);
+        if (n >= 0) { buf.SetLength(n); }
         return n;
     }
 
-    /// <summary>定位读取到原始块中。</summary>
+    /// <summary>定位读取到原始块中；读取错误与 EOF（0）分开报告。</summary>
     int ReadRaw(long offset, nint raw, int count) {
-        if (this.fp == 0) { return -1; }
+        if (this.fp == 0) { this.lastError = "file is closed"; return -1; }
+        if (offset < 0 || count < 0) { this.lastError = "invalid read range"; return -1; }
+        int n = 0;
         #if WINDOWS
         if (SeekFd(this.fd, offset, 0) < 0) {
-            this.lastError = "seek failed";
+            this.lastError = "read seek failed";
             return -1;
         }
-        return ReadFd(this.fd, raw, count);
+        n = ReadFd(this.fd, raw, count);
         #else
-        return PReadFd(this.fd, raw, count, offset);
+        n = PReadFd(this.fd, raw, count, offset);
         #endif
+        if (n < 0) { this.lastError = "file read failed"; }
+        return n;
     }
 
     /// <summary>从原始块向 offset 处写入 count 字节。
-    /// 返回写入的字节数。</summary>
+    /// 返回写入的字节数，短写同样留下错误。</summary>
     int WriteAt(long offset, nint raw, int count) {
-        if (this.fp == 0) { return -1; }
+        if (this.fp == 0) { this.lastError = "file is closed"; return -1; }
+        if (offset < 0 || count < 0) { this.lastError = "invalid write range"; return -1; }
+        int n = 0;
         #if WINDOWS
         if (SeekFd(this.fd, offset, 0) < 0) {
-            this.lastError = "seek failed";
+            this.lastError = "write seek failed";
             return -1;
         }
-        return WriteFd(this.fd, raw, count);
+        n = WriteFd(this.fd, raw, count);
         #else
-        return PWriteFd(this.fd, raw, count, offset);
+        n = PWriteFd(this.fd, raw, count, offset);
         #endif
+        if (n != count) { this.lastError = "file write failed"; }
+        return n;
     }
 
     /// <summary>在文件末尾追加 count 字节；返回数据落盘的偏移量，
@@ -170,8 +199,10 @@ class PageFile {
 
     /// <summary>当前文件大小（字节）。</summary>
     long Size() {
-        if (this.fp == 0) { return -1; }
-        return SeekFd(this.fd, 0, 2);
+        if (this.fp == 0) { this.lastError = "file is closed"; return -1; }
+        long n = SeekFd(this.fd, 0, 2);
+        if (n < 0) { this.lastError = "file size failed"; }
+        return n;
     }
 
     /// <summary>缓冲写入的 flush；定位 IO 无缓冲，因此该方法
@@ -181,15 +212,18 @@ class PageFile {
     /// <summary>将写入的数据强制落盘到稳定存储。成功时返回 true
     /// 成功。</summary>
     bool Sync() {
-        if (this.fp == 0) { return false; }
-        return SyncFd(this.fd) == 0;
+        if (this.fp == 0) { this.lastError = "file is closed"; return false; }
+        if (SyncFd(this.fd) != 0) { this.lastError = "file sync failed"; return false; }
+        return true;
     }
 
     /// <summary>把文件截断/扩展到 size 字节。日志重放后用
     /// 它清掉撕裂尾部。</summary>
     bool Truncate(long size) {
-        if (this.fp == 0) { return false; }
-        return TruncFd(this.fd, size) == 0;
+        if (this.fp == 0) { this.lastError = "file is closed"; return false; }
+        if (size < 0) { this.lastError = "invalid truncate size"; return false; }
+        if (TruncFd(this.fd, size) != 0) { this.lastError = "file truncate failed"; return false; }
+        return true;
     }
 
     /// <summary>获取整个文件的独占锁，等待当前
@@ -239,7 +273,9 @@ class PageFile {
     /// 能及时让出锁与句柄。
     void Close() {
         if (this.fp != 0) {
-            fclose(this.fp);
+            if (fclose(this.fp) != 0 && this.lastError == "") {
+                this.lastError = "file close failed";
+            }
             this.fp = 0;
             this.fd = -1;
         }

@@ -1,0 +1,214 @@
+using System;
+using System.Text;
+
+namespace Demos;
+
+class BenchTextFrequency {
+    string text;
+    int primary;
+    int auxiliary;
+
+    BenchTextFrequency(string text) { this.text = text; }
+}
+
+class BenchTextDocument {
+    int id;
+    int length;
+    List<BenchTextFrequency> terms = new List<BenchTextFrequency>();
+
+    BenchTextDocument(int id, List<TextToken> tokens) {
+        this.id = id;
+        for (int i = 0; i < tokens.Count; i = i + 1) {
+            TextToken token = tokens[i];
+            BenchTextFrequency term = null;
+            for (int t = 0; t < this.terms.Count; t = t + 1) {
+                if (this.terms[t].text == token.text) { term = this.terms[t]; break; }
+            }
+            if (term == null) { term = new BenchTextFrequency(token.text); this.terms.Add(term); }
+            if (token.kind == 0) { term.primary = term.primary + 1; this.length = this.length + 1; }
+            else { term.auxiliary = term.auxiliary + 1; }
+        }
+    }
+
+    double Frequency(string text) {
+        for (int t = 0; t < this.terms.Count; t = t + 1) {
+            BenchTextFrequency term = this.terms[t];
+            if (term.text == text) { return (double)term.primary + 0.2 * (double)term.auxiliary; }
+        }
+        return 0.0;
+    }
+}
+
+class BenchTextQueryTerm {
+    string text;
+    double weight;
+    int df;
+    double idf;
+
+    BenchTextQueryTerm(string text, double weight) { this.text = text; this.weight = weight; }
+}
+
+// Independent full scan: local frequencies only, with no postings or index helpers.
+class BenchTextScan {
+    TextTokenizer tokenizer;
+    List<BenchTextDocument> docs = new List<BenchTextDocument>();
+    long totalLength;
+    int lastVisitedDocuments;
+
+    BenchTextScan(TextTokenizer tokenizer) { this.tokenizer = tokenizer; }
+
+    void Add(int id, string text) {
+        BenchTextDocument doc = new BenchTextDocument(id, this.tokenizer.Tokenize(text));
+        this.docs.Add(doc);
+        this.totalLength = this.totalLength + doc.length;
+    }
+
+    int LastVisitedDocuments() { return this.lastVisitedDocuments; }
+
+    List<Bm25Hit> SearchTop(string query, int k) {
+        this.lastVisitedDocuments = 0;
+        List<Bm25Hit> result = new List<Bm25Hit>();
+        if (k <= 0 || this.docs.Count == 0 || this.totalLength == 0) { return result; }
+        List<TextToken> tokens = this.tokenizer.Tokenize(query);
+        List<BenchTextQueryTerm> terms = new List<BenchTextQueryTerm>();
+        for (int i = 0; i < tokens.Count; i = i + 1) {
+            TextToken token = tokens[i];
+            double weight = token.kind == 0 ? 1.0 : 0.2;
+            BenchTextQueryTerm term = null;
+            for (int t = 0; t < terms.Count; t = t + 1) {
+                if (terms[t].text == token.text) { term = terms[t]; break; }
+            }
+            if (term == null) { terms.Add(new BenchTextQueryTerm(token.text, weight)); }
+            else if (weight > term.weight) { term.weight = weight; }
+        }
+        if (terms.Count == 0) { return result; }
+        // Count both complete document passes, including documents with no match.
+        for (int d = 0; d < this.docs.Count; d = d + 1) {
+            BenchTextDocument doc = this.docs[d];
+            this.lastVisitedDocuments = this.lastVisitedDocuments + 1;
+            for (int t = 0; t < terms.Count; t = t + 1) {
+                if (doc.Frequency(terms[t].text) > 0.0) { terms[t].df = terms[t].df + 1; }
+            }
+        }
+        for (int t = 0; t < terms.Count; t = t + 1) {
+            BenchTextQueryTerm term = terms[t];
+            term.idf = Math.Log(1.0 + ((double)(this.docs.Count - term.df) + 0.5) / ((double)term.df + 0.5));
+        }
+        double avgdl = (double)this.totalLength / (double)this.docs.Count;
+        for (int d = 0; d < this.docs.Count; d = d + 1) {
+            BenchTextDocument doc = this.docs[d];
+            this.lastVisitedDocuments = this.lastVisitedDocuments + 1;
+            double score = 0.0;
+            double normalization = 1.2 * (0.25 + 0.75 * (double)doc.length / avgdl);
+            for (int t = 0; t < terms.Count; t = t + 1) {
+                BenchTextQueryTerm term = terms[t];
+                double tf = doc.Frequency(term.text);
+                if (tf > 0.0) { score = score + term.weight * term.idf * tf * 2.2 / (tf + normalization); }
+            }
+            if (score <= 0.0) { continue; }
+            Bm25Hit hit = new Bm25Hit(doc.id, score);
+            int at = result.Count;
+            result.Add(hit);
+            // Strict comparison retains corpus insertion order on equal scores.
+            while (at > 0 && result[at - 1].score < score) {
+                result[at] = result[at - 1]; at = at - 1;
+            }
+            result[at] = hit;
+            if (result.Count > k) { result.RemoveAt(result.Count - 1); }
+        }
+        return result;
+    }
+}
+
+class ZanDbSearchBench {
+    static string DocumentText(int id) {
+        string text = "中文数据库文档 mysql common group" + Convert.ToString(id % 100);
+        if (id % 1000 == 0) { text = text + " rareanchor 星际航线"; }
+        return text;
+    }
+
+    static void Compare(List<Bm25Hit> actual, List<Bm25Hit> expected) {
+        if (actual.Count != 5 || actual.Count != expected.Count) {
+            throw new InvalidOperationException("BM25 scan/posting top5 hit count mismatch");
+        }
+        for (int i = 0; i < actual.Count; i = i + 1) {
+            double difference = actual[i].score - expected[i].score;
+            if (difference < 0.0) { difference = -difference; }
+            if (actual[i].id != expected[i].id || !(difference < 0.0000000001)) {
+                throw new InvalidOperationException("BM25 scan/posting top5 ID or score mismatch");
+            }
+        }
+    }
+
+    static void RunQuery(Bm25Index index, BenchTextScan scan, string query, string label,
+            int postingQueries, int scanQueries) {
+        List<Bm25Hit> actual = index.SearchTop(query, 5);
+        List<Bm25Hit> expected = scan.SearchTop(query, 5);
+        ZanDbSearchBench.Compare(actual, expected);
+        int postingHits = 0;
+        long postingVisits = 0;
+        long postingStart = Stopwatch.GetMicroseconds();
+        for (int i = 0; i < postingQueries; i = i + 1) {
+            actual = index.SearchTop(query, 5);
+            postingHits = postingHits + actual.Count;
+            postingVisits = postingVisits + index.LastVisitedPostings();
+        }
+        long postingUs = Stopwatch.GetMicroseconds() - postingStart;
+        int scanHits = 0;
+        long scanVisits = 0;
+        long scanStart = Stopwatch.GetMicroseconds();
+        for (int i = 0; i < scanQueries; i = i + 1) {
+            expected = scan.SearchTop(query, 5);
+            scanHits = scanHits + expected.Count;
+            scanVisits = scanVisits + scan.LastVisitedDocuments();
+        }
+        long scanUs = Stopwatch.GetMicroseconds() - scanStart;
+        ZanDbSearchBench.Compare(actual, expected);
+        Console.WriteLine("text " + label + " posting_queries=" + Convert.ToString(postingQueries)
+            + " posting_query_us=" + Convert.ToString(postingUs)
+            + " posting_avg_us=" + Convert.ToString((double)postingUs / (double)postingQueries)
+            + " posting_hits=" + Convert.ToString(postingHits)
+            + " postings_visited=" + Convert.ToString(index.LastVisitedPostings())
+            + " total_postings_visited=" + Convert.ToString(postingVisits));
+        Console.WriteLine("text " + label + " scan_queries=" + Convert.ToString(scanQueries)
+            + " scan_query_us=" + Convert.ToString(scanUs)
+            + " scan_avg_us=" + Convert.ToString((double)scanUs / (double)scanQueries)
+            + " scan_hits=" + Convert.ToString(scanHits)
+            + " scan_doc_visits=" + Convert.ToString(scan.LastVisitedDocuments())
+            + " total_scan_doc_visits=" + Convert.ToString(scanVisits)
+            + " total_docs=" + Convert.ToString(index.Count())
+            + " top5_match=1");
+        for (int i = 0; i < actual.Count; i = i + 1) {
+            Console.WriteLine("text " + label + " rank=" + Convert.ToString(i + 1)
+                + " posting_id=" + Convert.ToString(actual[i].id)
+                + " scan_id=" + Convert.ToString(expected[i].id)
+                + " posting_score=" + Convert.ToString(actual[i].score)
+                + " scan_score=" + Convert.ToString(expected[i].score));
+        }
+    }
+
+    static void RunText() {
+        int n = 10000;
+        TextTokenizer tokenizer = new TextTokenizer();
+        tokenizer.AddWord("星际航线");
+        Bm25Index index = new Bm25Index(tokenizer);
+        long buildStart = Stopwatch.GetMicroseconds();
+        for (int i = 0; i < n; i = i + 1) { index.Add(i, ZanDbSearchBench.DocumentText(i)); }
+        long buildUs = Stopwatch.GetMicroseconds() - buildStart;
+        // Reference tokenization and frequency aggregation are outside query timing.
+        BenchTextScan scan = new BenchTextScan(tokenizer);
+        long prepareStart = Stopwatch.GetMicroseconds();
+        for (int i = 0; i < n; i = i + 1) { scan.Add(i, ZanDbSearchBench.DocumentText(i)); }
+        long prepareUs = Stopwatch.GetMicroseconds() - prepareStart;
+        Console.WriteLine("text docs=" + Convert.ToString(index.Count())
+            + " build_us=" + Convert.ToString(buildUs)
+            + " scan_prepare_us=" + Convert.ToString(prepareUs));
+        // 76 searches total, including warmups and the common-term comparison.
+        ZanDbSearchBench.RunQuery(index, scan, "rareanchor 星际航线", "sparse", 50, 20);
+        ZanDbSearchBench.RunQuery(index, scan, "mysql", "common", 1, 1);
+    }
+
+    static void Main() {
+        ZanDbSearchBench.RunText();
+    }
+}

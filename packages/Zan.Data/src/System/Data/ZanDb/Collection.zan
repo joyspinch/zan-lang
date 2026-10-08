@@ -48,6 +48,7 @@ class Collection {
     Dict<int, JsonValue> docCache;
     List<int> docCacheOrder;
     int docCacheCapacity;
+    CollectionSearch search;
 
     /// <summary>批量索引构建中每个事务索引的文档数。</summary>
     static int INDEX_BATCH = 500;
@@ -83,27 +84,30 @@ class Collection {
         c.docCacheCapacity = 256;
         c.LoadIndexMeta();
         c.LoadKeyDict();
-        c.metaVersion = kv.Version();
+        c.metaVersion = kv.CacheVersion();
+        c.search = new CollectionSearch(kv, name);
         return c;
     }
 
-    /// <summary>当数据库更新到新版本（即其他进程已提交）时，重新读取缓存的元数据（字段名字典、索引
-    /// 列表）。操作文档前两者都必需：
-    /// 字典负责编解码对象键，因此过期的副本会
-    /// 用错误的字段名解码其他进程的文档，并将这些 id
-    /// 复用到不同的名称上。开销低：一次版本比较，
-    /// 两次读取只在确实有变化时
-    /// 才发生。</summary>
+    /// <summary>提交或回滚后刷新派生缓存。回滚不推进提交版本，
+    /// 但必须丢弃事务中分配的字段 id、序列和文档缓存。</summary>
     void SyncMeta() {
-        long v = this.kv.Version();
+        long v = this.kv.CacheVersion();
         if (v == this.metaVersion) { return; }
-        // 绝不要在当前尚未落盘的字典条目上重新加载——
-        // （事务中编码中途的条目）——否则它们会丢失。
-        if (this.keyDictDirty) { return; }
         this.metaVersion = v;
+        this.nextIdCache = 0;
         ClearCache();
         LoadIndexMeta();
         LoadKeyDict();
+    }
+
+    void CommitWrite() {
+        if (!this.kv.Commit()) {
+            this.kv.Rollback();
+            SyncMeta();
+            throw new IOException(this.kv.GetError());
+        }
+        this.metaVersion = this.kv.CacheVersion();
     }
 
     /// 集合名。
@@ -341,14 +345,24 @@ class Collection {
         }
     }
 
-    /// <summary>doc 的 from 之后是否还存在同名键
-    /// （JsonValue.Put 追加不去重，重复键以后写为准——与
-    /// DecodeDoc/JSON 语义一致，编码时在这里去重）。</summary>
+    /// <summary>doc 的 from 之后是否还存在同名键。
+    /// 集合正文约定顶层重复键以后写为准；JsonValue.Get 自身首键胜，
+    /// 因而写入前先消除旧键，使缓存、字段索引和检索输入一致。</summary>
     static bool HasLaterKey(JsonValue doc, string key, int from) {
         for (int j = from + 1; j < doc.Count(); j = j + 1) {
             if (doc.KeyAt(j) == key) { return true; }
         }
         return false;
+    }
+
+    void PrepareDoc(JsonValue doc) {
+        if (doc == null || !doc.IsObject()) { throw new ArgumentException("document must be an object"); }
+        int i = 0;
+        while (i < doc.Count()) {
+            if (Collection.HasLaterKey(doc, doc.KeyAt(i), i)) { doc.RemoveAt(i); }
+            else { i = i + 1; }
+        }
+        this.search.Validate(doc);
     }
 
     /// <summary>将文档序列化为紧凑的二进制记录：一个 'B'
@@ -987,7 +1001,7 @@ class Collection {
 
     /// <summary>从文档缓存中获取文档，若存在则更新 LRU 访问热度并返回其只读副本。</summary>
     JsonValue CacheGet(int id) {
-        if (this.docCacheCapacity <= 0 || !this.docCache.ContainsKey(id)) {
+        if (this.kv.InTransaction() || this.docCacheCapacity <= 0 || !this.docCache.ContainsKey(id)) {
             JsonValue miss = null;
             return miss;
         }
@@ -1006,7 +1020,7 @@ class Collection {
 
     /// <summary>将文档放入 LRU 缓存池；超过容量时淘汰最久未访问的条目。</summary>
     void CachePut(int id, JsonValue doc) {
-        if (this.docCacheCapacity <= 0 || doc == null) { return; }
+        if (this.kv.InTransaction() || this.docCacheCapacity <= 0 || doc == null) { return; }
         if (this.docCache.ContainsKey(id)) {
             this.docCache[id] = doc.Clone();
             int lastIdx = this.docCacheOrder.Count - 1;
@@ -1047,38 +1061,49 @@ class Collection {
     /// <summary>存储新文档，分配并返回其 _id
     /// （同时写入文档中）。</summary>
     int Insert(JsonValue doc) {
-        this.kv.Begin();
         SyncMeta();
-        int id = NextId();
-        doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
-        this.kv.Put(DocKey(id), EncodeDoc(doc));
-        AddIndexEntries(id, doc);
-        this.kv.Commit();
-        this.metaVersion = this.kv.Version();
-        CachePut(id, doc);
-        return id;
+        PrepareDoc(doc);
+        this.kv.Begin();
+        try {
+            int id = NextId();
+            doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+            this.kv.Put(DocKey(id), EncodeDoc(doc));
+            AddIndexEntries(id, doc);
+            this.search.Stage(id, doc);
+            CommitWrite();
+            CachePut(id, doc);
+            return id;
+        } catch {
+            this.kv.Rollback();
+            SyncMeta();
+            throw;
+        }
     }
 
     /// <summary>在单个原子提交中批量插入（整个批次
     /// 只做一次 WAL 刷新）。返回第一个分配的 id。</summary>
     int InsertBulk(List<JsonValue> docs) {
-        this.kv.Begin();
         SyncMeta();
-        int first = 0;
-        for (int i = 0; i < docs.Count; i = i + 1) {
-            int id = NextId();
-            if (first == 0) { first = id; }
-            docs[i].Set("_id", JsonValue.NewNum(Convert.ToString(id)));
-            this.kv.Put(DocKey(id), EncodeDoc(docs[i]));
-            AddIndexEntries(id, docs[i]);
+        for (int i = 0; i < docs.Count; i = i + 1) { PrepareDoc(docs[i]); }
+        this.kv.Begin();
+        try {
+            int first = 0;
+            for (int i = 0; i < docs.Count; i = i + 1) {
+                int id = NextId();
+                if (first == 0) { first = id; }
+                docs[i].Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+                this.kv.Put(DocKey(id), EncodeDoc(docs[i]));
+                AddIndexEntries(id, docs[i]);
+                this.search.Stage(id, docs[i]);
+            }
+            CommitWrite();
+            for (int i = 0; i < docs.Count; i = i + 1) { CachePut(first + i, docs[i]); }
+            return first;
+        } catch {
+            this.kv.Rollback();
+            SyncMeta();
+            throw;
         }
-        this.kv.Commit();
-        this.metaVersion = this.kv.Version();
-        for (int i = 0; i < docs.Count; i = i + 1) {
-            int cid = first + i;
-            CachePut(cid, docs[i]);
-        }
-        return first;
     }
 
     /// <summary>返回文档；优先走内存 LRU Buffer Pool，未命中则反序列化；不存在则返回 null。</summary>
@@ -1105,55 +1130,112 @@ class Collection {
     /// <summary>替换现有文档；id 不存在时返回 false。</summary>
     bool Update(int id, JsonValue doc) {
         if (!this.kv.Contains(DocKey(id))) { return false; }
-        this.kv.Begin();
         SyncMeta();
-        if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindById(id)); }
-        doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
-        this.kv.Put(DocKey(id), EncodeDoc(doc));
-        AddIndexEntries(id, doc);
-        this.kv.Commit();
-        this.metaVersion = this.kv.Version();
-        CachePut(id, doc);
-        return true;
+        PrepareDoc(doc);
+        this.kv.Begin();
+        try {
+            if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindById(id)); }
+            doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+            this.kv.Put(DocKey(id), EncodeDoc(doc));
+            AddIndexEntries(id, doc);
+            this.search.Stage(id, doc);
+            CommitWrite();
+            CachePut(id, doc);
+            return true;
+        } catch {
+            this.kv.Rollback();
+            SyncMeta();
+            throw;
+        }
     }
 
     /// <summary>在显式 id 下插入或替换。推进自增 id
     /// 序列越过该 id，避免后续插入冲突。</summary>
     void Upsert(int id, JsonValue doc) {
-        this.kv.Begin();
+        if (id < 1) { throw new ArgumentException("document id must be positive"); }
         SyncMeta();
-        string cur = this.kv.Get(SeqKey());
-        int seq = 0;
-        if (cur.Length > 0) { seq = Convert.ToInt(cur); }
-        if (id > seq) {
-            this.kv.Put(SeqKey(), Convert.ToString(id));
-            // 序列缓存与此处绕过 NextId 的推进保持一致
-            //（缓存语义 = 已落盘的序列值；已分配 id 不回退）。
-            if (this.nextIdCache < id) { this.nextIdCache = id; }
+        PrepareDoc(doc);
+        this.kv.Begin();
+        try {
+            string cur = this.kv.Get(SeqKey());
+            int seq = cur.Length > 0 ? Convert.ToInt(cur) : 0;
+            if (id > seq) {
+                this.kv.Put(SeqKey(), Convert.ToString(id));
+                if (this.nextIdCache < id) { this.nextIdCache = id; }
+            }
+            if (this.indexedFields.Count > 0 && this.kv.Contains(DocKey(id))) {
+                RemoveIndexEntries(id, FindById(id));
+            }
+            doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+            this.kv.Put(DocKey(id), EncodeDoc(doc));
+            AddIndexEntries(id, doc);
+            this.search.Stage(id, doc);
+            CommitWrite();
+            CachePut(id, doc);
+        } catch {
+            this.kv.Rollback();
+            SyncMeta();
+            throw;
         }
-        if (this.indexedFields.Count > 0 && this.kv.Contains(DocKey(id))) {
-            RemoveIndexEntries(id, FindById(id));
-        }
-        doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
-        this.kv.Put(DocKey(id), EncodeDoc(doc));
-        AddIndexEntries(id, doc);
-        this.kv.Commit();
-        this.metaVersion = this.kv.Version();
-        CachePut(id, doc);
     }
 
     /// 删除文档及其索引条目；返回该 id 是否原本存在。
     bool DeleteById(int id) {
-        this.kv.Begin();
         SyncMeta();
-        if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindById(id)); }
-        bool existed = this.kv.Delete(DocKey(id));
-        this.kv.Commit();
-        this.metaVersion = this.kv.Version();
-        if (existed) {
-            CacheEvict(id);
+        this.kv.Begin();
+        try {
+            if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindById(id)); }
+            bool existed = this.kv.Delete(DocKey(id));
+            if (existed) { this.search.Stage(id, null); }
+            CommitWrite();
+            if (existed) { CacheEvict(id); }
+            return existed;
+        } catch {
+            this.kv.Rollback();
+            SyncMeta();
+            throw;
         }
-        return existed;
+    }
+
+    /// <summary>索引字段文本，支持中文词典与未知词召回。</summary>
+    void EnsureFullTextIndex(string field) { this.search.EnsureText(this, field, new TextTokenizer()); }
+    void EnsureFullTextIndex(string field, TextTokenizer tokenizer) { this.search.EnsureText(this, field, tokenizer); }
+    void EnsureVectorIndex(string field, VectorIndexOptions options) { this.search.EnsureVector(this, field, options); }
+    List<Bm25Hit> SearchText(string field, string query, int k) { return this.search.Text(field, query, k, null); }
+    List<Bm25Hit> SearchTextFiltered(string field, string query, int k, Bm25Filter filter) {
+        return this.search.Text(field, query, k, filter);
+    }
+    List<VectorHit> SearchVector(string field, float[] query, int k, int efSearch) {
+        return this.search.Vector(field, query, k, efSearch, false, null);
+    }
+    List<VectorHit> SearchVectorFiltered(string field, float[] query, int k, int efSearch, VectorFilter filter) {
+        return this.search.Vector(field, query, k, efSearch, false, filter);
+    }
+    List<VectorHit> SearchVectorExact(string field, float[] query, int k) {
+        return this.search.Vector(field, query, k, 0, true, null);
+    }
+    List<VectorHit> SearchVectorExactFiltered(string field, float[] query, int k, VectorFilter filter) {
+        return this.search.Vector(field, query, k, 0, true, filter);
+    }
+    List<HybridHit> SearchHybrid(string textField, string query, string vectorField, float[] vector, int k, int efSearch) {
+        return this.search.Hybrid(textField, query, vectorField, vector, k, efSearch, null, null);
+    }
+    List<HybridHit> SearchHybridFiltered(string textField, string query, string vectorField, float[] vector,
+            int k, int efSearch, Bm25Filter textFilter, VectorFilter vectorFilter) {
+        return this.search.Hybrid(textField, query, vectorField, vector, k, efSearch, textFilter, vectorFilter);
+    }
+    void RebuildSearchIndexes() { this.search.Rebuild(this); }
+    void CheckpointSearchIndexes() { this.search.Checkpoint(); }
+    JsonValue ListSearchIndexes() {
+        SyncMeta();
+        JsonValue list = this.search.ListIndexes();
+        for (int i = 0; i < this.indexedFields.Count; i = i + 1) {
+            JsonValue item = JsonValue.NewObject();
+            item.PutStr("type", "field");
+            item.PutStr("field", this.indexedFields[i]);
+            list.Append(item);
+        }
+        return list;
     }
 
     // ===== 二级索引 =====
@@ -1186,53 +1268,42 @@ class Collection {
     /// <summary>索引下一批文档，每次调用一个事务，
     /// 覆盖整个集合后返回 true。
     ///
-    /// 在单个事务中为大集合构建索引会把
-    /// 每个触及的页固定到提交为止，并在整个构建期间持有
-    /// 跨进程写锁；分批将两者都限制在界内。游标
-    /// （m:{name}:idxpos:{field}）与它所覆盖的条目属于同一提交，
-    /// 因此构建中途崩溃或被杀死不会丢失任何内容，下次调用
-    /// 会从上次提交的位置继续。
-    ///
-    /// 字段在第一批就加入索引列表，因此并发写入者
-    /// （包括其他进程）已经在为构建尚未到达的
-    /// 文档维护条目；这些写入与构建结果一致，因为两者都
-    /// 从同一篇文档派生出条目。在构建完成前，
-    /// IndexReady 为 false，FindByIndex 回退为扫描，因此不完整的
-    /// 索引绝不会产生不完整的结果。</summary>
+    /// 分批限制事务大小；游标（m:{name}:idxpos:{field}）与条目
+    /// 共用提交边界，中断后从最后一批继续。字段在第一批加入
+    /// 索引列表，持库服务中的后续写入也会维护条目。构建完成前
+    /// IndexReady 为 false，FindByIndex 回退为扫描。</summary>
     bool BuildIndexStep(string field, int batchSize) {
         if (batchSize <= 0) { batchSize = Collection.INDEX_BATCH; }
-        this.kv.Begin();
         SyncMeta();
-        if (!HasIndex(field)) {
-            this.indexedFields.Add(field);
-            PersistIndexMeta();
-        }
-        int from = 0;
-        string cursor = this.kv.Get(IdxPosKey(field));
-        if (cursor.Length > 0) {
-            // 文档 id 本身是 int（DocKey 的参数类型）；显式收窄，
-            // 解析已升为 long 只是为了正确读出历史 18 位游标。
-            from = (int)(Collection.ParseI64(cursor) + 1);
-        }
-        // 只从每条记录中读取被索引的字段：构建索引
-        // 永远不需要文档的其他部分。
-        List<KvEntry> entries = new List<KvEntry>();
-        this.kv.ScanRange(DocKey(from), "c:" + this.name + ";", batchSize, entries);
-        int kid = KeyIdOf(field);
-        int last = from;
-        for (int i = 0; i < entries.Count; i = i + 1) {
-            int id = Collection.IdOfKey(entries[i].key);
-            JsonValue f = FieldOf(entries[i].val, kid);
-            if (f != null) {
-                this.kv.Put(IdxKey(field, f.AsString(""), id), "");
+        this.kv.Begin();
+        try {
+            if (!HasIndex(field)) {
+                this.indexedFields.Add(field);
+                PersistIndexMeta();
             }
-            if (id > last) { last = id; }
+            int from = 0;
+            string cursor = this.kv.Get(IdxPosKey(field));
+            if (cursor.Length > 0) { from = (int)(Collection.ParseI64(cursor) + 1); }
+            List<KvEntry> entries = new List<KvEntry>();
+            this.kv.ScanRange(DocKey(from), "c:" + this.name + ";", batchSize, entries);
+            int kid = KeyIdOf(field);
+            int last = from;
+            for (int i = 0; i < entries.Count; i = i + 1) {
+                int id = Collection.IdOfKey(entries[i].key);
+                JsonValue f = FieldOf(entries[i].val, kid);
+                if (f != null) { this.kv.Put(IdxKey(field, f.AsString(""), id), ""); }
+                if (id > last) { last = id; }
+            }
+            bool done = entries.Count < batchSize;
+            if (done) { this.kv.Delete(IdxPosKey(field)); }
+            else { this.kv.Put(IdxPosKey(field), Convert.ToString(last)); }
+            CommitWrite();
+            return done;
+        } catch {
+            this.kv.Rollback();
+            SyncMeta();
+            throw;
         }
-        bool done = entries.Count < batchSize;
-        if (done) { this.kv.Delete(IdxPosKey(field)); }
-        else { this.kv.Put(IdxPosKey(field), Convert.ToString(last)); }
-        this.kv.Commit();
-        return done;
     }
 
     /// 字段是否已在索引列表中（含批量构建尚未完成的）。
@@ -1877,36 +1948,32 @@ class Collection {
 
     // ===== 协程安全的异步 API =====
 
-    /// <see cref="FindById"/> 的协程版本：在共享读写锁的读侧执行。
+    /// <see cref="FindById"/> 的协程版本：读操作会维护缓存，因此也独占锁。
     async JsonValue FindByIdAsync(int id) {
-        await this.rw.EnterRead();
-        JsonValue v = FindById(id);
-        this.rw.ExitRead();
-        return v;
+        await this.rw.EnterWrite();
+        try { return FindById(id); }
+        finally { this.rw.ExitWrite(); }
     }
 
     /// <see cref="Insert"/> 的协程版本：在共享读写锁的写侧执行。
     async int InsertAsync(JsonValue doc) {
         await this.rw.EnterWrite();
-        int id = Insert(doc);
-        this.rw.ExitWrite();
-        return id;
+        try { return Insert(doc); }
+        finally { this.rw.ExitWrite(); }
     }
 
     /// <see cref="Update"/> 的协程版本：在共享读写锁的写侧执行。
     async bool UpdateAsync(int id, JsonValue doc) {
         await this.rw.EnterWrite();
-        bool ok = Update(id, doc);
-        this.rw.ExitWrite();
-        return ok;
+        try { return Update(id, doc); }
+        finally { this.rw.ExitWrite(); }
     }
 
     /// <see cref="DeleteById"/> 的协程版本：在共享读写锁的写侧执行。
     async bool DeleteByIdAsync(int id) {
         await this.rw.EnterWrite();
-        bool ok = DeleteById(id);
-        this.rw.ExitWrite();
-        return ok;
+        try { return DeleteById(id); }
+        finally { this.rw.ExitWrite(); }
     }
 
     /// <summary>对单篇文档的原子读改写：fn 在
@@ -1916,17 +1983,12 @@ class Collection {
     /// 返回了替换值时返回 true。</summary>
     async bool UpdateAtomic(int id, DocUpdater fn) {
         await this.rw.EnterWrite();
-        JsonValue cur = FindById(id);
-        if (cur == null) {
-            this.rw.ExitWrite();
-            return false;
-        }
-        JsonValue next = fn(cur);
-        bool ok = false;
-        if (next != null) {
-            ok = Update(id, next);
-        }
-        this.rw.ExitWrite();
-        return ok;
+        try {
+            JsonValue cur = FindById(id);
+            if (cur == null) { return false; }
+            JsonValue next = fn(cur);
+            if (next == null) { return false; }
+            return Update(id, next);
+        } finally { this.rw.ExitWrite(); }
     }
 }

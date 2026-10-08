@@ -1,0 +1,153 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+using System.Data.ZanDb;
+
+// The test driver must use a 30-second process timeout: a leaked writer lock
+// blocks the next await on the same collection instead of reaching its check.
+class ZanDbAsyncErrorsTest {
+    static int checks;
+    static int throwCalls;
+    static int missingCalls;
+    static int nullCalls;
+
+    static void Check(bool value, string message) {
+        checks = checks + 1;
+        Console.WriteLine((value ? "ok " : "FAIL ") + Convert.ToString(checks) + " - " + message);
+        if (!value) { throw new InvalidOperationException(message); }
+    }
+
+    static void Clean(string path) {
+        File.Delete(path); File.Delete(path + ".lock");
+        File.Delete(path + ".m0"); File.Delete(path + ".m1");
+        for (int i = 0; i < 100; i = i + 1) { File.Delete(path + ".s" + Convert.ToString(i)); }
+    }
+
+    static JsonValue Doc(string text) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.PutStr("body", text);
+        return doc;
+    }
+
+    static JsonValue InvalidDoc() {
+        JsonValue doc = JsonValue.NewObject();
+        doc.PutInt("body", 7);
+        return doc;
+    }
+
+    static string Body(JsonValue doc) { return doc == null ? "" : doc.Str("body", ""); }
+
+    static bool OnlyHit(Collection docs, string query, int id) {
+        List<Bm25Hit> hits = docs.SearchText("body", query, 5);
+        return hits.Count == 1 && hits[0].id == id;
+    }
+
+    static JsonValue ThrowingCallback(JsonValue current) {
+        throwCalls = throwCalls + 1;
+        current.Set("body", JsonValue.NewStr("callbacklocal"));
+        throw new InvalidOperationException("atomic callback sentinel");
+    }
+
+    static JsonValue MissingCallback(JsonValue current) {
+        missingCalls = missingCalls + 1;
+        return current;
+    }
+
+    static JsonValue NullCallback(JsonValue current) {
+        nullCalls = nullCalls + 1;
+        current.Set("body", JsonValue.NewStr("nulllocal"));
+        return null;
+    }
+
+    static async void Cases(ZanDatabase db, Collection docs) {
+        bool rejected = false;
+        try { await docs.InsertAsync(InvalidDoc()); }
+        catch (ArgumentException e) { rejected = e.Message == "text index requires string values"; }
+        Check(rejected && docs.Count() == 0 && !db.Kv().InTransaction(), "invalid async insert rejected");
+
+        int id = await docs.InsertAsync(Doc("alpha"));
+        Check(id == 1 && docs.Count() == 1, "valid async insert after exception");
+        JsonValue saved = await docs.FindByIdAsync(id);
+        Check(saved != null && Body(saved) == "alpha" && saved.Int("_id", 0) == id, "async read after insert exception");
+
+        rejected = false;
+        try { await docs.UpdateAsync(id, InvalidDoc()); }
+        catch (ArgumentException e) { rejected = e.Message == "text index requires string values"; }
+        Check(rejected && docs.Count() == 1 && !db.Kv().InTransaction(), "invalid async update rejected");
+        saved = await docs.FindByIdAsync(id);
+        Check(Body(saved) == "alpha", "invalid async update preserves document");
+        bool changed = await docs.UpdateAsync(id, Doc("beta"));
+        Check(changed, "valid async update after exception");
+        Check(OnlyHit(docs, "beta", id) && docs.SearchText("body", "alpha", 5).Count == 0,
+            "search reflects successful async update");
+
+        rejected = false;
+        try { await docs.UpdateAtomic(id, ZanDbAsyncErrorsTest.ThrowingCallback); }
+        catch (InvalidOperationException e) { rejected = e.Message == "atomic callback sentinel"; }
+        Check(rejected && throwCalls == 1 && !db.Kv().InTransaction(), "atomic callback exception propagated");
+        saved = await docs.FindByIdAsync(id);
+        Check(Body(saved) == "beta", "async read after callback exception");
+        changed = await docs.UpdateAtomic(id, (JsonValue current) => {
+            current.Set("body", JsonValue.NewStr("gamma"));
+            return current;
+        });
+        Check(changed, "valid atomic write after callback exception");
+        saved = await docs.FindByIdAsync(id);
+        Check(Body(saved) == "gamma", "atomic write persisted after exception");
+        Check(OnlyHit(docs, "gamma", id) && docs.SearchText("body", "callbacklocal", 5).Count == 0,
+            "throwing callback leaves no search change");
+
+        changed = await docs.UpdateAtomic(999, ZanDbAsyncErrorsTest.MissingCallback);
+        Check(!changed && missingCalls == 0, "missing atomic document skips callback");
+        changed = await docs.UpdateAsync(id, Doc("delta"));
+        Check(changed, "async write after missing atomic document");
+        saved = await docs.FindByIdAsync(id);
+        Check(Body(saved) == "delta", "async read after missing atomic document");
+        changed = await docs.UpdateAtomic(999, null);
+        Check(!changed, "missing atomic document accepts null delegate");
+        saved = await docs.FindByIdAsync(id);
+        Check(Body(saved) == "delta", "lock released before null delegate early return");
+
+        changed = await docs.UpdateAtomic(id, ZanDbAsyncErrorsTest.NullCallback);
+        Check(!changed && nullCalls == 1, "null callback result skips write");
+        saved = await docs.FindByIdAsync(id);
+        Check(Body(saved) == "delta", "null callback result preserves document");
+        changed = await docs.UpdateAsync(id, Doc("epsilon"));
+        Check(changed, "async write after null callback result");
+        Check(OnlyHit(docs, "epsilon", id) && docs.SearchText("body", "nulllocal", 5).Count == 0,
+            "null callback result leaves no search change");
+
+        bool removed = await docs.DeleteByIdAsync(999);
+        Check(!removed, "missing async delete returns false");
+        saved = await docs.FindByIdAsync(id);
+        Check(Body(saved) == "epsilon", "async read after missing delete");
+        removed = await docs.DeleteByIdAsync(id);
+        Check(removed, "valid async delete");
+        saved = await docs.FindByIdAsync(id);
+        Check(saved == null, "async read after delete returns null");
+        int next = await docs.InsertAsync(Doc("final"));
+        Check(next == 2 && docs.Count() == 1, "async insert after missing read");
+        saved = await docs.FindByIdAsync(next);
+        Check(Body(saved) == "final", "final async read reacquires lock");
+        Check(OnlyHit(docs, "final", next) && docs.SearchText("body", "epsilon", 5).Count == 0,
+            "final search has no deleted document");
+    }
+
+    static async void Main() {
+        Directory.CreateDirectory("_scratch");
+        string path = "_scratch/zandb_async_errors_tmp.zdb";
+        Clean(path);
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        try {
+            Check(db.IsOpen(), "database open");
+            Collection docs = db.GetCollection("async_errors");
+            docs.EnsureFullTextIndex("body");
+            await ZanDbAsyncErrorsTest.Cases(db, docs);
+        } finally {
+            db.Close();
+            Clean(path);
+        }
+        Console.WriteLine("done " + Convert.ToString(checks) + " checks");
+    }
+}

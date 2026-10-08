@@ -1,0 +1,352 @@
+using System;
+using System.IO;
+using System.Json;
+
+namespace System.Text;
+
+class TextToken {
+    string text;
+    int kind;
+    int position;
+
+    TextToken(string text, int kind, int position) {
+        this.text = text;
+        this.kind = kind;
+        this.position = position;
+    }
+}
+
+class TextTokenizer {
+    // One keyed edge table shares node prefixes; nodes do not own dictionaries.
+    Dictionary<long, int> edges = new Dictionary<long, int>();
+    List<int> terminals = new List<int>();
+    List<string> words = new List<string>();
+    string fingerprint = "";
+
+    TextTokenizer() {
+        terminals.Add(0);
+        // A small lexicon authored for this project, independent of external data.
+        ReadDictionary("中国\n中文\n中华\n中华人民共和国\n北京\n上海\n南京\n南京市\n长江\n长江大桥\n大桥\n语言\n程序\n编程\n编译器\n标准库\n工具\n项目\n文件\n文档\n数据库\n数据\n索引\n全文\n检索\n搜索\n查询\n更新\n删除\n测试\n性能\n网络\n服务\n用户\n系统\n配置\n缓存\n记录\n文本\n分词\n词典\n学习\n机器学习\n深度学习\n人工智能\n模型\n开发\n应用\n软件\n开源\n存储\n事务\n恢复\n排序\n过滤\n结果\n欢迎\n世界");
+    }
+
+    void AddWord(string word) {
+        AcceptWord(word);
+    }
+
+    int LoadDictionary(string path) {
+        return ReadDictionary(File.ReadAllText(path));
+    }
+
+    // The lexicon order does not affect segmentation or its cache identity.
+    string Fingerprint() {
+        if (fingerprint.Length != 0) { return fingerprint; }
+        List<string> sorted = new List<string>();
+        sorted.AddRange(words);
+        List<string> temp = new List<string>();
+        temp.AddRange(words);
+        int n = sorted.Count;
+        for (int width = 1; width < n; width = width * 2) {
+            for (int start = 0; start < n; start = start + width * 2) {
+                int mid = start + width;
+                if (mid > n) { mid = n; }
+                int end = mid + width;
+                if (end > n) { end = n; }
+                int a = start;
+                int b = mid;
+                for (int outPos = start; outPos < end; outPos = outPos + 1) {
+                    if (a < mid && (b >= end || String.CompareOrdinal(sorted[a], sorted[b]) <= 0)) {
+                        temp[outPos] = sorted[a];
+                        a = a + 1;
+                    } else {
+                        temp[outPos] = sorted[b];
+                        b = b + 1;
+                    }
+                }
+            }
+            List<string> swap = sorted;
+            sorted = temp;
+            temp = swap;
+        }
+        StringBuilder data = new StringBuilder();
+        data.Append("text-tokenizer-v1;ascii-fullwidth;longest;cjk-single-bigram\n");
+        for (int i = 0; i < n; i = i + 1) {
+            string word = sorted[i];
+            data.Append(Convert.ToString(word.Length));
+            data.Append(":");
+            data.Append(word);
+            data.Append("\n");
+        }
+        string source = data.ToString();
+        byte[] digest = new byte[20];
+        Encoding.Sha1(source, source.Length, digest);
+        StringBuilder hex = new StringBuilder();
+        hex.Append("text-v1:");
+        for (int i = 0; i < 20; i = i + 1) {
+            hex.Append(Encoding.ByteToHex(digest[i] & 255));
+        }
+        fingerprint = hex.ToString();
+        return fingerprint;
+    }
+
+    JsonValue ExportState() {
+        JsonValue state = JsonValue.NewObject();
+        state.PutInt("version", 1);
+        state.PutStr("fingerprint", Fingerprint());
+        JsonValue lexicon = JsonValue.NewArray();
+        for (int i = 0; i < words.Count; i = i + 1) { lexicon.AppendStr(words[i]); }
+        state.Put("words", lexicon);
+        return state;
+    }
+
+    static TextTokenizer ImportState(JsonValue state) {
+        if (state == null || !state.IsObject()) {
+            throw new ArgumentException("Invalid tokenizer state");
+        }
+        JsonValue version = state.Get("version");
+        JsonValue identity = state.Get("fingerprint");
+        JsonValue lexicon = state.Get("words");
+        if (version == null || !version.IsNumber() || !version.numIsInt || version.AsLong(0) != 1
+                || identity == null || !identity.IsString() || lexicon == null || !lexicon.IsArray()) {
+            throw new ArgumentException("Invalid tokenizer state shape/version");
+        }
+        TextTokenizer result = new TextTokenizer();
+        result.edges.Clear();
+        result.terminals.Clear();
+        result.terminals.Add(0);
+        result.words.Clear();
+        result.fingerprint = "";
+        for (int i = 0; i < lexicon.Count(); i = i + 1) {
+            JsonValue word = lexicon.At(i);
+            if (word == null || !word.IsString()) {
+                throw new ArgumentException("Invalid tokenizer dictionary entry");
+            }
+            string text = word.AsString("");
+            if (Normalize(text) != text || !result.AcceptWord(text)) {
+                throw new ArgumentException("Invalid or duplicate tokenizer dictionary word");
+            }
+        }
+        if (result.Fingerprint() != identity.AsString("")) {
+            throw new ArgumentException("Tokenizer fingerprint mismatch");
+        }
+        return result;
+    }
+
+    // Positions count Unicode scalars, including separators, rather than UTF-8 bytes.
+    List<TextToken> Tokenize(string text) {
+        List<TextToken> tokens = new List<TextToken>();
+        string source = Normalize(text);
+        int n = source.Length;
+        int cursor = 0;
+        int position = 0;
+        int[] scalar = new int[1];
+        int[] match = new int[2];
+        while (cursor < n) {
+            int used = Encoding.DecodeCodePoint(source, cursor, scalar);
+            int cp = scalar[0];
+            if (!IsAsciiWord(cp) && !IsCjk(cp)) {
+                cursor = cursor + used;
+                position = position + 1;
+                continue;
+            }
+            int start = cursor;
+            int firstPosition = position;
+            LongestMatch(source, start, scalar, match);
+            bool auxiliary = true;
+            if (match[0] > start) {
+                cursor = match[0];
+                position = position + match[1];
+            } else if (IsAsciiWord(cp)) {
+                auxiliary = false;
+                cursor = cursor + used;
+                position = position + 1;
+                while (cursor < n) {
+                    int width = Encoding.DecodeCodePoint(source, cursor, scalar);
+                    if (!IsAsciiWord(scalar[0])) { break; }
+                    cursor = cursor + width;
+                    position = position + 1;
+                }
+            } else {
+                cursor = cursor + used;
+                position = position + 1;
+            }
+            string primary = source.Substring(start, cursor - start);
+            tokens.Add(new TextToken(primary, 0, firstPosition));
+            if (auxiliary) {
+                EmitAuxiliary(tokens, source, start, cursor, firstPosition, primary, scalar);
+            }
+        }
+        return tokens;
+    }
+
+    static bool IsAsciiWord(int cp) {
+        return (cp >= 97 && cp <= 122) || (cp >= 48 && cp <= 57);
+    }
+
+    static bool IsCjk(int cp) {
+        return cp == 12295 || (cp >= 13312 && cp <= 19903)
+            || (cp >= 19968 && cp <= 40959) || (cp >= 63744 && cp <= 64255)
+            || (cp >= 131072 && cp <= 195103) || (cp >= 196608 && cp <= 205743);
+    }
+
+    static int Fold(int cp) {
+        if (cp >= 65281 && cp <= 65374) { cp = cp - 65248; }
+        else if (cp == 12288) { cp = 32; }
+        if (cp >= 65 && cp <= 90) { cp = cp + 32; }
+        return cp;
+    }
+
+    static string Normalize(string text) {
+        if (text == null || text.Length == 0) { return ""; }
+        int[] scalar = new int[1];
+        StringBuilder builder = new StringBuilder();
+        int cursor = 0;
+        int chunk = 0;
+        bool changed = false;
+        while (cursor < text.Length) {
+            int used = Encoding.DecodeCodePoint(text, cursor, scalar);
+            int cp = scalar[0];
+            int folded = Fold(cp);
+            bool invalid = cp == 65533 && (used != 3 || (text[cursor] & 255) != 239
+                || (text[cursor + 1] & 255) != 191 || (text[cursor + 2] & 255) != 189);
+            if (folded != cp || invalid) {
+                if (cursor > chunk) { builder.Append(text.Substring(chunk, cursor - chunk)); }
+                builder.Append(Encoding.Utf8FromCodePoint(folded));
+                chunk = cursor + used;
+                changed = true;
+            }
+            cursor = cursor + used;
+        }
+        if (!changed) { return text; }
+        if (chunk < text.Length) { builder.Append(text.Substring(chunk, text.Length - chunk)); }
+        return builder.ToString();
+    }
+
+    bool AcceptWord(string word) {
+        string normalized = Normalize(word);
+        if (normalized.Length == 0) { return false; }
+        int[] scalar = new int[1];
+        int cursor = 0;
+        // Validate before changing the trie, including malformed UTF-8 input.
+        while (cursor < normalized.Length) {
+            int used = Encoding.DecodeCodePoint(normalized, cursor, scalar);
+            if (!IsAsciiWord(scalar[0]) && !IsCjk(scalar[0])) { return false; }
+            cursor = cursor + used;
+        }
+        int node = 0;
+        cursor = 0;
+        while (cursor < normalized.Length) {
+            int used = Encoding.DecodeCodePoint(normalized, cursor, scalar);
+            long key = (long)node * 1114112 + (long)scalar[0];
+            if (edges.ContainsKey(key)) {
+                node = edges[key];
+            } else {
+                int child = terminals.Count;
+                terminals.Add(0);
+                edges[key] = child;
+                node = child;
+            }
+            cursor = cursor + used;
+        }
+        if (terminals[node] != 0) { return false; }
+        terminals[node] = 1;
+        words.Add(normalized);
+        fingerprint = "";
+        return true;
+    }
+
+    // Each line accepts one word; optional frequency columns and # comments are ignored.
+    int ReadDictionary(string data) {
+        int accepted = 0;
+        int start = 0;
+        if (data.Length >= 3 && (data[0] & 255) == 239 && (data[1] & 255) == 187
+                && (data[2] & 255) == 191) { start = 3; }
+        while (start < data.Length) {
+            int end = data.IndexOf("\n", start);
+            if (end < 0) { end = data.Length; }
+            int first = start;
+            while (first < end && ((data[first] & 255) == 32 || (data[first] & 255) == 9
+                    || (data[first] & 255) == 13)) { first = first + 1; }
+            int last = first;
+            while (last < end) {
+                int c = data[last] & 255;
+                if (c == 32 || c == 9 || c == 13 || c == 35) { break; }
+                last = last + 1;
+            }
+            if (last > first && AcceptWord(data.Substring(first, last - first))) {
+                accepted = accepted + 1;
+            }
+            start = end + 1;
+        }
+        return accepted;
+    }
+
+    void LongestMatch(string source, int start, int[] scalar, int[] result) {
+        result[0] = start;
+        result[1] = 0;
+        int node = 0;
+        int cursor = start;
+        int count = 0;
+        while (cursor < source.Length) {
+            int used = Encoding.DecodeCodePoint(source, cursor, scalar);
+            int cp = scalar[0];
+            long key = (long)node * 1114112 + (long)cp;
+            if (!edges.ContainsKey(key)) { break; }
+            node = edges[key];
+            cursor = cursor + used;
+            count = count + 1;
+            if (terminals[node] != 0) {
+                bool boundary = true;
+                if (IsAsciiWord(cp) && cursor < source.Length) {
+                    Encoding.DecodeCodePoint(source, cursor, scalar);
+                    boundary = !IsAsciiWord(scalar[0]);
+                }
+                if (boundary) { result[0] = cursor; result[1] = count; }
+            }
+        }
+    }
+
+    static void EmitAuxiliary(List<TextToken> tokens, string source, int start, int end,
+            int position, string primary, int[] scalar) {
+        int cursor = start;
+        int firstPosition = position;
+        while (cursor < end) {
+            int used = Encoding.DecodeCodePoint(source, cursor, scalar);
+            int cp = scalar[0];
+            if (IsAsciiWord(cp)) {
+                int run = cursor + used;
+                int count = 1;
+                while (run < end) {
+                    int width = Encoding.DecodeCodePoint(source, run, scalar);
+                    if (!IsAsciiWord(scalar[0])) { break; }
+                    run = run + width;
+                    count = count + 1;
+                }
+                string latin = source.Substring(cursor, run - cursor);
+                if (position != firstPosition || latin != primary) {
+                    tokens.Add(new TextToken(latin, 1, position));
+                }
+                cursor = run;
+                position = position + count;
+                continue;
+            }
+            if (IsCjk(cp)) {
+                string single = source.Substring(cursor, used);
+                if (position != firstPosition || single != primary) {
+                    tokens.Add(new TextToken(single, 1, position));
+                }
+                int next = cursor + used;
+                if (next < source.Length) {
+                    int nextUsed = Encoding.DecodeCodePoint(source, next, scalar);
+                    if (IsCjk(scalar[0])) {
+                        string bigram = source.Substring(cursor, used + nextUsed);
+                        if (position != firstPosition || bigram != primary) {
+                            tokens.Add(new TextToken(bigram, 1, position));
+                        }
+                    }
+                }
+            }
+            cursor = cursor + used;
+            position = position + 1;
+        }
+    }
+}

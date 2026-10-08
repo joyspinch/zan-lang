@@ -3,28 +3,17 @@ using System.IO;
 
 namespace System.Data.ZanDb;
 
-/// <summary>重放回调：payload 为一帧载荷，读位置在 0、长度为载荷字节数。
-/// 缓冲区归 LogFile 所有并在下一帧复用，访客不得 Free；
-/// 需要保留内容时必须自行复制。</summary>
-delegate void LogFrameVisitor(ByteBuffer payload);
+/// <summary>重放回调：完整载荷校验且应用成功才返回 true；false 拒绝
+/// 打开并保留日志原样。缓冲归 LogFile 所有，访客不得 Free。</summary>
+delegate bool LogFrameVisitor(ByteBuffer payload);
 
 /// <summary>
-/// 追加日志：定长头（载荷长度 + CRC32）+ 载荷的顺序帧序列。
-/// 写路径先把帧攒进内存缓冲，Flush 时一次性写到逻辑末尾，
-/// Sync 落到稳定存储——一组帧因此只需一次定位写、一次 fsync。
-/// Replay 按序校验帧，遇到第一个不完整或 CRC 不符的帧即停止；
-/// 崩溃留下的撕裂尾部被就地截断，因此重放之后日志永远以
-/// 完整帧结尾，后续追加直接覆盖垃圾区域。
-///
-/// 帧布局（小端）：
-///   u32 payloadLen
-///   u32 crc32     载荷的 CRC32
-///   payload       payloadLen 字节
+/// 追加日志：小端 u32 payloadLen + u32 crc32(payload) + payload。
+/// 每个事务占一个 CRC 帧。内存缓冲由 Flush 定位追加，Sync 强制落盘。
+/// Replay 只修复撕裂尾部；读取错误或 CRC 有效但载荷非法均失败关闭。
 /// </summary>
 class LogFile {
-    /// 帧头长度（字节）：u32 len + u32 crc。
     static int HEADER_LEN = 8;
-    /// 单帧载荷的防护性上限：超过即视为损坏帧。
     static long MAX_FRAME = 67108864;
 
     PageFile file;
@@ -40,132 +29,182 @@ class LogFile {
         this.pending = ByteBuffer.Alloc(256);
     }
 
-    /// <summary>打开（必要时创建）日志文件。重放由调用方
-    /// 经 <see cref="Replay"/> 驱动。</summary>
+    /// 打开日志；Store 必须先持有稳定的旁路锁，再调用此方法。
     static LogFile Open(string filePath) {
         LogFile lf = new LogFile();
         lf.path = filePath;
         lf.file = PageFile.Open(filePath);
         if (!lf.file.IsOpen()) {
             lf.lastError = lf.file.GetError();
+            lf.Close(false);
             return lf;
         }
+        long size = lf.file.Size();
+        if (size < 0) {
+            lf.lastError = lf.file.GetError();
+            lf.Close(false);
+            return lf;
+        }
+        lf.logicalEnd = size;
         return lf;
     }
 
-    /// 文件是否成功打开。
-    bool IsOpen() { return this.file.IsOpen(); }
+    bool IsOpen() {
+        return this.lastError == "" && this.file != null && this.file.IsOpen()
+            && this.pending != null;
+    }
 
-    /// 最近一次操作的错误描述（无错为空串）。
     string GetError() { return this.lastError; }
-
-    /// 日志文件的磁盘路径。
     string FilePath() { return this.path; }
 
-    /// 逻辑大小：已落盘的完整帧 + 缓冲中的帧。
-    long Size() { return this.logicalEnd + this.pending.Length(); }
+    /// 逻辑大小；关闭或失败时为 -1，不能把错误当成空日志。
+    long Size() { return this.IsOpen() ? this.logicalEnd + this.pending.Length() : -1; }
+    int PendingBytes() { return this.pending != null ? this.pending.Length() : 0; }
 
-    /// 缓冲中尚未写入文件的字节数。
-    int PendingBytes() { return this.pending.Length(); }
+    bool Ready() {
+        if (this.IsOpen()) { return true; }
+        if (this.lastError == "") { this.lastError = "log is closed"; }
+        return false;
+    }
 
-    /// <summary>追加一帧。帧先进入内存缓冲，
-    /// <see cref="Flush"/> 之前不落盘。</summary>
-    void AppendFrame(ByteBuffer payload) {
+    /// 追加完整 CRC 帧到缓冲；载荷上限在任何缓冲修改之前检查。
+    bool AppendFrame(ByteBuffer payload) {
+        if (!this.Ready()) { return false; }
         int plen = payload.Length();
+        if (plen <= 0 || plen > LogFile.MAX_FRAME
+                || (long)this.pending.Length() + LogFile.HEADER_LEN + plen > 2147483647) {
+            this.lastError = "log frame exceeds bounds";
+            return false;
+        }
         this.pending.EnsureRoom(LogFile.HEADER_LEN + plen);
         this.pending.WriteU32(plen);
         this.pending.WriteU32(payload.Crc32(plen));
-        payload.SeekRead(0);
         this.pending.WriteBytes(payload.Raw(), plen);
+        return true;
     }
 
-    /// <summary>把缓冲中的全部帧一次性写到逻辑末尾。
-    /// 失败时缓冲保持原样，可重试。</summary>
+    /// 短写/写错后缓冲保留供诊断；失败 Store 必须 Close(false)，不得重刷。
     bool Flush() {
-        if (this.pending.Length() == 0) { return true; }
-        long at = this.logicalEnd;
-        int n = this.file.WriteAt(at, this.pending.Raw(), this.pending.Length());
-        if (n != this.pending.Length()) {
-            this.lastError = "log write failed";
+        if (!this.Ready()) { return false; }
+        int bytes = this.pending.Length();
+        if (bytes == 0) { return true; }
+        int n = this.file.WriteAt(this.logicalEnd, this.pending.Raw(), bytes);
+        if (n != bytes) {
+            this.lastError = "log write failed: " + this.file.GetError();
             return false;
         }
-        this.logicalEnd = at + n;
+        this.logicalEnd = this.logicalEnd + n;
         this.pending.Clear();
         return true;
     }
 
-    /// <summary>Flush 并强制落盘到稳定存储。</summary>
     bool Sync() {
         if (!this.Flush()) { return false; }
-        return this.file.Sync();
+        if (!this.file.Sync()) {
+            this.lastError = "log sync failed: " + this.file.GetError();
+            return false;
+        }
+        return true;
     }
 
-    /// 标记缓冲当前位置（事务起点），供 <see cref="RollbackTo"/> 使用。
-    int Mark() { return this.pending.Length(); }
-
-    /// <summary>丢弃 Mark 之后缓冲中的帧（事务回滚）。
-    /// 只对尚未 Flush 的内容有效。</summary>
+    int Mark() { return this.PendingBytes(); }
     void RollbackTo(int mark) {
-        if (mark >= 0 && mark < this.pending.Length()) {
+        if (this.pending != null && mark >= 0 && mark < this.pending.Length()) {
             this.pending.SetLength(mark);
         }
     }
 
-    /// <summary>顺序重放全部完整帧，每个载荷交给 visit；
-    /// 遇到第一个不完整或 CRC 不符的帧停止，并截断其后的
-    /// 撕裂尾部。返回重放结束处的偏移（新的逻辑末尾）。</summary>
+    /// 返回新逻辑末尾；错误为 -1，不截断读取失败或非法载荷的日志。
     long Replay(LogFrameVisitor visit) {
+        if (!this.Ready()) { return -1; }
+        if (this.pending.Length() != 0) {
+            this.lastError = "cannot replay a log with pending writes";
+            return -1;
+        }
         long size = this.file.Size();
-        if (size <= 0) { return 0; }
+        if (size < 0) {
+            this.lastError = "log size failed: " + this.file.GetError();
+            return -1;
+        }
         long off = 0;
         ByteBuffer h = ByteBuffer.Alloc(LogFile.HEADER_LEN);
         ByteBuffer body = ByteBuffer.Alloc(256);
-        while (off + LogFile.HEADER_LEN <= size) {
-            int got = this.file.ReadAt(off, h, LogFile.HEADER_LEN);
-            if (got < LogFile.HEADER_LEN) { break; }
-            h.SeekRead(0);
-            long plen = h.ReadU32();
-            long crc = h.ReadU32();
-            if (plen > LogFile.MAX_FRAME) { break; }
-            if (off + LogFile.HEADER_LEN + plen > size) { break; }
-            if (plen > 0) {
-                body.EnsureCapacity((int)plen);
+        try {
+            while (size - off >= LogFile.HEADER_LEN) {
+                int got = this.file.ReadAt(off, h, LogFile.HEADER_LEN);
+                if (got != LogFile.HEADER_LEN) {
+                    this.lastError = "log header read failed: " + this.file.GetError();
+                    return -1;
+                }
+                h.SeekRead(0);
+                long plen = h.ReadU32();
+                long crc = h.ReadU32();
+                if (plen > LogFile.MAX_FRAME || plen > size - off - LogFile.HEADER_LEN) { break; }
                 got = this.file.ReadAt(off + LogFile.HEADER_LEN, body, (int)plen);
-                if (got != (int)plen) { break; }
-                if (body.Crc32(got) != crc) { break; }
+                if (got != (int)plen) {
+                    this.lastError = "log payload read failed: " + this.file.GetError();
+                    return -1;
+                }
+                if (body.Crc32(got) != crc) {
+                    // 一个定长完整帧后还有数据时，CRC 错不是单纯的撕裂尾。
+                    if (off + LogFile.HEADER_LEN + plen < size) {
+                        this.lastError = "log frame CRC corrupt before tail";
+                        return -1;
+                    }
+                    break;
+                }
+                body.SeekRead(0);
+                if (!visit(body)) {
+                    this.lastError = "invalid log frame payload";
+                    return -1;
+                }
+                off = off + LogFile.HEADER_LEN + plen;
             }
-            body.SeekRead(0);
-            visit(body);
-            off = off + LogFile.HEADER_LEN + plen;
+            if (off < size) {
+                if (!this.file.Truncate(off) || !this.file.Sync()) {
+                    this.lastError = "log tail repair failed: " + this.file.GetError();
+                    return -1;
+                }
+            }
+            this.logicalEnd = off;
+            return off;
+        } finally {
+            h.Free();
+            body.Free();
         }
-        h.Free();
-        body.Free();
-        if (off < size) {
-            this.file.Truncate(off);
-        }
-        this.logicalEnd = off;
-        return off;
     }
 
-    /// <summary>清空日志（段 flush 完成后调用）：丢弃缓冲、
-    /// 截断到 0。只在清单已持久化覆盖现有全部记录之后调用——
-    /// 顺序颠倒会出现恢复缺口。</summary>
-    void Reset() {
+    /// 两个清单槽均覆盖日志后才调用。截断失败时不丢弃缓冲/逻辑水位。
+    bool Reset() {
+        if (!this.Ready()) { return false; }
+        if (!this.file.Truncate(0) || !this.file.Sync()) {
+            this.lastError = "log reset failed: " + this.file.GetError();
+            return false;
+        }
         this.pending.Clear();
-        this.file.Truncate(0);
         this.logicalEnd = 0;
+        return true;
     }
 
-    /// <summary>非阻塞独占锁日志文件：ZanStore.Open 用它拒绝第二
-    /// 个进程打开同一路径（单写模型）。锁随 <see cref="Close"/>
-    /// 的句柄由操作系统释放，崩溃的持有者不会卡死后来的打开者。</summary>
+    /// 兼容旧版写入者的 WAL 锁；新版还必须先拿 .lock 的稳定锁。
     bool TryLockExclusive() {
-        return this.file.TryLockExclusive();
+        return this.Ready() && this.file.TryLockExclusive();
     }
 
-    /// <summary>Flush 后关闭底层文件。</summary>
-    void Close() {
-        this.Flush();
-        this.file.Close();
+    void Close() { this.Close(true); }
+
+    /// 失败路径传 false：关闭不把失败的待写帧再次落盘。
+    void Close(bool flushPending) {
+        if (flushPending && this.IsOpen()) { this.Sync(); }
+        if (this.file != null) {
+            this.file.Close();
+            if (this.lastError == "" && this.file.GetError() != "") {
+                this.lastError = this.file.GetError();
+            }
+        }
+        if (this.pending != null) {
+            this.pending.Free();
+            this.pending = null;
+        }
     }
 }

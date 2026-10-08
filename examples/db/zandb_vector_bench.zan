@@ -1,0 +1,124 @@
+using System;
+using System.Collections.Generic;
+using System.Data.ZanDb;
+
+/// Defaults: 10k vectors, 128 dimensions, 100 independent queries, cosine.
+/// Override ZAN_VECTOR_BENCH_N / _DIMS / _QUERIES / _METRIC / _EF explicitly
+/// for larger runs. Example: ZAN_VECTOR_BENCH_N=100000 (up to 1 million).
+/// Compile with --auto-stdlib --publish for meaningful native release timings.
+class VectorBenchRandom {
+    long state;
+    VectorBenchRandom(int seed) { this.state = seed; }
+    double Unit() {
+        this.state = (this.state * 48271) % 2147483647;
+        return (double)this.state / 2147483647.0;
+    }
+}
+
+class ZanDbVectorBench {
+    static int ConfigInt(string name, int fallback, int low, int high) {
+        string text = Environment.GetEnvironmentVariable(name);
+        if (text == null || text.Length == 0) { return fallback; }
+        int value = Convert.ToInt(text);
+        if (value < low || value > high) { throw new ArgumentException("Benchmark option out of range: " + name); }
+        return value;
+    }
+
+    static float[] Sample(int ordinal, int dimensions, VectorBenchRandom random) {
+        float[] vector = new float[dimensions];
+        int distribution = ordinal % 4;
+        int cluster = (ordinal / 4) % 32;
+        for (int i = 0; i < dimensions; i = i + 1) {
+            double noise = random.Unit() * 2.0 - 1.0;
+            double value = noise;
+            if (distribution == 1) { value = ((cluster * (i + 3) * 17) % 67 - 33) * 0.1 + noise * 0.08; }
+            if (distribution == 2) { value = noise * (i < 4 ? 10.0 : 0.15); }
+            if (distribution == 3) { value = noise * 0.04; }
+            vector[i] = (float)value;
+        }
+        if (distribution == 3) { vector[(ordinal * 7) % dimensions] = 2.0 + random.Unit(); }
+        return vector;
+    }
+
+    static int Overlap(List<VectorHit> hits, List<VectorHit> exact) {
+        int found = 0;
+        for (int i = 0; i < hits.Count; i = i + 1) {
+            for (int j = 0; j < exact.Count; j = j + 1) {
+                if (hits[i].id == exact[j].id) { found = found + 1; break; }
+            }
+        }
+        return found;
+    }
+
+    static string Number(double value) { return Convert.ToString(Math.Round(value, 3)); }
+
+    static void Measure(VectorIndex index, List<float[]> queries,
+            List<List<VectorHit>> reference, int ef, long exactMicros) {
+        long distanceCount = 0;
+        long micros = 0;
+        int overlap = 0;
+        for (int i = 0; i < queries.Count; i = i + 1) {
+            long begin = Stopwatch.GetMicroseconds();
+            List<VectorHit> hits = index.Search(queries[i], 10, ef);
+            micros = micros + Stopwatch.GetMicroseconds() - begin;
+            distanceCount = distanceCount + index.LastDistanceCount();
+            overlap = overlap + Overlap(hits, reference[i]);
+        }
+        double elapsed = (double)micros;
+        if (elapsed < 1) { elapsed = 1; }
+        double recall = (double)overlap / (queries.Count * 10.0);
+        Console.WriteLine("HNSW ef=" + Convert.ToString(ef)
+            + " recall@10=" + Number(recall)
+            + " total_ms=" + Number(elapsed / 1000.0)
+            + " mean_ms=" + Number(elapsed / (queries.Count * 1000.0))
+            + " distances/query=" + Number((double)distanceCount / queries.Count)
+            + " speedup=" + Number((double)exactMicros / elapsed));
+    }
+
+    static void Main() {
+        int n = ConfigInt("ZAN_VECTOR_BENCH_N", 10000, 1000, 1000000);
+        int dimensions = ConfigInt("ZAN_VECTOR_BENCH_DIMS", 128, 2, 4096);
+        int queryCount = ConfigInt("ZAN_VECTOR_BENCH_QUERIES", 100, 1, 1000);
+        int metric = ConfigInt("ZAN_VECTOR_BENCH_METRIC", 0, 0, 1);
+        int ef = ConfigInt("ZAN_VECTOR_BENCH_EF", 64, 10, 1000000);
+        VectorIndexOptions options = new VectorIndexOptions(dimensions, metric);
+        options.efConstruction = 160;
+        options.seed = 1729;
+        VectorIndex index = new VectorIndex(options);
+        VectorBenchRandom random = new VectorBenchRandom(7919);
+        Console.WriteLine("ZanDb pure Zan HNSW N=" + Convert.ToString(n)
+            + " dims=" + Convert.ToString(dimensions)
+            + " metric=" + (metric == 0 ? "cosine" : "squaredL2")
+            + " m=16 efConstruction=160 seed=1729 queries=" + Convert.ToString(queryCount));
+        long begin = Stopwatch.GetMicroseconds();
+        for (int i = 0; i < n; i = i + 1) { index.Add(i + 1, Sample(i, dimensions, random)); }
+        long buildMicros = Stopwatch.GetMicroseconds() - begin;
+        Console.WriteLine("build_ms=" + Number((double)buildMicros / 1000.0)
+            + " packed_vector_MiB=" + Number((double)n * dimensions * 4.0 / 1048576.0));
+        List<float[]> queries = new List<float[]>();
+        random = new VectorBenchRandom(104729);
+        for (int i = 0; i < queryCount; i = i + 1) {
+            queries.Add(Sample(n + 10000 + i * 47, dimensions, random));
+        }
+        // Warm both paths; timings below exclude reference comparison and output.
+        index.Search(queries[0], 10, ef);
+        index.SearchExact(queries[0], 10);
+        List<List<VectorHit>> reference = new List<List<VectorHit>>();
+        long exactMicros = 0;
+        long exactDistances = 0;
+        for (int i = 0; i < queries.Count; i = i + 1) {
+            begin = Stopwatch.GetMicroseconds();
+            List<VectorHit> hits = index.SearchExact(queries[i], 10);
+            exactMicros = exactMicros + Stopwatch.GetMicroseconds() - begin;
+            exactDistances = exactDistances + index.LastDistanceCount();
+            reference.Add(hits);
+        }
+        Console.WriteLine("exact total_ms=" + Number((double)exactMicros / 1000.0)
+            + " mean_ms=" + Number((double)exactMicros / (queryCount * 1000.0))
+            + " distances/query=" + Number((double)exactDistances / queryCount));
+        Measure(index, queries, reference, 32, exactMicros);
+        Measure(index, queries, reference, ef, exactMicros);
+        if (ef != 128) { Measure(index, queries, reference, 128, exactMicros); }
+        if (ef != 256) { Measure(index, queries, reference, 256, exactMicros); }
+    }
+}

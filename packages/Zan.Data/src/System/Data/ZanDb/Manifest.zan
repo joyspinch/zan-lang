@@ -46,20 +46,24 @@ class Manifest {
         return basePath + ".m" + Convert.ToString(slot);
     }
 
-    /// <summary>读取双槽清单：两个槽都试，取 CRC 有效且代数最高的。
-    /// 都无效（全新库）时返回 <see cref="Exists"/> 为 false 的空清单。
-    /// 只读，不创建任何文件。</summary>
+    /// <summary>读取双槽清单，取有效且代数最高的一份。仅两槽均缺席
+    /// 才是新库；已有槽全部损坏或发生读取错误时显式拒绝打开。</summary>
     static Manifest Load(string basePath) {
         Manifest m = new Manifest();
         m.basePath = basePath;
+        bool present = false;
         for (int slot = 0; slot < 2; slot = slot + 1) {
-            string p = SlotPath(basePath, slot);
-            if (!File.Exists(p)) { continue; }
+            string p = Manifest.SlotPath(basePath, slot);
+            if (!File.Exists(p) && !Directory.Exists(p)) { continue; }
+            present = true;
             long gen = 0;
             long seq = 0;
             long nextId = 0;
             List<long> ids = new List<long>();
-            if (!m.ParseSlot(p, out gen, out seq, out nextId, ids)) { continue; }
+            if (!m.ParseSlot(p, out gen, out seq, out nextId, ids)) {
+                if (m.lastError != "") { return m; }
+                continue;
+            }
             if (m.exists && gen <= m.gen) { continue; }
             m.curSlot = slot;
             m.gen = gen;
@@ -68,6 +72,7 @@ class Manifest {
             m.segIds = ids;
             m.exists = true;
         }
+        if (present && !m.exists) { m.lastError = "manifest has no valid slot"; }
         return m;
     }
 
@@ -76,14 +81,33 @@ class Manifest {
         gen = 0;
         seq = 0;
         nextId = 0;
-        PageFile f = PageFile.Open(path);
-        if (!f.IsOpen()) { return false; }
+        PageFile f = PageFile.OpenExisting(path);
+        if (!f.IsOpen()) {
+            this.lastError = "manifest open failed: " + f.GetError();
+            f.Close();
+            return false;
+        }
         long size = f.Size();
-        if (size < Manifest.FIXED + 4) { f.Close(); return false; }
+        if (size < 0) {
+            this.lastError = "manifest size failed: " + f.GetError();
+            f.Close();
+            return false;
+        }
+        if (size < Manifest.FIXED + 4 || size > LogFile.MAX_FRAME) { f.Close(); return false; }
         ByteBuffer b = ByteBuffer.Alloc((int)size);
         int got = f.ReadAt(0, b, (int)size);
+        if (got != (int)size) {
+            this.lastError = "manifest read failed: " + f.GetError();
+            f.Close();
+            b.Free();
+            return false;
+        }
         f.Close();
-        if (got != (int)size) { b.Free(); return false; }
+        if (f.GetError() != "") {
+            this.lastError = "manifest close failed: " + f.GetError();
+            b.Free();
+            return false;
+        }
         b.SeekRead(0);
         if (b.Str(0, 4) != Manifest.MAGIC) { b.Free(); return false; }
         b.SeekRead(4);
@@ -101,6 +125,17 @@ class Manifest {
         long crc = b.ReadU32();
         if (b.Crc32((int)size - 4) != crc) { b.Free(); return false; }
         b.Free();
+        return gen > 0 && Manifest.ValidState(seq, nextId, ids);
+    }
+
+    static bool ValidState(long seq, long nextId, List<long> ids) {
+        if (seq < 0 || nextId < 0) { return false; }
+        Dictionary<long, int> seen = new Dictionary<long, int>();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            long id = ids[i];
+            if (id < 0 || id >= nextId || seen.ContainsKey(id)) { return false; }
+            seen.Add(id, 1);
+        }
         return true;
     }
 
@@ -125,6 +160,11 @@ class Manifest {
         int slot = this.curSlot == 0 ? 1 : 0;
         long newGen = this.gen + 1;
         int n = ids.Count;
+        if (newGen <= 0 || !Manifest.ValidState(newLogStartSeq, newNextSegId, ids)
+                || (long)Manifest.FIXED + 8 * (long)n + 4 > LogFile.MAX_FRAME) {
+            this.lastError = "manifest state exceeds bounds";
+            return false;
+        }
         int total = Manifest.FIXED + 8 * n + 4;
         ByteBuffer b = ByteBuffer.Alloc(total);
         b.WriteRaw(Manifest.MAGIC, 4);
@@ -135,7 +175,7 @@ class Manifest {
         b.WriteU32(n);
         for (int i = 0; i < n; i = i + 1) { b.WriteU64(ids[i]); }
         b.WriteU32(b.Crc32(total - 4));
-        PageFile f = PageFile.Open(SlotPath(this.basePath, slot));
+        PageFile f = PageFile.Open(Manifest.SlotPath(this.basePath, slot));
         if (!f.IsOpen()) {
             this.lastError = f.GetError();
             b.Free();
@@ -145,8 +185,8 @@ class Manifest {
         bool ok = w == total && f.Truncate(total) && f.Sync();
         f.Close();
         b.Free();
-        if (!ok) {
-            this.lastError = "manifest save failed";
+        if (!ok || f.GetError() != "") {
+            this.lastError = "manifest save failed: " + f.GetError();
             return false;
         }
         this.curSlot = slot;
@@ -156,6 +196,8 @@ class Manifest {
         List<long> copy = new List<long>();
         for (int i = 0; i < n; i = i + 1) { copy.Add(ids[i]); }
         this.segIds = copy;
+        this.exists = true;
+        this.lastError = "";
         return true;
     }
 }

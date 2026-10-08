@@ -1,27 +1,22 @@
 using System;
 using System.Net.Sockets;
+using System.Threading;
 
 namespace System.Net.Sockets;
 
-/// <summary>
-/// 跨平台的异步 TCP 服务器监听器。
-/// 借鉴 Workerman 的思路：每个被接受的连接都可以
-/// 在独立的协程中处理，从而支持海量并发。
-///
-/// 用法：
-///   var listener = new TcpListener("0.0.0.0", 8080);
-///   TcpListener.Start(listener);
-///   while (true) {
-///       nint client = await TcpListener.AcceptAsync(listener);
-///       // 派生一个协程来处理该客户端
-///   }
-/// </summary>
+/// <summary>跨平台异步 TCP 监听器。构造后首次 Accept 可自动 Start；
+/// 显式 Stop 后不会自动重开。Stop 取消挂起的 accept，保留描述符
+/// 到这些操作结束；StopAsync 可等待它们全部结束。</summary>
 class TcpListener {
     nint sock;
     string host;
     int port;
     bool running;
     int backlog;
+    private object sync;
+    private bool stopped;
+    private int activeAccepts;
+    private CancellationTokenSource acceptCancellation;
 
     TcpListener(string host, int port) {
         Socket.Initialize();
@@ -30,6 +25,10 @@ class TcpListener {
         this.running = false;
         this.backlog = 128;
         this.sock = -1;
+        this.sync = new object();
+        this.stopped = false;
+        this.activeAccepts = 0;
+        this.acceptCancellation = null;
     }
 
     /// <summary>创建并启动一个带自定义 backlog 的监听器。</summary>
@@ -40,49 +39,25 @@ class TcpListener {
         return listener;
     }
 
-    /// <summary>开始监听传入的连接。任一步（创建套接字、绑定、
-    /// 监听、设为非阻塞）失败时关闭已创建的 fd 并抛
-    /// SocketException（端口被占用等），绝不留下一个
-    /// running=true 但实际没在监听的监听器。
-    /// host 含 ':'（IPv6 字面量）时用 AF_INET6 套接字——AF_INET
-    /// 套接字绑 [::1] 恒失败；IPv4 字面量与主机名仍走 AF_INET。</summary>
+    /// <summary>开始监听；运行中为无操作。创建、绑定、监听、非阻塞
+    /// 任一步失败都关闭新 fd 并抛 SocketException。IPv6 字面量使用
+    /// AF_INET6。显式 Stop 后可再 Start，但须先等待旧 accept 结束。</summary>
     void Start() {
-        nint s = this.host.IndexOf(":") >= 0
-            ? Socket.CreateTcp6() : Socket.CreateTcp();
-        if (s < 0) {
-            throw new SocketException(Socket.LastSocketError(),
-                "socket() failed: " + Convert.ToString(Socket.LastSocketError()));
-        }
-        Socket.SetReuseAddr(s);
-        if (Socket.Bind(s, this.host, this.port) != 0) {
-            int err = Socket.LastSocketError();
-            Socket.Close(s);
-            throw new SocketException(err,
-                "bind(" + this.host + ":" + Convert.ToString(this.port)
-                + ") failed: " + Convert.ToString(err));
-        }
-        if (Socket.Listen(s, this.backlog) != 0) {
-            int err = Socket.LastSocketError();
-            Socket.Close(s);
-            throw new SocketException(err,
-                "listen() failed: " + Convert.ToString(err));
-        }
-        if (Socket.SetNonBlocking(s) != 0) {
-            int err = Socket.LastSocketError();
-            Socket.Close(s);
-            throw new SocketException(err,
-                "set nonblocking failed: " + Convert.ToString(err));
-        }
-        this.sock = s;
-        this.running = true;
+        lock (this.sync) { this.StartOwned(false); }
     }
 
-    /// <summary>在 bind 前启用 SO_REUSEPORT 再开始监听，这样
-    /// 多个 worker 进程可共享同一地址:端口，由内核
-    /// 在它们之间负载均衡入站连接（Linux/macOS）。Windows 上行为同
-    /// Start（无 SO_REUSEPORT）。任一步失败时关闭 fd 并抛
-    /// SocketException。IPv6 主机的套接字族选择与 Start 相同。</summary>
+    /// <summary>在 bind 前启用 SO_REUSEPORT，让 Linux/macOS 的多个
+    /// worker 共享同一端口。Windows 与 Start 相同。生命周期与 Start
+    /// 相同：正在运行不重开，旧 accept 排空前拒绝重启。</summary>
     void StartReusePort() {
+        lock (this.sync) { this.StartOwned(true); }
+    }
+
+    private void StartOwned(bool reusePort) {
+        if (this.running && this.sock >= 0) { return; }
+        if (this.activeAccepts > 0) {
+            throw new InvalidOperationException("Wait for StopAsync before restarting the listener.");
+        }
         nint s = this.host.IndexOf(":") >= 0
             ? Socket.CreateTcp6() : Socket.CreateTcp();
         if (s < 0) {
@@ -90,7 +65,7 @@ class TcpListener {
                 "socket() failed: " + Convert.ToString(Socket.LastSocketError()));
         }
         Socket.SetReuseAddr(s);
-        Socket.SetReusePort(s);
+        if (reusePort) { Socket.SetReusePort(s); }
         if (Socket.Bind(s, this.host, this.port) != 0) {
             int err = Socket.LastSocketError();
             Socket.Close(s);
@@ -110,78 +85,132 @@ class TcpListener {
             throw new SocketException(err,
                 "set nonblocking failed: " + Convert.ToString(err));
         }
+        this.acceptCancellation = new CancellationTokenSource();
         this.sock = s;
+        this.stopped = false;
         this.running = true;
     }
 
-    /// <summary>在 IO reactor 上挂起直到客户端连接，然后接受
-    /// 连接。接受的套接字被设为非阻塞，因此其上的异步 recv/send 也会
-    /// 在 reactor 上挂起。</summary>
-    async nint AcceptAsync() {
-        this.EnsureStarted();
-        nint client = await Socket.AcceptAsync(this.sock);
-        if (client >= 0) {
-            Socket.SetNonBlocking(client);
+    private nint BeginAccept() {
+        lock (this.sync) {
+            if (this.stopped) { return -1; }
+            if (!this.running) { this.StartOwned(false); }
+            if (this.sock < 0) { return -1; }
+            this.activeAccepts = this.activeAccepts + 1;
+            return this.sock;
         }
-        return client;
     }
 
-    /// <summary>在 IO reactor 上挂起直到客户端连接，返回已置为非阻塞的
-    /// <see cref="TcpClient"/> 实例。接受失败返回 null。</summary>
+    private void EndAccept() {
+        lock (this.sync) {
+            this.activeAccepts = this.activeAccepts - 1;
+            if (this.stopped && this.activeAccepts == 0) { this.FinishStopOwned(); }
+        }
+    }
+
+    private nint CompleteAccept(nint client, bool nonBlocking) {
+        if (client < 0) { return client; }
+        lock (this.sync) {
+            if (this.stopped || !this.running) {
+                Socket.Close(client);
+                return -1;
+            }
+            if (nonBlocking && Socket.SetNonBlocking(client) != 0) {
+                Socket.Close(client);
+                return -1;
+            }
+            return client;
+        }
+    }
+
+    /// <summary>等待并接受非阻塞客户端。取消/失败返回 -1。停止状态
+    /// 在启动操作前与 await 后均检查；accept 的取消定时器先结束，
+    /// 最后一个操作才关闭监听 fd，避免迟到通知误伤复用的描述符。</summary>
+    async nint AcceptAsync() {
+        nint listener = this.BeginAccept();
+        if (listener < 0) { return -1; }
+        try {
+            nint client = await Socket.AcceptAsync(listener, this.acceptCancellation.Token);
+            return this.CompleteAccept(client, true);
+        } finally {
+            this.EndAccept();
+        }
+    }
+
+    /// <summary>等待连接并返回非阻塞 TcpClient。取消/失败返回 null。</summary>
     async TcpClient AcceptTcpClientAsync() {
         nint client = await this.AcceptAsync();
         if (client < 0) { return null; }
         return TcpClient.FromSocket(client);
     }
 
-    /// <summary>同步接受客户端连接。</summary>
+    /// <summary>同步尝试接受连接；停止后返回 -1，不自动重开。</summary>
     nint Accept() {
-        this.EnsureStarted();
-        return Socket.Accept(this.sock);
-    }
-
-    /// <summary>接受连接前的自愈：构造器只记录 host:port，真正的
-    /// socket/bind/listen 在 <see cref="Start"/> 里执行。若调用方未显式 Start
-    /// 即调用 Accept，在此自动补上一次 Start（失败照常抛 SocketException）。</summary>
-    void EnsureStarted() {
-        if (this.running && this.sock >= 0) { return; }
-        this.Start();
-    }
-
-    /// <summary>停止监听器。Windows 上必须先对句柄做 CancelIoEx
-    /// 再关闭：closesocket 自己不会给挂起的 AcceptEx 投递完成包，
-    /// accept 里的协程会带着整条服务端对象链永远挂起（泄漏探测在
-    /// 退出时全部记为仍可达）。CancelIoEx 让挂起的 accept 立刻以
-    /// -1 复位——与 POSIX 侧 dead-fd sweep 的语义一致；recv 版的
-    /// 同样机制见 <see cref="Socket.ShutdownBoth"/> 的注释。</summary>
-    void Stop() {
-        this.running = false;
-        if (this.sock >= 0) {
-            #if WINDOWS
-            Socket.ShutdownBoth(this.sock);
-            #endif
-            Socket.Close(this.sock);
-            this.sock = -1;
+        nint listener = this.BeginAccept();
+        if (listener < 0) { return -1; }
+        try {
+            return this.CompleteAccept(Socket.Accept(listener), false);
+        } finally {
+            this.EndAccept();
         }
     }
 
-    /// <summary>返回监听器是否正在运行。</summary>
-    bool IsRunning() {
-        return this.running;
+    /// <summary>首次 Accept 前可自动启动；显式 Stop 后只允许显式
+    /// Start/StartReusePort 重启，避免停止与 accept 启动竞态重开端口。</summary>
+    void EnsureStarted() {
+        lock (this.sync) {
+            if (!this.stopped && !this.running) { this.StartOwned(false); }
+        }
     }
 
-    /// <summary>返回底层套接字句柄。</summary>
+    /// <summary>请求停止。取消令牌先置位，再通知 reactor；所有挂起
+    /// accept 结束前保留 fd。可取消的 accept 重复通知覆盖通知早于
+    /// 注册的竞态；POSIX 无需依赖监听套接字的 shutdown 行为。</summary>
+    void Stop() {
+        lock (this.sync) {
+            this.stopped = true;
+            this.running = false;
+            if (this.acceptCancellation != null) { this.acceptCancellation.Cancel(); }
+            if (this.sock >= 0) { Socket.CancelPendingIo(this.sock); }
+            if (this.activeAccepts == 0) { this.FinishStopOwned(); }
+        }
+    }
+
+    private void FinishStopOwned() {
+        if (this.sock >= 0) {
+            Socket.Close(this.sock);
+            this.sock = -1;
+        }
+        if (this.acceptCancellation != null) {
+            this.acceptCancellation.Dispose();
+            this.acceptCancellation = null;
+        }
+    }
+
+    private int PendingAccepts() {
+        lock (this.sync) { return this.activeAccepts; }
+    }
+
+    /// <summary>请求停止并等挂起的 accept 清理完成、fd 已释放。</summary>
+    async void StopAsync() {
+        this.Stop();
+        while (this.PendingAccepts() > 0) { await Task.Delay(1); }
+    }
+
+    /// <summary>返回监听器是否仍允许新 accept。</summary>
+    bool IsRunning() {
+        lock (this.sync) { return this.running; }
+    }
+
+    /// <summary>底层句柄；Stop 后排空期间仍分配，最后一个 accept
+    /// 结束后才变为 -1。调用方不要直接关闭监听器拥有的句柄。</summary>
     nint GetSocket() {
-        return this.sock;
+        lock (this.sync) { return this.sock; }
     }
 
     /// <summary>返回绑定的端口。</summary>
-    int GetPort() {
-        return this.port;
-    }
+    int GetPort() { return this.port; }
 
     /// <summary>返回绑定的主机。</summary>
-    string GetHost() {
-        return this.host;
-    }
+    string GetHost() { return this.host; }
 }

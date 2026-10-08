@@ -19,6 +19,7 @@ class Timer {
     ThreadStart callback;
     bool running;
     int tickCount;
+    int pendingTicks; // selected callbacks, including one already executing
     /// 下次触发时刻（单调毫秒）。
     long nextDue;   // 下次触发的时间（单调毫秒，ServerMetrics.MonoMillis()）
 
@@ -29,6 +30,7 @@ class Timer {
         this.callback = callback;
         this.running = false;
         this.tickCount = 0;
+        this.pendingTicks = 0;
         this.nextDue = 0;
     }
 
@@ -78,7 +80,24 @@ class Timer {
         Mutex.Unlock(Timer.lockHandle);
     }
 
-    /// <summary>自 Start（或上次 Reset）以来已完成的 tick 数。</summary>
+    /// <summary>停止并等待已选中的回调结束。最后一个定时器还会等待
+    /// 共享泵释放临时回调批次并退出，适合异步 finally/进程退出前使用。
+    /// 不在回调内同步等待自身；回调内可继续使用 Stop。不要在本次
+    /// StopAsync 完成前重启同一个定时器。</summary>
+    async void StopAsync() {
+        this.Stop();
+        while (!this.IsDrained()) { await Task.Delay(1); }
+    }
+
+    private bool IsDrained() {
+        Mutex.Lock(Timer.lockHandle);
+        bool done = this.pendingTicks == 0 &&
+            (Timer.timers.Count > 0 || !Timer.pumpRunning);
+        Mutex.Unlock(Timer.lockHandle);
+        return done;
+    }
+
+    /// <summary>自 Start（或上次 Reset）以来已选中的 tick 数。</summary>
     int TickCount() {
         return this.tickCount;
     }
@@ -93,39 +112,54 @@ class Timer {
         return this.running;
     }
 
-    // 共享泵线程：约每 10 毫秒遍历注册表，触发到期的定时器。
-    // 遍历采用倒序，这样回调中停止/移除某个定时器（自身或
-    // 其他的、当前索引处或之后的）都不会跳过条目。
-    /// 共享泵线程体：遍历注册表触发到期定时器；无定时器时退出。
-    static void Pump() {
-        while (true) {
-            Mutex.Lock(Timer.lockHandle);
-            if (Timer.timers.Count == 0) {
-                Timer.pumpRunning = false;
-                Mutex.Unlock(Timer.lockHandle);
-                break;
-            }
-            long now = Timer.Now();
-            List<Timer> due = new List<Timer>();
-            int i = Timer.timers.Count - 1;
-            while (i >= 0) {
-                Timer t = Timer.timers[i];
-                if (t.running && now >= t.nextDue) {
-                    t.nextDue = now + t.intervalMs;
-                    t.tickCount = t.tickCount + 1;
-                    due.Add(t);
-                }
-                i = i - 1;
-            }
+    /// 共享泵的一个同步批次。临时列表和回调引用在方法返回时释放，
+    /// 不留到 Sleep/空注册表退出路径，避免 Stop 后仍由后台线程保活。
+    private static bool PumpBatch() {
+        Mutex.Lock(Timer.lockHandle);
+        if (Timer.timers.Count == 0) {
+            // The previous batch has returned and released every managed local.
+            Timer.pumpRunning = false;
             Mutex.Unlock(Timer.lockHandle);
-            int j = due.Count - 1;
-            while (j >= 0) {
-                Timer t = due[j];
-                if (t.callback != null) { t.callback(); }
-                j = j - 1;
-            }
-            Thread.Sleep(10);
+            return false;
         }
+        long now = Timer.Now();
+        List<Timer> due = new List<Timer>();
+        int i = Timer.timers.Count - 1;
+        while (i >= 0) {
+            Timer t = Timer.timers[i];
+            if (t.running && now >= t.nextDue) {
+                t.nextDue = now + t.intervalMs;
+                t.tickCount = t.tickCount + 1;
+                t.pendingTicks = t.pendingTicks + 1;
+                due.Add(t);
+            }
+            i = i - 1;
+        }
+        Mutex.Unlock(Timer.lockHandle);
+        int j = due.Count - 1;
+        while (j >= 0) {
+            Timer t = due[j];
+            try {
+                if (t.callback != null) { t.callback(); }
+            } catch (Exception e) {
+                // Background boundary: a failed callback must not abandon the
+                // selected batch or leave every timer's drain permanently pending.
+                Console.WriteLine("Timer callback failed: " + e.Message);
+            } finally {
+                // Drop the batch reference before publishing its completion.
+                due.RemoveAt(j);
+                Mutex.Lock(Timer.lockHandle);
+                t.pendingTicks = t.pendingTicks - 1;
+                Mutex.Unlock(Timer.lockHandle);
+            }
+            j = j - 1;
+        }
+        return true;
+    }
+
+    /// 共享泵线程体：批次不跨 sleep；最后一个 StopAsync 等其退出。
+    static void Pump() {
+        while (Timer.PumpBatch()) { Thread.Sleep(10); }
     }
 
     /// 获取当前单调时间戳（毫秒）。使用根命名空间的 Stopwatch，避免引入多余依赖。

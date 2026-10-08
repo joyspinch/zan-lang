@@ -1,9 +1,10 @@
 # ZanDb
 
-嵌入式文档数据库：存储原生 Zan 值树（`JsonValue`：整数、浮点、布尔、
-字符串、嵌套对象、数组），无 ORM 映射、无 SQL 字符串。底层是专门为
-Zan 重写的 KV 内核 **ZanStore**——追加式日志 + 不可变有序段 +
-双槽清单，崩溃安全，内存有界。
+文档数据库与知识库存储：存储原生 Zan 值树（`JsonValue`：整数、浮点、布尔、
+字符串、嵌套对象、数组），提供中文分词、倒排 BM25、HNSW 向量与混合检索。
+可以嵌入一个进程，也可以由 `ZanDbServer` 持库、多个客户端进程访问。
+底层 KV 内核 **ZanStore** 使用原子批次 WAL、不可变有序段和双槽清单。
+块缓存和 memtable 有容量配置；常驻倒排表、近邻图与键索引随数据量增长。
 
 > 2026-09 全面重写。旧引擎（内存 B+Tree + CoW Pager + WAL，跨进程
 > 多写者）因并发性能与存储体积不可接受而被整体替换，无兼容层；
@@ -55,13 +56,92 @@ db.SetAutoMerge(6, 4);                        // 或自动挡：固化后段数�
 db.Close();
 ```
 
+## 中文知识库检索
+
+```zan
+using System;
+using System.Data.ZanDb;
+using System.Json;
+using System.Text;
+
+ZanDatabase db = ZanDatabase.Open("knowledge.zdb", ZanStore.DUR_SYNC);
+if (!db.IsOpen()) { throw new System.IO.IOException(db.GetError()); }
+Collection chunks = db.GetCollection("chunks");
+TextTokenizer tokenizer = new TextTokenizer();
+tokenizer.AddWord("领域术语");
+// tokenizer.LoadDictionary("dictionary.txt"); // UTF-8，一行一个词
+chunks.EnsureFullTextIndex("text", tokenizer);
+VectorIndexOptions options = new VectorIndexOptions(768);
+options.efConstruction = 160;
+options.efSearch = 256;
+chunks.EnsureVectorIndex("embedding", options);
+
+JsonValue chunk = JsonValue.NewObject();
+chunk.PutStr("text", "中文知识库支持全文与向量检索");
+chunk.PutStr("source", "manual");
+JsonValue embedding = JsonValue.NewArray();
+float[] coordinates = new float[768];          // 此例仅演示格式；实际由模型输出
+coordinates[0] = 1;
+for (int i = 0; i < coordinates.Length; i = i + 1) {
+    embedding.Append(JsonValue.NewDouble((double)coordinates[i]));
+}
+chunk.Put("embedding", embedding);
+int id = chunks.Insert(chunk);
+
+List<Bm25Hit> text = chunks.SearchText("text", "知识库", 10);
+List<VectorHit> vector = chunks.SearchVector("embedding", coordinates, 10, 256);
+List<VectorHit> exact = chunks.SearchVectorExact("embedding", coordinates, 10);
+List<HybridHit> mixed = chunks.SearchHybrid("text", "知识库", "embedding", coordinates, 10, 256);
+List<Bm25Hit> filtered = chunks.SearchTextFiltered("text", "知识库", 10, (int candidate) => {
+    JsonValue doc = chunks.FindById(candidate);
+    if (doc == null) { return false; }
+    JsonValue source = doc.Get("source");
+    return source != null && source.AsString("") == "manual";
+});
+chunks.CheckpointSearchIndexes();
+db.Close();
+```
+
+- 中文最长词典匹配，ASCII 大小写与全角 ASCII 归一化，支持四字节汉字。
+  未知词有单字及双字辅助召回；辅助分数权重为 0.2，不增加主词 BM25 文档长度。
+  基础词表为项目原创的小词表，随项目许可证分发；领域词典由调用方补充。
+- `Bm25Index` 维护词元 posting、文档反向词频、df 和总长度。查询只访问相关
+  posting，并用有界堆取 top-k；高频词仍可能覆盖全库。更新和删除会摘除旧 posting。
+  原有 `Search(string)` 返回 ID 的接口仍可用，同分按原始插入顺序排序。
+- HNSW 包含多层下降、候选/结果堆、邻居多样性裁剪和双向连接。向量保存为 float32；
+  `metric=0` 为余弦距离，`metric=1` 为平方欧氏距离，距离越小越近。同距按 ID 排序。
+  维度不匹配、非有限值、float32 溢出和余弦零向量在写入前拒绝。缺字段或 null 不入索引。
+- embedding 由调用方提供。同一个字段应使用相同模型和维度，查询向量也必须一致。
+  检索接口提供候选结果；分块、模型调用、提示词和生成回答由上层应用负责。
+- `SearchVectorFiltered` / `SearchVectorExactFiltered` 的 `VectorFilter(int id)`
+  在返回 top-k 前生效。HNSW 过滤只排除结果，不阻断图遍历；选择性很强时可增大 ef
+  或使用精确检索。`SearchHybridFiltered` 接受两通道过滤器，应给它们同一过滤条件。
+  混合检索每通道取 `4*k` 候选，以 `1/(60+rank)` 做 RRF，平局按 ID；这是一种候选融合。
+- 集合写入前消除顶层重复键，保留最后一个值，并在调用方对象中附加 `_id`。
+  类型验证、文档缓存、字段索引及检索输入均使用同一份规范化值，重开不会改变字段语义。
+- 正文、检索输入和 journal 在同一个 WAL 批次提交；索引只重放完整提交，回滚不污染图。
+  每个索引使用独立 revision，其他集合的写入不会触发无关重放。
+- 初建即保存词频和完整近邻图。检查点按不超过 256 行、约 4 MiB 一批写新代，最后原子发布
+  header；旧代和 journal 在发布后分批回收。重开加载已有图及词频，再重放尾部变更。
+  未发布新代不参与检索。正常构建失败会清理本次新代；崩溃或 I/O 故障留下的孤儿在下次成功维护时回收。
+  常驻句柄按检查点标识失效，其他句柄发布并清理 journal 后仍可加载完整新检查点。
+- `RebuildSearchIndexes()` 从正文重建全部检索索引，可以修复坏检查点并回收向量墓碑。
+  修改词典后重新调用 `EnsureFullTextIndex(field, tokenizer)`，配置指纹变化会新建一代。
+  缺失、损坏或格式不兼容的检查点明确报错，不能返回部分结果。
+- 检索和检索维护只能在显式事务之外调用。创建、重建、检查点包含多个内部提交，需由
+  持库线程独占执行。直接使用 `VectorIndex` 时查询可并行，Add/Remove/Rebuild/ExportState
+  需与所有查询排他；Collection 的读取也会更新缓存，应统一串行同步。
+- 常驻图和倒排表需要内存，快照导入/导出也会物化 JSON 状态。当前检查点格式优先保证
+  可恢复性；大库需测量内存峰值与文件体积，尚无 mmap 图或流式快照 API。
+
 ## 架构（ZanStore 内核）
 
 ```
-写：Put/Delete ──► memtable（有序字典，有界）
-                    │ 追加 CRC 帧
-                    ▼
-                 日志 <path>.log ── 分组提交 fsync
+写：Put/Delete ──► 事务 overlay ──► 完整 CRC 批次 ──► 依档位持久化
+                                                         │ 成功后发布
+                                                         ▼
+                                                      memtable
+                    日志 <path> ──► fsync / 分组同步
                     │ 日志达阈值（SetFlushThreshold，默认 64MB）
                     ▼
                  固化为不可变有序段 <path>.s<n>（稀疏索引 + 4KB 块）
@@ -71,7 +151,10 @@ db.Close();
 读：Get ──► memtable ──► 段（新→旧，块缓存加速）──► 命中/未命中
 ```
 
-* **日志**：追加写，每帧 CRC32 校验；恢复时从尾部截掉撕裂/损坏帧。
+* **日志**：每个非空最外层提交是一帧，CRC32 外层包裹版本、记录数和全部操作，
+  最大 payload 为 64 MiB。恢复先校验完整批次再整批应用，撕裂/CRC 错误尾部截掉；
+  CRC 正确但事务结构非法则拒绝开库。支持旧 op1/op2 帧读取，后续写 op3/v1；
+  新版本写过的库不能由旧版本打开（旧恢复器不识别新批次）。升级前应备份并统一持库版本。
 * **段**：不可变、按键有序、4KB 分块 + 稀疏偏移；点读二分定位块，
   块内顺序扫。段内**新键值直接覆盖旧键值**（写入时合并），读侧不会
   见到同段旧版本。
@@ -81,8 +164,8 @@ db.Close();
   约 430 B/块）。实测 64/128 档全表扫只快 5-15%，点读反而掉一半以上
   （块内线性走读平均半块，块大了直接多扫 3-7 倍字节）——16 是对
   点读友好的甜点，不调。
-* **块缓存**：FIFO + pin，容量有界（`SetCacheCap`，默认 32MB）；
-  memtable 同样有界，整体内存不随数据量增长。
+* **块缓存**：FIFO + pin，容量配置为 `SetCacheCap`（默认 32MB）。memtable
+  按日志阈值固化；键目录及检索图/倒排表仍随数据量增长，事务 overlay 受批次大小影响。
 * **墓碑**：删除先记入内存墓碑集，固化时以 `op=2` 记录写入新段
   （防止旧段版本在恢复时复活），归并时彻底丢弃。
 * **序号不变量**：`Open` 后 `seq` 从日志水位起算；固化推进水位，
@@ -92,7 +175,8 @@ db.Close();
 
 | 文件          | 内容                                       |
 |---------------|--------------------------------------------|
-| `<path>.log`  | 追加 CRC 帧日志（未固化写入）              |
+| `<path>`      | 追加 CRC 批次 WAL（未固化写入）             |
+| `<path>.lock` | 持库进程的稳定锁文件，开 WAL 之前取得       |
 | `<path>.s<n>` | 不可变有序段（n 从 1 递增）                |
 | `<path>.m0`   | 清单槽 A：段列表 + 日志水位（CRC）         |
 | `<path>.m1`   | 清单槽 B（与 A 交替写，防半写）            |
@@ -101,12 +185,17 @@ db.Close();
 
 | 档位                  | 语义                                                   |
 |-----------------------|--------------------------------------------------------|
-| `ZanStore.DUR_SYNC`   | 每次提交 fsync——最安全，最慢                          |
-| `ZanStore.DUR_GROUP`（默认） | 分组提交：`SetSyncEvery(n)` 攒 n 次提交一次 fsync，攒满 512KB 提前 |
-| `ZanStore.DUR_NONE`   | 只写 OS 缓冲（攒 1MB flush），进程崩溃不丢、断电可能丢 |
+| `ZanStore.DUR_SYNC`   | 每个提交刷新并同步 WAL，成功确认达到同步持久化边界；服务默认使用此档 |
+| `ZanStore.DUR_GROUP`（嵌入式默认） | 每次提交刷新到 OS，`SetSyncEvery(n)` 次或累积 512KB 同步；断电可丢最近未同步提交 |
+| `ZanStore.DUR_NONE`   | 先缓存在进程内，攒到 1MB 再刷新；进程崩溃和断电均可能丢最近提交 |
 
-任何档位下**干净关闭都不丢数据**（`Close` 会 flush 未落盘帧）；
-崩溃恢复由 CRC 帧 + 水位 + 双槽清单保证到最近一次落盘点。
+无 I/O 错误的正常关闭会同步尚未落盘的完整帧。`Commit()` 返回 bool，Collection
+写入失败抛 `IOException`，`GetError()` 保留错误。非空最外层事务令 `GetRevision()`
+增加一次，嵌套提交和空事务不增加；`Rollback()` 清掉整个事务并推进缓存 epoch。
+
+如果 I/O 失败发生在已写帧或已发布清单之后，失败请求可能已经提交；该库停止接受
+后续操作，需关闭、重开恢复后查询结果。服务使用相同 request ID 重试可查询持久化的
+结果，避免重复写入。不能把 false 或断线直接解释成“肯定没写”。
 
 ### 归并维护（全量与增量）
 
@@ -126,18 +215,86 @@ db.Close();
 mergeK+1` 才生效（阈值太低会每次固化都归并、得不偿失），默认关闭
 （0）：归并代价是否引入写路径应由使用方决定。
 
-### 单写者模型（与旧引擎的关键差异）
+### 多进程访问与持库范围
 
-ZanStore 是**单进程单写者**：`Open` 对日志文件加非阻塞独占锁，
-第二个写者打开同一库直接报错 `store is locked by another writer`
-（锁由 OS 持有，写者崩溃不残留）。同进程内多线程共用一个
-`ZanDatabase`（内部 `AsyncRwLock` 串行写、并发读）。
+一个 `ZanDbServer` 进程持有数据库，多个客户端进程通过 `ZanDbClient` 或
+长度前缀 JSON 协议访问。服务默认监听 loopback，访问令牌由配置提供。请求在同一个
+owner gate 内执行，包含读取、检索、写入和维护；网络等待在 gate 外。
+写 batch 仅允许 Insert/Upsert/Update/Delete，正文及请求 ID/fingerprint/结果
+同事务保存，相同 ID 的相同请求重试返回原结果，不同请求重用 ID 拒绝。
+请求 ID 记录当前没有自动保留期，应由使用方按数据量评估磁盘成本。
 
-旧引擎支持跨进程多写者，代价是每次提交都走文件锁串行 + 同步落盘，
-这是它并发性能不可接受的根源。需要多进程共享数据的场景请用外部
-队列/服务聚合写入。
+检索维护先分批构建并原子发布新代，成功后再保存去重结果；中途失败可以安全重试，
+它不属于 CRUD batch 的原子范围。服务不会让另一请求看到正在构建的代。
+配置、完整客户端例子和真实进程测试见 [服务使用说明](../../../../../../examples/db/zandb_service_README.md)。
 
-## 基准
+数据库文件继续只允许一个持有者。`Open` 先取得 `<path>.lock` 稳定锁，
+然后打开 WAL 并取得兼容旧版本的 WAL 锁，最后加载清单、段和恢复日志。
+第二个持有者立即拒绝；进程退出由 OS 释放锁，留下 `.lock` 文件不代表仍被锁住。
+不要删除仍在使用中的锁文件。路径应使用同一规范绝对路径；`Path.Normalize`
+只归一化分隔符，不统一硬链接、符号链接或文件别名，这些别名不在持库保证范围内。
+
+直接嵌入时调用者必须串行管理事务、Collection 缓存和索引维护。`AsyncRwLock`
+是显式协调工具，直接 CRUD 方法不会自动持有它；不能仅因对象含有锁就并发调用。
+现有异步 CRUD 包装在共享锁内串行执行，包括会维护 LRU 的 `FindByIdAsync`；异常和提前返回都会释放锁。
+同步方法、显式事务及检索维护仍需调用者在同一个排他边界中管理。
+旧的“多个进程直接并发写同一套文件”不适用于当前引擎。
+
+## 检索实测
+
+2026-10，Windows 10，固定种子有界数据集，单进程原生查询；这些是复现样本，
+不能直接推断实际知识库的吞吐。网络、embedding 和正文读取不计入独立索引查询时间。
+
+| 项目 | 数据/参数 | 实测 |
+|------|-----------|------|
+| 中文 BM25 构建 | 10,000 文档，`--publish` | 102.8 ms |
+| 中文 BM25 稀疏查询 | 50 次，top-5；每次 90 posting | 平均 19 µs |
+| 独立 BM25 全扫参照：稀疏查询 | 20 次；每次两遍扫描共 20,000 文档访问 | 平均 109.76 ms |
+| 中文 BM25 高频查询 | 1 次，10,000 posting | 3.515 ms |
+| 独立 BM25 全扫参照：高频查询 | 1 次，两遍扫描 | 12.346 ms |
+| HNSW 余弦构建 | 10,000 × 128，M=16，efConstruction=160 | 8.68 s |
+| HNSW 余弦查询 | efSearch=64，20 次 | recall@10=87.5%，平均 0.186 ms，472 次距离计算 |
+| HNSW 余弦查询 | efSearch=256，20 次 | recall@10=95.5%，平均 0.593 ms，1,399 次距离计算 |
+| 精确余弦参照 | 同样数据与查询 | 平均 3.842 ms，10,000 次距离计算 |
+| HNSW 平方 L2 查询 | efSearch=64，20 次 | recall@10=100%，平均 0.170 ms，424 次距离计算 |
+| 精确平方 L2 参照 | 同样数据与查询 | 平均 4.055 ms，10,000 次距离计算 |
+
+BM25 扫描参照预先分词并保存各文档词频，查询独立全扫计算 df 与分数，没有使用倒排结构；
+两个查询的 top-5 ID 和分数均对拍一致。这是本次独立朴素参照，不能视为旧版实现的实测加速比。
+高频词仍访问全部 posting，基准中的高频查询各测一次，数字对机器负载敏感。
+
+余弦 ef=256 在这个数据集达到 95% 目标；默认 ef=64 更快但召回较低。
+需用自己的 embedding、过滤比例和数据分布选择参数，精确接口可用于对拍。
+`zandb_vector` 用独立标量距离与全排序验证两种 metric，1,200 条混合分布数据上的
+初建/更新/删除/重建均通过 recall≥95% 检查。坐标先从 float32 扩宽，距离以 double 累加，
+以覆盖极大值和次正规数；当前未实现或测量显式 SIMD 距离内核，上表是此数值契约下的测量。
+
+持久化基准使用 2,000 文档 × 64 维、同步持久化、256 文档/插入批次，`--publish` 构建。
+全文与近邻图的构建时间包含初始检查点，加载时间包含首次查询：
+
+| 操作 | 实测 |
+|------|------|
+| 批量插入 | 316.3 ms |
+| 全文构建及初始检查点 | 170.3 ms |
+| 向量构建及初始检查点（efConstruction=160） | 3.456 s |
+| 热全文查询 100 次（高频“知识库”） | 共 159.4 ms，平均 1.594 ms |
+| 热向量查询 100 次（efSearch=256） | 共 32.7 ms，平均 0.327 ms |
+| 两种索引检查点 | 2.959 s |
+| 固化后重开存储 | 24.1 ms |
+| 全文检查点加载及查询 | 146.9 ms |
+| 图检查点加载及查询 | 119.4 ms |
+| 图加载、两条尾部变更重放及查询 | 110.3 ms |
+| 从正文重建两种索引及检查点 | 4.650 s |
+
+重开检索各返回 10 个结果。检查点与重建当前会物化完整 JSON 状态，维护开销明显高于热查询；
+这些数字用于选择维护时机，尚未包含大库内存峰值和网络端吞吐。
+
+复现：`examples/db/zandb_search_bench.zan`、`zandb_vector_bench.zan`（建议
+`--publish`）、`zandb_persistence_bench.zan`（含初建检查点、重开加载和尾部重放）。
+产物应写入 `_scratch/`。向量基准的 `ZAN_VECTOR_BENCH_N/DIMS/QUERIES/METRIC/EF`
+环境变量选择规模和参数；持久化基准默认 2,000 × 64。
+
+## 既有 CRUD 基准
 
 **与内嵌 SQLite 同负载对拍**（Release 构建，Windows 10，NVMe SSD，
 2026-09；20000 文档：name/age/cat/bio 四字段、bio 为 80 字符文本，
@@ -184,7 +341,7 @@ ZanStore 是**单进程单写者**：`Open` 对日志文件加非阻塞独占锁
   `Begin`/`Commit` 批量（设计主路径，每批一次落盘）。
 * 批量写入/扫描的结构优化已内建：自增 id 的 seq 键缓存在内存
   （单写者下安全，Upsert 推进序列时同步缓存，崩溃重开作废重读）；
-  事务内同一键写 N 次只在提交时落最终值一帧（日志写放大不随批次内
+  事务内同一键写 N 次只在整批提交帧中记录一次最终值（日志写放大不随批次内
   重复写增长）；编码在记录不含 0x00/0xFF 时免转义直通（文本型文档
   几乎总命中）；解码走**字符串零拷贝直读**（不经 ByteBuffer，VarInt
   与字段在原串上按显式位置读取，memchr 判转义，含 0xFF 的罕见记录才
@@ -236,10 +393,21 @@ CoW B+Tree + WAL 对同等负载体积大数倍（页开销 + 写放大碎片 + 
 
 ## 测试
 
-`tests/conformance/`（确定性输出 + `--check-leaks` 通过）：
+`tests/conformance/` 使用确定性输出金标。本轮已逐项编译运行原子提交 56 项、集合检索 68 项、
+异步异常 29 项、向量 35 项及 PASS、服务 32 行金标，并运行中文分词/BM25/UTF-8 与受影响的既有存储用例。
+编译器 lock 非空保护的 10 个定向正负用例也通过。真实多进程测试位于
+`tests/integration/zandb_service_test.py`，实际执行结果见[服务使用说明](../../../../../../examples/db/zandb_service_README.md)。本轮未运行整档测试。
 
 | 用例                 | 覆盖                                                       |
 |----------------------|------------------------------------------------------------|
+| `zandb_atomic`       | 完整/撕裂/非法批次、嵌套版本、回滚 epoch、I/O 失败、双槽清单损坏及发布失败 |
+| `zandb_search`       | 中文/向量/混合/过滤、事务回滚、分批代发布、失败代清理、重复键、跨句柄检查点失效和重建 |
+| `zandb_vector`       | 独立精确距离参照、两种 metric、HNSW 召回、更新/删除/重建、图快照及 float32 边界 |
+| `zandb_async_errors` | 异步 CRUD 验证/回调异常及提前返回后锁释放 |
+| `zandb_service`      | 请求验证、CRUD/batch 去重、错误返回、检索过滤与维护 |
+| `text_tokenizer_zh` / `bm25_postings` | 中文/全角/混排/未知词、词典配置、倒排分数独立对拍与增删 |
+| `encoding_utf8_scalar` | UTF-8 代理区、超出 Unicode 标量范围的非法输入 |
+| `null_guard_lock`   | 编译器对 lock 内外非空保护的正例及六种非法访问负例 |
 | `zandb_store_flush`  | 阈值固化、memtable 清空、重开恢复、水位跳帧、撕裂尾         |
 | `zandb_scan`         | 归并扫描跨段/内存源、范围含端点、前缀扫描                   |
 | `zandb_docs`         | 文档层 CRUD、索引、重开、归并后墓碑不复活                   |
@@ -251,4 +419,6 @@ CoW B+Tree + WAL 对同等负载体积大数倍（页开销 + 写放大碎片 + 
 | `zandb_kernel`       | 块级聚合内核：单段稳态下 Sum/Min/Max/Avg/Count 与删除（固化墓碑）、未固化墓碑回退、0xFF 转义记录回退、文本数值字段回退、多段权威路径对拍、重开、索引覆盖 CountGroups 一致性 |
 | `zandb_fuzz`         | 300 步随机操作对拍内存参照模型（固定种子 LCG），跨持久化档重开 |
 | `zandb_lock`         | 单写锁：第二打开者被拒、关闭后可重开                        |
+| `tcp_listener_cancel` | 监听器取消：空闲 accept 停止、描述符保留与复用竞态、停止后不隐式重开、显式重启 |
+| `timer_stop_drain`   | 定时器排空：冷停/重复停、周期回调、回调内自停与重启、`StopAsync` 排空后无泄漏退出 |
 | `arr_lit_rc`         | （编译器）数组字面量元素 ARC retain——本引擎开发中发现的编译器缺陷 |
