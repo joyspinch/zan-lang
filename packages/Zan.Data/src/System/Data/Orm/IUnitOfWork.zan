@@ -1,0 +1,108 @@
+using System;
+using System.Data;
+
+namespace System.Data.Orm;
+
+/// <summary>
+/// FreeSql 工作单元契约：管理事务生命周期与专用连接，
+/// 自身实现 IDbExecutor，可在工作单元上直接执行 CRUD 或绑定仓储。
+/// </summary>
+interface IUnitOfWork : IDbExecutor, IDisposable {
+    /// <summary>获取工作单元持有的底层连接。</summary>
+    IDbConnection GetConnection();
+    /// <summary>提交事务。</summary>
+    void Commit();
+    /// <summary>回滚事务。</summary>
+    void Rollback();
+    /// <summary>异步提交事务。</summary>
+    async bool CommitAsync();
+    /// <summary>异步回滚事务。</summary>
+    async bool RollbackAsync();
+    /// <summary>释放连接并回滚未提交的事务。</summary>
+    void Dispose();
+}
+
+/// <summary>
+/// 工作单元默认实现。
+/// </summary>
+class UnitOfWork : IUnitOfWork {
+    IDbConnection conn;
+    bool committed;
+    bool rolledBack;
+    bool closeOnDispose;
+
+    UnitOfWork(IDbConnection conn, bool closeOnDispose) {
+        this.conn = conn;
+        this.committed = false;
+        this.rolledBack = false;
+        this.closeOnDispose = closeOnDispose;
+        if (this.conn != null) {
+            this.conn.BeginTransaction();
+        }
+    }
+
+    static UnitOfWork Create(IDbConnection conn, bool closeOnDispose) {
+        return new UnitOfWork(conn, closeOnDispose);
+    }
+
+    IDbConnection GetConnection() {
+        return this.conn;
+    }
+
+    void Commit() {
+        if (!this.committed && !this.rolledBack && this.conn != null) {
+            this.conn.Commit();
+            this.committed = true;
+        }
+    }
+
+    void Rollback() {
+        if (!this.committed && !this.rolledBack && this.conn != null) {
+            this.conn.Rollback();
+            this.rolledBack = true;
+        }
+    }
+
+    async bool CommitAsync() {
+        if (!this.committed && !this.rolledBack && this.conn != null) {
+            bool ok = await this.conn.CommitAsync();
+            this.committed = true;
+            return ok;
+        }
+        return false;
+    }
+
+    async bool RollbackAsync() {
+        if (!this.committed && !this.rolledBack && this.conn != null) {
+            bool ok = await this.conn.RollbackAsync();
+            this.rolledBack = true;
+            return ok;
+        }
+        return false;
+    }
+
+    void Dispose() {
+        if (!this.committed && !this.rolledBack) {
+            this.Rollback();
+        }
+        if (this.closeOnDispose && this.conn != null) {
+            this.conn.Close();
+        }
+    }
+
+    // IDbExecutor 实现
+    DbResult Query(string sql, DbParams prms) { return this.conn.Query(sql, prms); }
+    int Execute(string sql, DbParams prms) { return this.conn.Execute(sql, prms); }
+    DbResult Query(string sql) { return this.conn.Query(sql); }
+    int Execute(string sql) { return this.conn.Execute(sql); }
+    string ExecuteScalar(string sql) { return this.conn.ExecuteScalar(sql); }
+    string ExecuteScalar(string sql, DbParams prms) { return this.conn.ExecuteScalar(sql, prms); }
+    int GetProvider() { return this.conn.GetProvider(); }
+
+    async DbResult QueryAsync(string sql, DbParams prms) { return await this.conn.QueryAsync(sql, prms); }
+    async int ExecuteAsync(string sql, DbParams prms) { return await this.conn.ExecuteAsync(sql, prms); }
+    async DbResult QueryAsync(string sql) { return await this.conn.QueryAsync(sql); }
+    async int ExecuteAsync(string sql) { return await this.conn.ExecuteAsync(sql); }
+    async string ExecuteScalarAsync(string sql) { return await this.conn.ExecuteScalarAsync(sql); }
+    async string ExecuteScalarAsync(string sql, DbParams prms) { return await this.conn.ExecuteScalarAsync(sql, prms); }
+}

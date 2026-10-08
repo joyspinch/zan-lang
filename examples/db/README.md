@@ -21,7 +21,7 @@ build/zanc.exe examples/db/sqlite_crud.zan --auto-stdlib -o sqlite_crud.exe
 | `zandb_documents.zan` | ZanDb（内置嵌入式文档库） | JsonValue 文档 CRUD、原子批量、二级索引、LINQ 风格查询（lambda/排序/分页）、原子读改写 |
 | `zandb_bench.zan` | ZanDb（内置嵌入式文档库） | 引擎基准：批量/自动提交插入、主键点读、全表扫描、索引构建与点查、重开恢复、归并前后磁盘占用（参考值见 `stdlib/System/Data/ZanDb/README.md`） |
 | `zandb_vs_sqlite.zan` | ZanDb vs SQLite | 同负载对拍：同 22000 文档、同索引、同批量节奏，吞吐与磁盘占用逐项对照（结论表见 `stdlib/System/Data/ZanDb/README.md`） |
-| `orm_model.zan` | ORM 模型层（FreeSQL 风格） | 模型定义、建表、链式增删改查、分页、事务、Migration 迁移、FromTable 反向映射 + 代码生成 |
+| `orm_model.zan` | ORM 强类型实战（FreeSql 规范） | IFreeSql 统一门面、CodeFirst 实体与建表、BaseRepository 泛型仓储、链式查询/更新、WhereIf、IUnitOfWork 工作单元事务 |
 | `orm_querybuilder.zan` | ORM SQL 构建层 | 参数化 CRUD、全部条件族、Join、聚合、分页方言、注入安全 |
 
 ## 连接类型与 ORM 的关系

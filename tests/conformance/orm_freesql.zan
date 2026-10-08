@@ -1,5 +1,6 @@
-// FreeSql-style ORM surface: CodeFirst SyncStructure, chained
-// Insert/Update/Delete and the lambda Select chain, all over SQLite.
+// FreeSql-style ORM surface: FreeSqlBuilder, CodeFirst SyncStructure,
+// chained Insert/Update/Delete, lambda Select chain, BaseRepository,
+// and IUnitOfWork transaction, all over SQLite.
 using System;
 using System.Data;
 using System.Data.Orm;
@@ -24,81 +25,113 @@ class Blog {
         b.online = online;
         return b;
     }
+
+    int Id() { return this.id; }
+    string Title() { return this.title; }
+    int Clicks() { return this.clicks; }
+}
+
+class BlogRepository : BaseRepository<Blog> {
+    BlogRepository(IFreeSql fsql) : base(fsql) {}
+
+    Blog ById(int id) {
+        return this.GetExecutor().Select<Blog>().Where(a => a.id == id).ToOne();
+    }
 }
 
 class Program {
     static void Main() {
         string path = "orm_freesql.tmp.db";
         File.Delete(path);
-        SqliteConnection db = SqliteConnection.Open(path);
 
-        // 1. CodeFirst: create the table from the entity, idempotently
-        db.SyncStructure<Blog>();
-        db.SyncStructure<Blog>();
+        // 1. FreeSqlBuilder creates IFreeSql facade
+        IFreeSql fsql = new FreeSqlBuilder()
+            .UseConnectionString(DbProvider.SQLite, path)
+            .Build();
 
-        // 2. Insert one row, identity primary key comes back
-        int id = db.Insert<Blog>(Blog.Of("hello", 3, 1.5, true)).ExecuteIdentity();
+        // 2. CodeFirst: create the table from the entity, idempotently
+        fsql.CodeFirst().SyncStructure<Blog>();
+        fsql.CodeFirst().SyncStructure<Blog>();
+
+        // 3. Insert one row, identity primary key comes back
+        int id = fsql.Insert<Blog>(Blog.Of("hello", 3, 1.5, true)).ExecuteIdentity();
         Console.WriteLine("id: " + Convert.ToString(id));
 
-        // 3. Batch insert (collection initializer, one statement)
+        // 4. Batch insert (collection initializer, one statement)
         List<Blog> more = new List<Blog> {
             Blog.Of("zan orm", 10, 2.0, true),
             Blog.Of("freesql style", 40, 3.5, false),
             Blog.Of("draft", 1, 0.5, false)
         };
-        Console.WriteLine("ins: " + Convert.ToString(db.Insert<Blog>(more).ExecuteAffrows()));
+        Console.WriteLine("ins: " + Convert.ToString(fsql.Insert<Blog>(more).ExecuteAffrows()));
 
-        // 4. Chained update: assignment + increment, lambda condition
-        int up = db.Update<Blog>()
+        // 5. Chained update: assignment + increment, lambda condition
+        int up = fsql.Update<Blog>()
             .Set(a => a.title, "hello zan")
             .SetIncr(a => a.clicks, 5)
             .Where(a => a.id == id)
             .ExecuteAffrows();
         Console.WriteLine("up: " + Convert.ToString(up));
 
-        // 5. Select chain
-        List<Blog> hot = db.Select<Blog>()
+        // 6. Select chain
+        List<Blog> hot = fsql.Select<Blog>()
             .Where(a => a.clicks >= 8)
             .OrderByDescending(a => a.clicks)
             .ToList();
         Console.WriteLine("hot: " + Convert.ToString(hot.Count) + " " + hot[0].title);
 
-        Blog one = db.Select<Blog>().Where(a => a.id == id).ToOne();
+        Blog one = fsql.Select<Blog>().Where(a => a.id == id).ToOne();
         Console.WriteLine("one: " + one.title + " clicks=" + Convert.ToString(one.clicks)
             + " online=" + Convert.ToString(one.online));
 
-        // 6. Aggregates
-        Console.WriteLine("sum: " + Convert.ToString(db.Select<Blog>().Sum(a => a.clicks)));
-        Console.WriteLine("max: " + Convert.ToString(db.Select<Blog>().Max(a => a.clicks)));
-        Console.WriteLine("avg: " + Convert.ToString(db.Select<Blog>().Avg(a => a.score)));
-        Console.WriteLine("any: " + Convert.ToString(db.Select<Blog>().Where(a => a.online).Any()));
+        // 7. Aggregates
+        Console.WriteLine("sum: " + Convert.ToString(fsql.Select<Blog>().Sum(a => a.clicks)));
+        Console.WriteLine("max: " + Convert.ToString(fsql.Select<Blog>().Max(a => a.clicks)));
+        Console.WriteLine("avg: " + Convert.ToString(fsql.Select<Blog>().Avg(a => a.score)));
+        Console.WriteLine("any: " + Convert.ToString(fsql.Select<Blog>().Where(a => a.online).Any()));
 
-        // 7. Paging
-        List<Blog> page = db.Select<Blog>().OrderBy(a => a.id).Page(2, 2).ToList();
+        // 8. Paging
+        List<Blog> page = fsql.Select<Blog>().OrderBy(a => a.id).Page(2, 2).ToList();
         Console.WriteLine("page: " + Convert.ToString(page.Count) + " " + page[0].title);
 
-        // 8. WhereIf: the filter (and its parameters) apply only when the
+        // 9. WhereIf: the filter (and its parameters) apply only when the
         //    condition holds, so optional search boxes need no SQL strings
         string kw = "free";
         bool useKw = true;
         bool useDraft = false;
-        List<Blog> found = db.Select<Blog>()
+        List<Blog> found = fsql.Select<Blog>()
             .WhereIf(useDraft, a => a.title == "draft")
             .WhereIf(useKw, a => a.title.StartsWith(kw))
             .ToList();
         Console.WriteLine("found: " + Convert.ToString(found.Count) + " " + found[0].title);
 
-        // 9. SetSource updates every non-key column from an entity
+        // 10. SetSource updates every non-key column from an entity
         one.score = 9.5;
         one.online = false;
-        Console.WriteLine("src: " + Convert.ToString(db.Update<Blog>().SetSource(one).ExecuteAffrows()));
-        Console.WriteLine("score: " + Convert.ToString(db.Select<Blog>().Where(a => a.id == id).ToOne().score));
+        Console.WriteLine("src: " + Convert.ToString(fsql.Update<Blog>().SetSource(one).ExecuteAffrows()));
+        Console.WriteLine("score: " + Convert.ToString(fsql.Select<Blog>().Where(a => a.id == id).ToOne().score));
 
-        // 10. Delete
-        Console.WriteLine("del: " + Convert.ToString(db.Delete<Blog>().Where(a => a.clicks < 5).ExecuteAffrows()));
-        Console.WriteLine("left: " + Convert.ToString(db.Select<Blog>().Count()));
+        // 11. Delete
+        Console.WriteLine("del: " + Convert.ToString(fsql.Delete<Blog>().Where(a => a.clicks < 5).ExecuteAffrows()));
+        Console.WriteLine("left: " + Convert.ToString(fsql.Select<Blog>().Count()));
 
-        db.Close();
+        // 12. BaseRepository test
+        BlogRepository repo = new BlogRepository(fsql);
+        int repoId = repo.InsertIdentity(Blog.Of("repo blog", 99, 4.8, true));
+        Console.WriteLine("repo-ins: " + Convert.ToString(repoId));
+        Console.WriteLine("repo-get: " + repo.ById(repoId).Title());
+        Console.WriteLine("repo-count: " + Convert.ToString(repo.Count()));
+
+        // 13. IUnitOfWork transaction test
+        using (IUnitOfWork uow = fsql.CreateUnitOfWork()) {
+            repo.Attach(uow);
+            repo.Insert(Blog.Of("tx blog", 15, 3.0, true));
+            uow.Commit();
+        }
+        repo.Detach();
+        Console.WriteLine("uow-count: " + Convert.ToString(repo.Count()));
+
+        fsql.Dispose();
         File.Delete(path);
     }
 }

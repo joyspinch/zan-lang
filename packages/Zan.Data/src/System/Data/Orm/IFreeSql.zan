@@ -1,0 +1,280 @@
+using System;
+using System.Data;
+
+namespace System.Data.Orm;
+
+/// <summary>
+/// FreeSql 核心门面契约。
+/// 继承自 IDbExecutor，天然支持编译期降级的链式操作：
+/// fsql.Select<T>() / fsql.Insert<T>() / fsql.Update<T>() / fsql.Delete<T>()
+/// 以及 CodeFirst 表结构同步、工作单元事务、通用仓储和 AOP 审计。
+/// </summary>
+interface IFreeSql : IDbExecutor, IDisposable {
+    /// <summary>CodeFirst 结构同步模块。</summary>
+    ICodeFirst CodeFirst();
+
+    /// <summary>AOP 拦截模块。</summary>
+    IAop Aop();
+
+    /// <summary>创建独立的工作单元与事务。</summary>
+    IUnitOfWork CreateUnitOfWork();
+
+    /// <summary>借出或打开一个底层数据库连接。</summary>
+    IDbConnection OpenConnection();
+
+    /// <summary>释放 FreeSql 占用的连接或池资源。</summary>
+    void Dispose();
+}
+
+/// <summary>
+/// FreeSql 统一门面实现：直接管理单连接或连接池，
+/// 统管 CodeFirst、AOP 审计拦截、工作单元及全套 CRUD 链。
+/// </summary>
+class FreeSql : IFreeSql {
+    IDbConnection conn;
+    DbPool pool;
+    CodeFirst codeFirst;
+    AopProvider aop;
+
+    FreeSql(IDbConnection conn) {
+        this.conn = conn;
+        this.pool = null;
+        this.codeFirst = new CodeFirst(this);
+        this.aop = new AopProvider();
+    }
+
+    FreeSql(DbPool pool) {
+        this.conn = null;
+        this.pool = pool;
+        this.codeFirst = new CodeFirst(this);
+        this.aop = new AopProvider();
+    }
+
+    static IFreeSql FromConnection(IDbConnection conn) {
+        return new FreeSql(conn);
+    }
+
+    static IFreeSql FromPool(DbPool pool) {
+        return new FreeSql(pool);
+    }
+
+    ICodeFirst CodeFirst() { return this.codeFirst; }
+    IAop Aop() { return this.aop; }
+
+    /// <summary>属性风格访问 CodeFirst。</summary>
+    CodeFirst CodeFirstProperty { get { return this.codeFirst; } }
+
+    /// <summary>创建独立的工作单元与事务。</summary>
+    IUnitOfWork CreateUnitOfWork() {
+        if (this.pool != null) {
+            IDbConnection c = this.pool.TryAcquire();
+            if (c == null) {
+                throw new Exception("FreeSql.CreateUnitOfWork: no idle connection in pool");
+            }
+            return UnitOfWork.Create(c, false);
+        }
+        return UnitOfWork.Create(this.conn, false);
+    }
+
+    IDbConnection OpenConnection() {
+        if (this.conn != null) { return this.conn; }
+        if (this.pool != null) { return this.pool.TryAcquire(); }
+        return null;
+    }
+
+    /// <summary>供实体访问器与控制器重写的桥接方法。</summary>
+    IDbConnection __Conn() {
+        return this.OpenConnection();
+    }
+
+    int GetProvider() {
+        if (this.conn != null) { return this.conn.GetProvider(); }
+        if (this.pool != null) { return this.pool.GetProvider(); }
+        return 0;
+    }
+
+    DbResult Query(string sql, DbParams prms) {
+        DbParams ps = prms != null ? prms : new DbParams();
+        if (this.conn != null) { return this.conn.Query(sql, ps); }
+        if (this.pool != null) {
+            IDbConnection c = this.pool.TryAcquire();
+            if (c == null) { throw new Exception("FreeSql: db pool exhausted"); }
+            try {
+                return c.Query(sql, ps);
+            } finally {
+                this.pool.Release(c);
+            }
+        }
+        throw new Exception("FreeSql: no connection or pool configured");
+    }
+
+    int Execute(string sql, DbParams prms) {
+        DbParams ps = prms != null ? prms : new DbParams();
+        if (this.conn != null) { return this.conn.Execute(sql, ps); }
+        if (this.pool != null) {
+            IDbConnection c = this.pool.TryAcquire();
+            if (c == null) { throw new Exception("FreeSql: db pool exhausted"); }
+            try {
+                return c.Execute(sql, ps);
+            } finally {
+                this.pool.Release(c);
+            }
+        }
+        throw new Exception("FreeSql: no connection or pool configured");
+    }
+
+    DbResult Query(string sql) {
+        if (this.conn != null) { return this.conn.Query(sql); }
+        if (this.pool != null) {
+            IDbConnection c = this.pool.TryAcquire();
+            if (c == null) { throw new Exception("FreeSql: db pool exhausted"); }
+            try {
+                return c.Query(sql);
+            } finally {
+                this.pool.Release(c);
+            }
+        }
+        throw new Exception("FreeSql: no connection or pool configured");
+    }
+
+    int Execute(string sql) {
+        if (this.conn != null) { return this.conn.Execute(sql); }
+        if (this.pool != null) {
+            IDbConnection c = this.pool.TryAcquire();
+            if (c == null) { throw new Exception("FreeSql: db pool exhausted"); }
+            try {
+                return c.Execute(sql);
+            } finally {
+                this.pool.Release(c);
+            }
+        }
+        throw new Exception("FreeSql: no connection or pool configured");
+    }
+
+    string ExecuteScalar(string sql) {
+        if (this.conn != null) { return this.conn.ExecuteScalar(sql); }
+        if (this.pool != null) {
+            IDbConnection c = this.pool.TryAcquire();
+            if (c == null) { throw new Exception("FreeSql: db pool exhausted"); }
+            try {
+                return c.ExecuteScalar(sql);
+            } finally {
+                this.pool.Release(c);
+            }
+        }
+        throw new Exception("FreeSql: no connection or pool configured");
+    }
+
+    string ExecuteScalar(string sql, DbParams prms) {
+        DbParams ps = prms != null ? prms : new DbParams();
+        if (this.conn != null) { return this.conn.ExecuteScalar(sql, ps); }
+        if (this.pool != null) {
+            IDbConnection c = this.pool.TryAcquire();
+            if (c == null) { throw new Exception("FreeSql: db pool exhausted"); }
+            try {
+                return c.ExecuteScalar(sql, ps);
+            } finally {
+                this.pool.Release(c);
+            }
+        }
+        throw new Exception("FreeSql: no connection or pool configured");
+    }
+
+    async DbResult QueryAsync(string sql, DbParams prms) {
+        DbParams ps = prms != null ? prms : new DbParams();
+        if (this.conn != null) { return await this.conn.QueryAsync(sql, ps); }
+        if (this.pool != null) {
+            IDbConnection c = await this.pool.AcquireAsync();
+            if (c == null) { throw new Exception("FreeSql: db pool exhausted"); }
+            try {
+                return await c.QueryAsync(sql, ps);
+            } finally {
+                this.pool.Release(c);
+            }
+        }
+        throw new Exception("FreeSql: no connection or pool configured");
+    }
+
+    async int ExecuteAsync(string sql, DbParams prms) {
+        DbParams ps = prms != null ? prms : new DbParams();
+        if (this.conn != null) { return await this.conn.ExecuteAsync(sql, ps); }
+        if (this.pool != null) {
+            IDbConnection c = await this.pool.AcquireAsync();
+            if (c == null) { throw new Exception("FreeSql: db pool exhausted"); }
+            try {
+                return await c.ExecuteAsync(sql, ps);
+            } finally {
+                this.pool.Release(c);
+            }
+        }
+        throw new Exception("FreeSql: no connection or pool configured");
+    }
+
+    async DbResult QueryAsync(string sql) {
+        if (this.conn != null) { return await this.conn.QueryAsync(sql); }
+        if (this.pool != null) {
+            IDbConnection c = await this.pool.AcquireAsync();
+            if (c == null) { throw new Exception("FreeSql: db pool exhausted"); }
+            try {
+                return await c.QueryAsync(sql);
+            } finally {
+                this.pool.Release(c);
+            }
+        }
+        throw new Exception("FreeSql: no connection or pool configured");
+    }
+
+    async int ExecuteAsync(string sql) {
+        if (this.conn != null) { return await this.conn.ExecuteAsync(sql); }
+        if (this.pool != null) {
+            IDbConnection c = await this.pool.AcquireAsync();
+            if (c == null) { throw new Exception("FreeSql: db pool exhausted"); }
+            try {
+                return await c.ExecuteAsync(sql);
+            } finally {
+                this.pool.Release(c);
+            }
+        }
+        throw new Exception("FreeSql: no connection or pool configured");
+    }
+
+    async string ExecuteScalarAsync(string sql) {
+        if (this.conn != null) { return await this.conn.ExecuteScalarAsync(sql); }
+        if (this.pool != null) {
+            IDbConnection c = await this.pool.AcquireAsync();
+            if (c == null) { throw new Exception("FreeSql: db pool exhausted"); }
+            try {
+                return await c.ExecuteScalarAsync(sql);
+            } finally {
+                this.pool.Release(c);
+            }
+        }
+        throw new Exception("FreeSql: no connection or pool configured");
+    }
+
+    async string ExecuteScalarAsync(string sql, DbParams prms) {
+        DbParams ps = prms != null ? prms : new DbParams();
+        if (this.conn != null) { return await this.conn.ExecuteScalarAsync(sql, ps); }
+        if (this.pool != null) {
+            IDbConnection c = await this.pool.AcquireAsync();
+            if (c == null) { throw new Exception("FreeSql: db pool exhausted"); }
+            try {
+                return await c.ExecuteScalarAsync(sql, ps);
+            } finally {
+                this.pool.Release(c);
+            }
+        }
+        throw new Exception("FreeSql: no connection or pool configured");
+    }
+
+    void Dispose() {
+        if (this.conn != null) {
+            this.conn.Dispose();
+            this.conn = null;
+        }
+        if (this.pool != null) {
+            this.pool.Close();
+            this.pool = null;
+        }
+    }
+}
