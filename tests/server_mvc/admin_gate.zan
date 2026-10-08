@@ -1,0 +1,87 @@
+// 管理区守门：/admin 与 /api/admin 前缀除登录三件套外一律强制登录。
+// 两层保证缺一不可——
+//   编译期：GenRoute 给 Index 别名路由发射与主路由相同的授权链
+//           （此前 /xxx/index 别名不带 .Login()/.Auth()，是匿名旁路）；
+//   运行期：Boot.AdminGate 在路由注册后强制抬回（防显式 None 手滑）。
+// Compile with explicit packages/Zan.Mvc/src/**/*.zan sources and --auto-stdlib.
+using System;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Web;
+
+class Program {
+    static int failures;
+    static void Check(bool ok, string label) {
+        if (!ok) { Program.failures = Program.failures + 1;
+            Console.WriteLine("FAIL " + label); }
+    }
+
+    static async void Main() {
+        WebApp app = new WebApp("127.0.0.1", 0);
+        __AttrRoutes.Register(app);
+        List<Route> all = app.router.All();
+
+        /* 编译期默认即应全绿：守门运行前统计匿名管理区端点，必须只剩
+           登录三件套；Boot.AdminGate 的返回值（被纠正数）必须为 0——
+           非 0 说明有控制器显式声明了匿名，编译期约定已被绕过。 */
+        int adminCount = 0;
+        int preAnonymous = 0;
+        int trio = 0;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            Route r = all[i];
+            if (!Boot.AdminPath(r.pattern)) { continue; }
+            adminCount = adminCount + 1;
+            bool exempt = r.pattern == Routes.Login
+                || r.pattern == Routes.LoginSubmit
+                || r.pattern == Routes.Logout;
+            if (exempt) {
+                trio = trio + 1;
+                if (!r.needsLogin) { continue; }
+                Program.Check(false, "login trio must stay anonymous: "
+                    + r.pattern);
+                continue;
+            }
+            if (!r.needsLogin) { preAnonymous = preAnonymous + 1; }
+        }
+        int raised = Boot.AdminGate(app);
+        Program.Check(adminCount > 60, "admin route table is populated");
+        Program.Check(trio == 3, "exactly the login trio is exempt");
+        Program.Check(preAnonymous == 0,
+            "compiler fail-closed covers every admin endpoint (aliases too)");
+        Program.Check(raised == 0, "admin gate has nothing to correct");
+
+        /* 编译期别名同权回归锚：主路由 Grant 则别名同 Grant，不得再是
+           授权旁路。 */
+        bool aliasGrant = false;
+        bool rootServed = false;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            Route r = all[i];
+            if (r.pattern == "/admin/dev/coder/index" && r.needsAuth) {
+                aliasGrant = true;
+            }
+            if (r.pattern == "/admin" && r.needsLogin && r.inMenu) {
+                rootServed = true;
+            }
+        }
+        Program.Check(aliasGrant,
+            "index alias carries the primary's grant, not an auth bypass");
+        Program.Check(rootServed,
+            "/admin root is served by the dashboard and menu-visible");
+
+        /* 守门不得越界：Account 区公开流与健康检查保持匿名。 */
+        bool loginTouched = false;
+        bool healthTouched = false;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            Route r = all[i];
+            if (r.pattern == "/login" && r.needsLogin) { loginTouched = true; }
+            if (r.pattern == "/health" && r.needsLogin) { healthTouched = true; }
+        }
+        Program.Check(!loginTouched, "account-area login stays anonymous");
+        Program.Check(!healthTouched, "health probe stays anonymous");
+
+        Console.WriteLine("admin routes=" + Convert.ToString(adminCount)
+            + " gate raised=" + Convert.ToString(raised));
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        if (Program.failures != 0) { throw new Exception("admin gate regression"); }
+    }
+}

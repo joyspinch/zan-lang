@@ -191,6 +191,17 @@ class Boot {
             routes(app);
         }
 
+        /* 区级守门：管理区（/admin 与 /api/admin 前缀）除登录三件套外一律
+           强制登录。编译期的 fail-closed 默认覆盖"忘了声明"，这道闸防的是
+           "声明错了"——显式 None 在管理区同样被抬回，匿名面只剩登录页。
+           公开的账号流（/login /register /forgot 及验证码）在 Account 区，
+           不经此闸。 */
+        int raised = AdminGate(app);
+        if (raised > 0) {
+            Console.WriteLine("[auth] admin gate: " + Convert.ToString(raised)
+                + " 个管理区端点显式声明匿名，已被抬回需登录");
+        }
+
         /* 权限索引：从路由表建立 screen->bit 映射 */
         Perm.Index(app);
 
@@ -226,6 +237,37 @@ class Boot {
 
     /* double-submit CSRF 默认关闭（见 Run 内注释）。 */
     static bool csrfEnabled = false;
+
+    /* 管理区守门：段边界对齐的 /admin 与 /api/admin 前缀，豁免登录页/
+       登录提交/登出三件套，其余全部抬为需要登录（needsAuth 蕴含登录，
+       无需处理）。返回被纠正的端点数——正常装配为 0（编译期默认已是
+       Login），非 0 说明有控制器显式声明了匿名。 */
+    static int AdminGate(WebApp app) {
+        List<Route> all = app.router.All();
+        int raised = 0;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            Route r = all[i];
+            if (!AdminPath(r.pattern)) { continue; }
+            if (r.pattern == Routes.Login || r.pattern == Routes.LoginSubmit
+                || r.pattern == Routes.Logout) { continue; }
+            if (r.needsLogin) { continue; }
+            r.Login();
+            raised = raised + 1;
+        }
+        return raised;
+    }
+
+    /* 前缀匹配容忍缺前导斜杠的手写注册，但要求段边界（/adminX 不算）。 */
+    static bool AdminPath(string pattern) {
+        return PathIs(pattern, "/admin") || PathIs(pattern, "/api/admin");
+    }
+
+    static bool PathIs(string pattern, string prefix) {
+        string p = pattern.StartsWith("/") ? pattern : "/" + pattern;
+        if (!p.StartsWith(prefix)) { return false; }
+        int n = prefix.Length;
+        return p.Length == n || p[n] == '/';
+    }
 
     /// <summary>一行开启 double-submit CSRF（须在 Boot.Run() 之前调用）。
     /// 只拦浏览器形态的请求（携带 zsession/csrf cookie 的不安全方法）；

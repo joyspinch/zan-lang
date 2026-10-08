@@ -132,6 +132,7 @@ add_executable(zanc
     src/compiler/checker.c
     src/compiler/definite.c
     src/compiler/irgen.c
+    src/compiler/irgen_compact.cpp
     src/compiler/optimizer.c
     src/compiler/incremental.c
     src/compiler/package.c
@@ -149,6 +150,7 @@ add_executable(zanc
     src/common/miniz_tdef.c
 )
 target_include_directories(zanc PRIVATE src/compiler src/common ${LLVM_INCLUDE_DIRS})
+target_compile_features(zanc PRIVATE cxx_std_17)
 if(MSVC)
     target_link_libraries(zanc PRIVATE ${LLVM_LIBS} winhttp)
 elseif(WIN32)
@@ -625,13 +627,36 @@ else()
 endif()
 
 
-# ---- Native GUI runtime (zan_gui) ----
-# Cross-platform software renderer + windowing shell used by the Gui stdlib via
-# [DllImport("zan_gui")]: Win32 (full), X11 (Linux), Cocoa (macOS). Built
-# as a shared library so its platform system deps (X11 / user32+gdi32) are
-# self-contained and Zan programs only need `-lzan_gui`.
+# ---- Independent native GUI / image / audio / game drivers ----
+# GUI owns the windowing shell and base drawing context. Image decoding/cache
+# and audio have no GUI dependency; game rendering shares GUI's drawing context
+# and consumes the image cache through the two shared libraries.
 option(ZAN_BUILD_GUI "Build the native zan_gui runtime library" ON)
+option(ZAN_BUILD_IMAGE "Build the independent zan_image decoder/cache library" ON)
+option(ZAN_BUILD_AUDIO "Build the independent zan_audio runtime library" ON)
+option(ZAN_BUILD_GAME "Build zan_game (requires zan_gui and zan_image)" ON)
 set(ZAN_GUI_AVAILABLE FALSE)
+set(ZAN_IMAGE_AVAILABLE FALSE)
+set(ZAN_AUDIO_AVAILABLE FALSE)
+set(ZAN_GAME_AVAILABLE FALSE)
+
+# GNU ld cannot consume an MSVC .lib. Keep a GNU import archive next to each
+# freshly linked Windows DLL, using its own export table as the source of truth.
+if(WIN32)
+    find_program(ZAN_LLVM_DLLTOOL llvm-dlltool)
+    find_program(ZAN_LLVM_OBJDUMP llvm-objdump)
+endif()
+function(zan_native_import_library driver)
+    if(WIN32 AND ZAN_LLVM_DLLTOOL AND ZAN_LLVM_OBJDUMP)
+        add_custom_command(TARGET ${driver} POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                    -DZAN_OBJDUMP=${ZAN_LLVM_OBJDUMP}
+                    -DDLL=$<TARGET_FILE:${driver}>
+                    -DOUT=$<TARGET_FILE_DIR:${driver}>/lib${driver}.dll.a
+                    -P ${CMAKE_SOURCE_DIR}/cmake/zan_dll_import_lib.cmake
+            VERBATIM)
+    endif()
+endfunction()
 if(ZAN_BUILD_GUI)
     # B-ID23: gui_runtime.c mirrors ABI decisions that live in zanc's emission
     # logic (object/string layout, calling conventions, reflection protocol),
@@ -648,31 +673,7 @@ if(ZAN_BUILD_GUI)
         # runtime stays C and calls it through the zan_dw_* extern "C" ABI.
         add_library(zan_gui SHARED src/runtime/gui_runtime.c src/runtime/gui_runtime_dwrite.cpp)
         target_link_libraries(zan_gui PRIVATE user32 gdi32 dwmapi shcore imm32 ole32)
-        # zanc's bundled GNU ld cannot read the MSVC zan_gui.lib the linker
-        # emits, and --driver-dir points the [DllImport("zan_gui")] lookup at
-        # this directory (templates_build, Gui conformance), so generate the
-        # GNU import lib here from the DLL's own export table. Regenerating on
-        # every link keeps it in step with newly added exports — a stale copy
-        # made GUI programs fail with "undefined reference to zan_gui_*" for
-        # symbols the committed bundle predated. llvm-dlltool ships with the
-        # LLVM the toolchain already requires; when absent the committed
-        # packages/Zan.Gui/src/Gui/drivers/win-x64/libzan_gui.dll.a still resolves (the
-        # build script scripts/build_gui_driver.ps1 refreshes it).
-        find_program(ZAN_LLVM_DLLTOOL llvm-dlltool)
-        if(ZAN_LLVM_DLLTOOL)
-            # llvm-dlltool needs a .def; the linker does not write one, so
-            # derive it from the DLL's export table with llvm-objdump.
-            find_program(ZAN_LLVM_OBJDUMP llvm-objdump)
-            if(ZAN_LLVM_OBJDUMP)
-                add_custom_command(TARGET zan_gui POST_BUILD
-                    COMMAND ${CMAKE_COMMAND}
-                            -DZAN_OBJDUMP=${ZAN_LLVM_OBJDUMP}
-                            -DDLL=$<TARGET_FILE:zan_gui>
-                            -DOUT=$<TARGET_FILE_DIR:zan_gui>/libzan_gui.dll.a
-                            -P ${CMAKE_SOURCE_DIR}/cmake/zan_dll_import_lib.cmake
-                    VERBATIM)
-            endif()
-        endif()
+        zan_native_import_library(zan_gui)
         # Embedded WebView needs nothing here: the Edge WebView2 backend is
         # written in Zan (packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebView2.zan) against
         # its COM interfaces, and resolves WebView2Loader.dll (shipped in the
@@ -693,10 +694,7 @@ if(ZAN_BUILD_GUI)
     else()
         find_package(X11)
         if(X11_FOUND)
-            # gui_runtime_dwrite.cpp: DirectWrite glyph fallback (color emoji).
-        # C++ because the SDK's dwrite.h only parses as C++; the rest of the
-        # runtime stays C and calls it through the zan_dw_* extern "C" ABI.
-            add_library(zan_gui SHARED src/runtime/gui_runtime.c src/runtime/gui_runtime_dwrite.cpp)
+            add_library(zan_gui SHARED src/runtime/gui_runtime.c)
             target_include_directories(zan_gui PRIVATE ${X11_INCLUDE_DIR})
             target_link_libraries(zan_gui PRIVATE ${X11_LIBRARIES} m)
             find_package(Freetype QUIET)
@@ -710,6 +708,53 @@ if(ZAN_BUILD_GUI)
         else()
             message(WARNING "libX11 not found; skipping zan_gui (Gui conformance tests will be disabled)")
         endif()
+    endif()
+endif()
+
+if(ZAN_BUILD_IMAGE)
+    add_library(zan_image SHARED src/runtime/zan_image.c)
+    if(NOT WIN32)
+        target_link_libraries(zan_image PRIVATE m)
+    endif()
+    zan_native_import_library(zan_image)
+    set(ZAN_IMAGE_AVAILABLE TRUE)
+endif()
+
+if(ZAN_BUILD_AUDIO)
+    add_library(zan_audio SHARED src/runtime/zan_audio.c)
+    if(WIN32)
+        target_link_libraries(zan_audio PRIVATE ole32)
+    else()
+        # ALSA/CoreAudio/OH Audio are loaded dynamically; the mixer uses pthreads.
+        find_package(Threads REQUIRED)
+        target_link_libraries(zan_audio PRIVATE ${CMAKE_DL_LIBS} Threads::Threads m)
+        if(ANDROID)
+            target_link_libraries(zan_audio PRIVATE aaudio)
+        endif()
+    endif()
+    zan_native_import_library(zan_audio)
+    set(ZAN_AUDIO_AVAILABLE TRUE)
+endif()
+
+if(ZAN_BUILD_GAME)
+    if(TARGET zan_gui AND TARGET zan_image)
+        add_library(zan_game SHARED src/runtime/zan_game.c)
+        target_link_libraries(zan_game PRIVATE zan_gui zan_image)
+        if(WIN32)
+            target_link_libraries(zan_game PRIVATE user32 gdi32)
+        else()
+            target_link_libraries(zan_game PRIVATE ${CMAKE_DL_LIBS} m)
+        endif()
+        if(APPLE)
+            target_compile_definitions(zan_game PRIVATE ZAN_GUI_COCOA)
+        elseif(UNIX AND NOT ANDROID)
+            target_include_directories(zan_game PRIVATE ${X11_INCLUDE_DIR})
+            target_link_libraries(zan_game PRIVATE ${X11_LIBRARIES})
+        endif()
+        zan_native_import_library(zan_game)
+        set(ZAN_GAME_AVAILABLE TRUE)
+    else()
+        message(STATUS "Skipping zan_game: enable/build both zan_gui and zan_image")
     endif()
 endif()
 
@@ -911,6 +956,50 @@ if(NOT WIN32)
     target_link_libraries(zan_json_nul_test PRIVATE m)
 endif()
 add_test(NAME unit_json_nul COMMAND zan_json_nul_test)
+
+# ---- package lock read/write unit test (H-003) ----
+add_executable(zan_package_lock_test
+    tests/unit/package_lock_test.c
+    src/compiler/package.c
+    src/compiler/arena.c
+    src/common/json.c
+)
+target_include_directories(zan_package_lock_test PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src/compiler
+    ${CMAKE_SOURCE_DIR}/src/common
+)
+set_target_properties(zan_package_lock_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(NOT WIN32)
+    target_link_libraries(zan_package_lock_test PRIVATE m)
+endif()
+add_test(NAME unit_package_lock COMMAND zan_package_lock_test)
+
+add_executable(zan_package_namespace_test
+    tests/unit/package_namespace_test.c
+    src/compiler/package.c
+    src/compiler/arena.c
+    src/common/json.c
+)
+target_include_directories(zan_package_namespace_test PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src/compiler
+    ${CMAKE_SOURCE_DIR}/src/common
+)
+set_target_properties(zan_package_namespace_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(NOT WIN32)
+    target_link_libraries(zan_package_namespace_test PRIVATE m)
+endif()
+file(MAKE_DIRECTORY "${CMAKE_SOURCE_DIR}/_scratch")
+add_test(NAME unit_package_namespace
+    COMMAND zan_package_namespace_test "${CMAKE_SOURCE_DIR}/_scratch")
+set_tests_properties(unit_package_namespace PROPERTIES TIMEOUT 30)
 
 # A design doc node must name a real Zan Control class. Invalid kinds fail at
 # formgen time instead of silently becoming a Panel or Label.
@@ -1628,18 +1717,19 @@ endif()
 
 file(GLOB _conf_srcs ${CMAKE_SOURCE_DIR}/tests/conformance/*.zan)
 
-# Every test program is a pure function of its source, zanc, the stdlib and any
-# explicit Zan source arguments, so the suite reuses the binary it built last
-# time unless one of those changed.
-# This stamp carries the stdlib's mtime into that comparison; the test scripts
-# do the rest. Without it a plain re-run recompiled and relinked all ~165
-# programs three times over -- minutes of work with nothing to show for it.
+# Every test program is a pure function of its source, zanc, the stdlib/packages
+# and any explicit Zan source arguments, so the suite reuses the binary it built
+# last time unless one of those changed.
+# This stamp carries library source mtimes into that comparison; the test scripts
+# do the rest. Package-owned sources participate in the same compile as stdlib.
 set(_stdlib_stamp ${CMAKE_BINARY_DIR}/stdlib.stamp)
-file(GLOB_RECURSE _stdlib_srcs ${CMAKE_SOURCE_DIR}/stdlib/*.zan)
+file(GLOB_RECURSE _stdlib_srcs CONFIGURE_DEPENDS
+  ${CMAKE_SOURCE_DIR}/stdlib/*.zan
+  ${CMAKE_SOURCE_DIR}/packages/*.zan)
 add_custom_command(OUTPUT ${_stdlib_stamp}
   COMMAND ${CMAKE_COMMAND} -E touch ${_stdlib_stamp}
   DEPENDS ${_stdlib_srcs}
-  COMMENT "Stamping stdlib sources for the test suite")
+  COMMENT "Stamping stdlib and package sources for the test suite")
 add_custom_target(stdlib_stamp ALL DEPENDS ${_stdlib_stamp})
 
 # AI outbound targets are an exact allowlist, not an arbitrary URL setting.
@@ -1672,7 +1762,8 @@ set_tests_properties(server_mvc_readonly_action_lease PROPERTIES TIMEOUT 180
   LABELS "full;standard;smoke")
 
 foreach(_mvc_case security_bootstrap security_verify_code security_routes
-                  security_http_policy verify_code_issuance permission_branches security_csp)
+                  security_http_policy verify_code_issuance permission_branches security_csp
+                  admin_gate)
   add_test(NAME server_mvc_${_mvc_case}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -1890,6 +1981,26 @@ foreach(_src ${_conf_srcs})
   set_tests_properties(conformance_${_name} PROPERTIES
     RESOURCE_LOCK src_${_name} TIMEOUT 120)
 endforeach()
+
+# Doubling both live slots and waitpoints must not quadruple async IR.
+add_test(NAME conformance_async_ir_scaling
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DWORKDIR=${CMAKE_SOURCE_DIR}
+    -DSCRATCH=${CMAKE_SOURCE_DIR}/_scratch/async_ir_scaling
+    -DMAX_GROWTH_PERCENT=250
+    -P ${CMAKE_SOURCE_DIR}/tests/run_async_ir_scaling.cmake)
+set_tests_properties(conformance_async_ir_scaling PROPERTIES TIMEOUT 360)
+
+# Return-site count and finally-body size must not multiply async IR.
+add_test(NAME conformance_async_finally_ir_scaling
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DWORKDIR=${CMAKE_SOURCE_DIR}
+    -DSCRATCH=${CMAKE_SOURCE_DIR}/_scratch/async_finally_ir_scaling
+    -DMAX_GROWTH_PERCENT=250
+    -P ${CMAKE_SOURCE_DIR}/tests/run_async_finally_ir_scaling.cmake)
+set_tests_properties(conformance_async_finally_ir_scaling PROPERTIES TIMEOUT 360)
 
 # Back-edge preemption (B-ID44) is only observable when the hot frame and its
 # Delay sibling share ONE worker: with the default pool the sibling runs on
@@ -2414,11 +2525,29 @@ endif()
 # $ZAN_LIB_PATH, so the tests point that (and the OS loader path) at the freshly
 # built zan_gui. Enabled wherever zan_gui is available; the Windows CI job builds
 # only zanc, so it passes -DZAN_BUILD_GUI_TESTS=OFF.
+# Publish liveness exercises both unsharded and sharded package builds.
+add_test(NAME compiler_driver_liveness
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DWORK=${CMAKE_SOURCE_DIR}/_scratch/driver_liveness
+    -P ${CMAKE_SOURCE_DIR}/tests/run_driver_liveness.cmake)
+set_tests_properties(compiler_driver_liveness PROPERTIES TIMEOUT 180)
+
 option(ZAN_BUILD_GUI_TESTS "Run the Gui conformance tests (requires zan_gui)" ON)
 if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   add_executable(zan_gui_runtime_test tests/runtime/gui_runtime_test.c)
   target_link_libraries(zan_gui_runtime_test PRIVATE zan_gui)
   add_test(NAME runtime_gui COMMAND zan_gui_runtime_test)
+
+  if(ZAN_GAME_AVAILABLE)
+    add_executable(zan_render_modules_test tests/runtime/render_modules_test.c)
+    if(NOT WIN32)
+      target_link_libraries(zan_render_modules_test PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+    add_dependencies(zan_render_modules_test zan_gui zan_game zan_image)
+    add_test(NAME runtime_render_modules COMMAND zan_render_modules_test
+      $<TARGET_FILE:zan_gui> $<TARGET_FILE:zan_game> $<TARGET_FILE:zan_image>)
+  endif()
 
   # Combined rounded fill+border coverage (CPU primitive, no window needed).
   add_executable(zan_gui_surface_round_test tests/runtime/gui_surface_round_test.c)
@@ -2433,11 +2562,14 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     add_test(NAME runtime_gui_gl_aa COMMAND zan_gui_gl_aa_test $<TARGET_FILE:zan_gui>)
     set_tests_properties(runtime_gui_gl_aa PROPERTIES SKIP_RETURN_CODE 77)
 
-    add_executable(zan_gui_gl_3d_test tests/runtime/gui_gl_3d_test.c)
-    target_link_libraries(zan_gui_gl_3d_test PRIVATE ${CMAKE_DL_LIBS})
-    add_dependencies(zan_gui_gl_3d_test zan_gui)
-    add_test(NAME runtime_gui_gl_3d COMMAND zan_gui_gl_3d_test $<TARGET_FILE:zan_gui>)
-    set_tests_properties(runtime_gui_gl_3d PROPERTIES SKIP_RETURN_CODE 77)
+    if(ZAN_GAME_AVAILABLE)
+      add_executable(zan_gui_gl_3d_test tests/runtime/gui_gl_3d_test.c)
+      target_link_libraries(zan_gui_gl_3d_test PRIVATE ${CMAKE_DL_LIBS})
+      add_dependencies(zan_gui_gl_3d_test zan_gui zan_game zan_image)
+      add_test(NAME runtime_gui_gl_3d COMMAND zan_gui_gl_3d_test
+        $<TARGET_FILE:zan_gui> $<TARGET_FILE:zan_game> $<TARGET_FILE:zan_image>)
+      set_tests_properties(runtime_gui_gl_3d PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
   endif()
 
   # A4: surface dimension validation -- rejects non-positive / oversize dims.
@@ -3249,6 +3381,92 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_html${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # Designer preview and generated HTML share pixels and control rects across
+  # 100%-300% target DPI, independently of the editor display and view zoom.
+  add_test(NAME conformance_gui_designer_wysiwyg
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_wysiwyg_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/designer_wysiwyg.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_wysiwyg.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_designer_wysiwyg${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_designer_wysiwyg PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+  # Factory and prepared-control paths consume the same complete document:
+  # flow captions, HTML body/mixed order, placement, slots and component refs.
+  add_test(NAME conformance_gui_formbuild_contract
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/formbuild_contract_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_formbuild_contract.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_formbuild_contract${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_formbuild_contract PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+  # GenForm's typed fields and runtime FormBuilder must project one HTML
+  # document identically, including mixed text, slots, bindings and columns.
+  add_test(NAME conformance_gui_genform_contract
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/genform_contract_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/genform_contract.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_genform_contract.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_genform_contract${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_genform_contract PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+  add_test(NAME conformance_gui_designer_interaction
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_interaction_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_interaction.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_designer_interaction${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_designer_interaction PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+  add_test(NAME conformance_gui_window_shape_mask
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/window_shape_mask_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_window_shape_mask.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_window_shape_mask${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_window_shape_mask PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+  if(WIN32)
+    add_test(NAME conformance_gui_native_window_size
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/native_window_size_test.zan
+        "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_native_window_size.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_native_window_size${_exe_ext}
+        -DSTDLIB_STAMP=${_stdlib_stamp}
+        -DWORKDIR=${CMAKE_SOURCE_DIR}
+        -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+    set_tests_properties(conformance_gui_native_window_size PROPERTIES
+      TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+  endif()
+
   # A form-level size is the default for every generated control, including
   # nested children; an explicit per-control size class still wins.
   add_test(NAME conformance_gui_design_form_size
@@ -3718,7 +3936,21 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Styling/Css.zan;${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Styling/StyleSheet.zan;${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Styling/StyleBox.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_css.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_css${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  add_test(NAME conformance_gui_css_dpi
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/css_dpi_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_css_dpi.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_css_dpi${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_css_dpi PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
   # The Zan-side COM interop the WebView2 backend is built from (GUID
   # marshalling, vtable objects, slot dispatch, URL/profile helpers) is pure
@@ -4103,6 +4335,19 @@ add_test(NAME diag_null_guard_after_use
     "-DEXPECT_REGEX=can return null; accessing 'Name' on its result"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_null_guard_after_use PROPERTIES TIMEOUT 60)
+
+# Lock traversal preserves both preceding-guard order and nullable returns.
+foreach(_lock_null_case unguarded after_use later_body later_header locked_result locked_direct)
+  add_test(NAME diag_null_guard_lock_${_lock_null_case}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/null_guard_lock.zan
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_null_guard_lock_${_lock_null_case}${_exe_ext}
+      "-DZANC_ARGS=--no-packages;-D${_lock_null_case}"
+      "-DEXPECT_REGEX=can return null; accessing 'Name' on its result"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+  set_tests_properties(diag_null_guard_lock_${_lock_null_case} PROPERTIES TIMEOUT 60)
+endforeach()
 
 # Generic type arguments are invariant: List<int> is not a List<Box>, even
 # though both erase to the same object pointer in IR. Passing a mismatched

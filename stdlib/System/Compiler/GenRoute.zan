@@ -347,11 +347,16 @@ class GenRoute {
         List<string> segs = new List<string>();
         int start = 0;
         int nslen = ns.Length;
+        int segIdx = 0;
         for (int i = 0; i <= nslen; i = i + 1) {
             if (i == nslen || (ns[i] & 255) == 46) {
                 if (i > start) {
                     string seg = GenRoute.Lower(ns.Substring(start, i - start));
-                    if (seg != "app" && seg != "application" &&
+                    /* 首段是应用根命名空间 (ZanWeb/MyApp/...)，不进路由；
+                       其余样板词 (App/Controller/Web/...) 无论位置都剥。 */
+                    bool root = segIdx == 0;
+                    segIdx = segIdx + 1;
+                    if (!root && seg != "app" && seg != "application" &&
                         seg != "controller" && seg != "controllers" &&
                         seg != "src" && seg != "source" &&
                         seg != "packages" && seg != "package" &&
@@ -366,7 +371,11 @@ class GenRoute {
         string tok = GenRoute.ControllerToken(cls);
         if (segs.Count > 0) {
             string lastSeg = segs[segs.Count - 1];
-            if (tok.StartsWith(lastSeg) && tok.Length > lastSeg.Length) {
+            /* 尾部重复合并：tok 以末段开头则剥掉前缀；与末段完全同名
+               (Media/Media、Monitor/Monitor、Wiki/Wiki) 则整个剥空，
+               路由落在命名空间段本身上。 */
+            if (tok == lastSeg) { tok = ""; }
+            else if (tok.StartsWith(lastSeg) && tok.Length > lastSeg.Length) {
                 tok = tok.Substring(lastSeg.Length);
             }
         }
@@ -378,8 +387,11 @@ class GenRoute {
             route.Append("/");
             route.Append(segs[si]);
         }
-        route.Append("/");
-        route.Append(tok);
+        if (tok.Length > 0) {
+            route.Append("/");
+            route.Append(tok);
+        }
+        if (route.Length == 0) { route.Append("/"); }
         return route.ToString();
     }
 
@@ -411,10 +423,16 @@ class GenRoute {
             if (clsTpl.Length > 0) { tpl = clsTpl + "/" + mTpl; }
             else { tpl = mTpl; }
         } else {
-            if (clsTpl.IndexOf("[action]") >= 0) {
+            if (actionTok == "index") {
+                if (clsTpl.EndsWith("/[action]")) {
+                    tpl = clsTpl.Substring(0, clsTpl.Length - 9);
+                } else if (clsTpl.IndexOf("[action]") >= 0) {
+                    tpl = clsTpl;
+                } else {
+                    tpl = clsTpl.Length > 0 ? clsTpl : "/";
+                }
+            } else if (clsTpl.IndexOf("[action]") >= 0) {
                 tpl = clsTpl;
-            } else if (actionTok == "index") {
-                tpl = clsTpl.Length > 0 ? clsTpl : "/";
             } else {
                 tpl = clsTpl.Length > 0 ? clsTpl + "/[action]" : "/[action]";
             }
@@ -899,15 +917,19 @@ class GenRoute {
         }
 
         /* Authorization 枚举 → 分发器在该 action 运行前的要求。
-         * None/Auth 无所求(会话本来就为每个请求解析);Login 要求会话;
-         * Grant -- 给 token 客户端的 ApiAuth -- 要求会话 AND 该 action
-         * 的授权,而角色授予的正是这一个动作。声明 Grant 即完整声明
-         * 一个页面的安全。 */
+         * 默认为 Login (fail-closed 安全基线: 未声明任何 Authorization 的端点强制登录)。
+         * 仅在显式声明为 None 或 Auth (非强制只取用户) 时不追加 .Login()。
+         * Grant / ApiAuth 要求会话 AND 权限位。 */
         if (GenRoute.MetaGetKind("Authorization") == 3) {
             string av = GenRoute.MetaGetVal("Authorization");
             if (av == "Login") { out0.Append(".Login()"); }
             else if (av == "Grant") { out0.Append(".Auth()"); }
             else if (av == "ApiAuth") { out0.Append(".Auth()"); }
+            else if (av == "None" || av == "Auth") { /* 显式公开或仅挂载用户，不强制登录 */ }
+            else { out0.Append(".Login()"); }
+        } else {
+            /* 默认 fail-closed: 未声明 Authorization 的端点统一要求登录 */
+            out0.Append(".Login()");
         }
         /* IsMenu → 在管理菜单中呈现(路由上的布尔旗标)。 */
         if (GenRoute.MetaGetKind("IsMenu") == 1 &&
@@ -1228,7 +1250,22 @@ class GenRoute {
                     reg.Append(GenRoute.Esc(clsTpl + "/index"));
                     reg.Append("\", __AttrRoutes." + hname + ")\n            .Named(\"");
                     reg.Append(GenRoute.Esc(cact));
-                    reg.Append(".IndexAlias\");\n");
+                    reg.Append(".");
+                    reg.Append(GenRoute.Esc(mname));
+                    reg.Append("\")");
+                    /* 别名与主路由同权：完整 fluent 链（授权/限流/元数据）
+                       照搬，只剥 .Menu()——同一动作在侧边栏出现两次是错的。
+                       action 名与主路由一致，RBAC 位 (bits) 命中同一条；
+                       此前别名不带授权链，/xxx/index 一度是匿名旁路。 */
+                    StringBuilder aliasFluent = new StringBuilder();
+                    GenRoute.EmitFluent(aliasFluent, title);
+                    string afl = aliasFluent.ToString();
+                    int mi = afl.IndexOf(".Menu()");
+                    if (mi >= 0) {
+                        afl = afl.Substring(0, mi) + afl.Substring(mi + 7);
+                    }
+                    reg.Append(afl);
+                    reg.Append(";\n");
                 }
             }
             nroutes = nroutes + 1;
