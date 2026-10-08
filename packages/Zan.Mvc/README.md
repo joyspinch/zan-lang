@@ -29,14 +29,14 @@ zan.pkg                 包清单（版本随包演进）
 src/ZanWeb/             包源码。目录是工程组织（Framework/Modules 两块），
                         命名空间保持扁平、与 URL 同构，不随目录加深
   Framework/              框架层：所有模块共享的件；业务模块只依赖它
-    Core/                   基建：Boot 引导 · Cfg 配置 · Db/DbContext · Schema · Gen 代码生成器
+    Core/                   基建：Boot 引导 · Cfg 配置 · Db/DbContext · Schema
     Services/               业务支撑：JobHost 任务宿主 · Cache/CacheContext · Metrics ·
                             Mailer · ClusterBus/Presence · Settings
     Security/               横切·安全：Auth · Perm/PermTable · DataScope · Keys ·
                             LoginThrottle · VerifyCode
     Ai/                     横切·AI：AI 助手注册与端点策略
     *.zan                   接入层基座：App/Api/AdminController 三基类 · AppServices ·
-                            CrudOps 写网关 · ListPage/FormPage 屏基座 · Fmt/Lang/Prose 渲染件
+                            Fmt/Lang/Prose/Rows 渲染与格式化件
   Modules/                业务模块，一个目录一个模块（垂直切片：Controller+Model+Dao）
     Sys/
       Controller/           接入层：目录=URL 族（Account/ Admin/ Api/ Blog/
@@ -46,14 +46,14 @@ src/ZanWeb/             包源码。目录是工程组织（Framework/Modules �
                             Model/Blog/、Dao/Blog/ 为示例模块
       Services/             模块内非控制器业务件（业务种子 BlogSeed 等），
                             不进 Controller/，见「Controller/ 纯净与端点纪律」
-    Crud/                   配置驱动管理屏引擎
-      Controller/Admin/       CrudScreenController.zan——管理屏基座（ns
-                              ZanWeb.Admin，与 Dashboard/Profile 同族；
-                              继承 AppController 即控制器，无论是否
-                              自带路由）
-      Model/                  CrudConf.zan——屏面声明模型（ns ZanWeb.Model，
-                              与 Model/ 目录镜像；描述字段/表单/校验，
-                              非表实体）
+    Crud/                   CRUD 模块：声明式 CRUD 引擎、配置驱动管理屏与表单设计器
+      Engine/               引擎件：CrudOps 写网关 · FormPage 声明式表单页与校验 ·
+                            ListPage 声明式列表页与表格配置 · Gen 表设计器与代码生成引擎
+      Controller/Admin/     CrudScreenController.zan（通用屏基座）·
+                            Dev/CoderController.zan（表设计器，/admin/dev/coder）
+      Model/                CrudConf.zan（屏面声明模型）·
+                            SysGenTable.zan / SysGenColumn.zan（设计器表与字段模型）
+      Dao/                  SysGenTableDao.zan / SysGenColumnDao.zan（设计器 DAO）
 views/                  页面模板，按控制器模块分目录（随包资产）
   layout.html             全站布局；模块自有 layout.html 仅覆盖本模块
 wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/vendor/i18n）
@@ -246,7 +246,7 @@ adminUI（JSON 体）两套前端同动作双兼容靠它。成员按所在层�
 |-----------------------|---------------------------------------------|------------------------------|
 | `CrudConf`            | Modules/Crud/Model/（ns `ZanWeb.Model`）    | 屏面声明（描述字段/表单/校验）|
 | `CrudScreenController`| Modules/Crud/Controller/Admin/（ns `ZanWeb.Admin`） | 屏引擎基座            |
-| `CrudOps`             | Framework/（ns `ZanWeb.Web`）               | 声明驱动的通用写动作与 conf 投影网关 |
+| `CrudOps`             | Modules/Crud/Engine/（ns `ZanWeb.Web`）    | 声明驱动的通用写动作与 conf 投影网关 |
 
 （为什么：曾有静态网关 `class Crud` 与模块命名空间 `ZanWeb.Crud` 撞名，
 看名字分不清角色——已更名 `CrudOps`。）
