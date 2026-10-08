@@ -30,7 +30,7 @@ class Boot {
     /* 注册路由表挂点。应用侧传编译期生成的 __AttrRoutes.Register：
        Boot.OnRoutes(Program.RegisterRoutes); */
     static void OnRoutes(RouteFn fn) {
-        Boot.routes = fn;
+        routes = fn;
     }
 
     /* 引导并运行服务器；返回值即进程退出码（start/stop/restart 命令语义）。 */
@@ -110,15 +110,15 @@ class Boot {
         app.LoginPath(Routes.Login);
         /* 全站安全响应头，放在一切可能短路应答的中间件之前，让 403/204
            也带着这些头出门。 */
-        app.Before(Boot.SecurityHeaders);
+        app.Before(SecurityHeaders);
         /* Cookie 写入必须有同源证据；不要求无 cookie 的 API 客户端
            伪造浏览器头。double-submit CSRF 默认关闭——框架页面/脚本
            尚未产出 _csrf 字段与 X-CSRF-Token 头，默认打开 = 全站表单
            403；应用页面按 Csrf 类注释配齐 token 回显后，在 main.zan
            调 Boot.EnableCsrf() 一行开启。 */
-        app.Before(Boot.OriginGuard);
-        if (Boot.csrfEnabled) {
-            app.Before(Boot.CsrfGuard);
+        app.Before(OriginGuard);
+        if (csrfEnabled) {
+            app.Before(CsrfGuard);
         }
         /* 运行模式判断：mode=api 时跳过 HTML 视图载入与静态目录挂载（纯 API 轻量模式） */
         if (Cfg.Server.mode != "api") {
@@ -135,7 +135,7 @@ class Boot {
 
         /* 跨域资源共享（CORS）与预检阻断 */
         if (Cfg.Cors.enabled) {
-            app.Before(Boot.CorsFilter);
+            app.Before(CorsFilter);
             /* CORS 放行的具体 Origin 同样允许发起 WS 升级；"*" 不登记
                （带 cookie 的升级不适用通配凭据语义）。 */
             if (Cfg.Cors.allowOrigin != "*") {
@@ -145,13 +145,13 @@ class Boot {
 
         /* 生命周期钩子 */
         if (Cfg.Log.access) {
-            app.Before(Boot.AccessLog);
+            app.Before(AccessLog);
         }
-        Boot.slowMs = Cfg.Log.slowMs;
-        Boot.slowSqlUs = (long)Cfg.Log.slowSqlMs * 1000;
-        app.After(Boot.Metrics);
+        slowMs = Cfg.Log.slowMs;
+        slowSqlUs = (long)Cfg.Log.slowSqlMs * 1000;
+        app.After(Metrics);
         ServerMetrics.Global().SlowQueryMs(Cfg.Log.slowSqlMs);
-        DbTrace.Sink(Boot.SqlTrace);
+        DbTrace.Sink(SqlTrace);
         ServerMetrics.Global()
             .ErrorLog(Cfg.Log.errorLog, Cfg.Log.debug)
             .OnError(MetricsStore.Failed);
@@ -187,8 +187,8 @@ class Boot {
         }
 
         /* 路由：编译期从控制器属性生成，运行时只执行注册（挂点由应用侧注册） */
-        if (Boot.routes != null) {
-            Boot.routes(app);
+        if (routes != null) {
+            routes(app);
         }
 
         /* 权限索引：从路由表建立 screen->bit 映射 */
@@ -234,7 +234,7 @@ class Boot {
     /// 不拦。开启后应用页面的表单须带 _csrf 隐藏域、ajax 须回显
     /// X-CSRF-Token（Csrf 类注释），否则这些请求会被 403。</summary>
     static void EnableCsrf() {
-        Boot.csrfEnabled = true;
+        csrfEnabled = true;
     }
 
     /// double-submit 闸的浏览器形态过滤：真闸在 Csrf.Guard。
@@ -276,7 +276,7 @@ class Boot {
         /* 与 metrics_sql_day.sql 的 StringLength 一致；截得更短会砍掉宽表
            语句的 WHERE/LIMIT 尾巴，统计屏读不出语句形状。 */
         if (norm.Length > 400) { norm = norm.Substring(0, 400); }
-        bool slow = us >= Boot.slowSqlUs;
+        bool slow = us >= slowSqlUs;
         MetricsStore.RecordSql(norm, us, slow);
         if (slow) {
             Log.Warn("[slow-sql] " + Convert.ToString(us) + "us " + norm);
@@ -293,10 +293,10 @@ class Boot {
         bool bearer = ctx.Header("Authorization").StartsWith("Bearer ");
         bool cookie = !bearer && ctx.Cookie("zsession").Length > 0;
         if (!cookie) {
-            if (origin.Length > 0 && Cfg.Cors.enabled && Boot.ValidCorsOrigin()
+            if (origin.Length > 0 && Cfg.Cors.enabled && ValidCorsOrigin()
                     && (origin == Cfg.Cors.allowOrigin
                         || (bearer && Cfg.Cors.allowOrigin == "*"
-                            && Boot.HttpOrigin(origin) == origin))) {
+                            && HttpOrigin(origin) == origin))) {
                 return true;
             }
             return Csrf.OriginGuard(ctx);
@@ -304,14 +304,14 @@ class Boot {
         string site = ctx.Header("Sec-Fetch-Site");
         bool same = site != "cross-site";
         if (origin.Length > 0) {
-            same = same && Boot.HttpOrigin(origin) == origin
-                && Boot.SameOriginHost(origin, ctx.Header("Host"));
+            same = same && HttpOrigin(origin) == origin
+                && SameOriginHost(origin, ctx.Header("Host"));
         } else {
             string referer = ctx.Header("Referer");
             if (referer.Length > 0) {
-                string refOrigin = Boot.HttpOrigin(referer);
+                string refOrigin = HttpOrigin(referer);
                 same = same && refOrigin.Length > 0
-                    && Boot.SameOriginHost(refOrigin, ctx.Header("Host"));
+                    && SameOriginHost(refOrigin, ctx.Header("Host"));
             } else {
                 same = same && site == "same-origin";
             }
@@ -384,13 +384,13 @@ class Boot {
     static bool ValidCorsOrigin() {
         string origin = Cfg.Cors.allowOrigin;
         if (origin == "*") { return !Cfg.Cors.allowCredentials; }
-        return origin.Length > 0 && Boot.HttpOrigin(origin) == origin;
+        return origin.Length > 0 && HttpOrigin(origin) == origin;
     }
 
     /* Invalid CORS configuration grants no cross-origin access, without
        disabling same-origin pages or non-browser API clients. */
     static bool CorsFilter(HttpContext ctx) {
-        if (!Cfg.Cors.enabled || !Boot.ValidCorsOrigin()) { return true; }
+        if (!Cfg.Cors.enabled || !ValidCorsOrigin()) { return true; }
         ctx.SetHeader("Access-Control-Allow-Origin", Cfg.Cors.allowOrigin);
         ctx.SetHeader("Access-Control-Allow-Methods", Cfg.Cors.allowMethods);
         ctx.SetHeader("Access-Control-Allow-Headers", Cfg.Cors.allowHeaders);
@@ -414,11 +414,11 @@ class Boot {
         if (traceId.Length == 0) {
             traceId = ctx.Header("X-Request-Id");
         }
-        traceId = Boot.CleanTraceId(traceId);
+        traceId = CleanTraceId(traceId);
         if (traceId.Length == 0) {
-            Boot.traceSeq = Boot.traceSeq + 1;
+            traceSeq = traceSeq + 1;
             traceId = "tr_" + Convert.ToString(DateTime.UtcNow().ToUnixSeconds())
-                + "_" + Convert.ToString(Boot.traceSeq);
+                + "_" + Convert.ToString(traceSeq);
         }
         ctx.SetHeader("X-Request-Id", traceId);
         Console.WriteLine("[req] [" + traceId + "] " + ctx.method + " " + ctx.path);
@@ -446,7 +446,7 @@ class Boot {
     /* 请求指标：按毫秒统计，流式连接只计推送量 */
     static void Metrics(HttpContext ctx, long elapsedUs) {
         if (ctx.routePattern.Length == 0) {
-            if (elapsedUs > (long)Boot.slowMs * 1000) {
+            if (elapsedUs > (long)slowMs * 1000) {
                 Console.WriteLine("[slow] " + ctx.method + " " + ctx.path + " "
                     + Convert.ToString(elapsedUs) + "us");
             }
@@ -459,7 +459,7 @@ class Boot {
         }
         MetricsStore.Record(ctx.method, ctx.routePattern, ctx.status,
             elapsedUs);
-        if (elapsedUs > (long)Boot.slowMs * 1000) {
+        if (elapsedUs > (long)slowMs * 1000) {
             Console.WriteLine("[slow] " + ctx.method + " " + ctx.path + " "
                 + Convert.ToString(elapsedUs) + "us");
         }

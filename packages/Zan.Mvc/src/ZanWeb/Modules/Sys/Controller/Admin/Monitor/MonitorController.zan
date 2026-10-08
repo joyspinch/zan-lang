@@ -38,9 +38,9 @@ class MonitorController : AdminController {
 
         /* 当日四个数字随页渲出，首次绘制即为当日汇总而非本 worker 计数器（新派 worker 从 0 起），页后续由 /admin/monitor/today 保持更新。 */
         long now = (long)WebApp.NowSeconds();
-        long today = MonitorController.Today(now);
-        long from = MonitorController.PickedDay(this.In("d"), today);
-        long to = MonitorController.DayEnd(from, today, now);
+        long today = Today(now);
+        long from = PickedDay(this.In("d"), today);
+        long to = DayEnd(from, today, now);
         int _f = await MetricsStore.Flush();
         MetricMinute day = await MetricsStore.WindowTotals(from, to, "", "");
         d.Set("day", Fmt.Day(from));
@@ -48,7 +48,7 @@ class MonitorController : AdminController {
         if (from < today) { d.Set("past", "1"); }
         d.Set("dayCalls", Convert.ToString(day.calls));
         d.Set("dayErrors", Convert.ToString(day.errors));
-        d.Set("dayAvg", Fmt.Dur(MonitorController.Avg(day.totalUs, day.calls)));
+        d.Set("dayAvg", Fmt.Dur(Avg(day.totalUs, day.calls)));
         d.Set("dayMax", Fmt.Dur(day.maxUs));
         this.Page(d);
     }
@@ -79,7 +79,7 @@ class MonitorController : AdminController {
 
         int elapsed = 0;
         int sinceSeries = 0;
-        while (elapsed < MonitorController.StreamSeconds) {
+        while (elapsed < StreamSeconds) {
             await Task.Delay(2000);
             elapsed = elapsed + 2;
             sinceSeries = sinceSeries + 2;
@@ -105,8 +105,8 @@ class MonitorController : AdminController {
         int _w = await MetricsStore.Flush();
         MetricMinute tot = await MetricsStore.WindowTotals(from, to, "", "");
         List<MetricMinute> rows = await MetricsStore.HistoryBuckets(from, to,
-            "", "", MonitorController.DayStep, MonitorController.MaxRows);
-        rows = MonitorController.FillGaps(rows, from, to, MonitorController.DayStep);
+            "", "", DayStep, MaxRows);
+        rows = FillGaps(rows, from, to, DayStep);
 
         /* 最旧在前：图表 x 轴正向。 */
         JsonValue pts = JsonValue.NewArray();
@@ -116,7 +116,7 @@ class MonitorController : AdminController {
             p.Put("t", MetricsCluster.Num(b.minute));
             p.Put("calls", MetricsCluster.Num(b.calls));
             p.Put("errors", MetricsCluster.Num(b.errors));
-            p.Put("avg_us", MetricsCluster.Num(MonitorController.Avg(b.totalUs, b.calls)));
+            p.Put("avg_us", MetricsCluster.Num(Avg(b.totalUs, b.calls)));
             p.Put("p95_us", MetricsCluster.Num(b.p95Us));
             p.Put("max_us", MetricsCluster.Num(b.maxUs));
             pts.Append(p);
@@ -126,16 +126,16 @@ class MonitorController : AdminController {
         o.Put("day", JsonValue.NewStr(Fmt.Day(from)));
         o.Put("from", MetricsCluster.Num(from));
         o.Put("as_of", MetricsCluster.Num(to));
-        o.Put("step", MetricsCluster.Num(MonitorController.DayStep));
+        o.Put("step", MetricsCluster.Num(DayStep));
         o.Put("calls", MetricsCluster.Num(tot.calls));
         o.Put("errors", MetricsCluster.Num(tot.errors));
-        o.Put("avg_us", MetricsCluster.Num(MonitorController.Avg(tot.totalUs, tot.calls)));
+        o.Put("avg_us", MetricsCluster.Num(Avg(tot.totalUs, tot.calls)));
         o.Put("max_us", MetricsCluster.Num(tot.maxUs));
         o.Put("total_us", MetricsCluster.Num(tot.totalUs));
         o.Put("frames", MetricsCluster.Num(tot.frames));
         o.Put("bytes", MetricsCluster.Num(tot.bytes));
         o.Put("points", pts);
-        o.Put("top", await MonitorController.DayTop(from, to));
+        o.Put("top", await DayTop(from, to));
         return o.ToJson();
     }
 
@@ -143,8 +143,8 @@ class MonitorController : AdminController {
     static async JsonValue DayTop(long from, long to) {
         JsonValue arr = JsonValue.NewArray();
         Dictionary<string,int> seen = new Dictionary<string,int>();
-        await MonitorController.AppendDayTop(arr, seen, from, to, "calls");
-        await MonitorController.AppendDayTop(arr, seen, from, to, "time");
+        await AppendDayTop(arr, seen, from, to, "calls");
+        await AppendDayTop(arr, seen, from, to, "time");
         return arr;
     }
 
@@ -152,7 +152,7 @@ class MonitorController : AdminController {
     static async void AppendDayTop(JsonValue arr, Dictionary<string,int> seen,
             long from, long to, string rank) {
         List<MetricMinute> tops = await MetricsStore.RouteTotalsBy(from, to,
-            "", "", MonitorController.DayRoutes, rank);
+            "", "", DayRoutes, rank);
         for (int i = 0; i < tops.Count; i = i + 1) {
             MetricMinute b = tops[i];
             string req = b.method + " " + b.path;
@@ -162,7 +162,7 @@ class MonitorController : AdminController {
             o.Put("req", JsonValue.NewStr(req));
             o.Put("calls", MetricsCluster.Num(b.calls));
             o.Put("errors", MetricsCluster.Num(b.errors));
-            o.Put("avg_us", MetricsCluster.Num(MonitorController.Avg(b.totalUs, b.calls)));
+            o.Put("avg_us", MetricsCluster.Num(Avg(b.totalUs, b.calls)));
             o.Put("p95_us", MetricsCluster.Num(b.p95Us));
             o.Put("max_us", MetricsCluster.Num(b.maxUs));
             o.Put("total_us", MetricsCluster.Num(b.totalUs));
@@ -176,10 +176,10 @@ class MonitorController : AdminController {
     [Description("当天累计指标")]
     async void Today() {
         long now = (long)WebApp.NowSeconds();
-        long today = MonitorController.Today(now);
-        long from = MonitorController.PickedDay(this.In("d"), today);
-        this.Json(await MonitorController.DayJson(from,
-            MonitorController.DayEnd(from, today, now)));
+        long today = Today(now);
+        long from = PickedDay(this.In("d"), today);
+        this.Json(await DayJson(from,
+            DayEnd(from, today, now)));
     }
 
     /* 今日零点秒。 */
@@ -187,7 +187,7 @@ class MonitorController : AdminController {
 
     /* 屏幕所求日期：可解析且不在未来的取指定日，否则取今日；未来日无行，答空表会被读作历史丢失。 */
     static long PickedDay(string day, long today) {
-        long start = MonitorController.DaySeconds(day);
+        long start = DaySeconds(day);
         if (start < 0 || start > today) { return today; }
         return start;
     }
@@ -223,24 +223,24 @@ class MonitorController : AdminController {
         string method = this.In("m");
         string route = this.In("route");
         /* 两种取窗方式：h 为"过去 N 小时"，d/d2 为日历日期；日历窗两端闭合，故每次打开桶相同，滚动窗则不然。 */
-        MetricWindow w = MonitorController.Window(this.In("d"), this.In("d2"),
+        MetricWindow w = Window(this.In("d"), this.In("d2"),
             this.InInt("h", 24));
-        string gran = MonitorController.Gran(this.In("g"), w.hours);
-        long step = MonitorController.Step(gran);
+        string gran = Gran(this.In("g"), w.hours);
+        long step = Step(gran);
         long from = w.from;
         long to = w.to;
 
         /* 先刷窗，使"过去一小时"含正在填充的分钟而非止于十分钟前。 */
         int _w = await MetricsStore.Flush();
         List<MetricMinute> rows = await MetricsStore.HistoryBuckets(from, to,
-            method, route, step, MonitorController.MaxRows);
+            method, route, step, MaxRows);
         /* 两种顺序：哪个接口被调最多、哪个接口占窗内服务器时间；参数以名称切换，不进入语句。 */
         string by = "calls";
         if (this.In("by") == "time") { by = "time"; }
         List<MetricMinute> tops = await MetricsStore.RouteTotalsBy(from, to,
-            method, route, MonitorController.MaxRoutes, by);
+            method, route, MaxRoutes, by);
         /* 日历窗展示其含的全部桶，含无流量者——"03:00 无数据"是事实，跳过这些小时会被误读为时间线。 */
-        if (w.dated) { rows = MonitorController.FillGaps(rows, from, to, step); }
+        if (w.dated) { rows = FillGaps(rows, from, to, step); }
 
         List<StrMap> items = d.AddList("rows");
         long calls = 0;
@@ -253,12 +253,12 @@ class MonitorController : AdminController {
             long qps10 = b.calls * 10 / step;
             if (qps10 > peakQps10) { peakQps10 = qps10; }
             StrMap r = new StrMap();
-            r.Set("bucket", MonitorController.BucketLabel(b.minute, gran));
+            r.Set("bucket", BucketLabel(b.minute, gran));
             r.Set("calls", Convert.ToString(b.calls));
-            r.Set("qps", MonitorController.Tenths(qps10));
+            r.Set("qps", Tenths(qps10));
             r.Set("errors", Convert.ToString(b.errors));
-            r.Set("errRate", MonitorController.Rate(b.errors, b.calls));
-            r.Set("avg", Fmt.Dur(MonitorController.Avg(b.totalUs, b.calls)));
+            r.Set("errRate", Rate(b.errors, b.calls));
+            r.Set("avg", Fmt.Dur(Avg(b.totalUs, b.calls)));
             r.Set("p95", Fmt.Dur(b.p95Us));
             r.Set("max", Fmt.Dur(b.maxUs));
             r.Set("frames", Convert.ToString(b.frames));
@@ -275,10 +275,10 @@ class MonitorController : AdminController {
             r.Set("path", b.path);
             r.Set("route", b.method + " " + b.path);
             r.Set("calls", Convert.ToString(b.calls));
-            r.Set("share", MonitorController.Rate(b.calls, calls));
+            r.Set("share", Rate(b.calls, calls));
             r.Set("errors", Convert.ToString(b.errors));
-            r.Set("errRate", MonitorController.Rate(b.errors, b.calls));
-            r.Set("avg", Fmt.Dur(MonitorController.Avg(b.totalUs, b.calls)));
+            r.Set("errRate", Rate(b.errors, b.calls));
+            r.Set("avg", Fmt.Dur(Avg(b.totalUs, b.calls)));
             r.Set("p95", Fmt.Dur(b.p95Us));
             r.Set("max", Fmt.Dur(b.maxUs));
             r.Set("total", Fmt.Dur(b.totalUs));
@@ -312,11 +312,11 @@ class MonitorController : AdminController {
         long windowQps10 = 0;
         long span = to - from;
         if (span > 0) { windowQps10 = calls * 10 / span; }
-        d.Set("avgQps", MonitorController.Tenths(windowQps10));
-        d.Set("peakQps", MonitorController.Tenths(peakQps10));
+        d.Set("avgQps", Tenths(windowQps10));
+        d.Set("peakQps", Tenths(peakQps10));
         d.Set("shown", Convert.ToString(rows.Count));
         if (calls == 0) { d.Set("empty", "1"); }
-        if (rows.Count >= MonitorController.MaxRows) { d.Set("capped", "1"); }
+        if (rows.Count >= MaxRows) { d.Set("capped", "1"); }
         this.Page(d);
     }
 
@@ -327,16 +327,16 @@ class MonitorController : AdminController {
     async void Export() {
         string method = this.In("m");
         string route = this.In("route");
-        MetricWindow win = MonitorController.Window(this.In("d"), this.In("d2"),
+        MetricWindow win = Window(this.In("d"), this.In("d2"),
             this.InInt("h", 24));
-        string gran = MonitorController.Gran(this.In("g"), win.hours);
-        long step = MonitorController.Step(gran);
+        string gran = Gran(this.In("g"), win.hours);
+        long step = Step(gran);
         long from = win.from;
         long to = win.to;
         int _w = await MetricsStore.Flush();
         List<MetricMinute> rows = await MetricsStore.HistoryBuckets(from, to,
-            method, route, step, MonitorController.MaxRows);
-        if (win.dated) { rows = MonitorController.FillGaps(rows, from, to, step); }
+            method, route, step, MaxRows);
+        if (win.dated) { rows = FillGaps(rows, from, to, step); }
 
         if (this.In("format") == "json") {
             MetricsExportDoc doc = new MetricsExportDoc();
@@ -352,7 +352,7 @@ class MonitorController : AdminController {
                 o.path = route;
                 o.calls = b.calls;
                 o.errors = b.errors;
-                o.avg_us = MonitorController.Avg(b.totalUs, b.calls);
+                o.avg_us = Avg(b.totalUs, b.calls);
                 o.max_us = b.maxUs;
                 o.frames = b.frames;
                 o.bytes = b.bytes;
@@ -369,15 +369,15 @@ class MonitorController : AdminController {
             MetricMinute b = rows[i];
             sb.Append(Convert.ToString(b.minute));
             sb.Append(",");
-            sb.Append(MonitorController.Cell(method));
+            sb.Append(Cell(method));
             sb.Append(",");
-            sb.Append(MonitorController.Cell(route));
+            sb.Append(Cell(route));
             sb.Append(",");
             sb.Append(Convert.ToString(b.calls));
             sb.Append(",");
             sb.Append(Convert.ToString(b.errors));
             sb.Append(",");
-            sb.Append(Convert.ToString(MonitorController.Avg(b.totalUs, b.calls)));
+            sb.Append(Convert.ToString(Avg(b.totalUs, b.calls)));
             sb.Append(",");
             sb.Append(Convert.ToString(b.maxUs));
             sb.Append(",");
@@ -397,12 +397,12 @@ class MonitorController : AdminController {
     [Description("错误日志")]
     async void Errors() {
         ViewData d = await this.Layout("错误日志");
-        int hours = MonitorController.Hours(this.InInt("h", 24));
+        int hours = Hours(this.InInt("h", 24));
         long to = (long)WebApp.NowSeconds();
         long from = to - (long)hours * 3600;
         int _w = await MetricsStore.Flush();
         List<MetricError> rows = await MetricsStore.Errors(from, to,
-            MonitorController.MaxRows);
+            MaxRows);
         List<StrMap> items = d.AddList("rows");
         for (int i = 0; i < rows.Count; i = i + 1) {
             MetricError e = rows[i];
@@ -428,7 +428,7 @@ class MonitorController : AdminController {
     [Description("SQL 统计")]
     async void Sql() {
         ViewData d = await this.Layout("SQL 统计");
-        MetricWindow w = MonitorController.Window(this.In("d"), this.In("d2"),
+        MetricWindow w = Window(this.In("d"), this.In("d2"),
             this.InInt("h", 24));
         /* 三种排序回答三个问题：谁被调最多、谁占用服务器最多、谁最常慢——
            慢率高的未必慢（低频慢 query），占时多的才拖整体。 */
@@ -437,7 +437,7 @@ class MonitorController : AdminController {
         if (this.In("by") == "slow") { by = "slow"; }
         int _w = await MetricsStore.Flush();
         List<MetricSql> tops = await MetricsStore.SqlTotals(w.from, w.to,
-            MonitorController.MaxRoutes, by);
+            MaxRoutes, by);
 
         List<StrMap> items = d.AddList("rows");
         long calls = 0;
@@ -458,8 +458,8 @@ class MonitorController : AdminController {
                 + "&sql=" + Encoding.UrlEncode(e.sql));
             r.Set("calls", Convert.ToString(e.calls));
             r.Set("slow", Convert.ToString(e.slow));
-            r.Set("slowRate", MonitorController.Rate(e.slow, e.calls));
-            r.Set("avg", Fmt.Dur(MonitorController.Avg(e.totalUs, e.calls)));
+            r.Set("slowRate", Rate(e.slow, e.calls));
+            r.Set("avg", Fmt.Dur(Avg(e.totalUs, e.calls)));
             r.Set("max", Fmt.Dur(e.maxUs));
             r.Set("total", Fmt.Dur(e.totalUs));
             items.Add(r);
@@ -480,11 +480,11 @@ class MonitorController : AdminController {
         d.Set("shapes", Convert.ToString(tops.Count));
         d.Set("calls", Convert.ToString(calls));
         d.Set("slow", Convert.ToString(slow));
-        d.Set("slowRate", MonitorController.Rate(slow, calls));
+        d.Set("slowRate", Rate(slow, calls));
         d.Set("total", Fmt.Dur(totalUs));
         d.Set("max", Fmt.Dur(maxUs));
         if (tops.Count == 0) { d.Set("empty", "1"); }
-        if (tops.Count >= MonitorController.MaxRoutes) { d.Set("capped", "1"); }
+        if (tops.Count >= MaxRoutes) { d.Set("capped", "1"); }
         this.Page(d);
     }
 
@@ -495,7 +495,7 @@ class MonitorController : AdminController {
     [Custom(Perm = PermBit.View)]
     [Description("SQL 模板详情")]
     async void SqlDetail() {
-        MetricWindow w = MonitorController.Window(this.In("d"), this.In("d2"),
+        MetricWindow w = Window(this.In("d"), this.In("d2"),
             this.InInt("h", 24));
         int _w = await MetricsStore.Flush();
         MetricSql e = await MetricsStore.SqlOne(w.from, w.to, this.In("sql"));
@@ -510,7 +510,7 @@ class MonitorController : AdminController {
         d.Set("sql", e.sql);
         d.Set("calls", Convert.ToString(e.calls));
         d.Set("slow", Convert.ToString(e.slow));
-        d.Set("avg", Fmt.Dur(MonitorController.Avg(e.totalUs, e.calls)));
+        d.Set("avg", Fmt.Dur(Avg(e.totalUs, e.calls)));
         d.Set("max", Fmt.Dur(e.maxUs));
         this.Dialog(d);
     }
@@ -520,25 +520,25 @@ class MonitorController : AdminController {
     [Custom(Perm = PermBit.Export)]
     [Description("导出 SQL 统计")]
     async void SqlExport() {
-        MetricWindow win = MonitorController.Window(this.In("d"), this.In("d2"),
+        MetricWindow win = Window(this.In("d"), this.In("d2"),
             this.InInt("h", 24));
         string by = "calls";
         if (this.In("by") == "time") { by = "time"; }
         if (this.In("by") == "slow") { by = "slow"; }
         int _w = await MetricsStore.Flush();
         List<MetricSql> tops = await MetricsStore.SqlTotals(win.from, win.to,
-            MonitorController.MaxRoutes, by);
+            MaxRoutes, by);
         StringBuilder sb = new StringBuilder();
         sb.Append("sql,calls,slow,avg_us,max_us,total_us\n");
         for (int i = 0; i < tops.Count; i = i + 1) {
             MetricSql e = tops[i];
-            sb.Append(MonitorController.Cell(e.sql));
+            sb.Append(Cell(e.sql));
             sb.Append(",");
             sb.Append(Convert.ToString(e.calls));
             sb.Append(",");
             sb.Append(Convert.ToString(e.slow));
             sb.Append(",");
-            sb.Append(Convert.ToString(MonitorController.Avg(e.totalUs, e.calls)));
+            sb.Append(Convert.ToString(Avg(e.totalUs, e.calls)));
             sb.Append(",");
             sb.Append(Convert.ToString(e.maxUs));
             sb.Append(",");
@@ -563,27 +563,27 @@ class MonitorController : AdminController {
         if (Cfg.Metrics.enabled && MetricsStore.Ready()) {
             int _w = await MetricsStore.Flush();
             long to = (long)WebApp.NowSeconds();
-            long from = to - MonitorController.AlertWindowSec;
+            long from = to - AlertWindowSec;
             MetricMinute tot = await MetricsStore.WindowTotals(from, to, "", "");
             if (Cfg.Metrics.alertErrPct > 0
                     && tot.calls >= (long)Cfg.Metrics.alertErrCalls) {
                 long rate10 = tot.errors * 1000 / tot.calls;
                 if (rate10 >= (long)Cfg.Metrics.alertErrPct * 10) {
-                    arr.Append(MonitorController.AlertMsg("近 5 分钟错误率 "
-                        + MonitorController.Tenths(rate10) + "%（"
+                    arr.Append(AlertMsg("近 5 分钟错误率 "
+                        + Tenths(rate10) + "%（"
                         + Convert.ToString(tot.errors) + "/"
                         + Convert.ToString(tot.calls) + "）"));
                 }
             }
             if (Cfg.Metrics.alertP95Ms > 0) {
                 List<MetricMinute> rows = await MetricsStore.HistoryBuckets(
-                    from, to, "", "", 60, MonitorController.MaxRows);
+                    from, to, "", "", 60, MaxRows);
                 long worst = 0;
                 for (int i = 0; i < rows.Count; i = i + 1) {
                     if (rows[i].p95Us > worst) { worst = rows[i].p95Us; }
                 }
                 if (worst >= (long)Cfg.Metrics.alertP95Ms * 1000) {
-                    arr.Append(MonitorController.AlertMsg("近 5 分钟 P95 耗时 "
+                    arr.Append(AlertMsg("近 5 分钟 P95 耗时 "
                         + Fmt.Dur(worst)));
                 }
             }
@@ -591,7 +591,7 @@ class MonitorController : AdminController {
                 List<LiveRow> lives = await MetricsCluster.LiveRows("snapshot",
                     MetricsCluster.FreshSeconds);
                 if (lives.Count < Cfg.Worker.count) {
-                    arr.Append(MonitorController.AlertMsg("工作进程 "
+                    arr.Append(AlertMsg("工作进程 "
                         + Convert.ToString(lives.Count) + "/"
                         + Convert.ToString(Cfg.Worker.count) + " 在线"));
                 }
@@ -633,7 +633,7 @@ class MonitorController : AdminController {
             r.Set("name", SharedTable.OpenLabel(i));
             r.Set("used", Convert.ToString(used));
             r.Set("capacity", Convert.ToString(cap));
-            r.Set("fill", MonitorController.Rate(used, cap));
+            r.Set("fill", Rate(used, cap));
             r.Set("stride", Convert.ToString(
                 SharedTable.OpenStat(i, SharedTable.STAT_ROW_STRIDE)));
             r.Set("keySize", Convert.ToString(
@@ -661,7 +661,7 @@ class MonitorController : AdminController {
         d.Set("count", Convert.ToString(n));
         d.Set("usedTotal", Convert.ToString(usedTotal));
         d.Set("capacityTotal", Convert.ToString(capacityTotal));
-        d.Set("fillTotal", MonitorController.Rate(usedTotal, capacityTotal));
+        d.Set("fillTotal", Rate(usedTotal, capacityTotal));
         d.Set("pressure", Convert.ToString(pressure));
         d.Set("reserved", Fmt.Bytes(reserved));
         d.Set("resident", Fmt.Bytes(resident));
@@ -677,7 +677,7 @@ class MonitorController : AdminController {
 
     static int Hours(int h) {
         if (h < 1) { return 1; }
-        if (h > MonitorController.MaxHours) { return MonitorController.MaxHours; }
+        if (h > MaxHours) { return MaxHours; }
         return h;
     }
 
@@ -688,16 +688,16 @@ class MonitorController : AdminController {
         w.day2 = "";
         w.dated = false;
         w.invalid = false;
-        long start = MonitorController.DaySeconds(day);
+        long start = DaySeconds(day);
         if (day.Length > 0 && start < 0) { w.invalid = true; }
         if (start >= 0) {
-            long end = MonitorController.DaySeconds(day2);
+            long end = DaySeconds(day2);
             if (day2.Length > 0 && end < 0) { w.invalid = true; }
             if (end < start) { end = start; }
             long span = (end - start) / 3600 + 24;
-            if (span > (long)MonitorController.MaxHours) {
-                end = start + ((long)MonitorController.MaxHours - 24) * 3600;
-                span = (long)MonitorController.MaxHours;
+            if (span > (long)MaxHours) {
+                end = start + ((long)MaxHours - 24) * 3600;
+                span = (long)MaxHours;
             }
             w.from = start;
             w.to = end + 86399;
@@ -707,7 +707,7 @@ class MonitorController : AdminController {
             w.day2 = Fmt.Day(end);
             return w;
         }
-        w.hours = MonitorController.Hours(h);
+        w.hours = Hours(h);
         w.to = (long)WebApp.NowSeconds();
         w.from = w.to - (long)w.hours * 3600;
         return w;
@@ -719,9 +719,9 @@ class MonitorController : AdminController {
         if (s.Substring(4, 1) != "-" || s.Substring(7, 1) != "-") {
             return 0 - 1;
         }
-        int y = MonitorController.Digits(s, 0, 4);
-        int m = MonitorController.Digits(s, 5, 2);
-        int dd = MonitorController.Digits(s, 8, 2);
+        int y = Digits(s, 0, 4);
+        int m = Digits(s, 5, 2);
+        int dd = Digits(s, 8, 2);
         if (y < 1970 || m < 1 || m > 12 || dd < 1) { return 0 - 1; }
         if (dd > DateTime.DaysInMonth(y, m)) { return 0 - 1; }
         return Fmt.LocalDayStart(y, m, dd);
@@ -746,7 +746,7 @@ class MonitorController : AdminController {
         long last = (to / step) * step;
         int at = 0;
         for (long b = last; b >= first; b = b - step) {
-            if (outp.Count >= MonitorController.MaxRows) { break; }
+            if (outp.Count >= MaxRows) { break; }
             if (at < rows.Count && rows[at].minute == b) {
                 outp.Add(rows[at]);
                 at = at + 1;
@@ -793,7 +793,7 @@ class MonitorController : AdminController {
     /* part/whole 作百分比，一位小数。 */
     static string Rate(long part, long whole) {
         if (whole <= 0) { return "0.0"; }
-        return MonitorController.Tenths(part * 1000 / whole);
+        return Tenths(part * 1000 / whole);
     }
 
     /* 微秒均值；无调用桶答 0（补零小时无均值，除 0 会出错而非答数）。 */

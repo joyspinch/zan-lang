@@ -24,8 +24,8 @@ class PermTable {
      * 句柄经 Worker.ShareHandle 下发，worker 用继承的句柄映射同一块内存。
      * 全程没有名字，同机其他进程（包括别的 zan 服务）无法触及。*/
     static bool Open() {
-        long roleHandle = Worker.InheritedHandle(PermTable.ShareRoles);
-        long userHandle = Worker.InheritedHandle(PermTable.ShareUsers);
+        long roleHandle = Worker.InheritedHandle(ShareRoles);
+        long userHandle = Worker.InheritedHandle(ShareUsers);
         if (roleHandle != 0 || userHandle != 0) {
             /* worker：映射 master 下发的两张表；缺一即视为不可用，
              * 权限判断一律失败（fail closed）。*/
@@ -34,8 +34,8 @@ class PermTable {
             if (!r.IsOpen() || !u.IsOpen()) { return false; }
             r.Label("web perm roles");
             u.Label("web perm users");
-            PermTable.roles = r;
-            PermTable.users = u;
+            roles = r;
+            users = u;
             return true;
         }
 
@@ -57,31 +57,31 @@ class PermTable {
         if (!nu.CreateAnonymous()) { return false; }
         nu.Label("web perm users");
 
-        Worker.ShareHandle(PermTable.ShareRoles, nr.OsHandle());
-        Worker.ShareHandle(PermTable.ShareUsers, nu.OsHandle());
-        PermTable.roles = nr;
-        PermTable.users = nu;
+        Worker.ShareHandle(ShareRoles, nr.OsHandle());
+        Worker.ShareHandle(ShareUsers, nu.OsHandle());
+        roles = nr;
+        users = nu;
         return true;
     }
 
     static bool Ready() {
-        return PermTable.roles != null && PermTable.users != null;
+        return roles != null && users != null;
     }
 
     /* 从数据库重写所有角色掩码。启动时和授权变更后运行。*/
     static async void LoadRoles(IDbConnection db) {
-        if (!PermTable.Ready()) { return; }
+        if (!Ready()) { return; }
         List<SysRole> rows = await db.Select<SysRole>().ToListAsync();
         List<SysRoleGrant> grants = await db.Select<SysRoleGrant>().ToListAsync();
-        await PermTable.LoadRoles(rows, grants);
+        await LoadRoles(rows, grants);
     }
 
     /* 发布已加载的角色行（Controller 端使用，避免暴露请求连接）。*/
     static async void LoadRoles(List<SysRole> rows, List<SysRoleGrant> grants) {
-        if (!PermTable.Ready()) { return; }
+        if (!Ready()) { return; }
         if (rows == null) { rows = new List<SysRole>(); }
         if (grants == null) { grants = new List<SysRoleGrant>(); }
-        PermTable.roles.Clear();
+        roles.Clear();
         for (int i = 0; i < rows.Count; i = i + 1) {
             SysRole r = rows[i];
             if (r.status != 1) { continue; }
@@ -93,37 +93,37 @@ class PermTable {
                 Perm.Append(acts, grants[j].action, grants[j].mask);
             }
             string key = Convert.ToString(r.id);
-            bool _ok = PermTable.roles.SetString(key, "acts", acts.ToString());
-            bool _s = PermTable.roles.SetInt(key, "scope", r.dataScope);
+            bool _ok = roles.SetString(key, "acts", acts.ToString());
+            bool _s = roles.SetInt(key, "scope", r.dataScope);
             string depts = r.scopeDepts;
             if (depts == null) { depts = ""; }
-            bool _d = PermTable.roles.SetString(key, "depts", depts);
+            bool _d = roles.SetString(key, "depts", depts);
         }
     }
 
     static int RoleScope(string roleId) {
-        if (!PermTable.Ready()) { return 0; }
-        return PermTable.roles.GetInt(roleId, "scope");
+        if (!Ready()) { return 0; }
+        return roles.GetInt(roleId, "scope");
     }
 
     static string RoleDepts(string roleId) {
-        if (!PermTable.Ready()) { return ""; }
-        return PermTable.roles.GetString(roleId, "depts");
+        if (!Ready()) { return ""; }
+        return roles.GetString(roleId, "depts");
     }
 
     static bool RolesAllow(string roleIds, string action) {
-        if (!PermTable.Ready()) { return false; }
+        if (!Ready()) { return false; }
         int bit = Perm.BitOf(action);
         if (bit == 0) { return false; }
-        return (PermTable.RolesMask(roleIds, Perm.ScreenOf(action)) & bit) != 0;
+        return (RolesMask(roleIds, Perm.ScreenOf(action)) & bit) != 0;
     }
 
     static int RolesMask(string roleIds, string screen) {
-        if (!PermTable.Ready() || screen.Length == 0) { return 0; }
+        if (!Ready() || screen.Length == 0) { return 0; }
         int mask = 0;
-        List<string> ids = PermTable.Split(roleIds);
+        List<string> ids = Split(roleIds);
         for (int i = 0; i < ids.Count; i = i + 1) {
-            string acts = PermTable.roles.GetString(ids[i], "acts");
+            string acts = roles.GetString(ids[i], "acts");
             if (acts.Length == 0) { continue; }
             mask = mask | Perm.MaskIn(acts, screen);
         }
@@ -131,45 +131,45 @@ class PermTable {
     }
 
     static string UserRoles(string uid) {
-        if (!PermTable.Ready()) { return ""; }
-        if (!PermTable.users.Exists(uid)) { return ""; }
-        if (PermTable.users.GetInt(uid, "super") == 1) { return "*"; }
-        return PermTable.users.GetString(uid, "roles");
+        if (!Ready()) { return ""; }
+        if (!users.Exists(uid)) { return ""; }
+        if (users.GetInt(uid, "super") == 1) { return "*"; }
+        return users.GetString(uid, "roles");
     }
 
     static int UserScope(string uid) {
-        if (!PermTable.Ready()) { return 0; }
-        if (!PermTable.users.Exists(uid)) { return 0; }
-        return PermTable.users.GetInt(uid, "scope");
+        if (!Ready()) { return 0; }
+        if (!users.Exists(uid)) { return 0; }
+        return users.GetInt(uid, "scope");
     }
 
     static string UserDepts(string uid) {
-        if (!PermTable.Ready()) { return ""; }
-        return PermTable.users.GetString(uid, "depts");
+        if (!Ready()) { return ""; }
+        return users.GetString(uid, "depts");
     }
 
     static void SetUserScope(string uid, int mode, string depts) {
-        if (!PermTable.Ready()) { return; }
-        bool _m = PermTable.users.SetInt(uid, "scope", mode);
-        bool _d = PermTable.users.SetString(uid, "depts", depts);
-        bool _e = PermTable.users.Expire(uid, PermTable.UserLeaseMs);
+        if (!Ready()) { return; }
+        bool _m = users.SetInt(uid, "scope", mode);
+        bool _d = users.SetString(uid, "depts", depts);
+        bool _e = users.Expire(uid, UserLeaseMs);
     }
 
     static void SetUser(string uid, bool isSuper, string roleIds) {
-        if (!PermTable.Ready()) { return; }
-        bool _s = PermTable.users.SetInt(uid, "super", isSuper ? 1 : 0);
-        bool _r = PermTable.users.SetString(uid, "roles", roleIds);
-        bool _e = PermTable.users.Expire(uid, PermTable.UserLeaseMs);
+        if (!Ready()) { return; }
+        bool _s = users.SetInt(uid, "super", isSuper ? 1 : 0);
+        bool _r = users.SetString(uid, "roles", roleIds);
+        bool _e = users.Expire(uid, UserLeaseMs);
     }
 
     static void Forget(string uid) {
-        if (!PermTable.Ready()) { return; }
-        bool _d = PermTable.users.Delete(uid);
+        if (!Ready()) { return; }
+        bool _d = users.Delete(uid);
     }
 
     static void ForgetAll() {
-        if (!PermTable.Ready()) { return; }
-        PermTable.users.Clear();
+        if (!Ready()) { return; }
+        users.Clear();
     }
 
     static List<string> Split(string joined) {

@@ -17,34 +17,34 @@ class ClusterBus {
 
     /* 初始化总线状态（在 main.zan 中服务装配时调用）。*/
     static void Init(ClusterCfg cfg, RedisPool redisPool) {
-        ClusterBus.enabled = (cfg != null && cfg.enabled && redisPool != null);
-        if (ClusterBus.enabled) {
-            ClusterBus.channel = cfg.channel;
-            ClusterBus.pool = redisPool;
-            Log.Info("[cluster] bus initialized on channel " + ClusterBus.channel);
+        enabled = (cfg != null && cfg.enabled && redisPool != null);
+        if (enabled) {
+            channel = cfg.channel;
+            pool = redisPool;
+            Log.Info("[cluster] bus initialized on channel " + channel);
         }
     }
 
     /* 集群总线是否已启用。*/
     static bool Enabled() {
-        return ClusterBus.enabled;
+        return enabled;
     }
 
     /* 启动后台订阅监听协程（仅在 ClusterBus.enabled 时有意义）。*/
     static void Start() {
-        if (!ClusterBus.enabled || ClusterBus.listening) { return; }
-        ClusterBus.listening = true;
-        Task.Spawn(ClusterBus.ListenLoop());
+        if (!enabled || listening) { return; }
+        listening = true;
+        Task.Spawn(ListenLoop());
     }
 
     /* 停止监听。*/
     static void Stop() {
-        ClusterBus.listening = false;
+        listening = false;
     }
 
     /* 后台订阅长循环。*/
     static async void ListenLoop() {
-        while (ClusterBus.listening) {
+        while (listening) {
             RedisClient subClient = null;
             try {
                 subClient = await RedisClient.ConnectAsync(
@@ -56,10 +56,10 @@ class ClusterBus {
 
                 List<string> args = new List<string>();
                 args.Add("SUBSCRIBE");
-                args.Add(ClusterBus.channel);
+                args.Add(channel);
                 RedisReply _sub = await subClient.CommandAsync(args);
 
-                while (ClusterBus.listening) {
+                while (listening) {
                     RedisReply reply = await subClient.readReply();
                     if (reply == null || reply.IsNil() || reply.IsError()) {
                         break;
@@ -69,7 +69,7 @@ class ClusterBus {
                         if (tag != null && tag.AsString() == "message") {
                             RedisReply payloadRep = reply.At(2);
                             if (payloadRep != null) {
-                                ClusterBus.Dispatch(payloadRep.AsString());
+                                Dispatch(payloadRep.AsString());
                             }
                         }
                     }
@@ -82,7 +82,7 @@ class ClusterBus {
                 }
             }
 
-            if (ClusterBus.listening) {
+            if (listening) {
                 await Task.Delay(2000);
             }
         }
@@ -110,39 +110,39 @@ class ClusterBus {
 
     /* 广播单用户失效事件。*/
     static async void PublishEvictUser(string uid) {
-        if (!ClusterBus.enabled || ClusterBus.pool == null || uid.Length == 0) { return; }
-        RedisClient client = await ClusterBus.pool.AcquireAsync();
+        if (!enabled || pool == null || uid.Length == 0) { return; }
+        RedisClient client = await pool.AcquireAsync();
         if (client == null) { return; }
         try {
             string json = "{\"type\":\"evict_user\",\"uid\":\"" + uid + "\"}";
             List<string> args = new List<string>();
             args.Add("PUBLISH");
-            args.Add(ClusterBus.channel);
+            args.Add(channel);
             args.Add(json);
             RedisReply _rep = await client.CommandAsync(args);
         } catch (Exception ex) {
             Log.Warn("[cluster] publish evict_user failed: " + ex.Message);
         } finally {
-            ClusterBus.pool.Release(client);
+            pool.Release(client);
         }
     }
 
     /* 广播全量失效事件。*/
     static async void PublishEvictAll() {
-        if (!ClusterBus.enabled || ClusterBus.pool == null) { return; }
-        RedisClient client = await ClusterBus.pool.AcquireAsync();
+        if (!enabled || pool == null) { return; }
+        RedisClient client = await pool.AcquireAsync();
         if (client == null) { return; }
         try {
             string json = "{\"type\":\"evict_all\"}";
             List<string> args = new List<string>();
             args.Add("PUBLISH");
-            args.Add(ClusterBus.channel);
+            args.Add(channel);
             args.Add(json);
             RedisReply _rep = await client.CommandAsync(args);
         } catch (Exception ex) {
             Log.Warn("[cluster] publish evict_all failed: " + ex.Message);
         } finally {
-            ClusterBus.pool.Release(client);
+            pool.Release(client);
         }
     }
 }

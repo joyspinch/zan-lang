@@ -31,7 +31,7 @@ class Gen {
 
     /* 源码标识符既不能逃逸目录，也不能是 Zan 关键字或生成类已有成员。 */
     static bool SafeCode(string name) {
-        if (!Gen.Safe(name)) { return false; }
+        if (!Safe(name)) { return false; }
         string reserved = ",abstract,as,async,await,base,bool,break,case,catch,char,class,const,continue,decimal,default,delegate,do,double,else,enum,event,extern,false,finally,float,for,foreach,get,if,in,int,interface,internal,is,long,namespace,new,null,object,out,override,params,private,protected,public,return,set,short,static,string,struct,switch,this,throw,true,try,using,var,virtual,void,where,while,yield,ToRow,id,";
         return !reserved.Contains("," + name + ",");
     }
@@ -56,14 +56,14 @@ class Gen {
 
     /* 从数据库恢复的旧设计也必须过同一入口校验，不能只依赖保存时检查。 */
     static bool Valid(SysGenTable t, List<SysGenColumn> cols) {
-        if (!Gen.Safe(t.tableName) || t.tableName.ToLower().StartsWith("sys_")
-            || !Gen.SafeCode(t.entityName) || !Gen.Safe(t.section)
+        if (!Safe(t.tableName) || t.tableName.ToLower().StartsWith("sys_")
+            || !SafeCode(t.entityName) || !Safe(t.section)
             || t.entityName == "RowView" || t.entityName == "AdminController"
             || t.entityName == "AppController" || t.entityName == "Gen") { return false; }
         List<string> names = new List<string>();
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
-            if (!Gen.SafeCode(c.name) || names.Contains(c.name)
+            if (!SafeCode(c.name) || names.Contains(c.name)
                 || !(c.kind == "string" || c.kind == "text" || c.kind == "int"
                     || c.kind == "long" || c.kind == "decimal" || c.kind == "bool"
                     || c.kind == "datetime") || c.size < 0 || c.size > 4000) { return false; }
@@ -89,7 +89,7 @@ class Gen {
 
     /* 建表或追加设计中有而表缺失的列，不删列不改类型。 */
     static async int Migrate(IDbConnection db, SysGenTable t, List<SysGenColumn> cols) {
-        return await DbSchema.MigrateAsync(db, t.tableName, Gen.Columns(cols));
+        return await DbSchema.MigrateAsync(db, t.tableName, Columns(cols));
     }
 
     /* ---- 源码生成 ---- */
@@ -113,9 +113,9 @@ class Gen {
     /* 生成实体类源码。 */
     static string ModelSource(SysGenTable t, List<SysGenColumn> cols) {
         StringBuilder b = new StringBuilder();
-        b.Append(Gen.ZanHeader());
+        b.Append(ZanHeader());
         b.Append("using System;\nusing System.Data.Orm;\nusing ZanWeb.Web;\n\nnamespace ZanWeb.Model.Gen;\n\n");
-        b.Append("/// <summary>" + Gen.Comment(t.title) + "。由表设计器生成，可直接修改。</summary>\n");
+        b.Append("/// <summary>" + Comment(t.title) + "。由表设计器生成，可直接修改。</summary>\n");
         b.Append("[Table(Name = \"" + t.tableName + "\")]\n");
         b.Append("class " + t.entityName + " : RowView {\n");
         b.Append("    [Column(IsIdentity = true)]\n    int id;\n");
@@ -124,13 +124,13 @@ class Gen {
             if (c.name == "id") { continue; }
             b.Append("\n");
             if (c.label.Length > 0) {
-                b.Append("    /// <summary>" + Gen.Comment(c.label) + "</summary>\n");
+                b.Append("    /// <summary>" + Comment(c.label) + "</summary>\n");
             }
             if (c.kind == "string") {
                 b.Append("    [Column(StringLength = "
-                    + Convert.ToString(Gen.Size(c)) + ")]\n");
+                    + Convert.ToString(Size(c)) + ")]\n");
             }
-            b.Append("    " + Gen.ZanType(c.kind) + " " + c.name + ";\n");
+            b.Append("    " + ZanType(c.kind) + " " + c.name + ";\n");
         }
         /* 视图行自述投影：管理列表与前台列表的键集并集，datetime 出人读日。 */
         b.Append("\n    public void ToRow(StrMap row) {\n");
@@ -144,7 +144,7 @@ class Gen {
             } else if (c.kind == "bool") {
                 b.Append("        if (this." + c.name
                     + " == 1) { row.Set(\"" + c.name + "\", \"1\"); }\n");
-            } else if (Gen.ZanType(c.kind) == "string") {
+            } else if (ZanType(c.kind) == "string") {
                 b.Append("        row.Set(\"" + c.name + "\", this."
                     + c.name + ");\n");
             } else {
@@ -175,14 +175,14 @@ class Gen {
     /* 生成模块的 URL 路径（section/表名），侧边栏共享此 URL。 */
     static string Route(SysGenTable t) {
         string sec = t.section;
-        if (!Gen.Safe(sec)) { sec = "content"; }
+        if (!Safe(sec)) { sec = "content"; }
         return sec + "/" + t.tableName.Replace("_", "");
     }
 
     /* 设计的默认排序列：必须是设计里真实存在的列（id 不在列清单里，单独放行），否则回落 id。 */
     static string OrderCol(SysGenTable t, List<SysGenColumn> cols) {
         if (t.orderColumn == "id") { return "id"; }
-        if (Gen.SafeCode(t.orderColumn)) {
+        if (SafeCode(t.orderColumn)) {
             for (int i = 0; i < cols.Count; i = i + 1) {
                 if (cols[i].name == t.orderColumn) { return t.orderColumn; }
             }
@@ -193,20 +193,20 @@ class Gen {
     /* 关联列的取值/标签列名：设计器默认 id/name，非法配置回落 id——
        这些名字要进 emitted 的 DbTable 查询，不能带着注入通道出去。 */
     static string RelValue(SysGenColumn c) {
-        if (Gen.SafeCode(c.relValue)) { return c.relValue; }
+        if (SafeCode(c.relValue)) { return c.relValue; }
         return "id";
     }
 
     static string RelLabel(SysGenColumn c) {
-        if (Gen.SafeCode(c.relLabel)) { return c.relLabel; }
+        if (SafeCode(c.relLabel)) { return c.relLabel; }
         return "id";
     }
 
     /* 关联下拉只在 relTable 是本设计器里的一张表时才服务端喂数；
        指向陌生表时没有可靠的标签列，退回普通输入框。 */
     static bool RelDesigned(SysGenColumn c, List<SysGenTable> designed) {
-        if (c.relTable.Length == 0 || !Gen.Safe(c.relTable)) { return false; }
-        return Gen.DesignedOf(designed, c.relTable) != null;
+        if (c.relTable.Length == 0 || !Safe(c.relTable)) { return false; }
+        return DesignedOf(designed, c.relTable) != null;
     }
 
     /* 按表名找设计行；designed 传本设计器的全部表（Pick 需要对方的路由）。 */
@@ -220,11 +220,11 @@ class Gen {
     /* 选项端点与关联下拉的标签列：显式 labelColumn 必须是设计里真实存在的
        string 列；否则按 name→title→首个 string 列探测，全无则回落 id。 */
     static string LabelCol(SysGenTable t, List<SysGenColumn> cols) {
-        if (Gen.SafeCode(t.labelColumn) && Gen.HasStringCol(cols, t.labelColumn)) {
+        if (SafeCode(t.labelColumn) && HasStringCol(cols, t.labelColumn)) {
             return t.labelColumn;
         }
-        if (Gen.HasStringCol(cols, "name")) { return "name"; }
-        if (Gen.HasStringCol(cols, "title")) { return "title"; }
+        if (HasStringCol(cols, "name")) { return "name"; }
+        if (HasStringCol(cols, "title")) { return "title"; }
         for (int i = 0; i < cols.Count; i = i + 1) {
             if (cols[i].name != "id" && cols[i].kind == "string") { return cols[i].name; }
         }
@@ -242,16 +242,16 @@ class Gen {
        时间列恒为区间选择；其余按 filterOp（like/eq/range），不合法值与 auto
        时按类型回落——文本模糊、数值精确。select 无选项源时没有意义，同样回落。 */
     static string FilterOpOf(SysGenColumn c, List<SysGenTable> designed) {
-        if (Gen.RelDesigned(c, designed)) { return "pick"; }
-        if (c.dictType.Length > 0 && Gen.Safe(c.dictType)) { return "select"; }
+        if (RelDesigned(c, designed)) { return "pick"; }
+        if (c.dictType.Length > 0 && Safe(c.dictType)) { return "select"; }
         if (c.kind == "bool") { return "select"; }
         if (c.kind == "datetime") { return "time"; }
         string op = c.filterOp == null ? "" : c.filterOp;
         if (op != "like" && op != "eq" && op != "select" && op != "range") { op = ""; }
         if (op == "select") { op = ""; }
-        if (op.Length == 0) { op = Gen.ZanType(c.kind) == "string" ? "like" : "eq"; }
-        if (op == "like" && Gen.ZanType(c.kind) != "string") { op = "eq"; }
-        if (op == "range" && Gen.ZanType(c.kind) == "string") { op = "like"; }
+        if (op.Length == 0) { op = ZanType(c.kind) == "string" ? "like" : "eq"; }
+        if (op == "like" && ZanType(c.kind) != "string") { op = "eq"; }
+        if (op == "range" && ZanType(c.kind) == "string") { op = "like"; }
         return op;
     }
 
@@ -262,7 +262,7 @@ class Gen {
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
             if (c.name == name) {
-                if (c.kind == "bool" || (c.dictType.Length > 0 && Gen.Safe(c.dictType))) {
+                if (c.kind == "bool" || (c.dictType.Length > 0 && Safe(c.dictType))) {
                     return c;
                 }
                 return null;
@@ -273,7 +273,7 @@ class Gen {
 
     /* 列表列宽只放行「纯数字+px/em/%」的紧凑形态（≤16 字符），其余按类型默认。 */
     static string ColWidth(SysGenColumn c) {
-        return Gen.WidthOf(c.listWidth == null ? "" : c.listWidth);
+        return WidthOf(c.listWidth == null ? "" : c.listWidth);
     }
 
     static string WidthOf(string w) {
@@ -304,12 +304,12 @@ class Gen {
     }
 
     static string ZanHeader() {
-        return "/* 由表设计器生成于 " + Gen.Stamp()
+        return "/* 由表设计器生成于 " + Stamp()
             + "，重新生成会覆盖本文件；可直接修改。 */\n";
     }
 
     static string HtmlHeader() {
-        return "<!-- 由表设计器生成于 " + Gen.Stamp()
+        return "<!-- 由表设计器生成于 " + Stamp()
             + "；可直接修改，重新生成会覆盖本文件。 -->\n";
     }
 
@@ -317,8 +317,8 @@ class Gen {
         List<SysGenTable> designed) {
         string cls = t.entityName + "Controller";
         string mdl = "ZanWeb.Model.Gen." + t.entityName;
-        string route = Gen.Route(t);
-        string orderCol = Gen.OrderCol(t, cols);
+        string route = Route(t);
+        string orderCol = OrderCol(t, cols);
         string orderCall = "OrderBy(a => a." + orderCol + ")";
         if (t.orderDesc == 1) { orderCall = "OrderByDescending(a => a." + orderCol + ")"; }
         bool hasDict = false;
@@ -326,11 +326,11 @@ class Gen {
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
             if (c.name == "id") { continue; }
-            if (c.dictType.Length > 0 && Gen.Safe(c.dictType)) { hasDict = true; }
-            if (Gen.RelDesigned(c, designed)) { hasRelLabel = true; }
+            if (c.dictType.Length > 0 && Safe(c.dictType)) { hasDict = true; }
+            if (RelDesigned(c, designed)) { hasRelLabel = true; }
         }
         /* 页签列与菜单图标：菜单图标仅字符兜底，页签列的字典/布尔校验在 TabColOf。 */
-        SysGenColumn tabC = Gen.TabColOf(t, cols);
+        SysGenColumn tabC = TabColOf(t, cols);
         string tabCol = tabC == null ? "" : tabC.name;
         string menuIcon = t.menuIcon == null ? "" : t.menuIcon.Trim();
         /* 动作开关：关闭的动作不生成端点，列表不出对应入口（增/改/删/菜单）。 */
@@ -339,18 +339,18 @@ class Gen {
         bool hasDelete = t.hasDelete == 1;
         bool inMenu = t.menuEnabled == 1;
         StringBuilder b = new StringBuilder();
-        b.Append(Gen.ZanHeader());
+        b.Append(ZanHeader());
         b.Append("using System;\nusing System.Data;\nusing System.Data.Orm;\n");
         b.Append("using System.Json;\n");
         b.Append("using System.Web;\nusing ZanWeb.Core;\n");
         b.Append("using ZanWeb.Dao;\nusing ZanWeb.Model;\n");
         b.Append("using ZanWeb.Security;\nusing ZanWeb.Web;\nusing ZanWeb.Services;\n\n");
         b.Append("namespace ZanWeb.Admin;\n\n");
-        b.Append("/// <summary>" + Gen.Comment(t.title)
+        b.Append("/// <summary>" + Comment(t.title)
             + " 管理。由表设计器生成，可直接修改。</summary>\n");
         b.Append("[Route(\"admin/" + route + "/[action]\")]\n");
         b.Append("[Custom(Authorization = CustomAuthorization.Grant)]\n");
-        b.Append("[Description(\"" + Gen.Literal(t.title) + "\")]\n");
+        b.Append("[Description(\"" + Literal(t.title) + "\")]\n");
         b.Append("class " + cls + " : AdminController {\n");
 
         /* 本屏唯一声明：列、筛选、行内写动作白名单。字典与关联的选项是运行时
@@ -362,11 +362,11 @@ class Gen {
             if (c.name == "id" || (c.inList != 1 && c.inFilter != 1)) { continue; }
             /* 字典列的选项是运行时数据（列表 Tag 与筛选 Select 都吃它），按请求
                查好拼进声明；关联筛选走 options 端点远程搜索（Pick），不预载。 */
-            if (c.dictType.Length > 0 && Gen.Safe(c.dictType)) {
+            if (c.dictType.Length > 0 && Safe(c.dictType)) {
                 b.Append("        string " + c.name + "Opts = \"\";\n");
                 b.Append("        List<SysDictItem> " + c.name
                     + "Items = await new SysDictItemDao(this).ByTypeCodeActive(\""
-                    + Gen.Literal(c.dictType) + "\");\n");
+                    + Literal(c.dictType) + "\");\n");
                 b.Append("        for (int i = 0; i < " + c.name
                     + "Items.Count; i = i + 1) {\n");
                 b.Append("            if (" + c.name
@@ -381,14 +381,14 @@ class Gen {
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
             if (c.name == "id" || c.inList != 1) { continue; }
-            string width = Gen.ColWidth(c);
+            string width = ColWidth(c);
             if (width.Length == 0) {
-                if (Gen.ColKind(c.kind) == "num") { width = "90px"; }
+                if (ColKind(c.kind) == "num") { width = "90px"; }
                 if (c.kind == "datetime") { width = "130px"; }
             }
-            string label = Gen.Literal(Gen.LabelOf(c));
-            bool dictFed = c.dictType.Length > 0 && Gen.Safe(c.dictType);
-            bool relFed = Gen.RelDesigned(c, designed);
+            string label = Literal(LabelOf(c));
+            bool dictFed = c.dictType.Length > 0 && Safe(c.dictType);
+            bool relFed = RelDesigned(c, designed);
             if (c.kind == "bool") {
                 b.Append("            .Tag(\"" + c.name + "\", \"" + label
                     + "\", \"1=是|ok,0=否|off\", \"" + width + "\")\n");
@@ -400,20 +400,20 @@ class Gen {
                     + "\", \"text\", \"" + width + "\")\n");
             } else {
                 b.Append("            .Col(\"" + c.name + "\", \"" + label
-                    + "\", \"" + Gen.ColKind(c.kind) + "\", \"" + width + "\")\n");
+                    + "\", \"" + ColKind(c.kind) + "\", \"" + width + "\")\n");
             }
         }
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
             if (c.name == "id" || c.inFilter != 1) { continue; }
             if (tabCol.Length > 0 && c.name == tabCol) { continue; }
-            string label = Gen.Literal(Gen.LabelOf(c));
-            bool dictFed = c.dictType.Length > 0 && Gen.Safe(c.dictType);
-            string op = Gen.FilterOpOf(c, designed);
+            string label = Literal(LabelOf(c));
+            bool dictFed = c.dictType.Length > 0 && Safe(c.dictType);
+            string op = FilterOpOf(c, designed);
             if (op == "pick") {
-                SysGenTable rel = Gen.DesignedOf(designed, c.relTable);
+                SysGenTable rel = DesignedOf(designed, c.relTable);
                 b.Append("            .Pick(\"" + label + "\", \"" + c.name + "\", \""
-                    + c.name + "\", \"/admin/" + Gen.Route(rel) + "/options\")\n");
+                    + c.name + "\", \"/admin/" + Route(rel) + "/options\")\n");
             } else if (op == "select") {
                 string opts = c.kind == "bool" ? "\"1=是,0=否\"" : c.name + "Opts";
                 b.Append("            .Select(\"" + label + "\", \"" + c.name + "\", \""
@@ -454,8 +454,8 @@ class Gen {
             /* 行内编辑是编辑的快捷通道：inEdit 且未显式关行内（inQuick），
                字典/关联/时间列的语义行内控件表达不了，恒不进白名单。 */
             if (c.name == "id" || c.inEdit != 1 || c.inQuick != 1) { continue; }
-            bool fed = (c.dictType.Length > 0 && Gen.Safe(c.dictType))
-                || Gen.RelDesigned(c, designed);
+            bool fed = (c.dictType.Length > 0 && Safe(c.dictType))
+                || RelDesigned(c, designed);
             if (fed || c.kind == "datetime") { continue; }
             if (edits.Length > 0) { edits = edits + ","; }
             string ft = "text";
@@ -467,9 +467,9 @@ class Gen {
 
         /* 选项端点（data-pick 契约）：?id= 单条回显、?kw= 标签包含匹配，
            最多 20 条；标签列按 labelColumn 或探测列。关联筛选的远程搜索打这里。 */
-        string labelCol = Gen.LabelCol(t, cols);
+        string labelCol = LabelCol(t, cols);
         b.Append("\n    [HttpGet]\n    [Custom(Perm = PermBit.View)]\n");
-        b.Append("    [Description(\"" + Gen.Literal(t.title) + "选项\")]\n");
+        b.Append("    [Description(\"" + Literal(t.title) + "选项\")]\n");
         b.Append("    async void Options() {\n");
         b.Append("        string kw = this.In(\"kw\").Trim();\n");
         b.Append("        string idv = this.In(\"id\").Trim();\n");
@@ -520,13 +520,13 @@ class Gen {
             b.Append("    [Custom(IsMenu = false, Perm = PermBit.View)]\n");
         } else if (menuIcon.Length > 0) {
             b.Append("    [Custom(IsMenu = true, Perm = PermBit.View, Icon = \""
-                + Gen.Literal(menuIcon) + "\")]\n");
+                + Literal(menuIcon) + "\")]\n");
         } else {
             b.Append("    [Custom(IsMenu = true, Perm = PermBit.View)]\n");
         }
-        b.Append("    [Description(\"" + Gen.Literal(t.title) + "列表\")]\n");
+        b.Append("    [Description(\"" + Literal(t.title) + "列表\")]\n");
         b.Append("    async void Index() {\n");
-        b.Append("        ViewData d = await this.Layout(\"" + Gen.Literal(t.title) + "\");\n");
+        b.Append("        ViewData d = await this.Layout(\"" + Literal(t.title) + "\");\n");
         b.Append("        if (!this.DbReady()) { d.Set(\"dbDown\", \"1\"); this.Page(d); return; }\n");
         b.Append("        ListPage lp = await this.Screen();\n");
         if (tabC != null) {
@@ -549,7 +549,7 @@ class Gen {
                 b.Append("        tabItems.Add(tabN);\n");
             } else {
                 b.Append("        List<SysDictItem> tabDict = await new SysDictItemDao(this).ByTypeCodeActive(\""
-                    + Gen.Literal(tabC.dictType) + "\");\n");
+                    + Literal(tabC.dictType) + "\");\n");
                 b.Append("        for (int i = 0; i < tabDict.Count; i = i + 1) {\n");
                 b.Append("            StrMap o = new StrMap();\n");
                 b.Append("            o.Set(\"value\", Convert.ToString(tabDict[i].value));\n");
@@ -564,9 +564,9 @@ class Gen {
         }
         b.Append("        List<OrmCond> conds = lp.Collect(this);\n");
         b.Append("        ListQuery q = this.Paged(\"" + orderCol + "\", "
-            + Convert.ToString(Gen.PageSizeOf(t)) + ");\n");
+            + Convert.ToString(PageSizeOf(t)) + ");\n");
         /* 筛选局部变量 + WhereIf：与 ListPage.Collect 语义逐条对齐，共享发射。 */
-        string whereLines = Gen.FilterEmit(b, cols, designed, tabCol);
+        string whereLines = FilterEmit(b, cols, designed, tabCol);
         b.Append("        int total = await this." + t.entityName + "\n");
         b.Append(whereLines);
         b.Append("            .CountAsync();\n");
@@ -578,17 +578,17 @@ class Gen {
         b.Append("        Rows.Project(rows, items);\n");
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
-            if (c.name == "id" || c.inList != 1 || !Gen.RelDesigned(c, designed)) { continue; }
+            if (c.name == "id" || c.inList != 1 || !RelDesigned(c, designed)) { continue; }
             b.Append("        StrMap " + c.name + "Names = new StrMap();\n");
             b.Append("        DbResult " + c.name + "Rows = await DbTable.Of(this.Held(), \""
                 + c.relTable + "\").Query()\n");
-            b.Append("            .OrderBy(\"" + Gen.RelLabel(c)
+            b.Append("            .OrderBy(\"" + RelLabel(c)
                 + "\").Limit(500).ToResultAsync();\n");
             b.Append("        if (" + c.name + "Rows != null) {\n");
             b.Append("            int " + c.name + "V = " + c.name
-                + "Rows.GetColumnIndex(\"" + Gen.RelValue(c) + "\");\n");
+                + "Rows.GetColumnIndex(\"" + RelValue(c) + "\");\n");
             b.Append("            int " + c.name + "L = " + c.name
-                + "Rows.GetColumnIndex(\"" + Gen.RelLabel(c) + "\");\n");
+                + "Rows.GetColumnIndex(\"" + RelLabel(c) + "\");\n");
             b.Append("            if (" + c.name + "V >= 0 && " + c.name + "L >= 0) {\n");
             b.Append("                for (int i = 0; i < " + c.name
                 + "Rows.RowCount(); i = i + 1) {\n");
@@ -614,9 +614,9 @@ class Gen {
         if (t.exportEnabled == 1) {
             /* CSV 导出：同款筛选与排序，Take(50000) 兜底；字典/关联翻译成标签。 */
             b.Append("    [HttpGet]\n    [Custom(Perm = PermBit.Export)]\n");
-            b.Append("    [Description(\"导出" + Gen.Literal(t.title) + "CSV\")]\n");
+            b.Append("    [Description(\"导出" + Literal(t.title) + "CSV\")]\n");
             b.Append("    async void Export() {\n");
-            string whereLines = Gen.FilterEmit(b, cols, designed, tabCol);
+            string whereLines = FilterEmit(b, cols, designed, tabCol);
             b.Append("        List<" + mdl + "> rows = await this." + t.entityName + "\n");
             b.Append(whereLines);
             b.Append("            ." + orderCall + "\n");
@@ -624,27 +624,27 @@ class Gen {
             for (int i = 0; i < cols.Count; i = i + 1) {
                 SysGenColumn c = cols[i];
                 if (c.name == "id" || c.inList != 1) { continue; }
-                if (c.dictType.Length > 0 && Gen.Safe(c.dictType)) {
+                if (c.dictType.Length > 0 && Safe(c.dictType)) {
                     b.Append("        StrMap " + c.name + "Map = new StrMap();\n");
                     b.Append("        List<SysDictItem> " + c.name
                         + "Items = await new SysDictItemDao(this).ByTypeCodeActive(\""
-                        + Gen.Literal(c.dictType) + "\");\n");
+                        + Literal(c.dictType) + "\");\n");
                     b.Append("        for (int i = 0; i < " + c.name
                         + "Items.Count; i = i + 1) {\n");
                     b.Append("            " + c.name + "Map.Set(Convert.ToString("
                         + c.name + "Items[i].value), " + c.name + "Items[i].label);\n");
                     b.Append("        }\n");
-                } else if (Gen.RelDesigned(c, designed)) {
+                } else if (RelDesigned(c, designed)) {
                     b.Append("        StrMap " + c.name + "Names = new StrMap();\n");
                     b.Append("        DbResult " + c.name + "Rows = await DbTable.Of(this.Held(), \""
                         + c.relTable + "\").Query()\n");
-                    b.Append("            .OrderBy(\"" + Gen.RelLabel(c)
+                    b.Append("            .OrderBy(\"" + RelLabel(c)
                         + "\").Limit(500).ToResultAsync();\n");
                     b.Append("        if (" + c.name + "Rows != null) {\n");
                     b.Append("            int " + c.name + "V = " + c.name
-                        + "Rows.GetColumnIndex(\"" + Gen.RelValue(c) + "\");\n");
+                        + "Rows.GetColumnIndex(\"" + RelValue(c) + "\");\n");
                     b.Append("            int " + c.name + "L = " + c.name
-                        + "Rows.GetColumnIndex(\"" + Gen.RelLabel(c) + "\");\n");
+                        + "Rows.GetColumnIndex(\"" + RelLabel(c) + "\");\n");
                     b.Append("            if (" + c.name + "V >= 0 && " + c.name + "L >= 0) {\n");
                     b.Append("                for (int i = 0; i < " + c.name
                         + "Rows.RowCount(); i = i + 1) {\n");
@@ -663,7 +663,7 @@ class Gen {
                 SysGenColumn c = cols[i];
                 if (c.name == "id" || c.inList != 1) { continue; }
                 b.Append("        head = head + \",\" + CsvCell(\""
-                    + Gen.Literal(Gen.LabelOf(c)) + "\");\n");
+                    + Literal(LabelOf(c)) + "\");\n");
             }
             b.Append("        sb.Append(head + \"\\n\");\n");
             b.Append("        for (int i = 0; i < rows.Count; i = i + 1) {\n");
@@ -678,9 +678,9 @@ class Gen {
                 } else if (c.kind == "datetime") {
                     v = "(rows[i]." + c.name
                         + " > 0 ? Fmt.DayInput(rows[i]." + c.name + ") : \"\")";
-                } else if (c.dictType.Length > 0 && Gen.Safe(c.dictType)) {
+                } else if (c.dictType.Length > 0 && Safe(c.dictType)) {
                     v = "CsvDict(" + c.name + "Map, Convert.ToString(rows[i]." + c.name + "))";
-                } else if (Gen.RelDesigned(c, designed)) {
+                } else if (RelDesigned(c, designed)) {
                     v = "CsvDict(" + c.name + "Names, Convert.ToString(rows[i]." + c.name + "))";
                 } else {
                     v = "Convert.ToString(rows[i]." + c.name + ")";
@@ -714,36 +714,36 @@ class Gen {
 
         /* 表格配置契约：本屏声明 → adminUI ZanTable 的 ListConfData JSON。 */
         b.Append("    [HttpGet]\n    [Custom(Perm = PermBit.View)]\n");
-        b.Append("    [Description(\"" + Gen.Literal(t.title) + "表格配置\")]\n");
+        b.Append("    [Description(\"" + Literal(t.title) + "表格配置\")]\n");
         b.Append("    async void Conf() {\n");
         b.Append("        CrudOps.Conf(this, await this.Screen());\n");
         b.Append("    }\n\n");
 
         if (hasEdit) {
             b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Update)]\n");
-            b.Append("    [Description(\"编辑" + Gen.Literal(t.title) + "字段\")]\n");
+            b.Append("    [Description(\"编辑" + Literal(t.title) + "字段\")]\n");
             b.Append("    async void Field() {\n");
             b.Append("        int id = this.InInt(\"id\", 0);\n");
             b.Append("        " + mdl + " cur = await this." + t.entityName + ".Read(id);\n");
             b.Append("        List<int> allowed = new List<int>();\n");
             b.Append("        if (cur != null) { allowed.Add(id); }\n");
-            b.Append("        await CrudOps.Field(this, await this.Screen(), \"" + Gen.Literal(t.title)
+            b.Append("        await CrudOps.Field(this, await this.Screen(), \"" + Literal(t.title)
                 + "\", this.In(\"field\").Trim(), this.In(\"value\"), allowed);\n");
             b.Append("    }\n\n");
         }
 
         if (hasDelete) {
             b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Delete)]\n");
-            b.Append("    [Description(\"批量删除" + Gen.Literal(t.title) + "\")]\n");
+            b.Append("    [Description(\"批量删除" + Literal(t.title) + "\")]\n");
             b.Append("    async void BatchDelete() {\n");
             b.Append("        await CrudOps.Delete(this, await this.Screen(),"
-                + " this.Ids(\"ids\"), \"批量删除" + Gen.Literal(t.title) + "\");\n");
+                + " this.Ids(\"ids\"), \"批量删除" + Literal(t.title) + "\");\n");
             b.Append("    }\n\n");
         }
 
         if (hasCreate || hasEdit) {
             b.Append("    [HttpGet]\n    [Custom(Perm = PermBit.Create | PermBit.Update)]\n");
-            b.Append("    [Description(\"" + Gen.Literal(t.title) + "表单\")]\n");
+            b.Append("    [Description(\"" + Literal(t.title) + "表单\")]\n");
             b.Append("    async void Form() {\n");
         b.Append("        int id = this.InInt(\"id\", 0);\n");
         b.Append("        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {\n");
@@ -756,8 +756,8 @@ class Gen {
         b.Append("        ViewData d = new ViewData();\n");
         b.Append("        d.Set(\"id\", Convert.ToString(id));\n");
         b.Append("        d.Set(id > 0 ? \"editing\" : \"creating\", \"1\");\n");
-        b.Append("        d.Set(\"dialogTitle\", id > 0 ? \"编辑" + Gen.Literal(t.title)
-            + "\" : \"新增" + Gen.Literal(t.title) + "\");\n");
+        b.Append("        d.Set(\"dialogTitle\", id > 0 ? \"编辑" + Literal(t.title)
+            + "\" : \"新增" + Literal(t.title) + "\");\n");
         b.Append("        if (e != null) {\n");
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
@@ -765,7 +765,7 @@ class Gen {
             if (c.kind == "datetime") {
                 b.Append("            d.Set(\"" + c.name + "\", e." + c.name
                     + " > 0 ? Fmt.DayInput(e." + c.name + ") : \"\");\n");
-            } else if (Gen.ZanType(c.kind) == "string") {
+            } else if (ZanType(c.kind) == "string") {
                 b.Append("            d.Set(\"" + c.name + "\", e." + c.name + ");\n");
             } else {
                 b.Append("            d.Set(\"" + c.name
@@ -778,8 +778,8 @@ class Gen {
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
             if (c.name == "id" || (c.inCreate != 1 && c.inEdit != 1)) { continue; }
-            bool dictFed = c.dictType.Length > 0 && Gen.Safe(c.dictType);
-            bool relFed = Gen.RelDesigned(c, designed);
+            bool dictFed = c.dictType.Length > 0 && Safe(c.dictType);
+            bool relFed = RelDesigned(c, designed);
             if (!dictFed && !relFed) { continue; }
             string count = "";
             string vexpr = "";
@@ -788,7 +788,7 @@ class Gen {
                 b.Append("        List<StrMap> " + c.name + "Opts = d.AddList(\"" + c.name + "Opts\");\n");
                 b.Append("        List<SysDictItem> " + c.name
                     + "Items = await new SysDictItemDao(this).ByTypeCodeActive(\""
-                    + Gen.Literal(c.dictType) + "\");\n");
+                    + Literal(c.dictType) + "\");\n");
                 count = c.name + "Items.Count";
                 vexpr = c.name + "Items[i].value";
                 lexpr = c.name + "Items[i].label";
@@ -796,7 +796,7 @@ class Gen {
                 b.Append("        List<StrMap> " + c.name + "Opts = d.AddList(\"" + c.name + "Opts\");\n");
                 b.Append("        DbResult " + c.name + "Rows = await DbTable.Of(this.Held(), \""
                     + c.relTable + "\").Query()\n");
-                b.Append("            .OrderBy(\"" + Gen.RelLabel(c)
+                b.Append("            .OrderBy(\"" + RelLabel(c)
                     + "\").Limit(100).ToResultAsync();\n");
                 b.Append("        int " + c.name + "N = 0;\n");
                 b.Append("        int " + c.name + "V = -1;\n");
@@ -804,9 +804,9 @@ class Gen {
                 b.Append("        if (" + c.name + "Rows != null) {\n");
                 b.Append("            " + c.name + "N = " + c.name + "Rows.RowCount();\n");
                 b.Append("            " + c.name + "V = " + c.name + "Rows.GetColumnIndex(\""
-                    + Gen.RelValue(c) + "\");\n");
+                    + RelValue(c) + "\");\n");
                 b.Append("            " + c.name + "L = " + c.name + "Rows.GetColumnIndex(\""
-                    + Gen.RelLabel(c) + "\");\n");
+                    + RelLabel(c) + "\");\n");
                 b.Append("        }\n");
                 count = c.name + "N";
                 vexpr = c.name + "Rows.GetString(i, " + c.name + "V)";
@@ -832,7 +832,7 @@ class Gen {
 
         if (hasCreate || hasEdit) {
             b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Create | PermBit.Update)]\n");
-            b.Append("    [Description(\"保存" + Gen.Literal(t.title) + "\")]\n");
+            b.Append("    [Description(\"保存" + Literal(t.title) + "\")]\n");
             b.Append("    async void Save() {\n");
             b.Append("        int id = this.InInt(\"id\", 0);\n");
             b.Append("        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {\n");
@@ -854,10 +854,10 @@ class Gen {
             if (c.name == "id" || (c.inCreate != 1 && c.inEdit != 1)) { continue; }
             if (c.inCreate != 1) { b.Append("        if (id > 0) {\n"); }
             if (c.inEdit != 1) { b.Append("        if (id == 0) {\n"); }
-            string zt = Gen.ZanType(c.kind);
-            string label = Gen.Literal(Gen.LabelOf(c));
-            bool dictFed = c.dictType.Length > 0 && Gen.Safe(c.dictType);
-            bool relFed = Gen.RelDesigned(c, designed);
+            string zt = ZanType(c.kind);
+            string label = Literal(LabelOf(c));
+            bool dictFed = c.dictType.Length > 0 && Safe(c.dictType);
+            bool relFed = RelDesigned(c, designed);
             if (c.kind == "datetime") {
                 /* 日期列：入参是 YYYY-MM-DD 文本，ParseDay 转秒存整型列。 */
                 b.Append("        string " + c.name + "Raw = this.In(\"" + c.name + "\").Trim();\n");
@@ -892,7 +892,7 @@ class Gen {
                 string vexpr = zt == "string" ? "e." + c.name
                     : "Convert.ToString(e." + c.name + ")";
                 b.Append("        string " + c.name + "Err = await this.CheckDict(\""
-                    + Gen.Literal(c.dictType) + "\", \"" + label + "\", " + vexpr + ", "
+                    + Literal(c.dictType) + "\", \"" + label + "\", " + vexpr + ", "
                     + (c.required == 1 ? "true" : "false") + ");\n");
                 b.Append("        if (" + c.name + "Err.Length > 0) { this.Fail(400, \"0400\", "
                     + c.name + "Err); return; }\n");
@@ -900,7 +900,7 @@ class Gen {
             if (relFed) {
                 string relCheck = "DbResult " + c.name + "Chk = await DbTable.Of(this.Held(), \""
                     + c.relTable + "\").Query()\n                .WhereEq(\""
-                    + Gen.RelValue(c) + "\", ";
+                    + RelValue(c) + "\", ";
                 if (zt == "string") {
                     b.Append("        if (e." + c.name + ".Length > 0) {\n");
                     b.Append("            " + relCheck + "e." + c.name
@@ -948,24 +948,24 @@ class Gen {
         } else {
             b.Append("            int n = 0;\n");
         }
-        b.Append("            await this.Note(\"编辑" + Gen.Literal(t.title)
+        b.Append("            await this.Note(\"编辑" + Literal(t.title)
             + "\", Convert.ToString(id), n > 0, \"\");\n");
         b.Append("            this.Saved(\"已保存\");\n            return;\n        }\n");
         b.Append("        int newId = await this." + t.entityName
             + ".Insert(e).ExecuteIdentityAsync();\n");
-        b.Append("        await this.Note(\"新增" + Gen.Literal(t.title)
+        b.Append("        await this.Note(\"新增" + Literal(t.title)
             + "\", Convert.ToString(newId), newId > 0, \"\");\n");
         b.Append("        this.Saved(\"已创建\");\n    }\n\n");
         }
 
         if (hasDelete) {
             b.Append("    [HttpPost]\n    [Custom(Perm = PermBit.Delete)]\n");
-            b.Append("    [Description(\"删除" + Gen.Literal(t.title) + "\")]\n");
+            b.Append("    [Description(\"删除" + Literal(t.title) + "\")]\n");
             b.Append("    async void Delete() {\n");
             b.Append("        int id = this.InInt(\"id\", 0);\n");
             b.Append("        int n = await this." + t.entityName
                 + ".Delete().Where(a => a.id == id).ExecuteAffrowsAsync();\n");
-            b.Append("        await this.Note(\"删除" + Gen.Literal(t.title)
+            b.Append("        await this.Note(\"删除" + Literal(t.title)
                 + "\", Convert.ToString(id), n > 0, \"\");\n");
             b.Append("        this.Saved(\"已删除\");\n    }\n");
         }
@@ -981,10 +981,10 @@ class Gen {
     /* 生成列表视图源码：表格由 ListPage.Screen 整段产出，视图剩壳；启用
        状态页签/导出时加对应工具行，都没启用则与平铺期形状完全一致。 */
     static string ListViewSource(SysGenTable t, List<SysGenColumn> cols) {
-        SysGenColumn tabC = Gen.TabColOf(t, cols);
+        SysGenColumn tabC = TabColOf(t, cols);
         bool hasExport = t.exportEnabled == 1;
         StringBuilder b = new StringBuilder();
-        b.Append(Gen.HtmlHeader());
+        b.Append(HtmlHeader());
         b.Append("<div class=\"card\">\n");
         if (tabC != null) {
             b.Append("  <div class=\"gen-tabbar\" data-tab-col=\"{{tabCol}}\">\n");
@@ -1005,15 +1005,15 @@ class Gen {
        分桶，单桶平铺（与旧形状一致），多桶发页内页签。 */
     static string FormViewSource(SysGenTable t, List<SysGenColumn> cols,
         List<SysGenTable> designed) {
-        string route = Gen.Route(t);
-        List<string> groups = Gen.TabGroups(cols);
+        string route = Route(t);
+        List<string> groups = TabGroups(cols);
         StringBuilder b = new StringBuilder();
-        b.Append(Gen.HtmlHeader());
+        b.Append(HtmlHeader());
         b.Append("<form data-submit action=\"/admin/" + route + "/save\">\n");
         b.Append("  <input type=\"hidden\" name=\"id\" value=\"{{id}}\">\n");
         if (groups.Count <= 1) {
             b.Append("  <div class=\"form\">\n");
-            Gen.FormFields(b, cols, "", designed, "    ");
+            FormFields(b, cols, "", designed, "    ");
             b.Append("  </div>\n");
             b.Append("  <footer class=\"lay-footer\">\n"
                 + "    <button class=\"btn\" type=\"button\" data-close>取消</button>\n"
@@ -1025,14 +1025,14 @@ class Gen {
         for (int g = 0; g < groups.Count; g = g + 1) {
             b.Append("    <button type=\"button\" class=\"form-tab"
                 + (g == 0 ? " active" : "") + "\" data-pane=\""
-                + Convert.ToString(g) + "\">" + Gen.Html(groups[g]) + "</button>\n");
+                + Convert.ToString(g) + "\">" + Html(groups[g]) + "</button>\n");
         }
         b.Append("  </div>\n");
         for (int g = 0; g < groups.Count; g = g + 1) {
             b.Append("  <div class=\"form-pane" + (g == 0 ? " active" : "")
                 + "\" data-pane=\"" + Convert.ToString(g) + "\">\n");
             b.Append("    <div class=\"form\">\n");
-            Gen.FormFields(b, cols, groups[g], designed, "      ");
+            FormFields(b, cols, groups[g], designed, "      ");
             b.Append("    </div>\n  </div>\n");
         }
         b.Append("  <footer class=\"lay-footer\">\n"
@@ -1070,9 +1070,9 @@ class Gen {
             if (group.Length > 0 && g != group) { continue; }
             if (c.inCreate != 1) { b.Append(pad + "{{#if editing}}\n"); }
             if (c.inEdit != 1) { b.Append(pad + "{{#if creating}}\n"); }
-            b.Append(pad + "<label>" + Gen.Html(Gen.LabelOf(c)) + "</label>\n");
-            bool fed = (c.dictType.Length > 0 && Gen.Safe(c.dictType))
-                || Gen.RelDesigned(c, designed);
+            b.Append(pad + "<label>" + Html(LabelOf(c)) + "</label>\n");
+            bool fed = (c.dictType.Length > 0 && Safe(c.dictType))
+                || RelDesigned(c, designed);
             if (fed) {
                 /* 选项行由 Form 动作查好；保留行显示当前值，防止保存时静默改数据。 */
                 b.Append(pad + "<select class=\"input\" name=\"" + c.name + "\">\n");
@@ -1094,7 +1094,7 @@ class Gen {
                 string rows = c.widget == "richtext" ? "8" : "3";
                 b.Append(pad + "<textarea class=\"input\" name=\"" + c.name
                     + "\" rows=\"" + rows + "\">{{" + c.name + "}}</textarea>\n");
-            } else if (c.widget == "number" || Gen.ZanType(c.kind) != "string") {
+            } else if (c.widget == "number" || ZanType(c.kind) != "string") {
                 b.Append(pad + "<input class=\"input\" type=\"number\" name=\"" + c.name
                     + "\" value=\"{{" + c.name + "}}\">\n");
             } else if (c.widget == "upload") {
@@ -1112,11 +1112,11 @@ class Gen {
     static string DaoSource(SysGenTable t, List<SysGenColumn> cols) {
         string ent = t.entityName;
         StringBuilder b = new StringBuilder();
-        b.Append(Gen.ZanHeader());
+        b.Append(ZanHeader());
         b.Append("using System;\nusing System.Data;\nusing System.Data.Orm;\n");
         b.Append("using ZanWeb.Model.Gen;\n\n");
         b.Append("namespace ZanWeb.Dao.Gen;\n\n");
-        b.Append("/// <summary>" + Gen.Comment(t.title)
+        b.Append("/// <summary>" + Comment(t.title)
             + " 的数据网关。由表设计器生成，可直接修改。</summary>\n");
         b.Append("class " + ent + "Dao {\n");
         b.Append("    IDbConnection db;\n\n");
@@ -1181,7 +1181,7 @@ class Gen {
                         + "(this.InAny(\"" + c.name + "\").Trim(), -1);\n");
                     whereLines = whereLines + "            .WhereIf(f" + c.name
                         + "N >= 0, a => a." + c.name + " == f" + c.name + "N)\n";
-                } else if (Gen.ZanType(c.kind) == "string") {
+                } else if (ZanType(c.kind) == "string") {
                     b.Append("        string f" + c.name + " = this.InAny(\"" + c.name
                         + "\").Trim();\n");
                     whereLines = whereLines + "            .WhereIf(f" + c.name
@@ -1195,7 +1195,7 @@ class Gen {
                 continue;
             }
             if (c.inFilter != 1) { continue; }
-            string op = Gen.FilterOpOf(c, designed);
+            string op = FilterOpOf(c, designed);
             if (op == "time") {
                 b.Append("        long f" + c.name + "F = Fmt.ParseDay(this.InAny(\""
                     + c.name + "From\").Trim());\n");
@@ -1207,7 +1207,7 @@ class Gen {
                     + "T > 0, a => a." + c.name + " <= f" + c.name + "T + 86399)\n";
             } else if (op == "select" || op == "pick") {
                 /* 下拉/远程搜索语义对齐 Collect：空串与 -1 跳过，0 是合法选项值。 */
-                if (Gen.ZanType(c.kind) == "string") {
+                if (ZanType(c.kind) == "string") {
                     b.Append("        string f" + c.name + " = this.InAny(\"" + c.name
                         + "\").Trim();\n");
                     whereLines = whereLines + "            .WhereIf(f" + c.name
@@ -1242,7 +1242,7 @@ class Gen {
                     + "FR.Length > 0, a => a." + c.name + " >= f" + c.name + "F)\n";
                 whereLines = whereLines + "            .WhereIf(f" + c.name
                     + "TR.Length > 0, a => a." + c.name + " <= f" + c.name + "T)\n";
-            } else if (Gen.ZanType(c.kind) == "string") {
+            } else if (ZanType(c.kind) == "string") {
                 b.Append("        string f" + c.name + " = this.InAny(\"" + c.name
                     + "\").Trim();\n");
                 if (op == "eq") {
@@ -1256,7 +1256,7 @@ class Gen {
                 /* 数值精确值：int/long/double 各回本型比较，避免跨型等值。 */
                 b.Append("        string f" + c.name + "R = this.InAny(\"" + c.name
                     + "\").Trim();\n");
-                if (Gen.ZanType(c.kind) == "double") {
+                if (ZanType(c.kind) == "double") {
                     b.Append("        double f" + c.name + "N = f" + c.name
                         + "R.Length > 0 ? Filter.ToDouble(f" + c.name + "R, 0.0) : 0.0;\n");
                 } else if (c.kind == "long") {
@@ -1280,18 +1280,18 @@ class Gen {
         List<SysGenTable> designed) {
         string mdl = "ZanWeb.Model.Gen." + t.entityName;
         string route = "api/gen/" + t.tableName.Replace("_", "");
-        string orderCol = Gen.OrderCol(t, cols);
+        string orderCol = OrderCol(t, cols);
         string orderCall = t.orderDesc == 1
             ? "OrderByDescending(a => a." + orderCol + ")"
             : "OrderBy(a => a." + orderCol + ")";
-        string title = Gen.Literal(t.title);
-        int pageSize = Gen.PageSizeOf(t);
+        string title = Literal(t.title);
+        int pageSize = PageSizeOf(t);
         StringBuilder b = new StringBuilder();
-        b.Append(Gen.ZanHeader());
+        b.Append(ZanHeader());
         b.Append("using System;\nusing System.Json;\nusing System.Web;\n");
         b.Append("using ZanWeb.Core;\nusing ZanWeb.Security;\nusing ZanWeb.Web;\n\n");
         b.Append("namespace ZanWeb.Api.Gen;\n\n");
-        b.Append("/// <summary>" + Gen.Comment(t.title)
+        b.Append("/// <summary>" + Comment(t.title)
             + " JSON 接口。由表设计器生成，可直接修改。</summary>\n");
         b.Append("[Route(\"" + route + "/[action]\")]\n");
         b.Append("[Custom(Authorization = CustomAuthorization.Grant)]\n");
@@ -1302,7 +1302,7 @@ class Gen {
         b.Append("    async void Query() {\n");
         b.Append("        int page = this.InInt(\"page\", 1);\n");
         b.Append("        if (page < 1) { page = 1; }\n");
-        string whereLines = Gen.FilterEmit(b, cols, designed, "");
+        string whereLines = FilterEmit(b, cols, designed, "");
         b.Append("        int total = await this." + t.entityName + "\n");
         b.Append(whereLines);
         b.Append("            .CountAsync();\n");
@@ -1315,7 +1315,7 @@ class Gen {
         b.Append("        for (int i = 0; i < rows.Count; i = i + 1) {\n");
         b.Append("            JsonValue o = JsonValue.NewObject();\n");
         b.Append("            o.Put(\"id\", JsonValue.NewInt(rows[i].id));\n");
-        Gen.ApiPuts(b, cols, "rows[i]", "            ");
+        ApiPuts(b, cols, "rows[i]", "            ");
         b.Append("            arr.Append(o);\n");
         b.Append("        }\n");
         b.Append("        JsonValue outp = JsonValue.NewObject();\n");
@@ -1332,7 +1332,7 @@ class Gen {
         b.Append("        if (e == null) { this.Fail(404, \"0404\", \"记录不存在\"); }\n");
         b.Append("        JsonValue o = JsonValue.NewObject();\n");
         b.Append("        o.Put(\"id\", JsonValue.NewInt(e.id));\n");
-        Gen.ApiPuts(b, cols, "e", "        ");
+        ApiPuts(b, cols, "e", "        ");
         b.Append("        this.Ok(o.ToJson());\n");
         b.Append("    }\n}\n");
         return b.ToString();
@@ -1346,7 +1346,7 @@ class Gen {
             SysGenColumn c = cols[i];
             if (c.name == "id") { continue; }
             string v = target + "." + c.name;
-            if (Gen.ZanType(c.kind) == "string") {
+            if (ZanType(c.kind) == "string") {
                 b.Append(pad + "o.Put(\"" + c.name + "\", JsonValue.NewStr("
                     + v + "));\n");
             } else {

@@ -27,37 +27,37 @@ class JobHost {
 
     /* 管理页增删改后调用：本 worker 下个 tick 重读任务表。 */
     static void Touch() {
-        JobHost.dirty = true;
+        dirty = true;
     }
 
     /* main.zan 在 schema 就绪后调用一次；数据库未就绪时循环空转，
        每个 tick 自行重试借连接，服务照常启动。 */
     static void Arm() {
-        if (JobHost.armed) { return; }
-        JobHost.armed = true;
-        Task.Spawn(JobHost.Loop());
+        if (armed) { return; }
+        armed = true;
+        Task.Spawn(Loop());
     }
 
     static async void Loop() {
         while (true) {
             await Task.Delay(1000);
-            await JobHost.Tick();
+            await Tick();
         }
     }
 
     static async void Tick() {
-        JobHost.ticks = JobHost.ticks + 1;
-        if (JobHost.dirty || JobHost.ticks >= 30) {
-            JobHost.ticks = 0;
-            JobHost.dirty = false;
-            await JobHost.Reload();
+        ticks = ticks + 1;
+        if (dirty || ticks >= 30) {
+            ticks = 0;
+            dirty = false;
+            await Reload();
         }
         long now = WebApp.NowSeconds();
-        for (int i = 0; i < JobHost.jobs.Count; i = i + 1) {
-            SysJob j = JobHost.jobs[i];
+        for (int i = 0; i < jobs.Count; i = i + 1) {
+            SysJob j = jobs[i];
             if (j.enabled != 1) { continue; }
             if (now - j.lastRunAt < j.intervalSec) { continue; }
-            await JobHost.Fire(j.id, j.lastRunAt, now);
+            await Fire(j.id, j.lastRunAt, now);
         }
     }
 
@@ -67,7 +67,7 @@ class JobHost {
         IDbConnection db = await ctx.Acquire();
         if (db == null) { return; }
         try {
-            JobHost.jobs = await db.Select<SysJob>()
+            jobs = await db.Select<SysJob>()
                 .OrderBy(a => a.id).ToListAsync();
         } catch (Exception ex) {
             Log.Error("[jobs] reload failed: " + ex.Message);
@@ -94,8 +94,8 @@ class JobHost {
                 .Where(a => a.lastRunAt == prev)
                 .ExecuteAffrowsAsync();
             if (claimed != 1) { return; }
-            JobHost.RefreshMirror(jobId, now);
-            string _m = await JobHost.Run(db, j, now);
+            RefreshMirror(jobId, now);
+            string _m = await Run(db, j, now);
         } finally {
             ctx.Release(db);
         }
@@ -104,9 +104,9 @@ class JobHost {
     /* 抢单成功后把内存镜像的 lastRunAt 推到本次时间，避免下个 tick
        重复发起注定失败的抢单 UPDATE。 */
     static void RefreshMirror(int jobId, long now) {
-        for (int i = 0; i < JobHost.jobs.Count; i = i + 1) {
-            if (JobHost.jobs[i].id == jobId) {
-                JobHost.jobs[i].lastRunAt = now;
+        for (int i = 0; i < jobs.Count; i = i + 1) {
+            if (jobs[i].id == jobId) {
+                jobs[i].lastRunAt = now;
             }
         }
     }
@@ -119,7 +119,7 @@ class JobHost {
         string message = "";
         bool ok = true;
         try {
-            message = await JobHost.Execute(db, j);
+            message = await Execute(db, j);
         } catch (Exception ex) {
             ok = false;
             message = ex.Message;
@@ -150,8 +150,8 @@ class JobHost {
             List<SysJobLog> keep = await db.Select<SysJobLog>()
                 .Where(a => a.jobId == j.id)
                 .OrderByDescending(a => a.id)
-                .Take(JobHost.KeepLogs).ToListAsync();
-            if (keep.Count >= JobHost.KeepLogs) {
+                .Take(KeepLogs).ToListAsync();
+            if (keep.Count >= KeepLogs) {
                 long minKeep = keep[keep.Count - 1].id;
                 int _d = await db.Delete<SysJobLog>()
                     .Where(a => a.jobId == j.id)
@@ -174,8 +174,8 @@ class JobHost {
         if (claimed != 1) {
             return "任务正在被其他工作进程执行";
         }
-        JobHost.RefreshMirror(j.id, now);
-        return await JobHost.Run(db, j, now);
+        RefreshMirror(j.id, now);
+        return await Run(db, j, now);
     }
 
     /* kind 分发表：新增内置任务在此加一支，并在 Kinds/KindName/
@@ -185,7 +185,7 @@ class JobHost {
             return "pong @" + Convert.ToString(WebApp.NowSeconds());
         }
         if (j.kind == "log.cleanup") {
-            return JobHost.CleanupLogs(j);
+            return CleanupLogs(j);
         }
         return "未知任务类型 " + j.kind;
     }
@@ -222,7 +222,7 @@ class JobHost {
 
     /* kind 是否受支持。 */
     static bool Known(string kind) {
-        List<string> all = JobHost.Kinds();
+        List<string> all = Kinds();
         for (int i = 0; i < all.Count; i = i + 1) {
             if (all[i] == kind) { return true; }
         }

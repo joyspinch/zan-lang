@@ -106,31 +106,31 @@ class AuthUser {
             return AuthToken.Equal(Pbkdf2.Hex(password, salt, iter), want);
         }
         if (saltCol.Length > 0 && stored.Length == 64) {
-            return AuthToken.Equal(AuthUser.PasswordHash(password, saltCol),
+            return AuthToken.Equal(PasswordHash(password, saltCol),
                 stored);
         }
         return false;
     }
 
     static async SysUser ByUsername(string username) {
-        IDbConnection db = await AuthUser.Lease();
+        IDbConnection db = await Lease();
         if (db == null) { return null; }
         try {
             return await new SysUserDao(db).ByUsername(username);
         } finally {
-            AuthUser.Give(db);
+            Give(db);
         }
     }
 
     static async SysUser ById(string uid) {
-        int id = AuthUser.ToInt(uid);
+        int id = ToInt(uid);
         if (id <= 0) { return null; }
-        IDbConnection db = await AuthUser.Lease();
+        IDbConnection db = await Lease();
         if (db == null) { return null; }
         try {
             return await new SysUserDao(db).ById(id);
         } finally {
-            AuthUser.Give(db);
+            Give(db);
         }
     }
 
@@ -139,19 +139,19 @@ class AuthUser {
        达阈值锁到窗口滑出（LoginThrottle）。*/
     static async string Login(string username, string password) {
         if (!LoginThrottle.Allowed(username)) { return ""; }
-        SysUser row = await AuthUser.ByUsername(username);
-        if (row == null || row.status != AuthUser.Active) {
+        SysUser row = await ByUsername(username);
+        if (row == null || row.status != Active) {
             LoginThrottle.Fail(username);
             return "";
         }
-        if (!AuthUser.Verify(password, row.passwordSalt, row.passwordHash)) {
+        if (!Verify(password, row.passwordSalt, row.passwordHash)) {
             LoginThrottle.Fail(username);
             return "";
         }
         /* 遗留行成功登录即升级为 pbkdf2$ 自描述格式；写库失败静默，
            下次登录再试。不 bump tokenVersion：已发会话与口令哈希无关。 */
         if (row.passwordHash.IndexOf("pbkdf2$") != 0) {
-            await AuthUser.UpgradeHash(row.id, password);
+            await UpgradeHash(row.id, password);
         }
         LoginThrottle.Clear(username);
         return AuthToken.Issue(Convert.ToString(row.id), row.tokenVersion,
@@ -161,13 +161,13 @@ class AuthUser {
     /* 登录成功后的哈希格式升级（遗留链 → pbkdf2$）。独立借还连接，
        绝不嵌套在调用方租约之内。 */
     static async void UpgradeHash(int uid, string password) {
-        IDbConnection db = await AuthUser.Lease();
+        IDbConnection db = await Lease();
         if (db == null) { return; }
         try {
             int _n = await new SysUserDao(db).UpgradeHash(uid,
-                AuthUser.NewHash(password), WebApp.NowSeconds());
+                NewHash(password), WebApp.NowSeconds());
         } finally {
-            AuthUser.Give(db);
+            Give(db);
         }
     }
 
@@ -181,9 +181,9 @@ class AuthUser {
 
     /* 命中返回缓存的版本号，过期/缺失返回 -1。 */
     static int CachedVersion(string uid, int now) {
-        lock (AuthUser.verEntries) {
-            for (int i = 0; i < AuthUser.verEntries.Count; i = i + 1) {
-                AuthTokenVersionEntry e = AuthUser.verEntries[i];
+        lock (verEntries) {
+            for (int i = 0; i < verEntries.Count; i = i + 1) {
+                AuthTokenVersionEntry e = verEntries[i];
                 if (e != null && e.uid == uid && e.goodUntil > now) {
                     return e.version;
                 }
@@ -193,28 +193,28 @@ class AuthUser {
     }
 
     static void StoreVersion(string uid, int version, int now) {
-        lock (AuthUser.verEntries) {
+        lock (verEntries) {
             /* 顺带清扫过期项：倒序安全移除，永不漏项或死循环。 */
-            for (int i = AuthUser.verEntries.Count - 1; i >= 0; i = i - 1) {
-                AuthTokenVersionEntry e = AuthUser.verEntries[i];
+            for (int i = verEntries.Count - 1; i >= 0; i = i - 1) {
+                AuthTokenVersionEntry e = verEntries[i];
                 if (e == null || e.goodUntil <= now) {
-                    AuthUser.verEntries.RemoveAt(i);
+                    verEntries.RemoveAt(i);
                 } else if (e.uid == uid) {
                     e.version = version;
-                    e.goodUntil = now + AuthUser.VerTtlSec;
+                    e.goodUntil = now + VerTtlSec;
                     return;
                 }
             }
-            AuthUser.verEntries.Add(new AuthTokenVersionEntry(uid, version, now + AuthUser.VerTtlSec));
+            verEntries.Add(new AuthTokenVersionEntry(uid, version, now + VerTtlSec));
         }
     }
 
     static void DropCachedVersion(string uid) {
-        lock (AuthUser.verEntries) {
-            for (int i = 0; i < AuthUser.verEntries.Count; i = i + 1) {
-                AuthTokenVersionEntry e = AuthUser.verEntries[i];
+        lock (verEntries) {
+            for (int i = 0; i < verEntries.Count; i = i + 1) {
+                AuthTokenVersionEntry e = verEntries[i];
                 if (e != null && e.uid == uid) {
-                    AuthUser.verEntries.RemoveAt(i);
+                    verEntries.RemoveAt(i);
                     return;
                 }
             }
@@ -223,12 +223,12 @@ class AuthUser {
 
     static async int TokenVersion(string uid) {
         int now = WebApp.NowSeconds();
-        int cached = AuthUser.CachedVersion(uid, now);
+        int cached = CachedVersion(uid, now);
         if (cached >= 0) { return cached; }
-        SysUser row = await AuthUser.ById(uid);
+        SysUser row = await ById(uid);
         /* 负结果不缓存：禁用/删除必须尽快生效，且这类查询不在热路径上。 */
-        if (row == null || row.status != AuthUser.Active) { return -1; }
-        AuthUser.StoreVersion(uid, row.tokenVersion, now);
+        if (row == null || row.status != Active) { return -1; }
+        StoreVersion(uid, row.tokenVersion, now);
         return row.tokenVersion;
     }
 
@@ -240,7 +240,7 @@ class AuthUser {
     /* 模型：用户持角色，角色持路由 action，action 是调度和菜单共问的唯一权限单位。权限数据在共享内存（PermTable），首次缺失时从数据库加载。授权变更主动写回共享内存。*/
     /* 授权变更时同步失效版本缓存。若启用了集群总线，向集群广播。*/
     static void Forget(string uid) {
-        AuthUser.ForgetLocal(uid);
+        ForgetLocal(uid);
         if (ClusterBus.Enabled()) {
             ClusterBus.PublishEvictUser(uid);
         }
@@ -248,20 +248,20 @@ class AuthUser {
 
     /* 仅清除本进程内存与共享内存，不发跨节点广播（用于接收集群广播或纯本地清理）。*/
     static void ForgetLocal(string uid) {
-        AuthUser.DropCachedVersion(uid);
+        DropCachedVersion(uid);
         PermTable.Forget(uid);
     }
 
     static void ForgetAll() {
-        AuthUser.ForgetAllLocal();
+        ForgetAllLocal();
         if (ClusterBus.Enabled()) {
             ClusterBus.PublishEvictAll();
         }
     }
 
     static void ForgetAllLocal() {
-        lock (AuthUser.verEntries) {
-            AuthUser.verEntries.Clear();
+        lock (verEntries) {
+            verEntries.Clear();
         }
         PermTable.ForgetAll();
     }
@@ -281,7 +281,7 @@ class AuthUser {
        带连接重载——嵌套租借（持一条再等第二条）在高并发下会把池拖成
        循环等待，见 RolesOf 的说明。 */
     static async bool Allow(string uid, string action) {
-        return await AuthUser.Allow(null, uid, action);
+        return await Allow(null, uid, action);
     }
 
     /* 带租约的权限解析：db 传调用方已持有的请求租约（Held()），角色
@@ -289,7 +289,7 @@ class AuthUser {
        自行借还一次（调用方未持有任何连接时）。 */
     static async bool Allow(IDbConnection db, string uid, string action) {
         if (action.Length == 0) { return false; }
-        string roleIds = await AuthUser.RolesOf(db, uid);
+        string roleIds = await RolesOf(db, uid);
         if (roleIds == "*") { return true; }
         if (roleIds.Length == 0) { return false; }
         return PermTable.RolesAllow(roleIds, action);
@@ -297,13 +297,13 @@ class AuthUser {
 
     /* 该账号在某屏上的按钮掩码；与 Allow() 拒之依据为同一决策。Bootstrap 账号持该屏所有位。 */
     static async int MaskOf(string uid, string screen) {
-        return await AuthUser.MaskOf(null, uid, screen);
+        return await MaskOf(null, uid, screen);
     }
 
     /* 带租约的按钮掩码：语义同 <see cref="Allow"/> 的带连接重载。 */
     static async int MaskOf(IDbConnection db, string uid, string screen) {
         if (screen.Length == 0) { return 0; }
-        string roleIds = await AuthUser.RolesOf(db, uid);
+        string roleIds = await RolesOf(db, uid);
         if (roleIds == "*") { return Perm.MaskOf(screen); }
         if (roleIds.Length == 0) { return 0; }
         return PermTable.RolesMask(roleIds, screen) & Perm.MaskOf(screen);
@@ -311,7 +311,7 @@ class AuthUser {
 
     /* 账号角色 ",3,7,"；"*" 为 bootstrap；"" 为未知/禁用/数据库不可达。共享内存读，首次缺失从数据库填充。*/
     static async string RolesOf(string uid) {
-        return await AuthUser.RolesOf(null, uid);
+        return await RolesOf(null, uid);
     }
 
     /* 共享内存未命中时的数据库回填。db 为调用方已持有的租约时查询
@@ -320,7 +320,7 @@ class AuthUser {
        循环等待，谁也不释放（实测过的全站假死形态）。db 为 null 才
        自行借还一次，此时本协程未持有任何连接，顺序借用是安全的。*/
     static async string RolesOf(IDbConnection db, string uid) {
-        int id = AuthUser.ToInt(uid);
+        int id = ToInt(uid);
         if (id <= 0) { return ""; }
 
         string hit = PermTable.UserRoles(uid);
@@ -328,22 +328,22 @@ class AuthUser {
 
         IDbConnection owned = null;
         if (db == null) {
-            owned = await AuthUser.Lease();
+            owned = await Lease();
             if (owned == null) { return ""; }
             db = owned;
         }
         try {
             SysUser me = await db.Select<SysUser>().Where(a => a.id == id).FirstAsync();
-            if (me == null || me.status != AuthUser.Active) { return ""; }
+            if (me == null || me.status != Active) { return ""; }
             if (me.isSuper == 1) {
                 PermTable.SetUser(uid, true, "");
                 return "*";
             }
-            string joined = await AuthUser.RoleIds(db, me);
+            string joined = await RoleIds(db, me);
             PermTable.SetUser(uid, false, joined);
             return joined;
         } finally {
-            if (owned != null) { AuthUser.Give(owned); }
+            if (owned != null) { Give(owned); }
         }
     }
 
@@ -353,14 +353,14 @@ class AuthUser {
         List<SysUserRole> mine = await db.Select<SysUserRole>()
             .Where(a => a.userId == me.id).ToListAsync();
         for (int i = 0; i < mine.Count; i = i + 1) {
-            AuthUser.AddId(roleIds, mine[i].roleId);
+            AddId(roleIds, mine[i].roleId);
         }
         int dept = me.departmentId;
         if (dept > 0) {
             List<SysDepartmentRole> byDept = await db.Select<SysDepartmentRole>()
                 .Where(a => a.departmentId == dept).ToListAsync();
             for (int i = 0; i < byDept.Count; i = i + 1) {
-                AuthUser.AddId(roleIds, byDept[i].roleId);
+                AddId(roleIds, byDept[i].roleId);
             }
         }
         if (roleIds.Count == 0) { return ""; }
@@ -370,7 +370,7 @@ class AuthUser {
         List<SysRole> roles = await db.Select<SysRole>().ToListAsync();
         for (int i = 0; i < roles.Count; i = i + 1) {
             SysRole r = roles[i];
-            if (r.status != 1 || !AuthUser.HasId(roleIds, r.id)) { continue; }
+            if (r.status != 1 || !HasId(roleIds, r.id)) { continue; }
             outp.Append(Convert.ToString(r.id));
             outp.Append(",");
         }
@@ -380,7 +380,7 @@ class AuthUser {
     }
 
     static void AddId(List<int> list, int id) {
-        if (id <= 0 || AuthUser.HasId(list, id)) { return; }
+        if (id <= 0 || HasId(list, id)) { return; }
         list.Add(id);
     }
 
@@ -399,7 +399,7 @@ class AuthUser {
 
 class AuthToken {
     static string Secret() { return Cfg.Auth.secret; }
-    static bool Ready() { return AuthToken.Secret().Length >= 32; }
+    static bool Ready() { return Secret().Length >= 32; }
 
     static bool Equal(string actual, string expected) {
         int diff = actual.Length ^ expected.Length;
@@ -436,16 +436,16 @@ class AuthToken {
     }
 
     static byte[] Key() {
-        string secret = AuthToken.Secret();
+        string secret = Secret();
         return Sha256.Hash(secret, secret.Length);
     }
 
     /* 用 AES-GCM 加密签发 Cookie：版本标记 + uid + 签发时间 + tokenVersion。不含密码材料，强制登出只需 bump 整数。*/
     static string Issue(string uid, int tokenVersion, int now) {
-        if (!AuthToken.Ready()) { return ""; }
+        if (!Ready()) { return ""; }
         string plain = "2\t" + uid + "\t" + Convert.ToString(now) + "\t"
             + Convert.ToString(tokenVersion);
-        byte[] key = AuthToken.Key();
+        byte[] key = Key();
         byte[] iv = RandomNumberGenerator.GetBytes(12);
         byte[] tag = new byte[16];
         string aad = "zan.auth.cookie.v1";
@@ -456,13 +456,13 @@ class AuthToken {
         for (int i = 0; i < 12; i = i + 1) { packed[i] = iv[i]; }
         for (int i = 0; i < cipher.Length; i = i + 1) { packed[12 + i] = cipher[i]; }
         for (int i = 0; i < 16; i = i + 1) { packed[12 + cipher.Length + i] = tag[i]; }
-        return AuthToken.EncodeUrl(packed, packed.Length);
+        return EncodeUrl(packed, packed.Length);
     }
 
     static async string Resolve(string token) {
         if (token.Length < 50 || token.Length > 512) { return ""; }
         List<int> decodedLen = new List<int>(); decodedLen.Add(0);
-        byte[] packed = AuthToken.DecodeUrl(token, decodedLen);
+        byte[] packed = DecodeUrl(token, decodedLen);
         int total = decodedLen[0];
         if (total < 29) { return ""; }
         int cipherLen = total - 28;
@@ -472,7 +472,7 @@ class AuthToken {
         for (int i = 0; i < 12; i = i + 1) { iv[i] = packed[i]; }
         for (int i = 0; i < cipherLen; i = i + 1) { cipher[i] = packed[12 + i]; }
         for (int i = 0; i < 16; i = i + 1) { tag[i] = packed[12 + cipherLen + i]; }
-        byte[] key = AuthToken.Key();
+        byte[] key = Key();
         List<int> ok = new List<int>(); ok.Add(0);
         string aad = "zan.auth.cookie.v1";
         byte[] plainBytes = AesGcm.Decrypt(key, 32, iv, aad, aad.Length,
