@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Data;
+using System.Data.Orm;
 using ZanWeb.Dao.Collab;
 using ZanWeb.Model.Collab;
 
@@ -28,41 +29,36 @@ class CollabEventRelay {
        避免首拍执行延迟导致在首拍前由在线连接触发的新事件被误当作历史跳过。 */
     static async void InitWatermark(IDbConnection db) {
         if (CollabEventRelay.lastId >= 0) { return; }
-        CollabEventDao eventDao = new CollabEventDao(db);
-        CollabEvent last = await eventDao.Latest();
+        CollabEventDao dao = new CollabEventDao(db);
+        CollabEvent last = await dao.Latest();
         CollabEventRelay.lastId = last == null ? 0 : last.id;
     }
 
     static async void Loop() {
+        IFreeSql fsql = AppServices.Current()?.Orm();
         while (true) {
             await Task.Delay(CollabEventRelay.IntervalMs);
-            IDbConnection db = await AppServices.Current().Db().Acquire();
-            if (db == null) { continue; }
-            try {
-                await CollabEventRelay.Sweep(db);
-            } finally {
-                AppServices.Current().Db().Release(db);
-            }
+            if (fsql == null) { continue; }
+            await CollabEventRelay.Sweep(fsql);
         }
     }
 
-    static async void Sweep(IDbConnection db) {
-        CollabEventDao eventDao = new CollabEventDao(db);
-        CollabMemberDao memberDao = new CollabMemberDao(db);
-
+    static async void Sweep(IFreeSql fsql) {
         /* 首拍 Init：水位对齐当前 MAX(id)，历史不推。 */
         if (CollabEventRelay.lastId < 0) {
-            CollabEvent last = await eventDao.Latest();
+            CollabEventDao dao = new CollabEventDao(fsql);
+            CollabEvent last = await dao.Latest();
             CollabEventRelay.lastId = last == null ? 0 : last.id;
             return;
         }
-        long mark = CollabEventRelay.lastId;
-        List<CollabEvent> rows = await eventDao.AfterId(mark, CollabEventRelay.BatchSize);
+        CollabEventDao events = new CollabEventDao(fsql);
+        CollabMemberDao members = new CollabMemberDao(fsql);
+        List<CollabEvent> rows = await events.AfterId(CollabEventRelay.lastId, CollabEventRelay.BatchSize);
         for (int i = 0; i < rows.Count; i = i + 1) {
             CollabEvent r = rows[i];
             CollabEventRelay.lastId = r.id;
             if (r.conversationId <= 0) { continue; }
-            List<CollabMember> targets = await memberDao.ActiveMembers(r.tenantId, r.conversationId);
+            List<CollabMember> targets = await members.ActiveMembers(r.tenantId, r.conversationId);
             if (targets.Count == 0) { continue; }
             /* 每目标独立成形：PushTyped 会向 payload 写顶层 type，共享同一
                对象会被二次 Put 追加重复键。 */

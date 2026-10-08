@@ -35,42 +35,39 @@ class MessageRelay {
     /* 启动期显式对齐初始水位：服务对外接收请求前锁定已有最大 id 为历史水位，
        避免首拍执行延迟导致在首拍前由在线连接触发的新消息/新回执被误当作历史跳过。 */
     static async void InitWatermark(IDbConnection db) {
+        IFreeSql fsql = FreeSql.FromConnection(db);
         if (MessageRelay.lastId < 0) {
-            OaMessage last = await db.Select<OaMessage>()
+            OaMessage last = await fsql.Select<OaMessage>()
                 .OrderByDescending(a => a.id).FirstAsync();
             MessageRelay.lastId = last == null ? 0 : last.id;
         }
         if (MessageRelay.lastEvId < 0) {
-            OaMessageEvent lastEv = await db.Select<OaMessageEvent>()
+            OaMessageEvent lastEv = await fsql.Select<OaMessageEvent>()
                 .OrderByDescending(a => a.id).FirstAsync();
             MessageRelay.lastEvId = lastEv == null ? 0 : lastEv.id;
         }
     }
 
     static async void Loop() {
+        IFreeSql fsql = AppServices.Current()?.Orm();
         while (true) {
             await Task.Delay(MessageRelay.IntervalMs);
-            IDbConnection db = await AppServices.Current().Db().Acquire();
-            if (db == null) { continue; }
-            try {
-                await MessageRelay.Sweep(db);
-                await MessageRelay.SweepEvents(db);
-            } finally {
-                AppServices.Current().Db().Release(db);
-            }
+            if (fsql == null) { continue; }
+            await MessageRelay.Sweep(fsql);
+            await MessageRelay.SweepEvents(fsql);
         }
     }
 
-    static async void Sweep(IDbConnection db) {
+    static async void Sweep(IFreeSql fsql) {
         /* 首拍 Init：水位对齐当前 MAX(id)，历史不推。 */
         if (MessageRelay.lastId < 0) {
-            OaMessage last = await db.Select<OaMessage>()
+            OaMessage last = await fsql.Select<OaMessage>()
                 .OrderByDescending(a => a.id).FirstAsync();
             MessageRelay.lastId = last == null ? 0 : last.id;
             return;
         }
         long mark = MessageRelay.lastId;
-        List<OaMessage> rows = await db.Select<OaMessage>()
+        List<OaMessage> rows = await fsql.Select<OaMessage>()
             .Where(a => a.id > mark)
             .OrderBy(a => a.id).Take(MessageRelay.BatchSize).ToListAsync();
         for (int i = 0; i < rows.Count; i = i + 1) {
@@ -92,15 +89,15 @@ class MessageRelay {
        的 msgId（对端把 ≤ 该 id 的自己发的消息全部点亮「已读」）与行为方
        byId（发送方打开着谁的会话由对端页面自行比对）。首拍 Init 水位对齐
        MAX(id)，重启不重推历史。 */
-    static async void SweepEvents(IDbConnection db) {
+    static async void SweepEvents(IFreeSql fsql) {
         if (MessageRelay.lastEvId < 0) {
-            OaMessageEvent last = await db.Select<OaMessageEvent>()
+            OaMessageEvent last = await fsql.Select<OaMessageEvent>()
                 .OrderByDescending(a => a.id).FirstAsync();
             MessageRelay.lastEvId = last == null ? 0 : last.id;
             return;
         }
         long mark = MessageRelay.lastEvId;
-        List<OaMessageEvent> evs = await db.Select<OaMessageEvent>()
+        List<OaMessageEvent> evs = await fsql.Select<OaMessageEvent>()
             .Where(a => a.id > mark)
             .OrderBy(a => a.id).Take(MessageRelay.BatchSize).ToListAsync();
         for (int i = 0; i < evs.Count; i = i + 1) {
