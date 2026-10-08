@@ -14,9 +14,10 @@
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
 
-/* A frame-resident slot of an async $resume body: the stack alloca that holds
- * the value while executing, and the heap-frame field it is saved to / reloaded
- * from around each suspension. */
+/* A frame-resident slot of an async $resume body. During emission slot_alloca
+ * is a real alloca so the existing typed-address helpers can inspect it. Once
+ * the body and EH epilogues are complete, all uses are rewritten to the entry
+ * GEP of frame_index and the alloca is erased. No value is copied at suspend. */
 typedef struct {
     LLVMValueRef slot_alloca;
     LLVMTypeRef  llvm;
@@ -82,6 +83,18 @@ static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
  * it never restores a wrong depth. */
 #define ZAN_MAX_ARMED_TRY 1024
 
+typedef struct zan_irgen_pending_scope {
+    struct zan_irgen_pending_scope *parent;
+    int handler_id; /* HPENDING entry preceding this region's pending exit */
+    zan_ast_node_t *body;
+} zan_irgen_pending_scope_t;
+
+typedef struct zan_irgen_pending_context {
+    zan_irgen_pending_scope_t *scope;
+    zan_irgen_pending_scope_t *break_scope;
+    zan_irgen_pending_scope_t *continue_scope;
+} zan_irgen_pending_context_t;
+
 typedef struct zan_goto_label_rec {
     zan_istr_t        name;
     LLVMValueRef      fn;
@@ -92,6 +105,8 @@ typedef struct zan_goto_label_rec {
     int               catch_base;    /* active-catch depth */
     int               locals_base;   /* locals scope depth */
     int               locals_owned;  /* owning locals in scope */
+    zan_irgen_pending_scope_t *pending_scope;
+    zan_irgen_pending_scope_t *label_owner;
 } zan_goto_label_rec_t;
 
 /* One `catch` body being emitted: the handler owns the caught exception (see
@@ -112,6 +127,13 @@ typedef struct zan_irgen_finally_entry {
     LLVMValueRef monitor_obj; /* set instead of `body` by `lock (obj)`: the
                                * alloca holding the locked object, whose
                                * monitor every exit path must release */
+    LLVMValueRef continuation_slot; /* frame-resident pending-exit selector */
+    struct zan_irgen_finally_shared *shared; /* compatible pending-exit bodies */
+    int outer_armed_depth;
+    int outer_throw_locals_base;
+    int outer_throw_catch_base;
+    zan_irgen_pending_scope_t *pending_parent;
+    zan_irgen_pending_scope_t *pending_scope;
     bool in_try_body;       /* emitting the guarded body: a throw here is
                              * taken by this try's own handler, which runs
                              * the finally itself. False while emitting a
@@ -133,12 +155,20 @@ typedef struct zan_goto_fixup {
     /* Cleanup stacks at the goto site. At label definition the live stacks
      * only reach the label's depth, so the popped entries the jump must run
      * (skipped finallys/monitor exits, owned catch exceptions) are replayed
-     * from these copies; eh needs none (the disarm reads armed[base]'s
-     * old-top alloca, whose stale occupant still holds the right value). */
+     * from these copies together with armed slots and the source emission
+     * context: nested finally exits must see the goto site's handler state. */
     int finally_snap_n;
     struct zan_irgen_finally_entry *finally_snap;
     int catch_snap_n;
     struct zan_irgen_catch_cleanup *catch_snap;
+    LLVMValueRef *armed_snap;
+    zan_irgen_pending_scope_t *label_owner;
+    zan_irgen_pending_context_t pending;
+    LLVMBasicBlockRef break_target, continue_target;
+    int throw_locals_base, throw_catch_base;
+    int loop_locals_base, loop_catch_base;
+    int finally_loop_base, eh_armed_loop_base;
+    int checked_depth;
 } zan_goto_fixup_t;
 
 struct zan_irgen {
@@ -280,6 +310,8 @@ struct zan_irgen {
     int finally_count;
     /* finallys entered inside the innermost loop: break/continue run only those */
     int finally_loop_base;
+    /* Executing cleanup ancestry survives truncation of the finallys stack. */
+    zan_irgen_pending_context_t pending;
 
     /* Overflow-checking context while emitting a statement/expression: >0
      * inside `checked(...)`/`checked { ... }` (integer + - * get an overflow
@@ -734,11 +766,9 @@ struct zan_irgen {
     /* declared return type of the async method being emitted: the frame result
      * slot is encoded/decoded against it (see coerce_to_frame_result) */
     zan_type_t  *current_async_ret_type;
-    /* await state-machine context, valid only when current_async_frame is set
-     * and the body contains awaits: the entry switch (new resume-k cases are
-     * added here), the next state number to hand out, and the frame slots that
-     * must be saved before a suspend and reloaded after (params + named
-     * scalar locals live across suspensions). */
+    /* await state-machine context, valid only when current_async_frame is set:
+     * the entry switch, the next state number, and the typed proxies for the
+     * params / named locals whose storage lives directly in the heap frame. */
     LLVMValueRef current_async_switch;
     int          current_async_next_state;
     int          current_async_sub_base; /* frame index of first sub-task slot */
@@ -746,6 +776,19 @@ struct zan_irgen {
     int          current_async_ret_agg_slot; /* frame index of aggregate return slot (-1 if none) */
     zan_async_slot_t *current_async_slots;
     int          current_async_slot_count;
+    /* Completion is shared by returns, cancellation and the EH trampoline.
+     * The prefix of locals owns the frame fields; lexical suffix locals are
+     * released on the incoming edge before joining the result phi. */
+    int          current_async_frame_local_count;
+    LLVMBasicBlockRef current_async_complete_bb;
+    LLVMValueRef current_async_result_phi;
+    LLVMBasicBlockRef current_async_requeue_bb; /* shared Task.Yield/preempt ready-and-ret block */
+    LLVMBasicBlockRef current_async_cancel_bb;  /* shared top-level cancel exit block */
+    LLVMValueRef current_async_state_ptr;       /* cached &frame->state GEP */
+    LLVMValueRef current_async_cancel_ptr;      /* cached &frame->cancel GEP */
+    LLVMValueRef current_async_self_i8;         /* cached (i8*)frame bitcast */
+    /* Persistent per-function IR compaction state (owned by irgen.c). */
+    void        *function_compactor;
     /* async exception handling: the eh-stack depth on entry to the $resume
      * invocation being emitted (an alloca), the block that completes the frame
      * with a pending exception, the switch that re-enters the catch of a

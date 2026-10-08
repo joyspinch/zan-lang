@@ -10649,16 +10649,8 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 int k = g->current_async_next_state++;
                 LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
                 LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
-                LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                LLVMValueRef selfframe = g->current_async_frame;
-                zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0),
-                    LLVMBuildStructGEP2(g->builder, g->current_async_frame_type, selfframe,
-                                        ASYNC_FRAME_STATE, "self.state"));
-                zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready,
-                    (LLVMValueRef[]){ LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self"),
-                                      g->current_async_resume_fn }, 2, "");
-                emit_async_eh_unarm(g);
-                LLVMBuildRetVoid(g->builder);
+                zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0), get_async_state_ptr(g));
+                LLVMBuildBr(g->builder, get_async_requeue_bb(g));
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
                     g->current_async_resume_fn, "co.resume");
@@ -10684,11 +10676,8 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             }
             if (g->current_async_frame && g->current_async_switch) {
                 int k = g->current_async_next_state++;
-                LLVMValueRef selfframe = g->current_async_frame;
-                LLVMTypeRef self_ft = g->current_async_frame_type;
-                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
-                zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0),
-                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMValueRef self_i8 = get_async_self_i8(g);
+                zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0), get_async_state_ptr(g));
                 zan_call2(g->builder, g->rt_co_delay_type, g->rt_co_delay,
                     (LLVMValueRef[]){ ms, self_i8, g->current_async_resume_fn }, 3, "");
                 emit_async_eh_unarm(g);
@@ -11275,8 +11264,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_store_fit(g, sub_i8,
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
                         ASYNC_FRAME_CHILD, "self.child"));
-                zan_store_fit(g, LLVMConstInt(i32, (unsigned)k, 0),
-                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                zan_store_fit(g, LLVMConstInt(i32, (unsigned)k, 0), get_async_state_ptr(g));
                 LLVMValueRef sched_args[] = { sub_i8, sub_resume };
                 zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
                 emit_async_eh_unarm(g);

@@ -451,6 +451,27 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
        生成器表达式防环），`--target zanc` 快速迭代也会自动同步；旧构建树或
        SDK dist 里仍可能陈旧，undefined symbol 时先比对两边 .o 的 mtime。
 
+  8. **async 状态机 IR 膨胀治理：挂起退出块共享与帧指针缓存（2026-10-08）**：
+     - **挂起让渡尾块共享（`get_async_requeue_bb`）**：每个 `await Task.Yield()` 与
+       循环回边抢占（`emit_async_preempt_site`）原本就地生成完整的 `zan_co_ready(self, resume_fn)`
+       + `emit_async_eh_unarm()` + `ret void` 尾部（~7 条 LLVM 指令与基本块）。将其收敛至
+       函数级惰性单例 `co.requeue`，挂起点仅需 `store state` + `br label %co.requeue`，
+       消除 60%+ 的挂起胶水指令，同时消灭无意义的中间跳转蹦床块。
+     - **取消退出块共享守卫（`scope_has_owned_cleanups` 与 `get_async_cancel_bb`）**：
+       语句间取消检查（`emit_async_cancel_check`）原本在 `locals->count > frame_local_count`
+       时就放弃共享；由于标量局部变量（如 `int i`）也会累加 `locals->count`，导致多局部变量的
+       async 函数在每个 await 后面都生成独立的 `co.cancelledN` 块，不仅使基本块数量线性倍增，
+       更使最终 `%co.result` 的 PHI 节点输入边急剧膨胀。引入 `scope_has_owned_cleanups` 精确探测
+       是否存在 ARC 变量、EH slot、Box cell 或 struct RC；凡无作用域托管清理的取消检查点，
+       统统合流至唯一的 `co.cancelled`，使 PHI 节点输入度坍缩至 1，基本块大幅削减。
+     - **帧字段 GEP 句柄与 bitcast 缓存（`get_async_state_ptr` / `get_async_cancel_ptr` / `get_async_self_i8`）**：
+       在 async 函数 entry 块缓存 `ASYNC_FRAME_STATE`、`ASYNC_FRAME_CANCEL` 的 StructGEP2
+       以及 `(i8*)self` 的 BitCast。避免在每一个挂起点、恢复点、回边轮询点重复发射相同的
+       指针算术指令。注意 GEP 命名契约（如 `self.state`）需与 golden 测试子串期望精确匹配。
+     - **恢复函数作用域清理与重置**：每个 `$resume` 函数开始前必须将 `current_async_requeue_bb`、
+       `current_async_cancel_bb` 及缓存指针清空（使用保存-恢复栈保护嵌套/闭包），防止上一个
+       async 方法的基本块引用泄漏至下一个函数引发 LLVM verifier 报错。
+
 ## stdlib 肥边治理：独立类分片 + 槽反转 + 实例方法组注入（A332 肥边③④，2026-09-17）
 
 - **重文件被"字段类型"钉进图，与被调用钉进同罪**：`HttpFramer` 有个

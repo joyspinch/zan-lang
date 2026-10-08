@@ -147,6 +147,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
     g->catch_cleanup_count = 0;
     g->throw_catch_base = 0;
     g->finally_count = 0;
+    g->pending = (zan_irgen_pending_context_t){0};
     g->finally_loop_base = 0;
     g->eh_armed_count = 0;
     g->eh_armed_base = 0;
@@ -464,9 +465,8 @@ typedef struct {
     int             sub_base;       /* frame index of the first sub-task slot */
     int             ret_agg_slot;   /* frame index of aggregate return slot (-1 if none) */
     int             handler_cap;    /* per-handler slots in the frame */
-    /* deepest try/finally nesting the scan found in the body: sizes the
-     * FINEXC slot arrays. Was ZAN_MAX_FINALLY_DEPTH (256) unconditionally,
-     * which padded every async frame with ~5KB of never-touched slots. */
+    /* Lexical cleanup depth bounds pending owners after abandoned scopes
+     * are discarded; the frame allows one extra selected return record. */
     int             fin_depth_max;
     zan_type_t     *cur_inst;       /* instantiation being specialized, or NULL */
     LLVMTypeRef     fn_type;        /* signature of `fn` (the ramp, when async) */
@@ -502,6 +502,8 @@ static void emit_tp_erased_stub(zan_irgen_t *g, LLVMValueRef fn) {
     zan_call2(g->builder, vfn, ab, NULL, 0, "");
     LLVMBuildUnreachable(g->builder);
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    else if (g->function_compactor) LLVMClearInsertionPosition(g->builder);
+    zan_irgen_compact_completed(g, fn);
 }
 
 /* Declare the ramp/resume pair and heap-frame layout of an async method.
@@ -550,8 +552,9 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         /* Scan the body: count await points (→ states / sub-task slots)
          * and collect named scalar locals that must live in the frame
          * so they survive across suspensions. */
-        async_scan_t scan = { g, 0, NULL, 0, 0,
-                              local_scope_new(g->arena), 0, 0 };
+        async_scan_t scan = { .g = g, .scope =
+                              local_scope_new(g->arena) };
+        scan.body = member->method_decl.body;
         if (!is_static)
             local_add(scan.scope, (zan_istr_t){(char *)"this", 4}, NULL,
                       type_sym->type);
@@ -567,6 +570,7 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         w->await_count = scan.await_count;
         w->alocals = scan.locals;
         w->alocal_count = scan.local_count;
+        w->fin_depth_max = scan.fin_depth_max;
         /* One per-handler slot group per try the body lowers. LLVM
          * rejects a zero-length array member, so a body with no try at
          * all still gets one unused slot. */
@@ -613,7 +617,7 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         fields[ASYNC_FRAME_AWAITER] = i8ptr;
         fields[ASYNC_FRAME_AWAITER_STEP] = g->co_step_ptr;
         fields[ASYNC_FRAME_RESULT] = i64;
-        fields[ASYNC_FRAME_RETSPILL] = i64;
+        fields[ASYNC_FRAME_PENDING_COUNT] = i32;
         fields[ASYNC_FRAME_CLEANUP] = g->co_step_ptr;
         fields[ASYNC_FRAME_HCOUNT] = i32;
         fields[ASYNC_FRAME_SELF_STEP] = g->co_step_ptr;
@@ -627,15 +631,16 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         fields[ASYNC_FRAME_CEXC] = LLVMArrayType(i8ptr, (unsigned)w->handler_cap);
         fields[ASYNC_FRAME_CEXC_OWNED] = LLVMArrayType(i32, (unsigned)w->handler_cap);
         fields[ASYNC_FRAME_CEXC_TID] = LLVMArrayType(i8ptr, (unsigned)w->handler_cap);
-        /* one slot group per finally nesting level the scan found (>=1:
-         * LLVM rejects zero-length array members), not the 256 ceiling --
-         * a try-free body carried ~5KB of dead slots this way. */
+        /* Each live pending exit encloses an executing finally. One additional
+         * record holds a nested attempted return before its cleanup begins. */
         {
-            unsigned fin_cap = (unsigned)(w->fin_depth_max > 0
-                                              ? w->fin_depth_max : 1);
-            fields[ASYNC_FRAME_FINEXC] = LLVMArrayType(i8ptr, fin_cap);
-            fields[ASYNC_FRAME_FINEXC_OWNED] = LLVMArrayType(i32, fin_cap);
-            fields[ASYNC_FRAME_FINEXC_TID] = LLVMArrayType(i8ptr, fin_cap);
+            unsigned pending_cap = w->fin_depth_max > 0
+                ? (unsigned)w->fin_depth_max + 1 : 0;
+            LLVMTypeRef record_fields[] = { i64, i8ptr, i32, lret };
+            LLVMTypeRef record = LLVMStructTypeInContext(g->ctx, record_fields,
+                                                         is_agg_ret ? 4 : 3, 0);
+            fields[ASYNC_FRAME_PENDING] = LLVMArrayType(record, pending_cap);
+            fields[ASYNC_FRAME_HPENDING] = LLVMArrayType(i32, (unsigned)w->handler_cap);
         }
         for (int k = 0; k < total_params; k++) {
             fields[ASYNC_FRAME_FIRST_PARAM + k] = param_types[k];
@@ -726,8 +731,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMValueRef raw = zan_call2(g->builder, malloc_ty, g->fn_malloc, &fsize, 1, "frame.raw");
         zan_irgen_emit_oom_check(g, ramp_fn, raw);
         /* Zero the frame so every owning (RC) local slot starts null. The
-         * per-iteration capture of a loop-body local releases the reloaded
-         * previous occupant of its slot; that requires the slot to be null
+         * per-iteration capture of a loop-body local releases the previous
+         * occupant of its frame field; that requires the slot to be null
          * (not garbage) before its first write. */
         {
             LLVMTypeRef i8ptr0 = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -794,9 +799,31 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
                     if (is_rc_managed_type(pt) &&
                         LLVMGetTypeKind(LLVMTypeOf(pv)) == LLVMPointerTypeKind) {
                         emit_rc_retain_for_type(g, pt, pv);
+                    } else if (pt && pt->kind == TYPE_STRUCT &&
+                               type_contains_collection_rc(g, pt, 0)) {
+                        emit_collection_value_retain(g, pt, pv, 0);
                     }
                 }
             }
+        }
+        /* A captured frame local owns a cell, not the value inside it. Creating
+         * these cells in the ramp makes the entry binding valid on the first
+         * invocation as well as every resumed state; only declaration execution
+         * evaluates an initializer. Null payloads also make cancellation before
+         * a declaration and an initializer that throws safe to clean up. */
+        for (int k = 0; k < w->alocal_count; k++) {
+            async_local_t *al = &w->alocals[k];
+            if (!al->boxed) continue;
+            LLVMValueRef cell = emit_box_cell(g, al->decl->loc,
+                map_type(g, al->ztype), al->ztype, NULL);
+            LLVMValueRef tagged = LLVMBuildIntToPtr(g->builder,
+                LLVMBuildOr(g->builder,
+                    LLVMBuildPtrToInt(g->builder, cell, i64, "fl.box.i"),
+                    LLVMConstInt(i64, ZAN_CLOSURE_TAG, 0), "fl.box.tag"),
+                i8ptr, "fl.box.owner");
+            LLVMBuildStore(g->builder, tagged,
+                LLVMBuildStructGEP2(g->builder, frame_type, rframe,
+                    (unsigned)al->frame_index, "fl.box.slot"));
         }
         LLVMBuildRet(g->builder, raw);
 
@@ -809,10 +836,12 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
 
         local_scope_t *locals = local_scope_new(g->arena);
 
-        /* Frame-resident slots: `this` (instance methods), params, and named
-         * scalar locals. Their storage is stack allocas created here in the
-         * entry block (so they dominate every state block); values are saved
-         * to / reloaded from the heap frame around each suspension. */
+        /* `this`, params and named locals live directly in the heap frame.
+         * Keep typed alloca proxies while emitting so LLVMGetAllocatedType and
+         * the existing local-address helpers remain valid. After all body / EH
+         * emission, replace them with entry frame GEPs. The ramp memset is the
+         * only zero initialization: entry stores would clobber persisted values
+         * on every resume once these proxies are rewritten. */
         int alocal_count = w->alocal_count;
         int slot_total = total_params + alocal_count;
         zan_async_slot_t *slots = (zan_async_slot_t *)zan_arena_alloc(g->arena,
@@ -821,11 +850,6 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMValueRef res_this = NULL;
         if (!is_static) {
             res_this = LLVMBuildAlloca(g->builder, param_types[0], "this");
-            /* defined from entry, same reason as the param allocas:
-             * co.exc's cleanup releases `this` from this alloca and the load
-             * must not be undef before the first state block reloads it */
-            if (LLVMGetTypeKind(param_types[0]) == LLVMPointerTypeKind)
-                LLVMBuildStore(g->builder, LLVMConstNull(param_types[0]), res_this);
             slots[si].slot_alloca = res_this;
             slots[si].llvm = param_types[0];
             slots[si].frame_index = ASYNC_FRAME_FIRST_PARAM;
@@ -835,17 +859,16 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             zan_ast_node_t *param = member->method_decl.params.items[k];
             LLVMTypeRef pty = param_types[k + param_offset];
             LLVMValueRef pa = LLVMBuildAlloca(g->builder, pty, "p");
-            /* pointer-shaped param slots are defined from entry too:
-             * the ramp stores the incoming args into the frame before the
-             * first suspension, so these allocas are always written on the
-             * dispatch path -- but co.exc can also fire from the EH re-arm
-             * before any state block reloads, and its cleanup releases owned
-             * params from these allocas; without a store -O2 may fold the
-             * load to undef there (same corruption chain as the alocals). */
-            if (LLVMGetTypeKind(pty) == LLVMPointerTypeKind)
-                LLVMBuildStore(g->builder, LLVMConstNull(pty), pa);
             zan_type_t *pt = resolve_type_ctx(g, param->param.type);
-            local_add(locals, param->param.name, pa, pt);
+            /* A ref/out frame field stores the caller's slot address, not the
+             * variable's value. Rebind that address on each invocation; reads
+             * and writes then follow the same caller-owned protocol as sync. */
+            LLVMValueRef binding = param->param.by_ref
+                ? LLVMBuildLoad2(g->builder, pty, pa, "p.ref") : pa;
+            local_add(locals, param->param.name, binding, pt);
+            locals->vars[locals->count - 1].byref_slot = param->param.by_ref;
+            if (param->param.by_ref && is_rc_managed_type(pt))
+                locals->vars[locals->count - 1].arc_owned = 1;
             if (pt && pt->kind == TYPE_STRING)
                 locals->vars[locals->count - 1].opaque_string = 1;
             /* Balances the retain the ramp performed for ARC-managed by-value
@@ -853,6 +876,9 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             if (!param->param.by_ref && is_rc_managed_type(pt) &&
                 LLVMGetTypeKind(pty) == LLVMPointerTypeKind) {
                 locals->vars[locals->count - 1].arc_owned = 1;
+            } else if (!param->param.by_ref && pt && pt->kind == TYPE_STRUCT &&
+                       type_contains_collection_rc(g, pt, 0)) {
+                locals->vars[locals->count - 1].struct_rc = 1;
             }
             slots[si].slot_alloca = pa;
             slots[si].llvm = pty;
@@ -865,9 +891,9 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
              * invisible to by-name lookup: user visibility starts when the
              * declaration BINDS and adds its own entry (the alias), so a
              * same-named declaration later in the method can never shadow an
-             * earlier loop's variable from the prologue on. SYNTH slots
-             * ($fe.*) keep their names -- the foreach lowering looks them up
-             * by name to wire col_slot/idx_alloc/enum_slot. */
+             * earlier loop's variable from the prologue on. Foreach state
+             * slots bind by statement identity and role; copy counts can differ
+             * between the conservative scan and shared finally emission. */
             zan_istr_t fname;
             if (w->alocals[k].decl) {
                 char flbuf[80];
@@ -884,32 +910,29 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             /* A31x write side: tag the slot with the declaration node the
              * scan registered it from; binding resolves its own slot by
              * node (local_find_async_decl) instead of by name. */
-            locals->vars[locals->count - 1].async_decl = w->alocals[k].decl;
-            /* Every pointer-shaped frame slot is null-initialized HERE, in the
-             * entry block, regardless of arc ownership: entry statically
-             * dominates the co.exc landing pad (longjmp is not a CFG edge, so
-             * the optimizer cannot assume the landing pad is unreachable from
-             * the entry), which means the slot is never undefined there. The
-             * co.exc cleanup releases every owned local from these allocas;
-             * with no init, -O2 folded the loaded release operand to `ptr
-             * undef` whose registers happened to hold system addresses --
-             * free()ing them corrupted the heap and any later malloc crashed.
-             * Owned slots additionally need
-             * the init so a `return` lexically preceding the declaration (an
-             * early exit at the top of a loop whose body declares the local
-             * after an await) still releases the value a prior iteration
-             * stored, instead of leaking it. Storage-only slots (foreach
-             * variable/index/counter, catch binding) never release from these
-             * allocas, but emit_release_owned_locals walks locals->vars and
-             * unowned ptr slots are cheap to define. */
-            if (LLVMGetTypeKind(w->alocals[k].llvm) == LLVMPointerTypeKind) {
-                LLVMBuildStore(g->builder,
-                    LLVMConstNull(w->alocals[k].llvm), la);
-            }
-            if (!w->alocals[k].no_arc &&
-                is_rc_managed_type(w->alocals[k].ztype) &&
-                LLVMGetTypeKind(w->alocals[k].llvm) == LLVMPointerTypeKind) {
-                locals->vars[locals->count - 1].arc_owned = 1;
+            local_var_t *lv = &locals->vars[locals->count - 1];
+            lv->async_decl = w->alocals[k].decl;
+            lv->async_role = w->alocals[k].role;
+            if (w->alocals[k].boxed) {
+                LLVMValueRef tagged = LLVMBuildLoad2(g->builder, i8ptr, la,
+                                                     "fl.box.owner");
+                LLVMValueRef cell = emit_closure_untag(g, tagged);
+                lv->alloca = box_value_ptr(g, cell,
+                                          map_type(g, w->alocals[k].ztype));
+                lv->box_cell = cell;
+                lv->box_owner_slot = la;
+                lv->box_owned = 1;
+                /* Payload stores own their values, but this prefix entry owns
+                 * only the cell. release_boxed_local releases and nulls its
+                 * frame owner; payload clearing must never touch escaped cells. */
+            } else if (!w->alocals[k].no_arc &&
+                       is_rc_managed_type(w->alocals[k].ztype) &&
+                       LLVMGetTypeKind(w->alocals[k].llvm) == LLVMPointerTypeKind) {
+                lv->arc_owned = 1;
+            } else if (!w->alocals[k].no_arc && w->alocals[k].ztype &&
+                       w->alocals[k].ztype->kind == TYPE_STRUCT &&
+                       type_contains_collection_rc(g, w->alocals[k].ztype, 0)) {
+                lv->struct_rc = 1;
             }
             slots[si].slot_alloca = la;
             slots[si].llvm = w->alocals[k].llvm;
@@ -934,6 +957,14 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         int saved_ret_agg_slot = g->current_async_ret_agg_slot;
         void *saved_slots = (void *)g->current_async_slots;
         int saved_slot_count = g->current_async_slot_count;
+        int saved_frame_local_count = g->current_async_frame_local_count;
+        LLVMBasicBlockRef saved_complete_bb = g->current_async_complete_bb;
+        LLVMValueRef saved_result_phi = g->current_async_result_phi;
+        LLVMBasicBlockRef saved_requeue_bb = g->current_async_requeue_bb;
+        LLVMBasicBlockRef saved_cancel_bb = g->current_async_cancel_bb;
+        LLVMValueRef saved_state_ptr = g->current_async_state_ptr;
+        LLVMValueRef saved_cancel_ptr = g->current_async_cancel_ptr;
+        LLVMValueRef saved_self_i8 = g->current_async_self_i8;
         LLVMValueRef saved_eh_entry = g->current_async_eh_entry;
         LLVMBasicBlockRef saved_exc_bb = g->current_async_exc_bb;
         LLVMValueRef saved_rearm = g->current_async_rearm_switch;
@@ -950,6 +981,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         int saved_catch_cc = g->catch_cleanup_count;
         int saved_throw_cb = g->throw_catch_base;
         int saved_fin_c = g->finally_count;
+        zan_irgen_pending_context_t saved_pending = g->pending;
         int saved_fin_lb = g->finally_loop_base;
         int saved_eh_c = g->eh_armed_count;
         int saved_eh_b = g->eh_armed_base;
@@ -958,6 +990,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->catch_cleanup_count = 0;
         g->throw_catch_base = 0;
         g->finally_count = 0;
+        g->pending = (zan_irgen_pending_context_t){0};
         g->finally_loop_base = 0;
         g->eh_armed_base = g->eh_armed_count;
         g->eh_armed_loop_base = g->eh_armed_count;
@@ -982,6 +1015,14 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_sub_next = 0;
         g->current_async_slots = slots;
         g->current_async_slot_count = slot_total;
+        g->current_async_frame_local_count = locals->count;
+        g->current_async_complete_bb = NULL;
+        g->current_async_result_phi = NULL;
+        g->current_async_requeue_bb = NULL;
+        g->current_async_cancel_bb = NULL;
+        g->current_async_state_ptr = NULL;
+        g->current_async_cancel_ptr = NULL;
+        g->current_async_self_i8 = NULL;
         g->current_async_eh_entry = NULL;
         g->current_async_exc_bb = NULL;
         g->current_async_rearm_switch = NULL;
@@ -1017,7 +1058,6 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_switch = sw;
 
         LLVMPositionBuilderAtEnd(g->builder, body_bb);
-        emit_async_reload_slots(g); /* load `this`/params from the frame */
         /* cancelling a coroutine that is still queued for its first step
          * must skip the body entirely */
         emit_async_cancel_check(g, locals);
@@ -1051,6 +1091,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         /* an exception nothing in the body caught completes the coroutine
          * with that exception, for the awaiter to re-throw */
         emit_async_exc_epilogue(g, locals);
+        emit_async_complete_epilogue(g, locals);
+        emit_async_finalize_slots(g);
 
         g->current_fn = saved_fn;
         g->current_fn_ret_type = saved_fn_ret;
@@ -1059,6 +1101,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->catch_cleanup_count = saved_catch_cc;
         g->throw_catch_base = saved_throw_cb;
         g->finally_count = saved_fin_c;
+        g->pending = saved_pending;
         g->finally_loop_base = saved_fin_lb;
         g->eh_armed_count = saved_eh_c;
         g->eh_armed_base = saved_eh_b;
@@ -1077,6 +1120,14 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_ret_agg_slot = saved_ret_agg_slot;
         g->current_async_slots = saved_slots;
         g->current_async_slot_count = saved_slot_count;
+        g->current_async_frame_local_count = saved_frame_local_count;
+        g->current_async_complete_bb = saved_complete_bb;
+        g->current_async_result_phi = saved_result_phi;
+        g->current_async_requeue_bb = saved_requeue_bb;
+        g->current_async_cancel_bb = saved_cancel_bb;
+        g->current_async_state_ptr = saved_state_ptr;
+        g->current_async_cancel_ptr = saved_cancel_ptr;
+        g->current_async_self_i8 = saved_self_i8;
         g->current_async_eh_entry = saved_eh_entry;
         g->current_async_exc_bb = saved_exc_bb;
         g->current_async_rearm_switch = saved_rearm;
@@ -1089,8 +1140,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         /* ---- cleanup: release owned rc slots from the frame, free it.
          * Mirrors the arc_owned marking above: by-value rc params (the
          * ramp retained them) and frame-resident rc locals. Values are
-         * read from the heap frame -- authoritative for a suspended
-         * coroutine (slots are saved at every suspension and throw). */
+         * read from the heap frame, the sole live storage while the coroutine
+         * is executing as well as while it is suspended. */
         {
             LLVMBasicBlockRef cl_entry =
                 LLVMAppendBasicBlockInContext(g->ctx, cleanup_fn, "entry");
@@ -1112,24 +1163,30 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
                 if (param->param.by_ref) continue;
                 zan_type_t *pt = resolve_type_ctx(g, param->param.type);
                 LLVMTypeRef pty = param_types[k + param_offset];
-                if (!is_rc_managed_type(pt) ||
-                    LLVMGetTypeKind(pty) != LLVMPointerTypeKind) continue;
+                if (!type_contains_collection_rc(g, pt, 0)) continue;
                 LLVMValueRef sp = LLVMBuildStructGEP2(g->builder, frame_type, cframe,
                     (unsigned)(ASYNC_FRAME_FIRST_PARAM + param_offset + k), "cl.p");
                 LLVMValueRef v = LLVMBuildLoad2(g->builder, pty, sp, "cl.pv");
-                emit_rc_release_for_type(g, pt, v);
+                emit_collection_value_release(g, pt, v, 0);
             }
             for (int k = 0; k < w->alocal_count; k++) {
-                if (w->alocals[k].no_arc ||
-                    !is_rc_managed_type(w->alocals[k].ztype) ||
-                    LLVMGetTypeKind(w->alocals[k].llvm) != LLVMPointerTypeKind)
+                async_local_t *al = &w->alocals[k];
+                if (al->boxed) {
+                    LLVMValueRef sp = LLVMBuildStructGEP2(g->builder, frame_type,
+                        cframe, (unsigned)al->frame_index, "cl.box");
+                    emit_closure_release(g,
+                        LLVMBuildLoad2(g->builder, i8ptr, sp, "cl.box.owner"));
+                    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), sp);
+                    continue;
+                }
+                if (al->no_arc || !type_contains_collection_rc(g, al->ztype, 0))
                     continue;
                 LLVMValueRef sp = LLVMBuildStructGEP2(g->builder, frame_type, cframe,
-                    (unsigned)w->alocals[k].frame_index, "cl.l");
-                LLVMValueRef v = LLVMBuildLoad2(g->builder,
-                    w->alocals[k].llvm, sp, "cl.lv");
-                emit_rc_release_for_type(g, w->alocals[k].ztype, v);
+                    (unsigned)al->frame_index, "cl.l");
+                LLVMValueRef v = LLVMBuildLoad2(g->builder, al->llvm, sp, "cl.lv");
+                emit_collection_value_release(g, al->ztype, v, 0);
             }
+            emit_async_pending_discard(g, cframe, frame_type, LLVMConstInt(i32, 0, 0));
             /* an unwound frame is gone without completing: a DELAY entry still
              * parked on it would wake freed memory when it comes due */
             emit_co_cancel_delay(g, cparam);
@@ -1137,6 +1194,20 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             LLVMBuildRetVoid(g->builder);
             g->current_fn = saved_cl_fn;
         }
+        LLVMValueRef pending_discard_fn = NULL;
+        if (LLVMGetArrayLength(LLVMStructGetTypeAtIndex(frame_type, ASYNC_FRAME_PENDING))) {
+            emit_async_pending_discard_body(g, frame_type, w->ret_type);
+            pending_discard_fn = async_pending_discard_fn(g, frame_type);
+        }
+        /* All async emission and typed-address inspection are now finished.
+         * Move the builder out before compaction can delete instructions or
+         * blocks; only stable function handles are used after this point. */
+        if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+        else LLVMClearInsertionPosition(g->builder);
+        zan_irgen_compact_completed(g, resume_fn);
+        zan_irgen_compact_completed(g, ramp_fn);
+        zan_irgen_compact_completed(g, cleanup_fn);
+        if (pending_discard_fn) zan_irgen_compact_completed(g, pending_discard_fn);
         free(param_types);
     g->cur_mtps = saved_mtps;
     g->cur_mbind = saved_mbind;
@@ -1893,6 +1964,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         int saved_catch_cc = g->catch_cleanup_count;
         int saved_throw_cb = g->throw_catch_base;
         int saved_fin_c = g->finally_count;
+        zan_irgen_pending_context_t saved_pending = g->pending;
         int saved_fin_lb = g->finally_loop_base;
         int saved_eh_c = g->eh_armed_count;
         int saved_eh_b = g->eh_armed_base;
@@ -1901,6 +1973,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         g->catch_cleanup_count = 0;
         g->throw_catch_base = 0;
         g->finally_count = 0;
+        g->pending = (zan_irgen_pending_context_t){0};
         g->finally_loop_base = 0;
         g->eh_armed_base = g->eh_armed_count;
         g->eh_armed_loop_base = g->eh_armed_count;
@@ -2047,6 +2120,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         g->catch_cleanup_count = saved_catch_cc;
         g->throw_catch_base = saved_throw_cb;
         g->finally_count = saved_fin_c;
+        g->pending = saved_pending;
         g->finally_loop_base = saved_fin_lb;
         g->eh_armed_count = saved_eh_c;
         g->eh_armed_base = saved_eh_b;
@@ -2077,6 +2151,12 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
                 member->method_decl.body = NULL;
             }
         }
+        /* All terminators, ownership cleanup and local fixups are complete.
+         * The next method installs its own entry; leave no insertion point
+         * inside blocks that function-local compaction may erase. */
+        if (g->function_compactor) LLVMClearInsertionPosition(g->builder);
+        zan_irgen_compact_completed(g, fn);
+        if (zan_diag_has_errors(g->diag)) break;
     }
 
     g->cur_inst = NULL;
@@ -2632,6 +2712,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     int saved_catch_cc = g->catch_cleanup_count;
     int saved_throw_cb = g->throw_catch_base;
     int saved_fin_c = g->finally_count;
+    zan_irgen_pending_context_t saved_pending = g->pending;
     int saved_fin_lb = g->finally_loop_base;
     int saved_eh_c = g->eh_armed_count;
     int saved_eh_b = g->eh_armed_base;
@@ -2640,6 +2721,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     g->catch_cleanup_count = 0;
     g->throw_catch_base = 0;
     g->finally_count = 0;
+    g->pending = (zan_irgen_pending_context_t){0};
     g->finally_loop_base = 0;
     g->eh_armed_base = g->eh_armed_count;
     g->eh_armed_loop_base = g->eh_armed_count;
@@ -2695,6 +2777,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     g->catch_cleanup_count = saved_catch_cc;
     g->throw_catch_base = saved_throw_cb;
     g->finally_count = saved_fin_c;
+    g->pending = saved_pending;
     g->finally_loop_base = saved_fin_lb;
     g->eh_armed_count = saved_eh_c;
     g->eh_armed_base = saved_eh_b;
@@ -2706,6 +2789,8 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     g->cur_mbind = saved_mbind;
     g->cur_inst = saved_inst;
     if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+    else if (g->function_compactor) LLVMClearInsertionPosition(g->builder);
+    zan_irgen_compact_completed(g, sp.fn);
 }
 
 /* Drain the queue; emitting a body may enqueue further specializations. */
@@ -2713,6 +2798,7 @@ static void emit_pending_method_specs(zan_irgen_t *g) {
     while (g->method_spec_emitted < g->method_spec_count) {
         int i = g->method_spec_emitted++;
         emit_method_spec_body(g, i);
+        if (zan_diag_has_errors(g->diag)) break;
     }
 }
 
@@ -2731,12 +2817,24 @@ static void emit_windows_dll_main(zan_irgen_t *g) {
     LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMPositionBuilderAtEnd(g->builder, bb);
     LLVMBuildRet(g->builder, LLVMConstInt(i32, 1, 0));
+    if (g->function_compactor) LLVMClearInsertionPosition(g->builder);
+    zan_irgen_compact_completed(g, fn);
 }
 
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return ZAN_ERROR;
     g_di_emit_ctx = g; /* so local_add can forward variables to di_declare_var */
     di_debug_types_reset(); /* DI metadata dies with the module */
+    if (g->publish_mode && !g->emit_debug && !g->function_compactor) {
+        char error[4096];
+        g->function_compactor = zan_irgen_compactor_create(
+            g->mod, error, sizeof(error));
+        if (!g->function_compactor) {
+            zan_diag_emit(g->diag, DIAG_ERROR, unit->loc,
+                          "LLVM function compactor initialization failed: %s", error);
+            return ZAN_ERROR;
+        }
+    }
 
     /* Instantiations first: a generic class's field slots are sized from the
      * concrete types bound to its type parameters, so they must be known
@@ -2876,6 +2974,13 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     }
 done:
     ;
+    /* Both Main and __DesignMain (including the async entry wrapper) are now
+     * complete. Their local handles are no longer used by entry emission. */
+    if (g->function_compactor) {
+        LLVMClearInsertionPosition(g->builder);
+        LLVMValueRef main_fn = LLVMGetNamedFunction(g->mod, "main");
+        if (main_fn) zan_irgen_compact_completed(g, main_fn);
+    }
     /* Main and static initializers can instantiate generic methods. Their
      * specialized bodies contribute calls to ordinary methods as well. */
     emit_pending_method_specs(g);
@@ -3030,6 +3135,22 @@ done:
     if (g->emit_debug && g->di_builder) {
         LLVMSetCurrentDebugLocation2(g->builder, NULL);
         LLVMDIBuilderFinalize(g->di_builder);
+    }
+    /* One final sweep covers init/runtime/reflection support emitted outside
+     * the immediate completion points. Every body and global-table fixup above
+     * is finished; the compactor skips definitions already compacted in place. */
+    if (g->function_compactor) {
+        LLVMClearInsertionPosition(g->builder);
+        for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
+             fn = LLVMGetNextFunction(fn)) {
+            if (LLVMIsDeclaration(fn)) continue;
+            zan_irgen_compact_completed(g, fn);
+            if (zan_diag_has_errors(g->diag)) break;
+        }
+        /* Later module optimization/DCE may erase Function identities. */
+        zan_irgen_compactor_destroy((zan_irgen_compactor_t *)g->function_compactor);
+        g->function_compactor = NULL;
+        if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
     }
     /* verify module */
     char *error = NULL;
@@ -3232,14 +3353,16 @@ static void w32_build_adapter_into(zan_irgen_t *g, LLVMValueRef fn,
                                    LLVMValueRef real, LLVMTypeRef lft) {
     LLVMTypeRef src_ft = LLVMGlobalGetValueType(fn);
     unsigned nparams = LLVMCountParamTypes(src_ft);
-    if (nparams > 8 || LLVMCountParamTypes(lft) != nparams) return;
-    LLVMTypeRef sps[8], lps[8];
+    if (LLVMCountParamTypes(lft) != nparams) return;
+    size_t slots = nparams ? nparams : 1;
+    LLVMTypeRef *sps = zan_arena_alloc(g->arena, slots * sizeof(*sps));
+    LLVMTypeRef *lps = zan_arena_alloc(g->arena, slots * sizeof(*lps));
     LLVMGetParamTypes(src_ft, sps);
     LLVMGetParamTypes(lft, lps);
     LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
     LLVMPositionBuilderAtEnd(b, bb);
-    LLVMValueRef args[8];
+    LLVMValueRef *args = zan_arena_alloc(g->arena, slots * sizeof(*args));
     for (unsigned p = 0; p < nparams; p++) {
         LLVMValueRef a = LLVMGetParam(fn, p);
         LLVMTypeKind sk = LLVMGetTypeKind(sps[p]);
@@ -3285,8 +3408,7 @@ static void w32_build_adapter_into(zan_irgen_t *g, LLVMValueRef fn,
 static LLVMValueRef w32_build_adapter(zan_irgen_t *g, const char *name,
                                       LLVMTypeRef src_ft, LLVMValueRef real,
                                       LLVMTypeRef lft) {
-    if (LLVMCountParamTypes(src_ft) != LLVMCountParamTypes(lft) ||
-        LLVMCountParamTypes(src_ft) > 8)
+    if (LLVMCountParamTypes(src_ft) != LLVMCountParamTypes(lft))
         return NULL;
     LLVMValueRef fn = LLVMAddFunction(g->mod, name, src_ft);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
@@ -3552,6 +3674,17 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
              * mismatch and picks one side's signature. */
             { "zan_gui_draw_polyline", "vppiii" },
             { "zan_gui_draw_polyline_fx", "vppiii" },
+            { "zan_gui_draw_polybatch", "vippiii" },
+            { "zan_gui_fill_rects", "vipi" },
+            { "zan_gui_fill_circles", "vipi" },
+            { "zan_gui_fill_radials", "vipi" },
+            { "zan_gui_get_pixels", "pi" },
+            { "zan_gui_blit_pixels", "vipiiiiiiii" },
+            { "zan_image_get", "pp" },
+            { "zan_image_register_argb", "ippiii" },
+            { "zan_game_sprite_batch", "viipi" },
+            { "zan_game_mesh_create", "iipipi" },
+            { "zan_game_draw3d", "iiipip" },
             /* More GUI nint-handle shapes: the hit-guard pair take i32
              * window handles in C (iptr) against i64 nint call sites, and
              * zan_gui_text_stat_read returns i64 in C while Render.zan
@@ -3584,10 +3717,11 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             if (LLVMIsFunctionVarArg(dft)) continue;
             const char *sig = w32adapt[i].sig;
             int nparams = (int)strlen(sig) - 1;
-            if (nparams > 8 || (int)LLVMCountParamTypes(dft) != nparams)
+            if ((int)LLVMCountParamTypes(dft) != nparams)
                 continue;
-            /* the real libc function's type */
-            LLVMTypeRef lps[8];
+            /* the real native function's type */
+            size_t slots = nparams ? (size_t)nparams : 1;
+            LLVMTypeRef *lps = zan_arena_alloc(g->arena, slots * sizeof(*lps));
             for (int p = 0; p < nparams; p++) {
                 char c = sig[p + 1];
                 lps[p] = (c == 'p') ? w_ptr : (c == 'j') ? w_i64 : w_i32;

@@ -759,6 +759,99 @@ static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g) {
     return fn;
 }
 
+static LLVMValueRef get_async_self_i8(zan_irgen_t *g) {
+    if (g->current_async_self_i8) return g->current_async_self_i8;
+    if (!g->current_async_frame) return NULL;
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(g->current_async_resume_fn);
+    if (entry && LLVMGetFirstInstruction(entry)) {
+        LLVMPositionBuilderBefore(g->builder, LLVMGetFirstInstruction(entry));
+    }
+    LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    g->current_async_self_i8 = LLVMBuildBitCast(g->builder,
+        g->current_async_frame, di8ptr, "self.i8");
+    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    return g->current_async_self_i8;
+}
+
+static LLVMValueRef get_async_state_ptr(zan_irgen_t *g) {
+    if (g->current_async_state_ptr) return g->current_async_state_ptr;
+    if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(g->current_async_resume_fn);
+    if (entry && LLVMGetFirstInstruction(entry)) {
+        LLVMPositionBuilderBefore(g->builder, LLVMGetFirstInstruction(entry));
+    }
+    g->current_async_state_ptr = LLVMBuildStructGEP2(g->builder,
+        g->current_async_frame_type, g->current_async_frame,
+        ASYNC_FRAME_STATE, "self.state");
+    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    return g->current_async_state_ptr;
+}
+
+static LLVMValueRef get_async_cancel_ptr(zan_irgen_t *g) {
+    if (g->current_async_cancel_ptr) return g->current_async_cancel_ptr;
+    if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(g->current_async_resume_fn);
+    if (entry && LLVMGetFirstInstruction(entry)) {
+        LLVMPositionBuilderBefore(g->builder, LLVMGetFirstInstruction(entry));
+    }
+    g->current_async_cancel_ptr = LLVMBuildStructGEP2(g->builder,
+        g->current_async_frame_type, g->current_async_frame,
+        ASYNC_FRAME_CANCEL, "fr.cancel.p");
+    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    return g->current_async_cancel_ptr;
+}
+
+/* Cooperative preemption and Task.Yield requeue block. Shared across all
+ * yield points and loop-backedge preemptions within one $resume invocation. */
+static LLVMBasicBlockRef get_async_requeue_bb(zan_irgen_t *g) {
+    if (!g->current_async_frame || !g->current_async_resume_fn) return NULL;
+    if (g->current_async_requeue_bb) return g->current_async_requeue_bb;
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_async_resume_fn, "co.requeue");
+    LLVMPositionBuilderAtEnd(g->builder, bb);
+    LLVMValueRef self_i8 = get_async_self_i8(g);
+    zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready,
+        (LLVMValueRef[]){ self_i8, g->current_async_resume_fn }, 2, "");
+    emit_async_eh_unarm(g);
+    LLVMBuildRetVoid(g->builder);
+    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    g->current_async_requeue_bb = bb;
+    return bb;
+}
+
+static bool scope_has_owned_cleanups(zan_irgen_t *g, local_scope_t *locals, int start) {
+    (void)g;
+    if (!locals) return false;
+    for (int i = locals->count - 1; i >= start; i--) {
+        if (locals->vars[i].eh_slot) return true;
+        if (locals->vars[i].obj_rc_flag) return true;
+        if (locals->vars[i].box_cell) return true;
+        if (locals->vars[i].struct_rc) return true;
+        if (local_owns_arc(&locals->vars[i])) return true;
+    }
+    return false;
+}
+
+/* Shared top-level cancellation exit block: avoids minting identical
+ * co.cancelled blocks and dozens of duplicate incoming branches to
+ * co.complete when no lexical suffix locals require releasing. */
+static LLVMBasicBlockRef get_async_cancel_bb(zan_irgen_t *g, local_scope_t *locals) {
+    if (scope_has_owned_cleanups(g, locals, g->current_async_frame_local_count)) return NULL;
+    if (g->current_async_cancel_bb) return g->current_async_cancel_bb;
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_async_resume_fn, "co.cancelled");
+    LLVMPositionBuilderAtEnd(g->builder, bb);
+    emit_async_complete(g, NULL, NULL);
+    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    g->current_async_cancel_bb = bb;
+    return bb;
+}
+
 /* Emit `if (frame->cancel) <complete with no result>` at a point where the
  * body could just as well have executed `return;`: the locals in scope are
  * released by the completion, the awaiter is woken, and the rest of the body
@@ -774,19 +867,20 @@ static void emit_async_cancel_check(zan_irgen_t *g, local_scope_t *locals) {
     if (g->finally_count > 0 || g->catch_cleanup_count > 0) return;
     if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) return;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
-    LLVMValueRef frame = g->current_async_frame;
-    LLVMTypeRef ft = g->current_async_frame_type;
     LLVMValueRef fn = g->current_fn;
-    LLVMValueRef flag = LLVMBuildLoad2(g->builder, i32,
-        LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_CANCEL, "fr.cancel"),
-        "cancelled");
-    LLVMBasicBlockRef can_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.cancelled");
+    LLVMValueRef cancel_ptr = get_async_cancel_ptr(g);
+    LLVMValueRef flag = LLVMBuildLoad2(g->builder, i32, cancel_ptr, "cancelled");
+    LLVMBasicBlockRef shared_can = get_async_cancel_bb(g, locals);
+    LLVMBasicBlockRef can_bb = shared_can ? shared_can
+        : LLVMAppendBasicBlockInContext(g->ctx, fn, "co.cancelled");
     LLVMBasicBlockRef go_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.notcancelled");
     LLVMBuildCondBr(g->builder,
         zan_icmp(g->builder, LLVMIntNE, flag, LLVMConstInt(i32, 0, 0), "is.cancelled"),
         can_bb, go_bb);
-    LLVMPositionBuilderAtEnd(g->builder, can_bb);
-    emit_async_complete(g, locals, NULL);
+    if (!shared_can) {
+        LLVMPositionBuilderAtEnd(g->builder, can_bb);
+        emit_async_complete(g, locals, NULL);
+    }
     LLVMPositionBuilderAtEnd(g->builder, go_bb);
 }
 
@@ -849,9 +943,6 @@ static void emit_async_finalize_slots(zan_irgen_t *g) {
 static bool emit_async_preempt_site(zan_irgen_t *g, LLVMBasicBlockRef resume_target) {
     if (!g->current_async_frame || !g->current_async_switch) return false;
     LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
-    LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx,
-        g->current_fn, "co.preempt.cont");
     LLVMBasicBlockRef preempt_bb = LLVMAppendBasicBlockInContext(g->ctx,
         g->current_fn, "co.preempt");
     int k = g->current_async_next_state++;
@@ -859,26 +950,16 @@ static bool emit_async_preempt_site(zan_irgen_t *g, LLVMBasicBlockRef resume_tar
         NULL, 0, "poll");
     LLVMValueRef want = zan_icmp(g->builder, LLVMIntNE, fired,
         LLVMConstInt(di32, 0, 0), "poll.want");
-    LLVMBuildCondBr(g->builder, want, preempt_bb, cont_bb);
+    LLVMBuildCondBr(g->builder, want, preempt_bb, resume_target);
 
     LLVMPositionBuilderAtEnd(g->builder, preempt_bb);
-    LLVMValueRef selfframe = g->current_async_frame;
-    zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0),
-        LLVMBuildStructGEP2(g->builder, g->current_async_frame_type, selfframe,
-                            ASYNC_FRAME_STATE, "preempt.state"));
-    zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready,
-        (LLVMValueRef[]){ LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self"),
-                          g->current_async_resume_fn }, 2, "");
-    emit_async_eh_unarm(g);
-    LLVMBuildRetVoid(g->builder);
+    zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0), get_async_state_ptr(g));
+    LLVMBuildBr(g->builder, get_async_requeue_bb(g));
 
     LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
         g->current_async_resume_fn, "co.preempt.resume");
     LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
     LLVMPositionBuilderAtEnd(g->builder, rk);
-    LLVMBuildBr(g->builder, resume_target);
-
-    LLVMPositionBuilderAtEnd(g->builder, cont_bb);
     LLVMBuildBr(g->builder, resume_target);
     return true;
 }

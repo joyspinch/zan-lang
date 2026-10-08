@@ -102,17 +102,8 @@ enum {
                                    * outlive the coroutine (the reaper frees the
                                    * frame), so Task.Cancel first checks the
                                    * handle against this list. */
-    ASYNC_FRAME_RETSPILL = 16,    /* i64: `return e` inside a try whose finally
-                                   * runs before the return completes. The value
-                                   * is encoded here (the same i64 the result
-                                   * slot will receive) while the finally bodies
-                                   * run: a finally that awaits returns from
-                                   * this $resume invocation, so the value
-                                   * cannot sit in an entry alloca -- the entry
-                                   * block re-executes on the next invocation
-                                   * and would hand the reload a fresh, dead
-                                   * slot. Compiler-private: past the shared
-                                   * 16-field header prefix, like HSTACK. */
+    ASYNC_FRAME_PENDING_COUNT = 16, /* i32: live pending exits, past the shared
+                                    * 16-field runtime header */
     ASYNC_FRAME_HSTACK = 17,      /* [ntries x i32]: ids of the try
                                    * handlers this frame has armed, innermost
                                    * last -- re-armed at each resume (see
@@ -134,15 +125,10 @@ enum {
                                    * rethrows with the original dynamic type
                                    * even after an await (or a nested throw)
                                    * has overwritten the in-flight global */
-    ASYNC_FRAME_FINEXC = 21,      /* [ZAN_MAX_FINALLY_DEPTH x i8*]: the exception
-                                   * in flight across a `finally` body, indexed
-                                   * by the try's finally-region depth. A finally
-                                   * that awaits returns from this $resume, so
-                                   * the exception it has to re-raise afterwards
-                                   * cannot sit in an alloca. */
-    ASYNC_FRAME_FINEXC_OWNED = 22,/* [ZAN_MAX_FINALLY_DEPTH x i32] */
-    ASYNC_FRAME_FINEXC_TID = 23,  /* [ZAN_MAX_FINALLY_DEPTH x i8*] */
-    ASYNC_FRAME_FIRST_PARAM = 24
+    ASYNC_FRAME_PENDING = 21,    /* [{i64 value, ptr tid, i32 kind, aggregate?}]:
+                                   * pending returns and saved exceptions */
+    ASYNC_FRAME_HPENDING = 22,   /* [ntries x i32]: pending depth at try entry */
+    ASYNC_FRAME_FIRST_PARAM = 23
 };
 static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v);
 static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
@@ -151,6 +137,10 @@ static LLVMValueRef coerce_from_frame_result(zan_irgen_t *g, LLVMValueRef res,
                                              zan_type_t *ty);
 static LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val);
 static void emit_async_cancel_check(zan_irgen_t *g, local_scope_t *locals);
+static LLVMBasicBlockRef get_async_requeue_bb(zan_irgen_t *g);
+static LLVMValueRef get_async_state_ptr(zan_irgen_t *g);
+static LLVMValueRef get_async_cancel_ptr(zan_irgen_t *g);
+static LLVMValueRef get_async_self_i8(zan_irgen_t *g);
 static void emit_co_cancel_delay(zan_irgen_t *g, LLVMValueRef frame);
 static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g);
 static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g);
@@ -158,8 +148,6 @@ static LLVMValueRef get_co_reap_fn(zan_irgen_t *g);
 static LLVMValueRef get_co_track_fn(zan_irgen_t *g);
 static LLVMValueRef get_co_untrack_fn(zan_irgen_t *g);
 static bool anf_stmt_contains_await(zan_ast_node_t *s);
-static void emit_async_save_slots(zan_irgen_t *g);
-static void emit_async_reload_slots(zan_irgen_t *g);
 static void emit_async_eh_unarm(zan_irgen_t *g);
 static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub, LLVMValueRef tmp_mark);
 
@@ -1360,6 +1348,15 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
     return score;
 }
 
+/* The symbol-only implements walk cannot distinguish generic instantiations;
+ * keep those receivers on the existing type-argument matching path. */
+static bool ext_receiver_interface_match(zan_type_t *pt, zan_type_t *recv_ty) {
+    return pt && recv_ty && pt->kind == TYPE_INTERFACE &&
+           pt->type_arg_count == 0 &&
+           (recv_ty->kind == TYPE_CLASS || recv_ty->kind == TYPE_INTERFACE) &&
+           class_implements_iface(recv_ty->sym, pt->sym);
+}
+
 /* Rank one extension-method candidate against the call: -1 = incompatible
  * (a fully typed receiver or lambda return that contradicts the call),
  * otherwise a score where a concrete receiver match and each lambda whose
@@ -1372,6 +1369,7 @@ static int ext_method_score(zan_irgen_t *g, zan_symbol_t *m,
     int score = 0;
     if (pt && !type_mentions_tp(pt)) {
         if (types_concrete_equal(pt, recv_ty)) score += 4;
+        else if (ext_receiver_interface_match(pt, recv_ty)) score += 2;
         else if (!type_mentions_tp(recv_ty)) return -1;
     }
     int as = method_args_score(g, m, call, recv_expr, locals, 1);
@@ -1415,7 +1413,8 @@ static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
          * TYPE_STRING and skip the candidate for every receiver, so generic
          * extensions never resolved. Scoring keeps concrete receivers ahead
          * (ext_method_score leaves tp receivers at base score). */
-        if (pt->kind != TYPE_TYPE_PARAM) {
+        if (pt->kind != TYPE_TYPE_PARAM &&
+            !ext_receiver_interface_match(pt, recv_ty)) {
             if (pt->kind != recv_ty->kind) continue;
             if ((pt->kind == TYPE_CLASS || pt->kind == TYPE_STRUCT ||
                  pt->kind == TYPE_INTERFACE || pt->kind == TYPE_ENUM) &&
