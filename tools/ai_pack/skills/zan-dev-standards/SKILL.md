@@ -394,6 +394,14 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   空转；签名 = 树内画帧计数器停在 1。每帧先 `host.RequestRedraw()` 再泵
   再 Render()。断言像素画在画布 (0,0) 会被根面板的裁剪裁掉（读数像
   "没画"），要画进控件带内。
+- **哈希损伤与绘制同段共生，"漏喂哈希"类缺陷往往探针不可观测**
+  （2026-10-08 B-ID118/121 补喂实测）：控件的命令流哈希求值发生在
+  OnPaint 里——控件被条带裁掉时两者都不发生；而内容变化帧在动画/游戏
+  循环里总是 `RequestRedraw` 整帧（idle/GuiHost 每帧都 RequestRedraw）。
+  因此"批量原语漏喂哈希"即使真实违反契约，红/绿对照也双双全绿
+  （B-ID119 的 hover-label 流程才可观测）。新增 Canvas 原语补喂哈希
+  入口靠台账规则与评审守住，探针只能验证修好的行为、守不住不变量；
+  红对照全绿 ≠ 改动无意义，先分清"契约对齐"还是"缺陷修复"再写提交。
 - **dock=5（fill）子控件放 Panel.Root，不放 Panel.Column/Row**
   （2026-10-08 B-ID118 E2E）：Column/Row 是流式容器、按子控件 pref 尺寸
   排布——只设 grow 没有首选尺寸的控件（如 GameViewport）在 Column 里

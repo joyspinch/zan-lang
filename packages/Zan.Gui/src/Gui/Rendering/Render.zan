@@ -995,27 +995,51 @@ class Canvas {
     static extern void zan_gui_blit_surface(int dstId, int srcId, int dstX,
         int dstY, int srcX, int srcY, int w, int h);
 
+    /// 批量原语的哈希喂入口：内容逐条折入——与逐原语路径同敏感度，
+    /// 同条数不同内容也判得出变化（漏喂的后果是局部帧下内容变化不声明
+    /// 损伤、画面静默冻结）。关闭 partialFrames 的 App 由 PaintHashArmed
+    /// 整段跳过，不为批量提交付循环钱。
+    void PaintHashBatch(int op, nint data, int count, int stride) {
+        Span<int> items = new Span<int>(data, count * stride);
+        for (int i = 0; i < count; i = i + 1) {
+            int b = i * stride;
+            App.PaintHashOp(op, items[b], items[b + 1],
+                            items[b + 2], items[b + 3]);
+            if (stride == 5) {
+                App.PaintHashOp(0, items[b + 4], 0, 0, 0);
+            }
+        }
+    }
+
     /// 批量纯色矩形：`data` 为打包 i32 缓冲，每条 x,y,w,h,argb。
     /// 一次 FFI 提交整组（命令缓冲类调用方的每类型一次提交通道）。
     void FillRects(nint data, int count) {
+        if (App.PaintHashArmed()) { PaintHashBatch(29, data, count, 5); }
         zan_gui_fill_rects(surfaceId, data, count);
     }
 
     /// 批量实心圆盘：`data` 每条 cx,cy,r,argb。
     void FillCircles(nint data, int count) {
+        if (App.PaintHashArmed()) { PaintHashBatch(30, data, count, 4); }
         zan_gui_fill_circles(surfaceId, data, count);
     }
 
     /// 批量径向光晕：`data` 每条 cx,cy,r,argb,innerAlpha。
     void FillRadials(nint data, int count) {
+        if (App.PaintHashArmed()) { PaintHashBatch(31, data, count, 5); }
         zan_gui_fill_radials(surfaceId, data, count);
     }
 
     /// 把 `src` 表面的 (srcX,srcY,w,h) 不透明地整块贴到本画布的
     /// (dstX,dstY)。行级 memcpy，遵守本画布当前裁剪窗（局部帧条带对
     /// 贴图合成同样生效）。供 GameViewport 离屏位图合成等使用。
+    /// 哈希折几何与源表面 id；源内容的变化由"同段内的离屏渲染原语
+    /// 折叠"承载（GameViewport 的 Scene.Render(off) 就在本控件自段里，
+    /// 世界变了折出来的哈希自然变）。
     void BlitSurface(Canvas src, int dstX, int dstY, int srcX, int srcY,
                      int w, int h) {
+        App.PaintHashOp(32, dstX, dstY, w, h);
+        App.PaintHashOp(0, src.surfaceId, srcX, srcY, 0);
         zan_gui_blit_surface(surfaceId, src.surfaceId, dstX, dstY,
                              srcX, srcY, w, h);
     }
