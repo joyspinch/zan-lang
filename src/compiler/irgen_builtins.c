@@ -2888,6 +2888,15 @@ static LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_
     if (!((fsym->modifiers & MOD_STATIC) ||
           (fsym->decl->field_decl.modifiers & MOD_STATIC)))
         return NULL;
+    /* Static fields and properties belong to their declaring type. When accessed
+     * through a derived type (e.g. `Derived.Tag` or bare `Tag` in Derived),
+     * class_sym reflects the access site rather than the declaring site.
+     * Anchor storage to fsym->parent so all reads and writes address the single
+     * initialized global. */
+    if (fsym->parent && (fsym->parent->kind == SYM_CLASS ||
+                         fsym->parent->kind == SYM_STRUCT)) {
+        class_sym = fsym->parent;
+    }
     /* A static of a generic class is per closed instantiation (C# rules):
      * Stat<int>.s and Stat<string>.s are separate storage, so the backing
      * global carries the instantiation suffix. A single unsuffixed global made

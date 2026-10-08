@@ -987,6 +987,22 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   `lock (sync) { T x = Find(); if (x != null) x.Member(); }`；只补这一处，
   则锁内 `return null` 仍会逃过诊断，或后置锁头的空值比较会错误放行前置
   解引用。原因不是同步语义，而是辅助 AST 扫描与正常语句检查漏了同一种节点。
+
+## 继承静态字段存储归属（B-ID126，2026-10-08）
+
+- **症状**：派生类中通过裸名访问继承自基类的静态字段（如 `class Derived : Base` 中访问 `Tag`）或者通过派生类限定名访问（`Derived.Tag`），在实例方法中读出 `(null)`，在静态方法中读出空值或 0。
+- **根因**：静态字段与 auto 属性在 LLVM IR 层面被发射为全局变量 `__zan_sf_<ClassName>_<FieldName>`。在 `irgen_builtins.c:get_static_field_global` 中，构造符号名时原先直接采用传入的 `class_sym`。当通过派生类上下文（裸名解析或派生类限定）访问时，`class_sym` 记录的是访问点所在的类（`Derived`）而非实际声明该字段的类（`Base`）。导致基类静态初始化器写入 `__zan_sf_Base_Tag`，而派生类访问读取了未初始化的空全局 `__zan_sf_Derived_Tag`。
+- **定式**：所有静态字段及静态属性的 backing global 名字必须锚定在其声明类上：若字段符号的 `fsym->parent` 是类或结构体，必须将 `class_sym` 重定向为 `fsym->parent`。保证继承链上所有层级（包括多级继承、派生类限定和裸名访问）统一读写同一个全局实体。
+
+## 内建 `new object()` 堆分配契约与三元条件类型合流（B-ID124，2026-10-08）
+
+- **症状**：在三元条件表达式中包含 `new object()`（例如 `hit ? sync : new object()`），编译时通过语法与语义检查，但在 LLVM IR 校验时报 `LLVM verification failed: PHI node operands are not the same type as the result`（指纹为 `ptr` 与 `i32` 混合喂入同一 PHI 节点）。
+- **根因**：
+  1. `object` 为内建类型（`TYPE_OBJECT`），没有对应的 `SYM_CLASS` 结构描述符。`src/compiler/irgen_expr.c` 的 `emit_expr_new_expr` 原先只针对 `sym && (sym->type->kind == TYPE_STRUCT || sym->type->kind == TYPE_CLASS)` 进行实例化，未匹配内建 `object`，落入兜底的 `LLVMConstInt(i32, 0)`。
+  2. 条件表达式 `emit_expr_conditional` 将三元表达式的合流类型推断为引用指针 `ptr`，由于 `coerce_ternary_value` 仅在浮点与整型之间执行强制转换，不会将整型 0 盲目强制转化为指针，导致常数 `0: i32` 被直接喂入 `ptr` PHI 节点引发 verifier 拒绝。
+- **定式**：
+  1. `new object()` 是合法的对象实例化表达式（常用作 `lock` 同步锁头或通用哨兵）。`emit_expr_new_expr` 必须对其显式分配 ARC 堆对象（调用 `zan_rt_alloc` 分配 8 字节最小载荷并关联 ARC 站点），将载荷清零并返回引用指针；
+  2. 严禁通过简单将常数 0 转为 null 指针来避开 verifier：`new object()` 必须产生具有独立生命周期与堆身份的有效对象引用。
   回归用 guarded/nested lock 正例和未守卫、后置 body/header 守卫、锁内可空
   返回负例成对锁住；`null_guard_lock` 与 `diag_null_guard_lock_*` 已验证。
 
