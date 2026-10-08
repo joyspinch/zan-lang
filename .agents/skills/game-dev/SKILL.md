@@ -507,6 +507,15 @@ Post 调用核对编码，别信二手注释。
   `dump tree` 都完整。看到空白先别怀疑页面构建，用 `dump pixels`（ZPX1→PNG）
   做 A/B。`ZAN_UI_SCRIPT` 的驱动文件只传裸文件名（launcher 会拼目录，带路径
   就静默不跑）；点击后等数秒再 dump，否则 tree 全零。
+- **GameClock 按墙钟计步，同步进程内泵 Tick 出 0 步**（2026-10-08 B-ID118
+  E2E 探针）：窗口 Open 完立刻 `StepLogic()` 时 elapsed≈0，
+  AdvanceFixedStep 一次都不跑；而 `AddEntity` 只进 pending 队列、
+  `AdvanceFixedStep` 才折叠进世界——表现为"实体永远画不出来、世界全黑"，
+  并非渲染坏。先忙等 ~100ms（`Window.GetTickMs()` 自旋）攒出逻辑步再 Step。
+- **Canvas.DumpRaw 落盘是 24 位 BMP，不是裸像素+头**（2026-10-08 B-ID118
+  探针）：'BM' 头、像素数据偏移 54、BGR 三字节、行序底朝上、行宽 4 字节
+  对齐（64×64 纯色 = 12342 字节）——像素复核脚本按标准 BMP 解析（数据
+  偏移在 10、宽高在 18/22），别按"裸 BGRA+定长头"猜到越界切片。
 - **ctest 管道到 `tail` 会吃掉退出码**：后台跑 `test.ps1 … | tail` 得到 exit 0，
   日志尾却是 `TEST_FAIL`。判定看日志里的 `tests passed` / `TEST_FAIL` 文本，
   不看管道退出码；失败项先按名字归因（网络类 / 其他会话未提交的 stdlib

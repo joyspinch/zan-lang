@@ -396,6 +396,18 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   帧循环就停在那里（窗口"未挂起"、消息循环活着，但帧计数器不走，
   超时断言永远不触发）。探针每帧末尾调一次 `app.RequestRedraw()` 保持
   状态机推进，否则看起来像"卡死在某一帧"，实际是没消息可等。
+- **进程内 Render() 探针每帧要 RequestRedraw，断言像素别画在画布原点**
+  （2026-10-08 B-ID118 E2E）：`ChildWindow.Render()` 有 NeedsRedraw 门
+  （`open && (host.needsRedraw || Pending())`）——循环里裸调 Render()
+  只有首帧真画，后续全部静默短路，"静态帧复用/门控重渲染"类断言整体
+  空转；签名 = 树内画帧计数器停在 1。每帧先 `host.RequestRedraw()` 再泵
+  再 Render()。断言像素画在画布 (0,0) 会被根面板的裁剪裁掉（读数像
+  "没画"），要画进控件带内。
+- **dock=5（fill）子控件放 Panel.Root，不放 Panel.Column/Row**
+  （2026-10-08 B-ID118 E2E）：Column/Row 是流式容器、按子控件 pref 尺寸
+  排布——只设 grow 没有首选尺寸的控件（如 GameViewport）在 Column 里
+  排成零高，OnPaint 照常被调但 bw/bh=0，绘制静默空转，看起来像"没渲染"
+  实际是"没尺寸"。停靠子控件的宿主用 `Panel.Root`。
 - **并发会话共用一块屏幕时，点击验证必须在同一次调用内闭环**：
   多个自动化会话都把 TOPMOST 窗口摆同一坐标（如 40,40），别人的合成
   点击会落在自己的窗口上——表现为"没人操作，日志里却在切页签/按按钮"，
