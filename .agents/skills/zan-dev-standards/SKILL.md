@@ -108,6 +108,23 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   有描述的公开端点曾被类描述隐式默认刷进侧栏，而 Monitor 非根动作上
   已标注的 `[Custom(IsMenu=true)]` 又被反向吞掉（2026-09-25 GenRoute
   改约定后两端同时修复，web_menu_attrs 用例锁定）。
+- **门面/物理双层对象：物理实例绝不能回填管理器回引用，配置在发放时下沉拷贝**。
+  连接池、事务包装这类"门面 + 物理"结构里，门面判定字段（如
+  `client.pool != null`）往往就是命令路由开关——给池建的物理连接回绑
+  `pool`，它自己的第一条命令（连验活 PING 都算）就会被门面语义重新路由进
+  `pool.Acquire`，递归开连直接挂死，且没有任何编译期/诊断提示。正确做法：
+  池级钩子（序列化器、事件、超时）在开连时**拷贝**到物理对象上，池与物理
+  对象之间保持单向引用。边界：发放即快照，之后改池级钩子只影响新开对象，
+  需在注释里写明。坑出处（2026-10-09 Redis 池级序列化钩子实测）：回绑写法
+  表现为"第一条命令挂死、OpenOne 被递归进入两次"，分阶段打印（enter/
+  connected/wired/ping ok）一击定位——async 挂死先怀疑命令被二次路由，
+  别急着怀疑编译器。
+- **文件 IO 语义与 C# 直觉的两处差异**：`File.Delete` 对不存在的路径抛
+  IOException（C# 是无操作）——清理/finally 里删临时文件必须先
+  `File.Exists` 或包 try/catch；`Directory.CreateDirectory` 只建**单级**，
+  父目录不存在照样抛——建测试根目录树用 `Directory.CreateDirectoryRecursive`。
+  坑出处：导航快照测试的临时目录清理与建树两处先后踩中，异常只在运行期
+  冒出（裸 "Unhandled exception: IOException"），编译期毫无提示。
 - **语言事实三则（2026-09-25 CRUD 声明化实机踩出）**：① `protected`
   是**仅子类可见**——同包同命名空间的协作类也访问不到（`Crud` 访问
   `AdminController` 的 `Can/Note/Saved` 直接编译错）。包内协作面要么
