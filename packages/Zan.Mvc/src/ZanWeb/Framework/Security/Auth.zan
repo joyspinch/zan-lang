@@ -112,26 +112,25 @@ class AuthUser {
         return false;
     }
 
+    /* FreeSql 门面：认证单操作经门面逐次取还池连接，等价于一次性借还。*/
+    static IFreeSql Orm() {
+        AppServices s = AppServices.Current();
+        if (s == null) { return null; }
+        return s.Orm();
+    }
+
     static async SysUser ByUsername(string username) {
-        IDbConnection db = await Lease();
-        if (db == null) { return null; }
-        try {
-            return await new SysUserDao(db).ByUsername(username);
-        } finally {
-            Give(db);
-        }
+        IFreeSql fsql = Orm();
+        if (fsql == null) { return null; }
+        return await new SysUserDao(fsql).ByUsername(username);
     }
 
     static async SysUser ById(string uid) {
         int id = ToInt(uid);
         if (id <= 0) { return null; }
-        IDbConnection db = await Lease();
-        if (db == null) { return null; }
-        try {
-            return await new SysUserDao(db).ById(id);
-        } finally {
-            Give(db);
-        }
+        IFreeSql fsql = Orm();
+        if (fsql == null) { return null; }
+        return await new SysUserDao(fsql).ById(id);
     }
 
     /* 校验密码并发放 Cookie token；"" = 拒绝，调用方不得区分失败原因
@@ -158,17 +157,13 @@ class AuthUser {
             WebApp.NowSeconds());
     }
 
-    /* 登录成功后的哈希格式升级（遗留链 → pbkdf2$）。独立借还连接，
+    /* 登录成功后的哈希格式升级（遗留链 → pbkdf2$）。独立门面操作，
        绝不嵌套在调用方租约之内。 */
     static async void UpgradeHash(int uid, string password) {
-        IDbConnection db = await Lease();
-        if (db == null) { return; }
-        try {
-            int _n = await new SysUserDao(db).UpgradeHash(uid,
-                NewHash(password), WebApp.NowSeconds());
-        } finally {
-            Give(db);
-        }
+        IFreeSql fsql = Orm();
+        if (fsql == null) { return; }
+        int _n = await new SysUserDao(fsql).UpgradeHash(uid,
+            NewHash(password), WebApp.NowSeconds());
     }
 
     /* 账号当前 token 版本号；无法登录时返回 -1。token 版本不同即作废，token 本身不含密码材料。
@@ -333,7 +328,7 @@ class AuthUser {
             db = owned;
         }
         try {
-            SysUser me = await db.Select<SysUser>().Where(a => a.id == id).FirstAsync();
+            SysUser me = await db.SysUser.Where(a => a.id == id).FirstAsync();
             if (me == null || me.status != Active) { return ""; }
             if (me.isSuper == 1) {
                 PermTable.SetUser(uid, true, "");
@@ -350,14 +345,14 @@ class AuthUser {
     /* 账号已启用的角色（自身 + 所在部门），输出 ",3,7,"。*/
     static async string RoleIds(IDbConnection db, SysUser me) {
         List<int> roleIds = new List<int>();
-        List<SysUserRole> mine = await db.Select<SysUserRole>()
+        List<SysUserRole> mine = await db.SysUserRole
             .Where(a => a.userId == me.id).ToListAsync();
         for (int i = 0; i < mine.Count; i = i + 1) {
             AddId(roleIds, mine[i].roleId);
         }
         int dept = me.departmentId;
         if (dept > 0) {
-            List<SysDepartmentRole> byDept = await db.Select<SysDepartmentRole>()
+            List<SysDepartmentRole> byDept = await db.SysDepartmentRole
                 .Where(a => a.departmentId == dept).ToListAsync();
             for (int i = 0; i < byDept.Count; i = i + 1) {
                 AddId(roleIds, byDept[i].roleId);
@@ -367,7 +362,7 @@ class AuthUser {
 
         StringBuilder outp = new StringBuilder();
         outp.Append(",");
-        List<SysRole> roles = await db.Select<SysRole>().ToListAsync();
+        List<SysRole> roles = await db.SysRole.ToListAsync();
         for (int i = 0; i < roles.Count; i = i + 1) {
             SysRole r = roles[i];
             if (r.status != 1 || !HasId(roleIds, r.id)) { continue; }

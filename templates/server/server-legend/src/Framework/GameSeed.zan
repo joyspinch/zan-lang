@@ -10,30 +10,30 @@ namespace ZanWeb;
    Schema.Ensure 之后补种。种子带计数保护，重复启动不变。 */
 class GameSeed {
     /* 幂等入口：main.zan 在 Schema.Ensure 成功后调用（自持连接）。 */
-    public static async bool Ensure(IDbConnection db) {
-        return await SeedGame(db);
+    public static async bool Ensure(IFreeSql fsql) {
+        return await SeedGame(fsql);
     }
 
-    static async bool SeedGame(IDbConnection db) {
-        int realms = await db.Select<Realm>().CountAsync();
+    static async bool SeedGame(IFreeSql fsql) {
+        int realms = await fsql.Select<Realm>().CountAsync();
         if (realms == 0) {
-            if (!await GameSeed.AddRealm(db, "一区·雷霆之怒", 0, 1)) { return false; }
-            if (!await GameSeed.AddRealm(db, "二区·烈焰天下", 0, 2)) { return false; }
-            if (!await GameSeed.AddRealm(db, "三区·战神殿", 1, 3)) { return false; }
+            if (!await GameSeed.AddRealm(fsql, "一区·雷霆之怒", 0, 1)) { return false; }
+            if (!await GameSeed.AddRealm(fsql, "二区·烈焰天下", 0, 2)) { return false; }
+            if (!await GameSeed.AddRealm(fsql, "三区·战神殿", 1, 3)) { return false; }
         } else {
             /* 旧库补倍率列：ALTER TABLE 加列后旧行是 NULL，归一到 1.0 倍
                （用 is null 判空，=0 匹配不到 NULL）。 */
-            await db.ExecuteAsync("update game_realm set expRate=10000"
+            await fsql.ExecuteAsync("update game_realm set expRate=10000"
                 + " where expRate is null or expRate=0");
-            await db.ExecuteAsync("update game_realm set goldRate=10000"
+            await fsql.ExecuteAsync("update game_realm set goldRate=10000"
                 + " where goldRate is null or goldRate=0");
-            await db.ExecuteAsync("update game_realm set dropRate=10000"
+            await fsql.ExecuteAsync("update game_realm set dropRate=10000"
                 + " where dropRate is null or dropRate=0");
         }
-        int maps = await db.Select<GameMap>().CountAsync();
-        int itemsN = await db.Select<Item>().CountAsync();
-        int mobsN = await db.Select<Mob>().CountAsync();
-        int dropsN = await db.Select<Drop>().CountAsync();
+        int maps = await fsql.Select<GameMap>().CountAsync();
+        int itemsN = await fsql.Select<Item>().CountAsync();
+        int mobsN = await fsql.Select<Mob>().CountAsync();
+        int dropsN = await fsql.Select<Drop>().CountAsync();
         if (maps == 0 || itemsN == 0 || mobsN == 0 || dropsN == 0) {
             /* 游戏目录（地图/物品/刷怪点/爆率）整体来自 M2.DB 快照——
                迷你传奇 data.dll 的原值。任一为空都整表重建；快照缺失
@@ -44,10 +44,10 @@ class GameSeed {
                     + " -- run tools/sync_csv_to_db.py first");
                 return false;
             }
-            if (!await GameSeed.SeedMaps(db)) { GameSnapshot.Close(); return false; }
-            if (!await GameSeed.SeedItems(db)) { GameSnapshot.Close(); return false; }
-            if (!await GameSeed.SeedMobs(db)) { GameSnapshot.Close(); return false; }
-            if (!await GameSeed.SeedSkillsFromSnap(db)) { GameSnapshot.Close(); return false; }
+            if (!await GameSeed.SeedMaps(fsql)) { GameSnapshot.Close(); return false; }
+            if (!await GameSeed.SeedItems(fsql)) { GameSnapshot.Close(); return false; }
+            if (!await GameSeed.SeedMobs(fsql)) { GameSnapshot.Close(); return false; }
+            if (!await GameSeed.SeedSkillsFromSnap(fsql)) { GameSnapshot.Close(); return false; }
             GameSnapshot.Close();
         } else {
             /* 旧库补全：种子期只有 slot/攻/防的库，按快照逐条覆写为
@@ -60,7 +60,7 @@ class GameSeed {
                     string nm = GameSnapshot.Str(snap, i, "name");
                     if (nm.Length == 0) { continue; }
                     Item f = GameSeed.ItemFromSnap(snap, i);
-                    await db.Update<Item>()
+                    await fsql.Update<Item>()
                         .Set(a => a.slot, f.slot)
                         .Set(a => a.kind, f.kind)
                         .Set(a => a.atk, f.atk)
@@ -87,7 +87,7 @@ class GameSeed {
                    BOSS 怪名，BOSS 链解锁用。幂等。 */
                 DbResult gm = await GameSnapshot.Table("gamemap");
                 DbResult gmMons = await GameSnapshot.Table("gamemonster");
-                List<GameMap> rtMaps = await db.Select<GameMap>().ToListAsync();
+                List<GameMap> rtMaps = await fsql.Select<GameMap>().ToListAsync();
                 for (int i = 0; i < gm.RowCount(); i = i + 1) {
                     int bossId = GameSnapshot.Int(gm, i, "boss");
                     int brow = GameSeed.MonsterRow(gmMons, "", bossId);
@@ -96,7 +96,7 @@ class GameSeed {
                     string bossName = GameSnapshot.Str(gmMons, brow, "name");
                     for (int k = 0; k < rtMaps.Count; k = k + 1) {
                         if (rtMaps[k].name != snapMap) { continue; }
-                        await db.Update<GameMap>()
+                        await fsql.Update<GameMap>()
                             .Set(a => a.boss, bossName)
                             .Where(a => a.id == rtMaps[k].id)
                             .ExecuteAffrowsAsync();
@@ -109,7 +109,7 @@ class GameSeed {
                 for (int i = 0; i < gmMons2.RowCount(); i = i + 1) {
                     string nm = GameSnapshot.Str(gmMons2, i, "name");
                     if (nm.Length == 0) { continue; }
-                    await db.Update<Mob>()
+                    await fsql.Update<Mob>()
                         .Set(a => a.atkMin, GameSnapshot.Int(gmMons2, i, "za1"))
                         .Set(a => a.mp, GameSnapshot.Int(gmMons2, i, "zmp"))
                         .Set(a => a.mdef, GameSnapshot.Int(gmMons2, i, "ze2"))
@@ -119,11 +119,11 @@ class GameSeed {
                 GameSnapshot.Close();
             }
             /* 老库补 BOSS 挑战次数：新列旧行是 NULL/0，归一到每天 20 次。 */
-            await db.ExecuteAsync("update game_player set bossTries=20"
+            await fsql.ExecuteAsync("update game_player set bossTries=20"
                 + " where bossTries is null or bossTries=0");
-            if (!await GameSeed.SeedSkills(db)) { return false; }
+            if (!await GameSeed.SeedSkills(fsql)) { return false; }
         }
-        int ann = await db.Select<Announce>().CountAsync();
+        int ann = await fsql.Select<Announce>().CountAsync();
         if (ann == 0) {
             Announce row = new Announce();
             row.title = "欢迎来到 {{NAME}}";
@@ -131,7 +131,7 @@ class GameSeed {
             row.enabled = 1;
             row.author = "system";
             row.createdAt = WebApp.NowSeconds();
-            int _id = await db.Insert<Announce>(row).ExecuteIdentityAsync();
+            int _id = await fsql.Insert<Announce>(row).ExecuteIdentityAsync();
             if (_id <= 0) { return false; }
         }
         return true;
@@ -142,17 +142,17 @@ class GameSeed {
     /* 技能：skills 表原值 24 条（三职业各 8：4 主动 + 4 被动，伤害/
        治疗系数、冷却、耗蓝、升级花费全是原值）。快照 id 不保留；
        job 0/1/2 与原表一致。老库补种路径自己开关快照连接。 */
-    static async bool SeedSkills(IDbConnection db) {
-        int n = await db.Select<Skill>().CountAsync();
+    static async bool SeedSkills(IFreeSql fsql) {
+        int n = await fsql.Select<Skill>().CountAsync();
         if (n > 0) { return true; }
         if (!await GameSnapshot.Open("data/M2.DB")) { return false; }
-        bool ok = await GameSeed.SeedSkillsFromSnap(db);
+        bool ok = await GameSeed.SeedSkillsFromSnap(fsql);
         GameSnapshot.Close();
         return ok;
     }
 
     /* 种子主体：假定快照连接已打开（冷启动路径由 SeedGame 打开）。 */
-    static async bool SeedSkillsFromSnap(IDbConnection db) {
+    static async bool SeedSkillsFromSnap(IFreeSql fsql) {
         DbResult snap = await GameSnapshot.Table("skills");
         for (int i = 0; i < snap.RowCount(); i = i + 1) {
             string name = GameSnapshot.Str(snap, i, "name");
@@ -178,7 +178,7 @@ class GameSeed {
             s.trainIron = GameSnapshot.Int(snap, i, "train_iron");
             s.school = GameSnapshot.Str(snap, i, "school");
             s.status = 1;
-            int _id = await db.Insert<Skill>(s).ExecuteIdentityAsync();
+            int _id = await fsql.Insert<Skill>(s).ExecuteIdentityAsync();
             if (_id <= 0) { return false; }
         }
         return true;
@@ -186,8 +186,8 @@ class GameSeed {
 
     /* 地图：gamemap 原值（名称/门槛/美术键），sortOrder=快照 id，
        掉落换算按它回查运行时 id。 */
-    static async bool SeedMaps(IDbConnection db) {
-        int n = await db.Select<GameMap>().CountAsync();
+    static async bool SeedMaps(IFreeSql fsql) {
+        int n = await fsql.Select<GameMap>().CountAsync();
         if (n > 0) { return true; }
         DbResult snap = await GameSnapshot.Table("gamemap");
         DbResult mons = await GameSnapshot.Table("gamemonster");
@@ -204,7 +204,7 @@ class GameSeed {
             m.boss = brow >= 0
                 ? GameSnapshot.Str(mons, brow, "name") : "";
             m.status = 1;
-            int _id = await db.Insert<GameMap>(m).ExecuteIdentityAsync();
+            int _id = await fsql.Insert<GameMap>(m).ExecuteIdentityAsync();
             if (_id <= 0) { return false; }
         }
         return true;
@@ -267,14 +267,14 @@ class GameSeed {
         return row;
     }
 
-    static async bool SeedItems(IDbConnection db) {
-        int n = await db.Select<Item>().CountAsync();
+    static async bool SeedItems(IFreeSql fsql) {
+        int n = await fsql.Select<Item>().CountAsync();
         if (n > 0) { return true; }
         DbResult snap = await GameSnapshot.Table("gameitem");
         for (int i = 0; i < snap.RowCount(); i = i + 1) {
             if (GameSnapshot.Str(snap, i, "name").Length == 0) { continue; }
             Item row = GameSeed.ItemFromSnap(snap, i);
-            int _id = await db.Insert<Item>(row).ExecuteIdentityAsync();
+            int _id = await fsql.Insert<Item>(row).ExecuteIdentityAsync();
             if (_id <= 0) { return false; }
         }
         return true;
@@ -286,8 +286,8 @@ class GameSeed {
        曲线补齐——补出的数值与原值一样落库，后台可逐条调。掉落取该
        怪（缺则该图）掉落串第一个非消耗项，weight×10 记万分比；经验/
        金币按地图档位 exp、money..money×3（BOSS 经验×5）。 */
-    static async bool SeedMobs(IDbConnection db) {
-        int n = await db.Select<Mob>().CountAsync();
+    static async bool SeedMobs(IFreeSql fsql) {
+        int n = await fsql.Select<Mob>().CountAsync();
         if (n > 0) { return true; }
         DbResult mons = await GameSnapshot.Table("gamemonster");
         DbResult maps = await GameSnapshot.Table("gamemap");
@@ -300,8 +300,8 @@ class GameSeed {
                 GameSnapshot.Str(snapTable, i, "aclass")
             ));
         }
-        List<Item> items = await db.Select<Item>().ToListAsync();
-        List<GameMap> rtMaps = await db.Select<GameMap>().ToListAsync();
+        List<Item> items = await fsql.Select<Item>().ToListAsync();
+        List<GameMap> rtMaps = await fsql.Select<GameMap>().ToListAsync();
         for (int i = 0; i < maps.RowCount(); i = i + 1) {
             int mapId = GameSeed.MapIdBySort(rtMaps,
                 GameSnapshot.Int(maps, i, "id"));
@@ -313,7 +313,7 @@ class GameSeed {
             List<string> names = GameSeed.SplitList(
                 GameSnapshot.Str(maps, i, "present"), 124 /* '|' */);
             for (int k = 0; k < names.Count; k = k + 1) {
-                if (!await GameSeed.SeedSpawn(db, mons, snapItems,
+                if (!await GameSeed.SeedSpawn(fsql, mons, snapItems,
                         items, names[k], mapId, mapLvl,
                         exp, money, mapDrop, false)) { return false; }
             }
@@ -321,7 +321,7 @@ class GameSeed {
             if (boss.Length > 0) {
                 int bossRow = GameSeed.MonsterRow(mons, "",
                     Convert.ToInt(boss));
-                if (bossRow >= 0 && !await GameSeed.SeedSpawn(db, mons,
+                if (bossRow >= 0 && !await GameSeed.SeedSpawn(fsql, mons,
                         snapItems, items,
                         GameSnapshot.Str(mons, bossRow, "name"), mapId,
                         mapLvl, exp, money, mapDrop, true)) { return false; }
@@ -335,7 +335,7 @@ class GameSeed {
        表（稻草人 200hp@2 … 赤月恶魔 3000hp@50）：普通 hp=150+45·lvl
        攻=8+1.8·lvl 防=2+0.9·lvl；BOSS hp=400+42·lvl 攻=10+3·lvl
        防=5+0.8·lvl。 */
-    static async bool SeedSpawn(IDbConnection db, DbResult mons,
+    static async bool SeedSpawn(IFreeSql fsql, DbResult mons,
             List<SnapItem> snapItems, List<Item> items, string name,
             int mapId, int mapLvl, int exp, long money, string mapDrop,
             bool boss) {
@@ -393,15 +393,15 @@ class GameSeed {
         m.count = boss ? 1 : 4;
         m.picture = picture;
         m.status = 1;
-        int _id = await db.Insert<Mob>(m).ExecuteIdentityAsync();
+        int _id = await fsql.Insert<Mob>(m).ExecuteIdentityAsync();
         if (_id <= 0) { return false; }
-        return await GameSeed.SeedDrops(db, drops, snapItems, items, _id);
+        return await GameSeed.SeedDrops(fsql, drops, snapItems, items, _id);
     }
 
     /* 爆率种子：掉落串 "快照id|数量|?|权重/..." 的全部条目逐条写入
        game_drop（权重×10 = 万分比，封顶 5000；含消耗品——原表就有，
        GM 可在爆率管理页删改）。通过 SnapItem 强类型实体映射。 */
-    static async bool SeedDrops(IDbConnection db, string drops,
+    static async bool SeedDrops(IFreeSql fsql, string drops,
             List<SnapItem> snapItems, List<Item> items, int mobId) {
         List<string> entries = GameSeed.SplitList(drops, 47 /* '/' */);
         int sort = 0;
@@ -422,7 +422,7 @@ class GameSeed {
             d.rate = rate;
             d.sort = sort;
             sort = sort + 1;
-            int _id = await db.Insert<Drop>(d).ExecuteIdentityAsync();
+            int _id = await fsql.Insert<Drop>(d).ExecuteIdentityAsync();
             if (_id <= 0) { return false; }
         }
         return true;
@@ -486,16 +486,16 @@ class GameSeed {
     }
 
 
-    static async bool AddRealm(IDbConnection db, string name, int state,
+    static async bool AddRealm(IFreeSql fsql, string name, int state,
                             int sort) {
-        return await GameSeed.AddRealm(db, name, state, sort, 10000, 10000,
+        return await GameSeed.AddRealm(fsql, name, state, sort, 10000, 10000,
             10000);
     }
 
     /* 倍率走万分比整型（10000=1.0 倍），种子默认全 1.0 倍。
        分区组：种子全归“永久区”；GM 开新区时在后台改 grp 即分出
        “公测1-10区”这类组（客户端分区窗按组两层展示）。 */
-    static async bool AddRealm(IDbConnection db, string name, int state,
+    static async bool AddRealm(IFreeSql fsql, string name, int state,
                             int sort, int expRate, int goldRate,
                             int dropRate) {
         Realm r = new Realm();
@@ -507,18 +507,18 @@ class GameSeed {
         r.goldRate = goldRate;
         r.dropRate = dropRate;
         r.createdAt = WebApp.NowSeconds();
-        int _id = await db.Insert<Realm>(r).ExecuteIdentityAsync();
+        int _id = await fsql.Insert<Realm>(r).ExecuteIdentityAsync();
         return _id > 0;
     }
 
-    static async bool AddMap(IDbConnection db, string name, int minLevel,
+    static async bool AddMap(IFreeSql fsql, string name, int minLevel,
                           int sortOrder) {
         GameMap m = new GameMap();
         m.name = name;
         m.minLevel = minLevel;
         m.sortOrder = sortOrder;
         m.status = 1;
-        int _id = await db.Insert<GameMap>(m).ExecuteIdentityAsync();
+        int _id = await fsql.Insert<GameMap>(m).ExecuteIdentityAsync();
         return _id > 0;
     }
 }
