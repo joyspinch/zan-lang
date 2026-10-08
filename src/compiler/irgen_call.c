@@ -5226,7 +5226,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_symbol_t *iface = obj_ty->sym;
                 zan_symbol_t *iface_m = resolve_iface_overload(iface,
                                             callee->member.name,
-                                            expr->call.args.count);
+                                            expr->call.args.count,
+                                            expr->call.type_args.count);
                 if (iface_m) {
                     LLVMContextRef c = g->ctx;
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
@@ -5291,7 +5292,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     for (int si = 0; si < g->struct_type_count; si++) {
                         zan_symbol_t *cls = g->struct_types[si].sym;
                         if (!cls || !class_implements_iface(cls, iface)) continue;
-                        zan_symbol_t *impl_m = resolve_overload(cls, callee->member.name, uargc);
+                        zan_symbol_t *impl_m = resolve_overload(cls, callee->member.name, uargc, 0);
                         if (!impl_m) continue;
                         LLVMValueRef ifn = NULL; LLVMTypeRef ifnty = NULL;
                         for (int fi = irgen_find_function(g, impl_m); fi >= 0; fi = -1)
@@ -5346,7 +5347,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     for (int si = 0; si < g->struct_type_count; si++) {
                         zan_symbol_t *cls = g->struct_types[si].sym;
                         if (!cls || !class_implements_iface(cls, iface)) continue;
-                        zan_symbol_t *impl_m = resolve_overload(cls, callee->member.name, uargc);
+                        zan_symbol_t *impl_m = resolve_overload(cls, callee->member.name, uargc, 0);
                         if (!impl_m) continue;
                         LLVMValueRef ifn = NULL; LLVMTypeRef ifnty = NULL;
                         for (int fi = irgen_find_function(g, impl_m); fi >= 0; fi = -1)

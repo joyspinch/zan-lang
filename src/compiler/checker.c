@@ -1741,8 +1741,9 @@ static bool method_is_params_tail(zan_symbol_t *m) {
  * descends to its base. The most-derived same-named method is kept as a
  * fallback when nothing in the chain fits, so a genuinely wrong argument count
  * is still reported by check_call_arity against a real signature. */
-static zan_symbol_t *checker_find_method_argc(zan_symbol_t *type_sym,
-                                              zan_istr_t name, int argc) {
+static zan_symbol_t *checker_find_method_call(zan_symbol_t *type_sym,
+                                               zan_istr_t name, int argc,
+                                               int type_arg_count) {
     zan_symbol_t *fallback = NULL;
     for (zan_symbol_t *s = type_sym; s;
          s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
@@ -1754,6 +1755,9 @@ static zan_symbol_t *checker_find_method_argc(zan_symbol_t *type_sym,
                 continue;
             if (!fallback) fallback = m;
             if (!method_accepts_argc(m, argc)) continue;
+            int mtps = (m->decl && m->decl->kind == AST_METHOD_DECL)
+                ? m->decl->method_decl.type_params.count : 0;
+            if (type_arg_count > 0 && mtps != type_arg_count) continue;
             if (method_is_params_tail(m)) {
                 if (!variadic) variadic = m;
                 continue;
@@ -1777,6 +1781,7 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
     zan_symbol_t *best = NULL;
     int best_score = -1;
     int argc = call->call.args.count;
+    int type_arg_count = call->call.type_args.count;
     for (zan_symbol_t *s = type_sym; s;
          s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
         for (int i = 0; i < s->member_count; i++) {
@@ -1784,6 +1789,9 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
             if (!m || m->kind != SYM_METHOD || m->name.len != name.len ||
                 memcmp(m->name.str, name.str, (size_t)name.len) != 0 ||
                 !method_accepts_argc(m, argc)) continue;
+            int mtps = (m->decl && m->decl->kind == AST_METHOD_DECL)
+                ? m->decl->method_decl.type_params.count : 0;
+            if (type_arg_count > 0 && mtps != type_arg_count) continue;
             zan_ast_list_t *ps = &m->decl->method_decl.params;
             int score = 0;
             bool compatible = true;
@@ -1815,7 +1823,7 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
             }
         }
     }
-    return best ? best : checker_find_method_argc(type_sym, name, argc);
+    return best ? best : checker_find_method_call(type_sym, name, argc, type_arg_count);
 }
 
 /* Reject a call that passes the wrong number of arguments. Without this the
@@ -2793,9 +2801,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             recv = zan_checker_check_expr(c, expr->call.callee->member.object);
             if (recv && recv->sym) {
-                zan_symbol_t *m = checker_find_method_argc(
+                zan_symbol_t *m = checker_find_method_call(
                     recv->sym, expr->call.callee->member.name,
-                    expr->call.args.count);
+                    expr->call.args.count, expr->call.type_args.count);
                 if (m && m->kind == SYM_METHOD) {
                     /* the unresolved path below reports through
                      * check_member_access, so report here only for the
@@ -2929,6 +2937,26 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 return c->binder->type_void; /* explicit void return */
             }
         }
+        /* If the called method has explicit type arguments, substitute them into
+         * the declared return type. */
+        if (called_sym && called_sym->decl &&
+            called_sym->decl->kind == AST_METHOD_DECL &&
+            expr->call.type_args.count > 0) {
+            zan_ast_node_t *m = called_sym->decl;
+            zan_ast_list_t *tps = &m->method_decl.type_params;
+            if (tps->count == expr->call.type_args.count && m->method_decl.return_type) {
+                zan_type_t *ret = zan_binder_resolve_type(c->binder, m->method_decl.return_type);
+                zan_type_t *targs[8] = { NULL };
+                int n = expr->call.type_args.count < 8 ? expr->call.type_args.count : 8;
+                for (int i = 0; i < n; i++) {
+                    targs[i] = zan_binder_resolve_type(c->binder, expr->call.type_args.items[i]);
+                }
+                ret = zan_binder_subst_named(c->binder, ret, tps, targs);
+                no_runtime_warn_arc_return(c, expr, ret);
+                return ret;
+            }
+        }
+
         /* The overload chosen from concrete arguments has a known return type,
          * even when the name is shared with another same-arity method. */
         if (typed_overload_changed && called_sym && called_sym->decl &&

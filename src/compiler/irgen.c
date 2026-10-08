@@ -3929,8 +3929,18 @@ static int method_accepts_arity(zan_symbol_t *m, int argc) {
     return 0;
 }
 
+/* Generic-method arity is part of overload identity (mirrors the checker):
+ * `M<T>(x)` and `M(x)` coexist, so a call carrying explicit type arguments
+ * must never bind to the non-generic same-arity sibling -- the checker types
+ * the call as `T-substituted` while this phase would emit it against the
+ * plain signature, and the call returned garbage at runtime. */
+static int method_type_param_count(zan_symbol_t *m) {
+    if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return 0;
+    return m->decl->method_decl.type_params.count;
+}
+
 static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name,
-                                      int argc) {
+                                      int argc, int type_arg_count) {
     int depth = 0;
     while (type_sym && depth++ < 512) {
         zan_symbol_t *variadic = NULL;
@@ -3939,6 +3949,9 @@ static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name,
              i = member_next_named(ci, i)) {
             zan_symbol_t *m = type_sym->members[i];
             if (m->kind != SYM_METHOD || !member_name_is(m, name)) continue;
+            if (type_arg_count > 0 &&
+                method_type_param_count(m) != type_arg_count)
+                continue;
             if (m->decl && method_accepts_arity(m, argc)) {
                 /* keep variadic as a fallback: an exact/default-filled
                  * overload wins over the params tail */
@@ -3965,23 +3978,25 @@ static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name,
  * inherited method and the call would dispatch to nothing. */
 static zan_symbol_t *resolve_iface_overload_depth(zan_symbol_t *iface,
                                                    zan_istr_t name, int argc,
+                                                   int type_arg_count,
                                                    int depth) {
     if (!iface || depth > 512) return NULL;
-    zan_symbol_t *m = resolve_overload(iface, name, argc);
+    zan_symbol_t *m = resolve_overload(iface, name, argc, type_arg_count);
     if (m) return m;
     if (!iface->type) return NULL;
     for (int i = 0; i < iface->type->interface_count; i++) {
         zan_type_t *it = iface->type->interfaces[i];
         if (!it || !it->sym || it->sym == iface) continue;
-        m = resolve_iface_overload_depth(it->sym, name, argc, depth + 1);
+        m = resolve_iface_overload_depth(it->sym, name, argc, type_arg_count,
+                                         depth + 1);
         if (m) return m;
     }
     return NULL;
 }
 
 static zan_symbol_t *resolve_iface_overload(zan_symbol_t *iface, zan_istr_t name,
-                                            int argc) {
-    return resolve_iface_overload_depth(iface, name, argc, 0);
+                                            int argc, int type_arg_count) {
+    return resolve_iface_overload_depth(iface, name, argc, type_arg_count, 0);
 }
 
 /* Defined in irgen_abi.c, which is part of this translation unit. */

@@ -1439,7 +1439,7 @@ static void emit_vtables(zan_irgen_t *g) {
             if (s < nd) {
                 zan_symbol_t *decl = decls[s];
                 int arity = decl->decl ? decl->decl->method_decl.params.count : 0;
-                zan_symbol_t *impl = resolve_overload(sym, decl->name, arity);
+                zan_symbol_t *impl = resolve_overload(sym, decl->name, arity, 0);
                 LLVMValueRef fn = find_fn_for_sym(g, impl);
                 if (fn) e = LLVMConstBitCast(fn, i8ptr);
             }

@@ -3334,7 +3334,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * would silently fall through to the legacy List layout and read
              * unrelated memory. Say so instead. */
             zan_istr_t gi = { (char *)"GetEnumerator", 13 };
-            zan_symbol_t *gm = resolve_overload(col_type0->sym, gi, 0);
+            zan_symbol_t *gm = resolve_overload(col_type0->sym, gi, 0, 0);
             if (gm && gm->decl && gm->decl->kind == AST_METHOD_DECL &&
                 gm->decl->method_decl.return_type) {
                 zan_type_t *rt = resolve_type_ctx(g,
@@ -3353,9 +3353,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             zan_istr_t gi = { (char *)"GetEnumerator", 13 };
             zan_istr_t ni = { (char *)"MoveNext", 8 };
             zan_istr_t ci = { (char *)"Current", 7 };
-            fe_get_m = resolve_overload(col_type0->sym, gi, 0);
-            fe_next_m = resolve_overload(fe_enum_ty->sym, ni, 0);
-            fe_cur_m = resolve_overload(fe_enum_ty->sym, ci, 0);
+            fe_get_m = resolve_overload(col_type0->sym, gi, 0, 0);
+            fe_next_m = resolve_overload(fe_enum_ty->sym, ni, 0, 0);
+            fe_cur_m = resolve_overload(fe_enum_ty->sym, ci, 0, 0);
             if (!fe_cur_m) {
                 for (int i = 0; i < fe_enum_ty->sym->member_count &&
                                  !fe_cur_getter; i++) {

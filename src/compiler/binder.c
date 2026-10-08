@@ -218,6 +218,18 @@ static bool binder_params_equiv(zan_symbol_t *a, zan_symbol_t *b) {
     return true;
 }
 
+/* Generic-method arity is part of overload identity (C# CS0111 exempts
+ * `M(string)` from `M<T>(string)`): without the type-param count in the
+ * comparison, a generic Get<T>(string) next to Get(string) was a "duplicate
+ * method" and the FreeRedis-style typed alias could not be declared. */
+static bool binder_type_params_equiv(zan_symbol_t *a, zan_symbol_t *b) {
+    int atp = (a->decl && a->decl->kind == AST_METHOD_DECL)
+        ? a->decl->method_decl.type_params.count : 0;
+    int btp = (b->decl && b->decl->kind == AST_METHOD_DECL)
+        ? b->decl->method_decl.type_params.count : 0;
+    return atp == btp;
+}
+
 /* ---- per-type member-name index (struct zan_binder.member_idx) ---- */
 
 typedef struct {
@@ -407,7 +419,8 @@ static bool member_clash_one(zan_binder_t *b, zan_symbol_t *type_sym,
         return true;
     }
     if ((m_is_code && a_is_code) &&
-        binder_params_equiv(m, added)) {
+        binder_params_equiv(m, added) &&
+        binder_type_params_equiv(m, added)) {
         zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
                       "duplicate method '%.*s' in '%.*s': a method with "
                       "the same parameter types is already declared",

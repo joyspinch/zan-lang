@@ -893,7 +893,7 @@ static zan_symbol_t *arg_method_group(zan_irgen_t *g, zan_ast_node_t *a,
     zan_symbol_t *cs = zan_binder_lookup(g->binder, obj->ident.name);
     if (!cs || (cs->kind != SYM_CLASS && cs->kind != SYM_STRUCT)) return NULL;
     if (get_field_sym(cs, a->member.name)) return NULL;
-    zan_symbol_t *m = arity >= 0 ? resolve_overload(cs, a->member.name, arity)
+    zan_symbol_t *m = arity >= 0 ? resolve_overload(cs, a->member.name, arity, 0)
                                  : NULL;
     if (!m) m = get_method_sym(cs, a->member.name);
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return NULL;
@@ -1481,6 +1481,8 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
                                             zan_ast_node_t *call,
                                             local_scope_t *locals) {
     int argc = (call && call->kind == AST_CALL) ? call->call.args.count : 0;
+    int type_arg_count = (call && call->kind == AST_CALL)
+        ? call->call.type_args.count : 0;
     check_shared_table_width(g, type_sym, name, call);
     zan_symbol_t *best = NULL;
     int best_score = -1;
@@ -1500,6 +1502,15 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
                 m->decl->kind != AST_METHOD_DECL) continue;
             if (m->name.len != name.len ||
                 memcmp(m->name.str, name.str, name.len) != 0) continue;
+            /* Explicit type arguments pick the generic overload: without
+             * this filter `GetAsync<User>(key)` tied on argument scoring
+             * with a same-arity non-generic `GetAsync(key)` and kept the
+             * declaration-order winner, so the call was emitted against
+             * the string signature while the checker had already typed
+             * the result as `User` -- null/garbage at runtime. */
+            if (type_arg_count > 0 &&
+                m->decl->method_decl.type_params.count != type_arg_count)
+                continue;
             if (!method_accepts_arity(m, argc)) continue;
             arity_matches++;
             int score = method_args_score(g, m, call, NULL, locals, 0);
@@ -1529,7 +1540,7 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
                       (int)name.len, name.str);
         return NULL;
     }
-    return resolve_overload(type_sym, name, argc);
+    return resolve_overload(type_sym, name, argc, type_arg_count);
 }
 
 /* Overload resolution for operator-style methods whose first declared
