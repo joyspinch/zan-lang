@@ -3,8 +3,9 @@
 // reply per request (covering +simple, :integer, $bulk, $-1 nil and *array), so
 // the test is deterministic and needs no external redis-server. Exercises the
 // full path: non-blocking connect, RESP command encoding, and the incremental,
-// binary-safe reply parser.
+// binary-safe reply parser, along with FreeRedis-style high-level commands.
 using System;
+using System.Collections.Generic;
 using System.Net.Sockets;
 using System.Data.Redis;
 
@@ -20,16 +21,32 @@ class Program {
         Socket.SetNonBlocking(client);
 
         List<string> replies = new List<string>();
-        replies.Add("+PONG\r\n");                               // PING
-        replies.Add("+OK\r\n");                                 // SET name Alice
-        replies.Add("$5\r\nAlice\r\n");                         // GET name
-        replies.Add(":1\r\n");                                  // DEL name
-        replies.Add("$-1\r\n");                                 // GET name (nil)
-        replies.Add("*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");        // LRANGE
-        replies.Add(":5000000000\r\n");                         // INCRBY (64-bit integer > 2GB)
-        replies.Add("+OK\r\n");                                 // MSET
-        replies.Add("*2\r\n$3\r\none\r\n$3\r\ntwo\r\n");        // MGET
-        replies.Add(":2\r\n");                                  // DEL multiple
+        // 原有 10 个回复
+        replies.Add("+PONG\r\n");                               // 1. PING
+        replies.Add("+OK\r\n");                                 // 2. SET name Alice
+        replies.Add("$5\r\nAlice\r\n");                         // 3. GET name
+        replies.Add(":1\r\n");                                  // 4. DEL name
+        replies.Add("$-1\r\n");                                 // 5. GET name (nil)
+        replies.Add("*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");        // 6. LRANGE
+        replies.Add(":5000000000\r\n");                         // 7. INCRBY (64-bit integer > 2GB)
+        replies.Add("+OK\r\n");                                 // 8. MSET
+        replies.Add("*2\r\n$3\r\none\r\n$3\r\ntwo\r\n");        // 9. MGET
+        replies.Add(":2\r\n");                                  // 10. DEL multiple
+
+        // FreeRedis 风格强类型高阶命令回复
+        replies.Add("*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");        // 11. LRangeAsync
+        replies.Add(":1\r\n");                                  // 12. HSetAsync
+        replies.Add("$2\r\n20\r\n");                            // 13. HGetAsync
+        replies.Add("*4\r\n$4\r\nname\r\n$5\r\nAlice\r\n$3\r\nage\r\n$2\r\n20\r\n"); // 14. HGetAllAsync
+        replies.Add(":1\r\n");                                  // 15. SAddAsync
+        replies.Add("*2\r\n$3\r\nzan\r\n$4\r\nfast\r\n");        // 16. SMembersAsync
+        replies.Add(":1\r\n");                                  // 17. SIsMemberAsync
+        replies.Add(":1\r\n");                                  // 18. ZAddAsync
+        replies.Add("$4\r\n99.5\r\n");                          // 19. ZScoreAsync
+        replies.Add("*2\r\n$7\r\nplayer1\r\n$4\r\n99.5\r\n");    // 20. ZRangeWithScoresAsync
+        replies.Add("+zset\r\n");                               // 21. TypeAsync
+        replies.Add(":1\r\n");                                  // 22. SetNxAsync
+        replies.Add(":5\r\n");                                  // 23. StrLenAsync
 
         for (int i = 0; i < replies.Count; i = i + 1) {
             string _req = await AsyncSocket.Receive(client, 1024);
@@ -41,21 +58,27 @@ class Program {
     static async void RunClient() {
         RedisClient r = await RedisClient.ConnectAsync("127.0.0.1", PORT);
 
+        // 1. PING
         bool pong = await r.PingAsync();
         if (pong) { done = done + 1; }
 
+        // 2. SET
         bool setOk = await r.SetAsync("name", "Alice");
         if (setOk) { done = done + 1; }
 
+        // 3. GET
         string v = await r.GetAsync("name");
         if (v == "Alice") { done = done + 1; }
 
+        // 4. DEL
         int deleted = await r.DelAsync("name");
         if (deleted == 1) { done = done + 1; }
 
+        // 5. GET nil
         RedisReply missing = await r.GetReplyAsync("name");
         if (missing.IsNil()) { done = done + 1; }
 
+        // 6. 手动拼命令兼容性测试
         List<string> lr = new List<string>();
         lr.Add("LRANGE");
         lr.Add("mylist");
@@ -67,28 +90,118 @@ class Program {
             done = done + 1;
         }
 
+        // 7. 64 位大数 INCRBY
         long bigVal = await r.IncrByAsync("big_counter", 5000000000L);
         if (bigVal == 5000000000L) { done = done + 1; }
 
+        // 8. MSET
         List<string> mkeys = new List<string>{ "k1", "k2" };
         List<string> mvals = new List<string>{ "one", "two" };
         bool msetOk = await r.MSetAsync(mkeys, mvals);
         if (msetOk) { done = done + 1; }
 
+        // 9. MGET
         List<string> gotMvals = await r.MGetAsync(mkeys);
         if (gotMvals != null && gotMvals.Count == 2 &&
             gotMvals[0] == "one" && gotMvals[1] == "two") {
             done = done + 1;
         }
 
+        // 10. DEL multiple
         int delCount = await r.DelMultipleAsync(mkeys);
         if (delCount == 2) { done = done + 1; }
+
+        // ---- FreeRedis 风格高阶强类型命令（无需再手动拼命令）----
+
+        // 11. List: 直接调用 LRangeAsync 得到 List<string>
+        List<string> listItems = await r.LRangeAsync("mylist", 0, -1);
+        if (listItems != null && listItems.Count == 2 &&
+            listItems[0] == "foo" && listItems[1] == "bar") {
+            done = done + 1;
+        }
+
+        // 12. Hash: 直接调用 HSetAsync
+        long hsetRes = await r.HSetAsync("user:1", "age", "20");
+        if (hsetRes == 1) { done = done + 1; }
+
+        // 13. Hash: 直接调用 HGetAsync 得到字符串
+        string ageVal = await r.HGetAsync("user:1", "age");
+        if (ageVal == "20") { done = done + 1; }
+
+        // 14. Hash: 直接调用 HGetAllAsync 得到 Dictionary<string, string>
+        Dictionary<string, string> userMap = await r.HGetAllAsync("user:1");
+        if (userMap != null && userMap.Count == 2 &&
+            userMap["name"] == "Alice" && userMap["age"] == "20") {
+            done = done + 1;
+        }
+
+        // 15. Set: 直接调用 SAddAsync
+        long saddRes = await r.SAddAsync("tags", "zan");
+        if (saddRes == 1) { done = done + 1; }
+
+        // 16. Set: 直接调用 SMembersAsync 得到 List<string>
+        List<string> members = await r.SMembersAsync("tags");
+        if (members != null && members.Count == 2 &&
+            members[0] == "zan" && members[1] == "fast") {
+            done = done + 1;
+        }
+
+        // 17. Set: 直接调用 SIsMemberAsync
+        bool isMember = await r.SIsMemberAsync("tags", "zan");
+        if (isMember) { done = done + 1; }
+
+        // 18. ZSet: 直接调用 ZAddAsync
+        long zaddRes = await r.ZAddAsync("leaderboard", 99.5, "player1");
+        if (zaddRes == 1) { done = done + 1; }
+
+        // 19. ZSet: 直接调用 ZScoreAsync
+        double score = await r.ZScoreAsync("leaderboard", "player1");
+        if (score >= 99.4 && score <= 99.6) { done = done + 1; }
+
+        // 20. ZSet: 直接调用 ZRangeWithScoresAsync 得到 List<ZMember>
+        List<ZMember> topList = await r.ZRangeWithScoresAsync("leaderboard", 0, -1);
+        if (topList != null && topList.Count == 1 &&
+            topList[0].member == "player1" && topList[0].score >= 99.4) {
+            done = done + 1;
+        }
+
+        // 21. Key: 直接调用 TypeAsync
+        string ktype = await r.TypeAsync("leaderboard");
+        if (ktype == "zset") { done = done + 1; }
+
+        // 22. String: 直接调用 SetNxAsync
+        bool setnxOk = await r.SetNxAsync("lock:key", "val1");
+        if (setnxOk) { done = done + 1; }
+
+        // 23. String: 直接调用 StrLenAsync
+        long slen = await r.StrLenAsync("name");
+        if (slen == 5) { done = done + 1; }
 
         r.Close();
     }
 
+    static void TestOptions() {
+        // 24. 测试 FreeRedis 规范的标准连接字符串解析
+        RedisOptions opt1 = RedisOptions.Parse("127.0.0.1:6379,password=mypass,defaultDatabase=2,poolsize=15,ssl=true,connectTimeout=5000");
+        if (opt1.host == "127.0.0.1" && opt1.port == 6379 &&
+            opt1.password == "mypass" && opt1.database == 2 &&
+            opt1.poolSize == 15 && opt1.ssl && opt1.connectTimeoutMs == 5000) {
+            done = done + 1;
+        }
+
+        // 25. 测试 URI 格式连接字符串解析
+        RedisOptions opt2 = RedisOptions.Parse("rediss://:pwd123@10.0.0.1:6380/3");
+        if (opt2.host == "10.0.0.1" && opt2.port == 6380 &&
+            opt2.password == "pwd123" && opt2.database == 3 && opt2.ssl) {
+            done = done + 1;
+        }
+    }
+
     static async int Run() {
         Socket.Initialize();
+
+        // 先执行配置解析测试
+        TestOptions();
 
         nint listener = Socket.CreateTcp();
         Socket.SetReuseAddr(listener);
@@ -98,9 +211,6 @@ class Program {
 
         Task.Spawn(MockServer(listener));
 
-        // Run the client sequence in this (main) coroutine and await it to
-        // completion, so its reply objects are released deterministically at
-        // scope exit rather than lingering in a spawned frame at program exit.
         await RunClient();
 
         Console.WriteLine(done);

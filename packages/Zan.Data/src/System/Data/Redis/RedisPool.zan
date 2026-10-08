@@ -1,42 +1,90 @@
 using System;
+using System.Collections.Generic;
 using System.Data;
 
 namespace System.Data.Redis;
 
 /// <summary>
-/// Redis 客户端连接池：复用空闲连接、限制并发连接数，饱和时
-/// 以协程挂起等待归还（有界，超时返回 null）。建连失败的路径
-/// 带退避，避免后端不可达时每次获取都重试建连。
+/// Redis 客户端连接池（对标 FreeRedis 规范设计）。
+///
+/// 具备双重使用形态：
+/// 1. 高级免借还客户端：直接在池上调用 GetAsync / SetAsync / HSetAsync 等全套高阶命令，
+///    内部自动借出并在执行完成后安全归还，支持高并发协程调用；
+/// 2. 传统借还池：通过 AcquireAsync / Release 手动管理特定长事务或复杂序列。
 /// </summary>
 class RedisPool {
     string host;
     int port;
     int connectTimeoutMs;
+    RedisOptions options;
     PoolCore<RedisClient> core;
 
-    /// 以默认 3000ms 连接超时构建池。
-    RedisPool(string host, int port, int maxSize) : this(host, port, maxSize, 3000) {
+    /// <summary>通过连接字符串构造连接池（FreeRedis 规范）。</summary>
+    public RedisPool(string connectionString) : this(RedisOptions.Parse(connectionString)) {
     }
 
-    /// 以显式连接超时（毫秒）构建池。
-    RedisPool(string host, int port, int maxSize, int connectTimeoutMs) {
+    /// <summary>通过配置项构造连接池。</summary>
+    public RedisPool(RedisOptions options) {
+        this.options = options;
+        this.host = options.host;
+        this.port = options.port;
+        this.connectTimeoutMs = options.connectTimeoutMs;
+        int size = options.poolSize > 0 ? options.poolSize : 10;
+        this.core = new PoolCore<RedisClient>(size);
+    }
+
+    /// <summary>以默认 3000ms 连接超时构建池。</summary>
+    public RedisPool(string host, int port, int maxSize) : this(host, port, maxSize, 3000) {
+    }
+
+    /// <summary>以显式连接超时（毫秒）构建池。</summary>
+    public RedisPool(string host, int port, int maxSize, int connectTimeoutMs) {
+        this.options = new RedisOptions();
+        this.options.host = host;
+        this.options.port = port;
+        this.options.poolSize = maxSize;
+        this.options.connectTimeoutMs = connectTimeoutMs;
         this.host = host;
         this.port = port;
         this.connectTimeoutMs = connectTimeoutMs;
         this.core = new PoolCore<RedisClient>(maxSize);
     }
 
-    /// 新建一个客户端并用 PING 验证可用性；任何失败都关闭连接并
-    /// 返回 null（不抛出，由调用方记退避）。失败根因按 episode 首条
-    /// 记录诊断：退避期内静默，恢复后再次失败重新记录。
+    /// 新建一个客户端并用 PING 验证可用性（含自动认证与库切换）。
     async RedisClient OpenOne() {
-        RedisClient client = await RedisClient.ConnectAsync(
-            this.host, this.port, this.connectTimeoutMs);
+        RedisClient client = null;
+        if (this.options != null && this.options.ssl) {
+            client = await RedisClient.ConnectSecureAsync(
+                this.host, this.port, this.connectTimeoutMs);
+        } else {
+            client = await RedisClient.ConnectAsync(
+                this.host, this.port, this.connectTimeoutMs);
+        }
         if (client == null) {
             this.NoteOpenEpisode("connect failed (refused or timeout)");
             return null;
         }
         try {
+            if (this.options != null && this.options.password != null && this.options.password.Length > 0) {
+                bool authOk = false;
+                if (this.options.user != null && this.options.user.Length > 0) {
+                    authOk = await client.AuthAsync(this.options.user, this.options.password);
+                } else {
+                    authOk = await client.AuthAsync(this.options.password);
+                }
+                if (!authOk) {
+                    this.NoteOpenEpisode("auth failed");
+                    client.Close();
+                    return null;
+                }
+            }
+            if (this.options != null && this.options.database > 0) {
+                if (!await client.SelectAsync(this.options.database)) {
+                    this.NoteOpenEpisode("select database failed");
+                    client.Close();
+                    return null;
+                }
+            }
             if (!await client.PingAsync()) {
                 string why = client.GetLastError();
                 this.NoteOpenEpisode("ping failed"
@@ -52,7 +100,6 @@ class RedisPool {
         }
     }
 
-    /// 建连失败 episode 的首条诊断（池处于退避中即静默）。
     void NoteOpenEpisode(string detail) {
         if (!this.core.OpenFailing()) {
             Console.WriteLine("[redispool] " + this.host + ":"
@@ -60,10 +107,7 @@ class RedisPool {
         }
     }
 
-    /// <summary>借出一个客户端：复用空闲的，未达上限则新建，
-    /// 否则挂起协程直到有客户端被归还。饱和等待有硬上限
-    /// （见 <see cref="PoolWait"/>）：超时返回 null，绝不定死。
-    /// 连接池关闭后返回 null。</summary>
+    /// <summary>借出一个客户端。</summary>
     async RedisClient AcquireAsync() {
         PoolWait wait = new PoolWait();
         while (true) {
@@ -74,9 +118,6 @@ class RedisPool {
                 this.core.Drop(pooled);
                 pooled = this.core.TakeIdle();
             }
-            // 上一次建连失败后退避：后端不可达时，若每次获取都重试建连，
-            // 失败本身就成了每请求的固定开销（失败的本地 open 也要约
-            // 125us），足以让命中路由的吞吐掉一个数量级。
             if (this.core.OpenBlocked()) {
                 return null;
             }
@@ -104,8 +145,6 @@ class RedisPool {
                 this.core.Borrow(opened);
                 return opened;
             }
-            // 连接池已满：交给共享的有界等待（见 PoolWait），
-            // 预算耗尽以 null 快速失败。
             if (!await this.core.WaitForRelease(wait)) {
                 return null;
             }
@@ -113,12 +152,10 @@ class RedisPool {
         return null;
     }
 
-    /// 归还一个客户端：池已关闭或连接已死时无条件 Close 并剔除
-    /// （否则套接字泄漏），否则放回空闲列表。null 安全。
+    /// <summary>归还一个客户端。</summary>
     void Release(RedisClient client) {
         if (client == null) { return; }
         if (this.core.IsClosed() || !client.IsConnected()) {
-            // 无条件 Close：死连接的套接字还在，条件跳过即泄漏 fd。
             client.Close();
             this.core.Drop(client);
             return;
@@ -126,20 +163,13 @@ class RedisPool {
         this.core.Pool(client);
     }
 
-    /// 空闲连接数。
     int IdleCount() { return this.core.IdleCount(); }
-    /// 存活连接数（空闲 + 已借出）。
     int LiveCount() { return this.core.LiveCount(); }
-    /// 正在等待归还的协程数。
     int WaitingCount() { return this.core.WaitingCount(); }
-    /// 并发连接上限。
     int MaxSize() { return this.core.MaxSize(); }
-    /// 池是否已被关闭。
     bool IsClosed() { return this.core.IsClosed(); }
 
-    /// 关闭池：关闭所有空闲连接并唤醒全部等待者
-    /// （它们从 AcquireAsync 得到 null）。已借出的连接在
-    /// Release 时关闭。
+    /// <summary>关闭池：关闭所有连接并唤醒等待者。</summary>
     void Close() {
         this.core.MarkClosed();
         RedisClient client = this.core.TakeIdle();
@@ -149,5 +179,931 @@ class RedisPool {
             client = this.core.TakeIdle();
         }
         this.core.WakeAll();
+    }
+
+    // ========================================================================
+    // FreeRedis 风格高阶透明调用：自动借还连接执行命令
+    // ========================================================================
+
+    public async RedisReply CommandAsync(List<string> args) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) {
+            RedisReply err = new RedisReply();
+            err.kind = RedisReply.ERROR;
+            err.str = "failed to acquire redis client from pool";
+            return err;
+        }
+        try {
+            return await c.CommandAsync(args);
+        } finally {
+            this.Release(c);
+        }
+    }
+
+    public async RedisReply CommandBytesAsync(List<string> prefixArgs, byte[] binaryArg) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) {
+            RedisReply err = new RedisReply();
+            err.kind = RedisReply.ERROR;
+            err.str = "failed to acquire redis client from pool";
+            return err;
+        }
+        try {
+            return await c.CommandBytesAsync(prefixArgs, binaryArg);
+        } finally {
+            this.Release(c);
+        }
+    }
+
+    public async bool PingAsync() {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.PingAsync(); } finally { this.Release(c); }
+    }
+
+    public async string EchoAsync(string message) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.EchoAsync(message); } finally { this.Release(c); }
+    }
+
+    // 字符串
+    public async string GetAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.GetAsync(key); } finally { this.Release(c); }
+    }
+
+    public async byte[] GetBytesAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return null; }
+        try { return await c.GetBytesAsync(key); } finally { this.Release(c); }
+    }
+
+    public async RedisReply GetReplyAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return null; }
+        try { return await c.GetReplyAsync(key); } finally { this.Release(c); }
+    }
+
+    public async string GetSetAsync(string key, string val) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.GetSetAsync(key, val); } finally { this.Release(c); }
+    }
+
+    public async bool SetAsync(string key, string val) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SetAsync(key, val); } finally { this.Release(c); }
+    }
+
+    public async bool SetAsync(string key, string val, int expireSeconds) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SetAsync(key, val, expireSeconds); } finally { this.Release(c); }
+    }
+
+    public async bool SetAsync(string key, string val, int expireSeconds, bool nx, bool xx) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SetAsync(key, val, expireSeconds, nx, xx); } finally { this.Release(c); }
+    }
+
+    public async bool SetExAsync(string key, int seconds, string val) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SetExAsync(key, seconds, val); } finally { this.Release(c); }
+    }
+
+    public async bool SetNxAsync(string key, string val) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SetNxAsync(key, val); } finally { this.Release(c); }
+    }
+
+    public async bool SetNxAsync(string key, string val, int expireSeconds) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SetNxAsync(key, val, expireSeconds); } finally { this.Release(c); }
+    }
+
+    public async bool SetXxAsync(string key, string val) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SetXxAsync(key, val); } finally { this.Release(c); }
+    }
+
+    public async bool SetBytesAsync(string key, byte[] val) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SetBytesAsync(key, val); } finally { this.Release(c); }
+    }
+
+    public async List<string> MGetAsync(List<string> keys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.MGetAsync(keys); } finally { this.Release(c); }
+    }
+
+    public async bool MSetAsync(List<RedisEntry> entries) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.MSetAsync(entries); } finally { this.Release(c); }
+    }
+
+    public async bool MSetAsync(Dictionary<string, string> dict) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.MSetAsync(dict); } finally { this.Release(c); }
+    }
+
+    public async bool MSetAsync(List<string> keys, List<string> vals) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.MSetAsync(keys, vals); } finally { this.Release(c); }
+    }
+
+    public async bool MSetNxAsync(List<RedisEntry> entries) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.MSetNxAsync(entries); } finally { this.Release(c); }
+    }
+
+    public async int IncrAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.IncrAsync(key); } finally { this.Release(c); }
+    }
+
+    public async long Incr64Async(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.Incr64Async(key); } finally { this.Release(c); }
+    }
+
+    public async long IncrByAsync(string key, long amount) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.IncrByAsync(key, amount); } finally { this.Release(c); }
+    }
+
+    public async double IncrByFloatAsync(string key, double amount) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0.0; }
+        try { return await c.IncrByFloatAsync(key, amount); } finally { this.Release(c); }
+    }
+
+    public async int DecrAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.DecrAsync(key); } finally { this.Release(c); }
+    }
+
+    public async long Decr64Async(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.Decr64Async(key); } finally { this.Release(c); }
+    }
+
+    public async long DecrByAsync(string key, long amount) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.DecrByAsync(key, amount); } finally { this.Release(c); }
+    }
+
+    public async long StrLenAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.StrLenAsync(key); } finally { this.Release(c); }
+    }
+
+    public async long AppendAsync(string key, string value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.AppendAsync(key, value); } finally { this.Release(c); }
+    }
+
+    public async string GetRangeAsync(string key, long start, long end) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.GetRangeAsync(key, start, end); } finally { this.Release(c); }
+    }
+
+    public async long SetRangeAsync(string key, long offset, string value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.SetRangeAsync(key, offset, value); } finally { this.Release(c); }
+    }
+
+    // 键
+    public async int DelAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.DelAsync(key); } finally { this.Release(c); }
+    }
+
+    public async int DelMultipleAsync(List<string> keys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.DelMultipleAsync(keys); } finally { this.Release(c); }
+    }
+
+    public async int ExistsAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.ExistsAsync(key); } finally { this.Release(c); }
+    }
+
+    public async int ExistsMultipleAsync(List<string> keys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.ExistsMultipleAsync(keys); } finally { this.Release(c); }
+    }
+
+    public async string TypeAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.TypeAsync(key); } finally { this.Release(c); }
+    }
+
+    public async int ExpireAsync(string key, int seconds) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.ExpireAsync(key, seconds); } finally { this.Release(c); }
+    }
+
+    public async int ExpireAtAsync(string key, long timestamp) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.ExpireAtAsync(key, timestamp); } finally { this.Release(c); }
+    }
+
+    public async int PExpireAsync(string key, long ms) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.PExpireAsync(key, ms); } finally { this.Release(c); }
+    }
+
+    public async long TtlAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return -2; }
+        try { return await c.TtlAsync(key); } finally { this.Release(c); }
+    }
+
+    public async long PTtlAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return -2; }
+        try { return await c.PTtlAsync(key); } finally { this.Release(c); }
+    }
+
+    public async int PersistAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.PersistAsync(key); } finally { this.Release(c); }
+    }
+
+    public async List<string> KeysAsync(string pattern) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.KeysAsync(pattern); } finally { this.Release(c); }
+    }
+
+    public async bool RenameAsync(string key, string newKey) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.RenameAsync(key, newKey); } finally { this.Release(c); }
+    }
+
+    public async bool RenameNxAsync(string key, string newKey) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.RenameNxAsync(key, newKey); } finally { this.Release(c); }
+    }
+
+    public async string RandomKeyAsync() {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.RandomKeyAsync(); } finally { this.Release(c); }
+    }
+
+    public async byte[] DumpAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return null; }
+        try { return await c.DumpAsync(key); } finally { this.Release(c); }
+    }
+
+    public async RedisScanResult ScanAsync(long cursor, string pattern, int count) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new RedisScanResult(0, new List<string>()); }
+        try { return await c.ScanAsync(cursor, pattern, count); } finally { this.Release(c); }
+    }
+
+    // 哈希
+    public async long HSetAsync(string key, string field, string value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.HSetAsync(key, field, value); } finally { this.Release(c); }
+    }
+
+    public async bool HSetNxAsync(string key, string field, string value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.HSetNxAsync(key, field, value); } finally { this.Release(c); }
+    }
+
+    public async string HGetAsync(string key, string field) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.HGetAsync(key, field); } finally { this.Release(c); }
+    }
+
+    public async byte[] HGetBytesAsync(string key, string field) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return null; }
+        try { return await c.HGetBytesAsync(key, field); } finally { this.Release(c); }
+    }
+
+    public async bool HMSetAsync(string key, Dictionary<string, string> dict) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.HMSetAsync(key, dict); } finally { this.Release(c); }
+    }
+
+    public async bool HMSetAsync(string key, List<RedisEntry> entries) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.HMSetAsync(key, entries); } finally { this.Release(c); }
+    }
+
+    public async bool HMSetAsync(string key, List<string> fields, List<string> values) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.HMSetAsync(key, fields, values); } finally { this.Release(c); }
+    }
+
+    public async List<string> HMGetAsync(string key, List<string> fields) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.HMGetAsync(key, fields); } finally { this.Release(c); }
+    }
+
+    public async long HIncrByAsync(string key, string field, long amount) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.HIncrByAsync(key, field, amount); } finally { this.Release(c); }
+    }
+
+    public async double HIncrByFloatAsync(string key, string field, double amount) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0.0; }
+        try { return await c.HIncrByFloatAsync(key, field, amount); } finally { this.Release(c); }
+    }
+
+    public async bool HExistsAsync(string key, string field) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.HExistsAsync(key, field); } finally { this.Release(c); }
+    }
+
+    public async int HDelAsync(string key, string field) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.HDelAsync(key, field); } finally { this.Release(c); }
+    }
+
+    public async int HDelMultipleAsync(string key, List<string> fields) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.HDelMultipleAsync(key, fields); } finally { this.Release(c); }
+    }
+
+    public async long HLenAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.HLenAsync(key); } finally { this.Release(c); }
+    }
+
+    public async List<string> HKeysAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.HKeysAsync(key); } finally { this.Release(c); }
+    }
+
+    public async List<string> HValsAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.HValsAsync(key); } finally { this.Release(c); }
+    }
+
+    public async Dictionary<string, string> HGetAllAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new Dictionary<string, string>(); }
+        try { return await c.HGetAllAsync(key); } finally { this.Release(c); }
+    }
+
+    public async long HStrLenAsync(string key, string field) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.HStrLenAsync(key, field); } finally { this.Release(c); }
+    }
+
+    public async RedisScanResult HScanAsync(string key, long cursor, string pattern, int count) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new RedisScanResult(0, new List<string>()); }
+        try { return await c.HScanAsync(key, cursor, pattern, count); } finally { this.Release(c); }
+    }
+
+    // 列表
+    public async long LPushAsync(string key, string value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.LPushAsync(key, value); } finally { this.Release(c); }
+    }
+
+    public async long LPushMultipleAsync(string key, List<string> values) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.LPushMultipleAsync(key, values); } finally { this.Release(c); }
+    }
+
+    public async long RPushAsync(string key, string value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.RPushAsync(key, value); } finally { this.Release(c); }
+    }
+
+    public async long RPushMultipleAsync(string key, List<string> values) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.RPushMultipleAsync(key, values); } finally { this.Release(c); }
+    }
+
+    public async long LPushXAsync(string key, string value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.LPushXAsync(key, value); } finally { this.Release(c); }
+    }
+
+    public async long RPushXAsync(string key, string value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.RPushXAsync(key, value); } finally { this.Release(c); }
+    }
+
+    public async string LPopAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.LPopAsync(key); } finally { this.Release(c); }
+    }
+
+    public async byte[] LPopBytesAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return null; }
+        try { return await c.LPopBytesAsync(key); } finally { this.Release(c); }
+    }
+
+    public async string RPopAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.RPopAsync(key); } finally { this.Release(c); }
+    }
+
+    public async byte[] RPopBytesAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return null; }
+        try { return await c.RPopBytesAsync(key); } finally { this.Release(c); }
+    }
+
+    public async long LLenAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.LLenAsync(key); } finally { this.Release(c); }
+    }
+
+    public async string LIndexAsync(string key, long index) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.LIndexAsync(key, index); } finally { this.Release(c); }
+    }
+
+    public async List<string> LRangeAsync(string key, long start, long stop) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.LRangeAsync(key, start, stop); } finally { this.Release(c); }
+    }
+
+    public async bool LSetAsync(string key, long index, string value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.LSetAsync(key, index, value); } finally { this.Release(c); }
+    }
+
+    public async long LRemAsync(string key, long count, string value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.LRemAsync(key, count, value); } finally { this.Release(c); }
+    }
+
+    public async bool LTrimAsync(string key, long start, long stop) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.LTrimAsync(key, start, stop); } finally { this.Release(c); }
+    }
+
+    public async string RPopLPushAsync(string source, string destination) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.RPopLPushAsync(source, destination); } finally { this.Release(c); }
+    }
+
+    public async List<string> BLPopAsync(string key, int timeoutSeconds) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.BLPopAsync(key, timeoutSeconds); } finally { this.Release(c); }
+    }
+
+    public async List<string> BRPopAsync(string key, int timeoutSeconds) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.BRPopAsync(key, timeoutSeconds); } finally { this.Release(c); }
+    }
+
+    // 集合
+    public async long SAddAsync(string key, string member) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.SAddAsync(key, member); } finally { this.Release(c); }
+    }
+
+    public async long SAddMultipleAsync(string key, List<string> members) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.SAddMultipleAsync(key, members); } finally { this.Release(c); }
+    }
+
+    public async long SRemAsync(string key, string member) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.SRemAsync(key, member); } finally { this.Release(c); }
+    }
+
+    public async long SRemMultipleAsync(string key, List<string> members) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.SRemMultipleAsync(key, members); } finally { this.Release(c); }
+    }
+
+    public async List<string> SMembersAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.SMembersAsync(key); } finally { this.Release(c); }
+    }
+
+    public async bool SIsMemberAsync(string key, string member) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SIsMemberAsync(key, member); } finally { this.Release(c); }
+    }
+
+    public async long SCardAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.SCardAsync(key); } finally { this.Release(c); }
+    }
+
+    public async string SPopAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.SPopAsync(key); } finally { this.Release(c); }
+    }
+
+    public async string SRandMemberAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.SRandMemberAsync(key); } finally { this.Release(c); }
+    }
+
+    public async List<string> SRandMemberMultipleAsync(string key, int count) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.SRandMemberMultipleAsync(key, count); } finally { this.Release(c); }
+    }
+
+    public async List<string> SDiffAsync(List<string> keys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.SDiffAsync(keys); } finally { this.Release(c); }
+    }
+
+    public async List<string> SInterAsync(List<string> keys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.SInterAsync(keys); } finally { this.Release(c); }
+    }
+
+    public async List<string> SUnionAsync(List<string> keys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.SUnionAsync(keys); } finally { this.Release(c); }
+    }
+
+    public async long SDiffStoreAsync(string destination, List<string> keys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.SDiffStoreAsync(destination, keys); } finally { this.Release(c); }
+    }
+
+    public async long SInterStoreAsync(string destination, List<string> keys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.SInterStoreAsync(destination, keys); } finally { this.Release(c); }
+    }
+
+    public async long SUnionStoreAsync(string destination, List<string> keys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.SUnionStoreAsync(destination, keys); } finally { this.Release(c); }
+    }
+
+    public async bool SMoveAsync(string source, string destination, string member) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.SMoveAsync(source, destination, member); } finally { this.Release(c); }
+    }
+
+    public async RedisScanResult SScanAsync(string key, long cursor, string pattern, int count) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new RedisScanResult(0, new List<string>()); }
+        try { return await c.SScanAsync(key, cursor, pattern, count); } finally { this.Release(c); }
+    }
+
+    // 有序集合
+    public async long ZAddAsync(string key, double score, string member) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.ZAddAsync(key, score, member); } finally { this.Release(c); }
+    }
+
+    public async long ZAddMultipleAsync(string key, List<ZMember> members) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.ZAddMultipleAsync(key, members); } finally { this.Release(c); }
+    }
+
+    public async double ZScoreAsync(string key, string member) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0.0; }
+        try { return await c.ZScoreAsync(key, member); } finally { this.Release(c); }
+    }
+
+    public async string ZScoreStringAsync(string key, string member) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.ZScoreStringAsync(key, member); } finally { this.Release(c); }
+    }
+
+    public async double ZIncrByAsync(string key, double increment, string member) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0.0; }
+        try { return await c.ZIncrByAsync(key, increment, member); } finally { this.Release(c); }
+    }
+
+    public async long ZCardAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.ZCardAsync(key); } finally { this.Release(c); }
+    }
+
+    public async long ZCountAsync(string key, string min, string max) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.ZCountAsync(key, min, max); } finally { this.Release(c); }
+    }
+
+    public async List<string> ZRangeAsync(string key, long start, long stop) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.ZRangeAsync(key, start, stop); } finally { this.Release(c); }
+    }
+
+    public async List<ZMember> ZRangeWithScoresAsync(string key, long start, long stop) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<ZMember>(); }
+        try { return await c.ZRangeWithScoresAsync(key, start, stop); } finally { this.Release(c); }
+    }
+
+    public async List<string> ZRevRangeAsync(string key, long start, long stop) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.ZRevRangeAsync(key, start, stop); } finally { this.Release(c); }
+    }
+
+    public async List<ZMember> ZRevRangeWithScoresAsync(string key, long start, long stop) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<ZMember>(); }
+        try { return await c.ZRevRangeWithScoresAsync(key, start, stop); } finally { this.Release(c); }
+    }
+
+    public async List<string> ZRangeByScoreAsync(string key, string min, string max) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.ZRangeByScoreAsync(key, min, max); } finally { this.Release(c); }
+    }
+
+    public async List<string> ZRangeByScoreAsync(string key, string min, string max, int offset, int count) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.ZRangeByScoreAsync(key, min, max, offset, count); } finally { this.Release(c); }
+    }
+
+    public async List<ZMember> ZRangeByScoreWithScoresAsync(string key, string min, string max) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<ZMember>(); }
+        try { return await c.ZRangeByScoreWithScoresAsync(key, min, max); } finally { this.Release(c); }
+    }
+
+    public async long ZRankAsync(string key, string member) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return -1; }
+        try { return await c.ZRankAsync(key, member); } finally { this.Release(c); }
+    }
+
+    public async long ZRevRankAsync(string key, string member) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return -1; }
+        try { return await c.ZRevRankAsync(key, member); } finally { this.Release(c); }
+    }
+
+    public async long ZRemAsync(string key, string member) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.ZRemAsync(key, member); } finally { this.Release(c); }
+    }
+
+    public async long ZRemMultipleAsync(string key, List<string> members) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.ZRemMultipleAsync(key, members); } finally { this.Release(c); }
+    }
+
+    public async long ZRemRangeByRankAsync(string key, long start, long stop) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.ZRemRangeByRankAsync(key, start, stop); } finally { this.Release(c); }
+    }
+
+    public async long ZRemRangeByScoreAsync(string key, string min, string max) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.ZRemRangeByScoreAsync(key, min, max); } finally { this.Release(c); }
+    }
+
+    public async RedisScanResult ZScanAsync(string key, long cursor, string pattern, int count) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new RedisScanResult(0, new List<string>()); }
+        try { return await c.ZScanAsync(key, cursor, pattern, count); } finally { this.Release(c); }
+    }
+
+    // 位图
+    public async int SetBitAsync(string key, long offset, int value) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.SetBitAsync(key, offset, value); } finally { this.Release(c); }
+    }
+
+    public async int GetBitAsync(string key, long offset) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.GetBitAsync(key, offset); } finally { this.Release(c); }
+    }
+
+    public async long BitCountAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.BitCountAsync(key); } finally { this.Release(c); }
+    }
+
+    public async long BitCountAsync(string key, long start, long end) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.BitCountAsync(key, start, end); } finally { this.Release(c); }
+    }
+
+    public async long BitOpAndAsync(string destKey, List<string> keys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.BitOpAndAsync(destKey, keys); } finally { this.Release(c); }
+    }
+
+    public async long BitOpOrAsync(string destKey, List<string> keys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.BitOpOrAsync(destKey, keys); } finally { this.Release(c); }
+    }
+
+    public async long BitOpXorAsync(string destKey, List<string> keys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.BitOpXorAsync(destKey, keys); } finally { this.Release(c); }
+    }
+
+    public async long BitOpNotAsync(string destKey, string srcKey) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.BitOpNotAsync(destKey, srcKey); } finally { this.Release(c); }
+    }
+
+    public async long BitPosAsync(string key, int bit) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return -1; }
+        try { return await c.BitPosAsync(key, bit); } finally { this.Release(c); }
+    }
+
+    // HyperLogLog
+    public async bool PfAddAsync(string key, string element) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.PfAddAsync(key, element); } finally { this.Release(c); }
+    }
+
+    public async bool PfAddMultipleAsync(string key, List<string> elements) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.PfAddMultipleAsync(key, elements); } finally { this.Release(c); }
+    }
+
+    public async long PfCountAsync(string key) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.PfCountAsync(key); } finally { this.Release(c); }
+    }
+
+    public async long PfCountMultipleAsync(List<string> keys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.PfCountMultipleAsync(keys); } finally { this.Release(c); }
+    }
+
+    public async bool PfMergeAsync(string destKey, List<string> sourceKeys) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.PfMergeAsync(destKey, sourceKeys); } finally { this.Release(c); }
+    }
+
+    // PubSub
+    public async long PublishAsync(string channel, string message) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.PublishAsync(channel, message); } finally { this.Release(c); }
+    }
+
+    // 系统与状态
+    public async long DbSizeAsync() {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.DbSizeAsync(); } finally { this.Release(c); }
+    }
+
+    public async bool FlushDbAsync() {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.FlushDbAsync(); } finally { this.Release(c); }
+    }
+
+    public async bool FlushAllAsync() {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return false; }
+        try { return await c.FlushAllAsync(); } finally { this.Release(c); }
+    }
+
+    public async List<string> TimeAsync() {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return new List<string>(); }
+        try { return await c.TimeAsync(); } finally { this.Release(c); }
+    }
+
+    public async string InfoAsync() {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.InfoAsync(); } finally { this.Release(c); }
+    }
+
+    public async string InfoAsync(string section) {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.InfoAsync(section); } finally { this.Release(c); }
+    }
+
+    public async string BgSaveAsync() {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return ""; }
+        try { return await c.BgSaveAsync(); } finally { this.Release(c); }
+    }
+
+    public async long LastSaveAsync() {
+        RedisClient c = await this.AcquireAsync();
+        if (c == null) { return 0; }
+        try { return await c.LastSaveAsync(); } finally { this.Release(c); }
     }
 }

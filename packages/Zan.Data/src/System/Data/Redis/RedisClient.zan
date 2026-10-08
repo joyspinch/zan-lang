@@ -7,39 +7,21 @@ using System.Threading;
 
 namespace System.Data.Redis;
 
-/// <summary>Redis 键值对实体（用于实体化 MSET 等批量操作，替代 keys/vals 平行列表）。</summary>
-class RedisEntry {
-    public string key;
-    public string value;
-
-    public RedisEntry(string key, string value) {
-        this.key = key;
-        this.value = value;
-    }
-}
-
 /// <summary>
-/// 基于异步 IO reactor、使用 RESP（RESP2）协议的协程化 Redis 客户端。
+/// 基于异步 IO reactor、使用 RESP（RESP2）协议的高性能协程化 Redis 客户端。
+/// 全面对标 FreeRedis 规范设计，支持池化多协程安全复用与丰富强类型命令，告别手拼命令。
 ///
-/// 所有网络操作都通过异步
-/// <see cref="Socket"/> 层（非阻塞 connect / send / recv）挂起到无栈 reactor，因此
-/// 单个工作线程上可同时有数千个 Redis 调用在途，而不阻塞线程
-/// ——与 HTTP/WebSocket 栈采用相同模型。这是刻意
-/// 的无依赖设计：RESP 是行协议，因此无需任何原生客户端库
-/// 。
+/// 用法（免借还连接池模式，如同 FreeRedis）：
+///   RedisClient r = new RedisClient("127.0.0.1:6379,poolsize=10");
+///   await r.SetAsync("name", "Alice");
+///   string v = await r.GetAsync("name");
+///   await r.HSetAsync("user:1", "age", "18");
+///   Dictionary<string, string> map = await r.HGetAllAsync("user:1");
 ///
-/// 用法：
+/// 用法（单一底层连接模式）：
 ///   RedisClient r = await RedisClient.ConnectAsync("127.0.0.1", 6379);
 ///   await r.SetAsync("name", "Alice");
-///   string v = await r.GetAsync("name");     // "Alice"
-///   int n = await r.DelAsync("name");        // 1
-///   RedisReply pong = await r.CommandAsync2("PING", "");   // +PONG
 ///   r.Close();
-///
-/// 二进制安全：bulk *回复* 按显式字节长度解析，因此含
-/// NUL 字节的值可原样返回（使用 RedisReply.len）。命令
-/// *参数* 用 strlen 度量，因此参数值不应包含
-/// 内嵌的 NUL 字节。
 /// </summary>
 class RedisClient {
     nint sock;
@@ -50,23 +32,20 @@ class RedisClient {
     bool busy;
     List<AsyncGate> waiters;
 
-    // 接收缓冲区带显式 [head, tail) 有效区间，使 RESP 回复可
-    // 按字节精确解析（二进制安全），而非依赖 NUL 结尾。
     byte[] inbuf;
     int incap;
     int inhead;
     int intail;
-    byte[] tmp;      // 每次 recv 系统调用使用的固定暂存缓冲区
+    byte[] tmp;
     int tmpcap;
-    TlsStream tls;   // 非空 = 通道已加密（ConnectSecureAsync 建立）
+    TlsStream tls;
 
-    // TLS 校验开关：默认开启——证书链与主机名都验。自签/测试服务器
-    // 可经 SetTlsVerify(false) 放宽（只加密不校验），与 HttpClient 的
-    // verifyTls 开关同一语义。
+    // 当作为池化客户端使用时，委托至该连接池执行
+    RedisPool pool;
+
     static bool verifyTls = true;
 
-    /// <summary>切换后续 ConnectSecureAsync 的证书与主机名校验。
-    /// 仅测试/开发自签场景关闭；生产保持默认开启。</summary>
+    /// <summary>切换后续 ConnectSecureAsync 的证书与主机名校验。</summary>
     static void SetTlsVerify(bool verify) {
         RedisClient.verifyTls = verify;
     }
@@ -74,8 +53,24 @@ class RedisClient {
     [DllImport("crt")]
     static extern long strlen(string str);
 
-    /// 私有构造；统一经 <see cref="ConnectAsync"/> 创建。
-    RedisClient() {
+    /// <summary>通过连接字符串创建池化 Redis 客户端（FreeRedis 规范）。</summary>
+    public RedisClient(string connectionString) {
+        RedisOptions opt = RedisOptions.Parse(connectionString);
+        this.initPool(opt);
+    }
+
+    /// <summary>通过配置项创建池化 Redis 客户端。</summary>
+    public RedisClient(RedisOptions options) {
+        this.initPool(options);
+    }
+
+    /// <summary>直接绑定现有连接池作为客户端。</summary>
+    public RedisClient(RedisPool pool) {
+        this.initMembers();
+        this.pool = pool;
+    }
+
+    void initMembers() {
         this.sock = -1;
         this.host = "";
         this.port = 6379;
@@ -90,24 +85,64 @@ class RedisClient {
         this.tls = null;
         this.busy = false;
         this.waiters = new List<AsyncGate>();
+        this.pool = null;
     }
 
-    /// <summary>连接 Redis 服务器，在 IO reactor 上挂起直到
-    /// （非阻塞）连接建立完成。</summary>
+    void initPool(RedisOptions opt) {
+        this.initMembers();
+        this.host = opt.host;
+        this.port = opt.port;
+        this.pool = new RedisPool(opt);
+    }
+
+    /// 私有构造；单一物理连接统一经 ConnectAsync 创建。
+    RedisClient() {
+        this.initMembers();
+    }
+
+    /// <summary>连接 Redis 服务器（默认超时）。</summary>
     static async RedisClient ConnectAsync(string host, int port) {
         return await RedisClient.ConnectAsync(host, port, 0);
     }
 
-    /// 带连接超时（毫秒，0 = 不限时）的连接；失败返回 null。
+    /// <summary>带连接超时（毫秒，0 = 不限时）的连接；失败返回 null。</summary>
     static async RedisClient ConnectAsync(string host, int port, int timeoutMs) {
         return await RedisClient.doConnect(host, port, timeoutMs, false);
     }
 
-    /// <summary>与 <see cref="ConnectAsync"/> 相同，但 TCP 建连后立即把
-    /// 通道升级为 TLS（Redis 的 TLS 监听从首字节就是加密流，无需
-    /// 协商握手）。认证（AUTH）与数据全部走加密信道。
-    /// 握手按 <paramref name="host"/> 做证书主机名校验，信任系统根，
-    /// 口令不再明文过网。</summary>
+    /// <summary>通过连接字符串异步建立单物理连接。</summary>
+    static async RedisClient ConnectAsync(string connectionString) {
+        RedisOptions opt = RedisOptions.Parse(connectionString);
+        return await RedisClient.ConnectAsync(opt);
+    }
+
+    /// <summary>通过配置项异步建立单物理连接（包含自动 AUTH 与 SELECT）。</summary>
+    static async RedisClient ConnectAsync(RedisOptions opt) {
+        RedisClient c = await RedisClient.doConnect(opt.host, opt.port, opt.connectTimeoutMs, opt.ssl);
+        if (c == null) { return null; }
+        if (opt.password != null && opt.password.Length > 0) {
+            bool authOk = false;
+            if (opt.user != null && opt.user.Length > 0) {
+                authOk = await c.AuthAsync(opt.user, opt.password);
+            } else {
+                authOk = await c.AuthAsync(opt.password);
+            }
+            if (!authOk) {
+                c.Close();
+                return null;
+            }
+        }
+        if (opt.database > 0) {
+            bool selOk = await c.SelectAsync(opt.database);
+            if (!selOk) {
+                c.Close();
+                return null;
+            }
+        }
+        return c;
+    }
+
+    /// <summary>TLS 加密信道连接。</summary>
     static async RedisClient ConnectSecureAsync(string host, int port, int timeoutMs) {
         return await RedisClient.doConnect(host, port, timeoutMs, true);
     }
@@ -170,20 +205,22 @@ class RedisClient {
         }
     }
 
-    /// <summary>关闭连接并释放缓冲区。</summary>
+    /// <summary>关闭连接并释放缓冲区；若是池化客户端则关闭连接池。</summary>
     void Close() {
+        if (this.pool != null) {
+            this.pool.Close();
+            this.pool = null;
+        }
         this.ReleaseLock();
         while (this.waiters != null && this.waiters.Count > 0) {
             AsyncGate g = this.waiters[0];
             this.waiters.RemoveAt(0);
             g.Signal();
         }
-        // TLS 先发 close_notify 再关套接字（TlsStream.Close 不拥有底层 fd）。
         if (this.tls != null) {
             this.tls.Close();
             this.tls = null;
         }
-        // 套接字在就关闭，不依赖 connected 标志（死连接泄漏 fd）。
         if (this.connected || this.sock >= 0) {
             Socket.Close(this.sock);
             this.connected = false;
@@ -193,15 +230,10 @@ class RedisClient {
         this.tmp = null;
     }
 
-    /// <summary>从接收缓冲区中复制 <paramref name="len"/> 字节
-    /// （从 <paramref name="start"/> 起）到新的 NUL 结尾字符串中。
-    /// 二进制安全：按索引复制，内嵌 NUL 字节也能保留。</summary>
     string sliceBytes(int start, int len) {
         return this.inbuf.ToStr(start, len);
     }
 
-    /// <summary>确保接收缓冲区在尾位置之后还能容纳 <paramref name="extra"/> 字节，
-    /// 必要时先压缩再扩容。带上限与溢出防护。</summary>
     void ensureRoom(int extra) {
         if (this.intail + extra <= this.incap) {
             return;
@@ -233,8 +265,6 @@ class RedisClient {
         this.incap = ncap;
     }
 
-    /// <summary>从套接字接收一块数据存入缓冲区。返回
-    /// 字节数（对端关闭时为 0）。在 reactor 上挂起直到可读。</summary>
     async int fillMore() {
         if (this.tls != null) {
             int n = await this.tls.RecvBytesAsync(this.tmp, 0, this.tmpcap);
@@ -258,8 +288,6 @@ class RedisClient {
         return n;
     }
 
-    /// <summary>确保缓冲区中至少有 <paramref name="need"/> 字节，
-    /// 需要时从套接字补读。对端关闭时返回 false。</summary>
     async bool ensureAvailable(int need) {
         while ((this.intail - this.inhead) < need) {
             int got = await this.fillMore();
@@ -270,9 +298,6 @@ class RedisClient {
         return true;
     }
 
-    /// <summary>从头游标处读取一行以 CRLF 结尾的行（不含 CRLF），
-    /// 借助 AVX2 向量化 IndexOf 快速跳过普通字节，需要时补读更多数据。对端
-    /// 关闭时返回 null。</summary>
     async string readLine() {
         int scan = this.inhead;
         while (true) {
@@ -298,8 +323,6 @@ class RedisClient {
         return null;
     }
 
-    /// <summary>读取恰好 <paramref name="n"/> 字节的 bulk 负载，其后
-    /// 跟一个结尾 CRLF，并将头游标越过这两部分。</summary>
     async string readBulk(int n) {
         bool ok = await this.ensureAvailable(n + 2);
         if (!ok) {
@@ -310,8 +333,6 @@ class RedisClient {
         return data;
     }
 
-    /// <summary>从流中解析一条完整的 RESP 回复（数组递归解析），
-    /// 需要更多字节时在 reactor 上挂起。</summary>
     async RedisReply readReply() {
         string line = await this.readLine();
         RedisReply r = new RedisReply();
@@ -322,31 +343,31 @@ class RedisClient {
         }
         int prefix = line[0];
         string rest = line.Substring(1);
-        if (prefix == 43) {                 // '+' 简单字符串
+        if (prefix == 43) {                 // '+'
             r.kind = RedisReply.STR;
             r.str = rest;
             r.len = (int)strlen(rest);
             return r;
         }
-        if (prefix == 45) {                 // '-' 错误
+        if (prefix == 45) {                 // '-'
             r.kind = RedisReply.ERROR;
             r.str = rest;
             r.len = (int)strlen(rest);
             return r;
         }
-        if (prefix == 58) {                 // ':' 整数（64 位安全）
+        if (prefix == 58) {                 // ':'
             r.kind = RedisReply.INT;
             r.integer64 = Convert.ToInt64(rest);
             r.integer = (int)r.integer64;
             return r;
         }
-        if (prefix == 36) {                 // '$' bulk 字符串
+        if (prefix == 36) {                 // '$'
             int blen = Convert.ToInt(rest);
             if (blen < 0) {
                 r.kind = RedisReply.NIL;
                 return r;
             }
-            if (blen > 536870912) {          // 512MB 协议上限防御（超大畸形值防 OOM）
+            if (blen > 536870912) {
                 r.kind = RedisReply.ERROR;
                 r.str = "bulk string length exceeds 512MB protocol limit";
                 this.Close();
@@ -363,13 +384,13 @@ class RedisClient {
             r.len = blen;
             return r;
         }
-        if (prefix == 42) {                 // '*' 数组
+        if (prefix == 42) {                 // '*'
             int count = Convert.ToInt(rest);
             if (count < 0) {
                 r.kind = RedisReply.NIL;
                 return r;
             }
-            if (count > 1048576) {           // 100 万元素数组上限防御
+            if (count > 1048576) {
                 r.kind = RedisReply.ERROR;
                 r.str = "array element count exceeds 1M limit";
                 this.Close();
@@ -389,8 +410,6 @@ class RedisClient {
         return r;
     }
 
-    /// <summary>将 <paramref name="args"/> 编码为 RESP 数组（bulk 字符串），
-    /// 然后发送。参数长度用 strlen 度量。</summary>
     async int sendArgs(List<string> args) {
         StringBuilder sb = new StringBuilder();
         sb.Append("*");
@@ -416,8 +435,22 @@ class RedisClient {
         return sent;
     }
 
-    /// <summary>发送命令（参数向量）并等待其回复。内部使用 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。</summary>
+    /// <summary>发送命令（参数向量）并等待其回复。自动支持池化透明路由。</summary>
     async RedisReply CommandAsync(List<string> args) {
+        if (this.pool != null) {
+            RedisClient c = await this.pool.AcquireAsync();
+            if (c == null) {
+                RedisReply err = new RedisReply();
+                err.kind = RedisReply.ERROR;
+                err.str = "failed to acquire redis client from pool";
+                return err;
+            }
+            try {
+                return await c.CommandAsync(args);
+            } finally {
+                this.pool.Release(c);
+            }
+        }
         await this.AcquireLock();
         try {
             return await this.CommandInternalAsync(args);
@@ -442,10 +475,22 @@ class RedisClient {
         return r;
     }
 
-    /// <summary>发送带二进制参数的命令（如 SET key <byte[]>）并等待回复。
-    /// 前缀参数以字符串形式编码，最后一个二进制参数按原生字节流发送，
-    /// 完全二进制安全，支持任意包含 NUL 字节的大数据量载荷。</summary>
+    /// <summary>发送带二进制参数的命令（如 SET key <byte[]>）并等待回复。</summary>
     async RedisReply CommandBytesAsync(List<string> prefixArgs, byte[] binaryArg) {
+        if (this.pool != null) {
+            RedisClient c = await this.pool.AcquireAsync();
+            if (c == null) {
+                RedisReply err = new RedisReply();
+                err.kind = RedisReply.ERROR;
+                err.str = "failed to acquire redis client from pool";
+                return err;
+            }
+            try {
+                return await c.CommandBytesAsync(prefixArgs, binaryArg);
+            } finally {
+                this.pool.Release(c);
+            }
+        }
         await this.AcquireLock();
         try {
             return await this.CommandBytesInternalAsync(prefixArgs, binaryArg);
@@ -526,58 +571,145 @@ class RedisClient {
         return r;
     }
 
-    /// <summary>便捷方法：单参数命令（例如 PING）。</summary>
+    /// <summary>便捷方法：单参数命令。</summary>
     async RedisReply CommandAsync1(string a0) {
         List<string> args = new List<string>();
         args.Add(a0);
-        RedisReply r = await this.CommandAsync(args);
-        return r;
+        return await this.CommandAsync(args);
     }
 
-    /// <summary>便捷方法：双参数命令（例如 GET key）。</summary>
+    /// <summary>便捷方法：双参数命令。</summary>
     async RedisReply CommandAsync2(string a0, string a1) {
-        List<string> args = new List<string>{
-            a0,
-            a1 };
-        RedisReply r = await this.CommandAsync(args);
-        return r;
+        List<string> args = new List<string>{ a0, a1 };
+        return await this.CommandAsync(args);
     }
 
-    /// <summary>便捷方法：三参数命令（例如 SET key value）。</summary>
+    /// <summary>便捷方法：三参数命令。</summary>
     async RedisReply CommandAsync3(string a0, string a1, string a2) {
-        List<string> args = new List<string>{
-            a0,
-            a1,
-            a2 };
-        RedisReply r = await this.CommandAsync(args);
-        return r;
+        List<string> args = new List<string>{ a0, a1, a2 };
+        return await this.CommandAsync(args);
     }
 
-    /// <summary>PING；服务器回复 PONG 时返回 true。</summary>
+    // ========================================================================
+    // 连接与认证 (Connection & Auth)
+    // ========================================================================
+
+    /// <summary>PING；回复 PONG 返回 true。</summary>
     async bool PingAsync() {
         RedisReply r = await this.CommandAsync1("PING");
         return r.AsString() == "PONG";
     }
 
-    /// <summary>使用密码进行认证。收到 +OK 返回 true。</summary>
+    /// <summary>AUTH 单密码认证。</summary>
     async bool AuthAsync(string password) {
         RedisReply r = await this.CommandAsync2("AUTH", password);
         return r.AsString() == "OK";
     }
 
-    /// <summary>选择逻辑数据库编号。收到 +OK 返回 true。</summary>
+    /// <summary>AUTH 用户名与密码认证（Redis 6+ ACL）。</summary>
+    async bool AuthAsync(string username, string password) {
+        RedisReply r = await this.CommandAsync3("AUTH", username, password);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>SELECT 切换逻辑数据库。</summary>
     async bool SelectAsync(int index) {
         RedisReply r = await this.CommandAsync2("SELECT", Convert.ToString(index));
         return r.AsString() == "OK";
     }
 
-    /// <summary>SET key value。收到 +OK 返回 true。</summary>
+    /// <summary>ECHO 回显测试。</summary>
+    async string EchoAsync(string message) {
+        RedisReply r = await this.CommandAsync2("ECHO", message);
+        return r.AsString();
+    }
+
+    // ========================================================================
+    // 字符串 (Strings)
+    // ========================================================================
+
+    /// <summary>GET key。键不存在或出错返回空串。区分 nil 请用 GetReplyAsync。</summary>
+    async string GetAsync(string key) {
+        RedisReply r = await this.CommandAsync2("GET", key);
+        if (r.IsNil()) { return ""; }
+        return r.AsString();
+    }
+
+    /// <summary>二进制安全的 GET：返回原始字节数组。键不存在返回 null。</summary>
+    async byte[] GetBytesAsync(string key) {
+        RedisReply r = await this.CommandAsync2("GET", key);
+        if (r.IsNil() || r.IsError()) { return null; }
+        return r.AsBytes();
+    }
+
+    /// <summary>GET key，返回原始 RESP 回复。</summary>
+    async RedisReply GetReplyAsync(string key) {
+        return await this.CommandAsync2("GET", key);
+    }
+
+    /// <summary>GETSET key value：设置新值并返回旧值。</summary>
+    async string GetSetAsync(string key, string val) {
+        RedisReply r = await this.CommandAsync3("GETSET", key, val);
+        if (r.IsNil()) { return ""; }
+        return r.AsString();
+    }
+
+    /// <summary>SET key value。成功返回 true。</summary>
     async bool SetAsync(string key, string val) {
         RedisReply r = await this.CommandAsync3("SET", key, val);
         return r.AsString() == "OK";
     }
 
-    /// <summary>二进制安全的 SET：将原始字节数组作为值存储。支持包含 NUL 字节的任意二进制载荷与大数据量。</summary>
+    /// <summary>SET key value EX seconds：带过期时间秒数的设置。</summary>
+    async bool SetAsync(string key, string val, int expireSeconds) {
+        if (expireSeconds <= 0) {
+            return await this.SetAsync(key, val);
+        }
+        List<string> args = new List<string>{ "SET", key, val, "EX", Convert.ToString(expireSeconds) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>SET key value [EX seconds] [NX|XX] 全功能重载。</summary>
+    async bool SetAsync(string key, string val, int expireSeconds, bool nx, bool xx) {
+        List<string> args = new List<string>{ "SET", key, val };
+        if (expireSeconds > 0) {
+            args.Add("EX");
+            args.Add(Convert.ToString(expireSeconds));
+        }
+        if (nx) {
+            args.Add("NX");
+        } else if (xx) {
+            args.Add("XX");
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>SETEX key seconds value。</summary>
+    async bool SetExAsync(string key, int seconds, string val) {
+        List<string> args = new List<string>{ "SETEX", key, Convert.ToString(seconds), val };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>SETNX key value：键不存在时才设置，成功返回 true。</summary>
+    async bool SetNxAsync(string key, string val) {
+        RedisReply r = await this.CommandAsync3("SETNX", key, val);
+        return r.AsInt() == 1;
+    }
+
+    /// <summary>SETNX 带过期时间设置（原子锁常用）。</summary>
+    async bool SetNxAsync(string key, string val, int expireSeconds) {
+        return await this.SetAsync(key, val, expireSeconds, true, false);
+    }
+
+    /// <summary>SETXX key value：键已存在时才设置更新。</summary>
+    async bool SetXxAsync(string key, string val) {
+        return await this.SetAsync(key, val, 0, false, true);
+    }
+
+    /// <summary>二进制安全 SET。</summary>
     async bool SetBytesAsync(string key, byte[] val) {
         if (val == null) { return false; }
         List<string> args = new List<string>{ "SET", key };
@@ -585,87 +717,7 @@ class RedisClient {
         return r.IsString() && r.AsString() == "OK";
     }
 
-    /// <summary>GET key。返回对应的值；键不存在（nil）时
-    /// 返回空字符串。如需区分 nil 与
-    /// 空值，请使用 <see cref="GetReplyAsync"/>。</summary>
-    async string GetAsync(string key) {
-        RedisReply r = await this.CommandAsync2("GET", key);
-        if (r.IsNil()) {
-            return "";
-        }
-        return r.AsString();
-    }
-
-    /// <summary>二进制安全的 GET：返回原始字节数组。支持包含 NUL 字节的任意二进制载荷。
-    /// 键不存在或出错时返回 null。</summary>
-    async byte[] GetBytesAsync(string key) {
-        RedisReply r = await this.CommandAsync2("GET", key);
-        if (r.IsNil() || r.IsError()) { return null; }
-        return r.AsBytes();
-    }
-
-    /// <summary>GET key，返回原始回复，使调用方可区分
-    /// 空字符串值和不存在的键（nil）。</summary>
-    async RedisReply GetReplyAsync(string key) {
-        RedisReply r = await this.CommandAsync2("GET", key);
-        return r;
-    }
-
-    /// <summary>DEL key。返回被删除的键数（0 或 1）。</summary>
-    async int DelAsync(string key) {
-        RedisReply r = await this.CommandAsync2("DEL", key);
-        return r.AsInt();
-    }
-
-    /// <summary>DEL 批量删除多个键。返回被成功删除的键数量。</summary>
-    async int DelMultipleAsync(List<string> keys) {
-        if (keys == null || keys.Count == 0) { return 0; }
-        List<string> args = new List<string>();
-        args.Add("DEL");
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            args.Add(keys[i]);
-        }
-        RedisReply r = await this.CommandAsync(args);
-        return r.AsInt();
-    }
-
-    /// <summary>EXISTS key。键存在返回 1，否则返回 0。</summary>
-    async int ExistsAsync(string key) {
-        RedisReply r = await this.CommandAsync2("EXISTS", key);
-        return r.AsInt();
-    }
-
-    /// <summary>INCR key。返回自增后的值（32 位）。</summary>
-    async int IncrAsync(string key) {
-        RedisReply r = await this.CommandAsync2("INCR", key);
-        return r.AsInt();
-    }
-
-    /// <summary>INCR key。返回自增后的 64 位值，杜绝 20 亿计数溢出。</summary>
-    async long Incr64Async(string key) {
-        RedisReply r = await this.CommandAsync2("INCR", key);
-        return r.AsLong();
-    }
-
-    /// <summary>INCRBY key amount。按指定的 64 位增量自增，返回新值。</summary>
-    async long IncrByAsync(string key, long amount) {
-        RedisReply r = await this.CommandAsync3("INCRBY", key, Convert.ToString(amount));
-        return r.AsLong();
-    }
-
-    /// <summary>DECR key。返回自减后的 64 位值。</summary>
-    async long Decr64Async(string key) {
-        RedisReply r = await this.CommandAsync2("DECR", key);
-        return r.AsLong();
-    }
-
-    /// <summary>DECRBY key amount。按指定的 64 位减量自减，返回新值。</summary>
-    async long DecrByAsync(string key, long amount) {
-        RedisReply r = await this.CommandAsync3("DECRBY", key, Convert.ToString(amount));
-        return r.AsLong();
-    }
-
-    /// <summary>MGET 批量获取多个键对应的值（支持大数据量批量获取）。不存在的键在列表中表现为空字符串。</summary>
+    /// <summary>MGET 批量获取。</summary>
     async List<string> MGetAsync(List<string> keys) {
         List<string> res = new List<string>();
         if (keys == null || keys.Count == 0) { return res; }
@@ -675,56 +727,27 @@ class RedisClient {
             args.Add(keys[i]);
         }
         RedisReply r = await this.CommandAsync(args);
-        if (r.kind == RedisReply.ARRAY && r.items != null) {
-            for (int i = 0; i < r.items.Count; i = i + 1) {
-                RedisReply item = r.items[i];
-                if (item.IsNil()) {
-                    res.Add("");
-                } else {
-                    res.Add(item.AsString());
-                }
-            }
-        }
-        return res;
+        return r.AsListString();
     }
 
-    /// <summary>MSET 批量设置多个实体键值对（推荐，强类型实体避免平行列表）。收到 +OK 返回 true。</summary>
+    /// <summary>MSET 批量设置实体列表。</summary>
     async bool MSetAsync(List<RedisEntry> entries) {
-        if (entries == null || entries.Count == 0) {
-            return false;
-        }
-        List<string> args = new List<string>();
-        args.Add("MSET");
-        for (int i = 0; i < entries.Count; i = i + 1) {
-            RedisEntry e = entries[i];
-            if (e != null) {
-                args.Add(e.key);
-                args.Add(e.value);
-            }
-        }
-        RedisReply r = await this.CommandAsync(args);
-        return r.AsString() == "OK";
+        return await this.MSetEntriesAsync(entries);
     }
 
-    /// <summary>强类型实体主方法：批量设置键值对列表。收到 +OK 返回 true。</summary>
-    async bool MSetEntriesAsync(List<RedisEntry> entries) {
-        if (entries == null || entries.Count == 0) {
-            return false;
+    /// <summary>MSET 批量设置字典。</summary>
+    async bool MSetAsync(Dictionary<string, string> dict) {
+        if (dict == null || dict.Count == 0) { return false; }
+        List<RedisEntry> entries = new List<RedisEntry>();
+        List<string> keys = dict.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string k = keys[i];
+            entries.Add(new RedisEntry(k, dict[k]));
         }
-        List<string> args = new List<string>();
-        args.Add("MSET");
-        for (int i = 0; i < entries.Count; i = i + 1) {
-            RedisEntry e = entries[i];
-            if (e != null) {
-                args.Add(e.key);
-                args.Add(e.value);
-            }
-        }
-        RedisReply r = await this.CommandAsync(args);
-        return r.AsString() == "OK";
+        return await this.MSetEntriesAsync(entries);
     }
 
-    /// <summary>MSET 批量设置多个键值对（兼容入口，委托至 MSetEntriesAsync）。收到 +OK 返回 true。</summary>
+    /// <summary>MSET 兼容平行列表。</summary>
     async bool MSetAsync(List<string> keys, List<string> vals) {
         if (keys == null || vals == null || keys.Count == 0 || keys.Count != vals.Count) {
             return false;
@@ -736,12 +759,1069 @@ class RedisClient {
         return await this.MSetEntriesAsync(entries);
     }
 
-    /// <summary>EXPIRE key seconds。设置成功返回 1。</summary>
-    async int ExpireAsync(string key, int seconds) {
-        RedisReply r = await this.CommandAsync3("EXPIRE", key,
-                                                Convert.ToString(seconds));
+    /// <summary>MSET 实体主方法。</summary>
+    async bool MSetEntriesAsync(List<RedisEntry> entries) {
+        if (entries == null || entries.Count == 0) { return false; }
+        List<string> args = new List<string>();
+        args.Add("MSET");
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            RedisEntry e = entries[i];
+            if (e != null) {
+                args.Add(e.key);
+                args.Add(e.value);
+            }
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>MSETNX 仅当所有键都不存在时批量设置。</summary>
+    async bool MSetNxAsync(List<RedisEntry> entries) {
+        if (entries == null || entries.Count == 0) { return false; }
+        List<string> args = new List<string>();
+        args.Add("MSETNX");
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            RedisEntry e = entries[i];
+            if (e != null) {
+                args.Add(e.key);
+                args.Add(e.value);
+            }
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsInt() == 1;
+    }
+
+    /// <summary>INCR 自增 1（32 位）。</summary>
+    async int IncrAsync(string key) {
+        RedisReply r = await this.CommandAsync2("INCR", key);
         return r.AsInt();
     }
+
+    /// <summary>INCR 自增 1（64 位防溢出）。</summary>
+    async long Incr64Async(string key) {
+        RedisReply r = await this.CommandAsync2("INCR", key);
+        return r.AsLong();
+    }
+
+    /// <summary>INCRBY 按指定 64 位整数自增。</summary>
+    async long IncrByAsync(string key, long amount) {
+        RedisReply r = await this.CommandAsync3("INCRBY", key, Convert.ToString(amount));
+        return r.AsLong();
+    }
+
+    /// <summary>INCRBYFLOAT 按指定浮点数自增。</summary>
+    async double IncrByFloatAsync(string key, double amount) {
+        List<string> args = new List<string>{ "INCRBYFLOAT", key, Convert.ToString(amount) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsDouble();
+    }
+
+    /// <summary>DECR 自减 1（32 位）。</summary>
+    async int DecrAsync(string key) {
+        RedisReply r = await this.CommandAsync2("DECR", key);
+        return r.AsInt();
+    }
+
+    /// <summary>DECR 自减 1（64 位）。</summary>
+    async long Decr64Async(string key) {
+        RedisReply r = await this.CommandAsync2("DECR", key);
+        return r.AsLong();
+    }
+
+    /// <summary>DECRBY 按指定 64 位整数自减。</summary>
+    async long DecrByAsync(string key, long amount) {
+        RedisReply r = await this.CommandAsync3("DECRBY", key, Convert.ToString(amount));
+        return r.AsLong();
+    }
+
+    /// <summary>STRLEN 获取字符串长度。</summary>
+    async long StrLenAsync(string key) {
+        RedisReply r = await this.CommandAsync2("STRLEN", key);
+        return r.AsLong();
+    }
+
+    /// <summary>APPEND 追加字符串，返回追加后的长度。</summary>
+    async long AppendAsync(string key, string value) {
+        RedisReply r = await this.CommandAsync3("APPEND", key, value);
+        return r.AsLong();
+    }
+
+    /// <summary>GETRANGE 获取子字符串区间。</summary>
+    async string GetRangeAsync(string key, long start, long end) {
+        List<string> args = new List<string>{ "GETRANGE", key, Convert.ToString(start), Convert.ToString(end) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsString();
+    }
+
+    /// <summary>SETRANGE 覆写指定偏移处的子字符串，返回修改后的长度。</summary>
+    async long SetRangeAsync(string key, long offset, string value) {
+        List<string> args = new List<string>{ "SETRANGE", key, Convert.ToString(offset), value };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    // ========================================================================
+    // 键管理 (Keys)
+    // ========================================================================
+
+    /// <summary>DEL 删除单个键，返回删除数（0 或 1）。</summary>
+    async int DelAsync(string key) {
+        RedisReply r = await this.CommandAsync2("DEL", key);
+        return r.AsInt();
+    }
+
+    /// <summary>DEL 批量删除多个键，返回成功删除的键数。</summary>
+    async int DelMultipleAsync(List<string> keys) {
+        if (keys == null || keys.Count == 0) { return 0; }
+        List<string> args = new List<string>();
+        args.Add("DEL");
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            args.Add(keys[i]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsInt();
+    }
+
+    /// <summary>EXISTS 检查单个键是否存在。</summary>
+    async int ExistsAsync(string key) {
+        RedisReply r = await this.CommandAsync2("EXISTS", key);
+        return r.AsInt();
+    }
+
+    /// <summary>EXISTS 检查多个键中存在的数量。</summary>
+    async int ExistsMultipleAsync(List<string> keys) {
+        if (keys == null || keys.Count == 0) { return 0; }
+        List<string> args = new List<string>();
+        args.Add("EXISTS");
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            args.Add(keys[i]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsInt();
+    }
+
+    /// <summary>TYPE 获取键的数据类型。</summary>
+    async string TypeAsync(string key) {
+        RedisReply r = await this.CommandAsync2("TYPE", key);
+        return r.AsString();
+    }
+
+    /// <summary>EXPIRE 设置过期时间（秒）。</summary>
+    async int ExpireAsync(string key, int seconds) {
+        RedisReply r = await this.CommandAsync3("EXPIRE", key, Convert.ToString(seconds));
+        return r.AsInt();
+    }
+
+    /// <summary>EXPIREAT 设置 Unix 时间戳（秒）过期。</summary>
+    async int ExpireAtAsync(string key, long timestamp) {
+        RedisReply r = await this.CommandAsync3("EXPIREAT", key, Convert.ToString(timestamp));
+        return r.AsInt();
+    }
+
+    /// <summary>PEXPIRE 设置毫秒级过期。</summary>
+    async int PExpireAsync(string key, long ms) {
+        RedisReply r = await this.CommandAsync3("PEXPIRE", key, Convert.ToString(ms));
+        return r.AsInt();
+    }
+
+    /// <summary>TTL 查询剩余生存时间（秒）。</summary>
+    async long TtlAsync(string key) {
+        RedisReply r = await this.CommandAsync2("TTL", key);
+        return r.AsLong();
+    }
+
+    /// <summary>PTTL 查询剩余生存时间（毫秒）。</summary>
+    async long PTtlAsync(string key) {
+        RedisReply r = await this.CommandAsync2("PTTL", key);
+        return r.AsLong();
+    }
+
+    /// <summary>PERSIST 移除过期时间，持久化键。</summary>
+    async int PersistAsync(string key) {
+        RedisReply r = await this.CommandAsync2("PERSIST", key);
+        return r.AsInt();
+    }
+
+    /// <summary>KEYS 模式匹配查找键（注意：生产大库谨慎使用）。</summary>
+    async List<string> KeysAsync(string pattern) {
+        RedisReply r = await this.CommandAsync2("KEYS", pattern);
+        return r.AsListString();
+    }
+
+    /// <summary>RENAME 重命名键。</summary>
+    async bool RenameAsync(string key, string newKey) {
+        RedisReply r = await this.CommandAsync3("RENAME", key, newKey);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>RENAMENX 仅当新键不存在时重命名。</summary>
+    async bool RenameNxAsync(string key, string newKey) {
+        RedisReply r = await this.CommandAsync3("RENAMENX", key, newKey);
+        return r.AsInt() == 1;
+    }
+
+    /// <summary>RANDOMKEY 随机返回一个键。</summary>
+    async string RandomKeyAsync() {
+        RedisReply r = await this.CommandAsync1("RANDOMKEY");
+        return r.AsString();
+    }
+
+    /// <summary>DUMP 序列化键的值。</summary>
+    async byte[] DumpAsync(string key) {
+        RedisReply r = await this.CommandAsync2("DUMP", key);
+        return r.AsBytes();
+    }
+
+    /// <summary>SCAN 增量迭代键空间。</summary>
+    async RedisScanResult ScanAsync(long cursor, string pattern, int count) {
+        List<string> args = new List<string>{ "SCAN", Convert.ToString(cursor) };
+        if (pattern != null && pattern.Length > 0) {
+            args.Add("MATCH");
+            args.Add(pattern);
+        }
+        if (count > 0) {
+            args.Add("COUNT");
+            args.Add(Convert.ToString(count));
+        }
+        RedisReply r = await this.CommandAsync(args);
+        if (r.kind == RedisReply.ARRAY && r.Count() >= 2) {
+            long nextCur = Convert.ToInt64(r.At(0).AsString());
+            List<string> items = r.At(1).AsListString();
+            return new RedisScanResult(nextCur, items);
+        }
+        return new RedisScanResult(0, new List<string>());
+    }
+
+    // ========================================================================
+    // 哈希 (Hashes)
+    // ========================================================================
+
+    /// <summary>HSET 设置单个字段。</summary>
+    async long HSetAsync(string key, string field, string value) {
+        List<string> args = new List<string>{ "HSET", key, field, value };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>HSETNX 仅当字段不存在时设置。</summary>
+    async bool HSetNxAsync(string key, string field, string value) {
+        List<string> args = new List<string>{ "HSETNX", key, field, value };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsInt() == 1;
+    }
+
+    /// <summary>HGET 获取字段值。</summary>
+    async string HGetAsync(string key, string field) {
+        RedisReply r = await this.CommandAsync3("HGET", key, field);
+        if (r.IsNil()) { return ""; }
+        return r.AsString();
+    }
+
+    /// <summary>HGET 二进制安全获取。</summary>
+    async byte[] HGetBytesAsync(string key, string field) {
+        RedisReply r = await this.CommandAsync3("HGET", key, field);
+        if (r.IsNil() || r.IsError()) { return null; }
+        return r.AsBytes();
+    }
+
+    /// <summary>HMSET 批量设置字典。</summary>
+    async bool HMSetAsync(string key, Dictionary<string, string> dict) {
+        if (dict == null || dict.Count == 0) { return false; }
+        List<string> args = new List<string>{ "HMSET", key };
+        List<string> keys = dict.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string f = keys[i];
+            args.Add(f);
+            args.Add(dict[f]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>HMSET 批量设置实体列表。</summary>
+    async bool HMSetAsync(string key, List<RedisEntry> entries) {
+        if (entries == null || entries.Count == 0) { return false; }
+        List<string> args = new List<string>{ "HMSET", key };
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            RedisEntry e = entries[i];
+            if (e != null) {
+                args.Add(e.key);
+                args.Add(e.value);
+            }
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>HMSET 兼容平行列表。</summary>
+    async bool HMSetAsync(string key, List<string> fields, List<string> values) {
+        if (fields == null || values == null || fields.Count == 0 || fields.Count != values.Count) {
+            return false;
+        }
+        List<string> args = new List<string>{ "HMSET", key };
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            args.Add(fields[i]);
+            args.Add(values[i]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>HMGET 批量获取指定字段。</summary>
+    async List<string> HMGetAsync(string key, List<string> fields) {
+        List<string> res = new List<string>();
+        if (fields == null || fields.Count == 0) { return res; }
+        List<string> args = new List<string>{ "HMGET", key };
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            args.Add(fields[i]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsListString();
+    }
+
+    /// <summary>HINCRBY 字段整数自增。</summary>
+    async long HIncrByAsync(string key, string field, long amount) {
+        List<string> args = new List<string>{ "HINCRBY", key, field, Convert.ToString(amount) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>HINCRBYFLOAT 字段浮点数自增。</summary>
+    async double HIncrByFloatAsync(string key, string field, double amount) {
+        List<string> args = new List<string>{ "HINCRBYFLOAT", key, field, Convert.ToString(amount) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsDouble();
+    }
+
+    /// <summary>HEXISTS 检查字段是否存在。</summary>
+    async bool HExistsAsync(string key, string field) {
+        RedisReply r = await this.CommandAsync3("HEXISTS", key, field);
+        return r.AsInt() == 1;
+    }
+
+    /// <summary>HDEL 删除单个字段。</summary>
+    async int HDelAsync(string key, string field) {
+        RedisReply r = await this.CommandAsync3("HDEL", key, field);
+        return r.AsInt();
+    }
+
+    /// <summary>HDEL 批量删除多个字段。</summary>
+    async int HDelMultipleAsync(string key, List<string> fields) {
+        if (fields == null || fields.Count == 0) { return 0; }
+        List<string> args = new List<string>{ "HDEL", key };
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            args.Add(fields[i]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsInt();
+    }
+
+    /// <summary>HLEN 获取哈希表中字段数量。</summary>
+    async long HLenAsync(string key) {
+        RedisReply r = await this.CommandAsync2("HLEN", key);
+        return r.AsLong();
+    }
+
+    /// <summary>HKEYS 获取哈希表中所有字段名。</summary>
+    async List<string> HKeysAsync(string key) {
+        RedisReply r = await this.CommandAsync2("HKEYS", key);
+        return r.AsListString();
+    }
+
+    /// <summary>HVALS 获取哈希表中所有字段值。</summary>
+    async List<string> HValsAsync(string key) {
+        RedisReply r = await this.CommandAsync2("HVALS", key);
+        return r.AsListString();
+    }
+
+    /// <summary>HGETALL 获取全部键值对为字典。</summary>
+    async Dictionary<string, string> HGetAllAsync(string key) {
+        RedisReply r = await this.CommandAsync2("HGETALL", key);
+        return r.AsDictionary();
+    }
+
+    /// <summary>HSTRLEN 获取指定字段值的字符串长度。</summary>
+    async long HStrLenAsync(string key, string field) {
+        RedisReply r = await this.CommandAsync3("HSTRLEN", key, field);
+        return r.AsLong();
+    }
+
+    /// <summary>HSCAN 增量迭代哈希字段。</summary>
+    async RedisScanResult HScanAsync(string key, long cursor, string pattern, int count) {
+        List<string> args = new List<string>{ "HSCAN", key, Convert.ToString(cursor) };
+        if (pattern != null && pattern.Length > 0) {
+            args.Add("MATCH");
+            args.Add(pattern);
+        }
+        if (count > 0) {
+            args.Add("COUNT");
+            args.Add(Convert.ToString(count));
+        }
+        RedisReply r = await this.CommandAsync(args);
+        if (r.kind == RedisReply.ARRAY && r.Count() >= 2) {
+            long nextCur = Convert.ToInt64(r.At(0).AsString());
+            List<string> items = r.At(1).AsListString();
+            return new RedisScanResult(nextCur, items);
+        }
+        return new RedisScanResult(0, new List<string>());
+    }
+
+    // ========================================================================
+    // 列表 (Lists)
+    // ========================================================================
+
+    /// <summary>LPUSH 将单个元素推入列表左端。</summary>
+    async long LPushAsync(string key, string value) {
+        RedisReply r = await this.CommandAsync3("LPUSH", key, value);
+        return r.AsLong();
+    }
+
+    /// <summary>LPUSH 批量推入多个元素到左端。</summary>
+    async long LPushMultipleAsync(string key, List<string> values) {
+        if (values == null || values.Count == 0) { return 0; }
+        List<string> args = new List<string>{ "LPUSH", key };
+        for (int i = 0; i < values.Count; i = i + 1) {
+            args.Add(values[i]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>RPUSH 将单个元素推入列表右端。</summary>
+    async long RPushAsync(string key, string value) {
+        RedisReply r = await this.CommandAsync3("RPUSH", key, value);
+        return r.AsLong();
+    }
+
+    /// <summary>RPUSH 批量推入多个元素到右端。</summary>
+    async long RPushMultipleAsync(string key, List<string> values) {
+        if (values == null || values.Count == 0) { return 0; }
+        List<string> args = new List<string>{ "RPUSH", key };
+        for (int i = 0; i < values.Count; i = i + 1) {
+            args.Add(values[i]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>LPUSHX 仅当列表存在时推入左端。</summary>
+    async long LPushXAsync(string key, string value) {
+        RedisReply r = await this.CommandAsync3("LPUSHX", key, value);
+        return r.AsLong();
+    }
+
+    /// <summary>RPUSHX 仅当列表存在时推入右端。</summary>
+    async long RPushXAsync(string key, string value) {
+        RedisReply r = await this.CommandAsync3("RPUSHX", key, value);
+        return r.AsLong();
+    }
+
+    /// <summary>LPOP 弹出左端元素。</summary>
+    async string LPopAsync(string key) {
+        RedisReply r = await this.CommandAsync2("LPOP", key);
+        if (r.IsNil()) { return ""; }
+        return r.AsString();
+    }
+
+    /// <summary>LPOP 二进制安全弹出。</summary>
+    async byte[] LPopBytesAsync(string key) {
+        RedisReply r = await this.CommandAsync2("LPOP", key);
+        if (r.IsNil() || r.IsError()) { return null; }
+        return r.AsBytes();
+    }
+
+    /// <summary>RPOP 弹出右端元素。</summary>
+    async string RPopAsync(string key) {
+        RedisReply r = await this.CommandAsync2("RPOP", key);
+        if (r.IsNil()) { return ""; }
+        return r.AsString();
+    }
+
+    /// <summary>RPOP 二进制安全弹出。</summary>
+    async byte[] RPopBytesAsync(string key) {
+        RedisReply r = await this.CommandAsync2("RPOP", key);
+        if (r.IsNil() || r.IsError()) { return null; }
+        return r.AsBytes();
+    }
+
+    /// <summary>LLEN 获取列表长度。</summary>
+    async long LLenAsync(string key) {
+        RedisReply r = await this.CommandAsync2("LLEN", key);
+        return r.AsLong();
+    }
+
+    /// <summary>LINDEX 获取指定索引处的元素。</summary>
+    async string LIndexAsync(string key, long index) {
+        List<string> args = new List<string>{ "LINDEX", key, Convert.ToString(index) };
+        RedisReply r = await this.CommandAsync(args);
+        if (r.IsNil()) { return ""; }
+        return r.AsString();
+    }
+
+    /// <summary>LRANGE 获取指定闭区间 [start, stop] 的元素列表。</summary>
+    async List<string> LRangeAsync(string key, long start, long stop) {
+        List<string> args = new List<string>{ "LRANGE", key, Convert.ToString(start), Convert.ToString(stop) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsListString();
+    }
+
+    /// <summary>LSET 设置指定索引处的元素值。</summary>
+    async bool LSetAsync(string key, long index, string value) {
+        List<string> args = new List<string>{ "LSET", key, Convert.ToString(index), value };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>LREM 删除指定数量匹配的元素。</summary>
+    async long LRemAsync(string key, long count, string value) {
+        List<string> args = new List<string>{ "LREM", key, Convert.ToString(count), value };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>LTRIM 裁剪列表使其仅保留指定区间。</summary>
+    async bool LTrimAsync(string key, long start, long stop) {
+        List<string> args = new List<string>{ "LTRIM", key, Convert.ToString(start), Convert.ToString(stop) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>RPOPLPUSH 弹出 source 右端并推入 destination 左端。</summary>
+    async string RPopLPushAsync(string source, string destination) {
+        RedisReply r = await this.CommandAsync3("RPOPLPUSH", source, destination);
+        if (r.IsNil()) { return ""; }
+        return r.AsString();
+    }
+
+    /// <summary>BLPOP 阻塞式左端弹出。</summary>
+    async List<string> BLPopAsync(string key, int timeoutSeconds) {
+        List<string> args = new List<string>{ "BLPOP", key, Convert.ToString(timeoutSeconds) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsListString();
+    }
+
+    /// <summary>BRPOP 阻塞式右端弹出。</summary>
+    async List<string> BRPopAsync(string key, int timeoutSeconds) {
+        List<string> args = new List<string>{ "BRPOP", key, Convert.ToString(timeoutSeconds) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsListString();
+    }
+
+    // ========================================================================
+    // 集合 (Sets)
+    // ========================================================================
+
+    /// <summary>SADD 向集合添加单个成员。</summary>
+    async long SAddAsync(string key, string member) {
+        RedisReply r = await this.CommandAsync3("SADD", key, member);
+        return r.AsLong();
+    }
+
+    /// <summary>SADD 批量添加多个成员。</summary>
+    async long SAddMultipleAsync(string key, List<string> members) {
+        if (members == null || members.Count == 0) { return 0; }
+        List<string> args = new List<string>{ "SADD", key };
+        for (int i = 0; i < members.Count; i = i + 1) {
+            args.Add(members[i]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>SREM 从集合中移除单个成员。</summary>
+    async long SRemAsync(string key, string member) {
+        RedisReply r = await this.CommandAsync3("SREM", key, member);
+        return r.AsLong();
+    }
+
+    /// <summary>SREM 批量移除多个成员。</summary>
+    async long SRemMultipleAsync(string key, List<string> members) {
+        if (members == null || members.Count == 0) { return 0; }
+        List<string> args = new List<string>{ "SREM", key };
+        for (int i = 0; i < members.Count; i = i + 1) {
+            args.Add(members[i]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>SMEMBERS 获取集合中全部成员。</summary>
+    async List<string> SMembersAsync(string key) {
+        RedisReply r = await this.CommandAsync2("SMEMBERS", key);
+        return r.AsListString();
+    }
+
+    /// <summary>SISMEMBER 判断成员是否在集合中。</summary>
+    async bool SIsMemberAsync(string key, string member) {
+        RedisReply r = await this.CommandAsync3("SISMEMBER", key, member);
+        return r.AsInt() == 1;
+    }
+
+    /// <summary>SCARD 获取集合中元素基数。</summary>
+    async long SCardAsync(string key) {
+        RedisReply r = await this.CommandAsync2("SCARD", key);
+        return r.AsLong();
+    }
+
+    /// <summary>SPOP 随机弹出并移除一个成员。</summary>
+    async string SPopAsync(string key) {
+        RedisReply r = await this.CommandAsync2("SPOP", key);
+        if (r.IsNil()) { return ""; }
+        return r.AsString();
+    }
+
+    /// <summary>SRANDMEMBER 随机返回一个成员（不移除）。</summary>
+    async string SRandMemberAsync(string key) {
+        RedisReply r = await this.CommandAsync2("SRANDMEMBER", key);
+        if (r.IsNil()) { return ""; }
+        return r.AsString();
+    }
+
+    /// <summary>SRANDMEMBER 随机返回多个成员。</summary>
+    async List<string> SRandMemberMultipleAsync(string key, int count) {
+        List<string> args = new List<string>{ "SRANDMEMBER", key, Convert.ToString(count) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsListString();
+    }
+
+    /// <summary>SDIFF 差集。</summary>
+    async List<string> SDiffAsync(List<string> keys) {
+        if (keys == null || keys.Count == 0) { return new List<string>(); }
+        List<string> args = new List<string>{ "SDIFF" };
+        for (int i = 0; i < keys.Count; i = i + 1) { args.Add(keys[i]); }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsListString();
+    }
+
+    /// <summary>SINTER 交集。</summary>
+    async List<string> SInterAsync(List<string> keys) {
+        if (keys == null || keys.Count == 0) { return new List<string>(); }
+        List<string> args = new List<string>{ "SINTER" };
+        for (int i = 0; i < keys.Count; i = i + 1) { args.Add(keys[i]); }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsListString();
+    }
+
+    /// <summary>SUNION 并集。</summary>
+    async List<string> SUnionAsync(List<string> keys) {
+        if (keys == null || keys.Count == 0) { return new List<string>(); }
+        List<string> args = new List<string>{ "SUNION" };
+        for (int i = 0; i < keys.Count; i = i + 1) { args.Add(keys[i]); }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsListString();
+    }
+
+    /// <summary>SDIFFSTORE 差集并存储到目标集合。</summary>
+    async long SDiffStoreAsync(string destination, List<string> keys) {
+        List<string> args = new List<string>{ "SDIFFSTORE", destination };
+        if (keys != null) {
+            for (int i = 0; i < keys.Count; i = i + 1) { args.Add(keys[i]); }
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>SINTERSTORE 交集并存储到目标集合。</summary>
+    async long SInterStoreAsync(string destination, List<string> keys) {
+        List<string> args = new List<string>{ "SINTERSTORE", destination };
+        if (keys != null) {
+            for (int i = 0; i < keys.Count; i = i + 1) { args.Add(keys[i]); }
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>SUNIONSTORE 并集并存储到目标集合。</summary>
+    async long SUnionStoreAsync(string destination, List<string> keys) {
+        List<string> args = new List<string>{ "SUNIONSTORE", destination };
+        if (keys != null) {
+            for (int i = 0; i < keys.Count; i = i + 1) { args.Add(keys[i]); }
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>SMOVE 将成员从源集合原子移动到目标集合。</summary>
+    async bool SMoveAsync(string source, string destination, string member) {
+        List<string> args = new List<string>{ "SMOVE", source, destination, member };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsInt() == 1;
+    }
+
+    /// <summary>SSCAN 增量迭代集合元素。</summary>
+    async RedisScanResult SScanAsync(string key, long cursor, string pattern, int count) {
+        List<string> args = new List<string>{ "SSCAN", key, Convert.ToString(cursor) };
+        if (pattern != null && pattern.Length > 0) {
+            args.Add("MATCH");
+            args.Add(pattern);
+        }
+        if (count > 0) {
+            args.Add("COUNT");
+            args.Add(Convert.ToString(count));
+        }
+        RedisReply r = await this.CommandAsync(args);
+        if (r.kind == RedisReply.ARRAY && r.Count() >= 2) {
+            long nextCur = Convert.ToInt64(r.At(0).AsString());
+            List<string> items = r.At(1).AsListString();
+            return new RedisScanResult(nextCur, items);
+        }
+        return new RedisScanResult(0, new List<string>());
+    }
+
+    // ========================================================================
+    // 有序集合 (Sorted Sets / ZSet)
+    // ========================================================================
+
+    /// <summary>ZADD 添加单个成员与分数。</summary>
+    async long ZAddAsync(string key, double score, string member) {
+        List<string> args = new List<string>{ "ZADD", key, Convert.ToString(score), member };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>ZADD 批量添加多个成员与分数实体。</summary>
+    async long ZAddMultipleAsync(string key, List<ZMember> members) {
+        if (members == null || members.Count == 0) { return 0; }
+        List<string> args = new List<string>{ "ZADD", key };
+        for (int i = 0; i < members.Count; i = i + 1) {
+            ZMember zm = members[i];
+            if (zm != null) {
+                args.Add(Convert.ToString(zm.score));
+                args.Add(zm.member);
+            }
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>ZSCORE 查询成员分数。</summary>
+    async double ZScoreAsync(string key, string member) {
+        RedisReply r = await this.CommandAsync3("ZSCORE", key, member);
+        if (r.IsNil()) { return 0.0; }
+        return r.AsDouble();
+    }
+
+    /// <summary>ZSCORE 查询成员原始分数字符串（不存在返回空串）。</summary>
+    async string ZScoreStringAsync(string key, string member) {
+        RedisReply r = await this.CommandAsync3("ZSCORE", key, member);
+        if (r.IsNil()) { return ""; }
+        return r.AsString();
+    }
+
+    /// <summary>ZINCRBY 为成员的分数增加增量。</summary>
+    async double ZIncrByAsync(string key, double increment, string member) {
+        List<string> args = new List<string>{ "ZINCRBY", key, Convert.ToString(increment), member };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsDouble();
+    }
+
+    /// <summary>ZCARD 获取有序集合基数。</summary>
+    async long ZCardAsync(string key) {
+        RedisReply r = await this.CommandAsync2("ZCARD", key);
+        return r.AsLong();
+    }
+
+    /// <summary>ZCOUNT 统计分数在 [min, max] 区间内的成员数。</summary>
+    async long ZCountAsync(string key, string min, string max) {
+        List<string> args = new List<string>{ "ZCOUNT", key, min, max };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>ZRANGE 按排名由低到高获取成员。</summary>
+    async List<string> ZRangeAsync(string key, long start, long stop) {
+        List<string> args = new List<string>{ "ZRANGE", key, Convert.ToString(start), Convert.ToString(stop) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsListString();
+    }
+
+    /// <summary>ZRANGE WITHSCORES 按排名由低到高获取成员与分数。</summary>
+    async List<ZMember> ZRangeWithScoresAsync(string key, long start, long stop) {
+        List<string> args = new List<string>{ "ZRANGE", key, Convert.ToString(start), Convert.ToString(stop), "WITHSCORES" };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsZMemberList();
+    }
+
+    /// <summary>ZREVRANGE 按排名由高到低获取成员。</summary>
+    async List<string> ZRevRangeAsync(string key, long start, long stop) {
+        List<string> args = new List<string>{ "ZREVRANGE", key, Convert.ToString(start), Convert.ToString(stop) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsListString();
+    }
+
+    /// <summary>ZREVRANGE WITHSCORES 按排名由高到低获取成员与分数。</summary>
+    async List<ZMember> ZRevRangeWithScoresAsync(string key, long start, long stop) {
+        List<string> args = new List<string>{ "ZREVRANGE", key, Convert.ToString(start), Convert.ToString(stop), "WITHSCORES" };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsZMemberList();
+    }
+
+    /// <summary>ZRANGEBYSCORE 按分数区间由低到高获取成员。</summary>
+    async List<string> ZRangeByScoreAsync(string key, string min, string max) {
+        List<string> args = new List<string>{ "ZRANGEBYSCORE", key, min, max };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsListString();
+    }
+
+    /// <summary>ZRANGEBYSCORE 带分页。</summary>
+    async List<string> ZRangeByScoreAsync(string key, string min, string max, int offset, int count) {
+        List<string> args = new List<string>{ "ZRANGEBYSCORE", key, min, max, "LIMIT", Convert.ToString(offset), Convert.ToString(count) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsListString();
+    }
+
+    /// <summary>ZRANGEBYSCORE WITHSCORES 按分数区间获取成员与分数。</summary>
+    async List<ZMember> ZRangeByScoreWithScoresAsync(string key, string min, string max) {
+        List<string> args = new List<string>{ "ZRANGEBYSCORE", key, min, max, "WITHSCORES" };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsZMemberList();
+    }
+
+    /// <summary>ZRANK 获取成员由低到高的排名（0 起始，不存在返回 -1）。</summary>
+    async long ZRankAsync(string key, string member) {
+        RedisReply r = await this.CommandAsync3("ZRANK", key, member);
+        if (r.IsNil()) { return -1; }
+        return r.AsLong();
+    }
+
+    /// <summary>ZREVRANK 获取成员由高到低的倒序排名（0 起始，不存在返回 -1）。</summary>
+    async long ZRevRankAsync(string key, string member) {
+        RedisReply r = await this.CommandAsync3("ZREVRANK", key, member);
+        if (r.IsNil()) { return -1; }
+        return r.AsLong();
+    }
+
+    /// <summary>ZREM 移除单个成员。</summary>
+    async long ZRemAsync(string key, string member) {
+        RedisReply r = await this.CommandAsync3("ZREM", key, member);
+        return r.AsLong();
+    }
+
+    /// <summary>ZREM 批量移除多个成员。</summary>
+    async long ZRemMultipleAsync(string key, List<string> members) {
+        if (members == null || members.Count == 0) { return 0; }
+        List<string> args = new List<string>{ "ZREM", key };
+        for (int i = 0; i < members.Count; i = i + 1) {
+            args.Add(members[i]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>ZREMRANGEBYRANK 按排名区间移除成员。</summary>
+    async long ZRemRangeByRankAsync(string key, long start, long stop) {
+        List<string> args = new List<string>{ "ZREMRANGEBYRANK", key, Convert.ToString(start), Convert.ToString(stop) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>ZREMRANGEBYSCORE 按分数区间移除成员。</summary>
+    async long ZRemRangeByScoreAsync(string key, string min, string max) {
+        List<string> args = new List<string>{ "ZREMRANGEBYSCORE", key, min, max };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>ZSCAN 增量迭代有序集合成员。</summary>
+    async RedisScanResult ZScanAsync(string key, long cursor, string pattern, int count) {
+        List<string> args = new List<string>{ "ZSCAN", key, Convert.ToString(cursor) };
+        if (pattern != null && pattern.Length > 0) {
+            args.Add("MATCH");
+            args.Add(pattern);
+        }
+        if (count > 0) {
+            args.Add("COUNT");
+            args.Add(Convert.ToString(count));
+        }
+        RedisReply r = await this.CommandAsync(args);
+        if (r.kind == RedisReply.ARRAY && r.Count() >= 2) {
+            long nextCur = Convert.ToInt64(r.At(0).AsString());
+            List<string> items = r.At(1).AsListString();
+            return new RedisScanResult(nextCur, items);
+        }
+        return new RedisScanResult(0, new List<string>());
+    }
+
+    // ========================================================================
+    // 位图 (Bitmaps)
+    // ========================================================================
+
+    /// <summary>SETBIT 设置指定偏移量的位值（0 或 1）。返回旧的位值。</summary>
+    async int SetBitAsync(string key, long offset, int value) {
+        List<string> args = new List<string>{ "SETBIT", key, Convert.ToString(offset), Convert.ToString(value) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsInt();
+    }
+
+    /// <summary>GETBIT 获取指定偏移量的位值。</summary>
+    async int GetBitAsync(string key, long offset) {
+        List<string> args = new List<string>{ "GETBIT", key, Convert.ToString(offset) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsInt();
+    }
+
+    /// <summary>BITCOUNT 统计字符串中被设置为 1 的位数量。</summary>
+    async long BitCountAsync(string key) {
+        RedisReply r = await this.CommandAsync2("BITCOUNT", key);
+        return r.AsLong();
+    }
+
+    /// <summary>BITCOUNT 统计指定字节区间中为 1 的位数量。</summary>
+    async long BitCountAsync(string key, long start, long end) {
+        List<string> args = new List<string>{ "BITCOUNT", key, Convert.ToString(start), Convert.ToString(end) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>BITOP AND 位与运算并保存到目标键。</summary>
+    async long BitOpAndAsync(string destKey, List<string> keys) {
+        return await this.bitOp("AND", destKey, keys);
+    }
+
+    /// <summary>BITOP OR 位或运算并保存到目标键。</summary>
+    async long BitOpOrAsync(string destKey, List<string> keys) {
+        return await this.bitOp("OR", destKey, keys);
+    }
+
+    /// <summary>BITOP XOR 位异或运算并保存到目标键。</summary>
+    async long BitOpXorAsync(string destKey, List<string> keys) {
+        return await this.bitOp("XOR", destKey, keys);
+    }
+
+    /// <summary>BITOP NOT 位非运算并保存到目标键。</summary>
+    async long BitOpNotAsync(string destKey, string srcKey) {
+        List<string> args = new List<string>{ "BITOP", "NOT", destKey, srcKey };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    async long bitOp(string op, string destKey, List<string> keys) {
+        List<string> args = new List<string>{ "BITOP", op, destKey };
+        if (keys != null) {
+            for (int i = 0; i < keys.Count; i = i + 1) { args.Add(keys[i]); }
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>BITPOS 查找第一个设置为指定 bit (0 或 1) 的位置。</summary>
+    async long BitPosAsync(string key, int bit) {
+        List<string> args = new List<string>{ "BITPOS", key, Convert.ToString(bit) };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    // ========================================================================
+    // HyperLogLog (基数统计)
+    // ========================================================================
+
+    /// <summary>PFADD 添加单个元素。</summary>
+    async bool PfAddAsync(string key, string element) {
+        RedisReply r = await this.CommandAsync3("PFADD", key, element);
+        return r.AsInt() == 1;
+    }
+
+    /// <summary>PFADD 批量添加多个元素。</summary>
+    async bool PfAddMultipleAsync(string key, List<string> elements) {
+        if (elements == null || elements.Count == 0) { return false; }
+        List<string> args = new List<string>{ "PFADD", key };
+        for (int i = 0; i < elements.Count; i = i + 1) {
+            args.Add(elements[i]);
+        }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsInt() == 1;
+    }
+
+    /// <summary>PFCOUNT 返回近似基数。</summary>
+    async long PfCountAsync(string key) {
+        RedisReply r = await this.CommandAsync2("PFCOUNT", key);
+        return r.AsLong();
+    }
+
+    /// <summary>PFCOUNT 批量合并计算多个键的近似基数。</summary>
+    async long PfCountMultipleAsync(List<string> keys) {
+        if (keys == null || keys.Count == 0) { return 0; }
+        List<string> args = new List<string>{ "PFCOUNT" };
+        for (int i = 0; i < keys.Count; i = i + 1) { args.Add(keys[i]); }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    /// <summary>PFMERGE 合并多个源 HyperLogLog 到目标键。</summary>
+    async bool PfMergeAsync(string destKey, List<string> sourceKeys) {
+        if (sourceKeys == null || sourceKeys.Count == 0) { return false; }
+        List<string> args = new List<string>{ "PFMERGE", destKey };
+        for (int i = 0; i < sourceKeys.Count; i = i + 1) { args.Add(sourceKeys[i]); }
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsString() == "OK";
+    }
+
+    // ========================================================================
+    // 发布与订阅 (Pub / Sub)
+    // ========================================================================
+
+    /// <summary>PUBLISH 向指定频道发布消息，返回接收到消息的订阅者数量。</summary>
+    async long PublishAsync(string channel, string message) {
+        List<string> args = new List<string>{ "PUBLISH", channel, message };
+        RedisReply r = await this.CommandAsync(args);
+        return r.AsLong();
+    }
+
+    // ========================================================================
+    // 服务端与系统管理 (Server & System)
+    // ========================================================================
+
+    /// <summary>DBSIZE 返回当前数据库中的键数量。</summary>
+    async long DbSizeAsync() {
+        RedisReply r = await this.CommandAsync1("DBSIZE");
+        return r.AsLong();
+    }
+
+    /// <summary>FLUSHDB 清空当前逻辑数据库。</summary>
+    async bool FlushDbAsync() {
+        RedisReply r = await this.CommandAsync1("FLUSHDB");
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>FLUSHALL 清空所有逻辑数据库。</summary>
+    async bool FlushAllAsync() {
+        RedisReply r = await this.CommandAsync1("FLUSHALL");
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>TIME 获取服务器时间（[0]为秒，[1]为微秒）。</summary>
+    async List<string> TimeAsync() {
+        RedisReply r = await this.CommandAsync1("TIME");
+        return r.AsListString();
+    }
+
+    /// <summary>INFO 获取服务器信息与统计数据。</summary>
+    async string InfoAsync() {
+        RedisReply r = await this.CommandAsync1("INFO");
+        return r.AsString();
+    }
+
+    /// <summary>INFO 获取指定节的服务器信息。</summary>
+    async string InfoAsync(string section) {
+        RedisReply r = await this.CommandAsync2("INFO", section);
+        return r.AsString();
+    }
+
+    /// <summary>BGSAVE 异步将数据库保存到磁盘。</summary>
+    async string BgSaveAsync() {
+        RedisReply r = await this.CommandAsync1("BGSAVE");
+        return r.AsString();
+    }
+
+    /// <summary>LASTSAVE 返回最近一次成功将数据保存到磁盘的 UNIX 时间戳。</summary>
+    async long LastSaveAsync() {
+        RedisReply r = await this.CommandAsync1("LASTSAVE");
+        return r.AsLong();
+    }
+
+    // ========================================================================
+    // 状态与辅助
+    // ========================================================================
 
     /// <summary>返回最近记录到的服务器错误消息（如有）。</summary>
     string GetLastError() {
@@ -750,6 +1830,9 @@ class RedisClient {
 
     /// <summary>已连接则返回 true。</summary>
     bool IsConnected() {
+        if (this.pool != null) {
+            return !this.pool.IsClosed();
+        }
         return this.connected;
     }
 }

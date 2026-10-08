@@ -1,19 +1,20 @@
 // ============================================================================
-// Redis（RESP 协议，纯 Zan 实现）—— 缓存、计数器、过期、通用命令示例
+// Redis（RESP 协议，FreeRedis 风格强类型客户端）—— 缓存、哈希、列表、集合与排行榜示例
 // ----------------------------------------------------------------------------
 // 演示内容：
-//   1. RedisClient.ConnectAsync 异步连接（挂起在 IO reactor，不阻塞线程）
-//   2. 便捷方法：SetAsync / GetAsync / DelAsync / ExistsAsync /
-//      IncrAsync / ExpireAsync / PingAsync（AuthAsync / SelectAsync 备用）
-//   3. CommandAsync 家族发送任意 Redis 命令（HSET/HGET、LPUSH/LRANGE 等），
-//      RedisReply 按类型读取（kind/str/num/元素列表）
-//   4. 典型缓存模式：cache-aside（先查缓存，未命中回源再回填 + 过期时间）
+//   1. FreeRedis 规范连接：支持连接字符串 "127.0.0.1:6379,poolsize=10" 自动池化
+//   2. 字符串与缓存：SetAsync / GetAsync / ExistsAsync / DelAsync / IncrAsync / ExpireAsync
+//   3. 哈希：HSetAsync / HGetAsync / HGetAllAsync（告别手动拼 HSET / HGET 命令）
+//   4. 列表：RPushAsync / LRangeAsync（直接返回 List<string>）
+//   5. 集合与有序集合：SAddAsync / SMembersAsync / ZAddAsync / ZRangeWithScoresAsync
+//   6. 典型缓存模式：cache-aside（先查缓存，未命中回源再回填 + 过期时间）
 //
 // 说明：本示例需要一个可连接的 Redis。没有可用服务时会打印提示并跳过。
 // 运行：build/zanc examples/db/redis_cache.zan --auto-stdlib -o redis_cache.exe
 // 准备：docker run -p 6379:6379 redis:7
 // ============================================================================
 using System;
+using System.Collections.Generic;
 using System.Data.Redis;
 
 class Program {
@@ -21,16 +22,15 @@ class Program {
     static async string LoadUserName(RedisClient r, int userId) {
         string key = "user:" + Convert.ToString(userId) + ":name";
         string cached = await r.GetAsync(key);
-        if (cached != null) { return cached + " (cache)"; }
+        if (cached != null && cached.Length > 0) { return cached + " (cache)"; }
         string fresh = "Alice#" + Convert.ToString(userId);   // 假装查了数据库
-        bool ok = await r.SetAsync(key, fresh);
-        int e = await r.ExpireAsync(key, 60);                 // 60 秒过期
+        bool ok = await r.SetAsync(key, fresh, 60);           // 60 秒过期原子设置
         return fresh + " (db)";
     }
 
     static async int Run() {
-        // ---- 1. 连接 -----------------------------------------------------------
-        RedisClient r = await RedisClient.ConnectAsync("127.0.0.1", 6379);
+        // ---- 1. 连接（FreeRedis 规范，自动池化） ---------------------------------
+        RedisClient r = new RedisClient("127.0.0.1:6379,poolsize=10");
         bool alive = await r.PingAsync();
         if (!alive) {
             Console.WriteLine("Redis 未就绪，跳过示例。启动方法: docker run -p 6379:6379 redis:7");
@@ -44,40 +44,42 @@ class Program {
         Console.WriteLine("del: " + Convert.ToString(await r.DelAsync("greeting")));
 
         // ---- 3. 计数器：INCR + EXPIRE（限流、PV 统计的基本件） -------------------
-        int d1 = await r.DelAsync("page:home:pv");
+        await r.DelAsync("page:home:pv");
         Console.WriteLine("pv: " + Convert.ToString(await r.IncrAsync("page:home:pv")));
         Console.WriteLine("pv: " + Convert.ToString(await r.IncrAsync("page:home:pv")));
-        int e1 = await r.ExpireAsync("page:home:pv", 3600);
+        await r.ExpireAsync("page:home:pv", 3600);
 
-        // ---- 4. 任意命令：哈希 / 列表 --------------------------------------------
-        List<string> hset = new List<string>();
-        hset.Add("HSET"); hset.Add("user:1");
-        hset.Add("name"); hset.Add("Alice");
-        hset.Add("age"); hset.Add("30");
-        RedisReply h = await r.CommandAsync(hset);
-        RedisReply age = await r.CommandAsync3("HGET", "user:1", "age");
-        Console.WriteLine("hget age: " + age.AsString());
+        // ---- 4. 哈希：强类型调用，彻底告别手拼命令 ------------------------------
+        await r.HSetAsync("user:1", "name", "Alice");
+        await r.HSetAsync("user:1", "age", "30");
+        string age = await r.HGetAsync("user:1", "age");
+        Console.WriteLine("hget age: " + age);
 
-        List<string> lpush = new List<string>();
-        lpush.Add("RPUSH"); lpush.Add("queue:jobs"); lpush.Add("job-a"); lpush.Add("job-b");
-        RedisReply l1 = await r.CommandAsync(lpush);
-        List<string> lrange = new List<string>();
-        lrange.Add("LRANGE"); lrange.Add("queue:jobs"); lrange.Add("0"); lrange.Add("-1");
-        RedisReply jobs = await r.CommandAsync(lrange);
-        // ARRAY 回复：Count/At 遍历元素。
-        Console.WriteLine("jobs: " + Convert.ToString(jobs.Count())
-            + " first=" + jobs.At(0).AsString());
+        Dictionary<string, string> userMap = await r.HGetAllAsync("user:1");
+        Console.WriteLine("hgetall: name=" + userMap["name"] + ", age=" + userMap["age"]);
 
-        // ---- 5. cache-aside 模式 ---------------------------------------------------
-        int d2 = await r.DelAsync("user:42:name");
+        // ---- 5. 列表：RPushAsync 与 LRangeAsync 直接获取 List<string> -----------
+        await r.RPushAsync("queue:jobs", "job-a");
+        await r.RPushAsync("queue:jobs", "job-b");
+        List<string> jobs = await r.LRangeAsync("queue:jobs", 0, -1);
+        Console.WriteLine("jobs: " + Convert.ToString(jobs.Count) + " first=" + jobs[0]);
+
+        // ---- 6. 有序集合与排行榜 (ZSet) -------------------------------------------
+        await r.ZAddAsync("leaderboard", 100.0, "player-tom");
+        await r.ZAddAsync("leaderboard", 95.5, "player-jerry");
+        List<ZMember> top = await r.ZRevRangeWithScoresAsync("leaderboard", 0, 5);
+        if (top.Count > 0) {
+            Console.WriteLine("top player: " + top[0].member + " score=" + Convert.ToString(top[0].score));
+        }
+
+        // ---- 7. cache-aside 模式 ---------------------------------------------------
+        await r.DelAsync("user:42:name");
         Console.WriteLine("first : " + await LoadUserName(r, 42));   // 未命中 -> db
         Console.WriteLine("second: " + await LoadUserName(r, 42));   // 命中 -> cache
 
         // ---- 清理 -------------------------------------------------------------------
-        List<string> cleanup = new List<string>();
-        cleanup.Add("DEL"); cleanup.Add("page:home:pv"); cleanup.Add("user:1");
-        cleanup.Add("queue:jobs"); cleanup.Add("user:42:name");
-        RedisReply c = await r.CommandAsync(cleanup);
+        List<string> cleanup = new List<string>{ "page:home:pv", "user:1", "queue:jobs", "user:42:name", "leaderboard" };
+        await r.DelMultipleAsync(cleanup);
         r.Close();
         Console.WriteLine("done");
         return 0;

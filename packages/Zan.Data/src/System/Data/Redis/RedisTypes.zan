@@ -1,0 +1,165 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Data.Redis;
+
+/// <summary>Redis 键值对实体（用于 MSET / HMSET 等批量操作）。</summary>
+class RedisEntry {
+    public string key;
+    public string value;
+
+    public RedisEntry(string key, string value) {
+        this.key = key;
+        this.value = value;
+    }
+}
+
+/// <summary>有序集合 (Sorted Set / ZSet) 的成员与分数实体。</summary>
+class ZMember {
+    public string member;
+    public double score;
+
+    public ZMember(string member, double score) {
+        this.member = member;
+        this.score = score;
+    }
+}
+
+/// <summary>SCAN / HSCAN / SSCAN / ZSCAN 迭代游标与结果集。</summary>
+class RedisScanResult {
+    public long cursor;
+    public List<string> items;
+
+    public RedisScanResult(long cursor, List<string> items) {
+        this.cursor = cursor;
+        this.items = items;
+    }
+}
+
+/// <summary>
+/// Redis 连接配置项与连接字符串解析器（对标 FreeRedis ConnectionStringBuilder 规范）。
+///
+/// 支持格式：
+/// 1. 标准属性串："127.0.0.1:6379,password=123,defaultDatabase=1,poolsize=20,ssl=true,connectTimeout=3000"
+/// 2. 简单主机端口："127.0.0.1:6379" 或 "localhost"
+/// 3. URI 协议串："redis://:mypassword@127.0.0.1:6379/1" 或 "rediss://..." (SSL)
+/// </summary>
+class RedisOptions {
+    public string host;
+    public int port;
+    public string password;
+    public string user;
+    public int database;
+    public int poolSize;
+    public bool ssl;
+    public int connectTimeoutMs;
+
+    public RedisOptions() {
+        this.host = "127.0.0.1";
+        this.port = 6379;
+        this.password = "";
+        this.user = "";
+        this.database = 0;
+        this.poolSize = 10;
+        this.ssl = false;
+        this.connectTimeoutMs = 3000;
+    }
+
+    /// <summary>从连接字符串解析配置。</summary>
+    public static RedisOptions Parse(string connectionString) {
+        RedisOptions opt = new RedisOptions();
+        if (connectionString == null || connectionString.Length == 0) {
+            return opt;
+        }
+
+        string str = connectionString.Trim();
+        if (str.StartsWith("redis://") || str.StartsWith("rediss://")) {
+            opt.parseUri(str);
+            return opt;
+        }
+
+        // 逗号分隔的键值串：首段可能是 host:port，后续为 key=value
+        List<string> parts = str.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string p = parts[i].Trim();
+            if (p.Length == 0) { continue; }
+
+            int eq = p.IndexOf("=");
+            if (eq < 0) {
+                // 没有等号，判定为主机端口
+                opt.parseHostPort(p);
+            } else {
+                string k = p.Substring(0, eq).Trim().ToLower();
+                string v = p.Substring(eq + 1).Trim();
+                if (k == "host" || k == "server") {
+                    opt.host = v;
+                } else if (k == "port") {
+                    opt.port = Convert.ToInt(v);
+                } else if (k == "password" || k == "pwd" || k == "pass") {
+                    opt.password = v;
+                } else if (k == "user" || k == "username") {
+                    opt.user = v;
+                } else if (k == "defaultdatabase" || k == "database" || k == "db") {
+                    opt.database = Convert.ToInt(v);
+                } else if (k == "poolsize" || k == "maxpoolsize" || k == "pool") {
+                    opt.poolSize = Convert.ToInt(v);
+                } else if (k == "ssl" || k == "tls") {
+                    opt.ssl = (v == "true" || v == "1" || v.ToLower() == "yes");
+                } else if (k == "connecttimeout" || k == "timeout" || k == "connecttimeoutms") {
+                    opt.connectTimeoutMs = Convert.ToInt(v);
+                }
+            }
+        }
+        return opt;
+    }
+
+    void parseHostPort(string hp) {
+        int colon = hp.IndexOf(":");
+        if (colon >= 0) {
+            this.host = hp.Substring(0, colon).Trim();
+            string portStr = hp.Substring(colon + 1).Trim();
+            if (portStr.Length > 0) {
+                this.port = Convert.ToInt(portStr);
+            }
+        } else {
+            this.host = hp;
+        }
+    }
+
+    void parseUri(string uri) {
+        string rest = uri;
+        if (rest.StartsWith("rediss://")) {
+            this.ssl = true;
+            rest = rest.Substring(9);
+        } else if (rest.StartsWith("redis://")) {
+            rest = rest.Substring(8);
+        }
+
+        // 解析 auth: [user:password@]host[:port][/db]
+        int atIdx = rest.IndexOf("@");
+        if (atIdx >= 0) {
+            string authPart = rest.Substring(0, atIdx);
+            rest = rest.Substring(atIdx + 1);
+            int colonIdx = authPart.IndexOf(":");
+            if (colonIdx >= 0) {
+                this.user = authPart.Substring(0, colonIdx);
+                this.password = authPart.Substring(colonIdx + 1);
+            } else {
+                this.password = authPart;
+            }
+        }
+
+        // 解析路径中的 db: host[:port][/db]
+        int slashIdx = rest.IndexOf("/");
+        if (slashIdx >= 0) {
+            string dbStr = rest.Substring(slashIdx + 1);
+            rest = rest.Substring(0, slashIdx);
+            if (dbStr.Length > 0) {
+                this.database = Convert.ToInt(dbStr);
+            }
+        }
+
+        // 剩余为主机与端口
+        this.parseHostPort(rest);
+    }
+}
