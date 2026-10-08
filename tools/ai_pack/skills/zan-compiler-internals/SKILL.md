@@ -3297,3 +3297,26 @@ not be resolved to any callable`，且**位置错挂到项目里另一个文件�
 定式：访问器机械改写必须以 grep 收尾——`grep -nE "fsql\.[A-Z][A-Za-z]*\.(Count|ToList|Insert|Update)"`
 （大写开头的访问器形态）必须零命中；见到"任意文件 0:0 的 callable
 解析失败"先怀疑某处访问器/降级语法打在错误接收者类型上，别信报错位置。
+
+## 显式类型实参是重载身份的一部分：checker 与 irgen 必须同口径过滤（FreeRedis GetAsync<T> 实录，2026-10-08）
+
+- **症状**：`cli.GetAsync<User>("k")` checker 通过、运行时返回 null/垃圾
+  （`null reference where a string/byte buffer is required`），且**只在
+  非泛型同名同参重载声明在前时发生**——声明顺序敏感，泛型在前则一切
+  正常（最小二元探针一眼复现）。
+- **根因**：泛型方法的类型参数个数是重载身份的一部分（C# CS0111 豁免
+  `M(string)` vs `M<T>(string)` 同参共存）。checker 按
+  `type_args.count == type_params.count` 过滤候选并代入返回类型，irgen
+  的 `resolve_overload`/`resolve_overload_typed` 却只按实参类型打分——
+  两个同 arity 候选打分并列时按声明顺序取首，泛型调用被发射到
+  `string` 签名上而静态类型已是 `User`。**两阶段对同一调用选出不同
+  重载 = checker 算的类型与 irgen 发射的签名不一致 = 错编译**。
+- **修法**：irgen 两处候选循环加同一过滤
+  （`type_arg_count > 0 && type_params.count != type_arg_count → continue`），
+  `resolve_overload` 加 type-arg 计数参数贯通接口分发；binder 重复方法
+  判定同步把 `type_params.count` 计入等价比较，否则 `M<T>` 与 `M`
+  同名共存直接报 duplicate method 声明不出去。
+- **铁律**：checker 与 irgen 是同一决定的两次实现——改任何重载解析口径
+  （arity、类型实参、params 尾、默认参数）必须两处同提交落地，并补一条
+  "显式类型实参选中泛型重载"的 conformance（**非泛型声明在前**的顺序
+  必须在内，这是唯一能暴露本缺陷的形状）。
