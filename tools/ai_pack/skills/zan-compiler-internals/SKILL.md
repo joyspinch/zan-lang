@@ -613,6 +613,22 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   回归锁：conformance_gui_design_palette（设计文档放全 25 个
   展示/工控 kind + 探针侧 Tag/Led/Dropdown 三个同名用户类）。
 
+## 简单名同名劫持：using 导入的 stdlib 类压过另一 using 里的业务同名类（MarkdownLite，2026-10-08）
+
+- **症状**：业务包新增 `class Markdown`（`ZanWeb.Web`），调用方文件同时
+  `using System.Text;`（stdlib 有同名类）与 `using ZanWeb.Web;`，裸名
+  `Markdown.Html(...)` 绑到 stdlib 类，报
+  `type 'System.Text.System_Text_Markdown' has no member 'Html'`——
+  业务自己的同名类不赢，错误里的全限定名还指错方向。
+- **根因**：多个 using 导入的命名空间各有一个同名类型时，简单名解析
+  不保证"离调用方更近"的业务命名空间优先，命中取决于实现顺序，业务类
+  可能成为输家。（上一节的镜像：那是生成器发射限定名被用户同名类击穿，
+  这是业务源码裸名被 stdlib 同名类击穿。）
+- **修法/纪律**：业务/框架类起名避开 stdlib 高频通用名（Markdown/Fmt/
+  Text 级别的词），消费方零改动即可解析；靠调 using 顺序或写全限定名
+  都是把雷埋给下一个文件。坑出处：Mvc 包 golden 4/4 编译失败，
+  改名 MarkdownLite 后即愈。
+
 ## 嵌套类型提升：hoist 拿走 AST 嵌套关系，binder 必须挂回宿主 members[]（namespace_qualified_call，2026-09-23）
 
 - **症状**：`class Outer { public class Inner { ... } }` + `Outer.Inner.Value()`
