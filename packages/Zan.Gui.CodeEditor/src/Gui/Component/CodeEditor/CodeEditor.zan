@@ -10,7 +10,7 @@ namespace Gui.Component.CodeEditor;
 /// <summary>一行的缓存语法高亮：计算所用的源码
 /// 及并行的 token/颜色段，未变化的行在每次重绘时不会被
 /// 重新分词（和重新分配）。`blockOpen` 记录
-/// 该行是否以未闭合的 /* 块注释结尾，
+/// 该行是否以未闭合的块注释结尾，
 /// 下一行继承它作为起始状态。</summary>
 class CeHlLine {
     string src;
@@ -445,6 +445,16 @@ partial class CodeEditor {
     // ---- 多光标（次要光标，各在不同行） ----
     List<Caret> carets;
 
+    // ---- 光标括号配对（主光标紧邻的括号与其配偶） ----
+    // 记忆键 = (光标行, 光标列, textVersion)：光标没动、文档没变
+    // 的帧直接复用记忆，键入或移动光标才重扫。无配对时
+    // bpMLine < 0；有选择时整体不判不画。
+    int bpALine;
+    int bpACol;
+    int bpMLine;
+    int bpMCol;
+    string bpMemoKey;
+
     // ---- 剪贴板与撤销 ----
     string clipboard;
     /// 剪切 / 复制 / 粘贴 / 全选已经在按键事件里做过了，后面紧跟的
@@ -603,6 +613,8 @@ partial class CodeEditor {
     // （// / -- / #）和块注释形式，使内嵌的 .lua/.py 脚本不会
     // 按 Zan 高亮，Ctrl+/ 也插入该语言的注释符。
     int syntaxLang;
+    int textMemoStamp = 0 - 1;
+    string textMemo = "";
 
     /// 设置本缓冲区的语法语言（0=Zan、1=Lua、2=Python）。语言
     /// 变化时丢弃按行高亮缓存，使已绘制的行按新语言重新分词。
@@ -612,6 +624,7 @@ partial class CodeEditor {
         if (v == syntaxLang) { return; }
         syntaxLang = v;
         hlCache = new List<CeHlLine>();
+        RequestAnalysis();
     }
 
     /// 当前语法语言（0=Zan、1=Lua、2=Python）。
@@ -718,6 +731,11 @@ partial class CodeEditor {
         this.lastScrollMs = 0;
         this.wheelAccum = 0;
         this.carets = new List<Caret>();
+        this.bpALine = 0 - 1;
+        this.bpACol = 0 - 1;
+        this.bpMLine = 0 - 1;
+        this.bpMCol = 0 - 1;
+        this.bpMemoKey = null;
         this.clipboard = "";
         this.undoStack = new List<EditSnapshot>();
         this.redoStack = new List<EditSnapshot>();
@@ -810,6 +828,8 @@ partial class CodeEditor {
         textVersion = textVersion + 1;
         hoverLspMemo = null;
         signatureLspMemo = null;
+        InvalidateDiagStale();
+        RequestAnalysis();
         if (foldRegions != null) {
             for (int i = 0; i < foldRegions.Count; i = i + 1) {
                 foldRegions[i].folded = false;
@@ -830,7 +850,12 @@ partial class CodeEditor {
 
     /// 全部文本（行以 '\n' 连接）。
     string GetText() {
-        return string.Join("\n", lines);
+        int stamp = TextStamp();
+        if (textMemoStamp != stamp) {
+            textMemo = string.Join("\n", lines);
+            textMemoStamp = stamp;
+        }
+        return textMemo;
     }
 
     /// O(1) 内容版本号：文本实际变更时才递增，
@@ -962,8 +987,7 @@ partial class CodeEditor {
         selActive = false;
     }
 
-    /// 缓冲区总大小，仅用作使编译器诊断失效的廉价变化信号
-    /// （用户编辑文件时）。
+    /// 同步查询缓冲区总大小；诊断失效使用 O(1) 的 TextStamp。
     int BufLen() {
         int n = 0;
         for (int i = 0; i < lines.Count; i = i + 1) { n = n + lines[i].Length + 1; }
@@ -976,7 +1000,7 @@ partial class CodeEditor {
     /// 当编译成功（diagnostics 为空）时，清空启发式扫描的假阳性错误，保证与编译器一致。
     void SetCompilerDiagnostics(List<Diagnostic> diagnostics) {
         compErrors = diagnostics;
-        cErrStamp = BufLen();
+        cErrStamp = TextStamp();
         diagStaleFrame = 0 - 1;
         if (compErrors.Count > 0) {
             GoToLine(compErrors[0].line);
@@ -992,7 +1016,7 @@ partial class CodeEditor {
     bool CompilerDiagStale() {
         if (diagStaleFrame == 0) { return false; }
         if (diagStaleFrame == 1) { return true; }
-        bool stale = cErrStamp < 0 || BufLen() != cErrStamp;
+        bool stale = cErrStamp < 0 || TextStamp() != cErrStamp;
         diagStaleFrame = 0;
         if (stale) { diagStaleFrame = 1; }
         return stale;
@@ -2024,11 +2048,13 @@ partial class CodeEditor {
     /// 的闭合各报一条）、`using` 行缺分号，最后由
     /// AnalyzeMissingUsings 标记使用了却未导入的 stdlib 类型。
     void CheckErrors() {
+        if (analysisApp != null) { RequestAnalysis(); return; }
         errors = new List<Diagnostic>();
         EnsureLineScan();
         int braceDepth = 0;
         int parenDepth = 0;
         for (int li = 0; li < lines.Count; li = li + 1) {
+            if (AnalysisCancelled()) { return; }
             braceDepth = braceDepth + ceLineCaches[li].brace;
             parenDepth = parenDepth + ceLineCaches[li].paren;
             if (braceDepth < 0) {
@@ -2117,6 +2143,202 @@ partial class CodeEditor {
         if (CodeEditor.StartsWithP(tr, "using ")
             && tr.Substring(tr.Length - 1, 1) != ";") {
             ceLineCaches[li].usingBad = 1;
+        }
+    }
+
+    // ---- 光标括号配对 ------------------------------------------------
+
+    /// (line,col) 之前的词法前缀是否把该格落在字符串/注释里。
+    /// 只对本行从行首正走一遍：字符串含转义，Zan 也有块注释；
+    /// 跨行块注释的状态不回溯（锚点在多行注释里的场景罕见，
+    /// 误判代价只是少/多画一枚高亮框）。Lua/Python 的行注释
+    /// 引导符与单引号字符串随 syntaxLang 切换，同高亮分词器。
+    bool BracketInsideLexeme(int line, int col) {
+        string s = lines[line];
+        bool inStr = false;
+        bool inBlock = false;
+        int ci = 0;
+        while (ci < s.Length && ci < col) {
+            int ch = s[ci];
+            if (inBlock) {
+                if (ch == 42 && ci + 1 < s.Length && s[ci + 1] == 47) {
+                    inBlock = false;
+                    ci = ci + 2;
+                    continue;
+                }
+                ci = ci + 1;
+                continue;
+            }
+            if (inStr) {
+                if (ch == 92 && ci + 1 < s.Length) { ci = ci + 2; continue; }
+                if (ch == 34) { inStr = false; }
+                ci = ci + 1;
+                continue;
+            }
+            if (syntaxLang == 0 && ch == 47 && ci + 1 < s.Length) {
+                if (s[ci + 1] == 47) { return true; }   // // 到行尾全是注释
+                if (s[ci + 1] == 42) { inBlock = true; ci = ci + 2; continue; }
+            }
+            if (syntaxLang == 1 && ch == 45 && ci + 1 < s.Length
+                && s[ci + 1] == 45) { return true; }
+            if (syntaxLang == 2 && ch == 35) { return true; }
+            if (ch == 34 || (ch == 39 && syntaxLang > 0)) {
+                int q = ch;
+                ci = ci + 1;
+                while (ci < s.Length) {
+                    if (s[ci] == 92 && ci + 1 < s.Length) { ci = ci + 2; continue; }
+                    if (s[ci] == q) { ci = ci + 1; break; }
+                    ci = ci + 1;
+                }
+                continue;
+            }
+            ci = ci + 1;
+        }
+        return inStr || inBlock;
+    }
+
+    /// 从 (line,col) 处的开括号向下找配对的闭括号。词法跳过：
+    /// 行字符串（含转义）、行注释、Zan 的 /*…*/（跨行状态从
+    /// 锚点起算）。命中写入 bpMLine/bpMCol。
+    bool ScanPairForward(int line, int col, int open, int close) {
+        int depth = 0;
+        bool inBlock = false;
+        for (int li = line; li < lines.Count; li = li + 1) {
+            string s = lines[li];
+            int ci = li == line ? col : 0;
+            bool inStr = false;
+            while (ci < s.Length) {
+                int ch = s[ci];
+                if (inBlock) {
+                    if (ch == 42 && ci + 1 < s.Length && s[ci + 1] == 47) {
+                        inBlock = false;
+                        ci = ci + 2;
+                        continue;
+                    }
+                    ci = ci + 1;
+                    continue;
+                }
+                if (inStr) {
+                    if (ch == 92 && ci + 1 < s.Length) { ci = ci + 2; continue; }
+                    if (ch == 34) { inStr = false; }
+                    ci = ci + 1;
+                    continue;
+                }
+                if (syntaxLang == 0 && ch == 47 && ci + 1 < s.Length
+                    && s[ci + 1] == 47) { break; }
+                if (syntaxLang == 1 && ch == 45 && ci + 1 < s.Length
+                    && s[ci + 1] == 45) { break; }
+                if (syntaxLang == 2 && ch == 35) { break; }
+                if (syntaxLang == 0 && ch == 47 && ci + 1 < s.Length
+                    && s[ci + 1] == 42) { inBlock = true; ci = ci + 2; continue; }
+                if (ch == 34 || (ch == 39 && syntaxLang > 0)) {
+                    inStr = true;
+                    ci = ci + 1;
+                    continue;
+                }
+                if (ch == open) { depth = depth + 1; }
+                else if (ch == close) {
+                    depth = depth - 1;
+                    if (depth == 0) { bpMLine = li; bpMCol = ci; return true; }
+                }
+                ci = ci + 1;
+            }
+        }
+        return false;
+    }
+
+    /// 从 (line,col) 处的闭括号向上找配对的开括号。字符串/注释
+    /// 状态只有正向才知道：每行先做一遍正向词法收集代码区里的
+    /// 括号列，再按列倒序找配对；块注释状态跨行无法恢复，向上
+    /// 走按普通代码处理（罕见误配的代价只是少画高亮框）。
+    bool ScanPairBackward(int line, int col, int open, int close) {
+        int depth = 0;
+        for (int li = line; li >= 0; li = li - 1) {
+            string s = lines[li];
+            int maxCi = li == line ? col : s.Length - 1;
+            List<int> markCols = new List<int>();
+            List<int> markChs = new List<int>();
+            bool inStr = false;
+            int ci = 0;
+            while (ci <= maxCi && ci < s.Length) {
+                int ch = s[ci];
+                if (inStr) {
+                    if (ch == 92 && ci + 1 < s.Length) { ci = ci + 2; continue; }
+                    if (ch == 34) { inStr = false; }
+                    ci = ci + 1;
+                    continue;
+                }
+                if (syntaxLang == 0 && ch == 47 && ci + 1 < s.Length
+                    && s[ci + 1] == 47) { break; }
+                if (syntaxLang == 1 && ch == 45 && ci + 1 < s.Length
+                    && s[ci + 1] == 45) { break; }
+                if (syntaxLang == 2 && ch == 35) { break; }
+                if (ch == 34 || (ch == 39 && syntaxLang > 0)) {
+                    inStr = true;
+                    ci = ci + 1;
+                    continue;
+                }
+                if (ch == open || ch == close) {
+                    markCols.Add(ci);
+                    markChs.Add(ch);
+                }
+                ci = ci + 1;
+            }
+            for (int mi = markCols.Count - 1; mi >= 0; mi = mi - 1) {
+                if (markChs[mi] == close) {
+                    depth = depth + 1;
+                } else {
+                    depth = depth - 1;
+                    if (depth == 0) { bpMLine = li; bpMCol = markCols[mi]; return true; }
+                }
+            }
+        }
+        return false;
+    }
+
+    /// 重算主光标紧邻的括号配对（先看光标左格，输入开括号后
+    /// 光标在其右；再看右格）。记忆键含 textVersion，文档没动、
+    /// 光标没动的帧不重扫。
+    void UpdateBracketPair() {
+        if (selActive || lines == null || curLine < 0 || curLine >= lines.Count) {
+            bpMemoKey = "";
+            bpALine = 0 - 1;
+            bpACol = 0 - 1;
+            bpMLine = 0 - 1;
+            bpMCol = 0 - 1;
+            return;
+        }
+        string key = Convert.ToString(curLine) + "," + Convert.ToString(curCol)
+            + "," + Convert.ToString(textVersion);
+        if (key == bpMemoKey) { return; }
+        bpMemoKey = key;
+        bpALine = 0 - 1;
+        bpACol = 0 - 1;
+        bpMLine = 0 - 1;
+        bpMCol = 0 - 1;
+        string cur = lines[curLine];
+        for (int cand = 0; cand < 2; cand = cand + 1) {
+            int cc = cand == 0 ? curCol - 1 : curCol;
+            if (cc < 0 || cc >= cur.Length) { continue; }
+            int ch = cur[cc];
+            int open = 0;
+            int close = 0;
+            bool fwd = false;
+            if (ch == 40) { open = 40; close = 41; fwd = true; }
+            else if (ch == 41) { open = 40; close = 41; fwd = false; }
+            else if (ch == 91) { open = 91; close = 93; fwd = true; }
+            else if (ch == 93) { open = 91; close = 93; fwd = false; }
+            else if (ch == 123) { open = 123; close = 125; fwd = true; }
+            else if (ch == 125) { open = 123; close = 125; fwd = false; }
+            else { continue; }
+            if (this.BracketInsideLexeme(curLine, cc)) { continue; }
+            bool found = fwd ? this.ScanPairForward(curLine, cc, open, close)
+                : this.ScanPairBackward(curLine, cc, open, close);
+            if (found) {
+                bpALine = curLine;
+                bpACol = cc;
+                return;
+            }
         }
     }
 }

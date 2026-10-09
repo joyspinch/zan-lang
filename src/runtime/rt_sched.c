@@ -1,11 +1,6 @@
-/* rt_sched.c -- Zan M1 coroutine runtime (cooperative, stackful fibers).
- *
- * Single OS thread for M1 (M:1). See rt_sched.h for the compiler-facing ABI.
- * Now integrates with rt_io for async IO multiplexing.
- */
+/* 内部辅助实现 */
 
-/* macOS gates the ucontext routines behind _XOPEN_SOURCE; it must be defined
- * before any system header is pulled in (directly or transitively). */
+/* 内部辅助实现 */
 #if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
 #define _XOPEN_SOURCE 700
 #endif
@@ -32,11 +27,7 @@
 #endif
 #include "../common/host_oom.h"
 
-/* Per-coroutine stack size. 128 KB by default; ZAN_CO_STACK overrides it in
- * bytes (clamped 64 KB..16 MB). The number is address-space/commit, not
- * resident -- stacks are mmap'd / CreateFiber'd lazily, so a shallow coroutine
- * touches only a few pages. Resolved once on first use; the scheduler is
- * single-threaded (M:1), so no lock is needed. */
+/* Per-coroutine stack size */
 #define ZAN_CO_STACK_DEFAULT (128 * 1024)
 
 static size_t co_stack_size(void) {
@@ -79,12 +70,7 @@ struct zan_task {
 
 /* ---- timers ---- */
 
-/* Timers live in a binary min-heap ordered by due_ms (array of structs, no
- * per-timer allocation). The scheduler calls timers_process() on EVERY loop
- * iteration -- including iterations that only switch coroutines -- so the
- * pending set must be inspectable in O(1); the old unordered head-inserted
- * linked list paid a full O(n) walk plus a clock read per iteration, which
- * degraded to O(n^2) across a scheduling run with many timers. */
+/* 内部辅助逻辑 */
 
 typedef struct zan_timer {
     int64_t     due_ms;
@@ -115,9 +101,7 @@ static void *plat_fiber_new(zan_co_t *co) {
 }
 static void plat_fiber_delete(void *f) { DeleteFiber(f); }
 static void plat_switch(void *to)      { SwitchToFiber(to); }
-/* Windows Sleep takes a DWORD; a scheduler wait beyond that (a saturated
- * INT64_MAX deadline minus now) must clamp, not truncate modulo 2^32 --
- * 0xFFFFFFFE ms would silently become ~49.7 days' worth of wrong residue. */
+/* 内部辅助实现 */
 #define ZAN_SLEEP_MS_MAX ((int64_t)0x7FFFFFFF)
 static void plat_sleep(int64_t ms) {
     if (ms < 0) ms = 0;
@@ -137,11 +121,7 @@ static void co_trampoline_posix(unsigned ptr);
 
 typedef struct { ucontext_t ctx; char *stack; } posix_fiber_t;
 
-/* Coroutine stacks come from a pool instead of a malloc/free per spawn: a
- * server that spawns thousands of short coroutines otherwise pays a 128 KB
- * allocation per coroutine. Each stack has a PROT_NONE guard page at its low
- * end, so an overflow faults immediately instead of corrupting adjacent
- * memory. The scheduler is single-threaded (M:1), so the pool needs no lock. */
+/* 内部辅助实现 */
 #define ZAN_CO_STACK_POOL_MAX 256
 
 static void *g_stack_pool;
@@ -188,8 +168,7 @@ static void *plat_fiber_new(zan_co_t *co) {
     pf->ctx.uc_stack.ss_sp = pf->stack;
     pf->ctx.uc_stack.ss_size = co_stack_size();
     pf->ctx.uc_link = &g_sched_ctx;
-    /* makecontext passes int-sized args; split the co pointer across two on 64-bit.
-     * The trampoline reconstructs it, so each fiber runs its own body. */
+    /* makecontext passes int-sized args; split the co pointer across two on 64-bit */
 #if UINTPTR_MAX > 0xFFFFFFFFu
     uintptr_t p = (uintptr_t)co;
     makecontext(&pf->ctx, (void (*)(void))co_trampoline_posix, 2,
@@ -206,9 +185,7 @@ static void plat_fiber_delete(void *f) {
     free(pf);
 }
 static void plat_switch(void *to) {
-    /* Only ever called by the scheduler to enter a coroutine, so the state
-     * we save is the scheduler's; the coroutine returns here via
-     * switch_to_sched (swap co <-> g_sched_ctx). */
+    /* 内部辅助实现 */
     swapcontext(&g_sched_ctx, &((posix_fiber_t *)to)->ctx);
 }
 static void plat_sleep(int64_t ms) {
@@ -266,10 +243,7 @@ static void complete_task(zan_task_t *t, int64_t result) {
     if (t->completed) return;
     t->result = result;
     t->completed = 1;
-    /* Wake every awaiter, not just one: several coroutines may await the same
-     * task, and a single waiter slot silently strands all but one -- they
-     * never reach the ready queue again and g_live never drops. The waiters
-     * list is LIFO, so reverse it first to resume in park order (FIFO). */
+    /* 内部辅助实现 */
     zan_co_t *w = t->waiters;
     t->waiters = NULL;
     zan_co_t *rev = NULL;
@@ -287,30 +261,21 @@ static void complete_task(zan_task_t *t, int64_t result) {
     }
 }
 
-/* Detach and free a task the caller no longer references. Tasks stay alive
- * after completion so zan_task_result remains readable for as long as the
- * caller needs it; release is the call that declares "done". Safe to call
- * from any coroutine after its await on the task returned, and idempotent:
- * releasing an already-released (or never-tracked) pointer is a no-op. */
+/* Detach and free a task the caller no longer references */
 void zan_task_release(zan_task_t *task) {
     if (!task) return;
     zan_task_t **pp = &g_all_tasks;
     while (*pp && *pp != task) pp = &(*pp)->all_next;
     if (!*pp) return;   /* already released: ignore */
     if (!task->completed) {
-        /* Contract violation and a latent use-after-free: a delay timer still
-         * points at this task (timers_process would complete_task into freed
-         * memory), its coroutine may not have run out, or another coroutine
-         * is parked in await reading its result. There is no safe early
-         * release -- refuse loudly instead of corrupting the heap. */
+        /* 内部辅助实现 */
         zan_rt_fatal("sched", "task released before completion");
     }
     *pp = task->all_next;
     free(task);
 }
 
-/* Number of task objects still tracked (live or completed but not released).
- * Test/diagnostic hook: with every task released, this is 0 at shutdown. */
+/* Number of task objects still tracked (live or completed but not released) */
 size_t zan_task_live(void) {
     size_t n = 0;
     for (zan_task_t *t = g_all_tasks; t; t = t->all_next) n++;
@@ -329,9 +294,7 @@ static void timer_add(zan_task_t *t, int64_t delay_ms) {
     }
     /* Insert at the end, then sift up toward the root. */
     size_t i = g_timer_n++;
-    /* Saturate instead of wrapping: `plat_now_ms() + INT64_MAX` is UB and
-     * wraps negative, which the due check would read as already-expired.
-     * A deadline this far out is unreachable on any clock anyway. */
+    /* 内部辅助实现 */
     int64_t due;
     if (delay_ms < 0) {
         due = plat_now_ms();
@@ -370,16 +333,13 @@ static void timer_pop_root(void) {
 
 static int64_t timers_process(void) {
     int64_t now = plat_now_ms();
-    /* Complete every due timer. complete_task only parks waiters onto the
-     * ready queue -- it never creates timers and no coroutine runs here, so
-     * the heap cannot change underneath the loop. */
+    /* Complete every due timer */
     while (g_timer_n > 0 && g_timers[0].due_ms <= now) {
         zan_task_t *task = g_timers[0].task;
         timer_pop_root();
         complete_task(task, 0);
     }
-    /* The root is now the nearest deadline; report its delay, or -1 when no
-     * timer is pending (the caller treats that as "wait indefinitely"). */
+    /* 内部辅助实现 */
     return g_timer_n > 0 ? g_timers[0].due_ms - now : -1;
 }
 
@@ -433,10 +393,7 @@ void zan_task_return(zan_task_t *task, int64_t result) {
 int64_t zan_task_await(zan_task_t *task) {
     if (!task) return 0;
     if (!task->completed) {
-        /* Park on the task. A parked coroutine is off the ready queue, so its
-         * `next` link is free to chain the waiter list -- no extra allocation
-         * and no growth of zan_task for the (overwhelmingly common) single
-         * awaiter case. */
+        /* Park on the task */
         g_current->next = task->waiters;
         task->waiters = g_current;
         switch_to_sched();
@@ -462,8 +419,7 @@ int64_t zan_task_result(zan_task_t *task) { return task ? task->result : 0; }
 /* ================= IO integration ================= */
 
 void zan_io_suspend_current(void) {
-    /* The current coroutine is NOT pushed to the ready queue.
-     * It will be resumed by zan_io_resume() when its fd is ready. */
+    /* The current coroutine is NOT pushed to the ready queue */
     if (g_current) {
         switch_to_sched();
     }
@@ -502,11 +458,7 @@ void zan_sched_run(void) {
         /* Poll IO events (non-blocking if we have ready coroutines) */
         zan_co_t *co = ready_pop();
         if (!co) {
-            /* Nothing ready -- block until an IO event or the nearest timer
-             * instead of polling at a fixed 1 ms. -1 waits forever, which is
-             * safe: zan_io_poll sweeps watchers stranded on dead fds before
-             * committing to the wait, and returns immediately when no
-             * watchers are pending. */
+            /* 内部辅助逻辑 */
             int64_t poll_timeout = -1;
             if (next_timer >= 0) poll_timeout = next_timer;
             if (zan_io_has_pending()) {
@@ -516,11 +468,7 @@ void zan_sched_run(void) {
                 plat_sleep(next_timer);
                 continue;
             } else {
-                /* No ready coroutine, no timer and no pending IO: nothing can
-                 * ever wake whatever is still parked, so leaving silently
-                 * turns a lost wakeup into a clean-looking exit with no hint
-                 * of the coroutine that never ran. Say so, and name the count
-                 * so the stranded work is at least diagnosable. */
+                /* 内部辅助实现 */
                 if (g_live > 0) {
                     fprintf(stderr,
                             "zan runtime: %d coroutine(s) parked with no "
@@ -555,8 +503,7 @@ void zan_sched_shutdown(void) {
     zan_task_t *t = g_all_tasks;
     while (t) { zan_task_t *n = t->all_next; free(t); t = n; }
     g_all_tasks = NULL;
-    /* The heap owns its entries inline; freeing the array releases all of
-     * them. Tasks themselves stay in g_all_tasks (already freed above). */
+    /* The heap owns its entries inline; freeing the array releases all of them */
     free(g_timers);
     g_timers = NULL;
     g_timer_n = g_timer_cap = 0;

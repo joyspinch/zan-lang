@@ -1,8 +1,4 @@
-/* apk.c -- one-shot Android APK assembly for zanc (--emit-apk). See apk.h.
- *
- * Everything here runs on the build host with no Android SDK: the shell
- * manifest/dex/arsc are prebuilt, the zip writer is local, and the only
- * external process is Java running the staged apksigner.jar. */
+/* apk */
 
 #include "apk.h"
 
@@ -65,10 +61,7 @@ static uint32_t crc32_buf(const unsigned char *d, size_t n) {
     return c ^ 0xFFFFFFFFu;
 }
 
-/* The manifest and dex are tiny; native libs must be STORED anyway. The
- * fixed-Huffman "stored block" deflate wrapper below emits valid deflate
- * streams for any input without a zlib dependency; apksigner and the Android
- * package parser accept it (compress ratio 1.0). */
+/* The manifest and dex are tiny; native libs must be STORED anyway */
 
 static size_t deflate_store(const unsigned char *in, size_t n,
                             unsigned char **out) {
@@ -110,8 +103,7 @@ typedef struct {
 
 typedef struct {
     buf_t out;
-    zip_ent_t *ents;    /* grown on demand — a fixed cap silently dropped
-                         * entries past it and still shipped the APK */
+    zip_ent_t *ents;    /* 内部辅助逻辑 */
     int nent;
     int cap;
 } zip_t;
@@ -156,9 +148,7 @@ static int zip_add(zip_t *z, const char *name, const unsigned char *data,
 
     e->offset = z->out.len;
     size_t name_len = strlen(name);
-    /* Align a STORED entry's data start by padding before its header. The
-     * very first entry must not be preceded by padding: Android's package
-     * parser requires the file to begin with the local-header magic. */
+    /* Align a STORED entry's data start by padding before its header */
     if (align > 1 && e->method == 0 && z->nent > 0) {
         size_t need = 30 + name_len;
         while ((z->out.len + need) % (size_t)align) buf_u8(&z->out, 0);
@@ -217,24 +207,9 @@ static int zip_finish(zip_t *z) {
     return 0;
 }
 
-/* AXML string-pool patching: the template AndroidManifest.xml is a binary
- * AXML file whose string pool (chunk type 0x0001, UTF-16LE) holds every
- * attribute value; the package name and application label are ordinary
- * strings inside it. Patching = rebuild the pool with the two strings
- * replaced and fix the offsets, plus every chunk size that depends on the
- * pool length (just the root's).
- *
- * Project permissions (zan.proj androidPermissions) are appended as
- * <uses-permission android:name="..."/> element pairs right before the
- * manifest close tag: their name strings go on the pool tail (existing
- * indices stay valid, so the untouched tree chunks need no fixups) and the
- * two 80-byte element chunks (start + end, one "name" attribute typed as a
- * string reference into the new pool slot) are spliced in ahead of the
- * manifest end-element chunk. The resource-id map is keyed by attribute
- * pool index and "name" already exists, so nothing there changes. */
+/* AXML string-pool patching: the template AndroidManifest */
 
-/* ResStringPool length prefix: 8 bits below 128, else two bytes
- * "0x80 | (v >> 8), v & 0xFF". Returns the number of bytes written. */
+/* 内部辅助逻辑 */
 static size_t pool_put_len(unsigned char *out, size_t v) {
     if (v < 128) { out[0] = (unsigned char)v; return 1; }
     out[0] = (unsigned char)(0x80 | (v >> 8));
@@ -242,8 +217,7 @@ static size_t pool_put_len(unsigned char *out, size_t v) {
     return 2;
 }
 
-/* UTF-16 code units of a UTF-8 string (surrogate pairs count as 2) — the
- * value of the u16len prefix on UTF-8 pool entries. */
+/* 内部辅助逻辑 */
 static size_t utf8_utf16_units(const char *s, size_t bytes) {
     size_t units = 0, c = 0;
     while (c < bytes) {
@@ -288,8 +262,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     memcpy(&first_hdr, xml + 10, 2);
     memcpy(&first_size, xml + 12, 4);
     if (first_type != 0x0001 || first_hdr != 28) return -1;
-    /* ResStringPool header at xml+8: type(2) hdrSize(2) size(4) stringCount(4)
-     * styleCount(4) flags(4) stringsStart(4) stylesStart(4) = 28 bytes. */
+    /* 内部辅助逻辑 */
     uint32_t pool_size, str_start;
     uint32_t flags32;
     memcpy(&pool_size, xml + 12, 4);
@@ -307,8 +280,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     const uint32_t *offs = (const uint32_t *)(pool + 28);
     const unsigned char *base = pool + str_start;
 
-    /* extract strings as byte blobs (prefix + data + terminator, raw);
-     * heap tables: 4096 entries x 256B of stack would overflow 1MB stacks */
+    /* 内部辅助逻辑 */
     unsigned char **raw = (unsigned char **)calloc(str_count, sizeof(*raw));
     size_t *raw_len = (size_t *)calloc(str_count, sizeof(*raw_len));
     char (*text)[256] = (char (*)[256])calloc(str_count, 256);
@@ -320,9 +292,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
         size_t n = 0;                 /* string length in pool data units */
         size_t rl;                    /* raw entry: prefixes + data + term */
         if (utf8) {
-            /* UTF-8 entries carry TWO length prefixes — UTF-16 unit count
-             * then UTF-8 byte count — each 8-bit, or widened to 16-bit
-             * "0x80 | hi, lo" once the value reaches 128 (aapt2 spec). */
+            /* 内部辅助逻辑 */
             size_t hl2 = 1;
             n = pool[p];
             if (n & 0x80) { n = ((n & 0x7F) << 8) | pool[p + 1]; hl = 2; }
@@ -358,8 +328,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
             text[i][chars] = '\0';
             rl = hl + n * 2 + 2;
         }
-        /* untouched strings must survive the rebuild byte-exact, so keep the
-         * raw entry (prefixes + data + terminator) instead of re-encoding */
+        /* 内部辅助逻辑 */
         raw_len[i] = rl;
         raw[i] = (unsigned char *)malloc(rl);
         if (!raw[i]) zan_host_oom();
@@ -384,8 +353,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
         if (slots[v] < 0) { repl_len[v] = 0; continue; }
         size_t n = strlen(vals[v]);
         if (utf8) {
-            /* spec entry: UTF-16 unit count prefix, UTF-8 byte count prefix,
-             * data, nul — both prefixes widen at 128 */
+            /* 内部辅助逻辑 */
             size_t units = utf8_utf16_units(vals[v], n);
             if (4 + n + 1 > sizeof(repl[v])) {
                 fprintf(stderr, "error: manifest string replacement "
@@ -399,10 +367,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
             repl[v][dl++] = 0;
             repl_len[v] = dl;
         } else {
-            /* pool is UTF-16: decode UTF-8 input to UTF-16LE code units so
-             * non-ASCII labels (zan.proj is UTF-8) survive the patch. Every
-             * input byte expands to at most two output bytes (a 4-byte char
-             * yields a surrogate pair), so 2 + 2n + 2 bounds the entry. */
+            /* 内部辅助逻辑 */
             if (4 + n * 2 > sizeof(repl[v])) {
                 fprintf(stderr, "error: manifest string replacement "
                         "(%zu bytes) exceeds the pool entry buffer\n", n);
@@ -450,8 +415,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
         }
     }
 
-    /* rebuild the pool; new permission strings go on the tail so existing
-     * indices (and therefore the untouched tree chunks) stay valid */
+    /* 内部辅助逻辑 */
     uint32_t new_count = str_count + (uint32_t)nperms;
     buf_t nb; buf_init(&nb);
     uint32_t *new_offs = (uint32_t *)malloc(sizeof(uint32_t) * new_count);
@@ -487,14 +451,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     uint32_t pad = (4 - (new_pool_size % 4)) % 4;
     new_pool_size += pad;
 
-    /* splice <uses-permission> pairs before the manifest end-element chunk.
-     * Tree layout: [resource map][ns][elements...][manifest EL_END][ns_end].
-     * The trailing 24 bytes are the namespace close, NOT the manifest close,
-     * so scan for the last 0x0103 end-element ahead of it and insert there.
-     * Each pair is a 56-byte start element (line numbers zeroed, one
-     * 20-byte string attribute "name" pointing at the permission's pool
-     * slot) plus a 24-byte end element, matching the template's own
-     * uses-permission chunks byte for byte apart from the string index. */
+    /* splice <uses-permission> pairs before the manifest end-element chunk */
     buf_t tree; buf_init(&tree);
     {
         size_t rest_off = 8 + first_size;
@@ -531,8 +488,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
                 buf_u16(&tree, 0);                      /* idIndex */
                 buf_u16(&tree, 0);                      /* classIndex */
                 buf_u16(&tree, 0);                      /* styleIndex */
-                /* attribute: ns=android(33), name="name"(3), raw=slot,
-                 * typed value size 8, type STRING(3), data=slot */
+                /* 内部辅助逻辑 */
                 buf_u32(&tree, 33);
                 buf_u32(&tree, 3);
                 buf_u32(&tree, slot);                   /* raw value index */
@@ -664,10 +620,7 @@ static int find_java(char *out, size_t outsz) {
     return -1;
 }
 
-/* Download url -> path via zan_http_get (winhttp on Windows; the POSIX
- * backend in stdlib_ext.c is a stub that fails fast so the user gets a
- * clear message instead of a hang). Small and synchronous: the jar is
- * ~1 MB. */
+/* 内部辅助逻辑 */
 #include "stdlib_ext.h"
 
 static int download_file(const char *url, const char *path) {
@@ -681,8 +634,7 @@ static int download_file(const char *url, const char *path) {
     return rc;
 }
 
-/* Ensure a usable Java exists; downloads a portable JRE into ~/.zan/java on
- * first use. Returns 0 and fills the java path, or -1 after printing why. */
+/* Ensure a usable Java exists; downloads a portable JRE into ~/ */
 static int ensure_java(char *out, size_t outsz) {
     if (find_java(out, outsz) == 0) return 0;
 
@@ -752,7 +704,7 @@ static int ensure_java(char *out, size_t outsz) {
         fprintf(stderr, "error: could not unpack the downloaded JRE\n");
         return -1;
     }
-    /* adoptium archives as jdk-21.x.y+z-hotspot/ -> rename to a fixed dir */
+    /* adoptium archives as jdk-21 */
     snprintf(cmd, sizeof(cmd),
         "powershell -NoProfile -Command \"$d=Get-ChildItem '%s' -Directory |"
         "Where-Object Name -like 'jdk-*'; if($d){Move-Item -Force $d.FullName '%s\\jre-win'}\"",
@@ -835,8 +787,7 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
         free(man2); free(arsc); free(dex); free(lib);
         return 1;
     }
-    /* launcher icons: every PNG under <shell_dir>/res/ goes in at
-     * res/<dpi-dir>/<name>.png (paths aapt2 precompiled into the arsc) */
+    /* launcher icons: every PNG under <shell_dir>/res/ goes in at res/<dpi-dir>/<name> */
     {
         static const char *dpis[] = { "mipmap-mdpi", "mipmap-hdpi",
             "mipmap-xhdpi", "mipmap-xxhdpi", "mipmap-xxxhdpi" };
@@ -935,9 +886,7 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
           if (cut) { size_t keep = (size_t)(cut - java); snprintf(keytool, sizeof(keytool), "%.*s", (int)keep, java); }
           else snprintf(keytool, sizeof(keytool), "%s", java); }
 #ifdef _WIN32
-        /* system() runs `cmd /c <string>`; a string that both starts and
-         * ends with a quote gets its outer pair stripped, so wrap the whole
-         * command in one extra pair (the classic cmd /c quirk). */
+        /* 内部辅助逻辑 */
         snprintf(cmd, sizeof(cmd), "\"\"%s\\keytool.exe\" -genkeypair -keystore \"%s\""
                  " -storepass android -keypass android -alias zan"
                  " -dname CN=Zan_Debug -keyalg RSA -keysize 2048"
@@ -971,8 +920,7 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
         fprintf(stderr, "error: APK signing failed (apksigner). Run with the"
                 " same command manually for details:\n  java -jar %s sign "
                 "--ks %s --out %s %s\n", signer, ks, apk_path, tmp_apk);
-        /* keep the unsigned package around for post-mortem (AXML parsing,
-         * aapt2 dump) instead of deleting the evidence */
+        /* 内部辅助逻辑 */
         char keep[1400];
         snprintf(keep, sizeof(keep), "%s.unsigned", apk_path);
         remove(keep);

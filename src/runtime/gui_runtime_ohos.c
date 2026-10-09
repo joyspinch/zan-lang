@@ -1,19 +1,4 @@
-/* gui_runtime_ohos.c -- HarmonyOS window/event/present shell (ZAN_GUI_OHOS).
- *
- * Part of the gui_runtime translation unit: #include'd by gui_runtime.c in
- * a fixed order; not compiled standalone. Owns the zan_gui_* window/
- * event/present exports like every platform shell in this family.
- *
- * One window = the XComponent surface the HAP shell attaches via
- * zan_gui_ohos_attach(); the HAP shell feeds touch through
- * zan_gui_ohos_touch(). Present goes through EGL: the composed CPU surface
- * is uploaded as one texture and drawn over the attached native window --
- * the same EGL path every OHOS app can rely on (the raw OH_NativeWindow_*
- * buffer API is not exported by all emulator images, so nothing here may
- * reference those symbols: they would fail the .so's load-time relocation
- * even when never called). Window management exports a desktop GUI needs
- * (minimize/maximize/titlebars/cursors/clipboard/drag-drop/glass) are
- * stubs: a phone app window has no such chrome. */
+/* gui_runtime_ohos */
 
 #ifdef ZAN_GUI_OHOS
 
@@ -25,16 +10,7 @@
 #include <GLES3/gl3.h>
 #include <native_window/external_window.h>
 
-/* ---- NativeWindow direct path, resolved at runtime ----------------------
- * On real devices the fastest present writes the OHNativeWindow BufferQueue
- * directly (RequestBuffer/FlushBuffer, a few ms under EGL's swap on some
- * SoCs). Those symbols are not exported by every image -- the emulator
- * ships no libnative_window.so -- so they are looked up with dlsym instead
- * of linked: an undefined reference would fail the whole library's
- * load-time relocation even when the code path is never taken. The window
- * handle itself comes from the XComponent (the recommended source since
- * the CreateNativeWindow API deprecation). When the lookup fails
- * (emulator), present falls back to EGL below. */
+/* 内部辅助实现 */
 typedef int (*FnNWRequestBuffer)(OHNativeWindow *, OHNativeWindowBuffer **, int *);
 typedef int (*FnNWFlushBuffer)(OHNativeWindow *, OHNativeWindowBuffer *, int, Region *);
 typedef BufferHandle *(*FnNWGetBufferHandle)(OHNativeWindowBuffer *);
@@ -44,10 +20,7 @@ static FnNWFlushBuffer     g_nw_flush;
 static FnNWGetBufferHandle g_nw_getbh;
 static FnNWHandleOpt       g_nw_handleopt;
 
-/* ---- window record -----------------------------------------------------
- * The HAP shell owns the real native window (from the XComponent); we only
- * ever hold the pointer it hands us. The Zan-facing hwnd is this record's
- * address, exactly like every platform shell hands back its window. */
+/* 内部辅助实现 */
 typedef struct {
     void *nw;             /* NULL until the shell attaches the surface */
     int w, h;             /* attached surface size, device pixels */
@@ -59,11 +32,7 @@ typedef struct {
     EGLDisplay egl_dpy;
     EGLSurface egl_surf;
     void      *surf_nw;   /* native window egl_surf was created for */
-    int        surf_w, surf_h; /* size egl_surf was created for: a 2in1
-                                  maximize/drag resizes the SAME window
-                                  (pointer unchanged), so surf_nw alone
-                                  never detects it and swap would keep
-                                  presenting stale-size buffers */
+    int        surf_w, surf_h; /* 内部辅助实现 */
     EGLContext egl_ctx;
     GLuint     gl_prog;
     GLuint     gl_tex;
@@ -77,12 +46,7 @@ static int  g_window_width  = 0;
 static int  g_window_height = 0;
 static int  g_dpi           = 96;
 
-/* ---- event ring --------------------------------------------------------
- * Same flat event protocol as every shell: e[0] kind, e[1] x, e[2] y,
- * e[3] button, e[4] code (keycode / wheel delta), e[5] mods, e[6] flag.
- * Kinds: 0 wake, 1 move, 2 down, 3 up, 7 resize (x=w y=h), 8 close,
- * 13 wheel, 14 surface (re)attached / exposed (full repaint).
- * The HAP shell pushes from the UI thread; the app thread polls. */
+/* 内部辅助实现 */
 typedef struct { int e[8]; iptr win; } zan_oev_t;
 #define ZAN_OQ_CAP 512
 static zan_oev_t g_oq[ZAN_OQ_CAP];
@@ -93,12 +57,7 @@ static int g_pending_event[8];
 static iptr g_event_win = 0;
 static long long g_ev_seq = 0;
 
-/* Plain moves coalesce (freshest x/y wins) and wheel floods coalesce by
- * SUMMING deltas -- same contract across shells. The touch layer emits
- * one wheel per finger sample while the app eats one event per rendered
- * frame, so an un-coalesced wheel backlog lags the page visibly behind the
- * finger on slow-rendering pages (the gallery's glass theme runs ~1-6 fps
- * on the emulator). */
+/* Plain moves coalesce (freshest x/y wins) and wheel floods coalesce by SUMMING deltas -- same contract across shells */
 static void oq_push_locked(int kind, int x, int y, int button, int code, int mods) {
     int last = (g_oq_tail + ZAN_OQ_CAP - 1) % ZAN_OQ_CAP;
     int has_last = (g_oq_head != g_oq_tail);
@@ -142,10 +101,7 @@ EXPORT void zan_gui_ohos_attach(void *nw, int w, int h) {
     g_window_width = w;
     g_window_height = h;
     oq_push_locked(7, w, h, 0, 0, 0);
-    /* Surface (re)attached: every pixel in it is undefined, and an idle
-     * app sitting in WaitEvent would otherwise keep sleeping — minimize/
-     * restore used to leave the page black until the first touch. Kind 14
-     * wakes the loop and forces one full-window repaint. */
+    /* 内部辅助实现 */
     oq_push_locked(14, 0, 0, 0, 0, 0);
     pthread_mutex_unlock(&g_oq_lock);
 
@@ -170,13 +126,7 @@ EXPORT void zan_gui_ohos_attach(void *nw, int w, int h) {
     }
 }
 
-/* Surface gone: the XComponent callback fires on EVERY background cycle
- * (home key, app switch), not just real teardown. Queue nothing here — kind
- * 8 would stop the App loop for good, so restore found nobody polling and
- * the page stayed black. The app just presents no-ops while detached
- * (present returns 1 on !attached); the attach that follows pushes kind 14
- * to repaint. Genuine quit goes through zan_gui_close_window (kind 8) and
- * zan_gui_ohos_shutdown (teardown after zan_hap_main returns). */
+/* Surface gone: the XComponent callback fires on EVERY background cycle (home key, app switch), not just real teardown */
 EXPORT void zan_gui_ohos_detach(void) {
     pthread_mutex_lock(&g_oq_lock);
     g_owin.attached = 0;
@@ -184,14 +134,7 @@ EXPORT void zan_gui_ohos_detach(void) {
     pthread_mutex_unlock(&g_oq_lock);
 }
 
-/* ---- touch gesture synthesis (port of the shared finger layer) -----
- * A phone has no wheel: the first finger's drag beyond an 8 px slop turns
- * into Win32-scale wheel events (kind 13) that move content 1:1 with the
- * finger, a tap under the slop is delivered as a full synthesized click at
- * the anchor, and finger-up with residual speed coasts (fling) through a
- * 16 ms thread until exponential friction eats it. The formulas are the
- * original shell's verbatim, so both phones scroll identically:
- *   wheel degrees = finger dy * 288 / dpi  (sub-degree remainder carries) */
+/* 内部辅助实现 */
 static i64 ohs_tick_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -281,11 +224,7 @@ EXPORT void zan_gui_ohos_touch(int action, int x, int y) {
         g_tg_y = g_tg_ay = (float)y;
         g_tg_hn = 1; g_tg_hi = 1 % OH_TOUCH_HIST;
         g_tg_ht[0] = ohs_tick_ms(); g_tg_hy[0] = g_tg_y;
-        /* Press at finger-down, not at slop-exceed or lift-off: hold
-         * gestures (long-press context menus, press-state feedback on
-         * cells/buttons) need the press while the finger is still down.
-         * A plain move precedes it so hover/enter state settles first.
-         * Mirrors the shared finger layer. */
+        /* 内部辅助实现 */
         oq_push_locked(1, (int)g_tg_ax, (int)g_tg_ay, 0, 0, 0);
         oq_push_locked(2, (int)g_tg_ax, (int)g_tg_ay, 0, 0, 0);
         pthread_mutex_unlock(&g_oq_lock);
@@ -301,16 +240,9 @@ EXPORT void zan_gui_ohos_touch(int action, int x, int y) {
                 return; /* slop: still a tap */
             }
             g_tg_drag = 1;
-            /* The press already went out at finger-down (see action 0), so
-             * a drag on a draggable widget (title bar, slider) is owned by
-             * that widget from the start, while the wheel stream below
-             * keeps scrolling whatever the finger is over. */
+            /* 内部辅助实现 */
         }
-        /* Finger travel -> wheel deltas in the ±120 scale Gui/App's /120
-         * math expects; dragging up must scroll DOWN (content follows the
-         * finger), i.e. negative delta. Sub-degree remainders accumulate
-         * in g_tg_acc -- a per-event (int) cast there made slow drags
-         * stall, then jump. */
+        /* 内部辅助实现 */
         g_tg_acc += (fy - g_tg_y) * 288.0f / (float)g_dpi;
         int delta = (int)g_tg_acc;
         if (delta != 0) {
@@ -332,10 +264,7 @@ EXPORT void zan_gui_ohos_touch(int action, int x, int y) {
         g_tg_down = 0;
         pthread_mutex_lock(&g_oq_lock);
         if (g_tg_drag) {
-            /* Report the release at the finger position, flagged so the
-             * app swallows it as a click: the finger lifted wherever the
-             * drag ended, and treating that as a click would press
-             * whatever sits under the release point. */
+            /* 内部辅助实现 */
             oq_push_flag_locked(3, (int)g_tg_x, (int)g_tg_y, 0, 0, 0);
             pthread_mutex_unlock(&g_oq_lock);
             /* Release velocity from the recent travel window (oldest
@@ -365,20 +294,7 @@ EXPORT void zan_gui_ohos_touch(int action, int x, int y) {
     }
 }
 
-/* ---- IME (soft keyboard) ------------------------------------------------
- * FocusManager flips the IME session as text widgets gain/lose keyboard
- * focus (zan_gui_set_ime_open). A GUI that paints its own text widgets uses
- * the custom-editor path of the input method framework: attach registers a
- * TextEditorProxy whose callbacks (commit / delete / enter / cursor) arrive
- * on IMF binder threads and are pushed into the event ring as kind-6 char
- * events (the Win32 WM_CHAR contract the text widgets were built on:
- * Backspace=8, Enter=13) and kind-4 arrows. Preview text is disabled in
- * GetTextConfig so IMEs commit directly instead of streaming composing
- * letters into the widget.
- *
- * Like the NativeWindow direct path above, every IMF symbol is resolved
- * with dlsym: an image without libohinputmethod.so must still load this
- * library (the feature then degrades to the old no-op). */
+/* 内部辅助实现 */
 
 /* The IMF headers use char16_t (a C++ keyword) without pulling in the C11
  * home for it; include uchar.h first or every signature fails to parse. */
@@ -570,10 +486,7 @@ static void ime_on_finish_preview(InputMethod_TextEditorProxy *proxy) {
 static void ime_on_get_text_config(InputMethod_TextEditorProxy *proxy,
                                    InputMethod_TextConfig *config) {
     (void)proxy;
-    /* Same dlsym discipline as everywhere else in this file: the three
-     * TextConfig setters live in libohinputmethod.so, and a single hard
-     * reference here would fail the whole .so's load-time relocation on
-     * images that don't ship it. */
+    /* Same dlsym discipline as everywhere else in this file: the three TextConfig setters live in libohinputmethod */
     if (g_ime_cfg_input) { g_ime_cfg_input(config, IME_TEXT_INPUT_TYPE_TEXT); }
     if (g_ime_cfg_preview) { g_ime_cfg_preview(config, false); }
     if (g_ime_cfg_enter) { g_ime_cfg_enter(config, IME_ENTER_KEY_UNSPECIFIED); }
@@ -649,10 +562,7 @@ static void ime_feature_detect(void) {
     }
 }
 
-/* Open/close the IME session, driven by text-widget focus exactly like the
- * platform shell's Start/StopTextInput pairing. Attach with
- * showKeyboard=true summons the soft keyboard; Detach retires it. Called
- * on the app (render) thread only. */
+/* Open/close the IME session, driven by text-widget focus exactly like the platform shell's Start/StopTextInput pairing */
 EXPORT void zan_gui_set_ime_open(i32 on) {
     ime_feature_detect();
     ime_ensure_proxy();
@@ -688,11 +598,7 @@ void zan_gui_ohos_ime_shutdown(void) {
     }
 }
 
-/* ---- present (EGL) ------------------------------------------------------
- * The composed CPU surface goes up as one GL texture and out over the
- * attached native window through a fullscreen quad. Pixel bytes are B,G,R,A
- * (little-endian ARGB); they are uploaded as GL_RGBA and the fragment
- * shader swaps the channels back. */
+/* 内部辅助实现 */
 static const char *k_ohos_vs =
     "attribute vec2 a_pos;\n"
     "varying vec2 v_uv;\n"
@@ -743,16 +649,7 @@ static int ohos_gl_surface(zan_ohos_win_t *w) {
                                              (EGLNativeWindowType)w->nw, NULL);
         if (w->egl_surf == EGL_NO_SURFACE) return 1;
         w->surf_nw = w->nw;
-        /* Record the size the surface ACTUALLY got, not the attached one:
-         * a snap maximize is a single big resize (2090->3120) on the same
-         * window, and the native window's buffer geometry can still be the
-         * old one when the first post-resize present rebuilds here. Taking
-         * w->w made that stale surface look current (surf_w == w->w), the
-         * rebuild condition never fired again and the band stayed forever;
-         * the query reads the geometry eglCreateWindowSurface really used,
-         * so the next present still sees the mismatch and rebuilds -- by
-         * then the transition has settled and the new surface is full-size
-         * (the drag-resize path proves the geometry settles). */
+        /* 内部辅助实现 */
         EGLint qw = 0, qh = 0;
         if (eglQuerySurface(w->egl_dpy, w->egl_surf, EGL_WIDTH, &qw)
             && eglQuerySurface(w->egl_dpy, w->egl_surf, EGL_HEIGHT, &qh)
@@ -809,14 +706,7 @@ static int ohos_gl_init(zan_ohos_win_t *w) {
     return ohos_gl_program(w);
 }
 
-/* Dirty rects announced by the app (Window.PresentDirty): a partial-band or
- * effect-tick frame has no reason to re-upload the whole multi-MB surface on
- * the EGL path -- the texture persists across frames, so uploading just the
- * changed subrects keeps the rest of the texture. The list is emptied by
- * every present; a present with no announcement (or an overflow) falls back
- * to the full upload. The NativeWindow fast path still copies the whole
- * frame: the BufferQueue rotates several buffers, so rect damage would have
- * to be tracked per buffer to be safe. */
+/* Dirty rects announced by the app (Window */
 #define ZAN_OHOS_DIRTY_MAX 512
 static i32 g_dirty[ZAN_OHOS_DIRTY_MAX * 4];
 static int g_dirty_count;
@@ -841,10 +731,7 @@ static void ohos_dirty_reset(void) {
     g_dirty_full = 0;
 }
 
-/* Whole-window frame declaration (Win32Shell.PresentFull's counterpart):
- * a frame that repainted every pixel must not reuse earlier subrects; the
- * EGL texture persists, so honor the flag by falling back to the whole-
- * surface upload. */
+/* Whole-window frame declaration (Win32Shell */
 EXPORT void zan_gui_present_full(void) {
     g_dirty_full = 1;
 }
@@ -928,23 +815,11 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
         }
     }
 egl_path:
-    /* Fallback: EGL texture upload + fullscreen quad. The texture persists
-     * across frames, so a frame that announced damage uploads only those
-     * subrects (the HUD band / fx patches on idle ticks) instead of the
-     * whole surface. */
+    /* Fallback: EGL texture upload + fullscreen quad */
     if (g_owin.egl_surf && (g_owin.surf_nw != g_owin.nw
                             || g_owin.surf_w != g_owin.w
                             || g_owin.surf_h != g_owin.h)) {
-        /* The surface's window or size went stale: a rotation hands the
-         * shell a fresh native window, while a 2in1 maximize/drag resizes
-         * the SAME window (OnSurfaceChanged, pointer unchanged). Either way
-         * the surface made for the old geometry presents stale-size buffers.
-         * Drop it here -- on the app thread, never racing a present -- and
-         * let ohos_gl_init rebuild against the new window/geometry.
-         * Context/program/texture survive. surf_w/surf_h are what
-         * eglCreateWindowSurface actually used (ohos_gl_surface queries
-         * them), so a rebuild raced against an unsettled geometry catches
-         * itself here on the next frame instead of going stale forever. */
+        /* 内部辅助实现 */
         eglMakeCurrent(g_owin.egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
                        EGL_NO_CONTEXT);
         eglDestroySurface(g_owin.egl_dpy, g_owin.egl_surf);
@@ -1037,12 +912,7 @@ static int oq_pop(void) {
     return 1;
 }
 
-/* Return contract mirrors the reference driver -- the implementation the
- * Zan Window wrapper and every custom event loop (gallery, IDE) are written
- * against: poll 0 = event delivered / 1 = queue empty; wait 0 = delivered;
- * wait_event_timeout 0 = delivered / 1 = timed out. Inverting these starves
- * exactly the apps that escalate an empty poll into a timed wait, while
- * probes that read the event slots unconditionally keep working. */
+/* 内部辅助实现 */
 EXPORT i32 zan_gui_poll_event(void) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
     if (oq_pop()) { return 0; }
@@ -1073,10 +943,7 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
 }
 
 EXPORT i32 zan_gui_wake(void) { return 0; }
-/* UiDriver automation support: synthetic events go through the same ring as
- * real input, so hit testing, focus and click arbitration see them exactly
- * like a human's. The app may be parked in zan_gui_wait_event, which polls
- * every 4 ms -- no separate wake channel needed. */
+/* 内部辅助实现 */
 EXPORT i32 zan_gui_inject_event(
     iptr hwnd_val, i32 kind, i32 x, i32 y, i32 button, i32 keycode, i32 mods) {
     (void)hwnd_val;
@@ -1109,16 +976,7 @@ EXPORT i32 zan_gui_client_height(iptr hwnd_val) { (void)hwnd_val; return g_windo
 
 EXPORT i32 zan_gui_get_dpi_scale(void) { return (i32)(g_dpi * 100 / 96); }
 
-/* The HAP shell resolves the display density (libnative_display_manager lives
- * in the default linker namespace, out of reach of dlsym(RTLD_DEFAULT) from
- * this dlopened library) and hands it over before zan_hap_main. Mobile DPI is
- * denominated in 160 dpi (a 3.0x phone reports 480), but the reference driver keeps
- * g_dpi on the desktop 96-dpi base (contentScale*96) and every consumer --
- * the percent conversion above and the wheel synthesis 288/g_dpi -- assumes
- * that convention. Store the 96-base value: a 480 dpi device must yield
- * scale 300 (native 3.0x), not 500 (desktop-96 math on raw mobile DPI,
- * 67% oversized). Without any call g_dpi stays at the 96 fallback and every
- * control renders at desktop physical size on a phone-class screen. */
+/* 内部辅助实现 */
 EXPORT void zan_gui_ohos_set_dpi(i32 dpi) {
     if (dpi >= 48 && dpi <= 960) g_dpi = (int)((long)dpi * 96 / 160);
 }

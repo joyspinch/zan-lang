@@ -1,31 +1,4 @@
-/* gui_runtime_wasm.c -- wasm32 browser window shell (ZAN_GUI_WASM).
- *
- * Part of the gui_runtime translation unit: #include'd by gui_runtime.c in
- * a fixed order; not compiled standalone (preprocessor state and static
- * linkage are shared across the parts).
- *
- * One canvas = one window, the OHOS single-surface model. The wasm module
- * runs inside a Web Worker and every OS service arrives as a host import
- * in module "zan_env": wasm-ld keeps function imports declared with
- * import_module/import_name (data imports are not supported, so nothing
- * here imports memory), and the JS host supplies them at instantiation.
- * The browser main thread never touches wasm memory -- it writes input
- * into a small SharedArrayBuffer ring and receives finished frames the
- * worker copies out of linear memory. Atomics.wait on the ring's doorbell
- * gives wait_event_timeout a real blocking sleep, so the Zan run loop
- * idles like the desktop shells do in poll() instead of hot-spinning the
- * worker (a wasm call cannot yield, which rules out driving frames from
- * the main thread's rAF).
- *
- * Event ABI is the flat 8-slot contract the OHOS/X11 shells use:
- * e[0] kind, e[1] x, e[2] y, e[3] button, e[4] code, e[5] mods, e[6] flag.
- * Kinds: 0 wake, 1 move, 2 down, 3 up, 4 keydown, 5 keyup, 6 char,
- * 7 resize (x=w y=h), 8 close, 9 kill focus, 13 wheel (+-120), 14 attached.
- * mods: bit0 ctrl, bit1 shift, bit2 alt (Win32 encoding), matching
- * gui_runtime_x11.c's translation. Browser key events already carry
- * Win32-flavored keyCode values for letters/digits/arrows, so the host
- * forwards e.keyCode verbatim into the code slot.
- * ======================================================================== */
+/* gui_runtime_wasm */
 
 #ifdef __wasm__
 
@@ -34,15 +7,7 @@
 
 #include "../common/zan_abi.h"
 
-/* ---- host imports (module "zan_env") -----------------------------------
- * pump: drain the SharedArrayBuffer ring, feeding zan_gui_wasm_feed per
- *       event. Never blocks.
- * wait: pump, block up to ms on the doorbell (Atomics.wait), pump again;
- *       returns 1 when events are pending in the C ring afterwards.
- * sleep: block ms without pumping (the desktop nanosleep counterpart).
- * present: hand one frame to the host -- pixels at ptr are the surface's
- *       little-endian ARGB (bytes B,G,R,A), w*h*4 bytes.
- * title: NUL-terminated UTF-8, for document.title. */
+/* 内部辅助逻辑 */
 __attribute__((import_module("zan_env"), import_name("pump")))
 static void zan__env_pump(void);
 __attribute__((import_module("zan_env"), import_name("wait")))
@@ -54,7 +19,7 @@ static void zan__env_present(i32 ptr, i32 w, i32 h);
 __attribute__((import_module("zan_env"), import_name("title")))
 static void zan__env_title(const char *text, i32 len);
 
-/* ---- window record ----------------------------------------------------- */
+/* window record */
 
 typedef struct {
     int w, h;      /* canvas size, device pixels (host decides it) */
@@ -67,7 +32,7 @@ static zan_wasm_win_t g_wwin;
 static int  g_window_width  = 0;
 static int  g_window_height = 0;
 
-/* ---- event ring -------------------------------------------------------- */
+/* event ring */
 
 typedef struct { int e[8]; i64 win; } zan_wev_t;
 #define ZAN_WQ_CAP 512
@@ -78,10 +43,7 @@ static int g_pending_event[8];
 static i64 g_event_win = 0;
 static long long g_ev_seq = 0;
 
-/* Plain moves coalesce (freshest x/y wins) and wheel floods coalesce by
- * SUMMING deltas -- same contract as the OHOS/SDL shells. Single thread
- * (the worker), so unlike OHOS no lock wraps the ring: the only pushers
- * are the host pump and UiDriver's inject_event, both on this thread. */
+/* 内部辅助逻辑 */
 static void wq_push(int kind, int x, int y, int button, int code, int mods,
                     int flag) {
     if (kind == 7) { /* resize carries the new canvas size */
@@ -108,10 +70,7 @@ static void wq_push(int kind, int x, int y, int button, int code, int mods,
     g_wq_tail = next;
 }
 
-/* Host -> C injection: one event from the SharedArrayBuffer ring. Returns
- * the ring depth after the push so the JS pump can answer "is anything
- * pending" with one call (the wait import's return path). Exported from
- * the module: zanc adds --export for it when linking a GUI program. */
+/* Host -> C injection: one event from the SharedArrayBuffer ring */
 EXPORT i32 zan_gui_wasm_feed(i32 kind, i32 x, i32 y, i32 button, i32 code,
                              i32 mods, i32 flag) {
     wq_push((int)kind, (int)x, (int)y, (int)button, (int)code, (int)mods,
@@ -129,11 +88,9 @@ static int wq_pop(void) {
     return 1;
 }
 
-/* ---- window management (browser: no chrome) ---------------------------- */
+/* window management (browser: no chrome) */
 
-/* The canvas decides the size; the host seeds kind 7 + 14 before _start so
- * the first poll lays the app out at the real canvas size and repaints it
- * whole (same attach protocol as the OHOS XComponent shell). */
+/* 内部辅助逻辑 */
 EXPORT i64 zan_gui_create_window(const char *title, i32 width, i32 height) {
     (void)title;
     g_wwin.w = (int)width;
@@ -170,12 +127,7 @@ EXPORT i32 zan_gui_set_title(i64 h, const char *t) {
 }
 EXPORT i32 zan_gui_set_cursor(i32 cursor_type)     { (void)cursor_type; return 0; }
 
-/* ---- event pump --------------------------------------------------------
- * Return contract mirrors the SDL driver -- poll 0 = delivered / 1 = empty;
- * wait 0 = delivered; wait_event_timeout 0 = delivered / 1 = timed out.
- * Host events reach the C ring only through the pump import, so every
- * entry point pumps first; UiDriver's inject_event feeds the ring directly
- * (same thread) and needs no pump. */
+/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_poll_event(void) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
     zan__env_pump();
@@ -232,10 +184,7 @@ EXPORT i32 zan_gui_window_height(void) { return g_window_height; }
 EXPORT i32 zan_gui_client_width(i64 hwnd_val)  { (void)hwnd_val; return g_window_width; }
 EXPORT i32 zan_gui_client_height(i64 hwnd_val) { (void)hwnd_val; return g_window_height; }
 
-/* ---- present -----------------------------------------------------------
- * Dirty rects are tracked for API parity but v1 ships whole frames: the
- * host copy out of linear memory is one memcpy-shaped pass and correctness
- * beats bandwidth for the first browser milestone. */
+/* 内部辅助逻辑 */
 #define ZAN_DIRTY_MAX_WASM 512
 static int g_dirty_wasm[ZAN_DIRTY_MAX_WASM * 4];
 static int g_dirty_count_wasm;
@@ -263,7 +212,7 @@ EXPORT i32 zan_gui_present(i64 hwnd_val, i32 surface_id) {
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id])
         return 1;
     zan_surface_t *s = g_surfaces[surface_id];
-    /* A backend holding the frame elsewhere has to put it back first. */
+    /* A backend holding the frame elsewhere has to put it back first */
     if (s->be) {
         if (s->be->flush) s->be->flush(s);
         if (s->be->read_pixels) s->be->read_pixels(s);
@@ -274,10 +223,9 @@ EXPORT i32 zan_gui_present(i64 hwnd_val, i32 surface_id) {
     return 0;
 }
 
-/* ---- platform services ------------------------------------------------- */
+/* platform services */
 
-/* The canvas is sized 1:1 in CSS pixels by the host, so desktop-96 scale
- * until a devicePixelRatio-aware host lands. */
+/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_get_dpi_scale(void) { return 100; }
 
 EXPORT i64 zan_gui_get_tick_ms(void) {
@@ -286,8 +234,7 @@ EXPORT i64 zan_gui_get_tick_ms(void) {
     return (i64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* wasm has no nanosleep: the wasi clock import only reads time. Blocking
- * goes through the host (Atomics.wait is legal on the worker thread). */
+/* wasm has no nanosleep: the wasi clock import only reads time */
 EXPORT void zan_gui_sleep_ms(i32 ms) {
     if (ms > 0) zan__env_sleep(ms);
 }
@@ -305,15 +252,10 @@ EXPORT i32 zan_gui_enable_glass(i64 hwnd_val, i32 tint_argb) {
 EXPORT i32 zan_gui_disable_glass(i64 hwnd_val)    { (void)hwnd_val; return 0; }
 EXPORT i32 zan_gui_set_opacity(i64 h, i32 percent) { (void)h; (void)percent; return 0; }
 
-/* Files: wasi preopens give the module its own snapshot-scoped FS; there is
- * no Android-style app dir. Consumers of android_files_dir fall back to
- * relative paths, which resolve against the preopen root. */
+/* 内部辅助逻辑 */
 EXPORT const char *zan_gui_android_files_dir(void) { return "."; }
 
-/* ---- SDL-compat / scene / webview stubs --------------------------------
- * Same semantics as the other non-SDL shells: adopt/scene return "cannot"
- * (1) so the Zan side keeps the software path, webview_create returns 0 so
- * WebViewBackend paints its in-canvas placeholder instead of embedding. */
+/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_adopt_sdl_window(i64 hwnd_val)              { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_scene_set_renderer(i64 hwnd_val, i64 rend) { (void)hwnd_val; (void)rend; return 1; }
 EXPORT i32 zan_gui_scene_upload(i64 hwnd_val, const void *bgra, i32 w, i32 h) {
@@ -364,16 +306,7 @@ EXPORT void zan_gui_webview_set_context_menu_enabled(i32 h, i32 enabled) {
     (void)h; (void)enabled;
 }
 
-/* ---- UI dispatch (Gui.Dispatcher's queue) ------------------------------
- * The desktop implementation lives in rt_sync.c behind a mutex; wasm32 has
- * one thread and rt_sync cannot build here (pthread/shm), so the same queue
- * with the same ABI and retain/release discipline runs lock-free in the
- * gui object. Every pusher and drainer is this thread, so plain statics
- * stand in for the lock; the only observable difference is that "thread-
- * safe post" marshals nothing -- on wasm there is nowhere to marshal from.
- * Delegate values are tagged closure records (ZAN_CLOSURE_* in zan_abi.h):
- * the queue owns one reference, post retains, take transfers it to the
- * caller, clear releases in place -- exactly rt_sync.c's contract. */
+/* UI dispatch (Gui */
 #define ZAN_WDISP_CAP 4096
 static void *g_wdisp[ZAN_WDISP_CAP];
 static int g_wdisp_head = 0, g_wdisp_tail = 0;
@@ -393,9 +326,7 @@ static void wdisp_retain(void *d) {
 static void wdisp_release(void *d) {
     void *rec = wdisp_record(d);
     if (!rec) return;
-    /* zan_abi.h's closure offsets describe the native 64-bit record; wasm32
-     * pointers are 4 bytes, so the {fn, dtor, target} prefix sits at 0/4/8
-     * (offset 0 is the only layout-invariant one). */
+    /* zan_abi */
     void *dtor = *(void **)((char *)rec + 1 * sizeof(void *));
     if (dtor) ((void (*)(void *))dtor)(rec);
 }

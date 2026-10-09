@@ -8,8 +8,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 
-/* Caps shared by every depth-guarded recursion in the parser. Defined up
- * here because parse_type_ref sits above the statement section. */
+/* Caps shared by every depth-guarded recursion in the parser */
 #define ZAN_PARSER_MAX_TYPE_DEPTH 4096
 
 static void parser_advance(zan_parser_t *p) {
@@ -44,9 +43,7 @@ static zan_ast_node_t *parser_error_node(zan_parser_t *p) {
     return zan_ast_new(p->arena, AST_INT_LITERAL, p->current.loc);
 }
 
-/* Consume the '>' closing a generic argument list. The lexer greedily forms
- * '>>'-family tokens; for those, split off one '>' in place (without
- * advancing the lexer) so each nesting level consumes its own. */
+/* Consume the '>' closing a generic argument list */
 static void parser_expect_gt(zan_parser_t *p) {
     switch (p->current.kind) {
     case TK_GREATER:
@@ -84,9 +81,7 @@ static bool looks_like_var_decl(zan_parser_t *p);
 static zan_ast_node_t *parse_type_ref(zan_parser_t *p);
 static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers);
 
-/* Move any multi-declarator siblings parse_var_decl just queued into `list`,
- * in queue order. Must run immediately after pushing the statement that may
- * have come from parse_var_decl. */
+/* 内部辅助逻辑 */
 static void splice_pending_stmts(zan_parser_t *p, zan_ast_list_t *list) {
     for (int i = 0; i < p->pending_stmts.count; i++) {
         zan_ast_list_push(list, p->pending_stmts.items[i], p->arena);
@@ -105,9 +100,7 @@ static void parse_attr_usages(zan_parser_t *p, zan_ast_list_t *out,
                               bool *out_variadic);
 static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit);
 
-/* Parses `delegate ReturnType Name<TParams>(params);` with the cursor on the
- * `delegate` keyword. Shared by unit-level and nested declarations; nested
- * ones are hoisted to unit level by zan_parser_flatten_nested_types. */
+/* 内部辅助逻辑 */
 static zan_ast_node_t *parse_delegate_decl(zan_parser_t *p, uint32_t mods) {
     parser_advance(p);
     zan_loc_t dloc = p->current.loc;
@@ -140,11 +133,7 @@ static zan_ast_node_t *parse_delegate_decl(zan_parser_t *p, uint32_t mods) {
     return ddecl;
 }
 
-/* Parses one full top-level declaration (attributes, modifiers, class/struct/
- * interface/enum/delegate, `record` lowering) into unit->comp_unit.decls.
- * Shared verbatim by the unit decls loop and the block-scoped namespace member
- * loop. Returns false when nothing could be parsed (error emitted); the
- * caller skips one token to recover. */
+/* 内部辅助实现 */
 static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
     /* parse attributes: retained on the type; [StructLayout] also toggles C layout */
     bool has_c_layout = false;
@@ -156,8 +145,7 @@ static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
         zan_istr_t _n = type_attrs.items[_ai]->attribute.name->ident.name;
         if (_n.str && _n.len == 12 && memcmp(_n.str, "StructLayout", 12) == 0) {
             has_c_layout = true;
-            /* `LayoutKind.Explicit` parses as a member access whose last
-             * segment names the kind; anything else stays sequential. */
+            /* `LayoutKind */
             zan_ast_list_t *_args = &type_attrs.items[_ai]->attribute.args;
             for (int _aj = 0; _aj < _args->count; _aj++) {
                 zan_ast_node_t *_a = _args->items[_aj];
@@ -236,10 +224,7 @@ static zan_ast_node_t *parse_qualified_name(zan_parser_t *p) {
     return node;
 }
 
-/* Rank of the bracket at the current token when it is an array rank
- * specifier: `[]` -> 1, `[,]` -> 2. Returns 0 when the bracket holds a size
- * expression (`int[3]`), leaving it for the caller. `p->lex->pos` points just
- * past the `[`. */
+/* 内部辅助逻辑 */
 static int array_suffix_rank(zan_parser_t *p) {
     zan_lexer_t *lx = p->lex;
     const char *s = lx->source;
@@ -266,14 +251,11 @@ static int array_suffix_rank(zan_parser_t *p) {
 static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
-    /* One-shot suppression belongs to the OUTERMOST call only: nested calls
-     * parse inner types with the full nullable grammar (they always see 0). */
+    /* 内部辅助逻辑 */
     int nn_top = p->type_no_nullable;
     p->type_no_nullable = 0;
 
-    /* Depth guard: type nesting recurses once per level with no other guard,
-     * so hostile source would exhaust the C stack; the binder recurses the
-     * same shape, so cutting here bounds it there too. */
+    /* 内部辅助逻辑 */
     if (++p->type_depth > ZAN_PARSER_MAX_TYPE_DEPTH) {
         zan_diag_emit(p->diag, DIAG_ERROR, loc,
                       "type nesting too deep (max %d)",
@@ -282,8 +264,7 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
         return parser_error_node(p);
     }
 
-    /* C# tuple type `(int, string)`; element names are dropped -- Item1/Item2
-     * back the tuple regardless. */
+    /* 内部辅助逻辑 */
     if (parser_check(p, TK_LPAREN)) {
         parser_advance(p);
         zan_ast_node_t *tn = zan_ast_new(p->arena, AST_TUPLE_TYPE, loc);
@@ -294,8 +275,7 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
             /* named element `int x`: consume the name, keep the type */
             if (p->current.kind == TK_IDENT &&
                 !(et->kind == AST_TYPE_REF && et->type_ref.is_array)) {
-                /* identifier after the type is the element name; qualified
-                 * names were already consumed by parse_type_ref */
+                /* 内部辅助逻辑 */
                 parser_advance(p);
             }
             if (!parser_match(p, TK_COMMA)) break;
@@ -334,9 +314,7 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     } else if (parser_check(p, TK_IDENT)) {
         parser_advance(p);
         name = p->previous.str_val;
-        /* qualified type name A.B.C: build the dotted spelling, which
-         * nsresolve maps to the real type. Enter only when '.' is directly
-         * followed by an identifier. */
+        /* qualified type name A */
         if (parser_check(p, TK_DOT) &&
             zan_lexer_peek(p->lex).kind == TK_IDENT) {
             char qbuf[512];
@@ -377,19 +355,13 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
         parser_expect_gt(p);
     }
 
-    /* Nullable/array suffixes in either order. `int[]?`: an array pointer
-     * already admits null, so the `?` is consumed and not recorded. A bracket
-     * is a rank specifier only when it holds nothing but commas; `int[3]`
-     * leaves the bracket for the new-expression. C# folds rank specifiers
-     * with the LEFTMOST outermost (`int[][,]` is a 1D array of `int[,]`), so
-     * the collected ranks are wrapped right-to-left. */
+    /* Nullable/array suffixes in either order */
     int ranks[16];
     int nranks = 0;
     bool seen_array = false;
     for (;;) {
         if (nn_top && parser_check(p, TK_QUESTION)) {
-            /* This `?` opens a conditional (already decided by the is/as
-             * operand) -- leave it for parse_conditional. */
+            /* 内部辅助逻辑 */
             break;
         }
         if (parser_match(p, TK_QUESTION)) {
@@ -407,8 +379,7 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
             if (rank <= 16 && nranks < 16) {
                 ranks[nranks++] = rank;
             } else {
-                /* The bracket is already consumed, so silently dropping the
-                 * rank would mis-type the declaration -- diagnose instead. */
+                /* 内部辅助逻辑 */
                 zan_diag_emit(p->diag, DIAG_ERROR, loc,
                               "array rank specifier is too deep (max 16)");
             }
@@ -436,17 +407,13 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     return type_node;
 }
 
-/* `init` is a contextual keyword: it is only special as a property accessor
- * (`{ get; init; }`). The lexer must not reserve it, or ordinary identifiers
- * named `init` become impossible. */
+/* 内部辅助逻辑 */
 static bool is_init_accessor_kw(zan_parser_t *p) {
     return p->current.kind == TK_IDENT && p->current.str_val.len == 4 &&
            memcmp(p->current.str_val.str, "init", 4) == 0;
 }
 
-/* `checked` / `unchecked` are contextual: only special when followed by `(`
- * (an expression) or `{` (a statement block). Identifiers with those names
- * (e.g. a parameter `bool checked`) keep working elsewhere. */
+/* 内部辅助逻辑 */
 static bool is_checked_use(zan_parser_t *p) {
     if (p->current.kind != TK_IDENT) return false;
     const char *s = p->current.str_val.str;
@@ -472,26 +439,21 @@ static uint32_t parse_modifiers(zan_parser_t *p) {
         case TK_ABSTRACT:  parser_advance(p); mods |= MOD_ABSTRACT;  break;
         case TK_SEALED:    parser_advance(p); mods |= MOD_SEALED;    break;
         case TK_READONLY:  parser_advance(p); mods |= MOD_READONLY;  break;
-        /* C# `const` on a member is an implicitly static, never-assigned
-         * field; the compiler has no separate constant storage class, so it
-         * lowers to `static readonly`. */
+        /* 内部辅助逻辑 */
         case TK_CONST:     parser_advance(p);
                            mods |= MOD_STATIC | MOD_READONLY; break;
         case TK_EXTERN:    parser_advance(p); mods |= MOD_EXTERN;    break;
         case TK_ASYNC:     parser_advance(p); mods |= MOD_ASYNC;     break;
         case TK_UNSAFE:    parser_advance(p); mods |= MOD_UNSAFE;    break;
         case TK_WEAK:      parser_advance(p); mods |= MOD_WEAK;      break;
-        /* `ref struct` (stack-allocated struct). The modifier is recorded but
-         * the type has no special stack-only semantics in this runtime. */
+        /* `ref struct` (stack-allocated struct) */
         case TK_REF:       parser_advance(p); mods |= MOD_REF;       break;
         default: return mods;
         }
     }
 }
 
-/* Lookahead: with p->current on '(', true when the matching ')' is followed
- * by '=>'. Token-level only (saves/restores lexer state, allocates no AST,
- * emits no diagnostics). */
+/* 内部辅助逻辑 */
 static bool paren_is_lambda(zan_parser_t *p) {
     zan_lexer_t saved_lex = *p->lex;
     zan_token_t saved_cur = p->current;
@@ -516,10 +478,7 @@ static bool paren_is_lambda(zan_parser_t *p) {
     return result;
 }
 
-/* `(Name)operand` — cast to a user-declared type rather than a grouped
- * expression. Only the unambiguous shape is accepted: a single identifier in
- * the parentheses followed by a token that can only start an operand, so
- * `(x) + y` and `(x)` stay grouping. */
+/* `(Name)operand` — cast to a user-declared type rather than a grouped expression */
 static bool paren_is_named_cast(zan_parser_t *p) {
     if (zan_lexer_peek(p->lex).kind != TK_IDENT) return false;
     zan_lexer_t saved_lex = *p->lex;
@@ -545,8 +504,7 @@ static bool paren_is_named_cast(zan_parser_t *p) {
     return result;
 }
 
-/* A single lambda parameter: either an untyped bare identifier (when the
- * identifier is directly followed by ',' or ')') or a typed `Type name`. */
+/* 内部辅助逻辑 */
 static zan_ast_node_t *parse_lambda_param(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
     if (parser_check(p, TK_IDENT)) {
@@ -573,8 +531,7 @@ static zan_ast_node_t *parse_lambda_param(zan_parser_t *p) {
     return pn;
 }
 
-/* Parse a parenthesized lambda: `( params ) => body`, with p->current on '('.
- * The body is a block when it starts with '{', otherwise a single expression. */
+/* Parse a parenthesized lambda: `( params ) => body`, with p->current on '(' */
 static zan_ast_node_t *parse_lambda_paren(zan_parser_t *p, zan_loc_t loc) {
     zan_ast_node_t *n = zan_ast_new(p->arena, AST_LAMBDA, loc);
     zan_ast_list_init(&n->lambda.params);
@@ -596,18 +553,13 @@ static zan_ast_node_t *parse_lambda_paren(zan_parser_t *p, zan_loc_t loc) {
 
 static bool is_type_kw(zan_token_kind_t k);
 
-/* A call argument: an expression, a named `name: expr`, or a by-reference
- * `ref x` / `out x` / `out T x` argument. Forward-declared because
- * `new Type(args)` (inside parse_primary) parses constructor arguments with
- * it before its definition below. */
+/* 内部辅助逻辑 */
 static zan_ast_node_t *parse_call_arg(zan_parser_t *p);
 
 static zan_ast_node_t *parse_primary(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
-    /* checked(...) / unchecked(...): wrap the parenthesized form in an
-     * AST_CHECKED_STMT so irgen lowers the inner integer ops with overflow
-     * guards. Contextual: only when followed by `(` or `{`. */
+    /* checked( */
     if (is_checked_use(p)) {
         bool is_checked = p->current.str_val.len == 7;
         zan_loc_t cloc = p->current.loc;
@@ -623,9 +575,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             n->checked_stmt.body = inner;
             return n;
         }
-        /* checked { ... } in expression position: same fresh-wrapper rule as
-         * the statement form -- kind-mutating the block would alias
-         * block.stmts.items into checked_stmt.body. */
+        /* checked { */
         zan_ast_node_t *blk = parse_block(p);
         if (is_checked) p->checked_depth--; else p->unchecked_depth--;
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_CHECKED_STMT, cloc);
@@ -634,8 +584,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return n;
     }
 
-    /* Type keyword as a static receiver: `int.Parse(...)`, `string.Join(...)`.
-     * Lower the keyword to an identifier so member access parses normally. */
+    /* Type keyword as a static receiver: `int */
     if (is_type_kw(p->current.kind) && zan_lexer_peek(p->lex).kind == TK_DOT) {
         const char *nm = zan_token_kind_name(p->current.kind);
         parser_advance(p);
@@ -644,8 +593,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return n;
     }
 
-    /* LINQ query: `from x in src [where c]... select e` — `from` is
-     * contextual, committed only when `in` follows the range variable */
+    /* LINQ query: `from x in src [where c] */
     if (p->current.kind == TK_IDENT && p->current.str_val.len == 4 &&
         memcmp(p->current.str_val.str, "from", 4) == 0 &&
         zan_lexer_peek(p->lex).kind == TK_IDENT) {
@@ -665,9 +613,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             n->query.group_key = NULL;
             n->query.group_into = (zan_istr_t){ NULL, 0 };
             n->query.select = NULL;
-            /* where/let/orderby/join repeat in any order; they land in one
-             * ordered list so later passes can honour scope (a let is visible
-             * only to clauses after it). group is a single trailing clause. */
+            /* 内部辅助逻辑 */
             for (;;) {
                 if (parser_match(p, TK_WHERE)) {
                     zan_ast_node_t *wc = zan_ast_new(p->arena, AST_QUERY_WHERE,
@@ -754,8 +700,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                 }
                 break;
             }
-            /* trailing `group e by k [into g]`: `group` without `into` is
-             * terminal, so no select is required then. */
+            /* 内部辅助逻辑 */
             if (p->current.kind == TK_IDENT &&
                 p->current.str_val.len == 5 &&
                 memcmp(p->current.str_val.str, "group", 5) == 0) {
@@ -823,9 +768,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return n;
     }
     case TK_INTERP_START: {
-        /* $"text {expr:fmt}": a `:` after the expression is the format
-         * specifier; ternaries inside a hole must be parenthesized, so a
-         * top-level `:` always starts a format. */
+        /* 内部辅助逻辑 */
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_STRING_INTERP, loc);
         zan_ast_list_init(&n->string_interp.parts);
         zan_ast_list_init(&n->string_interp.formats);
@@ -939,13 +882,11 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return n;
     }
     case TK_LPAREN: {
-        /* Lambda with a parenthesized parameter list: () =>, (a, b) =>,
-         * (int x) =>. Must be checked before the cast rule. */
+        /* Lambda with a parenthesized parameter list: () =>, (a, b) =>, (int x) => */
         if (paren_is_lambda(p)) {
             return parse_lambda_paren(p, loc);
         }
-        /* C-style cast: primitive keywords cannot begin a parenthesized
-         * expression, so this is unambiguous. */
+        /* 内部辅助逻辑 */
         switch (zan_lexer_peek(p->lex).kind) {
         case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
         case TK_UINT: case TK_ULONG: case TK_USHORT: case TK_SBYTE:
@@ -975,9 +916,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         }
         parser_advance(p);
         zan_ast_node_t *expr = parse_expression(p);
-        /* C# tuple literal: a comma means the parens group a tuple, not a
-         * parenthesised single expression. Named elements (`(x: 1, y: 2)`)
-         * are lowered to plain positional tuples. */
+        /* 内部辅助逻辑 */
         if (parser_check(p, TK_COMMA)) {
             zan_ast_node_t *tup = zan_ast_new(p->arena, AST_TUPLE_EXPR, loc);
             zan_ast_list_init(&tup->tuple_expr.items);
@@ -1015,9 +954,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return expr;
     }
     case TK_DELEGATE: {
-        /* C# anonymous method `delegate (int x) { ... }`: lowers to a lambda;
-         * the target delegate type supplies the parameter types via the
-         * existing lambda-to-delegate assignment path. */
+        /* C# anonymous method `delegate (int x) { */
         zan_loc_t dloc = p->current.loc;
         parser_advance(p);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_LAMBDA, dloc);
@@ -1038,8 +975,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         zan_loc_t newloc = p->previous.loc;
         zan_ast_node_t *n = NULL;
 
-        /* C# anonymous object literal `new { e1, e2, ... }`: lowered to a
-         * NEW_EXPR with type == NULL and the member expressions as args. */
+        /* C# anonymous object literal `new { e1, e2, */
         if (parser_check(p, TK_LBRACE)) {
             parser_advance(p);
             n = zan_ast_new(p->arena, AST_NEW_EXPR, newloc);
@@ -1066,17 +1002,13 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         n->new_expr.is_array = false;
         n->new_expr.array_init = false;
 
-        /* array creation: new Type[d1, d2, ...] with optional trailing
-         * rank-only brackets (`new int[3][]` -- sizes belong to the leftmost
-         * level). */
+        /* array creation: new Type[d1, d2, */
         if (parser_check(p, TK_LBRACKET) && !type->type_ref.is_array) {
             parser_advance(p);
             n->new_expr.is_array = true;
             while (!parser_check(p, TK_RBRACKET) && !parser_check(p, TK_EOF)) {
                 if (n->new_expr.array_rank >= 16) {
-                    /* irgen keeps the sizes in a fixed dims[16]; a 17th
-                     * dimension would read past it. Diagnose but keep
-                     * consuming so parsing stays aligned. */
+                    /* irgen keeps the sizes in a fixed dims[16]; a 17th dimension would read past it */
                     zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
                                   "array rank specifier is too deep (max 16)");
                 }
@@ -1086,8 +1018,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                 if (!parser_match(p, TK_COMMA)) break;
             }
             parser_expect(p, TK_RBRACKET);
-            /* trailing rank-only brackets nest the element type below the
-             * sized level. */
+            /* trailing rank-only brackets nest the element type below the sized level */
             while (parser_check(p, TK_LBRACKET)) {
                 int rank = array_suffix_rank(p);
                 if (rank <= 0) break;
@@ -1095,8 +1026,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                 for (int c = 1; c < rank; c++) parser_advance(p);
                 parser_advance(p);
                 if (rank > 16) {
-                    /* same cap as the type-reference path: irgen keeps sizes
-                     * in dims[16] */
+                    /* same cap as the type-reference path: irgen keeps sizes in dims[16] */
                     zan_diag_emit(p->diag, DIAG_ERROR, loc,
                                   "array rank specifier is too deep (max 16)");
                     continue;
@@ -1128,14 +1058,10 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             }
             parser_expect(p, TK_RPAREN);
         }
-        /* collection/object initializer: a plain element is a single
-         * expression (list initializer); a braced element `{ k, v }` is a
-         * dictionary entry flattened into consecutive key/value args,
-         * consumed pairwise by the Dict lowering. */
+        /* 内部辅助实现 */
         if (parser_check(p, TK_LBRACE) && type->kind == AST_TYPE_REF &&
             type->type_ref.is_array && !n->new_expr.is_array) {
-            /* new T[] { ... }: the braces hold the elements; the length is
-             * how many there are. */
+            /* new T[] { */
             n->new_expr.is_array = true;
             n->new_expr.array_init = true;
         }
@@ -1187,13 +1113,9 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
 
 static bool is_type_kw(zan_token_kind_t k);
 
-/* A call argument: an expression, or a by-reference `ref x` / `out x` /
- * `out T x` argument (the latter declares a fresh local at the call site).
- * Named arguments also work in `new Type(args)`. */
+/* 内部辅助逻辑 */
 static zan_ast_node_t *parse_call_arg(zan_parser_t *p) {
-    /* named argument: `name: expr`. Only a bare identifier followed by `:`
-     * is treated as a name -- a conditional `a ? b : c` has a full expression
-     * before the colon, so it never reaches this branch. */
+    /* named argument: `name: expr` */
     if (parser_check(p, TK_IDENT)) {
         zan_token_t peek = zan_lexer_peek(p->lex);
         if (peek.kind == TK_COLON) {
@@ -1253,10 +1175,7 @@ static bool is_type_kw(zan_token_kind_t k) {
     }
 }
 
-/* Disambiguate `name<...>(` (explicit generic call) from a `<` comparison:
- * speculatively scan after `<`, allowing only type-argument shapes; confirmed
- * when the matching `>` is immediately followed by `(`. Lexer state is
- * restored so the caller re-parses from the `<`. */
+/* Disambiguate `name< */
 static bool looks_like_call_type_args(zan_parser_t *p) {
     zan_lexer_t saved_lex = *p->lex;
     zan_token_t saved_cur = p->current;
@@ -1290,9 +1209,7 @@ static bool looks_like_call_type_args(zan_parser_t *p) {
     return ok;
 }
 
-/* Disambiguate `Name<...>.` (static access on a constructed generic type,
- * e.g. `Box<int>.Create(7)`) from a `<` comparison, like
- * looks_like_call_type_args but the matching `>` must be followed by `.`. */
+/* Disambiguate `Name< */
 static bool looks_like_type_args_before_dot(zan_parser_t *p) {
     zan_lexer_t saved_lex = *p->lex;
     zan_token_t saved_cur = p->current;
@@ -1326,9 +1243,7 @@ static bool looks_like_type_args_before_dot(zan_parser_t *p) {
     return ok;
 }
 
-/* Disambiguate `Name<...>{` (object initializer on a constructed generic
- * type, e.g. `List<int> { 1, 2 }` spelled as a postfix on the type name)
- * from a `<` comparison: the matching `>` must be followed by `{`. */
+/* Disambiguate `Name< */
 static bool looks_like_type_args_before_brace(zan_parser_t *p) {
     zan_lexer_t saved_lex = *p->lex;
     zan_token_t saved_cur = p->current;
@@ -1362,10 +1277,7 @@ static bool looks_like_type_args_before_brace(zan_parser_t *p) {
     return ok;
 }
 
-/* `Task.WhenAll` / `Task.WhenAny` resolve to ordinary async stdlib code
- * (TaskJoin), not compiler intrinsics. Rewriting the receiver here -- before
- * name resolution, binding and irgen -- lets the promised spelling resolve to
- * that class; Task's real intrinsics are untouched. */
+/* 内部辅助实现 */
 static void desugar_task_join(zan_ast_node_t *member) {
     zan_istr_t obj_name;
     zan_istr_t m = member->member.name;
@@ -1386,14 +1298,11 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
     for (;;) {
         zan_loc_t loc = p->current.loc;
 
-        /* object initializer: Identifier { field = val, ... } -- when the
-         * preceding expression is an identifier, member access, or call. */
+        /* object initializer: Identifier { field = val, */
         if (parser_check(p, TK_LBRACE) &&
             (expr->kind == AST_IDENTIFIER || expr->kind == AST_MEMBER_ACCESS ||
              expr->kind == AST_CALL)) {
-            /* constructed generic (`List<int> { 1, 2 }`): the instantiation
-             * was captured by the `<...>` branch below, so the
-             * new-expression's type IS that instantiation. */
+            /* 内部辅助逻辑 */
             if (expr->kind == AST_IDENTIFIER && expr->ident.inst_type_ref) {
                 zan_ast_node_t *n = zan_ast_new(p->arena, AST_NEW_EXPR, loc);
                 n->new_expr.type = expr->ident.inst_type_ref;
@@ -1441,9 +1350,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                 continue;
             }
 
-            /* factory-call continuation (`Panel.Row() { ... }`): the braces
-             * continue the just-parsed call; the checker types it via the
-             * call and irgen lowers the call before the member-writes. */
+            /* factory-call continuation (`Panel */
             if (expr->kind == AST_CALL) {
                 zan_ast_node_t *n = zan_ast_new(p->arena, AST_NEW_EXPR, loc);
                 n->new_expr.call_init = expr;
@@ -1490,8 +1397,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                 expr = n;
                 continue;
             }
-            /* plain identifier / member access: re-interpret it as the type
-             * name of a new-expression */
+            /* 内部辅助逻辑 */
             zan_ast_node_t *type = zan_ast_new(p->arena, AST_TYPE_REF, expr->loc);
             if (expr->kind == AST_IDENTIFIER) {
                 type->type_ref.name = expr->ident.name;
@@ -1504,9 +1410,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             n->new_expr.type = type;
             zan_ast_list_init(&n->new_expr.args);
 
-            /* `Name = { a, b }` is a member collection initializer (C#
-             * semantics): kept as AST_COLL_INIT so irgen lowers it to
-             * Add(item) per element on that member. */
+            /* 内部辅助逻辑 */
             while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
                 zan_ast_node_t *field_init;
                 if (parser_check(p, TK_IDENT) &&
@@ -1598,9 +1502,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                    !expr->ident.inst_type_ref &&
                    (looks_like_type_args_before_dot(p) ||
                     looks_like_type_args_before_brace(p))) {
-            /* static access on a constructed generic type: the identifier
-             * keeps its simple name and carries the instantiation, so the
-             * following `.` or `{` is handled by the ordinary postfix loop. */
+            /* 内部辅助逻辑 */
             zan_ast_node_t *tref = zan_ast_new(p->arena, AST_TYPE_REF, expr->loc);
             tref->type_ref.name = expr->ident.name;
             tref->type_ref.is_nullable = false;
@@ -1627,9 +1529,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             parser_expect(p, TK_RBRACKET);
             expr = n;
         } else if (parser_check(p, TK_SWITCH)) {
-            /* switch expression: each arm is `pattern => result`,
-             * `pattern when g => result`, or `_ => result`; comma-separated
-             * with an optional trailing comma. */
+            /* 内部辅助逻辑 */
             parser_advance(p);
             parser_expect(p, TK_LBRACE);
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_SWITCH_EXPR, loc);
@@ -1644,8 +1544,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                 zan_istr_t var_name = {0};
                 bool is_default = false;
 
-                /* `_`/`default` are the fallback arm; handle `_` before the
-                 * type-pattern test (its next token is `=>`, not a name). */
+                /* 内部辅助逻辑 */
                 if (parser_check(p, TK_DEFAULT) ||
                     (parser_check(p, TK_IDENT) && p->current.str_val.len == 1 &&
                      p->current.str_val.str[0] == '_')) {
@@ -1682,9 +1581,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                    p->current.str_val.len == 4 &&
                    memcmp(p->current.str_val.str, "with", 4) == 0 &&
                    zan_lexer_peek(p->lex).kind == TK_LBRACE) {
-            /* with expression `recv with { field = value, ... }` (record
-             * copy). Contextual: `with` is only claimed right before a `{`.
-             * Each entry lowers to an AST_ASSIGNMENT with a bare field name. */
+            /* with expression `recv with { field = value, */
             parser_advance(p);
             parser_expect(p, TK_LBRACE);
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_WITH_EXPR, loc);
@@ -1708,9 +1605,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             parser_expect(p, TK_RBRACE);
             expr = n;
         } else if (parser_check(p, TK_BANG)) {
-            /* null-forgiving postfix (C# `!`): compile-time assertion. The
-             * wrapper is neither identifier nor call, so it bypasses the
-             * checker's null-receiver diagnostic; chaining continues on it. */
+            /* null-forgiving postfix (C# `!`): compile-time assertion */
             parser_advance(p);
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_POSTFIX_UNARY, loc);
             n->unary.op = TK_BANG;
@@ -1718,8 +1613,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             expr = n;
             continue;
         } else if (parser_check(p, TK_PLUS_PLUS) || parser_check(p, TK_MINUS_MINUS)) {
-            /* postfix ++/--: consume exactly one operator and stop, so
-             * `x++`/`x--` lower to a single AST_POSTFIX_UNARY. */
+            /* 内部辅助逻辑 */
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_POSTFIX_UNARY, loc);
             n->unary.op = p->current.kind;
             parser_advance(p);
@@ -1734,15 +1628,12 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
     return expr;
 }
 
-/* Cap on expression recursion depth: every expression-parsing cycle passes
- * through parse_unary, so bounding it bounds the whole recursive descent and
- * turns pathological nesting into a diagnostic instead of a stack overflow. */
+/* 内部辅助逻辑 */
 #define ZAN_PARSER_MAX_EXPR_DEPTH 512
 
 static zan_ast_node_t *parse_unary_inner(zan_parser_t *p);
 
-/* Report one expression-nesting trip, once per translation unit: error
- * recovery keeps re-descending the same over-deep expression. */
+/* 内部辅助逻辑 */
 static zan_ast_node_t *parser_expr_too_deep(zan_parser_t *p) {
     if (!p->expr_depth_reported) {
         p->expr_depth_reported = true;
@@ -1811,9 +1702,7 @@ static bool is_binary_op(zan_token_kind_t kind) {
     return get_precedence(kind) > 0;
 }
 
-/* Tokens that can begin an expression operand. Conservative on purpose: the
- * is/as `?` disambiguation treats "cannot start an expression" as "the `?` is
- * a nullable-type marker", so an unlisted token never changes existing parses. */
+/* Tokens that can begin an expression operand */
 static bool token_starts_expr(zan_token_kind_t k) {
     switch (k) {
     case TK_IDENT: case TK_INT_LIT: case TK_FLOAT_LIT: case TK_STRING_LIT:
@@ -1826,12 +1715,7 @@ static bool token_starts_expr(zan_token_kind_t k) {
     }
 }
 
-/* `x is T ? a : b` vs a nullable type/pattern (`x is int? i`): C# resolves
- * the ambiguity in favor of the conditional. Token-only lookahead: find the
- * first top-level `?`; it opens a conditional exactly when the next token can
- * begin an expression AND a top-level `:` appears before the construct ends
- * (`;`, `,`, braces, `=>`, EOF, stray closer). Nullable types/patterns have
- * no `:` after the `?`. */
+/* 内部辅助逻辑 */
 static bool is_question_is_conditional(zan_parser_t *p) {
     zan_lexer_t saved_lex = *p->lex;
     zan_token_t saved_cur = p->current;
@@ -1874,9 +1758,7 @@ static bool is_question_is_conditional(zan_parser_t *p) {
     return result;
 }
 
-/* A same-precedence chain (`a+b+c+...`) is built iteratively and never trips
- * the expr_depth guard, but the left spine grows one AST level per token and
- * every later pass walks it recursively -- cap it here. */
+/* A same-precedence chain (`a+b+c+ */
 #define ZAN_PARSER_MAX_BINOP_CHAIN 16384
 
 static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
@@ -1910,8 +1792,7 @@ static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
             n->type_test.var_name = (zan_istr_t){NULL, 0};
             n->type_test.is_not = false;
             if (op == TK_AS) {
-                /* `x as T ? a : b`: same C# ambiguity as `is` -- conditional
-                 * wins, the `?` stays for parse_conditional. */
+                /* 内部辅助逻辑 */
                 p->type_no_nullable =
                     is_question_is_conditional(p) ? 1 : 0;
                 n->type_test.type = parse_type_ref(p);
@@ -1919,8 +1800,7 @@ static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
                 left = n;
                 continue;
             }
-            /* `is` patterns: `is T`, `is T x`, `is null`, `is not T`,
-             * `is not null`. */
+            /* `is` patterns: `is T`, `is T x`, `is null`, `is not T`, `is not null` */
             if (parser_match(p, TK_NOT)) {
                 n->type_test.is_not = true;
             }
@@ -1932,9 +1812,7 @@ static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
                     is_question_is_conditional(p) ? 1 : 0;
                 n->type_test.type = parse_type_ref(p);
                 p->type_no_nullable = 0;
-                /* pattern variable `is T x`: a bare name after the type. With
-                 * the `?` claimed by a conditional the next token is `?`, so
-                 * the check does not fire. */
+                /* pattern variable `is T x`: a bare name after the type */
                 if (parser_check(p, TK_IDENT)) {
                     zan_token_t after = zan_lexer_peek(p->lex);
                     if (after.kind != TK_IS && after.kind != TK_AS) {
@@ -1950,9 +1828,7 @@ static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
         zan_ast_node_t *right = parse_binary(p, prec + 1);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_BINARY, loc);
         n->binary.op = op;
-        /* Stamp the overflow-checking context on the arithmetic operators it
-         * can apply to (see ast.h binary.checked); comparison/bitwise/shift
-         * nodes stay 0. */
+        /* 内部辅助逻辑 */
         if (op == TK_PLUS || op == TK_MINUS || op == TK_STAR) {
             if (p->checked_depth > 0) n->binary.checked = 1;
             else if (p->unchecked_depth > 0) n->binary.checked = -1;
@@ -1998,10 +1874,7 @@ static bool is_assign_op(zan_token_kind_t kind) {
 static zan_ast_node_t *parse_expression_inner(zan_parser_t *p);
 
 static zan_ast_node_t *parse_expression(zan_parser_t *p) {
-    /* Guard the low-precedence right recursion (`a = a = ...`, nested
-     * ternaries): they re-enter parse_expression directly, never through
-     * parse_unary, so expr_depth alone left them unbounded. Kept apart from
-     * expr_depth so the parenthesis/unary budget is unchanged. */
+    /* Guard the low-precedence right recursion (`a = a = */
     if (p->expr_tail_depth >= ZAN_PARSER_MAX_EXPR_DEPTH)
         return parser_expr_too_deep(p);
     p->expr_tail_depth++;
@@ -2018,10 +1891,7 @@ static zan_ast_node_t *parse_expression_inner(zan_parser_t *p) {
         zan_loc_t loc = p->current.loc;
         parser_advance(p);
 
-        /* `member = { a, b, c }` is a member collection initializer (C#
-         * semantics). parse_primary has no brace expression, so this previously
-         * died as "unexpected token"; checker/irgen reject AST_COLL_INIT
-         * outside an object-initializer tail. */
+        /* `member = { a, b, c }` is a member collection initializer (C# semantics) */
         if (op == TK_EQ && parser_check(p, TK_LBRACE) &&
             (expr->kind == AST_IDENTIFIER || expr->kind == AST_MEMBER_ACCESS)) {
             zan_istr_t name = (expr->kind == AST_IDENTIFIER)
@@ -2042,9 +1912,7 @@ static zan_ast_node_t *parse_expression_inner(zan_parser_t *p) {
 
         zan_ast_node_t *right = parse_expression(p);
 
-        /* Desugar `lhs OP= rhs` into `lhs = lhs OP rhs`: irgen has no
-         * compound-assign path, and `+` dispatches to a class's op_add, so
-         * operator-overloaded types drive `+=`. */
+        /* 内部辅助逻辑 */
         zan_token_kind_t base = TK_EOF;
         switch (op) {
         case TK_PLUS_EQ:            base = TK_PLUS; break;
@@ -2071,8 +1939,7 @@ static zan_ast_node_t *parse_expression_inner(zan_parser_t *p) {
 
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_ASSIGNMENT, loc);
         n->binary.op = op;
-        /* `expr` is referenced twice; compound_base tells irgen to rewrite
-         * the spine for single evaluation. */
+        /* 内部辅助逻辑 */
         n->binary.compound_base = base;
         n->binary.left = expr;
         n->binary.right = right;
@@ -2082,9 +1949,7 @@ static zan_ast_node_t *parse_expression_inner(zan_parser_t *p) {
     return expr;
 }
 
-/* Cap on statement/block nesting: thousands of nested `{` recurse
- * parse_block -> parse_statement without bound and would exhaust the C stack
- * before any diagnostic. */
+/* 内部辅助逻辑 */
 #define ZAN_PARSER_MAX_STMT_DEPTH 4096
 
 static void parse_block_stmts(zan_parser_t *p, zan_ast_list_t *stmts_list) {
@@ -2092,9 +1957,7 @@ static void parse_block_stmts(zan_parser_t *p, zan_ast_list_t *stmts_list) {
         if (parser_check(p, TK_DEFER)) {
             zan_loc_t defer_loc = p->current.loc;
             parser_advance(p);
-            /* the deferred statement recurses parse_statement without passing
-             * parse_block/parse_embedded_stmt, so count the nesting with the
-             * same statement depth */
+            /* 内部辅助逻辑 */
             if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
                 zan_diag_emit(p->diag, DIAG_ERROR, defer_loc,
                               "statement nesting too deep (max %d)",
@@ -2137,8 +2000,7 @@ static void parse_block_stmts(zan_parser_t *p, zan_ast_list_t *stmts_list) {
             zan_ast_list_push(stmts_list, stmt, p->arena);
             splice_pending_stmts(p, stmts_list);
         }
-        /* guarantee forward progress: skip a token when a malformed statement
-         * consumed nothing, so error recovery can't spin forever. */
+        /* 内部辅助逻辑 */
         if (p->current.loc.offset == before && !parser_check(p, TK_EOF)) {
             parser_advance(p);
         }
@@ -2172,15 +2034,9 @@ static zan_ast_node_t *parse_block(zan_parser_t *p) {
     return block;
 }
 
-/* C# deconstruction declaration `var (a, b) = rhs;` / `(int a, string b) =
- * rhs;`: lowered to AST_TUPLE_DECON with per-element names/types; irgen reads
- * the initializer's Item1..ItemN into fresh locals. `(` starts both a grouped
- * expression and a decon; the second element (a `,` after `name`) is what
- * makes it a decon. */
+/* 内部辅助实现 */
 
-/* Non-consuming lookahead of the k-th token after the current one: walk the
- * lexer k times saving/restoring its state (position, interpolation depth,
- * conditional-directive stack). */
+/* 内部辅助逻辑 */
 static zan_token_t lexer_peek_n(zan_parser_t *p, int k) {
     size_t pos = p->lex->pos;
     uint32_t line = p->lex->line;
@@ -2191,9 +2047,7 @@ static zan_token_t lexer_peek_n(zan_parser_t *p, int k) {
     zan_interp_level_t istack[ZAN_MAX_INTERP_DEPTH];
     if (nsave > 0)
         memcpy(istack, p->lex->interp_stack, sizeof(istack[0]) * (size_t)nsave);
-    /* A speculative peek can also cross a conditional directive: restore
-     * cond_depth/cond_overflow/cond_stack/cond_seen_true too (same contract
-     * as lexer.c's own peek helper). */
+    /* 内部辅助逻辑 */
     int cdep = p->lex->cond_depth;
     int cover = p->lex->cond_overflow;
     int cstack[ZAN_PP_MAX_COND_DEPTH];
@@ -2224,8 +2078,7 @@ static zan_token_t lexer_peek_n(zan_parser_t *p, int k) {
 static bool looks_like_decon_decl(zan_parser_t *p) {
     if (!parser_check(p, TK_LPAREN)) return false;
     zan_token_t a = lexer_peek_n(p, 1);
-    /* `var (a, b)` is handled inside parse_var_decl; a paren-prefixed decon
-     * needs `(` then a type keyword or a name. */
+    /* 内部辅助逻辑 */
     bool type_kw = a.kind == TK_INT || a.kind == TK_LONG || a.kind == TK_SHORT ||
                    a.kind == TK_BYTE || a.kind == TK_UINT || a.kind == TK_ULONG ||
                    a.kind == TK_USHORT || a.kind == TK_SBYTE || a.kind == TK_FLOAT ||
@@ -2233,17 +2086,13 @@ static bool looks_like_decon_decl(zan_parser_t *p) {
                    a.kind == TK_CHAR || a.kind == TK_STRING || a.kind == TK_OBJECT ||
                    a.kind == TK_NINT || a.kind == TK_VAR;
     if (a.kind != TK_IDENT && !type_kw) return false;
-    /* `(Type name` / `(name` then a comma => more than one element => decon.
-     * A single-element typed decon `(int a) = rhs` is left to the identifier
-     * path (which handles `(int)a` casts); require the comma. */
+    /* `(Type name` / `(name` then a comma => more than one element => decon */
     zan_token_t b = lexer_peek_n(p, 2);
     if (b.kind != TK_IDENT) return false;
     zan_token_t c = lexer_peek_n(p, 3);
     if (c.kind != TK_COMMA && c.kind != TK_RPAREN) return false;
 
-    /* Verify the closing paren is followed by `=` (deconstruction), not a
-     * variable name (`(int a, int b) t = rhs;` is a tuple-typed var decl
-     * handled by parse_var_decl). */
+    /* 内部辅助逻辑 */
     int depth = 0;
     for (int k = 1; k < 64; k++) {
         zan_token_t tk = lexer_peek_n(p, k);
@@ -2262,9 +2111,7 @@ static bool looks_like_decon_decl(zan_parser_t *p) {
     return false;
 }
 
-/* Parse the `(a, b) = rhs;` / `(int a, string b) = rhs;` statement body,
- * starting just after the `(`. Each element is either `name` (var/inferred)
- * or `Type name`. */
+/* 内部辅助逻辑 */
 static zan_ast_node_t *parse_tuple_decon_body(zan_parser_t *p, zan_loc_t loc,
                                               zan_ast_node_t *type_prefix) {
     zan_ast_node_t *n = zan_ast_new(p->arena, AST_TUPLE_DECON, loc);
@@ -2277,9 +2124,7 @@ static zan_ast_node_t *parse_tuple_decon_body(zan_parser_t *p, zan_loc_t loc,
                       type_prefix->type_ref.name.len == 3 &&
                       memcmp(type_prefix->type_ref.name.str, "var", 3) == 0;
         if (!is_var) {
-            /* `(int a` came through parse_var_decl after a plain type prefix —
-             * not a shape this helper handles (a typed prefix belongs to a
-             * regular var decl). */
+            /* 内部辅助逻辑 */
             zan_diag_emit(p->diag, DIAG_ERROR, loc,
                           "unsupported tuple deconstruction form");
             return n;
@@ -2289,9 +2134,7 @@ static zan_ast_node_t *parse_tuple_decon_body(zan_parser_t *p, zan_loc_t loc,
     if (parser_check(p, TK_LPAREN)) parser_advance(p);
 
     while (!parser_check(p, TK_RPAREN) && !parser_check(p, TK_EOF)) {
-        /* element: `name` or `Type name`. A bare identifier is a type only
-         * when something follows that continues a type (`Type name`, `T<...>`,
-         * `T[]`); a `,` or `)` right after makes it a plain variable name. */
+        /* element: `name` or `Type name` */
         zan_ast_node_t *elem_type = NULL;
         bool is_kw_type =
             parser_check(p, TK_INT) || parser_check(p, TK_LONG) ||
@@ -2331,18 +2174,13 @@ static zan_ast_node_t *parse_tuple_decon_body(zan_parser_t *p, zan_loc_t loc,
     return n;
 }
 
-/* C# embedded statement: body of if/else/while/for/foreach/do. A single
- * statement is wrapped in a block so scoping and block-assuming consumers keep
- * working; a declaration is not an embedded statement (CS1023) -- it would
- * declare a variable nothing can reach. */
+/* C# embedded statement: body of if/else/while/for/foreach/do */
 static zan_ast_node_t *parse_embedded_stmt(zan_parser_t *p) {
     if (parser_check(p, TK_LBRACE)) {
         return parse_block(p);
     }
 
-    /* The single-statement path recurses parse_statement without passing
-     * parse_block; count the depth here too (same guard as parse_block;
-     * the braces path is already counted there). */
+    /* 内部辅助逻辑 */
     if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
         zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
                       "statement nesting too deep (max %d)",
@@ -2377,9 +2215,7 @@ static zan_ast_node_t *parse_embedded_stmt(zan_parser_t *p) {
     return block;
 }
 
-/* Heuristic: does the current position look like a variable declaration
- * (`type name`, `var/let/const name`)? The raw-source scans below
- * disambiguate declaration shapes from expression statements. */
+/* 内部辅助逻辑 */
 static bool looks_like_var_decl(zan_parser_t *p) {
     if (parser_check(p, TK_VAR) || parser_check(p, TK_LET) || parser_check(p, TK_CONST)) {
         return true;
@@ -2389,10 +2225,7 @@ static bool looks_like_var_decl(zan_parser_t *p) {
     case TK_UINT: case TK_ULONG: case TK_USHORT: case TK_SBYTE:
     case TK_FLOAT: case TK_DOUBLE: case TK_DECIMAL: case TK_BOOL: case TK_CHAR:
     case TK_STRING: case TK_VOID: case TK_OBJECT: case TK_NINT: {
-        /* `int x = 3;` declares, but `int.Parse("abc");` is an expression
-         * statement on a builtin type's static member: a dot after the type
-         * keyword (past any array rank) means expression. `void` never starts
-         * an expression, so it stays an unconditional declaration. */
+        /* `int x = 3;` declares, but `int */
         if (p->current.kind == TK_VOID) return true;
         const char *s = p->lex->source;
         size_t q = p->lex->pos, n = p->lex->source_len;
@@ -2400,9 +2233,7 @@ static bool looks_like_var_decl(zan_parser_t *p) {
         while (q < n && ZAN_TKW_WS(s[q])) q++;
         while (q < n && s[q] == '[') {
             size_t r = q + 1;
-            /* Array-rank specifier: only whitespace and commas may sit
-             * between the brackets. int[]/int[,] all declare; anything else
-             * (a dot like int.Parse, or junk) goes to the expression path. */
+            /* Array-rank specifier: only whitespace and commas may sit between the brackets */
             while (r < n && (ZAN_TKW_WS(s[r]) || s[r] == ',')) r++;
             if (r >= n || s[r] != ']') return false;
             q = r + 1;
@@ -2417,9 +2248,7 @@ static bool looks_like_var_decl(zan_parser_t *p) {
         if (peek.kind == TK_IDENT) {
             return true;
         }
-        /* `List<int> name` declares, but `Stat<int>.s = 7;` is a statement on
-         * a generic instantiation: only a name after the matching `>` (past
-         * any array rank) makes this a declaration. */
+        /* `List<int> name` declares, but `Stat<int> */
         if (peek.kind == TK_LESS) {
             const char *s = p->lex->source;
             size_t q = p->lex->pos, n = p->lex->source_len;
@@ -2449,9 +2278,7 @@ static bool looks_like_var_decl(zan_parser_t *p) {
             #undef ZAN_GA_WS
             #undef ZAN_GA_IDSTART
         }
-        /* qualified type decl: `A.B.C name` / `A.B<T> name` / `A.B[] name`.
-         * Scan the raw source across the dotted chain, then check what
-         * follows so `a.b.c()` / `a.b = x` stay expressions. */
+        /* qualified type decl: `A */
         if (peek.kind == TK_DOT) {
             const char *s = p->lex->source;
             size_t q = p->lex->pos, n = p->lex->source_len;
@@ -2468,8 +2295,7 @@ static bool looks_like_var_decl(zan_parser_t *p) {
             }
             while (q < n && ZAN_WS(s[q])) q++;
             if (q < n && s[q] == '<') {
-                /* `A.B<T> name` declares, but `db.Select<T>()` is a generic
-                 * call: only a name after the matching `>` counts. */
+                /* `A */
                 int gd = 0; size_t r = q;
                 while (r < n) {
                     char gc = s[r];
@@ -2504,9 +2330,7 @@ static bool looks_like_var_decl(zan_parser_t *p) {
             #undef ZAN_IDCONT
             return false;
         }
-        /* `Ident? name` declares a nullable-typed variable; `c ? a : b` is a
-         * conditional (its second operand is followed by `:`). Require a name
-         * then `=`/`;` after the `?`. */
+        /* 内部辅助逻辑 */
         if (peek.kind == TK_QUESTION) {
             const char *s = p->lex->source;
             size_t q = p->lex->pos, n = p->lex->source_len;
@@ -2533,9 +2357,7 @@ static bool looks_like_var_decl(zan_parser_t *p) {
             #undef ZAN_NQ_IDCONT
             return is_decl;
         }
-        /* `Ident[] name` (array-typed decl) vs `arr[i]` (index expression):
-         * only a declaration when the brackets are empty. Scan the raw source
-         * after the current identifier for a `[` immediately followed by `]`. */
+        /* 内部辅助逻辑 */
         if (peek.kind == TK_LBRACKET) {
             const char *s = p->lex->source;
             size_t q = p->lex->pos, n = p->lex->source_len;
@@ -2551,9 +2373,7 @@ static bool looks_like_var_decl(zan_parser_t *p) {
         return false;
     }
     case TK_LPAREN: {
-        /* tuple-typed variable `(int, int) t = rhs;`: scan to the matching
-         * `)` then require an identifier. Non-consuming (lexer_peek_n
-         * restores state), so `(a, b) = rhs` falls through. */
+        /* 内部辅助逻辑 */
         int depth = 0;
         for (int k = 1; k < 64; k++) {
             zan_token_t tk = lexer_peek_n(p, k);
@@ -2619,10 +2439,7 @@ static zan_ast_node_t *parse_var_decl(zan_parser_t *p) {
     decl->var_decl.is_const = is_const;
     decl->var_decl.is_let = is_let;
 
-    /* Single-line multi-declarator `int a = 0, b = 2;`: later declarators
-     * share this declaration's type/const/let, carry their own initializer,
-     * and queue in pending_stmts for the enclosing statement collector to
-     * splice in right after, keeping source order. */
+    /* 内部辅助实现 */
     zan_ast_list_init(&p->pending_stmts);
     while (parser_match(p, TK_COMMA)) {
         zan_istr_t more = {0};
@@ -2662,9 +2479,7 @@ static zan_ast_node_t *parse_if_stmt(zan_parser_t *p) {
     zan_ast_node_t *else_body = NULL;
     if (parser_match(p, TK_ELSE)) {
         if (parser_check(p, TK_IF)) {
-            /* the else-if chain recurses parse_if_stmt directly, without
-             * parse_block/parse_embedded_stmt; count it with the same
-             * statement depth */
+            /* 内部辅助逻辑 */
             if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
                 zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
                               "statement nesting too deep (max %d)",
@@ -2707,12 +2522,7 @@ static zan_ast_node_t *parse_for_stmt(zan_parser_t *p) {
     parser_expect(p, TK_LPAREN);
 
     zan_ast_node_t *init = NULL;
-    /* For-head multi-declarators (`for (int i = 0, j = i; ...)`) are parsed
-     * right here: parse_var_decl's extras would be spliced AFTER the for
-     * statement, letting `j` escape the loop scope. Two or more declarators
-     * wrap head + for in a synthetic block (the C# scoping rule: the
-     * variables live for cond/step/body); a single declarator keeps the
-     * plain init shape. */
+    /* For-head multi-declarators (`for (int i = 0, j = i; */
     zan_ast_list_t head_decls;
     zan_ast_list_init(&head_decls);
     int head_count = 0;
@@ -2732,9 +2542,7 @@ static zan_ast_node_t *parse_for_stmt(zan_parser_t *p) {
             }
 
             if (dtype == NULL && parser_check(p, TK_LPAREN) && !is_const) {
-                /* deconstruction head `for (var (a, b) = pair; ...)`: a
-                 * single statement-shaped node; parse_tuple_decon_body
-                 * consumes the `;` itself */
+                /* deconstruction head `for (var (a, b) = pair; */
                 init = parse_tuple_decon_body(p, loc, dtype);
             } else {
                 for (;;) {
@@ -2765,8 +2573,7 @@ static zan_ast_node_t *parse_for_stmt(zan_parser_t *p) {
             }
             goto parse_cond;
         } else {
-            /* `for (r = 0; ...)`: a bare-expression init, wrapped in EXPR_STMT
-             * so it lowers like a statement (async-detach/ARC-drop included). */
+            /* `for (r = 0; */
             zan_loc_t eloc = p->current.loc;
             zan_ast_node_t *expr = parse_expression(p);
             parser_expect(p, TK_SEMICOLON);
@@ -2858,10 +2665,7 @@ static zan_ast_node_t *parse_return_stmt(zan_parser_t *p) {
     return n;
 }
 
-/* True when the current token starts a switch type pattern: `case T x:` or
- * `case T:` — a type keyword, or a name followed by another name / `<` / `?` /
- * `[` (so `case Color.Red:` and `case SomeConst:` stay constant patterns).
- * Mirrors the variable-declaration heuristic in looks_like_var_decl. */
+/* 内部辅助实现 */
 static bool is_case_type_pattern(zan_parser_t *p) {
     switch (p->current.kind) {
     case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
@@ -2910,8 +2714,7 @@ static zan_ast_node_t *parse_switch_stmt(zan_parser_t *p) {
                 /* `case 5:` / `case Color.Red:` / `case null:` */
                 pattern = parse_expression(p);
             }
-            /* `case ... when guard:` — the guard runs after the pattern var
-             * is bound, so it can reference it. */
+            /* `case */
             if (parser_match(p, TK_WHEN)) {
                 when_cond = parse_expression(p);
             }
@@ -2996,9 +2799,7 @@ static zan_ast_node_t *parse_try_stmt(zan_parser_t *p) {
     return n;
 }
 
-/* Skip a balanced `<...>` generic-args group; p->lex sits just before the `<`
- * (the detecting peek was non-consuming). Returns false at EOF/`;` first
- * (e.g. a comparison `a < b`), so the caller restores the lexer. */
+/* Skip a balanced `< */
 static bool skip_angle_group(zan_parser_t *p) {
     int depth = 0;
     for (;;) {
@@ -3012,16 +2813,11 @@ static bool skip_angle_group(zan_parser_t *p) {
     }
 }
 
-/* Detect a local function declaration at statement position: `R Name(params)
- * { body }` or `R Name(params) => expr;`. Structural rule: after the type and
- * the name comes `(`, and the matching `)` is followed by `{` or `=>` -- a
- * call or an initialized declaration ends differently. The lexer is restored
- * on every path. */
+/* 内部辅助逻辑 */
 static bool looks_like_local_func(zan_parser_t *p) {
     zan_lexer_t saved = *p->lex;
 
-    /* The lexer sits past p->current, so the first type token IS p->current
-     * and every later token comes from zan_lexer_next/peek. */
+    /* 内部辅助逻辑 */
     zan_token_t t = p->current;
 
     switch (t.kind) {
@@ -3077,8 +2873,7 @@ static bool looks_like_local_func(zan_parser_t *p) {
 
     if (zan_lexer_next(p->lex).kind != TK_LPAREN) { *p->lex = saved; return false; }
 
-    /* scan to the matching `)`; a `;` or EOF before it means this is a call
-     * or a var decl, not a local function */
+    /* 内部辅助逻辑 */
     {
         int depth = 1;
         while (depth > 0) {
@@ -3096,10 +2891,7 @@ static bool looks_like_local_func(zan_parser_t *p) {
     return tail.kind == TK_LBRACE || tail.kind == TK_ARROW;
 }
 
-/* Parse a local function declaration and hoist it into the enclosing type as
- * a private static method. The statement itself produces nothing (a caller
- * cannot capture the definition site), but its name becomes a member so bare
- * `Name(args)` calls inside the enclosing method resolve to it. */
+/* 内部辅助逻辑 */
 static zan_ast_node_t *parse_local_func(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
@@ -3178,8 +2970,7 @@ static zan_ast_node_t *parse_local_func(zan_parser_t *p) {
 }
 
 static zan_ast_node_t *parse_statement(zan_parser_t *p) {
-    /* `yield` is contextual: only `yield return expr;` / `yield break;` are
-     * statements, so identifiers named `yield` keep working elsewhere. */
+    /* 内部辅助逻辑 */
     if (p->current.kind == TK_IDENT && p->current.str_val.len == 5 &&
         memcmp(p->current.str_val.str, "yield", 5) == 0) {
         zan_token_kind_t nk = zan_lexer_peek(p->lex).kind;
@@ -3206,7 +2997,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         return n;
     }
 
-    /* `checked { ... }` / `unchecked { ... }` statement block (contextual). */
+    /* `checked { */
     if (is_checked_use(p) && zan_lexer_peek(p->lex).kind == TK_LBRACE) {
         zan_loc_t loc = p->current.loc;
         bool is_checked = p->current.str_val.len == 7;
@@ -3214,10 +3005,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         if (is_checked) p->checked_depth++; else p->unchecked_depth++;
         zan_ast_node_t *blk = parse_block(p);
         if (is_checked) p->checked_depth--; else p->unchecked_depth--;
-        /* A FRESH wrapper node, not a kind-mutation of the block: the union
-         * is untagged and checked_stmt.body aliases block.stmts.items, so
-         * reusing the block node would read the stmt-array pointer as a child
-         * node. The block rides as the body. */
+        /* 内部辅助逻辑 */
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_CHECKED_STMT, loc);
         n->checked_stmt.checked = is_checked;
         n->checked_stmt.body = blk;
@@ -3252,8 +3040,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
     case TK_THROW: {
         zan_loc_t loc = p->current.loc;
         parser_advance(p);
-        /* `throw;` (C# rethrow): no operand -- the enclosing catch's exception
-         * travels on unchanged, keeping its original dynamic type */
+        /* 内部辅助逻辑 */
         zan_ast_node_t *value = NULL;
         if (p->current.kind != TK_SEMICOLON)
             value = parse_expression(p);
@@ -3268,8 +3055,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         return parse_try_stmt(p);
     case TK_DEFER: {
         zan_loc_t loc = p->current.loc;
-        /* `defer defer ...` chains recurse parse_statement directly, past the
-         * depth guard in parse_block_stmts; count each defer here */
+        /* `defer defer */
         if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
             zan_diag_emit(p->diag, DIAG_ERROR, loc,
                           "statement nesting too deep (max %d)",
@@ -3302,9 +3088,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         return n;
     }
     case TK_USING: {
-        /* `using (Type name = expr) body` / `using (expr) body`: lowered to
-         * try/finally + a Dispose() call on the resource; a bare expression
-         * gets a synthetic temp to hold it. */
+        /* 内部辅助逻辑 */
         zan_loc_t loc = p->current.loc;
         parser_advance(p);
         parser_expect(p, TK_LPAREN);
@@ -3314,8 +3098,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         zan_ast_node_t *init = NULL;
 
         if (looks_like_var_decl(p)) {
-            /* using (Type name = expr) -- parse the declaration inline; the
-             * closing `)` ends it, not a semicolon. */
+            /* 内部辅助逻辑 */
             zan_ast_node_t *tref = parse_type_ref(p);
             type = tref;
             if (parser_check(p, TK_IDENT)) {
@@ -3344,9 +3127,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         zan_ast_list_init(&outer->block.stmts);
 
         if (type || !init) {
-            /* `using (Type name = expr)`: type carries the declared type; if
-             * the declared form had no initializer (unusual) the var decl is
-             * still pushed so the name binds in the body scope. */
+            /* 内部辅助逻辑 */
             zan_ast_node_t *decl = zan_ast_new(p->arena, AST_VAR_DECL, loc);
             decl->var_decl.name = name;
             decl->var_decl.type = type; /* NULL when `using (var x = ...)` */
@@ -3399,8 +3180,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         parser_expect(p, TK_RPAREN);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_LOCK_STMT, loc);
         n->lock_stmt.expr = expr;
-        /* parse_embedded_stmt, not parse_statement: a bare `lock(o)lock(o)...`
-         * chain must be depth-counted like the other single-statement bodies */
+        /* parse_embedded_stmt, not parse_statement: a bare `lock(o)lock(o) */
         n->lock_stmt.body = parse_embedded_stmt(p);
         return n;
     }
@@ -3414,12 +3194,11 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         return n;
     }
     case TK_UNSAFE:
-        /* unsafe { ... } — everything is "unsafe" here; just run the block */
+        /* unsafe { */
         parser_advance(p);
         return parse_block(p);
     case TK_FIXED: {
-        /* fixed (T name = expr) body — no GC to pin against, so this is a
-         * scoped alias: { T name = expr; body } */
+        /* 内部辅助逻辑 */
         zan_loc_t loc = p->current.loc;
         parser_advance(p);
         parser_expect(p, TK_LPAREN);
@@ -3436,8 +3215,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         decl->var_decl.initializer = init;
         decl->var_decl.is_const = false;
         decl->var_decl.is_let = false;
-        /* parse_embedded_stmt, not parse_statement: `fixed(...)` bodies chain
-         * like if/while bodies and must hit the same depth guard */
+        /* parse_embedded_stmt, not parse_statement: `fixed( */
         zan_ast_node_t *body = parse_embedded_stmt(p);
         zan_ast_node_t *blk = zan_ast_new(p->arena, AST_BLOCK, loc);
         zan_ast_list_init(&blk->block.stmts);
@@ -3463,10 +3241,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         break;
     }
 
-    /* local function: hoisted to the enclosing type as a private static
-     * method (the statement itself is a no-op), so a bare `Name(args)` call
-     * resolves through normal same-class member lookup. Detected before the
-     * var-decl check: `int F(...)` and `int x = ...` start the same way. */
+    /* 内部辅助实现 */
     if (looks_like_local_func(p)) {
         return parse_local_func(p);
     }
@@ -3489,9 +3264,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
     return n;
 }
 
-/* `where T : C1, C2 ...` generic constraint clauses. Reference/value/ctor
- * constraints (`class`, `struct`, `new()`) are accepted but not recorded;
- * named type constraints are collected for the checker to enforce. */
+/* `where T : C1, C2 */
 static void parse_where_clauses(zan_parser_t *p, zan_ast_list_t *out) {
     while (parser_check(p, TK_WHERE)) {
         parser_advance(p);
@@ -3529,17 +3302,14 @@ static void parse_where_clauses(zan_parser_t *p, zan_ast_list_t *out) {
 static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
-    /* `this` modifier on the first parameter marks an extension method:
-     * `static R M(this T recv, ...)` is callable as `recv.M(...)`. */
+    /* 内部辅助逻辑 */
     int is_this = 0;
     if (parser_check(p, TK_THIS)) {
         parser_advance(p);
         is_this = 1;
     }
 
-    /* Contextual `params` modifier: `params T[] rest`. The declared type stays
-     * `T[]` as written, like C#: the bundle is an array, and the callee reads
-     * `rest.Length`. */
+    /* Contextual `params` modifier: `params T[] rest` */
     int is_params = 0;
     if (parser_check(p, TK_IDENT) && p->current.str_val.len == 6 &&
         memcmp(p->current.str_val.str, "params", 6) == 0) {
@@ -3589,11 +3359,7 @@ static zan_ast_list_t parse_param_list(zan_parser_t *p) {
     return params;
 }
 
-/* Iterator methods are lowered eagerly: a method containing `yield` gets a
- * hidden `List<T> __yield` accumulator, each `yield return e` appends to it,
- * `yield break` returns it early, and the method returns the finished list
- * (its `IEnumerable<T>` return type is rewritten to `List<T>`, which foreach
- * already iterates). */
+/* 内部辅助实现 */
 
 static bool stmt_contains_yield(zan_ast_node_t *s);
 
@@ -3746,8 +3512,7 @@ static void desugar_async_task_method(zan_parser_t *p, zan_ast_node_t *m) {
     bool is_valuetask = (rt->type_ref.name.len == 9 && memcmp(rt->type_ref.name.str, "ValueTask", 9) == 0);
     if (!is_task && !is_valuetask) return;
 
-    /* C# compatibility: `async Task<T>` -> `T` and `async Task` -> `void`.
-     * Also stamps abstract/interface signatures without bodies. */
+    /* C# compatibility: `async Task<T>` -> `T` and `async Task` -> `void` */
     if ((m->method_decl.modifiers & MOD_ASYNC) != 0 || m->method_decl.body == NULL) {
         if ((m->method_decl.modifiers & MOD_ASYNC) == 0) {
             m->method_decl.modifiers |= MOD_ASYNC;
@@ -3768,11 +3533,7 @@ static void desugar_async_task_method(zan_parser_t *p, zan_ast_node_t *m) {
 static void parse_attr_usages(zan_parser_t *p, zan_ast_list_t *out,
                               zan_istr_t *out_lib, zan_istr_t *out_entry,
                               bool *out_variadic) {
-    /* Parse zero or more `[A, B(...)]` attribute groups; each becomes an
-     * AST_ATTRIBUTE (name = last dotted segment; args = positional expressions
-     * and AST_ASSIGNMENT nodes for `Name = value`) retained on the following
-     * declaration. `[DllImport(...)]` is also decoded into *out_lib /
-     * *out_entry, and its `Variadic = true` named argument into *out_variadic. */
+    /* Parse zero or more `[A, B( */
     while (parser_check(p, TK_LBRACKET)) {
         parser_advance(p);
         for (;;) {
@@ -3844,10 +3605,7 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
                                                zan_istr_t dll_entry_point,
                                                bool dll_variadic);
 
-/* Synthesize the accessor method of a property with a custom body (`get_Prop`
- * / `set_Prop`). The AST_METHOD_DECL joins the type's members via
- * p->pending_members so it flows through nsresolve/binder/irgen exactly like a
- * handwritten method. */
+/* 内部辅助逻辑 */
 static zan_ast_node_t *synth_property_accessor(zan_parser_t *p, zan_istr_t name,
                                                zan_ast_node_t *ret_type,
                                                zan_ast_node_t *value_type,
@@ -3892,8 +3650,7 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
                                                bool dll_variadic) {
     uint32_t mods = parse_modifiers(p);
     if (dll_import_lib.str) mods |= MOD_EXTERN;
-    /* `event` is contextual: only a modifier when introducing an event field
-     * (`event D E;`), so identifiers named `event` keep working elsewhere. */
+    /* 内部辅助逻辑 */
     if (parser_check(p, TK_IDENT) && p->current.str_val.len == 5 &&
         memcmp(p->current.str_val.str, "event", 5) == 0 &&
         zan_lexer_peek(p->lex).kind == TK_IDENT) {
@@ -3901,9 +3658,7 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         mods |= MOD_EVENT;
     }
 
-    /* `partial` is contextual here too: only a modifier right before a type
-     * keyword (nested `partial class` parts merge with their top-level
-     * parts once the nested types are hoisted to unit level). */
+    /* 内部辅助逻辑 */
     if (parser_check(p, TK_IDENT) && p->current.str_val.len == 7 &&
         memcmp(p->current.str_val.str, "partial", 7) == 0) {
         zan_token_kind_t nk = zan_lexer_peek(p->lex).kind;
@@ -3913,17 +3668,13 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         }
     }
 
-    /* nested type declaration: `[mods] class|struct|interface|enum Name {...}`
-     * inside a class body. The member modifier parser has already consumed
-     * `static`/`sealed`/... so the remaining token is the type keyword. */
+    /* nested type declaration: `[mods] class|struct|interface|enum Name { */
     if (parser_check(p, TK_CLASS) || parser_check(p, TK_STRUCT) ||
         parser_check(p, TK_INTERFACE) || parser_check(p, TK_ENUM)) {
         return parse_type_decl(p, mods);
     }
 
-    /* nested delegate declaration: `[mods] delegate R Name(params);` -- the
-     * same AST as a unit-level delegate; zan_parser_flatten_nested_types
-     * hoists it out of the type body so it binds identically. */
+    /* 内部辅助逻辑 */
     if (parser_check(p, TK_DELEGATE)) {
         return parse_delegate_decl(p, mods);
     }
@@ -3949,10 +3700,7 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         return n;
     }
 
-    /* user-defined conversion operator `implicit/explicit operator T2(T1)`.
-     * `implicit`/`explicit` are contextual: only here, where a member's return
-     * type would be, do they introduce a conversion. Lowers to a static
-     * `op_implicit`/`op_explicit` method. */
+    /* user-defined conversion operator `implicit/explicit operator T2(T1)` */
     if (parser_check(p, TK_IDENT) &&
         zan_lexer_peek(p->lex).kind == TK_OPERATOR) {
         zan_istr_t kw = p->current.str_val;
@@ -4078,10 +3826,7 @@ ordinary_member:
         return n;
     }
 
-    /* indexer: `type this[params] { get ... set ... }` / `=> expr;`. Lowers to
-     * the op_index/op_index_set protocol: synthesized instance methods whose
-     * receiver is `this` (irgen passes the indexed object as the first
-     * argument). Accessor bodies keep their C# shape. */
+    /* indexer: `type this[params] { get */
     if (parser_check(p, TK_THIS)) {
         parser_advance(p);
         parser_expect(p, TK_LBRACKET);
@@ -4161,18 +3906,13 @@ ordinary_member:
         n->field_decl.has_getter = has_getter;
         n->field_decl.has_setter = has_setter;
         n->field_decl.has_init = has_init;
-        /* Keep the index parameter list on the property node: the binder
-         * exempts two "Item" properties from the name-only duplicate check
-         * when both are indexers — their identity is the synthesized
-         * op_index signature, which still rejects identical signatures. */
+        /* 内部辅助实现 */
         zan_ast_list_t *iparams =
             (zan_ast_list_t *)zan_arena_alloc(p->arena, sizeof(zan_ast_list_t));
         *iparams = idx_params;
         n->field_decl.indexer_params = iparams;
 
-        /* Synthesize instance op_index(index...) / op_index_set(index..., value)
-         * methods for custom bodies; an automatic accessor (no body) is
-         * skipped -- the caller falls back to the plain array/list slot path. */
+        /* Synthesize instance op_index(index */
         if (getter_body) {
             zan_ast_node_t *g = zan_ast_new(p->arena, AST_METHOD_DECL, loc);
             zan_istr_t gistr = {(char *)"op_index", 8};
@@ -4211,9 +3951,7 @@ ordinary_member:
     parser_advance(p);
     zan_istr_t name = p->previous.str_val;
 
-    /* expression-bodied property `type Name => expr;`: get-only. A
-     * synthesized `get_<name>` is queued so a bare read `a.Name` (no
-     * parentheses) lowers to the accessor call. */
+    /* expression-bodied property `type Name => expr;`: get-only */
     if (parser_check(p, TK_ARROW)) {
         parser_advance(p);
         zan_ast_node_t *expr = parse_expression(p);
@@ -4306,7 +4044,7 @@ ordinary_member:
         return n;
     }
 
-    /* property: type Name { get; set; } or type Name { get { ... } set { ... } } */
+    /* property: type Name { get; set; } or type Name { get { */
     if (parser_check(p, TK_LBRACE)) {
         zan_token_t peek = zan_lexer_peek(p->lex);
         if (peek.kind == TK_GET || peek.kind == TK_SET) {
@@ -4369,9 +4107,7 @@ ordinary_member:
             n->field_decl.has_setter = has_setter;
             n->field_decl.has_init = has_init;
 
-            /* A custom getter/setter body needs a real method to call on read
-             * `a.Name` / write `a.Name = v`: synthesize `get_<name>` /
-             * `set_<name>` and queue them right after this member. */
+            /* A custom getter/setter body needs a real method to call on read `a */
             if (getter_body) {
                 size_t gn = 4;
                 char *gname = (char *)zan_arena_alloc(p->arena,
@@ -4402,9 +4138,7 @@ ordinary_member:
         }
     }
 
-    /* field with C#-style comma declarators: each name becomes its own field
-     * sharing the declared type/modifiers; extras queue through
-     * pending_members so the class body keeps declaration order. */
+    /* 内部辅助逻辑 */
     zan_ast_node_t *init = NULL;
     if (parser_match(p, TK_EQ)) {
         init = parse_expression(p);
@@ -4467,8 +4201,7 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
     zan_ast_list_init(&type_params);
     if (parser_match(p, TK_LESS)) {
         while (!parser_check(p, TK_GREATER) && !parser_check(p, TK_EOF)) {
-            /* C# variance annotation `out T` / `in T`: accepted and consumed
-             * (the type system stays invariant), not recorded. */
+            /* 内部辅助逻辑 */
             if (parser_check(p, TK_OUT) || parser_check(p, TK_IN)) {
                 parser_advance(p);
             }
@@ -4526,15 +4259,13 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
             if (member) {
                 zan_ast_list_push(&members, member, p->arena);
             }
-            /* Drain synthesized get_<name>/set_<name> accessors into the
-             * member list so they participate like handwritten methods. */
+            /* 内部辅助逻辑 */
             for (int pi = 0; pi < p->pending_members.count; pi++) {
                 zan_ast_list_push(&members, p->pending_members.items[pi],
                                   p->arena);
             }
             p->pending_members.count = 0;
-            /* forward-progress guard: a member that fails to parse without
-             * consuming its offending token must not spin the loop. */
+            /* 内部辅助逻辑 */
             if (p->current.loc.offset == before && !parser_check(p, TK_EOF)) {
                 parser_advance(p);
             }
@@ -4611,11 +4342,7 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
 
         unit->comp_unit.ns = ns;
 
-        /* Block-scoped `namespace X { ... }`: members land in comp_unit.decls
-         * and get the same ns stamping as file-scoped declarations (stamping
-         * keys off the unit's single ns slot; the binder only sees
-         * comp_unit.decls). At most one namespace per file: a later namespace
-         * header would join this block's name. */
+        /* Block-scoped `namespace X { */
         if (!ns->namespace_decl.is_file_scoped) {
             for (;;) {
                 if (parser_match(p, TK_RBRACE)) break;
@@ -4634,8 +4361,7 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
         if (!parse_top_level_decl(p, unit))
             parser_advance(p); /* skip to recover */
         if (parser_check(p, TK_RBRACE)) {
-            /* A stray `}` at top level: diagnose and skip it so
-             * following decls still parse. */
+            /* A stray `}` at top level: diagnose and skip it so following decls still parse */
             zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
                           "unexpected '}' at top level");
             parser_advance(p);
@@ -4645,11 +4371,7 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
     return unit;
 }
 
-/* `event D E;` fields are lowered to a generated multicast holder class
- * `__Event_D` backed by a `List<D>`; its op_add/op_sub drive the
- * compound-assignment desugar, so subscription needs no dedicated codegen.
- * `E.Invoke(...)` raises the event, `E.Count()` reports handlers; the holder
- * is materialized lazily in op_add (null until first subscription, like C#). */
+/* 内部辅助实现 */
 
 static zan_ast_node_t *find_delegate_decl(zan_ast_node_t *unit, zan_istr_t name) {
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
@@ -4662,14 +4384,8 @@ static zan_ast_node_t *find_delegate_decl(zan_ast_node_t *unit, zan_istr_t name)
     return NULL;
 }
 
-/* Bounded append into the synthetic-source buffers. `*off` saturates at cap,
- * so cap - *off can never underflow to a huge size_t. Callers pass `&n` and
- * read `n` back afterwards; never write `n += zsrc_append(...)` -- the
- * function already updates n through the pointer, and mixing the two is
- * unspecified evaluation order that double-counts on some compilers, leaving
- * gaps of uninitialized stack bytes in the generated source. */
-/* Capacity of the synthetic-source buffers; sized far above any plausible
- * declaration, with overflow reported as an error. */
+/* Bounded append into the synthetic-source buffers */
+/* 内部辅助逻辑 */
 #define ZAN_GEN_SRC_CAP (256 * 1024)
 
 static void zsrc_append(char *buf, int cap, int *off, const char *fmt, ...) {
@@ -4755,8 +4471,7 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
         "        }\n"
         "    }\n");
 
-    /* `E(args)` raises the event; the holder is null until the first
-     * subscription, and a call with no subscribers does nothing. */
+    /* 内部辅助逻辑 */
     int params_len = invoke_params_end - invoke_params_at;
     char *params = (char *)malloc((size_t)params_len + 1);
     if (!params) { free(src); return; }
@@ -4795,9 +4510,7 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
                           arena);
 }
 
-/* Lower `record Name(T1 A, T2 B);` into a class with public fields, a
- * positional constructor, field-wise op_eq/op_neq value equality, and a
- * C#-style ToString. */
+/* 内部辅助逻辑 */
 static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
                              zan_ast_list_t *params, zan_arena_t *arena,
                              zan_diag_t *diag) {
@@ -4832,9 +4545,7 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
                          (int)pp->param.name.len, pp->param.name.str);
     }
     zsrc_append(src, cap, &n, "    }\n");
-    /* __CloneWith: full-argument copy, the lowering target of
-     * `recv with { ... }` — irgen passes every positional field in order,
-     * substituted values for the fields the with-assignments name. */
+    /* __CloneWith: full-argument copy, the lowering target of `recv with { */
     zsrc_append(src, cap, &n, "    public %s __CloneWith(", nm);
     for (int i = 0; i < params->count; i++) {
         zan_ast_node_t *pp = params->items[i];
@@ -4908,10 +4619,7 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
                           arena);
 }
 
-/* Merge `partial` type declarations: members and bases of later parts are
- * appended to the first part of the same name/kind, and later parts are
- * dropped from the unit. Runs before binding, so the rest of the pipeline
- * only ever sees one declaration per type. */
+/* 内部辅助实现 */
 void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
                                zan_diag_t *diag) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
@@ -4960,9 +4668,7 @@ void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
     (void)diag;
 }
 
-/* Hoist one nested type declaration out of `type_node`'s member list into the
- * compilation-unit top level, recursing into deeper nesting first so the
- * whole subtree is lifted. Returns the number of types hoisted. */
+/* 内部辅助逻辑 */
 static int hoist_nested_types(zan_ast_node_t *unit, zan_ast_node_t *type_node,
                               zan_ast_list_t *decls, zan_arena_t *arena) {
     int hoisted = 0;
@@ -4981,9 +4687,7 @@ static int hoist_nested_types(zan_ast_node_t *unit, zan_ast_node_t *type_node,
         } else if (mem->kind == AST_CLASS_DECL || mem->kind == AST_STRUCT_DECL ||
                    mem->kind == AST_INTERFACE_DECL || mem->kind == AST_ENUM_DECL) {
             hoisted += hoist_nested_types(unit, mem, decls, arena);
-            /* Remember the host so the binder can re-link the lifted type
-             * (Host.Nested member access). Delegates share the method_decl
-             * union and cannot carry this stamp. */
+            /* Remember the host so the binder can re-link the lifted type (Host */
             mem->type_decl.nested_host = type_node;
             zan_ast_list_push(decls, mem, arena);
             hoisted++;

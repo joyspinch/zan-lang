@@ -1,5 +1,4 @@
-/* binder.c -- name resolution and symbol table. Pass 1 registers type
- * declarations in the global scope; pass 2 binds members and resolves types. */
+/* binder */
 
 #include "binder.h"
 #include "arena.h"
@@ -52,8 +51,7 @@ static void symbol_add_member(zan_arena_t *arena, zan_symbol_t *parent, zan_symb
     parent->members[parent->member_count++] = child;
 }
 
-/* FNV-1a over the identifier bytes; strings are not interned, so this hash is
- * what makes scope lookups O(1). */
+/* 内部辅助逻辑 */
 static uint32_t istr_hash(zan_istr_t name) {
     uint32_t h = 2166136261u;
     for (uint32_t i = 0; i < name.len; i++) {
@@ -74,10 +72,7 @@ static zan_scope_t *scope_new(zan_arena_t *arena, zan_scope_t *parent) {
     return s;
 }
 
-/* Grow the name index to the next power-of-two bucket count and rebuild it
- * from the symbols array. Forward walk + tail-append keeps every bucket in
- * insertion order; dead hash links stay in the arena (freed at end of
- * compile). */
+/* 内部辅助逻辑 */
 static void scope_index_grow(zan_arena_t *arena, zan_scope_t *scope) {
     int nc = scope->bucket_count < 16 ? 16 : scope->bucket_count * 2;
     zan_symbol_t **nb = (zan_symbol_t **)zan_arena_alloc(
@@ -108,10 +103,7 @@ static void scope_add(zan_arena_t *arena, zan_scope_t *scope, zan_symbol_t *sym)
     }
     scope->symbols[scope->sym_count++] = sym;
 
-    /* Keep the name index in step with the array: new symbols are appended at
-     * the TAIL of their bucket so a bucket reads in insertion order --
-     * scope_find's first-match tie-break for overloaded or redeclared names
-     * stays the linear scan's. */
+    /* 内部辅助实现 */
     sym->name_hash = istr_hash(sym->name);
     if (scope->sym_count > scope->bucket_count)   /* load factor 1 */
         scope_index_grow(arena, scope);
@@ -164,14 +156,8 @@ void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag) {
     b->type_typeinfo = make_type(arena, TYPE_STRUCT, "TypeInfo", 8);
 }
 
-/* A member name denotes either storage (field/property) or code (method),
- * never both: `Class.Name` in a value context reads the storage slot, so a
- * method sharing that name is unreachable and a delegate built from it would
- * call a data pointer. Partial classes hit this across parts, so both parts
- * are checked against the merged type. */
-/* Structural type identity for overload-duplicate detection: kind + name +
- * recursively compared type arguments. Two declarations of `List<string>`
- * match even though binder makes fresh type nodes per site. */
+/* 内部辅助逻辑 */
+/* 内部辅助逻辑 */
 static bool binder_type_equiv(const zan_type_t *a, const zan_type_t *b) {
     if (a == b) return true;
     if (!a || !b) return false;
@@ -186,9 +172,7 @@ static bool binder_type_equiv(const zan_type_t *a, const zan_type_t *b) {
     return true;
 }
 
-/* Full parameter-list identity: count plus each parameter's declared type.
- * Methods differing only in parameter types are legal overloads; methods
- * with identical lists are duplicate declarations that must be rejected. */
+/* Full parameter-list identity: count plus each parameter's declared type */
 static bool binder_params_equiv(zan_symbol_t *a, zan_symbol_t *b) {
     if (a->member_count != b->member_count) return false;
     for (int i = 0; i < a->member_count; i++) {
@@ -201,8 +185,7 @@ static bool binder_params_equiv(zan_symbol_t *a, zan_symbol_t *b) {
     return true;
 }
 
-/* Generic-method arity is part of overload identity (C# CS0111 exempts
- * `M(string)` from `M<T>(string)`). */
+/* 内部辅助逻辑 */
 static bool binder_type_params_equiv(zan_symbol_t *a, zan_symbol_t *b) {
     int atp = (a->decl && a->decl->kind == AST_METHOD_DECL)
         ? a->decl->method_decl.type_params.count : 0;
@@ -254,8 +237,7 @@ static void midx_buckets_rehash(zan_symbol_t *type,
     ix->bucket_cap = ncap;
 }
 
-/* Insert every member not yet indexed (the checked one, plus any members
- * added without a clash check -- type params, hoisted nested types). */
+/* 内部辅助逻辑 */
 static void midx_catch_up(zan_symbol_t *type,
                           struct zan_member_name_index *ix) {
     while (ix->node_count < type->member_count) {
@@ -348,8 +330,7 @@ static struct zan_member_name_index *midx_for(zan_binder_t *b,
     return ix;
 }
 
-/* One same-name candidate against `added`; true when a diagnostic fired and
- * the scan must stop. Name equality is established by the caller. */
+/* 内部辅助逻辑 */
 static bool member_clash_one(zan_binder_t *b, zan_symbol_t *type_sym,
                              zan_symbol_t *added, zan_symbol_t *m) {
     bool m_is_code = m->kind == SYM_METHOD;
@@ -366,16 +347,9 @@ static bool member_clash_one(zan_binder_t *b, zan_symbol_t *type_sym,
                       type_sym->name.len, type_sym->name.str);
         return true;
     }
-    /* Two members of the same kind with the same name cannot coexist.
-     * Fields collide on name alone (C# CS0102); methods and constructors
-     * collide when the full parameter list matches (C# CS0111, overloads
-     * stay legal); enum members collide on name alone. */
+    /* Two members of the same kind with the same name cannot coexist */
     if (m_is_data && a_is_data) {
-        /* Every indexer property is named "Item" by construction, and C#
-         * overloads them by index signature — exempt indexer/indexer
-         * pairs here; a true duplicate (same index types) is still
-         * rejected when the synthesized op_index methods collide on
-         * name + parameter types below. */
+        /* 内部辅助实现 */
         zan_ast_node_t *ad = added->decl;
         zan_ast_node_t *md = m->decl;
         if (ad && ad->kind == AST_PROPERTY_DECL &&
@@ -420,9 +394,7 @@ static bool member_clash_one(zan_binder_t *b, zan_symbol_t *type_sym,
     return false;
 }
 
-/* Original full scan, kept as the fallback when the same-name candidate
- * count overflows the fast path's fixed buffer (more than 64 overloads of
- * one name) or when the index could not be built. */
+/* 内部辅助逻辑 */
 static void clash_scan_full(zan_binder_t *b, zan_symbol_t *type_sym,
                             zan_symbol_t *added) {
     for (int i = 0; i < type_sym->member_count; i++) {
@@ -440,8 +412,7 @@ static void check_member_name_clash(zan_binder_t *b, zan_symbol_t *type_sym,
     struct zan_member_name_index *ix = midx_for(b, type_sym);
     if (!ix) { clash_scan_full(b, type_sym, added); return; }
     midx_catch_up(type_sym, ix);
-    /* every caller appends `added` right before checking; verify instead of
-     * assuming, so a future caller that checks first cannot self-collide */
+    /* 内部辅助逻辑 */
     int added_idx = type_sym->member_count - 1;
     if (added_idx < 0 || type_sym->members[added_idx] != added) {
         clash_scan_full(b, type_sym, added);
@@ -464,8 +435,7 @@ static void check_member_name_clash(zan_binder_t *b, zan_symbol_t *type_sym,
         }
     }
     if (overflow) { clash_scan_full(b, type_sym, added); return; }
-    /* bucket chains are reverse-declaration order; the flat scan reported
-     * the first (lowest-index) conflict, so restore ascending order */
+    /* 内部辅助逻辑 */
     for (int i = 1; i < nmatch; i++) {
         int v = matches[i];
         int k = i - 1;
@@ -493,8 +463,7 @@ zan_type_t *zan_binder_make_list_type(zan_binder_t *b, zan_type_t *elem) {
     return t;
 }
 
-/* Span<T> is a non-owning value view; it is a value struct (TYPE_STRUCT), so
- * ARC never retains or releases it. */
+/* 内部辅助逻辑 */
 zan_type_t *zan_binder_make_span_type(zan_binder_t *b, zan_type_t *elem) {
     zan_type_t *t = make_type(b->arena, TYPE_STRUCT, "Span", 4);
     t->type_args =
@@ -510,31 +479,21 @@ zan_type_t *zan_binder_make_array_type(zan_binder_t *b, zan_type_t *elem) {
     return t;
 }
 
-/* Grouping<T> is the System.Linq grouping record; a query `group e by k`
- * lowers to List<Grouping<e>>, and `group e by k into g` binds g to one
- * Grouping — both synthesized types need this constructor because there is
- * no syntactic type reference to resolve. */
+/* Grouping<T> is the System */
 zan_type_t *zan_binder_make_grouping_type(zan_binder_t *b, zan_type_t *elem) {
     zan_type_t *t = make_type(b->arena, TYPE_CLASS, "Grouping", 8);
     t->type_args =
         (zan_type_t **)zan_arena_alloc(b->arena, sizeof(zan_type_t *));
     t->type_args[0] = elem;
     t->type_arg_count = 1;
-    /* Attach the real stdlib class symbol: `Grouping` is an ordinary class in
-     * System.Linq, so with no symbol the type has no members and projections
-     * over `g.Key`/`g.Items` neither type-infer nor emit. */
+    /* Attach the real stdlib class symbol: `Grouping` is an ordinary class in System */
     zan_istr_t nm = { "Grouping", 8 };
     zan_symbol_t *sym = zan_binder_lookup(b, nm);
     if (sym && sym->kind == SYM_CLASS) t->sym = sym;
     return t;
 }
 
-/* Render a type into `buf` for use in a tuple signature: the element's simple
- * name with its generic arguments inlined (`List<int>` -> "List<int>"), so
- * two tuples whose element types are structurally identical -- even ones
- * spelled at different sites -- map to one anonymous struct. Returns false
- * when any part did NOT fit and was dropped (the caller must then
- * disambiguate; see zan_binder_make_tuple_type). */
+/* 内部辅助实现 */
 static bool tuple_sig_type(zan_type_t *t, char *buf, size_t cap) {
     if (!t || cap == 0) return true;
     size_t used = strlen(buf);
@@ -580,8 +539,7 @@ static bool tuple_sig_type(zan_type_t *t, char *buf, size_t cap) {
     return ok;
 }
 
-/* FNV-1a over a canonical encoding of a type structure. Never truncated, so
- * it can disambiguate signatures that overflowed the fixed-size name buffer. */
+/* FNV-1a over a canonical encoding of a type structure */
 static uint64_t tuple_type_hash(zan_type_t *t) {
     uint64_t h = 0xcbf29ce484222325ULL;
     while (t) {
@@ -606,8 +564,7 @@ static uint64_t tuple_type_hash(zan_type_t *t) {
     return h;
 }
 
-/* FNV-1a over the canonical tuple signature string: the cache index keys on
- * this string, and equal signatures hash equally by construction. */
+/* 内部辅助逻辑 */
 static uint64_t tuple_sig_hash(const char *s, int len) {
     uint64_t h = 0xcbf29ce484222325ULL;
     for (int i = 0; i < len; i++) {
@@ -617,12 +574,7 @@ static uint64_t tuple_sig_hash(const char *s, int len) {
     return h;
 }
 
-/* C# tuples `(T1, T2, ...)` lower to a canonical anonymous struct whose symbol
- * carries Item1..ItemN field members (ItemN for the N-th element, matching C#'s
- * naming). The type is cached per element signature so a tuple return type and
- * the value constructed at the call site are the same struct -- struct identity
- * is what lets `var t = Make();` assign the returned tuple to an inferred
- * variable and `t.Item1` resolve to a real field. */
+/* C# tuples `(T1, T2, */
 zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,
                                        int count) {
     if (!b || !elems || count <= 0) return b ? b->type_error : NULL;
@@ -638,11 +590,7 @@ zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,
         if (!tuple_sig_type(elems[i], sig, sizeof sig)) complete = false;
     }
     if (!complete) {
-        /* The readable signature overflowed the fixed buffer: two distinct
-         * tuples could truncate to the same prefix and wrongly share one
-         * anonymous struct (type confusion downstream). Append a hash over
-         * the full element structures so every distinct element list keeps a
-         * unique cache key. */
+        /* 内部辅助实现 */
         uint64_t h = 0xcbf29ce484222325ULL;
         for (int i = 0; i < count; i++) {
             uint64_t eh = tuple_type_hash(elems[i]);
@@ -726,8 +674,7 @@ zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,
     return t;
 }
 
-/* Substitute type parameters (matched by declared name in `tps`) with `args`
- * throughout `t`, cloning composite types as needed. */
+/* 内部辅助逻辑 */
 zan_type_t *zan_binder_subst_named(zan_binder_t *b, zan_type_t *t,
                                    zan_ast_list_t *tps, zan_type_t **args) {
     if (!t) return t;
@@ -771,10 +718,7 @@ zan_type_t *zan_binder_subst_named(zan_binder_t *b, zan_type_t *t,
     return nt;
 }
 
-/* Value types have no null representation of their own, so `T?` over one is a
- * real wrapper (irgen lowers it to a payload + has-value pair); over a
- * reference type it is just T. Type parameters are left out -- the substituted
- * type is not known here. */
+/* 内部辅助实现 */
 static bool type_is_value_kind(zan_type_t *t) {
     if (!t) return false;
     switch (t->kind) {
@@ -789,8 +733,7 @@ static bool type_is_value_kind(zan_type_t *t) {
     }
 }
 
-/* `T?` for a type no type reference spells, such as the result of `a?.v`.
- * Over a reference type it is just T, exactly as in zan_binder_resolve_type. */
+/* `T?` for a type no type reference spells, such as the result of `a? */
 zan_type_t *zan_binder_make_nullable_type(zan_binder_t *b, zan_type_t *elem) {
     if (!elem || elem == b->type_error || elem->kind == TYPE_NULLABLE ||
         !type_is_value_kind(elem))
@@ -800,8 +743,7 @@ zan_type_t *zan_binder_make_nullable_type(zan_binder_t *b, zan_type_t *elem) {
     return t;
 }
 
-/* Type-parameter count of a declared type: class/struct/interface/enum keep
- * their own list, a delegate declaration reuses method_decl. */
+/* 内部辅助逻辑 */
 static inline int binder_decl_type_param_count(const zan_ast_node_t *d) {
     if (!d) return 0;
     if (d->kind == AST_DELEGATE_DECL) return d->method_decl.type_params.count;
@@ -811,8 +753,7 @@ static inline int binder_decl_type_param_count(const zan_ast_node_t *d) {
 zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     if (!type_ref) return b->type_error;
     if (type_ref->kind == AST_TUPLE_TYPE) {
-        /* `(int, string)` in type position resolves to a canonical anonymous
-         * struct with Item1..ItemN fields (see zan_binder_make_tuple_type). */
+        /* 内部辅助逻辑 */
         int n = type_ref->tuple_type.elems.count;
         zan_type_t **elems = (zan_type_t **)zan_arena_alloc(
             b->arena, sizeof(zan_type_t *) * (size_t)(n > 0 ? n : 1));
@@ -824,18 +765,14 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         return b->type_error;
     }
 
-    /* Resolving is pure for a given (type reference, scope) pair but allocates
-     * a fresh instantiation type for every generic reference; overload
-     * resolution re-resolves the same signatures over and over, so without
-     * this memo the arena grows without bound. */
+    /* 内部辅助实现 */
     if (b->binding_done && type_ref->type_ref.rt_type &&
         type_ref->type_ref.rt_scope == (void *)b->current_scope)
         return (zan_type_t *)type_ref->type_ref.rt_type;
 
     zan_istr_t name = type_ref->type_ref.name;
 
-    /* Resolve the base (element) type first, then apply array / nullable
-     * wrapping uniformly (an early return on builtins would drop the `[]`). */
+    /* 内部辅助逻辑 */
     zan_type_t *base = NULL;
 
     if (istr_eq(name, "void",   4)) base = b->type_void;
@@ -850,9 +787,7 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     else if (istr_eq(name, "ulong",  5)) base = b->type_ulong;
     else if (istr_eq(name, "float",  5)) base = b->type_float;
     else if (istr_eq(name, "double", 6)) base = b->type_double;
-    /* decimal is a reserved keyword with no type behind it; reject so the
-     * representation (long minor units, double, or a string column) is chosen
-     * by the programmer. */
+    /* 内部辅助逻辑 */
     else if (istr_eq(name, "decimal", 7)) {
         zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
                       "'decimal' is not supported: use 'long' (minor units), "
@@ -872,14 +807,10 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         base = make_type(b->arena, TYPE_STRUCT, "Span", 4);
     /* TypeInfo: what typeof(T)/obj.GetType() yields (see binder.h) */
     else if (istr_eq(name, "TypeInfo", 8)) base = b->type_typeinfo;
-    /* Task / Task<T>: a coroutine handle (opaque i64 at codegen). The static
-     * `Task.Spawn/Run/IsDone/...` call surface stays a compiler-intercepted
-     * builtin (builtin_api.c); this makes the *type* usable as a value:
-     * `Task t = Task.Run(...)`, `Task<int> t`, `t.Wait()`, `t.Result`. */
+    /* Task / Task<T>: a coroutine handle (opaque i64 at codegen) */
     else if (istr_eq(name, "Task", 4))
         base = make_type(b->arena, TYPE_TASK, "Task", 4);
-    /* .NET Func<...>/Action<...> delegate families are synthesized from their
-     * type arguments (Func<T1..Tn, TResult> / Action<T1..Tn>); see below. */
+    /*  */
     else if (istr_eq(name, "Func", 4) || istr_eq(name, "Action", 6))
         base = make_type(b->arena, TYPE_DELEGATE, name.str, name.len);
     else {
@@ -893,18 +824,8 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         return b->type_error;
     }
 
-    /* carry generic arguments (e.g. List<Node>, Dict<K,V>, Box<int>) so codegen
-     * and the checker can recover concrete element/argument types. Built-in
-     * List/Dict use a fresh `make_type` above, but a user generic type resolves
-     * to the *shared* class-symbol type; mutating that would let one
-     * instantiation (Box<int>) clobber another (Box<string>), so copy it into a
-     * fresh instantiation type first. */
-    /* A generic delegate instantiation (e.g. Selector<T, List<R>>) must
-     * substitute the delegate's own type parameters in its signature: the
-     * shared delegate type's ret/param types are the delegate's bare type
-     * params, which only coincide with the use-site's meaning when the
-     * argument is that same bare name. Composite arguments (List<R>) would
-     * otherwise be silently flattened to the bare param. */
+    /* carry generic arguments (e */
+    /* A generic delegate instantiation (e */
     if (type_ref->type_ref.type_args.count > 0 && base->kind == TYPE_DELEGATE &&
         base->sym && base->sym->decl &&
         base->sym->decl->method_decl.type_params.count ==
@@ -987,12 +908,7 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         }
     }
 
-    /* Synthesize a Func<...>/Action<...> delegate from the type arguments:
-     *   Func<T1..Tn, TResult>  -> parameters T1..Tn, result TResult
-     *   Action<T1..Tn>         -> parameters T1..Tn, result void
-     * A bare `Func`/`Action` (no type args) is not a valid type -- it has no
-     * signature to derive, so it stays an empty placeholder and fails later
-     * when the signature is read. */
+    /* Synthesize a Func< */
     if (base && base->kind == TYPE_DELEGATE && base->name.len == 4 &&
         memcmp(base->name.str, "Func", 4) == 0) {
         if (type_ref->type_ref.type_args.count < 1) {
@@ -1044,26 +960,16 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
 
     zan_type_t *resolved = base;
     if (type_ref->type_ref.is_nullable) {
-        /* `T?` over a reference type is just T: the reference already carries
-         * null. Over a value type it becomes a TYPE_NULLABLE wrapper, which
-         * irgen lowers to `{ payload, i1 }` -- the value plus a has-value
-         * flag. */
+        /* `T?` over a reference type is just T: the reference already carries null */
         if (resolved && resolved != b->type_error &&
             type_is_value_kind(resolved)) {
             zan_type_t *nullable = make_type(b->arena, TYPE_NULLABLE, name.str, name.len);
             nullable->element_type = resolved;
             resolved = nullable;
         }
-        /* Reference types are left unwrapped: `A?` is A, which already admits
-         * null. TYPE_NULLABLE maps to a bare i8*, so wrapping would lose the
-         * class identity. */
+        /* Reference types are left unwrapped: `A?` is A, which already admits null */
     }
-    /* Wrap in array after the nullable wrap, so `int?[]` is an array whose
-     * element type is the nullable `int?`. A jagged declaration nests: the
-     * node's array_element is the inner declaration chain, so `int[][]`
-     * resolves as array-of-int[] and `int[][,]` as a 1D array of rank-2
-     * `int[,]` (leftmost specifier is the outermost array). A plain node
-     * without array_element is its own element. */
+    /* 内部辅助逻辑 */
     if (type_ref->type_ref.is_array) {
         zan_type_t *elem = resolved;
         if (type_ref->type_ref.array_element)
@@ -1086,11 +992,7 @@ zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name) {
     return scope_find(b->current_scope, name);
 }
 
-/* Register every declared generic type parameter (class Box<T> -> T) in the
- * root scope so it stays resolvable after per-type binding scopes are torn
- * down: later passes re-resolve signatures against the root scope. Type
- * parameters all erase to the same representation (an opaque pointer), so a
- * name shared by two classes' <T> is harmless. */
+/* 内部辅助实现 */
 static void register_type_param_list(zan_binder_t *b, zan_ast_list_t *tps) {
     for (int j = 0; j < tps->count; j++) {
         zan_ast_node_t *tp = tps->items[j];
@@ -1107,7 +1009,7 @@ static void register_type_param_list(zan_binder_t *b, zan_ast_list_t *tps) {
 static void register_type_params(zan_binder_t *b, zan_ast_list_t *decls) {
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *decl = decls->items[i];
-        /* delegate declarations may themselves be generic: delegate R F<T>(...) */
+        /* delegate declarations may themselves be generic: delegate R F<T>( */
         if (decl->kind == AST_DELEGATE_DECL) {
             register_type_param_list(b, &decl->method_decl.type_params);
             continue;
@@ -1117,8 +1019,7 @@ static void register_type_params(zan_binder_t *b, zan_ast_list_t *decls) {
             continue;
         }
         register_type_param_list(b, &decl->type_decl.type_params);
-        /* Method-level type parameters (static T Id<T>(...)) share the same
-         * erased-pointer representation as class type parameters. */
+        /* Method-level type parameters (static T Id<T>( */
         for (int m = 0; m < decl->type_decl.members.count; m++) {
             zan_ast_node_t *member = decl->type_decl.members.items[m];
             if (member->kind == AST_METHOD_DECL)
@@ -1151,8 +1052,7 @@ static zan_type_kind_t ast_kind_to_type_kind(zan_ast_kind_t kind) {
 
 /* Pass 1: register type declarations */
 static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
-    /* Per-decl symbols, filled as types register: the nested-type relink
-     * below needs the host's symbol by AST node identity, not by name. */
+    /* 内部辅助逻辑 */
     zan_symbol_t **syms = (zan_symbol_t **)zan_arena_alloc(
         b->arena, sizeof(zan_symbol_t *) *
                       (size_t)(decls->count > 0 ? decls->count : 1));
@@ -1201,11 +1101,7 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
         }
     }
 
-    /* Re-link hoisted nested types onto their host: the parser lifts
-     * `class Inner` out of `class Outer` to unit level, losing the nesting.
-     * Runs after every registration (deep nesting lifts C before its host B)
-     * and matches hosts by AST node identity, so declaration order is
-     * irrelevant. */
+    /* 内部辅助实现 */
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *node = decls->items[i];
         if (node->kind != AST_CLASS_DECL && node->kind != AST_STRUCT_DECL &&
@@ -1221,9 +1117,7 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
         if (sym && host_sym) symbol_add_member(b->arena, host_sym, sym);
     }
 
-    /* Resolve delegate signatures only after every named type is registered.
-     * This permits delegates to reference classes declared later or in another
-     * source file within the same compilation. */
+    /* Resolve delegate signatures only after every named type is registered */
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *node = decls->items[i];
         if (node->kind != AST_DELEGATE_DECL) continue;
@@ -1253,21 +1147,8 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
     }
 }
 
-/* Pass 3: resolve base types and inherit members. Runs only after every
- * type's own members are bound (pass 2), so declaration order across the
- * merged compilation unit (e.g. a stdlib class pulled in by --auto-stdlib)
- * does not matter. Multi-level chains resolve the base first (recursively);
- * inherited fields are PREPENDED so base fields stay a prefix of the derived
- * layout (upcasts are plain bitcasts). A derived field that repeats a base
- * field's name HIDES it, C#-style: both keep their own slot (the base one
- * stays in the prefix, so base methods still read and write the field they
- * were compiled against) and a name resolves to the last declaration for the
- * static type in hand -- see get_field_index. */
-/* Whether every generic argument of a declared base type reference names a
- * type this scope can resolve without a diagnostic: a builtin primitive or a
- * symbol visible here. Guards the interface-instantiation path in
- * resolve_bases, which runs at global scope where a declaring type's own
- * type parameters (`interface I<T> : J<T>`) are not bound. */
+/* Pass 3: resolve base types and inherit members */
+/* 内部辅助实现 */
 static bool base_args_resolvable(zan_binder_t *b, zan_ast_node_t *type_ref) {
     if (!type_ref || type_ref->kind != AST_TYPE_REF) return false;
     zan_ast_list_t *args = &type_ref->type_ref.type_args;
@@ -1286,10 +1167,7 @@ static bool base_args_resolvable(zan_binder_t *b, zan_ast_node_t *type_ref) {
             istr_eq(n, "nint", 4))
             continue;
         if (!scope_find(b->current_scope, n)) return false;
-        /* Nested generic arguments resolve recursively through the same
-         * guard; a name that resolves but carries unresolvable arguments of
-         * its own falls back to the template via resolve_type's result
-         * check in the caller. */
+        /* 内部辅助实现 */
         if (!base_args_resolvable(b, arg)) return false;
     }
     return true;
@@ -1300,10 +1178,7 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
     if (!type_sym || !type_sym->type || type_sym->decl != type_node) return;
     if (type_sym->type->bases_resolved == 2) return;   /* done */
     if (type_sym->type->bases_resolved == 1) {
-        /* Re-entered while still on the inheritance stack: the base edge we
-         * are resolving closes a cycle. Leave bases_resolved at 1 so the
-         * caller that recursed into us sees the resolution failed and skips
-         * this edge. */
+        /* 内部辅助逻辑 */
         zan_diag_emit(b->diag, DIAG_ERROR, type_node->loc,
                       "cyclic inheritance involving '%.*s'",
                       (int)type_node->type_decl.name.len,
@@ -1319,10 +1194,7 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
         int nif = 0;
         for (int bx = 0; bx < nbases; bx++) {
             zan_ast_node_t *base_ref = type_node->type_decl.bases.items[bx];
-            /* parse_type_ref can return a tuple-type or error node (e.g.
-             * `class C : (int, string)`); its union overlays tuple fields on
-             * type_ref.name, so reading .name blind hashes garbage. Reject
-             * anything that is not a plain type reference. */
+            /* parse_type_ref can return a tuple-type or error node (e */
             if (base_ref->kind != AST_TYPE_REF) {
                 zan_diag_emit(b->diag, DIAG_ERROR, base_ref->loc,
                               "invalid base type");
@@ -1338,9 +1210,7 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
             }
             if ((base_sym->kind == SYM_CLASS || base_sym->kind == SYM_STRUCT) &&
                 !type_sym->type->base_type) {
-                /* C# sealed closes the derivation chain; the check lives at
-                 * the adoption point so a generic or partial base is caught
-                 * by its symbol, not its spelling. */
+                /* 内部辅助逻辑 */
                 if ((base_sym->modifiers & MOD_SEALED) != 0) {
                     zan_diag_emit(b->diag, DIAG_ERROR, base_ref->loc,
                                   "cannot derive from sealed type '%.*s'",
@@ -1353,10 +1223,7 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
                      base_sym->decl->kind == AST_STRUCT_DECL)) {
                     resolve_bases(b, base_sym->decl);
                 }
-                /* A base whose own resolution was interrupted hit a cycle:
-                 * adopting it would build a base_type ring that later passes
-                 * walk forever. Skip the edge (the cycle was already
-                 * diagnosed at the re-entry site). */
+                /* 内部辅助实现 */
                 if (base_sym->type->bases_resolved != 2) continue;
                 if (base_args_resolvable(b, base_ref)) {
                     zan_type_t *inst = zan_binder_resolve_type(b, base_ref);
@@ -1369,8 +1236,7 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
                 } else {
                     type_sym->type->base_type = base_sym->type;
                 }
-                /* inherit base fields and properties (prefix layout): count
-                 * them, then prepend them to the derived member list */
+                /* 内部辅助逻辑 */
                 int ninherit = 0;
                 for (int bi = 0; bi < base_sym->member_count; bi++) {
                     if (base_sym->members[bi]->kind == SYM_FIELD ||
@@ -1398,15 +1264,7 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
             } else if (base_sym->kind == SYM_INTERFACE) {
                 if (base_sym->decl) resolve_bases(b, base_sym->decl);
                 if (base_sym->type->bases_resolved != 2) continue;
-                /* `class Range : Seq<int>` must record the *instantiation*,
-                 * not the interface's canonical template, or derivation
-                 * checks against a use-site `Seq<int>` compare Seq<T> with
-                 * Seq<int> and fail. Only instantiate when every declared
-                 * argument is a name this scope can already resolve: inside
-                 * `interface I<T> : J<T>` the type parameter is not in scope
-                 * during pass 3, and resolve_type would emit a bogus
-                 * "undefined type 'T'" instead of falling back to the
-                 * template. */
+                /* 内部辅助实现 */
                 if (base_args_resolvable(b, base_ref)) {
                     zan_type_t *inst = zan_binder_resolve_type(b, base_ref);
                     if (inst && inst->kind == TYPE_INTERFACE &&
@@ -1426,16 +1284,7 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
     type_sym->type->bases_resolved = 2;
 }
 
-/* Pass 1.5: copy default interface methods into the implementing types.
- *
- * irgen never walks an AST_INTERFACE_DECL, so an interface method with a body
- * would never be emitted. Copying the declaration into every implementing type
- * that does not provide its own override makes it an ordinary method of that
- * type -- bound, emitted and dispatched like any other -- and a `this.F()`
- * inside the default body resolves to the implementing type's F.
- *
- * Runs between pass 1 (types registered) and pass 2 (members bound), so the
- * copies are bound as members of the implementing type. */
+/* 内部辅助实现 */
 static bool binder_type_equal(zan_type_t *a, zan_type_t *b, int depth) {
     if (!a || !b) return a == b;
     if (a == b) return true;
@@ -1468,10 +1317,7 @@ static bool binder_type_equal(zan_type_t *a, zan_type_t *b, int depth) {
     return true;
 }
 
-/* True when `t` is `sup`, or reaches it through its interface list or base
- * chain. Used for covariant interface-method returns: the implementation may
- * return a subtype of what the interface declares (a concrete enumerator for
- * `IEnumerator<T> GetEnumerator()`). */
+/* True when `t` is `sup`, or reaches it through its interface list or base chain */
 static bool binder_type_derives(zan_type_t *t, zan_type_t *sup, int depth) {
     if (!t || !sup || depth > 64) return false;
     if (t == sup) return true;
@@ -1504,22 +1350,13 @@ static bool method_signature_equal(zan_binder_t *b, zan_ast_node_t *a,
         ? zan_binder_resolve_type(b, a->method_decl.return_type) : b->type_void;
     zan_type_t *br = other->method_decl.return_type
         ? zan_binder_resolve_type(b, other->method_decl.return_type) : b->type_void;
-    /* A use-site instantiation (`class Range : IEnumerable<int>`) binds the
-     * interface's parameters to concrete arguments; the declared signatures
-     * are re-resolved with those bindings so `IEnumerator<T> GetEnumerator()`
-     * compares as IEnumerator<int>. A still-unsubstituted interface parameter
-     * stays a wildcard; treating a substituted type parameter as a wildcard
-     * too would accept any signature and turn the contract check into a no-op
-     * for generic classes. */
+    /* 内部辅助实现 */
     bool ret_subst = false;
     if (bind_tps && bind_tps->count > 0 && bind_args) {
         zan_type_t *sr = zan_binder_subst_named(b, br, bind_tps, bind_args);
         if (sr && sr != br) { br = sr; ret_subst = true; }
     }
-    /* An interface method may be phrased in the interface's own type
-     * parameters (`interface I<T> { T Get(); }`). Against an implementing
-     * type's concrete signature the parameter is a wildcard -- `int Get()`
-     * implements `T Get()` for the binding `T := int`. */
+    /* 内部辅助逻辑 */
     bool a_tp = ar && ar->kind == TYPE_TYPE_PARAM;
     bool b_tp = br && br->kind == TYPE_TYPE_PARAM && !ret_subst;
     if (!(a_tp || b_tp) && !binder_type_equal(ar, br, 0) &&
@@ -1564,9 +1401,7 @@ static void inherit_default_methods(zan_binder_t *b, zan_ast_node_t *type_node,
         if (m->kind != AST_METHOD_DECL || !m->method_decl.body) continue;
         if ((m->method_decl.modifiers & MOD_STATIC) != 0) continue;
         if (type_declares_method(b, type_node, m)) continue;
-        /* Shallow copy: the body and parameter list are read-only here, but the
-         * node identity must differ per implementing type, since irgen keys a
-         * method's symbol and its emitted function on the declaration node. */
+        /* 内部辅助逻辑 */
         zan_ast_node_t *copy = zan_ast_new(b->arena, AST_METHOD_DECL, m->loc);
         *copy = *m;
         zan_ast_list_push(&type_node->type_decl.members, copy, b->arena);
@@ -1615,10 +1450,7 @@ static bool class_has_interface_method(zan_binder_t *b, zan_symbol_t *cls,
 static void validate_interface_contract(zan_binder_t *b, zan_symbol_t *cls,
                                         zan_ast_node_t *iface,
                                         zan_type_t *inst, int depth) {
-    /* The use-site binding for this interface edge (`IEnumerable<int>`),
-     * passed as the materialized instantiation from the class's interface
-     * list; NULL for recursive walks whose edges are phrased in the outer
-     * interface's own parameters. */
+    /* 内部辅助实现 */
     zan_ast_list_t *bind_tps = NULL;
     zan_type_t **bind_args = NULL;
     if (inst && inst->type_arg_count > 0 &&
@@ -1627,11 +1459,7 @@ static void validate_interface_contract(zan_binder_t *b, zan_symbol_t *cls,
         bind_args = inst->type_args;
     }
     if (!iface || depth > 64) return;
-    /* An interface method may be phrased in the interface's own type
-     * parameters (`interface I<T> { T Get(); }`). The signature comparison
-     * below re-resolves the method's declared types, which are only
-     * resolvable inside the interface's scope, so register those parameters
-     * here and pop them afterwards. */
+    /* 内部辅助逻辑 */
     zan_scope_t *saved = b->current_scope;
     int tp_count = iface->type_decl.type_params.count;
     if (tp_count > 0) {
@@ -1677,13 +1505,7 @@ static void validate_interface_contracts(zan_binder_t *b, zan_ast_list_t *decls)
 }
 
 /* Pass 2: bind member declarations */
-/* Fold an enum member initializer to its integer value. The parser stores the
- * initializer raw (`Red = -5` is a unary-minus node, `Green = Red + 1` names
- * a sibling member) but every consumer (irgen emitter, reflection tables)
- * only understands AST_INT_LITERAL. Fold here, once, in unsigned wrap-around
- * arithmetic, and rewrite the node in place so every consumer sees one
- * canonical shape. A sibling identifier resolves through the members already
- * bound for this enum, whose values are literals by then. */
+/* Fold an enum member initializer to its integer value */
 static bool fold_enum_member_value(zan_binder_t *b, zan_symbol_t *type_sym,
                                    zan_ast_node_t *e, int64_t *out) {
     if (!e) return false;
@@ -1730,8 +1552,7 @@ static bool fold_enum_member_value(zan_binder_t *b, zan_symbol_t *type_sym,
             if (m->name.len != e->ident.name.len ||
                 memcmp(m->name.str, e->ident.name.str, m->name.len))
                 continue;
-            /* a later member naming this one is circular (Red = Green,
-             * Green = Red): the value is not a literal yet, so not constant */
+            /* 内部辅助逻辑 */
             zan_ast_node_t *md = m->decl;
             if (!md || md->kind != AST_ENUM_MEMBER ||
                 !md->enum_member.value ||
@@ -1747,8 +1568,7 @@ static bool fold_enum_member_value(zan_binder_t *b, zan_symbol_t *type_sym,
     }
 }
 
-/* Enum members are ints: reject a folded value outside [INT32_MIN,
- * INT32_MAX] here rather than letting it wrap in every consumer. */
+/* 内部辅助逻辑 */
 static bool enum_value_fits_int(int64_t v) {
     return v >= INT32_MIN && v <= INT32_MAX;
 }
@@ -1795,8 +1615,7 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
                 member->method_decl.name, ret_type, member,
                 member->method_decl.modifiers);
 
-            /* bind parameters BEFORE the duplicate check: comparing two
-             * methods requires both parameter lists to be populated. */
+            /* 内部辅助逻辑 */
             for (int j = 0; j < member->method_decl.params.count; j++) {
                 zan_ast_node_t *param = member->method_decl.params.items[j];
                 zan_type_t *param_type = zan_binder_resolve_type(b, param->param.type);
@@ -1827,11 +1646,7 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             break;
         }
         case AST_ENUM_MEMBER: {
-            /* Fold the initializer once, here: every downstream consumer
-             * (irgen emitter, reflection tables) keys on AST_INT_LITERAL.
-             * An unfoldable initializer is an error; clearing the value
-             * leaves the member to the running counter so compilation can
-             * surface more diagnostics. */
+            /* 内部辅助逻辑 */
             if (member->enum_member.value) {
                 int64_t v;
                 if (fold_enum_member_value(b, type_sym,
@@ -1877,16 +1692,10 @@ void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit) {
     /* pass 1: collect type declarations */
     bind_type_decls(b, &unit->comp_unit.decls);
 
-    /* Type parameters must be resolvable by every later pass: pass 1.5
-     * re-resolves signatures when folding default methods, pass 3
-     * instantiates `class Repo<T> : IStore<T>`, and the contract validation
-     * re-resolves the implementing method's declared types at global scope.
-     * Registering them once here, right after the types themselves exist,
-     * keeps all of that name-complete. */
+    /* Type parameters must be resolvable by every later pass: pass 1 */
     register_type_params(b, &unit->comp_unit.decls);
 
-    /* pass 1.5: give every implementing type a copy of the default interface
-     * methods it does not override, before members are bound */
+    /* pass 1 */
     bind_default_interface_methods(b, &unit->comp_unit.decls);
 
     /* pass 2: bind members of each type */
@@ -1898,8 +1707,7 @@ void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit) {
         }
     }
 
-    /* pass 3: resolve bases + inherit members, after every type's own
-     * members exist (declaration order across files no longer matters) */
+    /* 内部辅助逻辑 */
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
         if (decl->kind == AST_CLASS_DECL || decl->kind == AST_STRUCT_DECL ||
@@ -1908,9 +1716,7 @@ void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit) {
         }
     }
 
-    /* Every interface contract is checked after inherited members and default
-     * methods are known, so a class method with the right name but the wrong
-     * signature cannot silently satisfy the interface. */
+    /* 内部辅助逻辑 */
     validate_interface_contracts(b, &unit->comp_unit.decls);
 
     b->binding_done = true;

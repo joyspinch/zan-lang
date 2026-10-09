@@ -1,4 +1,4 @@
-/* genrun.c -- Zan-scripted code-generator runner (see genrun.h). */
+/* genrun */
 
 #include "genrun.h"
 #include "genmeta.h"
@@ -35,11 +35,7 @@
 
 int zan_gen_enabled = 1;
 
-/* Captured texts of the generator-produced sources from the latest codegen
- * run (filled by zan_merge_sources). main.c re-seeds the demand-driven
- * stdlib pull-in with them: generated classes reference stdlib types the
- * user program never spells (OrmSelect/OrmMeta/...). Consumed via
- * zan_gen_take_source_texts, which hands over and clears the capture. */
+/* 内部辅助逻辑 */
 static char **g_gen_texts = NULL;
 static int g_gen_text_count = 0;
 static int g_gen_text_cap = 0;
@@ -60,13 +56,9 @@ void zan_gen_take_source_texts(char ***texts, int *count) {
 #define GEN_EXE_SUFFIX ""
 #endif
 
-/* The generator entry source is <stdlib_root>/System/Compiler/ZanGen.zan,
- * compiled with --auto-stdlib, so its whole stdlib closure (System.Web and
- * anything else it reaches) comes along without being listed here; the
- * cache key hashes the stdlib tree instead (see zan_gen_hash_stdlib). */
+/* The generator entry source is <stdlib_root>/System/Compiler/ZanGen */
 
-/* Full path of the running zanc executable (needed to compile the generator
- * with ourselves). */
+/* 内部辅助逻辑 */
 static void zan_self_exe(char *out, size_t outsz) {
 #ifdef _WIN32
     GetModuleFileNameA(NULL, out, (DWORD)outsz);
@@ -85,7 +77,7 @@ int zan_gen_cache_dir(char *dir, size_t dir_size) {
     base = getenv("LOCALAPPDATA");
     if (!base || !*base) return -1;
     if (snprintf(dir, dir_size, "%s\\Zan\\gen", base) <= 0) return -1;
-    /* Create every missing level: CreateDirectory only makes the last one. */
+    /* 创建every missing level: CreateDirectory only makes the last one */
     for (char *p = dir + 1; *p; p++) {
         if (*p != '\\' && *p != '/') continue;
         char sep = *p;
@@ -106,7 +98,7 @@ int zan_gen_cache_dir(char *dir, size_t dir_size) {
         if (!base || !*base) return -1;
         if (snprintf(dir, dir_size, "%s/.cache/zan/gen", base) <= 0) return -1;
     }
-    /* Create every missing level: the cache root itself may not exist yet. */
+    /* 创建every missing level: the cache root itself may not exist yet */
     for (char *p = dir + 1; *p; p++) {
         if (*p != '/') continue;
         *p = '\0';
@@ -143,9 +135,7 @@ static int zan_gen_hash_file(uint64_t *hash, const char *path) {
     return ok;
 }
 
-/* Spawn a child process and wait for it. argv[0] is the program. Returns the
- * exit code, or -1 when the child could not be spawned. The child inherits
- * our stdout/stderr, so its diagnostics pass through untouched. */
+/* Spawn a child process and wait for it */
 static int zan_spawn_wait(char *const argv[]) {
 #ifdef _WIN32
     intptr_t r = _spawnv(_P_WAIT, argv[0], (const char *const *)argv);
@@ -167,20 +157,7 @@ static int zan_spawn_wait(char *const argv[]) {
 #endif
 }
 
-/* ---- cache cleanup ----
- *
- * The generator cache (%LOCALAPPDATA%\Zan\gen on Windows,
- * $XDG_CACHE_HOME/zan/gen on Linux) is shared across zanc invocations and
- * accumulates per-process leftovers:
- *   ZanGen_<hash>_<pid>.exe     per-process compile temp; left behind when
- *                                zanc is killed before the rename
- *   gen_codegen_<pid>_in.json   per-process metadata I/O; same orphan problem
- *   gen_codegen_<pid>_out.json
- *   gen_design_<pid>_in.json / _out.json
- *
- * The published ZanGen_<hash>.exe is *not* touched here: it is the warm
- * cache future invocations read. Sweep is best-effort and runs once per
- * zanc process. */
+/* 内部辅助逻辑 */
 
 static int zan_pid_alive(uint32_t pid) {
     if (pid == 0) return 0;
@@ -197,8 +174,7 @@ static int zan_pid_alive(uint32_t pid) {
 #endif
 }
 
-/* Walk `dir` and call `cb(name, ud)` for every entry (basename only, no path
- * prefix). Skips "." and "..". Best-effort: missing dir is not an error. */
+/* 内部辅助逻辑 */
 static void zan_gen_scan_dir(const char *dir,
                              void (*cb)(const char *name, void *ud),
                              void *ud) {
@@ -233,8 +209,7 @@ static void zan_gen_scan_dir(const char *dir,
 #endif
 }
 
-/* Try to match `s` against `prefix` exactly; if it matches, point `rest` at
- * the first byte after the prefix and return 1. Else return 0. */
+/* 内部辅助逻辑 */
 static int zan_gen_strip(const char *s, const char *prefix, const char **rest) {
     size_t n = strlen(prefix);
     if (strncmp(s, prefix, n) != 0) return 0;
@@ -242,11 +217,7 @@ static int zan_gen_strip(const char *s, const char *prefix, const char **rest) {
     return 1;
 }
 
-/* Parse the ZanGen_<hash>[_<pid>] form. `s` points just past "ZanGen_".
- * The hash must be exactly 16 lowercase hex digits. If followed by "_<pid>"
- * (decimal, <= 10 digits, no .exe), the pid is written to *out and the
- * function returns 2. If only the hash is present (optionally followed by
- * ".exe" on Windows), returns 1. Returns 0 if `s` is not a ZanGen name. */
+/* Parse the ZanGen_<hash>[_<pid>] form */
 static int zan_gen_parse_zangen(const char *s, uint32_t *out) {
     if (!s) return 0;
     static const char hex[] = "0123456789abcdef";
@@ -282,11 +253,7 @@ static int zan_gen_parse_zangen(const char *s, uint32_t *out) {
     return 0;
 }
 
-/* Parse a decimal PID from the segment of `s` immediately following the
- * literal prefix it was stripped against. The segment runs from `s` to
- * either the end of the string, an optional ".exe" suffix, or an optional
- * "_in.json"/"_out.json" suffix. Returns 1 on success and writes to *out,
- * else 0. Capped at 10 digits (max uint32). */
+/* 内部辅助逻辑 */
 static int zan_gen_parse_pid(const char *s, uint32_t *out) {
     if (!s) return 0;
     const char *p = s;
@@ -318,9 +285,7 @@ static void zan_gen_sweep_one(const char *name, void *ud) {
     const char sep = '/';
 #endif
 
-    /* ZanGen_<16hex>[.exe] -- published cache, do not touch.
-     * ZanGen_<16hex>_<pid>[.exe] -- per-process compile temp; reap if the
-     *   holding zanc is gone. */
+    /* ZanGen_<16hex>[ */
     if (zan_gen_strip(name, "ZanGen_", &rest)) {
         int kind = zan_gen_parse_zangen(rest, &pid);
         if (kind == 2 && !zan_pid_alive(pid)) {
@@ -333,7 +298,7 @@ static void zan_gen_sweep_one(const char *name, void *ud) {
         }
         return;
     }
-    /* gen_codegen_<pid>_in.json / _out.json -- per-process metadata I/O. */
+    /* gen_codegen_<pid>_in */
     if (zan_gen_strip(name, "gen_codegen_", &rest)) {
         if (zan_gen_parse_pid(rest, &pid) && !zan_pid_alive(pid)) {
             snprintf(path, sizeof(path), "%s%c%s", dir, sep, name);
@@ -366,10 +331,7 @@ static void zan_gen_sweep(const char *dir) {
     zan_gen_scan_dir(dir, zan_gen_sweep_one, (void *)dir);
 }
 
-/* The generator's behavior is defined by its whole stdlib closure, not just
- * the System/Compiler sources (ZanGen.zan is compiled with --auto-stdlib, so
- * generators freely reach into other stdlib modules). The cache key therefore
- * hashes every .zan under the stdlib root. */
+/* 内部辅助逻辑 */
 
 typedef struct zan_gen_strlist {
     char **v;
@@ -396,8 +358,7 @@ static int zan_gen_relcmp(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-/* Collect relative paths of every .zan under `root` (any nesting depth).
- * Returns 0 on success, -1 when the root itself cannot be entered. */
+/* Collect relative paths of every */
 static int zan_gen_collect_zan(char *abs, size_t abscap, const char *rel,
                                size_t rellen, zan_gen_strlist *out) {
 #ifdef _WIN32
@@ -460,8 +421,7 @@ static int zan_gen_collect_zan(char *abs, size_t abscap, const char *rel,
 #endif
 }
 
-/* Hash every .zan file under the stdlib root into `key`: first the relative
- * path (renames/moves count), then the bytes. */
+/* Hash every */
 static int zan_gen_hash_stdlib(uint64_t *key, const char *root) {
     char abs[ZAN_GEN_MAX_PATH];
     snprintf(abs, sizeof(abs), "%s", root);
@@ -494,12 +454,10 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
         fprintf(stderr, "error: no user cache dir for the code generators\n");
         return -1;
     }
-    /* Reap orphans from a prior crashed/killed zanc, before we decide to
-     * (re)compile or reuse the published image. */
+    /* 内部辅助逻辑 */
     zan_gen_sweep(dir);
 
-    /* Key the image by compiler bytes + stdlib root + generator contents;
-     * timestamps must never decide cache sharing. */
+    /* 内部辅助逻辑 */
     char zexe[ZAN_GEN_MAX_PATH];
     zan_self_exe(zexe, sizeof(zexe));
     if (!zexe[0]) {
@@ -534,9 +492,7 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
                  stdlib_root, GEN_DIR_SEP_STR[0], GEN_DIR_SEP_STR[0],
                  GEN_DIR_SEP_STR[0]);
         fprintf(stderr, "zan: compiling code generators (first use; cached at %s)\n", exe);
-        /* Compile to a per-process path and rename into place: parallel
-         * builds share this cache, and a compile straight onto `exe` makes
-         * them fight over the same intermediate object file. */
+        /* 内部辅助逻辑 */
         char tmp[ZAN_GEN_MAX_PATH];
 #ifdef _WIN32
         int pid = (int)_getpid();
@@ -546,13 +502,8 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
         snprintf(tmp, sizeof(tmp), "%s%cZanGen_%016llx_%d%s", dir,
                  GEN_DIR_SEP_STR[0], (unsigned long long)key, pid,
                  GEN_EXE_SUFFIX);
-        /* --quiet: this is a nested build of our own generator; its stdout
-         * progress would corrupt the caller's machine channel (--emit-ir). */
-        /* --no-packages: the generator's closure is pinned to the stdlib.
-         * Package files skip the pull-in live-name gate, so a user package
-         * would join this nested --no-gen compile unconditionally, and its
-         * generator-magic calls cannot resolve there (the lowering only runs
-         * in the parent). */
+        /* 内部辅助逻辑 */
+        /* no-packages: the generator's closure is pinned to the stdlib */
         char *argv[] = {
             zexe, src, "--stdlib-path", (char *)stdlib_root, "--auto-stdlib",
             "--no-gen", "--no-packages", "--quiet", "-DZAN_GEN_MAIN=1",
@@ -569,9 +520,7 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
 #else
         if (rename(tmp, exe) != 0) {
 #endif
-            /* A parallel build may hold the published image open (Windows
-             * cannot replace a running exe); the content-addressed name
-             * proves identical inputs, so drop our copy and reuse theirs. */
+            /* 内部辅助逻辑 */
             remove(tmp);
             FILE *published = fopen(exe, "rb");
             if (published) {
@@ -595,9 +544,7 @@ int zan_gen_run(const char *exe, const char *meta_path, const char *out_path) {
     return 0;
 }
 
-/* A design document: generator input, translated to Zan source before
- * anything lexes it. Exported so the pre-parse token scans in main.c can
- * skip it -- lexing raw HTML as Zan yields only garbage tokens. */
+/* 内部辅助逻辑 */
 bool zan_is_design_path(const char *p) {
     size_t n = strlen(p);
     return (n > 7 && strcmp(p + n - 7, ".zscene") == 0) ||
@@ -605,9 +552,7 @@ bool zan_is_design_path(const char *p) {
            (n > 4 && strcmp(p + n - 4, ".htm") == 0);
 }
 
-/* A saved user component (designer "save as component"): pure design data
- * the generators expand into every referencing design doc; never parsed as
- * Zan source. */
+/* 内部辅助逻辑 */
 bool zan_is_zcomp_path(const char *p) {
     size_t n = strlen(p);
     return n > 6 && strcmp(p + n - 6, ".zcomp") == 0;
@@ -670,9 +615,7 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
         return NULL;
     }
 
-    /* Build the design request: { mode, files: [{ name, text, emitMain }] }.
-     * `name` is the full input path; the generator echoes it back verbatim in
-     * each reply source, which is how the texts are matched to inputs. */
+    /* 构建the design request: { mode, files: [{ name, text, emitMain }] } */
     json_value *files = json_new_arr();
     for (size_t i = 0; i < count; i++) {
         if (!zan_is_design_path(paths[i])) continue;
@@ -684,8 +627,7 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
             free(outs);
             return NULL;
         }
-        /* JSON must not start with a BOM: an editor saving the design doc
-         * as "UTF-8 with BOM" would fail the generator. Drop it. */
+        /* 内部辅助逻辑 */
         const char *body = text;
         if (tlen >= 3 && (unsigned char)body[0] == 0xEF &&
             (unsigned char)body[1] == 0xBB && (unsigned char)body[2] == 0xBF)
@@ -697,8 +639,7 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
         json_arr_add(files, f);
         free(text);
     }
-    /* Saved user components ride the same input list; the generator indexes
-     * them by file base name and expands every "ref" that points at one. */
+    /* 内部辅助逻辑 */
     json_value *comps = json_new_arr();
     for (size_t i = 0; i < count; i++) {
         if (!zan_is_zcomp_path(paths[i])) continue;
@@ -792,8 +733,7 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
         free(reply);
     }
 
-    /* ZAN_KEEP_GEN_REQ=1 keeps the request/reply pair for debugging a
-     * generator mismatch (default: removed). */
+    /* 内部辅助逻辑 */
     if (getenv("ZAN_KEEP_GEN_REQ") == NULL) {
         remove(meta_path);
         remove(out_path);
@@ -806,10 +746,7 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
     return outs;
 }
 
-/* AST-level codegen triggers (zero-allocation fast path): check whether any
- * call site or declaration matches the shapes jsongen/routegen/dbgen expect,
- * bypassing the multi-megabyte JSON export + parse when codegen is not
- * needed. */
+/* 内部辅助逻辑 */
 
 static bool ast_call_triggers(zan_ast_node_t *call) {
     if (!call || call->kind != AST_CALL || !call->call.callee)
@@ -836,8 +773,7 @@ static bool ast_call_triggers(zan_ast_node_t *call) {
         if (call->call.type_args.count > 0) return true;
     }
 
-    /* 2. ORM generic roots: db.Insert<T>, db.Select<T>, db.Update<T>, etc.
-     * Ordinary collection calls like `list.Insert(idx, val)` have 0 type_args. */
+    /* 2 */
     if (call->call.type_args.count > 0) {
         if (strcmp(name, "Insert") == 0 ||
             strcmp(name, "Update") == 0 ||
@@ -1066,24 +1002,7 @@ static bool zan_gen_ast_triggered(zan_ast_node_t *unit) {
     return false;
 }
 
-/* Rewrite directives: the generators decide everything (framework names, SQL
- * fragments, bind lists, Expr<T> trees); the compiler locates the call site
- * by id and mechanically rebuilds the AST per the directive.
- *
- *   json_call    {id, callee}        retarget callee to __JsonBind.<callee>,
- *                                    drop type args
- *   db_root      {id, name, extra}   `recv.Xxx<T>(a)` -> `__DbBind.<name>(recv[, a])`
- *   db_acc_head  {id, name, conn}    `<acc>.<Entity>` chain head ->
- *                                    `__DbBind.<name>(<conn>)` on the receiver
- *   db_acc_root  {id, tree}          whole call replaced by <tree>
- *   db_repo_call {id, tree}          entity accessor call replaced by a
- *                                    compile-time-resolved DAO call tree
- *   db_chain     {id, ops:[{m,args}]} chain `<recv>.<m>(args)...`, replaces call
- *   db_expr_arg  {id, param, tree}   args[param] replaced by <tree>
- *
- * Directives execute in ascending id order: ids are assigned children-first,
- * so the chain root is rewritten before the chain methods above it look for
- * it. `tree` fields are genmeta.c expression trees, rebuilt verbatim. */
+/* 内部辅助逻辑 */
 
 static zan_ast_node_t *rw_ident(zan_arena_t *arena, zan_loc_t loc,
                                 const char *name) {
@@ -1135,9 +1054,7 @@ static void rw_set_ident(zan_arena_t *arena, zan_ast_node_t *id,
     id->ident.name.len = (uint32_t)l;
 }
 
-/* Ascending-id order: call-site ids are assigned children-first, so ascending
- * replays the original rewrite sequence. The array is tiny; insertion sort is
- * fine. */
+/* 内部辅助逻辑 */
 static void rw_sort_desc(json_value *rw, int *order, int count) {
     for (int i = 1; i < count; i++) {
         int v = order[i];
@@ -1162,9 +1079,7 @@ static void zan_apply_rewrites(zan_ast_node_t *unit, json_value *rw,
     for (int i = 0; i < count; i++) order[i] = i;
     rw_sort_desc(rw, order, count);
 
-    /* Snapshot the call sites before rewriting: rewrites splice in new call
-     * nodes, which would shift the walking counter a fresh find_call relies
-     * on. Node pointers never change, so the snapshot stays exact. */
+    /* 内部辅助逻辑 */
     int total = zan_genmeta_index_calls(unit, NULL, 0);
     zan_ast_node_t **idx = NULL;
     if (total > 0) {
@@ -1203,9 +1118,7 @@ static void zan_apply_rewrites(zan_ast_node_t *unit, json_value *rw,
                               call->call.args.count > 0;
             zan_ast_node_t *ex =
                 keep_extra ? call->call.args.items[0] : NULL;
-            /* a fresh node replaces the callee object; `recv` (the original
-             * receiver) must stay intact -- it becomes the first argument
-             * below */
+            /* 内部辅助逻辑 */
             ce->member.object = rw_ident(arena, loc, "__DbBind");
             rw_set_member_name(arena, ce, name);
             call->call.type_args.count = 0;
@@ -1272,7 +1185,7 @@ static void zan_apply_rewrites(zan_ast_node_t *unit, json_value *rw,
     free(order);
 }
 
-/* Parse each generated source and merge its declarations into the unit. */
+/* Parse each generated source and merge its declarations into the unit */
 static void zan_merge_sources(zan_ast_node_t *unit, json_value *sources,
                               zan_arena_t *arena, zan_diag_t *diag) {
     if (!sources || sources->type != JSON_ARR) return;
@@ -1280,8 +1193,7 @@ static void zan_merge_sources(zan_ast_node_t *unit, json_value *sources,
         json_value *src = sources->as.arr.items[i];
         const char *text = json_get_str(json_obj_get(src, "text"));
         if (!text) continue;
-        /* Capture for the demand-driven pull-in's second round (freed by
-         * the consumer in zan_gen_take_source_texts). */
+        /* 内部辅助逻辑 */
         if (g_gen_text_count == g_gen_text_cap) {
             int ncap = g_gen_text_cap ? g_gen_text_cap * 2 : 4;
             char **grown = (char **)realloc(g_gen_texts,
@@ -1299,9 +1211,7 @@ static void zan_merge_sources(zan_ast_node_t *unit, json_value *sources,
         zan_parser_init(&gp, &lex, arena, diag);
         zan_ast_node_t *gu = zan_parser_parse(&gp);
         if (!gu) continue;
-        /* Generated decls bind like a late-added source file: stamp each with
-         * its own unit's namespace + usings, or the file's `using` header
-         * never reaches the binder. */
+        /* 内部辅助逻辑 */
         zan_nsresolve_stamp(gu, arena);
         for (int k = 0; k < gu->comp_unit.decls.count; k++)
             zan_ast_list_push(&unit->comp_unit.decls, gu->comp_unit.decls.items[k],
@@ -1309,8 +1219,7 @@ static void zan_merge_sources(zan_ast_node_t *unit, json_value *sources,
     }
 }
 
-/* Report generator diagnostics through the compiler's diag sink, preserving
- * the user file:line locations embedded in the metadata. */
+/* 内部辅助逻辑 */
 static void zan_report_diags(zan_diag_t *diag, json_value *arr, bool is_error) {
     if (!arr || arr->type != JSON_ARR) return;
     for (int i = 0; i < arr->as.arr.count; i++) {
@@ -1326,11 +1235,7 @@ static void zan_report_diags(zan_diag_t *diag, json_value *arr, bool is_error) {
     }
 }
 
-/* Run the Zan-scripted code generators over the compilation unit: export the
- * metadata, run the cached generator executable, then apply the reply --
- * generated sources are parsed and merged, rewrite directives retarget call
- * sites, diagnostics flow into `diag`. Returns 0 on success (or when nothing
- * triggered), -1 on failure with a message on stderr. */
+/* 内部辅助逻辑 */
 int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
                     zan_diag_t *diag, const char *stdlib_root) {
     if (!zan_gen_enabled || !unit) return 0;
@@ -1353,8 +1258,7 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
         return -1;
     }
 
-    /* Export with the file table: the generators ignore it, but GenIndex
-     * (opt-in via ZAN_INDEX_DIR) turns the `file` ids into paths with it. */
+    /* 内部辅助逻辑 */
     char *meta = zan_genmeta_export_files(unit, diag);
     if (!meta) return 0;
 
@@ -1370,8 +1274,7 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
              dir, GEN_DIR_SEP_STR[0], pid);
 
     int rc = -1;
-    /* Stream the metadata into the codegen request directly:
-     * {"mode":"codegen","unit":<meta>} -- no multi-megabyte heap copy. */
+    /* 内部辅助逻辑 */
     FILE *mf = fopen(meta_path, "wb");
     if (!mf) {
         fprintf(stderr, "error: cannot write generator request\n");
@@ -1415,8 +1318,7 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
         json_value *warnings = json_obj_get(root, "warnings");
         zan_report_diags(diag, warnings, false);
         zan_report_diags(diag, errors, true);
-        /* generated sources are only merged when no generator diagnostics
-         * were raised */
+        /* generated sources are only merged when no generator diagnostics were raised */
         zan_apply_rewrites(unit, json_obj_get(root, "rewrites"), arena);
         if (errors && errors->type == JSON_ARR && errors->as.arr.count > 0) {
             json_free(root);
@@ -1425,8 +1327,7 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
             goto done;
         }
         zan_merge_sources(unit, json_obj_get(root, "sources"), arena, diag);
-        /* ZAN_GEN_REPLY=<path>: keep a copy of the reply (test hook --
-         * tests/gen/ asserts on the generated text and rewrite directives). */
+        /* 内部辅助逻辑 */
         {
             const char *gr = getenv("ZAN_GEN_REPLY");
             if (gr && gr[0]) {

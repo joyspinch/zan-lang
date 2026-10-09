@@ -1,11 +1,4 @@
-/* nsresolve.c -- namespace-aware type resolution, run after the flat merge and
- * before the binder. The binder resolves types by simple name only, so this
- * pass stamps each declaration's namespace/`using` list at parse time (before
- * merge loses it), renames cross-namespace simple-name collisions to mangled
- * names (orig_name keeps the simple name for route/view generation), and
- * rewrites type references and static-member receivers per the referring
- * declaration's ns/usings; names shadowed by locals/params/fields are left
- * untouched. */
+/* nsresolve */
 
 #include "nsresolve.h"
 #include "arena.h"
@@ -35,9 +28,7 @@ static bool ns_has_dot(zan_istr_t s) {
     return false;
 }
 
-/* build "<a>.<b>"; if a is empty, just b. Allocated at full length: a silent
- * truncation here could merge two distinct namespace-qualified names into
- * one symbol identity. */
+/* 构建"<a> */
 static zan_istr_t join_ns(zan_arena_t *ar, zan_istr_t a, zan_istr_t b) {
     if (a.len == 0) return b;
     size_t n = (size_t)a.len + 1 + (size_t)b.len;
@@ -83,8 +74,7 @@ static zan_istr_t flatten_qname(zan_ast_node_t *q, zan_arena_t *ar) {
     return empty;
 }
 
-/* Nested declarations are hoisted only after the input units have been merged.
- * Stamp them now, while their source namespace/import list is still known. */
+/* Nested declarations are hoisted only after the input units have been merged */
 static void stamp_decl_context(zan_ast_node_t *d, zan_istr_t ns,
                                zan_ast_list_t *usings, zan_arena_t *arena) {
     if (!d) return;
@@ -120,20 +110,14 @@ typedef struct {
     bool conflicting;
 } nr_type_t;
 
-/* Names bound by the member currently being walked (locals, parameters,
- * foreach/catch variables, lambda parameters): they shadow a type of the same
- * name, so a `name.Member` receiver among them is a value, not a type. */
+/* 内部辅助逻辑 */
 typedef struct {
     zan_istr_t *items;
     int count;
     int cap;
 } nr_shadow_t;
 
-/* Chained hash indexes over the declared-type table: by_full serves find_full
- * (the per-reference lookup), by_simple groups same-simple-name declarations
- * for conflict detection and count_simple. find_full returns the
- * earliest-declared match; walks compare keys explicitly, so hash collisions
- * never merge distinct names. */
+/* 内部辅助逻辑 */
 typedef struct nr_chain {
     int idx;            /* index into ctx->items */
     int next;           /* next node in the bucket chain, -1 ends */
@@ -146,9 +130,7 @@ typedef struct {
     int count;
 } nr_index_t;
 
-/* Ref-recording set used by the reachability prune (nr_ctx_t.refs): when the
- * hook is active, resolution records every referenced type's final name so
- * zan_nsresolve_prune can compute reachability without duplicating the walk. */
+/* Ref-recording set used by the reachability prune (nr_ctx_t */
 typedef struct {
     zan_istr_t *items;
     int count;
@@ -170,14 +152,11 @@ typedef struct {
     zan_arena_t *arena;
     zan_diag_t *diag;
     nr_shadow_t shadow;
-    /* Field names of the class being walked: like locals, a field shadows a
-     * type of the same name when it is used as a receiver. */
+    /* 内部辅助逻辑 */
     nr_shadow_t fields;
     nr_index_t by_full;
     nr_index_t by_simple;
-    /* Reachability-prune hook (zan_nsresolve_prune): when non-NULL, nr_walk
-     * records the final name of every type reference and rewritten static
-     * receiver it resolves. */
+    /* 内部辅助逻辑 */
     zp_refs_t *refs;
 } nr_ctx_t;
 
@@ -201,7 +180,7 @@ static void nr_index_build(nr_index_t *ix, nr_type_t *items, int count,
     }
 }
 
-/* Earliest-declared item (lowest index) whose key equals `key`, or -1. */
+/* Earliest-declared item (lowest index) whose key equals `key`, or -1 */
 static int nr_index_find(nr_index_t *ix, nr_type_t *items, int key_is_full,
                          zan_istr_t key) {
     int best = -1;
@@ -338,7 +317,7 @@ static bool name_taken(nr_ctx_t *c, const char *s, size_t n) {
     return false;
 }
 
-/* mangle "A.B.C" -> "A_B_C", uniquified against existing final names */
+/* mangle "A */
 static zan_istr_t mangle(nr_ctx_t *c, zan_istr_t full) {
     char buf[600];
     size_t n = 0;
@@ -370,31 +349,20 @@ static void zan_refs_add(zp_refs_t *r, zan_istr_t name, zan_arena_t *arena) {
     r->items[r->count++] = name;
 }
 
-/* Type-parameter count of a declared type: class/struct/interface/enum keep
- * their own list, a delegate declaration reuses method_decl. */
+/* 内部辅助逻辑 */
 static int decl_type_param_count(const zan_ast_node_t *d) {
     if (!d) return 0;
     if (d->kind == AST_DELEGATE_DECL) return d->method_decl.type_params.count;
     return d->type_decl.type_params.count;
 }
 
-/* A type reference carrying type arguments can only bind to a declaration
- * with the same number of type parameters (the C# generic-arity rule).
- * Rewriting an `Action<string>` onto a mangled non-generic `Action` would
- * silently drop the argument and emit invokes with the wrong arity, so such
- * a reference stays untouched and the binder resolves the generic builtin
- * (System.Action<T>) instead. */
+/* 内部辅助逻辑 */
 static bool arity_matches(const zan_ast_node_t *tr, const nr_type_t *t) {
     if (tr->type_ref.type_args.count == 0) return true;
     return decl_type_param_count(t->decl) == tr->type_ref.type_args.count;
 }
 
-/* Same as count_simple, but a reference carrying type arguments only
- * conflicts with declarations of the same generic arity: `Action<int>` with
- * an arity-1 and an arity-0 candidate has exactly one possible target, and a
- * name-only count reports a false "ambiguous type". A reference without type
- * arguments keeps the name-based count (a bare `Action` with two imported
- * Actions IS ambiguous, C# CS0104). */
+/* 内部辅助逻辑 */
 static int count_simple_matching(nr_ctx_t *c, zan_istr_t simple,
                                  const zan_ast_node_t *tr) {
     int want = tr->type_ref.type_args.count;
@@ -431,9 +399,7 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
             }
         }
         if (t && !arity_matches(tr, t)) {
-            /* qualified reference with the wrong arity for the declared
-             * type: reduce to the simple name and let the binder resolve
-             * it (the generic builtin, if any) */
+            /* 内部辅助逻辑 */
             t = NULL;
         }
         if (t) {
@@ -441,8 +407,7 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
             if (c->refs) zan_refs_add(c->refs, t->final, c->arena);
             return;
         }
-        /* qualified reference to a non-declared (e.g. stdlib) type: reduce to
-         * the last segment so the simple-name binder can resolve it. */
+        /* qualified reference to a non-declared (e */
         uint32_t last = 0;
         for (uint32_t i = 0; i < R.len; i++)
             if (R.str[i] == '.') last = i + 1;
@@ -452,14 +417,7 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
         return;
     }
 
-    /* simple name: same-namespace first, then enclosing namespaces (C#
-     * scoping: a file in Gui.Component.DataTable sees Gui's types without a
-     * using), then usings. The global namespace is a namespace too: a
-     * declaration at global scope must win over an import, or a file with no
-     * `namespace` line resolves its own class to a same-named type pulled in
-     * by `using`. join_ns returns the bare name for an empty ctx_ns, so the
-     * first call covers ctx==global; the walk below adds the ancestors,
-     * innermost first, global last. */
+    /* 内部辅助逻辑 */
     t = find_full_joined(c, ctx_ns, R);
     if (!t && ctx_ns.len > 0) {
         char abuf[256];
@@ -475,10 +433,7 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
         }
     }
     if (t && !arity_matches(tr, t)) {
-        /* The same-namespace declaration cannot take the reference's type
-         * arguments: leave the reference untouched (it resolves to the
-         * generic builtin) instead of rewriting it onto the mangled
-         * non-generic name. */
+        /* 内部辅助逻辑 */
         if (c->refs) zan_refs_add(c->refs, R, c->arena);
         return;
     }
@@ -499,13 +454,10 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
         if (c->refs) zan_refs_add(c->refs, t->final, c->arena);
         return;
     }
-    /* Unresolved against the declared table: either a builtin, a generic type
-     * parameter, or a unique simple name the binder resolves globally. The
-     * prune needs it as an edge target anyway. */
+    /* 内部辅助逻辑 */
     if (c->refs) zan_refs_add(c->refs, R, c->arena);
 
-    /* Declared in several namespaces with no full-name match: ambiguous,
-     * require qualification; anything else stays for the binder. */
+    /* 内部辅助逻辑 */
     if (count_simple_matching(c, R, tr) >= 2 && !find_full(c, R)) {
         zan_diag_emit(c->diag, DIAG_ERROR, tr->loc,
                       "ambiguous type '%.*s'; qualify it with its namespace",
@@ -513,28 +465,17 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
     }
 }
 
-/* Resolves a simple name in expression position to a declared type, honoring
- * the referring declaration's namespace and `using` imports, and rewrites it to
- * that type's (mangled) name.  Anything that does not resolve to a renamed
- * declaration -- a variable, a builtin, a type whose name never collided -- is
- * left exactly as it was. */
+/* 内部辅助逻辑 */
 static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
                                     zan_istr_t ctx_ns, zan_ast_list_t *usings) {
     zan_istr_t R = id->ident.name;
     if (R.len == 0 || shadow_has(&c->shadow, R)) return;
 
-    /* The prune needs every receiver name as an edge: `DataTable.Col` keeps
-     * compiling through the binder's global simple-name lookup even when
-     * the qualified lookup here misses (generic classes, namespace-tail
-     * receivers), so an unresolved receiver is recorded too. */
+    /* The prune needs every receiver name as an edge: `DataTable */
     if (c->refs) zan_refs_add(c->refs, R, c->arena);
 
     nr_type_t *t = NULL;
-    /* Same-namespace first, then enclosing namespaces (C# scoping), then
-     * usings, the global namespace included -- the same rule resolve_ref
-     * applies to type positions. A declaration at global scope must win
-     * over an import. join_ns returns the bare name for an empty ctx_ns,
-     * so the first call covers ctx==global. */
+    /* 内部辅助逻辑 */
     t = find_full_joined(c, ctx_ns, R);
     if (!t && ctx_ns.len > 0) {
         char abuf[256];
@@ -567,8 +508,7 @@ static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
     }
 }
 
-/* Flattens a receiver made of identifiers and member accesses (`Gui.Reactive`)
- * into a dotted name; an empty name means it is something else. */
+/* Flattens a receiver made of identifiers and member accesses (`Gui */
 static zan_istr_t flatten_receiver(nr_ctx_t *c, zan_ast_node_t *n) {
     zan_istr_t empty = {0};
     if (!n) return empty;
@@ -581,18 +521,13 @@ static zan_istr_t flatten_receiver(nr_ctx_t *c, zan_ast_node_t *n) {
     return empty;
 }
 
-/* Rewrites a namespace-qualified static receiver (`Beta.Log.Line(...)`) to the
- * renamed declaration: the whole `Beta.Log` chain collapses into the single
- * identifier the binder knows. Only an exact namespace+type match collapses, so
- * a field chain (`this.a.b`) or a value's member is never touched. */
+/* Rewrites a namespace-qualified static receiver (`Beta */
 static void resolve_qualified_receiver(nr_ctx_t *c, zan_ast_node_t *recv) {
     zan_istr_t full = flatten_receiver(c, recv);
     if (full.len == 0 || !ns_has_dot(full)) return;
     nr_type_t *t = find_full(c, full);
     if (!t) {
-        /* `A.B.C` that is not a declared namespace+type pair: any segment
-         * may still name a declaration the binder resolves globally (the
-         * tail especially) — record them all for the prune. */
+        /* `A */
         if (c->refs) {
             zan_ast_node_t *seg = recv;
             while (seg && seg->kind == AST_MEMBER_ACCESS) {
@@ -617,9 +552,7 @@ static void collect_shadows_list(nr_ctx_t *c, zan_ast_list_t *l) {
     for (int i = 0; i < l->count; i++) collect_shadows(c, l->items[i]);
 }
 
-/* Gathers every name the member binds, anywhere in its body: nsresolve has no
- * scopes, so one flat set per member is what keeps a variable from being
- * mistaken for a type of the same name. */
+/* 内部辅助逻辑 */
 static void collect_shadows(nr_ctx_t *c, zan_ast_node_t *n) {
     if (!n) return;
     switch (n->kind) {
@@ -761,11 +694,7 @@ static void nr_walk_list(nr_ctx_t *c, zan_ast_list_t *l,
 static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
                     zan_istr_t ns, zan_ast_list_t *usings) {
     if (!n) return;
-    /* A declaration keeps the file context it was stamped with at parse time
-     * (zan_nsresolve_stamp runs per file, before merge_partials folds the
-     * partials together) over the caller's: a merged partial is walked with
-     * the surviving declaration's file, whose imports its members need not
-     * share. */
+    /* 内部辅助逻辑 */
     if (zan_ast_ns_usings(n)) {
         ns = zan_ast_ns_name(n);
         usings = zan_ast_ns_usings(n);
@@ -1023,8 +952,7 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
     c.arena = arena;
     c.diag = diag;
     c.count = 0;
-    /* nr_walk dereferences c->refs whenever non-NULL: initialize explicitly
-     * (only zan_nsresolve_prune installs the hook). */
+    /* 内部辅助逻辑 */
     c.refs = NULL;
     c.shadow.items = NULL;
     c.shadow.count = 0;
@@ -1050,8 +978,7 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
     nr_index_build(&c.by_full, c.items, c.count, 1, arena);
     nr_index_build(&c.by_simple, c.items, c.count, 0, arena);
 
-    /* 2. detect cross-namespace simple-name collisions: walk each
-     * same-simple-name group once via the simple-name index. */
+    /* 2 */
     for (int node = 0; node < c.count; node++) {
         zan_istr_t simple = c.items[node].simple;
         for (int other = c.by_simple.buckets[nr_hash(simple) & c.by_simple.mask];
@@ -1076,7 +1003,7 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
         decl_set_name(c.items[i].decl, m);
     }
 
-    /* 4. rewrite every type reference against its declaration's ns/usings */
+    /* 4 */
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *d = decls->items[i];
         if (!d) continue;
@@ -1092,9 +1019,7 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
     zan_ast_list_t *decls = &unit->comp_unit.decls;
     if (decls->count == 0) return;
 
-    /* Declared-type table keyed by FINAL names (post-mangle), mirroring
-     * zan_nsresolve_run's collection so reference names recorded during its
-     * walk match entries here. */
+    /* 内部辅助逻辑 */
     int count = 0;
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *d = decls->items[i];
@@ -1121,12 +1046,8 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
     nr_index_t by_simple;
     nr_index_build(&by_simple, items, n, 0, arena);
 
-    /* Roots: the program itself. User-authored declarations are always kept
-     * (compiler magic reflects over the entry unit), and stdlib declarations
-     * join the kept set only when a kept declaration references them. */
-    /* A compile with NO user declarations (compiling the code generators
-     * themselves, --no-gen) has no root set: pruning there would drop
-     * everything including Main, so the pass is skipped entirely. */
+    /* Roots: the program itself */
+    /* 内部辅助逻辑 */
     int user_roots = 0;
     for (int i = 0; i < n; i++)
         if (!items[i].decl->from_stdlib) user_roots++;
@@ -1138,11 +1059,7 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
     for (int i = 0; i < n; i++) {
         zan_ast_node_t *d = items[i].decl;
         if (!d->from_stdlib) { kept[i] = 1; continue; }
-        /* Extension-method hosts are invisible to name resolution: their
-         * members are called as `recv.M(...)` with no reference to the class
-         * name anywhere, and find_extension_method's linear search is the
-         * only thing that finds them -- pruning a host silently breaks every
-         * such call, so hosts are anchors. */
+        /* 内部辅助逻辑 */
         if (d->kind == AST_CLASS_DECL || d->kind == AST_STRUCT_DECL) {
             bool is_ext_host = false;
             for (int m = 0; m < d->type_decl.members.count && !is_ext_host; m++) {
@@ -1157,12 +1074,7 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
         }
     }
 
-    /* Fixpoint: walk every kept declaration with the ref hook on; any
-     * referenced type keeps its declaration. Each round the kept set can
-     * only grow; stop when a round adds nothing. The resolution indexes
-     * only read `items`, so they are built once and shared across all
-     * walks; only declarations newly kept in the previous round get
-     * walked, since folding in a decl's refs twice cannot grow the set. */
+    /* 内部辅助逻辑 */
     unsigned char *walked = (unsigned char *)calloc((size_t)n, 1);
     if (!walked) { free(kept); return; }
     nr_ctx_t c;
@@ -1185,9 +1097,7 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
             zan_ast_node_t *d = items[i].decl;
             refs.count = 0;
             nr_walk(&c, d, zan_ast_ns_name(d), zan_ast_ns_usings(d));
-            /* Recorded names are FINAL simple names (t->final): match them
-             * against the simple-name index, not by_full, or non-mangled
-             * references would be missed and live declarations dropped. */
+            /* 内部辅助逻辑 */
             for (int k = 0; k < refs.count; k++) {
                 int j = nr_index_find(&by_simple, items, 0, refs.items[k]);
                 if (j >= 0) kept[j] = 1;
@@ -1199,7 +1109,7 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
     }
     free(walked);
 
-    /* Rewrite the merged decl list, dropping unreachable type declarations. */
+    /* Rewrite the merged decl list, dropping unreachable type declarations */
     int w = 0;
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *d = decls->items[i];

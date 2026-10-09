@@ -14,10 +14,7 @@
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
 
-/* A frame-resident slot of an async $resume body. During emission slot_alloca
- * is a real alloca so the existing typed-address helpers can inspect it. Once
- * the body and EH epilogues are complete, all uses are rewritten to the entry
- * GEP of frame_index and the alloca is erased. No value is copied at suspend. */
+/* A frame-resident slot of an async $resume body */
 typedef struct {
     LLVMValueRef slot_alloca;
     LLVMTypeRef  llvm;
@@ -72,10 +69,7 @@ static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
 /* Nesting depth of try/finally regions a single function body may be inside. */
 #define ZAN_MAX_FINALLY_DEPTH 256
 
-/* Armed try handlers tracked at once. Nested bodies (lambdas, async $resume)
- * stack their own entries on top of the enclosing body's, so this is deeper
- * than the per-body try nesting; overflow drops the extra entries (grow-only
- * fallback) rather than restoring a wrong depth. */
+/* Armed try handlers tracked at once */
 #define ZAN_MAX_ARMED_TRY 1024
 
 typedef struct zan_irgen_pending_scope {
@@ -104,10 +98,7 @@ typedef struct zan_goto_label_rec {
     zan_irgen_pending_scope_t *label_owner;
 } zan_goto_label_rec_t;
 
-/* One `catch` body being emitted: the handler owns the caught exception (see
- * the exc.push/exc.hrel pair in the try lowering) and releases it in the try's
- * epilogue -- which `return`, `break`, `continue` and `throw` jump past, so
- * those paths release it from here instead. */
+/* One `catch` body being emitted: the handler owns the caught exception (see the exc */
 typedef struct zan_irgen_catch_cleanup {
     LLVMValueRef exc_slot;   /* i8* slot holding the caught exception */
     LLVMValueRef owned_slot; /* i32 slot: non-zero when the handler owns it */
@@ -129,11 +120,7 @@ typedef struct zan_irgen_finally_entry {
     int outer_throw_catch_base;
     zan_irgen_pending_scope_t *pending_parent;
     zan_irgen_pending_scope_t *pending_scope;
-    bool in_try_body;       /* emitting the guarded body: a throw here is
-                             * taken by this try's own handler, which runs
-                             * the finally itself. False while emitting a
-                             * catch (or the finally), where a throw leaves
-                             * the region and must run it at the throw site. */
+    bool in_try_body;       /* emitting the guarded body: a throw here is taken by this try's own handler, which runs the finally itself */
 } zan_irgen_finally_entry_t;
 
 typedef struct zan_goto_fixup {
@@ -147,11 +134,7 @@ typedef struct zan_goto_fixup {
     int          locals_owned;
     int          resolved;
     LLVMBasicBlockRef from_bb;  /* block holding this goto's forward branch */
-    /* Cleanup stacks at the goto site. At label definition the live stacks
-     * only reach the label's depth, so the popped entries the jump must run
-     * (skipped finallys/monitor exits, owned catch exceptions) are replayed
-     * from these copies together with armed slots and the source emission
-     * context: nested finally exits must see the goto site's handler state. */
+    /* Cleanup stacks at the goto site */
     int finally_snap_n;
     struct zan_irgen_finally_entry *finally_snap;
     int catch_snap_n;
@@ -223,10 +206,7 @@ struct zan_irgen {
     struct zan_struct_type_entry {
         zan_symbol_t *sym;
         LLVMTypeRef llvm_type;
-        /* [StructLayout(LayoutKind.Explicit)]: the body is one opaque block
-         * and every field is addressed by its own [FieldOffset(n)], so two
-         * fields may overlap -- that is how a C union is written. Indexed
-         * like get_field_index (a vptr slot, if any, is index 0). */
+        /* [StructLayout(LayoutKind */
         bool explicit_layout;
         unsigned long *field_offsets;
         LLVMTypeRef *field_llvm;
@@ -258,10 +238,7 @@ struct zan_irgen {
     } *functions;
     int function_count;
     int function_cap;
-    /* symbol -> index into `functions`, so a call site resolves its callee in
-     * O(1). Open addressing with a power-of-two capacity; sym == NULL marks a
-     * free slot, and a symbol registered twice keeps its first index (callers
-     * expect the first match). */
+    /* symbol -> index into `functions`, so a call site resolves its callee in O(1) */
     struct zan_fn_index_slot {
         zan_symbol_t *sym;
         int idx;
@@ -274,15 +251,9 @@ struct zan_irgen {
     /* first body-scope local of the innermost loop: `break`/`continue`
      * release owned locals from this index before leaving the body */
     int loop_locals_base;
-    /* first local whose scope-exit release a `throw` would skip: the longjmp
-     * lands in the innermost enclosing try of *this* function (so its body's
-     * locals, from this index up, must be released at the throw site) or, with
-     * no enclosing try, leaves the function altogether (index 0). */
+    /* 内部辅助实现 */
     int throw_locals_base;
-    /* catch bodies currently being emitted, innermost last. A handler owns the
-     * caught exception (see the exc.push/exc.hrel pair in the try lowering) and
-     * releases it in the try's epilogue -- which `return`, `break`, `continue`
-     * and `throw` jump past, so those paths release it from here instead. */
+    /* catch bodies currently being emitted, innermost last */
     zan_irgen_catch_cleanup_t *catch_cleanups;
     int catch_cleanup_count;
     int catch_cleanup_cap;
@@ -293,12 +264,7 @@ struct zan_irgen {
      * a `throw` unwinds past exactly those handlers */
     int throw_catch_base;
 
-    /* `finally` bodies of the try statements currently being emitted, innermost
-     * last. C# runs a finally on EVERY way out of its try, but this lowering
-     * has no landing pads to hang cleanups off, so each exit path emits the
-     * body inline: `return` runs all of them, `break`/`continue` the ones
-     * entered inside the loop (from finally_loop_base up), and an exception
-     * with no matching clause runs this try's own before rethrowing. */
+    /* `finally` bodies of the try statements currently being emitted, innermost last */
     zan_irgen_finally_entry_t finallys[ZAN_MAX_FINALLY_DEPTH];
     int finally_count;
     /* finallys entered inside the innermost loop: break/continue run only those */
@@ -306,18 +272,10 @@ struct zan_irgen {
     /* Executing cleanup ancestry survives truncation of the finallys stack. */
     zan_irgen_pending_context_t pending;
 
-    /* Overflow-checking context while emitting a statement/expression: >0
-     * inside `checked(...)`/`checked { ... }` (integer + - * get an overflow
-     * guard), <0 inside `unchecked(...)`/`unchecked { ... }` (plain wrapping
-     * ops even under an enclosing checked), 0 = default wrapping semantics. */
+    /* Overflow-checking context while emitting a statement/expression: >0 inside `checked( */
     int irgen_checked_depth;
 
-    /* try statements whose handler is currently armed, innermost last. Entering
-     * a try raises __zan_eh_top by one and the normal fallthrough out of its
-     * body lowers it again, but `return`/`break`/`continue` branch past that
-     * epilogue, so those paths restore the top from here -- otherwise the
-     * handler stack only ever grows until it aborts with "exception handler
-     * stack exhausted". */
+    /* try statements whose handler is currently armed, innermost last */
     struct {
         LLVMValueRef old_top_slot; /* i32 alloca: __zan_eh_top at try entry */
     } eh_armed[ZAN_MAX_ARMED_TRY];
@@ -328,10 +286,7 @@ struct zan_irgen {
     /* entries armed inside the innermost loop: break/continue leave only those */
     int eh_armed_loop_base;
 
-    /* wasm32 try lowering (LLVM WebAssembly EH): the engine unwinds instead
-     * of longjmp, so every call emitted inside a try body must be an invoke
-     * whose unwind edge lands on this try's landing-pad block. Innermost
-     * last, parallel to eh_armed's nesting; zan_call2 consults the top. */
+    /* 内部辅助实现 */
     LLVMBasicBlockRef wasm_lpad_stack[ZAN_MAX_ARMED_TRY];
     int wasm_try_depth;
     bool in_wasm_throw_op; /* inside the wasm throw emission: keep its calls
@@ -355,18 +310,8 @@ struct zan_irgen {
     int ctor_count;
     int ctor_cap;
 
-    /* generic monomorphization: specialized copies of a user generic class's
-     * methods/constructors, one per concrete instantiation (e.g. HashSet<string>).
-     * Signatures are IDENTICAL to the erased versions (type params still lower to
-     * the erased representation); the only behavioural difference is that the
-     * body is emitted with `cur_inst` set, so intrinsic element comparisons
-     * (List/Dict) substitute the type parameter to its concrete argument and use
-     * content equality (e.g. strcmp) instead of erased identity. Routing a call
-     * to a specialized symbol is therefore a pure symbol swap. */
-    zan_type_t *collect_inst_ctx; /* instantiation whose body is being scanned by
-                                   * the discovery pass; substitutes the class's
-                                   * own type parameters so open types inside it
-                                   * (Inner<T>) are recorded concretely */
+    /* 内部辅助实现 */
+    zan_type_t *collect_inst_ctx; /* 内部辅助实现 */
     zan_type_t *cur_inst;   /* active instantiation while emitting a specialized
                              * body (a class type carrying concrete type_args);
                              * NULL when emitting erased/non-generic code. */
@@ -398,14 +343,7 @@ struct zan_irgen {
     int generic_inst_count;
     int generic_inst_cap;
 
-    /* method-level monomorphization: specialized copies of a *generic method*
-     * (one declaring its own <T,...>), keyed by the concrete types bound to
-     * those parameters at a call site. Unlike the class-level table above,
-     * a specialized method's SIGNATURE uses the concrete types (no erasure),
-     * so type-specific semantics (string/double comparison, ARC releases of
-     * replaced values) hold inside the body. Bodies are emitted from a pending
-     * queue drained after the main passes; emission may enqueue further
-     * specializations (a generic method calling another generic method). */
+    /* method-level monomorphization: specialized copies of a *generic method* (one declaring its own <T, */
     struct zan_method_spec {
         zan_symbol_t   *msym;      /* the generic method symbol */
         zan_symbol_t   *type_sym;  /* declaring class */
@@ -456,10 +394,7 @@ struct zan_irgen {
     LLVMTypeRef  exit_type;
     LLVMValueRef fn_atexit;       /* int atexit(void(*)(void)) */
     LLVMTypeRef  atexit_type;
-    /* RC-managed static fields, registered as their backing globals are
-     * created, so program-exit cleanup can release them across EVERY
-     * compilation unit — the unit containing main() only sees its own
-     * declarations, and stdlib singletons (Pinyin.cache, ...) would leak. */
+    /* 内部辅助实现 */
     struct zan_static_field_ref {
         zan_type_t   *type;  /* the field's declared (rc-managed) type */
         LLVMValueRef  gv;    /* backing global */
@@ -467,12 +402,7 @@ struct zan_irgen {
     int static_field_count;
     int static_field_cap;
     LLVMValueRef g_live;          /* i64 global: net live ARC allocations */
-    /* check-leaks site tables: the arrays are created at finalize
-     * with the exact site count -- unknown during emission, and LLVM fixes a
-     * global's type at creation -- so instrumentation reaches them through
-     * these pointer globals, and __zan_site_count carries the bound for every
-     * runtime index check. Only check-leaks builds reference them; descriptor
-     * builds leave them null and the optimizer drops the globals. */
+    /* 内部辅助实现 */
     LLVMValueRef g_site_live;     /* ptr to [N x i64]: live count per alloc site */
     LLVMValueRef g_site_names;    /* ptr to [N x i8*]: "file:line:col" per site */
     LLVMValueRef g_site_dtors;    /* ptr to [N x i8*]: release fn per alloc site */
@@ -488,63 +418,34 @@ struct zan_irgen {
                                   * fields its type arguments really hold */
     int          *site_coll;     /* per site: 0=class, 1=List, 2=StringBuilder */
     zan_type_t   **site_coll_elem; /* per site: List element type (for release) */
-    /* Where the new-expression sits, so a check-leaks report can name each
-     * allocation site's own file:line instead of aliasing every same-shape
-     * site onto the one that allocated last. 0/0 = unknown (no -g), which
-     * keys shape-only, i.e. the pre-location behavior. */
+    /* 内部辅助实现 */
     uint32_t     *site_loc_file;
     uint32_t     *site_loc_line;
     int          leak_site_count; /* number of distinct `new` sites assigned */
     int          leak_site_cap;   /* capacity of the site_* host-side arrays */
-    /* Per-shape descriptor globals (non-check-leaks builds): one
-     * {dtor, tynames, meta, site_id} record per alloc-site shape, stored in
-     * the object header instead of a site index. All three pinning tables
-     * (site_dtors / site_tynames / site_meta) disappear in this mode, so
-     * --gc-sections can drop every descriptor's functions that no live code
-     * references. */
+    /* 内部辅助实现 */
     LLVMValueRef *desc_gv;       /* per shape: @__zan_desc_<i> global */
     int          desc_gv_cap;    /* capacity of desc_gv */
     bool         desc_hdr;       /* header word = descriptor pointer mode */
-    /* Intern table for compiler-emitted runtime-guard texts: identical
-     * "file:line:col: runtime error: msg" strings share one global. LLVM does
-     * not merge identical private string globals at -O0/-O1. Pointer identity
-     * is also the soft-report site identity (zan_rt_soft_seen), so sharing is
-     * semantically exact. */
+    /* 内部辅助实现 */
     zan_str_intern_t **str_intern; /* chained hash, ZAN_STR_INTERN_BUCKETS */
                                    /* (bucket array calloc'd on first intern) */
     int          str_intern_cap; /* allocated bucket count */
-    bool         rt_guard_split;   /* split prefix/msg guard reports (needs
-                                    * zan_rt_soft_note2 in the linked runtime;
-                                    * false for cross targets until their
-                                    * committed runtime objects are rebuilt) */
+    bool         rt_guard_split;   /* 内部辅助实现 */
     LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
     const char  *src_file;        /* source path, for runtime diagnostics */
     bool         runtime_checks;  /* insert div-by-zero (etc.) guards; default true */
-    LLVMValueRef expect_false_fn; /* cached llvm.expect.i1 declaration; the
-                                   * runtime guards feed their predicate
-                                   * through it with an expected value of
-                                   * false so the backend keeps the fault
-                                   * arm out of the hot path's layout */
+    LLVMValueRef expect_false_fn; /* cached llvm */
     LLVMValueRef soft_scratch_slot; /* per-function entry alloca holding the
                                    * zan_rt_soft_scratch() page pointer */
     LLVMValueRef soft_scratch_fn;   /* the function soft_scratch_slot lives in */
     bool         publish_mode;    /* --publish: release build without unused bodies */
-    bool         strict_runtime;  /* --strict-runtime: main() marks the program
-                                   * fail-fast at startup (equivalent to the
-                                   * operator setting ZAN_RT_HARD=1), so soft
-                                   * guards exit(70) instead of logging and
-                                   * continuing with a default value */
+    bool         strict_runtime;  /* 内部辅助实现 */
     bool         check_leaks;     /* emit a leak report at program exit */
     bool         arc_guard;       /* quarantine freed objects/strings and trap
                                    * any later retain/release of them
                                    * (use-after-free detection; leaks memory) */
-    bool         arc_net;         /* --publish over-release net: the same
-                                   * rc<=0 comparison the guard uses, but the
-                                   * report goes through the fail-soft note
-                                   * (once per kind, stderr + runtime log) and
-                                   * execution continues -- an over-release
-                                   * only leaks, so the net never turns a
-                                   * leak into a crash */
+    bool         arc_net;         /* 内部辅助实现 */
     bool         fast_codegen;    /* machine codegen at -O0 (fast turnaround) */
     bool         emit_lib;        /* library output: keep `public` members as
                                      exported (external-linkage) symbols */
@@ -601,10 +502,7 @@ struct zan_irgen {
     LLVMValueRef fn_refl_get_str;   /* i8* (i8* ti, i8* obj, i8* name) */
     LLVMValueRef fn_refl_fname;     /* i8* (i8* ti, i64 idx, i64 which) */
     LLVMValueRef fn_refl_obj_type;  /* i8* (i8* obj, i8* fallback) */
-    /* second layer: the method / constructor tables. A record is
-     * { i8* name, i8* retType, i64 retKind, i64 paramCount, i8* paramTypes,
-     *   i8* thunk, i64 flags }; the thunk unpacks an i64 argument array and
-     * calls the real function, so a call by name needs no signature. */
+    /* second layer: the method / constructor tables */
     LLVMTypeRef  refl_method_type;
     /* Method tables are shaped when the record is emitted but filled at the
      * end of the module: a typeof(T) lowered from a top-level function runs
@@ -631,11 +529,7 @@ struct zan_irgen {
     LLVMValueRef fn_refl_cfind;     /* i64 (i8* ti, i64 nargs) */
     LLVMValueRef fn_refl_tainfo;    /* i64 (i8* ti, i64 idx, i64 which) */
 
-    /* --publish string obfuscation. Literal text is stored XOR-scrambled in
-     * the image (emit_string_literal_rc); a .ctors constructor un-scrambles it
-     * in place before main, so a static `strings`/grep over the exe finds no
-     * user text. Not cryptography -- the key ships in the binary -- it only
-     * defeats trivial static extraction. */
+    /* --publish string obfuscation */
     bool obfuscate_strings;
     unsigned char obf_key[16];
     /* Grown on demand: a fixed cap would silently leave later literals
@@ -650,10 +544,7 @@ struct zan_irgen {
     LLVMTypeRef  co_header_type;  /* shared frame header {i64,step*,i32,i32,i8*,step*,i64} */
     LLVMValueRef rt_co_ready;     /* void zan_co_ready(void* frame, step) */
     LLVMTypeRef  rt_co_ready_type;
-    /* i32 zan_co_poll(void): planted at async loop back-edges; returns
-     * non-zero when the driver wants the running frame requeued (slice
-     * expired). M:1 driver: body emitted below. Multi-worker driver:
-     * resolved from zanrt_io_mt at link time. */
+    /* 内部辅助实现 */
     LLVMValueRef rt_co_poll;
     LLVMTypeRef  rt_co_poll_type;
     LLVMValueRef rt_co_frame_free;/* void __zan_co_frame_free(void* frame) */
@@ -662,22 +553,12 @@ struct zan_irgen {
     LLVMTypeRef  rt_co_sched_init_type;
     LLVMValueRef rt_co_sched_run; /* void zan_co_sched_run(void) */
     LLVMTypeRef  rt_co_sched_run_type;
-    /* void zan_co_sched_run_until(i32* done): pump like zan_co_sched_run but
-     * stop as soon as *done is non-zero (the awaited frame's DONE flag), so a
-     * synchronous context waiting on one coroutine is not held by unrelated
-     * background coroutines that never finish. A null pointer drains. */
+    /* 内部辅助实现 */
     LLVMValueRef rt_co_sched_run_until;
     LLVMTypeRef  rt_co_sched_run_until_type;
     LLVMValueRef rt_co_delay;     /* void zan_co_delay(i64 ms, void* frame, step) */
     LLVMTypeRef  rt_co_delay_type;
-    /* socket async: the readiness reactor, provided by the shipped
-     * zanrt_io object (built from src/runtime/rt_io.c). zan_io_wait_co registers
-     * a one-shot fd watcher that re-readies (frame, step) when ready;
-     * zan_io_pump_timeout blocks for IO up to the next timer deadline. A weak
-     * inline fallback sleeps for timer-only programs; the reactor object's
-     * strong definition overrides it for socket-async programs.
-     * The `fd` parameters are C `intptr_t` (a Windows SOCKET is a UINT_PTR),
-     * lowered as i64 because our targets are 64-bit. */
+    /* socket async: the readiness reactor, provided by the shipped zanrt_io object (built from src/runtime/rt_io */
     LLVMValueRef rt_io_wait_co;   /* void zan_io_wait_co(iptr fd,i32 interest,i8* frame,step) */
     LLVMTypeRef  rt_io_wait_co_type;
     LLVMValueRef rt_io_recv_co;   /* void zan_io_recv_co(iptr fd,i8* buf,i32 len,i8* frame,step,i64* out_n) */
@@ -708,29 +589,15 @@ struct zan_irgen {
     bool         uses_file_runtime; /* set by zan_file_* (file IO) externs */
     bool         uses_embed_api;    /* set by zan_embed_* extern references */
     bool         uses_inflate;      /* set by zan_embed_decode/rawlen (compressed payloads) */
-    /* goto/label support: label blocks keyed by (function, name), created on
-     * first reference from either the label statement or a goto. The depth
-     * fields are recorded at the label statement (definition): a backward
-     * goto runs the full exit sequence down to them; a forward goto is
-     * validated against them there, because the cleanup a jump must run is
-     * only known once the label's nesting depth is. */
+    /* 内部辅助实现 */
     zan_goto_label_rec_t *goto_labels;
     int goto_label_count;
     int goto_label_cap;
-    /* forward gotos waiting for their label's definition. A jump that would
-     * cross a try/lock boundary or leave owning locals behind can neither run
-     * the skipped finallys at the jump site (the label's depth is unknown
-     * there) nor have them retro-fitted at the label, so those are diagnosed
-     * instead of silently mis-lowered. */
+    /* forward gotos waiting for their label's definition */
     zan_goto_fixup_t *goto_fixups;
     int goto_fixup_count;
     int goto_fixup_cap;
-    /* exception class-name registry: one {descriptor address, name} pair per
-     * class that got a __zan_tid_<Class> descriptor. The unhandled-exception
-     * reporter walks the thrown object's descriptor chain and matches
-     * addresses against this table to print the real class name
-     * ("Unhandled exception: FileNotFoundException: msg") instead of an
-     * opaque "(class object)". */
+    /* exception class-name registry: one {descriptor address, name} pair per class that got a __zan_tid_<Class> descriptor */
     struct {
         LLVMValueRef tid;   /* address of the __zan_tid_<Class> global */
         const char     *name;
@@ -742,10 +609,7 @@ struct zan_irgen {
      * is emitted */
     LLVMValueRef tid_name_reg_global;
     LLVMTypeRef  tid_name_reg_ent_ty;
-    /* set while emitting an async function's $resume body: the current heap
-     * frame pointer and its struct type, so `return` stores into the frame's
-     * result slot + notifies the awaiter instead of a plain ret. NULL when not
-     * lowering an async body. */
+    /* 内部辅助实现 */
     LLVMValueRef current_async_frame;
     LLVMTypeRef  current_async_frame_type;
     LLVMValueRef current_async_resume_fn; /* the $resume fn being emitted */
@@ -787,10 +651,7 @@ struct zan_irgen {
     LLVMValueRef current_async_result_ptr;      /* cached &frame->result GEP */
     /* Persistent per-function IR compaction state (owned by irgen.c). */
     void        *function_compactor;
-    /* async exception handling: the eh-stack depth on entry to the $resume
-     * invocation being emitted (an alloca), the block that completes the frame
-     * with a pending exception, the switch that re-enters the catch of a
-     * handler armed by an earlier invocation, and the next handler id. */
+    /* 内部辅助实现 */
     LLVMValueRef current_async_eh_entry;
     LLVMBasicBlockRef current_async_exc_bb;
     LLVMValueRef current_async_rearm_switch;
@@ -828,29 +689,18 @@ struct zan_irgen {
     } *extern_fns;
     int extern_fn_count;
     int extern_fn_cap;
-    /* FFI on targets with no aggregate C ABI classification (wasm32 etc.):
-     * externs whose Zan signature carries a struct are declared plain and
-     * remembered here; only a real CALL errors (abi_pending_report in
-     * irgen_abi.c) -- merely pulling a stdlib file that declares one must
-     * not fail the whole compile. */
+    /* FFI on targets with no aggregate C ABI classification (wasm32 etc */
     char **abi_pending;
     int abi_pending_count;
     int abi_pending_cap;
 
-    /* Per-thread exception-handling state (see irgen_builtins.c). The block
-     * pointer and the field addresses derived from it are materialized once
-     * per function, in its entry block: EH lowering hands these pointers to
-     * blocks the async CPS split moves out of the defining block's dominance,
-     * exactly like emit_entry_alloca's slots. */
+    /* Per-thread exception-handling state (see irgen_builtins */
     LLVMTypeRef  eh_state_ty;
     LLVMValueRef eh_state_owner;   /* function the cache below belongs to */
     LLVMValueRef eh_state_cached;
     LLVMValueRef eh_state_fields[8];
 
-    /* cross-compilation target. When target_triple[0] is set, write_obj emits
-     * an object for that LLVM triple verbatim (e.g. x86_64-unknown-linux-musl)
-     * instead of applying the host's default/windows-gnu triple. Empty means
-     * "use the host default" (unchanged legacy behaviour). */
+    /* cross-compilation target */
     char target_triple[128];
     bool target_is_windows;   /* true when emitting for Windows (Sleep vs poll) */
     bool target_is_macos;     /* true when emitting for Darwin: libSystem exports
@@ -881,17 +731,10 @@ struct zan_irgen {
     uint32_t         di_cur_line;   /* source line of the statement in progress */
     uint32_t         di_cur_file;   /* its file_id (for local-variable declares) */
 
-    /* ARC: nesting depth of the statement currently being emitted, counting
-     * only control-flow bodies (if/loop/switch/try). A class-typed local is
-     * tracked as an owning reference (released at function exit) only when it
-     * is declared at depth 0, so its stack slot dominates every exit block. */
+    /* ARC: nesting depth of the statement currently being emitted, counting only control-flow bodies (if/loop/switch/try) */
     int arc_stmt_depth;
 
-    /* Whole-body use-scan memo: the scan runs once per function body (not once
-     * per declared local/parameter), recording identifiers (keyed {body, name})
-     * with `written`, `lam_written`, and a name-only `lam_captured` candidate
-     * that a scoped scan confirms before boxing. One open-addressing table,
-     * reset per compilation. */
+    /* 内部辅助实现 */
     struct zan_body_write_entry {
         zan_ast_node_t *body;
         zan_istr_t      name;
@@ -926,13 +769,7 @@ void zan_irgen_shard_buf_free(zan_irgen_t *g);
 bool zan_irgen_shard_harvest_fn(zan_irgen_t *g, LLVMValueRef fn);
 void zan_irgen_shard_harvest_stats(void);
 
-/* Zan compiles a whole program (every reachable stdlib and user file) into one
- * LLVM module and links an executable, so nothing outside the module can call a
- * Zan function: `main` is the only symbol the C runtime needs by name. Giving
- * every other definition internal linkage lets LLVM's GlobalDCE delete the
- * ones no live code, vtable or delegate refers to -- with external linkage the
- * linker has to keep them all. Address-taken functions stay alive through the
- * reference itself, so delegates, WndProcs and vtable slots are unaffected. */
+/* 内部辅助实现 */
 static inline void zan_set_module_local(LLVMValueRef fn) {
     if (fn) LLVMSetLinkage(fn, LLVMInternalLinkage);
 }
@@ -951,11 +788,7 @@ void zan_irgen_release_llvm(zan_irgen_t *g);
  * one private global instead of each emit site allocating its own .rdata. */
 LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text);
 
-/* Abort with "out of memory" when the malloc/realloc result `raw` is null,
- * instead of letting the store that follows write through a null buffer (which
- * faults at a tiny address and reports no cause). Splits the current block:
- * emission continues in the non-null continuation, so a phi fed by this edge
- * must name LLVMGetInsertBlock() rather than the original block. */
+/* 内部辅助实现 */
 void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw);
 
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit);
@@ -966,15 +799,7 @@ void zan_irgen_emit_string_deobf(zan_irgen_t *g);
 zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path);
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path);
 
-/* Codegen manifest (post-fixpoint semantic snapshot):
- * Built AFTER zan_irgen_emit (every fixpoint complete) and BEFORE the
- * optimizer. Read-only over the finished module; carries names and integer
- * facts only — never a module-local LLVM handle — so a future coordinator
- * can audit what may leave the single module without extending its
- * lifetime. The audit applies the stage-4 sharding allowlist and reports
- * how much defined body would be shard-eligible and how many functions are
- * "clean roots" (their transitive direct-call closure stays inside
- * eligible bodies + ARC release helpers). */
+/* 内部辅助实现 */
 typedef struct zan_mf_fn {
     const char *name;      /* module-owned LLVM name (alive while g lives) */
     unsigned    blocks, insns;
@@ -1009,47 +834,23 @@ int  zan_irgen_manifest_write_json(zan_irgen_t *g, zan_cg_manifest_t *m,
                                    const char *path);
 void zan_irgen_manifest_free(zan_cg_manifest_t *m);
 
-/* Stage-4 opt-in object sharding (ZAN_SHARD=1, native non-debug targets):
- * emits manifest-eligible bodies as separate object files
- * `<obj_base>.shard<k>.o`, deletes them from the coordinator module, and
- * hands the object paths to the caller (malloc'd strings, caller frees).
- * Returns the object count (0 = clean fallback to the single module, e.g.
- * nothing eligible or an unverifiable shard), -1 only on an internal error
- * the caller must treat as fatal. */
+/* 内部辅助实现 */
 int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                         const char *obj_base, char ***out_objs);
 
-/* Binds the target triple + data layout to the module early. --publish must
- * call this BEFORE the optimizer runs: with the layout still unset LLVM
- * assumes its generic default (64-bit pointers) and bakes 8-byte pointer
- * strides into the IR, which then misreads data laid out at the target's
- * real pointer size (rv32: literal-decode tables then read NULL and trap). */
+/* Binds the target triple + data layout to the module early */
 void zan_irgen_bind_target(zan_irgen_t *g);
 
-/* Turns every bodyless [DllImport] declaration owned by `lib` into a strong
- * definition returning -1/null/0. Used before write_obj when cross-linking a
- * static Linux binary and no static archive for the lib is bundled: the
- * program still links, and the stubbed calls fail at runtime instead of the
- * whole publish failing. Returns the number of functions stubbed. */
+/* Turns every bodyless [DllImport] declaration owned by `lib` into a strong definition returning -1/null/0 */
 int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
 
-/* Removes `lib` from the extern_libs list so the linker line stops asking
- * for it (-l<lib>). Companion to zan_irgen_stub_extern_lib: once every
- * import of the library is stubbed, nothing needs the archive/DLL and a
- * missing one must not fail the link. Returns the number of entries
- * removed (0 = the lib was not tracked). */
+/* Removes `lib` from the extern_libs list so the linker line stops asking for it (-l<lib>) */
 int zan_irgen_drop_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
 
-/* Drop from extern_libs every [DllImport] library whose imports were all
- * deleted as unreachable, so a program links only the native libraries it
- * actually calls. Must run after the dead-code sweep. Returns the number of
- * libraries dropped. */
+/* 内部辅助实现 */
 int zan_irgen_prune_extern_libs(zan_irgen_t *g);
 
-/* True when the module defines a function whose (mangled `Class_Member`) name
- * starts with `prefix`. Lets a driver bundle a dependency only for programs
- * that actually use the feature owning it (see the `if` clause of a
- * `<driver>.bundle` manifest). */
+/* True when the module defines a function whose (mangled `Class_Member`) name starts with `prefix` */
 bool zan_irgen_defines_prefix(zan_irgen_t *g, const char *prefix);
 
 #endif /* ZAN_IRGEN_H */

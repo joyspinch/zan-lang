@@ -1,13 +1,7 @@
-/* irgen_stmt.c -- statement codegen (emit_stmt and friends).
- *
- * #include'd by irgen.c in a fixed order; must not be compiled standalone.
- */
+/* 内部辅助实现 */
 
 static void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit);
-/* Structural type compatibility for async frame-slot reuse: two same-named
- * declarations may share one frame slot only when their types genuinely
- * agree, because the slot's LLVM type and width are baked into the frame
- * struct at plan time. */
+/* 内部辅助实现 */
 static bool async_slot_type_compatible(zan_type_t *a, zan_type_t *b) {
     if (a == b) return true;
     if (!a || !b) return false;
@@ -76,10 +70,7 @@ static zan_irgen_pending_scope_t *goto_label_owner(zan_irgen_t *g, zan_istr_t na
     return NULL;
 }
 
-/* Find or create the label record for (current function, body copy, name). Returns its
- * index into g->goto_labels, or -1 on allocation failure. The block is
- * created on first reference from either the label statement or a goto; the
- * depth fields are filled in by the label statement (definition). */
+/* Find or create the label record for (current function, body copy, name) */
 static int irgen_goto_label_idx(zan_irgen_t *g, zan_istr_t name) {
     LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
     zan_irgen_pending_scope_t *owner = goto_label_owner(g, name);
@@ -103,11 +94,7 @@ static int irgen_goto_label_idx(zan_irgen_t *g, zan_istr_t name) {
     return g->goto_label_count - 1;
 }
 
-/* Count the locals currently in scope that own something (ARC reference,
- * rc-field aggregate, boxed cell or ownership-flagged object slot). Recorded
- * at label definitions and forward gotos so a jump crossing an owning scope
- * boundary -- which would strand the owned +1s -- is diagnosed instead of
- * silently mis-lowered. */
+/* 内部辅助实现 */
 static int irgen_goto_count_owned_locals(local_scope_t *locals) {
     int owned = 0;
     for (int i = 0; i < locals->count; i++) {
@@ -118,17 +105,13 @@ static int irgen_goto_count_owned_locals(local_scope_t *locals) {
     return owned;
 }
 
-/* An empty function the debugger can put a breakpoint on, so a DAP client's
- * "break when an exception is thrown / goes unhandled" actually stops. Only
- * emitted for `zanc -g`; one local copy per module. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_eh_hook_fn(zan_irgen_t *g, const char *name) {
     LLVMValueRef f = LLVMGetNamedFunction(g->mod, name);
     if (f) return f;
     LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
     f = LLVMAddFunction(g->mod, name, fty);
-    /* Internal: a weak external turns into a mangled COFF alias that gdb
-     * cannot break on by name, while a local symbol per module gives the
-     * breakpoint one location per compilation unit. */
+    /* 内部辅助逻辑 */
     LLVMSetLinkage(f, LLVMInternalLinkage);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, f, "entry");
@@ -148,12 +131,7 @@ static void emit_eh_hook_call(zan_irgen_t *g, const char *name) {
 
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
 
-/* Bind a switch case's pattern variable (`case T x:`) to the discriminant.
- * A captured pattern variable follows the same shared-cell contract as every
- * other C# local: the guard-time and body-time lowering sites alias one cell
- * keyed by the switch-case AST node; both visible bindings point at the same
- * owner slot, while only the chain binding registers that slot with the
- * unwinder. */
+/* Bind a switch case's pattern variable (`case T x:`) to the discriminant */
 static void emit_switch_pattern_bind(zan_irgen_t *g, local_scope_t *locals,
                                      zan_ast_node_t *sc, LLVMValueRef switch_val) {
     if (!sc->switch_case.type_pattern || sc->switch_case.var_name.len == 0) return;
@@ -227,28 +205,18 @@ static void emit_switch_pattern_bind(zan_irgen_t *g, local_scope_t *locals,
     locals->vars[locals->count - 1].binding_decl = sc;
 }
 
-/* Release a captured pattern cell on a failed guard. The matching chain has no
- * body scope to trigger the ordinary suffix release, so drop its owner here;
- * the owner slot is nulled and any later scope cleanup becomes harmless. */
+/* Release a captured pattern cell on a failed guard */
 static void emit_switch_pattern_fail_release(zan_irgen_t *g,
                                              local_scope_t *locals,
                                              zan_ast_node_t *sc) {
     local_var_t *v = local_find_binding_decl(locals, sc);
     if (!v || !v->box_cell || !v->box_owned) return;
-    /* Keep the unwind entry registered until the switch scope's ordinary
-     * suffix pops it. The owner slot is nulled now, so an unwind before that
-     * suffix is harmless and the later cleanup performs exactly one pop. */
+    /* 内部辅助逻辑 */
     release_boxed_local(g, v);
 }
 
-/* Run the `finally` bodies of the try statements this exit path leaves, from
- * the innermost open one down to (and including) `base`: the bodies are
- * emitted inline once per exit path, and while emitting body i the stack is
- * truncated to i, so a `return` inside a finally runs only the finallys
- * outside it -- never itself. */
-/* Release the monitor a `lock (obj)` took. The object is reloaded from its
- * alloca so the call works from any exit path, including ones the entry block
- * does not dominate. */
+/* 内部辅助实现 */
+/* Release the monitor a `lock (obj)` took */
 static void emit_monitor_exit(zan_irgen_t *g, LLVMValueRef obj_slot) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef mon_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
@@ -259,12 +227,7 @@ static void emit_monitor_exit(zan_irgen_t *g, LLVMValueRef obj_slot) {
     zan_call2(g->builder, mon_ty, exit_fn, &obj, 1, "");
 }
 
-/* Restore __zan_eh_top for an exit path that jumps out of the try statements
- * armed from `base` up (their handlers are disarmed by leaving). Reads the top
- * the outermost of them was armed at, so nested tries need no arithmetic. In an
- * async body the handlers are frame-resident and re-armed per invocation, and
- * the try-entry allocas do not survive a suspension, so those keep their own
- * bookkeeping (frame.hcount). */
+/* 内部辅助实现 */
 static void emit_eh_disarm_from(zan_irgen_t *g, int base) {
     if (base < g->eh_armed_base) base = g->eh_armed_base;
     if (g->eh_armed_count <= base) return;
@@ -287,9 +250,7 @@ static void emit_eh_disarm_from(zan_irgen_t *g, int base) {
     }
 }
 
-/* Pending exits may share a body only when its lexical bindings, handlers and
- * cleanup context agree. Normal/unwind entries keep their separate EH protocol.
- * The selector is frame storage: a phi or private alloca dies across an await. */
+/* 内部辅助逻辑 */
 static zan_irgen_pending_scope_t *pending_scope_common(
         zan_irgen_pending_scope_t *a, zan_irgen_pending_scope_t *b) {
     for (zan_irgen_pending_scope_t *p = a; p; p = p->parent)
@@ -380,8 +341,7 @@ static bool finally_shared_matches(zan_irgen_t *g, local_scope_t *locals,
         g->pending.scope != s->pending.scope ||
         g->pending.break_scope != s->pending.break_scope ||
         g->pending.continue_scope != s->pending.continue_scope) return false;
-    /* A differing record conservatively creates a separate body; no inference
-     * about which bindings or owner flags a throwing body will use is needed. */
+    /* 内部辅助逻辑 */
     if (s->local_count && memcmp(locals->vars, s->vars,
             sizeof(*s->vars) * (size_t)s->local_count)) return false;
     if (s->pattern_count && memcmp(locals->patterns, s->patterns,
@@ -448,8 +408,7 @@ static void emit_shared_pending_finally(zan_irgen_t *g, local_scope_t *locals,
         LLVMPositionBuilderAtEnd(g->builder, s->body_bb);
         emit_finally_body(g, locals, &entry);
         locals->count = s->local_count;
-        /* A nested try in this body reuses fin_idx. Keep the enclosing region's
-         * descriptor instead of leaving the nested entry in its stack slot. */
+        /* A nested try in this body reuses fin_idx */
         g->finallys[fin_idx] = entry;
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
             LLVMBasicBlockRef tail = LLVMGetInsertBlock(g->builder);
@@ -527,9 +486,7 @@ static void emit_pending_finallys(zan_irgen_t *g, local_scope_t *locals, int bas
     g->throw_catch_base = saved_throw_cbase;
 }
 
-/* Run one try's finally body while an exception is in flight, then put the
- * in-flight exception back: the body may run try/catch of its own, and that
- * overwrites the exception globals. */
+/* 内部辅助逻辑 */
 static void emit_finally_on_exception_path(zan_irgen_t *g, local_scope_t *locals,
                                            int fin_idx) {
     if (fin_idx < 0) return;
@@ -604,10 +561,7 @@ static void emit_finally_on_exception_path(zan_irgen_t *g, local_scope_t *locals
     }
 }
 
-/* A throw leaves every enclosing try whose handler is no longer armed for it
- * (its catch or finally body is what is running); those finallys run at the
- * throw site. The try whose handler will take the longjmp keeps its own: the
- * catch path runs it. */
+/* 内部辅助实现 */
 static void emit_finallys_left_by_throw(zan_irgen_t *g, local_scope_t *locals) {
     int base = g->finally_count;
     while (base > 0 && !g->finallys[base - 1].in_try_body) base--;
@@ -617,14 +571,7 @@ static void emit_finallys_left_by_throw(zan_irgen_t *g, local_scope_t *locals) {
     }
 }
 
-/* Run the stack entries a rethrow out of try `fin_idx` leaves below it, down
- * to (excluding) the next try whose body is still executing. `lock` regions
- * have no handler of their own: their monitor exit lives only on the exit
- * paths that walk the stack, and the propagate tail's longjmp skips every
- * entry between this try and the handler that catches -- so the lock never
- * opens again (and an enclosing try whose catch/finally is currently running
- * loses its finally the same way). The handler that takes the longjmp runs
- * its own finally on its own catch path, so the walk stops there. */
+/* 内部辅助实现 */
 static void emit_finallys_below_for_propagate(zan_irgen_t *g,
                                               local_scope_t *locals,
                                               int fin_idx) {
@@ -636,8 +583,7 @@ static void emit_finallys_below_for_propagate(zan_irgen_t *g,
     }
 }
 
-/* Hand the in-flight exception (still in the globals) to the next outer
- * handler, or report it unhandled and exit. */
+/* 内部辅助逻辑 */
 static void emit_eh_propagate_tail(zan_irgen_t *g) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -649,10 +595,7 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
         LLVMConstInt(i32t, 0, 0), "reh.has");
     LLVMBasicBlockRef rjmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.jmp");
     LLVMBasicBlockRef rdie_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.die");
-    /* wasm32 arms no handlers (EH-free lowering, see AST_TRY_STMT): an armed
-     * top cannot exist there. Route the rethrow straight to the die path and
-     * terminate the (never entered) jmp block with unreachable so the
-     * pre-optimizer verification pass sees no unterminated block. */
+    /* 内部辅助逻辑 */
     if (g->target_is_wasm) {
         LLVMBuildBr(g->builder, rdie_bb);
         LLVMPositionBuilderAtEnd(g->builder, rjmp_bb);
@@ -661,9 +604,7 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
     } else {
         LLVMBuildCondBr(g->builder, rhas, rjmp_bb, rdie_bb);
         LLVMPositionBuilderAtEnd(g->builder, rjmp_bb);
-        /* an exception leaving this coroutine now travels through the frame
-         * (see emit_async_exc_epilogue), so the longjmp stays inside this
-         * invocation -- no cross-frame unwinding here */
+        /* 内部辅助逻辑 */
         emit_eh_longjmp(g, emit_eh_buf_ptr(g, rtop));
         LLVMBuildUnreachable(g->builder);
         LLVMPositionBuilderAtEnd(g->builder, rdie_bb);
@@ -672,10 +613,7 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
     LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
     if (printf_fn) {
         LLVMTypeRef printf_ty = LLVMFunctionType(i32t, &i8ptr, 1, 1);
-        /* Report the in-flight exception so an uncaught throw shows WHY it
-         * died: a string throw prints its text (string user data is
-         * NUL-terminated); a class throw prints a type note -- its ToString
-         * would need a vtable call this tail block cannot afford. */
+        /* 内部辅助实现 */
         LLVMValueRef exc = LLVMBuildLoad2(g->builder, i8ptr, exc_g, "reh.exc");
         LLVMValueRef tid = LLVMBuildLoad2(g->builder, i8ptr,
             get_eh_exc_tid_global(g), "reh.tid");
@@ -705,9 +643,7 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
             zan_call2(g->builder, printf_ty, printf_fn, sargs, 2, "");
         }
         LLVMBuildBr(g->builder, reh_cont_bb);
-        /* class throw: resolve the class name through the tid-name registry
-         * (walks the thrown descriptor's base chain) and print it; fall back
-         * to the old "(class object)" note when the class is not registered */
+        /* 内部辅助逻辑 */
         LLVMPositionBuilderAtEnd(g->builder, reh_cls_bb);
         {
             LLVMValueRef name_fn = get_eh_tid_name_fn(g);
@@ -752,18 +688,12 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
     LLVMBuildUnreachable(g->builder);
 }
 
-/* True when `expr` is a call to an extern/DllImport function. Extern calls
- * hand back raw pointers typed `string` (calloc/malloc views, FFI buffers);
- * their NUL terminator is not a reliable ordinal bound, so a string local fed
- * from one is treated as an opaque byte buffer by the string index guards. */
+/* True when `expr` is a call to an extern/DllImport function */
 static int call_targets_extern(zan_irgen_t *g, zan_ast_node_t *expr) {
     if (!expr || expr->kind != AST_CALL || !expr->call.callee) return 0;
     zan_symbol_t *sym = NULL;
     if (expr->call.callee->kind == AST_IDENTIFIER) {
-        /* A static method of the enclosing class (`calloc(...)` inside the
-         * class that declares it) resolves through the type's own members;
-         * zan_binder_lookup keys off the binder's current scope, which irgen
-         * may not still sit in. */
+        /* A static method of the enclosing class (`calloc( */
         if (g->current_type_sym)
             sym = get_method_sym(g->current_type_sym,
                                  expr->call.callee->ident.name);
@@ -781,15 +711,7 @@ static int call_targets_extern(zan_irgen_t *g, zan_ast_node_t *expr) {
            (sym->decl->method_decl.modifiers & MOD_EXTERN) != 0;
 }
 
-/* Declare every local captured by a lambda in a heap cell shared with each
- * closure (see the boxed-local comment in irgen_expr.c), so reads and writes
- * on both sides denote the one variable. Returns 0 for an ordinary local,
- * which the general path below then handles.
- *
- * Scalars, statically-owned references, and value structs are supported;
- * untagged object/open-type payloads are diagnosed because their ownership is
- * not representable. A captured async scalar/reference uses the cell owned by
- * its declaration's frame field, which survives both suspension and escape. */
+/* 内部辅助实现 */
 static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
                                local_scope_t *locals) {
     zan_ast_node_t *body = g->current_async_frame
@@ -836,11 +758,9 @@ static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
         v->box_cell = cell;
         v->box_owner_slot = owner;
         v->frame_owner = pre_idx;
-        /* This lexical binding borrows the cell. Its persistent prefix entry
-         * releases the frame's one reference only at completion/abandonment;
-         * scope exit must neither release it nor clear an escaped payload. */
+        /* This lexical binding borrows the cell */
     } else {
-        /* A null payload makes the destructor safe if initialization throws. */
+        /* A null payload makes the destructor safe if initialization throws */
         LLVMValueRef cell = emit_box_cell(g, stmt->loc, payload, type, NULL);
         slot = box_value_ptr(g, cell, payload);
         local_add(locals, stmt->var_decl.name, slot, type);
@@ -869,10 +789,7 @@ static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
     return 1;
 }
 
-/* Emit a 0-arg method call on a receiver value already in hand.
- * The foreach iteration protocol calls GetEnumerator/MoveNext/Current on
- * objects the loop itself materialized, so there is no AST call node to run
- * through the normal member-access path. Static methods drop the receiver. */
+/* 发射a 0-arg method call on a receiver value already in hand */
 static LLVMValueRef emit_foreach_call0(zan_irgen_t *g, zan_type_t *recv_ty,
                                        zan_symbol_t *m, LLVMValueRef recv) {
     if (!m) return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
@@ -895,12 +812,7 @@ static LLVMValueRef emit_foreach_call0(zan_irgen_t *g, zan_type_t *recv_ty,
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
     if (!stmt) return;
 
-    /* Unreachable code: the previous statement already terminated this block
-     * (return / throw / break / continue), so anything after it belongs to a
-     * fresh, unreachable block -- appending to the terminated one would build
-     * "terminator in the middle of a basic block". Platform-conditional
-     * sources hit this constantly (`throw new PlatformNotSupportedException();
-     * return info;` on the platform where the body is #if'd out). */
+    /* 内部辅助实现 */
     LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
     if (cur_bb && LLVMGetBasicBlockTerminator(cur_bb)) {
         LLVMBasicBlockRef dead_bb = LLVMAppendBasicBlockInContext(
@@ -908,14 +820,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMPositionBuilderAtEnd(g->builder, dead_bb);
     }
 
-    /* Attach this statement's source location for DWARF line tables (no-op
-     * unless `-g`). Lazily creates the enclosing function's DISubprogram. */
+    /* 内部辅助逻辑 */
     di_set_loc(g, stmt->loc);
 
-    /* ARC: track control-flow nesting so class locals declared inside a
-     * conditional/loop body (whose stack slot does not dominate the exit) are
-     * not registered as owning references. Every branch here ends in `break`,
-     * so the matching decrement below always runs. */
+    /* 内部辅助实现 */
     int arc_nested = (stmt->kind == AST_IF_STMT || stmt->kind == AST_WHILE_STMT ||
                       stmt->kind == AST_DO_WHILE_STMT || stmt->kind == AST_FOR_STMT ||
                       stmt->kind == AST_FOREACH_STMT || stmt->kind == AST_SWITCH_STMT ||
@@ -936,34 +844,21 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     }
 
     case AST_VAR_DECL: {
-        /* `int fd = SomethingReturningNint()` is the same silent truncation
-         * as an assignment or an argument. */
+        /* 内部辅助逻辑 */
         if (stmt->var_decl.type && stmt->var_decl.initializer) {
             check_implicit_narrowing(g, resolve_type_ctx(g, stmt->var_decl.type),
                            infer_expr_type(g, stmt->var_decl.initializer, locals),
                            stmt->var_decl.initializer, "initializer");
         }
-        /* A captured local is one variable shared with every closure, so it
-         * is declared in a heap cell instead of the frame. */
+        /* 内部辅助逻辑 */
         if (emit_boxed_var_decl(g, stmt, locals)) return;
-        /* In an async $resume body, named scalar locals were pre-allocated in
-         * the entry block and their storage lives in the heap frame (so they
-         * survive suspensions). Reuse that slot instead of a fresh alloca:
-         * just evaluate the initializer and store into it. */
+        /* 内部辅助实现 */
         if (g->current_async_frame && g->current_async_slot_count > 0) {
-            /* Bind this declaration to ITS OWN frame slot, keyed by the AST
-             * node the scan registered: one slot per declaration. A
-             * name lookup is wrong whenever more than one same-named
-             * declaration is frame-resident; name-dedup also let a `string k`
-             * declared after a `foreach (string k ...)` bind through the
-             * loop's borrowed-element slot, so its first capture-release
-             * freed the collection's internal key. */
+            /* 内部辅助逻辑 */
             local_var_t *pre = local_find_async_decl(locals, stmt);
             if (pre) {
                 int pre_idx = (int)(pre - locals->vars);
-                /* Resolve this declaration's own type -- explicitly written or
-                 * inferred from its initializer -- before deciding whether it
-                 * may reuse the frame slot the scan registered for it. */
+                /* 内部辅助逻辑 */
                 zan_type_t *type = stmt->var_decl.type
                     ? resolve_type_ctx(g, stmt->var_decl.type)
                     : NULL;
@@ -971,29 +866,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     type = infer_expr_type(g, stmt->var_decl.initializer, locals);
                 if (!type) type = pre->type;
                 for (int i = 0; i < g->current_async_slot_count; i++) {
-                    /* The slot's LLVM type is baked into the frame struct, so
-                     * when emit-time inference disagrees with what the scan
-                     * registered for THIS declaration, storing through the
-                     * slot would move the wrong width. Skip the reuse and let
-                     * the ordinary scoped declaration below handle it. */
+                    /* 内部辅助实现 */
                     if (g->current_async_slots[i].slot_alloca == pre->alloca &&
                         !async_slot_type_compatible(type, pre->type))
                         continue;
                     if (g->current_async_slots[i].slot_alloca == pre->alloca) {
-                        /* Own every rc-managed local, including those declared
-                         * inside loop/if/block bodies (arc_stmt_depth != 0):
-                         * per-block release at scope exit frees them each
-                         * iteration, so there is no double-release at function
-                         * exit. A string local initialized from a call is
-                         * owned exactly like the synchronous path: the callee
-                         * hands back a +1 reference, and emit_rc_capture_local
-                         * moves it in without an extra retain. */
+                        /* 内部辅助实现 */
                         int arc_own = (type && is_rc_managed_type(type) &&
                                        LLVMGetTypeKind(g->current_async_slots[i].llvm) == LLVMPointerTypeKind);
-                        /* The ramp zeroes the frame once; this persistent
-                         * field keeps the prior iteration's value. Capture
-                         * releases that occupant before replacing it, without
-                         * a resume-time null store or reload. */
+                        /* 内部辅助逻辑 */
                         if (stmt->var_decl.initializer) {
                             LLVMValueRef iv = (type->kind == TYPE_DELEGATE &&
                                 stmt->var_decl.initializer->kind == AST_LAMBDA)
@@ -1008,9 +889,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                     stmt->var_decl.initializer, locals);
                             } else {
                                 iv = coerce_int_to(g, iv, slot_ty);
-                                /* pointer-shaped locals (string/array/List/class) are
-                                 * frame-resident too; normalize a differing pointer
-                                 * type to the slot's before the store. */
+                                /* 内部辅助逻辑 */
                                 if (LLVMGetTypeKind(slot_ty) == LLVMPointerTypeKind &&
                                     LLVMGetTypeKind(LLVMTypeOf(iv)) == LLVMPointerTypeKind &&
                                     LLVMTypeOf(iv) != slot_ty) {
@@ -1020,22 +899,12 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                             }
                         }
                         if (arc_own) pre->arc_owned = 1;
-                        /* A frame-resident string fed from an extern call is a
-                         * raw byte buffer (same rule as the sync path). */
+                        /* 内部辅助逻辑 */
                         if (type && type->kind == TYPE_STRING &&
                             stmt->var_decl.initializer &&
                             call_targets_extern(g, stmt->var_decl.initializer))
                             pre->opaque_string = 1;
-                        /* Name visibility starts at bind time: add a
-                         * release-inert alias pointing at THIS declaration's
-                         * slot so reads and assignments inside this scope
-                         * resolve to this storage, and scope truncation
-                         * restores the outer binding on exit. The alias never
-                         * owns -- ownership stays on the pre-added slot entry:
-                         * capture-release at every store, one release of the
-                         * final value at coroutine completion. Assignments
-                         * through the alias route their capture-release to
-                         * the slot entry via frame_owner. */
+                        /* 内部辅助实现 */
                         local_add(locals, stmt->var_decl.name,
                                   locals->vars[pre_idx].alloca, type);
                         locals->vars[locals->count - 1].frame_owner = pre_idx;
@@ -1056,9 +925,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMValueRef alloca = emit_entry_alloca(g, ptr_type, "arr");
                 zan_store_fit(g, arr_val, alloca);
 
-                /* the allocation node is written `T[]`, so it already resolves
-                 * to the array type: wrapping it again made `var a = new T[n]`
-                 * a T[][] and lost T's own type arguments. */
+                /* 内部辅助逻辑 */
                 zan_type_t *arr_type = resolve_type_ctx(g, init->new_expr.type);
                 if (!arr_type || arr_type->kind != TYPE_ARRAY) {
                     zan_type_t *elem_type = arr_type ? arr_type : g->binder->type_int;
@@ -1069,8 +936,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     arr_type->array_rank = 1;
                 }
                 local_add(locals, stmt->var_decl.name, alloca, arr_type);
-                /* `new T[n]` yields an owned (+1) buffer that was stored
-                 * directly above, so the slot owns it: scope exit releases. */
+                /* 内部辅助逻辑 */
                 arc_own_local(g, locals);
                 return;
             }
@@ -1085,8 +951,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     zan_store_fit(g, list_val, alloca);
                     zan_type_t *list_type = resolve_type_ctx(g, init->new_expr.type);
                     local_add(locals, stmt->var_decl.name, alloca, list_type);
-                    /* List is refcounted: `new` yields an owned (+1) reference, so
-                     * this local owns it and must release it at scope exit. */
+                    /* 内部辅助逻辑 */
                     if (list_type && is_rc_managed_type(list_type))
                         arc_own_local(g, locals);
                     return;
@@ -1098,8 +963,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     zan_store_fit(g, sb_val, alloca);
                     zan_type_t *sb_type = resolve_type_ctx(g, init->new_expr.type);
                     local_add(locals, stmt->var_decl.name, alloca, sb_type);
-                    /* StringBuilder is refcounted: `new` yields an owned (+1)
-                     * reference this local owns and releases at scope exit. */
+                    /* 内部辅助逻辑 */
                     if (sb_type && is_rc_managed_type(sb_type))
                         arc_own_local(g, locals);
                     return;
@@ -1112,8 +976,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     zan_store_fit(g, dict_val, alloca);
                     zan_type_t *dict_type = resolve_type_ctx(g, init->new_expr.type);
                     local_add(locals, stmt->var_decl.name, alloca, dict_type);
-                    /* This local owns the freshly-built dict: release its
-                     * rc-managed keys/values at scope exit. */
+                    /* 内部辅助逻辑 */
                     arc_own_local(g, locals);
                     return;
                 }
@@ -1138,12 +1001,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                             bool ctor_called = false;
                             zan_type_t *new_inst = resolve_type_ctx(
                                 g, init->new_expr.type);
-                            /* object-initializer tail: `Field = v` writes and
-                             * member collection initializers both trail any
-                             * positional constructor arguments (mirrors the
-                             * init_start walk in emit_expr_new_expr). A
-                             * postfix generic-type initializer keeps its
-                             * member-writes in arg_inits (args is empty). */
+                            /* 内部辅助实现 */
                             int init_start = init->new_expr.args.count;
                             while (init_start > 0) {
                                 zan_ast_node_t *a =
@@ -1201,18 +1059,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                 ctor_called = true;
                             }
 
-                            /* object-initializer member writes after the
-                             * constructor (or after the implicit field
-                             * initializers when no constructor ran) */
+                            /* 内部辅助逻辑 */
                             if (!ctor_called) {
                                 emit_implicit_field_initializers(
                                     g, sym, new_inst ? new_inst : sym->type,
                                     alloca, locals);
                             }
-                            /* Ordinary initializers trail constructor
-                             * arguments in args; the generic-postfix form
-                             * stores the same tail in arg_inits. Present both
-                             * shapes as one list for identical lowering. */
+                            /* 内部辅助逻辑 */
                             zan_ast_list_t object_inits;
                             zan_ast_list_init(&object_inits);
                             for (int oi = init_start;
@@ -1227,10 +1080,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                             }
                             for (int i = 0; i < object_inits.count; i++) {
                                 zan_ast_node_t *arg = object_inits.items[i];
-                                /* `Members = { a, b }`: same synthetic
-                                 * `member.Add(item)` lowering as the
-                                 * emit_expr_new_expr path, sharing its ARC
-                                 * handling through the ordinary call emitter. */
+                                /* `Members = { a, b }`: same synthetic `member */
                                 if (arg->kind == AST_COLL_INIT) {
                                     zan_istr_t cname = arg->coll_init.name;
                                     zan_symbol_t *msym = get_field_sym(sym, cname);
@@ -1252,11 +1102,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                             new_inst ? new_inst : sym->type,
                                             alloca, arg, locals);
                                         zan_store_fit(g, v, cslot);
-                                        /* the getter handed us +1 on the
-                                         * collection; the temp slot took that
-                                         * reference and is dropped without a
-                                         * scope-exit release, so hand it back
-                                         * once the Adds are done */
+                                        /* 内部辅助实现 */
                                         getter_owned = 1;
                                     } else if (cfi >= 0) {
                                         LLVMValueRef cptr = emit_field_ptr(g, sym,
@@ -1312,9 +1158,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                 }
                                 if (arg->kind == AST_ASSIGNMENT && arg->binary.left->kind == AST_IDENTIFIER) {
                                     zan_symbol_t *fsym = get_field_sym(sym, arg->binary.left->ident.name);
-                                    /* custom-setter property in an object
-                                     * initializer: `new Foo { Prop = v }`
-                                     * dispatches to set_Prop(v) */
+                                    /* 内部辅助逻辑 */
                                     zan_symbol_t *setter = property_setter_sym(g, fsym);
                                     if (setter) {
                                         emit_property_setter_call(g, setter,
@@ -1340,12 +1184,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                                 fval = LLVMBuildFPExt(g->builder, fval, target_t, "ext");
                                             }
                                         }
-                                        /* The object owns its rc fields --
-                                         * retain a borrowed value / release the
-                                         * (null, zero-initialised) old occupant
-                                         * instead of storing the pointer raw, and
-                                         * a struct-typed field recurses the same
-                                         * contract into its own fields. */
+                                        /* 内部辅助实现 */
                                         if (fst && (is_rc_managed_type(fst) || fst->kind == TYPE_OBJECT)) {
                                             emit_rc_store_field(g, fst, fptr, fval,
                                                 arg->binary.right, locals,
@@ -1361,8 +1200,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                 }
                             }
                             local_add(locals, stmt->var_decl.name, alloca, type);
-                            /* The constructed value's rc fields (set by
-                             * the ctor / the writes above) are owned here. */
+                            /* 内部辅助逻辑 */
                             if (type && type->kind == TYPE_STRUCT &&
                                 type_contains_collection_rc(g, type, 0))
                                 locals->vars[locals->count - 1].struct_rc = 1;
@@ -1372,17 +1210,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 }
             }
 
-            /* tuple initializer: `var t = (a, b, ...)` is a value of the
-             * synthesized anonymous tuple struct; the local keeps the whole
-             * struct (so `t.Item1` resolves), copied by value from the temp
-             * slot the tuple emitter built. */
+            /* tuple initializer: `var t = (a, b, */
             if (init->kind == AST_TUPLE_EXPR) {
                 zan_type_t *ttype = infer_expr_type(g, init, locals);
                 if (ttype && ttype->kind == TYPE_STRUCT && ttype->sym) {
-                    /* map_type lazily registers a synthesized tuple struct
-                     * that was never seen by irgen pass 1 (e.g. a decon RHS
-                     * the checker did not visit); fall back to it so the
-                     * slot and the local are both typed as the struct. */
+                    /* 内部辅助逻辑 */
                     LLVMTypeRef st = get_struct_llvm_type(g, ttype->sym);
                     if (!st) st = map_type(g, ttype);
                     if (st) {
@@ -1395,9 +1227,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                 : tup;
                         zan_store_fit(g, tupval, alloca);
                         local_add(locals, stmt->var_decl.name, alloca, ttype);
-                        /* The literal carries +1 per rc field (ownership
-                         * normalized in emit_expr_tuple); the copy moved them
-                         * into this slot, so scope exit releases the fields. */
+                        /* 内部辅助逻辑 */
                         if (type_contains_collection_rc(g, ttype, 0))
                             locals->vars[locals->count - 1].struct_rc = 1;
                         return;
@@ -1405,25 +1235,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 }
             }
 
-            /* regular type inference from initializer. Static inference runs
-             * FIRST: a class/List/Dict/array/delegate value is a pointer at
-             * the LLVM layer, so keying the type off the LLVM kind alone
-             * stamped every one of them `string` -- member access then died
-             * with "'string' has no member", `x.Length` read the List header
-             * via strlen, and scope exit ran the string releaser on a class
-             * instance (both a correctness and a memory-safety bug). The
-             * LLVM-kind table below is only the fallback for initializers
-             * whose static type inference cannot see through (extern ABI
-             * results, untyped bare names), where the old heuristics remain
-             * the best available guess. */
+            /* regular type inference from initializer */
             type = infer_expr_type(g, init, locals);
             LLVMValueRef init_val = emit_expr(g, init, locals);
             LLVMTypeRef init_type = LLVMTypeOf(init_val);
             LLVMValueRef alloca = emit_entry_alloca(g, init_type, "var");
             zan_store_fit(g, init_val, alloca);
             if (type) {
-                /* reject a static type that cannot actually describe this
-                 * value (e.g. inference answered through an unrelated path) */
+                /* reject a static type that cannot actually describe this value (e */
                 LLVMTypeRef mt = map_type(g, type);
                 bool shape_ok =
                     LLVMGetTypeKind(mt) == LLVMGetTypeKind(init_type);
@@ -1444,9 +1263,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     if (bits <= 32) type = g->binder->type_int;
                     else type = g->binder->type_long;
                 } else if (llvm_is_nullable(init_type)) {
-                    /* `var v = maybe;` keeps the nullable type, so `v.HasValue`
-                     * still resolves. Static inference could not answer (or was
-                     * shape-rejected), so retry it just for the nullable kind. */
+                    /* `var v = maybe;` keeps the nullable type, so `v */
                     zan_type_t *it = infer_expr_type(g, init, locals);
                     type = (it && it->kind == TYPE_NULLABLE) ? it : g->binder->type_int;
                 } else {
@@ -1455,13 +1272,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             }
             if (type && type->kind == TYPE_NULLABLE &&
                 !llvm_is_nullable(init_type)) {
-                /* the static type says nullable but the value arrived bare
-                 * (a struct payload): rebuild the nullable wrapper below */
+                /* 内部辅助逻辑 */
                 type = NULL;
             }
             if (type && type->kind == TYPE_NULLABLE) {
-                /* keep the nullable type: `var v = maybe;` still answers
-                 * v.HasValue, and the slot stores the wrapper struct */
+                /* keep the nullable type: `var v = maybe;` still answers v */
                 LLVMTypeRef nst = map_type(g, type);
                 LLVMValueRef nslot = emit_entry_alloca(g, nst, "var");
                 zan_store_fit(g, init_val, nslot);
@@ -1477,9 +1292,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                       LLVMPointerTypeKind));
             if (type_is_ptr_class || (type_is_string && init_val &&
                 LLVMGetTypeKind(init_type) != LLVMPointerTypeKind)) {
-                /* A class/interface instance captured by value into an owning
-                 * slot: `new`/call results are (+1) owned, borrowed loads are
-                 * retained -- same contract as the typed path below. */
+                /* 内部辅助逻辑 */
                 LLVMTypeRef llvm_t = map_type(g, type);
                 LLVMValueRef slot = emit_entry_alloca(g, llvm_t, "var");
                 zan_store_fit(g, LLVMConstNull(llvm_t), slot);
@@ -1502,9 +1315,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             if (type && is_rc_managed_type(type) &&
                 LLVMGetTypeKind(init_type) == LLVMPointerTypeKind &&
                 !type_is_ptr_class) {
-                /* List<T>/Dict/arrays/delegates from a static call: the slot
-                 * keeps the pointer, the local owns it for scope-exit release
-                 * (matches the typed path's arc_own handling). */
+                /* 内部辅助逻辑 */
                 LLVMTypeRef llvm_t = map_type(g, type);
                 LLVMValueRef slot = emit_entry_alloca(g, llvm_t, "var");
                 zan_store_fit(g, LLVMConstNull(llvm_t), slot);
@@ -1514,9 +1325,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 return;
             }
             if (type && (type->kind == TYPE_ARRAY)) {
-                /* an array value from a static call: plain pointer slot like
-                 * the typed path, no extra capture (arrays own via their
-                 * prefix refcount and release through the typed path) */
+                /* 内部辅助逻辑 */
                 LLVMTypeRef llvm_t = map_type(g, type);
                 LLVMValueRef slot = emit_entry_alloca(g, llvm_t, "var");
                 zan_store_fit(g, init_val, slot);
@@ -1533,34 +1342,21 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             ? emit_entry_alloca(g, llvm_type, "var")
             : emit_entry_alloca(g, llvm_type, "var");
 
-        /* ARC: a class-typed local holds an owning heap reference. Track every
-         * rc-managed local, including those declared inside loop/if/block
-         * bodies: each enclosing block releases its owned locals at scope exit
-         * (emit_release_owned_locals_from) and truncates them out of scope, so
-         * they are freed once per iteration and never double-released at
-         * function exit. (Gating on arc_stmt_depth==0 leaked one object per
-         * iteration for class-typed loop/if locals.) Null-init so the release
-         * at exit is safe even before the initializer has stored anything. */
+        /* ARC: a class-typed local holds an owning heap reference */
         int arc_own = (type && is_rc_managed_type(type) &&
                        LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind);
         int struct_own = (type && type->kind == TYPE_STRUCT &&
                           LLVMGetTypeKind(llvm_type) == LLVMStructTypeKind &&
                           type_contains_collection_rc(g, type, 0));
-        /* Field replacement releases the old value even on its first write. */
+        /* Field replacement releases the old value even on its first write */
         if (arc_own || struct_own)
             zan_store_fit(g, LLVMConstNull(llvm_type), alloca);
-        /* A declared-but-unassigned string has no null form in the language:
-         * every read of it (`s == ""`, `s.Length`, printing it) dereferenced
-         * a null pointer and took the process down. It starts empty instead,
-         * which is what every other unassigned type does (0 / false). */
+        /* 内部辅助逻辑 */
         if (type && type->kind == TYPE_STRING && !stmt->var_decl.initializer) {
             zan_istr_t empty = { (char *)"", 0 };
             zan_store_fit(g, emit_string_literal_rc(g, empty), alloca);
         }
-        /* An `object` local decides ownership per stored value at runtime (see
-         * the object-local comment in irgen_generics.c). Its flag lives with the
-         * slot, which is only registered as a local further down, so track it
-         * on a stand-in until then. */
+        /* 内部辅助逻辑 */
         local_var_t obj_slot;
         memset(&obj_slot, 0, sizeof(obj_slot));
         obj_slot.alloca = alloca;
@@ -1578,8 +1374,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             if (type && type->kind == TYPE_DELEGATE &&
                 stmt->var_decl.initializer->kind != AST_LAMBDA)
                 check_delegate_async_match(g, stmt->var_decl.initializer, type, locals);
-            /* `Binding<T> b = <T expr>`: wrap the value in a binding object
-             * so slot readers receive a Binding<T> rather than a raw T. */
+            /* 内部辅助逻辑 */
             LLVMValueRef init_val = NULL;
             int init_owned = 0;
             if (type && type_is_binding(type) &&
@@ -1594,18 +1389,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                      stmt->var_decl.initializer->kind == AST_LAMBDA)
                         ? emit_lambda_typed(g, stmt->var_decl.initializer, type, locals)
                         : emit_expr(g, stmt->var_decl.initializer, locals);
-            /* User-defined implicit conversion in a typed initializer:
-             * `double d = c;` / `Fahrenheit t = 7.25;`. A conversion whose
-             * target is rc-managed yields an owned (+1) reference (the
-             * conversion method's `return new T(...)`), exactly like an
-             * AST_CALL result; hand the store below a dummy `new` node so it
-             * moves that reference instead of retaining a second one
-             * (mirrors the binding-lowering path). */
+            /* 内部辅助逻辑 */
             zan_ast_node_t *init_src = stmt->var_decl.initializer;
             bool conv_owned = false;
-            /* the binding object built above is owned (+1) like a `new`
-             * result: skip the conversion lookup (string→Binding is not a
-             * user conversion) and mark the store below to move it. */
+            /* 内部辅助逻辑 */
             bool bind_owned = init_owned;
             if (type && !bind_owned) {
                 zan_type_t *ity = infer_expr_type(g, init_src, locals);
@@ -1628,10 +1415,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     stmt->var_decl.initializer, locals);
             } else if (type && type->kind == TYPE_STRUCT &&
                        type_contains_collection_rc(g, type, 0)) {
-                /* A struct initializer is a field-wise copy. A call/new
-                 * result carries +1 per rc field (return retain) and the slot
-                 * takes it over; any other shape (another local, a field
-                 * read) is a borrowed copy and must retain its own +1s. */
+                /* A struct initializer is a field-wise copy */
                 init_val = coerce_int_to(g, init_val, llvm_type);
                 zan_store_fit(g, init_val, alloca);
                 if (!expr_yields_owned_rc_value(g, init_src, locals) &&
@@ -1643,14 +1427,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             }
         }
 
-        /* An array variable initialized from a List (`string[] p = s.Split(",")`)
-         * reads a length header that is not there and indexes a List struct as
-         * if it were a buffer. Reject it rather than corrupting memory. */
+        /* An array variable initialized from a List (`string[] p = s */
         if (type && type->kind == TYPE_ARRAY && stmt->var_decl.initializer) {
             zan_type_t *it = infer_expr_type(g, stmt->var_decl.initializer, locals);
-            /* An array type carries its element's name ("List" for
-             * List<string>[]), so the name test alone rejected the legal
-             * `List<string>[] rows = new List<string>[3]`. */
+            /* 内部辅助逻辑 */
             if (it && it->kind != TYPE_ARRAY && it->name.str &&
                 ((type_named(it, "List", 4)) ||
                  (type_named(it, "Dictionary", 10)) ||
@@ -1663,29 +1443,24 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
 
         local_add(locals, stmt->var_decl.name, alloca, type);
-        /* `string buf = calloc(...)`: an extern call's string is a raw buffer,
-         * so its bounds come from the caller's explicit length, not strlen. */
+        /* `string buf = calloc( */
         if (type && type->kind == TYPE_STRING && stmt->var_decl.initializer &&
             call_targets_extern(g, stmt->var_decl.initializer))
             locals->vars[locals->count - 1].opaque_string = 1;
-        /* An owning struct slot -- scope exit and field writes manage
-         * the rc fields inside its aggregate (see the init store above). */
+        /* 内部辅助逻辑 */
         if (struct_own)
             locals->vars[locals->count - 1].struct_rc = 1;
         if (arc_own) arc_own_local(g, locals);
         if (obj_own)
             locals->vars[locals->count - 1].obj_rc_flag = obj_slot.obj_rc_flag;
-        /* A local initialized with a freshly-built dict owns the dict's
-         * rc-managed keys/values and releases them at scope exit. */
+        /* 内部辅助逻辑 */
         if (type &&
             ((type_named(type, "Dict", 4)) ||
              (type_named(type, "Dictionary", 10))) &&
             stmt->var_decl.initializer &&
             stmt->var_decl.initializer->kind == AST_NEW_EXPR)
             arc_own_local(g, locals);
-        /* any `new T[n]` initializer: capture the element count so `a.Length`
-         * reads it (the raw buffer has no length header; strlen over binary
-         * data returned garbage). Size limited to side-effect-free exprs. */
+        /* any `new T[n]` initializer: capture the element count so `a */
         if (type && type->kind == TYPE_ARRAY &&
             stmt->var_decl.initializer &&
             stmt->var_decl.initializer->kind == AST_NEW_EXPR &&
@@ -1717,9 +1492,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     }
 
     case AST_TUPLE_DECON: {
-        /* `var (a, b) = rhs;` / `(int a, string b) = rhs;` — evaluate rhs into
-         * a temporary tuple slot, then declare each name initialized from its
-         * ItemN field. */
+        /* 内部辅助逻辑 */
         zan_ast_node_t *init = stmt->tuple_decon.initializer;
         zan_type_t *ttype = infer_expr_type(g, init, locals);
         if (!ttype || ttype->kind != TYPE_STRUCT || !ttype->sym) {
@@ -1734,11 +1507,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             tmp = emit_entry_alloca(g, st, "dtmp");
             zan_store_fit(g, LLVMConstNull(st), tmp);
             if (init->kind == AST_TUPLE_EXPR) {
-                /* the initializer is itself a tuple literal: build it in place
-                 * so the temp slot is filled once, not copied twice. Same
-                 * ownership normalization as emit_expr_tuple: the temp ends
-                 * up owning +1 per rc-managed field, which the targets below
-                 * move into their own slots. */
+                /* 内部辅助逻辑 */
                 int n = init->tuple_expr.items.count;
                 for (int i = 0; i < n; i++) {
                     zan_ast_node_t *item = init->tuple_expr.items.items[i];
@@ -1775,11 +1544,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 zan_store_fit(g, tvv, tmp);
             }
         }
-        /* Ownership: the temp owns +1 per rc-managed field (tuple literal
-         * normalization above, or the returned-struct convention for a call
-         * result). Each declared target MOVES its field's +1 into its own
-         * slot; fields with no consuming target (fewer names than items, or a
-         * non-identifier target) are released here, so neither shape leaks. */
+        /* 内部辅助实现 */
         bool de_consumed[64];
         int de_fields = 0;
         while (de_fields < 64) {
@@ -1790,10 +1555,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             de_fields++;
         }
         for (int i = 0; i < 64; i++) de_consumed[i] = false;
-        /* Does the source value own its fields' +1s? A tuple literal (after
-         * normalization) and a call result (returned-struct convention) do; a
-         * borrowed read of an existing tuple local does not -- its targets
-         * must retain their own +1 and nothing is released here. */
+        /* 内部辅助实现 */
         bool de_src_owns = expr_yields_owned_rc_value(g, init, locals);
         for (int i = 0; i < stmt->tuple_decon.names.count; i++) {
             zan_ast_node_t *nm = stmt->tuple_decon.names.items[i];
@@ -1827,8 +1589,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 zan_store_fit(g, de_fval, slot);
             }
             local_add(locals, nm->ident.name, slot, et);
-            /* the target owns the field's +1: moved from the owning source,
-             * or retained here when the source is itself a borrow */
+            /* 内部辅助逻辑 */
             if (et && is_rc_managed_type(et)) {
                 if (!de_src_owns && de_fval &&
                     LLVMGetTypeKind(elt) == LLVMPointerTypeKind)
@@ -1874,24 +1635,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     case AST_EXPR_STMT: {
         zan_ast_node_t *e = stmt->expr_stmt.expr;
         LLVMValueRef ev = emit_expr(g, e, locals);
-        /* `Foo();` where Foo is async: the ramp allocated a heap frame and
-         * handed back its task handle, and the statement drops it. Nothing
-         * else ever schedules that frame, so the body never ran and the frame
-         * never reached a free -- the call was a silent no-op leaking one
-         * frame per execution. Detach it exactly as `Task.Spawn(Foo())` does:
-         * the body runs and the reaper frees the frame at completion. */
+        /* 内部辅助实现 */
         if (ev && e->kind == AST_CALL && emit_detach_async_call(g, ev, false))
             break;
-        /* A discarded expression statement whose value is a freshly owned (+1)
-         * rc reference must release it, or it leaks. This covers fluent method
-         * chains used as statements (e.g. `builder.Add(x);` where Add returns
-         * `this`) and bare `new`/call results. Assignments and non-call
-         * expressions are not owned (expr_yields_owned_rc_value == 0).
-         *
-         * A bare `await E;` result arrives as an i64 (async frames store every
-         * result in an i64 slot); coerce it back to a pointer using the
-         * inferred rc type before releasing, or a discarded owned awaited
-         * string/object leaks once per await. */
+        /* 内部辅助逻辑 */
         if (ev && expr_yields_owned_rc_value(g, e, locals)) {
             zan_type_t *et = infer_expr_type(g, e, locals);
             if (et && is_rc_managed_type(et)) {
@@ -1918,10 +1665,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 infer_expr_type(g, stmt->ret.value, locals),
                 stmt->ret.value, "return");
         }
-        /* Inside an async $resume body, `return e` completes the state
-         * machine: store the result into the frame, mark it done, and
-         * `ret void` — the frame pointer (Task) was already handed out by
-         * the ramp. */
+        /* 内部辅助实现 */
         if (g->current_async_frame) {
             LLVMValueRef ri = NULL, rv = NULL;
             zan_type_t *ret_type = g->current_async_ret_type;
@@ -1950,9 +1694,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
         if (stmt->ret.value) {
             LLVMValueRef val = emit_expr(g, stmt->ret.value, locals);
-            /* user-defined implicit conversion: `return c;` from a method
-             * declared to return double where the source type declares
-             * `implicit operator double`. */
+            /* 内部辅助逻辑 */
             bool conv_ret = false;
             if (g->current_fn_zan_ret_type) {
                 zan_type_t *vty = infer_expr_type(g, stmt->ret.value, locals);
@@ -1964,11 +1706,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     conv_ret = true;
                 }
             }
-            /* ARC: hand the caller an owned (+1) reference, then release our
-             * owning locals. Retaining a borrowed return value first keeps it
-             * alive when it aliases a local about to be released. A converted
-             * value is already owned (+1) like a method-call result, so it is
-             * moved rather than retained. */
+            /* ARC: hand the caller an owned (+1) reference, then release our owning locals */
             zan_type_t *ret_type = concretize(g,
                 infer_expr_type(g, stmt->ret.value, locals));
             if (conv_ret) ret_type = g->current_fn_zan_ret_type;
@@ -1982,11 +1720,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                        type_contains_collection_rc(g, ret_type, 0) &&
                        !expr_yields_owned_rc_value(g, stmt->ret.value, locals) &&
                        !conv_ret) {
-                /* A returned struct must carry +1 per rc field (the
-                 * receiver releases them); a borrowed copy of an owning local
-                 * retains here, before the exit release below consumes the
-                 * local's own count. A call/new result already owns its +1s
-                 * and moves instead. */
+                /* 内部辅助实现 */
                 emit_collection_value_retain(g, ret_type, val, 0);
             }
             if (g->finally_count > 0) {
@@ -1999,9 +1733,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 val = LLVMBuildLoad2(g->builder, LLVMTypeOf(val), v_slot,
                                      "ret.fin");
             }
-            /* `return a;` needs no exclusion from the exit release pass: an
-             * array is retained above like any other rc-managed return, so the
-             * release of the local it aliases leaves the caller's +1. */
+            /* 内部辅助逻辑 */
             emit_release_owned_locals(g, locals);
             emit_release_active_catch_excs(g, 0);
             LLVMTypeRef fn_ret = g->current_fn_ret_type;
@@ -2020,18 +1752,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                             LLVMGetTypeKind(fn_ret) == LLVMFloatTypeKind) &&
                            LLVMGetTypeKind(val_t) == LLVMIntegerTypeKind &&
                            LLVMGetIntTypeWidth(val_t) > 1) {
-                    /* `return 2;` from a `double` method converts, as in C#;
-                     * returning the integer bit pattern failed verification. */
+                    /* 内部辅助逻辑 */
                     val = LLVMBuildSIToFP(g->builder, val, fn_ret, "retsitofp");
                 } else if (LLVMGetTypeKind(fn_ret) == LLVMIntegerTypeKind &&
                            LLVMGetTypeKind(val_t) == LLVMIntegerTypeKind) {
                     unsigned fn_bits = LLVMGetIntTypeWidth(fn_ret);
                     unsigned val_bits = LLVMGetIntTypeWidth(val_t);
                     if (fn_bits > val_bits) {
-                        /* Of the narrow widths only i1 (`bool`) and i8 (`byte`)
-                         * occur and both are unsigned, so `return someByte;`
-                         * from an `int` method must zero-extend -- sign-extending
-                         * made `return buf[i];` read 0xE4 back as -28. */
+                        /* 内部辅助实现 */
                         val = val_bits <= 8
                             ? LLVMBuildZExt(g->builder, val, fn_ret, "retzext")
                             : LLVMBuildSExt(g->builder, val, fn_ret, "retext");
@@ -2040,29 +1768,19 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     }
                 } else if (LLVMGetTypeKind(fn_ret) == LLVMStructTypeKind &&
                            LLVMGetTypeKind(val_t) == LLVMPointerTypeKind) {
-                    /* A value struct returns by value: `new Pair(3,4)` is a
-                     * stack slot behind a pointer, but the function signature
-                     * returns the aggregate. Loading it here produces the aggregate value.
-                     * Must precede the pointer-coercion branches below, since
-                     * the stack slot is itself a pointer. */
+                    /* 内部辅助实现 */
                     val = LLVMBuildLoad2(g->builder, fn_ret, val, "ret.struct");
                 } else if (LLVMGetTypeKind(fn_ret) == LLVMPointerTypeKind &&
                            LLVMGetTypeKind(val_t) == LLVMPointerTypeKind) {
-                    /* e.g. `return null` (i8*) from a method returning a
-                     * concrete class pointer, or vice versa */
+                    /* e */
                     val = LLVMBuildBitCast(g->builder, val, fn_ret, "retcast");
                 } else if (LLVMGetTypeKind(fn_ret) == LLVMPointerTypeKind ||
                            LLVMGetTypeKind(val_t) == LLVMPointerTypeKind) {
-                    /* A specialized generic body computes a T-typed value in
-                     * its concrete form (i32 for Queue<int>) while the
-                     * signature keeps the erased pointer form; the caller
-                     * coerces back. */
+                    /* 内部辅助实现 */
                     val = emit_boundary_coerce(g, val, fn_ret);
                 }
             }
-            /* `return 0;` in Main ends the program: release the static fields
-             * too, exactly like falling off the end of Main does, so a
-             * singleton held in a static field is not reported as a leak. */
+            /* 内部辅助逻辑 */
             if (g->current_fn_is_main) emit_release_static_rc_fields(g, NULL);
             emit_eh_disarm_from(g, 0);
             LLVMBuildRet(g->builder, val);
@@ -2072,10 +1790,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 break;
             emit_release_owned_locals(g, locals);
             emit_release_active_catch_excs(g, 0);
-            /* A bare `return;` normally maps to `ret void`. The program entry
-             * `Main` is lowered to an LLVM `i32 main`, though, so a bare return
-             * there must yield an exit code to match the function's return type
-             * (mirrors the implicit end-of-main `ret i32 0`). */
+            /* A bare `return;` normally maps to `ret void` */
             LLVMTypeRef fn_ret = g->current_fn_ret_type;
             if (g->current_fn_is_main) emit_release_static_rc_fields(g, NULL);
             emit_eh_disarm_from(g, 0);
@@ -2155,8 +1870,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         emit_stmt(g, stmt->while_stmt.body, locals);
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
             emit_release_owned_locals_from(g, locals, body_start);
-            /* back-edge cooperative preemption: inside an async fn
-             * this plants the poll/requeue site; outside it is a no-op. */
+            /* 内部辅助逻辑 */
             if (!emit_async_preempt_site(g, cond_bb))
                 LLVMBuildBr(g->builder, cond_bb);
         } else {
@@ -2179,23 +1893,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     case AST_FOR_STMT: {
         int for_start = locals->count;
         if (stmt->for_stmt.init) emit_stmt(g, stmt->for_stmt.init, locals);
-        /* Variables declared in the init clause capture per iteration.
-         * A closure created in the body takes a fresh cell holding
-         * the variable's value at capture time (see emit_closure_record), so
-         * storing delegates in a loop captures 0, 1, 2 instead of three
-         * references to the one loop-carried cell that ends at 3. The loop
-         * machinery itself keeps the single cell -- reads, writes, the step
-         * and the condition are untouched; only the capture shape changes. */
+        /* Variables declared in the init clause capture per iteration */
         for (int i = for_start; i < locals->count; i++)
             locals->vars[i].per_iteration = 1;
-        /* Loop variables declared in the init clause live in [for_start,
-         * for_body_start) and must survive across iterations (the step and
-         * condition read them). Only body-scope locals [for_body_start, ..)
-         * are released at the end of each iteration; the loop variables are
-         * dropped once, at loop exit. Releasing from for_start each iteration
-         * would truncate the loop var out of scope, so the step `i = i + 1`
-         * and condition `i < n` would operate on a dropped slot -> infinite
-         * loop. */
+        /* 内部辅助实现 */
         int for_body_start = locals->count;
 
         LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "for.cond");
@@ -2247,8 +1948,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 emit_expr(g, stmt->for_stmt.step, locals);
             }
         }
-        /* back-edge cooperative preemption: the step already ran, so
-         * the resume path re-enters at the condition; no-op outside async. */
+        /* 内部辅助逻辑 */
         if (!emit_async_preempt_site(g, cond_bb))
             LLVMBuildBr(g->builder, cond_bb);
 
@@ -2262,8 +1962,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->eh_armed_loop_base = saved_loop_ehbase;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
-        /* Drop the loop variables (and any owned init-clause locals) now that
-         * the loop has fully exited. */
+        /* 内部辅助逻辑 */
         emit_release_owned_locals_from(g, locals, for_start);
         break;
     }
@@ -2300,10 +1999,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMValueRef switch_val = emit_expr(g, stmt->switch_stmt.expr, locals);
         LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.end");
 
-        /* count non-default cases. A pure type-pattern case (`case Dog d:`)
-         * carries no `pattern` node -- it must not be mistaken for the
-         * default arm, or its body would run unconditionally as the
-         * fallthrough target. */
+        /* count non-default cases */
         int num_cases = 0;
         zan_ast_node_t *default_case = NULL;
         for (int i = 0; i < stmt->switch_stmt.cases.count; i++) {
@@ -2320,27 +2016,16 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             ? LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.default")
             : end_bb;
 
-        /* `break` in a case leaves the switch, not an enclosing loop
-         * (`continue` keeps targeting the loop, so it is left alone) */
+        /* 内部辅助逻辑 */
         zan_irgen_pending_scope_t *sw_saved_pending_break = g->pending.break_scope;
         g->pending.break_scope = g->pending.scope;
         LLVMBasicBlockRef sw_saved_break = g->break_target;
         g->break_target = end_bb;
-        /* ARC: a `break` out of a case body releases owning locals via
-         * g->loop_locals_base (see AST_BREAK_STMT). Point that base at the
-         * switch discriminant's slot, so the break releases only locals
-         * declared inside the switch -- not the discriminant itself, which
-         * stays owned until the enclosing scope exits. Without this the
-         * release range started at 0 and freed the switch value, so `case
-         * T x:` followed by `x is T` read a dangling pointer. */
+        /* 内部辅助逻辑 */
         int sw_saved_loop_base = g->loop_locals_base;
         g->loop_locals_base = switch_start;
 
-        /* Pattern cases — `case T x:`, `case null:`, `case ... when g:`.
-         * A type match is a runtime is-check, a null match a pointer compare,
-         * and a guard a side condition, so none of them can ride
-         * LLVMBuildSwitch; any switch containing one is lowered to a chain of
-         * per-case comparisons instead. */
+        /* Pattern cases — `case T x:`, `case null:`, `case */
         bool has_patterns = false;
         for (int i = 0; i < stmt->switch_stmt.cases.count && !has_patterns; i++) {
             zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
@@ -2380,15 +2065,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMPositionBuilderAtEnd(g->builder, test_bb);
                 LLVMBasicBlockRef match_bb = LLVMAppendBasicBlockInContext(
                     g->ctx, g->current_fn, "sw.pmatch");
-                /* always a fresh fail block: it either hosts the next case's
-                 * test or is wired to default/end after the chain. */
+                /* 内部辅助逻辑 */
                 LLVMBasicBlockRef fail_bb = LLVMAppendBasicBlockInContext(
                     g->ctx, g->current_fn, "sw.pnext");
 
-                /* pattern variable: bind before the guard so `when` can read
-                 * it. The case body rebinds it separately (see below) because
-                 * each body's scope-exit release truncates locals back to
-                 * switch_start, wiping every chain-time binding. */
+                /* pattern variable: bind before the guard so `when` can read it */
                 emit_switch_pattern_bind(g, locals, sc, switch_val);
 
                 LLVMValueRef cond;
@@ -2398,13 +2079,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                pt->kind == TYPE_OBJECT || pt->kind == TYPE_INTERFACE))
                         cond = emit_runtime_is_check_name(g, switch_val, pt);
                     else {
-                        /* A value type has no runtime type variation, so the
-                         * match is decided statically -- the same rule
-                         * AST_IS_EXPR uses: true iff the discriminant's static
-                         * type is the pattern type. It was hardcoded false, so
-                         * `case int n when n > 3:` (and the switch-expression
-                         * arm that lowers to it) never matched and the switch
-                         * silently fell through to default. */
+                        /* 内部辅助实现 */
                         zan_type_t *dt = infer_expr_type(g, stmt->switch_stmt.expr,
                                                          locals);
                         cond = LLVMConstInt(LLVMInt1TypeInContext(g->ctx),
@@ -2424,12 +2099,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     cond = zan_icmp(g->builder, LLVMIntEQ, switch_val, case_val,
                                     "sw.eq");
                 }
-                /* `when` guard: evaluated only after the pattern matched.
-                 * The guard runs in its own block so a failed match (null
-                 * discriminant, wrong runtime type) never evaluates it --
-                 * the pattern variable is only safe to read after the match
-                 * held. A plain `and` would evaluate it unconditionally and
-                 * crash on `case Dog d when d.Legs > 3:` for a null value. */
+                /* `when` guard: evaluated only after the pattern matched */
                 if (sc->switch_case.when_cond) {
                     LLVMBasicBlockRef guard_bb = LLVMAppendBasicBlockInContext(
                         g->ctx, g->current_fn, "sw.pguard");
@@ -2444,18 +2114,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 } else {
                     LLVMBuildCondBr(g->builder, cond, match_bb, fail_bb);
                 }
-                /* A failed type/guard match never enters the case body. Drop
-                 * the chain binding's cell owner before testing the next case;
-                 * the body alias path performs the same release through the
-                 * ordinary scope suffix when a case does match. */
+                /* A failed type/guard match never enters the case body */
                 LLVMPositionBuilderAtEnd(g->builder, fail_bb);
                 emit_switch_pattern_fail_release(g, locals, sc);
                 pmatch[ci] = match_bb;
                 psrc[ci] = i;
                 ci++;
-                /* emit_switch_pattern_fail_release may split the failure edge
-                 * through the tagged-cell release helper; continue the chain
-                 * from whichever block that helper left current. */
+                /* 内部辅助逻辑 */
                 test_bb = LLVMGetInsertBlock(g->builder);
             }
 
@@ -2487,9 +2152,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMBuildBr(g->builder, fall);
                     continue;
                 }
-                /* rebind the pattern variable in this body's scope: previous
-                 * bodies' scope-exit release truncated locals past the chain
-                 * time binding, so the body must see its own copy */
+                /* 内部辅助逻辑 */
                 emit_switch_pattern_bind(g, locals, sc, switch_val);
                 emit_stmt(g, sc->switch_case.body, locals);
                 if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
@@ -2555,8 +2218,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 int i = case_src[k];
                 zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
                 LLVMPositionBuilderAtEnd(g->builder, case_bbs[k]);
-                /* an empty case falls through into the next non-empty case
-                 * (or default), mirroring the integer-switch fix */
+                /* 内部辅助逻辑 */
                 bool case_empty = (sc->switch_case.body &&
                                    sc->switch_case.body->block.stmts.count == 0);
                 if (case_empty) {
@@ -2605,14 +2267,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         LLVMValueRef sw = LLVMBuildSwitch(g->builder, switch_val, default_bb, (unsigned)num_cases);
 
-        /* C# case fallthrough: `case 1: case 2: body` lets both labels share
-         * one body -- an empty case falls through into the next case (or, at
-         * the tail, into default). Each case gets its own block and empty
-         * cases are wired to the next non-empty one. */
+        /* 内部辅助实现 */
         LLVMBasicBlockRef *case_bbs = (LLVMBasicBlockRef *)calloc(
             (size_t)(num_cases > 0 ? num_cases : 1), sizeof(LLVMBasicBlockRef));
-        /* case_src[i] = index in stmt->cases of the i-th non-default case;
-         * lets an empty case find the block of the next non-empty case */
+        /* 内部辅助逻辑 */
         int *case_src = (int *)calloc((size_t)(num_cases > 0 ? num_cases : 1),
                                       sizeof(int));
         int nci = 0;
@@ -2624,10 +2282,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMBasicBlockRef case_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.case");
             LLVMBasicBlockRef entry_bb = LLVMGetInsertBlock(g->builder);
             LLVMValueRef case_val = emit_expr(g, sc->switch_case.pattern, locals);
-            /* LLVMBuildSwitch / LLVMConstIntGetSExtValue require a ConstantInt;
-             * an arbitrary expression here would type-confuse inside LLVM's
-             * C++ unwrap (UB / garbage constants). Diagnose and route this
-             * case straight to the switch end instead. */
+            /* 内部辅助实现 */
             if (!case_val || !LLVMIsAConstantInt(case_val)) {
                 zan_diag_emit(g->diag, DIAG_ERROR, sc->loc,
                               "case label must be a compile-time constant "
@@ -2638,12 +2293,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMPositionBuilderAtEnd(g->builder, entry_bb);
                 continue;
             }
-            /* A case label is an integer constant; fit it to the switch
-             * operand's width with a *constant* cast. Widening the operand
-             * instead (coerce_int_pair) would build a sext into this block,
-             * which LLVMBuildSwitch has already terminated, leaving the
-             * terminator no longer last -- invalid IR whenever the literal's
-             * width (i64) differs from the operand's (e.g. i32 `int`). */
+            /* 内部辅助逻辑 */
             LLVMTypeRef swty = LLVMTypeOf(switch_val);
             if (LLVMGetTypeKind(LLVMTypeOf(case_val)) == LLVMIntegerTypeKind &&
                 LLVMGetTypeKind(swty) == LLVMIntegerTypeKind &&
@@ -2657,16 +2307,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             nci++;
         }
 
-        /* pass 2: emit each case body; an empty case (no statements) is a
-         * fallthrough label and just branches into the next case's block */
+        /* 内部辅助逻辑 */
         for (int k = 0; k < nci; k++) {
             int i = case_src[k];
             zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
             LLVMBasicBlockRef case_bb = case_bbs[k];
             bool case_empty = (sc->switch_case.body &&
                                sc->switch_case.body->block.stmts.count == 0);
-            /* the next label this case falls into: the next case with a
-             * non-empty body, else default (or the switch end) */
+            /* 内部辅助逻辑 */
             LLVMBasicBlockRef fall_bb = NULL;
             if (case_empty) {
                 for (int k2 = k + 1; k2 < nci; k2++) {
@@ -2716,13 +2364,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     }
 
     case AST_TRY_STMT: {
-        /* try/catch/finally via a per-program setjmp stack: entering a try
-         * pushes a jmp_buf, `throw` longjmps to the innermost one with the
-         * exception object in a global, catch pops the stack and binds the
-         * exception local. On wasm32 there is no unwinder to reach: the
-         * mini-game V8 builds reject the Exception section the WebAssembly EH
-         * proposal emits, so the try body runs unconditionally and a throw
-         * takes the unhandled-exception die path (see AST_THROW_STMT). */
+        /* 内部辅助实现 */
         LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         LLVMValueRef top_g, bufs_g, exc_g;
@@ -2733,14 +2375,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "try.end");
 
         LLVMValueRef eh_tmptop_g = get_eh_tmp_top_global(g);
-        /* compile-time id of this try within the enclosing async function;
-         * indexes its frame-resident catch slots (-1 = not async / no room) */
+        /* 内部辅助逻辑 */
         int async_hid = -1;
         LLVMValueRef tmp_mark = LLVMBuildLoad2(g->builder, i32t, eh_tmptop_g, "eh.tmpmark");
         LLVMValueRef old_top = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.old");
-        /* Spill try-entry EH state to allocas: an await inside the try body
-         * splits the function during CPS lowering, so SSA values defined here
-         * would not dominate their uses in the catch/end blocks. */
+        /* 内部辅助逻辑 */
         LLVMValueRef tmp_mark_slot = emit_entry_alloca(g, i32t, "eh.tmpmark.slot");
         zan_store_fit(g, tmp_mark, tmp_mark_slot);
         LLVMValueRef old_top_slot = emit_entry_alloca(g, i32t, "eh.old.slot");
@@ -2748,13 +2387,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMValueRef new_top = zan_add(g->builder, old_top,
             LLVMConstInt(i32t, 1, 0), "eh.new");
         zan_store_fit(g, new_top, top_g);
-        /* record the depth this handler was armed at, so a throw below can
-         * release the skipped frames' locals while they are still alive */
+        /* 内部辅助逻辑 */
         zan_store_fit(g, tmp_mark, emit_eh_mark_ptr(g, new_top));
-        /* An async frame records how many try handlers it currently has
-         * armed (frame.hcount): __zan_async_unwind stops releasing frames at
-         * the first one with an armed handler, since the exception resumes
-         * inside it. Balanced by the decrements at try-exit / catch-entry. */
+        /* An async frame records how many try handlers it currently has armed (frame */
         if (g->current_async_frame) {
             LLVMValueRef hc_ptr = LLVMBuildStructGEP2(g->builder,
                 g->current_async_frame_type, g->current_async_frame,
@@ -2762,11 +2397,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32t, hc_ptr, "eh.hcv");
             zan_store_fit(g, zan_add(g->builder, hc,
                 LLVMConstInt(i32t, 1, 0), "eh.hc1"), hc_ptr);
-            /* Record this handler in the frame so a later resume can re-arm it:
-             * the jmp_buf armed below dies with this invocation, but the try
-             * itself stays open across every suspension in its body. The
-             * re-entry block restores the eh bookkeeping this invocation's
-             * try-entry would have written, then enters the catch. */
+            /* 内部辅助实现 */
             async_hid = g->current_async_handler_next++;
             if (LLVMGetArrayLength(LLVMStructGetTypeAtIndex(
                     g->current_async_frame_type, ASYNC_FRAME_PENDING))) {
@@ -2804,11 +2435,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMBasicBlockRef re_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
                         re[ri].nm);
                     LLVMPositionBuilderAtEnd(g->builder, re_bb);
-                    /* Live variables reside in the escaped heap frame, not
-                     * SROA-promotable private allocas. Loads in the catch body
-                     * therefore read the current memory even after longjmp;
-                     * no per-handler sweep / volatile self-copy is required.
-                     * The alloca proxies are rewritten after all EH emission. */
+                    /* 内部辅助逻辑 */
                     LLVMValueRef rtop = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.rtop");
                     zan_store_fit(g, zan_sub(g->builder, rtop,
                         LLVMConstInt(i32t, 1, 0), "eh.rtop0"), old_top_slot);
@@ -2824,11 +2451,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
         LLVMValueRef zero = LLVMConstInt(i32t, 0, 0);
         LLVMValueRef bufp = emit_eh_buf_ptr(g, new_top);
-        /* wasm32 carries no WebAssembly-EH landing pads: the devtools/mini-game
-         * V8 builds reject the Exception section outright, so try/catch lowers
-         * onto the body alone and a thrown exception dies (see AST_THROW_STMT).
-         * The catch code below is still emitted, then left unreachable by a
-         * conditional jump into the body -- dead-block stripping removes it. */
+        /* 内部辅助实现 */
         bool wasm_try = false;
         LLVMBasicBlockRef saved_lpad = NULL;
         int saved_try_depth = 0;
@@ -2847,15 +2470,12 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         LLVMPositionBuilderAtEnd(g->builder, try_bb);
         int try_start = locals->count;
-        /* a throw inside this body unwinds to the catch below, skipping the
-         * body's scope-exit releases: they move to the throw site */
+        /* 内部辅助逻辑 */
         int saved_throw_base = g->throw_locals_base;
         int saved_throw_cbase = g->throw_catch_base;
         g->throw_locals_base = try_start;
         g->throw_catch_base = g->catch_cleanup_count;
-        /* open this try's finally region: every exit path out of the body and
-         * the catches below runs the finally before leaving (see
-         * emit_pending_finallys) */
+        /* 内部辅助逻辑 */
         int fin_idx = -1;
         if (stmt->try_stmt.finally_body &&
             g->finally_count < ZAN_MAX_FINALLY_DEPTH) {
@@ -2891,8 +2511,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             g->eh_armed[armed_idx].old_top_slot = old_top_slot;
         }
         emit_stmt(g, stmt->try_stmt.try_body, locals);
-        /* the handler covers the body only: the catches below run with it
-         * already disarmed, so an exit path there leaves the enclosing tries */
+        /* 内部辅助逻辑 */
         if (armed_idx >= 0) g->eh_armed_count = armed_idx;
         if (fin_idx >= 0) g->finallys[fin_idx].in_try_body = false;
         g->throw_locals_base = saved_throw_base;
@@ -2924,23 +2543,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32t, hc_ptr, "eh.hcv");
                 zan_store_fit(g, zan_sub(g->builder, hc,
                     LLVMConstInt(i32t, 1, 0), "eh.hc0"), hc_ptr);
-                /* No reload from the frame: the handler this catch belongs to
-                 * is re-armed by the invocation that raises the throw, whose
-                 * state block already loaded the frame-resident slots, so the
-                 * stack allocas are the live copy -- and the only one holding
-                 * the locals assigned after the last suspension. */
+                /* 内部辅助实现 */
             }
         }
-        /* longjmp skipped the normal releases of temps pushed after this try
-         * was entered — release them now, restoring the temp stack to the
-         * depth this handler was armed at. Read the mark the arming wrote
-         * into the buffer (bufs[top].mark) rather than the live temp depth:
-         * this catch can be re-entered by an invocation that only re-armed
-         * the handler, and across the suspension other coroutines
-         * interleaved on the same thread-global temp stack, so the depth
-         * live at re-entry belongs to whoever ran last. A plain-frame
-         * thrower already unwound to this same mark before its longjmp
-         * (emit_eh_unwind_to_handler). */
+        /* 内部辅助实现 */
         {
             LLVMTypeRef uwty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i32t, 1, 0);
             LLVMValueRef t1 = zan_add(g->builder,
@@ -2963,19 +2569,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMBuildLoad2(g->builder, i32t, hp, "eh.pending.depth"));
         }
         LLVMValueRef exc_val = LLVMBuildLoad2(g->builder, i8ptr, exc_g, "exc");
-        /* The caught exception and its ownership flag are read again by the
-         * catch epilogue, which an `await` inside the catch body separates
-         * from here by a suspension: this $resume invocation returns and its
-         * stack allocas are garbage when the next one resumes into the
-         * epilogue. Keep them in the heap frame, indexed by this try's
-         * compile-time handler id, so they survive the suspension. */
+        /* 内部辅助实现 */
         LLVMValueRef exc_slot, exc_owned_slot, exc_tid_slot;
         if (g->current_async_frame && async_hid >= 0 &&
             async_hid < g->current_async_handler_cap) {
-            /* Address them in the entry block, like emit_entry_alloca: the
-             * catch epilogue lives in a block the CPS split leaves outside
-             * this one's dominance, so a GEP computed here would not
-             * dominate its uses. */
+            /* 内部辅助实现 */
             LLVMValueRef cidx[2] = { LLVMConstInt(i32t, 0, 0),
                                      LLVMConstInt(i32t, (unsigned)async_hid, 0) };
             LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
@@ -3002,11 +2600,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMPositionBuilderAtEnd(g->builder, cur_bb);
         } else {
             exc_slot = emit_entry_alloca(g, i8ptr, "eh.exc.slot");
-            /* set when a matched handler takes over the in-flight +1 (see the
-             * ownership transfer at the top of each catch body) */
+            /* 内部辅助逻辑 */
             exc_owned_slot = emit_entry_alloca(g, i32t, "eh.excown.slot");
-            /* the thrown type, kept per handler so a bare `throw;` can rethrow
-             * it after the global has moved on */
+            /* 内部辅助逻辑 */
             exc_tid_slot = emit_entry_alloca(g, i8ptr, "eh.exctid.slot");
         }
         zan_store_fit(g, exc_val, exc_slot);
@@ -3015,9 +2611,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         int catch_start = locals->count;
         int ncatch = stmt->try_stmt.catches.count;
         if (ncatch > 0) {
-            /* type-based dispatch: test each clause in order against the
-             * thrown object's type descriptor (walking its base chain); if
-             * no clause matches, rethrow to the next outer handler */
+            /* 内部辅助逻辑 */
             LLVMValueRef tid_g = get_eh_exc_tid_global(g);
             LLVMValueRef thrown_tid = LLVMBuildLoad2(g->builder, i8ptr, tid_g, "exc.tid");
             zan_store_fit(g, thrown_tid, exc_tid_slot);
@@ -3059,16 +2653,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMPositionBuilderAtEnd(g->builder, body_bb);
                 if (cc->catch_clause.var_name.len > 0) {
                     LLVMValueRef ev = LLVMBuildLoad2(g->builder, i8ptr, exc_slot, "exc.re");
-                    /* an await in the handler returns from this $resume, so a
-                     * stack alloca would hold garbage when the handler resumes
-                     * and dereferences the binding: use its frame slot (a
-                     * storage-only local, ztype NULL, registered by the async
-                     * scan) whenever the method has one */
+                    /* 内部辅助实现 */
                     LLVMValueRef ea = NULL;
                     if (g->current_async_frame) {
-                        /* the scan registered this handler's binding slot
-                         * under THIS catch node (storage-only, ztype NULL);
-                         * node lookup cannot alias a same-named user local */
+                        /* 内部辅助逻辑 */
                         local_var_t *fv = local_find_async_decl(locals, cc);
                         if (fv && !fv->type &&
                             LLVMGetTypeKind(local_slot_type(g, fv)) == LLVMPointerTypeKind)
@@ -3078,11 +2666,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     zan_store_fit(g, ev, ea);
                     local_add(locals, cc->catch_clause.var_name, ea, et);
                 }
-                /* transfer the in-flight +1 into this handler: clear the
-                 * global owned flag (so a throw during the handler doesn't
-                 * touch it) and stack the object as an EH temp so a throw
-                 * escaping this handler releases it via the outer catch's
-                 * temp unwind; the normal handler exit pops and releases. */
+                /* 内部辅助实现 */
                 {
                     LLVMValueRef owned_g2 = get_eh_exc_owned_global(g);
                     LLVMValueRef ofl = LLVMBuildLoad2(g->builder, i32t, owned_g2, "exc.ofl");
@@ -3101,9 +2685,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMBuildBr(g->builder, pcont_bb);
                     LLVMPositionBuilderAtEnd(g->builder, pcont_bb);
                 }
-                /* Grown on demand: skipping the entry left the handler's
-                 * exception released only by the try epilogue, so a `return`
-                 * or `throw` out of a deeply nested catch leaked it. */
+                /* 内部辅助逻辑 */
                 if (ZAN_TAB_ENSURE(g->catch_cleanups, g->catch_cleanup_count,
                                    g->catch_cleanup_cap, 16)) {
                     g->catch_cleanups[g->catch_cleanup_count].exc_slot = exc_slot;
@@ -3126,31 +2708,22 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 if (!miss_bb) break;   /* catch-all consumed the rest */
                 LLVMPositionBuilderAtEnd(g->builder, miss_bb);
             }
-            /* current block is the last miss target when every clause is
-             * typed; it already IS rethrow_bb in that case */
+            /* 内部辅助逻辑 */
             if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)) &&
                 LLVMGetInsertBlock(g->builder) != rethrow_bb)
                 LLVMBuildBr(g->builder, rethrow_bb);
 
-            /* rethrow: the exception object/owned/tid globals still hold the
-             * in-flight exception; run this try's finally (C# runs it while
-             * unwinding), then jump to the next outer handler (this try's frame
-             * was already popped above) or die if none remains */
+            /* 内部辅助实现 */
             LLVMPositionBuilderAtEnd(g->builder, rethrow_bb);
             emit_finally_on_exception_path(g, locals, fin_idx);
-            /* leaving this try also leaves every lock (and any catch/finally
-             * currently running) between it and the handler that will catch:
-             * the longjmp skips their exits otherwise */
+            /* 内部辅助逻辑 */
             emit_finallys_below_for_propagate(g, locals, fin_idx);
             if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
                 emit_eh_propagate_tail(g);
 
             LLVMPositionBuilderAtEnd(g->builder, done_bb);
         } else {
-            /* try/finally with no catch clause catches nothing: run the finally
-             * and hand the exception to the next outer handler. (Falling
-             * through to the epilogue below would release it and continue as if
-             * nothing had been thrown.) */
+            /* 内部辅助逻辑 */
             emit_finally_on_exception_path(g, locals, fin_idx);
             emit_finallys_below_for_propagate(g, locals, fin_idx);
             if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
@@ -3158,13 +2731,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
         locals->count = catch_start;
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
-            /* Every path into done_bb matched a catch clause: its entry moved
-             * the thrown +1 from the thread-global flag into exc_owned_slot.
-             * The globals are NOT this handler's ownership ledger. A nested
-             * catch/await can overwrite them with a different exception while
-             * this handler is suspended, so consulting the global here can
-             * release the original catch object twice (or release a stranger).
-             * Only the handler's frame-resident owned slot owns this +1. */
+            /* 内部辅助实现 */
             LLVMValueRef cfn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
             LLVMValueRef hofl = LLVMBuildLoad2(g->builder, i32t, exc_owned_slot,
                 "exc.hown");
@@ -3187,8 +2754,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMBuildBr(g->builder, end_bb);
         }
 
-        /* the region is closed: the normal-exit copy of the finally below is
-         * the last one this try emits */
+        /* 内部辅助逻辑 */
         if (fin_idx >= 0) g->finally_count = fin_idx;
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         if (stmt->try_stmt.finally_body) {
@@ -3211,10 +2777,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         int saved_loop_cbase = g->loop_catch_base;
         int saved_loop_fbase = g->finally_loop_base;
         int saved_loop_ehbase = g->eh_armed_loop_base;
-        /* break/continue targets were never registered here, so a break in a
-         * do-while body silently fell through (no target -> empty statement,
-         * infinite loop; a stale outer target -> exited the wrong loop).
-         * continue re-tests the condition, which is what cond_bb holds. */
+        /* 内部辅助实现 */
         g->pending.break_scope = g->pending.scope;
         g->pending.continue_scope = g->pending.scope;
         g->break_target = end_bb;
@@ -3229,8 +2792,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         emit_stmt(g, stmt->while_stmt.body, locals);
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
             emit_release_owned_locals_from(g, locals, body_start);
-            /* back-edge cooperative preemption: resume re-tests the
-             * condition; no-op outside async fns. */
+            /* 内部辅助逻辑 */
             if (!emit_async_preempt_site(g, cond_bb))
                 LLVMBuildBr(g->builder, cond_bb);
         } else {
@@ -3279,21 +2841,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         LLVMValueRef collection = emit_expr(g, stmt->foreach_stmt.collection, locals);
 
-        /* User iteration protocol: a collection whose type declares
-         * GetEnumerator() iterating an enumerator with MoveNext()/Current is
-         * driven through that protocol. The predicate lives in irgen_async.c
-         * next to the frame scan so both passes agree on which loops carry a
-         * $fe.e enumerator slot. */
+        /* 内部辅助实现 */
         zan_type_t *col_type0 = infer_expr_type(g, stmt->foreach_stmt.collection,
                                                 locals);
         zan_type_t *fe_enum_ty = foreach_proto_enum_type(g, col_type0);
         zan_type_t *fe_cur_ty = foreach_proto_current_type(g, col_type0);
         if (!fe_enum_ty && col_type0 && col_type0->kind == TYPE_CLASS &&
             col_type0->sym) {
-            /* GetEnumerator returning an interface is a protocol-shaped
-             * collection the loop cannot dispatch yet; without this guard it
-             * would silently fall through to the legacy List layout and read
-             * unrelated memory. Say so instead. */
+            /* 内部辅助实现 */
             zan_istr_t gi = { (char *)"GetEnumerator", 13 };
             zan_symbol_t *gm = resolve_overload(col_type0->sym, gi, 0, 0);
             if (gm && gm->decl && gm->decl->kind == AST_METHOD_DECL &&
@@ -3338,9 +2893,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (!elem_type) elem_type = g->binder->type_int;
         LLVMTypeRef elem_llvm = map_type(g, elem_type);
 
-        /* How the collection is laid out: List has a count and data pointer;
-         * an array is a bare buffer with length captured at declaration;
-         * a string is NUL-terminated bytes. */
+        /* 内部辅助逻辑 */
         zan_type_t *col_type = col_type0;
         bool fe_array = col_type && col_type->kind == TYPE_ARRAY;
         bool fe_string = col_type && col_type->kind == TYPE_STRING;
@@ -3353,18 +2906,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             fe_len = emit_string_length(g, sp, stmt->loc);
         }
 
-        /* Iteration state (element, index, collection) of a `foreach` in an
-         * async body lives in the heap frame: an await in the loop body
-         * re-enters at a block the pre-header never runs, so values computed
-         * here neither dominate their uses nor survive the suspension. The
-         * collection is what gets stored -- count and data are re-derived per
-         * iteration, which is also what keeps the loop correct across a
-         * reallocation of the list. */
+        /* 内部辅助实现 */
         LLVMValueRef col_slot = NULL, idx_alloc = NULL, iter_alloc = NULL;
         LLVMValueRef enum_slot = NULL, enum_alloc = NULL;
         if (g->current_async_frame) {
-            /* Scan and emission can visit a finally body different numbers of
-             * times. Statement identity and role preserve the same frame slots. */
+            /* Scan and emission can visit a finally body different numbers of times */
             if (fe_enum_ty) {
                 local_var_t *ev2 = local_find_async_role(locals, stmt,
                     ASYNC_FOREACH_ENUMERATOR);
@@ -3380,10 +2926,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             local_var_t *iv = local_find_async_role(locals, stmt,
                 ASYNC_FOREACH_INDEX);
             if (iv) idx_alloc = iv->alloca;
-            /* the loop variable's frame slot is the storage-only one THIS
-             * foreach registered (keyed by this statement node, ztype NULL);
-             * same-named user declarations own separate slots and must not
-             * be aliased */
+            /* 内部辅助实现 */
             local_var_t *ev = local_find_async_decl(locals, stmt);
             if (ev && !ev->type && LLVMGetTypeKind(elem_llvm) ==
                     LLVMGetTypeKind(local_slot_type(g, ev)))
@@ -3395,10 +2938,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0), "fe.colp"),
                 col_slot);
 
-        /* protocol: materialize the enumerator once, before the loop. The
-         * loop owns it (one release at the end block); the slot holds it in
-         * an async body so a resumed MoveNext/Current call sees the live
-         * enumerator, not a stale stack value. */
+        /* protocol: materialize the enumerator once, before the loop */
         LLVMTypeRef fe_enum_ll = fe_enum_ty ? map_type(g, fe_enum_ty) : NULL;
         if (fe_enum_ty) {
             if (!enum_slot) enum_alloc = emit_entry_alloca(g, fe_enum_ll, "fe.enum");
@@ -3407,15 +2947,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             zan_store_fit(g, ev0, enum_slot ? enum_slot : enum_alloc);
         }
 
-        /* The loop owns its enumerator -- and any owned collection temp (a
-         * call result like `s.Split(',')`) -- for the whole extent of the
-         * loop. Register them as owning locals BELOW the body scope (fe_start
-         * is taken after this) so every exit path releases exactly once
-         * through the shared locals machinery: the end block, break/continue
-         * (which skip them and reach the end block), `return` (full locals
-         * release), the plain-frame throw unwind (EH slot registered by
-         * arc_own_local), the async throw range, and goto. Without this a
-         * `return` out of the body leaked the enumerator and the temp. */
+        /* 内部辅助逻辑 */
         bool fe_coll_registered = false;
         {
             zan_type_t *coll_t = infer_expr_type(g,
@@ -3459,9 +2991,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMTypeRef list_ptr_ty = LLVMTypeOf(collection);
         LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.cond");
         LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.body");
-        /* the index advance is its own block so `continue` can reach it: a
-         * `continue` that branched straight to the condition would spin
-         * forever on the same element */
+        /* 内部辅助逻辑 */
         LLVMBasicBlockRef step_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.step");
         LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.end");
 
@@ -3484,10 +3014,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
 
-        /* protocol path: the condition is enumerator.MoveNext() and the body
-         * reads enumerator.Current. The enumerator is reloaded from its slot
-         * in both blocks -- an async resume re-enters either one directly,
-         * and a plain (sync) loop re-enters cond from step. */
+        /* protocol path: the condition is enumerator */
         if (fe_enum_ty) {
             LLVMValueRef fev = enum_slot
                 ? LLVMBuildBitCast(g->builder,
@@ -3520,10 +3047,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             else
                 cur = emit_property_getter_call(g, fe_cur_getter, fe_enum_ty,
                                                 fev, NULL, locals);
-            /* An erased enumerator hands Current back as the raw i64 slot
-             * word; convert it to the declared element type exactly like the
-             * collection-slot read (floats are bit-reinterpreted, never
-             * sitofp'd) before it reaches the iteration slot. */
+            /* 内部辅助实现 */
             if (cur && elem_type &&
                 LLVMGetTypeKind(LLVMTypeOf(cur)) == LLVMIntegerTypeKind &&
                 LLVMGetIntTypeWidth(LLVMTypeOf(cur)) == 64 &&
@@ -3552,12 +3076,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             g->finally_loop_base = fe_saved_loop_fbase;
             g->eh_armed_loop_base = fe_saved_loop_ehbase;
             LLVMPositionBuilderAtEnd(g->builder, end_bb);
-            /* the loop owns the enumerator and any owned collection temp:
-             * they are registered owning locals below the body scope, so the
-             * range release drops both exactly once on the single loop-exit
-             * path (return/break/continue routes reach it or were handled at
-             * their own site); an unregistered shape (struct-kind collection,
-             * async body without a frame slot) keeps the direct release */
+            /* 内部辅助实现 */
             emit_release_owned_locals_from(g, locals, fe_start);
             if (!fe_coll_registered)
                 emit_release_owned_call_temp(g, stmt->foreach_stmt.collection,
@@ -3575,10 +3094,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             : collection;
         LLVMValueRef count;
         if (fe_array || fe_string) {
-            /* the pre-header length is a register, so in an async body it
-             * neither dominates the condition (re-entered from a later resume)
-             * nor survives the suspension: re-derive it from the reloaded
-             * collection, exactly as the List path re-reads its count */
+            /* 内部辅助实现 */
             if (col_slot && fe_array) {
                 count = zan_array_len(g, col_cond);
             } else if (col_slot) {
@@ -3655,9 +3171,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
             data_ptr, "data");
         LLVMValueRef idx_body = LLVMBuildLoad2(g->builder, i64, idx_alloc, "ib");
-        /* load current element; slots physically hold an i64, so pointer
-         * (class/string) elements need inttoptr, doubles a bitcast, and
-         * narrower integers a trunc back to the value type */
+        /* 内部辅助逻辑 */
         LLVMValueRef fe_widx = slot_word_index(g, idx_body,
             elem_slot_words(g, elem_type));
         LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &fe_widx, 1, "ep");
@@ -3670,10 +3184,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         else if (ek == LLVMDoubleTypeKind)
             elem = LLVMBuildBitCast(g->builder, elem, elem_llvm, "elf");
         else if (ek == LLVMFloatTypeKind) {
-            /* the slot word carries the f32 BITS in its low half: the same
-             * trunc+bitcast the collection-slot read uses. Falling through to
-             * zan_store_fit sitofp'd the raw word's integer VALUE, so a
-             * foreach var over List<float> read 3.5f as 1069547520.0 */
+            /* 内部辅助逻辑 */
             LLVMValueRef nb = LLVMBuildTrunc(g->builder, elem,
                 LLVMInt32TypeInContext(g->ctx), "elf32");
             elem = LLVMBuildBitCast(g->builder, nb, elem_llvm, "elf32b");
@@ -3708,10 +3219,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->eh_armed_loop_base = fe_saved_loop_ehbase;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
-        /* an owned temporary collection (e.g. iterating a call result) is
-         * consumed by the loop and released once iteration ends; the
-         * enumerator and the temp are registered owning locals below the body
-         * scope, so the range release covers both exactly once */
+        /* an owned temporary collection (e */
         emit_release_owned_locals_from(g, locals, fe_start);
         if (!fe_coll_registered) {
             LLVMValueRef col_end = col_slot
@@ -3728,11 +3236,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     }
 
     case AST_CHECKED_STMT: {
-        /* checked { ... } / unchecked { ... }: emit the body under the
-         * requested overflow-checking context (irgen_checked_depth > 0 makes
-         * integer + - * trap on overflow; < 0 forces plain wrapping ops).
-         * The parenthesized form `checked(expr)` shares this node: its body
-         * is the expression, emitted as an expression statement's value. */
+        /* 内部辅助实现 */
         int saved = g->irgen_checked_depth;
         g->irgen_checked_depth = stmt->checked_stmt.checked ? saved + 1
                                                             : saved - 1;
@@ -3760,9 +3264,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             obj = LLVMBuildIntToPtr(g->builder, obj, i8ptr, "lockp");
         else if (LLVMGetTypeKind(ot) == LLVMPointerTypeKind && ot != i8ptr)
             obj = LLVMBuildBitCast(g->builder, obj, i8ptr, "lockp");
-        /* Lowers `lock` to try/finally semantics so return/break/throw
-         * paths reliably release the held monitor. The object goes in
-         * an alloca so exit paths can reload it. */
+        /* 内部辅助逻辑 */
         LLVMValueRef obj_slot = emit_entry_alloca(g, i8ptr, "lock.slot");
         zan_store_fit(g, obj, obj_slot);
         zan_call2(g->builder, mon_ty, enter_fn, &obj, 1, "");
@@ -3778,8 +3280,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             g->finallys[lock_fin].outer_armed_depth = g->eh_armed_count;
             g->finallys[lock_fin].outer_throw_locals_base = g->throw_locals_base;
             g->finallys[lock_fin].outer_throw_catch_base = g->throw_catch_base;
-            /* a throw in the body has no handler here, so it releases the
-             * monitor at the throw site */
+            /* 内部辅助逻辑 */
             g->finallys[lock_fin].in_try_body = false;
         } else {
             zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
@@ -3802,10 +3303,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 "duplicate label '%.*s' in this function",
                 (int)stmt->ident.name.len, stmt->ident.name.str);
         } else {
-            /* definition: record the nesting depths so backward gotos can run
-             * the full exit sequence down to here, and forward gotos recorded
-             * against this label can be checked for boundaries they must not
-             * cross (their cleanup can no longer be emitted at the jump site). */
+            /* 内部辅助实现 */
             g->goto_labels[li].defined = 1;
             g->goto_labels[li].pending_scope = g->pending.scope;
             g->goto_labels[li].fin_depth = g->finally_count;
@@ -3851,14 +3349,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 } else if (f->fin_depth > lab_fin || f->catch_base > lab_catch ||
                            f->eh_armed_base > lab_eh ||
                            f->pending.scope != g->pending.scope) {
-                    /* C#-legal jump OUT of try/catch/finally/lock: a landing
-                     * chain in the goto's own block replays the cleanups the
-                     * jump skips -- the same exit sequence a backward goto
-                     * runs, rebuilt from the goto-site snapshots (the live
-                     * stacks have been popped past these depths by now; only
-                     * the popped range is overwritten, the label's own live
-                     * entries below it stay intact). The label's emission
-                     * continues from where it was. */
+                    /* 内部辅助实现 */
                     zan_irgen_pending_context_t saved_pending = g->pending;
                     LLVMBasicBlockRef saved_break = g->break_target;
                     LLVMBasicBlockRef saved_continue = g->continue_target;
@@ -3975,9 +3466,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     (int)stmt->ident.name.len, stmt->ident.name.str);
                 break;
             }
-            /* backward jump: the region between here and the label is live on
-             * the finally/catch/locals stacks -- run the same exit sequence a
-             * break out of the label's nesting level runs, then jump */
+            /* 内部辅助逻辑 */
             emit_pending_finallys(g, locals, g->goto_labels[li].fin_depth, false);
             if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
                 emit_release_owned_locals_range(
@@ -3989,14 +3478,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMBuildBr(g->builder, bb);
             }
         } else {
-            /* forward jump: the label's depth is not known yet, so record the
-             * jump for validation and cleanup at the definition. A forward
-             * goto within the same block (no boundary crossing) stays a
-             * plain branch. The cleanup stacks are snapshotted here: by the
-             * time the label is seen these entries are popped (and their
-             * slots possibly reused), but a jump out of the try region must
-             * still run them -- C#-legal -- so the definition replays the
-             * cleanups from these copies as a landing chain. */
+            /* 内部辅助逻辑 */
             if (ZAN_TAB_ENSURE(g->goto_fixups, g->goto_fixup_count,
                                g->goto_fixup_cap, 8)) {
                 struct zan_goto_fixup *f =
@@ -4046,8 +3528,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             }
             LLVMBuildBr(g->builder, bb);
         }
-        /* anything after an unconditional goto is unreachable; park in a
-         * fresh block so subsequent emission stays well-formed */
+        /* 内部辅助逻辑 */
         LLVMBasicBlockRef cont =
             LLVMAppendBasicBlockInContext(g->ctx, gfn, "goto.cont");
         LLVMPositionBuilderAtEnd(g->builder, cont);
@@ -4055,14 +3536,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     }
 
     case AST_THROW_STMT: {
-        /* throw expr; — store the exception and longjmp to the innermost
-         * enclosing try (if any); otherwise print and exit(1).
-         * throw;      — rethrow what the enclosing catch is handling. */
+        /* 内部辅助逻辑 */
         bool rethrow = stmt->throw_stmt.value == NULL;
         if (rethrow) {
-            /* the handler's slots live in the function that opened it: a
-             * `throw;` in a lambda body nested inside a catch is not a
-             * rethrow site (C# rejects it too) */
+            /* 内部辅助逻辑 */
             LLVMValueRef hslot = g->catch_cleanup_count > 0
                 ? g->catch_cleanups[g->catch_cleanup_count - 1].exc_slot : NULL;
             LLVMBasicBlockRef hbb = hslot ? LLVMGetInstructionParent(hslot) : NULL;
@@ -4082,13 +3559,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMValueRef top_g, bufs_g, exc_g;
             get_eh_globals(g, &top_g, &bufs_g, &exc_g);
             if (rethrow) {
-                /* Put the handler's exception back in flight unchanged -- same
-                 * object, same type descriptor, so outer clauses dispatch on
-                 * its original dynamic type -- and hand its +1 back to the
-                 * globals: the handler stops owning it, so drop the EH temp
-                 * entry it stacked at entry and clear its owned flag (both the
-                 * temp unwind and emit_release_active_catch_excs below would
-                 * otherwise release it under the outer handler). */
+                /* 内部辅助实现 */
                 int ci = g->catch_cleanup_count - 1;
                 LLVMValueRef exc_slot = g->catch_cleanups[ci].exc_slot;
                 LLVMValueRef own_slot = g->catch_cleanups[ci].owned_slot;
@@ -4121,28 +3592,19 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             else if (LLVMTypeOf(vail) != i8ptr)
                 vail = LLVMBuildBitCast(g->builder, vail, i8ptr, "exc.bc");
             zan_store_fit(g, vail, exc_g);
-            /* rc convention: for class-typed throws __zan_eh_exc carries a +1
-             * reference (retain borrowed values here); the catch releases it
-             * once the handler completes */
+            /* 内部辅助逻辑 */
             {
                 LLVMValueRef owned_g = get_eh_exc_owned_global(g);
                 LLVMValueRef tid_g = get_eh_exc_tid_global(g);
                 zan_type_t *tt = infer_expr_type(g, stmt->throw_stmt.value, locals);
                 if (tt && is_rc_managed_type(tt) &&
                     LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind) {
-                    /* Retain borrowed values here; the catch (and the
-                     * propagate path) release through rt_release_dyn, which
-                     * dispatches on the header tag, so __zan_eh_exc holds an
-                     * owned reference during unwinding. */
+                    /* 内部辅助实现 */
                     if (!expr_yields_owned_rc_value(g, stmt->throw_stmt.value, locals))
-                        /* type-aware: a string retain must go through the
-                         * sentinel-tolerant helper -- interned literals sit in
-                         * read-only static storage, and the plain object
-                         * retain would fault incrementing their refcount */
+                        /* 内部辅助实现 */
                         emit_rc_retain_for_type(g, tt, vail);
                     zan_store_fit(g, LLVMConstInt(i32t, 1, 0), owned_g);
-                    /* record the thrown class's type descriptor so catch
-                     * clauses can dispatch by type */
+                    /* record the thrown class's type descriptor so catch clauses can dispatch by type */
                     if (tt->kind == TYPE_CLASS && tt->sym) {
                         LLVMValueRef tid = get_class_tid_global(g, tt->sym);
                         zan_store_fit(g,
@@ -4157,37 +3619,22 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 }
             }
 throw_unwind:
-            /* a throw out of a catch (or finally) body leaves that try, so its
-             * finally runs here -- the longjmp below goes straight to an outer
-             * handler and would skip it */
+            /* 内部辅助逻辑 */
             emit_finallys_left_by_throw(g, locals);
             if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) break;
-            /* longjmp skips every scope-exit release between here and the
-             * handler. An async body's locals live in its heap frame, which
-             * the frame chain releases, so releasing this frame's abandoned
-             * ones here is enough. A plain frame's locals -- and those of
-             * every frame between here and the handler -- are only reachable
-             * through the slots they registered on the unwind stack, released
-             * below while those frames are still alive. `throw` is noreturn,
-             * so the releases the normal paths emit for the same locals stay
-             * correct: they are only reached when no exception was raised. */
+            /* longjmp skips every scope-exit release between here and the handler */
             if (g->current_async_frame) {
                 emit_release_owned_locals_range(g, locals, g->throw_locals_base);
                 emit_clear_owned_locals_range(g, locals, g->throw_locals_base);
             }
-            /* a throw out of a catch body skips that handler's epilogue, so
-             * the exception it caught is released here (the new one is
-             * already stored in the globals and retained) */
+            /* 内部辅助逻辑 */
             emit_release_active_catch_excs(g, g->throw_catch_base);
             LLVMValueRef top = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.top");
             (void)top;
             LLVMValueRef fn2 = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
             LLVMBasicBlockRef jmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn2, "throw.jmp");
             LLVMBasicBlockRef die_bb = LLVMAppendBasicBlockInContext(g->ctx, fn2, "throw.die");
-            /* wasm32 arms no handlers (EH-free lowering, see AST_TRY_STMT):
-             * route every throw straight to the die path; terminate the
-             * (never entered) jmp block so the pre-optimizer verification
-             * pass sees no unterminated block. */
+            /* 内部辅助实现 */
             if (g->target_is_wasm) {
                 LLVMBuildBr(g->builder, die_bb);
                 LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
@@ -4198,9 +3645,7 @@ throw_unwind:
                     LLVMConstInt(i32t, 0, 0), "eh.has");
                 LLVMBuildCondBr(g->builder, has, jmp_bb, die_bb);
                 LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
-                /* the handler is either a try of this invocation or this
-                 * invocation's trampoline, so keep the frame authoritative and
-                 * longjmp without touching the frames that await us */
+                /* 内部辅助逻辑 */
                 if (g->current_async_frame) {
                     emit_eh_longjmp(g, emit_eh_buf_ptr(g, top));
                     LLVMBuildUnreachable(g->builder);
@@ -4216,11 +3661,7 @@ throw_unwind:
             if (printf_fn) {
                 LLVMTypeRef printf_ty = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx),
                     &i8ptr, 1, 1);
-                /* A string throw prints its message; a class throw prints a
-                 * type note. The thrown value alone is not enough: a class
-                 * object is also an i8*, and printing it as text yields
-                 * garbage. The type descriptor (null = string) tells the two
-                 * apart. */
+                /* A string throw prints its message; a class throw prints a type note */
                 LLVMValueRef dexc = LLVMBuildLoad2(g->builder, i8ptr, exc_g,
                     "die.exc");
                 LLVMValueRef dtid = LLVMBuildLoad2(g->builder, i8ptr,
@@ -4250,9 +3691,7 @@ throw_unwind:
                     zan_call2(g->builder, printf_ty, printf_fn, args, 2, "");
                 }
                 LLVMBuildBr(g->builder, die_cont_bb);
-                /* class throw: resolve the class name through the tid-name
-                 * registry and print it; fall back to "(class object)" when
-                 * the class is not registered (same as the propagate tail) */
+                /* 内部辅助逻辑 */
                 LLVMPositionBuilderAtEnd(g->builder, die_cls_bb);
                 {
                     LLVMValueRef name_fn = get_eh_tid_name_fn(g);
@@ -4313,15 +3752,7 @@ throw_unwind:
     if (arc_nested) g->arc_stmt_depth--;
 }
 
-/* Release every RC-managed static field into its backing global at program
- * exit, so long-lived singletons held in static fields do not leak. Mirrors
- * the static-field initializer pass at main() entry. Runs before the leak
- * report (which is scheduled via atexit and therefore fires afterwards).
- *
- * The sweep walks the registry built by get_static_field_global rather than
- * the compilation unit passed in: that unit only contains main()'s own
- * declarations, while stdlib singletons (Pinyin.cache, ...) are compiled into
- * separate units whose static fields would otherwise stay alive. */
+/* 内部辅助实现 */
 static void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit) {
     (void)unit;
     for (int i = 0; i < g->static_field_count; i++) {

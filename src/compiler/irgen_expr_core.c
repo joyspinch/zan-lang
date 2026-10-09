@@ -1,6 +1,4 @@
-/* irgen_expr_core.c -- expression codegen helpers (lvalues, loads/stores,
- * comparisons, shared emit utilities); #include'd by irgen.c in a fixed
- * order, not compilable standalone. */
+/* irgen_expr_core */
 
 /* defined in later-included parts of this translation unit */
 static zan_type_t *subst_type_param(zan_type_t *t, zan_type_t *recv);
@@ -19,13 +17,10 @@ static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
                                zan_loc_t loc, const char *msg);
 static LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base,
                                           LLVMValueRef isnull, zan_loc_t loc);
-/* Emit a lambda literal, typing its parameters/return from `expected` (the
- * target delegate type) when the lambda omits annotations. Without this the
- * params default to `int`, so a class-typed parameter cannot resolve fields.
- * `expected` may be NULL/non-delegate, in which case i64/int defaults apply. */
+/* 发射 Lambda 表达式并推断参数与返回值类型 */
 static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
                                       zan_type_t *expected, local_scope_t *locals);
-/* Resolve the declared type of a method's idx-th parameter (NULL if unknown). */
+/* Resolve the declared type of a method's idx-th parameter (NULL if unknown) */
 static zan_type_t *method_param_type(zan_irgen_t *g, zan_symbol_t *msym, int idx);
 static zan_type_t *method_param_type_at(zan_irgen_t *g, zan_symbol_t *msym,
                                         int idx, zan_ast_node_t *call,
@@ -36,86 +31,34 @@ static zan_type_t *method_ret_type_at(zan_irgen_t *g, zan_symbol_t *msym,
                                       zan_ast_node_t *recv_expr,
                                       local_scope_t *locals);
 static bool method_ret_is_bare_tp(zan_symbol_t *msym);
-/* Emit a call argument, typing a bare lambda from the target delegate param. */
+/* 发射a call argument, typing a bare lambda from the target delegate param */
 static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
                                    zan_type_t *ptype, local_scope_t *locals);
 
-/* async/await CPS helpers (defined below; forward-declared for use in the
- * AST_AWAIT_EXPR case of emit_expr). Frame header field indices are shared
- * across every async frame (see docs/ASYNC_CPS_DESIGN.md). */
+/* 内部辅助逻辑 */
 enum {
-    ASYNC_FRAME_SCHED = 0,        /* i64: scheduler state bits, owned by the
-                                   * multi-worker driver (rt_io.c: QUEUED /
-                                   * RUNNING / NOTIFIED / DEAD). Kept at offset
-                                   * 0 of every frame so the driver can CAS it
-                                   * through a bare i8* handle. */
-    ASYNC_FRAME_SCHED_STEP = 1,   /* void(i8*)*: resume fn banked by a ready that
-                                   * arrived while the frame was running, to be
-                                   * re-queued when its step returns */
+    ASYNC_FRAME_SCHED = 0,        /* i64: scheduler state bits, owned by the multi-worker driver (rt_io */
+    ASYNC_FRAME_SCHED_STEP = 1,   /* 内部辅助逻辑 */
     ASYNC_FRAME_STATE = 2,        /* i32: 0=start, k=resume-after-await-k, -1=done */
     ASYNC_FRAME_DONE = 3,         /* i32: 1 once result slot is valid */
     ASYNC_FRAME_AWAITER = 4,      /* i8*: frame waiting on this one (or null) */
     ASYNC_FRAME_AWAITER_STEP = 5, /* void(i8*)*: awaiter's resume fn (or null) */
-    ASYNC_FRAME_RESULT = 6,       /* i64: the return value, encoded to the slot
-                                   * width by coerce_to_frame_result and decoded
-                                   * back to the callee's declared type by
-                                   * coerce_from_frame_result. The slot stays 64
-                                   * bits (every frame shares this header
-                                   * prefix, so its offsets cannot depend on one
-                                   * body's return type); the *encoding* is
-                                   * type-directed, so a narrower or unsigned
-                                   * type survives it. */
+    ASYNC_FRAME_RESULT = 6,       /* 内部辅助实现 */
     ASYNC_FRAME_CLEANUP = 7,      /* void(i8*)*: releases owned slots + frees the frame */
     ASYNC_FRAME_HCOUNT = 8,       /* i32: try handlers currently armed by this frame */
-    ASYNC_FRAME_SELF_STEP = 9,    /* void(i8*)*: this frame's own resume/step fn.
-                                   * The ramp stores its $resume here so an awaiter
-                                   * can drive the sub-task without knowing its name
-                                   * -- required for awaiting an indirect (delegate)
-                                   * async call, whose callee has no static name. */
+    ASYNC_FRAME_SELF_STEP = 9,    /* void(i8*)*: this frame's own resume/step fn */
     ASYNC_FRAME_EXC = 10,         /* i8*: exception this coroutine completed with */
     ASYNC_FRAME_EXC_TID = 11,     /* i8*: its class type descriptor (or null) */
     ASYNC_FRAME_EXC_OWNED = 12,   /* i32: the exception carries a +1 reference */
-    ASYNC_FRAME_CANCEL = 13,      /* i32: 1 once cancellation was requested
-                                   * (Task.Cancel). Cooperative: the frame
-                                   * observes it at its next state block and
-                                   * completes early. In the shared header so
-                                   * __zan_co_cancel can set it through an i8*
-                                   * handle. */
-    ASYNC_FRAME_CHILD = 14,       /* i8*: the sub-frame this coroutine is
-                                   * currently suspended on (null while it runs
-                                   * or waits on a timer/IO), so cancellation
-                                   * propagates down the await chain. */
-    ASYNC_FRAME_LNEXT = 15,       /* i8*: intrusive link of the live detached
-                                   * (Task.Spawn) frame list rooted at the
-                                   * module's __zan_co_live; a spawn handle can
-                                   * outlive the coroutine (the reaper frees the
-                                   * frame), so Task.Cancel checks the handle
-                                   * against this list. */
-    ASYNC_FRAME_PENDING_COUNT = 16, /* i32: live pending exits, past the shared
-                                    * 16-field runtime header */
-    ASYNC_FRAME_HSTACK = 17,      /* [ntries x i32]: ids of the try
-                                   * handlers this frame has armed, innermost
-                                   * last -- re-armed at each resume (see
-                                   * emit_async_eh_prologue). ntries is this
-                                   * body's try count (current_async_handler_cap),
-                                   * an exact bound: ids are handed out one per
-                                   * lowered try. */
-    ASYNC_FRAME_CEXC = 18,        /* [ntries x i8*]: the exception each
-                                   * open catch is currently handling, indexed by
-                                   * the try's compile-time handler id. Frame- (not
-                                   * stack-) resident because an await inside a
-                                   * catch body returns from this $resume
-                                   * invocation: its allocas are garbage when the
-                                   * catch epilogue resumes and releases. */
-    ASYNC_FRAME_CEXC_OWNED = 19,  /* [ntries x i32]: whether that
-                                   * exception carries the in-flight +1 */
-    ASYNC_FRAME_CEXC_TID = 20,    /* [ntries x i8*]: that exception's
-                                   * class type descriptor, so a bare `throw;`
-                                   * rethrows with the original dynamic type
-                                   * even after an await (or a nested throw)
-                                   * has overwritten the in-flight global */
-    ASYNC_FRAME_PENDING = 21,    /* [{i64 value, ptr tid, i32 kind, aggregate?}]:
-                                   * pending returns and saved exceptions */
+    ASYNC_FRAME_CANCEL = 13,      /* i32: 1 once cancellation was requested (Task */
+    ASYNC_FRAME_CHILD = 14,       /* 内部辅助实现 */
+    ASYNC_FRAME_LNEXT = 15,       /* i8*: intrusive link of the live detached (Task */
+    ASYNC_FRAME_PENDING_COUNT = 16, /* i32: live pending exits, past the shared 16-field runtime header */
+    ASYNC_FRAME_HSTACK = 17,      /* 内部辅助实现 */
+    ASYNC_FRAME_CEXC = 18,        /* 内部辅助逻辑 */
+    ASYNC_FRAME_CEXC_OWNED = 19,  /* [ntries x i32]: whether that exception carries the in-flight +1 */
+    ASYNC_FRAME_CEXC_TID = 20,    /* 内部辅助实现 */
+    ASYNC_FRAME_PENDING = 21,    /* 内部辅助逻辑 */
     ASYNC_FRAME_HPENDING = 22,   /* [ntries x i32]: pending depth at try entry */
     ASYNC_FRAME_FIRST_PARAM = 23
 };
@@ -145,15 +88,7 @@ static void emit_async_eh_unarm(zan_irgen_t *g);
 static LLVMBasicBlockRef get_async_suspend_ret_bb(zan_irgen_t *g);
 static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub, LLVMValueRef tmp_mark);
 
-/* Shared lowering for the Task instance members (`t.Wait()`, `t.Result`,
- * `t.IsCompleted`; the spawn-side lives in irgen_call.c). `hp` is the task's
- * frame pointer (a spawned coroutine handle). Wait pumps the cooperative
- * driver until that frame is done — the only way a synchronous context can
- * let a spawned coroutine make progress; IsCompleted is a non-pumping probe;
- * Result reads the frame's result slot (decoded to `rt`) and reaps the frame.
- * mode: 0 = Wait on Task (pump only; its spawn installed the reaper),
- * 1 = Result (pump, read, reap), 2 = IsCompleted, 3 = Wait on Task<T>
- * (pump, reap; the result is discarded). */
+/* Shared lowering for the Task instance members (`t */
 static LLVMValueRef emit_task_member(zan_irgen_t *g, LLVMValueRef hp,
                                      zan_type_t *rt, int mode) {
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -175,17 +110,12 @@ static LLVMValueRef emit_task_member(zan_irgen_t *g, LLVMValueRef hp,
                                 LLVMConstInt(LLVMTypeOf(dn), 0, 0), "tk.dn1");
     LLVMBuildCondBr(g->builder, dn1, done_bb, pump_bb);
     LLVMPositionBuilderAtEnd(g->builder, pump_bb);
-    /* Drains rather than stopping at this frame's DONE flag: a spawned frame is
-     * reaped (freed) once it completes, so its flag must not be watched from
-     * outside -- the loop above re-tests through __zan_co_isdone, which checks
-     * the live registry first. */
+    /* 内部辅助实现 */
     zan_call2(g->builder, g->rt_co_sched_run_type, g->rt_co_sched_run, NULL, 0, "");
     LLVMBuildBr(g->builder, test_bb);
     LLVMPositionBuilderAtEnd(g->builder, done_bb);
     if (mode == 1) {
-        /* Task<T>.Result: read the frame's result slot, decode it to T, then
-         * reap the frame (untrack + free): its spawn left it alive precisely
-         * so the result could be read here. */
+        /* Task<T> */
         LLVMValueRef rp = LLVMBuildStructGEP2(g->builder, g->co_header_type,
             hp, ASYNC_FRAME_RESULT, "tk.resp");
         LLVMValueRef raw = LLVMBuildLoad2(g->builder, i64t, rp, "tk.raw");
@@ -195,17 +125,14 @@ static LLVMValueRef emit_task_member(zan_irgen_t *g, LLVMValueRef hp,
         return val;
     }
     if (mode == 3) {
-        /* Wait on a Task<T> owns the frame too (Result is the other consumer,
-         * so exactly one of them terminates the task): reap it once done. */
+        /* 内部辅助逻辑 */
         LLVMValueRef reap = get_co_reap_fn(g);
         zan_call2(g->builder, LLVMGlobalGetValueType(reap), reap, &hp, 1, "");
     }
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }
 
-/* A "name path" is a chain of identifiers joined by member access, e.g.
- * `Foo.Bar.Widget` — the syntactic form of a namespace-qualified type
- * reference. It contains no calls, indexes, `this`/`base`, etc. */
+/* A "name path" is a chain of identifiers joined by member access, e */
 static bool is_name_path(zan_ast_node_t *node) {
     if (!node) return false;
     if (node->kind == AST_IDENTIFIER) return true;
@@ -213,17 +140,13 @@ static bool is_name_path(zan_ast_node_t *node) {
     return false;
 }
 
-/* Leftmost identifier of a name path (the outermost namespace segment). */
+/* Leftmost identifier of a name path (the outermost namespace segment) */
 static zan_ast_node_t *name_path_head(zan_ast_node_t *node) {
     while (node && node->kind == AST_MEMBER_ACCESS) node = node->member.object;
     return (node && node->kind == AST_IDENTIFIER) ? node : NULL;
 }
 
-/* C# conversion rules: implicit narrowing is rejected when the destination
- * cannot hold every source value. `nint -> int` is an unconditional compile
- * error (int is 32-bit, so a pointer-width handle would truncate); other
- * numeric narrowing stays available as the opt-in ZAN_WARN_NARROW=1
- * migration diagnostic. */
+/* 内部辅助逻辑 */
 static int conv_rank(zan_type_t *t) {
     if (!t) return 0;
     switch (t->kind) {
@@ -242,13 +165,8 @@ static bool narrow_warn_enabled(void) {
     return state == 1;
 }
 
-/* C# implicit constant expression conversion: `byte b = 255;` is legal without
- * a cast because the value is known at compile time and fits. Only a constant
- * integer expression qualifies, so this folds literals and the operators a
- * constant can be spelled with, and reports "not constant" for anything else. */
-/* Fold in unsigned arithmetic: signed overflow during constant folding is
- * C-level UB in the compiler itself, while the wrap-around two's-complement
- * result is exactly what the folded value means. */
+/* 内部辅助实现 */
+/* 内部辅助逻辑 */
 static bool const_int_expr(zan_ast_node_t *e, int64_t *out) {
     if (!e) return false;
     switch (e->kind) {
@@ -316,15 +234,10 @@ static void check_implicit_narrowing(zan_irgen_t *g, zan_type_t *dst,
     bool src_float = src->kind == TYPE_FLOAT || src->kind == TYPE_DOUBLE;
     if (!rd || (!rs && !src_float)) return;
 
-    /* A native handle must not silently enter a fixed-width sub-64-bit
-     * carrier. This is a correctness boundary, not a style warning: the upper
-     * pointer bits are lost before the value reaches the runtime/FFI call. */
+    /* A native handle must not silently enter a fixed-width sub-64-bit carrier */
     bool native_handle_loss =
         src->kind == TYPE_NINT && dst->kind != TYPE_NINT && rd < 8;
-    /* An implicit float/double -> integral conversion is not a truncation but
-     * a bit-pattern misread (3.14 does not become 3; it becomes the low bits
-     * of the double representation), so it is an unconditional error even
-     * though integer narrowing stays an opt-in migration diagnostic. */
+    /* 内部辅助逻辑 */
     bool float_to_int_loss = src_float && rd != 0;
     bool loses = src_float || rs > rd || native_handle_loss;
     if (!loses) return;
@@ -345,17 +258,14 @@ static void check_implicit_narrowing(zan_irgen_t *g, zan_type_t *dst,
 static zan_symbol_t *find_user_conversion(zan_irgen_t *g, zan_type_t *from_type,
                                           zan_type_t *to_type, const char *op_name);
 
-/* A value struct and a primitive are unrelated types; without this check the
- * mismatch only surfaces as an LLVM verification failure with no source
- * location. */
+/* 内部辅助逻辑 */
 static void check_value_type_mismatch(zan_irgen_t *g, zan_type_t *dst, zan_type_t *src,
                                       zan_ast_node_t *at, const char *what) {
     if (!g || !g->diag || !at || !dst || !src) return;
     if (dst->kind == src->kind) return;
     bool dst_struct = dst->kind == TYPE_STRUCT, src_struct = src->kind == TYPE_STRUCT;
     if (dst_struct == src_struct) return;
-    /* A user-defined implicit conversion makes a struct↔primitive pair a real
-     * conversion rather than an unrelated-type mistake. */
+    /* 内部辅助逻辑 */
     if (find_user_conversion(g, src, dst, "op_implicit")) return;
     bool other_prim = (dst_struct ? conv_rank(src) : conv_rank(dst)) != 0 ||
                       (dst_struct ? src->kind : dst->kind) == TYPE_FLOAT ||
@@ -369,9 +279,7 @@ static void check_value_type_mismatch(zan_irgen_t *g, zan_type_t *dst, zan_type_
                   dst->name.str ? dst->name.str : "?", what);
 }
 
-/* Render `t`'s display name including generic arguments, arrays and nullable
- * into `buf` (truncated to `cap`). The generic-invariance diagnostic needs to
- * show List<int> vs List<Box>, not two bare "List"s. */
+/* 内部辅助逻辑 */
 static int render_type_full(zan_type_t *t, char *buf, int cap) {
     if (!t || cap <= 1) return 0;
     int n = 0;
@@ -406,9 +314,7 @@ static int render_type_full(zan_type_t *t, char *buf, int cap) {
     return n;
 }
 
-/* Structural equality of two types, recursing into generic type arguments.
- * Used to compare a container's concrete type arguments (List<int> vs
- * List<Box>), which are otherwise erased to the same object pointer in IR. */
+/* Structural equality of two types, recursing into generic type arguments */
 static bool type_full_equal(zan_type_t *a, zan_type_t *b) {
     if (a == b) return true;
     if (!a || !b) return false;
@@ -422,11 +328,7 @@ static bool type_full_equal(zan_type_t *a, zan_type_t *b) {
     return true;
 }
 
-/* True when `t` (recursively, through generic arguments and array/nullable
- * element types) mentions an unresolved type parameter or error type. Such
- * types appear in generic bodies while T is unbound and are compared at
- * instantiation time; skipping them here avoids false positives when the
- * outer comparison is legitimate but an inner T is not yet concrete. */
+/* 内部辅助实现 */
 static bool type_has_unresolved(zan_type_t *t) {
     if (!t) return true;
     if (t->kind == TYPE_ERROR || t->kind == TYPE_TYPE_PARAM) return true;
@@ -436,12 +338,7 @@ static bool type_has_unresolved(zan_type_t *t) {
     return false;
 }
 
-/* Generic type arguments are invariant: List<int> is not a List<Box>, even
- * though both erase to the same object pointer. Without this check a method
- * taking List<ChartData> could be handed a List<int> whose elements are then
- * dereferenced as ChartData*. Reject a mismatch when both sides are resolved
- * enough to compare; unresolved (error / type-param) arguments are skipped so
- * earlier phase failures do not cascade. */
+/* 内部辅助逻辑 */
 static void check_generic_invariance(zan_irgen_t *g, zan_type_t *dst, zan_type_t *src,
                                      zan_ast_node_t *at, const char *what) {
     if (!g || !g->diag || !at || !dst || !src) return;
@@ -469,9 +366,7 @@ static void check_generic_invariance(zan_irgen_t *g, zan_type_t *dst, zan_type_t
 
 static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 
-/* The declared type of a field, read through a receiver of type `owner`: a
- * field declared List<T> on Box<Square> reads back as List<Square>, so its
- * elements are loaded with the real element type instead of the erased T. */
+/* 内部辅助逻辑 */
 static zan_type_t *field_type_through(zan_irgen_t *g, zan_symbol_t *fsym,
                                      zan_type_t *owner) {
     if (!fsym) return NULL;
@@ -491,8 +386,7 @@ static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *local
             zan_symbol_t *fsym = get_field_sym(l->type->sym, member->member.name);
             if (fsym) return field_type_through(g, fsym, l->type);
         }
-        /* ClassName.StaticField: obj names a class (not a shadowing local) and
-         * member is one of its static fields. */
+        /* ClassName */
         if (!l && g && g->binder) {
             zan_symbol_t *cs = zan_binder_lookup(g->binder, obj->ident.name);
             if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
@@ -500,9 +394,7 @@ static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *local
                 if (fsym) return fsym->type;
             }
         }
-        /* EnumType.Member: the constant's type is the enum itself, so a
-         * chained call (`Color.Red.ToString()`) infers an enum receiver and
-         * reaches the compiler-lowered scalar handling. */
+        /* EnumType */
         if (!l && g && g->binder) {
             zan_symbol_t *es = zan_binder_lookup(g->binder, obj->ident.name);
             if (es && es->kind == SYM_ENUM) {
@@ -517,8 +409,7 @@ static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *local
                 }
             }
         }
-        /* not a local: could be an implicit `this` field whose own type is a
-         * class, e.g. `field.subfield` inside a method. */
+        /* not a local: could be an implicit `this` field whose own type is a class, e */
         if (g && g->current_type_sym) {
             zan_symbol_t *ofsym = get_field_sym(g->current_type_sym, obj->ident.name);
             if (ofsym && ofsym->type && ofsym->type->sym) {
@@ -527,17 +418,13 @@ static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *local
             }
         }
     }
-    /* explicit `this.field` / `base.field` — resolve against the current type. */
+    /* explicit `this */
     if ((obj->kind == AST_THIS_EXPR || obj->kind == AST_BASE_EXPR) &&
         g && g->current_type_sym) {
         zan_symbol_t *fsym = get_field_sym(g->current_type_sym, member->member.name);
         if (fsym) return fsym->type;
     }
-    /* General case: the object is any expression whose static type is a
-     * class/struct — e.g. `arr[i].field`, `a.b.field`, `make().field`. Infer
-     * the object's type and look the field up on it. This is what lets chained
-     * subscripts like `arr[i].values[j]` recover the element type (without it
-     * the AST_INDEX codegen falls back to a zero constant). */
+    /* 内部辅助逻辑 */
     {
         zan_type_t *ot = infer_expr_type(g, obj, locals);
         if (ot && ot->sym) {
@@ -553,7 +440,7 @@ static zan_type_t *container_elem_type(zan_type_t *t);
 static zan_type_t *generic_method_ret(zan_irgen_t *g, zan_symbol_t *msym,
                                       zan_ast_node_t *call, local_scope_t *locals);
 
-/* Render a type reference's display name (with generic args, [] and ?). */
+/* Render a type reference's display name (with generic args, [] and ?) */
 static int render_type_ref_name(const zan_ast_node_t *t, char *buf, int cap) {
     int n = 0;
     if (t && t->kind == AST_TYPE_REF && cap > 1) {
@@ -583,9 +470,7 @@ static int render_type_ref_name(const zan_ast_node_t *t, char *buf, int cap) {
     return n;
 }
 
-/* Best-effort static test for whether an expression yields a `string` value.
- * Used to route `+` to concatenation and `==`/`!=` to strcmp rather than raw
- * pointer arithmetic/comparison. Reference (class) values are NOT strings. */
+/* Best-effort static test for whether an expression yields a `string` value */
 static bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
     if (!e || !locals) return false;
     switch (e->kind) {
@@ -607,9 +492,7 @@ static bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *loc
         return ft && ft->kind == TYPE_STRING;
     }
     case AST_INDEX: {
-        /* Indexing a List<string>/string[] yields a borrowed string element.
-         * Recognising it keeps `a + list[i]` from releasing the element (which
-         * is still owned by the container). */
+        /* Indexing a List<string>/string[] yields a borrowed string element */
         zan_type_t *ot = infer_expr_type(g, e->index.object, locals);
         zan_type_t *et;
         if (ot && type_named(ot, "Dict", 4) &&
@@ -620,11 +503,7 @@ static bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *loc
         return et && et->kind == TYPE_STRING;
     }
     case AST_CONDITIONAL:
-        /* A conditional whose branches are strings yields a borrowed string PHI.
-         * Recognising it stops the string-concat cleanup from releasing the PHI
-         * (an over-release of a borrowed/static reference that corrupts the heap
-         * once the freed slot is reused). Ownership, when a branch is owned, is
-         * decided separately by expr_yields_owned_rc_value. */
+        /* A conditional whose branches are strings yields a borrowed string PHI */
         return is_string_expr(g, e->conditional.then_expr, locals) &&
                is_string_expr(g, e->conditional.else_expr, locals);
     case AST_BINARY:
@@ -678,14 +557,14 @@ static zan_type_t *dict_value_type(zan_type_t *t) {
     return t->type_args[1];
 }
 
-/* forward decls into irgen_expr.c (same translation unit, included later) */
+/* forward decls into irgen_expr */
 static bool type_mentions_tp(zan_type_t *t);
 static zan_type_t *method_param_type_at(zan_irgen_t *g, zan_symbol_t *msym,
                                         int idx, zan_ast_node_t *call,
                                         zan_ast_node_t *recv_expr,
                                         local_scope_t *locals);
 
-/* Structural equality of two fully concrete types (no type parameters). */
+/* Structural equality of two fully concrete types (no type parameters) */
 static bool types_concrete_equal(zan_type_t *a, zan_type_t *b) {
     if (!a || !b) return false;
     if (a->kind != b->kind) return false;
@@ -705,11 +584,7 @@ static bool types_concrete_equal(zan_type_t *a, zan_type_t *b) {
     return true;
 }
 
-/* Structural equality that reads a type parameter as a wildcard, so a
- * declared `Col<T>` matches an argument of `Col<Item>`. Overloads that differ
- * only inside their type arguments -- `Bag(Col<T>)` against
- * `Bag(List<Col<T>>)` -- are indistinguishable otherwise, because every
- * T-mentioning parameter is skipped and declaration order decides. */
+/* 内部辅助实现 */
 static bool types_match_modulo_tp(zan_type_t *a, zan_type_t *b) {
     if (!a || !b) return false;
     if (a->kind == TYPE_TYPE_PARAM || b->kind == TYPE_TYPE_PARAM) return true;
@@ -730,8 +605,7 @@ static bool types_match_modulo_tp(zan_type_t *a, zan_type_t *b) {
     return true;
 }
 
-/* Coarse type family used to rank overload candidates: 0 = unknown (never
- * ranked against), then bool / integral / floating / string / reference. */
+/* 内部辅助逻辑 */
 enum { FAM_UNKNOWN = 0, FAM_BOOL, FAM_INT, FAM_FLOAT, FAM_STRING, FAM_REF };
 
 static int type_family(zan_type_t *t) {
@@ -749,10 +623,7 @@ static int type_family(zan_type_t *t) {
     }
 }
 
-/* True when `s` is string and `b` a byte buffer (byte[]/sbyte[]/char[]). Both
- * are the same pointer to a NUL-terminated payload at runtime, and the stdlib
- * relies on it: wire data is built in a byte[] and read back through string
- * parameters. */
+/* True when `s` is string and `b` a byte buffer (byte[]/sbyte[]/char[]) */
 static bool str_and_byte_buffer(zan_type_t *s, zan_type_t *b) {
     if (!s || !b || s->kind != TYPE_STRING || b->kind != TYPE_ARRAY) return false;
     zan_type_t *e = b->element_type;
@@ -760,14 +631,7 @@ static bool str_and_byte_buffer(zan_type_t *s, zan_type_t *b) {
                  e->kind == TYPE_CHAR);
 }
 
-/* A block-bodied lambda's natural return type: the one type all of its
- * `return` expressions agree on (C#'s natural-type rule). Walks the
- * straight-line statements and if/else arms, registering local declarations
- * so later returns can reference them; a loop/switch/try anywhere makes the
- * walk give up (NULL — the caller keeps neutral ranking rather than
- * guessing), and a nested lambda's returns belong to that lambda. This is
- * what lets a statement lambda rank delegate overloads that differ only in
- * return type; without it every candidate ties and declaration order decides. */
+/* 内部辅助实现 */
 static void stmt_collect_return_types(zan_irgen_t *g, zan_ast_node_t *stmt,
                                       local_scope_t *locals,
                                       zan_type_t **found, int *mixed) {
@@ -794,8 +658,7 @@ static void stmt_collect_return_types(zan_irgen_t *g, zan_ast_node_t *stmt,
                                       found, mixed);
         return;
     case AST_VAR_DECL:
-        /* a local the trailing returns may reference: type its initializer
-         * with what is in scope so far and add it, mirroring emission order */
+        /* 内部辅助逻辑 */
         if (stmt->var_decl.initializer) {
             zan_type_t *t = infer_expr_type(g, stmt->var_decl.initializer, locals);
             if (t) local_add(locals, stmt->var_decl.name, NULL, t);
@@ -821,10 +684,7 @@ static zan_type_t *stmt_lambda_return_type(zan_irgen_t *g, zan_ast_node_t *body,
     return mixed ? NULL : found;
 }
 
-/* Type of an expression-bodied lambda read against a delegate signature: its
- * parameters take the delegate's types, so `i => Wrap(i.name)` types as what
- * Wrap returns. A block body types through its return statements instead
- * (stmt_lambda_return_type). NULL when nothing resolves. */
+/* 内部辅助实现 */
 static zan_type_t *lambda_body_type(zan_irgen_t *g, zan_ast_node_t *lam,
                                     zan_type_t *dt, local_scope_t *locals) {
     if (!lam || !dt || !locals) return NULL;
@@ -844,11 +704,7 @@ static zan_type_t *lambda_body_type(zan_irgen_t *g, zan_ast_node_t *lam,
     return bt;
 }
 
-/* A static method named but not called -- `RecentRow.Of` -- is a method group:
- * like a lambda it converts to a delegate parameter and to nothing else, and it
- * has no type of its own to rank by. Returns the referenced method (preferring
- * the overload of `arity` parameters, -1 = any), NULL when the expression is
- * not a static method reference. */
+/* A static method named but not called -- `RecentRow */
 static zan_symbol_t *arg_method_group(zan_irgen_t *g, zan_ast_node_t *a,
                                       local_scope_t *locals, int arity) {
     if (!a || a->kind != AST_MEMBER_ACCESS) return NULL;
@@ -865,9 +721,7 @@ static zan_symbol_t *arg_method_group(zan_irgen_t *g, zan_ast_node_t *a,
     return m;
 }
 
-/* Ranks a method-group argument against a candidate's parameter type the way
- * the lambda branch ranks a lambda: -1 when the parameter is not a delegate of
- * the method's shape, otherwise 2 plus 2 for a matching return type. */
+/* 内部辅助逻辑 */
 static int method_group_score(zan_irgen_t *g, zan_symbol_t *mg, zan_type_t *pt) {
     if (!pt || pt->kind != TYPE_DELEGATE) return -1;
     if (mg->decl->method_decl.params.count != pt->delegate_param_count) return -1;
@@ -877,10 +731,7 @@ static int method_group_score(zan_irgen_t *g, zan_symbol_t *mg, zan_type_t *pt) 
         : NULL;
     zan_type_t *dr = pt->delegate_ret_type;
     if (rt && dr && !type_mentions_tp(rt) && !type_mentions_tp(dr)) {
-        /* An exact return type settles two delegate overloads of the same
-         * arity; a different family (a control where text is wanted) rules the
-         * candidate out. A merely derived return type stays acceptable, so two
-         * reference returns are never ranked against each other. */
+        /* 内部辅助实现 */
         if (types_concrete_equal(rt, dr)) score += 2;
         else if (type_family(rt) != type_family(dr) &&
                  type_family(rt) != FAM_UNKNOWN &&
@@ -922,11 +773,7 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
         bool compatible = true;
         if (entry->decl && locals) {
             for (int j = 0; j < argc; j++) {
-                /* A named argument (`new T(y: 2, x: 1)`) does not occupy the
-                 * slot its name targets before reorder_named_args_impl runs
-                 * (after selection). Score it against the parameter whose
-                 * name matches, so the right overload is chosen and the
-                 * argument list is then reordered in place. */
+                /* 内部辅助实现 */
                 zan_ast_node_t *arg = args->items[j];
                 if (arg && arg->kind == AST_NAMED_ARG) {
                     int target = -1;
@@ -959,10 +806,7 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                 }
                 zan_ast_node_t *param = entry->decl->method_decl.params.items[j];
                 zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
-                /* A lambda converts to a delegate parameter and to nothing
-                 * else, so it both picks the delegate overload and rules the
-                 * others out. Ranking it by inferred type cannot work: a
-                 * lambda expression has no type of its own. */
+                /* 内部辅助实现 */
                 if (pt && args->items[j] && args->items[j]->kind == AST_LAMBDA) {
                     zan_ast_node_t *lam = args->items[j];
                     if (pt->kind != TYPE_DELEGATE ||
@@ -971,21 +815,14 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                         break;
                     }
                     score += 2;
-                    /* Two delegate overloads differ by what the lambda
-                     * returns, so the body's type decides between them: a row
-                     * template returning a control must not bind to the
-                     * column overload that returns a string. */
+                    /* 内部辅助实现 */
                     zan_type_t *bt = lambda_body_type(g, lam, pt, locals);
                     if (bt && pt->delegate_ret_type &&
                         types_concrete_equal(bt, pt->delegate_ret_type))
                         score += 2;
                     continue;
                 }
-                /* A method group is the same kind of argument as a lambda:
-                 * it only converts to a delegate, so a non-delegate parameter
-                 * rules the candidate out instead of scoring zero and letting
-                 * declaration order pick it (that would bind a function
-                 * pointer into an ARC field). */
+                /* 内部辅助实现 */
                 zan_symbol_t *mg = arg_method_group(
                     g, args->items[j], locals,
                     (pt && pt->kind == TYPE_DELEGATE)
@@ -998,10 +835,7 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                 }
                 zan_type_t *at = infer_expr_type(g, args->items[j], locals);
                 if (pt && at && type_mentions_tp(pt) && !type_mentions_tp(at)) {
-                    /* The parameter is phrased in the class's own type
-                     * parameters; rank it by shape rather than skipping it,
-                     * but never disqualify on it -- unifying the argument
-                     * against the declaration is the binder's job. */
+                    /* 内部辅助实现 */
                     if (types_match_modulo_tp(pt, at)) score += 3;
                     continue;
                 }
@@ -1057,17 +891,11 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
             best_score = score;
         }
     }
-    /* Without a local scope no argument can be typed, so nothing above ran and
-     * `best` stays unset. Returning the first constructor of matching arity
-     * would pick by declaration order and quietly run the wrong initializer;
-     * callers all treat NULL as "unresolved" and report, so hand them that. */
+    /* 内部辅助逻辑 */
     return best;
 }
 
-/* A primitive value may be materialized as a class only when the destination
- * declares a matching one-argument constructor. This is deliberately narrow:
- * reference-to-reference assignment remains the normal path, while a raw
- * integer/bool must never reach emit_boundary_coerce as an inttoptr. */
+/* 内部辅助逻辑 */
 static bool is_implicit_ctor_source(zan_type_t *t) {
     if (!t) return false;
     switch (t->kind) {
@@ -1095,12 +923,7 @@ static bool implicit_ctor_for_arg(zan_irgen_t *g, zan_type_t *target,
     return find_ctor(g, target->sym, &one, locals, NULL) != NULL;
 }
 
-/* A constructor call that leaves trailing defaulted parameters out
- * (`A(int x, int y = 5)` invoked as `new A(1)`) matches no entry on arity;
- * without this the object keeps zeroed fields and no constructor runs.
- * Extend the argument list with the declared default expressions -- the call
- * site is where C# evaluates them -- and report whether a constructor of the
- * resulting arity exists. */
+/* 内部辅助实现 */
 static bool fill_ctor_default_args(zan_irgen_t *g, zan_symbol_t *type_sym,
                                    const zan_ast_list_t *args,
                                    zan_ast_list_t *out) {
@@ -1129,9 +952,7 @@ static bool fill_ctor_default_args(zan_irgen_t *g, zan_symbol_t *type_sym,
     return false;
 }
 
-/* Type family of an expression, recognising the comparison/logical/arithmetic
- * shapes infer_expr_type leaves untyped (a lambda body like `u.age >= 18` or
- * `x * 2` still ranks against a delegate's declared return type). */
+/* 内部辅助逻辑 */
 static int expr_family(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
     if (!e) return FAM_UNKNOWN;
     switch (e->kind) {
@@ -1171,9 +992,7 @@ static int expr_family(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals)
     }
 }
 
-/* Rank one argument against a concrete parameter type: -1 disqualifies the
- * candidate, otherwise the score this argument contributes. Shared by the
- * fixed parameters and by the params tail, which applies it per element. */
+/* 内部辅助逻辑 */
 static int concrete_arg_score(zan_irgen_t *g, zan_type_t *pt,
                               zan_ast_node_t *a, local_scope_t *locals) {
     zan_type_t *at = infer_expr_type(g, a, locals);
@@ -1186,11 +1005,7 @@ static int concrete_arg_score(zan_irgen_t *g, zan_type_t *pt,
         if (implicit_ctor_for_arg(g, pt, at, a, locals)) return 1;
         /* integer arguments widen to floating parameters */
         if (pf == FAM_FLOAT && af == FAM_INT) return 0;
-        /* A string and a byte buffer share one pointer carrier at runtime,
-         * and the stdlib leans on it: random bytes flow into Fill's
-         * `string buf` extern as a byte[], wire data crosses both shapes.
-         * Score it neutrally instead of disqualifying -- a candidate that is
-         * the only arity match must stay selectable. */
+        /* 内部辅助实现 */
         if (str_and_byte_buffer(pt, at) || str_and_byte_buffer(at, pt)) return 0;
         return -1;
     }
@@ -1202,13 +1017,7 @@ static int concrete_arg_score(zan_irgen_t *g, zan_type_t *pt,
     return -1;
 }
 
-/* Rank the arguments of one candidate against the call: -1 = incompatible,
- * otherwise a score raised by each argument whose type agrees with the
- * candidate's declared parameter type. `p0` is the parameter index that call
- * argument 0 binds to (1 for extension-style invocation, 0 for direct calls).
- * Lambdas rank by their body's type family against the delegate's declared
- * return type; other arguments rank by structural / family agreement with a
- * concrete (non-generic) parameter type. */
+/* 内部辅助实现 */
 static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
                              zan_ast_node_t *call, zan_ast_node_t *recv_expr,
                              local_scope_t *locals, int p0) {
@@ -1218,11 +1027,7 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
     for (int j = p0; j < ps->count; j++) {
         int ai = j - p0;
         if (ai >= call->call.args.count) break;
-        /* The params tail takes every remaining argument as an element, so it
-         * must be ranked against the element type: comparing an element with
-         * the array type would disqualify the only candidate that can take the
-         * call (`Calc.Sum(1, 2, 3)`), while ranking on the element type is what
-         * tells `op_call(params double[])` from `op_call(params string[])`. */
+        /* 内部辅助实现 */
         if (ps->items[j]->kind == AST_PARAM && ps->items[j]->param.is_params) {
             zan_type_t *bundle = method_param_type(g, m, j);
             if (!bundle || bundle->kind != TYPE_ARRAY ||
@@ -1247,10 +1052,7 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
         zan_ast_node_t *a = call->call.args.items[ai];
         if (!a) continue;
         if (a->kind == AST_NAMED_ARG) {
-            /* A named argument's position in the source list does not match
-             * its parameter slot before reorder_named_args runs; it cannot be
-             * scored here. Stay neutral (score unchanged) and let arity decide,
-             * which is exact: named and positional arguments both count. */
+            /* 内部辅助实现 */
             continue;
         }
         if (a->kind == AST_LAMBDA) {
@@ -1267,9 +1069,7 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
                     : dp->delegate_param_types[k];
                 local_add(locals, lp->param.name, NULL, lpt);
             }
-            /* Block bodies rank by their return statements' common type:
-             * without it every delegate overload ties and declaration order
-             * decides. NULL keeps the neutral score. */
+            /* 内部辅助逻辑 */
             int bf = FAM_UNKNOWN;
             if (body->kind == AST_BLOCK) {
                 zan_type_t *bt = stmt_lambda_return_type(g, body, locals);
@@ -1295,28 +1095,18 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
             score += ms;
             continue;
         }
-        /* The bound parameter type, not a fresh resolve: a class type
-         * parameter (`Binding<T>.Set(T v)`) must stay a TYPE_TYPE_PARAM here
-         * even when the user declared `class T`, or the parameter reads as a
-         * concrete user type and disqualifies the only matching overload
-         * (see method_param_type). */
+        /* 内部辅助逻辑 */
         zan_type_t *pt = method_param_type(g, m, j);
         if (!pt) continue;
         if (type_mentions_tp(pt)) {
-            /* A parameter written over the class's own type parameters has no
-             * family to rank by, but its shape still tells it apart from an
-             * inherited overload: `DataGrid<T>.Add(GridColumn<T>)` has to beat
-             * `Control.Add(Control)` for a GridColumn argument. A bare `T`
-             * matches anything, so it stays neutral. */
+            /* 内部辅助实现 */
             if (pt->kind != TYPE_TYPE_PARAM) {
                 zan_type_t *gat = infer_expr_type(g, a, locals);
                 if (gat && types_match_modulo_tp(pt, gat)) score += 3;
             }
             continue;
         }
-        /* An interface parameter takes any implementing class; scoring
-         * cannot see the implements list, so it stays neutral here
-         * instead of disqualifying the candidate. */
+        /* 内部辅助逻辑 */
         if (pt->kind == TYPE_INTERFACE) continue;
         int s = concrete_arg_score(g, pt, a, locals);
         if (s < 0) return -1;
@@ -1325,8 +1115,7 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
     return score;
 }
 
-/* The symbol-only implements walk cannot distinguish generic instantiations;
- * keep those receivers on the existing type-argument matching path. */
+/* 内部辅助逻辑 */
 static bool ext_receiver_interface_match(zan_type_t *pt, zan_type_t *recv_ty) {
     return pt && recv_ty && pt->kind == TYPE_INTERFACE &&
            pt->type_arg_count == 0 &&
@@ -1334,10 +1123,7 @@ static bool ext_receiver_interface_match(zan_type_t *pt, zan_type_t *recv_ty) {
            class_implements_iface(recv_ty->sym, pt->sym);
 }
 
-/* Rank one extension-method candidate against the call: -1 = incompatible
- * (a fully typed receiver or lambda return that contradicts the call),
- * otherwise a score where a concrete receiver match and each lambda whose
- * body agrees with the delegate's return type raise the rank. */
+/* 内部辅助实现 */
 static int ext_method_score(zan_irgen_t *g, zan_symbol_t *m,
                             zan_type_t *recv_ty, zan_ast_node_t *call,
                             zan_ast_node_t *recv_expr, local_scope_t *locals) {
@@ -1354,14 +1140,7 @@ static int ext_method_score(zan_irgen_t *g, zan_symbol_t *m,
     return score + as;
 }
 
-/* Extension method lookup: a static method whose first parameter is declared
- * `this T` extends T; `recv.M(args)` resolves to it when no instance method
- * matches. Candidates match on method name, arity, and the receiver's static
- * type; among several, the best-scoring one wins (a concretely typed receiver
- * beats a generic one, and a lambda argument's body must agree with the
- * delegate's declared return type). When every candidate is disqualified on
- * argument types the answer is "no extension method" -- binding the first
- * name/arity match would lower the call against a foreign signature. */
+/* 内部辅助逻辑 */
 static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
                                            zan_istr_t name, int argc,
                                            zan_ast_node_t *call,
@@ -1384,11 +1163,7 @@ static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
         if (!p0 || p0->kind != AST_PARAM || !p0->param.is_this) continue;
         zan_type_t *pt = zan_binder_resolve_type(g->binder, p0->param.type);
         if (!pt) continue;
-        /* A bare type parameter (`this T item`) extends every receiver kind:
-         * the kind gate below would compare TYPE_TYPE_PARAM against e.g.
-         * TYPE_STRING and skip the candidate for every receiver, so generic
-         * extensions never resolved. Scoring keeps concrete receivers ahead
-         * (ext_method_score leaves tp receivers at base score). */
+        /* 内部辅助实现 */
         if (pt->kind != TYPE_TYPE_PARAM &&
             !ext_receiver_interface_match(pt, recv_ty)) {
             if (pt->kind != recv_ty->kind) continue;
@@ -1406,12 +1181,7 @@ static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
     return (best && best_score >= 0) ? best : NULL;
 }
 
-/* SharedTable column widths: a shared table's schema is fixed when the
- * mapping is created -- rt_sync reserves the declared width per row, and a
- * width past its ceiling makes Create() answer false, so the program carries
- * on with its shared state quietly missing. A constant width is therefore
- * judged where it is written. The ceilings mirror ZAN_TABLE_MAX_* in
- * src/runtime/rt_sync.c. */
+/* 内部辅助实现 */
 #define IRGEN_SHARED_MAX_STRING 1048576
 #define IRGEN_SHARED_MAX_KEY 1024
 
@@ -1442,11 +1212,7 @@ static void check_shared_table_width(zan_irgen_t *g, zan_symbol_t *type_sym,
                   what, (long long)arg->int_val, limit);
 }
 
-/* Argument-type-aware overload resolution for direct method calls
- * (Type.Method(args) and recv.Method(args)): among same-named, same-arity
- * candidates pick the best-scoring one (see method_args_score); ties keep
- * declaration order, and when every candidate is disqualified or no arity
- * matches, fall back to plain resolve_overload. */
+/* Argument-type-aware overload resolution for direct method calls (Type */
 static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
                                             zan_symbol_t *type_sym,
                                             zan_istr_t name,
@@ -1459,13 +1225,7 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
     zan_symbol_t *best = NULL;
     int best_score = -1;
     int arity_matches = 0;
-    /* Candidates come from the whole inheritance chain: a same-named,
-     * same-arity method on the derived class does not hide the inherited
-     * overloads, so `Add(child)` in a class that also declares
-     * `Add(string)` still reaches `Control.Add(Control)` instead of
-     * picking the string one and recursing into itself. Derived
-     * candidates are visited first, so an override still wins its tie
-     * against the base declaration it replaces. */
+    /* 内部辅助实现 */
     zan_symbol_t *cls = type_sym;
     while (cls) {
         for (int i = 0; i < cls->member_count; i++) {
@@ -1474,11 +1234,7 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
                 m->decl->kind != AST_METHOD_DECL) continue;
             if (m->name.len != name.len ||
                 memcmp(m->name.str, name.str, name.len) != 0) continue;
-            /* Explicit type arguments pick the generic overload: without this
-             * filter `GetAsync<User>(key)` ties on argument scoring with a
-             * same-arity non-generic `GetAsync(key)`, and the call is emitted
-             * against the wrong signature while the checker has already typed
-             * the result as `User`. */
+            /* 内部辅助实现 */
             if (type_arg_count > 0 &&
                 m->decl->method_decl.type_params.count != type_arg_count)
                 continue;
@@ -1496,11 +1252,7 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
     }
     if (best && best_score >= 0) return best;
     if (arity_matches > 0) {
-        /* Every same-arity candidate was disqualified on concrete argument
-         * types. Falling back to the first declaration would lower the call
-         * against a foreign signature (pointer carriers align, layouts do
-         * not) and crash far from the mistake. This is the one phase that
-         * knows both sides' types for every overload, so reject here instead. */
+        /* Every same-arity candidate was disqualified on concrete argument types */
         zan_diag_emit(g->diag, DIAG_ERROR,
                       call ? call->loc : (zan_loc_t){0},
                       "no overload of '%.*s.%.*s' matches argument type(s)",
@@ -1511,12 +1263,7 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
     return resolve_overload(type_sym, name, argc, type_arg_count);
 }
 
-/* Overload resolution for operator-style methods whose first declared
- * parameter is the injected receiver (`static T op_call(T self, ...)`,
- * `op_index`, `op_index_set`): same as resolve_overload_typed but the
- * declared parameter list includes `self`, so candidates match on
- * `params.count == argc + 1` (or the params tail for a variadic) and
- * arguments are scored starting at declared parameter 1. */
+/* 内部辅助实现 */
 static zan_symbol_t *resolve_op_overload(zan_irgen_t *g,
                                         zan_symbol_t *type_sym,
                                         zan_istr_t name,
@@ -1534,26 +1281,19 @@ static zan_symbol_t *resolve_op_overload(zan_irgen_t *g,
             memcmp(m->name.str, name.str, (size_t)name.len) != 0) continue;
         zan_ast_list_t *ps = &m->decl->method_decl.params;
         if (ps->count < 1) continue;
-        /* A static operator carries an explicit self parameter (op_index
-         * (self, index)) while an instance operator does not (the receiver is
-         * `this`), so the declared-parameter count that matches `argc` call
-         * arguments differs: static needs argc+1, instance needs argc. */
+        /* 内部辅助实现 */
         int is_static = (m->modifiers & MOD_STATIC) != 0;
         int p0 = is_static ? 1 : 0; /* first AST param that takes an argument */
         int variadic = method_is_params_variadic(m);
         int score = 0;
         if (variadic) {
-            /* fixed params before the params tail: drop the tail and the
-             * injected receiver (a static operator carries self, an instance
-             * one does not), so a call with no tail arguments never lets the
-             * scoring loop below start at a negative index (args[-1] read). */
+            /* 内部辅助实现 */
             int fixed = ps->count - 1 - p0;
             if (argc < fixed) continue;
             if (!first_variadic) first_variadic = m;
             score = method_args_score(g, m, call, NULL, locals, p0);
             if (score < 0 && fixed > 0) continue;
-            /* method_args_score sees the params array itself. Rank each
-             * expanded tail argument against its element type instead. */
+            /* method_args_score sees the params array itself */
             score = 0;
             zan_type_t *pt = zan_binder_resolve_type(g->binder,
                 ps->items[ps->count - 1]->param.type);
@@ -1584,11 +1324,7 @@ static zan_symbol_t *resolve_op_overload(zan_irgen_t *g,
     return first_variadic;
 }
 
-/* Index into an op_index/op_index_set method's AST parameter list for the
- * index argument (and, +1, the value argument of op_index_set). A static
- * operator takes an explicit self parameter first (op_index(self, index)),
- * while an instance operator's receiver is `this` and the AST list starts at
- * the index directly. */
+/* 内部辅助实现 */
 static int op_index_param_offset(zan_symbol_t *m) {
     return (m->modifiers & MOD_STATIC) ? 1 : 0;
 }
@@ -1596,20 +1332,8 @@ static int op_index_param_offset(zan_symbol_t *m) {
 static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                                        local_scope_t *locals);
 
-/* Best-effort static inference of an expression's Zan type, composed over
- * identifiers, `this`, field access and element indexing so that patterns like
- * `list[i].field` or `a.b[i].c` resolve their class/struct symbol.
- *
- * While a generic class is being specialized, anything still phrased in its
- * type parameters is resolved against that instantiation -- a local declared
- * `T` in Box<Square> is a Square here. Method lookup and element ownership
- * both go through this. */
-/* Inference is re-entered for the same subexpression many times over: a member
- * access infers its object, and overload scoring infers every argument again,
- * so a chain like `a.Next().Next().Value()` costs 2^depth inferences. Results
- * only depend on the emit context (the locals in scope, the active
- * specialization and `this`), so they are memoized per AST node and the whole
- * table is dropped whenever that context changes. */
+/* 内部辅助实现 */
+/* 内部辅助实现 */
 #define INFER_CACHE_SLOTS 65536   /* power of two */
 
 typedef struct {
@@ -1652,15 +1376,10 @@ static infer_cache_slot_t *infer_cache_slot(zan_irgen_t *g, zan_ast_node_t *e,
     return &g_infer_cache[h & (INFER_CACHE_SLOTS - 1)];
 }
 
-/* Drop every memoized inference result. The table is keyed on the AST node's
- * address, so a node rewritten in place keeps its cached type from before the
- * rewrite (e.g. an implicit-ctor argument wrap turns `false` into
- * `new Box(false)` while callers still read `bool`). */
+/* Drop every memoized inference result */
 static void infer_cache_invalidate(void) { g_infer_ctx.live = false; }
 
-/* The type of a null-conditional access is the member's type made nullable:
- * `a?.v` over an `int` field is an `int?`, because the access answers none
- * when the receiver is null. */
+/* The type of a null-conditional access is the member's type made nullable: `a? */
 static zan_type_t *null_cond_result_type(zan_irgen_t *g, zan_ast_node_t *e,
                                          zan_type_t *t) {
     zan_ast_node_t *m = NULL;
@@ -1674,20 +1393,14 @@ static zan_type_t *infer_expr_type_uncached(zan_irgen_t *g, zan_ast_node_t *e,
                                             local_scope_t *locals) {
     zan_type_t *t = null_cond_result_type(g, e, infer_expr_type_raw(g, e, locals));
     if (!t || !g->cur_inst || type_is_concrete(t)) return t;
-    /* Delegates keep their type parameters: a T-returning delegate is invoked
-     * through an erased signature, so resolving T would disagree with it. */
+    /* 内部辅助逻辑 */
     if (t->kind == TYPE_DELEGATE) return t;
-    /* A bare `T` stays erased: parameters and returns of a specialized body
-     * keep the erased ABI, and resolving T here would change how callers own
-     * the value they pass. Only composites are resolved, so that a field
-     * declared List<T> reads back as List<Square> and its elements are stored
-     * and loaded with the ownership rules of the real element type. */
+    /* 内部辅助实现 */
     if (t->kind == TYPE_TYPE_PARAM) return t;
     return subst_type_param_deep(g, t, g->cur_inst);
 }
 
-/* Depth of the inference recursion, so a cycle in it stops with a diagnostic
- * naming the expression instead of spinning the whole compiler silently. */
+/* 内部辅助逻辑 */
 static int g_infer_depth;
 static bool g_infer_bailed;
 
@@ -1708,8 +1421,7 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
     g_infer_depth++;
     zan_type_t *t = infer_expr_type_uncached(g, e, locals);
     g_infer_depth--;
-    /* The nested inference may have moved the context on (a query registers its
-     * range variable), which drops the table -- re-check before publishing. */
+    /* 内部辅助逻辑 */
     slot = infer_cache_slot(g, e, locals);
     if (slot) {
         slot->node = e;
@@ -1722,22 +1434,12 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                                        local_scope_t *locals) {
     if (!e) return NULL;
     switch (e->kind) {
-    /* String literals have a static type like any other expression; without
-     * this an extension method on a literal receiver ("a,b".Split(...)) found
-     * no receiver type and silently lowered to a constant. */
+    /* 内部辅助逻辑 */
     case AST_STRING_LITERAL:
         return g->binder ? g->binder->type_string : NULL;
-    /* Other literals are just as typed: an inferred declaration (`var n = 5`)
-     * needs them to reach a type at all. */
+    /* 内部辅助逻辑 */
     case AST_INT_LITERAL:
-        /* Value-based type: literals outside i32 are `long`, so assigning one
-         * to an `int` target is a real narrowing (ZAN_WARN_NARROW). A suffix
-         * pins the type regardless of value: L/l -> long, U/u -> uint (ulong
-         * when the value overflows uint), UL/LU -> ulong.
-         * Hex/binary/octal literals up to 0xFFFFFFFF are the Java-style
-         * exception: they type as `int` (two's-complement wrap) so ARGB
-         * color comparisons agree with the wrapped field values — see the
-         * matching rule in checker.c. */
+        /* 内部辅助实现 */
         if (!g->binder) return NULL;
         switch (e->lit_suffix) {
         case 1:
@@ -1769,9 +1471,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         if (l) return l->type;
         if (g->current_type_sym) {
             zan_symbol_t *fs = get_field_sym(g->current_type_sym, e->ident.name);
-            /* `item` (implicit `this.item`) declared as a class type parameter
-             * has the instantiation's concrete type inside a specialized body,
-             * exactly like the explicit `this.item` spelling. */
+            /* `item` (implicit `this */
             if (fs) return concretize(g, fs->type);
         }
         return NULL;
@@ -1779,24 +1479,17 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
     case AST_THIS_EXPR:
         return g->current_type_sym ? g->current_type_sym->type : NULL;
     case AST_BASE_EXPR:
-        /* `base.Method(...)` 的接收者类型按 C# 语义取基类，使重载解析在基类
-         * 符号表上进行（绑定侧已处理，这里补 irgen 侧的静态类型）；无基类时
-         * 落 error，与 checker 一致。 */
+        /* `base */
         if (g->current_type_sym && g->current_type_sym->type
             && g->current_type_sym->type->base_type) {
             return g->current_type_sym->type->base_type;
         }
         return g->current_type_sym ? g->current_type_sym->type : NULL;
     case AST_AWAIT_EXPR:
-        /* `await E` yields the (unwrapped) result type of the awaited async
-         * call — i.e. the callee's declared return type. */
+        /* `await E` yields the (unwrapped) result type of the awaited async call — i */
         return infer_expr_type(g, e->await_expr.expr, locals);
     case AST_QUERY_EXPR: {
-        /* query yields List<select-type>; the range var, `let` variables and
-         * join variables are briefly registered (type only) in clause order
-         * so the projection can be inferred through them. A terminal
-         * `group e by k` yields List<Grouping<elem>> instead (the grouping
-         * list itself); `group e by k into g` gives the select only g. */
+        /* 内部辅助实现 */
         zan_type_t *src_ty = infer_expr_type(g, e->query.source, locals);
         zan_type_t *elem = container_elem_type(src_ty);
         if (!elem) elem = g->binder->type_int;
@@ -1851,8 +1544,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         return zan_binder_make_list_type(g->binder, sel);
     }
     case AST_MEMBER_ACCESS: {
-        /* reflection members (`ti.Name`, `ti.FieldCount`): the receiver's own
-         * members win, so this only answers for a TypeInfo receiver. */
+        /* reflection members (`ti */
         {
             zan_type_t *rt = infer_expr_type(g, e->member.object, locals);
             if (zan_refl_is_typeinfo(rt)) {
@@ -1861,7 +1553,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 if (mt) return mt;
             }
         }
-        /* static field: ClassName.StaticField (class name, not a local). */
+        /* static field: ClassName */
         if (e->member.object->kind == AST_IDENTIFIER &&
             !local_find(locals, e->member.object->ident.name)) {
             zan_symbol_t *cs = zan_binder_lookup(g->binder,
@@ -1871,10 +1563,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 if (fs) return fs->type;
             }
         }
-        /* EnumType.Member (`Color.Green.ToString()`): the constant has the
-         * enum's own type, so a chained call infers an enum receiver and
-         * reaches the compiler-lowered scalar handling instead of the
-         * constant-0 fallback. */
+        /* 内部辅助实现 */
         if (e->member.object->kind == AST_IDENTIFIER &&
             !local_find(locals, e->member.object->ident.name)) {
             zan_symbol_t *es = zan_binder_lookup(g->binder,
@@ -1890,11 +1579,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 }
             }
         }
-        /* builtin scalar-type constants (`int.MaxValue`, `double.NaN`, ...):
-         * the receiver is a primitive type name with no class symbol, so the
-         * lookups above miss and the inferred type would be NULL. Mirror the
-         * emit-side table: MaxValue/MinValue/NaN/±Infinity/Epsilon resolve to
-         * the receiver type. */
+        /* builtin scalar-type constants (`int */
         if (e->member.object->kind == AST_IDENTIFIER &&
             !local_find(locals, e->member.object->ident.name)) {
             zan_istr_t on = e->member.object->ident.name;
@@ -1946,7 +1631,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             }
         }
         zan_type_t *ot = infer_expr_type(g, e->member.object, locals);
-        /* Dict.Keys / Dict.Values yield a fresh List of the key/value type */
+        /* Dict */
         if (ot && type_named(ot, "Dict", 4)) {
             if (e->member.name.len == 4 &&
                 memcmp(e->member.name.str, "Keys", 4) == 0)
@@ -1972,18 +1657,13 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         if (ot && ot->sym) {
             zan_symbol_t *fs = get_field_sym(ot->sym, e->member.name);
             if (fs) {
-                /* a field declared as a type parameter has the receiver's
-                 * concrete type argument here: Pool<Conn>.item is a Conn */
+                /* 内部辅助逻辑 */
                 zan_type_t *ft = subst_type_param_deep(g, fs->type, ot);
                 if (ft && ft->kind == TYPE_TYPE_PARAM) ft = concretize(g, ft);
                 return ft;
             }
         }
-        /* Properties of the compiler's built-in types (string.Length,
-         * List.Count, Dictionary.Count, StringBuilder.Length, array.Length)
-         * have no field symbol, so the lookups above miss them. The result
-         * type comes from the same table the diagnostics and --emit-symbols
-         * use (builtin_api.c). */
+        /* Properties of the compiler's built-in types (string */
         if (ot) {
             const char *bt = NULL;
             if (ot->kind == TYPE_STRING) bt = "string";
@@ -2014,8 +1694,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
     }
     case AST_INDEX: {
         zan_type_t *ot = infer_expr_type(g, e->index.object, locals);
-        /* op_index: `<class instance>[i]` has the static type of the
-         * class's op_index method return. */
+        /* 内部辅助逻辑 */
         if (ot && (ot->kind == TYPE_CLASS || ot->kind == TYPE_STRUCT) && ot->sym) {
             zan_istr_t op_istr = {(char *)"op_index", 8};
             zan_ast_node_t *op_call = zan_ast_new(g->arena, AST_CALL, e->loc);
@@ -2036,12 +1715,10 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         return container_elem_type(ot);
     }
     case AST_CALL: {
-        /* Resolve the static return type of a method/function call so that
-         * chained member access (e.g. Next().field) can find the struct. */
+        /* 内部辅助逻辑 */
         zan_ast_node_t *callee = e->call.callee;
         if (!callee) return NULL;
-        /* EnumType.TryParse(text, out T): compiler-lowered static over the
-         * enum's name table — always yields bool. */
+        /* EnumType */
         if (callee->kind == AST_MEMBER_ACCESS &&
             callee->member.object->kind == AST_IDENTIFIER &&
             callee->member.name.len == 8 &&
@@ -2052,8 +1729,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 return g->binder->type_bool;
             }
         }
-        /* reflection calls (`obj.GetType()`, `ti.GetFieldName(i)`, ...): a
-         * user-declared member of the same name is resolved below instead. */
+        /* reflection calls (`obj */
         if (callee->kind == AST_MEMBER_ACCESS) {
             zan_type_t *rt = infer_expr_type(g, callee->member.object, locals);
             if (zan_refl_is_typeinfo(rt) ||
@@ -2064,8 +1740,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 if (mt) return mt;
             }
         }
-        /* op_call: `<class instance>(args)` has the static type of the
-         * class's op_call method return. */
+        /* 内部辅助逻辑 */
         {
             zan_type_t *ct = infer_expr_type_raw(g, callee, locals);
             if (ct && (ct->kind == TYPE_CLASS || ct->kind == TYPE_STRUCT) && ct->sym) {
@@ -2075,17 +1750,13 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 if (op) return op->type;
             }
         }
-        /* Invoking a delegate-typed local or field: the call's type is the
-         * delegate's return type (else the call has no type and lowers to a
-         * constant when used as a receiver). */
+        /* 内部辅助逻辑 */
         if (callee->kind == AST_IDENTIFIER || callee->kind == AST_MEMBER_ACCESS) {
             zan_type_t *dt = infer_expr_type_raw(g, callee, locals);
             if (dt && dt->kind == TYPE_DELEGATE)
                 return dt->delegate_ret_type;
         }
-        /* Built-in string instance methods return string but have no symbol to
-         * resolve through, so name-match them (mirrors is_string_expr) — lets
-         * their owned result be released when passed straight into a call. */
+        /* 内部辅助逻辑 */
         if (callee->kind == AST_MEMBER_ACCESS) {
             zan_istr_t mm = callee->member.name;
             if (mm.len == 6 && memcmp(mm.str, "AsSpan", 6) == 0) {
@@ -2123,7 +1794,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 if (ot && ot->kind == TYPE_STRING)
                     return zan_binder_make_list_type(g->binder, g->binder->type_string);
             }
-            /* string.Join / string.Format statics return a fresh owned string */
+            /* string */
             if (callee->member.object->kind == AST_IDENTIFIER &&
                 !local_find(locals, callee->member.object->ident.name)) {
                 zan_istr_t on = callee->member.object->ident.name;
@@ -2137,15 +1808,11 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         if (callee->kind == AST_IDENTIFIER) {
             /* bare call: current class method, else global function */
             if (g->current_type_sym) {
-                /* Resolve the overload this call site actually reaches (arity,
-                 * argument types, inherited candidates) instead of the first
-                 * method with that name: a sibling overload's return type gives
-                 * await/ARC the wrong ownership carrier. */
+                /* 内部辅助实现 */
             zan_symbol_t *m = resolve_overload_typed(g, g->current_type_sym,
                                                      callee->ident.name, e, locals);
             if (!m) m = get_method_sym(g->current_type_sym, callee->ident.name);
-                /* an unqualified call to a sibling generic method binds its
-                 * type parameters here too (`await Id<int>(8)` is an int) */
+                /* 内部辅助逻辑 */
                 if (m) return method_ret_type_at(g, m, e, NULL, locals);
             }
             zan_symbol_t *gf = zan_binder_lookup(g->binder, callee->ident.name);
@@ -2155,7 +1822,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         }
         if (callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *obj = callee->member.object;
-            /* static: ClassName.Method() (class name, not a shadowing local) */
+            /* static: ClassName */
             if (obj->kind == AST_IDENTIFIER && !local_find(locals, obj->ident.name)) {
                 zan_symbol_t *ts = zan_binder_lookup(g->binder, obj->ident.name);
                 if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) {
@@ -2167,9 +1834,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                     }
                 }
             }
-            /* static call on a built-in class (File.ReadAllText, Path.Combine,
-             * Directory.ListNames, ...): irgen lowers these directly, so there
-             * is no symbol to read a return type from. */
+            /* static call on a built-in class (File */
             if (obj->kind == AST_IDENTIFIER && !local_find(locals, obj->ident.name)) {
                 char cls[64];
                 int cn = (int)obj->ident.name.len;
@@ -2193,8 +1858,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                     }
                 }
             }
-            /* static: Namespace.Path.ClassName.Method() -- the object is a
-             * name path, so its rightmost segment is the type name. */
+            /* static: Namespace */
             if (obj->kind == AST_MEMBER_ACCESS && is_name_path(obj)) {
                 zan_ast_node_t *head = name_path_head(obj);
                 if (head && !local_find(locals, head->ident.name)) {
@@ -2208,27 +1872,16 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                     }
                 }
             }
-            /* instance: <expr>.Method() -- resolve the receiver type
-             * generally (local, this, field, index, or a nested call) so
-             * that fluent chains a.M1().M2().M3() infer at any depth. */
+            /* instance: <expr> */
             zan_type_t *rt = infer_expr_type(g, obj, locals);
             if (rt && rt->sym) {
-                /* Lowering resolves same-arity methods by argument types.
-                 * Inferring a call from the first method with this name gives
-                 * await/ARC the wrong carrier (a class pointer instead of the
-                 * selected async string), even if the checker types it right. */
+                /* Lowering resolves same-arity methods by argument types */
                 zan_symbol_t *m = resolve_overload_typed(g, rt->sym,
                     callee->member.name, e, locals);
                 if (!m) m = get_method_sym(rt->sym, callee->member.name);
                 if (m) {
-                    /* a method returning a type parameter returns the
-                     * receiver's type argument: Acc<Node>.Get() is a Node, so
-                     * `a.Get().tag` finds Node's fields instead of treating an
-                     * erased result as a number */
-                    /* a method declaring its own <U> returns the type bound at
-                     * this call site: `s.Echo<int>(42)` is an int, whether it
-                     * is awaited or not. Class type args are substituted after,
-                     * so `p.Get<U>()` on a Pool<string> still yields string. */
+                    /* 内部辅助逻辑 */
+                    /* a method declaring its own <U> returns the type bound at this call site: `s */
                     zan_type_t *mt = method_ret_type_at(g, m, e, obj, locals);
                     if (!mt) mt = m->type;
                     mt = subst_type_param_deep(g, mt, rt);
@@ -2236,10 +1889,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                     return mt;
                 }
             }
-            /* extension method: recv.M(args) returns the static method's type
-             * (with its generic type parameters substituted from this call
-             * site, so fluent chains like list.Where(..).Select(..) keep a
-             * concrete element type) */
+            /* extension method: recv */
             zan_symbol_t *xm = find_extension_method(g, rt, callee->member.name,
                                                      e->call.args.count,
                                                      e, obj, locals);
@@ -2248,41 +1898,30 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         return NULL;
     }
     case AST_NEW_EXPR:
-        /* `new T(...)` yields a T. An array expression is not a single rc
-         * object (the NULL was meant to keep rc release logic off it), but
-         * callers like foreach's collection-type dispatch need the real
-         * element layout: resolve the `T[]` type node (it is written `T[]`
-         * for both `new T[n]` and `new T[]{...}`) and strip to the array
-         * type; the caller decides what to do with it. */
+        /* 内部辅助实现 */
         if (e->new_expr.is_array) {
             if (!e->new_expr.type) return NULL;
             zan_type_t *at = resolve_type_ctx(g, e->new_expr.type);
             if (at && at->kind == TYPE_ARRAY) return at;
             return NULL;
         }
-        /* `FactoryCall(...) { Members = {...} }`: the value's type is the
-         * call's result type, not the (absent) type node. */
+        /* `FactoryCall( */
         if (!e->new_expr.type && e->new_expr.call_init)
             return infer_expr_type(g, e->new_expr.call_init, locals);
         return resolve_type_ctx(g, e->new_expr.type);
     case AST_COLL_INIT:
-        /* member collection initializer: its value is the collection member it
-         * names; inference goes through the object-initializer lowering, so no
-         * standalone type exists. NULL keeps every typed consumer off it. */
+        /* 内部辅助逻辑 */
         return NULL;
     case AST_UNARY:
-        /* `!b` is bool; `-x`/`+x`/`~x` keep the operand's static type, so a
-         * negated value still prints and feeds `var` inference. */
+        /* 内部辅助逻辑 */
         if (e->unary.op == TK_BANG)
             return g->binder ? g->binder->type_bool : NULL;
         return infer_expr_type(g, e->unary.operand, locals);
     case AST_POSTFIX_UNARY:
-        /* postfix `!` (null-forgiving) is transparent: the wrapper's type is
-         * its operand's. ++/-- yield the scalar before the change. */
+        /* postfix `!` (null-forgiving) is transparent: the wrapper's type is its operand's */
         return infer_expr_type(g, e->unary.operand, locals);
     case AST_BINARY:
-        /* string concatenation (`a + b`) yields a freshly heap-allocated,
-         * owned string; other binary operators produce non-rc scalars. */
+        /* 内部辅助逻辑 */
         if (e->binary.op == TK_PLUS && is_string_expr(g, e, locals))
             return g->binder->type_string;
         switch (e->binary.op) {
@@ -2292,14 +1931,12 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         case TK_GREATER_GREATER_GREATER: {
             zan_type_t *lt = infer_expr_type(g, e->binary.left, locals);
             zan_type_t *rt = infer_expr_type(g, e->binary.right, locals);
-            /* An operand's nullability carries into the result: `a + 1` on an
-             * `int?` is an `int?` (null when a is). */
+            /* 内部辅助逻辑 */
             if (lt && lt->kind == TYPE_NULLABLE) return lt;
             if (rt && rt->kind == TYPE_NULLABLE) return rt;
             if ((lt && lt->kind == TYPE_ULONG) || (rt && rt->kind == TYPE_ULONG))
                 return g->binder->type_ulong;
-            /* otherwise the result keeps the operand type when both agree
-             * (or only one is known) -- enough to type `var d = a * b` */
+            /* 内部辅助逻辑 */
             if (lt && rt && lt->kind == rt->kind) return lt;
             if (lt && !rt) return lt;
             if (rt && !lt) return rt;
@@ -2312,8 +1949,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         default:
             return NULL;
         }
-    /* typeof(T) is a TypeInfo (its payload is the type name, so the string
-     * operations on it keep working -- see irgen_reflect.c). */
+    /* 内部辅助逻辑 */
     case AST_TYPEOF_EXPR:
         return g->binder->type_typeinfo;
     case AST_STRING_INTERP:
@@ -2321,14 +1957,10 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
     case AST_CAST_EXPR:
         return resolve_type_ctx(g, e->cast.type);
     case AST_CONDITIONAL:
-        /* A conditional's type is its then-branch's type (the checker already
-         * types it that way), so a `cond ? call() : 0` feeds the call's declared
-         * type into narrowing checks and lets the ternary IR unify both sides
-         * against the same target. */
+        /* 内部辅助实现 */
         return infer_expr_type(g, e->conditional.then_expr, locals);
     case AST_TUPLE_EXPR: {
-        /* (a, b, ...) has the synthesized anonymous struct type with Item1..N
-         * fields, built from the inferred element types. */
+        /* (a, b, */
         if (!g->binder) return NULL;
         int n = e->tuple_expr.items.count;
         zan_type_t **elems = (zan_type_t **)zan_arena_alloc(
@@ -2340,8 +1972,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         return zan_binder_make_tuple_type(g->binder, elems, n);
     }
     case AST_SWITCH_EXPR:
-        /* `x switch { ... }` types as its first arm's result (the checker
-         * merges arms to a common type). */
+        /* `x switch { */
         if (e->switch_expr.arms.count == 0) return NULL;
         return infer_expr_type(g, e->switch_expr.arms.items[0]->switch_arm.result,
                                locals);
@@ -2353,50 +1984,37 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
     }
 }
 
-/* True when an expression's static type is the unsigned 64-bit `ulong`,
- * which selects unsigned division/remainder/shift/compare and %llu output. */
+/* 内部辅助逻辑 */
 static bool expr_is_ulong(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
     return t && t->kind == TYPE_ULONG;
 }
 
-/* True when an expression's static type is the unsigned 32-bit `uint`:
- * selects unsigned division/remainder/shift/compare and, under `checked`,
- * trapping against the uint32 range (C# checked wraps uint too). */
+/* 内部辅助逻辑 */
 static bool expr_is_uint(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
     return t && t->kind == TYPE_UINT;
 }
 
-/* True when an expression's static type is 64-bit (either flavor): such an
- * operand promotes a mixed-width pair to i64 math, so a uint on the other
- * side must not drive u32-range trapping. */
+/* 内部辅助逻辑 */
 static bool expr_is_longish(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
     return t && (t->kind == TYPE_LONG || t->kind == TYPE_ULONG);
 }
 
-/* True when an expression's static type is 32-bit int (the C# `int`). Checked
- * arithmetic on such operands must detect overflow against the INT32 range:
- * literal operands are widened to i64 before the add (coerce_int_pair), so
- * without this the sign predicate compares inside i64 and silently misses
- * INT_MAX+1. */
+/* True when an expression's static type is 32-bit int (the C# `int`) */
 static bool expr_is_int32(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
     return t && t->kind == TYPE_INT;
 }
 
-/* True when an expression's static type is bool, so Console.WriteLine/Write
- * render it as true/false instead of falling into the integer path. */
+/* True when an expression's static type is bool, so Console */
 static bool expr_is_bool(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
     return t && t->kind == TYPE_BOOL;
 }
 
-/* True when the expression's static type is any unsigned integer (uint,
- * ulong, ushort, byte) or a member-access constant over one -- such values
- * live in a slot whose high bit is set for their max, so they must print
- * with the unsigned format rather than as a negative signed integer. */
+/* 内部辅助实现 */
 static bool expr_is_unsigned_int(zan_irgen_t *g, zan_ast_node_t *e,
                                  local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
@@ -2407,8 +2025,7 @@ static bool expr_is_unsigned_int(zan_irgen_t *g, zan_ast_node_t *e,
     return false;
 }
 
-/* True when an expression's static type is `char`, which prints and
- * concatenates as the character itself (C#) rather than its numeric code. */
+/* 内部辅助逻辑 */
 static bool expr_is_char(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
     return t && t->kind == TYPE_CHAR;
@@ -2418,19 +2035,13 @@ static bool expr_is_char(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *local
 static zan_symbol_t *expr_class_sym(zan_irgen_t *g, zan_ast_node_t *e,
                                     local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
-    /* Inside a specialization a receiver typed `T` -- a local declared `T` in
-     * Box<Square> -- must be resolved for the method to be found at all; the
-     * emitted signature stays erased. */
+    /* 内部辅助逻辑 */
     if (t && t->kind == TYPE_TYPE_PARAM) t = concretize(g, t);
     if (t && (t->kind == TYPE_CLASS || t->kind == TYPE_STRUCT)) return t->sym;
     return NULL;
 }
 
-/* Return the field symbol when `e` is a read of a weak instance field.  Keep
- * the two AST shapes here in step with the field-store paths: an explicit
- * member access resolves through the receiver's class symbol, while a bare
- * identifier resolves against the current class (and must not capture a local
- * shadowing the field). */
+/* 返回the field symbol when `e` is a read of a weak instance field */
 static zan_symbol_t *weak_field_read_sym(zan_irgen_t *g, zan_ast_node_t *e,
                                          local_scope_t *locals) {
     zan_symbol_t *field = NULL;
@@ -2451,19 +2062,11 @@ static zan_symbol_t *weak_field_read_sym(zan_irgen_t *g, zan_ast_node_t *e,
     return field && (field->modifiers & MOD_WEAK) ? field : NULL;
 }
 
-/* Guard one already-emitted weak-field value.  The caller emits the value
- * first so a receiver expression with side effects is evaluated exactly once.
- * `loc` is the weak read site, which gives the runtime report the useful
- * source position rather than a later lowered load. */
+/* Guard one already-emitted weak-field value */
 static void emit_weak_read_guard(zan_irgen_t *g, zan_ast_node_t *read_expr,
                                  LLVMValueRef value, zan_loc_t loc,
                                  local_scope_t *locals) {
-    /* A null class-typed receiver faults on the very first field/member load
-     * (addr=0x0 / 0x...fffe with no source location in a stripped release
-     * binary), so every member access guards its object the same way. The
-     * message names the receiver only when it is a plain identifier, which
-     * keeps the common `w.tag` case readable without extra emit machinery.
-     * Null-conditional access (`?.`) is excluded by the caller. */
+    /* 内部辅助逻辑 */
     zan_type_t *rt = infer_expr_type(g, read_expr, locals);
     bool reflike = rt && (rt->kind == TYPE_OBJECT || rt->kind == TYPE_CLASS ||
                           rt->kind == TYPE_INTERFACE ||
@@ -2498,12 +2101,7 @@ static void emit_weak_read_guard(zan_irgen_t *g, zan_ast_node_t *read_expr,
     emit_runtime_check(g, is_null, loc, msg);
 }
 
-/* Emit a member receiver once and guard it when the receiver expression is a
- * weak field read.  Null-conditional access owns its own null test and must
- * not receive a second fatal guard. On the soft path the returned value is
- * the scratch substitute when the receiver is null, so the field load that
- * follows reads a zeroed object instead of faulting (hard mode exits inside
- * the report). */
+/* 内部辅助逻辑 */
 static LLVMValueRef emit_guarded_member_object(zan_irgen_t *g,
                                                zan_ast_node_t *member,
                                                local_scope_t *locals) {
@@ -2529,8 +2127,7 @@ static LLVMValueRef emit_guarded_member_object(zan_irgen_t *g,
     return value;
 }
 
-/* True when class `cls` (or one of its base classes) declares `iface` — or an
- * interface that itself extends `iface` — in its implements list. */
+/* 内部辅助逻辑 */
 static bool class_implements_iface_depth(zan_symbol_t *cls, zan_symbol_t *iface,
                                           int depth) {
     if (!cls || !cls->type || !iface || depth > 512) return false;
@@ -2553,12 +2150,7 @@ static bool class_implements_iface(zan_symbol_t *cls, zan_symbol_t *iface) {
     return class_implements_iface_depth(cls, iface, 0);
 }
 
-/* True when the program (or the stdlib it was compiled with) declares a type
- * with this name that itself defines the method. irgen lowers a handful of
- * static library calls itself, which silently shadows the Zan implementation
- * of the same API -- the Zan one then cannot be fixed or even reached. Where
- * a real definition exists it wins, and the built-in lowering stays as the
- * fallback for programs compiled without the stdlib. */
+/* 内部辅助实现 */
 static zan_symbol_t *get_method_sym(zan_symbol_t *cls, zan_istr_t name);
 
 static bool zan_type_defines(zan_irgen_t *g, const char *type_name,
@@ -2573,15 +2165,12 @@ static bool zan_type_defines(zan_irgen_t *g, const char *type_name,
     return get_method_sym(sym, mn) != NULL;
 }
 
-/* Arrays carry their element count in the object header word at obj - 16 and
- * their refcount in the wider array prefix in front of it (see
- * ZAN_ARR_HDR_SIZE in ../common/zan_abi.h). The value a program holds points
- * at the first element, so the pointer can still be handed to C unchanged. */
+/* 内部辅助实现 */
 
 static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
                                zan_loc_t loc, const char *msg);
 
-/* Store one i64 header word at `raw + off` of a fresh array allocation. */
+/* Store one i64 header word at `raw + off` of a fresh array allocation */
 static void zan_arr_hdr_store(zan_irgen_t *g, LLVMValueRef raw, int off,
                               LLVMValueRef val, const char *name) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -2603,12 +2192,7 @@ static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
     LLVMValueRef overflow = zan_icmp(g->builder, LLVMIntUGT, total,
         max_total, "arr.overflow");
     emit_runtime_check(g, overflow, (zan_loc_t){0}, "array allocation overflow");
-    /* Soft mode continues past the report: the wrapped `total` would reach
-     * calloc as a huge unsigned count and fail (or corrupt accounting via
-     * __wrap_calloc's overflow check), leaving the caller with garbage. Fold
-     * an overflowing total to 0 so the caller gets a real, empty array --
-     * every later index into it reports instead of faulting. Hard mode exits
-     * inside the report; checks-off keeps the raw total. */
+    /* 内部辅助实现 */
     total = LLVMBuildSelect(g->builder, overflow,
         LLVMConstInt(i64, 0, 0), total, "arr.total.safe");
     count = LLVMBuildSelect(g->builder, overflow,
@@ -2619,10 +2203,7 @@ static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
         get_calloc_fn(g), (LLVMValueRef[]){ bytes, LLVMConstInt(i64, 1, 0) }, 2, "arr.raw");
     LLVMValueRef null_raw = LLVMBuildIsNull(g->builder, raw, "arr.null");
     emit_runtime_check(g, null_raw, (zan_loc_t){0}, "array allocation failed");
-    /* refcount = 1 and the rc guard, then the count and the array magic; see
-     * the prefix layout in zan_abi.h. The array magic is what lets a byte[]
-     * reaching `string`-typed code be told apart from a bare pointer an extern
-     * returned, whose payload has no count word in front of it. */
+    /* 内部辅助逻辑 */
     zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_OFF,
                       LLVMConstInt(i64, 1, 0), "arr.rc");
     zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_MAGIC_OFF,
@@ -2661,16 +2242,7 @@ static LLVMValueRef zan_array_len(zan_irgen_t *g, LLVMValueRef arr) {
         "arr.len");
 }
 
-/* Rank-N rectangular array (`int[,]`): the header extends the plain layout
- * with the shape, and the value still points at the first element so
- * zan_array_len keeps reporting the total element count. Counting from the
- * payload the array prefix holds, ahead of the shape:
- *   arr-32, arr-24: refcount and its guard (as for any array)
- *   arr-16        : total element count (= product of the dims)
- *   arr- 8        : rank (i64), in place of the array magic
- *   arr+0         : dims[0..rank-1]
- *   arr+8*rank    : elements, row-major
- * So dims[d] lives at arr + 8*d and the data at arr + 8*rank. */
+/* 内部辅助实现 */
 static LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
                                       int rank, LLVMTypeRef elem_llvm) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -2679,15 +2251,11 @@ static LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
     LLVMValueRef total = LLVMConstInt(i64, 1, 0);
     for (int d = 0; d < rank; d++)
         total = zan_mul(g->builder, total, dims[d], "md.total");
-    /* the dims are non-negative (checked by the caller), so a negative
-     * product means the multiply wrapped */
+    /* 内部辅助逻辑 */
     LLVMValueRef neg = zan_icmp(g->builder, LLVMIntSLT, total,
         LLVMConstInt(i64, 0, 0), "md.neg");
     emit_runtime_check(g, neg, (zan_loc_t){0}, "array allocation overflow");
-    /* Soft mode continues past the report: fold the wrapped product to 0 so
-     * calloc gets a small real size and the caller holds an empty array
-     * instead of a corrupt allocation. Hard mode exits inside the report;
-     * checks-off keeps the raw product. */
+    /* 内部辅助实现 */
     total = LLVMBuildSelect(g->builder, neg,
         LLVMConstInt(i64, 0, 0), total, "md.total.safe");
     LLVMValueRef hdr = LLVMConstInt(i64,
@@ -2723,12 +2291,7 @@ static LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
     return LLVMBuildGEP2(g->builder, i8, raw, &hdr_off, 1, "md.arr");
 }
 
-/* Decimal formatting of a 64-bit integer, emitted as a self-contained
- * function so integer-to-string conversions do not go through the vfprintf
- * machinery. Signature:
- *   i64 __zan_itoa(i8 *buf, i64 val, i32 is_unsigned)
- * Writes the digits plus a NUL terminator into `buf` (needs 21 bytes) and
- * returns the digit count, terminator excluded. */
+/* 内部辅助实现 */
 static LLVMValueRef zan_itoa_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_itoa");
     if (fn) return fn;
@@ -2757,8 +2320,7 @@ static LLVMValueRef zan_itoa_fn(zan_irgen_t *g) {
     LLVMValueRef tmp = LLVMBuildAlloca(g->builder, tmp_ty, "itoa.tmp");
     LLVMValueRef zero64 = LLVMConstInt(i64t, 0, 0);
     LLVMValueRef ten = LLVMConstInt(i64t, 10, 0);
-    /* negative only when the value is signed: -x as unsigned is the same bit
-     * pattern for INT64_MIN, so no special case is needed for it. */
+    /* 内部辅助逻辑 */
     LLVMValueRef is_signed = zan_icmp(g->builder, LLVMIntEQ, uns,
         LLVMConstInt(i32t, 0, 0), "itoa.signed");
     LLVMValueRef is_lt0 = zan_icmp(g->builder, LLVMIntSLT, val, zero64, "itoa.lt0");
@@ -2818,7 +2380,7 @@ static LLVMValueRef zan_itoa_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* Emit `__zan_itoa(buf, val, is_unsigned)`; `val` must already be i64. */
+/* 发射`__zan_itoa(buf, val, is_unsigned)`; `val` must already be i64 */
 static LLVMValueRef zan_emit_itoa(zan_irgen_t *g, LLVMValueRef buf,
                                  LLVMValueRef val, bool is_unsigned) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);

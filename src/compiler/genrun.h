@@ -1,15 +1,4 @@
-/* genrun.h -- run the Zan-scripted code generators (ZanGen).
- *
- * zanc drives the Zan-implemented generators (formgen/scenegen/jsongen/
- * routegen/dbgen, living in stdlib/System/Compiler/) as a subprocess: it
- * exports compilation-unit metadata to JSON, runs the cached generator
- * executable over it, and consumes the generated source + rewrite directives
- * from the reply JSON. The generator is compiled with zanc itself and cached
- * under the user cache dir, keyed by compiler + stdlib root + generator
- * source contents. --no-gen (zan_gen_enabled = 0) disables the machinery; it
- * exists to compile the generators themselves, whose sources must not run
- * the codegen passes on themselves (a bootstrap loop).
- */
+/* genrun */
 #ifndef ZAN_GENRUN_H
 #define ZAN_GENRUN_H
 
@@ -20,60 +9,34 @@ struct zan_ast_node;
 struct zan_arena;
 struct zan_diag;
 
-/* Set by main() from --no-gen. Generators run only while this is non-zero. */
+/* Set by main() from --no-gen */
 extern int zan_gen_enabled;
 
-/* Ensure the content-addressed generator executable exists for this compiler
- * and <stdlib_root>. Compiles it with zanc itself when cold. Fills `exe`
- * (caller's buffer, at least ZAN_GEN_MAX_PATH bytes) on success. Returns 0,
- * or -1 with a message on stderr. */
+/* 内部辅助逻辑 */
 #define ZAN_GEN_MAX_PATH 1024
 int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size);
 
-/* Run the generator over the metadata file `meta_path`, writing its reply
- * JSON to `out_path`. The generator's stderr passes through (its diagnostics
- * carry the user file:line locations embedded in the metadata). Returns 0 on
- * success, -1 on failure (message on stderr). */
+/* 内部辅助逻辑 */
 int zan_gen_run(const char *exe, const char *meta_path, const char *out_path);
 
-/* Translate every .html/.zscene design input in one generator run (the
- * "design" mode request) and return a malloc'd array of `count` translated
- * source texts; entries for non-design files are NULL and ownership of every
- * entry passes to the caller (one free() each, plus free() on the array).
- * Returns NULL on failure with a diagnostic already printed on stderr.
- * `stdlib_root` is needed only when a design file is present. */
+/* Translate every */
 char **zan_gen_design(const char *stdlib_root, const char *const *paths,
                       size_t count);
 
-/* True when `p` is a saved user component (".zcomp"): design data consumed
- * by the generators, never parsed as Zan source. */
+/* True when `p` is a saved user component (" */
 bool zan_is_zcomp_path(const char *p);
 
-/* True when `p` is a design document (".html"/".htm"/".zscene"): generator
- * input translated to Zan source by zan_gen_design, never meaningful to
- * lex as raw Zan (heuristic token scans must skip it -- raw HTML lexes as
- * garbage tokens whose Chinese bytes hit the lexer's unknown-character
- * path). */
+/* True when `p` is a design document (" */
 bool zan_is_design_path(const char *p);
 
-/* Run the Zan-scripted code generators (the "codegen" mode: jsongen/dbgen/
- * routegen) over the compilation unit. Exports the metadata, spawns the
- * cached generator when a call site could trigger codegen, then applies the
- * reply: generated sources are parsed and merged into the unit, rewrite
- * directives retarget call sites, diagnostics flow into `diag`. Returns 0 on
- * success (or when nothing triggered), -1 on failure (message on stderr). */
+/* 内部辅助逻辑 */
 int zan_gen_codegen(struct zan_ast_node *unit, struct zan_arena *arena,
                     struct zan_diag *diag, const char *stdlib_root);
 
-/* Hand over the texts of the generated sources merged by the latest
- * zan_gen_codegen run (NULL-terminated-free: caller frees each element and
- * the array) and clear the capture. The demand-driven stdlib pull-in seeds
- * its second closure round with them, since generated classes reference
- * stdlib types the user program never spells. */
+/* 内部辅助逻辑 */
 void zan_gen_take_source_texts(char ***texts, int *count);
 
-/* Fill `dir` with the generator cache directory (creating it), or return -1
- * when no user cache dir can be located. */
+/* 内部辅助逻辑 */
 int zan_gen_cache_dir(char *dir, size_t dir_size);
 
 #endif /* ZAN_GENRUN_H */

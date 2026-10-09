@@ -1,17 +1,10 @@
-/* irgen_emit.c -- top-level emission: globals, user-defined methods, entry point
- * and object/IR file output.
- *
- * Part of the irgen translation unit: this file is #include'd by irgen.c
- * (in a fixed order) and must not be compiled standalone. Splitting keeps
- * the single-TU static linkage while keeping each concern in its own file.
- */
+/* 内部辅助实现 */
 
 /* ---- top-level emission ---- */
 
 static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_t *type_sym,
                              zan_ast_node_t *unit) {
-    /* create main(i32 argc, i8** argv) so command-line args are available via
-     * the Environment.ArgCount()/ArgAt() builtins. */
+    /* 内部辅助逻辑 */
     LLVMTypeRef i32ty = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i8ptrptr = LLVMPointerType(i8ptr, 0);
@@ -23,11 +16,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
     LLVMPositionBuilderAtEnd(g->builder, entry);
     di_clear(g);
 
-    /* On Windows, switch the console code page to UTF-8 (65001) so that
-     * non-ASCII output (e.g. CJK text) renders correctly instead of being
-     * decoded with the legacy OEM/ANSI codepage. Our string data is UTF-8, and
-     * this only affects console handles (a no-op when stdout is a pipe/file),
-     * so redirected output keeps its raw UTF-8 bytes. */
+    /* 内部辅助逻辑 */
     if (g->target_is_windows) {
         LLVMTypeRef uintt = LLVMInt32TypeInContext(g->ctx);
         LLVMTypeRef setcp_type = LLVMFunctionType(uintt, (LLVMTypeRef[]){ uintt }, 1, 0);
@@ -40,10 +29,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         zan_call2(g->builder, setcp_type, fn_set_in, &cp_utf8, 1, "");
     }
 
-    /* Windows supplies the process argv through the active ANSI code page.
-     * Rebuild it from GetCommandLineW as UTF-8 so Environment.ArgAt() agrees
-     * with Zan strings and the wide Windows file APIs. The helper leaves the
-     * initialized locals untouched when conversion cannot be completed. */
+    /* Windows supplies the process argv through the active ANSI code page */
     LLVMValueRef main_argc = LLVMGetParam(main_fn, 0);
     LLVMValueRef main_argv = LLVMGetParam(main_fn, 1);
     if (g->target_is_windows) {
@@ -64,7 +50,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         main_argv = LLVMBuildLoad2(g->builder, i8ptrptr, argv_slot, "utf8_argv.value");
     }
 
-    /* stash argc/argv into module globals for Environment.* builtins */
+    /* stash argc/argv into module globals for Environment */
     LLVMValueRef g_argc = LLVMGetNamedGlobal(g->mod, "__zan_argc");
     if (!g_argc) {
         g_argc = LLVMAddGlobal(g->mod, i32ty, "__zan_argc");
@@ -78,13 +64,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
     LLVMBuildStore(g->builder, main_argc, g_argc);
     LLVMBuildStore(g->builder, main_argv, g_argv);
 
-    /* Make stdout flush promptly so a long-running program's output (a
-     * server's startup/request logs, progress prints, ...) is visible
-     * immediately instead of sitting in a block buffer until the process
-     * exits. The Windows CRT does not honor line buffering (it treats
-     * _IOLBF as full buffering), so use unbuffered there; ELF libc gets
-     * line buffering (flush on newline), which is cheap. Mirrors C#'s
-     * Console.Out.AutoFlush = true. */
+    /* 内部辅助逻辑 */
     {
         LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         LLVMTypeRef svi32 = LLVMInt32TypeInContext(g->ctx);
@@ -113,10 +93,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         zan_call2(g->builder, sv_type, sv, sv_args, 4, "");
     }
 
-    /* Programs emit UTF-8 bytes; the Windows console defaults to the legacy
-     * OEM/ANSI code page, which renders CJK/accented output as mojibake.
-     * Switch the console to UTF-8 (65001). Only affects console rendering:
-     * output redirected to a pipe/file keeps its raw UTF-8 bytes. */
+    /* 内部辅助实现 */
     if (g->target_is_windows) {
         LLVMValueRef set_out_cp = LLVMGetNamedFunction(g->mod, "SetConsoleOutputCP");
         LLVMTypeRef setcp_type = LLVMFunctionType(i32ty, (LLVMTypeRef[]){ i32ty }, 1, 0);
@@ -132,9 +109,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
 
     g->current_fn = main_fn;
     g->current_fn_ret_type = LLVMInt32TypeInContext(g->ctx);
-    /* --strict-runtime: mark this binary fail-fast before any user code runs,
-     * so a guard failure exits(70) even without ZAN_RT_HARD=1 in the
-     * environment (the env var still overrides when explicitly set to 0) */
+    /* 内部辅助逻辑 */
     if (g->strict_runtime) {
         LLVMTypeRef strict_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
                                                  NULL, 0, 0);
@@ -163,21 +138,13 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                        &g->fn_report_leaks, 1, "");
     }
 
-    /* Initialize the coroutine scheduler exactly once, before the body runs,
-     * so coroutines spawned before any root-level await remain enqueued.
-     * Harmless for non-async programs (it just nulls an already-empty queue). */
+    /* 协程工作窃取调度器 */
     zan_call2(g->builder, g->rt_co_sched_init_type, g->rt_co_sched_init, NULL, 0, "");
 
-    /* The static-field initializers below emit calls into Main's entry block.
-     * Anchor them to Main's source location so that, under -g, calls to
-     * (possibly always-inlined) generated helpers such as Foo_Defaults carry a
-     * !dbg location; the LLVM verifier rejects inlinable calls without one in a
-     * function that has debug info. No-op when debug info is disabled. */
+    /* The static-field initializers below emit calls into Main's entry block */
     di_set_loc(g, method->loc);
 
-    /* Apply static-field initializers once, at program entry, into their
-     * backing globals. Runs before the Main body so every subsequent read
-     * (in Main or in any method/coroutine) observes the initialized value. */
+    /* 内部辅助逻辑 */
     if (unit && unit->kind == AST_COMPILATION_UNIT) {
         local_scope_t *sf_locals = local_scope_new(g->arena);
         zan_symbol_t *saved_type = g->current_type_sym;
@@ -194,19 +161,12 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                 if (m->kind != AST_FIELD_DECL && m->kind != AST_PROPERTY_DECL) continue;
                 if (!(m->field_decl.modifiers & MOD_STATIC)) continue;
                 if (!m->field_decl.initializer) continue;
-                /* a custom-accessor static property has no backing global; only
-                 * automatic static properties (`static T P { get; set; }`)
-                 * accept an initializer */
+                /* 内部辅助逻辑 */
                 if (m->kind == AST_PROPERTY_DECL &&
                     (m->field_decl.getter_body || m->field_decl.setter_body))
                     continue;
                 zan_symbol_t *fs = get_field_sym(csym, m->field_decl.name);
-                /* A generic class's static is per closed instantiation, so its
-                 * initializer runs once for each instantiation the program
-                 * uses -- one store into one shared global would leave every
-                 * other instantiation at zero. The list grows with the
-                 * instantiation count: a fixed 64-slot table silently stopped
-                 * initializing past the 64th instantiation. */
+                /* 内部辅助实现 */
                 zan_type_t **insts = NULL;
                 int ninst = 0, inst_cap = 0;
                 if (d->type_decl.type_params.count > 0) {
@@ -257,12 +217,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                 free(insts);
             }
         }
-        /* ...then run each `static T()` type initializer, in declaration
-         * order, so a static field it assigns is already set before any user
-         * code (Main or a method reached from it) can observe it. C# triggers
-         * these lazily on first use of the type; running them all at entry is
-         * the same observable order for a single-file program and avoids a
-         * per-type guard on every static access. */
+        /* 内部辅助实现 */
         for (int di = 0; di < unit->comp_unit.decls.count; di++) {
             zan_ast_node_t *d = unit->comp_unit.decls.items[di];
             if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL) continue;
@@ -278,10 +233,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         g->current_this = saved_this;
     }
 
-    /* An async Main was emitted in Pass 2 as a normal ramp/$resume pair (see
-     * the Main skip in emit_user_methods). Call the ramp, enqueue the frame,
-     * and run the scheduler to completion so root-level awaits and Task.Spawn
-     * share one ready queue. */
+    /* 内部辅助逻辑 */
     if ((method->method_decl.modifiers & MOD_ASYNC) &&
         method->method_decl.params.count == 0 && type_sym) {
         char ramp_name[512];
@@ -309,8 +261,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
             LLVMValueRef res = LLVMBuildLoad2(g->builder, i64, rptr, "main.res");
             zan_emit_frame_free(g, sub_i8);
             emit_release_static_rc_fields(g, unit);
-            /* void Main: the result slot is zero-initialized, so this still
-             * returns 0. */
+            /* void Main: the result slot is zero-initialized, so this still returns 0 */
             LLVMBuildRet(g->builder, LLVMBuildTrunc(g->builder, res,
                 LLVMInt32TypeInContext(g->ctx), "main.ret"));
             g->current_type_sym = NULL;
@@ -321,8 +272,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
 
     local_scope_t *locals = local_scope_new(g->arena);
 
-    /* `static void Main(string[] args)`: build the parameter array from
-     * __zan_argc/__zan_argv: element i is an owned copy of argv[i+1]. */
+    /* 内部辅助逻辑 */
     if (method->method_decl.params.count == 1) {
         zan_ast_node_t *param = method->method_decl.params.items[0];
         zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
@@ -355,10 +305,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                 LLVMSizeOf(i8ptrptr), "ma.total");
             LLVMValueRef arr = zan_array_alloc_typed(g, total, n, g->binder->type_string);
             LLVMValueRef argv = LLVMBuildLoad2(g->builder, i8ptrptr, g_argv, "ma.argv");
-            /* fill loop: copy each C string into an owned rc string. Strided
-             * blocks share the alloc site; bounds are runtime values here, so
-             * the loop is emitted as a small count-guarded chain over a
-             * scratch-free pattern: fill[i] lives in its own block. */
+            /* fill loop: copy each C string into an owned rc string */
             LLVMValueRef lp = emit_entry_alloca(g, i64t, "ma.i");
             zan_store_fit(g, LLVMConstInt(i64t, 0, 0), lp);
             LLVMValueRef ffn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
@@ -405,17 +352,14 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
             LLVMPositionBuilderAtEnd(g->builder, done_bb);
             zan_type_t *args_type = zan_binder_make_array_type(g->binder,
                 g->binder->type_string);
-            /* the slot holds the array pointer; the local owns the array, so
-             * overwrite/scope-exit release it like any rc local */
+            /* 内部辅助逻辑 */
             LLVMValueRef slot_a = emit_entry_alloca(g, i8ptrptr, "ma.slot");
             zan_store_fit(g, arr, slot_a);
             local_add(locals, param->param.name, slot_a, args_type);
             box_captured_parameter(g, locals, param, args_type, i8ptrptr, arr,
                                    method->method_decl.body);
             if (locals->vars[locals->count - 1].box_cell) {
-                /* The synthetic argv array arrives owned, unlike an ordinary
-                 * borrowed method argument. box_captured_parameter retained it
-                 * for the cell, so drop the original Main-slot reference. */
+                /* 内部辅助逻辑 */
                 emit_rc_release_for_type(g, args_type, arr);
             } else {
                 arc_own_local(g, locals);
@@ -441,9 +385,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
 
 /* ---- emit user-defined methods ---- */
 
-/* Deferred body-emission work item: captures everything needed to emit a
- * method/constructor body after ALL functions have been declared, so bodies
- * may make forward references to methods declared later. */
+/* 内部辅助逻辑 */
 typedef struct {
     zan_ast_node_t *member;
     zan_symbol_t   *type_sym;
@@ -454,8 +396,7 @@ typedef struct {
     bool            is_static;
     LLVMTypeRef     llvm_ret;
     zan_type_t     *ret_type;
-    /* async CPS lowering: when is_async, `fn` is the ramp (returns the task
-     * handle) and the body is emitted into `resume_fn` over `frame_type`. */
+    /* 内部辅助逻辑 */
     bool            is_async;
     LLVMValueRef    resume_fn;
     LLVMTypeRef     frame_type;
@@ -466,8 +407,7 @@ typedef struct {
     int             ret_agg_slot;   /* frame index of aggregate return slot (-1 if none) */
     int             handler_cap;    /* per-handler slots in the frame */
     int             try_count;      /* lexical try blocks in the body (0 if none) */
-    /* Lexical cleanup depth bounds pending owners after abandoned scopes
-     * are discarded; the frame allows one extra selected return record. */
+    /* 内部辅助逻辑 */
     int             fin_depth_max;
     zan_type_t     *cur_inst;       /* instantiation being specialized, or NULL */
     LLVMTypeRef     fn_type;        /* signature of `fn` (the ramp, when async) */
@@ -475,7 +415,7 @@ typedef struct {
     zan_type_t    **mbind;          /* their concrete bindings, or NULL */
 } method_body_work_t;
 
-/* Count how many discovered instantiations exist for a given generic type. */
+/* Count how many discovered instantiations exist for a given generic type */
 static int generic_variant_count(zan_irgen_t *g, zan_symbol_t *type_sym) {
     int n = 0;
     for (int i = 0; i < g->generic_inst_count; i++)
@@ -487,11 +427,7 @@ static bool method_is_tp_template(zan_irgen_t *g, zan_ast_node_t *member);
 static bool class_member_uses_tp(zan_irgen_t *g, zan_ast_node_t *decl,
                                  zan_ast_node_t *member);
 
-/* Body for the erased variant of a generic-class member that reaches into one
- * of the class's type parameters: there is no erased lowering for `t.Member`
- * when T is unknown, and every call site whose receiver instantiation is known
- * routes to a specialized variant instead. Keeping the symbol (rather than
- * dropping it) keeps every existing reference linkable. */
+/* 内部辅助实现 */
 static void emit_tp_erased_stub(zan_irgen_t *g, LLVMValueRef fn) {
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
@@ -507,11 +443,7 @@ static void emit_tp_erased_stub(zan_irgen_t *g, LLVMValueRef fn) {
     zan_irgen_compact_completed(g, fn);
 }
 
-/* Declare the ramp/resume pair and heap-frame layout of an async method.
- * Shared by Pass A (the erased / per-class-instantiation variants) and by an
- * async method specialization created from a call site: with the type-param
- * bindings active (g->cur_mtps / g->cur_mbind / g->cur_inst) every type in the
- * signature, frame and local layout resolves to its concrete form. */
+/* Declare the ramp/resume pair and heap-frame layout of an async method */
 static bool is_task_like_type(zan_type_t *t) {
     if (!t) return false;
     if (t->kind == TYPE_TASK) return true;
@@ -541,18 +473,13 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
 
-        /* Normalize awaits into A-normal form so no intermediate value
-         * crosses a suspension in a register (compound / multiple
-         * awaits). This mutates the body in place; the scan and body
-         * emission below both see the rewritten tree. */
+        /* 内部辅助实现 */
         {
             int anf_counter = 0;
             anf_normalize_block(g, member->method_decl.body, &anf_counter);
         }
 
-        /* Scan the body: count await points (→ states / sub-task slots)
-         * and collect named scalar locals that must live in the frame
-         * so they survive across suspensions. */
+        /* 内部辅助逻辑 */
         async_scan_t scan = { .g = g, .scope =
                               local_scope_new(g->arena) };
         scan.body = member->method_decl.body;
@@ -573,15 +500,10 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         w->alocal_count = scan.local_count;
         w->fin_depth_max = scan.fin_depth_max;
         w->try_count = scan.try_count;
-        /* One per-handler slot group per try the body lowers. LLVM
-         * rejects a zero-length array member, so a body with no try at
-         * all still gets one unused slot. */
+        /* One per-handler slot group per try the body lowers */
         w->handler_cap = scan.try_count > 0 ? scan.try_count : 1;
 
-        /* frame = fixed header + params + frame locals +
-         * at most one shared i8* sub-task handle slot across all await points.
-         * A coroutine is suspended on at most one child at a time; sharing
-         * the slot shrinks frames and LLVM struct types from O(N_await) to O(1). */
+        /* 内部辅助逻辑 */
         int locals_base = ASYNC_FRAME_FIRST_PARAM + total_params;
         w->sub_base = locals_base + w->alocal_count;
         int nfields = w->sub_base + (w->await_count > 0 ? 1 : 0);
@@ -635,8 +557,7 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         fields[ASYNC_FRAME_CEXC] = LLVMArrayType(i8ptr, (unsigned)w->handler_cap);
         fields[ASYNC_FRAME_CEXC_OWNED] = LLVMArrayType(i32, (unsigned)w->handler_cap);
         fields[ASYNC_FRAME_CEXC_TID] = LLVMArrayType(i8ptr, (unsigned)w->handler_cap);
-        /* Each live pending exit encloses an executing finally. One additional
-         * record holds a nested attempted return before its cleanup begins. */
+        /* Each live pending exit encloses an executing finally */
         {
             unsigned pending_cap = w->fin_depth_max > 0
                 ? (unsigned)w->fin_depth_max + 1 : 0;
@@ -665,8 +586,7 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         LLVMStructSetBody(frame_type, fields, (unsigned)nfields, 0);
         free(fields);
 
-        /* ramp keeps the external param list but returns the task
-         * handle (i8*); the body runs later in resume(frame). */
+        /* 内部辅助逻辑 */
         w->fn_type = LLVMFunctionType(i8ptr, param_types, (unsigned)total_params, 0);
         w->fn = fn = LLVMAddFunction(g->mod, fn_name, w->fn_type);
         if (!(g->emit_lib &&
@@ -681,8 +601,7 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
     (void)type_sym; (void)is_static;
 }
 
-/* Emit the ramp, resume state machine and cleanup fn of one async method.
- * Shared by Pass A/B and by async method specializations (A32-3b). */
+/* 发射the ramp, resume state machine and cleanup fn of one async method */
 static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
     zan_ast_node_t *member = w->member;
     zan_symbol_t *type_sym = w->type_sym;
@@ -707,9 +626,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         int total_params = param_count + param_offset;
 
-        /* Per-coroutine cleanup fn (stored in the frame header): releases
-         * every rc value the frame owns and frees the frame itself. Called
-         * by __zan_async_unwind when an exception skips this frame. */
+        /* 内部辅助逻辑 */
         LLVMValueRef cleanup_fn;
         {
             size_t rn_len = 0;
@@ -724,20 +641,13 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         /* ---- ramp ---- */
         LLVMBasicBlockRef ramp_entry = LLVMAppendBasicBlockInContext(g->ctx, ramp_fn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, ramp_entry);
-        /* -g: anchor to the async method's decl line so ramp/resume prologue
-         * calls (frame malloc/memset, arg retains, state restore) carry an
-         * in-scope !dbg -- the resume fn gains a DISubprogram from its body
-         * statements, and LLVM rejects any inlinable call without a location
-         * in a debug-info function. (no-op when debug info is disabled.) */
+        /* 内部辅助实现 */
         di_set_loc(g, member->loc);
         LLVMTypeRef malloc_ty = LLVMGlobalGetValueType(g->fn_malloc);
         LLVMValueRef fsize = LLVMSizeOf(frame_type);
         LLVMValueRef raw = zan_call2(g->builder, malloc_ty, g->fn_malloc, &fsize, 1, "frame.raw");
         zan_irgen_emit_oom_check(g, ramp_fn, raw);
-        /* Zero the frame so every owning (RC) local slot starts null. The
-         * per-iteration capture of a loop-body local releases the previous
-         * occupant of its frame field; that requires the slot to be null
-         * (not garbage) before its first write. */
+        /* Zero the frame so every owning (RC) local slot starts null */
         {
             LLVMTypeRef i8ptr0 = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef memset_ty = LLVMFunctionType(i8ptr0,
@@ -764,9 +674,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_RESULT, "rs"));
         LLVMBuildStore(g->builder, cleanup_fn,
             LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_CLEANUP, "cl"));
-        /* Record this frame's own resume fn so an awaiter can drive it
-         * without resolving `<ramp>$resume` by name -- the only way to await
-         * an indirect (delegate/function-pointer) async call. */
+        /* 内部辅助逻辑 */
         LLVMBuildStore(g->builder, resume_fn,
             LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_SELF_STEP, "selfstep"));
         for (int k = 0; k < total_params; k++) {
@@ -774,20 +682,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             LLVMValueRef slot = LLVMBuildStructGEP2(g->builder, frame_type, rframe,
                 (unsigned)(ASYNC_FRAME_FIRST_PARAM + k), "arg");
             LLVMBuildStore(g->builder, pv, slot);
-            /* The caller passes arguments by borrow and releases owned temps
-             * right after the ramp returns, but the heap frame outlives that
-             * temp and the coroutine reads the argument after suspension. So
-             * the frame takes ownership of ARC-managed by-value arguments: it
-             * retains here (synchronously, before the caller's release) and
-             * releases them from emit_async_complete (see the matching
-             * arc_owned marking on the resume-body param locals).
-             *
-             * The receiver needs the same treatment: a fluent receiver temp
-             * (`db.Select<T>().Where(..).ToListAsync()`, `Make().RunAsync()`)
-             * is an owned temp the caller releases as soon as the ramp
-             * returns -- before the body has run a single statement -- so a
-             * borrowed `this` would be a use-after-free (unlike a synchronous
-             * method, whose body has already finished by then). */
+            /* 内部辅助实现 */
             if (k < param_offset) {
                 zan_type_t *rt = type_sym ? type_sym->type : NULL;
                 if (is_rc_managed_type(rt) &&
@@ -810,11 +705,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
                 }
             }
         }
-        /* A captured frame local owns a cell, not the value inside it. Creating
-         * these cells in the ramp makes the entry binding valid on the first
-         * invocation as well as every resumed state; only declaration execution
-         * evaluates an initializer. Null payloads also make cancellation before
-         * a declaration and an initializer that throws safe to clean up. */
+        /* A captured frame local owns a cell, not the value inside it */
         for (int k = 0; k < w->alocal_count; k++) {
             async_local_t *al = &w->alocals[k];
             if (!al->boxed) continue;
@@ -840,12 +731,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
 
         local_scope_t *locals = local_scope_new(g->arena);
 
-        /* `this`, params and named locals live directly in the heap frame.
-         * Keep typed alloca proxies while emitting so LLVMGetAllocatedType and
-         * the existing local-address helpers remain valid. After all body / EH
-         * emission, replace them with entry frame GEPs. The ramp memset is the
-         * only zero initialization: entry stores would clobber persisted values
-         * on every resume once these proxies are rewritten. */
+        /* `this`, params and named locals live directly in the heap frame */
         int alocal_count = w->alocal_count;
         int slot_total = total_params + alocal_count;
         zan_async_slot_t *slots = (zan_async_slot_t *)zan_arena_alloc(g->arena,
@@ -864,9 +750,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             LLVMTypeRef pty = param_types[k + param_offset];
             LLVMValueRef pa = LLVMBuildAlloca(g->builder, pty, "p");
             zan_type_t *pt = resolve_type_ctx(g, param->param.type);
-            /* A ref/out frame field stores the caller's slot address, not the
-             * variable's value. Rebind that address on each invocation; reads
-             * and writes then follow the same caller-owned protocol as sync. */
+            /* A ref/out frame field stores the caller's slot address, not the variable's value */
             LLVMValueRef binding = param->param.by_ref
                 ? LLVMBuildLoad2(g->builder, pty, pa, "p.ref") : pa;
             local_add(locals, param->param.name, binding, pt);
@@ -875,8 +759,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
                 locals->vars[locals->count - 1].arc_owned = 1;
             if (pt && pt->kind == TYPE_STRING)
                 locals->vars[locals->count - 1].opaque_string = 1;
-            /* Balances the retain the ramp performed for ARC-managed by-value
-             * params: the frame owns them, so release at coroutine completion. */
+            /* 内部辅助逻辑 */
             if (!param->param.by_ref && is_rc_managed_type(pt) &&
                 LLVMGetTypeKind(pty) == LLVMPointerTypeKind) {
                 locals->vars[locals->count - 1].arc_owned = 1;
@@ -891,13 +774,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         }
         for (int k = 0; k < alocal_count; k++) {
             LLVMValueRef la = LLVMBuildAlloca(g->builder, w->alocals[k].llvm, "fl");
-            /* USER-declaration slots carry a $-prefixed scope name so they are
-             * invisible to by-name lookup: user visibility starts when the
-             * declaration BINDS and adds its own entry (the alias), so a
-             * same-named declaration later in the method can never shadow an
-             * earlier loop's variable from the prologue on. Foreach state
-             * slots bind by statement identity and role; copy counts can differ
-             * between the conservative scan and shared finally emission. */
+            /* 内部辅助实现 */
             zan_istr_t fname;
             if (w->alocals[k].decl) {
                 char flbuf[80];
@@ -911,9 +788,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
                 fname = w->alocals[k].name;
             }
             local_add(locals, fname, la, w->alocals[k].ztype);
-            /* A31x write side: tag the slot with the declaration node the
-             * scan registered it from; binding resolves its own slot by
-             * node (local_find_async_decl) instead of by name. */
+            /* 内部辅助逻辑 */
             local_var_t *lv = &locals->vars[locals->count - 1];
             lv->async_decl = w->alocals[k].decl;
             lv->async_role = w->alocals[k].role;
@@ -926,9 +801,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
                 lv->box_cell = cell;
                 lv->box_owner_slot = la;
                 lv->box_owned = 1;
-                /* Payload stores own their values, but this prefix entry owns
-                 * only the cell. release_boxed_local releases and nulls its
-                 * frame owner; payload clearing must never touch escaped cells. */
+                /* Payload stores own their values, but this prefix entry owns only the cell */
             } else if (!w->alocals[k].no_arc &&
                        is_rc_managed_type(w->alocals[k].ztype) &&
                        LLVMGetTypeKind(w->alocals[k].llvm) == LLVMPointerTypeKind) {
@@ -1055,24 +928,15 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_this_owned = this_owned;
         g->current_async_this_type = this_owned_type;
 
-        /* arm this invocation's exception trampoline (and re-arm the
-         * handlers of the tries the frame is suspended inside) before the
-         * state dispatch, so a throw anywhere in the body lands on a live
-         * stack frame */
+        /* 内部辅助实现 */
         emit_async_eh_prologue(g);
 
-        /* This invocation is running, so it is not suspended on a
-         * sub-frame: drop the CHILD link the last suspension left behind
-         * (it is about to be consumed and freed). Cancellation walks that
-         * chain, and a stale entry would point at freed memory. */
+        /* 内部辅助实现 */
         LLVMBuildStore(g->builder,
             LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0)),
             get_async_child_ptr(g));
 
-        /* Check cooperative cancellation before state dispatch: if cancellation
-         * was requested while suspended, bail out directly to co.cancelled
-         * without entering any resume-k block. This eliminates duplicate cancel
-         * checks and block splitting across all await sites. */
+        /* 内部辅助实现 */
         LLVMValueRef cancel_ptr = get_async_cancel_ptr(g);
         LLVMValueRef cancel_val = LLVMBuildLoad2(g->builder, i32, cancel_ptr, "fr.cancelled");
         LLVMBasicBlockRef can_bb = get_async_cancel_bb(g, locals);
@@ -1092,8 +956,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             get_async_state_ptr(g),
             "state");
         LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "co.start");
-        /* switch(state): case 0 (start) -> body; each await point appends a
-         * resume-k case (see the AST_AWAIT_EXPR lowering). */
+        /* 内部辅助逻辑 */
         LLVMValueRef sw = LLVMBuildSwitch(g->builder, state, body_bb, (unsigned)(w->await_count + 1));
         LLVMAddCase(sw, LLVMConstInt(i32, 0, 0), body_bb);
         g->current_async_switch = sw;
@@ -1116,13 +979,12 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
                                        g->current_async_ret_type));
         }
 
-        /* fall off the end: implicit completion (void / default result). */
+        /* fall off the end: implicit completion (void / default result) */
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
             emit_async_complete(g, locals, NULL);
         }
 
-        /* an exception nothing in the body caught completes the coroutine
-         * with that exception, for the awaiter to re-throw */
+        /* 内部辅助逻辑 */
         emit_async_exc_epilogue(g, locals);
         emit_async_complete_epilogue(g, locals);
         emit_async_finalize_slots(g);
@@ -1179,11 +1041,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_this_owned = saved_this_owned;
         g->current_async_this_type = saved_this_owned_type;
 
-        /* ---- cleanup: release owned rc slots from the frame, free it.
-         * Mirrors the arc_owned marking above: by-value rc params (the
-         * ramp retained them) and frame-resident rc locals. Values are
-         * read from the heap frame, the sole live storage while the coroutine
-         * is executing as well as while it is suspended. */
+        /* ---- cleanup: release owned rc slots from the frame, free it */
         {
             LLVMBasicBlockRef cl_entry =
                 LLVMAppendBasicBlockInContext(g->ctx, cleanup_fn, "entry");
@@ -1229,8 +1087,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
                 emit_collection_value_release(g, al->ztype, v, 0);
             }
             emit_async_pending_discard(g, cframe, frame_type, LLVMConstInt(i32, 0, 0));
-            /* an unwound frame is gone without completing: a DELAY entry still
-             * parked on it would wake freed memory when it comes due */
+            /* 内部辅助逻辑 */
             emit_co_cancel_delay(g, cparam);
             zan_emit_frame_free(g, cparam);
             LLVMBuildRetVoid(g->builder);
@@ -1241,9 +1098,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             emit_async_pending_discard_body(g, frame_type, w->ret_type);
             pending_discard_fn = async_pending_discard_fn(g, frame_type);
         }
-        /* All async emission and typed-address inspection are now finished.
-         * Move the builder out before compaction can delete instructions or
-         * blocks; only stable function handles are used after this point. */
+        /* All async emission and typed-address inspection are now finished */
         if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
         else LLVMClearInsertionPosition(g->builder);
         zan_irgen_compact_completed(g, resume_fn);
@@ -1258,17 +1113,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
     (void)type_sym; (void)fn;
 }
 
-/* A parameter the body assigns to must own what its slot holds. An argument
- * arrives borrowed, so with a plain slot `t = p; p = q; q = t;` left the
- * *owned* local holding the caller's object -- and scope exit released it,
- * freeing an object the caller was still using. The stdlib's generic merge
- * sort swaps its key parameter exactly like this: `orderby` returned a
- * half-merged list and then corrupted the heap. Retaining on entry makes the
- * slot symmetric with a local: assignments release the previous occupant, and
- * scope exit or unwinding releases the last one. Parameters that are only read
- * keep the zero-cost borrow. `object` is excluded because its ownership is
- * tracked by a per-slot runtime flag (obj_rc_flag) rather than statically, and
- * `ref`/`out` parameters have their own byref_slot protocol. */
+/* A parameter the body assigns to must own what its slot holds */
 static void own_written_param(zan_irgen_t *g, local_scope_t *locals,
                               zan_ast_node_t *param, zan_type_t *pt,
                               LLVMTypeRef pty, LLVMValueRef pv,
@@ -1285,13 +1130,10 @@ static void own_written_param(zan_irgen_t *g, local_scope_t *locals,
 static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                                                  zan_ast_node_t *unit,
                                                  int *out_work_count) {
-    /* Discover every concrete instantiation of a user generic class up front so
-     * Pass A can emit one specialized variant per instantiation (in addition to
-     * the erased variant). */
+    /* 内部辅助逻辑 */
     discover_generic_insts(g, unit);
 
-    /* Size an upper bound for the deferred body work list, counting the erased
-     * variant plus one per discovered instantiation for generic types. */
+    /* 内部辅助逻辑 */
     int work_cap = 0;
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
@@ -1316,15 +1158,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
         zan_symbol_t *type_sym = zan_binder_lookup(g->binder, decl->type_decl.name);
         if (!type_sym) continue;
 
-        /* Emit one variant per (erased + each concrete instantiation). The
-         * erased variant (cur_variant == NULL) keeps the existing symbol names
-         * and registration; specialized variants add a name suffix and register
-         * into the generic fn/ctor tables. Signatures are identical across
-         * variants (type parameters still lower to the erased representation);
-         * only the body differs, via g->cur_inst set in Pass B. The list grows
-         * with the instantiation count: a fixed 64-slot table left the last
-         * instantiation's specialized body undefined, so its call sites fell
-         * back to the erased "abort" stub at run time. */
+        /* 发射one variant per (erased + each concrete instantiation) */
         int nvar = 0, var_cap = 8;
         zan_type_t **variants =
             (zan_type_t **)malloc((size_t)var_cap * sizeof(*variants));
@@ -1351,26 +1185,15 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
             zan_ast_node_t *member = decl->type_decl.members.items[j];
             bool is_ctor = (member->kind == AST_CONSTRUCTOR_DECL);
             if (member->kind != AST_METHOD_DECL && !is_ctor) continue;
-            /* `static T()` is a type initializer (cctor), not an instance
-             * constructor: it takes no `this`, is never selected by `new T(...)`,
-             * and runs once at program entry (emit_main_method calls T_cctor). */
+            /* 内部辅助逻辑 */
             bool is_type_init = is_ctor &&
                 (member->method_decl.modifiers & MOD_STATIC) != 0;
-            /* A generic type's initializer is emitted once, off the erased
-             * declaration, not per instantiation. */
+            /* 内部辅助逻辑 */
             if (is_type_init && cur_variant) continue;
-            /* A generic method that reaches into its own type parameters is a
-             * template: it exists only as monomorphized copies, emitted from
-             * the call sites (emit_method_spec_body). Emitting an erased
-             * instance here produced broken IR, since `c.Name()` on a T has
-             * nothing to resolve against. */
-            /* an instance template monomorphizes too (`this` is prepended to
-             * the specialized signature; a generic declaring type adds its
-             * instantiation to the specialization key), and so does an async
-             * one (its ramp/resume/frame are built per specialization). */
+            /* 内部辅助实现 */
+            /* 内部辅助实现 */
             if (method_is_tp_template(g, member)) continue;
-            /* extern/DllImport methods have no generic body: only the erased
-             * variant declares them. */
+            /* 内部辅助逻辑 */
             bool is_extern_decl =
                 member->kind == AST_METHOD_DECL && !member->method_decl.body &&
                 (zan_ast_method_extern_lib(member).str ||
@@ -1378,9 +1201,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
             if (cur_variant && is_extern_decl)
                 continue;
 
-            /* extern methods (with or without [DllImport]) become a plain
-             * external declaration resolved by the linker; without one a
-             * bodyless extern would silently return a default value. */
+            /* 内部辅助逻辑 */
             if (is_extern_decl) {
                 /* build extern function declaration */
                 int pc = member->method_decl.params.count;
@@ -1396,9 +1217,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                     ? zan_binder_resolve_type(g->binder, member->method_decl.return_type)
                     : g->binder->type_void;
                 LLVMTypeRef llvm_rt = map_type(g, rt);
-                /* Variadic = true (A2-3): the C callee is varargs, so the
-                 * declaration carries the trailing ... and calls may pass
-                 * more arguments than the declared parameters. */
+                /* 内部辅助逻辑 */
                 LLVMTypeRef ft = LLVMFunctionType(llvm_rt, pt, (unsigned)pc,
                     member->method_decl.is_variadic ? 1 : 0);
                 /* use entry_point if specified, otherwise method name */
@@ -1414,15 +1233,10 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                 }
                 if (strncmp(ext_name, "zan_file_", 9) == 0 ||
                     strncmp(ext_name, "zan_pkg_", 8) == 0) {
-                    /* file metadata + FILE* stream IO (System.IO.FileInfo /
-                     * FileStream): split into its own runtime object so a
-                     * file-IO program does not drag in the atomics/threads/
-                     * shared-table runtime (rt_file.o vs rt_sync.o). */
+                    /* file metadata + FILE* stream IO (System */
                     g->uses_file_runtime = true;
                 }
-                /* Every symbol family rt_sync.c exports, so a program that
-                 * declares one links the object. The list must stay in sync
-                 * with rt_sync.c's exports. */
+                /* Every symbol family rt_sync */
                 if (strncmp(ext_name, "zan_atomic_int_", 15) == 0 ||
                     strncmp(ext_name, "zan_shared_", 11) == 0 ||
                     strncmp(ext_name, "zan_thread_", 11) == 0 ||
@@ -1438,11 +1252,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                         fprintf(stderr, "[sync-flag] %s\n", ext_name);
                     g->uses_sync_runtime = true;
                 }
-                /* Any zan_io_ export (sockets today, future io helpers
-                 * tomorrow) pulls in the reactor object. Matching the
-                 * family prefix rather than each name prevents the next
-                 * runtime addition from linking as an undefined symbol
-                 * only on user machines with stale-but-valid bundles. */
+                /* 内部辅助逻辑 */
                 if (strncmp(ext_name, "zan_io_", 7) == 0) {
                     g->uses_socket_async = true;
                 }
@@ -1460,15 +1270,8 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                         g->uses_inflate = true;
                     }
                 }
-                /* Reuse existing declaration if the symbol already exists in the module
-                 * (e.g. built-in malloc/free/strlen, or duplicate DllImport across files). */
-                /* A struct crossing the boundary is not passed the way LLVM
-                 * passes a first-class aggregate: abi_extern_thunk declares the
-                 * symbol with the platform C signature and wraps it. A varargs
-                 * callee cannot be forwarded through such a thunk, so a
-                 * Variadic = true extern always declares plain (C gives a
-                 * struct argument to a variadic callee no better ABI than
-                 * this anyway). */
+                /* Reuse existing declaration if the symbol already exists in the module (e */
+                /* 内部辅助实现 */
                 LLVMValueRef efn = NULL;
                 if (!member->method_decl.is_variadic)
                     efn = abi_extern_thunk(g, ext_name, ft);
@@ -1501,8 +1304,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                         g->extern_libs[g->extern_lib_count++] = ext_lib;
                     }
                 }
-                /* record (lib, fn) so an unresolvable lib can be stubbed when
-                 * cross-linking a static Linux binary */
+                /* 内部辅助逻辑 */
                 if (ext_lib.str) {
                     zan_istr_t *ep = zan_ast_method_entry_point(member);
                     zan_istr_t sym = ep ? *ep : member->method_decl.name;
@@ -1528,21 +1330,14 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
 
             if (!member->method_decl.body) continue;
 
-            /* skip static Main — handled separately. An `async` Main IS
-             * emitted here, as an ordinary ramp/$resume pair: the real `main`
-             * (emit_main_method) then drives it on the scheduler. Inlining an
-             * async Main's body at the root would lower every `await
-             * Task.Delay` to a bare sleep that never runs the ready queue, so
-             * coroutines spawned with Task.Spawn would starve. */
+            /* skip static Main — handled separately */
             bool is_static = (!is_ctor || is_type_init) &&
                 (member->method_decl.modifiers & MOD_STATIC) != 0;
             if (is_static && member->method_decl.name.len == 4 &&
                 memcmp(member->method_decl.name.str, "Main", 4) == 0 &&
                 !(member->method_decl.modifiers & MOD_ASYNC)) continue;
 
-            /* build function name: TypeName_MethodName or TypeName_ctor,
-             * plus a per-instantiation suffix (e.g. HashSet_Add$string) for a
-             * specialized variant so it does not collide with the erased one. */
+            /* 内部辅助逻辑 */
             char fn_name[512];
             if (is_type_init) {
                 snprintf(fn_name, sizeof(fn_name), "%.*s_cctor",
@@ -1556,13 +1351,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                          (int)decl->type_decl.name.len, decl->type_decl.name.str,
                          (int)member->method_decl.name.len, member->method_decl.name.str,
                          vsuffix);
-                /* Same-named overloads would otherwise all be added as this
-                 * one LLVM symbol; LLVM silently renames the later ones (e.g.
-                 * "Box_GetAsync.1"), which breaks the async ramp/$resume
-                 * pairing - an await site derives the resume symbol from the
-                 * callee's actual name and would find nothing, falling into
-                 * the legacy busy-wait path (a hang). Uniquify explicitly so
-                 * every ramp keeps a matching "$resume". */
+                /* 内部辅助逻辑 */
                 {
                     char base_name[512];
                     int oi = 2;
@@ -1588,10 +1377,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                 param_offset = 1;
             }
 
-            /* A specialized variant is monomorphic: its signature must use the
-             * instantiation's concrete types. Leaving a value-type argument
-             * erased to a pointer made the caller pass a struct by value to a
-             * ptr parameter (Box<GVec>.Put), which LLVM rejects. */
+            /* 内部辅助逻辑 */
             for (int k = 0; k < param_count; k++) {
                 zan_ast_node_t *param = member->method_decl.params.items[k];
                 zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
@@ -1607,8 +1393,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                     : g->binder->type_void);
             if (cur_variant) ret_type = subst_type_param_deep(g, ret_type, cur_variant);
             LLVMTypeRef llvm_ret = map_type(g, ret_type);
-            /* async methods lower to a heap frame + ramp + resume (see
-             * docs/ASYNC_CPS_DESIGN.md); ctors are never async. */
+            /* async methods lower to a heap frame + ramp + resume (see docs/ASYNC_CPS_DESIGN */
             bool is_async = !is_ctor && (member->method_decl.modifiers & MOD_ASYNC) != 0;
 
             LLVMTypeRef fn_type = NULL;
@@ -1656,11 +1441,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                     zan_set_module_local(fn);
             }
 
-            /* register in function/ctor table. For async methods the ramp is
-             * the callable symbol (a call site receives the task handle). The
-             * erased variant registers in the ordinary tables; a specialized
-             * variant registers in the generic tables keyed by (sym, args) so a
-             * concrete call site can route to it. */
+            /* register in function/ctor table */
             if (is_type_init) {
                 /* callable only from program entry; not in any dispatch table */
             } else if (is_ctor) {
@@ -1690,9 +1471,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                 }
             }
 
-            /* The erased variant of a member reaching into the class's own
-             * type parameters has no valid lowering; only the specialized
-             * variants below carry a real body. */
+            /* 内部辅助逻辑 */
             if (!cur_variant && class_member_uses_tp(g, decl, member)) {
                 emit_tp_erased_stub(g, fn);
                 if (resume_fn) emit_tp_erased_stub(g, resume_fn);
@@ -1700,8 +1479,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                 continue;
             }
 
-            /* defer body emission to Pass B so calls may forward-reference
-             * methods declared later in this (or another) type */
+            /* 内部辅助逻辑 */
             if (work && work_count < work_cap) {
                 work[work_count].member = member;
                 work[work_count].type_sym = type_sym;
@@ -1736,9 +1514,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
     return work;
 }
 
-/* Pointer-keyed open-addressing map LLVMValueRef -> index into the method
- * work list, providing O(1) parent lookup during the live-use reachability sweep.
- * Built once before the fixpoint starts; the work list is fixed by then. */
+/* 内部辅助逻辑 */
 typedef struct {
     LLVMValueRef key; /* NULL = empty slot */
     int idx;
@@ -1793,8 +1569,7 @@ static int work_fn_index_lookup(const work_fn_index_t *ix, LLVMValueRef key) {
     return -1;
 }
 
-/* Helper: traverse up constant expression / aggregate nodes to locate an enclosing
- * global variable, stopping after a few hops to avoid cycles. */
+/* 内部辅助逻辑 */
 static LLVMValueRef find_owning_global(LLVMValueRef val, int depth) {
     if (!val || depth > 4) return NULL;
     if (LLVMIsAGlobalVariable(val)) return val;
@@ -1809,7 +1584,7 @@ static LLVMValueRef find_owning_global(LLVMValueRef val, int depth) {
     return NULL;
 }
 
-/* Helper: check if a class's instance constructor has already been marked live. */
+/* Helper: check if a class's instance constructor has already been marked live */
 static bool class_ctor_is_live(const work_fn_index_t *ix, const char *cname,
                                const unsigned char *live) {
     if (!ix || !ix->work || !cname) return false;
@@ -1826,8 +1601,7 @@ static bool class_ctor_is_live(const work_fn_index_t *ix, const char *cname,
     return false;
 }
 
-/* Helper: check if a global variable (specifically __zan_vtable_*) is referenced by any
- * live instruction (e.g. object initializer / field 0 store). */
+/* 内部辅助逻辑 */
 static bool vtable_has_live_use(LLVMValueRef vtg, const unsigned char *live,
                                 const work_fn_index_t *ix, int depth) {
     if (!vtg || depth > 4) return false;
@@ -1846,21 +1620,12 @@ static bool vtable_has_live_use(LLVMValueRef vtg, const unsigned char *live,
     return false;
 }
 
-/* LLVM use edges give a conservative pre-body reachability graph: all call
- * targets, method groups, constructor references and vtables are registered
- * before this pass. A declaration used by a live function must have its body
- * emitted; inspecting users of dead functions would bring the whole module
- * back. Globals (reflection tables, static delegates, vtables) can reference
- * functions indirectly, so their edges are always treated as live. */
+/* 内部辅助实现 */
 static bool body_has_live_use(LLVMValueRef fn, const unsigned char *live,
                               const work_fn_index_t *ix) {
     for (LLVMUseRef u = LLVMGetFirstUse(fn); u; u = LLVMGetNextUse(u)) {
         LLVMValueRef user = LLVMGetUser(u);
-        /* A constant expression/aggregate may sit between the function and
-         * the instruction/global that ultimately consumes its address.
-         * For vtables (__zan_vtable_*), only treat the edge as live if the class
-         * has an active constructor or the vtable global itself is referenced
-         * by live code. For other globals/constants, keep conservative root. */
+        /* 内部辅助实现 */
         if (LLVMIsAConstantExpr(user) || LLVMIsAConstantArray(user) ||
             LLVMIsAConstantStruct(user)) {
             LLVMValueRef gv = find_owning_global(user, 0);
@@ -1872,7 +1637,7 @@ static bool body_has_live_use(LLVMValueRef fn, const unsigned char *live,
                         vtable_has_live_use(gv, live, ix, 0)) {
                         return true;
                     }
-                    /* VTable for an uninstantiated class does not keep this method alive. */
+                    /* VTable for an uninstantiated class does not keep this method alive */
                     continue;
                 }
             }
@@ -1881,8 +1646,7 @@ static bool body_has_live_use(LLVMValueRef fn, const unsigned char *live,
         LLVMValueRef parent = LLVMIsAInstruction(user)
             ? LLVMGetBasicBlockParent(LLVMGetInstructionParent(user)) : NULL;
         if (!parent) return true;
-        /* Functions outside the work list (Main, cctors, late generic
-         * specializations) are roots: an unknown parent stays live. */
+        /* 内部辅助逻辑 */
         int i = work_fn_index_lookup(ix, parent);
         if (i < 0 || live[i] == 2) return true;
     }
@@ -1891,8 +1655,7 @@ static bool body_has_live_use(LLVMValueRef fn, const unsigned char *live,
 
 static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
                                     int work_count, unsigned char *live) {
-    /* Pass B: emit the newly reachable bodies, then rescan their outgoing
-     * edges before beginning another batch. 2 means its IR now exists. */
+    /* 内部辅助逻辑 */
     for (int w = 0; w < work_count; w++) {
         if (live[w] != 1) continue;
         live[w] = 2;
@@ -1911,14 +1674,10 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         LLVMTypeRef llvm_ret = work[w].llvm_ret;
         zan_type_t *ret_type = work[w].ret_type;
         LLVMValueRef this_alloca = NULL;
-        /* Activate the instantiation context for a specialized variant so that
-         * intrinsic element comparisons in this body substitute the type
-         * parameter to its concrete argument (NULL for erased/non-generic). */
+        /* 内部辅助逻辑 */
         g->cur_inst = work[w].cur_inst;
 
-        /* async method: emit ramp (allocate frame, stash params, hand out the
-         * task handle) + resume (state-machine entry running the body). See
-         * docs/ASYNC_CPS_DESIGN.md. */
+        /* 内部辅助逻辑 */
         if (work[w].is_async) {
             emit_async_method_ir(g, &work[w]);
             continue;
@@ -1926,12 +1685,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
 
         LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, entry);
-        /* -g: anchor to the method's declaration line before emitting the
-         * prologue. This eagerly creates this function's DISubprogram and
-         * gives prologue instructions -- notably a constructor's base/chained
-         * ctor call -- a valid in-scope !dbg, which LLVM requires of every
-         * inlinable call in a function that carries debug info. Statements
-         * override it per line. (no-op when debug info is disabled.) */
+        /* g: anchor to the method's declaration line before emitting the prologue */
         di_set_loc(g, member->loc);
 
         local_scope_t *locals = local_scope_new(g->arena);
@@ -1948,17 +1702,12 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
             zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
             if (g->cur_inst) pt = subst_type_param_deep(g, pt, g->cur_inst);
             if (param->param.by_ref) {
-                /* `ref`/`out`: the incoming pointer IS the storage slot, so
-                 * reads/writes go straight through to the caller's variable. */
+                /* 内部辅助逻辑 */
                 local_add(locals, param->param.name,
                           LLVMGetParam(fn, (unsigned)(k + param_offset)), pt);
                 if (pt && pt->kind == TYPE_STRING)
                     locals->vars[locals->count - 1].opaque_string = 1;
-                /* The caller's slot owns the reference it holds, so writing
-                 * through it must retain the new value and release the old
-                 * one; scope exit leaves it alone (byref_slot). Without this
-                 * `out string s; s = v;` handed the caller a borrowed value
-                 * it then released -- a refcount deficit that double-frees. */
+                /* 内部辅助实现 */
                 if (is_rc_managed_type(pt))
                     locals->vars[locals->count - 1].byref_slot =
                         locals->vars[locals->count - 1].arc_owned = 1;
@@ -1977,12 +1726,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
             box_captured_parameter(g, locals, param, pt,
                                    param_types[k + param_offset], pv,
                                    member->method_decl.body);
-            /* A struct param is a by-value copy whose rc fields alias
-             * the caller's refcounts. Retain them on entry (the copy is an
-             * owning borrow) so the scope-exit field release below releases
-             * only what this frame took; without it either the copy's writes
-             * alias the caller's +1s or the exit release double-frees them.
-             * By-ref params borrow the caller's slot and are excluded above. */
+            /* A struct param is a by-value copy whose rc fields alias the caller's refcounts */
             if (!locals->vars[locals->count - 1].box_cell && pt &&
                 pt->kind == TYPE_STRUCT &&
                 LLVMGetTypeKind(param_types[k + param_offset]) ==
@@ -2028,8 +1772,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         g->current_fn_is_ctor = member->kind == AST_CONSTRUCTOR_DECL;
         g->current_fn_no_runtime = zan_ast_has_attr(member, "NoRuntime");
 
-        /* `is_static` on a constructor means `static T()`: no `this`, so no
-         * base/this chaining and no instance field initializers. */
+        /* 内部辅助逻辑 */
         if (member->kind == AST_CONSTRUCTOR_DECL && !is_static) {
             bool this_init = member->method_decl.has_this_init;
             bool initializer_target_called = false;
@@ -2176,11 +1919,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         g->current_fn_no_runtime = false;
         free(param_types);
 
-        /* AST Body Discarding: Once a non-generic method's body IR has been
-         * emitted, its statement and expression syntax tree is never read again.
-         * Discard the body pointer immediately so subsequent passes and
-         * error contexts do not retain the syntax tree. (Preserve Main/__DesignMain
-         * until emit_main_method has wrapped the entry block). */
+        /* 内部辅助实现 */
         bool is_ctor = (member->kind == AST_CONSTRUCTOR_DECL);
         bool is_method = (member->kind == AST_METHOD_DECL);
         bool is_entry = is_method &&
@@ -2196,9 +1935,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
                 member->method_decl.body = NULL;
             }
         }
-        /* All terminators, ownership cleanup and local fixups are complete.
-         * The next method installs its own entry; leave no insertion point
-         * inside blocks that function-local compaction may erase. */
+        /* All terminators, ownership cleanup and local fixups are complete */
         if (g->function_compactor) LLVMClearInsertionPosition(g->builder);
         zan_irgen_compact_completed(g, fn);
         if (zan_diag_has_errors(g->diag)) break;
@@ -2207,35 +1944,15 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
     g->cur_inst = NULL;
 }
 
-/* ---- method-level monomorphization (bodies for zan_method_spec) ----
- *
- * A generic method (one declaring its own <T,...>) is normally emitted once
- * with type parameters erased to a machine pointer, which loses type-specific
- * semantics: `<`/`==` on a string key compare pointers, double keys compare
- * raw bits, a replaced ARC value is never released, and an `int` argument or
- * a `T`-typed return travels as an address (`M<int>(7)` handed the callee 7 as
- * a pointer and the caller read the result back as one). Whenever a call site
- * can bind every type parameter to a concrete type, a specialized copy with a
- * concrete signature is declared here and its body emitted from the pending
- * queue; the erased variant only serves calls that cannot bind. */
+/* 内部辅助逻辑 */
 
-/* ---- generic methods that reach into their own type parameters -----------
- * `c.Name()` or `c.id` where `c` is declared with one of the method's own type
- * parameters has no erased form: without a binding for T the member cannot be
- * resolved, and the erased body silently fell through to a default value --
- * miscompiled IR (`ret i32 0` out of a pointer-returning function), rejected
- * by the LLVM verifier. Such a method is a pure template: no erased instance
- * is emitted for it and every call site must monomorphize (A7-1). */
+/* generic methods that reach into their own type parameters ----------- `c */
 
 typedef struct {
     zan_irgen_t    *g;
     zan_ast_node_t *body;
     zan_ast_list_t *tps;
-    /* Locals/params and fields whose declared type is a type parameter. Both
-     * grow with the scan: fixed 32-entry tables silently stopped recording, so
-     * the 33rd T-typed field of a generic class was not recognised as one and
-     * the member was emitted erased -- which then failed with a misleading
-     * "unresolved call 'F32.ToString'". */
+    /* Locals/params and fields whose declared type is a type parameter */
     zan_istr_t     *names;
     int             count;
     int             names_cap;
@@ -2281,7 +1998,7 @@ static bool tp_istr_eq(zan_istr_t a, zan_istr_t b) {
            memcmp(a.str, b.str, (size_t)a.len) == 0;
 }
 
-/* `T` / `T[]` / `List<T>`: a type reference that names a type parameter. */
+/* `T` / `T[]` / `List<T>`: a type reference that names a type parameter */
 static bool tp_typeref_is_tp(tp_use_scan_t *s, zan_ast_node_t *tref) {
     if (!tref || tref->kind != AST_TYPE_REF) return false;
     for (int i = 0; i < s->tps->count; i++)
@@ -2296,7 +2013,7 @@ static bool tp_scan_is_tp_field(tp_use_scan_t *s, zan_istr_t name) {
     return false;
 }
 
-/* `c` (a local/parameter of type T), `item` / `this.item` (a field of type T). */
+/* `c` (a local/parameter of type T), `item` / `this */
 static bool tp_scan_is_tp_value(tp_use_scan_t *s, zan_ast_node_t *e) {
     if (!e) return false;
     if (e->kind == AST_IDENTIFIER) {
@@ -2325,9 +2042,7 @@ static void tp_scan_expr(tp_use_scan_t *s, zan_ast_node_t *e) {
         tp_scan_expr(s, e->index.index);
         return;
     case AST_CALL:
-        /* `Other<T>(x)`: forwarding one of our own type parameters to another
-         * generic call has no erased form either -- the callee is itself a
-         * template, so this body only exists monomorphized */
+        /* 内部辅助逻辑 */
         for (int i = 0; i < e->call.type_args.count; i++)
             if (tp_typeref_is_tp(s, e->call.type_args.items[i])) {
                 s->found = true;
@@ -2434,8 +2149,7 @@ static void tp_scan_stmt(tp_use_scan_t *s, zan_ast_node_t *st) {
     }
 }
 
-/* True when this generic method's body reaches through a value of one of its
- * own type parameters, i.e. it only makes sense monomorphized. */
+/* 内部辅助逻辑 */
 static bool method_is_tp_template(zan_irgen_t *g, zan_ast_node_t *member) {
     if (!member || member->kind != AST_METHOD_DECL) return false;
     zan_ast_list_t *tps = &member->method_decl.type_params;
@@ -2461,10 +2175,7 @@ static bool method_is_tp_template(zan_irgen_t *g, zan_ast_node_t *member) {
     return result;
 }
 
-/* Same question for a member of a generic *class*: does its body reach through
- * a value of one of the class's type parameters (a T field, a T parameter, a T
- * local)? The erased variant of such a body has nothing to resolve the member
- * against, so only the per-instantiation variants are emittable. */
+/* 内部辅助实现 */
 static bool class_member_uses_tp(zan_irgen_t *g, zan_ast_node_t *decl,
                                  zan_ast_node_t *member) {
     if (!decl || !member) return false;
@@ -2503,9 +2214,7 @@ static bool class_member_uses_tp(zan_irgen_t *g, zan_ast_node_t *decl,
     return result;
 }
 
-/* Two specializations share a declaring-type instantiation when they were
- * reached through the same class type arguments (`Pool<string>` vs
- * `Pool<int>`); a non-generic declaring type has none. */
+/* 内部辅助逻辑 */
 static bool mspec_owner_eq(zan_type_t *a, zan_type_t *b) {
     if (a == b) return true;
     if (!a || !b || a->sym != b->sym) return false;
@@ -2519,8 +2228,7 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return -1;
     zan_ast_node_t *member = msym->decl;
     if (!member->method_decl.body) return -1;
-    /* an async body lowers to a ramp/resume/frame triple; it specializes the
-     * same way, with the whole frame layout built from the bound types */
+    /* 内部辅助逻辑 */
     bool spec_async = (member->method_decl.modifiers & MOD_ASYNC) != 0;
     bool spec_static = (member->method_decl.modifiers & MOD_STATIC) != 0;
     zan_ast_list_t *tps = &member->method_decl.type_params;
@@ -2531,11 +2239,7 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     if (!type_sym ||
         (type_sym->kind != SYM_CLASS && type_sym->kind != SYM_STRUCT))
         return -1;
-    /* An instance generic method specializes the same way a static one does,
-     * with `this` prepended to the signature. When the declaring type is
-     * itself generic the specialization is additionally keyed on the receiver's
-     * instantiation, which supplies the class type parameters to every type
-     * resolved out of the body (A32-3a). */
+    /* 内部辅助逻辑 */
     if (!is_user_generic_sym(type_sym)) owner_inst = NULL;
     else if (!spec_static) {
         if (!owner_inst || owner_inst->sym != type_sym ||
@@ -2608,8 +2312,7 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     LLVMValueRef fn = NULL;
     method_body_work_t *air = NULL;
     if (spec_async) {
-        /* the ramp/resume/frame are built with the bindings active, so params,
-         * frame-resident locals and the result all use concrete types */
+        /* 内部辅助逻辑 */
         air = (method_body_work_t *)zan_arena_alloc(g->arena, sizeof(*air));
         memset(air, 0, sizeof(*air));
         air->member = member;
@@ -2663,9 +2366,7 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     return idx;
 }
 
-/* Emit the body of one specialization: the static, non-async subset of
- * emit_user_methods Pass B, with the type-parameter bindings active so every
- * type ref resolved from this body comes out concrete (resolve_type_ctx). */
+/* 内部辅助逻辑 */
 static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     struct zan_method_spec sp = g->method_specs[idx];
     zan_ast_node_t *member = sp.member;
@@ -2686,9 +2387,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, sp.fn, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
-    /* -g: see emit_user_methods Pass B -- anchor to the decl line so the
-     * specialization's prologue (incl. any chained ctor call) gets a valid
-     * in-scope !dbg before per-statement locations take over. */
+    /* 内部辅助逻辑 */
     di_set_loc(g, member->loc);
 
     local_scope_t *locals = local_scope_new(g->arena);
@@ -2725,8 +2424,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
         local_add(locals, param->param.name, param_alloca, pt);
         box_captured_parameter(g, locals, param, pt, param_types[pi], pv,
                                member->method_decl.body);
-        /* Same by-value struct copy rule as the unspecialized binding
-         * site above -- entry-retain the rc fields the copy aliases. */
+        /* 内部辅助逻辑 */
         if (!locals->vars[locals->count - 1].box_cell && pt &&
             pt->kind == TYPE_STRUCT &&
             LLVMGetTypeKind(param_types[pi]) == LLVMStructTypeKind &&
@@ -2838,7 +2536,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     zan_irgen_compact_completed(g, sp.fn);
 }
 
-/* Drain the queue; emitting a body may enqueue further specializations. */
+/* Drain the queue; emitting a body may enqueue further specializations */
 static void emit_pending_method_specs(zan_irgen_t *g) {
     while (g->method_spec_emitted < g->method_spec_count) {
         int i = g->method_spec_emitted++;
@@ -2847,11 +2545,7 @@ static void emit_pending_method_specs(zan_irgen_t *g) {
     }
 }
 
-/* A minimal Windows DLL entry point: `BOOL DllMain(...) { return TRUE; }`.
- * The loader passes (hinstDLL, reason, reserved) but a zero-arg function
- * ignores them; the non-zero return keeps the process running. External
- * linkage keeps it alive through GlobalDCE and lets the linker resolve
- * `-e DllMain`. */
+/* A minimal Windows DLL entry point: `BOOL DllMain( */
 static void emit_windows_dll_main(zan_irgen_t *g) {
     LLVMValueRef existing = LLVMGetNamedFunction(g->mod, "DllMain");
     if (existing) return;
@@ -2881,9 +2575,7 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
         }
     }
 
-    /* Instantiations first: a generic class's field slots are sized from the
-     * concrete types bound to its type parameters, so they must be known
-     * before the layout below is fixed. */
+    /* 内部辅助逻辑 */
     discover_generic_insts(g, unit);
 
     /* Pass 1: register all struct/class types */
@@ -2895,17 +2587,12 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
         }
     }
 
-    /* Pass 2A: register every method/ctor before the entry and its static
-     * initializers emit calls. Only publish-mode stdlib bodies may wait for
-     * the resulting use graph; all other bodies are lowered immediately. */
+    /* 内部辅助逻辑 */
     int work_count = 0;
     method_body_work_t *work = declare_user_methods(g, unit, &work_count);
     if (zan_diag_has_errors(g->diag)) { free(work); return ZAN_ERROR; }
 
-    /* Ordinary and IR-inspection builds must expose uncalled bodies too: some
-     * diagnostics are issued only during lowering. Keep user-authored bodies
-     * even in publish mode so dead user code cannot hide an error. The publish
-     * flag is set before emission; optimization level is chosen afterward. */
+    /* 内部辅助逻辑 */
     bool prune_stdlib_bodies = (g->publish_mode || g->obfuscate_strings) && !g->emit_debug;
     bool prune_user = prune_stdlib_bodies;
     unsigned char *live = (unsigned char *)calloc((size_t)work_count + 1, 1);
@@ -2965,11 +2652,7 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
         return ZAN_ERROR;
     }
 
-    /* Pass 3: find and emit static Main method. An explicit user Main wins
-     * regardless of which input declared it; when no input has one, the
-     * primary design document's __DesignMain fallback (GenForm/GenScene emit
-     * it instead of a Main that would steal the entry from user sources)
-     * becomes the program entry. */
+    /* Pass 3: find and emit static Main method */
     {
         zan_ast_node_t *design_main = NULL;
         for (int i = 0; i < unit->comp_unit.decls.count; i++) {
@@ -2996,7 +2679,7 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
             }
         }
         if (design_main) {
-            /* Re-find the owning type: the walk above kept only the member. */
+            /* Re-find the owning type: the walk above kept only the member */
             for (int i = 0; i < unit->comp_unit.decls.count; i++) {
                 zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
                 if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL)
@@ -3019,15 +2702,13 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     }
 done:
     ;
-    /* Both Main and __DesignMain (including the async entry wrapper) are now
-     * complete. Their local handles are no longer used by entry emission. */
+    /* Both Main and __DesignMain (including the async entry wrapper) are now complete */
     if (g->function_compactor) {
         LLVMClearInsertionPosition(g->builder);
         LLVMValueRef main_fn = LLVMGetNamedFunction(g->mod, "main");
         if (main_fn) zan_irgen_compact_completed(g, main_fn);
     }
-    /* Main and static initializers can instantiate generic methods. Their
-     * specialized bodies contribute calls to ordinary methods as well. */
+    /* Main and static initializers can instantiate generic methods */
     emit_pending_method_specs(g);
     if (zan_diag_has_errors(g->diag)) {
         free(live);
@@ -3035,9 +2716,7 @@ done:
         return ZAN_ERROR;
     }
 
-    /* Vtable slots can be reached by indirect dispatch even when no direct
-     * call instruction names their implementation. Register these edges now,
-     * before asking which stdlib bodies can safely be omitted. */
+    /* 内部辅助逻辑 */
     if (prune_stdlib_bodies) emit_vtables(g);
     work_fn_index_t work_ix = { 0 };
     work_fn_index_build(&work_ix, work, work_count);
@@ -3047,9 +2726,7 @@ done:
         for (int w = 0; w < work_count; w++) {
             if (live[w]) continue;
             zan_ast_node_t *member = work[w].member;
-            /* A library's public methods are entry points for external
-             * clients. Reflection preserves method tables for types that
-             * were explicitly queried via typeof() or registered into metadata. */
+            /* A library's public methods are entry points for external clients */
             bool is_refl_root = false;
             if (g->refl_used && work[w].type_sym) {
                 zan_symbol_t *tsym = work[w].type_sym;
@@ -3088,10 +2765,7 @@ done:
     for (int w = 0; w < work_count; w++) {
         if (live[w]) continue;
         free(work[w].param_types);
-        /* LLVM rejects an internal declaration without a definition. Keep
-         * a one-block unreachable definition until GlobalDCE discards it;
-         * this allocates no body IR, and also leaves function registries
-         * pointing at valid values during reflection/ARC finalization. */
+        /* LLVM rejects an internal declaration without a definition */
         LLVMValueRef fn = work[w].fn;
         if (LLVMIsDeclaration(fn)) {
             LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "dead");
@@ -3108,42 +2782,24 @@ done:
     free(live);
     free(work);
     if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
-    /* Synthesise per-class release functions now that every class type has
-     * been registered (Pass 1) and referenced (Passes 2/3). */
+    /* 内部辅助逻辑 */
     di_clear(g); /* the following are synthetic fns; no user source scope */
     emit_all_class_releases(g);
     emit_site_live_tables(g);
     emit_site_dtor_table(g);
     emit_site_tyname_table(g);
     emit_site_meta_table(g);
-    /* descriptor builds fill the per-shape records instead of the three
-     * tables above (which no-op there); needs every destructor declared */
+    /* 内部辅助逻辑 */
     zan_irgen_emit_arc_desc_init(g);
     if (!prune_stdlib_bodies) emit_vtables(g);
-    /* Reflected method/constructor tables: their records point at the real
-     * functions and at thunks over them, so they can only be filled in once
-     * every function, specialization and vtable above exists. */
+    /* 内部辅助逻辑 */
     refl_finalize_mtabs(g);
-    /* A Windows DLL must carry a real entry point: without one the PE
-     * AddressOfEntryPoint falls back to the start of .text, so the Windows
-     * loader calls the first exported function (often zan_rt_println) as
-     * DllMain on process attach/detach, printing garbage to stdout (the
-     * "MZ" PE magic of the image base it was handed as hinstDLL). Emit a
-     * minimal DllMain returning TRUE (non-zero) and link with `-e DllMain`. */
+    /* 内部辅助逻辑 */
     if (g->emit_lib && g->emit_shared && g->target_is_windows)
         emit_windows_dll_main(g);
-    /* --publish: emit the .ctors constructor that un-scrambles string literals
-     * (no-op unless obfuscation is on and literals were recorded). */
+    /* publish: emit the */
     zan_irgen_emit_string_deobf(g);
-    /* Fill the exception class-name registry: pairs recorded while emitting
-     * throw sites / catch dispatch become a static {tid, name} array the
-     * unhandled-exception reporter matches against, so an uncaught class
-     * throw prints its class name. The registry global is only referenced
-     * when a class throw can reach the reporter, so a program that never
-     * threw a class leaves it unreferenced (and dead) -- the fill below runs
-     * whenever the registry exists, giving it a real (possibly empty,
-     * terminator-only) body; an external global without an initializer would
-     * fail module verification. */
+    /* 内部辅助实现 */
     if (g->tid_name_reg_global) {
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         unsigned n = (unsigned)g->tid_name_count;
@@ -3151,8 +2807,7 @@ done:
         LLVMValueRef newg = LLVMAddGlobal(g->mod, reg_ty,
                                           LLVMGetValueName(g->tid_name_reg_global));
         LLVMSetLinkage(newg, LLVMInternalLinkage);
-        /* swap: the function body indexes through a pointer-typed GEP, so the
-         * array length behind the name doesn't matter to the emitted code */
+        /* 内部辅助逻辑 */
         LLVMReplaceAllUsesWith(g->tid_name_reg_global, newg);
         LLVMDeleteGlobal(g->tid_name_reg_global);
         g->tid_name_reg_global = newg;
@@ -3170,20 +2825,16 @@ done:
         LLVMSetInitializer(newg, LLVMConstArray(g->tid_name_reg_ent_ty,
                                                 elems, (unsigned)(n + 1)));
     }
-    /* An error diagnostic emitted during codegen (e.g. an unsupported await
-     * form flagged by the ANF pass) must fail the build — the driver only
-     * checks diagnostics before codegen, so surface it here. */
+    /* An error diagnostic emitted during codegen (e */
     if (zan_diag_has_errors(g->diag)) {
         return ZAN_ERROR;
     }
-    /* Finalize DWARF metadata (resolves temporary nodes) before verification. */
+    /* Finalize DWARF metadata (resolves temporary nodes) before verification */
     if (g->emit_debug && g->di_builder) {
         LLVMSetCurrentDebugLocation2(g->builder, NULL);
         LLVMDIBuilderFinalize(g->di_builder);
     }
-    /* One final sweep covers init/runtime/reflection support emitted outside
-     * the immediate completion points. Every body and global-table fixup above
-     * is finished; the compactor skips definitions already compacted in place. */
+    /* 内部辅助逻辑 */
     if (g->function_compactor) {
         LLVMClearInsertionPosition(g->builder);
         for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
@@ -3200,9 +2851,7 @@ done:
     /* verify module */
     char *error = NULL;
     if (LLVMVerifyModule(g->mod, LLVMReturnStatusAction, &error)) {
-        /* The module-level message quotes the offending instruction but not
-         * the function it sits in, which is what one actually needs to find
-         * the source. Re-verify per function to name it. */
+        /* 内部辅助逻辑 */
         const char *culprit = NULL;
         for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
              fn = LLVMGetNextFunction(fn)) {
@@ -3255,8 +2904,7 @@ zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path) {
         LLVMDisposeMessage(ir);
         return ZAN_ERROR;
     }
-    /* Report short writes (e.g. a full disk) instead of claiming success and
-     * leaving a truncated .ll behind. */
+    /* Report short writes (e */
     bool ok = (fputs(ir, f) >= 0);
     if (fclose(f) != 0) ok = false;
     LLVMDisposeMessage(ir);
@@ -3285,10 +2933,7 @@ int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len) {
             LLVMBuildRetVoid(b);
             break;
         case LLVMIntegerTypeKind:
-            /* -1 doubles as SQL_ERROR / a generic nonzero failure code, but a
-             * pointer-wide result is a handle (LoadLibrary, GetProcAddress,
-             * ...) that callers null-check and otherwise call through, so -1
-             * there turns "stubbed" into a jump to 0xffff...ffff. */
+            /* 内部辅助实现 */
             LLVMBuildRet(b, LLVMConstInt(rt,
                 LLVMGetIntTypeWidth(rt) >= 64 ? 0 : (unsigned long long)-1, 1));
             break;
@@ -3333,13 +2978,10 @@ int zan_irgen_prune_extern_libs(zan_irgen_t *g) {
             char nm[256];
             snprintf(nm, sizeof(nm), "%.*s", (int)g->extern_fns[i].name.len,
                      g->extern_fns[i].name.str);
-            /* The sweep erases declarations nothing references, so a surviving
-             * declaration (or a definition, e.g. an already-stubbed one) is
-             * what makes the library needed at link time. */
+            /* 内部辅助逻辑 */
             if (LLVMGetNamedFunction(g->mod, nm)) live = 1;
         }
-        /* A library with no recorded imports at all is not ours to judge (the
-         * declarations may have been registered elsewhere): keep it. */
+        /* 内部辅助逻辑 */
         if (!live) {
             int has_fns = 0;
             for (int i = 0; i < g->extern_fn_count && !has_fns; i++) {
@@ -3388,12 +3030,7 @@ bool zan_irgen_defines_prefix(zan_irgen_t *g, const char *prefix) {
     return found;
 }
 
-/* wasm32 libc adapters (see zan_irgen_write_obj): define `fn` (which must be
- * a body-less function of type src_ft) as a thin wrapper that converts its
- * arguments to `lft` (the real 32-bit libc signature), calls `real`, and
- * converts the result back. Conversions are int<->ptr and int-width casts;
- * wasm pointers fit in 32 bits so the i64 handles Zan uses are safe to
- * truncate. */
+/* 内部辅助实现 */
 static void w32_build_adapter_into(zan_irgen_t *g, LLVMValueRef fn,
                                    LLVMValueRef real, LLVMTypeRef lft) {
     LLVMTypeRef src_ft = LLVMGlobalGetValueType(fn);
@@ -3461,9 +3098,7 @@ static LLVMValueRef w32_build_adapter(zan_irgen_t *g, const char *name,
     return fn;
 }
 
-/* Initialize every target family the build links (see CMakeLists.txt), so
- * zanc can emit code for the host regardless of architecture (e.g. arm64
- * macOS) as well as cross-compile to the advertised targets. */
+/* 初始化every target family the build links (see CMakeLists */
 static void zan_init_llvm_targets(void) {
     LLVMInitializeX86TargetInfo();
     LLVMInitializeX86Target();
@@ -3502,29 +3137,17 @@ static void zan_init_llvm_targets(void) {
 #endif
 }
 
-/* Bind the target triple + data layout to the module, creating (and
- * optionally handing back) the target machine. Callers that optimize the
- * module afterwards MUST run this first: with the layout still unset LLVM
- * assumes its generic default (64-bit pointers) and bakes 8-byte pointer
- * strides into the IR, which then misreads data laid out at the target's
- * real pointer size (rv32 --publish: the string-decode tables read NULL and
- * trap; x86-64/arm64 only got away with it because the default layout
- * equals their real one). */
+/* 内部辅助逻辑 */
 static zan_status_t zan_bind_target_layout(zan_irgen_t *g,
                                            LLVMTargetMachineRef *out_tm) {
     char *triple;
     if (g->target_triple[0]) {
-        /* Cross-compilation: emit for the requested target triple verbatim
-         * (e.g. x86_64-unknown-linux-musl). The X86/AArch64 backends produce
-         * the right object format (ELF/Mach-O/COFF) from the triple's OS. */
+        /* Cross-compilation: emit for the requested target triple verbatim (e */
         triple = LLVMCreateMessage(g->target_triple);
     } else {
         triple = LLVMGetDefaultTargetTriple();
 #ifdef _WIN32
-        /* Emit GNU-ABI (MinGW) objects so the produced code links against the
-         * bundled ld.lld + mingw-w64 runtime, keeping zanc self-contained:
-         * building an .exe needs only zan, no external clang / MSVC / Windows
-         * SDK. Preserve the host architecture prefix and swap the vendor/abi. */
+        /* 发射GNU-ABI (MinGW) objects so the produced code links against the bundled ld */
         {
             const char *dash = strchr(triple, '-');
             size_t archlen = dash ? (size_t)(dash - triple) : strlen(triple);
@@ -3549,31 +3172,23 @@ static zan_status_t zan_bind_target_layout(zan_irgen_t *g,
         return ZAN_ERROR;
     }
 
-    /* RISC-V: match the RV64GC / lp64d ABI the bundled musl sysroot uses
-     * (the ABI must be recorded as a module flag for the backend to lower
-     * doubles into FP registers). */
+    /* 内部辅助逻辑 */
     const char *tm_cpu = "generic";
     const char *tm_features = "";
     if (strncmp(triple, "wasm", 4) == 0) {
-        /* WebAssembly EH: try/throw lower onto the exception-handling
-         * proposal; reference-types is a prerequisite of the backend's EH
-         * pipeline. Codegen also needs the --wasm-enable-eh option flag,
-         * parsed once in main() (LLVMParseCommandLineOptions). */
+        /* 内部辅助实现 */
         tm_features = "+exception-handling,+reference-types";
     } else if (strncmp(triple, "riscv64", 7) == 0) {
         tm_cpu = "generic-rv64";
         tm_features = "+m,+a,+f,+d,+c";
-        /* publish binds the target twice (main.c pre-optimization, then
-         * write_obj): adding the same ERROR-behavior flag twice is
-         * redundant, so guard on the existing one */
+        /* publish binds the target twice (main */
         if (!LLVMGetModuleFlag(g->mod, "target-abi", 10))
             LLVMAddModuleFlag(g->mod, LLVMModuleFlagBehaviorError,
                               "target-abi", strlen("target-abi"),
                               LLVMValueAsMetadata(LLVMMDStringInContext(
                                   g->ctx, "lp64d", 5)));
     } else if (strncmp(triple, "riscv32", 7) == 0) {
-        /* Bare-metal RV32IMC (ESP32-C3/C6): ilp32 soft-float ABI — those
-         * cores have no FPU, so doubles lower through helper calls. */
+        /* 内部辅助逻辑 */
         tm_cpu = "generic-rv32";
         tm_features = "+m,+c";
         if (!LLVMGetModuleFlag(g->mod, "target-abi", 10))
@@ -3585,13 +3200,10 @@ static zan_status_t zan_bind_target_layout(zan_irgen_t *g,
         tm_cpu = "x86-64";
         tm_features = "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi";
     } else if (strncmp(triple, "aarch64", 7) == 0) {
-        /* mirrors crosscomp.c: gates the llvm.aarch64.crypto.aes* selection
-         * used by emit_aes_call's ARM lowering */
+        /* mirrors crosscomp */
         tm_features = "+aes";
     }
-    /* Machine codegen dominates compile time. Development builds (no
-     * --publish / -O) use the fast path (FastISel, no machine-level
-     * optimization); release builds keep the optimizing selector. */
+    /* Machine codegen dominates compile time */
     LLVMCodeGenOptLevel cg = g->fast_codegen ? LLVMCodeGenLevelNone
                                              : LLVMCodeGenLevelDefault;
     LLVMTargetMachineRef tm = LLVMCreateTargetMachine(
@@ -3617,49 +3229,29 @@ void zan_irgen_bind_target(zan_irgen_t *g) {
 }
 
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
-    /* Targets with no aggregate C ABI classification only remember
-     * struct-carrying externs at declaration time; a real call is the
-     * reportable offense. No-op on classified targets. */
+    /* 内部辅助逻辑 */
     abi_pending_report(g);
     if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
-    /* wasm32 / riscv32: libc size_t/long are 32-bit but the IR declares these
-     * libc functions with i64 sizes (Zan int). Redirect the declarations to
-     * per-call-site adapters that truncate/extend and forward to the real
-     * 32-bit libc. wasm enforces exact call signatures at link time, and rv32
-     * (ilp32) misroutes the calls silently: an i64 argument occupies an
-     * even-aligned register pair, so a trailing i64 size happens to land its
-     * low word correctly but a size_t in the middle of the list shifts every
-     * argument after it. Both targets need the same adaptation. */
+    /* 内部辅助逻辑 */
     bool w32_triple = strncmp(g->target_triple, "wasm32", 6) == 0;
     bool rv32_triple = strncmp(g->target_triple, "riscv32", 7) == 0;
     if (w32_triple || rv32_triple) {
         bool wasi = w32_triple;
         if (wasi) {
-            /* wasi-libc's _start calls __main_argc_argv (the name clang gives
-             * a two-argument main on wasm), not "main". */
+            /* 内部辅助逻辑 */
             LLVMValueRef mainf = LLVMGetNamedFunction(g->mod, "main");
             if (mainf && LLVMCountBasicBlocks(mainf) > 0)
                 LLVMSetValueName2(mainf, "__main_argc_argv",
                                   strlen("__main_argc_argv"));
         }
-        /* Variadic snprintf cannot be adapted in IR (varargs cannot be
-         * forwarded); route it to a C wrapper whose size_t/long-long second
-         * parameter restores the ABI before the varargs. wasm ships the
-         * wrapper in rt_wasm.c; freestanding targets get it from the target
-         * side (rt_bare_shim.c / the ESP-IDF adapter). */
+        /* 内部辅助实现 */
         {
             LLVMValueRef f = LLVMGetNamedFunction(g->mod, "snprintf");
             if (f && LLVMCountBasicBlocks(f) == 0)
                 LLVMSetValueName2(f, "zan_w32_snprintf",
                                   strlen("zan_w32_snprintf"));
         }
-        /* Zan IR declares libc functions with 64-bit ints (Zan int is i64,
-         * and pointers passed through Zan `int` handles are i64 too), but
-         * wasm32/riscv32 size_t/long/pointers are 32-bit. For each such
-         * declaration, turn it into a thin adapter that truncates/extends
-         * the values and calls the real 32-bit libc function.
-         * Signature codes: p=pointer, i=i32, j=i64, s=size_t(i32),
-         * v=void; first char is the return, the rest are the params. */
+        /* 内部辅助实现 */
         static const struct { const char *name; const char *sig; } w32adapt[] = {
             { "malloc", "ps" },      { "calloc", "pss" },
             { "realloc", "pps" },    { "free", "vp" },
@@ -3680,43 +3272,22 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             { "rmdir", "ip" },       { "opendir", "pp" },
             { "readdir", "pp" },     { "closedir", "ip" },
             { "time", "jp" },        { "poll", "ipii" },
-            /* NativeMemory.FindNotAnyOf lowers to strcspn with a 64-bit run
-             * result (Zan int); wasm/rv32 size_t is 32-bit, so the adapter
-             * extends the return -- the -1 "clean to the end" compare must
-             * see the full-width value. */
+            /* NativeMemory */
             { "strcspn", "ipp" },
-            /* System.Threading declares the POSIX int-returning mutex ABI
-             * while irgen's EH-table lock calls declare a void return; one
-             * module holding both shapes (a GUI program pulls Threading)
-             * made wasm-ld synthesize trap functions. Route every call-site
-             * type through adapters onto the one POSIX-shaped definition in
-             * rt_wasm.c. */
+            /* 内部辅助实现 */
             { "pthread_mutex_init", "iii" },
             { "pthread_mutex_lock", "ii" },
             { "pthread_mutex_unlock", "ii" },
             { "pthread_mutex_destroy", "ii" },
-            /* the startup stdout line-buffering call (irgen_emit.c) declares
-             * size as i64 (Zan int); wasm's setvbuf takes a 32-bit size_t. */
+            /* the startup stdout line-buffering call (irgen_emit */
             { "setvbuf", "ipipi" },
-            /* wasi-libc ships dlfcn stubs that return 0 ("no dynamic
-             * linking"): the IR declares these with 64-bit nint, so adapt
-             * them too, keeping the graceful-failure path the stdlib's
-             * Interop.Entry relies on instead of a wasm-ld trap stub. */
+            /* 内部辅助实现 */
             { "dlopen", "pip" },     { "dlsym", "ppp" },
             { "dlclose", "ip" },
-            /* the file-IO runtime (rt_file.c) has the same problem: the IR
-             * declares its FILE*-returning entry points as nint (i64), but a
-             * wasm32 pointer is i32 -- adapt the two handles so wasm-ld does
-             * not see mismatched signatures on zan_file_fopen/zan_pkg_fopen. */
+            /* the file-IO runtime (rt_file */
             { "zan_file_fopen", "ppp" },
             { "zan_pkg_fopen", "ppp" },
-            /* DllImport params typed nint (TYPE_NINT lowers to i64 even on
-             * wasm32) against native definitions whose pointer/handle params
-             * are 32-bit. The GUI entry points take i32 surface ids / i32
-             * point buffers via nint call sites; the socket reactor takes
-             * i64 handles in C (long long) while other call shapes pass
-             * i32-ish ints. Without adapters wasm-ld flags each shape
-             * mismatch and picks one side's signature. */
+            /* 内部辅助实现 */
             { "zan_gui_draw_polyline", "vppiii" },
             { "zan_gui_draw_polyline_fx", "vppiii" },
             { "zan_gui_draw_polybatch", "vippiii" },
@@ -3730,24 +3301,13 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             { "zan_game_sprite_batch", "viipi" },
             { "zan_game_mesh_create", "iipipi" },
             { "zan_game_draw3d", "iiipip" },
-            /* More GUI nint-handle shapes: the hit-guard pair take i32
-             * window handles in C (iptr) against i64 nint call sites, and
-             * zan_gui_text_stat_read returns i64 in C while Render.zan
-             * declares int -- the x64 ABI overlaps the two widths in RAX,
-             * wasm32 needs an explicit adapter. */
+            /* 内部辅助实现 */
             { "zan_gui_clear_hit_guards", "ii" },
             { "zan_gui_add_hit_guard", "iiiiii" },
             { "zan_gui_text_stat_read", "ji" },
-            /* App's guard trampoline: App.zan passes (nint, nint) call sites
-             * at the C (iptr, iptr) -> int definition in gui_runtime.c.
-             * Unadapted, the WeChat probe trapped on the first guarded pump
-             * -- wasm-ld kept a signature_mismatch stub for the entry and
-             * the RunLoop's guard call landed in it. */
+            /* App's guard trampoline: App */
             { "zan_gui_guard_call", "iii" },
-            /* NativeMemory.Copy/Find lower to memmove/memchr with a 64-bit
-             * length (Zan int); wasm32 size_t is 32-bit. The coroutine
-             * drivers declare zan_timer_cancel_delay as void while
-             * rt_timer.c's real definition returns the cancel count. */
+            /* NativeMemory */
             { "memmove", "ppps" },
             { "memchr", "ppis" },
             { NULL, NULL }
@@ -3781,11 +3341,7 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             snprintf(an, sizeof(an), "__zan_w32ir_%s", w32adapt[i].name);
             LLVMSetValueName2(decl, an, strlen(an));
             LLVMValueRef real = LLVMAddFunction(g->mod, w32adapt[i].name, lft);
-            /* Different call sites may use different signatures for the same
-             * function (Zan reuses an existing declaration whatever its
-             * type), so rewrite every direct call: give each distinct
-             * call-site type its own adapter that converts the values and
-             * calls the real 32-bit libc function. */
+            /* 内部辅助实现 */
             LLVMTypeRef cts[8];
             LLVMValueRef cad[8];
             int ncts = 0;
@@ -3793,12 +3349,7 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             while (use) {
                 LLVMUseRef next = LLVMGetNextUse(use);
                 LLVMValueRef user = LLVMGetUser(use);
-                /* try/catch bodies lower extern calls to invoke, not call:
-                 * an invoke left on the old signature makes the wasm backend
-                 * materialize an unreachable stub (read_probe: fread inside
-                 * try trapped). CallInst and InvokeInst share the operand
-                 * layout (callee is the last operand), so both rewrite the
-                 * same way. */
+                /* 内部辅助实现 */
                 if ((LLVMIsACallInst(user) || LLVMIsAInvokeInst(user)) &&
                     LLVMGetCalledValue(user) == decl) {
                     LLVMTypeRef cft = LLVMGetCalledFunctionType(user);
@@ -3829,32 +3380,17 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
                 }
                 use = next;
             }
-            /* Any remaining (indirect) uses go through the renamed
-             * declaration itself: define it as an adapter too. */
+            /* 内部辅助逻辑 */
             if (LLVMGetFirstUse(decl) && dft != lft) {
                 w32_build_adapter_into(g, decl, real, lft);
                 LLVMSetLinkage(decl, LLVMInternalLinkage);
             }
         }
     }
-    /* Target init + triple/layout binding: see zan_bind_target_layout. The
-     * layout must be on the module before --publish's optimizer runs
-     * (main.c binds it there too; write_obj re-binding is idempotent and
-     * covers emit-only paths). */
+    /* Target init + triple/layout binding: see zan_bind_target_layout */
     zan_init_llvm_targets();
 
-    /* Function-sections for size builds: give every defined function its own
-     * ".text.<name>" COFF section so the linker's --gc-sections can drop
-     * unreferenced ones. LLVM's own globaldce can't do this: the ARC tables
-     * (vtables / site dtors / site tynames / refl mtabs) reference every
-     * class's methods and pin them into the reachable set, but section GC
-     * runs later with the linker's root set. Names are unique mangled
-     * symbols already (Zan_/__zan_/main), safe as section suffixes.
-     *
-     * Mach-O (macOS / iOS) uses an atom-based linker model (-dead_strip via
-     * .subsections_via_symbols) instead of section GC; Mach-O section specifiers
-     * require "__SEGMENT,__section" and reject ELF/COFF-style ".text.<name>".
-     * Wasm also does not use ELF/COFF section GC. Only apply to ELF and COFF. */
+    /* Function-sections for size builds: give every defined function its own " */
     if (g->obfuscate_strings /* publish */ && !g->target_is_macos && !g->target_is_wasm) {
         for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
              fn = LLVMGetNextFunction(fn)) {
@@ -3866,23 +3402,7 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             snprintf(sec, sizeof(sec), ".text.%s", nm);
             LLVMSetSection(fn, sec);
         }
-        /* Data-sections, same rationale: vtables, the per-class ARC tables
-         * (site dtors / tynames / refl mtabs) and named constants would
-         * otherwise coalesce into ONE .rdata/.data input section, and the
-         * linker GC can only drop whole input sections. Measured on an empty
-         * GUI window: one live string pinned all 65 vtables plus the release
-         * thunk tables, which pinned every virtual method -- Chart/DataTable/
-         * Excel code shipped to programs that never name them. Per-symbol
-         * sections let the linker drop a dead class's tables, taking its
-         * methods with it. Globals without a name or initializer (extern,
-         * tentative) stay in the merged blob; thread-locals keep their
-         * default placement.
-         *
-         * COFF/PE needs the '$' compose form: the linker turns everything
-         * before '$' into one output section while each input section stays
-         * individually gc-able. Dot-suffixed data sections would each become
-         * a private 4 KB-aligned output section (measured: +3.8 MB on the
-         * same probe). ELF and Mach-O linkers merge the dot form natively. */
+        /* 内部辅助实现 */
         int coff_obj = g->target_triple[0]
                            ? strstr(g->target_triple, "windows-gnu") != NULL
                            :
@@ -3900,27 +3420,12 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             size_t nlen = 0;
             const char *nm = LLVMGetValueName2(gv, &nlen);
             if (!nm || !nlen || nlen > 200) continue;
-            /* llvm.global_ctors must keep its special lowering: re-sectioning
-             * it silences every static constructor (string deobfuscation, the
-             * runtime registries) and the program dies at startup. */
+            /* llvm */
             if (strncmp(nm, "llvm.", 5) == 0) continue;
-            /* Interned guard texts (zan_irgen_intern_string, name "rterr",
-             * LLVM-renamed rterr.N) stay in the merged .rdata blob: -g on a
-             * real program interns thousands of distinct site messages, and
-             * one compose section per message pushes GNU ld's PE/COFF '$'
-             * grouping over its limits ("relocation truncated to fit:
-             * IMAGE_REL_AMD64_REL32 against .rdata$rterr.N" on a 13 MB
-             * object, nowhere near a 2 GB span). They are private text the
-             * runtime report reads through hard pointers, so per-string gc
-             * granularity buys nothing. */
+            /* Interned guard texts (zan_irgen_intern_string, name "rterr", LLVM-renamed rterr */
             if (strncmp(nm, "rterr", 5) == 0) continue;
             char sec[260];
-            /* LLVMIsConstant() answers "is this Value a Constant subclass",
-             * which is TRUE for every GlobalVariable; the read-only flag of
-             * the global itself is LLVMIsGlobalConstant(). Getting this wrong
-             * sends the mutable string-literal buffers (the deobfuscation
-             * ctor patches them at startup) into read-only .rdata -- instant
-             * SIGSEGV. */
+            /* 内部辅助实现 */
             snprintf(sec, sizeof(sec), "%s%s%s",
                      LLVMIsGlobalConstant(gv) ? ".rdata" : ".data",
                      dsep, nm);

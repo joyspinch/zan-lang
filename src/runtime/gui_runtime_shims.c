@@ -1,34 +1,8 @@
-/* gui_runtime_shims.c -- the embedded WebView control's macOS-without-Cocoa
- * fallback.
- *
- * Part of the gui_runtime translation unit: #include'd by gui_runtime.c in
- * a fixed order; not compiled standalone (preprocessor state and static
- * linkage are shared across the parts).
- */
+/* gui_runtime_shims */
 
-/* ========================================================================
- * Embedded WebView (native browser control).
- *
- * A real, navigable web view is a heavyweight, per-platform native control
- * (WKWebView on macOS, WebView2 on Windows, the system android.webkit.WebView
- * on Android, WebKitGTK on Linux). Two platforms need a backend here:
- * macOS (gui_runtime_mac.m, ZAN_GUI_COCOA): a WKWebView subview of the
- * window's content view; Android (gui_runtime_android.c, __ANDROID__): a
- * system WebView overlaid by the APK shell's Java bridge (org.zan.app.ZanWeb).
- * Windows drives Edge WebView2 from Zan itself (packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebView2.zan,
- * straight against its COM interfaces) and every other platform takes
- * WebViewBackend's own fallback, so neither references these exports. Only a
- * macOS build that opts out of the Cocoa backend (the SDL windowing shell)
- * still binds them, and gets no-op stubs:
- * zan_gui_webview_create returns 0 so the Zan WebView widget detects the lack
- * of native support and paints an in-canvas placeholder instead of embedding
- * a live browser.
- * ======================================================================== */
+/* Embedded WebView (native browser control) */
 #if defined(__APPLE__) && !defined(ZAN_GUI_COCOA)
-/* profile_id selects a per-account isolation profile (see WebView.zan). When a
- * real backend is added here it should map profile_id to that engine's data
- * partitioning -- a WKWebsiteDataStore with a per-profile identifier. Until
- * then it is a no-op stub. */
+/* profile_id selects a per-account isolation profile (see WebView */
 EXPORT i32 zan_gui_webview_create(iptr hwnd, const char *profile_id) {
     (void)hwnd; (void)profile_id; return 0;
 }
@@ -78,31 +52,10 @@ EXPORT void zan_gui_webview_set_context_menu_enabled(i32 h, i32 enabled) {
 }
 #endif
 
-/* ========================================================================
- * Win32 wide-string conversion symbols for non-Windows targets.
- *
- * stdlib System `Wide` marshals UTF-8 <-> UTF-16 via
- * [DllImport("kernel32")] MultiByteToWideChar / WideCharToMultiByte. On
- * Windows kernel32 provides them; on every other target the Android cross
- * link (unlike Linux/OHOS/native-non-Windows, which stub win-system libs)
- * leaves the imports unresolved, and dlopen of libmain.so dies with
- * "cannot locate symbol" before the app draws its first frame (goldminer
- * ARM64 build, 2026-09). Defining the pair here keeps any Zan program that
- * reaches `Wide` loadable on Android/OHOS/Linux, with real CP_UTF8
- * conversion instead of a stub: env-var names, clipboard text and other
- * marshaled strings convert correctly.
- *
- * Only CP_UTF8 (65001) is implemented -- the sole codepage stdlib uses;
- * anything else returns 0 (failure), matching Win32. Malformed sequences
- * decode as U+FFFD, one byte consumed. Callers pass explicit spans that
- * include the NUL (Wide.Of sends bytes+1; Wide.Read sends -1), so the
- * terminator travels through the conversion exactly as on Windows.
- * ======================================================================== */
+/* Win32 wide-string conversion symbols for non-Windows targets */
 #if !defined(_WIN32)
 
-/* Decode one UTF-8 sequence at s[*pos) (limit is the span end). Advances
- * *pos; returns 0 on a malformed lead/continuation (one byte consumed,
- * U+FFFD). */
+/* Decode one UTF-8 sequence at s[*pos) (limit is the span end) */
 static int zan_shim_utf8_next(const unsigned char *s, int limit, int *pos,
                               unsigned *cp) {
     unsigned char b = s[*pos];

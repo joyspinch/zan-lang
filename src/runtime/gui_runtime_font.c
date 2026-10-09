@@ -1,14 +1,6 @@
-/* gui_runtime_font.c -- the software bitmap-font fallback plus EWMH/Xlib window management
- * and client-side title-bar metrics for non-Windows backends.
- *
- * Part of the gui_runtime translation unit: #include'd by gui_runtime.c in
- * a fixed order; not compiled standalone (preprocessor state and static
- * linkage are shared across the parts).
- */
+/* gui_runtime_font */
 
-/* ========================================================================
- * Software bitmap-font fallback for non-Windows/non-Cocoa backends.
- * ======================================================================== */
+/* Software bitmap-font fallback for non-Windows/non-Cocoa backends */
 #if !defined(_WIN32) && !defined(ZAN_GUI_COCOA)
 /* Fallback bitmap font for software text rendering */
 static const unsigned char zan_font_6x10[96][10] = {
@@ -22,7 +14,7 @@ static const unsigned char zan_font_6x10[96][10] = {
     /* ' */ {0x04,0x04,0x04,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
     /* ( */ {0x02,0x04,0x08,0x08,0x08,0x04,0x02,0x00,0x00,0x00},
     /* ) */ {0x08,0x04,0x02,0x02,0x02,0x04,0x08,0x00,0x00,0x00},
-    /* * */ {0x00,0x04,0x15,0x0E,0x15,0x04,0x00,0x00,0x00,0x00},
+     {0x00,0x04,0x15,0x0E,0x15,0x04,0x00,0x00,0x00,0x00},
     /* + */ {0x00,0x04,0x04,0x1F,0x04,0x04,0x00,0x00,0x00,0x00},
     /* , */ {0x00,0x00,0x00,0x00,0x00,0x04,0x04,0x08,0x00,0x00},
     /* - */ {0x00,0x00,0x00,0x1F,0x00,0x00,0x00,0x00,0x00,0x00},
@@ -193,23 +185,14 @@ static FT_Face g_ft_face;
 static int g_ft_state;
 
 #if defined(__ANDROID__) || defined(__OHOS__)
-/* The device's default and CJK faces as configured by the ROM. Vendors
- * (MIUI, HarmonyOS, ...) ship their own default font and keep
- * /system/etc/fonts.xml pointing at it, so a fixed "Roboto" path renders
- * every ROM in Noto instead of the font the user actually sees elsewhere.
- * AOSP marks the file deprecated in favour of AFontMatcher (API 29+), but
- * still requires vendors to maintain it; when it disappears or stops
- * parsing, the hardcoded chain in ft_prepare is the fallback. OHOS is in
- * the same boat: musl sysroot has no fontconfig headers, and the device
- * ships /system/etc/fonts.xml + /system/fonts exactly like Android. */
+/* The device's default and CJK faces as configured by the ROM */
 static char g_android_def_path[256];
 static int g_android_def_idx;
 static char g_android_cjk_path[256];
 static int g_android_cjk_idx;
 static int g_android_cjk_ok;
 
-/* Pull one attribute value ("index", "weight", "lang") out of a tag body
- * [attrs, attrs+attrlen). Returns 0 when absent. */
+/* 内部辅助逻辑 */
 static int ft_xml_attr(const char *attrs, int attrlen, const char *name,
                        char *out, int outsz) {
     char pat[64];
@@ -262,10 +245,7 @@ static int ft_fonts_xml_scan(void) {
         char lang[32] = "";
         ft_xml_attr(attrs, attrlen, "lang", lang, sizeof(lang));
 
-        /* Within the family pick the regular upright face: weights are
-         * separate entries and often separate *files* (MiSans-Light vs
-         * MiSans-Regular), so "first" would grab whatever weight the
-         * ROM listed first. */
+        /* 内部辅助实现 */
         char best[256] = "";
         int best_idx = 0, best_score = 1 << 30;
         const char *q = body;
@@ -283,8 +263,7 @@ static int ft_fonts_xml_scan(void) {
             const char *txt = fgt + 1;
             const char *ftxt_end = strstr(txt, "</font>");
             if (!ftxt_end || ftxt_end > fend) break;
-            /* the text run may contain nested <axis .../> elements: the
-             * file name is the leading trimmed text before '<' */
+            /* the text run may contain nested <axis */
             const char *lt = memchr(txt, '<', (size_t)(ftxt_end - txt));
             if (!lt || lt > ftxt_end) lt = ftxt_end;
             char path[256];
@@ -354,20 +333,12 @@ static int ft_prepare(int font_size) {
         g_ft_state = -1;
         if (FT_Init_FreeType(&g_ft_library) != 0) return 0;
 #if defined(__wasm__)
-        /* Browser: no fontconfig and no filesystem fonts. The H5 driver
-         * loads a .ttf into WASI at /fonts/ui.ttf (gui_runtime_wasm.c's
-         * zan_gui_wasm_load_font copies it out of linear memory), so
-         * try that first; a missing font degrades to "no text". */
+        /* Browser: no fontconfig and no filesystem fonts */
         if (FT_New_Face(g_ft_library, "/fonts/ui.ttf", 0, &g_ft_face) == 0) {
             g_ft_state = 1;
         }
 #elif defined(__ANDROID__) || defined(__OHOS__)
-        /* Android ships no fontconfig; the system faces live in
-         * /system/fonts. Primary face follows the ROM's own default
-         * (fonts.xml first nameless family -- MiSans on MIUI, ...),
-         * falling back to AOSP's Roboto; CJK glyphs resolve through
-         * ft_face_for_cp's zh family below. OHOS musl: same shapes, no
-         * fontconfig headers in the sysroot either. */
+        /* Android ships no fontconfig; the system faces live in /system/fonts */
         ft_android_pick_fonts();
         if (access(g_android_def_path, R_OK) == 0 &&
             FT_New_Face(g_ft_library, g_android_def_path,
@@ -426,10 +397,7 @@ static int ft_prepare(int font_size) {
 static FT_Face g_ft_fb[ZAN_FT_FB_MAX];
 static int g_ft_fb_count = 0;
 
-/* Return a face that can render `cp` at `font_size`, discovering a fallback
- * font when the primary face lacks the glyph (e.g. CJK on a Latin face).
- * Discovered faces are cached; falls back to the primary face when no better
- * match exists. */
+/* 内部辅助逻辑 */
 static FT_Face ft_face_for_cp(u32 cp, int font_size) {
     if (FT_Get_Char_Index(g_ft_face, cp)) return g_ft_face;
     for (int i = 0; i < g_ft_fb_count; i++) {
@@ -440,13 +408,7 @@ static FT_Face ft_face_for_cp(u32 cp, int font_size) {
     }
     if (g_ft_fb_count < ZAN_FT_FB_MAX) {
 #if defined(__ANDROID__) || defined(__OHOS__)
-        /* The fallback chain mirrors fonts.xml: the zh family found at
-         * init (Noto CJK ttc face 2 on AOSP, the ROM's CJK face on
-         * vendor builds), then the serif ttc and DroidSansFallback for
-         * anything left, then the color-emoji font -- and finally a sweep
-         * of the whole fonts directory, so every glyph the system ships
-         * anywhere is renderable (the keyboard can only offer characters
-         * some installed font carries). */
+        /* The fallback chain mirrors fonts */
         const char *fb_paths[4];
         int fb_idx[4];
         int nfb = 0;
@@ -483,10 +445,7 @@ static FT_Face ft_face_for_cp(u32 cp, int font_size) {
             }
             if (face) FT_Done_Face(face);
         }
-        /* Thorough sweep of everything else /system/fonts ships: first
-         * face whose cmap covers `cp` is adopted. Scanned only while an
-         * uncovered code point keeps arriving, so the cost lands on the
-         * one glyph, not per frame. */
+        /* 内部辅助逻辑 */
         {
             DIR *d = opendir("/system/fonts");
             if (d) {
@@ -519,13 +478,7 @@ static FT_Face ft_face_for_cp(u32 cp, int font_size) {
             }
         }
 #elif defined(__wasm__)
-        /* wasm ships no fontconfig: the host bundles a UI face at
-         * /fonts/ui.ttf (Latin) and may bundle a wider face — CJK for the
-         * zh demo — at /fonts/cjk.ttf. The face is opened once, on the
-         * first uncovered code point, and then lives in g_ft_fb like the
-         * Android fonts.xml chain; when the file is absent every later
-         * uncovered code point still drops to the 6x10 bitmap path, so a
-         * Latin-only bundle keeps its small footprint. */
+        /* wasm ships no fontconfig: the host bundles a UI face at /fonts/ui */
         static int cjk_tried = 0;
         if (!cjk_tried) {
             cjk_tried = 1;
@@ -569,24 +522,9 @@ static FT_Face ft_face_for_cp(u32 cp, int font_size) {
     return g_ft_face;
 }
 
-/* One glyph's coverage tile, rasterised on its first use at this size and kept
- * in the glyph atlas: FT_LOAD_RENDER is the most expensive thing in a frame of
- * text, and a repaint draws the same characters over and over. Whatever pixel
- * format FreeType produced is normalised to one coverage byte per pixel here,
- * so nothing downstream (nor a GPU backend's R8 atlas) has to know about
- * FT_PIXEL_MODE_*. */
-/* COLR(v0) color glyph (modern NotoColorEmoji): composite the palette
- * layers ourselves into one premultiplied-BGRA bitmap via FT_Bitmap_Blend
- * (y measured bottom-up, offsets in 26.6), then un-premultiply into the
- * straight-alpha BGRA tile the composite path expects. Returns NULL when
- * the face carries no layers for this glyph. */
-/* COLR v1 (the emoji font on modern Android): walk the paint graph with
- * the FT API and rasterize every PaintGlyph leaf into the accumulating
- * premultiplied-BGRA target. Subset renderer: solid fills exact,
- * gradients flattened to their first stop, composite modes approximated
- * with source-over ordering, and the transform paints recursed into
- * without applying their matrices (positions of reused component shapes
- * may be approximate). Returns NULL when the glyph has no v1 paint. */
+/* 内部辅助实现 */
+/* 内部辅助实现 */
+/* 内部辅助实现 */
 static void colr1_color(FT_Color *palette, const FT_ColorIndex *ci,
                         FT_Color *out) {
     if (ci->palette_index == 0xFFFF || !palette) {
@@ -720,8 +658,7 @@ static const zan_glyph_tile *ft_colr_tile(FT_Face face, FT_UInt glyph,
     FT_OpaquePaint root;
     int used_v1 = 0;
 
-    /* FT_Get_Color_Glyph_Paint reads op->p as an input guard: the struct
-     * must start zeroed or stack garbage makes every lookup miss. */
+    /* 内部辅助逻辑 */
     memset(&root, 0, sizeof(root));
 
     if (FT_Palette_Select(face, 0, &palette) != 0) palette = NULL;
@@ -822,20 +759,12 @@ static const zan_glyph_tile *ft_glyph_tile(u32 cp, int font_size, int angle) {
     FT_Face face = ft_face_for_cp(cp, font_size);
     FT_UInt glyph = FT_Get_Char_Index(face, cp);
     if (!glyph) glyph = FT_Get_Char_Index(face, '?');
-    /* COLR layers carry the whole glyph: composite the color tile directly
-     * (unrotated only; a rotated color glyph degrades to its base outline
-     * through the coverage path below). */
+    /* 内部辅助逻辑 */
     if (FT_HAS_COLOR(face) && angle == 0) {
         const zan_glyph_tile *ct = ft_colr_tile(face, glyph, font_size, key);
         if (ct) return ct;
     }
-    /* Rotation is baked into the coverage tile via the face transform, so
-     * nothing downstream knows tiles come in orientations: the atlas keeps
-     * one tile per (glyph, angle) and the pen loop walks the rotated
-     * baseline. The transform rotates slot->advance too, so the unrotated
-     * pen advance comes from metrics (26.6, never transformed). FT's font
-     * space is y-up and the device is y-down; mapping the device-space
-     * clockwise rotation through that flip gives this matrix. */
+    /* 内部辅助实现 */
     int rotated = angle != 0;
     if (rotated) {
         double rad = (double)angle * 3.14159265358979323846 / 180.0;
@@ -846,8 +775,7 @@ static const zan_glyph_tile *ft_glyph_tile(u32 cp, int font_size, int angle) {
         mat.yy = (FT_Fixed)(cos(rad) * 65536.0);
         FT_Set_Transform(face, &mat, NULL);
     }
-    /* FT_LOAD_COLOR is a no-op on outline faces but hands CBDT/CBLC color
-     * emoji through as an FT_PIXEL_MODE_BGRA bitmap below. */
+    /* 内部辅助逻辑 */
     int loaded = glyph && FT_Load_Glyph(face, glyph,
                                         FT_LOAD_RENDER | FT_LOAD_COLOR) == 0;
     int advance = 0;
@@ -866,9 +794,7 @@ static const zan_glyph_tile *ft_glyph_tile(u32 cp, int font_size, int angle) {
                                0, 0, 0, 0, advance, NULL, 1);
     }
 
-    /* Color glyph (embedded-PNG CBDT emoji): keep FT's BGRA byte order with
-     * straight alpha -- the CPU composite source-overs it and the GL shelf
-     * uploads it as BGRA. Row-copied because FT pitches may pad. */
+    /* 内部辅助逻辑 */
     if (bitmap->pixel_mode == FT_PIXEL_MODE_BGRA) {
         int pitch = bitmap->pitch;
         unsigned char *px = (unsigned char *)malloc((size_t)w * h * 4);
@@ -940,11 +866,7 @@ static void ft_draw_text(i64 surface_id, i64 x, i64 y,
         zan_glyph_batch_flush(&batch);
         return;
     }
-    /* Rotated: each glyph's tile already carries the rotation (see
-     * ft_glyph_tile), so the run reassembles rigidly by walking the rotated
-     * baseline. Unrotated pen points sit at (s, asc) from the anchor with s
-     * the accumulated advance; placing rotated glyphs at R(s, asc) through
-     * the device-space rotation reproduces exactly that rigid rotation. */
+    /* 内部辅助实现 */
     double rad = (double)angle * 3.14159265358979323846 / 180.0;
     double cs = cos(rad), sn = sin(rad);
     double asc = (double)(g_ft_face->size->metrics.ascender >> 6);
@@ -963,12 +885,7 @@ static void ft_draw_text(i64 surface_id, i64 x, i64 y,
     zan_glyph_batch_flush(&batch);
 }
 
-/* Measured-width cache, ported from gui_runtime_text.c's Win32 one: layout,
- * caret and syntax-highlight paths call measure hundreds of times per frame
- * with unchanged strings, and every miss here costs one FT_Load_Glyph (plus
- * a pixel-size reselect on fallback faces) per code point. The face set is
- * fixed for the life of the process ("sans" plus discovered fallbacks), so
- * (text, size) fully determines the width. */
+/* Measured-width cache, ported from gui_runtime_text */
 typedef struct {
     char    *text;   /* UTF-8 key; NULL marks an empty slot */
     int      size;
@@ -1047,22 +964,13 @@ EXPORT void zan_gui_draw_text(
     bitmap_draw_text(surface_id, x, y, text, color, font_size);
 }
 
-/* Bold variant. The Win32 driver (gui_runtime_text.c) renders real bold via
- * a weight axis; the FreeType/bitmap fallbacks here have no weight axis yet,
- * so they draw regular rather than not at all -- same convention as the
- * rotated fallback below. Render.zan declares the entry point
- * unconditionally (chart titles bold by default), so every non-Win32 GUI
- * program needs the symbol to exist. */
+/* Bold variant */
 EXPORT void zan_gui_draw_text_bold(
     i32 surface_id, i32 x, i32 y, const char *text, i32 color, i32 font_size) {
     zan_gui_draw_text(surface_id, x, y, text, color, font_size);
 }
 
-/* Rotated text: anchor and angle convention match the Win32 driver --
- * (x, y) is the unrotated line box's top-left and the run rotates rigidly
- * about it, positive = clockwise. FreeType bakes the rotation into the
- * cached glyph tiles; the 6x10 bitmap fallback has no rotated rasters and
- * draws unrotated rather than not at all. */
+/* 内部辅助实现 */
 EXPORT void zan_gui_draw_text_rot(
     i32 surface_id, i32 x, i32 y, const char *text, i32 color, i32 font_size,
     i32 angle_deg) {
@@ -1095,8 +1003,7 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
 EXPORT i32 zan_gui_font_height(i32 font_size) {
 #ifdef ZAN_GUI_FREETYPE
     if (ft_prepare((int)font_size)) {
-        /* Chrome content box: floor(ascender) + floor(|descender|), no
-         * lineGap -- not round(height), which can differ by a pixel. */
+        /* 内部辅助逻辑 */
         FT_Size_Metrics m = g_ft_face->size->metrics;
         i32 asc = (i32)(m.ascender >> 6);
         i32 desc = (i32)((0 - m.descender) >> 6);
@@ -1106,8 +1013,7 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
     return bitmap_font_height(font_size);
 }
 
-/* Baseline ascent (FreeType hhea ascender, 26.6 -> px). The software
- * bitmap raster has no real metrics, so it reports the full cell height. */
+/* Baseline ascent (FreeType hhea ascender, 26 */
 EXPORT i32 zan_gui_font_ascent(i32 font_size) {
 #ifdef ZAN_GUI_FREETYPE
     if (ft_prepare((int)font_size))
@@ -1118,8 +1024,7 @@ EXPORT i32 zan_gui_font_ascent(i32 font_size) {
 
 #endif /* software bitmap text */
 
-/* Icon glyphs are drawn in Zan, as vector primitives on top of the Canvas
- * line/rect/circle/sector calls: packages/Zan.Gui/src/Gui/Media/IconVector.zan. */
+/* 内部辅助逻辑 */
 
 #if defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
 /* ---- window management (EWMH / Xlib) ---- */
@@ -1163,8 +1068,7 @@ EXPORT i32 zan_gui_is_maximized(iptr hwnd_val) {
     return (found_v && found_h) ? 1 : 0;
 }
 
-/* 1 while the window can be seen (not iconified/unmapped); ambient
- * animations pause while this reports 0. */
+/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_window_visible(iptr hwnd_val) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
     if (!g_display || !xid) return 0;
@@ -1176,9 +1080,7 @@ EXPORT i32 zan_gui_window_visible(iptr hwnd_val) {
     return 1;
 }
 
-/* 1 while the window holds the input focus; ambient animations idle down to a
- * slow heartbeat while this reports 0, so a background window costs almost
- * nothing. */
+/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_window_focused(iptr hwnd_val) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
     if (!g_display || !xid) return 0;
@@ -1203,12 +1105,7 @@ EXPORT i32 zan_gui_set_caption_buttons(iptr hwnd_val, i32 count) {
     return 0;
 }
 
-/* Close is a *request*, mirroring WM_CLOSE on Win32 and WM_DELETE_WINDOW
- * from the window manager: post a kind-8 event stamped with the target
- * window and let the owner tear the window down (zan_gui_destroy_window)
- * once its loop has seen the event. Destroying synchronously here races the
- * caller's frame loop, which may still render chrome against the dead
- * Window and die with a fatal BadWindow. */
+/* 内部辅助实现 */
 EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
     if (!g_display) return 0;
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
@@ -1235,7 +1132,7 @@ EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) {
         g_lwins[idx] = g_lwins[--g_lwin_count];
     }
     if (xid == g_primary_win) {
-        /* Promote another window to primary so process-wide ops keep working. */
+        /* Promote another window to primary so process-wide ops keep working */
         g_primary_win = g_lwin_count ? g_lwins[0].xid : 0;
         g_x11_window = g_primary_win;
         if (g_lwin_count) {
@@ -1264,13 +1161,7 @@ EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) {
     return 0;
 }
 
-/* Native glass on Linux: ask a compositing WM (KWin, or picom via rules) to
- * blur whatever is behind the window by setting the de-facto standard
- * _KDE_NET_WM_BLUR_BEHIND_REGION property. An empty region means "blur the
- * whole window". The blur is only *visible* where the window is translucent,
- * which requires a 32-bit ARGB visual plus a running compositor; without those
- * the hint is a harmless no-op. tint is unused (the compositor owns the tint).
- * This is the Linux side of the same Gui.Native.Window.EnableGlass API. */
+/* 内部辅助实现 */
 EXPORT i32 zan_gui_enable_glass(iptr hwnd_val, i32 tint_argb) {
     (void)tint_argb;
     if (!g_display) return 1;
@@ -1294,8 +1185,7 @@ EXPORT i32 zan_gui_disable_glass(iptr hwnd_val) {
     return 0;
 }
 
-/* Whole-window opacity via the EWMH _NET_WM_WINDOW_OPACITY hint (honoured by
- * any compositing WM). percent is 10..100. */
+/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_set_opacity(iptr hwnd_val, i32 percent) {
     if (!g_display) return 1;
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;

@@ -1,41 +1,4 @@
-/* rt_sync_wasm.c -- wasm32 (WASI) single-threaded equivalents for the sync
- * runtime symbols.
- *
- * wasm has no pthreads and no shared memory, so rt_sync.o (the real
- * implementation) cannot be built for this target. Whole-namespace stdlib
- * pull-in (System.Threading via System.IO -> DirectoryWatcher, DataTable
- * export, HttpClient/Socket timeout plumbing) makes GUI-sized programs
- * reference these symbols even when most are never called at runtime, so
- * the wasm link needs definitions, not rejections.
- *
- * Behaviour on this target (one thread, one instantiation):
- *   zan_thread_start        runs the body synchronously, returns 1 (C# +
- *                           capture-less method group callers keep working;
- *                           there is no parallelism to lose).
- *   zan_thread_current_id   constant 1.
- *   zan_atomic_int_*        plain load/store on a malloc'd i64 cell -- the
- *                           ABI (an opaque i64 handle) is preserved, only
- *                           the atomicity is meaningless without threads.
- *   zan_mutex (pthread_*)   provided by rt_wasm.c's no-op shims.
- *   zan_monitor_enter/exit  no-ops (recursive by triviality: one thread).
- *   zan_monotonic_us/ns     real clock_gettime(CLOCK_MONOTONIC) -- WASI
- *                           emulates it with the page clock.
- *   zan_shared_table_*      graceful stubs: create/open/attach return 0
- *                           (SharedTable's Zan side treats 0 as "not
- *                           available"), getters return 0/empty, everything
- *                           else is a no-op. Cross-process tables cannot
- *                           exist on wasm; the Zan wrappers surface the
- *                           failure instead of crashing.
- *
- * Signatures match what the stdlib [DllImport]s declare as adapted to
- * wasm32: Zan nint/long are i64 at the wasm ABI boundary, so every
- * handle/delta parameter is int64_t here and string parameters arrive as
- * char* (wasm32 pointers are 32-bit; the i64 locals on the C side just
- * truncate to the pointer width, which is lossless in the other direction).
- *
- * Compile with: zig cc -target wasm32-wasi -std=gnu11 -O2 -c rt_sync_wasm.c
- * (shipped pre-compiled as toolchain/wasm32/zanrt_syncw.o)
- */
+/* rt_sync_wasm */
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,10 +9,7 @@ typedef int64_t i64;
 /* ---- threads ------------------------------------------------------------ */
 
 int32_t zan_thread_start(void *body) {
-    /* body is the tagged closure record / bare fn pointer of a ThreadStart
-     * delegate; invoke it with the delegate ABI: tagged records carry the
-     * fn at record slot 0 and are called fn(rec), bare pointers are called
-     * directly (ZAN_CLOSURE_TAG = bit 0). */
+    /* 内部辅助实现 */
     if (!body) return 0;
     uintptr_t v = (uintptr_t)body;
     void (*fn)(void *);
@@ -369,16 +329,7 @@ int32_t zan_shared_table_delete_at(i64 handle, i64 key_hash) {
     return 0;
 }
 
-/* ---- gate + socket-async stubs -------------------------------------------
- * The Gate/async-socket layer rides the runtime IO reactor (rt_io.c), which
- * cannot build for wasm. GUI stdlib code (HttpClient timeout plumbing,
- * Socket declarations) references these symbols at declaration level, so
- * GUI-sized programs need definitions. Sockets cannot exist on wasm, so
- * every operation fails cleanly: connect/resolve report failure, send/recv
- * report error, alive reports dead, ready reports not-ready. Gate handles
- * never round-trip through real waits on this target (Task.Delay paths are
- * the coroutine scheduler's own timers, not gates), so gate_new returning 0
- * is only a marker that must never crash if signaled. */
+/* 内部辅助实现 */
 long zan_gate_new(void) {
     return 0;
 }
@@ -484,16 +435,7 @@ int zan_io_sockaddr_ip_str_into(int sa, long long buf, int cap) {
     return -1;
 }
 
-/* ---- setjmp/longjmp (async trampoline) -----------------------------------
- * wasi-libc ships neither symbol. The only wasm-side references come from
- * the async-state-machine EH trampoline (irgen_async.c emit_eh_setjmp);
- * wasm try/catch itself lowers to engine EH and never lands here. The
- * trampoline protocol: setjmp returns 0 to run the body, non-zero when
- * longjmp'd back. A longjmp on wasm means "unwind to the async frame
- * handler", and since the coroutines this target can actually run are
- * driven by the scheduler's own resume path (which clears the handler
- * before re-entry), reaching the longjmp means the frame has nowhere to
- * go -- abort loudly instead of corrupting the stack. */
+/* ---- setjmp/longjmp (async trampoline) ----------------------------------- wasi-libc ships neither symbol */
 int _setjmp(void *env) {
     (void)env;
     return 0;
@@ -501,15 +443,7 @@ int _setjmp(void *env) {
 /* longjmp itself already comes from rt_wasm.c's abort-shaped shim; no
  * second definition here (wasm-ld rejects the duplicate). */
 
-/* ---- OpenSSL (ssl/crypto) failure stubs ----------------------------------
- * TLS clients cannot exist on wasm (no sockets, no libssl). TlsStream.zan
- * declares the openssl surface for desktop builds; the GUI stdlib pulls the
- * declarations in, so the link needs definitions. Every entry point fails
- * the way openssl does on a dead context: allocation returns NULL (the Zan
- * side checks for that), handshake/read/write return the error family,
- * verification returns failure. A program that actually reaches for TLS
- * surfaces the failure through TlsStream/HttpClient's normal error path
- * instead of trapping the instance. */
+/* 内部辅助实现 */
 void *TLS_server_method(void) { return 0; }
 void *TLS_client_method(void) { return 0; }
 
@@ -608,13 +542,7 @@ void CRYPTO_free(long long p, int file, int line) {
     free((void *)(uintptr_t)p);
 }
 
-/* ---- coroutine IO reactor stubs (irgen.c's always-declared externs) ------
- * Every program that uses async/await gets these declarations even without
- * sockets (the async machinery declares them unconditionally; the linker
- * only pulls them when referenced). Socket-bearing awaits must resume the
- * frame with a failure result: each stub stores -1/0 into the out-slot and
- * resumes the step so the coroutine unwinds through its own error path
- * instead of hanging forever. */
+/* ---- coroutine IO reactor stubs (irgen */
 typedef void (*zan_co_step)(void *frame);
 
 static void zan_wasm_co_fail(void *frame, zan_co_step step) {
@@ -671,12 +599,7 @@ int system(const char *cmd) {
     return -1;
 }
 
-/* wasi-libc resolves the environment lazily: the first getenv triggers the
- * environ population, which walks the host-provided env block through the
- * zan WASI shims and crashes (strncmp over garbage entries) -- the shims'
- * empty-environ contract is not one wasi-libc's population path anticipates.
- * A browser tab has no environment variables anyway, so answer NULL
- * directly: callers (Skin.Env and friends) already treat NULL as "unset". */
+/* 内部辅助实现 */
 char *getenv(const char *name) {
     (void)name;
     return 0;

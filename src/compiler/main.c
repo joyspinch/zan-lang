@@ -1,4 +1,4 @@
-/* main.c -- zanc command-line driver: entry point of the Zan compiler. */
+/* main */
 
 #include "zan.h"
 #include "arena.h"
@@ -22,7 +22,7 @@
 #include "apk.h"
 #include "ipa.h"
 #include <llvm-c/Comdat.h>
-/* zan.ico compiled in (CMake-generated): the default --icon for Windows exes. */
+/* zan */
 #include "zan_default_icon.h"
 #include "zan_version.h"
 #include <stdio.h>
@@ -62,18 +62,16 @@
 
 #include "../common/host_oom.h"
 
-/* Link-invocation capacities; every site reports on overflow (link_cap_exceeded). */
+/* Link-invocation capacities; every site reports on overflow (link_cap_exceeded) */
 #define ZAN_LINK_MAX_ARGV        8192
 #define ZAN_LINK_MAX_LIBS        2048
 #define ZAN_LINK_MAX_DIRS        1024
 #define ZAN_MAX_USED_DRIVERS     1024
 #define ZAN_MAX_STATIC_DRV_LIBS  2048
-/* Argv slots the tail of each link line still needs (terminator, --end-group,
- * final inputs). */
+/* 内部辅助逻辑 */
 #define ZAN_LINK_ARGV_TAIL        32
 
-/* Native Windows x64 exe linking consumes this as a vector (sharding); every
- * other output mode deliberately uses the single-object fallback below. */
+/* 内部辅助逻辑 */
 typedef struct {
     char **paths;
     int count;
@@ -148,8 +146,7 @@ static void link_cap_exceeded(const char *what, int cap) {
     exit(1);
 }
 
-/* Append to a system() link command; a silent truncation would drop the tail
- * arguments, so report and exit like link_cap_exceeded. */
+/* 内部辅助逻辑 */
 static void cmd_appendf(char *cmd, size_t cap, const char *fmt, ...) {
     size_t cur = strlen(cmd);
     int need = -1;
@@ -170,7 +167,7 @@ static void cmd_appendf(char *cmd, size_t cap, const char *fmt, ...) {
 static bool g_time_phases = false;
 static double g_phase_start = 0.0;
 
-/* Scale counters: --time observes repeated frontend work without changing it. */
+/* Scale counters: --time observes repeated frontend work without changing it */
 typedef struct {
     size_t file_reads;
     size_t bytes_read;
@@ -203,7 +200,7 @@ static double now_ms(void) {
 
 static zan_arena_t *g_main_arena = NULL;
 
-/* Closes the phase opened by the previous call and reports how long it ran. */
+/* Closes the phase opened by the previous call and reports how long it ran */
 static void phase(const char *name) {
     if (!g_time_phases) return;
     double t = now_ms();
@@ -223,8 +220,7 @@ static void phase(const char *name) {
     g_phase_start = t;
 }
 
-/* Report errors dropped by the diagnostic cap; called on every error exit so
- * the closing count survives terminal scrolling. */
+/* 内部辅助逻辑 */
 static void report_suppressed_errors(const zan_diag_t *diag) {
     int dropped = zan_diag_suppressed_errors(diag);
     if (dropped > 0) {
@@ -254,8 +250,7 @@ static char *read_file(const char *path, size_t *out_len) {
     struct stat st;
     if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
 #endif
-        /* POSIX: a directory opens like a file and the allocation below then
-         * fails, misreporting the error as OOM. */
+        /* 内部辅助逻辑 */
         fprintf(stderr, "error: '%s' is a directory, not a source file\n", path);
         return NULL;
     }
@@ -286,8 +281,7 @@ static char *read_file(const char *path, size_t *out_len) {
     return buf;
 }
 
-/* Normalized comparison key so the same file passed explicitly and via
- * auto-stdlib (case/slash differences) is only compiled once. */
+/* 内部辅助逻辑 */
 static void canon_key(const char *in, char *out, size_t out_sz) {
 #ifdef _WIN32
     char full[4096];
@@ -308,8 +302,7 @@ static void canon_key(const char *in, char *out, size_t out_sz) {
 #endif
 }
 
-/* Canonical key of every path already in the input list, so a dedup check
- * costs one canonicalization. */
+/* 内部辅助逻辑 */
 typedef struct {
     char *key;
 #ifndef _WIN32
@@ -322,13 +315,11 @@ typedef struct {
 static input_key_t *input_keys = NULL;
 static int input_key_count = 0;
 static int input_key_cap = 0;
-/* Open-addressing index over input_keys (slots hold array indices, -1 =
- * empty); hashed over the same canonical key bytes strcmp compares. */
+/* 内部辅助逻辑 */
 static int *input_key_idx = NULL;
 static int input_key_idx_cap = 0; /* power of two, 0 = not built yet */
 #ifndef _WIN32
-/* POSIX (dev,ino) duplicate fallback: a symlink/hardlink whose canonical
- * path differs from an already-listed file. */
+/* 内部辅助逻辑 */
 static int *input_ino_idx = NULL;
 static int input_ino_idx_cap = 0;
 #endif
@@ -461,8 +452,7 @@ static int input_file_present(const char *cand) {
     return 0;
 }
 
-/* Growable input list: explicit CLI args plus transitively auto-included
- * stdlib .zan files; no fixed upper bound. */
+/* Growable input list: explicit CLI args plus transitively auto-included stdlib */
 static void input_files_push(const char ***files, int *count, int *cap,
                              const char *path) {
     if (*count == *cap) {
@@ -480,7 +470,7 @@ static void input_files_push(const char ***files, int *count, int *cap,
     input_key_add(path);
 }
 
-/* Append an auto-discovered stdlib file; skip if missing or already present. */
+/* Append an auto-discovered stdlib file; skip if missing or already present */
 static void add_stdlib_input(const char ***files, int *count, int *cap,
                              const char *path) {
     FILE *check = fopen(path, "rb");
@@ -540,9 +530,7 @@ static int resolve_stdlib_dir(const char *stdlib_root, const char *subdir,
 }
 #endif
 
-/* Does the stdlib provide this namespace dir? Gates package hierarchy
- * expansion; stdlib-rooted namespaces keep exact matching (`using System;`
- * must not reach package System.* files). */
+/* 内部辅助逻辑 */
 static int stdlib_has_dir(const char *stdlib_root, const char *subdir) {
 #ifdef _WIN32
     char p[1024];
@@ -610,8 +598,7 @@ static int subdir_globbed(const char *subdir) {
     return 0;
 }
 
-/* Probe a .zan file's declared namespace from its first ~1KB.
- * Returns 1 with out_ns populated, 0 otherwise. */
+/* Probe a */
 static int probe_file_namespace(const char *path, char *out_ns, size_t cap) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
@@ -661,7 +648,7 @@ static int probe_file_namespace(const char *path, char *out_ns, size_t cap) {
     return 0;
 }
 
-/* Convert a slash-separated subdir path ("A/B/C") to dot-separated namespace ("A.B.C"). */
+/* Convert a slash-separated subdir path ("A/B/C") to dot-separated namespace ("A */
 static void subdir_to_namespace(const char *subdir, char *out_ns, size_t cap) {
     size_t i = 0;
     for (; subdir[i] && i + 1 < cap; i++) {
@@ -670,9 +657,7 @@ static void subdir_to_namespace(const char *subdir, char *out_ns, size_t cap) {
     out_ns[i] = '\0';
 }
 
-/* Auto-include every *.zan under stdlib_root/subdir (dedup + existence
- * checked), recursing into subdirectories that declare the same namespace.
- * Returns 1 if any new file was added. */
+/* Auto-include every * */
 static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
                            const char ***files, int *count, int *cap) {
     int before = *count;
@@ -818,8 +803,7 @@ static int auto_include_namespace(const char *stdlib_root, const char *subdir,
     int package_count = package_visit_namespace(subdir, package_add_input,
                                                   &args, hierarchical);
     found = found || package_count > 0;
-    /* `using System;` names compiler/runtime core, never a marketplace
-     * install suggestion. */
+    /* 内部辅助逻辑 */
     if (!found && package_project_root[0] != '\0' &&
         strcmp(subdir, "System") != 0 &&
         !project_namespace_declared(subdir)) {
@@ -832,9 +816,7 @@ static int auto_include_namespace(const char *stdlib_root, const char *subdir,
 static void scan_namespace_tokens(const char *source, size_t len) {
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
-    /* Heuristic scan over text believed to be Zan source: lexer errors here
-     * are false alarms on foreign text -- capture instead of print (the diag
-     * has no file registered, a print would render as "<unknown>"). */
+    /* 内部辅助逻辑 */
     zan_diag_set_capture(diag, true);
     zan_lexer_t lex;
     zan_lexer_init(&lex, source, len, 0, arena, diag);
@@ -862,9 +844,7 @@ static void scan_namespace_tokens(const char *source, size_t len) {
     zan_arena_free(arena);
 }
 
-/* Dirs that never contribute project namespaces: installed-package stores,
- * VCS metadata, build output (the latter would falsely "satisfy" a
- * missing-namespace diagnosis with other projects' namespaces). */
+/* 内部辅助逻辑 */
 static int skip_project_dir(const char *name) {
     static const char *skip[] = {
         ".zan-packages", ".git", ".svn", ".hg", "build", "publish",
@@ -875,9 +855,7 @@ static int skip_project_dir(const char *name) {
     return 0;
 }
 
-/* Records every namespace declared under the project root so a same-project
- * `using` in an IDE single-file compile is not misreported as a missing
- * marketplace package. Lexer-only pass (no parse/check). */
+/* 内部辅助逻辑 */
 static void scan_project_namespaces(const char *root) {
 #ifdef _WIN32
     char pattern[1024];
@@ -958,13 +936,8 @@ static void resolve_package_project_root(const char *input) {
     snprintf(package_project_root, sizeof(package_project_root), ".");
 }
 
-/* zan.proj keys (--emit-apk): plain "key = value" lines.
- * androidPermissions is comma-separated, bare names prefixed
- * "android.permission."; CLI --apk-package/--apk-label win.
- * Skins: baseline dark+light + base.css always ship; `skins = 1` adds the
- * `skinlist = a,b,c` packs; `skins = -`/`skinlist = -` ships baseline only. */
-/* Package/label get 256 bytes (aapt accepts up to 255 chars); over-long
- * values are refused, not truncated into a plausible-but-wrong manifest. */
+/* 内部辅助实现 */
+/* 内部辅助逻辑 */
 static char proj_android_package[256];
 static char proj_android_label[256];
 static bool proj_android_keys_ok = true;
@@ -974,8 +947,7 @@ static char proj_skin_names[128][64];
 static int proj_skin_name_count = 0;
 static bool proj_skins_enabled = false;
 static bool load_proj_android_keys_done = false;
-/* Filter for zan_embed_emit_specs_filtered: the stdlib skins spec bakes only
- * these packs (plus base.css). NULL = unfiltered (no zan.proj). */
+/* 内部辅助逻辑 */
 static const char **skin_filter = NULL;
 static int skin_filter_count = 0;
 
@@ -1067,8 +1039,7 @@ static void scan_using_tokens(const char *source, size_t len,
                               const char ***files, int *count, int *cap) {
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
-    /* Heuristic scan: lexer errors on foreign text are false alarms, not
-     * user diagnostics (see scan_namespace_tokens). */
+    /* 内部辅助逻辑 */
     zan_diag_set_capture(diag, true);
     zan_lexer_t lex;
     zan_lexer_init(&lex, source, len, 0, arena, diag);
@@ -1097,57 +1068,23 @@ static void scan_using_tokens(const char *source, size_t len,
     zan_arena_free(arena);
 }
 
-/* Demand-driven stdlib pull-in: when the filter is active, a globbed file
- * joins the parse only when a real reference can name it --
- *   - only names in type positions (AST_TYPE_REF, trailing segment of a
- *     qualified name, root of a member access) flag a live name; a
- *     declaration or member name never counts (see pi_seed_ast below);
- *   - a reached directory is scanned once with the real lexer (top-level
- *     declared type names, `using` directives, extension-method marker) --
- *     no parse, no AST;
- *   - a file joins when one of its top-level names is live, or when it
- *     hosts extension methods (an extension call names the receiver and
- *     the method, never the host class);
- *   - including a file reaches its `using` directories; the closure runs
- *     to a fixpoint before any file reaches the real parse.
- * Observable semantics are preserved: every spelled type still pulls its
- * declaring file. ZAN_NO_PULLIN_FILTER=1 restores the glob-everything scan;
- * --emit-symbols always uses it (the IDE index must describe the whole
- * stdlib). */
+/* 内部辅助实现 */
 
 static zan_arena_t *pi_arena = NULL;
 static int pi_filter_active = 0;
-/* The currently seeded input is itself a stdlib file (e.g. a command-line
- * partial-class part): its names -- including qualified calls into its
- * partial siblings -- must flag normally, not be suppressed as user
- * shadowing. */
+/* The currently seeded input is itself a stdlib file (e */
 static int pi_seed_stdlib_input = 0;
-/* 1 while seeding a stdlib-authored source: flag helpers also stamp
- * flagged_stdlib, the repair trigger's source gate. Never nested. */
+/* 内部辅助逻辑 */
 static int pi_seeding_stdlib = 0;
-/* 1 while the repair walk metadata-scans a file: pi_note_using must not
- * reach its using-dirs (the walk reads top-level names only). */
+/* 内部辅助逻辑 */
 static int pi_repair_scanning = 0;
 
 typedef struct pi_name {
     const char *str;
     unsigned len;
     int flagged;                /* live: some parsed source spells this name */
-    int flagged_stdlib;         /* flagged by a stdlib-authored source: only
-                                 * such mentions trigger the repair walk
-                                 * (stdlib code must bind to the real
-                                 * declaration; user mentions keep today's
-                                 * fallback/inline behavior) */
-    int user_decl;              /* declared as a GLOBAL-scope top-level type
-                                 * by an input file: unqualified mentions
-                                 * resolve to the user's declaration and
-                                 * must not pull a same-named stdlib file
-                                 * (qualified `Ns.Name` mentions still do).
-                                 * Namespace-scoped declarations don't seed
-                                 * it: their namespace is invisible to other
-                                 * files' scope chains, so the stdlib file
-                                 * must stay pullable (nsresolve sorts the
-                                 * pair out). */
+    int flagged_stdlib;         /* 内部辅助实现 */
+    int user_decl;              /* 内部辅助实现 */
     int ns_root;                /* segment of a known namespace path */
     struct pi_name *next;
 } pi_name_t;
@@ -1161,15 +1098,8 @@ typedef struct pi_file {
     pi_name_t **idents; int ident_count, ident_cap; /* every identifier */
     char **usings; int using_count, using_cap;    /* dotted subdirs */
     int has_ext;                /* hosts an extension method */
-    int pkg_src;                /* installed-package source: joins the parse
-                                   unconditionally -- package controllers are
-                                   named only by generated route tables,
-                                   never by user code */
-    int gate_live;              /* split namespace (stdlib dir still exists
-                                   beside the package): join only when a
-                                   top-level name is live, like a stdlib
-                                   file, else every compile reaching the ns
-                                   drags the whole package in */
+    int pkg_src;                /* 内部辅助实现 */
+    int gate_live;              /* 内部辅助实现 */
     int included;               /* joins the parse */
     int parsed;                 /* already appended to the input list */
     int seeded;                 /* already parse-seeded in the fixpoint */
@@ -1187,10 +1117,7 @@ typedef struct pi_dir {
 static pi_dir_t *pi_dirs_head = NULL;
 static pi_dir_t *pi_dirs_tail = NULL;
 
-/* The preprocessor environment of the real parse. Seeding and the metadata
- * scan MUST run with the same defines: a `#if WINDOWS` region's references
- * are real on Windows, and the generator's Main (`#if ZAN_GEN_MAIN`) is the
- * only thing naming its Gen* helpers. */
+/* The preprocessor environment of the real parse */
 static zan_target_t pi_target;
 static const char *const *pi_pp_defines = NULL;
 static int pi_pp_define_count = 0;
@@ -1225,7 +1152,7 @@ static pi_name_t *pi_intern(const char *s, size_t len) {
     return p;
 }
 
-/* Growable per-file arrays backed by the pull-in arena (no realloc: copy). */
+/* Growable per-file arrays backed by the pull-in arena (no realloc: copy) */
 static int pi_reserve(void *arr_p, int count, int *cap, size_t elem_sz) {
     if (count < *cap) return 1;
     int ncap = *cap ? *cap * 2 : 8;
@@ -1256,12 +1183,10 @@ static void pi_reach(const char *subdir) {
     pi_dirs_tail = d;
 }
 
-/* The stdlib root every input-relative directory probe compares against. */
+/* The stdlib root every input-relative directory probe compares against */
 static const char *pi_stdlib_root_buf;
 
-/* An entry that IS a stdlib file (tests pass single stdlib sources) makes
- * its own directory visible: siblings and partial-class parts live beside
- * it. Walk up to the stdlib root's leaf name to recover the 'A/B/C' subdir. */
+/* 内部辅助逻辑 */
 static int pi_reach_input_dir(const char *file) {
     char comps[64][256];
     int n = 0;
@@ -1344,8 +1269,7 @@ static void pi_add_file(pi_dir_t *d, const char *path) {
     f->dnext = NULL;
 }
 
-/* Mirror of glob_stdlib_dir's platform halves, filling a pi_dir.
- * `root` may be the stdlib root or a package dir (empty subdir). */
+/* Mirror of glob_stdlib_dir's platform halves, filling a pi_dir */
 static void pi_glob_into(pi_dir_t *d, const char *root, const char *subdir) {
     char target_ns[256];
     subdir_to_namespace(subdir, target_ns, sizeof(target_ns));
@@ -1456,11 +1380,10 @@ static void pi_glob_into(pi_dir_t *d, const char *root, const char *subdir) {
 #endif
 }
 
-/* Record a dotted `using A.B.C;` target ('A/B/C' form) as a reached dir. */
+/* Record a dotted `using A */
 static void pi_note_using(pi_file_t *f, const char *subdir) {
     if (!subdir[0]) return;
-    /* The repair walk reads only top-level names; reaching their using-dirs
-     * here would widen the reach set to the whole tree. */
+    /* 内部辅助逻辑 */
     if (pi_repair_scanning) return;
     if (!pi_reserve((void *)&f->usings, f->using_count, &f->using_cap,
                     sizeof(char *)))
@@ -1477,7 +1400,7 @@ static void pi_flag_ident(pi_file_t *f, const char *s, size_t len) {
     pi_name_t *name = pi_intern(s, len);
     if (!name) return;
     if (!f) {
-        /* Seed pass: spelled by already-parsed sources, so live right away. */
+        /* Seed pass: spelled by already-parsed sources, so live right away */
         name->flagged = 1;
         if (pi_seeding_stdlib) name->flagged_stdlib = 1;
         return;
@@ -1488,12 +1411,7 @@ static void pi_flag_ident(pi_file_t *f, const char *s, size_t len) {
     f->idents[f->ident_count++] = name;
 }
 
-/* Lex one globbed file for pull-in metadata: top-level declared type names
- * (brace depth <= 1 covers block `namespace X { ... }`), `using` directives,
- * extension-method marker, full identifier set. A token-level pass cannot be
- * a perfect declaration parser and need not be: misses only ever
- * under-include, and the guard below keeps the generic-constraint spelling
- * (`where T : class`) from minting bogus candidates. */
+/* 内部辅助逻辑 */
 static uint64_t pi_meta_hash_bytes(uint64_t h, const void *data, size_t len) {
     const unsigned char *p = (const unsigned char *)data;
     for (size_t i = 0; i < len; i++) {
@@ -1530,8 +1448,7 @@ static uint64_t pi_meta_compiler_hash(void) {
     if (n <= 0) return 0;
     exe[n] = 0;
 #endif
-    /* Failure leaves identity 0: the caller then disables the cache, so a
-     * changed compiler must never hit an old cache. */
+    /* 内部辅助逻辑 */
     FILE *in = fopen(exe, "rb");
     if (!in) return 0;
     uint64_t h = UINT64_C(1469598103934665603);
@@ -1549,8 +1466,7 @@ static uint64_t pi_meta_file_hash(const char *path, const char *src, size_t len)
     uint64_t compiler = pi_meta_compiler_hash();
     if (!compiler) return 0;
     uint64_t h = UINT64_C(1469598103934665603);
-    /* Key uses explicit stable fields: hashing zan_target_t raw would fold
-     * padding bytes into the cache identity. */
+    /* 内部辅助逻辑 */
     h = pi_meta_hash_text(h, "zan-pullin-meta-v2");
     h = pi_meta_hash_text(h, ZAN_VERSION);
     h = pi_meta_hash_bytes(h, &compiler, sizeof(compiler));
@@ -1574,8 +1490,7 @@ static uint64_t pi_meta_file_hash(const char *path, const char *src, size_t len)
 static void pi_meta_cache_path(uint64_t key, char *out, size_t out_sz) {
     out[0] = 0;
     if (!key) return;
-    /* ZAN_META_CACHE_DIR overrides the per-user cache location (tests use a
-     * scratch dir for isolation). */
+    /* 内部辅助逻辑 */
     const char *override = getenv("ZAN_META_CACHE_DIR");
     if (override && *override) {
 #ifdef _WIN32
@@ -1606,10 +1521,7 @@ static void pi_meta_cache_path(uint64_t key, char *out, size_t out_sz) {
 #endif
 }
 
-/* Cache file format: magic "ZPM2", version, the three name-list counts, the
- * extension flag, then the lists as (u16 length, bytes) records in file
- * order -- order matters, replaying usings/idents differently would reorder
- * the input list nsresolve sees. */
+/* 内部辅助实现 */
 #define PI_META_MAGIC UINT32_C(0x5a504d32)
 #define PI_META_VERSION UINT32_C(2)
 #define PI_META_MAX_NAMES 100000u
@@ -1622,9 +1534,7 @@ static int pi_meta_cache_load(pi_file_t *f, const char *src, size_t len) {
     if (!cache[0]) return 0;
     FILE *in = fopen(cache, "rb");
     if (!in) return 0;
-    /* Failure leaves only interned names (harmless: unflagged names pull
-     * nothing); the reached-directory list is rolled back so a half-read
-     * cache cannot reach bogus namespaces (ZANPKG_MISSING). */
+    /* 内部辅助逻辑 */
     pi_dir_t *saved_head = pi_dirs_head, *saved_tail = pi_dirs_tail;
     uint32_t magic = 0, version = 0, top = 0, idents = 0, usings = 0;
     unsigned char ext = 0;
@@ -1695,7 +1605,7 @@ static void pi_meta_cache_write(const pi_file_t *f, const char *src, size_t len)
     char cache[1024], tmp[1060];
     pi_meta_cache_path(key, cache, sizeof(cache));
     if (!cache[0]) return;
-    /* Create the cache directory (one level deep suffices everywhere). */
+    /* 创建the cache directory (one level deep suffices everywhere) */
     {
         char dir[1024];
         size_t dl = strlen(cache);
@@ -1765,8 +1675,7 @@ static void pi_scan_file(pi_file_t *f) {
     size_t len = 0;
     char *src = read_file(f->path, &len);
     if (!src) {
-        /* Unreadable: include it so the real parse reports the error
-         * ("cannot read '<path>'"). */
+        /* 内部辅助逻辑 */
         f->included = 1;
         return;
     }
@@ -1777,8 +1686,7 @@ static void pi_scan_file(pi_file_t *f) {
     g_scale_stats.metadata_cache_misses++;
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
-    /* Heuristic scan: lexer errors on foreign text are false alarms, not
-     * user diagnostics (see scan_namespace_tokens). */
+    /* 内部辅助逻辑 */
     zan_diag_set_capture(diag, true);
     zan_lexer_t lex;
     zan_lexer_init(&lex, src, len, 0, arena, diag);
@@ -1786,8 +1694,7 @@ static void pi_scan_file(pi_file_t *f) {
                           pi_publish_mode);
     int depth = 0;
     zan_token_kind_t prev = TK_EOF;
-    pi_name_t *last_id = NULL;  /* previous chain segment; read by the
-                                 * Task.WhenAll mirror below */
+    pi_name_t *last_id = NULL;  /* previous chain segment; read by the Task */
     for (;;) {
         zan_token_t tok = zan_lexer_next(&lex);
         if (tok.kind == TK_EOF) break;
@@ -1838,11 +1745,7 @@ static void pi_scan_file(pi_file_t *f) {
             }
             break;
         case TK_DELEGATE:
-            /* `delegate Ret Name<T>(...)`: declared name is the last
-             * identifier outside angle brackets before the parameter list's
-             * '('; identifiers inside <...> are the delegate's own type
-             * parameters and must not mint names (a bare `T` would match
-             * every generic mention). */
+            /* `delegate Ret Name<T>( */
             if (depth <= 1 && prev != TK_COLON && prev != TK_COMMA) {
                 pi_name_t *name = NULL;
                 int angle = 0;
@@ -1866,11 +1769,7 @@ static void pi_scan_file(pi_file_t *f) {
             }
             break;
         case TK_THIS: {
-            /* Extension-declaration shape: `this` right after '(' AND
-             * followed by a type token. The receiver is often a builtin
-             * (`this string s`), where the type is a KEYWORD token.
-             * Expression mentions (`M(this.x)`, `M(this)`) have '.' / ')'
-             * after and never trigger. */
+            /* Extension-declaration shape: `this` right after '(' AND followed by a type token */
             zan_token_t next = zan_lexer_peek(&lex);
             if (prev == TK_LPAREN && (next.kind == TK_IDENT ||
                                       next.kind == TK_STRING ||
@@ -1890,8 +1789,7 @@ static void pi_scan_file(pi_file_t *f) {
             break;
         }
         case TK_IDENT:
-            /* `record Name(...)` lowers to a class; 'record' is a
-             * contextual keyword. */
+            /* `record Name( */
             if (depth <= 1 && tok.str_val.len == 6 &&
                 memcmp(tok.str_val.str, "record", 6) == 0 &&
                 zan_lexer_peek(&lex).kind == TK_IDENT) {
@@ -1908,8 +1806,7 @@ static void pi_scan_file(pi_file_t *f) {
                                           tok.str_val.len);
             if (prev != TK_DOT) last_id = cur_id;
             pi_flag_ident(f, tok.str_val.str, tok.str_val.len);
-            /* Mirror the parser's Task.WhenAll/WhenAny -> TaskJoin rewrite
-             * (desugar_task_join): the closure must pull its file. */
+            /* Mirror the parser's Task */
             if (prev == TK_DOT && last_id && last_id->len == 4 &&
                 memcmp(last_id->str, "Task", 4) == 0 && tok.str_val.len == 7 &&
                 (memcmp(tok.str_val.str, "WhenAll", 7) == 0 ||
@@ -1927,14 +1824,8 @@ static void pi_scan_file(pi_file_t *f) {
     free(src);
 }
 
-/* Seed the live-name worklist and the reached-directory set from one
- * fully-parsed source (user file, design translation or generator output).
- * Carve-out: a top-level type declared by an input file shadows its own name
- * for every unqualified use in user code, so those mentions do not pull a
- * same-named stdlib file (a `class App` template must not drag in stdlib
- * Gui.App); qualified (dotted) mentions still seed. */
-/* Token kinds a declaration's return type can start with, for the
- * method/property-declaration shape check in pi_seed_source. */
+/* 内部辅助实现 */
+/* 内部辅助逻辑 */
 static int pi_typeish(zan_token_kind_t k) {
     return k == TK_IDENT || k == TK_STRING || k == TK_BOOL || k == TK_CHAR ||
            k == TK_INT || k == TK_LONG || k == TK_SHORT || k == TK_BYTE ||
@@ -1949,20 +1840,14 @@ static void pi_seed_source(const char *source, size_t len) {
     zan_diag_t *diag = zan_diag_new(arena);
     zan_lexer_t lex;
 
-    /* Pass 1 collects namespace roots -- segments of `using` targets and of
-     * the file's own `namespace` declaration. Pass 2 needs them to tell a
-     * namespace-qualified type (`Gui.App`) apart from a member access
-     * (`b.Label()`): only chains rooted at a namespace segment can name a
-     * pull-in candidate. A second lex keeps the order irrelevant. */
+    /* 内部辅助逻辑 */
     for (int pass = 0; pass < 2; pass++) {
         g_scale_stats.seed_lex_passes++;
         zan_lexer_init(&lex, source, len, 0, arena, diag);
         zan_apply_lex_defines(&lex, pi_target, pi_pp_defines,
                               pi_pp_define_count, pi_publish_mode);
         int depth = 0;
-        /* set once a file-scoped `namespace X;` is seen: later top-level
-         * declarations are ns-scoped and must not seed the user_decl shadow
-         * (see pi_seed_parsed_unit) */
+        /* 内部辅助逻辑 */
         int ns_file_scoped = 0;
         zan_token_kind_t prev = TK_EOF;
         pi_name_t *chain = NULL;    /* first segment of the dotted chain */
@@ -2106,12 +1991,7 @@ static void pi_seed_source(const char *source, size_t len) {
                         if (prev != TK_DOT) {
                             chain = name;
                             zan_token_t next = zan_lexer_peek(&lex);
-                            /* Mirror the parser's Task.WhenAll/WhenAny ->
-                             * TaskJoin rewrite (desugar_task_join): flag
-                             * TaskJoin when a bare `Task` is followed by
-                             * `.WhenAll`/`.WhenAny`. Kept as the shape-only
-                             * check, independent of the chain mirror below
-                             * and of namespace roots. */
+                            /* Mirror the parser's Task */
                             if (name->len == 4 &&
                                 memcmp(name->str, "Task", 4) == 0 &&
                                 next.kind == TK_DOT) {
@@ -2132,13 +2012,7 @@ static void pi_seed_source(const char *source, size_t len) {
                             if (depth >= 1 && pi_typeish(prev) &&
                                 (next.kind == TK_LPAREN ||
                                  next.kind == TK_LBRACE)) {
-                                /* `string Label(` / `string Label {` inside
-                                 * a type body: a method or property
-                                 * DECLARATION never references a stdlib
-                                 * type, and method names collide with
-                                 * stdlib type names constantly.
-                                 * `new Label(...)` keeps prev==TK_NEW, so
-                                 * constructor calls still pull. */
+                                /* 内部辅助实现 */
                             } else if (!name->user_decl) {
                                 name->flagged = 1;
                                 if (pi_seeding_stdlib)
@@ -2154,10 +2028,7 @@ static void pi_seed_source(const char *source, size_t len) {
                                    name->len == 7 &&
                                    (memcmp(name->str, "WhenAll", 7) == 0 ||
                                     memcmp(name->str, "WhenAny", 7) == 0)) {
-                            /* parser desugars Task.WhenAll/WhenAny to
-                             * TaskJoin (desugar_task_join in parser.c); the
-                             * seed sees the pre-desugar spelling, so mirror
-                             * the rewrite. */
+                            /* parser desugars Task */
                             pi_name_t *tj = pi_intern("TaskJoin", 8);
                             if (tj) { tj->flagged = 1; if (pi_seeding_stdlib) tj->flagged_stdlib = 1; }
                         }
@@ -2165,16 +2036,13 @@ static void pi_seed_source(const char *source, size_t len) {
                 }
                 break;
             case TK_DOT:
-                /* A dot continues the chain: the next segment needs the
-                 * chain root to tell a namespace-qualified type (`Gui.App`)
-                 * from a member access (`b.Label()`). */
+                /* 内部辅助逻辑 */
                 break;
             default:
                 chain = NULL;
                 break;
             }
-            /* An IDENT may have just started a chain and must survive to the
-             * dot that follows it; every other token ends the chain. */
+            /* 内部辅助逻辑 */
             if (tok.kind != TK_DOT && tok.kind != TK_IDENT) chain = NULL;
             prev = tok.kind;
         }
@@ -2182,18 +2050,7 @@ static void pi_seed_source(const char *source, size_t len) {
     zan_arena_free(arena);
 }
 
-/* AST-driven seeding: collect a name only where the grammar can name a TYPE
- * (AST_TYPE_REF, the trailing segment of a qualified name, the root of a
- * member access). The lexical seeding flags every identifier and is only as
- * good as its hand-written exemptions -- one flagged method name pulls a
- * same-named type's whole file. A declared name is never a reference, and a
- * member name after a dot is not a type position either. Partial-class
- * siblings still co-include through the metadata top[] index; extension
- * hosts keep their own trigger (an extension call names the receiver, never
- * the host). Under-collection surfaces as "undefined type" at bind time, so
- * the walker errs on the side of walking: every child-bearing kind is listed
- * below. On a parse failure the file falls back to the lexical seeding so
- * the closure cannot silently shrink. */
+/* 内部辅助实现 */
 
 static void pi_seed_chain(const zan_ast_node_t *n, int in_chain);
 
@@ -2212,10 +2069,7 @@ static void pi_flag_istr(zan_istr_t name) {
     }
 }
 
-/* Flag a segment in a chain rooted at a known namespace segment
- * (`Gui.App.ISqrt`): trailing segments are qualified mentions and escape a
- * user-declared shadow, the same carve-out the lexical seeding gives such
- * chains. */
+/* Flag a segment in a chain rooted at a known namespace segment (`Gui */
 static void pi_flag_qualified(zan_istr_t name) {
     if (!name.str || name.len <= 0) return;
     pi_name_t *p = pi_intern(name.str, (size_t)name.len);
@@ -2238,10 +2092,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
     switch (n->kind) {
     /* type positions: the only places a simple name is a reference */
     case AST_TYPE_REF:
-        /* A qualified type parses into ONE type_ref whose name is the
-         * dotted spelling (nsresolve splits it later), so flag each
-         * '.'-separated segment; the trailing segment is the type name the
-         * candidate index holds. */
+        /* 内部辅助逻辑 */
         if (n->type_ref.name.str) {
             const char *s = n->type_ref.name.str;
             unsigned start = 0;
@@ -2257,9 +2108,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
         pi_seed_ast(n->type_ref.array_element);
         return;
     case AST_QUALIFIED_NAME:
-        /* a.b.c: flag every segment; middle segments may carry the type too
-         * (`Ns.Type.Member` in expression position), pure namespace segments
-         * match no top-level name and are harmless. */
+        /* a */
         for (int qi = 0; qi < n->qualified_name.parts.count; qi++)
             pi_flag_istr(n->qualified_name.parts.items[qi]->ident.name);
         return;
@@ -2334,8 +2183,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
 
     /* statements */
     case AST_COMPILATION_UNIT:
-        /* usings are namespace visibility, not references; the seeding
-         * driver reaches their directories separately */
+        /* 内部辅助逻辑 */
         pi_seed_ast(n->comp_unit.ns);
         pi_seed_list(&n->comp_unit.decls);
         return;
@@ -2435,9 +2283,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
 
     /* expressions */
     case AST_IDENTIFIER:
-        /* a bare identifier is a variable/delegate call, never a type
-         * mention; a generic type in expression position carries the type
-         * in inst_type_ref */
+        /* 内部辅助逻辑 */
         pi_seed_ast(n->ident.inst_type_ref);
         return;
     case AST_BINARY:
@@ -2458,9 +2304,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
         return;
     case AST_MEMBER_ACCESS: {
         zan_ast_node_t *obj = n->member.object;
-        /* `Ns.Type.member` parses as nested member accesses: every segment
-         * except the FINAL one may be a type, so a mid-chain member name
-         * gets flagged; the final segment (receiver . method) never is one. */
+        /* `Ns */
         if (in_chain) {
             zan_ast_node_t *rt = n;
             while (rt->kind == AST_MEMBER_ACCESS)
@@ -2472,11 +2316,9 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
                 pi_flag_istr(n->member.name);
         }
         if (obj && obj->kind == AST_IDENTIFIER) {
-            /* `Root.Member`: Root may be a static type (or a namespace
-             * segment matching no top name), so flag it */
+            /* `Root */
             pi_flag_istr(obj->ident.name);
-            /* Mirror the parser's Task.WhenAll/WhenAny -> TaskJoin desugar
-             * or the TaskJoin file is never pulled. */
+            /* Mirror the parser's Task */
             if (obj->ident.name.len == 4 &&
                 memcmp(obj->ident.name.str, "Task", 4) == 0) {
                 zan_istr_t m = n->member.name;
@@ -2558,32 +2400,25 @@ static void pi_add_package_source(const char *path, void *context) {
     if (d->file_count > 0) { d->files[d->file_count - 1].pkg_src = 1; }
 }
 
-/* Scan stdlib candidates and matching declared-namespace package sources.
- * A missing namespace is still reported through the existing suggestion path. */
+/* Scan stdlib candidates and matching declared-namespace package sources */
 static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
     if (d->reached) return;
     d->reached = 1;
     int before = d->file_count;
     pi_glob_into(d, stdlib_root, d->subdir);
-    /* Hierarchy expansion is for project-package namespaces only: a stdlib
-     * dir with the same name keeps exact matching, or a ubiquitous
-     * `using System;` would reach every package's System.* sources (pkg_src
-     * files skip the live-name gate). */
+    /* 内部辅助实现 */
     int hierarchical = stdlib_has_dir(stdlib_root, d->subdir) == 0;
     int found = d->file_count != before;
     int pre_visit = d->file_count;
     int package_count = package_visit_namespace(d->subdir, pi_add_package_source,
                                                   d, hierarchical);
     found = found || package_count > 0;
-    /* Split namespace (stdlib dir still exists beside the package): package
-     * files must clear the live-name gate like stdlib files, else an
-     * unconditional join drags the whole package into every compile. */
+    /* 内部辅助逻辑 */
     if (!hierarchical) {
         for (int i = pre_visit; i < d->file_count; i++)
             d->files[i].gate_live = 1;
     }
-    /* `using System;` names compiler/runtime core, never a marketplace
-     * install suggestion. */
+    /* 内部辅助逻辑 */
     if (!found && package_project_root[0] != '\0' &&
         strcmp(d->subdir, "System") != 0 &&
         !project_namespace_declared(d->subdir)) {
@@ -2594,9 +2429,7 @@ static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
         pi_scan_file(&d->files[i]);
 }
 
-/* One closure round: include files whose top-level names are live (or that
- * host extension methods) and reach their `using` directories. Returns 1
- * when anything changed; newly reached dirs are appended to the list. */
+/* 内部辅助逻辑 */
 static int pi_close_once(const char *stdlib_root) {
     int changed = 0;
     for (pi_dir_t *d = pi_dirs_head; d; d = d->next) {
@@ -2623,21 +2456,11 @@ static int pi_close_once(const char *stdlib_root) {
     return changed;
 }
 
-/* Repair round: reach stdlib directories for flagged-but-unsatisfied live
- * names. The closure's reach set grows only from `using` directives, but a
- * parsed file can reference a stdlib type by a plain member-access root
- * (`File.ReadAllText` with no `using System.IO`): the name flags live, no
- * scanned file declares it, its file never joins the parse, and the call
- * silently runs a different implementation chosen by whichever files the
- * HOST's using set pulled. When the closure settles with such a name, reach
- * every stdlib directory once and let the live-name gate re-run; inclusion
- * still requires a real mention. Package sources are not walked: a package
- * file joins unconditionally once its namespace dir is reached. */
+/* Repair round: reach stdlib directories for flagged-but-unsatisfied live names */
 
 static int pi_repair_done = 0;
 
-/* Unsatisfied = flagged live but declared by no scanned file. Collected
- * once per repair trigger; the walk clears entries it satisfies. */
+/* Unsatisfied = flagged live but declared by no scanned file */
 static pi_name_t *pi_unsatisfied_set[256];
 static int pi_unsatisfied_count = 0;
 
@@ -2649,10 +2472,7 @@ static int pi_name_declared_by_scanned(pi_name_t *n) {
     return 0;
 }
 
-/* 1 when some name flagged by a stdlib-authored source is declared by no
- * scanned file: its declaring directory was never reached, so stdlib code
- * would bind it through the binder's fallback. User-only mentions don't
- * count: their fallback/inline behavior is today's contract. */
+/* 内部辅助实现 */
 static int pi_unsatisfied_live_name(void) {
     pi_unsatisfied_count = 0;
     for (unsigned b = 0; b < PI_BUCKETS; b++)
@@ -2680,8 +2500,7 @@ static int pi_name_in_unsatisfied(pi_name_t *n) {
     return 0;
 }
 
-/* Metadata-scan one .zan file for its top-level declared names (no parse)
- * and clear any unsatisfied live name it declares. */
+/* Metadata-scan one */
 static void pi_repair_scan_file(const char *path) {
     pi_file_t f;
     memset(&f, 0, sizeof(f));
@@ -2693,11 +2512,7 @@ static void pi_repair_scan_file(const char *path) {
         pi_unsatisfied_mark_declared(f.top[k]);
 }
 
-/* Repair walk: metadata-scan the stdlib tree for the unsatisfied names and
- * reach ONLY the directories that declare one. Reaching every directory
- * instead would let pi_process_dir's package-namespace visit join whole
- * packages unconditionally (pkg_src files skip the live-name gate).
- * Returns 1 when any directory was reached. */
+/* 内部辅助逻辑 */
 static int pi_repair_walk(const char *root, const char *rel) {
     char dir_path[1024];
     if (rel[0]) snprintf(dir_path, sizeof(dir_path), "%s/%s", root, rel);
@@ -2767,22 +2582,10 @@ static int pi_repair_walk(const char *root, const char *rel) {
     return reached_any;
 }
 
-/* Seed the live-name worklist and the reached-directory set from one
- * fully-parsed source. Carve-out: a top-level type declared by an input file
- * shadows its own name for every unqualified use in user code, so those
- * mentions do not pull a same-named stdlib file (a `class App` template
- * must not drag in stdlib Gui.App); qualified (dotted) mentions still seed.
- *
- * The unit is owned by the compiler's main arena; this only reads it. A file
- * whose parse failed is seeded lexically by the caller instead: the closure
- * must not shrink silently. */
+/* 内部辅助逻辑 */
 static void pi_seed_parsed_unit(zan_ast_node_t *unit, int is_entry) {
     {
-        /* Every segment of a `using` directive or the file's own namespace
-         * is a namespace root: expression chains rooted at one
-         * (`Gui.App.ISqrt`) are qualified mentions that escape a
-         * user-declared shadow via pi_flag_qualified (nsresolve's shadow
-         * carve-out depends on it). */
+        /* 内部辅助实现 */
         for (int i = 0; i < unit->comp_unit.usings.count; i++) {
             zan_ast_node_t *u = unit->comp_unit.usings.items[i];
             zan_ast_node_t *qn = u ? u->using_decl.name : NULL;
@@ -2832,16 +2635,7 @@ static void pi_seed_parsed_unit(zan_ast_node_t *unit, int is_entry) {
                         qn->qualified_name.parts.count - 1]->ident.name);
             }
         }
-        /* Top-level declared names of an entry seed the shadow only at
-         * GLOBAL scope: the shadow's premise (an unqualified mention
-         * resolves to the entry's declaration) holds only where the
-         * declaring namespace is in scope. A namespace-scoped input
-         * declaration is invisible to a file referencing the bare name
-         * through another using, so suppressing the stdlib pull there
-         * starves nsresolve and order-dependently misbinds the name to the
-         * package's class. Global-scope declarations keep the shadow: the
-         * generated `partial class App` wins over stdlib Gui.App by the
-         * global-namespace rule, so pulling Gui/App.zan is pure width. */
+        /* 内部辅助实现 */
         if (is_entry && !pi_seed_stdlib_input) {
             for (int i = 0; i < unit->comp_unit.decls.count; i++) {
                 zan_ast_node_t *d = unit->comp_unit.decls.items[i];
@@ -2874,10 +2668,7 @@ static void pi_debug_dump(void) {
 
 static int pi_append_included(const char ***files, int *count, int *cap);
 
-/* Run closure rounds until nothing new is included or reached, appending
- * every included file to the input list. Parsing happens in the main parse
- * loop (each file parsed exactly once); this only drives the metadata side.
- * Returns how many files were appended in total. */
+/* 内部辅助逻辑 */
 static int pi_close_converged(const char *stdlib_root, const char ***files,
                               int *count, int *cap) {
     int appended = 0;
@@ -2891,8 +2682,7 @@ static int pi_close_converged(const char *stdlib_root, const char ***files,
     return appended;
 }
 
-/* Append every included-but-unparsed file to the compiler's input list.
- * Returns how many were appended (they sit at the tail, in walk order). */
+/* Append every included-but-unparsed file to the compiler's input list */
 static int pi_append_included(const char ***files, int *count, int *cap) {
     int before = *count;
     for (pi_dir_t *d = pi_dirs_head; d; d = d->next)
@@ -2906,9 +2696,7 @@ static int pi_append_included(const char ***files, int *count, int *cap) {
     return *count - before;
 }
 
-/* Apply the preprocessor environment every parse shares: platform macros
- * for the *target* (== host unless --target was given, so cross-compiled
- * sources see the destination OS/arch) plus the user's -D defines. */
+/* 内部辅助逻辑 */
 static void zan_apply_lex_defines(zan_lexer_t *lex, zan_target_t target,
                                   const char *const *pp_defines,
                                   int pp_define_count,
@@ -2922,15 +2710,12 @@ static void zan_apply_lex_defines(zan_lexer_t *lex, zan_target_t target,
         zan_lexer_define(lex, "LINUX", "1");
         break;
     case ZAN_OS_ANDROID:
-        /* Android is Linux-flavored (bionic): LINUX keeps compiling, ANDROID
-         * lets programs pick the differences (no GUI driver,
-         * /data/local/tmp file conventions, ...). */
+        /* 内部辅助逻辑 */
         zan_lexer_define(lex, "LINUX", "1");
         zan_lexer_define(lex, "ANDROID", "1");
         break;
     case ZAN_OS_OHOS:
-        /* OpenHarmony is musl-flavored; OHOS marks it (no GUI driver yet,
-         * hdc-based deployment flow). */
+        /* 内部辅助逻辑 */
         zan_lexer_define(lex, "LINUX", "1");
         zan_lexer_define(lex, "MUSL", "1");
         zan_lexer_define(lex, "OHOS", "1");
@@ -2985,9 +2770,7 @@ static void zan_apply_lex_defines(zan_lexer_t *lex, zan_target_t target,
     }
 }
 
-/* Parse one extra file with the same preprocessor environment as the main
- * parse loop and return its compilation unit (NULL when it cannot be read).
- * Used by the demand-driven pull-in's post-generator round. */
+/* 内部辅助逻辑 */
 static zan_ast_node_t *parse_secondary_unit(const char *path,
                                             zan_target_t target,
                                             const char *const *pp_defines,
@@ -2999,10 +2782,7 @@ static zan_ast_node_t *parse_secondary_unit(const char *path,
     size_t slen = 0;
     char *src = read_file(path, &slen);
     if (!src) return NULL;
-    /* zan_diag_add_file() keeps the pointer to render source snippets in
-     * later diagnostics, so the text must outlive this function: copy it
-     * into the arena instead of freeing the heap buffer out from under the
-     * diag. */
+    /* 内部辅助实现 */
     char *heap_src = src;
     src = zan_arena_strdup(arena, heap_src, slen);
     free(heap_src);
@@ -3413,11 +3193,7 @@ static void dump_ast_node(zan_ast_node_t *node, int depth) {
     }
 }
 
-/* A [DllImport] library name is interpolated verbatim into `-l<name>` on a
- * shell-executed linker command line, and the name comes straight out of the
- * source being compiled, so validate once here (covering every target's link
- * line). Allowed: ASCII letters, digits, and `. _ + -`. Path separators are
- * deliberately NOT allowed: a [DllImport] names a library, never a path. */
+/* 内部辅助实现 */
 static bool zan_dllimport_name_is_safe(const char *name, int len) {
     if (!name || len <= 0) return false;
     for (int i = 0; i < len; i++) {
@@ -3430,11 +3206,7 @@ static bool zan_dllimport_name_is_safe(const char *name, int len) {
     return true;
 }
 
-/* Map a [DllImport] name to its linker basename (the -l argument): strips a
- * leading "lib" so DllImport("libpq") and ("pq") both resolve to libpq,
- * identically on every link path. Sets *out_len. Returns NULL for implicit
- * CRT/libc/libm pseudo-libs and for names unsafe on a linker command line
- * (diagnosed here). */
+/* 内部辅助实现 */
 static const char *zan_dllimport_lname(const char *lib, int lib_len,
                                        int *out_len) {
     if (lib_len == 3 && memcmp(lib, "crt", 3) == 0) return NULL;
@@ -3444,9 +3216,7 @@ static const char *zan_dllimport_lname(const char *lib, int lib_len,
     if (n > 3 && memcmp(name, "lib", 3) == 0) { name += 3; n -= 3; }
     if (n == 1 && (name[0] == 'c' || name[0] == 'm')) return NULL;
     if (!zan_dllimport_name_is_safe(name, n)) {
-        /* Fail closed: skip the library rather than emit an unverified
-         * argument; the link fails with an unresolved symbol (diagnosable)
-         * instead of executing attacker-chosen text. */
+        /* 内部辅助逻辑 */
         fprintf(stderr,
                 "error: [DllImport] library name '%.*s' contains characters "
                 "that are not allowed on a linker command line "
@@ -3458,9 +3228,7 @@ static const char *zan_dllimport_lname(const char *lib, int lib_len,
     return name;
 }
 
-/* Windows system import libraries: a [DllImport] on one of these is a
- * platform-guarded path, so stubbing it out when the target is not Windows
- * is the expected outcome, not something to warn about. */
+/* 内部辅助逻辑 */
 static bool zan_win_system_lib(const char *lib, int lib_len) {
     static const char *const names[] = {
         "kernel32", "user32", "gdi32", "advapi32", "shell32", "shlwapi",
@@ -3476,23 +3244,13 @@ static bool zan_win_system_lib(const char *lib, int lib_len) {
     return false;
 }
 
-/* Registry of third-party native drivers a published program must carry
- * (unlike system libs that already exist on every target). DISCOVERED from
- * the stdlib tree, not hardcoded: each native-backed module declares the
- * [DllImport] library basenames it owns in a `drivers/driver.manifest` file
- * (one -l basename per line; blank lines and '#' comments ignored). The
- * owning module is simply the directory containing that `drivers/` folder,
- * so bundles live at <stdlib_root>/<module>/drivers/<target-sub>/; adding a
- * new native module needs no compiler change. */
+/* 内部辅助实现 */
 #define ZAN_MAX_DRIVERS 1024
 typedef struct {
     char lib[64];      /* normalized -l basename, e.g. "sqlite3", "zan_sdl3" */
     char module[512];  /* owning module path relative to its root, '/'-sep */
-    char sym[64];      /* "<lib> if <prefix>": a driver loaded at run time
-                        * (dlopen); used when the image defines a function
-                        * with this prefix */
-    char root[1024];   /* owning source root (stdlib root, or a package
-                        * source root); bundles live at <root>/<module>/drivers/. */
+    char sym[64];      /* 内部辅助逻辑 */
+    char root[1024];   /* 内部辅助逻辑 */
 } zan_driver_entry_t;
 typedef struct {
     zan_driver_entry_t entries[ZAN_MAX_DRIVERS];
@@ -3516,8 +3274,7 @@ static void zan_registry_add(zan_driver_registry_t *reg,
     reg->count++;
 }
 
-/* Read one module's driver.manifest, registering each listed lib against the
- * owning module (its directory relative to the root it was found under). */
+/* Read one module's driver */
 static void zan_read_driver_manifest(const char *manifest_path,
                                      const char *module,
                                      zan_driver_registry_t *reg,
@@ -3533,9 +3290,7 @@ static void zan_read_driver_manifest(const char *manifest_path,
                            s[len - 1] == ' ' || s[len - 1] == '\t'))
             s[--len] = '\0';
         if (s[0] == '\0' || s[0] == '#') continue;
-        /* "<lib> if <symbol-prefix>": a run-time loaded driver (dlopen/
-         * LoadLibrary rather than a [DllImport], never among the linked
-         * libs). */
+        /* 内部辅助逻辑 */
         const char *sym = "";
         char *cond = strstr(s, " if ");
         if (cond) {
@@ -3557,8 +3312,7 @@ typedef void (*zan_stdlib_dir_callback)(const char *dir_full,
 static bool zan_file_exists(const char *path);
 static bool zan_is_safe_bundle_name(const char *name);
 
-/* Walk module directories below the stdlib root: driver discovery and
- * static-library lookup share this bounded, platform-specific traversal. */
+/* 内部辅助逻辑 */
 static void zan_walk_stdlib_dirs(const char *dir_full, const char *rel,
                                  int depth, zan_stdlib_dir_callback visit,
                                  void *ctx) {
@@ -3606,8 +3360,7 @@ static void zan_walk_stdlib_dirs(const char *dir_full, const char *rel,
 #endif
 }
 
-/* Walk context: the registry to fill and the root every discovered module
- * is relative to (the stdlib root, or a package source root). */
+/* 内部辅助逻辑 */
 typedef struct {
     zan_driver_registry_t *reg;
     const char *root;
@@ -3624,9 +3377,7 @@ static void zan_scan_driver_module(const char *dir_full, const char *rel,
 
 typedef char zan_package_source_root_t[1024];
 
-/* The package API reports at most cap roots, so a full result may be
- * truncated. Retry until it is complete; a fixed small array silently hid
- * later package drivers. */
+/* The package API reports at most cap roots, so a full result may be truncated */
 static zan_package_source_root_t *zan_collect_package_source_roots(int *count) {
     int cap = 32;
     zan_package_source_root_t *roots = NULL;
@@ -3658,9 +3409,7 @@ static void zan_discover_drivers(const char *stdlib_root,
         scan.root = stdlib_root;
         zan_walk_stdlib_dirs(stdlib_root, "", 0, zan_scan_driver_module, &scan);
     }
-    /* Packages own drivers too: walk every visible package source root the
-     * same way. Stdlib entries were added first, so they keep first-wins on
-     * duplicate lib basenames. */
+    /* Packages own drivers too: walk every visible package source root the same way */
     int pkg_n;
     zan_package_source_root_t *pkg_roots = zan_collect_package_source_roots(&pkg_n);
     for (int i = 0; i < pkg_n; i++) {
@@ -3672,7 +3421,7 @@ static void zan_discover_drivers(const char *stdlib_root,
     free(pkg_roots);
 }
 
-/* Index of the discovered driver whose lib basename matches, or -1. */
+/* Index of the discovered driver whose lib basename matches, or -1 */
 static int zan_driver_find(const zan_driver_registry_t *reg,
                            const char *lname, int len) {
     for (int i = 0; i < reg->count; i++)
@@ -3687,10 +3436,7 @@ typedef struct {
     char result[1200];
 } zan_static_library_search_t;
 
-/* Locate a static dependency on demand (no module map): a new driver or
- * target only needs to ship its archive in the standard drivers/<target>/
- * static shape. The library name comes only from the validated .libs
- * manifest. */
+/* 内部辅助实现 */
 static void zan_find_static_library_dir(const char *dir_full, const char *rel,
                                         void *ctx) {
     (void)rel;
@@ -3723,8 +3469,7 @@ static bool zan_find_static_library(const char *stdlib_root,
     zan_walk_stdlib_dirs(stdlib_root, "", 0,
                          zan_find_static_library_dir, &search);
     if (!search.result[0]) {
-        /* Package-owned drivers ship the same drivers/<target>/static shape
-         * inside their package source root. */
+        /* 内部辅助逻辑 */
         int pkg_n;
         zan_package_source_root_t *pkg_roots = zan_collect_package_source_roots(&pkg_n);
         for (int i = 0; i < pkg_n && !search.result[0]; i++)
@@ -3737,9 +3482,7 @@ static bool zan_find_static_library(const char *stdlib_root,
     return true;
 }
 
-/* Resolve a Gui resource directory in the stdlib tree (Gui/icons, Gui/skins)
- * or, once Gui becomes a package, in a package source root; the stdlib copy
- * keeps precedence. Returns false and empties `out` when no copy exists. */
+/* 内部辅助逻辑 */
 static bool zan_resolve_gui_resource_dir(const char *stdlib_root,
                                         const char *rel, char *out,
                                         size_t cap) {
@@ -3761,12 +3504,10 @@ static bool zan_resolve_gui_resource_dir(const char *stdlib_root,
     return false;
 }
 
-/* Copy a file byte-for-byte (portable; no shell). Returns 0 on success;
- * on failure populates err_buf when non-NULL. */
+/* Copy a file byte-for-byte (portable; no shell) */
 static int zan_copy_file_ex(const char *src, const char *dst, char *err_buf, size_t err_cap) {
     if (err_buf && err_cap > 0) err_buf[0] = '\0';
-    /* Copying a file onto itself would truncate it to zero bytes:
-     * fopen(dst, "wb") empties the file before the source is read. */
+    /* 内部辅助逻辑 */
 #ifdef _WIN32
     if (_stricmp(src, dst) == 0) return 0;
     { WIN32_FILE_ATTRIBUTE_DATA sa, da;
@@ -3864,16 +3605,11 @@ static int zan_copy_file(const char *src, const char *dst) {
     return zan_copy_file_ex(src, dst, NULL, 0);
 }
 
-/* A driver-bundle manifest lists runtime libraries to copy next to the
- * published executable. Each entry must be a bare filename: absolute paths,
- * drive letters, path separators and ".." are rejected so a manifest can
- * never make publishing read or write outside the driver / output dir. */
+/* 内部辅助逻辑 */
 static bool zan_is_safe_bundle_name(const char *name) {
     if (!name || !name[0]) return false;
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
-    /* Allowlist, not blocklist: these names can reach a shell link command,
-     * and a blocklist that misses one metacharacter is command injection.
-     * A library/asset basename is always alphanumerics plus . _ - +. */
+    /* 内部辅助逻辑 */
     for (const char *p = name; *p; p++) {
         char c = *p;
         bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -3884,11 +3620,7 @@ static bool zan_is_safe_bundle_name(const char *name) {
     return true;
 }
 
-/* A static-driver library manifest lists additional linker library
- * basenames, one per line (optional "-l" prefix). macOS also accepts
- * "@framework/Cocoa", emitted as the separate arguments "-framework",
- * "Cocoa"; framework entries are ignored on other targets. Every name is
- * validated before it can enter a link command. */
+/* 内部辅助逻辑 */
 static int zan_read_static_libs(const char *path, char out[][128], int max,
                                 zan_os_t target_os) {
     FILE *f = fopen(path, "rb");
@@ -3948,8 +3680,7 @@ static int zan_read_static_libs(const char *path, char out[][128], int max,
     return count;
 }
 
-/* Per-target driver-bundle subdirectory under <module>/drivers/, matching
- * the cross-compile toolchain naming. */
+/* 内部辅助逻辑 */
 static const char *zan_driver_subdir(const zan_target_t *t) {
     if (t->os == ZAN_OS_LINUX)
         return (t->arch == ZAN_ARCH_AARCH64) ? "linux-arm64"
@@ -3965,10 +3696,7 @@ static const char *zan_driver_subdir(const zan_target_t *t) {
     return (t->arch == ZAN_ARCH_AARCH64) ? "win-arm64" : "win-x64";
 }
 
-/* Conditions must describe the whole stripped program before optimization
- * can inline away live feature names or sharding moves bodies out of the
- * coordinator; keep an arena-owned snapshot (irgen's prefix cache alone
- * cannot hold every package bundle condition). */
+/* 内部辅助实现 */
 typedef struct zan_driver_prefix_snapshot_entry {
     const char *prefix;
     bool defined;
@@ -3985,8 +3713,7 @@ static bool zan_driver_prefix_live(zan_irgen_t *g,
     for (const zan_driver_prefix_snapshot_entry_t *p = snapshot->head; p;
          p = p->next)
         if (strcmp(p->prefix, prefix) == 0) return p->defined;
-    /* A captured snapshot is sealed: never infer absence from a coordinator
-     * whose live bodies were moved away, or traverse LLVM after release. */
+    /* 内部辅助逻辑 */
     return !snapshot->captured && zan_irgen_defines_prefix(g, prefix);
 }
 
@@ -4003,8 +3730,7 @@ static void zan_driver_prefix_record(zan_irgen_t *g, zan_arena_t *arena,
     snapshot->head = p;
 }
 
-/* Shared parser for primary and recursive bundle manifests, including the
- * early prefix scan. The returned entry and condition borrow the line buffer. */
+/* 内部辅助逻辑 */
 static char *zan_driver_bundle_entry(char *line, const char **prefix) {
     while (*line == ' ' || *line == '\t') line++;
     size_t len = strlen(line);
@@ -4040,9 +3766,7 @@ static void zan_driver_capture_conditions(zan_irgen_t *g, zan_arena_t *arena,
     for (int d = 0; d < reg->count; d++) {
         const zan_driver_entry_t *driver = &reg->entries[d];
         zan_driver_prefix_record(g, arena, snapshot, driver->sym);
-        /* Scan every registered owner's bundle even when only reached via
-         * @driver. An override applies to primary drivers; dependency bundles
-         * still belong to their registered package roots. */
+        /* Scan every registered owner's bundle even when only reached via @driver */
         for (int pass = 0; pass < (override_dir ? 2 : 1); pass++) {
             char dir[1200], manifest[1400];
             if (pass == 1)
@@ -4075,9 +3799,7 @@ typedef struct {
     bool visiting[ZAN_MAX_DRIVERS];
 } zan_driver_bundle_context_t;
 
-/* @driver is a runtime dependency, independent of whether the program also
- * imports the dependency directly. Resolve each edge using its owner's root,
- * and apply the same conditions and filename validation at every depth. */
+/* 内部辅助逻辑 */
 static int zan_bundle_dependency(zan_driver_bundle_context_t *ctx,
                                  const char *dep, const char *from_manifest,
                                  int *copy_failed_count) {
@@ -4147,10 +3869,7 @@ static int zan_bundle_dependency(zan_driver_bundle_context_t *ctx,
     return copied;
 }
 
-/* Directory of the running zanc executable: everything zanc links with
- * (runtime objects, linker bundle, sysroot) is installed as its sibling, so
- * paths are resolved relative to this at runtime -- never a build-time
- * absolute path (breaks once zanc is relocated/redistributed). */
+/* 内部辅助实现 */
 static void zan_exe_dir(char *out, size_t outsz) {
     out[0] = '\0';
 #ifdef _WIN32
@@ -4175,7 +3894,7 @@ static bool zan_file_exists(const char *path) {
 #endif
 }
 
-/* Read the first usable runtime filename from a driver bundle manifest. */
+/* Read the first usable runtime filename from a driver bundle manifest */
 static bool zan_read_first_bundle_name(const char *path,
                                        char *out, size_t outsz) {
     FILE *f = fopen(path, "rb");
@@ -4202,8 +3921,7 @@ static bool zan_read_first_bundle_name(const char *path,
     return false;
 }
 
-/* Resolve a macOS driver's link input. The normal name is preferred, but
- * versioned dylibs such as libssl.3.dylib can be named by <lib>.bundle. */
+/* Resolve a macOS driver's link input */
 static bool zan_find_macos_driver_dylib(const char *dir,
                                         const char *name, int len,
                                         char *out, size_t outsz) {
@@ -4229,9 +3947,7 @@ static const char *zan_path_basename(const char *p) {
     return b;
 }
 
-/* Case-insensitive path prefix test (Windows-normalized separators): is
- * `path` inside `root` or the root itself? Used to tell auto-included
- * stdlib files from the program's own sources. */
+/* 内部辅助逻辑 */
 static int zan_path_is_under(const char *path, const char *root) {
     if (!path || !root || !root[0]) return 0;
     size_t rl = strlen(root);
@@ -4246,13 +3962,7 @@ static int zan_path_is_under(const char *path, const char *root) {
     return nc == '/' || nc == '\\';
 }
 
-/* WASI cross-builds: the declaration-level flags (uses_sync_runtime /
- * uses_socket_async) are set for almost every program even when the runtime
- * object's symbols are never referenced. Before rejecting a wasm32 link,
- * check the emitted object's undefined symbols with llvm-nm: only a real
- * reference needs the object. Returns 1 when `obj` references any symbol
- * starting with one of `prefixes`; a false "clean" is caught by the wasm-ld
- * link below. */
+/* 内部辅助实现 */
 static int wasm_obj_refs_any(const char *obj, const char *const *prefixes) {
     char nmout[1300];
     snprintf(nmout, sizeof(nmout), "%s.nm", obj);
@@ -4283,8 +3993,7 @@ static int wasm_obj_vec_refs_any(const generated_object_vec_t *objects,
     return 0;
 }
 
-/* Only compiler-owned runtime definitions may coalesce. In particular, never
- * infer ownership from a user function's spelling or weaken library exports. */
+/* Only compiler-owned runtime definitions may coalesce */
 static void zan_runtime_fallback(zan_irgen_t *g, LLVMValueRef value,
                                   bool use_comdat) {
     if (!value || LLVMIsDeclaration(value)) return;
@@ -4300,23 +4009,17 @@ static void zan_runtime_fallback(zan_irgen_t *g, LLVMValueRef value,
 static void zan_prepare_static_runtime(zan_irgen_t *g,
                                         const zan_target_t *target) {
     if (g->emit_lib && g->emit_shared) return;
-    /* Mach-O coalesces weak definitions without LLVM COMDAT groups. */
+    /* Mach-O coalesces weak definitions without LLVM COMDAT groups */
     bool use_comdat = target->os != ZAN_OS_MACOS && target->os != ZAN_OS_IOS;
 
-    /* A weak slot can be stored in one module and cleared by another
-     * module's destructor. Keep module-specific ARC site/descriptor tables
-     * private: their indices and destructors are not interchangeable. */
+    /* 内部辅助逻辑 */
     LLVMValueRef weak_state[] = {
         g->weak_buckets, g->weak_lock, g->weak_count
     };
     for (size_t i = 0; i < sizeof(weak_state) / sizeof(weak_state[0]); i++)
         zan_runtime_fallback(g, weak_state[i], use_comdat);
 
-    /* Scheduler entry points called by native IO/timer objects: a static
-     * library provides a fallback for C consumers, while a real external
-     * executor or the application's scheduler overrides it. All inline
-     * scheduler bodies must see the same queue even if optimized into
-     * callers. */
+    /* 内部辅助实现 */
     static const char *const co_state[] = {
         "__zan_co_head", "__zan_co_tail", "__zan_co_nodes",
         "__zan_co_slice_start", "__zan_co_poll_tick", "__zan_co_quantum_us"
@@ -4327,8 +4030,7 @@ static void zan_prepare_static_runtime(zan_irgen_t *g,
                                  use_comdat);
     }
 
-    /* The pre-existing weak IO fallbacks also need a COMDAT on COFF: otherwise
-     * their .weak.<name>.default.<anchor> definitions collide on extraction. */
+    /* The pre-existing weak IO fallbacks also need a COMDAT on COFF: otherwise their */
     LLVMValueRef io_fallbacks[] = {
         g->rt_io_pump_timeout, g->rt_io_has_pending,
         LLVMGetNamedFunction(g->mod, "zan_io_pump")
@@ -4344,11 +4046,7 @@ static void zan_prepare_static_runtime(zan_irgen_t *g,
     for (size_t i = 0; i < sizeof(co_fallbacks) / sizeof(co_fallbacks[0]); i++)
         zan_runtime_fallback(g, co_fallbacks[i], use_comdat);
 
-    /* These bodies use module-owned ARC metadata, diagnostics and constants:
-     * keep their definitions for standalone C callers of public methods, but
-     * bind the library's calls locally instead of competing with the host's
-     * differently configured runtime. Public user methods keep their original
-     * strong linkage. */
+    /* 内部辅助实现 */
     LLVMValueRef helpers[] = {
         g->rt_println, g->rt_print_int, g->rt_print_uint, g->rt_print_double,
         g->rt_retain, g->rt_release, g->rt_release_dyn, g->rt_alloc,
@@ -4363,9 +4061,7 @@ static void zan_prepare_static_runtime(zan_irgen_t *g,
     }
 }
 
-/* Invoke LLVM's archiver without a shell: output paths may contain spaces or
- * shell metacharacters. -1 means the tool was not found; once a tool starts,
- * its failure must be reported instead of silently trying another installation. */
+/* 内部辅助逻辑 */
 static int zan_run_archiver(const char *tool, const char *format,
                             const char *arc, const char *obj) {
     const char *argv[] = {tool, format, "rcsD", arc, obj, NULL};
@@ -4383,9 +4079,7 @@ static int zan_run_archiver(const char *tool, const char *format,
     free(wide_path);
     if (!path) return 1;
     argv[0] = path;
-    /* _wspawnv joins argv with spaces; quote each argument for the child's
-     * CRT parser. Windows filenames cannot contain a double quote and these
-     * arguments name files, so none can end in a directory separator. */
+    /* _wspawnv joins argv with spaces; quote each argument for the child's CRT parser */
     char *quoted[6] = {0};
     for (int i = 0; i < 5; i++) {
         size_t len = strlen(argv[i]);
@@ -4427,11 +4121,7 @@ static int zan_run_archiver(const char *tool, const char *format,
 #endif
 }
 
-/* An archive needs an object-format-aware symbol index for normal -l member
- * extraction (PE ld.lld in particular): let LLVM read COFF/ELF/Mach-O symbols
- * rather than maintaining separate object parsers here. Format is selected by
- * target; a fresh archive is started so re-emitting cannot retain old
- * members. */
+/* 内部辅助逻辑 */
 static int zan_write_static_lib(const char *obj, const char *arc,
                                 zan_os_t target_os) {
     char exe_dir[1024], bundled[1200] = {0}, versioned[64];
@@ -4552,10 +4242,7 @@ static void print_usage(void) {
     fprintf(stderr, "                   whitespace separated, \"quoted\" for paths with spaces)\n");
 }
 
-/* `@file` response files: a command line outgrows what a shell accepts
- * (cmd.exe truncates at 8191 characters) long before a project is big; the
- * file holds the arguments instead. Tokens are whitespace-separated,
- * "quoted" when they contain spaces, and `#` starts a comment line. */
+/* `@file` response files: a command line outgrows what a shell accepts (cmd */
 typedef struct {
     char **items;
     int count;
@@ -4576,8 +4263,7 @@ static void arg_list_push(arg_list_t *list, char *item) {
 
 static bool expand_arg_file(const char *path, arg_list_t *out, int depth);
 
-/* Appends one argument, expanding a nested `@file` (bounded, so a response
- * file that names itself cannot loop forever). */
+/* 内部辅助逻辑 */
 static void arg_list_add(arg_list_t *out, const char *token, int depth) {
     if (token[0] == '@' && token[1] != '\0') {
         if (!expand_arg_file(token + 1, out, depth + 1)) { exit(1); }
@@ -4614,8 +4300,7 @@ static bool expand_arg_file(const char *path, arg_list_t *out, int depth) {
     char *token = (char *)malloc(got + 1);
     if (!token) { free(text); return false; }
     size_t i = 0;
-    /* Editors and PowerShell write UTF-8 with a BOM; it would glue itself to
-     * the first argument. */
+    /* 内部辅助逻辑 */
     if (got >= 3 && (unsigned char)text[0] == 0xEF && (unsigned char)text[1] == 0xBB
         && (unsigned char)text[2] == 0xBF) {
         i = 3;
@@ -4644,7 +4329,7 @@ static bool expand_arg_file(const char *path, arg_list_t *out, int depth) {
     return true;
 }
 
-/* Rewrites argv with every `@file` replaced by the arguments it holds. */
+/* Rewrites argv with every `@file` replaced by the arguments it holds */
 static void expand_arg_files(int *argc, char ***argv) {
     bool any = false;
     for (int i = 1; i < *argc; i++) {
@@ -4665,10 +4350,7 @@ int main(int argc, char **argv) {
     if (utf8_argv) argv = utf8_argv;
 #endif
     {
-        /* WebAssembly EH codegen is gated on an LLVM cl::opt, not a target
-         * feature alone: without it the wasm backend silently drops (or
-         * crashes on) catchswitch IR. Parsed before any TargetMachine is
-         * created; harmless for every other target. */
+        /* 内部辅助实现 */
         const char *cl[] = { "zanc", "--wasm-enable-eh", NULL };
         LLVMParseCommandLineOptions(2, cl, "");
     }
@@ -4692,9 +4374,7 @@ int main(int argc, char **argv) {
     const char **input_files = NULL;
     int input_count = 0;
     int input_cap = 0;
-    /* Inputs present before the pull-in closure appends stdlib files; they
-     * get the entry-flavored seeding (usings reach directories, static
-     * usings flag their type, top-level types shadow stdlib names). */
+    /* 内部辅助逻辑 */
     int explicit_input_count = 0;
     const char *output_file = NULL;
     bool do_dump_tokens = false;
@@ -4702,34 +4382,23 @@ int main(int argc, char **argv) {
     const char *emit_symbols_path = NULL; /* --emit-symbols <file> */
     const char *gen_meta_path = NULL;     /* --gen-meta <file>: export metadata */
     bool do_emit_ir = false;
-    /* Tri-state until the whole command line is known: -g turns both ARC
-     * diagnostics on and --publish turns them off, so an explicit
-     * --check-leaks/--no-check-leaks wins regardless of argument order. */
+    /* 内部辅助逻辑 */
     int check_leaks_opt = -1;
     int arc_guard_opt = -1;
     bool runtime_checks = true;
-    /* --strict-runtime: bake guard hard mode into the emitted program, so a
-     * guard failure exits(70) regardless of ZAN_RT_HARD (the soft default
-     * "log and continue" keeps services alive on corrupted data). */
+    /* 内部辅助逻辑 */
     bool strict_runtime = false;
     bool publish_mode = false;
     int obfuscate_strings_opt = -1;
-    /* -ferror-limit=N: cap on diagnostics before the rest are suppressed;
-     * -1 = keep zan_diag_new's default, 0 = no cap. */
+    /* 内部辅助逻辑 */
     int error_limit = -1;
     bool debug_info = false; /* -g / --debug: emit DWARF for source debugging */
-    /* Small-object allocator link policy: 0 = default (native links it),
-     * 1 = --fast-alloc, -1 = --no-fast-alloc. Kept tri-state so the
-     * "no allocator object" warning only fires when the user asked. */
+    /* 小对象内存分配器管理池 */
     int fast_alloc_opt = 0;
     const char *stdlib_path = NULL;
     bool auto_stdlib = true;
     bool packages_disabled = false;
-    /* --quiet: suppress the human progress lines ("Compiled N files -> ...",
-     * driver bundling notices, APK packaging) that otherwise go to stdout.
-     * stdout is a machine channel -- `--emit-ir` writes the IR there -- and
-     * the compiler invokes itself to build the code generators, so a nested
-     * build's progress line would pollute the caller's stdout. */
+    /* quiet: suppress the human progress lines ("Compiled N files -> */
     bool quiet = false;
     const char *package_api = NULL;
     const char *package_install_dir = NULL;
@@ -4747,9 +4416,7 @@ int main(int argc, char **argv) {
     const char *target_name = NULL; /* --target <name|triple>; NULL = host */
     bool link_static_drivers = false; /* --link-mode static; default shared */
     const char *driver_dir_override = NULL; /* --driver-dir */
-    /* Extra native link inputs (--subsystem, --link-input, --link-lib,
-     * -L/--libpath): let callers produce GUI/native executables through
-     * zanc's own self-contained linker instead of shelling out to clang. */
+    /* 内部辅助逻辑 */
     const char *link_subsystem = NULL;
     const char *icon_path = NULL;   /* --icon <file.ico>: Windows exe icon */
     bool no_icon = false;           /* --no-icon: not even the built-in default */
@@ -4765,9 +4432,7 @@ int main(int argc, char **argv) {
     const char *embed_specs[ZAN_MAX_EMBED_SPECS]; int embed_spec_count = 0;
     const char *extra_link_libs[ZAN_LINK_MAX_LIBS]; int extra_link_lib_count = 0;
     const char *extra_lib_paths[ZAN_LINK_MAX_DIRS]; int extra_lib_path_count = 0;
-    /* Resolved stdlib root, hoisted so the native-driver block (which lives
-     * outside the stdlib-discovery scope) can root driver dirs at
-     * <stdlib_root>/<module>/drivers/<target>/. Empty when no stdlib is used. */
+    /* 内部辅助逻辑 */
     char resolved_stdlib_root[1024] = {0};
     char **design_outs = NULL;   /* translated .html/.zscene texts, per input */
     size_t design_count = 0;
@@ -4812,9 +4477,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--fast-alloc") == 0) {
             fast_alloc_opt = 1;
         } else if (strcmp(argv[i], "--no-fast-alloc") == 0) {
-            /* Both flags exist so either side can win a command line
-             * regardless of option order: --fast-alloc is a no-op by default,
-             * --no-fast-alloc restores the plain CRT allocator. */
+            /* 内部辅助逻辑 */
             fast_alloc_opt = -1;
         } else if (strcmp(argv[i], "--link-mode") == 0 && i + 1 < argc) {
             const char *m = argv[++i];
@@ -4839,9 +4502,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--no-stdlib") == 0) {
             auto_stdlib = false;
         } else if (strcmp(argv[i], "--no-packages") == 0) {
-            /* Generator-child mode: an empty project root turns every
-             * package-store lookup in package.c into a no-op, so user
-             * packages cannot leak into the generator closure. */
+            /* 内部辅助逻辑 */
             packages_disabled = true;
             package_project_root[0] = '\0';
         } else if (strcmp(argv[i], "--package-api") == 0 && i + 1 < argc) {
@@ -4874,9 +4535,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-Oz") == 0) {
             opt_level = ZAN_OPT_SIZE_MIN;
         } else if (strncmp(argv[i], "-ferror-limit=", 14) == 0) {
-            /* Clang-style spelling; 0 = no cap. The default cap (100) keeps
-             * a pathological input from flooding the terminal or the LSP
-             * capture buffer. */
+            /* Clang-style spelling; 0 = no cap */
             error_limit = atoi(argv[i] + 14);
         } else if (strcmp(argv[i], "--subsystem") == 0 && i + 1 < argc) {
             link_subsystem = argv[++i];
@@ -4886,8 +4545,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--emit-lib") == 0) {
             emit_lib = true;
         } else if (strcmp(argv[i], "--emit-apk") == 0 && i + 1 < argc) {
-            /* Android one-shot: compile + link libmain.so, then package and
-             * sign a NativeActivity APK (implies --emit-lib with a .so). */
+            /* Android one-shot: compile + link libmain */
             emit_lib = true;
             apk_path = argv[++i];
         } else if (strcmp(argv[i], "--apk-package") == 0 && i + 1 < argc) {
@@ -4973,8 +4631,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: no input file\n");
         return 1;
     }
-    /* The legacy .zform design format was removed: fail with a targeted
-     * message instead of parsing the JSON as Zan source. */
+    /* The legacy */
     for (int fi = 0; fi < input_count; fi++) {
         size_t pn = strlen(input_files[fi]);
         if (pn > 6 && strcmp(input_files[fi] + pn - 6, ".zform") == 0) {
@@ -4988,19 +4645,14 @@ int main(int argc, char **argv) {
     }
 
     input_file = input_files[0];
-    /* An explicit --package-project is authoritative for compile-time
-     * package discovery (namespace pull, package-root drivers/resources);
-     * without it, walk up from the input file looking for a zan.proj and
-     * fall back to the cwd. */
+    /* 内部辅助实现 */
     if (package_project)
         snprintf(package_project_root, sizeof(package_project_root), "%s",
                  package_project);
     else if (!packages_disabled)
         resolve_package_project_root(input_file);
     for (int fi = 0; fi < input_count; fi++) {
-        /* Design docs / saved components are generator data, not Zan
-         * source: their raw text is only meaningful to the generator, and
-         * lexing it here would surface lexer errors. */
+        /* 内部辅助逻辑 */
         if (zan_is_design_path(input_files[fi]) ||
             zan_is_zcomp_path(input_files[fi])) continue;
         size_t nlen = 0;
@@ -5009,11 +4661,7 @@ int main(int argc, char **argv) {
         scan_namespace_tokens(nsrc, nlen);
         free(nsrc);
     }
-    /* When the input sits in a project with a zan.proj manifest, also record
-     * namespaces declared anywhere under the project root (not just in the
-     * files being compiled). The IDE typically compiles a single file at a
-     * time; without this, every `using <project-namespace>;` would be
-     * misdiagnosed as a missing marketplace package. */
+    /* When the input sits in a project with a zan */
     if (project_root_has_manifest()) {
         scan_project_namespaces(package_project_root);
     }
@@ -5028,9 +4676,7 @@ int main(int argc, char **argv) {
         zan_target_host(&target);
     }
     bool cross_compiling = (target_name != NULL);
-    /* The external executor is a target capability, not a user-selectable
-     * semantic mode. Windows, Linux and macOS ZAN_CO_DRIVER implementations
-     * provide high-performance work-stealing multi-worker pools. */
+    /* 内部辅助逻辑 */
     bool external_async_executor = (target.os == ZAN_OS_WINDOWS ||
                                     target.os == ZAN_OS_LINUX ||
                                     target.os == ZAN_OS_MACOS ||
@@ -5038,8 +4684,7 @@ int main(int argc, char **argv) {
                                    (target.arch == ZAN_ARCH_X86_64 ||
                                     target.arch == ZAN_ARCH_AARCH64);
 
-    /* --auto-stdlib: discover the stdlib path relative to the compiler
-     * executable, then pull in the stdlib files the inputs' usings name. */
+    /* 内部辅助逻辑 */
     if (auto_stdlib || stdlib_path) {
         char stdlib_root[1024];
         if (stdlib_path) {
@@ -5082,14 +4727,9 @@ int main(int argc, char **argv) {
             }
 #endif
         }
-    /* Collapse any ".." (the exe lives in build\): every stdlib file name
-     * lands verbatim in diagnostics, leak-site descriptors and per-access
-     * null-guard strings, and the uncollapsed form bloats each by the
-     * redundant prefix. */
+    /* Collapse any " */
     {
-        /* PATH_MAX-sized: glibc's fortified realpath (__realpath_chk, armed
-         * by _FORTIFY_SOURCE) aborts when the destination buffer is smaller
-         * than PATH_MAX -- a 1024 buffer killed Linux zanc at startup. */
+        /* 内部辅助逻辑 */
         char norm_root[4096];
 #ifdef _WIN32
         if (zan_utf8_full_path(stdlib_root, norm_root, sizeof(norm_root)))
@@ -5102,9 +4742,7 @@ int main(int argc, char **argv) {
     snprintf(resolved_stdlib_root, sizeof(resolved_stdlib_root), "%s",
              stdlib_root);
 
-    /* A compiler copy whose sibling stdlib/ is missing would silently
-     * resolve NOTHING (only compiler-intrinsic types work) and read as a
-     * bogus "undefined type" for real stdlib classes. Say so instead. */
+    /* 内部辅助逻辑 */
 #ifdef _WIN32
     {
         DWORD root_attr = zan_utf8_get_file_attributes(stdlib_root);
@@ -5119,19 +4757,8 @@ int main(int argc, char **argv) {
     }
 #endif
 
-        /* Auto-include stdlib modules by path: every `using X.Y.Z;` maps to
-         * stdlib_root/X/Y/Z and all *.zan there are compiled in. There is
-         * deliberately NO hand-maintained namespace->file table: the stdlib
-         * directory layout mirrors the namespace hierarchy 1:1, so adding a
-         * module is just dropping .zan files at the matching path.
-         *
-         * Resolve to a fixpoint: a pulled-in module may itself `using`
-         * another namespace, so re-scan every included file until nothing
-         * new is added. */
-        /* Design documents are translated by the Zan-scripted generators
-         * (stdlib/System/Compiler/ZanGen.zan) before the using-scan: the
-         * synthetic source carries the `using System/Gui/...` directives the
-         * auto-stdlib pull-in needs. Non-design entries stay NULL. */
+        /* Auto-include stdlib modules by path: every `using X */
+        /* 内部辅助逻辑 */
         design_outs = zan_gen_design(
             resolved_stdlib_root, (const char *const *)input_files,
             (size_t)input_count);
@@ -5139,10 +4766,7 @@ int main(int argc, char **argv) {
         design_count = (size_t)input_count;
         explicit_input_count = input_count;
 
-        /* The IDE symbol index must describe the whole stdlib, and
-         * ZAN_NO_PULLIN_FILTER is the A/B + bisect escape hatch; otherwise
-         * globbed namespaces parse on demand, filtered by the live-name
-         * closure. */
+        /* 内部辅助实现 */
         pi_filter_active = !emit_symbols_path &&
                            getenv("ZAN_NO_PULLIN_FILTER") == NULL;
         if (pi_filter_active) {
@@ -5151,36 +4775,22 @@ int main(int argc, char **argv) {
             pi_pp_defines = pp_defines;
             pi_pp_define_count = pp_define_count;
             pi_publish_mode = publish_mode;
-            /* resolved_stdlib_root, not stdlib_root: the block-local array's
-             * scope ends with this if, but the pull-in filter keeps reading
-             * the pointer for the whole parse loop -- a stale stack slot is
-             * stack-use-after-scope. */
+            /* 内部辅助实现 */
             pi_stdlib_root_buf = resolved_stdlib_root;
-            /* Seeding happens in the main parse loop below, right after each
-             * file is parsed (parse-once). The closure is interleaved with
-             * that loop: each round parses the files appended so far, then
-             * the metadata closure appends the next batch. */
+            /* 内部辅助逻辑 */
         } else {
-        /* Each file's `using` set never changes, so scan every file exactly
-         * once: new files land at the end of the list and the next round picks
-         * them up. */
+        /* 内部辅助逻辑 */
         int scanned = 0;
         while (scanned < input_count) {
             int round_end = input_count;
             for (int fi = scanned; fi < round_end; fi++) {
-                /* A saved user component is generator data (consumed inside
-                 * zan_gen_design); its JSON has no `using` directives. */
+                /* 内部辅助逻辑 */
                 if (zan_is_zcomp_path(input_files[fi])) continue;
                 pi_reach_input_dir(input_files[fi]);
                 size_t slen3 = 0;
                 char *src3 = read_file(input_files[fi], &slen3);
                 if (!src3) continue;
-                /* A design input is a JSON model (projected from the
-                 * .html design doc), so the raw text has no `using`
-                 * directives to scan; it was translated up front (design_outs)
-                 * into a synthetic `partial class` with
-                 * `using System/Gui/...`, so the auto-stdlib pull-in covers
-                 * the widgets the design uses. */
+                /* A design input is a JSON model (projected from the */
                 char *owned = NULL;
                 if ((size_t)fi < design_count && design_outs[fi]) {
                     free(src3);
@@ -5222,25 +4832,13 @@ int main(int argc, char **argv) {
     zan_diag_set_deny_warnings(diag, do_deny_warnings);
     if (error_limit >= 0) zan_diag_set_max_errors(diag, error_limit);
 
-    /* Parse every input file and merge their declarations into a single
-     * compilation unit so that names resolve across files (multi-file
-     * compilation: zanc a.zan b.zan ... -o out). A design input is a visual
-     * design document, translated first (formgen) to a synthetic
-     * `partial class` -- typed widget fields, __BuildForm, __WireForm and
-     * Main -- which is then parsed and merged exactly like a source file.
-     *
-     * With the pull-in filter active this loop is interleaved with the
-     * metadata closure: each round parses the files appended so far and
-     * seeds the live-name worklist from their ASTs, then the closure marks
-     * the next batch of included files and appends them to the input list.
-     * Every file is parsed exactly once, with its final input-list index. */
+    /* 内部辅助实现 */
     zan_ast_node_t *ast = NULL;
     int scanned = 0;
     for (;;) {
         int round_end = input_count;
     for (int fi = scanned; fi < round_end; fi++) {
-        /* A saved user component (.zcomp) is generator data consumed inside
-         * zan_gen_design; it projects no Zan declarations of its own. */
+        /* A saved user component ( */
         if (fi > 0 && zan_is_zcomp_path(input_files[fi])) continue;
         size_t slen = 0;
         char *src = (fi == 0) ? source : read_file(input_files[fi], &slen);
@@ -5252,11 +4850,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (fi > 0) {
-            /* Secondary inputs are arena-backed so they are reclaimed with
-             * zan_arena_free() on every exit path below (the read_file()
-             * heap buffer has no other release point). The text must
-             * outlive this loop in either case -- zan_diag_add_file() keeps
-             * the pointer to render source snippets in later diagnostics. */
+            /* 内部辅助实现 */
             char *heap_src = src;
             src = zan_arena_strdup(arena, heap_src, slen);
             free(heap_src);
@@ -5268,25 +4862,17 @@ int main(int argc, char **argv) {
             }
         }
         {
-            /* A design input was translated up front (design_outs) to a
-             * synthetic `partial class` and merges exactly like a source
-             * file. Only the primary input's design becomes the entry
-             * point; the other designs of a multi-window project compile
-             * alongside it and are opened with `<Name>.Show()`, so the
-             * program keeps exactly one Main(). */
+            /* 内部辅助实现 */
             if ((size_t)fi < design_count && design_outs[fi]) {
                 char *owned_text = design_outs[fi];
                 design_outs[fi] = NULL;
                 if (fi == 0) {
-                    /* The caller still owns `source` (freed on every exit
-                     * path below), so the primary translation must be that
-                     * buffer - otherwise the exit-path free() double-frees. */
+                    /* 内部辅助逻辑 */
                     free(src);
                     src = owned_text;
                     source = src;
                 } else {
-                    /* Later designs live in the arena, so they are reclaimed
-                     * with zan_arena_free on every exit path. */
+                    /* 内部辅助逻辑 */
                     src = zan_arena_strdup(arena, owned_text,
                                            strlen(owned_text));
                     free(owned_text);
@@ -5316,19 +4902,13 @@ int main(int argc, char **argv) {
         g_scale_stats.real_parses++;
         int parse_failed = !unit || diag->error_count > errors_before;
         zan_nsresolve_stamp(unit, arena);
-        /* Seed the live-name worklist from this file's AST (parse-once). A
-         * file whose parse failed is seeded lexically instead: the closure
-         * must not shrink silently, and the error itself is already on the
-         * main diag (reported once, below). */
+        /* Seed the live-name worklist from this file's AST (parse-once) */
         if (pi_filter_active) {
             int seed_entry = fi < explicit_input_count &&
                              !zan_is_zcomp_path(input_files[fi]);
             pi_seed_stdlib_input =
                 seed_entry ? pi_reach_input_dir(input_files[fi]) : 0;
-            /* Mentions from stdlib-authored files stamp flagged_stdlib.
-             * fi == 0 is the entry and counts as user code even when it
-             * lives under the stdlib root (ZanGen), matching the
-             * from_stdlib stamp below. */
+            /* Mentions from stdlib-authored files stamp flagged_stdlib */
             pi_seeding_stdlib =
                 fi > 0 && auto_stdlib && resolved_stdlib_root[0] &&
                 input_files[fi] &&
@@ -5342,13 +4922,7 @@ int main(int argc, char **argv) {
             pi_seeding_stdlib = 0;
             pi_seed_stdlib_input = 0;
         }
-        /* Mark stdlib-authored declarations so the reachability prune can
-         * drop the ones nothing references (see nsresolve.c). A file counts
-         * as stdlib when it was auto-included from the stdlib root, not
-         * passed on the command line -- except the entry source itself: a
-         * project may live inside the stdlib root (ZanGen compiles
-         * ZanGen.zan from stdlib/System/Compiler), and its Main would be
-         * pruned as unreachable, losing the executable's entry point. */
+        /* 内部辅助逻辑 */
         if (fi > 0 && auto_stdlib && resolved_stdlib_root[0] && input_files[fi] &&
             zan_path_is_under(input_files[fi], resolved_stdlib_root)) {
             for (int k = 0; k < unit->comp_unit.decls.count; k++)
@@ -5370,19 +4944,12 @@ int main(int argc, char **argv) {
     }
         scanned = round_end;
         if (pi_filter_active) {
-            /* Metadata closure round: newly seeded names mark more files
-             * for inclusion; their usings reach further directories. The
-             * loop ends when a round neither includes nor appends anything
-             * (everything appended so far has been parsed above). */
+            /* 内部辅助逻辑 */
             int changed = pi_close_once(resolved_stdlib_root);
             int fresh = pi_append_included(&input_files, &input_count,
                                            &input_cap);
             if (!changed && !fresh) {
-                /* A flagged name nothing scanned declares means some parsed
-                 * file referenced a stdlib type across a directory no
-                 * `using` names -- widen the reach set once (see
-                 * pi_reach_all_dirs) and re-run; the live-name gate still
-                 * decides inclusion. */
+                /* 内部辅助实现 */
                 if (!pi_repair_done && pi_unsatisfied_live_name()) {
                     pi_repair_done = 1;
                     pi_repair_walk(resolved_stdlib_root, "");
@@ -5416,10 +4983,7 @@ int main(int argc, char **argv) {
         zan_parser_specialize_generic_bases(ast, arena, diag);
         phase("specialize_bases");
 
-        /* --gen-meta: dump the compilation-unit metadata the Zan-scripted
-         * code generators consume (see genmeta.h) and exit. Must run before
-         * the generators, whose rewrites would otherwise change the call
-         * sites under export. */
+        /* 内部辅助逻辑 */
         if (gen_meta_path) {
             char *meta = zan_genmeta_export_files(ast, diag);
             if (!meta) {
@@ -5446,11 +5010,7 @@ int main(int argc, char **argv) {
         }
 
         zan_compile_trace("codegen");
-        /* All five code generators (jsongen/dbgen/routegen/formgen/scenegen)
-         * live in stdlib/System/Compiler/ZanGen.zan: one subprocess run
-         * exports the metadata, generates the binders/mappers/routes and
-         * returns rewrite directives for the call sites. --no-gen (compiling
-         * the generators themselves) skips the subprocess entirely. */
+        /* 内部辅助逻辑 */
         if (zan_gen_enabled &&
             zan_gen_codegen(ast, arena, diag, resolved_stdlib_root) != 0) {
             zan_arena_free(arena);
@@ -5458,11 +5018,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         phase("codegen");
-        /* Demand-driven pull-in, second round: generated classes reference
-         * stdlib types the user program never spells (dbgen output binds the
-         * whole System.Data.Orm subtree), so seed the live-name worklist
-         * with the generated texts and parse whatever new files the closure
-         * adds, stamped stdlib-authored exactly like the primary loop does. */
+        /* 内部辅助实现 */
         if (pi_filter_active) {
             char **gen_texts = NULL;
             int gen_text_count = 0;
@@ -5472,18 +5028,13 @@ int main(int argc, char **argv) {
                 free(gen_texts[gi]);
             }
             free(gen_texts);
-            /* Closure rounds with parse-once seeding: each round parses and
-             * seeds the files it appended (their ASTs may reference further
-             * stdlib files), so the metadata side converges on real
-             * references instead of trusting the generator texts alone. */
+            /* 内部辅助实现 */
             for (;;) {
                 int changed = pi_close_once(resolved_stdlib_root);
                 int fresh = pi_append_included(&input_files, &input_count,
                                                &input_cap);
                 if (!changed && !fresh) {
-                    /* Same repair round as the main parse loop's closure:
-                     * generator texts can name stdlib types no
-                     * using-directive reaches. */
+                    /* 内部辅助逻辑 */
                     if (!pi_repair_done && pi_unsatisfied_live_name()) {
                         pi_repair_done = 1;
                         pi_repair_walk(resolved_stdlib_root, "");
@@ -5506,15 +5057,13 @@ int main(int argc, char **argv) {
                         return 1;
                     }
                     zan_nsresolve_stamp(unit, arena);
-                    /* Appended tail files are never the entry; the same
-                     * stdlib-authored test as the from_stdlib stamp below. */
+                    /* 内部辅助逻辑 */
                     pi_seeding_stdlib =
                         auto_stdlib && resolved_stdlib_root[0] &&
                         zan_path_is_under(input_files[fi],
                                           resolved_stdlib_root);
                     if (diag->error_count > errors_before) {
-                        /* Lexical fallback keeps the closure from shrinking;
-                         * the parse error is already on the main diag. */
+                        /* 内部辅助逻辑 */
                         g_scale_stats.throwaway_parse_fallbacks++;
                         size_t flen = 0;
                         char *fsrc = read_file(input_files[fi], &flen);
@@ -5547,21 +5096,10 @@ int main(int argc, char **argv) {
             memset(pi_table, 0, sizeof(pi_table));
             pi_dirs_head = pi_dirs_tail = NULL;
         }
-        /* Generators merged their generated classes into the unit above; run
-         * nsresolve again so the new declarations' type references (Expr<T>,
-         * OrmMeta, DbValues, ... from the generated file's own usings) resolve
-         * to final names exactly like every parsed file's do. Re-running over
-         * user code is safe: references already carry final names and resolve
-         * to themselves. */
+        /* 内部辅助实现 */
         zan_compile_trace("nsresolve generated");
         zan_nsresolve_run(ast, arena, diag);
-        /* Drop stdlib declarations nothing references: a `using Gui.Widget;`
-         * glob otherwise leaves every phase after this one chewing through
-         * definitions that can never be called. Runs after the generators:
-         * generated code is part of the reference graph (dbgen output
-         * references the System.Data.Orm subtree), so pruning before the
-         * merge deleted exactly the types the generated classes bind
-         * against. */
+        /* Drop stdlib declarations nothing references: a `using Gui */
         zan_compile_trace("prune");
         zan_nsresolve_prune(ast, arena, diag);
         phase("prune");
@@ -5570,10 +5108,7 @@ int main(int argc, char **argv) {
 
     package_sources_destroy();
 
-    /* --emit-symbols: the IDE and the language server read this index instead
-     * of carrying their own copy of what the standard library offers, so a
-     * member they suggest is a member the compiler really has. Parsing and
-     * namespace resolution are all it needs, so this runs before binding. */
+    /* 内部辅助实现 */
     if (emit_symbols_path) {
         int srv = zan_symbols_emit(ast, emit_symbols_path);
         if (srv != 0)
@@ -5633,9 +5168,7 @@ int main(int argc, char **argv) {
     probe_phase_mem("check");
 
     zan_irgen_t irgen;
-    /* Windows cross-objects use the mingw ABI (matching the bundled
-     * mingw-w64 runtime linked below), not the MSVC ABI of the listed
-     * triple. */
+    /* 内部辅助逻辑 */
     const char *irgen_triple = NULL;
     if (cross_compiling) {
         if (target.os == ZAN_OS_WINDOWS)
@@ -5645,12 +5178,7 @@ int main(int argc, char **argv) {
         else
             irgen_triple = target.triple;
     }
-    /* Library output is selected by the -o extension (.dll/.so/.dylib for
-     * shared, .a/.lib for static) or forced with --emit-lib (which then
-     * guesses shared/static from the extension, defaulting to static). The
-     * decision must happen before IR emission: `public` members of a library
-     * are kept as exported (external-linkage) symbols, and the pre-object
-     * dead-code sweep must not remove them. */
+    /* Library output is selected by the -o extension ( */
     if (output_file && !emit_lib) {
         const char *ext = strrchr(output_file, '.');
         if (ext) {
@@ -5669,17 +5197,14 @@ int main(int argc, char **argv) {
             lib_shared = true;
     }
     if (apk_path) {
-        /* The APK output is a shared libmain.so plus packaging; a .apk
-         * suffix must not read as a static archive. */
+        /* The APK output is a shared libmain */
         lib_shared = true;
         if (target.os != ZAN_OS_ANDROID) {
             fprintf(stderr, "error: --emit-apk requires --target "
                     "android-x64 or android-arm64\n");
             return 1;
         }
-        /* Pull androidPackage/androidLabel/androidPermissions from the
-         * project's zan.proj so publishing needs no extra CLI flags.
-         * CLI overrides keep precedence. */
+        /* Pull androidPackage/androidLabel/androidPermissions from the project's zan */
         if (project_root_has_manifest()) {
             if (!load_proj_android_keys_done) {
                 load_proj_android_keys();
@@ -5706,18 +5231,12 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    /* Debug builds carry the ARC diagnostics by default -- a leak or a stale
-     * reference reports itself with a source location instead of surfacing as
-     * a crash days later -- and --publish carries none of their cost. */
+    /* 内部辅助逻辑 */
     bool check_leaks = check_leaks_opt >= 0 ? check_leaks_opt != 0
                                            : (debug_info && !publish_mode);
     bool arc_guard = arc_guard_opt >= 0 ? arc_guard_opt != 0
                                         : (debug_info && !publish_mode);
-    /* Publish keeps one low-cost safety net: the over-release check reports
-     * through the fail-soft note and continues, so a leak in the field
-     * announces itself instead of silently corrupting. The full --arc-guard
-     * trap supersedes it; an explicit --no-arc-guard is the perf-paranoid
-     * escape hatch that turns the net off too. */
+    /* 内部辅助实现 */
     bool arc_net = publish_mode && arc_guard_opt != 1 && arc_guard_opt != 0;
     zan_arena_t *ir_arena = zan_arena_new();
     if (!ir_arena) {
@@ -5742,16 +5261,9 @@ int main(int argc, char **argv) {
     irgen.emit_debug = debug_info;
     irgen.strict_runtime = strict_runtime;
     irgen.publish_mode = publish_mode;
-    /* Split guard reports (shared message globals + zan_rt_soft_note2) need
-     * the runtime to actually export zan_rt_soft_note2. Host builds link the
-     * runtime object built from source, so they always have it; cross builds
-     * link the committed toolchain/<target>/zanrt_*.o objects, which lag
-     * until scripts/build_cross_rt.cmd runs -- keep the self-contained
-     * merged-text form there. */
+    /* 内部辅助逻辑 */
     irgen.rt_guard_split = !cross_compiling;
-    /* Obfuscate string literals: opt-in via --obfuscate-strings or ZAN_OBF=1.
-     * Default OFF: in-place startup deobfuscation marks every string page
-     * dirty, bloating private commit memory on large apps. */
+    /* Obfuscate string literals: opt-in via --obfuscate-strings or ZAN_OBF=1 */
     const char *obf_env = getenv("ZAN_OBF");
     const char *no_obf_env = getenv("ZAN_NO_OBF");
     if (obfuscate_strings_opt >= 0) {
@@ -5773,16 +5285,11 @@ int main(int argc, char **argv) {
                         target.arch == ZAN_ARCH_AARCH64);
     bool shard_opt_out = (shard_env && shard_env[0] == '0') ||
                          (no_shard_env && no_shard_env[0] == '1');
-    /* Sharded emission splits function bodies into <obj>.shardN.o files; only
-     * the native link branches consume them. Every cross branch assembles an
-     * explicit link line (obj_tmp + runtime objects) and would silently drop
-     * the shards, leaving each moved body an undefined __zan_release_* /
-     * __zan_desc_* reference at link time. */
+    /* Sharded emission splits function bodies into <obj> */
     bool want_shard = native_arch && !cross_compiling && !shard_opt_out &&
                       ((shard_env && shard_env[0] == '1') || publish_mode);
 
-    /* Function-local publish compaction already runs during emission and
-     * must use the target's actual pointer layout, including 32-bit targets. */
+    /* 内部辅助逻辑 */
     zan_irgen_bind_target(&irgen);
     if (zan_irgen_emit(&irgen, ast) != ZAN_OK) {
         fprintf(stderr, "error: code generation failed\n");
@@ -5795,8 +5302,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Establish cross-object runtime ownership before DCE or inlining can
-     * bake module-private state into bodies that will later be coalesced. */
+    /* 内部辅助逻辑 */
     zan_prepare_static_runtime(&irgen, &target);
 
     phase("irgen");
@@ -5836,12 +5342,7 @@ int main(int argc, char **argv) {
         zan_arena_dump_stats();
     }
 
-    /* Release the frontend AST, binder and source excerpts now that irgen is
-     * done. The codegen manifest reads only the modifiers snapshot captured
-     * into the function registry at emit time; LLVM sharding, optimization
-     * and emission passes only need irgen.mod. Freeing the arena before the
-     * manifest/shard/optimize/emit/link phases removes the frontend graph
-     * from the compiler's peak-memory window entirely. */
+    /* Release the frontend AST, binder and source excerpts now that irgen is done */
     if (arena) {
         for (int i = 0; i < irgen.extern_lib_count; i++) {
             zan_istr_t *lib = &irgen.extern_libs[i];
@@ -5874,19 +5375,13 @@ int main(int argc, char **argv) {
     probe_phase_mem("release ast");
     if (source) { free(source); source = NULL; }
 
-    /* Codegen manifest: semantic snapshot of the finished module (all
-     * irgen fixpoints complete, optimizer not yet run), opt-in via env so
-     * ordinary builds pay nothing. ZAN_SHARD=1 consumes the same manifest to
-     * split eligible bodies into separate objects; the snapshot then stays
-     * alive until the shard pass below has run. */
+    /* 内部辅助实现 */
     const char *mf_json_path = getenv("ZAN_CODEGEN_MANIFEST_JSON");
     zan_cg_manifest_t mf;
     bool mf_built = false;
     if (getenv("ZAN_CODEGEN_MANIFEST") || mf_json_path || want_shard) {
         zan_opt_strip_unused(&irgen);
-        /* All callers still live in this module. Prune now, before extraction
-         * turns live shard-only imports into unused coordinator declarations.
-         * The later shard_n == 0 gates remain necessary after bodies move. */
+        /* All callers still live in this module */
         zan_irgen_prune_extern_libs(&irgen);
         phase("manifest");
         probe_phase_mem("manifest");
@@ -5906,14 +5401,10 @@ int main(int argc, char **argv) {
     if (opt_level >= 0) {
         effective_opt = (zan_opt_level_t)opt_level;
     } else if (publish_mode) {
-        /* Release optimizes for SIZE (Os): the O2 default inlined ~1400
-         * functions and tripled .text, making --publish binaries larger than
-         * debug ones; speed-critical builds pass -O2/-O3 explicitly. */
+        /* 内部辅助逻辑 */
         effective_opt = ZAN_OPT_SIZE;
     }
-    /* Optimization reorders/folds instructions and drops locals, which makes
-     * DWARF line tables and variable locations unreliable. Debug builds stay at
-     * -O0 so single-stepping and breakpoints map faithfully to source. */
+    /* 内部辅助逻辑 */
     if (debug_info && effective_opt > ZAN_OPT_NONE) {
         fprintf(stderr, "note: -g forces -O0 (debug info is emitted unoptimized)\n");
         effective_opt = ZAN_OPT_NONE;
@@ -5961,17 +5452,12 @@ int main(int argc, char **argv) {
             zan_irgen_prune_extern_libs(&irgen);
         }
         zan_discover_drivers(resolved_stdlib_root, &driver_reg);
-        /* Even an unsharded optimizer may inline and erase every definition
-         * with a live feature's prefix. Capture after reachability stripping,
-         * while those names still describe the complete program. */
+        /* 内部辅助逻辑 */
         zan_driver_capture_conditions(&irgen, ir_arena, &driver_reg, &target,
                                       driver_dir_override, &driver_prefixes);
     }
 
-    /* Pre-optimization Module Sharding: split eligible bodies into separate
-     * objects, then delete moved bodies from the coordinator before the
-     * heavy global optimizer runs (prevents the monolithic module peak
-     * memory spike). */
+    /* 内部辅助实现 */
     char **shard_objs = NULL;
     int shard_n = 0;
     if (!do_emit_ir && want_shard && mf_built) {
@@ -5999,31 +5485,17 @@ int main(int argc, char **argv) {
         zan_opt_report_print(&opt_report);
         phase("optimize");
         probe_phase_mem("optimize");
-        /* Shard-aware gate: existence in the coordinator module is only a
-         * valid liveness signal while every body lives there. A sharded
-         * publish has already moved bodies into .shard<k>.o objects, so a
-         * driver declaration whose only callers are shard bodies looks dead
-         * in-module and an unconditional prune would drop the -l -- the
-         * link then dies on undefined references to sqlite3_reset etc.
-         * Unsharded publishes (and every dev build) prune here. */
+        /* 内部辅助逻辑 */
         if (shard_n == 0)
             zan_irgen_prune_extern_libs(&irgen);
     } else {
-        /* Unoptimized build: also skip machine-level optimization, the single
-         * most expensive phase (edit-compile-run turnaround). Unreachable
-         * definitions are still dropped by the sweep below. */
-        /* Not for wasm32: at CGLevelNone the WebAssembly backend stackifies
-         * nothing and lowers nearly every IR value to a wasm local, so any
-         * nontrivial function blows past V8's hard 50,000-locals-per-function
-         * cap and the module fails to instantiate. */
+        /* 内部辅助逻辑 */
+        /* 内部辅助实现 */
         if (!irgen.target_is_wasm)
             irgen.fast_codegen = true;
         if (!do_emit_ir) {
             zan_opt_strip_unused(&irgen);
-            /* The sweep just erased the imports nothing calls; drop their
-             * libraries too, or the link line keeps asking for native
-             * libraries that this program never calls. Same shard gate as
-             * the optimized branch. */
+            /* 内部辅助实现 */
             if (shard_n == 0)
                 zan_irgen_prune_extern_libs(&irgen);
         }
@@ -6041,12 +5513,7 @@ int main(int argc, char **argv) {
         }
     } else {
 
-        /* Cross-linking to Linux is fully static against the bundled musl
-         * sysroot, so a [DllImport] lib resolves only from a bundled static
-         * archive (<module>/drivers/<target-sub>/static/lib<name>.a). Any lib
-         * without one (e.g. a driver manager that cannot live inside a
-         * static binary) has its extern functions stubbed out so the publish
-         * still links, with the stubbed calls failing at runtime instead. */
+        /* 内部辅助实现 */
         char cross_archives[ZAN_MAX_USED_DRIVERS][1200];
         int cross_archive_count = 0;
         if (cross_compiling && (target.os == ZAN_OS_LINUX
@@ -6095,12 +5562,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Cross-linking to OHOS follows the Android policy: the OHOS sysroot
-         * ships none of the desktop third-party natives (openssl, ...), so a
-         * DllImport lib that neither a bundled static driver archive nor a
-         * driver .so can provide is stubbed and dropped from extern_libs --
-         * degrade that feature at runtime instead of failing the build.
-         * Runs before emission so links see a clean list. */
+        /* 内部辅助实现 */
         if (cross_compiling && target.os == ZAN_OS_OHOS) {
             char oexe[1024] = {0};
             zan_exe_dir(oexe, sizeof(oexe));
@@ -6108,8 +5570,7 @@ int main(int argc, char **argv) {
                                     ? "ohos-arm64" : "ohos-x64";
             zan_driver_registry_t oreg;
             zan_discover_drivers(resolved_stdlib_root, &oreg);
-            /* Backwards: drop_extern_lib compacts extern_libs; a forward
-             * walk would skip the entry after each drop. */
+            /* 内部辅助逻辑 */
             for (int li = irgen.extern_lib_count - 1; li >= 0; li--) {
                 if (zan_win_system_lib(irgen.extern_libs[li].str,
                                        (int)irgen.extern_libs[li].len))
@@ -6149,11 +5610,7 @@ int main(int argc, char **argv) {
                   }
                 }
                 if (via_static_archive) {
-                    /* The link already carries the static archive; dropping
-                     * the lib keeps -l<lib> (and so a duplicate DT_NEEDED on
-                     * a driver .so) off the line. No stubs here -- a defined
-                     * stub would satisfy the references and the archive
-                     * member would never load. */
+                    /* 内部辅助逻辑 */
                     zan_irgen_drop_extern_lib(
                         &irgen, irgen.extern_libs[li].str,
                         (int)irgen.extern_libs[li].len);
@@ -6168,15 +5625,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Cross-linking to macOS is dynamic: a [DllImport] lib resolves from
-         * the per-target driver dylib shipped inside the owning stdlib module
-         * (<module>/drivers/<target-sub>/lib<name>.dylib), or from the first
-         * usable filename in its <name>.bundle manifest; --publish copies it
-         * next to the executable as @rpath. The dylib's own framework
-         * dependencies (Cocoa, WebKit, ...) are bound on the target Mac,
-         * which is what lets a Windows/Linux host cross-link a GUI program
-         * without an Apple SDK. A lib with no bundled dylib has its externs
-         * stubbed, exactly as on the Linux cross path. */
+        /* 内部辅助实现 */
         char cross_dylibs[ZAN_MAX_USED_DRIVERS][1200];
         int cross_dylib_count = 0;
         if (cross_compiling && target.os == ZAN_OS_MACOS) {
@@ -6226,11 +5675,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* When targeting a non-Windows OS (native or cross), a [DllImport]
-         * on a Windows system library (kernel32, user32, ...) is a
-         * platform-guarded path this OS never takes, so its functions are
-         * stubbed instead of handed to the linker, which has no import
-         * library to resolve them from. */
+        /* 内部辅助逻辑 */
         if (target.os != ZAN_OS_WINDOWS) {
             for (int li = irgen.extern_lib_count - 1; li >= 0; li--) {
                 if (!zan_win_system_lib(irgen.extern_libs[li].str,
@@ -6243,28 +5688,15 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Native stdlib drivers (libpq, sqlite3, ...): not present on an
-         * arbitrary target, so a published program must carry them. Each
-         * ships at <stdlib_root>/<module>/drivers/<target-sub>/, overridable
-         * with --driver-dir; which libs are drivers and which module owns
-         * each comes from the stdlib tree's drivers/driver.manifest files
-         * (zan_discover_drivers), not hardcoded here. The directory joins
-         * the link search path. Windows copies runtime libs beside the exe
-         * (no rpath equivalent); other targets copy on --publish. */
-        /* Driver/resource conditions were captured before optimization could
-         * erase feature names. */
-        /* Android cross-link: bionic ships none of the desktop third-party
-         * natives; a DllImport lib that neither the sysroot stub .so set
-         * (libc/libm/liblog/libdl next to zanc) nor a bundled android
-         * driver .so provides is stubbed and dropped from the link line --
-         * same policy as the Linux/macOS cross paths. Runs before emission. */
+        /* Native stdlib drivers (libpq, sqlite3, */
+        /* 内部辅助逻辑 */
+        /* 内部辅助逻辑 */
         if (cross_compiling && target.os == ZAN_OS_ANDROID) {
             char aexe[1024] = {0};
             zan_exe_dir(aexe, sizeof(aexe));
             const char *asub = (target.arch == ZAN_ARCH_AARCH64)
                                ? "android-arm64" : "android-x64";
-            /* Backwards: drop_extern_lib compacts extern_libs; a forward
-             * walk would skip the entry after each drop. */
+            /* 内部辅助逻辑 */
             for (int li = irgen.extern_lib_count - 1; li >= 0; li--) {
                 if (zan_win_system_lib(irgen.extern_libs[li].str,
                                        (int)irgen.extern_libs[li].len))
@@ -6290,9 +5722,7 @@ int main(int argc, char **argv) {
                                    zan_driver_subdir(&target), nlen, nm);
                           resolvable = zan_file_exists(stubso);
                           if (!resolvable) {
-                              /* --link-mode static: the driver may ship
-                               * only a static archive; the link branch
-                               * resolves it via drivers/<target>/static. */
+                              /* 内部辅助逻辑 */
                               snprintf(stubso, sizeof(stubso),
                                        "%s/%s/drivers/%s/static/lib%.*s.a",
                                        driver_reg.entries[didx].root,
@@ -6347,9 +5777,7 @@ int main(int argc, char **argv) {
                 used_driver_count++;
             }
         }
-        /* Run-time drivers ("<lib> if <prefix>") are dlopen'd, never linked,
-         * so they never appear in extern_libs; used when the image contains
-         * the module's code. */
+        /* 内部辅助逻辑 */
         for (int di = 0; di < driver_reg.count; di++) {
             if (used_driver_count >= ZAN_MAX_USED_DRIVERS)
                 link_cap_exceeded("native drivers", ZAN_MAX_USED_DRIVERS);
@@ -6387,8 +5815,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* No explicit --subsystem on Windows: infer 'windows' for design
-         * documents or GUI-driver users so apps don't spawn a console. */
+        /* 内部辅助逻辑 */
         if (target.os == ZAN_OS_WINDOWS && link_subsystem == NULL) {
             bool is_gui_app = (design_count > 0);
             if (!is_gui_app) {
@@ -6407,13 +5834,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Windows has no rpath, so a dlopen'd driver lands beside the exe,
-         * defeating single-file publish; it cannot be linked instead because
-         * the CEF wrappers come in two variants bound to different CEF C ABIs
-         * and only one may resolve per process. In static mode the DLL
-         * travels as an embedded resource the module writes out before
-         * LoadLibrary; only the wrapper is embedded (the CEF runtime stays
-         * external). */
+        /* 内部辅助实现 */
         char embed_driver_specs[128][1300];
         int embed_driver_spec_count = 0;
         if (target.os == ZAN_OS_WINDOWS && link_static_drivers) {
@@ -6451,24 +5872,18 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Optional DllImport libraries on a Windows static publish: a lib
-         * with neither a static archive nor a shared DLL in the effective
-         * driver dirs cannot be linked (a self-contained exe has no runtime
-         * loader fallback), so stub and drop it like the cross paths above;
-         * the stubbed calls fail at run time. */
+        /* 内部辅助实现 */
         if (target.os == ZAN_OS_WINDOWS) {
             char win_exe_dir[1024] = {0};
             zan_exe_dir(win_exe_dir, sizeof(win_exe_dir));
-            /* Backwards: dropping a lib compacts extern_libs, shifting the
-             * remaining slots. */
+            /* Backwards: dropping a lib compacts extern_libs, shifting the remaining slots */
             for (int li = irgen.extern_lib_count - 1; li >= 0; li--) {
                 int nlen;
                 const char *nm = zan_dllimport_lname(
                     irgen.extern_libs[li].str,
                     (int)irgen.extern_libs[li].len, &nlen);
                 if (!nm || zan_win_system_lib(nm, nlen)) continue;
-                /* The owning driver's dir; a non-system lib with no driver
-                 * has no resolution channel. */
+                /* 内部辅助逻辑 */
                 char dir[1200];
                 dir[0] = '\0';
                 for (int d = 0; d < used_driver_count; d++) {
@@ -6517,8 +5932,7 @@ int main(int argc, char **argv) {
                     &irgen, irgen.extern_libs[li].str,
                     (int)irgen.extern_libs[li].len);
                 if (n > 0) {
-                    /* Snapshot the name before dropping: compacting shifts
-                     * the array slots. */
+                    /* Snapshot the name before dropping: compacting shifts the array slots */
                     char libname[128];
                     snprintf(libname, sizeof(libname), "%.*s",
                              (int)irgen.extern_libs[li].len,
@@ -6535,13 +5949,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Gui icon packs: IconSvgData resolves JSON data packs at run time
-         * like skin packs (env ZAN_GUI_ICONS, icons/ beside the exe,
-         * embedded resources, then the stdlib copy). When the program
-         * carries the module, the stdlib packs are baked in under their
-         * discovery names so a published app needs nothing beside the exe;
-         * disk packs win over embedded, so a shipped replacement still
-         * overrides. */
+        /* 内部辅助实现 */
         if (resolved_stdlib_root[0] &&
             zan_driver_prefix_live(&irgen, &driver_prefixes, "IconSvgData_")) {
             char icons_dir[1200];
@@ -6549,8 +5957,7 @@ int main(int argc, char **argv) {
                                              icons_dir, sizeof(icons_dir))) {
                 char *icon_spec = (char *)malloc(strlen(icons_dir) + 32);
                 if (icon_spec) {
-                    /* Resource name matches the reader's
-                     * zan_embed_list("icons/") prefix scan */
+                    /* Resource name matches the reader's zan_embed_list("icons/") prefix scan */
                     snprintf(icon_spec, strlen(icons_dir) + 32,
                              "%s=icons", icons_dir);
                     if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
@@ -6565,10 +5972,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Pinyin: System.Text.Pinyin resolves its hanzi->pinyin data file
-         * at run time like the icon packs (env, beside exe, embedded, then
-         * the source tree). When the program carries the module, the file
-         * is baked in under its discovery name "text/pinyin.txt". */
+        /* Pinyin: System */
         if (zan_driver_prefix_live(&irgen, &driver_prefixes, "Pinyin_")) {
             char pinyin_path[1200];
             if (zan_resolve_gui_resource_dir(resolved_stdlib_root,
@@ -6577,8 +5981,7 @@ int main(int argc, char **argv) {
                 ) {
                 char *pinyin_spec = (char *)malloc(strlen(pinyin_path) + 32);
                 if (pinyin_spec) {
-                    /* resource name matches the reader's
-                     * File.EmbedExists("text/pinyin.txt") lookup */
+                    /* resource name matches the reader's File */
                     snprintf(pinyin_spec, strlen(pinyin_path) + 32,
                              "%s=text/pinyin.txt", pinyin_path);
                     if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
@@ -6593,16 +5996,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Gui skin packs + base.css: Skin.Roots() resolves env ZAN_GUI_SKINS,
-         * skins/ beside the exe or under the cwd, then embedded resources.
-         * When the program carries the Skin module, the stdlib packs are
-         * baked in under their discovery names ("skins/<pack>/skin.css",
-         * "skins/base.css") so every GUI build finds the baseline and the
-         * picker with nothing beside the exe. Disk packs win over embedded;
-         * a project --embed of its own skins/ makes this auto-embed skip
-         * (one copy per name is enough); a staged skins/ only counts as a
-         * complete replacement when it carries base.css itself, else
-         * skins/base.css would go missing from the image. */
+        /* Gui skin packs + base */
         if (resolved_stdlib_root[0] &&
             zan_driver_prefix_live(&irgen, &driver_prefixes, "Skin_")) {
             bool skins_staged = false;
@@ -6625,17 +6019,13 @@ int main(int argc, char **argv) {
                                                  sizeof(skins_dir))) {
                     char *skin_spec = (char *)malloc(strlen(skins_dir) + 32);
                     if (skin_spec) {
-                        /* resource names "skins/<pack>/skin.css" match the
-                         * reader's zan_embed_list("skins/") prefix scan and
-                         * Skin.Load's EmbedRead("skins/<name>/skin.css") */
+                        /* resource names "skins/<pack>/skin */
                         snprintf(skin_spec, strlen(skins_dir) + 32,
                                  "%s=skins", skins_dir);
                         if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
                             int spec_at = embed_spec_count++;
                             embed_specs[spec_at] = skin_spec;
-                            /* Project skin selection (zan.proj skins/skinlist):
-                             * bake only the baseline packs + base.css unless
-                             * skins=1 widens the list with skinlist entries. */
+                            /* Project skin selection (zan */
                             if (!load_proj_android_keys_done &&
                                 project_root_has_manifest()) {
                                 load_proj_android_keys();
@@ -6676,11 +6066,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Chart theme packs: ChartTheme.Roots() resolves Gui/Component/Chart/
-         * themes at run time (env ZAN_CHART_THEMES, exe-beside layouts, then
-         * the stdlib copy; embedded last). When the program carries the Chart
-         * module, bake them in under "chartthemes/<name>.css" matching
-         * ChartTheme.Css's EmbedRead; disk wins over embedded. */
+        /* Chart theme packs: ChartTheme */
         if (resolved_stdlib_root[0] &&
             zan_driver_prefix_live(&irgen, &driver_prefixes, "Chart_")) {
             bool chartthemes_staged = false;
@@ -6713,20 +6099,10 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Project assets inside the executable: a program's own data folder
-         * (<project>/assets/) resolves at run time disk-first, embedded
-         * second; a published binary carries none of the source tree, so
-         * when the program calls the embed API and an assets/ folder exists,
-         * bake it in under its discovery name "assets/<file>". Disk wins at
-         * every read; an explicit --embed assets spec makes this auto-embed
-         * skip. Not gated on --publish: --emit-apk/--emit-lib builds are
-         * still programs and need their assets baked the same way. */
+        /* 内部辅助实现 */
         if (irgen.uses_embed_api &&
             resolved_stdlib_root[0]) {
-            /* Anchor candidates: the first input source whose own directory
-             * holds assets/ (multi-file builds list auxiliary sources before
-             * the entry), the parent of an input dir (<proj>/src +
-             * <proj>/assets layout), then the resolved project root. */
+            /* 内部辅助实现 */
             char assets_cands[4][1200];
             int assets_cand_count = 0;
             for (int fi = 0; fi < input_count && assets_cand_count < 2; fi++) {
@@ -6773,8 +6149,7 @@ int main(int argc, char **argv) {
                 assets_staged = true;
                 char *assets_spec = (char *)malloc(strlen(adir) + 32);
                 if (assets_spec) {
-                    /* resource names "assets/<file>" match the reader's
-                     * File.EmbedExists("assets/<file>") lookups */
+                    /* resource names "assets/<file>" match the reader's File */
                     snprintf(assets_spec, strlen(adir) + 32, "%s=assets", adir);
                     if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
                         embed_specs[embed_spec_count++] = assets_spec;
@@ -6789,9 +6164,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* --embed: project files baked into this module (not a separately
-         * compiled object) so every target works with no external C
-         * compiler; the read API is emitted with it. */
+        /* 内部辅助逻辑 */
         if (embed_spec_count > 0 || irgen.uses_embed_api) {
             int nres = zan_embed_emit_specs_filtered(&irgen, embed_specs,
                 embed_spec_count, skin_filter, skin_filter_count);
@@ -6835,14 +6208,11 @@ int main(int argc, char **argv) {
         phase("write obj");
         probe_phase_mem("write obj");
 
-        /* Driver/bundle conditions were captured while all live bodies were
-         * observable; bundling below uses that snapshot. */
+        /* 内部辅助逻辑 */
         zan_irgen_release_llvm(&irgen);
         probe_phase_mem("free llvm");
 
-        /* An icon is just another link input: compile the .ico into a .rsrc
-         * object here and hand it to whichever linker branch runs below.
-         * Only PE targets carry resources; libraries never embed one. */
+        /* An icon is just another link input: compile the */
         char icon_obj[1100];
         icon_obj[0] = '\0';
         if (!no_icon && !emit_lib && target.os == ZAN_OS_WINDOWS) {
@@ -6858,8 +6228,7 @@ int main(int argc, char **argv) {
             } else {
                 ires = 1;
             }
-            /* No (or unusable) --icon: fall back to zanc's built-in icon so
-             * the exe never shows the blank Windows shell icon. */
+            /* 内部辅助逻辑 */
             if (ires != 0)
                 ires = zan_winres_icon_object_mem(zan_default_icon,
                                                   ZAN_DEFAULT_ICON_LEN,
@@ -6875,9 +6244,7 @@ int main(int argc, char **argv) {
 
         int link_ret;
 
-        /* Runtime objects ship as siblings of zanc (copied there by the
-         * build/publish step), so resolve them relative to zanc at runtime,
-         * not the build-time absolute path baked into ZAN_RT_*_OBJ. */
+        /* 内部辅助逻辑 */
         char link_exe_dir[1024];
         zan_exe_dir(link_exe_dir, sizeof(link_exe_dir));
         char rt_io_buf[1200];
@@ -6888,8 +6255,7 @@ int main(int argc, char **argv) {
         char rt_timer_buf[1200];
         char rt_mem_buf[1200];
 
-        /* IO-await programs link the rt_io object shipped with zanc: socket
-         * readiness, generic blocking jobs, zan_io_pump_timeout. */
+        /* 内部辅助逻辑 */
         const char *rt_io_obj = NULL;
 #ifdef ZAN_RT_IO_OBJ
         if (irgen.uses_socket_async) {
@@ -6898,9 +6264,7 @@ int main(int argc, char **argv) {
             rt_io_obj = rt_io_buf;
         }
 #endif
-        /* Windows' external executor replaces the inline coroutine driver;
-         * linked when the program contains async/await or timer/socket
-         * async, skipped for pure synchronous programs. */
+        /* 内部辅助逻辑 */
 #ifdef ZAN_RT_IO_MT_OBJ
         if (external_async_executor) {
             snprintf(rt_io_buf, sizeof(rt_io_buf), "%s/%s",
@@ -6916,9 +6280,7 @@ int main(int argc, char **argv) {
             rt_sync_obj = rt_sync_buf;
         }
 #endif
-        /* File IO runtime (zan_file_*): its own object so a file-IO program
-         * skips the atomics/threads/shared-table runtime; wasm32 cross-builds
-         * can link it against plain libc while rt_sync.o is unavailable. */
+        /* 内部辅助逻辑 */
         const char *rt_file_obj = NULL;
 #ifdef ZAN_RT_FILE_OBJ
         if (irgen.uses_file_runtime) {
@@ -6927,11 +6289,7 @@ int main(int argc, char **argv) {
             rt_file_obj = rt_file_buf;
         }
 #endif
-        /* Embedded-resource API: any program referencing it links the tiny
-         * API object, so the build succeeds even with no resource data
-         * object (reads return empty, callers fall back to the filesystem).
-         * The generated data object registers the table via
-         * zan_embed_register. */
+        /* 内部辅助实现 */
         const char *rt_embed_obj = NULL;
 #ifdef ZAN_EMBED_OBJ
         if (irgen.uses_embed_api) {
@@ -6940,9 +6298,7 @@ int main(int argc, char **argv) {
             rt_embed_obj = rt_embed_buf;
         }
 #endif
-        /* Compressed-resource decoder: the inline embed API emits calls into
-         * it whenever a program embeds resources; ships next to zanc and
-         * rides the same rt_* slots through every link branch. */
+        /* 内部辅助逻辑 */
         const char *rt_inflate_obj = NULL;
 #ifdef ZAN_INFLATE_OBJ
         if (irgen.uses_inflate) {
@@ -6951,10 +6307,7 @@ int main(int argc, char **argv) {
             rt_inflate_obj = rt_inflate_buf;
         }
 #endif
-        /* Unified timer runtime: irgen emits calls into it from every
-         * program's inline coroutine driver (and rt_io.c calls it too), so
-         * every program needs it. Cross builds link the target-ABI copy in
-         * that target's toolchain directory (see the link branches below). */
+        /* 内部辅助逻辑 */
         const char *rt_timer_obj = NULL;
 #ifdef ZAN_RT_TIMER_OBJ
         if (!cross_compiling) {
@@ -6963,12 +6316,7 @@ int main(int argc, char **argv) {
             rt_timer_obj = rt_timer_buf;
         }
 #endif
-        /* Small-object allocator (rt_mem.c): wraps malloc/free/calloc/realloc
-         * for the whole image; per-thread caches and owner-directed
-         * cross-thread frees suit ARC traffic. --no-fast-alloc opts out.
-         * ld64 has no --wrap, so Mach-O native builds never link it; Android
-         * cross never links it (bionic TLS bootstrap); linux-musl cross
-         * auto-links its own copy from the sysroot when present. */
+        /* 小对象内存分配器管理池 */
         bool fast_alloc = fast_alloc_opt >= 0;
         const char *rt_mem_obj = NULL;
 #ifdef ZAN_RT_MEM_OBJ
@@ -6985,13 +6333,10 @@ int main(int argc, char **argv) {
                     "this target\n");
         }
 
-        /* Toolchain subdirectory holding the target-ABI runtime objects; NULL
-         * on a native build or for a target that ships none. */
+        /* 内部辅助逻辑 */
         const char *target_rt_sub = NULL;
         if (cross_compiling) {
-            /* The object zanc built for itself is host-ABI, so a cross link
-             * takes the target's own copy from that target's toolchain
-             * directory (scripts/build_{linux,win,macos}_rt.sh build them). */
+            /* 内部辅助逻辑 */
             const char *tsub = NULL;
             if (target.os == ZAN_OS_LINUX) {
                 tsub = (target.arch == ZAN_ARCH_AARCH64) ? "linux-arm64"
@@ -7035,11 +6380,7 @@ int main(int argc, char **argv) {
         if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX
             && target.os != ZAN_OS_ANDROID && target.os != ZAN_OS_OHOS
             && target.os != ZAN_OS_MACOS && target.os != ZAN_OS_WINDOWS) {
-            /* For WASI the declaration-level uses_sync_runtime flag is too
-             * coarse (auto-stdlib pulls the full sync API declarations into
-             * almost every program); link rt_sync.o only when the emitted
-             * object really references a sync symbol -- it cannot be built
-             * for wasm (no pthread/shm). */
+            /* 内部辅助实现 */
             int needs_sync = 1;   /* conservative default */
             if (target.os == ZAN_OS_WASI) {
                 static const char *const disp_pre[] = {
@@ -7053,14 +6394,7 @@ int main(int argc, char **argv) {
                     NULL
                 };
                 static const char *const gui_pre[] = { "zan_gui_", NULL };
-                /* Two escape hatches, both backed by single-threaded wasm
-                 * equivalents in the shipped objects: zan_dispatch_* comes
-                 * from zanrt_gui.o (lock-free ring) for GUI programs;
-                 * everything else has a stub in zanrt_syncw.o (threads run
-                 * their body synchronously, atomics are plain cells, the
-                 * shared table degrades to "unavailable", clocks are real).
-                 * Programs whose parallelism/cross-process semantics matter
-                 * get silently-wrong behavior from these stubs. */
+                /* 内部辅助实现 */
                 int has_disp = wasm_obj_vec_refs_any(&generated_objects, disp_pre);
                 int has_other = wasm_obj_vec_refs_any(&generated_objects, other_sync_pre);
                 needs_sync = (has_other || has_disp)
@@ -7080,9 +6414,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Extra library search dirs for [DllImport] libs from $ZAN_LIB_PATH
-         * (platform PATH separator), for libraries off the default system
-         * search path. */
+        /* 内部辅助逻辑 */
         char zan_lib_dirs[ZAN_LINK_MAX_DIRS][512]; int zan_lib_ndirs = 0;
         {
             const char *lp = getenv("ZAN_LIB_PATH");
@@ -7108,10 +6440,7 @@ int main(int argc, char **argv) {
         }
 
 #ifdef __APPLE__
-        /* Homebrew installs into non-default prefixes, so add its standard
-         * lib dirs (incl. keg-only libpq), only those that exist; DB/ORM
-         * programs then link on a stock Homebrew machine without
-         * ZAN_LIB_PATH. */
+        /* Homebrew installs into non-default prefixes, so add its standard lib dirs (incl */
         {
             char home_lib[512]; home_lib[0] = '\0';
             char home_pq[512];  home_pq[0] = '\0';
@@ -7144,15 +6473,10 @@ int main(int argc, char **argv) {
         }
 #endif
 
-        /* Driver dirs were resolved above (embedding needs them before
-         * emission); the link-search decisions belong here, where
-         * zan_lib_dirs exists. */
+        /* 内部辅助逻辑 */
         for (int d = 0; d < used_driver_count; d++) {
             if (!driver_dirs[d][0]) continue;
-            /* Add the driver dir to the link search path for every link
-             * branch below. In static mode choose per driver: the static
-             * subdir when the archive exists, else the shared dir (still
-             * bundleable); the macOS cross-dylib path is always shared. */
+            /* Add the driver dir to the link search path for every link branch below */
             char linkdir[1100];
             bool added_shared = false;
             bool want_static = link_static_drivers &&
@@ -7190,20 +6514,14 @@ int main(int argc, char **argv) {
                 snprintf(linkdir, sizeof(linkdir), "%s", driver_dirs[d]);
             }
             if (zan_lib_ndirs < ZAN_LINK_MAX_DIRS && strlen(linkdir) < sizeof(zan_lib_dirs[0])) {
-                /* Prepend, not append: a bundled driver must outrank the
-                 * auto-added Homebrew/system dirs, else a keg-only libpq
-                 * wins with an absolute install-name that defeats @rpath
-                 * bundling. */
+                /* 内部辅助实现 */
                 memmove(&zan_lib_dirs[1], &zan_lib_dirs[0],
                         (size_t)zan_lib_ndirs * sizeof(zan_lib_dirs[0]));
                 snprintf(zan_lib_dirs[0], sizeof(zan_lib_dirs[0]), "%s", linkdir);
                 zan_lib_ndirs++;
                 added_shared = true;
             }
-            /* Fallback: a target may ship only the static archive of a
-             * driver; keep its dir right after the shared one so ld resolves
-             * -l<driver> from the archive while a shared library still
-             * wins. */
+            /* 内部辅助实现 */
             if (added_shared && !link_static_drivers) {
                 char statdir[1100];
                 snprintf(statdir, sizeof(statdir), "%s/static", driver_dirs[d]);
@@ -7217,10 +6535,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Static .libs may name archives owned by another driver (libpq.a
-         * needs OpenSSL): resolve on demand via the target's standard
-         * drivers/<target>/static layout, keeping new drivers/targets
-         * data-driven (shipping the archive is enough). */
+        /* 内部辅助实现 */
         if (link_static_drivers && resolved_stdlib_root[0]) {
             const char *dsub = zan_driver_subdir(&target);
             for (int li = 0; li < static_driver_lib_count; li++) {
@@ -7282,20 +6597,9 @@ int main(int argc, char **argv) {
             }
         }
 
-
         if (emit_lib) {
-            /* Libraries stay on the single-object path; the generated-object
-             * vector is consumed only by the native Windows x64 executable
-             * link below. */
-            /* Library output: the same object linked WITHOUT the CRT startup
-             * objects and entry point. Static (.a/.lib) is an ar archive of
-             * the object; shared (.dll/.so/.dylib) links it with -shared.
-             * Objects are already emitted PIC, so one object serves both on
-             * every target. Runtime objects are pulled in only when the
-             * library uses them (irgen.uses_*); the rt_*_obj pointers are
-             * host-ABI, so a cross build repoints them at the target's
-             * toolchain copies like the executable links (cross static
-             * archives need none of this: the consumer links the runtime). */
+            /* 内部辅助逻辑 */
+            /* 内部辅助逻辑 */
             if (!lib_shared) {
                 if (zan_write_static_lib(obj_tmp, obj_path, target.os) != 0) {
                     fprintf(stderr, "error: failed to write static library '%s'\n",
@@ -7382,11 +6686,7 @@ int main(int argc, char **argv) {
                 bool lib_spawned = false; /* Windows: linked via _spawnv */
                 char exe_dir[1024];
                 zan_exe_dir(exe_dir, sizeof(exe_dir));
-                /* Windows DLLs get an import library so a consumer links with
-                 * just `-L <dir>` + [DllImport("foo.dll")]. GNU ld resolves
-                 * -l<name> against lib<name>.a and [DllImport] strips the
-                 * leading "lib" (zan_dllimport_lname), so the archive must
-                 * carry the lib prefix and the lname spelling. */
+                /* 内部辅助逻辑 */
                 char implib[1100] = {0};
                 if (target.os == ZAN_OS_WINDOWS) {
                     const char *sep = strrchr(obj_path, '\\');
@@ -7402,9 +6702,7 @@ int main(int argc, char **argv) {
                 }
                 if (target.os == ZAN_OS_WINDOWS) {
 #ifdef _WIN32
-                    /* The linker is spawned with an argv array, not system():
-                     * cmd.exe mangles a quoted executable path followed by
-                     * further quoted args. */
+                    /* The linker is spawned with an argv array, not system(): cmd */
                     char dll_exe_dir[1024]; dll_exe_dir[0] = '\0';
                     GetModuleFileNameA(NULL, dll_exe_dir, sizeof(dll_exe_dir));
                     { char *s = strrchr(dll_exe_dir, '\\'); if (s) *s = '\0'; }
@@ -7422,12 +6720,7 @@ int main(int argc, char **argv) {
                                     ? "arm64pe" : "i386pep";
                     argv[a++] = "-shared";
                     argv[a++] = "-Bdynamic";
-                    /* DLL entry: prefer the bundled dllcrt2.o
-                     * (DllMainCRTStartup: CRT init + our DllMain + PE386
-                     * relocator). Without a proper entry the loader calls the
-                     * first .text function on attach/detach (stdout garbage);
-                     * fall back to our minimal DllMain if the bundle lacks
-                     * dllcrt2.o. */
+                    /* DLL entry: prefer the bundled dllcrt2 */
                     char dllcrt2[1300];
                     snprintf(dllcrt2, sizeof(dllcrt2),
                              "%s\\mingw\\lib\\dllcrt2.o", dll_exe_dir);
@@ -7441,9 +6734,7 @@ int main(int argc, char **argv) {
                     argv[a++] = obj_tmp;
                     if (zan_file_exists(dllcrt2))
                         argv[a++] = dllcrt2;
-                    /* Runtime objects the library uses (IO reactor, sync,
-                     * file IO, embed API, timer); they must precede the -l
-                     * libs (single-pass ld). */
+                    /* 内部辅助逻辑 */
                     if (rt_io_obj) argv[a++] = rt_io_obj;
                     if (rt_sync_obj) argv[a++] = rt_sync_obj;
                     if (rt_file_obj) argv[a++] = rt_file_obj;
@@ -7455,8 +6746,7 @@ int main(int argc, char **argv) {
                     char ldirbufs[ZAN_LINK_MAX_DIRS * 2 + 4][520]; int nld = 0;
                     if (dll_exe_dir[0] &&
                         zan_file_exists(dll_exe_dir + 0) /* always true */) {
-                        /* Bundled mingw runtime: must be on the search path
-                         * for -lmingw32 etc. */
+                        /* Bundled mingw runtime: must be on the search path for -lmingw32 etc */
                         char mlib[1300];
                         snprintf(mlib, sizeof(mlib), "%s\\mingw\\lib",
                                  dll_exe_dir);
@@ -7482,15 +6772,9 @@ int main(int argc, char **argv) {
                                  "-L%s", extra_lib_paths[di]);
                         argv[a++] = ldirbufs[nld++];
                     }
-                    /* CRT libs in a group: mingw import/static libs reference
-                     * each other, so a single-pass scan needs the group. */
+                    /* 内部辅助逻辑 */
                     argv[a++] = "--start-group";
-                    /* winpthread: libgcc's unwinder reaches its per-thread
-                     * state via gthr-default.h (the POSIX one in the bundled
-                     * mingw), so -lgcc leaves pthread_* undefined without it.
-                     * Named as a static archive: -lwinpthread would pick the
-                     * import library and force libwinpthread_64-1.dll beside
-                     * every artifact at run time. */
+                    /* winpthread: libgcc's unwinder reaches its per-thread state via gthr-default */
                     static const char *const dllcrt[] = {
                         "-lmingw32", "-lgcc", "-lmoldname", "-lmingwex",
                         "-lmsvcrt", "-lkernel32", "-lshell32",
@@ -7532,8 +6816,7 @@ int main(int argc, char **argv) {
                     link_ret = (int)zan_utf8_spawnv(_P_WAIT, dll_ld, argv);
                     lib_spawned = true;
 #else
-                    /* Cross-linking a DLL from a non-Windows host; no quotes
-                     * around the first token, so system() is safe. */
+                    /* 内部辅助逻辑 */
                     const char *wsub = (target.arch == ZAN_ARCH_AARCH64)
                                        ? "arm64pe" : "i386pep";
                     snprintf(cmd, sizeof(cmd),
@@ -7595,8 +6878,7 @@ int main(int argc, char **argv) {
                 } else if (target.os == ZAN_OS_LINUX) {
                     snprintf(cmd, sizeof(cmd),
                              "ld.lld -shared -o \"%s\" \"%s\"", obj_path, obj_tmp);
-                    /* Runtime objects the library uses: host copies
-                     * natively, target copies on a cross build */
+                    /* 内部辅助逻辑 */
                     if (rt_io_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_io_obj);
@@ -7624,8 +6906,7 @@ int main(int argc, char **argv) {
                 } else if (target.os == ZAN_OS_MACOS) {
                     const char *march = (target.arch == ZAN_ARCH_AARCH64)
                                         ? "arm64" : "x86_64";
-                    /* Resolve libc/libm/printf/malloc against the bundled
-                     * libSystem text stub, exactly like the macOS exe path. */
+                    /* 内部辅助逻辑 */
                     char tbd[1200];
                     snprintf(tbd, sizeof(tbd), "%s/macos/libSystem.tbd",
                              exe_dir);
@@ -7646,8 +6927,7 @@ int main(int argc, char **argv) {
                              "ld64.lld -dylib -arch %s -platform_version macos "
                              "11.0 11.0 -o \"%s\" \"%s\" \"%s\"",
                              march, obj_path, obj_tmp, tbd);
-                    /* Runtime objects the library uses: host copies
-                     * natively, target copies on a cross build */
+                    /* 内部辅助逻辑 */
                     if (rt_io_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_io_obj);
@@ -7674,14 +6954,7 @@ int main(int argc, char **argv) {
                     }
                 } else if (cross_compiling &&
                            target.os == ZAN_OS_ANDROID) {
-                    /* Android shared library: the NativeActivity shell's
-                     * libmain.so inside an APK. The framework dlopens it and
-                     * calls ANativeActivity_onCreate, provided by
-                     * android_native_app_glue.o (sysroot subset), which
-                     * spawns the app thread into the module's main(). Links
-                     * the same stub .so set as the dynamic exe path;
-                     * [DllImport] drivers resolve from nativeLibraryDir at
-                     * APK install time. */
+                    /* Android shared library: the NativeActivity shell's libmain */
                     char exe_dir3[1024] = {0};
                     zan_exe_dir(exe_dir3, sizeof(exe_dir3));
                     const char *asub3 = (target.arch == ZAN_ARCH_AARCH64)
@@ -7761,10 +7034,7 @@ int main(int argc, char **argv) {
                                " \"%s/libc.so\" \"%s/libm.so\""
                                " \"%s/liblog.so\" \"%s/libdl.so\"",
                                sys3, sys3, sys3, sys3); }
-                    /* NativeActivity system libraries (libandroid, libEGL,
-                     * libGLESv2) go on as sysroot stubs so the dlopened
-                     * library records its full dependency group -- same
-                     * policy as the OHOS branch below. */
+                    /* 内部辅助实现 */
                     { cmd_appendf(cmd, sizeof(cmd),
                                " \"%s/libandroid.so\" \"%s/libEGL.so\""
                                " \"%s/libGLESv2.so\" \"%s/libaaudio.so\"",
@@ -7776,14 +7046,7 @@ int main(int argc, char **argv) {
                         fprintf(stderr, "[link] %s\n", cmd);
                     link_ret = system(cmd);
                 } else if (target.os == ZAN_OS_OHOS) {
-                    /* HarmonyOS shared library: the HAP's XComponent shell
-                     * dlopens the app's "main" .so and calls zan_hap_main();
-                     * zap_main.o (sysroot subset) adapts it to the module's
-                     * main(). The libEGL/libGLESv3 stubs must be recorded on
-                     * the link line: a dlopened library relocates against its
-                     * own dependency group, and preloading the libs globally
-                     * is not enough under the OHOS linker namespace; libc
-                     * resolves from the app's global namespace. */
+                    /* HarmonyOS shared library: the HAP's XComponent shell dlopens the app's "main" */
                     const char *osub = (target.arch == ZAN_ARCH_AARCH64)
                                        ? "ohos-arm64" : "ohos-x64";
                     char sys4[1200];
@@ -7809,16 +7072,12 @@ int main(int argc, char **argv) {
                              " \"%s\" \"%s/libclang_rt.builtins.a\""
                              " \"%s/libEGL.so\" \"%s/libGLESv3.so\"",
                              obj_path, sys4, obj_tmp, sys4, sys4, sys4);
-                    /* Bundled static driver archives: members are pulled in
-                     * for the symbols the module references; their libc
-                     * references resolve from the OHOS global namespace. */
+                    /* 内部辅助逻辑 */
                     for (int d = 0; d < cross_archive_count; d++) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  cross_archives[d]);
                     }
-                    /* Same conditional runtime objects as the exe link: a
-                     * dlopened library has no second chance to resolve
-                     * them. */
+                    /* 内部辅助逻辑 */
                     if (rt_timer_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_timer_obj);
@@ -7857,8 +7116,7 @@ int main(int argc, char **argv) {
                     free(source);
                     return 1;
                 }
-                /* Library search dirs + extern [DllImport] libs, so a library
-                 * resolves native dependencies like an exe does. */
+                /* 内部辅助逻辑 */
                 if (!lib_spawned) {
                     for (int di = 0; di < zan_lib_ndirs; di++) {
                         cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
@@ -7869,9 +7127,7 @@ int main(int argc, char **argv) {
                                  extra_lib_paths[di]);
                     }
                     for (int li = 0; li < irgen.extern_lib_count; li++) {
-                        /* Windows system libraries only make sense for a
-                         * Windows DLL; a cross-built ELF/dylib must not try
-                         * to resolve them. */
+                        /* 内部辅助逻辑 */
                         if (target.os != ZAN_OS_WINDOWS &&
                             zan_win_system_lib(irgen.extern_libs[li].str,
                                                (int)irgen.extern_libs[li].len))
@@ -7894,11 +7150,7 @@ int main(int argc, char **argv) {
                 }
             }
         } else if (cross_compiling && target.os == ZAN_OS_LINUX) {
-            /* Self-contained Linux cross-compile: static-link the ELF object
-             * against a bundled musl sysroot with ld.lld -- a dependency-free
-             * static binary (no glibc, no shared libs, no WSL on the target).
-             * Sysroot sits next to zanc at toolchain/<sub>/ (crt*.o + libc.a,
-             * plus a linux-built zanrt_io.o for socket-async programs). */
+            /* 内部辅助逻辑 */
             char exe_dir[1024] = {0};
 #ifdef _WIN32
             GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
@@ -7919,9 +7171,7 @@ int main(int argc, char **argv) {
             snprintf(sys, sizeof(sys), "%s/%s", exe_dir, sub);
 
             char cmd[4096];
-            /* --gc-sections pairs with the per-function .text sections the
-             * program object carries in publish mode; without it a cross
-             * publish ships every stdlib function reachable from vtables. */
+            /* gc-sections pairs with the per-function */
             snprintf(cmd, sizeof(cmd),
                      "ld.lld -static%s -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\" \"%s\"",
                      publish_mode ? " -s --gc-sections" : "", obj_path, sys, sys, obj_tmp);
@@ -7948,25 +7198,20 @@ int main(int argc, char **argv) {
                 }
             }
             if (irgen.uses_sync_runtime) {
-                /* Atomics/shared-table runtime; pthread/flock/shm resolve
-                 * from the static musl libc.a below. */
+                /* 内部辅助逻辑 */
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_sync.o\"", sys);
             }
             if (irgen.uses_file_runtime) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_file.o\"", sys);
             }
             if (irgen.uses_embed_api) {
-                /* Embedded-resource API; compiled for the target in the same
-                 * sysroot build. */
+                /* Embedded-resource API; compiled for the target in the same sysroot build */
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zan_embed_api.o\"", sys);
             }
             if (irgen.uses_inflate) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zan_inflate.o\"", sys);
             }
-            /* Small-object allocator in front of musl's mallocng: ARC's
-             * one-short-lived-block-per-object traffic is mallocng's worst
-             * case. --wrap also catches libc's own allocations; foreign
-             * pointers pass straight through. */
+            /* 内部辅助实现 */
             { char memobj[1300];
               snprintf(memobj, sizeof(memobj), "%s/zanrt_mem.o", sys);
               if (zan_file_exists(memobj)) {
@@ -7981,14 +7226,11 @@ int main(int argc, char **argv) {
               if (zan_file_exists(gcclib)) {
                   cmd_appendf(cmd, sizeof(cmd), " \"%s\"", gcclib);
               } }
-            /* Bundled static driver archives, inside the group so their libc
-             * references resolve from musl */
+            /* 内部辅助逻辑 */
             for (int d = 0; d < cross_archive_count; d++) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", cross_archives[d]);
             }
-            /* FreeType + fontconfig + expat for the GUI text engine: linked
-             * only when staged next to the other sysroot objects (an older
-             * layout still links text-less GUI programs). */
+            /* 内部辅助逻辑 */
             {
                 static const char *const ft_libs[] = {
                     "libfreetype.a", "libfontconfig.a", "libexpat.a"
@@ -8010,12 +7252,7 @@ int main(int argc, char **argv) {
                        " --end-group \"%s/crtn.o\"", sys); }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_OHOS) {
-            /* OHOS executable cross-link with ld.lld against the bundled
-             * OHOS NDK sysroot subset (crt1/crti/crtn.o + libc.a +
-             * compiler-rt builtins/unwind). OHOS userland is musl, so the
-             * link shape matches linux-musl: static, no .so dependencies,
-             * "hdc push + run"; runtime objects are the target-ABI copies
-             * from the same toolchain dir. */
+            /* OHOS executable cross-link with ld */
             char exe_dir[1024] = {0};
             zan_exe_dir(exe_dir, sizeof(exe_dir));
             const char *osub = (target.arch == ZAN_ARCH_AARCH64)
@@ -8057,9 +7294,7 @@ int main(int argc, char **argv) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_io.o\"", sys);
             }
             if (irgen.uses_sync_runtime) {
-                /* The OHOS NDK sysroot lacks shm_open, so rt_sync.c's
-                 * __OHOS__ shim backs shared tables with files under
-                 * $ZAN_SHM_DIR (default /data/local/tmp), like Android. */
+                /* The OHOS NDK sysroot lacks shm_open, so rt_sync */
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_sync.o\"", sys);
             }
             if (irgen.uses_file_runtime) {
@@ -8090,29 +7325,14 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[link] %s\n", cmd);
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_ANDROID) {
-            /* Android bionic executable cross-link from the committed NDK
-             * sysroot subset (crt objects + libc/libm/libdl + compiler-rt),
-             * objects emitted for *-linux-android28 (bionic gained glob()
-             * at API 28). Same runtime objects as the Linux sysroots except
-             * zanrt_mem.o: its --wrap=malloc interposes bionic internals and
-             * crashes under their TLS bootstrap, so --fast-alloc stays
-             * host/Linux only. Requires toolchain/android-<arch>/ staged
-             * next to zanc; run via adb push + chmod 755.
-             * STATIC (default) is a self-contained ELF; DYNAMIC (pie) when
-             * the program imports a native driver -- Android only resolves
-             * drivers from shared libraries, so the link records DT_NEEDED
-             * against the NDK stub .so files and the driver .so bundle is
-             * published beside the executable (nativeLibraryDir in an
-             * APK). */
+            /* 内部辅助实现 */
             char exe_dir[1024] = {0};
             zan_exe_dir(exe_dir, sizeof(exe_dir));
             const char *asub = (target.arch == ZAN_ARCH_AARCH64)
                                ? "android-arm64" : "android-x64";
             char sys[1200];
             snprintf(sys, sizeof(sys), "%s/%s", exe_dir, asub);
-            /* Which [DllImport] libs must the link record? Windows-only
-             * system libs are platform-guarded paths Android never takes;
-             * crt/libc/libm pseudo-libs resolve from the sysroot. */
+            /* 内部辅助逻辑 */
             const char *drv_libs[ZAN_LINK_MAX_LIBS];
             int drv_lib_len[ZAN_LINK_MAX_LIBS];
             int drv_lib_count = 0;
@@ -8133,9 +7353,7 @@ int main(int argc, char **argv) {
             }
             char cmd[8192];
             if (drv_lib_count > 0) {
-                /* DYNAMIC: pie executable; the stub .so files in the sysroot
-                 * subset give lld the symbol tables, and run time resolves
-                 * the real ones from the system and the bundled driver dir. */
+                /* DYNAMIC: pie executable; the stub */
                 snprintf(cmd, sizeof(cmd),
                          "ld.lld -pie%s -o \"%s\" \"%s/crtbegin_dynamic.o\""
                          " \"%s\"",
@@ -8161,9 +7379,7 @@ int main(int argc, char **argv) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_io.o\"", sys);
             }
             if (irgen.uses_sync_runtime) {
-                /* bionic has pthread/epoll; its missing shm_open is shimmed
-                 * inside rt_sync.c (__ANDROID__), so the Linux object
-                 * links. */
+                /* bionic has pthread/epoll; its missing shm_open is shimmed inside rt_sync */
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_sync.o\"", sys);
             }
             if (irgen.uses_file_runtime) {
@@ -8178,8 +7394,7 @@ int main(int argc, char **argv) {
                          " \"%s/zan_inflate.o\"", sys);
             }
             if (drv_lib_count > 0) {
-                /* Dynamic: libc/libm/liblog/libdl from the stub .so files,
-                 * imported drivers from the search dirs above. */
+                /* Dynamic: libc/libm/liblog/libdl from the stub */
                 cmd_appendf(cmd, sizeof(cmd), " --start-group");
             } else {
                 cmd_appendf(cmd, sizeof(cmd),
@@ -8215,11 +7430,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[link] %s\n", cmd);
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_WINDOWS) {
-            /* Windows PE executable cross-link via ld.lld's MinGW driver
-             * against the bundled mingw-w64 runtime (win-<arch>/mingw/lib).
-             * Objects use the *-w64-windows-gnu ABI; win-x64 links the
-             * GCC-built mingw runtime (libgcc), win-arm64 llvm-mingw
-             * (compiler-rt builtins + libunwind). */
+            /* Windows PE executable cross-link via ld */
             char exe_dir2[1024];
             zan_exe_dir(exe_dir2, sizeof(exe_dir2));
             const char *wsub = (target.arch == ZAN_ARCH_AARCH64)
@@ -8241,8 +7452,7 @@ int main(int argc, char **argv) {
                 free(source);
                 return 1;
             }
-            /* Host objects beside zanc are host-ABI; a cross-link takes the
-             * target's own copies staged as win-<arch>/zanrt_*.o. */
+            /* 内部辅助逻辑 */
             char winrt_io[1400] = {0};
             char winrt_sync[1400] = {0};
             char winrt_file[1400] = {0};
@@ -8339,8 +7549,7 @@ int main(int argc, char **argv) {
                 cmd_appendf(cmd, sizeof(cmd), " -l%s",
                          extra_link_libs[ei]);
             }
-            /* Extern [DllImport] libs: bundled import libs or the driver
-             * search dirs added above */
+            /* 内部辅助逻辑 */
             for (int li = 0; li < irgen.extern_lib_count; li++) {
                 int nlen;
                 const char *nm = zan_dllimport_lname(
@@ -8359,8 +7568,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[link win] %s\n", cmd);
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_WASI) {
-            /* Link a WASI command module with wasm-ld against the bundled
-             * wasi-libc sysroot (wasm32/, copied next to zanc). */
+            /* 内部辅助逻辑 */
             char exe_dir2[1024];
             zan_exe_dir(exe_dir2, sizeof(exe_dir2));
             char sys[1200];
@@ -8381,12 +7589,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
             if (rt_io_obj) {
-                /* Same declaration-level coarseness as the sync flag: only a
-                 * real undefined reference needs the reactor object (which
-                 * cannot link on wasm). GUI programs instead get
-                 * clean-failure socket stubs from zanrt_syncw.o; anything
-                 * that actually connects sees the failure through its
-                 * Zan-side error handling. */
+                /* 内部辅助实现 */
                 static const char *const sock_pre[] = {
                     "zan_io_socket_", "zan_gate_", "zan_io_connect_",
                     "zan_io_resolve", "zan_io_sockaddr_",
@@ -8408,19 +7611,7 @@ int main(int argc, char **argv) {
                 }
             }
             char cmd[8192];
-            /* --table-base=2: delegate values tag heap closure records with
-             * bit 0 (ZAN_CLOSURE_TAG) and treat even values as bare function
-             * pointers; on wasm32 a bare fn pointer is a table index, and
-             * lld's default base of 1 makes odd indices legal raw addresses
-             * -- an odd index read through a tag-test misroutes to function
-             * N-1. Basing the table at 2 keeps every raw index even.
-             * -z stack-size: lld's 64 KiB default is smaller than real
-             * apps' recursion needs, and the overflow writes into the
-             * statics below the stack. The larger stack only costs
-             * linear-memory address space (V8 commits pages lazily).
-             * --max-memory: without a declared maximum V8 reserves a
-             * multi-GB address space for memory32; declaring 512 MB keeps
-             * the reservation bounded (growth past it traps). */
+            /* 内部辅助实现 */
             snprintf(cmd, sizeof(cmd),
                      "wasm-ld%s -z stack-size=4194304 --max-memory=536870912 "
                      "--table-base=2 "
@@ -8432,8 +7623,7 @@ int main(int argc, char **argv) {
                          extra_link_inputs[ei]);
             }
             if (irgen.uses_file_runtime) {
-                /* File runtime (pure libc + a mutex) links against the
-                 * wasi-libc sysroot; rt_sync.o cannot (no pthread/shm). */
+                /* File runtime (pure libc + a mutex) links against the wasi-libc sysroot; rt_sync */
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_file.o\"",
                          sys);
             }
@@ -8455,10 +7645,7 @@ int main(int argc, char **argv) {
                 }
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", inflateobj);
             }
-            /* Every program calls zan_timer_* from its inline coroutine
-             * driver, so the timer object links unconditionally. libzigc.a:
-             * zig's libc.a references strlen/strcmp/abs and friends without
-             * defining them. */
+            /* 内部辅助逻辑 */
             { cmd_appendf(cmd, sizeof(cmd),
                        " \"%s/zanrt_timer.o\" \"%s/zanrt_wasm.o\"",
                        sys, sys); }
@@ -8516,18 +7703,13 @@ int main(int argc, char **argv) {
                     }
                     cmd_appendf(cmd, sizeof(cmd),
                              " \"%s\" --export=zan_gui_wasm_feed", guiobj);
-                    /* zanrt_gui.o is built with ZAN_GUI_FREETYPE, so it
-                     * references FT_*; the archive is linked only when
-                     * staged (an older layout still links, bitmap font). */
+                    /* zanrt_gui */
                     char ftlib[1300];
                     snprintf(ftlib, sizeof(ftlib), "%s/libfreetype.a", sys);
                     if (zan_file_exists(ftlib)) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"", ftlib);
                     }
-                    /* Sync-family symbols the GUI stdlib pulls in:
-                     * single-threaded equivalents from rt_sync_wasm.c,
-                     * linked under the same GUI gate that vouches for the
-                     * single-threaded execution model. */
+                    /* 内部辅助逻辑 */
                     char syncwobj[1300];
                     snprintf(syncwobj, sizeof(syncwobj),
                              "%s/zanrt_syncw.o", sys);
@@ -8537,8 +7719,7 @@ int main(int argc, char **argv) {
                 }
             }
             if (irgen.wasm_eh_used) {
-                /* try/throw programs raise the C++ exception tag (throw 0):
-                 * zanrt_ehtag.o defines that tag symbol. */
+                /* try/throw programs raise the C++ exception tag (throw 0): zanrt_ehtag */
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_ehtag.o\"",
                          sys);
             }
@@ -8548,13 +7729,7 @@ int main(int argc, char **argv) {
                        sys, sys, sys, sys); }
             link_ret = system(cmd);
         } else if (cross_compiling && (target.os == ZAN_OS_MACOS || target.os == ZAN_OS_IOS)) {
-            /* macOS/iOS executable cross-link with ld64.lld against the
-             * bundled libSystem.tbd text stub (MIT-licensed symbol list; no
-             * Apple SDK redistributed). All macOS/iOS system libraries live
-             * behind /usr/lib/libSystem.B, so a console exe only needs
-             * -lSystem. Socket-async and sync programs additionally link the
-             * Mach-O reactor/sync runtime builds from toolchain/ (every
-             * symbol they import is in libSystem). */
+            /* macOS/iOS executable cross-link with ld64 */
             char exe_dir2[1024];
             zan_exe_dir(exe_dir2, sizeof(exe_dir2));
             char tbd[1200];
@@ -8711,11 +7886,7 @@ int main(int argc, char **argv) {
             { cmd_appendf(cmd, sizeof(cmd), " \"%s\"", tbd); }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_FREESTANDING) {
-            /* Bare-metal freestanding (riscv32 for ESP32-C3/C6): no CRT, no
-             * sysroot, no bundled linker -- the compiler's object file is the
-             * product; the target SDK (ESP-IDF) owns startup code, libc and
-             * the final link, so undefined zan_timer_ / malloc symbols are
-             * expected and resolved there. */
+            /* 内部辅助实现 */
             remove(obj_path);
             if (rename(obj_tmp, obj_path) != 0) {
                 fprintf(stderr, "error: cannot write object '%s'\n",
@@ -8743,11 +7914,7 @@ int main(int argc, char **argv) {
             return 1;
         } else {
 #ifdef _WIN32
-        /* Self-contained native link: prefer the bundled ld + MinGW-w64
-         * runtime next to zanc, so producing an .exe needs only zan (no
-         * external clang / MSVC / Windows SDK). Objects are emitted with the
-         * x86_64-w64-windows-gnu ABI; without the bundle, fall back to a
-         * system clang targeting the same mingw ABI. */
+        /* 内部辅助逻辑 */
         char exe_dir[1024];
         GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
         { char *s = strrchr(exe_dir, '\\'); if (s) *s = '\0'; }
@@ -8765,10 +7932,7 @@ int main(int argc, char **argv) {
             snprintf(crtend, sizeof(crtend), "%s\\crtend.o", syslib);
             snprintf(lflag,  sizeof(lflag),  "-L%s", syslib);
 
-            /* LLD by default: GNU ld mishandles large sets of input sections
-             * (REL32 overflows, false undefined refs to same-object
-             * globals). The MinGW import/static libs need
-             * --start-group/--end-group. */
+            /* 内部辅助实现 */
             const char *argv[ZAN_LINK_MAX_ARGV];
             int a = 0;
             argv[a++] = ld_path;
@@ -8778,8 +7942,7 @@ int main(int argc, char **argv) {
             argv[a++] = "--stack"; argv[a++] = "268435456";
             if (publish_mode) {
                 argv[a++] = "-s";
-                /* publish objects carry one .text.<fn> section per function;
-                 * GC the unreferenced ones away. */
+                /* publish objects carry one */
                 argv[a++] = "--gc-sections";
             }
             /* GUI apps: hide the console window (still entered via main). */
@@ -8790,9 +7953,7 @@ int main(int argc, char **argv) {
             argv[a++] = crt2;
             argv[a++] = crtbeg;
             char ldirbufs[ZAN_LINK_MAX_DIRS][520];
-            /* Search bundled driver dirs before the MinGW sysroot so a
-             * driver-provided import library is not shadowed by a
-             * same-named host/runtime library. */
+            /* 内部辅助逻辑 */
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
                     link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
@@ -8830,8 +7991,7 @@ int main(int argc, char **argv) {
                 argv[a++] = extra_link_inputs[ei];
             }
             argv[a++] = "--start-group";
-            /* Caller-supplied libs (--link-lib), inside the group so they
-             * resolve against, and are resolved by, the system libs. */
+            /* 内部辅助逻辑 */
             char elibbufs[ZAN_LINK_MAX_LIBS][160]; int neb = 0;
             for (int ei = 0; ei < extra_link_lib_count; ei++) {
                 if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL || neb >= ZAN_LINK_MAX_LIBS)
@@ -8868,12 +8028,7 @@ int main(int argc, char **argv) {
             argv[a] = NULL;
             char lld_path[1200];
             snprintf(lld_path, sizeof(lld_path), "%s\\ld.lld.exe", exe_dir);
-            /* GNU ld when the small-object allocator is linked: lld's --wrap
-             * on PE/COFF rewrites the import slots into __wrap aliases that
-             * never engage the wrap and kill the process before main
-             * (silent exit 127 at load). lld stays the default otherwise --
-             * GNU ld mishandles large non-fast-alloc links (REL32
-             * overflow). */
+            /* 内部辅助实现 */
             const char *linker = rt_mem_obj ? ld_path
                                  : (zan_utf8_get_file_attributes(lld_path) != INVALID_FILE_ATTRIBUTES
                                     ? lld_path : ld_path);
@@ -8886,9 +8041,7 @@ int main(int argc, char **argv) {
             link_ret = (int)zan_utf8_spawnv(_P_WAIT, linker, argv);
         } else {
             char link_cmd[4096];
-            /* 256 MB stack: the self-hosted compiler recurses deeply;
-             * without it a clang-linked zanc overflows the default 1 MB
-             * Windows stack when self-compiling. */
+            /* 内部辅助逻辑 */
             snprintf(link_cmd, sizeof(link_cmd),
                      "clang --target=x86_64-w64-windows-gnu \"%s\" -o \"%s\" "
                      "-Wl,--stack,268435456%s",
@@ -9010,13 +8163,11 @@ int main(int argc, char **argv) {
 #endif
         }
         for (int di = 0; di < zan_lib_ndirs; di++) {
-            /* -L for link-time resolution, -rpath so the exe loads the
-             * shared library without LD_LIBRARY_PATH. */
+            /* 内部辅助逻辑 */
             cmd_appendf(link_cmd, sizeof(link_cmd),
                      " -L\"%s\" -Wl,-rpath,\"%s\"", zan_lib_dirs[di], zan_lib_dirs[di]);
         }
-        /* Runtime search path relative to the exe: a --publish build with
-         * driver dylibs beside it stays self-contained after relocation. */
+        /* 内部辅助逻辑 */
         if (used_driver_count > 0) {
 #ifdef __APPLE__
             cmd_appendf(link_cmd, sizeof(link_cmd),
@@ -9026,9 +8177,7 @@ int main(int argc, char **argv) {
                      " -Wl,-rpath,'$ORIGIN'");
 #endif
         }
-        /* Windows-only system import libraries have no Unix counterpart
-         * (zan_gui provides the functionality cross-platform); skip them,
-         * mirroring the CRT skip on the Windows link path. */
+        /* 内部辅助逻辑 */
         static const char *const win_only_libs[] = {
             "user32", "gdi32", "kernel32", "advapi32", "shell32", "ole32",
             "oleaut32", "comdlg32", "comctl32", "gdiplus", "dwmapi", "shcore",
@@ -9042,8 +8191,7 @@ int main(int argc, char **argv) {
                     memcmp(win_only_libs[wi], lib, lib_len) == 0) { skip = 1; break; }
             }
             if (skip) continue;
-            /* Shared normalization: strip a leading "lib", drop implicit
-             * CRT/libc/libm pseudo-libs (libm already via -lm). */
+            /* 内部辅助逻辑 */
             int name_len;
             const char *name = zan_dllimport_lname(lib, lib_len, &name_len);
             if (!name) continue;
@@ -9077,8 +8225,7 @@ int main(int argc, char **argv) {
             cmd_appendf(link_cmd, sizeof(link_cmd), " %s",
                      static_driver_libs[li]);
         }
-        /* Caller-supplied link inputs; --subsystem is Windows-only and
-         * ignored here. */
+        /* Caller-supplied link inputs; --subsystem is Windows-only and ignored here */
         for (int di = 0; di < extra_lib_path_count; di++) {
             cmd_appendf(link_cmd, sizeof(link_cmd),
                      " -L\"%s\" -Wl,-rpath,\"%s\"", extra_lib_paths[di], extra_lib_paths[di]);
@@ -9089,10 +8236,7 @@ int main(int argc, char **argv) {
         for (int ei = 0; ei < extra_link_lib_count; ei++) {
             cmd_appendf(link_cmd, sizeof(link_cmd), " -l%s", extra_link_libs[ei]);
         }
-        /* libm again, last: the first -lm sits before the driver archives,
-         * and ld only scans an archive for symbols already needed, so a
-         * driver pulled in after it (rasterizer sqrt/atan2) would leave
-         * those references unresolved. */
+        /* 内部辅助实现 */
         {
             cmd_appendf(link_cmd, sizeof(link_cmd), " -lm");
         }
@@ -9118,14 +8262,7 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* Bundle native driver runtime libraries: copy each used shared
-         * driver's files next to the executable (all Windows builds and
-         * publishes). The file set comes from an optional
-         * "<driver_dir>/<driver>.bundle" manifest (one file name per line,
-         * e.g. libpq with its OpenSSL DLLs); absent a manifest, common
-         * default file names are tried. A linked-static driver is not
-         * copied; drivers without a static archive and dlopen'd drivers
-         * still are. */
+        /* 内部辅助实现 */
         if ((publish_mode || target.os == ZAN_OS_WINDOWS) &&
             used_driver_count > 0) {
             char outdir[1024];
@@ -9148,9 +8285,7 @@ int main(int argc, char **argv) {
                 snprintf(drv, sizeof(drv), "%.*s",
                          used_driver_len[d], used_drivers[d]);
 
-                /* Candidate runtime file names for this driver: one entry per
-                 * file in its dependency closure (e.g. libpq ships libpq plus
-                 * its OpenSSL and Kerberos dylibs -> 8 files). */
+                /* 内部辅助逻辑 */
                 char cands[64][128]; int ncand = 0;
                 char manifest[1200];
                 snprintf(manifest, sizeof(manifest), "%s/%s.bundle", driver_dir, drv);
@@ -9174,13 +8309,7 @@ int main(int argc, char **argv) {
                             continue;
                         {
                             if (strncmp(entry, "@driver/", 8) == 0) {
-                                /* A dependency on another driver: publish
-                                 * that driver's runtime files too, resolved
-                                 * through the registry to its owning module
-                                 * (libpq needs the ssl and crypto drivers
-                                 * owned by Cryptography). Never a directory
-                                 * scan: a lib basename has exactly one
-                                 * registered owner. */
+                                /* 内部辅助实现 */
                                 const char *dep = entry + 8;
                                 size_t dl = strlen(dep);
                                 if (dl == 0 || dl >= 64 ||
@@ -9254,9 +8383,7 @@ int main(int argc, char **argv) {
                     }
                 }
                 if (copied == 0 && used_driver_runtime[d]) {
-                    /* A dlopen'd driver is optional by construction: the
-                     * module falls back to a system install, so an unstaged
-                     * bundle is a note, not a warning. */
+                    /* 内部辅助逻辑 */
                     if (!quiet)
                         printf("  note: driver '%s' not bundled (%s is empty); the "
                                "program will use a system-installed %s\n",
@@ -9278,17 +8405,11 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* APK packaging (Android GUI one-shot): pack the linked libmain.so
-         * and the bundled driver .so files into a NativeActivity-shell APK
-         * and sign it. No Android SDK needed: the manifest template/dex/
-         * arsc/apksigner.jar ship beside zanc. */
+        /* APK packaging (Android GUI one-shot): pack the linked libmain */
         if (apk_path) {
             const char *abi = (target.arch == ZAN_ARCH_AARCH64)
                               ? "arm64-v8a" : "x86_64";
-            /* Default package/label from the input file name unless set.
-             * 256 bytes to match proj_android_package/label: over-long CLI
-             * values fail loudly instead of truncating into a wrong-but-
-             * plausible manifest. */
+            /* Default package/label from the input file name unless set */
             char pkg[256], lbl[256];
             if (apk_package) {
                 if (strlen(apk_package) >= sizeof(pkg)) {
@@ -9447,10 +8568,7 @@ int main(int argc, char **argv) {
     zan_arena_free(arena);
     free(source);
 #ifdef _WIN32
-    /* ExitProcess skips CRT teardown, silently dropping any bytes still in
-     * the stdio buffers; exit() would flush but defeats the point (skipping
-     * the slow CRT teardown of the compiler's heaps). Flush by hand and
-     * keep ExitProcess. */
+    /* 内部辅助实现 */
     fflush(stdout);
     fflush(stderr);
     ExitProcess(0);

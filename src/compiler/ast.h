@@ -86,8 +86,7 @@ typedef enum {
     /* named call argument: `F(b: 2)` */
     AST_NAMED_ARG,
 
-    /* member collection initializer: `new C { Items = { a, b } }` -- the
-     * member named `name` receives Add(item) per element (C# semantics) */
+    /* 内部辅助实现 */
     AST_COLL_INIT,
 
     AST_ATTRIBUTE,
@@ -97,8 +96,8 @@ typedef enum {
     AST_WHERE_CLAUSE, /* generic constraint: where T : C1, C2 */
     AST_YIELD_STMT,   /* yield return expr; / yield break; (desugared in parser) */
     AST_LOCK_STMT,    /* lock (expr) body */
-    AST_CHECKED_STMT, /* checked { body } / unchecked { body }: an overflow-
-                       * checking context wrapper (checked/unchecked field) */
+    AST_CHECKED_STMT, 
+/* checked { body } / unchecked { body }: an overflow- checking context wrapper (checked/unchecked field) */
     AST_GOTO_STMT,    /* goto label; */
     AST_LABEL_STMT,   /* label: */
     AST_QUERY_EXPR,   /* from x in src where c ... select e */
@@ -120,9 +119,7 @@ typedef struct {
     int capacity;
 } zan_ast_list_t;
 
-/* Optional extension payload for cold method/ctor declaration attributes
- * (DllImport, where generic constraints, constructor base args).
- * Stored via pointer on AST_METHOD_DECL to keep common AST nodes small. */
+/* 内部辅助实现 */
 typedef struct {
     zan_istr_t extern_lib;        /* DllImport library name, {NULL,0} if none */
     zan_istr_t *entry_point;      /* DllImport entry point override, NULL if none */
@@ -130,9 +127,7 @@ typedef struct {
     zan_ast_list_t base_args;     /* constructor `: base(...)` argument exprs */
 } zan_method_ext_t;
 
-/* Declaration metadata (attributes, enclosing namespace, unmangled name,
- * and file-level usings) attached via pointer to top-level/member declarations.
- * 99% of AST nodes (expressions, statements, literals) keep this NULL. */
+/* 内部辅助实现 */
 typedef struct {
     zan_ast_list_t attributes;
     zan_istr_t ns_name;
@@ -144,14 +139,10 @@ struct zan_ast_node {
     zan_ast_kind_t kind;
     zan_loc_t loc;
 
-    /* Integer literal suffix (AST_INT_LITERAL only): 0=none, 1=L/l (long),
-     * 2=U/u (uint), 3=UL/LU in either case (ulong). */
+    /* Integer literal suffix (AST_INT_LITERAL only): 0=none, 1=L/l (long), 2=U/u (uint), 3=UL/LU in either case (ulong) */
     uint8_t lit_suffix;
 
-    /* Integer literal radix (AST_INT_LITERAL only): 2/8/10/16. Non-decimal
-     * unsuffixed literals up to 0xFFFFFFFF type as int (two's-complement
-     * wrap), so `0xFFRRGGBB` ARGB colors compare equal to the wrapped int
-     * field values they assign to. */
+    /* Integer literal radix (AST_INT_LITERAL only): 2/8/10/16 */
     uint8_t lit_radix;
     /* True for declarations supplied by the auto-included standard library. */
     unsigned char from_stdlib;
@@ -177,14 +168,9 @@ struct zan_ast_node {
         /* binary / assignment */
         struct {
             zan_token_kind_t op;
-            /* AST_ASSIGNMENT only: base operator of a desugared `lhs op= rhs`
-             * (TK_EOF for a plain assignment). The parser reuses the target
-             * subtree as the value-side operand; irgen keys single-evaluation
-             * rewriting on this. */
+            /* AST_ASSIGNMENT only: base operator of a desugared `lhs op= rhs` (TK_EOF for a plain assignment) */
             zan_token_kind_t compound_base;
-            /* AST_BINARY only: 1 when the expression was written inside
-             * `checked(...)` and must trap on integer overflow. (0 = leave
-             * the context decide.) */
+            /* AST_BINARY only: 1 when the expression was written inside `checked( */
             int checked;
             zan_ast_node_t *left;
             zan_ast_node_t *right;
@@ -227,24 +213,17 @@ struct zan_ast_node {
         /* new expression */
         struct {
             zan_ast_node_t *type;
-            /* `FactoryCall(...) { Members = { ... } }`: the callee the
-             * initializer continues. NULL for `new Type(...) { ... }`,
-             * which builds from `type`. */
+            /* `FactoryCall( */
             zan_ast_node_t *call_init;
             zan_ast_list_t args;
-            /* Member-writes of an object initializer on a postfix generic
-             * type reference (`List<int> { ... }`): the checker/irgen merge
-             * these with the constructor args of the same NEW_EXPR. Empty
-             * for every other form, which stores its initializer entries
-             * directly in args. */
+            /* Member-writes of an object initializer on a postfix generic type reference (`List<int> { */
             zan_ast_list_t arg_inits;
             bool is_array;       /* new Type[size] */
             bool array_init;     /* new Type[] { a, b } -- args are elements */
-            int array_rank;      /* number of dimension sizes at args start
-                                  * (0 = no dims: plain object or unsized init) */
-            bool list_copy;      /* new List<T>(src): copy-construct from
-                                  * another List (checker-flagged; without it
-                                  * args were silently initializer items) */
+            int array_rank;      
+/* number of dimension sizes at args start (0 = no dims: plain object or unsized init) */
+            bool list_copy;      
+/* new List<T>(src): copy-construct from another List (checker-flagged; without it args were silently initializer items) */
         } new_expr;
 
         /* cast: (Type)expr */
@@ -280,9 +259,7 @@ struct zan_ast_node {
         zan_ast_list_t elems;
     } tuple_type;
 
-    /* deconstruction: var (a, b) = rhs;  /  (int a, string b) = rhs;
-     * names[i] is the variable name, types[i] its declared type (NULL for a
-     * `var` element). Lowered to field reads of the initializer's ItemN. */
+    /* 内部辅助实现 */
     struct {
         zan_ast_list_t names;
         zan_ast_list_t types;
@@ -368,9 +345,7 @@ struct zan_ast_node {
             zan_ast_list_t arms;
         } switch_expr;
 
-        /* with expression: `recv with { field = value, ... }` — record copy.
-         * Assignments are AST_ASSIGNMENT nodes whose left is an
-         * AST_IDENTIFIER naming a record field. */
+        /* with expression: `recv with { field = value, */
         struct {
             zan_ast_node_t *expr;
             zan_ast_list_t assigns;
@@ -419,14 +394,13 @@ struct zan_ast_node {
             zan_ast_list_t members;
             uint32_t modifiers;
             bool is_c_layout;  /* [StructLayout(LayoutKind.Sequential)] for C ABI */
-            bool is_explicit_layout; /* [StructLayout(LayoutKind.Explicit)]:
-                                      * every field carries [FieldOffset(n)] */
+            bool is_explicit_layout; 
+/*
+ * [StructLayout(LayoutKind.Explicit)]:
+ * every field carries [FieldOffset(n)]
+ */
             zan_ast_list_t *where_clauses; /* AST_WHERE_CLAUSE generic constraints (NULL if none) */
-            /* Set by hoist_nested_types: the type this declaration was nested
-             * in before being lifted to unit level. The binder links the
-             * symbol back into the host's member list so `Host.Nested`
-             * resolves like the source wrote it. Delegate decls share the
-             * method_decl union and carry no stamp. */
+            /* Set by hoist_nested_types: the type this declaration was nested in before being lifted to unit level */
             zan_ast_node_t *nested_host;
         } type_decl;
 
@@ -438,9 +412,8 @@ struct zan_ast_node {
             zan_ast_list_t type_params;
             zan_ast_node_t *body;
             uint32_t modifiers;
-            bool is_variadic;        /* [DllImport(..., Variadic = true)]: the C
-                                      * callee is varargs, so a call may pass more
-                                      * arguments than the declared parameters */
+            bool is_variadic;        
+/* [DllImport( */
             bool has_base_init;     /* constructor declared a `: base(...)` initializer */
             bool has_this_init;
             bool is_task_return;    /* declared Task/Task<T>/ValueTask<T> before async desugaring */
@@ -453,28 +426,14 @@ struct zan_ast_node {
             zan_ast_node_t *type;
             zan_ast_node_t *initializer;
             uint32_t modifiers;
-            /* Property accessor bodies (AST_PROPERTY_DECL only). NULL means an
-             * automatic accessor (`{ get; }` / `{ set; }`) backed by the field
-             * slot; a block/expression body means the read/write lowers to the
-             * synthesized get_<name>/set_<name> method. Plain fields keep both
-             * NULL. */
+            /* Property accessor bodies (AST_PROPERTY_DECL only) */
             zan_ast_node_t *getter_body;
             zan_ast_node_t *setter_body;
-            /* Whether the corresponding accessor keyword was present at all
-             * (`get`/`set` in the `{ ... }` list). `{ get; }` has has_setter
-             * false and is read-only; `{ get; set; }` has both true even though
-             * the automatic setter's body is NULL. `has_init` marks an `init`
-             * accessor (`{ get; init; }`): a setter that is only writable while
-             * the object is being initialized (object initializer / ctor). Its
-             * body (if any) is stored in setter_body and lowers to set_<name>,
-             * same as `set`. */
+            /* 检查是否the corresponding accessor keyword was present at all (`get`/`set` in the `{ */
             bool has_getter;
             bool has_setter;
             bool has_init;
-            /* `this[...]` index parameter list; NULL unless the property is
-             * an indexer. Every indexer property is named "Item", so the
-             * binder exempts indexer/indexer name collisions and lets the
-             * synthesized op_index signature check catch true duplicates. */
+            /* 内部辅助实现 */
             zan_ast_list_t *indexer_params;
         } field_decl;
 
@@ -495,30 +454,28 @@ struct zan_ast_node {
             zan_ast_node_t *body;
         } lock_stmt;
 
-        /* checked { body } / unchecked { body }: sets the overflow-checking
-         * context the body's integer + - * emit under (AST_CHECKED_STMT) */
+        /* 内部辅助实现 */
         struct {
             zan_ast_node_t *body;
             bool checked;
         } checked_stmt;
 
-        /* from var in source [clauses]* [group e by k [into g]]? [select p]
-         * -- sub-clauses (where/let/orderby/join) sit in `clauses` in source
-         * order; group is a single trailing clause (its `into` makes the
-         * range variable that `select` sees a Grouping). */
+        /* 内部辅助实现 */
         struct {
             zan_istr_t var;
             zan_ast_node_t *source;
-            zan_ast_list_t clauses; /* AST_QUERY_WHERE/LET/ORDERBY/JOIN, in
-                                     * source order */
+            zan_ast_list_t clauses; 
+/*
+ * AST_QUERY_WHERE/LET/ORDERBY/JOIN, in
+ * source order
+ */
             zan_ast_node_t *group_expr; /* `group <expr> by <key>` element */
             zan_ast_node_t *group_key;  /* group key expression */
             zan_istr_t group_into;      /* `into <name>` var (empty = none) */
             zan_ast_node_t *select;
         } query;
 
-        /* sub-clause payloads (AST_QUERY_WHERE, AST_QUERY_LET,
-         * AST_QUERY_ORDERBY, AST_QUERY_JOIN) */
+        /* sub-clause payloads (AST_QUERY_WHERE, AST_QUERY_LET, AST_QUERY_ORDERBY, AST_QUERY_JOIN) */
         struct {
             zan_istr_t name;        /* let v / join y / into g var name */
             zan_ast_node_t *expr;   /* where cond, let value or orderby key */
@@ -546,17 +503,13 @@ struct zan_ast_node {
             int is_out;
         } ref_arg;
 
-        /* named call argument: `F(b: 2)` -- the arg name and its expression.
-         * Stored in the call's args list; irgen reorders it to the parameter
-         * position once the callee symbol is known. */
+        /* named call argument: `F(b: 2)` -- the arg name and its expression */
         struct {
             zan_istr_t name;
             zan_ast_node_t *expr;
         } named_arg;
 
-        /* member collection initializer: `new C { Items = { a, b } }` --
-         * parsed inside an object initializer; irgen lowers it to Add(item)
-         * per element on the collection member `name`. */
+        /* 内部辅助实现 */
         struct {
             zan_istr_t name;
             zan_ast_list_t items;
@@ -568,13 +521,7 @@ struct zan_ast_node {
             zan_ast_list_t type_args;
             bool is_nullable;
             bool is_array;
-            /* Array shape beyond the boolean: `array_rank` is 1 for `[]`,
-             * 2 for `[,]`, 3 for `[,,]` ... A *jagged* declaration wraps the
-             * inner declaration: `int[][]` parses as an outer node whose
-             * array_element points at the `int[]` node. C# folds the
-             * leftmost rank specifier as the OUTERMOST array, so `int[][,]`
-             * is a 1D array of `int[,]`. NULL array_element means the node
-             * itself is the element (plain `int[]` / `int[,]`). */
+            /* Array shape beyond the boolean: `array_rank` is 1 for `[]`, 2 for `[,]`, 3 for `[,,]` */
             int array_rank;
             zan_ast_node_t *array_element;
             /* Scope-sensitive binder memo; AST_TYPE_REF only. */
@@ -613,9 +560,7 @@ struct zan_ast_node {
         /* string interpolation: $"text {expr} text" */
         struct {
             zan_ast_list_t parts; /* alternating STRING_LITERAL and expr nodes */
-            /* Parallel to the expr parts: the format specifier of each hole
-             * (e.g. "D4" in {v:D4}) as an AST_STRING_LITERAL, or NULL when the
-             * hole has none. Index i corresponds to the i-th expr part. */
+            /* Parallel to the expr parts: the format specifier of each hole (e */
             zan_ast_list_t formats;
         } string_interp;
     };

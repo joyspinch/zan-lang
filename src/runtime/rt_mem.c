@@ -1,41 +1,10 @@
-/* rt_mem.c -- small-object allocator for produced Zan programs.
- *
- * ARC programs allocate constantly: every string, list node, object and
- * coroutine frame is a separate heap block with a very short life. musl's
- * mallocng (the allocator behind the bundled static sysroot) spends a large
- * share of a request in get_meta / alloc_slot / nontrivial_free for exactly
- * that pattern -- an HTTP benchmark showed ~23% of user CPU inside the
- * allocator.
- *
- * This object front-ends malloc/free/calloc/realloc with a size-class cache:
- *   - blocks up to ZAN_MEM_MAX_SMALL come from per-thread free lists carved
- *     out of 1 MiB slabs, so an allocation pops a pointer and a free pushes
- *     one -- no metadata search, no coalescing, no locks;
- *   - anything larger falls through to the libc allocator.
- *
- * Each block records its owning thread cache in its header, and a block freed
- * by another thread goes back to that owner (mimalloc's thread-free list)
- * instead of migrating into the freeing thread's list. The producer/consumer
- * split a server naturally has -- an IO worker allocates the buffer, another
- * worker frees it after the response -- would otherwise drift every block one
- * way and make each thread's cache grow without bound while the owner keeps
- * carving fresh slab space.
- *
- * It is linked with `ld --wrap=malloc,free,calloc,realloc`, so it also sees
- * allocations made inside libc: a pointer that did not come from one of our
- * slabs is handed straight back to the real allocator, decided by an
- * address-range test (never by reading memory we do not own).
- *
- * Slabs are never unmapped: freed blocks stay in their class list and are
- * reused, which is what a long-running server wants.
- */
+/* 内部辅助实现 */
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0601   /* Windows 7+: FlsAlloc and its thread-exit callback */
 #endif
 
-/* MAP_ANONYMOUS is an extension: a strict -std=c11 glibc build hides it
- * unless the default feature set is requested explicitly. */
+/* 内部辅助逻辑 */
 #if (defined(__linux__) || defined(__unix__)) && !defined(_DEFAULT_SOURCE)
 #define _DEFAULT_SOURCE 1
 #endif
@@ -69,13 +38,7 @@ void *__real_realloc(void *p, size_t n);
 #define ZAN_MEM_MAX_SMALL   2048u
 #define ZAN_MEM_SLAB        (1u << 20)      /* 1 MiB */
 
-/* 16-byte header keeps payloads 16-byte aligned; a freed block stores its
- * free-list link in the payload itself (every class is >= 16 bytes). `owner`
- * is the thread cache the block was carved for, so a cross-thread free can
- * hand it back. The compiler emits the same-size object header (refcount/site
- * at obj-16/-8, see ZAN_OBJ_HDR_SIZE in ../common/zan_abi.h) in front of every
- * class instance, so the allocator header must stay 16 bytes for payloads to keep
- * that object header 16-byte aligned. */
+/* 内部辅助实现 */
 typedef struct {
     uint32_t magic;
     uint32_t cls;
@@ -102,45 +65,26 @@ static const uint16_t k_class_size[] = {
 static unsigned char g_size_class[ZAN_MEM_MAX_SMALL + 1];
 static int g_class_ready;
 
-/* Slab bases live in a lock-free open-addressing set: slabs are 1 MiB
- * aligned, so free() masks the pointer down to its slab base and looks it up.
- * Entries are written once (under the slab lock) and read atomically, so a
- * concurrent lookup never sees a half-published table. */
+/* 内部辅助实现 */
 #define ZAN_MEM_SET_SIZE  (1u << 14)
 #define ZAN_MEM_SET_MASK  (ZAN_MEM_SET_SIZE - 1u)
 static uintptr_t g_slab_set[ZAN_MEM_SET_SIZE];
 static size_t g_slab_count;
 
-/* Slabs mapped so far. A cross-thread free that did not come back to the
- * block's owner shows up here: the owner keeps carving fresh slab space while
- * the freeing thread hoards the blocks, so the count climbs with the traffic
- * instead of settling (tests/runtime/rt_mem_remote_test.c asserts it). */
+/* Slabs mapped so far */
 size_t zan_mem_slabs(void) {
     return __atomic_load_n(&g_slab_count, __ATOMIC_RELAXED);
 }
 
-/* One cache per thread that has allocated: the class free lists and the bump
- * region are touched only by the owning thread, `remote` only through atomics.
- *
- * A cache outlives its thread. Nothing may free it: another thread can be
- * about to push a block onto `remote` (it read `owner` out of a block header
- * that is still valid), and the blocks carved from it stay live in whatever
- * data structure holds them. Retired caches go on a global list and are
- * adopted by the next thread that needs one, so a thread-per-request program
- * reuses caches instead of accumulating one per thread. */
-/* Foreign-free stripe count: 8 keeps 32-worker shapes off each other's
- * stripe line while drain only walks 8 heads. Power of two (mask select). */
+/* 内部辅助实现 */
+/* 内部辅助逻辑 */
 #define ZAN_MEM_REMOTE_STRIPES 8
 
 typedef struct zan_mem_cache {
     void  *free_list[ZAN_MEM_NCLASS];   /* owner-only */
     char  *bump;                        /* owner-only */
     char  *bump_end;                    /* owner-only */
-    /* Foreign-free stacks, striped to separate cache lines: every foreign
-     * free CASes one stripe head, and a block owner freed by many workers
-     * (a 10k-spawn x 32-worker batch) otherwise CAS-pounds one pointer and
-     * loses to the platform heap. A freer with its own cache always maps to
-     * the same stripe, so the common case is one writer per line. */
+    /* 内部辅助实现 */
     struct {
         void *head;
         char pad[64 - sizeof(void *)];  /* one stripe per cache line */
@@ -151,29 +95,16 @@ typedef struct zan_mem_cache {
 /* Retired caches waiting to be adopted. */
 static zan_mem_cache *g_cache_pool;
 
-/* Round-robin stripe selector for cache-less freeing threads (CRT threads
- * that never allocated through us). Relaxed: any spread will do. */
+/* 内部辅助逻辑 */
 static unsigned g_remote_rr;
 
-/* On MinGW (Windows) __thread is emulated by libgcc's emutls, whose first
- * access runs pthread_once(emutls_init) -- and emutls_init calls malloc. A
- * malloc reached from inside __wrap_malloc re-enters __emutls_get_address on
- * the same not-yet-initialized variable and spins forever on the once lock
- * (a real deadlock, observed with TDM-GCC 10.3 at CRT startup). So Windows
- * gets the cache pointer from the Win32 fiber-local API instead of from
- * __thread: FlsAlloc/FlsGetValue never allocate on the get path, and the
- * FlsAlloc callback is the thread-exit hook that retires the cache.
- *
- * Elsewhere __thread is a plain register-relative load, and a pthread key
- * carrying no value serves only as the thread-exit hook. */
+/* 内部辅助实现 */
 static void zan_mem_retire(zan_mem_cache *c);
 static void zan_mem_drain_remote(zan_mem_cache *c);
 
 #if defined(_WIN32)
 static DWORD g_fls = FLS_OUT_OF_INDEXES;
-/* 0 = not allocated, 1 = allocating on this thread, 2 = usable, 3 = the
- * process is out of FLS slots. Same shape as the pthread key below and for the
- * same reason: FlsAlloc may allocate, and that malloc re-enters this lookup. */
+/* 内部辅助逻辑 */
 static int g_fls_state;
 static void WINAPI zan_mem_fls_cb(void *p) {
     if (p) zan_mem_retire((zan_mem_cache *)p);
@@ -183,9 +114,7 @@ static void WINAPI zan_mem_fls_cb(void *p) {
 #include <sched.h>
 static __thread zan_mem_cache *t_cache;
 static pthread_key_t g_exit_key;
-/* 0 = not created, 1 = being created on this thread, 2 = usable. Never held
- * across the slab lock: pthread_key_create allocates on some libcs, and that
- * malloc comes back through __wrap_malloc into the cache lookup. */
+/* 0 = not created, 1 = being created on this thread, 2 = usable */
 static int g_exit_key_state;
 static void zan_mem_thread_exit(void *p) {
     t_cache = NULL;
@@ -195,10 +124,7 @@ static void zan_mem_thread_exit(void *p) {
 
 static volatile int g_slab_lock;
 
-/* Bounded TTAS backoff, same shape as rt_timer.c's live_lock:
- * pause-spin a few rounds, then hand the core back -- a preempted holder
- * otherwise costs every contender a full timeslice, and non-x86 targets
- * have no pause at all. */
+/* Bounded TTAS backoff, same shape as rt_timer */
 static void zan_mem_backoff(int spins) {
     if (spins < 64) {
 #if defined(__i386__) || defined(__x86_64__)
@@ -231,12 +157,7 @@ static void zan_mem_build_classes(void) {
     __atomic_store_n(&g_class_ready, 1, __ATOMIC_RELEASE);
 }
 
-/* Build the size-class table once. g_class_ready is a plain int in the
- * original code, and zan_mem_small can be reached from any thread the
- * scheduler runs (coroutine workers and Thread.Start bodies alike), so two
- * threads could race on it. The table itself is deterministic, but the
- * unsynchronized read/write is a C data race; guard it with the slab lock and
- * an atomic flag. */
+/* Build the size-class table once */
 static void zan_mem_ensure_classes(void) {
     if (__atomic_load_n(&g_class_ready, __ATOMIC_ACQUIRE)) return;
     zan_mem_lock();
@@ -259,9 +180,7 @@ static int zan_mem_owns(const void *p) {
         if (v == base) return 1;
         if (v == 0) return 0;
     }
-    /* The probe chain is full.  This is extremely rare, but returning 0 would
-     * hand a slab block to libc free.  Fall back to a full scan so ownership
-     * is never misreported. */
+    /* The probe chain is full */
     for (unsigned n = 0; n < ZAN_MEM_SET_SIZE; n++) {
         uintptr_t v = __atomic_load_n(&g_slab_set[n], __ATOMIC_ACQUIRE);
         if (v == base) return 1;
@@ -269,8 +188,7 @@ static int zan_mem_owns(const void *p) {
     return 0;
 }
 
-/* The calling thread's cache, created on first use. Allocated with the real
- * allocator: going through __wrap_malloc would recurse into this function. */
+/* The calling thread's cache, created on first use */
 static zan_mem_cache *zan_mem_cache_get(void) {
 #if defined(_WIN32)
     int fst = __atomic_load_n(&g_fls_state, __ATOMIC_ACQUIRE);
@@ -278,8 +196,7 @@ static zan_mem_cache *zan_mem_cache_get(void) {
                                                 __ATOMIC_ACQ_REL,
                                                 __ATOMIC_ACQUIRE)) {
         DWORD idx = FlsAlloc(zan_mem_fls_cb);
-        /* Plain loads/stores on g_fls would be a C data race: the winning
-         * thread writes it once and every other thread reads it after. */
+        /* 内部辅助逻辑 */
         __atomic_store_n(&g_fls, idx, __ATOMIC_RELEASE);
         __atomic_store_n(&g_fls_state, idx == FLS_OUT_OF_INDEXES ? 3 : 2,
                          __ATOMIC_RELEASE);
@@ -298,10 +215,7 @@ static zan_mem_cache *zan_mem_cache_get(void) {
                                                __ATOMIC_ACQ_REL,
                                                __ATOMIC_ACQUIRE)) {
         int ok = pthread_key_create(&g_exit_key, zan_mem_thread_exit) == 0;
-        /* 3 = key unavailable, permanently. Handing out a cache without the
-         * exit hook would strand it -- and every block sitting in its free
-         * lists -- when the thread dies; cache-less mode is correct, just
-         * slower (the Windows side lands there on FlsAlloc failure too). */
+        /* 3 = key unavailable, permanently */
         __atomic_store_n(&g_exit_key_state, ok ? 2 : 3, __ATOMIC_RELEASE);
         st = ok ? 2 : 3;
     } else {
@@ -335,9 +249,7 @@ static zan_mem_cache *zan_mem_cache_get(void) {
     return c;
 }
 
-/* Move everything foreign threads have freed back into the class free lists.
- * One exchange takes the whole stack, so the owner pays a single atomic no
- * matter how many blocks arrived. */
+/* Move everything foreign threads have freed back into the class free lists */
 static void zan_mem_drain_remote(zan_mem_cache *c) {
     for (int s = 0; s < ZAN_MEM_REMOTE_STRIPES; s++) {
         void *p = __atomic_exchange_n(&c->remote[s].head, NULL, __ATOMIC_ACQUIRE);
@@ -354,10 +266,7 @@ static void zan_mem_drain_remote(zan_mem_cache *c) {
     }
 }
 
-/* Hand a cache back for adoption when its thread exits. Its blocks and bump
- * region stay exactly as they are -- the next thread to adopt it continues
- * from there -- and foreign frees that are still in flight land on `remote`
- * for that thread to drain. */
+/* Hand a cache back for adoption when its thread exits */
 static void zan_mem_retire(zan_mem_cache *c) {
     zan_mem_drain_remote(c);
     zan_mem_lock();
@@ -366,8 +275,7 @@ static void zan_mem_retire(zan_mem_cache *c) {
     zan_mem_unlock();
 }
 
-/* Drain remote frees across all retired caches in the pool and harvest a free
- * block if available, adopting the rest of that class free list into `c`. */
+/* 内部辅助逻辑 */
 static void *zan_mem_harvest_free_block(zan_mem_cache *c, int cls) {
     if (!g_cache_pool) return NULL;
     zan_mem_lock();
@@ -385,8 +293,7 @@ static void *zan_mem_harvest_free_block(zan_mem_cache *c, int cls) {
     return NULL;
 }
 
-/* Adopt uncarved bump space from a retired cache in the pool if c's own bump
- * region cannot satisfy `need`. */
+/* 内部辅助逻辑 */
 static int zan_mem_adopt_retired_bump(zan_mem_cache *c, size_t need) {
     if (!g_cache_pool) return 0;
     zan_mem_lock();
@@ -404,9 +311,7 @@ static int zan_mem_adopt_retired_bump(zan_mem_cache *c, size_t need) {
     return 0;
 }
 
-/* Publish a slab base in the ownership set and hand it to `c` as its bump
- * region. Returns 0 when the set is full, and the caller then gives the
- * mapping back. */
+/* Publish a slab base in the ownership set and hand it to `c` as its bump region */
 static int zan_mem_publish_slab(zan_mem_cache *c, uintptr_t base) {
     zan_mem_lock();
     unsigned i = zan_mem_hash(base);
@@ -426,15 +331,10 @@ static int zan_mem_publish_slab(zan_mem_cache *c, uintptr_t base) {
     return 1;
 }
 
-/* Grab a fresh 1 MiB-aligned slab for this thread's bump region. Returns 0
- * when it cannot, and callers then fall back to the libc allocator. */
+/* Grab a fresh 1 MiB-aligned slab for this thread's bump region */
 static int zan_mem_new_slab(zan_mem_cache *c) {
 #if defined(_WIN32)
-    /* VirtualAlloc has no equivalent of trimming a mapping, so reserve twice
-     * the slab, commit the aligned megabyte inside it and leave the rest of
-     * the reservation alone: address space is not the scarce resource here,
-     * and the alignment is what makes a pointer's slab base computable with a
-     * mask in zan_mem_owns(). */
+    /* 内部辅助实现 */
     size_t span = (size_t)ZAN_MEM_SLAB * 2;
     char *raw = (char *)VirtualAlloc(NULL, span, MEM_RESERVE, PAGE_NOACCESS);
     if (!raw) return 0;
@@ -479,9 +379,7 @@ static void *zan_mem_small(size_t n) {
     int cls = g_size_class[n];
     void *p = c->free_list[cls];
     if (!p) {
-        /* Nothing local left in this class, so collect the foreign frees
-         * before taking more slab space: without this a producer thread would
-         * keep carving new memory while its blocks pile up on `remote`. */
+        /* 内部辅助逻辑 */
         zan_mem_drain_remote(c);
         p = c->free_list[cls];
     }
@@ -490,15 +388,11 @@ static void *zan_mem_small(size_t n) {
         p = zan_mem_harvest_free_block(c, cls);
     }
     if (p) {
-        /* If p was found in c->free_list, advance the list. If it was returned
-         * by zan_mem_harvest_free_block, c->free_list was already populated with
-         * the tail, and p is the detached head. */
+        /* If p was found in c->free_list, advance the list */
         if (p == c->free_list[cls]) {
             c->free_list[cls] = *(void **)p;
         }
-        /* A popped block is still marked FREED from its last free: reset the
-         * header so the next free of this live block is not mistaken for a
-         * double free (the guard keys on the FREED marker). */
+        /* 内部辅助逻辑 */
         zan_mem_hdr_t *h = (zan_mem_hdr_t *)((char *)p - ZAN_MEM_HDR);
         __atomic_store_n(&h->cls, (uint32_t)cls, __ATOMIC_RELAXED);
         __atomic_store_n(&h->owner, c, __ATOMIC_RELAXED);
@@ -528,20 +422,10 @@ void *__wrap_malloc(size_t n) {
     return __real_malloc(n);
 }
 
-/* Validate the allocator header in front of a slab block. Returns 0 with
- * *cls set when the block is a live block start; -1 for anything the
- * allocator does not own (not a block start: callers leave it alone); and
- * aborts on a block that was already freed or whose header is garbage --
- * both are aliasing bugs under ARC, and the abort is the detection.
- * __wrap_free and __wrap_realloc share this so their behavior can never
- * drift apart. */
+/* Validate the allocator header in front of a slab block */
 static int zan_mem_hdr_check(const void *p, uint32_t *cls) {
     zan_mem_hdr_t *h = (zan_mem_hdr_t *)((const char *)p - ZAN_MEM_HDR);
-    /* The allocator header at p-16 is only ever written by this allocator,
-     * but it can be read by a thread different from the one that allocated the
-     * block (per-thread free lists allow a block to be freed by another
-     * thread).  Atomic acquire/release accesses on the header fields synchronize
-     * those cross-thread operations. */
+    /* 内部辅助实现 */
     uint32_t magic = __atomic_load_n(&h->magic, __ATOMIC_ACQUIRE);
     if (magic == ZAN_MEM_FREED) {
         char msg[64];
@@ -566,10 +450,7 @@ void __wrap_free(void *p) {
     uint32_t cls;
     if (zan_mem_hdr_check(p, &cls) != 0) return;
     zan_mem_hdr_t *h = (zan_mem_hdr_t *)((char *)p - ZAN_MEM_HDR);
-    /* Claim the block: exactly one freer sees MAGIC and flips it to FREED. The
-     * old load-then-store let two threads freeing the same pointer both pass
-     * the check and both push the block onto a free list. The loser of
-     * the exchange must not touch the block at all. */
+    /* Claim the block: exactly one freer sees MAGIC and flips it to FREED */
     uint32_t expect = ZAN_MEM_MAGIC;
     if (!__atomic_compare_exchange_n(&h->magic, &expect, ZAN_MEM_FREED, 0,
                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
@@ -582,8 +463,7 @@ void __wrap_free(void *p) {
     }
     zan_mem_cache *owner = __atomic_load_n(&h->owner, __ATOMIC_RELAXED);
 #if defined(_WIN32)
-    /* Single atomic load: two plain reads of g_fls were both a data race
-     * and a re-read between the check and FlsGetValue. */
+    /* 内部辅助逻辑 */
     DWORD fls = __atomic_load_n(&g_fls, __ATOMIC_ACQUIRE);
     zan_mem_cache *self = (fls == FLS_OUT_OF_INDEXES)
                           ? NULL : (zan_mem_cache *)FlsGetValue(fls);
@@ -595,11 +475,7 @@ void __wrap_free(void *p) {
         self->free_list[cls] = p;
         return;
     }
-    /* Foreign free: push onto the owner's remote stack. The owner is still
-     * reachable (caches are never freed), and this thread may not even have a
-     * cache of its own -- freeing must not create one. Stripes: a freer with
-     * its own cache maps to one stripe (pointer-derived, so it stays put and
-     * the stripe line stays in its cache); cache-less threads round-robin. */
+    /* Foreign free: push onto the owner's remote stack */
     if (!owner) return;                  /* header garbage we already refused */
     unsigned s;
     if (self)
@@ -614,8 +490,7 @@ void __wrap_free(void *p) {
     } while (!__atomic_compare_exchange_n(slot, &head, p, 1,
                                           __ATOMIC_RELEASE, __ATOMIC_RELAXED));
 
-    /* Active cooperative reclamation: when foreign frees land on a cache while
-     * the current thread has its own cache, drain self's remote frees if pending */
+    /* 内部辅助逻辑 */
     if (self && self != owner) {
         zan_mem_drain_remote(self);
     }
@@ -633,15 +508,10 @@ void *__wrap_calloc(size_t n, size_t m) {
 
 void *__wrap_realloc(void *p, size_t n) {
     if (!p) return __wrap_malloc(n);
-    /* realloc(p, 0) must free p; the standard leaves only the return value
-     * implementation-defined (NULL or a unique 0-size block). Free and
-     * report NULL rather than returning p unchanged, which would both leak
-     * nothing but also pretend the block still exists. */
+    /* 内部辅助实现 */
     if (n == 0) { __wrap_free(p); return NULL; }
     if (!zan_mem_owns(p)) return __real_realloc(p, n);
-    /* Same header checks as free: reallocating a block that is on a free
-     * list (use-after-free) or whose header is garbage must abort, not hand
-     * the caller a block that some other owner may already hold. */
+    /* 内部辅助逻辑 */
     uint32_t cls;
     if (zan_mem_hdr_check(p, &cls) != 0) return NULL;  /* not a block start: cannot realloc */
     size_t old = k_class_size[cls];

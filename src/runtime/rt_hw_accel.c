@@ -1,6 +1,4 @@
-/* Zan Hardware Acceleration Engine & Cryptographic / SIMD Drivers
- * Implements AES-NI, SHA-NI, AVX2 / SSE SIMD kernels for maximum throughput.
- */
+/* 内部辅助逻辑 */
 
 #include "rt_hw_accel.h"
 #include "rt_hw_accel_sm4_tables.h"
@@ -17,14 +15,12 @@
 #if defined(__aarch64__) || defined(_M_ARM64)
   #include <arm_neon.h>
   #if defined(_WIN32)
-    /* windows.h normally arrives from the including TU (rt_timer.c); include
-     * it here too so the unit compiles standalone. */
+    /* windows */
     #include <windows.h>
   #elif defined(__APPLE__)
     #include <sys/sysctl.h>
   #else
-    /* Linux / Android (bionic, API 21+) / OpenHarmony (musl) all ship
-     * getauxval; iOS goes through the __APPLE__ branch above. */
+    /* 内部辅助逻辑 */
     #include <sys/auxv.h>
   #endif
 #endif
@@ -41,9 +37,7 @@ static int g_has_neon     = 0;
 static int g_has_shani    = 0;
 static int g_has_pclmul   = 0;
 
-/* ARMv8 crypto extension availability (aarch64 only). Split per algorithm:
- * FEAT_AES/SHA1/SHA2/PMULL are baseline "crypto"; FEAT_SHA512/SM3/SM4 and
- * FEAT_CRC32 are later optional extensions that must each be probed. */
+/* ARMv8 crypto extension availability (aarch64 only) */
 static int g_a_hw_aes    = 0;
 static int g_a_hw_sha1   = 0;
 static int g_a_hw_sha2   = 0;
@@ -81,9 +75,7 @@ static int zan_sysctl_i(const char *key) {
 }
 static void zan_arm_probe(void) {
 #if defined(_WIN32)
-    /* IsProcessorFeaturePresent bundles FEAT_AES+SHA1+SHA2+PMULL as the
-     * "v8 crypto" set; Windows exposes no per-extension flag for
-     * FEAT_SHA512/SM3/SM4, so those fall back to portable C there. */
+    /* 内部辅助逻辑 */
     int crypto = IsProcessorFeaturePresent(75 /* PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE */);
     g_a_hw_aes = g_a_hw_sha1 = g_a_hw_sha2 = g_a_hw_pmull = crypto;
     g_a_hw_crc32 = IsProcessorFeaturePresent(76 /* PF_ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE */);
@@ -108,9 +100,7 @@ static void zan_arm_probe(void) {
 }
 #endif /* aarch64 */
 
-/* ZAN_NO_HWACCEL=1 forces every dispatch onto the portable C path. Conformance
- * tests run each case twice (with and without the variable) to prove the
- * hardware path and the reference path agree byte for byte. */
+/* ZAN_NO_HWACCEL=1 forces every dispatch onto the portable C path */
 static int zan_hw_soft_forced(void) {
     const char *e = getenv("ZAN_NO_HWACCEL");
     return e != NULL && e[0] != '\0' && e[0] != '0';
@@ -166,14 +156,7 @@ static void zan_hw_init_cpu_features(void) {
     g_cpuid_inited = 1;
 }
 
-/* KAT gate for hardware paths: state is tri-state per primitive
- * (0 = untested, 1 = known-answer test passed, -1 = feature missing or KAT
- * failed -> permanently software). Every hardware kernel is checked once,
- * before its first real use, against published test vectors (FIPS-197,
- * SP 800-38A/38D, FIPS 180-4, GB/T 32905/32907, RFC 4960), so a defective
- * instruction path can never ship wrong bytes: it degrades to the pure-Zan
- * implementation in the stdlib. The registry below is what conformance
- * asserts against: a present feature must have KAT state 1, never -1. */
+/* 内部辅助逻辑 */
 static int g_gate_sha256 = 0;
 static int g_gate_sha1   = 0;
 static int g_gate_sha512 = 0;
@@ -304,9 +287,7 @@ __asm__(
   "    punpcklqdq xmm2, xmm0\n"
   "    jmp    .Lloop\n"
   "\n"
-  /* .p2align, not .align: the operand is always a power-of-two exponent
-   * for every assembler, while plain .align switches meaning -- ELF/x86
-   * takes bytes, Mach-O takes an exponent (.align 64 = align 2^64). */
+  /*  */
   ".p2align 4\n"
   ".Lloop:\n"
   "    movdqu xmm3, [rsi]\n"
@@ -562,7 +543,7 @@ static const uint32_t K256_C[64] = {
     0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
 };
 
-/* ARMv8 Cryptographic Extension SHA-2 (FEAT_SHA2: sha256h/h2/su0/su1). */
+/* ARMv8 Cryptographic Extension SHA-2 (FEAT_SHA2: sha256h/h2/su0/su1) */
 #if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
 #include <arm_neon.h>
 
@@ -579,9 +560,7 @@ static void zan_sha256_transform_arm(uint32_t state[8], const uint8_t *data, siz
         uint32x4_t msg3 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p + 48)));
         uint32x4_t tmp, save;
 
-        /* ACLE SHA-256 pair, verified against the FIPS loop: vsha256hq
-         * (abcd, efgh, wk) returns the new ABCD, vsha256h2q (efgh, abcd,
-         * wk) returns the new EFGH and reads the PRE-group ABCD. */
+        /* 内部辅助逻辑 */
         /* Rounds 0-3 */
         save = state0;
         tmp = vaddq_u32(msg0, vld1q_u32(&K256_C[0]));
@@ -668,9 +647,7 @@ static int zan_sha256_kat_arm(void) {
     return 1;
 }
 
-/* FEAT_SHA1 (sha1c/sha1p/sha1m rounds, sha1h rotate, su0/su1 schedule).
- * Group invariant: after a 4-round group the new E equals (a_before_group)
- * <<< 30, which is exactly what SHA1H extracts from the pre-group lane 0. */
+/* FEAT_SHA1 (sha1c/sha1p/sha1m rounds, sha1h rotate, su0/su1 schedule) */
 __attribute__((target("sha2")))
 static void zan_sha1_transform_arm(uint32_t state[5], const uint8_t *data, size_t num_blocks) {
     uint32x4_t abcd = vld1q_u32(&state[0]);
@@ -691,9 +668,7 @@ static void zan_sha1_transform_arm(uint32_t state[5], const uint8_t *data, size_
                 uint32x4_t t = vsha1su0q_u32(msg[g % 4], msg[(g + 1) % 4], msg[(g + 2) % 4]);
                 msg[g % 4] = vsha1su1q_u32(t, msg[(g + 3) % 4]);
             }
-            /* The SHA-1 instructions carry no K constant: K rides in the
-             * message word (SHA1C/P/M fold m ^ k internally). The schedule
-             * updates above stay on the raw words. */
+            /* 内部辅助逻辑 */
             uint32_t k = (g < 5)   ? 0x5a827999u
                        : (g < 10)  ? 0x6ed9eba1u
                        : (g < 15)  ? 0x8f1bbcdcu
@@ -791,15 +766,10 @@ int64_t zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]) {
     return 0;
 }
 
-/* ===== 2.1 SHA-1 Hardware Kernel (FIPS 180-4) ============================
- * x86: Intel SHA Extensions (sha1rnds4/nexte/msg1/msg2). ARM: FEAT_SHA1
- * (sha1c/sha1p/sha1m). The transform consumes whole 64-byte blocks only;
- * padding and the length word are driver plumbing below.
- * ======================================================================== */
+/* 2 */
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
 
-/* Canonical Intel SHA Extensions pipeline (public domain, noloader/SHA-Intrinsics).
- * `length` is in BYTES and must be a multiple of 64. */
+/* Canonical Intel SHA Extensions pipeline (public domain, noloader/SHA-Intrinsics) */
 __attribute__((target("sha,sse4.1")))
 static void zan_sha1_transform_ni(uint32_t state[5], const uint8_t *data, size_t num_blocks) {
     __m128i ABCD, ABCD_SAVE, E0, E0_SAVE, E1;
@@ -961,9 +931,7 @@ static void zan_sha1_transform_ni(uint32_t state[5], const uint8_t *data, size_t
 
 #endif /* x86 sha1 */
 
-/* FEAT_SHA1 rides LLVM's "sha2" target feature (SHA-1 and SHA-256 ship as
- * one crypto unit), so the kernel below carries the same attribute as the
- * SHA-2 one. */
+/* 内部辅助逻辑 */
 #if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
 #define ZAN_SHA1_ARM_KERNEL 1
 #else
@@ -1047,18 +1015,11 @@ int64_t zan_hw_sha1(const uint8_t *data, int64_t len, uint8_t out[20]) {
     return 0;
 }
 
-/* ===== 3. AES Hardware Kernels (FIPS-197, SP 800-38A) & GHASH (SP 800-38D)
- * Thin instruction-facing kernels only: AES-NI/PCLMULQDQ on x86, FEAT_AES /
- * FEAT_PMULL on ARM. Key schedule is the FIPS-197 scalar expansion feeding
- * the round instructions (shared by both ISAs); modes live in the Zan
- * stdlib, which falls back to its pure-Zan implementation when the kernel
- * reports -1 (no hardware, or the known-answer test below failed once).
- * ======================================================================== */
+/* 3 */
 static uint8_t zan_aes_sbox[256];
 
 static void zan_aes_init_sbox(void) {
-    /* FIPS-197 S-box generated from GF(2^8) inverse + affine map, so the
-     * table stays generated plumbing rather than a second implementation. */
+    /* 内部辅助逻辑 */
     static int inited = 0;
     if (inited) return;
     uint8_t inv[256];
@@ -1087,7 +1048,7 @@ static void zan_aes_init_sbox(void) {
     inited = 1;
 }
 
-/* FIPS-197 key expansion into nr+1 16-byte round keys (big-endian words). */
+/* FIPS-197 key expansion into nr+1 16-byte round keys (big-endian words) */
 static void zan_aes_expand_key(const uint8_t *key, int keybits,
                                uint8_t rk[15][16], int *nr_out) {
     zan_aes_init_sbox();
@@ -1279,12 +1240,7 @@ static int64_t zan_aes_ctr_ni(const uint8_t *in, int64_t len,
     return len;
 }
 
-/* GHASH over PCLMULQDQ. Domain: blocks byte-reversed into the register so
- * register bit r <-> GCM coefficient x^(127-r). Product bit t <-> x^(254-t);
- * reduction of bit t (t <= 126) lands at result bits {t-6, t-1, t, t+1}; the
- * six lowest product bits additionally spill through the second-level fold
- * (0xE1 at the top byte = q = x^7+x^2+x+1). Verified against the GCM spec
- * bit loop and KAT'd below. */
+/* GHASH over PCLMULQDQ */
 #define ZAN_XSHIFT_R(x, n) _mm_xor_si128(_mm_srli_epi64(x, n), _mm_srli_si128(_mm_slli_epi64(x, 64-(n)), 8))
 #define ZAN_XSHIFT_L(x, n) _mm_xor_si128(_mm_slli_epi64(x, n), _mm_slli_si128(_mm_srli_epi64(x, 64-(n)), 8))
 #define ZAN_BSWAP128 _mm_set_epi8(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)
@@ -1404,11 +1360,7 @@ static inline int64_t zan_ghash_block_clmul(const uint8_t *h16, const uint8_t *x
     return zan_ghash_update_clmul(h16, x16, 16, y16);
 }
 
-/* CRC-32C (Castagnoli), reflected poly 0x82F63B78, SSE4.2 single-cycle.
- * clang's feature model keeps the CRC32 instructions behind their own
- * "crc32" feature -- target("sse4.2") alone covers the SIMD half only
- * (-msse4.2 on the command line implies it, a function attribute does
- * not), so the cross builds hard-error without it. */
+/* CRC-32C (Castagnoli), reflected poly 0x82F63B78, SSE4 */
 __attribute__((target("sse4.2,crc32")))
 static uint32_t zan_crc32c_sse42(uint32_t crc, const uint8_t *p, int64_t n) {
     uint64_t c = crc;
@@ -1422,14 +1374,7 @@ static uint32_t zan_crc32c_sse42(uint32_t crc, const uint8_t *p, int64_t n) {
 
 #endif /* x86 */
 
-/* ---- ARM64 FEAT_AES / FEAT_PMULL / FEAT_CRC32 kernels ----
- * Mirrors of the x86 kernels above: same shared FIPS-197 scalar key
- * schedule (consumed round by round in the same order), same PKCS#7 CBC /
- * CTR / single-block-ECB semantics, same GHASH register-domain reflection.
- * On ARM the round key is XORed BEFORE the S-box (AESE/AESD), so the
- * pipeline is vaesmc(vaeseq(...)) over keys 0..nr-1 with the final round
- * XORing the last key twice (the pre-XOR inside vaeseq and the explicit
- * veor cancel, leaving the true post-round whitening). */
+/* 内部辅助逻辑 */
 #if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
 #include <arm_acle.h>
 
@@ -1445,21 +1390,14 @@ static uint8x16_t zan_aes_enc_block_arm(const uint8_t *key, int keybits, uint8x1
     uint8_t rkb[15][16];
     int nr;
     zan_aes_expand_key(key, keybits, rkb, &nr);
-    /* ARM fusion: AESE folds the round key in before the S-box, so the raw
-     * schedule streams straight through vaeseq; vaesmc after every round
-     * but the last (FIPS-197 round Nr has no MixColumns) and the state
-     * stays "pre-whitened": b = state_{r+1} ^ rk[r+1]. The final vaeseq
-     * consumes the pending rk[nr-1] to finish round Nr-1, then a plain
-     * veor applies the true last key. */
+    /* 内部辅助逻辑 */
     for (int r = 0; r + 1 < nr; r++) block = vaesmcq_u8(vaeseq_u8(block, vld1q_u8(rkb[r])));
     return veorq_u8(vaeseq_u8(block, vld1q_u8(rkb[nr - 1])), vld1q_u8(rkb[nr]));
 }
 
 __attribute__((target("aes")))
 static void zan_aes_expand_dec_arm(const uint8_t *key, int keybits, uint8x16_t *dec_rk) {
-    /* Mirror of the encryption fusion: plain reversed schedule — vaesimc is
-     * applied to the state inside the round loop, not to the keys (the x86
-     * aesdec flow pre-transforms its keys; ARM must not). */
+    /* 内部辅助逻辑 */
     uint8_t rkb[15][16];
     int nr;
     zan_aes_expand_key(key, keybits, rkb, &nr);
@@ -1514,14 +1452,7 @@ static int64_t zan_aes_cbc_decrypt_arm(const uint8_t *in, int64_t len,
 
     for (int64_t i = 0; i < blocks; i++) {
         uint8x16_t cur = vld1q_u8(in + i * 16);
-        /* AESD (like AESE) XORs its key BEFORE the S-box, but the inverse
-         * round needs the round key AFTER InvSubBytes — so the state
-         * register carries the pending key: ct = state0 ^ rk[Nr] already,
-         * each aesd cancels the pending key to feed the pure state through
-         * InvSubBytes, veor adds this round's key, vaesimc applies
-         * InvMixColumns, and that same key stays pending for the next
-         * round. The final aesd cancels rk[1] and its output is the
-         * plaintext once rk[0] is veor'd on. */
+        /* 内部辅助逻辑 */
         uint8x16_t block = cur;
         for (int r = 1; r < nr; r++) {
             uint8x16_t p = veorq_u8(vaesdq_u8(block, dec_rk[r - 1]), dec_rk[r]);
@@ -1589,12 +1520,7 @@ static int64_t zan_aes_ctr_arm(const uint8_t *in, int64_t len,
     return len;
 }
 
-/* GHASH over PMULL (vmull_p64 = the 64x64->128 carry-less multiply, the
- * ARM counterpart of PCLMULQDQ). Same register-domain reflection fold as
- * the x86 kernel: byte-reverse blocks into the register so register bit
- * r <-> GCM coefficient x^(127-r); product bit t <-> x^(254-t); reduction
- * of bit t (t <= 126) lands at result bits {t-6, t-1, t, t+1}; the six
- * lowest product bits spill through the second-level fold (0xE1 = q). */
+/* 内部辅助逻辑 */
 __attribute__((target("aes,neon")))
 static int64_t zan_ghash_update_pmull(const uint8_t *h16, const uint8_t *data, int64_t len, uint8_t *y16) {
     if (len <= 0) return 0;
@@ -1648,8 +1574,7 @@ static inline int64_t zan_ghash_block_pmull(const uint8_t *h16, const uint8_t *x
     return zan_ghash_update_pmull(h16, x16, 16, y16);
 }
 
-/* CRC-32C (Castagnoli), reflected poly 0x82F63B78, FEAT_CRC32. The acle
- * helpers carry their own target("crc") attribute in arm_acle.h. */
+/* CRC-32C (Castagnoli), reflected poly 0x82F63B78, FEAT_CRC32 */
 __attribute__((target("crc")))
 static uint32_t zan_crc32c_pmull_arm(uint32_t crc, const uint8_t *p, int64_t n) {
     uint64_t c = crc;
@@ -1782,8 +1707,7 @@ static int zan_aes_kat(void) {
 }
 
 static int zan_ghash_kat(void) {
-    /* Two GHASH steps checked against the SP 800-38D bit loop, frozen as
-     * constants (H, X1, X2 and the expected accumulator). */
+    /* 内部辅助逻辑 */
     static const uint8_t H[16]  = { 0x03,0x14,0x25,0x36,0x47,0x58,0x69,0x7a,0x8b,0x9c,0xad,0xbe,0xcf,0xe0,0xf1,0x02 };
     static const uint8_t X1[16] = { 0x07,0x24,0x41,0x5e,0x7b,0x98,0xb5,0xd2,0xef,0x0c,0x29,0x46,0x63,0x80,0x9d,0xba };
     static const uint8_t X2[16] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x80 };
@@ -2453,7 +2377,7 @@ int64_t zan_hw_crc32c_update(uint32_t crc, const uint8_t *p, int64_t len) {
     return -1;
 }
 
-/* ===== Software Reference Fallbacks for Single-Cycle Intrinsics ===== */
+/* Software Reference Fallbacks for Single-Cycle Intrinsics */
 static uint8_t zan_aes_inv_sbox[256];
 static int zan_aes_tables_inited = 0;
 
@@ -2482,7 +2406,7 @@ static void zan_aes_init_tables(void) {
     zan_aes_tables_inited = 1;
 }
 
-/* Single AES encryption round (x86 _mm_aesenc_si128 / _mm_aesenclast_si128 semantics) */
+/* 内部辅助逻辑 */
 static void zan_aes_encrypt_round_soft(const void *val, const void *key, void *out, int mix_columns) {
     zan_aes_init_tables();
     const uint8_t *s = (const uint8_t *)val;
@@ -2532,7 +2456,7 @@ static void zan_aes_encrypt_round_soft(const void *val, const void *key, void *o
     }
 }
 
-/* Single AES decryption round (x86 _mm_aesdec_si128 / _mm_aesdeclast_si128 semantics) */
+/* 内部辅助逻辑 */
 static void zan_aes_decrypt_round_soft(const void *val, const void *key, void *out, int inv_mix_columns) {
     zan_aes_init_tables();
     const uint8_t *s = (const uint8_t *)val;
@@ -3065,19 +2989,7 @@ void zan_hw_pixel_resample_bilinear_row(uint8_t *dst, const uint8_t *src0,
 
 #if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
 
-/* ===== 7. SM3 Cryptographic Hash (GB/T 32905-2012), FEAT_SM3 =============
- * Per-round hardware:
- *   sm3ss1              -> SS1 = rotl(rotl(A,12) + E + W[j] + rotl(T_j,j), 7)
- *   sm3tt1a/tt1b (imm2) -> TT1 with the A/B/C/D rotation folded in
- *                          (FF = X^Y^Z for rounds 0-15, majority after);
- *   sm3tt2a/tt2b (imm2) -> TT2 with the P0 compression folded in
- *                          (GG = X^Y^Z for rounds 0-15, choice after);
- *   sm3partw1/partw2    -> W[j] = P1(W[j-16]^W[j-9]^rotl(W[j-3],15))
- *                          ^ rotl(W[j-13],7) ^ W[j-6].
- * The TT instructions keep the working variables REVERSED — the A-side
- * vector is {D,C,B,A}, the E-side {H,G,F,E} — and read A/E/SS1 at lane 3
- * while imm2 selects the W/W' lane, so the per-round K+W[j] sum rides a
- * vext rotation of the group's constant vector. */
+/* 7 */
 static const uint32_t zan_sm3_kc_arm[64] = {
     0x79cc4519u,    0xf3988a32u,    0xe7311465u,    0xce6228cbu,
     0x9cc45197u,    0x3988a32fu,    0x7311465eu,    0xe6228cbcu,
@@ -3117,16 +3029,14 @@ static void zan_sm3_transform_arm(uint32_t state[8], const uint8_t *data, size_t
             uint32x4_t wprime = veorq_u32(cur, W[(g + 1) % 4]);
             uint32x4_t kc = vld1q_u32(&zan_sm3_kc_arm[4 * g]);
 
-            /* Extend the schedule by four words into the rolling slot.
-             * Group 15 produces W[64..67], which only W'[60..63] reads. */
+            /* Extend the schedule by four words into the rolling slot */
             uint32x4_t n1 = vextq_u32(W[(g + 1) % 4], W[(g + 2) % 4], 3);
             uint32x4_t n2 = vextq_u32(W[(g + 2) % 4], W[(g + 3) % 4], 2);
             uint32x4_t m2 = vextq_u32(W[g % 4], W[(g + 1) % 4], 3);
             uint32x4_t ext = vsm3partw1q_u32(W[g % 4], n1, W[(g + 3) % 4]);
             W[g % 4] = vsm3partw2q_u32(ext, n2, m2);
 
-            /* Rounds 0-15 run the XOR boolean form (tt1a/tt2a), rounds 16-63
-             * the majority/choice form (tt1b/tt2b); imm2 stays per-lane. */
+            /* 内部辅助逻辑 */
 #define ZAN_SM3_ROUND(l)                                                    \
             ss1 = vsm3ss1q_u32(avec, evec, vextq_u32(kc, kc, ((l) + 1) & 3)); \
             if (g < 4) {                                                    \
@@ -3182,12 +3092,8 @@ static int zan_sm3_kat_arm(void) {
 }
 #endif /* aarch64 SM3 */
 
-/* ===== 7. SM3 driver (GB/T 32905-2012) ===================================
- * x86 has no SM3 instructions; FEAT_SM3 covers ARM64. Everywhere else the
- * pure-Zan Sm3 class is the implementation.
- * ======================================================================== */
-/* SHA-512 has no x86 hardware engine (SHA extensions cover SHA-1/256 only);
- * the FEAT_SHA512 kernel lands with the ARM64 pass. Pure-Zan covers x86. */
+/* 7 */
+/* 内部辅助逻辑 */
 int64_t zan_hw_sha512(const uint8_t *data, int64_t len, uint8_t out[64]) {
     (void)data; (void)len; (void)out;
     return -1;
@@ -3244,16 +3150,7 @@ static inline uint32_t zan_rotl32(uint32_t x, int n) {
     return (x << n) | (x >> (32 - n));
 }
 
-/* ===== 8. SM4 Block Cipher CBC Acceleration (GB/T 32907-2016) =====
- * Dual-engine architecture:
- * 1. x86_64 Hardware Engine: AES-NI affine decomposition mapping SM4 S-Box onto
- *    AES SubBytes (via GF(2^8) isomorphism PSHUFB + AESENCLAST + PSHUFB) with
- *    constant-time single-block encryption and 8-way / 16-way (VAES) interleaved
- *    parallel decryption pipeline delivering >1 GB/s and cache-timing immunity.
- * 2. ARM64 Hardware Engine: FEAT_SM4 instruction pipeline (vsm4eq_u32).
- * 3. Software Fallback: 4x 32-bit precomputed T-Tables folding S-Box and linear
- *    diffusion L into 4 lookups + XORs per round.
- */
+/* 8 */
 static inline uint32_t zan_sm4_lp(uint32_t b) {
     return b ^ zan_rotl32(b, 13) ^ zan_rotl32(b, 23);
 }
@@ -3829,7 +3726,7 @@ int64_t zan_hw_sm4_cbc_decrypt(const uint8_t *in, int64_t len,
     return len - pad_val;
 }
 
-/* ===== 7. Base64 High-Throughput SIMD / Pipelined Encoders (RFC 4648) ===== */
+/* 7 */
 
 static const char ZAN_B64_ENC_TABLE[65] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -4081,9 +3978,7 @@ int64_t zan_hw_json_scan_string(const uint8_t *buf, int64_t pos, int64_t len) {
     return len;
 }
 
-/* =====================================================================
- * RFC 7748 Curve25519 (X25519) Constant-Time Key Exchange
- * ===================================================================== */
+/* RFC 7748 Curve25519 (X25519) Constant-Time Key Exchange */
 #if defined(__SIZEOF_INT128__) || (defined(__clang__) || defined(__GNUC__))
 typedef unsigned __int128 zan_fe_u128;
 #else
@@ -4364,9 +4259,7 @@ int64_t zan_hw_x25519(const uint8_t *scalar, const uint8_t *point, uint8_t *out)
     return 0;
 }
 
-/* =========================================================================
- * Montgomery Modular Exponentiation (RSA / DH up to 4096-bit odd modulus)
- * ========================================================================= */
+/* Montgomery Modular Exponentiation (RSA / DH up to 4096-bit odd modulus) */
 typedef unsigned __int128 zan_u128_t;
 
 static void zan_load_be64_limbs(const uint8_t *src, int64_t slen, uint64_t *dst, int k) {

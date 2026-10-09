@@ -1,8 +1,6 @@
-/* irgen_builtins.c -- builtin string-method helpers and EH-owned temporaries.
- * #include'd by irgen.c in a fixed order; not compiled standalone. */
+/* irgen_builtins */
 
-/* String-method bodies use libc (strlen/strstr/memcpy/toupper) plus
- * zan_rt_str_alloc, so every returned string is an ordinary owned rc string. */
+/* 内部辅助逻辑 */
 
 static LLVMValueRef get_libc_fn(zan_irgen_t *g, const char *name, LLVMTypeRef ty) {
     LLVMValueRef f = LLVMGetNamedFunction(g->mod, name);
@@ -10,8 +8,7 @@ static LLVMValueRef get_libc_fn(zan_irgen_t *g, const char *name, LLVMTypeRef ty
     return f;
 }
 
-/* __zan_str_last_index_of(s, sub) -> i64: byte index of the last occurrence
- * of `sub` in `s`, or -1. An empty needle yields strlen(s). */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_str_last_index_of_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_str_last_index_of");
     if (fn) return fn;
@@ -66,8 +63,7 @@ static LLVMValueRef get_str_last_index_of_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* __zan_str_trim(s) -> i8*: fresh rc string with leading/trailing ASCII
- * whitespace (space, \t, \r, \n, \v, \f) removed. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_str_trim_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_str_trim");
     if (fn) return fn;
@@ -146,8 +142,7 @@ static LLVMValueRef get_str_trim_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* __zan_str_to_upper / __zan_str_to_lower: per-byte toupper()/tolower() into
- * a fresh rc string. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_str_case_fn(zan_irgen_t *g, int upper) {
     const char *fname = upper ? "__zan_str_to_upper" : "__zan_str_to_lower";
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, fname);
@@ -200,9 +195,7 @@ static LLVMValueRef get_str_case_fn(zan_irgen_t *g, int upper) {
     return fn;
 }
 
-/* __zan_str_replace(s, from, to) -> i8*: fresh rc string with every
- * non-overlapping occurrence of `from` replaced by `to`. An empty `from`
- * returns a copy of `s`. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_str_replace_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_str_replace");
     if (fn) return fn;
@@ -305,8 +298,7 @@ static LLVMValueRef get_str_replace_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* void __zan_list_push_strn(i8* lst, i8* p, i64 n): copy n bytes of p into a
- * fresh rc string and push it onto the List (growing the i64 data buffer). */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_list_push_strn_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_list_push_strn");
     if (fn) return fn;
@@ -373,9 +365,7 @@ static LLVMValueRef get_list_push_strn_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* void __zan_str_split(i8* s, i8* sep, i8* lst): split s on every occurrence
- * of sep and push the segments (fresh rc strings) onto the List. An empty
- * separator yields the whole string as a single element. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_str_split_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_str_split");
     if (fn) return fn;
@@ -433,10 +423,7 @@ static LLVMValueRef get_str_split_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* i1 __zan_dict_key_eq(i8* a, i8* b, i64 is_str): key comparison for Dict
- * scans -- length-aware ordinal equality for string keys (strcmp collided a
- * key with its own NUL-truncated prefix), raw pointer/bit equality for
- * scalar keys (stored inttoptr'd in the i8** key slots). */
+/* 内部辅助实现 */
 static LLVMValueRef get_dict_key_eq_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_dict_key_eq");
     if (fn) return fn;
@@ -471,8 +458,7 @@ static LLVMValueRef get_dict_key_eq_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* i64 __zan_dict_hash(i8* key, i64 is_str): FNV-1a over the key bytes for
- * string keys, a 64-bit avalanche of the pointer/scalar bits otherwise. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_dict_hash_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_dict_hash");
     if (fn) return fn;
@@ -539,13 +525,7 @@ static LLVMValueRef get_dict_hash_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* i64 __zan_dict_find(i8* draw, i8* key, i64 is_str): index of the entry with
- * `key`, or -1. Probes the dict's open-addressed hash index, (re)building it
- * from the insertion-ordered key buffer when it is missing or stale -- so the
- * inline mutators (Add/Clear/the indexer's upsert) need no bookkeeping beyond
- * the count they already maintain; Remove clears index_capacity because it can
- * leave the count unchanged relative to a previous build. Duplicate keys keep
- * their first occurrence, matching the linear scan this replaces. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_dict_find");
     if (fn) return fn;
@@ -621,9 +601,7 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef grow = LLVMAppendBasicBlockInContext(c, fn, "rb.grow");
     LLVMBuildCondBr(b, empty, miss, live);
     LLVMPositionBuilderAtEnd(b, live);
-    /* Add only bumps the count, so the index reads as stale on the next lookup.
-     * Indexing just the appended keys keeps insertion amortized O(1): a full
-     * rebuild per insert makes insert-then-lookup loops quadratic. */
+    /* Add only bumps the count, so the index reads as stale on the next lookup */
     LLVMValueRef fits = zan_icmp(b, LLVMIntSGE, icap,
         zan_mul(b, cnt, LLVMConstInt(i64, 4, 0), "want4"), "fits");
     LLVMValueRef grew = zan_icmp(b, LLVMIntSLT, icnt, cnt, "grew");
@@ -657,8 +635,7 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMBuildBr(b, caploop);
 
     LLVMPositionBuilderAtEnd(b, alloc);
-    /* The old table is dead once a bigger one is allocated: free it, else it
-     * leaks one table per rebuild. */
+    /* 内部辅助逻辑 */
     LLVMTypeRef ixfree_ty = LLVMFunctionType(LLVMVoidTypeInContext(c),
         (LLVMTypeRef[]){ i8ptr }, 1, 0);
     LLVMValueRef ixfree = get_libc_fn(g, "free", ixfree_ty);
@@ -744,18 +721,7 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     return fn;
 }
 
-
-/* i64 __zan_dict_remove(i8* draw, i8* key, i64 is_str): remove the entry with
- * `key` from the hash index and shrink the count; returns the removed entry's
- * index (callers release the key/value and shift every entry above the hole
- * down one slot themselves, with the ARC types they know), or -1 when the key
- * is absent.
- *
- * The helper does find + cnt-- + indexed_count = 0: the hash index is dropped
- * wholesale and find rebuilds it from scratch on the next lookup (the
- * icnt != cnt stale check fires; the rebuild is the same O(n) class as the
- * caller's ordered data shift) — with every entry above the hole renumbered,
- * an in-place index repair is impossible. */
+/* 内部辅助实现 */
 static LLVMValueRef get_dict_remove_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_dict_remove");
     if (fn) return fn;
@@ -797,9 +763,7 @@ static LLVMValueRef get_dict_remove_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(b, nokey, miss, hit);
 
     LLVMPositionBuilderAtEnd(b, hit);
-    /* cnt--; the hash index is dropped wholesale (indexed_count = 0): with
-     * every entry above fi renumbered, an in-place index repair is impossible,
-     * so find rebuilds the index from scratch on the next lookup (doc above). */
+    /* 内部辅助逻辑 */
     LLVMValueRef cnt = LLVMBuildLoad2(b, i64, cntp, "cnt");
     LLVMBuildStore(b, zan_sub(b, cnt, LLVMConstInt(i64, 1, 0), "cnt.d"), cntp);
     LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), icntp);
@@ -808,10 +772,7 @@ static LLVMValueRef get_dict_remove_fn(zan_irgen_t *g) {
     return fn;
 }
 
-
-/* void __zan_dict_set(i8* draw, i8* key, i64 val, i64 is_str): upsert for the
- * Dict indexer. Replaces the value of an existing key, else appends the pair,
- * growing the parallel keys/values buffers when full. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_dict_set");
     if (fn) return fn;
@@ -889,24 +850,7 @@ static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* Handler-stack and unwind-stack storage: one independent state block per
- * thread. Handler depth is *runtime* nesting (one slot per entered try, so a
- * recursive try/catch has no static bound) and growing a single buffer would
- * move armed jmp_bufs out from under whoever is inside a try; sharing one
- * stack process-wide would let a throw on thread B longjmp into thread A's
- * frames. The state therefore lives in a per-thread block reached through
- * __zan_eh_state(): a thread-id keyed open-addressed table, since native TLS
- * is unusable in emitted code on the bundled MinGW/lld toolchain.
- *
- * Inside a block both stacks use a chunk table: a fixed array of chunk
- * pointers, each chunk calloc'd on first use and never freed, moved or
- * reallocated, so an armed jmp_buf's address is stable for the life of the
- * thread. A block is only ever touched by its owning thread, so no atomics
- * are needed past claiming its table slot. Handler slots carry their jmp_buf
- * (1024 bytes, covering every supported target's) plus the unwind-stack depth
- * the handler was armed at, which a throw uses to release the skipped frames'
- * locals while they are still alive (see emit_eh_unwind_to_handler).
- * The numeric constants (ZAN_EH_*) are in ../common/zan_abi.h. */
+/* Handler-stack and unwind-stack storage: one independent state block per thread */
 
 /* Fields of the per-thread state block. */
 enum {
@@ -929,28 +873,7 @@ static LLVMValueRef eh_add_global(zan_irgen_t *g, LLVMTypeRef ty,
     return v;
 }
 
-/* The calling thread's cached EH state pointer: `__zan_eh_state` otherwise
- * repeats pthread_self plus an open-addressed probe of the thread table on
- * every use. The table stays the source of truth, and `__zan_eh_release`
- * clears the slot when it drops the block.
- *
- * The TLS model is picked rather than left to the default: an executable or a
- * load-time shared object can use initial-exec (a GOT-relative load), while a
- * dlopen'able library must stay general-dynamic so it never runs out of the
- * static TLS surplus.
- *
- * Returns NULL where the cache is unavailable, and callers then go straight to
- * the table:
- *   - WASM has one thread and no TLS;
- *   - bare-metal riscv32 (ESP32-C3/C6) runs the same single-thread contract
- *     with no TLS block and no tp register: a GOT-slot load for the
- *     initial-exec thread-local answers 0 and the `add a0,a0,tp` turns it
- *     into a wild pointer that traps;
- *   - on Windows the bundled linker (GNU ld 2.36.1, i386pep) emits a base
- *     relocation over the section-relative displacement of a COFF TLS access,
- *     so ASLR rewrites the offset at load time and the very first lookup
- *     reads a wild address. Emitting no thread-local at all is the only way
- *     to keep both the relocation section and a working binary. */
+/* 内部辅助实现 */
 static LLVMValueRef get_eh_self_slot(zan_irgen_t *g) {
     if (g->target_is_windows ||
         strstr(g->target_triple, "wasm") ||
@@ -968,8 +891,7 @@ static LLVMValueRef get_eh_self_slot(zan_irgen_t *g) {
     return v;
 }
 
-/* The layout of a thread's EH state. Private to emitted code (nothing outside
- * this module allocates or reads a block), so it needs no fixed ABI. */
+/* The layout of a thread's EH state */
 static LLVMTypeRef get_eh_state_ty(zan_irgen_t *g) {
     if (g->eh_state_ty) return g->eh_state_ty;
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -989,9 +911,7 @@ static LLVMTypeRef get_eh_state_ty(zan_irgen_t *g) {
     return ty;
 }
 
-/* i64 id of the calling thread, non-zero on every supported target.
- * GetCurrentThreadId (kernel32) on Windows, pthread_self elsewhere -- both are
- * already in every produced program's link line. wasm32 has no threads. */
+/* i64 id of the calling thread, non-zero on every supported target */
 static LLVMValueRef emit_eh_thread_id(zan_irgen_t *g) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -1004,20 +924,14 @@ static LLVMValueRef emit_eh_thread_id(zan_irgen_t *g) {
             get_libc_fn(g, "GetCurrentThreadId", ty), NULL, 0, "tid32");
         return LLVMBuildZExt(g->builder, id, i64t, "tid");
     }
-    /* pthread_t is a pointer on macOS and an unsigned long on Linux; both are
-     * returned in a register, so a pointer-typed declaration is ABI-correct on
-     * 32- and 64-bit alike. */
+    /* 内部辅助逻辑 */
     LLVMTypeRef ty = LLVMFunctionType(i8ptr, NULL, 0, 0);
     LLVMValueRef self = zan_call2(g->builder, ty,
         get_libc_fn(g, "pthread_self", ty), NULL, 0, "self");
     return LLVMBuildPtrToInt(g->builder, self, i64t, "tid");
 }
 
-/* Table globals. The arrays start NULL and the first claimer installs a
- * ZAN_EH_THREADS-entry pair, so a program that never throws pays nothing; the
- * cap global lets __zan_eh_state grow the table when the last free slot goes.
- * Keys and states move together and are only swapped under the spinlock, so
- * readers either take the lock (slow path, release) or hold it (state). */
+/* Table globals */
 static LLVMValueRef get_eh_tab_keys(zan_irgen_t *g) {
     LLVMValueRef v = LLVMGetNamedGlobal(g->mod, "__zan_eh_keys");
     if (v) return v;
@@ -1040,10 +954,7 @@ static LLVMValueRef get_eh_tab_cap(zan_irgen_t *g) {
                          LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0));
 }
 
-/* Spinlock guarding the table arrays and their capacity. Held across a whole
- * lookup-or-claim-or-grow, released before return; the per-thread cache keeps
- * every later use of the state block lock-free. Fits in one word, so a
- * compare-exchange on an i64 global is the whole implementation. */
+/* Spinlock guarding the table arrays and their capacity */
 static LLVMValueRef get_eh_tab_lock(zan_irgen_t *g) {
     LLVMValueRef v = LLVMGetNamedGlobal(g->mod, "__zan_eh_tab_lock");
     if (v) return v;
@@ -1052,8 +963,7 @@ static LLVMValueRef get_eh_tab_lock(zan_irgen_t *g) {
     return eh_add_global(g, ty, "__zan_eh_tab_lock", LLVMConstNull(ty));
 }
 
-/* Acquire the table mutex: one plain call to AcquireSRWLockExclusive /
- * pthread_mutex_lock into the zero-initialized storage. */
+/* 内部辅助逻辑 */
 static void emit_eh_tab_lock_acquire(zan_irgen_t *g, LLVMValueRef lock_gv) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
@@ -1079,12 +989,7 @@ static void emit_eh_tab_lock_release(zan_irgen_t *g, LLVMValueRef lock_gv) {
     zan_call2(g->builder, ty, fn, &p, 1, "");
 }
 
-/* Grow the thread table: calloc a doubled keys/states pair, rehash every live
- * key into the new arrays (tombstones drop out, which is the point of doing
- * this here), then install. Called with the spinlock held; the fresh arrays
- * are unreachable until the pointer stores, so plain stores are enough.
- * Growers set the lock to 2 first so a spinner can see the delay is bounded
- * work, not a deadlock. */
+/* 内部辅助实现 */
 static void emit_eh_oom_abort(zan_irgen_t *g, const char *msg);
 static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
                              LLVMValueRef calloc_fn,
@@ -1101,7 +1006,7 @@ static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
 
     LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
     LLVMValueRef fn = LLVMGetBasicBlockParent(cur);
-    /* The caller's current block (under the lock) falls into the grow. */
+    /* The caller's current block (under the lock) falls into the grow */
     LLVMBasicBlockRef head  = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.head");
     LLVMBasicBlockRef walk  = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.walk");
     LLVMBasicBlockRef body  = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.body");
@@ -1164,7 +1069,7 @@ static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
     LLVMBuildCondBr(g->builder, live, place, bump);
 
     LLVMPositionBuilderAtEnd(g->builder, place);
-    /* Same mix as the reader: key ^ (key >> 32), masked to the new width. */
+    /* Same mix as the reader: key ^ (key >> 32), masked to the new width */
     LLVMValueRef h = zan_and(g->builder,
         LLVMBuildXor(g->builder, k,
             LLVMBuildLShr(g->builder, k, LLVMConstInt(i64t, 32, 0), "hi"),
@@ -1186,8 +1091,7 @@ static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
     LLVMPositionBuilderAtEnd(g->builder, full);
     /* Zeroed fresh array: this is a plain store. */
     LLVMBuildStore(g->builder, k, nkp);
-    /* sb is ptr-to-i8*, so GEP2 with that element type scales p by 8 itself;
-     * multiplying here too would index out of bounds. */
+    /* 内部辅助逻辑 */
     LLVMValueRef nsp = LLVMBuildGEP2(g->builder, states_ptr_ty, sb, &p, 1,
                                      "gw.nsp");
     LLVMValueRef osp = LLVMBuildGEP2(g->builder, states_ptr_ty,
@@ -1198,9 +1102,7 @@ static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
     LLVMBuildBr(g->builder, bump);
 
     LLVMPositionBuilderAtEnd(g->builder, npos);
-    /* Wrap the probe back to slot 0 at the array end: the start slot is masked
-     * and the reader probes mask every step, so without this mask a collision
-     * chain that crosses the last slot walks off the allocation. */
+    /* 内部辅助逻辑 */
     LLVMValueRef p2 = zan_and(g->builder,
         zan_add(g->builder, p, LLVMConstInt(i64t, 1, 0), "p.next"),
         LLVMBuildSub(g->builder, newcap, LLVMConstInt(i64t, 1, 0), "gw.m1b"),
@@ -1214,13 +1116,10 @@ static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
     LLVMBuildBr(g->builder, head2);
 
     LLVMPositionBuilderAtEnd(g->builder, fin);
-    /* Install. A stale reader cannot exist: only lock holders read the arrays
-     * (slow path) or the per-thread cache (state), and this thread holds the
-     * lock. Old arrays are freed after the pointer swap. */
+    /* Install */
     LLVMValueRef ok = LLVMBuildLoad2(g->builder, i64ptr, keys_gv, "gw.oldk2");
     LLVMValueRef os = LLVMBuildLoad2(g->builder, states_ptr_ty, states_gv, "gw.olds");
-    /* Plain stores: the mutex that guards them also provides the
-     * visibility ordering between the installer and later claimers. */
+    /* 内部辅助逻辑 */
     LLVMBuildStore(g->builder, kb, keys_gv);
     LLVMBuildStore(g->builder,
         LLVMBuildBitCast(g->builder, sb, states_ptr_ty, "sb.t"), states_gv);
@@ -1230,22 +1129,16 @@ static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
         (LLVMValueRef[]){ LLVMBuildBitCast(g->builder, os, i8ptr, "os.c") }, 1, "");
     LLVMBuildBr(g->builder, done);
     LLVMPositionBuilderAtEnd(g->builder, done);
-    /* The builder is left at gw.done so the caller's next emitted instruction
-     * lands there; the caller re-positions as it needs (it re-probes). */
+    /* The builder is left at gw */
     (void)src;
 }
 
 static LLVMValueRef get_eh_state_fn(zan_irgen_t *g);
 static LLVMValueRef get_eh_state_fast_fn(zan_irgen_t *g);
-/* Remembered in the irgen context so zan_call2's wasm32 invoke conversion can
- * keep the state accessor a plain call: it never raises (pure runtime read of
- * the thread slot), and as an invoke it would split whatever block the EH
- * helpers re-enter (the function entry) mid-emission, stranding the field
- * GEPs that follow against the new terminator. */
+/* 内部辅助实现 */
 static void wasm_note_state_fn(zan_irgen_t *g, LLVMValueRef state_fn);
 
-/* Position the builder in the current function's entry block, where the EH
- * state pointer and its field addresses are materialized (see irgen.h). */
+/* 内部辅助逻辑 */
 static LLVMBasicBlockRef eh_enter_entry_block(zan_irgen_t *g) {
     LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry =
@@ -1256,9 +1149,7 @@ static LLVMBasicBlockRef eh_enter_entry_block(zan_irgen_t *g) {
     return cur;
 }
 
-/* The calling thread's state block, typed. Emitted once per function; the
- * pointer is stable for the thread's lifetime, so every try, throw and catch
- * in the function shares it. */
+/* The calling thread's state block, typed */
 static LLVMValueRef emit_eh_state(zan_irgen_t *g) {
     LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
     LLVMValueRef fn = cur ? LLVMGetBasicBlockParent(cur) : NULL;
@@ -1282,12 +1173,7 @@ static LLVMValueRef emit_eh_state(zan_irgen_t *g) {
 static void add_enum_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
                           const char *name);
 
-/* i8* __zan_eh_state_fast(): the thread-local cache read, with the table
- * lookup left out of line (every push and pop of an owned temporary asks for
- * the state block). alwaysinline rather than a hint: the wrapper only pays
- * off when the fast path lands in the caller, and the optimizer's own
- * size-based hint stops at four blocks. Falls back to the table accessor
- * where there is no cache (see get_eh_self_slot). */
+/* 内部辅助实现 */
 static LLVMValueRef get_eh_state_fast_fn(zan_irgen_t *g) {
     LLVMValueRef slow = get_eh_state_fn(g);
     LLVMValueRef self_slot = get_eh_self_slot(g);
@@ -1332,10 +1218,7 @@ static LLVMValueRef emit_eh_field_ptr(zan_irgen_t *g, unsigned field,
     return p;
 }
 
-/* Exception-handling state pointers for the calling thread: the handler
- * stack's top index (-1 = empty), the handler chunk table and the in-flight
- * exception object. Index handler slots with emit_eh_buf_ptr /
- * emit_eh_mark_ptr, never with a direct GEP. */
+/* 内部辅助实现 */
 static void get_eh_globals(zan_irgen_t *g, LLVMValueRef *top,
                            LLVMValueRef *bufs, LLVMValueRef *exc) {
     *top = emit_eh_field_ptr(g, EH_F_TOP, "eh.topp");
@@ -1343,7 +1226,7 @@ static void get_eh_globals(zan_irgen_t *g, LLVMValueRef *top,
     if (bufs) *bufs = emit_eh_field_ptr(g, EH_F_BUFS, "eh.bufsp");
 }
 
-/* Aborts with a message: reached only when a stack cannot be extended. */
+/* Aborts with a message: reached only when a stack cannot be extended */
 static void emit_eh_oom_abort(zan_irgen_t *g, const char *msg) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1357,14 +1240,7 @@ static void emit_eh_oom_abort(zan_irgen_t *g, const char *msg) {
     LLVMBuildUnreachable(g->builder);
 }
 
-/* void __zan_eh_release(): drop the calling thread's EH state block.
- * Releasing marks the slot with a tombstone so it can be reclaimed,
- * and frees the block and its chunks.
- *
- * Called from the thread trampoline once the body has returned, and exported
- * so a foreign thread (an X11 / SDL / Cocoa callback that ran Zan code) can
- * detach itself via zan_thread_detach. Calling it from a thread that never
- * used the runtime, or twice, is a no-op. */
+/* void __zan_eh_release(): drop the calling thread's EH state block */
 static void emit_eh_release_fn(zan_irgen_t *g) {
     if (LLVMGetNamedFunction(g->mod, "__zan_eh_release")) return;
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -1401,9 +1277,7 @@ static void emit_eh_release_fn(zan_irgen_t *g) {
     LLVMValueRef sp_slot = LLVMBuildAlloca(g->builder, LLVMPointerType(i8ptr, 0), "spp");
     LLVMValueRef st_slot = LLVMBuildAlloca(g->builder, i8ptr, "stp");
     LLVMValueRef kp_slot = LLVMBuildAlloca(g->builder, LLVMPointerType(i64t, 0), "kpp");
-    /* The lock stays held across the chunk-freeing walk: it is bounded (64
-     * chunk slots) and releasing the block of a live thread's id must not race
-     * with that thread claiming it back. */
+    /* 内部辅助逻辑 */
     emit_eh_tab_lock_acquire(g, lock_gv);
     LLVMValueRef cap = LLVMBuildLoad2(g->builder, i64t, cap_gv, "st.cap");
     LLVMValueRef capm1 = LLVMBuildSub(g->builder, cap,
@@ -1433,8 +1307,7 @@ static void emit_eh_release_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(g->builder,
         zan_icmp(g->builder, LLVMIntEQ, k, key, "is.mine"), found, next);
 
-    /* Not this thread's slot. An empty one ends the search: the thread never
-     * claimed a block, so there is nothing to release. */
+    /* Not this thread's slot */
     LLVMPositionBuilderAtEnd(g->builder, next);
     LLVMValueRef k2 = LLVMBuildLoad2(g->builder, i64t,
         LLVMBuildLoad2(g->builder, LLVMPointerType(i64t, 0), kp_slot, "kp.v"),
@@ -1462,8 +1335,7 @@ static void emit_eh_release_fn(zan_irgen_t *g) {
     LLVMBuildStore(g->builder, zero64, c_slot);
     LLVMBuildBr(g->builder, cloop);
 
-    /* Both chunk tables are walked together: a chunk is calloc'd on first use
-     * and is this thread's alone, so nothing else can be looking at one. */
+    /* 内部辅助逻辑 */
     LLVMPositionBuilderAtEnd(g->builder, cloop);
     LLVMValueRef c = LLVMBuildLoad2(g->builder, i64t, c_slot, "c.v");
     LLVMBuildCondBr(g->builder,
@@ -1490,9 +1362,7 @@ static void emit_eh_release_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, drop);
     LLVMValueRef stv = LLVMBuildLoad2(g->builder, i8ptr, st_slot, "st.v2");
     zan_call2(g->builder, free_ty, free_fn, &stv, 1, "");
-    /* The block is gone, so the caller's cached pointer must go with it: this
-     * thread may enter a try again (a detached foreign thread that calls back
-     * in) and would otherwise reuse freed memory. */
+    /* 内部辅助逻辑 */
     LLVMValueRef eh_self = get_eh_self_slot(g);
     if (eh_self)
         LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), eh_self);
@@ -1508,23 +1378,7 @@ static void emit_eh_release_fn(zan_irgen_t *g) {
     LLVMBuildRetVoid(g->builder);
 }
 
-/* i8* __zan_eh_state(): the calling thread's EH state block, created on that
- * thread's first use of it.
- *
- * Threads are found in an open-addressed table keyed on the OS thread id,
- * guarded by a spinlock (see get_eh_tab_lock). The lock is held across the
- * whole lookup-or-claim-or-grow: the table arrays can be swapped by a
- * concurrent rehash mid-probe otherwise. Claim is a plain store (the lock
- * serializes claimers); after that only the owner touches its slot, so the
- * state pointer itself needs no synchronization -- and the per-thread cache
- * keeps every later use lock-free.
- *
- * A full table grows instead of failing: ZAN_EH_THREADS (1024) is the initial
- * capacity only, doubled whenever a probe runs off the end. Blocks are never
- * freed while claimed: a thread id recycled by the OS reuses the block of the
- * thread that had it, which is correct because a thread that exits with an
- * exception in flight terminates the program. __zan_eh_release frees the
- * block and tombstones the slot. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_state");
     if (fn) return fn;
@@ -1563,8 +1417,7 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef full  = LLVMAppendBasicBlockInContext(g->ctx, fn, "full");
     LLVMBasicBlockRef probe2 = LLVMAppendBasicBlockInContext(g->ctx, fn, "probe2");
 
-    /* Allocas stay in the entry block so mem2reg still promotes them; the
-     * thread-local fast path is the entry block's only other content. */
+    /* 内部辅助逻辑 */
     LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMValueRef i_slot = LLVMBuildAlloca(g->builder, i64t, "i");
     if (self_slot) {
@@ -1580,9 +1433,7 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
         LLVMDeleteBasicBlock(hit);
     }
 
-    /* Slow path: under the table mutex, lookup or claim a slot. The lock is
-     * held for the whole search so a concurrent rehash cannot swap the arrays
-     * mid-probe; the per-thread cache keeps every later use lock-free. */
+    /* Slow path: under the table mutex, lookup or claim a slot */
     LLVMPositionBuilderAtEnd(g->builder, look);
     emit_eh_tab_lock_acquire(g, lock_gv);
     LLVMValueRef cap0 = LLVMBuildLoad2(g->builder, i64t, cap_gv, "st.cap0");
@@ -1631,17 +1482,14 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
     LLVMBuildRet(g->builder, st_found);
 
     LLVMPositionBuilderAtEnd(g->builder, claim);
-    /* Free (never used) or a tombstone left by a thread that released its
-     * block. Both are claimable; only the tombstone must keep a probe passing
-     * through it, which it does because the probe stops at key 0 alone. */
+    /* Free (never used) or a tombstone left by a thread that released its block */
     LLVMValueRef reusable = LLVMBuildOr(g->builder,
         zan_icmp(g->builder, LLVMIntEQ, k, LLVMConstInt(i64t, 0, 0), "is.free"),
         zan_icmp(g->builder, LLVMIntEQ, k,
             LLVMConstInt(i64t, ZAN_EH_TOMBSTONE, 0), "is.dead"), "reusable");
     LLVMBuildCondBr(g->builder, reusable, make, next);
 
-    /* Claim it. Losing the race means another thread took this slot between the
-     * load and here, so move on to the next one. */
+    /* Claim it */
     LLVMPositionBuilderAtEnd(g->builder, make);
     LLVMValueRef xchg = LLVMBuildAtomicCmpXchg(g->builder, kp,
         k, key,
@@ -1663,7 +1511,7 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
         "zan: out of memory creating this thread's exception state\n");
 
     LLVMPositionBuilderAtEnd(g->builder, ready);
-    /* An empty handler stack is -1, the one field a zeroed block gets wrong. */
+    /* An empty handler stack is -1, the one field a zeroed block gets wrong */
     LLVMBuildStore(g->builder, LLVMConstInt(i32t, (unsigned long long)-1, 1),
         LLVMBuildStructGEP2(g->builder, state_ty,
             LLVMBuildBitCast(g->builder, st, LLVMPointerType(state_ty, 0),
@@ -1682,8 +1530,7 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(g->builder,
         zan_icmp(g->builder, LLVMIntUGE, ni, cap2, "exhausted"), full, probe2);
 
-    /* No free slot at the current capacity: double the table (the mutex is
-     * still held) and probe again from the top. */
+    /* 内部辅助逻辑 */
     LLVMPositionBuilderAtEnd(g->builder, full);
     emit_eh_tab_grow(g, state_ty, calloc_fn, free_ty, free_fn);
     LLVMBuildBr(g->builder, probe);
@@ -1692,14 +1539,7 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* i8* <name>(i8* state, i32 idx): the address of entry `idx` in one of the
- * calling thread's chunked stacks, bringing its chunk into existence on first
- * use. `shift` entries of `elem` bytes per chunk; a chunk is never freed, so an
- * address handed out here stays valid and stays put for the life of the thread
- * -- required for armed jmp_bufs. Running past the chunk table (4096 live
- * handlers / 256K stacked temporaries per thread) or failing to allocate a
- * chunk is fatal: there is no correct way to continue a try whose handler
- * cannot be armed, and silently dropping the entry corrupts the stack. */
+/* 内部辅助实现 */
 static LLVMValueRef get_eh_chunk_fn(zan_irgen_t *g, const char *name,
                                     unsigned field, unsigned shift,
                                     unsigned elem, const char *deep_msg) {
@@ -1764,7 +1604,7 @@ static LLVMValueRef get_eh_chunk_fn(zan_irgen_t *g, const char *name,
     return fn;
 }
 
-/* Call one of the chunked-stack accessors for the calling thread. */
+/* Call one of the chunked-stack accessors for the calling thread */
 static LLVMValueRef emit_eh_chunk_call(zan_irgen_t *g, LLVMValueRef fn,
                                       LLVMValueRef idx, const char *name) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -1776,15 +1616,7 @@ static LLVMValueRef emit_eh_chunk_call(zan_irgen_t *g, LLVMValueRef fn,
         fn, args, 2, name);
 }
 
-/* First-touch chunk geometry. A hosted process pays the default shifts'
- * 64x1040B handler chunk + 4096x8B unwind chunk without noticing; a
- * bare-metal pool (default 64KiB) cannot — the first try/catch would be a
- * fatal OOM at 97% of the whole heap. Bare-metal ELF targets therefore take
- * narrow chunks: the chunk table still holds ZAN_EH_CHUNKS entries, so only
- * the granularity (and the per-chunk calloc) shrinks — 2080B per handler
- * chunk (128 max nested tries), 512B per unwind chunk (4096 entries). The
- * on-heap layout of a slot is target-independent (ZAN_EH_SLOT_BYTES), so the
- * two geometries never mix in one program. */
+/* First-touch chunk geometry */
 static bool eh_bare_target(zan_irgen_t *g) {
     return strncmp(g->target_triple, "riscv", 5) == 0 &&
            !strstr(g->target_triple, "linux");
@@ -1809,7 +1641,7 @@ static LLVMValueRef emit_eh_buf_ptr(zan_irgen_t *g, LLVMValueRef idx) {
     return emit_eh_chunk_call(g, get_eh_slot_fn(g), idx, "eh.bufp");
 }
 
-/* i32* to handler slot `idx`'s unwind-stack mark, which trails its jmp_buf. */
+/* i32* to handler slot `idx`'s unwind-stack mark, which trails its jmp_buf */
 static LLVMValueRef emit_eh_mark_ptr(zan_irgen_t *g, LLVMValueRef idx) {
     LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -1819,7 +1651,7 @@ static LLVMValueRef emit_eh_mark_ptr(zan_irgen_t *g, LLVMValueRef idx) {
         LLVMPointerType(i32t, 0), "eh.markp");
 }
 
-/* Marks a function and a call to it with a simple enum attribute. */
+/* Marks a function and a call to it with a simple enum attribute */
 static void add_enum_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
                           const char *name) {
     unsigned kind = LLVMGetEnumAttributeKindForName(name, strlen(name));
@@ -1831,29 +1663,14 @@ static void add_enum_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
                                  attr);
 }
 
-/* True for the Windows-on-ARM64 target, whose setjmp needs the mingw-w64
- * static pair rather than an msvcrt export (see emit_eh_setjmp). */
+/* 内部辅助逻辑 */
 static bool target_is_windows_arm64(zan_irgen_t *g) {
     return g->target_is_windows &&
            (strstr(g->target_triple, "aarch64") != NULL ||
             strstr(g->target_triple, "arm64") != NULL);
 }
 
-/* i32 setjmp on the current target: `_setjmp(buf, NULL)` on Windows, `_setjmp(buf)`
- * elsewhere (no sigmask save). The Windows two-argument form is load-bearing:
- * the bundled toolchain links msvcrt.dll, whose `_setjmp` saves the caller's
- * return address from rdx into jmp_buf[0] (longjmp restores it), and it is the
- * two-argument call shape that makes the LLVM backend emit the
- * `rdx = return address` preamble -- a one-argument call leaves rdx as garbage
- * and every throw jumps to it. The call carries `returns_twice`: without it
- * the backend may keep values in registers across the setjmp, and whatever
- * the longjmp'd-to catch block reads afterwards is garbage.
- *
- * Windows-arm64 lowers onto mingw-w64's own static pair instead: msvcrt.dll
- * on ARM64 has no `_setjmp`, and the rdx-preamble trick is x64-only.
- * `__mingw_setjmp` saves the return address straight from Lr at entry and
- * `__mingw_longjmp` restores the same buffer; both are in libmingwex.a of
- * every mingw-ABI arm64 toolchain, with no OS export involved. */
+/* 内部辅助逻辑 */
 static LLVMValueRef emit_eh_setjmp(zan_irgen_t *g, LLVMValueRef bufp) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1872,13 +1689,7 @@ static LLVMValueRef emit_eh_setjmp(zan_irgen_t *g, LLVMValueRef bufp) {
         add_enum_attr(g, fn, call, "returns_twice");
         return call;
     }
-    /* Bare-metal ELF libc (picolibc/newlib, the riscv*-unknown-elf case)
-     * ships only `setjmp` — `_setjmp` is a hosted-libc (glibc/msvcrt) name.
-     * Linux triples keep `_setjmp` because it skips the sigmask save.
-     * wasm32/64 have no libc setjmp at all (wasi-libc) and no backend sjlj
-     * lowering: `setjmp` resolves to the always-calm stub in zanrt_wasm.o —
-     * the wasm EH transport is the engine's (wasm.throw + catchswitch), so
-     * the armed guard can never be re-entered by a longjmp; see rt_wasm.c. */
+    /* 内部辅助实现 */
     bool riscv_bare = strncmp(g->target_triple, "riscv", 5) == 0 &&
                       !strstr(g->target_triple, "linux");
     LLVMTypeRef ty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ i8ptr }, 1, 0);
@@ -1894,8 +1705,7 @@ static void emit_eh_longjmp(zan_irgen_t *g, LLVMValueRef bufp) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
         (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0);
-    /* Pair with the setjmp side (see emit_eh_setjmp): __mingw_longjmp reads
-     * the exact buffer __mingw_setjmp wrote. */
+    /* 内部辅助逻辑 */
     const char *name = target_is_windows_arm64(g) ? "__mingw_longjmp" : "longjmp";
     LLVMValueRef fn = get_libc_fn(g, name, ty);
     LLVMValueRef call = zan_call2(g->builder, ty, fn,
@@ -1903,18 +1713,9 @@ static void emit_eh_longjmp(zan_irgen_t *g, LLVMValueRef bufp) {
     add_enum_attr(g, fn, call, "noreturn");
 }
 
-/* WebAssembly EH (wasm32 target): wasi-libc ships no setjmp/longjmp, so
- * try/catch lowers onto the WebAssembly exception-handling proposal -- `try`
- * becomes a catchswitch whose unwind edges are the invokes zan_call2 emits
- * inside the body, `throw` becomes the `wasm.throw` intrinsic with the C++
- * exception tag (the tag object is toolchain/wasm32/zanrt_ehtag.o, linked on
- * demand). The engine unwinds, so the __zan_eh_* globals keep the role they
- * have in the longjmp lowering: in-flight object, owned flag and type
- * descriptor for catch dispatch, armed-handler stack for cleanup. */
+/* 内部辅助实现 */
 
-/* void @llvm.wasm.throw(i32 tag, i8* payload), noreturn: the raise used where
- * no same-function pad exists (a throw escaping this frame). The engine
- * unwinds to the caller's region; no link-time symbol is involved. */
+/* void @llvm */
 static LLVMValueRef get_wasm_throw_intrinsic_fn(zan_irgen_t *g) {
     if (g->wasm_eh_throw_intrinsic_fn)
         return g->wasm_eh_throw_intrinsic_fn;
@@ -1929,10 +1730,7 @@ static LLVMValueRef get_wasm_throw_intrinsic_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* void @__cxa_throw(ptr obj, ptr tinfo, ptr dtor), noreturn: the raise call
- * WasmEHPrepare recognizes. Clang emits the same invoke for a C++ throw; the
- * wasm backend rewrites it into the `throw` instruction (tag __cpp_exception,
- * defined by toolchain/wasm32/zanrt_ehtag.o) and drops the symbol. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_wasm_cxa_throw_fn(zan_irgen_t *g) {
     if (g->wasm_eh_throw_fn) return g->wasm_eh_throw_fn;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1945,9 +1743,7 @@ static LLVMValueRef get_wasm_cxa_throw_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* i32 @__gxx_wasm_personality_v0(...): the name the WebAssembly backend
- * requires on every function carrying EH IR. No libcxxabi is linked -- Zan
- * dispatches clauses on its own globals, the personality is a marker. */
+/* i32 @__gxx_wasm_personality_v0( */
 static LLVMValueRef get_wasm_personality_fn(zan_irgen_t *g) {
     if (g->wasm_eh_personality_fn) return g->wasm_eh_personality_fn;
     LLVMTypeRef ty = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), NULL, 0, 1);
@@ -1957,9 +1753,7 @@ static LLVMValueRef get_wasm_personality_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* Attach the wasm personality to the function being emitted. Called when a
- * try is lowered (catchswitch requires it) so lambdas and async $resume
- * bodies pick it up through the same path. */
+/* Attach the wasm personality to the function being emitted */
 static void wasm_eh_set_personality(zan_irgen_t *g) {
     if (!g->target_is_wasm || !g->current_fn) return;
     LLVMSetPersonalityFn(g->current_fn, get_wasm_personality_fn(g));
@@ -1969,22 +1763,14 @@ static void wasm_note_state_fn(zan_irgen_t *g, LLVMValueRef state_fn) {
     if (g->target_is_wasm) g->wasm_eh_state_fn = state_fn;
 }
 
-/* Raising the exception: the throw-site releases have already run, the
- * in-flight globals are stored. wasm.throw never returns; the engine unwinds
- * to the innermost enclosing try (of this frame or a caller's). */
+/* 内部辅助逻辑 */
 static void emit_wasm_throw_op(zan_irgen_t *g, LLVMValueRef exc_obj) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef fn = get_wasm_cxa_throw_fn(g);
     if (LLVMGetTypeKind(LLVMTypeOf(exc_obj)) == LLVMPointerTypeKind &&
         LLVMTypeOf(exc_obj) != i8ptr)
         exc_obj = LLVMBuildBitCast(g->builder, exc_obj, i8ptr, "wt.exc");
-    /* The raise is an invoke of __cxa_throw to the current try's pad -- the
-     * exact shape WasmEHPrepare rewrites into the `throw` instruction. wasm
-     * EH ties a block to its enclosing handler only through unwind edges, so
-     * a plain raise call inside the same function would never reach the
-     * catchswitch. Inside a catchpad funclet (rethrow) the current pad comes
-     * from a different function's stack or is absent, so fall back to a
-     * plain call there; the funclet's own catchswitch covers it. */
+    /* 内部辅助实现 */
     LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef lpad = g->wasm_try_depth > 0
         ? g->wasm_lpad_stack[g->wasm_try_depth - 1] : NULL;
@@ -2000,10 +1786,7 @@ static void emit_wasm_throw_op(zan_irgen_t *g, LLVMValueRef exc_obj) {
         LLVMBuildUnreachable(g->builder);
         return;
     }
-    /* No same-function pad: the throw escapes this frame and the engine
-     * unwinds into the caller's region. The intrinsic's plain call lowers
-     * straight to the `throw` opcode (__cxa_throw would never be rewritten
-     * out here and would fail to link). */
+    /* 内部辅助逻辑 */
     LLVMValueRef inl = get_wasm_throw_intrinsic_fn(g);
     LLVMBuildCall2(g->builder,
         LLVMGlobalGetValueType(inl), inl,
@@ -2012,11 +1795,7 @@ static void emit_wasm_throw_op(zan_irgen_t *g, LLVMValueRef exc_obj) {
     LLVMBuildUnreachable(g->builder);
 }
 
-/* The landing pad of one armed try: catchswitch (unwinds to the caller, i.e.
- * the enclosing invoke) with a single catch_all handler; the catchpad ends
- * in a CatchRet that resumes normal control flow in the try's catch block,
- * where the longjmp lowering's catch code takes over. The pad block itself
- * carries no payload handling: Zan reads the exception from its globals. */
+/* The landing pad of one armed try: catchswitch (unwinds to the caller, i */
 static LLVMBasicBlockRef emit_wasm_lpad(zan_irgen_t *g,
                                         LLVMBasicBlockRef catch_bb) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -2037,24 +1816,13 @@ static LLVMBasicBlockRef emit_wasm_lpad(zan_irgen_t *g,
     return lpad_bb;
 }
 
-/* EH-owned temporaries: `throw` unwinds with longjmp, which skips the
- * compiler-emitted releases of owned temporaries that are live across a call
- * (a partially-constructed object during its ctor, or an owned receiver temp
- * of a method call), so a throwing callee would leak them. Each such temp is
- * pushed onto a small global stack for the duration of the call and popped on
- * normal return; entering a catch releases every entry pushed after its try
- * was entered. */
-/* Storage for the unwind stack: chunked like the handler stack (see
- * get_eh_chunk_fn), because its depth is recursion depth times the number of
- * live owning locals per frame -- nothing the compiler can bound. */
+/* 内部辅助实现 */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_eh_tmp_top_global(zan_irgen_t *g) {
     return emit_eh_field_ptr(g, EH_F_TMPS_TOP, "eh.tmptopp");
 }
 
-/* i8* __zan_eh_tmp_slot_fast(i8* state, i32 idx): entry `idx` when it lives in
- * the unwind stack's first chunk, which is every entry a program under 4096
- * live owned temporaries per thread ever asks for; only chunk creation and
- * the deeper chunks stay out of line. */
+/* 内部辅助实现 */
 static LLVMValueRef get_eh_tmp_slot_fast_fn(zan_irgen_t *g, LLVMValueRef slow) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tmp_slot_fast");
     if (fn) return fn;
@@ -2123,27 +1891,17 @@ static LLVMValueRef emit_eh_tmp_slot_ptr(zan_irgen_t *g, LLVMValueRef idx) {
         LLVMPointerType(i8ptr, 0), "eh.tslotp");
 }
 
-/* i32 flag: the in-flight __zan_eh_exc holds a +1 reference (class-typed
- * throw) that the catch must release after the handler runs. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_eh_exc_owned_global(zan_irgen_t *g) {
     return emit_eh_field_ptr(g, EH_F_EXC_OWNED, "eh.ownp");
 }
 
-/* i8* pointing at the thrown object's class type-descriptor (see
- * get_class_tid_global); null for string/non-class throws. Catch clauses use
- * it for type-based dispatch. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_eh_exc_tid_global(zan_irgen_t *g) {
     return emit_eh_field_ptr(g, EH_F_EXC_TID, "eh.tidp");
 }
 
-/* Per-class type descriptor for exception dispatch: an i8* global named
- * __zan_tid_<Class> whose value is the base class's descriptor (or null for
- * a root class). Identity is the descriptor's ADDRESS; the stored pointer
- * links the inheritance chain so `catch (Base b)` matches derived throws.
- * Every descriptor created here also registers its {address, class name}
- * pair in g->tid_names: the unhandled-exception reporter matches the thrown
- * object's descriptor chain against these addresses at RUNTIME (addresses,
- * not names, survive into the binary) to print the real class name. */
+/* 内部辅助实现 */
 static LLVMValueRef get_class_tid_global(zan_irgen_t *g, zan_symbol_t *sym) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     char name[512];
@@ -2171,14 +1929,7 @@ static LLVMValueRef get_class_tid_global(zan_irgen_t *g, zan_symbol_t *sym) {
     return v;
 }
 
-/* i1 __zan_eh_tid_match(i8* thrown, i8* want): walks the thrown descriptor's
- * base chain looking for `want`. A null thrown descriptor (string / legacy
- * throw) matches NO typed clause: the object is not an Exception subclass, so
- * binding it to a typed catch variable (and then reading fields off it, e.g.
- * e.Message) would dereference string data as an object and crash. A string
- * throw is only caught by an untyped `catch { }` (or a non-class clause like
- * `catch (string s)`), which the emitter routes straight to its body without
- * calling this function. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_eh_tid_match_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tid_match");
     if (fn) return fn;
@@ -2224,14 +1975,7 @@ static LLVMValueRef get_eh_tid_match_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* i8* __zan_eh_tid_name(i8* thrown): walks the thrown descriptor's base chain
- * and returns the registered class-name string of the FIRST entry whose
- * registered descriptor address appears in that chain, or null. The registry
- * is a static array of {i8* tid, i8* name} pairs grown lazily as classes get
- * descriptors, terminated by a null tid. This is what makes an uncaught
- * `throw new FileNotFoundException("x")` print the class name instead of
- * "(class object)": descriptors are addresses, so the reporter can only
- * identify a class by matching the thrown chain against the registry. */
+/* 内部辅助实现 */
 static LLVMValueRef get_eh_tid_name_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tid_name");
     if (fn) return fn;
@@ -2252,8 +1996,7 @@ static LLVMValueRef get_eh_tid_name_fn(zan_irgen_t *g) {
     LLVMValueRef tn = zan_icmp(g->builder, LLVMIntEQ, thrown,
         LLVMConstNull(i8ptr), "tnull");
     LLVMBuildCondBr(g->builder, tn, no, chain);
-    /* walk the thrown descriptor's base chain (the descriptor slot itself
-     * holds the base descriptor's address; a root class holds null) */
+    /* 内部辅助逻辑 */
     LLVMPositionBuilderAtEnd(g->builder, chain);
     LLVMValueRef cur = LLVMBuildAlloca(g->builder, i8ptr, "cur");
     LLVMBuildStore(g->builder, thrown, cur);
@@ -2264,15 +2007,13 @@ static LLVMValueRef get_eh_tid_name_fn(zan_irgen_t *g) {
         zan_icmp(g->builder, LLVMIntEQ, c, LLVMConstNull(i8ptr), "cnull"),
         no, ent);
     LLVMPositionBuilderAtEnd(g->builder, ent);
-    /* for each registry entry, compare its tid against the current chain
-     * link; entry.tid == NULL terminates the registry */
+    /* for each registry entry, compare its tid against the current chain link; entry */
     LLVMTypeRef ent_ty = LLVMStructTypeInContext(g->ctx,
         (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
     LLVMTypeRef reg_ty = LLVMArrayType(ent_ty, 0);
     LLVMValueRef reg = LLVMAddGlobal(g->mod, reg_ty, "__zan_tid_name_reg");
     LLVMSetLinkage(reg, LLVMInternalLinkage);
-    /* zero-initialized: entry.tid of every pair is null, i.e. a terminated
-     * empty registry -- the fill pass writes real pairs into it */
+    /* zero-initialized: entry */
     LLVMValueRef idx[2] = { LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0),
                             LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0) };
     LLVMValueRef reg0 = LLVMBuildInBoundsGEP2(g->builder, reg_ty, reg, idx, 2,
@@ -2319,8 +2060,7 @@ static LLVMValueRef get_eh_tid_name_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, no);
     LLVMBuildRet(g->builder, LLVMConstNull(i8ptr));
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
-    /* the registry is filled after emission; remember the global and its
-     * element type for the fill pass on the irgen struct */
+    /* 内部辅助逻辑 */
     g->tid_name_reg_global = reg;
     g->tid_name_reg_ent_ty = ent_ty;
     return fn;
@@ -2337,8 +2077,7 @@ static LLVMValueRef get_eh_tmp_push_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
-    /* after positioning: the state pointer is materialized in the entry block
-     * of whatever function is being emitted, and must be this one */
+    /* 内部辅助逻辑 */
     LLVMValueRef top_g = get_eh_tmp_top_global(g);
     LLVMValueRef top = LLVMBuildLoad2(g->builder, i32t, top_g, "top");
     LLVMBuildStore(g->builder, LLVMGetParam(fn, 0), emit_eh_tmp_slot_ptr(g, top));
@@ -2379,18 +2118,7 @@ static LLVMValueRef get_eh_tmp_pop_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* void __zan_eh_tmp_unwind(i32 mark): release every stacked temp above
- * `mark`, restoring the stack to the try-entry depth. Object/class entries use
- * zan_rt_release_dyn; string slots use zan_rt_str_release because strings have
- * a different header and are not valid inputs to the dynamic object releaser;
- * delegate slots go through the closure release, which leaves a bare function
- * pointer -- a static method, a non-capturing lambda, a native address --
- * alone instead of decrementing a refcount it never had. Array slots use
- * zan_rt_arr_release: an array keeps its refcount in its own prefix, and its
- * count word sits where an object header keeps a refcount, so the dynamic
- * releaser would decrement the length instead. (An unwound array of
- * rc-managed elements drops the buffer but not the elements: the element type
- * is a compile-time property the runtime entry does not carry.) */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tmp_unwind");
     if (fn) return fn;
@@ -2429,13 +2157,7 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMValueRef slot = emit_eh_tmp_slot_ptr(g, ntop);
     LLVMValueRef obj = LLVMBuildLoad2(g->builder, i8ptr, slot, "obj");
     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), slot);
-    /* Entry flavours share the stack. Plain object pointers have their low
-     * bits clear (RC allocations are naturally aligned). Variable slots set
-     * bit 0 and carry the release flavour of what they hold in bits 1-2
-     * (ZAN_EH_SLOT_*). The slot flavour keeps up with reassignment and lets
-     * unwind null the variable; the flavour is required because
-     * zan_rt_release_dyn expects an object allocation header, which neither a
-     * Zan string nor a bare function pointer has. */
+    /* Entry flavours share the stack */
     LLVMValueRef obj_i = LLVMBuildPtrToInt(g->builder, obj,
         LLVMInt64TypeInContext(g->ctx), "obji");
     LLVMValueRef tagged = LLVMBuildTrunc(g->builder,
@@ -2446,9 +2168,7 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef kind = zan_and(g->builder, obj_i,
         LLVMConstInt(i64t, 6, 0), "eh.kind");
-    /* The slot holds an i8*, so the untagged address is an i8** -- typing it
-     * as i8* makes the load/store below fail verification on a typed-pointer
-     * LLVM ("Stored value type does not match pointer operand type"). */
+    /* 内部辅助逻辑 */
     LLVMValueRef untag = LLVMBuildIntToPtr(g->builder,
         zan_and(g->builder, obj_i,
             LLVMConstInt(i64t, ~(uint64_t)7, 0), "untag"),
@@ -2551,10 +2271,7 @@ static void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj) {
     zan_call2(g->builder, fnty, get_eh_tmp_push_fn(g), &obj, 1, "");
 }
 
-/* Register a *variable slot* with the unwinder: an exception raised anywhere
- * below this frame releases whatever the variable holds at that moment, which
- * is the only way a longjmp-based unwind can free the locals of the frames it
- * skips over. */
+/* 内部辅助实现 */
 static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind) {
     if (!slot || LLVMGetTypeKind(LLVMTypeOf(slot)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -2568,10 +2285,7 @@ static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind) {
     zan_call2(g->builder, fnty, get_eh_tmp_push_fn(g), &tagged, 1, "");
 }
 
-/* Release everything the unwind stack holds above the depth handler `top` was
- * armed at. Emitted at the throw site, before the longjmp: the frames between
- * here and the handler are still alive at this point, and their locals are
- * only reachable through the slots they registered. */
+/* 内部辅助逻辑 */
 static void emit_eh_unwind_to_handler(zan_irgen_t *g, LLVMValueRef top) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMValueRef mp = emit_eh_mark_ptr(g, top);
@@ -2585,12 +2299,7 @@ static void emit_eh_tmp_pop(zan_irgen_t *g) {
     zan_call2(g->builder, fnty, get_eh_tmp_pop_fn(g), NULL, 0, "");
 }
 
-/* void __zan_eh_tmp_drop(i8* obj): unregister one stacked temp by identity.
- * A catch body that is abandoned by `return`/`break`/`continue`/`throw` has to
- * take back the exception it stacked at handler entry, but locals declared in
- * the handler sit above it, so popping the top would unregister the wrong
- * entry. Nulls the topmost entry equal to `obj` (and shrinks the stack when
- * that entry is the top). */
+/* void __zan_eh_tmp_drop(i8* obj): unregister one stacked temp by identity */
 static LLVMValueRef get_eh_tmp_drop_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tmp_drop");
     if (fn) return fn;
@@ -2660,8 +2369,7 @@ static void emit_eh_tmp_drop(zan_irgen_t *g, LLVMValueRef obj) {
     zan_call2(g->builder, fnty, get_eh_tmp_drop_fn(g), &obj, 1, "");
 }
 
-/* i8* __zan_str_join(i8* sep, i8* lst): join a List<string>'s elements with
- * `sep` into a fresh RC string (two passes: measure, then copy). */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_str_join_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_str_join");
     if (fn) return fn;
@@ -2713,8 +2421,7 @@ static LLVMValueRef get_str_join_fn(zan_irgen_t *g) {
         zan_icmp(g->builder, LLVMIntSLT, mi, n, "mlt"), m_body, c_pre);
     LLVMPositionBuilderAtEnd(g->builder, m_body);
     LLVMValueRef slot = LLVMBuildGEP2(g->builder, i64, data, &mi, 1, "slot");
-    /* a list may legitimately hold null entries (xs.Add(null)); join treats
-     * them as empty strings instead of handing NULL to strlen */
+    /* a list may legitimately hold null entries (xs */
     LLVMValueRef sv = emit_str_nonnull(g, LLVMBuildIntToPtr(g->builder,
         LLVMBuildLoad2(g->builder, i64, slot, "svi"), i8ptr, "sv"));
     LLVMValueRef sl = zan_call2(g->builder, strlen_ty, g->fn_strlen, &sv, 1, "sl");
@@ -2768,16 +2475,13 @@ static LLVMValueRef get_str_join_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* Coerce a Dict key value to the i8* slot representation (scalar keys are
- * stored inttoptr'd; string keys are already pointers). */
+/* 内部辅助逻辑 */
 static LLVMValueRef coerce_dict_key(zan_irgen_t *g, LLVMValueRef key,
                                     zan_type_t *kt) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     if (LLVMGetTypeKind(LLVMTypeOf(key)) == LLVMIntegerTypeKind) {
-        /* Normalize to the declared key width (Dict<int,...> keys are i32)
-         * before sign-extending, so a literal and a same-valued variable map
-         * to one raw key. */
+        /* Normalize to the declared key width (Dict<int, */
         LLVMTypeRef kem = kt ? map_type(g, kt) : NULL;
         if (kem && LLVMGetTypeKind(kem) == LLVMIntegerTypeKind &&
             LLVMGetIntTypeWidth(kem) < LLVMGetIntTypeWidth(LLVMTypeOf(key)))
@@ -2791,7 +2495,7 @@ static LLVMValueRef coerce_dict_key(zan_irgen_t *g, LLVMValueRef key,
     return key;
 }
 
-/* Emit `keys[i] == search` for a Dict scan via __zan_dict_key_eq. */
+/* 发射`keys[i] == search` for a Dict scan via __zan_dict_key_eq */
 static LLVMValueRef emit_dict_key_eq(zan_irgen_t *g, zan_type_t *dict_type,
                                      LLVMValueRef kv, LLVMValueRef search) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -2803,7 +2507,7 @@ static LLVMValueRef emit_dict_key_eq(zan_irgen_t *g, zan_type_t *dict_type,
         (LLVMValueRef[]){ kv, search, is_str }, 3, "keq");
 }
 
-/* Emit `__zan_dict_find(dict, key, is_str)` for a dict of type `dict_type`. */
+/* 发射`__zan_dict_find(dict, key, is_str)` for a dict of type `dict_type` */
 static LLVMValueRef emit_dict_find(zan_irgen_t *g, zan_type_t *dict_type,
                                    LLVMValueRef draw, LLVMValueRef key) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -2817,16 +2521,8 @@ static LLVMValueRef emit_dict_find(zan_irgen_t *g, zan_type_t *dict_type,
         (LLVMValueRef[]){ draw, key, is_str }, 3, "dfind");
 }
 
-/* Backing LLVM global for a static class/struct field `Class.field`.
- * Static fields are shared mutable storage (not compile-time constants):
- * they are lowered to an internal, zero-initialised module global. The
- * field's declared initializer is applied once at main() entry as a runtime
- * store (see emit_main_method), so any initializer expression works with
- * correct ordering. Returns NULL when `fsym` is not a static field. */
-/* The instantiation a static access names, if any: `Stat<int>.s` parses as an
- * identifier carrying `inst_type_ref`. Inside a specialized body the reference
- * is still written in terms of the type parameters (`Stat<T>.s`), so it is
- * substituted through the active instantiation. */
+/* Backing LLVM global for a static class/struct field `Class */
+/* The instantiation a static access names, if any: `Stat<int> */
 static zan_type_t *static_access_inst(zan_irgen_t *g, zan_ast_node_t *obj_expr) {
     if (!obj_expr || !obj_expr->ident.inst_type_ref) return NULL;
     zan_type_t *t = zan_binder_resolve_type(g->binder, obj_expr->ident.inst_type_ref);
@@ -2837,9 +2533,7 @@ static zan_type_t *static_access_inst(zan_irgen_t *g, zan_ast_node_t *obj_expr) 
 static LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_sym,
                                             zan_symbol_t *fsym,
                                             zan_type_t *inst) {
-    /* plain fields and automatic properties (`{ get; set; }`) share a backing
-     * global; custom-accessor properties are dispatched to their getter/setter
-     * methods and never reach here */
+    /* 内部辅助逻辑 */
     if (!class_sym || !fsym || !fsym->decl ||
         (fsym->decl->kind != AST_FIELD_DECL &&
          fsym->decl->kind != AST_PROPERTY_DECL))
@@ -2847,19 +2541,12 @@ static LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_
     if (!((fsym->modifiers & MOD_STATIC) ||
           (fsym->decl->field_decl.modifiers & MOD_STATIC)))
         return NULL;
-    /* Static fields and properties belong to their declaring type. When accessed
-     * through a derived type (e.g. `Derived.Tag` or bare `Tag` in Derived),
-     * class_sym reflects the access site rather than the declaring site.
-     * Anchor storage to fsym->parent so all reads and writes address the single
-     * initialized global. */
+    /* Static fields and properties belong to their declaring type */
     if (fsym->parent && (fsym->parent->kind == SYM_CLASS ||
                          fsym->parent->kind == SYM_STRUCT)) {
         class_sym = fsym->parent;
     }
-    /* A static of a generic class is per closed instantiation (C# rules):
-     * Stat<int>.s and Stat<string>.s are separate storage, so the backing
-     * global carries the instantiation suffix. A single unsuffixed global made
-     * every instantiation share one slot. */
+    /* A static of a generic class is per closed instantiation (C# rules): Stat<int> */
     if (!inst && g->cur_inst && g->cur_inst->sym == class_sym) inst = g->cur_inst;
     char suffix[256];
     suffix[0] = '\0';
@@ -2876,9 +2563,7 @@ static LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_
     gv = LLVMAddGlobal(g->mod, ft, name);
     LLVMSetLinkage(gv, LLVMInternalLinkage);
     LLVMSetInitializer(gv, LLVMConstNull(ft));
-    /* Register rc-managed static fields for program-exit cleanup: the
-     * main-unit sweep below can only see the unit containing main(), but
-     * stdlib singletons (Pinyin.cache, ...) live in other units. */
+    /* 内部辅助逻辑 */
     if (fsym->type && (is_rc_managed_type(fsym->type) || fsym->type->kind == TYPE_OBJECT)) {
         if (g->static_field_count >= g->static_field_cap) {
             g->static_field_cap = g->static_field_cap ? g->static_field_cap * 2 : 16;
@@ -2982,15 +2667,7 @@ static void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg,
     LLVMBuildStore(g->builder, LLVMConstNull(map_type(g, field_type)), field_ptr);
 }
 
-/* Null-conditional access `a?.b` / `a?.M(...)`: evaluate the receiver once,
- * bind it to a synthetic local, and only evaluate the member/call when it is
- * non-null; a null receiver yields the result type's zero value. The member
- * node is temporarily rewired to read the synthetic local so the ordinary
- * member/call codegen paths apply unchanged, then restored (the same AST may
- * be re-emitted, e.g. per generic instantiation). A value-typed result is
- * wrapped as `T?`, as in C#: a value type has no null of its own, so handing
- * back its zero would make the null receiver indistinguishable from a member
- * that really holds zero. */
+/* Null-conditional access `a? */
 static LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr,
                                    zan_ast_node_t *qmem, local_scope_t *locals) {
     LLVMValueRef obj = emit_expr(g, qmem->member.object, locals);
@@ -3049,29 +2726,14 @@ static LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMValueRef vals[] = { dflt, v };
     LLVMBasicBlockRef bbs[] = { entry_bb, then_end };
     LLVMAddIncoming(phi, vals, bbs, 2);
-    /* an owned receiver temp (e.g. `M()?.x`, where M returns +1) is consumed
-     * by this access; the class release helper is null-safe */
+    /* an owned receiver temp (e */
     emit_release_owned_call_temp(g, saved_obj, obj, locals);
     return phi;
 }
 
-/* `params T[] rest` call-site packing. The trailing arguments are bundled into
- * a synthetic `new List<T>{ ... }` node (the parameter itself was lowered to
- * List<T> at parse time), so the callee sees a normal List. Passing a List
- * (or an explicit `new List<T>{...}`) as the sole trailing argument passes it
- * through unpacked. The call node is mutated in place; the rewrite is
- * idempotent so re-emission (e.g. per generic instantiation) is safe. */
-/* Default parameter values: `F(int a, int b = 2)` invoked as `F(1)` has the
- * declared default expression appended at the call site, which is where C#
- * evaluates it. The call node is mutated in place, and the rewrite is
- * idempotent: once the argument list is full there is nothing left to append.
- * A trailing `params` tail and operator methods (whose declared list carries
- * an injected receiver) are left to pack_params_args. */
-/* Reorder named call arguments (`F(b: 2, x: 10)`) to the callee's parameter
- * order once the method symbol is known. Positional arguments fill the
- * remaining slots left to right, mirroring C#: a named argument binds to the
- * parameter of the same name, and the position of a named argument is
- * irrelevant. Unknown names and duplicates are diagnosed. */
+/* `params T[] rest` call-site packing */
+/* 内部辅助实现 */
+/* 内部辅助逻辑 */
 static void reorder_named_args_impl(zan_irgen_t *g, zan_ast_list_t *args,
                                     zan_loc_t loc, zan_ast_node_t *decl) {
     if (!args || !decl) return;
@@ -3087,7 +2749,7 @@ static void reorder_named_args_impl(zan_irgen_t *g, zan_ast_list_t *args,
 
     zan_ast_list_t *ps = &decl->method_decl.params;
     int m = ps->count;
-    /* slot[i] = call-arg index placed at AST-parameter position i, or -1. */
+    /* slot[i] = call-arg index placed at AST-parameter position i, or -1 */
     int *slot = (int *)malloc(sizeof(int) * (size_t)(m > n ? m : n));
     for (int i = 0; i < (m > n ? m : n); i++) slot[i] = -1;
     int *used_name = (int *)malloc(sizeof(int) * (size_t)n);
@@ -3125,7 +2787,7 @@ static void reorder_named_args_impl(zan_irgen_t *g, zan_ast_list_t *args,
         }
     }
 
-    /* Second pass: positional arguments fill the leftmost free slots. */
+    /* Second pass: positional arguments fill the leftmost free slots */
     int j = 0;
     for (int i = 0; i < n; i++) {
         if (used_name[i]) continue;
@@ -3135,12 +2797,7 @@ static void reorder_named_args_impl(zan_irgen_t *g, zan_ast_list_t *args,
         j++;
     }
 
-    /* Rebuild: each named arg contributes its expression; positional args
-     * move to their slot. The result list keeps the original length.
-     * The rewrite is only meaningful when the bound parameter slots are
-     * exactly 0..n-1 (the dense positional prefix downstream expects); any
-     * other shape (unknown/duplicate name or holes) restores the original
-     * argument order so diagnostics can stand without crashing later phases. */
+    /* 内部辅助逻辑 */
     zan_ast_node_t **reb = (zan_ast_node_t **)malloc(sizeof(zan_ast_node_t *) *
                                                      (size_t)n);
     if (!reb) { free(slot); free(used_name); return; }
@@ -3197,9 +2854,7 @@ static void pack_params_args(zan_irgen_t *g, zan_ast_node_t *call,
         method_sym->decl->kind != AST_METHOD_DECL) return;
     if (!method_is_params_variadic(method_sym)) return;
     zan_ast_list_t *ps = &method_sym->decl->method_decl.params;
-    /* A static op_call operator declares an injected receiver (`self`) which
-     * does not appear in the source call's argument list; an instance
-     * operator's receiver is `this` and its params start at the real ones. */
+    /* 内部辅助逻辑 */
     int injected = method_sym->name.len == 7 &&
         memcmp(method_sym->name.str, "op_call", 7) == 0 &&
         (method_sym->modifiers & MOD_STATIC) != 0;
@@ -3208,9 +2863,7 @@ static void pack_params_args(zan_irgen_t *g, zan_ast_node_t *call,
     int argc = call->call.args.count;
     if (argc < fixed) return;
     if (argc == visible) {
-        /* A single trailing argument that is already the bundle passes through
-         * untouched, as in C#: `Sum(arr)` hands `arr` over instead of wrapping
-         * it in a one-element array. */
+        /* 内部辅助逻辑 */
         zan_ast_node_t *la = call->call.args.items[argc - 1];
         if (la->kind == AST_NEW_EXPR) return; /* already packed / explicit array */
         zan_type_t *lt = infer_expr_type(g, la, locals);

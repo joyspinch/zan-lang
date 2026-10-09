@@ -1,16 +1,6 @@
-/* gui_runtime_text.c -- text rendering (Win32 GDI / Linux Xft + fallback).
- *
- * The Win32 window shell (window class, WndProc, event queue, presentation,
- * clipboard, IME, glass) lives in Zan: packages/Zan.Gui/src/Gui/Backend/Win32Shell.zan.
- *
- * Part of the gui_runtime translation unit: #include'd by gui_runtime.c in
- * a fixed order; not compiled standalone (preprocessor state and static
- * linkage are shared across the parts).
- */
+/* gui_runtime_text */
 
-/* ========================================================================
- * Text Rendering — Platform-specific (Win32: GDI, Linux: Xft/fallback)
- * ======================================================================== */
+/* Text Rendering — Platform-specific (Win32: GDI, Linux: Xft/fallback) */
 
 #ifdef _WIN32
 
@@ -76,8 +66,7 @@ EXPORT i64 zan_gui_text_stat_read(i32 idx) {
         case 9: return (i64)g_text_draw_us;
         case 10: return (i64)g_text_measure_us;
         case 11: return (i64)g_text_height_us;
-        /* glyph-atlas internals (gui_runtime_glyph.c part): live payload
-         * bytes, stores so far, tiles reclaimed by the cold sweep. */
+        /* glyph-atlas internals (gui_runtime_glyph */
         case 76: return (i64)g_atlas_bytes;
         case 77: return (i64)g_atlas_stores;
         case 78: return (i64)g_atlas_swept;
@@ -98,22 +87,18 @@ static void ensure_text_dc(void) {
 
 static int g_font_sizes[16];
 static int g_font_bold[16];   /* 1 = FW_BOLD slot; the table is keyed by (size, weight) */
-/* Active text face (env-seeded, program-overridable via
- * zan_gui_set_text_family -- see the exports below get_or_create_font). */
+/* 内部辅助逻辑 */
 static wchar_t g_font_family[64] = L"Segoe UI";
 static int g_font_family_env_done = 0;
 static int g_font_family_explicit = 0;
-/* Chrome/DirectWrite-equivalent vertical metrics (see
- * load_os2_vertical_metrics): font units straight from OS/2, so
- * ascent/height match the browser instead of GDI's grid-fitted values. */
+/* 内部辅助逻辑 */
 static int g_os2_asc = 0;    /* usWinAscent, font units */
 static int g_os2_desc = 0;   /* usWinDescent, font units */
 static int g_os2_upem = 0;   /* unitsPerEm ('head'), 0 = fall back to GDI */
 static int g_os2_tried = 0;
 
 static HFONT get_or_create_font(int size, int bold) {
-    /* Cache by exact (size, weight) match. Bold shares the 16-slot table with
-     * regular, so a slot that holds the wrong weight is not a hit. */
+    /* Cache by exact (size, weight) match */
     for (int i = 0; i < 16; i++) {
         if (g_font_sizes[i] == size && g_font_bold[i] == bold && g_fonts[i]) {
             if (g_text_stats_enabled) { g_text_font_hits++; }
@@ -127,12 +112,7 @@ static HFONT get_or_create_font(int size, int bold) {
     }
     if (slot < 0) slot = 15; /* reuse last */
 
-    /* Face: ZAN_GUI_FONT_FACE seeds the default, so an app can pick a family
-     * that matches its art direction (a game HUD wants a rounder face than
-     * the OS UI font). A program can also set it at runtime via
-     * zan_gui_set_text_family -- that wins over the env var. GDI font
-     * linking resolves an absent family to the system default, so a missing
-     * face degrades instead of failing. */
+    /* 内部辅助实现 */
     if (!g_font_family_explicit && !g_font_family_env_done) {
         g_font_family_env_done = 1;
         wchar_t env[64];
@@ -158,10 +138,7 @@ static HFONT get_or_create_font(int size, int bold) {
     return g_fonts[slot];
 }
 
-/* Programmatic face selection (games: a rounder face matching the art).
- * Call before the first text draw/measure of the process: the glyph-run
- * atlas keys tiles by (text,size) and would keep tiles rasterized with an
- * earlier face. Returns 1 when the family name was stored. */
+/* Programmatic face selection (games: a rounder face matching the art) */
 EXPORT i32 zan_gui_set_text_family(const char *utf8_family) {
     if (!utf8_family || !*utf8_family) return 0;
     wchar_t want[64];
@@ -169,7 +146,7 @@ EXPORT i32 zan_gui_set_text_family(const char *utf8_family) {
     if (n <= 0 || n > 64) return 0;
     memcpy(g_font_family, want, (size_t)n * sizeof(wchar_t));
     g_font_family_explicit = 1;
-    /* Drop cached HFONTs so the next draw rebuilds with the new face. */
+    /* Drop cached HFONTs so the next draw rebuilds with the new face */
     for (int i = 0; i < 16; i++) {
         if (g_fonts[i]) { DeleteObject(g_fonts[i]); g_fonts[i] = NULL; }
         g_font_sizes[i] = 0;
@@ -181,9 +158,7 @@ EXPORT i32 zan_gui_set_text_family(const char *utf8_family) {
     return 1;
 }
 
-/* 1 when `utf8_family` resolves to an installed face: GDI's mapper silently
- * falls back for absent families, so the probe selects a throwaway HFONT and
- * compares the face GDI actually kept (case-insensitive). */
+/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_font_face_matches(const char *utf8_family) {
     if (!utf8_family || !*utf8_family) return 0;
     wchar_t want[64];
@@ -222,29 +197,13 @@ static uint64_t zan_text_hash(const char *s, int size) {
     return h;
 }
 
-/* Runs are cached per (text, size, weight). `size` is the atlas key, so a bold
- * run gets its own tile; the two weight spaces never collide because the
- * regular space uses the raw size and bold adds ZAN_RUN_BOLD_FLAG (a high bit
- * no real font size reaches). */
+/* Runs are cached per (text, size, weight) */
 #define ZAN_RUN_BOLD_FLAG 0x10000
 static int run_key_size(int size, int bold) {
     return bold ? (size | ZAN_RUN_BOLD_FLAG) : size;
 }
 
-/* ---- DirectWrite fallback runs -----------------------------------------
- * GDI maps exactly one family per HFONT and has no glyph fallback: a code
- * point the face lacks -- emoji above all, since Segoe UI Emoji is a color
- * font GDI cannot paint -- rasterises as .notdef tofu. DirectWrite resolves
- * the system fallback and paints COLR layers, and its bpp-4 tiles ride the
- * same color-tile path the Linux FreeType (CBDT) tiles already use, so the
- * backends need no change. dwrite.dll loads lazily and tolerates absence:
- * without it a run keeps GDI's behaviour rather than degrading below it.
- *
- * The Windows SDK's dwrite.h only parses as C++, so the COM side lives in
- * gui_runtime_dwrite.cpp; this side keeps the tile contract: family comes
- * from the selected GDI face (labels keep their configured look), pixels
- * come back straight-alpha BGRA, and the tile is marked ZAN_TILE_RGBA so
- * both compositors treat it as color art, untinted. */
+/* 内部辅助实现 */
 extern int zan_dw_init(void);
 extern int zan_dw_text_width(const wchar_t *w, int len,
     const wchar_t *family, float size, int bold);
@@ -252,11 +211,7 @@ extern int zan_dw_render(const wchar_t *w, int len,
     const wchar_t *family, float size, int bold,
     unsigned char **out_px, int *out_w, int *out_h, int *out_advance);
 
-/* Emoji code-point ranges (Unicode 15 practical set): CJK faces like
- * Microsoft YaHei carry MONOCHROME outline glyphs for these, so "the face
- * has a glyph" is not enough -- a run containing one of these must go to
- * DirectWrite, which maps it to the color emoji font. UTF-16: the SMP
- * blocks appear as surrogate pairs, covered by the high-surrogate test. */
+/* 内部辅助实现 */
 static int win_cp_is_emoji(unsigned int cp) {
     if (cp >= 0x1F000 && cp <= 0x1FFFF) return 1;   /* SMP emoji + tags */
     if (cp >= 0xD83C && cp <= 0xD83E) return 1;     /* SMP high surrogates */
@@ -276,9 +231,7 @@ static int win_cp_is_emoji(unsigned int cp) {
     return 0;
 }
 
-/* Whether the run contains an emoji code point (see above): such runs must
- * be rendered by DirectWrite -- the color emoji font is a color font GDI
- * cannot paint, and CJK faces substitute monochrome outlines for them. */
+/* 内部辅助逻辑 */
 static int win_run_has_emoji(const wchar_t *w, int len) {
     for (int i = 0; i < len; i++) {
         if (win_cp_is_emoji((unsigned int)w[i])) return 1;
@@ -286,8 +239,7 @@ static int win_run_has_emoji(const wchar_t *w, int len) {
     return 0;
 }
 
-/* Whether the currently selected GDI face covers every UTF-16 unit: the
- * trigger that routes a run from the GDI tile path to the DWrite one. */
+/* 内部辅助逻辑 */
 static int win_run_has_missing(int size, int bold,
                                const wchar_t *w, int len) {
     HFONT font = get_or_create_font(size, bold);
@@ -307,8 +259,7 @@ static int win_run_has_missing(int size, int bold,
     return missing;
 }
 
-/* The DWrite run tile: everything the GDI face lacks resolves through the
- * system fallback, color glyphs land as palette-colored layers. */
+/* 内部辅助逻辑 */
 static const zan_glyph_tile *win_dwrite_tile(const char *text, int size,
                                              int bold) {
     int key_len = (int)strlen(text);
@@ -354,20 +305,7 @@ static int win_dw_text_width(const wchar_t *w, int len, int size, int bold) {
     return zan_dw_text_width(w, len, family, (float)size, bold ? 1 : 0);
 }
 
-
-
-
-/* The coverage tile of a whole text run, rasterised by GDI on the first use of
- * that (text, size) and cached in the glyph atlas afterwards.
- *
- * The run -- not the glyph -- is the unit here: ClearType coverage is
- * per-channel and produced for the string GDI laid out itself, so caching
- * glyphs separately and placing them at integer advances would change how
- * every label in the app looks.
- *
- * White on black is what makes the result a mask: the draw colour is applied
- * when the run is composited, so it is not part of the key and one tile serves
- * every colour the same string is drawn in. */
+/* 内部辅助实现 */
 static const zan_glyph_tile *win_run_tile(const char *text, int size, int bold) {
     int key_len = (int)strlen(text);
     int ksize = run_key_size(size, bold);
@@ -438,8 +376,7 @@ EXPORT void zan_gui_draw_text(
 
     const zan_glyph_tile *tile = win_run_tile(text, size, 0);
     if (!tile) {
-        /* The GDI face lacks a glyph (emoji): re-render through DirectWrite
-         * with the system fallback, color glyphs included. */
+        /* 内部辅助逻辑 */
         tile = win_dwrite_tile(text, size, 0);
     }
     if (tile) {
@@ -458,10 +395,7 @@ EXPORT void zan_gui_draw_text(
     }
 }
 
-/* Bold variant of zan_gui_draw_text. ECharts' title default is
- * textStyle.fontWeight 'bold', and the API kept the weight out of the
- * draw call, so bold gets its own entry point rather than widening the
- * existing signature (which every existing caller would have to touch). */
+/* Bold variant of zan_gui_draw_text */
 EXPORT void zan_gui_draw_text_bold(
     i32 surface_id, i32 x, i32 y, const char *text, i32 color, i32 font_size) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
@@ -487,20 +421,7 @@ EXPORT void zan_gui_draw_text_bold(
     }
 }
 
-/* Rotated text, same run-tile machinery as above: the whole run is
- * rasterised once through a world transform on the text DC (the atlas key is
- * the run text, so a second angle on the same string is a second tile), and
- * compositing is unchanged -- cpu_glyph_run / gl_glyph_run place whatever
- * coverage tile they are handed.
- *
- * The anchor is the unrotated run box's top-left, like zan_gui_draw_text, and
- * the run rotates rigidly about it; positive angles turn clockwise. GDI
- * disables ClearType while a world transform is live, so rotated tiles come
- * back grey-antialiased in the 4bpp layout (R=G=B coverage), which both tile
- * consumers render without knowing the difference. The atlas key is 0xFF-
- * prefixed -- a byte that cannot appear in the text itself -- so a rotated
- * tile can never collide with the unrotated tile of a string that merely ends
- * in digits. */
+/* 内部辅助实现 */
 EXPORT void zan_gui_draw_text_rot(
     i32 surface_id, i32 x, i32 y, const char *text, i32 color, i32 font_size,
     i32 angle_deg) {
@@ -551,8 +472,7 @@ EXPORT void zan_gui_draw_text_rot(
 
         double rad = (double)angle * 3.14159265358979323846 / 180.0;
         double cs = cos(rad), sn = sin(rad);
-        /* Rotated bbox of the padded box [0..w)x[0..h) around the anchor:
-         * x' = cs*x - sn*y, y' = sn*x + cs*y. */
+        /* Rotated bbox of the padded box [0 */
         double cx0 = 0.0, cx1 = cs * w, cx2 = -sn * h, cx3 = cs * w - sn * h;
         double cy0 = 0.0, cy1 = sn * w, cy2 = cs * h, cy3 = sn * w + cs * h;
         double mnx = cx0;
@@ -602,9 +522,7 @@ EXPORT void zan_gui_draw_text_rot(
         HBITMAP old_bmp = (HBITMAP)SelectObject(g_text_dc, hbmp);
         memset(dbits, 0, (size_t)bw * (size_t)bh * 4);
 
-        /* Rotate about the anchor, then shift so the rotated bbox's min
-         * corner sits at (1,1) in the DIB (the +1 slack the left/top offset
-         * carries back out). Text drawn at (0,0) lands rotated. */
+        /* 内部辅助逻辑 */
         XFORM xf;
         xf.eM11 = (FLOAT)cs;   xf.eM12 = (FLOAT)sn;
         xf.eM21 = (FLOAT)-sn;  xf.eM22 = (FLOAT)cs;
@@ -643,13 +561,7 @@ EXPORT void zan_gui_draw_text_rot(
     }
 }
 
-/* --- Measured-width cache -------------------------------------------------
- * zan_gui_measure_text runs a GDI GetTextExtentPoint32W round-trip plus two
- * MultiByteToWideChar and a malloc/free on every call, and layout / caret /
- * selection / syntax-highlight code calls it hundreds of times per frame with
- * the same strings (one per visible token, every frame while scrolling). Cache
- * width by (text, size) so a steady frame measures nothing and allocates
- * nothing -- the dominant per-frame CPU + allocation churn otherwise. */
+/* 内部辅助实现 */
 typedef struct {
     char    *text;   /* UTF-8 key; NULL marks an empty slot */
     int      size;
@@ -673,8 +585,7 @@ static int measure_text_gdi(const char *text, int size) {
     GetTextExtentPoint32W(g_text_dc, wtext, wlen - 1, &text_size);
     int missing = win_run_has_emoji(wtext, wlen - 1);
     SelectObject(g_text_dc, old_font);
-    /* Emoji runs: GDI measures the .notdef boxes, the tile is drawn from
-     * the DWrite layout -- keep width and paint on the same metrics. */
+    /* Emoji runs: GDI measures the */
     int w = 0;
     if (missing) {
         w = win_dw_text_width(wtext, wlen - 1, size, 0);
@@ -737,7 +648,7 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
     return (i64)w;
 }
 
-/* Font height depends only on size; only a handful of sizes are ever used. */
+/* Font height depends only on size; only a handful of sizes are ever used */
 static int g_fh_size[16];
 static int g_fh_val[16];
 static int g_fh_count = 0;
@@ -753,10 +664,7 @@ static void load_os2_vertical_metrics(void) {
     HFONT font = get_or_create_font(16, 0);
     HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
     uint8_t buf[2];
-    /* GetFontData wants each table tag byte-swapped in the DWORD
-     * ('head' = 0x64616568, 'OS/2' = 0x322F534F -- verified via GDI;
-     * the natural reading 0x68656164/0x4F532F32 returns GDI_ERROR).
-     * offsets: head.unitsPerEm 18, OS/2.usWinAscent 74, OS/2.usWinDescent 76. */
+    /* 内部辅助实现 */
     if (GetFontData(g_text_dc, 0x64616568, 18, buf, 2) == 2) {
         g_os2_upem = (int)((buf[0] << 8) | buf[1]);
     }
@@ -772,9 +680,7 @@ static void load_os2_vertical_metrics(void) {
     }
 }
 
-/* Ascent above the baseline (Chrome fontBoundingBoxAscent semantics:
- * floor(size * usWinAscent / unitsPerEm); GDI tmAscent fallback). Line-box
- * baseline math needs the browser's metric, not GDI's rounded one. */
+/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_font_ascent(i32 font_size) {
     int size = (int)font_size;
     if (size < 8) size = 8;
@@ -823,8 +729,7 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
     load_os2_vertical_metrics();
     int val;
     if (g_os2_upem > 0) {
-        /* Chrome content box: floor(size*usWinAscent/upem)
-         * + floor(size*usWinDescent/upem). */
+        /* Chrome content box: floor(size*usWinAscent/upem) + floor(size*usWinDescent/upem) */
         val = (size * g_os2_asc) / g_os2_upem
             + (size * g_os2_desc) / g_os2_upem;
     } else {
@@ -847,20 +752,14 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
     return (i64)val;
 }
 
-
 #else /* !_WIN32 */
 
-/* The text profiler counts GDI calls and its caches, so only the Win32 text
- * path has anything to report. Canvas.TextStat* is declared unconditionally
- * in Zan (packages/Zan.Gui/src/Gui/Rendering/Render.zan), so every program touching it -- including
- * the GUI conformance cases -- needs the symbols to exist elsewhere too;
- * here they report "profiler off / nothing measured". */
+/* 内部辅助逻辑 */
 EXPORT void zan_gui_text_stat_enable(i32 enabled) { (void)enabled; }
 
 EXPORT i64 zan_gui_text_stat_read(i32 idx) { (void)idx; return 0; }
 
-/* Non-GDI builds keep their platform font pick; the exports exist so game
- * programs (Game.Kit SysFont) probe and set uniformly across platforms. */
+/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_set_text_family(const char *utf8_family) {
     (void)utf8_family;
     return 0;

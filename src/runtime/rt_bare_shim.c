@@ -1,36 +1,4 @@
-/* rt_bare_shim.c -- freestanding shim for zanc's bare-metal targets.
- *
- * Not built by zan's CMake: compile this file with the TARGET SDK's C
- * compiler and link it with the object zanc emits (`zanc app.zan --target
- * riscv32 -o app.o`). It covers the POSIX-ish surface the emitted code
- * references when there is no OS underneath. On ESP-IDF you do not need
- * this file -- the IDF adapter (examples/esp32_hello) uses IDF's newlib,
- * pthread and vfs components instead, which behave better than these
- * stubs wherever both exist.
- *
- * What this file provides (strong definitions: if your libc also defines
- * one, the libc's archive member is simply never pulled in):
- *   malloc/calloc/free/realloc  deterministic pool allocator below
- *                               (-DZAN_BARE_HEAP_BYTES=... to size it)
- *   poll                        always "nothing ready" -- the scheduler's
- *                               pump falls through to its timer dispatch,
- *                               so awaits busy-wait (correct, power-hungry)
- *   pthread_mutex_lock/unlock   no-ops, pthread_self -> 1 (single thread
- *                               is the bare-metal contract)
- *   getenv                      NULL
- *   zan_w32_snprintf            snprintf with a long-long size parameter;
- *                               the compiler routes IR snprintf calls here
- *                               on 32-bit targets because an i64 in the
- *                               middle of the ilp32 argument list shifts
- *                               the register-pair alignment of everything
- *                               after it
- *
- * What must come from your toolchain (a riscv32 libc + libgcc, e.g.
- * picolibc or newlib-nano; NOT provided here):
- *   printf/setvbuf/stdout (Console output), exit, memcpy/memset/strlen,
- *   _setjmp/longjmp (try/throw lower onto them), __atomic_*_8 (rv32imc
- *   has no A extension -- libgcc's lock-based fallbacks are fine).
- */
+/* rt_bare_shim */
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -47,20 +15,14 @@ int vsnprintf(char *s, unsigned long n, const char *fmt, zan_va_list ap);
 #define va_list zan_va_list
 #endif
 
-/* Stub symbols are weak so a board bring-up (QEMU kit, Arduino core, ...)
- * can override them with strong definitions while still linking this file
- * for the allocator. */
+/* Stub symbols are weak so a board bring-up (QEMU kit, Arduino core, */
 #if defined(__ELF__)
 #define ZAN_SHIM_WEAK __attribute__((weak))
 #else
 #define ZAN_SHIM_WEAK
 #endif
 
-/* ---- deterministic pool allocator -----------------------------------
- * First fit with a free list, 8-byte aligned (rv32 long long / double).
- * Out of pool: returns NULL -- the runtime's call sites treat that as a
- * soft failure (the timer heap drops the delay and readies the frame, the
- * string builder reports OOM) rather than aborting. */
+/* 内部辅助逻辑 */
 
 #ifndef ZAN_BARE_HEAP_BYTES
 #define ZAN_BARE_HEAP_BYTES (64 * 1024)
@@ -76,18 +38,14 @@ union zan_shim_block {
     long long align_min;
     unsigned char align_bytes[16];
 };
-/* Block magic so free() can refuse a wild or doubled pointer instead of
- * unlinking it into the free list: a bare-metal build has no MMU, so one
- * bad free would otherwise corrupt the whole pool silently. Fills the
- * union's existing slack (rv32 header stays 16 bytes). */
+/* 内部辅助逻辑 */
 #define ZAN_SHIM_MAGIC ((size_t)0x5A4E4245u)   /* "ZNBE" */
 
 static unsigned char zan_shim_pool[ZAN_BARE_HEAP_BYTES]
     __attribute__((aligned(8)));
 static union zan_shim_block *zan_shim_free = NULL;
 static int zan_shim_pool_ready;
-/* Watermarks for the board's exit report (soak evidence): live payload
- * bytes, the all-time peak, and OOM hits. Constant-time updates. */
+/* 内部辅助逻辑 */
 static size_t zan_shim_live_bytes;
 static size_t zan_shim_live_peak;
 static unsigned zan_shim_oom;
@@ -96,8 +54,7 @@ static unsigned zan_shim_frees;
 static unsigned zan_shim_allocs;
 static unsigned zan_shim_bad_frees;  /* wild/doubled pointers refused */
 
-/* Header validation for free/realloc: pointer must sit inside the pool with
- * a live block's magic. Refused pointers are counted, never unlinked. */
+/* 内部辅助逻辑 */
 static union zan_shim_block *zan_shim_checked_header(void *p) {
     if ((uintptr_t)p < (uintptr_t)zan_shim_pool + sizeof(union zan_shim_block) ||
         (uintptr_t)p >= (uintptr_t)zan_shim_pool + sizeof(zan_shim_pool))
@@ -107,9 +64,7 @@ static union zan_shim_block *zan_shim_checked_header(void *p) {
     if (b->hdr.magic != ZAN_SHIM_MAGIC) return NULL;
     return b;
 }
-/* last-N request sizes, dumped by the board's exit report when a soak
- * behaves oddly (rv32 brought-up the need: allocs were far fewer than
- * string operations and the live bytes made no sense) */
+/* 内部辅助逻辑 */
 #define ZAN_SHIM_TRACE 16
 static size_t zan_shim_alloc_trace[ZAN_SHIM_TRACE];
 static size_t zan_shim_free_trace[ZAN_SHIM_TRACE];
@@ -135,9 +90,7 @@ void zan_shim_trace(const size_t **allocs, const size_t **frees,
     *fn = zan_shim_free_trace_n;
 }
 
-/* Outstanding-block census: (ptr,size) pairs recorded at malloc, cleared at
- * free; the board report prints the largest live sizes so a leak names
- * itself instead of hiding inside the live-bytes watermark. */
+/* 内部辅助逻辑 */
 #define ZAN_SHIM_LIVE_N 64
 static struct { void *p; size_t n; } zan_shim_live[ZAN_SHIM_LIVE_N];
 static unsigned zan_shim_live_over;   /* live table overflows stop recording */
@@ -181,9 +134,7 @@ static void zan_shim_pool_init(void) {
 void *malloc(size_t n) {
     if (!zan_shim_pool_ready) zan_shim_pool_init();
     if (n == 0) n = 1;
-    /* Reject oversize before rounding: past the pool means the walk can
-     * never satisfy it anyway, and the +7 rounding must never wrap a
-     * hostile size down to a small allocation. */
+    /* 内部辅助逻辑 */
     if (n > sizeof(zan_shim_pool)) {
         zan_shim_oom++;
         zan_shim_oom_size = n;
@@ -203,9 +154,7 @@ void *malloc(size_t n) {
             *prev = tail;
         } else {
             *prev = b->hdr.next;
-            /* a tail smaller than a header can't stand alone: absorb it so
-             * free() returns exactly what malloc() took (live accounting
-             * stays exact, no bytes fall out of the ledger) */
+            /* 内部辅助逻辑 */
             n = b->hdr.size;
         }
         b->hdr.size = n;         /* free() reads this back */
@@ -223,9 +172,7 @@ void *malloc(size_t n) {
     return NULL;
 }
 
-/* Free-list census for the board report: total free payload, largest
- * contiguous hole, hole count. Distinguishes "out of bytes" from
- * "bytes present but fragmented" in one line. */
+/* 内部辅助逻辑 */
 void zan_shim_free_walk(size_t *total, size_t *maxhole, unsigned *holes) {
     size_t sum = 0, best = 0;
     unsigned count = 0;
@@ -254,11 +201,7 @@ void free(void *p) {
     zan_shim_live_del(p);
     if (b->hdr.size <= zan_shim_live_bytes)
         zan_shim_live_bytes -= b->hdr.size;
-    /* Address-ordered insert + immediate coalescing. The rv32 soak's string
-     * churn (a buffer growing 64B per iteration) shatters an unordered list:
-     * every freed buffer is 64B smaller than the next request, so first-fit
-     * never reuses it and the pool OOMs at 90% free (40 holes, largest 1200,
-     * request 1392). Merging neighbours keeps largest-hole ~= total-free. */
+    /* Address-ordered insert + immediate coalescing */
     union zan_shim_block **link = &zan_shim_free;
     union zan_shim_block *pv = NULL;
     while (*link && (uintptr_t)*link < (uintptr_t)b) {
@@ -310,7 +253,7 @@ void *realloc(void *p, size_t n) {
     return np;
 }
 
-/* ---- single-thread stubs -------------------------------------------- */
+/* single-thread stubs */
 
 ZAN_SHIM_WEAK int poll(void *fds, unsigned long nfds, int timeout) {
     (void)fds; (void)nfds; (void)timeout;
@@ -323,7 +266,7 @@ ZAN_SHIM_WEAK unsigned long pthread_self(void) { return 1; }
 
 ZAN_SHIM_WEAK char *getenv(const char *name) { (void)name; return NULL; }
 
-/* ---- snprintf ABI wrapper ------------------------------------------- */
+/* snprintf ABI wrapper */
 
 #ifdef ZAN_SHIM_HAVE_STDIO
 int zan_w32_snprintf(char *s, long long n, const char *fmt, ...) {

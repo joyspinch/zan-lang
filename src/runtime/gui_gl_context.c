@@ -1,27 +1,4 @@
-/* Getting a GL 3.3 core context, per platform, with nothing but what the OS
- * ships: WGL on Windows, GLX on X11. Included by gui_gl_backend.c.
- *
- * The context itself is created off-screen (a pbuffer / a hidden window) and
- * the backend always renders into a framebuffer object, so a frame can leave
- * here two ways:
- *
- *  - read_pixels back into the surface bitmap, which is what the layered
- *    (glass) window, screenshots and every CPU-only primitive need;
- *  - or straight to the screen: zan_gl_ctx_present_begin binds the context to
- *    a GL child window covering the shell window's client area, the backend
- *    blits its FBO into the back buffer, and present_end swaps it.
- *
- * The child window is why presenting does not disturb the CPU path: the shell
- * window's own device context keeps its plain GDI / X11 pixel format, so
- * switching back to the CPU backend just hides the child and resumes blitting
- * the bitmap. Setting a double-buffered GL pixel format on the shell window
- * itself is a one-way door on Windows (a format with PFD_DOUBLEBUFFER usually
- * has no PFD_SUPPORT_GDI), and on X11 it would mean creating the shell window
- * with the GL visual before anyone knows which backend the application wants.
- *
- * Everything here returns 0 rather than failing loudly: no GL, an ancient
- * driver, a remote session, a CI box -- the caller simply stays on the CPU
- * backend, which is why none of this is allowed to be a link-time dependency. */
+/* Getting a GL 3 */
 
 #include "gui_gl.h"
 
@@ -105,7 +82,7 @@ int zan_gl_api_load(zan_gl_api *api, void *(*getproc)(const char *name)) {
 }
 
 #ifdef _WIN32
-/* ---------------------------------------------------------------- Win32/WGL */
+/* Win32/WGL */
 #include <windows.h>
 
 #define WGL_CONTEXT_MAJOR_VERSION_ARB       0x2091
@@ -113,10 +90,7 @@ int zan_gl_api_load(zan_gl_api *api, void *(*getproc)(const char *name)) {
 #define WGL_CONTEXT_PROFILE_MASK_ARB        0x9126
 #define WGL_CONTEXT_CORE_PROFILE_BIT_ARB    0x00000001
 
-/* Every wgl entry point is fetched from the dll we load ourselves: linking
- * opengl32 would put an import on every consumer of the GUI runtime (including
- * the GNU-ld static archive the IDE links), and a machine without GL would then
- * fail to start instead of falling back to the CPU backend. */
+/* 内部辅助逻辑 */
 typedef struct {
     HMODULE opengl32;
     HWND    wnd;
@@ -130,9 +104,7 @@ typedef struct {
     PROC  (WINAPI *GetProcAddress_)(LPCSTR);
 } zan_gl_ctx;
 
-/* The GL child windows, one per shell window that presents through GL. Eight
- * is the IDE's main window plus its dialogs; a ninth simply keeps reading back,
- * which is slower but correct. */
+/* The GL child windows, one per shell window that presents through GL */
 typedef struct {
     HWND host, child;
     HDC  dc;
@@ -144,8 +116,7 @@ static void *zan_gl_ctx_getproc(const char *name);
 static zan_gl_ctx g_glctx;
 
 static void *zan_gl_ctx_getproc(const char *name) {
-    /* wglGetProcAddress only knows the extension-era entry points; the ones
-     * that were already in GL 1.1 have to come out of opengl32.dll itself. */
+    /* 内部辅助逻辑 */
     PROC p = g_glctx.GetProcAddress_ ? g_glctx.GetProcAddress_(name) : NULL;
     if (p) return (void *)p;
     return (void *)GetProcAddress(g_glctx.opengl32, name);
@@ -165,9 +136,7 @@ static void zan_gl_ctx_destroy(void) {
     memset(&g_glctx, 0, sizeof(g_glctx));
 }
 
-/* A message-only-sized hidden window is the cheapest thing that carries a
- * pixel format, which WGL needs before it will hand out any context at all --
- * nothing is ever drawn to it, the backend renders into an FBO. */
+/* 内部辅助逻辑 */
 static int zan_gl_ctx_create(void) {
     g_glctx.opengl32 = LoadLibraryA("opengl32.dll");
     if (!g_glctx.opengl32) return 0;
@@ -210,17 +179,14 @@ static int zan_gl_ctx_create(void) {
     if (!pf || !SetPixelFormat(g_glctx.dc, pf, &pfd)) {
         zan_gl_ctx_destroy(); return 0;
     }
-    /* A context is only current on a device context of the same pixel format,
-     * so every present child window has to be given this one. */
+    /* 内部辅助逻辑 */
     g_glctx.pf = pf;
 
     HGLRC boot = g_glctx.CreateContext(g_glctx.dc);
     if (!boot) { zan_gl_ctx_destroy(); return 0; }
     g_glctx.MakeCurrent(g_glctx.dc, boot);
 
-    /* Ask for 3.3 core through the modern path; a driver without it is a
-     * driver this backend cannot use, so fall back rather than run on the
-     * compatibility context. */
+    /* Ask for 3 */
     HGLRC (WINAPI *create_attribs)(HDC, HGLRC, const int *) =
         (HGLRC (WINAPI *)(HDC, HGLRC, const int *))
             g_glctx.GetProcAddress_("wglCreateContextAttribsARB");
@@ -253,9 +219,7 @@ static int zan_gl_ctx_make_current(void) {
     return g_glctx.MakeCurrent(g_glctx.dc, g_glctx.rc) ? 1 : 0;
 }
 
-/* Mouse and keyboard belong to the shell window: the child is a pure output
- * surface, so it declines hit-testing and never erases itself (an erase would
- * flash the window background between swaps). */
+/* 内部辅助逻辑 */
 static LRESULT CALLBACK zan_gl_present_proc(HWND h, UINT msg, WPARAM wp,
                                            LPARAM lp) {
     if (msg == WM_NCHITTEST) return HTTRANSPARENT;
@@ -289,9 +253,7 @@ static void zan_gl_ctx_present_drop_all(void) {
         if (g_glpres[i].host) zan_gl_ctx_present_drop((void *)g_glpres[i].host);
 }
 
-/* Makes the context current on `host`'s GL child window, creating or resizing
- * it as needed. 0 means this window cannot be presented to (no slot, no GL
- * pixel format on it), and the caller reads the frame back instead. */
+/* 内部辅助逻辑 */
 static int zan_gl_ctx_present_begin(void *host, int w, int h) {
     HWND hw = (HWND)host;
     if (!hw || !g_glctx.rc || !g_glctx.pf || !g_glctx.SwapBuffers_) return 0;
@@ -305,8 +267,7 @@ static int zan_gl_ctx_present_begin(void *host, int w, int h) {
         wc.lpfnWndProc = zan_gl_present_proc;
         wc.hInstance = GetModuleHandleA(NULL);
         wc.lpszClassName = "ZanGLPresent";
-        /* CS_OWNDC: the device context outlives each paint, which is what the
-         * pixel format is attached to. */
+        /* 内部辅助逻辑 */
         wc.style = CS_OWNDC;
         RegisterClassA(&wc);
         HWND child = CreateWindowExA(0, "ZanGLPresent", "",
@@ -335,8 +296,7 @@ static int zan_gl_ctx_present_begin(void *host, int w, int h) {
     return 1;
 }
 
-/* Swaps what the caller just blitted, then puts the context back where the
- * rest of the backend expects it (off-screen). */
+/* 内部辅助逻辑 */
 static void zan_gl_ctx_present_end(void *host) {
     zan_gl_present_win *p = NULL;
     int n = (int)(sizeof(g_glpres) / sizeof(g_glpres[0]));
@@ -347,7 +307,7 @@ static void zan_gl_ctx_present_end(void *host) {
 }
 
 #elif defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
-/* ------------------------------------------------------------------- X11/GLX */
+/* X11/GLX */
 #include <dlfcn.h>
 #include <X11/Xlib.h>
 
@@ -378,9 +338,7 @@ typedef struct {
     int owns_dpy;
     GLXPbuffer_t pbuf;
     GLXContext_t rc;
-    GLXFBConfig_t cfg;       /* the config both the pbuffer and any present
-                              * window are created from: a context is only
-                              * current on drawables of its own config */
+    GLXFBConfig_t cfg;       /* 内部辅助逻辑 */
     int can_present;         /* the config also does windows and double buffers */
     void *(*get_proc)(const char *);
     GLXFBConfig_t *(*choose_fbconfig)(Display *, int, const int *, int *);
@@ -400,8 +358,7 @@ typedef struct {
 
 static zan_gl_ctx g_glctx;
 
-/* GL child windows, keyed by the shell window they cover -- see the header
- * comment for why the frame does not go to the shell window itself. */
+/* 内部辅助逻辑 */
 typedef struct {
     Window       host, child;
     Colormap     cmap;
@@ -410,9 +367,7 @@ typedef struct {
 } zan_gl_present_win;
 static zan_gl_present_win g_glpres[8];
 
-/* dlsym hands back an object pointer and ISO C has no conversion from one to a
- * function pointer; POSIX guarantees the representations match, and a union is
- * how one says so without a diagnostic. */
+/* 内部辅助逻辑 */
 typedef void (*zan_anyfn)(void);
 static zan_anyfn zan_gl_dlfn(void *lib, const char *name) {
     union { void *obj; zan_anyfn fn; } u;
@@ -427,7 +382,7 @@ static void *zan_gl_ctx_getproc(const char *name) {
     return p;
 }
 
-/* Same lookup, typed as a function pointer for the GLX entry points below. */
+/* Same lookup, typed as a function pointer for the GLX entry points below */
 static zan_anyfn zan_gl_glxfn(const char *name) {
     union { void *obj; zan_anyfn fn; } u;
     u.obj = zan_gl_ctx_getproc(name);
@@ -477,8 +432,7 @@ static int zan_gl_ctx_create(void) {
             "glXMakeContextCurrent");
     ZGL_GLX(destroy_context, void (*)(Display *, GLXContext_t),
             "glXDestroyContext");
-    /* Presentation only: a driver missing any of these keeps working, it just
-     * reads frames back instead of swapping them. */
+    /* 内部辅助逻辑 */
     ZGL_GLX(get_visual, XVisualInfo *(*)(Display *, GLXFBConfig_t),
             "glXGetVisualFromFBConfig");
     ZGL_GLX(create_glxwindow,
@@ -495,9 +449,7 @@ static int zan_gl_ctx_create(void) {
         return 0;
     }
 
-    /* Share the shell's display when there is one: a second connection would
-     * work, but the context has to end up on the same server as the window it
-     * will eventually present to. */
+    /* 内部辅助逻辑 */
     g_glctx.dpy = g_display;
     if (!g_glctx.dpy) {
         g_glctx.dpy = XOpenDisplay(NULL);
@@ -505,10 +457,7 @@ static int zan_gl_ctx_create(void) {
     }
     if (!g_glctx.dpy) { zan_gl_ctx_destroy(); return 0; }
 
-    /* Ask for a config that does both drawable kinds and double buffering, so
-     * the same context can render to the pbuffer and swap a window. A server
-     * without one still gets the GPU rasterizer -- with the pbuffer-only config
-     * below, which cannot present and so reads frames back. */
+    /* 内部辅助逻辑 */
     const int present_attribs[] = {
         GLX_RENDER_TYPE,   GLX_RGBA_BIT,
         GLX_DRAWABLE_TYPE, GLX_PBUFFER_BIT | GLX_WINDOW_BIT,
@@ -584,8 +533,7 @@ static void zan_gl_ctx_present_drop(void *host) {
     zan_gl_ctx_make_current();
 }
 
-/* See the Win32 twin: 0 means "cannot present to this window", and the caller
- * reads the frame back into the surface bitmap as before. */
+/* 内部辅助逻辑 */
 static int zan_gl_ctx_present_begin(void *host, int w, int h) {
     Window hw = (Window)(size_t)host;
     if (!hw || !g_glctx.rc || !g_glctx.can_present) return 0;
@@ -604,8 +552,7 @@ static int zan_gl_ctx_present_begin(void *host, int w, int h) {
         memset(&swa, 0, sizeof(swa));
         swa.colormap = cmap;
         swa.border_pixel = 0;
-        /* No event mask: pointer and key events keep propagating to the shell
-         * window, which is the one with the input handling. */
+        /* 内部辅助逻辑 */
         swa.event_mask = 0;
         Window child = XCreateWindow(g_glctx.dpy, hw, 0, 0,
                                      (unsigned)w, (unsigned)h, 0, vi->depth,
@@ -652,14 +599,10 @@ static void zan_gl_ctx_present_end(void *host) {
 }
 
 #elif defined(__APPLE__)
-/* --------------------------------------------------------------- macOS/CGL */
+/* macOS/CGL */
 #include <dlfcn.h>
 
-/* CGL is the C layer under NSOpenGLContext: it gives a context with no drawable
- * at all, which is exactly what rendering into an FBO wants, and it keeps this
- * file plain C (the Cocoa shell's Objective-C lives in gui_runtime_mac.m).
- * A legacy context on macOS is stuck at GL 2.1 / GLSL 120, so a core profile is
- * not optional here -- the backend's shaders are `#version 330 core`. */
+/* 内部辅助逻辑 */
 typedef void *CGLPixelFormatObj_t;
 typedef void *CGLContextObj_t;
 
@@ -682,8 +625,7 @@ typedef struct {
 } zan_gl_ctx;
 static zan_gl_ctx g_glctx;
 
-/* See the X11 twin: dlsym returns an object pointer and ISO C has no
- * conversion to a function pointer, so the representation is aliased. */
+/* 内部辅助逻辑 */
 typedef void (*zan_anyfn)(void);
 static zan_anyfn zan_gl_cglfn(const char *name) {
     union { void *obj; zan_anyfn fn; } u;
@@ -729,8 +671,7 @@ static int zan_gl_ctx_create(void) {
     if (!g_glctx.ChoosePixelFormat || !g_glctx.CreateContext ||
         !g_glctx.SetCurrentContext) { zan_gl_ctx_destroy(); return 0; }
 
-    /* GL4 core first (GLSL 410 hardware), then the 3.2 core profile every Mac
-     * with a Metal-era GPU still answers; nothing else can run the shaders. */
+    /* GL4 core first (GLSL 410 hardware), then the 3 */
     const int profiles[] = { kCGLOGLPVersion_GL4_Core, kCGLOGLPVersion_3_2_Core };
     for (int i = 0; i < 2 && !g_glctx.pf; i++) {
         const int attribs[] = {
@@ -758,13 +699,7 @@ static int zan_gl_ctx_create(void) {
     return 1;
 }
 
-/* No direct present on macOS yet: the Cocoa shell already hands each frame to
- * the WindowServer as an IOSurface through the view's CALayer (a GPU
- * composite, not a CPU blit), so the only thing left to save is the
- * FBO -> IOSurface copy. Doing that means rendering into an IOSurface-backed
- * texture (CGLTexImageIOSurface2D) and handing that same surface to the layer,
- * which needs the Objective-C side; until then macOS reads the frame back and
- * presents it exactly as the CPU backend does. */
+/* 内部辅助逻辑 */
 static int zan_gl_ctx_present_begin(void *host, int w, int h) {
     (void)host; (void)w; (void)h; return 0;
 }
@@ -773,8 +708,7 @@ static void zan_gl_ctx_present_drop(void *host) { (void)host; }
 static void zan_gl_ctx_present_drop_all(void) { }
 
 #else
-/* No context source on this platform build, so the GPU backend simply never
- * installs itself. */
+/* 内部辅助逻辑 */
 static int zan_gl_ctx_create(void) { return 0; }
 static int zan_gl_ctx_make_current(void) { return 0; }
 static void zan_gl_ctx_destroy(void) { }

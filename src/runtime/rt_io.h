@@ -1,18 +1,4 @@
-/* rt_io.h -- Zan async-IO event loop for coroutine integration.
- *
- * Provides a thin abstraction over platform IO multiplexing:
- *   - Linux:   epoll
- *   - macOS:   kqueue
- *   - Windows: IOCP
- *   - Fallback: select
- *
- * The scheduler calls zan_io_poll() in its main loop to wake coroutines
- * whose file descriptors became readable or writable.
- *
- * Coroutines call zan_io_wait_readable / zan_io_wait_writable to suspend
- * until their fd is ready.  These functions are the async-IO ABI that the
- * Zan compiler (or stdlib DllImport) can call.
- */
+/* 内部辅助实现 */
 #ifndef ZAN_RT_IO_H
 #define ZAN_RT_IO_H
 
@@ -27,12 +13,7 @@
 void zan_io_init(void);
 void zan_io_shutdown(void);
 void zan_io_socket_cleanup(void);
-/* `fd` is a socket handle, so it is pointer-width (`intptr_t`): a Windows
- * SOCKET is a UINT_PTR and only a POSIX fd fits in 32 bits. Byte counts are
- * `int64_t`; flags, status codes and 0/1 results are `int32_t` -- none of
- * these may be spelled `int`/`long`, whose width differs across our targets. A
- * status that fits in 32 bits stays 32 bits: widening it would force every
- * Zan caller to spell an errno/SO_ERROR code or a boolean `long`. */
+/* 内部辅助实现 */
 int64_t zan_io_socket_send(intptr_t fd, const void *buf, int64_t len,
                            int32_t flags);
 int64_t zan_io_socket_recv(intptr_t fd, void *buf, int64_t len,
@@ -44,22 +25,10 @@ int32_t zan_io_socket_ready(intptr_t fd, int32_t write_ready);
  * available) once the connect has failed, and -2 while still in progress. */
 int32_t zan_io_connect_status(intptr_t fd);
 
-/* Whether `fd` still refers to an open socket. Non-zero when it does.
- * A readiness-retry loop (accept, in particular) needs this: once its socket
- * has been closed under it -- a listener taken down by Stop() while a coroutine
- * was parked in accept -- the fd can never become ready again, and the loop
- * must report the failure instead of re-arming the watcher forever. */
+/* 检查是否`fd` still refers to an open socket */
 int32_t zan_io_socket_alive(intptr_t fd);
 
-/* Close-notification hook, called BEFORE the fd's close(2)/closesocket():
- * fails every readiness waiter parked on `fd` with the end-of-stream shape
- * (recv 0 / accept -1) and drops the fd from the readiness set. Closing an
- * fd without this hook leaves its waiters parked on a slot keyed by the raw
- * fd number; when the kernel recycles that number for a new socket the old
- * waiter is served by (or delivers into) a recycled fd. With the hook,
- * no waiter outlives the identity it registered against. No-op on
- * Windows, whose overlapped path already completes pending ops via
- * CancelIoEx on shutdown. */
+/* 内部辅助实现 */
 void zan_io_close_notify(intptr_t fd);
 int64_t zan_io_socket_peer_ipv4(intptr_t fd);
 
@@ -67,20 +36,11 @@ int64_t zan_io_socket_peer_ipv4(intptr_t fd);
  * Returns 0 when the hostname cannot be resolved. */
 int32_t zan_io_resolve_ipv4(const char *hostname);
 
-/* Resolve `name` (hostname or literal IPv4/IPv6) to a complete sockaddr --
- * IPv4 or IPv6, whatever the resolver returns first -- and copy it into
- * `buf` (which must hold at least 28 bytes). Returns the sockaddr length
- * (16 or 28), or 0 on failure. Keeps the sockaddr layout out of the Zan
- * standard library. */
+/* 内部辅助实现 */
 int32_t zan_io_resolve_sa(const char *name, int32_t port, void *buf,
                           int32_t cap);
 
-/* Resolve every IPv4/IPv6 candidate into caller-owned fixed-size records.
- * Each record occupies ZAN_IO_SA_STRIDE bytes, starts with the native
- * sockaddr (16 bytes for AF_INET or 28 bytes for AF_INET6), and is zero-filled
- * through the rest of the record. The return value is the number of records
- * written; malformed arguments, resolver failure, or a buffer too small for
- * one record return 0. No pointers from getaddrinfo escape this call. */
+/* Resolve every IPv4/IPv6 candidate into caller-owned fixed-size records */
 #define ZAN_IO_SA_STRIDE 32
 int32_t zan_io_resolve_all(const char *name, int32_t port, void *buf,
                            int32_t cap);
@@ -112,10 +72,7 @@ int64_t zan_io_connect_sa(intptr_t fd, const void *sa, int32_t salen,
  * the family is neither AF_INET nor AF_INET6. */
 const char *zan_io_sockaddr_ip_str(const void *sa);
 
-/* Async sockaddr resolution: like zan_io_resolve_co, but stores a complete
- * sockaddr (16 or 28 bytes) into `buf` and writes its length into `*out`
- * (0 on failure / timeout). `buf` must stay valid until the frame resumes;
- * the caller keeps it reachable across the await. */
+/* 内部辅助实现 */
 void zan_io_resolve_sa_co(const char *name, int32_t port, void *buf,
                           int32_t cap, void *frame, zan_co_step_t step,
                           int32_t *out);
@@ -124,46 +81,19 @@ void zan_io_resolve_sa_co(const char *name, int32_t port, void *buf,
 /* Read the encoded DER pointer/length from a Windows PCCERT_CONTEXT.
  * Keeps the CERT_CONTEXT layout out of the Zan standard library. */
 const unsigned char *zan_crypto_cert_encoded(const void *cert, int *out_len);
-/* Verify the exact TLS peer DER sequence against Windows chain + SSL policy.
- * certs is count repetitions of [uint32 little-endian length][DER], with
- * total_len bounding all reads. host is an ASCII DNS name with explicit length.
- * Returns 1 only if the chain, revocation and hostname all pass; 0 otherwise.
- * The OS trust store is consulted as policy, never enumerated as loose anchors. */
+/* Verify the exact TLS peer DER sequence against Windows chain + SSL policy */
 int32_t zan_io_crypto_windows_ssl_policy(const unsigned char *certs, int32_t total_len,
                                        int32_t count, const char *host, int32_t host_len);
 #endif
 
-/* ---- stackless (CPS state-machine) ABI ----
- *
- * The compiler's async lowering (see docs/ASYNC_CPS_DESIGN.md) has no fiber to
- * park: an `await` on IO records its resume point in the heap frame and returns
- * to the scheduler. So instead of suspending the caller inline, register a
- * one-shot watcher that, when `fd` becomes ready for `interest`
- * (ZAN_IO_READ / ZAN_IO_WRITE), calls `zan_co_ready(frame, step)` to re-enter
- * the state machine. Returns immediately (does not block or suspend). */
+/* ---- stackless (CPS state-machine) ABI ---- The compiler's async lowering (see docs/ASYNC_CPS_DESIGN */
 void zan_io_wait_co(intptr_t fd, int32_t interest, void *frame, zan_co_step_t step);
 
-/* Overlapped receive: post a real recv of up to `len` bytes into `buf` and
- * suspend `frame` until it completes, then re-enter via `step`. The number of
- * bytes received (0 on peer close) is stored into `*out_n` before the frame is
- * re-readied, so the resumed state machine can read it as the await value.
- *
- * Unlike the zero-byte readiness probe used by zan_io_wait_co (which needs a
- * separate synchronous recv after waking), this issues the receive itself as a
- * single overlapped op, so there is no probe/recv window -- the pattern the
- * multi-worker IOCP driver needs to avoid lost completions under high load.
- * On POSIX backends the recv is performed at readiness (same effect). */
+/* 内部辅助实现 */
 void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
                     zan_co_step_t step, int64_t *out_n);
 
-/* Overlapped receive with a deadline: like zan_io_recv_co, but the await also
- * carries `timeout_ms`. Data (or a peer close) delivers the byte count exactly
- * as zan_io_recv_co does; if the deadline passes first, *out_n is set to -1
- * and the frame is re-readied (0 stays reserved for peer close). The deadline
- * is enforced by the reactor itself -- a deadline registry scanned at every
- * poll turn -- not by the timer heap, so no timer entry can outlive the recv
- * and no recv/timer cancel race exists: whichever arm arrives first retires
- * the other before waking the frame. */
+/* Overlapped receive with a deadline: like zan_io_recv_co, but the await also carries `timeout_ms` */
 void zan_io_recv_to_co(intptr_t fd, void *buf, int32_t len, int64_t timeout_ms,
                        void *frame, zan_co_step_t step, int64_t *out_n);
 
@@ -173,11 +103,7 @@ void zan_io_recv_to_co(intptr_t fd, void *buf, int32_t len, int64_t timeout_ms,
 void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
                       intptr_t *out_fd);
 
-/* Async hostname resolution: run `hostname` through the resolver on a worker
- * thread (the reactor never blocks on DNS) and suspend `frame` until it
- * finishes. The resolved IPv4 address -- same value and byte order as
- * zan_io_resolve_ipv4, 0 on failure -- is stored into `*out` before the frame
- * is re-readied via `step`. Returns immediately. */
+/* 内部辅助实现 */
 void zan_io_resolve_co(const char *hostname, void *frame, zan_co_step_t step,
                        int32_t *out);
 
@@ -188,10 +114,7 @@ void zan_rt_blocking_co(void *fn, int32_t argc,
                         int64_t a0, int64_t a1, int64_t a2, int64_t a3,
                         void *frame, zan_co_step_t step, int64_t *out);
 
-/* Idle bridge for the stackless scheduler: if IO watchers are pending, block
- * until at least one fires (readying its frame via zan_co_ready) and return the
- * number woken; otherwise return 0. Wire into the co driver with
- * zan_co_set_idle(zan_io_pump). */
+/* 内部辅助实现 */
 int32_t zan_io_pump(void);
 
 /* Timer-aware idle bridge used by generated schedulers. Blocks for IO for at
@@ -212,10 +135,7 @@ int64_t zan_io_wait_writable(intptr_t fd);
  * Returns 1 if readable, 0 if timeout, -1 on error. */
 int64_t zan_io_wait_readable_timeout(intptr_t fd, int64_t timeout_ms);
 
-/* Asynchronously connect socket `fd` to `ip`:`port` (IPv4 dotted-quad).
- * Suspends the current coroutine until the connection completes.
- * Returns 0 on success, -1 on error.  Backend: ConnectEx on Windows,
- * non-blocking connect + writable readiness on POSIX. */
+/* Asynchronously connect socket `fd` to `ip`:`port` (IPv4 dotted-quad) */
 int64_t zan_io_connect(intptr_t fd, const char *ip, int32_t port);
 
 /* ---- scheduler-facing ---- */

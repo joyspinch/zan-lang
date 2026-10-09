@@ -1,17 +1,4 @@
-/* embedres.c -- bakes files into the produced executable.
- *
- * The IDE's per-item build action "embed" ends up here: instead of copying a
- * project's config/, views/ or wwwroot/ next to the exe, their bytes become
- * constants in the program's own module and are handed to the runtime registry
- * (zan_embed_register) by a module constructor, so System.IO reads them with
- * no file on disk.
- *
- * Payloads at or above ZAN_EMBED_COMPRESS_MIN bytes are baked
- * deflate-compressed ([u32 raw_len][u32 comp_len][raw deflate], the format
- * src/runtime/zan_inflate.c zan_embed_decode consumes); the emitted read API
- * decodes an entry on first hit and patches the table slot in place, so
- * repeat reads stay allocation-free.
- */
+/* embedres */
 
 #include "embedres.h"
 #include "win_utf8.h"
@@ -103,9 +90,7 @@ static int embed_add_file(zan_embed_list_t *l, const char *path,
     return 1;
 }
 
-/* Walks `dir`, adding every file below it under the logical prefix `name`.
- * Each frame carries ~2.8 KB of locals, so EMBED_WALK_MAX_DEPTH stops a
- * crafted deep tree from blowing the stack; deeper levels are skipped. */
+/* Walks `dir`, adding every file below it under the logical prefix `name` */
 #define EMBED_WALK_MAX_DEPTH 128
 
 static void embed_walk_impl(zan_embed_list_t *l, const char *dir, const char *name, int depth) {
@@ -171,10 +156,7 @@ static void embed_walk(zan_embed_list_t *l, const char *dir, const char *name) {
     embed_walk_impl(l, dir, name, 1);
 }
 
-/* Filtered walk: descends only into first-level directories whose name is in
- * `filter`, always takes the loose files at the top level, and below a kept
- * pack takes everything (the stdlib GUI skins shape: skins/<pack>/skin.css).
- * depth 1 == the spec root, mirroring embed_walk. */
+/* 内部辅助逻辑 */
 static void embed_walk_filtered_impl(zan_embed_list_t *l, const char *dir,
                                      const char *name, int depth,
                                      const char *const *filter,
@@ -275,18 +257,12 @@ static const char *embed_basename(const char *path) {
     return sep ? sep + 1 : path;
 }
 
-/* Entries at or above this size are baked compressed; smaller ones gain less
- * than the 8-byte header costs. */
+/* 内部辅助逻辑 */
 #define ZAN_EMBED_COMPRESS_MIN 512
-/* len high bit marks a compressed payload; the emitted read API tests it and
- * decodes on first hit. */
+/* 内部辅助逻辑 */
 #define ZAN_EMBED_COMPRESSED 0x8000000000000000ULL
 
-/* Returns a malloc'd [u32 raw_len][u32 comp_len][raw deflate] payload with
- * *out_len set to its byte count, or NULL when compression does not pay (the
- * resource is kept raw then). Raw deflate -- no zlib header -- is exactly what
- * zan_embed_decode (src/runtime/zan_inflate.c) consumes. tdefl is
- * deterministic, so a rebuild of the same sources bakes the same image. */
+/* 内部辅助逻辑 */
 static unsigned char *embed_maybe_compress(const unsigned char *data,
                                            long long len, long long *out_len) {
     if (len < ZAN_EMBED_COMPRESS_MIN) return NULL;
@@ -309,14 +285,12 @@ static unsigned char *embed_maybe_compress(const unsigned char *data,
     return out;
 }
 
-/* A private constant holding `len` bytes plus a trailing NUL, so text
- * resources round-trip as C strings while `len` stays the true size. */
+/* 内部辅助逻辑 */
 static LLVMValueRef embed_bytes_global(zan_irgen_t *g, const char *label,
                                        const unsigned char *data,
                                        long long len) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
-    /* LLVM array lengths are 32-bit; a resource of 4 GiB or more would
-     * truncate here and emit a bogus smaller constant. Refuse it instead. */
+    /* 内部辅助逻辑 */
     if (len < 0 || len > 0xFFFFFFFEULL) {
         fprintf(stderr,
                 "error: embedded resource '%s' is too large (%lld bytes, "
@@ -335,10 +309,7 @@ static LLVMValueRef embed_bytes_global(zan_irgen_t *g, const char *label,
     return LLVMConstInBoundsGEP2(arr_ty, gv, idx, 2);
 }
 
-/* The function to give a body to. A declaration already exists whenever the
- * program references the API from Zan (Skin.EmbedRead's externs); defining
- * that very function is what makes those calls resolve here, where adding a
- * second one would leave them pointing at an undefined symbol. */
+/* The function to give a body to */
 static LLVMValueRef embed_define(zan_irgen_t *g, const char *name,
                                  LLVMTypeRef fty) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
@@ -357,15 +328,7 @@ static LLVMValueRef embed_libc(zan_irgen_t *g, const char *name,
     return fn;
 }
 
-/* The read API the stdlib calls (Skin.EmbedRead, System.IO's embedded-resource
- * fallback). Emitted into the program's own module rather than linked from the
- * shipped zan_embed_api object, so an embedding program stays linkable for
- * cross targets whose toolchain directory carries no such object. This
- * module's own --embed table lives in two immutable slots; a generated data
- * object (scripts/gen_embed.ps1) linked alongside appends ITS table through
- * zan_embed_register (slots 2+), and lookups consult every slot with the
- * registered ones winning duplicate names -- the same accumulate semantics the
- * shipped runtime implementation (src/runtime/zan_embed_api.c) follows. */
+/* The read API the stdlib calls (Skin */
 struct embed_api_ctx {
     LLVMTypeRef  i8, i8p, i32, i64, ent_ty;
     LLVMValueRef gtbl, gcnt, gbuf, empty;
@@ -379,10 +342,7 @@ static LLVMValueRef embed_entry_at(LLVMBuilderRef b, struct embed_api_ctx *c,
     return LLVMBuildGEP2(b, c->ent_ty, base, &i, 1, "ent");
 }
 
-/* i8* zan.embed.find(i8* name): the entry with that name, or null. Scans two
- * slots in turn -- first the table registered through zan_embed_register (a
- * generated data object's group, which wins duplicate names), then this
- * module's own --embed table. */
+/* i8* zan */
 static LLVMValueRef embed_emit_find(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMTypeRef args[] = { c->i8p };
     LLVMTypeRef fty = LLVMFunctionType(c->i8p, args, 1, 0);
@@ -409,8 +369,7 @@ static LLVMValueRef embed_emit_find(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMValueRef nv = LLVMBuildAlloca(b, c->i64, "n");
     LLVMValueRef sv = LLVMBuildAlloca(b, c->i64, "slot");
     LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), iv);
-    /* slot 0 = registered table (gtbl/gcnt, mutable), slot 1 = this module's
-     * own table (own_tbl/own_cnt, immutable). */
+    /* 内部辅助逻辑 */
     LLVMBuildStore(b, LLVMBuildLoad2(b, c->i8p, c->gtbl, "tbl0"), bv);
     LLVMBuildStore(b, LLVMBuildLoad2(b, c->i64, c->gcnt, "cnt0"), nv);
     LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), sv);
@@ -467,13 +426,7 @@ static LLVMValueRef embed_emit_find(zan_irgen_t *g, struct embed_api_ctx *c) {
     return fn;
 }
 
-/* i8* zan.embed.unzip(i8* ent): a compressed entry (flag bit in len, payload
- * [u32 raw_len][u32 comp_len][raw deflate]) is decoded on first hit and the
- * slot patched in place -- repeat reads and zan_embed_has then see plain
- * data. Raw entries pass through untouched. Decode failure (corrupt bake)
- * reads as a missing resource rather than garbage bytes. Two threads hitting
- * the same entry before either stores can decode twice; the loser's buffer
- * is simply dropped -- bounded, rare, and the slot still ends up decoded. */
+/* i8* zan */
 static LLVMValueRef embed_emit_unzip(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMTypeRef args[] = { c->i8p };
     LLVMTypeRef fty = LLVMFunctionType(c->i8p, args, 1, 0);
@@ -501,9 +454,7 @@ static LLVMValueRef embed_emit_unzip(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMPositionBuilderAtEnd(b, comp);
     LLVMValueRef dp = LLVMBuildStructGEP2(b, c->ent_ty, e, 1, "dp");
     LLVMValueRef d = LLVMBuildLoad2(b, c->i8p, dp, "d");
-    /* zan_embed_decode demands the ARC array-header tag on `len` (it masks
-     * the byte count out of a tagged size); supply it on top of the payload
-     * size with the compressed flag cleared. */
+    /* 内部辅助逻辑 */
     LLVMValueRef plain = LLVMBuildOr(b,
         LLVMBuildAnd(b, len,
             LLVMConstInt(c->i64, 0x7FFFFFFFFFFFFFFFULL, 0), "pl0"),
@@ -514,12 +465,7 @@ static LLVMValueRef embed_emit_unzip(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMPositionBuilderAtEnd(b, bad);
     LLVMBuildRet(b, LLVMConstNull(c->i8p));
     LLVMPositionBuilderAtEnd(b, ok);
-    /* raw_len is the payload's first u32: deref the payload ADDRESS (d),
-     * not the field slot -- dp is &entry.data and still holds the old
-     * pointer at this point; loading through it baked the pointer's low
-     * half into entry.len and every consumer read a 2 GiB size. The
-     * decoded buffer is already NUL-terminated at raw_len, so the slot
-     * ends up exactly as a raw bake. */
+    /* 内部辅助逻辑 */
     LLVMValueRef rl = LLVMBuildLoad2(b, c->i32, d, "rawlen");
     LLVMValueRef rl64 = LLVMBuildZExt(b, rl, c->i64, "raw64");
     LLVMBuildStore(b, out, dp);
@@ -529,11 +475,7 @@ static LLVMValueRef embed_emit_unzip(zan_irgen_t *g, struct embed_api_ctx *c) {
     return fn;
 }
 
-/* i8* zan.embed.pass(i8* ent): the no-compression stand-in for unzip. A
- * program that only CALLS the embed API (uses_embed_api, empty own table)
- * must not drag a zan_embed_decode extern into its object -- nothing sets
- * the compressed flag, so a passthrough keeps read/bytes' bodies shared
- * without creating an undefined reference the link would reject. */
+/* i8* zan */
 static LLVMValueRef embed_emit_passthrough(zan_irgen_t *g,
                                            struct embed_api_ctx *c) {
     LLVMTypeRef args[] = { c->i8p };
@@ -592,11 +534,7 @@ static void embed_emit_read_has_bytes(zan_irgen_t *g, struct embed_api_ctx *c,
     LLVMTypeRef bty = LLVMFunctionType(c->i8p, bargs, 2, 0);
     LLVMValueRef bfn = embed_define(g, "zan_embed_bytes", bty);
     if (!bfn) { LLVMDisposeBuilder(b); return; }
-    /* embed_define reuses the declaration File.zan's DllImport already made,
-     * and TYPE_NINT lowers to i64 on every target (irgen.c map_type), so the
-     * reused function returns i64 while the body's natural result is the data
-     * pointer. Coerce both returns to the declaration's actual return type --
-     * a narrower ret fails module validation on wasm32's 32-bit pointers. */
+    /* embed_define reuses the declaration File */
     LLVMTypeRef brt = LLVMGetReturnType(LLVMGlobalGetValueType(bfn));
     LLVMBasicBlockRef bb0 = LLVMAppendBasicBlockInContext(g->ctx, bfn, "entry");
     LLVMBasicBlockRef bgot = LLVMAppendBasicBlockInContext(g->ctx, bfn, "got");
@@ -638,10 +576,7 @@ static void embed_emit_read_has_bytes(zan_irgen_t *g, struct embed_api_ctx *c,
     LLVMDisposeBuilder(b);
 }
 
-/* const char* zan_embed_list(const char* prefix): the matching names joined by
- * '\n' in a lazily allocated buffer. Iterates the two lookup slots (registered
- * table first, then this module's own) and drops names the registered slot
- * already produced, mirroring find's "registered wins duplicates" order. */
+/* 内部辅助逻辑 */
 static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMTypeRef args[] = { c->i8p };
     LLVMTypeRef fty = LLVMFunctionType(c->i8p, args, 1, 0);
@@ -755,8 +690,7 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
         LLVMConstInt(c->i32, 0, 0), "pmatch"), take, next);
 
     LLVMPositionBuilderAtEnd(b, take);
-    /* In slot 0 (registered table) the name is emitted as-is; in slot 1 (own
-     * table) it is dropped when the registered table also carries it. */
+    /* 内部辅助逻辑 */
     LLVMValueRef s0 = LLVMBuildLoad2(b, c->i64, sva, "scur");
     LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, s0,
         LLVMConstInt(c->i64, 0, 0), "is0"), take2, dup);
@@ -840,13 +774,7 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMDisposeBuilder(b);
 }
 
-/* void zan_embed_register(const zan_embed_ent* tbl, long long n)
- *
- * Called by a generated data object's constructor (scripts/gen_embed.ps1).
- * Stores the table in the registered slot (slot 0 of find/list); this module's
- * own --embed table stays reachable in slot 1, so both groups remain visible.
- * Re-registering the identical table is a no-op, so two ctors carrying the
- * same object (a static archive pulled in twice) stay harmless. */
+/* 内部辅助逻辑 */
 static void embed_emit_register(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMTypeRef args[] = { c->i8p, c->i64 };
     LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), args, 2, 0);
@@ -874,10 +802,7 @@ int zan_embed_driver_spec(const char *path, const char *file, char *out,
     long long len = 0;
     unsigned char *data = embed_read_file(path, &len);
     if (!data) return -1;
-    /* FNV-1a over the whole driver: the fingerprint goes into the resource
-     * name, so the extracted copy of one build can never be mistaken for
-     * another's (a rebuild against different CEF headers often keeps the
-     * very same file size). */
+    /* 内部辅助逻辑 */
     unsigned long long h = 1469598103934665603ULL;
     for (long long i = 0; i < len; i++) {
         h ^= (unsigned long long)data[i];
@@ -889,10 +814,7 @@ int zan_embed_driver_spec(const char *path, const char *file, char *out,
     return (n < 0 || (size_t)n >= out_sz) ? -1 : 0;
 }
 
-/* Same as zan_embed_emit_specs, but a directory spec walks only the pack
- * folders named in `filter` (plus the loose files at the spec root). Names in
- * the filter are bare path segments: "dark" matches "<path>/dark/skin.css".
- * A NULL/empty filter walks everything. Returns the same contract. */
+/* 内部辅助逻辑 */
 int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
                                   int count, const char *const *filter,
                                   int filter_count);
@@ -920,10 +842,7 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
         }
 #endif
         int before = files.n;
-        /* The pack filter belongs to the skins spec alone ("skins/<pack>/
-         * skin.css" shape): on any other directory spec it would drop every
-         * subfolder at that spec's root and trip the "matched no readable
-         * file" hard error below. */
+        /* The pack filter belongs to the skins spec alone ("skins/<pack>/ skin */
         int filtering = filter != NULL && filter_count > 0
                         && embed_is_dir(path)
                         && prefix != NULL && strcmp(prefix, "skins") == 0;
@@ -942,8 +861,7 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
             return -1;
         }
     }
-    /* Compress the payloads that gain from it and mark them via the len sign
-     * bit; the emitted read API decodes lazily on first hit. */
+    /* 内部辅助逻辑 */
     unsigned char *compressed = (unsigned char *)calloc(
         (size_t)(files.n > 0 ? files.n : 1), 1);
     if (!compressed) {
@@ -966,7 +884,7 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
         compressed[i] = 1;
         any_compressed = 1;
     }
-    /* link zan_inflate.o (zan_embed_decode) only when a payload compressed */
+    /* link zan_inflate */
     if (any_compressed) g->uses_inflate = true;
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -988,9 +906,7 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
         LLVMValueRef data = embed_bytes_global(g, label, files.v[i].data,
                                                files.v[i].len);
         if (!name || !data) {
-            /* Same release discipline as the success tail: free every
-             * remaining entry (name + data) or a ≥4 GiB resource aborts with
-             * the whole list still held. */
+            /* 内部辅助逻辑 */
             free(ents);
             free(compressed);
             for (int f = 0; f < files.n; f++) {
@@ -1009,10 +925,7 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
                              LLVMConstInt(i64, 0, 0) };
     ents[files.n] = LLVMConstNamedStruct(ent_ty, nulls, 3);
 
-    /* With nothing embedded the API is still emitted, with an empty table: a
-     * generated data object linked alongside (scripts/gen_embed.ps1) fills
-     * the registered slot in through zan_embed_register, and a program that
-     * merely calls the API reads empty and falls back to the filesystem. */
+    /* 内部辅助逻辑 */
     LLVMValueRef tbl0 = LLVMConstNull(i8p);
     if (files.n > 0) {
         LLVMTypeRef tbl_ty = LLVMArrayType(ent_ty, (unsigned)files.n + 1);
@@ -1020,8 +933,7 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
         LLVMSetInitializer(tbl,
             LLVMConstArray(ent_ty, ents, (unsigned)files.n + 1));
         LLVMSetLinkage(tbl, LLVMPrivateLinkage);
-        /* NOT constant: zan.embed.unzip patches compressed slots in place on
-         * first read, so repeat reads see the decoded payload. */
+        /* NOT constant: zan */
         LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
         LLVMValueRef idx[] = { zero, zero };
         tbl0 = LLVMConstInBoundsGEP2(tbl_ty, tbl, idx, 2);
@@ -1034,9 +946,7 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
     c.i32 = LLVMInt32TypeInContext(g->ctx);
     c.i64 = i64;
     c.ent_ty = ent_ty;
-    /* The registered slot starts EMPTY (a generated data object fills it in
-     * at startup); this module's own table lives in own_tbl/own_cnt. Two
-     * slots, no clobbering. */
+    /* 内部辅助逻辑 */
     c.buf_cap = total_names + 4096;
     c.gtbl = LLVMAddGlobal(g->mod, i8p, "zan.embed.gtbl");
     LLVMSetInitializer(c.gtbl, LLVMConstNull(i8p));
@@ -1059,9 +969,7 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
     embed_emit_read_has_bytes(g, &c, find, unzip);
     embed_emit_list(g, &c);
 
-    /* The API is defined right here, so the shipped zan_embed_api object must
-     * NOT also be linked (duplicate definitions); this is what lets an
-     * embedding program link for targets that ship no such object. */
+    /* 内部辅助逻辑 */
     g->uses_embed_api = false;
 
     int n = files.n;

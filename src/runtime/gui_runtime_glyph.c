@@ -1,27 +1,6 @@
-/* gui_runtime_glyph.c -- the glyph atlas: coverage tiles a platform font
- * engine produced, cached across frames and keyed by what was rasterized.
- *
- * Text is redrawn from scratch every frame (a scrolling editor repaints the
- * same tokens with only their Y moved), while rasterizing a glyph is by far the
- * most expensive thing in that frame: a GDI DIB round-trip or a FreeType
- * FT_LOAD_RENDER per character. So the font engine is asked once per distinct
- * (kind, size, key) and the coverage is kept; drawing text then only composites
- * cached tiles, which is also exactly what a GPU backend needs -- upload the
- * tile once, draw the run in one call (see zan_glyph_run in gui_backend.h).
- *
- * Colour is deliberately not part of the key: coverage is colourless, the draw
- * colour is applied when the run is composited, so the same tile serves every
- * colour the same string is ever drawn in.
- *
- * Part of the gui_runtime translation unit: #include'd by gui_runtime.c in
- * a fixed order; not compiled standalone (preprocessor state and static
- * linkage are shared across the parts).
- */
+/* gui_runtime_glyph */
 
-/* What the key means. A single glyph is the cacheable unit wherever the font
- * engine gives per-glyph coverage and metrics (FreeType); GDI's ClearType
- * coverage is per-channel and produced for a whole laid-out run, so there the
- * run itself is the tile. */
+/* What the key means */
 #define ZAN_TILE_RUN   0
 #define ZAN_TILE_GLYPH 1
 
@@ -36,19 +15,10 @@ typedef struct {
     zan_glyph_tile tile;
 } zan_atlas_slot;
 
-/* Open addressing with a short probe window, like the caches this replaces: a
- * miss costs the font engine anyway, so a slot collision evicting the coldest
- * of eight is cheaper than any chaining. The byte budget is what actually
- * bounds memory -- a run tile is as wide as a whole line of text, so a count
- * alone would not. */
+/* 内部辅助逻辑 */
 #define ZAN_ATLAS_CAP   4096
 #define ZAN_ATLAS_PROBE 8
-/* Desktop workstations never notice the atlas; phones do. A CJK page holds
- * hundreds of whole-line run tiles and the desktop budget lands straight on
- * the device's PSS bill (gui_gallery sat at ~32MB atlas on Android). Sweep
- * evicts cold tiles either way -- a miss costs the font engine pass that
- * already had to happen -- so the budget trades resident memory for an
- * occasional re-raster, which is the right trade on a phone. */
+/* Desktop workstations never notice the atlas; phones do */
 #if defined(__ANDROID__)
 #define ZAN_ATLAS_BYTES (4u * 1024u * 1024u)
 #else
@@ -64,20 +34,7 @@ static uint64_t g_atlas_hits = 0;
 static uint64_t g_atlas_misses = 0;
 static uint64_t g_atlas_swept = 0;
 
-/* Coverage-buffer pool. A churn UI -- counters, clocks, log lines -- cycles
- * tile allocations through store/sweep forever. Routing those buffers
- * through malloc/free made the CRT heap climb to a fragmentation high-water,
- * which read as "still leaking" under fast clicking even though every tile
- * was recycled. The pool keeps released coverage buffers and hands them back,
- * so a steady state performs zero heap traffic.
- *
- * Exact-size matching would almost never hit: on proportional fonts every
- * new string value rasterizes a few pixels wider or narrower than the last,
- * so allocations are rounded up to bucket steps first -- 1KB for the small
- * glyph tiles, 8KB for whole-line run tiles -- collapsing the recurring
- * sizes into a handful of buckets that recycle perfectly. The waste is
- * bounded by one step per tile. The pool is capped by count and total bytes;
- * overflow falls back to free() as before. */
+/* Coverage-buffer pool */
 #define ZAN_ATLAS_POOL_CAP 256
 #if defined(__ANDROID__)
 #define ZAN_ATLAS_POOL_BYTES (1u * 1024u * 1024u)
@@ -153,23 +110,12 @@ static void zan_atlas_trim(void) {
     }
 }
 
-/* A tile stops earning its bytes once no frame has found it for this many
- * subsequent stores. Every string a live frame still draws is re-found (and
- * re-stamped) every frame, while dynamic values -- counters, clocks, log and
- * chat lines -- are superseded and never drawn again. Stores only happen when
- * some text on screen CHANGES, so a threshold of a few dozen covers every
- * realistic lifetime of a displayed value; text that has been superseded this
- * many stores ago cannot come back (worst case: one re-rasterisation when a
- * long-idle screen is revisited). */
+/* 内部辅助逻辑 */
 #define ZAN_ATLAS_COLD_STORES 64
-/* Sweep cadence: amortises the full-slot scan over this many stores. */
+/* Sweep cadence: amortises the full-slot scan over this many stores */
 #define ZAN_ATLAS_SWEEP 64
 
-/* Drop every cold tile. Without this, a UI that renders ever-changing text
- * (the gallery's `count: N` labels, per-click) mints one run tile per
- * distinct value and holds all of them until the 32 MB hard cap, so RSS
- * climbs linearly with use. Sweeping recycles exactly the superseded values
- * and never touches text the current frames still draw. */
+/* Drop every cold tile */
 static void zan_atlas_sweep(void) {
     for (int i = 0; i < ZAN_ATLAS_CAP; i++) {
         zan_atlas_slot *e = &g_atlas[i];
@@ -181,7 +127,7 @@ static void zan_atlas_sweep(void) {
     }
 }
 
-/* The cached tile for this key, or NULL when the caller has to rasterize. */
+/* The cached tile for this key, or NULL when the caller has to rasterize */
 static const zan_glyph_tile *zan_atlas_find(int kind, int size,
                                             const char *key, int key_len) {
     uint64_t h = zan_atlas_hash(kind, size, key, key_len);
@@ -201,12 +147,7 @@ static const zan_glyph_tile *zan_atlas_find(int kind, int size,
     return NULL;
 }
 
-/* Take a copy of freshly rasterized coverage and return the cached tile, or
- * NULL if it could not be cached -- callers must handle NULL rather than draw
- * uncached, so a failed allocation degrades to "this text is not drawn" instead
- * of duplicating the composite path. `cov` holds w*h samples of `bpp` bytes;
- * w/h of 0 caches a glyph that has no coverage but still moves the pen (a
- * space), which is worth a slot precisely because it is so common. */
+/* 内部辅助逻辑 */
 static const zan_glyph_tile *zan_atlas_store(
     int kind, int size, const char *key, int key_len,
     int w, int h, int left, int top, int advance,
@@ -258,8 +199,7 @@ static const zan_glyph_tile *zan_atlas_store(
     return &victim->tile;
 }
 
-/* A run is emitted in batches so a long line of text costs one backend call
- * per batch instead of one per glyph, without an unbounded buffer. */
+/* 内部辅助逻辑 */
 #define ZAN_GLYPH_BATCH 128
 
 typedef struct {

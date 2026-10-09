@@ -1,15 +1,9 @@
-/* clock_gettime is POSIX, not ISO C: a strict -std=c11 build (which is how the
- * timer object is compiled, natively and for every cross target) hides it
- * behind this feature macro, so ask for it before any header is pulled in.
- * Darwin exposes it unconditionally and narrows other APIs when asked for
- * strict POSIX, so leave it alone there. */
+/* 内部辅助实现 */
 #if !defined(_WIN32) && !defined(__APPLE__)
 #define _POSIX_C_SOURCE 200809L
 #endif
 
-/* GetTickCount64 needs Vista+ headers; without this the strict -std=c11 MinGW
- * build only gets an implicit declaration and truncates the 64-bit tick count
- * to int. */
+/* 内部辅助实现 */
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0601
 #endif
@@ -24,14 +18,7 @@
 #include "../common/host_oom.h"
 #include "../common/zan_abi.h"
 
-/* Persistent crash logging. This object is linked into every program zanc
- * builds (its coroutine driver calls zan_timer_*, see src/compiler/main.c), so
- * including the logger here is what gives a plain console or GUI program the
- * same crash record the async reactor and the GUI runtime already installed --
- * before this, a program that used neither died without a trace. Every symbol
- * in the header is static and installation is idempotent, so the runtimes that
- * also include it stay correct. The wasm sysroot has no signals or process
- * paths, so it keeps the previous behaviour. */
+/* Persistent crash logging */
 #if !defined(__wasm__) && !defined(ZAN_BARE_METAL)
 #include "rt_crash.h"
 #endif
@@ -53,24 +40,16 @@ static void timer_lock(void) {
 }
 static void timer_unlock(void) { LeaveCriticalSection(&g_lock); }
 #elif defined(__wasm__)
-/* Single-threaded wasm (WASI): the sysroot has no pthreads, and none are
- * needed -- one thread cannot race the timer heap. */
+/* 内部辅助逻辑 */
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
-/* cloudlibc's time.h defines CLOCK_MONOTONIC (as a clockid) but does not
- * declare clock_gettime; declare it -- libc.a provides the implementation
- * as a WASI host-import wrapper. */
+/* cloudlibc's time */
 int clock_gettime(clockid_t, struct timespec *);
 static void timer_lock(void) {}
 static void timer_unlock(void) {}
 #elif defined(ZAN_BARE_METAL)
-/* Bare-metal / MCU (ESP-IDF's newlib, picolibc, a freestanding libc of the
- * target SDK): one thread, so the heap needs no mutex. Time comes from the
- * libc's clock_gettime (ESP-IDF maps CLOCK_MONOTONIC onto esp_timer); a
- * target whose libc lacks it overrides the (weak) zan_timer_now_ms. No
- * signal-based crash logging -- signals either do not exist or belong to
- * the MCU's own panic handler. */
+/* 内部辅助实现 */
 #include <time.h>
 static void timer_lock(void) {}
 static void timer_unlock(void) {}
@@ -85,11 +64,7 @@ static void timer_lock(void) { pthread_mutex_lock(&g_lock); }
 static void timer_unlock(void) { pthread_mutex_unlock(&g_lock); }
 #endif
 
-/* Dispatcher identity for the DELAY wake window (see zan_timer_dispatch_due):
- * a cross-thread cancel that loses the removed re-check race must wait the
- * window out before its caller frees the frame, while a same-thread cancel
- * (a coroutine cancelling itself from inside the resumed code) must NOT wait
- * -- waiting would deadlock against our own ready() return. */
+/* 内部辅助实现 */
 #if defined(_WIN32)
 static unsigned long timer_self_tid(void) { return GetCurrentThreadId(); }
 static void timer_yield(void) { Sleep(1); }
@@ -103,12 +78,7 @@ static unsigned long timer_self_tid(void) {
 }
 static void timer_yield(void) { sched_yield(); }
 #endif
-/* The Windows C runtime's argv is decoded with the process ANSI code page,
- * whereas Zan strings and the Windows file APIs use UTF-8. Reparse the
- * original Unicode command line and retain the converted vector for process
- * lifetime, matching the CRT argv lifetime. This object is linked into every
- * native executable, so the compiler can use the helper without a new optional
- * runtime dependency. */
+/* 内部辅助实现 */
 int zan_utf8_argv(int *argc, char ***argv) {
 #if defined(_WIN32)
     if (!argc || !argv) return 0;
@@ -160,43 +130,17 @@ int zan_utf8_argv(int *argc, char ***argv) {
 #endif
 }
 
-
-/* ---- Fail-soft fault reports (zan_rt_soft_note) ----
- *
- * The compiler's runtime guards used to have one outcome: print and exit(70).
- * That turns a latent null reference in a long-running service into a crash
- * loop at 3am: the process dies, the supervisor restarts it, it hits the same
- * guard and dies again. The soft path instead appends the message to the same
- * dated log the crash handler already writes (POSIX: <exe_dir>/logs/YYYYMM/
- * DD.log, Windows: <exe_dir>\zan_crash.log), prints it on stderr once, and
- * lets the caller continue with a default value; the dedup table keeps a
- * hot loop that trips the same site from flooding the disk. ZAN_RT_HARD=1
- * restores the historical hard exit (the compiler test-suite relies on the
- * exit status to pin the guard behavior).
- *
- * Callers run on the guarded thread, not inside a signal handler, so this may
- * use stdio and the environment freely -- but it must never itself abort:
- * every allocation/open failure silently degrades to "no log entry". */
+/* 内部辅助实现 */
 
 #define ZAN_SOFT_MAX_SITES 1024
 
 static char *g_soft_seen[ZAN_SOFT_MAX_SITES];
 static int g_soft_seen_count;
-/* set once by a --strict-runtime program's main() prologue (see
- * zan_rt_set_strict); forces the hard path of every guard regardless of
- * ZAN_RT_HARD (which still overrides to 0 for an explicit opt-out) */
+/* 内部辅助实现 */
 static int g_soft_strict;
 
 static int zan_soft_is_hard(void) {
-    /* Same lazy-init shape as zan_rt_soft_scratch below: the guards test this
-     * on any worker thread under multi-worker builds, and a plain first-write
-     * to a shared static is a C data race even when both racers store the
-     * same value. The computation is idempotent (the getenv result and
-     * g_soft_strict -- set once by the main prologue -- are process-stable),
-     * so the timer lock is pure race removal. It is never called with that
-     * lock held: guard_fail2/guard_fail3 test it before the note/report
-     * entry points take it, and the emitted guards calling
-     * zan_rt_soft_is_hard hold no runtime lock. */
+    /* 内部辅助实现 */
     timer_lock();
     static int hard = -1;
     if (hard < 0) {
@@ -211,40 +155,10 @@ static int zan_soft_is_hard(void) {
 
 int zan_rt_soft_is_hard(void) { return zan_soft_is_hard(); }
 
-/* Program-baked fail-fast: --strict-runtime compiles a main() prologue that
- * calls this before any user code, so a binary built strict exits(70) on a
- * guard failure even where the operator never set ZAN_RT_HARD=1 (audit D7:
- * soft mode's "log + continue with a default value" is a deployment choice,
- * not a property of every binary). The env var still wins when the operator
- * explicitly sets it to 0, keeping an escape hatch without a rebuild. */
+/* 内部辅助实现 */
 void zan_rt_set_strict(void) { g_soft_strict = 1; }
 
-/* Scratch substitute for a null base on the soft path (see rt_timer.h).
- *
- * The compiler swaps this page in for a null receiver on the soft path and
- * then keeps executing the surrounding code (emit_soft_base_select,
- * irgen_generics.c): field loads read zeros, but the substituted base also
- * flows into ordinary ARC operations and method arguments. With a bare zeroed
- * buffer the refcount slot sat at scratch-16 -- whatever .bss global the
- * linker placed before it. A retain incremented that global; a release
- * decremented it, and when the count reached zero zan_rt_release called
- * free() on an address inside the image. Those writes were the heap/image
- * corruption behind the publish IDE's startup crash (DropAlive called with
- * this==0x1, HeapFree faulting on a mangled free list), invisible at -O0
- * where the same sequence stayed on guarded runtime calls.
- *
- * So the page is a well-formed, immortal object instead: a full 32-byte ARC
- * header in front of a zeroed payload. The header words are exactly the
- * layout every retain/release probes (zan_abi.h):
- *   P-32  huge rc            (array/class refcount slot -- never hits 0)
- *   P-24  ZAN_ARRAY_RC_MAGIC (tolerant retain/release guard)
- *   P-16  huge rc            (object/string refcount slot)
- *   P-8   ZAN_ARRAY_MAGIC    (discriminator: string paths forward to the
- *                             array pair, whose rc slot is also non-sentinel)
- * Retains and releases now land inside our own header, never free (both rc
- * slots start at 2^62, and free fires only at exactly 0), and field loads
- * still see a zeroed object. The payload is 4096 bytes so guarded field
- * reads on larger structs stay inside the page too. */
+/* Scratch substitute for a null base on the soft path (see rt_timer */
 #define ZAN_SOFT_SCRATCH_RC  (UINT64_C(1) << 62)
 #define ZAN_SOFT_SCRATCH_PAYLOAD 4096
 static union {
@@ -259,14 +173,7 @@ static void store_u64_le(unsigned char *p, uint64_t v) {
 }
 
 unsigned char *zan_rt_soft_scratch(void) {
-    /* Guard paths fire on any worker thread under multi-worker builds, and
-     * the old lazy init was a plain check-then-write: two first callers
-     * could race the memset + store_u64_le sequence, and a third could
-     * observe g_soft_scratch non-null while the ARC header words in front
-     * of the payload were still being written -- retain/release on a
-     * half-built page is exactly the heap corruption this page exists to
-     * prevent. Cold path (a null reference already happened), so the timer
-     * lock costs nothing and needs no new per-platform atomic plumbing. */
+    /* 内部辅助实现 */
     timer_lock();
     if (!g_soft_scratch) {
         unsigned char *hdr = g_soft_scratch_store.bytes;
@@ -282,14 +189,7 @@ unsigned char *zan_rt_soft_scratch(void) {
     return scratch;
 }
 
-/* One message per site per process: the same null field hit in a loop would
- * otherwise append an entry per iteration. Pointer identity of the compiler-
- * emitted global string is the site identity.
- *
- * Called with the timer lock held (the note/report entry points take it
- * around zan_soft_seen): soft reports can fire on any worker thread under
- * multi-worker builds, and the count+store was an unsynchronized RMW that could
- * drop or corrupt entries -- worst case two threads store past index 255. */
+/* 内部辅助逻辑 */
 static int zan_soft_seen(const char *text) {
     for (int i = 0; i < g_soft_seen_count; i++)
         if (g_soft_seen[i] == text) return 1;
@@ -298,14 +198,7 @@ static int zan_soft_seen(const char *text) {
     return 0;
 }
 
-/* Dedup table for zan_rt_soft_note3, keyed on the guard site's (file, line,
- * col) triple instead of the composed text. note3 composes into a stack
- * buffer, so a pointer-identity table would store a dangling stack address:
- * reports from a different thread or call depth would miss (log flood) and a
- * later site reusing that stack slot would be suppressed without ever having
- * reported. `file` is the emitter's per-module interned global, so pointer
- * identity on it is stable. No allocation: the fail-soft path must not
- * depend on the heap being healthy. */
+/* 内部辅助逻辑 */
 static struct {
     const char *file;
     unsigned line;
@@ -355,9 +248,7 @@ static void zan_soft_init_logdir(void) {
     strncat(g_soft_logdir, "logs", sizeof(g_soft_logdir) - strlen(g_soft_logdir) - 1);
 }
 
-/* <logdir>/<YYYYMM>/<DD>.log -- the same file the crash handler records into,
- * so a soft report sits between the crash records the operator already reads.
- * Runs outside a signal handler, so localtime_r is fine here. */
+/* <logdir>/<YYYYMM>/<DD> */
 static void zan_soft_log_path(char *path, size_t cap) {
     if (!g_soft_logdir[0]) zan_soft_init_logdir();
     time_t now = time(NULL);
@@ -382,9 +273,7 @@ static void zan_soft_append(const char *text) {
     if (!f) return;
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
-    /* Header line once per file (best effort): a fresh log starts with the
-     * exe so a lone soft line is attributable even if the process exits
-     * before anything else logs. */
+    /* 内部辅助实现 */
     if (size == 0) {
 #if defined(_WIN32)
         char exe[MAX_PATH];
@@ -426,13 +315,7 @@ void zan_rt_soft_note(const char *text) {
     zan_soft_append(text);
 }
 
-/* Two-part soft report. `prefix` is per-site ("Gui/App.zan:818:40: runtime
- * error: "), `msg` is one of a few hundred shared templates. Site identity
- * (and therefore the dedup key) is the prefix pointer: every guard site
- * emits exactly one prefix global, mirroring how zan_rt_soft_note keys on
- * the whole-text pointer. Composition happens under the same lock that
- * guards the dedup table, into a buffer long enough for any prefix+msg the
- * emitter produces (the compiler caps each part at 640 bytes). */
+/* Two-part soft report */
 void zan_rt_soft_note2(const char *prefix, const char *msg) {
     if (!prefix) return;
     char buf[1400];
@@ -457,12 +340,7 @@ void zan_rt_soft_note2(const char *prefix, const char *msg) {
     zan_soft_append(buf);
 }
 
-/* Three-part soft report: the emitter interns the file name once per module
- * (thousands of guard sites share one "Gui/App.zan" global) and passes
- * line/col as immediate operands, instead of every site carrying its own
- * "file:line:col: runtime error: " prefix string (~24k strings / ~1 MB of
- * .rdata in the gui gallery publish). Dedup keys on the composed text via
- * the same g_soft_seen table as note2 -- one report per site per process. */
+/* 内部辅助逻辑 */
 void zan_rt_soft_note3(const char *file, unsigned line, unsigned col,
                        const char *msg) {
     char buf[1400];
@@ -470,10 +348,7 @@ void zan_rt_soft_note3(const char *file, unsigned line, unsigned col,
                      file ? file : "<unknown>", line, col,
                      msg ? msg : "");
     if (n <= 0) return;
-    /* Reserve two bytes for the trailing "\n\0" pair. Clamping to size-1 made
-     * buf[n + 1] write one byte past the array when the report overflowed --
-     * precisely the long-path/long-message guard failure this handler exists
-     * to survive; guard_fail3's n + 1 < sizeof buf check is the same rule. */
+    /* Reserve two bytes for the trailing "\n\0" pair */
     if ((size_t)n >= sizeof buf - 1) n = (int)sizeof buf - 2;
     buf[n] = '\n';
     buf[n + 1] = '\0';
@@ -502,13 +377,11 @@ void zan_rt_guard_fail2(const char *prefix, const char *msg) {
         fprintf(stderr, "%s", buf);
         fflush(stderr);
 #if defined(_WIN32)
-        /* Raise the fault-message record so the crash filter appends it to
-         * zan_crash.log. The filter resumes this thread (CONTINUE_EXECUTION for
-         * 0xE0A2C010), so the exit below still runs. */
+        /* Raise the fault-message record so the crash filter appends it to zan_crash */
         void (WINAPI *raise)(DWORD, DWORD, DWORD, const ULONG_PTR *) =
             RaiseException;
-        unsigned long code = 0xE0A2C010u; /* ZAN_RT_FAULT_MESSAGE (keep in sync
-                                             with rt_crash.h / irgen_generics.c) */
+        unsigned long code = 0xE0A2C010u; 
+/* ZAN_RT_FAULT_MESSAGE (keep in sync with rt_crash */
         ULONG_PTR args[2] = { (ULONG_PTR)buf, 70 };
         raise(code, 0, 2, args);
 #endif
@@ -521,8 +394,7 @@ void zan_rt_guard_fail3(const char *file, unsigned line, unsigned col,
                         const char *msg) {
     if (zan_soft_is_hard()) {
 #if defined(_WIN32)
-        /* Same contract as guard_fail2: compose the text, print it, raise the
-         * fault-message record for the crash log, then exit(70). */
+        /* 内部辅助实现 */
         char buf[1400];
         snprintf(buf, sizeof buf, "%s:%u:%u: runtime error: %s",
                  file ? file : "<unknown>", line, col, msg ? msg : "");
@@ -535,8 +407,8 @@ void zan_rt_guard_fail3(const char *file, unsigned line, unsigned col,
         fflush(stderr);
         void (WINAPI *raise)(DWORD, DWORD, DWORD, const ULONG_PTR *) =
             RaiseException;
-        unsigned long code = 0xE0A2C010u; /* ZAN_RT_FAULT_MESSAGE (keep in sync
-                                             with rt_crash.h / irgen_generics.c) */
+        unsigned long code = 0xE0A2C010u; 
+/* ZAN_RT_FAULT_MESSAGE (keep in sync with rt_crash */
         ULONG_PTR args[2] = { (ULONG_PTR)buf, 70 };
         raise(code, 0, 2, args);
 #endif
@@ -552,19 +424,13 @@ static zan_fatal_fn g_fatal_handler;
 void zan_rt_set_fatal_handler(zan_fatal_fn fn) { g_fatal_handler = fn; }
 
 void zan_rt_fatal(const char *category, const char *message) {
-    /* One diagnostic line for every fatal path, including the OOM fail-fasts
-     * that historically died without a word. Sites that printed their own
-     * message now pass it here instead, so nothing is printed twice and a
-     * supervisor tailing stderr sees the same stream shape for all of them. */
+    /* 内部辅助逻辑 */
     fprintf(stderr, "zan runtime: fatal (%s): %s\n",
             category ? category : "runtime", message ? message : "");
     fflush(stderr);
     zan_fatal_fn fn = g_fatal_handler;
     if (fn) fn(category, message);
-    /* The handler was supposed to exit() the process itself; returning means
-     * the host wants to keep running through a corrupt heap or a NULL the
-     * caller will immediately dereference -- refuse, exactly as before the
-     * hook existed. */
+    /* 内部辅助实现 */
     abort();
 }
 typedef enum zan_timer_kind {
@@ -572,10 +438,7 @@ typedef enum zan_timer_kind {
     ZAN_TIMER_PUBLIC = 1
 } zan_timer_kind;
 typedef struct zan_timer_entry {
-    /* Microsecond deadline on zan_co_precise_us: the ms wall clock
-     * quantizes to the OS tick (~15.6ms on Windows), and every Delay
-     * overshoot carried that granularity. zan_timer_next_timeout still
-     * ANSWERS in ms (round-up) because its callers park on ms waits. */
+    /* 内部辅助逻辑 */
     long long due_us;
     long long id;
     long long interval;
@@ -585,9 +448,7 @@ typedef struct zan_timer_entry {
     unsigned long long sequence;
     zan_timer_kind kind;
     int removed;
-    /* The dispatcher re-read `removed == 0`, released the lock and is inside
-     * its ready() for this entry's frame. Set under the lock; a cancel that
-     * arrives after the re-read waits (cross-thread) for it to clear. */
+    /* 内部辅助逻辑 */
     int waking;
     zan_timer_callback_t callback;
     void *frame;
@@ -602,27 +463,14 @@ static long long g_round;
 static unsigned long long g_sequence;
 static int g_initialized;
 static void (*g_ready_hook)(void *frame, zan_timer_step_t step);
-/* Entry whose callback is currently running (dispatch popped it from the heap
- * and is executing it outside the lock). zan_timer_clear must reach it too:
- * without this, a tick callback could not clear itself -- the entry is no
- * longer in the heap, so the usual scan would miss it and the timer would
- * reschedule forever. Read/written under the lock. */
+/* 内部辅助逻辑 */
 static zan_timer_entry *g_dispatching;
-/* Thread id of the dispatcher while a DELAY wake window is open (waking==1
- * on the g_dispatching entry). Under the lock. */
+/* 内部辅助逻辑 */
 static unsigned long g_dispatch_tid;
-/* Live (not removed) entries currently in the heap. Maintained on every push /
- * pop / removal so zan_timer_pending() is an O(1) unlocked read: the
- * multi-worker driver calls it once per scheduler loop iteration on every
- * worker, and the old "take the global lock and walk the whole heap" version
- * made the timer lock the pool's hottest contention point. */
+/* Live (not removed) entries currently in the heap */
 static volatile long long g_live;
 
-/* Weak on bare metal so a target with no usable CLOCK_MONOTONIC (or that
- * wants esp_timer ticks directly) overrides the clock wholesale. Everywhere
- * else the runtime object owns the symbol like before. Libcs whose headers
- * hide CLOCK_MONOTONIC (picolibc without POSIX feature tests) still compile:
- * the stub returns 0 and the board's override is mandatory there. */
+/* 内部辅助实现 */
 #if defined(ZAN_BARE_METAL)
 __attribute__((weak))
 #endif
@@ -638,12 +486,7 @@ long long zan_timer_now_ms(void) {
 #endif
 }
 
-/* Cooperative scheduling quantum in ms: how long a coroutine frame may run
- * before the poll sites the compiler plants at async loop back-edges call
- * zan_co_poll and, past this budget, requeue the frame so its siblings (and
- * the timer/IO pumps) get a turn. ZAN_CO_QUANTUM_MS overrides; 0 disables
- * preemption outright. Cached idempotently -- a first-call race between
- * workers computes the same value (same pattern as zan_io_trace above). */
+/* 内部辅助实现 */
 long long zan_co_quantum_ms(void) {
     static long long q = -1;
     if (q >= 0) return q;
@@ -655,12 +498,7 @@ long long zan_co_quantum_ms(void) {
     return q;
 }
 
-/* Microsecond monotonic clock for the drivers' slice accounting and the mt
- * pump throttle (see rt_timer.h). The two-term split is load-bearing: a
- * straight c*1000000/freq overflows i64 after ~15 minutes of uptime at the
- * usual 10MHz QPC frequency, while each term alone stays under it (seconds*
- * 1e6 since boot; sub-second remainder*1e6). The freq cache race on first
- * call is the same benign write-same-value pattern zan_co_quantum_ms has. */
+/* 内部辅助逻辑 */
 long long zan_co_precise_us(void) {
 #if defined(_WIN32)
     static long long freq;
@@ -693,13 +531,7 @@ static void heap_swap(size_t a, size_t b) {
     g_heap[b] = entry;
 }
 
-/* Push onto the heap. Returns 0 on success; on allocation failure the entry is
- * NOT queued, its removed flag is set (so cancel_delay sees it as gone) and the
- * caller must run the failure path appropriate to its kind. The historical
- * abort() here turned a transient allocation failure under load into an
- * instant whole-process death -- a server running thousands of Task.Delay
- * awaits should degrade (the await simply never fires and the awaiting frame
- * is cancelled on its next release) instead. */
+/* Push onto the heap */
 static int heap_push(zan_timer_entry *entry) {
     if (g_heap_len == g_heap_cap) {
         size_t cap = g_heap_cap ? g_heap_cap * 2 : 64;
@@ -762,19 +594,14 @@ void zan_timer_runtime_reset(void) {
     timer_unlock();
 }
 
-/* Shared deadline arithmetic: saturate instead of wrapping. `now + INT64_MAX`
- * is UB and wraps negative, which every due check would read as already
- * expired -- a huge delay would wake immediately instead of never. A deadline
- * this far out is unreachable on any monotonic clock anyway. */
+/* Shared deadline arithmetic: saturate instead of wrapping */
 long long zan_timer_saturating_due(long long now_ms, long long delay_ms) {
     if (delay_ms < 0) return now_ms;
     if (delay_ms > LLONG_MAX - now_ms) return LLONG_MAX;
     return now_ms + delay_ms;
 }
 
-/* Microsecond deadline arithmetic: same saturation rule as the ms
- * helper, plus the ms->us lift every public timer API needs (the public
- * surface stays milliseconds; only the heap runs in microseconds). */
+/* 内部辅助实现 */
 long long zan_timer_saturating_due_us(long long now_us, long long delay_us) {
     if (delay_us < 0) return now_us;
     if (delay_us > LLONG_MAX - now_us) return LLONG_MAX;
@@ -790,8 +617,8 @@ static long long delay_ms_to_us(long long ms) {
 void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
     if (!step) return;
     zan_timer_entry *entry = (zan_timer_entry *)calloc(1, sizeof(*entry));
-    if (!entry) return;   /* OOM: the await never fires; frame release still
-                             cancels nothing since no entry exists (soft). */
+    if (!entry) return;   
+/* 内部辅助逻辑 */
     entry->due_us = zan_timer_saturating_due_us(zan_co_precise_us(),
                                                                delay_ms_to_us(ms));
     entry->kind = ZAN_TIMER_DELAY;
@@ -801,10 +628,7 @@ void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
     g_initialized = 1;
     entry->sequence = ++g_sequence;   /* shared counter: only touch under the lock */
     if (heap_push(entry) != 0) {
-        /* Heap growth failed under load: drop the delay. The awaiting frame
-         * is parked on this resume -- with no entry it would hang forever, so
-         * ready it immediately (the delay elapses with zero remaining time
-         * from the waiter's perspective; better than a lost coroutine). */
+        /* Heap growth failed under load: drop the delay */
         timer_unlock();
         free(entry);   /* the entry never entered the heap */
         step(frame);
@@ -813,17 +637,7 @@ void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
     timer_unlock();
 }
 
-/* Cancel every pending DELAY entry naming `frame`.
- *
- * A DELAY entry holds a raw coroutine-frame pointer for as long as the
- * coroutine is suspended at `await Task.Delay`. Whoever releases that frame
- * must cancel its entries first: an entry that outlives the frame would wake
- * freed memory when it comes due (the dispatcher reads the frame's scheduler
- * header, and on the multi-worker driver may re-queue it). The coroutine
- * drivers call this on every frame-release path, right before the free.
- * Entries already popped and inside their dispatch window are covered through
- * g_dispatching -- dispatch_due re-reads `removed` under the lock before
- * waking the frame. Returns the number of entries cancelled. */
+/* Cancel every pending DELAY entry naming `frame` */
 int zan_timer_cancel_delay(void *frame) {
     int found = 0;
     if (!frame) return 0;
@@ -842,12 +656,7 @@ int zan_timer_cancel_delay(void *frame) {
         g_dispatching->removed = 1;
         found++;
     }
-    /* Close the dispatch TOCTOU: between the dispatcher's removed re-read and
-     * its ready() call this cancel can interleave (multi-worker pool), and the
-     * owner contract is cancel-then-FREE -- returning now would let the frame
-     * be freed under the wake. Wait the open wake window out. Same thread
-     * needs no wait: a coroutine cancelling itself from inside the resumed
-     * code runs within our own ready(), where waiting would deadlock. */
+    /* 内部辅助实现 */
     while (g_dispatching && g_dispatching->kind == ZAN_TIMER_DELAY &&
            g_dispatching->waking && g_dispatching->frame == frame &&
            g_dispatch_tid != timer_self_tid()) {
@@ -855,16 +664,7 @@ int zan_timer_cancel_delay(void *frame) {
         timer_yield();
         timer_lock();
     }
-    /* Physically purge cancelled DELAY entries instead of waiting for the
-     * lazy root pop. A removed entry normally self-cleans: once its due time
-     * passes it surfaces at the root and dispatch_due/next_timeout free it.
-     * A saturated LLONG_MAX deadline (an unreachable Task.Delay retired by
-     * TaskJoin.CancelAll) can never come due, so its entry would linger in
-     * the heap forever -- cancel is the only reclaim point. Free them here
-     * and heapify the survivors back into shape (Floyd, O(n); compaction
-     * shifts entries into different parent/child slots, so the residual
-     * array is NOT still a heap). g_dispatching is safe from the frees: it
-     * was popped from the heap before its dispatch window opened. */
+    /* 内部辅助逻辑 */
     size_t old_len = g_heap_len;
     size_t w = 0;
     for (size_t i = 0; i < g_heap_len; i++) {
@@ -875,11 +675,7 @@ int zan_timer_cancel_delay(void *frame) {
         }
     }
     g_heap_len = w;
-    /* Restore the heap invariant: after compaction the array is a permutation
-     * of live entries, so a full heapify (Floyd) is O(n). When nothing was
-     * purged the heap was never disturbed -- reordering it anyway both wasted
-     * the O(n) walk on every no-op cancel and shuffled timer deadlines
-     * between heap slots for nothing. */
+    /* 内部辅助实现 */
     if (w != old_len && g_heap_len > 1) {
         for (size_t i = g_heap_len / 2; i-- > 0;) {
             size_t index = i;
@@ -904,8 +700,7 @@ static long long timer_add(long long ms, zan_timer_callback_t callback, int repe
     if (ms < 1 || !callback) return 0;
     zan_timer_entry *entry = (zan_timer_entry *)calloc(1, sizeof(*entry));
     if (!entry) return 0;   /* OOM: report failure as an invalid timer id. */
-    /* Set the callback before publishing the entry: another thread dispatching
-     * due timers must never see a pushed entry with a NULL callback. */
+    /* 内部辅助实现 */
     entry->callback = callback;
     timer_lock();
     g_initialized = 1;
@@ -938,10 +733,7 @@ long long zan_timer_next_timeout(void) {
     timer_lock();
     while (g_heap_len > 0 && g_heap[0]->removed) free(heap_pop());
     if (g_heap_len > 0) {
-        /* Microsecond heap, millisecond answer: the callers park on ms waits
-         * (GQCS timeout / Sleep / poll). Round UP so a park never overshoots
-         * the deadline on conversion; sub-millisecond remainders become a
-         * 1ms park, whose lateness is the wait granularity, not clock error. */
+        /* 内部辅助逻辑 */
         long long rem_us = g_heap[0]->due_us - zan_co_precise_us();
         timeout = (rem_us <= 0) ? 0 : (rem_us + 999) / 1000;
     }
@@ -964,29 +756,20 @@ long long zan_timer_dispatch_due(void) {
             entry->exec_count++;
             entry->round = ++g_round;
         }
-        /* Publish the running entry under the lock so a clear() from inside
-         * the callback (or from another thread) can mark it removed. Save the
-         * previous entry: a callback that itself dispatches due timers would
-         * otherwise clobber the outer entry's window. */
+        /* 内部辅助实现 */
         zan_timer_entry *prev = g_dispatching;
         g_dispatching = entry;
         timer_unlock();
 
         long long started_us = zan_co_precise_us();
         if (entry->kind == ZAN_TIMER_DELAY) {
-            /* The frame may have been released after this entry was pushed
-             * (zan_timer_cancel_delay marks entries it cannot reach in the
-             * heap too -- including this one via g_dispatching). Re-read the
-             * flag under the lock: a cancelled DELAY neither wakes the frame
-             * nor steps it. */
+            /* 内部辅助实现 */
             void (*ready)(void *, zan_timer_step_t);
             timer_lock();
             ready = g_ready_hook;
             int cancelled = entry->removed;
             if (!cancelled) {
-                /* Claim the wake window: a cancel that interleaves after this
-                 * re-read (another thread) sees waking==1 and waits for the
-                 * tail below to clear it before its caller frees the frame. */
+                /* 内部辅助实现 */
                 entry->waking = 1;
                 g_dispatch_tid = timer_self_tid();
             }
@@ -1000,10 +783,7 @@ long long zan_timer_dispatch_due(void) {
         dispatched++;
 
         timer_lock();
-        /* Close the wake claim BEFORE the entry becomes freeable below and
-         * g_dispatching moves on: a cancel waiting in its wake-window spin
-         * re-reads g_dispatching fresh and leaves the loop once waking is 0
-         * (or the pointer moved past this entry). */
+        /* 内部辅助实现 */
         entry->waking = 0;
         g_dispatching = prev;
         if (entry->kind == ZAN_TIMER_PUBLIC) entry->exec_msec = elapsed / 1000;
@@ -1012,11 +792,7 @@ long long zan_timer_dispatch_due(void) {
             long long interval_us = delay_ms_to_us(entry->interval);
             entry->due_us = zan_timer_saturating_due_us(entry->due_us, interval_us);
             if (entry->due_us < cur_now) {
-                /* If delayed, allow catch-up for moderate lag, but prevent
-                 * unbounded catch-up loops when delayed by more than one interval
-                 * (e.g. process freeze, long blocking operation). Resynchronize
-                 * due_us to the periodic grid. skips * interval_us cannot
-                 * overflow: skips is only taken while lag > interval_us. */
+                /* 内部辅助实现 */
                 if (cur_now - entry->due_us > interval_us) {
                     long long lag = cur_now - entry->due_us;
                     long long skips = lag / interval_us;
@@ -1028,8 +804,7 @@ long long zan_timer_dispatch_due(void) {
             }
             entry->sequence = ++g_sequence;
             if (heap_push(entry) != 0) {
-                /* Heap growth failed: a repeating timer that cannot be
-                 * re-queued is dropped rather than aborting the process. */
+                /* 内部辅助逻辑 */
                 timer_unlock();
                 free(entry);
                 continue;
@@ -1043,13 +818,9 @@ long long zan_timer_dispatch_due(void) {
 }
 
 long long zan_timer_pending(void) {
-    /* Writers mutate g_live under the timer lock, but this read is lock-free
-     * (it runs once per scheduler iteration on every multi-worker driver worker).
-     * A plain load tears on 32-bit targets, and a torn 0 makes the driver's
-     * idle check declare the pool finished while a timer is still pending. */
+    /* 内部辅助实现 */
     return __atomic_load_n(&g_live, __ATOMIC_RELAXED);
 }
-
 
 int zan_timer_clear(long long id) {
     int found = 0;
@@ -1063,8 +834,7 @@ int zan_timer_clear(long long id) {
             break;
         }
     }
-    /* The entry whose callback is running is not in the heap; clear it here so
-     * a tick callback can cancel itself (it would otherwise reschedule). */
+    /* 内部辅助实现 */
     if (!found && g_dispatching && g_dispatching->kind == ZAN_TIMER_PUBLIC &&
         g_dispatching->id == id && !g_dispatching->removed) {
         g_dispatching->removed = 1;
@@ -1085,8 +855,7 @@ long long zan_timer_clear_all(void) {
             count++;
         }
     }
-    /* Also cover the running entry: a clear_all from inside a callback (or
-     * from another thread) must stop the timer from rescheduling. */
+    /* 内部辅助实现 */
     if (g_dispatching && g_dispatching->kind == ZAN_TIMER_PUBLIC &&
         !g_dispatching->removed) {
         g_dispatching->removed = 1;
@@ -1139,9 +908,7 @@ long long zan_timer_list_at(long long index) {
 }
 
 void zan_timer_stats(long long *initialized, long long *num, long long *round) {
-    /* All three are written under the lock (dispatch bumps g_round/exec_count,
-     * add/reset write g_initialized), so take it once and count inline instead
-     * of calling zan_timer_list_count (which would re-lock). */
+    /* 内部辅助实现 */
     timer_lock();
     if (initialized) *initialized = g_initialized;
     if (num) {
@@ -1154,33 +921,9 @@ void zan_timer_stats(long long *initialized, long long *num, long long *round) {
     timer_unlock();
 }
 
-/* ---- registry of live detached (Task.Spawn) coroutine frames ----
- *
- * A spawn handle is a raw frame pointer that can outlive the coroutine (the
- * reaper frees the frame), so Task.Cancel / Task.WhenAll must ask "is this
- * frame still alive?" before dereferencing it. That used to be an intrusive
- * singly-linked list rooted in a compiler-emitted global (__zan_co_live),
- * walked and spliced by emitted code with plain loads and stores. Two problems:
- *
- *   - unlinking scanned the list, so a server holding N live coroutines paid
- *     O(N) per completion -- at 1000 connections, a walk of a thousand frames
- *     per finished coroutine;
- *   - the splice was unsynchronized, which the multi-worker driver
- *     (multi-worker driver) turns into a crash: workers on different OS threads
- *     mutate the list concurrently and one follows a stale link (an access
- *     violation inside the emitted __zan_co_untrack).
- *
- * Same registry as an open-addressed hash set of frame pointers behind a spin
- * lock: O(1) expected for all operations and safe from any thread the driver
- * runs. It lives in this object rather than rt_co.c because emitted code calls
- * it unconditionally and zanc links this object into every native program,
- * while rt_co.c is replaced wholesale by the multi-worker driver.
- */
+/* ---- registry of live detached (Task */
 
-
-/* Tombstone: a slot whose frame was removed. Linear probing cannot simply
- * clear a slot without breaking the probe chains that run through it, and no
- * real frame pointer can be 1 (frames are at least 16-byte aligned). */
+/* Tombstone: a slot whose frame was removed */
 #define ZAN_LIVE_DEAD ((void *)(uintptr_t)1)
 
 static void  **g_colive_slots;
@@ -1190,10 +933,7 @@ static size_t   g_colive_dead;   /* tombstones */
 
 static volatile int g_colive_lock;
 
-/* Bounded TTAS backoff: pause-spin a few rounds, then hand the
- * core back. A pure pause-spin burns a whole timeslice when the lock holder
- * is preempted, stalling every worker that touches the live registry; and
- * the pause itself is x86-only, so non-x86 targets get the yield too. */
+/* Bounded TTAS backoff: pause-spin a few rounds, then hand the core back */
 static void zan_lock_backoff(int spins) {
     if (spins < 64) {
 #if defined(__i386__) || defined(__x86_64__)
@@ -1219,8 +959,7 @@ static void live_lock(void) {
 
 static void live_unlock(void) { __sync_lock_release(&g_colive_lock); }
 
-/* Pointer mix (splitmix64 finaliser): frames come from the allocator in
- * 16-byte-aligned runs, so the low bits alone would collide heavily. */
+/* 内部辅助实现 */
 static size_t live_hash(void *p) {
     uint64_t x = (uint64_t)(uintptr_t)p;
     x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
@@ -1229,7 +968,7 @@ static size_t live_hash(void *p) {
     return (size_t)x;
 }
 
-/* Grow (or compact, when tombstones are what filled the table) to `ncap`. */
+/* Grow (or compact, when tombstones are what filled the table) to `ncap` */
 static void live_rehash(size_t ncap) {
     void **old = g_colive_slots;
     size_t ocap = g_colive_cap;
@@ -1253,9 +992,7 @@ static void live_rehash(size_t ncap) {
 void zan_co_live_add(void *frame) {
     if (!frame) return;
     live_lock();
-    /* Keep the load factor at or below 3/4 counting tombstones: probe chains
-     * stay short, and a table churning in place (a server where coroutines
-     * come and go) compacts instead of growing without bound. */
+    /* 内部辅助实现 */
     if ((g_colive_live + g_colive_dead + 1) * 4 > g_colive_cap * 3)
         live_rehash(g_colive_cap ? (g_colive_live * 4 > g_colive_cap ? g_colive_cap * 2 : g_colive_cap) : 64);
     size_t mask = g_colive_cap - 1;
@@ -1279,11 +1016,7 @@ static void join_on_untrack(void *frame, void **out_joiner,
 
 void zan_co_live_del(void *frame) {
     if (!frame || !g_colive_cap) return;
-    /* Untrack is the one universal pre-free point every detached
-     * frame passes (reap fn -> untrack -> cancel_delay -> frame_free), so it
-     * is the completion-notification point for event-driven joins. The hook
-     * runs under live_lock; the ready call fires only after unlock so the
-     * joiner never wakes while we still hold the lock. */
+    /* 内部辅助实现 */
     void *fire_joiner = NULL;
     zan_timer_step_t fire_step = NULL;
     live_lock();
@@ -1314,8 +1047,7 @@ int zan_co_live_count(void) {
     return n;
 }
 
-/* lock-free core: caller must hold live_lock (join paths re-check liveness
- * while already holding it) */
+/* 内部辅助逻辑 */
 static int live_has_nolock(void *frame) {
     size_t mask = g_colive_cap - 1;
     size_t i = live_hash(frame) & mask;
@@ -1343,42 +1075,10 @@ void zan_co_live_reset(void) {
     live_unlock();
 }
 
-/* ---- event-driven join (Task.WhenAll / Task.WhenAny fast path) ----
- * Replaces the yield-hybrid polling of WhenAll/WhenAny with a suspension that
- * is readied by the completion itself. Design constraints that shaped it:
- *
- *  - A spawn ("fire-and-forget") frame is born with awaiter=self and
- *    awaiter_step=reap_fn (emit_detach_async_call): those two frame slots
- *    BELONG to the spawn/reap lifecycle and may not be borrowed. The old
- *    CAS-on-awaiter join design could never match on them.
- *  - Completion notification hooks at the emitted completion epilogue
- *    (zan_join_complete, called right after DONE is published): every async
- *    frame passes it exactly once, including result-carrying Task.Run frames
- *    that stay TRACKED after completion (done=1, not reaped until Result/
- *    Wait) — for those the untrack call never fires. The untrack point in
- *    zan_co_live_del remains as the fallback for a frame that leaves the
- *    registry without a normal completion.
- *  - The joiner suspends with the Delay shape: the runtime keeps
- *    (frame, step) and readies it later; the suspend path must NOT self-ready
- *    (a stray self-ready means an immediate empty resume and a broken wait).
- *
- * Bookkeeping is a global open-addressed map frame -> pair behind the live
- * registry's spin lock (same lock, no new synchronization). A pair records
- * {frame, owner, idx, done}; bind inserts it only while the frame is live,
- * NOT done, and not already bound — the frame is never dereferenced beyond
- * reading its done flag, and cancel/untrack remove by exact pointer + value
- * match, so a recycled address can never be touched. Firing goes through
- * g_ready_hook AFTER live_unlock (set by both drivers: the mt scheduler's
- * init and the M:1 timer loop via zan_timer_set_ready_hook). */
+/* ---- event-driven join (Task */
 
 #define JOIN_OFF_DONE (12 + (int)sizeof(void *)) /* co_header: done field */
-/* Cross-boundary ABI contract: the emitter lays every async frame out as
- * { i64 sched; void(i8*) *sched_step; i32 state; i32 done; ... } (the
- * ASYNC_FRAME_* indices in src/compiler/irgen_expr_core.c) while this object
- * probes DONE behind the runtime's back (join_pair_done / zan_join_bind).
- * Mirror the header prefix and pin the offsets at compile time so a layout
- * change on either side -- which would silently break every WhenAll/WhenAny
- * -- fails the build instead. */
+/* 内部辅助实现 */
 typedef struct zan_co_header_probe {
     long long sched;                /* ASYNC_FRAME_SCHED (i64) */
     void (*sched_step)(void *);     /* ASYNC_FRAME_SCHED_STEP (ptr) */
@@ -1405,11 +1105,7 @@ typedef struct zan_join {
     zan_timer_step_t joiner_step;
     int              npairs;  /* bound pairs, filled during the bind phase */
     int              winner;  /* any mode: first completed pair's index */
-    /* Bound pairs not yet marked done. Every mutation site (bind,
-     * the two done hooks, wait2, fire) already runs under live_lock, so a
-     * plain int is exact -- and the all-mode fire test collapses from a
-     * rescan of all N pairs on EVERY completion (O(N^2) under the global
-     * lock) to this counter hitting zero. */
+    /* Bound pairs not yet marked done */
     int              remaining;
     int              capacity; /* elements allocated in pairs[] */
     zan_join_pair_t  pairs[]; /* flexible array, one allocation */
@@ -1439,10 +1135,7 @@ static void joinmap_rehash(size_t ncap) {
 }
 
 static void joinmap_put(zan_join_pair_t *pr) {
-    /* Same policy as zan_co_live_add: double only when live entries alone
-     * would overflow, otherwise rehash in place -- a churn burst of
-     * completions must compact its tombstones, not ratchet the cap upward
-     * (high-throughput timers never shrink back otherwise). */
+    /* 内部辅助实现 */
     if ((g_joinmap_live + g_joinmap_dead + 1) * 4 >= g_joinmap_cap * 3)
         joinmap_rehash(g_joinmap_cap
                            ? (g_joinmap_live * 4 > g_joinmap_cap ? g_joinmap_cap * 2
@@ -1475,8 +1168,7 @@ static zan_join_pair_t *joinmap_get(void *frame) {
     }
 }
 
-/* remove by exact pointer whose frame still matches: a recycled address that
- * re-bound to the map must never be evicted by a stale entry's removal */
+/* 内部辅助实现 */
 static void joinmap_remove(void *frame, zan_join_pair_t *pr) {
     if (!g_joinmap_cap) return;
     size_t mask = g_joinmap_cap - 1;
@@ -1498,9 +1190,7 @@ static void joinmap_remove(void *frame, zan_join_pair_t *pr) {
 static int join_pair_done(const zan_join_pair_t *pr) {
     if (pr->done) return 1;
     if (!live_has_nolock(pr->frame)) return 1;   /* untracked: completed */
-    /* The emitter publishes DONE with a release xchg (irgen_async.c); read
-     * it acquire so the dependent RESULT store cannot slide under the probe
-     * on arm64/wasm32 -- a plain memcpy left that to luck. */
+    /* The emitter publishes DONE with a release xchg (irgen_async */
     int32_t done = __atomic_load_n(
         (const volatile int32_t *)((const unsigned char *)pr->frame + JOIN_OFF_DONE),
         __ATOMIC_ACQUIRE);
@@ -1508,8 +1198,7 @@ static int join_pair_done(const zan_join_pair_t *pr) {
 }
 
 static int join_any_done(zan_join_t *j) {
-    /* no bound pairs = every frame was already done (or gone) when bound:
-     * the join is satisfied, the joiner's own scan picks the winner */
+    /* 内部辅助实现 */
     if (j->npairs == 0) return 1;
     for (int i = 0; i < j->npairs; i++)
         if (join_pair_done(&j->pairs[i])) { j->winner = j->pairs[i].idx; return 1; }
@@ -1519,9 +1208,7 @@ static int join_any_done(zan_join_t *j) {
 static void join_fire_locked(zan_join_t *j, void **out_joiner, zan_timer_step_t *out_step) {
     *out_joiner = NULL;
     if (j->fired) return;
-    /* all mode: `remaining` is exactly the bound-not-done count (both done
-     * hooks decrement it once, mutually exclusive via joinmap removal), so
-     * zero means every pair fired -- no O(N) rescan per completion. */
+    /* 内部辅助实现 */
     int trig = j->any ? join_any_done(j) : (j->remaining == 0);
     if (!trig) return;
     j->fired = 1;
@@ -1540,14 +1227,7 @@ static void join_on_untrack(void *frame, void **out_joiner, zan_timer_step_t *ou
     join_fire_locked(pr->owner, out_joiner, out_step);
 }
 
-/* completion hook: called by the emitted completion epilogue of
- * EVERY async frame right after DONE is published. This is the primary join
- * notification because it also covers result-carrying Task.Run frames, which
- * stay tracked after completion (done=1, not reaped) until Result/Wait reaps
- * them — the untrack hook alone never sees those, and the join would hang
- * until the scheduler runs dry. The untrack hook in zan_co_live_del stays as
- * the fallback for a frame that leaves the registry without a normal
- * completion. Lock-free fast path for programs that never join. */
+/* 内部辅助逻辑 */
 static int zan_sched_trace(void) {
     static volatile int t = -1;
     int cur = __atomic_load_n(&t, __ATOMIC_RELAXED);
@@ -1594,17 +1274,14 @@ long long zan_join_new(int npairs, int any) {
     return (long long)(intptr_t)j;
 }
 
-/* bind one handle to the join. Returns 1 bound, 0 skipped (frame already
- * done, reaped, or bound twice — all benign: the scan below still sees it). */
+/* bind one handle to the join */
 int zan_join_bind(long long entry, void *frame, int idx) {
     zan_join_t *j = (zan_join_t *)(intptr_t)entry;
     if (!j || !frame) return 0;
     int bound = 0;
     live_lock();
     if (live_has_nolock(frame) && !joinmap_get(frame)) {
-        /* acquire, same reason as join_pair_done: the emitter publishes DONE
-         * with a release xchg, and a stale 0 read here binds a completed
-         * frame whose hook already ran. */
+        /* 内部辅助实现 */
         int32_t done = __atomic_load_n(
             (const volatile int32_t *)((const unsigned char *)frame + JOIN_OFF_DONE),
             __ATOMIC_ACQUIRE);
@@ -1625,9 +1302,7 @@ int zan_join_bind(long long entry, void *frame, int idx) {
     return bound;
 }
 
-/* suspend the caller until the join fires. Returns 1 satisfied (return
- * immediately), 0 suspended (runtime will ready (frame, step) on fire),
- * 2 unsupported here (no hook / not a coroutine — caller falls back). */
+/* suspend the caller until the join fires */
 int zan_join_wait2(long long entry, void *frame, zan_timer_step_t step) {
     zan_join_t *j = (zan_join_t *)(intptr_t)entry;
     if (!j || !g_ready_hook || !frame || !step) return 2;
@@ -1649,18 +1324,7 @@ void zan_join_cancel(long long entry) {
     free(j);
 }
 
-/* ---- async runtime configuration ----
- * Per-program scheduler/reactor settings, written by System.Threading
- * .AsyncRuntime from Main and read by the multi-worker driver when it starts
- * (the generated main calls zan_co_sched_init at entry and zan_co_sched_run
- * after the body, so a call in Main lands between the two).
- *
- * They live here, not in rt_io.c, because this object is linked into every
- * program while the reactor object is linked only for socket-async ones -- a
- * program that only configures the runtime must still link. Programs that
- * configure nothing keep the previous behaviour: the driver falls back to the
- * ZAN_CO_WORKERS / ZAN_IO_SHARDS / ZAN_IO_SYNCFAST environment variables,
- * which stay available for A/B measurements without a rebuild. */
+/* 内部辅助逻辑 */
 static volatile int g_cfg_workers   = 0;    /* 0  = unset (CPU count) */
 static volatile int g_cfg_io_shards = 0;    /* 0  = unset (one per worker) */
 static volatile int g_cfg_sync_fast = -1;   /* -1 = unset */
@@ -1673,16 +1337,7 @@ int32_t zan_async_cfg_workers(void)   { return (int32_t)__atomic_load_n(&g_cfg_w
 int32_t zan_async_cfg_io_shards(void) { return (int32_t)__atomic_load_n(&g_cfg_io_shards, __ATOMIC_ACQUIRE); }
 int32_t zan_async_cfg_sync_fast(void) { return (int32_t)__atomic_load_n(&g_cfg_sync_fast, __ATOMIC_ACQUIRE); }
 
-/* ---- shortest round-trip double formatting (audit D6/D25) --------------
- * zan_rt_dbl_str writes `v` in the C# default ("G") layout: the shortest
- * decimal digit string strtod reads back bit-identical, laid out
- * fixed-point for first-digit exponents -4..14 and d.dddE+xx outside that
- * window, with NaN / +/-Infinity spelled the way C# names them (strtod
- * parses both back). The %g emission this replaces printed six significant
- * digits (3.14159265358979 -> "3.14159", round-trip broken) and let MSVC
- * render the specials as 1.#INF / 1.#QNAN / -1.#IND, which no parser reads.
- * Lives in this object because it links into every program (see the
- * crash-logger note at the top); `buf` receives at most 40 bytes incl. NUL. */
+/* 内部辅助实现 */
 void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
     if (v != v) { snprintf(buf, (size_t)cap, "NaN"); return; }
     if (v == 0.0) { snprintf(buf, (size_t)cap, "0"); return; }
@@ -1692,8 +1347,7 @@ void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
         snprintf(buf, (size_t)cap, "%sInfinity", sign);
         return;
     }
-    /* shortest digit search: the smallest precision whose %.Pe text strtod
-     * reads back as the same double. 17 significant digits always suffice. */
+    /* shortest digit search: the smallest precision whose % */
     char m[40];
     int p;
     for (p = 1; p < 17; p++) {
@@ -1702,7 +1356,7 @@ void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
     }
     if (p == 17) snprintf(m, sizeof m, "%.16e", v);
 
-    /* split "-d.dddde+XX" into the digit run and the first-digit exponent */
+    /* split "-d */
     char *q = (*m == '-') ? m + 1 : m;
     char *es = strchr(q, 'e');
     int e10 = atoi(es + 1);
@@ -1723,8 +1377,7 @@ void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
             zeros[z] = 0;
             snprintf(out, sizeof out, "%s%s%s", sign, sig, zeros);
     } else if (e10 >= 0) {
-        /* point inside the digit run: head.tail -- or integral when the
-         * point would trail the last digit (1.0 must read "1", not "1.") */
+        /* point inside the digit run: head */
         int h = e10 + 1;
         if (sig[h])
             snprintf(out, sizeof out, "%s%.*s.%s", sign, h, sig, sig + h);
@@ -1739,7 +1392,7 @@ void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
             snprintf(out, sizeof out, "%s0.%s%s", sign, zeros, sig);
         }
     } else {
-        /* scientific: d[.rest]E+xx, exponent sign always shown, 2 digits min */
+        /* scientific: d[ */
         if (sig[1])
             snprintf(out, sizeof out, "%s%c.%sE%+03d", sign, sig[0], sig + 1,
                      e10);
@@ -1749,11 +1402,7 @@ void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
     snprintf(buf, (size_t)cap, "%s", out);
 }
 
-/* double.Parse / double.TryParse backing (audit D6/D25 read-back): the four
- * special spellings zan_rt_dbl_str emits are matched here first, because the
- * legacy msvcrt strtod a MinGW build links predates C99 and answers 0 for
- * "NaN"/"Infinity" instead of parsing them. endp follows strtod semantics:
- * left at `s` when nothing converted. */
+/* 内部辅助实现 */
 double zan_rt_dbl_parse(const char *s, char **endp) {
     if (endp) *endp = (char *)s;
     if (strcmp(s, "NaN") == 0) {
