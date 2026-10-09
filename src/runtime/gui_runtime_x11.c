@@ -1,23 +1,13 @@
-/* gui_runtime_x11.c -- the Linux X11 window shell.
- *
- * Part of the gui_runtime translation unit: #include'd by gui_runtime.c in
- * a fixed order; not compiled standalone (preprocessor state and static
- * linkage are shared across the parts).
- */
+/* gui_runtime_x11 */
 
-/* ========================================================================
- * Linux X11 Window Shell
- * ======================================================================== */
+/* Linux X11 Window Shell */
 
-/* Linux/X11 window shell. The shared software rasterizer and
- * FreeType/software text above still build regardless. */
+/* Linux/X11 window shell */
 #if defined(__linux__)
 
 static Display *g_display = NULL;
 static Window g_x11_window = 0;
-/* Self-pipe used to wake a UI thread blocked in wait_event from another
- * thread (Xlib is not thread-safe, so we can't post an X event off-thread;
- * writing a byte to a pipe that wait_event also polls is safe). */
+/* 内部辅助逻辑 */
 static int g_wake_pipe[2] = { -1, -1 };
 static int g_pending_event_linux[8];
 static int g_win_w = 0, g_win_h = 0;
@@ -27,17 +17,14 @@ static Cursor g_cursors_linux[8];
 static XIM g_xim = NULL;
 static XIC g_xic = NULL;
 
-/* Client-side decoration metrics for the borderless window with an app-drawn
- * title bar, mirroring the Win32 backend. */
+/* 内部辅助逻辑 */
 static int g_scale_linux = 100;
 static int g_titlebar_h_l = 32;
 static int g_btn_w_l = 46;
 static int g_caption_btn_count_l = 5;
 static int g_metrics_ready_linux = 0;
 
-/* Per-window state so one process can drive several top-level windows. The
- * globals above still track the primary window for process-wide operations
- * (clipboard, cursor, input method) and single-window size queries. */
+/* Per-window state so one process can drive several top-level windows */
 #define ZAN_MAX_WINDOWS 256
 typedef struct {
     Window xid;
@@ -50,7 +37,7 @@ typedef struct {
 static zan_lwin_t g_lwins[ZAN_MAX_WINDOWS];
 static int g_lwin_count = 0;
 static Window g_primary_win = 0;
-/* xid of the window the event currently being decoded originated from. */
+/* xid of the window the event currently being decoded originated from */
 static Window g_evwin_linux = 0;
 
 static zan_lwin_t *lwin_find(Window xid) {
@@ -71,19 +58,12 @@ static void x11_set_scale_metrics(int scale) {
     g_metrics_ready_linux = 1;
 }
 
-/* Decoded-event queue: a single XEvent can yield several ABI events (a key
- * press -> keyDown + textInput; a wheel button -> scroll), so decoded events
- * are buffered and drained one per poll/wait call, mirroring the Win32 message
- * queue. Slots: [kind, x, y, button, keycode, mods, 0, 0]. */
+/* 内部辅助逻辑 */
 #define ZAN_EVQ_CAP 64
 static int g_evq_linux[ZAN_EVQ_CAP][8];
 static int g_evq_head_linux = 0, g_evq_tail_linux = 0;
 
-/* Monotonic counter bumped every time an event is delivered into
- * g_pending_event_linux. Event getters return the LAST event even when no
- * new one arrived (animation frames exit without pumping), so the shell
- * needs a way to tell a fresh event from a stale re-read -- the click
- * frame-binding must only be released by a genuinely new release event. */
+/* 内部辅助逻辑 */
 static long long g_ev_seq_linux = 0;
 
 static void evq_push_linux(int kind, int x, int y, int button, int keycode, int mods) {
@@ -116,7 +96,7 @@ static unsigned x11_utf8_next(const char **p) {
     return cp;
 }
 
-/* X11 modifier state -> Win32 encoding (bit0=Ctrl, bit1=Shift, bit2=Alt). */
+/* X11 modifier state -> Win32 encoding (bit0=Ctrl, bit1=Shift, bit2=Alt) */
 static int x11_mods(unsigned int state) {
     int m = 0;
     if (state & ControlMask) m |= 1;
@@ -162,8 +142,7 @@ static int x11_vk_from_keysym(KeySym ks) {
 
 static Atom x11_atom(const char *name) { return XInternAtom(g_display, name, False); }
 
-/* Toggle/set an EWMH _NET_WM_STATE property via the window manager.
- * action: 0 = remove, 1 = add, 2 = toggle. state2 may be 0. */
+/* Toggle/set an EWMH _NET_WM_STATE property via the window manager */
 static void x11_wm_state(Window win, Atom state1, Atom state2, long action) {
     if (!g_display || !win) return;
     XEvent xev;
@@ -192,8 +171,7 @@ static void x11_wm_state(Window win, Atom state1, Atom state2, long action) {
 #define ZAN_NWMR_LEFT        7
 #define ZAN_NWMR_MOVE        8
 
-/* Remove window-manager decorations via the Motif hint so the app can draw its
- * own title bar (matching the Win32 borderless window). */
+/* 内部辅助逻辑 */
 static void x11_set_borderless(Window win) {
     if (!g_display || !win) return;
     struct {
@@ -209,8 +187,7 @@ static void x11_set_borderless(Window win) {
                     (unsigned char *)&hints, 5);
 }
 
-/* Ask the window manager to start an interactive move/resize, so the app-drawn
- * caption and resize borders behave like real ones. */
+/* 内部辅助逻辑 */
 static void x11_start_moveresize(Window win, int x_root, int y_root, int direction) {
     if (!g_display || !win) return;
     XUngrabPointer(g_display, CurrentTime);
@@ -230,9 +207,7 @@ static void x11_start_moveresize(Window win, int x_root, int y_root, int directi
     XFlush(g_display);
 }
 
-/* Map a left press to a move/resize direction, mirroring the Win32
- * WM_NCHITTEST logic: 8px resize borders plus a draggable caption that excludes
- * the caption-button cluster. Returns -1 for an ordinary client click. */
+/* 内部辅助逻辑 */
 static int x11_caption_hit(zan_lwin_t *lw, int x, int y) {
     int w = lw->w, h = lw->h;
     int capW = g_caption_btn_count_l * g_btn_w_l;
@@ -247,8 +222,7 @@ static int x11_caption_hit(zan_lwin_t *lw, int x, int y) {
     if (top && right) return ZAN_NWMR_TOPRIGHT;
     if (bottom && left) return ZAN_NWMR_BOTTOMLEFT;
     if (bottom && right) return ZAN_NWMR_BOTTOMRIGHT;
-    /* Corners first, then let a control drawn flush with the edge (a scrollbar
-     * in the last few pixels) keep its own presses. */
+    /* 内部辅助逻辑 */
     if (!zan_gui_in_hit_guard((iptr)lw->xid, x, y)) {
         if (left) return ZAN_NWMR_LEFT;
         if (right) return ZAN_NWMR_RIGHT;
@@ -259,7 +233,7 @@ static int x11_caption_hit(zan_lwin_t *lw, int x, int y) {
     return -1;
 }
 
-/* Serve a clipboard paste request from another client (we own CLIPBOARD). */
+/* Serve a clipboard paste request from another client (we own CLIPBOARD) */
 static void x11_serve_selection(XSelectionRequestEvent *req) {
     XSelectionEvent resp;
     memset(&resp, 0, sizeof(resp));
@@ -289,8 +263,7 @@ static void x11_serve_selection(XSelectionRequestEvent *req) {
     XFlush(g_display);
 }
 
-/* X11 buttons: 1=left 2=middle 3=right. The event ABI follows the Win32/SDL
- * backends: 0=left 1=right 2=middle. */
+/* X11 buttons: 1=left 2=middle 3=right */
 static int x11_abi_button(unsigned int b) {
     if (b == 3) return 1;
     if (b == 2) return 2;
@@ -306,9 +279,7 @@ static void x11_translate_event(XEvent *ev) {
                        x11_mods(ev->xmotion.state));
         break;
     case ButtonPress:
-        /* Buttons 4/5 are the vertical wheel; report them as scroll (kind 13)
-         * with a Win32-style +/-120 delta. Buttons 6/7 (horizontal) have no
-         * ABI and are ignored. */
+        /* 内部辅助逻辑 */
         if (ev->xbutton.button == 4 || ev->xbutton.button == 5) {
             int delta = ev->xbutton.button == 4 ? 120 : -120;
             evq_push_linux(13, ev->xbutton.x, ev->xbutton.y, 0, delta,
@@ -316,9 +287,7 @@ static void x11_translate_event(XEvent *ev) {
         } else if (ev->xbutton.button == 6 || ev->xbutton.button == 7) {
             /* horizontal wheel: ignored */
         } else if (ev->xbutton.button == 1) {
-            /* Honor the app-drawn caption and resize borders by delegating to
-             * the WM, mirroring Win32 WM_NCHITTEST. Presses over content or the
-             * caption buttons fall through as ordinary clicks. */
+            /* 内部辅助逻辑 */
             zan_lwin_t *bw = lwin_find(ev->xbutton.window);
             int dir = bw ? x11_caption_hit(bw, ev->xbutton.x, ev->xbutton.y) : -1;
             if (dir >= 0) {
@@ -354,10 +323,7 @@ static void x11_translate_event(XEvent *ev) {
             n = XLookupString(&ev->xkey, buf, sizeof(buf) - 1, &ks, NULL);
         }
         evq_push_linux(4, 0, 0, 0, x11_vk_from_keysym(ks), mods);
-        /* Emit a WM_CHAR-style text event for each decoded character. X already
-         * folds Ctrl combos to control codes (e.g. Ctrl+C -> 0x03) and delivers
-         * Backspace/Tab/Enter as 8/9/13, exactly like Win32 WM_CHAR; the widgets
-         * rely on those integer codes for both typing and shortcuts. */
+        /* 发射a WM_CHAR-style text event for each decoded character */
         if (n > 0) {
             buf[n] = '\0';
             const char *p = buf;
@@ -390,8 +356,7 @@ static void x11_translate_event(XEvent *ev) {
         break;
     }
     case Expose: {
-        /* Re-blit the last frame from the window's back buffer so uncover/move
-         * never leaves stale or blank content. */
+        /* 内部辅助逻辑 */
         zan_lwin_t *ew = lwin_find(ev->xexpose.window);
         if (ew && ew->backbuf)
             XCopyArea(g_display, ew->backbuf, ew->xid, ew->gc, 0, 0,
@@ -402,9 +367,7 @@ static void x11_translate_event(XEvent *ev) {
         evq_push_linux(8, 0, 0, 0, 0, 0);
         break;
     case FocusOut:
-        /* Kind 9 mirrors WM_KILLFOCUS: floating popups (context menus,
-         * dropdowns) dismiss themselves when the window loses focus, so a
-         * stale menu never lingers over an inactive window. */
+        /* 内部辅助逻辑 */
         evq_push_linux(9, 0, 0, 0, 0, 0);
         break;
     }
@@ -415,11 +378,9 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
         g_display = XOpenDisplay(NULL);
         if (!g_display) return 0;
     }
-    /* Keep client-side decoration metrics in device pixels even for callers
-     * that create a window directly without querying DPI first. */
+    /* 内部辅助逻辑 */
     zan_gui_get_dpi_scale();
-    /* Input method for UTF-8 text input (also enables IME preedit); opened
-     * once per display and shared by every window's input context. */
+    /* 内部辅助逻辑 */
     if (!g_xim) {
         setlocale(LC_ALL, "");
         XSetLocaleModifiers("");
@@ -469,8 +430,7 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
     w->h = height;
 
     if (!g_primary_win) {
-        /* First window drives process-wide operations (clipboard, cursor) and
-         * the client-side title-bar metrics computed once from its DPI. */
+        /* 内部辅助逻辑 */
         g_primary_win = xid;
         g_x11_window = xid;
         g_xic = xic;
@@ -498,7 +458,7 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
             XMoveWindow(g_display, xid, x, y);
         }
     }
-    /* Borderless window with app-drawn title bar (matches the Win32 backend). */
+    /* Borderless window with app-drawn title bar (matches the Win32 backend) */
     x11_set_borderless(xid);
 
     return (i64)xid;
@@ -521,7 +481,7 @@ EXPORT i32 zan_gui_wait_event(void) {
     int xfd = ConnectionNumber(g_display);
     XEvent ev;
     for (;;) {
-        /* Drain any X events already buffered in the client before blocking. */
+        /* Drain any X events already buffered in the client before blocking */
         while (XPending(g_display) > 0) {
             XNextEvent(g_display, &ev);
             if (ev.type == SelectionRequest) {
@@ -532,7 +492,7 @@ EXPORT i32 zan_gui_wait_event(void) {
             x11_translate_event(&ev);
             if (evq_pop_linux()) return 0;
         }
-        /* Block until the X connection or the wake pipe becomes readable. */
+        /* Block until the X connection or the wake pipe becomes readable */
         struct pollfd fds[2];
         fds[0].fd = xfd; fds[0].events = POLLIN; fds[0].revents = 0;
         int nfds = 1;
@@ -548,17 +508,14 @@ EXPORT i32 zan_gui_wait_event(void) {
         if (nfds == 2 && (fds[1].revents & POLLIN)) {
             char buf[64];
             while (read(g_wake_pipe[0], buf, sizeof(buf)) > 0) { }
-            /* Return a benign empty frame (kind 0) so the caller drains its
-             * dispatch queue. Any pending X events are handled next loop. */
+            /* 返回a benign empty frame (kind 0) so the caller drains its dispatch queue */
             return 0;
         }
         /* X connection readable: loop back to XPending/XNextEvent. */
     }
 }
 
-/* Like wait_event but gives up after `ms` milliseconds. Returns 0 when an
- * event was delivered, 1 on timeout, -1 on error. Lets an animation loop idle
- * in the kernel until either input arrives or its next frame deadline. */
+/* Like wait_event but gives up after `ms` milliseconds */
 EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
     if (!g_display) return -1;
     memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
@@ -606,9 +563,7 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
     }
 }
 
-/* Wake a UI thread blocked in wait_event so it can drain the dispatch queue.
- * write() is async-signal-safe and thread-safe, so this is callable from any
- * thread even though Xlib is not. */
+/* Wake a UI thread blocked in wait_event so it can drain the dispatch queue */
 EXPORT i32 zan_gui_wake(void) {
     if (g_wake_pipe[1] >= 0) {
         char b = 1;
@@ -636,10 +591,7 @@ EXPORT i32 zan_gui_poll_event(void) {
     }
 }
 
-/* Queue a synthetic input event for the automation driver (see Gui.UiDriver);
- * drained by poll/wait_event like a real X11 event so App dispatch is
- * exercised unchanged. Called on the UI thread. hwnd_val is unused here (the
- * X11 backend tracks the source window internally). */
+/* Queue a synthetic input event for the automation driver (see Gui */
 EXPORT i32 zan_gui_inject_event(
     iptr hwnd_val, i32 kind, i32 x, i32 y, i32 button, i32 keycode, i32 mods) {
     (void)hwnd_val;
@@ -673,9 +625,7 @@ EXPORT i32 zan_gui_client_height(iptr hwnd_val) {
     return w ? w->h : g_win_h;
 }
 
-/* Dirty rects for the next present -- see the SDL backend: an effect tick that
- * only touched a few hundred particles blits just those instead of the whole
- * surface. Emptied by every present, so announcing nothing means a full blit. */
+/* 内部辅助逻辑 */
 #define ZAN_DIRTY_MAX 512
 static int g_dirty[ZAN_DIRTY_MAX * 4];
 static int g_dirty_count;
@@ -692,10 +642,7 @@ EXPORT i32 zan_gui_present_dirty_add(i32 x, i32 y, i32 w, i32 h) {
     return 0;
 }
 
-/* Whole-window frame declaration (Win32Shell.PresentFull's counterpart):
- * a frame that repainted every pixel must not reuse earlier subrects.
- * The X11 backbuf shares the surface's exact size, so honoring the flag
- * is just "ignore the rects this frame" -- the next present uploads all. */
+/* Whole-window frame declaration (Win32Shell */
 EXPORT void zan_gui_present_full(void) {
     g_dirty_count = 0;
     g_dirty_overflow = 0;
@@ -709,16 +656,13 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return 1;
     zan_surface_t *s = g_surfaces[surface_id];
 
-    /* GPU direct present: the frame is swapped onto the window and never passes
-     * through s->pixels. 0 means this backend cannot present to this window
-     * (always so on the CPU rasterizer), and the Pixmap path below runs. */
+    /* 内部辅助逻辑 */
     if (zan_gui_present_window(surface_id, (void *)(intptr_t)w->xid)) {
         g_dirty_count = 0;
         g_dirty_overflow = 0;
         return 0;
     }
-    /* Presenting the bitmap: a backend holding the frame elsewhere has to put
-     * it back here first. */
+    /* 内部辅助逻辑 */
     if (s->be) {
         if (s->be->flush) s->be->flush(s);
         if (s->be->read_pixels) s->be->read_pixels(s);
@@ -727,8 +671,7 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     int screen = DefaultScreen(g_display);
     unsigned depth = (unsigned)DefaultDepth(g_display, screen);
 
-    /* Blit through the window's own off-screen Pixmap (double buffering) so
-     * resizes and expose events never show a half-drawn or torn frame. */
+    /* 内部辅助逻辑 */
     if (!w->backbuf || w->backbuf_w != s->width || w->backbuf_h != s->height) {
         /* A fresh back buffer holds no previous frame to patch. */
         g_dirty_count = 0;
@@ -844,13 +787,7 @@ EXPORT void zan_gui_sleep_ms(i32 ms) {
     nanosleep(&req, NULL);
 }
 
-/* libc compatibility shim for the bundled static X11 archive
- * (packages/Zan.Gui/src/Gui/drivers/linux-x64/static/libzan_gui.a). Its Xlib objects were
- * compiled against a libc that has issetugid() (musl/BSD); glibc before 2.41
- * does not, so statically linking the font/locale part of Xlib fails with
- * "undefined reference to issetugid". Weak, so a libc that does define it
- * wins, and it implements the documented semantics rather than a stub: Xlib
- * only uses it to decide whether to trust XLOCALEDIR from the environment. */
+/* libc compatibility shim for the bundled static X11 archive (packages/Zan */
 #if defined(__GNUC__)
 __attribute__((weak)) int issetugid(void) {
     return (getuid() != geteuid() || getgid() != getegid()) ? 1 : 0;

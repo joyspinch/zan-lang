@@ -1,24 +1,4 @@
-/* genmeta.c -- generic compilation-unit metadata exporter (see genmeta.h).
- *
- * Output shape:
- *   { "version": 1,
- *     "files":   [ ... ],  // only in _export_files
- *     "classes": [ { "name","ns","kind","file","line","bases":[...],
- *                    "attrs":[...],
- *                    "fields":[{ "name","type","file","line","attrs" }],
- *                    "methods":[{ "name","static","async","file","line",
- *                                 "params":[{ "name","type" }],"attrs" }],
- *                    "members":[ { "name","value" } ] } ],  // enums
- *     "calls":  [ { "id","file","line","col","name","recv",
- *                   "targs":[...],"args":[...] } ] }
- *
- * `recv` is a short receiver shape ("this", "id:<name>", "mem:a.b", "call",
- * "base", "other"); args items are shape objects -- literals, ids, null,
- * lambda (with an expression tree), or other. The calls array contains only
- * generator entry points and their fluent receiver chains; ids still refer
- * to the complete compilation-unit traversal and can therefore be sparse.
- * Every expression-tree node is { "k": kind, ... } with "k" in bin/uni/mem/
- * id/lit/call/cond/cast/is/idx/assign/new/lam/null/this/base/await/other. */
+/* genmeta */
 
 #include "genmeta.h"
 
@@ -40,8 +20,7 @@ typedef struct {
     int call_id;
     char cur_cls[128];   /* enclosing class name (call owner) */
     char cur_fn[128];    /* enclosing method name ("" for field initializers) */
-    /* node -> id, filled when a call is recorded; the children-first walk
-     * records a receiver before the outer call names it as `call#<id>`. */
+    /* 内部辅助逻辑 */
     zan_ast_node_t **rec_nodes;
     int *rec_ids;
     int rec_count;
@@ -51,8 +30,7 @@ typedef struct {
     int *pend_ids;
     int pend_count;
     int pend_cap;
-    /* precomputed seed filters: most calls are discarded before any JSON
-     * allocation */
+    /* precomputed seed filters: most calls are discarded before any JSON allocation */
     const char *const *expr_names;
     int expr_count;
     const char *const *table_names;
@@ -79,9 +57,7 @@ static bool gm_istr_is(zan_istr_t s, const char *lit) {
     return s.str && s.len == (uint32_t)n && memcmp(s.str, lit, n) == 0;
 }
 
-/* Append `fmt` at `pos` into `out`/`cap`, saturating at cap-1: vsnprintf
- * returns the *would-be* length, so accumulating it raw can run the cursor
- * past the caller's buffer. */
+/* 内部辅助逻辑 */
 static size_t gm_snpcat(char *out, size_t cap, size_t pos,
                         const char *fmt, ...) {
     if (cap == 0) return 0;
@@ -344,9 +320,7 @@ static void gm_recv_str(zan_ast_node_t *obj, char *out, size_t outsz) {
     }
 }
 
-/* Reserve (or find) the placeholder id of a receiver call node. Only a
- * fallback: the children-first walk normally records the receiver before
- * the outer call names it. */
+/* Reserve (or find) the placeholder id of a receiver call node */
 static int gm_recv_reserve(zan_ast_node_t *recv, gm_ctx_t *c) {
     for (int i = 0; i < c->pend_count; i++)
         if (c->pend_nodes[i] == recv) return c->pend_ids[i];
@@ -366,7 +340,7 @@ static int gm_recv_reserve(zan_ast_node_t *recv, gm_ctx_t *c) {
     return c->pend_ids[c->pend_count++];
 }
 
-/* Look up the id a call node was recorded with (children-first walk). */
+/* 查找the id a call node was recorded with (children-first walk) */
 static int gm_rec_lookup(zan_ast_node_t *call, gm_ctx_t *c) {
     for (int i = 0; i < c->rec_count; i++)
         if (c->rec_nodes[i] == call) return c->rec_ids[i];
@@ -388,14 +362,13 @@ static bool gm_is_candidate_ast_call(zan_ast_node_t *call, gm_ctx_t *c) {
         if (c->pend_nodes[i] == call) return true;
     }
 
-    /* 2. Generic method calls: Json.Serialize<T>, db.Insert<T>, etc. --
-     * generator root targets carry type arguments */
+    /* 2 */
     if (call->call.type_args.count > 0) return true;
 
     zan_ast_node_t *robj = (callee->kind == AST_MEMBER_ACCESS)
                                ? callee->member.object
                                : NULL;
-    /* 3. Receiver is a call that was recorded (fluent chain descendant) */
+    /* 3 */
     if (robj && robj->kind == AST_CALL) {
         if (gm_rec_lookup(robj, c) != 0) return true;
     }
@@ -431,8 +404,7 @@ static bool gm_is_candidate_ast_call(zan_ast_node_t *call, gm_ctx_t *c) {
 
 static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
     zan_ast_node_t *callee = call->call.callee;
-    /* a placeholder id may still exist if an outer call reserved this node
-     * before it was walked (defensive path) */
+    /* 内部辅助逻辑 */
     int id = 0;
     for (int i = 0; i < c->pend_count; i++) {
         if (c->pend_nodes[i] == call) {
@@ -445,8 +417,7 @@ static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
     }
     if (!id) id = ++c->call_id;
 
-    /* Record the AST node -> id mapping BEFORE candidate filtering so that
-     * node indices and placeholder lookups match gm_find_expr 100% exactly. */
+    /* 内部辅助逻辑 */
     if (c->rec_count >= c->rec_cap) {
         int ncap = c->rec_cap ? c->rec_cap * 2 : 256;
         zan_ast_node_t **nn =
@@ -464,8 +435,7 @@ static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
         c->rec_count++;
     }
 
-    /* fast discard: most ordinary calls are never generator seeds nor fluent
-     * chain members; return before allocating any JSON. */
+    /* 内部辅助逻辑 */
     if (!gm_is_candidate_ast_call(call, c)) {
         return;
     }
@@ -514,8 +484,7 @@ static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
     json_arr_add(c->calls, o);
 }
 
-/* Table entity names of the unit: `[Table] class Order` -- accessor members
- * named after one of them (`ctx.Order.Where(...)`) start a fluent DB chain. */
+/* 内部辅助逻辑 */
 static const char **gm_table_entity_names(json_value *classes, int *out_count) {
     const char **names = NULL;
     int count = 0, cap = 0;
@@ -573,8 +542,7 @@ static bool gm_is_codegen_seed(json_value *call, const char *const *expr_names,
     if (gm_name_in(name, seeds, (int)(sizeof(seeds) / sizeof(seeds[0]))))
         return true;
     if (gm_name_in(name, expr_names, expr_count)) return true;
-    /* accessor chain head: the receiver is `<obj>.<Entity>`, so the call has
-     * no receiving call site the walk could reach it through. */
+    /* accessor chain head: the receiver is `<obj> */
     {
         json_value *recvx = json_obj_get(call, "recvx");
         if (recvx && recvx->type == JSON_OBJ) {
@@ -654,8 +622,7 @@ static void gm_prune_calls(json_value *calls, const char *const *expr_names,
             keep[id] = true;
     }
 
-    /* keep fluent chains in both directions: ancestors locate the root,
-     * descendants carry the supported chain methods. */
+    /* 内部辅助逻辑 */
     bool changed;
     do {
         changed = false;
@@ -696,8 +663,7 @@ static void gm_walk_expr(zan_ast_node_t *n, gm_ctx_t *c) {
     if (!n) return;
     switch (n->kind) {
     case AST_CALL:
-        /* children first: a chain root (`Query<T>`) is recorded before the
-         * chain methods above it, so their `recv` can name it call#<id> */
+        /* 内部辅助逻辑 */
         gm_walk_expr(n->call.callee, c);
         for (int i = 0; i < n->call.args.count; i++)
             gm_walk_expr(n->call.args.items[i], c);
@@ -952,12 +918,10 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
                 gm_attrs_json(zan_ast_attributes(m), ma);
                 json_obj_set(mm, "attrs", ma);
                 json_arr_add(methods, mm);
-                /* ctor: the `Prop = param;` assignments mapping ctor params
-                 * onto property names (compile-time attr classes) */
+                /* 内部辅助逻辑 */
                 if (m->kind == AST_CONSTRUCTOR_DECL) {
                     json_value *co = json_new_obj();
-                    /* params cannot be shared with the methods entry: the
-                     * JSON tree is freed recursively (one owner per child) */
+                    /* 内部辅助逻辑 */
                     json_value *cps = json_new_arr();
                     for (int j = 0; j < m->method_decl.params.count; j++) {
                         zan_ast_node_t *p = m->method_decl.params.items[j];
@@ -1063,15 +1027,12 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
     json_arr_add(classes, o);
 }
 
-/* Walk in the exact export order and stop at the `id`-th member call (ids
- * start at 1, matching gm_record_call). */
+/* 内部辅助逻辑 */
 typedef struct {
     int want;
     int seen;
     zan_ast_node_t *found;
-    /* collect mode: store the first `cap` call-site nodes in `nodes`
-     * (index 0 == call site 1); rewrites mutate node contents, never replace
-     * nodes, so the pointers stay valid for the whole pass. */
+    /* 内部辅助逻辑 */
     zan_ast_node_t **nodes;
     int cap;
 } gm_find_ctx_t;
@@ -1264,11 +1225,7 @@ zan_ast_node_t *zan_genmeta_find_call(zan_ast_node_t *unit, int id) {
     return f.found;
 }
 
-/* One pass over the unit, storing the call-site node of id k (1-based, in the
- * export's traversal order) at nodes[k-1], for k <= cap. Returns the total
- * call-site count (call with nodes = NULL to size the array). Unaffected by
- * earlier rewrites: rewrites only mutate node contents, never replace the
- * nodes themselves. */
+/* 内部辅助逻辑 */
 int zan_genmeta_index_calls(zan_ast_node_t *unit, zan_ast_node_t **nodes,
                             int cap) {
     gm_find_ctx_t f;
@@ -1380,11 +1337,7 @@ char *zan_genmeta_export_files(zan_ast_node_t *unit, zan_diag_t *diag) {
     return gm_export(unit, diag);
 }
 
-/* Expression-tree deserializer (gm_expr_tree's inverse): rebuilds AST
- * expression nodes from the JSON trees the generators embed in rewrite
- * directives. No binder metadata needed: generation runs pre-binding and
- * every node is identified by shape alone. An `id` node may carry a "targs"
- * array to build a generic identifier (`Expr<User>.From`). */
+/* 内部辅助逻辑 */
 
 static zan_token_kind_t gm_token_kind(const char *name) {
     if (!name) return TK_INVALID;

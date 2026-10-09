@@ -14,38 +14,18 @@ struct zan_parser {
     zan_token_t current;
     zan_token_t previous;
     int expr_depth; /* current expression recursion depth (stack-overflow guard) */
-    int expr_tail_depth; /* depth of the low-precedence right recursion
-                          * (assignment `a = a = ...`, conditional
-                          * `c ? a : c ? b : ...`); these re-enter
-                          * parse_expression directly, never through
-                          * parse_unary, so expr_depth alone does not
-                          * guard them */
-    bool expr_depth_reported; /* the nesting guard reports once per unit:
-                               * error recovery re-parses the same deep
-                               * expression and would otherwise repeat
-                               * the diagnostic */
+    int expr_tail_depth; /* depth of the low-precedence right recursion (assignment `a = a */
+    bool expr_depth_reported; /* 内部辅助逻辑 */
     int stmt_depth; /* current statement/block recursion depth (stack-overflow guard) */
     int type_depth; /* current type-reference recursion depth (stack-overflow guard) */
-    int type_no_nullable; /* one-shot: the next parse_type_ref call's TOP-LEVEL
-                          * suffix loop must not consume a `?` (the `is`/`as` type
-                          * operand decided the `?` opens a conditional expression;
-                          * recursion into generic/tuple element types clears it) */
-    int checked_depth; /* >0 while inside checked(...)/checked{...}: binary + - *
-                        * nodes get binary.checked = 1 (see ast.h) */
-    int unchecked_depth; /* >0 while inside unchecked(...)/unchecked{...}:
-                          * explicitly wrapping semantics (binary.checked = -1) */
+    int type_no_nullable; /* 内部辅助逻辑 */
+    int checked_depth; /* >0 while inside checked( */
+    int unchecked_depth; /* >0 while inside unchecked( */
     int synth_counter; /* unique-id seed for synthesized locals (using temp) */
-    bool chain_cap_reported; /* the binop-chain guard reports once per unit:
-                              * error recovery re-parses the same chain and
-                              * would otherwise repeat the diagnostic */
-    /* Synthesized property accessor methods (get_<name>/set_<name>) queued by
-     * parse_member_decl_inner; drained into the enclosing type's members list
-     * right after the property declaration itself. */
+    bool chain_cap_reported; /* 内部辅助逻辑 */
+    /* 内部辅助逻辑 */
     zan_ast_list_t pending_members;
-    /* Single-line multi-declarator (`int a = 0, b = 2;`): parse_var_decl
-     * returns the first declarator and queues the rest here; statement
-     * collectors splice them in right after, so every declarator lands in
-     * the enclosing scope in source order. */
+    /* 内部辅助逻辑 */
     zan_ast_list_t pending_stmts;
 };
 
@@ -53,20 +33,15 @@ void zan_parser_init(zan_parser_t *p, zan_lexer_t *lex, zan_arena_t *arena,
                      zan_diag_t *diag);
 zan_ast_node_t *zan_parser_parse(zan_parser_t *p);
 
-/* Lower `event D E;` fields into generated multicast holder classes.
- * Runs on the merged compilation unit after all files are parsed. */
+/* 降级`event D E;` fields into generated multicast holder classes */
 void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
                                zan_diag_t *diag);
 void zan_parser_desugar_events(zan_ast_node_t *unit, zan_arena_t *arena,
                                zan_diag_t *diag);
-/* Hoist nested type declarations (e.g. `static class Holder {}` inside a class
- * body) to the compilation-unit top level, since every later pass only walks
- * unit->comp_unit.decls. Runs before merge_partials/desugar_events so the
- * hoisted types participate in those passes. */
+/* Hoist nested type declarations (e */
 void zan_parser_flatten_nested_types(zan_ast_node_t *unit, zan_arena_t *arena,
                                      zan_diag_t *diag);
-/* Specialize inherited methods from generic base classes into derived classes
- * before codegen and binding so type parameters are bound to concrete types. */
+/* 内部辅助逻辑 */
 void zan_parser_specialize_generic_bases(zan_ast_node_t *unit, zan_arena_t *arena,
                                          zan_diag_t *diag);
 

@@ -1,14 +1,4 @@
-/* irgen_abi.c -- C calling-convention classification for extern (FFI) calls.
- *
- * LLVM leaves aggregate classification to the frontend, so every extern whose
- * signature mentions a struct gets two functions: the real symbol, declared
- * with the register/memory shape the platform C compiler uses (Win64: an
- * 8-byte struct in one integer register, anything else a pointer to a
- * caller-made copy; SysV: the first 16 bytes split into INTEGER/SSE
- * eightbytes; AArch64: homogeneous float aggregates), and an internal thunk
- * carrying the Zan-level signature that converts between the two. Call sites
- * keep calling the Zan-level signature.
- */
+/* irgen_abi */
 
 typedef enum {
     ABI_TARGET_WIN64,
@@ -89,10 +79,7 @@ static unsigned long abi_align_of(LLVMTypeRef t) {
     }
 }
 
-/* Size computation must not truncate: on LLP64/Windows `unsigned long` is
- * 32 bits, so a large array length times its element size would wrap into a
- * small value and the classifier would pass a MEMORY-class aggregate in
- * registers. Compute in 64 bits with saturation. */
+/* 内部辅助逻辑 */
 #define ABI_SIZE_MAX (1ULL << 40)
 
 static uint64_t abi_size_of64(LLVMTypeRef t) {
@@ -207,14 +194,11 @@ static void sysv_classify(LLVMTypeRef t, sysv_info_t *in) {
     sysv_walk(t, 0, in);
 }
 
-/* Register shape of eightbyte `eb`: an INTEGER eightbyte becomes an integer
- * exactly as wide as the bytes it holds (i64 / i32 / i24 ...), an SSE eightbyte
- * becomes double, <2 x float> or float. */
+/* 内部辅助逻辑 */
 static LLVMTypeRef sysv_part_type(zan_irgen_t *g, sysv_info_t *in, int eb) {
     unsigned long rest = in->size - (unsigned long)eb * 8;
     unsigned long bytes = rest > 8 ? 8 : rest;
-    /* trailing padding is not part of the register: {int, long} passes its
-     * first eightbyte as i32, the way a C compiler does */
+    /* 内部辅助逻辑 */
     if (in->used[eb] && in->used[eb] < bytes) bytes = in->used[eb];
     if (in->cls[eb] == SYSV_INTEGER)
         return LLVMIntTypeInContext(g->ctx, (unsigned)(bytes * 8));
@@ -316,7 +300,7 @@ static void abi_classify(zan_irgen_t *g, abi_target_t tgt, LLVMTypeRef ty,
         return;
     }
 
-    /* Unknown target: leave the declaration alone and let the caller report it. */
+    /* Unknown target: leave the declaration alone and let the caller report it */
 }
 
 static void abi_add_type_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
@@ -341,11 +325,7 @@ static void abi_add_int_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
                                  LLVMCreateEnumAttribute(g->ctx, kind, val));
 }
 
-/* The C ABI promotes anything narrower than `int` at the boundary, and every
- * supported target makes that the *caller's* job: AAPCS64 and the RISC-V ABI
- * let the callee read the whole register, so an unextended i1/i8/i16 argument
- * arrives with garbage above its own width. `char`/enum are 64-bit here and
- * need no promotion. */
+/* 内部辅助逻辑 */
 static const char *abi_int_ext_attr(zan_type_t *t) {
     if (!t) return NULL;
     switch (t->kind) {
@@ -358,8 +338,7 @@ static const char *abi_int_ext_attr(zan_type_t *t) {
     }
 }
 
-/* Attach the promotion attributes for one extern declaration. `ptypes` holds
- * the resolved parameter types in declaration order. */
+/* Attach the promotion attributes for one extern declaration */
 static void abi_add_int_ext_attrs(zan_irgen_t *g, LLVMValueRef fn,
                                   zan_type_t *ret, zan_type_t **ptypes,
                                   int pc) {
@@ -379,13 +358,8 @@ static LLVMValueRef abi_byte_ptr(zan_irgen_t *g, LLVMValueRef base,
     return LLVMBuildInBoundsGEP2(g->builder, i8, base, &idx, 1, "abi.off");
 }
 
-/* Declare `name` with the platform C signature and wrap it in an internal
- * thunk that keeps the Zan-level signature `zan_ft`. Returns NULL when no
- * struct crosses the boundary (the plain declaration is then correct). */
-/* Names of externs declared plain because this target has no aggregate C ABI
- * classification. Declaration alone is not a use: pulling in a stdlib file
- * that merely declares such an extern must not fail the compile, so the
- * error moves to abi_pending_report() which fires only at a real call. */
+/* 内部辅助逻辑 */
+/* 内部辅助逻辑 */
 static void abi_pending_add(zan_irgen_t *g, const char *name) {
     for (int i = 0; i < g->abi_pending_count; i++)
         if (strcmp(g->abi_pending[i], name) == 0) return;
@@ -441,10 +415,7 @@ static LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
 
     abi_target_t tgt = abi_target_of(g);
     if (tgt == ABI_TARGET_UNSUPPORTED) {
-        /* Not an error here: a declaration alone is not a use, and stdlib
-         * files full of SIMD intrinsics get pulled into compiles that never
-         * call them. Declare plain, remember the name, and let
-         * abi_pending_report() flag a real call. */
+        /* 内部辅助逻辑 */
         abi_pending_add(g, name);
         free(zan_params);
         return NULL;

@@ -1,15 +1,4 @@
-/* Part of the irgen translation unit: this file is #include'd by irgen.c
- * (see the include block at the end of irgen.c) so every helper keeps static
- * linkage. Do not add it to CMake.
- *
- * Codegen manifest: a post-fixpoint semantic snapshot of the module, frozen
- * after zan_irgen_emit has completed every fixpoint and before the optimizer
- * runs. Records function names/linkage/sizes, direct-call edges, address-taken
- * sites, referenced globals and the per-function facts that gate the sharding
- * allowlist (async ramp, generic specialization, virtual/override dispatch,
- * aggregate ABI, synthetic kind). Read-only over the finished module; the
- * audit and JSON dump run only when ZAN_CODEGEN_MANIFEST /
- * ZAN_CODEGEN_MANIFEST_JSON is set, and nothing here changes codegen. */
+/* Part of the irgen translation unit: this file is #include'd by irgen */
 
 enum {
     ZAN_MF_USER = 0,       /* registered user method/ctor (g->functions) */
@@ -61,18 +50,12 @@ static unsigned char mf_classify(const char *name, int reg_idx) {
     return ZAN_MF_OTHER;
 }
 
-/* A registry symbol marks overridable dispatch when the method is
- * virtual/override/abstract: such bodies are reachable through vtable slots
- * even when no direct call names them. Reads the modifiers snapshot stored in
- * the function registry at registration time, so this stays valid after the
- * frontend arena (symbols + AST) has been freed. */
+/* 内部辅助逻辑 */
 static bool mf_is_virtual_dispatch(uint32_t modifiers) {
     return (modifiers & (MOD_VIRTUAL | MOD_OVERRIDE | MOD_ABSTRACT)) != 0;
 }
 
-/* Stage-4 allowlist v1 admits scalar-ABI bodies only: no aggregate (struct /
- * array / vector) operand in the LLVM signature. Pointer arguments (objects,
- * slices) are the norm and fine. */
+/* 内部辅助逻辑 */
 static bool mf_simple_abi(LLVMTypeRef ft) {
     LLVMTypeKind rk = LLVMGetTypeKind(LLVMGetReturnType(ft));
     if (rk != LLVMVoidTypeKind && rk != LLVMPointerTypeKind &&
@@ -97,16 +80,14 @@ static bool mf_simple_abi(LLVMTypeRef ft) {
     return true;
 }
 
-/* g->generic_fns is the specialization registry; a fn registered there is a
- * generic-method instantiation, not an original body. */
+/* 内部辅助逻辑 */
 static bool mf_is_spec(zan_irgen_t *g, LLVMValueRef fn) {
     for (int i = 0; i < g->generic_fn_count; i++)
         if (g->generic_fns[i].fn == fn) return true;
     return false;
 }
 
-/* An async ramp always has a "<name>$resume" sibling carrying the real body
- * (declare_async_method names them that way). */
+/* 内部辅助逻辑 */
 static bool mf_is_async_ramp(zan_irgen_t *g, const char *name) {
     char buf[512];
     if (strlen(name) + 8 >= sizeof(buf)) return false;
@@ -149,11 +130,7 @@ static int mf_defined_lookup(const mf_name_map_t *map, int n, const char *name) 
     return hit ? hit->idx : -1;
 }
 
-/* Non-call instruction operand: a referenced defined function has its
- * address taken by this body (bitcast into a table, stored, passed as a
- * callback) — the flag lands on the REFERENCED body, the one that must not
- * move out from under the taker; anything else that is a global value is a
- * referenced global. */
+/* 内部辅助逻辑 */
 static void mf_scan_insn_operand(zan_mf_fn *F, zan_mf_fn *fns,
                                  const mf_name_map_t *map, int map_n,
                                  LLVMValueRef op) {
@@ -170,10 +147,7 @@ static void mf_scan_insn_operand(zan_mf_fn *F, zan_mf_fn *fns,
                      LLVMGetValueName(op));
 }
 
-/* Constant-expression / nested-initializer descent for global initializers:
- * vtable slot arrays and reflection tables hold bitcast function pointers,
- * and those references make the referenced bodies address-taken. Names are
- * collected into `out_names`; `depth` bounds pathological nesting. */
+/* 内部辅助逻辑 */
 static void mf_scan_const(zan_mf_fn *F, const mf_name_map_t *map, int map_n,
                           LLVMValueRef v, int depth) {
     if (!v || depth > 8) return;
@@ -278,8 +252,7 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
             for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in;
                  in = LLVMGetNextInstruction(in)) {
                 if (LLVMGetInstructionOpcode(in) == LLVMCall) {
-                    /* zanc never emits operand bundles, so a direct call's
-                     * callee is always its last operand */
+                    /* 内部辅助逻辑 */
                     unsigned nop = LLVMGetNumOperands(in);
                     LLVMValueRef callee =
                         nop ? LLVMGetOperand(in, (int)(nop - 1)) : NULL;
@@ -312,8 +285,7 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
         }
     }
 
-    /* pass 3: function pointers in global initializers (vtables, reflection
-     * tables) make the referenced bodies address-taken */
+    /* 内部辅助逻辑 */
     for (LLVMValueRef gv = LLVMGetFirstGlobal(g->mod); gv;
          gv = LLVMGetNextGlobal(gv)) {
         LLVMValueRef init = LLVMGetInitializer(gv);
@@ -329,10 +301,7 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
     }
     free(llfns);
 
-    /* stage-4 allowlist v1: native host, non-debug, no leak/ARC guards, no
-     * string obfuscation, no reflection participation, not a library build,
-     * ordinary synchronous non-generic non-virtual scalar-ABI user bodies
-     * whose address is never taken and which make no indirect calls. */
+    /* 内部辅助逻辑 */
     bool policy_ok = native && !g->emit_debug && !g->check_leaks &&
                      !g->arc_guard && !g->emit_lib;
     for (int i = 0; i < m->fn_count; i++) {
@@ -342,9 +311,7 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
                       (F->kind == ZAN_MF_USER || F->kind == ZAN_MF_RELEASE) &&
                       !F->is_async;
     }
-    /* clean roots: the transitive direct-call closure stays inside eligible
-     * USER bodies + RELEASE helpers (per-class private ARC release bodies —
-     * they could travel with a shard or be deduped by the coordinator). */
+    /* 内部辅助逻辑 */
     unsigned char *seen = (unsigned char *)calloc((size_t)m->fn_count, 1);
     int *stack = (int *)malloc((size_t)(m->fn_count ? m->fn_count : 1) *
                                sizeof(int));
@@ -474,8 +441,7 @@ static void mf_json_str(FILE *out, const char *s) {
     fputc('"', out);
 }
 
-/* sort + dedupe + write a name list; arr is sorted in place (order is not
- * meaningful on the collected edge lists) */
+/* 内部辅助逻辑 */
 static void mf_json_names(FILE *out, const char **arr, int cnt) {
     if (cnt > 1) qsort(arr, (size_t)cnt, sizeof(char *), mf_json_cmp_str);
     fputc('[', out);

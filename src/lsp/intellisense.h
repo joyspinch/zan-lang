@@ -1,9 +1,4 @@
-/* intellisense.h -- Code intelligence (autocomplete, go-to-def, hover, signatures).
- *
- * Provides code intelligence by parsing the current file and collecting
- * symbols (classes, methods, variables, types) for autocomplete, navigation,
- * and signature help.
- */
+/* intellisense */
 #ifndef ZAN_INTELLISENSE_H
 #define ZAN_INTELLISENSE_H
 
@@ -14,20 +9,13 @@
 extern "C" {
 #endif
 
-/* Cooperative abort flag for the project index scan: the host (zan-lsp) sets
- * it to 1 to make a running intel_index_project / intel_index_files bail out
- * at its next file; the host clears it before starting the next scan.
- * Defined in intellisense.c. */
+/* 内部辅助逻辑 */
 extern volatile int intel_cancel_flag;
 
-/* Code identifier offsets, excluding comments and interpolation literals.
- * A NULL offsets buffer counts every occurrence without truncation. */
+/* Code identifier offsets, excluding comments and interpolation literals */
 int intel_find_text_references(const char *text, const char *word, size_t *offsets, int max);
 
-/* The symbol table and the indexed-file list grow on demand: a fixed 4096
- * symbols and 64 files silently truncated the index of any real project (the
- * standard library alone is several hundred files), so completion went quiet
- * with no way to tell why. These are only the initial capacities. */
+/* 内部辅助逻辑 */
 #define INTEL_INIT_SYMBOLS     1024
 #define INTEL_INIT_FILES       64
 #define INTEL_MAX_COMPLETIONS  512
@@ -55,9 +43,7 @@ typedef enum {
     ISYM_CONSTRUCTOR
 } isym_kind_t;
 
-/* Member visibility, as declared. An unmarked member is public (docs/SPEC.md
- * "未加修饰符的成员完全公开"); `internal` is treated as public here because
- * deciding it needs the module of every use site. */
+/* Member visibility, as declared */
 typedef enum {
     IVIS_PUBLIC = 0,
     IVIS_PROTECTED,
@@ -88,7 +74,7 @@ typedef struct {
     int         scope_end_offset;
 } isym_t;
 
-/* A method body extent (for scope-aware rename/references of locals). */
+/* A method body extent (for scope-aware rename/references of locals) */
 typedef struct {
     char        name[128];
     char        parent[128];        /* enclosing class */
@@ -196,24 +182,17 @@ void intel_init(intellisense_t *is);
 void intel_parse_file(intellisense_t *is, const char *filepath,
                       const char *content, size_t len);
 
-/* Parse with a project index available to initializer type inference. */
+/* Parse with a project index available to initializer type inference */
 void intel_parse_file_ex(intellisense_t *is, intellisense_t *project,
                          const char *filepath, const char *content, size_t len);
 
 /* Clear all symbols */
 void intel_clear(intellisense_t *is);
 
-/* Release the symbol table and file list. The struct itself is the caller's
- * (it is usually malloc'd for one request). */
+/* Release the symbol table and file list */
 void intel_free(intellisense_t *is);
 
-/* Request autocomplete at the given position.
- * `prefix` is the partial word typed so far.
- * `context_class` is the type before the dot (for member access).
- * With a position, offers visible locals and accessible members of the enclosing
- * type/base chain. Without one, offers types/namespaces, excluding locals and
- * all bare members (also used for project supplementation).
- * Returns number of completions available. */
+/* Request autocomplete at the given position */
 int intel_complete_pos(intellisense_t *is, const char *prefix,
                        const char *context_class, int line, int col);
 int intel_complete_at(intellisense_t *is, const char *prefix,
@@ -221,17 +200,11 @@ int intel_complete_at(intellisense_t *is, const char *prefix,
 int intel_complete(intellisense_t *is, const char *prefix,
                    const char *context_class);
 
-/* Bare-identifier completion against a project/stdlib/package index on
- * behalf of the open document: `from_class` is the enclosing class taken
- * from the live buffer, so members that exist only in the index (e.g.
- * designer-projected widget fields on a partial class) complete even
- * though the index has no position for the request. */
+/* 内部辅助逻辑 */
 int intel_complete_bare(intellisense_t *is, const char *prefix,
                         const char *from_class);
 
-/* Request member completions for a specific type.
- * Called when user types "varName." or "ClassName."
- * If line >= 0, resolves varName using the enclosing method scope. */
+/* Request member completions for a specific type */
 int intel_complete_members_pos(intellisense_t *is, const char *type_name,
                                const char *prefix, int line, int col);
 int intel_complete_members_at(intellisense_t *is, const char *type_name,
@@ -239,34 +212,25 @@ int intel_complete_members_at(intellisense_t *is, const char *type_name,
 int intel_complete_members(intellisense_t *is, const char *type_name,
                            const char *prefix);
 
-/* Namespace completions for a `using` directive: the stdlib namespace
- * map plus every namespace declared in this file and in `project`
- * (the shared project index; may be NULL). `ns_prefix` is the partial
- * namespace typed after the keyword ("" = list all). */
+/* 内部辅助逻辑 */
 int intel_complete_usings(intellisense_t *is, intellisense_t *project,
                           const char *ns_prefix);
 
-/* Get hover info for a symbol at the given name.
- * If line >= 0, resolves locals/parameters within the method enclosing line. */
+/* Get hover info for a symbol at the given name */
 hover_info_t intel_hover_pos(intellisense_t *is, const char *word, int line, int col);
 hover_info_t intel_hover_at(intellisense_t *is, const char *word, int line);
 hover_info_t intel_hover(intellisense_t *is, const char *word);
-/* Hover for `receiver.member` with the receiver's type already resolved:
- * describes that type's member (base walk, then builtin table) instead of a
- * name-sharing symbol from an unrelated class. */
+/* Hover for `receiver */
 hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
                                 const char *member);
-/* Go-to-definition for `receiver.member` with the receiver's type resolved:
- * jumps to the member declared on that type (base walk) rather than a
- * name-sharing symbol the index walk reaches first. */
+/* Go-to-definition for `receiver */
 bool intel_goto_member(intellisense_t *is, const char *type_name,
                        const char *member, goto_def_t *out);
 
 /* Go to definition of a symbol */
 goto_def_t intel_goto_def(intellisense_t *is, const char *word);
 
-/* Signature help: receiver variable/type or NULL for an unqualified call.
- * Position is zero-based, with a UTF-16 column; the legacy wrapper has none. */
+/* Signature help: receiver variable/type or NULL for an unqualified call */
 signature_info_t intel_signature_help_pos_ex(intellisense_t *is, intellisense_t *project,
                                              const char *method_name, const char *class_context,
                                              int line, int col);
@@ -292,25 +256,18 @@ void intel_register_snippets(intellisense_t *is);
 int intel_find_references(intellisense_t *is, const char *word,
                           goto_def_t *results, int max_results);
 
-/* Legacy line-only lookup: return a visible local/parameter's lexical block
- * extent and declaration line (all 0-based; output pointers may be NULL).
- * For precise rename/references including same-line blocks, use
- * intel_lookup_symbol_at and its byte offsets/exclusive scope end instead. */
+/* 内部辅助逻辑 */
 bool intel_local_extent(intellisense_t *is, const char *word, int line,
                         int *out_start_line, int *out_end_line,
                         int *out_decl_line);
 
-/* Precise lexical lookup. `col` is a zero-based UTF-16 column; -1 keeps
- * legacy line-only behavior. Locals never escape their file/callable/block.
- * Set current_file on the index before querying a multi-file index. */
+/* Precise lexical lookup */
 bool intel_same_file(const char *a, const char *b);
 const isym_t *intel_lookup_symbol_at(intellisense_t *is, const char *word,
                                     int line, int col);
-/* True when the word is one of the language keywords — never a legal
- * replacement identifier for rename. */
+/* 内部辅助逻辑 */
 bool intel_is_keyword(const char *word);
-/* Name-only lookup across an aggregate index (project/stdlib/packages):
- * ignores current_file/position, prefers type members over declarations. */
+/* 内部辅助逻辑 */
 const isym_t *intel_lookup_symbol_any(intellisense_t *is, const char *word);
 bool intel_symbol_visible_at(const intellisense_t *is, const isym_t *sym,
                              int line, int col);
@@ -321,23 +278,17 @@ const imethod_t *intel_method_at(const intellisense_t *is, int line, int col);
 const char *intel_resolve_type_pos(intellisense_t *is, const char *var_name,
                                  int line, int col);
 
-/* Resolve the type of a variable name from context.
- * If line >= 0, resolves locals/parameters within the enclosing method first. */
+/* Resolve the type of a variable name from context */
 const char *intel_resolve_type_at(intellisense_t *is, const char *var_name, int line);
 const char *intel_resolve_type(intellisense_t *is, const char *var_name);
 
-/* Resolve the return type of a method call on a given type.
- * For example: intel_resolve_method_return(is, "List<int>", "ToArray") -> "int[]"
- * Used for chain-call completion. */
+/* Resolve the return type of a method call on a given type */
 const char *intel_resolve_method_return_ex(intellisense_t *is, intellisense_t *project,
                                            const char *type_name, const char *method_name);
 const char *intel_resolve_method_return(intellisense_t *is, const char *type_name,
                                         const char *method_name);
 
-/* Resolve the type at the end of a chain expression like "a.Method1().Method2"
- * `chain` is the full expression text (e.g. "myList.Where(x => x > 0).Select")
- * Returns the resolved type of the last element before the final dot.
- * `final_member` receives the text after the last dot (the completion prefix). */
+/* Resolve the type at the end of a chain expression like "a */
 const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
                                     const char *chain, char *final_member, size_t final_cap,
                                     int line, int col);
@@ -349,9 +300,7 @@ const char *intel_resolve_chain(intellisense_t *is, const char *chain,
 
 /* --- Project-wide indexing --- */
 
-/* Index all .zan files in a project directory (recursive).
- * `project_root` is the base directory. After indexing, all symbols
- * from the project are available for completion. */
+/* Index all */
 void intel_index_project(intellisense_t *is, const char *project_root);
 
 /* Index a list of files explicitly */
@@ -379,16 +328,13 @@ typedef struct {
     int           unused_count;
 } using_analysis_t;
 
-/* Analyze using statements in a file: find missing and unused usings.
- * `content` is the file text, `len` its length.
- * Returns analysis result. */
+/* Analyze using statements in a file: find missing and unused usings */
 using_analysis_t intel_analyze_usings(intellisense_t *is, const char *content, size_t len);
 
 /* Generate the text for a "using" line to add */
 void intel_format_using(const char *namespace_name, char *out, size_t out_cap);
 
-/* Organize usings: sort alphabetically, remove unused, add missing.
- * Returns the new file content (caller must free). */
+/* Organize usings: sort alphabetically, remove unused, add missing */
 char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
                             size_t *out_len);
 

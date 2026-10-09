@@ -1,7 +1,4 @@
-/* Module-local weak-reference registry. The registry is emitted into each
- * generated module so targets do not need an additional runtime object. The
- * bucket array is lazily allocated on first use by weak_buckets_ensure under
- * the weak spinlock. */
+/* Module-local weak-reference registry */
 
 #define ZAN_WEAK_BUCKET_COUNT 8192
 
@@ -82,10 +79,7 @@ static void emit_weak_unlock(zan_irgen_t *g) {
         LLVMAtomicOrderingRelease, 0);
 }
 
-/* Ensure the bucket array exists, calloc'ing it on first use. Call with the
- * weak lock held, right after emit_weak_lock, so the lazy allocation cannot
- * race. Positions the builder at the join block and returns the array base,
- * which then dominates every bucket access in the body. */
+/* Ensure the bucket array exists, calloc'ing it on first use */
 static LLVMValueRef weak_buckets_ensure(zan_irgen_t *g, LLVMValueRef fn,
                                         LLVMValueRef calloc_fn) {
     LLVMBuilderRef b = g->builder;
@@ -111,8 +105,7 @@ static LLVMValueRef weak_buckets_ensure(zan_irgen_t *g, LLVMValueRef fn,
         calloc_fn, args, 2, "weak.buckets.calloc");
     zan_irgen_emit_oom_check(g, fn, mem);
     LLVMBuildStore(b, mem, g->weak_buckets);
-    /* The oom check may have split alloc_bb (fail/ok); the phi's predecessor
-     * is whichever block now falls through to the join. */
+    /* 内部辅助逻辑 */
     LLVMBasicBlockRef tail_bb = LLVMGetInsertBlock(b);
     LLVMBuildBr(b, join_bb);
 
@@ -244,9 +237,7 @@ static void emit_weak_store_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
     LLVMBuildRetVoid(b);
 }
 
-/* Emit lock + bucket scan that unlinks every registry node whose target is
- * `obj`, nulling each node's slot and freeing the node. Positions the builder
- * at done_bb with the lock still held; the caller emits its epilogue there. */
+/* 内部辅助逻辑 */
 static void emit_weak_nil_scan(zan_irgen_t *g, LLVMValueRef fn,
                                LLVMValueRef weak_calloc, LLVMValueRef obj,
                                LLVMBasicBlockRef done_bb) {
@@ -360,12 +351,7 @@ static void emit_weak_nil_all_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
     LLVMBuildRetVoid(b);
 }
 
-/* Body of zan_rt_weak_destroy_begin(void* obj) -> i1: under the registry lock,
- * null every slot pointing at obj, then commit only if the refcount is still
- * zero. This is the destroy-side half of the weak read handshake: a reader
- * that retained in between absorbed the releasing decrement, so the gate
- * aborts and the reader's own release claims the destroy later. An empty
- * registry short-circuits: no slot was ever created, so no reader exists. */
+/* 内部辅助逻辑 */
 static void emit_weak_destroy_begin_body(zan_irgen_t *g,
                                          LLVMValueRef weak_calloc) {
     LLVMBuilderRef b = g->builder;
@@ -393,10 +379,7 @@ static void emit_weak_destroy_begin_body(zan_irgen_t *g,
         &neg16, 1, "weak.begin.rcp");
     LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0),
         "weak.begin.rcip");
-    /* Read the count as a no-op fetch_add: an i64 atomic LOAD lowers to an
-     * __atomic_load libcall on 32-bit targets, while RMWs inline via
-     * cmpxchg8b. Monotonic is enough either way -- the registry spinlock's
-     * own acquire/release pairs order this read against the claim. */
+    /* 内部辅助逻辑 */
     LLVMValueRef rc = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpAdd, rcip,
         LLVMConstInt(i64, 0, 0), LLVMAtomicOrderingMonotonic, 0);
     LLVMValueRef ok = LLVMBuildICmp(b, LLVMIntEQ, rc,
@@ -405,11 +388,7 @@ static void emit_weak_destroy_begin_body(zan_irgen_t *g,
     LLVMBuildRet(b, ok);
 }
 
-/* Body of zan_rt_weak_load_retain(void** slot) -> void*: under the registry
- * lock, load the slot and retain a non-null value before unlocking. A non-null
- * return is a live object with a fresh +1 (the destroyer's commit gate runs
- * under the same lock and aborts when the count moved); a null return means
- * the target is gone or its teardown has begun. */
+/* 内部辅助逻辑 */
 static void emit_weak_load_retain_body(zan_irgen_t *g) {
     LLVMBuilderRef b = g->builder;
     LLVMTypeRef i8ptr = weak_i8ptr(g);
@@ -438,8 +417,7 @@ static void emit_weak_runtime(zan_irgen_t *g) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
 
-    /* The bucket array itself is a NULL pointer global; the array behind it
-     * is calloc'ed by weak_buckets_ensure on the first weak store. */
+    /* 内部辅助逻辑 */
     g->weak_buckets = LLVMAddGlobal(g->mod, i8ptr, "zan_weak_buckets");
     LLVMSetInitializer(g->weak_buckets, LLVMConstNull(i8ptr));
     LLVMSetLinkage(g->weak_buckets, LLVMInternalLinkage);
@@ -510,12 +488,7 @@ static void emit_weak_store(zan_irgen_t *g, LLVMValueRef field_ptr,
               g->rt_weak_store, args, 2, "");
 }
 
-/* Weak-field read handshake (call at every value-producing read of a
- * MOD_WEAK class/interface field): the slot is loaded and a non-null value
- * retained under the registry spinlock, so the returned reference is either
- * null or a live object with a fresh +1. The +1 is real ownership: consumers
- * must report the read as owned (+1) via expr_yields_owned_rc_value, which
- * then releases it at the end of the value's use. */
+/* 内部辅助逻辑 */
 static LLVMValueRef emit_weak_field_load(zan_irgen_t *g, LLVMValueRef field_ptr,
                                          LLVMTypeRef val_ty) {
     LLVMTypeRef i8ptr = weak_i8ptr(g);

@@ -1,20 +1,4 @@
-/* Generic embedded-resource read API.
- *
- * A generated data object (see scripts/gen_embed.ps1) registers its
- * name->bytes table here via a constructor before main runs; skins, DB drivers
- * and other extension assets are then read straight from the executable's
- * memory by name -- no self-extract, no external files. When no table has been
- * registered every read returns empty, so callers transparently fall back to
- * the filesystem.
- *
- * A registration REPLACES the previous one (as does the copy zanc emits into an
- * embedding program, src/compiler/embedres.c), so a program links exactly one
- * generated object: gen_embed.ps1 takes several -Group arguments to put every
- * resource group in that one table.
- *
- * Kept as its own translation unit (not baked into a specific runtime) so it is
- * a single definition every consumer links against, while the *data* lives in
- * the per-program generated object. */
+/* Generic embedded-resource read API */
 #include <string.h>
 #include <stdlib.h>
 
@@ -56,7 +40,7 @@ int zan_embed_has(const char* name) {
     return zan_embed_find(name) ? 1 : 0;
 }
 
-/* Raw pointer + length (binary resources such as driver blobs / images). */
+/* Raw pointer + length (binary resources such as driver blobs / images) */
 const unsigned char* zan_embed_bytes(const char* name, int* outLen) {
     const zan_embed_ent* e = zan_embed_find(name);
     if (!e) { if (outLen) *outLen = 0; return 0; }
@@ -64,7 +48,7 @@ const unsigned char* zan_embed_bytes(const char* name, int* outLen) {
     return e->data;
 }
 
-/* '\n'-joined names carrying the given prefix (for enumeration). */
+/* '\n'-joined names carrying the given prefix (for enumeration) */
 const char* zan_embed_list(const char* prefix) {
     static char* buf = 0;
     static size_t cap = 0;

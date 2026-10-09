@@ -1,28 +1,10 @@
-/* gui_runtime_android.c -- Android system-WebView backend for the embedded
- * browser control (Gui.Component.WebView's WebViewBackend).
- *
- * #included by gui_runtime.c after the windowing backend part; compiles only in
- * __ANDROID__ builds of the zan_gui driver. The engine is the per-device
- * system WebView: one android.webkit.WebView per Zan handle, overlaid on the
- * app surface by the Java side (org.zan.app.ZanWeb, packaged in the APK
- * shell's classes.dex -- see toolchain/apk-shell/java). Every view operation
- * hops to the UI thread inside ZanWeb; page events come back through the
- * single zanGuiWebEvent JNI sink and update the per-handle state cache that
- * the zan_gui_webview_* exports report.
- *
- * Limitations vs the macOS WKWebView backend: cookies are process-global
- * (CookieManager has no per-profile stores), so profileId is accepted but
- * ignored; eval marshals to the UI thread and waits up to 3 s for the
- * result (the JSON encoding evaluateJavascript produces, not WKWebView's
- * description format). */
+/* gui_runtime_android */
 
 #if defined(__ANDROID__)
 
 #include <errno.h>
 #include <jni.h>
-/* The JNI reach goes through the windowing shell's bridge helpers: the
- * NativeActivity shell (gui_runtime_android_native.c) hands out the glue's
- * env/activity. */
+/* 内部辅助逻辑 */
 static JNIEnv *zan_anw_bridge_env(void);
 static jobject  zan_anw_bridge_activity(void);
 #include <pthread.h>
@@ -30,7 +12,7 @@ static jobject  zan_anw_bridge_activity(void);
 #include <string.h>
 #include <time.h>
 
-/* Diagnostics go to logcat under "zan_awv"; the bridge has no other console. */
+/* Diagnostics go to logcat under "zan_awv"; the bridge has no other console */
 #include <android/log.h>
 #define AWV_LOG(...) \
     __android_log_print(ANDROID_LOG_INFO, "zan_awv", __VA_ARGS__)
@@ -41,8 +23,7 @@ static jobject  zan_anw_bridge_activity(void);
 #define ZAN_AWV_MSG_MAX 128     /* queued "<handler>\t<body>" entries */
 #define ZAN_AWV_EVAL_TIMEOUT 3  /* seconds, matching the macOS spin */
 
-/* Event kinds sent by org.zan.app.ZanWeb.zanGuiWebEvent -- keep in step
- * with the EV_* constants in ZanWeb.java. */
+/* Event kinds sent by org */
 #define ZAN_AWV_EV_PAGE_STARTED 1
 #define ZAN_AWV_EV_PAGE_FINISHED 2
 #define ZAN_AWV_EV_TITLE 3
@@ -92,8 +73,7 @@ static zaw_t *awv_slot(int h) {
     return w->used ? w : NULL;
 }
 
-/* ART's NewStringUTF is Modified-UTF-8; real page URLs/HTML carry 4-byte
- * sequences, so take the byte-array path whenever one is present. */
+/* 内部辅助逻辑 */
 static jstring awv_jstr(JNIEnv *env, const char *utf8) {
     if (!utf8) { utf8 = ""; }
     int needsBytes = 0;
@@ -138,9 +118,7 @@ static char *awv_cstr(JNIEnv *env, jstring s) {
     return out;
 }
 
-/* Cache the bridge class and entry points. Runs on the first webview call:
- * the app classloader is reached through the activity because FindClass from
- * a native thread only sees the system loader. */
+/* Cache the bridge class and entry points */
 static int awv_init(void) {
     static int done = -1;
     if (done == 0) { return 0; }
@@ -176,8 +154,7 @@ static int awv_init(void) {
     }
     jstring name = (*env)->NewStringUTF(env, "org.zan.app.ZanWeb");
     jclass bridge = (jclass)(*env)->CallObjectMethod(env, loader, load, name);
-    /* loader stays alive until after the call: deleting the local ref early
-     * leaves the receiver dangling (segfault inside ART arg marshaling). */
+    /* 内部辅助逻辑 */
     (*env)->DeleteLocalRef(env, loader);
     (*env)->DeleteLocalRef(env, name);
     if ((*env)->ExceptionCheck(env) || !bridge) {
@@ -256,9 +233,7 @@ fail:
     return -1;
 }
 
-/* JNIEnv for the calling thread: native threads arrive attached via the
- * shell bridge, UI/Javascript threads come pre-attached with their own
- * env through the JNI sink. */
+/* 内部辅助逻辑 */
 static JNIEnv *awv_env(void) {
     JNIEnv *env = zan_anw_bridge_env();
     if (env) { return env; }
@@ -269,9 +244,7 @@ static JNIEnv *awv_env(void) {
     return env;
 }
 
-/* ZanWeb's static methods all start with the Activity (from the bridge);
- * these helpers dispatch each argument shape and clear any Java exception.
- * String arguments accept NULL. */
+/* 内部辅助逻辑 */
 static int awv_begin(JNIEnv **env, jobject *act) {
     if (!g_awv_bridge) { return -1; }
     *env = awv_env();
@@ -353,7 +326,7 @@ static void awv_call_ss(jmethodID mid, i32 a, const char *s1, const char *s2) {
     (*env)->DeleteLocalRef(env, act);
 }
 
-/* The single event sink. Called on Java threads; updates the state cache. */
+/* The single event sink */
 EXPORT void JNICALL
 Java_org_zan_app_ZanWeb_zanGuiWebEvent(JNIEnv *env, jclass clazz, jint id,
                                        jint kind, jstring s1, jstring s2,
@@ -428,7 +401,7 @@ Java_org_zan_app_ZanWeb_zanGuiWebEvent(JNIEnv *env, jclass clazz, jint id,
     free(b);
 }
 
-/* ---- zan_gui_webview_* exports (see WebViewBackend.zan for the contract) */
+/* zan_gui_webview_* exports (see WebViewBackend */
 
 EXPORT i32 zan_gui_webview_create(i64 hwnd, const char *profileId) {
     (void)hwnd;      /* one app window == the whole activity surface */
@@ -586,8 +559,7 @@ EXPORT const char *zan_gui_webview_eval(i32 h, const char *js) {
     pthread_mutex_unlock(&g_awv_lock);
     if (!w) { return ""; }
     awv_call_s(g_awv_mid.eval, h, js ? js : "");
-    /* UI thread reports through zanGuiWebEvent; bounded wait, macOS spins
-     * its runloop for the same 3 s budget. */
+    /* 内部辅助逻辑 */
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);
     dl.tv_sec += ZAN_AWV_EVAL_TIMEOUT;
@@ -652,7 +624,7 @@ EXPORT void zan_gui_webview_clear_cookies(i32 h) {
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); }
 }
 
-/* ---- optional bridge layer (dlopen-probed by WebViewBackend.zan) */
+/* optional bridge layer (dlopen-probed by WebViewBackend */
 
 EXPORT i32 zan_gui_webview_add_handler(i32 h, const char *name) {
     if (!awv_slot(h) || !name || !*name) { return 0; }
@@ -725,9 +697,7 @@ EXPORT void zan_gui_webview_clear_data(i32 h) {
     awv_call_i(g_awv_mid.clearData, h);
 }
 
-/* Partial-occlusion clip, same contract as the macOS backend: "" = fully
- * covered (hide), otherwise clip the view to the union's bounding box.
- * Deduplicating identical specs matters -- this fires every frame. */
+/* 内部辅助逻辑 */
 EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
     zaw_t *slot = awv_slot(h);
     if (!slot) { return; }
