@@ -232,6 +232,12 @@ class IdeRenameCommit {
     string failure = "";
 }
 
+class IdeRenameHistoryItem {
+    string word;
+    string newName;
+    IdeRenamePlan plan;
+}
+
 delegate void IdeRenameDiskWriter(string path, string text);
 
 // 接口数据协议与执行契约。
@@ -252,6 +258,7 @@ partial class ZanIDE {
     IdeProjectSourceRead projectSourceRead;
     List<Action> projectSourceWaiters = new List<Action>();
     List<Action> navigationIdleWaiters = new List<Action>();
+    List<IdeRenameHistoryItem> renameHistory = new List<IdeRenameHistoryItem>();
     bool navigationCommitBusy;
     bool navigationCommitWaiting;
     bool navigationDocumentWritesPaused;
@@ -2278,6 +2285,18 @@ partial class ZanIDE {
                     }
                     if (snapshot.cancellation.IsCancellationRequested) { return; }
                     host.Post(delegate () {
+                        List<SearchHit> previewHits = new List<SearchHit>();
+                        if (edits != null) {
+                            for (int ei = 0; ei < edits.Count; ei = ei + 1) {
+                                LspRenameEdit ed = edits[ei];
+                                previewHits.Add(SearchHit.Create(ed.path, ed.start.line,
+                                    "Rename '" + word + "' -> '" + newName + "'"));
+                            }
+                        }
+                        if (previewHits.Count > 0) {
+                            fifHits = previewHits;
+                            fifSel = -1;
+                        }
                         this.BeginRenamePlanCommit(guard, plan, "Rename", "Renamed '" + word + "' -> '" + newName + "' (semantic)");
                     });
                 });
@@ -2397,11 +2416,117 @@ partial class ZanIDE {
                 lspSess.SyncDoc(entry.path, entry.newText);
             }
         }
+        this.PushRenameHistory(snapshot.word, summary, plan);
         ZanIDE.InvalidateNavFiles();
         log.Add("> " + summary + ": " + Convert.ToString(plan.buffers) + " open tab(s), "
-            + Convert.ToString(plan.disk) + " file(s) on disk.");
+            + Convert.ToString(plan.disk) + " file(s) on disk. (Ctrl+Alt+Z / Ctrl+Shift+Z to undo)");
         this.ReleaseNavigationCommit();
         this.RequestProjectSourcesAsync();
+    }
+
+    void PushRenameHistory(string word, string newName, IdeRenamePlan plan) {
+        if (plan == null || plan.entries == null || plan.entries.Count == 0) { return; }
+        IdeRenameHistoryItem item = new IdeRenameHistoryItem();
+        item.word = word;
+        item.newName = newName;
+        item.plan = plan;
+        renameHistory.Add(item);
+    }
+
+    bool UndoRename() {
+        if (renameHistory == null || renameHistory.Count == 0) {
+            log.Add(ZanIDE.T("> Undo Rename: no rename history to undo.", "> 撤销重命名：没有可撤销的重命名历史。"));
+            app.RequestRedraw();
+            return false;
+        }
+        IdeRenameHistoryItem last = renameHistory[renameHistory.Count - 1];
+        renameHistory.RemoveAt(renameHistory.Count - 1);
+        IdeRenamePlan plan = last.plan;
+        if (plan == null || plan.entries == null || plan.entries.Count == 0) {
+            log.Add(ZanIDE.T("> Undo Rename: empty rename plan.", "> 撤销重命名：重命名计划为空。"));
+            app.RequestRedraw();
+            return false;
+        }
+
+        // 1. 校验当前性（打开页签 body == newText、磁盘 == newText）
+        for (int i = 0; i < plan.entries.Count; i = i + 1) {
+            IdeRenamePlanEntry entry = plan.entries[i];
+            if (entry.open) {
+                int tab = ZanIDE.FindNavigationTab(tabs, entry.path);
+                if (tab < 0 || tabs[tab].body != entry.newText) {
+                    log.Add(ZanIDE.T("> Undo Rename: document '", "> 撤销重命名：文档 '")
+                        + Path.GetFileName(entry.path)
+                        + ZanIDE.T("' was modified after rename; cannot undo.", "' 在重命名后已被修改，无法撤销。"));
+                    app.RequestRedraw();
+                    return false;
+                }
+            } else {
+                if (!File.Exists(entry.path) || File.ReadAllText(entry.path) != entry.newText) {
+                    log.Add(ZanIDE.T("> Undo Rename: file '", "> 撤销重命名：文件 '")
+                        + Path.GetFileName(entry.path)
+                        + ZanIDE.T("' was modified after rename; cannot undo.", "' 在重命名后已被修改，无法撤销。"));
+                    app.RequestRedraw();
+                    return false;
+                }
+            }
+        }
+
+        // 2. RollbackRenameDiskPlan 语义还盘
+        for (int i = 0; i < plan.entries.Count; i = i + 1) {
+            if (!plan.entries[i].open) {
+                plan.entries[i].written = true;
+            }
+        }
+        string rollbackErr = ZanIDE.RollbackRenameDiskPlan(plan);
+        if (rollbackErr != "") {
+            log.Add("> Undo Rename: " + rollbackErr);
+        }
+
+        // 3. 恢复打开页签 body
+        for (int i = 0; i < plan.entries.Count; i = i + 1) {
+            IdeRenamePlanEntry entry = plan.entries[i];
+            if (entry.open) {
+                int tab = ZanIDE.FindNavigationTab(tabs, entry.path);
+                if (tab >= 0) {
+                    tabs[tab].body = entry.originalText;
+                    tabs[tab].preparedText = CodeEditor.PrepareText(entry.originalText);
+                    tabs[tab].preparedBody = entry.originalText;
+                    this.InvalidateLoadedDocument(tabs[tab].path);
+                }
+            }
+        }
+
+        // 4. 重载活动编辑器
+        int active = activeTab.Get();
+        if (active >= 0 && active < tabs.Count) {
+            string curPath = tabs[active].path;
+            for (int i = 0; i < plan.entries.Count; i = i + 1) {
+                if (LspSession.SameDocumentPath(plan.entries[i].path, curPath)) {
+                    CodeEditorTextLoad req = editor.BeginTextLoad(curPath, CodeEditor.LangForName(curPath));
+                    editor.SaveUndo();
+                    editor.ApplyPreparedText(req, tabs[active].preparedText);
+                    break;
+                }
+            }
+        }
+
+        // 5. lspSess.SyncDoc
+        if (lspSess != null && lspSess.Alive()) {
+            for (int i = 0; i < plan.entries.Count; i = i + 1) {
+                IdeRenamePlanEntry entry = plan.entries[i];
+                if (entry.path.ToLower().EndsWith(".zan")) {
+                    lspSess.SyncDoc(entry.path, entry.originalText);
+                }
+            }
+        }
+
+        ZanIDE.InvalidateNavFiles();
+        log.Add(ZanIDE.T("> Undo Rename: reverted '", "> 撤销重命名：已恢复 '")
+            + last.newName + "' -> '" + last.word + "' ("
+            + Convert.ToString(plan.entries.Count) + " file(s)).");
+        this.RequestProjectSourcesAsync();
+        app.RequestRedraw();
+        return true;
     }
 
     static List<IdeSourceSnapshot> SearchSourceSnapshots(IdeProjectSourceCache cache,

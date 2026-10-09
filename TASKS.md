@@ -13,4 +13,4 @@
 
 ## 未完成
 
-- [ ] IDE-1 跨文件重命名缺预览与全局撤销：挂钩点在 CodeNav 异步重命名管线（RenameSymbolAsync/FinishRenamePlanCommit，尚在会话在途未落地 HEAD）。落地后在 FinishRenamePlanCommit 提交磁盘前调 PushRenameHistory（计划条目含 originalText/newText/open/version），撤销=校验当前性（打开页签 body==newText、磁盘==newText）→ RollbackRenameDiskPlan 语义还盘 → 恢复打开页签 body → 重载活动编辑器 → lspSess.SyncDoc → 注册撤销命令。
+（暂无欠账）
