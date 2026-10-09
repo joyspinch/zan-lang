@@ -1,29 +1,6 @@
-/* zan_cef_helper -- the Chromium subprocess executable for macOS bundles.
- *
- * On macOS a Chromium child process must not be the host application's own
- * executable: it would be launched inside the host's .app bundle, so
- * LaunchServices registers every render/gpu/utility process as a copy of the
- * app (a Dock icon per child). CEF's answer is a separate helper bundle, and
- * this program is its executable: ~30 KB whose whole job is to load the
- * zan_cef driver next door and hand the process over to cef_execute_process.
- *
- * It deliberately does not duplicate the host program: the helper needs no Zan
- * runtime, no GUI driver and no TLS libraries, only libcef -- which it reaches
- * through the same driver dylib the browser process already loaded, so the two
- * always agree on the CEF API version they were built against.
- *
- * Where the driver and the CEF runtime live comes from the browser process
- * through the environment (zan_cef_init exports these before it initializes
- * CEF, and Chromium passes its own environment on to the children):
- *
- *   ZAN_CEF_HELPER_DRIVER    absolute path of libzan_cef.dylib
- *   ZAN_CEF_HELPER_RUNTIME   CEF runtime directory (holds Release/...framework)
- *   ZAN_CEF_HELPER_SWITCHES  the host's extra Chromium switches
- *
- * The driver path also has a layout fallback, so a helper started with a
- * stripped environment still finds it: Contents/Frameworks/<x> Helper.app/
- * Contents/MacOS/<x> Helper -> Contents/MacOS/libzan_cef.dylib of the outer
- * bundle, and, failing that, next to the helper itself.
+/*
+ * zan_cef_helper: macOS 环境下 Chromium 独立子进程引导程序。
+ * 动态加载 zan_cef 驱动并将控制权移交 cef_execute_process，避免子进程污染 Dock 图标。
  */
 
 #include <dlfcn.h>

@@ -1,27 +1,9 @@
-/* zan_cef -- native driver behind Gui.Component.CefBrowser.
- *
- * The Chromium Embedded Framework runtime is NOT linked: it is downloaded per
- * machine by CefRuntime.zan into a cache directory and opened here with
- * dlopen/LoadLibrary, so a Zan program carries no 1.4 GB payload and a machine
- * without CEF still runs (every entry point degrades to a no-op and
- * zan_cef_last_error() explains why).
- *
- * Only libcef's exported C functions are resolved dynamically; the struct
- * layouts come from CEF headers at build time. Modern CEF (>= 127) versions
- * its C API, so this translation unit is compiled twice: once with
- * -DCEF_API_VERSION=<n> against current headers (compatible with every CEF
- * whose supported range covers <n>) and once with -DZAN_CEF_LEGACY against
- * CEF 109 headers, the last branch supporting Windows 7/8.1. CefRuntime picks
- * the matching pair at run time.
- *
- * Rich page control (JavaScript results, cookies, screenshots, request
- * interception) is not mirrored one function at a time: the driver exposes the
- * DevTools protocol (CDP) as a message pipe, which is exactly the surface
- * Chromium itself is automated with.
+/*
+ * zan_cef: Gui.Component.CefBrowser 原生驱动实现。
+ * 运行时动态加载外部 libcef 共享库，导出 CDP（Chrome DevTools Protocol）管道。
  */
 
-/* dladdr/Dl_info (the helper-driver lookup below) are glibc extensions guarded
- * behind _GNU_SOURCE, which must be defined before the first system include. */
+/* dladdr/Dl_info 为 glibc 扩展，须在引入系统头文件前定义 _GNU_SOURCE */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
 #endif
