@@ -79,7 +79,7 @@ foreach ($mf in $manifests) {
     }
 
     # 2) build: the entry is ALWAYS the first input (zanc emits Main from the
-    #    first input); side design documents (.html/.htm/.zscene next to the
+    #    first input); side design documents (.html/.htm next to the
     #    entry, e.g. gui-wechat's runtime windows) ride the same command line
     #    or their Build() references fail to resolve; then every other src
     #    .zan. Same input order as tests/run_templates.cmake.

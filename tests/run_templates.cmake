@@ -108,7 +108,7 @@ foreach(_proj IN LISTS _projs)
     ${_out}/src/*.zscene)
   list(SORT _zan)
   list(SORT _designs)
-  # Side design documents (.html/.zscene next to the entry, e.g. gui-wechat's
+  # Side design documents (.html next to the entry, e.g. gui-wechat's
   # WeChatFavs/WeChatMoments run-time windows) ride the same command line --
   # ZanIDE.GatherZanFiles puts them into every whole-project build the same
   # way, and a design doc not on the command line projects no class at all,
