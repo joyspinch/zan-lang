@@ -4,34 +4,32 @@ using System.Net.Sockets;
 
 namespace System.Net.Http;
 
-/// TLS 分片注入的字节源：从 TLS 记录层精确收 (buf, cap) 内的字节，
-/// 返回收到的字节数（0 = 对端关闭），形态跟随 Socket.RecvIntoAsync，
-/// 使分片可以逐参转发。核心文件不拼 TlsStream 类型名——拼了会把
-/// TLS 全家（连带 Base64/Sha256 与 ssl/crypto 驱动拷贝）拉进一切
-/// HTTP 程序。
+// TLS 分片注入的字节源：从 TLS 记录层精确收 (buf, cap) 内的字节，
+// 返回收到的字节数（0 = 对端关闭），形态跟随 Socket.RecvIntoAsync，
+// 使分片可以逐参转发。核心文件不拼 TlsStream 类型名——拼了会把
+// TLS 全家（连带 Base64/Sha256 与 ssl/crypto 驱动拷贝）拉进一切
+// HTTP 程序。
 async delegate int FramerRecvFn(string buf, int cap);
 
-/// <summary>
-/// 一条 HTTP/1.1 连接上的请求拆包器：把字节流切成请求，
-/// 全程按显式字节数处理。
-/// stdlib 里的每个 HTTP 连接循环（HttpServer/Worker 的 "http" 协议、
-/// System.Web 的 WebApp、HttpsServer 的 TLS 连接）都用它拆包，因此
-/// 定界的修复对所有入口同时生效，不会再出现多套实现各自漂移。
-/// 为什么不能用字符串拼接来攒请求：Zan 字符串以 NUL 结尾，
-/// <c>s.Length</c> 是 strlen，<c>a + b</c> 也按 strlen 定长。请求体
-/// （文件上传、protobuf、gzip 内容）里的 NUL 会让长度提前截断，于是
-/// 声明的 Content-Length 永远读不满，请求超时或被判 400。这里把未
-/// 消费的字节放在带显式长度的 <see cref="ByteBuffer"/> 里，接收用
-/// <see cref="Socket.RecvIntoAsync"/> 的精确返回值，切片用带长度的
-/// <see cref="ByteBuffer.Str"/>，全程不依赖 NUL。
-/// 用法（一次请求）：
-/// 核心契约与语义定义。
-/// int he = await f.ReadHead(maxHeaderBytes);        // 头部块到齐
-/// 核心契约与语义定义。
-/// int st = await f.ReadBody(req, maxBodyBytes);     // 正文到齐
-/// f.Consume(f.RequestBytes());                     // 只丢弃本请求
-/// 剩余字节留在拆包器里，就是下一条流水线请求的开头。
-/// </summary>
+// 一条 HTTP/1.1 连接上的请求拆包器：把字节流切成请求，
+// 全程按显式字节数处理。
+// stdlib 里的每个 HTTP 连接循环（HttpServer/Worker 的 "http" 协议、
+// System.Web 的 WebApp、HttpsServer 的 TLS 连接）都用它拆包，因此
+// 定界的修复对所有入口同时生效，不会再出现多套实现各自漂移。
+// 为什么不能用字符串拼接来攒请求：Zan 字符串以 NUL 结尾，
+// <c>s.Length</c> 是 strlen，<c>a + b</c> 也按 strlen 定长。请求体
+// （文件上传、protobuf、gzip 内容）里的 NUL 会让长度提前截断，于是
+// 声明的 Content-Length 永远读不满，请求超时或被判 400。这里把未
+// 消费的字节放在带显式长度的 <see cref="ByteBuffer"/> 里，接收用
+// <see cref="Socket.RecvIntoAsync"/> 的精确返回值，切片用带长度的
+// <see cref="ByteBuffer.Str"/>，全程不依赖 NUL。
+// 用法（一次请求）：
+// 核心契约与语义定义。
+// int he = await f.ReadHead(maxHeaderBytes);        // 头部块到齐
+// 核心契约与语义定义。
+// int st = await f.ReadBody(req, maxBodyBytes);     // 正文到齐
+// f.Consume(f.RequestBytes());                     // 只丢弃本请求
+// 剩余字节留在拆包器里，就是下一条流水线请求的开头。
 class HttpFramer {
     nint sock;
     // TLS 字节源槽（明文为空，直接从 sock 读）。核心不拼 TlsStream
@@ -53,7 +51,7 @@ class HttpFramer {
     // 分块编码则是整个分块序列）。
     int wireBytes;
 
-    /// <summary>私有构造：用 <see cref="Create"/> 创建；TLS 变体见 HttpFramerTls.Create。</summary>
+    // 私有构造：用 <see cref="Create"/> 创建；TLS 变体见 HttpFramerTls.Create。
     HttpFramer() {
         this.sock = -1;
         this.recv = null;
@@ -65,7 +63,7 @@ class HttpFramer {
         this.wireBytes = 0;
     }
 
-    /// <summary>为明文套接字创建拆包器（64KB 复用接收缓冲）。</summary>
+    // 为明文套接字创建拆包器（64KB 复用接收缓冲）。
     static HttpFramer Create(nint sock) {
         HttpFramer f = new HttpFramer();
         f.sock = sock;
@@ -75,26 +73,26 @@ class HttpFramer {
         return f;
     }
 
-    /// <summary>把已经从套接字读出的字节放回流头部。同一端口同时
-    /// 服务 HTTP 与 WebSocket 时，要先看过请求头才能判断协议，
-    /// 已消费的字节由此交还拆包器。</summary>
+    // 把已经从套接字读出的字节放回流头部。同一端口同时
+    // 服务 HTTP 与 WebSocket 时，要先看过请求头才能判断协议，
+    // 已消费的字节由此交还拆包器。
     void Prime(string bytes, int len) {
         if (len > 0) { this.pend.WriteRaw(bytes, len); }
     }
 
-    /// <summary>以原生字节数组把已读出的前缀放回流头部。完全二进制安全，避免字符串转换导致的 NUL 截断。</summary>
+    // 以原生字节数组把已读出的前缀放回流头部。完全二进制安全，避免字符串转换导致的 NUL 截断。
     void PrimeBytes(byte[] bytes, int offset, int len) {
         if (bytes != null && len > 0) { this.pend.WriteBytes(bytes, offset, len); }
     }
 
-    /// <summary>尚未消费的字节数。</summary>
+    // 尚未消费的字节数。
     int Pending() { return this.pend.Length(); }
 
-    /// <summary>对端已关闭且缓冲区里没有剩余字节。</summary>
+    // 对端已关闭且缓冲区里没有剩余字节。
     bool Closed() { return this.closed; }
 
-    /// <summary>接收一次，把收到的字节追加到待处理缓冲区。
-    /// 返回收到的字节数，0 表示对端关闭。</summary>
+    // 接收一次，把收到的字节追加到待处理缓冲区。
+    // 返回收到的字节数，0 表示对端关闭。
     async int Fill() {
         int n = 0;
         if (this.recv != null) {
@@ -110,8 +108,8 @@ class HttpFramer {
         return n;
     }
 
-    /// <summary>分块元数据/正文的受限接收；不能用 Fill 的固定 64KB
-    /// 读取无终止符的长度行，也不能让小块的线缆开销无限驻留。</summary>
+    // 分块元数据/正文的受限接收；不能用 Fill 的固定 64KB
+    // 读取无终止符的长度行，也不能让小块的线缆开销无限驻留。
     async int FillTo(int maxPending) {
         int room = maxPending - this.pend.Length();
         if (room <= 0) { return -1; }
@@ -126,8 +124,8 @@ class HttpFramer {
         return n;
     }
 
-    /// <summary>头部结束空行之后的下标（即正文首字节的位置），
-    /// 空行尚未到达时返回 -1。同时识别 CRLF 与单独 LF 分隔。</summary>
+    // 头部结束空行之后的下标（即正文首字节的位置），
+    // 空行尚未到达时返回 -1。同时识别 CRLF 与单独 LF 分隔。
     int HeaderEnd() {
         int len = this.pend.Length();
         int i = this.scanned;
@@ -150,11 +148,11 @@ class HttpFramer {
         return -1;
     }
 
-    /// <summary>头部读取专用的受限接收（不能调用无上限的 Fill：一次
-    /// 64KB 的 recv 可能把 maxHeaderBytes 直接冲过头，随后才检查已经
-    /// 太迟）。只接收仍在 cap 内的字节，并在追加后再次核验，保证恶意
-    /// 头不会先进入待处理缓冲。返回收到的字节数；超限返回 -431，
-    /// 对端关闭返回 0。</summary>
+    // 头部读取专用的受限接收（不能调用无上限的 Fill：一次
+    // 64KB 的 recv 可能把 maxHeaderBytes 直接冲过头，随后才检查已经
+    // 太迟）。只接收仍在 cap 内的字节，并在追加后再次核验，保证恶意
+    // 头不会先进入待处理缓冲。返回收到的字节数；超限返回 -431，
+    // 对端关闭返回 0。
     async int FillHead(int maxHeaderBytes) {
         int room = maxHeaderBytes - this.pend.Length();
         if (room <= 0) { return -431; }
@@ -176,11 +174,11 @@ class HttpFramer {
         return n;
     }
 
-    /// <summary>一直接收，直到完整的头部块到齐。
-    /// 返回头部块长度（含结束空行）；对端在请求中途关闭返回 0；
-    /// 头部块超过 <paramref name="maxHeaderBytes"/> 返回 -431——
-    /// 违规字节在被无限缓冲之前就被拒绝（slowloris 的一种形态是
-    /// 只发头部却永不发空行）。</summary>
+    // 一直接收，直到完整的头部块到齐。
+    // 返回头部块长度（含结束空行）；对端在请求中途关闭返回 0；
+    // 头部块超过 <paramref name="maxHeaderBytes"/> 返回 -431——
+    // 违规字节在被无限缓冲之前就被拒绝（slowloris 的一种形态是
+    // 只发头部却永不发空行）。
     async int ReadHead(int maxHeaderBytes) {
         if (maxHeaderBytes <= 0) { return -431; }
         int he = this.HeaderEnd();
@@ -195,25 +193,25 @@ class HttpFramer {
         return he;
     }
 
-    /// <summary>头部块（前 <paramref name="headerLen"/> 个字节）的字符串
-    /// 切片，交给 <see cref="HttpRequest.Parse"/>。</summary>
+    // 头部块（前 <paramref name="headerLen"/> 个字节）的字符串
+    // 切片，交给 <see cref="HttpRequest.Parse"/>。
     string Head(int headerLen) {
         return this.pend.Str(0, headerLen);
     }
 
-    /// <summary>待处理字节中 [off, off+count) 的切片（按长度复制，
-    /// 内嵌 NUL 得以保留）。流式上传用它取出"与头部同包到达"的
-    /// 那段正文，其余部分直接从套接字续读。</summary>
+    // 待处理字节中 [off, off+count) 的切片（按长度复制，
+    // 内嵌 NUL 得以保留）。流式上传用它取出"与头部同包到达"的
+    // 那段正文，其余部分直接从套接字续读。
     string Slice(int off, int count) {
         return this.pend.Str(off, count);
     }
 
-    /// <summary>一直接收，直到 <paramref name="req"/> 的正文到齐，并按
-    /// 精确字节数写入 <c>req.body</c> / <c>req.bodyLength</c>。
-    /// 返回 0 表示成功；返回 HTTP 状态码表示应当据此拒绝
-    /// （413 超限、400 分块编码畸形）；返回 -1 表示对端在正文
-    /// 中途关闭。分块编码在这里解码，解码后的正文与固定长度
-    /// 正文一样，对处理器不可区分。</summary>
+    // 一直接收，直到 <paramref name="req"/> 的正文到齐，并按
+    // 精确字节数写入 <c>req.body</c> / <c>req.bodyLength</c>。
+    // 返回 0 表示成功；返回 HTTP 状态码表示应当据此拒绝
+    // （413 超限、400 分块编码畸形）；返回 -1 表示对端在正文
+    // 中途关闭。分块编码在这里解码，解码后的正文与固定长度
+    // 正文一样，对处理器不可区分。
     async int ReadBody(HttpRequest req, int maxBodyBytes) {
         int he = req.bodyStart;
         if (req.chunked) {
@@ -240,9 +238,9 @@ class HttpFramer {
         return 0;
     }
 
-    /// <summary>响应体定界使用响应解析器，不能把状态行交给要求
-    /// request-target 与 Host 的 HttpRequest.Parse。ReadChunked 只借用
-    /// req 作为解码结果容器，不重新解析响应头。</summary>
+    // 响应体定界使用响应解析器，不能把状态行交给要求
+    // request-target 与 Host 的 HttpRequest.Parse。ReadChunked 只借用
+    // req 作为解码结果容器，不重新解析响应头。
     async int ReadResponseBody(HttpResponse response, int headerLen,
             int maxBodyBytes) {
         if (response.framingChunked) {
@@ -261,9 +259,9 @@ class HttpFramer {
         return 0;
     }
 
-    /// <summary>流式将请求体分块直接落盘，避免超大正文（如 GB 级上传）引发 OOM。
-    /// 支持 Content-Length 与 Transfer-Encoding: chunked 两大传输定界，
-    /// 内存仅占用当前分块缓冲区（<=64KB），落盘完成后保留后续流水线请求字节。</summary>
+    // 流式将请求体分块直接落盘，避免超大正文（如 GB 级上传）引发 OOM。
+    // 支持 Content-Length 与 Transfer-Encoding: chunked 两大传输定界，
+    // 内存仅占用当前分块缓冲区（<=64KB），落盘完成后保留后续流水线请求字节。
     async int SaveBodyToFile(HttpRequest req, string filePath, int maxBytes) {
         if (req.chunked) {
             return await this.SaveChunkedBodyToFile(req, filePath, maxBytes);
@@ -322,8 +320,8 @@ class HttpFramer {
         return 0;
     }
 
-    /// <summary>流式将 chunked 编码的请求体直接落盘，避免超大 chunked 正文占用堆内存。
-    /// 每解码一个 chunk 直接写盘并 Discard，内存恒定在当前 chunk 大小以内。</summary>
+    // 流式将 chunked 编码的请求体直接落盘，避免超大 chunked 正文占用堆内存。
+    // 每解码一个 chunk 直接写盘并 Discard，内存恒定在当前 chunk 大小以内。
     async int SaveChunkedBodyToFile(HttpRequest req, string filePath, int maxBytes) {
         int pos = req.bodyStart;
         int decoded = 0;
@@ -435,26 +433,26 @@ class HttpFramer {
         return 0;
     }
 
-    /// <summary>本请求在线路上占用的字节数（头部 + 正文，分块编码则
-    /// 是整个分块序列）。<see cref="Consume"/> 用它精确丢弃，
-    /// 缓冲区里剩下的字节属于下一条流水线请求。</summary>
+    // 本请求在线路上占用的字节数（头部 + 正文，分块编码则
+    // 是整个分块序列）。<see cref="Consume"/> 用它精确丢弃，
+    // 缓冲区里剩下的字节属于下一条流水线请求。
     int RequestBytes() { return this.wireBytes; }
 
-    /// <summary>丢弃已处理请求的字节，保留其后的流水线字节。</summary>
+    // 丢弃已处理请求的字节，保留其后的流水线字节。
     void Consume(int count) {
         this.pend.Discard(count);
         this.scanned = 0;
     }
 
-    /// <summary>解码 Transfer-Encoding: chunked 的请求体。
-    /// 逐块读取 "长度(十六进制)[;扩展]CRLF 数据 CRLF"，直到长度为 0 的
-    /// 结束块，其后的尾部头部（trailer）一并跳过。解码结果按字节
-    /// 累积，因此块里的 NUL 不会截断正文；累计长度超过
-    /// <paramref name="maxBodyBytes"/> 立即拒绝，避免用无限多个小块
-    /// 撑爆内存。畸形的长度行按 400 拒绝——不能猜，猜错就等于把
-    /// 剩余字节当成下一条请求（走私）。等待 LF 的字节同样有上限
-    /// （8KB）：一条不终止的"长度行"不计入正文限额，若无上限，
-    /// 单条连接就能把待处理缓冲喂到任意大小。</summary>
+    // 解码 Transfer-Encoding: chunked 的请求体。
+    // 逐块读取 "长度(十六进制)[;扩展]CRLF 数据 CRLF"，直到长度为 0 的
+    // 结束块，其后的尾部头部（trailer）一并跳过。解码结果按字节
+    // 累积，因此块里的 NUL 不会截断正文；累计长度超过
+    // <paramref name="maxBodyBytes"/> 立即拒绝，避免用无限多个小块
+    // 撑爆内存。畸形的长度行按 400 拒绝——不能猜，猜错就等于把
+    // 剩余字节当成下一条请求（走私）。等待 LF 的字节同样有上限
+    // （8KB）：一条不终止的"长度行"不计入正文限额，若无上限，
+    // 单条连接就能把待处理缓冲喂到任意大小。
     async int ReadChunkedBody(HttpRequest req, HttpResponse response, int he,
             int maxBodyBytes) {
         ByteBuffer acc = ByteBuffer.Alloc(4096);
@@ -559,8 +557,8 @@ class HttpFramer {
         return 0;
     }
 
-    /// <summary>跳过结束块之后的 trailer 头部，返回其后的线路下标；
-    /// 对端中途关闭返回 -1，行或累计长度超过 8KB 返回 -2。</summary>
+    // 跳过结束块之后的 trailer 头部，返回其后的线路下标；
+    // 对端中途关闭返回 -1，行或累计长度超过 8KB 返回 -2。
     async int SkipTrailer(int from) {
         int pos = from;
         while (true) {
@@ -582,7 +580,7 @@ class HttpFramer {
         return pos;
     }
 
-    /// <summary>从 <paramref name="from"/> 起第一个 LF 的下标，没有则 -1。</summary>
+    // 从 <paramref name="from"/> 起第一个 LF 的下标，没有则 -1。
     int IndexOfLf(int from) {
         int len = this.pend.Length();
         for (int i = from; i < len; i = i + 1) {
@@ -591,7 +589,7 @@ class HttpFramer {
         return -1;
     }
 
-    /// <summary>十六进制字符的数值；非十六进制字符返回 -1。</summary>
+    // 十六进制字符的数值；非十六进制字符返回 -1。
     static int HexVal(int c) {
         if (c >= 48 && c <= 57) { return c - 48; }
         if (c >= 97 && c <= 102) { return c - 87; }
@@ -599,8 +597,8 @@ class HttpFramer {
         return -1;
     }
 
-    /// <summary>归还接收缓冲区并释放待处理缓冲区。连接关闭时调用；
-    /// 之后不得再使用本拆包器。</summary>
+    // 归还接收缓冲区并释放待处理缓冲区。连接关闭时调用；
+    // 之后不得再使用本拆包器。
     void Dispose() {
         if (this.buf != null) {
             TcpClient.ReturnRecvBuffer(this.buf, this.bufCap);

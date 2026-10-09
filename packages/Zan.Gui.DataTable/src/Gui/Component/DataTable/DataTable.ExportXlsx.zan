@@ -6,38 +6,34 @@ using Gui.Component.DataTable;
 
 namespace Gui.Component.DataTable;
 
-/// <summary>
-/// DataTable 的 XLSX 导出支路：XlsxRowSource 适配器与 xlsx 写盘核心。
-/// 单独成文件是发布体积治理的一环——XlsxBook/Deflate/Zip 流式写盘
-/// 家族（~770 行 + Compression 依赖）只有真的导出 Excel 的程序才
-/// 需要；CSV 支路只要 StreamWriter。与按需拉取的 GridImageSlot 同一
-/// 机理：partial 家族的分片随 "DataTable" 名字整体拉入，本文件
-/// 绝不能声明 partial DataTable（类名一进 top 名单，家族触发词
-/// 就把 Xlsx 拖回每个放表格的程序），写盘核心改挂独立类
-/// DataTableXlsx；ExportJob.Worker 的分派行是唯一反向引用——
-/// 未拉入本文件时那行代码不可达，但按需拉取按名计数，所以
-/// Worker 只拼 ExportJob/ExportCsvSnapshot（主文件），xlsx 分派
-/// 经 DataTableXlsx.ExportSnapshot 二跳。VM 契约：本文件被拉入
-/// 的前提是有人真的导出 xlsx，此刻家族必然完整在图。
-/// </summary>
+// DataTable 的 XLSX 导出支路：XlsxRowSource 适配器与 xlsx 写盘核心。
+// 单独成文件是发布体积治理的一环——XlsxBook/Deflate/Zip 流式写盘
+// 家族（~770 行 + Compression 依赖）只有真的导出 Excel 的程序才
+// 需要；CSV 支路只要 StreamWriter。与按需拉取的 GridImageSlot 同一
+// 机理：partial 家族的分片随 "DataTable" 名字整体拉入，本文件
+// 绝不能声明 partial DataTable（类名一进 top 名单，家族触发词
+// 就把 Xlsx 拖回每个放表格的程序），写盘核心改挂独立类
+// DataTableXlsx；ExportJob.Worker 的分派行是唯一反向引用——
+// 未拉入本文件时那行代码不可达，但按需拉取按名计数，所以
+// Worker 只拼 ExportJob/ExportCsvSnapshot（主文件），xlsx 分派
+// 经 DataTableXlsx.ExportSnapshot 二跳。VM 契约：本文件被拉入
+// 的前提是有人真的导出 xlsx，此刻家族必然完整在图。
 
-/// <summary>
-/// <see cref="XlsxRowSource"/> 适配器：把快照 + DataSource 逐行喂给
-/// 流式写盘。排序/过滤/勾选状态已在快照里冻结（所见即所得）；
-/// CellText/CellNum 等直接读应用侧数据源——导出期间应用不应改写
-/// 数据源内容（行数上限 1048576 由 XlsxBook 自动分表兜住）。
-/// </summary>
+// <see cref="XlsxRowSource"/> 适配器：把快照 + DataSource 逐行喂给
+// 流式写盘。排序/过滤/勾选状态已在快照里冻结（所见即所得）；
+// CellText/CellNum 等直接读应用侧数据源——导出期间应用不应改写
+// 数据源内容（行数上限 1048576 由 XlsxBook 自动分表兜住）。
 class DataTableRowSource : XlsxRowSource {
     public DataSource src;
     public List<DataColumn> cols;
     public DataTableExportSnapshot snap;
     public DataTableExportProgress progress;
 
-    /// 行数 = 快照行数 + 1（表头行）。
+    // 行数 = 快照行数 + 1（表头行）。
     override int RowCount() { return this.snap.rows.Count + 1; }
 
-    /// index 0 写表头（快照列区间内的列标题），其余按快照行序
-    /// 逐格写出数据行。
+    // index 0 写表头（快照列区间内的列标题），其余按快照行序
+    // 逐格写出数据行。
     override bool FillRow(int index, List<XlsxCell> row) {
         if (index == 0) {
             for (int cc = this.snap.c0; cc <= this.snap.c1; cc = cc + 1) {
@@ -52,51 +48,49 @@ class DataTableRowSource : XlsxRowSource {
         return true;
     }
 
-    /// 把写盘进度转发给调用方钩子；未挂接 progress 时忽略。
+    // 把写盘进度转发给调用方钩子；未挂接 progress 时忽略。
     override void OnProgress(int done, int total) {
         if (this.progress != null) { this.progress.OnProgress(done, total); }
     }
 
-    /// 把取消询问转发给调用方钩子；未挂接 progress 时恒不取消。
+    // 把取消询问转发给调用方钩子；未挂接 progress 时恒不取消。
     override bool Cancelled() {
         return this.progress != null && this.progress.Cancelled();
     }
 }
 
-/// xlsx 写盘核心与带弹层的导出入口（原 DataTable partial 的
-/// XLSX 支路，见文件头）。
+// xlsx 写盘核心与带弹层的导出入口（原 DataTable partial 的
+// XLSX 支路，见文件头）。
 class DataTableXlsx {
 
-    /// 装配 xlsx 弹层导出口（把本类的 ExportToXlsxAsyncUi 挂进
-    /// DataTable.sXlsxExportUi 槽）。需要 Excel 导出的宿主（或测试）
-    /// 调一次本方法——按需拉取按名计数，这一拼就把本文件连同
-    /// XlsxBook/Zip/Deflate 写盘家族拉进图；不调用的程序整支裁掉。
+    // 装配 xlsx 弹层导出口（把本类的 ExportToXlsxAsyncUi 挂进
+    // DataTable.sXlsxExportUi 槽）。需要 Excel 导出的宿主（或测试）
+    // 调一次本方法——按需拉取按名计数，这一拼就把本文件连同
+    // XlsxBook/Zip/Deflate 写盘家族拉进图；不调用的程序整支裁掉。
     static void InstallExportUi() {
         DataTable.InstallXlsxExportUi(DataTableXlsx.ExportToXlsxAsyncUi);
     }
 
-    /// 异步导出 .xlsx 并显示居中进度弹层（含取消/关闭）。行选择
-    /// 与快照语义与 <see cref="DataTable.ExportToCsvAsync"/> 完全
-    /// 一致。返回 false（无可导内容或已有导出在运行）时弹层仍会
-    /// 显示失败原因，点关闭收起。弹层本体（DataTableExportUi/
-    /// Progress/SyncUi）在 DataTable.ExportUi.zan——本文件被拉入
-    /// 的前提是有人真的点了 Excel 导出（Overlays 菜单项先经
-    /// DataTable.sXlsxExportUi 槽查装配），那时弹层文件必然在图。
+    // 异步导出 .xlsx 并显示居中进度弹层（含取消/关闭）。行选择
+    // 与快照语义与 <see cref="DataTable.ExportToCsvAsync"/> 完全
+    // 一致。返回 false（无可导内容或已有导出在运行）时弹层仍会
+    // 显示失败原因，点关闭收起。弹层本体（DataTableExportUi/
+    // Progress/SyncUi）在 DataTable.ExportUi.zan——本文件被拉入
+    // 的前提是有人真的点了 Excel 导出（Overlays 菜单项先经
+    // DataTable.sXlsxExportUi 槽查装配），那时弹层文件必然在图。
     static bool ExportToXlsxAsyncUi(App app, DataTableState st, List<DataColumn> cols,
                                     DataSource src, string path, bool selectionOnly) {
         DataTableUiExportProgress prog = new DataTableUiExportProgress();
         return DataTableXlsx.ExportToXlsxAsync(st, cols, src, path, selectionOnly, prog);
     }
 
-    /// <summary>
-    /// 异步导出为 .xlsx：立即返回 true 表示任务已启动，写盘在后台
-    /// 线程上流式进行。行集/列区间在本调用内（当前线程）冻结成
-    /// 快照——之后表格的排序、过滤、勾选变化不影响本次导出；数据
-    /// 源内容本身请保持只读。进度/取消经 `progress` 回调（在后台
-    /// 线程上发生，UI 更新用 App.Post 切回），结束时必有一次
-    /// OnDone。返回 false：已有导出在运行（并回调
-    /// OnDone(false, "已有导出在运行")）或无可导内容（不回调）。
-    /// </summary>
+    // 异步导出为 .xlsx：立即返回 true 表示任务已启动，写盘在后台
+    // 线程上流式进行。行集/列区间在本调用内（当前线程）冻结成
+    // 快照——之后表格的排序、过滤、勾选变化不影响本次导出；数据
+    // 源内容本身请保持只读。进度/取消经 `progress` 回调（在后台
+    // 线程上发生，UI 更新用 App.Post 切回），结束时必有一次
+    // OnDone。返回 false：已有导出在运行（并回调
+    // OnDone(false, "已有导出在运行")）或无可导内容（不回调）。
     static bool ExportToXlsxAsync(DataTableState st, List<DataColumn> cols,
                                   DataSource src, string path, bool selectionOnly,
                                   DataTableExportProgress progress) {
@@ -127,8 +121,8 @@ class DataTableXlsx {
         return true;
     }
 
-    /// xlsx 写盘核心（同步与后台线程共用）。progress 为 null 表示
-    /// 不需要进度/取消。返回 false = 取消或写盘失败。
+    // xlsx 写盘核心（同步与后台线程共用）。progress 为 null 表示
+    // 不需要进度/取消。返回 false = 取消或写盘失败。
     static bool ExportXlsxSnapshot(DataTableExportSnapshot snap, List<DataColumn> cols,
                                    DataSource src, string path,
                                    DataTableExportProgress progress) {
@@ -155,9 +149,9 @@ class DataTableXlsx {
         return ok;
     }
 
-    /// 单元格 → xlsx 值：按列声明的类型键取数（与排序/汇总走的
-    /// 是同一条路径，导出与表格显示不会各说各话）。
-    /// 空单元格返回 null（写出时跳过）。计算列导出公式实数。
+    // 单元格 → xlsx 值：按列声明的类型键取数（与排序/汇总走的
+    // 是同一条路径，导出与表格显示不会各说各话）。
+    // 空单元格返回 null（写出时跳过）。计算列导出公式实数。
     static XlsxCell ExportCell(int ci, List<DataColumn> cols, DataColumn col,
                                DataSource src, int row) {
         // 计算列：优先按公式值取数（失败行显示空，跳过）。

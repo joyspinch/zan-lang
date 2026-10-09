@@ -3,42 +3,38 @@ using System.Threading;
 
 namespace System.Data;
 
-/// <summary>
-/// 与驱动无关、支持协程的连接池。
-/// 连接通过 <see cref="IDbConnector"/> 惰性打开，最多
-/// <c>maxSize</c> 个，并在协程间复用。当所有连接
-/// 都被借出且达到上限时，<see cref="AcquireAsync"/> 会挂起
-/// 调用协程，等待基于事件的 <see cref="Gate"/>（无轮询、无
-/// 定时器），而不是阻塞工作线程；一旦有连接
-/// 通过 <see cref="Release"/> 归还便立即恢复。已失效的连接
-/// 会被逐出而非回收，把名额让给等待者。
-/// 连接池的共享状态（空闲/借出列表）由 <see cref="PoolCore"/>
-/// 管理：池可能被不同 worker 线程上的协程同时访问，
-/// 每处访问都必须在锁内进行——早期版本假设"只在 await
-/// 之间访问、无需加锁"，在多 worker 下导致过真实崩溃。
-/// 用法：
-/// 核心契约与语义定义。
-/// 核心契约与语义定义。
-/// 核心契约与语义定义。
-/// pool.Release(db);
-/// pool.Close();
-/// 查询本身即为协程的驱动（MySQL、PostgreSQL）还提供
-/// 类型化连接池——<c>MySqlPool</c>、<c>PgPool</c>——返回
-/// 具体连接类型，使 <c>QueryAsync</c> 仍可调用。
-/// </summary>
+// 与驱动无关、支持协程的连接池。
+// 连接通过 <see cref="IDbConnector"/> 惰性打开，最多
+// <c>maxSize</c> 个，并在协程间复用。当所有连接
+// 都被借出且达到上限时，<see cref="AcquireAsync"/> 会挂起
+// 调用协程，等待基于事件的 <see cref="Gate"/>（无轮询、无
+// 定时器），而不是阻塞工作线程；一旦有连接
+// 通过 <see cref="Release"/> 归还便立即恢复。已失效的连接
+// 会被逐出而非回收，把名额让给等待者。
+// 连接池的共享状态（空闲/借出列表）由 <see cref="PoolCore"/>
+// 管理：池可能被不同 worker 线程上的协程同时访问，
+// 每处访问都必须在锁内进行——早期版本假设"只在 await
+// 之间访问、无需加锁"，在多 worker 下导致过真实崩溃。
+// 用法：
+// 核心契约与语义定义。
+// pool.Release(db);
+// pool.Close();
+// 查询本身即为协程的驱动（MySQL、PostgreSQL）还提供
+// 类型化连接池——<c>MySqlPool</c>、<c>PgPool</c>——返回
+// 具体连接类型，使 <c>QueryAsync</c> 仍可调用。
 class DbPool {
     IDbConnector connector;
     PoolCore<IDbConnection> core;
     string lastOpenError;
 
-    /// 由各 Connector 的 <c>Pool()</c> 工厂构造（构造器不公开）。
+    // 由各 Connector 的 <c>Pool()</c> 工厂构造（构造器不公开）。
     DbPool(IDbConnector connector, int maxSize) {
         this.connector = connector;
         this.core = new PoolCore<IDbConnection>(maxSize);
         this.lastOpenError = "";
     }
 
-    /// 经 connector 打开一个新连接。
+    // 经 connector 打开一个新连接。
     async IDbConnection OpenOne() {
         try {
             return await this.connector.ConnectAsync();
@@ -50,14 +46,14 @@ class DbPool {
         }
     }
 
-    /// <summary>借出一个连接：复用空闲连接，未达上限时新建，
-    /// 否则挂起协程直到有连接被释放。饱和等待有硬上限
-    /// （见 <see cref="PoolWait"/>）：超时返回 null，调用方按
-    /// 「数据库暂不可用」应答，绝不定死——任何「持着一条连接再等
-    /// 第二条」的嵌套租借缺陷只会退化成个别请求 503，而不是把整个
-    /// worker 拖成永久假死（实测教训：协程死锁时 CPU 空转、端口照收、
-    /// 全站无响应）。
-    /// 连接池关闭后同样返回 null。</summary>
+    // 借出一个连接：复用空闲连接，未达上限时新建，
+    // 否则挂起协程直到有连接被释放。饱和等待有硬上限
+    // （见 <see cref="PoolWait"/>）：超时返回 null，调用方按
+    // 「数据库暂不可用」应答，绝不定死——任何「持着一条连接再等
+    // 第二条」的嵌套租借缺陷只会退化成个别请求 503，而不是把整个
+    // worker 拖成永久假死（实测教训：协程死锁时 CPU 空转、端口照收、
+    // 全站无响应）。
+    // 连接池关闭后同样返回 null。
     async IDbConnection AcquireAsync() {
         PoolWait wait = new PoolWait();
         while (true) {
@@ -119,8 +115,8 @@ class DbPool {
         return null;
     }
 
-    /// <summary>将连接归还连接池。已损坏或 Close() 之后
-    /// 的连接会被关闭丢弃，不再入池。</summary>
+    // 将连接归还连接池。已损坏或 Close() 之后
+    // 的连接会被关闭丢弃，不再入池。
     void Release(IDbConnection c) {
         if (c == null) {
             return;
@@ -133,12 +129,12 @@ class DbPool {
         this.core.Pool(c);
     }
 
-    /// <summary>借出已空闲的连接而不挂起；没有空闲连接时
-    /// 返回 null。适用于同步调用点（非协程的钩子或
-    /// 解析器），且驱动 IO 本身是同步的；它从不新建连接，因为
-    /// 打开连接是协程操作，所以应在启动时用
-    /// <see cref="WarmupAsync"/> 预热连接池，并把 null 视为
-    /// "容量已耗尽"。归还方式与借出的连接相同。</summary>
+    // 借出已空闲的连接而不挂起；没有空闲连接时
+    // 返回 null。适用于同步调用点（非协程的钩子或
+    // 解析器），且驱动 IO 本身是同步的；它从不新建连接，因为
+    // 打开连接是协程操作，所以应在启动时用
+    // <see cref="WarmupAsync"/> 预热连接池，并把 null 视为
+    // "容量已耗尽"。归还方式与借出的连接相同。
     IDbConnection TryAcquire() {
         if (this.core.IsClosed()) {
             return null;
@@ -154,10 +150,10 @@ class DbPool {
         return null;
     }
 
-    /// <summary>最多打开 <paramref name="count"/> 个连接（上限为
-    /// maxSize）并停放，使首批请求——以及每次
-    /// <see cref="TryAcquire"/> 的调用方——都能拿到活跃连接。返回
-    /// 当前空闲的数量；数据库不可达时返回 0。</summary>
+    // 最多打开 <paramref name="count"/> 个连接（上限为
+    // maxSize）并停放，使首批请求——以及每次
+    // <see cref="TryAcquire"/> 的调用方——都能拿到活跃连接。返回
+    // 当前空闲的数量；数据库不可达时返回 0。
     async int WarmupAsync(int count) {
         int want = count;
         if (want > this.core.MaxSize()) { want = this.core.MaxSize(); }
@@ -175,38 +171,38 @@ class DbPool {
         return this.core.IdleCount();
     }
 
-    /// <summary>空闲（已入池、可即用）连接数。</summary>
+    // 空闲（已入池、可即用）连接数。
     int IdleCount() {
         return this.core.IdleCount();
     }
 
-    /// <summary>活跃连接总数（空闲 + 已借出）。</summary>
+    // 活跃连接总数（空闲 + 已借出）。
     int LiveCount() {
         return this.core.LiveCount();
     }
 
-    /// <summary>当前挂起等待连接的协程数。</summary>
+    // 当前挂起等待连接的协程数。
     int WaitingCount() {
         return this.core.WaitingCount();
     }
 
-    /// <summary>并发活跃连接的最大数量。</summary>
+    // 并发活跃连接的最大数量。
     int MaxSize() {
         return this.core.MaxSize();
     }
 
-    /// <summary><see cref="Close"/> 调用过后为 true。</summary>
+    // <see cref="Close"/> 调用过后为 true。
     bool IsClosed() {
         return this.core.IsClosed();
     }
 
-    /// <summary>此连接池服务的 <see cref="DbProvider"/> id。</summary>
+    // 此连接池服务的 <see cref="DbProvider"/> id。
     int GetProvider() {
         return this.connector.GetProvider();
     }
 
-    /// <summary>关闭所有空闲连接并将连接池标记为已关闭。仍
-    /// 被借出的连接会在归还时关闭。</summary>
+    // 关闭所有空闲连接并将连接池标记为已关闭。仍
+    // 被借出的连接会在归还时关闭。
     void Close() {
         this.core.MarkClosed();
         IDbConnection c = this.core.TakeIdle();

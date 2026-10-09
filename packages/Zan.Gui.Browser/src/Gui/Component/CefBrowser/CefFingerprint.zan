@@ -3,105 +3,95 @@ using System;
 
 namespace Gui.Component.CefBrowser;
 
-/// <summary>
-/// 浏览器指纹套用：UA 与 Client Hints 品牌、语言、时区、屏幕与 DPR、
-/// WebGL vendor/renderer、canvas 噪声，一次 <see cref="Apply"/> 全部生效。
-/// 分两条路子实现，都建在 <see cref="CefCdp"/> 上：
-/// 浏览器自己认的那几项（UA/Client Hints/时区/地区/屏幕/CPU 核数）走
-/// `Emulation` 域的 override —— 页面里读到的 `navigator.userAgent`、
-/// `Intl.DateTimeFormat().resolvedOptions().timeZone`、`screen.width` 全都跟着变，
-/// 请求头也跟着变；浏览器不给覆盖的那几项（`navigator.languages`、
-/// `deviceMemory`、`webdriver`、WebGL 型号串、canvas 像素）靠
-/// `Page.addScriptToEvaluateOnNewDocument` 在页面脚本之前打补丁。
-/// <code>
-/// CefFingerprint fp = web.Fingerprint();
-/// 核心契约与语义定义。
-/// 核心契约与语义定义。
-/// fp.locale = "zh-CN";  fp.acceptLanguage = "zh-CN,zh;q=0.9";
-/// fp.timezone = "Asia/Shanghai";
-/// fp.screenWidth = 1920;  fp.screenHeight = 1080;  fp.scalePercent = 100;
-/// 核心契约与语义定义。
-/// 核心契约与语义定义。
-/// fp.canvasNoise = 2;
-/// fp.Apply();
-/// web.Reload();          // 注入脚本对「下一个」文档生效，当前页要刷一下
-/// </code>
-/// 空字段 = 不动那一项，所以只想改 UA 就只填 <see cref="userAgent"/>。
-/// 改不了的：TLS/JA3（Chromium 内置栈）、真实 GPU 型号（要换
-/// `--use-angle=`）、系统字体列表（要么注入补丁，要么换 profile 字体目录）。
-/// </summary>
+// 浏览器指纹套用：UA 与 Client Hints 品牌、语言、时区、屏幕与 DPR、
+// WebGL vendor/renderer、canvas 噪声，一次 <see cref="Apply"/> 全部生效。
+// 分两条路子实现，都建在 <see cref="CefCdp"/> 上：
+// 浏览器自己认的那几项（UA/Client Hints/时区/地区/屏幕/CPU 核数）走
+// `Emulation` 域的 override —— 页面里读到的 `navigator.userAgent`、
+// `Intl.DateTimeFormat().resolvedOptions().timeZone`、`screen.width` 全都跟着变，
+// 请求头也跟着变；浏览器不给覆盖的那几项（`navigator.languages`、
+// `deviceMemory`、`webdriver`、WebGL 型号串、canvas 像素）靠
+// `Page.addScriptToEvaluateOnNewDocument` 在页面脚本之前打补丁。
+// <code>
+// CefFingerprint fp = web.Fingerprint();
+// 核心契约与语义定义。
+// fp.locale = "zh-CN";  fp.acceptLanguage = "zh-CN,zh;q=0.9";
+// fp.timezone = "Asia/Shanghai";
+// fp.screenWidth = 1920;  fp.screenHeight = 1080;  fp.scalePercent = 100;
+// 核心契约与语义定义。
+// fp.canvasNoise = 2;
+// fp.Apply();
+// web.Reload();          // 注入脚本对「下一个」文档生效，当前页要刷一下
+// </code>
+// 空字段 = 不动那一项，所以只想改 UA 就只填 <see cref="userAgent"/>。
+// 改不了的：TLS/JA3（Chromium 内置栈）、真实 GPU 型号（要换
+// `--use-angle=`）、系统字体列表（要么注入补丁，要么换 profile 字体目录）。
 class CefFingerprint {
     CefCdp cdp;
 
-    /// <summary>完整 UA 串；空 = 不改。</summary>
+    // 完整 UA 串；空 = 不改。
     string userAgent;
-    /// <summary>`Accept-Language` 请求头，如 `zh-CN,zh;q=0.9`；空 = 不改。</summary>
+    // `Accept-Language` 请求头，如 `zh-CN,zh;q=0.9`；空 = 不改。
     string acceptLanguage;
-    /// <summary>JS 侧地区（`navigator.language`、`Intl` 默认地区），如 `zh-CN`。
-    /// </summary>
+    // JS 侧地区（`navigator.language`、`Intl` 默认地区），如 `zh-CN`。
     string locale;
-    /// <summary>`navigator.languages` 列表；空表 = 用 <see cref="locale"/>。
-    /// </summary>
+    // `navigator.languages` 列表；空表 = 用 <see cref="locale"/>。
     List<string> languages;
-    /// <summary>IANA 时区名，如 `Asia/Shanghai`；空 = 不改。</summary>
+    // IANA 时区名，如 `Asia/Shanghai`；空 = 不改。
     string timezone;
 
-    /// <summary>Client Hints 平台名，如 `Windows`；空 = 不发 Client Hints。
-    /// </summary>
+    // Client Hints 平台名，如 `Windows`；空 = 不发 Client Hints。
     string platform;
-    /// <summary>Client Hints 平台版本，如 `15.0.0`（Win11）。</summary>
+    // Client Hints 平台版本，如 `15.0.0`（Win11）。
     string platformVersion;
-    /// <summary>Client Hints 品牌，如 `Google Chrome`。</summary>
+    // Client Hints 品牌，如 `Google Chrome`。
     string brand;
-    /// <summary>品牌主版本号，如 `151`。</summary>
+    // 品牌主版本号，如 `151`。
     string brandVersion;
-    /// <summary>品牌完整版本号，如 `151.0.7922.138`；空 = 用主版本号。</summary>
+    // 品牌完整版本号，如 `151.0.7922.138`；空 = 用主版本号。
     string brandFullVersion;
-    /// <summary>CPU 架构：`x86` / `arm`；空 = `x86`。</summary>
+    // CPU 架构：`x86` / `arm`；空 = `x86`。
     string architecture;
-    /// <summary>机型（移动端才有意义）。</summary>
+    // 机型（移动端才有意义）。
     string model;
-    /// <summary>移动标志（`navigator.userAgentData.mobile`、`Sec-CH-UA-Mobile`）。
-    /// </summary>
+    // 移动标志（`navigator.userAgentData.mobile`、`Sec-CH-UA-Mobile`）。
     bool mobile;
 
-    /// <summary>屏幕宽（CSS 像素）；0 = 不改屏幕。</summary>
+    // 屏幕宽（CSS 像素）；0 = 不改屏幕。
     int screenWidth;
-    /// <summary>屏幕高（CSS 像素）。</summary>
+    // 屏幕高（CSS 像素）。
     int screenHeight;
-    /// <summary>设备像素比 × 100（100 = 1.0，150 = 1.5）；0 = 用 100。</summary>
+    // 设备像素比 × 100（100 = 1.0，150 = 1.5）；0 = 用 100。
     int scalePercent;
 
-    /// <summary>`navigator.hardwareConcurrency`；0 = 不改。</summary>
+    // `navigator.hardwareConcurrency`；0 = 不改。
     int hardwareConcurrency;
-    /// <summary>`navigator.deviceMemory`（GB，2 的幂）；0 = 不改。</summary>
+    // `navigator.deviceMemory`（GB，2 的幂）；0 = 不改。
     int deviceMemory;
-    /// <summary>把 `navigator.webdriver` 抹成 false。</summary>
+    // 把 `navigator.webdriver` 抹成 false。
     bool hideWebdriver;
 
-    /// <summary>WebGL `UNMASKED_VENDOR_WEBGL` / `VENDOR`；空 = 不改。</summary>
+    // WebGL `UNMASKED_VENDOR_WEBGL` / `VENDOR`；空 = 不改。
     string webglVendor;
-    /// <summary>WebGL `UNMASKED_RENDERER_WEBGL` / `RENDERER`；空 = 不改。
-    /// </summary>
+    // WebGL `UNMASKED_RENDERER_WEBGL` / `RENDERER`；空 = 不改。
     string webglRenderer;
 
-    /// <summary>canvas 噪声幅度（每像素红色通道 ±n，1~8 足够打散哈希）；
-    /// 0 = 不加噪声。加了之后 `toDataURL`/`toBlob`/`getImageData` 拿到的像素每次
-    /// 都不同，代价是画布内容真的被改了一点。</summary>
+    // canvas 噪声幅度（每像素红色通道 ±n，1~8 足够打散哈希）；
+    // 0 = 不加噪声。加了之后 `toDataURL`/`toBlob`/`getImageData` 拿到的像素每次
+    // 都不同，代价是画布内容真的被改了一点。
     int canvasNoise;
-    /// <summary>噪声随机种子；0 = 用固定种子（同一指纹每次运行一致）。
-    /// </summary>
+    // 噪声随机种子；0 = 用固定种子（同一指纹每次运行一致）。
     int seed;
 
-    /// <summary>已注入脚本的标识（<see cref="Reset"/> 用来撤掉它）。</summary>
+    // 已注入脚本的标识（<see cref="Reset"/> 用来撤掉它）。
     string scriptId;
-    /// <summary>覆盖之前浏览器自己的 UA：CDP 没有「清除 UA 覆盖」这个命令，
-    /// 只能把原值再设回去，所以第一次 <see cref="Apply"/> 时先问一句
-    /// `Browser.getVersion` 记下来。</summary>
+    // 覆盖之前浏览器自己的 UA：CDP 没有「清除 UA 覆盖」这个命令，
+    // 只能把原值再设回去，所以第一次 <see cref="Apply"/> 时先问一句
+    // `Browser.getVersion` 记下来。
     string originalUa;
 
-    /// 构造全空的指纹：所有字段都是「不改」默认，由
-    /// <see cref="CefBrowser.Fingerprint"/> 创建。
+    // 构造全空的指纹：所有字段都是「不改」默认，由
+    // <see cref="CefBrowser.Fingerprint"/> 创建。
     CefFingerprint(CefCdp channel) {
         cdp = channel;
         userAgent = "";
@@ -131,10 +121,9 @@ class CefFingerprint {
         originalUa = "";
     }
 
-    /// <summary>一份桌面 Windows Chrome 的常见取值：调完再按需改字段。
-    /// <paramref name="version"/> 是 Chrome 完整版本号（如
-    /// `151.0.7922.138`），拿 <see cref="CefHost.ChromeVersion"/> 最省事。
-    /// </summary>
+    // 一份桌面 Windows Chrome 的常见取值：调完再按需改字段。
+    // <paramref name="version"/> 是 Chrome 完整版本号（如
+    // `151.0.7922.138`），拿 <see cref="CefHost.ChromeVersion"/> 最省事。
     void UseWindowsChrome(string version) {
         string major = CefFingerprint.Major(version);
         userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -149,8 +138,8 @@ class CefFingerprint {
         mobile = false;
     }
 
-    /// <summary>把当前字段套到浏览器上。`Emulation` 那几项立即生效，注入脚本
-    /// 对下一个文档生效（当前页要 <see cref="CefBrowser.Reload"/>）。</summary>
+    // 把当前字段套到浏览器上。`Emulation` 那几项立即生效，注入脚本
+    // 对下一个文档生效（当前页要 <see cref="CefBrowser.Reload"/>）。
     void Apply() {
         if (userAgent != "" && originalUa == "") {
             cdp.Send("Browser.getVersion", "{}",
@@ -201,8 +190,8 @@ class CefFingerprint {
         }
     }
 
-    /// <summary>撤掉 <see cref="Apply"/> 装上的东西（屏幕/UA/时区/地区 override
-    /// 与注入脚本）。已经加载的页面同样要刷一下才回原样。</summary>
+    // 撤掉 <see cref="Apply"/> 装上的东西（屏幕/UA/时区/地区 override
+    // 与注入脚本）。已经加载的页面同样要刷一下才回原样。
     void Reset() {
         cdp.Send("Emulation.clearDeviceMetricsOverride", "{}", null);
         // 时区给空串 = 撤掉覆盖；地区不带参数 = 回默认（这是 CDP 的约定，
@@ -229,9 +218,9 @@ class CefFingerprint {
 
     // 核心契约与执行状态转移规范。
 
-    /// 下发 UA 覆盖：带品牌/版本时走 `Emulation.setUserAgentOverride`
-    /// （随带 Client Hints 元数据），否则走 `Network.setUserAgentOverride`
-    /// 老接口。
+    // 下发 UA 覆盖：带品牌/版本时走 `Emulation.setUserAgentOverride`
+    // （随带 Client Hints 元数据），否则走 `Network.setUserAgentOverride`
+    // 老接口。
     void SendUserAgent() {
         JsonValue p = JsonValue.NewObject();
         p.PutStr("userAgent", userAgent);
@@ -248,9 +237,8 @@ class CefFingerprint {
         }
     }
 
-    /// <summary>Client Hints 元数据：品牌列表按 Chromium 的做法带上
-    /// `Chromium` 与 `Not.A/Brand` 两个同版本条目，只报一个品牌反而扎眼。
-    /// </summary>
+    // Client Hints 元数据：品牌列表按 Chromium 的做法带上
+    // `Chromium` 与 `Not.A/Brand` 两个同版本条目，只报一个品牌反而扎眼。
     string Metadata() {
         string full = brandFullVersion != "" ? brandFullVersion : brandVersion;
         JsonValue brands = JsonValue.NewArray();
@@ -293,8 +281,8 @@ class CefFingerprint {
 
     // ---- 注入脚本 ---------------------------------------------------------
 
-    /// <summary>要注入的补丁脚本（不需要补任何东西时是 ""）。补丁都在页面
-    /// 脚本之前跑，且每个新文档都跑一遍（iframe 也算）。</summary>
+    // 要注入的补丁脚本（不需要补任何东西时是 ""）。补丁都在页面
+    // 脚本之前跑，且每个新文档都跑一遍（iframe 也算）。
     string Script() {
         StringBuilder js = new StringBuilder();
         if (languages.Count > 0 || locale != "") { js.Append(LanguagesJs()); }
@@ -314,8 +302,8 @@ class CefFingerprint {
         return "(function(){" + js.ToString() + "})();";
     }
 
-    /// 补 `navigator.languages` 的脚本片段：有 languages 列表用列表，
-    /// 否则用单个 locale；getter 返回副本防外部改写。
+    // 补 `navigator.languages` 的脚本片段：有 languages 列表用列表，
+    // 否则用单个 locale；getter 返回副本防外部改写。
     string LanguagesJs() {
         JsonValue arr = JsonValue.NewArray();
         if (languages.Count > 0) {
@@ -328,9 +316,9 @@ class CefFingerprint {
             + "{get:function(){return L.slice();}});}catch(e){}";
     }
 
-    /// 补 WebGL vendor/renderer 的脚本片段：包住 1.x/2.x 两个上下文原型的
-    /// getParameter，debug 扩展（37445/37446）与标准（7936/7937）两套参数号
-    /// 都返回伪装值，其余参数透传原实现。
+    // 补 WebGL vendor/renderer 的脚本片段：包住 1.x/2.x 两个上下文原型的
+    // getParameter，debug 扩展（37445/37446）与标准（7936/7937）两套参数号
+    // 都返回伪装值，其余参数透传原实现。
     string WebglJs() {
         string v = webglVendor != "" ? webglVendor : "";
         string r = webglRenderer != "" ? webglRenderer : "";
@@ -355,9 +343,9 @@ class CefFingerprint {
         return js.ToString();
     }
 
-    /// canvas 噪声的脚本片段：以线性同余生成可复现伪随机数（不依赖
-    /// Math.random），包住 toDataURL/toBlob/getImageData，读像素前给红色
-    /// 通道加 ±N 抖动并钳制到 [0,255]。
+    // canvas 噪声的脚本片段：以线性同余生成可复现伪随机数（不依赖
+    // Math.random），包住 toDataURL/toBlob/getImageData，读像素前给红色
+    // 通道加 ±N 抖动并钳制到 [0,255]。
     string CanvasJs() {
         int s = seed > 0 ? seed : 20250816;
         StringBuilder js = new StringBuilder();
@@ -390,9 +378,8 @@ class CefFingerprint {
 
     // ---- 小工具 -----------------------------------------------------------
 
-    /// <summary>百分数转小数串：150 → `1.5`，100 → `1`，225 → `2.25`。
-    /// （拼 JSON 要的是字面量，浮点格式化的小数点在别的地区会变成逗号。）
-    /// </summary>
+    // 百分数转小数串：150 → `1.5`，100 → `1`，225 → `2.25`。
+    // （拼 JSON 要的是字面量，浮点格式化的小数点在别的地区会变成逗号。）
     static string Ratio(int percent) {
         int whole = percent / 100;
         int frac = percent % 100;
@@ -405,7 +392,7 @@ class CefFingerprint {
         return Convert.ToString(whole) + "." + f;
     }
 
-    /// <summary>取版本号的主版本段：`151.0.7922.138` → `151`。</summary>
+    // 取版本号的主版本段：`151.0.7922.138` → `151`。
     static string Major(string version) {
         for (int i = 0; i < version.Length; i = i + 1) {
             if ((version[i] & 255) == 46) { return version.Substring(0, i); }

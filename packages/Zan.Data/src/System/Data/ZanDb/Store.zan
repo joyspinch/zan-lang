@@ -6,56 +6,54 @@ namespace System.Data.ZanDb;
 
 delegate string StoreUpdater(string current);
 
-/// <summary>扫描回调：按 键序升序 收到每个存活键的最新值；
-/// 返回 false 早停。</summary>
+// 扫描回调：按 键序升序 收到每个存活键的最新值；
+// 返回 false 早停。
 delegate bool StoreVisit(string key, string val);
 
-/// <summary>裸扫描回调：收到零拷贝扫描行（值按块内偏移/长度/指针
-/// 暴露，Key()/Val() 才物化字符串）；返回 false 早停。</summary>
+// 裸扫描回调：收到零拷贝扫描行（值按块内偏移/长度/指针
+// 暴露，Key()/Val() 才物化字符串）；返回 false 早停。
 delegate bool ScanRowVisit(ScanRow row);
 
-/// <summary>
-/// 扫描行视图：<see cref="ZanStore.ScanRows"/> 回调参数。值默认
-/// 零拷贝——按块内偏移/长度/指针暴露，调用 Key()/Val() 才物化
-/// 字符串（同一行内缓存，推进到下一行自动失效）。多源归并退化
-/// 路径（memtable 有未固化数据）时 <see cref="Block"/> 为 null，
-/// 键值直接以字符串给出。行数据仅在回调返回前有效。
-/// </summary>
+// 扫描行视图：<see cref="ZanStore.ScanRows"/> 回调参数。值默认
+// 零拷贝——按块内偏移/长度/指针暴露，调用 Key()/Val() 才物化
+// 字符串（同一行内缓存，推进到下一行自动失效）。多源归并退化
+// 路径（memtable 有未固化数据）时 <see cref="Block"/> 为 null，
+// 键值直接以字符串给出。行数据仅在回调返回前有效。
 class ScanRow {
     SegCursor cur;
     string memKey;
     string memVal;
 
-    /// 绑定到段游标当前记录（零拷贝模式）。
+    // 绑定到段游标当前记录（零拷贝模式）。
     void Bind(SegCursor c) {
         this.cur = c;
         this.memKey = "";
         this.memVal = "";
     }
 
-    /// 绑定到一对字符串（多源归并退化模式）。
+    // 绑定到一对字符串（多源归并退化模式）。
     void BindMem(string k, string v) {
         this.cur = null;
         this.memKey = k;
         this.memVal = v;
     }
 
-    /// 当前行的键（惰性物化，行内缓存；退化模式直接给字符串）。
+    // 当前行的键（惰性物化，行内缓存；退化模式直接给字符串）。
     string Key() { return this.cur != null ? this.cur.Key() : this.memKey; }
 
-    /// 当前行的值字符串（惰性物化，行内缓存）。
+    // 当前行的值字符串（惰性物化，行内缓存）。
     string Val() { return this.cur != null ? this.cur.Val() : this.memVal; }
 
-    /// 值所在块缓冲；退化模式下为 null，调用方须走字符串路径。
+    // 值所在块缓冲；退化模式下为 null，调用方须走字符串路径。
     ByteBuffer Block() { return this.cur != null ? this.cur.Block() : null; }
 
-    /// 值在块内的起始偏移（退化模式无意义）。
+    // 值在块内的起始偏移（退化模式无意义）。
     int ValOff() { return this.cur != null ? this.cur.ValOff() : 0; }
 
-    /// 值的字节长度。
+    // 值的字节长度。
     int ValLen() { return this.cur != null ? this.cur.ValLen() : 0; }
 
-    /// 值字节的裸指针（等于 Block().Raw() + ValOff()）。
+    // 值字节的裸指针（等于 Block().Raw() + ValOff()）。
     nint ValPtr() {
         if (this.cur == null) { return 0; }
         ByteBuffer b = this.cur.Block();
@@ -64,19 +62,17 @@ class ScanRow {
     }
 }
 
-/// <summary>
-/// 聚合内核回调：块级扫描按记录粒度交付（op=1 的存活 put），
-/// 键/值以（缓冲裸指针 + 偏移 + 长度）零拷贝给出——同一缓冲跨
-/// 块复用、回调期间有效。返回 false 早停整个扫描。
-/// </summary>
+// 聚合内核回调：块级扫描按记录粒度交付（op=1 的存活 put），
+// 键/值以（缓冲裸指针 + 偏移 + 长度）零拷贝给出——同一缓冲跨
+// 块复用、回调期间有效。返回 false 早停整个扫描。
 delegate bool KernelVisit(nint basePtr, int keyOff, int keyLen, int valOff, int valLen);
 
-/// <summary>覆盖索引内核回调：索引条目键以（缓冲裸指针 + 偏移 +
-/// 长度）零拷贝交付，id 段固定在键尾 6 字节；缓冲跨跨度复用、
-/// 回调期间有效。返回 false 早停。</summary>
+// 覆盖索引内核回调：索引条目键以（缓冲裸指针 + 偏移 +
+// 长度）零拷贝交付，id 段固定在键尾 6 字节；缓冲跨跨度复用、
+// 回调期间有效。返回 false 早停。
 delegate bool KernelKeyVisit(nint basePtr, int keyOff, int keyLen);
 
-/// 段句柄：段文件与其全局段号的配对。
+// 段句柄：段文件与其全局段号的配对。
 class SegRef {
     SegmentFile seg;
     long id;
@@ -87,37 +83,35 @@ class SegRef {
     }
 }
 
-/// <summary>
-/// 日志式键值存储：memtable + 不可变有序段 + 追加日志 + 双槽清单。
-/// 写路径：追加 CRC 帧日志（组提交）+ 更新 memtable；日志攒到
-/// 阈值（默认 64MB，可调）把 memtable 排序固化为新段、保存
-/// manifest、截断日志。读路径：memtable → 内存索引（键 → 段号）
-/// → 目标段的块（有界块缓存，O(1) 点读）。恢复：逐段顺序扫描
-/// 重建索引（Bitcask 式，纯顺序读）+ 重放日志中 seq ≥ 水位的
-/// 尾部——「manifest 已存、日志未截断」的崩溃窗口由水位跳过。
-/// 内存有界：memtable ≤ 阈值，块缓存有硬上限；常驻索引每键
-/// 只有哈希项 + 4 字节段号。
-/// 记录帧、持久化三档、NUL-free 契约、单进程单写多读模型
-/// 与异步 API 的说明见各类注释（LogFile / Segment / Manifest）。
-/// </summary>
+// 日志式键值存储：memtable + 不可变有序段 + 追加日志 + 双槽清单。
+// 写路径：追加 CRC 帧日志（组提交）+ 更新 memtable；日志攒到
+// 阈值（默认 64MB，可调）把 memtable 排序固化为新段、保存
+// manifest、截断日志。读路径：memtable → 内存索引（键 → 段号）
+// → 目标段的块（有界块缓存，O(1) 点读）。恢复：逐段顺序扫描
+// 重建索引（Bitcask 式，纯顺序读）+ 重放日志中 seq ≥ 水位的
+// 尾部——「manifest 已存、日志未截断」的崩溃窗口由水位跳过。
+// 内存有界：memtable ≤ 阈值，块缓存有硬上限；常驻索引每键
+// 只有哈希项 + 4 字节段号。
+// 记录帧、持久化三档、NUL-free 契约、单进程单写多读模型
+// 与异步 API 的说明见各类注释（LogFile / Segment / Manifest）。
 class ZanStore {
-    /// 每次提交都 fsync。
+    // 每次提交都 fsync。
     static int DUR_SYNC = 0;
-    /// 分组提交：按次数/字节数窗口 fsync。
+    // 分组提交：按次数/字节数窗口 fsync。
     static int DUR_GROUP = 1;
-    /// 只在 Checkpoint/Close 与缓冲攒满时落盘。
+    // 只在 Checkpoint/Close 与缓冲攒满时落盘。
     static int DUR_NONE = 2;
 
-    /// GROUP 档攒满这么多字节提前 fsync。
+    // GROUP 档攒满这么多字节提前 fsync。
     static int GROUP_FLUSH_BYTES = 524288;
-    /// NONE 档攒满这么多字节强制 flush 进 OS 缓存。
+    // NONE 档攒满这么多字节强制 flush 进 OS 缓存。
     static int NONE_FLUSH_BYTES = 1048576;
-    /// 默认 memtable/日志 flush 阈值（字节）。
+    // 默认 memtable/日志 flush 阈值（字节）。
     static long DEFAULT_FLUSH_THRESHOLD = 67108864;
-    /// 默认块缓存上限（字节）。
+    // 默认块缓存上限（字节）。
     static long DEFAULT_CACHE_CAP = 33554432;
-    /// 块级内核的读跨度（字节）：一次 ReadAt 摊掉这么多的逐块
-    /// 系统调用——扫描/聚合路径的 IO 下限由它决定。
+    // 块级内核的读跨度（字节）：一次 ReadAt 摊掉这么多的逐块
+    // 系统调用——扫描/聚合路径的 IO 下限由它决定。
     static int KERNEL_SPAN_BYTES = 262144;
 
     LogFile log;
@@ -145,13 +139,13 @@ class ZanStore {
     static int BATCH_HEADER_LEN = 17;
     Dictionary<string, string> txPut;
     Dictionary<string, string> txDel;
-    /// <summary>未固化墓碑：删掉的键在旧段里仍有旧版本，固化时
-    /// 必须把 op=2 记录写进新段压住它们，否则恢复扫描会让已删
-    /// 键复活（旧段版本重指索引）。</summary>
+    // 未固化墓碑：删掉的键在旧段里仍有旧版本，固化时
+    // 必须把 op=2 记录写进新段压住它们，否则恢复扫描会让已删
+    // 键复活（旧段版本重指索引）。
     Dictionary<string, long> tombstones;
-    /// <summary>自动增量归并阈值：固化后段数 ≥ autoMergeAt 时就地
-    /// 归并 autoMergeK 个最老段。0 = 关闭（默认）——归并代价显式
-    /// 交还调用方，自动策略只应被明确开启。</summary>
+    // 自动增量归并阈值：固化后段数 ≥ autoMergeAt 时就地
+    // 归并 autoMergeK 个最老段。0 = 关闭（默认）——归并代价显式
+    // 交还调用方，自动策略只应被明确开启。
     int autoMergeAt;
     int autoMergeK;
     string lastError;
@@ -188,14 +182,14 @@ class ZanStore {
         return basePath + ".s" + Convert.ToString(id);
     }
 
-    /// <summary>打开（必要时创建）分组提交档的存储。</summary>
+    // 打开（必要时创建）分组提交档的存储。
     static ZanStore Open(string path) {
         return ZanStore.Open(path, ZanStore.DUR_GROUP);
     }
 
-    /// <summary>先取得持久 .lock 文件的系统锁，再打开 WAL/清单/段。
-    /// Path.Normalize 只统一分隔符；调用者必须使用同一规范路径，不能
-    /// 用符号链接、硬链接或不同目录别名指向同一 WAL。锁文件不删除。</summary>
+    // 先取得持久 .lock 文件的系统锁，再打开 WAL/清单/段。
+    // Path.Normalize 只统一分隔符；调用者必须使用同一规范路径，不能
+    // 用符号链接、硬链接或不同目录别名指向同一 WAL。锁文件不删除。
     static ZanStore Open(string path, int durability) {
         ZanStore s = new ZanStore();
         s.durability = durability;
@@ -248,8 +242,8 @@ class ZanStore {
         return s;
     }
 
-    /// 恢复扫描回调：段内记录重指索引（段按号升序扫描，
-    /// 后段覆盖前段；墓碑摘除索引，为合并输出预留）。
+    // 恢复扫描回调：段内记录重指索引（段按号升序扫描，
+    // 后段覆盖前段；墓碑摘除索引，为合并输出预留）。
     bool RecoverRecord(string key, string val, int op) {
         if (op == 2) {
             if (this.index.ContainsKey(key)) { this.index.Remove(key); }
@@ -260,8 +254,8 @@ class ZanStore {
         return true;
     }
 
-    /// 不物化字符串地验证完整长度，避免 ReadString 的 long→int
-    /// 转换吞掉恶意高位；合法帧的长度前缀最多需要 5 个字节。
+    // 不物化字符串地验证完整长度，避免 ReadString 的 long→int
+    // 转换吞掉恶意高位；合法帧的长度前缀最多需要 5 个字节。
     static bool SkipWalString(ByteBuffer b) {
         int at = b.ReadPos();
         int next = at;
@@ -271,7 +265,7 @@ class ZanStore {
         return true;
     }
 
-    /// 校验全部记录后才允许应用，CRC 有效并不等于载荷有效。
+    // 校验全部记录后才允许应用，CRC 有效并不等于载荷有效。
     static bool ValidFrame(ByteBuffer b) {
         b.SeekRead(0);
         if (!b.CanRead(9)) { return false; }
@@ -297,8 +291,8 @@ class ZanStore {
         return b.Remaining() == 0;
     }
 
-    /// 新格式：seq:u64, op=3:u8, version:u32, count:u32，随后每条
-    /// op:u8 + WriteString(key)，put 再跟 WriteString(val)。旧 op1/2 兼容。
+    // 新格式：seq:u64, op=3:u8, version:u32, count:u32，随后每条
+    // op:u8 + WriteString(key)，put 再跟 WriteString(val)。旧 op1/2 兼容。
     bool ApplyFrame(ByteBuffer b) {
         if (!ZanStore.ValidFrame(b)) {
             this.lastError = "invalid WAL record or batch";
@@ -338,17 +332,17 @@ class ZanStore {
         return !this.closed && this.lastError == "" && this.log != null && this.log.IsOpen();
     }
 
-    /// 打开/读写/维护失败的诊断；失败句柄不再接收写入。
+    // 打开/读写/维护失败的诊断；失败句柄不再接收写入。
     string GetError() { return this.lastError; }
 
-    /// 已提交版本：每个非空外层批次只推进一次，回滚不推进。
+    // 已提交版本：每个非空外层批次只推进一次，回滚不推进。
     long Version() { return this.seq; }
     long GetRevision() { return this.seq; }
     bool InTransaction() { return this.txDepth > 0; }
-    /// 缓存失效代数：外层提交及回滚后改变；事务中读缓存应禁用。
+    // 缓存失效代数：外层提交及回滚后改变；事务中读缓存应禁用。
     long CacheVersion() { return this.cacheEpoch; }
 
-    /// 键值对总数：索引（已落段）+ memtable 中尚未落段的新键。
+    // 键值对总数：索引（已落段）+ memtable 中尚未落段的新键。
     int Count() {
         if (!this.IsOpen()) { return 0; }
         int n = this.index.Count;
@@ -359,41 +353,41 @@ class ZanStore {
         return n;
     }
 
-    /// 已固化段的数量。
+    // 已固化段的数量。
     int SegCount() { return this.segs.Count; }
 
-    /// 日志逻辑大小（字节）：0 表示全部数据已在段里。
+    // 日志逻辑大小（字节）：0 表示全部数据已在段里。
     long LogBytes() { return this.log != null ? this.log.Size() : -1; }
 
-    /// 切换持久化档（立即生效）。
+    // 切换持久化档（立即生效）。
     void SetDurability(int d) { this.durability = d; }
 
-    /// <summary>GROUP 档的 fsync 窗口：N = 每 N 次提交至多
-    /// 一次 fsync（攒满 <see cref="GROUP_FLUSH_BYTES"/> 字节会提前）。</summary>
+    // GROUP 档的 fsync 窗口：N = 每 N 次提交至多
+    // 一次 fsync（攒满 <see cref="GROUP_FLUSH_BYTES"/> 字节会提前）。
     void SetSyncEvery(int n) {
         if (n >= 1) { this.syncEvery = n; }
     }
 
-    /// <summary>memtable/日志 flush 阈值（字节）：日志攒到该值
-    /// 即固化新段。默认 64MB；调小是合法配置（=1 即每次提交
-    /// 都固化），只拒绝非正数。</summary>
+    // memtable/日志 flush 阈值（字节）：日志攒到该值
+    // 即固化新段。默认 64MB；调小是合法配置（=1 即每次提交
+    // 都固化），只拒绝非正数。
     void SetFlushThreshold(long bytes) {
         if (bytes >= 1) { this.flushThreshold = bytes; }
     }
 
-    /// <summary>块缓存字节上限。默认 32MB；调小是合法配置
-    /// （缓存退化到直读），只拒绝非正数。</summary>
+    // 块缓存字节上限。默认 32MB；调小是合法配置
+    // （缓存退化到直读），只拒绝非正数。
     void SetCacheCap(long bytes) {
         if (bytes >= 1) { this.cache.SetCap(bytes); }
     }
 
-    /// <summary>开启自动增量归并：每次固化新段后若段数达到
-    /// <paramref name="atSegs"/>，就地归并最老的
-    /// <paramref name="mergeK"/> 个段（同
-    /// <see cref="MergeSomeSegments"/>，有界停顿=写 k 段的耗时）。
-    /// atSegs ≥ max(3, mergeK+1) 才生效——阈值太低会每次固化都
-    /// 归并、得不偿失；atSegs = 0 关闭（默认）。段数稳态在
-    /// [atSegs-mergeK+1, atSegs] 间振荡，不再无界增长。</summary>
+    // 开启自动增量归并：每次固化新段后若段数达到
+    // <paramref name="atSegs"/>，就地归并最老的
+    // <paramref name="mergeK"/> 个段（同
+    // <see cref="MergeSomeSegments"/>，有界停顿=写 k 段的耗时）。
+    // atSegs ≥ max(3, mergeK+1) 才生效——阈值太低会每次固化都
+    // 归并、得不偿失；atSegs = 0 关闭（默认）。段数稳态在
+    // [atSegs-mergeK+1, atSegs] 间振荡，不再无界增长。
     void SetAutoMerge(int atSegs, int mergeK) {
         if (atSegs <= 0) { this.autoMergeAt = 0; this.autoMergeK = 0; return; }
         if (mergeK < 2) { return; }
@@ -404,9 +398,9 @@ class ZanStore {
 
     // ===== 同步核心（单所有者，无锁） =====
 
-    /// <summary>返回值；不存在时返回 ""（与「值为空串」不可区分，
-    /// 需要区分时用 <see cref="Contains"/>）。事务内可见未提交的
-    /// 本事务写入。</summary>
+    // 返回值；不存在时返回 ""（与「值为空串」不可区分，
+    // 需要区分时用 <see cref="Contains"/>）。事务内可见未提交的
+    // 本事务写入。
     string Get(string key) {
         if (!this.IsOpen()) { return ""; }
         if (this.txDepth > 0) {
@@ -429,7 +423,7 @@ class ZanStore {
         return "";
     }
 
-    /// 键是否存在。
+    // 键是否存在。
     bool Contains(string key) {
         if (!this.IsOpen()) { return false; }
         if (this.txDepth > 0) {
@@ -440,8 +434,8 @@ class ZanStore {
         return this.index.ContainsKey(key);
     }
 
-    /// <summary>事务内只暂存最终值；自动提交走同一批次路径。
-    /// 失败抛 IOException，并通过 GetError 留下诊断。</summary>
+    // 事务内只暂存最终值；自动提交走同一批次路径。
+    // 失败抛 IOException，并通过 GetError 留下诊断。
     void Put(string key, string val) {
         if (!this.WriteReady()) { throw new IOException(this.GetError()); }
         bool automatic = this.txDepth == 0;
@@ -452,7 +446,7 @@ class ZanStore {
         if (automatic && !this.Commit()) { throw new IOException(this.GetError()); }
     }
 
-    /// 删除存在的键；事务内 true 表示暂存，自动提交失败返回 false。
+    // 删除存在的键；事务内 true 表示暂存，自动提交失败返回 false。
     bool Delete(string key) {
         if (!this.WriteReady() || !this.Contains(key)) { return false; }
         bool automatic = this.txDepth == 0;
@@ -463,16 +457,16 @@ class ZanStore {
         return !automatic || this.Commit();
     }
 
-    /// 写入仅进入覆盖层；嵌套批次由最外层一次性提交。
+    // 写入仅进入覆盖层；嵌套批次由最外层一次性提交。
     void Begin() {
         if (!this.WriteReady()) { throw new IOException(this.GetError()); }
         this.txDepth = this.txDepth + 1;
     }
 
-    /// <summary>最外层非空批次写一个 CRC 帧，按持久化档落盘成功后
-    /// 才发布 memtable 和版本。嵌套 true 仅表示仍在暂存；空批次不推进。
-    /// I/O 失败返回 false 并关闭写入。若自动固化在 WAL 提交后失败，
-    /// false 的结果可能已提交，调用者应重开并检查修订号。</summary>
+    // 最外层非空批次写一个 CRC 帧，按持久化档落盘成功后
+    // 才发布 memtable 和版本。嵌套 true 仅表示仍在暂存；空批次不推进。
+    // I/O 失败返回 false 并关闭写入。若自动固化在 WAL 提交后失败，
+    // false 的结果可能已提交，调用者应重开并检查修订号。
     bool Commit() {
         if (!this.WriteReady()) { return false; }
         if (this.txDepth == 0) { return true; }
@@ -511,7 +505,7 @@ class ZanStore {
         return bytes;
     }
 
-    /// 在分配/追加之前计算精确大小，不让多键批次绕过帧上限。
+    // 在分配/追加之前计算精确大小，不让多键批次绕过帧上限。
     ByteBuffer BuildTxFrame() {
         List<string> dk = this.txDel.Keys;
         List<string> pk = this.txPut.Keys;
@@ -546,7 +540,7 @@ class ZanStore {
         return b;
     }
 
-    /// 回滚覆盖层；缓冲中从未写入本事务，既有已提交待写帧不受影响。
+    // 回滚覆盖层；缓冲中从未写入本事务，既有已提交待写帧不受影响。
     void Rollback() {
         if (this.txDepth == 0) { return; }
         this.txDepth = 0;
@@ -568,8 +562,8 @@ class ZanStore {
         this.txPut.Clear();
     }
 
-    /// 成功完成选定的持久化动作后才能发布覆盖层。GROUP 字节窗口
-    /// 记录已 flush 但未 sync 的量，不能在 Flush 清零后看 PendingBytes。
+    // 成功完成选定的持久化动作后才能发布覆盖层。GROUP 字节窗口
+    // 记录已 flush 但未 sync 的量，不能在 Flush 清零后看 PendingBytes。
     bool PersistCommit(int bytes) {
         if (this.durability == ZanStore.DUR_SYNC) {
             if (!this.log.Sync()) { return false; }
@@ -590,13 +584,13 @@ class ZanStore {
         return true;
     }
 
-    /// <summary>把 memtable 固化为新段：put 与未固化墓碑按键序
-    /// 合并写段 → fsync → 保存 manifest（水位 = 当前 seq）→ 截断
-    /// 日志。墓碑必须随段持久化：被删键在旧段里仍有旧版本，没有
-    /// 新段墓碑压住，恢复扫描就会把它复活。任一步失败都保持日志
-    /// 兜底（旧 manifest + 完整日志 = 完好状态）；成功后日志归零。
-    /// 须在写侧串行环境调用（同步核心即满足；协程请走
-    /// 核心契约与语义定义。
+    // 把 memtable 固化为新段：put 与未固化墓碑按键序
+    // 合并写段 → fsync → 保存 manifest（水位 = 当前 seq）→ 截断
+    // 日志。墓碑必须随段持久化：被删键在旧段里仍有旧版本，没有
+    // 新段墓碑压住，恢复扫描就会把它复活。任一步失败都保持日志
+    // 兜底（旧 manifest + 完整日志 = 完好状态）；成功后日志归零。
+    // 须在写侧串行环境调用（同步核心即满足；协程请走
+    // 核心契约与语义定义。
     void FlushToSegment() {
         if (!this.WriteReady() || this.txDepth > 0) { return; }
         long logBytes = this.log.Size();
@@ -673,8 +667,8 @@ class ZanStore {
         }
     }
 
-    /// 覆盖两个 fallback 槽后，旧段/日志才能退休。第二次失败时
-    /// 第一份已发布，不可删除它引用的新段，也不可截断/删除旧介质。
+    // 覆盖两个 fallback 槽后，旧段/日志才能退休。第二次失败时
+    // 第一份已发布，不可删除它引用的新段，也不可截断/删除旧介质。
     bool PublishBoth(long logSeq, long nextId, List<long> ids) {
         if (!this.man.Save(logSeq, nextId, ids) || !this.man.Save(logSeq, nextId, ids)) {
             this.Fail(this.man.GetError());
@@ -689,25 +683,25 @@ class ZanStore {
         if (wtr.buf != null) { wtr.buf.Free(); wtr.buf = null; }
     }
 
-    /// <summary>把全部已固化段（≥2 个）归并为一个新段：同键只留
-    /// 最新版本，墓碑直接掉落（归并集=全部段，不存在会复活的更老
-    /// 版本），索引按归并结果重建。须在写侧串行环境调用且不在事务
-    /// 中（协程请走 <see cref="MergeAsync"/>）；期间阻塞写入——
-    /// 在线换段优化留待后续。崩溃窗口两段皆一致：段已写清单未换
-    /// = 孤儿段，下次同号归并覆盖之；清单已换 = 旧段成孤儿（不再
-    /// 被引用，仅占盘）。内存峰值 ≈ 存活键数（重建索引用）。</summary>
+    // 把全部已固化段（≥2 个）归并为一个新段：同键只留
+    // 最新版本，墓碑直接掉落（归并集=全部段，不存在会复活的更老
+    // 版本），索引按归并结果重建。须在写侧串行环境调用且不在事务
+    // 中（协程请走 <see cref="MergeAsync"/>）；期间阻塞写入——
+    // 在线换段优化留待后续。崩溃窗口两段皆一致：段已写清单未换
+    // = 孤儿段，下次同号归并覆盖之；清单已换 = 旧段成孤儿（不再
+    // 被引用，仅占盘）。内存峰值 ≈ 存活键数（重建索引用）。
     void MergeSegments() {
         this.MergeSomeSegments(this.segs.Count);
     }
 
-    /// <summary>独占锁下的 <see cref="MergeSegments"/>。</summary>
+    // 独占锁下的 <see cref="MergeSegments"/>。
     async void MergeAsync() {
         await this.rw.EnterWrite();
         MergeSegments();
         this.rw.ExitWrite();
     }
 
-    /// 线性查小列表（归并集段号，k 很小）。
+    // 线性查小列表（归并集段号，k 很小）。
     static bool IdInList(List<long> ids, long id) {
         for (int i = 0; i < ids.Count; i = i + 1) {
             if (ids[i] == id) { return true; }
@@ -715,15 +709,15 @@ class ZanStore {
         return false;
     }
 
-    /// <summary><see cref="MergeSegments"/> 的增量形式：把最老的
-    /// maxMerge（≥2）个段归并为一个新段，其余较新段原样保留——
-    /// 写阻塞时长被归并集规模封顶，反复调用最终收敛为单段。索引
-    /// 原地改指：只有键索引仍指向归并集的键才重指/摘除；指向未
-    /// 归并新段的键保持原指（更新版本继续赢），且这样的键**不写
-    /// 入新段**——重开恢复按清单序「后扫覆盖前扫」时才不会让旧
-    /// 版本压住未归并段的新版本。归并集内同键由游标新→旧序去重，
-    /// 未固化墓碑压键与崩溃窗口语义同全量归并。返回实际归并的
-    /// 段数（0 = 无事可做：段不足 2 或在事务中）。</summary>
+    // <see cref="MergeSegments"/> 的增量形式：把最老的
+    // maxMerge（≥2）个段归并为一个新段，其余较新段原样保留——
+    // 写阻塞时长被归并集规模封顶，反复调用最终收敛为单段。索引
+    // 原地改指：只有键索引仍指向归并集的键才重指/摘除；指向未
+    // 归并新段的键保持原指（更新版本继续赢），且这样的键**不写
+    // 入新段**——重开恢复按清单序「后扫覆盖前扫」时才不会让旧
+    // 版本压住未归并段的新版本。归并集内同键由游标新→旧序去重，
+    // 未固化墓碑压键与崩溃窗口语义同全量归并。返回实际归并的
+    // 段数（0 = 无事可做：段不足 2 或在事务中）。
     int MergeSomeSegments(int maxMerge) {
         if (!this.WriteReady() || maxMerge < 2 || this.segs.Count < 2 || this.txDepth > 0) { return 0; }
         if (!this.log.Sync()) { this.Fail(this.log.GetError()); return 0; }
@@ -836,19 +830,19 @@ class ZanStore {
         return false;
     }
 
-    /// <summary>按键序（<see cref="String.CompareOrdinal"/> 升序）
-    /// 归并扫描 fromKey（含）起的全部存活键值：memtable 与各段
-    /// 多路归并，同键取最新版本（memtable &gt; 更大段号），墓碑
-    /// 隐藏。visit 返回 false 早停。看到的是已提交视图（不含未
-    /// 提交事务的覆盖层）；memtable 部分每次扫描现排序，段部分
-    /// 顺序流读、不占用块缓存。返回 visit 接受的键数。</summary>
+    // 按键序（<see cref="String.CompareOrdinal"/> 升序）
+    // 归并扫描 fromKey（含）起的全部存活键值：memtable 与各段
+    // 多路归并，同键取最新版本（memtable &gt; 更大段号），墓碑
+    // 隐藏。visit 返回 false 早停。看到的是已提交视图（不含未
+    // 提交事务的覆盖层）；memtable 部分每次扫描现排序，段部分
+    // 顺序流读、不占用块缓存。返回 visit 接受的键数。
     int Scan(string fromKey, StoreVisit visit) {
         return ScanBetween(fromKey, "", visit);
     }
 
-    /// <summary><see cref="Scan"/> 的有界形式：只访问
-    /// [startKey, endKey] 闭区间内的键，上界在归并循环内判定，
-    /// 调用方无需在回调里逐键比对。返回 visit 接受的键数。</summary>
+    // <see cref="Scan"/> 的有界形式：只访问
+    // [startKey, endKey] 闭区间内的键，上界在归并循环内判定，
+    // 调用方无需在回调里逐键比对。返回 visit 接受的键数。
     int ScanBetween(string startKey, string endKey, StoreVisit visit) {
         // 各段游标，段号降序排列 = 新段在前。
         List<SegCursor> cursors = new List<SegCursor>();
@@ -950,11 +944,11 @@ class ZanStore {
         return accepted;
     }
 
-    /// <summary><see cref="ScanBetween"/> 的零拷贝形式：交付
-    /// <see cref="ScanRow"/> 而非字符串——单段且 memtable 无未固化
-    /// 数据时值不物化、上界与墓碑判定全走块内指针；memtable 有
-    /// 参与则退化为字符串路径包装。语义与 ScanBetween 完全一致，
-    /// 行数据仅在回调返回前有效。返回 visit 接受的键数。</summary>
+    // <see cref="ScanBetween"/> 的零拷贝形式：交付
+    // <see cref="ScanRow"/> 而非字符串——单段且 memtable 无未固化
+    // 数据时值不物化、上界与墓碑判定全走块内指针；memtable 有
+    // 参与则退化为字符串路径包装。语义与 ScanBetween 完全一致，
+    // 行数据仅在回调返回前有效。返回 visit 接受的键数。
     int ScanRows(string startKey, string endKey, ScanRowVisit visit) {
         if (this.segs.Count == 1 && this.memtable.Keys.Count == 0) {
             SegCursor c = SegCursor.Open(this.segs[0].seg, startKey);
@@ -984,9 +978,9 @@ class ZanStore {
         });
     }
 
-    /// <summary>统计 [startKey, endKey] 闭区间内的存活键数，
-    /// 不做任何回调：单段且 memtable 无参与时走块级内核直数
-    /// （免游标/回调对象），否则退化为归并扫描。返回键数。</summary>
+    // 统计 [startKey, endKey] 闭区间内的存活键数，
+    // 不做任何回调：单段且 memtable 无参与时走块级内核直数
+    // （免游标/回调对象），否则退化为归并扫描。返回键数。
     int CountRange(string startKey, string endKey) {
         List<string> src = this.memtable.Keys;
         if (this.segs.Count == 1 && src.Count == 0) {
@@ -1000,28 +994,26 @@ class ZanStore {
         });
     }
 
-    /// <summary><see cref="ScanKernel"/> 的区间形式：仅当处于
-    /// 单段稳态（memtable 空）时走块级内核；多源归并或 memtable
-    /// 有未固化数据时返回 -1（调用方须退回 <see cref="ScanRows"/>
-    /// 字符串路径）。endKey 为空串 = 无上界。</summary>
+    // <see cref="ScanKernel"/> 的区间形式：仅当处于
+    // 单段稳态（memtable 空）时走块级内核；多源归并或 memtable
+    // 有未固化数据时返回 -1（调用方须退回 <see cref="ScanRows"/>
+    // 字符串路径）。endKey 为空串 = 无上界。
     int TryScanKernel(string startKey, string endKey, KernelVisit visit) {
         List<string> src = this.memtable.Keys;
         if (this.segs.Count != 1 || src.Count != 0) { return -1; }
         return ScanKernel(this.segs[0].seg, startKey, endKey, visit);
     }
 
-    /// <summary>
-    /// 块级聚合内核（单段快速路径）：把块跨度一次读入（每
-    /// <see cref="KERNEL_SPAN_BYTES"/> 一次系统调用，块在段文件里物理
-    /// 连续、记录解析不依赖块边界）后循环裸解析记录，把（基址+偏移+
-    /// 长度）直接交给 visit——不经 SegCursor/ScanRow 对象、不经每行
-    /// delegate 之外的任何抽象；op=2 的段内墓碑由这里跳过（op=2 记
-    /// 录无值）。墓碑集非空时逐键 memcmp 比对（未固化删除极少，比
-    /// 对成本可忽略）；visit 返回 false 早停。返回 visit 接受的行数。
-    /// 常态扫描（固化+归并后单段、memtable 空）的聚合与计数走
-    /// 这里——每行成本 = varint 解码 + 一次回调，无对象分配；每
-    /// 跨度成本 = 一次 ReadAt + 逐块 CRC（同会话首遍）。
-    /// </summary>
+    // 块级聚合内核（单段快速路径）：把块跨度一次读入（每
+    // <see cref="KERNEL_SPAN_BYTES"/> 一次系统调用，块在段文件里物理
+    // 连续、记录解析不依赖块边界）后循环裸解析记录，把（基址+偏移+
+    // 长度）直接交给 visit——不经 SegCursor/ScanRow 对象、不经每行
+    // delegate 之外的任何抽象；op=2 的段内墓碑由这里跳过（op=2 记
+    // 录无值）。墓碑集非空时逐键 memcmp 比对（未固化删除极少，比
+    // 对成本可忽略）；visit 返回 false 早停。返回 visit 接受的行数。
+    // 常态扫描（固化+归并后单段、memtable 空）的聚合与计数走
+    // 这里——每行成本 = varint 解码 + 一次回调，无对象分配；每
+    // 跨度成本 = 一次 ReadAt + 逐块 CRC（同会话首遍）。
     int ScanKernel(SegmentFile seg, string startKey, string endKey, KernelVisit visit) {
         int blockIdx = seg.BlockFor(startKey);
         int blockTotal = seg.BlockCount();
@@ -1094,7 +1086,7 @@ class ZanStore {
         return accepted;
     }
 
-    /// <summary>共享锁下的 <see cref="Scan"/>；可与并发写入共存。</summary>
+    // 共享锁下的 <see cref="Scan"/>；可与并发写入共存。
     async int ScanAsync(string fromKey, StoreVisit visit) {
         await this.rw.EnterRead();
         int n = Scan(fromKey, visit);
@@ -1102,9 +1094,9 @@ class ZanStore {
         return n;
     }
 
-    /// <summary>物化式范围扫描：startKey（含）到 endKey（含，与
-    /// 旧引擎 <c>BTree.Scan</c> 语义一致）按键序收集到 output；
-    /// limit &gt; 0 时至多 limit 条。返回收集的条数。</summary>
+    // 物化式范围扫描：startKey（含）到 endKey（含，与
+    // 旧引擎 <c>BTree.Scan</c> 语义一致）按键序收集到 output；
+    // limit &gt; 0 时至多 limit 条。返回收集的条数。
     int ScanRange(string startKey, string endKey, int limit, List<KvEntry> output) {
         int before = output.Count;
         Scan(startKey, delegate(string k, string v) {
@@ -1117,8 +1109,8 @@ class ZanStore {
         return output.Count - before;
     }
 
-    /// <summary>前缀扫描：所有以 prefix 开头的键值按键序收集；
-    /// limit &gt; 0 时至多 limit 条。返回收集的条数。</summary>
+    // 前缀扫描：所有以 prefix 开头的键值按键序收集；
+    // limit &gt; 0 时至多 limit 条。返回收集的条数。
     int ScanPrefix(string prefix, int limit, List<KvEntry> output) {
         int before = output.Count;
         Scan(prefix, delegate(string k, string v) {
@@ -1129,19 +1121,19 @@ class ZanStore {
         return output.Count - before;
     }
 
-    /// <summary><see cref="ScanKernel"/> 的键只读形式：不解析值、
-    /// 只把（基址+键偏移+键长）交给 visit，供覆盖索引路径
-    /// （索引条目键自带 id/值段，零文档读也零字符串物化）使用。
-    /// 单段稳态前提与 <see cref="TryScanKernel"/> 相同，否则返回 -1。
-    /// 返回 visit 接受的键数。</summary>
+    // <see cref="ScanKernel"/> 的键只读形式：不解析值、
+    // 只把（基址+键偏移+键长）交给 visit，供覆盖索引路径
+    // （索引条目键自带 id/值段，零文档读也零字符串物化）使用。
+    // 单段稳态前提与 <see cref="TryScanKernel"/> 相同，否则返回 -1。
+    // 返回 visit 接受的键数。
     int TryScanKeyKernel(string startKey, string endKey, KernelKeyVisit visit) {
         List<string> src = this.memtable.Keys;
         if (this.segs.Count != 1 || src.Count != 0) { return -1; }
         return ScanKeyKernel(this.segs[0].seg, startKey, endKey, visit);
     }
 
-    /// <summary><see cref="ScanKernel"/> 的键只读内档：与行版同
-    /// 跨度整读与上界/墓碑逻辑，只是不读值、交付键区间。</summary>
+    // <see cref="ScanKernel"/> 的键只读内档：与行版同
+    // 跨度整读与上界/墓碑逻辑，只是不读值、交付键区间。
     int ScanKeyKernel(SegmentFile seg, string startKey, string endKey, KernelKeyVisit visit) {
         int blockIdx = seg.BlockFor(startKey);
         int blockTotal = seg.BlockCount();
@@ -1212,7 +1204,7 @@ class ZanStore {
         return accepted;
     }
 
-    /// <summary>将缓冲与 OS 缓存全部强制落盘。</summary>
+    // 将缓冲与 OS 缓存全部强制落盘。
     void Checkpoint() {
         if (!this.WriteReady()) { return; }
         if (!this.log.Sync()) { this.Fail(this.log.GetError()); return; }
@@ -1220,7 +1212,7 @@ class ZanStore {
         this.bytesSinceSync = 0;
     }
 
-    /// 当前全部段号列表。
+    // 当前全部段号列表。
     List<long> SegIdList() {
         List<long> ids = new List<long>();
         for (int i = 0; i < this.segs.Count; i = i + 1) {
@@ -1229,7 +1221,7 @@ class ZanStore {
         return ids;
     }
 
-    /// 按段号找段句柄。
+    // 按段号找段句柄。
     SegRef FindSeg(long id) {
         for (int i = 0; i < this.segs.Count; i = i + 1) {
             if (this.segs[i].id == id) { return this.segs[i]; }
@@ -1237,7 +1229,7 @@ class ZanStore {
         return null;
     }
 
-    /// 失败关闭：保留首个诊断，丢弃事务，绝不重刷失败 pending 帧。
+    // 失败关闭：保留首个诊断，丢弃事务，绝不重刷失败 pending 帧。
     void Fail(string error) {
         if (this.lastError == "") { this.lastError = error != "" ? error : "store I/O failed"; }
         if (this.txDepth > 0 || this.txPut.Count > 0 || this.txDel.Count > 0) {
@@ -1263,7 +1255,7 @@ class ZanStore {
         }
     }
 
-    /// 健康关闭同步所有已提交帧；尚未提交的覆盖层回滚。
+    // 健康关闭同步所有已提交帧；尚未提交的覆盖层回滚。
     void Close() {
         if (this.closed) { return; }
         this.Rollback();
@@ -1328,7 +1320,7 @@ class ZanStore {
 
     // ===== 协程安全的异步 API =====
 
-    /// <summary>共享锁读取；可安全地与并发写入共存。</summary>
+    // 共享锁读取；可安全地与并发写入共存。
     async string GetAsync(string key) {
         await this.rw.EnterRead();
         string v = Get(key);
@@ -1336,14 +1328,14 @@ class ZanStore {
         return v;
     }
 
-    /// <summary>独占锁写入并按当前持久化档落盘。</summary>
+    // 独占锁写入并按当前持久化档落盘。
     async void PutAsync(string key, string val) {
         await this.rw.EnterWrite();
         try { Put(key, val); }
         finally { this.rw.ExitWrite(); }
     }
 
-    /// 独占锁删除一个键；返回键此前是否存在。
+    // 独占锁删除一个键；返回键此前是否存在。
     async bool DeleteAsync(string key) {
         await this.rw.EnterWrite();
         bool existed = Delete(key);
@@ -1351,16 +1343,16 @@ class ZanStore {
         return existed;
     }
 
-    /// <summary>独占锁下把 memtable 固化为新段。</summary>
+    // 独占锁下把 memtable 固化为新段。
     async void FlushAsync() {
         await this.rw.EnterWrite();
         FlushToSegment();
         this.rw.ExitWrite();
     }
 
-    /// <summary>原子读改写：fn 在写临界区内看到最新已提交值
-    /// （不存在时为 ""），因此同一键上的并发 UpdateAtomic
-    /// 不会丢失更新。返回最终存储的结果。</summary>
+    // 原子读改写：fn 在写临界区内看到最新已提交值
+    // （不存在时为 ""），因此同一键上的并发 UpdateAtomic
+    // 不会丢失更新。返回最终存储的结果。
     async string UpdateAtomic(string key, StoreUpdater fn) {
         await this.rw.EnterWrite();
         try {

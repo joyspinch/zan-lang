@@ -8,36 +8,34 @@ using System.Threading;
 
 namespace System.Net;
 
-/// <summary>
-/// WebSocket 协议分片：握手/帧循环/连接注册表/Push 的实现，
-/// 从 Worker.zan 外迁为独立类。Worker 核心只经静态槽分发（Worker.wsEntry），
-/// 应用调用一次 WorkerWs.Install() 本文件才进编译图——纯 HTTP 服务不背
-/// ws 编解码（约 870 行），正如不背 SSE/MQTT。槽反转与独立类（不写
-/// partial Worker）的理由见 Worker.ProtoEntryFn 的文档。
-/// </summary>
+// WebSocket 协议分片：握手/帧循环/连接注册表/Push 的实现，
+// 从 Worker.zan 外迁为独立类。Worker 核心只经静态槽分发（Worker.wsEntry），
+// 应用调用一次 WorkerWs.Install() 本文件才进编译图——纯 HTTP 服务不背
+// ws 编解码（约 870 行），正如不背 SSE/MQTT。槽反转与独立类（不写
+// partial Worker）的理由见 Worker.ProtoEntryFn 的文档。
 class WorkerWs {
     [DllImport("crt")]
     static extern long strlen(string str);
 
-    /// 网络协程状态调度与数据交互。
-    /// 接口数据协议与执行契约。
-    /// 核心契约与语义定义。
+    // 网络协程状态调度与数据交互。
+    // 接口数据协议与执行契约。
+    // 核心契约与语义定义。
     static void Install() {
         Worker.wsEntry = WorkerWs.HandleWebSocket;
         WorkerWs.EnableSharedBus("zan_ws_worker_bus");
     }
 
-    /// <summary>停掉跨进程总线轮询并解除静态持有。sharedBus/
-    /// busConsumer 是 WsSharedBus→SharedTable 链在泄漏探测里的
-    /// 保持根，退出前需显式拆卸避免残留。</summary>
+    // 停掉跨进程总线轮询并解除静态持有。sharedBus/
+    // busConsumer 是 WsSharedBus→SharedTable 链在泄漏探测里的
+    // 保持根，退出前需显式拆卸避免残留。
     static void DisableSharedBus() {
         if (WorkerWs.sharedBus != null) { WorkerWs.sharedBus.Stop(); }
         WorkerWs.sharedBus = null;
         WorkerWs.busConsumer = null;
     }
 
-    /// <summary>进程退出前的拆卸入口：解除协议分片并停总线，
-    /// 与 Install() 对称。</summary>
+    // 进程退出前的拆卸入口：解除协议分片并停总线，
+    // 与 Install() 对称。
     static void Uninstall() {
         Worker.wsEntry = null;
         WorkerWs.DisableSharedBus();
@@ -53,7 +51,7 @@ class WorkerWs {
         if (WorkerWs.chanLock == 0) { WorkerWs.chanLock = Mutex.Create(); }
     }
 
-    /// <summary>启用基于 SharedTable 共享内存的跨 Worker 进程 WebSocket 消息总线。</summary>
+    // 启用基于 SharedTable 共享内存的跨 Worker 进程 WebSocket 消息总线。
     static void EnableSharedBus(string busName) {
         if (WorkerWs.sharedBus != null) { return; }
         WorkerWs.sharedBus = new WsSharedBus(busName, 128);
@@ -63,7 +61,7 @@ class WorkerWs {
         }
     }
 
-    /// <summary>订阅者加入频道/房间。</summary>
+    // 订阅者加入频道/房间。
     static void Join(string channel, Connection conn) {
         if (conn == null || channel == "") { return; }
         WorkerWs.ChanInit();
@@ -89,7 +87,7 @@ class WorkerWs {
         Mutex.Unlock(WorkerWs.chanLock);
     }
 
-    /// <summary>订阅者离开频道/房间。</summary>
+    // 订阅者离开频道/房间。
     static void Leave(string channel, Connection conn) {
         if (conn == null || channel == "") { return; }
         WorkerWs.ChanInit();
@@ -110,7 +108,7 @@ class WorkerWs {
         Mutex.Unlock(WorkerWs.chanLock);
     }
 
-    /// <summary>断开时从所有频道中自动清理该连接。</summary>
+    // 断开时从所有频道中自动清理该连接。
     static void LeaveAllChannels(Connection conn) {
         if (conn == null) { return; }
         WorkerWs.ChanInit();
@@ -140,13 +138,13 @@ class WorkerWs {
     // 不同线程，Dict 本身不是线程安全）。
     static nint regLock = 0;
 
-    /// 惰性创建注册表用的互斥锁。
+    // 惰性创建注册表用的互斥锁。
     static void RegInit() {
         if (WorkerWs.regLock == 0) { WorkerWs.regLock = Mutex.Create(); }
     }
 
-    /// Upgrade 成功后由 HandleWebSocket 调用（单线程 accept 路径）：
-    /// 出站 writer/client 挂到连接的注册项上，Push/Broadcast 经 id 找回。
+    // Upgrade 成功后由 HandleWebSocket 调用（单线程 accept 路径）：
+    // 出站 writer/client 挂到连接的注册项上，Push/Broadcast 经 id 找回。
     static void Attach(Connection conn, WsWriter writer, TcpClient client) {
         WorkerWs.RegInit();
         Mutex.Lock(WorkerWs.regLock);
@@ -165,7 +163,7 @@ class WorkerWs {
         }
     }
 
-    /// 连接结束后由 HandleWebSocket 调用（O(1) 删除）。
+    // 连接结束后由 HandleWebSocket 调用（O(1) 删除）。
     static void ConnRemove(Connection conn) {
         WorkerWs.RegInit();
         Mutex.Lock(WorkerWs.regLock);
@@ -187,7 +185,7 @@ class WorkerWs {
         }
     }
 
-    /// 按连接 id 找注册项；不存在（已断开）返回 null（O(1) 哈希查找）。
+    // 按连接 id 找注册项；不存在（已断开）返回 null（O(1) 哈希查找）。
     static WsLink LinkOf(int id) {
         WorkerWs.RegInit();
         Mutex.Lock(WorkerWs.regLock);
@@ -199,7 +197,7 @@ class WorkerWs {
         return found;
     }
 
-    /// <summary>本进程当前在线 WebSocket 连接数。</summary>
+    // 本进程当前在线 WebSocket 连接数。
     static int ConnCount() {
         WorkerWs.RegInit();
         Mutex.Lock(WorkerWs.regLock);
@@ -208,7 +206,7 @@ class WorkerWs {
         return n;
     }
 
-    /// <summary>获取集群跨 Worker 实时在线 WebSocket 连接总数。</summary>
+    // 获取集群跨 Worker 实时在线 WebSocket 连接总数。
     static int ClusterConnCount() {
         if (WorkerWs.sharedBus != null && WorkerWs.sharedBus.IsAvailable()) {
             return WorkerWs.sharedBus.GetTotalConnCount();
@@ -216,15 +214,15 @@ class WorkerWs {
         return WorkerWs.ConnCount();
     }
 
-    /// <summary>按连接 id 取在线连接；不存在（已断开）返回 null。
-    /// 用于定时器等无引用上下文里找回连接后 WorkerWs.Push(conn, ...)。</summary>
+    // 按连接 id 取在线连接；不存在（已断开）返回 null。
+    // 用于定时器等无引用上下文里找回连接后 WorkerWs.Push(conn, ...)。
     static Connection ConnById(int id) {
         WsLink link = WorkerWs.LinkOf(id);
         if (link == null) { return null; }
         return link.conn;
     }
 
-    /// <summary>向本进程内所有在线 WebSocket 连接广播一条 Text 帧，返回成功投递数。</summary>
+    // 向本进程内所有在线 WebSocket 连接广播一条 Text 帧，返回成功投递数。
     static async int BroadcastLocal(string data) {
         WorkerWs.RegInit();
         Mutex.Lock(WorkerWs.regLock);
@@ -240,8 +238,8 @@ class WorkerWs {
         return sent;
     }
 
-    /// <summary>向所有 Worker 进程的所有在线 WebSocket 连接全局广播一条 Text 帧。
-    /// 本进程连接立即本地推送，其他 Worker 进程经 SharedTable 环形总线接收后推送。</summary>
+    // 向所有 Worker 进程的所有在线 WebSocket 连接全局广播一条 Text 帧。
+    // 本进程连接立即本地推送，其他 Worker 进程经 SharedTable 环形总线接收后推送。
     static async int Broadcast(string data) {
         int sent = await WorkerWs.BroadcastLocal(data);
         if (WorkerWs.sharedBus != null && WorkerWs.sharedBus.IsAvailable()) {
@@ -250,7 +248,7 @@ class WorkerWs {
         return sent;
     }
 
-    /// <summary>向本进程内加入指定频道/房间的所有连接广播一条 Text 帧。</summary>
+    // 向本进程内加入指定频道/房间的所有连接广播一条 Text 帧。
     static async int BroadcastToLocal(string channel, string data) {
         WorkerWs.ChanInit();
         Mutex.Lock(WorkerWs.chanLock);
@@ -272,7 +270,7 @@ class WorkerWs {
         return sent;
     }
 
-    /// <summary>跨 Worker 向加入指定频道/房间的所有在线连接广播 Text 帧。</summary>
+    // 跨 Worker 向加入指定频道/房间的所有在线连接广播 Text 帧。
     static async int BroadcastTo(string channel, string data) {
         int sent = await WorkerWs.BroadcastToLocal(channel, data);
         if (WorkerWs.sharedBus != null && WorkerWs.sharedBus.IsAvailable()) {
@@ -281,8 +279,8 @@ class WorkerWs {
         return sent;
     }
 
-    /// <summary>精准向指定连接 ID 发送消息。若该连接在本进程则立即发送；
-    /// 若在集群其他 Worker 进程，则经 SharedTable 路由至目标进程发送。</summary>
+    // 精准向指定连接 ID 发送消息。若该连接在本进程则立即发送；
+    // 若在集群其他 Worker 进程，则经 SharedTable 路由至目标进程发送。
     static async bool PushTo(int connId, string data) {
         Connection localConn = WorkerWs.ConnById(connId);
         if (localConn != null) {
@@ -295,7 +293,7 @@ class WorkerWs {
         return false;
     }
 
-    /// <summary>接收来自其他 Worker 进程发来的跨进程共享总线消息。</summary>
+    // 接收来自其他 Worker 进程发来的跨进程共享总线消息。
     public static async void OnSharedMessage(int targetType, string channel, int targetId, string payload, int payloadLen) {
         if (targetType == 0) {
             await WorkerWs.BroadcastLocal(payload);
@@ -309,11 +307,11 @@ class WorkerWs {
         }
     }
 
-    /// <summary>WebSocket push：把一条 Text 帧排进该连接的出站缓冲并立即
-    /// 写出（服务端帧不掩码）。可从任何回调上下文调用——包括 onOpen 里
-    /// 主动欢迎、定时器里广播等没有入站消息先行的场景，这正是与"从
-    /// onMessage 返回应答"的区别。连接已关或未升级返回 false。
-    /// 帧序与帧循环共用同一缓冲，Append 到 Flush 之间不让出，天然一致。</summary>
+    // WebSocket push：把一条 Text 帧排进该连接的出站缓冲并立即
+    // 写出（服务端帧不掩码）。可从任何回调上下文调用——包括 onOpen 里
+    // 主动欢迎、定时器里广播等没有入站消息先行的场景，这正是与"从
+    // onMessage 返回应答"的区别。连接已关或未升级返回 false。
+    // 帧序与帧循环共用同一缓冲，Append 到 Flush 之间不让出，天然一致。
     static async bool Push(Connection c, string data) {
         WsLink link = WorkerWs.LinkOf(c.GetId());
         if (link == null || c.IsClosed()) { return false; }
@@ -336,8 +334,8 @@ class WorkerWs {
         }
     }
 
-    /// <summary>WebSocket 二进制 push：`data` 可含 NUL，`len` 为精确
-    /// 字节数（绝不 strlen）。语义同 Push。</summary>
+    // WebSocket 二进制 push：`data` 可含 NUL，`len` 为精确
+    // 字节数（绝不 strlen）。语义同 Push。
     static async bool PushBinary(Connection c, string data, int len) {
         WsLink link = WorkerWs.LinkOf(c.GetId());
         if (link == null || c.IsClosed()) { return false; }
@@ -359,7 +357,7 @@ class WorkerWs {
         }
     }
 
-    /// <summary>WebSocket 原始字节数组 push：零中转字符串拷贝与二进制安全。</summary>
+    // WebSocket 原始字节数组 push：零中转字符串拷贝与二进制安全。
     static async bool PushBinary(Connection c, byte[] data, int offset, int len) {
         if (data == null || offset < 0 || len <= 0 || offset + len > data.Length) { return false; }
         WsLink link = WorkerWs.LinkOf(c.GetId());
@@ -382,7 +380,7 @@ class WorkerWs {
         }
     }
 
-    /// <summary>WebSocket 原始字节数组 push 全量切片。</summary>
+    // WebSocket 原始字节数组 push 全量切片。
     static async bool PushBinary(Connection c, byte[] data) {
         int len = data != null ? data.Length : 0;
         return await WorkerWs.PushBinary(c, data, 0, len);
@@ -390,15 +388,11 @@ class WorkerWs {
 
     // ---- 帧循环 ----
 
-    /// 网络协程状态调度与数据交互。
-    /// 网络协程状态调度与数据交互。
-    /// 网络协程状态调度与数据交互。
-    /// 网络协程状态调度与数据交互。
+    // 网络协程状态调度与数据交互。
     static async void HandleWebSocket(Worker w, nint clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
 
         // 网络协程状态调度与数据交互。
-        // 接口数据协议与执行契约。
         // 接口数据协议与执行契约。
         // 握手读取与明文 HTTP 一样受 requestTimeout 约束（慢速客户端
         // 每秒滴一个字节就能永久钉住协程与 64KB 复用缓冲）；WS 循环
@@ -455,7 +449,6 @@ class WorkerWs {
 
         Connection conn = w.NewConnection(clientSock);
 
-        // 接口数据协议与执行契约。
         // 接口数据协议与执行契约。
         WsReader reader = new WsReader(clientSock);
         int afterHead = framer.Pending() - headerEnd;
@@ -572,11 +565,7 @@ class WorkerWs {
             }
             // 网络协程状态调度与数据交互。
             // 接口数据协议与执行契约。
-            // 接口数据协议与执行契约。
-            // 接口数据协议与执行契约。
             // 网络协程状态调度与数据交互。
-            // 网络协程状态调度与数据交互。
-            // 接口数据协议与执行契约。
             // 接口数据协议与执行契约。
             int respLen = (int)strlen(response);
             if (respLen > 16777216) {
@@ -604,9 +593,9 @@ class WorkerWs {
     }
 }
 
-/// 一条在线 WebSocket 连接的注册项：连接对象 + 出站 writer + 底层
-/// socket。原先是 Connection 上的 wsWriter/wsClient 字段——字段类型
-/// 引用 ws 家族会把编解码拖回核心文件，故随分片外迁、按连接 id 关联。
+// 一条在线 WebSocket 连接的注册项：连接对象 + 出站 writer + 底层
+// socket。原先是 Connection 上的 wsWriter/wsClient 字段——字段类型
+// 引用 ws 家族会把编解码拖回核心文件，故随分片外迁、按连接 id 关联。
 class WsLink {
     Connection conn;
     WsWriter writer;
