@@ -5078,7 +5078,7 @@ static void emit_decl_field_initializers(zan_irgen_t *g,
             g, type_sym, st, object_ptr, fi, "field.init");
         LLVMTypeRef slot_type = map_type(g, fsym->type);
         value = emit_boundary_coerce(g, value, slot_type);
-        if (field_type && is_rc_managed_type(field_type)) {
+        if (field_type && (is_rc_managed_type(field_type) || field_type->kind == TYPE_OBJECT)) {
             emit_rc_store_field(g, field_type, field_ptr, value,
                                 field->field_decl.initializer, locals,
                                 (fsym->modifiers & MOD_WEAK) ? 1 : 0);
@@ -5552,7 +5552,7 @@ binding_lowered:
                                 }
                             }
                         }
-                        if (fst && is_rc_managed_type(fst)) {
+                        if (fst && (is_rc_managed_type(fst) || fst->kind == TYPE_OBJECT)) {
                             emit_rc_store_field(g, fst, fptr, right, expr->binary.right, locals,
                                                 (fsym->modifiers & MOD_WEAK) ? 1 : 0);
                         } else if (fst && fst->kind == TYPE_STRUCT &&
@@ -6227,7 +6227,7 @@ binding_lowered:
                             LLVMValueRef fptr = emit_field_ptr(g, local->type->sym, st, struct_ptr, fi, "fld");
                             zan_symbol_t *afsym = get_field_sym(local->type->sym, expr->binary.left->member.name);
                             zan_type_t *aft = afsym ? field_store_type(g, afsym, local->type) : NULL;
-                            if (aft && is_rc_managed_type(aft)) {
+                            if (aft && (is_rc_managed_type(aft) || aft->kind == TYPE_OBJECT)) {
                                 emit_rc_store_field(g, aft, fptr, right, expr->binary.right, locals,
                                                     (afsym->modifiers & MOD_WEAK) ? 1 : 0);
                             } else if (aft && aft->kind == TYPE_STRUCT &&
@@ -6279,7 +6279,7 @@ binding_lowered:
                                         expr->binary.left->member.name);
                                     zan_type_t *gft = gfsym ? field_store_type(g,
                                         gfsym, et) : NULL;
-                                    if (gft && is_rc_managed_type(gft)) {
+                                    if (gft && (is_rc_managed_type(gft) || gft->kind == TYPE_OBJECT)) {
                                         emit_rc_store_field(g, gft, fptr, right,
                                             expr->binary.right, locals,
                                             (gfsym->modifiers & MOD_WEAK) ? 1 : 0);
@@ -6313,7 +6313,7 @@ binding_lowered:
                                     ? field_store_type(g, gfsym,
                                           infer_expr_type(g, obj_expr, locals))
                                     : NULL;
-                                if (gft && is_rc_managed_type(gft)) {
+                                if (gft && (is_rc_managed_type(gft) || gft->kind == TYPE_OBJECT)) {
                                     emit_rc_store_field(g, gft, fptr, right, expr->binary.right, locals,
                                                         (gfsym->modifiers & MOD_WEAK) ? 1 : 0);
                                 } else if (gft && gft->kind == TYPE_STRUCT &&
@@ -10137,7 +10137,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                     if (fsym && fsym->type && fval) {
                                         zan_type_t *fsty = field_store_type(
                                             g, fsym, new_inst ? new_inst : sym->type);
-                                        if (fsty && is_rc_managed_type(fsty) &&
+                                        if (fsty && (is_rc_managed_type(fsty) || fsty->kind == TYPE_OBJECT) &&
                                             !(fsym->modifiers & MOD_WEAK)) {
                                             /* fval from emit_binding_value is
                                              * freshly owned (+1): the store
@@ -11204,7 +11204,6 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
 
             if (g->current_async_frame && g->current_async_switch) {
                 int k = g->current_async_next_state++;
-                int j = g->current_async_sub_next++;
                 LLVMValueRef selfframe = g->current_async_frame;
                 LLVMTypeRef self_ft = g->current_async_frame_type;
                 LLVMTypeRef ptr_int_ty = g->target_is_wasm ? i32 : i64;
@@ -11249,7 +11248,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMPositionBuilderAtEnd(g->builder, suspend_bb);
                 zan_store_fit(g, sub_i8,
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
-                        (unsigned)(g->current_async_sub_base + j), "sub.slot"));
+                        (unsigned)g->current_async_sub_base, "sub.slot"));
                 zan_store_fit(g, sub_i8, get_async_child_ptr(g));
                 zan_store_fit(g, LLVMConstInt(i32, (unsigned)k, 0), get_async_state_ptr(g));
                 LLVMValueRef sched_args[] = { sub_i8, sub_resume };
@@ -11259,7 +11258,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 /* ---- co.resume (rk): re-entered by driver once sub completes ---- */
                 LLVMPositionBuilderAtEnd(g->builder, rk);
                 LLVMValueRef sub_slot = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
-                    (unsigned)(g->current_async_sub_base + j), "sub.slot2");
+                    (unsigned)g->current_async_sub_base, "sub.slot2");
                 LLVMValueRef sub_rl = LLVMBuildLoad2(g->builder, i8ptr, sub_slot, "sub.rl");
                 LLVMBuildBr(g->builder, cont_bb);
 

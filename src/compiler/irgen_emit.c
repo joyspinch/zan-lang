@@ -579,10 +579,12 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         w->handler_cap = scan.try_count > 0 ? scan.try_count : 1;
 
         /* frame = fixed header + params + frame locals +
-         * one i8* sub-task handle per await point. */
+         * at most one shared i8* sub-task handle slot across all await points.
+         * A coroutine is suspended on at most one child at a time; sharing
+         * the slot shrinks frames and LLVM struct types from O(N_await) to O(1). */
         int locals_base = ASYNC_FRAME_FIRST_PARAM + total_params;
         w->sub_base = locals_base + w->alocal_count;
-        int nfields = w->sub_base + w->await_count;
+        int nfields = w->sub_base + (w->await_count > 0 ? 1 : 0);
 
         int ret_agg_slot = -1;
         zan_type_t *raw_ret = w->ret_type ? w->ret_type : g->binder->type_void;
@@ -651,8 +653,8 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
             w->alocals[k].frame_index = locals_base + k;
             fields[locals_base + k] = w->alocals[k].llvm;
         }
-        for (int k = 0; k < w->await_count; k++) {
-            fields[w->sub_base + k] = i8ptr;
+        if (w->await_count > 0) {
+            fields[w->sub_base] = i8ptr;
         }
         if (is_agg_ret) {
             fields[ret_agg_slot] = lret;

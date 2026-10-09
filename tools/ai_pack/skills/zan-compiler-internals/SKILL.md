@@ -83,6 +83,9 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
     原先协程在顶层块与嵌套块中遍历语句时，凡遇到 `anf_stmt_contains_await(bs)` 即发射 `emit_async_cancel_check`，导致每个 await 恢复后均额外分裂出 `co.cancelled` 与 `co.notcancelled` 块，生成重复的 `fr.cancel.p` 载入与条件分支。正确定式：
     ① **前置集中拦截**：取消检查统一提升至 `$resume` 方法的分发器入口（`co.dispatch` 之前）；若协程在挂起期间已被请求取消（`Task.Cancel`），直接跳转至共享的 `co.cancelled` 块完成清理并退出，根本无需进入 `switch(state)` 分发；
     ② **消除语句级逐条探测**：由于恢复执行的协程在分发前已经确认未取消，且同步语句序列执行期间取消标志不会自发改变，因此彻底消除 `AST_BLOCK` 内每条包含 await 语句后的重复 `emit_async_cancel_check`。不仅消除了成倍膨胀的基本块，更严格维护了取消协议的语义一致性。
+  - **协程帧单例子任务槽位复用（2026-10-09 落地）**：
+    原先编译器在 `declare_async_method` 中计算协程帧结构体时，按 `w->sub_base + w->await_count` 为每一个 await 挂起点分配一个独立的 `i8*` 子任务句柄槽位，导致包含数十甚至上百个 await 的方法堆帧字段数 $O(N)$ 线性暴涨，结构体膨胀上千字节。
+    正确定式：一个协程在任意时刻至多挂起在 1 个子任务上，且在 `rk` 恢复块消费子任务结果并 `zan_emit_frame_free` 后才可能进入下一个 await。因此整个协程帧只需分配至多 1 个共享单例子任务槽位（`w->await_count > 0 ? 1 : 0`），所有 await 点统一读写 `g->current_async_sub_base`。帧类型字段数与内存开销从 $O(N)$ 彻底收敛为 $O(1)$。
 
 - **`static object` 静态字段的 RC 根注册与动态析构契约（2026-10-09 落地）**：
   在 Zan 编译器中，`TYPE_OBJECT` 不属于静态编译期的强类型类（`is_arc_managed_type` 为 false），但其运行时持有的可能是通过 `zan_rt_alloc` 分配的堆类实例（如 `new object()`）或堆字符串。
@@ -2127,6 +2130,15 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   `GetType()`+`is` 一起钉，四孪生（conformance/leakcheck/arcguard/determinism）。
 
 ## Binding 活绑定弱引用契约与 out 字段写穿
+
+- **借用槽的写入与析构必须成对（2026-10-09，设计器崩溃实证）**：扩展通用
+  `object` 字段 ARC 时，先核对编译器内建对象里的非占有字段。
+  `emit_binding_value` 对 `Binding<T>.target` 只写入、不 retain；因此
+  `build_class_release_body` 必须跳过这个 target，常量绑定的 `constVal` 仍照常
+  释放。坑出处：补齐普通 `object` 字段析构后，临时属性表销毁把按钮作为绑定源
+  提前释放，下一次建表在分配器崩溃；`-g` 守卫与无 GUI 最小探针抓到更早的
+  stale release。回归 `binding_target_lifetime` 反复销毁临时绑定后继续读写模型，
+  并用自绑定的 leakcheck/arcguard 检查保持借用语义，不能靠 retain 源对象掩盖错误。
 
 - **A310（已修）**：`comp.prop = f().field;`（Binding<T> 属性 ← 字段左值、但接收者
   产出 owned 临时）曾合成活绑定——活绑定的 `object target` 是**刻意设计的弱引用**
