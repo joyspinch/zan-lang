@@ -18,21 +18,17 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/drivers.yml'
-      # The trigger is the whole runtime source tree, not a hand-listed file
-      # set: everything this workflow ships unity-includes runtime TUs —
-      # gui_runtime.c pulls in the gui_* platform backends, gui_gl_backend,
-      # gui_image_svg, stb_image/stb_vorbis and the vendored libwebp subset;
-      # zan_inflate.c pulls in miniz_tinfl.c — and a missing entry here is
-      # exactly how the committed GUI bundles went silently stale across the
-      # B-ID71 WAV/mixer fixes (never re-triggered, B-ID86), and how a libwebp
-      # upgrade (B-ID84) would have stranded all five GUI drivers again.
-      # Over-triggering is cheap: deterministic rebuilds write back
-      # byte-identical files, which git records as no change at all.
+      # Core GUI, image decoding/cache, audio and game are separate drivers.
+      # Trigger on the runtime tree so their headers and vendored codecs cannot
+      # silently leave a committed driver behind the new ABI.
       - 'src/runtime/**'
       # The linux static GUI driver archive (libzan_gui.a) is glibc-host-built
       # and merged with distro X11 objects; the win-arm64 runtime objects can
       # only be built by an aarch64 mingw toolchain. Both rerun with the tree.
       - 'scripts/build_linux_gui_static.sh'
+      - 'scripts/build_macos_gui.sh'
+      - 'scripts/build_gui_driver.ps1'
+      - 'scripts/build_win_static_drivers.ps1'
       - 'scripts/build_win_rt.sh'
   pull_request:
     paths:
@@ -40,6 +36,9 @@ on:
       - 'src/runtime/**'
       - 'packages/Zan.Data/**'
       - 'scripts/build_linux_gui_static.sh'
+      - 'scripts/build_macos_gui.sh'
+      - 'scripts/build_gui_driver.ps1'
+      - 'scripts/build_win_static_drivers.ps1'
       - 'scripts/build_win_rt.sh'
       - 'scripts/stage_*'
 
@@ -142,7 +141,7 @@ jobs:
           ln -sf liblua5.4.so "$DEST/liblua.so"
           printf 'liblua5.4.so\nliblua.so\n' > "$DEST/lua.bundle"
 
-      - name: Stage Linux static GUI driver
+      - name: Stage Linux GUI/image/audio/game shared and static drivers
         run: bash scripts/build_linux_gui_static.sh "${{ matrix.target }}"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -153,6 +152,9 @@ jobs:
             packages/Zan.Data/src/System/Data/Postgres/drivers/${{ matrix.target }}/
             packages/Zan.Scripting/src/System/Scripting/drivers/${{ matrix.target }}/
             packages/Zan.Gui/src/Gui/drivers/${{ matrix.target }}/
+            packages/Zan.Image/src/System/Drawing/Imaging/drivers/${{ matrix.target }}/
+            packages/Zan.Desktop/src/System/Media/drivers/${{ matrix.target }}/
+            packages/Zan.Game/src/Game/Graphics/drivers/${{ matrix.target }}/
 
   # ---------------------------------------------------------------- macOS ----
   macos:
@@ -232,46 +234,27 @@ jobs:
       # here is what makes `zanc --target macos-*` able to link GUI programs
       # from Windows/Linux: the cross link resolves against this dylib, whose
       # own framework dependencies are bound on the target Mac.
-      - name: Stage zan_gui driver (Cocoa)
-        run: |
-          set -eux
-          DEST="packages/Zan.Gui/src/Gui/drivers/${{ matrix.target }}"
-          mkdir -p "$DEST"
-          xcrun clang -O2 -fPIC -dynamiclib -mmacosx-version-min=11.0 \
-            -install_name @rpath/libzan_gui.dylib -o "$DEST/libzan_gui.dylib" \
-            -DZAN_GUI_COCOA src/runtime/gui_runtime.c src/runtime/gui_runtime_mac.m \
-            -lm -framework Cocoa -framework CoreText -framework QuartzCore \
-            -framework IOSurface -framework WebKit
-          codesign --force --sign - "$DEST/libzan_gui.dylib"
-          printf 'libzan_gui.dylib\n' > "$DEST/zan_gui.bundle"
-          otool -l "$DEST/libzan_gui.dylib" | grep -A3 LC_BUILD_VERSION
-          otool -L "$DEST/libzan_gui.dylib"
+      - name: Stage macOS GUI/image/audio/game shared and static drivers
+        run: bash scripts/build_macos_gui.sh "${{ matrix.target }}"
 
       # The GUI driver has no third-party dependency -- only system frameworks,
       # and the macOS SDK carries both slices -- so the Intel one can be built
       # right here with -arch. That keeps GUI cross-linking for `macos-x64`
       # independent of the (perpetually queued) Intel runner, which is still
       # needed for the brew-installed drivers (libpq/sqlite).
-      - name: Stage zan_gui driver for macos-x64 (cross -arch)
+      - name: Stage macos-x64 native drivers (cross -arch)
         if: matrix.target == 'macos-arm64'
-        run: |
-          set -eux
-          DEST="packages/Zan.Gui/src/Gui/drivers/macos-x64"
-          mkdir -p "$DEST"
-          xcrun clang -O2 -fPIC -dynamiclib -arch x86_64 -mmacosx-version-min=11.0 \
-            -install_name @rpath/libzan_gui.dylib -o "$DEST/libzan_gui.dylib" \
-            -DZAN_GUI_COCOA src/runtime/gui_runtime.c src/runtime/gui_runtime_mac.m \
-            -lm -framework Cocoa -framework CoreText -framework QuartzCore \
-            -framework IOSurface -framework WebKit
-          codesign --force --sign - "$DEST/libzan_gui.dylib"
-          printf 'libzan_gui.dylib\n' > "$DEST/zan_gui.bundle"
-          file "$DEST/libzan_gui.dylib"
+        run: bash scripts/build_macos_gui.sh macos-x64
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: matrix.target == 'macos-arm64'
         with:
           name: gui-macos-x64
-          path: packages/Zan.Gui/src/Gui/drivers/macos-x64/
+          path: |
+            packages/Zan.Gui/src/Gui/drivers/macos-x64/
+            packages/Zan.Image/src/System/Drawing/Imaging/drivers/macos-x64/
+            packages/Zan.Desktop/src/System/Media/drivers/macos-x64/
+            packages/Zan.Game/src/Game/Graphics/drivers/macos-x64/
 
       # Refresh the committed dylibs. A cross link reads them straight out of
       # the working tree, so a GUI runtime change that is not mirrored here
@@ -285,12 +268,17 @@ jobs:
           set -eux
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add packages/Zan.Gui/src/Gui/drivers/macos-arm64 packages/Zan.Gui/src/Gui/drivers/macos-x64
+          for TARGET in macos-arm64 macos-x64; do
+            git add -f "packages/Zan.Gui/src/Gui/drivers/$TARGET" \
+              "packages/Zan.Image/src/System/Drawing/Imaging/drivers/$TARGET" \
+              "packages/Zan.Desktop/src/System/Media/drivers/$TARGET" \
+              "packages/Zan.Game/src/Game/Graphics/drivers/$TARGET"
+          done
           if git diff --cached --quiet; then
             echo "drivers already current"
             exit 0
           fi
-          git commit -m 'drivers: rebuild macOS GUI dylibs (arm64 + x64)'
+          git commit -m 'drivers: rebuild macOS GUI/image/audio/game bundles (arm64 + x64)'
           # The earlier steps leave the brew-staged bundles dirty in the work
           # tree; a plain rebase refuses to run with those around.
           git pull --rebase --autostash origin main
@@ -303,6 +291,9 @@ jobs:
             packages/Zan.Data/src/System/Data/Sqlite/drivers/${{ matrix.target }}/
             packages/Zan.Data/src/System/Data/Postgres/drivers/${{ matrix.target }}/
             packages/Zan.Gui/src/Gui/drivers/${{ matrix.target }}/
+            packages/Zan.Image/src/System/Drawing/Imaging/drivers/${{ matrix.target }}/
+            packages/Zan.Desktop/src/System/Media/drivers/${{ matrix.target }}/
+            packages/Zan.Game/src/Game/Graphics/drivers/${{ matrix.target }}/
             packages/Zan.Scripting/src/System/Scripting/drivers/${{ matrix.target }}/
 
   # -------------------------------------------------------------- Windows ----
@@ -352,27 +343,46 @@ jobs:
       # zan_gui target links it beside gui_runtime.c) -- after zan_dw_* became
       # mandatory the old single-file recipe could no longer link at all, and
       # step-level continue-on-error silently kept the stale DLL.
-      - name: Stage GUI driver
-        # Same reason the build step sits ahead of this one: a missing
-        # CLANGARM64 package here must not stop the runtime objects from
-        # being committed below.
-        continue-on-error: true
+      - name: Stage GUI/image/audio/game shared and static drivers
         run: |
           set -eux
           DEST="packages/Zan.Gui/src/Gui/drivers/${{ matrix.target }}"
-          mkdir -p "$DEST"
-          # C first, then the C++ DirectWrite TU, exactly like the CMake
-          # zan_gui target (gui_runtime.c compiled as C++; unity-included
-          # COM headers misparse). -static-libstdc++ keeps the DLL's import
-          # table system-only (USER32/GDI32/ole32/KERNEL32).
-          cc -O2 -c src/runtime/gui_runtime.c -o zan_gui_core.o
-          c++ -O2 -fno-exceptions -fno-rtti -c src/runtime/gui_runtime_dwrite.cpp \
-            -o zan_gui_dwrite.o
-          c++ -O2 -shared -o "$DEST/zan_gui.dll" zan_gui_core.o zan_gui_dwrite.o \
-            -Wl,--out-implib,"$DEST/libzan_gui.dll.a" \
-            -static-libgcc -static-libstdc++ \
+          IMAGE="packages/Zan.Image/src/System/Drawing/Imaging/drivers/${{ matrix.target }}"
+          AUDIO="packages/Zan.Desktop/src/System/Media/drivers/${{ matrix.target }}"
+          GAME="packages/Zan.Game/src/Game/Graphics/drivers/${{ matrix.target }}"
+          WORK="build/native_drivers/${{ matrix.target }}"
+          mkdir -p "$WORK" "$DEST/static" "$IMAGE/static" "$AUDIO/static" "$GAME/static"
+          # Separate DLL and static objects: _STATIC suppresses PE exports.
+          cc -O2 -DNDEBUG -c src/runtime/gui_runtime.c -o "$WORK/gui.o"
+          cc -O2 -DNDEBUG -DZAN_GUI_STATIC -c src/runtime/gui_runtime.c -o "$WORK/gui.static.o"
+          c++ -O2 -DNDEBUG -fno-exceptions -fno-rtti -c src/runtime/gui_runtime_dwrite.cpp -o "$WORK/dwrite.o"
+          c++ -O2 -DNDEBUG -DZAN_GUI_STATIC -fno-exceptions -fno-rtti -c src/runtime/gui_runtime_dwrite.cpp -o "$WORK/dwrite.static.o"
+          c++ -O2 -shared -o "$DEST/zan_gui.dll" "$WORK/gui.o" "$WORK/dwrite.o" \
+            -Wl,--out-implib,"$DEST/libzan_gui.dll.a" -static-libgcc -static-libstdc++ \
             -luser32 -lgdi32 -ldwmapi -lshcore -limm32 -lole32 -lrpcrt4
-          rm -f zan_gui_core.o zan_gui_dwrite.o
+          rm -f "$DEST/static/libzan_gui.a"
+          ar rcs "$DEST/static/libzan_gui.a" "$WORK/gui.static.o" "$WORK/dwrite.static.o"
+          printf 'dwmapi\ngdi32\nimm32\nuser32\nshcore\nole32\nrpcrt4\n' > "$DEST/static/zan_gui.libs"
+          for FEATURE in image audio game; do
+            NAME="zan_$FEATURE"
+            case "$FEATURE" in
+              image) OUT="$IMAGE"; LIBS="" ;;
+              audio) OUT="$AUDIO"; LIBS="-lole32" ;;
+              game) OUT="$GAME"; LIBS="-L$DEST -L$IMAGE -lzan_gui -lzan_image" ;;
+            esac
+            STATIC="ZAN_$(printf '%s' "$FEATURE" | tr '[:lower:]' '[:upper:]')_STATIC"
+            cc -O2 -DNDEBUG -c "src/runtime/$NAME.c" -o "$WORK/$NAME.o"
+            cc -O2 -DNDEBUG -D"$STATIC" -c "src/runtime/$NAME.c" -o "$WORK/$NAME.static.o"
+            cc -O2 -shared -static-libgcc -o "$OUT/$NAME.dll" "$WORK/$NAME.o" \
+              -Wl,--out-implib,"$OUT/lib$NAME.dll.a" $LIBS
+            rm -f "$OUT/static/lib$NAME.a"
+            ar rcs "$OUT/static/lib$NAME.a" "$WORK/$NAME.static.o"
+            printf '%s.dll\n' "$NAME" > "$OUT/$NAME.bundle"
+          done
+          printf '# Pure decoder/cache: no system-library dependency.\n' > "$IMAGE/static/zan_image.libs"
+          printf 'ole32\n' > "$AUDIO/static/zan_audio.libs"
+          { printf 'zan_gui\nzan_image\n'; cat "$DEST/static/zan_gui.libs"; } > "$GAME/static/zan_game.libs"
+          printf '@driver/zan_gui\n@driver/zan_image\nzan_game.dll\n' > "$GAME/zan_game.bundle"
           # WebView2Loader: the WebView widget resolves it at run time, so the
           # matching arch has to travel with the program.
           curl -fsSL -o wv2.zip \
@@ -391,6 +401,9 @@ jobs:
             toolchain/${{ matrix.target }}/zanrt_*.o
             toolchain/${{ matrix.target }}/mingw/lib/lib*.a
             packages/Zan.Gui/src/Gui/drivers/${{ matrix.target }}/
+            packages/Zan.Image/src/System/Drawing/Imaging/drivers/${{ matrix.target }}/
+            packages/Zan.Desktop/src/System/Media/drivers/${{ matrix.target }}/
+            packages/Zan.Game/src/Game/Graphics/drivers/${{ matrix.target }}/
 
       # PowerShell, not the job's msys2 shell: the MSYS2 environments here ship
       # no git, so the runner's own git has to do the commit.
@@ -410,8 +423,15 @@ jobs:
           # -f is mandatory: *.dll is globally gitignored (.gitignore *.dll),
           # a plain git add silently skips zan_gui.dll/WebView2Loader.dll and
           # the committed bundle goes stale again with the build green.
-          if (Test-Path 'packages/Zan.Gui/src/Gui/drivers/${{ matrix.target }}') {
-            git add -f 'packages/Zan.Gui/src/Gui/drivers/${{ matrix.target }}'
+          $owners = @(
+            'packages/Zan.Gui/src/Gui/drivers',
+            'packages/Zan.Image/src/System/Drawing/Imaging/drivers',
+            'packages/Zan.Desktop/src/System/Media/drivers',
+            'packages/Zan.Game/src/Game/Graphics/drivers'
+          )
+          foreach ($owner in $owners) {
+            $driverPath = "$owner/${{ matrix.target }}"
+            if (Test-Path $driverPath) { git add -f $driverPath }
           }
           git diff --cached --quiet
           if ($LASTEXITCODE -eq 0) {
@@ -514,10 +534,18 @@ jobs:
             packages/Zan.Data/src/System/Data/Sqlite/drivers/${{ matrix.target }}/
             packages/Zan.Data/src/System/Data/Postgres/drivers/${{ matrix.target }}/
             packages/Zan.Scripting/src/System/Scripting/drivers/${{ matrix.target }}/
+            packages/Zan.Gui/src/Gui/drivers/${{ matrix.target }}/
+            packages/Zan.Image/src/System/Drawing/Imaging/drivers/${{ matrix.target }}/
+            packages/Zan.Desktop/src/System/Media/drivers/${{ matrix.target }}/
+            packages/Zan.Game/src/Game/Graphics/drivers/${{ matrix.target }}/
 
   # -------------------------------------------------------------- Release ----
   release:
-    if: startsWith(github.ref, 'refs/tags/')
+    # The arm64 Mac also supplies native x64 drivers when the Intel leg fails.
+    if: >-
+      always() && startsWith(github.ref, 'refs/tags/')
+      && needs.linux.result == 'success' && needs.windows.result == 'success'
+      && (needs.macos.result == 'success' || needs.macos.result == 'failure')
     needs: [linux, macos, windows]
     runs-on: ubuntu-latest
     # Publishes a GitHub Release: the one job that legitimately writes.
@@ -526,6 +554,16 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { path: dist }
+      - name: Merge macos-x64 fallback native drivers
+        run: |
+          if [ -d dist/gui-macos-x64 ]; then
+            mkdir -p dist/drivers-macos-x64
+            cp -a dist/gui-macos-x64/. dist/drivers-macos-x64/
+          fi
+          test -d dist/drivers-macos-arm64
+          for owner in Zan.Gui/src/Gui Zan.Image/src/System/Drawing/Imaging Zan.Desktop/src/System/Media Zan.Game/src/Game/Graphics; do
+            test -d "dist/drivers-macos-x64/$owner/drivers/macos-x64"
+          done
       - name: Zip per-target bundles
         run: cd dist && for d in drivers-*; do zip -r "../$d.zip" "$d"; done
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
