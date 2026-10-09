@@ -72,6 +72,7 @@ GAME_ENGINE_GUIDE 各自的附录），逐文件仓库地图与编译器架构�
 | [projects/zanide/](projects/zanide/STRUCTURE.md) | ZanIDE 项目专属文档（STRUCTURE.md 由 `check_structure.ps1` 强制） |
 | [arpg/](arpg/00-DM3体系总览.md) | ARPG（DM3 体系）参考资料（`templates/game/legend` 引用） |
 | [archive/](archive/) | 历史/过时文档，冻结不随实现更新 |
+| [compiler-finally-cost-2026-10-08](archive/compiler-finally-cost-2026-10-08.md) | async finally 共享发射的规模探针、冻结 OnePlus 对照及已知异常泄漏边界（时点报告） |
 
 ## AI 协作文档（不在本目录）
 

@@ -30,11 +30,11 @@ Gui.Widget 上如鱼得水，因为工具界面用的矩形/文本恰是这套�
 
 ### 1.1 纹理化精灵批（R0，性价比核心）
 
-zan_gui 运行时新增三个能力，GL 与 CPU 兜底路径同步实现：
+渲染栈新增三个能力，GL 与 CPU 兜底路径同步实现。当前精灵批入口归 `zan_game`，图片缓存归 `zan_image`，GUI 提供共享 context 与通用像素合成；driver 边界见 [原生模块文档](native-rendering-modules.md)：
 
 - **图集注册**：内存像素/文件 → GPU 纹理，返回 int 句柄；运行时持引用计数，
   显式卸载。`blit_image` 用同一机制补齐——工具轨的 Image 部件随之直接受益。
-- **精灵批提交**：`zan_gui_sprite_batch(atlas, quads[], n)`——调用方把一层的
+- **精灵批提交**：`zan_game_sprite_batch(surface, handle, quads, count)`——调用方把一层的
   全部四边形（位置/uv/色/翻转打包进预分配数组）**一次 FFI 提交**；GL 侧新增
   textured-quad 顶点种类并入现有批管道（BLEND mode，与几何批共存、按状态切换
   flush）；CPU 兜底按图块裁剪逐个 blit。

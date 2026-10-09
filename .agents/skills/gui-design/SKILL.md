@@ -18,8 +18,8 @@ description: Zan GUI (stdlib/Gui) 审美与排版规范——对齐、间距、�
   状态完整,还原或新写收尾都过一遍)
 - CSS 方言/引擎解析规则全集(选择器/伪元素/单位/已知坑):
   `references/css-dialect.md`(改皮肤或写 CSS 前先查)
-- HTML 窗口开发定式(.html 设计稿五件声明原语、两条建树通道、
-  多按钮切中间区的 Nav 出口、游戏帧内边界):
+- HTML 窗口开发定式(.html 设计稿五件声明原语、三条建树通道、
+  所见所得设计器、Nav 出口、游戏帧内边界):
   `references/html-window.md`(写 .html 设计稿窗口前先读)
 - 复杂窗口的迭代过程纪律(先问框架要、加高标题栏三处同步、动效帧调度、
   弹窗层序、截图驱动的小步收口):`references/layout-iteration.md`
@@ -288,6 +288,10 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   `TabChanged.Add` 类型化接线(On 为空)时,按页签=按空白
   (hitId<0 → pressOnBlocker),释放被 ClickAvailable 判成"点外部"吞掉,
   页签永远切不动。
+- **立即模式点击先过 `app.ClickAvailable()`，再检查命中与可用性**:
+  Ribbon 曾只读 `EventKind()==3` 与 `ClickTarget()`，不泵新事件的重绘
+  会再次执行同一次释放。公共点击判定还包含遮罩、拖拽、长按与消费状态，
+  不要局部重写；回归须验证首次释放生效、同事件下一帧不生效、新点击恢复。
 - **PropSpec 的 str/num/flag 必须绑字段本身,不能绑 getter 返回值**
   (ListItem 教训):`text.str = this.Label()` 绑到的是一份值快照,设计
   通道的 SetProp 写进死快照,界面永不出现;绑 `Text` 字段才拿到编译器
@@ -297,16 +301,13 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   border-bottom 画在控件整框底;页签条内容自然高=theme.heightMedium(34),
   控件 fh 设 44 时两线错开 12px 看着像双下划线。修法是控件 fh 对齐
   heightMedium,不是去改皮肤线位。
-- **设计器画布中控件选中框、默认宽高与预览渲染必须严丝合缝**
-  (Pagination、工业仪表等选区错位与拖拽失效教训):
-  ① `DefaultFreeW(f)` 与 `DefaultFreeH(f)` 必须依据各控件自身真实度量尺寸赋值
-  (如 Pagination 520x36，Switch 50x28，Gauge 160x160)，不可一律兜底成 200x32 导致空旷错位；
-  ② 调色板点击添加(`AddField`)与拖拽添加必须同步赋予正确的 `DefaultFreeW` 和 `DefaultFreeH` 并错落排布；
-  ③ 设计器 `PreviewControl` / `PreviewDisplay` 渲染控件时严禁写死尺寸
-  (如死写 `PvCtrl(..., 160, 160)` 或 `RenderAt(x, y)` 无视 `w`)，必须严格使用设计器传入的 `(w, avail)`，
-  让 8 个缩放手柄拖拽改变大小能够真正实时驱动控件尺寸；
-  ④ 浮层类预览(如 `Popover`、`Popconfirm`)必须在选区原点 `(x, y)` 呈现，禁止硬编码像素偏移；
-  ⑤ 自由画布必须在 `PreviewControl` 外层加 `c.PushClip` 约束，杜绝控件内容意外溢出选区破坏画布。
+- **设计器选框读取实际布局，默认尺寸只用于创建**
+  (Pagination/仪表选区错位及 HTML 设计与运行不一致教训):
+  调色板点击与拖拽添加采用一致的控件自然尺寸，避免统一 200x32 造成
+  空旷错位；完整窗口预览共用 retained tree，选框、拾取、缩放、换父
+  使用实际框。禁止另写逐控件布局或外层裁剪遮盖差异；那会丢掉继承、
+  容器 chrome 和合法 overflow。视图 zoom 只缩放最终图像，细则与
+  几何/像素/交互验证见 `references/html-window.md` 所见所得专节。
 - **富文本/自绘文本的默认前景兜底是纯白**(Arpg 深色底习惯):亮色皮肤
   里标记文本没写色码的段落、以及 #W 白/#Y 纯黄这类深底快捷色,画在
   亮底上全部隐形——不是"渲染丢了"。皮肤补
@@ -625,11 +626,23 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
 
 ## 缩放纪律(DPI:为什么界面忽大忽小)
 
-框架的缩放是自动且不重复的,混乱全是绕开它造成的。机制:主题 token
-(字号/高度/间距)由 `App.ScaleThemeMetrics()` 按"基线×密度档×DPI"统一重算;
-CSS 里非 token 的长度由 `Style.ScaleLayout` 补乘,`StyleBox.IsPrescaled`
-保证来自 `var(--token)` 的值不再乘第二次;Canvas 自绘是唯一例外——
-`Canvas.DrawText` 的 fontSize、手算的坐标间距都不经过任何自动缩放。
+框架样式路径负责自动缩放一次:主题 token (字号/高度/间距)由
+`App.ScaleThemeMetrics()` 按"基线×密度档×DPI"重算;CSS 字面长度在共享
+解析层换算。来源必须随每个标量及级联胜出值保留,不能凭数值等于主题值
+猜测已经缩放。跨 DPI 异常也可能是框架缺陷:曾复现绝对行高、字距、边框
+漏乘 DPI,设计器与运行时共用错误仍能像素相等。验收要同时断言逻辑长度
+的预期换算和同目标 DPI 的布局/像素,发现缺陷修共享层,不在应用里补乘。
+`Canvas.DrawText` 的 fontSize、手算的坐标间距不经过样式自动缩放。
+
+- **每个独立属性独立保留来源**:width/min-width、四侧 padding/margin、
+  gap/row-gap/column-gap 不共用缩放位;shorthand 与 calc 按分量保留来源,
+  `!important` 的值与来源同取胜出声明。共用来源曾使未缩放长度被误当物理值。
+- **内联 style 保留原文,在解析上下文中重放**:不要同时烤进控件标量;
+  替换/清空样式后旧字号、边框与背景曾因此残留。用实际
+  `SetProp("style", ...)`→`ResolveStyle`→量测路径验证初次、替换、清空。
+- **Clone 复制单位环境,文本 fallback 与 rem 基准分别保存**:补拷贝单位
+  环境曾把历史 16px 默认文字悄悄换成主题 14px,改变未声明字号的布局;
+  单位求值应读根字号,文字 fallback 保持原契约,各自只缩放一次。
 
 从截图还原界面时的倍数判定是另一类坑:先按 `references/screenshot-restore.md`
 1.5 节"三票定倍数"判出原图 DPI 档,换算只在布局账本里发生一次;把截图
@@ -759,6 +772,22 @@ ScreenToClient 与应用鼠标坐标同帧对照,不用注入式 SetCursorPos
     `Pagination` 默认吃 `heightMedium` 34 逻辑，原图页脚只有 20 逻辑，加一条
     `pagination { height: 20; font-size: 12; }` 即可），不要回去自绘、也不要在
     每个使用处补坐标。
+
+12. **free 布局（`data-layout-mode="1"`）里浮动只由 `fx`/`fy` 声明；
+    裸 `fw`/`fh` 是自然尺寸声明，控件必须留在流内参与 flex**。
+    `FormBuilder.HasGeometry` 曾把 `fh` 也当浮动几何：「声明高的分隔线 +
+    grow 填充行」的带子里，分隔线被拽出流外钉在 (0,0)——填充行吃满整条
+    带、两者重叠、总高溢出（实证:RunStrip line=22 rule=3,带高只有 22,
+    面板布局测试 `line+rule==22` 抓住）。顺带两条：
+    - 设计 HTML 的 `<hr>` 不是 Element,是 **Divider 控件**（CSS type
+      `divider`）,它的 `divider { height: 1 }` 是**线粗**（OnPaint 按
+      `HeightOr(1)` 画线）。要粗一点的分隔线走 CSS 类
+      （`.runstrip-rule { height: 3; }`）,**不要借 `data-fh`**——那会
+      踩上面这条浮动语义,而且在流内也会被 divider 自己的 CSS 声明压住。
+    - 在 flex 排布路径想再判一次"未声明"没有意义：`StyleWidthIn/
+      StyleHeightIn` **永不返回负值**（未声明回退测量 pref）,-1 只来自
+      `StyleBasisIn`。对它们的结果判 `sz < 0` 是死代码（ ArrangeFlexLine
+      曾白加一层 logH 兜底,两轮测试才确认从不触发）。
 
 这两道闸门随工具链走:安装版 SDK 是发布时刻的冻结副本——早于对应闸门合入
 的安装里没有它们,环境变量静默无效(skill 跑在工具链前面时先查工具链日期,

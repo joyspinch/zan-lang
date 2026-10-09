@@ -92,6 +92,11 @@ build/zanc probe.zan --auto-stdlib --time              # 各阶段耗时
 
 调试构建（`-g`）自动开启泄漏检测与 ARC 检疫（等于 `--check-leaks
 --arc-guard`），程序退出时报告未释放对象并隔离悬垂指针。
+IDE 的 F5 调试使用 `-g --arc-guard --check-leaks --strict-runtime`；项目的
+`strictMemory = 1` 让普通构建/运行也使用这组诊断。发布独立选择模式：
+Release 使用 `--publish`，Debug 使用 `-g --no-arc-guard --no-check-leaks`。
+ARC 检疫会保留已释放的块，内存占用随分配量增长，因此只用于诊断运行，
+本地严格内存选项不覆盖任何平台的发布模式。
 
 泄漏排查时再设环境变量 `ZAN_ARC_TRACE=1` 运行该程序，可打印每笔
 ARC 事件（alloc/retain/release/release-dyn，含对象地址、分配站点索引、
