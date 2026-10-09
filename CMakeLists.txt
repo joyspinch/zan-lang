@@ -114,6 +114,9 @@ endforeach()
 # LLVM 23 split the C-API br opcode (LLVMBr) into LLVMCondBr/LLVMUncondBr;
 # sources pick the right symbol by this major (optimizer.c).
 add_compile_definitions(ZAN_LLVM_MAJOR=${LLVM_VERSION_MAJOR})
+if(WIN32)
+    add_compile_definitions(_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH)
+endif()
 llvm_map_components_to_libnames(LLVM_LIBS ${ZAN_LLVM_COMPONENTS})
 
 # ---- Compiler executable ----
