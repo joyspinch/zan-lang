@@ -104,8 +104,7 @@ foreach(_proj IN LISTS _projs)
   set(_srcs "")
   list(APPEND _srcs ${_out}/${_entry})
   file(GLOB_RECURSE _zan ${_out}/src/*.zan)
-  file(GLOB_RECURSE _designs ${_out}/src/*.html ${_out}/src/*.htm
-    ${_out}/src/*.zscene)
+  file(GLOB_RECURSE _designs ${_out}/src/*.html ${_out}/src/*.htm)
   list(SORT _zan)
   list(SORT _designs)
   # Side design documents (.html next to the entry, e.g. gui-wechat's
