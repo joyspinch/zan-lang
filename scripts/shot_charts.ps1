@@ -2,7 +2,7 @@
 $exe = "d:\project\zan-lang\build\charts_test.exe"
 Get-Process charts_test -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 300
-# Quote the argument so two-word demo names ("Nested rings") survive as one argv entry.
+# 契约：工程辅助自动化与脚本执行规范
 # --nomouse：截图模式（charts_test 把鼠标钉到窗口外，悬停
 # tooltip/轴指示器不再随宿主光标进画面——本机光标归自动化
 # 宿主管理，SetCursorPos/PostMessage 都挪不动它）。

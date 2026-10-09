@@ -12,16 +12,9 @@ Set-Location $root
 # only stdlib widgets, and zanc auto-includes the Chart component sources by
 # namespace when the example `using Gui.Component.Chart;`s them.
 
-Write-Output "[1/2] Building native GUI runtime (Win32, static, mingw ABI)..."
-clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
-    -c src\runtime\gui_runtime.c -o build\zan_gui_charts_gnu.o
-if ($LASTEXITCODE -ne 0) { throw "RUNTIME_COMPILE_FAILED" }
-clang++ --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
-    -fno-exceptions -fno-rtti `
-    -c src\runtime\gui_runtime_dwrite.cpp -o build\zan_gui_dwrite_charts_gnu.o
-if ($LASTEXITCODE -ne 0) { throw "RUNTIME_DWRITE_COMPILE_FAILED" }
-llvm-ar rcs build\libzan_gui_charts_gnu.a build\zan_gui_charts_gnu.o build\zan_gui_dwrite_charts_gnu.o
-if ($LASTEXITCODE -ne 0) { throw "RUNTIME_LIB_FAILED" }
+Write-Output "[1/2] Building independent native drivers (static, mingw ABI)..."
+& (Join-Path $PSScriptRoot "build_gui_driver.ps1") -Static `
+    -Drivers @("zan_gui", "zan_image", "zan_audio")
 
 Write-Output "[2/2] Compiling and linking charts_test.exe..."
 $files = @()
@@ -46,10 +39,8 @@ $zanArgs += @("--embed", "examples\gui_charts\charts-registry.json=charts-regist
 # geo-svg 系列的 registerMap(name, {svg}) 素材），gui_charts 启动时
 # RegisterMaps() 按官方地图名注册进 ChartMaps。
 $zanArgs += @("--embed", "examples\gui_charts\maps")
-$zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_charts_gnu")
-# Native Win32 backend needs only the system libs it imports directly (the
-# runtime's #pragma libs: dwmapi/user32/gdi32/imm32) plus the reactor deps.
-# ole32: WASAPI 音频初始化（CoInitializeEx/CoUninitialize）——缺它链接失败。
+$zanArgs += @("--auto-stdlib", "--link-mode", "static")
+# Each selected driver contributes its own .libs system dependency closure.
 $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
 $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
 $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32")

@@ -9,7 +9,7 @@
 #
 #   scripts/build_macos_rt.sh [path-to-zig]
 #
-# Outputs toolchain/macos/{arm64,x64}/zanrt_{io,io_mt,sync,file,timer}.o. The objects are
+# 契约：工程辅助自动化与脚本执行规范
 # committed (they are our own code; *.o is gitignored, so `git add -f` them).
 # -g0: DWARF in an object that is only ever statically linked is dead weight,
 # and it embeds the build directory, so the bytes differ per machine and CI

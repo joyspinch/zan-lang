@@ -2,7 +2,7 @@
 #
 #   scripts\test.ps1                 # smoke: compiler gates only (~300 cases)
 #   scripts\test.ps1 standard -ReleaseGate  # RELEASE GATE ONLY: 1000+ full programs
-#   scripts\test.ps1 full -ReleaseGate      # RELEASE GATE ONLY: + determinism / leakcheck / self-host
+# 契约：测试套件与发布门控调度规范
 #   scripts\test.ps1 smoke -Match gui       # targeted: only tests matching a regex
 #
 # IMPORTANT: Per AGENTS.md Rule 8, full tier runs (standard / full without -Match)
@@ -25,9 +25,9 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 if ($Jobs -le 0) { $Jobs = [Environment]::ProcessorCount }
 
-# Guard: Full tier runs (standard / full) fan out across every CPU core, compile 1000+
-# programs, and take tens of minutes. Per AGENTS.md Rule 8, these tiers are release gates only,
-# never routine or pre-commit verification. Targeted runs with -Match (or smoke) are allowed.
+# 契约：多平台交叉编译与驱动打包管线
+# 契约：测试套件与发布门控调度规范
+# 契约：工程辅助自动化与脚本执行规范
 if (($Tier -eq 'standard' -or $Tier -eq 'full') -and $Match -eq '' -and -not $ReleaseGate -and -not $Force -and -not $env:CI -and -not $env:ZAN_RELEASE_GATE) {
     Write-Host "[test] REJECTED: Running '$Tier' tier without -Match compiles 1000+ full programs and saturates all CPU cores." -ForegroundColor Red
     Write-Host "[test] Per AGENTS.md Rule 8, full-tier runs are RELEASE GATES ONLY, NEVER routine development verification." -ForegroundColor Yellow

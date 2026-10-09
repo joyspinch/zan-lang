@@ -35,23 +35,10 @@ if ($clangExe -eq "") {
 }
 $clangDir = Split-Path -Parent $clangExe
 
-# ---- 1) native GUI runtime (static, mingw ABI) ----------------------------
-# Win32 native backend (ZAN_GUI_STATIC): the IDE shell, editor and
-# all retained widgets are pure Win32. Compiled for zanc's own
-# x86_64-w64-windows-gnu link ABI so it links straight through the compiler.
-# Rebuilt on every run (the compiler driver auto-links the async reactor).
-	$runtimeLib = Join-Path $root "build\libzan_gui_ide_gnu.a"
-	& $clangExe --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
-	    -c src\runtime\gui_runtime.c -o build\zan_gui_ide_gnu.o
-	if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_COMPILE_FAILED"; exit 1 }
-	$clangCxx = Join-Path $clangDir "clang++.exe"
-	if (-not (Test-Path $clangCxx)) { $clangCxx = $clangExe }
-	& $clangCxx --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
-	    -fno-exceptions -fno-rtti `
-	    -c src\runtime\gui_runtime_dwrite.cpp -o build\zan_gui_dwrite_ide_gnu.o
-	if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_DWRITE_COMPILE_FAILED"; exit 1 }
-	& (Join-Path $clangDir "llvm-ar.exe") rcs $runtimeLib build\zan_gui_ide_gnu.o build\zan_gui_dwrite_ide_gnu.o
-	if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
+# ---- 1) independent native drivers (static, mingw ABI) -------------------
+# zanc selects archives from each module's driver directory by live imports.
+& (Join-Path $PSScriptRoot "build_gui_driver.ps1") -Static -Clang $clangExe `
+    -Drivers @("zan_gui", "zan_image", "zan_audio")
 
 # ---- 2) embedded resources (skins, help topics, ide.css) -------------------
 # Everything the IDE reads as data ships inside the exe and is looked up by name
@@ -190,12 +177,9 @@ if ($env:IDE_NO_PUBLISH -eq "1") { $zanArgs = $zanArgs -ne "--publish" }
 # ever-growing process and a permanent CPU tax. Ask for them explicitly with
 # ZAN_IDE_ZANC_ARGS="--arc-guard --check-leaks" when chasing a leak.
 $zanArgs += @("--no-arc-guard", "--no-check-leaks")
-$zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_ide_gnu")
+$zanArgs += @("--auto-stdlib", "--link-mode", "static")
 $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_gen.o"))
-# Native Win32 backend system deps (dwmapi/user32/gdi32/imm32 + reactor).
-# ole32: zan_audio 的 WASAPI 设备枚举走 COM（CoInitializeEx/CoCreateInstance/
-# CoTaskMemFree），静态驱动归档 libzan_gui_ide_gnu.a 直接引用这些符号；
-# 缺 -lole32 整个链接失败、ZanIDE.exe 出不来（2026-09-09 实测）。
+# Runtime/process system deps; each selected driver adds its own .libs closure.
 $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
 $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
 $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32",

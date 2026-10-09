@@ -45,14 +45,30 @@ EMBED = ["src/runtime/zan_embed_api.c", "src/runtime/rt_timer.h",
          "src/common/host_oom.h"]
 INFLATE = ["src/runtime/zan_inflate.c", "src/common/miniz_tinfl.c",
            "src/common/miniz.h"]
-WASM_GUI = ["src/runtime/gui_runtime.c", "src/runtime/libwebp"]  # unity object
+WASM_GUI = ["src/runtime/gui_runtime.c", "src/runtime/gui_gl_backend.c",
+            "src/runtime/gui_gl_context.c", "src/runtime/gui_runtime_wasm.c",
+            "src/runtime/gui_runtime_glyph.c", "src/runtime/gui_runtime_text.c",
+            "src/runtime/gui_runtime_font.c", "src/runtime/gui_runtime_tray.c",
+            "src/runtime/gui_runtime_shims.c", "src/runtime/gui_runtime_android.c",
+            "src/runtime/gui_backend.h", "src/runtime/gui_gl.h",
+            "src/runtime/zan_gui_graphics.h", "src/runtime/zan_bitmap.h",
+            "src/common/host_oom.h", "toolchain/wasm32/freetype-shim"]
 ANDROID_NDK = []  # NDK-derived: no repo source drives it; never "stale" by src
 OHOS_NDK = []     # same for the OHOS SDK sysroot subset (libc.a, crt*, builtins)
 ZIG_BUNDLED = []  # zig/wasi/musl sysroot subsets + external prebuilts: no repo source
-GUI = sorted(glob.glob("src/runtime/gui_*")) + [
-    "src/runtime/zan_audio.c", "src/runtime/stb_image.h",
-    "src/runtime/stb_vorbis.c", "src/runtime/libwebp",
-    "src/runtime/rt_crash.h", "src/runtime/zan_fortify_compat.c"]
+GUI = [p for p in sorted(glob.glob("src/runtime/gui_*"))
+       if not p.endswith("gui_image_svg.c")] + [
+    "src/runtime/zan_gui_graphics.h", "src/runtime/rt_crash.h",
+    "src/runtime/zan_fortify_compat.c"]
+IMAGE = ["src/runtime/zan_image.c", "src/runtime/zan_image.h",
+         "src/runtime/zan_bitmap.h", "src/runtime/gui_image_svg.c",
+         "src/runtime/stb_image.h", "src/runtime/libwebp",
+         "src/common/host_oom.h"]
+AUDIO = ["src/runtime/zan_audio.c", "src/runtime/stb_vorbis.c",
+         "src/common/host_oom.h"]
+GAME = ["src/runtime/zan_game.c", "src/runtime/zan_game.h",
+        "src/runtime/zan_gui_graphics.h", "src/runtime/zan_image.h",
+        "src/runtime/zan_bitmap.h", "src/runtime/gui_gl.h"]
 
 # (path, sources, group). The groups exist so CI can hold the part it can
 # rebuild -- `--group runtime`, which zig cc produces for every target from one
@@ -140,15 +156,18 @@ ARTIFACTS = [
     ("toolchain/wasm32/zanrt_wasm.o", RT_WASM, "runtime"),
     ("toolchain/wasm32/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/wasm32/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/wasm32/zan_inflate.o", INFLATE, "runtime"),
     # Built with mozbuild clang -fexceptions -mllvm -wasm-enable-eh (zig's
     # clang cannot emit the tag); source lives beside the object. The commit
     # below it keeps the artifact fresh by hand -- see build_cross_rt.cmd.
     ("toolchain/wasm32/zanrt_ehtag.o",
      ["toolchain/wasm32/zanrt_ehtag.c"], "manual"),
-    # GUI software rasterizer as one unity object (gui_runtime.c pulls text/
-    # font/shims and the libwebp tree via #include), plus rt_sync_wasm for
-    # GUI-sized thread/atomic pull-ins. Both built by build_cross_rt.cmd.
+    # Independent core/decoder/audio/game objects plus single-threaded sync,
+    # all built by build_cross_rt.cmd and selected by actual native references.
     ("toolchain/wasm32/zanrt_gui.o", WASM_GUI, "runtime"),
+    ("toolchain/wasm32/zanrt_image.o", IMAGE, "runtime"),
+    ("toolchain/wasm32/zanrt_audio.o", AUDIO, "runtime"),
+    ("toolchain/wasm32/zanrt_game.o", GAME, "runtime"),
     ("toolchain/wasm32/zanrt_syncw.o", ["src/runtime/rt_sync_wasm.c"], "runtime"),
     # wasi-libc subset + external prebuilts (freetype archive): no repo source.
     ("toolchain/wasm32/crt1.o", ZIG_BUNDLED, "manual"),
@@ -270,19 +289,25 @@ ARTIFACTS = [
     ("toolchain/ohos-x64/clang_rt.crtend.o", OHOS_NDK, "manual"),
     ("toolchain/ohos-x64/libclang_rt.builtins.a", OHOS_NDK, "manual"),
     ("toolchain/ohos-x64/libunwind.a", OHOS_NDK, "manual"),
-    ("packages/Zan.Gui/src/Gui/drivers/win-x64/zan_gui.dll", GUI, "gui"),
-    ("packages/Zan.Gui/src/Gui/drivers/win-arm64/zan_gui.dll", GUI, "gui"),
-    ("packages/Zan.Gui/src/Gui/drivers/linux-x64/static/libzan_gui.a", GUI, "gui"),
-    ("packages/Zan.Gui/src/Gui/drivers/linux-arm64/static/libzan_gui.a", GUI, "gui"),
-    ("packages/Zan.Gui/src/Gui/drivers/macos-arm64/libzan_gui.dylib", GUI, "gui"),
-    ("packages/Zan.Gui/src/Gui/drivers/macos-x64/libzan_gui.dylib", GUI, "gui"),
-    ("packages/Zan.Gui/src/Gui/drivers/android-arm64/static/libzan_gui.a", GUI, "gui"),
-    ("packages/Zan.Gui/src/Gui/drivers/android-x64/static/libzan_gui.a", GUI, "gui"),
-    ("packages/Zan.Gui/src/Gui/drivers/ohos-arm64/libzan_gui.so", GUI, "gui"),
-    ("packages/Zan.Gui/src/Gui/drivers/ohos-arm64/static/libzan_gui.a", GUI, "gui"),
-    ("packages/Zan.Gui/src/Gui/drivers/ohos-x64/libzan_gui.so", GUI, "gui"),
-    ("packages/Zan.Gui/src/Gui/drivers/ohos-x64/static/libzan_gui.a", GUI, "gui"),
 ]
+
+# Keep the existing `gui` policy group for all native feature drivers, while
+# tracking each driver's actual source closure instead of a unity aggregate.
+for platform in ("win", "linux", "macos", "android", "ohos"):
+    for arch in ("x64", "arm64"):
+        target = f"{platform}-{arch}"
+        for driver, owner, sources in (
+            ("zan_gui", "packages/Zan.Gui/src/Gui/drivers", GUI),
+            ("zan_image", "packages/Zan.Image/src/System/Drawing/Imaging/drivers", IMAGE),
+            ("zan_audio", "packages/Zan.Desktop/src/System/Media/drivers", AUDIO),
+            ("zan_game", "packages/Zan.Game/src/Game/Graphics/drivers", GAME),
+        ):
+            suffix = ".dll" if platform == "win" else ".dylib" if platform == "macos" else ".so"
+            prefix = "" if platform == "win" else "lib"
+            ARTIFACTS.append((f"{owner}/{target}/{prefix}{driver}{suffix}", sources, "gui"))
+            ARTIFACTS.append((f"{owner}/{target}/static/lib{driver}.a", sources, "gui"))
+            if platform == "win":
+                ARTIFACTS.append((f"{owner}/{target}/lib{driver}.dll.a", sources, "gui"))
 
 
 _commit_cache = {}
@@ -372,17 +397,39 @@ def rebuild_cmd(artifact, zig, ndk):
         # zanrt_ehtag.o needs mozbuild clang's wasm EH backend -- no builder.
         if not zig or name == "zanrt_ehtag.o":
             return None
+        if name == "zan_inflate.o":
+            return [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=c11",
+                    "-O2", "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS",
+                    "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME",
+                    "-DMINIZ_NO_ARCHIVE_WRITERS", "-I", "src/common",
+                    "-c", f"{rt}/zan_inflate.c"]
         if name == "zanrt_gui.o":
-            # Unity GUI object; the freetype variant only when both inputs the
-            # .cmd checks are present, else the bitmap-font fallback build.
+            # Core text/drawing only; retain the .cmd's FreeType detection and
+            # bitmap-font fallback, with the same static export contract.
             cmd = [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11",
-                   "-I", rt, "-I", f"{rt}/libwebp/src", "-O2", "-DZAN_GUI_WASM"]
+                   "-I", rt]
             ft_inc = os.environ.get("FREETYPE_INC") or "D:/project/firefox/modules/freetype2/include"
-            if (os.path.isfile(os.path.join(ft_inc, "ft2build.h"))
-                    and os.path.isfile("toolchain/wasm32/libfreetype.a")):
-                cmd += ["-I", ft_inc, "-I", "toolchain/wasm32/freetype-shim",
-                        "-DZAN_GUI_FREETYPE"]
-            return cmd + ["-c", f"{rt}/gui_runtime.c"]
+            with_freetype = (os.path.isfile(os.path.join(ft_inc, "ft2build.h"))
+                             and os.path.isfile("toolchain/wasm32/libfreetype.a"))
+            if with_freetype:
+                cmd += ["-I", ft_inc, "-I", "toolchain/wasm32/freetype-shim"]
+            cmd += ["-O2", "-c", f"{rt}/gui_runtime.c", "-DZAN_GUI_WASM",
+                    "-DZAN_GUI_STATIC"]
+            if with_freetype:
+                cmd += ["-DZAN_GUI_FREETYPE"]
+            return cmd
+        feature_sources = {
+            "zanrt_image.o": ("zan_image.c", "ZAN_IMAGE_STATIC"),
+            "zanrt_audio.o": ("zan_audio.c", "ZAN_AUDIO_STATIC"),
+            "zanrt_game.o": ("zan_game.c", "ZAN_GAME_STATIC"),
+        }
+        if name in feature_sources:
+            source, static_macro = feature_sources[name]
+            cmd = [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11",
+                   "-I", rt]
+            if name == "zanrt_image.o":
+                cmd += ["-I", f"{rt}/libwebp/src"]
+            return cmd + ["-O2", "-c", f"{rt}/{source}", f"-D{static_macro}"]
         if name == "zanrt_syncw.o":
             return [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11",
                     "-I", rt, "-O2", "-c", f"{rt}/rt_sync_wasm.c"]
@@ -623,12 +670,12 @@ def do_rebuild():
         outdir = "toolchain/wasm32"
         os.makedirs(outdir, exist_ok=True)
         print("Building wasm32...")
-        subprocess.run([zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=c11", "-I", rt, "-O2", "-c", f"{rt}/rt_wasm.c", "-o", f"{outdir}/zanrt_wasm.o"], check=True)
-        subprocess.run([zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=c11", "-I", rt, "-O2", "-c", f"{rt}/rt_file.c", "-o", f"{outdir}/zanrt_file.o"], check=True)
-        subprocess.run([zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=c11", "-I", rt, "-O2", "-c", f"{rt}/rt_timer.c", "-o", f"{outdir}/zanrt_timer.o"], check=True)
-        subprocess.run([zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=c11", "-I", rt, "-O2", "-c", f"{rt}/rt_timer.c", "-o", f"{outdir}/zanrt_timer.o"], check=True)
-        subprocess.run([zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11", "-I", rt, "-I", f"{rt}/libwebp/src", "-O2", "-c", f"{rt}/gui_runtime.c", "-o", f"{outdir}/zanrt_gui.o", "-DZAN_GUI_WASM"], check=True)
-        subprocess.run([zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11", "-I", rt, "-O2", "-c", f"{rt}/rt_sync_wasm.c", "-o", f"{outdir}/zanrt_syncw.o"], check=True)
+        for name in ("zanrt_wasm.o", "zanrt_file.o", "zanrt_timer.o",
+                     "zan_inflate.o", "zanrt_gui.o", "zanrt_image.o", "zanrt_audio.o",
+                     "zanrt_game.o", "zanrt_syncw.o"):
+            artifact = f"{outdir}/{name}"
+            cmd = rebuild_cmd(artifact, zig, ndk)
+            subprocess.run(cmd + ["-o", artifact], check=True)
 
         # ohos: delegate to the proven NDK-free recipe rather than duplicating
         # its flag table here (same call shape as build_cross_rt.cmd's fallback).

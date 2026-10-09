@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
-# Build the self-contained static Linux GUI driver archive
-#   packages/Zan.Gui/src/Gui/drivers/<target>/static/libzan_gui.a
-# that zanc links into --target linux-{x64,arm64} GUI builds.
-#
-# The archive is: gui_runtime.c compiled as a single translation unit
-# with -DZAN_GUI_STATIC -DZAN_GUI_FREETYPE, merged together with the
-# static system X11 archives (libX11.a, libXau.a, libxcb.a) into a single .a archive.
+# Build/stage independent Linux GUI, image, audio and game shared/static drivers.
+# GUI keeps its existing bundled X11 objects and font backend. Image decoding
+# and audio are standalone archives; game links the GUI/image shared context.
+# For cross builds set CC, AR and PKG_CONFIG_LIBDIR for the requested target.
 #
 # Usage: scripts/build_linux_gui_static.sh [linux-x64|linux-arm64]
 set -euo pipefail
@@ -29,11 +26,15 @@ case "$TARGET" in
 esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="$ROOT/packages/Zan.Gui/src/Gui/drivers/$TARGET/static"
+GUI="$ROOT/packages/Zan.Gui/src/Gui/drivers/$TARGET"
+IMAGE="$ROOT/packages/Zan.Image/src/System/Drawing/Imaging/drivers/$TARGET"
+AUDIO="$ROOT/packages/Zan.Desktop/src/System/Media/drivers/$TARGET"
+GAME="$ROOT/packages/Zan.Game/src/Game/Graphics/drivers/$TARGET"
+DEST="$GUI/static"
 WORK="$ROOT/build/linux_gui_drivers_$ARCH_SUFFIX"
-mkdir -p "$DEST" "$WORK"
+mkdir -p "$DEST" "$IMAGE/static" "$AUDIO/static" "$GAME/static" "$WORK"
 
-echo "== [1/3] Compiling gui_runtime.c for $TARGET =="
+echo "== [1/3] Compiling independent native drivers for $TARGET =="
 CC="${CC:-gcc}"
 AR="${AR:-ar}"
 
@@ -57,6 +58,12 @@ $CC -O2 -g0 -DNDEBUG -ffunction-sections -fdata-sections -fPIC -std=gnu11 \
     $FT_CFLAGS \
     -I"$ROOT/src/runtime" \
     -c "$ROOT/src/runtime/gui_runtime.c" -o "$WORK/zan_gui_${ARCH_SUFFIX}.o"
+
+for feature in image audio game; do
+    $CC -O2 -g0 -DNDEBUG -ffunction-sections -fdata-sections -fPIC -std=gnu11 \
+        -U_FORTIFY_SOURCE -DZAN_NO_EXECINFO -D"ZAN_${feature^^}_STATIC" \
+        -I"$ROOT/src/runtime" -c "$ROOT/src/runtime/zan_$feature.c" -o "$WORK/zan_$feature.o"
+done
 
 echo "== [1b] Compiling fortify/link shims =="
 # -U_FORTIFY_SOURCE is mandatory here: with it, this file's own memcpy/... would
@@ -103,5 +110,26 @@ echo "== [3/3] Creating merged static archive libzan_gui.a =="
 rm -f "$DEST/libzan_gui.a"
 $AR rcs "$DEST/libzan_gui.a" "$WORK/zan_gui_${ARCH_SUFFIX}.o" "$WORK/zan_fortify_compat.o" "$X_OBJS_DIR"/*/*.o 2>/dev/null || \
 $AR rcs "$DEST/libzan_gui.a" "$WORK/zan_gui_${ARCH_SUFFIX}.o" "$WORK/zan_fortify_compat.o"
+rm -f "$IMAGE/static/libzan_image.a" "$AUDIO/static/libzan_audio.a" "$GAME/static/libzan_game.a"
+$AR rcs "$IMAGE/static/libzan_image.a" "$WORK/zan_image.o"
+$AR rcs "$AUDIO/static/libzan_audio.a" "$WORK/zan_audio.o"
+$AR rcs "$GAME/static/libzan_game.a" "$WORK/zan_game.o"
+printf 'freetype\nfontconfig\ndl\npthread\nm\n' > "$DEST/zan_gui.libs"
+printf 'm\n' > "$IMAGE/static/zan_image.libs"
+printf 'dl\npthread\nm\n' > "$AUDIO/static/zan_audio.libs"
+{ printf 'zan_gui\nzan_image\n'; cat "$DEST/zan_gui.libs"; } > "$GAME/static/zan_game.libs"
 
-echo "Successfully generated $DEST/libzan_gui.a"
+# Build the shared form from the same independent objects. $ORIGIN lets a
+# published game driver find the two dependent libraries beside it.
+$CC -shared -Wl,-soname,libzan_gui.so -o "$GUI/libzan_gui.so" \
+    "$WORK/zan_gui_${ARCH_SUFFIX}.o" \
+    -lX11 $(pkg-config --libs freetype2 fontconfig) -ldl -lpthread -lm
+$CC -shared -Wl,-soname,libzan_image.so -o "$IMAGE/libzan_image.so" "$WORK/zan_image.o" -lm
+$CC -shared -Wl,-soname,libzan_audio.so -o "$AUDIO/libzan_audio.so" "$WORK/zan_audio.o" -ldl -lpthread -lm
+$CC -shared -Wl,-soname,libzan_game.so -Wl,-rpath,'$ORIGIN' \
+    -o "$GAME/libzan_game.so" "$WORK/zan_game.o" -L"$GUI" -L"$IMAGE" -lzan_gui -lzan_image -lm
+printf 'libzan_gui.so\n' > "$GUI/zan_gui.bundle"
+printf 'libzan_image.so\n' > "$IMAGE/zan_image.bundle"
+printf 'libzan_audio.so\n' > "$AUDIO/zan_audio.bundle"
+printf '@driver/zan_gui\n@driver/zan_image\nlibzan_game.so\n' > "$GAME/zan_game.bundle"
+echo "Successfully generated GUI/image/audio/game shared and static drivers for $TARGET"

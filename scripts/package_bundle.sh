@@ -26,6 +26,44 @@ for exe in zanc zan-lsp zan-dap zanfmt zandoc; do
     [ -f "build/$exe" ] && cp "build/$exe" "$stage/toolchain/"
 done
 
+# --emit-lib needs an indexed archive writer for this SDK's host, regardless
+# of the archive's target. Prefer the LLVM installation used by the build.
+llvm_bin="${LLVM_TOOLS_BINARY_DIR:-}"
+llvm_dir="${LLVM_DIR:-}"
+configured_cc=""
+if [ -f build/CMakeCache.txt ]; then
+    while IFS= read -r entry; do
+        case "$entry" in
+            LLVM_TOOLS_BINARY_DIR:*=*) llvm_bin="${entry#*=}" ;;
+            LLVM_DIR:*=*) llvm_dir="${entry#*=}" ;;
+            CMAKE_C_COMPILER:*=*) configured_cc="${entry#*=}" ;;
+        esac
+    done < build/CMakeCache.txt
+fi
+llvm_ar_candidates=("build/llvm-ar")
+[ -z "$llvm_bin" ] || llvm_ar_candidates+=("$llvm_bin/llvm-ar")
+if [ -n "$llvm_dir" ]; then
+    llvm_ar_candidates+=("$llvm_dir/../bin/llvm-ar" "$llvm_dir/../../../bin/llvm-ar")
+fi
+[ -z "$configured_cc" ] || llvm_ar_candidates+=("${configured_cc%/*}/llvm-ar")
+[ -z "${LLVM_ROOT:-}" ] || llvm_ar_candidates+=("$LLVM_ROOT/bin/llvm-ar")
+[ -z "${LLVM_PATH:-}" ] || llvm_ar_candidates+=("$LLVM_PATH/bin/llvm-ar")
+if command -v llvm-ar >/dev/null 2>&1; then
+    llvm_ar_candidates+=("$(command -v llvm-ar)")
+fi
+llvm_ar=""
+for candidate in "${llvm_ar_candidates[@]}"; do
+    if [ -x "$candidate" ] && [ -f "$candidate" ]; then
+        llvm_ar="$candidate"
+        break
+    fi
+done
+if [ -z "$llvm_ar" ]; then
+    echo "package_bundle: host llvm-ar missing; install the configured LLVM tools" >&2
+    exit 1
+fi
+cp "$llvm_ar" "$stage/toolchain/llvm-ar"
+
 # cross sysroot + runtime objects that travel next to zanc
 for sys in linux-musl linux-arm64 win-x64 win-arm64 wasm32 riscv64 macos ohos-x64 ohos-arm64; do
     [ -d "build/$sys" ] && cp -r "build/$sys" "$stage/toolchain/"

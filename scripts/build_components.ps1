@@ -1,22 +1,11 @@
+# Build the components demo with zanc's normal driver selection/link path.
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
-$files = @()
-$files += (Get-ChildItem packages\Zan.Gui\src\Gui\*.zan).FullName
-$files += (Get-ChildItem packages\Zan.Gui\src\Gui\Widget\*.zan).FullName
-$files += (Join-Path (Get-Location) "examples\components_demo.zan")
-Push-Location build
-$ir = & .\zanc.exe --emit-ir $files
-$code = $LASTEXITCODE
-if ($code -eq 0) {
-    [System.IO.File]::WriteAllLines((Join-Path (Get-Location) "components_demo.ll"), $ir)
-} else {
-    Write-Output "IR_FAILED code=$code"
-    Pop-Location
-    exit 1
-}
-clang components_demo.ll zan_icon.res -o components_demo.exe -O2 -Xlinker /STACK:268435456 -Xlinker /SUBSYSTEM:WINDOWS -Xlinker /ENTRY:mainCRTStartup -lzan_gui
-$lc = $LASTEXITCODE
-Pop-Location
-if ($lc -ne 0) { Write-Output "LINK_FAILED code=$lc"; exit 1 }
-Write-Output "COMPONENTS_BUILD_OK"
+& (Join-Path $PSScriptRoot "build_gui_driver.ps1") -Static `
+    -Drivers @("zan_gui", "zan_image", "zan_audio")
+& build\zanc.exe examples\components_demo.zan --auto-stdlib `
+    --link-mode static --subsystem windows --icon assets\zan.ico `
+    -o build\components_demo.exe
+if ($LASTEXITCODE -ne 0) { throw "COMPONENTS_LINK_FAILED code=$LASTEXITCODE" }
+Write-Output "COMPONENTS_BUILD_OK build\components_demo.exe"

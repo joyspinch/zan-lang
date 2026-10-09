@@ -4,7 +4,7 @@ $gui = @(Get-ChildItem -Recurse packages\Zan.Gui\src\Gui -Filter *.zan | ForEach
 foreach($g in $gui){
   $p = Start-Process -FilePath .\build\zanc1.exe -ArgumentList @("build\pf.ll",$g) -RedirectStandardError build\pf_e.txt -PassThru -WindowStyle Hidden
   if($p.WaitForExit(4000)){
-    # only note quick ones that are NOT simple error exits (rc0 unexpected) - we care about HANG
+    # 契约：工程辅助自动化与脚本执行规范
   } else {
     $p.Kill()
     "HANG: $($g -replace [regex]::Escape((Get-Location).Path + '\'),'')" | Out-File build\pf_status.txt -Append -Encoding utf8

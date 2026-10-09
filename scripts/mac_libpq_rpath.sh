@@ -33,7 +33,7 @@ cat > /tmp/iso2/t.c <<'EOF'
 int main(){ void*h=dlopen("libpq.5.dylib",RTLD_NOW); if(!h){printf("FAIL %s\n",dlerror());return 1;}
   void*(*v)(void)=dlsym(h,"PQlibVersion"); printf("OK libpq loaded via rpath\n"); return 0; }
 EOF
-# build with LC_RPATH=@loader_path so bare "libpq.5.dylib"->@rpath resolves beside the exe
+# 契约：多平台交叉编译与驱动打包管线
 clang -arch arm64 -Wl,-rpath,@loader_path /tmp/iso2/t.c -o /tmp/iso2/t \
   -L/tmp/iso2 -lpq
 cd /tmp/iso2 && env -i ./t

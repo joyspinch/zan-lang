@@ -206,6 +206,40 @@ if (Test-Path $ld) {
 } else {
     Write-Output "PUBLISH_WARN: build\ld.exe missing; dist zanc will need a system LLVM/clang on PATH"
 }
+# --emit-lib uses a real indexed archive; ship the host LLVM tool next to zanc.
+function Find-HostLlvmAr([string]$buildDir) {
+    $candidates = @((Join-Path $buildDir "llvm-ar.exe"))
+    $cache = Join-Path $buildDir "CMakeCache.txt"
+    if (Test-Path -LiteralPath $cache -PathType Leaf) {
+        foreach ($key in @("LLVM_TOOLS_BINARY_DIR", "LLVM_DIR", "CMAKE_C_COMPILER")) {
+            $entry = Select-String -LiteralPath $cache -Pattern "^${key}:[^=]*=(.+)$" |
+                     Select-Object -First 1
+            if (-not $entry) { continue }
+            $value = $entry.Matches[0].Groups[1].Value.Trim()
+            switch ($key) {
+                "LLVM_TOOLS_BINARY_DIR" { $candidates += Join-Path $value "llvm-ar.exe" }
+                "LLVM_DIR" { $candidates += Join-Path $value "../../../bin/llvm-ar.exe" }
+                "CMAKE_C_COMPILER" { $candidates += Join-Path (Split-Path -Parent $value) "llvm-ar.exe" }
+            }
+        }
+    }
+    foreach ($prefix in @($env:LLVM_ROOT, $env:LLVM_PATH)) {
+        if ($prefix) { $candidates += Join-Path $prefix "bin/llvm-ar.exe" }
+    }
+    $onPath = Get-Command llvm-ar.exe -CommandType Application -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+    if ($onPath) { $candidates += $onPath.Source }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return [IO.Path]::GetFullPath($candidate)
+        }
+    }
+    return $null
+}
+$llvmAr = Find-HostLlvmAr $b
+if (-not $llvmAr) { throw "PUBLISH_FAILED: host llvm-ar.exe missing; install the configured LLVM tools" }
+Copy-Item -LiteralPath $llvmAr -Destination (Join-Path $distTc 'llvm-ar.exe') -Force
+
 foreach ($sub in @('linux-musl', 'linux-arm64', 'linux-riscv64', 'win-x64', 'win-arm64', 'wasm32', 'riscv64', 'macos', 'ios', 'ohos-x64', 'ohos-arm64')) {
     $sys = Join-Path $b $sub
     if (-not (Test-Path $sys)) {
@@ -219,12 +253,40 @@ foreach ($rt in (Get-ChildItem $b -File -ErrorAction SilentlyContinue |
     Copy-Item $rt.FullName (Join-Path $distTc $rt.Name)
 }
 
-# ---- native GUI runtime (linked when the IDE builds/runs GUI projects) ----
-# Without this, user GUI/window projects fail to link (undefined zan_gui_* /
-# sprintf). The IDE passes -L<toolchain> -lzan_gui when a project is type=gui.
-$guiLib = Join-Path $b 'zan_gui.lib'
-if (Test-Path $guiLib) { Copy-Item $guiLib (Join-Path $distTc 'zan_gui.lib') }
-else { Write-Output "PUBLISH_WARN: build\zan_gui.lib missing; GUI projects will not link" }
+# ---- independent native drivers (legacy toolchain lookup support) ---------
+# Canonical shared/static bundles remain in each package owner directory.
+# Also keep every freshly built DLL and both import formats beside zanc for
+# callers that explicitly select this directory with --driver-dir.
+$nativeOwners = @{
+    zan_gui = 'packages/Zan.Gui/src/Gui/drivers'
+    zan_image = 'packages/Zan.Image/src/System/Drawing/Imaging/drivers'
+    zan_audio = 'packages/Zan.Desktop/src/System/Media/drivers'
+    zan_game = 'packages/Zan.Game/src/Game/Graphics/drivers'
+}
+foreach ($driver in @('zan_gui', 'zan_image', 'zan_audio', 'zan_game')) {
+    foreach ($name in @("$driver.dll", "$driver.lib", "lib$driver.dll.a")) {
+        $nativeFile = Join-Path $b $name
+        if (Test-Path $nativeFile) { Copy-Item $nativeFile (Join-Path $distTc $name) }
+    }
+    $ownerDir = Join-Path (Join-Path $root $nativeOwners[$driver]) 'win-x64'
+    $bundleName = "$driver.bundle"
+    $bundle = Join-Path $b $bundleName
+    if (-not (Test-Path -LiteralPath $bundle -PathType Leaf)) { $bundle = Join-Path $ownerDir $bundleName }
+    if (Test-Path -LiteralPath $bundle -PathType Leaf) {
+        Copy-Item -LiteralPath $bundle -Destination (Join-Path $distTc $bundleName) -Force
+        # Carry conditional runtime payloads (e.g. WebView2Loader if WebView).
+        foreach ($entry in (Get-Content -LiteralPath $bundle)) {
+            if ($entry -match '^\s*([^#@\s]+)\s+if\s+\S+\s*$') {
+                $payloadName = $Matches[1]
+                $payload = Join-Path $b $payloadName
+                if (-not (Test-Path -LiteralPath $payload -PathType Leaf)) { $payload = Join-Path $ownerDir $payloadName }
+                if (Test-Path -LiteralPath $payload -PathType Leaf) {
+                    Copy-Item -LiteralPath $payload -Destination (Join-Path $distTc $payloadName) -Force
+                }
+            }
+        }
+    }
+}
 
 # ---- bundle the native debugger (gdb) so debugging is out-of-the-box ----
 # zan-dap resolves gdb next to itself first (toolchain\debugger\bin\gdb.exe),

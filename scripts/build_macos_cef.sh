@@ -1,5 +1,5 @@
 #!/bin/sh
-# Cross-build the macOS CEF driver (packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser) without a
+# 契约：多平台交叉编译与驱动打包管线
 # Mac and without an Apple SDK: `zig cc` carries the Darwin libc headers, and
 # zan_cef.c only imports libSystem symbols (AppKit is reached through dlopen'd
 # libobjc at run time), so the same trick scripts/build_macos_rt.sh uses works
@@ -15,7 +15,7 @@
 # range covers it -- writing the number twice is exactly how the earlier
 # "cef api hash mismatch" happened.
 #
-# Outputs, into packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/drivers/macos-{arm64,x64} -- the
+# 契约：底层平台运行时与本地驱动依赖
 # directories zanc bundles from (zan_driver_subdir() in src/compiler/main.c):
 #   libzan_cef.dylib   the driver
 #   zan_cef_helper     the Chromium subprocess executable of macOS bundles

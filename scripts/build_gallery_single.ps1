@@ -20,28 +20,10 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-# ---- native GUI runtime + embed API (static, mingw ABI, Win32 backend) ----
-Write-Output "[1/4] Building static native GUI runtime + embed API ..."
-clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
-    -c src\runtime\gui_runtime.c -o build\zan_gui_gallery_gnu.o
-if ($LASTEXITCODE -ne 0) { throw "RUNTIME_COMPILE_FAILED" }
-clang --target=x86_64-w64-windows-gnu -O2 `
-    -c src\runtime\zan_embed_api.c -o build\zan_embed_api.o
-if ($LASTEXITCODE -ne 0) { throw "EMBED_API_COMPILE_FAILED" }
-# irgen emits zan_rt_guard_fail2/soft_note2 (guard-string dedup, dda956d3)
-# from rt_timer.c; the archive must carry it or guard sites fail to link.
-clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
-    -c src\runtime\rt_timer.c -o build\zan_gui_gallery_timer_gnu.o
-if ($LASTEXITCODE -ne 0) { throw "TIMER_COMPILE_FAILED" }
-# Text shaping goes through the DirectWrite backend: gui_runtime.c only
-# declares zan_dw_render, the implementation lives in gui_runtime_dwrite.cpp
-# (it LoadLibraryW's dwrite.dll at runtime, so no import lib is needed).
-clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
-    -fno-exceptions -fno-rtti `
-    -c src\runtime\gui_runtime_dwrite.cpp -o build\zan_gui_dwrite_gallery_gnu.o
-if ($LASTEXITCODE -ne 0) { throw "RUNTIME_DWRITE_COMPILE_FAILED" }
-llvm-ar rcs build\libzan_gui_gallery_gnu.a build\zan_gui_gallery_gnu.o build\zan_embed_api.o build\zan_gui_gallery_timer_gnu.o build\zan_gui_dwrite_gallery_gnu.o
-if ($LASTEXITCODE -ne 0) { throw "RUNTIME_LIB_FAILED" }
+# ---- independent native drivers (static, mingw ABI, Win32 backend) --------
+Write-Output "[1/4] Building static native drivers ..."
+& (Join-Path $PSScriptRoot "build_gui_driver.ps1") -Static `
+    -Drivers @("zan_gui", "zan_image", "zan_audio") -StageRoot "build\static_driver"
 
 # ---- bake the skin packs (base.css + skins) into the exe -----------------
 Write-Output "[2/4] Embedding skin packs (base.css + all skins) ..."
@@ -61,10 +43,8 @@ if ($LASTEXITCODE -ne 0) { throw "EMBED_GEN_FAILED" }
 # -lssl/-lcrypto is dropped from the link line, keeping ~5.5 MB of OpenSSL
 # out of the exe. A program that DOES use https stages the archives (or
 # publishes shared) and links the real thing.
-$staticDriver = Join-Path $root "build\static_driver\static"
-New-Item -ItemType Directory -Path $staticDriver -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $root "build\libzan_gui_gallery_gnu.a") `
-    -Destination (Join-Path $staticDriver "libzan_gui.a") -Force
+# The unified recipe already staged GUI/image/audio archives and their .libs
+# into build/static_driver/static. Runtime/timer/embed objects are zanc-owned.
 
 # ---- compile + link through zanc (its own bundled ld) --------------------
 Write-Output "[3/4] Compiling and linking gui_gallery (static, single file) ..."
@@ -90,11 +70,10 @@ $zanArgs += @("--link-mode", "static", "--driver-dir", (Join-Path $root "build\s
 # the exe; File.ReadAllText falls back to the embedded copy when the loose
 # file is not next to the binary (the single-file output has no siblings).
 $zanArgs += @("--embed", "examples\gui_gallery\assets=assets")
-$zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_gallery_gnu")
+$zanArgs += @("--auto-stdlib")
 $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_gen_gallery.o"))
-# Native Win32 backend needs only the system libs it imports directly (the
-# runtime's #pragma libs: dwmapi/user32/gdi32/imm32) plus the reactor deps;
-# ole32 covers the WASAPI audio block (gui_runtime.c includes zan_audio.c).
+# Native driver system dependencies come from the staged .libs files;
+# keep the existing runtime/process dependencies for the gallery link.
 $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
 $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
 $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32")

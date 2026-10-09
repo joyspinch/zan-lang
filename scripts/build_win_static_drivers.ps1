@@ -1,6 +1,6 @@
 # Builds the native static driver archives used by Windows x64 single-file
-# publishes. The GUI recipe matches build_ide.ps1; SQLite is built from the
-# pinned amalgamation used by .github/workflows/drivers.yml.
+# publishes. GUI/image/audio/game reuse build_gui_driver.ps1; SQLite is built
+# from the pinned amalgamation used by .github/workflows/drivers.yml.
 #
 # OpenSSL static archives are staged by the drivers workflow from the MSYS2
 # OpenSSL package. This developer-side script does not build OpenSSL from
@@ -14,86 +14,14 @@ function Fail([string]$mark, [string]$message) {
     exit 1
 }
 
-$guiDir = Join-Path $root "packages\Zan.Gui\src\Gui\drivers\win-x64"
-$sqliteDir = Join-Path $root "stdlib\System\Data\Sqlite\drivers\win-x64"
-$guiStatic = Join-Path $guiDir "static"
+# Each native feature gets its own owner directory/archive; compiling the game
+# driver here does not force it into a GUI application's link.
+& (Join-Path $PSScriptRoot "build_gui_driver.ps1") -Static
+
+$sqliteDir = Join-Path $root "packages\Zan.Data\src\System\Data\Sqlite\drivers\win-x64"
 $sqliteStatic = Join-Path $sqliteDir "static"
 $work = Join-Path $root "build\win_static_drivers"
-New-Item -ItemType Directory -Force -Path $guiStatic, $sqliteStatic, $work | Out-Null
-
-$guiObj = Join-Path $work "zan_gui_win_x64.o"
-$guiArchive = Join-Path $guiStatic "libzan_gui.a"
-# -DNDEBUG drops the vendored libs' assert() strings, whose __FILE__ otherwise
-# leak build-machine paths (D:\<repo>\src\runtime\libwebp/...) into every
-# single-file publish. On-demand subsystems use archive-member granularity
-# instead of --gc-sections: GNU ld's PE link keeps .text$-grouped sections
-# no matter what, so ZAN_GUI_AUDIO_SEPARATE splits the WASAPI mixer
-# (+ stb_vorbis) into its own member that is pulled only when the program's
-# DllImport surface actually references zan_audio_*.
-try {
-    & clang --target=x86_64-w64-windows-gnu -O2 -DNDEBUG -DZAN_GUI_STATIC `
-        -DZAN_GUI_AUDIO_SEPARATE `
-        -c (Join-Path $root "src\runtime\gui_runtime.c") -o $guiObj
-    if ($LASTEXITCODE -ne 0) {
-        Fail "GUI_RUNTIME_COMPILE_FAILED" "clang returned $LASTEXITCODE"
-    }
-} catch {
-    Fail "GUI_RUNTIME_COMPILE_FAILED" $_.Exception.Message
-}
-
-$dwriteObj = Join-Path $work "zan_gui_dwrite_win_x64.o"
-try {
-    & clang++ --target=x86_64-w64-windows-gnu -O2 -DNDEBUG `
-        -fno-exceptions -fno-rtti `
-        -c (Join-Path $root "src\runtime\gui_runtime_dwrite.cpp") -o $dwriteObj
-    if ($LASTEXITCODE -ne 0) {
-        Fail "GUI_DWRITE_COMPILE_FAILED" "clang++ returned $LASTEXITCODE"
-    }
-} catch {
-    Fail "GUI_DWRITE_COMPILE_FAILED" $_.Exception.Message
-}
-
-# Audio as a separate archive member (see ZAN_GUI_AUDIO_SEPARATE above).
-$audioObj = Join-Path $work "zan_audio_win_x64.o"
-try {
-    & clang --target=x86_64-w64-windows-gnu -O2 -DNDEBUG `
-        -c (Join-Path $root "src\runtime\zan_audio.c") -o $audioObj
-    if ($LASTEXITCODE -ne 0) {
-        Fail "GUI_AUDIO_COMPILE_FAILED" "clang returned $LASTEXITCODE"
-    }
-} catch {
-    Fail "GUI_AUDIO_COMPILE_FAILED" $_.Exception.Message
-}
-
-try {
-    if (Test-Path -LiteralPath $guiArchive) {
-        Remove-Item -LiteralPath $guiArchive -Force
-    }
-    & llvm-ar rcs $guiArchive $guiObj $dwriteObj $audioObj
-    if ($LASTEXITCODE -ne 0) {
-        Fail "GUI_RUNTIME_LIB_FAILED" "llvm-ar returned $LASTEXITCODE"
-    }
-} catch {
-    Fail "GUI_RUNTIME_LIB_FAILED" $_.Exception.Message
-}
-
-@"
-# Win32 dependencies from scripts/build_ide.ps1, merged with the committed
-# static bundle's list: ole32 backs the WASAPI mixer's COM calls (CoInitialize/
-# CoTaskMemFree in zan_audio.c), shcore backs the Per-Monitor-DPI queries in
-# gui_runtime_dwrite.cpp. The async reactor and process helpers bring the rest.
-dwmapi
-gdi32
-imm32
-user32
-shcore
-ole32
-rpcrt4
-ws2_32
-mswsock
-psapi
-advapi32
-"@ | Set-Content -Encoding ascii (Join-Path $guiStatic "zan_gui.libs")
+New-Item -ItemType Directory -Force -Path $sqliteStatic, $work | Out-Null
 
 $sqliteUrl = "https://sqlite.org/2024/sqlite-amalgamation-3460100.zip"
 $sqliteZip = Join-Path $work "sq.zip"
@@ -188,5 +116,4 @@ try {
     Fail "SQLITE_LIB_FAILED" $_.Exception.Message
 }
 
-Write-Output ("WIN_STATIC_DRIVERS_OK gui=" + $guiArchive +
-    " sqlite=" + $sqliteArchive)
+Write-Output ("WIN_STATIC_DRIVERS_OK native=zan_gui,zan_image,zan_audio,zan_game sqlite=" + $sqliteArchive)

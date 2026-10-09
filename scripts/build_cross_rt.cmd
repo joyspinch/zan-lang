@@ -86,13 +86,14 @@ rem (main.c links it only when wasm_eh_used).
 if not exist toolchain\wasm32 mkdir toolchain\wasm32
 "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\wasm32\zanrt_file.o  || exit /b 1
 "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\wasm32\zanrt_timer.o || exit /b 1
-rem GUI runtime for wasm32: the whole software rasterizer + image/text stack as
-rem one object, with the browser window shell (gui_runtime_wasm.c) included by
-rem gui_runtime.c under __wasm__. Linked by main.c only when the program
-rem references zan_gui_*, and exported symbol zan_gui_wasm_feed is the host's
-rem event-injection door (see the JS host in the H5 template).
-rem gnu11, not c11: wasi-libc hides clock_gettime (gui shell's tick) and
-rem stb_vorbis's alloca behind the GNU feature-test macros.
+rem Compressed embedded icons/skins need the same decoder as native targets.
+"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -O2 -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS -I src\common -c %RT%\zan_inflate.c -o toolchain\wasm32\zan_inflate.o || exit /b 1
+rem GUI core for wasm32: software drawing/text plus the browser window shell
+rem (gui_runtime_wasm.c, included under __wasm__). The independent feature
+rem objects below are selected by main.c from emitted symbol references;
+rem zanrt_game.o additionally needs zanrt_gui.o and zanrt_image.o.
+rem zan_gui_wasm_feed remains the JS host's event-injection export.
+rem gnu11 exposes clock_gettime for the shell and alloca for stb_vorbis.
 rem ZAN_GUI_FREETYPE: proportional text on wasm32. Needs freetype headers
 rem (external checkout, e.g. %FREETYPE_INC%) and the prebuilt
 rem toolchain\wasm32\libfreetype.a plus the setjmp/ftmodule shims under
@@ -104,11 +105,19 @@ rem 6x10 bitmap font.
 set FT_INC=%FREETYPE_INC%
 if "%FT_INC%"=="" set FT_INC=D:/project/firefox/modules/freetype2/include
 if exist "%FT_INC%\ft2build.h" if exist toolchain\wasm32\libfreetype.a goto ft_gui
-"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %RT%\libwebp\src -O2 -c %RT%\gui_runtime.c -DZAN_GUI_WASM -o toolchain\wasm32\zanrt_gui.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -O2 -c %RT%\gui_runtime.c -DZAN_GUI_WASM -DZAN_GUI_STATIC -o toolchain\wasm32\zanrt_gui.o || exit /b 1
 goto gui_done
 :ft_gui
-"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %RT%\libwebp\src -I "%FT_INC%" -I toolchain\wasm32\freetype-shim -O2 -c %RT%\gui_runtime.c -DZAN_GUI_WASM -DZAN_GUI_FREETYPE -o toolchain\wasm32\zanrt_gui.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I "%FT_INC%" -I toolchain\wasm32\freetype-shim -O2 -c %RT%\gui_runtime.c -DZAN_GUI_WASM -DZAN_GUI_STATIC -DZAN_GUI_FREETYPE -o toolchain\wasm32\zanrt_gui.o || exit /b 1
 :gui_done
+rem Decoder/cache owns stb_image, the vendored libwebp TU and gui_image_svg.c;
+rem it has no window, FreeType or GUI dependency.
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %RT%\libwebp\src -O2 -c %RT%\zan_image.c -DZAN_IMAGE_STATIC -o toolchain\wasm32\zanrt_image.o || exit /b 1
+rem Game consumes the shared graphics context and image cache via their headers.
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -O2 -c %RT%\zan_game.c -DZAN_GAME_STATIC -o toolchain\wasm32\zanrt_game.o || exit /b 1
+rem WASI keeps offline WAV/Vorbis APIs and the existing no-device result;
+rem zan_audio.c's WASI path must not require desktop pthread/dlopen backends.
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -O2 -c %RT%\zan_audio.c -DZAN_AUDIO_STATIC -o toolchain\wasm32\zanrt_audio.o || exit /b 1
 rem Single-threaded sync equivalents for wasm32 GUI programs (rt_sync_wasm.c):
 rem threads run their body synchronously, atomics are plain cells, the shared
 rem table degrades to "unavailable", clocks are real. main.c links this next to

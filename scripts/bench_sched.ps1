@@ -7,10 +7,10 @@
 # attributed to LIFO hits / steals / injector traffic instead of guessed at.
 #
 # Build the servers first (from the repo root):
-#   build\zanc.exe _scratch\netbench\srvmt.zan --auto-stdlib -o _scratch\netbench\srvmt_st.exe
-#   build\zanc.exe _scratch\netbench\srvmt.zan --auto-stdlib --async-workers -o _scratch\netbench\srvmt_mt.exe
-#   build\zanc.exe _scratch\netbench\srvmt.zan --auto-stdlib --async-workers --fast-alloc -o _scratch\netbench\srvmt_mtfa.exe
-#   build\zanc.exe _scratch\netbench\cli.zan   --auto-stdlib -o _scratch\netbench\cli.exe
+# 契约：多平台交叉编译与驱动打包管线
+# 契约：多平台交叉编译与驱动打包管线
+# 契约：多平台交叉编译与驱动打包管线
+# 契约：多平台交叉编译与驱动打包管线
 #
 # Example:
 #   powershell -File scripts\bench_sched.ps1 -Servers srvmt_st.exe,srvmt_mt.exe `

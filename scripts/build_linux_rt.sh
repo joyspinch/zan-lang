@@ -9,7 +9,7 @@
 #
 #   scripts/build_linux_rt.sh [path-to-zig]
 #
-# Outputs toolchain/{linux-musl,linux-arm64,linux-riscv64}/zanrt_{io,sync,file,timer}.o.
+# 契约：工程辅助自动化与脚本执行规范
 # The objects are committed (they are our own code; *.o is gitignored, so
 # `git add -f` them). -g0 keeps them the size the previously committed ones
 # were: DWARF in an object that is only ever statically linked is dead weight.

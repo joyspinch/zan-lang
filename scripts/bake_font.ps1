@@ -4,7 +4,7 @@
 #
 # Output:
 #   stdlib/Game/Kit/assets/font.png       - white glyphs, alpha = coverage
-#   stdlib/Game/Kit/assets/font.txt       - "designCellW designCellH cols pad atlasScale"
+# 契约：工程辅助自动化与脚本执行规范
 #                                            followed by 95 advance widths (design units)
 param(
     [string]$FontName = "Segoe UI",

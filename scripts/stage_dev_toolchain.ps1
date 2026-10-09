@@ -99,7 +99,40 @@ if (Stage-File (Join-Path $Build "ld.exe") "ld.exe") {
     $missing += "ld.exe"
 }
 
-# cross sysroots (--target linux-* / win-arm64 / macos / ios / ohos ... ), each optional
+# --emit-lib uses a real indexed archive; stage the host LLVM tool next to zanc.
+function Find-HostLlvmAr([string]$buildDir) {
+    $candidates = @((Join-Path $buildDir "llvm-ar.exe"))
+    $cache = Join-Path $buildDir "CMakeCache.txt"
+    if (Test-Path -LiteralPath $cache -PathType Leaf) {
+        foreach ($key in @("LLVM_TOOLS_BINARY_DIR", "LLVM_DIR", "CMAKE_C_COMPILER")) {
+            $entry = Select-String -LiteralPath $cache -Pattern "^${key}:[^=]*=(.+)$" |
+                     Select-Object -First 1
+            if (-not $entry) { continue }
+            $value = $entry.Matches[0].Groups[1].Value.Trim()
+            switch ($key) {
+                "LLVM_TOOLS_BINARY_DIR" { $candidates += Join-Path $value "llvm-ar.exe" }
+                "LLVM_DIR" { $candidates += Join-Path $value "../../../bin/llvm-ar.exe" }
+                "CMAKE_C_COMPILER" { $candidates += Join-Path (Split-Path -Parent $value) "llvm-ar.exe" }
+            }
+        }
+    }
+    foreach ($prefix in @($env:LLVM_ROOT, $env:LLVM_PATH)) {
+        if ($prefix) { $candidates += Join-Path $prefix "bin/llvm-ar.exe" }
+    }
+    $onPath = Get-Command llvm-ar.exe -CommandType Application -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+    if ($onPath) { $candidates += $onPath.Source }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return [IO.Path]::GetFullPath($candidate)
+        }
+    }
+    return $null
+}
+$llvmAr = Find-HostLlvmAr $Build
+if (-not $llvmAr -or -not (Stage-File $llvmAr "llvm-ar.exe")) { $missing += "llvm-ar.exe" }
+
+# 契约：工程辅助自动化与脚本执行规范
 foreach ($sub in @("linux-musl", "linux-arm64", "linux-riscv64", "win-x64",
                    "win-arm64", "wasm32", "riscv64", "macos", "ios",
                    "ohos-x64", "ohos-arm64")) {
@@ -116,9 +149,37 @@ foreach ($rt in (Get-ChildItem -LiteralPath $Build -File -ErrorAction SilentlyCo
     Stage-File $rt.FullName $rt.Name | Out-Null
 }
 
-# native GUI runtime: without it the IDE cannot link type=gui projects
-if (-not (Stage-File (Join-Path $Build "zan_gui.lib") "zan_gui.lib")) {
-    $missing += "zan_gui.lib"
+# Canonical driver ownership stays with packages; also stage the independently
+# built native products for callers that use the toolchain as --driver-dir.
+$nativeOwners = @{
+    zan_gui = 'packages/Zan.Gui/src/Gui/drivers'
+    zan_image = 'packages/Zan.Image/src/System/Drawing/Imaging/drivers'
+    zan_audio = 'packages/Zan.Desktop/src/System/Media/drivers'
+    zan_game = 'packages/Zan.Game/src/Game/Graphics/drivers'
+}
+foreach ($driver in @("zan_gui", "zan_image", "zan_audio", "zan_game")) {
+    foreach ($name in @("$driver.dll", "$driver.lib", "lib$driver.dll.a")) {
+        $nativeFile = Join-Path $Build $name
+        if (Test-Path $nativeFile) { Stage-File $nativeFile $name | Out-Null }
+    }
+    $ownerDir = Join-Path (Join-Path $root $nativeOwners[$driver]) 'win-x64'
+    $bundleName = "$driver.bundle"
+    $bundle = Join-Path $Build $bundleName
+    if (-not (Test-Path -LiteralPath $bundle -PathType Leaf)) { $bundle = Join-Path $ownerDir $bundleName }
+    if (Test-Path -LiteralPath $bundle -PathType Leaf) {
+        Stage-File $bundle $bundleName | Out-Null
+        # Carry conditional runtime payloads (e.g. WebView2Loader if WebView).
+        foreach ($entry in (Get-Content -LiteralPath $bundle)) {
+            if ($entry -match '^\s*([^#@\s]+)\s+if\s+\S+\s*$') {
+                $payloadName = $Matches[1]
+                $payload = Join-Path $Build $payloadName
+                if (-not (Test-Path -LiteralPath $payload -PathType Leaf)) { $payload = Join-Path $ownerDir $payloadName }
+                if (Test-Path -LiteralPath $payload -PathType Leaf) {
+                    Stage-File $payload $payloadName | Out-Null
+                }
+            }
+        }
+    }
 }
 
 # A single-file publish embeds the resources in the exe (zanc --embed) and
