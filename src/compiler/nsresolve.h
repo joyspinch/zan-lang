@@ -5,28 +5,13 @@
 #include "arena.h"
 #include "diag.h"
 
-/* Stamp every top-level declaration in a freshly parsed compilation unit with
- * its file's namespace and `using` list, so that after all files are merged
- * into one flat unit the namespace context of each declaration is still known.
- * Call once per parsed file, before merging. */
+/* 标记顶层声明所属文件命名空间与 using 列表，供多文件合并后保留命名空间上下文 */
 void zan_nsresolve_stamp(zan_ast_node_t *unit, zan_arena_t *arena);
 
-/* Namespace-aware type resolution pass.  Runs on the merged unit before the
- * binder.  Renames declarations whose simple name collides across namespaces
- * to a unique mangled name (original kept in node->orig_name) and rewrites all
- * type references to the resolved type's name, honoring the referring
- * declaration's namespace, its `using` imports and explicit qualified names.
- * Non-conflicting single-namespace code is left untouched. */
+/* 命名空间类型解析：消解跨命名空间同名类型冲突，重写类型引用 */
 void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *diag);
 
-/* Reachability prune.  Runs right after zan_nsresolve_run on the merged unit.
- * Drops stdlib-authored top-level declarations (from_stdlib stamped by main.c)
- * that nothing reachable references; user-authored declarations are always
- * kept (the program is the root set, which keeps entry-file reflection magic
- * such as ORM bindings and genrun rewrites working).  The closure walks the
- * same node kinds nsresolve walks (type refs, static receivers, bases,
- * attributes, generic arguments), so the binder only loses definitions it
- * could never resolve to. */
+/* 可达性裁剪：按需剔除未被引用的标准库顶层声明，保留用户声明 */
 void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
                          zan_diag_t *diag);
 

@@ -13,6 +13,8 @@ zan_diag_t *zan_diag_new(zan_arena_t *arena) {
     d->error_count = 0;
     d->warning_count = 0;
     d->max_errors = 100;
+    d->suppressed_errors = 0;
+    d->limit_notice_shown = false;
     d->file_names = NULL;
     d->file_sources = NULL;
     d->file_count = 0;
@@ -24,11 +26,21 @@ zan_diag_t *zan_diag_new(zan_arena_t *arena) {
     d->dup_file_id = 0;
     d->dup_line = 0;
     d->dup_line_errors = 0;
+    d->dup_line_suppressed = 0;
+    d->dup_line_notice_shown = false;
     return d;
 }
 
+void zan_diag_set_max_errors(zan_diag_t *diag, int max_errors) {
+    if (!diag) return;
+    diag->max_errors = max_errors;
+}
+
+int zan_diag_suppressed_errors(const zan_diag_t *diag) {
+    return diag ? diag->suppressed_errors : 0;
+}
+
 void zan_diag_add_file(zan_diag_t *diag, const char *name, const char *source) {
-    /* simple dynamic array for file list */
     int idx = diag->file_count;
     int new_count = idx + 1;
 
@@ -120,23 +132,45 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
 
     if (level == DIAG_ERROR) {
         diag->error_count++;
-        if (diag->error_count > diag->max_errors) return;
+        if (diag->max_errors > 0 && diag->error_count > diag->max_errors) {
+            /* 限制诊断信息条数上限，避免语法崩溃时输出大量级联错误 */
+            diag->suppressed_errors++;
+            if (!diag->limit_notice_shown && !diag->capture) {
+                diag->limit_notice_shown = true;
+                fprintf(stderr,
+                        "\033[33mnote\033[0m: too many errors, stopping after %d"
+                        " (further errors are suppressed; use"
+                        " -ferror-limit=0 for all)\n",
+                        diag->max_errors);
+            }
+            return;
+        }
     } else if (level == DIAG_WARNING) {
         diag->warning_count++;
     }
 
-    /* Collapse cascade noise: error recovery walks a malformed expression one
-     * token at a time re-reporting the same handful of failures at each
-     * successive column, which produced massive logs for one
-     * pathological line. Cap the errors printed per line; error_count
-     * has already counted them, so the compile still fails. */
+    /* 折叠单行级联报错噪音，限制单行最大打印错误数 */
     if (level == DIAG_ERROR) {
         if (diag->dup_line != loc.line || diag->dup_file_id != loc.file_id) {
             diag->dup_file_id = loc.file_id;
             diag->dup_line = loc.line;
             diag->dup_line_errors = 0;
+            diag->dup_line_suppressed = 0;
+            diag->dup_line_notice_shown = false;
         }
-        if (++diag->dup_line_errors > ZAN_DIAG_MAX_ERRORS_PER_LINE) return;
+        if (++diag->dup_line_errors > ZAN_DIAG_MAX_ERRORS_PER_LINE) {
+            /* Same reasoning as the global cap: record the drop and report it
+             * once per line. */
+            diag->dup_line_suppressed++;
+            if (!diag->dup_line_notice_shown && !diag->capture) {
+                diag->dup_line_notice_shown = true;
+                fprintf(stderr,
+                        "\033[33mnote\033[0m: line %u: more than %d errors,"
+                        " rest of the line suppressed\n",
+                        loc.line, ZAN_DIAG_MAX_ERRORS_PER_LINE);
+            }
+            return;
+        }
     }
 
     /* structured capture path: store and skip stderr rendering */
@@ -161,21 +195,16 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
         file_name = diag->file_names[loc.file_id];
     }
 
-    /* header: file:line:col: level: message */
     fprintf(stderr, "%s:%u:%u: %s%s\033[0m: %s\n", file_name, loc.line, loc.col,
             color, level_str, msgbuf);
 
-    /* show source line if available */
     if (loc.file_id < (uint32_t)diag->file_count && diag->file_sources) {
         const char *source = diag->file_sources[loc.file_id];
         if (source && loc.offset < strlen(source)) {
             const char *line_start = find_line_start(source, loc.offset);
             int line_len = find_line_len(line_start);
-            /* Window the excerpt around the error column. Echoing the whole
-             * line is fine for hand-written code but a pathological one-liner
-             * (a 100k-character paren nest) repeats the full line for every
-             * diagnostic. Long lines are shown as an excerpt with a caret that
-             * lands on the right character. */
+            /* Window the excerpt around the error column so the caret lands
+             * on the right character without echoing the whole long line. */
             int col0 = loc.col > 0 ? (int)loc.col - 1 : 0;
             int vis_start = 0;
             if (line_len > ZAN_DIAG_MAX_SOURCE_ECHO) {
@@ -202,11 +231,8 @@ bool zan_diag_has_errors(zan_diag_t *diag) {
     return diag->error_count > 0;
 }
 
-/* The long phases run for as long as they run and print nothing until they
- * are done, so a build that appears to hang gives no clue which phase or
- * method body it is inside. Setting ZANC_TRACE turns on a line per phase /
- * emitted method body; the last line printed is the one that never came
- * back. */
+/* A phase-per-line trace (ZANC_TRACE): the last line printed is the one that
+ * never came back. */
 void zan_compile_trace(const char *fmt, ...) {
     static int on = -1;
     if (on < 0) on = getenv("ZANC_TRACE") ? 1 : 0;

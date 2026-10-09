@@ -1,13 +1,6 @@
-/* irgen_async.c -- async/await CPS lowering, await A-normal-form normalization
- * and the rc-element array escape analysis.
- *
- * #include'd by irgen.c in a fixed order; must not be compiled standalone.
- */
+/* irgen_async.c: 异步函数 CPS 变换、await ANF 正规化与协程帧生成 (由 irgen.c 包含) */
 
-/* Does `t` fill the frame result slot with zeros rather than a sign bit? The
- * slot is 64 bits wide, so a narrower value is extended into it and truncated
- * back out; extending an unsigned type with its sign bit would turn `uint`
- * 0xFFFFFFFF into -1 for anything that reads the slot as 64 bits. */
+/* 判断类型写入 64 位帧结果槽时是否需零扩展（无符号标量类型） */
 static bool type_is_unsigned_scalar(zan_type_t *t) {
     if (!t) return false;
     switch (t->kind) {
@@ -23,11 +16,7 @@ static bool type_is_unsigned_scalar(zan_type_t *t) {
     }
 }
 
-/* Encode a completed coroutine's return value into the 64-bit frame result
- * slot, using the callee's declared return type `ty` (may be NULL when it is
- * not known). `coerce_from_frame_result` is the exact inverse: the pair is
- * what makes `await` give back the value the coroutine returned rather than
- * the bits that happened to fit an i64. */
+/* 将协程返回值编码写入 64 位帧结果槽，与 coerce_from_frame_result 互为逆操作 */
 static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
                                            zan_type_t *ty) {
     if (!v) return NULL;
@@ -71,26 +60,17 @@ static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
     case LLVMDoubleTypeKind:
         return LLVMBuildBitCast(g->builder, v, i64, "res.slot");
     case LLVMFloatTypeKind: {
-        /* keep the 32 float bits as they are: widening to double here would
-         * make the awaiter's `float` read (a 32-bit bitcast) see the low half
-         * of a double instead of the value */
+        /* 保持 32 位浮点原始位模式，避免拓宽为 double 导致按 float 位转换时失真 */
         LLVMValueRef fb = LLVMBuildBitCast(g->builder, v, i32, "res.f32");
         return LLVMBuildZExt(g->builder, fb, i64, "res.slot");
     }
     default:
-        /* No encoding exists for this value in the one-word slot. The aggregate
-         * case is already reported once, at the declaration, by the async
-         * prologue; this fallback only keeps the encoder from handing
-         * LLVM a wrong-typed value. */
+        /* 单字槽无法容纳时的类型兜底转换 */
         return LLVMConstInt(i64, 0, 0);
     }
 }
 
-/* Convert a returned value to the async method's declared return type, the way
- * a synchronous `return` converts to the function's LLVM return type. The
- * frame result encoding is type-directed, so the value has to reach it in the
- * declared type -- otherwise `return 0;` from an async `double` method encodes
- * an integer that the awaiter then reads as a double. */
+/* 将返回值转换为方法声明的返回类型，确保帧结果编码类型一致 */
 static LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val) {
     zan_type_t *rt = g->current_async_ret_type;
     if (!val || !rt || rt->kind == TYPE_VOID) return val;
@@ -111,8 +91,7 @@ static LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val) {
     }
     if (wk == LLVMIntegerTypeKind && hk == LLVMIntegerTypeKind) {
         unsigned wb = LLVMGetIntTypeWidth(want), hb = LLVMGetIntTypeWidth(have);
-        /* i1/i8 are `bool`/`byte`, both unsigned: widen them zero-extended
-         * (same rule as the sync return path). */
+        /* bool/byte 无符号类型采用零扩展 */
         if (wb > hb) return hb <= 8
             ? LLVMBuildZExt(g->builder, val, want, "ret.zext")
             : LLVMBuildSExt(g->builder, val, want, "ret.ext");
@@ -126,7 +105,7 @@ static LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val) {
     return val;
 }
 
-/* Decode a frame result slot back into the callee's declared type `ty`. */
+/* 将 64 位帧结果槽中的位解码还原为声明类型 ty */
 static LLVMValueRef coerce_from_frame_result(zan_irgen_t *g, LLVMValueRef res,
                                              zan_type_t *ty) {
     if (!res || !ty) return res;
@@ -167,9 +146,7 @@ static LLVMValueRef coerce_from_frame_result(zan_irgen_t *g, LLVMValueRef res,
     }
 }
 
-/* Coerce an arbitrary scalar value to the i64 used by the frame result slot,
- * without a declared type to go by (untyped lambda bodies). Prefer
- * coerce_to_frame_result wherever the declared type is available. */
+/* 无声明返回类型时标量值到 i64 帧结果槽的强制转换兜底 */
 static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef t = LLVMTypeOf(v);
@@ -241,9 +218,7 @@ static void emit_async_pending_discard(zan_irgen_t *g, LLVMValueRef frame,
     zan_call2(g->builder, LLVMGlobalGetValueType(fn), fn, args, 2, "");
 }
 
-/* The ledger owns each value until a move or a scope discard. An inner catch
- * keeps the prefix that existed at its entry; an outer catch discards the
- * interrupted exit, including synchronous calls and awaited child failures. */
+/* 待定引用所有权账本：在移动或作用域丢弃前持有引用，catch 处清理中断分支未决引用 */
 static LLVMValueRef emit_async_pending_push(zan_irgen_t *g, LLVMValueRef value,
                                             LLVMValueRef tid, LLVMValueRef kind) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -342,8 +317,7 @@ static LLVMValueRef emit_async_pending_take_return(zan_irgen_t *g) {
     return result;
 }
 
-/* One discard loop per frame type, shared by catch landings, completion and
- * abandonment, rather than expanded once per exit and pending slot. */
+/* 单个帧类型的统一丢弃循环，供 catch、正常完成与协程放弃共享调用 */
 static void emit_async_pending_discard_body(zan_irgen_t *g, LLVMTypeRef ft,
                                             zan_type_t *ret_type) {
     LLVMValueRef fn = async_pending_discard_fn(g, ft);
@@ -403,10 +377,7 @@ static void emit_async_pending_discard_body(zan_irgen_t *g, LLVMTypeRef ft,
     g->current_fn = saved_fn;
 }
 
-/* Join a return, cancellation or uncaught exception to the one completion
- * epilogue. Frame owners are a permanent prefix of locals; only the lexical
- * suffix needs edge-specific cleanup. Keeping the frame cleanup out of these
- * edges avoids multiplying it by every await/cancellation boundary. */
+/* 汇合 return、取消或未捕获异常至统一步骤：完成清理与帧释放 */
 static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals,
                                 LLVMValueRef result_i64) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -426,16 +397,7 @@ static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals,
     LLVMAddIncoming(g->current_async_result_phi, &value, &from, 1);
 }
 
-/* Emit the shared completion epilogue after the body and EH edges are known:
- * store the result, mark the frame done, release its owners, wake an awaiter
- * (if any), then `ret void`. The frame-local prefix is complete at this point.
- *
- * The awaiter-wake handshake schedules the frame that awaited us: when a
- * caller `await`s this task it stores itself + its own $resume into our
- * awaiter/awaiter_step header slots (see the await protocol). On completion we
- * re-enqueue that awaiter via zan_co_ready so the cooperative driver re-steps
- * it and it can read our result. A root (non-async) driver leaves awaiter null
- * and instead polls the result after zan_co_sched_run drains. */
+/* 发射共享完成尾声：存入结果、标记完成、释放持有者、唤醒等待者并 ret void */
 static void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) {
     if (!g->current_async_complete_bb) return;
     LLVMPositionBuilderAtEnd(g->builder, g->current_async_complete_bb);
@@ -446,9 +408,7 @@ static void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) 
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
 
-    /* the frame is done: any pending Task.Delay entry naming it must not
-     * fire again (a frame that completes inside the delay window without
-     * another await would leave a stale entry that wakes freed memory) */
+    /* 协程已完成：取消关联该帧的所有未决 Task.Delay 定时器 */
     LLVMValueRef self_i8 = get_async_self_i8(g);
     emit_co_cancel_delay(g, self_i8);
 
@@ -458,27 +418,15 @@ static void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) 
 
     LLVMValueRef done_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
         ASYNC_FRAME_DONE, "fr.done");
-    /* Release exchange: every waiter that observes DONE==1 through an
-     * acquire load (the await fast-path probe, the root-drive probe and the
-     * runtime's zan_co_sched_run_until spin) must also see the RESULT store
-     * above. Plain stores left that ordering to luck -- fine under x86 TSO,
-     * a real race under weak arm64/wasm32 memory order and for the LLVM
-     * optimizer, which may hoist the dependent plain RESULT load above the
-     * plain DONE probe. */
+    /* 原子 release exchange 发布 DONE 标志，保证等待者 acquire 时能观测到结果写入 */
     LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpXchg, done_ptr,
         LLVMConstInt(i32, 1, 0), LLVMAtomicOrderingRelease, 0);
     LLVMBuildStore(g->builder, LLVMConstInt(i32, -1, 1), get_async_state_ptr(g));
-    /* a `return` inside a try leaves that try's armed-handler count behind;
-     * a completed frame has no live handlers, so reset it for the unwinder */
+    /* 协程完成时已无活跃异常处理器，重置展开器处理器计数 */
     LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0),
         LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "fr.hc"));
 
-    /* Completion notification for event-driven joins (Task.WhenAll /
-     * WhenAny). Every async frame passes here exactly once after DONE is
-     * published, INCLUDING result-carrying Task.Run frames that stay tracked
-     * (done=1, not reaped) until Result/Wait reads them — those never reach
-     * the untrack hook, so completion is the primary join notification.
-     * Void call: must stay unnamed — LLVM rejects named void values. */
+    /* 发布 DONE 后的事件级汇合通知（支持 Task.WhenAll / WhenAny） */
     {
         LLVMTypeRef jc_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
             (LLVMTypeRef[]){ i8ptr }, 1, 0);
@@ -492,12 +440,9 @@ static void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) 
     local_scope_t frame_locals = *locals;
     frame_locals.count = g->current_async_frame_local_count;
     emit_release_owned_locals(g, &frame_locals);
-    /* The frame may remain live for Task.Run.Result or an unwind cleanup.
-     * Released fields must no longer advertise dangling owned references. */
+    /* 帧可能因 Result 读取或展开暂时存活，已释放字段清零避免悬垂引用 */
     emit_clear_owned_locals_range(g, &frame_locals, 0);
-    /* balance the ramp's receiver retain: the frame owns a +1 on `this` for
-     * as long as the coroutine runs (its caller may have dropped the temp
-     * that produced it long before) */
+    /* 平衡启动时的 this 引用保持：协程运行期间持有 this 的 +1 引用 */
     if (g->current_async_this_owned && g->current_this &&
         g->current_async_this_type) {
         LLVMTypeRef tty = LLVMGetAllocatedType(g->current_this);
@@ -507,10 +452,7 @@ static void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) 
     }
     emit_async_eh_unarm(g);
 
-    /* Race-free completion handshake via atomic exchange with sentinel (1).
-     * If an awaiter was already registered (old_aw > 1), ready it. If no
-     * awaiter was registered or it was already marked done (old_aw <= 1), do
-     * nothing. */
+    /* 通过原子交换哨兵值 (1) 安全唤醒已注册的等待协程 */
     LLVMTypeRef ptr_int_ty = g->target_is_wasm ? i32 : i64;
     LLVMValueRef aw_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
         ASYNC_FRAME_AWAITER, "fr.awaiter");
@@ -539,9 +481,7 @@ static void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) 
     LLVMBuildRetVoid(g->builder);
 }
 
-/* Declare one of the runtime's live-frame registry entry points
- * (zan_co_live_add / _del / _has, rt_colive.c), creating the declaration once
- * per module. */
+/* 声明活跃协程帧注册表接口（zan_co_live_add/del/has） */
 static LLVMValueRef get_co_live_fn(zan_irgen_t *g, const char *name,
                                    bool returns_i32, LLVMTypeRef *out_ty) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -561,16 +501,9 @@ static LLVMValueRef emit_co_live_has(zan_irgen_t *g, LLVMValueRef frame) {
     return zan_call2(g->builder, ty, fn, &frame, 1, "co.live");
 }
 
-/* Emit `zan_timer_cancel_delay(frame)` at the current insertion point: drop
- * every pending DELAY timer naming this frame from the runtime's heap (see
- * irgen_expr.c's Task.Delay lowering). Called on each frame-release path --
- * the coroutine completes, a reaper frees it, or an unwind skips it -- because
- * an entry that outlives its frame would wake freed memory when it comes due. */
+/* 发射 zan_timer_cancel_delay(frame)，从定时器堆中移除该帧的未决延迟任务 */
 static void emit_co_cancel_delay(zan_irgen_t *g, LLVMValueRef frame) {
-    /* The real definition (rt_timer.c) returns the cancel count; the call
-     * sites ignore it. On wasm32 wasm-ld enforces exact signatures, so the
-     * declaration must carry the i32 return too or the link synthesizes a
-     * mismatch against zanrt_timer.o. */
+    /* 运行时定义返回取消数量 i32，为兼容 wasm32 链接签名必须严格匹配 */
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef ty = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), &i8ptr, 1, 0);
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_timer_cancel_delay");
@@ -578,8 +511,7 @@ static void emit_co_cancel_delay(zan_irgen_t *g, LLVMValueRef frame) {
     zan_call2(g->builder, ty, fn, &frame, 1, "");
 }
 
-/* Open an internal `void f(i8*)` helper: creates it, positions the builder in a
- * fresh entry block and returns it through *fn. Returns false if it existed. */
+/* 创建内部辅助函数 `void f(i8*)` 并将 builder 定位到 entry 块 */
 static bool open_co_helper(zan_irgen_t *g, const char *name, LLVMValueRef *fn,
                            LLVMBasicBlockRef *saved, LLVMValueRef *saved_fn) {
     LLVMValueRef existing = LLVMGetNamedFunction(g->mod, name);
@@ -629,20 +561,7 @@ static LLVMValueRef get_co_untrack_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* Return the module's `__zan_co_cancel(i8*)`, creating it once.
- *
- * Cancellation is cooperative and never touches the scheduler: it sets the
- * CANCEL flag on the target frame and, following the CHILD links, on the
- * coroutines it is transitively suspended on. Each frame observes the flag at
- * its next state block and completes early (see emit_async_cancel_check), so
- * every frame still finishes through the normal completion protocol. The cost
- * is that a coroutine parked on a timer or socket wait is only cancelled once
- * that wait completes.
- *
- * The handle comes from Task.Spawn and may name a frame the reaper has already
- * freed, so the root handle is looked up in the runtime's live-frame registry
- * first; the CHILD chain below it is alive by construction (a suspended
- * awaiter owns its sub-frame until it resumes). */
+/* 获取或声明模块内部的 `__zan_co_cancel(i8*)`（协作式取消标记置位） */
 static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_co_cancel");
     if (fn) return fn;
@@ -693,22 +612,7 @@ static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* Return the module's `i32 __zan_co_isdone(i8*)`, creating it once.
- *
- * Whether the coroutine a Task.Spawn handle names has finished, so a fan-out
- * (Task.WhenAll) can join detached coroutines instead of every caller wiring
- * its own counter and gate. Two states mean "finished":
- *
- *   - the handle is no longer in the runtime's live-frame registry: the reaper
- *     has already run and freed the frame (dereferencing it would be a use
- *     after free, which is why the registry is consulted rather than the flag
- *     read blind);
- *   - the frame is still live but its DONE flag is set: the body ran to
- *     completion and the frame is only queued for reaping.
- *
- * A handle that never named a detached frame (0, or a frame already reaped)
- * therefore reads as done, which is what a joiner wants: it cannot wait for
- * something that no longer exists. */
+/* 获取或声明模块内部的 `__zan_co_isdone(i8*)`（查询协程完成状态） */
 static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_co_isdone");
     if (fn) return fn;
@@ -843,8 +747,7 @@ static LLVMValueRef get_async_result_ptr(zan_irgen_t *g) {
     return g->current_async_result_ptr;
 }
 
-/* Cooperative preemption and Task.Yield requeue block. Shared across all
- * yield points and loop-backedge preemptions within one $resume invocation. */
+/* 协作式抢占与 Task.Yield 重新入队块（共享于所有让出点） */
 static LLVMBasicBlockRef get_async_requeue_bb(zan_irgen_t *g) {
     if (!g->current_async_frame || !g->current_async_resume_fn) return NULL;
     if (g->current_async_requeue_bb) return g->current_async_requeue_bb;
@@ -874,9 +777,7 @@ static bool scope_has_owned_cleanups(zan_irgen_t *g, local_scope_t *locals, int 
     return false;
 }
 
-/* Shared top-level cancellation exit block: avoids minting identical
- * co.cancelled blocks and dozens of duplicate incoming branches to
- * co.complete when no lexical suffix locals require releasing. */
+/* 共享顶层取消退出块：无词法作用域未决局部变量时直接跳转完成块 */
 static LLVMBasicBlockRef get_async_cancel_bb(zan_irgen_t *g, local_scope_t *locals) {
     if (scope_has_owned_cleanups(g, locals, g->current_async_frame_local_count)) return NULL;
     if (g->current_async_cancel_bb) return g->current_async_cancel_bb;
@@ -890,18 +791,10 @@ static LLVMBasicBlockRef get_async_cancel_bb(zan_irgen_t *g, local_scope_t *loca
     return bb;
 }
 
-/* Emit `if (frame->cancel) <complete with no result>` at a point where the
- * body could just as well have executed `return;`: the locals in scope are
- * released by the completion, the awaiter is woken, and the rest of the body
- * never runs. Emitted at the start of the body and after every statement that
- * awaited, i.e. at each point where cancellation can newly have been
- * requested. */
+/* 发射取消检查：若已请求取消则进入完成路径释放作用域变量并退出 */
 static void emit_async_cancel_check(zan_irgen_t *g, local_scope_t *locals) {
     if (!g->current_async_frame) return;
-    /* Inside a try with a finally, an early completion would skip the finally
-     * body. Cancellation is cooperative, so it simply waits for the next
-     * statement boundary outside the protected region -- correctness of the
-     * unwind machinery beats reacting one statement sooner. */
+    /* 在 finally 保护块内暂缓退出，等待离开 finally 后再响应取消 */
     if (g->finally_count > 0 || g->catch_cleanup_count > 0) return;
     if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) return;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -921,12 +814,7 @@ static void emit_async_cancel_check(zan_irgen_t *g, local_scope_t *locals) {
     LLVMPositionBuilderAtEnd(g->builder, go_bb);
 }
 
-/* Pop every eh handler this $resume invocation armed (its own trampoline plus
- * the user handlers re-armed from the frame). A jmp_buf records a stack frame,
- * so a handler armed by an invocation is unusable once that invocation returns
- * -- leaving it on the eh stack is what made a throw after a suspension jump
- * into a dead frame. Handlers armed by a try that spans the suspension stay
- * recorded in the frame (hcount/hstack) and are re-armed on the next resume. */
+/* 弹出本次 resume 挂载的异常处理器并恢复栈上下文 */
 static void emit_async_eh_unarm(zan_irgen_t *g) {
     if (!g->current_async_eh_entry) return;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -951,13 +839,7 @@ static LLVMBasicBlockRef get_async_suspend_ret_bb(zan_irgen_t *g) {
     return bb;
 }
 
-/* Typed-address inspection must finish before replacing the proxy allocas:
- * LLVMGetAllocatedType is only valid on an actual alloca, and several local /
- * receiver helpers depend on that contract. Rewriting only after the complete
- * body (including EH and ARC) has been emitted keeps those helpers unchanged
- * while every generated business load/store uses the persistent frame field.
- * Ramp memset supplies the sole initial value; the proxies have NO entry
- * null stores, which would erase the frame's live values on every resume. */
+/* 代理 alloca 替换为帧字段前完成指针类型提取与校验 */
 static void emit_async_finalize_slots(zan_irgen_t *g) {
     LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
     for (int i = 0; i < g->current_async_slot_count; i++) {
@@ -968,10 +850,7 @@ static void emit_async_finalize_slots(zan_irgen_t *g) {
             g->current_async_frame_type, g->current_async_frame,
             (unsigned)slot->frame_index, "fr.local");
         LLVMReplaceAllUsesWith(proxy, address);
-        /* Host-side scope records are emission-only and may no longer be
-         * consumed after this finalization. Invalidate the exposed async
-         * handles before erasing; the caller restores its enclosing context
-         * immediately afterwards. No GEP is presented as a typed alloca. */
+        /* 作用域记录终结：清理临时句柄 */
         if (g->current_this == proxy) g->current_this = NULL;
         slot->slot_alloca = NULL;
         LLVMInstructionEraseFromParent(proxy);
@@ -979,18 +858,7 @@ static void emit_async_finalize_slots(zan_irgen_t *g) {
     if (here) LLVMPositionBuilderAtEnd(g->builder, here);
 }
 
-/* Cooperative preemption site. Planted by the loop emitters at every
- * back-edge of an async function: poll the driver; when the slice is up,
- * requeue this frame with the exact `await Task.Yield()` sequence and re-enter
- * the loop at resume_target once the scheduler gets back to it. This is what
- * keeps a compute-bound loop (no awaits of its own) from monopolizing the
- * worker and starving timers, IO callbacks, and sibling coroutines.
- *
- * Safe at statement boundaries by the same invariant that makes awaits work:
- * named locals survive the `ret void` in their frame fields (ANF keeps SSA
- * temporaries from crossing), and the back edge sits
- * between statements. In a non-async function this emits nothing and returns
- * false, so the caller falls through to its plain back-edge branch. */
+/* 循环回边协作式抢占点：时间片用尽时重新排队当前帧并让出控制权 */
 static bool emit_async_preempt_site(zan_irgen_t *g, LLVMBasicBlockRef resume_target) {
     if (!g->current_async_frame || !g->current_async_switch) return false;
     LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
@@ -1011,27 +879,7 @@ static bool emit_async_preempt_site(zan_irgen_t *g, LLVMBasicBlockRef resume_tar
     return true;
 }
 
-/* ---- await A-normal-form (ANF) normalization ----
- *
- * The state machine keeps a value alive across a suspension only when it is a
- * named scalar
- * local (those live directly in the heap frame across every state).
- * An intermediate SSA temp produced *before* an await and consumed *after* it
- * does not survive: the resume-k block is entered from the entry switch, so a
- * value computed in the pre-suspend block does not dominate it and LLVM rejects
- * the module ("instruction does not dominate all uses"). This shows up for
- * compound / multiple awaits, e.g. `c + await f()`, `await a() + await b()`,
- * or `h(await a(), await b())`.
- *
- * This pass rewrites each async body into A-normal form for awaits: every
- * `await E` in a linearly-evaluated position becomes its own preceding
- * statement `int $awN = await E;` and the original occurrence is replaced by a
- * reference to `$awN`. Because `$awN` is a named scalar local it is made
- * frame-resident by async_scan and persist across the suspension, so no value
- * crosses a suspend point in a register. Awaits inside short-circuit (`&&`,
- * `||`) and conditional (`?:`) operands, and inside loop conditions/steps, are
- * left in place (their existing control-flow lowering handles them and hoisting
- * would change evaluation semantics). */
+/* await A-标准型 (ANF) 正规化：将嵌套表达式中的 await 提升为独立临时变量语句 */
 
 typedef struct {
     zan_irgen_t    *g;
@@ -1084,11 +932,7 @@ static bool anf_expr_contains_await(zan_ast_node_t *e) {
     }
 }
 
-/* A side-effecting operand (a call, assignment, or ++/--) evaluated *before* an
- * await in the same operand list would be reordered to run *after* the await if
- * we only hoist the await (it stays in the residual). Detect that to reject it
- * with a clear message instead of silently changing evaluation order. Awaits
- * themselves are hoisted in order, so they are not counted here. */
+/* 提升位于 await 之前且具副作用的操作数至临时变量，保证求值顺序保真 */
 static bool anf_expr_has_side_effect(zan_ast_node_t *e) {
     if (!e) return false;
     switch (e->kind) {
@@ -1116,8 +960,7 @@ static bool anf_expr_has_side_effect(zan_ast_node_t *e) {
 static zan_ast_node_t *anf_expr(anf_ctx_t *c, zan_ast_node_t *e);
 static void anf_spill_await_receiver(anf_ctx_t *c, zan_ast_node_t *aw);
 
-/* If operand `before` (evaluated first) has side effects and a later operand
- * `after` contains an await, hoisting only the await reorders them. Flag it. */
+/* 检查先求值的操作数是否具副作用且后续操作数含 await */
 static void anf_check_order(anf_ctx_t *c, zan_ast_node_t *before, zan_ast_node_t *after) {
     if (after && before && anf_expr_contains_await(after) &&
         anf_expr_has_side_effect(before)) {
@@ -1127,11 +970,7 @@ static void anf_check_order(anf_ctx_t *c, zan_ast_node_t *before, zan_ast_node_t
     }
 }
 
-/* Hoist `await E` into `var $awN = await E;` and return a reference to $awN.
- *
- * The temp is inferred, not `int`: an awaited call can yield a string, a list
- * or a class instance, and typing the temp `int` made the residual expression
- * see the reference as a number (`"n=" + await F()` printed a pointer). */
+/* 将 `await E` 提升为 `var $awN = await E;` 声明并返回该临时变量引用 */
 static zan_ast_node_t *anf_hoist_await(anf_ctx_t *c, zan_ast_node_t *aw) {
     /* normalize any nested awaits inside the awaited expression first */
     aw->await_expr.expr = anf_expr(c, aw->await_expr.expr);
@@ -1154,20 +993,7 @@ static zan_ast_node_t *anf_hoist_await(anf_ctx_t *c, zan_ast_node_t *aw) {
     return id;
 }
 
-/* Spill a computed receiver out of an awaited call.
- *
- * `await MakeQuery().ToListAsync()` leaves the receiver in an SSA temp and then
- * enters the awaited call. The temp lives neither in the heap frame nor in a
- * block that dominates the resume block, so as soon as the call suspends the
- * receiver is gone and reading `this` inside the callee crashes. Fluent
- * builders hit this constantly: `db.Select<T>().Where(..).ToListAsync()`.
- *
- * Hoisting the receiver into its own named local fixes it, because named locals
- * are made frame-resident by async_scan and accessed directly in every state.
- * Evaluation order is unchanged: the receiver already ran before the await.
- *
- * A receiver that is just a name (`b.ToListAsync()`, `this.db.QueryAsync()`) is
- * already a stable location, so it is left alone. */
+/* 将被 await 调用的计算所得接收者提升为独立局部变量，避免跨挂起点丢失 SSA 临时值 */
 static bool anf_receiver_needs_spill(zan_ast_node_t *obj) {
     if (!obj) return false;
     switch (obj->kind) {
@@ -1209,9 +1035,7 @@ static void anf_spill_await_receiver(anf_ctx_t *c, zan_ast_node_t *aw) {
     callee->member.object = id;
 }
 
-/* Recursively lift awaits out of a linearly-evaluated expression, appending
- * hoisted `$awN` declarations to c->out in evaluation order and returning the
- * residual expression (which no longer contains any hoistable await). */
+/* 递归提取表达式中的 await 并按求值顺序追加至 hoisted 声明列表 */
 static zan_ast_node_t *anf_expr(anf_ctx_t *c, zan_ast_node_t *e) {
     if (!e) return e;
     switch (e->kind) {
@@ -1285,8 +1109,7 @@ static zan_ast_node_t *anf_expr(anf_ctx_t *c, zan_ast_node_t *e) {
 
 static void anf_normalize_block(zan_irgen_t *g, zan_ast_node_t *block, int *counter);
 
-/* Does a statement subtree contain any await? Used to decide whether a
- * single-statement body must be wrapped in a block for hoisting. */
+/* 递归判断语句子树中是否包含任何 await 节点 */
 static bool anf_stmt_contains_await(zan_ast_node_t *st) {
     if (!st) return false;
     switch (st->kind) {
@@ -1342,9 +1165,7 @@ static bool anf_stmt_contains_await(zan_ast_node_t *st) {
     }
 }
 
-/* Ensure `*slot` is an AST_BLOCK so hoisted statements can be inserted before
- * the awaits it contains, then normalize it. Used for single-statement bodies
- * (e.g. `if (c) return await f();`). */
+/* 确保目标槽位为 AST_BLOCK 节点以容纳提升语句并进行正规化 */
 static void anf_normalize_body(zan_irgen_t *g, zan_ast_node_t **slot, int *counter) {
     zan_ast_node_t *body = *slot;
     if (!body) return;
@@ -1359,28 +1180,7 @@ static void anf_normalize_body(zan_irgen_t *g, zan_ast_node_t **slot, int *count
     anf_normalize_block(g, body, counter);
 }
 
-/* Rewrite a per-iteration loop position whose expression contains an await so
- * the expression evaluates at statement position inside the loop body:
- *
- *   while (C) B      ->  while (true) { <C-hoists>; if (!C) break; B }
- *   do B while (C)   ->  do { B <C-hoists>; if (!C) break; } while (true)
- *   for (I; C; S) B  ->  for (I; [true]; [S]) { <C-hoists>; if (!C) break; B [S']; }
- *
- * `<C-hoists>` are the `var $awN = await E;` declarations anf_expr appends for
- * every await in C. Hoisting C out of the loop was never an option (the
- * condition is re-evaluated every iteration), but leaving the await IN the
- * condition is just as broken: the eager operands computed before the
- * suspension are SSA temps, and their consumer (the resume-block icmp/add)
- * sits in a block those temps do not dominate ("Instruction does not dominate
- * all uses"). At statement position every hoisted await becomes a named scalar
- * local, which async_scan makes frame-resident and every state block reloads,
- * so no SSA value crosses the suspension.
- *
- * break/continue targets are unchanged: the guard stands exactly where the
- * condition used to be evaluated, and a for-step moved to the end of the body
- * still runs after the body and before the re-test -- which is also where
- * `continue` lands. Returns the `true` literal to store into the loop's
- * condition slot (left in place when only the step contained awaits). */
+/* 重写条件含 await 的循环表达式，使其在循环体首部作为语句求值 */
 static zan_ast_node_t *anf_loop_cond_guard(zan_irgen_t *g, zan_ast_list_t *dst,
                                            int *counter, zan_ast_node_t **cond_slot,
                                            const zan_loc_t *loc) {
@@ -1403,19 +1203,14 @@ static zan_ast_node_t *anf_loop_cond_guard(zan_irgen_t *g, zan_ast_list_t *dst,
     return tru;
 }
 
-/* Normalize one statement, appending any hoisted declarations to `dst` (in
- * evaluation order) *before* the statement is pushed by the caller. Nested
- * statement bodies are normalized recursively. */
+/* 单条语句正规化：将提升出的声明按求值顺序追加至目标列表 */
 static void anf_normalize_stmt(zan_irgen_t *g, zan_ast_node_t *st,
                                zan_ast_list_t *dst, int *counter) {
     if (!st) return;
     anf_ctx_t c = { g, dst, counter };
     switch (st->kind) {
     case AST_VAR_DECL:
-        /* `T x = await E;` is already at statement position: keep the await
-         * as the initializer instead of hoisting it into an `int $awN` temp,
-         * which would erase its result type -- an inferred declaration
-         * (`var s = await Echo()`) would then hold a string as an integer. */
+        /* `T x = await E;` 已位于语句位置，直接保留原初始化式避免类型信息丢失 */
         if (st->var_decl.initializer &&
             st->var_decl.initializer->kind == AST_AWAIT_EXPR) {
             st->var_decl.initializer->await_expr.expr =
@@ -1426,13 +1221,7 @@ static void anf_normalize_stmt(zan_irgen_t *g, zan_ast_node_t *st,
         }
         break;
     case AST_EXPR_STMT:
-        /* A bare `await E;` is already at statement position, so keep the await
-         * in place (only normalize awaits nested inside E) instead of hoisting
-         * it into an `int $awN` temp. Hoisting would erase the real result type
-         * (the temp is always typed `int`), so a discarded owned rc result
-         * (string/object) would never be released and would leak. Emitted
-         * directly, the expr-statement discard path releases it by its true
-         * type. */
+        /* 顶层表达式语句 `await E;` 仅递归正规化其内部嵌套 await */
         if (st->expr_stmt.expr && st->expr_stmt.expr->kind == AST_AWAIT_EXPR) {
             st->expr_stmt.expr->await_expr.expr =
                 anf_expr(&c, st->expr_stmt.expr->await_expr.expr);
@@ -1454,11 +1243,7 @@ static void anf_normalize_stmt(zan_irgen_t *g, zan_ast_node_t *st,
         anf_normalize_body(g, &st->if_stmt.else_body, counter);
         break;
     case AST_WHILE_STMT:
-        /* condition is re-evaluated each iteration → must NOT hoist it out;
-         * an await left in it dies at the suspension instead -- evaluate it
-         * at statement position at the top of the body and gate the iteration
-         * with an if-break (see anf_loop_cond_guard). Continue lands at
-         * cond_bb (testing true) and enters the body top where the guard lives. */
+        /* 循环条件每轮求值：改写为循环体内首部语句，防止跨挂起点丢失状态 */
         if (anf_expr_contains_await(st->while_stmt.cond)) {
             zan_ast_node_t *blk = zan_ast_new(g->arena, AST_BLOCK, st->loc);
             zan_ast_list_init(&blk->block.stmts);
@@ -1472,10 +1257,7 @@ static void anf_normalize_stmt(zan_irgen_t *g, zan_ast_node_t *st,
         }
         break;
     case AST_DO_WHILE_STMT:
-        /* do-while evaluates its condition at cond_bb (the loop's continue_target).
-         * If the condition awaits, package hoisted statements into an AST_BLOCK in
-         * while_stmt.cond so both normal fall-through and continue evaluate the
-         * condition and its awaits at cond_bb instead of bypassing it. */
+        /* do-while 循环条件含 await 时的块包装处理 */
         if (anf_expr_contains_await(st->while_stmt.cond)) {
             zan_ast_node_t *cblk = zan_ast_new(g->arena, AST_BLOCK, st->loc);
             zan_ast_list_init(&cblk->block.stmts);
@@ -1505,9 +1287,7 @@ static void anf_normalize_stmt(zan_irgen_t *g, zan_ast_node_t *st,
             anf_normalize_body(g, &st->for_stmt.body, counter);
         }
         if (step_awaits) {
-            /* Package step hoists and residual into an AST_BLOCK at for_stmt.step.
-             * The step block runs at step_bb (the continue target), so `continue`
-             * in the body executes the step as required by language semantics. */
+            /* 将 for 循环 step 中的提升语句打包进 step 块 */
             zan_ast_node_t *sblk = zan_ast_new(g->arena, AST_BLOCK, st->loc);
             zan_ast_list_init(&sblk->block.stmts);
             anf_ctx_t c2 = { g, &sblk->block.stmts, counter };
@@ -1547,8 +1327,7 @@ static void anf_normalize_stmt(zan_irgen_t *g, zan_ast_node_t *st,
     }
 }
 
-/* Rebuild a block's statement list, inserting hoisted `$awN` declarations
- * before each statement that needed them. */
+/* 重构块语句列表，将提升出的临时变量声明插入在所属语句之前 */
 static void anf_normalize_block(zan_irgen_t *g, zan_ast_node_t *block, int *counter) {
     if (!block || block->kind != AST_BLOCK) return;
     zan_ast_list_t nl;
@@ -1561,25 +1340,17 @@ static void anf_normalize_block(zan_irgen_t *g, zan_ast_node_t *block, int *coun
     block->block.stmts = nl;
 }
 
-/* A named scalar local of an async method that must live in the heap frame so
- * its value survives across suspensions. `frame_index` is assigned when the
- * frame struct is laid out (params first, then these locals). */
+/* 异步方法需在堆帧中跨挂起点保持的局部变量记录 */
 typedef struct {
     zan_istr_t   name;
     LLVMTypeRef  llvm;        /* slot element type */
     zan_type_t  *ztype;      /* zan type (for identifier load typing) */
     int          frame_index;
-    /* storage-only slot: the frame preserves the bits across suspensions but
-     * does not own the value. A `foreach` loop variable borrows its element
-     * from the collection, so the coroutine's cleanup must not release it. */
+    /* 借用槽标记：帧仅跨挂起点保存位模式而不持有所有权（如 foreach 循环变量） */
     bool         no_arc;
-    /* A captured scalar/reference stores a tagged cell owner, not its payload.
-     * The ramp creates it once; every resume borrows the same cell. */
+    /* 捕获变量存储标记 cell 所有者，多次 resume 借用同一 cell */
     bool         boxed;
-    /* The declaration (or foreach/catch) node this slot was scanned from.
-     * Every declaration owns its own slot and binding finds it by NODE, so
-     * same-named shadowing declarations never alias each other's storage
-     * (name-dedup did exactly that). */
+    /* 关联的 AST 声明节点（按节点区分同名遮蔽变量的独立槽位） */
     zan_ast_node_t *decl;
     int role;
 } async_local_t;
@@ -1590,23 +1361,16 @@ typedef struct {
     async_local_t *locals;
     int            local_count;
     int            local_cap;
-    /* Types of the locals seen so far, so a `var` declaration's type can be
-     * inferred here exactly as it will be at emit time. Alloca-less: only the
-     * `type` field is read (by infer_expr_type). */
+    /* 局部变量类型推断环境表 */
     local_scope_t *scope;
     /* id of the next `foreach`, in the same AST order the emitter walks */
     int            foreach_next;
-    /* how many try statements the emitter will lower, counting a try inside a
-     * finally body once per copy of that body -- the frame's per-handler slot
-     * arrays are sized from this */
+    /* 待降解 try 块数量（决定帧内异常处理槽数组容量） */
     int            try_count;
-    /* Lexical try/finally and lock depth, including an executing finally's
-     * body, bounds pending ownership after scope-exit normalization. Nested
-     * lambda bodies are scanned as separate functions. */
+    /* 词法 try/finally 与 lock 嵌套深度 */
     int            fin_depth;
     int            fin_depth_max;
-    /* Capture queries need this async body's declaration identities, rather
-     * than current_fn_body (which may belong to an enclosing emission). */
+    /* 捕获分析所用的异步方法体 AST 节点 */
     zan_ast_node_t *body;
 } async_scan_t;
 
@@ -1621,9 +1385,7 @@ static bool async_type_is_scalar(LLVMTypeRef t) {
     }
 }
 
-/* Every supported local value can outlive a resume invocation, including
- * aggregates returned by an await. Proxy finalization moves its storage into
- * the frame; suspension itself does not transfer ARC ownership. */
+/* 为局部变量分配帧内槽位，确保其在挂起点跨调用存活 */
 static bool async_type_is_frame_resident(LLVMTypeRef t) {
     return async_type_is_scalar(t) || LLVMGetTypeKind(t) == LLVMPointerTypeKind ||
            LLVMGetTypeKind(t) == LLVMStructTypeKind;
@@ -1636,8 +1398,7 @@ static int async_scan_add_local_role(async_scan_t *s, zan_istr_t name, LLVMTypeR
                                       zan_type_t *zt, zan_ast_node_t *decl, int role) {
     for (int i = 0; i < s->local_count; i++) {
         if (decl) {
-            /* Key slots by declaration NODE: two same-named declarations are
-             * two variables and each gets its own frame slot. */
+            /* 按声明 AST 节点索引：同名遮蔽变量分配独立帧槽位 */
             if (s->locals[i].decl == decl && s->locals[i].role == role) return i;
         } else if (s->locals[i].name.len == name.len &&
                    memcmp(s->locals[i].name.str, name.str, name.len) == 0) {
@@ -1675,8 +1436,7 @@ static int async_scan_add_local(async_scan_t *s, zan_istr_t name, LLVMTypeRef ll
     return async_scan_add_local_role(s, name, llvm, zt, decl, ASYNC_LOCAL_VALUE);
 }
 
-/* A compiler-generated frame local. The `$` keeps it out of the identifier
- * namespace, so it can never collide with (or shadow) a user local. */
+/* 分配以 $ 开头的编译器内部帧临时槽，避免与用户变量冲突 */
 static zan_istr_t async_synth_name(zan_irgen_t *g, const char *prefix, int n) {
     char buf[32];
     int len = snprintf(buf, sizeof(buf), "$%s%d", prefix, n);
@@ -1759,9 +1519,7 @@ static void async_scan_expr(async_scan_t *s, zan_ast_node_t *e) {
     }
 }
 
-/* Count the statements that leave a try region early (each emits its own inline
- * copy of the enclosing finally body, see emit_pending_finallys). Nested
- * function bodies are not walked -- they carry their own finallys. */
+/* 统计提前离开 try 块的跳转语句数（用于估算内联 finally 体数量） */
 static int async_count_transfers(zan_ast_node_t *st) {
     if (!st) return 0;
     switch (st->kind) {
@@ -1808,12 +1566,7 @@ static int async_count_transfers(zan_ast_node_t *st) {
     }
 }
 
-/* The foreach iteration protocol (GetEnumerator/MoveNext/Current). These
- * predicates are shared by the async frame scan and the AST_FOREACH_STMT
- * emitter so both passes agree on which loops carry a $fe.e enumerator slot.
- * `Current` may be a 0-arg method or a property with a custom getter; the
- * enumerator must be a concrete class (an interface enumerator would need
- * per-call tag dispatch, which the loop cannot re-derive cheaply yet). */
+/* foreach 迭代协议接口判断（GetEnumerator / MoveNext / Current） */
 static zan_type_t *foreach_proto_enum_type(zan_irgen_t *g, zan_type_t *ct) {
     if (!ct || ct->kind != TYPE_CLASS || !ct->sym) return NULL;
     zan_istr_t gi = { (char *)"GetEnumerator", 13 };
@@ -1865,10 +1618,7 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
             async_scan_stmt(s, st->block.stmts.items[i]);
         break;
     case AST_VAR_DECL: {
-        /* `var x = e` must reach the frame just like `T x = e`: infer its type
-         * here with the same inference the emitter uses, resolved in the
-         * specialization's context so a `T`/`U` local in a monomorphized
-         * async body gets its concrete frame slot. */
+        /* 推断 var 声明变量类型并登记至帧槽位 */
         zan_type_t *t = st->var_decl.type
             ? resolve_type_ctx(s->g, st->var_decl.type)
             : NULL;
@@ -1916,11 +1666,7 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
         break;
     case AST_FOREACH_STMT: {
         async_scan_expr(s, st->foreach_stmt.collection);
-        /* A `foreach` resumed inside its body re-enters at a block the loop
-         * pre-header never reaches, so the whole iteration state -- element,
-         * index and collection -- lives in the frame. The collection itself is
-         * kept (rather than the data/count pair derived from it) so every
-         * iteration reloads them from the live list. */
+        /* foreach 循环变量与迭代状态跨挂起点分配帧槽位 */
         int fe_id = s->foreach_next++;
         zan_type_t *et = st->foreach_stmt.var_type
             ? resolve_type_ctx(s->g, st->foreach_stmt.var_type)
@@ -1945,9 +1691,7 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
             ASYNC_FOREACH_COLLECTION);
         if (foreach_proto_enum_type(s->g,
                 infer_expr_type(s->g, st->foreach_stmt.collection, s->scope)))
-            /* protocol enumerator: lives for the whole loop, survives a
-             * suspension like the collection itself (loaded as an i8* and
-             * bitcast back by the emitter) */
+            /* 枚举器对象在整个循环期间驻留帧槽位 */
             async_scan_add_storage_role(s,
                 async_synth_name(s->g, "fe.e", fe_id),
                 LLVMPointerType(LLVMInt8TypeInContext(s->g->ctx), 0), st,
@@ -1981,9 +1725,7 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
         async_scan_stmt(s, st->try_stmt.try_body);
         for (int i = 0; i < st->try_stmt.catches.count; i++) {
             zan_ast_node_t *cc = st->try_stmt.catches.items[i];
-            /* the caught exception binding outlives an await in the handler,
-             * so it is frame-resident too; the frame's per-handler exception
-             * slot owns the object, this binding only borrows it */
+            /* catch 异常绑定变量跨 await 驻留帧槽位（借用所有权） */
             if (cc->catch_clause.var_name.len > 0) {
                 async_scan_add_storage_local(s, cc->catch_clause.var_name,
                     LLVMPointerType(LLVMInt8TypeInContext(s->g->ctx), 0), cc);
@@ -1993,12 +1735,7 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
             }
             async_scan_stmt(s, cc->catch_clause.body);
         }
-        /* The finally body is emitted once per exit path out of this try, and
-         * every copy of an `await` inside it needs its own frame sub-slot, so
-         * scan it once per copy: the normal exit, the exception path, and one
-         * for each early transfer in the guarded/handler bodies. Over-counting
-         * only costs frame bytes; under-counting hands out sub-slot indices past
-         * the end of the frame type. */
+        /* 扫描 finally 块中每个退出分支对应副本的 await 槽位需求 */
         if (st->try_stmt.finally_body) {
             int copies = 2 + async_count_transfers(st->try_stmt.try_body);
             for (int i = 0; i < st->try_stmt.catches.count; i++)
@@ -2021,17 +1758,9 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
 
 static void emit_eh_hook_call(zan_irgen_t *g, const char *name);
 
-/* Async exception propagation: a coroutine cannot longjmp into the frame that
- * awaits it -- that frame's invocation returned to the scheduler at the
- * suspension. Instead each $resume invocation arms one trampoline handler
- * around its whole body; an exception that escapes the body lands there, is
- * parked in the frame's exception slots, and completes the coroutine. The
- * awaiting frame finds it at its resume point and re-throws it in its own
- * (live) invocation. */
+/* 异步异常传播：未捕获异常存放于帧 exc_val 槽供 awaiter 唤醒时重抛 */
 
-/* Arm the trampoline plus every handler recorded in the frame, then leave the
- * builder in the block where the state dispatch belongs. Emitted at the top of
- * each $resume invocation, after the frame slots have been set up. */
+/* resume 入口发射：挂载蹦床与帧内活跃的异常处理器，随后分发至当前 step 块 */
 static void emit_async_eh_prologue(zan_irgen_t *g) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMValueRef fn = g->current_async_resume_fn;
@@ -2051,9 +1780,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
     g->current_async_exc_bb = exc_bb;
 
     if (g->current_async_try_count == 0) {
-        /* Trampoline only: no inner try statements exist in this coroutine, so
-         * no handlers will ever be re-armed upon resumption. Branch directly
-         * to co.dispatch, skipping the rearm machinery entirely. */
+        /* 无内部 try 语句时直接跳转至分发块 */
         LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t");
         LLVMValueRef t1 = zan_add(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t1");
         LLVMBuildStore(g->builder, t1, top_g);
@@ -2083,12 +1810,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
         LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t");
         LLVMValueRef t1 = zan_add(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t1");
         LLVMBuildStore(g->builder, t1, top_g);
-        /* record the unwind-stack depth this handler was armed at, like the
-         * try arm does (irgen_stmt.c): a throw from a plain frame below
-         * reads this mark to release only the temps stacked above it.
-         * Leaving it zero made __zan_eh_tmp_unwind(0) release *every*
-         * registered local of every frame between the thrower and here --
-         * the awaiter's locals came back null after its catch. */
+        /* 记录处理器挂载时的临时变量栈深度，供异常展开时清理 */
         LLVMBuildStore(g->builder,
             LLVMBuildLoad2(g->builder, i32, get_eh_tmp_top_global(g), "eh.t0"),
             emit_eh_mark_ptr(g, t1));
@@ -2103,8 +1825,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
         LLVMValueRef i = LLVMBuildLoad2(g->builder, i32, idx_slot, "eh.i");
         LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32,
             LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "hc.p"), "hc");
-        /* the frame has one slot per try in this body, so hc can only exceed it
-         * if the bookkeeping is broken; clamp rather than read past the frame */
+        /* 限制活跃处理器计数不超过帧分配的容量上限 */
         LLVMValueRef cap = LLVMConstInt(i32, g->current_async_handler_cap, 0);
         hc = LLVMBuildSelect(g->builder,
             zan_icmp(g->builder, LLVMIntSLT, hc, cap, "hc.fits"), hc, cap, "hc.cap");
@@ -2135,8 +1856,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
         LLVMBuildCondBr(g->builder, took, init_bb, land_bb);
     }
 
-    /* the try's own entry code ran in an earlier invocation, so its eh
-     * bookkeeping allocas are uninitialised here: let the try fill them in */
+    /* 恢复此前 invocation 挂载的异常处理器标记 */
     LLVMPositionBuilderAtEnd(g->builder, init_bb);
     g->current_async_rearm_next_bb = next_bb;
     g->current_async_rearm_init_switch = LLVMBuildSwitch(g->builder,
@@ -2151,18 +1871,10 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
         LLVMBuildBr(g->builder, head_bb);
     }
 
-    /* a re-armed handler caught: hand control to that try's catch (the cases
-     * are added by the try lowering, which owns the catch blocks) */
+    /* 命中恢复挂载的异常处理器：分发至对应 try 块的 catch 分支 */
     LLVMPositionBuilderAtEnd(g->builder, land_bb);
     {
-        /* Which of the re-armed handlers was jumped to: a thrower longjmps to
-         * bufs[__zan_eh_top], and handler k of this invocation was armed at
-         * entry + 2 + k (entry + 1 is the trampoline). id_slot still holds the
-         * id armed *last*, which is the innermost handler -- dispatching on it
-         * would send an exception raised inside a catch body back into the try
-         * it just left. Recover k from the top instead, and truncate the
-         * handler count so the handlers armed inside the one that caught are
-         * dropped (the catch entry pops the catching handler itself). */
+        /* 根据 longjmp 跳转目标深度反查命中的处理器索引 k */
         LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.land.top");
         LLVMValueRef e = LLVMBuildLoad2(g->builder, i32, entry_slot, "eh.land.entry");
         LLVMValueRef k = zan_sub(g->builder,
@@ -2188,23 +1900,13 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
         LLVMBuildStore(g->builder,
             zan_add(g->builder, ksafe, LLVMConstInt(i32, 1, 0), "eh.land.hc"),
             LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "hc.l"));
-        /* Release the temps stacked above the catching handler: the async
-         * throw site skips __zan_eh_tmp_unwind (it must not touch the frames
-         * that await us), so this invocation's expression temporaries --
-         * delegates, boxed values, concat strings -- stay on the unwind stack
-         * otherwise. The mark recorded when this handler was (re-)armed is
-         * the exact boundary; everything above it belongs to the interrupted
-         * segment alone. Plain frames that threw below already released
-         * their own entries at their throw sites. */
+        /* 展开并释放捕获处理器之上的临时分配变量 */
         emit_eh_unwind_to_handler(g,
             zan_add(g->builder,
                 zan_add(g->builder, e, LLVMConstInt(i32, 2, 0), "eh.land.a2"),
                 ksafe, "eh.land.arm"));
     }
-    /* A longjmp reaches a handler armed by this invocation (suspension unarms
-     * the old stack handlers). The frame is the sole live variable storage,
-     * including writes since the last await, so the catch needs no restore or
-     * all-slot self-copy. Keep the handler's own mark / bookkeeping rearm. */
+    /* longjmp 捕获后从帧中重载局部变量最新值供 catch 块读取 */
     g->current_async_rearm_switch = LLVMBuildSwitch(g->builder,
         LLVMBuildLoad2(g->builder, i32, id_slot, "eh.id"), exc_bb,
         (unsigned)g->current_async_handler_cap);
@@ -2212,8 +1914,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, disp_bb);
 }
 
-/* Fill the trampoline landing block: park the in-flight exception in the frame
- * and complete the coroutine, so the awaiter can re-throw it. */
+/* 蹦床着陆块：将未捕获异常存入帧并完成协程，供 awaiter 重新抛出 */
 static void emit_async_exc_epilogue(zan_irgen_t *g, local_scope_t *locals) {
     if (!g->current_async_exc_bb) return;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -2224,17 +1925,14 @@ static void emit_async_exc_epilogue(zan_irgen_t *g, local_scope_t *locals) {
     get_eh_globals(g, &top_g, &bufs_g, &exc_g);
 
     LLVMPositionBuilderAtEnd(g->builder, g->current_async_exc_bb);
-    /* No handler caught: release everything this invocation stacked since it
-     * last resumed (same contract as the eh.land unwind above, bounded by the
-     * trampoline's entry-time mark). */
+    /* 未捕获异常时释放本次 resume 期间分配的所有临时变量 */
     if (g->current_async_eh_entry) {
         LLVMValueRef e0 = LLVMBuildLoad2(g->builder, i32,
             g->current_async_eh_entry, "eh.exc.entry");
         emit_eh_unwind_to_handler(g,
             zan_add(g->builder, e0, LLVMConstInt(i32, 1, 0), "eh.exc.tr"));
     }
-    /* Completion reads the authoritative frame fields, including values
-     * this invocation assigned before a nested sync throw longjmp'd here. */
+    /* 协程完成时读取帧字段完成最终清理 */
     LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr, exc_g, "exc.v"),
         LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_EXC, "fr.exc"));
     LLVMBuildStore(g->builder,
@@ -2249,8 +1947,7 @@ static void emit_async_exc_epilogue(zan_irgen_t *g, local_scope_t *locals) {
     emit_async_complete(g, locals, NULL);
 }
 
-/* Re-throw the exception the globals currently hold: jump to the innermost
- * armed handler, or report it as unhandled when none is left. */
+/* 重抛全局异常：跳转至最近挂载的处理器或终止进程 */
 static void emit_eh_rethrow_current(zan_irgen_t *g) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -2262,10 +1959,7 @@ static void emit_eh_rethrow_current(zan_irgen_t *g) {
         LLVMConstInt(i32, 0, 0), "reh.has");
     LLVMBasicBlockRef jmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.jmp");
     LLVMBasicBlockRef die_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.die");
-    /* wasm32 arms no handlers (EH-free lowering, see irgen_stmt.c
-     * AST_TRY_STMT): an armed top cannot exist there, so the rethrow goes
-     * straight to the die path; terminate the (never entered) jmp block so
-     * the pre-optimizer verification pass sees no unterminated block. */
+    /* wasm32 不挂载异常处理器，直接进入未捕获异常终止分支 */
     if (g->target_is_wasm) {
         LLVMBuildBr(g->builder, die_bb);
         LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
@@ -2283,10 +1977,7 @@ static void emit_eh_rethrow_current(zan_irgen_t *g) {
         LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
         if (printf_fn) {
             LLVMTypeRef printf_ty = LLVMFunctionType(i32, &i8ptr, 1, 1);
-            /* Mirror the sync die block (irgen_stmt.c): report WHAT escaped,
-             * not just that something did -- on a device console the bare
-             * line is unfollowable. Class throw: the tid-name registry;
-             * string throw: the message itself; nothing: the old text. */
+            /* 打印未捕获异常详细类型与调用栈信息 */
             LLVMValueRef exc = LLVMBuildLoad2(g->builder, i8ptr, exc_g, "aeh.exc");
             LLVMValueRef tid = LLVMBuildLoad2(g->builder, i8ptr,
                 get_eh_exc_tid_global(g), "aeh.tid");
@@ -2355,8 +2046,7 @@ static void emit_eh_rethrow_current(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, cont);
 }
 
-/* Shared rethrow block for all child-coroutine exception propagation points
- * within a single $resume invocation. */
+/* 单次 resume 调用内子协程异常传播的共享重抛块 */
 static LLVMBasicBlockRef get_async_rethrow_bb(zan_irgen_t *g) {
     if (!g->current_async_resume_fn) return NULL;
     if (g->current_async_rethrow_bb) return g->current_async_rethrow_bb;
@@ -2372,11 +2062,7 @@ static LLVMBasicBlockRef get_async_rethrow_bb(zan_irgen_t *g) {
     return bb;
 }
 
-/* Shared sub-coroutine exception transfer block within a single $resume invocation.
- * Awaited coroutines that threw branch here with their (sub, exc) values; the
- * shared block reads TID/OWNED, commits to EH globals, frees the sub-frame,
- * and enters the invocation's rethrow / EH handler. This turns O(N) inline
- * exception handling blocks into O(1). */
+/* 子协程异常传递共享块：转移异常至当前帧并重抛 */
 static LLVMBasicBlockRef get_async_sub_rethrow_bb(zan_irgen_t *g) {
     if (!g->current_async_resume_fn) return NULL;
     if (g->current_async_sub_rethrow_bb) return g->current_async_sub_rethrow_bb;
@@ -2423,15 +2109,7 @@ static LLVMBasicBlockRef get_async_sub_rethrow_bb(zan_irgen_t *g) {
     return bb;
 }
 
-/* At an await resume point: if the awaited coroutine completed by throwing,
- * move its exception back into the globals and re-throw it here, inside a live
- * invocation of this frame. `sub` is the (still owned) sub-frame handle.
- * `tmp_mark` is the temp-stack depth captured at the await site before the
- * awaited call ran (root drive only; NULL elsewhere). The sub chain pumped
- * other coroutines on this same thread-global stack, and an exception inside
- * them leaves their temp registrations above this handler's mark with nobody
- * left to pop them -- releasing them here, while they are still alive, keeps
- * the catch-entry unwind from releasing long-dead entries. */
+/* await 恢复点检查：若被等待子协程异常退出，提取异常并在当前上下文重抛 */
 static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
                                      LLVMValueRef tmp_mark) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -2450,8 +2128,7 @@ static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
     LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sub.ok");
 
     if (!tmp_mark && g->current_async_resume_fn) {
-        /* In an async $resume invocation without root tmp_mark, route exception
-         * handling through the shared sub-rethrow block. */
+        /* 路由异常处理至共享子重抛块 */
         LLVMBasicBlockRef sub_rethrow_bb = get_async_sub_rethrow_bb(g);
         LLVMAddIncoming(g->current_async_sub_rethrow_phi_sub, &sub, &cur_bb, 1);
         LLVMAddIncoming(g->current_async_sub_rethrow_phi_ev, &ev, &cur_bb, 1);

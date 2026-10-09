@@ -11,21 +11,13 @@ extern "C" {
  * function pointer). Returns 1 on success, 0 on failure. */
 int32_t zan_thread_start(void *body);
 
-/* Return a process-unique numeric id for the calling thread. On Windows this
- * is GetCurrentThreadId(); on Linux it is the TID (gettid, not the PID shared
- * by every thread); on macOS pthread_threadid_np; elsewhere a stable hash of
- * pthread_self(). Thread.CurrentId() in the stdlib is built on this. */
+/* 获取当前线程的进程内唯一数值 ID（跨平台底层线程标识） */
 int64_t zan_thread_current_id(void);
 
-/* Drop the calling thread's per-thread runtime state (currently its
- * exception-handling block). Threads started by zan_thread_start do this
- * themselves; a foreign callback thread that ran Zan code must call it, or it
- * keeps a slot in a table with a hard limit. Idempotent. */
+/* 释放当前线程的线程局部运行时状态（支持幂等调用） */
 void zan_thread_detach(void);
 
-/* Drop the calling thread's exception-handling state. Emitted by the compiler
- * as the epilogue of a thread body that can throw; the runtime object provides
- * a weak fallback definition, the produced program overrides it when needed. */
+/* 释放当前线程的异常处理状态 */
 void __zan_eh_release(void);
 
 /* `lock (obj)` statement monitor: process-wide recursive mutex (coarser than
@@ -33,20 +25,17 @@ void __zan_eh_release(void);
 void zan_monitor_enter(void *obj);
 void zan_monitor_exit(void *obj);
 
-/* UI-thread dispatch queue: post a delegate from any thread, drain on the UI
- * thread. A queued entry is owned by the queue -- post retains a closure
- * record, take hands that reference to the caller (which invokes and then
- * releases it), clear releases what it drops. */
+/* UI 线程派发队列：支持多线程投递闭包并在 UI 主线程消费执行 */
 void zan_dispatch_init(void);
 int32_t zan_dispatch_post(void *fn);
 void *zan_dispatch_take(void);
 
-/* A process-local atomic i64 behind an opaque handle. Every operation on a
- * live handle is safe from any thread; destroying one is not an operation on
- * it but the end of its life, so the owner must have joined or otherwise
- * excluded every user first -- as with C# Dispose, a concurrent destroy and
- * load is a use-after-free in the caller, not something the handle can defend
- * against. */
+/* UI thread tracking and assertions for GUI operations */
+void zan_ui_thread_set(void);
+int32_t zan_ui_thread_check(void);
+void zan_ui_thread_assert(const char *msg);
+
+/* 进程内原子 i64 句柄封装：多线程并发安全 */
 int64_t zan_atomic_int_create(int64_t initial_value);
 void zan_atomic_int_destroy(int64_t handle);
 int64_t zan_atomic_int_load(int64_t handle);
@@ -71,10 +60,7 @@ int64_t zan_monotonic_frequency(void);
 int64_t zan_shared_table_create(
     const char *name, int32_t capacity, int32_t key_size, const char *schema);
 int64_t zan_shared_table_open(const char *name);
-/* Anonymous table: no name in any namespace, so nothing outside this process
- * tree can reach it and nothing survives the last reference. The creator hands
- * zan_shared_table_handle() -- a descriptor its children inherit -- to a child,
- * which maps the same memory with zan_shared_table_attach(). */
+/* 匿名共享内存表：仅通过继承句柄在父子进程间映射共享 */
 int64_t zan_shared_table_create_anon(
     int32_t capacity, int32_t key_size, const char *schema);
 int64_t zan_shared_table_handle(int64_t handle);
@@ -114,12 +100,7 @@ int32_t zan_shared_table_exists(int64_t handle, const char *key);
 int64_t zan_shared_table_count(int64_t handle);
 void zan_shared_table_clear(int64_t handle);
 
-/* One number about the mapping itself, selected by `what`:
- *   0 reserved bytes (the whole mapping: rows are addressable, not paid for)
- *   1 resident bytes (the pages of it this process actually has in memory)
- *   2 capacity (rows)   3 used rows        4 row stride
- *   5 key size          6 column count
- * -1 means "not available on this platform". */
+/* 查询共享内存表元数据（0:保留字节 1:常驻字节 2:容量 3:已用行 4:行跨度 5:键大小 6:列数） */
 #define ZAN_TABLE_STAT_RESERVED 0
 #define ZAN_TABLE_STAT_RESIDENT 1
 #define ZAN_TABLE_STAT_CAPACITY 2
@@ -129,9 +110,7 @@ void zan_shared_table_clear(int64_t handle);
 #define ZAN_TABLE_STAT_COLUMNS 6
 int64_t zan_shared_table_stat(int64_t handle, int32_t what);
 
-/* Hash-keyed variants of the shared-table operations. The stdlib precomputes
- * zan_shared_table_hash() on the hot path so lookups skip the string scan;
- * the keyed API above is the same operations keyed by name. */
+/* 共享内存表哈希键变体接口：加速热路径查询 */
 int64_t zan_shared_table_hash(const char *value);
 int32_t zan_shared_table_set_int_at(
     int64_t handle, int64_t key_hash, const char *column_name, int64_t value);
@@ -184,9 +163,7 @@ long long zan_file_flush(long long handle);
 long long zan_file_close(long long handle);
 long long zan_file_eof(long long handle);
 
-/* whole-file locks (System.IO.File.TryLock): released by the OS when the
- * owning process exits, so they survive a crash without leaving a stale
- * marker */
+/* 全文件排他锁：进程退出时由操作系统自动回收 */
 long long zan_file_try_lock(const char *path);
 long long zan_file_unlock(long long handle);
 

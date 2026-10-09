@@ -355,11 +355,7 @@ zan_dce_stats_t zan_opt_dce(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetFirstFunction(mod);
 
     while (fn) {
-        /* LLVMGetFirstBasicBlock returns NULL for declarations (extern
-         * [DllImport] targets, runtime decls, not-yet-defined generic
-         * instantiations); LLVMGetEntryBasicBlock would instead deref the
-         * empty block list and hand back a bogus block, so walking its
-         * instructions faults. Use the first block and skip bodyless fns. */
+        /* LLVMGetFirstBasicBlock 对声明返回 NULL，跳过无函数体定义 */
         LLVMBasicBlockRef entry = LLVMGetFirstBasicBlock(fn);
         if (entry) {
             LLVMValueRef inst = LLVMGetFirstInstruction(entry);
@@ -382,18 +378,13 @@ zan_dce_stats_t zan_opt_dce(zan_irgen_t *g) {
 zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level) {
     (void)g;
     (void)level;
-    /* No force, no hint: ARC ownership transfer across inline boundaries
-     * requires EH-ownership-aware lifetime tracking, so automatic inlining
-     * attributes are omitted here. LLVM's standard size-tier cost model
-     * handles inlining decisions during pass execution. */
+    /* ARC 跨内联边界生命周期受控，交由 LLVM 标准成本模型决策 */
     zan_inline_stats_t stats = {0, 0};
     return stats;
 }
 
 #if ZAN_LLVM_MAJOR >= 23
-/* LLVM 23 removed the Os/Oz optimization levels: run the O2 pipeline and
- * mark every defined function with the size attributes instead, which is
- * how clang -Os/-Oz are encoded now. */
+/* 运行 O2 流水线并标记尺寸属性以实现代码体积优化 */
 static void zan_opt_mark_size(zan_irgen_t *g, bool min_size) {
     LLVMContextRef ctx = LLVMGetModuleContext(g->mod);
     LLVMAttributeRef opt = LLVMCreateEnumAttribute(ctx,
@@ -458,13 +449,7 @@ void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, za
     LLVMDisposePassBuilderOptions(opts);
 }
 
-/* Delete every function and global no live code refers to, without running any
- * other transform. A whole program is one module here, so a `using` that pulls
- * in a directory of stdlib widgets leaves uncalled definitions behind.
- * GlobalDCE is a pure reachability sweep over the module's reference graph,
- * which keeps unoptimized builds fast while dropping dead weight. Only
- * internal-linkage definitions can be removed, which is why irgen marks
- * everything but `main` internal. */
+/* 全局死代码消除 (GlobalDCE)：纯可达性扫描剔除未引用的内部符号 */
 void zan_opt_strip_unused(zan_irgen_t *g) {
     LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
     LLVMPassBuilderOptionsSetVerifyEach(opts, 0);

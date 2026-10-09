@@ -20,28 +20,16 @@ int zan_hw_has_shani(void);
 int zan_hw_has_pclmul(void);
 int zan_cpu_feature(int id);
 
-/* Per-primitive known-answer-test gate state (conformance can assert that a
- * present feature actually passed its KAT instead of silently degrading):
- *   1 = KAT passed (hardware path live), 0 = not yet evaluated,
- *  -1 = feature absent or KAT failed (hardware path disabled).
- * Ids match zan_cpu_feature. */
+/* 硬件加速原语标准答案测试 (KAT) 门控状态 (1:通过 0:未评估 -1:不支持或失败) */
 int zan_hw_kat_state(int id);
 
-/* ---------------------------------------------------------------------
- * Digest kernels. Each returns 0 and fills `out` on success, or -1 when
- * no hardware path is available (the caller falls back to the pure-Zan
- * implementation). No portable C implementation lives in the runtime.
- * --------------------------------------------------------------------- */
+/* 硬件加速哈希摘要内核：成功返回 0 并填充 out，无硬件路径时返回 -1 由纯 Zan 兜底 */
 int64_t zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]);
 int64_t zan_hw_sha1(const uint8_t *data, int64_t len, uint8_t out[20]);
 int64_t zan_hw_sha512(const uint8_t *data, int64_t len, uint8_t out[64]);
 int64_t zan_hw_sm3(const uint8_t *data, int64_t len, uint8_t out[32]);
 
-/* SM4 Block Cipher CBC mode with PKCS#7 padding (GB/T 32907-2016).
- * Returns produced/plaintext length or -1. On x86_64, uses AES-NI affine
- * decomposition and AVX2+VAES multi-block pipelined vector instructions;
- * on ARM with FEAT_SM4 uses sm4e instructions; falls back to the T-table
- * driver when hardware extensions are absent. */
+/* SM4 分组密码 CBC 模式 (PKCS#7 填充)：支持 AES-NI/AVX2/ARM-SM4 硬件指令与 T-table 回退 */
 int64_t zan_hw_sm4_cbc_encrypt(const uint8_t *in, int64_t len,
                                const uint8_t *key, const uint8_t *iv,
                                uint8_t *out);
@@ -49,10 +37,7 @@ int64_t zan_hw_sm4_cbc_decrypt(const uint8_t *in, int64_t len,
                                const uint8_t *key, const uint8_t *iv,
                                uint8_t *out);
 
-/* AES (FIPS-197) with 128/192/256-bit keys. CBC applies PKCS#7 padding and
- * returns the produced/plaintext length (-1 on refusal). Every path is a
- * thin hardware kernel (AES-NI on x86, FEAT_AES on ARM); the pure-Zan
- * implementation in the stdlib is the software fallback. */
+/* AES 加密/解密内核 (CBC 模式带 PKCS#7 填充)：采用 AES-NI 或 ARMv8 硬件加速 */
 int64_t zan_hw_aes_cbc_encrypt(const uint8_t *in, int64_t len,
                                const uint8_t *key, int keybits,
                                const uint8_t *iv, uint8_t *out);
@@ -117,10 +102,7 @@ int64_t zan_hw_rsa_mod_pow(const uint8_t *base, int64_t bLen,
                            const uint8_t *mod, int64_t mLen,
                            uint8_t *out);
 
-/* RSA Chinese Remainder Theorem (CRT) modular exponentiation:
- * evaluates s1 = m^dp mod p, s2 = m^dq mod q, and recombines via Garner's algorithm:
- * h = (s1 - s2) * qinv mod p, s = s2 + h * q.
- * Returns 0 on success, -1 otherwise. */
+/* RSA 中国剩余定理 (CRT) 模幂计算：基于 Garner 算法重组结果 */
 int64_t zan_hw_rsa_crt(const uint8_t *msg, int64_t mLen,
                        const uint8_t *p, int64_t pLen,
                        const uint8_t *q, int64_t qLen,
@@ -129,14 +111,10 @@ int64_t zan_hw_rsa_crt(const uint8_t *msg, int64_t mLen,
                        const uint8_t *qinv, int64_t qinvLen,
                        uint8_t *out, int64_t outLen);
 
-/* RFC 7748 X25519 constant-time Diffie-Hellman scalar multiplication:
- * computes scalar * point -> out (all 32 bytes little-endian).
- * Clamping of scalar is performed internally. Returns 0 on success. */
+/* RFC 7748 X25519 常数时间 Diffie-Hellman 标量乘法内核 */
 int64_t zan_hw_x25519(const uint8_t *scalar, const uint8_t *point, uint8_t *out);
 
-/* CRC-32C (Castagnoli, poly 0x82F63B78) continuation: returns the updated
- * CRC of `crc` extended with len bytes at p, or -1 when no hardware path
- * exists (SSE4.2 crc32 / ARMv8 CRC instructions). */
+/* CRC-32C 硬件加速计算：基于 SSE4.2 crc32 / ARMv8 CRC 指令 */
 int64_t zan_hw_crc32c_update(uint32_t crc, const uint8_t *p, int64_t len);
 
 /* Vector128 / AES-NI single-cycle primitive helpers */
