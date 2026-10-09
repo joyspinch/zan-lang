@@ -1,0 +1,141 @@
+using System;
+
+class TransferError : Exception {
+    public TransferError(string value) : base(value) { }
+}
+
+class FinallyScopeTransfers {
+    static int discarded;
+    static int preserved;
+    static int forward;
+    static void Check(bool value) {
+        if (!value) { throw new Exception("finally scope transfers"); }
+    }
+
+    static async string Continue() {
+        for (int i = 0; i < 8; i++) {
+            try { return "old-" + Convert.ToString(i); }
+            finally {
+                await Task.Yield();
+                discarded = discarded + 1;
+                continue;
+            }
+        }
+        return "done-" + Convert.ToString(discarded);
+    }
+
+    static async string Break() {
+        while (true) {
+            try { return "old-" + Convert.ToString(discarded); }
+            finally {
+                await Task.Yield();
+                discarded = discarded + 1;
+                break;
+            }
+        }
+        return "break-" + Convert.ToString(discarded);
+    }
+
+    static async string Backward() {
+        int i = 0;
+    again:
+        i = i + 1;
+        if (i <= 8) {
+            try { return "old-" + Convert.ToString(i); }
+            finally {
+                await Task.Yield();
+                discarded = discarded + 1;
+                goto again;
+            }
+        }
+        return "back-" + Convert.ToString(i);
+    }
+
+    static async string Forward() {
+        try { return "old-" + Convert.ToString(discarded); }
+        finally {
+            await Task.Yield();
+            discarded = discarded + 1;
+            goto done;
+        }
+    done:
+        return "forward-" + Convert.ToString(discarded);
+    }
+
+    static async string Internal(bool throws) {
+        try {
+            if (throws) { throw new TransferError("original"); }
+            return "preserved-" + Convert.ToString(preserved);
+        } finally {
+            for (int i = 0; i < 4; i++) {
+                await Task.Yield();
+                preserved = preserved + 1;
+                if (i == 0) { continue; }
+                if (i == 1) { break; }
+            }
+            int j = 0;
+        inner:
+            await Task.Yield();
+            j = j + 1;
+            if (j < 3) { goto inner; }
+            goto next;
+        next:
+            Check(j == 3);
+            try {
+                try { return "nested-" + Convert.ToString(preserved); }
+                finally {
+                    await Task.Yield();
+                    goto caught;
+                }
+            caught:
+                preserved = preserved + 1;
+            } catch (TransferError unexpected) { Check(false); }
+            await Task.Yield();
+        }
+    }
+
+    static async int ForwardReplacement() {
+        try {
+            try { goto done; }
+            finally {
+                await Task.Yield();
+                forward = forward + 1;
+                throw new TransferError("replacement");
+            }
+        done:
+            return -1;
+        } catch (TransferError error) {
+            Check(error.Message == "replacement");
+            await Task.Yield();
+            return forward;
+        }
+    }
+
+    static async int ForwardCatchReturn() {
+        try {
+            try { throw new TransferError("caught"); }
+            catch (TransferError error) {
+                try { goto done; }
+                finally { await Task.Yield(); return 7; }
+            }
+        done:
+            return -1;
+        } finally { await Task.Yield(); }
+    }
+
+    static async void Main() {
+        Check(await Continue() == "done-8");
+        Check(await Break() == "break-9");
+        Check(await Backward() == "back-9");
+        Check(await Forward() == "forward-18");
+        Check(await Internal(false) == "preserved-0");
+        Check(preserved == 3);
+        try { await Internal(true); Check(false); }
+        catch (TransferError error) { Check(error.Message == "original"); }
+        Check(preserved == 6);
+        Check(await ForwardReplacement() == 1);
+        Check(await ForwardCatchReturn() == 7);
+        Check(forward == 1 && discarded == 18);
+        Console.WriteLine("finally scope transfers ok");
+    }
+}

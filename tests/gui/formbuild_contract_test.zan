@@ -1,0 +1,170 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+/// 核心契约与语义定义。
+class FormBuildContractTest {
+    static int fails;
+
+    static void Ok(string what, bool value) {
+        if (value) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static Control Node(Control root, string name) {
+        Control node = root.Find(name);
+        if (node == null) { throw new Exception("Missing node: " + name); }
+        return node;
+    }
+
+    static string Tree(Control c) {
+        string value = c.Kind() + "#" + c.name + "." + c.Class
+            + ":" + Convert.ToString(c.dock)
+            + ":" + Convert.ToString(c.logW) + "," + Convert.ToString(c.logH)
+            + "," + Convert.ToString(c.logX) + "," + Convert.ToString(c.logY)
+            + ":" + Convert.ToString(c.designFloat)
+            + "," + Convert.ToString(c.designAnchor);
+        List<FlowEntry> entries = c.FlowEntries();
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            FlowEntry entry = entries[i];
+            if (entry.kid == null) { value = value + "[text:" + entry.text + "]"; }
+            else { value = value + "[" + Tree(entry.kid) + "]"; }
+        }
+        return value;
+    }
+
+    static JsonValue FlowDoc() {
+        return JsonValue.Parse("{\"formSize\":0,\"fields\":["
+            + "{\"kind\":\"Input\",\"name\":\"entry\",\"label\":\"Name\",\"span\":6,"
+            + "\"placeholder\":\"type here\",\"required\":true,\"bind\":\"user.name\",\"bindProp\":\"value\"},"
+            + "{\"kind\":\"Checkbox\",\"name\":\"agree\",\"label\":\"Agree\",\"span\":18,\"defOn\":true,\"class\":\"small\"},"
+            + "{\"kind\":\"Panel\",\"name\":\"group\",\"label\":\"Group\",\"span\":2,\"kids\":["
+            + "{\"kind\":\"InputNumber\",\"name\":\"amount\",\"min\":125,\"max\":950,\"precision\":2,\"fh\":40}]}]}");
+    }
+
+    static void Flow() {
+        Control dynamicRoot = FormBuilder.Build(FlowDoc());
+        List<Control> prepared = new List<Control>();
+        Input entry = new Input();
+        Checkbox agree = new Checkbox();
+        Panel group = new Panel();
+        InputNumber amount = new InputNumber();
+        prepared.Add(entry); prepared.Add(agree); prepared.Add(group); prepared.Add(amount);
+        Control typedRoot = FormBuilder.BuildWith(FlowDoc(), prepared);
+        Ok("flow tree identical", Tree(dynamicRoot) == Tree(typedRoot));
+        Ok("typed identity", typedRoot.Find("entry") == entry && typedRoot.Find("amount") == amount);
+        Ok("root uses style padding", !typedRoot.padSet && typedRoot.logPad == 0 - 1);
+        Ok("form default size", entry.Class == "large" && agree.Class == "small");
+        Ok("scalar props", entry.GetProp("placeholder") == "type here"
+            && agree.GetProp("defOn") == "true");
+        Ok("unsupported metadata does not become class", entry.Class == "large"
+            && entry.GetProp("required") == "");
+        Ok("numeric scalar", amount.GetProp("min") == "125" && amount.GetProp("max") == "950"
+            && amount.GetProp("precision") == "2");
+        Ok("decimal serialization", FormBuilder.ScalarText(JsonValue.Parse("1.25")) == "1.25");
+        Ok("model binding", entry.bindPath == "user.name" && entry.bindProp == "value");
+        FbFlow row = (FbFlow)typedRoot.children[0];
+        Ok("caption wrapper", row.children[0] is FbStack
+            && row.children[0].children[0].GetProp("text") == "Name");
+        Ok("span contract", row.spans[0] == 6 && row.spans[1] == 18 && row.spans[2] == 24);
+        Ok("container kids", group.children[0] is FbFlow && group.Find("amount") == amount);
+        Ok("logical height", amount.logH == 40);
+    }
+
+    static JsonValue MixedDoc() {
+        return JsonValue.Parse("{\"layoutMode\":1,\"formSize\":0,"
+            + "\"docCss\":\"body { padding: 7px; } .accent { color: red; }\","
+            + "\"bodyClass\":\"document\",\"bodyStyle\":\"display:block\","
+            + "\"bodyContent\":[\"before \",1,\" middle \",0,\" after\",1,99],\"fields\":["
+            + "{\"kind\":\"Panel\",\"htmlTag\":\"span\",\"name\":\"first\",\"text\":\"fallback\","
+            + "\"class\":\"accent\",\"htmlContent\":[\"left \",0,\" right\"],\"kids\":["
+            + "{\"kind\":\"Button\",\"name\":\"inside\",\"text\":\"click\"}]},"
+            + "{\"kind\":\"Element\",\"tag\":\"nav\",\"name\":\"second\",\"text\":\"menu\"},"
+            + "{\"kind\":\"Label\",\"name\":\"added\",\"text\":\"new\"}]}");
+    }
+
+    static void Mixed() {
+        List<Control> prepared = new List<Control>();
+        Element first = new Element(); Button inside = new Button(); Element second = new Element();
+        Label added = new Label();
+        prepared.Add(first); prepared.Add(inside); prepared.Add(second); prepared.Add(added);
+        Control typedRoot = FormBuilder.BuildWith(MixedDoc(), prepared);
+        Control dynamicRoot = FormBuilder.Build(MixedDoc());
+        Ok("mixed tree identical", Tree(dynamicRoot) == Tree(typedRoot));
+        Ok("HTML body root", typedRoot is Element && typedRoot.Kind() == "body");
+        Ok("root CSS retained", typedRoot.designCss == MixedDoc().Str("docCss", "")
+            && typedRoot.Class == "document");
+        Ok("mixed source slots survive reorder", typedRoot.children[0] == second
+            && typedRoot.children[1] == first && typedRoot.children[2] == added);
+        Ok("mixed text order", typedRoot.FlowEntries().Count == 6
+            && typedRoot.FlowEntries()[0].text == "before "
+            && typedRoot.FlowEntries()[2].text == " middle "
+            && typedRoot.FlowEntries()[4].text == " after");
+        Ok("mixed overrides fallback text", first.Text() == "" && first.FlowEntries().Count == 3
+            && first.FlowEntries()[0].text == "left " && first.FlowEntries()[1].kid == inside
+            && first.FlowEntries()[2].text == " right");
+        Ok("Element no default size", first.Class == "accent" && second.Class == "");
+        Ok("natural dimensions", first.logW == 0 && first.logH == 0 && !first.designFloat);
+        Control composite = new Control(); composite.InitControl("component", 5);
+        FormBuilder.BuildInto(composite, MixedDoc(), null);
+        Ok("embedded body semantics", composite.ChildCount() == 1
+            && Tree(composite.children[0]) == Tree(dynamicRoot));
+    }
+
+    static void LayoutAndSlots() {
+        JsonValue doc = JsonValue.Parse("{\"layoutMode\":1,\"fields\":["
+            + "{\"kind\":\"Panel\",\"name\":\"dockTop\",\"dock\":1,\"fx\":99,\"fh\":30},"
+            + "{\"kind\":\"Panel\",\"name\":\"floating\",\"position\":1,\"dock\":1,\"anchor\":9,\"fx\":7,\"fy\":8,\"fw\":40,\"fh\":20},"
+            + "{\"kind\":\"Panel\",\"name\":\"legacy\",\"fx\":5,\"fy\":6,\"fw\":50,\"fh\":25},"
+            + "{\"kind\":\"Panel\",\"name\":\"flow\",\"position\":0,\"dock\":0,\"anchor\":7,\"flexGrow\":2,\"fh\":35},"
+            + "{\"kind\":\"Tabs\",\"name\":\"tabs\",\"options\":[\"A\",\"B\"],\"activeTab\":1,\"kids\":["
+            + "{\"kind\":\"Label\",\"name\":\"tab0\",\"text\":\"zero\"},"
+            + "{\"kind\":\"Label\",\"name\":\"tab1\",\"childTab\":1,\"text\":\"one\"}]},"
+            + "{\"kind\":\"SplitPanel\",\"name\":\"split\",\"kids\":["
+            + "{\"kind\":\"Label\",\"name\":\"pane0\",\"text\":\"left\"},"
+            + "{\"kind\":\"Label\",\"name\":\"pane1\",\"childTab\":1,\"text\":\"right\"}]}]}");
+        Control root = FormBuilder.Build(doc);
+        Control top = Node(root, "dockTop"); Control floating = Node(root, "floating");
+        Control legacy = Node(root, "legacy"); Control flow = Node(root, "flow");
+        Ok("legacy dock eats edge", top.dock == 1 && !top.designFloat);
+        Ok("position wins dock", floating.dock == 0 && floating.designFloat
+            && floating.designAnchor == 9 && floating.logPlaceSet && floating.logX == 7 && floating.logY == 8);
+        Ok("geometry legacy Manual", legacy.designFloat && legacy.designAnchor == 0
+            && legacy.logW == 50 && legacy.logH == 25);
+        Ok("Flow wins legacy Manual", !flow.designFloat && flow.dock == 1 && flow.grow);
+        Ok("structure never leaks classes", flow.Class == "" && floating.Class == "");
+        Tabs tabs = (Tabs)Node(root, "tabs");
+        Ok("active tab scalar", tabs.GetProp("activeTab") == "1");
+        Ok("default tab slot", Node(root, "tab0").parent == tabs.SlotHost(0));
+        Ok("explicit tab slot", Node(root, "tab1").parent == tabs.SlotHost(1));
+        Control split = Node(root, "split");
+        Ok("default split slot", Node(root, "pane0").parent == split.SlotHost(0));
+        Ok("explicit split slot", Node(root, "pane1").parent == split.SlotHost(1));
+    }
+
+    static void ComponentSlots() {
+        string component = "{\"name\":\"ContractBadge\",\"layoutMode\":1,\"winW\":90,\"winH\":50,"
+            + "\"fields\":[{\"kind\":\"Button\",\"name\":\"action\",\"label\":\"Default\",\"fx\":4,\"fy\":5,\"fw\":70,\"fh\":30}],"
+            + "\"props\":[{\"key\":\"caption\",\"target\":\"action\",\"prop\":\"text\",\"def\":\"Default\"}]}";
+        UserComponentRegistry.Register("ContractBadge", component);
+        JsonValue doc = JsonValue.Parse("{\"layoutMode\":1,\"fields\":["
+            + "{\"kind\":\"ContractBadge\",\"name\":\"badge\",\"ref\":\"ContractBadge\",\"props\":{\"caption\":\"Applied\"}},"
+            + "{\"kind\":\"Input\",\"name\":\"after\",\"placeholder\":\"stable slot\"}]}" );
+        List<Control> prepared = new List<Control>();
+        Input after = new Input(); prepared.Add(null); prepared.Add(after);
+        Control root = FormBuilder.BuildWith(doc, prepared);
+        Ok("component internals do not steal prepared slot", root.Find("after") == after
+            && after.GetProp("placeholder") == "stable slot");
+        Control action = Node(root, "badge_action");
+        Ok("component expanded", action.GetProp("text") == "Applied");
+        Ok("expansion is idempotent", Tree(FormBuilder.Build(doc)) == Tree(root));
+    }
+
+    static void Main() {
+        fails = 0;
+        Flow(); Mixed(); LayoutAndSlots(); ComponentSlots();
+        if (fails == 0) { Console.WriteLine("FORMBUILD_CONTRACT_OK"); }
+    }
+}

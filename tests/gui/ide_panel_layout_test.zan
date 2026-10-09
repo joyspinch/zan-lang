@@ -1,0 +1,238 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Widget;
+
+/// IDE 面板布局回归（body/Flex 通道）。
+///
+/// 背景：设计 HTML 经 DesignerHtml.ToJsonDoc 总是带 bodyContent，
+/// FormBuilder.IsHtmlRoot 据此构造 Element(body)；真实 ide.css 经
+/// App.UseAppCss 安装了 Web UA 基线（body 是块流）。块流里
+/// data-dock=5 的子项不再「吃剩余高度」——于是 OUTPUT 的控制台和
+/// ERRORS 的错误列表只有 0 高（11 条诊断 count=11 却一行看不见）。
+/// 修复走纯声明 Flex：body 根显式 display:flex/column（ide-panel），
+/// 填充控件 flex-grow:1/flex-basis:0（ide-panel-fill），工具条保持
+/// 自然高度（ide-panel-toolbar / ide-panel-action shrink:0）。
+///
+/// 本测试用真实面板文档生成的 typed 控件树（OutputPanel/ErrorsPanel/
+/// 五个树面板/四个 AI 内嵌视图）+ 真实 ide.css，在离屏 App 里测量、
+/// 排布并绘制，在多组面板高度与 DPI 下断言：
+///   - 填充区（ConsoleView/ErrorList/TreeView）有正高度，且严格等于
+///     面板高减去自然高度段（对 bh=0 回归的精确反断言）；
+///   - 工具条自然高度、输入框与按钮互不重叠、按钮贴行内；
+///   - 11 行合成诊断逐行正高、逐行堆叠不重叠、首行可见；
+///   - RunStrip/SendCue/PlanStrip/TeamBoard 各段自然高、声明细线
+///     保持、填充段吃剩余空间、折叠段默认隐藏。
+///
+/// 运行前提（交由主侧执行，本测试自身不触发编译）：
+///   1. 必须与官方 IDE 同一 source/input shape 编译——scripts/
+///      build_ide.ps1 枚举的全部 src/ide_zan 源 + 全部 .html 设计，
+///      并把本文件放在入口位（显式 Main 优先于 generated
+///      __DesignMain，见 GenForm），否则 generated 面板类与嵌入
+///      设计不存在；
+///   2. 工作目录为仓库根（相对路径读 src/ide_zan/assets/ide.css，
+///      与 designer_wysiwyg_test 读 tests/gui/*.html 同一口径）。
+/// 成功输出 IDE_PANEL_LAYOUT_OK，任何断言失败即抛异常。
+class IdePanelLayoutTest {
+    static App app;
+    static string ideCss;
+    static int W;
+
+    static void Check(string what, bool ok) {
+        if (ok) { return; }
+        Console.WriteLine("FAIL " + what);
+        throw new Exception("IDE panel layout: " + what);
+    }
+
+    static void LoadCss() {
+        string path = "src/ide_zan/assets/ide.css";
+        Check("ide.css exists at " + path, File.Exists(path));
+        ideCss = File.ReadAllText(path);
+        Check("ide.css non-empty", ideCss != null && ideCss.Length > 100);
+    }
+
+    /// 每组尺寸一个离屏帧：先定视口，再装真实 ide.css（面板构造可能
+    /// 重设应用样式，渲染前重装一次保证被测的就是线上的这份），帧内
+    /// 完成测量 + 排布 + 绘制（列表行矩形在 OnPaint 里落）。
+    static void BeginArea(int h, int scale) {
+        app.SetOffscreenViewport(W, h, scale);
+        app.UseAppCss(ideCss);
+        app.BeginOffscreenFrame();
+    }
+
+    static void OutputAt(int h, int scale) {
+        OutputPanel p = new OutputPanel();
+        List<string> log = new List<string>();
+        log.Add("> [Debug] build started");
+        log.Add("compile src/main.zan ok");
+        log.Add("warning: unused variable x");
+        log.Add("> --- Link ---");
+        log.Add("done in 1.2s");
+        BeginArea(h, scale);
+        p.Render(app, new Rect(0, 0, W, h), log);
+        app.EndOffscreenFrame();
+
+        string tag = "output h=" + Convert.ToString(h)
+            + " dpi=" + Convert.ToString(scale) + " ";
+        Check(tag + "toolbar natural height", p.Bar.bh > 0 && p.Bar.bh < h);
+        Check(tag + "toolbar spans body", p.Bar.bx == 0 && p.Bar.bw == W);
+        Check(tag + "filter filled", p.Filter.bw > 0 && p.Filter.bh > 0);
+        Check(tag + "clear button natural", p.ClearBtn.bw > 0 && p.ClearBtn.bh > 0
+            && p.ClearBtn.bh <= p.Bar.bh);
+        Check(tag + "toolbar no overlap",
+            p.Filter.bx + p.Filter.bw <= p.ClearBtn.bx
+            && p.ClearBtn.bx + p.ClearBtn.bw <= p.Bar.bx + p.Bar.bw);
+        Check(tag + "rule below toolbar", p.Rule.bh > 0
+            && p.Rule.by >= p.Bar.by + p.Bar.bh);
+        // 反 bh=0 回归的精确式：控制台高度必须等于剩余空间，差一像素
+        // 都说明又回到了非 Flex 通道。
+        Check(tag + "console fills exactly the rest",
+            p.Log.by >= p.Rule.by + p.Rule.bh && p.Log.bh > 0
+            && p.Log.by + p.Log.bh == h
+            && p.Log.bh == h - p.Bar.bh - p.Rule.bh);
+    }
+
+    static void ErrorsAt(int h, int scale) {
+        ErrorsPanel p = new ErrorsPanel();
+        List<DiagnosticRecord> recs = new List<DiagnosticRecord>();
+        for (int i = 0; i < 11; i = i + 1) {
+            string what;
+            if (i % 3 == 0) {
+                what = "unknown type 'Foo" + Convert.ToString(i) + "'";
+            }
+            else if (i % 3 == 1) {
+                what = "undeclared variable y" + Convert.ToString(i);
+            }
+            else { what = "missing semicolon before }"; }
+            recs.Add(new DiagnosticRecord(
+                "src/demo/file" + Convert.ToString(i) + ".zan",
+                Convert.ToString(i + 1), what));
+        }
+        BeginArea(h, scale);
+        p.Render(app, new Rect(0, 0, W, h), recs);
+        app.EndOffscreenFrame();
+
+        string tag = "errors h=" + Convert.ToString(h)
+            + " dpi=" + Convert.ToString(scale) + " ";
+        Check(tag + "panel count", p.Count() == 11);
+        // 面板体只有列表一处填充：列表必须吃满整个面板。
+        Check(tag + "list filled", p.List.bh == h && p.List.by == 0
+            && p.List.bw == W);
+        Control inner = p.List.children[0];
+        Check(tag + "inner list filled", inner.bh == h && inner.bw > 0);
+        Check(tag + "rows built", inner.children.Count == 11);
+        for (int i = 0; i < 11; i = i + 1) {
+            Control row = inner.children[i];
+            Check(tag + "row " + Convert.ToString(i) + " positive height",
+                row.bh > 0);
+            if (i > 0) {
+                Control prev = inner.children[i - 1];
+                Check(tag + "row " + Convert.ToString(i)
+                    + " stacks without overlap",
+                    row.by == prev.by + prev.bh);
+            }
+        }
+        Check(tag + "first row at top", inner.children[0].by == inner.by);
+        // 短视口下后面的行允许滚出裁剪，但第一行必须真的看得见。
+        Check(tag + "first row visible", inner.children[0].visible);
+    }
+
+    static void TreePanelsAt(int h, int scale) {
+        ExplorerPanel pe = new ExplorerPanel();
+        ExamplesPanel px = new ExamplesPanel();
+        StdlibPanel ps = new StdlibPanel();
+        StructurePanel pt = new StructurePanel();
+        ToolsPanel po = new ToolsPanel();
+        BeginArea(h, scale);
+        pe.RenderInside(app, new Rect(0, 0, W, h));
+        px.RenderInside(app, new Rect(0, 0, W, h));
+        ps.RenderInside(app, new Rect(0, 0, W, h));
+        pt.RenderInside(app, new Rect(0, 0, W, h));
+        po.RenderInside(app, new Rect(0, 0, W, h));
+        app.EndOffscreenFrame();
+
+        string tag = "trees h=" + Convert.ToString(h)
+            + " dpi=" + Convert.ToString(scale) + " ";
+        Check(tag + "explorer filled", pe.Tree.bh == h && pe.Tree.bw == W);
+        Check(tag + "examples filled", px.Tree.bh == h && px.Tree.bw == W);
+        Check(tag + "stdlib filled", ps.Tree.bh == h && ps.Tree.bw == W);
+        Check(tag + "structure filled", pt.Tree.bh == h && pt.Tree.bw == W);
+        Check(tag + "tools filled", po.Tree.bh == h && po.Tree.bw == W);
+    }
+
+    /// 四个 AI 内嵌视图：宿主（AiPanel.Prepare）给的是固定带高，视图
+    /// 体内各段自然高、填充段吃剩余。一次帧内各排一块互不干扰。
+    static void Views() {
+        RunStrip run = new RunStrip();
+        SendCue cue = new SendCue();
+        PlanStrip plan = new PlanStrip();
+        TeamBoard team = new TeamBoard();
+        BeginArea(300, 100);
+        run.RenderInside(app, new Rect(0, 0, 220, 22));
+        cue.RenderInside(app, new Rect(0, 40, 260, 26));
+        plan.RenderInside(app, new Rect(0, 0, 300, 240));
+        team.RenderInside(app, new Rect(0, 0, 240, 120));
+        app.EndOffscreenFrame();
+
+        // RunStrip：状态行撑满、细分隔线保持声明高并垫底。
+        Check("runstrip line plus rule is strip height (line=" + Convert.ToString(run.Line.bh)
+            + " rule=" + Convert.ToString(run.Rule.bh) + ")",
+            run.Line.bh + run.Rule.bh == 22 && run.Line.bh > 0);
+        Check("runstrip rule below line",
+            run.Rule.by == run.Line.by + run.Line.bh);
+        Check("runstrip dots natural", run.Dots.bw > 0 && run.Dots.bh > 0);
+        Check("runstrip status filled", run.StatusLbl.bw > 0);
+        // SendCue：整行吃满宿主带高；说明文字自然宽，下拉宿主保持声明宽。
+        Check("sendcue line filled", cue.Line.bh == 26 && cue.Line.bw == 260);
+        Check("sendcue label natural", cue.ToLbl.bw > 0 && cue.ToLbl.bh > 0);
+        Check("sendcue pick host declared width",
+            cue.PickHost.bw == app.Scale(170));
+        // PlanStrip：状态条声明高、两行表头自然高、步骤清单吃剩余、
+        // 底部细线保持声明高。
+        int used = plan.Run.bh + plan.Head.bh + plan.FilesHead.bh
+            + plan.Files.bh + plan.Rule.bh;
+        Check("planstrip run declared height", plan.Run.bh == app.Scale(22));
+        Check("planstrip heads natural",
+            plan.Head.bh > 0 && plan.FilesHead.bh > 0);
+        Check("planstrip titles filled",
+            plan.TitleBtn.bw > 0 && plan.FilesBtn.bw > 0);
+        Check("planstrip rows fill the rest",
+            plan.Rows.bh == 240 - used && plan.Rows.bh > 0);
+        Check("planstrip rule keeps hairline", plan.Rule.bh == app.Scale(4));
+        Check("planstrip section order",
+            plan.Head.by == plan.Run.by + plan.Run.bh
+            && plan.Rows.by == plan.Files.by + plan.Files.bh);
+        // TeamBoard：头行自然高、开关与徽标区有宽、默认折叠段隐藏。
+        Check("teamboard head natural", team.Head.bh > 0);
+        Check("teamboard switch and chips",
+            team.ModeSw.bw > 0 && team.Chips.bw > 0);
+        Check("teamboard collapsed by default",
+            !team.Pipeline.visible && !team.Graph.visible
+            && !team.Sizer.visible && !team.Why.visible);
+    }
+
+    static void Main() {
+        app = App.CreateOffscreen("IDE panel layout", 480, 240);
+        W = 480;
+        LoadCss();
+        // 多高度 × 多 DPI：填充式必须在一整圈尺寸下都成立。
+        OutputAt(240, 100);
+        ErrorsAt(240, 100);
+        TreePanelsAt(240, 100);
+        OutputAt(160, 100);
+        ErrorsAt(160, 100);
+        TreePanelsAt(160, 100);
+        OutputAt(420, 100);
+        ErrorsAt(420, 100);
+        TreePanelsAt(420, 100);
+        OutputAt(240, 150);
+        ErrorsAt(240, 150);
+        TreePanelsAt(240, 150);
+        OutputAt(160, 150);
+        ErrorsAt(160, 150);
+        TreePanelsAt(160, 150);
+        Views();
+        app.canvas.Destroy();
+        Console.WriteLine("IDE_PANEL_LAYOUT_OK");
+    }
+}

@@ -1,15 +1,4 @@
-/* Multi-window event routing (X11 backend).
- *
- * One process can now own several top-level windows. Each window keeps its own
- * size, back buffer, GC and input context, and every decoded event carries the
- * handle of the window it came from (queried with zan_gui_event_hwnd). This
- * test creates two differently-sized windows, moves them apart so pointer
- * events are unambiguous, and asserts that:
- *   - per-handle client_width/height return each window's own size;
- *   - a content click routes to the window under the pointer (event_hwnd);
- *   - present() targets a window by handle without error;
- *   - closing one window leaves the other fully usable.
- * Runs headless under Xvfb (no window manager required). */
+/* 底层系统交互与数据协议契约 */
 #include <X11/Xlib.h>
 #include <X11/extensions/XTest.h>
 
@@ -36,8 +25,7 @@ static void pump(int n) {
     for (int j = 0; j < n; j++) { zan_gui_poll_event(); usleep(3000); }
 }
 
-/* Warp to root (rx,ry), click button 1, and return the handle of the window
- * that produced the resulting kind-2 mouse-down (0 if none). */
+/* 底层系统交互与数据协议契约 */
 static i64 click_hwnd(int rx, int ry) {
     XWarpPointer(d, None, DefaultRootWindow(d), 0, 0, 0, 0, rx, ry);
     XSync(d, False);
@@ -65,12 +53,12 @@ int main(void) {
     zan_gui_show_window(w1);
     zan_gui_show_window(w2);
 
-    /* Per-handle sizes must be independent. */
+    /* 核心系统底层抽象与内存语义契约 */
     int sizes_ok = zan_gui_client_width(w1) == 300 && zan_gui_client_height(w1) == 200 &&
                    zan_gui_client_width(w2) == 360 && zan_gui_client_height(w2) == 260;
     printf("per-window sizes: %s\n", sizes_ok ? "OK" : "FAIL");
 
-    /* Present each window by handle (own back buffer, no cross-talk). */
+    /* 底层系统交互与数据协议契约 */
     i64 s1 = zan_gui_create_surface(300, 200);
     i64 s2 = zan_gui_create_surface(360, 260);
     int present_ok = zan_gui_present(w1, s1) == 0 && zan_gui_present(w2, s2) == 0;
@@ -78,7 +66,7 @@ int main(void) {
 
     d = XOpenDisplay(NULL);
     if (!d) { printf("no display\n"); return 3; }
-    /* Separate the two windows so the pointer lands unambiguously in one. */
+    /* 底层系统交互与数据协议契约 */
     XMoveWindow(d, (Window)w1, 0, 0);
     XMoveWindow(d, (Window)w2, 400, 0);
     XRaiseWindow(d, (Window)w1);
@@ -86,7 +74,7 @@ int main(void) {
     XSync(d, False);
     pump(30);
 
-    /* Content clicks (below the 32px title bar, away from resize borders). */
+    /* 底层系统交互与数据协议契约 */
     i64 h1 = click_hwnd(150, 120);
     i64 h2 = click_hwnd(400 + 180, 120);
     int route_ok = (h1 == w1) && (h2 == w2);
@@ -94,7 +82,7 @@ int main(void) {
            h1 == w1 ? "w1" : "?", h2 == w2 ? "w2" : "?",
            route_ok ? "OK" : "FAIL");
 
-    /* Destroying one window must not disturb the other. */
+    /* 底层系统交互与数据协议契约 */
     zan_gui_close_window(w1);
     pump(10);
     int survive_ok = zan_gui_client_width(w2) == 360 &&

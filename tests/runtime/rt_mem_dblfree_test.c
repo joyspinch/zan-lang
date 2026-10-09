@@ -1,23 +1,4 @@
-/* rt_mem_dblfree_test.c -- the allocator's double-free guard (rt_mem.c).
- *
- * Every produced Zan program links the size-class allocator with
- * `ld --wrap=malloc,free,calloc,realloc`. A freed block keeps its 16-byte
- * allocator header and is marked ZAN_MEM_FREED until it is re-allocated, so
- * freeing the same block twice -- a memory-aliasing bug under ARC -- aborts
- * with a clear message instead of handing the same address to two owners.
- *
- * The slab path is mmap-based, so it only exists on POSIX (on Windows the
- * allocator falls through to the libc heap and the guard never runs); this
- * file is therefore POSIX-only and must be linked with the same --wrap flags:
- *
- * Build (POSIX):
- *   cc -O2 -Wall -Wextra tests/runtime/rt_mem_dblfree_test.c \
- *        src/runtime/rt_mem.c \
- *        -Wl,--wrap=malloc -Wl,--wrap=free -Wl,--wrap=calloc -Wl,--wrap=realloc \
- *        -o rt_mem_dblfree_test
- *
- * Exit code 0 = all checks passed, non-zero = at least one failure.
- */
+/* 模块核心语义抽象与接口调用契约 */
 
 #include <errno.h>
 #include <signal.h>
@@ -28,16 +9,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* The wrapped entry points, declared here so the test talks to the allocator
- * the same way produced code does (the standard headers still resolve the
- * unwrapped names for everything else in this file). */
+/* 模块核心语义抽象与接口调用契约 */
 void *__wrap_malloc(size_t n);
 void __wrap_free(void *p);
 void *__wrap_calloc(size_t n, size_t m);
 
-/* The fatal funnel the guards route through (rt_timer.c): a host registers a
- * handler to take over the process death, or leaves it unset for the
- * historical print + abort. */
+/* 模块核心语义抽象与接口调用契约 */
 #include "src/runtime/rt_timer.h"
 
 static int failures;
@@ -46,8 +23,7 @@ static int failures;
     if (!(cond)) { fprintf(stderr, "FAIL: %s\n", msg); failures++; } \
 } while (0)
 
-/* Run `child_fn` in a forked child with its stderr captured, and require the
- * child to die on SIGABRT with `needle` on stderr. */
+/* 模块核心语义抽象与接口调用契约 */
 static void expect_abort(void (*child_fn)(void), const char *needle) {
     int fds[2];
     CHECK(pipe(fds) == 0, "pipe");
@@ -59,7 +35,7 @@ static void expect_abort(void (*child_fn)(void), const char *needle) {
         dup2(fds[1], STDERR_FILENO);
         close(fds[0]); close(fds[1]);
         child_fn();
-        _exit(3);                 /* reached only if the guard did not fire */
+        _exit(3);                 /* 底层系统交互与数据协议契约 */
     }
     close(fds[1]);
     char buf[4096];
@@ -77,9 +53,7 @@ static void expect_abort(void (*child_fn)(void), const char *needle) {
     CHECK(strstr(buf, needle) != NULL, "abort message must name the failure");
 }
 
-/* Same harness shape, but the child must exit CLEANLY with `code` -- the
- * host-takeover contract: the fatal handler runs and terminates the process
- * itself, so nobody aborts. */
+/* 模块核心语义抽象与接口调用契约 */
 static void expect_exit(void (*child_fn)(void), int code,
                         const char *needle) {
     int fds[2];
@@ -92,7 +66,7 @@ static void expect_exit(void (*child_fn)(void), int code,
         dup2(fds[1], STDERR_FILENO);
         close(fds[0]); close(fds[1]);
         child_fn();
-        _exit(3);                 /* reached only if the guard did not fire */
+        _exit(3);                 /* 底层系统交互与数据协议契约 */
     }
     close(fds[1]);
     char buf[4096];
@@ -114,25 +88,22 @@ static void double_free_child(void) {
     void *p = __wrap_malloc(64);
     if (!p) _exit(2);
     __wrap_free(p);
-    __wrap_free(p);               /* must abort here */
+    __wrap_free(p);               /* 核心系统底层抽象与内存语义契约 */
 }
 
 static void corrupt_header_child(void) {
-    /* A block whose header class is out of range is not a block start the
-     * allocator knows: it must refuse to trust the header, not dereference a
-     * free list indexed by garbage. */
+    /* 模块核心语义抽象与接口调用契约 */
     void *p = __wrap_malloc(32);
     if (!p) _exit(2);
     unsigned char *hdr = (unsigned char *)p - 16;
-    hdr[7] = (unsigned char)0xff; /* cls = 0xffff..., past ZAN_MEM_NCLASS */
-    __wrap_free(p);               /* must abort here */
+    hdr[7] = (unsigned char)0xff; /* 底层系统交互与数据协议契约 */
+    __wrap_free(p);               /* 核心系统底层抽象与内存语义契约 */
 }
 
-/* ---- host takeover (zan_rt_fatal / zan_rt_set_fatal_handler) ---- */
+/* 模块核心语义抽象与接口调用契约 */
 
 static void takeover_handler(const char *category, const char *message) {
-    /* Stand-in for a game server's supervisor handshake: report what came in,
-     * then terminate with the host's own status. */
+    /* 模块核心语义抽象与接口调用契约 */
     fprintf(stderr, "fatal-handler-saw: %s: %s\n", category, message);
     fflush(stderr);
     _exit(71);
@@ -143,14 +114,13 @@ static void takeover_child(void) {
     void *p = __wrap_malloc(64);
     if (!p) _exit(2);
     __wrap_free(p);
-    __wrap_free(p);               /* must route through the handler, exit(71) */
+    __wrap_free(p);               /* 底层系统交互与数据协议契约 */
     _exit(3);
 }
 
 static void returning_handler(const char *category, const char *message) {
     (void)category; (void)message;
-    /* Returns: a contract violation by the host. The runtime must fall back
-     * to abort -- the heap is corrupt either way. */
+    /* 模块核心语义抽象与接口调用契约 */
 }
 
 static void returning_handler_child(void) {
@@ -158,14 +128,12 @@ static void returning_handler_child(void) {
     void *p = __wrap_malloc(64);
     if (!p) _exit(2);
     __wrap_free(p);
-    __wrap_free(p);               /* handler returns -> abort fallback */
+    __wrap_free(p);               /* 核心系统底层抽象与内存语义契约 */
     _exit(3);
 }
 
 int main(void) {
-    /* Sanity: the allocator works and legal free/reuse cycles are not
-     * flagged. malloc(64) lands in a slab; calloc and a >2048-byte block
-     * exercise the fallthrough paths. */
+    /* 模块核心语义抽象与接口调用契约 */
     void *p = __wrap_malloc(64);
     CHECK(p != NULL, "malloc small");
     __wrap_free(p);
@@ -179,14 +147,11 @@ int main(void) {
     CHECK(big != NULL, "malloc large (libc fallthrough)");
     __wrap_free(big);
 
-    /* The guards themselves: each runs in a child so the abort does not take
-     * down the test runner. */
+    /* 模块核心语义抽象与接口调用契约 */
     expect_abort(double_free_child, "double free");
     expect_abort(corrupt_header_child, "corrupt block header");
 
-    /* Host takeover: a registered handler terminates the process itself
-     * (exit 71) with the category and message delivered intact; a handler
-     * that returns falls back to the historical abort. */
+    /* 模块核心语义抽象与接口调用契约 */
     expect_exit(takeover_child, 71, "fatal-handler-saw: mem: double free");
     expect_abort(returning_handler_child, "double free");
 

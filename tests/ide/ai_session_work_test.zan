@@ -1,0 +1,180 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Threading;
+using System.Data;
+using System.Data.Sqlite;
+
+// 接口数据协议与执行契约。
+class AiSessionWorkTest {
+    static void Require(bool condition, string message) {
+        if (!condition) { throw new Exception(message); }
+    }
+
+    static IdeAiSessionContext Context(string dir, string name) {
+        IdeAiSessionContext context = new IdeAiSessionContext();
+        context.path = dir + "/" + name + ".db";
+        context.checkpoint = dir + "/" + name + ".json";
+        context.shared = dir + "/shared.db";
+        context.sharedArchive = dir + "/shared-old.db";
+        context.legacy = dir + "/legacy.json";
+        context.root = name;
+        return context;
+    }
+
+    static IdeAiSessionEntry Entry(string text, string title, int archived) {
+        IdeAiSessionEntry entry = new IdeAiSessionEntry();
+        entry.image = IdeAiSessionImage.Empty();
+        entry.image.messages.Add(ChatMessage.CreateWithReason("user", text, "reason"));
+        entry.title = title;
+        entry.archived = archived;
+        return entry;
+    }
+
+    static IdeAiSessionRequest Save(IdeAiSessionContext context, IdeAiSessionEntry first,
+                                    IdeAiSessionEntry second) {
+        IdeAiSessionRequest request = new IdeAiSessionRequest();
+        request.context = context;
+        request.kind = 0;
+        request.entries.Add(first);
+        if (second != null) { request.entries.Add(second); }
+        return request;
+    }
+
+    static IdeAiSessionResult Read(IdeAiSessionContext source) {
+        IdeAiSessionContext fresh = new IdeAiSessionContext();
+        fresh.path = source.path;
+        fresh.checkpoint = source.checkpoint;
+        fresh.shared = source.shared;
+        fresh.sharedArchive = source.sharedArchive;
+        fresh.legacy = source.legacy;
+        IdeAiSessionWork.ReadBaseline(fresh);
+        IdeAiSessionResult result = new IdeAiSessionResult();
+        result.entries = fresh.baseline;
+        result.current = fresh.current;
+        return result;
+    }
+
+    static async void Main() {
+        string dir = "_scratch/ide-ai-session-test-" + Convert.ToString(Runtime.GetProcessId());
+        Directory.CreateDirectoryRecursive(dir);
+        try {
+            // 接口数据协议与执行契约。
+            List<ChatMessage> messages = new List<ChatMessage>();
+            ChatMessage live = ChatMessage.CreateWithReason("user", "quoted \"text\"\n中文", "thinking");
+            live.at = 123;
+            messages.Add(live);
+            List<AiPlanStep> plan = new List<AiPlanStep>();
+            plan.Add(AiPlanStep.Create("plan", 1));
+            AiTeamState team = AiTeamState.Create();
+            team.activeTask = "task-1";
+            List<AiTask> tasks = new List<AiTask>();
+            tasks.Add(AiTask.Create("task-1", "board", "dev"));
+            tasks[0].deps.Add("dependency");
+            AiRun run = AiRun.Begin("run-1", "delivery", 10);
+            run.steps[0].diagnostics.Add("original diagnostic");
+            run.changes.Add(new AiFileChange("src/a.zan", 2, 1));
+            IdeAiSessionImage image = IdeAiSessionImage.Capture(messages, plan, true, team, tasks, run);
+            live.text = "changed";
+            plan[0].done = 0;
+            team.activeTask = "changed";
+            tasks[0].title = "changed";
+            tasks[0].deps[0] = "changed";
+            run.steps[0].diagnostics[0] = "changed";
+            run.changes[0].adds = 900;
+            IdeAiSessionImage restored = IdeAiSessionImage.Read(image.Pack());
+            Require(restored.messages[0].text == "quoted \"text\"\n中文" && restored.messages[0].at == 123, "message snapshot");
+            Require(restored.plan[0].done == 1 && restored.team.st.activeTask == "task-1", "plan/team snapshot");
+            Require(restored.team.tasks[0].title == "board" && image.team.tasks[0].deps[0] == "dependency", "board snapshot");
+            Require(restored.run != null, "run present");
+            if (restored.run != null) {
+                Require(restored.run.steps[0].diagnostics[0] == "original diagnostic", "run list snapshot");
+                Require(restored.run.changes[0].adds == 2, "run change snapshot");
+            }
+
+            IdeAiSessionContext a = AiSessionWorkTest.Context(dir, "a");
+            IdeAiSessionContext b = AiSessionWorkTest.Context(dir, "b");
+            IdeAiSessionWork work = new IdeAiSessionWork();
+            IdeAiSessionRequest initial = AiSessionWorkTest.Save(a, AiSessionWorkTest.Entry("old-0", "old", 0),
+                AiSessionWorkTest.Entry("old-1", "old-1", 0));
+            initial.current = 1;
+            work.Enqueue(initial);
+            IdeAiSessionRequest autosave = AiSessionWorkTest.Save(a, AiSessionWorkTest.Entry("old-0", "old", 0),
+                AiSessionWorkTest.Entry("autosave-before-delete", "old-1", 0));
+            autosave.kind = 1;
+            autosave.index = 1;
+            autosave.current = 1;
+            work.Enqueue(autosave);
+            work.Enqueue(AiSessionWorkTest.Save(b, AiSessionWorkTest.Entry("other workspace", "B", 0), null));
+            work.Enqueue(AiSessionWorkTest.Save(a, AiSessionWorkTest.Entry("new-current", "A renamed", 1), null));
+            IdeAiSessionRequest checkpoint = new IdeAiSessionRequest();
+            checkpoint.kind = 3; checkpoint.context = a; checkpoint.run = image.run;
+            work.Enqueue(checkpoint);
+            checkpoint = new IdeAiSessionRequest();
+            checkpoint.kind = 3; checkpoint.context = a;
+            work.Enqueue(checkpoint);
+            TaskCompletionSource<int> complete = work.Seal();
+            await complete.Task;
+            IdeAiSessionResult disk = AiSessionWorkTest.Read(a);
+            Require(disk.entries.Count == 1 && disk.current == 0, "FIFO preserves deletion and active index");
+            Require(disk.entries[0].title == "A renamed" && disk.entries[0].archived == 1, "metadata matches rows");
+            Require(disk.entries[0].image.messages[0].text == "new-current", "old autosave cannot overwrite final snapshot");
+            IdeAiSessionResult other = AiSessionWorkTest.Read(b);
+            Require(other.entries.Count == 1, "separate workspace destination");
+            Require(!File.Exists(a.checkpoint), "checkpoint delete follows checkpoint save");
+            Require(!work.Enqueue(initial), "drained producer is sealed");
+
+            // 接口数据协议与执行契约。
+            IdeAiSessionContext adopting = AiSessionWorkTest.Context(dir, "a");
+            IdeAiSessionWork adoption = new IdeAiSessionWork();
+            CancellationTokenSource cancellation = new CancellationTokenSource();
+            cancellation.Cancel();
+            IdeAiSessionRequest load = new IdeAiSessionRequest();
+            load.kind = 2; load.context = adopting; load.cancellation = cancellation.Token;
+            adoption.Enqueue(load);
+            IdeAiSessionRequest draft = AiSessionWorkTest.Save(adopting, AiSessionWorkTest.Entry("draft-before-close", "draft", 0), null);
+            draft.mergeBaseline = true; draft.hasDrafts = true;
+            adoption.Enqueue(draft);
+            IdeAiSessionRequest latest = AiSessionWorkTest.Save(adopting, AiSessionWorkTest.Entry("latest draft", "draft", 0), null);
+            latest.mergeBaseline = true; latest.hasDrafts = true;
+            adoption.Enqueue(latest);
+            complete = adoption.Seal();
+            await complete.Task;
+            disk = AiSessionWorkTest.Read(a);
+            Require(disk.entries.Count == 2 && disk.current == 1, "baseline plus latest draft exactly once");
+            Require(disk.entries[0].image.messages[0].text == "new-current", "adoption preserves historical chat");
+            Require(disk.entries[1].image.messages[0].text == "latest draft", "close flush preserves new chat without UI apply");
+            Require(adoption.CancelledLoads() == 1, "cancelled adoption observable");
+
+            ChatSessionsDoc legacy = new ChatSessionsDoc();
+            legacy.cur = 77; legacy.s = new List<string>(); legacy.s.Add(image.Pack());
+            File.WriteAllText(dir + "/legacy.json", Json.Serialize<ChatSessionsDoc>(legacy));
+            IdeAiSessionContext migrated = AiSessionWorkTest.Context(dir, "migrated");
+            IdeAiSessionWork migration = new IdeAiSessionWork();
+            load = new IdeAiSessionRequest(); load.kind = 2; load.context = migrated;
+            migration.Enqueue(load);
+            complete = migration.Seal();
+            await complete.Task;
+            disk = AiSessionWorkTest.Read(migrated);
+            Require(disk.entries.Count == 1 && disk.current == 0, "legacy migration has no duplicate and clamps index");
+            File.Delete(dir + "/legacy.json");
+
+            // 接口数据协议与执行契约。
+            string blocked = dir + "/blocked.db";
+            Directory.CreateDirectoryRecursive(blocked);
+            IdeAiSessionContext bad = AiSessionWorkTest.Context(dir, "blocked");
+            IdeAiSessionWork failing = new IdeAiSessionWork();
+            failing.Enqueue(AiSessionWorkTest.Save(bad, AiSessionWorkTest.Entry("cannot write", "bad", 0), null));
+            failing.Enqueue(AiSessionWorkTest.Save(b, AiSessionWorkTest.Entry("still saved", "B", 0), null));
+            bool observed = false;
+            complete = failing.Seal();
+            try { await complete.Task; } catch (Exception failure) { observed = failure.Message != ""; }
+            Require(observed && failing.Error() != "", "drain faults with storage error");
+            disk = AiSessionWorkTest.Read(b);
+            Require(disk.entries[0].image.messages[0].text == "still saved", "queue continues after error");
+            Console.WriteLine("ai-session-work-ok");
+        } finally {
+            Directory.DeleteRecursive(dir);
+        }
+    }
+}

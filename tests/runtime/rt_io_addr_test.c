@@ -1,5 +1,4 @@
-/* Binary sockaddr classification and all-address resolution tests.
- * No public-network dependency: literals and localhost only. */
+/* 底层系统交互与数据协议契约 */
 #include "src/runtime/rt_io.h"
 #include <stdio.h>
 #include <string.h>
@@ -67,8 +66,7 @@ int main(void) {
     CHECK(zan_io_sockaddr_family(&v6, 16) == 0);
     CHECK(zan_io_sockaddr_family(NULL, 28) == 0);
 
-    /* IPv4 binary CIDR table: every dangerous block must reject regardless of
-     * textual spelling, loopback honours the explicit exception only. */
+    /* 底层系统交互与数据协议契约 */
     check_v4("127.0.0.1", 0, 0);
     check_v4("127.0.0.1", 1, 1);
     check_v4("0.1.2.3", 1, 0);
@@ -89,7 +87,7 @@ int main(void) {
     check_v4("255.255.255.255", 1, 0);
     check_v4("8.8.8.8", 1, 1);
 
-    /* IPv6: unspecified, loopback, ULA, link-local, multicast, documentation. */
+    /* 底层系统交互与数据协议契约 */
     check_v6("::", 1, 0);
     check_v6("::1", 0, 0);
     check_v6("::1", 1, 1);
@@ -100,29 +98,24 @@ int main(void) {
     check_v6("2001:db8::1", 1, 0);
     check_v6("2001:4860:4860::8888", 1, 1);
 
-    /* IPv4-mapped IPv6 must re-classify under the IPv4 table. */
+    /* 底层系统交互与数据协议契约 */
     check_v6("::ffff:127.0.0.1", 0, 0);
     check_v6("::ffff:127.0.0.1", 1, 1);
     check_v6("::ffff:10.0.0.1", 1, 0);
     check_v6("::ffff:8.8.8.8", 1, 1);
 
-    /* Transition and deprecated forms embed an IPv4 destination too, so they
-     * must re-classify under the IPv4 table (A286): 6to4 (2002::/16) at bytes
-     * 2..5, NAT64 (64:ff9b::/96) and IPv4-compatible (::a.b.c.d) at 12..15,
-     * Teredo (2001::/32) with the server at 4..7 and the client at 12..15
-     * XOR 0xffffffff. Before this, each fell through to "safe". */
+    /* 底层系统交互与数据协议契约 */
     check_v6("2002:0a00:0001::1", 1, 0);                 /* 6to4 -> 10.0.0.1 */
     check_v6("2002:0808:0808::1", 1, 1);                 /* 6to4 -> 8.8.8.8 */
     check_v6("64:ff9b::a00:1", 1, 0);                    /* NAT64 -> 10.0.0.1 */
     check_v6("64:ff9b::808:808", 1, 1);                  /* NAT64 -> 8.8.8.8 */
     check_v6("::10.0.0.1", 1, 0);                        /* v4-compatible */
     check_v6("::8.8.8.8", 1, 1);
-    /* RFC 4380 example: client 192.0.2.45 (documentation) is not usable. */
+    /* 底层系统交互与数据协议契约 */
     check_v6("2001:0000:4136:e378:8000:63bf:3fff:fdd2", 1, 0);
     check_v6("2001:0000:4136:e378:8000:63bf:8787:8787", 1, 1);
 
-    /* Resolver: full chain, stable records, stride padding zeroed. The
-     * 0xa5 poison proves resolve_all never leaves stale caller bytes. */
+    /* 底层系统交互与数据协议契约 */
     memset(records, 0xa5, sizeof(records));
     int n = (int)zan_io_resolve_all("127.0.0.1", 80, records, sizeof(records));
     if (n < 1) {

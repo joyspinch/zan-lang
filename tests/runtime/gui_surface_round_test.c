@@ -1,9 +1,10 @@
-/* Coverage regression: no window or GPU context is needed. */
+/* 底层系统交互与数据协议契约 */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <limits.h>
+#include "../../src/runtime/zan_gui_graphics.h"
 
 extern int32_t zan_gui_create_surface(int32_t, int32_t);
 extern int32_t zan_gui_destroy_surface(int32_t);
@@ -16,8 +17,7 @@ extern void zan_gui_surface_rounded_rect(int32_t, int32_t, int32_t, int32_t, int
 extern void zan_gui_surface_rounded_rect_mask(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "surface round line %d: %s\n", __LINE__, #c); exit(1); } } while (0)
 
-/* Independent floating-point reference: integrate inner fill and border-over-
- * fill materials over disjoint coverage, then source-over the background. */
+/* 底层系统交互与数据协议契约 */
 static double coverage(int x, int y, int w, int h, int r) {
     if (x < 0 || y < 0 || x >= w || y >= h || w <= 0 || h <= 0) return 0;
     if (r < 0) r = 0;
@@ -50,7 +50,49 @@ static void near_pixel(uint32_t got, uint32_t want) {
         }
     }
 }
+static void bitmap_boundaries(void) {
+    const int invalid[] = {0, -1, 16385, INT_MAX};
+    for (unsigned i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
+        CHECK(zan_gui_create_surface(invalid[i], 1) == -1);
+        CHECK(zan_gui_create_surface(1, invalid[i]) == -1);
+    }
+    int32_t id = zan_gui_create_surface(3, 2);
+    CHECK(id >= 0);
+    uint32_t *dst = zan_gui_get_pixels(id);
+    uint32_t *src = malloc(5 * sizeof *src);
+    CHECK(dst && src);
+    src[0] = 0xff112233u; src[1] = 0xff223344u;
+    src[2] = 0xdeadbeefu;
+    src[3] = 0xff334455u; src[4] = 0xff445566u;
+    zan_bitmap img = {0};
+    img.pixels = src; img.width = 2; img.height = 2; img.stride = 3;
+    /* 底层系统交互与数据协议契约 */
+    zan_gui_clear(id, 0);
+    zan_gui_blit_pixels(id, &img, 2, 1, 1, 1, 1, 1, 1, 1);
+    CHECK(dst[5] == src[4]);
+    for (int i = 0; i < 5; i++) CHECK(dst[i] == 0);
+    zan_gui_blit_pixels(id, &img, 2, 1, 2, 2, 0, 0, 2, 2);
+    CHECK(dst[5] == src[0]);
+    zan_gui_blit_pixels(id, &img, -1, -1, 2, 2, 0, 0, 2, 2);
+    CHECK(dst[0] == src[4]);
+    img.stride = 1;
+    zan_gui_blit_pixels(id, &img, 0, 0, 2, 2, 0, 0, 2, 2);
+    CHECK(dst[0] == src[4] && dst[1] == 0);
+    img.stride = 3;
+    zan_gui_blit_pixels(id, &img, INT_MAX, INT_MAX, 2, 2, 0, 0, 2, 2);
+    zan_gui_blit_pixels(id, &img, INT_MIN, INT_MIN, 2, 2, 0, 0, 2, 2);
+    CHECK(dst[0] == src[4] && dst[5] == src[0]);
+    CHECK(src[2] == 0xdeadbeefu);
+    free(src);
+    CHECK(zan_gui_destroy_surface(id) == 0);
+    CHECK(zan_gui_get_pixels(id) == NULL);
+    int32_t next = zan_gui_create_surface(1, 1);
+    CHECK(next == id);
+    CHECK(zan_gui_destroy_surface(next) == 0);
+}
+
 int main(void) {
+    bitmap_boundaries();
     int32_t id = zan_gui_create_surface(32, 32);
     CHECK(id >= 0);
     uint32_t *p = zan_gui_get_pixels(id);
@@ -74,8 +116,7 @@ int main(void) {
             near_pixel(p[y*32+x], reference(backgrounds[bg], fills[f], borders[b], o, in));
         }
     }
-    /* Opaque border must entirely hide a contrasting fill at every outer AA
-     * pixel. Its alpha silhouette equals one rounded fill, not two passes. */
+    /* 底层系统交互与数据协议契约 */
     uint32_t one[1024];
     zan_gui_clear(id, 0);
     zan_gui_fill_rounded_rect(id, 4, 4, 24, 20, 7, (int32_t)0xff2288eeu);
@@ -87,7 +128,7 @@ int main(void) {
         CHECK(p[i] == one[i]); fractional++;
     }
     CHECK(fractional > 0);
-    /* Masked square TL corner and nested damage clipping. */
+    /* 底层系统交互与数据协议契约 */
     zan_gui_clear(id, 0);
     zan_gui_push_clip(id,4,4,12,12);
     zan_gui_push_clip(id,4,4,6,6);

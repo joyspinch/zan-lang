@@ -1,0 +1,112 @@
+using System;
+
+struct Held {
+    public string Text;
+    public Held(string text) { Text = text; }
+}
+
+class ContextPaths {
+    static int clean;
+    static int nested;
+    static int a;
+    static int b;
+    static int c;
+    static int d;
+
+    static void Check(bool ok) {
+        if (!ok) { throw new Exception("finally context"); }
+    }
+
+    static async int Step(int value, bool slow) {
+        if (slow) { await Task.Yield(); }
+        return value;
+    }
+
+    static async string Scoped(int mode, bool slow) {
+        string seed = "seed-" + Convert.ToString(mode);
+        try {
+            if (mode == 0) {
+                string local = "left-" + seed;
+                await Step(mode, slow);
+                return local;
+            }
+            if (mode == 1) {
+                string local = "right-" + seed;
+                await Step(mode, slow);
+                return local;
+            }
+            if (mode == 2) { return seed; }
+            return seed + "-last";
+        } finally {
+            await Step(mode, slow);
+            try {
+                await Task.Yield();
+                Check(seed == "seed-" + Convert.ToString(mode));
+            } finally {
+                await Task.Yield();
+                nested = nested + 1;
+            }
+            clean = clean + 1;
+        }
+    }
+
+    static async int Jump(int mode) {
+        int result = 0;
+        try {
+            try {
+                if (mode == 0) { result = 10; goto done; }
+                if (mode == 1) { result = 20; goto done; }
+                result = 30;
+            } finally {
+                await Task.Yield();
+                nested = nested + 1;
+            }
+        } finally {
+            await Task.Yield();
+            clean = clean + 1;
+        }
+    done:
+        return result;
+    }
+
+    static async int Multi(int mode) {
+        try {
+            try {
+                if (mode == 0) { return 10; }
+                if (mode == 1) { return 20; }
+                return 30;
+            } finally {
+                await Task.Yield();
+                b = b + 1;
+            }
+        } finally {
+            try {
+                try { await Task.Yield(); }
+                finally { await Task.Yield(); d = d + 1; }
+            } finally { await Task.Yield(); c = c + 1; }
+            Held tail = new Held("tail-" + Convert.ToString(mode));
+            await Task.Yield();
+            Check(tail.Text == "tail-" + Convert.ToString(mode));
+            a = a + 1;
+        }
+    }
+
+    static async void Main() {
+        for (int pass = 0; pass < 2; pass = pass + 1) {
+            bool slow = pass == 1;
+            Check(await Scoped(0, slow) == "left-seed-0");
+            Check(await Scoped(1, slow) == "right-seed-1");
+            Check(await Scoped(2, slow) == "seed-2");
+            Check(await Scoped(3, slow) == "seed-3-last");
+            Check(await Jump(0) == 10);
+            Check(await Jump(1) == 20);
+            Check(await Jump(2) == 30);
+        }
+        Check(clean == 14 && nested == 14);
+        Check(await Multi(0) == 10);
+        Check(await Multi(1) == 20);
+        Check(await Multi(2) == 30);
+        Check(a == 3 && b == 3 && c == 3 && d == 3);
+        Console.WriteLine("finally contexts ok");
+    }
+}

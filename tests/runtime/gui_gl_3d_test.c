@@ -1,19 +1,4 @@
-/* gui_gl_3d_test.c -- real-driver 3D regression for the GL backend's mesh
- * pipeline, the same shape as gui_gl_aa_test.c: no window, load zan_gui.dll
- * dynamically, install the GPU backend and compare the composed frame against
- * hand-computed expectations. Exit 77 explicitly means GL 3.3 is unavailable,
- * never a passing CPU substitute.
- *
- * What it pins down:
- *  - draw3d returns 1 on GL and 0 on the CPU backend (the seam's report);
- *  - a textured, rotating cube actually lands textured pixels: two frames of
- *    the same cube at different angles must differ (rotation happened) and
- *    must both differ from the flat clear (triangles rasterized);
- *  - depth ordering: with three overlapping quads at increasing depth, the
- *    nearest one must win -- the readback centre pixel equals the near quad's
- *    colour, not the far one's;
- *  - the alpha channel of a 3D draw stays opaque over the 2D clear.
- */
+/* 模块核心语义抽象与接口调用契约 */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,12 +6,14 @@
 #include <math.h>
 #ifdef _WIN32
 #include <windows.h>
-static HMODULE lib;
-#define SYMBOL(n) GetProcAddress(lib, n)
+typedef HMODULE library;
+#define OPEN(p) LoadLibraryA(p)
+#define SYMBOL(l,n) GetProcAddress(l, n)
 #else
 #include <dlfcn.h>
-static void *lib;
-#define SYMBOL(n) dlsym(lib, n)
+typedef void *library;
+#define OPEN(p) dlopen(p, RTLD_NOW | RTLD_GLOBAL)
+#define SYMBOL(l,n) dlsym(l, n)
 #endif
 #define W 120
 #define H 100
@@ -39,8 +26,10 @@ static const char *(*backend_name)(void);
 static const void *(*pixels)(int32_t);
 static void (*clear_rect)(int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t);
 static int32_t (*mesh_create)(int32_t,const float*,int32_t,const uint16_t*,int32_t);
+static void (*push_clip)(int32_t,int32_t,int32_t,int32_t,int32_t);
+static void (*pop_clip)(int32_t);
 static int32_t (*draw3d)(int32_t,int32_t,const float*,uint32_t,const char*);
-#define LOAD(v,n) do { *(void **)(&(v)) = (void *)SYMBOL(n); CHECK(v); } while (0)
+#define LOAD(v,l,n) do { *(void **)(&(v)) = (void *)SYMBOL(l,n); CHECK(v); } while (0)
 
 static uint32_t frame[W*H];
 static void capture(int s) {
@@ -56,12 +45,11 @@ static uint32_t frame_hash(void) {
     return h;
 }
 
-/* column-major perspective * view * model for a cube of half-size r centred
- * at origin, viewed from (0, 0, dist) looking at the origin, spun by rad. */
+/* 模块核心语义抽象与接口调用契约 */
 static float *cube_mvp(float rad, float dist, float r) {
     static float m[16];
     float c = (float)cos(rad), s = (float)sin(rad);
-    /* model: rotate about Y then a fixed tilt about X */
+    /* 底层系统交互与数据协议契约 */
     float cy=(float)cos(0.4), sy=(float)sin(0.4);
     float R[16] = {
         c,        0,   -s,       0,
@@ -69,9 +57,9 @@ static float *cube_mvp(float rad, float dist, float r) {
         cy*s,    -sy,  cy*c,     0,
         0,        0,    0,       1,
     };
-    /* view: translate -dist on z (camera looks down -z), right-handed */
+    /* 模块核心语义抽象与接口调用契约 */
     float V[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,-dist,1 };
-    /* perspective, 60deg, aspect W/H, D3D-style depth */
+    /* 核心系统底层抽象与内存语义契约 */
     float f = 1.0f / (float)tan(0.5235988);
     float P[16] = {
         f / ((float)W / (float)H), 0, 0, 0,
@@ -79,7 +67,7 @@ static float *cube_mvp(float rad, float dist, float r) {
         0, 0, 10.0f/(1.0f-100.0f), (1.0f*100.0f)/(1.0f-100.0f),
         0, 0, -1, 0,
     };
-    /* M = P * V * R, all column-major (m[col*4+row]) */
+    /* 核心系统底层抽象与内存语义契约 */
     float PV[16];
     for (int col = 0; col < 4; col++)
         for (int row = 0; row < 4; row++) {
@@ -132,38 +120,38 @@ static void build_cube(void) {
 }
 
 int main(int argc, char **argv) {
-    CHECK(argc == 2);
-#ifdef _WIN32
-    lib = LoadLibraryA(argv[1]);
-#else
-    lib = dlopen(argv[1], RTLD_NOW);
-#endif
-    CHECK(lib);
-    LOAD(create, "zan_gui_create_surface");
-    LOAD(destroy, "zan_gui_destroy_surface");
-    LOAD(backend, "zan_gui_set_render_backend");
-    LOAD(backend_name, "zan_gui_render_backend");
-    LOAD(pixels, "zan_gui_get_pixels");
-    LOAD(clear_rect, "zan_gui_clear_rect");
-    LOAD(mesh_create, "zan_gui_mesh_create");
-    LOAD(draw3d, "zan_gui_draw3d");
+    CHECK(argc == 4);
+    library core = OPEN(argv[1]);
+    CHECK(core);
+    library image = OPEN(argv[3]);
+    CHECK(image);
+    library game = OPEN(argv[2]);
+    CHECK(game);
+    LOAD(create, core, "zan_gui_create_surface");
+    LOAD(destroy, core, "zan_gui_destroy_surface");
+    LOAD(backend, core, "zan_gui_set_render_backend");
+    LOAD(backend_name, core, "zan_gui_render_backend");
+    LOAD(pixels, core, "zan_gui_get_pixels");
+    LOAD(clear_rect, core, "zan_gui_clear_rect");
+    LOAD(push_clip, core, "zan_gui_push_clip");
+    LOAD(pop_clip, core, "zan_gui_pop_clip");
+    LOAD(mesh_create, game, "zan_game_mesh_create");
+    LOAD(draw3d, game, "zan_game_draw3d");
 
     build_cube();
-    /* CPU first: the seam must report "no 3D" without crashing.
-     * (set_render_backend(0) returns 0 by design -- the CPU has no backend
-     * object -- so unlike the GL switch above, its return is not checked.) */
+    /* 模块核心语义抽象与接口调用契约 */
     backend(0);
     int s = create(W, H);
     CHECK(s >= 0);
     clear_rect(s, 0, 0, W, H, 0xFF203040);
     int mesh_cpu = mesh_create(s, cube_verts, 24, cube_idx, 36);
-    (void)mesh_cpu;   /* CPU refuses meshes; either 0 or a no-op id is fine */
+    (void)mesh_cpu;   /* 核心系统底层抽象与内存语义契约 */
     int cpu_ret = draw3d(s, 1, cube_mvp(0.0f, 4.0f, 1.0f), 0xFFFFFFFF, NULL);
     capture(s);
     uint32_t cpu_hash = frame_hash();
     if (cpu_ret != 0) { fprintf(stderr, "GL 3D: CPU backend must report 0\n"); return 1; }
 
-    /* GL: the same probe must report 1 and produce real content. */
+    /* 模块核心语义抽象与接口调用契约 */
     if (!backend(1) || strcmp(backend_name(), "gl")) {
         fprintf(stderr, "SKIP: real GL 3.3 unavailable\n");
         return 77;
@@ -176,22 +164,19 @@ int main(int argc, char **argv) {
     capture(s);
     uint32_t h0 = frame_hash();
     CHECK(h0 != cpu_hash);
-    /* centre pixel must have been covered by the cube (shaded white-ish,
-     * definitely not the flat clear colour 0x40,0x30,0x20) */
+    /* 模块核心语义抽象与接口调用契约 */
     CHECK(center_r() > 0x50 && center_g() > 0x50);
 
-    /* Rotation must actually change the frame. */
+    /* 底层系统交互与数据协议契约 */
     clear_rect(s, 0, 0, W, H, 0xFF203040);
     CHECK(draw3d(s, mesh, cube_mvp(0.7f, 4.0f, 1.0f), 0xFFFFFFFF, NULL) == 1);
     capture(s);
     uint32_t h1 = frame_hash();
     CHECK(h0 != h1);
 
-    /* Texture path: a 2x2 checker via the image cache (the runtime decodes
-     * bytes through stb_image, so wrap the pixels in an uncompressed TGA
-     * header); the frame must change again versus the white-textured draw. */
+    /* 模块核心语义抽象与接口调用契约 */
     unsigned char checker[18 + 2*2*4] = {0};
-    checker[2] = 2;             /* TGA type 2: uncompressed true-colour */
+    checker[2] = 2;             /* 核心系统底层抽象与内存语义契约 */
     checker[12] = 2; checker[14] = 2;   /* 2x2, little-endian */
     checker[16] = 32; checker[17] = 0x28; /* 32bpp, top-down */
     {
@@ -202,7 +187,7 @@ int main(int argc, char **argv) {
         memcpy(checker + 18, px, sizeof(px));
     }
     int32_t (*img_mem)(const char*, const char*, int32_t);
-    *(void **)(&img_mem) = (void *)SYMBOL("zan_gui_image_load_mem");
+    *(void **)(&img_mem) = (void *)SYMBOL(image, "zan_image_load_mem");
     CHECK(img_mem);
     CHECK(img_mem("mem:3dcheck", (const char *)checker, sizeof(checker)) > 0);
     clear_rect(s, 0, 0, W, H, 0xFF203040);
@@ -211,60 +196,75 @@ int main(int argc, char **argv) {
     uint32_t h2 = frame_hash();
     CHECK(h1 != h2);
 
-    /* Depth: three full-screen-ish quads at z = -1, -3, -6 painted far to
-     * near; the visible centre must be the NEAR quad's colour (green). */
-    float quad_v[3*4*8];
-    uint16_t quad_i[6];
-    for (int q = 0; q < 3; q++) {
-        float z = (q == 0) ? -6.0f : (q == 1) ? -3.0f : -1.0f;
-        float half = (q == 0) ? 3.0f : (q == 1) ? 2.0f : 1.0f;
-        uint16_t base = (uint16_t)(q*4);
-        const float corners[4][2] = {{-1,-1},{1,-1},{1,1},{-1,1}};
-        for (int c2 = 0; c2 < 4; c2++) {
-            quad_v[(q*4+c2)*8+0] = corners[c2][0]*half;
-            quad_v[(q*4+c2)*8+1] = corners[c2][1]*half;
-            quad_v[(q*4+c2)*8+2] = z;
-            quad_v[(q*4+c2)*8+3] = 0;
-            quad_v[(q*4+c2)*8+4] = 0;
-            quad_v[(q*4+c2)*8+5] = 1;
-            quad_v[(q*4+c2)*8+6] = 0;
-            quad_v[(q*4+c2)*8+7] = 0;
+    /* 模块核心语义抽象与接口调用契约 */
+    float quad_v[2*4*8] = {0};
+    uint16_t quad_i[12];
+    const float corners[4][2] = {{-1,-1},{1,-1},{1,1},{-1,1}};
+    for (int q = 0; q < 2; q++) {
+        uint16_t base = (uint16_t)(q * 4);
+        for (int v = 0; v < 4; v++) {
+            float *vertex = quad_v + (q * 4 + v) * 8;
+            vertex[0] = corners[v][0];
+            vertex[1] = corners[v][1];
+            vertex[2] = q == 0 ? -0.5f : 0.5f;
+            vertex[5] = 1.0f;
+            vertex[6] = q == 0 ? 0.25f : 0.75f;
+            vertex[7] = 0.5f;
         }
-        quad_i[q*6+0]=base; quad_i[q*6+1]=(uint16_t)(base+1); quad_i[q*6+2]=(uint16_t)(base+2);
-        quad_i[q*6+3]=base; quad_i[q*6+4]=(uint16_t)(base+2); quad_i[q*6+5]=(uint16_t)(base+3);
+        const uint16_t indices[6] = {0,1,2,0,2,3};
+        for (int i = 0; i < 6; i++) quad_i[q*6+i] = base + indices[i];
     }
-    int qmesh = mesh_create(s, quad_v, 12, quad_i, 6);
+    unsigned char depth_texture[18 + 8] = {0};
+    depth_texture[2] = 2;
+    depth_texture[12] = 2; depth_texture[14] = 1;
+    depth_texture[16] = 32; depth_texture[17] = 0x28;
+    const unsigned char colors[8] = {0,0,255,255, 255,0,0,255};
+    memcpy(depth_texture + 18, colors, sizeof(colors));
+    CHECK(img_mem("mem:depth", (const char *)depth_texture, sizeof(depth_texture)));
+    int qmesh = mesh_create(s, quad_v, 8, quad_i, 12);
     CHECK(qmesh > 0);
-    (void)qmesh;
-    /* Straight-on ortho view down -z: x/y untouched, z squeezed into [0,1)
-     * D3D-style. Column-major, so m[14] scales z and m[11] is w's z-row. */
-    float ortho[16] = {
-        0.5f, 0, 0, 0,
-        0, 0.5f, 0, 0,
-        0, 0, 0.2f, 0,
-        0, 0, 0.5f, 1,
-    };
-    for (int q = 0; q < 3; q++) {
-        int m1 = mesh_create(s, quad_v + q*4*8, 4, quad_i, 6);
-        CHECK(m1 > 0);
-        /* draw in far -> near order with distinct colours */
-        uint32_t col = (q == 0) ? 0xFF0000FFu /* red, far */
-                     : (q == 1) ? 0xFF00FF00u /* green, middle */
-                                : 0xFFFF0000u /* blue, near */;
-        CHECK(draw3d(s, m1, ortho, (int)col, NULL) == 1);
-    }
+    float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    clear_rect(s, 0, 0, W, H, 0xFF203040);
+    CHECK(draw3d(s, qmesh, identity, 0xFFFFFFFF, "mem:depth") == 1);
     capture(s);
-    /* Near quad (half=1, z=-1) covers the centre. The shader treats the
-     * colour as R,G,B,A over an ARGB u32 (0xRRGGBBAA here, matching
-     * Uniform4f's channel order), and readback stores 0xAABBGGRR, so the
-     * red 0xFFFF0000u draw reads back 0xE60000FF-ish: red channel high. */
-    {
-        uint32_t c = frame[(H/2)*W + W/2];
-        int r = (int)((c >> 16) & 255);
-        int b = (int)(c & 255);
-        fprintf(stderr, "GL 3D: depth centre %08x (r=%d b=%d)\n", c, r, b);
-        CHECK(r > 150 && b < 100);
-    }
+    uint32_t center = frame[(H/2)*W + W/2];
+    CHECK(((center >> 16) & 255) > 150 && (center & 255) < 50);
+    CHECK((center >> 24) == 255);
+
+    /* 模块核心语义抽象与接口调用契约 */
+    clear_rect(s, 0, 0, W, H, 0xFF203040);
+    push_clip(s, 0, 0, W/2, H);
+    CHECK(draw3d(s, qmesh, identity, 0xFFFFFFFF, "mem:depth") == 1);
+    pop_clip(s);
+    clear_rect(s, W-4, 0, 4, H, 0xFF00FF00);
+    capture(s);
+    CHECK(frame[(H/2)*W + W/4] != 0xFF203040);
+    CHECK(frame[(H/2)*W + 3*W/4] == 0xFF203040);
+    CHECK(frame[(H/2)*W + W-2] == 0xFF00FF00);
+
+    uint32_t before_switch = frame_hash();
+    CHECK(backend(0) == 0);
+    capture(s);
+    CHECK(frame_hash() == before_switch);
+    CHECK(draw3d(s, mesh, identity, 0xFFFFFFFF, NULL) == 0);
+    CHECK(backend(1) == 1);
+    CHECK(draw3d(s, mesh, identity, 0xFFFFFFFF, NULL) == 0);
+    CHECK(draw3d(s, qmesh, identity, 0xFFFFFFFF, NULL) == 0);
+    int new_mesh = mesh_create(s, quad_v, 8, quad_i, 12);
+    CHECK(new_mesh > qmesh);
+    clear_rect(s, 0, 0, W, H, 0xFF203040);
+    CHECK(draw3d(s, new_mesh, identity, 0xFFFFFFFF, "mem:depth") == 1);
+    capture(s);
+    CHECK(frame_hash() != cpu_hash);
+
+    /* 模块核心语义抽象与接口调用契约 */
+    CHECK(destroy(s) == 0);
+    s = create(W, H);
+    CHECK(s >= 0);
+    clear_rect(s, 0, 0, W, H, 0xFF203040);
+    CHECK(draw3d(s, new_mesh, identity, 0xFFFFFFFF, "mem:depth") == 1);
+    capture(s);
+    CHECK(((frame[(H/2)*W + W/2] >> 16) & 255) > 150);
 
     destroy(s);
     fprintf(stderr, "GL 3D: OK\n");

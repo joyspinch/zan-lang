@@ -1,0 +1,117 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Threading;
+
+class Program {
+    #if !WINDOWS
+    [DllImport("crt", EntryPoint = "chmod")]
+    static extern int Chmod(string path, int mode);
+    [DllImport("crt", EntryPoint = "close")]
+    static extern int CloseFd(int fd);
+    #endif
+
+    static bool WaitForFile(string path) {
+        long until = Stopwatch.GetMilliseconds() + 5000;
+        while (!File.Exists(path) && Stopwatch.GetMilliseconds() < until) { Thread.Sleep(5); }
+        return File.Exists(path);
+    }
+
+    static bool CheckClosedStreams(string self) {
+        #if WINDOWS
+        return true;
+        #else
+        string result = Path.Combine(Environment.ExeDir(), "process-closed-streams.txt");
+        File.Delete(result);
+        List<string> args = new List<string>();
+        args.Add("--closed-stdio");
+        args.Add(result);
+        bool ok = Process.RunSafe(self, args) == 0 && File.Exists(result);
+        if (ok) { ok = File.ReadAllText(result) == "closed ok"; }
+        File.Delete(result);
+        return ok;
+        #endif
+    }
+
+    static void Main() {
+        #if !WINDOWS
+        if (Environment.ArgCount() > 0 && Environment.ArgAt(0) == "--closed-stdio") {
+            string result = Environment.ArgAt(1);
+            Program.CloseFd(0);
+            Program.CloseFd(1);
+            Program.CloseFd(2);
+            List<string> empty = new List<string>();
+            bool failed = Process.StartDetachedSafe("zan-no-such-program-7f4a", empty) != 0;
+            string childMarker = result + ".child";
+            List<string> childArgs = new List<string>();
+            childArgs.Add("--child");
+            childArgs.Add(childMarker);
+            bool started = Process.StartDetachedSafe(Environment.ProcessPath, childArgs) == 0;
+            bool ready = Program.WaitForFile(childMarker);
+            File.Delete(childMarker);
+            File.WriteAllText(result, failed && started && ready ? "closed ok" : "closed failed");
+            Environment.Exit(0);
+        }
+        #endif
+        if (Environment.ArgCount() > 0 && Environment.ArgAt(0) == "--child") {
+            File.WriteAllText(Environment.ArgAt(1), "ready");
+            Environment.Exit(127);
+        }
+        List<string> args = new List<string>();
+        Console.WriteLine(Process.StartDetachedSafe("zan-no-such-program-7f4a", args) != 0);
+        string marker = Path.Combine(Environment.ExeDir(), "process-portable-child.txt");
+        File.Delete(marker);
+        args.Add("--child");
+        args.Add(marker);
+        string self = Environment.ProcessPath;
+        Console.WriteLine(Process.StartDetachedSafe(self, args) == 0);
+        Console.WriteLine(Program.WaitForFile(marker));
+        if (File.Exists(marker)) { File.Delete(marker); }
+        Console.WriteLine(Program.CheckClosedStreams(self));
+        Console.WriteLine(!Process.OpenUrl(""));
+        Console.WriteLine(!Process.OpenUrl("relative/path"));
+        Console.WriteLine(!Process.OpenUrl("-option:value"));
+        Console.WriteLine(!Process.OpenUrl("https://example.invalid/\n"));
+        Console.WriteLine(!Process.OpenPath(""));
+        Console.WriteLine(!Process.OpenPath("zan-no-such-file-7f4a"));
+
+        #if LINUX && !ANDROID && !OHOS
+        string dir = Path.Combine(Environment.ExeDir(), "process-portable-open");
+        Directory.CreateDirectory(dir);
+        string opener = Path.Combine(dir, "xdg-open");
+        string result = Path.Combine(dir, "result.txt");
+        string file = Path.Combine(dir, "中文 & % 文件.txt");
+        string oldPath = Environment.GetEnvironmentVariable("PATH");
+        string oldResult = Environment.GetEnvironmentVariable("ZAN_TEST_OPEN_RESULT");
+        try {
+            File.WriteAllText(opener, "#!/bin/sh\nprintf '%s' \"$1\" > \"$ZAN_TEST_OPEN_RESULT\"\n");
+            Program.Chmod(opener, 493);
+            File.WriteAllText(file, "fixture");
+            Environment.SetEnvironmentVariable("PATH", dir);
+            Environment.SetEnvironmentVariable("ZAN_TEST_OPEN_RESULT", result);
+            string uri = "https://example.invalid/中文?q=a&b=%20;literal";
+            bool opened = Process.OpenUrl(uri);
+            bool seen = Program.WaitForFile(result);
+            bool exact = seen && File.ReadAllText(result) == uri;
+            if (!opened || !exact) { Console.WriteLine("bad URI forwarding"); }
+            File.Delete(result);
+            opened = Process.OpenPath(file);
+            seen = Program.WaitForFile(result);
+            exact = seen && File.ReadAllText(result) == Path.GetFullPath(file);
+            if (!opened || !exact) { Console.WriteLine("bad path forwarding"); }
+            File.Delete(opener);
+            if (Process.OpenUrl(uri) || Process.OpenPath(file)) {
+                Console.WriteLine("bad missing-handler result");
+            }
+        } finally {
+            Environment.SetEnvironmentVariable("PATH", oldPath);
+            Environment.SetEnvironmentVariable("ZAN_TEST_OPEN_RESULT", oldResult);
+            File.Delete(result);
+            File.Delete(file);
+            File.Delete(opener);
+            Directory.Delete(dir);
+        }
+        #endif
+        Console.WriteLine("launch ok");
+    }
+}

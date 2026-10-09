@@ -1,19 +1,4 @@
-/* ====================================================================
- * DAP integration test for zan-dap.
- *
- * Spawns the real zan-dap adapter, speaks Content-Length-framed DAP over
- * its stdio, and drives a full debug session against a program compiled
- * with `zanc -g`. It asserts genuine gdb-backed behaviour: verified source
- * breakpoints, a real stopped event, a real call stack, real local-variable
- * values, stepping, continue-to-next-breakpoint, and process exit.
- *
- * Usage: dap_integration_test <zan-dap> <target-exe> <source-file>
- *
- * A missing debugger FAILS the test: a machine or CI job without gdb must
- * opt out explicitly with ZAN_ALLOW_SKIP_DAP=1, which exits 77 (CTest
- * SKIP_RETURN_CODE) so the run shows as "skipped", not "passed". This keeps
- * a broken adapter or an absent gdb from silently green-lighting the suite.
- * ==================================================================== */
+/* 底层系统交互与数据协议契约 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,11 +14,11 @@
 #  include <errno.h>
 #endif
 
-/* --------- child process with bidirectional pipes --------- */
+/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
 #ifdef _WIN32
     HANDLE in_w;   /* write to child's stdin */
-    HANDLE out_r;  /* read from child's stdout */
+    HANDLE out_r;  /* 核心系统底层抽象与内存语义契约 */
     HANDLE proc;
 #else
     int in_w;
@@ -135,7 +120,7 @@ static void child_close(child_t *c) {
 #endif
 }
 
-/* --------- DAP framing --------- */
+/* 核心系统底层抽象与内存语义契约 */
 static int g_seq = 0;
 
 static void dap_send(child_t *c, const char *body) {
@@ -146,12 +131,12 @@ static void dap_send(child_t *c, const char *body) {
     child_write(c, body, (int)strlen(body));
 }
 
-/* Read one framed DAP message into buf (NUL-terminated). Returns false on EOF. */
+/* 底层系统交互与数据协议契约 */
 static bool dap_recv(child_t *c, char *buf, int cap) {
     char header[256];
     int hp = 0;
     int content_len = -1;
-    /* read header lines until blank line */
+    /* 底层系统交互与数据协议契约 */
     while (1) {
         int line_start = hp;
         while (1) {
@@ -161,8 +146,8 @@ static bool dap_recv(child_t *c, char *buf, int cap) {
             if (ch == '\n') break;
         }
         header[hp] = '\0';
-        /* the line just read is header+line_start .. hp */
-        if (hp - line_start <= 2) break; /* blank line ("\r\n") */
+        /* 底层系统交互与数据协议契约 */
+        if (hp - line_start <= 2) break; /* 核心系统底层抽象与内存语义契约 */
         if (content_len < 0) {
             const char *cl = header + line_start;
             if (strncmp(cl, "Content-Length:", 15) == 0)
@@ -180,7 +165,7 @@ static bool dap_recv(child_t *c, char *buf, int cap) {
     return true;
 }
 
-/* Wait for a message whose "event" field equals name; copy it to out. */
+/* 底层系统交互与数据协议契约 */
 static bool wait_event(child_t *c, const char *name, char *out, int cap) {
     for (int i = 0; i < 200; i++) {
         if (!dap_recv(c, out, cap)) return false;
@@ -192,11 +177,7 @@ static bool wait_event(child_t *c, const char *name, char *out, int cap) {
     return false;
 }
 
-/* Wait for a "stopped" event, but treat any end-of-session event
- * ("terminated"/"exited", which the adapter emits when the inferior runs to
- * completion without a stop) as the absence of a stop. The adapter stays
- * alive waiting for more requests after that, so a plain wait_event would
- * block forever in the gdb-less case. Returns true only on a real stop. */
+/* 底层系统交互与数据协议契约 */
 static bool wait_stopped_or_ended(child_t *c, char *out, int cap) {
     for (int i = 0; i < 200; i++) {
         if (!dap_recv(c, out, cap)) return false;
@@ -211,7 +192,7 @@ static bool wait_stopped_or_ended(child_t *c, char *out, int cap) {
     return false;
 }
 
-/* Wait for the response to command name; copy it to out. */
+/* 底层系统交互与数据协议契约 */
 static bool wait_response(child_t *c, const char *command, char *out, int cap) {
     for (int i = 0; i < 200; i++) {
         if (!dap_recv(c, out, cap)) return false;
@@ -229,7 +210,7 @@ static void check(bool cond, const char *msg) {
     if (!cond) g_fails++;
 }
 
-/* Locate "key":<number> and return it, or def. */
+/* 底层系统交互与数据协议契约 */
 static long json_num(const char *json, const char *key, long def) {
     char pat[128];
     snprintf(pat, sizeof(pat), "\"%s\":", key);
@@ -240,9 +221,7 @@ static long json_num(const char *json, const char *key, long def) {
     return strtol(p, NULL, 10);
 }
 
-/* Escape a raw string for embedding inside a JSON string literal (backslash
- * and double-quote). Windows paths contain backslashes that must be escaped
- * or the JSON parser mis-reads e.g. "\b" as a backspace. */
+/* 底层系统交互与数据协议契约 */
 static void json_escape(const char *in, char *out, size_t cap) {
     size_t j = 0;
     for (size_t i = 0; in[i] && j + 2 < cap; i++) {
@@ -253,7 +232,7 @@ static void json_escape(const char *in, char *out, size_t cap) {
     out[j] = '\0';
 }
 
-/* ---- shared handshake helpers ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 static void handshake(child_t *c, const char *program, char *body, char *msg,
                       size_t cap) {
@@ -287,7 +266,7 @@ static void send_disconnect(child_t *c, char *body, char *msg, size_t cap) {
     dap_send(c, body);
 }
 
-/* ---- scenario: the original breakpoint/stack/locals/step session ---- */
+/* 底层系统交互与数据协议契约 */
 static int run_basic(const char *dap_exe, const char *target, const char *source) {
     g_seq = 0;
     child_t c;
@@ -305,7 +284,7 @@ static int run_basic(const char *dap_exe, const char *target, const char *source
 
     handshake(&c, target, body, msg, sizeof(body));
 
-    /* setBreakpoints (lines 11 and 17 of the target) */
+    /* 核心系统底层抽象与内存语义契约 */
     snprintf(body, sizeof(body),
              "{\"seq\":%d,\"type\":\"request\",\"command\":\"setBreakpoints\","
              "\"arguments\":{\"source\":{\"path\":\"%s\"},"
@@ -317,11 +296,7 @@ static int run_basic(const char *dap_exe, const char *target, const char *source
 
     send_configuration_done(&c, body, msg, sizeof(body));
 
-    /* Either we stop at a breakpoint (gdb present) or the session ends
-     * without ever stopping (no gdb / broken adapter). An end without a stop
-     * FAILS the test by default; ZAN_ALLOW_SKIP_DAP=1 is the explicit
-     * opt-out for environments that cannot provide gdb, reported as
-     * "skipped" (exit 77) not "passed". */
+    /* 底层系统交互与数据协议契约 */
     if (!wait_stopped_or_ended(&c, msg, sizeof(msg))) {
         child_close(&c);
         const char *optout = getenv("ZAN_ALLOW_SKIP_DAP");
@@ -371,7 +346,7 @@ static int run_basic(const char *dap_exe, const char *target, const char *source
     dap_send(&c, body);
     check(wait_response(&c, "evaluate", msg, sizeof(msg)), "evaluate response");
 
-    /* step over */
+    /* 核心系统底层抽象与内存语义契约 */
     snprintf(body, sizeof(body),
              "{\"seq\":%d,\"type\":\"request\",\"command\":\"next\","
              "\"arguments\":{\"threadId\":1}}", ++g_seq);
@@ -379,9 +354,7 @@ static int run_basic(const char *dap_exe, const char *target, const char *source
     (void)wait_response(&c, "next", msg, sizeof(msg));
     check(wait_event(&c, "stopped", msg, sizeof(msg)), "stopped after step over");
 
-    /* continue to termination. The program may still hit the line-17
-     * breakpoint before exiting, so drain events and resume on each stop
-     * until the adapter reports "exited". */
+    /* 底层系统交互与数据协议契约 */
     snprintf(body, sizeof(body),
              "{\"seq\":%d,\"type\":\"request\",\"command\":\"continue\","
              "\"arguments\":{\"threadId\":1}}", ++g_seq);
@@ -407,11 +380,7 @@ static int run_basic(const char *dap_exe, const char *target, const char *source
     return 0;
 }
 
-/* ---- scenario: hit-count breakpoint "==1000" stops on the 1000th hit ----
- * Spin() crosses line 15 exactly 3000 times, so with a gdb ignore-count of
- * 999 the first stop lands on hit #1000 with i == 999. The session ends by
- * disconnect right after: gdb's ignore-count is exhausted at that point and
- * would stop on every later hit, which the drain would have to walk. */
+/* 底层系统交互与数据协议契约 */
 static int run_hitcount(const char *dap_exe, const char *burn, const char *burn_src) {
     g_seq = 0;
     child_t c;
@@ -451,7 +420,7 @@ static int run_hitcount(const char *dap_exe, const char *burn, const char *burn_
     (void)wait_response(&c, "stackTrace", msg, sizeof(msg));
     long frame_id = json_num(msg, "id", -1);
 
-    /* i must be 999 (zero-based counter) on the 1000th crossing */
+    /* 底层系统交互与数据协议契约 */
     snprintf(body, sizeof(body),
              "{\"seq\":%d,\"type\":\"request\",\"command\":\"evaluate\","
              "\"arguments\":{\"expression\":\"i\",\"frameId\":%ld,\"context\":\"watch\"}}",
@@ -465,10 +434,7 @@ static int run_hitcount(const char *dap_exe, const char *burn, const char *burn_
     return 0;
 }
 
-/* ---- scenario: logpoint logs and continues, never stops ----
- * Line 30 is crossed 20 times; with a logMessage the adapter must emit an
- * output event per crossing (with {outer} interpolated) and run the target
- * to completion without ever surfacing a stopped event. */
+/* 底层系统交互与数据协议契约 */
 static int run_logpoint(const char *dap_exe, const char *burn, const char *burn_src) {
     g_seq = 0;
     child_t c;
@@ -516,12 +482,7 @@ static int run_logpoint(const char *dap_exe, const char *burn, const char *burn_
     return 0;
 }
 
-/* ---- scenario: pause really interrupts the running target ----
- * No breakpoints: after configurationDone the target burns CPU for seconds
- * inside Burn(). The harness waits a second so the run is well inside the
- * burn loop, then sends `pause` while the adapter is pumping gdb output —
- * the wait-hook path. The stop must carry reason "pause" and a frame inside
- * the burn target's source. */
+/* 底层系统交互与数据协议契约 */
 static int run_pause(const char *dap_exe, const char *burn, const char *burn_src) {
     (void)burn_src;
     g_seq = 0;
@@ -537,7 +498,7 @@ static int run_pause(const char *dap_exe, const char *burn, const char *burn_src
 
     send_configuration_done(&c, body, msg, sizeof(body));
 
-    /* let the target get deep into Burn()'s burn loop */
+    /* 底层系统交互与数据协议契约 */
 #ifdef _WIN32
     Sleep(1000);
 #else
@@ -585,7 +546,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
     int r = run_basic(dap_exe, target, source);
-    if (r != 0) return r; /* skip (77) or basic failure: gdb absent/broken */
+    if (r != 0) return r; /* 底层系统交互与数据协议契约 */
 
     if (argc >= 6) {
         char burn[1024], burn_src[1024];

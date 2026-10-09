@@ -1,0 +1,190 @@
+using System;
+using System.Threading;
+using Gui;
+using Gui.Component.CodeEditor;
+
+namespace CodeEditorAnalysisTest;
+
+/// 无窗口回归：快照计算、UI 接收、请求失效和不依赖 Render 的完成回填。
+class Program {
+    static void Require(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+
+    static List<string> Project(string text) {
+        List<string> sources = new List<string>();
+        sources.Add(text);
+        return sources;
+    }
+
+    static void CheckPreparedText() {
+        CodeEditor editor = new CodeEditor();
+        editor.documentPath = "old.zan";
+        editor.LoadText("old");
+        CodeEditorTextLoad first = editor.BeginTextLoad("first.zan", 0);
+        CodeEditorPreparedText prepared = CodeEditor.PrepareText("a\r\nb\r\n");
+        CodeEditorTextLoad latest = editor.BeginTextLoad("latest.py", 2);
+        Require(!editor.ApplyPreparedText(first, prepared) && !prepared.applied,
+            "superseded load must not consume prepared text");
+        Require(editor.ApplyPreparedText(latest, prepared), "latest load applies");
+        Require(editor.documentPath == "latest.py" && editor.SyntaxLang() == 2
+            && editor.GetText() == "a\nb\n", "prepared load preserves canonical text and language");
+        Require(editor.textMemoStamp == editor.TextStamp(), "load supplies text memo without UI Join");
+        Require(prepared.applied && !editor.ApplyPreparedText(latest, prepared), "prepared is consumed once");
+        CodeEditorTextLoad edited = editor.BeginTextLoad("late.zan", 0);
+        editor.SaveUndo();
+        editor.InsertStr("x");
+        Require(!editor.ApplyPreparedText(edited, CodeEditor.PrepareText("late")), "edit rejects late load");
+        Require(editor.GetText() == "xa\nb\n", "text memo follows the new version");
+        Require(editor.textMemoStamp == editor.TextStamp(), "GetText memo is versioned");
+        CodeEditorTextLoad moved = editor.BeginTextLoad("other.zan", 0);
+        editor.documentPath = "moved.py";
+        Require(!editor.ApplyPreparedText(moved, CodeEditor.PrepareText("late")), "path change rejects load");
+        CodeEditorTextLoad detached = editor.BeginTextLoad("detached.zan", 0);
+        editor.DetachAnalysis();
+        Require(!editor.ApplyPreparedText(detached, CodeEditor.PrepareText("late")), "detach invalidates load request");
+    }
+
+    static void CheckSymbolPreparation() {
+        CodeEditor.ClearSymbolIndex();
+        CodeEditorPreparedSymbolIndex installed = CodeEditor.PrepareSymbolIndex(
+            "T\tclass\tTest\tOld\t\nM\tOld\tRun\tmethod\t1\tvoid Run()\n");
+        Require(CodeEditor.ApplyPreparedSymbolIndex(installed), "old symbols install");
+        CodeEditorPreparedSymbolIndex prepared = CodeEditor.PrepareSymbolIndex(
+            "# symbols\r\nT\tclass\tTest\tNew\tOld\r\n"
+            + "T\tclass\tTest\tNew\tOld\n"
+            + "M\tNew\tOpen\tmethod\t1\tvoid Open()\n"
+            + "M\tNew\tNative\tmethod\t1\tvoid Native()\tx\n");
+        Require(CodeEditor.HasSymbolType("Old") && !CodeEditor.HasSymbolType("New"),
+            "PrepareSymbolIndex cannot mutate installed global index");
+        Require(prepared.types.Count == 1 && prepared.members.Count == 1,
+            "prepared parser deduplicates types and filters extern members");
+        List<CeSymbolType> oldTypes = installed.types;
+        Require(CodeEditor.ApplyPreparedSymbolIndex(prepared) && CodeEditor.HasSymbolType("New"),
+            "UI installs prepared symbols");
+        Require(oldTypes.Count == 1 && oldTypes[0].name == "Old", "old symbol snapshot remains intact");
+        Require(!CodeEditor.ApplyPreparedSymbolIndex(CodeEditor.PrepareSymbolIndex(""))
+            && !CodeEditor.SymbolIndexLoaded(), "empty result clears old symbols");
+    }
+
+    static void CheckSnapshotGuards() {
+        CodeEditor.EnsureNsTable();
+        CodeEditor editor = new CodeEditor();
+        editor.documentPath = "snapshot.zan";
+        editor.LoadText("using System.IO;\nclass Local {\n    static void Run() { }\n}\nLocal.Run();");
+        List<string> sources = Program.Project("class Other {\n    static void Ping() { }\n}");
+        editor.SetProjectFiles(sources);
+        sources[0] = "class Changed { }";
+        editor.analysisLease = new CeAnalysisLease();
+        CeAnalysisSnapshot snapshot = editor.CaptureAnalysisSnapshot();
+        Require(snapshot.projectSources[0] != sources[0], "project source list is owned by editor");
+        CeAnalysisResult result = CodeEditor.ComputeAnalysis(snapshot);
+        Require(result != null && editor.muTypes == null && editor.refIdx == null,
+            "worker computation does not mutate live editor caches");
+        Require(editor.ApplyAnalysis(snapshot, result), "current snapshot applies");
+        Require(CodeEditor.HasProjType(editor.projTypes, "Other"), "project type result comes from captured sources");
+        Require(editor.analysisSignatures.ContainsKey("Run"), "signatures are computed outside rendering");
+        editor.curLine = 2;
+        Require(editor.AnalysisSnapshotCurrent(snapshot), "caret movement does not rescan whole document");
+        CeAnalysisLensResult lenses = CodeEditor.ComputeAnalysisLenses(snapshot, result.references);
+        Require(lenses != null && lenses.counts.ContainsKey(2) && lenses.counts[2] == 1,
+            "member count and reference list are computed from captured text");
+        editor.analysisRunning = snapshot;
+        editor.CompleteAnalysis(snapshot, lenses, "");
+        List<int> hits = new List<int>();
+        Require(editor.CopyCachedReferenceLines("Run", 2, hits) == 1 && hits[0] == 4,
+            "UI consumes prepared reference locations");
+        editor.SaveUndo();
+        editor.InsertStr("x");
+        Require(snapshot.lines[2] != editor.lines[2], "snapshot lines do not alias live mutable list");
+        Require(!editor.ApplyAnalysis(snapshot, result), "new text version rejects stale analysis");
+        CeAnalysisSnapshot projectSnapshot = editor.CaptureAnalysisSnapshot();
+        editor.SetProjectFiles(Program.Project("class Another { }"));
+        Require(!editor.ApplyAnalysis(projectSnapshot, result), "same-count project change rejects old types");
+        CeAnalysisSnapshot pathSnapshot = editor.CaptureAnalysisSnapshot();
+        editor.documentPath = "different.zan";
+        Require(!editor.ApplyAnalysis(pathSnapshot, result), "document path change rejects old result");
+        CeAnalysisSnapshot symbolSnapshot = editor.CaptureAnalysisSnapshot();
+        CodeEditor.ApplyPreparedSymbolIndex(CodeEditor.PrepareSymbolIndex("T\tclass\tTest\tReplacement\t\n"));
+        Require(!editor.ApplyAnalysis(symbolSnapshot, result), "symbol generation rejects old analysis");
+        CeAnalysisSnapshot cancelled = editor.CaptureAnalysisSnapshot();
+        cancelled.cancelled = new AtomicInt(1);
+        Require(CodeEditor.ComputeAnalysis(cancelled) == null && !editor.ApplyAnalysis(cancelled, result),
+            "cancelled analysis cannot publish an empty or old result");
+        CeAnalysisSnapshot detached = editor.CaptureAnalysisSnapshot();
+        editor.DetachAnalysis();
+        editor.analysisLease = new CeAnalysisLease();
+        Require(!editor.ApplyAnalysis(detached, result), "reattach cannot accept a previous lease result");
+        CodeEditor.ClearSymbolIndex();
+    }
+
+    static void CheckSameLengthCompilerDiagnostic() {
+        CodeEditor editor = new CodeEditor();
+        editor.LoadText("abcd");
+        List<Diagnostic> diagnostics = new List<Diagnostic>();
+        diagnostics.Add(new Diagnostic(0, "compiler error"));
+        editor.SetCompilerDiagnostics(diagnostics);
+        Require(!editor.CompilerDiagStale(), "compiler diagnostics start current");
+        editor.SaveUndo();
+        editor.lines[0] = "wxyz";
+        Require(editor.CompilerDiagStale(), "equal-length edit invalidates compiler diagnostics by version");
+    }
+
+    static async void CheckDrain(CodeEditor editor) {
+        await editor.DrainAnalysisAsync();
+    }
+
+    static void CheckPostProgressWithoutRender() {
+        App app = App.CreateOffscreen("editor analysis test", 320, 240);
+        CodeEditor editor = new CodeEditor();
+        editor.documentPath = "post.zan";
+        editor.LoadText("class Local {\n    static void Run() { }\n}\nLocal.Run();");
+        editor.AttachAnalysis(app);
+        editor.RequestAnalysis();
+        editor.RequestAnalysis();
+        Require(editor.analysisQueued && editor.analysisRunning == null, "requests coalesce before UI Post dispatch");
+        editor.CheckErrors();
+        editor.EnsureProjectScan();
+        editor.EnsureBufTypes();
+        editor.EnsureCandBase();
+        Require(editor.refIdx == null && editor.errors.Count == 0,
+            "bound synchronous compatibility methods only schedule analysis");
+        int count = 0;
+        while ((editor.analysisApplied == null || editor.analysisRunning != null || editor.analysisQueued)
+            && count < 5000) {
+            app.DrainPosts();
+            Thread.Sleep(1);
+            count = count + 1;
+        }
+        app.DrainPosts();
+        Require(editor.analysisApplied != null && editor.analysisRunning == null
+            && editor.CachedLensRefCount(1) == 1, "worker results arrive without a Render call");
+        Require(editor.analysisWorkers.Load() == 0, "worker completion barrier is independent of UI result application");
+        editor.LoadText("class Next { }");
+        app.DrainPosts();
+        CeAnalysisSnapshot running = editor.analysisRunning;
+        editor.DetachAnalysis();
+        Task drain = Task.Run(Program.CheckDrain(editor));
+        // Wait 只泵协程驱动，不调用 App.DrainPosts。
+        drain.Wait();
+        Require(drain.IsCompleted && editor.analysisWorkers.Load() == 0,
+            "Detach plus Drain does not need App.Post to complete");
+        if (running != null) {
+            Require(running.lines == null && running.projectSources == null,
+                "worker releases captured full-document input before drain completes");
+        }
+        app.DrainPosts();
+        Require(editor.analysisApplied == null && editor.analysisApp == null,
+            "late posts after detach cannot mutate editor caches");
+        app.StopLoop();
+    }
+
+    static void Main() {
+        Program.CheckPreparedText();
+        Program.CheckSymbolPreparation();
+        Program.CheckSnapshotGuards();
+        Program.CheckSameLengthCompilerDiagnostic();
+        Program.CheckPostProgressWithoutRender();
+        Console.WriteLine("codeeditor analysis ok");
+    }
+}

@@ -1,7 +1,4 @@
-/* json_trailing_test.c -- reproduces A2: json_parse must reject trailing data
- * after the first complete value. The original parser returned as soon as it
- * had one value, so `{"a":1} garbage` was silently accepted (and the garbage
- * ignored), masking malformed input from LSP/DAP peers. */
+/* 底层系统交互与数据协议契约 */
 #include "src/common/json.h"
 
 #include <stdio.h>

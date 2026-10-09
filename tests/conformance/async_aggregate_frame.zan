@@ -1,0 +1,86 @@
+using System;
+
+delegate string ReadText();
+
+class Item {
+    int value;
+}
+
+struct Payload {
+    string text;
+    Item item;
+    int[] numbers;
+}
+
+struct Envelope {
+    Payload data;
+    long stamp;
+}
+
+class Program {
+    static void Check(bool ok) {
+        if (!ok) { throw new Exception("async aggregate frame"); }
+    }
+
+    static async Task<Envelope> Make(int value, bool slow) {
+        if (slow) { await Task.Yield(); }
+        Envelope result;
+        result.data.text = "value-" + Convert.ToString(value);
+        result.data.item = new Item();
+        result.data.item.value = value;
+        result.data.numbers = new int[] { value, value + 1 };
+        result.stamp = 1234567890123L + value;
+        await Task.Yield();
+        return result;
+    }
+
+    static async Task<Envelope> Echo(Envelope value) {
+        await Task.Yield();
+        Check(value.data.text == "value-7" && value.data.numbers[1] == 8);
+        return value;
+    }
+
+    static async ReadText Capture() {
+        Envelope value = await Make(2, true);
+        ReadText read = () => value.data.text;
+        value = await Make(3, false);
+        await Task.Yield();
+        Check(read() == "value-3");
+        return read;
+    }
+
+    static async void Main() {
+        Envelope first = await Make(7, false);
+        Envelope copy = first;
+        await Task.Yield();
+        Check(copy.data.text == "value-7" && copy.data.item.value == 7);
+        Envelope echoed = await Echo(copy);
+        copy = await Make(9, true);
+        await Task.Yield();
+        Check(first.stamp == 1234567890130L && first.data.numbers[0] == 7);
+        Check(echoed.data.text == "value-7" && echoed.data.item.value == 7);
+        Check(copy.data.text == "value-9" && copy.data.numbers[1] == 10);
+        Payload initialized = new Payload {
+            text = "init-" + Convert.ToString(4),
+            item = new Item(),
+            numbers = new int[] { 4, 5 }
+        };
+        initialized.item.value = 4;
+        await Task.Yield();
+        Check(initialized.text == "init-4" && initialized.numbers[1] == 5);
+        first.data = initialized;
+        await Task.Yield();
+        Check(first.data.item.value == 4 && echoed.data.item.value == 7);
+        for (int i = 0; i < 3; i = i + 1) {
+            Envelope loop = await Make(i, true);
+            await Task.Yield();
+            Check(loop.data.item.value == i);
+        }
+        await Make(11, false);
+        await Make(12, true);
+        ReadText escaped = await Capture();
+        await Task.Yield();
+        Check(escaped() == "value-3");
+        Console.WriteLine("async aggregate frame ok");
+    }
+}

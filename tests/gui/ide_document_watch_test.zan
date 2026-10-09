@@ -1,0 +1,142 @@
+using System;
+using System.IO;
+using System.Threading;
+using Gui.Component;
+
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
+//
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
+// 核心契约与语义定义。
+class Program {
+    static int failures;
+
+    static void Assert(bool condition, string message) {
+        if (!condition) {
+            failures = failures + 1;
+            Console.WriteLine("ide_document_watch FAIL: " + message);
+        }
+    }
+
+    static void TestSameText() {
+        Assert(DocBaseline.SameText("", ""), "empty equals empty");
+        Assert(DocBaseline.SameText("abc", "abc"), "identical text equal");
+        Assert(DocBaseline.SameText("a\r\nb\r\nc\n", "a\nb\nc\n"), "CRLF normalised to LF");
+        Assert(DocBaseline.SameText("a\nb\nc\n", "a\r\nb\r\nc\n"), "LF buffer matches CRLF file");
+        Assert(DocBaseline.SameText("\r", ""), "lone CR normalises to empty");
+        Assert(DocBaseline.SameText("\r\n\r\n", "\n\n"), "blank CRLF lines normalise");
+        Assert(DocBaseline.SameText("x", "\rx\r"), "CR around text ignored");
+        Assert(!DocBaseline.SameText("abc", "abd"), "content difference detected");
+        Assert(!DocBaseline.SameText("abc", "ab"), "length difference detected");
+        Assert(!DocBaseline.SameText("ab", "abc"), "longer right detected");
+        Assert(!DocBaseline.SameText("a\r\nb", "a\nb\n"), "trailing newline still matters");
+    }
+
+    static void TestFileTabClassification() {
+        Assert(!DocBaseline.IsFileTab(""), "empty path is not a file tab");
+        Assert(!DocBaseline.IsFileTab("@start"), "virtual start tab is not a file tab");
+        Assert(!DocBaseline.IsFileTab("@docs"), "virtual docs tab is not a file tab");
+        Assert(!DocBaseline.IsFileTab("proj/Forms/Ship.zform"), "form path is designer owned");
+        Assert(!DocBaseline.IsFileTab("proj/Scene/Hud.zscene"), "scene path is designer owned");
+        Assert(DocBaseline.IsFileTab("src/Main.zan"), "plain source file tracked");
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        // 核心契约与语义定义。
+        Assert(DocBaseline.IsFileTab("src/page.html"), "plain html page tracked");
+    }
+
+    static void TestBaselineLifecycle() {
+        DocBaseline docs = DocBaseline.Create();
+        string path = "src/Main.zan";
+        // 接口数据协议与执行契约。
+        Assert(docs.IsDirty(path, "anything"), "untracked file reports dirty");
+        Assert(!docs.IsDirty("@start", "anything"), "virtual tab is never dirty");
+        Assert(docs.ChangedOutside(path, 123), "unknown stamp never proves unchanged");
+
+        docs.Note(path, "one\ntwo", 100);
+        Assert(!docs.IsDirty(path, "one\ntwo"), "noted text is clean");
+        Assert(!docs.IsDirty(path, "one\r\ntwo"), "CRLF buffer still clean");
+        Assert(docs.IsDirty(path, "one\nTWO"), "edited buffer is dirty");
+        Assert(docs.TextOf(path) == "one\ntwo", "baseline text readable");
+        Assert(!docs.ChangedOutside(path, 100), "same stamp is not an outside change");
+        Assert(docs.ChangedOutside(path, 101), "moved stamp is an outside change");
+
+        // 接口数据协议与执行契约。
+        docs.Track(path, "overwritten", 999);
+        Assert(docs.TextOf(path) == "one\ntwo" && !docs.ChangedOutside(path, 100),
+            "track keeps the first baseline");
+
+        // 接口数据协议与执行契约。
+        // 核心契约与执行状态转移规范。
+        docs.AcceptStamp(path, 101);
+        Assert(!docs.ChangedOutside(path, 101), "accepted stamp stops re-reporting");
+        Assert(docs.TextOf(path) == "one\ntwo", "accept stamp keeps the text baseline");
+        Assert(docs.IsDirty(path, "one\ntwo") == false, "still clean after accept");
+
+        docs.Forget(path);
+        Assert(docs.IsDirty(path, "one\ntwo"), "forgotten file falls back to dirty");
+    }
+
+    static void TestWatchSnapshotGating() {
+        IdeDocumentWatchSnapshot snapshot = new IdeDocumentWatchSnapshot();
+        snapshot.workspace = 3;
+        snapshot.epoch = 7;
+        IdeDocumentDiskInput file = new IdeDocumentDiskInput();
+        file.workspace = 3;
+        file.epoch = 7;
+        file.slot = 42;
+        file.path = "src/A.zan";
+        snapshot.files.Add(file);
+        Assert(IdeDocumentWatch.Contains(snapshot, file), "identical input contained");
+
+        IdeDocumentDiskInput moved = new IdeDocumentDiskInput();
+        moved.workspace = 3;
+        moved.epoch = 8;
+        moved.slot = 42;
+        moved.path = "src/A.zan";
+        Assert(!IdeDocumentWatch.Contains(snapshot, moved), "old epoch rejected");
+
+        IdeDocumentDiskInput otherSlot = new IdeDocumentDiskInput();
+        otherSlot.workspace = 3;
+        otherSlot.epoch = 7;
+        otherSlot.slot = 43;
+        otherSlot.path = "src/A.zan";
+        Assert(!IdeDocumentWatch.Contains(snapshot, otherSlot), "other slot rejected");
+
+        IdeDocumentDiskInput otherPath = new IdeDocumentDiskInput();
+        otherPath.workspace = 3;
+        otherPath.epoch = 7;
+        otherPath.slot = 42;
+        otherPath.path = "src/B.zan";
+        Assert(!IdeDocumentWatch.Contains(snapshot, otherPath), "other path rejected");
+    }
+
+    static void TestWatchLifecycleWithoutThread() {
+        IdeDocumentWatch watch = new IdeDocumentWatch();
+        IdeDocumentWrite write = IdeDocumentWrite.Create("src/A.zan", "text");
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        Assert(!watch.Enqueue(write), "enqueue without snapshot rejected");
+        TaskCompletionSource<bool> paused = watch.PauseWrites();
+        Assert(paused.IsCompleted, "idle pause completes synchronously");
+        watch.ResumeWrites();
+        Assert(!watch.Enqueue(write), "enqueue still rejected without a snapshot");
+        // 核心契约与语义定义。
+        watch.Cancel();
+        Assert(!watch.Enqueue(write), "enqueue after cancel rejected");
+    }
+
+    static void Main() {
+        TestSameText();
+        TestFileTabClassification();
+        TestBaselineLifecycle();
+        TestWatchSnapshotGating();
+        TestWatchLifecycleWithoutThread();
+        if (failures > 0) {
+            Console.WriteLine("ide_document_watch: " + failures + " failure(s)");
+            Environment.Exit(1);
+        }
+        Console.WriteLine("ide_document_watch OK");
+    }
+}

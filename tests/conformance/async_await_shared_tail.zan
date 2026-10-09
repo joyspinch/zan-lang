@@ -1,0 +1,108 @@
+using System;
+
+async delegate string ReadText(bool slow);
+
+struct Triple {
+    long first;
+    long second;
+    long third;
+}
+
+class Item {
+    int value;
+}
+
+class AwaitError : Exception {
+    AwaitError(string message) : base(message) { }
+}
+
+class Program {
+    static int touches;
+    static int finalized;
+
+    static void Check(bool ok, string name) {
+        if (!ok) { Console.WriteLine("failed=" + name); throw new Exception("await shared tail"); }
+    }
+
+    static async string Text(bool slow) {
+        if (slow) { await Task.Yield(); }
+        return "result-" + Convert.ToString(17);
+    }
+
+    static async Item ObjectResult(bool slow) {
+        if (slow) { await Task.Yield(); }
+        Item item = new Item();
+        item.value = 23;
+        return item;
+    }
+
+    static async int[] ArrayResult(bool slow) {
+        if (slow) { await Task.Yield(); }
+        return new int[] { 3, 5, 7 };
+    }
+
+    static async double Number(bool slow) {
+        if (slow) { await Task.Yield(); }
+        return -2.75;
+    }
+
+    static async Task<Triple> Aggregate(bool slow) {
+        if (slow) { await Task.Yield(); }
+        Triple value;
+        value.first = 1234567890123L;
+        value.second = -2345678901234L;
+        value.third = 3456789012345L;
+        return value;
+    }
+
+    static async void Touch(bool slow) {
+        if (slow) { await Task.Yield(); }
+        touches = touches + 1;
+    }
+
+    static async string ThrowResult(bool slow) {
+        if (slow) { await Task.Yield(); }
+        throw new AwaitError("child-error");
+    }
+
+    static async void Consume(bool slow) {
+        string text = await Text(slow);
+        Item item = await ObjectResult(slow);
+        int[] numbers = await ArrayResult(slow);
+        double number = await Number(slow);
+        Triple triple = await Aggregate(slow);
+        ReadText read = Text;
+        string indirect = await read(slow);
+        await Touch(slow);
+        await Text(slow);
+        await ObjectResult(slow);
+        await ArrayResult(slow);
+        await Task.Yield();
+        Check(text == "result-17" && indirect == "result-17", "text");
+        Check(item.value == 23 && numbers.Length == 3 && numbers[2] == 7, "references");
+        Check(number == -2.75, "double");
+        Check(triple.first == 1234567890123L, "aggregate-first");
+        Check(triple.second == -2345678901234L && triple.third == 3456789012345L, "aggregate-rest");
+        try {
+            await ThrowResult(slow);
+            Check(false, "missing-throw");
+        } catch (AwaitError error) {
+            Check(error.Message == "child-error", "exception");
+            await Task.Yield();
+            Check(error.Message == "child-error", "exception");
+        } finally {
+            await Task.Yield();
+            finalized = finalized + 1;
+        }
+        Check(item.value == 23 && text == "result-17" && numbers[0] == 3, "after-finally");
+    }
+
+    static async void Main() {
+        for (int i = 0; i < 4; i = i + 1) {
+            await Consume(false);
+            await Consume(true);
+        }
+        Check(touches == 8 && finalized == 8, "counts");
+        Console.WriteLine("await shared tail ok");
+    }
+}

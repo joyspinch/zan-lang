@@ -1,11 +1,4 @@
-/* Borderless-window caption hit-testing (client-side decorations).
- *
- * The X11 backend draws its own title bar, so a left press on the caption drag
- * area must be delegated to the window manager (interactive move) and NOT
- * surface as a normal mouse-down, whereas presses on window content and on the
- * caption-button cluster must pass through as kind-2 events. This mirrors the
- * Win32 WM_NCHITTEST behavior. Runs headless under Xvfb (no WM is required: the
- * hit-test decides locally whether to consume the press). */
+/* 底层系统交互与数据协议契约 */
 #include <X11/Xlib.h>
 #include <X11/extensions/XTest.h>
 
@@ -26,8 +19,7 @@ extern i64 zan_gui_event_kind(void);
 static Display *d;
 static Window target;
 
-/* Warp to (px,py) inside the window, press+release button 1, and report whether
- * a kind-2 (mouse-down) ABI event was produced. */
+/* 底层系统交互与数据协议契约 */
 static int click_produces_mousedown(int px, int py) {
     XWarpPointer(d, None, target, 0, 0, 0, 0, px, py);
     XSync(d, False);
@@ -67,9 +59,9 @@ int main(void) {
     XSetInputFocus(d, target, RevertToParent, CurrentTime);
     XSync(d, False);
 
-    int caption = click_produces_mousedown(40, 16);    /* drag area -> consumed */
+    int caption = click_produces_mousedown(40, 16);    /* 核心系统底层抽象与内存语义契约 */
     int content = click_produces_mousedown(150, 150);  /* content   -> kind2   */
-    int button  = click_produces_mousedown(300, 16);   /* btn cluster -> kind2 */
+    int button  = click_produces_mousedown(300, 16);   /* 核心系统底层抽象与内存语义契约 */
 
     printf("caption drag consumed: %s\n", caption == 0 ? "OK" : "FAIL");
     printf("content click -> mousedown: %s\n", content == 1 ? "OK" : "FAIL");

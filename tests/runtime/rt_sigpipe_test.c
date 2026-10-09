@@ -1,12 +1,4 @@
-/* rt_sigpipe_test.c -- writing to a hung-up peer must not kill the process.
- *
- * A browser closing a Server-Sent Events stream (or any client walking away
- * mid-response) leaves the server writing into a socket whose peer is gone.
- * On POSIX that raises SIGPIPE, whose default action terminates the process:
- * one closed monitor tab used to take the whole web server down, silently and
- * with no log line. The reactor therefore neutralises the signal, and every
- * send reports a dead peer through its return value instead.
- */
+/* 底层系统交互与数据协议契约 */
 #include <sys/socket.h>
 #include <unistd.h>
 #include <signal.h>
@@ -37,11 +29,10 @@ int main(void) {
     check(sigaction(SIGPIPE, NULL, &cur) == 0 && cur.sa_handler != SIG_DFL,
           "zan_io_init() takes SIGPIPE off its default (fatal) action");
 
-    close(sv[1]);                      /* the peer hangs up */
+    close(sv[1]);                      /* 核心系统底层抽象与内存语义契约 */
     memset(buf, 'x', sizeof(buf));
 
-    /* Without the fix the first or second send raises SIGPIPE and this process
-     * dies here: no output past this point, and ctest reports a signal. */
+    /* 底层系统交互与数据协议契约 */
     r = zan_io_socket_send((intptr_t)sv[0], buf, (int64_t)sizeof(buf), 0);
     if (r >= 0) {
         r = zan_io_socket_send((intptr_t)sv[0], buf, (int64_t)sizeof(buf), 0);

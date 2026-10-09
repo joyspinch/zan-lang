@@ -1,0 +1,92 @@
+using System;
+using System.Threading;
+using Gui;
+
+/// 接口数据协议与执行契约。
+/// 接口数据协议与执行契约。
+/// 接口数据协议与执行契约。
+class GuiPostWakeTest {
+    static App app;
+    static AtomicInt startWorker;
+    static AtomicInt postedAt;
+    static AtomicInt workerThread;
+    static AtomicInt workerDone;
+    static int callbacks;
+    static long callbackAt;
+    static long callbackThread;
+    static int callbackFrames;
+    static bool deadlinePending;
+    static bool redrawAtCallback;
+
+    static void Worker() {
+        while (GuiPostWakeTest.startWorker.Load() == 0) { Thread.Sleep(1); }
+        Thread.Sleep(100);
+        GuiPostWakeTest.workerThread.Store(Thread.CurrentId());
+        GuiPostWakeTest.postedAt.Store(Stopwatch.GetMilliseconds());
+        GuiPostWakeTest.app.Post(() => {
+            GuiPostWakeTest.callbackAt = Stopwatch.GetMilliseconds();
+            GuiPostWakeTest.callbackThread = Thread.CurrentId();
+            GuiPostWakeTest.callbackFrames = GuiPostWakeTest.app.frameCount;
+            GuiPostWakeTest.deadlinePending =
+                GuiPostWakeTest.app.animNextMs > Window.GetTickMs();
+            GuiPostWakeTest.redrawAtCallback = GuiPostWakeTest.app.needsRedraw;
+            GuiPostWakeTest.callbacks = GuiPostWakeTest.callbacks + 1;
+        });
+        GuiPostWakeTest.workerDone.Store(1);
+    }
+
+    static void Main(string[] args) {
+        #if WINDOWS
+        GuiPostWakeTest.app = new App("Post wake regression", 96, 64);
+        if (GuiPostWakeTest.app.WindowHandle() == 0) {
+            throw new Exception("native HWND creation failed");
+        }
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        for (int i = 0; i < 64; i = i + 1) {
+            if (GuiPostWakeTest.app.window.PollEvent() != 0) { break; }
+        }
+        GuiPostWakeTest.startWorker = new AtomicInt(0);
+        GuiPostWakeTest.postedAt = new AtomicInt(0);
+        GuiPostWakeTest.workerThread = new AtomicInt(0);
+        GuiPostWakeTest.workerDone = new AtomicInt(0);
+        long uiThread = Thread.CurrentId();
+        GuiPostWakeTest.app.needsRedraw = false;
+        GuiPostWakeTest.app.RequestAnimationFrame(4000);
+        if (!Thread.Start(GuiPostWakeTest.Worker)) {
+            GuiPostWakeTest.app.StopLoop();
+            GuiPostWakeTest.app.window.Close();
+            throw new Exception("background thread creation failed");
+        }
+        long limit = Stopwatch.GetMilliseconds() + 6000;
+        GuiPostWakeTest.startWorker.Store(1);
+        while (GuiPostWakeTest.callbacks == 0 && Stopwatch.GetMilliseconds() < limit) {
+            GuiPostWakeTest.app.needsRedraw = false;
+            if (!GuiPostWakeTest.app.PumpGuarded()) { break; }
+        }
+        while (GuiPostWakeTest.workerDone.Load() == 0 && Stopwatch.GetMilliseconds() < limit) {
+            Thread.Sleep(1);
+        }
+        long latencyMs = GuiPostWakeTest.callbackAt - GuiPostWakeTest.postedAt.Load();
+        bool passed = GuiPostWakeTest.callbacks == 1
+            && GuiPostWakeTest.workerDone.Load() == 1
+            && latencyMs >= 0 && latencyMs < 1000
+            && GuiPostWakeTest.deadlinePending && !GuiPostWakeTest.redrawAtCallback
+            && GuiPostWakeTest.callbackThread == uiThread
+            && GuiPostWakeTest.workerThread.Load() != uiThread
+            && GuiPostWakeTest.callbackFrames == 0 && GuiPostWakeTest.app.frameCount == 0
+            && GuiPostWakeTest.app.frameErrors == 0;
+        GuiPostWakeTest.app.StopLoop();
+        GuiPostWakeTest.app.window.Close();
+        if (!passed || (args.Length > 0 && args[0] == "--measure")) {
+            Console.WriteLine("post-latency-ms=" + Convert.ToString(latencyMs)
+                + " callbacks=" + Convert.ToString(GuiPostWakeTest.callbacks)
+                + " deadline-pending=" + Convert.ToString(GuiPostWakeTest.deadlinePending)
+                + " redraw-at-callback=" + Convert.ToString(GuiPostWakeTest.redrawAtCallback)
+                + " frames=" + Convert.ToString(GuiPostWakeTest.app.frameCount));
+        }
+        if (!passed) { throw new Exception("Post did not promptly wake the timed UI pump without rendering"); }
+        #endif
+        Console.WriteLine("gui-post-wake: 1");
+    }
+}

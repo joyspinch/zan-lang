@@ -97,6 +97,126 @@ static void test_atomic_int(void) {
     zan_atomic_int_destroy(atomic);
 }
 
+typedef struct {
+    void *obj;
+    volatile int *counter;
+    int iterations;
+} monitor_worker_args;
+
+typedef struct {
+    void *o1;
+    void *o2;
+    volatile int *counter;
+    int iterations;
+} nested_monitor_worker_args;
+
+#ifdef _WIN32
+static DWORD WINAPI monitor_worker(LPVOID arg) {
+#else
+static void *monitor_worker(void *arg) {
+#endif
+    monitor_worker_args *m = (monitor_worker_args *)arg;
+    for (int i = 0; i < m->iterations; i++) {
+        zan_monitor_enter(m->obj);
+        (*m->counter)++;
+        zan_monitor_exit(m->obj);
+    }
+    return 0;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI nested_monitor_worker(LPVOID arg) {
+#else
+static void *nested_monitor_worker(void *arg) {
+#endif
+    nested_monitor_worker_args *m = (nested_monitor_worker_args *)arg;
+    for (int i = 0; i < m->iterations; i++) {
+        zan_monitor_enter(m->o1);
+        zan_monitor_enter(m->o2);
+        (*m->counter)++;
+        zan_monitor_exit(m->o2);
+        zan_monitor_exit(m->o1);
+    }
+    return 0;
+}
+
+static void test_monitor(void) {
+    /* 核心系统底层抽象与内存语义契约 */
+    int dummy_obj = 42;
+    zan_monitor_enter(&dummy_obj);
+    zan_monitor_enter(&dummy_obj);
+    zan_monitor_exit(&dummy_obj);
+    zan_monitor_exit(&dummy_obj);
+    CHECK(1, "recursive monitor enter/exit succeeded");
+
+    /* 核心系统底层抽象与内存语义契约 */
+    enum { M_THREADS = 4, M_ITERS = 10000 };
+    volatile int counter = 0;
+    monitor_worker_args margs = {&dummy_obj, &counter, M_ITERS};
+    thread_t threads[M_THREADS];
+    memset(threads, 0, sizeof(threads));
+    for (int i = 0; i < M_THREADS; i++) {
+#ifdef _WIN32
+        threads[i] = CreateThread(NULL, 0, monitor_worker, &margs, 0, NULL);
+#else
+        pthread_create(&threads[i], NULL, monitor_worker, &margs);
+#endif
+    }
+    for (int i = 0; i < M_THREADS; i++) {
+#ifdef _WIN32
+        if (threads[i]) {
+            WaitForSingleObject(threads[i], INFINITE);
+            CloseHandle(threads[i]);
+        }
+#else
+        pthread_join(threads[i], NULL);
+#endif
+    }
+    CHECK(counter == M_THREADS * M_ITERS,
+          "striped monitor failed mutual exclusion: counter=%d expected=%d",
+          counter, M_THREADS * M_ITERS);
+
+    /* 核心系统底层抽象与内存语义契约 */
+    int obj1 = 1, obj2 = 2;
+    zan_monitor_enter(&obj1);
+    zan_monitor_enter(&obj2);
+    zan_monitor_exit(&obj2);
+    zan_monitor_exit(&obj1);
+    CHECK(1, "nested monitor enter/exit succeeded");
+
+    /* 底层系统交互与数据协议契约 */
+    enum { N_THREADS = 4, N_ITERS = 5000 };
+    volatile int ncounter = 0;
+    nested_monitor_worker_args nargs = {&obj1, &obj2, &ncounter, N_ITERS};
+    thread_t nthreads[N_THREADS];
+    memset(nthreads, 0, sizeof(nthreads));
+    for (int i = 0; i < N_THREADS; i++) {
+#ifdef _WIN32
+        nthreads[i] = CreateThread(NULL, 0, nested_monitor_worker, &nargs, 0, NULL);
+#else
+        pthread_create(&nthreads[i], NULL, nested_monitor_worker, &nargs);
+#endif
+    }
+    for (int i = 0; i < N_THREADS; i++) {
+#ifdef _WIN32
+        if (nthreads[i]) {
+            WaitForSingleObject(nthreads[i], INFINITE);
+            CloseHandle(nthreads[i]);
+        }
+#else
+        pthread_join(nthreads[i], NULL);
+#endif
+    }
+    CHECK(ncounter == N_THREADS * N_ITERS,
+          "concurrent nested monitor failed: counter=%d expected=%d",
+          ncounter, N_THREADS * N_ITERS);
+
+    /* 核心系统底层抽象与内存语义契约 */
+    zan_ui_thread_set();
+    CHECK(zan_ui_thread_check() == 1, "UI thread check should succeed on registered UI thread");
+    zan_ui_thread_assert("test on UI thread");
+}
+
 static int shared_table_child(const char *name) {
     int64_t table = zan_shared_table_open(name);
     if (!table) return 2;
@@ -265,11 +385,7 @@ static void test_shared_table(void) {
           "destroyed shared table can still be opened");
 }
 
-/* B1: file handles must be unforgeable. A handle is no longer a raw FILE*
- * pointer but a (generation, index) ticket into a table, so a fabricated
- * integer, a wrong-generation value, or a double close must fail cleanly
- * instead of being dereferenced (a use-after-free / garbage-pointer crash
- * before the fix). */
+/* 模块核心语义抽象与接口调用契约 */
 static void test_file_handle(void) {
     char path[160];
 #ifdef _WIN32
@@ -298,7 +414,7 @@ static void test_file_handle(void) {
     CHECK(zan_file_tell(h) == n, "tell after read is wrong");
     CHECK(zan_file_flush(h) == 1, "flush failed on open handle");
 
-    /* Forged handles must be rejected, never dereferenced. */
+    /* 底层系统交互与数据协议契约 */
     CHECK(zan_file_read(12345, (long long)(intptr_t)buf, 4) == 0,
           "forged handle accepted by read");
     CHECK(zan_file_write(12345, (long long)(intptr_t)msg, 4) == 0,
@@ -310,20 +426,19 @@ static void test_file_handle(void) {
     CHECK(zan_file_read(0, (long long)(intptr_t)buf, 4) == 0,
           "zero handle accepted by read");
 
-    /* A live index carrying the wrong generation must not match either. */
+    /* 模块核心语义抽象与接口调用契约 */
     CHECK(zan_file_read(h ^ (1LL << 32), (long long)(intptr_t)buf, 4) == 0,
           "wrong-generation handle accepted by read");
     CHECK(zan_file_close(h ^ (1LL << 32)) == 0,
           "wrong-generation handle accepted by close");
 
-    /* Close once succeeds; the same handle again must be detected as stale. */
+    /* 模块核心语义抽象与接口调用契约 */
     CHECK(zan_file_close(h) == 1, "first close failed");
     CHECK(zan_file_close(h) == 0, "double close not detected");
     CHECK(zan_file_read(h, (long long)(intptr_t)buf, 4) == 0,
           "use-after-close handle accepted by read");
 
-    /* The slot is reusable, and the stale handle stays dead while the new one
-     * works (generation was bumped, so the stale ticket no longer matches). */
+    /* 模块核心语义抽象与接口调用契约 */
     long long h2 = zan_file_open(path, "rb");
     CHECK(h2 != 0, "could not reopen scratch file");
     if (h2) {
@@ -337,12 +452,7 @@ static void test_file_handle(void) {
     remove(path);
 }
 
-/* B2: the POSIX path APIs must not follow symlinks or leave a TOCTOU window.
- * set_readonly / set_time used to stat() a path and then chmod()/utimensat()
- * it by name, so a symlink at the path was followed and the real target was
- * mutated. The fix resolves the path to a descriptor once with O_NOFOLLOW and
- * operates on the fd: acting on a symlink must fail and leave the target's
- * permissions and timestamps untouched. POSIX-only (Windows uses handles). */
+/* 模块核心语义抽象与接口调用契约 */
 #ifndef _WIN32
 static void test_file_no_follow_symlink(void) {
     char dir[192], target[192], link[192];
@@ -374,7 +484,7 @@ static void test_file_no_follow_symlink(void) {
     mode_t mode_before = st_before.st_mode & 07777;
     time_t mtime_before = st_before.st_mtime;
 
-    /* Acting on the symlink must fail and leave the real target untouched. */
+    /* 模块核心语义抽象与接口调用契约 */
     CHECK(zan_file_set_readonly(link, 1) == 0,
           "set_readonly followed a symlink");
     CHECK(zan_file_set_time(link, 0, (long long)(mtime_before + 3600)) == 0,
@@ -385,7 +495,7 @@ static void test_file_no_follow_symlink(void) {
     CHECK(st_after.st_mtime == mtime_before,
           "symlink set_time changed the target's mtime");
 
-    /* The direct path must still work (the fix cannot break normal use). */
+    /* 模块核心语义抽象与接口调用契约 */
     CHECK(zan_file_set_readonly(target, 1) == 1,
           "set_readonly failed on the real file");
     CHECK(stat(target, &st_after) == 0, "could not restat target");
@@ -411,6 +521,7 @@ int main(int argc, char **argv) {
     }
 
     test_atomic_int();
+    test_monitor();
     test_shared_table();
     test_file_handle();
 #ifndef _WIN32

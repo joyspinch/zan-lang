@@ -1,0 +1,384 @@
+using System;
+using System.IO;
+using System.Web;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+
+partial class WysiwygFixture {
+    static void OnLoad(Form form) { }
+}
+
+class DesignerWysiwygTest {
+    static int fails;
+
+    static void Check(string label, bool ok) {
+        if (ok) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + label);
+    }
+
+    static Control Node(Control tree, string name) {
+        Control ctl = tree.Find(name);
+        if (ctl == null) { throw new Exception("missing " + name); }
+        return ctl;
+    }
+
+    static FormField Field(List<FormField> fields, string name) {
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            FormField field = fields[i];
+            if (field.fname == name) { return field; }
+            FormField nested = DesignerWysiwygTest.Field(field.kids, name);
+            if (nested != null) { return nested; }
+        }
+        return null;
+    }
+
+    static void Freeze(App app) {
+        app.freezeAnimClock = true;
+        app.nowMs = 10000;
+        app.lastFrameMs = 10000;
+    }
+
+    static void SameRects(Designer designer, Control runtime) {
+        for (int i = 0; i < designer.pvDocNodes.Count; i = i + 1) {
+            DesignPreviewNode node = designer.pvDocNodes[i];
+            if (node.control == null || node.field.fname == "") { continue; }
+            Control reference = DesignerWysiwygTest.Node(runtime, node.field.fname);
+            Control actual = node.control;
+            DesignerWysiwygTest.Check("rect " + node.field.fname,
+                actual.bx == reference.bx && actual.by == reference.by
+                && actual.bw == reference.bw && actual.bh == reference.bh);
+        }
+    }
+
+    static void SamePixels(Canvas actual, Canvas reference) {
+        Check("pixel surface dimensions", actual.Width() == reference.Width() && actual.Height() == reference.Height());
+        int differences = 0;
+        for (int y = 0; y < actual.Height(); y = y + 1) {
+            for (int x = 0; x < actual.Width(); x = x + 1) {
+                if (actual.GetPixel(x, y) != reference.GetPixel(x, y)) {
+                    differences = differences + 1;
+                }
+            }
+        }
+        if (differences != 0) {
+            Console.WriteLine("pixel differences=" + Convert.ToString(differences));
+        }
+        DesignerWysiwygTest.Check("whole window pixels", differences == 0);
+    }
+
+    static void RunAtDpi(string html, int dpi) {
+        Designer designer = new Designer();
+        designer.LoadHtmlText(html);
+        App editor = App.CreateOffscreen("editor", 760, 500);
+        editor.SetOffscreenViewport(760, 500, 150);
+        designer.targetDpi = dpi;
+        editor.UseAppCss("button { background: #00ff00; } .head { color: #00ff00; }");
+        string saved = designer.SaveJson();
+        DesignerWysiwygTest.Check("prepare", designer.PrepareDesignPreview(editor));
+        Check("target DPI independent from editor", designer.DesignDpi() == dpi && editor.dpiScale == 150);
+        Check("target DPI does not change document", designer.SaveJson() == saved);
+        for (int logical = 0 - 257; logical <= 257; logical = logical + 1) {
+            Check("logical geometry roundtrip at " + Convert.ToString(dpi),
+                designer.DesignLogical(designer.DesignDevice(logical)) == logical);
+        }
+        DesignerWysiwygTest.Freeze(designer.pvDocForm.GetApp());
+        designer.PrepareDesignPreview(editor);
+
+        JsonValue document = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(html));
+        Control tree = WysiwygFixture.__BuildForm();
+        Form runtime = Form.CreateOffscreen("Preview parity", 480, 320);
+        App app = runtime.GetApp();
+        app.SetOffscreenViewport(480, 320, dpi);
+        FormBuilder.ConfigureWindow(app, document);
+        FormBuilder.ApplyStyles(app, document);
+        runtime.Add(tree);
+        DesignerWysiwygTest.Freeze(app);
+        app.BeginOffscreenFrame();
+        runtime.RenderFrame(app);
+        app.RenderChrome("Preview parity");
+        app.EndOffscreenFrame();
+        DesignerWysiwygTest.SameRects(designer, tree);
+        DesignerWysiwygTest.SamePixels(designer.pvDocForm.GetApp().canvas, app.canvas);
+
+        Control heading = DesignerWysiwygTest.Node(tree, "Heading");
+        Control row = DesignerWysiwygTest.Node(tree, "Row");
+        Control anchor = DesignerWysiwygTest.Node(tree, "Anchored");
+        DesignerWysiwygTest.Check("flow order", row.by >= heading.by + heading.bh);
+        DesignerWysiwygTest.Check("padding and chrome", heading.bx == app.Scale(12)
+            && heading.by == app.ContentTop() + app.Scale(12));
+        DesignerWysiwygTest.Check("bottom right anchor", anchor.bx + anchor.bw == app.Scale(480 - 12 - 8)
+            && anchor.by + anchor.bh == app.Scale(320 - 12 - 8));
+
+        Control oldTree = designer.pvDocRoot;
+        designer.winZoom = 2000;
+        designer.PrepareDesignPreview(editor);
+        DesignerWysiwygTest.Check("view zoom retains tree", designer.pvDocRoot == oldTree);
+        DesignerWysiwygTest.SameRects(designer, tree);
+        DesignerWysiwygTest.Check("editor CSS isolated", editor.appCss.Contains("#00ff00")
+            && !designer.pvDocForm.GetApp().appCss.Contains("#00ff00"));
+        designer.DisposeDesignPreview();
+        app.canvas.Destroy();
+        editor.canvas.Destroy();
+    }
+
+    static void DpiChanges(string html) {
+        Designer designer = new Designer();
+        designer.LoadHtmlText(html);
+        App editor = App.CreateOffscreen("editor", 760, 500);
+        editor.SetOffscreenViewport(760, 500, 150);
+        designer.PrepareDesignPreview(editor);
+        Control original = designer.pvDocRoot;
+        string saved = designer.SaveJson();
+        JsonValue doc = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(html));
+        Form runtime = Form.CreateOffscreen("Preview parity", 480, 320);
+        App app = runtime.GetApp();
+        FormBuilder.ConfigureWindow(app, doc);
+        FormBuilder.ApplyStyles(app, doc);
+        Control tree = WysiwygFixture.__BuildForm();
+        runtime.Add(tree);
+        Freeze(app);
+        Freeze(designer.pvDocForm.GetApp());
+        for (int pass = 0; pass < 2; pass = pass + 1) {
+            for (int dpi = 100; dpi <= 300; dpi = dpi + 25) {
+                int target = pass == 0 ? dpi : 400 - dpi;
+                designer.SetDesignTargetDpi(editor, target);
+                app.SetOffscreenViewport(480, 320, target);
+                app.BeginOffscreenFrame();
+                runtime.RenderFrame(app);
+                app.RenderChrome("Preview parity");
+                app.EndOffscreenFrame();
+                Check("DPI switch retains author tree", designer.pvDocRoot == original);
+                Check("DPI switch preserves logical document", designer.SaveJson() == saved);
+                SameRects(designer, tree);
+                SamePixels(designer.pvDocForm.GetApp().canvas, app.canvas);
+            }
+        }
+        designer.SetDesignTargetDpi(editor, 0);
+        Check("follow device uses editor DPI", designer.DesignDpi() == 150);
+        editor.SetOffscreenViewport(760, 500, 225);
+        designer.PrepareDesignPreview(editor);
+        Check("follow device responds to DPI changes", designer.DesignDpi() == 225);
+        designer.SetDesignTargetDpi(editor, 175);
+        editor.SetOffscreenViewport(760, 500, 100);
+        designer.PrepareDesignPreview(editor);
+        Check("explicit target ignores editor DPI changes", designer.DesignDpi() == 175);
+        Check("host change preserves document and tree", designer.SaveJson() == saved && designer.pvDocRoot == original);
+        designer.DisposeDesignPreview();
+        app.canvas.Destroy();
+        editor.canvas.Destroy();
+    }
+
+    static void MixedEdit(string html) {
+        Designer designer = new Designer();
+        designer.LoadHtmlText(html);
+        FormField heading = DesignerWysiwygTest.Field(designer.fields, "Heading");
+        if (heading == null) { throw new Exception("missing heading"); }
+        heading.kids.RemoveAt(0);
+        JsonValue saved = JsonValue.ParseLenient(designer.SaveJson());
+        JsonValue savedFields = saved.Get("fields");
+        if (savedFields == null) { throw new Exception("missing fields"); }
+        JsonValue headingDoc = savedFields.At(0);
+        JsonValue order = headingDoc.Get("htmlContent");
+        if (order == null) { throw new Exception("missing htmlContent"); }
+        bool references = false;
+        for (int i = 0; i < order.Count(); i = i + 1) {
+            if (order.At(i).IsNumber()) { references = true; }
+        }
+        DesignerWysiwygTest.Check("deleted mixed child reference", !references);
+        DesignerWysiwygTest.Check("mixed text remains", designer.SaveHtml().Contains("Before ")
+            && designer.SaveHtml().Contains(" after."));
+        designer.LoadHtmlText(html);
+        heading = DesignerWysiwygTest.Field(designer.fields, "Heading");
+        if (heading == null) { throw new Exception("missing heading for duplicate"); }
+        designer.sel = heading;
+        designer.DuplicateSel();
+        FormField copied = designer.sel;
+        if (copied == null) { throw new Exception("missing copy"); }
+        JsonValue copyDoc = designer.FieldJson(copied);
+        Check("duplicate retains native mixed content", copyDoc.Str("htmlTag", "") == "div"
+            && copyDoc.Get("htmlContent") != null && copied.kids.Count == heading.kids.Count
+            && copied.kids[0].styleText == heading.kids[0].styleText);
+    }
+
+    static JsonValue Member(JsonValue obj, string key) {
+        JsonValue value = obj.Get(key);
+        if (value == null) { throw new Exception("missing " + key); }
+        return value;
+    }
+
+    static void MixedReorder() {
+        Designer designer = new Designer();
+        designer.LoadHtmlText("<html><body data-zan-design id=\"Reorder\">"
+            + "lead<div id=\"A\">A</div>between<div id=\"B\">B</div>tail"
+            + "</body></html>");
+        designer.sel = Field(designer.fields, "B");
+        designer.MoveSel(0 - 1);
+        JsonValue root = JsonValue.ParseLenient(designer.SaveJson());
+        JsonValue content = Member(root, "bodyContent");
+        Check("root mixed reorder keeps text slots", content.ToJson() == "[\"lead\",0,\"between\",1,\"tail\"]"
+            && Member(root, "fields").At(0).Str("name", "") == "B");
+        Element body = (Element)FormBuilder.Build(root);
+        Check("root mixed reorder changes actual source order", body.elOrder[1].kid == body.children[0]
+            && body.elOrder[3].kid == body.children[1]
+            && body.children[0].name == "B" && body.children[1].name == "A");
+        designer.Undo();
+        Check("root reorder undo", designer.fields[0].fname == "A");
+        designer.Redo();
+        Check("root reorder redo", designer.fields[0].fname == "B");
+        designer.LoadHtmlText("<html><body data-zan-design id=\"Reorder\">"
+            + "<div id=\"Owner\">lead<span id=\"A\">A</span>between<span id=\"B\">B</span>tail</div>"
+            + "</body></html>");
+        designer.sel = Field(designer.fields, "B");
+        designer.SelToEdge(1);
+        root = JsonValue.ParseLenient(designer.SaveJson());
+        JsonValue owner = Member(root, "fields").At(0);
+        Check("nested mixed reorder keeps text slots", Member(owner, "htmlContent").ToJson()
+            == "[\"lead\",0,\"between\",1,\"tail\"]"
+            && Member(owner, "kids").At(0).Str("name", "") == "B");
+        body = (Element)FormBuilder.Build(root);
+        Element element = (Element)Node(body, "Owner");
+        Check("nested mixed reorder changes actual source order", element.children[0].name == "B"
+            && element.children[1].name == "A");
+        designer.SelToEdge(0);
+        root = JsonValue.ParseLenient(designer.SaveJson());
+        owner = Member(root, "fields").At(0);
+        Check("second mixed reorder", Member(owner, "kids").At(0).Str("name", "") == "A");
+        designer.sel = Field(designer.fields, "A");
+        designer.DeleteSelGroup();
+        designer.sel = Field(designer.fields, "B");
+        designer.DuplicateSel();
+        designer.SelToEdge(1);
+        root = JsonValue.ParseLenient(designer.SaveJson());
+        owner = Member(root, "fields").At(0);
+        content = Member(owner, "htmlContent");
+        Check("reorder after delete and duplicate preserves references", Member(owner, "kids").Count() == 2
+            && content.At(2).AsInt(0 - 1) == 0
+            && content.At(4).AsInt(0 - 1) == 1);
+    }
+
+    static void CssDpiLengths() {
+        App app = App.CreateOffscreen("CSS DPI", 320, 240);
+        for (int dpi = 100; dpi <= 300; dpi = dpi + 25) {
+            app.SetOffscreenViewport(320, 240, dpi);
+            int font = app.theme.fontSizeMedium;
+            int height = app.theme.heightMedium;
+            app.UseAppCss("button { font-size:" + Convert.ToString(font)
+                + "px; height:" + Convert.ToString(height)
+                + "px; line-height:29px; letter-spacing:3px; border:2px solid #405060; }");
+            StyleBox box = Style.Of(app, "button", "", Style.SNormal());
+            Check("CSS font equal to scaled theme is still logical at " + Convert.ToString(dpi), box.fontPx == app.Scale(font));
+            Check("CSS height equal to scaled theme is still logical at " + Convert.ToString(dpi), box.height == app.Scale(height));
+            Check("CSS pixel line-height scales at " + Convert.ToString(dpi), box.lineHeight == app.Scale(29));
+            Check("CSS letter-spacing scales at " + Convert.ToString(dpi), box.letterSpacing == app.Scale(3));
+            Check("CSS border scales at " + Convert.ToString(dpi), box.BorderWOr(0) == app.Scale(2));
+        }
+        app.canvas.Destroy();
+    }
+
+    static void WindowStateAndClone() {
+        App first = App.CreateOffscreen("first", 240, 160);
+        App second = App.CreateOffscreen("second", 240, 160);
+        first.SetTheme(Theme.Light());
+        second.SetTheme(Theme.Dark());
+        Check("app owned theme sheets", Style.BaseSheet(first) != Style.BaseSheet(second));
+        Check("theme sheet stable", Style.BaseSheet(first) == Style.BaseSheet(first));
+        JsonValue shaped = JsonValue.ParseLenient("{\"winW\":240,\"winH\":160,\"winShape\":1,\"winShapeRadius\":20,\"winShadow\":8,\"winChrome\":false,\"winResizable\":false,\"winTool\":true,\"winOpacity\":70}");
+        FormBuilder.ConfigureWindow(first, shaped);
+        first.SetOffscreenViewport(240, 160, 150);
+        Check("shape extent includes shadow", first.canvas.Width() == first.Scale(256)
+            && first.canvas.Height() == first.Scale(176)
+            && first.ShapeOffX() == first.Scale(8));
+        FormBuilder.ConfigureWindow(first, JsonValue.NewObject());
+        first.SetOffscreenViewport(240, 160, 150);
+        Check("window appearance restored", first.shapeMode == 0 && first.ShapeOffX() == 0
+            && first.ChromeVisible() && first.Resizable() && first.WindowOpacity() == 100
+            && first.canvas.Width() == first.Scale(240) && first.canvas.Height() == first.Scale(160));
+        Control original = FormBuilder.Build(JsonValue.ParseLenient("{\"bodyContent\":[0],\"docCss\":\"div { color: red; }\",\"fields\":[{\"kind\":\"Panel\",\"htmlTag\":\"div\",\"name\":\"placed\",\"position\":1,\"anchor\":9,\"fx\":4,\"fy\":5,\"fw\":60,\"fh\":30}]}"));
+        Control clone = Html.Clone(original);
+        if (clone == null) { throw new Exception("clone failed"); }
+        Control placed = Node(clone, "placed");
+        Check("clone design positioning", clone.designCss == original.designCss
+            && placed.designFloat && placed.designAnchor == 9
+            && placed.logX == 4 && placed.logY == 5 && placed.logW == 60 && placed.logH == 30);
+        first.canvas.Destroy();
+        second.canvas.Destroy();
+    }
+
+    static void ShapedPreview(string html, int dpi, int shape) {
+        JsonValue doc = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(html));
+        doc.Set("winShape", JsonValue.NewNum(Convert.ToString(shape)));
+        doc.Set("winShapeRadius", JsonValue.NewNum("24"));
+        doc.Set("winShadow", JsonValue.NewNum(shape == 1 ? "8" : "0"));
+        doc.Set("winOpacity", JsonValue.NewNum(shape == 0 ? "70" : "100"));
+        Designer designer = new Designer();
+        designer.LoadJson(doc.ToJson());
+        App editor = App.CreateOffscreen("editor", 760, 500);
+        editor.SetOffscreenViewport(760, 500, 150);
+        designer.targetDpi = dpi;
+        Check("shaped prepare", designer.PrepareDesignPreview(editor));
+        Freeze(designer.pvDocForm.GetApp());
+        designer.PrepareDesignPreview(editor);
+        Form runtime = Form.CreateOffscreen("Preview parity", 480, 320);
+        App app = runtime.GetApp();
+        FormBuilder.ConfigureWindow(app, doc);
+        app.SetOffscreenViewport(480, 320, dpi);
+        FormBuilder.ApplyStyles(app, doc);
+        Control tree = WysiwygFixture.__BuildForm();
+        runtime.Add(tree);
+        Freeze(app);
+        app.BeginOffscreenFrame();
+        runtime.RenderFrame(app);
+        app.RenderChrome("Preview parity");
+        app.EndOffscreenFrame();
+        SameRects(designer, tree);
+        Check("shaped extent parity", app.canvas.Width() == designer.pvDocForm.GetApp().canvas.Width()
+            && app.canvas.Height() == designer.pvDocForm.GetApp().canvas.Height());
+        SamePixels(designer.pvDocForm.GetApp().canvas, app.canvas);
+        int width = app.canvas.Width();
+        int height = app.canvas.Height();
+        Canvas actual = new Canvas(width, height);
+        Canvas reference = new Canvas(width, height);
+        actual.Clear(0xFF102030);
+        reference.Clear(0xFF102030);
+        designer.PaintDesignPreview(actual, 0, 0, width, height);
+        string key = "mem:shape-reference";
+        Check("runtime final shape", app.canvas.SnapshotWindowShape(key,
+            new WindowShapeMask(), app.shapeRegions, dpi, app.WindowOpacity()));
+        reference.BlitImage(key, 0, 0, width, height, 0, 0, width, height);
+        SamePixels(actual, reference);
+        if (shape != 0) { Check("window corner clipped", actual.GetPixel(0, 0) == 0xFF102030); }
+        Canvas.EvictImage(key);
+        actual.Destroy();
+        reference.Destroy();
+        app.canvas.Destroy();
+        designer.DisposeDesignPreview();
+        editor.canvas.Destroy();
+    }
+
+    static void Main() {
+        string html = File.ReadAllText("tests/gui/designer_wysiwyg.html");
+        for (int dpi = 100; dpi <= 300; dpi = dpi + 25) {
+            DesignerWysiwygTest.RunAtDpi(html, dpi);
+        }
+        DesignerWysiwygTest.DpiChanges(html);
+        DesignerWysiwygTest.MixedEdit(html);
+        DesignerWysiwygTest.MixedReorder();
+        DesignerWysiwygTest.CssDpiLengths();
+        DesignerWysiwygTest.WindowStateAndClone();
+        DesignerWysiwygTest.ShapedPreview(html, 100, 1);
+        DesignerWysiwygTest.ShapedPreview(html, 150, 1);
+        DesignerWysiwygTest.ShapedPreview(html, 100, 2);
+        DesignerWysiwygTest.ShapedPreview(html, 150, 2);
+        DesignerWysiwygTest.ShapedPreview(html, 100, 0);
+        DesignerWysiwygTest.ShapedPreview(html, 150, 0);
+        for (int dpi = 175; dpi <= 225; dpi = dpi + 50) {
+            for (int shape = 0; shape <= 2; shape = shape + 1) {
+                DesignerWysiwygTest.ShapedPreview(html, dpi, shape);
+            }
+        }
+        if (fails != 0) { throw new Exception("WYSIWYG failed"); }
+        Console.WriteLine("DESIGNER_WYSIWYG_OK");
+    }
+}

@@ -1,0 +1,220 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+class NativeWindowSizeTest {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "SendMessageW")]
+    static extern nint SendMessageW(nint hwnd, int msg, nint wp, nint lp);
+    static int renderScale;
+    static int renderCalls;
+    #endif
+
+    static void Check(string name, bool ok) {
+        if (!ok) {
+            Console.WriteLine("FAIL native window size: " + name);
+            throw new Exception(name);
+        }
+    }
+
+    #if WINDOWS
+    static void ChangeDpi(Window window, int dpi, int w, int h) {
+        nint rect = NativeMemory.Alloc(16);
+        Span<int> values = new Span<int>(rect, 4);
+        values[0] = 40;
+        values[1] = 40;
+        values[2] = 40 + w;
+        values[3] = 40 + h;
+        // 接口数据协议与执行契约。
+        NativeWindowSizeTest.SendMessageW(window.GetHandle(), 0x02E0,
+            (nint)(dpi | (dpi << 16)), rect);
+        NativeMemory.Free(rect);
+    }
+
+    static void Pump(App app) {
+        for (int i = 0; i < 256; i = i + 1) {
+            int result = app.PollOneEvent();
+            Check("app stays running", result >= 0);
+            if (result == 0) { return; }
+        }
+        Check("native queue drains", false);
+    }
+
+    static void CheckMetrics(App app, int percent) {
+        Check("app DPI", app.dpiScale == percent);
+        Check("app geometry ratio", app.Scale(320) == 320 * percent / 100);
+        Check("app chrome height", app.ContentTop() == 32 * percent / 100);
+        Check("app caption width", app.captionBtnW == 46 * percent / 100);
+        Check("app scroll speed", app.scrollSpeed == 40 * percent / 100);
+        Theme expected = Theme.Light();
+        expected.ScaleByDpi(percent);
+        List<int> want = expected.SnapshotMetrics();
+        List<int> actual = app.theme.SnapshotMetrics();
+        Check("theme metric count", actual.Count == want.Count);
+        for (int i = 0; i < want.Count; i = i + 1) {
+            Check("theme metric refreshed", actual[i] == want[i]);
+        }
+    }
+
+    static void CheckPosition(Window window) {
+        nint rect = NativeMemory.Alloc(16);
+        int ok = Win32Shell.GetWindowRect(window.GetHandle(), rect);
+        int x = new Span<int>(rect, 4)[0];
+        int y = new Span<int>(rect, 4)[1];
+        NativeMemory.Free(rect);
+        Check("suggested RECT position", ok != 0 && x == 40 && y == 40);
+    }
+
+    static void CheckMainStageMinimum(Window stage) {
+        nint info = NativeMemory.Alloc(40);
+        NativeMemory.Fill(info, 0, 40);
+        NativeWindowSizeTest.SendMessageW(stage.GetHandle(), 0x0024, 0, info);
+        int w = new Span<int>(info, 10)[6];
+        int h = new Span<int>(info, 10)[7];
+        NativeMemory.Free(info);
+        Check("main stage minimum width stays physical", w == 400);
+        Check("main stage minimum content stays physical", h == 300 + stage.GetTitlebarHeight());
+    }
+
+    static void CheckDpiUpdates(Window mainStage) {
+        App app = new App("DPI updates", 240, 160);
+        App peer = new App("Independent DPI", 260, 180);
+        int initialScale = app.window.GetDpiScale();
+        // 接口数据协议与执行契约。
+        app.window.SetClientSizeDev(120 * initialScale / 100, 80 * initialScale / 100);
+        app.Show();
+        CheckMetrics(app, initialScale);
+        peer.Show();
+        app.SetWindowPos(40, 40);
+        peer.SetWindowPos(40, 40);
+        Pump(app);
+        NativeWindowSizeTest.ChangeDpi(peer.window, 168, 455, 315);
+        peer.SyncSurface();
+        CheckMetrics(peer, 175);
+        int peerW = peer.ClientWidth();
+        int peerH = peer.ClientHeight();
+        NativeWindowSizeTest.renderScale = app.dpiScale;
+        NativeWindowSizeTest.renderCalls = 0;
+        app.SetFrameBody(() => {
+            NativeWindowSizeTest.CheckMetrics(app, NativeWindowSizeTest.renderScale);
+            NativeWindowSizeTest.renderCalls = NativeWindowSizeTest.renderCalls + 1;
+        });
+
+        List<int> sequence = new List<int>();
+        sequence.Add(144);
+        sequence.Add(168);
+        sequence.Add(216);
+        sequence.Add(144);
+        for (int i = 0; i < sequence.Count; i = i + 1) {
+            int dpi = sequence[i];
+            int percent = dpi * 100 / 96;
+            NativeWindowSizeTest.ChangeDpi(mainStage, dpi, 900, 700);
+            Check("main stage width preserved", mainStage.ClientWidth() == 400);
+            Check("main stage content preserved", mainStage.ClientHeight() == 300 + 32 * percent / 100);
+            CheckMainStageMinimum(mainStage);
+            NativeWindowSizeTest.renderScale = percent;
+            int rendered = NativeWindowSizeTest.renderCalls;
+            // 接口数据协议与执行契约。
+            NativeWindowSizeTest.SendMessageW(app.WindowHandle(), 0x0231, 0, 0);
+            NativeWindowSizeTest.ChangeDpi(app.window, dpi,
+                320 * percent / 100, 240 * percent / 100);
+            NativeWindowSizeTest.SendMessageW(app.WindowHandle(), 0x0232, 0, 0);
+            Check("modal frame rendered", NativeWindowSizeTest.renderCalls > rendered);
+            Check("modal frame metric assertions", app.FrameErrorCount() == 0);
+            CheckMetrics(app, percent);
+            Pump(app);
+            Check("suggested RECT width", app.ClientWidth() == 320 * percent / 100);
+            Check("suggested RECT height", app.ClientHeight() == 240 * percent / 100);
+            CheckPosition(app.window);
+            Check("window DPI stored", Win32Shell.WindowDpi(app.WindowHandle()) == dpi);
+            peer.SyncSurface();
+            CheckMetrics(peer, 175);
+            Check("peer viewport isolated", peer.ClientWidth() == peerW && peer.ClientHeight() == peerH);
+            Check("peer raw DPI isolated", Win32Shell.WindowDpi(peer.WindowHandle()) == 168);
+            app.SetClientSize(323, 241);
+            app.SyncSurface();
+            Check("logical resize at updated DPI", app.ClientWidth() == app.Scale(323)
+                && app.ClientHeight() == app.Scale(241));
+        }
+
+        int sameW = app.ClientWidth();
+        int sameH = app.ClientHeight();
+        Canvas sameCanvas = app.canvas;
+        NativeWindowSizeTest.renderScale = 175;
+        NativeWindowSizeTest.ChangeDpi(app.window, 168, sameW, sameH);
+        Pump(app);
+        Check("same size keeps surface", app.canvas == sameCanvas);
+        CheckMetrics(app, 175);
+        // 接口数据协议与执行契约。
+        NativeWindowSizeTest.renderScale = 225;
+        NativeWindowSizeTest.ChangeDpi(app.window, 216, sameW, sameH);
+        app.BeginFrame();
+        CheckMetrics(app, 225);
+        app.PresentFrame();
+
+        // 接口数据协议与执行契约。
+        NativeWindowSizeTest.renderScale = 137;
+        NativeWindowSizeTest.ChangeDpi(app.window, 132, 438, 330);
+        Pump(app);
+        CheckMetrics(app, 137);
+        app.SetClientSize(320, 240);
+        app.SyncSurface();
+        Check("fractional DPI common width", app.ClientWidth() == 438 && app.Scale(320) == 438);
+        Check("fractional DPI common height", app.ClientHeight() == 328 && app.Scale(240) == 328);
+        CheckMetrics(peer, 175);
+
+        App stage = new App("Physical DPI updates", 400, 300, true);
+        stage.Show();
+        stage.SetWindowPos(40, 40);
+        for (int i = 0; i < sequence.Count; i = i + 1) {
+            int dpi = sequence[i];
+            int percent = dpi * 100 / 96;
+            NativeWindowSizeTest.ChangeDpi(stage.window, dpi, 900, 700);
+            Pump(stage);
+            CheckMetrics(stage, percent);
+            Check("physical stage width preserved", stage.ClientWidth() == 400);
+            Check("physical stage content preserved", stage.ClientHeight() - stage.ContentTop() == 300);
+            Check("physical stage native size", stage.window.ClientHeight() == 300 + 32 * percent / 100);
+            CheckMetrics(peer, 175);
+        }
+        stage.window.Destroy();
+        stage.canvas.Destroy();
+        peer.window.Destroy();
+        peer.canvas.Destroy();
+        app.window.Destroy();
+        app.canvas.Destroy();
+    }
+    #endif
+
+    static void Main() {
+        #if WINDOWS
+        // 接口数据协议与执行契约。
+        Window mainStage = Window.CreatePhysical("Main stage DPI", 400, 300);
+        Check("main stage created", mainStage.GetHandle() != 0);
+        Check("main stage width", mainStage.ClientWidth() == 400);
+        Check("main stage height", mainStage.ClientHeight() == 300 + mainStage.GetTitlebarHeight());
+        CheckMainStageMinimum(mainStage);
+        Window window = new Window("Client size", 240, 160);
+        Check("created", window.GetHandle() != 0);
+        int percent = window.GetDpiScale();
+        Check("logical create width", window.ClientWidth() == 240 * percent / 100);
+        Check("logical create height", window.ClientHeight() == 160 * percent / 100);
+        window.SetClientSize(320, 240);
+        Check("logical resize width", window.ClientWidth() == 320 * percent / 100);
+        Check("logical resize height", window.ClientHeight() == 240 * percent / 100);
+        window.SetClientSizeDev(481, 361);
+        Check("device resize width", window.ClientWidth() == 481);
+        Check("device resize height", window.ClientHeight() == 361);
+
+        Window stage = Window.CreatePhysical("Stage size", 400, 300);
+        Check("stage created", stage.GetHandle() != 0);
+        Check("stage width", stage.ClientWidth() == 400);
+        Check("stage height", stage.ClientHeight() == 300 + stage.GetTitlebarHeight());
+        stage.Destroy();
+        NativeWindowSizeTest.CheckDpiUpdates(mainStage);
+        window.Destroy();
+        mainStage.Destroy();
+        #endif
+        Console.WriteLine("NATIVE_WINDOW_SIZE_OK");
+    }
+}

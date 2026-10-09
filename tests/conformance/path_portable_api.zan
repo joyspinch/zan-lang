@@ -1,0 +1,100 @@
+using System;
+using System.IO;
+using System.Text;
+
+class Program {
+    static void Check(string name, bool ok) {
+        Console.WriteLine(name + "=" + Convert.ToString(ok ? 1 : 0));
+    }
+
+    static void Main() {
+        string sep = Path.Separator();
+        string cwd = Directory.GetCurrentDirectory();
+        string basePath = Path.GetFullPath(".");
+        Check("cwd", basePath == cwd);
+        Check("rooted", Path.IsPathRooted(basePath) && !Path.IsPathRooted("relative")
+            && !Path.IsPathRooted("") && !Path.IsPathRooted(null));
+        Check("combine-empty", Path.Combine("", "a") == "a"
+            && Path.Combine("a", "") == "a" && Path.Combine("", "") == "");
+        Check("combine-boundary", Path.Combine("a" + sep, "b") == "a" + sep + "b"
+            && Path.Combine("a", "b") == "a" + sep + "b");
+        Check("combine-absolute", Path.Combine("ignored", basePath) == basePath);
+        string child = "zan_path_missing_" + Convert.ToString(Environment.ProcessId);
+        string expected = Path.Combine(basePath, child + sep + "目录.txt");
+        Check("full-nonexistent", Path.GetFullPath(child + sep + "sub" + sep + ".."
+            + sep + "." + sep + "目录.txt") == expected && !File.Exists(expected));
+        Check("full-idempotent", Path.GetFullPath(expected) == expected);
+        string root = "";
+        #if WINDOWS
+        root = basePath.Substring(0, 3);
+        Check("platform-rooted", Path.IsPathRooted("C:relative")
+            && Path.IsPathRooted("\\rooted") && Path.IsPathRooted("/rooted")
+            && Path.IsPathRooted("\\\\server\\share\\file"));
+        Check("platform-combine", Path.Combine("a/", "b") == "a/b"
+            && Path.Combine("a", "C:relative") == "C:relative");
+        Check("backslash", Path.GetFullPath(child + "\\..\\目录.txt")
+            == Path.Combine(basePath, "目录.txt"));
+        #else
+        root = "/";
+        Check("platform-rooted", Path.IsPathRooted("/rooted")
+            && !Path.IsPathRooted("C:relative") && !Path.IsPathRooted("\\rooted"));
+        Check("platform-combine", Path.Combine("a\\", "b") == "a\\/b"
+            && Path.Combine("a", "\\b") == "a/\\b");
+        Check("backslash", Path.GetFullPath(child + "/a\\b")
+            == Path.Combine(basePath, child + "/a\\b"));
+        #endif
+        #if WINDOWS
+        Check("filename-separator", Path.GetFileName("dir\\a.txt") == "a.txt"
+            && Path.GetDirectoryName("dir\\a.txt") == "dir");
+        #else
+        Check("filename-separator", Path.GetFileName("dir/a\\b.txt") == "a\\b.txt"
+            && Path.GetDirectoryName("dir/a\\b.txt") == "dir"
+            && Path.GetDirectoryName("a\\b.txt") == "");
+        #endif
+        Check("full-root", Path.GetFullPath(root + ".." + sep + ".." + sep) == root);
+        Check("full-trailing", Path.GetFullPath(child + sep).EndsWith(sep));
+        bool emptyRejected = false;
+        try { Path.GetFullPath(""); }
+        catch (ArgumentException ex) { emptyRejected = true; }
+        Check("full-empty-rejected", emptyRejected);
+        bool nulRejected = false;
+        try { Path.GetFullPath("a" + Encoding.Utf8FromCodePoint(0) + "b"); }
+        catch (ArgumentException ex) { nulRejected = true; }
+        Check("full-nul-rejected", nulRejected);
+
+        // Windows 的单次小缓冲必须扩容；目标不存在，不创建超长目录。
+        StringBuilder suffix = new StringBuilder();
+        for (int i = 0; i < 90; i = i + 1) { suffix.Append("segment" + sep); }
+        suffix.Append("终点.txt");
+        string longPath = Path.Combine(root, suffix.ToString());
+        Check("full-dynamic", Path.GetFullPath(longPath) == longPath);
+
+        #if WINDOWS
+        string envKey = "TMP";
+        string temp = Path.Combine(root, "zan_临时");
+        #else
+        string envKey = "TMPDIR";
+        string temp = "/zan_临时";
+        #endif
+        string oldTemp = Environment.GetEnvironmentVariable(envKey);
+        try {
+            Environment.SetEnvironmentVariable(envKey, temp);
+            Check("temp-unicode", Path.GetTempPath() == temp + sep);
+            Environment.SetEnvironmentVariable(envKey, temp + sep);
+            Check("temp-trailing", Path.GetTempPath() == temp + sep);
+            #if WINDOWS
+            // GetTempPathW 支持不存在的目录；长度不超过传统 MAX_PATH。
+            string expanded = root;
+            for (int i = 0; i < 31; i = i + 1) { expanded = expanded + "segment\\"; }
+            expanded = expanded + "临时abcdef";
+            Environment.SetEnvironmentVariable(envKey, expanded);
+            Check("temp-dynamic", Path.GetTempPath() == expanded + sep);
+            #else
+            Environment.SetEnvironmentVariable(envKey, null);
+            Check("temp-dynamic", Path.GetTempPath() == "/tmp/");
+            #endif
+        } finally {
+            Environment.SetEnvironmentVariable(envKey, oldTemp == "" ? null : oldTemp);
+        }
+    }
+}

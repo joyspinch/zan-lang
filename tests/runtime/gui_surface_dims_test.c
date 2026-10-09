@@ -1,10 +1,4 @@
-/* gui_surface_dims_test.c -- reproduces A4: zan_gui_create_surface must reject
- * non-positive or absurdly large dimensions instead of computing a
- * width*height that overflows int (and then malloc'ing the wrong size, or
- * aborting under the OOM policy), and must cope with a NULL pixel allocation.
- *
- * The existing gui_runtime_test covers the happy path; this one covers the
- * rejection path. */
+/* 底层系统交互与数据协议契约 */
 #include <stdint.h>
 #include <stdio.h>
 
@@ -42,13 +36,12 @@ static void test_negative_dims_rejected(void) {
 }
 
 static void test_oversize_dims_rejected(void) {
-    /* 100000 x 100000 = 10^10 pixels: overflows 32-bit int in width*height,
-     * and 40 GB of pixels is not a legitimate surface. Must be rejected. */
+    /* 底层系统交互与数据协议契约 */
     i64 s = zan_gui_create_surface(100000, 100000);
     EXPECT(s < 0, "create_surface(100000,100000) should fail (got %lld)", (long long)s);
     if (s >= 0) zan_gui_destroy_surface(s);
 
-    /* just over the 16384 cap on one axis */
+    /* 底层系统交互与数据协议契约 */
     s = zan_gui_create_surface(16385, 16);
     EXPECT(s < 0, "create_surface(16385,16) should fail (got %lld)", (long long)s);
     if (s >= 0) zan_gui_destroy_surface(s);

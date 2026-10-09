@@ -1,0 +1,102 @@
+using System;
+
+class PathError : Exception {
+    public PathError(string text) : base(text) { }
+}
+
+class FinallyPaths {
+    static int inner;
+    static int outer;
+    static int caught;
+    static int tail;
+
+    static void Check(bool ok) {
+        if (!ok) { throw new Exception("shared finally paths"); }
+    }
+
+    static async int Step(int value, bool slow) {
+        if (slow) { await Task.Yield(); }
+        return value;
+    }
+
+    static async string Returns(int mode, bool slow) {
+        string seed = "seed-" + Convert.ToString(mode);
+        try {
+            try {
+                if (mode == 0) { return seed; }
+                if (mode == 1) { return "one-" + Convert.ToString(await Step(mode, slow)); }
+                if (mode == 2) { throw new PathError("caught-2"); }
+                await Step(mode, slow);
+            } catch (PathError error) {
+                Check(error.Message == "caught-2");
+                await Task.Yield();
+                caught = caught + 1;
+                return error.Message;
+            } finally {
+                int value = await Step(mode + 10, slow);
+                Check(value == mode + 10);
+                await Task.Yield();
+                Check(seed == "seed-" + Convert.ToString(mode));
+                inner = inner + 1;
+            }
+            return "tail-" + Convert.ToString(mode);
+        } finally {
+            await Task.Yield();
+            outer = outer + 1;
+        }
+    }
+
+    static async int Loop(bool slow) {
+        int sum = 0;
+        for (int i = 0; i < 5; i = i + 1) {
+            try {
+                if (i == 1) { continue; }
+                if (i == 4) { break; }
+                sum = sum + await Step(i, slow);
+            } finally {
+                await Step(i, slow);
+                tail = tail + 1;
+            }
+        }
+        return sum;
+    }
+
+    static async int Unwind(bool slow) {
+        try {
+            try {
+                throw new PathError("original");
+            } finally {
+                await Step(1, slow);
+                try {
+                    throw new PathError("handled");
+                } catch (PathError error) {
+                    Check(error.Message == "handled");
+                    await Task.Yield();
+                }
+                inner = inner + 1;
+            }
+        } finally {
+            await Task.Yield();
+            outer = outer + 1;
+        }
+    }
+
+    static async void Main() {
+        for (int pass = 0; pass < 2; pass = pass + 1) {
+            bool slow = pass == 1;
+            Check(await Returns(0, slow) == "seed-0");
+            Check(await Returns(1, slow) == "one-1");
+            Check(await Returns(2, slow) == "caught-2");
+            Check(await Returns(3, slow) == "tail-3");
+            Check(await Loop(slow) == 5);
+            try {
+                await Unwind(slow);
+                Check(false);
+            } catch (PathError error) {
+                Check(error.Message == "original");
+            }
+        }
+        Check(inner == 10 && outer == 10 && caught == 2 && tail == 10);
+        Console.WriteLine("shared finally paths ok");
+    }
+}

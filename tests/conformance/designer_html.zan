@@ -26,13 +26,18 @@ class DesignerHtmlTest {
             + "' want '" + want + "'");
     }
 
-    /// 递归逐键比较（对象按插入序、数组按序、标量比 JSON 文本）。
+    /// 递归逐键比较：对象键集合完整一致、数组按序、标量保留类型。
     static void Cmp(JsonValue a, JsonValue b, string path) {
         if (a == null || b == null) {
             if (a != b) {
                 Console.WriteLine("DIFF null " + path);
                 fails = fails + 1;
             }
+            return;
+        }
+        // 根的文档序必须精确保留，不能把字符串 "0" 当作子节点索引 0。
+        if (path == ".bodyContent") {
+            Eq("bodyContent", b.ToJson(), a.ToJson());
             return;
         }
         if (a.IsObject() && b.IsObject()) {
@@ -58,14 +63,45 @@ class DesignerHtmlTest {
             }
             return;
         }
-        string sa = a.IsNumber() ? a.ToJson() : a.AsString("");
-        string sb = b == null ? "<missing>"
-            : (b.IsNumber() ? b.ToJson() : b.AsString(""));
+        string sa = a.ToJson();
+        string sb = b.ToJson();
+        // 原生 min/max/step 属性以字符串读回，保留原有数字文本兼容；
+        // bool/null/容器不能再与同文字符串或空串混为一谈。
+        if ((a.IsNumber() && b.IsString()) || (a.IsString() && b.IsNumber())) {
+            sa = a.AsString("");
+            sb = b.AsString("");
+        }
         if (sa != sb) {
             Console.WriteLine("DIFF val " + path + " '" + sa
                 + "' vs '" + sb + "'");
             fails = fails + 1;
         }
+    }
+
+    /// 旧 JSON 缺 HTML 根身份是合法输入；仅在预期根补自然子节点序。
+    /// 不补实际输出或子字段，缺键、多键、错误值仍必须失败。
+    static JsonValue WithBodyOrder(JsonValue doc) {
+        if (doc == null || !doc.IsObject() || doc.Has("bodyContent")) { return doc; }
+        JsonValue normalized = doc.Clone();
+        JsonValue order = JsonValue.NewArray();
+        JsonValue fields = doc.Get("fields");
+        if (fields != null && fields.IsArray()) {
+            for (int i = 0; i < fields.Count(); i = i + 1) {
+                order.Append(JsonValue.NewInt(i));
+            }
+        }
+        normalized.Set("bodyContent", order);
+        return normalized;
+    }
+
+    static void CmpRoundTrip(string json, string back, string label) {
+        JsonValue actual = JsonValue.ParseLenient(back);
+        Cmp(WithBodyOrder(JsonValue.ParseLenient(json)), actual, "");
+        // 首次导入可以增加根身份；从此 JSON 与规范 HTML 都须收敛。
+        string canonicalHtml = DesignerHtml.FromJsonDoc(back);
+        string next = DesignerHtml.ToJsonDoc(canonicalHtml);
+        Cmp(actual, JsonValue.ParseLenient(next), "");
+        Eq(label + " fixedpoint", DesignerHtml.FromJsonDoc(next), canonicalHtml);
     }
 
     /// 在字段树里按 name 找 styleText（找不到返回 "<none>"）。
@@ -105,7 +141,7 @@ class DesignerHtmlTest {
             + "}\n";
         string html = DesignerHtml.FromJsonDoc(json);
         string back = DesignerHtml.ToJsonDoc(html);
-        Cmp(JsonValue.ParseLenient(json), JsonValue.ParseLenient(back), "");
+        CmpRoundTrip(json, back, "document");
         // style 键走元素 style 属性（不是 data-* 通道）。
         Eq("style attr", html.Contains("style=\"padding:8px; background:#101418\"")
             ? "1" : "0", "1");
@@ -133,9 +169,13 @@ class DesignerHtmlTest {
         Eq("snap back",
             DesignerHtml.ToJsonDoc(snapHtml).Contains("\"layoutMode\": 0")
                 ? "1" : "0", "1");
+        // 空 body 也必须显式保留 [] 根身份，不可因 fields 为空省略。
+        CmpRoundTrip(snapJson, DesignerHtml.ToJsonDoc(snapHtml), "empty document");
+        CmpRoundTrip("{\"fields\":[]}",
+            DesignerHtml.ToJsonDoc("<body data-zan-design></body>"), "empty body");
 
         // ---- 1b. 动态原语往返（P8）---------------------------------------
-        // <template data-for> 与 data-if 字段的全键往返："tag"/"for"/"if"
+        // 系统底层交互与数据流转契约
         // 都不在建模键名单里，靠元素名与 data-* 属性原样透传；读端
         // template → Element 由标签名兜底（data-kind 缺失也成立）。
         string dynJson = "{\n"
@@ -154,7 +194,7 @@ class DesignerHtmlTest {
             + "}\n";
         string dynHtml = DesignerHtml.FromJsonDoc(dynJson);
         string dynBack = DesignerHtml.ToJsonDoc(dynHtml);
-        Cmp(JsonValue.ParseLenient(dynJson), JsonValue.ParseLenient(dynBack), "");
+        CmpRoundTrip(dynJson, dynBack, "dynamic");
         Eq("tpl element", dynHtml.Contains("<template") ? "1" : "0", "1");
         Eq("tpl for", dynHtml.Contains("data-for=\"items\"") ? "1" : "0", "1");
         Eq("tpl if", dynHtml.Contains("data-if=\"showTitle\"") ? "1" : "0", "1");
@@ -169,7 +209,7 @@ class DesignerHtmlTest {
 
         // ---- 1c. 原生 HTML 语义 ------------------------------------------
         // 手写真 HTML（无任何 data-* 建模属性）也能等价导入：
-        // <img src/alt>、input/textarea 的 placeholder/value、
+        // 系统底层交互与数据流转契约
         // button/label/textarea 的文本内容；导出侧对称回写原生形态。
         string natHtml = "<body data-zan-design>"
             + "<button class=\"primary\" data-fx=\"8\" data-fy=\"8\""
@@ -198,7 +238,7 @@ class DesignerHtmlTest {
         Eq("nat textarea text", natBack.Contains("\"text\": \"hello\"")
             ? "1" : "0", "1");
         // 导出侧：text/src/alt/placeholder/value 回写为原生形态，
-        // 且模型级往返等价（text 不再走 data-text、src 不再走 data-src）。
+        // 系统底层交互与数据流转契约
         string natJson = "{\n"
             + "  \"name\": \"NatDoc\",\n"
             + "  \"fields\": [\n"
@@ -208,8 +248,7 @@ class DesignerHtmlTest {
             + "  ]\n"
             + "}\n";
         string natHtml2 = DesignerHtml.FromJsonDoc(natJson);
-        Cmp(JsonValue.ParseLenient(natJson),
-            JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(natHtml2)), "");
+        CmpRoundTrip(natJson, DesignerHtml.ToJsonDoc(natHtml2), "native");
         Eq("nat exp btn", natHtml2.Contains(">点我</button>") ? "1" : "0", "1");
         Eq("nat exp btn nodatatext", natHtml2.Contains("data-text")
             ? "1" : "0", "0");
@@ -220,7 +259,7 @@ class DesignerHtmlTest {
             ? "1" : "0", "1");
 
         // ---- 1d. 原生表单族语义 ------------------------------------------
-        // <hr>、<progress value/max>、<select><option>、<input type=…>
+        // 核心契约与语义定义。
         // 一族、<p> 段落——手写无 data-* 也等价导入。
         string fmHtml = "<body data-zan-design>"
             + "<hr data-fx=\"8\" data-fy=\"8\" data-fw=\"200\" data-fh=\"16\""
@@ -309,8 +348,7 @@ class DesignerHtmlTest {
             + "  ]\n"
             + "}\n";
         string fmHtml2 = DesignerHtml.FromJsonDoc(fmJson);
-        Cmp(JsonValue.ParseLenient(fmJson),
-            JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(fmHtml2)), "");
+        CmpRoundTrip(fmJson, DesignerHtml.ToJsonDoc(fmHtml2), "form widgets");
         Eq("fm exp hr", fmHtml2.Contains("<hr") ? "1" : "0", "1");
         Eq("fm exp progress", fmHtml2.Contains("value=\"72\" max=\"100\"")
             ? "1" : "0", "1");
@@ -351,8 +389,7 @@ class DesignerHtmlTest {
             + "  ]\n"
             + "}\n";
         string ceHtml2 = DesignerHtml.FromJsonDoc(ceJson);
-        Cmp(JsonValue.ParseLenient(ceJson),
-            JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(ceHtml2)), "");
+        CmpRoundTrip(ceJson, DesignerHtml.ToJsonDoc(ceHtml2), "custom elements");
         Eq("ce exp avatar", ceHtml2.Contains("<zan-avatar")
             && !ceHtml2.Contains("data-kind=\"Avatar\"") ? "1" : "0", "1");
         Eq("ce exp panel bare", ceHtml2.Contains("<div id=\"Shell\"")

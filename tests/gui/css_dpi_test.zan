@@ -1,0 +1,245 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class CssDpiTest {
+    static void Eq(string label, int actual, int expected) {
+        if (actual == expected) { return; }
+        Console.WriteLine("FAIL " + label + " actual=" + Convert.ToString(actual)
+            + " expected=" + Convert.ToString(expected));
+        throw new Exception("CSS DPI: " + label);
+    }
+
+    static void Check(string label, bool ok) {
+        if (ok) { return; }
+        Console.WriteLine("FAIL " + label);
+        throw new Exception("CSS DPI: " + label);
+    }
+
+    static StyleBox Resolve(App app, string css) {
+        StyleBox b = new StyleBox();
+        Style.UnitEnvironment(app, b);
+        List<CssVarDecl> vars = Css.CollectVarDecls(Style.RootFromTheme(app.theme));
+        StyleSheet sheet = Css.ParseWith(css, vars);
+        sheet.ApplyBox(b, "box");
+        Style.ScaleLayout(app, b);
+        return b;
+    }
+
+    static void EqualDefaults(App app) {
+        app.UseAppCss("");
+        StyleBox baseline = Style.Of(app, "button", "small", Style.SNormal());
+        Check("resolved small baseline dpi=" + Convert.ToString(app.dpiScale)
+            + " font=" + Convert.ToString(baseline.fontPx)
+            + " height=" + Convert.ToString(baseline.height),
+            baseline.fontPx > 0 && baseline.height > 0);
+        int font = baseline.fontPx;
+        int height = baseline.height;
+        app.UseAppCss("button.small { font-size:" + Convert.ToString(font) + "px; height:"
+            + Convert.ToString(height) + "px; line-height:29px; letter-spacing:3px; border:2px solid red; }");
+        StyleBox b = Style.Of(app, "button", "small", Style.SNormal());
+        Eq("literal equal to resolved font", b.fontPx, app.Scale(font));
+        Eq("literal equal to resolved height", b.height, app.Scale(height));
+        Eq("absolute line-height", b.lineHeight, app.Scale(29));
+        Eq("letter-spacing", b.letterSpacing, app.Scale(3));
+        Eq("uniform border", b.borderW, app.Scale(2));
+        StyleBox hit = Style.Of(app, "button", "small", Style.SNormal());
+        Eq("cache font", hit.fontPx, b.fontPx);
+        Eq("cache height", hit.height, b.height);
+        Style.ScaleLayout(app, hit);
+        Eq("normalization is idempotent", hit.fontPx, b.fontPx);
+
+        StyleBox defaults = new StyleBox();
+        Style.Defaults(app, defaults, "button", "small", Style.SNormal());
+        int defaultFont = defaults.fontPx;
+        int defaultHeight = defaults.height;
+        Check("small Defaults dpi=" + Convert.ToString(app.dpiScale)
+            + " font=" + Convert.ToString(defaultFont)
+            + " height=" + Convert.ToString(defaultHeight),
+            defaultFont > 0 && defaultHeight > 0);
+        int defaultPad = defaults.padL;
+        int defaultRadius = defaults.radius;
+        Style.ScaleLayout(app, defaults);
+        Eq("untouched Defaults font", defaults.fontPx, defaultFont);
+        Eq("untouched Defaults height", defaults.height, defaultHeight);
+        Eq("untouched Defaults padding", defaults.padL, defaultPad);
+        Eq("untouched Defaults radius", defaults.radius, defaultRadius);
+        StyleBox same = new StyleBox();
+        Style.Defaults(app, same, "button", "small", Style.SNormal());
+        Css.Parse("box { font-size:" + Convert.ToString(defaultFont) + "px; height:"
+            + Convert.ToString(defaultHeight) + "px; }").ApplyBox(same, "box");
+        Style.ScaleLayout(app, same);
+        Eq("literal equal to actual Defaults font", same.fontPx, app.Scale(defaultFont));
+        Eq("literal equal to actual Defaults height", same.height, app.Scale(defaultHeight));
+    }
+
+    static void TokensAndImportance(App app) {
+        StyleBox b = CssDpiTest.Resolve(app,
+            "box { font-size:var(--font-size-medium); height:var(--height-small);"
+            + " width:var(--height-large); min-width:7px; padding:var(--padding-small) 3px;"
+            + " margin-left:5px; gap:var(--gap-small) 4px; border-radius:var(--radius-small) 4px; }");
+        Eq("font token", b.fontPx, app.theme.fontSizeMedium);
+        Eq("height token", b.height, app.theme.heightSmall);
+        Eq("width token independent of min-width", b.width, app.theme.heightLarge);
+        Eq("literal min-width", b.minW, app.Scale(7));
+        Eq("padding token component", b.padT, app.theme.paddingSmall);
+        Eq("literal padding component", b.padL, app.Scale(3));
+        Eq("margin independent of padding", b.marL, app.Scale(5));
+        Eq("row gap token", b.rowGap, app.theme.gapSmall);
+        Eq("column gap literal", b.colGap, app.Scale(4));
+        Eq("radius token component", b.radiusTL, app.theme.borderRadiusSmall);
+        Eq("radius literal component", b.radiusTR, app.Scale(4));
+        StyleBox reverse = CssDpiTest.Resolve(app,
+            "box { min-width:7px; width:var(--height-large); margin-left:5px;"
+            + " padding:var(--padding-small) 3px; }");
+        Eq("reverse width", reverse.width, b.width);
+        Eq("reverse min-width", reverse.minW, b.minW);
+        Eq("reverse margin", reverse.marL, b.marL);
+        StyleBox local = CssDpiTest.Resolve(app,
+            ":root { --height-small:17; --padding-small:9; --gap-small:5; --radius-small:7; }"
+            + " box { height:var(--height-small); padding:var(--padding-small);"
+            + " gap:var(--gap-small); radius:var(--radius-small); }");
+        Eq("local height token stays logical", local.height, app.Scale(17));
+        Eq("local padding token stays logical", local.padL, app.Scale(9));
+        Eq("local gap token stays logical", local.gap, app.Scale(5));
+        Eq("local radius token stays logical", local.radius, app.Scale(7));
+        StyleBox singleGap = CssDpiTest.Resolve(app, "box { gap:12px; }");
+        Eq("single gap leaves row fallback", singleGap.rowGap, StyleBox.Unset());
+        Eq("single gap leaves column fallback", singleGap.colGap, StyleBox.Unset());
+        Eq("single gap row consumption", singleGap.RowGapOr(0), app.Scale(12));
+        Eq("single gap column consumption", singleGap.ColGapOr(0), app.Scale(12));
+        StyleBox important = CssDpiTest.Resolve(app,
+            "box { height:var(--height-small) !important; height:7px; }"
+            + " box { height:9px; font-size:13px !important; }"
+            + " box { font-size:var(--font-size-medium); }");
+        Eq("important token keeps origin across normal merge", important.height, app.theme.heightSmall);
+        Eq("important literal keeps origin across token merge", important.fontPx, app.Scale(13));
+        StyleBox alias = CssDpiTest.Resolve(app,
+            ":root { --alias:var(--height-small); } box { height:var(--alias);"
+            + " width:calc(var(--height-small) + 3px); }");
+        Eq("alias keeps physical origin", alias.height, app.theme.heightSmall);
+        Eq("mixed token calc", alias.width, app.theme.heightSmall + app.Scale(3));
+    }
+
+    static void UnitsAndPaint(App app) {
+        StyleBox b = CssDpiTest.Resolve(app,
+            "box { font-size:20px; width:2em; height:2rem; line-height:150%;"
+            + " letter-spacing:0.5em; border-left:3px solid red; border-top:2px solid red;"
+            + " position:relative; inset:8px 6px; transform:translate(4px,-8px);"
+            + " margin:auto; box-shadow:2px 3px 8px red; backdrop-filter:blur(9px);"
+            + " text-shadow:1px 2px red; }");
+        Eq("em basis", b.width, app.Scale(20) * 2);
+        Eq("rem basis", b.height, app.theme.fontSizeMedium * 2);
+        Eq("relative line-height stays multiplier", b.lineHeight, 1500);
+        Eq("relative line-height consumption", b.LineHeightPx(b.fontPx), b.fontPx * 1500 / 1000);
+        Eq("font-relative spacing", b.letterSpacing, StyleSheet.Round1000(b.fontPx * 500));
+        Eq("left border", b.borderLeftW, app.Scale(3));
+        Eq("top border", b.borderTopW, app.Scale(2));
+        Eq("inset top", b.posT, app.Scale(8));
+        Eq("inset left", b.posL, app.Scale(6));
+        Eq("translate x", b.tx, app.Scale(4));
+        Eq("negative translate y", b.ty, app.Scale(0 - 8));
+        Eq("auto margin sentinel", b.marL, StyleBox.Unset());
+        Eq("shadow remains logical", b.shadowDy, 3);
+        Eq("shadow scales during paint", b.PaintLength(app, b.shadowDy, StyleBox.SourceShadowDy()), app.Scale(3));
+        Eq("blur remains logical", b.blur, 9);
+        Eq("blur scales during paint", b.PaintLength(app, b.blur, StyleBox.SourceBlur()), app.Scale(9));
+        Eq("text-shadow keeps device x", b.tsDx, 1);
+        Eq("text-shadow keeps device y", b.tsDy, 2);
+        StyleBox pct = CssDpiTest.Resolve(app, "box { width:50%; height:25%; flex-basis:40%; line-height:1.5; }");
+        Eq("percentage width", pct.widthPm, 500);
+        Eq("percentage height", pct.heightPm, 250);
+        Eq("percentage basis", pct.basisPm, 400);
+        Eq("unitless line-height", pct.lineHeight, 1500);
+        StyleBox mixed = CssDpiTest.Resolve(app,
+            "box { font-size:20px; width:calc(2em + 3px); height:calc(3px * 2); }");
+        Eq("mixed em and px expression", mixed.width, app.Scale(20) * 2 + app.Scale(3));
+        Eq("dimensionless multiply factor", mixed.height, app.Scale(3) * 2);
+        StyleBox clone = b.Clone();
+        Eq("clone text fallback environment", clone.envRemPx, b.envRemPx);
+        Eq("clone rem unit environment", clone.envRootFontPx, b.envRootFontPx);
+        Eq("clone DPI environment", clone.envDpiScale, app.dpiScale);
+        Check("clone high source bits", clone.IsPrescaled(StyleBox.SourceTx())
+            && clone.IsPrescaled(StyleBox.SourceBorderLeft()));
+    }
+
+    static void Inline(App app) {
+        app.UseAppCss(".inline-probe { display:block; box-sizing:border-box; font-size:18px;"
+            + " line-height:23px; letter-spacing:1px; width:60px; height:45px;"
+            + " padding:2px; gap:3px; margin:0; radius:2px; border:1px solid blue;"
+            + " color:blue; background:blue; box-shadow:none; transition:0ms; }"
+            + " .inline-host { display:block; width:auto; height:auto; padding:0;"
+            + " margin:0; border:0; gap:0; }");
+        Control c = Panel.Row();
+        c.Class = "inline-probe";
+        StyleBox baseline = c.ResolveStyle(app, Style.SNormal());
+        c.SetProp("style", "font-size:2em; line-height:29px; letter-spacing:3px;"
+            + " border:2px solid red; radius:4px; width:40px; height:30px; padding:5px; gap:6px;"
+            + " color:red; background:linear-gradient(red,yellow);"
+            + " box-shadow:2px 3px 8px red; transition:17ms;");
+        Check("inline invalidates computed style", c.computedStyle == null);
+        StyleBox b = c.ResolveStyle(app, Style.SNormal());
+        Eq("inline em uses actual resolved font", b.fontPx, baseline.fontPx * 2);
+        Eq("inline line-height", b.lineHeight, app.Scale(29));
+        Eq("inline letter-spacing", b.letterSpacing, app.Scale(3));
+        Eq("inline border", b.borderW, app.Scale(2));
+        Eq("inline radius", b.radius, app.Scale(4));
+        Eq("inline width", b.width, app.Scale(40));
+        Eq("inline height", b.height, app.Scale(30));
+        Eq("inline padding", b.padL, app.Scale(5));
+        Eq("inline gap", b.gap, app.Scale(6));
+
+        Element host = new Element();
+        host.InitElement("div", "css-dpi-inline-host");
+        host.Class = "inline-host";
+        host.AddKid(c);
+        host.MeasureTree(app);
+        Eq("inline measured host width", host.prefW, app.Scale(40));
+        Eq("inline measured host height", host.prefH, app.Scale(30));
+
+        c.SetProp("style", "width:44px; height:32px;");
+        StyleBox replaced = c.ResolveStyle(app, Style.SNormal());
+        Eq("inline replacement restores font", replaced.fontPx, baseline.fontPx);
+        Eq("inline replacement restores line-height", replaced.lineHeight, baseline.lineHeight);
+        Eq("inline replacement restores spacing", replaced.letterSpacing, baseline.letterSpacing);
+        Eq("inline replacement restores radius", replaced.radius, baseline.radius);
+        Eq("inline replacement restores border", replaced.borderW, baseline.borderW);
+        Eq("inline replacement restores border color", replaced.borderColor, baseline.borderColor);
+        Eq("inline replacement restores color", replaced.fg, baseline.fg);
+        Eq("inline replacement restores background", replaced.bg, baseline.bg);
+        Eq("inline replacement restores gradient end", replaced.bgTo, baseline.bgTo);
+        Eq("inline replacement restores shadow", replaced.shadow, baseline.shadow);
+        Eq("inline replacement restores transition", replaced.transitionMs, baseline.transitionMs);
+        Eq("inline replacement restores padding", replaced.padL, baseline.padL);
+        Eq("inline replacement restores gap", replaced.gap, baseline.gap);
+        host.MeasureTree(app);
+        Eq("inline replacement measured width", host.prefW, app.Scale(44));
+        Eq("inline replacement measured height", host.prefH, app.Scale(32));
+
+        c.SetProp("style", "");
+        StyleBox cleared = c.ResolveStyle(app, Style.SNormal());
+        Eq("inline clear restores font", cleared.fontPx, baseline.fontPx);
+        Eq("inline clear restores radius", cleared.radius, baseline.radius);
+        Eq("inline clear restores border", cleared.borderW, baseline.borderW);
+        Eq("inline clear restores color", cleared.fg, baseline.fg);
+        Eq("inline clear restores background", cleared.bg, baseline.bg);
+        Eq("inline clear restores width", cleared.width, baseline.width);
+        Eq("inline clear restores height", cleared.height, baseline.height);
+        host.MeasureTree(app);
+        Eq("inline clear measured width", host.prefW, baseline.width);
+        Eq("inline clear measured height", host.prefH, baseline.height);
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("CSS DPI", 320, 240);
+        for (int dpi = 100; dpi <= 300; dpi = dpi + 25) {
+            app.SetOffscreenViewport(320, 240, dpi);
+            CssDpiTest.EqualDefaults(app);
+            CssDpiTest.TokensAndImportance(app);
+            CssDpiTest.UnitsAndPaint(app);
+            CssDpiTest.Inline(app);
+        }
+        app.canvas.Destroy();
+        Console.WriteLine("CSS_DPI_OK");
+    }
+}

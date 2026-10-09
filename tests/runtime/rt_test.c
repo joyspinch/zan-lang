@@ -1,21 +1,4 @@
-/* rt_test.c -- cross-platform unit tests for the Zan async runtime.
- *
- * Exercises the coroutine scheduler (rt_sched) and the async-IO abstraction
- * (rt_io: epoll on Linux, kqueue on macOS, IOCP on Windows, select fallback)
- * without any dependency on LLVM or the compiler, so it builds and runs fast
- * on every platform's CI runner.
- *
- * Build (POSIX):
- *   cc -O2 -Wall -Wextra -I. tests/runtime/rt_test.c \
- *        src/runtime/rt_sched.c src/runtime/rt_io.c src/runtime/rt_co.c \
- *        -o rt_test -lpthread
- * Build (Windows, MinGW):
- *   gcc -O2 -Wall -Wextra -I. tests/runtime/rt_test.c \
- *        src/runtime/rt_sched.c src/runtime/rt_io.c src/runtime/rt_co.c \
- *        -o rt_test.exe -lws2_32 -lmswsock
- *
- * Exit code 0 = all checks passed, non-zero = at least one failure.
- */
+/* 底层系统交互与数据协议契约 */
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0601
@@ -64,7 +47,7 @@
   typedef pthread_t thread_t;
 #endif
 
-/* ================= tiny assertion framework ================= */
+/* 核心系统底层抽象与内存语义契约 */
 
 static int g_checks = 0;
 static int g_fails  = 0;
@@ -82,7 +65,7 @@ static int g_fails  = 0;
 
 static void banner(const char *name) { printf("[test] %s\n", name); }
 
-/* ================= portable helpers ================= */
+/* 核心系统底层抽象与内存语义契约 */
 
 static int64_t now_ms(void) {
 #if defined(_WIN32)
@@ -109,7 +92,7 @@ static sock_t make_listener(int port) {
     return s;
 }
 
-/* ================= threaded echo server ================= */
+/* 核心系统底层抽象与内存语义契约 */
 
 static sock_t g_listen = BAD_SOCK;
 
@@ -164,9 +147,9 @@ static void *server_thread(void *arg) {
     return 0;
 }
 
-/* ================= scheduler tests ================= */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* worker returns arg*arg after yielding a few times. */
+/* 底层系统交互与数据协议契约 */
 static void square_body(zan_task_t *t) {
     int64_t n = (int64_t)(intptr_t)zan_task_arg(t);
     for (int i = 0; i < 3; i++) zan_task_yield();
@@ -179,7 +162,7 @@ static void sched_main(zan_task_t *t) {
     zan_task_t *b = zan_spawn(square_body, (void *)(intptr_t)11);
     int64_t ra = zan_task_await(a);
     int64_t rb = zan_task_await(b);
-    /* result readable again after completion (before releasing the task) */
+    /* 底层系统交互与数据协议契约 */
     int64_t ra2 = zan_task_result(a);
     zan_task_release(a);
     zan_task_release(b);
@@ -198,7 +181,7 @@ static void test_scheduler(void) {
     CHECK(g_sched_ok == 1, "expected 7*7=49 and 11*11=121 from awaited coroutines");
 }
 
-/* ================= timer test ================= */
+/* 核心系统底层抽象与内存语义契约 */
 
 static int64_t g_delay_elapsed = -1;
 static void delay_body(zan_task_t *t) {
@@ -218,12 +201,12 @@ static void test_timer(void) {
     zan_task_release(main_task);
     CHECK(zan_task_live() == 0, "tasks leaked: %zu still tracked", zan_task_live());
     zan_sched_shutdown();
-    /* Allow slack for timer granularity/scheduling, but it must actually wait. */
+    /* 底层系统交互与数据协议契约 */
     CHECK(g_delay_elapsed >= 60, "delay(80ms) only waited %lldms", (long long)g_delay_elapsed);
     CHECK(g_delay_elapsed < 2000, "delay(80ms) took way too long: %lldms", (long long)g_delay_elapsed);
 }
 
-/* ================= async IO: single echo ================= */
+/* 核心系统底层抽象与内存语义契约 */
 
 static int64_t g_echo_bytes = -1;
 static void echo_body(zan_task_t *t) {
@@ -284,7 +267,7 @@ static void test_io_echo(int port) {
           (long long)g_echo_bytes);
 }
 
-/* ================= async IO: many concurrent connections ================= */
+/* 核心系统底层抽象与内存语义契约 */
 
 #define CONC_N 128
 static int g_conc_port = 0;
@@ -350,13 +333,13 @@ static void test_io_concurrent(int port) {
     CHECK(g_conc_ok == CONC_N, "only %d/%d concurrent connections echoed", g_conc_ok, CONC_N);
 }
 
-/* ================= async IO: connect refused (error path) ================= */
+/* 核心系统底层抽象与内存语义契约 */
 
 static int64_t g_refused_rc = 0;
 static void refused_body(zan_task_t *t) {
     sock_t s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == BAD_SOCK) { zan_task_return(t, 0); return; }
-    /* Port with nothing listening -> connect must fail, not hang. */
+    /* 底层系统交互与数据协议契约 */
     int64_t rc = zan_io_connect((int64_t)s, "127.0.0.1", (int)(intptr_t)zan_task_arg(t));
     closesock(s);
     g_refused_rc = rc;
@@ -376,26 +359,15 @@ static void test_connect_refused(int port) {
 
 /* ================= main ================= */
 
-/* ================= stackless-coroutine state-machine driver =================
- *
- * Hand-written frames + step functions that mirror EXACTLY what the compiler's
- * CPS lowering emits (see docs/ASYNC_CPS_DESIGN.md). This validates the rt_co
- * ready-queue and the await/complete handshake independently of codegen, so the
- * runtime ABI is proven before irgen targets it.
- *
- * Models:
- *   async int Add(int a, int b)  { return a + b; }              // no await
- *   async int Compute(int x)     { int r = await Add(x, x);     // chained
- *                                  return await Add(r, 100); }
- */
+/* 底层系统交互与数据协议契约 */
 
-/* Fixed frame header the await protocol relies on (offsets known to codegen). */
+/* 底层系统交互与数据协议契约 */
 typedef struct co_hdr {
-    int32_t       state;        /* 0 start, k resume point, -1 done */
-    int32_t       done;         /* 1 once result is valid */
-    void         *awaiter;      /* frame blocked on this one */
+    int32_t       state;        /* 核心系统底层抽象与内存语义契约 */
+    int32_t       done;         /* 核心系统底层抽象与内存语义契约 */
+    void         *awaiter;      /* 核心系统底层抽象与内存语义契约 */
     zan_co_step_t awaiter_step; /* awaiter's resume fn */
-    int64_t       result;       /* return value slot */
+    int64_t       result;       /* 核心系统底层抽象与内存语义契约 */
 } co_hdr_t;
 
 typedef struct { co_hdr_t h; int64_t a, b; } add_frame_t;
@@ -404,7 +376,7 @@ typedef struct { co_hdr_t h; int64_t x, r; void *sub; } compute_frame_t;
 static void add_resume(void *fp);
 static void compute_resume(void *fp);
 
-/* Complete `self`: publish result and re-schedule whoever awaited it. */
+/* 底层系统交互与数据协议契约 */
 static void co_complete(co_hdr_t *self, int64_t result) {
     self->result = result;
     self->done   = 1;
@@ -412,7 +384,7 @@ static void co_complete(co_hdr_t *self, int64_t result) {
     if (self->awaiter) zan_co_ready(self->awaiter, self->awaiter_step);
 }
 
-/* Ramp: allocate + init a frame, but do not run the body yet. */
+/* 底层系统交互与数据协议契约 */
 static void *add_ramp(int64_t a, int64_t b) {
     add_frame_t *f = (add_frame_t *)calloc(1, sizeof(*f));
     f->a = a; f->b = b;
@@ -438,7 +410,7 @@ static void compute_resume(void *fp) {
     compute_frame_t *f = (compute_frame_t *)fp;
     switch (f->h.state) {
     case 0: {
-        /* r = await Add(x, x); */
+        /* 核心系统底层抽象与内存语义契约 */
         void *sub = add_ramp(f->x, f->x);
         co_hdr_t *sh = (co_hdr_t *)sub;
         sh->awaiter = f; sh->awaiter_step = compute_resume;
@@ -451,7 +423,7 @@ static void compute_resume(void *fp) {
         add_frame_t *sub = (add_frame_t *)f->sub;
         f->r = sub->h.result;
         free(sub);
-        /* return await Add(r, 100); */
+        /* 核心系统底层抽象与内存语义契约 */
         void *sub2 = add_ramp(f->r, 100);
         co_hdr_t *sh = (co_hdr_t *)sub2;
         sh->awaiter = f; sh->awaiter_step = compute_resume;
@@ -485,14 +457,7 @@ static void test_co_statemachine(void) {
     free(root);
 }
 
-/* ===== stackless co + async IO =====
- *
- * Mirrors what the compiler's async lowering will emit for an `await` on a
- * socket read: the frame records its resume point and returns to the scheduler,
- * which blocks in the IO reactor (zan_io_pump) until the fd is ready and then
- * re-enters the state machine via zan_co_ready. Proves the reactor-to-CPS
- * bridge (zan_io_wait_co) on every platform's backend (epoll/kqueue/IOCP/select)
- * without any dependency on the stackful rt_sched fiber path. */
+/* 底层系统交互与数据协议契约 */
 
 static const char IO_CO_MSG[] = "hello-zan-async-io";
 
@@ -500,7 +465,7 @@ typedef struct {
     co_hdr_t h;
     sock_t   s;
     int      port;
-    int64_t  got;       /* bytes received so far (survives suspensions) */
+    int64_t  got;       /* 核心系统底层抽象与内存语义契约 */
     char     buf[64];
 } io_co_frame_t;
 
@@ -509,7 +474,7 @@ static void io_co_resume(void *fp) {
     int len = (int)strlen(IO_CO_MSG);
     switch (f->h.state) {
     case 0: {
-        /* connect (loopback, blocking) + send the request synchronously */
+        /* 底层系统交互与数据协议契约 */
         sock_t s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (s == BAD_SOCK) { co_complete(&f->h, -1); return; }
         struct sockaddr_in a;
@@ -528,21 +493,21 @@ static void io_co_resume(void *fp) {
         }
         zan_io_set_nonblocking((int64_t)s);
         f->s = s;
-        /* await socket-readable: register + SUSPEND (return to scheduler). */
+        /* 底层系统交互与数据协议契约 */
         f->h.state = 1;
         zan_io_wait_co((int64_t)s, ZAN_IO_READ, f, io_co_resume);
         return;
     }
     case 1: {
-        /* readable: read the echoed bytes; re-await if not all arrived yet. */
+        /* 底层系统交互与数据协议契约 */
         while (f->got < len) {
             int n = recv(f->s, f->buf + f->got, len - (int)f->got, 0);
             if (n > 0) { f->got += n; continue; }
             if (n < 0 && WOULD_BLOCK(sock_errno())) {
                 zan_io_wait_co((int64_t)f->s, ZAN_IO_READ, f, io_co_resume);
-                return;             /* stay in state 1, suspend again */
+                return;             /* 核心系统底层抽象与内存语义契约 */
             }
-            break;                  /* EOF or hard error */
+            break;                  /* 核心系统底层抽象与内存语义契约 */
         }
         closesock(f->s);
         co_complete(&f->h, (f->got == len && memcmp(f->buf, IO_CO_MSG, len) == 0)
@@ -557,7 +522,7 @@ static void io_co_resume(void *fp) {
 static void test_co_io(int port) {
     banner("stackless co + async-io: await readable wakes a CPS frame");
     zan_co_sched_init();
-    zan_io_init();                      /* WSAStartup before any socket() */
+    zan_io_init();                      /* 核心系统底层抽象与内存语义契约 */
     g_listen = make_listener(port);
     CHECK(g_listen != BAD_SOCK, "could not bind echo server on port %d", port);
     if (g_listen == BAD_SOCK) { zan_io_shutdown(); return; }

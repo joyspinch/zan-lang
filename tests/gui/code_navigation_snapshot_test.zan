@@ -1,0 +1,292 @@
+using System;
+using System.IO;
+using System.Threading;
+using Gui.Component;
+
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
+class Program {
+    static void Assert(bool condition, string message) {
+        if (!condition) {
+            Console.WriteLine("code_navigation_snapshot FAIL: " + message);
+            throw new Exception("code_navigation_snapshot: " + message);
+        }
+    }
+
+    static IdeNavigationSnapshot Snapshot(string root, string path, string body,
+            CancellationToken cancellation) {
+        IdeNavigationSnapshot snapshot = new IdeNavigationSnapshot();
+        snapshot.root = root; snapshot.path = path; snapshot.body = body;
+        snapshot.word = "Foo"; snapshot.owner = ""; snapshot.referenceOwner = "";
+        snapshot.documents = new List<IdeSourceSnapshot>();
+        snapshot.family = new List<string>();
+        snapshot.workspace = 4; snapshot.sourceRevision = 8; snapshot.sequence = 12;
+        snapshot.stamp = 16; snapshot.line = 0; snapshot.column = 0;
+        snapshot.cancellation = cancellation;
+        return snapshot;
+    }
+
+    static void TestRequestVersions() {
+        CancellationTokenSource cancellation = new CancellationTokenSource();
+        IdeNavigationSnapshot snapshot = Program.Snapshot("D:/work", "D:/work/Foo.zan", "Foo", cancellation.Token);
+        Assert(ZanIDE.NavigationSnapshotCurrent(snapshot, 4, 8, 12, "d:\\work\\Foo.zan", 16, 0, 0, true), "normalized path accepts current request");
+        Assert(!ZanIDE.NavigationSnapshotCurrent(snapshot, 5, 8, 12, snapshot.path, 16, 0, 0, true), "old workspace result rejected");
+        Assert(!ZanIDE.NavigationSnapshotCurrent(snapshot, 4, 9, 12, snapshot.path, 16, 0, 0, true), "old source cache result rejected");
+        Assert(!ZanIDE.NavigationSnapshotCurrent(snapshot, 4, 8, 13, snapshot.path, 16, 0, 0, true), "older navigation choice rejected");
+        Assert(!ZanIDE.NavigationSnapshotCurrent(snapshot, 4, 8, 12, snapshot.path, 17, 0, 0, true), "new document version rejected");
+        Assert(!ZanIDE.NavigationSnapshotCurrent(snapshot, 4, 8, 12, snapshot.path, 16, 0, 1, true), "moved caret rejects navigation result");
+        Assert(ZanIDE.NavigationSnapshotCurrent(snapshot, 4, 8, 12, snapshot.path, 16, 0, 1, false), "source feed need not match caret");
+        cancellation.Cancel();
+        Assert(!ZanIDE.NavigationSnapshotCurrent(snapshot, 4, 8, 12, snapshot.path, 16, 0, 0, true), "canceled late result rejected");
+    }
+
+    static void TestWorkerDrain() {
+        IdeCodeNavigationWork work = new IdeCodeNavigationWork();
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        // 核心契约与语义定义。
+        // 接口数据协议与执行契约。
+        // 核心契约与语义定义。
+        work.Begin();
+        Task first = work.DrainAsync();
+        Task second = work.DrainAsync();
+        work.Complete();
+        first.Wait(); second.Wait();
+        Task empty = work.DrainAsync();
+        empty.Wait();
+
+        bool finished = false;
+        Task worker = work.Run(delegate () { finished = true; });
+        Task drained = work.DrainAsync();
+        drained.Wait(); worker.Wait();
+        Assert(finished, "tracked worker finishes before drain returns without a message pump");
+
+        CancellationTokenSource canceled = new CancellationTokenSource();
+        canceled.Cancel();
+        bool canceledWorkRan = false;
+        Task stopped = work.Run(delegate () {
+            if (canceled.Token.IsCancellationRequested) { return; }
+            canceledWorkRan = true;
+        });
+        Task canceledDrain = work.DrainAsync();
+        canceledDrain.Wait(); stopped.Wait();
+        Assert(!canceledWorkRan, "early canceled worker still releases its pending slot");
+
+        bool failureCaught = false;
+        Task failed = work.Run(delegate () {
+            try { throw new Exception("injected worker failure"); }
+            catch (Exception error) { failureCaught = error.Message.Length > 0; }
+        });
+        Task failureDrain = work.DrainAsync();
+        failureDrain.Wait(); failed.Wait();
+        Assert(failureCaught, "failed operation still drains its worker");
+    }
+
+    static void TestProjectCache(string root) {
+        string definitionPath = root + "/src/Foo.zan";
+        string usePath = root + "/src/Use.zan";
+        string emptyPath = root + "/src/Empty.zan";
+        string htmlPath = root + "/src/View.html";
+        File.WriteAllText(definitionPath, "class Foo { }\n");
+        File.WriteAllText(usePath, "class Saved { Foo value; }\n");
+        File.WriteAllText(emptyPath, "");
+        File.WriteAllText(htmlPath, "<p>Foo</p>\n");
+        File.WriteAllText(root + "/build/Generated.zan", "class Generated { Foo value; }\n");
+        CancellationTokenSource cancellation = new CancellationTokenSource();
+        IdeProjectSourceRead request = new IdeProjectSourceRead();
+        request.root = root; request.workspace = 4; request.revision = 8;
+        request.library = new List<IdeSourceSnapshot>();
+        request.cancellation = cancellation.Token;
+        IdeProjectSourceCache cache = null;
+        // 接口数据协议与执行契约。
+        Task worker = Task.Run(delegate () {
+            try { cache = ZanIDE.LoadProjectSourceSnapshot(request); }
+            catch (Exception error) {
+                Console.WriteLine("cache worker error: " + error.Message);
+                throw error;
+            }
+        });
+        worker.Wait();
+        if (cache == null) { throw new Exception("background cache did not complete"); }
+        Assert(cache.project.Count == 3, "project source walk excludes build output and design documents");
+        Assert(cache.search.Count == 4, "Find/Replace includes HTML and excludes generated sources");
+        IdeSourceSnapshot empty = ZanIDE.SnapshotSource(cache.project, emptyPath);
+        Assert(empty != null, "empty file is represented in loaded cache");
+        if (empty != null) { Assert(empty.body == "", "empty source is a loaded value"); }
+
+        IdeNavigationSnapshot snapshot = Program.Snapshot(root, usePath, "class Live { Foo value; }\n", cancellation.Token);
+        TabRecord live = TabRecord.Create("Use.zan", snapshot.body, usePath);
+        snapshot.documents.Add(IdeSourceSnapshot.Create(live.path, live.body, 7));
+        snapshot.documents.Add(IdeSourceSnapshot.Create(root + "/outside/Outside.zan", "class Outside { }", 2));
+        live.body = "class LaterEdit { }";
+        Assert(snapshot.documents[0].body == snapshot.body, "worker input does not follow live tab mutation");
+        List<string> bodies = ZanIDE.ProjectSourceBodies(cache, snapshot);
+        Assert(bodies.Count == 3, "source feed omits active file and includes other open Zan buffers");
+        List<SearchHit> hits = ZanIDE.FindInSourceSnapshot(snapshot, cache, "Live");
+        Assert(hits.Count == 1 && hits[0].path == usePath, "Find uses unsaved captured text");
+        Assert(ZanIDE.FindInSourceSnapshot(snapshot, cache, "Outside").Count == 0, "Find keeps project search scope");
+        List<SearchHit> references = ZanIDE.ReferencesInSnapshot(snapshot, cache, null);
+        Assert(references.Count == 2, "references use captured tabs and cached closed source");
+        IdeNavigationTarget target = ZanIDE.DefinitionInSnapshot(snapshot, cache, null);
+        Assert(target.valid && target.path == definitionPath && target.line == 0 && target.column == 6,
+            "cross-file fallback returns prepared target without switching a live tab");
+        Assert(target.prepared != null && target.prepared.preparedText != null, "target text is prepared on the worker");
+        Assert(target.fromDisk && target.diskStamp == FileInfo.GetLastWriteTime(definitionPath),
+            "closed navigation target carries the stamp of its disk baseline");
+        LspDefinitionTarget semantic = new LspDefinitionTarget();
+        semantic.path = usePath; semantic.line = 0; semantic.column = 12;
+        IdeNavigationTarget overlay = ZanIDE.DefinitionInSnapshot(snapshot, cache, semantic);
+        Assert(overlay.valid && overlay.body == snapshot.body && !overlay.fromDisk,
+            "unsaved navigation overlay cannot become a saved-file baseline");
+
+        ZanIDE.InvalidateNavFiles();
+        Assert(ZanIDE.ProjectSourcesStep(root, 0), "explicit headless sync loader completes");
+        File.Delete(emptyPath);
+        Assert(ZanIDE.ProjectSourcesStep(root, 0), "completed sync loader does not reread a deleted empty file");
+        Assert(ZanIDE.ProjectSourceBodies(cache, snapshot).Count == bodies.Count, "published cache can be read without disk access");
+
+        CancellationTokenSource stopped = new CancellationTokenSource();
+        stopped.Cancel();
+        IdeProjectSourceRead canceled = new IdeProjectSourceRead();
+        canceled.root = root + "/never-created"; canceled.workspace = 5; canceled.revision = 9;
+        canceled.library = new List<IdeSourceSnapshot>(); canceled.cancellation = stopped.Token;
+        IdeProjectSourceCache unused = ZanIDE.LoadProjectSourceSnapshot(canceled);
+        Assert(unused.project.Count == 0 && unused.search.Count == 0, "canceled cache request does not walk the filesystem");
+    }
+
+    static void TestSemanticColumns() {
+        string body = "😀 Foo\n";
+        IdeNavigationTarget target = ZanIDE.PrepareNavigationTarget("Target.zan", body, 0, 3, "Foo", true);
+        Assert(target.valid && target.column == 5, "UTF-16 target column converts to UTF-8 byte column");
+        Assert(!ZanIDE.PrepareNavigationTarget("Target.zan", body, 0, 1, "Foo", true).valid,
+            "column inside surrogate pair is rejected");
+        Assert(!ZanIDE.PrepareNavigationTarget("Target.zan", body, 100, 0, "Foo", true).valid,
+            "out-of-bounds semantic line is rejected");
+    }
+
+    static LspRenameEdit Edit(string path, string name, int endColumn, int version) {
+        LspRenameEdit edit = new LspRenameEdit();
+        edit.path = path; edit.start = LspSession.PosObj(0, 0);
+        edit.end = LspSession.PosObj(0, endColumn); edit.newText = name; edit.version = version;
+        return edit;
+    }
+
+    static void TestRenameTransactions(string root) {
+        string openedPath = root + "/Open.zan";
+        string first = root + "/DiskOne.zan";
+        string second = root + "/DiskTwo.zan";
+        File.WriteAllText(openedPath, "Foo saved\n");
+        File.WriteAllText(first, "Foo one\n");
+        File.WriteAllText(second, "Foo two\n");
+        CancellationTokenSource cancellation = new CancellationTokenSource();
+        IdeNavigationSnapshot snapshot = Program.Snapshot(root, openedPath, "Foo unsaved\n", cancellation.Token);
+        snapshot.documents.Add(IdeSourceSnapshot.Create(openedPath, snapshot.body, 7));
+        LspDocumentSnapshot document = new LspDocumentSnapshot();
+        document.path = openedPath; document.text = snapshot.body; document.version = 7;
+        List<LspDocumentSnapshot> documents = new List<LspDocumentSnapshot>();
+        documents.Add(document);
+        List<LspRenameEdit> edits = new List<LspRenameEdit>();
+        edits.Add(Program.Edit(openedPath, "Bar", 3, 7));
+        edits.Add(Program.Edit(first, "Bar", 3, -1));
+        edits.Add(Program.Edit(second, "Bar", 3, -1));
+        IdeRenamePlan plan = ZanIDE.PrepareRenamePlan(snapshot, edits, documents);
+        Assert(plan.valid && plan.buffers == 1 && plan.disk == 2, "whole rename is planned against captured documents");
+        Assert(File.ReadAllText(first) == "Foo one\n" && snapshot.documents[0].body == "Foo unsaved\n", "planning changes neither disk nor buffer");
+
+        document.text = "a different synchronized document";
+        Assert(!ZanIDE.PrepareRenamePlan(snapshot, edits, documents).valid, "mismatched semantic original rejects entire plan");
+        document.text = snapshot.body;
+        edits[0].version = 8;
+        Assert(!ZanIDE.PrepareRenamePlan(snapshot, edits, documents).valid, "mismatched semantic version rejects entire plan");
+        edits[0].version = 7;
+        edits[2].end = LspSession.PosObj(0, 500);
+        Assert(!ZanIDE.PrepareRenamePlan(snapshot, edits, documents).valid, "bad last range rejects all earlier valid edits");
+        edits[2].end = LspSession.PosObj(0, 3);
+
+        File.WriteAllText(second, "Foo external\n");
+        IdeRenameCommit changed = ZanIDE.CommitRenameDiskPlan(plan, cancellation.Token);
+        Assert(!changed.committed && File.ReadAllText(first) == "Foo one\n" && File.ReadAllText(second) == "Foo external\n",
+            "changed last target prevents every earlier write");
+        File.WriteAllText(second, "Foo two\n");
+        IdeRenameCommit written = ZanIDE.CommitRenameDiskPlan(plan, cancellation.Token);
+        Assert(written.committed && File.ReadAllText(first) == "Bar one\n" && File.ReadAllText(second) == "Bar two\n", "whole disk batch commits");
+        Assert(File.ReadAllText(openedPath) == "Foo saved\n" && snapshot.documents[0].body == "Foo unsaved\n", "worker never writes an open buffer to disk");
+        Assert(ZanIDE.RollbackRenameDiskPlan(plan) == "", "late rejected commit compensates all writes");
+        Assert(File.ReadAllText(first) == "Foo one\n" && File.ReadAllText(second) == "Foo two\n", "late-result compensation restores original bytes");
+
+        IdeRenameCommit failed = ZanIDE.CommitRenameDiskPlanWithWriter(plan, cancellation.Token,
+            delegate (string path, string text) {
+                if (path == second) {
+                    File.WriteAllText(path, "partial");
+                    throw new IOException("injected partial-write failure");
+                }
+                File.WriteAllText(path, text);
+            });
+        Assert(!failed.committed && failed.failure.IndexOf("injected") >= 0, "partial-write failure is reported");
+        Assert(File.ReadAllText(first) == "Foo one\n" && File.ReadAllText(second) == "Foo two\n", "partial failure restores both completed and truncated targets");
+
+        CancellationTokenSource midWrite = new CancellationTokenSource();
+        IdeRenameCommit stopped = ZanIDE.CommitRenameDiskPlanWithWriter(plan, midWrite.Token,
+            delegate (string path, string text) {
+                File.WriteAllText(path, text);
+                if (path == first) { midWrite.Cancel(); }
+            });
+        Assert(!stopped.committed && File.ReadAllText(first) == "Foo one\n" && File.ReadAllText(second) == "Foo two\n",
+            "cancellation between writes compensates completed targets");
+        Assert(snapshot.documents[0].body == "Foo unsaved\n", "failed or canceled disk batch never changes captured buffers");
+    }
+
+    static void TestReplacementPlan(string root) {
+        string path = root + "/DiskOne.zan";
+        CancellationTokenSource cancellation = new CancellationTokenSource();
+        IdeProjectSourceCache cache = new IdeProjectSourceCache();
+        cache.search = new List<IdeSourceSnapshot>();
+        cache.search.Add(IdeSourceSnapshot.Create(path, "Foo on disk\n", 0));
+        IdeNavigationSnapshot snapshot = Program.Snapshot(root, path, "FOO unsaved\n", cancellation.Token);
+        snapshot.documents.Add(IdeSourceSnapshot.Create(path, snapshot.body, 9));
+        IdeRenamePlan plan = ZanIDE.PrepareReplacementPlan(snapshot, cache, "foo", "New");
+        Assert(plan.valid && plan.buffers == 1 && plan.disk == 0, "replacement retains open-buffer persistence semantics");
+        Assert(plan.entries[0].originalText == snapshot.body && plan.entries[0].newText == "New unsaved\n", "replacement plans use captured unsaved text");
+        Assert(File.ReadAllText(path) == "Foo one\n", "replacement planning performs no writes");
+    }
+
+    static void QuietDelete(string path) {
+        if (File.Exists(path)) { File.Delete(path); }
+    }
+
+    static void QuietDeleteDir(string path) {
+        if (Directory.Exists(path)) { Directory.Delete(path); }
+    }
+
+    static void Main() {
+        string root = Directory.GetCurrentDirectory().Replace("\\", "/") + "/_scratch/code_navigation_snapshot_test";
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        Directory.CreateDirectoryRecursive(root + "/src");
+        Directory.CreateDirectoryRecursive(root + "/build");
+        try {
+            Program.TestRequestVersions();
+            Program.TestWorkerDrain();
+            Program.TestProjectCache(root);
+            Program.TestSemanticColumns();
+            Program.TestRenameTransactions(root);
+            Program.TestReplacementPlan(root);
+            Console.WriteLine("code_navigation_snapshot: PASS");
+        } finally {
+            // 核心契约与语义定义。
+            // 接口数据协议与执行契约。
+            Program.QuietDelete(root + "/src/Foo.zan");
+            Program.QuietDelete(root + "/src/Use.zan");
+            Program.QuietDelete(root + "/src/Empty.zan");
+            Program.QuietDelete(root + "/src/View.html");
+            Program.QuietDelete(root + "/build/Generated.zan");
+            Program.QuietDelete(root + "/Open.zan");
+            Program.QuietDelete(root + "/DiskOne.zan");
+            Program.QuietDelete(root + "/DiskTwo.zan");
+            Program.QuietDeleteDir(root + "/src");
+            Program.QuietDeleteDir(root + "/build");
+            Directory.Delete(root);
+        }
+    }
+}

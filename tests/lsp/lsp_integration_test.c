@@ -1,21 +1,4 @@
-/* ====================================================================
- * LSP integration test for zan-lsp (A5: UTF-16 position encoding).
- *
- * Spawns the real zan-lsp server, speaks Content-Length-framed LSP over its
- * stdio, opens a source file whose lines contain multi-byte UTF-8 (CJK and a
- * 4-byte emoji, i.e. surrogate-pair -> 2 UTF-16 units), and asks for the
- * definition of `Helper` at a position given in UTF-16 code units.
- *
- * The LSP protocol defines positions in UTF-16 code units, but the compiler's
- * lexer counts columns in bytes.  The old server passed the raw client
- * character through as a byte offset, so a query at UTF-16 unit 39 landed at
- * byte 39 -- inside the word `int` on the call line -- and the definition
- * came back null.  With the conversion fixed, unit 39 maps to the byte offset
- * of `Helper`, and the server must answer with the real definition location
- * (line 2, UTF-16 column 31, measured to the `H` of `Helper`).
- *
- * Usage: lsp_integration_test <zan-lsp>
- * ==================================================================== */
+/* 模块核心语义抽象与接口调用契约 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,11 +17,11 @@
 
 #include "src/common/json.h"
 
-/* --------- child process with bidirectional pipes --------- */
+/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
 #ifdef _WIN32
     HANDLE in_w;   /* write to child's stdin */
-    HANDLE out_r;  /* read from child's stdout */
+    HANDLE out_r;  /* 核心系统底层抽象与内存语义契约 */
     HANDLE proc;
 #else
     int in_w;
@@ -140,9 +123,8 @@ static void child_close(child_t *c) {
 #endif
 }
 
-/* --------- LSP framing --------- */
-/* Hard ceiling on how much we will read; a server that spirals into sending
- * junk (or a framing bug) fails the test instead of hanging the suite. */
+/* 核心系统底层抽象与内存语义契约 */
+/* 模块核心语义抽象与接口调用契约 */
 static int g_read_budget = 4 * 1024 * 1024;
 
 static int child_read_byte_budgeted(child_t *c) {
@@ -160,7 +142,7 @@ static void lsp_send(child_t *c, const char *body) {
     child_write(c, body, (int)strlen(body));
 }
 
-/* Read one framed LSP message into buf (NUL-terminated). False on EOF. */
+/* 模块核心语义抽象与接口调用契约 */
 static bool lsp_recv(child_t *c, char *buf, int cap) {
     char header[256];
     int hp = 0;
@@ -174,7 +156,7 @@ static bool lsp_recv(child_t *c, char *buf, int cap) {
             if (ch == '\n') break;
         }
         header[hp] = '\0';
-        if (hp - line_start <= 2) break; /* blank line */
+        if (hp - line_start <= 2) break; /* 核心系统底层抽象与内存语义契约 */
         if (content_len < 0) {
             const char *cl = header + line_start;
             if (strncmp(cl, "Content-Length:", 15) == 0)
@@ -192,7 +174,7 @@ static bool lsp_recv(child_t *c, char *buf, int cap) {
     return true;
 }
 
-/* Serialize + frame one JSON message to the server. */
+/* 底层系统交互与数据协议契约 */
 static void send_message(child_t *c, json_value *root) {
     char *body = json_serialize(root);
     lsp_send(c, body);
@@ -200,9 +182,7 @@ static void send_message(child_t *c, json_value *root) {
     json_free(root);
 }
 
-/* Drain messages until one whose top-level "id" equals want_id arrives.
- * Returns a malloc'd copy of that message body, or NULL if the server never
- * answers (EOF, framing error, or too many unrelated messages). */
+/* 模块核心语义抽象与接口调用契约 */
 static char *recv_until_id(child_t *c, double want_id) {
     char buf[65536];
     for (int tries = 0; tries < 64; tries++) {
@@ -216,12 +196,8 @@ static char *recv_until_id(child_t *c, double want_id) {
     return NULL;
 }
 
-/* --------- the test --------- */
-/* Test document.  Line 2 (0-based) is the definition of Helper; the comment
- * in front of it holds CJK + a surrogate-pair emoji, so the H of `Helper`
- * sits at byte 45 but only UTF-16 column 31.  Line 4 calls it; there the H
- * sits at byte 45 too but at UTF-16 column 39.  Any byte-oriented server
- * misplaces at least one of the two. */
+/* 核心系统底层抽象与内存语义契约 */
+/* 模块核心语义抽象与接口调用契约 */
 #define TEST_URI "file:///lsp_utf16_test.zan"
 static const char *DOC =
     "using System;\n"
@@ -242,12 +218,9 @@ static json_value *mk_text_document(void) {
     return td;
 }
 
-/* --------- extended capability checks (formatting/highlight/fold) ------- */
+/* 底层系统交互与数据协议契约 */
 
-/* Second document with an intentional syntax error on line 1 (the compiler
- * accepts unknown symbols in field initializers, so the error must be a
- * parser one: "int q = ;" fails at 1-based 2:13, i.e. 0-based line 1 char 12
- * with the ';' as a one-character token range). */
+/* 模块核心语义抽象与接口调用契约 */
 #define BAD_URI "file:///lsp_diag_range_test.zan"
 static const char *BAD_DOC =
     "class P {\n"
@@ -261,7 +234,7 @@ static void ext_check(bool cond, const char *msg) {
     if (!cond) ext_fails++;
 }
 
-/* Build one request message with the given id/method/params. */
+/* 模块核心语义抽象与接口调用契约 */
 static json_value *mk_request(int id, const char *method, json_value *params) {
     json_value *msg = json_new_obj();
     json_obj_set(msg, "jsonrpc", json_new_str("2.0"));
@@ -271,8 +244,7 @@ static json_value *mk_request(int id, const char *method, json_value *params) {
     return msg;
 }
 
-/* Does an array-valued JSON fragment (raw text) contain a folding range
- * start->end? Parsed with the shared json parser on a synthesized object. */
+/* 模块核心语义抽象与接口调用契约 */
 static bool fold_contains(const char *body, int s0, int e0) {
     char pat[96];
     snprintf(pat, sizeof(pat), "\"startLine\":%d,\"endLine\":%d", s0, e0);
@@ -304,8 +276,7 @@ static bool helper_highlights_exact(const char *body) {
 }
 
 static int run_extended_checks(child_t *child) {
-    /* open the intentionally-broken second document: didOpen publishes its
-     * diagnostics synchronously */
+    /* 模块核心语义抽象与接口调用契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(BAD_URI));
@@ -349,7 +320,7 @@ static int run_extended_checks(child_t *child) {
         json_obj_set(params, "position", pos);
         send_message(child, mk_request(12, "textDocument/prepareRename", params));
     }
-    /* formatting (id 13) and rangeFormatting over already-clean lines (id 14) */
+    /* 底层系统交互与数据协议契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(TEST_URI));
@@ -378,9 +349,9 @@ static int run_extended_checks(child_t *child) {
         send_message(child, mk_request(14, "textDocument/rangeFormatting", params));
     }
 
-    /* drain: collect the five responses and the second doc's diagnostics */
+    /* 模块核心语义抽象与接口调用契约 */
     char *r[6] = {0};       /* by id: 10..14 */
-    char *diag_bad = NULL;  /* publishDiagnostics for BAD_URI */
+    char *diag_bad = NULL;  /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < 300 && ext_fails == 0; i++) {
         char buf[131072];
         if (!lsp_recv(child, buf, sizeof(buf))) break;
@@ -400,7 +371,7 @@ static int run_extended_checks(child_t *child) {
         if (done && diag_bad) break;
     }
 
-    /* foldingRange: class block and Main's block, same-line Helper braces excluded */
+    /* 模块核心语义抽象与接口调用契约 */
     if (r[0]) {
         ext_check(fold_contains(r[0], 1, 6), "foldingRange: class block 1..6");
         ext_check(fold_contains(r[0], 3, 5), "foldingRange: Main block 3..5");
@@ -429,7 +400,7 @@ static int run_extended_checks(child_t *child) {
         free(response);
     }
 
-    /* prepareRename: exact word range + placeholder */
+    /* 核心系统底层抽象与内存语义契约 */
     if (r[2]) {
         ext_check(strstr(r[2], "\"placeholder\":\"Helper\"") != NULL,
                   "prepareRename: placeholder is Helper");
@@ -439,7 +410,7 @@ static int run_extended_checks(child_t *child) {
         ext_check(false, "prepareRename: no response");
     }
 
-    /* formatting: already-clean document comes back unchanged in one edit */
+    /* 模块核心语义抽象与接口调用契约 */
     if (r[3]) {
         ext_check(strstr(r[3], "\"newText\":\"using System;\\nclass Program {\\n") != NULL,
                   "formatting: stable on formatted input");
@@ -447,7 +418,7 @@ static int run_extended_checks(child_t *child) {
         ext_check(false, "formatting: no response");
     }
 
-    /* rangeFormatting over clean lines: zero edits (idempotence) */
+    /* 底层系统交互与数据协议契约 */
     if (r[4]) {
         ext_check(strstr(r[4], "\"result\":[]") != NULL,
                   "rangeFormatting: no spurious edits on clean lines");
@@ -455,8 +426,7 @@ static int run_extended_checks(child_t *child) {
         ext_check(false, "rangeFormatting: no response");
     }
 
-    /* diagnostics: the broken expression is flagged with its real extent
-     * (';' at 0-based char 12, one character wide) */
+    /* 模块核心语义抽象与接口调用契约 */
     if (diag_bad) {
         ext_check(strstr(diag_bad, "\"start\":{\"line\":1,\"character\":12}") != NULL,
                   "diagnostics: error reported at line 1 char 12");
@@ -554,8 +524,7 @@ static bool completion_has(child_t *child, const char *uri, const char *text,
     return found;
 }
 
-/* Check every returned occurrence, so correct counts cannot hide a literal
- * fragment being edited in place of a real (possibly nested) hole. */
+/* 模块核心语义抽象与接口调用契约 */
 static bool interpolation_ranges_exact(json_value *items, const char *text,
                                         const char *uri, bool rename) {
     const char *markers[] = {
@@ -823,8 +792,7 @@ static int run_completion_checks(child_t *child) {
     ext_check(member_rename_safe, "rename: member cannot edit unrelated type or local");
     json_free(root); free(response);
 
-    /* Unresolved word: the lexical fallback must stay in the origin document —
-     * same-named text in other files has no proven identity to rename. */
+    /* 模块核心语义抽象与接口调用契约 */
     const char *fb_a_uri = "file:///lsp_rename_fallback_a.zan";
     const char *fb_a_text = "class FallbackA { void F() { mystery = 1; } }\n";
     const char *fb_b_uri = "file:///lsp_rename_fallback_b.zan";
@@ -955,22 +923,21 @@ static int run_completion_checks(child_t *child) {
     return ext_fails ? 1 : 0;
 }
 
-/* --------- scope-aware rename/references + engine cache ---- */
+/* 底层系统交互与数据协议契约 */
 
 #define SC_URI "file:///lsp_scope_test.zan"
-/* Two methods each with a local `count`: scope-aware rename of the one in
- * Add() (line 4) must not touch the unrelated one in Other() (line 8). */
+/* 模块核心语义抽象与接口调用契约 */
 static const char *SC_DOC =
     "class S {\n"
     "    int total = 0;\n"
     "    static void Add() {\n"
     "        int count = 1;\n"       /* line 3 */
-    "        count = count + 1;\n"   /* line 4: rename target */
+    "        count = count + 1;\n"   /* 核心系统底层抽象与内存语义契约 */
     "        Console.WriteLine(count);\n" /* line 5 */
     "    }\n"
     "    static void Other() {\n"
-    "        int count = 9;\n"       /* line 8: must stay untouched */
-    "        Console.WriteLine(count);\n" /* line 9: must stay untouched */
+    "        int count = 9;\n"       /* 核心系统底层抽象与内存语义契约 */
+    "        Console.WriteLine(count);\n" /* 核心系统底层抽象与内存语义契约 */
     "    }\n"
     "}\n";
 
@@ -995,7 +962,7 @@ static json_value *scope_position(int line, int character) {
 static int run_scope_checks(child_t *child) {
     scope_open(child);
 
-    /* rename the local `count` in Add() (line 4, char 8) -> "tally" */
+    /* 模块核心语义抽象与接口调用契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(SC_URI));
@@ -1018,8 +985,7 @@ static int run_scope_checks(child_t *child) {
         free(r);
     }
 
-    /* references on Other()'s own `count` (line 8; "int " occupies chars
-     * 8..11, the identifier starts at char 12) */
+    /* 模块核心语义抽象与接口调用契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(SC_URI));
@@ -1042,8 +1008,7 @@ static int run_scope_checks(child_t *child) {
         free(r);
     }
 
-    /* engine cache: symbols -> definition on another doc -> symbols again.
-     * Each switch must rebuild on the uri change and still answer right. */
+    /* 模块核心语义抽象与接口调用契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(SC_URI));
@@ -1085,7 +1050,7 @@ static int run_scope_checks(child_t *child) {
     return ext_fails ? 1 : 0;
 }
 
-/* --------- semanticTokens and inlay hints checks --------- */
+/* 核心系统底层抽象与内存语义契约 */
 #define HINT_URI "file:///lsp_hint_test.zan"
 static const char *HINT_DOC =
     "class Greeter {\n"
@@ -1098,7 +1063,7 @@ static const char *HINT_DOC =
     "}\n";
 
 static int run_semantic_and_hint_checks(child_t *child) {
-    /* open HINT_DOC */
+    /* 核心系统底层抽象与内存语义契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(HINT_URI));
@@ -1135,7 +1100,7 @@ static int run_semantic_and_hint_checks(child_t *child) {
         char *r = recv_until_id(child, 31);
         ext_check(r && strstr(r, "\"data\":[") != NULL,
                   "semanticTokens: returned data array");
-        /* ensure data array is non-empty */
+        /* 核心系统底层抽象与内存语义契约 */
         ext_check(r && strstr(r, "\"data\":[]") == NULL,
                   "semanticTokens: non-empty token data returned");
         free(r);
@@ -1145,18 +1110,11 @@ static int run_semantic_and_hint_checks(child_t *child) {
     return ext_fails ? 1 : 0;
 }
 
-/* --------- $/cancelRequest checks (reader/worker split) ---------
- *
- * A second server rooted at a generated workspace of ~300 files, so project
- * indexing and the references file walk take seconds. The reader thread must
- * stay unblocked while the worker executes, so a cancel lands while a
- * request is queued or mid-walk: the cancelled request must answer -32800
- * and the request behind it must still complete. */
+/* 模块核心语义抽象与接口调用契约 */
 #define CANCEL_FILES 300
 #define CANCEL_FILLER_LINES 1200
 
-/* references at line 1 char 8 = the `cancelMe` field (a field, not a
- * local, so the scope fast path does not shorten the walk). */
+/* 模块核心语义抽象与接口调用契约 */
 static json_value *mk_refs_params(const char *doc_uri) {
     json_value *td = json_new_obj();
     json_obj_set(td, "uri", json_new_str(doc_uri));
@@ -1190,8 +1148,7 @@ static int run_cancel_checks(const char *exe) {
     mkdir(root, 0755);
 #endif
 
-    /* Each generated file references the same Doc.cancelMe declaration, so
-     * the semantic references walk must still report one location per file. */
+    /* 模块核心语义抽象与接口调用契约 */
     for (int i = 0; i < CANCEL_FILES; i++) {
         char path[700];
         snprintf(path, sizeof(path), "%s%cGen%d.zan", root,
@@ -1219,12 +1176,12 @@ static int run_cancel_checks(const char *exe) {
     char uri[700];
     snprintf(uri, sizeof(uri), "file:///Gen0.zan");
 
-    /* initialize with the generated workspace as root */
+    /* 底层系统交互与数据协议契约 */
     {
         json_value *params = json_new_obj();
         char ruri[700];
 #ifdef _WIN32
-        /* the server only accepts file:/// URIs; backslashes become '/' */
+        /* 模块核心语义抽象与接口调用契约 */
         snprintf(ruri, sizeof(ruri), "file:///");
         char *wp = ruri + strlen(ruri);
         for (const char *q = root; *q && wp < ruri + sizeof(ruri) - 1; q++)
@@ -1244,7 +1201,7 @@ static int run_cancel_checks(const char *exe) {
         free(r);
     }
 
-    /* didOpen: the worker starts the (slow) project index for this root. */
+    /* 模块核心语义抽象与接口调用契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(uri));
@@ -1257,13 +1214,7 @@ static int run_cancel_checks(const char *exe) {
         send_message(&child, mk_request(-1, "textDocument/didOpen", params));
     }
 
-    /* All three rounds rely on the same slow path: indexing the generated
-     * workspace takes seconds, while the reader thread accepts a cancel in
-     * microseconds, so every cancel lands well inside the window.
-     *
-     * Round 1: didOpen started the cold index build inside the worker;
-     * refs(100) queues behind it, so the cancel slot is recorded long before
-     * refs(100) is dequeued and the worker refuses it without executing. */
+    /* 模块核心语义抽象与接口调用契约 */
     send_message(&child, mk_request(100, "textDocument/references",
                                     mk_refs_params(uri)));
     {
@@ -1281,9 +1232,7 @@ static int run_cancel_checks(const char *exe) {
               "cancel: queued references request answers -32800");
     free(r100);
 
-    /* Round 2: the cancelled build left the index cold, so refs(101) restarts
-     * the multi-second scan itself and the cancel hits its checkpoints
-     * mid-walk; the answer must be -32800, never a partial success. */
+    /* 模块核心语义抽象与接口调用契约 */
     send_message(&child, mk_request(101, "textDocument/references",
                                     mk_refs_params(uri)));
     {
@@ -1300,8 +1249,7 @@ static int run_cancel_checks(const char *exe) {
               "cancel: in-flight references walk aborts with -32800");
     free(r101);
 
-    /* Round 3: after two aborts the index is rebuilt from scratch; the
-     * pipeline must not be wedged and the walk must cover the project. */
+    /* 模块核心语义抽象与接口调用契约 */
     send_message(&child, mk_request(102, "textDocument/references",
                                     mk_refs_params(uri)));
     char *r102 = recv_until_id(&child, 102);
@@ -1364,7 +1312,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* initialize (id 1) -- no positionEncoding cap: the server must do UTF-16 */
+    /* 底层系统交互与数据协议契约 */
     {
         json_value *msg = json_new_obj();
         json_obj_set(msg, "jsonrpc", json_new_str("2.0"));
@@ -1381,7 +1329,7 @@ int main(int argc, char **argv) {
     }
     free(resp);
 
-    /* textDocument/didOpen -- registers the doc and triggers diagnostics */
+    /* 模块核心语义抽象与接口调用契约 */
     {
         json_value *params = json_new_obj();
         json_obj_set(params, "textDocument", mk_text_document());
@@ -1392,7 +1340,7 @@ int main(int argc, char **argv) {
         send_message(&child, msg);
     }
 
-    /* textDocument/definition (id 3) at line 4, UTF-16 col 39 -> `Helper` */
+    /* 底层系统交互与数据协议契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(TEST_URI));
@@ -1465,7 +1413,7 @@ int main(int argc, char **argv) {
     if (rc == 0)
         rc = run_semantic_and_hint_checks(&child);
 
-    /* spawns its own second server rooted at a generated workspace */
+    /* 模块核心语义抽象与接口调用契约 */
     if (rc == 0)
         rc = run_cancel_checks(argv[1]);
 

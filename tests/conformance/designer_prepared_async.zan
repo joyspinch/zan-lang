@@ -1,0 +1,116 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+using Game.Scene;
+
+/// 设计文档异步化契约：worker 侧独立 prepare/serialize 与 UI 侧
+/// 单次消费安装。回归锚：
+/// 1. PrepareJson/Copy/ToJson/ToHtml 不触碰 Designer 实例与输入控件，
+///    worker 线程可安全执行；损坏文档得到显式 loadError 基线，
+///    宿主不得把半份文档自动存回；
+/// 2. Copy 深拷贝独立——worker 改动字段不会穿透回 UI 模型，
+///    反之亦然；未知键（futureKey/docCss/bodyContent/htmlContent）
+///    经 docSource/extra 通道原样往返；
+/// 3. ApplyPreparedDocument 单次消费；安装后 UI SaveJson 与
+///    worker 快照 ToJson 逐字节一致（同一模型、同一序列化）；
+/// 4. SceneDoc.CaptureSnapshot/SnapshotEquals 独立快照：
+///    改快照不穿透原文档；SceneDesigner.PrepareJson 单次消费，
+///    错误保存在请求上而非全局 LastError。
+class DesignerPreparedAsyncTest {
+    static string Y(bool b) { return b ? "yes" : "NO"; }
+
+    static string FormDoc() {
+        return "{\n"
+            + "  \"name\": \"Contact\",\n"
+            + "  \"submit\": \"Send\",\n"
+            + "  \"docCss\": \"body { color:#123; }\",\n"
+            + "  \"bodyContent\": [\"start \", 0, \" end\"],\n"
+            + "  \"fields\": [\n"
+            + "    { \"kind\": \"Panel\", \"name\": \"box\", \"text\": \"Hi\",\n"
+            + "      \"fx\": 8, \"fy\": 8, \"fw\": 120, \"fh\": 40,\n"
+            + "      \"htmlContent\": [\"lead \", 0],\n"
+            + "      \"futureKey\": \"keepMe\",\n"
+            + "      \"kids\": [\n"
+            + "        { \"kind\": \"Label\", \"name\": \"hint\", \"text\": \"hello\" }\n"
+            + "      ] }\n"
+            + "  ]\n"
+            + "}\n";
+    }
+
+    static void Main() {
+        // ---- worker 解析/构建：不构造额外 Designer，options 是独立标量模型 ----
+        Designer blank = new Designer();
+        DesignerDocumentSnapshot prepared = Designer.PrepareJson(FormDoc(), blank.CaptureDocumentOptions());
+        Console.WriteLine("formerror " + Y(!prepared.loadError && prepared.lastError == ""));
+        Console.WriteLine("formname " + Y(prepared.ToJson().Contains("\"name\": \"Contact\"")
+            && prepared.ToJson().Contains("\"submit\": \"Send\"")));
+        Console.WriteLine("formfields " + Y(prepared.fields.Count == 1
+            && prepared.fields[0].fname == "box" && prepared.fields[0].kids.Count == 1
+            && prepared.fields[0].kids[0].fname == "hint" && prepared.sequence == 2));
+        Console.WriteLine("formextra " + Y(prepared.ToJson().Contains("futureKey")
+            && prepared.ToJson().Contains("docCss") && prepared.ToJson().Contains("bodyContent")));
+        Console.WriteLine("formhtml " + Y(prepared.ToHtml().Contains("start ")
+            && prepared.ToHtml().Contains("lead ") && prepared.ToHtml().Contains("keepMe")));
+
+        // ---- 独立快照：worker 改动不穿透回 UI 模型 ----
+        DesignerDocumentSnapshot baseline = prepared.Copy();
+        baseline.fields[0].fname = "moved";
+        Console.WriteLine("copyindependent " + Y(prepared.fields[0].fname == "box"
+            && !Designer.DocumentFieldsEqual(prepared.fields, baseline.fields)));
+        Console.WriteLine("copyserial " + Y(baseline.ToJson().Contains("\"name\": \"moved\"")
+            && prepared.ToJson().Contains("\"name\": \"box\"")));
+
+        // ---- UI 单次消费安装；序列化与 worker 快照逐字节一致 ----
+        Designer d = new Designer();
+        bool first = d.ApplyPreparedDocument(prepared);
+        bool second = d.ApplyPreparedDocument(prepared);
+        Console.WriteLine("applyonce " + Y(first && !second));
+        Console.WriteLine("applymodel " + Y(d.fields.Count == 1 && d.fields[0].kids.Count == 1
+            && d.FormNameText() == "Contact"));
+        Console.WriteLine("savesame " + Y(d.SaveJson() == prepared.ToJson()));
+        Console.WriteLine("matchbaseline " + Y(d.DocumentMatchesSnapshot(prepared)));
+        d.fields[0].fname = "edited";
+        Console.WriteLine("detectedit " + Y(!d.DocumentMatchesSnapshot(prepared)
+            && d.SaveJson() != prepared.ToJson()));
+
+        // ---- 损坏文档：显式失败基线，绝不半份自动存回 ----
+        DesignerDocumentSnapshot broken = Designer.PrepareJson("{oops", blank.CaptureDocumentOptions());
+        Console.WriteLine("malformed " + Y(broken.loadError && broken.lastError.Length > 0
+            && broken.fields.Count == 0 && !broken.applied && broken.ToJson().Length > 0));
+
+        // ---- 场景：worker prepare + 独立快照 + 单次消费 ----
+        string sceneJson = "{\"name\": \"hud\", \"designWidth\": 640, \"designHeight\": 480,"
+            + " \"elements\": [\n  {\"kind\": \"sprite\", \"name\": \"s1\","
+            + " \"x\": 10, \"y\": 20, \"w\": 30, \"h\": 40, \"image\": \"img/s1.png\"}\n]}";
+        ScenePreparedDocument scenePrepared = SceneDesigner.PrepareJson(sceneJson);
+        Console.WriteLine("sceneerror " + Y(!scenePrepared.loadError && scenePrepared.lastError == ""));
+        SceneDoc scene = scenePrepared.document;
+        Console.WriteLine("sceneload " + Y(scene.Find("s1") != null
+            && scene.ToJson().Contains("img/s1.png")));
+        SceneDoc snap = scene.CaptureSnapshot();
+        Console.WriteLine("scenesame " + Y(scene.SnapshotEquals(snap)
+            && scene.SnapshotEquals(scene.CaptureSnapshot())));
+        // 快照里的元素与原件相互独立：改快照不动原件。Find 可能空，
+        // 先存再护栏——scenesame 已证明 s1/snap1 都在。
+        SceneElement s1el = snap.Find("s1");
+        SceneElement s1src = scene.Find("s1");
+        if (s1el == null || s1src == null) {
+            Console.WriteLine("sceneindependent " + Y(false));
+        } else {
+            s1el.x = 999;
+            Console.WriteLine("sceneindependent " + Y(!scene.SnapshotEquals(snap)
+                && s1src.x == 10 && s1el.x == 999));
+        }
+        SceneDesigner sd = new SceneDesigner();
+        bool s1 = sd.ApplyPreparedDocument(scenePrepared);
+        bool s2 = sd.ApplyPreparedDocument(scenePrepared);
+        Console.WriteLine("sceneapply " + Y(s1 && !s2 && !scenePrepared.loadError));
+        ScenePreparedDocument sceneBroken = SceneDesigner.PrepareJson("{\"name\":");
+        Console.WriteLine("scenebroken " + Y(sceneBroken.loadError
+            && sceneBroken.lastError.Length > 0 && !sceneBroken.applied));
+
+        Console.WriteLine("designer prepared async OK");
+    }
+}

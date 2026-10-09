@@ -1,9 +1,4 @@
-/* Standalone real-driver regression, dynamically loads the freshly built GUI
- * library. No window is needed, but Linux needs a headed GL 3.3 display.
- * clang tests/runtime/gui_gl_aa_test.c -o build/gui_gl_aa_test.exe (Windows)
- * cc tests/runtime/gui_gl_aa_test.c -ldl -o build/gui_gl_aa_test (Linux)
- * Run with the absolute path to zan_gui.dll / libzan_gui.so as argv[1].
- * Exit 77 explicitly means GL unavailable, never a passing CPU substitute. */
+/* 底层系统交互与数据协议契约 */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,7 +87,7 @@ int main(int argc,char **argv) {
         CHECK(backend(1)); clear(s,0x00203040); paths(s,color,fixed); capture(s,actual);
         compare("clipped max-union path",3);
     }
-    /* Retracing must not brighten AA edges, even with opaque paint. */
+    /* 底层系统交互与数据协议契约 */
     const int32_t once[]={12,19,78,53};
     const int32_t retraced[]={12,19,78,53,12,19,78,53};
     for(int alpha=0;alpha<2;alpha++) {
@@ -101,16 +96,14 @@ int main(int argc,char **argv) {
         clear(s,0xFF192B3Du); poly(s,retraced,4,color,3); capture(s,actual);
         compare("retrace idempotence",0);
     }
-    /* Consecutive calls clear scratch but retain painter order and restore
-     * normal blending for shapes, without an intervening readback. */
+    /* 底层系统交互与数据协议契约 */
     backend(0); clear(s,0xFF192B3Du);
     poly(s,retraced,4,0x8044CCFFu,3); paths(s,0xFFCB7744u,1); shape(s,0);
     capture(s,reference);
     CHECK(backend(1)); clear(s,0xFF192B3Du);
     poly(s,retraced,4,0x8044CCFFu,3); paths(s,0xFFCB7744u,1); shape(s,0);
     capture(s,actual); compare("painter order and blend restoration",4);
-    /* Tiny distant paths with alternating damage clips exercise bounded clear
-     * scissor origin/extent and ensure uninitialized scratch is never sampled. */
+    /* 底层系统交互与数据协议契约 */
     for(int pass=0;pass<2;pass++) {
         if(pass) CHECK(backend(1)); else backend(0);
         clear(s,0xFF192B3Du);
@@ -122,7 +115,7 @@ int main(int argc,char **argv) {
         capture(s,pass?actual:reference);
     }
     compare("bounded scratch clear",3);
-    /* No stale coverage survives a new path, clip, surface, or recycled id. */
+    /* 底层系统交互与数据协议契约 */
     int other=create(W,H); CHECK(other>=0);
     clear(other,0xFF192B3Du); poly(other,once,2,0xFFFFFFFFu,3); capture(other,reference);
     destroy(s); s=create(W,H); CHECK(s>=0);

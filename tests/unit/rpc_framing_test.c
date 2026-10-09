@@ -1,16 +1,4 @@
-/* rpc_framing_test.c -- reproduces A3: three Content-Length framing bugs in
- * rpc_read_message_cb.
- *
- *   A3.1 content-length parsed with bare strtol -- no errno / endptr / range
- *        check, so "Content-Length: abc" silently becomes 0 and
- *        "Content-Length: 9999999999" overflows long.
- *   A3.2 a partial body (got < content_length, got > 0) was accepted as a
- *        complete message because the guard was `got != cl && got == 0`.
- *   A3.3 rpc_read_message(FILE*) passed max_len = 0, disabling the size cap so
- *        a single header could force a multi-GB allocation.
- *
- * The test drives rpc_read_message_cb with an in-memory reader so the framing
- * logic can be probed without a real pipe. */
+/* 底层系统交互与数据协议契约 */
 #include "src/common/rpc.h"
 
 #include <stdio.h>
@@ -28,7 +16,7 @@ static int failures = 0;
     }                                                                       \
 } while (0)
 
-/* ---- in-memory reader: serves a fixed buffer one byte (or chunk) at a time ---- */
+/* 底层系统交互与数据协议契约 */
 typedef struct {
     const char *data;
     size_t len;
@@ -50,39 +38,35 @@ static char *read_frame(const char *frame, long max_len) {
     return rpc_read_message_cb(mem_read_byte, &m, max_len);
 }
 
-/* ---- A3.1: malformed / out-of-range Content-Length ---- */
+/* 核心系统底层抽象与内存语义契约 */
 static void test_bad_content_length(void) {
-    /* "abc" is not a number; original strtol gives 0, which then looks like a
-     * zero-length body and returns a 1-byte "". Must be rejected. */
+    /* 底层系统交互与数据协议契约 */
     char *r = read_frame("Content-Length: abc\r\n\r\n", 1024);
     EXPECT(r == NULL, "Content-Length: abc should be rejected");
 
-    /* negative length */
+    /* 核心系统底层抽象与内存语义契约 */
     r = read_frame("Content-Length: -5\r\n\r\n", 1024);
     EXPECT(r == NULL, "negative Content-Length should be rejected");
 
-    /* trailing junk after the digits */
+    /* 核心系统底层抽象与内存语义契约 */
     r = read_frame("Content-Length: 5x\r\n\r\n12345", 1024);
     EXPECT(r == NULL, "Content-Length with trailing junk should be rejected");
 
-    /* empty value */
+    /* 核心系统底层抽象与内存语义契约 */
     r = read_frame("Content-Length:\r\n\r\n", 1024);
     EXPECT(r == NULL, "empty Content-Length should be rejected");
 }
 
-/* ---- A3.3: oversize Content-Length capped ---- */
+/* 核心系统底层抽象与内存语义契约 */
 static void test_oversize_capped(void) {
-    /* A huge but parseable length must be rejected without allocating. With the
-     * cap disabled (max_len=0) the original code would malloc(~10GB). */
+    /* 底层系统交互与数据协议契约 */
     char *r = read_frame("Content-Length: 9999999999\r\n\r\n", 16 * 1024 * 1024);
     EXPECT(r == NULL, "oversize Content-Length should be rejected under the cap");
 }
 
-/* ---- A3.2: partial body rejected ---- */
+/* 核心系统底层抽象与内存语义契约 */
 static void test_partial_body_rejected(void) {
-    /* Declare 100 bytes but supply only 50 then EOF. The original guard
-     * (`got != cl && got == 0`) let this through as a "complete" 50-byte
-     * message. Must return NULL. */
+    /* 底层系统交互与数据协议契约 */
     const char *hdr = "Content-Length: 100\r\n\r\n";
     size_t hl = strlen(hdr);
     char *frame = (char *)malloc(hl + 50);
@@ -95,7 +79,7 @@ static void test_partial_body_rejected(void) {
     free(frame);
 }
 
-/* ---- normal frame still works ---- */
+/* 核心系统底层抽象与内存语义契约 */
 static void test_normal_frame(void) {
     const char *body = "{\"method\":\"initialize\"}";
     char header[64];
@@ -111,7 +95,7 @@ static void test_normal_frame(void) {
     free(frame);
 }
 
-/* ---- multiple headers, Content-Length not first ---- */
+/* 底层系统交互与数据协议契约 */
 static void test_content_length_not_first(void) {
     const char *body = "12345";
     char frame[256];
@@ -126,7 +110,7 @@ static void test_content_length_not_first(void) {
     }
 }
 
-/* ---- zero-length body is a valid (if unusual) message ---- */
+/* 底层系统交互与数据协议契约 */
 static void test_zero_length_body(void) {
     char *r = read_frame("Content-Length: 0\r\n\r\n", 1024);
     EXPECT(r != NULL, "zero-length body should parse");
@@ -136,7 +120,7 @@ static void test_zero_length_body(void) {
     }
 }
 
-/* ---- EOF before any header byte returns NULL (no spurious message) ---- */
+/* 底层系统交互与数据协议契约 */
 static void test_immediate_eof(void) {
     mem_reader m = { "", 0, 0 };
     char *r = rpc_read_message_cb(mem_read_byte, &m, 1024);

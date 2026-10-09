@@ -4,7 +4,7 @@ using System.Web;
 
 /// DesignerHtml .html 设计稿 ↔ JSON 文档模型往返契约。
 ///
-/// 锁三件事（2026-10 修复的两个往返缺陷的回归锚）：
+/// 往返契约的回归锚：
 /// 1. 属性固定序：FieldHtml 的发射序不随模型键序走——异序文档
 ///    （手写/旧版生成）读存一代即收敛，不再每代换属性位置
 ///    （coreforge 进度条 value/max/style 震荡案例）；
@@ -12,9 +12,57 @@ using System.Web;
 ///    逐字节往返；元素正文通道只发安全文本，且读端 data-text
 ///    优先——修掉"读存一次多行塌单行 + JSON 里出现重复 text 键"；
 /// 3. 语义保真：progress 的 value/max ↔ percent 折算、props
-///    直通表的字符串值（"0" 不嗅探成数字）读回一致。
+///    直通表的字符串值（"0" 不嗅探成数字）读回一致；
+/// 4. stylesheet 与原生 body 属性、Element 文本/子树顺序无损保存，
+///    HTML 空白裁决保持行内间隔，保存缩进不生成新文本；
+/// 5. 原生标签来源与旧 Panel 定位形态区分，旧精确 text 仍可读存。
 class DesignerHtmlRoundTrip {
     static string Y(bool b) { return b ? "yes" : "NO"; }
+
+    // 对象键序不是语义，数组的文本/子节点次序才是往返契约。
+    static bool Eqv(JsonValue a, JsonValue b) {
+        if (a == null || b == null) { return a == b; }
+        if (a.IsObject() && b.IsObject()) {
+            if (a.Count() != b.Count()) { return false; }
+            for (int i = 0; i < a.Count(); i = i + 1) {
+                string key = a.KeyAt(i);
+                if (!b.Has(key) || !Eqv(a.ValAt(i), b.Get(key))) { return false; }
+            }
+            return true;
+        }
+        if (a.IsArray() && b.IsArray()) {
+            if (a.Count() != b.Count()) { return false; }
+            for (int i = 0; i < a.Count(); i = i + 1) {
+                if (!Eqv(a.At(i), b.At(i))) { return false; }
+            }
+            return true;
+        }
+        return a.ToJson() == b.ToJson();
+    }
+
+    static JsonValue Obj(JsonValue o, string key) {
+        JsonValue v = o.Get(key);
+        return v == null ? JsonValue.NewNull() : v;
+    }
+
+    // 旧 JSON 没有 HTML 根身份；进入 HTML 后补上的自然子节点顺序
+    // 是预期元数据。只在文档根补齐，字段/混排顺序仍由 Eqv 严格比较。
+    static JsonValue WithBodyOrder(JsonValue doc) {
+        JsonValue normalized = JsonValue.ParseLenient(doc.ToJson());
+        if (!normalized.Has("bodyContent")) {
+            JsonValue order = JsonValue.NewArray();
+            JsonValue fields = Obj(normalized, "fields");
+            for (int i = 0; i < fields.Count(); i = i + 1) {
+                order.Append(JsonValue.NewNum(Convert.ToString(i)));
+            }
+            normalized.Set("bodyContent", order);
+        }
+        return normalized;
+    }
+
+    static bool DocEqv(JsonValue a, JsonValue b) {
+        return Eqv(WithBodyOrder(a), WithBodyOrder(b));
+    }
 
     static void Main() {
         // ---- 1. 异序文档固定点：value/max 在 style 之前的属性序 ----
@@ -45,7 +93,8 @@ class DesignerHtmlRoundTrip {
         string j1 = doc.PrettyToJson() + "\n";
         string h = DesignerHtml.FromJsonDoc(j1);
         string j2 = DesignerHtml.ToJsonDoc(h);
-        Console.WriteLine("textexact " + Y(j1 == j2));
+        Console.WriteLine("textexact " + Y(DocEqv(JsonValue.ParseLenient(j1),
+            JsonValue.ParseLenient(j2))));
         // 不安全文本只走 data-text 属性通道，元素正文保持空
         Console.WriteLine("bodyempty " + Y(h.Contains("></label>")));
 
@@ -70,5 +119,299 @@ class DesignerHtmlRoundTrip {
             doc2.PrettyToJson() + "\n"));
         Console.WriteLine("percentround " + Y(j3.Contains("\"percent\": 72")));
         Console.WriteLine("propstr " + Y(j3.Contains("\"min\": \"0\"")));
+
+        // 文档 CSS 与窗口壳的原生属性必须和旧 data-class/data-style 分离。
+        string cssA = ".root { color:#123; }\n";
+        string cssB = "span { font-size:17px; }";
+        string styled = "<html><head><style>" + cssA + "</style>"
+            + "<style>" + cssB + "</style></head>"
+            + "<body data-zan-design id=Styled class='root shell'"
+            + " style='padding:8px; color:#456' data-class='legacy-class'"
+            + " data-style='legacy-style'><label>Styled</label></body></html>";
+        JsonValue sd = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(styled));
+        Console.WriteLine("doccss " + Y(sd.Str("docCss", "") == cssA + "\n" + cssB));
+        Console.WriteLine("bodyattrs " + Y(sd.Str("bodyClass", "") == "root shell"
+            && sd.Str("bodyStyle", "") == "padding:8px; color:#456"
+            && sd.Str("class", "") == "legacy-class"
+            && sd.Str("style", "") == "legacy-style"));
+        string sh = DesignerHtml.FromJsonDoc(sd.ToJson());
+        WDoc sw = HtmlParser.Parse(sh, "");
+        Console.WriteLine("stylenative " + Y(sw.css == cssA + "\n" + cssB + "\n"
+            && HtmlText.NodeAttr(sw.nodes[0].attrs, "class") == "root shell"
+            && HtmlText.NodeAttr(sw.nodes[0].attrs, "style") == "padding:8px; color:#456"
+            && !sh.Contains("data-doc-css") && !sh.Contains("data-body-class")
+            && !sh.Contains("data-body-style")));
+        JsonValue sd2 = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(sh));
+        Console.WriteLine("styleround " + Y(DocEqv(sd, sd2)
+            && sh == DesignerHtml.FromJsonDoc(sd2.ToJson())));
+
+        // 纯文本沿既有 text 通道保留；混排只存 kids 索引，避免复制子树。
+        string mixed = "<body data-zan-design id=Mixed>start "
+            + "<div data-kind=Element id=Outer>lead "
+            + "<span data-kind=Element id=First>A&amp;B &lt;C&gt;</span> tail "
+            + "<label id=Second>middle</label> after</div>end "
+            + "<span data-kind=Element id=Last>last</span>!</body>";
+        JsonValue md = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(mixed));
+        JsonValue mf = Obj(md, "fields");
+        JsonValue outer = mf.At(0);
+        JsonValue mk = Obj(outer, "kids");
+        Console.WriteLine("elementtext " + Y(mk.At(0).Str("text", "") == "A&B <C>"
+            && mf.At(1).Str("text", "") == "last"));
+        Console.WriteLine("mixedorder " + Y(Obj(outer, "htmlContent").ToJson()
+            == "[\"lead \",0,\" tail \",1,\" after\"]"));
+        Console.WriteLine("bodyorder " + Y(Obj(md, "bodyContent").ToJson()
+            == "[\"start\",0,\"end \",1,\"!\"]"));
+        string mh = DesignerHtml.FromJsonDoc(md.ToJson());
+        Console.WriteLine("mixednative " + Y(mh.Contains(">lead <span")
+            && mh.Contains("</span> tail <label")
+            && mh.Contains("</label> after</div>")
+            && !mh.Contains("data-html-content")
+            && !mh.Contains("data-x-html-content")
+            && !mh.Contains("data-x-body-content")));
+        JsonValue md2 = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(mh));
+        Console.WriteLine("mixedround " + Y(DocEqv(md, md2)
+            && mh == DesignerHtml.FromJsonDoc(md2.ToJson())));
+
+        // 没有子节点的 body 文本不能因 fields 为空而被清掉。
+        JsonValue td = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(
+            "<body data-zan-design>only &amp; text</body>"));
+        string th = DesignerHtml.FromJsonDoc(td.ToJson());
+        Console.WriteLine("bodytext " + Y(Obj(td, "bodyContent").ToJson()
+            == "[\"only & text\"]"
+            && DocEqv(td, JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(th)))));
+
+        // 空属性、实体与 CSS 尾换行都是有效内容，保存不能每代再补一行。
+        JsonValue ed = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(
+            "<head><style>.a{color:red}\n\n</style></head>"
+            + "<body data-zan-design class='' style=''></body>"));
+        string eh = DesignerHtml.FromJsonDoc(ed.ToJson());
+        Console.WriteLine("emptyshell " + Y(ed.Has("bodyClass") && ed.Has("bodyStyle")
+            && ed.Str("bodyClass", "?") == "" && ed.Str("bodyStyle", "?") == ""
+            && eh.Contains(" class=\"\" style=\"\"")));
+        Console.WriteLine("csstail " + Y(ed.Str("docCss", "") == ".a{color:red}\n\n"
+            && DocEqv(ed, JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(eh)))));
+
+        Console.WriteLine("collapseedges " + Y(HtmlText.CollapseSpace(" \ttail \n")
+            == " tail " && HtmlText.CollapseSpace(" \t\n") == " "));
+        WDoc boundary = HtmlParser.Parse("<body><div><span>left</span> "
+            + "<span>right</span> tail <div> block </div> after </div>"
+            + "<button> \tone\n two </button><textarea> a\n b </textarea></body>", "");
+        WNode boundaryDiv = boundary.nodes[1];
+        Console.WriteLine("parserboundaries " + Y(boundaryDiv.items.Count == 6
+            && boundaryDiv.items[1].text == " "
+            && boundaryDiv.items[3].text == " tail"
+            && boundaryDiv.items[5].text == "after"
+            && boundary.nodes[4].items[0].text == "block"
+            && boundary.nodes[5].text == "one two"
+            && boundary.nodes[6].text == "a b"));
+        string spaced = "<body data-zan-design><div data-kind=Element id=Gap>"
+            + "<span data-kind=Element id=A>one </span> "
+            + "<span data-kind=Element id=B> two</span> tail </div></body>";
+        JsonValue spd = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(spaced));
+        JsonValue spf = Obj(spd, "fields").At(0);
+        string sph = DesignerHtml.FromJsonDoc(spd.ToJson());
+        Console.WriteLine("inlinegaps " + Y(Obj(spf, "htmlContent").ToJson()
+            == "[0,\" \",1,\" tail\"]"
+            && Obj(spf, "kids").At(0).Str("text", "") == "one "
+            && sph.Contains("one </span> <span")
+            && DocEqv(spd, JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(sph)))));
+        string adjacent = "<body data-zan-design><span data-kind=Element>a</span>"
+            + "<span data-kind=Element><span data-kind=Element>b</span>"
+            + "<span data-kind=Element>c</span></span></body>";
+        JsonValue adj = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(adjacent));
+        string adjh = DesignerHtml.FromJsonDoc(adj.ToJson());
+        Console.WriteLine("nosyntheticgap " + Y(Obj(adj, "bodyContent").ToJson() == "[0,1]"
+            && adjh.Contains("</span><span")
+            && DocEqv(adj, JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(adjh)))));
+
+        // 原生标签标记和 legacy Panel 定位形态互斥，显式 kind 始终优先。
+        string native = "<body data-zan-design>"
+            + "<span id=Native> A&amp;B </span>"
+            + "<div id=NativeDiv class=box style='padding:2px'>div text</div>"
+            + "<div id=Legacy data-fx=0 data-fh=32>old</div>"
+            + "<div id=Explicit data-kind=Panel>panel</div>"
+            + "<span id=Forced data-kind=Panel>forced</span>"
+            + "<p id=Paragraph>paragraph</p><zan-avatar id=Avatar></zan-avatar>"
+            + "<nav id=NativeNav>nav text</nav><br></body>";
+        JsonValue nd = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(native));
+        JsonValue nf = Obj(nd, "fields");
+        Console.WriteLine("nativetags " + Y(nf.At(0).Str("kind", "") == "Panel"
+            && nf.At(0).Str("htmlTag", "") == "span"
+            && nf.At(0).Str("text", "") == "A&B "
+            && nf.At(1).Str("htmlTag", "") == "div"
+            && nf.At(1).Str("text", "") == "div text"
+            && nf.At(7).Str("htmlTag", "") == "nav"
+            && nf.At(8).Str("htmlTag", "") == "br"));
+        Console.WriteLine("legacykinds " + Y(nf.At(2).Str("kind", "") == "Panel"
+            && !nf.At(2).Has("htmlTag") && nf.At(2).Int("fx", -1) == 0
+            && !nf.At(3).Has("htmlTag") && !nf.At(4).Has("htmlTag")
+            && nf.At(5).Str("kind", "") == "Typography"
+            && nf.At(6).Str("kind", "") == "Avatar"));
+        string nh = DesignerHtml.FromJsonDoc(nd.ToJson());
+        Console.WriteLine("nativeemit " + Y(nh.Contains("<span id=\"Native\"")
+            && nh.Contains("<div id=\"NativeDiv\"")
+            && nh.Contains("<nav id=\"NativeNav\">nav text</nav><br />")
+            && !nh.Contains("data-html-tag") && !nh.Contains("data-text=")
+            && DocEqv(nd, JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(nh)))));
+
+        // 全为零的几何同样是显式声明，不能因为零值把原生来源丢掉。
+        nf.At(1).Set("fx", JsonValue.NewNum("0"));
+        nf.At(1).Set("fh", JsonValue.NewNum("0"));
+        string ngh = DesignerHtml.FromJsonDoc(nd.ToJson());
+        JsonValue ngr = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(ngh));
+        Console.WriteLine("nativegeometry " + Y(ngh.Contains("data-html-tag=\"div\"")
+            && ngh.Contains("data-fx=\"0\" data-fh=\"0\">div text</div>")
+            && Obj(ngr, "fields").At(1).Str("htmlTag", "") == "div"
+            && DocEqv(nd, ngr)
+            && ngh == DesignerHtml.FromJsonDoc(ngr.ToJson())));
+        JsonValue authority = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(
+            "<body data-zan-design><div data-kind=Panel data-html-tag=div"
+            + " data-fh=40>panel</div><span data-kind=Button data-html-tag=span>"
+            + "button</span><div data-kind=Panel data-x-html-tag='div'></div>"
+            + "<input data-kind=Input type=checkbox>"
+            + "<zan-button data-kind=Element>custom</zan-button></body>"));
+        JsonValue af = Obj(authority, "fields");
+        string ah = DesignerHtml.FromJsonDoc(authority.ToJson());
+        Console.WriteLine("kindauthority " + Y(!af.At(0).Has("htmlTag")
+            && af.At(1).Str("kind", "") == "Button" && !af.At(1).Has("htmlTag")
+            && !af.At(2).Has("htmlTag") && af.At(3).Str("kind", "") == "Input"
+            && af.At(4).Str("kind", "") == "Element"
+            && ah.Contains("<button data-kind=\"Button\">button</button>")
+            && ah.Contains("<zan-button data-kind=\"Element\">custom</zan-button>")
+            && DocEqv(authority, JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(ah)))));
+
+        JsonValue placement = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(
+            "<body><div data-fx=0></div><div data-fy=0></div><div data-fw=0></div>"
+            + "<div data-fh=0></div><div data-dock=0></div><div data-position=0></div>"
+            + "<div data-span=0></div><div data-anchor=0></div>"
+            + "<div data-flex-grow=0></div></body>"));
+        JsonValue pf = Obj(placement, "fields");
+        bool legacyPlacement = pf.Count() == 9;
+        for (int i = 0; i < pf.Count(); i = i + 1) {
+            legacyPlacement = legacyPlacement && pf.At(i).Str("kind", "") == "Panel"
+                && !pf.At(i).Has("htmlTag");
+        }
+        Console.WriteLine("placementkeys " + Y(legacyPlacement));
+
+        JsonValue lp = JsonValue.NewObject();
+        JsonValue lpf = JsonValue.NewArray();
+        JsonValue bare = JsonValue.NewObject();
+        bare.PutStr("kind", "Panel");
+        bare.PutStr("name", "Bare");
+        lpf.Append(bare);
+        JsonValue geom = JsonValue.NewObject();
+        geom.PutStr("kind", "Panel");
+        geom.PutStr("name", "Geom");
+        geom.PutInt("fh", 60);
+        lpf.Append(geom);
+        lp.Put("fields", lpf);
+        string lph = DesignerHtml.FromJsonDoc(lp.ToJson());
+        JsonValue lpr = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(lph));
+        Console.WriteLine("panelcompat " + Y(lph.Contains("<div id=\"Bare\" data-kind=\"Panel\"")
+            && lph.Contains("<div id=\"Geom\" data-fh=\"60\"")
+            && DocEqv(lp, lpr)));
+        JsonValue empty = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc("<body></body>"));
+        JsonValue widgets = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(
+            "<body><button>only widget</button></body>"));
+        Console.WriteLine("rootidentity " + Y(Obj(empty, "bodyContent").ToJson() == "[]"
+            && Obj(widgets, "bodyContent").ToJson() == "[0]"
+            && Obj(lpr, "bodyContent").ToJson() == "[0,1]"
+            && Obj(nd, "bodyContent").ToJson() == "[0,1,2,3,4,5,6,7,8]"
+            && DocEqv(empty, JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(
+                DesignerHtml.FromJsonDoc(empty.ToJson()))))));
+
+        JsonValue exactDoc = JsonValue.NewObject();
+        JsonValue exactFields = JsonValue.NewArray();
+        JsonValue exactValues = JsonValue.NewArray();
+        exactValues.Append(JsonValue.NewStr(" first\nsecond\tlast "));
+        exactValues.Append(JsonValue.NewStr("two  spaces"));
+        exactValues.Append(JsonValue.NewStr(" "));
+        exactValues.Append(JsonValue.NewStr(""));
+        for (int i = 0; i < exactValues.Count(); i = i + 1) {
+            JsonValue exactSpan = JsonValue.NewObject();
+            exactSpan.PutStr("kind", "Element");
+            exactSpan.PutStr("tag", "span");
+            exactSpan.PutStr("text", exactValues.At(i).AsString(""));
+            exactFields.Append(exactSpan);
+        }
+        exactDoc.Put("fields", exactFields);
+        string exactHtml = DesignerHtml.FromJsonDoc(exactDoc.ToJson());
+        Console.WriteLine("elementexact " + Y(exactHtml.Contains(" data-text=")
+            && exactHtml.Contains("> first&#10;second&#9;last </span>")
+            && exactHtml.Contains(">two  spaces</span>")
+            && exactHtml.Contains("data-text=\" \"> </span>")
+            && exactHtml.Contains("data-text=\"\"></span>")
+            && DocEqv(exactDoc, JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(exactHtml)))));
+        JsonValue attrDoc = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(
+            "<body><span data-kind=Element data-text='0'>fallback</span>"
+            + "<span data-kind=Element data-text='true'>fallback</span>"
+            + "<span data-kind=Element data-text='false'>fallback</span>"
+            + "<span data-kind=Element data-text=''>fallback</span></body>"));
+        JsonValue attrFields = Obj(attrDoc, "fields");
+        string attrHtml = DesignerHtml.FromJsonDoc(attrDoc.ToJson());
+        Console.WriteLine("elementattrstrings " + Y(Obj(attrFields.At(0), "text").IsString()
+            && attrFields.At(0).Str("text", "?") == "0"
+            && Obj(attrFields.At(1), "text").IsString()
+            && attrFields.At(1).Str("text", "?") == "true"
+            && Obj(attrFields.At(2), "text").IsString()
+            && attrFields.At(2).Str("text", "?") == "false"
+            && attrFields.At(3).Str("text", "?") == ""
+            && attrHtml.Contains(">0</span>") && attrHtml.Contains(">true</span>")
+            && attrHtml.Contains(">false</span>") && !attrHtml.Contains("fallback")
+            && DocEqv(attrDoc, JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(attrHtml)))));
+        outer.Set("text", JsonValue.NewStr("legacy exact\ntext"));
+        string preciseMixed = DesignerHtml.FromJsonDoc(md.ToJson());
+        JsonValue pm = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(preciseMixed));
+        Console.WriteLine("mixedtextpriority " + Y(DocEqv(md, pm)
+            && preciseMixed.Contains("data-text=\"legacy exact&#10;text\"")
+            && !preciseMixed.Contains(">legacy exact")));
+
+        // 编辑已有 kids 后有序表不能写出旧子树，也不能丢掉新加的孩子。
+        mk.At(0).Set("text", JsonValue.NewStr("edited"));
+        JsonValue appended = JsonValue.NewObject();
+        appended.PutStr("kind", "Element");
+        appended.PutStr("tag", "span");
+        appended.PutStr("name", "Appended");
+        appended.PutStr("text", "new");
+        mk.Append(appended);
+        string edited = DesignerHtml.FromJsonDoc(md.ToJson());
+        JsonValue er = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(edited));
+        JsonValue ek = Obj(Obj(er, "fields").At(0), "kids");
+        Console.WriteLine("kididentity " + Y(ek.Count() == 3
+            && ek.At(0).Str("text", "") == "edited"
+            && ek.At(2).Str("name", "") == "Appended"
+            && edited.Contains("</label> after<span id=\"Appended\"")
+            && !edited.Contains("A&amp;B")));
+        JsonValue bodyKid = JsonValue.NewObject();
+        bodyKid.PutStr("kind", "Panel");
+        bodyKid.PutStr("htmlTag", "nav");
+        bodyKid.PutStr("text", "new root");
+        mf.Append(bodyKid);
+        string bodyEdited = DesignerHtml.FromJsonDoc(md.ToJson());
+        JsonValue bodyBack = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(bodyEdited));
+        Console.WriteLine("bodyappend " + Y(Obj(bodyBack, "fields").Count() == 3
+            && bodyEdited.Contains("</span>!<nav>new root</nav>")
+            && Obj(bodyBack, "bodyContent").ToJson() == "[\"start\",0,\"end \",1,\"!\",2]"));
+
+        // ---- href/title 保真：<a> 链接与悬停提示读存不得丢 ----
+        string linkHtml = "<!doctype html>\n<html><head><title>Link</title></head>\n"
+            + "<body data-zan-design id=\"LinkDoc\">\n"
+            + "  <a id=\"home\" href=\"https://zan-lang.org\""
+            + " target=\"_blank\" title=\"回首页\">首页</a>\n"
+            + "</body>\n</html>\n";
+        JsonValue ld = JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(linkHtml));
+        JsonValue lf = Obj(ld, "fields").At(0);
+        Console.WriteLine("linkread " + Y(lf.Str("kind", "") == "Panel"
+            && lf.Str("htmlTag", "") == "a"
+            && lf.Str("href", "") == "https://zan-lang.org"
+            && lf.Str("target", "") == "_blank"
+            && lf.Str("title", "") == "回首页"));
+        string linkBack = DesignerHtml.FromJsonDoc(ld.ToJson());
+        // 固定序发射：href → target → title 紧随 class/style 区。
+        Console.WriteLine("linkwrite " + Y(linkBack.Contains(
+            " href=\"https://zan-lang.org\" target=\"_blank\"")
+            && linkBack.Contains(" title=\"回首页\"")));
+        Console.WriteLine("linkround " + Y(DocEqv(ld,
+            JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(linkBack)))));
     }
 }
