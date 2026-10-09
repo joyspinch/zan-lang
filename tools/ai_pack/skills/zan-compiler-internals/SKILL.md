@@ -89,6 +89,11 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   - **子协程异常传播块单例共享（`co.sub_rethrow`，2026-10-09 落地）**：
     原先每个 await 挂起点在 `cont_bb` 中调用 `emit_async_check_sub_exc` 时，均就地内联生成 `sub.rethrow` 基本块，重复发射读取 `sub.exc.tid`、`sub.exc.own`，写 3 个全局 EH 变量，并调用 `zan_emit_frame_free` 与 `get_async_rethrow_bb`。这导致 N 个 await 点生成 N 个同构异常转移基本块与数十条重复指令。
     正确定式：在同一个 `$resume` 方法中，惰性分配一个共享的 `co.sub_rethrow` 基本块，头部放置 `phi_sub` 与 `phi_ev` 两个 PHI 节点收集异常来源；各个 await 点检测到 `sub.exc != NULL` 时直接分支到该共享块。全方法只需 1 组 GEP/Store/FrameFree 展开，消除 $O(N)$ 个冗余异常处理块。
+  - **协程挂起点与完成尾部单例指令收敛（2026-10-09 落地）**：
+    原先编译器在 `Gate.Park`、`Socket.ReadReady`/`WriteReady`、`Socket.RecvOv` 等内建异步 I/O 原语挂起点，以及子协程 `await <call>` 与 `emit_async_complete_epilogue` 完成尾部中，频繁就地重复发射 `(i8*)self`、`&self.state`、`&self.result`、`&self.sub_slot` 与 `&self.child` 的 GEP/BitCast。
+    正确定式：
+    ① **Entry 前导块单例缓存**：在 `$resume` 入口前导块惰性分配并缓存 `self_i8`、`self.state`、`self.result`、`self.sub_slot` 和 `self.child`，全局各挂起点与 epilogue 统一读取单例，将重复发射降为 $O(1)$；
+    ② **挂起点 BitCast 与类型匹配收敛**：在 `await <call>` 中，当 `sub` 或指针类型已与目标类型匹配时，豁免发射无操作的 `BitCast`，消除未经优化的中间 IR 指令堆积。
 
 - **`static object` 静态字段的 RC 根注册与动态析构契约（2026-10-09 落地）**：
   在 Zan 编译器中，`TYPE_OBJECT` 不属于静态编译期的强类型类（`is_arc_managed_type` 为 false），但其运行时持有的可能是通过 `zan_rt_alloc` 分配的堆类实例（如 `new object()`）或堆字符串。
