@@ -14,10 +14,10 @@ namespace Gui;
 /// 而无需改动或重新构建任何代码：
 ///
 ///   :root { --accent: #d92b2b; --radius: 999; }
-///   button.primary        { background: linear-gradient(#ffd76a, #e0a020);
-///                           radius: var(--radius); border: 1 #8a5b12; }
-///   button.primary:hover  { background: #ffe08a; }
-///   tab.item:active       { border-bottom: 2 var(--accent); }
+/// 核心契约与语义定义。
+/// 核心契约与语义定义。
+/// 核心契约与语义定义。
+/// 核心契约与语义定义。
 ///
 /// 有目的地支持（仅此而已，无更多级联）：声明块、选择器
 /// 列表（`a, b { }`）、`:state` 后缀、`/* 注释 */` 以及 `:root`
@@ -243,8 +243,8 @@ class Css {
         return outp;
     }
 
-    /// External theme tokens precede inherited logical skin variables. Keep
-    /// the boundary explicit so app CSS does not mistake skin sizes for pixels.
+    /// 核心契约与语义定义。
+    /// 核心契约与语义定义。
     static StyleSheet ParseWithSources(string src, List<CssVarDecl> extraVars,
                                        int physicalCount) {
         StyleSheet sheet = new StyleSheet();
@@ -775,7 +775,10 @@ class Css {
                                            int externalCount) {
         JsonValue block = JsonValue.NewObject();
         JsonValue source = JsonValue.NewObject();
+        JsonValue lengths = JsonValue.NewObject();
         JsonValue important = JsonValue.NewObject();
+        JsonValue importantSource = JsonValue.NewObject();
+        JsonValue importantLengths = JsonValue.NewObject();
         List<string> decls = Css.SplitTrim(body, ";");
         int i = 0;
         while (i < decls.Count) {
@@ -791,23 +794,29 @@ class Css {
             string lowerKey = Css.Lower(key);
             string plain = Css.StripImportant(Css.ExpandVars(val, vars));
             bool imp = Css.HasImportant(val);
-            // 带 !important 的声明进 `__zan_important`；不带的照旧。
-            // 同一键在块内被两种写法各写一次时，important 的那条胜出
-            // （CSS 语义），所以普通声明不得覆盖已记下的 important。
-            if (imp) { important.Set(lowerKey, JsonValue.NewStr(plain)); }
-            else if (important.Get(lowerKey) == null) {
+            // 公开值保留原 CSS 展开结果；内部长度串给每个物理令牌
+            // 分量加 dpx 单位，避免简写或 calc 混合来源时整条误判。
+            string resolved = Css.StripImportant(
+                Css.ExpandVarsWithSources(val, vars, externalCount));
+            bool physical = Css.IsPrescaledValue(val, vars, externalCount);
+            if (imp) {
+                important.Set(lowerKey, JsonValue.NewStr(plain));
+                importantSource.Set(lowerKey, JsonValue.NewBool(physical));
+                importantLengths.Set(lowerKey, JsonValue.NewStr(resolved));
+            } else if (important.Get(lowerKey) == null) {
                 block.Set(lowerKey, JsonValue.NewStr(plain));
+                source.Set(lowerKey, JsonValue.NewBool(physical));
+                lengths.Set(lowerKey, JsonValue.NewStr(resolved));
             }
-            // `__zan_prescaled` 是 per-key 的，important/普通两处都要
-            // 记：ApplyImportant 靠它决定是否跳过 DPI 缩放。
-            source.Set(lowerKey, JsonValue.NewBool(
-                Css.IsPrescaledValue(val, vars, externalCount)));
         }
         if (source.Count() > 0) {
             block.Set("__zan_prescaled", source);
+            block.Set("__zan_lengths", lengths);
         }
         if (important.Count() > 0) {
             block.Set("__zan_important", important);
+            block.Set("__zan_important_prescaled", importantSource);
+            block.Set("__zan_important_lengths", importantLengths);
         }
         return block;
     }
@@ -826,30 +835,67 @@ class Css {
         return Css.ParseBlockWithSources(body, decls, externalCount);
     }
 
-    /// Only externally supplied theme font metrics are physical pixels. Local
-    /// :root declarations remain logical, even when they shadow a theme token.
-    /// Follow aliases with the same bounded expansion used by ExpandVars.
-    static bool IsPrescaledValue(string val, List<CssVarDecl> vars, int externalCount) {
-        string value = val;
+    /// 只认外部主题的已缩放度量；本地同名 :root 覆盖仍是逻辑值。
+    static bool IsPhysicalThemeMetric(string name) {
+        return Css.StartsWithStr(name, "--font-size-")
+            || Css.StartsWithStr(name, "--height-")
+            || Css.StartsWithStr(name, "--padding-")
+            || Css.StartsWithStr(name, "--gap-")
+            || Css.StartsWithStr(name, "--radius-");
+    }
+
+    static string PhysicalMetric(string val) {
+        string s = Css.Trim(val);
+        if (s.EndsWith("px")) { s = s.Substring(0, s.Length - 2); }
+        if (!StyleSheet.IsNumeric(s)) { return val; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (!StyleSheet.Digit(ch) && ch != "." && ch != "-" && ch != "+") {
+                return val;
+            }
+        }
+        return s + "dpx";
+    }
+
+    /// 与 ExpandVars 同样的别名/回退/循环上限，额外保留每个长度分量的来源。
+    static string ExpandVarsWithSources(string val, List<CssVarDecl> vars,
+                                         int externalCount) {
+        string s = val;
         for (int guard = 0; guard < 8; guard = guard + 1) {
-            int at = Css.IndexFrom(value, "var(", 0);
-            if (at < 0) { return false; }
-            int close = Css.IndexFrom(value, ")", at);
-            if (close < 0) { return false; }
-            string name = Css.Trim(value.Substring(at + 4, close - at - 4));
-            int found = -1;
+            int at = Css.IndexFrom(s, "var(", 0);
+            if (at < 0) { return s; }
+            int close = Css.MatchParen(s, at + 3);
+            if (close < 0) { return s; }
+            string inner = Css.Trim(s.Substring(at + 4, close - at - 4));
+            int comma = Css.TopComma(inner);
+            string name = comma < 0 ? inner : Css.Trim(inner.Substring(0, comma));
+            string fallback = comma < 0 ? "" : Css.Trim(
+                inner.Substring(comma + 1, inner.Length - comma - 1));
+            int found = 0 - 1;
             if (vars != null) {
                 for (int i = 0; i < vars.Count; i = i + 1) {
                     if (vars[i].name == name) { found = i; }
                 }
             }
-            if (found < 0) { return false; }
-            if (found < externalCount && Css.IndexFrom(name, "--font-size-", 0) == 0) {
-                return true;
+            string rep = found < 0 ? "" : vars[found].val;
+            if (rep == "") { rep = fallback; }
+            else if (found < externalCount && Css.IsPhysicalThemeMetric(name)) {
+                rep = Css.PhysicalMetric(rep);
             }
-            value = vars[found].val;
+            int tail = close + 1;
+            // 兼容裸数令牌的 `var(--height-small)px` 拼接写法。
+            if (rep.EndsWith("dpx") && tail + 2 <= s.Length
+                    && s.Substring(tail, 2) == "px") { tail = tail + 2; }
+            s = s.Substring(0, at) + rep + s.Substring(tail, s.Length - tail);
         }
-        return false;
+        return s;
+    }
+
+    static bool IsPrescaledValue(string val, List<CssVarDecl> vars, int externalCount) {
+        string value = Css.StripImportant(Css.ExpandVarsWithSources(val, vars, externalCount));
+        // 此布尔接口只表示单一物理标量；混合串由 dpx 分量分别求值。
+        List<string> parts = StyleSheet.Tokens(value);
+        return parts.Count == 1 && StyleSheet.IsNumeric(value) && value.EndsWith("dpx");
     }
 
     /// 兼容旧版平行列表调用。
@@ -920,7 +966,7 @@ class Css {
         }
         for (int j = 0; j < block.Count(); j = j + 1) {
             string key = block.KeyAt(j);
-            if (key == "__zan_prescaled" || key == "__zan_important") {
+            if (Css.StartsWithStr(key, "__zan_")) {
                 JsonValue oldObj = existing.Get(key);
                 if (oldObj == null || !oldObj.IsObject()) {
                     oldObj = JsonValue.NewObject();

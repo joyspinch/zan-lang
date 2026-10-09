@@ -1,0 +1,463 @@
+using System;
+using System.Threading;
+using Gui;
+using Gui.Backend;
+using Gui.Component;
+
+namespace Gui.Component.CodeEditor;
+
+/// UI 创建的装载凭据；准备阶段不持有编辑器或其可变行表。
+class CodeEditorTextLoad {
+    string path;
+    string previousPath;
+    int version;
+    int language;
+}
+
+/// PrepareText 的一次性结果。ApplyPreparedText 接收后，行表归编辑器所有。
+class CodeEditorPreparedText {
+    List<string> lines;
+    string text;
+    bool applied;
+}
+
+class CeAnalysisLease { }
+
+/// 行表只复制不可变字符串引用，后台不得读取 live 编辑器的集合。
+class CeAnalysisSnapshot {
+    CeAnalysisLease lease;
+    List<string> lines;
+    List<string> projectSources;
+    List<ProjType> projectTypes;
+    List<CeSymbolType> symbolTypes;
+    string path;
+    int version;
+    int projectVersion;
+    int symbolVersion;
+    int language;
+    int themeSignature;
+    int keywordColor;
+    int typeColor;
+    int stringColor;
+    int commentColor;
+    int numberColor;
+    int textColor;
+    AtomicInt cancelled;
+}
+
+/// 发布后后台只读；像素宽度缓存由 UI 独占填写。
+class CeAnalysisResult {
+    List<Diagnostic> errors;
+    List<QuickFix> fixes;
+    List<CeBufType> bufferTypes;
+    List<ProjType> projectTypes;
+    List<CeCompletionCandidate> candidates;
+    List<CeHlLine> highlights;
+    CeFileIndex references;
+    Dict<string, string> signatures;
+    List<string> imports;
+    string fileNamespace;
+}
+
+class CeAnalysisLensResult {
+    Dict<int, int> counts;
+    Dict<int, List<int>> references;
+}
+
+partial class CodeEditor {
+    App analysisApp;
+    CeAnalysisLease analysisLease;
+    CeAnalysisSnapshot analysisRunning;
+    CeAnalysisSnapshot analysisApplied;
+    AtomicInt analysisWorkers = new AtomicInt(0);
+    bool analysisDetached;
+    bool analysisQueued;
+    bool analysisWanted;
+    int projectVersion;
+    string analysisFailure = "";
+    Dict<int, int> analysisLensCounts;
+    Dict<int, List<int>> analysisReferenceLines;
+    Dict<string, string> analysisSignatures;
+    List<string> analysisImports;
+    string analysisNamespace = "";
+    int analysisKeywordColor;
+    int analysisTypeColor;
+    int analysisStringColor;
+    int analysisCommentColor;
+    int analysisNumberColor;
+    int analysisTextColor;
+    int analysisThemeSignature;
+    CodeEditorTextLoad textLoadRequest;
+    // 仅独立分析器使用；取消检查与类型家族只读任务自己的快照。
+    CeAnalysisSnapshot workerSnapshot;
+    bool workerBufferTypesReady;
+
+    /// UI 接线时调用。即时模式编辑器没有 Control 的隐式卸载钩子。
+    void AttachAnalysis(App app) {
+        if (analysisApp == app && analysisLease != null) { return; }
+        DetachAnalysis();
+        analysisApp = app;
+        if (app == null) { return; }
+        analysisDetached = false;
+        analysisLease = new CeAnalysisLease();
+        // 共享只读表在 UI 上发布，避免多个分析线程同时初始化静态槽。
+        CodeEditor.EnsureNsTable();
+        RequestAnalysis();
+    }
+
+    /// UI 关闭/解绑时调用；迟到 Post 的 lease 校验必然失败。
+    void DetachAnalysis() {
+        analysisDetached = true;
+        if (analysisRunning != null) { analysisRunning.cancelled.Store(1); }
+        analysisRunning = null;
+        analysisApplied = null;
+        analysisLease = null;
+        analysisApp = null;
+        analysisQueued = false;
+        analysisWanted = false;
+        textLoadRequest = null;
+    }
+
+    /// Detach 后等待全部旧 lease 的 CPU 任务结束；不等待 UI Post 回填。
+    async void DrainAnalysisAsync() {
+        AtomicInt workers = analysisWorkers;
+        while (workers.Load() != 0) { await Task.Delay(1); }
+    }
+
+    CodeEditorTextLoad BeginTextLoad(string path, int language) {
+        CodeEditorTextLoad request = new CodeEditorTextLoad();
+        request.path = path;
+        request.previousPath = documentPath;
+        request.version = TextStamp();
+        request.language = language < 0 || language > 2 ? 0 : language;
+        textLoadRequest = request;
+        return request;
+    }
+
+    /// worker 调用：拆全文在这里完成，不访问 App/编辑器。
+    static CodeEditorPreparedText PrepareText(string text) {
+        CodeEditorPreparedText prepared = new CodeEditorPreparedText();
+        prepared.lines = CodeEditor.SplitLines(text);
+        if (prepared.lines.Count == 0) { prepared.lines.Add(""); }
+        prepared.text = string.Join("\n", prepared.lines);
+        return prepared;
+    }
+
+    /// UI 调用：只接收行表。切换文件、再次装载或用户编辑后拒收旧结果。
+    bool ApplyPreparedText(CodeEditorTextLoad request, CodeEditorPreparedText prepared) {
+        if (request == null || prepared == null || prepared.applied
+            || textLoadRequest != request || documentPath != request.previousPath
+            || TextStamp() != request.version) { return false; }
+        textLoadRequest = null;
+        prepared.applied = true;
+        documentPath = request.path;
+        SetSyntaxLang(request.language);
+        SetLines(prepared.lines);
+        textMemo = prepared.text;
+        textMemoStamp = TextStamp();
+        extRefDirty = true;
+        sigMemoName = "";
+        lensMemos = new List<CeLensMemo>();
+        lensStamp = 0 - 1;
+        return true;
+    }
+
+    bool AnalysisSnapshotCurrent(CeAnalysisSnapshot snapshot) {
+        return snapshot != null && snapshot.lease == analysisLease
+            && snapshot.path == documentPath && snapshot.version == TextStamp()
+            && snapshot.projectVersion == projectVersion
+            && snapshot.symbolVersion == CodeEditor.symbolVersion
+            && snapshot.language == syntaxLang
+            && snapshot.themeSignature == analysisThemeSignature;
+    }
+
+    /// 此复制只发生在 UI Post 中，每轮合并请求只复制一次字符串引用。
+    CeAnalysisSnapshot CaptureAnalysisSnapshot() {
+        CeAnalysisSnapshot snapshot = new CeAnalysisSnapshot();
+        snapshot.lease = analysisLease;
+        snapshot.lines = CodeEditor.CloneLines(lines);
+        snapshot.projectSources = CodeEditor.CloneLines(projFileSrc);
+        snapshot.path = documentPath;
+        snapshot.version = TextStamp();
+        snapshot.projectVersion = projectVersion;
+        snapshot.symbolVersion = CodeEditor.symbolVersion;
+        snapshot.symbolTypes = CodeEditor.symTypes;
+        snapshot.projectTypes = projScanDirty ? null : projTypes;
+        snapshot.language = syntaxLang;
+        snapshot.themeSignature = analysisThemeSignature;
+        snapshot.keywordColor = analysisKeywordColor;
+        snapshot.typeColor = analysisTypeColor;
+        snapshot.stringColor = analysisStringColor;
+        snapshot.commentColor = analysisCommentColor;
+        snapshot.numberColor = analysisNumberColor;
+        snapshot.textColor = analysisTextColor;
+        return snapshot;
+    }
+
+    /// O(1) 请求合并；不存在按绘制帧推进的扫描预算。
+    void RequestAnalysis() {
+        if (analysisApp == null || analysisLease == null) { return; }
+        if (AnalysisSnapshotCurrent(analysisRunning) && analysisRunning.cancelled.Load() == 0) { return; }
+        if (AnalysisSnapshotCurrent(analysisApplied)) { analysisWanted = false; return; }
+        analysisWanted = true;
+        if (analysisRunning != null) { analysisRunning.cancelled.Store(1); }
+        if (analysisRunning != null || analysisQueued) { return; }
+        analysisQueued = true;
+        App app = analysisApp;
+        CeAnalysisLease lease = analysisLease;
+        app.Post(() => {
+            if (analysisApp != app || analysisLease != lease) { return; }
+            analysisQueued = false;
+            StartAnalysis();
+        });
+    }
+
+    void StartAnalysis() {
+        if (analysisApp == null || analysisRunning != null || !analysisWanted) { return; }
+        analysisWanted = false;
+        CeAnalysisSnapshot snapshot = CaptureAnalysisSnapshot();
+        snapshot.cancelled = new AtomicInt(0);
+        analysisRunning = snapshot;
+        App app = analysisApp;
+        // Worker 只访问 snapshot/独立分析器。owner 方法仅在 Post 内运行。
+        AtomicInt workers = analysisWorkers;
+        workers.Increment();
+        bool started = Thread.Start(() => {
+            try {
+                CeAnalysisResult result = CodeEditor.ComputeAnalysis(snapshot);
+                if (result != null && !CodeEditor.SnapshotCancelled(snapshot)) {
+                    app.Post(() => { ApplyAnalysis(snapshot, result); });
+                }
+                CeAnalysisLensResult counts = null;
+                if (result != null && !CodeEditor.SnapshotCancelled(snapshot)) {
+                    counts = CodeEditor.ComputeAnalysisLenses(snapshot, result.references);
+                }
+                CeAnalysisLensResult completed = counts;
+                app.Post(() => { CompleteAnalysis(snapshot, completed, ""); });
+            } catch (Exception ex) {
+                // 后台边界：报告失败并释放单任务槽，不把异常伪装为有效空结果。
+                string failure = ex.Message;
+                app.Post(() => { CompleteAnalysis(snapshot, null, failure); });
+            } finally {
+                // UI 校验只读标量；任务的全文/项目输入在屏障归零前释放。
+                snapshot.lines = null;
+                snapshot.projectSources = null;
+                snapshot.projectTypes = null;
+                snapshot.symbolTypes = null;
+                workers.Decrement();
+            }
+        });
+        if (!started) {
+            workers.Decrement();
+            CompleteAnalysis(snapshot, null, "Unable to start editor analysis worker");
+        }
+    }
+
+    static CodeEditor AnalysisWorker(CeAnalysisSnapshot snapshot) {
+        CodeEditor worker = new CodeEditor();
+        worker.lines = snapshot.lines;
+        worker.projFileSrc = snapshot.projectSources;
+        worker.projScanDirty = snapshot.projectTypes == null;
+        if (snapshot.projectTypes != null) { worker.projTypes = snapshot.projectTypes; }
+        worker.extRefDirty = true;
+        // 活动行的 using 提示由 UI 消费时抑制；移动光标不重扫全文。
+        worker.curLine = 0 - 1;
+        worker.textVersion = snapshot.version;
+        worker.syntaxLang = snapshot.language;
+        worker.workerSnapshot = snapshot;
+        return worker;
+    }
+
+    static bool SnapshotCancelled(CeAnalysisSnapshot snapshot) {
+        return snapshot != null && snapshot.cancelled != null && snapshot.cancelled.Load() != 0;
+    }
+
+    bool AnalysisCancelled() { return CodeEditor.SnapshotCancelled(workerSnapshot); }
+
+    /// 引用统计的类型家族也来自快照，worker 不读取可被 UI 替换的 static 槽。
+    void AnalysisMemberRecvs(CeFileIndex index, string owner,
+            List<string> family, List<string> receivers) {
+        if (workerSnapshot == null) {
+            CodeEditor.MemberRecvsPre(index.stripped, owner, family, receivers);
+            return;
+        }
+        CodeEditor.MemberRecvsWithTypes(index.stripped, owner, family, receivers,
+            workerSnapshot.symbolTypes);
+    }
+
+    /// 可独立无头测试的纯计算入口；不读 UI、provider 或渲染时钟。
+    static CeAnalysisResult ComputeAnalysis(CeAnalysisSnapshot snapshot) {
+        CodeEditor worker = CodeEditor.AnalysisWorker(snapshot);
+        List<string> imports = new List<string>();
+        worker.ParseUsingsInto(imports);
+        worker.analysisNamespace = worker.FileNamespace();
+        worker.analysisImports = imports;
+        worker.CheckErrors();
+        if (worker.AnalysisCancelled()) { return null; }
+        worker.EnsureCandBase();
+        if (worker.AnalysisCancelled()) { return null; }
+        worker.EnsureRefIndex();
+        CeAnalysisResult result = new CeAnalysisResult();
+        result.errors = worker.errors;
+        result.fixes = worker.fixes;
+        result.bufferTypes = worker.muTypes;
+        result.projectTypes = worker.projTypes;
+        result.candidates = worker.cbCandidates;
+        result.references = worker.refIdx;
+        result.imports = imports;
+        result.fileNamespace = worker.analysisNamespace;
+        result.highlights = new List<CeHlLine>();
+        bool inBlock = false;
+        for (int i = 0; i < snapshot.lines.Count; i = i + 1) {
+            if (worker.AnalysisCancelled()) { return null; }
+            CeHlLine hl = new CeHlLine();
+            hl.src = snapshot.lines[i];
+            hl.blockIn = inBlock;
+            hl.spans = new List<CodeSpan>();
+            hl.blockOpen = CodeEditor.HighlightSpansLang(hl.src,
+                snapshot.keywordColor, snapshot.typeColor, snapshot.stringColor,
+                snapshot.commentColor, snapshot.numberColor, snapshot.textColor,
+                inBlock, snapshot.language, hl.spans);
+            inBlock = hl.blockOpen;
+            result.highlights.Add(hl);
+        }
+        result.signatures = new Dict<string, string>();
+        CodeEditor.CollectAnalysisSignatures(snapshot.lines, result.signatures);
+        for (int i = 0; i < snapshot.projectSources.Count; i = i + 1) {
+            if (worker.AnalysisCancelled()) { return null; }
+            CodeEditor.CollectAnalysisSignatures(
+                CodeEditor.SplitLines(snapshot.projectSources[i]), result.signatures);
+        }
+        return result;
+    }
+
+    static void CollectAnalysisSignatures(List<string> source, Dict<string, string> signatures) {
+        for (int i = 0; i < source.Count; i = i + 1) {
+            string line = CodeEditor.TrimStr(source[i]);
+            string name = CodeEditor.MemberDeclName(line);
+            if (name.Length == 0 || signatures.ContainsKey(name)) { continue; }
+            string signature = CodeEditor.SigFromLine(line);
+            if (signature.Length > 0) { signatures.Add(name, signature); }
+        }
+    }
+
+    /// 较慢的项目引用统计单独发布，不能扣住已完成的高亮/诊断。
+    static CeAnalysisLensResult ComputeAnalysisLenses(CeAnalysisSnapshot snapshot, CeFileIndex index) {
+        CodeEditor worker = CodeEditor.AnalysisWorker(snapshot);
+        worker.refIdx = index;
+        worker.refStamp = snapshot.version;
+        worker.EnsureExternRefs();
+        if (worker.AnalysisCancelled()) { return null; }
+        CeAnalysisLensResult result = new CeAnalysisLensResult();
+        result.counts = new Dict<int, int>();
+        result.references = new Dict<int, List<int>>();
+        for (int i = 0; i < index.decls.Count; i = i + 1) {
+            if (worker.AnalysisCancelled()) { return null; }
+            string name = index.decls[i];
+            if (name.Length == 0) { continue; }
+            List<int> hits = new List<int>();
+            int count = worker.ScanRefs(name, i, hits);
+            string owner = i < index.owners.Count ? index.owners[i] : "";
+            if (owner.Length > 0) { count = count + worker.ExternRefCount(owner, name); }
+            result.counts.Add(i, count);
+            result.references.Add(i, hits);
+        }
+        return result;
+    }
+
+    bool ApplyAnalysis(CeAnalysisSnapshot snapshot, CeAnalysisResult result) {
+        if (result == null || CodeEditor.SnapshotCancelled(snapshot)
+            || !AnalysisSnapshotCurrent(snapshot)) { return false; }
+        errors = result.errors;
+        fixes = result.fixes;
+        muTypes = result.bufferTypes;
+        projTypes = result.projectTypes;
+        cbCandidates = result.candidates;
+        candBaseGen = candBaseGen + 1;
+        cbGen = candBaseGen;
+        projScanDirty = false;
+        refIdx = result.references;
+        refStamp = snapshot.version;
+        hlCache = result.highlights;
+        hlThemeSig = snapshot.themeSignature;
+        analysisSignatures = result.signatures;
+        analysisImports = result.imports;
+        analysisNamespace = result.fileNamespace;
+        analysisLensCounts = null;
+        analysisReferenceLines = null;
+        sigMemoName = "";
+        sigMemoStamp = 0 - 1;
+        analysisApplied = snapshot;
+        analysisFailure = "";
+        return true;
+    }
+
+    void CompleteAnalysis(CeAnalysisSnapshot snapshot, CeAnalysisLensResult lenses, string failure) {
+        if (analysisRunning != snapshot) { return; }
+        bool current = !CodeEditor.SnapshotCancelled(snapshot) && AnalysisSnapshotCurrent(snapshot);
+        if (current) {
+            if (lenses != null) {
+                analysisLensCounts = lenses.counts;
+                analysisReferenceLines = lenses.references;
+            }
+            analysisFailure = failure;
+        }
+        analysisRunning = null;
+        if (!current || analysisWanted) {
+            analysisWanted = true;
+            // 下一轮由 Post 调度，不在结果应用里直接拆/分析文档。
+            RequestAnalysis();
+        }
+    }
+
+    string AnalysisFailure() { return analysisFailure; }
+
+    bool LocalDiagnosticsCurrent() {
+        return analysisApp == null || AnalysisSnapshotCurrent(analysisApplied);
+    }
+
+    string LocalDiagnosticMessage(int line) {
+        if (!LocalDiagnosticsCurrent()) { return ""; }
+        for (int i = 0; i < errors.Count; i = i + 1) {
+            Diagnostic diagnostic = errors[i];
+            if (diagnostic.line != line) { continue; }
+            if (line == curLine && diagnostic.msg == "Missing ';' after using") { continue; }
+            return diagnostic.msg;
+        }
+        return "";
+    }
+
+    int CopyCachedReferenceLines(string name, int declaration, List<int> output) {
+        if (!AnalysisSnapshotCurrent(analysisApplied) || analysisReferenceLines == null
+            || refIdx == null || declaration < 0 || declaration >= refIdx.decls.Count
+            || refIdx.decls[declaration] != name
+            || !analysisReferenceLines.ContainsKey(declaration)) { return 0; }
+        List<int> hits = analysisReferenceLines[declaration];
+        if (output != null) {
+            for (int i = 0; i < hits.Count; i = i + 1) { output.Add(hits[i]); }
+        }
+        return hits.Count;
+    }
+
+    int CachedLensRefCount(int line) {
+        if (!AnalysisSnapshotCurrent(analysisApplied) || analysisLensCounts == null
+            || !analysisLensCounts.ContainsKey(line)) { return 0 - 1; }
+        return analysisLensCounts[line];
+    }
+
+    /// 颜色只复制标量；分词线程不持有可变 Theme 或 CSS 树。
+    void UpdateAnalysisPalette(Theme theme, int defaultText) {
+        if (analysisApp == null) { return; }
+        int signature = HlThemeSig(theme, defaultText);
+        if (signature == analysisThemeSignature) { return; }
+        EditorPalette palette = EditorPalette.For(theme);
+        analysisKeywordColor = synKw != 0 ? synKw : (cssKw != 0 ? cssKw : palette.keyword);
+        analysisTypeColor = synTy != 0 ? synTy : (cssTy != 0 ? cssTy : palette.type);
+        analysisStringColor = synStr != 0 ? synStr : (cssStr != 0 ? cssStr : palette.str);
+        analysisCommentColor = synCom != 0 ? synCom : (cssCom != 0 ? cssCom : palette.comment);
+        analysisNumberColor = synNum != 0 ? synNum : (cssNum != 0 ? cssNum : palette.number);
+        analysisTextColor = synText != 0 ? synText : defaultText;
+        analysisThemeSignature = signature;
+        RequestAnalysis();
+    }
+}

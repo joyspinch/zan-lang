@@ -1,6 +1,9 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+#if MACOS
+using System.Json;
+#endif
 
 namespace System.Windows.Clipboard;
 
@@ -31,14 +34,15 @@ class ClipFormat {
 ///   }
 ///   Clipboard.SetText("hello");
 ///   Clipboard.SetFiles(paths);          // Explorer 会将其视为真实文件拖放
-///   List<string> files = Clipboard.GetFiles();
+/// 核心契约与语义定义。
 ///
 /// Windows 走 user32 剪贴板 API。Linux 上 X11 的剪贴板是“谁拥有
 /// 选区谁就要活着响应请求”的协议，进程退出内容就没了，因此
 /// 这里委托给平台自己的剪贴板工具（Wayland 用 wl-copy/wl-paste，
-/// X11 用 xclip 或 xsel，macOS 用 pbcopy/pbpaste）；它们会自己 fork 一个
-/// 持有进程。内容走临时文件而不进命令行，因此任意文本（包括
-/// 引号、换行、shell 元字符）都不会被解释。工具不存在时抛出
+/// X11 用 xclip 或 xsel）；工具会自己 fork 持有进程。macOS 文本用
+/// pbcopy/pbpaste，文件列表由系统 JXA 桥接 AppKit NSURL 对象。
+/// 内容走临时文件，脚本与数据分离，因此任意文本（包括
+/// 引号、换行、shell 元字符）都不会被解释。文本工具不存在时抛出
 /// PlatformNotSupportedException，而不是假装成功。
 /// </summary>
 class Clipboard {
@@ -146,12 +150,91 @@ class Clipboard {
             + "(Wayland), xclip or xsel (X11); macOS uses pbcopy/pbpaste");
     }
 
-    /// <summary>临时文件路径：剪贴板内容走文件而不进命令行，包含 GUID 防止多线程碰撞与符号链接劫持。</summary>
+    /// <summary>临时文件路径：包含 PID 与 GUID 降低碰撞风险；敏感内容仍须安全创建文件。</summary>
     static string TempFile(string tag) {
         return Path.GetTempPath() + "zan_clip_" + tag + "_"
             + Convert.ToString(ProcessHost.Pid()) + "_"
             + Guid.New() + ".tmp";
     }
+
+    #if MACOS
+    /// AppKit 的 NSURL 粘贴板对象由系统 JXA 桥接，避免跨架构手写 objc_msgSend ABI。
+    /// JSON 数据与静态脚本分离，路径中的换行、引号与 Unicode 不进入脚本源码。
+    static List<string> MacFiles() {
+        List<string> files = new List<string>();
+        string script = "ObjC.import('AppKit');\n"
+            + "function run(argv) {\n"
+            + "var opts = $.NSMutableDictionary.alloc.init;\n"
+            + "opts.setObjectForKey($.NSNumber.numberWithBool(true), $.NSPasteboardURLReadingFileURLsOnlyKey);\n"
+            + "var urls = $.NSPasteboard.generalPasteboard.readObjectsForClassesOptions($.NSArray.arrayWithObject($.NSURL), opts);\n"
+            + "var paths = [];\n"
+            + "if (!urls.isNil()) { for (var i = 0; i < Number(urls.count); i++) {\n"
+            + "var url = urls.objectAtIndex(i); if (url.isFileURL) { paths.push(ObjC.unwrap(url.path)); }\n"
+            + "} }\n"
+            + "return JSON.stringify(paths);\n"
+            + "}";
+        List<string> args = new List<string>();
+        args.Add("-l");
+        args.Add("JavaScript");
+        args.Add("-e");
+        args.Add(script);
+        ProcessResult result = Process.CaptureSafe("/usr/bin/osascript", args);
+        if (!result.Ok()) { return files; }
+        JsonValue values = JsonValue.Parse(result.Text().Trim());
+        if (values == null || !values.IsArray()) { return files; }
+        for (int i = 0; i < values.Count(); i = i + 1) {
+            JsonValue value = values.At(i);
+            if (value == null) { continue; }
+            string path = value.AsString("");
+            if (path.Length > 0) { files.Add(path); }
+        }
+        return files;
+    }
+
+    static bool MacSetFiles(List<string> paths) {
+        if (paths == null) { return false; }
+        JsonValue values = JsonValue.NewArray();
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            string path = paths[i];
+            if (path == null || path.Length == 0) { return false; }
+            values.Append(JsonValue.NewStr(Clipboard.FileUri(path)));
+        }
+        string script = "ObjC.import('AppKit');\n"
+            + "function run(argv) {\n"
+            + "var text = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, $());\n"
+            + "if (text.isNil()) { throw new Error('Cannot read file URL list'); }\n"
+            + "var paths = JSON.parse(ObjC.unwrap(text));\n"
+            + "var urls = $.NSMutableArray.alloc.init;\n"
+            + "for (var i = 0; i < paths.length; i++) {\n"
+            + "var url = $.NSURL.URLWithString(paths[i]);\n"
+            + "if (url.isNil() || !url.isFileURL) { throw new Error('Invalid file URL'); }\n"
+            + "urls.addObject(url);\n"
+            + "}\n"
+            + "var pb = $.NSPasteboard.generalPasteboard; pb.clearContents;\n"
+            + "return urls.count == 0 || pb.writeObjects(urls) ? '1' : '0';\n"
+            + "}";
+        // macOS mktemp 创建真实的 0600 文件；不能依赖默认 umask 保密路径列表。
+        List<string> tempArgs = new List<string>();
+        tempArgs.Add(Clipboard.TempFile("files") + ".XXXXXX");
+        ProcessResult created = Process.CaptureSafe("/usr/bin/mktemp", tempArgs);
+        if (!created.Ok()) { return false; }
+        string tmp = created.Text().Trim();
+        if (tmp.Length == 0) { return false; }
+        try {
+            File.WriteAllText(tmp, values.ToJson());
+            List<string> args = new List<string>();
+            args.Add("-l");
+            args.Add("JavaScript");
+            args.Add("-e");
+            args.Add(script);
+            args.Add(tmp);
+            ProcessResult result = Process.CaptureSafe("/usr/bin/osascript", args);
+            return result.Ok() && result.Text().Trim() == "1";
+        } finally {
+            if (File.Exists(tmp)) { File.Delete(tmp); }
+        }
+    }
+    #endif
 
     /// <summary>读取 `mime` 目标的剪贴板内容；没有该目标时返回 ""。</summary>
     static string PosixRead(int tool, string mime) {
@@ -244,6 +327,8 @@ class Clipboard {
     static bool HasFiles() {
         #if WINDOWS
         return Clipboard.WinIsClipboardFormatAvailable(15) != 0;
+        #elif MACOS
+        return Clipboard.MacFiles().Count > 0;
         #else
         return Clipboard.PosixRead(Clipboard.PosixTool(),
                                    Clipboard.MimeUriList()).Length > 0;
@@ -380,6 +465,8 @@ class Clipboard {
             return false;
         }
         return true;
+        #elif MACOS
+        return Clipboard.MacSetFiles(paths);
         #else
         // freedesktop 的文件拖放/粘贴格式是 text/uri-list，每行一个
         // file:// URI，CRLF 分隔
@@ -416,6 +503,8 @@ class Clipboard {
         } finally {
             Clipboard.WinCloseClipboard();
         }
+        #elif MACOS
+        return Clipboard.MacFiles();
         #else
         string text = Clipboard.PosixRead(Clipboard.PosixTool(),
                                           Clipboard.MimeUriList());
@@ -452,9 +541,13 @@ class Clipboard {
         if (Clipboard.PosixRead(tool, Clipboard.MimeText()).Length > 0) {
             list.Add(13);
         }
+        #if MACOS
+        if (Clipboard.HasFiles()) { list.Add(15); }
+        #else
         if (Clipboard.PosixRead(tool, Clipboard.MimeUriList()).Length > 0) {
             list.Add(15);
         }
+        #endif
         #endif
         return list;
     }
@@ -505,6 +598,9 @@ class Clipboard {
             if (fmts[i] == 13 || fmts[i] == 1) { list.Add(Clipboard.MimeText()); }
             else if (fmts[i] == 15) { list.Add(Clipboard.MimeUriList()); }
         }
+        #elif MACOS
+        if (Clipboard.HasText()) { list.Add(Clipboard.MimeText()); }
+        if (Clipboard.HasFiles()) { list.Add(Clipboard.MimeUriList()); }
         #else
         int tool = Clipboard.PosixTool();
         List<string> args = new List<string>();
@@ -538,10 +634,12 @@ class Clipboard {
     /// <summary>本地路径 -> file:// URI（uri-list 需要百分号转义）。</summary>
     static string FileUri(string path) {
         string full = path;
-        if (!(full.StartsWith("/") || (full.Length > 1 && (full[1] & 255) == 58))) {
-            full = Directory.GetCurrentDirectory() + Path.Separator() + full;
+        if (!Path.IsPathRooted(full)) {
+            full = Path.Combine(Directory.GetCurrentDirectory(), full);
         }
+        #if WINDOWS
         full = Clipboard.Slashes(full);
+        #endif
         if (!full.StartsWith("/")) { full = "/" + full; }   // Windows 盘符
         StringBuilder sb = new StringBuilder();
         sb.Append("file://");
@@ -573,41 +671,39 @@ class Clipboard {
         return path.Replace("\\", "/");
     }
 
-    /// <summary>file:// URI -> 本地路径；不是 file URI 时返回 ""。</summary>
+    /// <summary>file:// URI -> 本地路径；不是本机 file URI 时返回 ""。</summary>
     static string PathFromUri(string uri) {
         if (!uri.StartsWith("file://")) { return ""; }
         string rest = uri.Substring(7, uri.Length - 7);
-        // file://host/path：只接受本机（空 host）
+        // file://host/path：空 host 与 localhost 才是本机文件，不能把远端路径当本机。
         int slash = rest.IndexOf("/");
         if (slash != 0) {
             if (slash < 0) { return ""; }
+            string host = rest.Substring(0, slash);
+            if (host != "localhost") { return ""; }
             rest = rest.Substring(slash, rest.Length - slash);
         }
         if (rest.IndexOf("%") < 0) { return rest; }
-        StringBuilder sb = new StringBuilder();
+        // URI 转义的是 UTF-8 字节，逐字节转 Unicode 字符会把中文重新编码成乱码。
+        byte[] bytes = new byte[rest.Length + 1];
+        int count = 0;
         int i = 0;
-        int start = 0;
-        int n = rest.Length;
-        while (i < n) {
+        while (i < rest.Length) {
             int c = rest[i] & 255;
-            if (c == 37 && i + 2 < n) {
+            if (c == 37 && i + 2 < rest.Length) {
                 int hi = Encoding.HexDigit(rest[i + 1] & 255);
                 int lo = Encoding.HexDigit(rest[i + 2] & 255);
                 if (hi >= 0 && lo >= 0) {
-                    if (i > start) {
-                        sb.Append(rest.Substring(start, i - start));
-                    }
-                    sb.Append(Encoding.CharFromCode(hi * 16 + lo));
+                    bytes[count] = (byte)(hi * 16 + lo);
+                    count = count + 1;
                     i = i + 3;
-                    start = i;
                     continue;
                 }
             }
+            bytes[count] = (byte)c;
+            count = count + 1;
             i = i + 1;
         }
-        if (start < n) {
-            sb.Append(rest.Substring(start, n - start));
-        }
-        return sb.ToString();
+        return bytes.ToStr(0, count);
     }
 }

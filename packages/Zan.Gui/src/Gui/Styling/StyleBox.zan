@@ -10,7 +10,7 @@ namespace Gui;
 /// 控件无需再携带按皮肤分叉的绘制代码，它只解析一次
 /// 然后绘制：
 ///
-///     StyleBox s = Style.Eased(app, id, "button", "primary", disabled);
+/// 核心契约与语义定义。
 ///     s.Paint(app, x, y, w, h);
 ///     s.DrawLabel(app, x, y, w, h, "Save");
 ///
@@ -19,9 +19,18 @@ namespace Gui;
 /// 通过接收回退值的 `*Or` 访问器读取它们。
 /// </summary>
 class StyleBox {
-    /// 设备像素来源标记：每个位（SourceFont 等）对应一个长度属性，
-    /// 置位表示该属性的当前值已是设备像素，ScaleLayout 不再对其二次缩放。
-    int prescaled;
+    /// 每个可独立覆盖的长度有自己的设备像素来源位；数值相等不能
+    /// 判定来源，width/min-width、padding/margin 等也不能共用一位。
+    long prescaled;
+    int envDpiScale;
+    bool envRemPhysical;
+    Theme envTheme;
+    StyleSheet envSheet;
+    // 长度解析的临时上下文，不进入级联或缓存的来源判定。
+    bool lengthDevice;
+    bool lengthMath;
+    bool lengthPhysical;
+    bool declPrescaled;
 
     // ---- fill ---------------------------------------------------------------
     int bg;          // 背景色（0 = 无）
@@ -76,7 +85,7 @@ class StyleBox {
 
     // ---- decoration ---------------------------------------------------------
     // 皮肤按名称请求的外观，绘制 box 的每个控件都会应用
-    // （`border-style: dashed`、`-zan-emboss: raised|inset`、`-zan-specular: 1`），
+    // 核心契约与语义定义。
     // 因此没有控件需要自带的按变体绘制代码。
     int borderStyle; // 0 实线，1 虚线
     int emboss;      // 0 无，1 凸起，2 凹陷（新拟态）
@@ -89,7 +98,7 @@ class StyleBox {
     int sheen;
     int sheenColor;  // 光泽颜色（0 = 白）
 
-    // ---- box metrics --------------------------------------------------------
+    // 核心契约与执行状态转移规范。
     int padL; int padT; int padR; int padB;
     int marL; int marT; int marR; int marB;
     int width; int height;
@@ -107,7 +116,7 @@ class StyleBox {
     /// 每行的等分列数（-1 未设置 = 按可用宽度自动换行）。
     int columns;
 
-    // ---- grid（WEB_GUI_ROADMAP P4）------------------------------------------
+    // 核心契约与语义定义。
     /// 容器轨道模板存原文串（Clone 直拷；repeat()/minmax() 的展开只在
     /// 排版时用到，不值得驻留在每个 StyleBox 里）。"" = 未声明。
     string gridCols;     // grid-template-columns
@@ -130,7 +139,7 @@ class StyleBox {
     int alignItems;  // 0 stretch，1 start，2 center，3 end
     int wrap;        // 1 = flex-wrap: wrap
     /// 换行容器里各行在交叉轴上的分布（CSS `align-content`）：
-    /// 0 start，1 center，2 end，3 space-between，4 space-around，5 stretch。
+    /// 核心契约与语义定义。
     /// 默认 start——本框架的容器按内容测量自身高度，若按 CSS
     /// 的 `stretch` 默认值，一个被停靠成 fill 的换行容器会把两行
     /// 悄悄撑到上下两端，与作者写下的紧凑排版不符。
@@ -176,12 +185,12 @@ class StyleBox {
     int inlineLevel;
     /// CSS `float`：0 none，1 left，2 right（P3 完成绕排布局）。
     int floatSide;
-    /// CSS `clear`：0 none，1 left，2 right，3 both。
+    /// 核心契约与语义定义。
     int clearSide;
     /// CSS `box-sizing`：0 border-box（缺省，声明尺寸含 border+padding），
     /// 1 content-box（声明尺寸只含内容，布局端反推框宽）。
     int boxSizing;
-    /// CSS `white-space`：0 normal，1 nowrap，2 pre，3 pre-wrap。
+    /// 核心契约与语义定义。
     /// 旧字段 nowrap 同步维护（绘制端"不折行"位）：nowrap/pre 置 1。
     int whiteSpace;
     /// `line-height` 的量纲：0 未声明/normal，1 px（lineHeight），
@@ -209,8 +218,10 @@ class StyleBox {
     // 解析期可得的基准：根字号（rem）与视口逻辑尺寸（vw/vh）。
     // 未经过 Style.Defaults 的裸盒（头号消费者是无窗口的测试）取
     // 确定性缺省：16px 字号、1280x720 视口。
-    /// rem 的基准：主题正文字号（px）。
+    /// 未声明字号的文本布局回退（px），保持原有 16px 缺省。
     int envRemPx;
+    /// em/rem 求值的主题根字号；0 时沿用 envRemPx（裸盒兼容）。
+    int envRootFontPx;
     /// vw 的基准：窗口逻辑宽。
     int envVw;
     /// vh 的基准：窗口逻辑高。
@@ -223,38 +234,93 @@ class StyleBox {
 
     /// 度量未设置的通用哨兵（-1）。
     static int Unset() { return 0 - 1; }
-    /// prescaled 位 1：字号已按设备像素。
-    static int SourceFont() { return 1; }
-    /// prescaled 位 2：宽度类度量（width/minW/maxW/basis）已按设备像素。
-    static int SourceWidth() { return 2; }
-    /// prescaled 位 4：高度类度量（height/minH/maxH）已按设备像素。
-    static int SourceHeight() { return 4; }
-    /// prescaled 位 8：间距（gap/rowGap/colGap）已按设备像素。
-    static int SourceGap() { return 8; }
-    /// prescaled 位 16：圆角半径已按设备像素。
-    static int SourceRadius() { return 16; }
-    /// prescaled 位 32：内/外边距已按设备像素。
-    static int SourcePadding() { return 32; }
-    /// prescaled 位 64：图标尺寸已按设备像素。
-    static int SourceIcon() { return 64; }
+    static long SourceFont() { return 1; }
+    static long SourceWidth() { return 2; }
+    static long SourceHeight() { return 4; }
+    static long SourceGap() { return 8; }
+    static long SourceRadius() { return 16; }
+    static long SourcePadL() { return 32; }
+    static long SourceIcon() { return 64; }
+    static long SourceMinW() { return 128; }
+    static long SourceMinH() { return 256; }
+    static long SourceMaxW() { return 512; }
+    static long SourceMaxH() { return 1024; }
+    static long SourceBasis() { return 2048; }
+    static long SourceRowGap() { return 4096; }
+    static long SourceColGap() { return 8192; }
+    static long SourceRadiusTL() { return 16384; }
+    static long SourceRadiusTR() { return 32768; }
+    static long SourceRadiusBR() { return 65536; }
+    static long SourceRadiusBL() { return 131072; }
+    static long SourcePadT() { return 262144; }
+    static long SourcePadR() { return 524288; }
+    static long SourcePadB() { return 1048576; }
+    static long SourceMarL() { return 2097152; }
+    static long SourceMarT() { return 4194304; }
+    static long SourceMarR() { return 8388608; }
+    static long SourceMarB() { return 16777216; }
+    static long SourceLineHeight() { return 33554432; }
+    static long SourceLetterSpacing() { return 67108864; }
+    static long SourceBorder() { return 134217728; }
+    static long SourceBorderTop() { return 268435456; }
+    static long SourceBorderRight() { return 536870912; }
+    static long SourceBorderBottom() { return 1073741824; }
+    static long SourceBorderLeft() { return (long)1 << 31; }
+    static long SourcePosT() { return (long)1 << 32; }
+    static long SourcePosR() { return (long)1 << 33; }
+    static long SourcePosB() { return (long)1 << 34; }
+    static long SourcePosL() { return (long)1 << 35; }
+    static long SourceTx() { return (long)1 << 36; }
+    static long SourceTy() { return (long)1 << 37; }
+    static long SourceShadowDx() { return (long)1 << 38; }
+    static long SourceShadowDy() { return (long)1 << 39; }
+    static long SourceShadowBlur() { return (long)1 << 40; }
+    static long SourceBlur() { return (long)1 << 41; }
 
-    /// `source` 位标记的属性是否已是设备像素（无需再缩放）。
-    bool IsPrescaled(int source) {
-        return (prescaled & source) != 0;
+    /// 兼容整组设置；解析长属性时只修改该边自己的来源位。
+    static long SourcePadding() {
+        return StyleBox.SourcePadL() | StyleBox.SourcePadT()
+            | StyleBox.SourcePadR() | StyleBox.SourcePadB()
+            | StyleBox.SourceMarL() | StyleBox.SourceMarT()
+            | StyleBox.SourceMarR() | StyleBox.SourceMarB();
     }
 
-    /// 置位/清位 `source` 属性的设备像素标记。
-    void SetPrescaled(int source, bool value) {
-        if (value) {
-            prescaled = prescaled | source;
-        } else {
-            prescaled = prescaled & (0 - 1 - source);
-        }
+    bool IsPrescaled(long source) {
+        return source != 0 && (prescaled & source) == source;
+    }
+
+    void SetPrescaled(long source, bool value) {
+        if (value) { prescaled = prescaled | source; }
+        else { prescaled = prescaled & (0 - 1 - source); }
+    }
+
+    /// Defaults 只落已由主题缩放过的布局度量；后来的声明逐字段覆盖。
+    void MarkThemeLengths() {
+        prescaled = prescaled | (((long)1 << 38) - 1);
+    }
+
+    int ScaleLogical(int value) {
+        return value * envDpiScale / 100;
+    }
+
+    /// 解析末尾和内联覆盖共用，置位使重复调用保持幂等。
+    int ResolveLength(int value, long source) {
+        if (!this.IsPrescaled(source)) { value = this.ScaleLogical(value); }
+        this.SetPrescaled(source, true);
+        return value;
+    }
+
+    /// 阴影/模糊保留绘制时换算；物理令牌或字体相对值无需再乘 DPI。
+    int PaintLength(App app, int value, long source) {
+        return this.IsPrescaled(source) ? value : app.Scale(value);
     }
 
     /// 空 box：什么都不设置，所有访问器都返回其回退值。
     StyleBox() {
         this.prescaled = 0;
+        this.envDpiScale = 100; this.envRemPhysical = false;
+        this.lengthDevice = false; this.lengthMath = false;
+        this.lengthPhysical = false; this.declPrescaled = false;
         this.bg = 0; this.bgTo = 0; this.bgVia = 0; this.bgDir = 0;
         this.opacity = 1000; this.blur = 0;
         this.fg = 0; this.accent = 0;
@@ -304,7 +370,8 @@ class StyleBox {
         this.transitionMs = 0 - 1; this.easing = 0;
         this.anim = 0; this.animMs = 0;
         this.tx = 0; this.ty = 0; this.scale = 1000; this.rotate = 0;
-        this.envRemPx = 16; this.envVw = 1280; this.envVh = 720;
+        this.envRemPx = 16; this.envRootFontPx = 0;
+        this.envVw = 1280; this.envVh = 720;
         this.mediaDark = false; this.mediaReduced = false;
     }
 
@@ -313,6 +380,11 @@ class StyleBox {
     StyleBox Clone() {
         StyleBox d = new StyleBox();
         d.prescaled = prescaled;
+        d.envDpiScale = envDpiScale; d.envRemPhysical = envRemPhysical;
+        d.envTheme = envTheme; d.envSheet = envSheet;
+        d.envRemPx = envRemPx; d.envRootFontPx = envRootFontPx;
+        d.envVw = envVw; d.envVh = envVh;
+        d.mediaDark = mediaDark; d.mediaReduced = mediaReduced;
         d.bg = bg; d.bgTo = bgTo; d.bgVia = bgVia; d.bgDir = bgDir;
         d.opacity = opacity; d.blur = blur;
         d.fg = fg; d.accent = accent;
@@ -372,7 +444,7 @@ class StyleBox {
         return d;
     }
 
-    // ---- fallback accessors -------------------------------------------------
+    // 核心契约与执行状态转移规范。
 
     /// 各边 border 实际宽度（px）：四边声明优先，未声明回退统一
     /// `borderW`。border 参与布局（WEB_GUI_ROADMAP P0）——
@@ -685,10 +757,10 @@ class StyleBox {
             int slot = app.BlurSlotFor(key);
             bool bd = app.BackdropDirtyIn(slot, rx, ry, rw, rh);
             if (r > 0) {
-                c.BlurRoundCached(rx, ry, rw, rh, app.Scale(blur),
+                c.BlurRoundCached(rx, ry, rw, rh, this.PaintLength(app, blur, StyleBox.SourceBlur()),
                                   slot, bd, r, this.Corners());
             } else {
-                c.BlurRectCached(rx, ry, rw, rh, app.Scale(blur),
+                c.BlurRectCached(rx, ry, rw, rh, this.PaintLength(app, blur, StyleBox.SourceBlur()),
                                  slot, bd);
             }
         }
@@ -704,8 +776,8 @@ class StyleBox {
 
         int corners = this.Corners();
         int fill = this.Fade(bg);
-        // Solid uniform borders share one coverage pass with their fill.
-        // Keep the original ordering when intervening effects paint the surface.
+        // GUI 控件排版布局与事件分发契约。
+        // GUI 控件排版布局与事件分发契约。
         bool combined = bgTo == 0 && borderStyle != 1 && sheen <= 0
             && !(shadow != 0 && shadowInset == 1)
             && borderTopW <= 0 && borderRightW <= 0
@@ -748,9 +820,9 @@ class StyleBox {
     /// 只写一次，半透明阴影色合成到标称 alpha。
     void PaintShadow(App app, int x, int y, int w, int h, int r) {
         int col = this.Fade(shadow);
-        int dx = x + app.Scale(shadowDx);
-        int dy = y + app.Scale(shadowDy);
-        int blur = app.Scale(shadowBlur);
+        int dx = x + this.PaintLength(app, shadowDx, StyleBox.SourceShadowDx());
+        int dy = y + this.PaintLength(app, shadowDy, StyleBox.SourceShadowDy());
+        int blur = this.PaintLength(app, shadowBlur, StyleBox.SourceShadowBlur());
         if (r < 0) { r = 0; }
         app.canvas.ShadowRoundRect(dx, dy, w, h, r, blur, col);
     }

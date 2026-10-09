@@ -36,18 +36,16 @@ class StyleMediaEntry {
 /// CSS 声明级联，应用于已解析的 StyleBox（
 /// 皮肤路径，每个控件通过 Style 使用）或 retained-mode Control
 /// （在 UiDoc 构建期间）。
-///
 /// 样式表是 selector -> declaration-block 映射。选择器保留 CSS
 /// 拼写（`button`、`.primary`、`button.primary`、`#save`），并可能带有
 /// `:state` 后缀（`:hover`、`:active`、`:focus`、`:disabled`、`:selected`、
 /// `:checked`）。特异性按 type -> class -> type.class -> id 递增，状态
 /// 规则叠加在基础外观之上，所以 `button:hover` 只需注明
 /// 变化的部分。
-///
 /// 值是真正的 CSS：颜色用 `#rgb / #rrggbb / #aarrggbb / rgb() / rgba() /
 /// hsl() / hsla()` 或命名颜色，长度带或不带 `px`，时长用
-/// `120ms / 0.2s`、`linear-gradient(...)`、`box-shadow: x y blur color`、
-/// `backdrop-filter: blur(20px)`、`transform: translate/scale/rotate`、flex
+/// 核心契约与语义定义。
+/// 核心契约与语义定义。
 /// 布局、排版和 `animation: <name> <dur> <easing>`。
 class StyleSheet {
     JsonValue rules;
@@ -205,9 +203,7 @@ class StyleSheet {
                 if (imp == null || !imp.IsObject()) { continue; }
                 for (int k = 0; k < imp.Count(); k = k + 1) {
                     string key = imp.KeyAt(k);
-                    StyleSheet.DeclSource(b, key, StyleSheet.ValStr(imp.ValAt(k)),
-                                          StyleSheet.IsPrescaled(
-                                              entry.block, key));
+                    StyleSheet.DeclBlock(b, entry.block, key, true);
                 }
             } else {
                 this.ApplyDecls(b, entry.block);
@@ -317,17 +313,15 @@ class StyleSheet {
         if (block == null) { return; }
         for (int i = 0; i < block.Count(); i = i + 1) {
             string k = block.KeyAt(i);
-            if (k == "__zan_prescaled" || k == "__zan_important") { continue; }
+            if (StyleSheet.InternalKey(k)) { continue; }
             JsonValue v = block.ValAt(i);
-            StyleSheet.DeclSource(b, k, StyleSheet.ValStr(v),
-                                  StyleSheet.IsPrescaled(block, k));
+            StyleSheet.DeclBlock(b, block, k, false);
         }
         JsonValue imp = block.Get("__zan_important");
         if (imp != null && imp.IsObject()) {
             for (int j = 0; j < imp.Count(); j = j + 1) {
                 string k = imp.KeyAt(j);
-                StyleSheet.DeclSource(b, k, StyleSheet.ValStr(imp.ValAt(j)),
-                                      StyleSheet.IsPrescaled(block, k));
+                StyleSheet.DeclBlock(b, block, k, true);
             }
         }
         StyleSheet.ResolveCurrentColor(b);
@@ -339,7 +333,6 @@ class StyleSheet {
     /// 因此最具体的声明胜出。`classes` 是控件的 class
     /// 列表，`part` 选择 `type::part` 规则（“”表示控件本身），
     /// `stateBits` 是 Style.S* 掩码。
-    ///
     /// 排序以状态为主：所有无状态规则先应用（按 CSS
     /// 特异性：type < class < class chain < id），然后是每个
     /// 活动状态的规则，因此无论作者把 `:hover` 放在文件
@@ -435,8 +428,7 @@ class StyleSheet {
                 if (imp == null || !imp.IsObject()) { continue; }
                 for (int k = 0; k < imp.Count(); k = k + 1) {
                     string key = imp.KeyAt(k);
-                    StyleSheet.DeclSource(b, key, StyleSheet.ValStr(imp.ValAt(k)),
-                                          StyleSheet.IsPrescaled(blk, key));
+                    StyleSheet.DeclBlock(b, blk, key, true);
                 }
             }
         }
@@ -449,9 +441,8 @@ class StyleSheet {
         if (block == null) { return; }
         for (int i = 0; i < block.Count(); i = i + 1) {
             string k = block.KeyAt(i);
-            if (k == "__zan_prescaled" || k == "__zan_important") { continue; }
-            StyleSheet.DeclSource(b, k, StyleSheet.ValStr(block.ValAt(i)),
-                                  StyleSheet.IsPrescaled(block, k));
+            if (StyleSheet.InternalKey(k)) { continue; }
+            StyleSheet.DeclBlock(b, block, k, false);
         }
     }
 
@@ -532,13 +523,11 @@ class StyleSheet {
     // ---- 诊断（lint）--------------------------------------------------------
 
     /// 把这张样式表里"写了但没生效"的部分整理成可读报告：
-    ///
     /// * 被跳过的 at-rule（`@media` 等）——引擎没有媒体查询；
     /// * 选择器含组合同器/伪元素而被丢弃的规则——引擎的选择器模型
-    ///   只有 `type.class#id::part:state`，没有祖先链；
+    /// 只有 `type.class#id::part:state`，没有祖先链；
     /// * 声明全部不被 Decl 消费的规则（`float`、`text-shadow` 之类
-    ///   拼错或未实现的属性）。
-    ///
+    /// 拼错或未实现的属性）。
     /// 返回空列表表示这张表里的每一条都真的会生效。皮肤调试时
     /// 调一次就能把"改了没反应"从猜测变成清单；正常渲染路径不
     /// 调用它，因此不影响开销。
@@ -622,7 +611,7 @@ class StyleSheet {
             List<string> inert = new List<string>();
             for (int k = 0; k < blk.Count(); k = k + 1) {
                 string key = blk.KeyAt(k);
-                if (key == "__zan_prescaled" || key == "__zan_important") { continue; }
+                if (StyleSheet.InternalKey(key)) { continue; }
                 if (StyleSheet.Known(key)) {
                     consumed = consumed + 1;
                     if (StyleSheet.ValueUnresolved(key, StyleSheet.ValStr(blk.ValAt(k)))) {
@@ -868,14 +857,39 @@ class StyleSheet {
         return v.AsString("");
     }
 
-    /// 声明 key 的值是否直接来自 `var(--font-size-*)`（主题已按
-    /// DPI/密度缩放，应用样式不得再叠加缩放；见 Css.ParseBlock）。
+    static bool InternalKey(string key) {
+        return StyleSheet.StartsWith(key, "__zan_");
+    }
+
     static bool IsPrescaled(JsonValue block, string key) {
+        return StyleSheet.IsPrescaled(block, key, false);
+    }
+
+    static bool IsPrescaled(JsonValue block, string key, bool important) {
         if (block == null) { return false; }
-        JsonValue source = block.Get("__zan_prescaled");
+        JsonValue source = block.Get(important
+            ? "__zan_important_prescaled" : "__zan_prescaled");
         if (source == null || !source.IsObject()) { return false; }
         JsonValue value = source.Get(key);
         return value != null && value.AsBool(false);
+    }
+
+    /// 值、优先级和长度分量的来源必须来自同一条获胜声明。
+    static bool DeclBlock(StyleBox b, JsonValue block, string key, bool important) {
+        if (block == null) { return false; }
+        JsonValue values = important ? block.Get("__zan_important") : block;
+        if (values == null) { return false; }
+        JsonValue value = values.Get(key);
+        if (value == null) { return false; }
+        string val = StyleSheet.ValStr(value);
+        JsonValue lengths = block.Get(important
+            ? "__zan_important_lengths" : "__zan_lengths");
+        if (lengths != null && lengths.IsObject()) {
+            JsonValue resolved = lengths.Get(key);
+            if (resolved != null) { val = StyleSheet.ValStr(resolved); }
+        }
+        return StyleSheet.DeclSource(b, key, val,
+            StyleSheet.IsPrescaled(block, key, important));
     }
 
     /// 将一条 CSS 声明应用到样式盒。当该
@@ -959,45 +973,77 @@ class StyleSheet {
         return k;
     }
 
-    /// 应用一条声明，并按属性类别记录“预缩放来源”位
-    /// （Decl 不认得的属性返回 false）。
+    /// 兼容直接传入物理标量的调用；各赋值点记录独立的来源位。
     static bool DeclSource(StyleBox b, string key, string val, bool prescaled) {
+        bool previous = b.declPrescaled;
+        b.declPrescaled = prescaled;
         bool ok = StyleSheet.Decl(b, key, val);
-        if (!ok) { return false; }
-        int source = StyleSheet.SourceFor(key);
-        if (source != 0) { b.SetPrescaled(source, prescaled); }
-        return true;
+        b.declPrescaled = previous;
+        return ok;
     }
 
-    /// 属性对应的预缩放来源类别（StyleBox.Source*），无关属性为 0。
-    static int SourceFor(string key) {
-        string k = StyleSheet.Lower(StyleSheet.Trim(key));
-        if (k == "font-size" || k == "font") {
-            return StyleBox.SourceFont();
+    static long SourceFor(string key) {
+        string k = StyleSheet.StripVendor(StyleSheet.Lower(StyleSheet.Trim(key)));
+        if (k == "font-size") { return StyleBox.SourceFont(); }
+        if (k == "font") { return StyleBox.SourceFont(); }
+        if (k == "width") { return StyleBox.SourceWidth(); }
+        if (k == "height") { return StyleBox.SourceHeight(); }
+        if (k == "min-width") { return StyleBox.SourceMinW(); }
+        if (k == "min-height") { return StyleBox.SourceMinH(); }
+        if (k == "max-width") { return StyleBox.SourceMaxW(); }
+        if (k == "max-height") { return StyleBox.SourceMaxH(); }
+        if (k == "flex-basis") { return StyleBox.SourceBasis(); }
+        if (k == "flex") { return StyleBox.SourceBasis(); }
+        if (k == "gap") { return StyleBox.SourceGap(); }
+        if (k == "row-gap") { return StyleBox.SourceRowGap(); }
+        if (k == "column-gap") { return StyleBox.SourceColGap(); }
+        if (k == "padding-left") { return StyleBox.SourcePadL(); }
+        if (k == "padding-top") { return StyleBox.SourcePadT(); }
+        if (k == "padding-right") { return StyleBox.SourcePadR(); }
+        if (k == "padding-bottom") { return StyleBox.SourcePadB(); }
+        if (k == "margin-left") { return StyleBox.SourceMarL(); }
+        if (k == "margin-top") { return StyleBox.SourceMarT(); }
+        if (k == "margin-right") { return StyleBox.SourceMarR(); }
+        if (k == "margin-bottom") { return StyleBox.SourceMarB(); }
+        if (k == "border-top-left-radius") { return StyleBox.SourceRadiusTL(); }
+        if (k == "border-top-right-radius") { return StyleBox.SourceRadiusTR(); }
+        if (k == "border-bottom-right-radius") { return StyleBox.SourceRadiusBR(); }
+        if (k == "border-bottom-left-radius") { return StyleBox.SourceRadiusBL(); }
+        if (k == "line-height") { return StyleBox.SourceLineHeight(); }
+        if (k == "letter-spacing") { return StyleBox.SourceLetterSpacing(); }
+        if (k == "border") { return StyleBox.SourceBorder(); }
+        if (k == "border-width") { return StyleBox.SourceBorder(); }
+        if (k == "border-top") { return StyleBox.SourceBorderTop(); }
+        if (k == "border-top-width") { return StyleBox.SourceBorderTop(); }
+        if (k == "border-right") { return StyleBox.SourceBorderRight(); }
+        if (k == "border-right-width") { return StyleBox.SourceBorderRight(); }
+        if (k == "border-bottom") { return StyleBox.SourceBorderBottom(); }
+        if (k == "border-bottom-width") { return StyleBox.SourceBorderBottom(); }
+        if (k == "border-left") { return StyleBox.SourceBorderLeft(); }
+        if (k == "border-left-width") { return StyleBox.SourceBorderLeft(); }
+        if (k == "top") { return StyleBox.SourcePosT(); }
+        if (k == "right") { return StyleBox.SourcePosR(); }
+        if (k == "bottom") { return StyleBox.SourcePosB(); }
+        if (k == "left") { return StyleBox.SourcePosL(); }
+        if (k == "padding" || k == "pad") {
+            return StyleBox.SourcePadL() | StyleBox.SourcePadT()
+                | StyleBox.SourcePadR() | StyleBox.SourcePadB();
         }
-        if (k == "width" || k == "min-width" || k == "max-width"
-                || k == "flex-basis") {
-            return StyleBox.SourceWidth();
+        if (k == "margin") {
+            return StyleBox.SourceMarL() | StyleBox.SourceMarT()
+                | StyleBox.SourceMarR() | StyleBox.SourceMarB();
         }
-        if (k == "height" || k == "min-height" || k == "max-height") {
-            return StyleBox.SourceHeight();
+        if (k == "radius" || k == "border-radius") {
+            return StyleBox.SourceRadius() | StyleBox.SourceRadiusTL()
+                | StyleBox.SourceRadiusTR() | StyleBox.SourceRadiusBR()
+                | StyleBox.SourceRadiusBL();
         }
-        if (k == "gap" || k == "row-gap" || k == "column-gap") {
-            return StyleBox.SourceGap();
+        if (k == "inset") {
+            return StyleBox.SourcePosT() | StyleBox.SourcePosR()
+                | StyleBox.SourcePosB() | StyleBox.SourcePosL();
         }
-        if (k == "radius" || k == "border-radius"
-                || k == "border-top-left-radius"
-                || k == "border-top-right-radius"
-                || k == "border-bottom-right-radius"
-                || k == "border-bottom-left-radius") {
-            return StyleBox.SourceRadius();
-        }
-        if (k == "padding" || k == "pad" || k == "padding-left"
-                || k == "padding-top" || k == "padding-right"
-                || k == "padding-bottom" || k == "margin"
-                || k == "margin-left" || k == "margin-top"
-                || k == "margin-right" || k == "margin-bottom") {
-            return StyleBox.SourcePadding();
+        if (k == "translate" || k == "transform") {
+            return StyleBox.SourceTx() | StyleBox.SourceTy();
         }
         return 0;
     }
@@ -1020,10 +1066,7 @@ class StyleSheet {
         return false;
     }
 
-    /// text：颜色 / 字体 / 对齐 / 变换 / 换行。
-    /// `line-height`：`normal`（未声明态）、长度（px/em/…）、百分比
-    /// 或无单位数字（倍数）。量纲记 lineHeightKind：0 未声明，1 px，
-    /// 2 千分（% 按 n*10，倍数按 n*1000；消费端乘 fontPx / 1000）。
+    /// line-height 长度与倍数分开存储，百分比不进入 DPI 长度换算。
     static void LineHeightOf(StyleBox b, string v) {
         string t = StyleSheet.Lower(StyleSheet.Trim(v));
         if (t == "normal" || t == "") {
@@ -1045,17 +1088,17 @@ class StyleSheet {
             b.lineHeightKind = 2;
             return;
         }
-        b.lineHeight = StyleSheet.Len(b, v);
+        b.lineHeight = StyleSheet.LenField(b, v, StyleBox.SourceLineHeight());
         b.lineHeightKind = 1;
     }
 
     static bool DeclText(StyleBox b, string k, string v) {
         if (k == "color") { b.fg = StyleSheet.ParseColor(v); return true; }
         if (k == "accent-color") { b.accent = StyleSheet.ParseColor(v); return true; }
-        if (k == "font-size" || k == "font") { b.fontPx = StyleSheet.Len(b, v); return true; }
+        if (k == "font-size" || k == "font") { b.fontPx = StyleSheet.LenField(b, v, StyleBox.SourceFont()); return true; }
         if (k == "font-weight") { b.fontWeight = StyleSheet.Weight(v); return true; }
         if (k == "line-height") { StyleSheet.LineHeightOf(b, v); return true; }
-        if (k == "letter-spacing") { b.letterSpacing = StyleSheet.Len(b, v); return true; }
+        if (k == "letter-spacing") { b.letterSpacing = StyleSheet.LenField(b, v, StyleBox.SourceLetterSpacing()); return true; }
         if (k == "text-shadow") { StyleSheet.DeclTextShadow(b, v); return true; }
         if (k == "text-align") {
             b.align = 0;
@@ -1064,8 +1107,6 @@ class StyleSheet {
             return true;
         }
         if (k == "vertical-align") {
-            // P2：行内对齐通道（baseline 缺省）。valign 的旧映射保留
-            // （历史上该属性曾喂给块级 valign 的控件）。
             b.valign = 0;
             b.vaInline = 0;
             if (v == "middle" || v == "center") { b.valign = 1; b.vaInline = 1; }
@@ -1102,12 +1143,12 @@ class StyleSheet {
         if (k == "border-right") { StyleSheet.DeclBorder(b, v, 2); return true; }
         if (k == "border-bottom") { StyleSheet.DeclBorder(b, v, 3); return true; }
         if (k == "border-left") { StyleSheet.DeclBorder(b, v, 4); return true; }
-        if (k == "border-width") { b.borderW = StyleSheet.Len(b, v); return true; }
+        if (k == "border-width") { b.borderW = StyleSheet.LenField(b, v, StyleBox.SourceBorder()); return true; }
         if (k == "border-color") { b.borderColor = StyleSheet.ParseColor(v); return true; }
-        if (k == "border-top-width") { b.borderTopW = StyleSheet.Len(b, v); return true; }
-        if (k == "border-right-width") { b.borderRightW = StyleSheet.Len(b, v); return true; }
-        if (k == "border-bottom-width") { b.borderBottomW = StyleSheet.Len(b, v); return true; }
-        if (k == "border-left-width") { b.borderLeftW = StyleSheet.Len(b, v); return true; }
+        if (k == "border-top-width") { b.borderTopW = StyleSheet.LenField(b, v, StyleBox.SourceBorderTop()); return true; }
+        if (k == "border-right-width") { b.borderRightW = StyleSheet.LenField(b, v, StyleBox.SourceBorderRight()); return true; }
+        if (k == "border-bottom-width") { b.borderBottomW = StyleSheet.LenField(b, v, StyleBox.SourceBorderBottom()); return true; }
+        if (k == "border-left-width") { b.borderLeftW = StyleSheet.LenField(b, v, StyleBox.SourceBorderLeft()); return true; }
         if (k == "border-top-color") { b.borderTopColor = StyleSheet.ParseColor(v); return true; }
         if (k == "border-right-color") { b.borderRightColor = StyleSheet.ParseColor(v); return true; }
         if (k == "border-bottom-color") { b.borderBottomColor = StyleSheet.ParseColor(v); return true; }
@@ -1117,19 +1158,19 @@ class StyleSheet {
             return true;
         }
         if (k == "border-top-left-radius") {
-            StyleSheet.CornerRadius(b, 0, StyleSheet.Len(b, v));
+            StyleSheet.CornerRadius(b, 0, StyleSheet.LenField(b, v, StyleBox.SourceRadiusTL()));
             return true;
         }
         if (k == "border-top-right-radius") {
-            StyleSheet.CornerRadius(b, 1, StyleSheet.Len(b, v));
+            StyleSheet.CornerRadius(b, 1, StyleSheet.LenField(b, v, StyleBox.SourceRadiusTR()));
             return true;
         }
         if (k == "border-bottom-right-radius") {
-            StyleSheet.CornerRadius(b, 2, StyleSheet.Len(b, v));
+            StyleSheet.CornerRadius(b, 2, StyleSheet.LenField(b, v, StyleBox.SourceRadiusBR()));
             return true;
         }
         if (k == "border-bottom-left-radius") {
-            StyleSheet.CornerRadius(b, 3, StyleSheet.Len(b, v));
+            StyleSheet.CornerRadius(b, 3, StyleSheet.LenField(b, v, StyleBox.SourceRadiusBL()));
             return true;
         }
         if (k == "box-shadow" || k == "shadow") { StyleSheet.DeclShadow(b, v); return true; }
@@ -1138,8 +1179,6 @@ class StyleSheet {
             if (v == "dashed" || v == "dotted") { b.borderStyle = 1; }
             return true;
         }
-        // 两种没有自有 CSS 拼写的装饰：拟物化
-        // 凸起/内陷边对和跟随光标的 sheen 光泽。
         if (k == "emboss" || k == "-zan-emboss") {
             b.emboss = 0;
             if (v == "raised") { b.emboss = 1; }
@@ -1161,38 +1200,33 @@ class StyleSheet {
     /// 盒子度量：padding / margin / size / gap。
     static bool DeclBoxMetrics(StyleBox b, string k, string v) {
         if (k == "padding" || k == "pad") { StyleSheet.DeclSides(b, v, 0); return true; }
-        if (k == "padding-left") { b.padL = StyleSheet.Len(b, v); return true; }
-        if (k == "padding-top") { b.padT = StyleSheet.Len(b, v); return true; }
-        if (k == "padding-right") { b.padR = StyleSheet.Len(b, v); return true; }
-        if (k == "padding-bottom") { b.padB = StyleSheet.Len(b, v); return true; }
+        if (k == "padding-left") { b.padL = StyleSheet.LenField(b, v, StyleBox.SourcePadL()); return true; }
+        if (k == "padding-top") { b.padT = StyleSheet.LenField(b, v, StyleBox.SourcePadT()); return true; }
+        if (k == "padding-right") { b.padR = StyleSheet.LenField(b, v, StyleBox.SourcePadR()); return true; }
+        if (k == "padding-bottom") { b.padB = StyleSheet.LenField(b, v, StyleBox.SourcePadB()); return true; }
         if (k == "margin") { StyleSheet.DeclSides(b, v, 1); return true; }
-        if (k == "margin-left") { b.marL = StyleSheet.SideVal(b, v, true); return true; }
-        if (k == "margin-top") { b.marT = StyleSheet.SideVal(b, v, true); return true; }
-        if (k == "margin-right") { b.marR = StyleSheet.SideVal(b, v, true); return true; }
-        if (k == "margin-bottom") { b.marB = StyleSheet.SideVal(b, v, true); return true; }
+        if (k == "margin-left") { b.marL = StyleSheet.SideLength(b, v, true, StyleBox.SourceMarL()); return true; }
+        if (k == "margin-top") { b.marT = StyleSheet.SideLength(b, v, true, StyleBox.SourceMarT()); return true; }
+        if (k == "margin-right") { b.marR = StyleSheet.SideLength(b, v, true, StyleBox.SourceMarR()); return true; }
+        if (k == "margin-bottom") { b.marB = StyleSheet.SideLength(b, v, true, StyleBox.SourceMarB()); return true; }
         if (k == "width") { StyleSheet.DeclMetric(b, 0, v); return true; }
         if (k == "height") { StyleSheet.DeclMetric(b, 1, v); return true; }
         if (k == "min-width") { StyleSheet.DeclMetric(b, 2, v); return true; }
         if (k == "min-height") { StyleSheet.DeclMetric(b, 3, v); return true; }
         if (k == "max-width") { StyleSheet.DeclMetric(b, 4, v); return true; }
         if (k == "max-height") { StyleSheet.DeclMetric(b, 5, v); return true; }
-        // `gap: <both>` 或 `gap: <row> <column>`（CSS 简写：第一个值是
-        // 行距）。两个值时同时置上两根轴，`row-gap`/`column-gap`
-        // 仍可在其后单独覆盖。
         if (k == "gap") {
             List<string> g = StyleSheet.Tokens(v);
             if (g.Count == 0) { return true; }
-            b.gap = StyleSheet.Len(b, g[0]);
+            b.gap = StyleSheet.LenField(b, g[0], StyleBox.SourceGap());
             if (g.Count >= 2) {
-                b.rowGap = StyleSheet.Len(b, g[0]);
-                b.colGap = StyleSheet.Len(b, g[1]);
+                b.rowGap = StyleSheet.LenField(b, g[0], StyleBox.SourceRowGap());
+                b.colGap = StyleSheet.LenField(b, g[1], StyleBox.SourceColGap());
             }
             return true;
         }
-        if (k == "row-gap") { b.rowGap = StyleSheet.Len(b, v); return true; }
-        if (k == "column-gap") { b.colGap = StyleSheet.Len(b, v); return true; }
-        // P4 grid：容器轨道模板存原文（排版时经 CssGrid.ParseTracks 展开
-        // repeat()/minmax()）；条目放置按 CSS 语法折成线号 + span。
+        if (k == "row-gap") { b.rowGap = StyleSheet.LenField(b, v, StyleBox.SourceRowGap()); return true; }
+        if (k == "column-gap") { b.colGap = StyleSheet.LenField(b, v, StyleBox.SourceColGap()); return true; }
         if (k == "grid-template-columns") { b.gridCols = StyleSheet.Trim(v); return true; }
         if (k == "grid-template-rows") { b.gridRows = StyleSheet.Trim(v); return true; }
         if (k == "grid-auto-columns") { b.gridAutoCols = StyleSheet.Trim(v); return true; }
@@ -1234,28 +1268,29 @@ class StyleSheet {
         return false;
     }
 
-    /// 单个盒子度量（0 宽、1 高、2/3 min、4/5 max）：`%` 值保留
-    /// 为包含块的比例（千分数），其余按像素处理。
+    /// 百分比与绝对长度分开保留，后声明撤销另一量纲的旧值。
     static void DeclMetric(StyleBox b, int which, string v) {
         string tv = StyleSheet.Lower(StyleSheet.Trim(v));
-        if (tv == "auto") {
-            // `width/height: auto` = 未声明（块流里宽填满、高按内容，
-            // 语义由布局端给出）——保持哨兵 -1，此前 "auto" 会被当
-            // 裸数字静默写成 0。
-            return;
-        }
-        bool pct = StyleSheet.IndexOf(v, "%") >= 0;
-        int n = StyleSheet.Len(b, v);
-        if (pct) { n = n * 10; }
-        if (which == 0) { if (pct) { b.widthPm = n; } else { b.width = n; } }
-        else if (which == 1) { if (pct) { b.heightPm = n; } else { b.height = n; } }
-        else if (which == 2) { if (pct) { b.minWPm = n; } else { b.minW = n; } }
-        else if (which == 3) { if (pct) { b.minHPm = n; } else { b.minH = n; } }
-        else if (which == 4) { if (pct) { b.maxWPm = n; } else { b.maxW = n; } }
-        else { if (pct) { b.maxHPm = n; } else { b.maxH = n; } }
+        bool pct = StyleSheet.EndsWith(tv, "%") && !StyleSheet.HasMath(tv);
+        long source = StyleBox.SourceWidth();
+        if (which == 1) { source = StyleBox.SourceHeight(); }
+        else if (which == 2) { source = StyleBox.SourceMinW(); }
+        else if (which == 3) { source = StyleBox.SourceMinH(); }
+        else if (which == 4) { source = StyleBox.SourceMaxW(); }
+        else if (which == 5) { source = StyleBox.SourceMaxH(); }
+        int n = tv == "auto" ? StyleBox.Unset()
+            : (pct ? StyleSheet.Len(b, v) * 10 : StyleSheet.LenField(b, v, source));
+        int px = pct ? StyleBox.Unset() : n;
+        int pm = pct ? n : StyleBox.Unset();
+        if (which == 0) { b.width = px; b.widthPm = pm; }
+        else if (which == 1) { b.height = px; b.heightPm = pm; }
+        else if (which == 2) { b.minW = px; b.minWPm = pm; }
+        else if (which == 3) { b.minH = px; b.minHPm = pm; }
+        else if (which == 4) { b.maxW = px; b.maxWPm = pm; }
+        else { b.maxH = px; b.maxHPm = pm; }
     }
 
-    /// layout：display / flexbox / position / overflow / visibility / cursor。
+    /// 核心契约与语义定义。
     static bool DeclLayout(StyleBox b, string k, string v) {
         if (k == "display") {
             b.display = 0;
@@ -1265,27 +1300,13 @@ class StyleSheet {
                 b.display = 1; b.inlineLevel = 1; b.bfc = 1;
             }
             else if (v == "none") { b.display = 2; }
-            else if (v == "block") {
-                // 普通块容器（P1）：与首/尾子 margin 塌陷。
-                b.display = 3;
-            }
-            else if (v == "flow-root") {
-                // flow-root 建立 BFC：不与首尾子塌陷。
-                b.display = 3; b.bfc = 1;
-            }
-            else if (v == "grid") {
-                // 真 grid（P4）：轨道模板排版；容器是天然的分隔
-                // （子项 margin 不与容器塌陷）。
-                b.display = 4; b.bfc = 1;
-            }
-            else if (v == "inline-grid") {
-                b.display = 4; b.inlineLevel = 1; b.bfc = 1;
-            }
+            else if (v == "block") { b.display = 3; }
+            else if (v == "flow-root") { b.display = 3; b.bfc = 1; }
+            else if (v == "grid") { b.display = 4; }
+            else if (v == "inline-grid") { b.display = 4; b.inlineLevel = 1; b.bfc = 1; }
             else if (v == "inline" || v == "inline-block") {
-                // 行内级（P2 行盒；P1 暂按块排）。inline-block 是 BFC。
                 b.display = 3; b.inlineLevel = 1; b.bfc = 1;
             }
-            else { b.display = 0; }
             return true;
         }
         if (k == "flex-direction") {
@@ -1293,37 +1314,21 @@ class StyleSheet {
             if (v == "column" || v == "column-reverse") { b.flexDir = 1; }
             return true;
         }
-        if (k == "justify-content") {
-            b.justify = StyleSheet.JustifyCode(v);
-            return true;
-        }
-        if (k == "align-items") {
-            b.alignItems = StyleSheet.AlignItemCode(v);
-            return true;
-        }
-        // `flex-flow: <direction> || <wrap>`——两个值顺序任意，各自
-        // 可省。
+        if (k == "justify-content") { b.justify = StyleSheet.JustifyCode(v); return true; }
+        if (k == "align-items") { b.alignItems = StyleSheet.AlignItemCode(v); return true; }
         if (k == "flex-flow") {
             List<string> ff = StyleSheet.Tokens(v);
             for (int i = 0; i < ff.Count; i = i + 1) {
                 string t = StyleSheet.Lower(ff[i]);
                 if (t == "row" || t == "row-reverse") { b.flexDir = 0; }
-                else if (t == "column" || t == "col" || t == "column-reverse") {
-                    b.flexDir = 1;
-                } else if (t == "wrap" || t == "wrap-reverse") { b.wrap = 1; }
+                else if (t == "column" || t == "col" || t == "column-reverse") { b.flexDir = 1; }
+                else if (t == "wrap" || t == "wrap-reverse") { b.wrap = 1; }
                 else if (t == "nowrap") { b.wrap = 0; }
             }
             return true;
         }
-        if (k == "flex-wrap") {
-            b.wrap = 0;
-            if (v == "wrap" || v == "wrap-reverse") { b.wrap = 1; }
-            return true;
-        }
-        if (k == "align-content") {
-            b.alignContent = StyleSheet.AlignContentCode(v);
-            return true;
-        }
+        if (k == "flex-wrap") { b.wrap = v == "wrap" || v == "wrap-reverse" ? 1 : 0; return true; }
+        if (k == "align-content") { b.alignContent = StyleSheet.AlignContentCode(v); return true; }
         if (k == "align-self") {
             b.alignSelf = 0;
             if (v == "auto") { b.alignSelf = 0 - 1; }
@@ -1332,15 +1337,11 @@ class StyleSheet {
             if (v == "flex-end" || v == "end" || v == "bottom") { b.alignSelf = 3; }
             return true;
         }
-        // `place-content: <align-content> [<justify-content>]`——一个值时
-        // 两根轴取同一个（`place-content: center` 就是整块居中）。
         if (k == "place-content") {
             List<string> pc = StyleSheet.Tokens(v);
             if (pc.Count == 0) { return true; }
-            b.alignContent = StyleSheet.AlignContentCode(StyleSheet.Lower(pc[0]));
-            string j = pc[0];
-            if (pc.Count >= 2) { j = pc[1]; }
-            b.justify = StyleSheet.JustifyCode(StyleSheet.Lower(j));
+            b.alignContent = StyleSheet.AlignContentCode(pc[0]);
+            if (pc.Count >= 2) { b.justify = StyleSheet.JustifyCode(pc[1]); }
             return true;
         }
         if (k == "flex") { StyleSheet.DeclFlex(b, v); return true; }
@@ -1355,36 +1356,21 @@ class StyleSheet {
             if (v == "absolute" || v == "fixed") { b.position = 2; }
             return true;
         }
-        if (k == "top") { b.posT = StyleSheet.Len(b, v); return true; }
-        if (k == "right") { b.posR = StyleSheet.Len(b, v); return true; }
-        if (k == "bottom") { b.posB = StyleSheet.Len(b, v); return true; }
-        if (k == "left") { b.posL = StyleSheet.Len(b, v); return true; }
-        // `inset: <all> | <v> <h> | <t> <h> <b> | <t> <r> <b> <l>`
-        // （四边偏移的简写，和 padding 同一套取值规则）。
+        if (k == "top") { b.posT = StyleSheet.LenField(b, v, StyleBox.SourcePosT()); return true; }
+        if (k == "right") { b.posR = StyleSheet.LenField(b, v, StyleBox.SourcePosR()); return true; }
+        if (k == "bottom") { b.posB = StyleSheet.LenField(b, v, StyleBox.SourcePosB()); return true; }
+        if (k == "left") { b.posL = StyleSheet.LenField(b, v, StyleBox.SourcePosL()); return true; }
         if (k == "inset") {
             List<string> ins = StyleSheet.Tokens(v);
             if (ins.Count == 0) { return true; }
-            int t = StyleSheet.Len(b, ins[0]);
-            int r = t;
-            int bo = t;
-            int l = t;
-            if (ins.Count == 2) {
-                r = StyleSheet.Len(b, ins[1]);
-                l = r;
-            } else if (ins.Count == 3) {
-                r = StyleSheet.Len(b, ins[1]);
-                l = r;
-                bo = StyleSheet.Len(b, ins[2]);
-            } else if (ins.Count >= 4) {
-                r = StyleSheet.Len(b, ins[1]);
-                bo = StyleSheet.Len(b, ins[2]);
-                l = StyleSheet.Len(b, ins[3]);
-            }
-            b.posT = t; b.posR = r; b.posB = bo; b.posL = l;
+            b.posT = StyleSheet.LenField(b, StyleSheet.SideToken(ins, 0), StyleBox.SourcePosT());
+            b.posR = StyleSheet.LenField(b, StyleSheet.SideToken(ins, 1), StyleBox.SourcePosR());
+            b.posB = StyleSheet.LenField(b, StyleSheet.SideToken(ins, 2), StyleBox.SourcePosB());
+            b.posL = StyleSheet.LenField(b, StyleSheet.SideToken(ins, 3), StyleBox.SourcePosL());
             return true;
         }
         if (k == "overflow" || k == "overflow-y" || k == "overflow-x") {
-            // P6 per-axis 滚动语义：visible 0 / hidden|clip 1 / auto 2 /
+            // 图表配置契约与样式属性适配规范
             // scroll 3。shorthand 先双轴复位（CSS：overflow 是双轴
             // 简写，后声明的长hand覆盖单轴），非 visible 落渲染裁剪位
             // 与 BFC 位（P1 判据不变）。
@@ -1519,7 +1505,7 @@ class StyleSheet {
     }
 
     /// `justify-content` 的取值码：0 start，1 center，2 end，
-    /// 3 space-between，4 space-around/evenly。
+    /// 核心契约与语义定义。
     /// 对齐关键词 → alignItems/justifyItems 编码（0 stretch/normal、
     /// 1 start 系、2 center、3 end 系）；grid 与 flex 共用。
     static int AlignItemCode(string v) {
@@ -1538,7 +1524,7 @@ class StyleSheet {
     }
 
     /// `align-content` 的取值码：0 start，1 center，2 end，
-    /// 3 space-between，4 space-around/evenly，5 stretch。
+    /// 核心契约与语义定义。
     static int AlignContentCode(string v) {
         if (v == "center") { return 1; }
         if (v == "flex-end" || v == "end" || v == "bottom") { return 2; }
@@ -1548,7 +1534,7 @@ class StyleSheet {
         return 0;
     }
 
-    /// `flex: none | auto | initial | <grow> [<shrink> [<basis>]]`。
+    /// 核心契约与语义定义。
     static void DeclFlex(StyleBox b, string val) {
         string lo = StyleSheet.Lower(val);
         if (lo == "none") { b.grow = 0; b.shrink = 0; return; }
@@ -1570,8 +1556,10 @@ class StyleSheet {
             b.basisPm = 0 - 1;
             return;
         }
-        int n = StyleSheet.Len(b, val);
-        if (StyleSheet.IndexOf(val, "%") >= 0) {
+        bool pct = StyleSheet.EndsWith(StyleSheet.Trim(val), "%") && !StyleSheet.HasMath(val);
+        int n = pct ? StyleSheet.Len(b, val)
+            : StyleSheet.LenField(b, val, StyleBox.SourceBasis());
+        if (pct) {
             b.basisPm = n * 10;
             b.basis = 0 - 1;
         } else {
@@ -1597,7 +1585,7 @@ class StyleSheet {
         b.aspect = StyleSheet.Perm(val);
     }
 
-    /// motion：transition / transform / animation。
+    /// 核心契约与语义定义。
     static bool DeclMotion(StyleBox b, string k, string v) {
         if (k == "transition" || k == "transition-duration") {
             StyleSheet.DeclTransition(b, v);
@@ -1614,8 +1602,8 @@ class StyleSheet {
         if (k == "scale") { b.scale = StyleSheet.Perm(v); return true; }
         if (k == "translate") {
             List<string> t = StyleSheet.Tokens(v);
-            if (t.Count >= 1) { b.tx = StyleSheet.Len(b, t[0]); }
-            if (t.Count >= 2) { b.ty = StyleSheet.Len(b, t[1]); }
+            if (t.Count >= 1) { b.tx = StyleSheet.LenField(b, t[0], StyleBox.SourceTx()); }
+            b.ty = StyleSheet.LenField(b, t.Count >= 2 ? t[1] : "0", StyleBox.SourceTy());
             return true;
         }
         if (k == "animation" || k == "animation-name") {
@@ -1626,7 +1614,7 @@ class StyleSheet {
         return false;
     }
 
-    /// `background: <color> | linear-gradient([<dir>,] a, b[, c])`。
+    /// 核心契约与语义定义。
     /// 停靠点上的位置（`#fff 40%`）在解析时被丢掉：运行时的
     /// `grad_sample` 只采样 0/500/1000 三个位置，任意停靠点
     /// 没有对应的绘制原语（见 StopColor）。
@@ -1679,7 +1667,6 @@ class StyleSheet {
 
     /// 渐变方向关键字/角度作为 StyleBox.bgDir，当该
     /// token 是颜色停靠点（color stop）时返回 -1。
-    ///
     /// 五个方向码（StyleBox.bgDir）：0 向下、1 向右、2 右下、
     /// 3 向上、4 左下。CSS 的 `to left` 是横向的另一个朝向，没有
     /// 独立的码——它等价于「向右的渐变把两端调过来」，所以这里
@@ -1707,11 +1694,11 @@ class StyleSheet {
             for (int ci = 0; ci < 5; ci = ci + 1) {
                 int a = 0;
                 int dir = 0;
-                if (ci == 0) { a = 180; dir = 0; }      // 底
-                else if (ci == 1) { a = 0; dir = 3; }   // 顶
+                if (ci == 0) { a = 180; dir = 0; }  // 底
+                else if (ci == 1) { a = 0; dir = 3; }  // 顶
                 else if (ci == 2) { a = 90; dir = 1; }  // 右
-                else if (ci == 3) { a = 135; dir = 2; } // 右下
-                else { a = 225; dir = 4; }              // 左下
+                else if (ci == 3) { a = 135; dir = 2; }  // 右下
+                else { a = 225; dir = 4; }  // 左下
                 int dist = a - d;
                 if (dist < 0) { dist = 0 - dist; }
                 if (dist > 180) { dist = 360 - dist; }
@@ -1776,14 +1763,18 @@ class StyleSheet {
     }
 
     /// `border[-side]: <width> [style] <color>`（顺序任意，宽度可选）。
-    ///
     /// style 词（`dashed`/`dotted`）以前被 `continue` 掉、不落到任何
     /// 字段上：`border: 1 dashed var(--border-secondary)` 解析成实线，
     /// 作者看到的是「虚线写了没反应」。这里把它记进 borderStyle，
     /// 绘制侧（StyleBox.PaintBorders）已经会据此走 Fx.DashedBorder。
     static void DeclBorder(StyleBox b, string val, int side) {
         List<string> toks = StyleSheet.Tokens(val);
-        int w = 1;
+        long source = StyleBox.SourceBorder();
+        if (side == 1) { source = StyleBox.SourceBorderTop(); }
+        else if (side == 2) { source = StyleBox.SourceBorderRight(); }
+        else if (side == 3) { source = StyleBox.SourceBorderBottom(); }
+        else if (side == 4) { source = StyleBox.SourceBorderLeft(); }
+        int w = StyleSheet.LenField(b, "1px", source);
         int col = 0;
         bool haveW = false;
         bool haveStyle = false;
@@ -1801,14 +1792,14 @@ class StyleSheet {
                 if (lo == "none") { w = 0; haveW = true; }
                 continue;
             }
-            if (StyleSheet.IsNumeric(tk)) {
-                w = StyleSheet.Len(b, tk);
+            if (StyleSheet.IsNumeric(tk) || StyleSheet.HasMath(tk)) {
+                w = StyleSheet.LenField(b, tk, source);
                 haveW = true;
                 continue;
             }
             col = StyleSheet.ParseColor(tk);
         }
-        if (!haveW) { w = 1; }
+        if (!haveW) { w = StyleSheet.LenField(b, "1px", source); }
         // 只有整盒简写才带 style 语义：`border-top: 1 dashed x` 里
         // 引擎只画统一虚线框（各边线型没有独立字段），写成整体
         // 比「悄悄变实线」更接近作者意图。
@@ -1833,49 +1824,39 @@ class StyleSheet {
     static void DeclRadius(StyleBox b, string val) {
         List<string> toks = StyleSheet.Tokens(val);
         if (toks.Count == 0) { return; }
-        if (toks.Count == 1) {
-            b.SetRadius(StyleSheet.Len(b, toks[0]));
-            return;
-        }
-        int tl = StyleSheet.Len(b, toks[0]);
-        int tr = tl;
-        int br = tl;
-        int bl = tl;
-        if (toks.Count == 2) {
-            tr = StyleSheet.Len(b, toks[1]);
-            br = tl;
-            bl = tr;
-        } else if (toks.Count == 3) {
-            tr = StyleSheet.Len(b, toks[1]);
-            br = StyleSheet.Len(b, toks[2]);
-            bl = tr;
-        } else {
-            tr = StyleSheet.Len(b, toks[1]);
-            br = StyleSheet.Len(b, toks[2]);
-            bl = StyleSheet.Len(b, toks[3]);
-        }
-        b.radiusTL = tl; b.radiusTR = tr; b.radiusBR = br; b.radiusBL = bl;
-        int max = tl;
-        if (tr > max) { max = tr; }
-        if (br > max) { max = br; }
-        if (bl > max) { max = bl; }
-        b.radius = max;
+        b.radiusTL = StyleSheet.LenField(b, StyleSheet.SideToken(toks, 0), StyleBox.SourceRadiusTL());
+        b.radiusTR = StyleSheet.LenField(b, StyleSheet.SideToken(toks, 1), StyleBox.SourceRadiusTR());
+        b.radiusBR = StyleSheet.LenField(b, StyleSheet.SideToken(toks, 2), StyleBox.SourceRadiusBR());
+        b.radiusBL = StyleSheet.LenField(b, StyleSheet.SideToken(toks, 3), StyleBox.SourceRadiusBL());
+        int r = b.radiusTL;
+        long source = StyleBox.SourceRadiusTL();
+        if (b.radiusTR > r) { r = b.radiusTR; source = StyleBox.SourceRadiusTR(); }
+        if (b.radiusBR > r) { r = b.radiusBR; source = StyleBox.SourceRadiusBR(); }
+        if (b.radiusBL > r) { r = b.radiusBL; source = StyleBox.SourceRadiusBL(); }
+        b.radius = r;
+        b.SetPrescaled(StyleBox.SourceRadius(), b.IsPrescaled(source));
     }
 
     /// 单个角的圆角（`border-top-left-radius` 等，`which`：0 TL、
     /// 1 TR、2 BR、3 BL）。
-    ///
     /// 未被声明过的角先继承当前的 `radius`：StyleBox 用"四个角都
     /// 未声明"表示全圆角，只写一个角的话另外三个必须落成具体值，
     /// 否则 Corners() 会把它们当成直角，一条
     /// `border-top-left-radius: 0` 就会把整个盒子削成方的。
     static void CornerRadius(StyleBox b, int which, int v) {
+        long source = StyleBox.SourceRadiusTL();
+        if (which == 1) { source = StyleBox.SourceRadiusTR(); }
+        else if (which == 2) { source = StyleBox.SourceRadiusBR(); }
+        else if (which == 3) { source = StyleBox.SourceRadiusBL(); }
+        bool physical = b.IsPrescaled(source);
         int fb = b.radius;
         if (fb < 0) { fb = 0; }
-        if (b.radiusTL < 0) { b.radiusTL = fb; }
-        if (b.radiusTR < 0) { b.radiusTR = fb; }
-        if (b.radiusBR < 0) { b.radiusBR = fb; }
-        if (b.radiusBL < 0) { b.radiusBL = fb; }
+        bool inherited = b.IsPrescaled(StyleBox.SourceRadius());
+        if (b.radiusTL < 0) { b.radiusTL = fb; b.SetPrescaled(StyleBox.SourceRadiusTL(), inherited); }
+        if (b.radiusTR < 0) { b.radiusTR = fb; b.SetPrescaled(StyleBox.SourceRadiusTR(), inherited); }
+        if (b.radiusBR < 0) { b.radiusBR = fb; b.SetPrescaled(StyleBox.SourceRadiusBR(), inherited); }
+        if (b.radiusBL < 0) { b.radiusBL = fb; b.SetPrescaled(StyleBox.SourceRadiusBL(), inherited); }
+        b.SetPrescaled(source, physical);
         if (which == 0) { b.radiusTL = v; }
         else if (which == 1) { b.radiusTR = v; }
         else if (which == 2) { b.radiusBR = v; }
@@ -1885,6 +1866,11 @@ class StyleSheet {
         if (b.radiusBR > max) { max = b.radiusBR; }
         if (b.radiusBL > max) { max = b.radiusBL; }
         b.radius = max;
+        long maxSource = StyleBox.SourceRadiusTL();
+        if (b.radiusTR == max) { maxSource = StyleBox.SourceRadiusTR(); }
+        if (b.radiusBR == max) { maxSource = StyleBox.SourceRadiusBR(); }
+        if (b.radiusBL == max) { maxSource = StyleBox.SourceRadiusBL(); }
+        b.SetPrescaled(StyleBox.SourceRadius(), b.IsPrescaled(maxSource));
     }
 
     /// `box-shadow: [inset] <dx> <dy> [blur] <color>`（或仅一个颜色）。
@@ -1894,25 +1880,26 @@ class StyleSheet {
             return;
         }
         List<string> toks = StyleSheet.Tokens(val);
-        List<int> nums = new List<int>();
+        List<string> nums = new List<string>();
         int col = 0;
         int i = 0;
         while (i < toks.Count) {
             string tk = toks[i];
             i = i + 1;
             if (StyleSheet.Lower(tk) == "inset") { b.shadowInset = 1; continue; }
-            if (StyleSheet.IsNumeric(tk)) { nums.Add(StyleSheet.Len(b, tk)); continue; }
+            if (StyleSheet.IsNumeric(tk) || StyleSheet.HasMath(tk)) { nums.Add(tk); continue; }
             col = StyleSheet.ParseColor(tk);
         }
         if (col != 0) { b.shadow = col; }
         if (nums.Count >= 2) {
-            b.shadowDx = nums[0];
-            b.shadowDy = nums[1];
-            if (nums.Count >= 3) { b.shadowBlur = nums[2]; }
+            b.shadowDx = StyleSheet.LenStored(b, nums[0], StyleBox.SourceShadowDx());
+            b.shadowDy = StyleSheet.LenStored(b, nums[1], StyleBox.SourceShadowDy());
+            if (nums.Count >= 3) { b.shadowBlur = StyleSheet.LenStored(b, nums[2], StyleBox.SourceShadowBlur()); }
         } else if (nums.Count == 1) {
-            b.shadowDy = nums[0];
+            b.shadowDy = StyleSheet.LenStored(b, nums[0], StyleBox.SourceShadowDy());
         } else if (b.shadowDy == 0) {
             b.shadowDy = 2;
+            b.SetPrescaled(StyleBox.SourceShadowDy(), false);
         }
     }
 
@@ -1949,30 +1936,34 @@ class StyleSheet {
         return StyleSheet.Len(b, tok);
     }
 
+    static string SideToken(List<string> toks, int side) {
+        if (side == 0) { return toks[0]; }
+        if (side == 1) { return toks.Count >= 2 ? toks[1] : toks[0]; }
+        if (side == 2) { return toks.Count >= 3 ? toks[2] : toks[0]; }
+        return toks.Count >= 4 ? toks[3] : (toks.Count >= 2 ? toks[1] : toks[0]);
+    }
+
+    static int SideLength(StyleBox b, string tok, bool margin, long source) {
+        if (tok == "auto") {
+            b.SetPrescaled(source, false);
+            return margin ? StyleBox.Unset() : 0;
+        }
+        return StyleSheet.LenField(b, tok, source);
+    }
+
     static void DeclSides(StyleBox b, string val, int which) {
         List<string> toks = StyleSheet.Tokens(val);
         if (toks.Count == 0) { return; }
-        bool margin = which == 1;
-        int t = StyleSheet.SideVal(b, toks[0], margin);
-        int r = t;
-        int bo = t;
-        int l = t;
-        if (toks.Count == 2) {
-            r = StyleSheet.SideVal(b, toks[1], margin);
-            l = r;
-        } else if (toks.Count == 3) {
-            r = StyleSheet.SideVal(b, toks[1], margin);
-            l = r;
-            bo = StyleSheet.SideVal(b, toks[2], margin);
-        } else if (toks.Count >= 4) {
-            r = StyleSheet.SideVal(b, toks[1], margin);
-            bo = StyleSheet.SideVal(b, toks[2], margin);
-            l = StyleSheet.SideVal(b, toks[3], margin);
-        }
         if (which == 0) {
-            b.padT = t; b.padR = r; b.padB = bo; b.padL = l;
+            b.padT = StyleSheet.SideLength(b, StyleSheet.SideToken(toks, 0), false, StyleBox.SourcePadT());
+            b.padR = StyleSheet.SideLength(b, StyleSheet.SideToken(toks, 1), false, StyleBox.SourcePadR());
+            b.padB = StyleSheet.SideLength(b, StyleSheet.SideToken(toks, 2), false, StyleBox.SourcePadB());
+            b.padL = StyleSheet.SideLength(b, StyleSheet.SideToken(toks, 3), false, StyleBox.SourcePadL());
         } else {
-            b.marT = t; b.marR = r; b.marB = bo; b.marL = l;
+            b.marT = StyleSheet.SideLength(b, StyleSheet.SideToken(toks, 0), true, StyleBox.SourceMarT());
+            b.marR = StyleSheet.SideLength(b, StyleSheet.SideToken(toks, 1), true, StyleBox.SourceMarR());
+            b.marB = StyleSheet.SideLength(b, StyleSheet.SideToken(toks, 2), true, StyleBox.SourceMarB());
+            b.marL = StyleSheet.SideLength(b, StyleSheet.SideToken(toks, 3), true, StyleBox.SourceMarL());
         }
     }
 
@@ -1990,30 +1981,31 @@ class StyleSheet {
         }
     }
 
-    /// `transform: translate(x,y) translateX(x) translateY(y) scale(n) rotate(deg)`。
+    /// 核心契约与语义定义。
     static void DeclTransform(StyleBox b, string val) {
         string s = val;
         if (StyleSheet.Lower(s) == "none") {
             b.tx = 0; b.ty = 0; b.scale = 1000; b.rotate = 0;
+            b.SetPrescaled(StyleBox.SourceTx() | StyleBox.SourceTy(), false);
             return;
         }
         int i = 0;
         while (i < s.Length) {
             int open = Css.IndexFrom(s, "(", i);
             if (open < 0) { return; }
-            int close = Css.IndexFrom(s, ")", open + 1);
+            int close = Css.MatchParen(s, open);
             if (close < 0) { return; }
             string name = StyleSheet.Lower(StyleSheet.Trim(s.Substring(i, open - i)));
             string args = s.Substring(open + 1, close - open - 1);
             i = close + 1;
-            List<string> a = Css.SplitTrim(args, ",");
+            List<string> a = Css.SplitTopTrim(args, ",");
             if (name == "translate") {
-                if (a.Count >= 1) { b.tx = StyleSheet.Len(b, a[0]); }
-                if (a.Count >= 2) { b.ty = StyleSheet.Len(b, a[1]); }
+                if (a.Count >= 1) { b.tx = StyleSheet.LenField(b, a[0], StyleBox.SourceTx()); }
+                if (a.Count >= 2) { b.ty = StyleSheet.LenField(b, a[1], StyleBox.SourceTy()); }
             } else if (name == "translatex") {
-                if (a.Count >= 1) { b.tx = StyleSheet.Len(b, a[0]); }
+                if (a.Count >= 1) { b.tx = StyleSheet.LenField(b, a[0], StyleBox.SourceTx()); }
             } else if (name == "translatey") {
-                if (a.Count >= 1) { b.ty = StyleSheet.Len(b, a[0]); }
+                if (a.Count >= 1) { b.ty = StyleSheet.LenField(b, a[0], StyleBox.SourceTy()); }
             } else if (name == "scale") {
                 if (a.Count >= 1) { b.scale = StyleSheet.Perm(a[0]); }
             } else if (name == "rotate") {
@@ -2053,7 +2045,7 @@ class StyleSheet {
         if (at < 0) { return 0; }
         int close = Css.IndexFrom(val, ")", at);
         if (close < 0) { return 0; }
-        return StyleSheet.Len(b, val.Substring(at + 5, close - at - 5));
+        return StyleSheet.LenStored(b, val.Substring(at + 5, close - at - 5), StyleBox.SourceBlur());
     }
 
     /// 缓动函数名转枚举码：ease/linear/ease-in/ease-out/ease-in-out，
@@ -2129,8 +2121,7 @@ class StyleSheet {
         bool visual = false;
         for (int j = 0; j < imp.Count(); j = j + 1) {
             string k = imp.KeyAt(j);
-            if (StyleSheet.DeclSource(box, k, StyleSheet.ValStr(imp.ValAt(j)),
-                                      StyleSheet.IsPrescaled(block, k))) {
+            if (StyleSheet.DeclBlock(box, block, k, true)) {
                 visual = true;
             } else {
                 c.SetProp(k, StyleSheet.Scalar(imp.ValAt(j)));
@@ -2150,7 +2141,7 @@ class StyleSheet {
     }
 
     /// ApplySelector 的主体：一个声明块（JsonValue 对象）落到
-    /// 控件上。选择器路径与内联 style 通道（ApplyInline）共用。
+    /// 控件上。内联 style 原文由 ApplyInline 保存并在解析时重放。
     static void ApplyBlock(Control c, JsonValue block) {
         StyleBox box = new StyleBox();
         bool visual = false;
@@ -2162,7 +2153,7 @@ class StyleSheet {
             string k = block.KeyAt(i);
             JsonValue v = block.ValAt(i);
             i = i + 1;
-            if (k == "__zan_prescaled" || k == "__zan_important") { continue; }
+            if (StyleSheet.InternalKey(k)) { continue; }
             if (k == "pad" || k == "padding") {
                 c.Pad(StyleSheet.Num(StyleSheet.ValStr(v)));
                 continue;
@@ -2177,8 +2168,7 @@ class StyleSheet {
             if (k == "y") { c.my = v.AsInt(0); continue; }
             if (k == "width") { c.prefW = StyleSheet.Num(StyleSheet.ValStr(v)); continue; }
             if (k == "height") { c.prefH = StyleSheet.Num(StyleSheet.ValStr(v)); continue; }
-            if (StyleSheet.DeclSource(box, k, StyleSheet.ValStr(v),
-                                      StyleSheet.IsPrescaled(block, k))) {
+            if (StyleSheet.DeclBlock(box, block, k, false)) {
                 visual = true;
                 continue;
             }
@@ -2187,8 +2177,7 @@ class StyleSheet {
         if (imp != null && imp.IsObject()) {
             for (int j = 0; j < imp.Count(); j = j + 1) {
                 string k = imp.KeyAt(j);
-                if (StyleSheet.DeclSource(box, k, StyleSheet.ValStr(imp.ValAt(j)),
-                                          StyleSheet.IsPrescaled(block, k))) {
+                if (StyleSheet.DeclBlock(box, block, k, true)) {
                     visual = true;
                 }
             }
@@ -2196,19 +2185,56 @@ class StyleSheet {
         if (visual) { StyleSheet.CopyToControl(box, c); }
     }
 
-    /// 内联 style 声明（style="color:#c00; padding:8px"）落到控件：
-    /// 声明文本交给整块 CSS 解析器（缩写键/颜色/函数/!important 全
-    /// 部复用），再走 ApplyBlock——与选择器路径同一落点语义。
-    /// 内联值是字面量，应用一次即终值，不随主题/皮肤重算，与浏览器
-    /// inline style 同语义；视觉键经 CopyToControl 落 style* 覆盖
-    /// 字段，优先级高于类规则（在每次样式解析的 Inline 覆盖之后）。
+    /// 内联 style 原文由 Control 持有，在 Style.Inline 使用当前 DPI、
+    /// 字号和主题令牌重放，复用缩写键/颜色/函数/!important 解析。
+    /// 不写 style* 或 prefW/pad 的第二份副本：替换或清空原文后，
+    /// 未声明的属性自然回到样式表和显式 fluent 设置器的值。
     static void ApplyInline(Control c, string decls) {
         if (c == null || decls == null) { return; }
-        string s = StyleSheet.Trim(decls);
-        if (s == "") { return; }
-        StyleSheet sheet = Css.Parse(".zan-inline { " + s + " }");
+        c.inlineStyleCss = StyleSheet.Trim(decls);
+        c.computedStyle = null;
+        if (c.inlineStyleCss == "") { return; }
+        StyleSheet sheet = Css.Parse(".zan-inline { " + c.inlineStyleCss + " }");
         JsonValue block = sheet.Block(".zan-inline");
-        if (block != null) { StyleSheet.ApplyBlock(c, block); }
+        if (block == null) { return; }
+        JsonValue dock = block.Get("dock");
+        if (dock != null) { c.dock = StyleSheet.DockValue(StyleSheet.ValStr(dock)); }
+        JsonValue x = block.Get("x");
+        JsonValue y = block.Get("y");
+        if (x != null || y != null) {
+            c.logX = x == null ? c.logX : StyleSheet.Num(StyleSheet.ValStr(x));
+            c.logY = y == null ? c.logY : StyleSheet.Num(StyleSheet.ValStr(y));
+            c.logPlaceSet = true;
+        }
+    }
+
+    /// 解析后的盒已有 App/DPI 环境；重放只修改声明的字段。
+    static void ReplayInline(StyleBox b, Control c, int resolvedFont, bool fontPhysical) {
+        string decls = c.inlineStyleCss;
+        if (decls == null || decls == "") { return; }
+        List<CssVarDecl> vars = b.envTheme == null ? new List<CssVarDecl>()
+            : Css.CollectVarDecls(Style.RootFromTheme(b.envTheme));
+        int physicalCount = vars.Count;
+        if (b.envSheet != null && b.envSheet.vars != null) {
+            for (int i = 0; i < b.envSheet.vars.Count(); i = i + 1) {
+                vars.Add(new CssVarDecl(b.envSheet.vars.KeyAt(i),
+                    StyleSheet.ValStr(b.envSheet.vars.ValAt(i))));
+            }
+        }
+        StyleSheet sheet = Css.ParseWithSources(".zan-inline { " + decls + " }", vars, physicalCount);
+        JsonValue block = sheet.Block(".zan-inline");
+        if (block == null) { return; }
+        JsonValue imp = block.Get("__zan_important");
+        bool setsFont = block.Get("font-size") != null || block.Get("font") != null;
+        if (imp != null) {
+            setsFont = setsFont || imp.Get("font-size") != null || imp.Get("font") != null;
+        }
+        if (setsFont) {
+            b.fontPx = resolvedFont;
+            b.SetPrescaled(StyleBox.SourceFont(), fontPhysical);
+        }
+        sheet.ApplyBox(b, ".zan-inline");
+        Style.ScaleBox(b);
     }
 
     /// 复制控件内联携带的视觉属性（Control 只保留
@@ -2248,7 +2274,7 @@ class StyleSheet {
     // ---- 值解析 -----
 
     /// 将 CSS 颜色解析为打包的 0xAARRGGBB int。接受 `#RGB`、
-    /// `#RRGGBB`、`#RRGGBBAA`、`#AARRGGBB`、`rgb()/rgba()`、`hsl()/hsla()`、
+    /// 核心契约与语义定义。
     /// `0x...`、纯十进制数和 CSS 命名颜色。空值或无法解析的值
     /// 返回 0（= 未设置），因此坏规则只是什么都不做。
     static int ParseColor(string val) {
@@ -2340,7 +2366,7 @@ class StyleSheet {
         return outp;
     }
 
-    /// alpha token：`0.5` / `50%` -> 0..255。
+    /// 核心契约与执行状态转移规范。
     static int Alpha255(string tok) {
         if (Css.IndexFrom(tok, "%", 0) >= 0) {
             return StyleSheet.Perm(tok) * 255 / 1000;
@@ -2502,7 +2528,7 @@ class StyleSheet {
                                StyleSheet.Gamma255(bl));
     }
 
-    /// `lab(L a b [/ a])` 与 `lch(L C H [/ a])`（CIE Lab，D50 白点）。
+    /// `lab(L a b [/ a])` 与 `lch(L C H [/ a])`（CIE Lab，白点）。
     static int ParseCielabLike(string val, bool polar) {
         List<string> a = StyleSheet.FuncArgs(val);
         if (a.Count < 3) { return 0; }
@@ -2521,7 +2547,7 @@ class StyleSheet {
         return StyleSheet.LabToRgb(L, ax, bx, alpha);
     }
 
-    /// CIE Lab(D50) -> XYZ(D50) -> Bradford 适应到 D65 ->
+    /// CIE Lab() -> XYZ() -> Bradford 适应到 ->
     /// 线性 sRGB。矩阵常数取自 CSS Color 4 转换样例。
     static int LabToRgb(double L, double ax, double bx, int alpha) {
         double e = 216.0 / 24389.0;
@@ -2954,9 +2980,55 @@ class StyleSheet {
     /// calc()/min()/max()/clamp() 递归求值（见 CssMath）。
     static int Len(StyleBox b, string val) {
         string v = StyleSheet.Trim(val);
+        b.lengthPhysical = false;
         if (v == "") { return 0; }
-        if (StyleSheet.HasMath(v)) { return StyleSheet.CssMath(b, v); }
-        return StyleSheet.UnitPx(b, v);
+        bool previousMath = b.lengthMath;
+        b.lengthMath = StyleSheet.HasMath(v);
+        int n = b.lengthMath ? StyleSheet.CssMath(b, v) : StyleSheet.UnitPx(b, v);
+        b.lengthMath = previousMath;
+        return n;
+    }
+
+    /// 每个赋值点记录自身结果的量纲，简写的其他分量不受影响。
+    static int LenField(StyleBox b, string val, long source) {
+        bool previous = b.lengthDevice;
+        b.lengthDevice = true;
+        int n = StyleSheet.Len(b, val);
+        b.lengthDevice = previous;
+        b.SetPrescaled(source, b.lengthPhysical);
+        return n;
+    }
+
+    static int LenStored(StyleBox b, string val, long source) {
+        bool previous = b.lengthDevice;
+        // 表达式先统一量纲再运算；普通阴影/blur 字面量仍留到绘制缩放。
+        b.lengthDevice = StyleSheet.HasMath(val);
+        int n = StyleSheet.Len(b, val);
+        b.lengthDevice = previous;
+        b.SetPrescaled(source, b.lengthPhysical);
+        return n;
+    }
+
+    static int UnitResult(StyleBox b, int n, bool physical) {
+        if (physical) { b.lengthPhysical = true; return n; }
+        if (b.lengthDevice && b.envDpiScale != 100) {
+            b.lengthPhysical = true;
+            return b.ScaleLogical(n);
+        }
+        return n;
+    }
+
+    static int FontUnit(StyleBox b, bool root) {
+        bool useFont = !root && b.fontPx > 0;
+        int rootFont = b.envRootFontPx > 0 ? b.envRootFontPx : b.envRemPx;
+        int f = useFont ? b.fontPx : (rootFont > 0 ? rootFont : 16);
+        bool physical = useFont ? b.IsPrescaled(StyleBox.SourceFont()) : b.envRemPhysical;
+        if (b.lengthDevice && !physical && b.envDpiScale != 100) {
+            f = b.ScaleLogical(f);
+            physical = true;
+        }
+        if (physical) { b.lengthPhysical = true; }
+        return f;
     }
 
     /// 值里是否带数学函数（calc/min/max/clamp）。
@@ -3006,7 +3078,6 @@ class StyleSheet {
         if (s.Length == 0) { return 0; }
         int i = 0;
         if (s.Substring(0, 1) == "-" || s.Substring(0, 1) == "+") { i = 1; }
-        int st = i;
         while (i < s.Length) {
             string ch = s.Substring(i, 1);
             if (StyleSheet.Digit(ch) || ch == ".") { i = i + 1; }
@@ -3018,49 +3089,40 @@ class StyleSheet {
             return StyleSheet.Num(s);
         }
         int perm = StyleSheet.NumPerm(numStr);
-        if (unit == "" || unit == "px") { return StyleSheet.Round1000(perm); }
-        if (unit == "em") {
-            int font = b.fontPx > 0 ? b.fontPx
-                : (b.envRemPx > 0 ? b.envRemPx : 16);
+        int n = StyleSheet.Round1000(perm);
+        if (unit == "dpx" || b.declPrescaled) {
+            return StyleSheet.UnitResult(b, n, true);
+        }
+        // calc 的无单位乘除因子不能跟着长度一起缩放。
+        if (unit == "" && b.lengthMath) { return n; }
+        if (unit == "" || unit == "px") { return StyleSheet.UnitResult(b, n, false); }
+        if (unit == "em" || unit == "rem" || unit == "ex" || unit == "ch") {
+            int font = StyleSheet.FontUnit(b, unit == "rem");
+            if (unit == "ex" || unit == "ch") { return StyleSheet.Round1000(perm * font / 2); }
             return StyleSheet.Round1000(perm * font);
         }
-        if (unit == "rem") {
-            int rem = b.envRemPx > 0 ? b.envRemPx : 16;
-            return StyleSheet.Round1000(perm * rem);
-        }
-        if (unit == "ex" || unit == "ch") {
-            int f2 = b.fontPx > 0 ? b.fontPx
-                : (b.envRemPx > 0 ? b.envRemPx : 16);
-            return StyleSheet.Round1000(perm * f2 / 2);
-        }
-        if (unit == "pt") { return StyleSheet.Round1000(perm * 4 / 3); }
-        // 绝对单位按 96dpi 折算：pc = 12pt，in = 96px，
-        // cm = 96/2.54，mm = 1/10 cm，q = 1/40 cm。
-        if (unit == "pc") { return StyleSheet.Round1000(perm * 16); }
-        if (unit == "in") { return StyleSheet.Round1000(perm * 96); }
-        if (unit == "cm") { return StyleSheet.Round1000(perm * 37795 / 1000); }
-        if (unit == "mm") { return StyleSheet.Round1000(perm * 37795 / 10000); }
-        if (unit == "q") { return StyleSheet.Round1000(perm * 37795 / 40000); }
-        if (unit == "vw") {
+        if (unit == "pt") { n = StyleSheet.Round1000(perm * 4 / 3); }
+        else if (unit == "pc") { n = StyleSheet.Round1000(perm * 16); }
+        else if (unit == "in") { n = StyleSheet.Round1000(perm * 96); }
+        else if (unit == "cm") { n = StyleSheet.Round1000(perm * 37795 / 1000); }
+        else if (unit == "mm") { n = StyleSheet.Round1000(perm * 37795 / 10000); }
+        else if (unit == "q") { n = StyleSheet.Round1000(perm * 37795 / 40000); }
+        else if (unit == "vw") {
             int w = b.envVw > 0 ? b.envVw : 1280;
-            return StyleSheet.Round1000(perm * w / 100);
-        }
-        if (unit == "vh") {
+            n = StyleSheet.Round1000(perm * w / 100);
+        } else if (unit == "vh") {
             int h = b.envVh > 0 ? b.envVh : 720;
-            return StyleSheet.Round1000(perm * h / 100);
-        }
-        if (unit == "vmin" || unit == "vmax") {
+            n = StyleSheet.Round1000(perm * h / 100);
+        } else if (unit == "vmin" || unit == "vmax") {
             int w2 = b.envVw > 0 ? b.envVw : 1280;
             int h2 = b.envVh > 0 ? b.envVh : 720;
             int base2 = unit == "vmin" ? (w2 < h2 ? w2 : h2) : (w2 > h2 ? w2 : h2);
-            return StyleSheet.Round1000(perm * base2 / 100);
+            n = StyleSheet.Round1000(perm * base2 / 100);
+        } else if (unit == "%") {
+            // width/basis 百分比、line-height 倍数仍交给声明点和布局。
+            return n;
         }
-        if (unit == "%") {
-            // 长度点的 % 语义属于各声明（widthPm/千分比通道）；
-            // 这里维持"裸数字"的历史行为。
-            return StyleSheet.Round1000(perm);
-        }
-        return StyleSheet.Round1000(perm);
+        return StyleSheet.UnitResult(b, n, false);
     }
 
     /// calc()/min()/max()/clamp() 求值（可嵌套）。叶子单位在 UnitPx

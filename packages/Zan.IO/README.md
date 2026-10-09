@@ -25,6 +25,18 @@
 | `Compression/BZip2.zan` | BZip2（BZip2Decoder） |
 | `Compression/Tar.zan` | Tar 打包/解包（保留 unix mode 位） |
 
+## 跨平台路径与用户目录
+
+`Path.GetFullPath(path)` 按当前工作目录解析完整路径，目标可以尚不存在；
+`Path.IsPathRooted(path)` 判断是否有根。Windows 使用 Unicode 系统接口，
+POSIX 按 `/` 处理路径并保留文件名中的反斜杠。`Path.Combine` 支持空路径和
+有根的第二参数，`GetTempPath()` 返回带末尾分隔符的临时目录。
+
+`KnownFolders` 保留统一入口：Linux 应用目录遵循绝对路径形式的 XDG 环境变量，
+桌面、文档和下载目录读取 `user-dirs.dirs`；macOS 的应用数据目录为
+`~/Library/Application Support`。Windows 应用数据目录读取环境变量，用户目录
+仍使用主目录下的默认位置，尚不读取系统已知文件夹重定向。
+
 ## 留守 stdlib（生成器子编译闭包，`--no-packages` 可达）
 
 `File` / `Directory` / `FileInfo` / `FileInfoEx` / `FileStream` / `Stream` /

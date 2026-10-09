@@ -9,12 +9,20 @@
 |---|---|
 | `Log.zan` | 结构化日志（Log/LogLevel，落盘与内存环形缓冲） |
 | `ServerMetrics.zan` | 请求/SQL/慢路径指标与错误汇点（WebApp 监控数据源） |
-| `Process.zan` | 子进程派生与输出捕获（Process/ProcessResult） |
+| `Process.zan` | 子进程派生、输出捕获及系统关联程序打开（Process/ProcessResult） |
 | `ProcessControl.zan` | 进程树控制（挂起/恢复/终止） |
 | `ProcessList.zan` | 系统进程枚举（ProcessEntry） |
 | `ProcessHost.zan` | 常驻子进程宿主（保活与重启） |
 | `Privileges.zan` | 特权检查（管理员/提权探测） |
 | `ServiceProcess.zan` | Windows 服务集成（SCM 状态码快照：查询/状态/PID） |
+
+## 系统关联程序
+
+`Process.OpenUrl(uri)` 和 `Process.OpenPath(path)` 分别打开绝对 URI、现有文件或目录；
+相对路径按当前工作目录解析，参数不经 shell 解释。Windows 使用 ShellExecuteW，
+Linux 使用 PATH 中的 xdg-open，macOS 使用 /usr/bin/open。返回 true 表示处理器已启动，
+不代表资源加载成功；缺少处理器或输入无效返回 false。无桌面的 Linux 环境需要自行
+提供关联程序；WASI、移动平台目前返回 false。GUI 的 `App.OpenInSystemBrowser` 复用此入口。
 
 ## 消费者
 

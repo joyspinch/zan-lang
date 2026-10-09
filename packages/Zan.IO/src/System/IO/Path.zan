@@ -3,26 +3,24 @@ using System;
 namespace System.IO;
 
 /// <summary>
-/// 路径操作工具。纯字符串处理：唯一剩下的平台调用
-/// 是向操作系统询问临时目录位置的那一个。
+/// 路径操作工具。完整路径按当前工作目录解析，不要求目标存在；
+/// Windows 的完整路径与临时目录查询使用 UTF-16 系统接口。
 /// </summary>
 class Path {
     #if WINDOWS
-    [DllImport("kernel32", EntryPoint = "GetTempPathA")]
-    static extern int WinGetTempPath(int bufLen, string buf);
-    #else
-    [DllImport("crt")]
-    static extern string getenv(string name);
+    [DllImport("kernel32", EntryPoint = "GetTempPathW")]
+    static extern int WinGetTempPath(int bufLen, nint buf);
+
+    [DllImport("kernel32", EntryPoint = "GetFullPathNameW")]
+    static extern int WinGetFullPathName(nint path, int bufLen, nint buf, nint filePart);
     #endif
 
     /// <summary>最后一个分隔符之后的索引，没有分隔符时为 0。</summary>
     static int AfterLastSeparator(string path) {
-        int slash = path.LastIndexOf("/");
-        int bslash = path.LastIndexOf("\\");
-        int sep = slash;
-        if (bslash > sep) { sep = bslash; }
-        if (sep < 0) { return 0; }
-        return sep + 1;
+        for (int i = path.Length - 1; i >= 0; i = i - 1) {
+            if (Path.IsDirectorySeparator(path[i] & 255)) { return i + 1; }
+        }
+        return 0;
     }
 
     /// <summary>从路径中返回文件名（含扩展名）。</summary>
@@ -49,9 +47,104 @@ class Path {
         #endif
     }
 
-    /// <summary>用平台分隔符拼接两个路径字符串。</summary>
+    /// <summary>拼接路径；第二个路径有根时直接返回它，空路径不添加分隔符。
+    /// 保留输入中的分隔符，仅在连接处缺少分隔符时添加一个。</summary>
     static string Combine(string path1, string path2) {
+        if (path1 == null || path2 == null) {
+            throw new ArgumentException("path must not be null");
+        }
+        if (path2.Length == 0) { return path1; }
+        if (path1.Length == 0 || Path.IsPathRooted(path2)) { return path2; }
+        int last = path1[path1.Length - 1] & 255;
+        if (Path.IsDirectorySeparator(last)) { return path1 + path2; }
         return path1 + Path.Separator() + path2;
+    }
+
+    /// <summary>检查路径是否有根。Windows 的盘符相对路径（C:foo）也有根，
+    /// 但仍需要当前目录解析；POSIX 只有 / 是分隔符。</summary>
+    static bool IsPathRooted(string path) {
+        if (path == null || path.Length == 0) { return false; }
+        if (Path.IsDirectorySeparator(path[0] & 255)) { return true; }
+        #if WINDOWS
+        if (path.Length >= 2 && (path[1] & 255) == 58) {
+            int drive = path[0] & 255;
+            return (drive >= 65 && drive <= 90) || (drive >= 97 && drive <= 122);
+        }
+        #endif
+        return false;
+    }
+
+    private static bool IsDirectorySeparator(int c) {
+        if (c == 47) { return true; }
+        #if WINDOWS
+        return c == 92;
+        #else
+        return false;
+        #endif
+    }
+
+    /// <summary>按当前工作目录解析完整路径，不要求文件或目录存在。
+    /// 空路径或含 NUL 的路径抛 ArgumentException，系统查询失败抛 IOException。</summary>
+    static string GetFullPath(string path) {
+        if (path == null || path.Length == 0) {
+            throw new ArgumentException("path must not be empty");
+        }
+        for (int i = 0; i < path.Length; i = i + 1) {
+            if ((path[i] & 255) == 0) {
+                throw new ArgumentException("path must not contain NUL");
+            }
+        }
+        #if WINDOWS
+        nint input = Wide.Of(path);
+        try {
+            int size = 256;
+            while (true) {
+                nint buf = NativeMemory.Alloc(size * 2);
+                try {
+                    int n = Path.WinGetFullPathName(input, size, buf, 0);
+                    if (n <= 0) { throw new IOException("Could not resolve full path: " + path); }
+                    if (n < size) { return Wide.Read(buf); }
+                    if (n >= 1073741823) { throw new IOException("Full path is too long"); }
+                    size = n + 1;
+                } finally {
+                    NativeMemory.Free(buf);
+                }
+            }
+        } finally {
+            Wide.Free(input);
+        }
+        #else
+        string full = path;
+        if (!Path.IsPathRooted(full)) {
+            string cwd = Directory.GetCurrentDirectory();
+            if (cwd == null || !Path.IsPathRooted(cwd)) {
+                throw new IOException("Could not get current directory");
+            }
+            full = Path.Combine(cwd, full);
+        }
+        // 不调用 realpath：新文件也可解析，反斜杠与符号链接不改变词法路径。
+        List<string> parts = new List<string>();
+        int start = 0;
+        for (int i = 0; i <= full.Length; i = i + 1) {
+            if (i < full.Length && (full[i] & 255) != 47) { continue; }
+            string part = full.Substring(start, i - start);
+            start = i + 1;
+            if (part == "" || part == ".") { continue; }
+            if (part == "..") {
+                if (parts.Count > 0) { parts.RemoveAt(parts.Count - 1); }
+            } else {
+                parts.Add(part);
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("/");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (i > 0) { sb.Append("/"); }
+            sb.Append(parts[i]);
+        }
+        if (parts.Count > 0 && full.EndsWith("/")) { sb.Append("/"); }
+        return sb.ToString();
+        #endif
     }
 
     /// <summary>返回路径的目录部分。</summary>
@@ -83,16 +176,31 @@ class Path {
         return Path.GetExtension(path) != "";
     }
 
-    /// <summary>获取系统临时目录路径。</summary>
+    /// <summary>获取带末尾目录分隔符的系统临时目录路径；Windows 查询失败返回空串。</summary>
     static string GetTempPath() {
         #if WINDOWS
-        byte[] buf = new byte[4096];
-        int n = WinGetTempPath(4096, buf);
-        return buf.ToStr(0, n);
+        int size = 256;
+        while (true) {
+            nint buf = NativeMemory.Alloc(size * 2);
+            try {
+                int n = Path.WinGetTempPath(size, buf);
+                if (n <= 0) { return ""; }
+                if (n < size) {
+                    string t = Wide.Read(buf);
+                    if (t.Length == 0 || t.EndsWith("\\") || t.EndsWith("/")) { return t; }
+                    return t + "\\";
+                }
+                if (n >= 1073741823) { return ""; }
+                size = n + 1;
+            } finally {
+                NativeMemory.Free(buf);
+            }
+        }
         #else
-        string t = getenv("TMPDIR");
-        if (t != null && t != "") { return t; }
-        return "/tmp/";
+        string t = Interop.EnvVar("TMPDIR");
+        if (t == "") { return "/tmp/"; }
+        if (t.EndsWith("/")) { return t; }
+        return t + "/";
         #endif
     }
 

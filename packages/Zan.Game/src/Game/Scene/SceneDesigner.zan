@@ -56,7 +56,7 @@ class SceneBarDispatch {
 /// 组件（文本、美术文本、精灵、矩形、圆形、动画）。拖动移动，
 /// 拖角落手柄缩放，吸附网格，在
 /// 检查器中编辑属性、调整 z 顺序、复制，然后保存写出 `.zscene` JSON。
-class SceneDesigner {
+partial class SceneDesigner {
     /// UI 语言码（"zh" / "en"）；IDE 根据其界面语言设置。
     // UI 语言码（"zh" / "en"）；IDE 根据其界面语言设置。
     static string lang = "zh";
@@ -727,6 +727,40 @@ class SceneDesigner {
         this.msg = SceneDesigner.T("layout applied", "已应用排版");
     }
 
+    /// 一键将主选与多选元素全部按当前网格模数（grid）精确吸附坐标，消除拖拽微调时的子像素错位。自动入撤销栈。
+    void SnapSelectionToGrid() {
+        if (this.sel == null) {
+            this.msg = SceneDesigner.T("select an element first", "请先选中一个元素");
+            return;
+        }
+        if (this.grid <= 0) { return; }
+        this.PushUndo();
+
+        int count = 0;
+        if (!this.sel.Locked()) {
+            this.SnapElementToGrid(this.sel);
+            count = count + 1;
+        }
+        for (int i = 0; i < this.selExtra.Count; i = i + 1) {
+            SceneElement e = this.selExtra[i];
+            if (!e.Locked()) {
+                this.SnapElementToGrid(e);
+                count = count + 1;
+            }
+        }
+        this.msg = SceneDesigner.T("snapped ", "已吸附 ") + SceneDoc.IntStr(count)
+            + SceneDesigner.T(" element(s) to grid", " 个元素到网格");
+    }
+
+    void SnapElementToGrid(SceneElement e) {
+        int l = this.DesignLeft(e);
+        int tp = this.DesignTop(e);
+        int g = this.grid;
+        int snL = (l + g / 2) / g * g;
+        int snT = (tp + g / 2) / g * g;
+        this.SetDesignPos(e, snL, snT);
+    }
+
     // --- 顶层渲染 ----------------------------------------------------
 
     /// 渲染整个设计器（功能区 + 画布 + 面板/检查器/状态栏）到矩形 (x,y,w,h)；使用独立的控件 id 序号段，不污染宿主 id。宿主面板开启时只画功能区与画布。
@@ -737,9 +771,6 @@ class SceneDesigner {
         WidgetId.SetSeq(savedSeq);
     }
 
-    /// 宿主（IDE）把元素面板和属性面板画进自己的 dock 面板里，
-    /// 设计器本体就只剩功能区 + 画布。id 基值和 Render 分开，
-    /// 免得两趟互相错位。
     /// 宿主（IDE）把元素面板和属性面板画进自己的 dock 面板里，
     /// 设计器本体就只剩功能区 + 画布。id 基值和 Render 分开，
     /// 免得两趟互相错位。
@@ -849,13 +880,16 @@ class SceneDesigner {
         this.RenderResPicker(app, c, t, x, y, w, h);
     }
 
-    /// 层下拉菜单：列出基础层 + 文档里出现过的层名，选择后画布切到那一层编辑。菜单浮在功能区"编辑：xx"按钮下；点击菜单外关闭。
+    /// 层下拉菜单：列出基础层 + 文档里出现过的层名与新建层入口，选择后画布切到那一层编辑。菜单浮在功能区"编辑：xx"按钮下；点击菜单外关闭。
     void RenderLayerMenu(App app, Canvas c, Theme t, int x, int y, int w, int h) {
         if (!this.layerMenuOpen) { return; }
         List<string> ls = new List<string>();
         ls.Add(SceneDesigner.T("Base layer", "基础层"));
         List<string> docLs = this.DocLayers();
         for (int i = 0; i < docLs.Count; i = i + 1) { ls.Add(docLs[i]); }
+        // 增加新建层操作项
+        ls.Add("+ " + SceneDesigner.T("New Layer", "新建图层"));
+
         int mw = app.Scale(220);
         int rowH = app.Scale(26);
         int mh = app.Scale(8) + ls.Count * rowH + app.Scale(6);
@@ -867,27 +901,47 @@ class SceneDesigner {
             SceneDesigner.T("Edit layer", "编辑层"));
         app.BlockHitsRect(mx, my, mw, mh);
         int iy = my + app.Scale(24);
-        for (int i = 0; i < ls.Count; i = i + 1) {
+        int totalItems = ls.Count;
+        for (int i = 0; i < totalItems; i = i + 1) {
             bool hover = SceneDesigner.InRect(app.mouseX, app.mouseY,
                 mx + app.Scale(4), iy, mw - app.Scale(8), rowH);
             if (hover) {
                 c.FillRect(mx + app.Scale(4), iy, mw - app.Scale(8), rowH, t.bgTertiary);
             }
             string cur = ls[i];
-            bool active = (i == 0 && this.editLayer.Length == 0)
-                || (i > 0 && this.editLayer == ls[i]);
+            bool isNewAction = (i == totalItems - 1);
+            bool active = !isNewAction && ((i == 0 && this.editLayer.Length == 0)
+                || (i > 0 && this.editLayer == ls[i]));
+
+            int textColor = isNewAction ? t.primary : (active ? t.primary : t.textPrimary);
             c.DrawText(mx + app.Scale(10),
                 Canvas.CenterTextY(iy, rowH, t.fontSizeSmall), cur,
-                active ? t.primary : t.textPrimary, t.fontSizeSmall);
+                textColor, t.fontSizeSmall);
+
             int idx = i;
             if (Ui.ClickedIn(app, mx + app.Scale(4), iy, mw - app.Scale(8), rowH)) {
-                this.editLayer = idx == 0 ? "" : ls[idx];
-                this.layerMenuOpen = false;
-                this.sel = null;
-                this.selExtra = new List<SceneElement>();
-                this.msg = idx == 0
-                    ? SceneDesigner.T("editing base layer", "正在编辑基础层")
-                    : SceneDesigner.T("editing layer ", "正在编辑层 ") + this.editLayer;
+                if (isNewAction) {
+                    // 生成唯一图层名 layer1, layer2...
+                    int layerNum = docLs.Count + 1;
+                    string newLayerName = "layer" + SceneDoc.IntStr(layerNum);
+                    while (this.DocHasLayer(newLayerName)) {
+                        layerNum = layerNum + 1;
+                        newLayerName = "layer" + SceneDoc.IntStr(layerNum);
+                    }
+                    this.editLayer = newLayerName;
+                    this.layerMenuOpen = false;
+                    this.sel = null;
+                    this.selExtra = new List<SceneElement>();
+                    this.msg = SceneDesigner.T("created and editing layer ", "已创建并切换到层 ") + this.editLayer;
+                } else {
+                    this.editLayer = idx == 0 ? "" : ls[idx];
+                    this.layerMenuOpen = false;
+                    this.sel = null;
+                    this.selExtra = new List<SceneElement>();
+                    this.msg = idx == 0
+                        ? SceneDesigner.T("editing base layer", "正在编辑基础层")
+                        : SceneDesigner.T("editing layer ", "正在编辑层 ") + this.editLayer;
+                }
                 app.RequestRedraw();
             }
             iy = iy + rowH;
@@ -898,6 +952,16 @@ class SceneDesigner {
             this.layerMenuOpen = false;
             app.RequestRedraw();
         }
+    }
+
+    bool DocHasLayer(string ly) {
+        if (ly == null || ly.Length == 0) { return true; }
+        for (int i = 0; i < this.doc.Count(); i = i + 1) {
+            if (this.doc.ElementAt(i).Layer() == ly) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// 将 s 中的 ASCII 大写字母转为小写；其余字符原样保留（用于扩展名等不区分大小写的比较）。
@@ -1053,8 +1117,10 @@ class SceneDesigner {
             RibbonItem.Small("table", SceneDesigner.T("Step ", "步长 ")
                 + SceneDoc.IntStr(this.grid)), 5, 2);
         this.AddBarItem(groups, dispatches, gg,
+            RibbonItem.Small("magnet", SceneDesigner.T("Snap Now", "一键吸附")), 5, 3);
+        this.AddBarItem(groups, dispatches, gg,
             RibbonItem.Toggle("font", SceneDesigner.T("Tags", "标签"),
-                this.showTags), 5, 3);
+                this.showTags), 5, 4);
         groups.Add(gg);
 
         // --- 缩放 ---
@@ -1121,7 +1187,9 @@ class SceneDesigner {
                 else if (this.grid == 8) { this.grid = 16; }
                 else if (this.grid == 16) { this.grid = 32; }
                 else { this.grid = 4; }
-            } else { this.showTags = !this.showTags; }
+            }
+            else if (this.barClickIndex == 3) { this.SnapSelectionToGrid(); }
+            else { this.showTags = !this.showTags; }
             app.RequestRedraw();
         }
         else if (this.barClickGroup == 6) {
@@ -1165,7 +1233,7 @@ class SceneDesigner {
         }
     }
 
-    /// 针对选中画布元素的浮动右键菜单（复制/删除/z 顺序/锁定）；Esc 或点击菜单项后关闭，无选中时自动收起。
+    /// 针对选中画布元素的浮动右键菜单（复制/删除/z 顺序/移至图层/锁定）；Esc 或点击菜单项后关闭，无选中时自动收起。
     void RenderContextMenu(App app, Canvas c, Theme t) {
         if (!this.ctxOpen) { return; }
         if (this.sel == null) { this.ctxOpen = false; return; }
@@ -1178,6 +1246,19 @@ class SceneDesigner {
             SceneDesigner.T("Bring to Front", "置顶"),
             SceneDesigner.T("Send to Back", "置底"),
             "-" };
+
+        // 移至当前编辑层或基础层
+        if (this.sel.Layer() != this.editLayer) {
+            string targetLayerName = this.editLayer.Length == 0
+                ? SceneDesigner.T("Base layer", "基础层")
+                : this.editLayer;
+            items.Add(SceneDesigner.T("Move to ", "移至 ") + targetLayerName);
+        } else if (this.sel.Layer().Length > 0) {
+            items.Add(SceneDesigner.T("Move to Base layer", "移至基础层"));
+        }
+
+        items.Add(SceneDesigner.T("Snap to Grid", "对齐到网格"));
+
         if (this.sel.Locked()) { items.Add(SceneDesigner.T("Unlock", "解锁")); }
         else { items.Add(SceneDesigner.T("Lock", "锁定")); }
 
@@ -1185,7 +1266,7 @@ class SceneDesigner {
         if (choice == 0 - 2) {
             this.ctxOpen = false;
         } else if (choice >= 0) {
-            this.ApplyContextAction(choice);
+            this.ApplyContextAction(choice, items[choice]);
             this.ctxOpen = false;
         }
         if (app.EventKind() == 4 && app.window.EventKeyCode() == 27) {
@@ -1194,15 +1275,32 @@ class SceneDesigner {
         }
     }
 
-    /// 执行右键菜单项：0 复制，1 删除，3 上移一层，4 下移一层，5 置顶，6 置底，8 锁定/解锁。
-    void ApplyContextAction(int idx) {
+    /// 执行右键菜单项操作，支持移至图层与锁定切换，统一受 PushUndo 保护。
+    void ApplyContextAction(int idx, string itemText) {
         if (idx == 0) { this.DuplicateSel(); }
         else if (idx == 1) { this.DeleteSel(); }
         else if (idx == 3) { this.RaiseSel(1); this.msg = SceneDesigner.T("brought forward", "已上移一层"); }
         else if (idx == 4) { this.RaiseSel(0 - 1); this.msg = SceneDesigner.T("sent backward", "已下移一层"); }
         else if (idx == 5) { this.SelToTop(); this.msg = SceneDesigner.T("brought to front", "已置顶"); }
         else if (idx == 6) { this.SelToBottom(); this.msg = SceneDesigner.T("sent to back", "已置底"); }
-        else if (idx == 8 && this.sel != null) {
+        else if (itemText != null && (itemText.StartsWith(SceneDesigner.T("Move to", "移至")))) {
+            if (this.sel != null) {
+                this.PushUndo();
+                if (itemText.EndsWith(SceneDesigner.T("Base layer", "基础层"))) {
+                    this.sel.SetLayer("");
+                    this.layerIn.SetText("");
+                    this.msg = SceneDesigner.T("moved to base layer", "已移至基础层");
+                } else {
+                    this.sel.SetLayer(this.editLayer);
+                    this.layerIn.SetText(this.editLayer);
+                    this.msg = SceneDesigner.T("moved to layer ", "已移至层 ") + this.editLayer;
+                }
+            }
+        }
+        else if (itemText != null && (itemText == SceneDesigner.T("Snap to Grid", "对齐到网格"))) {
+            this.SnapSelectionToGrid();
+        }
+        else if (this.sel != null && (itemText == SceneDesigner.T("Lock", "锁定") || itemText == SceneDesigner.T("Unlock", "解锁"))) {
             this.PushUndo();
             this.sel.SetLocked(!this.sel.Locked());
             if (this.sel.Locked()) {

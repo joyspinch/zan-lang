@@ -65,6 +65,12 @@ class CeSymbolType {
     }
 }
 
+/// 独立解析成品；PrepareSymbolIndex 不读写已安装的全局索引。
+class CodeEditorPreparedSymbolIndex {
+    List<CeSymbolMember> members;
+    List<CeSymbolType> types;
+}
+
 class CeTypeScope {
     public string typeName;
     public int depth;
@@ -86,6 +92,7 @@ class CeTypeScope {
 partial class CodeEditor {
     static List<CeSymbolMember> symMembers;
     static List<CeSymbolType> symTypes;
+    static int symbolVersion;
 
     /// 索引成功加载后返回 true。
     static bool SymbolIndexLoaded() {
@@ -94,24 +101,18 @@ partial class CodeEditor {
 
     /// 丢弃已加载的索引（构建后重新加载前使用）。
     static void ClearSymbolIndex() {
-        symMembers = new List<CeSymbolMember>();
-        symTypes = new List<CeSymbolType>();
+        CodeEditor.ApplyPreparedSymbolIndex(CodeEditor.PrepareSymbolIndex(""));
     }
 
-    /// 加载 `zanc --emit-symbols <path>` 写入的索引：制表符分隔的
-    /// `T kind namespace name bases` 和 `M owner name kind static signature`
-    /// 记录。文件缺失或没有记录时返回 false，
-    /// 此时补全继续使用内置表。
-    static bool LoadSymbolIndex(string path) {
-        CodeEditor.ClearSymbolIndex();
-        if (path.Length == 0 || !File.Exists(path)) { return false; }
-        string text = File.ReadAllText(path);
-        if (text.Length == 0) { return false; }
+    /// worker 解析 emit-symbols 的制表符记录；不读盘、不访问 static 索引。
+    static CodeEditorPreparedSymbolIndex PrepareSymbolIndex(string text) {
+        CodeEditorPreparedSymbolIndex prepared = new CodeEditorPreparedSymbolIndex();
+        prepared.members = new List<CeSymbolMember>();
+        prepared.types = new List<CeSymbolType>();
+        Dict<string, bool> seen = new Dict<string, bool>();
         List<string> ls = text.Split("\n");
-        int i = 0;
-        while (i < ls.Count) {
+        for (int i = 0; i < ls.Count; i = i + 1) {
             string line = ls[i];
-            i = i + 1;
             if (line.Length == 0) { continue; }
             if (line.EndsWith("\r")) { line = line.Substring(0, line.Length - 1); }
             if (line.StartsWith("#")) { continue; }
@@ -119,21 +120,39 @@ partial class CodeEditor {
             if (f.Count < 4) { continue; }
             if (f[0] == "T") {
                 string tn = f[3];
-                if (tn.Length > 0 && !CodeEditor.HasSymbolType(tn)) {
+                if (tn.Length > 0 && !seen.ContainsKey(tn)) {
+                    seen.Add(tn, true);
                     string bases = "";
                     if (f.Count > 4) { bases = f[4]; }
-                    symTypes.Add(new CeSymbolType(tn, bases));
+                    prepared.types.Add(new CeSymbolType(tn, bases));
                 }
             } else if (f[0] == "M" && f.Count >= 6) {
-                // extern（DllImport）声明是 FFI 绑定而非 API，
-                // 不应提供：WebApp 的 crt `time`/`fopen`/`fwrite`/`fclose`
-                // 是该类型的成员，看起来像 WebApp 自己的方法。
+                // extern（DllImport）是 FFI 绑定，不作为公开 API 补全。
                 if (f.Count > 6 && CodeEditor.Find(f[6], "x") >= 0) { continue; }
-                bool isSt = f[4] == "1";
-                symMembers.Add(new CeSymbolMember(f[1], f[2], f[3], f[5], isSt));
+                prepared.members.Add(new CeSymbolMember(f[1], f[2], f[3], f[5], f[4] == "1"));
             }
         }
+        return prepared;
+    }
+
+    /// UI 安装完整成品；宿主在 Post 中先校验工作区/路径请求身份。
+    /// 成品安装后只读，旧分析任务保留自己捕获的类型表。
+    static bool ApplyPreparedSymbolIndex(CodeEditorPreparedSymbolIndex prepared) {
+        if (prepared == null || prepared.members == null || prepared.types == null) { return false; }
+        symMembers = prepared.members;
+        symTypes = prepared.types;
+        symbolVersion = symbolVersion + 1;
         return symTypes.Count > 0;
+    }
+
+    /// 同步兼容入口；异步宿主用 PrepareSymbolIndex + UI ApplyPreparedSymbolIndex。
+    static bool LoadSymbolIndex(string path) {
+        if (path.Length == 0 || !File.Exists(path)) {
+            CodeEditor.ClearSymbolIndex();
+            return false;
+        }
+        return CodeEditor.ApplyPreparedSymbolIndex(
+            CodeEditor.PrepareSymbolIndex(File.ReadAllText(path)));
     }
 
     /// 索引描述了 `typeName` 时返回 true。
@@ -307,7 +326,7 @@ partial class CodeEditor {
                         outNames.Add(nm);
                     }
                 }
-                // `name = Type.Something(...)` / `name = new Type(...)`。
+                // 核心契约与语义定义。
                 int eq = p;
                 while (eq > 0 && (s[eq - 1] & 255) == 32) { eq = eq - 1; }
                 if (CodeEditor.IdentBefore(s, eq) == "new") { eq = eq - 3; }
@@ -352,10 +371,15 @@ partial class CodeEditor {
     /// 都是对同一成员的引用。
     static void MemberRecvsPre(List<string> stripped, string owner,
             List<string> outFamily, List<string> outRecvs) {
+        CodeEditor.MemberRecvsWithTypes(stripped, owner, outFamily, outRecvs, symTypes);
+    }
+
+    static void MemberRecvsWithTypes(List<string> stripped, string owner,
+            List<string> outFamily, List<string> outRecvs, List<CeSymbolType> types) {
         outRecvs.Add("this");
         outRecvs.Add("base");
         outFamily.Add(owner);
-        CodeEditor.SymbolSubtypesOf(owner, outFamily);
+        CodeEditor.SymbolSubtypesIn(types, owner, outFamily);
         for (int fi = 0; fi < outFamily.Count; fi = fi + 1) {
             if (!CodeEditor.Has(outRecvs, outFamily[fi])) {
                 outRecvs.Add(outFamily[fi]);
@@ -510,25 +534,33 @@ partial class CodeEditor {
     /// 追加所有基类链可达 `typeName` 的已索引类型 ——
     /// 即其成员也能到达的类型。
     static void SymbolSubtypesOf(string typeName, List<string> out2) {
-        if (!CodeEditor.SymbolIndexLoaded()) { return; }
-        for (int i = 0; i < symTypes.Count; i = i + 1) {
-            string cur = CodeEditor.SymbolFirstBase(symTypes[i].name);
+        CodeEditor.SymbolSubtypesIn(symTypes, typeName, out2);
+    }
+
+    static void SymbolSubtypesIn(List<CeSymbolType> types, string typeName, List<string> out2) {
+        if (types == null) { return; }
+        for (int i = 0; i < types.Count; i = i + 1) {
+            string cur = CodeEditor.SymbolFirstBaseIn(types, types[i].name);
             for (int depth = 0; cur.Length > 0 && depth < 8; depth = depth + 1) {
                 if (cur == typeName) {
-                    if (!CodeEditor.Has(out2, symTypes[i].name)) { out2.Add(symTypes[i].name); }
+                    if (!CodeEditor.Has(out2, types[i].name)) { out2.Add(types[i].name); }
                     break;
                 }
-                cur = CodeEditor.SymbolFirstBase(cur);
+                cur = CodeEditor.SymbolFirstBaseIn(types, cur);
             }
         }
     }
 
     /// `typeName` 在索引中的第一个基类（无则 ""）。
     static string SymbolFirstBase(string typeName) {
-        if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
-        for (int i = 0; i < symTypes.Count; i = i + 1) {
-            if (symTypes[i].name == typeName) {
-                string b = symTypes[i].baseTypes;
+        return CodeEditor.SymbolFirstBaseIn(symTypes, typeName);
+    }
+
+    static string SymbolFirstBaseIn(List<CeSymbolType> types, string typeName) {
+        if (types == null) { return ""; }
+        for (int i = 0; i < types.Count; i = i + 1) {
+            if (types[i].name == typeName) {
+                string b = types[i].baseTypes;
                 if (b.Length == 0) { return ""; }
                 int c = b.IndexOf(",");
                 if (c >= 0) { b = b.Substring(0, c); }

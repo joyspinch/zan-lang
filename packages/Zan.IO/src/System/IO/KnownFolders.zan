@@ -6,13 +6,13 @@ namespace System.IO;
 /// <summary>
 /// 常见的用户/系统文件夹，以及环境变量访问。
 ///
-/// 文件夹查找通过环境变量解析（Windows：%USERPROFILE%、
-/// %APPDATA% 等；POSIX：$HOME、$XDG_CONFIG_HOME 等），因此
-/// 同一份代码在所有平台可用，并遵循操作系统设置中
-/// 对单个用户的目录重定向。无法解析时返回“”。
+/// Windows 主目录与应用数据目录通过环境变量解析，桌面/文档/下载
+/// 使用主目录下的默认位置；Linux 遵循 XDG 与 user-dirs.dirs 重定向；
+/// macOS 应用数据使用 ~/Library/Application Support。查询不创建目录，
+/// 无法解析时返回“”。
 ///
-///   string cfg = KnownFolders.AppData() + Path.Separator() + "myapp";
-///   string home = KnownFolders.Home();
+/// 核心契约与语义定义。
+/// 核心契约与语义定义。
 /// </summary>
 class KnownFolders {
     /// 用户主目录（Windows：%USERPROFILE%；POSIX：$HOME）。
@@ -26,54 +26,137 @@ class KnownFolders {
         #endif
     }
 
-    /// 用户桌面文件夹。
+    /// 用户桌面文件夹；Linux 遵循 user-dirs.dirs。
     static string Desktop() {
-        string home = KnownFolders.Home();
-        if (home == "") { return ""; }
-        return Path.Combine(home, "Desktop");
+        #if LINUX
+        return KnownFolders.XdgUserDirectory("XDG_DESKTOP_DIR", "Desktop");
+        #else
+        return KnownFolders.HomeChild("Desktop");
+        #endif
     }
 
-    /// 用户文档文件夹。
+    /// 用户文档文件夹；Linux 遵循 user-dirs.dirs。
     static string Documents() {
-        string home = KnownFolders.Home();
-        if (home == "") { return ""; }
-        return Path.Combine(home, "Documents");
+        #if LINUX
+        return KnownFolders.XdgUserDirectory("XDG_DOCUMENTS_DIR", "Documents");
+        #else
+        return KnownFolders.HomeChild("Documents");
+        #endif
     }
 
-    /// 用户下载文件夹。
+    /// 用户下载文件夹；Linux 遵循 user-dirs.dirs。
     static string Downloads() {
-        string home = KnownFolders.Home();
-        if (home == "") { return ""; }
-        return Path.Combine(home, "Downloads");
+        #if LINUX
+        return KnownFolders.XdgUserDirectory("XDG_DOWNLOAD_DIR", "Downloads");
+        #else
+        return KnownFolders.HomeChild("Downloads");
+        #endif
     }
 
-    /// 按用户漫游的应用数据（Windows：%APPDATA%；
-    /// POSIX：$XDG_CONFIG_HOME 或 ~/.config）。
+    /// 用户配置/应用数据（Windows：%APPDATA%；Linux：XDG_CONFIG_HOME
+    /// 或 ~/.config；macOS：~/Library/Application Support，无漫游/本地之分）。
     static string AppData() {
         #if WINDOWS
         return Interop.EnvVar("APPDATA");
+        #elif MACOS
+        return KnownFolders.HomeChild("Library/Application Support");
         #else
-        string xdg = Interop.EnvVar("XDG_CONFIG_HOME");
-        if (xdg != "") { return xdg; }
-        string home = KnownFolders.Home();
-        if (home == "") { return ""; }
-        return Path.Combine(home, ".config");
+        return KnownFolders.XdgBaseDirectory("XDG_CONFIG_HOME", ".config");
         #endif
     }
 
-    /// 按用户的本地（非漫游）应用数据
-    /// （Windows：%LOCALAPPDATA%；POSIX：$XDG_DATA_HOME 或 ~/.local/share）。
+    /// 本地应用数据（Windows：%LOCALAPPDATA%；Linux：XDG_DATA_HOME
+    /// 或 ~/.local/share；macOS：~/Library/Application Support）。
     static string LocalAppData() {
         #if WINDOWS
         return Interop.EnvVar("LOCALAPPDATA");
+        #elif MACOS
+        return KnownFolders.HomeChild("Library/Application Support");
         #else
-        string xdg = Interop.EnvVar("XDG_DATA_HOME");
-        if (xdg != "") { return xdg; }
-        string home = KnownFolders.Home();
-        if (home == "") { return ""; }
-        return Path.Combine(Path.Combine(home, ".local"), "share");
+        return KnownFolders.XdgBaseDirectory("XDG_DATA_HOME", ".local/share");
         #endif
     }
+
+    private static string HomeChild(string name) {
+        string home = KnownFolders.Home();
+        if (home == "") { return ""; }
+        return Path.Combine(home, name);
+    }
+
+    #if !WINDOWS && !MACOS
+    private static string XdgBaseDirectory(string variable, string fallback) {
+        string path = Interop.EnvVar(variable);
+        // XDG 要求绝对路径；相对环境值无效，不能随工作目录漂移。
+        if (path.StartsWith("/")) { return path; }
+        return KnownFolders.HomeChild(fallback);
+    }
+    #endif
+
+    #if LINUX
+    private static string XdgUserDirectory(string variable, string fallback) {
+        string home = KnownFolders.Home();
+        string config = KnownFolders.AppData();
+        string result = "";
+        if (config.StartsWith("/")) {
+            string file = Path.Combine(config, "user-dirs.dirs");
+            try {
+                List<string> lines = File.ReadAllLines(file);
+                for (int i = 0; i < lines.Count; i = i + 1) {
+                    string line = lines[i].Trim();
+                    if (line == "" || line.StartsWith("#")) { continue; }
+                    int eq = line.IndexOf("=");
+                    if (eq < 0 || line.Substring(0, eq).Trim() != variable) { continue; }
+                    string value = KnownFolders.XdgUserValue(
+                        line.Substring(eq + 1, line.Length - eq - 1).Trim(), home);
+                    if (value != "") { result = value; }
+                }
+            } catch (IOException ex) {
+                // 可选配置缺失或不可读时使用默认目录，不创建或执行配置。
+            }
+        }
+        if (result != "") { return result; }
+        return KnownFolders.HomeChild(fallback);
+    }
+
+    private static string XdgUserValue(string text, string home) {
+        if (text.Length < 2 || (text[0] & 255) != 34) { return ""; }
+        int start = 1;
+        StringBuilder sb = new StringBuilder();
+        if (text.StartsWith("\"$HOME")) {
+            if (home == "" || text.Length < 7) { return ""; }
+            int afterHome = text[6] & 255;
+            if (afterHome != 47 && afterHome != 34) { return ""; }
+            sb.Append(home);
+            start = 6;
+        } else if ((text[1] & 255) != 47) {
+            return "";
+        }
+        int chunk = start;
+        for (int i = start; i < text.Length; i = i + 1) {
+            int c = text[i] & 255;
+            if (c == 34) {
+                if (i > chunk) { sb.Append(text.Substring(chunk, i - chunk)); }
+                string rest = text.Substring(i + 1, text.Length - i - 1).Trim();
+                if (rest != "" && !rest.StartsWith("#")) { return ""; }
+                string value = sb.ToString();
+                return value.StartsWith("/") ? value : "";
+            }
+            // 只解 HOME 与双引号中的转义，不执行 shell 变量或命令替换。
+            if (c == 36 || c == 96) { return ""; }
+            if (c == 92) {
+                if (i + 1 >= text.Length) { return ""; }
+                int next = text[i + 1] & 255;
+                if (next == 34 || next == 36 || next == 96 || next == 92) {
+                    if (i > chunk) { sb.Append(text.Substring(chunk, i - chunk)); }
+                    sb.Append(text.Substring(i + 1, 1));
+                    i = i + 1;
+                    chunk = i + 1;
+                }
+            }
+        }
+        return "";
+    }
+    #endif
 
     /// 系统临时目录（Windows：%TEMP%/%TMP%；
     /// POSIX：$TMPDIR 或 /tmp）。
@@ -219,7 +302,7 @@ class KnownFolders {
     }
 
     #if !WINDOWS
-    // 真实签名是 int setenv(const char*, const char*, int overwrite)：
+    // 系统底层交互与数据流转契约
     // 缺第三个参数时 x86-64 SysV 的 edx 是调用点残留的垃圾值，
     // overwrite 随机 → 有时覆盖、有时不覆盖，行为不可复现。
     [DllImport("crt", EntryPoint = "setenv")]

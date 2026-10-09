@@ -1,0 +1,353 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Designer;
+
+/// 独立文档模型。Capture 后只由 worker 读取；Prepare 的字段树安装后归 UI 所有。
+class DesignerDocumentSnapshot {
+    string name;
+    string submit;
+    string docRole;
+    string device;
+    int labelPos;
+    int formSize;
+    int labelWidth;
+    bool hideStar;
+    bool showSubmit;
+    bool showReset;
+    int winW;
+    int winH;
+    string winTitle;
+    bool winResizable;
+    bool winTool;
+    bool winCenter;
+    int winPosX;
+    int winPosY;
+    int layoutMode;
+    int winZoom;
+    bool winRound;
+    int winShape;
+    string winShapeSpec;
+    int winShapeRadius;
+    bool winChrome;
+    bool winGlass;
+    int winOpacity;
+    int winShadow;
+    JsonValue docSource;
+    List<FormField> fields = new List<FormField>();
+    int sequence;
+    bool loadError;
+    string lastError = "";
+    bool applied;
+
+    /// 不读取 Designer/Input；序列化仅消费独立快照。
+    string ToJson() {
+        JsonValue o = JsonValue.NewObject();
+        o.PutStr("name", name);
+        if (docRole != "") { o.PutStr("role", docRole); }
+        if (device != "") { o.PutStr("device", device); }
+        o.PutInt("labelPos", labelPos);
+        o.PutInt("formSize", formSize);
+        o.PutInt("labelWidth", labelWidth);
+        o.PutBool("hideStar", hideStar);
+        o.PutBool("showSubmit", showSubmit);
+        o.PutBool("showReset", showReset);
+        o.PutStr("submit", submit);
+        o.PutInt("winW", winW);
+        o.PutInt("winH", winH);
+        o.PutStr("winTitle", winTitle);
+        o.PutBool("winResizable", winResizable);
+        o.PutBool("winTool", winTool);
+        o.PutBool("winCenter", winCenter);
+        o.PutInt("winPosX", winPosX);
+        o.PutInt("winPosY", winPosY);
+        o.PutInt("layoutMode", layoutMode);
+        o.PutInt("winZoom", winZoom);
+        o.PutBool("winRound", winRound);
+        if (winShape != 3) { o.PutInt("winShape", winShape); }
+        else {
+            JsonValue regions = JsonValue.NewArray();
+            List<string> parts = winShapeSpec.Split(";");
+            for (int i = 0; i < parts.Count; i = i + 1) {
+                List<string> values = parts[i].Split(",");
+                if (values.Count < 6) { continue; }
+                JsonValue region = JsonValue.NewObject();
+                region.Put("t", JsonValue.NewNum(values[0]));
+                region.Put("x", JsonValue.NewNum(values[1]));
+                region.Put("y", JsonValue.NewNum(values[2]));
+                region.Put("w", JsonValue.NewNum(values[3]));
+                region.Put("h", JsonValue.NewNum(values[4]));
+                region.Put("r", JsonValue.NewNum(values[5]));
+                regions.Append(region);
+            }
+            o.Put("winShape", regions);
+        }
+        o.PutInt("winShapeRadius", winShapeRadius);
+        o.PutBool("winChrome", winChrome);
+        o.PutBool("winGlass", winGlass);
+        o.PutInt("winOpacity", winOpacity);
+        o.PutInt("winShadow", winShadow);
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            arr.Append(Designer.PreparedFieldJson(fields[i]));
+        }
+        o.Put("fields", arr);
+        if (docSource != null && docSource.IsObject()) {
+            for (int i = 0; i < docSource.Count(); i = i + 1) {
+                string key = docSource.KeyAt(i);
+                if (!o.Has(key)) { o.Put(key, docSource.ValAt(i)); }
+            }
+            if (docSource.Has("bodyContent")) {
+                o.Set("bodyContent", Designer.PreparedRemapContent(docSource.Get("bodyContent"),
+                    docSource.Get("fields"), fields));
+            }
+        }
+        return o.PrettyToJson() + "\n";
+    }
+
+    string ToHtml() { return DesignerHtml.FromJsonDoc(this.ToJson()); }
+
+    DesignerDocumentSnapshot Copy() {
+        DesignerDocumentSnapshot s = new DesignerDocumentSnapshot();
+        s.name = name; s.submit = submit; s.docRole = docRole; s.device = device;
+        s.labelPos = labelPos; s.formSize = formSize; s.labelWidth = labelWidth;
+        s.hideStar = hideStar; s.showSubmit = showSubmit; s.showReset = showReset;
+        s.winW = winW; s.winH = winH; s.winTitle = winTitle;
+        s.winResizable = winResizable; s.winTool = winTool; s.winCenter = winCenter;
+        s.winPosX = winPosX; s.winPosY = winPosY; s.layoutMode = layoutMode; s.winZoom = winZoom;
+        s.winRound = winRound; s.winShape = winShape; s.winShapeSpec = winShapeSpec;
+        s.winShapeRadius = winShapeRadius; s.winChrome = winChrome; s.winGlass = winGlass;
+        s.winOpacity = winOpacity; s.winShadow = winShadow; s.sequence = sequence;
+        s.loadError = loadError; s.lastError = lastError;
+        List<DesignerSourceCopy> copies = new List<DesignerSourceCopy>();
+        s.docSource = Designer.CopyDocumentSource(docSource, copies);
+        s.fields = Designer.CopyDocumentFields(fields, copies);
+        return s;
+    }
+}
+
+class DesignerSourceCopy {
+    JsonValue source;
+    JsonValue copy;
+    DesignerSourceCopy(JsonValue source, JsonValue copy) {
+        this.source = source;
+        this.copy = copy;
+    }
+}
+
+partial class Designer {
+    /// UI 只捕获标量缺省值，worker 不接收设计器或输入控件。
+    DesignerDocumentSnapshot CaptureDocumentOptions() {
+        DesignerDocumentSnapshot s = new DesignerDocumentSnapshot();
+        s.name = formNameInput.GetText(); s.submit = submitInput.GetText();
+        s.docRole = docRole; s.device = device;
+        s.labelPos = labelPos; s.formSize = formSize; s.labelWidth = labelWidth;
+        s.hideStar = hideStar; s.showSubmit = showSubmit; s.showReset = showReset;
+        s.winW = winW; s.winH = winH; s.winTitle = winTitle;
+        s.winResizable = winResizable; s.winTool = winTool; s.winCenter = winCenter;
+        s.winPosX = winPosX; s.winPosY = winPosY;
+        s.layoutMode = layoutMode; s.winZoom = winZoom; s.winRound = winRound;
+        s.winShape = winShape; s.winShapeSpec = winShapeSpec; s.winShapeRadius = winShapeRadius;
+        s.winChrome = winChrome; s.winGlass = winGlass; s.winOpacity = winOpacity; s.winShadow = winShadow;
+        return s;
+    }
+
+    /// UI 深拷贝可变字段、事件、额外属性及 HTML 混合内容的身份关系。
+    DesignerDocumentSnapshot CaptureDocumentSnapshot() {
+        DesignerDocumentSnapshot s = this.CaptureDocumentOptions();
+        List<DesignerSourceCopy> copies = new List<DesignerSourceCopy>();
+        s.docSource = Designer.CopyDocumentSource(docSource, copies);
+        s.fields = Designer.CopyDocumentFields(fields, copies);
+        s.sequence = seq;
+        return s;
+    }
+
+    static JsonValue CopyDocumentSource(JsonValue source, List<DesignerSourceCopy> copies) {
+        if (source == null) { return null; }
+        for (int i = 0; i < copies.Count; i = i + 1) {
+            if (copies[i].source == source) { return copies[i].copy; }
+        }
+        JsonValue copy = source.IsArray() ? JsonValue.NewArray()
+            : source.IsObject() ? JsonValue.NewObject() : source.Clone();
+        copies.Add(new DesignerSourceCopy(source, copy));
+        if (source.IsArray()) {
+            for (int i = 0; i < source.Count(); i = i + 1) {
+                copy.Append(Designer.CopyDocumentSource(source.At(i), copies));
+            }
+        } else if (source.IsObject()) {
+            for (int i = 0; i < source.Count(); i = i + 1) {
+                copy.Put(source.KeyAt(i), Designer.CopyDocumentSource(source.ValAt(i), copies));
+            }
+        }
+        return copy;
+    }
+
+    static List<FormField> CopyDocumentFields(List<FormField> source, List<DesignerSourceCopy> copies) {
+        List<FormField> result = new List<FormField>();
+        for (int i = 0; i < source.Count; i = i + 1) {
+            FormField f = source[i];
+            FormField copy = new FormField(f.ftype);
+            copy.kind = f.kind; copy.label = f.label; copy.fname = f.fname; copy.name = f.fname;
+            copy.placeholder = f.placeholder; copy.customKind = f.customKind;
+            copy.compRef = f.compRef; copy.pvPreview = f.pvPreview;
+            copy.required = f.required; copy.defOn = f.defOn; copy.wrap = f.wrap;
+            copy.span = f.span; copy.fx = f.fx; copy.fy = f.fy; copy.fw = f.fw; copy.fh = f.fh;
+            copy.altRects = f.altRects; copy.locked = f.locked; copy.dockSide = f.dockSide;
+            copy.position = f.position; copy.anchor = f.anchor; copy.flexGrow = f.flexGrow;
+            copy.childTab = f.childTab; copy.tabOrient = f.tabOrient; copy.uiState.Set(f.uiState.Get());
+            copy.Class = f.Class; copy.styleText = f.styleText;
+            copy.bindPath = f.bindPath; copy.bindProp = f.bindProp; copy.handlerArg = f.handlerArg;
+            copy.options = new List<string>();
+            for (int k = 0; k < f.options.Count; k = k + 1) { copy.options.Add(f.options[k]); }
+            List<string> events = f.Events();
+            for (int k = 0; k < events.Count; k = k + 1) { copy.SetHandler(events[k], f.GetHandler(events[k])); }
+            copy.designSource = Designer.CopyDocumentSource(f.designSource, copies);
+            copy.extra = Designer.CopyDocumentSource(f.extra, copies);
+            copy.kids = Designer.CopyDocumentFields(f.kids, copies);
+            result.Add(copy);
+        }
+        return result;
+    }
+
+    /// worker 解析并构建字段树；options 是 UI 捕获的独立标量模型。
+    static DesignerDocumentSnapshot PrepareJson(string text, DesignerDocumentSnapshot options) {
+        DesignerDocumentSnapshot s = options;
+        s.docRole = ""; s.docSource = null;
+        s.fields = new List<FormField>(); s.sequence = 0; s.loadError = false; s.lastError = "";
+        JsonValue root = null;
+        try { root = JsonValue.Parse(text); }
+        catch (JsonException error) {
+            // 损坏文档是显式失败模型，绝不把半份文档自动存回。
+            s.loadError = true; s.lastError = error.Message; return s;
+        }
+        if (root == null || !root.IsObject()) {
+            s.loadError = true; s.lastError = "document is not a JSON object"; return s;
+        }
+        s.docSource = root;
+        s.name = root.Str("name", s.name); s.submit = root.Str("submit", s.submit);
+        s.docRole = root.Str("role", "");
+        s.labelPos = root.Int("labelPos", s.labelPos); s.formSize = root.Int("formSize", s.formSize);
+        s.labelWidth = root.Int("labelWidth", s.labelWidth);
+        s.hideStar = root.Bool("hideStar", s.hideStar); s.showSubmit = root.Bool("showSubmit", s.showSubmit);
+        s.showReset = root.Bool("showReset", s.showReset);
+        s.winW = root.Int("winW", s.winW); s.winH = root.Int("winH", s.winH);
+        s.device = root.Str("device", "");
+        DeviceProfile profile = DeviceProfile.ById(s.device);
+        if (profile == null) { s.device = ""; }
+        else if (profile.Locked()) {
+            int orientation = profile.Rotatable() && s.winW > s.winH ? 1 : 0;
+            s.winW = profile.CanvasW(orientation); s.winH = profile.CanvasH(orientation);
+        }
+        s.winTitle = root.Str("winTitle", s.winTitle);
+        s.winResizable = root.Bool("winResizable", s.winResizable);
+        if (profile != null && profile.Locked()) { s.winResizable = false; }
+        s.winTool = root.Bool("winTool", s.winTool); s.winCenter = root.Bool("winCenter", s.winCenter);
+        s.winPosX = root.Int("winPosX", s.winPosX); s.winPosY = root.Int("winPosY", s.winPosY);
+        s.layoutMode = root.Int("layoutMode", s.layoutMode);
+        if (s.layoutMode < 0 || s.layoutMode > 1) { s.layoutMode = 0; }
+        s.winZoom = root.Int("winZoom", s.winZoom);
+        if (s.winZoom < 0) { s.winZoom = 0; } else if (s.winZoom > 2000) { s.winZoom = 2000; }
+        s.winRound = profile != null && profile.Round();
+        JsonValue shape = root.Get("winShape");
+        if (shape != null && shape.IsArray()) { s.winShape = 3; s.winShapeSpec = Designer.PreparedShapeSpec(shape); }
+        else { s.winShape = root.Int("winShape", s.winShape); s.winShapeSpec = ""; }
+        s.winShapeRadius = root.Int("winShapeRadius", s.winShapeRadius);
+        s.winChrome = root.Bool("winChrome", s.winChrome); s.winGlass = root.Bool("winGlass", s.winGlass);
+        s.winOpacity = root.Int("winOpacity", s.winOpacity);
+        if (s.winOpacity <= 0) { s.winOpacity = 100; }
+        s.winShadow = root.Int("winShadow", 10);
+        if (s.winShapeRadius <= 0 && s.winShape == 1) { s.winShapeRadius = 12; }
+        JsonValue arr = root.Get("fields");
+        if (arr != null && arr.IsArray()) { Designer.BuildPreparedFields(arr, s.fields); }
+        s.sequence = Designer.CountPreparedFields(s.fields);
+        return s;
+    }
+
+    /// UI 单次消费，安装不解析/遍历字段树；历史与预览缓存从新文档重新开始。
+    bool ApplyPreparedDocument(DesignerDocumentSnapshot s) {
+        if (s == null || s.applied) { return false; }
+        s.applied = true;
+        // 安装的是深拷贝：快照必须保持 worker 侧基线的独立性——
+        // 直接别名 s.fields 的话，用户的第一笔编辑就写进基线，
+        // DocumentMatchesSnapshot 从此永远报"未修改"（detectedit 回归）。
+        List<DesignerSourceCopy> copies = new List<DesignerSourceCopy>();
+        docSource = Designer.CopyDocumentSource(s.docSource, copies);
+        fields = Designer.CopyDocumentFields(s.fields, copies);
+        docRole = s.docRole; device = s.device; seq = s.sequence;
+        formNameInput.SetText(s.name); submitInput.SetText(s.submit);
+        labelPos = s.labelPos; formSize = s.formSize; labelWidth = s.labelWidth;
+        hideStar = s.hideStar; showSubmit = s.showSubmit; showReset = s.showReset;
+        winW = s.winW; winH = s.winH; winTitle = s.winTitle;
+        winResizable = s.winResizable; winTool = s.winTool; winCenter = s.winCenter;
+        winPosX = s.winPosX; winPosY = s.winPosY; layoutMode = s.layoutMode;
+        winZoom = s.winZoom; winRound = s.winRound;
+        winShape = s.winShape; winShapeSpec = s.winShapeSpec; winShapeRadius = s.winShapeRadius;
+        winChrome = s.winChrome; winGlass = s.winGlass; winOpacity = s.winOpacity; winShadow = s.winShadow;
+        loadError = s.loadError; lastError = s.lastError;
+        sel = null; selPrev = null; activeContainer = null;
+        freeExtra = new List<FormField>(); freeDragging = false; freeResizing = false;
+        dragging = false; freeMarquee = false; canvasMenuOpen = false;
+        pvDocKey = ""; pvDocRoot = null; pvDocNodes = null;
+        if (!loadError) { this.ResetHistoryLocked(); }
+        return true;
+    }
+
+    /// 比较模型而非格式化全文；空闲帧无需复制或序列化设计文档。
+    bool DocumentMatchesSnapshot(DesignerDocumentSnapshot s) {
+        if (s == null) { return false; }
+        return formNameInput.GetText() == s.name && submitInput.GetText() == s.submit
+            && docRole == s.docRole && device == s.device && labelPos == s.labelPos
+            && formSize == s.formSize && labelWidth == s.labelWidth && hideStar == s.hideStar
+            && showSubmit == s.showSubmit && showReset == s.showReset && winW == s.winW && winH == s.winH
+            && winTitle == s.winTitle && winResizable == s.winResizable && winTool == s.winTool
+            && winCenter == s.winCenter && winPosX == s.winPosX && winPosY == s.winPosY
+            && layoutMode == s.layoutMode && winZoom == s.winZoom && winRound == s.winRound
+            && winShape == s.winShape && winShapeSpec == s.winShapeSpec && winShapeRadius == s.winShapeRadius
+            && winChrome == s.winChrome && winGlass == s.winGlass && winOpacity == s.winOpacity
+            && winShadow == s.winShadow && Designer.DocumentJsonEqual(docSource, s.docSource)
+            && Designer.DocumentFieldsEqual(fields, s.fields);
+    }
+
+    static bool DocumentJsonEqual(JsonValue a, JsonValue b) {
+        if (a == b) { return true; }
+        if (a == null || b == null || a.kind != b.kind || a.Count() != b.Count()) { return false; }
+        if (a.IsObject()) {
+            for (int i = 0; i < a.Count(); i = i + 1) {
+                if (a.KeyAt(i) != b.KeyAt(i) || !Designer.DocumentJsonEqual(a.ValAt(i), b.ValAt(i))) { return false; }
+            }
+        } else if (a.IsArray()) {
+            for (int i = 0; i < a.Count(); i = i + 1) {
+                if (!Designer.DocumentJsonEqual(a.At(i), b.At(i))) { return false; }
+            }
+        } else if (a.AsString("") != b.AsString("")) { return false; }
+        return true;
+    }
+
+    static bool DocumentFieldsEqual(List<FormField> a, List<FormField> b) {
+        if (a.Count != b.Count) { return false; }
+        for (int i = 0; i < a.Count; i = i + 1) {
+            FormField f = a[i]; FormField g = b[i];
+            if (f.kind != g.kind || f.ftype != g.ftype || f.label != g.label || f.fname != g.fname
+                || f.placeholder != g.placeholder || f.customKind != g.customKind
+                || f.compRef != g.compRef || f.pvPreview != g.pvPreview || f.required != g.required
+                || f.defOn != g.defOn || f.wrap != g.wrap || f.span != g.span
+                || f.fx != g.fx || f.fy != g.fy || f.fw != g.fw || f.fh != g.fh
+                || f.altRects != g.altRects || f.locked != g.locked || f.dockSide != g.dockSide
+                || f.position != g.position || f.anchor != g.anchor || f.flexGrow != g.flexGrow
+                || f.childTab != g.childTab || f.tabOrient != g.tabOrient || f.uiState.Get() != g.uiState.Get()
+                || f.Class != g.Class || f.styleText != g.styleText || f.bindPath != g.bindPath
+                || f.bindProp != g.bindProp || f.handlerArg != g.handlerArg || f.options.Count != g.options.Count
+                || !Designer.DocumentJsonEqual(f.extra, g.extra)
+                || !Designer.DocumentJsonEqual(f.designSource, g.designSource)
+                || !Designer.DocumentFieldsEqual(f.kids, g.kids)) { return false; }
+            for (int k = 0; k < f.options.Count; k = k + 1) { if (f.options[k] != g.options[k]) { return false; } }
+            List<string> events = f.Events();
+            for (int k = 0; k < events.Count; k = k + 1) {
+                if (f.GetHandler(events[k]) != g.GetHandler(events[k])) { return false; }
+            }
+        }
+        return true;
+    }
+}

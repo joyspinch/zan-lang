@@ -78,6 +78,33 @@ partial class Designer {
         }
     }
 
+    /// 撤销会话状态：即时模式输入框每键一变，不能逐键压整档
+    /// 快照。同一编辑会话（同一输入框连续编辑）只在第一处变更
+    /// 前压一次；会话键变化（换输入框/换目标）才允许再压。
+    string undoSession;
+    bool undoSessionPushed;
+
+    /// 连续编辑的撤销会话守卫：会话首变时压栈（调用方随后写值，
+    /// 快照因此落在变更之前），后续键入不再压。
+    void GateInspectorUndo(string sessionKey) {
+        if (sessionKey != undoSession) {
+            undoSession = sessionKey;
+            undoSessionPushed = false;
+        }
+        if (!undoSessionPushed) {
+            this.PushUndo();
+            undoSessionPushed = true;
+        }
+    }
+
+    /// 离散命令（单击按钮/开关）用：每次调用必压一次栈，并结束
+    /// 当前编辑会话——命令之后的第一笔键入重新起会话。
+    void BarrierInspectorUndo() {
+        undoSession = "";
+        undoSessionPushed = false;
+        this.PushUndo();
+    }
+
     /// 选区变化时重置选项 / 事件编辑器（普通属性行直接
     /// 绑定字段，不需要手动同步）。
     void SyncEditors(FormField f) {
@@ -300,6 +327,7 @@ partial class Designer {
             string ofCur = f.extra == null ? "" : f.extra.Str("of", "");
             string ofNew = StyleSheet.Trim(ofEd);
             if (ofNew != ofCur) {
+                this.GateInspectorUndo("of|" + Convert.ToString(inspKeySeq));
                 if (f.extra == null) { f.extra = JsonValue.NewObject(); }
                 if (ofNew == "") { Designer.DropKey(f.extra, "of"); }
                 else { f.extra.Put("of", JsonValue.NewStr(ofNew)); }
@@ -335,6 +363,7 @@ partial class Designer {
             int rmStyId = SmallIconBtn(app, "close", 5,
                 ix + iw - btnW, iy, btnW);
             if (Ui.Clicked(app, rmStyId)) {
+                this.BarrierInspectorUndo();
                 styleInputs.RemoveAt(si);
                 app.RequestRedraw();
                 continue;   // 不前进 iy：下一行顶上被删行的位置
@@ -350,6 +379,7 @@ partial class Designer {
             joined = joined + t;
         }
         if (joined != f.styleText) {
+            this.GateInspectorUndo("style|" + styId);
             f.styleText = joined;
             app.RequestRedraw();
         }
@@ -426,6 +456,7 @@ partial class Designer {
                         bool isSwOn = sw.IsOn();
                         string bcur = isSwOn ? "true" : "false";
                         if (bcur != er.shadow) {
+                            this.BarrierInspectorUndo();
                             SetCompPropValue(f, er.key, bcur);
                             er.shadow = bcur;
                             app.RequestRedraw();
@@ -435,6 +466,8 @@ partial class Designer {
                             iw - labelW, rowH);
                         string bcur = er.input.GetText();
                         if (bcur != er.shadow) {
+                            this.GateInspectorUndo("bprop|" + browId
+                                + "|" + er.key);
                             SetCompPropValue(f, er.key, bcur);
                             er.shadow = bcur;
                             app.RequestRedraw();
@@ -514,6 +547,7 @@ partial class Designer {
                         bool isSwOn = sw.IsOn();
                         string cur = isSwOn ? "true" : "false";
                         if (cur != er.shadow) {
+                            this.BarrierInspectorUndo();
                             SetCompPropValue(f, er.key, cur);
                             er.shadow = cur;
                             app.RequestRedraw();
@@ -523,6 +557,8 @@ partial class Designer {
                             iw - labelW, rowH);
                         string cur = er.input.GetText();
                         if (cur != er.shadow) {
+                            this.GateInspectorUndo("cprop|" + rowId
+                                + "|" + er.key);
                             SetCompPropValue(f, er.key, cur);
                             er.shadow = cur;
                             app.RequestRedraw();
@@ -1016,6 +1052,7 @@ partial class Designer {
                         }
                         int crId = SmallBtn(app, Designer.T("new", "新建"), 1, ix + iw - app.Scale(40), iy, app.Scale(40));
                         if (Ui.Clicked(app, crId)) {
+                            this.BarrierInspectorUndo();
                             if (root) {
                                 winEvtEditing = ev;
                                 string sug = "OnWindow" + ev;
@@ -1042,8 +1079,18 @@ partial class Designer {
         iy = iy + app.Scale(18);
         evtInput.Render(app, ix, iy, iw, app.Scale(28));
         if (editEv != "") {
-            if (root) { WinSetHandler(editEv, evtInput.GetText()); }
-            else { sel.SetHandler(editEv, evtInput.GetText()); }
+            // 该帧输入与已绑处理器不同才写回；写回前过撤销会话
+            // 守卫——快照落在首键变更前，同一事件的连续键入并作
+            // 一步撤销。
+            string hnew = evtInput.GetText();
+            string hcur = root ? this.WinGetHandler(editEv)
+                : sel.GetHandler(editEv);
+            if (hnew != hcur) {
+                this.GateInspectorUndo("evt|" + (root ? "win|" : "fld|")
+                    + Convert.ToString(inspKeySeq) + "|" + editEv);
+                if (root) { WinSetHandler(editEv, hnew); }
+                else { sel.SetHandler(editEv, hnew); }
+            }
         }
         return iy + app.Scale(38);
     }
@@ -1154,8 +1201,8 @@ partial class Designer {
     /// 配置加有序的 "fields" 数组。这是交换格式——
     /// 手工编辑 JSON 再加载回去即可重新配置表单，
     /// 设计器完全由数据驱动。与 LoadJson 往返兼容。
-    ///   { name, labelPos, formSize, labelWidth, hideStar, showSubmit,
-    ///     showReset, submit, fields:[ { type,label,name,placeholder,
+    /// 核心契约与语义定义。
+    /// 核心契约与语义定义。
     ///     required,change,options:[...] } ] }
     string SaveJson() {
         JsonValue o = JsonValue.NewObject();
@@ -1194,6 +1241,16 @@ partial class Designer {
             fieldsArr.Append(this.FieldJson(fields[fi]));
         }
         o.Put("fields", fieldsArr);
+        if (docSource != null && docSource.IsObject()) {
+            for (int i = 0; i < docSource.Count(); i = i + 1) {
+                string key = docSource.KeyAt(i);
+                if (!o.Has(key)) { o.Put(key, docSource.ValAt(i)); }
+            }
+        }
+        if (docSource != null && docSource.Has("bodyContent")) {
+            o.Set("bodyContent", this.RemapDesignContent(docSource.Get("bodyContent"),
+                docSource.Get("fields"), fields));
+        }
         return o.PrettyToJson() + "\n";
     }
 
@@ -1221,7 +1278,9 @@ partial class Designer {
 
     /// ShapeJson 的逆操作：winShape 区域数组 -> 运行时消费的紧凑
     /// "t,x,y,w,h,r;..." 规格。
-    string ShapeSpecFromJson(JsonValue arr) {
+    string ShapeSpecFromJson(JsonValue arr) { return Designer.PreparedShapeSpec(arr); }
+
+    static string PreparedShapeSpec(JsonValue arr) {
         string s = "";
         int i = 0;
         while (i < arr.Count()) {
@@ -1245,7 +1304,78 @@ partial class Designer {
     /// 从 FormField 构建一个字段对象，递归进入容器
     /// `kids`，使 JSON 往返包含所有设计器事件绑定、选项和
     /// 子节点。读取器（FieldFromJson）与此键集镜像对应。
-    JsonValue FieldJson(FormField f) {
+    JsonValue RemapDesignContent(JsonValue content, JsonValue sourceKids,
+            List<FormField> currentKids) {
+        return Designer.PreparedRemapContent(content, sourceKids, currentKids);
+    }
+
+    static JsonValue PreparedRemapContent(JsonValue content, JsonValue sourceKids,
+            List<FormField> currentKids) {
+        JsonValue result = JsonValue.NewArray();
+        if (content == null || !content.IsArray()) { return result; }
+        for (int i = 0; i < content.Count(); i = i + 1) {
+            JsonValue item = content.At(i);
+            if (item == null) { continue; }
+            if (item.IsString()) { result.Append(item); continue; }
+            if (!item.IsNumber() || sourceKids == null || !sourceKids.IsArray()) { continue; }
+            int oldIndex = item.AsInt(0 - 1);
+            if (oldIndex < 0 || oldIndex >= sourceKids.Count()) { continue; }
+            JsonValue source = sourceKids.At(oldIndex);
+            for (int k = 0; k < currentKids.Count; k = k + 1) {
+                if (currentKids[k].designSource == source) {
+                    result.Append(JsonValue.NewNum(Convert.ToString(k)));
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+
+    void ReorderDesignContent(FormField owner, List<FormField> before,
+            List<FormField> after) {
+        JsonValue source = owner == null ? docSource : owner.designSource;
+        JsonValue metadata = owner == null ? docSource : owner.extra;
+        string contentKey = owner == null ? "bodyContent" : "htmlContent";
+        string kidsKey = owner == null ? "fields" : "kids";
+        if (source == null || metadata == null || !metadata.Has(contentKey)) { return; }
+        JsonValue sourceKids = source.Get(kidsKey);
+        if (sourceKids == null || !sourceKids.IsArray()) { return; }
+        JsonValue current = this.RemapDesignContent(metadata.Get(contentKey), sourceKids, before);
+        JsonValue order = JsonValue.NewArray();
+        for (int i = 0; i < after.Count; i = i + 1) {
+            FormField field = after[i];
+            if (field.designSource == null) { field.designSource = this.FieldJson(field); }
+            int index = 0 - 1;
+            for (int k = 0; k < sourceKids.Count(); k = k + 1) {
+                if (sourceKids.At(k) == field.designSource) { index = k; break; }
+            }
+            if (index < 0) {
+                index = sourceKids.Count();
+                sourceKids.Append(field.designSource);
+            }
+            order.Append(JsonValue.NewNum(Convert.ToString(index)));
+        }
+        JsonValue result = JsonValue.NewArray();
+        int next = 0;
+        for (int i = 0; i < current.Count(); i = i + 1) {
+            JsonValue item = current.At(i);
+            if (item == null) { continue; }
+            if (item.IsString()) { result.Append(item); }
+            else if (item.IsNumber() && next < order.Count()) {
+                result.Append(order.At(next));
+                next = next + 1;
+            }
+        }
+        while (next < order.Count()) {
+            result.Append(order.At(next));
+            next = next + 1;
+        }
+        metadata.Set(contentKey, result);
+    }
+
+    JsonValue FieldJson(FormField f) { return Designer.PreparedFieldJson(f); }
+
+    static JsonValue PreparedFieldJson(FormField f) {
         JsonValue o = JsonValue.NewObject();
         o.Put("kind", JsonValue.NewStr(f.KindName()));
         // 用户组件引用节点：显式携带 ref，GenForm 编译期据此
@@ -1262,11 +1392,22 @@ partial class Designer {
             o.Put("wrap", JsonValue.NewBool(f.wrap));
         }
         o.Put("span", JsonValue.NewNum(Convert.ToString(f.span)));
-        o.Put("fx", JsonValue.NewNum(Convert.ToString(f.fx)));
-        o.Put("fy", JsonValue.NewNum(Convert.ToString(f.fy)));
-        o.Put("fw", JsonValue.NewNum(Convert.ToString(f.fw)));
-        o.Put("fh", JsonValue.NewNum(Convert.ToString(f.fh)));
-        if (f.position != 0) {
+        if (f.designSource == null || f.designSource.Has("fx") || f.fx != 0) {
+            o.Put("fx", JsonValue.NewNum(Convert.ToString(f.fx)));
+        }
+        if (f.designSource == null || f.designSource.Has("fy") || f.fy != 0) {
+            o.Put("fy", JsonValue.NewNum(Convert.ToString(f.fy)));
+        }
+        if (f.designSource == null || f.designSource.Has("fw") || f.fw != 0) {
+            o.Put("fw", JsonValue.NewNum(Convert.ToString(f.fw)));
+        }
+        if (f.designSource == null || f.designSource.Has("fh") || f.fh != 0) {
+            o.Put("fh", JsonValue.NewNum(Convert.ToString(f.fh)));
+        }
+        if (f.dockSide != 0 || (f.designSource != null && f.designSource.Has("dock"))) {
+            o.Put("dock", JsonValue.NewNum(Convert.ToString(f.dockSide)));
+        }
+        if (f.position != 0 || f.designSource == null || f.designSource.Has("position")) {
             o.Put("position", JsonValue.NewNum(Convert.ToString(f.position)));
         }
         if (f.anchor != 0) {
@@ -1306,8 +1447,8 @@ partial class Designer {
             opts.Append(JsonValue.NewStr(f.OptionAt(op)));
         }
         o.Put("options", opts);
-        // Keep optional class metadata after options: this is the established
-        // order in the existing design-doc corpus and preserves its byte order.
+        // 核心契约与语义定义。
+        // 核心契约与语义定义。
         if (f.Class != "") { o.Put("class", JsonValue.NewStr(f.Class)); }
         // 内联 CSS 声明：与元素 style 属性同键同名（.html 设计稿里
         // 就是元素的 style 属性），解码端按同一属性名读回。
@@ -1317,7 +1458,7 @@ partial class Designer {
         // 往返一次就消失。
         if (f.extra != null && f.extra.IsObject()) {
             for (int x = 0; x < f.extra.Count(); x = x + 1) {
-                o.Put(f.extra.KeyAt(x), f.extra.ValAt(x));
+                o.Set(f.extra.KeyAt(x), f.extra.ValAt(x));
             }
         }
         // 只要挂着子级就一定写出来：手写/工具生成的设计稿会把
@@ -1326,9 +1467,13 @@ partial class Designer {
         if (f.IsContainer() || f.kids.Count > 0) {
             JsonValue kids = JsonValue.NewArray();
             for (int ki = 0; ki < f.kids.Count; ki = ki + 1) {
-                kids.Append(this.FieldJson(f.kids[ki]));
+                kids.Append(Designer.PreparedFieldJson(f.kids[ki]));
             }
             o.Put("kids", kids);
+        }
+        if (f.designSource != null && o.Has("htmlContent")) {
+            o.Set("htmlContent", Designer.PreparedRemapContent(o.Get("htmlContent"),
+                f.designSource.Get("kids"), f.kids));
         }
         return o;
     }
@@ -1346,6 +1491,10 @@ partial class Designer {
         selPrev = null;
         activeContainer = null;
         docRole = "";
+        docSource = null;
+        pvDocKey = "";
+        pvDocRoot = null;
+        pvDocNodes = null;
         loadError = false;
         // 严格解析：截断/损坏的设计稿不能被宽松解析静默降级成
         // 半份表单（下一次编辑就会把降级文档覆盖回盘）。
@@ -1366,6 +1515,7 @@ partial class Designer {
             return;
         }
         if (root.Has("name")) { formNameInput.SetText(root.Str("name", formNameInput.GetText())); }
+        docSource = root;
         docRole = root.Str("role", "");
         labelPos = root.Int("labelPos", labelPos);
         formSize = root.Int("formSize", formSize);
@@ -1485,10 +1635,14 @@ partial class Designer {
     /// 将 JSON 数组中的每个对象追加为 FormField（递归处理
     /// 容器 "kids"），保持顺序。
     void BuildFieldsFromJson(JsonValue arr, List<FormField> dst) {
+        Designer.BuildPreparedFields(arr, dst);
+    }
+
+    static void BuildPreparedFields(JsonValue arr, List<FormField> dst) {
         for (int i = 0; i < arr.Count(); i = i + 1) {
             JsonValue o = arr.At(i);
             if (o != null && o.IsObject()) {
-                dst.Add(FieldFromJson(o));
+                dst.Add(Designer.PreparedFieldFromJson(o));
             }
         }
     }
@@ -1582,7 +1736,9 @@ partial class Designer {
     /// 从 JSON 对象构建一个 FormField。先应用 "type"，这样
     /// 字段的事件集（Events()）和容器属性反映真实类型，
     /// 然后才读取 handlers、options 和子级。
-    FormField FieldFromJson(JsonValue o) {
+    FormField FieldFromJson(JsonValue o) { return Designer.PreparedFieldFromJson(o); }
+
+    static FormField PreparedFieldFromJson(JsonValue o) {
         FormField f = new FormField(0);
         f.SetOptionsFrom("");
         string kd = o.Str("kind", "");
@@ -1619,10 +1775,11 @@ partial class Designer {
             f.label = FormField.DefaultLabel(f.ftype);
             f.placeholder = FormField.DefaultPlaceholder(f.ftype);
         }
-        f.label = o.Str("label", f.label);
+        f.designSource = o;
+        f.label = o.Str("label", "");
         f.fname = o.Str("name", f.fname);
         f.name = f.fname;
-        f.placeholder = o.Str("placeholder", f.placeholder);
+        f.placeholder = o.Str("placeholder", "");
         f.bindPath = o.Str("bind", f.bindPath);
         f.bindProp = o.Str("bindProp", f.bindProp);
         f.required = o.Bool("required", f.required);
@@ -1630,25 +1787,17 @@ partial class Designer {
         f.Class = o.Str("class", f.Class);
         f.styleText = o.Str("style", f.styleText);
         f.span = o.Int("span", f.span);
-        f.fx = o.Int("fx", f.fx);
-        f.fy = o.Int("fy", f.fy);
-        f.fw = o.Int("fw", f.fw);
-        f.fh = o.Int("fh", f.fh);
+        f.fx = o.Int("fx", 0);
+        f.fy = o.Int("fy", 0);
+        f.fw = o.Int("fw", 0);
+        f.fh = o.Int("fh", 0);
         f.position = o.Int("position", f.position);
         f.anchor = o.Int("anchor", f.anchor);
         f.flexGrow = o.Int("flexGrow", f.flexGrow);
         f.altRects = o.Str("alt", f.altRects);
         f.locked = o.Bool("locked", f.locked);
         f.defOn = o.Bool("defOn", f.defOn);
-        if (o.Has("dock")) {
-            int oldDock = o.Int("dock", 0);
-            if (oldDock == 5) { f.position = 1; f.anchor = 10; }
-            else if (oldDock == 1) { f.position = 1; f.anchor = 2; }
-            else if (oldDock == 2) { f.position = 1; f.anchor = 8; }
-            else if (oldDock == 3) { f.position = 1; f.anchor = 4; }
-            else if (oldDock == 4) { f.position = 1; f.anchor = 6; }
-        }
-        f.dockSide = 0;
+        f.dockSide = o.Int("dock", 0);
         f.childTab = o.Int("childTab", f.childTab);
         // Tabs 标签条方向：文档里存选项名，容忍旧的数字写法。
         string ors = o.Str("orient", "");
@@ -1671,6 +1820,7 @@ partial class Designer {
                 f.AddOption(opts.At(k).AsString(""));
             }
         }
+        if (opts != null && opts.IsString()) { f.SetOptionsFrom(opts.AsString("")); }
         // 列声明（extra["columns"]）顺序对齐 options：设计器以
         // options 为列序真相，GenForm 先行的设计稿里两者可能不同
         // 序。条目数可以少于 options（缺 = 全缺省）；对齐后的数组
@@ -1682,7 +1832,7 @@ partial class Designer {
         }
         JsonValue kids = o.Get("kids");
         if (kids != null && kids.IsArray()) {
-            BuildFieldsFromJson(kids, f.kids);
+            Designer.BuildPreparedFields(kids, f.kids);
         }
         f.extra = Designer.UnmodeledKeys(o);
         return f;
@@ -1714,6 +1864,7 @@ partial class Designer {
             || k == "fy"
             || k == "fw" || k == "fh" || k == "alt" || k == "locked"
             || k == "defOn" || k == "dock" || k == "childTab"
+            || k == "position" || k == "anchor" || k == "flexGrow"
             || k == "activeTab" || k == "options" || k == "kids"
             || k == "orient" || k == "arg"
             || k == "change" || k == "ref" || k == "pvOff";
@@ -1721,10 +1872,12 @@ partial class Designer {
 
     /// 字段总数（含嵌套容器子级）；加载后为唯一名计数器
     /// 提供初始值。
-    int CountFields(List<FormField> lst) {
+    int CountFields(List<FormField> lst) { return Designer.CountPreparedFields(lst); }
+
+    static int CountPreparedFields(List<FormField> lst) {
         int total = 0;
         for (int i = 0; i < lst.Count; i = i + 1) {
-            total = total + 1 + CountFields(lst[i].kids);
+            total = total + 1 + Designer.CountPreparedFields(lst[i].kids);
         }
         return total;
     }

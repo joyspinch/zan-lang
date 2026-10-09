@@ -24,6 +24,21 @@ toolchain-relative `packages/` store).
   Works headless; consumers include Zan.Gui.Browser (cache sizing) and
   Zan.Commercial (device fingerprint).
 
+Portable clipboard entry points are `Clipboard.SetText/GetText` and
+`Clipboard.SetFiles/GetFiles/HasFiles`. Windows file lists use CF_HDROP;
+Linux uses `text/uri-list` with wl-clipboard, xclip, or xsel; macOS file lists
+use NSURL objects on NSPasteboard through the system JXA bridge. Linux
+clipboard access needs an active desktop session and an installed clipboard
+tool. macOS uses `/usr/bin/osascript` for file lists and pbcopy/pbpaste for text.
+
+`Display.Monitors()` on macOS reports CoreGraphics desktop origins, device
+pixel dimensions, the actual primary display, color depth and available mode
+refresh rate. `Screen.Dpi()` reports logical DPI from the primary screen's
+backing scale. On mixed-scale desktops, origins and device pixel dimensions
+have different units; multiplying each origin by its screen scale does not
+produce a global device-pixel coordinate system. These macOS backends have
+cross-compilation coverage; runtime verification requires a macOS desktop.
+
 Everything here talks to the operating system directly (Win32 via
 DllImport); server-shaped programs that never reference these namespaces
 compile without this package.

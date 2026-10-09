@@ -126,6 +126,17 @@ partial class CodeEditor {
     /// 从最近的已缓存行向前分词重新推导状态，
     /// 直至本行。
     CeHlLine GetHl(int ln, string text, Theme t, int defaultText) {
+        if (analysisApp != null) {
+            if (AnalysisSnapshotCurrent(analysisApplied) && ln >= 0 && ln < hlCache.Count) {
+                return hlCache[ln];
+            }
+            // 结果未到时画原文本，不同步回溯屏幕外行。
+            CeHlLine plain = new CeHlLine();
+            plain.src = text;
+            plain.spans = new List<CodeSpan>();
+            plain.spans.Add(new CodeSpan(text, synText != 0 ? synText : defaultText));
+            return plain;
+        }
         int sig = HlThemeSig(t, defaultText);
         if (sig != hlThemeSig) {
             hlCache = new List<CeHlLine>();
@@ -162,8 +173,8 @@ partial class CodeEditor {
                         string kt = lines[k];
                         CeHlLine ke = new CeHlLine();
                         ke.src = kt;
-                        // Checkpoint only: these lines are off screen, so keep
-                        // the block state and throw the colouring away.
+                        // 核心契约与语义定义。
+                        // 核心契约与语义定义。
                         ke.spans = null;
                         ke.blockIn = inBlock;
                         // 快速推导：绝大多数普通代码行不含块注释定界符，inBlock 状态保持不变，
@@ -392,6 +403,17 @@ partial class CodeEditor {
         c.FillRect(xStart, rowY, xEnd - xStart, lineH, CodeEditor.SelColor(app.theme));
     }
 
+    /// 在行的 `col` 格画一枚括号配对描边框（列→x 与选区/光标同
+    /// 一映射，保证框正好套住那一格）。
+    static void DrawBracketBox(Canvas c, string text, int col, int textX,
+            int rowY, int lineH, int fontSize, int color) {
+        if (col < 0 || col >= text.Length) { return; }
+        int x1 = textX + Canvas.MeasureText(Text.Left(text, col), fontSize);
+        int x2 = textX + Canvas.MeasureText(Text.Left(text, col + 1), fontSize);
+        if (x2 <= x1) { return; }
+        c.DrawRoundRect(x1, rowY + 1, x2 - x1, lineH - 2, 2, color, 1);
+    }
+
     /// 诊断列表里 `line` 行的消息（无则 ""）。
     static string DiagMsg(List<Diagnostic> ds, int line) {
         for (int i = 0; i < ds.Count; i = i + 1) {
@@ -421,9 +443,10 @@ partial class CodeEditor {
     /// 主渲染：画表面/装订线/高亮文本/光标/诊断与选区，处理焦点
     /// （获得焦点即占用 Tab）、滚轮与行布局，随后是补全弹窗、右键
     /// 菜单、CodeLens、引用弹窗、滚动条与悬停提示，最后做点击（移动
-    /// 光标/多击选择）与按键输入。诊断在光标换行时重跑。返回本帧
+    /// 光标/多击选择）与按键输入。分析只消费后台成品。返回本帧
     /// 编辑器的焦点 id。
     int Render(App app, Rect area) {
+        if (!analysisDetached && analysisApp != app) { AttachAnalysis(app); }
         Canvas c = app.canvas;
         Gui.Theme t = app.theme;
         EditorPalette pal = EditorPalette.For(t);
@@ -448,6 +471,8 @@ partial class CodeEditor {
                             "", "", "", Style.SNormal()).FgOr(0);
         cssNum = Style.Part(app, "codeeditor", "number",
                             "", "", "", Style.SNormal()).FgOr(0);
+        UpdateAnalysisPalette(t, textStyle.FgOr(0));
+        RequestAnalysis();
         int id = app.focus.AllocId();
         lastId = id;
         bool focused = app.focus.IsFocused(id);
@@ -498,17 +523,8 @@ partial class CodeEditor {
         }
 
         if (focused) { HandleInput(app); }
-        // 光标移到不同行时重新校验诊断：
-        // 刚离开的行现已完整可查，而活动行被
-        // CheckErrors 有意跳过。这还避免行内每次击键
-        // 触发整文档重扫。
-        // 拖拽选择或滚动条滑块拖动期间跳过整文档诊断：
-        // 指针每越过一行就运行一次会让多行选择或滚动严重卡顿。
-        // 滚动静止或拖动结束后才运行（光标行在未选择/未拖动期间变化时）。
-        if (curLine != lastDiagLine && !mouseSelecting && !barDragging && (app.nowMs - lastScrollMs >= 200)) {
-            CheckErrors();
-            lastDiagLine = curLine;
-        }
+        // 活动行的 using 提示在消费时抑制，移动光标不触发全文分析。
+        lastDiagLine = curLine;
         // 本帧缓冲区已稳定：丢弃编译器诊断的
         // 过期记忆，使其只重算一次而非每可见行一次。
         InvalidateDiagStale();
@@ -642,15 +658,7 @@ partial class CodeEditor {
                     hoverStyle.BgOr(0), breakpointStyle.BgOr(0),
                     lineNumberStyle.FgOr(0), caretStyle.BgOr(0),
                     textStyle.FgOr(0));
-        // 本帧预算不足未完成的计数：在视口稳定后（滚动或编辑静默期结束）才继续请求下一帧，
-        // 确保滚动时完全零多余重绘，帧率极致稳定。
-        if (LensPending() && app.nowMs - lastScrollMs >= 200) {
-            if (app.nowMs - lensQuietMs >= 250) {
-                app.RequestRedraw();
-            } else {
-                app.RequestWakeFrameIn(250 - (app.nowMs - lensQuietMs));
-            }
-        }
+        // 分析完成的 Post 自带重绘；不为引用扫描请求下一帧。
 
         // ---- 右侧诊断 / 滚动条（VS 风格概览标尺） ----
         RenderOverviewRuler(app, area, visLines);
@@ -1194,6 +1202,9 @@ partial class CodeEditor {
         Canvas c = app.canvas;
         Gui.Theme t = app.theme;
         EditorPalette pal = EditorPalette.For(t);
+        // 光标括号配对在行循环前算一次（内部有记忆，光标与文档
+        // 未变的帧零扫描）；画框在行内按命中行落笔。
+        this.UpdateBracketPair();
         // 把所有行渲染裁剪到编辑器框内，长代码行、宽
         // 装订线、选区高亮和行内错误提示就绝不会绘制
         // 到编辑器矩形之外的相邻窗格。
@@ -1249,13 +1260,21 @@ partial class CodeEditor {
                         curLine, curCol, ln, text, textX, rowY, lineH, fontSize, area);
                 }
 
+                // 光标括号配对：锚/配偶两格各画一枚描边小框（VS 同
+                // 款）。本格越界（滚动到行尾之后）不画。
+                if (focused && bpMLine >= 0 && (ln == bpALine || ln == bpMLine)) {
+                    CodeEditor.DrawBracketBox(c, text,
+                        ln == bpALine ? bpACol : bpMCol,
+                        textX, rowY, lineH, fontSize, pal.accent);
+                }
+
                 // 错误指示（红色下划线）。真实编译器错误具有权威优先权；
                 // 当存在有效的真实编译器诊断时，仅以真实编译器错误为准，消除启发式误报。
                 bool hasCompVal = (compErrors != null && !CompilerDiagStale());
                 if (HasCompilerErr(ln)) {
                     c.FillRect(textX, rowY + lineH - app.Scale(2),
                         Canvas.MeasureText(text, fontSize), app.Scale(2), pal.error);
-                } else if (!hasCompVal && CodeEditor.DiagHas(errors, ln)) {
+                } else if (!hasCompVal && LocalDiagnosticMessage(ln).Length > 0) {
                     c.FillRect(textX, rowY + lineH - app.Scale(2),
                         Canvas.MeasureText(text, fontSize), app.Scale(2), pal.errorDim);
                 }
@@ -1335,10 +1354,10 @@ partial class CodeEditor {
                 // 显示光标行的错误原因。编译器诊断具有权威优先权；
                 // 当存在有效的真实编译器诊断时，仅以真实诊断为准。
                 bool hasCompVal2 = (compErrors != null && !CompilerDiagStale());
-                bool shouldShowErr = HasCompilerErr(ln) || (!hasCompVal2 && CodeEditor.DiagHas(errors, ln));
+                bool shouldShowErr = HasCompilerErr(ln) || (!hasCompVal2 && LocalDiagnosticMessage(ln).Length > 0);
                 if (shouldShowErr && ln == curLine) {
                     string errMsg = CompilerErrMsg(ln);
-                    if (errMsg.Length == 0 && !hasCompVal2) { errMsg = CodeEditor.DiagMsg(errors, ln); }
+                    if (errMsg.Length == 0 && !hasCompVal2) { errMsg = LocalDiagnosticMessage(ln); }
                     if (errMsg.Length > 0) {
                         int ttW = Canvas.MeasureText(errMsg, fontSize) + app.Scale(12);
                         int ttH = lineH;
@@ -1382,7 +1401,8 @@ partial class CodeEditor {
             if (thumbY + thumbH > area.y + area.height) { thumbY = area.y + area.height - thumbH; }
             if (thumbY < area.y) { thumbY = area.y; }
             c.FillRoundRect(stripX + app.Scale(3), thumbY, stripW - app.Scale(6), thumbH, app.Scale(3), pal.minimapThumb);
-            for (int mi = 0; mi < errors.Count; mi = mi + 1) {
+            for (int mi = 0; LocalDiagnosticsCurrent() && mi < errors.Count; mi = mi + 1) {
+                if (errors[mi].line == curLine && errors[mi].msg == "Missing ';' after using") { continue; }
                 int el = errors[mi].line;
                 if (el >= 0 && el < lines.Count) {
                     int my = area.y + el * area.height / total;

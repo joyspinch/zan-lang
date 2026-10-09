@@ -5,9 +5,9 @@ namespace Gui;
 
 /// 模糊缓存槽状态实体（消除 blurSlotKey / blurSlotUse / blurSlotNew 平行列表反模式）。
 class BlurSlot {
-    int key;    // 占用槽的元素身份（0=空槽）
-    int lastUse; // 最后被用到的帧号
-    int lastNew; // 最后一次换手（分配给新身份）的帧号
+    int key;  // 占用槽的元素身份（0=空槽）
+    int lastUse;  // 最后被用到的帧号
+    int lastNew;  // 最后一次换手（分配给新身份）的帧号
 
     BlurSlot() {
         this.key = 0;
@@ -220,8 +220,8 @@ class App {
     // hasSkinDensity：当前皮肤包声明过 `--density`（跟随皮肤，用户
     // 抽屉选择被皮肤切换覆盖）；false = 用户自主档位。
     int density;
-    ThemeMetricsSnapshot densitySnapshot; // 强类型主题度量基线快照（主表示）
-    List<int> densityBase;                 // 兼容视图：24 项扁平整数度量基线
+    ThemeMetricsSnapshot densitySnapshot;  // 强类型主题度量基线快照（主表示）
+    List<int> densityBase;  // 兼容视图：24 项扁平整数度量基线
     bool hasSkinDensity;
     // 皮肤切换：当 autoSkins 开启时，标题栏主题按钮是一个菜单
     // 其中列出磁盘上的皮肤（Skin.Names），由 App 自行应用所选皮肤
@@ -245,6 +245,8 @@ class App {
     // 永不为空：空样式表表示"仅主题默认值"，因此控件
     // 无需判空即可始终解析成功。
     StyleSheet sheet;
+    Dict<int, StyleSheet> baseSheets;
+    int baseSheetGen;
     // 应用自身的样式表（页面布局和应用专属规则）。
     // 与皮肤分开保存，并在每次皮肤变更时重新叠放到最上层，
     // 这样切换皮肤会重新为应用换装，而不会丢失其布局。
@@ -259,7 +261,7 @@ class App {
     // （auto-stdlib 按 using 整目录拉入）；未注册 = 链接一律直开
     // 系统浏览器。
     static LinkNavigateFn linkNavigator;
-    // 图表主题包（Gui.Component.Chart/themes/<name>.css）编译出的
+    // 系统底层交互与数据流转契约
     // 独立样式表：解析时垫在内置基线之上、皮肤 sheet 之下，不与
     // 皮肤/appCss 合并成一张表。null = 未安装，图表跟随皮肤。
     StyleSheet chartSheet;
@@ -309,7 +311,7 @@ class App {
     // 圆角矩形）到规格中，标记外扩后的表面边界。shapeRects 以
     // 逻辑像素镜像已解析的规格，使 App 无需接触后端即可绘制阴影。
     int shapeShadow;
-    List<WindowShapeRegion> shapeRegions; // 强类型窗口轮廓区域实体集合（唯一主表示）
+    List<WindowShapeRegion> shapeRegions;  // 强类型窗口轮廓区域实体集合（唯一主表示）
     // SetWindowShadow 外扩时整份规格被平移 (px, px)（FitShapeWindow
     // 拒绝负坐标包围盒，见 SetWindowShadow 注释），因此画布上的内容
     // 轮廓相对窗口左上角偏移了 (px, px)：阴影、填充与自绘标题栏
@@ -389,7 +391,7 @@ class App {
     // 在自身渲染时碰巧重新读取原始事件的控件。
     int clickTargetId;
     int pressTargetId;
-    bool pointerDown;    // 按住左键（控件外的拖拽需要移动重绘）
+    bool pointerDown;  // 按住左键（控件外的拖拽需要移动重绘）
     // 按下（左键）落点是否为阻挡区/空白（上一帧命中快照里该点
     // 只被 BlockHitsRect/BlockHitsBelow 的遮罩或什么都没有覆盖）。
     // 弹层「按外部关闭」正是把这样一下按下当作关闭指令；若随后
@@ -672,7 +674,7 @@ class App {
     // 主题度量（字号/高度/内边距/圆角……）当前被临时缩放到的千分比：
     // 1000 = 主题原始度量。设计器渲染真控件预览时按画布缩放整体改写
     // 主题度量（见 Designer.BeginCtrlZoom），解析出来的样式随之不同，
-    // 因此样式缓存（app.styleCache / Style.baseSheet / Control.computedStyle）
+    // 系统底层交互与数据流转契约
     // 必须把它算进键里。它不是“代次”而是“状态”：在缩放与原始度量之间
     // 来回切换时两份缓存并存，不像递增 bgThemeGen 那样每个控件都把
     // 整张表连 base.css 的解析结果一起作废。
@@ -784,9 +786,63 @@ class App {
     /// <summary>physicalStage=true 时不做显示器 DPI 放大，窗口客户区
     /// 物理像素 == 请求尺寸（游戏舞台契约，画布逻辑尺寸恒等于请求
     /// 值）；普通 Gui 应用保持按 DPI 放大、控件度量随 DPI 缩放。</summary>
-    App(string title, int width, int height, bool physicalStage) {
+    App(string title, int width, int height, bool physicalStage)
+        : this(title, width, height, physicalStage, false) { }
+
+    static App CreateOffscreen(string title, int width, int height) {
+        App app = new App(title, width, height, false, true);
+        app.SetOffscreenViewport(width, height, 100);
+        app.mouseX = 0 - 100000;
+        app.mouseY = 0 - 100000;
+        return app;
+    }
+
+    /// 目标逻辑 viewport 与设备 DPI 独立于设计器的视图缩放。
+    void SetOffscreenViewport(int width, int height, int scale) {
+        if (window.GetHandle() != 0) { return; }
+        if (scale < 1) { scale = 100; }
+        bool metricsChanged = dpiScale != scale;
+        designW = width;
+        designH = height;
+        dpiScale = scale;
+        titlebarH = this.Scale(32);
+        captionBtnW = this.Scale(46);
+        scrollSpeed = this.Scale(40);
+        int w = this.Scale(width);
+        int h = this.Scale(height);
+        if (shapeMode != 0 && shapeRegions != null && shapeRegions.Count > 0) {
+            int minX = 2147483647;
+            int minY = 2147483647;
+            int maxX = 0 - 2147483647;
+            int maxY = 0 - 2147483647;
+            for (int i = 0; i < shapeRegions.Count; i = i + 1) {
+                WindowShapeRegion region = shapeRegions[i];
+                if (region.x < minX) { minX = region.x; }
+                if (region.y < minY) { minY = region.y; }
+                if (region.x + region.width > maxX) { maxX = region.x + region.width; }
+                if (region.y + region.height > maxY) { maxY = region.y + region.height; }
+            }
+            if (minX >= 0 && minY >= 0 && maxX > minX && maxY > minY) {
+                w = this.Scale(maxX - minX);
+                h = this.Scale(maxY - minY);
+            }
+        }
+        if (w < 1) { w = 1; }
+        if (h < 1) { h = 1; }
+        if (canvas.Width() != w || canvas.Height() != h) { this.SwapCanvas(w, h); }
+        window.width = w;
+        window.height = h;
+        if (metricsChanged) {
+            this.ScaleThemeMetrics();
+            bgThemeGen = bgThemeGen + 1;
+        }
+    }
+
+    App(string title, int width, int height, bool physicalStage, bool offscreen) {
         this.physicalStage = physicalStage;
-        if (physicalStage) {
+        if (offscreen) {
+            this.window = Window.Offscreen(width, height);
+        } else if (physicalStage) {
             this.window = Window.CreatePhysical(title, width, height);
         } else {
             this.window = new Window(title, width, height);
@@ -1039,7 +1095,7 @@ class App {
         this.canvas = new Canvas(width, height);
         // 预先（在 UI 线程上）重置 UI 线程分派队列，使
         // 任何后台工作线程一产生，App.Post 就安全可用。
-        Dispatcher.Init();
+        if (!offscreen) { Dispatcher.Init(); }
         // 每个窗口默认在标题栏获得内置皮肤选择器
         // （浅色窗口 -> 预选"Light"）。id 块
         // 现在分配，早于任何应用的 WidgetId.Mark，使选项 id 保持
@@ -1257,7 +1313,7 @@ class App {
     }
 
     /// 装载后端的落树收尾：作用域 CSS 并进 appCss 链、整树补作用
-    ///域类（原 LoadHtmlWith 内联逻辑，搬进 Html.LoadForApp）。
+    /// 域类（原 LoadHtmlWith 内联逻辑，搬进 Html.LoadForApp）。
     void ApplyScopedTree(Control root, string scopedCss, string zs) {
         string merged = appCss == "" ? scopedCss : appCss + "\n" + scopedCss;
         this.UseAppCss(merged);
@@ -1278,22 +1334,10 @@ class App {
         App.OpenInSystemBrowser(url);
     }
 
-    /// 系统关联程序打开 url（target="_blank" 与内嵌导航不可用时的
-    /// 回落通道）。Windows 走 ShellExecuteW——不经 cmd.exe，URL 里
-    /// 的 & ? # 等元字符不会被 shell 吃掉；POSIX 经 RunDetached 的
-    /// sh，URL 单引号包裹 + '\'' 转义防注入。原在 Gui.Html（链接
-    /// 语义的底层通道属 App 核心，Html 未安装也要能用）。
+    /// 系统关联程序打开 URI（内嵌导航不可用时的回落通道）。
+    /// 平台选择与参数封送由 Process.OpenUrl 统一处理，不经 shell 解释 URI。
     static void OpenInSystemBrowser(string url) {
-        #if WINDOWS
-        Win32Shell.ShellOpenUrl(url);
-        #else
-        List<string> args = new List<string>();
-        args.Add(url);
-        int rc = Process.StartDetachedSafe("xdg-open", args);
-        if (rc != 0) {
-            Process.StartDetachedSafe("open", args);
-        }
-        #endif
+        Process.OpenUrl(url);
     }
 
     /// WebView 家族（宿主就地图/链接窗口）向 App 注册 <a href> 内嵌
@@ -1368,7 +1412,7 @@ class App {
                 varList.Add(new CssVarDecl(fresh.vars.KeyAt(i), fresh.vars.ValAt(i).AsString("")));
             }
         }
-        // Theme metrics are physical; inherited skin declarations are logical.
+        // 主题指标为物理像素，继承的皮肤声明为逻辑像素。
         if (appCss != "") {
             fresh.MergeSheet(Css.ParseWithSources(appCss, varList, themeVarCount));
         }
@@ -1406,7 +1450,7 @@ class App {
     /// 不会重复应用。幂等：稳定 id 块只分配一次。
     void EnableSkins(int index) {
         autoSkins = true;
-        // 皮肤即数据：`packages/Zan.Gui/src/Gui/skins`、`./skins` 或 $ZAN_GUI_SKINS，每个
+        // 系统底层交互与数据流转契约
         // 是含设计令牌 skin.css（以及可选规则/美术）的文件夹。
         skinPacks = Skin.Names();
         themeNames = Skin.Labels(skinPacks);
@@ -1989,7 +2033,7 @@ class App {
     }
 
     /// 当 `path` 是任意已安装皮肤包自身的美术（不仅限当前
-    /// 皮肤）时为 true。持久化设置曾把皮肤包美术存为壁纸，
+    /// 皮肤）时为 true
     /// 因此针对旧皮肤列表编写的配置可能指向一个不再属于
     /// 当前皮肤的横幅；IDE 会忽略这类过期路径。
     bool IsSkinArtPath(string path) {
@@ -2500,7 +2544,7 @@ class App {
     /// 只有不可见的窗口才停止计时（见 FxPresent）。
     /// 不做"输入空闲就放慢"的降速：输入空闲 ≠ 没人看，失焦或
     /// 挂机后仍可见的窗口按半速/四分之一速起步，粒子漂移肉眼
-    /// 可见地一卡一卡（2026-10-01 实机反馈）。没人看的窗口
+    /// 可见地一卡一卡（实机反馈）。没人看的窗口
     /// （最小化/隐藏）本就走 FxPresent 的暂停，那才是该省的 CPU。
     int FxIntervalMs() {
         return BackdropFx.IntervalMs(this.EffectiveFx());
@@ -2583,12 +2627,12 @@ class App {
     /// 条带外的控件既无输入也无输出。合并以下来源后仍收不住（接近
     /// 整窗、无上一帧认领）时返回 false，调用方退回整帧：
     /// - 上一帧认领视口（wheelCapW>0）：主来源。触摸拖动/滚轮连续
-    ///   滚动时每一帧的声明都落在这里面；
+    /// 滚动时每一帧的声明都落在这里面；
     /// - 本帧已声明的损伤（dmgW>0，页面滚动 NotePageScrollDamage
-    ///   在事件期先行声明）：一并包住；
+    /// 在事件期先行声明）：一并包住；
     /// - 指针邻域（Scale(24)）：悬停高亮随内容滚到新行的过渡帧，
-    ///   RefreshScrollHover 补的条带下一帧自己会画，这里只要不把
-    ///   指针底下那一小块留在上一帧的样子。
+    /// RefreshScrollHover 补的条带下一帧自己会画，这里只要不把
+    /// 指针底下那一小块留在上一帧的样子。
     /// 判 false 的兜底：无认领（指针刚跨入滚动区，整帧——这正是
     /// wheel-unclaimed 注释描述的吞格场景，整帧才认得出新声明者）、
     /// 页面级滚动（内容区近乎整窗，条带无利可图）、弹层/按住（这
@@ -2958,7 +3002,6 @@ class App {
     }
 
     /// 悬停在某个标题按钮上够久（提示该露出来了）。
-    ///
     /// 声明给动画的重绘范围必须把按钮下方那条提示一起圈进去：提示是这次悬停
     /// 动画画出来的东西，只声明按钮自己那一格的话，被动画唤醒的那一帧就裁到
     /// 那 46x33 —— 提示画在标题栏下方，整条都在裁剪框外，于是它一个像素也落
@@ -2977,7 +3020,6 @@ class App {
 
     /// 记下这一帧哪条标题提示露着（`id` 为 0 表示一条也没有），并为
     /// “浮出/消失”那一刻额外要一帧。
-    ///
     /// 提示是指针刚进按钮那一帧画出来的，而那一帧的重绘范围是悬停损伤
     /// （只有离开与进入的那两格按钮），提示整条都在裁剪框外，于是一个
     /// 像素也落不到屏幕上（只有别的原因触发整窗重绘时才闪一下）；指针移开
@@ -3112,19 +3154,12 @@ class App {
         if (realW != canvas.Width() || realH != canvas.Height()) {
             this.SwapCanvas(realW, realH);
         }
-        dpiScale = Canvas.GetDpiScale();
-        // 全屏宿主不给所请求的窗口尺寸（Android 上 SDL 窗口永远
-        // 是整个 activity 表面）：设计整页按当前 DPI 缩放后超出
-        // 客户区时，把缩放重新拟合到刚好放下——生成代码的坐标
-        // 都是逻辑字段，随 dpiScale 整页重解，右侧不再裁掉半列。
-        // 桌面上客户区 == 请求尺寸（或系统钳制后的尺寸），拟合
-        // 只在真的放不下时介入，行为不变。下限 50：宁可滚动、
-        // 裁边也不要把界面缩到不可读。
-        // Android 例外：整页拟合在手机上是倒退——窗口是 1080×2400
-        // 级别的竖屏表面，设计稿（桌面比例）宽或高必然超，拟合会
-        // 把 420dpi 设备压回 96dpi 的字，整页小得没法读。手机上
-        // 的正确形状是「按设备原生密度渲染 + 页内滚动」，所以拟合
-        // 只允许下调到原生密度为止，绝不低于它。
+        dpiScale = window.GetDpiScale();
+        // 桌面保持窗口的真实 DPI；工作区钳制只改变 viewport，不能
+        // 降低字体和控件比例，否则首帧与后续原生 DPI 同步不一致。
+        #if ANDROID || OHOS
+        // 移动全屏宿主的表面尺寸由 activity / XComponent 决定，
+        // 保留整页拟合策略；缩放不得低于原生密度，超出的内容滚动。
         if (realW > 0 && realH > 0 && designW > 0 && designH > 0) {
             int wantW = designW * dpiScale / 100;
             int wantH = designH * dpiScale / 100;
@@ -3134,26 +3169,19 @@ class App {
                 int fit = fitX < fitY ? fitX : fitY;
                 if (fit < 50) { fit = 50; }
                 if (fit > 400) { fit = 400; }
-                #if ANDROID || OHOS
-                // 鸿蒙同安卓：XComponent 全屏表面，拟合不得把
-                // 原生密度压回去，否则整页小得没法读。
                 if (fit < dpiScale) { fit = dpiScale; }
-                #endif
                 if (fit < dpiScale) { dpiScale = fit; }
             }
         }
+        #endif
         if (physicalStage) {
-            // 舞台窗口的客户区就是设计尺寸的物理 1:1，上面的拟合必然
-            // 把 dpiScale 压回 100，chrome（标题文字/按钮/图标）就跟
-            // 不上设备 DPI 的标题栏高度了（150% 屏上 32px 字挤在 48px
-            // 条里）。舞台恢复设备 DPI：内容区绘制不经过 dpiScale
-            // （模板按物理像素直接作画），只有 chrome 度量跟随。
-            dpiScale = Canvas.GetDpiScale();
+            // 舞台内容按物理像素 1:1 绘制，只有 chrome 度量跟随 DPI。
+            dpiScale = window.GetDpiScale();
         }
         this.ScaleThemeMetrics();
         scrollSpeed = 40 * dpiScale / 100;
-        titlebarH = Window.TitlebarHeight();
-        captionBtnW = Window.CaptionButtonWidth();
+        titlebarH = window.GetTitlebarHeight();
+        captionBtnW = window.GetCaptionButtonWidth();
         if (titlebarH < 24) { titlebarH = Scale(32); }
         if (captionBtnW < 24) { captionBtnW = Scale(32); }
         int nCap = 0;
@@ -3171,10 +3199,37 @@ class App {
         this.RunLoop(() => { this.RenderChrome(title); });
     }
 
+    /// 原生 DPI 先于表面尺寸同步；相同尺寸也可能需要重排字体与 chrome。
+    void SyncNativeDpi() {
+        #if WINDOWS
+        if (window.GetHandle() == 0) { return; }
+        int scale = window.GetDpiScale();
+        int bar = window.GetTitlebarHeight();
+        int button = window.GetCaptionButtonWidth();
+        bool metricsChanged = dpiScale != scale;
+        if (!metricsChanged && titlebarH == bar && captionBtnW == button) { return; }
+        dpiScale = scale;
+        titlebarH = bar;
+        captionBtnW = button;
+        scrollSpeed = 40 * scale / 100;
+        if (metricsChanged) {
+            this.ScaleThemeMetrics();
+            bgThemeGen = bgThemeGen + 1;
+        }
+        backdropDirty = true;
+        fxSnapValid = false;
+        partialPending = false;
+        forceFullNext = true;
+        this.NoteRedrawWhy("SyncNativeDpi");
+        needsRedraw = true;
+        #endif
+    }
+
     /// <summary>让渲染表面跟上真实的窗口大小（并把滚动限制到
     /// 新视口）。由 ProcessEvent 每次事件调用，也由窗口过程
     /// 驱动的重绘调用。</summary>
     void SyncSurface() {
+        this.SyncNativeDpi();
         int curW = window.ClientWidth();
         int curH = window.ClientHeight();
         if (curW <= 0 || curH <= 0) { return; }
@@ -3364,9 +3419,9 @@ class App {
         return titlebarH;
     }
 
-    /// Client dimensions exposed without leaking the backing Canvas to
-    /// application layout code. Controls and forms use these for their root
-    /// arrange pass; direct pixel drawing remains an internal App concern.
+    /// 暴露客户区逻辑尺寸供排版布局使用，隔离底层 Canvas 画布。
+    /// 控件与表单根节点排版参照尺寸。
+    /// 核心契约与语义定义。
     /// 阴影带外扩的异形窗口扣掉两侧 band，返回内容区尺寸。
     int ClientWidth() {
         return canvas.Width() - this.ShapeOffX() * 2;
@@ -3813,6 +3868,11 @@ class App {
         redrawWhy = why;
     }
 
+    /// 获取整窗重绘原因（分析器与测试使用）。
+    string RedrawWhy() {
+        return redrawWhy;
+    }
+
     void RequestRedraw() {
         // 未声明范围的重绘：无法知道哪些像素变了，因此
         // 下一帧整窗重绘（NoteDamage 是声明了范围的那一个）。
@@ -3922,14 +3982,12 @@ class App {
     /// 损伤裁剪帧只有与脏矩形相交的区域才算脏——条带外的面板一个
     /// 像素也写不出去，重算纯属白费（连校验和都不用算）。
     /// 另外 slot 本帧刚换手时必须重算：里面是上一位主人的像素。
-    ///
     /// 滚动串（连续的滚轮/拖拽，见 NoteScrollDamage）里再放宽一档：
     /// 与条带相交的面板也暂用缓存的旧模糊。此时重卷积只能拿到条带
     /// 外上一帧的合成像素，结果注定不准、还得把下一帧扩成面板并集
     /// 重来；不如先欠着——细条带照常便宜地走，串一结束由 EndFrame
     /// 武装一帧「条带 ∪ 欠账面板」的扩展刷新统一还账。磨砂玻璃对
     /// 快速滚动中的一两帧模糊滞后不敏感，账还清后像素严格正确。
-    ///
     /// 「与条带相交」其实不够——矩形跨出条带的玻璃同样不能真算
     /// （冻结测试时钟下悬停补间的条带帧就是这一类，曾让同一区域
     /// 条带帧与整帧渲染出两种色调）。判定改成「完整落在条带内」：
@@ -4065,6 +4123,7 @@ class App {
     /// 组合/候选窗口跟随光标，而非固定在
     /// 窗口原点。聚焦期间由 Input/TextArea 每帧调用。
     void SetImeCaret(int x, int y) {
+        if (window.GetHandle() == 0) { return; }
         Ime.SetCaret(x, y);
     }
 
@@ -4097,6 +4156,27 @@ class App {
     void StopLoop() {
         isRunning = false;
         Dispatcher.Clear();
+    }
+
+    Action closeRequest;
+    bool closePending;
+
+    /// 核心契约与语义定义。
+    void OnCloseRequest(Action handler) {
+        closeRequest = handler;
+        closePending = false;
+    }
+
+    bool HandleCloseRequest() {
+        if (closeRequest == null) {
+            this.StopLoop();
+            return false;
+        }
+        if (!closePending) {
+            closePending = true;
+            closeRequest();
+        }
+        return isRunning;
     }
 
     /// <summary>编程式关闭窗口：等效于点击标题栏的关闭按钮
@@ -4729,8 +4809,7 @@ class App {
         if (App.PerfOn()) { this.PerfLoopTick(loopT0, loopPath); }
         this.lastPollResult = result;
         if (result < 0) {
-            this.StopLoop();
-            return false;
+            return this.HandleCloseRequest();
         }
 
         // 在 UI 线程上运行从后台线程调度来的工作。
@@ -4790,8 +4869,7 @@ class App {
         }
 
         if (kind == 8) {
-            this.StopLoop();
-            return false;
+            return this.HandleCloseRequest();
         }
 
         // 让渲染表面始终与真实窗口大小一致。最大化/还原
@@ -5102,8 +5180,7 @@ class App {
         if (mine) { DrainPosts(); }
 
         if (mine && kind == 8) {
-            this.StopLoop();
-            return false;
+            return this.HandleCloseRequest();
         }
         if (!mine) {
             // 不是本窗口的事件：所有交互状态
@@ -5330,23 +5407,23 @@ class App {
         return true;
     }
 
-    void PresentFrame() {
-        int perfT0 = 0;
-        if (App.PerfOn()) { perfT0 = Window.GetTickMs(); }
-        // 最后绘制并分发弹层，使其位于所有内容之上并拥有
-        // 最顶层命中区域（框架拥有的遮罩/层叠层）。
+    void RenderFrameOverlays() {
         RunOverlays();
-        // 延迟悬停提示最后绘制：拥有它们的控件帧内渲染较早，
-        // 会被同页后续内容甚至弹层盖住。宿主若已自行 Flush 过，
-        // 这里就是空操作（队列已清空）。
         Widget.Tooltip.Flush(this);
-        // 重家族的呈现尾段（Chart 提示刷新等）经 AddPresentTail
-        // 注册，App 编译图不背它们。
         if (presentTails != null) {
             for (int i = 0; i < presentTails.Count; i = i + 1) {
                 presentTails[i](this);
             }
         }
+    }
+
+    void PresentFrame() {
+        if (window.GetHandle() == 0) { this.EndOffscreenFrame(); return; }
+        int perfT0 = 0;
+        if (App.PerfOn()) { perfT0 = Window.GetTickMs(); }
+        // 最后绘制并分发弹层，使其位于所有内容之上并拥有
+        // 最顶层命中区域（框架拥有的遮罩/层叠层）。
+        this.RenderFrameOverlays();
         // 弹层落定之后再结算原生浮层：此刻本帧所有拦截区都已注册，
         // 能算出网页视图真正该露出的区域（菜单/对话框压住的部分被
         // 裁掉），否则原生层会盖住它上面的一切。
@@ -5714,7 +5791,7 @@ class App {
         lastPresentMs = Window.GetTickMs();
         // 将悬停/焦点/按下快照为本帧的"上一帧"基线，
         // 使下一渲染帧能检测进入/离开和焦点/失焦转换
-        // （Ui.Entered/Left/FocusGained/FocusLost）。
+        // 核心契约与语义定义。
         focus.RollFrame();
         // 滚轮把内容挪到指针底下的那一帧在出完帧后重算悬停目标：
         // 此时命中区已按滚动后的新位置注册完毕，重算才是准的。
@@ -5904,7 +5981,6 @@ class App {
     }
 
     // ---- 控件级内容哈希（partialFrames 损伤上报自动化） --------------------
-    //
     // partialFrames 的正确性前提是"每处状态变化都声明自己改了哪些像素"，
     // 漏报的像素留在屏上直到下一次整窗重绘——这正是它默认关闭的原因。
     // 这组设施把上报自动化：RenderTreeInner 把每个控件自段
@@ -5913,7 +5989,6 @@ class App {
     // 自段结束与上一帧的存档比对——不同说明这块内容变了；当前条带没
     // 盖住它时像素还是旧的，NoteDamage 控件矩形补进下一帧条带
     // （needsRedraw 同时被点亮，空闲等事件的 App 也会被推着走完补画帧）。
-    //
     // 累加器是静态的：Canvas 绘制原语是静态薄封装拿不到实例，而 UI 单
     // 线程、任一时刻只有一个 App 在渲染帧。每帧 BeginFrame 随
     // PartialFrames() 置/清 paintHashOn——默认关闭的 App 每原语只多一次
@@ -6012,7 +6087,6 @@ class App {
     /// 阴影/模糊/图片这几个图元在 CPU 上（分派时自动同步帧），并且要靠
     /// 每台机器的 GL 驱动，先让应用自己逐屏验证过再开。切换会带着当前
     /// 窗口内容一起搬过去，不会闪白；随后整窗重画一帧。
-    ///
     /// 返回实际装上的后端：1 = GPU，0 = CPU（要了 GPU 拿到 0 就是这台机器
     /// 没有可用的 GL 上下文——远程桌面、虚拟机、CI——不是错误）。
     int SetRenderBackend(int mode) {
@@ -6110,7 +6184,191 @@ class App {
         return line;
     }
 
+    Widget.TooltipRequest offscreenTooltip;
+    App offscreenFrameParent;
+    bool offscreenFrameActive;
+    bool offscreenWheelPending;
+    int offscreenWheelX;
+    int offscreenWheelY;
+    int offscreenWheelKey;
+    int offscreenWheelMods;
+    int offscreenWheelFlag;
+    long offscreenWheelSeq;
+
+    /// 未认领的滚轮在登记更新后本地重放一次，不写入系统事件队列。
+    bool ReplayOffscreenWheel() {
+        if (window.GetHandle() != 0 || !offscreenWheelPending) { return false; }
+        this.ProcessOffscreenInput(13, offscreenWheelX, offscreenWheelY, 0,
+            offscreenWheelKey, offscreenWheelMods, offscreenWheelFlag);
+        window.localSeq = offscreenWheelSeq;
+        wheelReplayArmed = true;
+        return true;
+    }
+
+    /// 离屏输入通过上一帧的命中登记解析，本实例不泵或重写 OS 事件。
+    void ProcessOffscreenInput(int kind, int x, int y, int button,
+            int key, int mods, int flag) {
+        if (window.GetHandle() != 0) { return; }
+        offscreenWheelPending = false;
+        wheelReplayArmed = false;
+        window.SetLocalEvent(kind, x, y, button, key, mods, flag);
+        if (kind == 1 || kind == 2 || kind == 3 || kind == 13) {
+            mouseX = x;
+            mouseY = y;
+            focus.SetHovered(hitTester.HitTest(x, y));
+        }
+        if (kind == 2) {
+            if (button == 1) {
+                rightPressTargetId = hitTester.AnchorAt(2, x, y, menuBlockPrevious);
+                hitTester.ClearAnchor(0);
+            } else {
+                int hit = hitTester.AnchorAt(0, x, y, false);
+                pressTargetId = hit;
+                pressOnBlocker = hit < 0;
+                pointerDown = true;
+                focus.SetPressed(hit);
+                focus.SetFocused(hit);
+                hitTester.ClearAnchor(2);
+                hitTester.ClearAnchor(3);
+                this.NotePressStart(hit, x, y);
+            }
+        } else if (kind == 3) {
+            clickSeenSeq = 0 - 1;
+            clickEvSeq = window.EventSeq();
+            if (button == 1) {
+                rightClickTargetId = hitTester.AnchorAt(3, x, y, menuBlockPrevious);
+                hitTester.ClearAnchor(1);
+            } else {
+                int hit = hitTester.AnchorAt(1, x, y, false);
+                pointerDown = false;
+                if (flag == 1 || pressOnBlocker) {
+                    clickTargetId = 0 - 1;
+                    hitTester.ClearAnchor(1);
+                } else {
+                    clickTargetId = hit;
+                    this.NoteClickTarget(hit);
+                }
+                this.NoteRelease(x, y);
+                focus.ClearPress();
+            }
+        } else if (kind == 4 && key == 9) {
+            if (!this.HasOverlays() && !blocksInputBelow && tabHoldId < 0) {
+                focus.FocusStep(Modifiers.HasShift(mods) ? 0 - 1 : 1);
+            }
+        }
+        backdropDirty = kind != 0 && kind != 4 && kind != 5 && kind != 6
+            && (kind != 1 || pointerDown);
+    }
+
+    /// 离屏帧只重置本 App 的登记和表面，不泵系统事件或同步平台外壳。
+    void BeginOffscreenFrame() {
+        if (window.GetHandle() != 0) { return; }
+        offscreenFrameParent = App.frameApp;
+        App.frameApp = this;
+        offscreenFrameActive = true;
+        offscreenTooltip = Widget.Tooltip.Suspend();
+        try {
+            lastFrameMs = nowMs;
+            if (!freezeAnimClock) { nowMs = Window.GetTickMs(); }
+            needsRedraw = false;
+            frameSeq = frameSeq + 1;
+            blurSlotSeq = 0;
+            clickClaimed = false;
+            wheelConsumed = false;
+            wheelClaimSeen = false;
+            wheelOwnerOrder = wheelCapOrder;
+            wheelClaimSeq = 0;
+            wheelCapOrder = 0;
+            wheelCapW = 0;
+            wheelCapH = 0;
+            tabHoldId = 0 - 1;
+            inputBlockPrevious = blocksInputBelow;
+            blocksInputBelow = false;
+            menuBlockPrevious = menuBlock;
+            menuBlock = false;
+            this.SyncSkin();
+            partialFrame = false;
+            partialPending = false;
+            paintHashOn = false;
+            glassDeferred = false;
+            hitTester.Clear();
+            focus.ResetIds();
+            glassRects.Clear();
+            overlays = new List<OverlayPopup>();
+            nativeLayers = new List<NativeLayerReq>();
+            nativeOccluders = new List<int>();
+            hitOnlyBlockers = new List<int>();
+            if (shapeMode != 0) {
+                canvas.Clear(0);
+            } else if (glassNative) {
+                canvas.Clear(Style.Part(this, "windowbg", "glass", "", "",
+                    "", Style.SNormal()).BgOr(0));
+            } else {
+                canvas.Clear(Style.Full(this, "windowbg", "", "",
+                    Style.SNormal()).BgOr(0));
+            }
+        } catch (Exception ex) {
+            this.CancelOffscreenFrame();
+            throw ex;
+        }
+    }
+
+    void CancelOffscreenFrame() {
+        if (!offscreenFrameActive) { return; }
+        Widget.Tooltip.Restore(offscreenTooltip);
+        offscreenTooltip = null;
+        App.frameApp = offscreenFrameParent;
+        offscreenFrameParent = null;
+        offscreenFrameActive = false;
+        window.SetLocalEvent(0, mouseX, mouseY, 0, 0, 0, 0);
+    }
+
+    void EndOffscreenFrame() {
+        if (window.GetHandle() != 0 || !offscreenFrameActive) { return; }
+        try {
+            this.RenderFrameOverlays();
+            if (this.FxActive()) {
+                BackdropFx.Render(this, canvas, this.EffectiveFx(), 0, 0,
+                    canvas.Width(), canvas.Height(), nowMs, theme, dpiScale);
+                BackdropFx.TakeDamage();
+            }
+            hitTester.KeepFullSnapshot();
+            focus.prevFocusedId = focus.focusedId;
+            focus.prevHoveredId = focus.hoveredId;
+            focus.prevPressedId = focus.pressedId;
+            if (this.EventKind() == 13 && wheelClaimSeen && !wheelConsumed && !wheelReplayArmed) {
+                offscreenWheelPending = true;
+                offscreenWheelX = window.EventX();
+                offscreenWheelY = window.EventY();
+                offscreenWheelKey = window.EventKeyCode();
+                offscreenWheelMods = window.EventMods();
+                offscreenWheelFlag = window.EventFlag();
+                offscreenWheelSeq = window.EventSeq();
+            }
+        } finally {
+            this.CancelOffscreenFrame();
+        }
+    }
+
+    /// 离屏帧的延迟绘制由可见宿主的事件循环兑现。
+    void ForwardOffscreenFrameRequests(App host) {
+        if (window.GetHandle() != 0 || host == null || host == this) { return; }
+        if (needsRedraw) { host.RequestRedraw(); needsRedraw = false; }
+        int due = wakeFrameNextMs;
+        if (animNextMs >= 0 && (due < 0 || animNextMs < due)) { due = animNextMs; }
+        if (wakeNextMs >= 0 && (due < 0 || wakeNextMs < due)) { due = wakeNextMs; }
+        if (due >= 0) {
+            int delay = due - Window.GetTickMs();
+            host.RequestWakeFrameIn(delay < 0 ? 0 : delay);
+        }
+        wakeFrameNextMs = 0 - 1;
+        animNextMs = 0 - 1;
+        wakeNextMs = 0 - 1;
+    }
+
     void BeginFrame() {
+        if (window.GetHandle() == 0) { this.BeginOffscreenFrame(); return; }
+        this.SyncNativeDpi();
         if (App.PerfOn()) { perfBeginMs = Window.GetTickMs(); }
         if (App.PerfOn()) { Canvas.TextStatEnable(true); }
         // 在任何绘制之前应用新选的内置皮肤，
@@ -6187,7 +6445,7 @@ class App {
         partialFrame = false;
         partialBlocked = false;
         glassDeferred = false;
-        // 控件内容哈希只在本应用开了局部帧时计数（B-ID119）。
+        // 控件内容哈希只在本应用开了局部帧时计数（）。
         paintHashOn = this.PartialFrames();
         // 输入事件（按下/释放/按键）触发的帧不得继承上一帧遗留的
         // 条带裁剪：条带外的控件本帧不渲染、不注册命中区，锚点认领
@@ -6284,7 +6542,7 @@ class App {
 
     /// 将弹层排队，在主内容绘制之后绘制并分发，
     /// 使其位于一切之上并拥有最顶层命中区域。
-    /// <see cref="RunOverlays"/>.
+    /// 核心契约与执行状态转移规范。
     void AddOverlay(OverlayPopup p) {
         overlays.Add(p);
         // 在损坏裁剪帧期间出现的弹层/工具提示会被
@@ -6463,6 +6721,7 @@ class App {
     /// 原生状态已被清（排空后的空轮询）且宿主挂住了本帧事件时，
     /// 回退到挂住值（见 HoldEventKind）。
     int EventKind() {
+        if (window.GetHandle() == 0) { return this.NormalizedKind(); }
         nint evh = Window.EventHwnd();
         if (evh != window.GetHandle()) {
             if (evh == 0 && this.holdEvArmed
@@ -6475,7 +6734,7 @@ class App {
     }
 
     /// 当正在处理的事件投递到了本 App 的窗口时为真。
-    bool EventIsMine() { return Window.EventHwnd() == window.GetHandle(); }
+    bool EventIsMine() { return window.GetHandle() == 0 || Window.EventHwnd() == window.GetHandle(); }
 
     /// 当主点击（mouse-up）事件在本帧有效且
     /// 可由当前渲染的表面处理时为真。即时模式

@@ -1,0 +1,350 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Designer;
+
+class DesignPreviewEvents {
+    string last;
+
+    void Note(string evt, string handler, Control sender) {
+        string who = sender == null ? "" : " · " + sender.Kind();
+        last = evt + " → " + handler + who;
+    }
+}
+
+partial class Designer {
+    DesignPreviewEvents pvEvents;
+    long pvInputSeq;
+    bool pvInputSeen;
+    bool pvInputFocused;
+    WindowShapeMask pvShapeMask;
+    string pvShapeImage;
+    bool pvShapeReady;
+
+    void BindDesignPreviewEvents(Control root, DesignPreviewEvents events) {
+        for (int i = 0; i < root.events.Count; i = i + 1) {
+            string evt = root.events[i].key;
+            string handler = root.events[i].val;
+            if (evt == "" || handler == "") { continue; }
+            root.BindEventS(evt, (Control sender) => { events.Note(evt, handler, sender); });
+        }
+        for (int i = 0; i < root.children.Count; i = i + 1) {
+            this.BindDesignPreviewEvents(root.children[i], events);
+        }
+    }
+
+    void RenderDesignPreview() {
+        if (pvDocForm == null) { return; }
+        App target = pvDocForm.GetApp();
+        if (target.canvas == null) { return; }
+        for (int pass = 0; pass < 2; pass = pass + 1) {
+            target.BeginOffscreenFrame();
+            try {
+                pvDocForm.RenderFrame(target);
+                target.RenderChrome(winTitle);
+                target.EndOffscreenFrame();
+            } finally {
+                target.CancelOffscreenFrame();
+            }
+            if (pass != 0 || !target.ReplayOffscreenWheel()) { break; }
+        }
+        pvShapeReady = false;
+        if (target.shapeMode != 0 || target.WindowOpacity() < 100) {
+            if (pvShapeMask == null) { pvShapeMask = new WindowShapeMask(); }
+            if (pvShapeImage == null || pvShapeImage == "") {
+                pvShapeImage = "mem:designer-shape-" + Convert.ToString(pvDocForm.CommonId());
+            }
+            pvShapeReady = target.canvas.SnapshotWindowShape(pvShapeImage,
+                pvShapeMask, target.shapeRegions, target.dpiScale, target.WindowOpacity());
+        }
+        this.UpdateDesignPreviewLayout();
+    }
+
+    void ProcessDesignPreviewInput(App host, int x, int y, bool inside) {
+        if (pvDocForm == null) { return; }
+        App target = pvDocForm.GetApp();
+        long seq = host.window.EventSeq();
+        int kind = host.EventKind();
+        bool fresh = !pvInputSeen || seq != pvInputSeq;
+        pvInputSeen = true;
+        pvInputSeq = seq;
+        if (!fresh) { kind = 0; }
+        int button = host.window.EventButton();
+        bool editorGesture = freeHand || freePanning
+            || ((kind == 2 || kind == 3) && button == 2)
+            || (kind == 13 && Modifiers.HasCtrl(host.window.EventMods()));
+        if (editorGesture) {
+            kind = 0;
+            inside = false;
+            target.pointerDown = false;
+            target.pressTargetId = 0 - 1;
+            target.clickTargetId = 0 - 1;
+            target.focus.ClearPress();
+            target.hitTester.ClearAnchor(0);
+            target.hitTester.ClearAnchor(1);
+        }
+        if (kind == 2) { pvInputFocused = inside; }
+        bool pointer = kind == 1 || kind == 2 || kind == 3 || kind == 13;
+        if (pointer && !inside && !target.pointerDown) { kind = 0; }
+        if ((kind == 4 || kind == 5 || kind == 6) && !pvInputFocused) { kind = 0; }
+        if (kind != 1 && kind != 2 && kind != 3 && kind != 4
+                && kind != 5 && kind != 6 && kind != 13) { kind = 0; }
+        if (!inside && !target.pointerDown) { x = 0 - 100000; y = x; }
+        bool move = target.mouseX != x || target.mouseY != y;
+        if (kind == 0 && !move) { return; }
+        if (kind == 0) { kind = 1; }
+        target.ProcessOffscreenInput(kind, x, y, button,
+            host.window.EventKeyCode(), host.window.EventMods(), host.window.EventFlag());
+        this.RenderDesignPreview();
+        target.ForwardOffscreenFrameRequests(host);
+        if (pvEvents != null && pvEvents.last != null && pvEvents.last != "") {
+            msg = Designer.T("preview ", "预览 ") + pvEvents.last;
+            pvEvents.last = "";
+        }
+        host.RequestRedraw();
+    }
+
+    DesignPreviewNode PreviewNode(FormField field) {
+        if (pvDocNodes == null) { return null; }
+        for (int i = 0; i < pvDocNodes.Count; i = i + 1) {
+            if (pvDocNodes[i].field == field) { return pvDocNodes[i]; }
+        }
+        return null;
+    }
+
+    bool PreviewHasLayout() {
+        return pvDocRoot != null && pvDocForm != null && pvDocNodes != null;
+    }
+
+    void CollectDesignPreview(JsonValue arr, List<FormField> model,
+            List<Control> prepared, List<DesignPreviewNode> nodes) {
+        if (arr == null || !arr.IsArray()) { return; }
+        for (int i = 0; i < arr.Count() && i < model.Count; i = i + 1) {
+            JsonValue obj = arr.At(i);
+            FormField field = model[i];
+            Control ctl = null;
+            if (obj != null && obj.IsObject()) {
+                if (field.compRef) {
+                    ctl = Panel.Root(obj.Str("name", ""));
+                    if (!field.pvPreview) {
+                        obj.Remove("ref");
+                        obj.Set("kind", JsonValue.NewStr("Panel"));
+                    }
+                } else {
+                    ctl = FormBuilder.CreateControl(obj);
+                }
+            }
+            prepared.Add(ctl);
+            nodes.Add(new DesignPreviewNode(field, ctl));
+            if (obj != null && obj.IsObject()) {
+                this.CollectDesignPreview(obj.Get("kids"), field.kids, prepared, nodes);
+            }
+        }
+    }
+
+    int DesignTargetDpi(App host) {
+        int dpi = targetDpi > 0 ? targetDpi : host.dpiScale;
+        return dpi > 0 ? dpi : 100;
+    }
+
+    List<int> DpiPresets() {
+        List<int> values = new List<int>();
+        values.Add(0);
+        for (int dpi = 100; dpi <= 300; dpi = dpi + 25) { values.Add(dpi); }
+        return values;
+    }
+
+    List<string> DpiMenuLabels() {
+        List<string> labels = new List<string>();
+        labels.Add(Designer.T("Follow device", "跟随本机"));
+        List<int> values = this.DpiPresets();
+        for (int i = 1; i < values.Count; i = i + 1) {
+            labels.Add(Convert.ToString(values[i]) + "%");
+        }
+        return labels;
+    }
+
+    void SetDesignTargetDpi(App host, int dpi) {
+        targetDpi = dpi < 0 ? 0 : dpi;
+        freePanX = 0;
+        freePanY = 0;
+        if (freeDragging || freeResizing) { this.PopUndoIfUnchanged(); }
+        freeDragging = false;
+        freeDragHasMoved = false;
+        freeResizing = false;
+        designResizeMoved = false;
+        designMoves = null;
+        this.PrepareDesignPreview(host);
+        host.RequestRedraw();
+    }
+
+    bool PrepareDesignPreview(App host) {
+        JsonValue doc = JsonValue.ParseLenient(this.SaveJson());
+        if (doc == null || !doc.IsObject()) { return false; }
+        doc.Remove("winZoom");
+        string key = doc.ToJson() + "|" + Convert.ToString(pvCompGen)
+            + "|" + Convert.ToString(preview);
+        int dpi = this.DesignTargetDpi(host);
+        int width = winW < 40 ? 40 : winW;
+        int height = winH < 40 ? 40 : winH;
+        if (pvDocForm == null) {
+            pvDocForm = Form.CreateOffscreen(winTitle, width, height);
+        }
+        App target = pvDocForm.GetApp();
+        target.SetOffscreenViewport(width, height, dpi);
+        pvDocDpi = dpi;
+        if (pvDocRoot == null || pvDocKey != key) {
+            List<Control> prepared = new List<Control>();
+            List<DesignPreviewNode> nodes = new List<DesignPreviewNode>();
+            this.CollectDesignPreview(doc.Get("fields"), fields, prepared, nodes);
+            Control tree = FormBuilder.BuildWith(doc, prepared);
+            FormBuilder.ApplyStyles(target, doc);
+            FormBuilder.ConfigureWindow(target, doc);
+            if (pvDocRoot != null) { pvDocRoot.parent = null; }
+            pvDocForm.children.Clear();
+            pvDocForm.Add(tree);
+            pvDocRoot = tree;
+            pvDocNodes = nodes;
+            pvDocKey = key;
+            pvEvents = new DesignPreviewEvents();
+            this.BindDesignPreviewEvents(tree, pvEvents);
+            target.ProcessOffscreenInput(0, 0 - 100000, 0 - 100000, 0, 0, 0, 0);
+            target.focus.SetFocused(0 - 1);
+            target.focus.SetHovered(0 - 1);
+            target.focus.ClearPress();
+            target.pointerDown = false;
+            target.pressTargetId = 0 - 1;
+            target.clickTargetId = 0 - 1;
+            pvInputFocused = false;
+            for (int i = 0; i < nodes.Count; i = i + 1) {
+                Control ctl = nodes[i].control;
+                if (ctl == null) { continue; }
+                if (nodes[i].field.kind == "DataGrid") {
+                    JsonValue source = this.FieldJson(nodes[i].field);
+                    string columns = FormBuilder.GridColumnsSpec(source);
+                    if (columns != "") { ctl.SetProp("previewColumns", columns); }
+                }
+            }
+        }
+        target.SetOffscreenViewport(width, height, dpi);
+        this.RenderDesignPreview();
+        target.ForwardOffscreenFrameRequests(host);
+        return true;
+    }
+
+    void UpdateDesignPreviewLayout() {
+        if (!this.PreviewHasLayout()) { return; }
+        for (int i = 0; i < pvDocNodes.Count; i = i + 1) {
+            DesignPreviewNode node = pvDocNodes[i];
+            FormField field = node.field;
+            Control ctl = node.control;
+            if (ctl == null) {
+                field.layoutReady = false;
+                node.visible = false;
+                continue;
+            }
+            bool shown = !field.IsNonVisual();
+            Control ancestor = ctl;
+            while (ancestor != null) {
+                if (!ancestor.StyleVisible()) { shown = false; }
+                ancestor = ancestor.parent;
+            }
+            node.visible = shown && ctl.bw > 0 && ctl.bh > 0;
+            Control parent = ctl.parent;
+            int parentX = 0;
+            int parentY = 0;
+            if (parent != null) {
+                parentX = parent.bx + parent.StyleInsetL() - parent.ScrollLeft();
+                parentY = parent.by + parent.StyleInsetT() - parent.ScrollTop();
+            }
+            node.originX = this.DesignLogical(parentX);
+            node.originY = this.DesignLogical(parentY);
+            field.layoutX = this.DesignLogical(ctl.bx - parentX);
+            field.layoutY = this.DesignLogical(ctl.by - parentY);
+            field.layoutW = this.DesignLogical(ctl.bw);
+            field.layoutH = this.DesignLogical(ctl.bh);
+            field.layoutReady = true;
+            Control slot = ctl;
+            if (ctl is Tabs || ctl is SplitPanel) {
+                slot = ctl.SlotHost(field.uiState.Get());
+            }
+            if (slot != null) {
+                node.insetX = this.DesignLogical(slot.bx + slot.StyleInsetL() - slot.ScrollLeft() - ctl.bx);
+                node.insetY = this.DesignLogical(slot.by + slot.StyleInsetT() - slot.ScrollTop() - ctl.by);
+            }
+        }
+    }
+
+    string DesignPreviewProbe(int x, int y, int width, int height) {
+        JsonValue state = JsonValue.NewObject();
+        state.Set("preview", JsonValue.NewBool(preview));
+        state.Set("dpi", JsonValue.NewNum(Convert.ToString(pvDocDpi)));
+        state.Set("x", JsonValue.NewNum(Convert.ToString(x)));
+        state.Set("y", JsonValue.NewNum(Convert.ToString(y)));
+        state.Set("width", JsonValue.NewNum(Convert.ToString(width)));
+        state.Set("height", JsonValue.NewNum(Convert.ToString(height)));
+        state.Set("selected", JsonValue.NewStr(sel == null ? "" : sel.fname));
+        state.Set("dragging", JsonValue.NewBool(freeDragging));
+        state.Set("resizing", JsonValue.NewBool(freeResizing));
+        state.Set("document", JsonValue.ParseLenient(this.SaveJson()));
+        JsonValue rects = JsonValue.NewArray();
+        if (pvDocNodes != null) {
+            for (int i = 0; i < pvDocNodes.Count; i = i + 1) {
+                DesignPreviewNode node = pvDocNodes[i];
+                if (node.control == null) { continue; }
+                JsonValue rect = JsonValue.NewObject();
+                rect.Set("name", JsonValue.NewStr(node.field.fname));
+                rect.Set("x", JsonValue.NewNum(Convert.ToString(node.control.bx)));
+                rect.Set("y", JsonValue.NewNum(Convert.ToString(node.control.by)));
+                rect.Set("width", JsonValue.NewNum(Convert.ToString(node.control.bw)));
+                rect.Set("height", JsonValue.NewNum(Convert.ToString(node.control.bh)));
+                rect.Set("value", JsonValue.NewStr(node.control.GetProp("value")));
+                rects.Append(rect);
+            }
+        }
+        state.Set("rects", rects);
+        return state.ToJson();
+    }
+
+    void PaintDesignPreview(Canvas canvas, int x, int y, int width, int height) {
+        if (pvDocForm == null) { return; }
+        // viewport 变化会替换并销毁旧表面，每次绘制取离屏 App 当前持有的画布。
+        Canvas source = pvDocForm.GetApp().canvas;
+        if (source == null) { return; }
+        if (pvDocForm.GetApp().shapeMode != 0 || pvDocForm.GetApp().WindowOpacity() < 100) {
+            if (pvShapeReady) {
+                canvas.BlitImage(pvShapeImage, x, y, width, height,
+                    0, 0, source.Width(), source.Height());
+            }
+            return;
+        }
+        canvas.BlitSurfaceScaled(source, x, y, width, height,
+            0, 0, source.Width(), source.Height());
+    }
+
+    ~Designer() {
+        this.DisposeDesignPreview();
+    }
+
+    void DisposeDesignPreview() {
+        if (pvShapeImage != null && pvShapeImage != "") { Canvas.EvictImage(pvShapeImage); }
+        pvShapeImage = "";
+        pvShapeMask = null;
+        pvShapeReady = false;
+        if (pvDocForm != null) {
+            App target = pvDocForm.GetApp();
+            if (target.canvas != null) {
+                target.canvas.Destroy();
+                target.canvas = null;
+            }
+        }
+        pvDocForm = null;
+        pvDocRoot = null;
+        pvDocNodes = null;
+        pvDocKey = "";
+        pvEvents = null;
+        pvInputSeen = false;
+        pvInputFocused = false;
+    }
+}

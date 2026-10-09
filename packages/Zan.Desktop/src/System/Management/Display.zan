@@ -1,5 +1,8 @@
 using System;
 using System.Diagnostics;
+#if MACOS
+using System.Json;
+#endif
 
 namespace System.Management;
 
@@ -16,9 +19,10 @@ class DisplayInfo {
     public int width;
     /// 高度（像素）。
     public int height;
-    /// 该显示器在虚拟桌面里的左上角坐标。
+    /// 该显示器在虚拟桌面里的左上角坐标。macOS 为 CoreGraphics 桌面坐标，
+    /// 不等于混合缩放桌面上的设备像素偏移；负值表示主屏左侧。
     public int x;
-    /// 该显示器在虚拟桌面里的左上角 Y 坐标。
+    /// 该显示器在虚拟桌面里的左上角 Y 坐标（macOS 主屏左上为零，向下为正）。
     public int y;
     /// 是否为主显示器。
     public bool primary;
@@ -32,7 +36,7 @@ class DisplayInfo {
 /// 显示器拓扑。Windows 通过 GetSystemMetrics 查询主屏，
 /// 并通过 EnumDisplayMonitors/EnumDisplaySettingsW 查询每台显示器。
 /// Linux 读 xrandr（X11）或 wlr-randr / swaymsg（wlroots 系 Wayland），
-/// macOS 读 system_profiler。拿不到拓扑时返回 0/空值而不抛异常：
+/// macOS 通过系统 JXA 桥接 CoreGraphics / NSScreen。拿不到拓扑时返回 0/空值而不抛异常：
 /// 布局代码更希望拿到一个可回退的值。
 /// </summary>
 class Display {
@@ -74,7 +78,7 @@ class Display {
         #if WINDOWS
         return Display.WinMode(0xFFFFFFFF /*ENUM_CURRENT_SETTINGS*/, 168);
         #elif LINUX
-        // xdpyinfo: "  depth of root window:    24 planes"
+        // 核心契约与语义定义。
         List<string> dargs = new List<string>();
         ProcessResult r = Process.CaptureSafe("xdpyinfo", dargs);
         for (int i = 0; i < r.lines.Count; i = i + 1) {
@@ -84,6 +88,10 @@ class Display {
             }
         }
         return 0;
+        #elif MACOS
+        DisplayInfo d = Display.Primary();
+        if (d == null) { return 0; }
+        return d.bitsPerPixel;
         #else
         return 0;
         #endif
@@ -108,23 +116,24 @@ class Display {
         Display.monitorProc = Display.WinMonitorProc;
         Display.WinEnumDisplayMonitors(0, 0, Display.monitorProc, 0);
         #elif MACOS
-        // system_profiler 报告的是“Resolution: 2560 x 1440”这种行，
-        // 没有位置信息；没有位置就保持 0/0 而不编一个
-        List<string> spArgs = new List<string>();
-        spArgs.Add("SPDisplaysDataType");
-        ProcessResult r = Process.CaptureSafe("system_profiler", spArgs);
-        for (int i = 0; i < r.lines.Count; i = i + 1) {
-            string line = r.lines[i];
-            if (line.IndexOf("Resolution:") < 0) { continue; }
-            List<int> nums = Display.Ints(line);
-            if (nums.Count < 2) { continue; }
+        JsonValue snapshot = Display.MacSnapshot();
+        if (snapshot == null) { return list; }
+        JsonValue monitors = snapshot.Get("monitors");
+        if (monitors == null || !monitors.IsArray()) { return list; }
+        for (int i = 0; i < monitors.Count(); i = i + 1) {
+            JsonValue monitor = monitors.At(i);
+            if (monitor == null || !monitor.IsObject()) { continue; }
             DisplayInfo d = new DisplayInfo();
             d.index = list.Count;
-            d.name = "Display " + Convert.ToString(list.Count);
-            d.width = nums[0];
-            d.height = nums[1];
-            d.primary = list.Count == 0;
-            list.Add(d);
+            d.name = monitor.Str("name", "");
+            d.x = monitor.Int("x", 0);
+            d.y = monitor.Int("y", 0);
+            d.width = monitor.Int("width", 0);
+            d.height = monitor.Int("height", 0);
+            d.primary = monitor.Bool("primary", false);
+            d.bitsPerPixel = monitor.Int("bitsPerPixel", 0);
+            d.refreshHz = monitor.Int("refreshHz", 0);
+            if (d.width > 0 && d.height > 0) { list.Add(d); }
         }
         #else
         Display.ReadXrandr(list);
@@ -134,9 +143,57 @@ class Display {
         return list;
     }
 
+    #if MACOS
+    /// 主屏的逻辑 DPI；NSScreen 的 backingScaleFactor 是像素/点，不是物理 PPI。
+    static int MacLogicalDpi() {
+        JsonValue snapshot = Display.MacSnapshot();
+        if (snapshot == null) { return 96; }
+        int dpi = snapshot.Int("dpi", 96);
+        return dpi > 0 ? dpi : 96;
+    }
+
+    /// CoreGraphics 的 CGRect 结构返回由 Apple 系统桥接器处理；不在 Zan 声明结构 FFI。
+    /// x/y 保留 CoreGraphics 全局桌面坐标，width/height 为设备像素。混合缩放屏
+    /// 没有一套全局物理像素坐标，不能按各屏 backingScaleFactor 乘原点。
+    static JsonValue MacSnapshot() {
+        string script = "ObjC.import('AppKit'); ObjC.import('CoreGraphics');\n"
+            + "function run(argv) {\n"
+            + "var screens = $.NSScreen.screens; var main = Number($.CGMainDisplayID());\n"
+            + "var out = []; var dpi = 96;\n"
+            + "for (var i = 0; i < Number(screens.count); i++) {\n"
+            + "var screen = screens.objectAtIndex(i);\n"
+            + "var number = screen.deviceDescription.objectForKey('NSScreenNumber');\n"
+            + "if (number.isNil()) { continue; }\n"
+            + "var id = Number(number.unsignedIntValue); var bounds = $.CGDisplayBounds(id);\n"
+            + "var mode = $.CGDisplayCopyDisplayMode(id); var rate = 0;\n"
+            + "try { rate = Number($.CGDisplayModeGetRefreshRate(mode)); }\n"
+            + "finally { $.CGDisplayModeRelease(mode); }\n"
+            + "var primary = id == main;\n"
+            + "if (primary) { dpi = Math.round(96 * Number(screen.backingScaleFactor)); }\n"
+            + "out.push({name:'Display '+id, x:Math.round(bounds.origin.x), y:Math.round(bounds.origin.y),\n"
+            + "width:Number($.CGDisplayPixelsWide(id)), height:Number($.CGDisplayPixelsHigh(id)),\n"
+            + "primary:primary, bitsPerPixel:Number($.NSBitsPerPixelFromDepth(screen.depth)),\n"
+            + "refreshHz:isFinite(rate) && rate > 0 ? Math.round(rate) : 0});\n"
+            + "}\n"
+            + "out.sort(function(a,b) { return a.primary ? -1 : b.primary ? 1 : 0; });\n"
+            + "return JSON.stringify({dpi:dpi, monitors:out});\n"
+            + "}";
+        List<string> args = new List<string>();
+        args.Add("-l");
+        args.Add("JavaScript");
+        args.Add("-e");
+        args.Add(script);
+        ProcessResult result = Process.CaptureSafe("/usr/bin/osascript", args);
+        if (!result.Ok()) { return null; }
+        JsonValue snapshot = JsonValue.Parse(result.Text().Trim());
+        if (snapshot == null || !snapshot.IsObject()) { return null; }
+        return snapshot;
+    }
+    #endif
+
     #if !WINDOWS
     /// xrandr --current 里的已连接输出：
-    ///   eDP-1 connected primary 1920x1080+0+0 (normal ...) 344mm x 193mm
+    /// 核心契约与语义定义。
     ///      1920x1080     60.02*+  59.97
     /// 带 '*' 的那行是当前模式，刷新率从那里取。
     static void ReadXrandr(List<DisplayInfo> list) {
@@ -329,8 +386,8 @@ class Display {
     /// 枚举回调：读 MONITORINFOEXW 与该屏当前 DEVMODEW 组装 DisplayInfo；
     /// 返回 1 继续枚举。结果写入 monitorResults。
     static int WinMonitorProc(nint monitor, nint hdc, nint rect, nint data) {
-        // MONITORINFOEXW: cbSize(4) rcMonitor(16) rcWork(16) dwFlags(4)
-        // szDevice[32] WCHAR (64) = 104 bytes total.
+        // 核心契约与语义定义。
+        // 核心契约与语义定义。
         nint info = NativeMemory.Alloc(112);
         try {
             new Span<int>(info, 2)[0] = 104;   // cbSize

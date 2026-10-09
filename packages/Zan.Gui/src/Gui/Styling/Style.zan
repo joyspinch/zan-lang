@@ -12,8 +12,8 @@ namespace Gui;
 /// 这正是控件无需携带各皮肤绘制代码即可换肤的关键。
 /// 控件的整个视觉层变成：
 ///
-///     int st = Style.StateOf(app, id, disabled);
-///     StyleBox s = Style.Eased(app, id, "button", "primary", disabled);
+/// 核心契约与语义定义。
+/// 核心契约与语义定义。
 ///     s.Paint(app, x, y, w, h);
 ///     s.DrawLabel(app, x, y, w, h, label);
 ///
@@ -24,7 +24,7 @@ namespace Gui;
 /// 没有 skin.css 的应用外观与内置主题完全一致。
 /// </summary>
 class Style {
-    // ---- interaction state bits --------------------------------------------
+    // 核心契约与执行状态转移规范。
 
     /// 常态（0，无任何状态位）。
     static int SNormal()   { return 0; }
@@ -41,7 +41,7 @@ class Style {
     /// 勾选位（32）；与 SSelected 相同的锁定语义。
     static int SChecked()  { return 32; }
 
-    // ---- animation kinds (CSS `animation: <name> ...`) ---------------------
+    // 核心契约与语义定义。
 
     /// 无动画（0）。
     static int AnimNone()    { return 0; }
@@ -109,7 +109,7 @@ class Style {
         return st;
     }
 
-    // ---- resolution cache --------------------------------------------------
+    // 核心契约与执行状态转移规范。
     // 解析需要遍历 sheet 的选择器表，因此结果按（type, class, state）
     // 记忆化，并在主题/皮肤代次变化时清空。
     // 控件每帧都要解析；缓存让这件事保持廉价。
@@ -205,11 +205,6 @@ class Style {
 
         StyleBox b = new StyleBox();
         Style.Defaults(app, b, type, cls, state);
-        // 主题自身的度量值会在此落入 box，且已按显示缩放；
-        // 只有 sheet 之后才声明的长度（按 100% 编写）
-        // 才需要再缩放，所以要保留 sheet 前的值来
-        // 区分二者。
-        StyleBox themed = b.Clone();
         if (basef != null) {
             Style.ApplySheetCtx(basef, b, type, cls, id, state, ctxNode);
         }
@@ -223,7 +218,7 @@ class Style {
             Style.ApplySheetCtx(sheet, b, type, cls, id, state, ctxNode);
         }
         Style.Shell(app, b, type, cls, state);
-        Style.ScaleLayout(app, b, themed);
+        Style.ScaleLayout(app, b);
         Style.CachePut(app, key, b);
         return b.Clone();
     }
@@ -258,7 +253,7 @@ class Style {
         if (fallbackType != "") {
             Style.Defaults(app, b, fallbackType, cls, state);
         }
-        StyleBox themed = b.Clone();
+        if (fallbackType == "") { Style.UnitEnvironment(app, b); }
         if (basef != null) {
             if (fallbackType != "") {
                 Style.ApplySheetCtx(basef, b, fallbackType, cls, "", state, ctxNode);
@@ -279,118 +274,137 @@ class Style {
             Style.ApplyPartSheetCtx(sheet, b, type, part, cls, id, state, ctxNode);
         }
         if (fallbackType != "") { Style.Shell(app, b, fallbackType, cls, state); }
-        Style.ScaleLayout(app, b, themed);
+        Style.ScaleLayout(app, b);
         Style.CachePut(app, key, b);
         return b.Clone();
     }
 
-    /// 把样式表的长度（box 尺寸、外边距、字号、圆角半径）
-    /// 缩放到显示设备：CSS 按 100% 编写，而主题自身的
-    /// 度量已按 DPI 缩放，因此 sheet 的 `width: 260px` 必须
-    /// 按相同系数缩放才能保持相同的物理尺寸。百分比
-    /// 无需缩放。
-    ///
-    /// `themed` 是主题默认值处理后的 box：若某长度仍等于
-    /// 其主题值，说明它已带有显示缩放系数，不能再乘
-    /// 第二次（否则 150% 显示下每个按钮、输入框和 chip 都会被放大
-    /// 到 1.5 倍）。
+    /// 布局/文字长度按各标量自己的来源换算，不能比较主题数值。
+    /// 百分比和行高倍数不进入此通道；阴影/模糊仍在绘制时换算。
+    static void ScaleLayout(App app, StyleBox b) {
+        b.envDpiScale = app.dpiScale;
+        Style.ScaleBox(b);
+    }
+
+    /// 保留旧调用形状；themed 不再承担数值猜测来源的职责。
     static void ScaleLayout(App app, StyleBox b, StyleBox themed) {
-        if (app.dpiScale == 100) { return; }
-        if (b.width >= 0 && b.width != themed.width
-                && !b.IsPrescaled(StyleBox.SourceWidth())) {
-            b.width = app.Scale(b.width);
+        Style.ScaleLayout(app, b);
+    }
+
+    static void ScaleBox(StyleBox b) {
+        if (b.width >= 0) {
+            b.width = b.ResolveLength(b.width, StyleBox.SourceWidth());
         }
-        if (b.height >= 0 && b.height != themed.height
-                && !b.IsPrescaled(StyleBox.SourceHeight())) {
-            b.height = app.Scale(b.height);
+        if (b.height >= 0) {
+            b.height = b.ResolveLength(b.height, StyleBox.SourceHeight());
         }
-        if (b.minW >= 0 && b.minW != themed.minW
-                && !b.IsPrescaled(StyleBox.SourceWidth())) {
-            b.minW = app.Scale(b.minW);
+        if (b.minW >= 0) {
+            b.minW = b.ResolveLength(b.minW, StyleBox.SourceMinW());
         }
-        if (b.minH >= 0 && b.minH != themed.minH
-                && !b.IsPrescaled(StyleBox.SourceHeight())) {
-            b.minH = app.Scale(b.minH);
+        if (b.minH >= 0) {
+            b.minH = b.ResolveLength(b.minH, StyleBox.SourceMinH());
         }
-        if (b.maxW >= 0 && b.maxW != themed.maxW
-                && !b.IsPrescaled(StyleBox.SourceWidth())) {
-            b.maxW = app.Scale(b.maxW);
+        if (b.maxW >= 0) {
+            b.maxW = b.ResolveLength(b.maxW, StyleBox.SourceMaxW());
         }
-        if (b.maxH >= 0 && b.maxH != themed.maxH
-                && !b.IsPrescaled(StyleBox.SourceHeight())) {
-            b.maxH = app.Scale(b.maxH);
+        if (b.maxH >= 0) {
+            b.maxH = b.ResolveLength(b.maxH, StyleBox.SourceMaxH());
         }
-        if (b.gap >= 0 && b.gap != themed.gap
-                && !b.IsPrescaled(StyleBox.SourceGap())) {
-            b.gap = app.Scale(b.gap);
+        if (b.basis >= 0) {
+            b.basis = b.ResolveLength(b.basis, StyleBox.SourceBasis());
         }
-        if (b.fontPx > 0 && b.fontPx != themed.fontPx
-                && !b.IsPrescaled(StyleBox.SourceFont())) {
-            b.fontPx = app.Scale(b.fontPx);
+        if (b.gap >= 0) {
+            b.gap = b.ResolveLength(b.gap, StyleBox.SourceGap());
         }
-        if (b.radius >= 0 && b.radius != themed.radius
-                && !b.IsPrescaled(StyleBox.SourceRadius())) {
-            b.radius = app.Scale(b.radius);
+        if (b.rowGap >= 0) {
+            b.rowGap = b.ResolveLength(b.rowGap, StyleBox.SourceRowGap());
         }
-        if (b.marL != themed.marL && !b.IsPrescaled(StyleBox.SourcePadding())) {
-            b.marL = app.Scale(b.marL);
+        if (b.colGap >= 0) {
+            b.colGap = b.ResolveLength(b.colGap, StyleBox.SourceColGap());
         }
-        if (b.marT != themed.marT && !b.IsPrescaled(StyleBox.SourcePadding())) {
-            b.marT = app.Scale(b.marT);
+        if (b.fontPx > 0) {
+            b.fontPx = b.ResolveLength(b.fontPx, StyleBox.SourceFont());
         }
-        if (b.marR != themed.marR && !b.IsPrescaled(StyleBox.SourcePadding())) {
-            b.marR = app.Scale(b.marR);
+        if (b.radius >= 0) {
+            b.radius = b.ResolveLength(b.radius, StyleBox.SourceRadius());
         }
-        if (b.marB != themed.marB && !b.IsPrescaled(StyleBox.SourcePadding())) {
-            b.marB = app.Scale(b.marB);
+        if (b.radiusTL >= 0) {
+            b.radiusTL = b.ResolveLength(b.radiusTL, StyleBox.SourceRadiusTL());
         }
-        if (b.padL >= 0 && b.padL != themed.padL
-                && !b.IsPrescaled(StyleBox.SourcePadding())) {
-            b.padL = app.Scale(b.padL);
+        if (b.radiusTR >= 0) {
+            b.radiusTR = b.ResolveLength(b.radiusTR, StyleBox.SourceRadiusTR());
         }
-        if (b.padT >= 0 && b.padT != themed.padT
-                && !b.IsPrescaled(StyleBox.SourcePadding())) {
-            b.padT = app.Scale(b.padT);
+        if (b.radiusBR >= 0) {
+            b.radiusBR = b.ResolveLength(b.radiusBR, StyleBox.SourceRadiusBR());
         }
-        if (b.padR >= 0 && b.padR != themed.padR
-                && !b.IsPrescaled(StyleBox.SourcePadding())) {
-            b.padR = app.Scale(b.padR);
+        if (b.radiusBL >= 0) {
+            b.radiusBL = b.ResolveLength(b.radiusBL, StyleBox.SourceRadiusBL());
         }
-        if (b.padB >= 0 && b.padB != themed.padB
-                && !b.IsPrescaled(StyleBox.SourcePadding())) {
-            b.padB = app.Scale(b.padB);
+        if (b.padL >= 0) {
+            b.padL = b.ResolveLength(b.padL, StyleBox.SourcePadL());
         }
-        // 轴向独立的间距和逐角圆角以前漏在这里：`grid { row-gap: 24 }`
-        // 或 `border-radius: 8 8 0 0` 在 150% 显示下会停在 100% 的
-        // 像素上，同一张皮肤里只有它们不跟着放大。
-        if (b.rowGap >= 0 && b.rowGap != themed.rowGap
-                && !b.IsPrescaled(StyleBox.SourceGap())) {
-            b.rowGap = app.Scale(b.rowGap);
+        if (b.padT >= 0) {
+            b.padT = b.ResolveLength(b.padT, StyleBox.SourcePadT());
         }
-        if (b.colGap >= 0 && b.colGap != themed.colGap
-                && !b.IsPrescaled(StyleBox.SourceGap())) {
-            b.colGap = app.Scale(b.colGap);
+        if (b.padR >= 0) {
+            b.padR = b.ResolveLength(b.padR, StyleBox.SourcePadR());
         }
-        if (b.radiusTL >= 0 && b.radiusTL != themed.radiusTL
-                && !b.IsPrescaled(StyleBox.SourceRadius())) {
-            b.radiusTL = app.Scale(b.radiusTL);
+        if (b.padB >= 0) {
+            b.padB = b.ResolveLength(b.padB, StyleBox.SourcePadB());
         }
-        if (b.radiusTR >= 0 && b.radiusTR != themed.radiusTR
-                && !b.IsPrescaled(StyleBox.SourceRadius())) {
-            b.radiusTR = app.Scale(b.radiusTR);
+        if (b.marL != StyleBox.Unset()) {
+            b.marL = b.ResolveLength(b.marL, StyleBox.SourceMarL());
         }
-        if (b.radiusBR >= 0 && b.radiusBR != themed.radiusBR
-                && !b.IsPrescaled(StyleBox.SourceRadius())) {
-            b.radiusBR = app.Scale(b.radiusBR);
+        if (b.marT != StyleBox.Unset()) {
+            b.marT = b.ResolveLength(b.marT, StyleBox.SourceMarT());
         }
-        if (b.radiusBL >= 0 && b.radiusBL != themed.radiusBL
-                && !b.IsPrescaled(StyleBox.SourceRadius())) {
-            b.radiusBL = app.Scale(b.radiusBL);
+        if (b.marR != StyleBox.Unset()) {
+            b.marR = b.ResolveLength(b.marR, StyleBox.SourceMarR());
         }
-        // flex-basis 是主轴上的一个长度，和 width/height 同类。
-        if (b.basis >= 0 && b.basis != themed.basis
-                && !b.IsPrescaled(StyleBox.SourceWidth())) {
-            b.basis = app.Scale(b.basis);
+        if (b.marB != StyleBox.Unset()) {
+            b.marB = b.ResolveLength(b.marB, StyleBox.SourceMarB());
+        }
+        if (b.borderW >= 0) {
+            b.borderW = b.ResolveLength(b.borderW, StyleBox.SourceBorder());
+        }
+        if (b.borderTopW >= 0) {
+            b.borderTopW = b.ResolveLength(b.borderTopW, StyleBox.SourceBorderTop());
+        }
+        if (b.borderRightW >= 0) {
+            b.borderRightW = b.ResolveLength(b.borderRightW, StyleBox.SourceBorderRight());
+        }
+        if (b.borderBottomW >= 0) {
+            b.borderBottomW = b.ResolveLength(b.borderBottomW, StyleBox.SourceBorderBottom());
+        }
+        if (b.borderLeftW >= 0) {
+            b.borderLeftW = b.ResolveLength(b.borderLeftW, StyleBox.SourceBorderLeft());
+        }
+        if (b.posT != StyleBox.Unset()) {
+            b.posT = b.ResolveLength(b.posT, StyleBox.SourcePosT());
+        }
+        if (b.posR != StyleBox.Unset()) {
+            b.posR = b.ResolveLength(b.posR, StyleBox.SourcePosR());
+        }
+        if (b.posB != StyleBox.Unset()) {
+            b.posB = b.ResolveLength(b.posB, StyleBox.SourcePosB());
+        }
+        if (b.posL != StyleBox.Unset()) {
+            b.posL = b.ResolveLength(b.posL, StyleBox.SourcePosL());
+        }
+        if (b.lineHeightKind == 1) {
+            b.lineHeight = b.ResolveLength(b.lineHeight, StyleBox.SourceLineHeight());
+        }
+        b.letterSpacing = b.ResolveLength(b.letterSpacing, StyleBox.SourceLetterSpacing());
+        b.tx = b.ResolveLength(b.tx, StyleBox.SourceTx());
+        b.ty = b.ResolveLength(b.ty, StyleBox.SourceTy());
+        // 圆角总半径是各角的派生值，混合来源必须先换算各角再求最大。
+        if (b.radiusTL >= 0 || b.radiusTR >= 0 || b.radiusBR >= 0 || b.radiusBL >= 0) {
+            int r = b.radiusTL;
+            if (b.radiusTR > r) { r = b.radiusTR; }
+            if (b.radiusBR > r) { r = b.radiusBR; }
+            if (b.radiusBL > r) { r = b.radiusBL; }
+            b.radius = r;
+            b.SetPrescaled(StyleBox.SourceRadius(), true);
         }
     }
 
@@ -701,7 +715,7 @@ class Style {
         return App.Ease(p);
     }
 
-    // ---- theme defaults ----------------------------------------------------
+    // 核心契约与执行状态转移规范。
 
     /// 角色类（primary/info/success/warning/error）在某状态下的强调色，
     /// 无角色类时为 0。按钮/tab 的上色已经全在 skins/base.css 里，这里
@@ -756,15 +770,7 @@ class Style {
         // 就用 CSS 的，未声明时尺寸比例依然生效。
         b.transitionMs = t.animFastMs;
         b.fg = t.textPrimary;
-        // 单位环境：rem 相对主题正文字号，vw/vh 相对窗口逻辑尺寸。
-        // rem 基准取主题根字号（主题令牌恒正；这是 style 层
-        // 自身的合法消费，字体预算豁免这一行）。
-        int remBase = t.fontSizeMedium;
-        if (remBase > 0) { b.envRemPx = remBase; }
-        if (app.designW > 0) { b.envVw = app.designW; }
-        if (app.designH > 0) { b.envVh = app.designH; }
-        b.mediaDark = app.isDark;
-        b.mediaReduced = app.reducedMotion;
+        Style.UnitEnvironment(app, b);
         // 禁用态的弱化文字放在默认层，CSS 因此还能改写它
         // （皮肤的 `x:disabled { color: ... }` 以前被 Style.Shell 抹掉）。
         if (disabled) { b.fg = t.textDisabled; }
@@ -784,6 +790,23 @@ class Style {
             // 横向则被裁掉两侧（导轨文字截断）。外观由组合控件
             // 自己的子控件决定，皮肤仍可在 CSS 里按类型名给它上样式。
         }
+        b.MarkThemeLengths();
+    }
+
+    /// 解析环境自身也携带来源：主题根字号已缩放，视口仍为逻辑尺寸。
+    static void UnitEnvironment(App app, StyleBox b) {
+        b.envDpiScale = app.dpiScale;
+        b.envTheme = app.theme;
+        b.envSheet = app.sheet;
+        // Clone 曾遗漏单位环境，文本布局因而一直回退到 16px；
+        // 复制环境时不能把主题 rem 基准当成未声明字号的布局默认值。
+        b.envRemPx = app.Scale(16);
+        int remBase = app.theme.fontSizeMedium;
+        if (remBase > 0) { b.envRootFontPx = remBase; b.envRemPhysical = true; }
+        if (app.designW > 0) { b.envVw = app.designW; }
+        if (app.designH > 0) { b.envVh = app.designH; }
+        b.mediaDark = app.isDark;
+        b.mediaReduced = app.reducedMotion;
     }
 
     /// 静态 CSS 规则无法表达的运行时处理，在
@@ -830,11 +853,17 @@ class Style {
             b.shadowBlur = 0;
             b.borderColor = t.borderPrimary;
             b.borderW = t.borderWidth;
-            if (active) { b.shadow = 0; b.tx = 4; b.ty = 4; }
+            b.SetPrescaled(StyleBox.SourceBorder(), true);
+            b.SetPrescaled(StyleBox.SourceShadowDx() | StyleBox.SourceShadowDy()
+                | StyleBox.SourceShadowBlur(), false);
+            if (active) {
+                b.shadow = 0; b.tx = 4; b.ty = 4;
+                b.SetPrescaled(StyleBox.SourceTx() | StyleBox.SourceTy(), false);
+            }
         }
     }
 
-    // ---- base floor sheet --------------------------------------------------
+    // 核心契约与执行状态转移规范。
     // 内置组件基线（skins/base.css），解析时把当前主题的
     // token 作为 :root 注入，使它的 var() 规则能解析到实时的
     // 调色板。每次解析都垫在应用自身 sheet 之下，并按主题代次
@@ -844,21 +873,19 @@ class Style {
     // 画布缩放后的度量之间来回切换（每个预览控件两次），两份解析结果
     // 因此必须并存 —— 否则每个控件都要重新解析一遍 base.css，
     // 一帧几十个控件就是几百毫秒。
-    static Dict<int, StyleSheet> baseSheets;
-    static int baseSheetGen;
 
     /// 内置基线样式表（skins/base.css，主题 token 以 :root 注入），
     /// 每次解析都垫在应用自身 sheet 之下。按主题代次 + 度量缩放
     /// 缓存；base.css 为空（未打包皮肤资源）时返回空表。
     static StyleSheet BaseSheet(App app) {
         int gen = app.bgThemeGen;
-        if (Style.baseSheets == null || Style.baseSheetGen != gen) {
-            Style.baseSheets = new Dict<int, StyleSheet>();
-            Style.baseSheetGen = gen;
+        if (app.baseSheets == null || app.baseSheetGen != gen) {
+            app.baseSheets = new Dict<int, StyleSheet>();
+            app.baseSheetGen = gen;
         }
         int scale = app.metricsScale;
         StyleSheet hit;
-        if (Style.baseSheets.TryGetValue(scale, out hit)) { return hit; }
+        if (app.baseSheets.TryGetValue(scale, out hit)) { return hit; }
         StyleSheet made;
         string css = Skin.BaseCss();
         if (css == "") {
@@ -867,7 +894,7 @@ class Style {
             List<CssVarDecl> decls = Css.CollectVarDecls(Style.RootFromTheme(app.theme));
             made = Css.ParseWith(css, decls);
         }
-        Style.baseSheets.Add(scale, made);
+        app.baseSheets.Add(scale, made);
         return made;
     }
 
@@ -1191,7 +1218,7 @@ class Style {
         // 传入 HeightOr/FontOr/PadLOr 的 medium 主题度量。
     }
 
-    // ---- design-system class names -----------------------------------------
+    // 核心契约与语义定义。
     // 下面的名称是设计系统的词汇表：控件始终只把
     // 类列表交给解析器，皮肤可以在 CSS 中重新定义其中任意一个。
     // int 形式服务于数据驱动的调用方（设计文档、
@@ -1263,7 +1290,7 @@ class Style {
         return (255 * a / 1000) * 16777216 + rgb;
     }
 
-    // ---- semantic type colours ---------------------------------------------
+    // 核心契约与执行状态转移规范。
     // 供没有自己的 StyleBox、直接绘制按钮型表面的控件使用
     // （按钮组、功能带、工具栏），所以它们接收 int。
 
@@ -1385,24 +1412,39 @@ class Style {
         }
     }
 
-    // ---- inline (fluent / retained-mode) overrides --------------------------
+    // 核心契约与语义定义。
 
     /// 把控件自身的 inline 样式（Control.Bg/Radius/Border/... 或 UiDoc 应用的
     /// CSS）叠加到已解析的 box 上，使 retained-mode 控件与
     /// immediate-mode 控件共用一条解析路径。
     static void Inline(StyleBox b, Control c) {
         if (c == null) { return; }
+        int resolvedFont = b.fontPx;
+        bool fontPhysical = b.IsPrescaled(StyleBox.SourceFont());
         if (c.styleBg != 0) { b.bg = c.styleBg; b.bgTo = c.styleBgTo; }
-        if (c.styleRadius != 0) { b.SetRadius(c.styleRadius); }
+        if (c.styleRadius != 0) {
+            b.SetRadius(b.ScaleLogical(c.styleRadius));
+            b.SetPrescaled(StyleBox.SourceRadius() | StyleBox.SourceRadiusTL()
+                | StyleBox.SourceRadiusTR() | StyleBox.SourceRadiusBR()
+                | StyleBox.SourceRadiusBL(), true);
+        }
         if (c.styleCorners != 0) { b.SetCorners(c.styleCorners); }
         if (c.styleBorderColor != 0) { b.borderColor = c.styleBorderColor; }
-        if (c.styleBorderWidth != 0) { b.borderW = c.styleBorderWidth; }
+        if (c.styleBorderWidth != 0) {
+            b.borderW = b.ScaleLogical(c.styleBorderWidth);
+            b.SetPrescaled(StyleBox.SourceBorder(), true);
+        }
         if (c.styleShadow != 0) {
             b.shadow = c.styleShadow;
             b.shadowDy = c.styleShadowDy;
+            b.SetPrescaled(StyleBox.SourceShadowDy(), false);
         }
         if (c.styleColor != 0) { b.fg = c.styleColor; }
-        if (c.styleFontPx != 0) { b.fontPx = c.styleFontPx; }
+        if (c.styleFontPx != 0) {
+            b.fontPx = b.ScaleLogical(c.styleFontPx);
+            b.SetPrescaled(StyleBox.SourceFont(), true);
+        }
         if (c.styleTransitionMs != 0) { b.transitionMs = c.styleTransitionMs; }
+        StyleSheet.ReplayInline(b, c, resolvedFont, fontPhysical);
     }
 }

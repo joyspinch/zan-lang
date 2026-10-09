@@ -200,7 +200,22 @@ class TabHeaderHit {
     }
 }
 
-/// 预览控件缓存条目强类型实体（替代 pvCompKeys 与 pvCompCtls 平行列表）。
+/// 作者字段与真实预览控件的映射；原点取自运行时父内容框。
+class DesignPreviewNode {
+    FormField field;
+    Control control;
+    int originX;
+    int originY;
+    int insetX;
+    int insetY;
+    bool visible;
+
+    DesignPreviewNode(FormField field, Control control) {
+        this.field = field;
+        this.control = control;
+    }
+}
+
 class PreviewControlCache {
     string key;
     Control control;
@@ -244,7 +259,7 @@ class CompPropEditRow {
 }
 
 partial class Designer {
-    // UI language code ("zh" / "en"). Set by the host (e.g. the IDE) so the
+    // 核心契约与语义定义。
     // designer 界面文案跟随宿主 UI 语言，通过 T(en, zh) 读取。
     static string lang = "en";
 
@@ -296,6 +311,12 @@ partial class Designer {
     // 最近一帧「适应」算出的实际缩放（千分比，1000 = 100%），供功能区
     // 显示与从 Fit 缩放的起步值使用。
     int lastFitPct;
+    // 目标显示比例是编辑器会话状态，不写进设计稿；0 跟随开发设备。
+    int targetDpi;
+    bool dpiMenuOpen;
+    int dpiMenuX;
+    int dpiMenuY;
+    bool dpiMenuArm;
     // 自由画布交互状态。名称带前缀，避免与
     // 流式模式的面板拖拽（`dragging` 等）冲突。
     bool freeDragging;   // 在自由画布上拖移选区
@@ -491,9 +512,15 @@ partial class Designer {
     // 尺寸变化才重建 FormBuilder 树，其余帧只重渲染。
     List<PreviewControlCache> pvCompCache;
     int pvCompGen;
+    JsonValue docSource;
+    string pvDocKey;
+    Control pvDocRoot;
+    List<DesignPreviewNode> pvDocNodes;
+    Form pvDocForm;
+    int pvDocDpi;
 
     // 当前选中引用节点的组件属性声明缓存（组件文档根上的
-    // "props":[{key,label,kind,target,prop,def}]，v1 只消费 text 型）。
+    // 图表配置契约与样式属性适配规范
     // 实例值存引用节点 extra 的 "props" 直通表，序列化/展开全链路
     // 复用既有通道。
     string compPropFor;
@@ -555,7 +582,7 @@ partial class Designer {
     bool colEdResizable;
     bool colEdEditable;
     // 扩展列声明（GenForm EmitColumn 消费的同一批键）：decimals
-    // 仅 real 列生效（缺省 2）；summary 是 sum/avg/min/max/count
+    // 系统底层交互与数据流转契约
     // 五个布尔键的设计器侧归一枚举；pin 归一 left/right。
     int colEdDecimals;
     string colEdMoney;
@@ -821,7 +848,7 @@ partial class Designer {
     /// 标签切换行为开箱即可见。
     void Seed(App app) {
         activeContainer = null;
-        // A 24-column 网格: two halves, then thirds, showing 等分 layout.
+        // 系统底层交互与数据流转契约
         AddField(0); fields[fields.Count - 1].span = 12;
         AddField(2); fields[fields.Count - 1].span = 12;
         AddField(3); fields[fields.Count - 1].span = 8;
@@ -933,6 +960,7 @@ partial class Designer {
     /// 或保存，引用节点据此作废预览缓存。
     void SetUserComponents(List<UserComponent> comps) {
         userComps = comps;
+        UserComponentRegistry.SetAll(comps);
         pvCompGen = pvCompGen + 1;
     }
 
@@ -1279,7 +1307,7 @@ partial class Designer {
         }
         // ---- 2026-09-17 全量盘点增补（键逐一核对各控件 Props()/
         // GetExtra/SetExtra/SetProp 覆写；只收设计期配置与展示形态
-        // 键。运行态信号（Slider.value、Led.state、Gauge.value 等
+        // 系统底层交互与数据流转契约
         // 绑定通道）与已建模键（options/placeholder/orient/label）
         // 不进来；颜色键走文本通道解析 int 色值不可靠，一律不收。
         // Alert 走下方 type 行；AlarmBanner/AlarmList 数据源驱动
@@ -1674,7 +1702,6 @@ partial class Designer {
 
     /// 当 `inner` 位于 `owner` 子树的任意位置时返回 true。
     bool InSubtree(FormField owner, FormField inner) {
-        if (!owner.IsContainer()) { return false; }
         if (ContainsRef(owner.kids, inner)) { return true; }
         for (int i = 0; i < owner.kids.Count; i = i + 1) {
             if (InSubtree(owner.kids[i], inner)) { return true; }
@@ -1709,11 +1736,9 @@ partial class Designer {
     FormField FindOwner(List<FormField> lst, FormField target) {
         for (int i = 0; i < lst.Count; i = i + 1) {
             FormField f = lst[i];
-            if (f.IsContainer()) {
-                if (ContainsRef(f.kids, target)) { return f; }
-                FormField r = FindOwner(f.kids, target);
-                if (r != null) { return r; }
-            }
+            if (ContainsRef(f.kids, target)) { return f; }
+            FormField r = FindOwner(f.kids, target);
+            if (r != null) { return r; }
         }
         return null;
     }
@@ -1762,14 +1787,22 @@ partial class Designer {
             int to = idx + delta;
             if (to < 0) { to = 0; }
             if (to >= fields.Count) { to = fields.Count - 1; }
-            if (to != idx) { fields = ListMove(fields, idx, to); }
+            if (to != idx) {
+                List<FormField> moved = ListMove(fields, idx, to);
+                this.ReorderDesignContent(null, fields, moved);
+                fields = moved;
+            }
         } else {
             int idx = IndexIn(pc.kids, sel);
             if (idx < 0) { return; }
             int to = idx + delta;
             if (to < 0) { to = 0; }
             if (to >= pc.kids.Count) { to = pc.kids.Count - 1; }
-            if (to != idx) { pc.kids = ListMove(pc.kids, idx, to); }
+            if (to != idx) {
+                List<FormField> moved = ListMove(pc.kids, idx, to);
+                this.ReorderDesignContent(pc, pc.kids, moved);
+                pc.kids = moved;
+            }
         }
     }
 
@@ -1834,15 +1867,16 @@ partial class Designer {
         if (top == 0) { to = list.Count - 1; }
         if (to == idx) { return; }
         this.PushUndo();
-        list = ListMove(list, idx, to);
-        if (pc == null) { fields = list; } else { pc.kids = list; }
+        List<FormField> moved = ListMove(list, idx, to);
+        this.ReorderDesignContent(pc, list, moved);
+        if (pc == null) { fields = moved; } else { pc.kids = moved; }
     }
 
     /// 复制选中项，副本偏移一点并成为新的选中项。
     void DuplicateSel() {
         if (sel == null) { return; }
         this.PushUndo();
-        FormField nf = sel.Clone();
+        FormField nf = this.FieldFromJson(JsonValue.ParseLenient(this.FieldJson(sel).ToJson()));
         nf.fx = sel.LayoutX() + 16;
         nf.fy = sel.LayoutY() + 16;
         nf.fw = sel.LayoutW();
@@ -2396,6 +2430,22 @@ partial class Designer {
                 List<int> zps = this.ZoomPresets();
                 if (zc < zps.Count) { winZoom = zps[zc]; }
                 zoomMenuOpen = false;
+                app.RequestRedraw();
+            }
+        }
+
+        if (dpiMenuOpen && rowsEdField == null && propsEdField == null) {
+            int dc = ContextMenu.Render(app, dpiMenuX, dpiMenuY, this.DpiMenuLabels());
+            if (!dpiMenuArm) {
+                dpiMenuArm = true;
+                app.RequestRedraw();
+            } else if (dc == 0 - 2) {
+                dpiMenuOpen = false;
+                app.RequestRedraw();
+            } else if (dc >= 0) {
+                List<int> dps = this.DpiPresets();
+                if (dc < dps.Count) { this.SetDesignTargetDpi(app, dps[dc]); }
+                dpiMenuOpen = false;
                 app.RequestRedraw();
             }
         }

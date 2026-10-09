@@ -105,7 +105,7 @@ partial class CodeEditor {
     }
 
     void CaptureCompletionSource() {
-        acSourceText = GetText();
+        acSourceText = "";
         acSourceVersion = TextStamp();
         acSourcePath = documentPath;
         acSourceLine = curLine;
@@ -114,7 +114,7 @@ partial class CodeEditor {
 
     bool CompletionSourceCurrent() {
         return documentPath == acSourcePath && TextStamp() == acSourceVersion
-            && curLine == acSourceLine && curCol == acSourceCol && GetText() == acSourceText;
+            && curLine == acSourceLine && curCol == acSourceCol;
     }
 
     /// 从候选实体重建当前种类过滤器的可见列表并更新弹窗状态。
@@ -327,7 +327,7 @@ partial class CodeEditor {
             CeSemanticCompletionIntent intent = semanticCompletionIntent;
             if (intent == null || intent.token != token || intent.path != path
                 || intent.stamp != stamp || intent.line != curLine || intent.col != curCol
-                || line != curLine || col != curCol || intent.text != GetText()) { return false; }
+                || line != curLine || col != curCol) { return false; }
             acDot = intent.dot;
             acForced = intent.forced;
             acStart = intent.start;
@@ -358,7 +358,7 @@ partial class CodeEditor {
 
     bool ScoreExternalCompletion(string prefix, Dict<string, bool> taken, List<int> scores) {
         if (externalCompletion == null || documentPath.Length == 0) { return true; }
-        string source = GetText();
+        string source = "";
         int version = TextStamp();
         string path = documentPath;
         int line = curLine;
@@ -378,7 +378,7 @@ partial class CodeEditor {
         List<CodeCompletionItem> items = externalCompletion(path, line, col);
         // 提供者允许泵事件；返回时文档或光标改变就不能应用旧范围。
         if (semanticCompletionIntent != intent || documentPath != path || TextStamp() != version
-            || curLine != line || curCol != col || GetText() != source) { return false; }
+            || curLine != line || curCol != col) { return false; }
         if (items == null) { return true; }
         for (int i = 0; i < items.Count; i = i + 1) {
             CodeCompletionItem item = items[i];
@@ -515,6 +515,11 @@ partial class CodeEditor {
     /// 项目类型与成员。它只在项目扫描或缓冲区类型表变化时才会变，而
     /// 重建一次要走遍上千个类型和成员，因此跨击键复用。
     void EnsureCandBase() {
+        if (analysisApp != null) {
+            RequestAnalysis();
+            if (cbCandidates == null) { cbCandidates = new List<CeCompletionCandidate>(); }
+            return;
+        }
         EnsureProjectScan();
         EnsureBufTypes();
         if (cbCandidates != null && cbGen == candBaseGen) { return; }
@@ -625,7 +630,7 @@ partial class CodeEditor {
         string trimmed = CodeEditor.TrimStr(line);
         if (trimmed.Length == 0) { return ""; }
         // 必须包含一个 '('，其匹配的 ')' 后跟方法体的 '{'。
-        // 方法体可能在同一行结束 —— 像 `WebApp Views(string d) { views = d; return this; }`
+        // 系统底层交互与数据流转契约
         // 这样的单行访问器同样是声明，
         // 与花括号结束行尾的声明无异。
         // 先判断属性：其初始化器可能包含该行唯一的
@@ -729,6 +734,10 @@ partial class CodeEditor {
     /// 调用点数量，给定 `outLines` 时把每处
     /// 行号追加到其中。
     int ScanRefs(string name, int declLine, List<int> outLines) {
+        if (analysisApp != null) {
+            RequestAnalysis();
+            return CopyCachedReferenceLines(name, declLine, outLines);
+        }
         // 成员的引用应通过其所属类型到达。仅按名称
         // 时，`WebApp.Create` 的列表曾包含其他所有类型的 `Create`。
         EnsureRefIndex();
@@ -737,7 +746,10 @@ partial class CodeEditor {
             owner = refIdx.owners[declLine];
         }
         if (owner.Length > 0) {
-            return CodeEditor.CountMemberRefsPre(refIdx, name, owner, outLines);
+            List<string> family = new List<string>();
+            List<string> receivers = new List<string>();
+            AnalysisMemberRecvs(refIdx, owner, family, receivers);
+            return CodeEditor.CountMemberRefsWith(refIdx, family, receivers, name, outLines);
         }
         int total = 0;
         for (int li = 0; li < lines.Count && li < refIdx.stripped.Count;
@@ -767,6 +779,7 @@ partial class CodeEditor {
     /// 和引用列表都靠它，而它与被查的成员无关：一屏几十个声明
     /// 各自重建一份时，单个声明的统计就要 50 ms。
     void EnsureRefIndex() {
+        if (analysisApp != null) { RequestAnalysis(); return; }
         int stamp = TextStamp();
         if (refIdx != null && refStamp == stamp) { return; }
         refIdx = CeFileIndex.Of(lines);
@@ -804,19 +817,15 @@ partial class CodeEditor {
         if (extRefDecls.Count == 0) { extRefAt = 0 - 1; }
     }
 
-    /// 跨文件统计推进至多 `kbBudget` KB 的扫描量（一个声明扫一个
-    /// 文件即该文件的字节数），<=0 表示一口气做完。一口气做完
-    /// 意味着打开文件后的第一帧要扫完整个项目：实测本 IDE 工程
-    /// 3 s，更大的工程两分钟。因此绘制路径只给预算，进度
-    /// （文件下标、声明下标、当前文件的索引与接收者）留在帧之间；
-    /// 未算完时 CodeLens 先不显示数字，靠 lensPending 请求的重绘
-    /// 接着算下一批。预算按字节而非文件计，一个大文件也不会
-    /// 独占一帧。
+    /// 独立分析器的跨文件统计；<=0 表示整批完成。
+    /// KB 只计工作量，不限制单个文件扫描耗时，因此绑定后的 UI 不执行这里。
     void StepExternRefs(int kbBudget) {
+        if (analysisApp != null) { RequestAnalysis(); return; }
         if (extRefDirty) { BeginExternRefs(); }
         if (extRefAt < 0) { return; }
         int spent = 0;
         while (extRefAt < projFileSrc.Count) {
+            if (AnalysisCancelled()) { return; }
             string body = projFileSrc[extRefAt];
             int kb = body.Length / 1024 + 1;
             if (extRefFileIdx == null) {
@@ -830,6 +839,7 @@ partial class CodeEditor {
                 spent = spent + kb * 4;
             }
             while (extRefDeclAt < extRefDecls.Count) {
+                if (AnalysisCancelled()) { return; }
                 if (kbBudget > 0 && spent >= kbBudget) { return; }
                 // 同一声明类型的接收者在一个文件里只收集一次
                 // （声明按行序归类，同类型的连成一段）。
@@ -838,7 +848,7 @@ partial class CodeEditor {
                     extRefOwnerCur = extRefDecls[extRefDeclAt].owner;
                     extRefFamily = new List<string>();
                     extRefRecvs = new List<string>();
-                    CodeEditor.MemberRecvsPre(extRefFileIdx.stripped,
+                    AnalysisMemberRecvs(extRefFileIdx,
                         extRefOwnerCur, extRefFamily, extRefRecvs);
                     // 收集接收者要为类型家族的每个成员扫一遍本文件。
                     spent = spent + kb * extRefFamily.Count;
@@ -860,8 +870,7 @@ partial class CodeEditor {
     /// 本缓冲区之外 `owner.member` 的调用点数（未知为 0）；跨文件
     /// 统计尚未算完时返回 -1。
     int ExternRefCount(string owner, string member) {
-        // 一次最多扫 512 KB 源码（实测约 4 ms）；一帧里绘制路径
-        // 至多取 lensBudget 个计数，因此一帧的统计开销有上限。
+        // 同步兼容分析器可分批推进；绑定后的绘制只读取已发布计数。
         StepExternRefs(512);
         if (extRefAt >= 0) { return 0 - 1; }
         string key = owner + "." + member;
@@ -878,6 +887,7 @@ partial class CodeEditor {
     /// 跨文件统计还没算完时返回 -1，与预算耗尽同义：调用方
     /// 不绘制未统计完的数字。
     int LensRefCount(string name, int declLine) {
+        if (analysisApp != null) { RequestAnalysis(); return CachedLensRefCount(declLine); }
         EnsureRefIndex();
         string owner = "";
         if (declLine >= 0 && declLine < refIdx.owners.Count) {
@@ -896,6 +906,7 @@ partial class CodeEditor {
     /// 连过期值都没有则返回 -1，调用方不绘制
     /// 未经统计的数字。
     int LensRefCountBudgeted(string name, int declLine) {
+        if (analysisApp != null) { return CachedLensRefCount(declLine); }
         int at = 0 - 1;
         for (int k = 0; k < lensMemos.Count; k = k + 1) {
             if (lensMemos[k].name == name) { at = k; break; }
@@ -928,15 +939,15 @@ partial class CodeEditor {
         return v;
     }
 
-    /// 开启一帧的 CodeLens 预算，缓冲区变化时
-    /// 使记忆过期。指纹在此只取一次，因为 TextStamp() 会遍历
-    /// 每一行，而一屏可容纳数十个声明。
+    /// 同步兼容路径的 CodeLens 预算；TextStamp 为 O(1)。
+    /// 绑定后的 UI 不推进统计，后台 Post 到达时自然重绘。
     ///
     /// 重算等待输入停止：每次击键都会使
     /// 所有计数失效，每帧统计两个也要各遍历
     /// 整个缓冲区。缓冲区静置片刻前，面板显示
     /// 上次的计数，即一次击键前的值。
     void BeginLensFrame(App app) {
+        if (analysisApp != null) { lensPending = false; return; }
         lensPending = false;
         int stamp = TextStamp();
         if (lensStamp != stamp) {
@@ -1695,7 +1706,7 @@ partial class CodeEditor {
             if (CodeEditor.IsControlWord(mname)) { return ""; }
             return mname;
         }
-        // 字段 / 属性："Type name;"、"Type name =" 或 "Type name {"。
+        // 系统底层交互与数据流转契约
         int term = -1;
         for (int ti = 0; ti < s.Length; ti = ti + 1) {
             int c = s[ti] & 255;
@@ -1768,20 +1779,27 @@ partial class CodeEditor {
     /// 宿主 IDE 钩子：提供所有其他项目文件的源码，使
     /// 编辑器能解析跨文件类型（如 utils.zan 中的 `Utils` 类）。
     void SetProjectFiles(List<string> contents) {
-        projFileSrc = contents;
+        // 防宿主随后增删输入集合；字符串本身只读。
+        projFileSrc = CodeEditor.CloneLines(contents);
+        projectVersion = projectVersion + 1;
         projScanDirty = true;
         extRefDirty = true;
+        sigMemoName = "";
+        muLineCaches = null;
+        RequestAnalysis();
     }
 
     /// 若 SetProjectFiles() 留下待处理的跨文件类型扫描
     /// 则执行之。由补全路径惰性调用，使切换标签页
     /// 本身保持低成本。
     void EnsureProjectScan() {
+        if (analysisApp != null) { RequestAnalysis(); return; }
         if (!projScanDirty) { return; }
         projScanDirty = false;
         candBaseGen = candBaseGen + 1;
         projTypes = new List<ProjType>();
         for (int i = 0; i < projFileSrc.Count; i = i + 1) {
+            if (AnalysisCancelled()) { return; }
             List<string> tn = new List<string>();
             List<string> tm = new List<string>();
             CodeEditor.ScanTypesInto(projFileSrc[i], tn, tm);
@@ -1803,6 +1821,13 @@ partial class CodeEditor {
 
     /// 收集当前缓冲区 `using` 行导入的命名空间。
     void ParseUsingsInto(List<string> outNs) {
+        if (analysisApp != null || (workerSnapshot != null && analysisImports != null)) {
+            if (analysisApp != null) { RequestAnalysis(); }
+            if (analysisImports != null) {
+                for (int i = 0; i < analysisImports.Count; i = i + 1) { outNs.Add(analysisImports[i]); }
+            }
+            return;
+        }
         for (int i = 0; i < lines.Count; i = i + 1) {
             string tr = CodeEditor.TrimStr(lines[i]);
             if (CodeEditor.StartsWithP(tr, "using ")) {
@@ -1823,6 +1848,10 @@ partial class CodeEditor {
 
     /// 当前缓冲区声明的命名空间（`namespace X;`），无则 ""。
     string FileNamespace() {
+        if (analysisApp != null || (workerSnapshot != null && analysisImports != null)) {
+            if (analysisApp != null) { RequestAnalysis(); }
+            return analysisNamespace;
+        }
         for (int i = 0; i < lines.Count; i = i + 1) {
             string tr = CodeEditor.TrimStr(lines[i]);
             if (CodeEditor.StartsWithP(tr, "namespace ")) {
@@ -1927,9 +1956,9 @@ partial class CodeEditor {
 
     static List<CeStdlibTypeEntry> nsTypeTable;
 
-    /// Builds the name -> namespace table once. It used to be rebuilt as a
-    /// dozen packed strings on every lookup, and the lookup runs for every
-    /// capitalised identifier in the buffer each time the diagnostics rerun.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     static void EnsureNsTable() {
         if (CodeEditor.nsTypeTable != null) { return; }
         List<CeStdlibTypeEntry> table = new List<CeStdlibTypeEntry>();
@@ -1953,7 +1982,7 @@ partial class CodeEditor {
         CodeEditor.nsTypeTable = table;
     }
 
-    /// Appends every space-separated name in `words` with namespace `ns`.
+    /// 接口数据协议与执行契约。
     static void AddNsGroup(List<CeStdlibTypeEntry> table, string ns, string words) {
         int i = 0;
         int n = words.Length;
@@ -2139,6 +2168,12 @@ partial class CodeEditor {
     /// 每次光标移动都要用到它，而重扫是一整篇解析，因此只在结构
     /// 真的变了时重扫（见 BufTypesStructuralChange）。
     void EnsureBufTypes() {
+        if (analysisApp != null) {
+            RequestAnalysis();
+            if (muTypes == null) { muTypes = new List<CeBufType>(); }
+            return;
+        }
+        if (workerSnapshot != null && workerBufferTypesReady) { return; }
         if (muTypes != null && !BufTypesStructuralChange()) { return; }
         List<string> names = new List<string>();
         List<string> membersJoined = new List<string>();
@@ -2148,6 +2183,7 @@ partial class CodeEditor {
             muTypes.Add(new CeBufType(names[k], membersJoined[k]));
         }
         candBaseGen = candBaseGen + 1;
+        if (workerSnapshot != null) { workerBufferTypesReady = true; return; }
         btLineSrc = new List<string>();
         for (int i = 0; i < lines.Count; i = i + 1) { btLineSrc.Add(lines[i]); }
     }
@@ -2195,24 +2231,25 @@ partial class CodeEditor {
         return b == 95;
     }
 
-    /// Missing-`using` diagnostics for the whole buffer. The scan walks every
-    /// character of every line, so it is cached twice over: once per line (a
-    /// line whose text is unchanged reuses its result, so typing rescans one
-    /// line) and once per buffer (the caller reruns this on every caret line
-    /// change, and an unchanged buffer answers from the cache).
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     void AnalyzeMissingUsings() {
-        // Fast path: no line changed since the last scan, so nothing outside
-        // the buffer can have changed the answer either -- replay the cache
-        // without reparsing the imports or rescanning a character.
+        if (analysisApp != null) { RequestAnalysis(); return; }
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        // 核心契约与语义定义。
         if (ReplayMissingUsings()) { return; }
         EnsureProjectScan();
         List<string> usings = new List<string>();
         ParseUsingsInto(usings);
         string fileNs = FileNamespace();
         EnsureBufTypes();
-        // Everything outside the line itself that the answer depends on. A
-        // change here (a new using, a type declared elsewhere) drops the
-        // per-line cache.
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        // 核心契约与执行状态转移规范。
         string ctx = fileNs + "|" + string.Join(",", usings) + "|"
             + Convert.ToString(muTypes.Count) + ":"
             + Convert.ToString(projTypes.Count);
@@ -2223,6 +2260,7 @@ partial class CodeEditor {
         fixes = new List<QuickFix>();
         int li = 0;
         while (li < lines.Count) {
+            if (AnalysisCancelled()) { return; }
             while (muLineCaches.Count <= li) {
                 muLineCaches.Add(new CeMissingUsingLine(null, "", ""));
             }
@@ -2242,9 +2280,9 @@ partial class CodeEditor {
         muStamp = TextStamp();
     }
 
-    /// Rebuilds the diagnostics and quick fixes from the per-line cache when
-    /// every line still holds the text it was scanned from. Returns false
-    /// when the buffer moved on and a real scan is needed.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     bool ReplayMissingUsings() {
         if (muLineCaches == null || muLineCaches.Count != lines.Count) { return false; }
         for (int i = 0; i < lines.Count; i = i + 1) {
@@ -2261,9 +2299,9 @@ partial class CodeEditor {
         return true;
     }
 
-    /// Scans one line for the first stdlib type used without its `using` and
-    /// records the answer (namespace + type name, both "" for none) in the
-    /// per-line cache.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 核心契约与执行状态转移规范。
     void ScanLineMissingUsing(int li, List<string> usings, string fileNs) {
         muLineCaches[li].src = lines[li];
         muLineCaches[li].ns = "";

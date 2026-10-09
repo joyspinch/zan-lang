@@ -13,9 +13,83 @@ namespace System.Diagnostics;
 /// 会被解释。切勿用不可信或未经清理的
 /// 输入构造这些命令——否则会招致命令注入。只传入可信、完全
 /// 可控的命令字符串。（不经 shell、基于 argv 的启动器才是处理不可信参数的
-/// 安全之选，也是计划中的新增功能。）
+/// 安全之选，使用 RunSafe / CaptureSafe / StartDetachedSafe。）
 /// </summary>
 class Process {
+    /// <summary>将绝对 URI 交给系统关联程序；成功启动处理器返回 true。
+    /// 不等待处理器退出，不经 shell 解释 URI；无效输入或不支持的平台返回 false。</summary>
+    static bool OpenUrl(string url) {
+        if (!Process.ValidUri(url)) { return false; }
+        return Process.OpenTarget(url);
+    }
+
+    /// <summary>将现有文件或目录交给系统关联程序。相对路径按当前目录解析；
+    /// 成功启动处理器返回 true，不等待其退出；路径无效或不存在返回 false。</summary>
+    static bool OpenPath(string path) {
+        if (path == null || path == "") { return false; }
+        for (int i = 0; i < path.Length; i = i + 1) {
+            if ((path[i] & 255) == 0) { return false; }
+        }
+        try {
+            string absolute = Path.GetFullPath(path);
+            if (!File.Exists(absolute) && !Directory.Exists(absolute)) { return false; }
+            return Process.OpenTarget(absolute);
+        } catch (ArgumentException ex) {
+            // 无效路径属于 bool 启动契约的失败值。
+            return false;
+        } catch (IOException ex) {
+            // 当前目录或完整路径查询失败也属于启动失败。
+            return false;
+        }
+    }
+
+    private static bool ValidUri(string url) {
+        if (url == null || url == "") { return false; }
+        int colon = url.IndexOf(":");
+        if (colon <= 0) { return false; }
+        int first = url[0] & 255;
+        if (!((first >= 65 && first <= 90) || (first >= 97 && first <= 122))) { return false; }
+        for (int i = 1; i < colon; i = i + 1) {
+            int c = url[i] & 255;
+            if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                || (c >= 48 && c <= 57) || c == 43 || c == 45 || c == 46)) { return false; }
+        }
+        for (int i = colon + 1; i < url.Length; i = i + 1) {
+            int c = url[i] & 255;
+            if (c <= 32 || c == 127) { return false; }
+        }
+        return colon + 1 < url.Length;
+    }
+
+    private static bool OpenTarget(string target) {
+        #if WINDOWS
+        nint operation = Wide.Of("open");
+        nint value = Wide.Of(target);
+        try {
+            return Process.WinShellExecute(0, operation, value, 0, 0, 1) > 32;
+        } finally {
+            Wide.Free(value);
+            Wide.Free(operation);
+        }
+        #elif MACOS
+        List<string> args = new List<string>();
+        args.Add("--");
+        args.Add(target);
+        return Process.StartDetachedSafe("/usr/bin/open", args) == 0;
+        #elif LINUX && !ANDROID && !OHOS
+        List<string> args = new List<string>();
+        args.Add(target);
+        return Process.StartDetachedSafe("xdg-open", args) == 0;
+        #else
+        return false;
+        #endif
+    }
+
+    #if WINDOWS
+    [DllImport("shell32", EntryPoint = "ShellExecuteW")]
+    private static extern nint WinShellExecute(nint window, nint operation, nint target,
+                                               nint parameters, nint directory, int show);
+    #endif
     #if WINDOWS
     [DllImport("crt", EntryPoint = "_popen")]
     static extern nint plat_popen(string cmd, string mode);
@@ -73,7 +147,7 @@ class Process {
     static extern nint WinCreateFile(nint path, int access, int share, byte[] sa,
                                      int disposition, int flags, nint template);
     #else
-    // Linux、macOS 等 POSIX 系统都在 libc 中提供 popen/pclose。
+    // 系统底层交互与数据流转契约
     [DllImport("crt", EntryPoint = "zan_proc_run_safe")]
     static extern int PlatProcRunSafe(string exe, nint argsPtr, int argc);
     [DllImport("crt", EntryPoint = "zan_proc_start_detached_safe")]
@@ -200,10 +274,10 @@ class Process {
         si[0] = 104;                        // STARTUPINFOA.cb = sizeof(STARTUPINFOA)
         byte[] pi = new byte[32];
         int CREATE_NO_WINDOW = 134217728;   // 0x08000000
-        // WinCreateProcess is CreateProcessW: pass writable UTF-16 storage.
-        // StartProgram already follows this rule; the shell-backed Run /
-        // RunDetached path must do the same instead of handing UTF-8 bytes to
-        // the W API (which fails before cmd.exe starts).
+        // 核心契约与语义定义。
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
         nint wcmd = Wide.Of(cmdline);
         int ok = WinCreateProcess(0, wcmd, 0, 0, 0, CREATE_NO_WINDOW, 0, 0, si, pi);
         Wide.Free(wcmd);
@@ -404,7 +478,7 @@ class Process {
         // TRUE 时才发生。只有显式标成可继承的句柄会被传下去，其余不受影响。
         int inherit = 1;
         if (logPath != "") {
-            // SECURITY_ATTRIBUTES{ nLength=24, lpSecurityDescriptor=0,
+            // 核心契约与语义定义。
             //                      bInheritHandle=TRUE }：句柄必须可继承，
             // 子进程才能把它当作自己的 stdout。
             byte[] sa = new byte[24];
@@ -436,8 +510,8 @@ class Process {
             // 它保持控制台程序语义但没有窗口，也没有多余的 conhost。
             flags = CREATE_NO_WINDOW;
         }
-        // CreateProcessW keeps Chinese and other Unicode deployment paths intact.
-        // Windows may mutate commandLine, so Wide.Of supplies writable storage.
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
         nint wcmd = Wide.Of("\"" + exe + "\"");
         int ok = WinCreateProcess(0, wcmd, 0, 0, inherit, flags,
                                   0, 0, si, pi);
@@ -646,7 +720,7 @@ class Process {
         nint wcmd = Wide.Of(cmdline);
         int ok = WinCreateProcess(0, wcmd, 0, 0, 1, CREATE_NO_WINDOW, 0, 0, si, pi);
         Wide.Free(wcmd);
-        WinCloseHandle(hWritePipe); // Close write end in parent so ReadFile hits EOF
+        WinCloseHandle(hWritePipe); // 接口数据协议与执行契约。
 
         if (ok == 0) {
             WinCloseHandle(hReadPipe);

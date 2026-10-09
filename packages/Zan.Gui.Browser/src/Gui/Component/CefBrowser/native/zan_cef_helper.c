@@ -22,7 +22,7 @@ static int zch_exists(const char *path) {
     return path && path[0] && stat(path, &st) == 0 && !S_ISDIR(st.st_mode);
 }
 
-/* Strips `n` trailing path components from `p`, in place. */
+/* 底层系统交互与数据协议契约 */
 static void zch_up(char *p, int n) {
     for (int i = 0; i < n; i++) {
         char *slash = strrchr(p, '/');
@@ -43,8 +43,7 @@ static int zch_exe_path(char *buf, size_t cap) {
     return 0;
 }
 
-/* libzan_cef.dylib: environment first (what the browser process actually
- * loaded), then the two places the publish layout can put it. */
+/* 底层系统交互与数据协议契约 */
 static int zch_driver_path(char *out, size_t cap) {
     const char *env = getenv("ZAN_CEF_HELPER_DRIVER");
     if (zch_exists(env)) {
@@ -54,7 +53,7 @@ static int zch_driver_path(char *out, size_t cap) {
     char exe[1024];
     if (!zch_exe_path(exe, sizeof(exe))) return 0;
 
-    /* .../<app>.app/Contents/Frameworks/<x> Helper.app/Contents/MacOS/<x> */
+    /* 底层系统交互与数据协议契约 */
     char base[1024];
     snprintf(base, sizeof(base), "%s", exe);
     zch_up(base, 5);
@@ -67,17 +66,13 @@ static int zch_driver_path(char *out, size_t cap) {
     return zch_exists(out);
 }
 
-/* ZAN_CEF_LOG=1 (Chromium hands the browser process's environment to its
- * children, so the host's setting reaches every helper): report what this
- * process is and how far it got. A Chromium child that dies before CEF has
- * initialized its logging writes nothing to the CEF log file, so this is the
- * only place the type of a subprocess that never came up shows up. */
+/* 底层系统交互与数据协议契约 */
 static int zch_log_on(void) {
     const char *v = getenv("ZAN_CEF_LOG");
     return v && v[0] && strcmp(v, "0") != 0;
 }
 
-/* The --type= of this process, "browser" when there is none. */
+/* 底层系统交互与数据协议契约 */
 static const char *zch_type(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (argv[i] && strncmp(argv[i], "--type=", 7) == 0) return argv[i] + 7;
@@ -131,8 +126,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[helper] leave type=%s rc=%d\n", type, rc);
         fflush(stderr);
     }
-    /* -1 means "this is the browser process" -- impossible here, since the
-     * helper is only ever spawned by Chromium with a --type= argument. */
+    /* 底层系统交互与数据协议契约 */
     if (rc < 0) return 1;
     return rc;
 }

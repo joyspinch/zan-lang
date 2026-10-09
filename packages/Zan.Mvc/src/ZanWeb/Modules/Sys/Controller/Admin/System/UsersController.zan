@@ -13,7 +13,6 @@ using ZanWeb.Web;
 namespace ZanWeb.Admin.System;
 
 /* /admin/system/users 账号管理：搜索、建、编、删、改密、分角色、启禁、强制下线；列表为投影，永非实体——不把密码散列与盐放进行，避免模板失手泄露凭证材料；禁用与强制下线有意分为两键——status=0 阻断后续登录、改 tokenVersion 使已持令牌失效，禁用两者都做，因放行已开会话的禁令不算禁令。 */
-[Route("admin/system/users/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("账号管理")]
 class UsersController : AdminController {
@@ -54,7 +53,6 @@ class UsersController : AdminController {
     }
 
     [HttpGet]
-    [Route("/admin/system/users")]
     [Custom(IsMenu = true, Icon = "mdi:account", Perm = PermBit.View)]
     [Description("账号管理")]
     async void Index() {
@@ -71,14 +69,14 @@ class UsersController : AdminController {
         List<int> scoped = sc.Depts();
         int mine = sc.UserId();
 
-        int total = await new SysUserDao(this).CountBy(
+        int total = await this.SysUser.CountBy(
             conds, sc.ByDept(), scoped, sc.Mine(), mine);
-        List<SysUser> rows = await new SysUserDao(this).PagedListBy(
+        List<SysUser> rows = await this.SysUser.PagedListBy(
             conds, sc.ByDept(), scoped, sc.Mine(), mine, q.Skip(), q.Limit());
 
-        List<SysDepartment> depts = await new SysDepartmentDao(this).All();
-        List<SysRole> roles = await new SysRoleDao(this).All();
-        List<SysUserRole> links = await new SysUserRoleDao(this).All();
+        List<SysDepartment> depts = await this.SysDepartment.All();
+        List<SysRole> roles = await this.SysRole.All();
+        List<SysUserRole> links = await this.SysUserRole.All();
 
         /* 实体行一行投影；部门名/角色名是跨表组合，留控制器补键。 */
         List<StrMap> items = d.AddList("rows");
@@ -145,7 +143,7 @@ class UsersController : AdminController {
         }
         /* 仅该账号可写部门入选，使对话框无法提议 Save 随后拒绝的迁移；仅本人 scope 一处都不可写。 */
         DataScope sc = await this.Scope();
-        List<SysDepartment> depts = await new SysDepartmentDao(this).Scoped(
+        List<SysDepartment> depts = await this.SysDepartment.Scoped(
             sc.ByDept(), sc.Depts(), sc.Mine());
         List<StrMap> deptRows = new List<StrMap>();
         for (int i = 0; i < depts.Count; i = i + 1) {
@@ -194,7 +192,7 @@ class UsersController : AdminController {
         string password = this.In("password");
         if (status != 1) { status = 0; }
 
-        SysUser clash = await new SysUserDao(this).ByUsername(username);
+        SysUser clash = await this.SysUser.ByUsername(username);
         if (clash != null && clash.id != id) {
             this.Fail(400, "0004", "账号 " + username + " 已存在");
         }
@@ -203,8 +201,7 @@ class UsersController : AdminController {
         await this.Reachable(departmentId);
 
         if (id > 0) {
-            SysUserDao userDao = new SysUserDao(this);
-            int n = await userDao.UpdateProfile(id, username, nickname, email, mobile, departmentId, status, WebApp.NowSeconds());
+            int n = await this.SysUser.UpdateProfile(id, username, nickname, email, mobile, departmentId, status, WebApp.NowSeconds());
             /* 禁用账号须使其已持会话失效，否则禁令只对下次登录生效。 */
             if (status == 0) { await this.Revoke(id); }
             AuthUser.Forget(Convert.ToString(id));
@@ -228,8 +225,7 @@ class UsersController : AdminController {
         u.tokenVersion = 1;
         u.createdAt = WebApp.NowSeconds();
         u.updatedAt = u.createdAt;
-        SysUserDao userDao = new SysUserDao(this);
-        int newId = await userDao.Insert(u);
+        int newId = await this.SysUser.Insert(u).ExecuteIdentityAsync();
         await this.Note("新增账号",
             "#" + Convert.ToString(newId) + " " + username, newId > 0, "");
         this.Saved("账号已创建");
@@ -248,9 +244,8 @@ class UsersController : AdminController {
         if (me != null && me.id == id) {
             this.Fail(400, "0004", "不能删除当前登录的账号");
         }
-        SysUserDao userDao = new SysUserDao(this);
-        int n = await userDao.Delete(id);
-        int _r = await new SysUserRoleDao(this).DeleteByUserId(id);
+        int n = await this.SysUser.Delete().Where(a => a.id == id).ExecuteAffrowsAsync();
+        int _r = await this.SysUserRole.DeleteByUserId(id);
         AuthUser.Forget(Convert.ToString(id));
         await this.Note("删除账号",
             "#" + Convert.ToString(id) + " " + u.username, n > 0, "");
@@ -268,8 +263,7 @@ class UsersController : AdminController {
         if (u.isSuper == 1 && status == 0) {
             this.Fail(400, "0004", "超级管理员账号不能禁用");
         }
-        SysUserDao userDao = new SysUserDao(this);
-        int n = await userDao.SetStatus(id, status);
+        int n = await this.SysUser.SetStatus(id, status);
         if (status == 0) { await this.Revoke(id); }
         AuthUser.Forget(Convert.ToString(id));
         await this.Note("启用或禁用账号",
@@ -295,7 +289,7 @@ class UsersController : AdminController {
         if (ids.Count == 0) { this.Fail(400, "0004", "未选择账号"); return; }
         string value = this.In("value");
         int status = value == "1" ? 1 : 0;
-        List<SysUser> rows = await new SysUserDao(this).ByIds(ids);
+        List<SysUser> rows = await this.SysUser.ByIds(ids);
         if (rows.Count == 0) { this.Fail(400, "0004", "所选账号不存在"); return; }
         SysUser me = await this.Admin();
         if (value.Length == 0) {
@@ -312,7 +306,7 @@ class UsersController : AdminController {
             }
             await CrudOps.Delete(this, ScreenDef(), ids, "批量删除账号");
             for (int i = 0; i < rows.Count; i = i + 1) {
-                int _r = await new SysUserRoleDao(this).DeleteByUserId(rows[i].id);
+                int _r = await this.SysUserRole.DeleteByUserId(rows[i].id);
                 AuthUser.Forget(Convert.ToString(rows[i].id));
             }
             return;
@@ -375,8 +369,7 @@ class UsersController : AdminController {
             this.Fail(400, "0004", "密码至少 8 位");
         }
         SysUser u = await this.Reach(id);
-        SysUserDao userDao = new SysUserDao(this);
-        int n = await userDao.ResetPassword(id, "", AuthUser.NewHash(password),
+        int n = await this.SysUser.ResetPassword(id, "", AuthUser.NewHash(password),
             WebApp.NowSeconds());
         if (n > 0) { AuthUser.Forget(Convert.ToString(id)); }
         await this.Note("重置密码",
@@ -394,8 +387,8 @@ class UsersController : AdminController {
         ViewData d = new ViewData();
         d.Set("id", Convert.ToString(id));
         d.Set("username", u.username);
-        List<SysRole> roles = await new SysRoleDao(this).All();
-        List<SysUserRole> mine = await new SysUserRoleDao(this).ByUserId(id);
+        List<SysRole> roles = await this.SysRole.All();
+        List<SysUserRole> mine = await this.SysUserRole.ByUserId(id);
         List<StrMap> rows = d.AddList("roles");
         Rows.Project(roles, rows);
         for (int i = 0; i < roles.Count; i = i + 1) {
@@ -415,16 +408,15 @@ class UsersController : AdminController {
         int id = this.InInt("id", 0);
         SysUser u = await this.Reach(id);
         string picked = this.In("roleIds");
-        SysUserRoleDao urDao = new SysUserRoleDao(this);
-        int _cleared = await urDao.DeleteByUserId(id);
-        List<SysRole> roles = await new SysRoleDao(this).All();
+        int _cleared = await this.SysUserRole.DeleteByUserId(id);
+        List<SysRole> roles = await this.SysRole.All();
         int granted = 0;
         for (int i = 0; i < roles.Count; i = i + 1) {
             if (!AuthUser.Holds(picked, Convert.ToString(roles[i].id))) { continue; }
             SysUserRole link = new SysUserRole();
             link.userId = id;
             link.roleId = roles[i].id;
-            int _n = await urDao.Insert(link);
+            int _n = await this.SysUserRole.Insert(link).ExecuteIdentityAsync();
             granted = granted + 1;
         }
         AuthUser.Forget(Convert.ToString(id));
@@ -436,7 +428,7 @@ class UsersController : AdminController {
 
     /* 请求有权操作的账号；超调用方数据 scope 的答与不存在的行同 404——无法列表的账号不得在对话框或 POST 中确认其存在。 */
     private async SysUser Reach(int id) {
-        SysUser u = await new SysUserDao(this).ById(id);
+        SysUser u = await this.SysUser.ById(id);
         if (u == null) { this.Fail(404, "0404", "账号不存在"); }
         DataScope sc = await this.Scope();
         if (!sc.Covers(u.id, u.departmentId)) {
@@ -454,7 +446,7 @@ class UsersController : AdminController {
 
     /* 使该账号已发的所有令牌失效。 */
     private async void Revoke(int id) {
-        int n = await new SysUserDao(this).BumpTokenVersion(id);
+        int n = await this.SysUser.BumpTokenVersion(id);
         if (n > 0) { AuthUser.Forget(Convert.ToString(id)); }
     }
 

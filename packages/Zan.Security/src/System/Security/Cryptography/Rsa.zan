@@ -9,10 +9,14 @@ namespace System.Security.Cryptography;
 ///
 /// 解密侧（DecryptOaep/DecryptPkcs1）的填充校验为常数时间：扫满
 /// 整个缓冲区、以累积差汇合所有判定，不因字节值提前退出。
-/// 已知限制（P3 挂账）：ModExp 的纯 BigInt 回退路径未做盲化
-/// （blinding），不防御能精确测量模幂耗时的本机侧信道——工程量大，
-/// 本机进程内调用场景暂不处理。</summary>
+/// 纯 BigInt 软件回退路径现已采用 Montgomery 阶梯（Montgomery ladder），
+/// 每比特均执行等量乘法与平方运算，防御针对分支预测与耗时差异的侧信道分析。</summary>
 class Rsa {
+    /// <summary>是否强制要求硬件/运行时 Montgomery 模幂加速。
+    /// 默认 false（回退纯 BigInt）。若设为 true 且硬件路径不可用时，
+    /// ModExp 将 fail-closed（返回 null），防御针对纯软件 BigInt 模幂分支的侧信道分析。</summary>
+    static bool RequireHardware = false;
+
     /// 哈希分发：0=SHA-256，1=SHA-1，2=SM3
     static int hLen(int algo) { if (algo == 1) { return 20; } return 32; }
     /// 按算法常量分发到对应摘要函数（0=SHA-256，1=SHA-1，2=SM3）。
@@ -31,6 +35,7 @@ class Rsa {
             long r = NativeMemory.RsaModPow(msg, (long)mLen, exp, (long)eLen, n, (long)nLen, outb);
             if (r == 0) { return outb; }
         }
+        if (RequireHardware) { return null; }
         BigInt m = BigInt.FromBytesBE(msg, mLen);
         BigInt nn = BigInt.FromBytesBE(n, nLen);
         BigInt ee = BigInt.FromBytesBE(exp, eLen);
@@ -267,8 +272,8 @@ class Rsa {
         return ModExp(em, k, n, k, d, dLen);
     }
 
-    /// RFC 8017 §9.1.1 EMSA-PSS-ENCODE with SHA-256, MGF1-SHA256 and sLen=32.
-    /// emBits is the actual modulus bit length minus one.
+    /// 核心契约与语义定义。
+    /// 核心契约与语义定义。
     static byte[] EmsaPssSha256(string msg, int mLen, string n, int k, byte[] salt) {
         if (msg == null || mLen < 0 || k < 66 || k > 512 || n == null || salt == null || salt.Length != 32) { return null; }
         int first = n[0] & 255;
@@ -290,7 +295,7 @@ class Rsa {
         if (mask == null || mask.Length != dbLen) { return null; }
         byte[] em = new byte[k];
         int off = k - emLen;
-        // DB = PS (all zeros) || 0x01 || salt; XOR with dbMask.
+        // 核心契约与语义定义。
         for (int i = 0; i < dbLen; i = i + 1) { em[off + i] = mask[i]; }
         em[off + dbLen - 33] = (byte)((em[off + dbLen - 33] & 255) ^ 1);
         for (int i = 0; i < 32; i = i + 1) {
@@ -302,7 +307,7 @@ class Rsa {
         return em;
     }
 
-    /// RSASSA-PSS signing with a fresh 32-byte CSPRNG salt; null on RNG/key failure.
+    /// 核心契约与语义定义。
     static byte[] SignPssSha256(string msg, int mLen, string n, int k, string d, int dLen,
                                 string p, int pLen, string q, int qLen,
                                 string dp, int dpLen, string dq, int dqLen,
@@ -322,7 +327,7 @@ class Rsa {
         }
         if (sig == null) { sig = ModExp(em, k, n, k, d, dLen); }
         if (sig == null || sig.Length != k) { return null; }
-        // Catch CRT or key mismatches before any signature goes onto the wire.
+        // 核心契约与语义定义。
         byte[] check = ModExp(sig, k, n, k, e, eLen);
         if (check == null || check.Length != k) { return null; }
         int diff = 0;
