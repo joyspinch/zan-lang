@@ -1070,7 +1070,7 @@ static void uri_percent_encode_path(const char *in, char *out, size_t cap) {
     out[o] = '\0';
 }
 
-/* Native filesystem path for a file:// URI (percent-decoded, separators
+/* Native filesystem path for a file:  // URI (percent-decoded, separators
  * native), so a document update can replace the project index's entry for
  * the same file instead of adding a duplicate keyed by URI. */
 static void uri_to_native_path(const char *uri, char *out, size_t cap) {
@@ -1851,7 +1851,7 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
     send_response(s, id, result);
 }
 
-/* Native path <-> file:// URI conversion; defined further below alongside
+/* Native path <-> file:  // URI conversion; defined further below alongside
  * the reference-walking helpers that share them. */
 static void fspath_to_uri(const char *path, char *out, size_t cap);
 static bool same_uri_ci(const char *a, const char *b);
@@ -1917,7 +1917,7 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
     if (!g.found) { send_response(s, id, json_new_null()); return; }
 
     /* The target file may be recorded as a native path (project index) or as
-     * the document URI (doc engine); always answer with a proper file:// URI
+     * the document URI (doc engine); always answer with a proper file:  // URI
      * so clients can open it, and compare through same_uri_ci, which decodes
      * and case-folds both sides. */
     char target_uri[1800];
@@ -2077,7 +2077,7 @@ static char *read_file_all(const char *path) {
     return buf;
 }
 
-/* file:// URI for a native path, separators normalized to '/' and percent-
+/* file:  // URI for a native path, separators normalized to '/' and percent-
  * encoded, so echoed URIs match the encoded forms clients send for the
  * same files (spaces, '%', non-ASCII). */
 static void fspath_to_uri(const char *path, char *out, size_t cap) {
@@ -2176,7 +2176,7 @@ typedef struct {
     bool is_local;
     char rt_simple[128]; /* member owner, simple name */
     bool have_decl;
-    char decl_ref[512];  /* declaration file (native path or file://) */
+    char decl_ref[512];  /* declaration file (native path or file:  // ) */
     int decl_line, decl_col; /* member declaration position */
     int ldecl_line, ldecl_col; /* local declaration position */
     const char *origin_uri;
@@ -2882,7 +2882,7 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
  * emitting, a line whose last character is '{' bumps the level after,
  * trailing whitespace stripped, blank runs collapsed to one, final newline.
  * Unlike zanfmt the brace detection here is string/comment aware — a '{'
- * inside a literal or a trailing // comment no longer shifts the indent.
+ * inside a literal or a trailing  // comment no longer shifts the indent.
  * Both stay line-based: nothing inside a line is ever re-spaced. */
 
 typedef struct {
@@ -3698,7 +3698,7 @@ static void handle_semantic_tokens_full(lsp_server_t *s, json_value *id, json_va
 
 /* ========================= leak checking ============================ */
 
-/* Convert a file:// URI to a native filesystem path. Delegates to
+/* Convert a file:  // URI to a native filesystem path. Delegates to
  * uri_to_native_path so the decode rules live in exactly one place. */
 static void uri_to_fspath(const char *uri, char *out, size_t cap) {
     out[0] = '\0';
