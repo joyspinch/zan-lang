@@ -1,26 +1,33 @@
-// GenScene.zan -- .zscene 场景设计文档 → 合成 partial class 的代码生成器。
-// 等价迁移自 src/compiler/scenegen.c(输出逐字节一致)。
+// GenScene.zan -- 游戏场景设计文档（.html / 兼容 .zscene）→ 合成 partial class 的代码生成器。
+// 等价迁移自 src/compiler/scenegen.c。
 // 输入(design 请求的 files[i]):
 // 接口数据协议与执行契约。
 // 输出:reply.sources 里追加一段名为 name 的 .zan 源码。
 namespace System.Compiler;
 
-// .zscene 场景设计文档到合成 partial class 的代码生成器。
-// 与 src/compiler/scenegen.c 等价(输出逐字节一致);入口是
-// <see cref="Translate"/>,由 design 请求分派 .zscene 文件进来。
+// 游戏场景设计文档到合成 partial class 的代码生成器。
+// 入口是 <see cref="Translate"/>，由 design 请求分派 .html 场景文档（或兼容 .zscene）进来。
 class GenScene {
-    // 翻译 design 请求里所有 .zscene 文件(.html 设计稿归 GenForm):
-    // 逐个解析、合成为 .zan 源码,经 GenCommon.AddSource 追加进
-    // reply 的 sources;失败时写 reply 的 error 后返回。
+    // 翻译 design 请求里所有场景文件（.html 场景设计稿与兼容 .zscene 文件）：
+    // 逐个解析、合成为 .zan 源码，经 GenCommon.AddSource 追加进
+    // reply 的 sources；失败时写 reply 的 error 后返回。
     static void Translate(JsonValue req, JsonValue reply) {
         JsonValue files = req.Get("files");
         if (files == null) { return; }
         for (int i = 0; i < files.Count(); i = i + 1) {
             JsonValue f = files.At(i);
             string fname = f.Str("name", "");
-            /* 只处理 .zscene;.html 设计稿归 GenForm(与旧 C 的按扩展名分派一致)。 */
-            if (!fname.EndsWith(".zscene")) { continue; }
+            string flower = fname.ToLower();
+            bool isSceneExt = flower.EndsWith(".zscene");
+            bool isHtmlExt = flower.EndsWith(".html") || flower.EndsWith(".htm");
+            if (!isSceneExt && !isHtmlExt) { continue; }
             string text = f.Str("text", "");
+            /* 对 .html 检查是否为场景设计文档（含 data-zan-scene 标记） */
+            if (isHtmlExt) {
+                if (text.IndexOf("data-zan-scene") < 0 && text.IndexOf("<body data-scene") < 0) {
+                    continue;
+                }
+            }
             bool emitMain = f.Bool("emitMain", false);
             StringBuilder outText = GenScene.TranslateOne(reply, text, fname, emitMain);
             if (outText == null) {
@@ -110,15 +117,205 @@ class GenScene {
         return used.Contains(n);
     }
 
-    // 翻译单个 .zscene 文档。解析失败返回 null(不设 error,
-    // 由 C 端报通用错误)。
-    static StringBuilder TranslateOne(JsonValue reply, string json,
+    // 从 HTML 标签中提取属性值。
+    static string ExtractAttr(string tag, string name) {
+        if (tag == null || name == null) { return ""; }
+        string pattern = " " + name + "=";
+        int idx = tag.IndexOf(pattern);
+        if (idx < 0) {
+            pattern = "\t" + name + "=";
+            idx = tag.IndexOf(pattern);
+        }
+        if (idx < 0) {
+            pattern = "\n" + name + "=";
+            idx = tag.IndexOf(pattern);
+        }
+        if (idx < 0) { return ""; }
+        int valStart = idx + pattern.Length;
+        if (valStart >= tag.Length) { return ""; }
+        char quote = tag[valStart];
+        if (quote == '"' || quote == '\'') {
+            valStart = valStart + 1;
+            int endIdx = tag.IndexOf(Convert.ToString(quote), valStart);
+            if (endIdx < 0) { return ""; }
+            string raw = tag.Substring(valStart, endIdx - valStart);
+            return raw.Replace("&quot;", "\"").Replace("&lt;", "<").Replace("&gt;", ">").Replace("&amp;", "&");
+        }
+        int spaceIdx = tag.IndexOf(" ", valStart);
+        int closeIdx = tag.IndexOf(">", valStart);
+        int end = spaceIdx;
+        if (end < 0 || (closeIdx >= 0 && closeIdx < end)) { end = closeIdx; }
+        if (end < 0) { end = tag.Length; }
+        return tag.Substring(valStart, end - valStart);
+    }
+
+    // 十进制串转整数，缺省返回 defVal。
+    static int ParseInt(string s, int defVal) {
+        if (s == null || s.Length == 0) { return defVal; }
+        string t = s.Trim();
+        if (t.Length == 0) { return defVal; }
+        bool neg = false;
+        int idx = 0;
+        if (t[0] == '-') {
+            neg = true;
+            idx = 1;
+        } else if (t[0] == '+') {
+            idx = 1;
+        }
+        if (idx >= t.Length) { return defVal; }
+        int val = 0;
+        while (idx < t.Length) {
+            char c = t[idx];
+            if (c < '0' || c > '9') { return defVal; }
+            val = val * 10 + ((int)c - (int)'0');
+            idx = idx + 1;
+        }
+        return neg ? (0 - val) : val;
+    }
+
+    // 将 HTML 场景设计文档解析为 JsonValue 场景模型。
+    static JsonValue HtmlToSceneJson(string html) {
+        if (html == null || html.Length == 0) { return null; }
+        int bodyStart = html.IndexOf("<body");
+        if (bodyStart < 0) { return null; }
+        int bodyTagEnd = html.IndexOf(">", bodyStart);
+        if (bodyTagEnd < 0) { return null; }
+        string bodyTag = html.Substring(bodyStart, bodyTagEnd - bodyStart);
+
+        JsonValue root = JsonValue.NewObject();
+        string sname = GenScene.ExtractAttr(bodyTag, "data-zan-scene");
+        if (sname.Length == 0) { sname = GenScene.ExtractAttr(bodyTag, "data-scene"); }
+        if (sname.Length == 0) { sname = GenScene.ExtractAttr(bodyTag, "id"); }
+        root.Put("name", JsonValue.NewStr(sname));
+
+        int dw = GenScene.ParseInt(GenScene.ExtractAttr(bodyTag, "data-design-width"), 1280);
+        int dh = GenScene.ParseInt(GenScene.ExtractAttr(bodyTag, "data-design-height"), 720);
+        root.Put("designWidth", JsonValue.NewNum(Convert.ToString(dw)));
+        root.Put("designHeight", JsonValue.NewNum(Convert.ToString(dh)));
+
+        int scaleMode = GenScene.ParseInt(GenScene.ExtractAttr(bodyTag, "data-scale-mode"), 0);
+        root.Put("scaleMode", JsonValue.NewNum(Convert.ToString(scaleMode)));
+
+        string winTitle = GenScene.ExtractAttr(bodyTag, "data-win-title");
+        if (winTitle.Length > 0) { root.Put("winTitle", JsonValue.NewStr(winTitle)); }
+
+        string bg = GenScene.ExtractAttr(bodyTag, "data-background");
+        if (bg.Length > 0) { root.Put("background", JsonValue.NewStr(bg)); }
+
+        string clearStr = GenScene.ExtractAttr(bodyTag, "data-clear-color");
+        if (clearStr.Length > 0) {
+            List<string> parts = clearStr.Split(",");
+            if (parts.Count >= 3) {
+                JsonValue carr = JsonValue.NewArray();
+                carr.Append(JsonValue.NewNum(Convert.ToString(GenScene.ParseInt(parts[0], 18))));
+                carr.Append(JsonValue.NewNum(Convert.ToString(GenScene.ParseInt(parts[1], 20))));
+                carr.Append(JsonValue.NewNum(Convert.ToString(GenScene.ParseInt(parts[2], 32))));
+                root.Put("clearColor", carr);
+            }
+        }
+
+        JsonValue elems = JsonValue.NewArray();
+        int searchPos = bodyTagEnd;
+        int elemIdx = 1;
+        while (searchPos < html.Length) {
+            int divStart = html.IndexOf("<div", searchPos);
+            if (divStart < 0) { break; }
+            int divTagEnd = html.IndexOf(">", divStart);
+            if (divTagEnd < 0) { break; }
+            string divTag = html.Substring(divStart, divTagEnd - divStart);
+
+            string ename = GenScene.ExtractAttr(divTag, "id");
+            string kind = GenScene.ExtractAttr(divTag, "data-kind");
+            if (kind.Length == 0) { kind = "panel"; }
+            if (ename.Length == 0) { ename = kind + Convert.ToString(elemIdx); }
+            elemIdx = elemIdx + 1;
+
+            JsonValue el = JsonValue.NewObject();
+            el.Put("name", JsonValue.NewStr(ename));
+            el.Put("kind", JsonValue.NewStr(kind));
+            el.Put("x", JsonValue.NewNum(Convert.ToString(GenScene.ParseInt(GenScene.ExtractAttr(divTag, "data-x"), 0))));
+            el.Put("y", JsonValue.NewNum(Convert.ToString(GenScene.ParseInt(GenScene.ExtractAttr(divTag, "data-y"), 0))));
+            el.Put("w", JsonValue.NewNum(Convert.ToString(GenScene.ParseInt(GenScene.ExtractAttr(divTag, "data-w"), 0))));
+            el.Put("h", JsonValue.NewNum(Convert.ToString(GenScene.ParseInt(GenScene.ExtractAttr(divTag, "data-h"), 0))));
+            el.Put("anchorX", JsonValue.NewNum(Convert.ToString(GenScene.ParseInt(GenScene.ExtractAttr(divTag, "data-anchor-x"), 0))));
+            el.Put("anchorY", JsonValue.NewNum(Convert.ToString(GenScene.ParseInt(GenScene.ExtractAttr(divTag, "data-anchor-y"), 0))));
+            el.Put("z", JsonValue.NewNum(Convert.ToString(GenScene.ParseInt(GenScene.ExtractAttr(divTag, "data-z"), 0))));
+
+            string img = GenScene.ExtractAttr(divTag, "data-image");
+            if (img.Length > 0) { el.Put("image", JsonValue.NewStr(img)); }
+            string txt = GenScene.ExtractAttr(divTag, "data-text");
+            if (txt.Length > 0) { el.Put("text", JsonValue.NewStr(txt)); }
+
+            string colorStr = GenScene.ExtractAttr(divTag, "data-color");
+            if (colorStr.Length > 0) {
+                List<string> cp = colorStr.Split(",");
+                if (cp.Count >= 4) {
+                    JsonValue colArr = JsonValue.NewArray();
+                    colArr.Append(JsonValue.NewNum(Convert.ToString(GenScene.ParseInt(cp[0], 255))));
+                    colArr.Append(JsonValue.NewNum(Convert.ToString(GenScene.ParseInt(cp[1], 255))));
+                    colArr.Append(JsonValue.NewNum(Convert.ToString(GenScene.ParseInt(cp[2], 255))));
+                    colArr.Append(JsonValue.NewNum(Convert.ToString(GenScene.ParseInt(cp[3], 255))));
+                    el.Put("color", colArr);
+                }
+            }
+
+            int rows = GenScene.ParseInt(GenScene.ExtractAttr(divTag, "data-rows"), 1);
+            int cols = GenScene.ParseInt(GenScene.ExtractAttr(divTag, "data-cols"), 1);
+            int gapx = GenScene.ParseInt(GenScene.ExtractAttr(divTag, "data-gap-x"), 0);
+            int gapy = GenScene.ParseInt(GenScene.ExtractAttr(divTag, "data-gap-y"), 0);
+            if (rows > 1 || cols > 1 || gapx != 0 || gapy != 0) {
+                el.Put("rows", JsonValue.NewNum(Convert.ToString(rows)));
+                el.Put("cols", JsonValue.NewNum(Convert.ToString(cols)));
+                el.Put("gapX", JsonValue.NewNum(Convert.ToString(gapx)));
+                el.Put("gapY", JsonValue.NewNum(Convert.ToString(gapy)));
+            }
+
+            int val = GenScene.ParseInt(GenScene.ExtractAttr(divTag, "data-value"), 0);
+            if (val != 0) { el.Put("value", JsonValue.NewNum(Convert.ToString(val))); }
+
+            string items = GenScene.ExtractAttr(divTag, "data-items");
+            if (items.Length > 0) { el.Put("items", JsonValue.NewStr(items)); }
+
+            if (GenScene.ExtractAttr(divTag, "data-locked") == "true") { el.Put("locked", JsonValue.NewBool(true)); }
+
+            string layer = GenScene.ExtractAttr(divTag, "data-layer");
+            if (layer.Length > 0) { el.Put("layer", JsonValue.NewStr(layer)); }
+
+            string cls = GenScene.ExtractAttr(divTag, "class");
+            if (cls.Length > 0) { el.Put("class", JsonValue.NewStr(cls)); }
+
+            int pos = GenScene.ParseInt(GenScene.ExtractAttr(divTag, "data-position"), 1);
+            el.Put("position", JsonValue.NewNum(Convert.ToString(pos)));
+
+            int flexGrow = GenScene.ParseInt(GenScene.ExtractAttr(divTag, "data-flex-grow"), 0);
+            if (flexGrow > 0) { el.Put("flexGrow", JsonValue.NewNum(Convert.ToString(flexGrow))); }
+
+            if (GenScene.ExtractAttr(divTag, "data-visible") == "false") { el.Put("visible", JsonValue.NewBool(false)); }
+
+            string onClick = GenScene.ExtractAttr(divTag, "data-on-click");
+            if (onClick.Length > 0) { el.Put("onClick", JsonValue.NewStr(onClick)); }
+
+            elems.Append(el);
+            searchPos = divTagEnd + 1;
+        }
+
+        root.Put("elements", elems);
+        return root;
+    }
+
+    // 翻译单个场景设计文档（.html 场景设计稿或兼容 .zscene）。解析失败返回 null。
+    static StringBuilder TranslateOne(JsonValue reply, string content,
                                       string file_name, bool emit_main) {
-        JsonValue root;
-        try {
-            root = JsonValue.Parse(json);
-        } catch (Exception ex) {
-            return null;
+        JsonValue root = null;
+        if (content != null && (content.IndexOf("<body") >= 0 || content.IndexOf("data-zan-scene") >= 0 || content.IndexOf("<!doctype") >= 0)) {
+            root = GenScene.HtmlToSceneJson(content);
+        }
+        if (root == null) {
+            try {
+                root = JsonValue.Parse(content);
+            } catch (Exception ex) {
+                return null;
+            }
         }
 
         string name = GenScene.ObjStr(root, "name");
@@ -132,6 +329,8 @@ class GenScene {
             else if (bslash >= 0) { p = bslash + 1; }
             string nm = base0.Substring(p);
             if (nm.EndsWith(".zscene")) { nm = nm.Substring(0, nm.Length - 7); }
+            else if (nm.EndsWith(".html")) { nm = nm.Substring(0, nm.Length - 5); }
+            else if (nm.EndsWith(".htm")) { nm = nm.Substring(0, nm.Length - 4); }
             if (nm.Length > 127) { nm = nm.Substring(0, 127); }
             if (!GenCommon.IsIdent(nm)) { nm = "Scene"; }
             name = nm;
@@ -250,7 +449,7 @@ class GenScene {
         out0.Append("// <auto-generated> compile-time projection of ");
         if (file_name == null) { out0.Append("(scene)"); } else { out0.Append(file_name); }
         out0.Append("\n");
-        out0.Append("// The .zscene design document is the source of truth; put\n");
+        out0.Append("// The scene design document is the source of truth; put\n");
         out0.Append("// your initialization and game logic in " + name + ".zan.\n");
         out0.Append("using System;\n");
         out0.Append("using Gui;\n");

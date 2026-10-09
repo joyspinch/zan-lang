@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Json;
+using System.Web;
 using Gui;
 
 namespace Game.Scene;
@@ -741,11 +742,15 @@ partial class SceneDoc {
         return o;
     }
 
-    // 宽松解析 `.zscene` JSON 文档（尽力而为，面向工具生成的
-    // 输入）：解析失败或根非对象时返回字段取默认值的文档。
+    // 宽松解析场景设计文档（支持标准 .html 与兼容 .zscene JSON）：
+    // 优先探测 HTML 格式并解析；解析失败或根非对象时返回字段取默认值的文档。
     // 严格校验请用 TryParse（失败原因见 LastError）。
-    static SceneDoc Parse(string json) {
-        JsonValue root = JsonValue.ParseLenient(json);
+    static SceneDoc Parse(string text) {
+        if (text != null && (text.IndexOf("<body") >= 0 || text.IndexOf("data-zan-scene") >= 0 || text.IndexOf("<!doctype") >= 0)) {
+            SceneDoc hd = new SceneDoc("", 1280, 720);
+            if (SceneDoc.FromHtml(text, hd)) { return hd; }
+        }
+        JsonValue root = JsonValue.ParseLenient(text);
         return SceneDoc.FromRoot(root);
     }
 
@@ -753,22 +758,24 @@ partial class SceneDoc {
     // Parse 走宽松路径不会置位；TryParse 失败时携带原因。
     static string lastError;
 
-    // 严格解析：文档必须是完整合法的 JSON 对象，否则返回
-    // false 且 SceneDoc.LastError() 给出原因。设计器打开文档
-    // 走这条路径——截断/损坏的设计稿被静默降级成半份文档、
-    // 再在用户下一次编辑时覆盖回盘，比直接拒绝打开糟糕得多。
-    // 返回的文档经 FromRoot 构建，调用方拿到后照常使用。
-    static bool TryParse(string json, SceneDoc outDoc) {
+    // 严格解析：文档必须是完整合法的标准 HTML 场景设计稿或 JSON 对象，
+    // 否则返回 false 且 SceneDoc.LastError() 给出原因。
+    static bool TryParse(string text, SceneDoc outDoc) {
         SceneDoc.lastError = "";
+        if (text != null && (text.IndexOf("<body") >= 0 || text.IndexOf("data-zan-scene") >= 0 || text.IndexOf("<!doctype") >= 0)) {
+            if (SceneDoc.FromHtml(text, outDoc)) {
+                return true;
+            }
+        }
         JsonValue root = null;
         try {
-            root = JsonValue.Parse(json);
+            root = JsonValue.Parse(text);
         } catch (JsonException ex) {
             SceneDoc.lastError = ex.Message;
             return false;
         }
         if (root == null || !root.IsObject()) {
-            SceneDoc.lastError = "document is not a JSON object";
+            SceneDoc.lastError = "document is not a valid scene document";
             return false;
         }
         SceneDoc parsed = SceneDoc.FromRoot(root);
@@ -1032,5 +1039,295 @@ partial class SceneDoc {
         }
         o.Put("elements", elems);
         return o.PrettyToJson();
+    }
+
+    // HTML 属性转义辅助函数。
+    static string EscAttr(string s) {
+        if (s == null) { return ""; }
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            char c = s[i];
+            if (c == '&') { b.Append("&amp;"); }
+            else if (c == '"') { b.Append("&quot;"); }
+            else if (c == '<') { b.Append("&lt;"); }
+            else if (c == '>') { b.Append("&gt;"); }
+            else { b.Append(c); }
+        }
+        return b.ToString();
+    }
+
+    // 从 HTML 标签串中提取属性值，支持 attr="value" 与 attr='value'。
+    static string ExtractAttr(string tag, string name) {
+        if (tag == null || name == null) { return ""; }
+        string pattern = " " + name + "=";
+        int idx = tag.IndexOf(pattern);
+        if (idx < 0) {
+            pattern = "\t" + name + "=";
+            idx = tag.IndexOf(pattern);
+        }
+        if (idx < 0) {
+            pattern = "\n" + name + "=";
+            idx = tag.IndexOf(pattern);
+        }
+        if (idx < 0) { return ""; }
+        int valStart = idx + pattern.Length;
+        if (valStart >= tag.Length) { return ""; }
+        char quote = tag[valStart];
+        if (quote == '"' || quote == '\'') {
+            valStart = valStart + 1;
+            int endIdx = tag.IndexOf(Convert.ToString(quote), valStart);
+            if (endIdx < 0) { return ""; }
+            string raw = tag.Substring(valStart, endIdx - valStart);
+            return raw.Replace("&quot;", "\"").Replace("&lt;", "<").Replace("&gt;", ">").Replace("&amp;", "&");
+        }
+        int spaceIdx = tag.IndexOf(" ", valStart);
+        int closeIdx = tag.IndexOf(">", valStart);
+        int end = spaceIdx;
+        if (end < 0 || (closeIdx >= 0 && closeIdx < end)) { end = closeIdx; }
+        if (end < 0) { end = tag.Length; }
+        return tag.Substring(valStart, end - valStart);
+    }
+
+    // 将场景文档序列化为标准 HTML5 设计稿。
+    public string ToHtml() {
+        StringBuilder b = new StringBuilder();
+        b.Append("<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <title>");
+        string title = this.WinTitle();
+        if (title.Length == 0) { title = this.sname; }
+        b.Append(SceneDoc.EscAttr(title));
+        b.Append("</title>\n</head>\n<body data-zan-scene=\"");
+        b.Append(SceneDoc.EscAttr(this.sname));
+        b.Append("\" data-design-width=\"");
+        b.Append(Convert.ToString(this.designWidth));
+        b.Append("\" data-design-height=\"");
+        b.Append(Convert.ToString(this.designHeight));
+        b.Append("\" data-scale-mode=\"");
+        b.Append(Convert.ToString(this.scaleMode));
+        b.Append("\" data-win-center=\"");
+        b.Append(Convert.ToString(this.winCenter));
+        b.Append("\" data-win-pos-x=\"");
+        b.Append(Convert.ToString(this.winPosX));
+        b.Append("\" data-win-pos-y=\"");
+        b.Append(Convert.ToString(this.winPosY));
+        if (this.WinTitle().Length > 0) {
+            b.Append("\" data-win-title=\"");
+            b.Append(SceneDoc.EscAttr(this.winTitle));
+        }
+        b.Append("\" data-win-resizable=\"");
+        b.Append(Convert.ToString(this.winResizable));
+        b.Append("\" data-win-chrome=\"");
+        b.Append(Convert.ToString(this.winChrome));
+        if (this.background.Length > 0) {
+            b.Append("\" data-background=\"");
+            b.Append(SceneDoc.EscAttr(this.background));
+        }
+        b.Append("\" data-clear-color=\"");
+        b.Append(Convert.ToString(this.bgR) + "," + Convert.ToString(this.bgG) + "," + Convert.ToString(this.bgB));
+        b.Append("\">\n");
+
+        for (int i = 0; i < this.elements.Count; i = i + 1) {
+            SceneElement e = this.elements[i];
+            b.Append("  <div id=\"");
+            b.Append(SceneDoc.EscAttr(e.Name()));
+            b.Append("\" data-kind=\"");
+            b.Append(SceneDoc.EscAttr(e.Kind()));
+            b.Append("\" data-x=\"");
+            b.Append(Convert.ToString(e.X()));
+            b.Append("\" data-y=\"");
+            b.Append(Convert.ToString(e.Y()));
+            b.Append("\" data-w=\"");
+            b.Append(Convert.ToString(e.W()));
+            b.Append("\" data-h=\"");
+            b.Append(Convert.ToString(e.H()));
+            b.Append("\" data-anchor-x=\"");
+            b.Append(Convert.ToString(e.AnchorX()));
+            b.Append("\" data-anchor-y=\"");
+            b.Append(Convert.ToString(e.AnchorY()));
+            b.Append("\" data-z=\"");
+            b.Append(Convert.ToString(e.Z()));
+            if (e.ImageId().Length > 0) {
+                b.Append("\" data-image=\"");
+                b.Append(SceneDoc.EscAttr(e.ImageId()));
+            }
+            if (e.Text().Length > 0) {
+                b.Append("\" data-text=\"");
+                b.Append(SceneDoc.EscAttr(e.Text()));
+            }
+            b.Append("\" data-color=\"");
+            b.Append(Convert.ToString(e.R()) + "," + Convert.ToString(e.G()) + "," + Convert.ToString(e.B()) + "," + Convert.ToString(e.A()));
+            if (e.IsGrid() || e.GapX() != 0 || e.GapY() != 0) {
+                b.Append("\" data-rows=\"");
+                b.Append(Convert.ToString(e.Rows()));
+                b.Append("\" data-cols=\"");
+                b.Append(Convert.ToString(e.Cols()));
+                b.Append("\" data-gap-x=\"");
+                b.Append(Convert.ToString(e.GapX()));
+                b.Append("\" data-gap-y=\"");
+                b.Append(Convert.ToString(e.GapY()));
+            }
+            if (e.Value() != 0) {
+                b.Append("\" data-value=\"");
+                b.Append(Convert.ToString(e.Value()));
+            }
+            if (e.Items().Length > 0) {
+                b.Append("\" data-items=\"");
+                b.Append(SceneDoc.EscAttr(e.Items()));
+            }
+            if (e.Locked()) {
+                b.Append("\" data-locked=\"true");
+            }
+            if (e.Layer().Length > 0) {
+                b.Append("\" data-layer=\"");
+                b.Append(SceneDoc.EscAttr(e.Layer()));
+            }
+            if (e.CssClass().Length > 0) {
+                b.Append("\" class=\"");
+                b.Append(SceneDoc.EscAttr(e.CssClass()));
+            }
+            if (e.Position() != 1) {
+                b.Append("\" data-position=\"");
+                b.Append(Convert.ToString(e.Position()));
+            }
+            if (e.FlexGrow() > 0) {
+                b.Append("\" data-flex-grow=\"");
+                b.Append(Convert.ToString(e.FlexGrow()));
+            }
+            if (!e.Visible()) {
+                b.Append("\" data-visible=\"false");
+            }
+            if (e.actions != null && e.actions.IsObject()) {
+                for (int ak = 0; ak < e.actions.Count(); ak = ak + 1) {
+                    JsonValue av = e.actions.ValAt(ak);
+                    if (av == null || !av.IsString()) { continue; }
+                    string hv = av.AsString("");
+                    if (hv.Length == 0) { continue; }
+                    b.Append("\" data-on-" + e.actions.KeyAt(ak).ToLower() + "=\"");
+                    b.Append(SceneDoc.EscAttr(hv));
+                }
+            }
+            b.Append("\"></div>\n");
+        }
+        b.Append("</body>\n</html>\n");
+        return b.ToString();
+    }
+
+    // 十进制字符串转 int，解析失败或空串返回 defVal。
+    static int ParseInt(string s, int defVal) {
+        if (s == null || s.Length == 0) { return defVal; }
+        string t = s.Trim();
+        if (t.Length == 0) { return defVal; }
+        bool neg = false;
+        int idx = 0;
+        if (t[0] == '-') {
+            neg = true;
+            idx = 1;
+        } else if (t[0] == '+') {
+            idx = 1;
+        }
+        if (idx >= t.Length) { return defVal; }
+        int val = 0;
+        while (idx < t.Length) {
+            char c = t[idx];
+            if (c < '0' || c > '9') { return defVal; }
+            val = val * 10 + ((int)c - (int)'0');
+            idx = idx + 1;
+        }
+        return neg ? (0 - val) : val;
+    }
+
+    // 从标准 HTML 设计稿反序列化场景文档。
+    public static bool FromHtml(string html, SceneDoc outDoc) {
+        if (html == null || html.Length == 0) { return false; }
+        int bodyStart = html.IndexOf("<body");
+        if (bodyStart < 0) { return false; }
+        int bodyTagEnd = html.IndexOf(">", bodyStart);
+        if (bodyTagEnd < 0) { return false; }
+        string bodyTag = html.Substring(bodyStart, bodyTagEnd - bodyStart);
+
+        string sname = SceneDoc.ExtractAttr(bodyTag, "data-zan-scene");
+        if (sname.Length == 0) { sname = SceneDoc.ExtractAttr(bodyTag, "data-scene"); }
+        if (sname.Length == 0) { sname = SceneDoc.ExtractAttr(bodyTag, "id"); }
+        int dw = SceneDoc.ParseInt(SceneDoc.ExtractAttr(bodyTag, "data-design-width"), 1280);
+        int dh = SceneDoc.ParseInt(SceneDoc.ExtractAttr(bodyTag, "data-design-height"), 720);
+
+        outDoc.sname = sname;
+        outDoc.designWidth = dw;
+        outDoc.designHeight = dh;
+        outDoc.scaleMode = SceneDoc.ParseInt(SceneDoc.ExtractAttr(bodyTag, "data-scale-mode"), 0);
+        outDoc.winCenter = SceneDoc.ParseInt(SceneDoc.ExtractAttr(bodyTag, "data-win-center"), 1);
+        outDoc.winPosX = SceneDoc.ParseInt(SceneDoc.ExtractAttr(bodyTag, "data-win-pos-x"), 0);
+        outDoc.winPosY = SceneDoc.ParseInt(SceneDoc.ExtractAttr(bodyTag, "data-win-pos-y"), 0);
+        outDoc.winTitle = SceneDoc.ExtractAttr(bodyTag, "data-win-title");
+        outDoc.winResizable = SceneDoc.ParseInt(SceneDoc.ExtractAttr(bodyTag, "data-win-resizable"), 1);
+        outDoc.winChrome = SceneDoc.ParseInt(SceneDoc.ExtractAttr(bodyTag, "data-win-chrome"), 1);
+        outDoc.background = SceneDoc.ExtractAttr(bodyTag, "data-background");
+
+        string clearStr = SceneDoc.ExtractAttr(bodyTag, "data-clear-color");
+        if (clearStr.Length > 0) {
+            List<string> parts = clearStr.Split(",");
+            if (parts.Count >= 3) {
+                outDoc.bgR = SceneDoc.ParseInt(parts[0], 18);
+                outDoc.bgG = SceneDoc.ParseInt(parts[1], 20);
+                outDoc.bgB = SceneDoc.ParseInt(parts[2], 32);
+            }
+        }
+
+        outDoc.elements = new List<SceneElement>();
+        int searchPos = bodyTagEnd;
+        while (searchPos < html.Length) {
+            int divStart = html.IndexOf("<div", searchPos);
+            if (divStart < 0) { break; }
+            int divTagEnd = html.IndexOf(">", divStart);
+            if (divTagEnd < 0) { break; }
+            string divTag = html.Substring(divStart, divTagEnd - divStart);
+
+            string ename = SceneDoc.ExtractAttr(divTag, "id");
+            string kind = SceneDoc.ExtractAttr(divTag, "data-kind");
+            if (kind.Length == 0) { kind = "panel"; }
+            if (ename.Length == 0) { ename = kind + SceneDoc.IntStr(outDoc.elements.Count + 1); }
+
+            SceneElement e = new SceneElement(kind, ename);
+            e.x = SceneDoc.ParseInt(SceneDoc.ExtractAttr(divTag, "data-x"), 0);
+            e.y = SceneDoc.ParseInt(SceneDoc.ExtractAttr(divTag, "data-y"), 0);
+            e.w = SceneDoc.ParseInt(SceneDoc.ExtractAttr(divTag, "data-w"), 0);
+            e.h = SceneDoc.ParseInt(SceneDoc.ExtractAttr(divTag, "data-h"), 0);
+            e.anchorX = SceneDoc.ParseInt(SceneDoc.ExtractAttr(divTag, "data-anchor-x"), 0);
+            e.anchorY = SceneDoc.ParseInt(SceneDoc.ExtractAttr(divTag, "data-anchor-y"), 0);
+            e.z = SceneDoc.ParseInt(SceneDoc.ExtractAttr(divTag, "data-z"), 0);
+            e.image = SceneDoc.ExtractAttr(divTag, "data-image");
+            e.text = SceneDoc.ExtractAttr(divTag, "data-text");
+
+            string cStr = SceneDoc.ExtractAttr(divTag, "data-color");
+            if (cStr.Length > 0) {
+                List<string> cp = cStr.Split(",");
+                if (cp.Count >= 4) {
+                    e.cr = SceneDoc.ParseInt(cp[0], 255);
+                    e.cg = SceneDoc.ParseInt(cp[1], 255);
+                    e.cb = SceneDoc.ParseInt(cp[2], 255);
+                    e.ca = SceneDoc.ParseInt(cp[3], 255);
+                }
+            }
+
+            e.rows = SceneDoc.ParseInt(SceneDoc.ExtractAttr(divTag, "data-rows"), 1);
+            e.cols = SceneDoc.ParseInt(SceneDoc.ExtractAttr(divTag, "data-cols"), 1);
+            e.gapX = SceneDoc.ParseInt(SceneDoc.ExtractAttr(divTag, "data-gap-x"), 0);
+            e.gapY = SceneDoc.ParseInt(SceneDoc.ExtractAttr(divTag, "data-gap-y"), 0);
+            e.val = SceneDoc.ParseInt(SceneDoc.ExtractAttr(divTag, "data-value"), 0);
+            e.items = SceneDoc.ExtractAttr(divTag, "data-items");
+            if (SceneDoc.ExtractAttr(divTag, "data-locked") == "true") { e.locked = true; }
+            e.layer = SceneDoc.ExtractAttr(divTag, "data-layer");
+            e.cssClass = SceneDoc.ExtractAttr(divTag, "class");
+            e.position = SceneDoc.ParseInt(SceneDoc.ExtractAttr(divTag, "data-position"), 1);
+            e.flexGrow = SceneDoc.ParseInt(SceneDoc.ExtractAttr(divTag, "data-flex-grow"), 0);
+            if (SceneDoc.ExtractAttr(divTag, "data-visible") == "false") { e.visible = false; }
+
+            string onClick = SceneDoc.ExtractAttr(divTag, "data-on-click");
+            if (onClick.Length > 0) { e.On("Click", onClick); }
+
+            outDoc.elements.Add(e);
+            searchPos = divTagEnd + 1;
+        }
+
+        return true;
     }
 }
