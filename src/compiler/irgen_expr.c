@@ -11357,11 +11357,8 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 gate_park = LLVMAddFunction(g->mod, "zan_gate_park", gate_park_type);
             }
             int k = g->current_async_next_state++;
-            LLVMValueRef selfframe = g->current_async_frame;
-            LLVMTypeRef self_ft = g->current_async_frame_type;
-            LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
-            zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0),
-                LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+            LLVMValueRef self_i8 = get_async_self_i8(g);
+            zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0), get_async_state_ptr(g));
             zan_call2(g->builder, gate_park_type, gate_park,
                 (LLVMValueRef[]){ handle, self_i8, g->current_async_resume_fn }, 3, "");
             LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
@@ -11460,11 +11457,8 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 g->uses_socket_async = true;
 
                 int k = g->current_async_next_state++;
-                LLVMValueRef selfframe = g->current_async_frame;
-                LLVMTypeRef self_ft = g->current_async_frame_type;
-                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
-                zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0),
-                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMValueRef self_i8 = get_async_self_i8(g);
+                zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0), get_async_state_ptr(g));
                 zan_call2(g->builder, g->rt_io_wait_co_type, g->rt_io_wait_co,
                     (LLVMValueRef[]){ fd, interest, self_i8, g->current_async_resume_fn }, 4, "");
                 LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));

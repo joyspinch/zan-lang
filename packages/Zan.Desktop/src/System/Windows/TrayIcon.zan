@@ -3,6 +3,9 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
 using System.Threading;
+#if LINUX
+using System.Drawing.Imaging;
+#endif
 
 namespace System.Windows;
 
@@ -24,12 +27,12 @@ delegate void TrayMenuCallback(int id);
 /// <summary>
 /// 托盘右键菜单的一项。`id` 是选中时传给回调的编号，
 /// 必须大于 0（0 是“未选择”）；分隔线用 `TrayMenuItem.Separator()`。
-///
-///   List&lt;TrayMenuItem&gt; m = new List&lt;TrayMenuItem&gt;();
-///   m.Add(new TrayMenuItem(1, "显示主窗口"));
-///   m.Add(TrayMenuItem.Separator());
-///   m.Add(new TrayMenuItem(2, "退出"));
-///   TrayIcon.SetMenu(m, Demo.OnTrayMenu);
+
+/// List&lt;TrayMenuItem&gt; m = new List&lt;TrayMenuItem&gt;();
+/// m.Add(new TrayMenuItem(1, "显示主窗口"));
+/// m.Add(TrayMenuItem.Separator());
+/// m.Add(new TrayMenuItem(2, "退出"));
+/// TrayIcon.SetMenu(m, Demo.OnTrayMenu);
 /// </summary>
 class TrayMenuItem {
     /// 选中时传给回调的编号，必须大于 0。
@@ -71,15 +74,15 @@ class TrayMenuItem {
 /// 完全自包含：自行创建隐藏消息窗口和消息
 /// 循环并运行在专用线程上，因此控制台程序和 GUI
 /// 程序都可使用，且不依赖 Gui 框架。
-///
-///   TrayIconCallback cb = Demo.OnTray;      // 静态方法
-///   TrayIcon.Add("myicon.ico", "MyApp", cb);
-///   TrayIcon.ShowBalloon("Done", "Task finished", 1, 3000);
-///   TrayIcon.SetMenu(items, Demo.OnTrayMenu);   // 右键菜单
-///   TrayIcon.Remove();
-///
+
+/// TrayIconCallback cb = Demo.OnTray; // 静态方法
+/// TrayIcon.Add("myicon.ico", "MyApp", cb);
+/// TrayIcon.ShowBalloon("Done", "Task finished", 1, 3000);
+/// TrayIcon.SetMenu(items, Demo.OnTrayMenu); // 右键菜单
+/// TrayIcon.Remove();
+
 /// 每个进程仅一个图标（常见情形）。
-///
+
 /// Windows 走 Shell_NotifyIconW；Linux 走 freedesktop 系统托盘
 /// （XEmbed）协议，图标支持 .ico（未压缩 DIB 或 PNG 子图）与
 /// PNG/BMP/JPEG，气泡通知走 libnotify 的 notify-send，右键菜单
@@ -181,8 +184,13 @@ class TrayIcon {
     #elif LINUX || MACOS
     // Linux/macOS 托盘后端（zan_gui）。回调不能交给原生线程，因此
     // 原生层只排队事件，由下面的 Zan 泵线程取出并调用回调。
+    #if LINUX
+    [DllImport("zan_gui", EntryPoint = "zan_tray_start_pixels")]
+    static extern int NativeStartPixels(nint bitmap, string iconPath, string tooltip);
+    #else
     [DllImport("zan_gui", EntryPoint = "zan_tray_start")]
     static extern int NativeStart(string iconPath, string tooltip);
+    #endif
 
     [DllImport("zan_gui", EntryPoint = "zan_tray_stop")]
     static extern int NativeStop();
@@ -257,7 +265,12 @@ class TrayIcon {
         #elif LINUX || MACOS
         if (TrayIcon.posixLive != 0) { return false; }
         TrayIcon.userCb = cb;
-        if (TrayIcon.NativeStart(iconPath, tooltip) == 0) {
+        #if LINUX
+        int started = TrayIcon.NativeStartPixels(ImageCodec.View(iconPath), iconPath, tooltip);
+        #else
+        int started = TrayIcon.NativeStart(iconPath, tooltip);
+        #endif
+        if (started == 0) {
             TrayIcon.userCb = null;
             return false;
         }
@@ -275,8 +288,8 @@ class TrayIcon {
     static void Remove() {
         #if WINDOWS
         if (TrayIcon.trayHwnd == 0) { return; }
-        TrayIcon.Notify(2 /*NIM_DELETE*/);
-        TrayIcon.WinPostThreadMessageW(TrayIcon.trayThreadId, 0x0012 /*WM_QUIT*/, 0, 0);
+        TrayIcon.Notify(2 /* NIM_DELETE */);
+        TrayIcon.WinPostThreadMessageW(TrayIcon.trayThreadId, 0x0012 /* WM_QUIT */, 0, 0);
         for (int waited = 0; TrayIcon.trayHwnd != 0 && waited < 500; waited = waited + 1) {
             Thread.Sleep(1);
         }
@@ -307,7 +320,7 @@ class TrayIcon {
         if (data == 0) { return false; }
         // 仅 NIF_TIP。
         new Span<int>(data + 20, 1)[0] = 0x0004;
-        int ok = TrayIcon.WinShellNotifyIcon(1 /*NIM_MODIFY*/, data);
+        int ok = TrayIcon.WinShellNotifyIcon(1 /* NIM_MODIFY */, data);
         NativeMemory.Free(data);
         return ok != 0;
         #elif LINUX || MACOS
@@ -330,7 +343,7 @@ class TrayIcon {
         if (data == 0) { return false; }
         // 仅 NIF_INFO。
         new Span<int>(data + 20, 1)[0] = 0x0010;
-        int ok = TrayIcon.WinShellNotifyIcon(1 /*NIM_MODIFY*/, data);
+        int ok = TrayIcon.WinShellNotifyIcon(1 /* NIM_MODIFY */, data);
         NativeMemory.Free(data);
         return ok != 0;
         #elif LINUX
@@ -466,7 +479,7 @@ class TrayIcon {
             TrayMenuItem it = items[i];
             if (it == null) { continue; }
             if (it.separator) {
-                TrayIcon.WinAppendMenuW(menu, 0x0800 /*MF_SEPARATOR*/, 0, 0);
+                TrayIcon.WinAppendMenuW(menu, 0x0800 /* MF_SEPARATOR */, 0, 0);
                 continue;
             }
             int flags = 0;                            // MF_STRING
@@ -494,7 +507,7 @@ class TrayIcon {
                                               px, py, TrayIcon.trayHwnd, 0);
         TrayIcon.WinDestroyMenu(menu);
         // 菜单关闭后需要一条空消息，否则下一次弹出可能不响应。
-        TrayIcon.WinPostMessageW(TrayIcon.trayHwnd, 0 /*WM_NULL*/, 0, 0);
+        TrayIcon.WinPostMessageW(TrayIcon.trayHwnd, 0 /* WM_NULL */, 0, 0);
         if (cmd > 0 && TrayIcon.menuCb != null) { TrayIcon.menuCb(cmd); }
     }
 
@@ -529,7 +542,7 @@ class TrayIcon {
         }
         TrayIcon.trayHwnd = hwnd;
         TrayIcon.LoadIcon();
-        if (!TrayIcon.Notify(0 /*NIM_ADD*/)) {
+        if (!TrayIcon.Notify(0 /* NIM_ADD */)) {
             TrayIcon.WinDestroyWindow(hwnd);
             TrayIcon.trayHwnd = 0;
             TrayIcon.threadFailed = 1;
@@ -549,7 +562,7 @@ class TrayIcon {
         } finally {
             NativeMemory.Free(msg);
         }
-        TrayIcon.Notify(2 /*NIM_DELETE*/);
+        TrayIcon.Notify(2 /* NIM_DELETE */);
         if (TrayIcon.trayIcon != 0) {
             TrayIcon.WinDestroyIcon(TrayIcon.trayIcon);
             TrayIcon.trayIcon = 0;
@@ -592,7 +605,7 @@ class TrayIcon {
         new Span<long>(data + 8, 1)[0] = TrayIcon.trayHwnd;
         new Span<int>(data + 16, 1)[0] = 1;       // uID
         new Span<int>(data + 816, 1)[0] = 3;      // NOTIFYICON_VERSION_4
-        TrayIcon.WinShellNotifyIcon(4 /*NIM_SETVERSION*/, data);
+        TrayIcon.WinShellNotifyIcon(4 /* NIM_SETVERSION */, data);
         NativeMemory.Free(data);
     }
 
@@ -662,7 +675,7 @@ class TrayIcon {
     /// 隐藏宿主窗口的窗口过程 (window proc)。只有托盘回调
     /// 消息和 TaskbarCreated 消息值得关注。
     static nint TrayWndProcImpl(nint hwnd, int msg, nint wp, nint lp) {
-        if (msg == 0x8000 /*WM_APP*/) {
+        if (msg == 0x8000 /* WM_APP */) {
             int l = (int)lp;
             if (TrayIcon.userCb != null) {
                 int action = 0;
@@ -674,13 +687,13 @@ class TrayIcon {
             }
             // 右键抬起 / 菜单键：弹出托盘菜单。用抬起而不是按下，
             // 与系统托盘图标一致。
-            if (l == 0x0205 /*WM_RBUTTONUP*/ || l == 0x007B /*WM_CONTEXTMENU*/) {
+            if (l == 0x0205 /* WM_RBUTTONUP */ || l == 0x007B /* WM_CONTEXTMENU */) {
                 TrayIcon.ShowMenu();
             }
         }
         if (msg == TrayIcon.taskbarCreatedMsg && TrayIcon.trayHwnd != 0) {
             // Explorer 已重启：重新添加图标，使图标得以保留。
-            TrayIcon.Notify(0 /*NIM_ADD*/);
+            TrayIcon.Notify(0 /* NIM_ADD */);
             TrayIcon.SetVersion();
         }
         return TrayIcon.WinDefWindowProcW(hwnd, msg, wp, lp);

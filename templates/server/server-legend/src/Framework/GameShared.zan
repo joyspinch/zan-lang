@@ -8,22 +8,7 @@ using System.Web;
 
 namespace ZanWeb.Game;
 
-/* 跨 worker 共享状态：登录令牌、管理端令牌版本缓存、HTTP 会话发号、
-   在线计数。多 worker（[worker].count>1）时 HTTP 接入层水平扩，游戏世界
-   （会话/tick/战斗/推送连接）固定在 1 号 worker 单写；四张表都是匿名
-   共享内存：master 建好，句柄经 ZAN_SHARE_* 下发，worker 继承映射，
-   机器上其它进程无法触及。
-
-   count==1（单进程）时同样走这组表：建表者即使用者，所有中继路径被
-   WorldHere() 短路为进程内直调，行为与改造前一致。
-
-   控制通道说明：世界类操作（登录会话登记/游戏 op/管理写动作）经世界
-   进程的环回 TCP 控制通道执行（GatewayWorker 同构）：世界进程在
-   127.0.0.1 上从 HTTP 端口+1 起扫描第一个空闲端口监听，实际端口写进
-   sys 表供其它进程发现；请求与应答都是一行紧凑 JSON + '\n'（ToJson
-   不产换行，可安全分帧）。每请求一条短连接、进程间无共享连接状态，
-   一次往返约 0.1-0.3ms（替换原 ops 表 2ms 轮询的 2-6ms）。世界重启
-   换端口后，调用方连接失败即失效端口缓存重新发现。 */
+/* 跨 worker 共享状态：登录令牌、管理端令牌版本缓存、HTTP 会话发号、 在线计数。多 worker（[worker].count>1）时 HTTP 接入层水平扩，游戏世界 （会话/tick/战斗/推送连接）固定在 1 号 worker 单写；四张表都是匿名 共享内存：master 建好，句柄经 ZAN_SHARE_* 下发，worker 继承映射， 机器上其它进程无法触及。 count==1（单进程）时同样走这组表：建表者即使用者，所有中继路径被 WorldHere() 短路为进程内直调，行为与改造前一致。 控制通道说明：世界类操作（登录会话登记/游戏 op/管理写动作）经世界 进程的环回 TCP 控制通道执行（GatewayWorker 同构）：世界进程在 127.0.0.1 上从 HTTP 端口+1 起扫描第一个空闲端口监听，实际端口写进 sys 表供其它进程发现；请求与应答都是一行紧凑 JSON + '\n'（ToJson 不产换行，可安全分帧）。每请求一条短连接、进程间无共享连接状态， 一次往返约 0.1-0.3ms（替换原 ops 表 2ms 轮询的 2-6ms）。世界重启 换端口后，调用方连接失败即失效端口缓存重新发现。 */
 class GameShared {
     /* 句柄在 master 与 worker 之间传递所用的名字（ZAN_SHARE_<name>）。 */
     static const string ShareTokens = "GAME_TOKENS";
@@ -54,9 +39,7 @@ class GameShared {
     /* 管理端令牌版本缓存 TTL（与 AuthUser.VerTtlSec 同源）。 */
     static long AuthTtlMs = 30000;
 
-    /* master/worker 双侧初始化：worker 侧映射 master 下发的四张表，
-     * 缺一即不可用（调用方走进程内回退或明确报错）；master/单进程侧
-     * 创建匿名表并登记句柄。必须在 Worker.RunAll 之前调用。 */
+    /* master/worker 双侧初始化：worker 侧映射 master 下发的四张表， 缺一即不可用（调用方走进程内回退或明确报错）；master/单进程侧 创建匿名表并登记句柄。必须在 Worker.RunAll 之前调用。 */
     static bool Open() {
         GameShared.worldRole = Cfg.Worker.count <= 1
             || ProcessHost.WorkerId() == 1;
@@ -84,12 +67,7 @@ class GameShared {
             return true;
         }
 
-        /* tokens 容量要按「峰值日登录数 × TTL 天数」给足：表满了
-           SetInt 会静默失败，之后签出的 token 全都解析不到（实测
-           8192 容量在数小时压测内就被打穿）。131072 ≈ 1.3 万日登录
-           × 10 天，行宽 ~100B，共享段约 13MB。每账号另有一行账号
-           索引（"a<id>" → cur 列存最新 token，供重登吊销），与
-           token 行同表同 TTL——容量账含它，无需另开。 */
+        /* tokens 容量要按「峰值日登录数 × TTL 天数」给足：表满了 SetInt 会静默失败，之后签出的 token 全都解析不到（实测 8192 容量在数小时压测内就被打穿）。131072 ≈ 1.3 万日登录 × 10 天，行宽 ~100B，共享段约 13MB。每账号另有一行账号 索引（"a<id>" → cur 列存最新 token，供重登吊销），与 token 行同表同 TTL——容量账含它，无需另开。 */
         SharedTable nt = new SharedTable("", 131072);
         nt.KeySize(40);
         nt.ColumnInt("acc");
@@ -109,7 +87,7 @@ class GameShared {
         if (!ns.CreateAnonymous()) { return false; }
         ns.Label("game sys");
         /* 发号段种子：worker 侧只 Increment，不重置。控制通道端口由
-           世界进程启动后写进 "rpc" 行。 */
+ 世界进程启动后写进 "rpc" 行。 */
         bool _c = ns.SetInt("cid", "v", GameShared.HttpCidBase);
 
         SharedTable no = new SharedTable("", 256);
@@ -134,23 +112,15 @@ class GameShared {
         return GameShared.opened;
     }
 
-    /* 本进程是否直接持有游戏世界：单进程恒真；多 worker 时只在 1 号
-     * worker。世界类操作（世界 op/管理页写动作/登录会话登记）非本角色
-     * 时必须走 WorldCall 中继。 */
+    /* 本进程是否直接持有游戏世界：单进程恒真；多 worker 时只在 1 号 worker。世界类操作（世界 op/管理页写动作/登录会话登记）非本角色 时必须走 WorldCall 中继。 */
     static bool WorldHere() {
         return GameShared.opened && GameShared.worldRole;
     }
 
-    /* ---- 登录令牌（TokenBox 的存储层）----
-
-       两行一账：token 行（键=token，acc 列=账号 id）供 token→账号
-       反查；账号索引行（键="a<accountId>"，cur 列=最新 token）供
-       「重登吊销旧 token」——Resolve 时 token 行查到的账号，其索引
-       行不是本 token 即视为已作废。索引行与 token 行同 TTL，账号
-       停止登录后一并过期回收。 */
+    /* ---- 登录令牌（TokenBox 的存储层）---- 两行一账：token 行（键=token，acc 列=账号 id）供 token→账号 反查；账号索引行（键="a<accountId>"，cur 列=最新 token）供 「重登吊销旧 token」——Resolve 时 token 行查到的账号，其索引 行不是本 token 即视为已作废。索引行与 token 行同 TTL，账号 停止登录后一并过期回收。 */
 
     /* 写入失败（表满/共享内存不可用）返回 false：调用方必须让登录
-       响亮失败，绝不能把一个解析不到的 token 发给客户端。 */
+ 响亮失败，绝不能把一个解析不到的 token 发给客户端。 */
     static bool TokenPut(string token, int accountId) {
         if (!GameShared.Ready()) { return false; }
         if (!GameShared.tokens.SetInt(token, "acc", accountId)) { return false; }
@@ -218,11 +188,7 @@ class GameShared {
         return (int)GameShared.sys.Increment("cid", "v", 1);
     }
 
-    /* ---- 在线计数（世界进程维护，各进程可读）----
-     *
-     * 行布局：total=在世界中的会话数；r<realmId>=各区在线；p<playerId>=1
-     * 表示角色在线。写侧只在进区/退区/离开三个语义点增减，读侧供
-     * 心跳、区服列表、管理页展示，不再遍历会话。 */
+    /* ---- 在线计数（世界进程维护，各进程可读）---- 行布局：total=在世界中的会话数；r<realmId>=各区在线；p<playerId>=1 表示角色在线。写侧只在进区/退区/离开三个语义点增减，读侧供 心跳、区服列表、管理页展示，不再遍历会话。 */
 
     static void OnlineEnter(int realmId, int playerId) {
         if (!GameShared.Ready()) { return; }
@@ -260,13 +226,7 @@ class GameShared {
         return GameShared.online.Exists("p" + Convert.ToString(playerId));
     }
 
-    /* ---- 跨进程控制通道（环回 TCP）----
-     *
-     * 调用方：发现端口 → 连接 → 发一行请求 JSON → 收一行应答 → 断开；
-     * 世界进程：RpcLoop 接受连接，ServeConn 逐行 Dispatch 后原连接写回。
-     * 请求体里带 rpc 标记区分三类：login=登记登录会话（世界进程做顶号
-     * +入表），game=完整游戏 op（token 已由调用方认领并限流），gm=管理
-     * 页写动作。协议字段（rpc/acc）只在请求 JSON 一处。 */
+    /* ---- 跨进程控制通道（环回 TCP）---- 调用方：发现端口 → 连接 → 发一行请求 JSON → 收一行应答 → 断开； 世界进程：RpcLoop 接受连接，ServeConn 逐行 Dispatch 后原连接写回。 请求体里带 rpc 标记区分三类：login=登记登录会话（世界进程做顶号 +入表），game=完整游戏 op（token 已由调用方认领并限流），gm=管理 页写动作。协议字段（rpc/acc）只在请求 JSON 一处。 */
 
     static JsonValue RpcFail(string why) {
         JsonValue r = JsonValue.NewObject();
@@ -293,9 +253,7 @@ class GameShared {
         return GameShared.RpcFail("世界进程应答异常");
     }
 
-    /* 一次完整的请求-应答。每请求一条短连接：进程间零共享连接状态，
-       坏连接/半开连接的影响面只有当次调用。两轮尝试覆盖世界重启换
-       端口——首轮失败失效端口缓存，重发现后再试一次。 */
+    /* 一次完整的请求-应答。每请求一条短连接：进程间零共享连接状态， 坏连接/半开连接的影响面只有当次调用。两轮尝试覆盖世界重启换 端口——首轮失败失效端口缓存，重发现后再试一次。 */
     static async string RoundTrip(string req) {
         for (int attempt = 0; attempt < 2; attempt = attempt + 1) {
             int port = await GameShared.DiscoverRpcPort();
@@ -341,7 +299,7 @@ class GameShared {
     }
 
     /* 端口发现：世界进程启动后写 sys 表 "rpc" 行；未写时最多等 2s
-       （世界可能还在迁移 schema）。缓存命中不再读表。 */
+ （世界可能还在迁移 schema）。缓存命中不再读表。 */
     static async int DiscoverRpcPort() {
         if (GameShared.rpcPort > 0) { return GameShared.rpcPort; }
         for (int i = 0; i < 100; i = i + 1) {
@@ -382,9 +340,7 @@ class GameShared {
         return r.Int("cid", 0);
     }
 
-    /* 世界进程侧：监听并派发。从 HTTP 端口+1 扫第一个空闲端口（实际
-       用哪个写进 sys 表，调用方不关心），每连接一个协程逐行执行。
-       count==1 时全部中继路径都是进程内直调，不监听。 */
+    /* 世界进程侧：监听并派发。从 HTTP 端口+1 扫第一个空闲端口（实际 用哪个写进 sys 表，调用方不关心），每连接一个协程逐行执行。 count==1 时全部中继路径都是进程内直调，不监听。 */
     static async void RpcLoop() {
         if (Cfg.Worker.count <= 1) { return; }
         int want = Cfg.Server.port + 1;
@@ -410,9 +366,7 @@ class GameShared {
         }
     }
 
-    /* 单连接读循环：攒缓冲、切行、按序执行（同一连接严格 FIFO）。
-       空闲 8s 或对端关闭即断——配合调用方的每请求短连接，不会有
-       长期挂着的半开连接。 */
+    /* 单连接读循环：攒缓冲、切行、按序执行（同一连接严格 FIFO）。 空闲 8s 或对端关闭即断——配合调用方的每请求短连接，不会有 长期挂着的半开连接。 */
     static async void ServeConn(nint sock) {
         string buf = "";
         bool alive = true;
@@ -443,7 +397,7 @@ class GameShared {
     }
 
     /* 执行一行请求并把应答写回同一连接。返回 false=写失败或部分写
-       （帧被截断，连接不可再用于下一行），读循环应当断开。 */
+ （帧被截断，连接不可再用于下一行），读循环应当断开。 */
     static async bool ServeLine(nint sock, string line) {
         long t0 = Stopwatch.GetMicroseconds();
         JsonValue m = null;
@@ -516,7 +470,7 @@ class GameShared {
         }
         if (act == "saveOnline") {
             /* 页面传来的是绝对目标值：差量在世界侧对着实时内存值算，
-               避免页面读到过期的库值把发奖算偏。 */
+ 避免页面读到过期的库值把发奖算偏。 */
             bool saved = await GameShared.SaveOnlinePlayer(
                 m.Int("playerId", 0), m.Int("level", 0), m.Int("job", 0),
                 m.Int("mapId", 0), m.Str("nickname", ""),
@@ -562,10 +516,7 @@ class GameShared {
         return r;
     }
 
-    /* ---- 管理页帮手（页面所在进程侧）----
-     *
-     * 世界角色进程内直调（含 count==1 的单进程），否则经 ops 表中继。
-     * 中继失败返回 null/false，页面按"目标不在线/空列表"降级。 */
+    /* ---- 管理页帮手（页面所在进程侧）---- 世界角色进程内直调（含 count==1 的单进程），否则经 ops 表中继。 中继失败返回 null/false，页面按"目标不在线/空列表"降级。 */
 
     /* 在线会话清单；行字段见 World.SessionsJson。 */
     static async JsonValue Sessions() {

@@ -1578,6 +1578,12 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   Gui 车道在途改动；`conformance_http_client_keepalive` 则是全量并行 120s 超时、
   单跑 0.5s 过，属端口竞争）。并行档的超时值一律先单跑复核。
 
+## 协程挂起点与完成尾部单例指令收敛（2026-10-09，B-ID119 优化收敛）
+
+- **挂起点内联 bitcast/GEP 冗余消除**：在 `Gate.Park` 与 `Socket.ReadReady`/`Socket.WriteReady` 等内建挂起点中，原先每次就地发射 `LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self")` 与 `LLVMBuildStructGEP2(..., ASYNC_FRAME_STATE, "self.state")`。通过统一收敛至 `get_async_self_i8(g)` 与 `get_async_state_ptr(g)`，消除了重复的指针类型转换与结构体偏移计算。
+- **协程完成尾部指令复用（`emit_async_complete_epilogue`）**：在协程正常完成与取消完成汇聚的 `co.complete` 尾部基本块中，原先再次对 frame 发射独立的 `fr.i8` bitcast、`fr.result` GEP、`fr.state` GEP 以及 `fr.jc` bitcast。重构为复用 entry 前导块单例缓存 `get_async_self_i8(g)`、`get_async_result_ptr(g)` 与 `get_async_state_ptr(g)`，使整个协程方法生命周期内的帧基础指针与状态/结果指针实现 $O(1)$ 指令发射共享，进一步压缩 IR 指令数量与基本块拓扑。
+- **回归锁定**：`ctest -R "conformance_async_ir_scaling|conformance_async_asocket_echo"` 及全套 70 项 async conformance 测试 100% 全部通过。
+
 - **两档 ctest 绝不能同时跑：它们共享同一批 `build/conf_*.exe`**（smoke 与 standard
   的 label 大量重叠，`add_test` 的 `-DOUT_EXE` 是同一个路径）。本轮：我这轮
   `-L standard -j 4` 起来后，另一会话的 `-L smoke -j 32` 也在跑，两条进程同时往同一个

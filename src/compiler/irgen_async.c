@@ -449,10 +449,10 @@ static void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) 
     /* the frame is done: any pending Task.Delay entry naming it must not
      * fire again (a frame that completes inside the delay window without
      * another await would leave a stale entry that wakes freed memory) */
-    emit_co_cancel_delay(g, LLVMBuildBitCast(g->builder, frame, i8ptr, "fr.i8"));
+    LLVMValueRef self_i8 = get_async_self_i8(g);
+    emit_co_cancel_delay(g, self_i8);
 
-    LLVMValueRef res_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
-        ASYNC_FRAME_RESULT, "fr.result");
+    LLVMValueRef res_ptr = get_async_result_ptr(g);
     LLVMBuildStore(g->builder, result_i64 ? result_i64 : LLVMConstInt(i64, 0, 0),
         res_ptr);
 
@@ -467,8 +467,7 @@ static void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) 
      * plain DONE probe. */
     LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpXchg, done_ptr,
         LLVMConstInt(i32, 1, 0), LLVMAtomicOrderingRelease, 0);
-    LLVMBuildStore(g->builder, LLVMConstInt(i32, -1, 1),
-        LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_STATE, "fr.state"));
+    LLVMBuildStore(g->builder, LLVMConstInt(i32, -1, 1), get_async_state_ptr(g));
     /* a `return` inside a try leaves that try's armed-handler count behind;
      * a completed frame has no live handlers, so reset it for the unwinder */
     LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0),
@@ -485,7 +484,7 @@ static void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) 
             (LLVMTypeRef[]){ i8ptr }, 1, 0);
         LLVMValueRef jc = LLVMGetNamedFunction(g->mod, "zan_join_complete");
         if (!jc) jc = LLVMAddFunction(g->mod, "zan_join_complete", jc_type);
-        LLVMValueRef jc_args[] = { LLVMBuildBitCast(g->builder, frame, i8ptr, "fr.jc") };
+        LLVMValueRef jc_args[] = { self_i8 };
         zan_call2(g->builder, jc_type, jc, jc_args, 1, "");
     }
 
