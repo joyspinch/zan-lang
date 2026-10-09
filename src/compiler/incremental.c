@@ -1,4 +1,4 @@
-/* incremental.c -- Incremental compilation and parallel build support. */
+/* incremental.c: 增量编译与并行构建缓存管理 */
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0601 /* Windows 7+: SRW locks */
@@ -239,9 +239,7 @@ bool zan_incr_save(zan_incr_cache_t *cache) {
     snprintf(manifest, sizeof(manifest), "%s" PATH_SEP "manifest.bin", cache->cache_dir);
     snprintf(manifest_tmp, sizeof(manifest_tmp), "%s.tmp", manifest);
 
-    /* Write to a temporary file and move it into place: a crash or full disk
-     * mid-save must never leave a truncated manifest.bin that a later load
-     * would have to treat as corrupt input. */
+    /* 写入临时清单文件后原子替换，防止异常中断导致损坏 */
     FILE *f = fopen(manifest_tmp, "wb");
     if (!f) return false;
 
@@ -275,8 +273,7 @@ bool zan_incr_save(zan_incr_cache_t *cache) {
         }
     }
 
-    /* A short write (e.g. a full disk) leaves a truncated temporary that is
-     * simply abandoned; only a fully written file replaces the manifest. */
+    /* 写入不完整时放弃临时文件，仅在完整写入后替换正式清单 */
     bool ok = (ferror(f) == 0);
     if (fclose(f) != 0) ok = false;
     if (!ok) { remove(manifest_tmp); return false; }
@@ -309,8 +306,7 @@ bool zan_incr_needs_rebuild(zan_incr_cache_t *cache, const char *source_path) {
     zan_compile_unit_t *unit = find_unit(cache, source_path);
     if (!unit) { zan_incr_unlock(cache); return true; }
 
-    /* Copy the object path while holding the lock: another worker may
-     * reallocate the units array (register) and invalidate the pointer. */
+    /* 持锁拷贝目标文件路径，避免其他工作线程重新分配数组导致野指针 */
     char object_path[1024];
     snprintf(object_path, sizeof(object_path), "%s", unit->object_path);
     zan_incr_unlock(cache);
