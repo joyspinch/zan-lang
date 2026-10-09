@@ -4,202 +4,200 @@ using System.Runtime.Intrinsics;
 
 namespace System;
 
-/// <summary>
-/// 二进制 IO 用的堆外原始内存（ByteBuffer、数据库页、网络
-/// 组帧）。地址是普通 nint，不进入 ARC 对象
-/// 机制，因此热路径的字节级循环开销与等效的 C 代码相同。
-/// 这里每个方法都是编译器内建函数：这些声明是为了
-/// 让检查器能对调用做类型检查（ARC 也能跟踪 GetString 返回的字符串），
-/// 但 irgen 将每个调用降低为单个 libc 调用——所命名的
-/// 库实际上从未被调用或链接。
-/// 标量访问是 <c>Span&lt;T&gt;</c> 的职责：<c>new Span&lt;int&gt;(p, n)</c>
-/// 将原始地址视图化，并以小端、无对齐要求的
-/// 类型化读写进行索引。
-/// 安全约定：地址必须来自 <see cref="Alloc"/>（或
-/// ByteBuffer.Raw() 之类的固定缓冲区），并且不能在
-/// <see cref="Free"/> 之后继续使用。偏移/长度不做边界检查——由调用方
-/// 负责边界，与任何 FFI 缓冲区一样。
-/// </summary>
+// 二进制 IO 用的堆外原始内存（ByteBuffer、数据库页、网络
+// 组帧）。地址是普通 nint，不进入 ARC 对象
+// 机制，因此热路径的字节级循环开销与等效的 C 代码相同。
+// 这里每个方法都是编译器内建函数：这些声明是为了
+// 让检查器能对调用做类型检查（ARC 也能跟踪 GetString 返回的字符串），
+// 但 irgen 将每个调用降低为单个 libc 调用——所命名的
+// 库实际上从未被调用或链接。
+// 标量访问是 <c>Span&lt;T&gt;</c> 的职责：<c>new Span&lt;int&gt;(p, n)</c>
+// 将原始地址视图化，并以小端、无对齐要求的
+// 类型化读写进行索引。
+// 安全约定：地址必须来自 <see cref="Alloc"/>（或
+// ByteBuffer.Raw() 之类的固定缓冲区），并且不能在
+// <see cref="Free"/> 之后继续使用。偏移/长度不做边界检查——由调用方
+// 负责边界，与任何 FFI 缓冲区一样。
 class NativeMemory {
-    /// 分配 `size` 字节并清零；返回其地址。
+    // 分配 `size` 字节并清零；返回其地址。
     [DllImport("crt")]
     static extern nint Alloc(int size);
 
-    /// 释放从 Alloc 获得的地址。释放 0 为无操作。
+    // 释放从 Alloc 获得的地址。释放 0 为无操作。
     [DllImport("crt")]
     static extern void Free(nint p);
 
-    /// 将 n 字节从 src 复制到 dst（允许重叠，memmove 语义）。
+    // 将 n 字节从 src 复制到 dst（允许重叠，memmove 语义）。
     [DllImport("crt")]
     static extern void Copy(nint dst, nint src, int n);
 
-    /// 2D 跨步内存复制：将 src（跨步 srcStride）的 height 行、每行 rowBytes 字节
-    /// 复制到 dst（跨步 dstStride）。支持非连续切片与矩形图像裁剪/贴图。
+    // 2D 跨步内存复制：将 src（跨步 srcStride）的 height 行、每行 rowBytes 字节
+    // 复制到 dst（跨步 dstStride）。支持非连续切片与矩形图像裁剪/贴图。
     [DllImport("crt")]
     static extern void Copy2D(nint dst, int dstStride, nint src, int srcStride, int rowBytes, int height);
 
-    /// 用 v 的低 8 位填充 p 处的 n 字节。
+    // 用 v 的低 8 位填充 p 处的 n 字节。
     [DllImport("crt")]
     static extern void Fill(nint p, int v, int n);
 
-    /// memcmp：a 与 b 前 n 字节的比较序 <0 / 0 / >0。
+    // memcmp：a 与 b 前 n 字节的比较序 <0 / 0 / >0。
     [DllImport("crt")]
     static extern int Compare(nint a, nint b, int n);
 
-    /// memchr：在 p+off 起的 n 字节内查找字节 b（取低 8 位），
-    /// 命中返回相对 p 的偏移，未命中返回 -1。
+    // memchr：在 p+off 起的 n 字节内查找字节 b（取低 8 位），
+    // 命中返回相对 p 的偏移，未命中返回 -1。
     [DllImport("crt")]
     static extern int Find(nint p, int off, int b, int n);
 
-    /// 将 p+off 处的 len 字节复制为新的 ARC 托管字符串。
+    // 将 p+off 处的 len 字节复制为新的 ARC 托管字符串。
     [DllImport("crt")]
     static extern string GetString(nint p, int off, int len);
 
-    /// 将 s 的前 len 字节复制到 p+off（不写 NUL 终止符）。
+    // 将 s 的前 len 字节复制到 p+off（不写 NUL 终止符）。
     [DllImport("crt")]
     static extern void PutString(nint p, int off, string s, int len);
 
-    /// double 的 IEEE-754 位型读作 i64（编译器内建 bitcast，零开销）。
-    /// NaN 归一为安静位型 0x7FF8000000000000；-0.0 保持 0x8000000000000000。
+    // double 的 IEEE-754 位型读作 i64（编译器内建 bitcast，零开销）。
+    // NaN 归一为安静位型 0x7FF8000000000000；-0.0 保持 0x8000000000000000。
     [DllImport("crt")]
     static extern long AsI64(double value);
 
-    /// i64 位型写回 double（AsI64 的逆；次正规/±∞ 原位保留）。
+    // i64 位型写回 double（AsI64 的逆；次正规/±∞ 原位保留）。
     [DllImport("crt")]
     static extern double AsF64(long bits);
 
-    /// p 处 len 字节的 CRC-32（IEEE，poly 0xEDB88320）。
+    // p 处 len 字节的 CRC-32（IEEE，poly 0xEDB88320）。
     [DllImport("crt")]
     static extern int Crc32(nint p, int len);
 
-    /// p 处 len 字节的 CRC-32C（Castagnoli，poly 0x82F63B78）。
-    /// 常用于现代数据库存储页（ZanDB、RocksDB）与网络协议的完整性校验。
+    // p 处 len 字节的 CRC-32C（Castagnoli，poly 0x82F63B78）。
+    // 常用于现代数据库存储页（ZanDB、RocksDB）与网络协议的完整性校验。
     [DllImport("crt")]
     static extern int Crc32C(nint p, int len);
 
-    /// CRC-32C 续算：把 p 处 len 字节追加到 crc（SSE4.2 crc32/ARMv8 CRC
-    /// 指令流水线）。返回更新后的 CRC；无硬件路径返回 -1（正常 CRC 值
-    /// 恒为非负 32 位数，-1 不会歧义）。
+    // CRC-32C 续算：把 p 处 len 字节追加到 crc（SSE4.2 crc32/ARMv8 CRC
+    // 指令流水线）。返回更新后的 CRC；无硬件路径返回 -1（正常 CRC 值
+    // 恒为非负 32 位数，-1 不会歧义）。
     [DllImport("crt")]
     static extern long Crc32CUpdate(long crc, nint p, long len);
 
-    /// 对 p 处 len 字节计算 FIPS 180-4 SHA-256，返回 32 字节原始
-    /// 摘要的新 ARC 字符串（调用方持有 +1）。返回值是真托管串，
-    /// 消费点照常释放；不是 extern 借用指针。本机无硬件路径时
-    /// 返回 null，调用方应回退到纯 Zan 实现。
+    // 对 p 处 len 字节计算 FIPS 180-4 SHA-256，返回 32 字节原始
+    // 摘要的新 ARC 字符串（调用方持有 +1）。返回值是真托管串，
+    // 消费点照常释放；不是 extern 借用指针。本机无硬件路径时
+    // 返回 null，调用方应回退到纯 Zan 实现。
     [DllImport("crt")]
     static extern string Sha256(nint p, int len);
 
-    /// 对 p 处 len 字节计算 FIPS 180-4 SHA-1，返回 20 字节原始摘要的
-    /// 新 ARC 字符串（调用方持有 +1）；无硬件路径返回 null。
+    // 对 p 处 len 字节计算 FIPS 180-4 SHA-1，返回 20 字节原始摘要的
+    // 新 ARC 字符串（调用方持有 +1）；无硬件路径返回 null。
     [DllImport("crt")]
     static extern string Sha1(nint p, int len);
 
-    /// 对 p 处 len 字节计算 FIPS 180-4 SHA-512，返回 64 字节原始摘要的
-    /// 新 ARC 字符串（调用方持有 +1）；无硬件路径返回 null。
+    // 对 p 处 len 字节计算 FIPS 180-4 SHA-512，返回 64 字节原始摘要的
+    // 新 ARC 字符串（调用方持有 +1）；无硬件路径返回 null。
     [DllImport("crt")]
     static extern string Sha512(nint p, int len);
 
-    /// 硬件加速 AES-CBC 加密（AES-NI/ARMv8 单周期吞吐），keybits 为
-    /// 128/192/256，含 PKCS#7 填充，返回密文长度；无硬件路径返回 -1。
+    // 硬件加速 AES-CBC 加密（AES-NI/ARMv8 单周期吞吐），keybits 为
+    // 128/192/256，含 PKCS#7 填充，返回密文长度；无硬件路径返回 -1。
     [DllImport("crt")]
     static extern long AesCbcEncrypt(nint dst, nint src, long size, nint key, int keybits, nint iv);
 
-    /// 硬件加速 AES-CBC 解密（AES-NI 并行解码），返回明文长度；无硬件路径返回 -1。
+    // 硬件加速 AES-CBC 解密（AES-NI 并行解码），返回明文长度；无硬件路径返回 -1。
     [DllImport("crt")]
     static extern long AesCbcDecrypt(nint dst, nint src, long size, nint key, int keybits, nint iv);
 
-    /// 单块 AES-ECB（FIPS-197）：把 in16 的 16 字节加密写入 out16。
-    /// 成功返回 0，无硬件路径返回 -1。
+    // 单块 AES-ECB（FIPS-197）：把 in16 的 16 字节加密写入 out16。
+    // 成功返回 0，无硬件路径返回 -1。
     [DllImport("crt")]
     static extern long AesEcbBlock(nint key, int keybits, nint in16, nint out16);
 
-    /// AES-CTR keystream 异或（SP 800-38A）：counter 为 128 位大端计数器，
-    /// 原地前进越过已消耗的块。成功返回 size，无硬件路径返回 -1。
+    // AES-CTR keystream 异或（SP 800-38A）：counter 为 128 位大端计数器，
+    // 原地前进越过已消耗的块。成功返回 size，无硬件路径返回 -1。
     [DllImport("crt")]
     static extern long AesCtrCrypt(nint dst, nint src, long size, nint key, int keybits, nint counter);
 
-    /// GHASH 一步（GCM，SP 800-38D）：y = (y ^ x) * h，三者均为 16 字节块。
-    /// 成功返回 0，无硬件路径返回 -1。
+    // GHASH 一步（GCM，SP 800-38D）：y = (y ^ x) * h，三者均为 16 字节块。
+    // 成功返回 0，无硬件路径返回 -1。
     [DllImport("crt")]
     static extern long GhashBlock(nint h, nint x, nint y);
 
-    /// GHASH 连续流式哈希（GCM，SP 800-38D）：逐块处理 data 的 len 字节并累加到 y16。
-    /// 成功返回 0，无硬件路径返回 -1。
+    // GHASH 连续流式哈希（GCM，SP 800-38D）：逐块处理 data 的 len 字节并累加到 y16。
+    // 成功返回 0，无硬件路径返回 -1。
     [DllImport("crt")]
     static extern long GhashUpdate(nint h, nint data, long len, nint y);
 
-    /// 硬件加速一体化 AES-GCM 认证加密（SP 800-38D）。
-    /// 支持 原地/独立 缓冲区加密，无跨层 FFI 开销与零堆内存分配。
-    /// 成功返回密文长度（等于 inLen），无硬件路径或失败返回 -1。
+    // 硬件加速一体化 AES-GCM 认证加密（SP 800-38D）。
+    // 支持 原地/独立 缓冲区加密，无跨层 FFI 开销与零堆内存分配。
+    // 成功返回密文长度（等于 inLen），无硬件路径或失败返回 -1。
     [DllImport("crt")]
     static extern long AesGcmEncrypt(nint key, int keybits, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint outBuf, nint tag16);
 
-    /// 硬件加速一体化 AES-GCM 认证解密（SP 800-38D）。
-    /// 成功返回明文长度（等于 inLen），MAC 认证失败或无硬件路径返回 -1。
+    // 硬件加速一体化 AES-GCM 认证解密（SP 800-38D）。
+    // 成功返回明文长度（等于 inLen），MAC 认证失败或无硬件路径返回 -1。
     [DllImport("crt")]
     static extern long AesGcmDecrypt(nint key, int keybits, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint tag16, nint outBuf);
 
-    /// 初始化 AES-GCM 预计算上下文（预展开密钥编排并预计算 GHASH H 与反射常量）。
-    /// ctxBuf 建议至少 384 字节，成功返回 0，失败返回 -1。
+    // 初始化 AES-GCM 预计算上下文（预展开密钥编排并预计算 GHASH H 与反射常量）。
+    // ctxBuf 建议至少 384 字节，成功返回 0，失败返回 -1。
     [DllImport("crt")]
     static extern long AesGcmInit(nint ctxBuf, long ctxLen, nint key, int keybits);
 
-    /// 基于预计算上下文的高吞吐 AES-GCM 认证加密，消除每记录重复密钥展开开销。
+    // 基于预计算上下文的高吞吐 AES-GCM 认证加密，消除每记录重复密钥展开开销。
     [DllImport("crt")]
     static extern long AesGcmEncryptCtx(nint ctxBuf, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint outBuf, nint tag16);
 
-    /// 基于预计算上下文的高吞吐 AES-GCM 认证解密，消除每记录重复密钥展开开销。
+    // 基于预计算上下文的高吞吐 AES-GCM 认证解密，消除每记录重复密钥展开开销。
     [DllImport("crt")]
     static extern long AesGcmDecryptCtx(nint ctxBuf, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint tag16, nint outBuf);
 
-    /// Montgomery 模幂加速 baseVal^exp mod mod（最大 4096 位奇模数）。大端序字节缓冲区。
-    /// 成功返回 0，无硬件路径或参数不合法返回 -1。
+    // Montgomery 模幂加速 baseVal^exp mod mod（最大 4096 位奇模数）。大端序字节缓冲区。
+    // 成功返回 0，无硬件路径或参数不合法返回 -1。
     [DllImport("crt")]
     static extern long RsaModPow(nint baseVal, long bLen, nint exp, long eLen, nint mod, long mLen, nint outBuf);
 
-    /// RSA 中国剩余定理 (CRT) 加速模幂：
-    /// s1 = msg^dp mod p, s2 = msg^dq mod q, 通过 Garner 算法重构 s = s2 + ((s1 - s2) * qinv mod p) * q。
-    /// 成功返回 0，失败返回 -1。
+    // RSA 中国剩余定理 (CRT) 加速模幂：
+    // s1 = msg^dp mod p, s2 = msg^dq mod q, 通过 Garner 算法重构 s = s2 + ((s1 - s2) * qinv mod p) * q。
+    // 成功返回 0，失败返回 -1。
     [DllImport("crt")]
     static extern long RsaCrtModPow(nint msg, long mLen, nint p, long pLen, nint q, long qLen, nint dp, long dpLen, nint dq, long dqLen, nint qinv, long qinvLen, nint outBuf, long outLen);
 
-    /// RFC 7748 X25519 常数时间密钥交换：计算 scalar * point 写入 outBuf。
-    /// scalar、point、outBuf 均为 32 字节小端序缓冲区，原地夹紧标量。成功返回 0，失败返回 -1。
+    // RFC 7748 X25519 常数时间密钥交换：计算 scalar * point 写入 outBuf。
+    // scalar、point、outBuf 均为 32 字节小端序缓冲区，原地夹紧标量。成功返回 0，失败返回 -1。
     [DllImport("crt")]
     static extern long X25519(nint scalar, nint point, nint outBuf);
 
-    /// 高性能流水线国密 SM3 摘要计算（GM/T 0004-2012），返回 32 字节原始
-    /// 摘要的新 ARC 字符串（调用方持有 +1）；无硬件路径返回 null。
+    // 高性能流水线国密 SM3 摘要计算（GM/T 0004-2012），返回 32 字节原始
+    // 摘要的新 ARC 字符串（调用方持有 +1）；无硬件路径返回 null。
     [DllImport("crt")]
     static extern string Sm3(nint p, int len);
 
-    /// 硬件查表流水线 SM4-CBC 加密（GB/T 32907-2016，含 PKCS#7 填充）。
+    // 硬件查表流水线 SM4-CBC 加密（GB/T 32907-2016，含 PKCS#7 填充）。
     [DllImport("crt")]
     static extern long Sm4CbcEncrypt(nint dst, nint src, long size, nint key, nint iv);
 
-    /// 硬件查表流水线 SM4-CBC 解密（GB/T 32907-2016，含 PKCS#7 校验去除）。
+    // 硬件查表流水线 SM4-CBC 解密（GB/T 32907-2016，含 PKCS#7 校验去除）。
     [DllImport("crt")]
     static extern long Sm4CbcDecrypt(nint dst, nint src, long size, nint key, nint iv);
 
-    /// 高吞吐 SIMD / 流水线 Base64 编码，返回新分配的 ARC 字符串。
+    // 高吞吐 SIMD / 流水线 Base64 编码，返回新分配的 ARC 字符串。
     [DllImport("crt")]
     static extern string Base64Encode(nint ptr, long size);
 
-    /// 高吞吐 SIMD / 流水线 Base64 解码，将解码字节写入 dst，返回实际解码字节数（失败返回负值）。
+    // 高吞吐 SIMD / 流水线 Base64 解码，将解码字节写入 dst，返回实际解码字节数（失败返回负值）。
     [DllImport("crt")]
     static extern long Base64Decode(nint dst, nint src, long size);
 
-    /// SIMD 向量化 JSON 空白跳过：并行比对空格、换行、回车、制表符，返回首个非空白字符偏移。
+    // SIMD 向量化 JSON 空白跳过：并行比对空格、换行、回车、制表符，返回首个非空白字符偏移。
     [DllImport("crt")]
     static extern long JsonSkipWhitespace(nint ptr, long pos, long len);
 
-    /// SIMD 向量化 JSON 字符串扫描：并行查找闭引号 '\"' 或转义符 '\\'。
-    /// 命中闭引号返回其正偏移量 (>= 0)；命中反斜杠转义符返回 -(esc_pos + 1)；未命中到达末尾返回 len。
+    // SIMD 向量化 JSON 字符串扫描：并行查找闭引号 '\"' 或转义符 '\\'。
+    // 命中闭引号返回其正偏移量 (>= 0)；命中反斜杠转义符返回 -(esc_pos + 1)；未命中到达末尾返回 len。
     [DllImport("crt")]
     static extern long JsonScanString(nint ptr, long pos, long len);
 
-    /// <summary>利用 AVX2/SSE2 硬件向量化单指令周期，比较两块连续原始内存的内容是否完全一致。</summary>
+    // 利用 AVX2/SSE2 硬件向量化单指令周期，比较两块连续原始内存的内容是否完全一致。
     public static bool SequenceEqual(nint a, nint b, int len) {
         if (a == b) return true;
         if (a == 0 || b == 0) return false;
@@ -229,7 +227,7 @@ class NativeMemory {
         return true;
     }
 
-    /// <summary>利用 AVX2 + BMI1 TrailingZeroCount 硬件加速单指令定位，在连续原始内存中查找字节 target 的偏移量。</summary>
+    // 利用 AVX2 + BMI1 TrailingZeroCount 硬件加速单指令定位，在连续原始内存中查找字节 target 的偏移量。
     public static int IndexOf(nint p, int len, byte target) {
         if (p == 0 || len <= 0) return -1;
         int i = 0;
@@ -261,7 +259,7 @@ class NativeMemory {
         return -1;
     }
 
-    /// <summary>利用 AVX2/SSE2 硬件向量化扫描，快速检测连续原始内存是否全为 ASCII 字符（0..127）。</summary>
+    // 利用 AVX2/SSE2 硬件向量化扫描，快速检测连续原始内存是否全为 ASCII 字符（0..127）。
     public static bool IsAscii(nint p, int len) {
         if (p == 0 || len <= 0) return true;
         int i = 0;
@@ -285,7 +283,7 @@ class NativeMemory {
         return true;
     }
 
-    /// <summary>利用 AVX2/SSE2 硬件向量化并发匹配两个目标字节中的任意一个（例如快速扫描 \r 或 \n，引号或反斜杠）。</summary>
+    // 利用 AVX2/SSE2 硬件向量化并发匹配两个目标字节中的任意一个（例如快速扫描 \r 或 \n，引号或反斜杠）。
     public static int IndexOfAny(nint p, int len, byte val1, byte val2) {
         if (p == 0 || len <= 0) return -1;
         int i = 0;
@@ -324,7 +322,7 @@ class NativeMemory {
         return -1;
     }
 
-    /// <summary>SwissTable 16 字节控制组并发探测：单周期匹配 16 个槽位的 H2 标签，返回 16 位匹配掩码。</summary>
+    // SwissTable 16 字节控制组并发探测：单周期匹配 16 个槽位的 H2 标签，返回 16 位匹配掩码。
     public static int MatchGroup16(nint groupPtr, byte targetH2) {
         if (groupPtr == 0) return 0;
         Vector128 g = Vector128.Load(groupPtr);
@@ -333,7 +331,7 @@ class NativeMemory {
         return Vector128.ExtractMostSignificantBits(eq);
     }
 
-    /// <summary>SwissTable 16 字节控制组空槽探测：提取最高位为 1（0x80 Empty / 0xFE Deleted）的所有槽位掩码。</summary>
+    // SwissTable 16 字节控制组空槽探测：提取最高位为 1（0x80 Empty / 0xFE Deleted）的所有槽位掩码。
     public static int MatchEmpty16(nint groupPtr) {
         if (groupPtr == 0) return 0;
         Vector128 g = Vector128.Load(groupPtr);

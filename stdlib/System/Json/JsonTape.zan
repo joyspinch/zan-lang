@@ -7,37 +7,35 @@ using System.Text;
 
 namespace System.Json;
 
-/// <summary>
-/// 一个 JSON 槽位（tape 上的一个节点）。JsonDoc 的 slots 列表就是
-/// 解析出的整棵树，深度优先连续排布：标量内联在槽里，孩子紧随
-/// 容器槽之后。字段编码（16 字节，<see cref="JsonSlot.a"/> 低 8 位
-/// 是值类别，其余位按类别复用；b 是唯一的载荷字段）：
-/// - null/bool（kind 0/1/6）：a 即 kind，一位信息折进编码，b = 0；
-/// - 整数（kind 2，纯整数 token）：完整 64 位值放 <see cref="JsonSlot.b"/>；
-/// - 浮点（kind 7，带 . / e 的 token）：IEEE 754 位型经
-/// NativeMemory.AsI64 折进 <see cref="JsonSlot.b"/>（AsF64 取回）；
-/// - 字符串（kind 3）：无转义 token 零拷贝——a 高位记 src 起始偏移、
-/// b 记长度；含转义（无法零拷贝）a 高位记 -1，b 记 escPool 下标；
-/// - 数组（kind 4）/ 对象（kind 5）：b = 元素数 | (跳过偏移 &lt;&lt; 31)，
-/// 跳过偏移是"容器整体之后第一个槽位"的相对距离。
-/// <see cref="JsonDoc.KindAt"/> 把 6/7 归一化回 0..5 对外契约。
-/// </summary>
+// 一个 JSON 槽位（tape 上的一个节点）。JsonDoc 的 slots 列表就是
+// 解析出的整棵树，深度优先连续排布：标量内联在槽里，孩子紧随
+// 容器槽之后。字段编码（16 字节，<see cref="JsonSlot.a"/> 低 8 位
+// 是值类别，其余位按类别复用；b 是唯一的载荷字段）：
+// - null/bool（kind 0/1/6）：a 即 kind，一位信息折进编码，b = 0；
+// - 整数（kind 2，纯整数 token）：完整 64 位值放 <see cref="JsonSlot.b"/>；
+// - 浮点（kind 7，带 . / e 的 token）：IEEE 754 位型经
+// NativeMemory.AsI64 折进 <see cref="JsonSlot.b"/>（AsF64 取回）；
+// - 字符串（kind 3）：无转义 token 零拷贝——a 高位记 src 起始偏移、
+// b 记长度；含转义（无法零拷贝）a 高位记 -1，b 记 escPool 下标；
+// - 数组（kind 4）/ 对象（kind 5）：b = 元素数 | (跳过偏移 &lt;&lt; 31)，
+// 跳过偏移是"容器整体之后第一个槽位"的相对距离。
+// <see cref="JsonDoc.KindAt"/> 把 6/7 归一化回 0..5 对外契约。
 struct JsonSlot {
-    /// 低 8 位 kind：0 null，1 bool(true)，2 number(整数 token)，
-    /// 3 string，4 array，5 object，6 bool(false)，7 number(浮点 token)。
-    /// 高位：kind 3 无转义串的 src 起始偏移（含转义 -1）；
-    /// kind 5 首个键值对在 pairs 表里的下标。
+    // 低 8 位 kind：0 null，1 bool(true)，2 number(整数 token)，
+    // 3 string，4 array，5 object，6 bool(false)，7 number(浮点 token)。
+    // 高位：kind 3 无转义串的 src 起始偏移（含转义 -1）；
+    // kind 5 首个键值对在 pairs 表里的下标。
     public long a;
-    /// 唯一载荷字段：kind 2 整数值；kind 7 浮点的 IEEE 754 位型；
-    /// kind 3 串长或 escPool 下标；kind 4/5 元素数 | (跳过偏移 &lt;&lt; 31)。
+    // 唯一载荷字段：kind 2 整数值；kind 7 浮点的 IEEE 754 位型；
+    // kind 3 串长或 escPool 下标；kind 4/5 元素数 | (跳过偏移 &lt;&lt; 31)。
     public long b;
 }
 
-/// 对象键值对：键为 doc.src 里的零拷贝 token（keyStart >= 0）或
-/// escPool 里物化的转义串（keyStart == -1，keyLen 是 pool 下标），
-/// 加同对象内的下一对与值槽位。键查找走这张紧凑表（16B 连续），
-/// 不碰槽带。（刻意全是 int：List&lt;struct&gt; 每次 indexer 读都会按位
-/// 拷贝，带 ARC 指针字段就会每次 retain/release，纯 POD 才能当数组用。）
+// 对象键值对：键为 doc.src 里的零拷贝 token（keyStart >= 0）或
+// escPool 里物化的转义串（keyStart == -1，keyLen 是 pool 下标），
+// 加同对象内的下一对与值槽位。键查找走这张紧凑表（16B 连续），
+// 不碰槽带。（刻意全是 int：List&lt;struct&gt; 每次 indexer 读都会按位
+// 拷贝，带 ARC 指针字段就会每次 retain/release，纯 POD 才能当数组用。）
 struct JsonPair {
     public int keyStart;
     public int keyLen;
@@ -45,32 +43,30 @@ struct JsonPair {
     public int valueSlot;
 }
 
-/// <see cref="JsonDoc.ForEachChild"/> 的回调：收到每个孩子的槽位
-/// （数组元素或对象成员值）。
+// <see cref="JsonDoc.ForEachChild"/> 的回调：收到每个孩子的槽位
+// （数组元素或对象成员值）。
 delegate void JsonChildVisitor(int childSlot);
 
-/// <summary>
-/// 平面 tape 形式的 JSON 文档：解析是单遍熔合状态机（见
-/// <see cref="ParseCore"/>），位置/缓冲全部参数线程化，错误用
-/// -(位置+1) 返回值直接上抛。字符串 token 解析期不物化——槽里只记
-/// (start,len) 源串偏移，<see cref="StrAt"/> 等访问器首次读取才物化
-/// （代价是 doc 持有 src/buf 引用使其存活）。
-/// 树形 API 见 <see cref="ToJson"/> / <see cref="At"/> / <see cref="Get"/>。
-/// </summary>
+// 平面 tape 形式的 JSON 文档：解析是单遍熔合状态机（见
+// <see cref="ParseCore"/>），位置/缓冲全部参数线程化，错误用
+// -(位置+1) 返回值直接上抛。字符串 token 解析期不物化——槽里只记
+// (start,len) 源串偏移，<see cref="StrAt"/> 等访问器首次读取才物化
+// （代价是 doc 持有 src/buf 引用使其存活）。
+// 树形 API 见 <see cref="ToJson"/> / <see cref="At"/> / <see cref="Get"/>。
 class JsonDoc {
-    /// tape 槽位（外部走访问器）。
+    // tape 槽位（外部走访问器）。
     public List<JsonSlot> slots;
-    /// 全部对象的键值对表（对象槽 a 高位记首对下标）。
+    // 全部对象的键值对表（对象槽 a 高位记首对下标）。
     public List<JsonPair> pairs;
-    /// 含转义的字符串/键在此物化（无转义的走 src 零拷贝）。
+    // 含转义的字符串/键在此物化（无转义的走 src 零拷贝）。
     public List<string> escPool;
-    /// 源串。零拷贝 token 指向它，因此它随 doc 存活。
+    // 源串。零拷贝 token 指向它，因此它随 doc 存活。
     public string src;
-    /// 源字节缓冲，下标 &lt; len 与字符串下标一一对应；尾部多 32 字节
-    /// 零填充供 Load64 裸读兜越界。键比较走它——数组索引比 string
-    /// 索引快约 7 倍。
+    // 源字节缓冲，下标 &lt; len 与字符串下标一一对应；尾部多 32 字节
+    // 零填充供 Load64 裸读兜越界。键比较走它——数组索引比 string
+    // 索引快约 7 倍。
     public byte[] buf;
-    /// 根槽位。
+    // 根槽位。
     public int root;
 
     static JsonDoc Parse(string src) {
@@ -102,11 +98,11 @@ class JsonDoc {
         return d;
     }
 
-    /// 熔合解析核心：单函数显式状态机。
-    /// 深度语义：容器嵌套以 MaxDepth 封顶（推栈时检查）。
-    /// 值完成后就地记账并级联处理分隔符与逐层收口，仅对象"要键"时
-    /// 切 wantKey 布尔，空容器走免推栈快路径。
-    /// 错误 -(位置+1) 为首错位置。
+    // 熔合解析核心：单函数显式状态机。
+    // 深度语义：容器嵌套以 MaxDepth 封顶（推栈时检查）。
+    // 值完成后就地记账并级联处理分隔符与逐层收口，仅对象"要键"时
+    // 切 wantKey 布尔，空容器走免推栈快路径。
+    // 错误 -(位置+1) 为首错位置。
     static int ParseCore(List<JsonSlot> sl, List<JsonPair> pr,
         List<string> pool, string src, byte[] buf, int len) {
         // 容器栈：每层 4 个 int——kind(4/5)、容器槽下标、已收子元素
@@ -371,7 +367,7 @@ class JsonDoc {
         }
     }
 
-    /// 对象键 token 扫描（起始引号在 pos）：SIMD 向量查找闭引号与转义符。
+    // 对象键 token 扫描（起始引号在 pos）：SIMD 向量查找闭引号与转义符。
     static int ScanKey(List<JsonSlot> sl, List<JsonPair> pr,
         List<string> pool, string src, byte[] buf, int len, int pos,
         int pbase, int[] fr) {
@@ -409,10 +405,10 @@ class JsonDoc {
         return pos;
     }
 
-    /// 转义 token 物化：前缀 (start..esc) 原文进池，再从 esc（首个
-    /// 反斜杠位置）扫到闭引号，解码全部转义（含 \uXXXX 与代理对）。
-    /// 返回闭引号后位置或 -(错误位置+1)；调用方以 pool.Count-1 取本
-    /// 串下标。值与键共用，冷路径。
+    // 转义 token 物化：前缀 (start..esc) 原文进池，再从 esc（首个
+    // 反斜杠位置）扫到闭引号，解码全部转义（含 \uXXXX 与代理对）。
+    // 返回闭引号后位置或 -(错误位置+1)；调用方以 pool.Count-1 取本
+    // 串下标。值与键共用，冷路径。
     static int EscStringInto(List<string> pool, string src, byte[] buf,
         int len, int start, int esc) {
         StringBuilder sb = new StringBuilder();
@@ -468,9 +464,9 @@ class JsonDoc {
         return -1 - pos;
     }
 
-    /// 就地解析 [from, to) 的浮点 token。运算顺序与
-    /// JsonValue.DoubleOf 完全一致（long 尾数 + 精确 10 的幂表一次
-    /// 缩放），结果位级相同。
+    // 就地解析 [from, to) 的浮点 token。运算顺序与
+    // JsonValue.DoubleOf 完全一致（long 尾数 + 精确 10 的幂表一次
+    // 缩放），结果位级相同。
     static double DoubleInRange(byte[] buf, int from, int to) {
         int i = from;
         bool neg = false;
@@ -541,8 +537,8 @@ class JsonDoc {
         return v;
     }
 
-    /// 从 `at` 开始的 4 位十六进制值；不足 4 位或含非十六进制
-    /// 字符时返回 -1。
+    // 从 `at` 开始的 4 位十六进制值；不足 4 位或含非十六进制
+    // 字符时返回 -1。
     static int Hex4(string src, int at, int limit) {
         if (at + 4 > limit) { return -1; }
         int acc = 0;
@@ -554,7 +550,7 @@ class JsonDoc {
         return acc;
     }
 
-    /// 递归深度上限（与 JsonValue 一致）。
+    // 递归深度上限（与 JsonValue 一致）。
     static int MaxDepth = 512;
 
     // ---------- 访问器 ----------
@@ -583,22 +579,22 @@ class JsonDoc {
         return k;
     }
 
-    /// 注意：At 是从首个孩子跳 i 次 NextSibling 的链式访问，取第 i 个
-    /// 孩子要 O(i) 次；把它当随机索引用在顺序循环里整体退化为 O(n²)
-    /// （215 倍实测差距）。顺序遍历请走 FirstChild/NextSibling 链或
-    /// <see cref="ForEachChild"/>，只有真正的随机访问才用 At。
+    // 注意：At 是从首个孩子跳 i 次 NextSibling 的链式访问，取第 i 个
+    // 孩子要 O(i) 次；把它当随机索引用在顺序循环里整体退化为 O(n²)
+    // （215 倍实测差距）。顺序遍历请走 FirstChild/NextSibling 链或
+    // <see cref="ForEachChild"/>，只有真正的随机访问才用 At。
     int At(int at, int i) {
         int c = at + 1;
         for (int j = 0; j < i; j = j + 1) { c = this.NextSibling(c); }
         return c;
     }
 
-    /// <summary>按 tape 链遍历 <paramref name="at"/> 的全部孩子，逐个
-    /// 调用 <paramref name="fn"/>（at 是孩子槽位；对象成员是值槽位，
-    /// 键用 <see cref="KeyAt"/> 取）。顺序与源文档一致。这是 O(孩子数)
-    /// 的正确遍历姿势：FirstChild/NextSibling 各走一步，不像
-    /// <see cref="At"/> 顺序循环那样累计 O(n²)。非容器（标量）与
-    /// 负槽位没有孩子，回调一次都不触发；fn 为 null 时静默返回。</summary>
+    // 按 tape 链遍历 <paramref name="at"/> 的全部孩子，逐个
+    // 调用 <paramref name="fn"/>（at 是孩子槽位；对象成员是值槽位，
+    // 键用 <see cref="KeyAt"/> 取）。顺序与源文档一致。这是 O(孩子数)
+    // 的正确遍历姿势：FirstChild/NextSibling 各走一步，不像
+    // <see cref="At"/> 顺序循环那样累计 O(n²)。非容器（标量）与
+    // 负槽位没有孩子，回调一次都不触发；fn 为 null 时静默返回。
     void ForEachChild(int at, JsonChildVisitor fn) {
         if (fn == null) { return; }
         int c = this.FirstChild(at);
