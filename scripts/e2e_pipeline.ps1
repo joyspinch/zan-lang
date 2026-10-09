@@ -89,7 +89,7 @@ foreach ($mf in $manifests) {
         continue
     }
     $inputs = @($entryFull)
-    $inputs += @(Get-ChildItem $srcDir -Recurse -File -Include "*.html", "*.htm", "*.zscene" |
+    $inputs += @(Get-ChildItem $srcDir -Recurse -File -Include "*.html", "*.htm" |
         Where-Object { $_.FullName -ne $entryFull } | ForEach-Object { $_.FullName })
     $inputs += @(Get-ChildItem $srcDir -Recurse -File -Filter "*.zan" | ForEach-Object { $_.FullName })
     $inputs = @($inputs | Select-Object -Unique)
