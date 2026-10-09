@@ -87,9 +87,14 @@ views/Admin/Lic/                  管理界面视图
 
 ## 构建与运行
 
-```
-zanc src/main.zan --auto-stdlib -o build/licensing_server.exe   # A90 在案时需显式附带 stdlib Orm/Linq 源文件
-build/licensing_server.exe        # 从项目根运行，config/views/wwwroot 按相对路径解析
+模板是多文件工程，编译输入包含 `src/` 下的全部 `.zan` 文件；
+`--auto-stdlib` 按需拉入标准库和 Zan.Mvc 包。PowerShell 示例：
+
+```powershell
+New-Item -ItemType Directory -Force build | Out-Null
+$sources = Get-ChildItem src -Recurse -Filter *.zan | ForEach-Object { $_.FullName }
+zanc @sources --auto-stdlib -o build/licensing_server.exe
+.\build\licensing_server.exe      # 从项目根运行，config/views/wwwroot 按相对路径解析
 ```
 
 管理后台 `http://127.0.0.1:8096/admin`；客户端 SDK 指向
