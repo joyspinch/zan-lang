@@ -21,9 +21,9 @@ struct zan_diag;
 char *zan_genmeta_export(struct zan_ast_node *unit);
 
 /* Same, plus a "files" array naming every source file, so the `file` ids the
- * export carries on locations resolve to paths. Tooling that indexes a project
- * ("which file declares this entity") needs the table; the generators do not,
- * and zan_genmeta_export keeps their input unchanged. */
+ * export carries on locations resolve to paths (project-indexing tooling
+ * needs the table; the generators do not, and zan_genmeta_export keeps their
+ * input unchanged). */
 char *zan_genmeta_export_files(struct zan_ast_node *unit,
                                struct zan_diag *diag);
 

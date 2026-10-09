@@ -1,4 +1,4 @@
-/* stdlib_ext.c -- Extended standard library runtime (M7.3). */
+/* stdlib_ext.c -- Extended standard library runtime. */
 
 #include "stdlib_ext.h"
 #include <stdio.h>
@@ -17,7 +17,6 @@
 #endif
 
 #include "../common/host_oom.h"
-/* ==== HTTP Client ==== */
 
 #ifdef _WIN32
 
@@ -25,12 +24,10 @@ zan_http_response_t *zan_http_get(const char *url) {
     zan_http_response_t *resp = (zan_http_response_t *)calloc(1, sizeof(zan_http_response_t));
     resp->status_code = -1;
 
-    /* Convert URL to wide string */
     int wlen = MultiByteToWideChar(CP_UTF8, 0, url, -1, NULL, 0);
     wchar_t *wurl = (wchar_t *)malloc(sizeof(wchar_t) * (size_t)wlen);
     MultiByteToWideChar(CP_UTF8, 0, url, -1, wurl, wlen);
 
-    /* Crack URL */
     URL_COMPONENTSW uc;
     memset(&uc, 0, sizeof(uc));
     uc.dwStructSize = sizeof(uc);
@@ -55,7 +52,6 @@ zan_http_response_t *zan_http_get(const char *url) {
         WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &status, &size, NULL);
         resp->status_code = (int)status;
 
-        /* Read body */
         char *body = NULL;
         size_t body_len = 0, body_cap = 4096;
         body = (char *)malloc(body_cap);
@@ -102,7 +98,6 @@ zan_http_response_t *zan_http_post(const char *url, const char *body, const char
     HINTERNET request = WinHttpOpenRequest(connect, L"POST", path, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!request) { WinHttpCloseHandle(connect); WinHttpCloseHandle(session); free(wurl); return resp; }
 
-    /* Set content type header */
     wchar_t ct_header[256];
     swprintf(ct_header, 256, L"Content-Type: %hs", content_type ? content_type : "application/json");
 
@@ -459,8 +454,6 @@ void zan_http_response_free(zan_http_response_t *resp) {
     free(resp);
 }
 
-/* ==== Threading ==== */
-
 #ifdef _WIN32
 
 zan_thread_t zan_thread_create(zan_thread_fn fn, void *arg) {
@@ -562,8 +555,6 @@ int64_t zan_atomic_load(volatile int64_t *ptr) { return __sync_val_compare_and_s
 void zan_atomic_store(volatile int64_t *ptr, int64_t val) { __sync_lock_test_and_set(ptr, val); }
 
 #endif
-
-/* ==== JSON Parser ==== */
 
 static void skip_json_ws(const char **p, const char *end) {
     while (*p < end && isspace((unsigned char)**p)) (*p)++;
@@ -739,7 +730,6 @@ zan_json_value_t *zan_json_parse(const char *json, size_t len) {
     return parse_json_value(&p, end, 0);
 }
 
-/* JSON serialization */
 static void json_serialize_value(zan_string_builder_t *sb, const zan_json_value_t *val, bool pretty, int depth);
 
 static void json_indent(zan_string_builder_t *sb, int depth) {
@@ -917,8 +907,6 @@ void zan_json_free(zan_json_value_t *val) {
     }
     free(val);
 }
-
-/* ==== StringBuilder ==== */
 
 void zan_sb_init(zan_string_builder_t *sb) {
     sb->cap = 256;

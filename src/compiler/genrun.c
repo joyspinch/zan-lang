@@ -38,8 +38,7 @@ int zan_gen_enabled = 1;
 /* Captured texts of the generator-produced sources from the latest codegen
  * run (filled by zan_merge_sources). main.c re-seeds the demand-driven
  * stdlib pull-in with them: generated classes reference stdlib types the
- * user program never spells (OrmSelect/OrmMeta/...), so the declaring files
- * must join the parse even though no user token names them. Consumed via
+ * user program never spells (OrmSelect/OrmMeta/...). Consumed via
  * zan_gen_take_source_texts, which hands over and clears the capture. */
 static char **g_gen_texts = NULL;
 static int g_gen_text_count = 0;
@@ -86,9 +85,7 @@ int zan_gen_cache_dir(char *dir, size_t dir_size) {
     base = getenv("LOCALAPPDATA");
     if (!base || !*base) return -1;
     if (snprintf(dir, dir_size, "%s\\Zan\\gen", base) <= 0) return -1;
-    /* Create every missing level: CreateDirectory only makes the last one, so
-     * a machine without %LOCALAPPDATA%\Zan yet got no cache directory at all
-     * and the generator compile failed with "cannot emit object file". */
+    /* Create every missing level: CreateDirectory only makes the last one. */
     for (char *p = dir + 1; *p; p++) {
         if (*p != '\\' && *p != '/') continue;
         char sep = *p;
@@ -173,21 +170,17 @@ static int zan_spawn_wait(char *const argv[]) {
 /* ---- cache cleanup ----
  *
  * The generator cache (%LOCALAPPDATA%\Zan\gen on Windows,
- * $XDG_CACHE_HOME/zan/gen on Linux) is shared across every zanc invocation
- * and may accumulate files we never want to keep around:
- *
- *   ZanGen_<hash>_<pid>.exe   per-process compile temp; zanc killed before
- *                              MoveFileExA leaves it behind
- *   gen_codegen_<pid>_in.json  per-process metadata I/O; same orphan problem
+ * $XDG_CACHE_HOME/zan/gen on Linux) is shared across zanc invocations and
+ * accumulates per-process leftovers:
+ *   ZanGen_<hash>_<pid>.exe     per-process compile temp; left behind when
+ *                                zanc is killed before the rename
+ *   gen_codegen_<pid>_in.json   per-process metadata I/O; same orphan problem
  *   gen_codegen_<pid>_out.json
- *   gen_design_<pid>_in.json
- *   gen_design_<pid>_out.json
+ *   gen_design_<pid>_in.json / _out.json
  *
  * The published ZanGen_<hash>.exe is *not* touched here: it is the warm
- * cache that future invocations read, and the gen_cache_isolation test
- * (tests/run_gen_cache_isolation.cmake) asserts the count of those entries
- * after building two stdlib worktrees. Sweep is best-effort and runs once
- * per zanc process. */
+ * cache future invocations read. Sweep is best-effort and runs once per
+ * zanc process. */
 
 static int zan_pid_alive(uint32_t pid) {
     if (pid == 0) return 0;
@@ -269,7 +262,6 @@ static int zan_gen_parse_zangen(const char *s, uint32_t *out) {
         const char *end = q;
         while (*end >= '0' && *end <= '9') end++;
         if (end == q || end - q > 10) return 0;
-        /* On Windows an optional ".exe" suffix is allowed. */
         if (end[0] == '.') {
             if (end[1] != 'e' || end[2] != 'x' || end[3] != 'e' || end[4])
                 return 0;
@@ -375,11 +367,9 @@ static void zan_gen_sweep(const char *dir) {
 }
 
 /* The generator's behavior is defined by its whole stdlib closure, not just
- * the System/Compiler sources: ZanGen.zan is compiled with --auto-stdlib, so
- * GenForm/GenHtml freely reach into System.Web (HtmlParser, DesignerHtml)
- * and every other stdlib module. The cache key therefore hashes every .zan
- * under the stdlib root (deterministic order), so any stdlib edit yields a
- * fresh generator image. */
+ * the System/Compiler sources (ZanGen.zan is compiled with --auto-stdlib, so
+ * generators freely reach into other stdlib modules). The cache key therefore
+ * hashes every .zan under the stdlib root. */
 
 typedef struct zan_gen_strlist {
     char **v;
@@ -391,8 +381,8 @@ static void zan_gen_strlist_push(zan_gen_strlist *l, const char *s) {
     if (l->n == l->cap) {
         size_t ncap = l->cap ? l->cap * 2 : 64;
         char **nv = (char **)realloc(l->v, ncap * sizeof(char *));
-        if (!nv) return; /* oom: the walk reports fewer files, cache may */
-        l->v = nv;       /* collide after an edit - acceptable degradation */
+        if (!nv) return; /* oom: fewer files hashed; the cache may collide */
+        l->v = nv;
         l->cap = ncap;
     }
     size_t len = strlen(s);
@@ -508,10 +498,8 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
      * (re)compile or reuse the published image. */
     zan_gen_sweep(dir);
 
-    /* The cache must not be shared merely because timestamps happen to line
-     * up. Different worktrees can carry incompatible generator sources whose
-     * checkout times are newer than the cached executable. Key the image by
-     * compiler bytes, stdlib root and generator contents instead. */
+    /* Key the image by compiler bytes + stdlib root + generator contents;
+     * timestamps must never decide cache sharing. */
     char zexe[ZAN_GEN_MAX_PATH];
     zan_self_exe(zexe, sizeof(zexe));
     if (!zexe[0]) {
@@ -558,16 +546,13 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
         snprintf(tmp, sizeof(tmp), "%s%cZanGen_%016llx_%d%s", dir,
                  GEN_DIR_SEP_STR[0], (unsigned long long)key, pid,
                  GEN_EXE_SUFFIX);
-        /* --quiet: this is a nested build of our own generator, and the
-         * child inherits our stdout. Its "Compiled N files -> ..." progress
-         * line would otherwise land on the caller's stdout -- the machine
-         * channel `--emit-ir` writes the IR to -- making two emissions of
-         * the same source differ. */
+        /* --quiet: this is a nested build of our own generator; its stdout
+         * progress would corrupt the caller's machine channel (--emit-ir). */
         /* --no-packages: the generator's closure is pinned to the stdlib.
          * Package files skip the pull-in live-name gate, so a user package
-         * would join this nested --no-gen compile unconditionally -- and a
-         * file using generator-magic calls (Json.Serialize, db.Insert<T>)
-         * cannot resolve there: the lowering only runs in the parent. */
+         * would join this nested --no-gen compile unconditionally, and its
+         * generator-magic calls cannot resolve there (the lowering only runs
+         * in the parent). */
         char *argv[] = {
             zexe, src, "--stdlib-path", (char *)stdlib_root, "--auto-stdlib",
             "--no-gen", "--no-packages", "--quiet", "-DZAN_GEN_MAIN=1",
@@ -584,10 +569,9 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
 #else
         if (rename(tmp, exe) != 0) {
 #endif
-            /* A parallel build compiling the same generator may hold the
-             * published image open (Windows cannot replace a running exe).
-             * The content-addressed destination proves their image has the
-             * same inputs, so drop our copy and reuse it. */
+            /* A parallel build may hold the published image open (Windows
+             * cannot replace a running exe); the content-addressed name
+             * proves identical inputs, so drop our copy and reuse theirs. */
             remove(tmp);
             FILE *published = fopen(exe, "rb");
             if (published) {
@@ -611,12 +595,9 @@ int zan_gen_run(const char *exe, const char *meta_path, const char *out_path) {
     return 0;
 }
 
-/* ---- design-document translation (the "design" mode) ---- */
-
-/* A design document: generator input, translated to Zan source by
- * zan_gen_design before anything lexes it. Exported so the pre-parse
- * heuristic token scans in main.c can skip it -- lexing raw HTML as Zan
- * cannot produce anything but garbage tokens. */
+/* A design document: generator input, translated to Zan source before
+ * anything lexes it. Exported so the pre-parse token scans in main.c can
+ * skip it -- lexing raw HTML as Zan yields only garbage tokens. */
 bool zan_is_design_path(const char *p) {
     size_t n = strlen(p);
     return (n > 7 && strcmp(p + n - 7, ".zscene") == 0) ||
@@ -625,8 +606,8 @@ bool zan_is_design_path(const char *p) {
 }
 
 /* A saved user component (designer "save as component"): pure design data
- * the generators expand into every referencing design doc. Not a translatable
- * design document itself, and never parsed as Zan source. */
+ * the generators expand into every referencing design doc; never parsed as
+ * Zan source. */
 bool zan_is_zcomp_path(const char *p) {
     size_t n = strlen(p);
     return n > 6 && strcmp(p + n - 6, ".zcomp") == 0;
@@ -703,10 +684,8 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
             free(outs);
             return NULL;
         }
-        /* A design document is JSON, and JSON must not start with a byte order
-         * mark: an editor that saves the design doc as "UTF-8 with BOM"
-         * (Notepad, PowerShell's Set-Content) would otherwise make the
-         * generator fail with "cannot translate design document". Drop it. */
+        /* JSON must not start with a BOM: an editor saving the design doc
+         * as "UTF-8 with BOM" would fail the generator. Drop it. */
         const char *body = text;
         if (tlen >= 3 && (unsigned char)body[0] == 0xEF &&
             (unsigned char)body[1] == 0xBB && (unsigned char)body[2] == 0xBF)
@@ -827,15 +806,10 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
     return outs;
 }
 
-/* ---- codegen mode (jsongen/dbgen/routegen) ---- */
-
-/* ---- AST-level codegen triggers (zero-allocation fast path) ----
- *
- * Checks whether any call site or declaration in the compilation unit matches
- * the shapes expected by jsongen, routegen, or dbgen. By evaluating directly
- * on the AST, we completely bypass exporting and parsing multi-megabyte JSON
- * metadata when codegen is not needed, and avoid a second json_parse DOM tree
- * when it is needed. */
+/* AST-level codegen triggers (zero-allocation fast path): check whether any
+ * call site or declaration matches the shapes jsongen/routegen/dbgen expect,
+ * bypassing the multi-megabyte JSON export + parse when codegen is not
+ * needed. */
 
 static bool ast_call_triggers(zan_ast_node_t *call) {
     if (!call || call->kind != AST_CALL || !call->call.callee)
@@ -1092,27 +1066,24 @@ static bool zan_gen_ast_triggered(zan_ast_node_t *unit) {
     return false;
 }
 
-/* ---- rewrite directives ----
+/* Rewrite directives: the generators decide everything (framework names, SQL
+ * fragments, bind lists, Expr<T> trees); the compiler locates the call site
+ * by id and mechanically rebuilds the AST per the directive.
  *
- * The generators decide everything (framework names, SQL fragments, bind
- * lists, Expr<T> trees); the compiler is only the "surgeon": locate the
- * call site by id and mechanically rebuild the AST per the directive.
- *
- *   json_call   {id, callee}        retarget callee to __JsonBind.<callee>,
- *                                   drop type args
- *   db_root     {id, name, extra}   `recv.Xxx<T>(a)` -> `__DbBind.<name>(recv[, a])`
- *   db_acc_head {id, name, conn}    `<acc>.<Entity>` chain head ->
- *                                   `__DbBind.<name>(<conn>)` on the receiver
- *   db_acc_root {id, tree}          whole call replaced by <tree>
+ *   json_call    {id, callee}        retarget callee to __JsonBind.<callee>,
+ *                                    drop type args
+ *   db_root      {id, name, extra}   `recv.Xxx<T>(a)` -> `__DbBind.<name>(recv[, a])`
+ *   db_acc_head  {id, name, conn}    `<acc>.<Entity>` chain head ->
+ *                                    `__DbBind.<name>(<conn>)` on the receiver
+ *   db_acc_root  {id, tree}          whole call replaced by <tree>
  *   db_repo_call {id, tree}          entity accessor call replaced by a
- *                                   compile-time-resolved DAO call tree
- *   db_chain    {id, ops:[{m,args}]} chain `<recv>.<m>(args)...`, replaces call
- *   db_expr_arg {id, param, tree}   args[param] replaced by <tree>
+ *                                    compile-time-resolved DAO call tree
+ *   db_chain     {id, ops:[{m,args}]} chain `<recv>.<m>(args)...`, replaces call
+ *   db_expr_arg  {id, param, tree}   args[param] replaced by <tree>
  *
- * Directives execute in descending id order, matching the C dbgen's
- * children-first visit: the chain root (`__DbBind.Q_T`) is rewritten before
- * the chain methods above it look for it. `tree` fields are expression trees
- * serialized by the exporter (genmeta.c) and rebuilt here verbatim. */
+ * Directives execute in ascending id order: ids are assigned children-first,
+ * so the chain root is rewritten before the chain methods above it look for
+ * it. `tree` fields are genmeta.c expression trees, rebuilt verbatim. */
 
 static zan_ast_node_t *rw_ident(zan_arena_t *arena, zan_loc_t loc,
                                 const char *name) {
@@ -1164,9 +1135,9 @@ static void rw_set_ident(zan_arena_t *arena, zan_ast_node_t *id,
     id->ident.name.len = (uint32_t)l;
 }
 
-/* Ascending-id order: call-site ids are assigned children-first (the same
- * order the old C dbgen visits), so ascending replays the exact rewrite sequence of
- * the C generators. The array is tiny, insertion sort is fine. */
+/* Ascending-id order: call-site ids are assigned children-first, so ascending
+ * replays the original rewrite sequence. The array is tiny; insertion sort is
+ * fine. */
 static void rw_sort_desc(json_value *rw, int *order, int count) {
     for (int i = 1; i < count; i++) {
         int v = order[i];
@@ -1191,10 +1162,9 @@ static void zan_apply_rewrites(zan_ast_node_t *unit, json_value *rw,
     for (int i = 0; i < count; i++) order[i] = i;
     rw_sort_desc(rw, order, count);
 
-    /* Snapshot the call sites before rewriting anything: rewrites splice in
-     * new call nodes (e.g. `__DbBind.Q_T(...)`), which would shift the
-     * walking counter a fresh find_call relies on. Node *pointers* never
-     * change, so the snapshot stays exact for the whole pass. */
+    /* Snapshot the call sites before rewriting: rewrites splice in new call
+     * nodes, which would shift the walking counter a fresh find_call relies
+     * on. Node pointers never change, so the snapshot stays exact. */
     int total = zan_genmeta_index_calls(unit, NULL, 0);
     zan_ast_node_t **idx = NULL;
     if (total > 0) {
@@ -1234,8 +1204,8 @@ static void zan_apply_rewrites(zan_ast_node_t *unit, json_value *rw,
             zan_ast_node_t *ex =
                 keep_extra ? call->call.args.items[0] : NULL;
             /* a fresh node replaces the callee object; `recv` (the original
-             * receiver) must stay intact because it becomes the first
-             * argument below */
+             * receiver) must stay intact -- it becomes the first argument
+             * below */
             ce->member.object = rw_ident(arena, loc, "__DbBind");
             rw_set_member_name(arena, ce, name);
             call->call.type_args.count = 0;
@@ -1330,9 +1300,8 @@ static void zan_merge_sources(zan_ast_node_t *unit, json_value *sources,
         zan_ast_node_t *gu = zan_parser_parse(&gp);
         if (!gu) continue;
         /* Generated decls bind like a late-added source file: stamp each with
-         * its own unit's namespace + usings, or the file's `using
-         * System.Data.Orm;` header never reaches the binder and every
-         * unqualified OrmMeta/DbValues reference fails to resolve. */
+         * its own unit's namespace + usings, or the file's `using` header
+         * never reaches the binder. */
         zan_nsresolve_stamp(gu, arena);
         for (int k = 0; k < gu->comp_unit.decls.count; k++)
             zan_ast_list_push(&unit->comp_unit.decls, gu->comp_unit.decls.items[k],
@@ -1340,9 +1309,8 @@ static void zan_merge_sources(zan_ast_node_t *unit, json_value *sources,
     }
 }
 
-/* Report generator diagnostics (errors/warnings) through the compiler's
- * diag sink, where they carry the user file:line locations the generator
- * embedded in the metadata. */
+/* Report generator diagnostics through the compiler's diag sink, preserving
+ * the user file:line locations embedded in the metadata. */
 static void zan_report_diags(zan_diag_t *diag, json_value *arr, bool is_error) {
     if (!arr || arr->type != JSON_ARR) return;
     for (int i = 0; i < arr->as.arr.count; i++) {
@@ -1367,8 +1335,7 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
                     zan_diag_t *diag, const char *stdlib_root) {
     if (!zan_gen_enabled || !unit) return 0;
 
-    /* Fast path: check triggers directly on the AST without any allocation.
-     * Projects with no Json/ORM/route shapes exit in <2ms with ZERO heap allocations. */
+    /* Fast path: trigger check directly on the AST, no allocation. */
     if (!zan_gen_ast_triggered(unit)) return 0;
 
     if (!stdlib_root || !stdlib_root[0]) {
@@ -1386,9 +1353,8 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
         return -1;
     }
 
-    /* Export with the file table: the generators ignore it, but the index
-     * emitter (GenIndex, opt-in via ZAN_INDEX_DIR) turns the `file` ids on
-     * every declaration into paths with it. */
+    /* Export with the file table: the generators ignore it, but GenIndex
+     * (opt-in via ZAN_INDEX_DIR) turns the `file` ids into paths with it. */
     char *meta = zan_genmeta_export_files(unit, diag);
     if (!meta) return 0;
 
@@ -1405,8 +1371,7 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
 
     int rc = -1;
     /* Stream the metadata into the codegen request directly:
-     * {"mode":"codegen","unit":<meta>}.
-     * Avoid duplicating the multi-megabyte string into another heap buffer. */
+     * {"mode":"codegen","unit":<meta>} -- no multi-megabyte heap copy. */
     FILE *mf = fopen(meta_path, "wb");
     if (!mf) {
         fprintf(stderr, "error: cannot write generator request\n");
@@ -1450,9 +1415,8 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
         json_value *warnings = json_obj_get(root, "warnings");
         zan_report_diags(diag, warnings, false);
         zan_report_diags(diag, errors, true);
-        /* Rewrites were already decided while scanning (matching the old
-         * in-place C generators); generated sources are only merged when no
-         * generator diagnostics were raised. */
+        /* generated sources are only merged when no generator diagnostics
+         * were raised */
         zan_apply_rewrites(unit, json_obj_get(root, "rewrites"), arena);
         if (errors && errors->type == JSON_ARR && errors->as.arr.count > 0) {
             json_free(root);

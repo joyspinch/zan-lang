@@ -16,15 +16,14 @@ struct zan_parser {
     int expr_depth; /* current expression recursion depth (stack-overflow guard) */
     int expr_tail_depth; /* depth of the low-precedence right recursion
                           * (assignment `a = a = ...`, conditional
-                          * `c ? a : c ? b : ...`); those re-enter
+                          * `c ? a : c ? b : ...`); these re-enter
                           * parse_expression directly, never through
-                          * parse_unary, so expr_depth alone left them
-                          * unguarded and an extreme-depth chain killed the
-                          * compiler with STATUS_STACK_OVERFLOW */
-    bool expr_depth_reported; /* the nesting guard reports once per unit: error
-                               * recovery re-parses the same deep expression and
-                               * would otherwise repeat it thousands of times
-                               * (30k parens printed 6 MB of one error) */
+                          * parse_unary, so expr_depth alone does not
+                          * guard them */
+    bool expr_depth_reported; /* the nesting guard reports once per unit:
+                               * error recovery re-parses the same deep
+                               * expression and would otherwise repeat
+                               * the diagnostic */
     int stmt_depth; /* current statement/block recursion depth (stack-overflow guard) */
     int type_depth; /* current type-reference recursion depth (stack-overflow guard) */
     int type_no_nullable; /* one-shot: the next parse_type_ref call's TOP-LEVEL

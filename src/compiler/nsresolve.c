@@ -1,29 +1,11 @@
-/* nsresolve.c -- namespace-aware type resolution.
- *
- * Zan merges every input file's declarations into one flat compilation unit
- * and the binder registers/looks up types by simple name only, which made it
- * impossible for two namespaces to declare the same simple name (e.g. one
- * `class Index` per module).  This pass runs after merge and before the binder.
- *
- *   1. zan_nsresolve_stamp() records each top-level declaration's namespace and
- *      `using` list at parse time (before the flat merge loses that context).
- *   2. zan_nsresolve_run() finds simple names declared in more than one
- *      namespace and renames those declarations to a unique mangled name,
- *      keeping the original simple name in node->orig_name for downstream
- *      passes (route/view generation).  It then rewrites every type reference
- *      to the resolved type's (possibly mangled) name, honoring the referring
- *      declaration's own namespace, its `using` imports, and explicit qualified
- *      names.  Non-conflicting simple names are never touched, so all existing
- *      single-namespace code binds exactly as before.
- *
- * A type name also appears in expression position, as the receiver of a static
- * member access (`Dispatcher.Post(h)`, `Colors.Red`), where it parses as a plain
- * identifier and not as a type reference.  Those receivers are rewritten too --
- * otherwise renaming the declaration leaves every static call to it unresolved.
- * Identifiers that a local, parameter, foreach/catch variable or lambda
- * parameter of the enclosing member shadows are left alone, since there the
- * name means the variable, not the type.
- */
+/* nsresolve.c -- namespace-aware type resolution, run after the flat merge and
+ * before the binder. The binder resolves types by simple name only, so this
+ * pass stamps each declaration's namespace/`using` list at parse time (before
+ * merge loses it), renames cross-namespace simple-name collisions to mangled
+ * names (orig_name keeps the simple name for route/view generation), and
+ * rewrites type references and static-member receivers per the referring
+ * declaration's ns/usings; names shadowed by locals/params/fields are left
+ * untouched. */
 
 #include "nsresolve.h"
 #include "arena.h"
@@ -35,8 +17,6 @@
 #include <stdlib.h>
 
 #include "../common/host_oom.h"
-
-/* ---- istr helpers ---- */
 
 static zan_istr_t mk_istr(zan_arena_t *a, const char *s, size_t n) {
     zan_istr_t r;
@@ -103,8 +83,6 @@ static zan_istr_t flatten_qname(zan_ast_node_t *q, zan_arena_t *ar) {
     return empty;
 }
 
-/* ---- stamping (called per parsed file, before merge) ---- */
-
 /* Nested declarations are hoisted only after the input units have been merged.
  * Stamp them now, while their source namespace/import list is still known. */
 static void stamp_decl_context(zan_ast_node_t *d, zan_istr_t ns,
@@ -133,8 +111,6 @@ void zan_nsresolve_stamp(zan_ast_node_t *unit, zan_arena_t *arena) {
     }
 }
 
-/* ---- declared-type table ---- */
-
 typedef struct {
     zan_ast_node_t *decl;
     zan_istr_t simple;   /* declared simple name */
@@ -153,11 +129,11 @@ typedef struct {
     int cap;
 } nr_shadow_t;
 
-/* Chained hash indexes over the declared-type table. Two views of the same
- * items array: by_full serves find_full (the per-reference lookup), by_simple
- * groups same-simple-name declarations for conflict detection and count_simple.
- * Semantics are preserved: find_full returns the earliest-declared match;
- * group walks compare keys explicitly, so hash collisions never merge distinct names. */
+/* Chained hash indexes over the declared-type table: by_full serves find_full
+ * (the per-reference lookup), by_simple groups same-simple-name declarations
+ * for conflict detection and count_simple. find_full returns the
+ * earliest-declared match; walks compare keys explicitly, so hash collisions
+ * never merge distinct names. */
 typedef struct nr_chain {
     int idx;            /* index into ctx->items */
     int next;           /* next node in the bucket chain, -1 ends */
@@ -197,16 +173,11 @@ typedef struct {
     /* Field names of the class being walked: like locals, a field shadows a
      * type of the same name when it is used as a receiver. */
     nr_shadow_t fields;
-    /* Hash indexes over items (built once after collection). find_full and
-     * count_simple were linear scans, which made nsresolve O(N^2) in the
-     * declared-type count: every type reference paid O(N). */
     nr_index_t by_full;
     nr_index_t by_simple;
     /* Reachability-prune hook (zan_nsresolve_prune): when non-NULL, nr_walk
      * records the final name of every type reference and rewritten static
-     * receiver it resolves. The prune closure then knows exactly which
-     * declarations each kept declaration mentions, with zero duplicated
-     * walk logic. */
+     * receiver it resolves. */
     zp_refs_t *refs;
 } nr_ctx_t;
 
@@ -383,8 +354,6 @@ static zan_istr_t mangle(nr_ctx_t *c, zan_istr_t full) {
     return mk_istr(c->arena, buf, n);
 }
 
-/* ---- reference resolution ---- */
-
 static void zan_refs_add(zp_refs_t *r, zan_istr_t name, zan_arena_t *arena) {
     if (!r || !name.len) return;
     for (int i = 0; i < r->count; i++)
@@ -410,29 +379,22 @@ static int decl_type_param_count(const zan_ast_node_t *d) {
 }
 
 /* A type reference carrying type arguments can only bind to a declaration
- * that declares the same number of type parameters (the C# generic-arity
- * rule). `Gui.Action` is a non-generic delegate; when a same-namespace or
- * using-imported `Action` makes nsresolve rewrite `Action` references to the
- * mangled name, an `Action<string>` reference rewritten along with them would
- * silently lose its argument and change the type's signature -- the rewritten
- * reference then binds to the zero-parameter delegate and every delegate
- * invoke on it emits a call with the wrong arity (the lambda_87 IDE-build
- * verifier failure). Such a reference must stay untouched so the binder
- * resolves the generic builtin (System.Action<T>) instead. */
+ * with the same number of type parameters (the C# generic-arity rule).
+ * Rewriting an `Action<string>` onto a mangled non-generic `Action` would
+ * silently drop the argument and emit invokes with the wrong arity, so such
+ * a reference stays untouched and the binder resolves the generic builtin
+ * (System.Action<T>) instead. */
 static bool arity_matches(const zan_ast_node_t *tr, const nr_type_t *t) {
     if (tr->type_ref.type_args.count == 0) return true;
     return decl_type_param_count(t->decl) == tr->type_ref.type_args.count;
 }
 
 /* Same as count_simple, but a reference carrying type arguments only
- * conflicts with declarations of the same generic arity: `Action<int>` under
- * `using System; using Gui;` has one arity-1 candidate (System.Linq.Action<T>)
- * and one arity-0 one (Gui.Action) -- counting by name alone reported a false
- * "ambiguous type" even though exactly one candidate can take the argument
- * list. An arity-matched reference stays untouched and the binder
- * resolves it globally, like the qualified paths above already do via
- * arity_matches. A reference without type arguments keeps the name-based
- * count (a bare `Action` with two imported Actions IS ambiguous, C# CS0104). */
+ * conflicts with declarations of the same generic arity: `Action<int>` with
+ * an arity-1 and an arity-0 candidate has exactly one possible target, and a
+ * name-only count reports a false "ambiguous type". A reference without type
+ * arguments keeps the name-based count (a bare `Action` with two imported
+ * Actions IS ambiguous, C# CS0104). */
 static int count_simple_matching(nr_ctx_t *c, zan_istr_t simple,
                                  const zan_ast_node_t *tr) {
     int want = tr->type_ref.type_args.count;
@@ -491,14 +453,11 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
     }
 
     /* simple name: same-namespace first, then enclosing namespaces (C#
-     * scoping: a file in Gui.Component.DataTable sees Gui's types without
-     * a using -- every Gui.* package file relying on a bare `App` did this
-     * through the fragile global fallback until now), then usings. The
-     * global namespace is a namespace too: a declaration at global scope
-     * must win over an import, or a file with no `namespace` line resolves
-     * its own class to a same-named stdlib type pulled in by `using` (the
-     * generated global `partial class App` bound its App.OnLoad to
-     * Gui.App). join_ns returns the bare name for an empty ctx_ns, so the
+     * scoping: a file in Gui.Component.DataTable sees Gui's types without a
+     * using), then usings. The global namespace is a namespace too: a
+     * declaration at global scope must win over an import, or a file with no
+     * `namespace` line resolves its own class to a same-named type pulled in
+     * by `using`. join_ns returns the bare name for an empty ctx_ns, so the
      * first call covers ctx==global; the walk below adds the ancestors,
      * innermost first, global last. */
     t = find_full_joined(c, ctx_ns, R);
@@ -545,10 +504,8 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
      * prune needs it as an edge target anyway. */
     if (c->refs) zan_refs_add(c->refs, R, c->arena);
 
-    /* Unresolved simple name.  If it names a type that only exists inside some
-     * namespace(s) and is ambiguous, warn the user to qualify it; otherwise
-     * leave it unchanged (builtin, generic type parameter, or a unique
-     * non-conflicting global/simple type the binder resolves as before). */
+    /* Declared in several namespaces with no full-name match: ambiguous,
+     * require qualification; anything else stays for the binder. */
     if (count_simple_matching(c, R, tr) >= 2 && !find_full(c, R)) {
         zan_diag_emit(c->diag, DIAG_ERROR, tr->loc,
                       "ambiguous type '%.*s'; qualify it with its namespace",
@@ -573,17 +530,11 @@ static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
     if (c->refs) zan_refs_add(c->refs, R, c->arena);
 
     nr_type_t *t = NULL;
-    /* Same-namespace first, then enclosing namespaces (the expression-
-     * position twin of resolve_ref's ancestor walk: `Cpu.HasSse42` inside
-     * namespace System.Runtime.Intrinsics.X86 binds to the parent
-     * Intrinsics Cpu by scope, not by the global fallback's uniqueness
-     * luck), the global namespace included -- the same rule resolve_ref
+    /* Same-namespace first, then enclosing namespaces (C# scoping), then
+     * usings, the global namespace included -- the same rule resolve_ref
      * applies to type positions. A declaration at global scope must win
-     * over an import, or `App.OnLoad(form)` in the design-generated global
-     * `partial class App` resolves through `using Gui;` to Gui.App and the
-     * binder reports `'Gui_App' has no member 'OnLoad'`. join_ns returns
-     * the bare name for an empty ctx_ns, so the first call covers
-     * ctx==global. */
+     * over an import. join_ns returns the bare name for an empty ctx_ns,
+     * so the first call covers ctx==global. */
     t = find_full_joined(c, ctx_ns, R);
     if (!t && ctx_ns.len > 0) {
         char abuf[256];
@@ -641,8 +592,7 @@ static void resolve_qualified_receiver(nr_ctx_t *c, zan_ast_node_t *recv) {
     if (!t) {
         /* `A.B.C` that is not a declared namespace+type pair: any segment
          * may still name a declaration the binder resolves globally (the
-         * tail especially — `Gui.Component.Chart.ChartView` under a
-         * ctx-ns-relative spelling) — record them all for the prune. */
+         * tail especially) — record them all for the prune. */
         if (c->refs) {
             zan_ast_node_t *seg = recv;
             while (seg && seg->kind == AST_MEMBER_ACCESS) {
@@ -659,8 +609,6 @@ static void resolve_qualified_receiver(nr_ctx_t *c, zan_ast_node_t *recv) {
     recv->ident.inst_type_ref = NULL;
     if (c->refs) zan_refs_add(c->refs, t->final, c->arena);
 }
-
-/* ---- shadow collection ---- */
 
 static void collect_shadows(nr_ctx_t *c, zan_ast_node_t *n);
 
@@ -800,8 +748,6 @@ static void collect_shadows(nr_ctx_t *c, zan_ast_node_t *n) {
     }
 }
 
-/* ---- AST walk ---- */
-
 static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
                     zan_istr_t ns, zan_ast_list_t *usings);
 
@@ -817,12 +763,9 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
     if (!n) return;
     /* A declaration keeps the file context it was stamped with at parse time
      * (zan_nsresolve_stamp runs per file, before merge_partials folds the
-     * partials together). Honor that over the caller's, which for a merged
-     * partial is the surviving declaration's file: the first partial of a
-     * split class need not import what the others' members use. ChartView is
-     * spread over ~20 files and its ChartBarLayout.zan partial has no
-     * `using Gui;`, so inheriting that file's imports left every `App`
-     * parameter in the other partials unresolved. */
+     * partials together) over the caller's: a merged partial is walked with
+     * the surviving declaration's file, whose imports its members need not
+     * share. */
     if (zan_ast_ns_usings(n)) {
         ns = zan_ast_ns_name(n);
         usings = zan_ast_ns_usings(n);
@@ -1071,8 +1014,6 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
     }
 }
 
-/* ---- entry point ---- */
-
 void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *diag) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
     zan_ast_list_t *decls = &unit->comp_unit.decls;
@@ -1082,10 +1023,8 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
     c.arena = arena;
     c.diag = diag;
     c.count = 0;
-    /* Only zan_nsresolve_prune installs the ref hook; leaving this as stack
-     * residue made nr_walk's `if (c->refs)` dereference garbage whenever a
-     * prior phase happened to leave a stale pointer in the slot (input- and
-     * layout-dependent SEGV, e.g. `using System` + string concat). */
+    /* nr_walk dereferences c->refs whenever non-NULL: initialize explicitly
+     * (only zan_nsresolve_prune installs the hook). */
     c.refs = NULL;
     c.shadow.items = NULL;
     c.shadow.count = 0;
@@ -1112,8 +1051,7 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
     nr_index_build(&c.by_simple, c.items, c.count, 0, arena);
 
     /* 2. detect cross-namespace simple-name collisions: walk each
-     * same-simple-name group once via the simple-name index instead of
-     * comparing every pair. */
+     * same-simple-name group once via the simple-name index. */
     for (int node = 0; node < c.count; node++) {
         zan_istr_t simple = c.items[node].simple;
         for (int other = c.by_simple.buckets[nr_hash(simple) & c.by_simple.mask];
@@ -1147,8 +1085,6 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
     }
     free(c.shadow.items);
 }
-
-/* ---- reachability prune ---- */
 
 void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
                          zan_diag_t *diag) {
@@ -1203,11 +1139,10 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
         zan_ast_node_t *d = items[i].decl;
         if (!d->from_stdlib) { kept[i] = 1; continue; }
         /* Extension-method hosts are invisible to name resolution: their
-         * members are called as `recv.M(...)` with no reference to the
-         * class name anywhere, so find_extension_method's linear search
-         * over all registered methods is the only thing that finds them.
-         * A host that gets pruned silently breaks every `s.CompareTo(...)`
-         * style call, so hosts are anchors. */
+         * members are called as `recv.M(...)` with no reference to the class
+         * name anywhere, and find_extension_method's linear search is the
+         * only thing that finds them -- pruning a host silently breaks every
+         * such call, so hosts are anchors. */
         if (d->kind == AST_CLASS_DECL || d->kind == AST_STRUCT_DECL) {
             bool is_ext_host = false;
             for (int m = 0; m < d->type_decl.members.count && !is_ext_host; m++) {
@@ -1224,14 +1159,10 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
 
     /* Fixpoint: walk every kept declaration with the ref hook on; any
      * referenced type keeps its declaration. Each round the kept set can
-     * only grow; stop when a round adds nothing.
-     *
-     * The resolution indexes are built ONCE (they only read `items`, which
-     * never changes) and shared across all walks; only declarations newly
-     * kept in the previous round get walked, since a decl whose refs were
-     * already folded in cannot grow the kept set a second time. Without
-     * this, a stdlib-heavy compile re-walked hundreds of large classes per
-     * round — gallery paid +3.8s in resolve alone. */
+     * only grow; stop when a round adds nothing. The resolution indexes
+     * only read `items`, so they are built once and shared across all
+     * walks; only declarations newly kept in the previous round get
+     * walked, since folding in a decl's refs twice cannot grow the set. */
     unsigned char *walked = (unsigned char *)calloc((size_t)n, 1);
     if (!walked) { free(kept); return; }
     nr_ctx_t c;
@@ -1240,8 +1171,6 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
     c.diag = NULL; /* Prune is purely for reachability: suppress duplicate diagnostics */
     c.items = items;
     c.count = n;
-    /* nr_walk's resolution paths call find_full/count_simple, which read
-     * these indexes: build them like zan_nsresolve_run does. */
     nr_index_build(&c.by_full, items, n, 1, arena);
     nr_index_build(&c.by_simple, items, n, 0, arena);
     zp_refs_t refs;
@@ -1256,10 +1185,9 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
             zan_ast_node_t *d = items[i].decl;
             refs.count = 0;
             nr_walk(&c, d, zan_ast_ns_name(d), zan_ast_ns_usings(d));
-            /* Recorded names are FINAL simple names (t->final), so resolve
-             * them against the simple-name index: a by_full lookup would
-             * miss every non-mangled reference ("App" vs "Gui.App"),
-             * silently dropping live declarations. */
+            /* Recorded names are FINAL simple names (t->final): match them
+             * against the simple-name index, not by_full, or non-mangled
+             * references would be missed and live declarations dropped. */
             for (int k = 0; k < refs.count; k++) {
                 int j = nr_index_find(&by_simple, items, 0, refs.items[k]);
                 if (j >= 0) kept[j] = 1;

@@ -7,8 +7,6 @@
 #include <string.h>
 #include <stdio.h>
 
-/* ---- Available targets ---- */
-
 static const zan_target_info_t s_targets[] = {
     { "win-x64",     "x86_64-pc-windows-msvc",    "Windows x86-64 (MSVC ABI)" },
     { "win-arm64",   "aarch64-pc-windows-msvc",   "Windows ARM64 (MSVC ABI)" },
@@ -35,8 +33,6 @@ int zan_target_list(const zan_target_info_t **out) {
     *out = s_targets;
     return NUM_TARGETS;
 }
-
-/* ---- Parse target triple ---- */
 
 static zan_arch_t parse_arch(const char *s) {
     if (strncmp(s, "x86_64", 6) == 0 || strncmp(s, "x86-64", 6) == 0) return ZAN_ARCH_X86_64;
@@ -71,7 +67,6 @@ static zan_abi_t parse_abi(const char *s, zan_os_t os) {
 bool zan_target_parse(const char *triple_str, zan_target_t *out) {
     memset(out, 0, sizeof(*out));
 
-    /* Check if it's a short name first */
     for (int i = 0; i < NUM_TARGETS; i++) {
         if (strcmp(triple_str, s_targets[i].name) == 0) {
             triple_str = s_targets[i].triple;
@@ -89,9 +84,8 @@ bool zan_target_parse(const char *triple_str, zan_target_t *out) {
         snprintf(out->features, sizeof(out->features), "%s", "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi");
     } else if (out->arch == ZAN_ARCH_AARCH64) {
         /* +aes gates selection of the llvm.aarch64.crypto.aes* intrinsics
-         * (emit_aes_call's ARM lowering); the extension is universal on
-         * arm64 application silicon and the flag has zero effect on code
-         * that never emits AES instructions. */
+         * (emit_aes_call's ARM lowering); universal on arm64 application
+         * silicon, no effect on code that never emits AES instructions. */
         snprintf(out->features, sizeof(out->features), "%s", "+aes");
     } else {
         out->features[0] = 0;
@@ -125,8 +119,6 @@ void zan_target_host(zan_target_t *out) {
 const char *zan_target_llvm_triple(const zan_target_t *target) {
     return target->triple;
 }
-
-/* ---- LLVM target machine creation ---- */
 
 void *zan_target_create_machine(const zan_target_t *target, int opt_level) {
     char *error = NULL;

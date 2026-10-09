@@ -23,7 +23,6 @@
 #endif
 
 #include "../common/host_oom.h"
-/* ---- FNV-1a 64-bit hash ---- */
 
 uint64_t zan_hash_buffer(const void *data, size_t len) {
     const uint8_t *p = (const uint8_t *)data;
@@ -89,16 +88,10 @@ int zan_cpu_count(void) {
 #endif
 }
 
-/* ---- cache lock ----
- *
- * The parallel driver (zan_parallel_compile) runs compile workers on
- * multiple threads that all share one zan_incr_cache_t: workers read it via
- * zan_incr_get_object and mutate it via zan_incr_register. Without a lock
- * the units array can be reallocated while another thread reads it and
- * unit_count can race, corrupting the heap. All entry points that touch the
- * units array serialize on this mutex; single-threaded callers pay only an
- * uncontended lock.
- */
+/* The parallel driver runs compile workers that share one zan_incr_cache_t
+ * (reads via zan_incr_get_object, mutations via zan_incr_register); without a
+ * lock the units array can be reallocated while another thread reads it. All
+ * entry points that touch the units array serialize on this mutex. */
 
 #ifdef _WIN32
 typedef SRWLOCK zan_incr_lock_t;
@@ -121,8 +114,6 @@ static void zan_incr_lock(zan_incr_cache_t *cache) {
 static void zan_incr_unlock(zan_incr_cache_t *cache) {
     zan_incr_lock_release((zan_incr_lock_t *)&cache->lock);
 }
-
-/* ---- cache directory management ---- */
 
 static void ensure_cache_dir(const char *path) {
 #ifdef _WIN32
@@ -149,8 +140,6 @@ void zan_incr_init(zan_incr_cache_t *cache, const char *project_dir) {
     }
     cache->cache_valid = false;
 }
-
-/* ---- manifest load/save ---- */
 
 #define CACHE_MAGIC 0x5A414E43
 #define CACHE_VERSION 1
@@ -304,8 +293,6 @@ bool zan_incr_save(zan_incr_cache_t *cache) {
 #endif
     return ok;
 }
-
-/* ---- rebuild detection ---- */
 
 static zan_compile_unit_t *find_unit(zan_incr_cache_t *cache, const char *path) {
     for (int i = 0; i < cache->unit_count; i++) {
@@ -481,8 +468,6 @@ void zan_incr_destroy(zan_incr_cache_t *cache) {
     zan_incr_unlock(cache);
     memset(cache, 0, sizeof(*cache));
 }
-
-/* ---- parallel compilation ---- */
 
 typedef struct {
     const char *source_path;

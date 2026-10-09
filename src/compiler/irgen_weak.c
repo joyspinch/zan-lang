@@ -363,11 +363,9 @@ static void emit_weak_nil_all_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
 /* Body of zan_rt_weak_destroy_begin(void* obj) -> i1: under the registry lock,
  * null every slot pointing at obj, then commit only if the refcount is still
  * zero. This is the destroy-side half of the weak read handshake: a reader
- * that retained between the release's fetch_sub and this lock resurrected the
- * object -- the gate aborts, the releasing decrement is absorbed by the
- * reader's +1, and the reader's own release claims the destroy later. An empty
- * registry short-circuits: no slot was ever created, so no reader exists and
- * the count reaching zero is final. */
+ * that retained in between absorbed the releasing decrement, so the gate
+ * aborts and the reader's own release claims the destroy later. An empty
+ * registry short-circuits: no slot was ever created, so no reader exists. */
 static void emit_weak_destroy_begin_body(zan_irgen_t *g,
                                          LLVMValueRef weak_calloc) {
     LLVMBuilderRef b = g->builder;

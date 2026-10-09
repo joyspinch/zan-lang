@@ -1,11 +1,7 @@
-/* Windows resource embedding without an external toolchain.
- *
- * An .ico file is turned into a COFF object holding a .rsrc section with the
- * RT_ICON / RT_GROUP_ICON resources laid out exactly the way the PE loader
- * (and Explorer) expects, so the bundled ld can link it into the .exe. This
- * is what windres would otherwise be needed for; zan ships no windres, and
- * requiring MinGW or the Windows SDK just to give a program an icon would
- * break the "zanc alone produces an .exe" promise.
+/* Windows resource embedding without an external toolchain: an .ico file is
+ * turned into a COFF object holding a .rsrc section with the RT_ICON /
+ * RT_GROUP_ICON resources laid out the way the PE loader expects, linkable by
+ * the bundled ld (what windres would otherwise be needed for).
  */
 #include <stdio.h>
 #include <stdlib.h>

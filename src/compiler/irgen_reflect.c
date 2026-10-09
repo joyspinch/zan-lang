@@ -1,41 +1,24 @@
-/* Reflection metadata.
+/* Reflection metadata: `typeof(T)` / `obj.GetType()` yield a TypeInfo, a
+ * pointer into a compiler-emitted, immortal record laid out so the value points
+ * exactly at the type's display name, with the reflection slots in front:
  *
- * `typeof(T)` and `obj.GetType()` yield a TypeInfo: a pointer into a
- * compiler-emitted, immortal record that describes one type. The record is laid
- * out so that the pointer lands exactly on the type's display name, with the
- * reflection slots in FRONT of it:
+ *      -88  i8*  methods     -80  i64  method_count
+ *      -72  i8*  ctors       -64  i64  ctor_count
+ *      -56  i8*  elem        TypeInfo of the array element / nullable payload
+ *      -48  i8*  targs       null-terminated TypeInfo array, one per generic arg
+ *      -40  i8*  fields     -32  i64  field_count
+ *      -24  i64  type kind (ZAN_REFL_TK_*)
+ *      -16  i64  refcount    -8  i64  tag|length   (string RC header, zan_abi.h)
+ *        0  i8[] name  NUL-terminated display name
  *
- *      offset from the TypeInfo value
- *      -88   i8*  methods       pointer to the method-record array (or null)
- *      -80   i64  method_count
- *      -72   i8*  ctors         pointer to the constructor-record array
- *      -64   i64  ctor_count
- *      -56   i8*  elem          TypeInfo of the array element / nullable
- *                               payload (null when the type has neither)
- *      -48   i8*  targs         null-terminated array of TypeInfo, one per
- *                               generic argument (null when not generic)
- *      -40   i8*  fields        pointer to the field-record array (or null)
- *      -32   i64  field_count
- *      -24   i64  type kind     ZAN_REFL_TK_*
- *      -16   i64  refcount      ZAN_STRING_SENTINEL_RC  \  the string RC header
- *       -8   i64  tag|length    ZAN_STR_HDR_WORD(len)   /  (see zan_abi.h)
- *        0   i8[] name          NUL-terminated display name ("Widget", "int")
- *
- * The two header words a Zan string carries are therefore present at exactly
- * the offsets the string ABI puts them, which makes a TypeInfo *also* a valid
- * managed string holding the type name: printing, concatenating or comparing
- * one needs no conversion, and retain/release see the sentinel refcount and
- * leave it alone. `TypeInfo.Name` is the identity.
- *
- * Each field record is { i8* name, i8* typeName, i64 kind, i64 offset }: kind
- * is a ZAN_REFL_FK_* code that says how to load the slot, offset is the byte
- * offset inside the instance (a relocatable constant expression — the layout is
- * only known once the data layout is attached at object-emission time), or, for
- * an enum member, the member's constant value.
- *
- * Records are emitted on demand and cached per (symbol, display name). Field
- * lookup and loading are done by a handful of small internal functions built
- * into the module on first use, so no runtime-library support is needed.
+ * The string header words sit at the string-ABI offsets, so a TypeInfo is also
+ * a valid managed string holding the type name (retain/release see the sentinel
+ * refcount and leave it alone). A field record is { i8* name, i8* typeName,
+ * i64 kind (ZAN_REFL_FK_* load code), i64 offset }: offset is the instance byte
+ * offset (a relocatable constant, resolved at object-emission time) or an enum
+ * member's constant value. Records are emitted on demand, cached per
+ * (symbol, display name); field lookup/loading are small functions built into
+ * the module on first use, so no runtime-library support is needed.
  */
 
 /* record header offsets, from the TypeInfo value */
@@ -304,9 +287,8 @@ static LLVMValueRef refl_emit_fields_class(zan_irgen_t *g, zan_symbol_t *sym,
     return arr;
 }
 
-/* Emit the member-record array for an enum: one record per member, carrying
- * the member's constant value in the offset slot (see the C# rule the emit
- * side uses: an explicit `= n` resets the running value, otherwise +1). */
+/* Emit the member-record array for an enum: one record per member, its constant
+ * value in the offset slot (an explicit `= n` resets the running value, else +1). */
 static LLVMValueRef refl_emit_fields_enum(zan_irgen_t *g, zan_symbol_t *sym,
                                           int *out_count) {
     *out_count = 0;
@@ -350,8 +332,6 @@ static LLVMValueRef refl_emit_fields_enum(zan_irgen_t *g, zan_symbol_t *sym,
     return arr;
 }
 
-/* ---- method / constructor tables ------------------------------------- */
-
 static LLVMTypeRef refl_method_type(zan_irgen_t *g) {
     if (!g->refl_method_type) {
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -363,10 +343,8 @@ static LLVMTypeRef refl_method_type(zan_irgen_t *g) {
 }
 
 /* PROPGET/PROPSET when `msym` is the synthesized accessor of a property of
- * `sym` (`get_Count` for `Count`), 0 for an ordinary method. The reflected
- * read/write of a property routes through these instead of the backing slot,
- * which is the only correct answer for a property with a custom accessor: its
- * slot is never written. */
+ * `sym` (`get_Count` for `Count`), 0 for an ordinary method. Reflected
+ * property reads/writes route through these, never the backing slot. */
 static int refl_accessor_flag(zan_symbol_t *sym, zan_symbol_t *msym) {
     if (!sym || !msym || msym->name.len <= 4) return 0;
     bool is_get = memcmp(msym->name.str, "get_", 4) == 0;
@@ -462,10 +440,8 @@ static LLVMValueRef refl_to_slot(zan_irgen_t *g, LLVMValueRef v) {
 }
 
 /* void thunk(i8 *self, i64 *args, i64 *ret): unpack the argument slots into
- * the real signature, call `fn`, and pack the result back. One is emitted per
- * reflected method, which is what lets a call by name work without the call
- * site knowing the signature. NULL when the signature has a parameter or a
- * result no slot can carry. */
+ * the real signature, call `fn`, and pack the result back. NULL when the
+ * signature has a parameter or a result no slot can carry. */
 static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
                                     LLVMTypeRef fn_ty, bool is_static,
                                     const char *tag) {
@@ -479,9 +455,7 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
     unsigned total = LLVMCountParamTypes(fn_ty);
     /* instance thunks read args[0..total-2] (slot 0 of the caller's array is
      * the first real argument); a static method gets no self pointer, so its
-     * whole signature must fit the same fixed-size slot array -- allowing
-     * SLOTS+1 here made a 5-parameter static method read one slot past the
-     * end of every caller's [ZAN_REFL_ARG_SLOTS x i64] alloca */
+     * whole signature must fit the same fixed-size slot array */
     unsigned max_params = is_static ? ZAN_REFL_ARG_SLOTS : ZAN_REFL_ARG_SLOTS + 1;
     if (total > max_params) return NULL;
     LLVMTypeRef ptypes[ZAN_REFL_ARG_SLOTS + 1];
@@ -924,8 +898,6 @@ static void refl_finalize_mtabs(zan_irgen_t *g) {
     }
 }
 
-/* ---- record readers -------------------------------------------------- */
-
 /* Load one i64 header slot of the record `ti` points into. */
 static LLVMValueRef refl_hdr_i64(zan_irgen_t *g, LLVMValueRef ti, int off,
                                  const char *name) {
@@ -1280,9 +1252,8 @@ static LLVMValueRef refl_get_f64_fn(zan_irgen_t *g) {
 }
 
 /* i8 *__zan_refl_get_str(i8 *ti, i8 *obj, i8 *name): a string field, or "" for
- * anything else (never null, so the result is printable/concatenable).
- * The result is returned owned (+1), like every other call: the field keeps its
- * own reference, so the caller's release cannot free the object's string. */
+ * anything else (never null). The result is returned owned (+1); the field
+ * keeps its own reference. */
 static LLVMValueRef refl_get_str_fn(zan_irgen_t *g) {
     if (g->fn_refl_get_str) return g->fn_refl_get_str;
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
@@ -1424,11 +1395,10 @@ static LLVMValueRef refl_fname_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* i8 *__zan_refl_obj_type(i8 *obj, i8 *fallback): the record recorded for the
- * object's allocation site — its CONCRETE type, so a base-typed variable
- * holding a derived instance reports the derived type. Falls back to the static
- * type's record for anything with no usable site word (a string, a borrowed
- * buffer, an object allocated in another module). */
+/* i8 *__zan_refl_obj_type(i8 *obj, i8 *fallback): the CONCRETE type recorded at
+ * the object's allocation site (a base-typed variable reports the derived
+ * type); fallback = the static type's record when there is no usable site word
+ * (string, borrowed buffer, object allocated in another module). */
 static LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
     if (g->fn_refl_obj_type) return g->fn_refl_obj_type;
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
@@ -1468,15 +1438,10 @@ static LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
     } else {
         /* descriptor mode: the header word is the record pointer; load its
          * meta field (offset 16). Zero record -> fallback. A managed string or
-         * array held in the slot is NOT a descriptor: its second header word is
-         * the string tag (with the cached byte length), the array magic, or --
-         * for a rectangular array -- the rank, and dereferencing any of those
-         * as a pointer +16 faults. `object o = "lit"; o.GetType()` crashed
-         * every default build this way. Reject the two tags and any word too
-         * small to be a pointer (a descriptor is a global, never a rank/index)
-         * before the load, and fall back to the static type's record -- which
-         * is exactly what the range-checked check-leaks build answers for the
-         * same value, so the two modes stay in step. */
+         * array is NOT a descriptor (its second header word is a string tag,
+         * the array magic, or a rank); reject the tags and any word too small
+         * to be a pointer before the load, and fall back to the static type's
+         * record. */
         LLVMValueRef is_tag = zan_or(g->builder,
             zan_or(g->builder,
                 zan_hdr_is_string(g, site, "refl.isstr"),
@@ -1520,8 +1485,6 @@ static LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
     if (save) LLVMPositionBuilderAtEnd(g->builder, save);
     return fn;
 }
-
-/* ---- method-table readers -------------------------------------------- */
 
 /* The method (tbl=0) or constructor (tbl=1) array of the record, and how many
  * records it holds. */
@@ -2215,8 +2178,6 @@ static LLVMValueRef refl_tainfo_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* ---- call-site helpers ---------------------------------------------- */
-
 /* The TypeInfo of `obj`, whose static type is `st`. */
 static LLVMValueRef refl_emit_get_type(zan_irgen_t *g, zan_type_t *st,
                                        LLVMValueRef obj) {
@@ -2251,8 +2212,6 @@ static LLVMValueRef refl_receiver_ptr(zan_irgen_t *g, zan_type_t *rt,
     }
     return LLVMConstNull(i8ptr);
 }
-
-/* ---- reader call wrappers -------------------------------------------- */
 
 static LLVMValueRef refl_mi64(zan_irgen_t *g, LLVMValueRef ti, int tbl,
                               LLVMValueRef idx, int which) {
@@ -2681,9 +2640,8 @@ static bool refl_emit_instance_call(zan_irgen_t *g, zan_type_t *rt,
 }
 
 /* Per-allocation-site record table (through the __zan_site_meta pointer
- * global), so GetType() can answer the concrete type. The array is
- * created here with the real site count. Emitted only when the module actually
- * reflects. */
+ * global), so GetType() can answer the concrete type; created here with the
+ * real site count, only when the module actually reflects. */
 static void emit_site_meta_table(zan_irgen_t *g) {
     if (!g->refl_used || !g->g_site_meta || !g->site_syms) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -2709,10 +2667,9 @@ static void emit_site_meta_table(zan_irgen_t *g) {
 
 /* Descriptor builds (default): fill each __zan_desc_<site> with
  * {dtor, tynames, meta, site}, replacing the three [4096 x i8*] tables (see
- * the declaration in irgen_arc.c). Each descriptor is a small per-shape
- * constant only live code references, so --gc-sections can drop every
- * unreachable class's release function. Runs at finalize, after
- * emit_all_class_releases declared every destructor. */
+ * irgen_arc.c). Descriptors are per-shape constants only live code references,
+ * so --gc-sections can drop unreachable classes' release functions. Runs at
+ * finalize, after emit_all_class_releases declared every destructor. */
 void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
     if (!g->desc_hdr || !g->desc_gv) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);

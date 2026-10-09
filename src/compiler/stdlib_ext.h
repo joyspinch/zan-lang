@@ -1,10 +1,8 @@
-/* stdlib_ext.h -- Extended standard library for Zan (M7.3).
+/* stdlib_ext.h -- Extended standard library for Zan.
  *
- * Provides runtime implementations for:
- *   - System.Net.Http (HTTP client)
- *   - System.Threading (threads, mutex, async runtime)
- *   - System.Json (JSON parse/serialize)
- *   - System.Text.StringBuilder (efficient string building)
+ * Runtime implementations for System.Net.Http (HTTP client),
+ * System.Threading (threads, mutex, async runtime), System.Json
+ * (JSON parse/serialize) and System.Text.StringBuilder.
  */
 
 #ifndef ZAN_STDLIB_EXT_H
@@ -13,8 +11,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-
-/* ---- HTTP Client ---- */
 
 typedef struct {
     int status_code;
@@ -32,8 +28,6 @@ zan_http_response_t *zan_http_post(const char *url, const char *body, const char
 
 /* Free HTTP response */
 void zan_http_response_free(zan_http_response_t *resp);
-
-/* ---- Threading ---- */
 
 typedef void *zan_thread_t;
 typedef void *zan_mutex_t;
@@ -69,8 +63,6 @@ void zan_event_destroy(zan_event_t evt);
 int64_t zan_atomic_add(volatile int64_t *ptr, int64_t val);
 int64_t zan_atomic_load(volatile int64_t *ptr);
 void zan_atomic_store(volatile int64_t *ptr, int64_t val);
-
-/* ---- JSON ---- */
 
 typedef enum {
     ZAN_JSON_NULL,
@@ -124,8 +116,6 @@ void zan_json_array_push(zan_json_value_t *arr, zan_json_value_t *val);
 
 /* Free a JSON value tree */
 void zan_json_free(zan_json_value_t *val);
-
-/* ---- StringBuilder ---- */
 
 typedef struct {
     char *buf;

@@ -1,23 +1,13 @@
 /* definite.c -- Definite-assignment analysis.
  *
- * A local read before every path through the method has written it produces a
- * zero/garbage slot at runtime, which is exactly the class of bug that reads
- * as "the IDE just closed": a null control field, a count that was never set.
- * This pass walks each body once as a small flow analysis and reports the read
- * instead.
- *
- * Shape of the analysis: every declared local is a slot that is either
- * definitely assigned or not; statements move that state forward, branches are
- * analysed independently and merged by intersection (a variable is assigned
- * after an `if` only when *both* arms assigned it), and a statement that
- * cannot fall through (return / throw / break / continue) contributes nothing
- * to the merge. Loop bodies may run zero times, so what they assign does not
- * survive the loop unless the loop cannot exit normally.
- *
- * Deliberately conservative, because a false positive here is a program that
- * no longer compiles: a body containing `goto`/labels is skipped entirely, a
- * lambda marks everything it could capture as assigned, and the right operand
- * of `&&` / `||` / `??` / `?:` never counts as a definite write. */
+ * Flow analysis over each method body: branches are analysed independently and
+ * merged by intersection (assigned after an `if` only when both arms assigned),
+ * statements that cannot fall through contribute nothing to the merge, and
+ * loop bodies may run zero times so their writes do not survive the loop
+ * unless it cannot exit normally. Deliberately conservative, because a false
+ * positive is a program that no longer compiles: bodies with goto/labels are
+ * skipped entirely, lambdas mark everything they could capture as assigned,
+ * and the right operand of && / || / ?? / ?: never counts as a definite write. */
 
 #include <stdint.h>
 #include <string.h>
@@ -159,8 +149,6 @@ static void da_record_exit(struct da_ctx *c) {
 static bool da_is_true_literal(zan_ast_node_t *n) {
     return n && n->kind == AST_BOOL_LITERAL && n->bool_val;
 }
-
-/* ---- expressions ---- */
 
 static void da_list(struct da_ctx *c, zan_ast_list_t *l) {
     if (!l) return;
@@ -367,8 +355,6 @@ static void da_expr(struct da_ctx *c, zan_ast_node_t *n) {
         return;
     }
 }
-
-/* ---- statements ---- */
 
 static void da_block(struct da_ctx *c, zan_ast_node_t *n) {
     int mark = c->count;
@@ -645,7 +631,6 @@ static void da_stmt(struct da_ctx *c, zan_ast_node_t *n) {
         return;
 
     case AST_CHECKED_STMT:
-        /* transparent context wrapper */
         da_stmt(c, n->checked_stmt.body);
         return;
 

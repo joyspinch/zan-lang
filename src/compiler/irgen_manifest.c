@@ -2,21 +2,14 @@
  * (see the include block at the end of irgen.c) so every helper keeps static
  * linkage. Do not add it to CMake.
  *
- * ---- codegen manifest (post-fixpoint semantic snapshot) -------------------
- * Frozen AFTER zan_irgen_emit has completed every fixpoint (generic method
- * specs, live-body pruning, vtables, reflection tables, ARC descriptors,
- * static initializers, string deobfuscation) and BEFORE the optimizer runs.
- * It records what a future coordinator needs in order to decide what may
- * leave the single LLVM module, without carrying any module-local LLVM
- * handle out alive: function names, linkage, sizes, direct-call edges,
- * address-taken sites, referenced globals and the per-function facts that
- * gate the sharding allowlist (async ramp, generic specialization,
- * virtual/override dispatch, aggregate ABI, synthetic kind).
- *
- * Everything here is read-only over the finished module; the audit and the
- * JSON dump run only when ZAN_CODEGEN_MANIFEST / ZAN_CODEGEN_MANIFEST_JSON
- * is set, so ordinary builds pay nothing. Stage 4 (object sharding) will
- * consume these records; nothing in this file changes code generation. */
+ * Codegen manifest: a post-fixpoint semantic snapshot of the module, frozen
+ * after zan_irgen_emit has completed every fixpoint and before the optimizer
+ * runs. Records function names/linkage/sizes, direct-call edges, address-taken
+ * sites, referenced globals and the per-function facts that gate the sharding
+ * allowlist (async ramp, generic specialization, virtual/override dispatch,
+ * aggregate ABI, synthetic kind). Read-only over the finished module; the
+ * audit and JSON dump run only when ZAN_CODEGEN_MANIFEST /
+ * ZAN_CODEGEN_MANIFEST_JSON is set, and nothing here changes codegen. */
 
 enum {
     ZAN_MF_USER = 0,       /* registered user method/ctor (g->functions)   */

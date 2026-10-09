@@ -17,9 +17,8 @@ int zan_embed_emit_specs(zan_irgen_t *g, const char *const *specs, int count);
 
 /* Same, but for a directory spec only first-level subdirectories named in
  * `filter` (bare path segments, e.g. "dark") plus the spec root's loose files
- * are baked; a NULL filter walks everything (the unfiltered behavior). Used by
- * the Gui skin auto-embed so a zan.proj `skinlist = a,b` ships exactly those
- * packs + the base.css baseline instead of all 16 stdlib packs. */
+ * are baked; a NULL filter walks everything (the unfiltered behavior). Used
+ * by the Gui skin auto-embed (zan.proj `skinlist`). */
 int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
                                   int count, const char *const *filter,
                                   int filter_count);
@@ -31,10 +30,10 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
 #define ZAN_EMBED_DRIVER_PREFIX "zan-drivers"
 
 /* Writes the --embed spec for the run-time driver at `path` (whose loadable
- * file name is `file`) into `out`. The resource name carries a fingerprint of
- * the driver's bytes -- "zan-drivers/<fp>/<file>" -- so the copy one build
- * extracts on the target is never mistaken for another build's, and the loading
- * module finds the name via zan_embed_list. Returns 0 on success. */
+ * file name is `file`) into `out`: "zan-drivers/<fp>/<file>", where <fp> is a
+ * fingerprint of the driver's bytes so one build's extract is never mistaken
+ * for another's; the loading module finds the name via zan_embed_list.
+ * Returns 0 on success. */
 int zan_embed_driver_spec(const char *path, const char *file, char *out,
                           size_t out_sz);
 

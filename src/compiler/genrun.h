@@ -1,19 +1,14 @@
 /* genrun.h -- run the Zan-scripted code generators (ZanGen).
  *
- * The compiler's source-generators (formgen/scenegen/jsongen/routegen/dbgen)
- * were moved out of C into Zan code living in stdlib/System/Compiler/. zanc
- * drives them through a subprocess: it exports the compilation-unit metadata
- * to a JSON file, runs the cached generator executable over it, and consumes
- * the generated source + rewrite directives from the reply JSON.
- *
- * The generator is compiled with zanc itself (it is ordinary Zan code) and
- * cached under the user cache dir, keyed by the compiler, stdlib root and
- * generator source contents: a cold cache costs one extra compile, a warm
- * cache one spawn per build.
- *
- * --no-gen (zan_gen_enabled = 0) disables the whole machinery; it exists to
- * compile the generators themselves, whose sources must not run the codegen
- * passes on themselves (a bootstrap loop).
+ * zanc drives the Zan-implemented generators (formgen/scenegen/jsongen/
+ * routegen/dbgen, living in stdlib/System/Compiler/) as a subprocess: it
+ * exports compilation-unit metadata to JSON, runs the cached generator
+ * executable over it, and consumes the generated source + rewrite directives
+ * from the reply JSON. The generator is compiled with zanc itself and cached
+ * under the user cache dir, keyed by compiler + stdlib root + generator
+ * source contents. --no-gen (zan_gen_enabled = 0) disables the machinery; it
+ * exists to compile the generators themselves, whose sources must not run
+ * the codegen passes on themselves (a bootstrap loop).
  */
 #ifndef ZAN_GENRUN_H
 #define ZAN_GENRUN_H

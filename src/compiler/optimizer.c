@@ -27,8 +27,6 @@ static double get_time_ms(void) {
 }
 #endif
 
-/* ---- ARC optimization ---- */
-
 typedef enum {
     ARC_NONE = 0,
     ARC_RETAIN_OBJ,
@@ -154,8 +152,6 @@ static bool is_safe_arc_intermediate(LLVMValueRef inst, LLVMValueRef target_obj)
         return false;
     }
 
-    /* Pure arithmetic, logical, bitwise, comparison, selection,
-     * addressing, casting, extraction, and local load instructions are safe. */
     return true;
 }
 
@@ -246,8 +242,6 @@ zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level) {
     return stats;
 }
 
-/* ---- Devirtualization ---- */
-
 zan_devirt_stats_t zan_opt_devirtualize(zan_irgen_t *g, zan_binder_t *binder) {
     zan_devirt_stats_t stats = {0, 0};
     (void)binder;
@@ -306,8 +300,6 @@ zan_devirt_stats_t zan_opt_devirtualize(zan_irgen_t *g, zan_binder_t *binder) {
     return stats;
 }
 
-/* ---- Constant folding ---- */
-
 zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g) {
     zan_constfold_stats_t stats = {0, 0, 0};
 
@@ -329,7 +321,6 @@ zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g) {
                     LLVMValueRef rhs = LLVMGetOperand(inst, 1);
                     if (LLVMIsAConstantInt(lhs) && LLVMIsAConstantInt(rhs)) {
                         stats.constants_folded++;
-                        /* LLVM pass pipeline handles actual folding */
                     }
                 }
 
@@ -356,8 +347,6 @@ zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g) {
 
     return stats;
 }
-
-/* ---- Dead code elimination ---- */
 
 zan_dce_stats_t zan_opt_dce(zan_irgen_t *g) {
     zan_dce_stats_t stats = {0, 0, 0};
@@ -390,8 +379,6 @@ zan_dce_stats_t zan_opt_dce(zan_irgen_t *g) {
     return stats;
 }
 
-/* ---- Inlining ---- */
-
 zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level) {
     (void)g;
     (void)level;
@@ -402,8 +389,6 @@ zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level) {
     zan_inline_stats_t stats = {0, 0};
     return stats;
 }
-
-/* ---- LLVM pass pipeline configuration ---- */
 
 #if ZAN_LLVM_MAJOR >= 23
 /* LLVM 23 removed the Os/Oz optimization levels: run the O2 pipeline and
@@ -505,8 +490,6 @@ static void zan_opt_early_mem2reg(zan_irgen_t *g) {
     }
     LLVMDisposePassBuilderOptions(opts);
 }
-
-/* ---- Combined pipeline ---- */
 
 zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_level_t level) {
     zan_opt_report_t report;

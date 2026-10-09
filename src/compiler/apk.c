@@ -20,8 +20,6 @@
 
 #include "../common/host_oom.h"
 
-/* ========================= small dynamic buffer ========================= */
-
 typedef struct {
     unsigned char *p;
     size_t len, cap;
@@ -50,8 +48,6 @@ static void buf_u16(buf_t *b, uint16_t v) { buf_write(b, &v, 2); }
 static void buf_u32(buf_t *b, uint32_t v) { buf_write(b, &v, 4); }
 static void buf_u8(buf_t *b, uint8_t v) { buf_write(b, &v, 1); }
 
-/* ========================= CRC-32 (IEEE) ========================= */
-
 static uint32_t crc32_buf(const unsigned char *d, size_t n) {
     static uint32_t table[256];
     static int have = 0;
@@ -69,12 +65,10 @@ static uint32_t crc32_buf(const unsigned char *d, size_t n) {
     return c ^ 0xFFFFFFFFu;
 }
 
-/* ========================= raw DEFLATE (stored-ish) =========================
- * The manifest and dex are tiny; native libs must be STORED anyway. Using
- * real deflate for the two compressed entries keeps APKs honest without a
- * zlib dependency: a fixed-Huffman "stored block" deflate wrapper emits
- * valid deflate streams for any input, just without shrinkage. apksigner
- * and the Android package parser accept it (compress ratio 1.0). */
+/* The manifest and dex are tiny; native libs must be STORED anyway. The
+ * fixed-Huffman "stored block" deflate wrapper below emits valid deflate
+ * streams for any input without a zlib dependency; apksigner and the Android
+ * package parser accept it (compress ratio 1.0). */
 
 static size_t deflate_store(const unsigned char *in, size_t n,
                             unsigned char **out) {
@@ -105,8 +99,6 @@ static size_t deflate_store(const unsigned char *in, size_t n,
     *out = o;
     return w;
 }
-
-/* ========================= zip writer ========================= */
 
 typedef struct {
     char name[128];
@@ -225,12 +217,12 @@ static int zip_finish(zip_t *z) {
     return 0;
 }
 
-/* ========================= AXML string-pool patching =========================
- * The template AndroidManifest.xml is a binary AXML file. Its string pool
- * (chunk type 0x0001, UTF-16LE) holds every attribute value; the package
- * name and application label are ordinary strings inside it. Patching =
- * rebuild the pool with the two strings replaced and fix the offsets, plus
- * every chunk size that depends on the pool length (just the root's).
+/* AXML string-pool patching: the template AndroidManifest.xml is a binary
+ * AXML file whose string pool (chunk type 0x0001, UTF-16LE) holds every
+ * attribute value; the package name and application label are ordinary
+ * strings inside it. Patching = rebuild the pool with the two strings
+ * replaced and fix the offsets, plus every chunk size that depends on the
+ * pool length (just the root's).
  *
  * Project permissions (zan.proj androidPermissions) are appended as
  * <uses-permission android:name="..."/> element pairs right before the
@@ -590,8 +582,6 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     return 0;
 }
 
-/* ========================= file helpers ========================= */
-
 static unsigned char *read_all(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -616,8 +606,6 @@ static int write_all(const char *path, const unsigned char *d, size_t n) {
     fclose(f);
     return 0;
 }
-
-/* ========================= Java discovery + auto-download ========================= */
 
 static int file_exists(const char *p) {
 #ifdef _WIN32
@@ -736,7 +724,6 @@ static int ensure_java(char *out, size_t outsz) {
 #endif
     }
     if (file_exists(done)) {
-        /* previously downloaded */
 #ifdef _WIN32
         snprintf(out, outsz, "%s\\jre-win\\bin\\java.exe", zdir);
 #else
@@ -785,8 +772,6 @@ static int ensure_java(char *out, size_t outsz) {
     return 0;
 }
 
-/* ========================= keystore + signing ========================= */
-
 static int find_java(char *out, size_t outsz);
 
 static int ensure_keystore(char *out, size_t outsz) {
@@ -811,8 +796,6 @@ static int run_quiet(const char *cmd) {
     return rc == 0 ? 0 : -1;
 }
 
-/* ========================= main entry ========================= */
-
 int zan_apk_build(const char *apk_path, const char *lib_main,
                   const char *abi, const char *package, const char *label,
                   const char *shell_dir, char **extra_libs, int extra_count,
@@ -820,7 +803,6 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
     char tmp_apk[1400];
     snprintf(tmp_apk, sizeof(tmp_apk), "%s.tmp", apk_path);
 
-    /* ---- load shell assets ---- */
     char path[1400];
     size_t man_len = 0, arsc_len = 0, dex_len = 0, lib_len = 0;
     snprintf(path, sizeof(path), "%s/AndroidManifest.xml.bin", shell_dir);
@@ -838,7 +820,6 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
         return 1;
     }
 
-    /* ---- patch the manifest string pool ---- */
     unsigned char *man2 = NULL; size_t man2_len = 0;
     int prc = axml_patch(manifest, man_len, package, label,
                          perm_count, perms, &man2, &man2_len);
@@ -846,7 +827,6 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
     if (prc != 0) { fprintf(stderr, "error: manifest patch failed\n");
         free(arsc); free(dex); free(lib); return 1; }
 
-    /* ---- assemble the zip ---- */
     zip_t z; zip_start(&z);
     if (zip_add(&z, "AndroidManifest.xml", man2, man2_len, 1, 4) != 0 ||
         zip_add(&z, "resources.arsc", arsc, arsc_len, 0, 4) != 0 ||
@@ -915,7 +895,6 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
         return 1;
     }
 
-    /* ---- sign ---- */
     char exe_dir[1200] = {0};
 #ifdef _WIN32
     { char mod[1200]; DWORD n = GetModuleFileNameA(NULL, mod, sizeof(mod));

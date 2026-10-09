@@ -1,13 +1,8 @@
 /* irgen_builtins.c -- builtin string-method helpers and EH-owned temporaries.
- *
- * Part of the irgen translation unit: this file is #include'd by irgen.c
- * (in a fixed order) and must not be compiled standalone. Splitting keeps
- * the single-TU static linkage while keeping each concern in its own file.
- */
+ * #include'd by irgen.c in a fixed order; not compiled standalone. */
 
-/* ---- builtin string-method helpers (lazily emitted once per module) ----
- * Bodies use libc (strlen/strstr/memcpy/toupper) plus zan_rt_str_alloc, so
- * every returned string is an ordinary owned rc string. */
+/* String-method bodies use libc (strlen/strstr/memcpy/toupper) plus
+ * zan_rt_str_alloc, so every returned string is an ordinary owned rc string. */
 
 static LLVMValueRef get_libc_fn(zan_irgen_t *g, const char *name, LLVMTypeRef ty) {
     LLVMValueRef f = LLVMGetNamedFunction(g->mod, name);
@@ -628,8 +623,7 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(b, live);
     /* Add only bumps the count, so the index reads as stale on the next lookup.
      * Indexing just the appended keys keeps insertion amortized O(1): a full
-     * rebuild per insert made insert-then-lookup loops quadratic in time and in
-     * allocation (gigabytes for a dictionary with tens of thousands of keys). */
+     * rebuild per insert makes insert-then-lookup loops quadratic. */
     LLVMValueRef fits = zan_icmp(b, LLVMIntSGE, icap,
         zan_mul(b, cnt, LLVMConstInt(i64, 4, 0), "want4"), "fits");
     LLVMValueRef grew = zan_icmp(b, LLVMIntSLT, icnt, cnt, "grew");
@@ -663,8 +657,8 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMBuildBr(b, caploop);
 
     LLVMPositionBuilderAtEnd(b, alloc);
-    /* The old table is dead once a bigger one is allocated: dropping it on the
-     * floor leaked one table per rebuild. */
+    /* The old table is dead once a bigger one is allocated: free it, else it
+     * leaks one table per rebuild. */
     LLVMTypeRef ixfree_ty = LLVMFunctionType(LLVMVoidTypeInContext(c),
         (LLVMTypeRef[]){ i8ptr }, 1, 0);
     LLVMValueRef ixfree = get_libc_fn(g, "free", ixfree_ty);
@@ -803,13 +797,9 @@ static LLVMValueRef get_dict_remove_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(b, nokey, miss, hit);
 
     LLVMPositionBuilderAtEnd(b, hit);
-    /* cnt--; the hash index is dropped wholesale (indexed_count = 0). The
-     * caller shifts every entry above the hole down one slot so the parallel
-     * buffers keep insertion order (C# observable enumeration semantics; the
-     * layout contract documented at dict_struct_type). With every entry above
-     * fi renumbered, an in-place index repair is impossible — find rebuilds
-     * the index from scratch on the next lookup (its icnt != cnt stale check
-     * fires; the rebuild is the same O(n) class as the data shift itself). */
+    /* cnt--; the hash index is dropped wholesale (indexed_count = 0): with
+     * every entry above fi renumbered, an in-place index repair is impossible,
+     * so find rebuilds the index from scratch on the next lookup (doc above). */
     LLVMValueRef cnt = LLVMBuildLoad2(b, i64, cntp, "cnt");
     LLVMBuildStore(b, zan_sub(b, cnt, LLVMConstInt(i64, 1, 0), "cnt.d"), cntp);
     LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), icntp);
@@ -900,23 +890,13 @@ static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
 }
 
 /* Handler-stack and unwind-stack storage: one independent state block per
- * thread.
- *
- * Handler depth is *runtime* nesting -- one slot per try currently entered, so
- * a recursive function with a try/catch has no static bound. The previous
- * fixed 16-slot global array did no bound check at all: arming the 17th
- * handler wrote a jmp_buf past the end (access violation, see A20), and
- * growing a single buffer with realloc moves armed jmp_bufs out from under
- * whoever is inside a try.
- *
- * Sharing one stack process-wide is wrong on its own: `System.Threading`
- * programs run Zan code on real OS threads (zan_thread_start), each with its
- * own call stack, so a throw on thread B would longjmp into thread A's frames
- * (A21). The state therefore lives in a per-thread block reached through
+ * thread. Handler depth is *runtime* nesting (one slot per entered try, so a
+ * recursive try/catch has no static bound) and growing a single buffer would
+ * move armed jmp_bufs out from under whoever is inside a try; sharing one
+ * stack process-wide would let a throw on thread B longjmp into thread A's
+ * frames. The state therefore lives in a per-thread block reached through
  * __zan_eh_state(): a thread-id keyed open-addressed table, since native TLS
- * is unusable in emitted code on the bundled MinGW/lld toolchain (the first
- * access to a thread_local global faults on _tls_index) and adding a runtime
- * object would have to be cross-built for every supported target.
+ * is unusable in emitted code on the bundled MinGW/lld toolchain.
  *
  * Inside a block both stacks use a chunk table: a fixed array of chunk
  * pointers, each chunk calloc'd on first use and never freed, moved or
@@ -951,10 +931,8 @@ static LLVMValueRef eh_add_global(zan_irgen_t *g, LLVMTypeRef ty,
 
 /* The calling thread's cached EH state pointer: `__zan_eh_state` otherwise
  * repeats pthread_self plus an open-addressed probe of the thread table on
- * every use, and a keep-alive HTTP request makes ~36 of them (each temporary
- * pushed for exception safety asks twice). A thread-local slot answers the
- * steady-state call in two instructions; the table stays the source of truth,
- * and `__zan_eh_release` clears the slot when it drops the block.
+ * every use. The table stays the source of truth, and `__zan_eh_release`
+ * clears the slot when it drops the block.
  *
  * The TLS model is picked rather than left to the default: an executable or a
  * load-time shared object can use initial-exec (a GOT-relative load), while a
@@ -963,18 +941,16 @@ static LLVMValueRef eh_add_global(zan_irgen_t *g, LLVMTypeRef ty,
  *
  * Returns NULL where the cache is unavailable, and callers then go straight to
  * the table:
- *   - WASM has one thread and no TLS, so the table probe is already the whole
- *     cost of a lookup;
+ *   - WASM has one thread and no TLS;
  *   - bare-metal riscv32 (ESP32-C3/C6) runs the same single-thread contract
  *     with no TLS block and no tp register: a GOT-slot load for the
  *     initial-exec thread-local answers 0 and the `add a0,a0,tp` turns it
  *     into a wild pointer that traps;
  *   - on Windows the bundled linker (GNU ld 2.36.1, i386pep) emits a base
- *     relocation over the section-relative displacement of a COFF TLS access
- *     (`mov 0x8(%rax),%rax` after the %gs:0x58 / _tls_index pair), so ASLR
- *     rewrites the offset at load time and the very first lookup reads a wild
- *     address. Emitting no thread-local at all is the only way to keep both
- *     the relocation section and a working binary. */
+ *     relocation over the section-relative displacement of a COFF TLS access,
+ *     so ASLR rewrites the offset at load time and the very first lookup
+ *     reads a wild address. Emitting no thread-local at all is the only way
+ *     to keep both the relocation section and a working binary. */
 static LLVMValueRef get_eh_self_slot(zan_irgen_t *g) {
     if (g->target_is_windows ||
         strstr(g->target_triple, "wasm") ||
@@ -1211,8 +1187,7 @@ static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
     /* Zeroed fresh array: this is a plain store. */
     LLVMBuildStore(g->builder, k, nkp);
     /* sb is ptr-to-i8*, so GEP2 with that element type scales p by 8 itself;
-     * multiplying here too wrote new_states[p] at sb + p*64 -- out of bounds
-     * on the first real rehash, and the >1024-thread segfault. */
+     * multiplying here too would index out of bounds. */
     LLVMValueRef nsp = LLVMBuildGEP2(g->builder, states_ptr_ty, sb, &p, 1,
                                      "gw.nsp");
     LLVMValueRef osp = LLVMBuildGEP2(g->builder, states_ptr_ty,
@@ -1225,9 +1200,7 @@ static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
     LLVMPositionBuilderAtEnd(g->builder, npos);
     /* Wrap the probe back to slot 0 at the array end: the start slot is masked
      * and the reader probes mask every step, so without this mask a collision
-     * chain that crosses the last slot walks off the allocation and writes the
-     * key/state pair into unowned heap -- first reachable once more than
-     * ZAN_EH_THREADS threads claim states, i.e. at the first real rehash. */
+     * chain that crosses the last slot walks off the allocation. */
     LLVMValueRef p2 = zan_and(g->builder,
         zan_add(g->builder, p, LLVMConstInt(i64t, 1, 0), "p.next"),
         LLVMBuildSub(g->builder, newcap, LLVMConstInt(i64t, 1, 0), "gw.m1b"),
@@ -1310,13 +1283,11 @@ static void add_enum_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
                           const char *name);
 
 /* i8* __zan_eh_state_fast(): the thread-local cache read, with the table
- * lookup left out of line. Every push and pop of an owned temporary asks for
- * the state block, and an out-of-line call for what is a GOT-relative load
- * plus a null test showed up as ~6% of a keep-alive request's user time.
- * alwaysinline rather than a hint: the wrapper only pays off when the fast
- * path lands in the caller, and the optimizer's own size-based hint stops at
- * four blocks. Falls back to the table accessor where there is no cache
- * (see get_eh_self_slot). */
+ * lookup left out of line (every push and pop of an owned temporary asks for
+ * the state block). alwaysinline rather than a hint: the wrapper only pays
+ * off when the fast path lands in the caller, and the optimizer's own
+ * size-based hint stops at four blocks. Falls back to the table accessor
+ * where there is no cache (see get_eh_self_slot). */
 static LLVMValueRef get_eh_state_fast_fn(zan_irgen_t *g) {
     LLVMValueRef slow = get_eh_state_fn(g);
     LLVMValueRef self_slot = get_eh_self_slot(g);
@@ -1377,8 +1348,7 @@ static void emit_eh_oom_abort(zan_irgen_t *g, const char *msg) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef pty = LLVMFunctionType(i32t, &i8ptr, 1, 1);
-    /* interned: only a handful of texts exist but each was a fresh global;
-     * the intern table also dedups across the multiple EH chunk helpers. */
+    /* Interned: dedups across the multiple EH chunk helpers. */
     LLVMValueRef fmt = zan_irgen_intern_string(g, msg);
     zan_call2(g->builder, pty, get_libc_fn(g, "printf", pty), &fmt, 1, "");
     LLVMTypeRef ety = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i32t, 1, 0);
@@ -1538,7 +1508,6 @@ static void emit_eh_release_fn(zan_irgen_t *g) {
     LLVMBuildRetVoid(g->builder);
 }
 
-/* i8* __zan_eh_state(): the calling thread's EH state block, created on that
 /* i8* __zan_eh_state(): the calling thread's EH state block, created on that
  * thread's first use of it.
  *
@@ -1730,8 +1699,7 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
  * -- required for armed jmp_bufs. Running past the chunk table (4096 live
  * handlers / 256K stacked temporaries per thread) or failing to allocate a
  * chunk is fatal: there is no correct way to continue a try whose handler
- * cannot be armed, and silently dropping the entry is what A19/A20 were
- * about. */
+ * cannot be armed, and silently dropping the entry corrupts the stack. */
 static LLVMValueRef get_eh_chunk_fn(zan_irgen_t *g, const char *name,
                                     unsigned field, unsigned shift,
                                     unsigned elem, const char *deep_msg) {
@@ -1872,25 +1840,20 @@ static bool target_is_windows_arm64(zan_irgen_t *g) {
 }
 
 /* i32 setjmp on the current target: `_setjmp(buf, NULL)` on Windows, `_setjmp(buf)`
- * elsewhere (no sigmask save). The Windows form is load-bearing, not a
- * redundant argument: on the bundled toolchain the generated program links
- * msvcrt.dll, whose `_setjmp` follows the MSVC x64 convention of saving the
- * caller's return address from rdx into jmp_buf[0] (longjmp restores it), and
- * it is the two-argument call shape that makes the LLVM backend emit the
- * `rdx = return address` preamble for `_setjmp`. A one-argument call leaves
- * rdx as garbage, longjmp jumps to it, and every throw crashes. The call
- * carries `returns_twice`: without it the backend is free to keep values in
- * registers across the setjmp, and whatever the longjmp'd-to catch block reads
- * afterwards is garbage (it showed up as corrupted exception messages and
- * access violations in unoptimized builds).
+ * elsewhere (no sigmask save). The Windows two-argument form is load-bearing:
+ * the bundled toolchain links msvcrt.dll, whose `_setjmp` saves the caller's
+ * return address from rdx into jmp_buf[0] (longjmp restores it), and it is the
+ * two-argument call shape that makes the LLVM backend emit the
+ * `rdx = return address` preamble -- a one-argument call leaves rdx as garbage
+ * and every throw jumps to it. The call carries `returns_twice`: without it
+ * the backend may keep values in registers across the setjmp, and whatever
+ * the longjmp'd-to catch block reads afterwards is garbage.
  *
  * Windows-arm64 lowers onto mingw-w64's own static pair instead: msvcrt.dll
- * on ARM64 has no `_setjmp` to link against (mingw's setjmp.h spells it out:
- * "ARM64 msvcrt.dll lacks _setjmp, only has _setjmpex"), and the rdx-preamble
- * trick is x64-only. `__mingw_setjmp` saves the return address straight from
- * Lr at entry -- nothing to arrange -- and `__mingw_longjmp` restores the
- * same buffer; both are in libmingwex.a of every mingw-ABI arm64 toolchain,
- * with no OS export involved. */
+ * on ARM64 has no `_setjmp`, and the rdx-preamble trick is x64-only.
+ * `__mingw_setjmp` saves the return address straight from Lr at entry and
+ * `__mingw_longjmp` restores the same buffer; both are in libmingwex.a of
+ * every mingw-ABI arm64 toolchain, with no OS export involved. */
 static LLVMValueRef emit_eh_setjmp(zan_irgen_t *g, LLVMValueRef bufp) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1940,15 +1903,14 @@ static void emit_eh_longjmp(zan_irgen_t *g, LLVMValueRef bufp) {
     add_enum_attr(g, fn, call, "noreturn");
 }
 
-/* ---- WebAssembly EH (wasm32 target) ---------------------------------------
- * wasi-libc ships no setjmp/longjmp, so the wasm32 target lowers try/catch
- * onto the WebAssembly exception-handling proposal instead: `try` becomes a
- * catchswitch whose unwind edges are the invokes zan_call2 emits inside the
- * body, `throw` becomes the `wasm.throw` intrinsic with the C++ exception
- * tag (the tag object itself is toolchain/wasm32/zanrt_ehtag.o, linked on
- * demand). The engine unwinds, so the __zan_eh_* globals keep exactly the
- * role they have in the longjmp lowering: in-flight object, owned flag and
- * type descriptor for catch dispatch, armed-handler stack for cleanup. */
+/* WebAssembly EH (wasm32 target): wasi-libc ships no setjmp/longjmp, so
+ * try/catch lowers onto the WebAssembly exception-handling proposal -- `try`
+ * becomes a catchswitch whose unwind edges are the invokes zan_call2 emits
+ * inside the body, `throw` becomes the `wasm.throw` intrinsic with the C++
+ * exception tag (the tag object is toolchain/wasm32/zanrt_ehtag.o, linked on
+ * demand). The engine unwinds, so the __zan_eh_* globals keep the role they
+ * have in the longjmp lowering: in-flight object, owned flag and type
+ * descriptor for catch dispatch, armed-handler stack for cleanup. */
 
 /* void @llvm.wasm.throw(i32 tag, i8* payload), noreturn: the raise used where
  * no same-function pad exists (a throw escaping this frame). The engine
@@ -2075,27 +2037,24 @@ static LLVMBasicBlockRef emit_wasm_lpad(zan_irgen_t *g,
     return lpad_bb;
 }
 
-/* ---- EH-owned temporaries -------------------------------------------------
- * `throw` unwinds with longjmp, which skips the compiler-emitted releases of
- * owned temporaries that are live across a call (a partially-constructed
- * object during its ctor, or an owned receiver temp of a method call), so a
- * throwing callee would leak them. Each such temp is pushed onto a small
- * global stack for the duration of the call and popped on normal return;
- * entering a catch releases every entry pushed after its try was entered. */
+/* EH-owned temporaries: `throw` unwinds with longjmp, which skips the
+ * compiler-emitted releases of owned temporaries that are live across a call
+ * (a partially-constructed object during its ctor, or an owned receiver temp
+ * of a method call), so a throwing callee would leak them. Each such temp is
+ * pushed onto a small global stack for the duration of the call and popped on
+ * normal return; entering a catch releases every entry pushed after its try
+ * was entered. */
 /* Storage for the unwind stack: chunked like the handler stack (see
  * get_eh_chunk_fn), because its depth is recursion depth times the number of
- * live owning locals per frame -- nothing the compiler can bound. The fixed
- * array it replaced silently dropped entries past its end and leaked whatever
- * they pointed at when an exception unwound past them (A19). */
+ * live owning locals per frame -- nothing the compiler can bound. */
 static LLVMValueRef get_eh_tmp_top_global(zan_irgen_t *g) {
     return emit_eh_field_ptr(g, EH_F_TMPS_TOP, "eh.tmptopp");
 }
 
 /* i8* __zan_eh_tmp_slot_fast(i8* state, i32 idx): entry `idx` when it lives in
  * the unwind stack's first chunk, which is every entry a program under 4096
- * live owned temporaries per thread ever asks for. Only chunk creation and the
- * deeper chunks stay out of line; the accessor call itself was ~6% of a
- * keep-alive request's user time, paid twice per stacked temporary. */
+ * live owned temporaries per thread ever asks for; only chunk creation and
+ * the deeper chunks stay out of line. */
 static LLVMValueRef get_eh_tmp_slot_fast_fn(zan_irgen_t *g, LLVMValueRef slow) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tmp_slot_fast");
     if (fn) return fn;
@@ -2595,7 +2554,7 @@ static void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj) {
 /* Register a *variable slot* with the unwinder: an exception raised anywhere
  * below this frame releases whatever the variable holds at that moment, which
  * is the only way a longjmp-based unwind can free the locals of the frames it
- * skips over (A8-12). */
+ * skips over. */
 static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind) {
     if (!slot || LLVMGetTypeKind(LLVMTypeOf(slot)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -3104,12 +3063,10 @@ static LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr,
  * idempotent so re-emission (e.g. per generic instantiation) is safe. */
 /* Default parameter values: `F(int a, int b = 2)` invoked as `F(1)` has the
  * declared default expression appended at the call site, which is where C#
- * evaluates it. Without this the call was emitted with fewer arguments than the
- * callee declares and failed LLVM verification ("Incorrect number of arguments
- * passed"). The call node is mutated in place, and the rewrite is idempotent:
- * once the argument list is full there is nothing left to append. A trailing
- * `params` tail and operator methods (whose declared list carries an injected
- * receiver) are left to pack_params_args. */
+ * evaluates it. The call node is mutated in place, and the rewrite is
+ * idempotent: once the argument list is full there is nothing left to append.
+ * A trailing `params` tail and operator methods (whose declared list carries
+ * an injected receiver) are left to pack_params_args. */
 /* Reorder named call arguments (`F(b: 2, x: 10)`) to the callee's parameter
  * order once the method symbol is known. Positional arguments fill the
  * remaining slots left to right, mirroring C#: a named argument binds to the

@@ -1,16 +1,13 @@
 /* irgen_abi.c -- C calling-convention classification for extern (FFI) calls.
  *
- * LLVM leaves aggregate classification to the frontend: an argument typed
- * `%struct.P` in IR is *not* what a C compiler passes for `struct P`. Win64
- * puts an 8-byte struct in one integer register and hands anything else over
- * as a pointer to a caller-made copy; SysV splits the first 16 bytes into
- * eightbytes classified INTEGER or SSE; AArch64 has homogeneous float
- * aggregates. Getting this wrong reads arguments out of the wrong registers.
- *
- * Every extern whose signature mentions a struct therefore gets two functions:
- * the real symbol, declared with the register/memory shape the platform C
- * compiler uses, and an internal thunk carrying the Zan-level signature that
- * converts between the two. Call sites keep calling the Zan-level signature.
+ * LLVM leaves aggregate classification to the frontend, so every extern whose
+ * signature mentions a struct gets two functions: the real symbol, declared
+ * with the register/memory shape the platform C compiler uses (Win64: an
+ * 8-byte struct in one integer register, anything else a pointer to a
+ * caller-made copy; SysV: the first 16 bytes split into INTEGER/SSE
+ * eightbytes; AArch64: homogeneous float aggregates), and an internal thunk
+ * carrying the Zan-level signature that converts between the two. Call sites
+ * keep calling the Zan-level signature.
  */
 
 typedef enum {
@@ -140,8 +137,6 @@ static bool abi_is_aggregate(LLVMTypeRef t) {
     return k == LLVMStructTypeKind || k == LLVMArrayTypeKind;
 }
 
-/* ---- SysV x86-64 eightbyte classification ---- */
-
 typedef enum { SYSV_NONE = 0, SYSV_SSE, SYSV_INTEGER, SYSV_MEMORY } sysv_class_t;
 
 typedef struct {
@@ -229,8 +224,6 @@ static LLVMTypeRef sysv_part_type(zan_irgen_t *g, sysv_info_t *in, int eb) {
     return LLVMFloatTypeInContext(g->ctx);
 }
 
-/* ---- AArch64 homogeneous float aggregates ---- */
-
 static bool aarch64_hfa(LLVMTypeRef t, LLVMTypeRef *base, int *count) {
     switch (LLVMGetTypeKind(t)) {
     case LLVMFloatTypeKind:
@@ -256,8 +249,6 @@ static bool aarch64_hfa(LLVMTypeRef t, LLVMTypeRef *base, int *count) {
         return false;
     }
 }
-
-/* ---- classification entry points ---- */
 
 static void abi_classify(zan_irgen_t *g, abi_target_t tgt, LLVMTypeRef ty,
                          bool is_return, abi_slot_t *slot) {
@@ -438,7 +429,6 @@ static void abi_pending_report(zan_irgen_t *g) {
 static LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
                                      LLVMTypeRef zan_ft) {
     unsigned pc = LLVMCountParamTypes(zan_ft);
-    /* Sized by the actual parameter count to support arbitrary signature widths. */
     LLVMTypeRef *zan_params =
         (LLVMTypeRef *)calloc(pc ? pc : 1, sizeof(LLVMTypeRef));
     if (!zan_params) return NULL;

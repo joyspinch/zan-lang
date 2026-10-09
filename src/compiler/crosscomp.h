@@ -5,8 +5,6 @@
 
 #include <stdbool.h>
 
-/* ---- Target architecture ---- */
-
 typedef enum {
     ZAN_ARCH_X86_64,
     ZAN_ARCH_AARCH64,
@@ -14,8 +12,6 @@ typedef enum {
     ZAN_ARCH_RISCV32,
     ZAN_ARCH_WASM32,
 } zan_arch_t;
-
-/* ---- Target OS ---- */
 
 typedef enum {
     ZAN_OS_WINDOWS,
@@ -28,8 +24,6 @@ typedef enum {
     ZAN_OS_FREESTANDING,
 } zan_os_t;
 
-/* ---- Target ABI ---- */
-
 typedef enum {
     ZAN_ABI_MSVC,
     ZAN_ABI_GNU,
@@ -37,8 +31,6 @@ typedef enum {
     ZAN_ABI_APPLE,
     ZAN_ABI_WASM,
 } zan_abi_t;
-
-/* ---- Target triple ---- */
 
 typedef struct {
     zan_arch_t arch;

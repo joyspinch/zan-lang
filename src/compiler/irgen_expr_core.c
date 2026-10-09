@@ -1,12 +1,6 @@
-/* irgen_expr_core.c -- expression codegen: emit_expr/emit_stmt forward decls' helpers --
- * lvalues, loads/stores, comparisons and small shared emit utilities.
- *
- * Part of the irgen translation unit: this file is #include'd by irgen.c
- * (in a fixed order) and must not be compiled standalone. Splitting keeps
- * the single-TU static linkage while keeping each concern in its own file.
- */
-
-/* ---- expression codegen ---- */
+/* irgen_expr_core.c -- expression codegen helpers (lvalues, loads/stores,
+ * comparisons, shared emit utilities); #include'd by irgen.c in a fixed
+ * order, not compilable standalone. */
 
 /* defined in later-included parts of this translation unit */
 static zan_type_t *subst_type_param(zan_type_t *t, zan_type_t *recv);
@@ -51,13 +45,10 @@ static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
  * across every async frame (see docs/ASYNC_CPS_DESIGN.md). */
 enum {
     ASYNC_FRAME_SCHED = 0,        /* i64: scheduler state bits, owned by the
-                                   * multi-worker driver (see rt_io.c: QUEUED /
+                                   * multi-worker driver (rt_io.c: QUEUED /
                                    * RUNNING / NOTIFIED / DEAD). Kept at offset
                                    * 0 of every frame so the driver can CAS it
-                                   * through a bare i8* handle: that single word
-                                   * replaces the per-shard hash set that used to
-                                   * suppress duplicate readies and the linear
-                                   * scan that kept one frame off two workers. */
+                                   * through a bare i8* handle. */
     ASYNC_FRAME_SCHED_STEP = 1,   /* void(i8*)*: resume fn banked by a ready that
                                    * arrived while the frame was running, to be
                                    * re-queued when its step returns */
@@ -73,7 +64,7 @@ enum {
                                    * prefix, so its offsets cannot depend on one
                                    * body's return type); the *encoding* is
                                    * type-directed, so a narrower or unsigned
-                                   * type survives it once `int` is 32 bits. */
+                                   * type survives it. */
     ASYNC_FRAME_CLEANUP = 7,      /* void(i8*)*: releases owned slots + frees the frame */
     ASYNC_FRAME_HCOUNT = 8,       /* i32: try handlers currently armed by this frame */
     ASYNC_FRAME_SELF_STEP = 9,    /* void(i8*)*: this frame's own resume/step fn.
@@ -84,24 +75,22 @@ enum {
     ASYNC_FRAME_EXC = 10,         /* i8*: exception this coroutine completed with */
     ASYNC_FRAME_EXC_TID = 11,     /* i8*: its class type descriptor (or null) */
     ASYNC_FRAME_EXC_OWNED = 12,   /* i32: the exception carries a +1 reference */
-    ASYNC_FRAME_CANCEL = 13,      /* i32: 1 once cancellation was requested for
-                                   * this coroutine (Task.Cancel). Cooperative:
-                                   * the frame observes it at its next state
-                                   * block and completes early instead of
-                                   * running the rest of the body. Part of the
-                                   * shared header so __zan_co_cancel can set it
-                                   * through an i8* handle. */
+    ASYNC_FRAME_CANCEL = 13,      /* i32: 1 once cancellation was requested
+                                   * (Task.Cancel). Cooperative: the frame
+                                   * observes it at its next state block and
+                                   * completes early. In the shared header so
+                                   * __zan_co_cancel can set it through an i8*
+                                   * handle. */
     ASYNC_FRAME_CHILD = 14,       /* i8*: the sub-frame this coroutine is
                                    * currently suspended on (null while it runs
-                                   * and when it suspends on a timer/IO), so
-                                   * cancellation propagates down the await
-                                   * chain to the coroutine actually waiting. */
+                                   * or waits on a timer/IO), so cancellation
+                                   * propagates down the await chain. */
     ASYNC_FRAME_LNEXT = 15,       /* i8*: intrusive link of the live detached
                                    * (Task.Spawn) frame list rooted at the
-                                   * module's __zan_co_live. A spawn handle can
+                                   * module's __zan_co_live; a spawn handle can
                                    * outlive the coroutine (the reaper frees the
-                                   * frame), so Task.Cancel first checks the
-                                   * handle against this list. */
+                                   * frame), so Task.Cancel checks the handle
+                                   * against this list. */
     ASYNC_FRAME_PENDING_COUNT = 16, /* i32: live pending exits, past the shared
                                     * 16-field runtime header */
     ASYNC_FRAME_HSTACK = 17,      /* [ntries x i32]: ids of the try
@@ -155,15 +144,14 @@ static LLVMBasicBlockRef get_async_suspend_ret_bb(zan_irgen_t *g);
 static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub, LLVMValueRef tmp_mark);
 
 /* Shared lowering for the Task instance members (`t.Wait()`, `t.Result`,
- * `t.IsCompleted`; the Task.Run/Spawn spawn-side lives in irgen_call.c).
- * `hp` is the task's frame pointer (a spawned coroutine handle). Wait pumps
- * the cooperative driver until that frame is done — the only way a
- * synchronous context can let a spawned coroutine make progress —
- * IsCompleted is a non-pumping probe, and Result reads the frame's result
- * slot (decoded to `rt`) and reaps the frame so the value survives the
- * coroutine. mode: 0 = Wait on a plain Task (pump only; its spawn installed
- * the reaper), 1 = Result (pump, read, reap), 2 = IsCompleted, 3 = Wait on a
- * Task<T> (pump, reap; the result is discarded). */
+ * `t.IsCompleted`; the spawn-side lives in irgen_call.c). `hp` is the task's
+ * frame pointer (a spawned coroutine handle). Wait pumps the cooperative
+ * driver until that frame is done — the only way a synchronous context can
+ * let a spawned coroutine make progress; IsCompleted is a non-pumping probe;
+ * Result reads the frame's result slot (decoded to `rt`) and reaps the frame.
+ * mode: 0 = Wait on Task (pump only; its spawn installed the reaper),
+ * 1 = Result (pump, read, reap), 2 = IsCompleted, 3 = Wait on Task<T>
+ * (pump, reap; the result is discarded). */
 static LLVMValueRef emit_task_member(zan_irgen_t *g, LLVMValueRef hp,
                                      zan_type_t *rt, int mode) {
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -229,19 +217,11 @@ static zan_ast_node_t *name_path_head(zan_ast_node_t *node) {
     return (node && node->kind == AST_IDENTIFIER) ? node : NULL;
 }
 
-/* Resolve the declared type of an `obj.field` member access so that element
- * indexing on struct/class array fields (e.g. `b.data[i]`) can determine the
- * element LLVM type. Returns NULL when the field/type cannot be resolved. */
-/* ---- C# conversion rules: reject unsafe native-integer narrowing (A0) ----
- *
- * C# only converts implicitly when the destination can hold every value of
- * the source: `int -> long` / `int -> nint` are implicit, while `nint -> int`
- * needs an explicit cast. Since Zan's `int` is now 32-bit, silently accepting
- * a pointer-width handle in an `int` carrier truncates live pointers on 64-bit
- * targets. That conversion is therefore an unconditional compile error.
- *
- * Other historical numeric narrowing remains available as the opt-in
- * `ZAN_WARN_NARROW=1` migration diagnostic until those call sites are audited. */
+/* C# conversion rules: implicit narrowing is rejected when the destination
+ * cannot hold every source value. `nint -> int` is an unconditional compile
+ * error (int is 32-bit, so a pointer-width handle would truncate); other
+ * numeric narrowing stays available as the opt-in ZAN_WARN_NARROW=1
+ * migration diagnostic. */
 static int conv_rank(zan_type_t *t) {
     if (!t) return 0;
     switch (t->kind) {
@@ -265,10 +245,8 @@ static bool narrow_warn_enabled(void) {
  * integer expression qualifies, so this folds literals and the operators a
  * constant can be spelled with, and reports "not constant" for anything else. */
 /* Fold in unsigned arithmetic: signed overflow during constant folding is
- * C-level UB in the compiler itself (a source literal like
- * `long x = 9223372036854775807 * 2;` would be enough to trip it), while the
- * wrap-around two's-complement result is exactly what the folded value
- * means. */
+ * C-level UB in the compiler itself, while the wrap-around two's-complement
+ * result is exactly what the folded value means. */
 static bool const_int_expr(zan_ast_node_t *e, int64_t *out) {
     if (!e) return false;
     switch (e->kind) {
@@ -365,10 +343,9 @@ static void check_implicit_narrowing(zan_irgen_t *g, zan_type_t *dst,
 static zan_symbol_t *find_user_conversion(zan_irgen_t *g, zan_type_t *from_type,
                                           zan_type_t *to_type, const char *op_name);
 
-/* A value struct and a primitive are unrelated types. Without this check the
+/* A value struct and a primitive are unrelated types; without this check the
  * mismatch only surfaces as an LLVM verification failure with no source
- * location ("Call parameter type does not match function signature"), which is
- * useless while migrating an API onto a value type. */
+ * location. */
 static void check_value_type_mismatch(zan_irgen_t *g, zan_type_t *dst, zan_type_t *src,
                                       zan_ast_node_t *at, const char *what) {
     if (!g || !g->diag || !at || !dst || !src) return;
@@ -376,7 +353,7 @@ static void check_value_type_mismatch(zan_irgen_t *g, zan_type_t *dst, zan_type_
     bool dst_struct = dst->kind == TYPE_STRUCT, src_struct = src->kind == TYPE_STRUCT;
     if (dst_struct == src_struct) return;
     /* A user-defined implicit conversion makes a struct↔primitive pair a real
-     * conversion rather than an unrelated-type mistake (B12). */
+     * conversion rather than an unrelated-type mistake. */
     if (find_user_conversion(g, src, dst, "op_implicit")) return;
     bool other_prim = (dst_struct ? conv_rank(src) : conv_rank(dst)) != 0 ||
                       (dst_struct ? src->kind : dst->kind) == TYPE_FLOAT ||
@@ -445,11 +422,9 @@ static bool type_full_equal(zan_type_t *a, zan_type_t *b) {
 
 /* True when `t` (recursively, through generic arguments and array/nullable
  * element types) mentions an unresolved type parameter or error type. Such
- * types appear in the bodies of generic classes/methods while T is not yet
- * bound; they are compared at instantiation time, when concrete arguments
- * substitute in. Skipping them here avoids false positives on e.g.
- * List<ListColumn<T>> vs List<ListColumn<string>>, where the outer comparison
- * is legitimate but the inner T is not yet a concrete type. */
+ * types appear in generic bodies while T is unbound and are compared at
+ * instantiation time; skipping them here avoids false positives when the
+ * outer comparison is legitimate but an inner T is not yet concrete. */
 static bool type_has_unresolved(zan_type_t *t) {
     if (!t) return true;
     if (t->kind == TYPE_ERROR || t->kind == TYPE_TYPE_PARAM) return true;
@@ -460,12 +435,11 @@ static bool type_has_unresolved(zan_type_t *t) {
 }
 
 /* Generic type arguments are invariant: List<int> is not a List<Box>, even
- * though both erase to the same object pointer. The old behaviour silently
- * accepted any container of the same class with mismatched type arguments, so
- * a method taking List<ChartData> could be handed a List<int> and the elements
- * were then dereferenced as ChartData* (the A45 crash). Reject a mismatch when
- * both sides are resolved enough to compare; unresolved (error / type-param)
- * arguments are skipped so earlier phase failures do not cascade. */
+ * though both erase to the same object pointer. Without this check a method
+ * taking List<ChartData> could be handed a List<int> whose elements are then
+ * dereferenced as ChartData*. Reject a mismatch when both sides are resolved
+ * enough to compare; unresolved (error / type-param) arguments are skipped so
+ * earlier phase failures do not cascade. */
 static void check_generic_invariance(zan_irgen_t *g, zan_type_t *dst, zan_type_t *src,
                                      zan_ast_node_t *at, const char *what) {
     if (!g || !g->diag || !at || !dst || !src) return;
@@ -788,12 +762,10 @@ static bool str_and_byte_buffer(zan_type_t *s, zan_type_t *b) {
  * `return` expressions agree on (C#'s natural-type rule). Walks the
  * straight-line statements and if/else arms, registering local declarations
  * so later returns can reference them; a loop/switch/try anywhere makes the
- * walk give up (NULL — the caller keeps today's neutral ranking rather than
- * guessing), and a nested lambda's returns belong to that lambda, not this
- * one. This is what lets a statement lambda rank delegate overloads that
- * differ only in return type: without it every candidate tied and
- * declaration order decided, which bound `x => { return x.Length; }` to the
- * string-key OrderBy and reinterpreted the int as a string pointer. */
+ * walk give up (NULL — the caller keeps neutral ranking rather than
+ * guessing), and a nested lambda's returns belong to that lambda. This is
+ * what lets a statement lambda rank delegate overloads that differ only in
+ * return type; without it every candidate ties and declaration order decides. */
 static void stmt_collect_return_types(zan_irgen_t *g, zan_ast_node_t *stmt,
                                       local_scope_t *locals,
                                       zan_type_t **found, int *mixed) {
@@ -1010,9 +982,8 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                 /* A method group is the same kind of argument as a lambda:
                  * it only converts to a delegate, so a non-delegate parameter
                  * rules the candidate out instead of scoring zero and letting
-                 * declaration order pick it. Binding `new ListView<T>(Row.Of)`
-                 * to the List<ListColumn<T>> overload stored a function
-                 * pointer in an ARC field and crashed on the retain. */
+                 * declaration order pick it (that would bind a function
+                 * pointer into an ARC field). */
                 zan_symbol_t *mg = arg_method_group(
                     g, args->items[j], locals,
                     (pt && pt->kind == TYPE_DELEGATE)
@@ -1123,11 +1094,11 @@ static bool implicit_ctor_for_arg(zan_irgen_t *g, zan_type_t *target,
 }
 
 /* A constructor call that leaves trailing defaulted parameters out
- * (`A(int x, int y = 5)` invoked as `new A(1)`) matches no entry on arity, so
- * without this the object was left with its fields at zero and no constructor
- * ran at all. Extend the argument list with the declared default expressions --
- * the call site is where C# evaluates them -- and report whether a constructor
- * of the resulting arity exists. */
+ * (`A(int x, int y = 5)` invoked as `new A(1)`) matches no entry on arity;
+ * without this the object keeps zeroed fields and no constructor runs.
+ * Extend the argument list with the declared default expressions -- the call
+ * site is where C# evaluates them -- and report whether a constructor of the
+ * resulting arity exists. */
 static bool fill_ctor_default_args(zan_irgen_t *g, zan_symbol_t *type_sym,
                                    const zan_ast_list_t *args,
                                    zan_ast_list_t *out) {
@@ -1216,10 +1187,8 @@ static int concrete_arg_score(zan_irgen_t *g, zan_type_t *pt,
         /* A string and a byte buffer share one pointer carrier at runtime,
          * and the stdlib leans on it: random bytes flow into Fill's
          * `string buf` extern as a byte[], wire data crosses both shapes.
-         * Score it neutrally instead of disqualifying -- for a candidate
-         * that is the ONLY arity match, disqualification left the caller
-         * to the historical first-declaration fallback or, after the
-         * all-disqualified reject, broke perfectly working code. */
+         * Score it neutrally instead of disqualifying -- a candidate that is
+         * the only arity match must stay selectable. */
         if (str_and_byte_buffer(pt, at) || str_and_byte_buffer(at, pt)) return 0;
         return -1;
     }
@@ -1297,9 +1266,8 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
                 local_add(locals, lp->param.name, NULL, lpt);
             }
             /* Block bodies rank by their return statements' common type:
-             * without it every delegate overload tied and declaration order
-             * decided, binding `x => { return x.Length; }` to the string-key
-             * overload. NULL keeps the neutral score. */
+             * without it every delegate overload ties and declaration order
+             * decides. NULL keeps the neutral score. */
             int bf = FAM_UNKNOWN;
             if (body->kind == AST_BLOCK) {
                 zan_type_t *bt = stmt_lambda_return_type(g, body, locals);
@@ -1336,9 +1304,8 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
             /* A parameter written over the class's own type parameters has no
              * family to rank by, but its shape still tells it apart from an
              * inherited overload: `DataGrid<T>.Add(GridColumn<T>)` has to beat
-             * `Control.Add(Control)` for a GridColumn argument, or the column
-             * lands in the child-control list and the next tree walk reads it
-             * as a Control. A bare `T` matches anything, so it stays neutral. */
+             * `Control.Add(Control)` for a GridColumn argument. A bare `T`
+             * matches anything, so it stays neutral. */
             if (pt->kind != TYPE_TYPE_PARAM) {
                 zan_type_t *gat = infer_expr_type(g, a, locals);
                 if (gat && types_match_modulo_tp(pt, gat)) score += 3;
@@ -1391,9 +1358,8 @@ static int ext_method_score(zan_irgen_t *g, zan_symbol_t *m,
  * type; among several, the best-scoring one wins (a concretely typed receiver
  * beats a generic one, and a lambda argument's body must agree with the
  * delegate's declared return type). When every candidate is disqualified on
- * argument types the answer is "no extension method": binding the first
- * name/arity match lowered the call against a foreign signature, which is the
- * same silent-miscompile shape that `resolve_overload_typed` used to have. */
+ * argument types the answer is "no extension method" -- binding the first
+ * name/arity match would lower the call against a foreign signature. */
 static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
                                            zan_istr_t name, int argc,
                                            zan_ast_node_t *call,
@@ -1438,13 +1404,10 @@ static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
     return (best && best_score >= 0) ? best : NULL;
 }
 
-/* ---- SharedTable column widths ------------------------------------------
- * A shared table's schema is fixed when the mapping is created: rt_sync
- * reserves the declared width per row, so a width past its ceiling is not a
- * request the runtime can satisfy -- Create() answers false and the program
- * carries on with its shared state quietly missing (the MVC template declared
- * an 8KB action list against a 4KB ceiling and lost its permission cache at
- * startup, leaving only a log line behind). A constant width is therefore
+/* SharedTable column widths: a shared table's schema is fixed when the
+ * mapping is created -- rt_sync reserves the declared width per row, and a
+ * width past its ceiling makes Create() answer false, so the program carries
+ * on with its shared state quietly missing. A constant width is therefore
  * judged where it is written. The ceilings mirror ZAN_TABLE_MAX_* in
  * src/runtime/rt_sync.c. */
 #define IRGEN_SHARED_MAX_STRING 1048576
@@ -1481,7 +1444,7 @@ static void check_shared_table_width(zan_irgen_t *g, zan_symbol_t *type_sym,
  * (Type.Method(args) and recv.Method(args)): among same-named, same-arity
  * candidates pick the best-scoring one (see method_args_score); ties keep
  * declaration order, and when every candidate is disqualified or no arity
- * matches, fall back to resolve_overload's historical behaviour. */
+ * matches, fall back to plain resolve_overload. */
 static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
                                             zan_symbol_t *type_sym,
                                             zan_istr_t name,
@@ -1509,12 +1472,11 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
                 m->decl->kind != AST_METHOD_DECL) continue;
             if (m->name.len != name.len ||
                 memcmp(m->name.str, name.str, name.len) != 0) continue;
-            /* Explicit type arguments pick the generic overload: without
-             * this filter `GetAsync<User>(key)` tied on argument scoring
-             * with a same-arity non-generic `GetAsync(key)` and kept the
-             * declaration-order winner, so the call was emitted against
-             * the string signature while the checker had already typed
-             * the result as `User` -- null/garbage at runtime. */
+            /* Explicit type arguments pick the generic overload: without this
+             * filter `GetAsync<User>(key)` ties on argument scoring with a
+             * same-arity non-generic `GetAsync(key)`, and the call is emitted
+             * against the wrong signature while the checker has already typed
+             * the result as `User`. */
             if (type_arg_count > 0 &&
                 m->decl->method_decl.type_params.count != type_arg_count)
                 continue;
@@ -1533,13 +1495,10 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
     if (best && best_score >= 0) return best;
     if (arity_matches > 0) {
         /* Every same-arity candidate was disqualified on concrete argument
-         * types. The historical fallback picked the first declaration by
-         * arity and lowered the call against a foreign signature: pointer
-         * carriers aligned, layouts did not, and CheckboxGroup.Add("Cheese")
-         * (no Add(string) declared at all) faulted inside Control.Adopt's
-         * stale-parent walk at gallery startup. This is the one phase that
-         * knows both sides' types for every overload, so reject here instead
-         * of emitting an executable that crashes far from the mistake. */
+         * types. Falling back to the first declaration would lower the call
+         * against a foreign signature (pointer carriers align, layouts do
+         * not) and crash far from the mistake. This is the one phase that
+         * knows both sides' types for every overload, so reject here instead. */
         zan_diag_emit(g->diag, DIAG_ERROR,
                       call ? call->loc : (zan_loc_t){0},
                       "no overload of '%.*s.%.*s' matches argument type(s)",
@@ -1642,15 +1601,13 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
  * While a generic class is being specialized, anything still phrased in its
  * type parameters is resolved against that instantiation -- a local declared
  * `T` in Box<Square> is a Square here. Method lookup and element ownership
- * both go through this, so leaving T unresolved silently lowered
- * `item.Area()` to a 0 and dropped the stored element's retain. */
+ * both go through this. */
 /* Inference is re-entered for the same subexpression many times over: a member
  * access infers its object, and overload scoring infers every argument again,
- * so a chain like `a.Next().Next().Value()` costs 2^depth inferences -- deeply
- * nested expressions took minutes and exhausted the host's memory. Results only
- * depend on the emit context (the locals in scope, the active specialization
- * and `this`), so they are memoized per AST node and the whole table is dropped
- * whenever that context changes. */
+ * so a chain like `a.Next().Next().Value()` costs 2^depth inferences. Results
+ * only depend on the emit context (the locals in scope, the active
+ * specialization and `this`), so they are memoized per AST node and the whole
+ * table is dropped whenever that context changes. */
 #define INFER_CACHE_SLOTS 65536   /* power of two */
 
 typedef struct {
@@ -1695,9 +1652,8 @@ static infer_cache_slot_t *infer_cache_slot(zan_irgen_t *g, zan_ast_node_t *e,
 
 /* Drop every memoized inference result. The table is keyed on the AST node's
  * address, so a node rewritten in place keeps its cached type from before the
- * rewrite: the implicit-ctor argument wrap turned `false` into `new Box(false)`
- * yet callers still read `bool`, saw a non-rc type and skipped the release of
- * the synthesized temporary (leakcheck_implicit_ctor_argument). */
+ * rewrite (e.g. an implicit-ctor argument wrap turns `false` into
+ * `new Box(false)` while callers still read `bool`). */
 static void infer_cache_invalidate(void) { g_infer_ctx.live = false; }
 
 /* The type of a null-conditional access is the member's type made nullable:
@@ -1821,9 +1777,9 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
     case AST_THIS_EXPR:
         return g->current_type_sym ? g->current_type_sym->type : NULL;
     case AST_BASE_EXPR:
-        /* `base.Method(...)` 成员调用的接收者类型：按 C# 语义取基类，
-         * 使重载解析在基类符号表上进行（绑定路径在 M2 已处理，这里补
-         * irgen 侧的静态类型）。没有基类时落 error，与 checker 一致。 */
+        /* `base.Method(...)` 的接收者类型按 C# 语义取基类，使重载解析在基类
+         * 符号表上进行（绑定侧已处理，这里补 irgen 侧的静态类型）；无基类时
+         * 落 error，与 checker 一致。 */
         if (g->current_type_sym && g->current_type_sym->type
             && g->current_type_sym->type->base_type) {
             return g->current_type_sym->type->base_type;
@@ -1934,11 +1890,9 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         }
         /* builtin scalar-type constants (`int.MaxValue`, `double.NaN`, ...):
          * the receiver is a primitive type name with no class symbol, so the
-         * lookup above misses; without this the inferred type is NULL and the
-         * constant value emitted by emit_expr_member_access gets printed as
-         * an int (PositiveInfinity showed as 0). Mirror the emit-side table:
-         * MaxValue/MinValue/NaN/±Infinity/Epsilon resolve to the receiver
-         * type. */
+         * lookups above miss and the inferred type would be NULL. Mirror the
+         * emit-side table: MaxValue/MinValue/NaN/±Infinity/Epsilon resolve to
+         * the receiver type. */
         if (e->member.object->kind == AST_IDENTIFIER &&
             !local_find(locals, e->member.object->ident.name)) {
             zan_istr_t on = e->member.object->ident.name;
@@ -2025,10 +1979,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         }
         /* Properties of the compiler's built-in types (string.Length,
          * List.Count, Dictionary.Count, StringBuilder.Length, array.Length)
-         * have no field symbol, so everything above misses them and the
-         * inferred type was NULL. Any lowering that keys off the receiver's
-         * static type then declined the expression -- `xs.Count.ToString()`
-         * fell through to the constant-0 fallback and printed "0". The result
+         * have no field symbol, so the lookups above miss them. The result
          * type comes from the same table the diagnostics and --emit-symbols
          * use (builtin_api.c). */
         if (ot) {
@@ -2078,9 +2029,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         if (ot && type_named(ot, "Dict", 4) &&
             ot->type_arg_count == 2)
             return ot->type_args[1];
-        /* string[i] yields a `char` (the checker types it char too). Losing
-         * the type here made `s + s[i]` format the byte code in decimal and
-         * broke every hand-rolled split/parse loop built on it. */
+        /* string[i] yields a `char` (the checker types it char too). */
         if (ot && ot->kind == TYPE_STRING) return g->binder->type_char;
         return container_elem_type(ot);
     }
@@ -2125,9 +2074,8 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             }
         }
         /* Invoking a delegate-typed local or field: the call's type is the
-         * delegate's return type. Without this a template call used straight
-         * as a receiver (`rowOf(item).Kind()`) had no type and lowered to a
-         * constant. */
+         * delegate's return type (else the call has no type and lowers to a
+         * constant when used as a receiver). */
         if (callee->kind == AST_IDENTIFIER || callee->kind == AST_MEMBER_ACCESS) {
             zan_type_t *dt = infer_expr_type_raw(g, callee, locals);
             if (dt && dt->kind == TYPE_DELEGATE)
@@ -2188,9 +2136,9 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             /* bare call: current class method, else global function */
             if (g->current_type_sym) {
                 /* Resolve the overload this call site actually reaches (arity,
-              * argument types, inherited candidates) instead of the first
-              * method with that name: a sibling overload's return type made
-              * a discarded rc result look unowned, and it leaked. */
+                 * argument types, inherited candidates) instead of the first
+                 * method with that name: a sibling overload's return type gives
+                 * await/ARC the wrong ownership carrier. */
             zan_symbol_t *m = resolve_overload_typed(g, g->current_type_sym,
                                                      callee->ident.name, e, locals);
             if (!m) m = get_method_sym(g->current_type_sym, callee->ident.name);
@@ -2219,9 +2167,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             }
             /* static call on a built-in class (File.ReadAllText, Path.Combine,
              * Directory.ListNames, ...): irgen lowers these directly, so there
-             * is no symbol to read a return type from. Without this a chained
-             * call -- File.ReadAllText(p).Split("\n") -- saw an untyped
-             * receiver and lowered to a constant. */
+             * is no symbol to read a return type from. */
             if (obj->kind == AST_IDENTIFIER && !local_find(locals, obj->ident.name)) {
                 char cls[64];
                 int cn = (int)obj->ident.name.len;
@@ -2303,11 +2249,9 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         /* `new T(...)` yields a T. An array expression is not a single rc
          * object (the NULL was meant to keep rc release logic off it), but
          * callers like foreach's collection-type dispatch need the real
-         * element layout: returning NULL there made `new int[]{...}` fall
-         * through to the List path and dereference a bare array as a List
-         * struct (crash on the first element). Resolve the `T[]` type node
-         * (it is written `T[]` for both `new T[n]` and `new T[]{...}`) and
-         * strip to the array type; the caller decides what to do with it. */
+         * element layout: resolve the `T[]` type node (it is written `T[]`
+         * for both `new T[n]` and `new T[]{...}`) and strip to the array
+         * type; the caller decides what to do with it. */
         if (e->new_expr.is_array) {
             if (!e->new_expr.type) return NULL;
             zan_type_t *at = resolve_type_ctx(g, e->new_expr.type);
@@ -2473,9 +2417,8 @@ static zan_symbol_t *expr_class_sym(zan_irgen_t *g, zan_ast_node_t *e,
                                     local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
     /* Inside a specialization a receiver typed `T` -- a local declared `T` in
-     * Box<Square> -- must be resolved for the method to be found at all;
-     * unresolved, the call silently lowered to a 0. Only the lookup resolves
-     * it: the emitted signature stays erased. */
+     * Box<Square> -- must be resolved for the method to be found at all; the
+     * emitted signature stays erased. */
     if (t && t->kind == TYPE_TYPE_PARAM) t = concretize(g, t);
     if (t && (t->kind == TYPE_CLASS || t->kind == TYPE_STRUCT)) return t->sym;
     return NULL;
@@ -2779,10 +2722,8 @@ static LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
 }
 
 /* Decimal formatting of a 64-bit integer, emitted as a self-contained
- * function so integer-to-string conversions do not go through snprintf
- * (parsing "%lld" and running the whole vfprintf machinery costs an order of
- * magnitude more than the division loop; on the JSON serializer path it was a
- * quarter of all instructions). Signature:
+ * function so integer-to-string conversions do not go through the vfprintf
+ * machinery. Signature:
  *   i64 __zan_itoa(i8 *buf, i64 val, i32 is_unsigned)
  * Writes the digits plus a NUL terminator into `buf` (needs 21 bytes) and
  * returns the digit count, terminator excluded. */

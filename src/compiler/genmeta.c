@@ -2,7 +2,7 @@
  *
  * Output shape:
  *   { "version": 1,
- *     "files":   [ "src/main.zan", ... ],   // only in _export_files
+ *     "files":   [ ... ],   // only in _export_files
  *     "classes": [ { "name","ns","kind","file","line","bases":[...],
  *                    "attrs":[...],
  *                    "fields":[{ "name","type","file","line","attrs" }],
@@ -12,8 +12,8 @@
  *     "calls":  [ { "id","file","line","col","name","recv",
  *                   "targs":[...],"args":[...] } ] }
  *
- * `recv` is a short receiver shape ("this", "id:<name>", "mem:a.b",
- * "call", "other"); `args` items are shape objects -- literals, ids, null,
+ * `recv` is a short receiver shape ("this", "id:<name>", "mem:a.b", "call",
+ * "base", "other"); args items are shape objects -- literals, ids, null,
  * lambda (with an expression tree), or other. The calls array contains only
  * generator entry points and their fluent receiver chains; ids still refer
  * to the complete compilation-unit traversal and can therefore be sparse.
@@ -36,13 +36,12 @@
 #include "../common/host_oom.h"
 
 typedef struct {
-    json_value *calls;   /* json array */
+    json_value *calls;
     int call_id;
     char cur_cls[128];   /* enclosing class name (call owner) */
     char cur_fn[128];    /* enclosing method name ("" for field initializers) */
-    /* node -> id, filled when a call is recorded. The walk is children-first
-     * (the same order the old C dbgen visited), so a receiver call is recorded before
-     * the outer call that names it as `call#<id>`. Grows as needed. */
+    /* node -> id, filled when a call is recorded; the children-first walk
+     * records a receiver before the outer call names it as `call#<id>`. */
     zan_ast_node_t **rec_nodes;
     int *rec_ids;
     int rec_count;
@@ -52,7 +51,8 @@ typedef struct {
     int *pend_ids;
     int pend_count;
     int pend_cap;
-    /* Precomputed seed filters: avoid allocating 98% of dead call DOM nodes */
+    /* precomputed seed filters: most calls are discarded before any JSON
+     * allocation */
     const char *const *expr_names;
     int expr_count;
     const char *const *table_names;
@@ -68,8 +68,6 @@ static bool gm_name_in(const char *name, const char *const *names, int count) {
 
 static json_value *gm_arg_json(zan_ast_node_t *n);
 
-/* ---- interned-string helpers (same semantics as the generator files) ---- */
-
 static void gm_istr_to(char *dst, size_t cap, zan_istr_t s) {
     size_t n = (s.str && s.len < cap - 1) ? s.len : (cap ? cap - 1 : 0);
     if (s.str && n) memcpy(dst, s.str, n);
@@ -81,12 +79,9 @@ static bool gm_istr_is(zan_istr_t s, const char *lit) {
     return s.str && s.len == (uint32_t)n && memcmp(s.str, lit, n) == 0;
 }
 
-/* ---- type reference -> string ---- */
-
-/* Append `fmt` at `pos` into `out`/`cap`, keeping the cursor inside the
- * buffer: snprintf returns the *would-be* length, so accumulating it raw
- * let a truncated write send `out + n` past the caller's stack buffer
- * (with `outsz - n` wrapping to a huge size_t). Saturates at cap-1. */
+/* Append `fmt` at `pos` into `out`/`cap`, saturating at cap-1: vsnprintf
+ * returns the *would-be* length, so accumulating it raw can run the cursor
+ * past the caller's buffer. */
 static size_t gm_snpcat(char *out, size_t cap, size_t pos,
                         const char *fmt, ...) {
     if (cap == 0) return 0;
@@ -144,8 +139,6 @@ static void gm_type_str(zan_ast_node_t *t, char *out, size_t outsz) {
     }
 }
 
-/* ---- attributes ---- */
-
 static void gm_attr_json(zan_ast_node_t *attr, json_value *obj) {
     char nm[256];
     nm[0] = '\0';
@@ -177,9 +170,6 @@ static void gm_attrs_json(zan_ast_list_t *attrs, json_value *arr) {
         json_arr_add(arr, a);
     }
 }
-
-/* ---- expression trees ---- */
-
 
 static json_value *gm_expr_tree(zan_ast_node_t *n) {
     json_value *o = json_new_obj();
@@ -333,8 +323,6 @@ static json_value *gm_arg_json(zan_ast_node_t *n) {
     return gm_expr_tree(n);
 }
 
-/* ---- call-site recording ---- */
-
 static void gm_recv_str(zan_ast_node_t *obj, char *out, size_t outsz) {
     if (!obj) { snprintf(out, outsz, "other"); return; }
     switch (obj->kind) {
@@ -356,9 +344,9 @@ static void gm_recv_str(zan_ast_node_t *obj, char *out, size_t outsz) {
     }
 }
 
-/* Reserve (or find) the placeholder id of a receiver call node. Only hit as
- * a fallback: the children-first walk records a receiver before the outer
- * call names it, so gm_record_call finds it in the rec table first. */
+/* Reserve (or find) the placeholder id of a receiver call node. Only a
+ * fallback: the children-first walk normally records the receiver before
+ * the outer call names it. */
 static int gm_recv_reserve(zan_ast_node_t *recv, gm_ctx_t *c) {
     for (int i = 0; i < c->pend_count; i++)
         if (c->pend_nodes[i] == recv) return c->pend_ids[i];
@@ -400,8 +388,8 @@ static bool gm_is_candidate_ast_call(zan_ast_node_t *call, gm_ctx_t *c) {
         if (c->pend_nodes[i] == call) return true;
     }
 
-    /* 2. Generic method calls: Json.Serialize<T>, db.Insert<T>, etc.
-     * All generator root targets carry type arguments! */
+    /* 2. Generic method calls: Json.Serialize<T>, db.Insert<T>, etc. --
+     * generator root targets carry type arguments */
     if (call->call.type_args.count > 0) return true;
 
     zan_ast_node_t *robj = (callee->kind == AST_MEMBER_ACCESS)
@@ -443,8 +431,8 @@ static bool gm_is_candidate_ast_call(zan_ast_node_t *call, gm_ctx_t *c) {
 
 static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
     zan_ast_node_t *callee = call->call.callee;
-    /* children-first: a placeholder id may still exist if this node was
-     * reserved by an outer call before it was walked (defensive path) */
+    /* a placeholder id may still exist if an outer call reserved this node
+     * before it was walked (defensive path) */
     int id = 0;
     for (int i = 0; i < c->pend_count; i++) {
         if (c->pend_nodes[i] == call) {
@@ -476,9 +464,8 @@ static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
         c->rec_count++;
     }
 
-    /* Fast discard: 98% of ordinary calls (Math, Console, list, string)
-     * are never generator seeds nor fluent chain members. Discard without
-     * allocating ANY json_value nodes or expr trees. */
+    /* fast discard: most ordinary calls are never generator seeds nor fluent
+     * chain members; return before allocating any JSON. */
     if (!gm_is_candidate_ast_call(call, c)) {
         return;
     }
@@ -587,7 +574,7 @@ static bool gm_is_codegen_seed(json_value *call, const char *const *expr_names,
         return true;
     if (gm_name_in(name, expr_names, expr_count)) return true;
     /* accessor chain head: the receiver is `<obj>.<Entity>`, so the call has
-     * no receiving call site the walk above could reach it through. */
+     * no receiving call site the walk could reach it through. */
     {
         json_value *recvx = json_obj_get(call, "recvx");
         if (recvx && recvx->type == JSON_OBJ) {
@@ -667,8 +654,8 @@ static void gm_prune_calls(json_value *calls, const char *const *expr_names,
             keep[id] = true;
     }
 
-    /* DB metadata follows fluent receivers in both directions: ancestors
-     * locate the root and descendants carry every supported chain method. */
+    /* keep fluent chains in both directions: ancestors locate the root,
+     * descendants carry the supported chain methods. */
     bool changed;
     do {
         changed = false;
@@ -705,15 +692,12 @@ static void gm_prune_calls(json_value *calls, const char *const *expr_names,
     free(keep);
 }
 
-/* ---- expression walk (finds call sites) ---- */
-
 static void gm_walk_expr(zan_ast_node_t *n, gm_ctx_t *c) {
     if (!n) return;
     switch (n->kind) {
     case AST_CALL:
-        /* children first, exactly like the old C dbgen's dg_visit_call: a chain
-         * root (`Query<T>`) is recorded before the chain methods above it,
-         * so their `recv` can name it as call#<id> */
+        /* children first: a chain root (`Query<T>`) is recorded before the
+         * chain methods above it, so their `recv` can name it call#<id> */
         gm_walk_expr(n->call.callee, c);
         for (int i = 0; i < n->call.args.count; i++)
             gm_walk_expr(n->call.args.items[i], c);
@@ -871,8 +855,6 @@ static void gm_walk_stmt(zan_ast_node_t *n, gm_ctx_t *c) {
     }
 }
 
-/* ---- top-level type shapes ---- */
-
 static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
     json_value *o = json_new_obj();
     switch (decl->kind) {
@@ -970,13 +952,12 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
                 gm_attrs_json(zan_ast_attributes(m), ma);
                 json_obj_set(mm, "attrs", ma);
                 json_arr_add(methods, mm);
-                /* constructor: the `Prop = param;` assignments that map ctor
-                 * parameters onto property names (compile-time attr classes) */
+                /* ctor: the `Prop = param;` assignments mapping ctor params
+                 * onto property names (compile-time attr classes) */
                 if (m->kind == AST_CONSTRUCTOR_DECL) {
                     json_value *co = json_new_obj();
                     /* params cannot be shared with the methods entry: the
-                     * JSON tree is freed recursively, so each child has one
-                     * owner */
+                     * JSON tree is freed recursively (one owner per child) */
                     json_value *cps = json_new_arr();
                     for (int j = 0; j < m->method_decl.params.count; j++) {
                         zan_ast_node_t *p = m->method_decl.params.items[j];
@@ -1082,17 +1063,15 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
     json_arr_add(classes, o);
 }
 
-/* ---- call-site finder (for rewrite application) ---- */
-
-/* Walk with the exact same order as the export and stop at the `id`-th
- * member call (ids start at 1, matching gm_record_call). */
+/* Walk in the exact export order and stop at the `id`-th member call (ids
+ * start at 1, matching gm_record_call). */
 typedef struct {
     int want;
     int seen;
     zan_ast_node_t *found;
     /* collect mode: store the first `cap` call-site nodes in `nodes`
-     * (index 0 == call site 1). Rewrites mutate node contents but never
-     * replace nodes, so the pointers stay valid for the whole pass. */
+     * (index 0 == call site 1); rewrites mutate node contents, never replace
+     * nodes, so the pointers stay valid for the whole pass. */
     zan_ast_node_t **nodes;
     int cap;
 } gm_find_ctx_t;
@@ -1287,10 +1266,9 @@ zan_ast_node_t *zan_genmeta_find_call(zan_ast_node_t *unit, int id) {
 
 /* One pass over the unit, storing the call-site node of id k (1-based, in the
  * export's traversal order) at nodes[k-1], for k <= cap. Returns the total
- * number of call sites, so the caller can size the array with a first call
- * (nodes = NULL). Unlike zan_genmeta_find_call this is unaffected by earlier
- * rewrites: apply_rewrites takes its snapshot before touching anything, and
- * rewrites only mutate node contents, never replace the nodes themselves. */
+ * call-site count (call with nodes = NULL to size the array). Unaffected by
+ * earlier rewrites: rewrites only mutate node contents, never replace the
+ * nodes themselves. */
 int zan_genmeta_index_calls(zan_ast_node_t *unit, zan_ast_node_t **nodes,
                             int cap) {
     gm_find_ctx_t f;
@@ -1350,7 +1328,6 @@ static char *gm_export(zan_ast_node_t *unit, zan_diag_t *diag) {
     ctx.expr_count = expr_count;
     ctx.table_names = table_names;
     ctx.table_count = table_count;
-    /* walk every method body and field initializer for call sites */
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
         if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL)
@@ -1403,14 +1380,11 @@ char *zan_genmeta_export_files(zan_ast_node_t *unit, zan_diag_t *diag) {
     return gm_export(unit, diag);
 }
 
-/* ---- expression-tree deserializer (gm_expr_tree's inverse) ----
- *
- * Rebuilds AST expression nodes from the JSON trees the generators embed in
- * rewrite directives (db_chain args, db_acc_root/db_expr_arg whole trees).
- * No binder metadata is needed: generation runs pre-binding and every node is
- * identified by shape alone. An `id` node may carry a "targs" array to build
- * a generic identifier (`Expr<User>.From`) the same way the parser does
- * (`Box<int>.Create(x)` -> inst_type_ref). */
+/* Expression-tree deserializer (gm_expr_tree's inverse): rebuilds AST
+ * expression nodes from the JSON trees the generators embed in rewrite
+ * directives. No binder metadata needed: generation runs pre-binding and
+ * every node is identified by shape alone. An `id` node may carry a "targs"
+ * array to build a generic identifier (`Expr<User>.From`). */
 
 static zan_token_kind_t gm_token_kind(const char *name) {
     if (!name) return TK_INVALID;

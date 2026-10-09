@@ -1,14 +1,8 @@
 /* ipa.h -- one-shot iOS IPA packaging for zanc (--emit-ipa).
  *
- * An IPA is a zip archive containing:
- *   Payload/<AppName>.app/
- *     <AppName>                (Mach-O arm64 executable with ad-hoc code signature)
- *     Info.plist               (XML plist with bundle id, executable name, orientation, etc.)
- *     PkgInfo                  (8-byte ASCII: "APPL????")
- *
- * This generator produces standard .ipa files installable via TrollStore,
- * jailbreak tools, or sideloading utilities (AltStore, Sideloadly)
- * without requiring macOS or official Apple developer certificates.
+ * An IPA is a zip with Payload/<AppName>.app/ holding the ad-hoc signed
+ * Mach-O arm64 executable, Info.plist and PkgInfo; produced without macOS
+ * or Apple developer certificates.
  */
 
 #ifndef ZAN_IPA_H

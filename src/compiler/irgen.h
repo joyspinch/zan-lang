@@ -33,11 +33,8 @@ typedef struct zan_str_intern {
     struct zan_str_intern *next;
 } zan_str_intern_t;
 
-/* Growth helpers for the generator's heap tables. A fixed-size table that
- * silently stops recording (an un-scrambled literal, a dropped extern lib, a
- * mis-attributed debug file) is far worse than one that reallocs, so every
- * table that scales with program size uses these. Both return false only when
- * the allocation itself fails. */
+/* Growth helpers for the generator's heap tables; every table that scales with
+ * program size uses these. Both return false only when the allocation fails. */
 static inline bool zan_tab_grow(void **items, int *cap, size_t elem,
                                 int initial) {
     int ncap = *cap ? *cap * 2 : initial;
@@ -67,10 +64,9 @@ static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
 #define ZAN_TAB_ENSURE(tab, cnt, cap, initial) \
     ((cnt) < (cap) || zan_tab_grow((void **)&(tab), &(cap), sizeof(*(tab)), (initial)))
 
-/* Depth at which expression inference is treated as non-terminating. Inference
- * re-enters itself through member access and overload scoring, so a cycle or a
- * pathological nesting used to spin the compiler with no output at all; past
- * this it reports where it gave up instead. Matches ZAN_PARSER_MAX_BINOP_CHAIN. */
+/* Depth at which expression inference is treated as non-terminating: past it
+ * the compiler reports where it gave up instead of recursing forever.
+ * Matches ZAN_PARSER_MAX_BINOP_CHAIN. */
 #define ZAN_MAX_INFER_DEPTH 16384
 
 /* Nesting depth of try/finally regions a single function body may be inside. */
@@ -78,9 +74,8 @@ static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
 
 /* Armed try handlers tracked at once. Nested bodies (lambdas, async $resume)
  * stack their own entries on top of the enclosing body's, so this is deeper
- * than the per-body try nesting; overflowing it drops the extra entries, so an
- * early exit out of those levels falls back to the old grow-only behaviour --
- * it never restores a wrong depth. */
+ * than the per-body try nesting; overflow drops the extra entries (grow-only
+ * fallback) rather than restoring a wrong depth. */
 #define ZAN_MAX_ARMED_TRY 1024
 
 typedef struct zan_irgen_pending_scope {
@@ -199,7 +194,7 @@ struct zan_irgen {
     bool current_fn_no_runtime;      /* [NoRuntime]: emit no ARC in this body */
     /* >0 while emitting a lambda body: lambdas are non-capturing, so current_this
      * is NULL inside them and a `this`/`base` reference would silently load a
-     * garbage receiver (A33). Emitting AST_THIS_EXPR checks this to reject. */
+     * garbage receiver. Emitting AST_THIS_EXPR checks this to reject. */
     int lambda_depth;
 
     /* runtime function declarations */
@@ -264,11 +259,9 @@ struct zan_irgen {
     int function_count;
     int function_cap;
     /* symbol -> index into `functions`, so a call site resolves its callee in
-     * O(1). Scanning the registry made irgen quadratic in the number of
-     * functions (48k lines of code spent ~4.5 s of a 6 s build in irgen).
-     * Open addressing with a power-of-two capacity; sym == NULL marks a free
-     * slot, and a symbol registered twice keeps its first index (the scan it
-     * replaces stopped at the first match). */
+     * O(1). Open addressing with a power-of-two capacity; sym == NULL marks a
+     * free slot, and a symbol registered twice keeps its first index (callers
+     * expect the first match). */
     struct zan_fn_index_slot {
         zan_symbol_t *sym;
         int idx;
@@ -323,9 +316,8 @@ struct zan_irgen {
      * a try raises __zan_eh_top by one and the normal fallthrough out of its
      * body lowers it again, but `return`/`break`/`continue` branch past that
      * epilogue, so those paths restore the top from here -- otherwise the
-     * handler stack only ever grows (one 1040-byte slot per call for a
-     * `try { ... return x; }`: a per-frame GUI loop fills all 4096 slots
-     * within seconds and aborts with "exception handler stack exhausted"). */
+     * handler stack only ever grows until it aborts with "exception handler
+     * stack exhausted". */
     struct {
         LLVMValueRef old_top_slot; /* i32 alloca: __zan_eh_top at try entry */
     } eh_armed[ZAN_MAX_ARMED_TRY];
@@ -423,7 +415,7 @@ struct zan_irgen {
         int             bindc;
         LLVMValueRef    fn;
         LLVMTypeRef     fn_type;
-        /* an async specialization is a ramp/resume/frame triple (A32-3b):
+        /* an async specialization is a ramp/resume/frame triple:
          * `fn` is the ramp and `async_ir` the method_body_work_t carrying its
          * frame layout, kept until the body is emitted from the queue. */
         bool            is_async;
@@ -515,10 +507,9 @@ struct zan_irgen {
     bool         desc_hdr;       /* header word = descriptor pointer mode */
     /* Intern table for compiler-emitted runtime-guard texts: identical
      * "file:line:col: runtime error: msg" strings share one global. LLVM does
-     * not merge identical private string globals at -O0/-O1, so without this
-     * every duplicated emit re-allocates its .rdata copy (~5% of guard volume
-     * on the gallery). Pointer identity also IS the soft-report site identity
-     * (zan_rt_soft_seen), so sharing is semantically exact. */
+     * not merge identical private string globals at -O0/-O1. Pointer identity
+     * is also the soft-report site identity (zan_rt_soft_seen), so sharing is
+     * semantically exact. */
     zan_str_intern_t **str_intern; /* chained hash, ZAN_STR_INTERN_BUCKETS */
                                    /* (bucket array calloc'd on first intern) */
     int          str_intern_cap; /* allocated bucket count */
@@ -647,9 +638,8 @@ struct zan_irgen {
      * defeats trivial static extraction. */
     bool obfuscate_strings;
     unsigned char obf_key[16];
-    /* Grown on demand: a fixed cap would silently leave every literal past it
-     * in plain text, which is worse than not scrambling at all -- the build
-     * looks protected while most of the image is readable. */
+    /* Grown on demand: a fixed cap would silently leave later literals
+     * in plain text. */
     struct { LLVMValueRef global; uint32_t len; } *obf_literals;
     int obf_literal_count;
     int obf_literal_cap;
@@ -680,15 +670,14 @@ struct zan_irgen {
     LLVMTypeRef  rt_co_sched_run_until_type;
     LLVMValueRef rt_co_delay;     /* void zan_co_delay(i64 ms, void* frame, step) */
     LLVMTypeRef  rt_co_delay_type;
-    /* socket async (S4b-2): the readiness reactor, provided by the shipped
+    /* socket async: the readiness reactor, provided by the shipped
      * zanrt_io object (built from src/runtime/rt_io.c). zan_io_wait_co registers
      * a one-shot fd watcher that re-readies (frame, step) when ready;
      * zan_io_pump_timeout blocks for IO up to the next timer deadline. A weak
      * inline fallback sleeps for timer-only programs; the reactor object's
      * strong definition overrides it for socket-async programs.
      * The `fd` parameters are C `intptr_t` (a Windows SOCKET is a UINT_PTR),
-     * lowered as i64 because our targets are 64-bit; A0-2 makes that a real
-     * pointer-width lowering. */
+     * lowered as i64 because our targets are 64-bit. */
     LLVMValueRef rt_io_wait_co;   /* void zan_io_wait_co(iptr fd,i32 interest,i8* frame,step) */
     LLVMTypeRef  rt_io_wait_co_type;
     LLVMValueRef rt_io_recv_co;   /* void zan_io_recv_co(iptr fd,i8* buf,i32 len,i8* frame,step,i64* out_n) */
@@ -893,14 +882,11 @@ struct zan_irgen {
      * is declared at depth 0, so its stack slot dominates every exit block. */
     int arc_stmt_depth;
 
-    /* Whole-body use-scan memo (A79-1). body_writes_ident / local_is_lambda_
-     * captured re-walked the entire function body once per declared local or
-     * parameter, which made a method with N declarations cost O(N^2) AST
-     * visits -- a 12k-statement body spent 18 minutes in that loop alone. Per
-     * function body the scan now runs once, recording identifiers (keyed
-     * {body, name}) with `written`, `lam_written`, and a name-only
-     * `lam_captured` candidate that a scoped scan confirms before boxing. One
-     * open-addressing table, reset per compilation. */
+    /* Whole-body use-scan memo: the scan runs once per function body (not once
+     * per declared local/parameter), recording identifiers (keyed {body, name})
+     * with `written`, `lam_written`, and a name-only `lam_captured` candidate
+     * that a scoped scan confirms before boxing. One open-addressing table,
+     * reset per compilation. */
     struct zan_body_write_entry {
         zan_ast_node_t *body;
         zan_istr_t      name;
@@ -938,10 +924,9 @@ void zan_irgen_shard_harvest_stats(void);
 /* Zan compiles a whole program (every reachable stdlib and user file) into one
  * LLVM module and links an executable, so nothing outside the module can call a
  * Zan function: `main` is the only symbol the C runtime needs by name. Giving
- * every other definition internal linkage is what lets LLVM's GlobalDCE delete
- * the ones no live code, vtable or delegate refers to -- with external linkage
- * the linker has to keep them all (a layout-only demo still carried the whole
- * code editor and data grid). Address-taken functions stay alive through the
+ * every other definition internal linkage lets LLVM's GlobalDCE delete the
+ * ones no live code, vtable or delegate refers to -- with external linkage the
+ * linker has to keep them all. Address-taken functions stay alive through the
  * reference itself, so delegates, WndProcs and vtable slots are unaffected. */
 static inline void zan_set_module_local(LLVMValueRef fn) {
     if (fn) LLVMSetLinkage(fn, LLVMInternalLinkage);
@@ -976,7 +961,7 @@ void zan_irgen_emit_string_deobf(zan_irgen_t *g);
 zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path);
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path);
 
-/* ---- codegen manifest (post-fixpoint semantic snapshot) ------------------
+/* Codegen manifest (post-fixpoint semantic snapshot):
  * Built AFTER zan_irgen_emit (every fixpoint complete) and BEFORE the
  * optimizer. Read-only over the finished module; carries names and integer
  * facts only — never a module-local LLVM handle — so a future coordinator

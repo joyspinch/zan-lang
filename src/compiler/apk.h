@@ -1,22 +1,13 @@
 /* apk.h -- one-shot Android APK assembly for zanc (--emit-apk).
  *
- * A Zan GUI program for Android is a shared library (libmain.so, the
- * NativeActivity shell's android_main entry) loaded by the framework
- * activity. This module packages the linked library plus its bundled
- * driver .so files into an installable, signed APK without any Android
- * SDK on the machine:
- *
- *   - AndroidManifest.xml comes from a precompiled binary template
- *     (toolchain/apk-shell/AndroidManifest.xml.bin); only the package name
- *     and application label are per-project, and both are patched in the
- *     template's binary string pool (no aapt2 needed).
- *   - resources.arsc / classes.dex are fixed prebuilt files (the shell's
- *     Java side -- dev.zan.app.ZanApp/ZanIme, org.zan.app.ZanWeb --
- *     built by scripts/build_apk_shell_dex.sh).
- *   - the zip is written here with STORED native libs aligned to 4 bytes
- *     and an uncompressed, 4-byte-aligned resources.arsc (Android 11+
- *     requires the latter); signing runs apksigner.jar (staged next to
- *     zanc) through a discovered or auto-downloaded Java runtime. */
+ * Packages the linked libmain.so (NativeActivity shell) plus bundled driver
+ * .so files into a signed APK with no Android SDK: AndroidManifest.xml comes
+ * from a precompiled binary template with only the package name and label
+ * patched in its string pool (no aapt2); resources.arsc / classes.dex are
+ * fixed prebuilts (shell Java side, built by scripts/build_apk_shell_dex.sh);
+ * native libs are STORED and 4-byte aligned, resources.arsc is uncompressed
+ * and 4-byte aligned (Android 11+ requires it); signing runs apksigner.jar
+ * through a discovered or auto-downloaded Java runtime. */
 
 #ifndef ZAN_APK_H
 #define ZAN_APK_H

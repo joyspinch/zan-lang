@@ -9,8 +9,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* ---- Optimization level ---- */
-
 typedef enum {
     ZAN_OPT_NONE = 0,
     ZAN_OPT_BASIC = 1,
@@ -21,7 +19,6 @@ typedef enum {
     ZAN_OPT_SIZE_MIN = 5
 } zan_opt_level_t;
 
-/* ---- ARC optimization ---- */
 typedef struct {
     int pairs_elided;
     int moves_optimized;
@@ -30,7 +27,6 @@ typedef struct {
 
 zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level);
 
-/* ---- Devirtualization ---- */
 typedef struct {
     int calls_devirtualized;
     int interfaces_resolved;
@@ -38,7 +34,6 @@ typedef struct {
 
 zan_devirt_stats_t zan_opt_devirtualize(zan_irgen_t *g, zan_binder_t *binder);
 
-/* ---- Constant folding ---- */
 typedef struct {
     int constants_folded;
     int branches_eliminated;
@@ -47,7 +42,6 @@ typedef struct {
 
 zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g);
 
-/* ---- Dead code elimination ---- */
 typedef struct {
     int dead_stores;
     int dead_calls;
@@ -56,7 +50,6 @@ typedef struct {
 
 zan_dce_stats_t zan_opt_dce(zan_irgen_t *g);
 
-/* ---- Inlining ---- */
 typedef struct {
     int functions_inlined;
     int recursive_skipped;
@@ -64,7 +57,6 @@ typedef struct {
 
 zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level);
 
-/* ---- Combined pipeline ---- */
 typedef struct {
     zan_arc_opt_stats_t arc;
     zan_devirt_stats_t devirt;

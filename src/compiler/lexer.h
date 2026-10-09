@@ -6,7 +6,6 @@
 #include "zan.h"
 #include "token.h"
 
-/* ---- Preprocessor defines ---- */
 #define ZAN_PP_MAX_DEFINES 2048
 #define ZAN_PP_MAX_COND_DEPTH 64
 
@@ -53,23 +52,15 @@ struct zan_lexer {
     zan_diag_t *diag;
     /* Interpolation holes currently open, innermost last. A hole can hold
      * another $"..." with holes of its own, so the bracket counters are per
-     * hole: with one shared set the inner string's closing quote ended
-     * interpolation for the outer one too. */
+     * hole. */
     int interp_depth;
     zan_interp_level_t interp_stack[ZAN_MAX_INTERP_DEPTH];
 
-    /* ---- Preprocessor state ---- */
-    /* Arena-allocated rather than inline: the table is 40 KB, and the parser
-     * backtracks speculative lookahead by snapshotting a whole lexer into a
-     * stack local (`zan_lexer_t saved = *p->lex;`, six sites in parser.c). With
-     * the table inline every one of those frames was 41 KB, and one of them
-     * sits in the expression recursion cycle (parse_postfix) -- so nesting
-     * overflowed the 1 MB stack at ~25 levels, long before the parser's own
-     * 256-deep guard could turn it into a diagnostic.
-     * Behind a pointer a snapshot copies ~520 bytes and shares the table.
-     * Semantics are unchanged: the snapshot carries `define_count`, so
-     * restoring it truncates any #define a speculative pass appended (live
-     * entries are always [0, define_count)). */
+    /* Arena-allocated rather than inline: the parser snapshots whole lexers
+     * into stack locals for speculative lookahead, and the 40 KB table inline
+     * overflowed the 1 MB stack at modest expression nesting. The snapshot
+     * carries `define_count`, so restoring it truncates any #define a
+     * speculative pass appended (live entries are always [0, define_count)). */
     zan_pp_define_t *defines;
     int define_count;
     int define_cap;
@@ -79,9 +70,8 @@ struct zan_lexer {
     /* Track whether current #if group had a true branch (for #elif) */
     int cond_seen_true[ZAN_PP_MAX_COND_DEPTH];
     /* Frames pushed past ZAN_PP_MAX_COND_DEPTH are counted here instead of
-     * writing cond_stack[MAX]: that index is out of bounds and its address
-     * aliases cond_depth, so the overflow write zeroed the depth and collapsed
-     * the whole stack to 1. pp_active() treats an overflow frame as inactive. */
+     * writing cond_stack[MAX] (out of bounds; its address aliases cond_depth).
+     * pp_active() treats an overflow frame as inactive. */
     int cond_overflow;
     int at_line_start; /* 1 if next non-ws char is at start of logical line */
 };

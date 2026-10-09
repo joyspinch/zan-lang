@@ -1,24 +1,16 @@
 /* irgen_call.c -- the call-expression emitter: builtin/intrinsic dispatch,
- * overload resolution, receiver handling and user-method calls.
- *
- * Part of the irgen translation unit: #include'd by irgen.c after
- * irgen_expr.c; not compiled standalone.
- */
+ * overload resolution, receiver handling and user-method calls. Part of the
+ * irgen translation unit: #include'd by irgen.c after irgen_expr.c; not
+ * compiled standalone. */
 
 /* Detach an async call nobody awaits: `sub` is the frame its ramp returned.
- * Install the reaper as the frame's own awaiter step (awaiter = the frame
- * itself, a non-null marker) so emit_async_complete's awaiter-wake path
- * re-enqueues (frame, __zan_co_reap) and the driver frees the frame once the
- * body finishes; then schedule the frame and track it, so the driver can tell
- * a live frame from a reaped one before Task.Cancel writes through it.
- *
- * `keep_result` skips the reaper for a frame whose result is still to be read
- * (Task.Run of a value-returning method): Result/Wait reaps it instead.
- *
- * Returns the frame as i8*, or NULL when `sub` is not an async ramp result --
- * the caller then lowers the expression as an ordinary call. Shared by
- * Task.Spawn/Task.Run and by a discarded async call statement, which is a
- * spawn in every respect (see AST_EXPR_STMT in irgen_stmt.c). */
+ * Install the reaper as the frame's awaiter step, schedule and track the
+ * frame, so the driver can tell a live frame from a reaped one before
+ * Task.Cancel writes through it. `keep_result` skips the reaper for a frame
+ * whose result is still to be read (Result/Wait reaps it instead). Returns
+ * the frame as i8*, or NULL when `sub` is not an async ramp result -- the
+ * caller then lowers an ordinary call. Shared by Task.Spawn/Task.Run and a
+ * discarded async call statement. */
 static LLVMValueRef emit_detach_async_call(zan_irgen_t *g, LLVMValueRef sub,
                                            bool keep_result) {
     if (!sub || LLVMGetTypeKind(LLVMTypeOf(sub)) != LLVMPointerTypeKind ||
@@ -125,7 +117,6 @@ static LLVMValueRef get_task_action_step_fn(zan_irgen_t *g) {
     LLVMTypeRef ft = get_task_action_frame_type(g);
     LLVMValueRef frame = LLVMBuildBitCast(g->builder, arg, LLVMPointerType(ft, 0), "fr");
 
-    /* Check cancellation */
     LLVMValueRef cancel_p = LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_CANCEL, "cancel.p");
     LLVMValueRef cancel = LLVMBuildLoad2(g->builder, i32, cancel_p, "cancel");
     LLVMValueRef is_cancelled = zan_icmp(g->builder, LLVMIntNE, cancel, LLVMConstInt(i32, 0, 0), "is_cancelled");
@@ -210,17 +201,15 @@ static LLVMValueRef emit_task_action_run(zan_irgen_t *g, LLVMValueRef lv,
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMValueRef lv_i8 = LLVMBuildBitCast(g->builder, lv, i8ptr, "task.del");
 
-    /* Retain closure reference so it survives while executing on background worker */
+    /* Retain the closure so it survives execution on the worker */
     emit_closure_retain(g, lv_i8);
 
-    /* Allocate TaskActionFrame */
     LLVMTypeRef ft = get_task_action_frame_type(g);
     LLVMTypeRef malloc_ty = LLVMGlobalGetValueType(g->fn_malloc);
     LLVMValueRef fsize = LLVMSizeOf(ft);
     LLVMValueRef raw = zan_call2(g->builder, malloc_ty, g->fn_malloc, &fsize, 1, "task.raw");
     zan_irgen_emit_oom_check(g, g->current_fn, raw);
 
-    /* Zero the allocated frame */
     {
         LLVMTypeRef memset_ty = LLVMFunctionType(i8ptr,
             (LLVMTypeRef[]){ i8ptr, i32, sp_i64 }, 3, 0);
@@ -249,26 +238,21 @@ static LLVMValueRef emit_task_action_run(zan_irgen_t *g, LLVMValueRef lv,
     LLVMBuildStore(g->builder, reap_fn,
         LLVMBuildStructGEP2(g->builder, ft, rframe, ASYNC_FRAME_AWAITER_STEP, "task.aws"));
 
-    /* Release caller temporary */
     emit_release_owned_call_temp(g, sub_arg, lv, locals);
 
-    /* Enqueue to background worker pool */
     LLVMValueRef sched_args[] = { raw, step_fn };
     zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
 
-    /* Track in live frame registry */
     LLVMValueRef track = get_co_track_fn(g);
     zan_call2(g->builder, LLVMGlobalGetValueType(track), track, &raw, 1, "");
 
     return LLVMBuildPtrToInt(g->builder, raw, sp_i64, "task.h");
 }
 
-/* True when the identifier names a field of the class being compiled -- an
- * instance field (it reads as `this.<name>`) or a static one. Such a field
- * shadows a type of the same name wherever a receiver is resolved. Statics
- * count too, and in a static method they are the only fields in reach: a
- * designed form holds its controls in statics, so a control named after a
- * widget class (`static DataTable DataGrid;`) must resolve to the field. */
+/* True when the identifier names a field of the class being compiled
+ * (instance or static); such a field shadows a type of the same name wherever
+ * a receiver is resolved -- in a static method statics are the only fields in
+ * reach, so `static DataTable DataGrid;` must resolve to the field. */
 static bool ident_names_own_field(zan_irgen_t *g, zan_ast_node_t *e) {
     if (!e || e->kind != AST_IDENTIFIER) return false;
     if (!g->current_type_sym) return false;
@@ -293,9 +277,8 @@ static bool type_mentions_type_param(zan_type_t *t, int depth) {
 }
 
 /* Whether an unclaimed call sits in the erased body of a generic, reaching
- * through a receiver whose type is still open. Distinguishes "the code
- * generator failed to resolve a real call" from "this copy of the body is the
- * erased template and the real code lives in the specializations". */
+ * through a receiver whose type is still open: this copy is the template, and
+ * the real code lives in the specializations. */
 static bool call_receiver_is_open_generic(zan_irgen_t *g, zan_ast_node_t *call,
                                          local_scope_t *locals) {
     if (g->current_type_sym && g->current_type_sym->decl &&
@@ -318,10 +301,9 @@ static bool call_receiver_is_open_generic(zan_irgen_t *g, zan_ast_node_t *call,
 }
 
 /* Walks the receiver chain of an unclaimed call and reports the first
- * `Type.Method(...)` link naming a class that has no such method. A chained
- * call hides the broken link from the per-call checks: the outer call resolves
- * nothing, so it never emits its receiver and the missing method went
- * unreported. */
+ * `Type.Method(...)` link naming a class that has no such method (a chained
+ * call hides the broken link from the per-call checks: the outer call
+ * resolves nothing, so it never emits its receiver). */
 static void diagnose_unresolved_static_chain(zan_irgen_t *g,
                                              zan_ast_node_t *recv) {
     while (recv && recv->kind == AST_CALL) {
@@ -371,10 +353,9 @@ static int format_name_path(zan_ast_node_t *n, char *buf, int cap) {
 }
 
 /* True when the call's receiver names a class compiled from source (user or
- * stdlib) that defines the called method. Builtin lowerings that duplicate a
- * stdlib class (File.*) step aside so the source implementation — with its
- * richer semantics such as thrown exceptions — wins whenever it is present
- * (e.g. under --auto-stdlib). */
+ * stdlib) that defines the called method: builtin lowerings that duplicate a
+ * stdlib class (File.*) step aside so the source implementation -- with its
+ * richer semantics such as thrown exceptions -- wins whenever it is present. */
 static bool src_method_takes_over(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
     zan_ast_node_t *callee = expr->call.callee;
@@ -415,9 +396,9 @@ static int try_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
                                                           : NULL);
         if (!rt || rt->kind != TYPE_CLASS) return -1;
         if (!recv_expr && !g->current_this) return -1;
-        /* `Pool<string>.Wrap<int>` specializes per class instantiation too;
+        /* `Pool<string>.Wrap<int>` specializes per class instantiation too:
          * inside a generic body the receiver's own instantiation is the one
-         * being emitted (`this.Wrap<int>()`). */
+         * being emitted. */
         if (rt->type_arg_count > 0) owner_inst = rt;
         else if (g->cur_inst && (!rt->sym || rt->sym == g->cur_inst->sym))
             owner_inst = g->cur_inst;
@@ -540,9 +521,9 @@ static LLVMValueRef emit_string_copy_range(zan_irgen_t *g,
 }
 
 /* True when `n` (a lambda body) contains a `return <expr>;` anywhere below it.
- * Task.Run's delegate parameter is an Action (void), so a value-returning body
- * would be emitted into a void function and fail LLVM verification; report it
- * like C# would instead. */
+ * Task.Run's delegate parameter is an Action (void); report a value-returning
+ * body like C# would instead of emitting into a void function and failing
+ * LLVM verification. */
 static bool lambda_body_has_value_return(zan_ast_node_t *n) {
     if (!n) return false;
     switch (n->kind) {
@@ -580,10 +561,9 @@ static bool lambda_body_has_value_return(zan_ast_node_t *n) {
 }
 
 /* C# overloads the string search/split methods on char, and a char argument
- * denotes the one-character string it spells. These three keep that
- * conversion out of every call site: without it a char argument reached
- * strstr/strncmp as an integer, which is what made `"abc".IndexOf('b')`
- * answer 0. */
+ * denotes the one-character string it spells; these keep that conversion out
+ * of every call site (a char would otherwise reach strstr/strncmp as an
+ * integer). */
 static int is_string_like_expr(zan_irgen_t *g, zan_ast_node_t *e,
                                local_scope_t *locals) {
     return is_string_expr(g, e, locals) || expr_is_char(g, e, locals);
@@ -610,10 +590,9 @@ static void release_string_like_arg(zan_irgen_t *g, zan_ast_node_t *e,
     else emit_release_owned_call_temp(g, e, v, locals);
 }
 
-/* The declared members of an enum symbol with their effective constants.
- * C# running counter: an explicit `= n` resets it, the next auto member
- * continues at n+1 — the same rule as the EnumType.Member fold in
- * irgen_expr.c and the reflection table in irgen_reflect.c. Returns the
+/* The declared members of an enum symbol with their effective constants
+ * (an explicit `= n` resets the counter, the next auto member continues at
+ * n+1 -- same rule as the EnumType.Member fold in irgen_expr.c). Returns the
  * member count written, capped at `cap`. */
 static int irgen_enum_members(zan_symbol_t *sym, zan_symbol_t **out_syms,
                               long long *out_vals, int cap) {
@@ -638,12 +617,11 @@ static int irgen_enum_members(zan_symbol_t *sym, zan_symbol_t **out_syms,
 
 /* The collection intrinsics evaluate their receiver expression directly
  * instead of going through the regular instance-call path, so an owned (+1)
- * receiver (`Fetch().Items`) leaks its extra reference: nobody released it
- * after the operation. Mirror what a regular call does with its self argument
- * (the arg handling above): register the value for exception unwinding while
- * the arguments run, then pop and release it once the intrinsic is done.
- * Borrowed receivers (locals, statics, fields of locals) make both helpers
- * no-ops. */
+ * receiver (`Fetch().Items`) leaks its extra reference. Mirror what a regular
+ * call does with its self argument: register the value for exception
+ * unwinding while the arguments run, then pop and release it once the
+ * intrinsic is done. Borrowed receivers (locals, statics, fields of locals)
+ * make both helpers no-ops. */
 static int emit_intrinsic_own_recv(zan_irgen_t *g, zan_ast_node_t *lobj,
                                    LLVMValueRef recv, local_scope_t *locals) {
     zan_type_t *lt = infer_expr_type(g, lobj, locals);
@@ -662,12 +640,9 @@ static void emit_intrinsic_drop_recv(zan_irgen_t *g, zan_ast_node_t *lobj,
 }
 
 /* Register one argument temporary with the exception unwinder while the
- * callee runs. The generic-spec call path (emit_method_spec_call) does this
- * for every owned argument; the plain paths below had it only on the
- * receiver, so `db.Execute(sql, new DbParams())` where Execute throws
- * leaked the parameter object every time — the success-path release never
- * runs after a longjmp (A64b sibling: db_error_throw). Same condition and
- * slot-kind handling as the spec path. */
+ * callee runs: the success-path release never runs after a longjmp, so an
+ * owned argument of a throwing call would leak without this. Same condition
+ * and slot-kind handling as the generic-spec call path. */
 static int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
                                  LLVMValueRef val, local_scope_t *locals) {
     zan_type_t *at = infer_expr_type(g, arg, locals);
@@ -766,11 +741,10 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMConstInt(i64, at->array_rank, 0), "gl.oob");
                     emit_runtime_check(g, oob, expr->loc,
                         "GetLength dimension out of range");
-                    /* Soft mode continues past the report; an out-of-range
-                     * dim would GEP past the rank words and read garbage (or
-                     * fault past the allocation for high dims). Fold it to 0
-                     * so the call answers dim 0's length instead. Hard mode
-                     * exits inside the report; checks-off keeps the raw dim. */
+                    /* Soft mode continues past the report: an out-of-range
+                     * dim would GEP past the rank words, so fold it to 0.
+                     * Hard mode exits inside the report; checks-off keeps the
+                     * raw dim. */
                     dim = LLVMBuildSelect(g->builder, oob,
                         LLVMConstInt(i64, 0, 0), dim, "gl.dim.safe");
                     LLVMValueRef dim_ptr = LLVMBuildBitCast(g->builder, arr,
@@ -785,11 +759,10 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         /* Task instance members — `t.Wait()`, `t.Result`, `t.IsCompleted` on
          * a Task/Task<T> value. The value is the coroutine handle Task.Run/
          * Task.Spawn hands back (the frame pointer as an i64). Wait pumps the
-         * cooperative driver until that frame is done — the only way a
-         * synchronous context can let a spawned coroutine make progress —
-         * IsCompleted is a non-pumping probe, and Result reads the frame's
-         * result slot for a Task<T> (whose spawn deliberately left the frame
-         * unreaped so the result survives; see below). */
+         * cooperative driver until the frame is done; IsCompleted is a
+         * non-pumping probe; Result reads the frame's result slot for a
+         * Task<T> (whose spawn deliberately left the frame unreaped so the
+         * result survives). */
         if (expr->call.callee->kind == AST_MEMBER_ACCESS &&
             expr->call.args.count == 0) {
             zan_ast_node_t *recv = expr->call.callee->member.object;
@@ -823,16 +796,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* Task.Spawn(<asyncCall>) — fire-and-forget: run an async call as an
          * independent coroutine WITHOUT awaiting it. Task.Run is the same
-         * lowering under the name the design docs use, except that when the
-         * async call returns a value the frame is left unreaped so the caller
-         * can read it through `Task<T>.Result` / `Wait()` (Task.Spawn always
-         * reaps: its handles are only polled with IsDone/Cancel). Emits the
-         * callee's ramp (heap frame) then schedules it on the cooperative
-         * driver with no awaiter and without suspending the caller (contrast
-         * await, which registers self as awaiter and suspends). This is the
-         * concurrency primitive a server accept loop uses to handle each
-         * connection on its own coroutine instead of serially. See
-         * docs/ASYNC_CPS_DESIGN.md. */
+         * lowering under another name, except that when the async call returns
+         * a value the frame is left unreaped so the caller can read it through
+         * `Task<T>.Result` / `Wait()` (Task.Spawn always reaps: its handles
+         * are only polled with IsDone/Cancel). Emits the callee's ramp (heap
+         * frame) then schedules it on the cooperative driver with no awaiter
+         * and without suspending the caller (contrast await, which registers
+         * self as awaiter and suspends). */
         if ((is_call_to(expr, "Task", "Spawn") || is_call_to(expr, "Task", "Run")) &&
             expr->call.args.count == 1) {
             LLVMTypeRef sp_i64 = LLVMInt64TypeInContext(g->ctx);
@@ -841,9 +811,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_type_t *sub_ty = infer_expr_type(g, sub_arg, locals);
             bool is_del = sub_ty && sub_ty->kind == TYPE_DELEGATE;
             if (sub_arg->kind != AST_CALL && sub_arg->kind != AST_LAMBDA && !is_del) {
-                /* not a shape this lowering handles (e.g. Task.Run(5)): leave
-                 * it to the normal call path so the unresolved-call
-                 * diagnostic fires instead of silently lowering to 0 */
+                /* not a shape this lowering handles: leave it to the normal
+                 * call path so the unresolved-call diagnostic fires */
             } else {
 
             /* Task.Run(<delegate>) / Task.Spawn(<delegate>): schedule the delegate
@@ -880,17 +849,16 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 return emit_task_action_run(g, lv, sub_arg, locals);
             }
             LLVMValueRef sub = emit_expr(g, sub_arg, locals);
-            /* A result-carrying Task.Run keeps its frame: it must stay alive
-             * (tracked, DONE set at completion) until Result/Wait reads the
-             * result and reaps it. */
+            /* A result-carrying Task.Run keeps its frame alive (tracked, DONE
+             * set at completion) until Result/Wait reads the result and reaps
+             * it. */
             bool keep_result = is_call_to(expr, "Task", "Run") &&
                 !is_call_to(expr, "Task", "Spawn") &&
                 sub_ty && sub_ty->kind != TYPE_VOID;
             LLVMValueRef sub_i8 = emit_detach_async_call(g, sub, keep_result);
             emit_release_owned_call_temp(g, sub_arg, sub, locals);
-            /* Task.Spawn yields the task handle, so the program can later
-             * cancel the detached coroutine (Task.Cancel). Discarding it
-             * stays fire-and-forget. */
+            /* Task.Spawn yields the task handle for a later Task.Cancel;
+             * discarding it stays fire-and-forget. */
             if (sub_i8) return LLVMBuildPtrToInt(g->builder, sub_i8, sp_i64, "spawn.h");
             return LLVMConstInt(sp_i64, 0, 0);
             }
@@ -916,13 +884,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             return LLVMConstInt(ci64, 0, 0);
         }
 
-        /* Task.IsDone(handle) — whether the coroutine a Task.Spawn handle names
-         * has completed. This is what fan-out joins are built on
-         * (System.Threading.TaskJoin, which `Task.WhenAll` desugars to): without
-         * it a spawned coroutine's completion is unobservable from the outside,
-         * so every caller had to thread its own counter and gate through the
-         * spawned bodies. See get_co_isdone_fn. Yields 1/0 as an `int`, like the
-         * sibling Task.IsCancellationRequested. */
+        /* Task.IsDone(handle) — whether the coroutine a Task.Spawn handle
+         * names has completed. This is what fan-out joins are built on
+         * (System.Threading.TaskJoin, which `Task.WhenAll` desugars to).
+         * Yields 1/0 as an `int`, like the sibling
+         * Task.IsCancellationRequested. */
         if (is_call_to(expr, "Task", "IsDone") && expr->call.args.count == 1) {
             LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
@@ -1032,13 +998,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 int sb_is_tostring = (sbm.len == 8 && memcmp(sbm.str, "ToString", 8) == 0 &&
                                       expr->call.args.count == 0);
                 /* The intrinsic evaluates its receiver expression directly, so
-                 * an owned (+1) receiver (`this.BuildHeadersSb().ToString()` in
-                 * HttpResponse.BuildHeaders -- the empty-body response path)
-                 * leaked one StringBuilder per execution: the intrinsic never
-                 * released the receiver, and Append's void result meant the
-                 * statement-level discard release never fired either. Same
-                 * recipe as the collection intrinsics: EH-register the receiver
-                 * while the arguments run, drop it once the intrinsic is done. */
+                 * an owned (+1) receiver leaks: Append's void result means no
+                 * statement-level discard release ever fires either. Same
+                 * recipe as the collection intrinsics: EH-register the
+                 * receiver while the arguments run, drop it once the intrinsic
+                 * is done. */
                 int sb_recv_own = 0;
                 if (sb_is_append || sb_is_appendline || sb_is_tostring || sb_is_clear)
                     sb_recv_own = emit_intrinsic_own_recv(g,
@@ -1089,8 +1053,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             /* A string argument appends its BYTE count, not a
                              * strlen: a managed string carries its length in
                              * the ARC header, and a payload with an embedded
-                             * NUL (UrlDecode's `%00`, binary frames) otherwise
-                             * shrank to the bytes before that NUL. */
+                             * NUL would otherwise shrink to the bytes before
+                             * that NUL. */
                             int str_arg = !char_arg &&
                                 LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind &&
                                 is_string_expr(g, arg0, locals);
@@ -1137,9 +1101,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, buf, &count, 1, "sbend");
                     LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), endp);
                     /* The buffer count is the exact byte length; stamp it so a
-                     * receiver with an embedded NUL keeps its Length (without
-                     * this the first reader cached a strlen and `%00` content
-                     * still collapsed at the NUL). */
+                     * receiver with an embedded NUL keeps its Length. */
                     emit_string_len_set(g, buf, count);
                     emit_intrinsic_drop_recv(g, sbcallee->member.object, raw,
                                              locals, sb_recv_own);
@@ -1148,7 +1110,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
-        /* special-case Console.WriteLine */
+        /* Console.WriteLine/PrintLine builtin -- reached only when no source
+         * type defines Console.WriteLine (source wins). */
         if (!zan_type_defines(g, "Console", "WriteLine") &&
             (is_call_to(expr, "Console", "WriteLine") ||
              is_call_to(expr, "Console", "PrintLine"))) {
@@ -1266,7 +1229,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     zan_call2(g->builder, printf_type, printf_fn, args, 2, "");
                 } else if (LLVMGetTypeKind(arg_type) == LLVMDoubleTypeKind ||
                            LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind) {
-                    /* shortest round-trip spelling, not %g (audit D6/D25) */
+                    /* shortest round-trip spelling, not %g */
                     LLVMValueRef sbuf = emit_entry_scratch(g, 40, "wl.dbl");
                     emit_dbl_str(g, sbuf,
                         LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 40, 0),
@@ -1321,10 +1284,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             is_call_to(expr, "Console", "ReadLine")) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-            /* allocate 1024 byte buffer */
             LLVMValueRef buf_size = LLVMConstInt(i64, 1024, 0);
             LLVMValueRef buf = emit_string_alloc_rc(g, buf_size);
-            /* declare fgets if needed */
             LLVMValueRef fgets_fn = LLVMGetNamedFunction(g->mod, "fgets");
             if (!fgets_fn) {
                 LLVMTypeRef fgets_args[] = { i8ptr, LLVMInt32TypeInContext(g->ctx), i8ptr };
@@ -1332,10 +1293,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 fgets_fn = LLVMAddFunction(g->mod, "fgets", fgets_type);
             }
             /* get stdin: Windows UCRT exposes the stdin FILE* via
-             * __acrt_iob_func(0), but ELF libc (glibc/musl) exports a `stdin`
-             * global instead. Referencing __acrt_iob_func unconditionally left
-             * that symbol undefined when cross-compiling to linux, so pick the
-             * right one for the target. */
+             * __acrt_iob_func(0); ELF libc exports a `stdin` global, macOS
+             * `__stdinp`. Pick by target, or cross-compiling to linux would
+             * reference an undefined symbol. */
             LLVMValueRef stdin_ptr;
             if (g->target_is_windows) {
                 LLVMValueRef stdin_fn = LLVMGetNamedFunction(g->mod, "__acrt_iob_func");
@@ -1356,9 +1316,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
             LLVMValueRef sz = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 1024, 0);
             LLVMValueRef fgets_args[] = { buf, sz, stdin_ptr };
-            /* Zero the first byte before fgets: on EOF (fgets returns NULL with
-             * the buffer contents untouched) the returned string is "" rather
-             * than whatever garbage the allocation happened to hold. */
+            /* Zero the first byte before fgets: on EOF fgets leaves the
+             * buffer untouched, so the returned string is "" not garbage. */
             LLVMBuildStore(g->builder, LLVMConstInt(LLVMInt8TypeInContext(g->ctx), 0, 0),
                 buf);
             zan_call2(g->builder,
@@ -1422,12 +1381,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
         }
 
-        /* ==== NativeMemory intrinsics ====
-         * Raw off-heap memory access for binary IO (ByteBuffer, ZanDB pages,
-         * network framing). Addresses travel as nint (i64); every operation
-         * lowers to a libc call, so none of these values ever enter the ARC
-         * string/object machinery. Scalar access goes through Span<T> views
-         * over the address (little-endian, align 1). */
+        /* NativeMemory intrinsics: raw off-heap memory access for binary IO.
+         * Addresses travel as nint (i64); every operation lowers to a libc
+         * call, so none of these values enter the ARC string/object
+         * machinery. Scalar access goes through Span<T> views over the
+         * address (little-endian, align 1). */
         {
             LLVMValueRef nm_out = NULL;
             if (emit_native_memory_call(g, expr, locals, &nm_out))
@@ -1508,13 +1466,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             is_call_to(expr, "Math", "Sqrt") && expr->call.args.count == 1) {
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
-            /* ensure arg is double */
             if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMFloatTypeKind) {
                 arg = LLVMBuildFPExt(g->builder, arg, dbl, "ext");
             } else if (LLVMGetTypeKind(LLVMTypeOf(arg)) != LLVMDoubleTypeKind) {
                 arg = LLVMBuildSIToFP(g->builder, arg, dbl, "tofp");
             }
-            /* declare sqrt if needed */
             LLVMValueRef sqrt_fn = LLVMGetNamedFunction(g->mod, "sqrt");
             if (!sqrt_fn) {
                 LLVMTypeRef sqrt_args[] = { dbl };
@@ -1548,7 +1504,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
-        /* Math.Atan2(y, x) */
+        /* Math.Atan2(y, x) → libm atan2 */
         if (!zan_type_defines(g, "Math", "Atan2") &&
             is_call_to(expr, "Math", "Atan2") && expr->call.args.count == 2) {
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
@@ -1644,11 +1600,10 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             : b)
                        : LLVMBuildSIToFP(g->builder, b, dbl, "tofp");
                 /* C# Math.Max/Min propagate NaN: either operand NaN makes the
-                 * result NaN, in both argument orders, and .NET returns the
-                 * FIRST NaN in argument order (left if left is NaN, else
-                 * right). A bare ordered comparison + select returned the
-                 * OTHER operand instead (Math.Max(NaN, 5) was 5). Test each
-                 * operand for NaN in order, then the ordered pick. */
+                 * result NaN, and .NET returns the FIRST NaN in argument
+                 * order. A bare ordered comparison + select returns the OTHER
+                 * operand, so test each operand for NaN in order, then the
+                 * ordered pick. */
                 LLVMValueRef a_nan = LLVMBuildFCmp(g->builder,
                     LLVMRealUNO, a, a, "an");
                 LLVMValueRef b_nan = LLVMBuildFCmp(g->builder,
@@ -1673,7 +1628,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             return LLVMBuildSelect(g->builder, cmp, a, b, want_max ? "max" : "min");
         }
 
-        /* Math.Pow(base, exp) */
+        /* Math.Pow(base, exp) → libm pow */
         if (!zan_type_defines(g, "Math", "Pow") &&
             is_call_to(expr, "Math", "Pow") && expr->call.args.count == 2) {
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
@@ -1694,7 +1649,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 pow_fn, args, 2, "pow");
         }
 
-        /* Math.Floor(x) */
+        /* Math.Floor(x) → libm floor */
         if (!zan_type_defines(g, "Math", "Floor") &&
             is_call_to(expr, "Math", "Floor") && expr->call.args.count == 1) {
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
@@ -1710,7 +1665,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 floor_fn, &arg, 1, "floor");
         }
 
-        /* Math.Ceiling(x) */
+        /* Math.Ceiling(x) → libm ceil */
         if (!zan_type_defines(g, "Math", "Ceiling") &&
             is_call_to(expr, "Math", "Ceiling") && expr->call.args.count == 1) {
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
@@ -1726,7 +1681,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 ceil_fn, &arg, 1, "ceil");
         }
 
-        /* Math.Round(x[, digits]) */
+        /* Math.Round(x[, digits]) → libm round; the digits form scales by
+         * 10^d around the call. */
         if (!zan_type_defines(g, "Math", "Round") &&
             is_call_to(expr, "Math", "Round") &&
             (expr->call.args.count == 1 || expr->call.args.count == 2)) {
@@ -1762,7 +1718,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeKind ak = LLVMGetTypeKind(LLVMTypeOf(arg));
             if (ak == LLVMPointerTypeKind) {
                 /* zan_rt_dbl_parse fronts strtod with the NaN/Infinity
-                 * spellings the formatter emits (audit D6/D25) */
+                 * spellings the formatter emits */
                 LLVMTypeRef strtod_ty = LLVMFunctionType(dbl,
                     (LLVMTypeRef[]){ i8ptr, LLVMPointerType(i8ptr, 0) }, 2, 0);
                 LLVMValueRef f = LLVMGetNamedFunction(g->mod, "zan_rt_dbl_parse");
@@ -1813,8 +1769,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                           LLVMConstInt(i32t, 10, 0) }, 3, "parse");
                 } else {
                     /* zan_rt_dbl_parse fronts strtod with the NaN/Infinity
-                     * spellings zan_rt_dbl_str emits -- legacy msvcrt strtod
-                     * answers 0 for them (audit D6/D25 read-back) */
+                     * spellings zan_rt_dbl_str emits (msvcrt strtod answers 0
+                     * for them) */
                     LLVMTypeRef strtod_ty = LLVMFunctionType(dbl,
                         (LLVMTypeRef[]){ i8ptr, i8pp }, 2, 0);
                     LLVMValueRef f = LLVMGetNamedFunction(g->mod, "zan_rt_dbl_parse");
@@ -1997,18 +1953,19 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
-        /* String methods: str.Substring(start, len), str.Contains(sub), str.IndexOf(ch) */
+        /* String-typed member calls; the arms below claim the Convert
+         * special-cases and fall through to the general handlers. */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee = expr->call.callee;
             zan_istr_t method_name = callee->member.name;
-            
-            /* Check if calling on a local variable of string type */
+
+            /* Probe only: a local receiver is checked for pointer-ness (the
+             * check itself emits a load) and then falls through to the
+             * general handler unchanged. */
             if (callee->member.object->kind == AST_IDENTIFIER) {
                 local_var_t *str_local = local_find(locals, callee->member.object->ident.name);
                 if (str_local && LLVMGetTypeKind(LLVMTypeOf(LLVMBuildLoad2(g->builder,
                     LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0), str_local->alloca, "chk"))) == LLVMPointerTypeKind) {
-                    /* It's a pointer — might be a string */
-                    /* DON'T emit load twice; skip for now, let it fall through to general handler */
                 }
             }
             
@@ -2018,7 +1975,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 /* A program of its own may define some of Convert: each
                  * lowering steps aside only for the method that program
                  * declares, so defining ToInt32 does not take ToString with
-                 * it (which left every stdlib Convert.ToString unresolved). */
+                 * it. */
                 if (obj_name.len == 7 && memcmp(obj_name.str, "Convert", 7) == 0) {
                     if (((method_name.len == 7 && memcmp(method_name.str, "ToInt32", 7) == 0) ||
                          (method_name.len == 7 && memcmp(method_name.str, "ToInt64", 7) == 0) ||
@@ -2032,11 +1989,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMTypeKind ak = LLVMGetTypeKind(LLVMTypeOf(arg));
                         LLVMValueRef parsed;
                         if (ak == LLVMPointerTypeKind) {
-                            /* string -> strtoll(s, NULL, 10): full signed 64-bit.
-                             * atoi returned i32 and, when a stdlib extern had
-                             * declared it i64, left garbage in the upper bits --
-                             * so values > 2^31 (and some negatives) came back
-                             * corrupt. */
+                            /* string -> strtoll(s, NULL, 10): full signed
+                             * 64-bit (atoi's i32 would truncate). */
                             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                             LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
                             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -2090,9 +2044,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             return emit_char_to_cstr(g, arg);
                         /* T? formats through the shared coercion helper: the
                          * payload's text for a some, the empty string for a
-                         * none (C#). Reaching the itoa below with the nullable
-                         * struct still by value made the LLVM verifier reject
-                         * the call ("Call parameter type does not match"). */
+                         * none (C#). The nullable struct must not reach the
+                         * itoa below by value. */
                         if (llvm_is_nullable(LLVMTypeOf(arg))) {
                             zan_type_t *st = infer_expr_type(
                                 g, expr->call.args.items[0], locals);
@@ -2101,16 +2054,15 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                         st->element_type->kind == TYPE_ULONG);
                             return emit_to_cstr_u(g, arg, uns ? 1 : 0);
                         }
-                        /* allocate buffer and sprintf; 40 bytes fits the
-                         * longest shortest-round-trip double (the -1.79689...
-                         * E+308 family and the 15-digit fixed forms) */
+                        /* 40 bytes fits the longest shortest-round-trip
+                         * double. */
                         LLVMValueRef buf_size = LLVMConstInt(i64, 40, 0);
                         LLVMValueRef buf = emit_string_alloc_rc(g, buf_size);
                         LLVMTypeKind atk = LLVMGetTypeKind(LLVMTypeOf(arg));
                         if (atk == LLVMDoubleTypeKind || atk == LLVMFloatTypeKind) {
-                            /* shortest round-trip spelling (audit D6/D25):
-                             * %g kept six significant digits and printed the
-                             * specials as 1.#INF / 1.#QNAN */
+                            /* shortest round-trip spelling, not %g (%g keeps
+                             * six significant digits and prints the specials
+                             * as 1.#INF / 1.#QNAN) */
                             emit_dbl_str(g, buf, buf_size, arg);
                             return buf;
                         }
@@ -2141,14 +2093,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef start = coerce_int_to(g,
                     emit_expr(g, expr->call.args.items[0], locals), i64);
                 /* bounds: `start` in [0, strlen]; the two-argument form also
-                 * needs `len >= 0` and `start+len <= strlen`. Without this the
-                 * GEP+memcpy below read arbitrary heap (and a one-argument
-                 * call with start > strlen computes a negative size). */
+                 * needs `len >= 0` and `start+len <= strlen`, or the GEP+
+                 * memcpy below read arbitrary heap (a one-argument call with
+                 * start > strlen computes a negative size). */
                 /* A receiver without a reliable NUL bound (a raw FFI buffer
-                 * typed as `string`, e.g. a `struct dirent*` sliced byte by
-                 * byte) would fail the window check against strlen even though
-                 * the read is in range -- the same policy the string index
-                 * guards use. */
+                 * typed as `string`) skips the window check against strlen --
+                 * same policy as the string index guards. */
                 bool bounded = expr_has_reliable_string_bounds(sc->member.object,
                                                               locals) != 0;
                 LLVMValueRef total = (bounded || expr->call.args.count == 1)
@@ -2250,9 +2200,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
-        /* str.Contains(sub) -> bool: substring search via strstr. Without
-         * this, the call fell through to the generic fallback and lowered to
-         * constant false for multi-character needles. */
+        /* str.Contains(sub) -> bool: substring search via strstr. */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *sc = expr->call.callee;
             zan_istr_t sm = sc->member.name;
@@ -2357,7 +2305,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* str.Equals(p) -> bool: content compare, the instance-method
-         * spelling of the == the language already gives strings (D20). */
+         * spelling of the == the language already gives strings. */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *sc = expr->call.callee;
             zan_istr_t sm = sc->member.name;
@@ -2373,9 +2321,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 /* a null receiver compares as the empty string, matching the
                  * null-coalescing the other string methods use */
                 s = emit_str_nonnull(g, s);
-                /* length-aware ordinal compare: strcmp truncated at the
-                 * first embedded NUL, so Equals lied about digest-carrying
-                 * strings */
+                /* length-aware ordinal compare: strcmp truncates at the
+                 * first embedded NUL */
                 LLVMValueRef ocmp = get_str_ordinal_cmp_fn(g, expr->loc);
                 LLVMValueRef cmp = zan_call2(g->builder,
                     LLVMGlobalGetValueType(ocmp), ocmp,
@@ -2537,7 +2484,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 expr->call.callee->member.object->ident.name);
             if (es && es->kind == SYM_ENUM && es->member_count > 0) {
                 /* sized by the declared member count — a fixed cap here
-                 * silently truncated enum 257+ (A78-3: no silent caps) */
+                 * silently truncates large enums */
                 zan_symbol_t **mems = (zan_symbol_t **)calloc(
                     (size_t)es->member_count, sizeof(*mems));
                 long long *vals = (long long *)calloc(
@@ -2611,8 +2558,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* value.ToString() on a scalar (int/float/bool/char/enum) or string
          * receiver. Class/struct receivers fall through to normal method
-         * dispatch. Previously these calls lowered to the constant-0 fallback,
-         * so e.g. `n.ToString()` always produced "0". */
+         * dispatch. */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
             expr->call.args.count == 0) {
             zan_ast_node_t *sc = expr->call.callee;
@@ -2667,8 +2613,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     if (rt_ty->kind == TYPE_ENUM && rt_ty->sym &&
                         rt_ty->sym->member_count > 0) {
                         /* sized by the declared member count — a fixed cap
-                         * here silently truncated enum 257+ (A78-3: no
-                         * silent caps) */
+                         * here silently truncates large enums */
                         int cap = rt_ty->sym->member_count;
                         zan_symbol_t **mems = (zan_symbol_t **)calloc(
                             (size_t)cap, sizeof(*mems));
@@ -2751,7 +2696,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef buf = emit_string_alloc_rc(g,
                         LLVMConstInt(i64, 40, 0));
                     if (vk == LLVMDoubleTypeKind || vk == LLVMFloatTypeKind) {
-                        /* shortest round-trip spelling (audit D6/D25) */
+                        /* shortest round-trip spelling, not %g */
                         emit_dbl_str(g, buf, LLVMConstInt(i64, 40, 0), v);
                         return buf;
                     }
@@ -2838,13 +2783,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
-            /* declare fopen */
             LLVMValueRef fopen_fn = LLVMGetNamedFunction(g->mod, "fopen");
             if (!fopen_fn) {
                 LLVMTypeRef fopen_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
                 fopen_fn = LLVMAddFunction(g->mod, "fopen", fopen_type);
             }
-            /* declare fseek, ftell, fread, fclose */
             LLVMValueRef fseek_fn = LLVMGetNamedFunction(g->mod, "fseek");
             if (!fseek_fn) {
                 LLVMTypeRef fseek_type = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0);
@@ -2865,14 +2808,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef fclose_type = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
                 fclose_fn = LLVMAddFunction(g->mod, "fclose", fclose_type);
             }
-            /* open file */
             LLVMValueRef mode = zan_irgen_intern_string(g, "rb");
             LLVMValueRef open_args[] = { path_arg, mode };
             LLVMValueRef fp = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 fopen_fn, open_args, 2, "fp");
             emit_fopen_check(g, fp, "cannot read file\n");
-            /* seek to end, get size */
             LLVMValueRef seek_end_args[] = { fp, LLVMConstInt(i64, 0, 0), LLVMConstInt(i32, 2, 0) };
             LLVMValueRef se_end = zan_call2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0),
                 fseek_fn, seek_end_args, 3, "se_end");
@@ -2882,7 +2823,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0), ftell_fn, &fp, 1, "sz");
             emit_io_abort_if(g, zan_icmp(g->builder, LLVMIntSLT, size, LLVMConstInt(i64, 0, 0), "sz.err"),
                 "cannot read file\n");
-            /* seek back to start */
             LLVMValueRef seek_start_args[] = { fp, LLVMConstInt(i64, 0, 0), LLVMConstInt(i32, 0, 0) };
             LLVMValueRef se_start = zan_call2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0),
                 fseek_fn, seek_start_args, 3, "se_start");
@@ -2891,16 +2831,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             /* allocate buffer (size+1 for null terminator) */
             LLVMValueRef buf_size = zan_add(g->builder, size, LLVMConstInt(i64, 1, 0), "bsz");
             LLVMValueRef buf = emit_string_alloc_rc(g, buf_size);
-            /* read file; require the full byte count */
             LLVMValueRef fread_args[] = { buf, LLVMConstInt(i64, 1, 0), size, fp };
             LLVMValueRef got = zan_call2(g->builder, LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64, i64, i8ptr }, 4, 0),
                 fread_fn, fread_args, 4, "got");
             emit_io_abort_if(g, zan_icmp(g->builder, LLVMIntNE, got, size, "got.err"),
                 "cannot read file\n");
-            /* null terminate */
             LLVMValueRef end_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), buf, &size, 1, "end");
             LLVMBuildStore(g->builder, LLVMConstInt(LLVMInt8TypeInContext(g->ctx), 0, 0), end_ptr);
-            /* close */
             LLVMValueRef rd_close = zan_call2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 fclose_fn, &fp, 1, "rd_close");
             emit_io_abort_if(g, zan_icmp(g->builder, LLVMIntNE, rd_close, LLVMConstInt(i32, 0, 0), "rd_close.err"),
@@ -2955,15 +2892,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
         }
 
-        /* Path.GetFileName(path), Path.GetExtension(path), Path.Combine(a,b) */
-
         if (!zan_type_defines(g, "Path", "GetFileName") &&
             is_call_to(expr, "Path", "GetFileName") && expr->call.args.count == 1) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
             zan_ast_node_t *path_ast = expr->call.args.items[0];
             LLVMValueRef path_val = emit_expr(g, path_ast, locals);
-            /* call strrchr(path, '/') then strrchr(path, '\\') and pick later one */
             LLVMValueRef strrchr_fn = LLVMGetNamedFunction(g->mod, "strrchr");
             LLVMValueRef slash_args[] = { path_val, LLVMConstInt(i32t, '/', 0) };
             LLVMValueRef slash = zan_call2(g->builder,
@@ -2973,7 +2907,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef bslash = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0),
                 strrchr_fn, bslash_args, 2, "bslash");
-            /* end of the path, for the substring copy */
             LLVMTypeRef strlen_ty = LLVMFunctionType(LLVMInt64TypeInContext(g->ctx),
                 (LLVMTypeRef[]){ i8ptr }, 1, 0);
             LLVMValueRef plen = zan_call2(g->builder, strlen_ty, g->fn_strlen,
@@ -3046,7 +2979,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef dot = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0),
                 strrchr_fn, dot_args, 2, "dot");
-            /* no dot: return an empty string */
             LLVMValueRef is_null = zan_icmp(g->builder, LLVMIntEQ, dot,
                 LLVMConstNull(i8ptr), "dnull");
             LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
@@ -3086,26 +3018,22 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef a = emit_expr(g, expr->call.args.items[0], locals);
             LLVMValueRef b = emit_expr(g, expr->call.args.items[1], locals);
-            /* len = strlen(a) + 1 + strlen(b) + 1 */
             LLVMTypeRef strlen_type = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0);
             LLVMValueRef len_a = zan_call2(g->builder, strlen_type, g->fn_strlen, &a, 1, "la");
             LLVMValueRef len_b = zan_call2(g->builder, strlen_type, g->fn_strlen, &b, 1, "lb");
             LLVMValueRef total = zan_add(g->builder, len_a, len_b, "t");
             total = zan_add(g->builder, total, LLVMConstInt(i64, 2, 0), "t2"); /* +separator+null */
             LLVMValueRef buf = emit_string_alloc_rc(g, total);
-            /* strcpy(buf, a) */
             LLVMValueRef strcpy_args[] = { buf, a };
             zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 g->fn_strcpy, strcpy_args, 2, "");
-            /* strcat(buf, "/") */
             LLVMValueRef sep = (g->target_is_windows ? zan_irgen_intern_string(g, "\\")
                                   : zan_irgen_intern_string(g, "/"));
             LLVMValueRef cat1_args[] = { buf, sep };
             zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 g->fn_strcat, cat1_args, 2, "");
-            /* strcat(buf, b) */
             LLVMValueRef cat2_args[] = { buf, b };
             zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
@@ -3177,7 +3105,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 fopen_fn, open_args, 2, "fp");
             LLVMValueRef is_null = zan_icmp(g->builder, LLVMIntNE, fp,
                 LLVMConstNull(i8ptr), "exists");
-            /* close if opened */
             LLVMBasicBlockRef close_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "fexist.close");
             LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "fexist.end");
             LLVMBuildCondBr(g->builder, is_null, close_bb, end_bb);
@@ -3239,7 +3166,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
-            /* declare helper functions */
             LLVMValueRef fopen_fn = LLVMGetNamedFunction(g->mod, "fopen");
             if (!fopen_fn) {
                 LLVMTypeRef ft = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
@@ -3270,15 +3196,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef ft = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
                 fclose_fn = LLVMAddFunction(g->mod, "fclose", ft);
             }
-            /* open source for reading */
             LLVMValueRef rb = zan_irgen_intern_string(g, "rb");
             LLVMValueRef sargs[] = { src, rb };
             LLVMValueRef sfp = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 fopen_fn, sargs, 2, "sfp");
             emit_fopen_check(g, sfp, "cannot read file\n");
-            /* get size (ftell failure yields -1: clamp to an empty copy
-             * instead of driving fread/fwrite with a huge size) */
+            /* ftell failure yields -1: clamp to 0 so fread/fwrite don't get
+             * a huge size */
             LLVMValueRef zero64 = LLVMConstInt(i64, 0, 0);
             LLVMValueRef seek_end[] = { sfp, zero64, LLVMConstInt(i32, 2, 0) };
             zan_call2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0),
@@ -3303,26 +3228,22 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMConstPointerNull(i8ptr_t), "cp.buf.null"),
                     "out of memory\n");
             }
-            /* read */
             LLVMValueRef fread_args[] = { buf, LLVMConstInt(i64, 1, 0), sz, sfp };
             zan_call2(g->builder, LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64, i64, i8ptr }, 4, 0),
                 fread_fn, fread_args, 4, "");
             zan_call2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 fclose_fn, &sfp, 1, "");
-            /* open dest for writing */
             LLVMValueRef wb = zan_irgen_intern_string(g, "wb");
             LLVMValueRef dargs[] = { dst, wb };
             LLVMValueRef dfp = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 fopen_fn, dargs, 2, "dfp");
             emit_fopen_check(g, dfp, "cannot write file\n");
-            /* write */
             LLVMValueRef fwrite_args[] = { buf, LLVMConstInt(i64, 1, 0), sz, dfp };
             zan_call2(g->builder, LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64, i64, i8ptr }, 4, 0),
                 fwrite_fn, fwrite_args, 4, "");
             zan_call2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 fclose_fn, &dfp, 1, "");
-            /* free buffer */
             zan_call2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 g->fn_free, &buf, 1, "");
             emit_release_owned_call_temp(g, expr->call.args.items[0], src, locals);
@@ -3552,16 +3473,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
             LLVMValueRef path_val = emit_expr(g, expr->call.args.items[0], locals);
-            /* strlen */
             LLVMValueRef len = zan_call2(g->builder,
                 LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0), g->fn_strlen, &path_val, 1, "plen");
-            /* allocate copy */
             LLVMValueRef bsz = zan_add(g->builder, len, LLVMConstInt(i64, 1, 0), "bsz");
             LLVMValueRef buf = emit_string_alloc_rc(g, bsz);
             LLVMValueRef cpy_args[] = { buf, path_val };
             zan_call2(g->builder, LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 g->fn_strcpy, cpy_args, 2, "");
-            /* find last separator */
             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
             LLVMValueRef strrchr_fn = LLVMGetNamedFunction(g->mod, "strrchr");
             LLVMValueRef slash_args[] = { buf, LLVMConstInt(i32t, '/', 0) };
@@ -3572,7 +3490,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef bslash = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0),
                 strrchr_fn, bslash_args, 2, "bsl");
-            /* pick later one */
             LLVMValueRef sl_null = zan_icmp(g->builder, LLVMIntEQ, slash, LLVMConstNull(i8ptr), "snul");
             LLVMValueRef pick = LLVMBuildSelect(g->builder, sl_null, bslash, slash, "pk1");
             LLVMValueRef bs_null = zan_icmp(g->builder, LLVMIntEQ, bslash, LLVMConstNull(i8ptr), "bnul");
@@ -3580,7 +3497,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMBuildSelect(g->builder,
                     zan_icmp(g->builder, LLVMIntUGT, bslash, pick, "bgt"),
                     bslash, pick, "pk2"), "sep");
-            /* truncate at separator */
             LLVMValueRef found = zan_icmp(g->builder, LLVMIntNE, sep_ptr, LLVMConstNull(i8ptr), "fnd");
             LLVMBasicBlockRef trunc_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dn.trunc");
             LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dn.end");
@@ -3654,7 +3570,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
             LLVMValueRef path_val = emit_expr(g, expr->call.args.items[0], locals);
-            /* Get filename first (reuse strrchr logic) */
             LLVMValueRef strrchr_fn = LLVMGetNamedFunction(g->mod, "strrchr");
             LLVMValueRef slash_args[] = { path_val, LLVMConstInt(i32t, '/', 0) };
             LLVMValueRef slash = zan_call2(g->builder,
@@ -3664,7 +3579,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef bslash = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0),
                 strrchr_fn, bslash_args, 2, "bsl");
-            /* pick later separator */
             LLVMValueRef sl_null = zan_icmp(g->builder, LLVMIntEQ, slash, LLVMConstNull(i8ptr), "snul");
             LLVMValueRef bs_null = zan_icmp(g->builder, LLVMIntEQ, bslash, LLVMConstNull(i8ptr), "bnul");
             LLVMValueRef best = LLVMBuildSelect(g->builder, sl_null, bslash,
@@ -3672,10 +3586,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildSelect(g->builder, zan_icmp(g->builder, LLVMIntUGT, bslash, slash, "bgt"),
                         bslash, slash, "mx"), "pk"), "sep");
             LLVMValueRef has_sep = zan_icmp(g->builder, LLVMIntNE, best, LLVMConstNull(i8ptr), "hs");
-            /* filename starts after separator+1, or is the whole path */
             LLVMValueRef after = LLVMBuildGEP2(g->builder, i8, best, &(LLVMValueRef){LLVMConstInt(i64, 1, 0)}, 1, "aft");
             LLVMValueRef fname = LLVMBuildSelect(g->builder, has_sep, after, path_val, "fn");
-            /* make a copy, then truncate at last dot */
             LLVMValueRef flen = zan_call2(g->builder,
                 LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0), g->fn_strlen, &fname, 1, "flen");
             LLVMValueRef bsz = zan_add(g->builder, flen, LLVMConstInt(i64, 1, 0), "bsz");
@@ -3699,7 +3611,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
 
-                /* List.Add(item) — append to dynamic list */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee = expr->call.callee;
             zan_istr_t method_name = callee->member.name;
@@ -3710,24 +3621,19 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 if (ltype && type_named(ltype, "List", 4)) {
                     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                    /* load list pointer (works for local vars and fields) */
                     LLVMValueRef raw_ptr = emit_expr(g, lobj, locals);
                     int recv_own = emit_intrinsic_own_recv(g, lobj, raw_ptr, locals);
                     (void)i8ptr;
                     LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, raw_ptr,
                         LLVMPointerType(g->list_struct_type, 0), "lptr");
-                    /* load count */
                     LLVMValueRef count_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 0, "cntp");
                     LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, count_ptr, "cnt");
-                    /* load capacity */
                     LLVMValueRef cap_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 1, "capp");
                     LLVMValueRef cap = LLVMBuildLoad2(g->builder, i64, cap_ptr, "cap");
-                    /* check if need to grow: if count >= capacity */
                     LLVMValueRef need_grow = zan_icmp(g->builder, LLVMIntUGE, count, cap, "grow");
                     LLVMBasicBlockRef grow_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "list.grow");
                     LLVMBasicBlockRef add_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "list.add");
                     LLVMBuildCondBr(g->builder, need_grow, grow_bb, add_bb);
-                    /* grow block: double capacity, realloc */
                     LLVMPositionBuilderAtEnd(g->builder, grow_bb);
                     LLVMValueRef new_cap = zan_mul(g->builder, cap, LLVMConstInt(i64, 2, 0), "ncap");
                     LLVMBuildStore(g->builder, new_cap, cap_ptr);
@@ -3752,11 +3658,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef count2 = LLVMBuildLoad2(g->builder, i64, count_ptr, "cnt2");
                     LLVMValueRef wpos = slot_word_index(g, count2, lwords);
                     LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &wpos, 1, "ep");
-                    /* emit the value to add */
                     LLVMValueRef val = emit_expr(g, expr->call.args.items[0], locals);
                     emit_collection_slot_store(g, container_elem_type(ltype), i64, elem_ptr,
                         val, expr->call.args.items[0], locals, 0);
-                    /* count++ */
                     LLVMValueRef new_count = zan_add(g->builder, count2, LLVMConstInt(i64, 1, 0), "nc");
                     LLVMBuildStore(g->builder, new_count, count_ptr);
                     emit_intrinsic_drop_recv(g, lobj, raw_ptr, locals, recv_own);
@@ -3766,9 +3670,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* List.Reserve(n) — pre-grow the backing buffer so the next n Adds
-         * never realloc. Parsers and bulk loaders know their target size up
-         * front; Add's doubling growth otherwise memmoves the whole buffer
-         * log2(n) times (a 420k-slot parse moves ~33MB of pure copying). */
+         * never realloc (Add's doubling growth otherwise memmoves the whole
+         * buffer log2(n) times). */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee = expr->call.callee;
             zan_istr_t method_name = callee->member.name;
@@ -3840,15 +3743,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     zan_type_t *elem_type = container_elem_type(ltype);
                     unsigned ar_words = elem_slot_words(g, elem_type);
                     LLVMTypeRef elem_llvm = elem_type ? map_type(g, elem_type) : i64;
-                    /* self + other list pointers */
                     LLVMValueRef self_raw = emit_expr(g, lobj, locals);
                     LLVMValueRef self_ptr = LLVMBuildBitCast(g->builder, self_raw, list_pt, "ar.self");
-                    /* The source is another List or (C#: AddRange takes an
-                     * IEnumerable) an array. An array carries its length in
+                    /* The source is another List or an array (C#: AddRange
+                     * takes an IEnumerable). An array carries its length in
                      * the allocation header and packs elements by their own
-                     * type, so it needs its own count/read pair -- reading it
-                     * as a list struct took the first element for a count and
-                     * a data pointer out of the elements. */
+                     * type, so it needs its own count/read pair. */
                     zan_type_t *otype = infer_expr_type(g, expr->call.args.items[0], locals);
                     int src_array = otype && otype->kind == TYPE_ARRAY &&
                                     otype->array_rank <= 1;
@@ -3858,7 +3758,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             ? map_type(g, otype->element_type) : i64;
                     LLVMValueRef other_raw = emit_expr(g, expr->call.args.items[0], locals);
                     LLVMValueRef other_ptr = LLVMBuildBitCast(g->builder, other_raw, list_pt, "ar.other");
-                    /* skip entirely when other is null */
                     LLVMValueRef other_i = LLVMBuildPtrToInt(g->builder, other_ptr, i64, "ar.oi");
                     LLVMValueRef is_null = zan_icmp(g->builder, LLVMIntEQ, other_i,
                         LLVMConstInt(i64, 0, 0), "ar.null");
@@ -3922,7 +3821,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             ? load_struct_from_slot(g, oslot, elem_llvm)
                             : LLVMBuildLoad2(g->builder, i64, oslot, "ar.rv");
                     }
-                    /* grow self if full (mirrors List.Add) */
                     LLVMValueRef s_cnt_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, self_ptr, 0, "ar.scp");
                     LLVMValueRef s_cnt = LLVMBuildLoad2(g->builder, i64, s_cnt_ptr, "ar.sc");
                     LLVMValueRef s_cap_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, self_ptr, 1, "ar.scapp");
@@ -3932,7 +3830,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBasicBlockRef s_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ar.store");
                     LLVMBuildCondBr(g->builder, need, g_bb, s_bb);
                     LLVMPositionBuilderAtEnd(g->builder, g_bb);
-                    /* newcap = cap == 0 ? 4 : cap * 2 */
                     LLVMValueRef cap_zero = zan_icmp(g->builder, LLVMIntEQ, s_cap,
                         LLVMConstInt(i64, 0, 0), "ar.cz");
                     LLVMValueRef dbl = zan_mul(g->builder, s_cap, LLVMConstInt(i64, 2, 0), "ar.dbl");
@@ -3953,7 +3850,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildStore(g->builder, nd, s_df);
                     LLVMBuildBr(g->builder, s_bb);
                     LLVMPositionBuilderAtEnd(g->builder, s_bb);
-                    /* store raw value at self.data[count] */
                     LLVMValueRef s_df2 = LLVMBuildStructGEP2(g->builder, g->list_struct_type, self_ptr, 2, "ar.sdf2");
                     LLVMValueRef s_data = LLVMBuildLoad2(g->builder, i64ptr, s_df2, "ar.sd");
                     LLVMValueRef s_cnt2 = LLVMBuildLoad2(g->builder, i64, s_cnt_ptr, "ar.sc2");
@@ -3982,7 +3878,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
-        /* List.Clear() — reset count to 0 */
+        /* List.Clear() — release every element, then reset count to 0 */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee = expr->call.callee;
             zan_istr_t method_name = callee->member.name;
@@ -4124,7 +4020,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         container_elem_type(ltype));
                     unsigned io_words = elem_slot_words(g, elem_type);
                     LLVMValueRef search = emit_expr(g, expr->call.args.items[0], locals);
-                    /* result alloca — -1 for not found */
                     LLVMValueRef res = emit_entry_alloca(g, i64, "iofr");
                     LLVMBuildStore(g->builder, LLVMConstInt(i64, (uint64_t)-1LL, 1), res);
                     LLVMValueRef idx_a = emit_entry_alloca(g, i64, "ii");
@@ -4156,10 +4051,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildStore(g->builder, ni, idx_a);
                     LLVMBuildBr(g->builder, cond_bb);
                     LLVMPositionBuilderAtEnd(g->builder, done_bb);
-                    /* `items.IndexOf(P.Make())` hands the search key's rc to
-                     * this expression; a temporary argument has no other
-                     * owner, so drop it here (A64b sibling: the leak checker
-                     * traced stray strings to exactly this window). */
+                    /* A temporary search-key argument has no other owner
+                     * (`items.IndexOf(P.Make())`); drop its rc here. */
                     emit_release_owned_call_temp(g, expr->call.args.items[0],
                                                  search, locals);
                     return LLVMBuildLoad2(g->builder, i64, res, "iofres");
@@ -4188,7 +4081,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         container_elem_type(ltype));
                     unsigned lio_words = elem_slot_words(g, elem_type);
                     LLVMValueRef search = emit_expr(g, expr->call.args.items[0], locals);
-                    /* result alloca — -1 for not found */
                     LLVMValueRef res = emit_entry_alloca(g, i64, "liofr");
                     LLVMBuildStore(g->builder, LLVMConstInt(i64, (uint64_t)-1LL, 1), res);
                     LLVMValueRef idx_a = emit_entry_alloca(g, i64, "lii");
@@ -4320,13 +4212,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                                 expr->loc, "list");
                     /* Keep `item` in its natural type (pointer for string/class
                      * elements) so emit_collection_slot_store can retain it:
-                     * emit_string_retain/emit_arc_retain no-op on non-pointer
-                     * values, so pre-converting to i64 here would silently skip
-                     * the +1 and leave the list holding a slot that is freed
-                     * when the argument temp dies -> heap corruption. The store
-                     * helper performs the pointer->i64 slot conversion itself. */
+                     * the retain helpers no-op on non-pointers, so
+                     * pre-converting to i64 here would silently skip the +1
+                     * and leave the slot freed when the argument temp dies.
+                     * The store helper performs the pointer->i64 slot
+                     * conversion itself. */
                     LLVMValueRef item = emit_expr(g, expr->call.args.items[1], locals);
-                    /* grow if needed */
                     LLVMValueRef need = zan_icmp(g->builder, LLVMIntUGE, count, cap, "need");
                     LLVMBasicBlockRef grow_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ins.grow");
                     LLVMBasicBlockRef shift_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ins.shift");
@@ -4344,7 +4235,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef new_data_i = LLVMBuildBitCast(g->builder, new_data, LLVMPointerType(i64, 0), "ndi");
                     LLVMBuildStore(g->builder, new_data_i, data_field);
                     LLVMBuildBr(g->builder, shift_bb);
-                    /* shift elements right from count-1 down to idx */
                     LLVMPositionBuilderAtEnd(g->builder, shift_bb);
                     LLVMValueRef phi_data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "phid");
                     LLVMValueRef j_a = emit_entry_alloca(g, i64, "ij");
@@ -4374,11 +4264,10 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildStore(g->builder, prev, j_a);
                     LLVMBuildBr(g->builder, scond_bb);
                     LLVMPositionBuilderAtEnd(g->builder, sdone_bb);
-                    /* store item at index. overwrite_old must be 0: Insert
-                     * shifts the previous occupant of this slot up to idx+1
-                     * where it stays live, so it must not be released here
-                     * (doing so frees a still-referenced element). The new
-                     * item is still retained by emit_collection_slot_store. */
+                    /* overwrite_old must be 0: Insert shifts the previous
+                     * occupant of this slot up to idx+1 where it stays live,
+                     * so it must not be released here; the new item is still
+                     * retained by emit_collection_slot_store. */
                     LLVMValueRef ins_word = slot_word_index(g, idx, ins_words);
                     LLVMValueRef ins_slot = LLVMBuildGEP2(g->builder, i64, phi_data, &ins_word, 1, "is");
                     emit_collection_slot_store(g, elem_type, i64, ins_slot,
@@ -4410,7 +4299,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     zan_type_t *elem_type = concretize(g,
                         container_elem_type(ltype));
                     unsigned rv_words = elem_slot_words(g, elem_type);
-                    /* two-pointer swap: lo=0, hi=count-1 */
                     LLVMValueRef lo_a = emit_entry_alloca(g, i64, "lo");
                     LLVMValueRef hi_a = emit_entry_alloca(g, i64, "hi");
                     LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), lo_a);
@@ -4527,10 +4415,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
 
-                /* Dict method calls: Add, ContainsKey, Clear. The receiver is
-                 * resolved by its static type, not by name, so it works for
-                 * locals AND fields (`dict.Add` / `this.dict.Add` /
-                 * `obj.dict.Add`) alike. */
+                /* Dict method calls: the receiver is resolved by its static
+                 * type, not by name, so this covers locals and fields
+                 * (`dict.Add` / `this.dict.Add` / `obj.dict.Add`) alike. */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee_d = expr->call.callee;
             zan_istr_t mname = callee_d->member.name;
@@ -4654,7 +4541,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 }
         }
 
-        /* Dict.Clear() — reset count to 0 */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee_d = expr->call.callee;
             zan_istr_t mname = callee_d->member.name;
@@ -4675,16 +4561,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
-        /* Dict.Remove(key) — the helper finds the entry, decrements the count
-         * and invalidates the hash index (indexed_count = 0); find rebuilds it
-         * from scratch on the next lookup, the same O(n) class as this
-         * caller's data shift. That shift moves every entry above the hole
-         * down one slot so the parallel buffers keep insertion order (C#
-         * observable enumeration semantics; the layout contract documented at
-         * dict_struct_type). The helper returns the removed entry's index;
-         * this caller releases the key/value (ARC types it knows) and does
-         * the shift. Receiver resolved by static type (locals and fields
-         * alike). */
+        /* Dict.Remove(key): the helper finds the entry, decrements the count
+         * and invalidates the hash index (indexed_count = 0; find rebuilds it
+         * lazily on the next lookup). This caller releases the removed
+         * key/value and shifts every entry above the hole down one slot so
+         * the parallel buffers keep insertion order (C# enumeration
+         * semantics; layout contract at dict_struct_type). Receiver resolved
+         * by static type (locals and fields alike). */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee_d = expr->call.callee;
             zan_istr_t mname = callee_d->member.name;
@@ -4727,13 +4610,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMBuildCondBr(g->builder, hit, hit_bb, miss_bb);
                         LLVMPositionBuilderAtEnd(g->builder, hit_bb);
                         /* the helper already decremented cnt, so the ORIGINAL
-                         * last entry is exactly the post-remove count: the
-                         * entry this data move relocates. Subtracting 1 here
-                         * again double-shifted the window (fi==last became
-                         * true for every remove, skipping the data move and
-                         * corrupting the table for the next lookup). */
+                         * last entry is exactly the post-remove count;
+                         * subtracting 1 again would skip the data move. */
                         LLVMValueRef last = LLVMBuildLoad2(g->builder, i64, cntp, "cnt2");
-                        /* release the removed entry's key/value */
                         LLVMValueRef kp0 = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 2, "kp0");
                         LLVMValueRef ks0 = LLVMBuildLoad2(g->builder, LLVMPointerType(i8ptr, 0), kp0, "ks0");
                         LLVMValueRef rkey = LLVMBuildGEP2(g->builder, i8ptr, ks0, &fi, 1, "rkey");
@@ -4764,7 +4643,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMBuildCondBr(g->builder, is_last, tail_bb, move_bb);
                         LLVMPositionBuilderAtEnd(g->builder, move_bb);
                         LLVMValueRef shift_entries = zan_sub(g->builder, last, fi, "dr.shent");
-                        /* keys: memmove(ks + fi, ks + fi + 1, (last-fi)*8) */
+                        /* shift the entries above the hole down one slot (keys
+                         * one word each, values value_words each) */
                         LLVMValueRef ksrc_i = zan_add(g->builder, fi,
                             LLVMConstInt(i64, 1, 0), "dr.ksi");
                         LLVMValueRef ksrc = LLVMBuildGEP2(g->builder, i8ptr, ks0,
@@ -4775,8 +4655,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             (LLVMValueRef[]){ LLVMBuildBitCast(g->builder, rkey, i8ptr, "kdst8"),
                                               LLVMBuildBitCast(g->builder, ksrc, i8ptr, "ksrc8"),
                                               kbytes }, 3, "");
-                        /* values: memmove(vs + fi*w, vs + (fi+1)*w,
-                         *                (last-fi)*w words) */
                         LLVMValueRef next_word = zan_add(g->builder, removed_word,
                             value_words, "dr.vnw");
                         LLVMValueRef vsrc = LLVMBuildGEP2(g->builder, i64, vs0,
@@ -4790,12 +4668,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                               vbytes }, 3, "");
                         LLVMBuildBr(g->builder, tail_bb);
                         LLVMPositionBuilderAtEnd(g->builder, tail_bb);
-                        /* clear the tail slot (ARC must not see a stale ref)。
-                         * memset 一律按 libc 真身 (ptr,i32,i64)->ptr 调——
-                         * get_libc_fn 按名字取模块里先到的声明，签名各处
-                         * 不一致就会实参/形参不匹配，LLVM verifier 直接
-                         * 拒绝（GenRoute_MetaSet 的 "Incorrect number of
-                         * arguments passed to called function" 即源于此）。 */
+                        /* clear the tail slot (ARC must not see a stale ref).
+                         * memset must be declared exactly (ptr,i32,i64)->ptr:
+                         * get_libc_fn resolves by name and takes the first
+                         * declaration in the module, so mismatched signatures
+                         * trip the LLVM verifier. */
                         LLVMValueRef tkey = LLVMBuildGEP2(g->builder, i8ptr, ks0, &last, 1, "tkey");
                         LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), tkey);
                         LLVMTypeRef zero_ty = LLVMFunctionType(i8ptr,
@@ -4803,11 +4680,10 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef memset_fn = get_libc_fn(g, "memset", zero_ty);
                         LLVMValueRef tw = zan_mul(g->builder, last, value_words, "dr.tword");
                         LLVMValueRef tvslot = LLVMBuildGEP2(g->builder, i64, vs0, &tw, 1, "tvslot");
-                        /* 尾槽清零的长度是「本槽大小」value_words×8，不是
-                         * 上面的搬移距离 move.bytes——后者定义在搬移分支
-                         * 里不支配 tail_bb（删末项时跳过搬移直落本块，旧
-                         * 代码这里=0，末项删除后残留脏 ARC 槽），verifier
-                         * 也以 dominance 拒绝。 */
+                        /* The clear length is this slot's size,
+                         * value_words*8 — not the move distance above, which
+                         * is defined only in the move branch and does not
+                         * dominate tail_bb. */
                         LLVMValueRef tail_bytes = zan_mul(g->builder, value_words,
                             LLVMConstInt(i64, 8, 0), "tail.bytes");
                         zan_call2(g->builder, zero_ty, memset_fn,
@@ -4936,11 +4812,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                     if (method_sym) {
                         /* `d.StaticMethod(args)` through a local variable is
-                         * legal: a static method has no receiver parameter, so
-                         * the receiver is not passed. Emitting it anyway shifted
-                         * every argument by one and failed LLVM verification with
-                         * a count mismatch far from this call site -- the
-                         * `recv_cls` branch below has always handled this shape. */
+                         * legal: a static method has no receiver parameter,
+                         * so the receiver is not passed. */
                         bool callee_static = (method_sym->modifiers & MOD_STATIC) != 0;
                         int recv_off = callee_static ? 0 : 1;
                         /* a generic instance method monomorphizes with the
@@ -4999,10 +4872,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 /* try as static method: ClassName.Method(args).
                  * A field of the enclosing class shadows a type of the same
                  * name, exactly as a local does: in a class holding a field
-                 * `Collapse`, `Collapse.Add(h)` calls that field's method and
-                 * not a static of the widget class named Collapse. Without
-                 * this the receiver silently became the type and the call was
-                 * emitted against the wrong (instance) signature. */
+                 * `Collapse`, `Collapse.Add(h)` calls that field's method,
+                 * not a static of the widget class named Collapse. */
                 zan_symbol_t *type_sym = NULL;
                 if (!ident_names_own_field(g, callee->member.object))
                     type_sym = zan_binder_lookup(g->binder,
@@ -5014,10 +4885,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     if (method_sym) {
                         /* The receiver here is a type name (locals and fields
                          * were ruled out above), so only a static method can
-                         * be claimed: emitting an instance method would drop
-                         * its receiver argument and fail LLVM verification
-                         * with an argument-count mismatch far from this call
-                         * site. Diagnose at the source instead. */
+                         * be claimed; diagnose an instance call at the
+                         * source. */
                         if ((method_sym->modifiers & MOD_STATIC) == 0) {
                             zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
                                 "cannot call instance method '%.*s.%.*s' via "
@@ -5240,10 +5109,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                      * instantiation, but the method's declared signature
                      * names the bare type parameters -- `T At(int i)`
                      * resolves `T` to an opaque pointer and the dispatch
-                     * phi/argument types disagree with every concrete
-                     * implementation (LLVM "operands are not of the same
-                     * type"). Substitute the declared arguments for the
-                     * interface's type parameters in both directions. */
+                     * types disagree with every concrete implementation.
+                     * Substitute the declared arguments for the interface's
+                     * type parameters in both directions. */
                     zan_ast_list_t *ifc_tps = &iface->decl->type_decl.type_params;
                     bool ifc_generic = obj_ty->type_arg_count > 0 &&
                         obj_ty->type_arg_count == ifc_tps->count &&
@@ -5308,7 +5176,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     }
 
                     if (impl_count == 1 && single_cls && single_m && single_fn && single_fnty) {
-                        /* Monomorphic interface call: exactly one class implements this interface */
                         unsigned npar = LLVMCountParamTypes(single_fnty);
                         LLVMTypeRef *pts = (LLVMTypeRef *)calloc((size_t)(npar > 0 ? npar : 1), sizeof(LLVMTypeRef));
                         LLVMGetParamTypes(single_fnty, pts);
@@ -5722,12 +5589,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                  * coerce each argument to the formal's type here. */
                 unsigned nparams = LLVMCountParamTypes(fn_type);
                 /* LLVMGetParamTypes has no capacity argument: it writes
-                 * LLVMCountParamTypes entries. A fixed 16-slot array with a
-                 * "nparams = 16" clamp only clamped the coercion loop below,
-                 * so an extern declaring more than 16 formals wrote past the
-                 * array (60 params = 480 bytes into a 128-byte stack slot) and
-                 * then failed with a mismatched-signature verifier error far
-                 * from the cause. Size the array to the real count. */
+                 * LLVMCountParamTypes entries, so the array is sized to the
+                 * real count (a fixed 16-slot clamp wrote past the array for
+                 * externs declaring more formals). */
                 LLVMTypeRef *ptypes = nparams > 0
                     ? (LLVMTypeRef *)calloc(nparams, sizeof(LLVMTypeRef))
                     : NULL;
@@ -5761,9 +5625,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             call_args[k], pt, "arg.ptrc");
                     }
                 }
-                /* Variadic = true tail (A2-3): C default argument promotions
-                 * on args beyond the declared parameters -- small integers
-                 * widen to int, float to double. */
+                /* Variadic tail: C default argument promotions on args beyond
+                 * the declared parameters -- small integers widen to int,
+                 * float to double. */
                 if (LLVMIsFunctionVarArg(fn_type)) {
                     for (int k = (int)nparams; k < argc; k++) {
                         LLVMTypeRef at = LLVMTypeOf(call_args[k]);
@@ -5862,16 +5726,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* Robustness: a call `obj.Method(...)` on a known class/struct type
          * where no member of that name exists anywhere in the class or its
-         * base chain. Historically this silently lowered to a constant 0
-         * (e.g. a missing IsOpen() "returned" false), which is very hard to
-         * diagnose. Members that do exist (delegate fields, arity-mismatched
-         * overloads) are left to the later paths / LLVM verification. */
+         * base chain must error, not silently lower to 0. Members that do
+         * exist (delegate fields, arity-mismatched overloads) are left to the
+         * later paths / LLVM verification. */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee = expr->call.callee;
             zan_symbol_t *recv_cls = expr_class_sym(g, callee->member.object, locals);
             if (!recv_cls && callee->member.object->kind == AST_IDENTIFIER &&
                 !local_find(locals, callee->member.object->ident.name)) {
-                /* static call ClassName.Method(...) */
                 zan_symbol_t *ts = zan_binder_lookup(g->binder, callee->member.object->ident.name);
                 if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) recv_cls = ts;
             }
@@ -5890,11 +5752,10 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     cur = (base && base != cur) ? base : NULL;
                 }
                 if (!found) {
-                    /* Same tell as the checker's member diagnostic: the
-                     * receiver here is typically a bare identifier that
-                     * fell through to a unique imported type, and the
-                     * simple name alone read as "my field broke" when the
-                     * member never existed on the imported class. */
+                    /* Qualify with the namespace: the receiver is typically a
+                     * bare identifier that fell through to a uniquely
+                     * imported type, and the simple name alone reads as a
+                     * member of the current class. */
                     zan_istr_t ns = recv_cls->decl
                         ? zan_ast_ns_name(recv_cls->decl) : (zan_istr_t){0};
                     if (ns.len)
@@ -5914,20 +5775,18 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* Robustness: a member-access call `X.Method(...)` where X is neither a
          * local variable nor any known symbol (class / struct / enum / namespace)
-         * is an unresolved reference. This most often means the class was never
-         * compiled — e.g. a stdlib file missing from the stdlib_map in main.c —
-         * or a typo. Historically such a call silently lowered to a 0/null result
-         * (a string method would then return "(null)"), which is very hard to
-         * diagnose. Emit a hard compile error instead. Valid builtin calls
-         * (Console.*, Math.*, ...) and resolved user methods return earlier, so
-         * only genuinely unresolved references reach this point; keying on the
-         * object being an unknown name (rather than a known class missing the
-         * method) keeps this from firing on extern/DllImport members.
+         * is an unresolved reference -- most often a class that was never
+         * compiled (a stdlib file missing from the stdlib_map in main.c) or a
+         * typo. Emit a hard compile error, not a silent 0/null. Valid builtin
+         * calls (Console.*, Math.*, ...) and resolved user methods return
+         * earlier, so only genuinely unresolved references reach this point;
+         * keying on the object being an unknown name (rather than a known class
+         * missing the method) keeps this from firing on extern/DllImport
+         * members.
          *
          * `X` may itself be a dotted name path (`Foo.Bar.Baz.Quux(...)`) whose
          * head is a namespace and whose rightmost segment is the type name. The
-         * AST nests such a path inside member accesses, so the single-identifier
-         * check below would silently pass it through; walk the chain instead. A
+         * AST nests such a path inside member accesses, so walk the chain; a
          * chain rooted in a local (`a.b.c.M()`) is a genuine instance chain and
          * is left to the instance handlers above. */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
@@ -5977,10 +5836,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         plen, path, (int)on.len, on.str);
                 }
                 /* The type name is a known class/struct but the method does not
-                 * exist on it (and no builtin lowering claimed the call earlier).
-                 * This is the method-call twin of the check above: silently
-                 * lowering to 0/null turns a typo or a missing stdlib method into
-                 * a runtime null-pointer crash far from the call site. */
+                 * exist on it (and no builtin lowering claimed the call
+                 * earlier): the method-call twin of the check above. */
                 else if (osym && (osym->kind == SYM_CLASS || osym->kind == SYM_STRUCT) &&
                          !get_method_sym(osym, mn)) {
                     zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
@@ -5993,10 +5850,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* Robustness: `recv.M(...)` where recv's static type is one of the
          * compiler's built-in types (string, List<T>, Dictionary<K,V>,
-         * StringBuilder) and M is neither a member irgen lowers (builtin_api.c)
-         * nor an extension method (tried above). Falling through to the
-         * constant below made `s.PadLeft(4)` evaluate to 0 and `items.Sort()`
-         * a no-op, with no diagnostic anywhere. */
+         * StringBuilder) and M is neither a member irgen lowers
+         * (builtin_api.c) nor an extension method (tried above) must be
+         * diagnosed, not silently lowered to 0. */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *bcallee = expr->call.callee;
             zan_istr_t bmn = bcallee->member.name;
@@ -6035,10 +5891,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* Reaching here means no lowering claimed the call: nothing was
          * emitted, so the call simply does not happen and the expression
-         * becomes the zero below. Every specific shape checked above was added
-         * after a bug where exactly that produced a silently wrong program, so
-         * the general case has to report too -- a call the code generator
-         * cannot resolve is a compile error, not a zero.
+         * becomes the zero below -- a call the code generator cannot resolve
+         * is a compile error, not a zero.
          *
          * Two contexts legitimately reach here and must stay quiet:
          *   - the ERASED body of a generic, where a receiver still typed as a

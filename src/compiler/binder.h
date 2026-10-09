@@ -6,7 +6,6 @@
 #include "zan.h"
 #include "ast.h"
 
-/* ---- symbol kinds ---- */
 typedef enum {
     SYM_NAMESPACE,
     SYM_CLASS,
@@ -24,7 +23,6 @@ typedef enum {
     SYM_DELEGATE,
 } zan_sym_kind_t;
 
-/* ---- type representation ---- */
 typedef enum {
     TYPE_VOID,
     TYPE_BOOL,
@@ -76,7 +74,6 @@ struct zan_type {
                                       * yields a task handle (i8*) and is awaited */
 };
 
-/* ---- symbol table entry ---- */
 typedef struct zan_symbol zan_symbol_t;
 struct zan_symbol {
     zan_sym_kind_t kind;
@@ -91,33 +88,30 @@ struct zan_symbol {
     int member_count;
     int member_cap;
 
-    /* P2: scope name-index chain, owned by the scope the symbol was added
-     * to. name_hash is FNV-1a over `name`, computed once at scope_add;
-     * hash_next links the other symbols of the same hash bucket. Arena
-     * memory is not zeroed, so both fields must be initialized by
-     * make_symbol. */
+    /* Scope name-index chain, owned by the scope the symbol was added to.
+     * name_hash is FNV-1a over `name`, computed once at scope_add; hash_next
+     * links the other symbols of the same hash bucket. Arena memory is not
+     * zeroed, so both fields must be initialized by make_symbol. */
     uint32_t name_hash;
     zan_symbol_t *hash_next;
 };
 
-/* ---- scope ---- */
 typedef struct zan_scope zan_scope_t;
 struct zan_scope {
     zan_scope_t *parent;
     zan_symbol_t **symbols;
     int sym_count;
     int sym_cap;
-    /* P2: O(1) name index over `symbols`. The array stays the authoritative
+    /* O(1) name index over `symbols`. The array stays the authoritative
      * storage in insertion order; `buckets` points at the same symbols,
      * chained via hash_next with every bucket also kept in insertion order,
      * so the first same-name symbol per scope is still the first one added
-     * and overload / redeclaration diagnostics see exactly what the old
-     * linear scan returned. */
+     * and overload / redeclaration diagnostics see exactly what a linear
+     * scan would return. */
     zan_symbol_t **buckets;          /* NULL until the first symbol is added */
     int bucket_count;                /* power of two, or 0 when empty */
 };
 
-/* ---- binder context ---- */
 struct zan_binder {
     zan_arena_t *arena;
     zan_diag_t *diag;
@@ -160,15 +154,11 @@ struct zan_binder {
     int tuple_type_count;
     int tuple_type_cap;
     /* Hash index over tuple_types keyed on the canonical signature string
-     * (open addressing, NULL = empty): the flat scan made every new tuple
-     * signature compare against every cached one -- O(N^2) memcmps on
-     * projects with many distinct tuple shapes. */
+     * (open addressing, NULL = empty). */
     zan_type_t **tuple_hash;
     int tuple_hash_cap; /* power of two, 0 = not built */
     /* Per-type member-name index for check_member_name_clash: open
-     * addressing over type symbols, value owned by binder.c. The flat
-     * per-member scan made a type with M members cost O(M^2) name compares
-     * while binding. */
+     * addressing over type symbols, value owned by binder.c. */
     struct zan_member_idx_slot {
         zan_symbol_t *type; /* NULL = empty slot */
         struct zan_member_name_index *idx;

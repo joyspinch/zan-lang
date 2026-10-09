@@ -14,15 +14,11 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* ---- file hash (fast 64-bit hash for change detection) ---- */
-
 typedef struct {
     uint64_t hash;
     uint64_t mtime;     /* last modification time */
     uint64_t size;      /* file size */
 } zan_file_stamp_t;
-
-/* ---- dependency tracking ---- */
 
 typedef struct {
     char *source_path;         /* source .zan file */
@@ -32,8 +28,6 @@ typedef struct {
     int dep_count;
     bool needs_rebuild;        /* set during analysis */
 } zan_compile_unit_t;
-
-/* ---- incremental cache ---- */
 
 typedef struct {
     char *cache_dir;                /* .zan-cache directory path */
@@ -48,10 +42,10 @@ typedef struct {
 /* Initialize incremental cache for a project directory */
 void zan_incr_init(zan_incr_cache_t *cache, const char *project_dir);
 
-/* Load cache from .zan-cache/manifest.json */
+/* Load cache from .zan-cache/manifest.bin */
 bool zan_incr_load(zan_incr_cache_t *cache);
 
-/* Save cache to .zan-cache/manifest.json */
+/* Save cache to .zan-cache/manifest.bin */
 bool zan_incr_save(zan_incr_cache_t *cache);
 
 /* Check if a source file needs recompilation */
@@ -73,8 +67,6 @@ void zan_incr_clean(zan_incr_cache_t *cache);
 /* Destroy cache and free memory */
 void zan_incr_destroy(zan_incr_cache_t *cache);
 
-/* ---- file hashing utility ---- */
-
 /* Compute a fast 64-bit hash of file contents */
 uint64_t zan_hash_file(const char *path);
 
@@ -86,8 +78,6 @@ uint64_t zan_file_mtime(const char *path);
 
 /* Get file size (0 on error) */
 uint64_t zan_file_size(const char *path);
-
-/* ---- parallel compilation ---- */
 
 typedef struct {
     const char **source_files;  /* array of source file paths */

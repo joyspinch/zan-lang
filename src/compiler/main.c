@@ -286,8 +286,6 @@ static char *read_file(const char *path, size_t *out_len) {
     return buf;
 }
 
-/* ---- input-file list helpers (auto-stdlib dedup) ---- */
-
 /* Normalized comparison key so the same file passed explicitly and via
  * auto-stdlib (case/slash differences) is only compiled once. */
 static void canon_key(const char *in, char *out, size_t out_sz) {
@@ -5020,7 +5018,6 @@ int main(int argc, char **argv) {
         scan_project_namespaces(package_project_root);
     }
 
-    /* ---- resolve compilation target ---- */
     zan_target_t target;
     if (target_name) {
         if (!zan_target_parse(target_name, &target)) {
@@ -9013,14 +9010,13 @@ int main(int argc, char **argv) {
 #endif
         }
         for (int di = 0; di < zan_lib_ndirs; di++) {
-            /* -L for link-time resolution, -rpath so the produced exe can load
-             * the shared library at runtime without LD_LIBRARY_PATH. */
+            /* -L for link-time resolution, -rpath so the exe loads the
+             * shared library without LD_LIBRARY_PATH. */
             cmd_appendf(link_cmd, sizeof(link_cmd),
                      " -L\"%s\" -Wl,-rpath,\"%s\"", zan_lib_dirs[di], zan_lib_dirs[di]);
         }
-        /* Runtime search path relative to the executable, so a --publish build
-         * whose driver dylibs are copied next to the exe stays self-contained
-         * even after the whole directory is relocated to the target machine. */
+        /* Runtime search path relative to the exe: a --publish build with
+         * driver dylibs beside it stays self-contained after relocation. */
         if (used_driver_count > 0) {
 #ifdef __APPLE__
             cmd_appendf(link_cmd, sizeof(link_cmd),
@@ -9030,10 +9026,9 @@ int main(int argc, char **argv) {
                      " -Wl,-rpath,'$ORIGIN'");
 #endif
         }
-        /* Windows-only system import libraries have no counterpart on
-         * Unix (their functionality is provided through the cross-platform
-         * zan_gui native library instead), so skip them here - mirroring the
-         * CRT skip on the Windows link path. */
+        /* Windows-only system import libraries have no Unix counterpart
+         * (zan_gui provides the functionality cross-platform); skip them,
+         * mirroring the CRT skip on the Windows link path. */
         static const char *const win_only_libs[] = {
             "user32", "gdi32", "kernel32", "advapi32", "shell32", "ole32",
             "oleaut32", "comdlg32", "comctl32", "gdiplus", "dwmapi", "shcore",
@@ -9042,7 +9037,6 @@ int main(int argc, char **argv) {
             const char *lib = irgen.extern_libs[li].str;
             int lib_len = (int)irgen.extern_libs[li].len;
             int skip = 0;
-            /* Windows-only system import libs have no -l counterpart on Unix. */
             for (int wi = 0; win_only_libs[wi]; wi++) {
                 if ((int)strlen(win_only_libs[wi]) == lib_len &&
                     memcmp(win_only_libs[wi], lib, lib_len) == 0) { skip = 1; break; }
@@ -9083,8 +9077,8 @@ int main(int argc, char **argv) {
             cmd_appendf(link_cmd, sizeof(link_cmd), " %s",
                      static_driver_libs[li]);
         }
-        /* caller-supplied link inputs (--libpath / --link-input / --link-lib);
-         * --subsystem is Windows-only and ignored here. */
+        /* Caller-supplied link inputs; --subsystem is Windows-only and
+         * ignored here. */
         for (int di = 0; di < extra_lib_path_count; di++) {
             cmd_appendf(link_cmd, sizeof(link_cmd),
                      " -L\"%s\" -Wl,-rpath,\"%s\"", extra_lib_paths[di], extra_lib_paths[di]);
@@ -9095,10 +9089,10 @@ int main(int argc, char **argv) {
         for (int ei = 0; ei < extra_link_lib_count; ei++) {
             cmd_appendf(link_cmd, sizeof(link_cmd), " -l%s", extra_link_libs[ei]);
         }
-        /* libm again, last: the -lm above sits before the driver libraries, and
-         * a static driver archive pulled in after it (zan_gui's software
-         * rasterizer uses sqrt/atan2) would otherwise leave those references
-         * unresolved -- ld only scans an archive for symbols already needed. */
+        /* libm again, last: the first -lm sits before the driver archives,
+         * and ld only scans an archive for symbols already needed, so a
+         * driver pulled in after it (rasterizer sqrt/atan2) would leave
+         * those references unresolved. */
         {
             cmd_appendf(link_cmd, sizeof(link_cmd), " -lm");
         }
@@ -9124,16 +9118,14 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* ---- bundle native driver runtime libraries ---------------------
-         * Copy each used shared driver's runtime libraries next to the produced
-         * executable for published programs and for all Windows builds, where
-         * a linked DLL must be available beside the executable at launch. The
-         * set of files per driver is taken
-         * from an optional manifest "<driver_dir>/<driver>.bundle" (one file
-         * name per line - lets a driver ship its own dependencies, e.g. libpq
-         * with the OpenSSL DLLs); absent a manifest, common default file names
-         * are tried. A driver with a linked static archive is not copied;
-         * drivers without one, and dlopen'd drivers, are still copied. */
+        /* Bundle native driver runtime libraries: copy each used shared
+         * driver's files next to the executable (all Windows builds and
+         * publishes). The file set comes from an optional
+         * "<driver_dir>/<driver>.bundle" manifest (one file name per line,
+         * e.g. libpq with its OpenSSL DLLs); absent a manifest, common
+         * default file names are tried. A linked-static driver is not
+         * copied; drivers without a static archive and dlopen'd drivers
+         * still are. */
         if ((publish_mode || target.os == ZAN_OS_WINDOWS) &&
             used_driver_count > 0) {
             char outdir[1024];
@@ -9182,14 +9174,13 @@ int main(int argc, char **argv) {
                             continue;
                         {
                             if (strncmp(entry, "@driver/", 8) == 0) {
-                                /* A dependency on another driver: "publish
+                                /* A dependency on another driver: publish
                                  * that driver's runtime files too, resolved
-                                 * through the registry to its owning module's
-                                 * directory" (e.g. libpq needs the ssl and
-                                 * crypto drivers owned by Cryptography).
-                                 * Ownership-directed, never a directory scan:
-                                 * a lib basename has exactly one registered
-                                 * owner. */
+                                 * through the registry to its owning module
+                                 * (libpq needs the ssl and crypto drivers
+                                 * owned by Cryptography). Never a directory
+                                 * scan: a lib basename has exactly one
+                                 * registered owner. */
                                 const char *dep = entry + 8;
                                 size_t dl = strlen(dep);
                                 if (dl == 0 || dl >= 64 ||
@@ -9263,10 +9254,9 @@ int main(int argc, char **argv) {
                     }
                 }
                 if (copied == 0 && used_driver_runtime[d]) {
-                    /* A dlopen'd driver is optional by construction: the module
-                     * falls back to a system install (and reports
-                     * IsAvailable() == false when there is none), so an
-                     * unstaged bundle is a note, not a warning. */
+                    /* A dlopen'd driver is optional by construction: the
+                     * module falls back to a system install, so an unstaged
+                     * bundle is a note, not a warning. */
                     if (!quiet)
                         printf("  note: driver '%s' not bundled (%s is empty); the "
                                "program will use a system-installed %s\n",
@@ -9288,18 +9278,17 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* ---- APK packaging (Android GUI one-shot) -----------------------
-         * The shared libmain.so is linked above and the bundled driver .so
-         * files sit next to it in the output directory; pack both into a
-         * NativeActivity-shell APK and sign it. No Android SDK needed: the
-         * manifest template/dex/arsc/apksigner.jar ship beside zanc. */
+        /* APK packaging (Android GUI one-shot): pack the linked libmain.so
+         * and the bundled driver .so files into a NativeActivity-shell APK
+         * and sign it. No Android SDK needed: the manifest template/dex/
+         * arsc/apksigner.jar ship beside zanc. */
         if (apk_path) {
             const char *abi = (target.arch == ZAN_ARCH_AARCH64)
                               ? "arm64-v8a" : "x86_64";
-            /* default package/label from the input file name unless set.
-             * 256 bytes to match proj_android_package/label; over-long CLI
-             * values fail loudly here instead of truncating into a
-             * wrong-but-plausible manifest. */
+            /* Default package/label from the input file name unless set.
+             * 256 bytes to match proj_android_package/label: over-long CLI
+             * values fail loudly instead of truncating into a wrong-but-
+             * plausible manifest. */
             char pkg[256], lbl[256];
             if (apk_package) {
                 if (strlen(apk_package) >= sizeof(pkg)) {
@@ -9320,7 +9309,6 @@ int main(int argc, char **argv) {
               if (base2 > base) base = base2;
               base = base ? base + 1 : input_file;
               snprintf(pkg, sizeof(pkg), "dev.zan.%s", base);
-              /* .zan (designer entry) suffix off */
               { char *dot = strrchr(pkg, '.');
                 if (dot && strcmp(dot, ".zan") == 0) *dot = 0; }
               /* package segments must be [a-zA-Z0-9_]; fold the rest */
@@ -9410,7 +9398,6 @@ int main(int argc, char **argv) {
         }
 
         if (ipa_path) {
-            /* Derive default app name and bundle identifier */
             const char *app_name = ipa_name;
             char def_name[256];
             if (!app_name) {
@@ -9460,11 +9447,10 @@ int main(int argc, char **argv) {
     zan_arena_free(arena);
     free(source);
 #ifdef _WIN32
-    /* ExitProcess skips CRT teardown, so any bytes still sitting in the C
-     * stdio buffers are silently dropped (--emit-ir streams megabytes
-     * through stdout and lost its tail this way, exit code 0). exit() would
-     * flush, but the point of ExitProcess here is skipping the slow CRT
-     * teardown of the compiler's heaps -- flush by hand and keep it. */
+    /* ExitProcess skips CRT teardown, silently dropping any bytes still in
+     * the stdio buffers; exit() would flush but defeats the point (skipping
+     * the slow CRT teardown of the compiler's heaps). Flush by hand and
+     * keep ExitProcess. */
     fflush(stdout);
     fflush(stderr);
     ExitProcess(0);

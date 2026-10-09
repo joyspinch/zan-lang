@@ -1,8 +1,8 @@
 /* ipa.c -- one-shot iOS IPA packaging for zanc (--emit-ipa).
  *
  * Packages an arm64 Mach-O executable, Info.plist, and PkgInfo into a
- * standard .ipa zip archive for TrollStore, jailbroken devices, or
- * sideloading tools without requiring official Apple certificates.
+ * standard .ipa zip archive without requiring macOS or official Apple
+ * certificates.
  */
 
 #include "ipa.h"
@@ -11,8 +11,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-
-/* ========================= byte buffer ========================= */
 
 typedef struct {
     unsigned char *data;
@@ -52,8 +50,6 @@ static void buf_write(ipa_buf_t *b, const void *p, size_t n) {
 static void buf_u16(ipa_buf_t *b, uint16_t v) { buf_write(b, &v, 2); }
 static void buf_u32(ipa_buf_t *b, uint32_t v) { buf_write(b, &v, 4); }
 
-/* ========================= CRC-32 (IEEE) ========================= */
-
 static uint32_t ipa_crc32(const unsigned char *d, size_t n) {
     static uint32_t table[256];
     static int have = 0;
@@ -70,8 +66,6 @@ static uint32_t ipa_crc32(const unsigned char *d, size_t n) {
     for (size_t i = 0; i < n; i++) c = table[(c ^ d[i]) & 0xFF] ^ (c >> 8);
     return c ^ 0xFFFFFFFFu;
 }
-
-/* ========================= zip writer ========================= */
 
 typedef struct {
     char name[256];
@@ -186,8 +180,6 @@ static int zip_finish(ipa_zip_t *z) {
     return 0;
 }
 
-/* ========================= file helper ========================= */
-
 static unsigned char *read_file_bytes(const char *path, size_t *out_sz) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -207,8 +199,6 @@ static unsigned char *read_file_bytes(const char *path, size_t *out_sz) {
     return b;
 }
 
-/* ========================= zan_ipa_build ========================= */
-
 int zan_ipa_build(const char *ipa_path, const char *binary_path,
                   const char *app_name, const char *bundle_id,
                   const char *display_name, const char *version) {
@@ -224,7 +214,6 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
         return -1;
     }
 
-    /* Fallback defaults */
     char default_bundle[256];
     if (!bundle_id || !bundle_id[0]) {
         snprintf(default_bundle, sizeof(default_bundle), "dev.zan.%s", app_name);
@@ -237,7 +226,6 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
         version = "1.0.0";
     }
 
-    /* Generate Info.plist */
     char plist[2048];
     int plist_len = snprintf(plist, sizeof(plist),
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -292,13 +280,11 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
         return -1;
     }
 
-    /* Fixed PkgInfo content */
     const char *pkg_info = "APPL????";
 
     ipa_zip_t zip;
     zip_start(&zip);
 
-    /* 1. Add Mach-O binary to Payload/<AppName>.app/<AppName> with 0755 permissions */
     char bin_entry[512];
     snprintf(bin_entry, sizeof(bin_entry), "Payload/%s.app/%s", app_name, app_name);
     if (zip_add(&zip, bin_entry, bin_data, bin_sz, 0100755) != 0) {
@@ -308,7 +294,6 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
     }
     free(bin_data);
 
-    /* 2. Add Info.plist to Payload/<AppName>.app/Info.plist with 0644 permissions */
     char plist_entry[512];
     snprintf(plist_entry, sizeof(plist_entry), "Payload/%s.app/Info.plist", app_name);
     if (zip_add(&zip, plist_entry, plist, (size_t)plist_len, 0100644) != 0) {
@@ -316,7 +301,6 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
         return -1;
     }
 
-    /* 3. Add PkgInfo to Payload/<AppName>.app/PkgInfo with 0644 permissions */
     char pkg_entry[512];
     snprintf(pkg_entry, sizeof(pkg_entry), "Payload/%s.app/PkgInfo", app_name);
     if (zip_add(&zip, pkg_entry, pkg_info, 8, 0100644) != 0) {
@@ -326,7 +310,6 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
 
     zip_finish(&zip);
 
-    /* Write zip output to ipa_path */
     FILE *out = fopen(ipa_path, "wb");
     if (!out) {
         fprintf(stderr, "error: failed to open '%s' for writing\n", ipa_path);

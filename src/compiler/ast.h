@@ -6,22 +6,17 @@
 #include "zan.h"
 #include "token.h"
 
-/* ---- AST node kinds ---- */
-
 typedef enum {
-    /* top-level */
     AST_COMPILATION_UNIT,
     AST_USING_DECL,
     AST_NAMESPACE_DECL,
 
-    /* type declarations */
     AST_CLASS_DECL,
     AST_STRUCT_DECL,
     AST_INTERFACE_DECL,
     AST_ENUM_DECL,
     AST_DELEGATE_DECL,
 
-    /* members */
     AST_FIELD_DECL,
     AST_METHOD_DECL,
     AST_CONSTRUCTOR_DECL,
@@ -29,7 +24,6 @@ typedef enum {
     AST_PROPERTY_DECL,
     AST_PARAM,
 
-    /* statements */
     AST_BLOCK,
     AST_VAR_DECL,
     AST_EXPR_STMT,
@@ -45,7 +39,6 @@ typedef enum {
     AST_TRY_STMT,
     AST_SWITCH_STMT,
 
-    /* expressions */
     AST_INT_LITERAL,
     AST_FLOAT_LITERAL,
     AST_STRING_LITERAL,
@@ -97,7 +90,6 @@ typedef enum {
      * member named `name` receives Add(item) per element (C# semantics) */
     AST_COLL_INIT,
 
-    /* misc */
     AST_ATTRIBUTE,
     AST_ENUM_MEMBER,
     AST_CATCH_CLAUSE,
@@ -120,8 +112,6 @@ typedef enum {
 
     AST__COUNT,
 } zan_ast_kind_t;
-
-/* ---- AST node ---- */
 
 /* dynamic child list */
 typedef struct {
@@ -220,7 +210,6 @@ struct zan_ast_node {
             int null_cond;
         } member;
 
-        /* index: expr[idx] */
         /* index: obj[i] or obj[i,j] (multi-dimensional) */
         struct {
             zan_ast_node_t *object;
@@ -651,8 +640,6 @@ struct zan_ast_node {
 #define MOD_EVENT     0x4000
 #define MOD_PARTIAL   0x8000
 #define MOD_REF       0x10000  /* `ref struct` / `ref` return-annotated member */
-
-/* ---- utility functions ---- */
 
 zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t loc);
 size_t zan_ast_node_count(void);

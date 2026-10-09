@@ -4,17 +4,13 @@
  * project's config/, views/ or wwwroot/ next to the exe, their bytes become
  * constants in the program's own module and are handed to the runtime registry
  * (zan_embed_register) by a module constructor, so System.IO reads them with
- * no file on disk. Generating the data straight into the module keeps this
- * working for every target and needs no external C compiler -- unlike the
- * scripts/gen_embed.ps1 route, which compiles a generated .c with clang.
+ * no file on disk.
  *
  * Payloads at or above ZAN_EMBED_COMPRESS_MIN bytes are baked
  * deflate-compressed ([u32 raw_len][u32 comp_len][raw deflate], the format
- * src/runtime/zan_inflate.c zan_embed_decode consumes): skins, icon packs and
- * the pinyin table shrink to a fraction and stop showing up in a plain
- * `strings` dump of the executable. The emitted read API decodes an entry on
- * first hit and patches the table slot in place, so repeat reads stay
- * allocation-free.
+ * src/runtime/zan_inflate.c zan_embed_decode consumes); the emitted read API
+ * decodes an entry on first hit and patches the table slot in place, so
+ * repeat reads stay allocation-free.
  */
 
 #include "embedres.h"
@@ -108,12 +104,8 @@ static int embed_add_file(zan_embed_list_t *l, const char *path,
 }
 
 /* Walks `dir`, adding every file below it under the logical prefix `name`.
- *
- * Each frame carries ~2.8 KB of locals (pattern/path[1024] +
- * WIN32_FIND_DATAW), so an unbounded directory tree would blow the 1 MB
- * default Windows stack at ~350 levels. A depth cap turns a crafted tree
- * into a diagnosable error instead of a crash; 32 is far beyond any real
- * resource layout (stdlib skins: 3). */
+ * Each frame carries ~2.8 KB of locals, so EMBED_WALK_MAX_DEPTH stops a
+ * crafted deep tree from blowing the stack; deeper levels are skipped. */
 #define EMBED_WALK_MAX_DEPTH 128
 
 static void embed_walk_impl(zan_embed_list_t *l, const char *dir, const char *name, int depth) {
@@ -603,10 +595,8 @@ static void embed_emit_read_has_bytes(zan_irgen_t *g, struct embed_api_ctx *c,
     /* embed_define reuses the declaration File.zan's DllImport already made,
      * and TYPE_NINT lowers to i64 on every target (irgen.c map_type), so the
      * reused function returns i64 while the body's natural result is the data
-     * pointer. On 64-bit targets the widths coincide and the mis-typed ret
-     * slipped through; wasm32's 32-bit pointers hit it as a real module
-     * validation error ("type error in return[0] (expected i64, got i32)").
-     * Coerce both returns to the declaration's actual return type. */
+     * pointer. Coerce both returns to the declaration's actual return type --
+     * a narrower ret fails module validation on wasm32's 32-bit pointers. */
     LLVMTypeRef brt = LLVMGetReturnType(LLVMGlobalGetValueType(bfn));
     LLVMBasicBlockRef bb0 = LLVMAppendBasicBlockInContext(g->ctx, bfn, "entry");
     LLVMBasicBlockRef bgot = LLVMAppendBasicBlockInContext(g->ctx, bfn, "got");
@@ -931,10 +921,9 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
 #endif
         int before = files.n;
         /* The pack filter belongs to the skins spec alone ("skins/<pack>/
-         * skin.css" shape): applying it to any other directory spec deletes
-         * everything not named dark/light at that spec's root — a project
-         * assets/ tree of subfolders (audio/, images/) walked to zero files
-         * and died on the "matched no readable file" hard error below. */
+         * skin.css" shape): on any other directory spec it would drop every
+         * subfolder at that spec's root and trip the "matched no readable
+         * file" hard error below. */
         int filtering = filter != NULL && filter_count > 0
                         && embed_is_dir(path)
                         && prefix != NULL && strcmp(prefix, "skins") == 0;
@@ -953,8 +942,7 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
             return -1;
         }
     }
-    /* Deflate the payloads that gain from it (skins/icons/pinyin arrive as
-     * multi-hundred-KB plaintext otherwise) and mark them via the len sign
+    /* Compress the payloads that gain from it and mark them via the len sign
      * bit; the emitted read API decodes lazily on first hit. */
     unsigned char *compressed = (unsigned char *)calloc(
         (size_t)(files.n > 0 ? files.n : 1), 1);
@@ -1048,8 +1036,7 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
     c.ent_ty = ent_ty;
     /* The registered slot starts EMPTY (a generated data object fills it in
      * at startup); this module's own table lives in own_tbl/own_cnt. Two
-     * slots, no clobbering -- the bug that once made a skins-only generated
-     * object hide an --embed-baked assets catalog. */
+     * slots, no clobbering. */
     c.buf_cap = total_names + 4096;
     c.gtbl = LLVMAddGlobal(g->mod, i8p, "zan.embed.gtbl");
     LLVMSetInitializer(c.gtbl, LLVMConstNull(i8p));
