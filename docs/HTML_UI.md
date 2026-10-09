@@ -297,8 +297,7 @@ P7d 起全仓库窗口声明只有 .html 一种形态：templates/gui 12 份与 
 31 份设计稿均已迁移（模型级等价校验），模板/新建文件/编译发现全部以
 .html 为入口。早期 .html 编译通道已彻底删除，统一采用 .html 设计稿。
 把设计文档转成 .html（`DesignerHtml.FromJsonDoc` 是规范转换器）后编译；
-GenForm 只认 .html 设计稿，`.zscene`（场景）与 `.zcomp`（用户组件）不受
-影响。
+GenForm 与 GenScene 均统一以 .html 设计稿为规范格式（分别通过 `data-zan-design` 与 `data-zan-scene` 标记），`.zcomp`（用户组件）不受影响。
 
 ## 字段内联 style（P7b）
 
