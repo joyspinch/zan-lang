@@ -5,7 +5,7 @@ using System.Data.Orm;
 using System.Json;
 using System.Net;
 using System.Security.Cryptography;
-using ZanWeb.Dao.Game;
+using ZanWeb.Model.Game;
 
 namespace ZanWeb.Game;
 
@@ -481,8 +481,7 @@ class Gateway {
         IDbConnection db = await Gateway.Db();
         if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
         try {
-            AccountDao dao = new AccountDao(db);
-            int id = await dao.Register(user, pass, email, question, answer);
+            int id = await db.Account.Register(user, pass, email, question, answer);
             if (id == 0) { return Gateway.Err("账号已存在"); }
             if (id < 0) { return Gateway.Err("注册失败，请稍后再试"); }
             JsonValue r = Gateway.Ok();
@@ -508,17 +507,16 @@ class Gateway {
         IDbConnection db = await Gateway.Db();
         if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
         try {
-            AccountDao dao = new AccountDao(db);
-            Account row = await dao.ByUsername(user);
+            Account row = await db.Account.ByUsername(user);
             /* 账号级锁定（分布式撞库闸门）：先于密码校验，
                拒绝文案不带「账号不存在」信息——不向爆破者透露账号存在性。
                row==null 时锁定恒假，走同一条错误文案。 */
-            if (dao.LoginLocked(row, now)) {
+            if (db.Account.LoginLocked(row, now)) {
                 return Gateway.Err("错误次数过多，请一小时后再试");
             }
             /* 空响应同文案：不向爆破者透露账号是否存在。 */
-            if (!dao.CheckPassword(row, pass)) {
-                await dao.NoteLoginFail(row, now);
+            if (!db.Account.CheckPassword(row, pass)) {
+                await db.Account.NoteLoginFail(row, now);
                 return Gateway.Err("账号或密码不正确");
             }
             if (row.status != 1) {
@@ -527,8 +525,8 @@ class Gateway {
                     : "账号已被封禁";
                 return Gateway.Err(why);
             }
-            int _t = await dao.TouchLogin(row.id, now);
-            await dao.ClearLoginFails(row.id);
+            int _t = await db.Account.TouchLogin(row.id, now);
+            await db.Account.ClearLoginFails(row.id);
 
             /* 密码校验在本 worker 完成（多 worker 时登录算力按请求分摊
                到各 HTTP worker）；会话登记在世界进程：顶号与入表必须
@@ -604,8 +602,7 @@ class Gateway {
         IDbConnection db = await Gateway.Db();
         if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
         try {
-            AccountDao dao = new AccountDao(db);
-            Account row = await dao.ByUsername(user);
+            Account row = await db.Account.ByUsername(user);
             if (row == null || row.question.Length == 0) {
                 return Gateway.Err("账号不存在或未设置密保");
             }
@@ -627,21 +624,20 @@ class Gateway {
         IDbConnection db = await Gateway.Db();
         if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
         try {
-            AccountDao dao = new AccountDao(db);
-            Account row = await dao.ByUsername(user);
+            Account row = await db.Account.ByUsername(user);
             if (row == null || row.question.Length == 0) {
                 return Gateway.Err("账号不存在或未设置密保");
             }
-            if (dao.AnswerLocked(row, now)) {
+            if (db.Account.AnswerLocked(row, now)) {
                 return Gateway.Err("错误次数过多，请一小时后再试");
             }
-            if (!dao.CheckAnswer(row, answer)) {
-                await dao.NoteAnswerFail(row, now);
+            if (!db.Account.CheckAnswer(row, answer)) {
+                await db.Account.NoteAnswerFail(row, now);
                 return Gateway.Err("密保答案不正确");
             }
-            await dao.ClearAnswerFails(row.id);
-            await dao.SetPassword(row.id, newpass);
-            await dao.ClearLoginFails(row.id);
+            await db.Account.ClearAnswerFails(row.id);
+            await db.Account.SetPassword(row.id, newpass);
+            await db.Account.ClearLoginFails(row.id);
             JsonValue r = Gateway.Ok();
             r.Set("msg", JsonValue.NewStr("密码已重置，请用新密码登录"));
             return r;
@@ -664,20 +660,19 @@ class Gateway {
         IDbConnection db = await Gateway.Db();
         if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
         try {
-            AccountDao dao = new AccountDao(db);
-            Account row = await dao.ByUsername(user);
-            if (dao.LoginLocked(row, now)) {
+            Account row = await db.Account.ByUsername(user);
+            if (db.Account.LoginLocked(row, now)) {
                 return Gateway.Err("错误次数过多，请一小时后再试");
             }
-            if (!dao.CheckPassword(row, oldpass)) {
-                await dao.NoteLoginFail(row, now);
+            if (!db.Account.CheckPassword(row, oldpass)) {
+                await db.Account.NoteLoginFail(row, now);
                 return Gateway.Err("账号或原密码不正确");
             }
-            await dao.SetPassword(row.id, newpass);
-            await dao.ClearLoginFails(row.id);
+            await db.Account.SetPassword(row.id, newpass);
+            await db.Account.ClearLoginFails(row.id);
             /* 锁定计数一并归零：玩家已经证明了自己是账号主人（连续两次
                正确凭据），留着的密保失败计数只会误伤下一次找回。 */
-            await dao.ClearAnswerFails(row.id);
+            await db.Account.ClearAnswerFails(row.id);
             JsonValue r = Gateway.Ok();
             r.Set("msg", JsonValue.NewStr("密码已修改，请用新密码登录"));
             r.Set("mailed", JsonValue.NewNum("0"));
@@ -707,8 +702,7 @@ class Gateway {
 
     /* 区服列表（带本进程实时在线数），login/realms 应答共用。 */
     static async bool RealmsInto(JsonValue r, IDbConnection db) {
-        List<ZanWeb.Model.Game.Realm> realms = await db
-            .Select<ZanWeb.Model.Game.Realm>()
+        List<ZanWeb.Model.Game.Realm> realms = await db.Realm
             .OrderBy(a => a.sort).ToListAsync();
         JsonValue arr = JsonValue.NewArray();
         for (int i = 0; i < realms.Count; i = i + 1) {
@@ -741,8 +735,7 @@ class Gateway {
         IDbConnection db = await Gateway.Db();
         if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
         try {
-            List<ZanWeb.Model.Game.Player> rows = await db
-                .Select<ZanWeb.Model.Game.Player>()
+            List<ZanWeb.Model.Game.Player> rows = await db.Player
                 .Where(a => a.accountId == s.accountId && a.realmId == realmId)
                 .OrderBy(a => a.id).ToListAsync();
             JsonValue arr = JsonValue.NewArray();
@@ -770,8 +763,7 @@ class Gateway {
         IDbConnection db = await Gateway.Db();
         if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
         try {
-            List<ZanWeb.Model.Game.Player> rows = await db
-                .Select<ZanWeb.Model.Game.Player>()
+            List<ZanWeb.Model.Game.Player> rows = await db.Player
                 .Where(a => a.accountId == s.accountId && a.realmId == realmId)
                 .ToListAsync();
             if (rows.Count == 0) {
@@ -784,9 +776,9 @@ class Gateway {
             }
             for (int i = 0; i < rows.Count; i = i + 1) {
                 int pid = rows[i].id;
-                await db.Delete<ZanWeb.Model.Game.Bag>()
+                await db.Bag.Delete()
                     .Where(a => a.playerId == pid).ExecuteAffrowsAsync();
-                await db.Delete<ZanWeb.Model.Game.Player>()
+                await db.Player.Delete()
                     .Where(a => a.id == pid).ExecuteAffrowsAsync();
             }
             JsonValue r = Gateway.Ok();
@@ -818,13 +810,13 @@ class Gateway {
             if (realm == null) {
                 return Gateway.Err("区服不存在或维护中");
             }
-            int dupName = await db.Select<ZanWeb.Model.Game.Player>()
+            int dupName = await db.Player
                 .Where(a => a.realmId == realmId && a.nickname == name)
                 .CountAsync();
             if (dupName > 0) {
                 return Gateway.Err("角色名已被占用");
             }
-            int mine = await db.Select<ZanWeb.Model.Game.Player>()
+            int mine = await db.Player
                 .Where(a => a.accountId == s.accountId && a.realmId == realmId)
                 .CountAsync();
             if (mine > 0) {
@@ -861,7 +853,7 @@ class Gateway {
             row.lastLogoutAt = 0;
             row.createdAt = now;
             row.updatedAt = now;
-            int id = await db.Insert<ZanWeb.Model.Game.Player>(row)
+            int id = await db.Player.Insert(row)
                 .ExecuteIdentityAsync();
             if (id <= 0) {
                 return Gateway.Err("创建失败，请稍后再试");
@@ -873,19 +865,17 @@ class Gateway {
                进区 LoadBag 即载入——新角色进世界就能穿上，不必先去商店。
                表达式里不写变量：字面量查询最稳（表达式树对局部串变量
                的求值不稳），性别分支各写字面量。 */
-            ZanWeb.Model.Game.Item starter = await db
-                .Select<ZanWeb.Model.Game.Item>()
+            ZanWeb.Model.Game.Item starter = await db.Item
                 .Where(a => a.name == "木剑").FirstAsync();
             if (starter != null) {
                 ZanWeb.Model.Game.Bag b = new ZanWeb.Model.Game.Bag();
                 b.playerId = row.id;
                 b.itemId = starter.id;
                 b.count = 1;
-                await db.Insert<ZanWeb.Model.Game.Bag>(b).ExecuteAffrowsAsync();
+                await db.Bag.Insert(b).ExecuteAffrowsAsync();
             }
             /* 开区礼包信：邮箱页有信可拆（黑铁×10，锻造/祭坛都用得上）。 */
-            ZanWeb.Model.Game.Item oreItem = await db
-                .Select<ZanWeb.Model.Game.Item>()
+            ZanWeb.Model.Game.Item oreItem = await db.Item
                 .Where(a => a.name == "黑铁矿石").FirstAsync();
             if (oreItem != null) {
                 ZanWeb.Model.Game.Mail wm = new ZanWeb.Model.Game.Mail();
@@ -897,15 +887,15 @@ class Gateway {
                 wm.items = Convert.ToString(oreItem.id) + ":10";
                 wm.claimed = 0;
                 wm.createdAt = now;
-                int _mid = await db.Insert<ZanWeb.Model.Game.Mail>(wm)
+                int _mid = await db.Mail.Insert(wm)
                     .ExecuteAffrowsAsync();
             }
             if (gender == 1) {
-                starter = await db.Select<ZanWeb.Model.Game.Item>()
+                starter = await db.Item
                     .Where(a => a.name == "布衣(女)").FirstAsync();
             }
             if (starter == null) {
-                starter = await db.Select<ZanWeb.Model.Game.Item>()
+                starter = await db.Item
                     .Where(a => a.name == "布衣(男)").FirstAsync();
             }
             if (starter != null) {
@@ -913,7 +903,7 @@ class Gateway {
                 b.playerId = row.id;
                 b.itemId = starter.id;
                 b.count = 1;
-                await db.Insert<ZanWeb.Model.Game.Bag>(b).ExecuteAffrowsAsync();
+                await db.Bag.Insert(b).ExecuteAffrowsAsync();
             }
             return await Gateway.IntoWorld(s, db, realm, row, now, null);
         } finally {
@@ -937,8 +927,7 @@ class Gateway {
                 r.Set("self", Gateway.SelfJson(s));
                 return r;
             }
-            ZanWeb.Model.Game.Player row = await db
-                .Select<ZanWeb.Model.Game.Player>()
+            ZanWeb.Model.Game.Player row = await db.Player
                 .Where(a => a.accountId == s.accountId && a.realmId == realmId)
                 .FirstAsync();
             if (row == null) {
@@ -968,7 +957,7 @@ class Gateway {
             int maxMp = Fight.MaxMp(row);
             if (row.mp > maxMp) { row.mp = maxMp; }
             /* 进区即落一次库：最后登录时间与离线收益不入内存 dirty 流。 */
-            int _u = await db.Update<ZanWeb.Model.Game.Player>()
+            int _u = await db.Player.Update()
                 .Set(a => a.lastLoginAt, now)
                 .Set(a => a.gold, row.gold)
                 .Set(a => a.hp, row.hp)
@@ -1003,8 +992,7 @@ class Gateway {
     }
 
     static async ZanWeb.Model.Game.Realm OpenRealm(IDbConnection db, int id) {
-        ZanWeb.Model.Game.Realm realm = await db
-            .Select<ZanWeb.Model.Game.Realm>()
+        ZanWeb.Model.Game.Realm realm = await db.Realm
             .Where(a => a.id == id).FirstAsync();
         if (realm == null || realm.state != 0) { return null; }
         return realm;
@@ -1018,8 +1006,7 @@ class Gateway {
         IDbConnection db = await Gateway.Db();
         if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
         try {
-            ZanWeb.Model.Game.GameMap map = await db
-                .Select<ZanWeb.Model.Game.GameMap>()
+            ZanWeb.Model.Game.GameMap map = await db.GameMap
                 .Where(a => a.id == target && a.status == 1).FirstAsync();
             if (map == null) {
                 return Gateway.Err("没有这张地图");
@@ -1143,8 +1130,7 @@ class Gateway {
         IDbConnection db = await Gateway.Db();
         if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
         try {
-            List<ZanWeb.Model.Game.Announce> rows = await db
-                .Select<ZanWeb.Model.Game.Announce>()
+            List<ZanWeb.Model.Game.Announce> rows = await db.Announce
                 .Where(a => a.enabled == 1)
                 .OrderByDescending(a => a.id).ToListAsync();
             JsonValue arr = JsonValue.NewArray();
@@ -1168,8 +1154,7 @@ class Gateway {
         IDbConnection db = await Gateway.Db();
         if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
         try {
-            List<ZanWeb.Model.Game.Player> rows = await db
-                .Select<ZanWeb.Model.Game.Player>()
+            List<ZanWeb.Model.Game.Player> rows = await db.Player
                 .Where(a => a.realmId == s.realmId).ToListAsync();
             for (int i = 1; i < rows.Count; i = i + 1) {
                 ZanWeb.Model.Game.Player cur = rows[i];
@@ -1325,8 +1310,7 @@ class Gateway {
     static async bool MapsInto(JsonValue r, IDbConnection db) {
         /* 全量下发（开放+未开放），open 标记 status==1；客户端按
            未开放置灰，与原版地图列表一致。 */
-        List<ZanWeb.Model.Game.GameMap> maps = await db
-            .Select<ZanWeb.Model.Game.GameMap>()
+        List<ZanWeb.Model.Game.GameMap> maps = await db.GameMap
             .OrderBy(a => a.sortOrder).ToListAsync();
         JsonValue arr = JsonValue.NewArray();
         for (int i = 0; i < maps.Count; i = i + 1) {
@@ -1345,8 +1329,7 @@ class Gateway {
     }
 
     static async bool AnnounceInto(JsonValue r, IDbConnection db) {
-        ZanWeb.Model.Game.Announce row = await db
-            .Select<ZanWeb.Model.Game.Announce>()
+        ZanWeb.Model.Game.Announce row = await db.Announce
             .Where(a => a.enabled == 1)
             .OrderByDescending(a => a.id).FirstAsync();
         if (row == null) { return false; }
