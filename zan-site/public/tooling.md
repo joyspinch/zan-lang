@@ -69,7 +69,7 @@ build/repomap.exe .                # 项目根；写出 <root>/.zanmap/
 | `.zanmap/repo.map.txt` | 每个文件 + 类/方法签名 + 行号的精简大纲（几 KB 级） | **作为 AI 首次上下文**直接喂入（几 KB 换全局，不必读源码） |
 | `.zanmap/symbols.json` | 扁平索引 `[{name,kind,file,line,sig}]` | 定点跳转：改哪个符号 → 精确到文件+行号 |
 | `.zanmap/routes.json` | 路由表（仅 server 模板输出） | 按 URL 定位控制器 |
-| `.zanmap/gallery.json` / `zform.json` | 模板/示例目录 + `.zform` schema 与控件目录 | 查"现成能力"（模板/控件/属性） |
+| `.zanmap/gallery.json` / `controls.json` | 模板/示例目录 + 控件 schema 与目录 | 查"现成能力"（模板/控件/属性） |
 
 ### 推荐工作流（改一个功能）
 
@@ -81,7 +81,7 @@ build/repomap.exe .                # 项目根；写出 <root>/.zanmap/
 ## 三、编译器（zanc 命令行）
 
 ```bash
-zanc src/main.zan ../src/App.zform --auto-stdlib -o app.exe   # 编译运行
+zanc src/main.zan ../src/App.html --auto-stdlib -o app.exe   # 编译运行
 zanc src/main.zan --publish -o app.exe                        # 发布（-Os、strip、链接驱动）
 zanc src/*.zan --auto-stdlib -o lib.dll --emit-lib            # 库
 zanc src/*.zan --target linux-x64 -o app                      # 交叉编译（--list-targets）

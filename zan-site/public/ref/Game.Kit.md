@@ -18,6 +18,15 @@
 - public static string FindCommon(string name)
 
 
+## BlitSourceEntry (class)
+
+- public string path;
+
+- public string key;
+
+- public BlitSourceEntry(string path, string key)
+
+
 ## CDraw (class)
 
 - static int originX;
@@ -25,7 +34,6 @@
 - static int originY;
 
 - static void Origin(int x, int y)
-  - 设置本帧舞台绘制的画布原点；模板 Render 开头调用一次。
 
 - static int vpS=65536;
 
@@ -48,11 +56,6 @@
 - static int UnmapY(int v)
 
 - static void StageViewport(Canvas c, int contentTopPx, int designW, int designH, int marginColor)
-  - 桌面窗口跟随：内容区 [contentTopPx, 画布底) 等比铺满逻辑
-    designW×designH——缩放取短轴，长轴延展成更大的逻辑空间（不
-    缩放不裁剪），故无黑边。帧首整块铺 marginColor 打底（延展边、
-    换面首帧不至于露垃圾），模板随后按 stageW/stageH 满画。指针
-    坐标用 UnmapX/UnmapY 换回。GuiHost 每帧调用。
 
 - static int Argb(int a, int r, int g, int b)
 
@@ -62,9 +65,7 @@
 
 - static void Clear(Canvas c, int w, int h, int color)
 
-- static List<string> blitSrcPaths;
-
-- static List<string> blitSrcKeys;
+- static List<BlitSourceEntry> blitSources;
 
 - static string BlitSource(Canvas c, string path)
 
@@ -140,9 +141,6 @@
 ## KeyShares (class)
 
 - public static string File(string path)
-  - Read one 64-char hex share from a file (typically an
-    --embed'd copy, so File.ReadAllBytes finds it without a real file on
-    disk). Trims whitespace/newlines.
 
 - static bool SpaceAt(string s, int i)
 
@@ -154,51 +152,22 @@
 - PackedAssets()
 
 - public static PackedAssets Open(string packPath, string shareAHex, string shareBHex)
-  - Open a .zrp and authenticate its index.
-    Both shares are 64-char hex strings (32 bytes each); the real key is
-    their XOR, reassembled here and never stored as one literal.
-    Throws IOException when the pack can't be read/authenticated:
-    "pack: io/magic"    (1) not a .zrp or truncated
-    "pack: auth"        (2) wrong master key (index failed GCM)
-    "pack: signature"   (3) index signature mismatch (repacked/tampered)
 
 - public static PackedAssets OpenKeyed(string packPath, string masterKey)
-  - Open with an already-assembled master key (32 bytes as a
-    byte buffer). Same error contract as `Open`.
 
 - public static PackedAssets OpenVerified(string packPath, string shareAHex, string shareBHex, string nHex, string eHex)
-  - Open a SIGNED .zrp (packed with --sign-n/--sign-d) and
-    authenticate AND signature-check its index before serving anything.
-    Games that ship signed packs should use this: a stolen master key
-    alone is then not enough to swap entries — the pack must be re-signed
-    with the private key. The verify key (RSA modulus/exponent hex) is
-    public material and may live in the binary — it's meant to be seen.
-    <paramref name="nHex"/>/<paramref name="eHex"/> = public modulus and
-    exponent (hex). Error contract is `Open`'s, plus:
-    "pack: signature"   (3) index signature missing/mismatched
-    (an unsigned pack is rejected too — signature is required here).
 
 - public static PackedAssets OpenKeyedVerified(string packPath, string masterKey, string nHex, string eHex)
-  - OpenVerified with an already-assembled master key (32 bytes
-    as a byte buffer). Same error contract as `OpenVerified`.
 
 - public byte[]Read(string name)
-  - Raw entry bytes. Throws IOException when the name is not in
-    the pack or the payload fails GCM authentication (tampered).
 
 - public AudioClip LoadWav(string name)
-  - Parse a WAV entry straight from the decrypted bytes -- the
-    PCM is copied out inside the call, nothing touches the disk. Invalid
-    handle when the bytes aren't a WAV.
 
 - public bool Contains(string name)
-  - Entry existence probe (no decryption).
 
 - public int Count()
-  - Number of entries in the pack.
 
 - public int SizeOf(string name)
-  - Byte size of one entry (no decryption), -1 when unknown.
 
 
 ## Rng (class)
@@ -218,8 +187,35 @@
 
 ## SpriteBatch (class)
 
-2D 游戏批量图元与精灵渲染上下文。
-封装批量绘制指令流、全局颜色/Alpha 混合与视口映射，提供绘图统计以指导性能调优。
+- const int CmdRect=0;
+
+- const int CmdBall=1;
+
+- const int CmdGlow=2;
+
+- int capacity;
+
+- int count;
+
+- int culledCount;
+
+- int[]cmdType;
+
+- int[]cmdX;
+
+- int[]cmdY;
+
+- int[]cmdW;
+
+- int[]cmdH;
+
+- int[]cmdR;
+
+- int[]cmdG;
+
+- int[]cmdB;
+
+- int[]cmdA;
 
 - Canvas canvas;
 
@@ -227,35 +223,41 @@
 
 - int drawCalls;
 
-- int itemCount;
-
 - int globalAlpha;
+
+- nint bufRects;
+
+- nint bufBalls;
+
+- nint bufGlows;
 
 - SpriteBatch()
 
+- SpriteBatch(int cap)
+
+- void allocCommands()
+
+- static SpriteBatch Create(int capacity)
+
 - int DrawCalls()
-  - 当前已提交的批次绘制调用数（DrawCalls）。
 
 - int ItemCount()
-  - 本帧批量绘制的项目（图元/精灵）总数。
+
+- int CulledCount()
 
 - void SetGlobalAlpha(int alpha)
-  - 设置全局 Alpha 透明度乘数（0~255）。
 
 - void Begin(Canvas c)
-  - 开始一个精灵批处理阶段。
 
 - void End()
-  - 结束批处理阶段。
+
+- void ensurePackBuffers()
 
 - void DrawRect(int x, int y, int w, int h, int color)
-  - 批量绘制实心矩形。
 
 - void DrawBall(int cx, int cy, int rad, int r, int g, int b, int a)
-  - 批量绘制实心圆盘。
 
 - void DrawGlow(int cx, int cy, int rad, int r, int g, int b, int a)
-  - 批量绘制柔和径向光晕。
 
 
 ## Talker (class)

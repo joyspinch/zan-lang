@@ -5,10 +5,6 @@
 
 ## WechatWorkAddCalendarJsonResult (class)
 
-从随附的 C# SDK 生成的共享 DTO 实体。
-一个 C# 命名空间/类型标识精确对应一个 Zan 模型。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - public string cal_id;
 
 
@@ -2886,6 +2882,8 @@
 
 - public string name;
 
+- public List<WechatWorkMemberDepartmentAssignment> assignments;
+
 - public List<long> department;
 
 - public List<int> order;
@@ -2931,6 +2929,10 @@
 - public string external_position;
 
 - public string address;
+
+- public List<WechatWorkMemberDepartmentAssignment> GetAssignments()
+
+- public void SetAssignments(List<WechatWorkMemberDepartmentAssignment> list)
 
 
 ## WechatWorkGetMessageStatisticsResult (class)
@@ -4095,6 +4097,21 @@
 ## WechatWorkMassUpdateTemplateCardUpdateTemplateCardRequestButton (class)
 
 - public string replace_name;
+
+
+## WechatWorkMemberDepartmentAssignment (class)
+
+- public long departmentId;
+
+- public int order;
+
+- public int isLeader;
+
+- public string directLeader;
+
+- public WechatWorkMemberDepartmentAssignment()
+
+- public WechatWorkMemberDepartmentAssignment(long deptId, int ord, int leader, string dirLeader)
 
 
 ## WechatWorkMemberList (class)

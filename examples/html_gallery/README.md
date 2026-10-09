@@ -30,10 +30,8 @@ html_gallery.exe
 组件目录 78 个 + 目录漏登 2 个（CheckboxGroup/ListView）+ 目录外 9 个
 （Dropdown/RichText/ChatView/PropertyGrid/Grid/FileTree/ScrollColumn/
 Flex/FormGroup，都是可独立实例化演示的真控件）。其中 Flex/FormGroup 与
-Grid/GridItem/ScrollColumn/CheckboxGroup/ChartHost 一样没登进
-zform.controls.txt 目录——该目录是 `GenKnowledge --write-controls` 的
-生成物，只收声明了 `override Props()` 的控件类；这些布局容器/宿主类
-没有 Props() 可声明，但 `data-kind` 声明与 ControlFactory 创建都认它们。
+Grid/GridItem/ScrollColumn/CheckboxGroup/ChartHost 这些布局容器/宿主类
+`data-kind` 声明与 ControlFactory 创建都认它们。
 剔除的组件与原因：
 
 | 组件 | 原因 |

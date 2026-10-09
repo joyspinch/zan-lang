@@ -1,35 +1,53 @@
 # System.Data.Postgres
 
-> 源码: `packages/Zan.Data/src/System/Data/Postgres/PgConnector.zan`, `packages/Zan.Data/src/System/Data/Postgres/PgPool.zan`, `packages/Zan.Data/src/System/Data/Postgres/PostgresConnection.zan`
+> 源码: `packages/Zan.Data/src/System/Data/Postgres/PgConnector.zan`, `packages/Zan.Data/src/System/Data/Postgres/PgPool.zan`, `packages/Zan.Data/src/System/Data/Postgres/PgWire.zan`, `packages/Zan.Data/src/System/Data/Postgres/PostgresConnection.zan`
 
 
 ## PgConnection (class)
 
-通过 libpq 的原生 PostgreSQL 连接，同样适用于 PG wire 兼容的
-engines: openGauss / GaussDB, KingbaseES (人大金仓), Vastbase and QuestDB.
+- nint sock;
 
-libpq 提供按单元格的文本取值器（PQgetvalue -> char*），可干净地映射
-到 Zan 字符串，无需手动做缓冲区编组。需要
-在构建/运行时提供 libpq 共享库。
+- TlsStream tls;
 
-用法：
-PostgresConnection db = PostgresConnection.Open(
-"host=127.0.0.1 port=5432 dbname=app user=postgres password=secret");
-db.Execute("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)");
-DbResult r = db.Query("SELECT * FROM users");
-db.Close();
+- TlsEngine syncTls;
 
-参数化（推荐做法——值从不进入 SQL 文本；`?`
-占位符会转换为 libpq 的 $1..$n 形式）：
-db.Execute("INSERT INTO users (name) VALUES (?)", new DbParams().Add(name));
-DbResult r = db.Query("SELECT * FROM users WHERE name = ?",
-new DbParams().Add(name));
-
-- nint handle;
+- byte[]tlsIn;
 
 - bool connected;
 
 - string lastError;
+
+- int lastAffected;
+
+- bool hadError;
+
+- int msgType;
+
+- int msgLen;
+
+- string host;
+
+- int port;
+
+- string database;
+
+- string user;
+
+- string password;
+
+- int sslMode;
+
+- string sslRootCert;
+
+- int connectTimeout;
+
+- int backendPid;
+
+- int backendSecret;
+
+- byte[]bb;
+
+- int bp;
 
 - bool busy;
 
@@ -39,280 +57,225 @@ new DbParams().Add(name));
 
 - void ReleaseLock()
 
-- [DllImport("libpq")]static extern nint PQconnectdb(string conninfo);
+- static bool verifyTls=true;
 
-- [DllImport("libpq")]static extern int PQstatus(nint conn);
-
-- [DllImport("libpq")]static extern string PQerrorMessage(nint conn);
-
-- [DllImport("libpq")]static extern void PQfinish(nint conn);
-
-- [DllImport("libpq")]static extern nint PQexec(nint conn, string query);
-
-- [DllImport("libpq")]static extern int PQresultStatus(nint res);
-
-- [DllImport("libpq")]static extern int PQntuples(nint res);
-
-- [DllImport("libpq")]static extern int PQnfields(nint res);
-
-- [DllImport("libpq")]static extern string PQfname(nint res, int col);
-
-- [DllImport("libpq")]static extern string PQgetvalue(nint res, int row, int col);
-
-- [DllImport("libpq")]static extern int PQgetisnull(nint res, int row, int col);
-
-- [DllImport("libpq")]static extern string PQcmdTuples(nint res);
-
-- [DllImport("libpq")]static extern void PQclear(nint res);
-
-- [DllImport("libpq")]static extern nint PQexecParams(nint conn, string command, int nParams, nint paramTypes, nint paramValues, nint paramLengths, nint paramFormats, int resultFormat);
-
-- [DllImport("libpq")]static extern int PQsendQueryParams(nint conn, string command, int nParams, nint paramTypes, nint paramValues, nint paramLengths, nint paramFormats, int resultFormat);
-
-- [DllImport("libpq")]static extern nint PQconnectStart(string conninfo);
-
-- [DllImport("libpq")]static extern int PQconnectPoll(nint conn);
-
-- [DllImport("libpq")]static extern int PQsocket(nint conn);
-
-- [DllImport("libpq")]static extern int PQsetnonblocking(nint conn, int arg);
-
-- [DllImport("libpq")]static extern int PQsendQuery(nint conn, string query);
-
-- [DllImport("libpq")]static extern int PQflush(nint conn);
-
-- [DllImport("libpq")]static extern int PQconsumeInput(nint conn);
-
-- [DllImport("libpq")]static extern int PQisBusy(nint conn);
-
-- [DllImport("libpq")]static extern nint PQgetResult(nint conn);
-
-- static string CopyText(string s)
-  - 将 libpq 返回的 C 字符串复制成由 ARC 管理的自有 Zan
-    字符串。PQgetvalue/PQfname/PQerrorMessage 返回指向
-    PGresult/PGconn 缓冲区的指针，PQclear()（或下一次 libpq 调用）会
-    使其失效；直接保存会让结果集或
-    lastError 指向已释放的内存。与 "" 拼接可在源指针仍有效时
-    分配一份新的托管副本。
-
-- static string ToDollarParams(string sql)
-  - 将 `?` 占位符（SQL 结构位置）改写为 libpq 的
-    位置参数 $1..$n 形式，使所有驱动统一使用 `?` 语法。
-    上下文感知：字符串字面量、转义引号、双引号标识符、
-    行/块注释以及美元引用（$$..$$ / $tag$..$tag$）内部的
-    `?` 一律原样保留——此前无脑改写，
-    SELECT * FROM t WHERE note = 'a?b' 会变成 $1 参数错位、
-    注释里的示例 SQL 直接破坏语句。采用分块游标区间切片，0 单字符堆分配。
-
-- static byte[]BuildParamBlock(DbParams prms, List <byte[]> keepAlive)
-  - 为 PQexecParams 构建 char** paramValues 块：一个
-    指向各值 NUL 结尾副本的指针数组（SQL NULL 用 0）。
-    值缓冲区会追加到 keepAlive 中，调用方须保证其在
-    libpq 调用返回前一直存活。
-
-- static DbResult ReadTuples(nint res)
-  - 将 TUPLES_OK 的 PGresult 复制为 DbResult（NULL 单元格变为 ""）。
+- static void SetTlsVerify(bool verify)
 
 - PgConnection()
-  - 私有构造；统一经 `Open`/`OpenAsync` 创建。
+
+- void begin(int cap)
+
+- void put8(int v)
+
+- void put32(int v)
+
+- void put16(int v)
+
+- void putRaw(string s)
+
+- void putCstr(string s)
+
+- void putBytes(byte[]b, int len)
+
+- int tlsFlushSync()
+
+- int tlsRecvSync(byte[]dst, int want)
+
+- int tlsSendSync(byte[]data, int len)
+
+- int recvExactSync(byte[]dst, int off, int need)
+
+- int sendRawSync(byte[]buf, int len)
+
+- int sendMessageSync(int type, byte[]pay, int len)
+
+- byte[]recvMessageSync()
+
+- int sendPasswordSync(string text)
+
+- async int recvExactAsync(byte[]dst, int off, int need)
+
+- async int sendRawAsync(byte[]buf, int len)
+
+- async int sendMessageAsync(int type, byte[]pay, int len)
+
+- async byte[]recvMessageAsync()
+
+- async int sendPasswordAsync(string text)
+
+- int applyConninfo(string conninfo)
+
+- int sslNegotiateSync()
+
+- async int sslNegotiateAsync()
+
+- bool tlsUpgradeSync()
+
+- byte[]startupPayload()
+
+- bool doConnectSync()
+
+- async bool doConnectAsync()
+
+- void recordParamStatus(byte[]pay)
+
+- bool authLoopSync()
+
+- async bool authLoopAsync()
 
 - static PgConnection Open(string conninfo)
-  - 从 libpq conninfo 字符串打开连接。
 
 - static PgConnection OpenParams(string host, int port, string database, string user, string password)
-  - 从分散参数打开连接。
-
-- int Execute(string sql)
-  - 执行非查询语句；返回受影响行数或 -1。
-
-- DbResult Query(string sql)
-  - 执行查询并返回结果集。
-
-- int Execute(string sql, DbParams prms)
-  - 通过 PQexecParams 执行参数化非查询语句：
-    值带外传输，绝不拼入 SQL 文本。
-
-- DbResult Query(string sql, DbParams prms)
-  - 通过 PQexecParams 执行参数化查询。
-
-- string ExecuteScalar(string sql)
-  - 执行标量查询（第一行第一列）。
-
-- string ExecuteScalar(string sql, DbParams prms)
-  - 执行参数化标量查询。
 
 - static async PgConnection OpenAsync(string conninfo)
-  - 打开连接而不阻塞线程：驱动 libpq 的
-    非阻塞握手（PQconnectStart / PQconnectPoll），并在
-    各轮询步骤之间于 IO reactor 上挂起等待套接字就绪。
 
 - static async PgConnection OpenParamsAsync(string host, int port, string database, string user, string password)
-  - 从分散参数异步打开连接。
 
-- async int flushOutput()
-  - 将缓冲输出刷新到服务器，在 libpq 仍有待发数据时
-    挂起等待可写就绪。成功返回 0。
+- DbResult readResultsSync()
 
-- async bool waitReady()
-  - 等待 libpq 能无阻塞地产出下一条结果，
-    在可读就绪时消费输入。出错返回 false。
+- async DbResult readResultsAsync()
+
+- int Execute(string sql)
+
+- DbResult Query(string sql)
+
+- string ExecuteScalar(string sql)
+
+- int Execute(string sql, DbParams prms)
+
+- DbResult Query(string sql, DbParams prms)
+
+- string ExecuteScalar(string sql, DbParams prms)
+
+- bool sendExtendedSync(string dollarSql, DbParams prms)
+
+- void die(string why)
 
 - async DbResult QueryAsync(string sql)
-  - 发送查询并异步收完所有结果，保留
-    最后一个返回行的结果集。在 reactor 上挂起等待 IO 就绪，
-    使工作线程可供其他协程使用。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
-
-- async DbResult QueryParamsAsync(string sql, DbParams prms)
-  - 异步发送参数化查询（PQsendQueryParams）
-    并在 IO reactor 上收完结果。语句失败时抛出
-    `DbException`。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
-
-- async int ExecuteParamsAsync(string sql, DbParams prms)
-  - 异步发送参数化非查询语句并返回
-    受影响行数。语句失败时抛出 `DbException`。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
 
 - async int ExecuteAsync(string sql)
-  - 异步发送非查询语句并返回
-    受影响行数。语句失败时抛出 `DbException`。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
+
+- async DbResult QueryParamsAsync(string sql, DbParams prms)
+
+- async int ExecuteParamsAsync(string sql, DbParams prms)
+
+- async bool sendExtendedAsync(string dollarSql, DbParams prms)
 
 - void fail()
-  - 抛出记录的失败。libpq 的消息来自服务器本身，
-    因此能原样到达调用方，而不会被
-    空结果或 -1 吞掉。
 
 - string GetError()
-  - 获取最后一条错误消息。
 
-- async DbResult QueryAsync(string sql, DbParams prms)
-  - 开始一个事务。
+- string serverVersion;
 
-- async int ExecuteAsync(string sql, DbParams prms)
-  - `ExecuteParamsAsync` 的接口命名别名。
-
-- async string ExecuteScalarAsync(string sql)
-  - `ExecuteScalar(string)` 的协程版本。
-
-- async string ExecuteScalarAsync(string sql, DbParams prms)
-  - `ExecuteScalar(string, DbParams)` 的协程版本。
-
-- async bool BeginTransactionAsync()
-  - 协程版事务：执行 BEGIN，恒返回 true。
-
-- async bool CommitAsync()
-  - 协程版提交：执行 COMMIT，恒返回 true。
-
-- async bool RollbackAsync()
-  - 协程版回滚：执行 ROLLBACK，恒返回 true。
+- string clientEncoding;
 
 - void BeginTransaction()
-  - 开始一个事务（执行 BEGIN）。
 
 - void Commit()
-  - 提交当前事务。
 
 - void Rollback()
-  - 回滚当前事务。
+
+- async DbResult QueryAsync(string sql, DbParams prms)
+
+- async int ExecuteAsync(string sql, DbParams prms)
+
+- async string ExecuteScalarAsync(string sql)
+
+- async string ExecuteScalarAsync(string sql, DbParams prms)
+
+- async bool BeginTransactionAsync()
+
+- async bool CommitAsync()
+
+- async bool RollbackAsync()
 
 - void Close()
-  - 关闭数据库连接。安全释放互斥门控并唤醒所有等待者。
 
 - bool IsConnected()
-  - 返回连接是否已打开。
 
 - int GetProvider()
-  - 返回提供程序 ID（DbProvider.PostgreSQL）。
 
 - void Dispose()
-  - 释放连接持有的资源（实现 IDisposable，等同于 Close）。
 
 
 ## PgConnector (class)
-
-`IDbConnector` 的原生 PostgreSQL 驱动实现。
-使用非阻塞握手建立连接（<c>PQconnectStart</c> 由
-IO reactor 驱动），因此扩容连接池从不阻塞工作线程。
-
-用法：
-DbPool pool = PgConnector.Pool("127.0.0.1", 5432, "app", "postgres", "secret", 8);
-IDbConnection db = await pool.AcquireAsync();
-DbResult r = db.Query("SELECT 1");
-pool.Release(db);
-
-`PgPool` 是对应的类型化连接池；当查询
-本身需要以协程方式运行时使用（<c>QueryAsync</c>/<c>ExecuteAsync</c>）。
 
 - string conninfo;
 
 - PgConnector(string conninfo)
 
 - static PgConnector CreateParams(string host, int port, string database, string user, string password)
-  - 基于 host/port/database/user/password 的连接器。
 
 - static DbPool Pool(string conninfo, int maxSize)
-  - 基于 libpq 连接字符串的连接池。
 
 - static DbPool Pool(string host, int port, string database, string user, string password, int maxSize)
-  - 基于 host/port/database/user/password 的连接池。
 
 - static string BuildConninfo(string host, int port, string database, string user, string password)
-  - 把 host/port/database/user/password 拼成 libpq conninfo 字符串。
 
 - async IDbConnection ConnectAsync()
-  - 执行非阻塞握手打开一个新连接（由 IO reactor 驱动）。
 
 - int GetProvider()
-  - 池的 provider id（恒为 `DbProvider.PostgreSQL`）。
 
 
 ## PgPool (class)
-
-面向 `PgConnection` 的协程化连接池。
-
-契约与 `DbPool` 相同——惰性增长至 <c>maxSize</c>，
-用事件驱动 `Gate` 等待而非轮询，驱逐失效
-连接——但它是类型化的，协程查询 API（<c>QueryAsync</c>、
-<c>ExecuteAsync</c>、<c>QueryParamsAsync</c>）仍然可用。连接
-使用非阻塞 libpq 握手建立，因此无论扩容
-连接池还是查询都不会阻塞工作线程。
-
-用法：
-PgPool pool = new PgPool("127.0.0.1", 5432, "app", "postgres", "secret", 8);
-PgConnection db = await pool.AcquireAsync();
-DbResult r = await db.QueryAsync("SELECT 1");
-pool.Release(db);
-pool.Close();
 
 - string conninfo;
 
 - PoolCore<PgConnection> core;
 
+- string lastOpenError;
+
 - PgPool(string conninfo, int maxSize)
 
 - PgPool(string host, int port, string database, string user, string password, int maxSize):this("host="+host+" port="+Convert.ToString(port)+" dbname="+database+" user="+user+" password="+password, maxSize)
-  - 以主机/端口/库/用户/密码构造连接池（内部拼成 conninfo）。
 
 - async PgConnection OpenOne()
-  - 新建一条物理连接（池扩容时由 AcquireAsync 调用）；失败返回 null。
 
 - async PgConnection AcquireAsync()
-  - 借出连接：优先复用空闲连接，
-    未达上限则新建，否则挂起协程直到有连接被归还。饱和等待有
-    硬上限（见 `PoolWait`）：超时返回 null，绝不定死。
-    连接池关闭后返回 null。
 
 - void Release(PgConnection c)
-  - 将连接归还连接池。已损坏或 Close() 之后的
-    连接会被关闭销毁而不入池。
 
 - int IdleCount()
-  - 空闲（已入池、立即可用）连接数。
 
 - int LiveCount()
-  - 存活连接总数（空闲 + 借出）。
 
 - int WaitingCount()
-  - 当前停泊等待连接的协程数。
 
 - void Close()
-  - 关闭所有空闲连接并标记连接池已关闭。仍
-    被借出的连接在归还时关闭。
+
+
+## PgWire (class)
+
+- static string bytesToStr(byte[]buf, int off, int len)
+
+- static byte[]strToBytes(string s, int len)
+
+- static byte[]slice4(byte[]b, int off)
+
+- static bool hasPrefix(string b, string pre)
+
+- static int be32(byte[]b, int off)
+
+- static int parseConninfo(string s, List<string> outs)
+
+- static bool isSpace(int c)
+
+- static void readRowDescription(DbResult result, byte[]pay, int len, List<int> colOids)
+
+- static void readDataRow(DbResult result, byte[]pay, int len, List<int> colOids)
+
+- static string formatError(byte[]pay, int len)
+
+- static int parseCommandTag(string tag)
+
+- static string ToDollarParams(string sql)
+
+- static string md5PasswordToken(string password, string user, byte[]salt)
+
+- static string clientNonce()
+
+- static string scramField(string msg, string key)
+
+- static byte[]pbkdf2Sha256(string password, byte[]salt, int saltLen, int iters)
+
+- static byte[]xor32(byte[]a, byte[]b)

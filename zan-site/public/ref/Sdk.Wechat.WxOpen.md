@@ -5,48 +5,36 @@
 
 ## WechatWxOpenB2BApi (class)
 
-B2B/B2BApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenB2BApi(WechatWxOpenClient client)
 
 - async WechatWxOpenB2BApiApplyRetailBusinessResponse ApplyRetailBusinessAsync(WechatWxOpenB2BApiApplyRetailBusinessRequest request)
-  - POST /wxa/business/retailbusinessapply
 
 - async WechatResponse ApplyRetailBusinessRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BApiBatchCreateRetailResponse BatchCreateRetailAsync(WechatWxOpenB2BApiBatchCreateRetailRequest request)
-  - POST /wxa/business/batchcreateretail
 
 - async WechatResponse BatchCreateRetailRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BApiGetRetailInfoResponse GetRetailInfoAsync(WechatWxOpenB2BApiGetRetailInfoRequest request)
-  - POST /wxa/business/getretailinfo
 
 - async WechatResponse GetRetailInfoRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BApiGetRetailOpenIdListResponse GetRetailOpenIdListAsync(WechatWxOpenB2BApiGetRetailOpenIdListRequest request)
-  - POST /wxa/business/getretailopenidlist
 
 - async WechatResponse GetRetailOpenIdListRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BApiSendRetailNotificationResponse SendRetailNotificationAsync(WechatWxOpenB2BApiSendRetailNotificationRequest request)
-  - POST /wxa/business/retailnotifybusiness
 
 - async WechatResponse SendRetailNotificationRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BApiGetRetailMessageListResponse GetRetailMessageListAsync(WechatWxOpenB2BApiGetRetailMessageListRequest request)
-  - POST /wxa/business/getretailmessagelist
 
 - async WechatResponse GetRetailMessageListRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenB2BApiApplyRetailBusinessRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 
@@ -188,56 +176,43 @@ B2B/B2BApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenB2BMerchantApi (class)
 
-B2B/B2BMerchantApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenB2BMerchantApi(WechatWxOpenClient client)
 
 - async WechatWxOpenB2BMerchantApiRegisterMerchantResponse RegisterMerchantAsync(WechatWxOpenB2BMerchantApiRegisterMerchantRequest request)
-  - POST /retail/B2b/retailregistermch
 
 - async WechatResponse RegisterMerchantRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BMerchantApiUploadMerchantFileResponse UploadMerchantFileAsync(WechatWxOpenB2BMerchantApiUploadMerchantFileRequest request)
-  - POST /retail/B2b/retailuploadmchfile
 
 - async WechatResponse UploadMerchantFileRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BMerchantApiGetMerchantApplicationResponse GetMerchantApplicationAsync(WechatWxOpenB2BMerchantApiGetMerchantApplicationRequest request)
-  - POST /retail/B2b/retailgetmchorder
 
 - async WechatResponse GetMerchantApplicationRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BMerchantApiApplyBankTransferResponse ApplyBankTransferAsync(WechatWxOpenB2BMerchantApiApplyBankTransferRequest request)
-  - POST /retail/B2b/registeronlywqf
 
 - async WechatResponse ApplyBankTransferRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BMerchantApiCreateBankTransferLinkResponse CreateBankTransferLinkAsync(WechatWxOpenB2BMerchantApiCreateBankTransferLinkRequest request)
-  - POST /retail/B2b/createwqflink
 
 - async WechatResponse CreateBankTransferLinkRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BMerchantApiGetMerchantInfoResponse GetMerchantInfoAsync()
-  - POST /retail/B2b/getmchinfo
 
 - async WechatResponse GetMerchantInfoRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BMerchantApiSetMerchantProfitRateResponse SetMerchantProfitRateAsync(WechatWxOpenB2BMerchantApiSetMerchantProfitRateRequest request)
-  - POST /retail/B2b/setmchprofitrate
 
 - async WechatResponse SetMerchantProfitRateRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BMerchantApiUpdateBankTransferFeeResponse UpdateBankTransferFeeAsync(WechatWxOpenB2BMerchantApiUpdateBankTransferFeeRequest request)
-  - POST /retail/B2b/updatewqfchargefee
 
 - async WechatResponse UpdateBankTransferFeeRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BMerchantApiGetBankTransferFeeResponse GetBankTransferFeeAsync(WechatWxOpenB2BMerchantApiGetBankTransferFeeRequest request)
-  - POST /retail/B2b/getwqfchargefee
 
 - async WechatResponse GetBankTransferFeeRawAsync(string query, string jsonBody)
 
@@ -326,8 +301,6 @@ B2B/B2BMerchantApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenB2BMerchantApiRegisterMerchantRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 
@@ -439,61 +412,47 @@ B2B/B2BMerchantApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenB2BOrderApi (class)
 
-B2B/B2BOrderApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenB2BOrderApi(WechatWxOpenClient client)
 
 - async WechatWxOpenB2BOrderApiGetOrderResponse GetOrderAsync(WechatWxOpenB2BOrderApiGetOrderRequest request)
-  - POST /retail/B2b/getorder
 
 - async WechatResponse GetOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BOrderApiCloseOrderResponse CloseOrderAsync(WechatWxOpenB2BOrderApiCloseOrderRequest request)
-  - POST /retail/B2b/closeb2border
 
 - async WechatResponse CloseOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BOrderApiRefundOrderResponse RefundOrderAsync(WechatWxOpenB2BOrderApiRefundOrderRequest request)
-  - POST /retail/B2b/refund
 
 - async WechatResponse RefundOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BOrderApiGetRefundResponse GetRefundAsync(WechatWxOpenB2BOrderApiGetRefundRequest request)
-  - POST /retail/B2b/getrefund
 
 - async WechatResponse GetRefundRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BOrderApiGetAppKeyResponse GetAppKeyAsync(WechatWxOpenB2BOrderApiGetAppKeyRequest request)
-  - POST /retail/B2b/getappkey
 
 - async WechatResponse GetAppKeyRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BOrderApiDownloadBillResponse DownloadBillAsync(WechatWxOpenB2BOrderApiDownloadBillRequest request)
-  - POST /retail/B2b/downloadbill
 
 - async WechatResponse DownloadBillRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BOrderApiGetMerchantBalanceResponse GetMerchantBalanceAsync(WechatWxOpenB2BOrderApiGetMerchantBalanceRequest request)
-  - POST /retail/B2b/getmchbalance
 
 - async WechatResponse GetMerchantBalanceRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BOrderApiWithdrawResponse WithdrawAsync(WechatWxOpenB2BOrderApiWithdrawRequest request)
-  - POST /retail/B2b/withdraw
 
 - async WechatResponse WithdrawRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BOrderApiQueryWithdrawResponse QueryWithdrawAsync(WechatWxOpenB2BOrderApiQueryWithdrawRequest request)
-  - POST /retail/B2b/querywithdraw
 
 - async WechatResponse QueryWithdrawRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BOrderApiSetAutoWithdrawResponse SetAutoWithdrawAsync(WechatWxOpenB2BOrderApiSetAutoWithdrawRequest request)
-  - POST /retail/B2b/setautowithdraw
 
 - async WechatResponse SetAutoWithdrawRawAsync(string query, string jsonBody)
 
@@ -585,8 +544,6 @@ B2B/B2BOrderApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenB2BOrderApiGetOrderRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 
@@ -744,63 +701,48 @@ B2B/B2BOrderApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenB2BProfitSharingApi (class)
 
-B2B/B2BProfitSharingApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenB2BProfitSharingApi(WechatWxOpenClient client)
 
 - async WechatWxOpenB2BProfitSharingApiAddProfitSharingAccountResponse AddProfitSharingAccountAsync(WechatWxOpenB2BProfitSharingApiAddProfitSharingAccountRequest request)
-  - POST /retail/B2b/addprofitsharingaccount
 
 - async WechatResponse AddProfitSharingAccountRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BProfitSharingApiDeleteProfitSharingAccountResponse DeleteProfitSharingAccountAsync(WechatWxOpenB2BProfitSharingApiDeleteProfitSharingAccountRequest request)
-  - POST /retail/B2b/delprofitsharingaccount
 
 - async WechatResponse DeleteProfitSharingAccountRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BProfitSharingApiQueryProfitSharingAccountResponse QueryProfitSharingAccountAsync(WechatWxOpenB2BProfitSharingApiQueryProfitSharingAccountRequest request)
-  - POST /retail/B2b/queryprofitsharingaccount
 
 - async WechatResponse QueryProfitSharingAccountRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BProfitSharingApiCreateProfitSharingOrderResponse CreateProfitSharingOrderAsync(WechatWxOpenB2BProfitSharingApiCreateProfitSharingOrderRequest request)
-  - POST /retail/B2b/createprofitsharingorder
 
 - async WechatResponse CreateProfitSharingOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BProfitSharingApiQueryProfitSharingOrderResponse QueryProfitSharingOrderAsync(WechatWxOpenB2BProfitSharingApiQueryProfitSharingOrderRequest request)
-  - POST /retail/B2b/queryprofitsharingorder
 
 - async WechatResponse QueryProfitSharingOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BProfitSharingApiQueryProfitSharingRemainingAmountResponse QueryProfitSharingRemainingAmountAsync(WechatWxOpenB2BProfitSharingApiQueryProfitSharingRemainingAmountRequest request)
-  - POST /retail/B2b/queryprofitsharingremainamt
 
 - async WechatResponse QueryProfitSharingRemainingAmountRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BProfitSharingApiFinishProfitSharingOrderResponse FinishProfitSharingOrderAsync(WechatWxOpenB2BProfitSharingApiFinishProfitSharingOrderRequest request)
-  - POST /retail/B2b/finishprofitsharingorder
 
 - async WechatResponse FinishProfitSharingOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BProfitSharingApiRefundProfitSharingResponse RefundProfitSharingAsync(WechatWxOpenB2BProfitSharingApiRefundProfitSharingRequest request)
-  - POST /retail/B2b/refundprofitsharing
 
 - async WechatResponse RefundProfitSharingRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenB2BProfitSharingApiQueryRefundProfitSharingOrderResponse QueryRefundProfitSharingOrderAsync(WechatWxOpenB2BProfitSharingApiQueryRefundProfitSharingOrderRequest request)
-  - POST /retail/B2b/queryrefundprofitsharingorder
 
 - async WechatResponse QueryRefundProfitSharingOrderRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenB2BProfitSharingApiAddProfitSharingAccountRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 
@@ -1038,21 +980,15 @@ B2B/B2BProfitSharingApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenChargeApi (class)
 
-Charge/ChargeApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenChargeApi(WechatWxOpenClient client)
 
 - async WechatWxOpenChargeApiUsageResponse UsageAsync(WechatWxOpenChargeApiUsageRequest request)
-  - GET /wxa/charge/usage/get
 
 - async WechatResponse UsageRawAsync(string query)
 
 - async WechatWxOpenChargeApiGetRecentAverageResponse GetRecentAverageAsync(WechatWxOpenChargeApiGetRecentAverageRequest request)
-  - GET /wxa/charge/usage/get_recent_average
 
 - async WechatResponse GetRecentAverageRawAsync(string query)
 
@@ -1077,8 +1013,6 @@ Charge/ChargeApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenChargeApiUsageRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.WxOpen。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenChargeApiUsageRequest()
@@ -1101,66 +1035,51 @@ Charge/ChargeApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenCityServiceApi (class)
 
-CityService/CityServiceApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenCityServiceApi(WechatWxOpenClient client)
 
 - async WechatWxOpenCityServiceApiGetServicePathResponse GetServicePathAsync(WechatWxOpenCityServiceApiGetServicePathRequest request)
-  - POST /cityservice/getservicepath
 
 - async WechatResponse GetServicePathRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCityServiceApiSendMessageDataResponse SendMessageDataAsync(WechatWxOpenCityServiceApiSendMessageDataRequest request)
-  - POST /cityservice/sendmsgdata
 
 - async WechatResponse SendMessageDataRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCityServiceApiCheckRealNameResponse CheckRealNameAsync(WechatWxOpenCityServiceApiCheckRealNameRequest request)
-  - POST /intp/realname/checkrealnameinfo
 
 - async WechatResponse CheckRealNameRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCityServiceApiGetBusinessViewResponse GetBusinessViewAsync(WechatWxOpenCityServiceApiGetBusinessViewRequest request)
-  - POST /intp/transportcode/getbusinessview
 
 - async WechatResponse GetBusinessViewRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCityServiceApiSendMedicalMessageResponse SendMedicalMessageAsync(WechatWxOpenCityServiceApiSendMedicalMessageRequest request)
-  - POST /cityservice/sendchannelmsg
 
 - async WechatResponse SendMedicalMessageRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCityServiceApiGetMedicalRealNameResponse GetMedicalRealNameAsync(WechatWxOpenCityServiceApiGetMedicalRealNameRequest request)
-  - POST /cityservice/getmedrealname
 
 - async WechatResponse GetMedicalRealNameRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCityServiceApiGetMessageRelationResponse GetMessageRelationAsync(WechatWxOpenCityServiceApiGetMessageRelationRequest request)
-  - POST /cityservice/getmsgrelation
 
 - async WechatResponse GetMessageRelationRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCityServiceApiGetHospitalNoticeListResponse GetHospitalNoticeListAsync(WechatWxOpenCityServiceApiGetHospitalNoticeListRequest request)
-  - POST /intp/eldermedical/gethospnoticelist
 
 - async WechatResponse GetHospitalNoticeListRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCityServiceApiSetHospitalNoticePreviewResponse SetHospitalNoticePreviewAsync(WechatWxOpenCityServiceApiSetHospitalNoticePreviewRequest request)
-  - POST /intp/eldermedical/previewhopsnotice
 
 - async WechatResponse SetHospitalNoticePreviewRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCityServiceApiPublishHospitalNoticeResponse PublishHospitalNoticeAsync(WechatWxOpenCityServiceApiPublishHospitalNoticeRequest request)
-  - POST /intp/eldermedical/publichopsnotice
 
 - async WechatResponse PublishHospitalNoticeRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCityServiceApiSetHospitalNoticeResponse SetHospitalNoticeAsync(WechatWxOpenCityServiceApiSetHospitalNoticeRequest request)
-  - POST /intp/eldermedical/sethopsnotice
 
 - async WechatResponse SetHospitalNoticeRawAsync(string query, string jsonBody)
 
@@ -1272,8 +1191,6 @@ CityService/CityServiceApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenCityServiceApiGetServicePathRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 
@@ -1419,8 +1336,6 @@ CityService/CityServiceApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenClient (class)
 
-微信小程序 JSON API 客户端，自动缓存小程序 access_token。
-
 - WechatApiTransport transport;
 
 - string appId;
@@ -1450,33 +1365,24 @@ CityService/CityServiceApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenCustomApi (class)
 
-Custom/CustomApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenCustomApi(WechatWxOpenClient client)
 
 - async WechatWxOpenCustomApiSendImageResponse SendImageAsync(WechatWxOpenCustomApiSendImageRequest request)
-  - POST /cgi-bin/message/custom/send
 
 - async WechatResponse SendImageRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCustomApiSendLinkResponse SendLinkAsync(WechatWxOpenCustomApiSendLinkRequest request)
-  - POST /cgi-bin/message/custom/send
 
 - async WechatResponse SendLinkRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCustomApiSendMiniProgramPageResponse SendMiniProgramPageAsync(WechatWxOpenCustomApiSendMiniProgramPageRequest request)
-  - POST /cgi-bin/message/custom/send
 
 - async WechatResponse SendMiniProgramPageRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenCustomApiSendImageRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 
@@ -1550,48 +1456,36 @@ Custom/CustomApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenCustomServiceApi (class)
 
-CustomService/CustomServiceApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenCustomServiceApi(WechatWxOpenClient client)
 
 - async WechatWxOpenCustomServiceApiGetKfListResponse GetKfListAsync()
-  - GET /cgi-bin/customservice/getkflist
 
 - async WechatResponse GetKfListRawAsync(string query)
 
 - async WechatWxOpenCustomServiceApiGetOnlineKfListResponse GetOnlineKfListAsync()
-  - GET /cgi-bin/customservice/getonlinekflist
 
 - async WechatResponse GetOnlineKfListRawAsync(string query)
 
 - async WechatWxOpenCustomServiceApiKfAccountAddResponse KfAccountAddAsync(WechatWxOpenCustomServiceApiKfAccountAddRequest request)
-  - POST /customservice/kfaccount/add
 
 - async WechatResponse KfAccountAddRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCustomServiceApiKfAccountDelResponse KfAccountDelAsync(WechatWxOpenCustomServiceApiKfAccountDelRequest request)
-  - POST /customservice/kfaccount/del
 
 - async WechatResponse KfAccountDelRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCustomServiceApiKfAccountSetAdminResponse KfAccountSetAdminAsync(WechatWxOpenCustomServiceApiKfAccountSetAdminRequest request)
-  - POST /customservice/kfaccount/setadmin
 
 - async WechatResponse KfAccountSetAdminRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCustomServiceApiKfAccountCancelAdminResponse KfAccountCancelAdminAsync(WechatWxOpenCustomServiceApiKfAccountCancelAdminRequest request)
-  - POST /customservice/kfaccount/canceladmin
 
 - async WechatResponse KfAccountCancelAdminRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenCustomServiceApiGetKfListResponse (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.WxOpen。
 
 - public string Raw;
 
@@ -1683,31 +1577,23 @@ CustomService/CustomServiceApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenCustomServiceCustomerServiceBusinessApi (class)
 
-CustomService/CustomerServiceBusinessApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenCustomServiceCustomerServiceBusinessApi(WechatWxOpenClient client)
 
 - async WechatWxOpenCustomServiceCustomerServiceBusinessApiRegisterResponse RegisterAsync(WechatWxOpenCustomServiceCustomerServiceBusinessApiRegisterRequest request)
-  - POST /cgi-bin/business/register
 
 - async WechatResponse RegisterRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCustomServiceCustomerServiceBusinessApiUpdateResponse UpdateAsync(WechatWxOpenCustomServiceCustomerServiceBusinessApiUpdateRequest request)
-  - POST /cgi-bin/business/update
 
 - async WechatResponse UpdateRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCustomServiceCustomerServiceBusinessApiGetResponse GetAsync(WechatWxOpenCustomServiceCustomerServiceBusinessApiGetRequest request)
-  - POST /cgi-bin/business/get
 
 - async WechatResponse GetRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCustomServiceCustomerServiceBusinessApiListResponse ListAsync(WechatWxOpenCustomServiceCustomerServiceBusinessApiListRequest request)
-  - POST /cgi-bin/business/list
 
 - async WechatResponse ListRawAsync(string query, string jsonBody)
 
@@ -1753,8 +1639,6 @@ CustomService/CustomerServiceBusinessApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenCustomServiceCustomerServiceBusinessApiRegisterRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 
@@ -1804,26 +1688,19 @@ CustomService/CustomerServiceBusinessApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenCustomServiceKfWorkApi (class)
 
-CustomService/KfWorkApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenCustomServiceKfWorkApi(WechatWxOpenClient client)
 
 - async WechatWxOpenCustomServiceKfWorkApiGetBoundResponse GetBoundAsync()
-  - GET /customservice/work/get
 
 - async WechatResponse GetBoundRawAsync(string query)
 
 - async WechatWxOpenCustomServiceKfWorkApiBindResponse BindAsync(WechatWxOpenCustomServiceKfWorkApiBindRequest request)
-  - POST /customservice/work/bind
 
 - async WechatResponse BindRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenCustomServiceKfWorkApiUnbindResponse UnbindAsync(WechatWxOpenCustomServiceKfWorkApiUnbindRequest request)
-  - POST /customservice/work/unbind
 
 - async WechatResponse UnbindRawAsync(string query, string jsonBody)
 
@@ -1850,8 +1727,6 @@ CustomService/KfWorkApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenCustomServiceKfWorkApiGetBoundResponse (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.WxOpen。
-
 - public string Raw;
 
 
@@ -1877,66 +1752,51 @@ CustomService/KfWorkApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenDataCubeApi (class)
 
-DataCube/DataCubeApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenDataCubeApi(WechatWxOpenClient client)
 
 - async WechatWxOpenDataCubeApiGetWeAnalysisAppidDailySummaryTrendResponse GetWeAnalysisAppidDailySummaryTrendAsync(WechatWxOpenDataCubeApiGetWeAnalysisAppidDailySummaryTrendRequest request)
-  - POST /datacube/getweanalysisappiddailysummarytrend
 
 - async WechatResponse GetWeAnalysisAppidDailySummaryTrendRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDataCubeApiGetWeAnalysisAppidDailyVisitTrendResponse GetWeAnalysisAppidDailyVisitTrendAsync(WechatWxOpenDataCubeApiGetWeAnalysisAppidDailyVisitTrendRequest request)
-  - POST /datacube/getweanalysisappiddailyvisittrend
 
 - async WechatResponse GetWeAnalysisAppidDailyVisitTrendRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDataCubeApiGetWeAnalysisAppidWeeklyVisitTrendResponse GetWeAnalysisAppidWeeklyVisitTrendAsync(WechatWxOpenDataCubeApiGetWeAnalysisAppidWeeklyVisitTrendRequest request)
-  - POST /datacube/getweanalysisappidweeklyvisittrend
 
 - async WechatResponse GetWeAnalysisAppidWeeklyVisitTrendRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDataCubeApiGetWeAnalysisAppidMonthlyVisitTrendResponse GetWeAnalysisAppidMonthlyVisitTrendAsync(WechatWxOpenDataCubeApiGetWeAnalysisAppidMonthlyVisitTrendRequest request)
-  - POST /datacube/getweanalysisappidmonthlyvisittrend
 
 - async WechatResponse GetWeAnalysisAppidMonthlyVisitTrendRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDataCubeApiGetWeAnalysisAppidVisitDistributionResponse GetWeAnalysisAppidVisitDistributionAsync(WechatWxOpenDataCubeApiGetWeAnalysisAppidVisitDistributionRequest request)
-  - POST /datacube/getweanalysisappidvisitdistribution
 
 - async WechatResponse GetWeAnalysisAppidVisitDistributionRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDataCubeApiGetWeAnalysisAppidDailyRetainInfoResponse GetWeAnalysisAppidDailyRetainInfoAsync(WechatWxOpenDataCubeApiGetWeAnalysisAppidDailyRetainInfoRequest request)
-  - POST /datacube/getweanalysisappiddailyretaininfo
 
 - async WechatResponse GetWeAnalysisAppidDailyRetainInfoRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDataCubeApiGetWeAnalysisAppidWeeklyRetainInfoResponse GetWeAnalysisAppidWeeklyRetainInfoAsync(WechatWxOpenDataCubeApiGetWeAnalysisAppidWeeklyRetainInfoRequest request)
-  - POST /datacube/getweanalysisappidweeklyretaininfo
 
 - async WechatResponse GetWeAnalysisAppidWeeklyRetainInfoRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDataCubeApiGetWeAnalysisAppidMonthlyRetainInfoResponse GetWeAnalysisAppidMonthlyRetainInfoAsync(WechatWxOpenDataCubeApiGetWeAnalysisAppidMonthlyRetainInfoRequest request)
-  - POST /datacube/getweanalysisappidmonthlyretaininfo
 
 - async WechatResponse GetWeAnalysisAppidMonthlyRetainInfoRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDataCubeApiGetWeAnalysisAppidVisitPageResponse GetWeAnalysisAppidVisitPageAsync(WechatWxOpenDataCubeApiGetWeAnalysisAppidVisitPageRequest request)
-  - POST /datacube/getweanalysisappidvisitpage
 
 - async WechatResponse GetWeAnalysisAppidVisitPageRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDataCubeApiGetWeAnalysisAppidUserPortraitResponse GetWeAnalysisAppidUserPortraitAsync(WechatWxOpenDataCubeApiGetWeAnalysisAppidUserPortraitRequest request)
-  - POST /datacube/getweanalysisappiduserportrait
 
 - async WechatResponse GetWeAnalysisAppidUserPortraitRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDataCubeApiGetPerformanceDataResponse GetPerformanceDataAsync(WechatWxOpenDataCubeApiGetPerformanceDataRequest request)
-  - POST /wxa/business/performance/boot
 
 - async WechatResponse GetPerformanceDataRawAsync(string query, string jsonBody)
 
@@ -1986,8 +1846,6 @@ DataCube/DataCubeApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenDataCubeApiGetWeAnalysisAppidDailySummaryTrendRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -2169,71 +2027,55 @@ DataCube/DataCubeApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenDeliveryApi (class)
 
-Delivery/DeliveryApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenDeliveryApi(WechatWxOpenClient client)
 
 - async WechatWxOpenDeliveryApiGetAllDeliveryResponse GetAllDeliveryAsync()
-  - GET /cgi-bin/express/business/delivery/getall
 
 - async WechatResponse GetAllDeliveryRawAsync(string query)
 
 - async WechatWxOpenDeliveryApiBindAccountResponse BindAccountAsync(WechatWxOpenDeliveryApiBindAccountRequest request)
-  - POST /cgi-bin/express/business/account/bind
 
 - async WechatResponse BindAccountRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryApiGetAllAccountResponse GetAllAccountAsync()
-  - GET /cgi-bin/express/business/account/getall
 
 - async WechatResponse GetAllAccountRawAsync(string query)
 
 - async WechatWxOpenDeliveryApiGetPrinterResponse GetPrinterAsync()
-  - GET /cgi-bin/express/business/printer/getall
 
 - async WechatResponse GetPrinterRawAsync(string query)
 
 - async WechatWxOpenDeliveryApiUpdatePrinterResponse UpdatePrinterAsync(WechatWxOpenDeliveryApiUpdatePrinterRequest request)
-  - POST /cgi-bin/express/business/printer/update
 
 - async WechatResponse UpdatePrinterRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryApiGetQuotaResponse GetQuotaAsync(WechatWxOpenDeliveryApiGetQuotaRequest request)
-  - POST /cgi-bin/express/business/quota/get
 
 - async WechatResponse GetQuotaRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryApiAddOrderResponse AddOrderAsync(WechatWxOpenDeliveryApiAddOrderRequest request)
-  - POST /cgi-bin/express/business/order/add
 
 - async WechatResponse AddOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryApiCancelOrderResponse CancelOrderAsync(WechatWxOpenDeliveryApiCancelOrderRequest request)
-  - POST /cgi-bin/express/business/order/cancel
 
 - async WechatResponse CancelOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryApiGetOrderResponse GetOrderAsync(WechatWxOpenDeliveryApiGetOrderRequest request)
-  - POST /cgi-bin/express/business/order/get
 
 - async WechatResponse GetOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryApiBatchGetOrderResponse BatchGetOrderAsync(WechatWxOpenDeliveryApiBatchGetOrderRequest request)
-  - POST /cgi-bin/express/business/order/batchget
 
 - async WechatResponse BatchGetOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryApiGetPathResponse GetPathAsync(WechatWxOpenDeliveryApiGetPathRequest request)
-  - POST /cgi-bin/express/business/path/get
 
 - async WechatResponse GetPathRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryApiTestUpdateOrderResponse TestUpdateOrderAsync(WechatWxOpenDeliveryApiTestUpdateOrderRequest request)
-  - POST /cgi-bin/express/business/test_update_order
 
 - async WechatResponse TestUpdateOrderRawAsync(string query, string jsonBody)
 
@@ -2360,8 +2202,6 @@ Delivery/DeliveryApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenDeliveryApiGetAllDeliveryResponse (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - public string Raw;
 
@@ -2495,56 +2335,43 @@ Delivery/DeliveryApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenDeliveryProviderApi (class)
 
-Delivery/DeliveryProviderApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenDeliveryProviderApi(WechatWxOpenClient client)
 
 - async WechatWxOpenDeliveryProviderApiUpdateBusinessResponse UpdateBusinessAsync(WechatWxOpenDeliveryProviderApiUpdateBusinessRequest request)
-  - POST /cgi-bin/express/delivery/service/business/update
 
 - async WechatResponse UpdateBusinessRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryProviderApiUpdatePathResponse UpdatePathAsync(WechatWxOpenDeliveryProviderApiUpdatePathRequest request)
-  - POST /cgi-bin/express/delivery/path/update
 
 - async WechatResponse UpdatePathRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryProviderApiPreviewTemplateResponse PreviewTemplateAsync(WechatWxOpenDeliveryProviderApiPreviewTemplateRequest request)
-  - POST /cgi-bin/express/delivery/template/preview
 
 - async WechatResponse PreviewTemplateRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryProviderApiGetContactResponse GetContactAsync(WechatWxOpenDeliveryProviderApiGetContactRequest request)
-  - POST /cgi-bin/express/delivery/contact/get
 
 - async WechatResponse GetContactRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryProviderApiCancelOrderResponse CancelOrderAsync(WechatWxOpenDeliveryProviderApiCancelOrderRequest request)
-  - POST /cgi-bin/express/delivery/single_waybill/cancel_order
 
 - async WechatResponse CancelOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryProviderApiUpdateOrderFeeResponse UpdateOrderFeeAsync(WechatWxOpenDeliveryProviderApiUpdateOrderFeeRequest request)
-  - POST /cgi-bin/express/delivery/single_waybill/fee
 
 - async WechatResponse UpdateOrderFeeRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryProviderApiRefundOrderResponse RefundOrderAsync(WechatWxOpenDeliveryProviderApiRefundOrderRequest request)
-  - POST /cgi-bin/express/delivery/single_waybill/refund_order
 
 - async WechatResponse RefundOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryProviderApiUpdateComplaintResultResponse UpdateComplaintResultAsync(WechatWxOpenDeliveryProviderApiUpdateComplaintResultRequest request)
-  - POST /cgi-bin/express/delivery/scatter/update_complaint_result
 
 - async WechatResponse UpdateComplaintResultRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenDeliveryProviderApiUpdateOrderStatusResponse UpdateOrderStatusAsync(WechatWxOpenDeliveryProviderApiUpdateOrderStatusRequest request)
-  - POST /cgi-bin/express/delivery/single_waybill/update
 
 - async WechatResponse UpdateOrderStatusRawAsync(string query, string jsonBody)
 
@@ -2638,8 +2465,6 @@ Delivery/DeliveryProviderApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenDeliveryProviderApiUpdateBusinessRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -2795,81 +2620,63 @@ Delivery/DeliveryProviderApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenExpressApi (class)
 
-Express/ExpressApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenExpressApi(WechatWxOpenClient client)
 
 - async WechatWxOpenExpressApiGetAllImmeDeliveryResponse GetAllImmeDeliveryAsync()
-  - POST /cgi-bin/express/local/business/delivery/getall
 
 - async WechatResponse GetAllImmeDeliveryRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenExpressApiGetBindAccountResponse GetBindAccountAsync()
-  - POST /cgi-bin/express/local/business/shop/get
 
 - async WechatResponse GetBindAccountRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenExpressApiBindAccountResponse BindAccountAsync(WechatWxOpenExpressApiBindAccountRequest request)
-  - POST /cgi-bin/express/local/business/shop/add
 
 - async WechatResponse BindAccountRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenExpressApiOpenDeliveryResponse OpenDeliveryAsync()
-  - POST /cgi-bin/express/local/business/open
 
 - async WechatResponse OpenDeliveryRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenExpressApiPreAddOrderResponse PreAddOrderAsync(WechatWxOpenExpressApiPreAddOrderRequest request)
-  - POST /cgi-bin/express/local/business/order/pre_add
 
 - async WechatResponse PreAddOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenExpressApiPreCancelOrderResponse PreCancelOrderAsync(WechatWxOpenExpressApiPreCancelOrderRequest request)
-  - POST /cgi-bin/express/local/business/order/precancel
 
 - async WechatResponse PreCancelOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenExpressApiAddOrderResponse AddOrderAsync(WechatWxOpenExpressApiAddOrderRequest request)
-  - POST /cgi-bin/express/local/business/order/add
 
 - async WechatResponse AddOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenExpressApiCancelOrderResponse CancelOrderAsync(WechatWxOpenExpressApiCancelOrderRequest request)
-  - POST /cgi-bin/express/local/business/order/cancel
 
 - async WechatResponse CancelOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenExpressApiReOrderResponse ReOrderAsync(WechatWxOpenExpressApiReOrderRequest request)
-  - POST /cgi-bin/express/local/business/order/readd
 
 - async WechatResponse ReOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenExpressApiGetOrderResponse GetOrderAsync(WechatWxOpenExpressApiGetOrderRequest request)
-  - POST /cgi-bin/express/local/business/order/get
 
 - async WechatResponse GetOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenExpressApiAddTipResponse AddTipAsync(WechatWxOpenExpressApiAddTipRequest request)
-  - POST /cgi-bin/express/local/business/order/addtips
 
 - async WechatResponse AddTipRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenExpressApiAbnormalConfirmResponse AbnormalConfirmAsync(WechatWxOpenExpressApiAbnormalConfirmRequest request)
-  - POST /cgi-bin/express/local/business/order/confirm_return
 
 - async WechatResponse AbnormalConfirmRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenExpressApiRealMockUpdateOrderResponse RealMockUpdateOrderAsync(WechatWxOpenExpressApiRealMockUpdateOrderRequest request)
-  - POST /cgi-bin/express/local/business/realmock_update_order
 
 - async WechatResponse RealMockUpdateOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenExpressApiMockUpdateOrderResponse MockUpdateOrderAsync(WechatWxOpenExpressApiMockUpdateOrderRequest request)
-  - POST /cgi-bin/express/local/business/test_update_order
 
 - async WechatResponse MockUpdateOrderRawAsync(string query, string jsonBody)
 
@@ -3027,8 +2834,6 @@ Express/ExpressApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenExpressApiGetAllImmeDeliveryResponse (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - public string Raw;
 
@@ -3239,28 +3044,20 @@ Express/ExpressApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenFaceApi (class)
 
-Face/FaceApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenFaceApi(WechatWxOpenClient client)
 
 - async WechatWxOpenFaceApiGetVerifyIdResponse GetVerifyIdAsync(WechatWxOpenFaceApiGetVerifyIdRequest request)
-  - POST /cityservice/face/identify/getverifyid
 
 - async WechatResponse GetVerifyIdRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenFaceApiQueryVerifyInfoResponse QueryVerifyInfoAsync(WechatWxOpenFaceApiQueryVerifyInfoRequest request)
-  - POST /cityservice/face/identify/queryverifyinfo
 
 - async WechatResponse QueryVerifyInfoRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenFaceApiGetVerifyIdRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -3308,23 +3105,16 @@ Face/FaceApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenHardwareDeviceApi (class)
 
-HardwareDevice/HardwareDeviceApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenHardwareDeviceApi(WechatWxOpenClient client)
 
 - async WechatWxOpenHardwareDeviceApiSendDeviceMessageResponse SendDeviceMessageAsync(WechatWxOpenHardwareDeviceApiSendDeviceMessageRequest request)
-  - POST /cgi-bin/message/device/subscribe/send
 
 - async WechatResponse SendDeviceMessageRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenHardwareDeviceApiSendDeviceMessageRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -3360,81 +3150,63 @@ HardwareDevice/HardwareDeviceApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenImmediateDeliveryApi (class)
 
-ImmediateDelivery/ImmediateDeliveryApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenImmediateDeliveryApi(WechatWxOpenClient client)
 
 - async WechatWxOpenImmediateDeliveryApiGetAllDeliveryCompaniesResponse GetAllDeliveryCompaniesAsync()
-  - POST /cgi-bin/express/local/business/delivery/getall
 
 - async WechatResponse GetAllDeliveryCompaniesRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenImmediateDeliveryApiPreAddOrderResponse PreAddOrderAsync(WechatWxOpenImmediateDeliveryApiPreAddOrderRequest request)
-  - POST /cgi-bin/express/local/business/order/pre_add
 
 - async WechatResponse PreAddOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenImmediateDeliveryApiGetBoundAccountsResponse GetBoundAccountsAsync()
-  - POST /cgi-bin/express/local/business/shop/get
 
 - async WechatResponse GetBoundAccountsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenImmediateDeliveryApiPreCancelOrderResponse PreCancelOrderAsync(WechatWxOpenImmediateDeliveryApiPreCancelOrderRequest request)
-  - POST /cgi-bin/express/local/business/order/precancel
 
 - async WechatResponse PreCancelOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenImmediateDeliveryApiOpenDeliveryResponse OpenDeliveryAsync()
-  - POST /cgi-bin/express/local/business/open
 
 - async WechatResponse OpenDeliveryRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenImmediateDeliveryApiBindAccountResponse BindAccountAsync(WechatWxOpenImmediateDeliveryApiBindAccountRequest request)
-  - POST /cgi-bin/express/local/business/shop/add
 
 - async WechatResponse BindAccountRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenImmediateDeliveryApiReAddOrderResponse ReAddOrderAsync(WechatWxOpenImmediateDeliveryApiReAddOrderRequest request)
-  - POST /cgi-bin/express/local/business/order/readd
 
 - async WechatResponse ReAddOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenImmediateDeliveryApiRealMockUpdateOrderResponse RealMockUpdateOrderAsync(WechatWxOpenImmediateDeliveryApiRealMockUpdateOrderRequest request)
-  - POST /cgi-bin/express/local/business/realmock_update_order
 
 - async WechatResponse RealMockUpdateOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenImmediateDeliveryApiMockUpdateOrderResponse MockUpdateOrderAsync(WechatWxOpenImmediateDeliveryApiMockUpdateOrderRequest request)
-  - POST /cgi-bin/express/local/business/test_update_order
 
 - async WechatResponse MockUpdateOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenImmediateDeliveryApiGetOrderResponse GetOrderAsync(WechatWxOpenImmediateDeliveryApiGetOrderRequest request)
-  - POST /cgi-bin/express/local/business/order/get
 
 - async WechatResponse GetOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenImmediateDeliveryApiConfirmReturnResponse ConfirmReturnAsync(WechatWxOpenImmediateDeliveryApiConfirmReturnRequest request)
-  - POST /cgi-bin/express/local/business/order/confirm_return
 
 - async WechatResponse ConfirmReturnRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenImmediateDeliveryApiCancelOrderResponse CancelOrderAsync(WechatWxOpenImmediateDeliveryApiCancelOrderRequest request)
-  - POST /cgi-bin/express/local/business/order/cancel
 
 - async WechatResponse CancelOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenImmediateDeliveryApiAddTipsResponse AddTipsAsync(WechatWxOpenImmediateDeliveryApiAddTipsRequest request)
-  - POST /cgi-bin/express/local/business/order/addtips
 
 - async WechatResponse AddTipsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenImmediateDeliveryApiAddOrderResponse AddOrderAsync(WechatWxOpenImmediateDeliveryApiAddOrderRequest request)
-  - POST /cgi-bin/express/local/business/order/add
 
 - async WechatResponse AddOrderRawAsync(string query, string jsonBody)
 
@@ -3590,8 +3362,6 @@ ImmediateDelivery/ImmediateDeliveryApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenImmediateDeliveryApiGetAllDeliveryCompaniesResponse (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - public string Raw;
 
@@ -3802,23 +3572,16 @@ ImmediateDelivery/ImmediateDeliveryApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenImmediateDeliveryProviderApi (class)
 
-ImmediateDelivery/ImmediateDeliveryProviderApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenImmediateDeliveryProviderApi(WechatWxOpenClient client)
 
 - async WechatWxOpenImmediateDeliveryProviderApiUpdateOrderStatusResponse UpdateOrderStatusAsync(WechatWxOpenImmediateDeliveryProviderApiUpdateOrderStatusRequest request)
-  - POST /cgi-bin/express/local/delivery/update_order
 
 - async WechatResponse UpdateOrderStatusRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenImmediateDeliveryProviderApiUpdateOrderStatusRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -3858,141 +3621,111 @@ ImmediateDelivery/ImmediateDeliveryProviderApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenLiveBroadcastApi (class)
 
-LiveBroadcast/LiveBroadcastApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenLiveBroadcastApi(WechatWxOpenClient client)
 
 - async WechatWxOpenLiveBroadcastApiCreateRoomResponse CreateRoomAsync(WechatWxOpenLiveBroadcastApiCreateRoomRequest request)
-  - POST /wxaapi/broadcast/room/create
 
 - async WechatResponse CreateRoomRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiGetLiveInfoResponse GetLiveInfoAsync(WechatWxOpenLiveBroadcastApiGetLiveInfoRequest request)
-  - POST /wxa/business/getliveinfo
 
 - async WechatResponse GetLiveInfoRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiDeleteRoomResponse DeleteRoomAsync(WechatWxOpenLiveBroadcastApiDeleteRoomRequest request)
-  - POST /wxaapi/broadcast/room/deleteroom
 
 - async WechatResponse DeleteRoomRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiImportGoodsResponse ImportGoodsAsync(WechatWxOpenLiveBroadcastApiImportGoodsRequest request)
-  - POST /wxaapi/broadcast/room/addgoods
 
 - async WechatResponse ImportGoodsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiEditRoomResponse EditRoomAsync(WechatWxOpenLiveBroadcastApiEditRoomRequest request)
-  - POST /wxaapi/broadcast/room/editroom
 
 - async WechatResponse EditRoomRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiGetPushUrlResponse GetPushUrlAsync(WechatWxOpenLiveBroadcastApiGetPushUrlRequest request)
-  - GET /wxaapi/broadcast/room/getpushurl
 
 - async WechatResponse GetPushUrlRawAsync(string query)
 
 - async WechatWxOpenLiveBroadcastApiGetSharedCodeResponse GetSharedCodeAsync(WechatWxOpenLiveBroadcastApiGetSharedCodeRequest request)
-  - GET /wxaapi/broadcast/room/getsharedcode
 
 - async WechatResponse GetSharedCodeRawAsync(string query)
 
 - async WechatWxOpenLiveBroadcastApiGetSubAnchorResponse GetSubAnchorAsync(WechatWxOpenLiveBroadcastApiGetSubAnchorRequest request)
-  - GET /wxaapi/broadcast/room/getsubanchor
 
 - async WechatResponse GetSubAnchorRawAsync(string query)
 
 - async WechatWxOpenLiveBroadcastApiModifySubAnchorResponse ModifySubAnchorAsync(WechatWxOpenLiveBroadcastApiModifySubAnchorRequest request)
-  - POST /wxaapi/broadcast/room/modifysubanchor
 
 - async WechatResponse ModifySubAnchorRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiDeleteSubAnchorResponse DeleteSubAnchorAsync(WechatWxOpenLiveBroadcastApiDeleteSubAnchorRequest request)
-  - POST /wxaapi/broadcast/room/deletesubanchor
 
 - async WechatResponse DeleteSubAnchorRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiAddSubAnchorResponse AddSubAnchorAsync(WechatWxOpenLiveBroadcastApiAddSubAnchorRequest request)
-  - POST /wxaapi/broadcast/room/addsubanchor
 
 - async WechatResponse AddSubAnchorRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiDeleteRoomGoodsResponse DeleteRoomGoodsAsync(WechatWxOpenLiveBroadcastApiDeleteRoomGoodsRequest request)
-  - POST /wxaapi/broadcast/goods/deleteInRoom
 
 - async WechatResponse DeleteRoomGoodsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiPushGoodsResponse PushGoodsAsync(WechatWxOpenLiveBroadcastApiPushGoodsRequest request)
-  - POST /wxaapi/broadcast/goods/push
 
 - async WechatResponse PushGoodsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiSetGoodsOnSaleResponse SetGoodsOnSaleAsync(WechatWxOpenLiveBroadcastApiSetGoodsOnSaleRequest request)
-  - POST /wxaapi/broadcast/goods/onsale
 
 - async WechatResponse SetGoodsOnSaleRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiSortRoomGoodsResponse SortRoomGoodsAsync(WechatWxOpenLiveBroadcastApiSortRoomGoodsRequest request)
-  - POST /wxaapi/broadcast/goods/sort
 
 - async WechatResponse SortRoomGoodsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiModifyAssistantResponse ModifyAssistantAsync(WechatWxOpenLiveBroadcastApiModifyAssistantRequest request)
-  - POST /wxaapi/broadcast/room/modifyassistant
 
 - async WechatResponse ModifyAssistantRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiGetAssistantListResponse GetAssistantListAsync(WechatWxOpenLiveBroadcastApiGetAssistantListRequest request)
-  - GET /wxaapi/broadcast/room/getassistantlist
 
 - async WechatResponse GetAssistantListRawAsync(string query)
 
 - async WechatWxOpenLiveBroadcastApiRemoveAssistantResponse RemoveAssistantAsync(WechatWxOpenLiveBroadcastApiRemoveAssistantRequest request)
-  - POST /wxaapi/broadcast/room/removeassistant
 
 - async WechatResponse RemoveAssistantRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiAddAssistantsResponse AddAssistantsAsync(WechatWxOpenLiveBroadcastApiAddAssistantsRequest request)
-  - POST /wxaapi/broadcast/room/addassistant
 
 - async WechatResponse AddAssistantsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiUpdateCommentResponse UpdateCommentAsync(WechatWxOpenLiveBroadcastApiUpdateCommentRequest request)
-  - POST /wxaapi/broadcast/room/updatecomment
 
 - async WechatResponse UpdateCommentRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiUpdateFeedPublicResponse UpdateFeedPublicAsync(WechatWxOpenLiveBroadcastApiUpdateFeedPublicRequest request)
-  - POST /wxaapi/broadcast/room/updatefeedpublic
 
 - async WechatResponse UpdateFeedPublicRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiUpdateCustomerServiceResponse UpdateCustomerServiceAsync(WechatWxOpenLiveBroadcastApiUpdateCustomerServiceRequest request)
-  - POST /wxaapi/broadcast/room/updatekf
 
 - async WechatResponse UpdateCustomerServiceRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiUpdateReplayResponse UpdateReplayAsync(WechatWxOpenLiveBroadcastApiUpdateReplayRequest request)
-  - POST /wxaapi/broadcast/room/updatereplay
 
 - async WechatResponse UpdateReplayRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiGetGoodsVideoResponse GetGoodsVideoAsync(WechatWxOpenLiveBroadcastApiGetGoodsVideoRequest request)
-  - POST /wxaapi/broadcast/goods/getVideo
 
 - async WechatResponse GetGoodsVideoRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiSetDefaultGoodsKeyResponse SetDefaultGoodsKeyAsync(WechatWxOpenLiveBroadcastApiSetDefaultGoodsKeyRequest request)
-  - POST /wxaapi/broadcast/goods/setkey
 
 - async WechatResponse SetDefaultGoodsKeyRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastApiGetDefaultGoodsKeyResponse GetDefaultGoodsKeyAsync()
-  - GET /wxaapi/broadcast/goods/getkey
 
 - async WechatResponse GetDefaultGoodsKeyRawAsync(string query)
 
@@ -4042,8 +3775,6 @@ LiveBroadcast/LiveBroadcastApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenLiveBroadcastApiCreateRoomRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -4598,53 +4329,40 @@ LiveBroadcast/LiveBroadcastApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenLiveBroadcastGoodsApi (class)
 
-LiveBroadcast/LiveBroadcastGoodsApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenLiveBroadcastGoodsApi(WechatWxOpenClient client)
 
 - async WechatWxOpenLiveBroadcastGoodsApiAddGoodsResponse AddGoodsAsync(WechatWxOpenLiveBroadcastGoodsApiAddGoodsRequest request)
-  - POST /wxaapi/broadcast/goods/add
 
 - async WechatResponse AddGoodsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastGoodsApiResubmitGoodsAuditResponse ResubmitGoodsAuditAsync(WechatWxOpenLiveBroadcastGoodsApiResubmitGoodsAuditRequest request)
-  - POST /wxaapi/broadcast/goods/audit
 
 - async WechatResponse ResubmitGoodsAuditRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastGoodsApiGetGoodsWarehouseResponse GetGoodsWarehouseAsync(WechatWxOpenLiveBroadcastGoodsApiGetGoodsWarehouseRequest request)
-  - POST /wxa/business/getgoodswarehouse
 
 - async WechatResponse GetGoodsWarehouseRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastGoodsApiResetGoodsAuditResponse ResetGoodsAuditAsync(WechatWxOpenLiveBroadcastGoodsApiResetGoodsAuditRequest request)
-  - POST /wxaapi/broadcast/goods/resetaudit
 
 - async WechatResponse ResetGoodsAuditRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastGoodsApiUpdateGoodsResponse UpdateGoodsAsync(WechatWxOpenLiveBroadcastGoodsApiUpdateGoodsRequest request)
-  - POST /wxaapi/broadcast/goods/update
 
 - async WechatResponse UpdateGoodsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastGoodsApiGetApprovedGoodsResponse GetApprovedGoodsAsync(WechatWxOpenLiveBroadcastGoodsApiGetApprovedGoodsRequest request)
-  - GET /wxaapi/broadcast/goods/getapproved
 
 - async WechatResponse GetApprovedGoodsRawAsync(string query)
 
 - async WechatWxOpenLiveBroadcastGoodsApiDeleteGoodsResponse DeleteGoodsAsync(WechatWxOpenLiveBroadcastGoodsApiDeleteGoodsRequest request)
-  - POST /wxaapi/broadcast/goods/delete
 
 - async WechatResponse DeleteGoodsRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenLiveBroadcastGoodsApiAddGoodsRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -4784,43 +4502,32 @@ LiveBroadcast/LiveBroadcastGoodsApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenLiveBroadcastRoleSubscriptionApi (class)
 
-LiveBroadcast/LiveBroadcastRoleSubscriptionApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenLiveBroadcastRoleSubscriptionApi(WechatWxOpenClient client)
 
 - async WechatWxOpenLiveBroadcastRoleSubscriptionApiAddRoleResponse AddRoleAsync(WechatWxOpenLiveBroadcastRoleSubscriptionApiAddRoleRequest request)
-  - POST /wxaapi/broadcast/role/addrole
 
 - async WechatResponse AddRoleRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastRoleSubscriptionApiDeleteRoleResponse DeleteRoleAsync(WechatWxOpenLiveBroadcastRoleSubscriptionApiDeleteRoleRequest request)
-  - POST /wxaapi/broadcast/role/deleterole
 
 - async WechatResponse DeleteRoleRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastRoleSubscriptionApiGetRoleListResponse GetRoleListAsync(WechatWxOpenLiveBroadcastRoleSubscriptionApiGetRoleListRequest request)
-  - GET /wxaapi/broadcast/role/getrolelist
 
 - async WechatResponse GetRoleListRawAsync(string query)
 
 - async WechatWxOpenLiveBroadcastRoleSubscriptionApiPushLiveStartMessageResponse PushLiveStartMessageAsync(WechatWxOpenLiveBroadcastRoleSubscriptionApiPushLiveStartMessageRequest request)
-  - POST /wxa/business/push_message
 
 - async WechatResponse PushLiveStartMessageRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenLiveBroadcastRoleSubscriptionApiGetFollowersResponse GetFollowersAsync(WechatWxOpenLiveBroadcastRoleSubscriptionApiGetFollowersRequest request)
-  - POST /wxa/business/get_wxa_followers
 
 - async WechatResponse GetFollowersRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenLiveBroadcastRoleSubscriptionApiAddRoleRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -4926,21 +4633,15 @@ LiveBroadcast/LiveBroadcastRoleSubscriptionApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenMessageApi (class)
 
-Message/MessageApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenMessageApi(WechatWxOpenClient client)
 
 - async WechatWxOpenMessageApiSendSubscribeResponse SendSubscribeAsync(WechatWxOpenMessageApiSendSubscribeRequest request)
-  - POST /cgi-bin/message/subscribe/send
 
 - async WechatResponse SendSubscribeRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMessageApiSendEmployeeRelationMessageResponse SendEmployeeRelationMessageAsync(WechatWxOpenMessageApiSendEmployeeRelationMessageRequest request)
-  - POST /cgi-bin/message/wxopen/employeerelationmsg/send
 
 - async WechatResponse SendEmployeeRelationMessageRawAsync(string query, string jsonBody)
 
@@ -4973,8 +4674,6 @@ Message/MessageApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenMessageApiSendSubscribeRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenMessageApiSendSubscribeRequest()
@@ -5005,26 +4704,19 @@ Message/MessageApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenMessageServiceCardApi (class)
 
-Message/ServiceCardApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenMessageServiceCardApi(WechatWxOpenClient client)
 
 - async WechatWxOpenMessageServiceCardApiSetUserNotifyResponse SetUserNotifyAsync(WechatWxOpenMessageServiceCardApiSetUserNotifyRequest request)
-  - POST /wxa/set_user_notify
 
 - async WechatResponse SetUserNotifyRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMessageServiceCardApiSetUserNotifyExtResponse SetUserNotifyExtAsync(WechatWxOpenMessageServiceCardApiSetUserNotifyExtRequest request)
-  - POST /wxa/set_user_notifyext
 
 - async WechatResponse SetUserNotifyExtRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMessageServiceCardApiGetUserNotifyResponse GetUserNotifyAsync(WechatWxOpenMessageServiceCardApiGetUserNotifyRequest request)
-  - POST /wxa/get_user_notify
 
 - async WechatResponse GetUserNotifyRawAsync(string query, string jsonBody)
 
@@ -5079,8 +4771,6 @@ Message/ServiceCardApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenMessageServiceCardApiSetUserNotifyRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenMessageServiceCardApiSetUserNotifyRequest()
@@ -5109,33 +4799,24 @@ Message/ServiceCardApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenMessageUpdatableMessageApi (class)
 
-Message/UpdatableMessageApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenMessageUpdatableMessageApi(WechatWxOpenClient client)
 
 - async WechatWxOpenMessageUpdatableMessageApiCreateActivityIdResponse CreateActivityIdAsync(WechatWxOpenMessageUpdatableMessageApiCreateActivityIdRequest request)
-  - GET /cgi-bin/message/wxopen/activityid/create
 
 - async WechatResponse CreateActivityIdRawAsync(string query)
 
 - async WechatWxOpenMessageUpdatableMessageApiSetUpdatableMessageResponse SetUpdatableMessageAsync(WechatWxOpenMessageUpdatableMessageApiSetUpdatableMessageRequest request)
-  - POST /cgi-bin/message/wxopen/updatablemsg/send
 
 - async WechatResponse SetUpdatableMessageRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMessageUpdatableMessageApiSetChatToolMessageResponse SetChatToolMessageAsync(WechatWxOpenMessageUpdatableMessageApiSetChatToolMessageRequest request)
-  - POST /cgi-bin/message/wxopen/chattoolmsg/send
 
 - async WechatResponse SetChatToolMessageRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenMessageUpdatableMessageApiCreateActivityIdRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -5209,51 +4890,39 @@ Message/UpdatableMessageApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenMiniDramaApi (class)
 
-MiniDrama/MiniDramaApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenMiniDramaApi(WechatWxOpenClient client)
 
 - async WechatWxOpenMiniDramaApiPullUploadResponse PullUploadAsync(WechatWxOpenMiniDramaApiPullUploadRequest request)
-  - POST /wxa/sec/vod/pullupload
 
 - async WechatResponse PullUploadRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaApiGetTaskResponse GetTaskAsync(WechatWxOpenMiniDramaApiGetTaskRequest request)
-  - POST /wxa/sec/vod/gettask
 
 - async WechatResponse GetTaskRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaApiApplyUploadResponse ApplyUploadAsync(WechatWxOpenMiniDramaApiApplyUploadRequest request)
-  - POST /wxa/sec/vod/applyupload
 
 - async WechatResponse ApplyUploadRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaApiCommitUploadResponse CommitUploadAsync(WechatWxOpenMiniDramaApiCommitUploadRequest request)
-  - POST /wxa/sec/vod/commitupload
 
 - async WechatResponse CommitUploadRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaApiListMediaResponse ListMediaAsync(WechatWxOpenMiniDramaApiListMediaRequest request)
-  - POST /wxa/sec/vod/listmedia
 
 - async WechatResponse ListMediaRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaApiGetMediaResponse GetMediaAsync(WechatWxOpenMiniDramaApiGetMediaRequest request)
-  - POST /wxa/sec/vod/getmedia
 
 - async WechatResponse GetMediaRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaApiGetMediaLinkResponse GetMediaLinkAsync(WechatWxOpenMiniDramaApiGetMediaLinkRequest request)
-  - POST /wxa/sec/vod/getmedialink
 
 - async WechatResponse GetMediaLinkRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaApiDeleteMediaResponse DeleteMediaAsync(WechatWxOpenMiniDramaApiDeleteMediaRequest request)
-  - POST /wxa/sec/vod/deletemedia
 
 - async WechatResponse DeleteMediaRawAsync(string query, string jsonBody)
 
@@ -5422,8 +5091,6 @@ MiniDrama/MiniDramaApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenMiniDramaApiPullUploadRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenMiniDramaApiPullUploadRequest()
@@ -5448,68 +5115,52 @@ MiniDrama/MiniDramaApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenMiniDramaAuditApi (class)
 
-MiniDrama/MiniDramaAuditApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenMiniDramaAuditApi(WechatWxOpenClient client)
 
 - async WechatWxOpenMiniDramaAuditApiAuditDramaResponse AuditDramaAsync(WechatWxOpenMiniDramaAuditApiAuditDramaRequest request)
-  - POST /wxa/sec/vod/auditdrama
 
 - async WechatResponse AuditDramaRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuditApiListDramasResponse ListDramasAsync(WechatWxOpenMiniDramaAuditApiListDramasRequest request)
-  - POST /wxa/sec/vod/listdramas
 
 - async WechatResponse ListDramasRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuditApiGetDramaResponse GetDramaAsync(WechatWxOpenMiniDramaAuditApiGetDramaRequest request)
-  - POST /wxa/sec/vod/getdrama
 
 - async WechatResponse GetDramaRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuditApiSubmitReplaceDramaMediasResponse SubmitReplaceDramaMediasAsync(WechatWxOpenMiniDramaAuditApiSubmitReplaceDramaMediasRequest request)
-  - POST /wxa/sec/vod/submitreplacedramamedias
 
 - async WechatResponse SubmitReplaceDramaMediasRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuditApiReplaceDramaMediaResponse ReplaceDramaMediaAsync(WechatWxOpenMiniDramaAuditApiReplaceDramaMediaRequest request)
-  - POST /wxa/sec/vod/replacedramamedia
 
 - async WechatResponse ReplaceDramaMediaRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuditApiModifyDramaBasicInfoResponse ModifyDramaBasicInfoAsync(WechatWxOpenMiniDramaAuditApiModifyDramaBasicInfoRequest request)
-  - POST /wxa/sec/vod/modifydramabasicinfo
 
 - async WechatResponse ModifyDramaBasicInfoRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuditApiGetDramaLatestAuditInfoResponse GetDramaLatestAuditInfoAsync(WechatWxOpenMiniDramaAuditApiGetDramaLatestAuditInfoRequest request)
-  - POST /wxa/sec/vod/getdramalatestauditinfo
 
 - async WechatResponse GetDramaLatestAuditInfoRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuditApiGetCdnUsageDataResponse GetCdnUsageDataAsync(WechatWxOpenMiniDramaAuditApiGetCdnUsageDataRequest request)
-  - POST /wxa/sec/vod/getcdnusagedata
 
 - async WechatResponse GetCdnUsageDataRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuditApiGetCdnLogsResponse GetCdnLogsAsync(WechatWxOpenMiniDramaAuditApiGetCdnLogsRequest request)
-  - POST /wxa/sec/vod/getcdnlogs
 
 - async WechatResponse GetCdnLogsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuditApiListPackagesResponse ListPackagesAsync(WechatWxOpenMiniDramaAuditApiListPackagesRequest request)
-  - POST /wxa/sec/vod/listpackages
 
 - async WechatResponse ListPackagesRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenMiniDramaAuditApiAuditDramaRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -5801,66 +5452,51 @@ MiniDrama/MiniDramaAuditApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenMiniDramaAuthorizationApi (class)
 
-MiniDrama/MiniDramaAuthorizationApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenMiniDramaAuthorizationApi(WechatWxOpenClient client)
 
 - async WechatWxOpenMiniDramaAuthorizationApiGetAuthorizedObjectsResponse GetAuthorizedObjectsAsync(WechatWxOpenMiniDramaAuthorizationApiGetAuthorizedObjectsRequest request)
-  - POST /wxa/sec/vod/getauthorizedobjects
 
 - async WechatResponse GetAuthorizedObjectsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuthorizationApiAuthorizeDramaResponse AuthorizeDramaAsync(WechatWxOpenMiniDramaAuthorizationApiAuthorizeDramaRequest request)
-  - POST /wxa/sec/vod/authorizedrama
 
 - async WechatResponse AuthorizeDramaRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuthorizationApiDeauthorizeDramaResponse DeauthorizeDramaAsync(WechatWxOpenMiniDramaAuthorizationApiDeauthorizeDramaRequest request)
-  - POST /wxa/sec/vod/deauthorizedrama
 
 - async WechatResponse DeauthorizeDramaRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuthorizationApiGetAuthorizeObjectsResponse GetAuthorizeObjectsAsync(WechatWxOpenMiniDramaAuthorizationApiGetAuthorizeObjectsRequest request)
-  - POST /wxa/sec/vod/getauthorizeobjects
 
 - async WechatResponse GetAuthorizeObjectsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuthorizationApiAuthorizeAppResponse AuthorizeAppAsync(WechatWxOpenMiniDramaAuthorizationApiAuthorizeAppRequest request)
-  - POST /wxa/sec/vod/authorizeapp
 
 - async WechatResponse AuthorizeAppRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuthorizationApiDeauthorizeAppResponse DeauthorizeAppAsync(WechatWxOpenMiniDramaAuthorizationApiDeauthorizeAppRequest request)
-  - POST /wxa/sec/vod/deauthorizeapp
 
 - async WechatResponse DeauthorizeAppRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuthorizationApiGetAuthorizeAppsResponse GetAuthorizeAppsAsync()
-  - POST /wxa/sec/vod/getauthorizeapps
 
 - async WechatResponse GetAuthorizeAppsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuthorizationApiAuthorizeCopyrightResponse AuthorizeCopyrightAsync(WechatWxOpenMiniDramaAuthorizationApiAuthorizeCopyrightRequest request)
-  - POST /wxa/sec/vod/authorizecopyright
 
 - async WechatResponse AuthorizeCopyrightRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuthorizationApiDeauthorizeCopyrightResponse DeauthorizeCopyrightAsync(WechatWxOpenMiniDramaAuthorizationApiDeauthorizeCopyrightRequest request)
-  - POST /wxa/sec/vod/deauthorizecopyright
 
 - async WechatResponse DeauthorizeCopyrightRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuthorizationApiGetCopyrightAuthorizationListResponse GetCopyrightAuthorizationListAsync(WechatWxOpenMiniDramaAuthorizationApiGetCopyrightAuthorizationListRequest request)
-  - POST /wxa/sec/vod/getcopyrightauthorizationlist
 
 - async WechatResponse GetCopyrightAuthorizationListRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaAuthorizationApiGetCopyrightAuthorizedListResponse GetCopyrightAuthorizedListAsync(WechatWxOpenMiniDramaAuthorizationApiGetCopyrightAuthorizedListRequest request)
-  - POST /wxa/sec/vod/getcopyrightauthorizedlist
 
 - async WechatResponse GetCopyrightAuthorizedListRawAsync(string query, string jsonBody)
 
@@ -6030,8 +5666,6 @@ MiniDrama/MiniDramaAuthorizationApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenMiniDramaAuthorizationApiGetAuthorizedObjectsRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenMiniDramaAuthorizationApiGetAuthorizedObjectsRequest()
@@ -6104,56 +5738,43 @@ MiniDrama/MiniDramaAuthorizationApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenMiniDramaPlayerApi (class)
 
-MiniDrama/MiniDramaPlayerApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenMiniDramaPlayerApi(WechatWxOpenClient client)
 
 - async WechatWxOpenMiniDramaPlayerApiSetPlayerDramaRecommendedSwitchResponse SetPlayerDramaRecommendedSwitchAsync(WechatWxOpenMiniDramaPlayerApiSetPlayerDramaRecommendedSwitchRequest request)
-  - POST /wxadrama/setplayerdramarecmdswitch
 
 - async WechatResponse SetPlayerDramaRecommendedSwitchRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaPlayerApiSetFlushDramaResponse SetFlushDramaAsync(WechatWxOpenMiniDramaPlayerApiSetFlushDramaRequest request)
-  - POST /wxadrama/developersetflushdrama
 
 - async WechatResponse SetFlushDramaRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaPlayerApiSetRecommendedDramaResponse SetRecommendedDramaAsync(WechatWxOpenMiniDramaPlayerApiSetRecommendedDramaRequest request)
-  - POST /wxadrama/developersetrecmddrama
 
 - async WechatResponse SetRecommendedDramaRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaPlayerApiPublishDramaResponse PublishDramaAsync(WechatWxOpenMiniDramaPlayerApiPublishDramaRequest request)
-  - POST /wxadrama/developerpublishdrama
 
 - async WechatResponse PublishDramaRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaPlayerApiGetPublishedDramaResponse GetPublishedDramaAsync()
-  - POST /wxadrama/developergetpublisheddrama
 
 - async WechatResponse GetPublishedDramaRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaPlayerApiSetMonetizationResponse SetMonetizationAsync(WechatWxOpenMiniDramaPlayerApiSetMonetizationRequest request)
-  - POST /wxadrama/developersetiaadrama
 
 - async WechatResponse SetMonetizationRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaPlayerApiGetMonetizationResponse GetMonetizationAsync(WechatWxOpenMiniDramaPlayerApiGetMonetizationRequest request)
-  - POST /wxadrama/developergetiaadrama
 
 - async WechatResponse GetMonetizationRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaPlayerApiBatchProcessPromotionResponse BatchProcessPromotionAsync(WechatWxOpenMiniDramaPlayerApiBatchProcessPromotionRequest request)
-  - POST /wxadrama/batchprocessdramapromotion
 
 - async WechatResponse BatchProcessPromotionRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenMiniDramaPlayerApiGetFinderEventResponse GetFinderEventAsync(WechatWxOpenMiniDramaPlayerApiGetFinderEventRequest request)
-  - POST /wxadrama/getfinderevent
 
 - async WechatResponse GetFinderEventRawAsync(string query, string jsonBody)
 
@@ -6281,8 +5902,6 @@ MiniDrama/MiniDramaPlayerApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenMiniDramaPlayerApiSetPlayerDramaRecommendedSwitchRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenMiniDramaPlayerApiSetPlayerDramaRecommendedSwitchRequest()
@@ -6331,81 +5950,63 @@ MiniDrama/MiniDramaPlayerApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenNovelApi (class)
 
-Novel/NovelApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenNovelApi(WechatWxOpenClient client)
 
 - async WechatWxOpenNovelApiCreateBookResponse CreateBookAsync(WechatWxOpenNovelApiCreateBookRequest request)
-  - POST /wxa/book/createbook
 
 - async WechatResponse CreateBookRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelApiUpdateBookResponse UpdateBookAsync(WechatWxOpenNovelApiUpdateBookRequest request)
-  - POST /wxa/book/updatebook
 
 - async WechatResponse UpdateBookRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelApiDeleteBookResponse DeleteBookAsync(WechatWxOpenNovelApiDeleteBookRequest request)
-  - POST /wxa/book/deletebook
 
 - async WechatResponse DeleteBookRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelApiListBooksResponse ListBooksAsync(WechatWxOpenNovelApiListBooksRequest request)
-  - POST /wxa/book/listbook
 
 - async WechatResponse ListBooksRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelApiGetBookResponse GetBookAsync(WechatWxOpenNovelApiGetBookRequest request)
-  - POST /wxa/book/getbook
 
 - async WechatResponse GetBookRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelApiCreateChapterResponse CreateChapterAsync(WechatWxOpenNovelApiCreateChapterRequest request)
-  - POST /wxa/book/createchapter
 
 - async WechatResponse CreateChapterRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelApiBatchCreateChaptersResponse BatchCreateChaptersAsync(WechatWxOpenNovelApiBatchCreateChaptersRequest request)
-  - POST /wxa/book/batchcreatechapter
 
 - async WechatResponse BatchCreateChaptersRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelApiDeleteChapterResponse DeleteChapterAsync(WechatWxOpenNovelApiDeleteChapterRequest request)
-  - POST /wxa/book/deletechapter
 
 - async WechatResponse DeleteChapterRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelApiReplaceChapterResponse ReplaceChapterAsync(WechatWxOpenNovelApiReplaceChapterRequest request)
-  - POST /wxa/book/replacechapter
 
 - async WechatResponse ReplaceChapterRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelApiListChaptersResponse ListChaptersAsync(WechatWxOpenNovelApiListChaptersRequest request)
-  - POST /wxa/book/listchapter
 
 - async WechatResponse ListChaptersRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelApiGetChapterResponse GetChapterAsync(WechatWxOpenNovelApiGetChapterRequest request)
-  - POST /wxa/book/getchapter
 
 - async WechatResponse GetChapterRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelApiReorderChapterResponse ReorderChapterAsync(WechatWxOpenNovelApiReorderChapterRequest request)
-  - POST /wxa/book/reorderchapter
 
 - async WechatResponse ReorderChapterRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelApiUpdateChapterSequenceResponse UpdateChapterSequenceAsync(WechatWxOpenNovelApiUpdateChapterSequenceRequest request)
-  - POST /wxa/book/updatechapterseq
 
 - async WechatResponse UpdateChapterSequenceRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelApiAuditBookResponse AuditBookAsync(WechatWxOpenNovelApiAuditBookRequest request)
-  - POST /wxa/book/auditbook
 
 - async WechatResponse AuditBookRawAsync(string query, string jsonBody)
 
@@ -6451,8 +6052,6 @@ Novel/NovelApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenNovelApiCreateBookRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -6776,41 +6375,31 @@ Novel/NovelApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenNovelAuthorizationApi (class)
 
-Novel/NovelAuthorizationApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenNovelAuthorizationApi(WechatWxOpenClient client)
 
 - async WechatWxOpenNovelAuthorizationApiAddBookAuthorizationResponse AddBookAuthorizationAsync(WechatWxOpenNovelAuthorizationApiAddBookAuthorizationRequest request)
-  - POST /wxa/book/addbookauth
 
 - async WechatResponse AddBookAuthorizationRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelAuthorizationApiQueryBookAuthorizationResponse QueryBookAuthorizationAsync(WechatWxOpenNovelAuthorizationApiQueryBookAuthorizationRequest request)
-  - POST /wxa/book/querybookauth
 
 - async WechatResponse QueryBookAuthorizationRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelAuthorizationApiDeleteBookAuthorizationResponse DeleteBookAuthorizationAsync(WechatWxOpenNovelAuthorizationApiDeleteBookAuthorizationRequest request)
-  - POST /wxa/book/delbookauth
 
 - async WechatResponse DeleteBookAuthorizationRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelAuthorizationApiAddAppAuthorizationResponse AddAppAuthorizationAsync(WechatWxOpenNovelAuthorizationApiAddAppAuthorizationRequest request)
-  - POST /wxa/book/addbookauthbyappid
 
 - async WechatResponse AddAppAuthorizationRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelAuthorizationApiQueryAppAuthorizationResponse QueryAppAuthorizationAsync(WechatWxOpenNovelAuthorizationApiQueryAppAuthorizationRequest request)
-  - POST /wxa/book/querybookauthv2
 
 - async WechatResponse QueryAppAuthorizationRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelAuthorizationApiDeleteAppAuthorizationResponse DeleteAppAuthorizationAsync(WechatWxOpenNovelAuthorizationApiDeleteAppAuthorizationRequest request)
-  - POST /wxa/book/delbookauthbyappid
 
 - async WechatResponse DeleteAppAuthorizationRawAsync(string query, string jsonBody)
 
@@ -6834,8 +6423,6 @@ Novel/NovelAuthorizationApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenNovelAuthorizationApiAddBookAuthorizationRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -6949,26 +6536,19 @@ Novel/NovelAuthorizationApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenNovelReaderApi (class)
 
-Novel/NovelReaderApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenNovelReaderApi(WechatWxOpenClient client)
 
 - async WechatWxOpenNovelReaderApiSetPreviewSettingResponse SetPreviewSettingAsync(WechatWxOpenNovelReaderApiSetPreviewSettingRequest request)
-  - POST /wxa/business/novelreader/setpreviewsetting
 
 - async WechatResponse SetPreviewSettingRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelReaderApiGetPreviewSettingResponse GetPreviewSettingAsync(WechatWxOpenNovelReaderApiGetPreviewSettingRequest request)
-  - POST /wxa/business/novelreader/getpreviewsetting
 
 - async WechatResponse GetPreviewSettingRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenNovelReaderApiSetRecommendedNovelsResponse SetRecommendedNovelsAsync(WechatWxOpenNovelReaderApiSetRecommendedNovelsRequest request)
-  - POST /wxa/business/novelreader/setrecmdnovel
 
 - async WechatResponse SetRecommendedNovelsRawAsync(string query, string jsonBody)
 
@@ -6992,8 +6572,6 @@ Novel/NovelReaderApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenNovelReaderApiSetPreviewSettingRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -7037,58 +6615,44 @@ Novel/NovelReaderApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenOperationApi (class)
 
-Operation/OperationApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenOperationApi(WechatWxOpenClient client)
 
 - async WechatWxOpenOperationApiGetDomainInfoResponse GetDomainInfoAsync(WechatWxOpenOperationApiGetDomainInfoRequest request)
-  - POST /wxa/getwxadevinfo
 
 - async WechatResponse GetDomainInfoRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenOperationApiGetPerformanceResponse GetPerformanceAsync(WechatWxOpenOperationApiGetPerformanceRequest request)
-  - POST /wxaapi/log/get_performance
 
 - async WechatResponse GetPerformanceRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenOperationApiGetSceneListResponse GetSceneListAsync()
-  - GET /wxaapi/log/get_scene
 
 - async WechatResponse GetSceneListRawAsync(string query)
 
 - async WechatWxOpenOperationApiGetVersionListResponse GetVersionListAsync()
-  - GET /wxaapi/log/get_client_version
 
 - async WechatResponse GetVersionListRawAsync(string query)
 
 - async WechatWxOpenOperationApiRealTimeLogSearchResponse RealTimeLogSearchAsync(WechatWxOpenOperationApiRealTimeLogSearchRequest request)
-  - GET /wxaapi/userlog/userlog_search
 
 - async WechatResponse RealTimeLogSearchRawAsync(string query)
 
 - async WechatWxOpenOperationApiGetFeedbackResponse GetFeedbackAsync(WechatWxOpenOperationApiGetFeedbackRequest request)
-  - GET /wxaapi/feedback/list
 
 - async WechatResponse GetFeedbackRawAsync(string query)
 
 - async WechatWxOpenOperationApiGetJsErrDetailResponse GetJsErrDetailAsync(WechatWxOpenOperationApiGetJsErrDetailRequest request)
-  - POST /wxaapi/log/jserr_detail
 
 - async WechatResponse GetJsErrDetailRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenOperationApiGetJsErrListResponse GetJsErrListAsync(WechatWxOpenOperationApiGetJsErrListRequest request)
-  - POST /wxaapi/log/jserr_list
 
 - async WechatResponse GetJsErrListRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenOperationApiGetDomainInfoRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -7282,36 +6846,27 @@ Operation/OperationApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenQrCodeJumpApi (class)
 
-QrCodeJump/QrCodeJumpApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenQrCodeJumpApi(WechatWxOpenClient client)
 
 - async WechatWxOpenQrCodeJumpApiGetResponse GetAsync()
-  - POST /cgi-bin/wxopen/qrcodejumpget
 
 - async WechatResponse GetRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenQrCodeJumpApiDownloadResponse DownloadAsync()
-  - POST /cgi-bin/wxopen/qrcodejumpdownload
 
 - async WechatResponse DownloadRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenQrCodeJumpApiAddResponse AddAsync(WechatWxOpenQrCodeJumpApiAddRequest request)
-  - POST /cgi-bin/wxopen/qrcodejumpadd
 
 - async WechatResponse AddRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenQrCodeJumpApiPublishResponse PublishAsync(WechatWxOpenQrCodeJumpApiPublishRequest request)
-  - POST /cgi-bin/wxopen/qrcodejumppublish
 
 - async WechatResponse PublishRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenQrCodeJumpApiDeleteResponse DeleteAsync(WechatWxOpenQrCodeJumpApiDeleteRequest request)
-  - POST /cgi-bin/wxopen/qrcodejumpdelete
 
 - async WechatResponse DeleteRawAsync(string query, string jsonBody)
 
@@ -7373,8 +6928,6 @@ QrCodeJump/QrCodeJumpApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenQrCodeJumpApiGetResponse (class)
 
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
-
 - public string Raw;
 
 
@@ -7400,23 +6953,16 @@ QrCodeJump/QrCodeJumpApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenRedPacketCoverApi (class)
 
-RedPacketCover/RedPacketCoverApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenRedPacketCoverApi(WechatWxOpenClient client)
 
 - async WechatWxOpenRedPacketCoverApiGetCoverUrlResponse GetCoverUrlAsync(WechatWxOpenRedPacketCoverApiGetCoverUrlRequest request)
-  - POST /redpacketcover/wxapp/cover_url/get_by_token
 
 - async WechatResponse GetCoverUrlRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenRedPacketCoverApiGetCoverUrlRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -7438,51 +6984,39 @@ RedPacketCover/RedPacketCoverApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenSecOrderApi (class)
 
-Sec/Order.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenSecOrderApi(WechatWxOpenClient client)
 
 - async WechatWxOpenSecOrderApiUploadShippingInfoResponse UploadShippingInfoAsync(WechatWxOpenSecOrderApiUploadShippingInfoRequest request)
-  - POST /wxa/sec/order/upload_shipping_info
 
 - async WechatResponse UploadShippingInfoRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenSecOrderApiUploadCombinedShippingInfoResponse UploadCombinedShippingInfoAsync(WechatWxOpenSecOrderApiUploadCombinedShippingInfoRequest request)
-  - POST /wxa/sec/order/upload_combined_shipping_info
 
 - async WechatResponse UploadCombinedShippingInfoRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenSecOrderApiGetOrderResponse GetOrderAsync(WechatWxOpenSecOrderApiGetOrderRequest request)
-  - POST /wxa/sec/order/get_order
 
 - async WechatResponse GetOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenSecOrderApiGetOrderListResponse GetOrderListAsync(WechatWxOpenSecOrderApiGetOrderListRequest request)
-  - POST /wxa/sec/order/get_order_list
 
 - async WechatResponse GetOrderListRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenSecOrderApiNotifyConfirmReceiveResponse NotifyConfirmReceiveAsync(WechatWxOpenSecOrderApiNotifyConfirmReceiveRequest request)
-  - POST /wxa/sec/order/notify_confirm_receive
 
 - async WechatResponse NotifyConfirmReceiveRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenSecOrderApiSetMsgJumpPathResponse SetMsgJumpPathAsync(WechatWxOpenSecOrderApiSetMsgJumpPathRequest request)
-  - POST /wxa/sec/order/set_msg_jump_path
 
 - async WechatResponse SetMsgJumpPathRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenSecOrderApiIsTradeManagedResponse IsTradeManagedAsync(WechatWxOpenSecOrderApiIsTradeManagedRequest request)
-  - POST /wxa/sec/order/is_trade_managed
 
 - async WechatResponse IsTradeManagedRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenSecOrderApiIsTradeManagementConfirmationCompletedResponse IsTradeManagementConfirmationCompletedAsync(WechatWxOpenSecOrderApiIsTradeManagementConfirmationCompletedRequest request)
-  - POST /wxa/sec/order/is_trade_management_confirmation_completed
 
 - async WechatResponse IsTradeManagementConfirmationCompletedRawAsync(string query, string jsonBody)
 
@@ -7649,8 +7183,6 @@ Sec/Order.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenSecOrderApiUploadShippingInfoRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenSecOrderApiUploadShippingInfoRequest()
@@ -7683,31 +7215,23 @@ Sec/Order.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenSecOrderIncrementApi (class)
 
-Sec/OrderIncrementApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenSecOrderIncrementApi(WechatWxOpenClient client)
 
 - async WechatWxOpenSecOrderIncrementApiReportSpecialOrderResponse ReportSpecialOrderAsync(WechatWxOpenSecOrderIncrementApiReportSpecialOrderRequest request)
-  - POST /wxa/sec/order/opspecialorder
 
 - async WechatResponse ReportSpecialOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenSecOrderIncrementApiApplyFamousBrandResponse ApplyFamousBrandAsync(WechatWxOpenSecOrderIncrementApiApplyFamousBrandRequest request)
-  - POST /wxa/sec/famousbrand/apply
 
 - async WechatResponse ApplyFamousBrandRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenSecOrderIncrementApiGetFamousBrandApplyStatusResponse GetFamousBrandApplyStatusAsync()
-  - POST /wxa/sec/famousbrand/get_status
 
 - async WechatResponse GetFamousBrandApplyStatusRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenSecOrderIncrementApiApplyTradeTypeChangeResponse ApplyTradeTypeChangeAsync(WechatWxOpenSecOrderIncrementApiApplyTradeTypeChangeRequest request)
-  - POST /wxa/sec/order/setwxatradetypecgi
 
 - async WechatResponse ApplyTradeTypeChangeRawAsync(string query, string jsonBody)
 
@@ -7763,8 +7287,6 @@ Sec/OrderIncrementApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenSecOrderIncrementApiReportSpecialOrderRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenSecOrderIncrementApiReportSpecialOrderRequest()
@@ -7789,28 +7311,20 @@ Sec/OrderIncrementApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenServiceMarketApi (class)
 
-ServiceMarket/ServiceMarketApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenServiceMarketApi(WechatWxOpenClient client)
 
 - async WechatWxOpenServiceMarketApiInvokeServiceResponse InvokeServiceAsync(WechatWxOpenServiceMarketApiInvokeServiceRequest request)
-  - POST /wxa/servicemarket
 
 - async WechatResponse InvokeServiceRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenServiceMarketApiRetrieveResultResponse RetrieveResultAsync(WechatWxOpenServiceMarketApiRetrieveResultRequest request)
-  - POST /wxa/servicemarketretrieve
 
 - async WechatResponse RetrieveResultRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenServiceMarketApiInvokeServiceRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -7848,23 +7362,16 @@ ServiceMarket/ServiceMarketApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenSnsApi (class)
 
-Sns/SnsApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenSnsApi(WechatWxOpenClient client)
 
 - async WechatWxOpenSnsApiJsCode2JsonResponse JsCode2JsonAsync(WechatWxOpenSnsApiJsCode2JsonRequest request)
-  - GET /sns/jscode2session
 
 - async WechatResponse JsCode2JsonRawAsync(string query)
 
 
 ## WechatWxOpenSnsApiJsCode2JsonRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -7890,23 +7397,16 @@ Sns/SnsApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenSoterApi (class)
 
-Soter/SoterApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenSoterApi(WechatWxOpenClient client)
 
 - async WechatWxOpenSoterApiVerifySignatureResponse VerifySignatureAsync(WechatWxOpenSoterApiVerifySignatureRequest request)
-  - POST /cgi-bin/soter/verify_signature
 
 - async WechatResponse VerifySignatureRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenSoterApiVerifySignatureRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -7929,8 +7429,6 @@ Soter/SoterApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenSpecialApi (class)
-
-小程序客服动态路径、文件上传、媒体下载和二维码二进制接口。
 
 - WechatWxOpenClient client;
 
@@ -8102,23 +7600,16 @@ Soter/SoterApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenStudentApi (class)
 
-Student/StudentApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenStudentApi(WechatWxOpenClient client)
 
 - async WechatWxOpenStudentApiQuickCheckStudentIdentityResponse QuickCheckStudentIdentityAsync(WechatWxOpenStudentApiQuickCheckStudentIdentityRequest request)
-  - POST /intp/quickcheckstudentidentity
 
 - async WechatResponse QuickCheckStudentIdentityRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenStudentApiQuickCheckStudentIdentityRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
 
 - WechatTypedRequest request;
 
@@ -8140,101 +7631,79 @@ Student/StudentApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenTcbApi (class)
 
-Tcb/TcbApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenTcbApi(WechatWxOpenClient client)
 
 - async WechatWxOpenTcbApiSendTemplateMessageResponse SendTemplateMessageAsync(WechatWxOpenTcbApiSendTemplateMessageRequest request)
-  - POST /tcb/invokecloudfunction
 
 - async WechatResponse SendTemplateMessageRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiDatabaseMigrateImportResponse DatabaseMigrateImportAsync(WechatWxOpenTcbApiDatabaseMigrateImportRequest request)
-  - POST /tcb/databasemigrateimport
 
 - async WechatResponse DatabaseMigrateImportRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiDatabaseMigrateExportResponse DatabaseMigrateExportAsync(WechatWxOpenTcbApiDatabaseMigrateExportRequest request)
-  - POST /tcb/databasemigrateexport
 
 - async WechatResponse DatabaseMigrateExportRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiDatabaseMigrateQueryInfoResponse DatabaseMigrateQueryInfoAsync(WechatWxOpenTcbApiDatabaseMigrateQueryInfoRequest request)
-  - POST /tcb/databasemigratequeryinfo
 
 - async WechatResponse DatabaseMigrateQueryInfoRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiUpdateIndexResponse UpdateIndexAsync(WechatWxOpenTcbApiUpdateIndexRequest request)
-  - POST /tcb/updateindex
 
 - async WechatResponse UpdateIndexRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiDatabaseCollectionAddResponse DatabaseCollectionAddAsync(WechatWxOpenTcbApiDatabaseCollectionAddRequest request)
-  - POST /tcb/databasecollectionadd
 
 - async WechatResponse DatabaseCollectionAddRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiDatabaseCollectionDeleteResponse DatabaseCollectionDeleteAsync(WechatWxOpenTcbApiDatabaseCollectionDeleteRequest request)
-  - POST /tcb/databasecollectiondelete
 
 - async WechatResponse DatabaseCollectionDeleteRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiDatabaseCollectionGetResponse DatabaseCollectionGetAsync(WechatWxOpenTcbApiDatabaseCollectionGetRequest request)
-  - POST /tcb/databasecollectionget
 
 - async WechatResponse DatabaseCollectionGetRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiDatabaseAddResponse DatabaseAddAsync(WechatWxOpenTcbApiDatabaseAddRequest request)
-  - POST /tcb/databaseadd
 
 - async WechatResponse DatabaseAddRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiDatabaseDeleteResponse DatabaseDeleteAsync(WechatWxOpenTcbApiDatabaseDeleteRequest request)
-  - POST /tcb/databasedelete
 
 - async WechatResponse DatabaseDeleteRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiDatabaseUpdateResponse DatabaseUpdateAsync(WechatWxOpenTcbApiDatabaseUpdateRequest request)
-  - POST /tcb/databaseupdate
 
 - async WechatResponse DatabaseUpdateRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiDatabaseQueryResponse DatabaseQueryAsync(WechatWxOpenTcbApiDatabaseQueryRequest request)
-  - POST /tcb/databasequery
 
 - async WechatResponse DatabaseQueryRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiDatabaseAggregateResponse DatabaseAggregateAsync(WechatWxOpenTcbApiDatabaseAggregateRequest request)
-  - POST /tcb/databaseaggregate
 
 - async WechatResponse DatabaseAggregateRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiDatabaseCountResponse DatabaseCountAsync(WechatWxOpenTcbApiDatabaseCountRequest request)
-  - POST /tcb/databasecount
 
 - async WechatResponse DatabaseCountRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiUploadFileResponse UploadFileAsync(WechatWxOpenTcbApiUploadFileRequest request)
-  - POST /tcb/uploadfile
 
 - async WechatResponse UploadFileRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiBatchDownloadFileResponse BatchDownloadFileAsync(WechatWxOpenTcbApiBatchDownloadFileRequest request)
-  - POST /tcb/batchdownloadfile
 
 - async WechatResponse BatchDownloadFileRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiBatchDeleteFileResponse BatchDeleteFileAsync(WechatWxOpenTcbApiBatchDeleteFileRequest request)
-  - POST /tcb/batchdeletefile
 
 - async WechatResponse BatchDeleteFileRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTcbApiGetQcloudTokenResponse GetQcloudTokenAsync(WechatWxOpenTcbApiGetQcloudTokenRequest request)
-  - POST /tcb/getqcloudtoken
 
 - async WechatResponse GetQcloudTokenRawAsync(string query, string jsonBody)
 
@@ -8557,8 +8026,6 @@ Tcb/TcbApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenTcbApiSendTemplateMessageRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体定义在 Sdk.Wechat.Models.WxOpen 中。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenTcbApiSendTemplateMessageRequest()
@@ -8627,23 +8094,16 @@ Tcb/TcbApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenTcbIncrementApi (class)
 
-Tcb/TcbIncrementApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenTcbIncrementApi(WechatWxOpenClient client)
 
 - async WechatWxOpenTcbIncrementApiGetOpenDataResponse GetOpenDataAsync(WechatWxOpenTcbIncrementApiGetOpenDataRequest request)
-  - POST /wxa/getopendata
 
 - async WechatResponse GetOpenDataRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenTcbIncrementApiGetOpenDataRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 
@@ -8663,46 +8123,35 @@ Tcb/TcbIncrementApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenTemplateApi (class)
 
-Template/TemplateApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenTemplateApi(WechatWxOpenClient client)
 
 - async WechatWxOpenTemplateApiSendTemplateMessageResponse SendTemplateMessageAsync(WechatWxOpenTemplateApiSendTemplateMessageRequest request)
-  - POST /cgi-bin/message/wxopen/template/send
 
 - async WechatResponse SendTemplateMessageRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTemplateApiUniformSendResponse UniformSendAsync(WechatWxOpenTemplateApiUniformSendRequest request)
-  - POST /cgi-bin/message/wxopen/template/uniform_send
 
 - async WechatResponse UniformSendRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTemplateApiLibraryListResponse LibraryListAsync(WechatWxOpenTemplateApiLibraryListRequest request)
-  - POST /cgi-bin/wxopen/template/library/list
 
 - async WechatResponse LibraryListRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTemplateApiLibraryGetResponse LibraryGetAsync(WechatWxOpenTemplateApiLibraryGetRequest request)
-  - POST /cgi-bin/wxopen/template/library/get
 
 - async WechatResponse LibraryGetRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTemplateApiAddResponse AddAsync(WechatWxOpenTemplateApiAddRequest request)
-  - POST /cgi-bin/wxopen/template/add
 
 - async WechatResponse AddRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTemplateApiListResponse ListAsync(WechatWxOpenTemplateApiListRequest request)
-  - POST /cgi-bin/wxopen/template/list
 
 - async WechatResponse ListRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTemplateApiDelResponse DelAsync(WechatWxOpenTemplateApiDelRequest request)
-  - POST /cgi-bin/wxopen/template/del
 
 - async WechatResponse DelRawAsync(string query, string jsonBody)
 
@@ -8807,8 +8256,6 @@ Template/TemplateApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenTemplateApiSendTemplateMessageRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenTemplateApiSendTemplateMessageRequest()
@@ -8865,91 +8312,71 @@ Template/TemplateApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenTransactionGuaranteeApi (class)
 
-TransactionGuarantee/TransactionGuaranteeApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenTransactionGuaranteeApi(WechatWxOpenClient client)
 
 - async WechatWxOpenTransactionGuaranteeApiGetPenaltyListResponse GetPenaltyListAsync(WechatWxOpenTransactionGuaranteeApiGetPenaltyListRequest request)
-  - GET /wxaapi/wxamptrade/get_penalty_list
 
 - async WechatResponse GetPenaltyListRawAsync(string query)
 
 - async WechatWxOpenTransactionGuaranteeApiGetGuaranteeStatusResponse GetGuaranteeStatusAsync()
-  - GET /wxaapi/wxamptrade/get_guarantee_status
 
 - async WechatResponse GetGuaranteeStatusRawAsync(string query)
 
 - async WechatWxOpenTransactionGuaranteeApiGetCommentListResponse GetCommentListAsync(WechatWxOpenTransactionGuaranteeApiGetCommentListRequest request)
-  - GET /wxaapi/comment/mpcommentlist/get
 
 - async WechatResponse GetCommentListRawAsync(string query)
 
 - async WechatWxOpenTransactionGuaranteeApiGetCommentReplyListResponse GetCommentReplyListAsync(WechatWxOpenTransactionGuaranteeApiGetCommentReplyListRequest request)
-  - GET /wxaapi/comment/replyandcommentreplylist/get
 
 - async WechatResponse GetCommentReplyListRawAsync(string query)
 
 - async WechatWxOpenTransactionGuaranteeApiGetCommentInfoResponse GetCommentInfoAsync(WechatWxOpenTransactionGuaranteeApiGetCommentInfoRequest request)
-  - GET /wxaapi/comment/commentinfo/get
 
 - async WechatResponse GetCommentInfoRawAsync(string query)
 
 - async WechatWxOpenTransactionGuaranteeApiAddReplyResponse AddReplyAsync(WechatWxOpenTransactionGuaranteeApiAddReplyRequest request)
-  - POST /wxaapi/comment/reply/add
 
 - async WechatResponse AddReplyRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTransactionGuaranteeApiDeleteReplyResponse DeleteReplyAsync(WechatWxOpenTransactionGuaranteeApiDeleteReplyRequest request)
-  - POST /wxaapi/comment/reply/delete
 
 - async WechatResponse DeleteReplyRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTransactionGuaranteeApiAddCommentReplyResponse AddCommentReplyAsync(WechatWxOpenTransactionGuaranteeApiAddCommentReplyRequest request)
-  - POST /wxaapi/comment/commentreply/add
 
 - async WechatResponse AddCommentReplyRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTransactionGuaranteeApiDeleteCommentReplyResponse DeleteCommentReplyAsync(WechatWxOpenTransactionGuaranteeApiDeleteCommentReplyRequest request)
-  - POST /wxaapi/comment/commentreply/delete
 
 - async WechatResponse DeleteCommentReplyRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTransactionGuaranteeApiResetApiCustomerServiceQuotaResponse ResetApiCustomerServiceQuotaAsync(WechatWxOpenTransactionGuaranteeApiResetApiCustomerServiceQuotaRequest request)
-  - POST /wxaapi/comment/apikfquota/reset
 
 - async WechatResponse ResetApiCustomerServiceQuotaRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTransactionGuaranteeApiConfirmCompromiseResponse ConfirmCompromiseAsync(WechatWxOpenTransactionGuaranteeApiConfirmCompromiseRequest request)
-  - POST /wxaapi/comment/confirmcompromise
 
 - async WechatResponse ConfirmCompromiseRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTransactionGuaranteeApiRespondComplaintResponse RespondComplaintAsync(WechatWxOpenTransactionGuaranteeApiRespondComplaintRequest request)
-  - POST /wxaapi/minishop/bussiRespondComplaint
 
 - async WechatResponse RespondComplaintRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTransactionGuaranteeApiSupplyComplaintProofResponse SupplyComplaintProofAsync(WechatWxOpenTransactionGuaranteeApiSupplyComplaintProofRequest request)
-  - POST /wxaapi/minishop/bussiSupplyProof
 
 - async WechatResponse SupplyComplaintProofRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTransactionGuaranteeApiSubmitComplaintRefundResponse SubmitComplaintRefundAsync(WechatWxOpenTransactionGuaranteeApiSubmitComplaintRefundRequest request)
-  - POST /wxaapi/minishop/bussiSupplyRefund
 
 - async WechatResponse SubmitComplaintRefundRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenTransactionGuaranteeApiGetComplaintOrderDetailResponse GetComplaintOrderDetailAsync(WechatWxOpenTransactionGuaranteeApiGetComplaintOrderDetailRequest request)
-  - GET /wxaapi/minishop/complaintOrderDetail
 
 - async WechatResponse GetComplaintOrderDetailRawAsync(string query)
 
 - async WechatWxOpenTransactionGuaranteeApiSubmitComplaintAppealResponse SubmitComplaintAppealAsync(WechatWxOpenTransactionGuaranteeApiSubmitComplaintAppealRequest request)
-  - POST /wxaapi/minishop/busiAppeal
 
 - async WechatResponse SubmitComplaintAppealRawAsync(string query, string jsonBody)
 
@@ -9147,8 +8574,6 @@ TransactionGuarantee/TransactionGuaranteeApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenTransactionGuaranteeApiGetPenaltyListRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenTransactionGuaranteeApiGetPenaltyListRequest()
@@ -9289,46 +8714,35 @@ TransactionGuarantee/TransactionGuaranteeApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWeixinExpressApi (class)
 
-WeixinExpress/WeixinExpressApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenWeixinExpressApi(WechatWxOpenClient client)
 
 - async WechatWxOpenWeixinExpressApiQueryTraceResponse QueryTraceAsync(WechatWxOpenWeixinExpressApiQueryTraceRequest request)
-  - POST /cgi-bin/express/delivery/open_msg/query_trace
 
 - async WechatResponse QueryTraceRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressApiGetDeliveryListResponse GetDeliveryListAsync()
-  - POST /cgi-bin/express/delivery/open_msg/get_delivery_list
 
 - async WechatResponse GetDeliveryListRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressApiTraceWaybillResponse TraceWaybillAsync(WechatWxOpenWeixinExpressApiTraceWaybillRequest request)
-  - POST /cgi-bin/express/delivery/open_msg/trace_waybill
 
 - async WechatResponse TraceWaybillRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressApiUpdateWaybillGoodsResponse UpdateWaybillGoodsAsync(WechatWxOpenWeixinExpressApiUpdateWaybillGoodsRequest request)
-  - POST /cgi-bin/express/delivery/open_msg/update_waybill_goods
 
 - async WechatResponse UpdateWaybillGoodsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressApiUpdateFollowWaybillGoodsResponse UpdateFollowWaybillGoodsAsync(WechatWxOpenWeixinExpressApiUpdateFollowWaybillGoodsRequest request)
-  - POST /cgi-bin/express/delivery/open_msg/update_follow_waybill_goods
 
 - async WechatResponse UpdateFollowWaybillGoodsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressApiQueryFollowTraceResponse QueryFollowTraceAsync(WechatWxOpenWeixinExpressApiQueryFollowTraceRequest request)
-  - POST /cgi-bin/express/delivery/open_msg/query_follow_trace
 
 - async WechatResponse QueryFollowTraceRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressApiFollowWaybillResponse FollowWaybillAsync(WechatWxOpenWeixinExpressApiFollowWaybillRequest request)
-  - POST /cgi-bin/express/delivery/open_msg/follow_waybill
 
 - async WechatResponse FollowWaybillRawAsync(string query, string jsonBody)
 
@@ -9391,8 +8805,6 @@ WeixinExpress/WeixinExpressApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenWeixinExpressApiQueryTraceRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 
@@ -9494,66 +8906,51 @@ WeixinExpress/WeixinExpressApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWeixinExpressInsuranceApi (class)
 
-WeixinExpress/WeixinExpressInsuranceApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenWeixinExpressInsuranceApi(WechatWxOpenClient client)
 
 - async WechatWxOpenWeixinExpressInsuranceApiOpenInsuranceFreightResponse OpenInsuranceFreightAsync()
-  - POST /wxa/business/insurance_freight/open
 
 - async WechatResponse OpenInsuranceFreightRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressInsuranceApiQueryInsuranceFreightOpenStatusResponse QueryInsuranceFreightOpenStatusAsync()
-  - POST /wxa/business/insurance_freight/query_open
 
 - async WechatResponse QueryInsuranceFreightOpenStatusRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressInsuranceApiCreateInsuranceFreightOrderResponse CreateInsuranceFreightOrderAsync(WechatWxOpenWeixinExpressInsuranceApiCreateInsuranceFreightOrderRequest request)
-  - POST /wxa/business/insurance_freight/createorder
 
 - async WechatResponse CreateInsuranceFreightOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressInsuranceApiClaimInsuranceFreightResponse ClaimInsuranceFreightAsync(WechatWxOpenWeixinExpressInsuranceApiClaimInsuranceFreightRequest request)
-  - POST /wxa/business/insurance_freight/claim
 
 - async WechatResponse ClaimInsuranceFreightRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressInsuranceApiCreateInsuranceChargeIdResponse CreateInsuranceChargeIdAsync(WechatWxOpenWeixinExpressInsuranceApiCreateInsuranceChargeIdRequest request)
-  - POST /wxa/business/insurance_freight/createchargeid
 
 - async WechatResponse CreateInsuranceChargeIdRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressInsuranceApiApplyInsurancePayResponse ApplyInsurancePayAsync(WechatWxOpenWeixinExpressInsuranceApiApplyInsurancePayRequest request)
-  - POST /wxa/business/insurance_freight/applypay
 
 - async WechatResponse ApplyInsurancePayRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressInsuranceApiGetInsurancePayOrderListResponse GetInsurancePayOrderListAsync(WechatWxOpenWeixinExpressInsuranceApiGetInsurancePayOrderListRequest request)
-  - POST /wxa/business/insurance_freight/getpayorderlist
 
 - async WechatResponse GetInsurancePayOrderListRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressInsuranceApiRefundInsurancePremiumResponse RefundInsurancePremiumAsync()
-  - POST /wxa/business/insurance_freight/refund
 
 - async WechatResponse RefundInsurancePremiumRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressInsuranceApiGetInsuranceSummaryResponse GetInsuranceSummaryAsync(WechatWxOpenWeixinExpressInsuranceApiGetInsuranceSummaryRequest request)
-  - POST /wxa/business/insurance_freight/getsummary
 
 - async WechatResponse GetInsuranceSummaryRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressInsuranceApiGetInsuranceOrderListResponse GetInsuranceOrderListAsync(WechatWxOpenWeixinExpressInsuranceApiGetInsuranceOrderListRequest request)
-  - POST /wxa/business/insurance_freight/getorderlist
 
 - async WechatResponse GetInsuranceOrderListRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressInsuranceApiUpdateInsuranceNotifyFundsResponse UpdateInsuranceNotifyFundsAsync(WechatWxOpenWeixinExpressInsuranceApiUpdateInsuranceNotifyFundsRequest request)
-  - POST /wxa/business/insurance_freight/update_notify_funds
 
 - async WechatResponse UpdateInsuranceNotifyFundsRawAsync(string query, string jsonBody)
 
@@ -9734,8 +9131,6 @@ WeixinExpress/WeixinExpressInsuranceApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWeixinExpressInsuranceApiOpenInsuranceFreightResponse (class)
 
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
-
 - public string Raw;
 
 - public JsonValue Value;
@@ -9775,91 +9170,71 @@ WeixinExpress/WeixinExpressInsuranceApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWeixinExpressIntracityApi (class)
 
-WeixinExpress/WeixinExpressIntracityApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenWeixinExpressIntracityApi(WechatWxOpenClient client)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityApplyResponse IntracityApplyAsync()
-  - POST /cgi-bin/express/intracity/apply
 
 - async WechatResponse IntracityApplyRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityCreateStoreResponse IntracityCreateStoreAsync(WechatWxOpenWeixinExpressIntracityApiIntracityCreateStoreRequest request)
-  - POST /cgi-bin/express/intracity/createstore
 
 - async WechatResponse IntracityCreateStoreRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityQueryStoreResponse IntracityQueryStoreAsync(WechatWxOpenWeixinExpressIntracityApiIntracityQueryStoreRequest request)
-  - POST /cgi-bin/express/intracity/querystore
 
 - async WechatResponse IntracityQueryStoreRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityUpdateStoreResponse IntracityUpdateStoreAsync(WechatWxOpenWeixinExpressIntracityApiIntracityUpdateStoreRequest request)
-  - POST /cgi-bin/express/intracity/updatestore
 
 - async WechatResponse IntracityUpdateStoreRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityStoreChargeResponse IntracityStoreChargeAsync(WechatWxOpenWeixinExpressIntracityApiIntracityStoreChargeRequest request)
-  - POST /cgi-bin/express/intracity/storecharge
 
 - async WechatResponse IntracityStoreChargeRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityStoreRefundResponse IntracityStoreRefundAsync(WechatWxOpenWeixinExpressIntracityApiIntracityStoreRefundRequest request)
-  - POST /cgi-bin/express/intracity/storerefund
 
 - async WechatResponse IntracityStoreRefundRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityQueryFlowResponse IntracityQueryFlowAsync(WechatWxOpenWeixinExpressIntracityApiIntracityQueryFlowRequest request)
-  - POST /cgi-bin/express/intracity/queryflow
 
 - async WechatResponse IntracityQueryFlowRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityBalanceQueryResponse IntracityBalanceQueryAsync(WechatWxOpenWeixinExpressIntracityApiIntracityBalanceQueryRequest request)
-  - POST /cgi-bin/express/intracity/balancequery
 
 - async WechatResponse IntracityBalanceQueryRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityPreAddOrderResponse IntracityPreAddOrderAsync(WechatWxOpenWeixinExpressIntracityApiIntracityPreAddOrderRequest request)
-  - POST /cgi-bin/express/intracity/preaddorder
 
 - async WechatResponse IntracityPreAddOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityAddOrderResponse IntracityAddOrderAsync(WechatWxOpenWeixinExpressIntracityApiIntracityAddOrderRequest request)
-  - POST /cgi-bin/express/intracity/addorder
 
 - async WechatResponse IntracityAddOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityQueryOrderResponse IntracityQueryOrderAsync(WechatWxOpenWeixinExpressIntracityApiIntracityQueryOrderRequest request)
-  - POST /cgi-bin/express/intracity/queryorder
 
 - async WechatResponse IntracityQueryOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityCancelOrderResponse IntracityCancelOrderAsync(WechatWxOpenWeixinExpressIntracityApiIntracityCancelOrderRequest request)
-  - POST /cgi-bin/express/intracity/cancelorder
 
 - async WechatResponse IntracityCancelOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracitySetPayModeResponse IntracitySetPayModeAsync(WechatWxOpenWeixinExpressIntracityApiIntracitySetPayModeRequest request)
-  - POST /cgi-bin/express/intracity/setpaymode
 
 - async WechatResponse IntracitySetPayModeRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityGetPayModeResponse IntracityGetPayModeAsync(WechatWxOpenWeixinExpressIntracityApiIntracityGetPayModeRequest request)
-  - POST /cgi-bin/express/intracity/getpaymode
 
 - async WechatResponse IntracityGetPayModeRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityGetCityResponse IntracityGetCityAsync(WechatWxOpenWeixinExpressIntracityApiIntracityGetCityRequest request)
-  - POST /cgi-bin/express/intracity/getcity
 
 - async WechatResponse IntracityGetCityRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressIntracityApiIntracityMockNotifyResponse IntracityMockNotifyAsync(WechatWxOpenWeixinExpressIntracityApiIntracityMockNotifyRequest request)
-  - POST /cgi-bin/express/intracity/mocknotify
 
 - async WechatResponse IntracityMockNotifyRawAsync(string query, string jsonBody)
 
@@ -9909,8 +9284,6 @@ WeixinExpress/WeixinExpressIntracityApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenWeixinExpressIntracityApiIntracityApplyResponse (class)
-
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
 
 - public string Raw;
 
@@ -10249,21 +9622,15 @@ WeixinExpress/WeixinExpressIntracityApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWeixinExpressProviderApi (class)
 
-WeixinExpress/WeixinExpressProviderApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenWeixinExpressProviderApi(WechatWxOpenClient client)
 
 - async WechatWxOpenWeixinExpressProviderApiQueryUserBindingResponse QueryUserBindingAsync(WechatWxOpenWeixinExpressProviderApiQueryUserBindingRequest request)
-  - POST /cgi-bin/express/delivery/userquery
 
 - async WechatResponse QueryUserBindingRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressProviderApiNotifyPathResponse NotifyPathAsync(WechatWxOpenWeixinExpressProviderApiNotifyPathRequest request)
-  - POST /cgi-bin/express/delivery/pathnotify
 
 - async WechatResponse NotifyPathRawAsync(string query, string jsonBody)
 
@@ -10296,8 +9663,6 @@ WeixinExpress/WeixinExpressProviderApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWeixinExpressProviderApiQueryUserBindingRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenWeixinExpressProviderApiQueryUserBindingRequest()
@@ -10316,26 +9681,19 @@ WeixinExpress/WeixinExpressProviderApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWeixinExpressReturnApi (class)
 
-WeixinExpress/WeixinExpressReturnApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenWeixinExpressReturnApi(WechatWxOpenClient client)
 
 - async WechatWxOpenWeixinExpressReturnApiUnbindReturnIdResponse UnbindReturnIdAsync(WechatWxOpenWeixinExpressReturnApiUnbindReturnIdRequest request)
-  - POST /cgi-bin/express/delivery/no_worry_return/unbind
 
 - async WechatResponse UnbindReturnIdRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressReturnApiGetReturnIdResponse GetReturnIdAsync(WechatWxOpenWeixinExpressReturnApiGetReturnIdRequest request)
-  - POST /cgi-bin/express/delivery/no_worry_return/get
 
 - async WechatResponse GetReturnIdRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWeixinExpressReturnApiAddReturnIdResponse AddReturnIdAsync(WechatWxOpenWeixinExpressReturnApiAddReturnIdRequest request)
-  - POST /cgi-bin/express/delivery/no_worry_return/add
 
 - async WechatResponse AddReturnIdRawAsync(string query, string jsonBody)
 
@@ -10392,8 +9750,6 @@ WeixinExpress/WeixinExpressReturnApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWeixinExpressReturnApiUnbindReturnIdRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenWeixinExpressReturnApiUnbindReturnIdRequest()
@@ -10414,126 +9770,99 @@ WeixinExpress/WeixinExpressReturnApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWxAppApi (class)
 
-WxApp/WxAppApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenWxAppApi(WechatWxOpenClient client)
 
 - async WechatWxOpenWxAppApiMediaCheckResponse MediaCheckAsync(WechatWxOpenWxAppApiMediaCheckRequest request)
-  - POST /wxa/media_check_async
 
 - async WechatResponse MediaCheckRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppApiCheckSessionResponse CheckSessionAsync(WechatWxOpenWxAppApiCheckSessionRequest request)
-  - GET /wxa/checksession
 
 - async WechatResponse CheckSessionRawAsync(string query)
 
 - async WechatWxOpenWxAppApiGetMerchantCategoryResponse GetMerchantCategoryAsync()
-  - GET /wxa/get_merchant_category
 
 - async WechatResponse GetMerchantCategoryRawAsync(string query)
 
 - async WechatWxOpenWxAppApiNearbyapplycategoryResponse NearbyapplycategoryAsync(WechatWxOpenWxAppApiNearbyapplycategoryRequest request)
-  - POST /wxa/nearbyapplycategory
 
 - async WechatResponse NearbyapplycategoryRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppApiGetStoreWxaAttrResponse GetStoreWxaAttrAsync()
-  - GET /wxa/getstorewxaattr
 
 - async WechatResponse GetStoreWxaAttrRawAsync(string query)
 
 - async WechatWxOpenWxAppApiGetNearbyOfficialServiceInfoResponse GetNearbyOfficialServiceInfoAsync()
-  - GET /wxa/getnearbyofficialserviceinfo
 
 - async WechatResponse GetNearbyOfficialServiceInfoRawAsync(string query)
 
 - async WechatWxOpenWxAppApiGetDistrictResponse GetDistrictAsync()
-  - GET /wxa/get_district
 
 - async WechatResponse GetDistrictRawAsync(string query)
 
 - async WechatWxOpenWxAppApiSearchMapPoiResponse SearchMapPoiAsync(WechatWxOpenWxAppApiSearchMapPoiRequest request)
-  - POST /wxa/search_map_poi
 
 - async WechatResponse SearchMapPoiRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppApiCreateMapPoiResponse CreateMapPoiAsync(WechatWxOpenWxAppApiCreateMapPoiRequest request)
-  - POST /wxa/create_map_poi
 
 - async WechatResponse CreateMapPoiRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppApiAddNearbyPoiResponse AddNearbyPoiAsync(WechatWxOpenWxAppApiAddNearbyPoiRequest request)
-  - POST /wxa/addnearbypoi
 
 - async WechatResponse AddNearbyPoiRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppApiGetNearbyPoiListResponse GetNearbyPoiListAsync(WechatWxOpenWxAppApiGetNearbyPoiListRequest request)
-  - GET /wxa/getnearbypoilist
 
 - async WechatResponse GetNearbyPoiListRawAsync(string query)
 
 - async WechatWxOpenWxAppApiDelNearbyPoiResponse DelNearbyPoiAsync(WechatWxOpenWxAppApiDelNearbyPoiRequest request)
-  - POST /wxa/delnearbypoi
 
 - async WechatResponse DelNearbyPoiRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppApiSetNearbyPoiListResponse SetNearbyPoiListAsync(WechatWxOpenWxAppApiSetNearbyPoiListRequest request)
-  - POST /wxa/setnearbypoishowstatus
 
 - async WechatResponse SetNearbyPoiListRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppApiGetNearbyDetailPageResponse GetNearbyDetailPageAsync(WechatWxOpenWxAppApiGetNearbyDetailPageRequest request)
-  - GET /wxa/getnearbydetailpage
 
 - async WechatResponse GetNearbyDetailPageRawAsync(string query)
 
 - async WechatWxOpenWxAppApiMediaCheckAsyncResponse MediaCheckAsyncAsync(WechatWxOpenWxAppApiMediaCheckAsyncRequest request)
-  - POST /wxa/media_check_async
 
 - async WechatResponse MediaCheckAsyncRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppApiMsgSecCheckResponse MsgSecCheckAsync(WechatWxOpenWxAppApiMsgSecCheckRequest request)
-  - POST /wxa/msg_sec_check
 
 - async WechatResponse MsgSecCheckRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppApiApplyPluginResponse ApplyPluginAsync(WechatWxOpenWxAppApiApplyPluginRequest request)
-  - POST /wxa/plugin
 
 - async WechatResponse ApplyPluginRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppApiDevPluginResponse DevPluginAsync(WechatWxOpenWxAppApiDevPluginRequest request)
-  - POST /wxa/devplugin
 
 - async WechatResponse DevPluginRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppApiSetDevPluginApplyStatusResponse SetDevPluginApplyStatusAsync(WechatWxOpenWxAppApiSetDevPluginApplyStatusRequest request)
-  - POST /wxa/devplugin
 
 - async WechatResponse SetDevPluginApplyStatusRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppApiGetPluginListResponse GetPluginListAsync()
-  - POST /wxa/plugin
 
 - async WechatResponse GetPluginListRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppApiUnbindPluginResponse UnbindPluginAsync(WechatWxOpenWxAppApiUnbindPluginRequest request)
-  - POST /wxa/plugin
 
 - async WechatResponse UnbindPluginRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppApiGetPaidUnionidResponse GetPaidUnionidAsync(WechatWxOpenWxAppApiGetPaidUnionidRequest request)
-  - GET /wxa/getpaidunionid
 
 - async WechatResponse GetPaidUnionidRawAsync(string query)
 
 - async WechatWxOpenWxAppApiGetUserRiskResponse GetUserRiskAsync(WechatWxOpenWxAppApiGetUserRiskRequest request)
-  - POST /wxa/getuserriskrank
 
 - async WechatResponse GetUserRiskRawAsync(string query, string jsonBody)
 
@@ -10853,8 +10182,6 @@ WxApp/WxAppApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWxAppApiMediaCheckRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenWxAppApiMediaCheckRequest()
@@ -11009,41 +10336,31 @@ WxApp/WxAppApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWxAppBusinessApi (class)
 
-WxApp/Business/BusinessApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenWxAppBusinessApi(WechatWxOpenClient client)
 
 - async WechatWxOpenWxAppBusinessApiGetUserPhoneNumberResponse GetUserPhoneNumberAsync(WechatWxOpenWxAppBusinessApiGetUserPhoneNumberRequest request)
-  - POST /wxa/business/getuserphonenumber
 
 - async WechatResponse GetUserPhoneNumberRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppBusinessApiUnBindUserAuthinfoResponse UnBindUserAuthinfoAsync(WechatWxOpenWxAppBusinessApiUnBindUserAuthinfoRequest request)
-  - POST /wxa/business/unbinduserb2cauthinfo
 
 - async WechatResponse UnBindUserAuthinfoRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppBusinessApiGetPluginOpenPidResponse GetPluginOpenPidAsync(WechatWxOpenWxAppBusinessApiGetPluginOpenPidRequest request)
-  - POST /wxa/getpluginopenpid
 
 - async WechatResponse GetPluginOpenPidRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppBusinessApiCheckEncryptedDataResponse CheckEncryptedDataAsync(WechatWxOpenWxAppBusinessApiCheckEncryptedDataRequest request)
-  - POST /wxa/business/checkencryptedmsg
 
 - async WechatResponse CheckEncryptedDataRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppBusinessApiGetUserEncryptKeyResponse GetUserEncryptKeyAsync(WechatWxOpenWxAppBusinessApiGetUserEncryptKeyRequest request)
-  - GET /wxa/business/getuserencryptkey
 
 - async WechatResponse GetUserEncryptKeyRawAsync(string query)
 
 - async WechatWxOpenWxAppBusinessApiResetUserSessionKeyResponse ResetUserSessionKeyAsync(WechatWxOpenWxAppBusinessApiResetUserSessionKeyRequest request)
-  - GET /wxa/resetusersessionkey
 
 - async WechatResponse ResetUserSessionKeyRawAsync(string query)
 
@@ -11108,8 +10425,6 @@ WxApp/Business/BusinessApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWxAppBusinessApiGetUserPhoneNumberRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenWxAppBusinessApiGetUserPhoneNumberRequest()
@@ -11170,23 +10485,16 @@ WxApp/Business/BusinessApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWxAppGenerateSchemeApi (class)
 
-WxApp/GenerateSchemeApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenWxAppGenerateSchemeApi(WechatWxOpenClient client)
 
 - async WechatWxOpenWxAppGenerateSchemeApiSubmitPagesResponse SubmitPagesAsync(WechatWxOpenWxAppGenerateSchemeApiSubmitPagesRequest request)
-  - POST /wxa/search/wxaapi_submitpages
 
 - async WechatResponse SubmitPagesRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenWxAppGenerateSchemeApiSubmitPagesRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 
@@ -11208,23 +10516,16 @@ WxApp/GenerateSchemeApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWxAppSearchApi (class)
 
-WxApp/SearchApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenWxAppSearchApi(WechatWxOpenClient client)
 
 - async WechatWxOpenWxAppSearchApiSubmitPagesResponse SubmitPagesAsync(WechatWxOpenWxAppSearchApiSubmitPagesRequest request)
-  - POST /wxa/search/wxaapi_submitpages
 
 - async WechatResponse SubmitPagesRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenWxAppSearchApiSubmitPagesRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 
@@ -11246,23 +10547,16 @@ WxApp/SearchApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWxAppShortLinkApi (class)
 
-WxApp/ShortLinkApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenWxAppShortLinkApi(WechatWxOpenClient client)
 
 - async WechatWxOpenWxAppShortLinkApiGenerateResponse GenerateAsync(WechatWxOpenWxAppShortLinkApiGenerateRequest request)
-  - POST /wxa/genwxashortlink
 
 - async WechatResponse GenerateRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenWxAppShortLinkApiGenerateRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 
@@ -11286,28 +10580,20 @@ WxApp/ShortLinkApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWxAppUrlLinkApi (class)
 
-WxApp/UrlLinkApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenWxAppUrlLinkApi(WechatWxOpenClient client)
 
 - async WechatWxOpenWxAppUrlLinkApiGenerateResponse GenerateAsync(WechatWxOpenWxAppUrlLinkApiGenerateRequest request)
-  - POST /wxa/generate_urllink
 
 - async WechatResponse GenerateRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppUrlLinkApiQueryResponse QueryAsync(WechatWxOpenWxAppUrlLinkApiQueryRequest request)
-  - POST /wxa/query_urllink
 
 - async WechatResponse QueryRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenWxAppUrlLinkApiGenerateRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 
@@ -11369,26 +10655,19 @@ WxApp/UrlLinkApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenWxAppUrlSchemeApi (class)
 
-WxApp/UrlScheme/UrlSchemeApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenWxAppUrlSchemeApi(WechatWxOpenClient client)
 
 - async WechatWxOpenWxAppUrlSchemeApiGenerateSchemeResponse GenerateSchemeAsync(WechatWxOpenWxAppUrlSchemeApiGenerateSchemeRequest request)
-  - POST /wxa/generatescheme
 
 - async WechatResponse GenerateSchemeRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppUrlSchemeApiGenerateNFCSchemeResponse GenerateNFCSchemeAsync(WechatWxOpenWxAppUrlSchemeApiGenerateNFCSchemeRequest request)
-  - POST /wxa/generatenfcscheme
 
 - async WechatResponse GenerateNFCSchemeRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenWxAppUrlSchemeApiQuerySchemeResponse QuerySchemeAsync(WechatWxOpenWxAppUrlSchemeApiQuerySchemeRequest request)
-  - POST /wxa/queryscheme
 
 - async WechatResponse QuerySchemeRawAsync(string query, string jsonBody)
 
@@ -11420,8 +10699,6 @@ WxApp/UrlScheme/UrlSchemeApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWxOpenWxAppUrlSchemeApiGenerateSchemeRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 
@@ -11469,186 +10746,147 @@ WxApp/UrlScheme/UrlSchemeApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenXPayApi (class)
 
-XPay/XPayApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenXPayApi(WechatWxOpenClient client)
 
 - async WechatWxOpenXPayApiQueryUserBalanceResponse QueryUserBalanceAsync(WechatWxOpenXPayApiQueryUserBalanceRequest request)
-  - POST /xpay/query_user_balance
 
 - async WechatResponse QueryUserBalanceRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiCurrencyPayResponse CurrencyPayAsync(WechatWxOpenXPayApiCurrencyPayRequest request)
-  - POST /xpay/currency_pay
 
 - async WechatResponse CurrencyPayRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiQueryOrderResponse QueryOrderAsync(WechatWxOpenXPayApiQueryOrderRequest request)
-  - POST /xpay/query_order
 
 - async WechatResponse QueryOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiCancelCurrencyPayResponse CancelCurrencyPayAsync(WechatWxOpenXPayApiCancelCurrencyPayRequest request)
-  - POST /xpay/cancel_currency_pay
 
 - async WechatResponse CancelCurrencyPayRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiNotifyProvideGoodsResponse NotifyProvideGoodsAsync(WechatWxOpenXPayApiNotifyProvideGoodsRequest request)
-  - POST /xpay/notify_provide_goods
 
 - async WechatResponse NotifyProvideGoodsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiPresentCurrencyResponse PresentCurrencyAsync(WechatWxOpenXPayApiPresentCurrencyRequest request)
-  - POST /xpay/present_currency
 
 - async WechatResponse PresentCurrencyRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiDownloadBillResponse DownloadBillAsync(WechatWxOpenXPayApiDownloadBillRequest request)
-  - POST /xpay/download_bill
 
 - async WechatResponse DownloadBillRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiRefundOrderResponse RefundOrderAsync(WechatWxOpenXPayApiRefundOrderRequest request)
-  - POST /xpay/refund_order
 
 - async WechatResponse RefundOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiCreateWithdrawOrderResponse CreateWithdrawOrderAsync(WechatWxOpenXPayApiCreateWithdrawOrderRequest request)
-  - POST /xpay/create_withdraw_order
 
 - async WechatResponse CreateWithdrawOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiQueryWithdrawOrderResponse QueryWithdrawOrderAsync(WechatWxOpenXPayApiQueryWithdrawOrderRequest request)
-  - POST /xpay/query_withdraw_order
 
 - async WechatResponse QueryWithdrawOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiStartUploadGoodsResponse StartUploadGoodsAsync(WechatWxOpenXPayApiStartUploadGoodsRequest request)
-  - POST /xpay/start_upload_goods
 
 - async WechatResponse StartUploadGoodsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiQueryUploadGoodsResponse QueryUploadGoodsAsync(WechatWxOpenXPayApiQueryUploadGoodsRequest request)
-  - POST /xpay/query_upload_goods
 
 - async WechatResponse QueryUploadGoodsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiStartPublishGoodsResponse StartPublishGoodsAsync(WechatWxOpenXPayApiStartPublishGoodsRequest request)
-  - POST /xpay/start_publish_goods
 
 - async WechatResponse StartPublishGoodsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiQueryPublishGoodsResponse QueryPublishGoodsAsync(WechatWxOpenXPayApiQueryPublishGoodsRequest request)
-  - POST /xpay/query_publish_goods
 
 - async WechatResponse QueryPublishGoodsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiQueryBizBalanceResponse QueryBizBalanceAsync(WechatWxOpenXPayApiQueryBizBalanceRequest request)
-  - POST /xpay/query_biz_balance
 
 - async WechatResponse QueryBizBalanceRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiQueryTransferAccountResponse QueryTransferAccountAsync(WechatWxOpenXPayApiQueryTransferAccountRequest request)
-  - POST /xpay/query_transfer_account
 
 - async WechatResponse QueryTransferAccountRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiQueryAdverFundsResponse QueryAdverFundsAsync(WechatWxOpenXPayApiQueryAdverFundsRequest request)
-  - POST /xpay/query_adver_funds
 
 - async WechatResponse QueryAdverFundsRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiCreateFundsBillResponse CreateFundsBillAsync(WechatWxOpenXPayApiCreateFundsBillRequest request)
-  - POST /xpay/create_funds_bill
 
 - async WechatResponse CreateFundsBillRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiBindTransferAccoutResponse BindTransferAccoutAsync(WechatWxOpenXPayApiBindTransferAccoutRequest request)
-  - POST /xpay/bind_transfer_accout
 
 - async WechatResponse BindTransferAccoutRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiQueryFundsBillResponse QueryFundsBillAsync(WechatWxOpenXPayApiQueryFundsBillRequest request)
-  - POST /xpay/query_funds_bill
 
 - async WechatResponse QueryFundsBillRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiQueryRecoverBillResponse QueryRecoverBillAsync(WechatWxOpenXPayApiQueryRecoverBillRequest request)
-  - POST /xpay/query_recover_bill
 
 - async WechatResponse QueryRecoverBillRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiGetComplaintListResponse GetComplaintListAsync(WechatWxOpenXPayApiGetComplaintListRequest request)
-  - POST /xpay/get_complaint_list
 
 - async WechatResponse GetComplaintListRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiGetComplaintDetailResponse GetComplaintDetailAsync(WechatWxOpenXPayApiGetComplaintDetailRequest request)
-  - POST /xpay/get_complaint_detail
 
 - async WechatResponse GetComplaintDetailRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiGetNegotiationHistoryResponse GetNegotiationHistoryAsync(WechatWxOpenXPayApiGetNegotiationHistoryRequest request)
-  - POST /xpay/get_negotiation_history
 
 - async WechatResponse GetNegotiationHistoryRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiResponseComplaintResponse ResponseComplaintAsync(WechatWxOpenXPayApiResponseComplaintRequest request)
-  - POST /xpay/response_complaint
 
 - async WechatResponse ResponseComplaintRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiCompleteComplaintResponse CompleteComplaintAsync(WechatWxOpenXPayApiCompleteComplaintRequest request)
-  - POST /xpay/complete_complaint
 
 - async WechatResponse CompleteComplaintRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiUploadVpFileResponse UploadVpFileAsync(WechatWxOpenXPayApiUploadVpFileRequest request)
-  - POST /xpay/upload_vp_file
 
 - async WechatResponse UploadVpFileRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiGetUploadFileSignResponse GetUploadFileSignAsync(WechatWxOpenXPayApiGetUploadFileSignRequest request)
-  - POST /xpay/get_upload_file_sign
 
 - async WechatResponse GetUploadFileSignRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiDownloadAdverfundsOrderResponse DownloadAdverfundsOrderAsync(WechatWxOpenXPayApiDownloadAdverfundsOrderRequest request)
-  - POST /xpay/download_adverfunds_order
 
 - async WechatResponse DownloadAdverfundsOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiQuerySubscribeContractResponse QuerySubscribeContractAsync(WechatWxOpenXPayApiQuerySubscribeContractRequest request)
-  - POST /xpay/query_subscribe_contract
 
 - async WechatResponse QuerySubscribeContractRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiSendSubscribePrePaymentResponse SendSubscribePrePaymentAsync(WechatWxOpenXPayApiSendSubscribePrePaymentRequest request)
-  - POST /xpay/send_subscribe_pre_payment
 
 - async WechatResponse SendSubscribePrePaymentRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiSubmitSubscribePayOrderResponse SubmitSubscribePayOrderAsync(WechatWxOpenXPayApiSubmitSubscribePayOrderRequest request)
-  - POST /xpay/submit_subscribe_pay_order
 
 - async WechatResponse SubmitSubscribePayOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiCancelSubscribeContractResponse CancelSubscribeContractAsync(WechatWxOpenXPayApiCancelSubscribeContractRequest request)
-  - POST /xpay/cancel_subscribe_contract
 
 - async WechatResponse CancelSubscribeContractRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiStartDownloadOrderResponse StartDownloadOrderAsync(WechatWxOpenXPayApiStartDownloadOrderRequest request)
-  - POST /xpay/start_download_order
 
 - async WechatResponse StartDownloadOrderRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayApiQueryDownloadOrderResponse QueryDownloadOrderAsync(WechatWxOpenXPayApiQueryDownloadOrderRequest request)
-  - POST /xpay/query_download_order
 
 - async WechatResponse QueryDownloadOrderRawAsync(string query, string jsonBody)
 
@@ -12263,8 +11501,6 @@ XPay/XPayApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenXPayApiQueryUserBalanceRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
-
 - WechatTypedRequest request;
 
 - public WechatWxOpenXPayApiQueryUserBalanceRequest()
@@ -12545,33 +11781,24 @@ XPay/XPayApi.cs 的 Zan 强类型接口。
 
 ## WechatWxOpenXPayIncrementApi (class)
 
-XPay/XPayIncrementApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWxOpenClient client;
 
 - public WechatWxOpenXPayIncrementApi(WechatWxOpenClient client)
 
 - async WechatWxOpenXPayIncrementApiBindTransferAccountResponse BindTransferAccountAsync(WechatWxOpenXPayIncrementApiBindTransferAccountRequest request)
-  - POST /xpay/bind_transfer_accout
 
 - async WechatResponse BindTransferAccountRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayIncrementApiDownloadIosSettlementBillResponse DownloadIosSettlementBillAsync(WechatWxOpenXPayIncrementApiDownloadIosSettlementBillRequest request)
-  - POST /xpay/download_ios_settlement_bill
 
 - async WechatResponse DownloadIosSettlementBillRawAsync(string query, string jsonBody)
 
 - async WechatWxOpenXPayIncrementApiQueryPunishmentReasonsResponse QueryPunishmentReasonsAsync(WechatWxOpenXPayIncrementApiQueryPunishmentReasonsRequest request)
-  - POST /xpay/query_punishment_reasons
 
 - async WechatResponse QueryPunishmentReasonsRawAsync(string query, string jsonBody)
 
 
 ## WechatWxOpenXPayIncrementApiBindTransferAccountRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体位于 Sdk.Wechat.Models.WxOpen。
 
 - WechatTypedRequest request;
 

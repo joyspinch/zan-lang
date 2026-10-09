@@ -14,7 +14,7 @@
 | 页面 | 内容 | 适合 |
 |---|---|---|
 | [`/lang.md`](/lang.md) | **语言参考**：全部语法/类型/语句/泛型/异步/ARC/FFI/工具链，含「与 C# 的差异」与「未实现特性」清单 | 写任何 Zan 代码前必读 |
-| [`/gui.md`](/gui.md) | **GUI 开发指南**：App/Form/Control 架构、`.zform` JSON 设计文档完整 schema、代码式组件操作、布局、样式/主题/皮肤、事件、控件、Canvas、WebView/CEF/DataGrid | 做界面/窗口应用 |
+| [`/gui.md`](/gui.md) | **GUI 开发指南**：App/Form/Control 架构、`.html` 设计文档规范、代码式组件操作、布局、样式/主题/皮肤、事件、控件、Canvas、WebView/CEF/DataGrid | 做界面/窗口应用 |
 | [`/stdlib.md`](/stdlib.md) | **标准库总览**：全部命名空间地图、语言内建类型成员速查、常用写法（文件/JSON/HTTP/数据库/加密/线程） | 找 API 归属 |
 | [`/ref/index.json`](/ref/index.json) | **机器可读索引**：命名空间 → 类型清单 + 源码文件列表 | 程序化检索 |
 | [`/ref/<ns>.md`](/ref/System.IO.md) | **逐命名空间 API 参考**：类型 + 成员完整签名 + `///` 文档注释（从 stdlib 源码提取） | 查具体类/方法 |
@@ -35,12 +35,12 @@
 
 ### 我要写一个 GUI 窗口/组件
 
-1. `/gui.md` — 架构、`.zform`、代码式操作、布局样式事件（大部分答案在此）；
+1. `/gui.md` — 架构、`.html` 设计稿、代码式操作、布局样式事件（大部分答案在此）；
 2. 按需 `/ref/Gui.md`（App/Control/Form/Canvas）、`/ref/Gui.Widget.md`（控件）、
    `/ref/Gui.Component.md`（DataGrid/WebView/CodeEditor/Chart 等）、
    `/ref/Gui.Hmi.md`；
-3. 用 `.zform` 时注意：`kind` 写**类名**（`SelectBox`/`WebViewBox`/`CefBrowserBox`/
-   `DataGrid`），泛型控件用 `of`；事件绑定 `onClick: "Handler名"` + 代码后置
+3. 用 `.html` 设计稿时注意：`data-kind` 写**类名**（`SelectBox`/`WebViewBox`/`CefBrowserBox`/
+   `DataGrid`），泛型控件用 `data-of`；事件绑定 `onClick: "Handler名"` + 代码后置
    `static void OnLoad(Form form)`。
 
 ### 我要写服务端（HTTP/MQTT/WS/TCP）
@@ -79,7 +79,7 @@
 
 1. 抓 `/tooling.md`——先建立工具/定位心智（3 次调用内解决问题，杜绝通读）；
 2. 抓 `/lang.md` 了解语法与限制；
-3. 抓 `/gui.md` 确定用 `.zform` 还是代码建控件；
+3. 抓 `/gui.md` 确定用 `.html` 设计稿还是代码建控件；
 4. 抓 `/ref/Gui.Widget.md` 找 `Button`/`Tabs` 的字段与事件名；
 5. 抓 `/ref/System.IO.md` 找文件读写 API；
 6. 按 `/wiki.md`/`/examples.md` 组织项目文件结构（`zan.proj` + `src/`）；

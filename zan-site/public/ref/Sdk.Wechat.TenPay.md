@@ -5,15 +5,9 @@
 
 ## WechatPayConfigRegistry (class)
 
-按名称保存多商户配置，对应原 SDK 的 TenPayV3InfoCollection。
+- List<WechatPayV3Entry> v3Entries;
 
-- List<string> v3Names;
-
-- List<WechatPayV3Config> v3Values;
-
-- List<string> v2Names;
-
-- List<WechatPayV2Config> v2Values;
+- List<WechatPayV2Entry> v2Entries;
 
 - public WechatPayConfigRegistry()
 
@@ -25,12 +19,12 @@
 
 - WechatPayV2Config GetV2(string name)
 
-- int IndexOf(List<string> names, string name)
+- int IndexOfV3(string name)
+
+- int IndexOfV2(string name)
 
 
 ## WechatPayLegacyMpClient (class)
-
-早期公众号微信支付客户端。AppId/AppSecret 是配置，短期 access_token 可在刷新后设置。
 
 - WechatPayLegacyMpConfig config;
 
@@ -55,8 +49,6 @@
 
 ## WechatPayLegacyMpConfig (class)
 
-早期公众号支付 /pay 与 /payfeedback 接口配置。
-
 - string AppId;
 
 - string AppSecret;
@@ -69,8 +61,6 @@
 
 
 ## WechatPayLegacyProfitSharingApi (class)
-
-旧版 XML 分账接口。
 
 - WechatPayV2Client client;
 
@@ -90,8 +80,6 @@
 
 
 ## WechatPayLegacyRedPackApi (class)
-
-现金红包、企业红包等仅在原 SDK 中提供同步方法的 V2/mTLS 接口。
 
 - WechatPayV2Client client;
 
@@ -121,21 +109,15 @@
 - public WechatPayLegacyTenPayApi(WechatPayLegacyMpClient client)
 
 - async WechatPayLegacyTenPayApiDelivernotifyResponse DelivernotifyAsync(WechatPayLegacyTenPayApiDelivernotifyRequest request)
-  - POST /pay/delivernotify?access_token={0}; C# 参数：string appId, string accessToken,string openId, string transId, string out_Trade_No, string deliver_TimesTamp, string deliver_Status, string deliver_Msg, string app_Signature, string sign_Method = "sha1"
 
 - async WechatRawResponse DelivernotifyRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayLegacyTenPayApiOrderqueryResponse OrderqueryAsync(WechatPayLegacyTenPayApiOrderqueryRequest request)
-  - POST /pay/orderquery?access_token={0}; C# 参数：string appId, string accessToken, string package, string timesTamp, string app_Signature, string sign_Method
 
 - async WechatRawResponse OrderqueryRawAsync(string path, string query, string jsonBody)
 
 
 ## WechatPayLegacyTenPayApiDelivernotifyRequest (class)
-
-TenPay.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -216,16 +198,11 @@ TenPay.cs 的 Zan 微信支付强类型接口。
 - public WechatPayLegacyTenPayRightsApi(WechatPayLegacyMpClient client)
 
 - async WechatPayLegacyTenPayRightsApiUpDateFeedBackResponse UpDateFeedBackAsync(WechatPayLegacyTenPayRightsApiUpDateFeedBackRequest request)
-  - GET /payfeedback/更新?access_token={0}&openid={1}&feedbackid={2}; C# 参数：string accessToken, string openId, string feedBackId
 
 - async WechatRawResponse UpDateFeedBackRawAsync(string path, string query)
 
 
 ## WechatPayLegacyTenPayRightsApiUpDateFeedBackRequest (class)
-
-TenPayRights.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -260,77 +237,62 @@ TenPayRights.cs 的 Zan 微信支付强类型接口。
 - public WechatPayLegacyTenPayV3Api(WechatPayV2Client client)
 
 - async WechatPayLegacyTenPayV3ApiGetSignKeyResponse GetSignKeyAsync(WechatPayLegacyTenPayV3ApiGetSignKeyRequest request)
-  - POST /sandboxnew/pay/getsignkey; C# 参数：TenPayV3GetSignKeyRequestData dataInfo, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse GetSignKeyRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenPayV3ApiUnifiedorderResponse UnifiedorderAsync(WechatPayLegacyTenPayV3ApiUnifiedorderRequest request)
-  - POST /pay/unifiedorder; C# 参数：string 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UnifiedorderRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenPayV3ApiHtml5OrderResponse Html5OrderAsync(WechatPayLegacyTenPayV3ApiHtml5OrderRequest request)
-  - POST /pay/unifiedorder; C# 参数：TenPayV3UnifiedorderRequestData dataInfo, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse Html5OrderRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenPayV3ApiRefundResponse RefundAsync(WechatPayLegacyTenPayV3ApiRefundRequest request)
-  - POST /secapi/pay/refund; C# 参数：IServiceProvider serviceProvider, TenPayV3RefundRequestData dataInfo, #if NET462 string cert, string certPassword, #endif int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse RefundRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenPayV3ApiOrderQueryResponse OrderQueryAsync(WechatPayLegacyTenPayV3ApiOrderQueryRequest request)
-  - POST /pay/orderquery; C# 参数：string 数据
 
 - async WechatRawResponse OrderQueryRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenPayV3ApiCloseOrderResponse CloseOrderAsync(WechatPayLegacyTenPayV3ApiCloseOrderRequest request)
-  - POST /pay/closeorder; C# 参数：string 数据
 
 - async WechatRawResponse CloseOrderRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenPayV3ApiReverseResponse ReverseAsync(WechatPayLegacyTenPayV3ApiReverseRequest request)
-  - POST /secapi/pay/reverse; C# 参数：string 数据
 
 - async WechatRawResponse ReverseRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenPayV3ApiRefundQueryResponse RefundQueryAsync(WechatPayLegacyTenPayV3ApiRefundQueryRequest request)
-  - POST /pay/refundquery; C# 参数：string 数据
 
 - async WechatRawResponse RefundQueryRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenPayV3ApiDownloadBillResponse DownloadBillAsync(WechatPayLegacyTenPayV3ApiDownloadBillRequest request)
-  - POST /pay/downloadbill; C# 参数：string 数据
 
 - async WechatRawResponse DownloadBillRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenPayV3ApiShortUrlResponse ShortUrlAsync(WechatPayLegacyTenPayV3ApiShortUrlRequest request)
-  - POST /tools/shorturl; C# 参数：string 数据
 
 - async WechatRawResponse ShortUrlRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenPayV3ApiMicroPayResponse MicroPayAsync(WechatPayLegacyTenPayV3ApiMicroPayRequest request)
-  - POST /pay/micropay; C# 参数：string 数据
 
 - async WechatRawResponse MicroPayRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenPayV3ApiTransfersResponse TransfersAsync(WechatPayLegacyTenPayV3ApiTransfersRequest request)
-  - POST /mmpaymkttransfers/promotion/transfers; C# 参数：string 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse TransfersRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenPayV3ApiPayToWorkerResponse PayToWorkerAsync(WechatPayLegacyTenPayV3ApiPayToWorkerRequest request)
-  - POST /mmpaymkttransfers/promotion/paywwsptrans2pocket; C# 参数：IServiceProvider serviceProvider, TenPayV3PayToWorkerRequestData dataInfo, #if NET462 string cert, string certPassword, #endif int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse PayToWorkerRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenPayV3ApiGetTransferInfoResponse GetTransferInfoAsync(WechatPayLegacyTenPayV3ApiGetTransferInfoRequest request)
-  - POST /mmpaymkttransfers/gettransferinfo; C# 参数：string 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse GetTransferInfoRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenPayV3ApiQueryPayLogResponse QueryPayLogAsync(WechatPayLegacyTenPayV3ApiQueryPayLogRequest request)
-  - POST /mmpaymkttransfers/promotion/querywwsptrans2pocket; C# 参数：IServiceProvider serviceProvider, TenPayV3GetTransferInfoRequestData dataInfo, #if NET462 string cert, string certPassword, #endif int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryPayLogRawAsync(WechatPayV2Request request)
 
@@ -372,10 +334,6 @@ TenPayRights.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayLegacyTenPayV3ApiGetSignKeyRequest (class)
-
-TenPayV3.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatPayV2Request request;
 
@@ -906,17 +864,14 @@ TenPayV3.cs 的 Zan 微信支付强类型接口。
 - public WechatPayLegacyTenpayV3PayBankApi(WechatPayV2Client client)
 
 - async WechatPayLegacyTenpayV3PayBankApiPayBankResponse PayBankAsync(WechatPayLegacyTenpayV3PayBankApiPayBankRequest request)
-  - POST /mmpaysptrans/pay_bank; C# 参数：IServiceProvider serviceProvider, TenPayV3PayBankRequestData dataInfo, #if NET462 string cert, string certPassword, #endif int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse PayBankRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenpayV3PayBankApiQueryBankResponse QueryBankAsync(WechatPayLegacyTenpayV3PayBankApiQueryBankRequest request)
-  - POST /mmpaysptrans/query_bank; C# 参数：IServiceProvider serviceProvider, TenPayV3QueryBankRequestData dataInfo, #if NET462 string cert, string certPassword, #endif int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryBankRawAsync(WechatPayV2Request request)
 
 - async WechatPayLegacyTenpayV3PayBankApiGetPublicKeyResponse GetPublicKeyAsync(WechatPayLegacyTenpayV3PayBankApiGetPublicKeyRequest request)
-  - POST /risk/getpublickey; C# 参数：IServiceProvider serviceProvider, TenPayV3QueryBankRequestData dataInfo, #if NET462 string cert, string certPassword, #endif int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse GetPublicKeyRawAsync(WechatPayV2Request request)
 
@@ -964,10 +919,6 @@ TenPayV3.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayLegacyTenpayV3PayBankApiPayBankRequest (class)
-
-TenpayV3.PayBank.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatPayV2Request request;
 
@@ -1095,8 +1046,6 @@ TenpayV3.PayBank.cs 的 Zan 微信支付强类型接口。
 
 ## WechatPayLegacyUtilities (class)
 
-旧版微信支付中没有异步端点对应项的工具函数。
-
 - static string NativePayV1(string sign, string appId, string timestamp, string nonce, string productId)
 
 - static string NativePay(string appId, string timestamp, string merchantId, string nonce, string productId, string sign)
@@ -1105,9 +1054,6 @@ TenpayV3.PayBank.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayNotification (class)
-
-微信支付 API v3 通知。原始报文、通知 ID、验签与 AES-GCM 资源解密均保留，
-业务方可将 DecryptResource() 的 JSON 再映射为自己的数据类型。
 
 - string Id;
 
@@ -1142,15 +1088,20 @@ TenpayV3.PayBank.cs 的 Zan 微信支付强类型接口。
 - string DecryptResource(WechatPayV3Client client)
 
 
+## WechatPayPlatformKeyEntry (class)
+
+- public string serial;
+
+- public string pem;
+
+- public RsaKey key;
+
+- WechatPayPlatformKeyEntry(string serial, string pem, RsaKey key)
+
+
 ## WechatPayPlatformKeyStore (class)
 
-微信支付平台证书/公钥缓存，按序列号支持证书轮换。
-
-- List<string> serials;
-
-- List<string> pems;
-
-- List<RsaKey> keys;
+- List<WechatPayPlatformKeyEntry> entries;
 
 - public WechatPayPlatformKeyStore()
 
@@ -1173,8 +1124,6 @@ TenpayV3.PayBank.cs 的 Zan 微信支付强类型接口。
 
 ## WechatPaySpecialBuilders (class)
 
-现代特殊接口中的客户端参数构造辅助。
-
 - static string VehicleParkingRepaymentMiniProgramAppId()
 
 - static string VehicleParkingRepaymentMiniProgramUserName()
@@ -1187,8 +1136,6 @@ TenpayV3.PayBank.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV2Client (class)
-
-微信支付 V2 XML 客户端，支持普通 HTTPS 与退款/红包所需 mTLS。
 
 - WechatPayV2Config config;
 
@@ -1216,8 +1163,6 @@ TenpayV3.PayBank.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV2Config (class)
-
-微信支付 V2/XML 商户配置。
 
 - string AppId;
 
@@ -1258,9 +1203,16 @@ TenpayV3.PayBank.cs 的 Zan 微信支付强类型接口。
 - WechatPayV2Config SetServiceProviderCredentials(string subAppId, string subAppSecret, string subMerchantId)
 
 
-## WechatPayV2Field (class)
+## WechatPayV2Entry (class)
 
-微信支付 V2/XML 单个参数。
+- public string name;
+
+- public WechatPayV2Config config;
+
+- WechatPayV2Entry(string name, WechatPayV2Config config)
+
+
+## WechatPayV2Field (class)
 
 - string name;
 
@@ -1270,8 +1222,6 @@ TenpayV3.PayBank.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV2Request (class)
-
-微信支付 V2/XML 参数集合、排序签名与 XML 编解码。
 
 - List<WechatPayV2Field> fields;
 
@@ -1311,36 +1261,27 @@ TenpayV3.PayBank.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3Apply4SubApply4SubApisApi(WechatPayV3Client client)
 
 - async WechatPayV3Apply4SubApply4SubApisApiApply4SubApplymentResponse Apply4SubApplymentAsync(WechatPayV3Apply4SubApply4SubApisApiApply4SubApplymentRequest request)
-  - POST /v3/apply4sub/applyment/; C# 参数：Apply4SubApplymentRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse Apply4SubApplymentRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3Apply4SubApply4SubApisApiQueryApply4SubApplymentByIdResponse QueryApply4SubApplymentByIdAsync(WechatPayV3Apply4SubApply4SubApisApiQueryApply4SubApplymentByIdRequest request)
-  - GET /v3/apply4sub/applyment/applyment_id/{数据.applyment_id}; C# 参数：QueryApply4SubApplymentByIdRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryApply4SubApplymentByIdRawAsync(string path, string query)
 
 - async WechatPayV3Apply4SubApply4SubApisApiQueryApply4SubApplymentByOutRequestNoResponse QueryApply4SubApplymentByOutRequestNoAsync(WechatPayV3Apply4SubApply4SubApisApiQueryApply4SubApplymentByOutRequestNoRequest request)
-  - GET /v3/apply4sub/applyment/out_request_no/{数据.out_request_no}; C# 参数：QueryApply4SubApplymentByOutRequestNoRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryApply4SubApplymentByOutRequestNoRawAsync(string path, string query)
 
 - async WechatPayV3Apply4SubApply4SubApisApiModifyApply4SubSettlementResponse ModifyApply4SubSettlementAsync(WechatPayV3Apply4SubApply4SubApisApiModifyApply4SubSettlementRequest request)
-  - POST /v3/apply4sub/sub_merchants/{数据.sub_mchid}/modify-settlement; C# 参数：ModifyApply4SubSettlementRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ModifyApply4SubSettlementRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3Apply4SubApply4SubApisApiQueryApply4SubSettlementResponse QueryApply4SubSettlementAsync(WechatPayV3Apply4SubApply4SubApisApiQueryApply4SubSettlementRequest request)
-  - GET /v3/apply4sub/sub_merchants/{数据.sub_mchid}/settlement; C# 参数：QueryApply4SubSettlementRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryApply4SubSettlementRawAsync(string path, string query)
 
 
 ## WechatPayV3Apply4SubApply4SubApisApiApply4SubApplymentRequest (class)
-
-Apply4Sub/Apply4SubApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -1491,42 +1432,34 @@ Apply4Sub/Apply4SubApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3Apply4SubApply4SubApisCurrentApi(WechatPayV3Client client)
 
 - async WechatPayV3Apply4SubApply4SubApisCurrentApiSubmitApplymentResponse SubmitApplymentAsync(WechatPayV3Apply4SubApply4SubApisCurrentApiSubmitApplymentRequest request)
-  - POST /v3/applyment4sub/applyment/; C# 参数：Apply4SubCurrentApplymentRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SubmitApplymentRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3Apply4SubApply4SubApisCurrentApiQueryApplymentByIdResponse QueryApplymentByIdAsync(WechatPayV3Apply4SubApply4SubApisCurrentApiQueryApplymentByIdRequest request)
-  - GET /v3/applyment4sub/applyment/applyment_id/{applymentId}; C# 参数：long applymentId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryApplymentByIdRawAsync(string path, string query)
 
 - async WechatPayV3Apply4SubApply4SubApisCurrentApiQueryApplymentByBusinessCodeResponse QueryApplymentByBusinessCodeAsync(WechatPayV3Apply4SubApply4SubApisCurrentApiQueryApplymentByBusinessCodeRequest request)
-  - GET /v3/applyment4sub/applyment/business_code/{EscapeCurrent(businessCode)}; C# 参数：string businessCode, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryApplymentByBusinessCodeRawAsync(string path, string query)
 
 - async WechatPayV3Apply4SubApply4SubApisCurrentApiModifySettlementResponse ModifySettlementAsync(WechatPayV3Apply4SubApply4SubApisCurrentApiModifySettlementRequest request)
-  - POST /v3/apply4sub/sub_merchants/{EscapeCurrent(subMchId)}/modify-settlement; C# 参数：string subMchId, Apply4SubModifySettlementRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ModifySettlementRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3Apply4SubApply4SubApisCurrentApiQuerySettlementResponse QuerySettlementAsync(WechatPayV3Apply4SubApply4SubApisCurrentApiQuerySettlementRequest request)
-  - GET /v3/apply4sub/sub_merchants/{EscapeCurrent(subMchId)}/settlement; C# 参数：string subMchId, string accountNumberRule = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QuerySettlementRawAsync(string path, string query)
 
 - async WechatPayV3Apply4SubApply4SubApisCurrentApiQuerySettlementModificationResponse QuerySettlementModificationAsync(WechatPayV3Apply4SubApply4SubApisCurrentApiQuerySettlementModificationRequest request)
-  - GET /v3/apply4sub/sub_merchants/{EscapeCurrent(subMchId)}/application/{EscapeCurrent(applicationNo)}; C# 参数：string subMchId, string applicationNo, string accountNumberRule = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QuerySettlementModificationRawAsync(string path, string query)
 
 - async WechatPayV3Apply4SubApply4SubApisCurrentApiUploadFileResponse UploadFileAsync(WechatPayV3Apply4SubApply4SubApisCurrentApiUploadFileRequest request, WechatMultipart multipart)
-  - POST /v3/merchant/media/upload; C# 参数：string fileName, Stream fileStream, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UploadFileRawAsync(string path, string query, WechatMultipart multipart)
 
 - async WechatPayV3Apply4SubApply4SubApisCurrentApiUploadVideoResponse UploadVideoAsync(WechatPayV3Apply4SubApply4SubApisCurrentApiUploadVideoRequest request, WechatMultipart multipart)
-  - POST /v3/merchant/media/video_upload; C# 参数：string fileName, Stream fileStream, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UploadVideoRawAsync(string path, string query, WechatMultipart multipart)
 
@@ -1671,10 +1604,6 @@ Apply4Sub/Apply4SubApis.cs 的 Zan 微信支付强类型接口。
 
 ## WechatPayV3Apply4SubApply4SubApisCurrentApiSubmitApplymentRequest (class)
 
-Apply4Sub/Apply4SubApis.Current.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
-
 - WechatTypedRequest request;
 
 - string overridePath;
@@ -1764,31 +1693,23 @@ Apply4Sub/Apply4SubApis.Current.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3Apply4SubjectApply4SubjectApisApi(WechatPayV3Client client)
 
 - async WechatPayV3Apply4SubjectApply4SubjectApisApiApply4SubjectApplymentResponse Apply4SubjectApplymentAsync(WechatPayV3Apply4SubjectApply4SubjectApisApiApply4SubjectApplymentRequest request)
-  - POST /v3/apply4subject/applyment; C# 参数：Apply4SubjectApplymentRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse Apply4SubjectApplymentRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3Apply4SubjectApply4SubjectApisApiCancelApply4SubjectApplymentResponse CancelApply4SubjectApplymentAsync(WechatPayV3Apply4SubjectApply4SubjectApisApiCancelApply4SubjectApplymentRequest request)
-  - POST /v3/apply4subject/applyment/{数据.applyment_id}/cancel; C# 参数：CancelApply4SubjectApplymentRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CancelApply4SubjectApplymentRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3Apply4SubjectApply4SubjectApisApiQueryApply4SubjectApplymentByIdResponse QueryApply4SubjectApplymentByIdAsync(WechatPayV3Apply4SubjectApply4SubjectApisApiQueryApply4SubjectApplymentByIdRequest request)
-  - GET /v3/apply4subject/applyment/applyment_id/{数据.applyment_id}; C# 参数：QueryApply4SubjectApplymentByIdRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryApply4SubjectApplymentByIdRawAsync(string path, string query)
 
 - async WechatPayV3Apply4SubjectApply4SubjectApisApiQueryApply4SubjectApplymentByOutRequestNoResponse QueryApply4SubjectApplymentByOutRequestNoAsync(WechatPayV3Apply4SubjectApply4SubjectApisApiQueryApply4SubjectApplymentByOutRequestNoRequest request)
-  - GET /v3/apply4subject/applyment/out_request_no/{数据.out_request_no}; C# 参数：QueryApply4SubjectApplymentByOutRequestNoRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryApply4SubjectApplymentByOutRequestNoRawAsync(string path, string query)
 
 
 ## WechatPayV3Apply4SubjectApply4SubjectApisApiApply4SubjectApplymentRequest (class)
-
-Apply4Subject/Apply4SubjectApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -1897,27 +1818,22 @@ Apply4Subject/Apply4SubjectApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3Apply4SubjectApply4SubjectApisCurrentApi(WechatPayV3Client client)
 
 - async WechatPayV3Apply4SubjectApply4SubjectApisCurrentApiSubmitApplymentResponse SubmitApplymentAsync(WechatPayV3Apply4SubjectApply4SubjectApisCurrentApiSubmitApplymentRequest request)
-  - POST /v3/apply4subject/applyment/; C# 参数：Apply4SubjectApplicationRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SubmitApplymentRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3Apply4SubjectApply4SubjectApisCurrentApiCancelApplymentResponse CancelApplymentAsync(WechatPayV3Apply4SubjectApply4SubjectApisCurrentApiCancelApplymentRequest request)
-  - POST /v3/apply4subject/applyment/{Escape(identifier)}/cancel; C# 参数：string businessCode = null, long? applymentId = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CancelApplymentRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3Apply4SubjectApply4SubjectApisCurrentApiQueryApplymentAuditResultResponse QueryApplymentAuditResultAsync(WechatPayV3Apply4SubjectApply4SubjectApisCurrentApiQueryApplymentAuditResultRequest request)
-  - GET /v3/apply4subject/applyment; C# 参数：long? applymentId = null, string businessCode = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryApplymentAuditResultRawAsync(string path, string query)
 
 - async WechatPayV3Apply4SubjectApply4SubjectApisCurrentApiQueryMerchantAuthorizationStateResponse QueryMerchantAuthorizationStateAsync(WechatPayV3Apply4SubjectApply4SubjectApisCurrentApiQueryMerchantAuthorizationStateRequest request)
-  - GET /v3/apply4subject/applyment/merchants/{Escape(subMchId)}/state; C# 参数：string subMchId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryMerchantAuthorizationStateRawAsync(string path, string query)
 
 - async WechatPayV3Apply4SubjectApply4SubjectApisCurrentApiUploadImageResponse UploadImageAsync(WechatPayV3Apply4SubjectApply4SubjectApisCurrentApiUploadImageRequest request, WechatMultipart multipart)
-  - POST /v3/merchant/media/upload; C# 参数：string fileName, Stream fileStream, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UploadImageRawAsync(string path, string query, WechatMultipart multipart)
 
@@ -2000,10 +1916,6 @@ Apply4Subject/Apply4SubjectApis.cs 的 Zan 微信支付强类型接口。
 
 ## WechatPayV3Apply4SubjectApply4SubjectApisCurrentApiSubmitApplymentRequest (class)
 
-Apply4Subject/Apply4SubjectApis.Current.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
-
 - WechatTypedRequest request;
 
 - string overridePath;
@@ -2069,27 +1981,22 @@ Apply4Subject/Apply4SubjectApis.Current.cs 的 Zan 微信支付强类型接口�
 - public WechatPayV3BankComponentBankComponentApisApi(WechatPayV3Client client)
 
 - async WechatPayV3BankComponentBankComponentApisApiQueryBankResponse QueryBankAsync(WechatPayV3BankComponentBankComponentApisApiQueryBankRequest request)
-  - POST /v3/capital/capitallhh/banks/personal-banking; C# 参数：QueryBankRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryBankRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BankComponentBankComponentApisApiQueryBankListResponse QueryBankListAsync(WechatPayV3BankComponentBankComponentApisApiQueryBankListRequest request)
-  - GET /v3/capital/capitallhh/banks/personal-banking/banks; C# 参数：QueryBankListRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryBankListRawAsync(string path, string query)
 
 - async WechatPayV3BankComponentBankComponentApisApiQueryProvinceListResponse QueryProvinceListAsync(WechatPayV3BankComponentBankComponentApisApiQueryProvinceListRequest request)
-  - GET /v3/capital/capitallhh/areas/provinces; C# 参数：int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryProvinceListRawAsync(string path, string query)
 
 - async WechatPayV3BankComponentBankComponentApisApiQueryCityListResponse QueryCityListAsync(WechatPayV3BankComponentBankComponentApisApiQueryCityListRequest request)
-  - GET /v3/capital/capitallhh/areas/provinces/{数据.province_code}/cities; C# 参数：QueryCityListRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryCityListRawAsync(string path, string query)
 
 - async WechatPayV3BankComponentBankComponentApisApiQueryBranchListResponse QueryBranchListAsync(WechatPayV3BankComponentBankComponentApisApiQueryBranchListRequest request)
-  - POST /v3/capital/capitallhh/banks/{数据.bank_alias_code}/branches; C# 参数：QueryBranchListRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryBranchListRawAsync(string path, string query, string jsonBody)
 
@@ -2121,10 +2028,6 @@ Apply4Subject/Apply4SubjectApis.Current.cs 的 Zan 微信支付强类型接口�
 
 
 ## WechatPayV3BankComponentBankComponentApisApiQueryBankRequest (class)
-
-BankComponent/BankComponentApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -2231,21 +2134,15 @@ BankComponent/BankComponentApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3BasePayBasePayApisAbnormalRefundApi(WechatPayV3Client client)
 
 - async WechatPayV3BasePayBasePayApisAbnormalRefundApiApplyAbnormalRefundResponse ApplyAbnormalRefundAsync(WechatPayV3BasePayBasePayApisAbnormalRefundApiApplyAbnormalRefundRequest request)
-  - POST /v3/refund/domestic/refunds/{escapedRefundId}/apply-abnormal-refund; C# 参数：string refundId, AbnormalRefundRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ApplyAbnormalRefundRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BasePayBasePayApisAbnormalRefundApiApplyCombineAbnormalRefundResponse ApplyCombineAbnormalRefundAsync(WechatPayV3BasePayBasePayApisAbnormalRefundApiApplyCombineAbnormalRefundRequest request)
-  - POST /v3/refund/domestic/refunds/{escapedRefundId}/apply-abnormal-refund; C# 参数：string refundId, AbnormalRefundRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ApplyCombineAbnormalRefundRawAsync(string path, string query, string jsonBody)
 
 
 ## WechatPayV3BasePayBasePayApisAbnormalRefundApiApplyAbnormalRefundRequest (class)
-
-BasePay/BasePayApis.AbnormalRefund.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -2324,102 +2221,82 @@ BasePay/BasePayApis.AbnormalRefund.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3BasePayBasePayApisApi(WechatPayV3Client client)
 
 - async WechatPayV3BasePayBasePayApisApiCertificatesResponse CertificatesAsync(WechatPayV3BasePayBasePayApisApiCertificatesRequest request)
-  - GET /v3/certificates; C# 参数：CertType algorithmType, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CertificatesRawAsync(string path, string query)
 
 - async WechatPayV3BasePayBasePayApisApiGetPublicKeysResponse GetPublicKeysAsync(WechatPayV3BasePayBasePayApisApiGetPublicKeysRequest request)
-  - GET /v3/pub_key; C# 参数：
 
 - async WechatRawResponse GetPublicKeysRawAsync(string path, string query)
 
 - async WechatPayV3BasePayBasePayApisApiJsApiResponse JsApiAsync(WechatPayV3BasePayBasePayApisApiJsApiRequest request)
-  - POST /v3/pay/{1}transactions/jsapi; C# 参数：TransactionsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse JsApiRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BasePayBasePayApisApiJsApiCombineResponse JsApiCombineAsync(WechatPayV3BasePayBasePayApisApiJsApiCombineRequest request)
-  - POST /v3/combine-transactions/jsapi; C# 参数：CombineTransactionsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse JsApiCombineRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BasePayBasePayApisApiAppResponse AppAsync(WechatPayV3BasePayBasePayApisApiAppRequest request)
-  - POST /v3/pay/{1}transactions/app; C# 参数：TransactionsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse AppRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BasePayBasePayApisApiAppCombineResponse AppCombineAsync(WechatPayV3BasePayBasePayApisApiAppCombineRequest request)
-  - POST /v3/combine-transactions/app; C# 参数：CombineTransactionsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse AppCombineRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BasePayBasePayApisApiH5Response H5Async(WechatPayV3BasePayBasePayApisApiH5Request request)
-  - POST /v3/pay/{1}transactions/h5; C# 参数：TransactionsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse H5RawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BasePayBasePayApisApiH5CombineResponse H5CombineAsync(WechatPayV3BasePayBasePayApisApiH5CombineRequest request)
-  - POST /v3/combine-transactions/h5; C# 参数：CombineTransactionsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse H5CombineRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BasePayBasePayApisApiNativeResponse NativeAsync(WechatPayV3BasePayBasePayApisApiNativeRequest request)
-  - POST /v3/pay/{1}transactions/native; C# 参数：TransactionsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse NativeRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BasePayBasePayApisApiNativeCombineResponse NativeCombineAsync(WechatPayV3BasePayBasePayApisApiNativeCombineRequest request)
-  - POST /v3/combine-transactions/native; C# 参数：CombineTransactionsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse NativeCombineRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BasePayBasePayApisApiOrderQueryByTransactionIdResponse OrderQueryByTransactionIdAsync(WechatPayV3BasePayBasePayApisApiOrderQueryByTransactionIdRequest request)
-  - GET /v3/pay/transactions/id/{transaction_id}?mchid={mchid}; C# 参数：string transaction_id, string mchid, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse OrderQueryByTransactionIdRawAsync(string path, string query)
 
 - async WechatPayV3BasePayBasePayApisApiOrderQueryByOutTradeNoResponse OrderQueryByOutTradeNoAsync(WechatPayV3BasePayBasePayApisApiOrderQueryByOutTradeNoRequest request)
-  - GET /v3/pay/transactions/out-trade-no/{out_trade_no}?mchid={mchid}; C# 参数：string out_trade_no, string mchid, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse OrderQueryByOutTradeNoRawAsync(string path, string query)
 
 - async WechatPayV3BasePayBasePayApisApiCombineOrderQueryResponse CombineOrderQueryAsync(WechatPayV3BasePayBasePayApisApiCombineOrderQueryRequest request)
-  - GET /v3/combine-transactions/out-trade-no/{combine_out_trade_no}; C# 参数：string combine_out_trade_no, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CombineOrderQueryRawAsync(string path, string query)
 
 - async WechatPayV3BasePayBasePayApisApiCloseOrderResponse CloseOrderAsync(WechatPayV3BasePayBasePayApisApiCloseOrderRequest request)
-  - POST /v3/pay/transactions/out-trade-no/{out_trade_no}/close; C# 参数：string out_trade_no, string mchid, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CloseOrderRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BasePayBasePayApisApiCloseCombineOrderResponse CloseCombineOrderAsync(WechatPayV3BasePayBasePayApisApiCloseCombineOrderRequest request)
-  - POST /v3/combine-transactions/out-trade-no/{combine_out_trade_no}/close; C# 参数：string combine_out_trade_no, CloseCombineOrderRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CloseCombineOrderRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BasePayBasePayApisApiRefundResponse RefundAsync(WechatPayV3BasePayBasePayApisApiRefundRequest request)
-  - POST /v3/refund/domestic/refunds; C# 参数：RefundRequsetData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse RefundRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BasePayBasePayApisApiRefundQueryResponse RefundQueryAsync(WechatPayV3BasePayBasePayApisApiRefundQueryRequest request)
-  - GET /v3/refund/domestic/refunds/{out_refund_no}; C# 参数：string out_refund_no, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse RefundQueryRawAsync(string path, string query)
 
 - async WechatRawResponse TradeBillQueryAsync(WechatPayV3BasePayBasePayApisApiTradeBillQueryRequest request)
-  - GET /v3/bill/tradebill?bill_date={bill_date}&bill_type={bill_type}; C# 参数：string bill_date, Stream fileStream, string bill_type = "ALL", string tar_type = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse TradeBillQueryRawAsync(string path, string query)
 
 - async WechatRawResponse FundflowBillQueryAsync(WechatPayV3BasePayBasePayApisApiFundflowBillQueryRequest request)
-  - GET /v3/bill/fundflowbill?bill_date={bill_date}&account_type={account_type}; C# 参数：string bill_date, Stream fileStream, string account_type = "BASIC", string tar_type = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse FundflowBillQueryRawAsync(string path, string query)
 
 - async WechatPayV3BasePayBasePayApisApiSubmerchantFundflowBillQueryResponse SubmerchantFundflowBillQueryAsync(WechatPayV3BasePayBasePayApisApiSubmerchantFundflowBillQueryRequest request)
-  - GET /v3/bill/sub-merchant-fundflowbill{UrlQueryHelper.ToParams(数据)}; C# 参数：FundflowBillQueryRequestData 数据, List<Stream> fileStreams, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SubmerchantFundflowBillQueryRawAsync(string path, string query)
 
@@ -2523,10 +2400,6 @@ BasePay/BasePayApis.AbnormalRefund.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3BasePayBasePayApisApiCertificatesRequest (class)
-
-BasePay/BasePayApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -3153,27 +3026,22 @@ BasePay/BasePayApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3BrandApplymentBrandApplymentApisApi(WechatPayV3Client client)
 
 - async WechatPayV3BrandApplymentBrandApplymentApisApiSubmitApplymentResponse SubmitApplymentAsync(WechatPayV3BrandApplymentBrandApplymentApisApiSubmitApplymentRequest request)
-  - POST /v3/brand/applyments; C# 参数：BrandApplymentRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SubmitApplymentRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandApplymentBrandApplymentApisApiQueryByBusinessCodeResponse QueryByBusinessCodeAsync(WechatPayV3BrandApplymentBrandApplymentApisApiQueryByBusinessCodeRequest request)
-  - GET /v3/brand/applyments/business-code/{Escape(businessCode)}; C# 参数：string businessCode, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryByBusinessCodeRawAsync(string path, string query)
 
 - async WechatPayV3BrandApplymentBrandApplymentApisApiQueryByApplymentIdResponse QueryByApplymentIdAsync(WechatPayV3BrandApplymentBrandApplymentApisApiQueryByApplymentIdRequest request)
-  - GET /v3/brand/applyments/applyment-id/{Escape(applymentId)}; C# 参数：string applymentId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryByApplymentIdRawAsync(string path, string query)
 
 - async WechatPayV3BrandApplymentBrandApplymentApisApiCancelApplymentResponse CancelApplymentAsync(WechatPayV3BrandApplymentBrandApplymentApisApiCancelApplymentRequest request)
-  - POST /v3/brand/applyments/cancel-applyment; C# 参数：BrandApplymentCancelRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CancelApplymentRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandApplymentBrandApplymentApisApiUploadImageResponse UploadImageAsync(WechatPayV3BrandApplymentBrandApplymentApisApiUploadImageRequest request, WechatMultipart multipart)
-  - POST /v3/merchant/media/upload; C# 参数：string fileName, Stream fileStream, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UploadImageRawAsync(string path, string query, WechatMultipart multipart)
 
@@ -3254,10 +3122,6 @@ BasePay/BasePayApis.cs 的 Zan 微信支付强类型接口。
 
 ## WechatPayV3BrandApplymentBrandApplymentApisApiSubmitApplymentRequest (class)
 
-BrandApplyment/BrandApplymentApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
-
 - WechatTypedRequest request;
 
 - string overridePath;
@@ -3319,52 +3183,42 @@ BrandApplyment/BrandApplymentApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3BrandCardBrandCardApisApi(WechatPayV3Client client)
 
 - async WechatPayV3BrandCardBrandCardApisApiSubmitCardConfigResponse SubmitCardConfigAsync(WechatPayV3BrandCardBrandCardApisApiSubmitCardConfigRequest request)
-  - POST /v3/brand/card/card-configs; C# 参数：BrandCardConfigRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SubmitCardConfigRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandCardBrandCardApisApiPublishCardConfigResponse PublishCardConfigAsync(WechatPayV3BrandCardBrandCardApisApiPublishCardConfigRequest request)
-  - POST /v3/brand/card/card-configs/publish; C# 参数：BrandCardConfigPublishRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse PublishCardConfigRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandCardBrandCardApisApiCancelCardConfigApplymentResponse CancelCardConfigApplymentAsync(WechatPayV3BrandCardBrandCardApisApiCancelCardConfigApplymentRequest request)
-  - POST /v3/brand/card/card-configs/cancel-applyment; C# 参数：BrandCardConfigApplymentRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CancelCardConfigApplymentRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandCardBrandCardApisApiQueryCardConfigApplymentResponse QueryCardConfigApplymentAsync(WechatPayV3BrandCardBrandCardApisApiQueryCardConfigApplymentRequest request)
-  - GET /v3/brand/card/card-configs; C# 参数：BrandCardConfigApplymentRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryCardConfigApplymentRawAsync(string path, string query)
 
 - async WechatPayV3BrandCardBrandCardApisApiGetCardPreviewUrlResponse GetCardPreviewUrlAsync(WechatPayV3BrandCardBrandCardApisApiGetCardPreviewUrlRequest request)
-  - GET /v3/brand/card/card-configs/preview-url; C# 参数：BrandCardConfigApplymentRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse GetCardPreviewUrlRawAsync(string path, string query)
 
 - async WechatPayV3BrandCardBrandCardApisApiAddCardLinkResponse AddCardLinkAsync(WechatPayV3BrandCardBrandCardApisApiAddCardLinkRequest request)
-  - POST /v3/brand/card/card-links; C# 参数：BrandCardLinkRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse AddCardLinkRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandCardBrandCardApisApiUnbindCardLinkResponse UnbindCardLinkAsync(WechatPayV3BrandCardBrandCardApisApiUnbindCardLinkRequest request)
-  - POST /v3/brand/card/card-links/unbind-card-link; C# 参数：BrandCardLinkUnbindRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UnbindCardLinkRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandCardBrandCardApisApiCancelCardLinkApplymentResponse CancelCardLinkApplymentAsync(WechatPayV3BrandCardBrandCardApisApiCancelCardLinkApplymentRequest request)
-  - POST /v3/brand/card/card-links/cancel-applyment; C# 参数：BrandCardLinkCancelRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CancelCardLinkApplymentRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandCardBrandCardApisApiQueryActiveCardLinksResponse QueryActiveCardLinksAsync(WechatPayV3BrandCardBrandCardApisApiQueryActiveCardLinksRequest request)
-  - GET /v3/brand/card/card-links; C# 参数：BrandCardActiveLinksQueryRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryActiveCardLinksRawAsync(string path, string query)
 
 - async WechatPayV3BrandCardBrandCardApisApiQueryCardLinkApplymentByBusinessCodeResponse QueryCardLinkApplymentByBusinessCodeAsync(WechatPayV3BrandCardBrandCardApisApiQueryCardLinkApplymentByBusinessCodeRequest request)
-  - GET /v3/brand/card/card-links/business-code/{EscapeBrandCardValue(businessCode)}; C# 参数：string businessCode, string brandId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryCardLinkApplymentByBusinessCodeRawAsync(string path, string query)
 
@@ -3603,10 +3457,6 @@ BrandApplyment/BrandApplymentApis.cs 的 Zan 微信支付强类型接口。
 
 ## WechatPayV3BrandCardBrandCardApisApiSubmitCardConfigRequest (class)
 
-BrandCard/BrandCardApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
-
 - WechatTypedRequest request;
 
 - string overridePath;
@@ -3676,82 +3526,66 @@ BrandCard/BrandCardApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3BrandMemberCardBrandMemberCardApisApi(WechatPayV3Client client)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiCreateCardResponse CreateCardAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiCreateCardRequest request)
-  - POST /v3/card-member/cards; C# 参数：BrandMemberCardCreateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateCardRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiQueryCardsResponse QueryCardsAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiQueryCardsRequest request)
-  - GET /v3/card-member/cards; C# 参数：BrandMemberCardListQueryRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryCardsRawAsync(string path, string query)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiQueryCardResponse QueryCardAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiQueryCardRequest request)
-  - GET /v3/card-member/cards/{值}; C# 参数：string cardId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryCardRawAsync(string path, string query)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiUpdateCardResponse UpdateCardAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiUpdateCardRequest request)
-  - PATCH /v3/card-member/cards/{值}; C# 参数：string cardId, BrandMemberCardUpdateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UpdateCardRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiInvalidateCardResponse InvalidateCardAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiInvalidateCardRequest request)
-  - POST /v3/card-member/cards/{值}; C# 参数：string cardId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse InvalidateCardRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiQueryUserCardResponse QueryUserCardAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiQueryUserCardRequest request)
-  - GET /v3/card-member/user-cards/{值}; C# 参数：string userCardCode, BrandMemberCardUserCardQueryRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryUserCardRawAsync(string path, string query)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiQueryUserCardsResponse QueryUserCardsAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiQueryUserCardsRequest request)
-  - GET /v3/card-member/user-cards; C# 参数：BrandMemberCardUserCardListQueryRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryUserCardsRawAsync(string path, string query)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiUpdateUserCardResponse UpdateUserCardAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiUpdateUserCardRequest request)
-  - PATCH /v3/card-member/user-cards/{值}; C# 参数：string userCardCode, BrandMemberCardUserCardUpdateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UpdateUserCardRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiInvalidateUserCardResponse InvalidateUserCardAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiInvalidateUserCardRequest request)
-  - POST /v3/card-member/user-cards/{值}; C# 参数：string userCardCode, BrandMemberCardUserCardInvalidateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse InvalidateUserCardRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiCreatePreAuthTokenResponse CreatePreAuthTokenAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiCreatePreAuthTokenRequest request)
-  - POST /v3/card-member/pre-auth-tokens; C# 参数：BrandMemberCardPreAuthTokenRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreatePreAuthTokenRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiImportUserCardByOpenIdResponse ImportUserCardByOpenIdAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiImportUserCardByOpenIdRequest request)
-  - POST /v3/card-member/user-cards/import-by-openid; C# 参数：BrandMemberCardUserCardImportRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ImportUserCardByOpenIdRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiConfirmUserCardResponse ConfirmUserCardAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiConfirmUserCardRequest request)
-  - POST /v3/card-member/user-cards/{值}; C# 参数：string userCardCode, BrandMemberCardUserCardConfirmRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ConfirmUserCardRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiCreateUserFeedResponse CreateUserFeedAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiCreateUserFeedRequest request)
-  - POST /v3/card-member/user-feeds; C# 参数：BrandMemberCardUserFeedRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateUserFeedRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiSyncUserPointsResponse SyncUserPointsAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiSyncUserPointsRequest request)
-  - POST /v3/card-member/user-points/sync; C# 参数：BrandMemberCardPointBalanceRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SyncUserPointsRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiConfirmPointExchangeCouponResponse ConfirmPointExchangeCouponAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiConfirmPointExchangeCouponRequest request)
-  - POST /v3/card-member/user-points/exchange-coupon/confirm; C# 参数：BrandMemberCardPointExchangeRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ConfirmPointExchangeCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandMemberCardBrandMemberCardApisApiUploadMemberImageResponse UploadMemberImageAsync(WechatPayV3BrandMemberCardBrandMemberCardApisApiUploadMemberImageRequest request, WechatMultipart multipart)
-  - POST /v3/card-member/media/图片-upload; C# 参数：string fileName, Stream fileStream, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UploadMemberImageRawAsync(string path, string query, WechatMultipart multipart)
 
@@ -3837,10 +3671,6 @@ BrandCard/BrandCardApis.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3BrandMemberCardBrandMemberCardApisApiCreateCardRequest (class)
-
-BrandMemberCard/BrandMemberCardApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -4329,47 +4159,38 @@ BrandMemberCard/BrandMemberCardApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3BrandStoreBrandStoreApisApi(WechatPayV3Client client)
 
 - async WechatPayV3BrandStoreBrandStoreApisApiCreateBrandStoreResponse CreateBrandStoreAsync(WechatPayV3BrandStoreBrandStoreApisApiCreateBrandStoreRequest request)
-  - POST /v3/store/brandstores; C# 参数：BrandStoreCreateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateBrandStoreRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandStoreBrandStoreApisApiQueryBrandStoreResponse QueryBrandStoreAsync(WechatPayV3BrandStoreBrandStoreApisApiQueryBrandStoreRequest request)
-  - GET /v3/store/brandstores/{值}; C# 参数：string storeId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryBrandStoreRawAsync(string path, string query)
 
 - async WechatPayV3BrandStoreBrandStoreApisApiQueryBrandStoresResponse QueryBrandStoresAsync(WechatPayV3BrandStoreBrandStoreApisApiQueryBrandStoresRequest request)
-  - GET /v3/store/brandstores; C# 参数：BrandStoreListQueryRequestData 数据 = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryBrandStoresRawAsync(string path, string query)
 
 - async WechatPayV3BrandStoreBrandStoreApisApiUpdateBrandStoreResponse UpdateBrandStoreAsync(WechatPayV3BrandStoreBrandStoreApisApiUpdateBrandStoreRequest request)
-  - PATCH /v3/store/brandstores/{值}; C# 参数：string storeId, BrandStoreUpdateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UpdateBrandStoreRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandStoreBrandStoreApisApiDeleteBrandStoreResponse DeleteBrandStoreAsync(WechatPayV3BrandStoreBrandStoreApisApiDeleteBrandStoreRequest request)
-  - DELETE /v3/store/brandstores/{值}; C# 参数：string storeId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DeleteBrandStoreRawAsync(string path, string query)
 
 - async WechatPayV3BrandStoreBrandStoreApisApiCloseBrandStoreResponse CloseBrandStoreAsync(WechatPayV3BrandStoreBrandStoreApisApiCloseBrandStoreRequest request)
-  - POST /v3/store/brandstores/{值}; C# 参数：string storeId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CloseBrandStoreRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandStoreBrandStoreApisApiResumeBrandStoreResponse ResumeBrandStoreAsync(WechatPayV3BrandStoreBrandStoreApisApiResumeBrandStoreRequest request)
-  - POST /v3/store/brandstores/{值}; C# 参数：string storeId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ResumeBrandStoreRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandStoreBrandStoreApisApiBindRecipientResponse BindRecipientAsync(WechatPayV3BrandStoreBrandStoreApisApiBindRecipientRequest request)
-  - POST /v3/store/brandstores/{值}; C# 参数：string storeId, BrandStoreBindRecipientRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse BindRecipientRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BrandStoreBrandStoreApisApiUnbindRecipientResponse UnbindRecipientAsync(WechatPayV3BrandStoreBrandStoreApisApiUnbindRecipientRequest request)
-  - POST /v3/store/brandstores/{值}; C# 参数：string storeId, BrandStoreUnbindRecipientRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UnbindRecipientRawAsync(string path, string query, string jsonBody)
 
@@ -4427,10 +4248,6 @@ BrandMemberCard/BrandMemberCardApis.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3BrandStoreBrandStoreApisApiCreateBrandStoreRequest (class)
-
-BrandStore/BrandStoreApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -4621,21 +4438,15 @@ BrandStore/BrandStoreApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3BusinessCircleBusinessCircleApisApi(WechatPayV3Client client)
 
 - async WechatPayV3BusinessCircleBusinessCircleApisApiNotifyBusinessCirclePointsResponse NotifyBusinessCirclePointsAsync(WechatPayV3BusinessCircleBusinessCircleApisApiNotifyBusinessCirclePointsRequest request)
-  - POST /v3/businesscircle/points/notify; C# 参数：NotifyBusinessCirclePointsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse NotifyBusinessCirclePointsRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3BusinessCircleBusinessCircleApisApiQueryUserAuthorizationResponse QueryUserAuthorizationAsync(WechatPayV3BusinessCircleBusinessCircleApisApiQueryUserAuthorizationRequest request)
-  - GET /v3/businesscircle/user-authorizations/{openid}?appid={appid}; C# 参数：string appid, string openid, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryUserAuthorizationRawAsync(string path, string query)
 
 
 ## WechatPayV3BusinessCircleBusinessCircleApisApiNotifyBusinessCirclePointsRequest (class)
-
-BusinessCircle/BusinessCircleApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -4706,57 +4517,46 @@ BusinessCircle/BusinessCircleApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApi(WechatPayV3Client client)
 
 - async WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiCreateOrderResponse CreateOrderAsync(WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiCreateOrderRequest request)
-  - POST /v3/brand/profitsharing/orders; C# 参数：ChainBrandProfitsharingCreateOrderRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateOrderRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiQueryOrderResponse QueryOrderAsync(WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiQueryOrderRequest request)
-  - GET /v3/brand/profitsharing/orders; C# 参数：ChainBrandProfitsharingOrderQueryRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryOrderRawAsync(string path, string query)
 
 - async WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiCreateReturnOrderResponse CreateReturnOrderAsync(WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiCreateReturnOrderRequest request)
-  - POST /v3/brand/profitsharing/returnorders; C# 参数：ChainBrandProfitsharingReturnOrderRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateReturnOrderRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiQueryReturnOrderResponse QueryReturnOrderAsync(WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiQueryReturnOrderRequest request)
-  - GET /v3/brand/profitsharing/returnorders; C# 参数：ChainBrandProfitsharingReturnOrderQueryRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryReturnOrderRawAsync(string path, string query)
 
 - async WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiFinishOrderResponse FinishOrderAsync(WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiFinishOrderRequest request)
-  - POST /v3/brand/profitsharing/finish-顺序; C# 参数：ChainBrandProfitsharingFinishOrderRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse FinishOrderRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiQueryAmountsResponse QueryAmountsAsync(WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiQueryAmountsRequest request)
-  - GET /v3/brand/profitsharing/orders/; C# 参数：string transactionId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryAmountsRawAsync(string path, string query)
 
 - async WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiQueryBrandConfigResponse QueryBrandConfigAsync(WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiQueryBrandConfigRequest request)
-  - GET /v3/brand/profitsharing/brand-configs/; C# 参数：string brandMchid, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryBrandConfigRawAsync(string path, string query)
 
 - async WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiAddReceiverResponse AddReceiverAsync(WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiAddReceiverRequest request)
-  - POST /v3/brand/profitsharing/receivers/添加; C# 参数：ChainBrandProfitsharingAddReceiverRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse AddReceiverRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiDeleteReceiverResponse DeleteReceiverAsync(WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiDeleteReceiverRequest request)
-  - POST /v3/brand/profitsharing/receivers/删除; C# 参数：ChainBrandProfitsharingDeleteReceiverRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DeleteReceiverRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiApplyBillResponse ApplyBillAsync(WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiApplyBillRequest request)
-  - GET /v3/profitsharing/bills; C# 参数：ChainBrandProfitsharingBillRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ApplyBillRawAsync(string path, string query)
 
 - async WechatRawResponse DownloadBillAsync(WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiDownloadBillRequest request)
-  - POST (请求.RequestPath 指定); C# 参数：ChainBrandProfitsharingBillResultJson bill, Stream destination, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DownloadBillRawAsync(string path, string query, string jsonBody)
 
@@ -4826,10 +4626,6 @@ BusinessCircle/BusinessCircleApis.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3ChainBrandProfitsharingChainBrandProfitsharingApisApiCreateOrderRequest (class)
-
-ChainBrandProfitsharing/ChainBrandProfitsharingApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -5107,8 +4903,6 @@ ChainBrandProfitsharing/ChainBrandProfitsharingApis.cs 的 Zan 微信支付强�
 
 ## WechatPayV3Client (class)
 
-微信支付 API v3 的 WECHATPAY2 签名、验签、平台证书轮换、敏感字段和通知解密客户端。
-
 - WechatPayV3Config config;
 
 - WechatApiTransport transport;
@@ -5140,9 +4934,10 @@ ChainBrandProfitsharing/ChainBrandProfitsharingApis.cs 的 Zan 微信支付强�
 - async WechatRawResponse RequestMultipartAsync(string method, string path, string query, WechatMultipart multipart)
 
 - async WechatRawResponse DownloadAsync(string url)
-  - 下载微信返回的短期签名 URL；此请求不附加商户 Authorization。
 
 - bool VerifyResponse(WechatRawResponse response)
+
+- static bool TimestampFresh(string timestamp)
 
 - bool VerifyNotification(string timestamp, string nonce, string body, string signature, string serial)
 
@@ -5161,16 +4956,12 @@ ChainBrandProfitsharing/ChainBrandProfitsharingApis.cs 的 Zan 微信支付强�
 - string SignAppMessage(string appId, string packageValue, long timestamp, string nonce)
 
 - async WechatRawResponse DownloadCertificatesAsync(string algorithmType)
-  - 下载微信支付平台证书；algorithmType 为 RSA、SM2 或 ALL。
 
 - async int RefreshPlatformCertificatesAsync(string algorithmType)
-  - 下载并解密 RSA 平台证书，加入按序列号缓存。
 
 - int LoadCertificatesResponse(string json)
-  - 装载 /v3/certificates 的 JSON 响应并返回新增/更新数量。
 
 - int LoadPublicKeysResponse(string json)
-  - 装载直接返回 public_key/public_key_id 的平台公钥 JSON。
 
 - int LoadPublicKeyItem(JsonValue item)
 
@@ -5182,47 +4973,38 @@ ChainBrandProfitsharing/ChainBrandProfitsharingApis.cs 的 Zan 微信支付强�
 - public WechatPayV3ComplaintComplaintApisApi(WechatPayV3Client client)
 
 - async WechatPayV3ComplaintComplaintApisApiQueryComplaintsResponse QueryComplaintsAsync(WechatPayV3ComplaintComplaintApisApiQueryComplaintsRequest request)
-  - GET /v3/merchant-service/complaints-v2?limit={limit}&偏移={偏移}&begin_date={begin_date?.ToString()}&end_date={end_date?.ToString()}; C# 参数：TenpayDateTime begin_date, TenpayDateTime end_date, string complainted_mchid, int limit = 10, int 偏移 = 0, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryComplaintsRawAsync(string path, string query)
 
 - async WechatPayV3ComplaintComplaintApisApiQueryComplaintResponse QueryComplaintAsync(WechatPayV3ComplaintComplaintApisApiQueryComplaintRequest request)
-  - GET /v3/merchant-service/complaints-v2/{complaint_id}; C# 参数：string complaint_id, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryComplaintRawAsync(string path, string query)
 
 - async WechatPayV3ComplaintComplaintApisApiQueryNegotiationHistorysResponse QueryNegotiationHistorysAsync(WechatPayV3ComplaintComplaintApisApiQueryNegotiationHistorysRequest request)
-  - GET /v3/merchant-service/complaints-v2/{complaint_id}/negotiation-historys?limit={limit}&偏移={偏移}; C# 参数：string complaint_id, int limit = 10, int 偏移 = 0, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryNegotiationHistorysRawAsync(string path, string query)
 
 - async WechatPayV3ComplaintComplaintApisApiCreateComplaintNotifyUrlResponse CreateComplaintNotifyUrlAsync(WechatPayV3ComplaintComplaintApisApiCreateComplaintNotifyUrlRequest request)
-  - POST /v3/merchant-service/complaint-notifications; C# 参数：CreateComplaintNotifyUrlRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateComplaintNotifyUrlRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ComplaintComplaintApisApiQueryComplaintNotifyUrlResponse QueryComplaintNotifyUrlAsync(WechatPayV3ComplaintComplaintApisApiQueryComplaintNotifyUrlRequest request)
-  - GET /v3/merchant-service/complaint-notifications; C# 参数：int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryComplaintNotifyUrlRawAsync(string path, string query)
 
 - async WechatPayV3ComplaintComplaintApisApiModifyComplaintNotifyUrlResponse ModifyComplaintNotifyUrlAsync(WechatPayV3ComplaintComplaintApisApiModifyComplaintNotifyUrlRequest request)
-  - POST /v3/merchant-service/complaint-notifications; C# 参数：ModifyComplaintNotifyUrlRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ModifyComplaintNotifyUrlRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ComplaintComplaintApisApiDeleteComplaintNotifyUrlResponse DeleteComplaintNotifyUrlAsync(WechatPayV3ComplaintComplaintApisApiDeleteComplaintNotifyUrlRequest request)
-  - DELETE /v3/merchant-service/complaint-notifications; C# 参数：int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DeleteComplaintNotifyUrlRawAsync(string path, string query)
 
 - async WechatPayV3ComplaintComplaintApisApiResponseResponse ResponseAsync(WechatPayV3ComplaintComplaintApisApiResponseRequest request)
-  - POST /v3/merchant-service/complaints-v2/{数据.complaint_id}/响应; C# 参数：ResponseRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ResponseRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ComplaintComplaintApisApiCompleteComplaintResponse CompleteComplaintAsync(WechatPayV3ComplaintComplaintApisApiCompleteComplaintRequest request)
-  - POST /v3/merchant-service/complaints-v2/{数据.complaint_id}/complete; C# 参数：CompleteComplaintRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CompleteComplaintRawAsync(string path, string query, string jsonBody)
 
@@ -5371,10 +5153,6 @@ ChainBrandProfitsharing/ChainBrandProfitsharingApis.cs 的 Zan 微信支付强�
 
 ## WechatPayV3ComplaintComplaintApisApiQueryComplaintsRequest (class)
 
-Complaint/ComplaintApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
-
 - WechatTypedRequest request;
 
 - string overridePath;
@@ -5470,22 +5248,18 @@ Complaint/ComplaintApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3ComplaintComplaintApisP1Api(WechatPayV3Client client)
 
 - async WechatPayV3ComplaintComplaintApisP1ApiUpdateRefundProgressResponse UpdateRefundProgressAsync(WechatPayV3ComplaintComplaintApisP1ApiUpdateRefundProgressRequest request)
-  - POST /v3/merchant-service/complaints-v2/{escapedComplaintId}/更新-refund-progress; C# 参数：string complaintId, UpdateRefundProgressRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UpdateRefundProgressRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ComplaintComplaintApisP1ApiResponseImmediateServiceResponse ResponseImmediateServiceAsync(WechatPayV3ComplaintComplaintApisP1ApiResponseImmediateServiceRequest request)
-  - POST /v3/merchant-service/complaints-v2/{escapedComplaintId}/响应-immediate-service; C# 参数：string complaintId, ImmediateServiceRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ResponseImmediateServiceRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ComplaintComplaintApisP1ApiUploadImageResponse UploadImageAsync(WechatPayV3ComplaintComplaintApisP1ApiUploadImageRequest request, WechatMultipart multipart)
-  - POST /v3/merchant-service/图片/upload; C# 参数：string fileName, Stream fileStream, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UploadImageRawAsync(string path, string query, WechatMultipart multipart)
 
 - async WechatRawResponse DownloadImageAsync(WechatPayV3ComplaintComplaintApisP1ApiDownloadImageRequest request)
-  - POST /v3/merchant-service/图片/{escapedMediaId}; C# 参数：string mediaId, Stream destination, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DownloadImageRawAsync(string path, string query, string jsonBody)
 
@@ -5548,10 +5322,6 @@ Complaint/ComplaintApis.cs 的 Zan 微信支付强类型接口。
 
 ## WechatPayV3ComplaintComplaintApisP1ApiUpdateRefundProgressRequest (class)
 
-Complaint/ComplaintApis.P1.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
-
 - WechatTypedRequest request;
 
 - string overridePath;
@@ -5609,9 +5379,6 @@ Complaint/ComplaintApis.P1.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3Config (class)
-
-微信支付 API v3 商户配置。这里保存商户部署时提供的长期配置；
-每笔订单、退款等业务数据由具体 API 的强类型 Request 提供。
 
 - string AppId;
 
@@ -5675,36 +5442,27 @@ Complaint/ComplaintApis.P1.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3DeliveryPlanDeliveryPlanApisApi(WechatPayV3Client client)
 
 - async WechatPayV3DeliveryPlanDeliveryPlanApisApiCreateDeliveryPlanResponse CreateDeliveryPlanAsync(WechatPayV3DeliveryPlanDeliveryPlanApisApiCreateDeliveryPlanRequest request)
-  - POST /v3/marketing/partner/delivery-plan/delivery-plans; C# 参数：DeliveryPlanCreateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateDeliveryPlanRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3DeliveryPlanDeliveryPlanApisApiQueryDeliveryPlansResponse QueryDeliveryPlansAsync(WechatPayV3DeliveryPlanDeliveryPlanApisApiQueryDeliveryPlansRequest request)
-  - GET /v3/marketing/partner/delivery-plan/delivery-plans/{EscapeDeliveryPlanValue(brandId)}/delivery-plans; C# 参数：string brandId, DeliveryPlanQueryRequestData 数据 = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryDeliveryPlansRawAsync(string path, string query)
 
 - async WechatPayV3DeliveryPlanDeliveryPlanApisApiUpdateDeliveryPlanResponse UpdateDeliveryPlanAsync(WechatPayV3DeliveryPlanDeliveryPlanApisApiUpdateDeliveryPlanRequest request)
-  - PATCH /v3/marketing/partner/delivery-plan/delivery-plans/{EscapeDeliveryPlanValue(planId)}; C# 参数：string planId, DeliveryPlanUpdateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UpdateDeliveryPlanRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3DeliveryPlanDeliveryPlanApisApiTerminateDeliveryPlanResponse TerminateDeliveryPlanAsync(WechatPayV3DeliveryPlanDeliveryPlanApisApiTerminateDeliveryPlanRequest request)
-  - POST /v3/marketing/partner/delivery-plan/delivery-plans/{EscapeDeliveryPlanValue(planId)}/terminate; C# 参数：string planId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse TerminateDeliveryPlanRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3DeliveryPlanDeliveryPlanApisApiSetDeliveryPlanNotifyUrlResponse SetDeliveryPlanNotifyUrlAsync(WechatPayV3DeliveryPlanDeliveryPlanApisApiSetDeliveryPlanNotifyUrlRequest request)
-  - POST /v3/marketing/partner/delivery-plan/{EscapeDeliveryPlanValue(serviceProviderMchId)}/notify-url; C# 参数：string serviceProviderMchId, DeliveryPlanNotifyUrlRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SetDeliveryPlanNotifyUrlRawAsync(string path, string query, string jsonBody)
 
 
 ## WechatPayV3DeliveryPlanDeliveryPlanApisApiCreateDeliveryPlanRequest (class)
-
-DeliveryPlan/DeliveryPlanApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -5873,67 +5631,54 @@ DeliveryPlan/DeliveryPlanApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3EcommerceEcommerceApisAccountFundsApi(WechatPayV3Client client)
 
 - async WechatPayV3EcommerceEcommerceApisAccountFundsApiQuerySubMerchantBalanceResponse QuerySubMerchantBalanceAsync(WechatPayV3EcommerceEcommerceApisAccountFundsApiQuerySubMerchantBalanceRequest request)
-  - GET /v3/ecommerce/fund/balance/{EscapeAccountFundsValue(subMchId)}; C# 参数：string subMchId, string accountType = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QuerySubMerchantBalanceRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisAccountFundsApiQuerySubMerchantDayEndBalanceResponse QuerySubMerchantDayEndBalanceAsync(WechatPayV3EcommerceEcommerceApisAccountFundsApiQuerySubMerchantDayEndBalanceRequest request)
-  - GET /v3/ecommerce/fund/enddaybalance/{EscapeAccountFundsValue(subMchId)}; C# 参数：string subMchId, string date, string accountType = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QuerySubMerchantDayEndBalanceRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisAccountFundsApiQueryPlatformBalanceResponse QueryPlatformBalanceAsync(WechatPayV3EcommerceEcommerceApisAccountFundsApiQueryPlatformBalanceRequest request)
-  - GET /v3/merchant/fund/balance/{EscapeAccountFundsValue(accountType)}; C# 参数：string accountType, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryPlatformBalanceRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisAccountFundsApiQueryPlatformDayEndBalanceResponse QueryPlatformDayEndBalanceAsync(WechatPayV3EcommerceEcommerceApisAccountFundsApiQueryPlatformDayEndBalanceRequest request)
-  - GET /v3/merchant/fund/dayendbalance/{EscapeAccountFundsValue(accountType)}; C# 参数：string accountType, string date = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryPlatformDayEndBalanceRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisAccountFundsApiSubmitSubMerchantWithdrawalResponse SubmitSubMerchantWithdrawalAsync(WechatPayV3EcommerceEcommerceApisAccountFundsApiSubmitSubMerchantWithdrawalRequest request)
-  - POST /v3/ecommerce/fund/withdraw; C# 参数：EcommerceSubMerchantWithdrawalRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SubmitSubMerchantWithdrawalRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3EcommerceEcommerceApisAccountFundsApiQuerySubMerchantWithdrawalByOutRequestNoResponse QuerySubMerchantWithdrawalByOutRequestNoAsync(WechatPayV3EcommerceEcommerceApisAccountFundsApiQuerySubMerchantWithdrawalByOutRequestNoRequest request)
-  - GET /v3/ecommerce/fund/withdraw/out-请求-no/{EscapeAccountFundsValue(outRequestNo)}; C# 参数：string outRequestNo, string subMchId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QuerySubMerchantWithdrawalByOutRequestNoRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisAccountFundsApiQuerySubMerchantWithdrawalByWithdrawIdResponse QuerySubMerchantWithdrawalByWithdrawIdAsync(WechatPayV3EcommerceEcommerceApisAccountFundsApiQuerySubMerchantWithdrawalByWithdrawIdRequest request)
-  - GET /v3/ecommerce/fund/withdraw/{EscapeAccountFundsValue(withdrawId)}; C# 参数：string withdrawId, string subMchId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QuerySubMerchantWithdrawalByWithdrawIdRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisAccountFundsApiSubmitPlatformWithdrawalResponse SubmitPlatformWithdrawalAsync(WechatPayV3EcommerceEcommerceApisAccountFundsApiSubmitPlatformWithdrawalRequest request)
-  - POST /v3/merchant/fund/withdraw; C# 参数：EcommercePlatformWithdrawalRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SubmitPlatformWithdrawalRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3EcommerceEcommerceApisAccountFundsApiQueryPlatformWithdrawalByOutRequestNoResponse QueryPlatformWithdrawalByOutRequestNoAsync(WechatPayV3EcommerceEcommerceApisAccountFundsApiQueryPlatformWithdrawalByOutRequestNoRequest request)
-  - GET /v3/merchant/fund/withdraw/out-请求-no/{EscapeAccountFundsValue(outRequestNo)}; C# 参数：string outRequestNo, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryPlatformWithdrawalByOutRequestNoRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisAccountFundsApiQueryPlatformWithdrawalByWithdrawIdResponse QueryPlatformWithdrawalByWithdrawIdAsync(WechatPayV3EcommerceEcommerceApisAccountFundsApiQueryPlatformWithdrawalByWithdrawIdRequest request)
-  - GET /v3/merchant/fund/withdraw/withdraw-id/{EscapeAccountFundsValue(withdrawId)}; C# 参数：string withdrawId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryPlatformWithdrawalByWithdrawIdRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisAccountFundsApiSubmitSubMerchantDayEndWithdrawalResponse SubmitSubMerchantDayEndWithdrawalAsync(WechatPayV3EcommerceEcommerceApisAccountFundsApiSubmitSubMerchantDayEndWithdrawalRequest request)
-  - POST /v3/platsolution/ecommerce/withdraw/day-end-balance-withdraw; C# 参数：EcommerceSubMerchantDayEndWithdrawalRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SubmitSubMerchantDayEndWithdrawalRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3EcommerceEcommerceApisAccountFundsApiQuerySubMerchantDayEndWithdrawalResponse QuerySubMerchantDayEndWithdrawalAsync(WechatPayV3EcommerceEcommerceApisAccountFundsApiQuerySubMerchantDayEndWithdrawalRequest request)
-  - GET /v3/platsolution/ecommerce/withdraw/day-end-balance-withdraw/out-请求-no/{EscapeAccountFundsValue(outRequestNo)}; C# 参数：string outRequestNo, string subMchId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QuerySubMerchantDayEndWithdrawalRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisAccountFundsApiQueryWithdrawalAbnormalBillResponse QueryWithdrawalAbnormalBillAsync(WechatPayV3EcommerceEcommerceApisAccountFundsApiQueryWithdrawalAbnormalBillRequest request)
-  - GET /v3/merchant/fund/withdraw/bill-type/{EscapeAccountFundsValue(billType)}; C# 参数：string billType, string billDate, string tarType = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryWithdrawalAbnormalBillRawAsync(string path, string query)
 
@@ -6037,10 +5782,6 @@ DeliveryPlan/DeliveryPlanApis.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3EcommerceEcommerceApisAccountFundsApiQuerySubMerchantBalanceRequest (class)
-
-Ecommerce/EcommerceApis.AccountFunds.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -6313,32 +6054,26 @@ Ecommerce/EcommerceApis.AccountFunds.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3EcommerceEcommerceApisApi(WechatPayV3Client client)
 
 - async WechatPayV3EcommerceEcommerceApisApiSubMerchantApplymentResponse SubMerchantApplymentAsync(WechatPayV3EcommerceEcommerceApisApiSubMerchantApplymentRequest request)
-  - POST /v3/ecommerce/applyments/; C# 参数：SubMerchantApplymentRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SubMerchantApplymentRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3EcommerceEcommerceApisApiQuerySubMerchantApplymentResponse QuerySubMerchantApplymentAsync(WechatPayV3EcommerceEcommerceApisApiQuerySubMerchantApplymentRequest request)
-  - GET /v3/ecommerce/applyments/{数据.applyment_id}; C# 参数：QuerySubMerchantApplymentRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QuerySubMerchantApplymentRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisApiQuerySubMerchantApplymentByOutRequestNoResponse QuerySubMerchantApplymentByOutRequestNoAsync(WechatPayV3EcommerceEcommerceApisApiQuerySubMerchantApplymentByOutRequestNoRequest request)
-  - GET /v3/ecommerce/applyments/out-请求-no/{数据.out_request_no}; C# 参数：QuerySubMerchantApplymentByOutRequestNoRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QuerySubMerchantApplymentByOutRequestNoRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisApiCombineTransactionsResponse CombineTransactionsAsync(WechatPayV3EcommerceEcommerceApisApiCombineTransactionsRequest request)
-  - POST /v3/ecommerce/combine/transactions/jsapi; C# 参数：CombineTransactionsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CombineTransactionsRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3EcommerceEcommerceApisApiQueryCombineTransactionsResponse QueryCombineTransactionsAsync(WechatPayV3EcommerceEcommerceApisApiQueryCombineTransactionsRequest request)
-  - GET /v3/ecommerce/combine/transactions/out-trade-no/{数据.combine_out_trade_no}; C# 参数：QueryCombineTransactionsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryCombineTransactionsRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisApiCloseCombineTransactionsResponse CloseCombineTransactionsAsync(WechatPayV3EcommerceEcommerceApisApiCloseCombineTransactionsRequest request)
-  - POST /v3/ecommerce/combine/transactions/out-trade-no/{数据.combine_out_trade_no}/close; C# 参数：CloseCombineTransactionsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CloseCombineTransactionsRawAsync(string path, string query, string jsonBody)
 
@@ -6481,10 +6216,6 @@ Ecommerce/EcommerceApis.AccountFunds.cs 的 Zan 微信支付强类型接口。
 
 ## WechatPayV3EcommerceEcommerceApisApiSubMerchantApplymentRequest (class)
 
-Ecommerce/EcommerceApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
-
 - WechatTypedRequest request;
 
 - string overridePath;
@@ -6536,26 +6267,19 @@ Ecommerce/EcommerceApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3EcommerceEcommerceApisBillsApi(WechatPayV3Client client)
 
 - async WechatPayV3EcommerceEcommerceApisBillsApiApplyAllSubMerchantFundflowBillResponse ApplyAllSubMerchantFundflowBillAsync(WechatPayV3EcommerceEcommerceApisBillsApiApplyAllSubMerchantFundflowBillRequest request)
-  - GET /v3/ecommerce/bill/fundflowbill; C# 参数：EcommerceAllSubMerchantFundflowBillRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ApplyAllSubMerchantFundflowBillRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisBillsApiApplySingleSubMerchantFundflowBillResponse ApplySingleSubMerchantFundflowBillAsync(WechatPayV3EcommerceEcommerceApisBillsApiApplySingleSubMerchantFundflowBillRequest request)
-  - GET /v3/bill/sub-merchant-fundflowbill; C# 参数：EcommerceSingleSubMerchantFundflowBillRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ApplySingleSubMerchantFundflowBillRawAsync(string path, string query)
 
 - async WechatRawResponse DownloadEcommerceBillAsync(WechatPayV3EcommerceEcommerceApisBillsApiDownloadEcommerceBillRequest request)
-  - POST (请求.RequestPath 指定); C# 参数：string downloadUrl, Stream destination, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DownloadEcommerceBillRawAsync(string path, string query, string jsonBody)
 
 
 ## WechatPayV3EcommerceEcommerceApisBillsApiApplyAllSubMerchantFundflowBillRequest (class)
-
-Ecommerce/EcommerceApis.Bills.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -6650,22 +6374,18 @@ Ecommerce/EcommerceApis.Bills.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3EcommerceEcommerceApisCrossBorderApi(WechatPayV3Client client)
 
 - async WechatPayV3EcommerceEcommerceApisCrossBorderApiQueryFundsToOverseaAvailableAmountResponse QueryFundsToOverseaAvailableAmountAsync(WechatPayV3EcommerceEcommerceApisCrossBorderApiQueryFundsToOverseaAvailableAmountRequest request)
-  - GET /v3/funds-to-oversea/transactions/{EscapeFundsToOverseaValue(transactionId)}/available_abroad_amounts; C# 参数：string transactionId, string subMchId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryFundsToOverseaAvailableAmountRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisCrossBorderApiApplyFundsToOverseaResponse ApplyFundsToOverseaAsync(WechatPayV3EcommerceEcommerceApisCrossBorderApiApplyFundsToOverseaRequest request)
-  - POST /v3/funds-to-oversea/orders; C# 参数：EcommerceFundsToOverseaRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ApplyFundsToOverseaRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3EcommerceEcommerceApisCrossBorderApiQueryFundsToOverseaOrderResponse QueryFundsToOverseaOrderAsync(WechatPayV3EcommerceEcommerceApisCrossBorderApiQueryFundsToOverseaOrderRequest request)
-  - GET /v3/funds-to-oversea/orders/{EscapeFundsToOverseaValue(outOrderId)}; C# 参数：string outOrderId, string subMchId, string transactionId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryFundsToOverseaOrderRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisCrossBorderApiQueryFundsToOverseaBillDownloadUrlResponse QueryFundsToOverseaBillDownloadUrlAsync(WechatPayV3EcommerceEcommerceApisCrossBorderApiQueryFundsToOverseaBillDownloadUrlRequest request)
-  - GET /v3/funds-to-oversea/bill-download-url; C# 参数：EcommerceFundsToOverseaBillRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryFundsToOverseaBillDownloadUrlRawAsync(string path, string query)
 
@@ -6713,10 +6433,6 @@ Ecommerce/EcommerceApis.Bills.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3EcommerceEcommerceApisCrossBorderApiQueryFundsToOverseaAvailableAmountRequest (class)
-
-Ecommerce/EcommerceApis.CrossBorder.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -6803,52 +6519,42 @@ Ecommerce/EcommerceApis.CrossBorder.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3EcommerceEcommerceApisMerchantCancellationApi(WechatPayV3Client client)
 
 - async WechatPayV3EcommerceEcommerceApisMerchantCancellationApiValidateMerchantCancellationResponse ValidateMerchantCancellationAsync(WechatPayV3EcommerceEcommerceApisMerchantCancellationApiValidateMerchantCancellationRequest request)
-  - GET /v3/ecommerce/account/apply-cancel-withdraw/validate-cancel/{EscapeMerchantCancellationPath(subMchId)}; C# 参数：string subMchId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ValidateMerchantCancellationRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisMerchantCancellationApiApplyCancelWithdrawResponse ApplyCancelWithdrawAsync(WechatPayV3EcommerceEcommerceApisMerchantCancellationApiApplyCancelWithdrawRequest request)
-  - POST /v3/ecommerce/account/apply-cancel-withdraw; C# 参数：EcommerceApplyCancelWithdrawRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ApplyCancelWithdrawRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3EcommerceEcommerceApisMerchantCancellationApiQueryCancelWithdrawByOutRequestNoResponse QueryCancelWithdrawByOutRequestNoAsync(WechatPayV3EcommerceEcommerceApisMerchantCancellationApiQueryCancelWithdrawByOutRequestNoRequest request)
-  - GET /v3/ecommerce/account/apply-cancel-withdraw/out-请求-no/{EscapeMerchantCancellationPath(outRequestNo)}; C# 参数：string outRequestNo, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryCancelWithdrawByOutRequestNoRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisMerchantCancellationApiQueryCancelWithdrawByApplymentIdResponse QueryCancelWithdrawByApplymentIdAsync(WechatPayV3EcommerceEcommerceApisMerchantCancellationApiQueryCancelWithdrawByApplymentIdRequest request)
-  - GET /v3/ecommerce/account/apply-cancel-withdraw/applyment-id/{EscapeMerchantCancellationPath(applymentId)}; C# 参数：string applymentId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryCancelWithdrawByApplymentIdRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisMerchantCancellationApiSubmitLegacyCancelApplicationResponse SubmitLegacyCancelApplicationAsync(WechatPayV3EcommerceEcommerceApisMerchantCancellationApiSubmitLegacyCancelApplicationRequest request)
-  - POST /v3/ecommerce/account/cancel-applications; C# 参数：EcommerceLegacyCancelApplicationRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SubmitLegacyCancelApplicationRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3EcommerceEcommerceApisMerchantCancellationApiQueryLegacyCancelApplicationResponse QueryLegacyCancelApplicationAsync(WechatPayV3EcommerceEcommerceApisMerchantCancellationApiQueryLegacyCancelApplicationRequest request)
-  - GET /v3/ecommerce/account/cancel-applications/out-apply-no/{EscapeMerchantCancellationPath(outApplyNo)}; C# 参数：string outApplyNo, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryLegacyCancelApplicationRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisMerchantCancellationApiUploadCancelApplicationImageResponse UploadCancelApplicationImageAsync(WechatPayV3EcommerceEcommerceApisMerchantCancellationApiUploadCancelApplicationImageRequest request, WechatMultipart multipart)
-  - POST /v3/ecommerce/account/cancel-applications/media; C# 参数：string fileName, Stream fileStream, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UploadCancelApplicationImageRawAsync(string path, string query, WechatMultipart multipart)
 
 - async WechatPayV3EcommerceEcommerceApisMerchantCancellationApiSubmitLegacyCancelWithdrawResponse SubmitLegacyCancelWithdrawAsync(WechatPayV3EcommerceEcommerceApisMerchantCancellationApiSubmitLegacyCancelWithdrawRequest request)
-  - POST /v3/mch_operate/risk/withdrawl-apply; C# 参数：EcommerceLegacyCancelWithdrawRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SubmitLegacyCancelWithdrawRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3EcommerceEcommerceApisMerchantCancellationApiQueryLegacyCancelWithdrawByOutRequestNoResponse QueryLegacyCancelWithdrawByOutRequestNoAsync(WechatPayV3EcommerceEcommerceApisMerchantCancellationApiQueryLegacyCancelWithdrawByOutRequestNoRequest request)
-  - GET /v3/mch_operate/risk/withdrawl-apply/out-请求-no/{EscapeMerchantCancellationPath(outRequestNo)}; C# 参数：string outRequestNo, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryLegacyCancelWithdrawByOutRequestNoRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisMerchantCancellationApiQueryLegacyCancelWithdrawByApplymentIdResponse QueryLegacyCancelWithdrawByApplymentIdAsync(WechatPayV3EcommerceEcommerceApisMerchantCancellationApiQueryLegacyCancelWithdrawByApplymentIdRequest request)
-  - GET /v3/mch_operate/risk/withdrawl-apply/applyment-id/{EscapeMerchantCancellationPath(applymentId)}; C# 参数：string applymentId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryLegacyCancelWithdrawByApplymentIdRawAsync(string path, string query)
 
@@ -7105,10 +6811,6 @@ Ecommerce/EcommerceApis.CrossBorder.cs 的 Zan 微信支付强类型接口。
 
 ## WechatPayV3EcommerceEcommerceApisMerchantCancellationApiValidateMerchantCancellationRequest (class)
 
-Ecommerce/EcommerceApis.MerchantCancellation.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
-
 - WechatTypedRequest request;
 
 - string overridePath;
@@ -7138,32 +6840,26 @@ Ecommerce/EcommerceApis.MerchantCancellation.cs 的 Zan 微信支付强类型接
 - public WechatPayV3EcommerceEcommerceApisRefundsApi(WechatPayV3Client client)
 
 - async WechatPayV3EcommerceEcommerceApisRefundsApiApplyEcommerceRefundResponse ApplyEcommerceRefundAsync(WechatPayV3EcommerceEcommerceApisRefundsApiApplyEcommerceRefundRequest request)
-  - POST /v3/ecommerce/refunds/apply; C# 参数：EcommerceRefundRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ApplyEcommerceRefundRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3EcommerceEcommerceApisRefundsApiQueryEcommerceRefundByRefundIdResponse QueryEcommerceRefundByRefundIdAsync(WechatPayV3EcommerceEcommerceApisRefundsApiQueryEcommerceRefundByRefundIdRequest request)
-  - GET /v3/ecommerce/refunds/id/{EscapeEcommerceRefundValue(refundId)}; C# 参数：string refundId, string subMchId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryEcommerceRefundByRefundIdRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisRefundsApiQueryEcommerceRefundByOutRefundNoResponse QueryEcommerceRefundByOutRefundNoAsync(WechatPayV3EcommerceEcommerceApisRefundsApiQueryEcommerceRefundByOutRefundNoRequest request)
-  - GET /v3/ecommerce/refunds/out-refund-no/{EscapeEcommerceRefundValue(outRefundNo)}; C# 参数：string outRefundNo, string subMchId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryEcommerceRefundByOutRefundNoRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisRefundsApiQueryEcommerceRefundAdvanceReturnResponse QueryEcommerceRefundAdvanceReturnAsync(WechatPayV3EcommerceEcommerceApisRefundsApiQueryEcommerceRefundAdvanceReturnRequest request)
-  - GET /v3/ecommerce/refunds/{EscapeEcommerceRefundValue(refundId)}/return-advance; C# 参数：string refundId, string subMchId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryEcommerceRefundAdvanceReturnRawAsync(string path, string query)
 
 - async WechatPayV3EcommerceEcommerceApisRefundsApiReturnEcommerceRefundAdvanceResponse ReturnEcommerceRefundAdvanceAsync(WechatPayV3EcommerceEcommerceApisRefundsApiReturnEcommerceRefundAdvanceRequest request)
-  - POST /v3/ecommerce/refunds/{EscapeEcommerceRefundValue(refundId)}/return-advance; C# 参数：string refundId, EcommerceRefundAdvanceReturnRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ReturnEcommerceRefundAdvanceRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3EcommerceEcommerceApisRefundsApiApplyEcommerceAbnormalRefundResponse ApplyEcommerceAbnormalRefundAsync(WechatPayV3EcommerceEcommerceApisRefundsApiApplyEcommerceAbnormalRefundRequest request)
-  - POST /v3/ecommerce/refunds/{EscapeEcommerceRefundValue(refundId)}/apply-abnormal-refund; C# 参数：string refundId, AbnormalRefundRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ApplyEcommerceAbnormalRefundRawAsync(string path, string query, string jsonBody)
 
@@ -7205,10 +6901,6 @@ Ecommerce/EcommerceApis.MerchantCancellation.cs 的 Zan 微信支付强类型接
 
 
 ## WechatPayV3EcommerceEcommerceApisRefundsApiApplyEcommerceRefundRequest (class)
-
-Ecommerce/EcommerceApis.Refunds.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -7356,6 +7048,15 @@ Ecommerce/EcommerceApis.Refunds.cs 的 Zan 微信支付强类型接口。
 - public string Raw;
 
 
+## WechatPayV3Entry (class)
+
+- public string name;
+
+- public WechatPayV3Config config;
+
+- WechatPayV3Entry(string name, WechatPayV3Config config)
+
+
 ## WechatPayV3FaPiaoFaPiaoApisApi (class)
 
 - WechatPayV3Client client;
@@ -7363,56 +7064,43 @@ Ecommerce/EcommerceApis.Refunds.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3FaPiaoFaPiaoApisApi(WechatPayV3Client client)
 
 - async WechatPayV3FaPiaoFaPiaoApisApiCheckSubMerchantFapiaoStatusResponse CheckSubMerchantFapiaoStatusAsync(WechatPayV3FaPiaoFaPiaoApisApiCheckSubMerchantFapiaoStatusRequest request)
-  - GET /v3/new-tax-控件-fapiao/merchant/{数据.sub_mchid}/检查; C# 参数：CheckFapiaoStatusRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CheckSubMerchantFapiaoStatusRawAsync(string path, string query)
 
 - async WechatPayV3FaPiaoFaPiaoApisApiCreateFapiaoCardTemplateResponse CreateFapiaoCardTemplateAsync(WechatPayV3FaPiaoFaPiaoApisApiCreateFapiaoCardTemplateRequest request)
-  - POST /v3/new-tax-控件-fapiao/card-template; C# 参数：CreateFapiaoCardTemplateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateFapiaoCardTemplateRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3FaPiaoFaPiaoApisApiQueryFapiaoResponse QueryFapiaoAsync(WechatPayV3FaPiaoFaPiaoApisApiQueryFapiaoRequest request)
-  - GET /v3/new-tax-控件-fapiao/fapiao-applications/{数据.fapiao_apply_id}; C# 参数：QueryFapiaoRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryFapiaoRawAsync(string path, string query)
 
 - async WechatPayV3FaPiaoFaPiaoApisApiGetTitleUrlResponse GetTitleUrlAsync(WechatPayV3FaPiaoFaPiaoApisApiGetTitleUrlRequest request)
-  - POST /v3/new-tax-控件-fapiao/user-title/title-url; C# 参数：GetTitleUrlRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse GetTitleUrlRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3FaPiaoFaPiaoApisApiGetUserTitleResponse GetUserTitleAsync(WechatPayV3FaPiaoFaPiaoApisApiGetUserTitleRequest request)
-  - POST /v3/new-tax-控件-fapiao/user-title; C# 参数：GetUserTitleRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse GetUserTitleRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3FaPiaoFaPiaoApisApiGetMerchantInfoResponse GetMerchantInfoAsync(WechatPayV3FaPiaoFaPiaoApisApiGetMerchantInfoRequest request)
-  - GET /v3/new-tax-控件-fapiao/merchant/{数据.sub_mchid}; C# 参数：GetMerchantInfoRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse GetMerchantInfoRawAsync(string path, string query)
 
 - async WechatPayV3FaPiaoFaPiaoApisApiCreateFapiaoResponse CreateFapiaoAsync(WechatPayV3FaPiaoFaPiaoApisApiCreateFapiaoRequest request)
-  - POST /v3/new-tax-控件-fapiao/fapiao-applications; C# 参数：CreateFapiaoRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateFapiaoRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3FaPiaoFaPiaoApisApiReverseFapiaoResponse ReverseFapiaoAsync(WechatPayV3FaPiaoFaPiaoApisApiReverseFapiaoRequest request)
-  - POST /v3/new-tax-控件-fapiao/fapiao-applications/{数据.fapiao_apply_id}/reverse; C# 参数：ReverseFapiaoRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ReverseFapiaoRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3FaPiaoFaPiaoApisApiGetFapiaoFileResponse GetFapiaoFileAsync(WechatPayV3FaPiaoFaPiaoApisApiGetFapiaoFileRequest request)
-  - GET /v3/new-tax-控件-fapiao/fapiao-applications/{数据.fapiao_apply_id}/fapiao-文件; C# 参数：GetFapiaoFileRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse GetFapiaoFileRawAsync(string path, string query)
 
 
 ## WechatPayV3FaPiaoFaPiaoApisApiCheckSubMerchantFapiaoStatusRequest (class)
-
-FaPiao/FaPiaoApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -7661,42 +7349,34 @@ FaPiao/FaPiaoApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3FundAppFundAppApisApi(WechatPayV3Client client)
 
 - async WechatPayV3FundAppFundAppApisApiTransferBillResponse TransferBillAsync(WechatPayV3FundAppFundAppApisApiTransferBillRequest request)
-  - POST /v3/fund-app/mch-transfer/transfer-bills; C# 参数：TransferBillRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse TransferBillRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3FundAppFundAppApisApiCancelTransferResponse CancelTransferAsync(WechatPayV3FundAppFundAppApisApiCancelTransferRequest request)
-  - POST /v3/fund-app/mch-transfer/transfer-bills/out-bill-no/{数据.out_bill_no}/cancel; C# 参数：CancelTransferRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CancelTransferRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3FundAppFundAppApisApiQueryTransferByOutBillNoResponse QueryTransferByOutBillNoAsync(WechatPayV3FundAppFundAppApisApiQueryTransferByOutBillNoRequest request)
-  - GET /v3/fund-app/mch-transfer/transfer-bills/out-bill-no/{数据.out_bill_no}; C# 参数：QueryTransferByOutBillNoRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryTransferByOutBillNoRawAsync(string path, string query)
 
 - async WechatPayV3FundAppFundAppApisApiQueryTransferByBillNoResponse QueryTransferByBillNoAsync(WechatPayV3FundAppFundAppApisApiQueryTransferByBillNoRequest request)
-  - GET /v3/fund-app/mch-transfer/transfer-bills/transfer-bill-no/{数据.transfer_bill_no}; C# 参数：QueryTransferByBillNoRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryTransferByBillNoRawAsync(string path, string query)
 
 - async WechatPayV3FundAppFundAppApisApiApplyElecsignByOutBillNoResponse ApplyElecsignByOutBillNoAsync(WechatPayV3FundAppFundAppApisApiApplyElecsignByOutBillNoRequest request)
-  - POST /v3/fund-app/mch-transfer/elecsign/out-bill-no; C# 参数：ApplyElecsignByOutBillNoRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ApplyElecsignByOutBillNoRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3FundAppFundAppApisApiQueryElecsignByOutBillNoResponse QueryElecsignByOutBillNoAsync(WechatPayV3FundAppFundAppApisApiQueryElecsignByOutBillNoRequest request)
-  - GET /v3/fund-app/mch-transfer/elecsign/out-bill-no/{数据.out_bill_no}; C# 参数：QueryElecsignByOutBillNoRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryElecsignByOutBillNoRawAsync(string path, string query)
 
 - async WechatPayV3FundAppFundAppApisApiApplyElecsignByBillNoResponse ApplyElecsignByBillNoAsync(WechatPayV3FundAppFundAppApisApiApplyElecsignByBillNoRequest request)
-  - POST /v3/fund-app/mch-transfer/elecsign/transfer-bill-no; C# 参数：ApplyElecsignByBillNoRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ApplyElecsignByBillNoRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3FundAppFundAppApisApiQueryElecsignByBillNoResponse QueryElecsignByBillNoAsync(WechatPayV3FundAppFundAppApisApiQueryElecsignByBillNoRequest request)
-  - GET /v3/fund-app/mch-transfer/elecsign/transfer-bill-no/{数据.transfer_bill_no}; C# 参数：QueryElecsignByBillNoRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryElecsignByBillNoRawAsync(string path, string query)
 
@@ -7871,10 +7551,6 @@ FaPiao/FaPiaoApis.cs 的 Zan 微信支付强类型接口。
 
 ## WechatPayV3FundAppFundAppApisApiTransferBillRequest (class)
 
-FundApp/FundAppApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
-
 - WechatTypedRequest request;
 
 - string overridePath;
@@ -7922,82 +7598,66 @@ FundApp/FundAppApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3MarketingMarketingApisBusifavorApi(WechatPayV3Client client)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiCreateBusifavorStockRequestDataResponse CreateBusifavorStockRequestDataAsync(WechatPayV3MarketingMarketingApisBusifavorApiCreateBusifavorStockRequestDataRequest request)
-  - POST /v3/marketing/busifavor/stocks; C# 参数：CreateBusifavorStockRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateBusifavorStockRequestDataRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiQueryBusifavorStockResponse QueryBusifavorStockAsync(WechatPayV3MarketingMarketingApisBusifavorApiQueryBusifavorStockRequest request)
-  - GET /v3/marketing/busifavor/stocks/{stock_id}; C# 参数：string stock_id, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryBusifavorStockRawAsync(string path, string query)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiUseBusifavorCouponResponse UseBusifavorCouponAsync(WechatPayV3MarketingMarketingApisBusifavorApiUseBusifavorCouponRequest request)
-  - POST /v3/marketing/busifavor/coupons/use; C# 参数：UseBusifavorCouponRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UseBusifavorCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiQueryBusifavorCouponsResponse QueryBusifavorCouponsAsync(WechatPayV3MarketingMarketingApisBusifavorApiQueryBusifavorCouponsRequest request)
-  - GET /v3/marketing/busifavor/users/{openid}/coupons?appid={appid}&偏移={偏移}&limit={limit}; C# 参数：string openid, string appid, string stock_id, string coupon_state, string creator_merchant, string belong_merchant, string sender_merchant, int 偏移 = 0, int limit = 20, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryBusifavorCouponsRawAsync(string path, string query)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiQueryBusifavorCouponResponse QueryBusifavorCouponAsync(WechatPayV3MarketingMarketingApisBusifavorApiQueryBusifavorCouponRequest request)
-  - GET /v3/marketing/busifavor/users/{openid}/coupons/{coupon_code}/appids/{appid}; C# 参数：string coupon_code, string appid, string openid, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryBusifavorCouponRawAsync(string path, string query)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiSetBusifavorCouponCodesResponse SetBusifavorCouponCodesAsync(WechatPayV3MarketingMarketingApisBusifavorApiSetBusifavorCouponCodesRequest request)
-  - POST /v3/marketing/busifavor/stocks/{数据.stock_id}/couponcodes; C# 参数：SetBusifavorCouponCodesRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SetBusifavorCouponCodesRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiSetBusifavorSetNotifyUrlResponse SetBusifavorSetNotifyUrlAsync(WechatPayV3MarketingMarketingApisBusifavorApiSetBusifavorSetNotifyUrlRequest request)
-  - POST /v3/marketing/busifavor/callbacks; C# 参数：SetBusifavorSetNotifyUrlRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SetBusifavorSetNotifyUrlRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiQueryBusifavorNotifyUrlResponse QueryBusifavorNotifyUrlAsync(WechatPayV3MarketingMarketingApisBusifavorApiQueryBusifavorNotifyUrlRequest request)
-  - GET /v3/marketing/busifavor/callbacks?mchid={mchid}; C# 参数：string mchid, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryBusifavorNotifyUrlRawAsync(string path, string query)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiAssociateBusifavorResponse AssociateBusifavorAsync(WechatPayV3MarketingMarketingApisBusifavorApiAssociateBusifavorRequest request)
-  - POST /v3/marketing/busifavor/coupons/associate; C# 参数：AssociateBusifavorRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse AssociateBusifavorRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiDisassociateBusifavorResponse DisassociateBusifavorAsync(WechatPayV3MarketingMarketingApisBusifavorApiDisassociateBusifavorRequest request)
-  - POST /v3/marketing/busifavor/coupons/disassociate; C# 参数：DisassociateBusifavorRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DisassociateBusifavorRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiModifyBusifavorStockBudgetResponse ModifyBusifavorStockBudgetAsync(WechatPayV3MarketingMarketingApisBusifavorApiModifyBusifavorStockBudgetRequest request)
-  - PATCH /v3/marketing/busifavor/stocks/{stock_id}/budget; C# 参数：string stock_id, ModifyBusifavorStockBudgetRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ModifyBusifavorStockBudgetRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiModifyBusifavorStockInformationResponse ModifyBusifavorStockInformationAsync(WechatPayV3MarketingMarketingApisBusifavorApiModifyBusifavorStockInformationRequest request)
-  - PATCH /v3/marketing/busifavor/stocks/{stock_id}; C# 参数：string stock_id, ModifyBusifavorStockInformationRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ModifyBusifavorStockInformationRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiReturnBusifavorCouponResponse ReturnBusifavorCouponAsync(WechatPayV3MarketingMarketingApisBusifavorApiReturnBusifavorCouponRequest request)
-  - POST /v3/marketing/busifavor/coupons/return; C# 参数：ReturnBusifavorCouponRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ReturnBusifavorCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiDeactivateBusifavorCouponResponse DeactivateBusifavorCouponAsync(WechatPayV3MarketingMarketingApisBusifavorApiDeactivateBusifavorCouponRequest request)
-  - POST /v3/marketing/busifavor/coupons/deactivate; C# 参数：DeactivateBusifavorCouponRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DeactivateBusifavorCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiPayBusifavorReceiptsResponse PayBusifavorReceiptsAsync(WechatPayV3MarketingMarketingApisBusifavorApiPayBusifavorReceiptsRequest request)
-  - POST /v3/marketing/busifavor/subsidy/pay-receipts; C# 参数：PayBusifavorReceiptsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse PayBusifavorReceiptsRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisBusifavorApiQueryBusifavorPayReceiptsResponse QueryBusifavorPayReceiptsAsync(WechatPayV3MarketingMarketingApisBusifavorApiQueryBusifavorPayReceiptsRequest request)
-  - GET /v3/marketing/busifavor/subsidy/pay-receipts/{subsidy_receipt_id}; C# 参数：string subsidy_receipt_id, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryBusifavorPayReceiptsRawAsync(string path, string query)
 
@@ -8033,10 +7693,6 @@ FundApp/FundAppApis.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3MarketingMarketingApisBusifavorApiCreateBusifavorStockRequestDataRequest (class)
-
-Marketing/MarketingApis.Busifavor.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -8521,16 +8177,11 @@ Marketing/MarketingApis.Busifavor.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3MarketingMarketingApisCardApi(WechatPayV3Client client)
 
 - async WechatPayV3MarketingMarketingApisCardApiSendCardResponse SendCardAsync(WechatPayV3MarketingMarketingApisCardApiSendCardRequest request)
-  - POST /v3/marketing/busifavor/coupons/{数据.card_id}/发送; C# 参数：SendCardRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SendCardRawAsync(string path, string query, string jsonBody)
 
 
 ## WechatPayV3MarketingMarketingApisCardApiSendCardRequest (class)
-
-Marketing/MarketingApis.Card.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -8569,81 +8220,63 @@ Marketing/MarketingApis.Card.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3MarketingMarketingApisFavorApi(WechatPayV3Client client)
 
 - async WechatPayV3MarketingMarketingApisFavorApiCreateStockResponse CreateStockAsync(WechatPayV3MarketingMarketingApisFavorApiCreateStockRequest request)
-  - POST /v3/marketing/favor/coupon-stocks; C# 参数：CreateStockRequsetData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateStockRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisFavorApiStartStockResponse StartStockAsync(WechatPayV3MarketingMarketingApisFavorApiStartStockRequest request)
-  - POST /v3/marketing/favor/stocks/{stock_id}/start; C# 参数：string stock_id, StartStockRequsetData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse StartStockRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisFavorApiDistributeStockResponse DistributeStockAsync(WechatPayV3MarketingMarketingApisFavorApiDistributeStockRequest request)
-  - POST /v3/marketing/favor/users/{openid}/coupons; C# 参数：string openid, DistributeStockRequsetData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DistributeStockRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisFavorApiPauseStockResponse PauseStockAsync(WechatPayV3MarketingMarketingApisFavorApiPauseStockRequest request)
-  - POST /v3/marketing/favor/stocks/{stock_id}/pause; C# 参数：string stock_id, string stock_creator_mchid, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse PauseStockRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisFavorApiRestartStockResponse RestartStockAsync(WechatPayV3MarketingMarketingApisFavorApiRestartStockRequest request)
-  - POST /v3/marketing/favor/stocks/{stock_id}/restart; C# 参数：string stock_id, string stock_creator_mchid, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse RestartStockRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisFavorApiQueryStocksResponse QueryStocksAsync(WechatPayV3MarketingMarketingApisFavorApiQueryStocksRequest request)
-  - GET /v3/marketing/favor/stocks?偏移={偏移}&limit={limit}&stock_creator_mchid={stock_creator_mchid}; C# 参数：uint 偏移, uint limit, string stock_creator_mchid, TenpayDateTime create_start_time = null, TenpayDateTime create_end_time = null, string status = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryStocksRawAsync(string path, string query)
 
 - async WechatPayV3MarketingMarketingApisFavorApiQueryStockResponse QueryStockAsync(WechatPayV3MarketingMarketingApisFavorApiQueryStockRequest request)
-  - GET /v3/marketing/favor/stocks/{stock_id}?stock_creator_mchid={stock_creator_mchid}; C# 参数：string stock_id, string stock_creator_mchid, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryStockRawAsync(string path, string query)
 
 - async WechatPayV3MarketingMarketingApisFavorApiQueryMerchantsStockResponse QueryMerchantsStockAsync(WechatPayV3MarketingMarketingApisFavorApiQueryMerchantsStockRequest request)
-  - GET /v3/marketing/favor/stocks/{stock_id}/merchants?偏移={偏移}&limit={limit}&stock_creator_mchid={stock_creator_mchid}; C# 参数：uint 偏移, uint limit, string stock_creator_mchid, string stock_id, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryMerchantsStockRawAsync(string path, string query)
 
 - async WechatPayV3MarketingMarketingApisFavorApiQueryItemsResponse QueryItemsAsync(WechatPayV3MarketingMarketingApisFavorApiQueryItemsRequest request)
-  - GET /v3/marketing/favor/stocks/{stock_id}/项目?偏移={偏移}&limit={limit}&stock_creator_mchid={stock_creator_mchid}; C# 参数：uint 偏移, uint limit, string stock_creator_mchid, string stock_id, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryItemsRawAsync(string path, string query)
 
 - async WechatPayV3MarketingMarketingApisFavorApiQueryCouponsResponse QueryCouponsAsync(WechatPayV3MarketingMarketingApisFavorApiQueryCouponsRequest request)
-  - GET /v3/marketing/favor/users/{openid}/coupons?appid={appid}&偏移={偏移}&limit={limit}; C# 参数：string openid, string appid, string stock_id, string status, string creator_mchid, string sender_mchid, string available_mchid, uint 偏移 = 0, uint limit = 20, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryCouponsRawAsync(string path, string query)
 
 - async WechatPayV3MarketingMarketingApisFavorApiQueryCouponResponse QueryCouponAsync(WechatPayV3MarketingMarketingApisFavorApiQueryCouponRequest request)
-  - GET /v3/marketing/favor/users/{openid}/coupons/{coupon_id}?appid={appid}; C# 参数：string coupon_id, string appid, string openid, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryCouponRawAsync(string path, string query)
 
 - async WechatRawResponse DownloadStockUseFlowAsync(WechatPayV3MarketingMarketingApisFavorApiDownloadStockUseFlowRequest request)
-  - GET /v3/marketing/favor/stocks/{stock_id}/use-flow; C# 参数：string stock_id, Stream fileStream, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DownloadStockUseFlowRawAsync(string path, string query)
 
 - async WechatRawResponse DownloadStockRefundFlowAsync(WechatPayV3MarketingMarketingApisFavorApiDownloadStockRefundFlowRequest request)
-  - GET /v3/marketing/favor/stocks/{stock_id}/refund-flow; C# 参数：string stock_id, Stream fileStream, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DownloadStockRefundFlowRawAsync(string path, string query)
 
 - async WechatPayV3MarketingMarketingApisFavorApiSetNotifyUrlResponse SetNotifyUrlAsync(WechatPayV3MarketingMarketingApisFavorApiSetNotifyUrlRequest request)
-  - POST /v3/marketing/favor/callbacks; C# 参数：SetNotifyUrlRequsetData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SetNotifyUrlRawAsync(string path, string query, string jsonBody)
 
 
 ## WechatPayV3MarketingMarketingApisFavorApiCreateStockRequest (class)
-
-Marketing/MarketingApis.Favor.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -9062,16 +8695,11 @@ Marketing/MarketingApis.Favor.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3MarketingMarketingApisImageApi(WechatPayV3Client client)
 
 - async WechatPayV3MarketingMarketingApisImageApiUploadImageResponse UploadImage(WechatPayV3MarketingMarketingApisImageApiUploadImageRequest request)
-  - POST /v3/marketing/favor/media/图片-upload; C# 参数：UploadImageRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UploadImage(string path, string query, string jsonBody)
 
 
 ## WechatPayV3MarketingMarketingApisImageApiUploadImageRequest (class)
-
-Marketing/MarketingApis.Image.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -9104,26 +8732,19 @@ Marketing/MarketingApis.Image.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3MarketingMarketingApisPartnershipsApi(WechatPayV3Client client)
 
 - async WechatPayV3MarketingMarketingApisPartnershipsApiBuildPartnershipsResponse BuildPartnershipsAsync(WechatPayV3MarketingMarketingApisPartnershipsApiBuildPartnershipsRequest request)
-  - POST /v3/marketing/partnerships/build; C# 参数：BuildPartnershipsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse BuildPartnershipsRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisPartnershipsApiTerminatePartnershipsResponse TerminatePartnershipsAsync(WechatPayV3MarketingMarketingApisPartnershipsApiTerminatePartnershipsRequest request)
-  - POST /v3/marketing/partnerships/terminate; C# 参数：TerminatePartnershipsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse TerminatePartnershipsRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisPartnershipsApiQueryPartnershipsResponse QueryPartnershipsAsync(WechatPayV3MarketingMarketingApisPartnershipsApiQueryPartnershipsRequest request)
-  - GET /v3/marketing/partnerships?authorized_data={数据.authorized_data.ToJson()}&partner={数据.partner.ToJson()}&偏移={偏移}&limit={limit}; C# 参数：QueryPartnershipsRequestData 数据, ulong limit = 20, ulong 偏移 = 0, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryPartnershipsRawAsync(string path, string query)
 
 
 ## WechatPayV3MarketingMarketingApisPartnershipsApiBuildPartnershipsRequest (class)
-
-Marketing/MarketingApis.Partnerships.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -9212,42 +8833,34 @@ Marketing/MarketingApis.Partnerships.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3MarketingMarketingApisPaygiftApi(WechatPayV3Client client)
 
 - async WechatPayV3MarketingMarketingApisPaygiftApiCreateUniqueThresholdActivityResponse CreateUniqueThresholdActivityAsync(WechatPayV3MarketingMarketingApisPaygiftApiCreateUniqueThresholdActivityRequest request)
-  - POST /v3/marketing/paygiftactivity/unique-threshold-activity; C# 参数：CreateUniqueThresholdActivityRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateUniqueThresholdActivityRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisPaygiftApiQueryPaygiftActivityResponse QueryPaygiftActivityAsync(WechatPayV3MarketingMarketingApisPaygiftApiQueryPaygiftActivityRequest request)
-  - GET /v3/marketing/paygiftactivity/activities/{activity_id}; C# 参数：string activity_id, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryPaygiftActivityRawAsync(string path, string query)
 
 - async WechatPayV3MarketingMarketingApisPaygiftApiQueryPaygiftActivityMerchantsResponse QueryPaygiftActivityMerchantsAsync(WechatPayV3MarketingMarketingApisPaygiftApiQueryPaygiftActivityMerchantsRequest request)
-  - GET /v3/marketing/paygiftactivity/activities/{activity_id}/merchants?偏移={偏移}&limit={limit}; C# 参数：string activity_id, ulong limit = 10, ulong 偏移 = 0, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryPaygiftActivityMerchantsRawAsync(string path, string query)
 
 - async WechatPayV3MarketingMarketingApisPaygiftApiQueryPaygiftActivityGoodsResponse QueryPaygiftActivityGoodsAsync(WechatPayV3MarketingMarketingApisPaygiftApiQueryPaygiftActivityGoodsRequest request)
-  - GET /v3/marketing/paygiftactivity/activities/{activity_id}/goods?偏移={偏移}&limit={limit}; C# 参数：string activity_id, ulong limit = 10, ulong 偏移 = 0, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryPaygiftActivityGoodsRawAsync(string path, string query)
 
 - async WechatPayV3MarketingMarketingApisPaygiftApiTerminatePaygiftActivityResponse TerminatePaygiftActivityAsync(WechatPayV3MarketingMarketingApisPaygiftApiTerminatePaygiftActivityRequest request)
-  - POST /v3/marketing/paygiftactivity/activities/{activity_id}/terminate; C# 参数：string activity_id, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse TerminatePaygiftActivityRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisPaygiftApiAddPaygiftActivityMerchantsResponse AddPaygiftActivityMerchantsAsync(WechatPayV3MarketingMarketingApisPaygiftApiAddPaygiftActivityMerchantsRequest request)
-  - POST /v3/marketing/paygiftactivity/activities/{数据.activity_id}/merchants/添加; C# 参数：AddPaygiftActivityMerchantsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse AddPaygiftActivityMerchantsRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MarketingMarketingApisPaygiftApiQueryPaygiftActivitiesResponse QueryPaygiftActivitiesAsync(WechatPayV3MarketingMarketingApisPaygiftApiQueryPaygiftActivitiesRequest request)
-  - GET /v3/marketing/paygiftactivity/activities?偏移={偏移}&limit={limit}; C# 参数：string activity_name, string activity_status, string award_type, int limit = 10, int 偏移 = 0, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryPaygiftActivitiesRawAsync(string path, string query)
 
 - async WechatPayV3MarketingMarketingApisPaygiftApiDeletePaygiftActivitiyMerchantsResponse DeletePaygiftActivitiyMerchantsAsync(WechatPayV3MarketingMarketingApisPaygiftApiDeletePaygiftActivitiyMerchantsRequest request)
-  - POST /v3/marketing/paygiftactivity/activities/{数据.activity_id}/merchants/删除; C# 参数：DeletePaygiftActivitiyMerchantsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DeletePaygiftActivitiyMerchantsRawAsync(string path, string query, string jsonBody)
 
@@ -9281,10 +8894,6 @@ Marketing/MarketingApis.Partnerships.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3MarketingMarketingApisPaygiftApiCreateUniqueThresholdActivityRequest (class)
-
-Marketing/MarketingApis.Paygift.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -9483,31 +9092,23 @@ Marketing/MarketingApis.Paygift.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3MedicalInsuranceMedicalInsuranceApisApi(WechatPayV3Client client)
 
 - async WechatPayV3MedicalInsuranceMedicalInsuranceApisApiCreateOrderResponse CreateOrderAsync(WechatPayV3MedicalInsuranceMedicalInsuranceApisApiCreateOrderRequest request)
-  - POST /v3/med-ins/orders; C# 参数：MedicalInsuranceOrderRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateOrderRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MedicalInsuranceMedicalInsuranceApisApiQueryOrderByMixTradeNoResponse QueryOrderByMixTradeNoAsync(WechatPayV3MedicalInsuranceMedicalInsuranceApisApiQueryOrderByMixTradeNoRequest request)
-  - GET /v3/med-ins/orders/mix-trade-no/{Escape(mixTradeNo)}; C# 参数：string mixTradeNo, string subMchId = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryOrderByMixTradeNoRawAsync(string path, string query)
 
 - async WechatPayV3MedicalInsuranceMedicalInsuranceApisApiQueryOrderByOutTradeNoResponse QueryOrderByOutTradeNoAsync(WechatPayV3MedicalInsuranceMedicalInsuranceApisApiQueryOrderByOutTradeNoRequest request)
-  - GET /v3/med-ins/orders/out-trade-no/{Escape(outTradeNo)}; C# 参数：string outTradeNo, string subMchId = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryOrderByOutTradeNoRawAsync(string path, string query)
 
 - async WechatPayV3MedicalInsuranceMedicalInsuranceApisApiNotifyRefundSuccessResponse NotifyRefundSuccessAsync(WechatPayV3MedicalInsuranceMedicalInsuranceApisApiNotifyRefundSuccessRequest request)
-  - POST /v3/med-ins/refunds/notify{query}; C# 参数：string mixTradeNo, MedicalInsuranceRefundNotifyRequestData 数据, string subMchId = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse NotifyRefundSuccessRawAsync(string path, string query, string jsonBody)
 
 
 ## WechatPayV3MedicalInsuranceMedicalInsuranceApisApiCreateOrderRequest (class)
-
-MedicalInsurance/MedicalInsuranceApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -9694,12 +9295,10 @@ MedicalInsurance/MedicalInsuranceApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3MerchantGovernanceInactiveMerchantVerificationApisApi(WechatPayV3Client client)
 
 - async WechatPayV3MerchantGovernanceInactiveMerchantVerificationApisApiStartVerificationResponse StartVerificationAsync(WechatPayV3MerchantGovernanceInactiveMerchantVerificationApisApiStartVerificationRequest request)
-  - POST /v3/compliance/inactive-merchant-identity-verification/merchants; C# 参数：InactiveMerchantVerificationRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse StartVerificationRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MerchantGovernanceInactiveMerchantVerificationApisApiQueryVerificationResponse QueryVerificationAsync(WechatPayV3MerchantGovernanceInactiveMerchantVerificationApisApiQueryVerificationRequest request)
-  - GET /v3/compliance/inactive-merchant-identity-verification/merchants/{Escape(subMchId)}/verifications/{Escape(verificationId)}; C# 参数：string subMchId, string verificationId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryVerificationRawAsync(string path, string query)
 
@@ -9732,10 +9331,6 @@ MedicalInsurance/MedicalInsuranceApis.cs 的 Zan 微信支付强类型接口。
 
 ## WechatPayV3MerchantGovernanceInactiveMerchantVerificationApisApiStartVerificationRequest (class)
 
-MerchantGovernance/InactiveMerchantVerificationApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
-
 - WechatTypedRequest request;
 
 - string overridePath;
@@ -9765,16 +9360,11 @@ MerchantGovernance/InactiveMerchantVerificationApis.cs 的 Zan 微信支付强�
 - public WechatPayV3MerchantGovernanceMerchantLimitationApisApi(WechatPayV3Client client)
 
 - async WechatPayV3MerchantGovernanceMerchantLimitationApisApiQuerySubMerchantLimitationResponse QuerySubMerchantLimitationAsync(WechatPayV3MerchantGovernanceMerchantLimitationApisApiQuerySubMerchantLimitationRequest request)
-  - GET /v3/mch-operation-manage/merchant-limitations/sub-mchid/{Escape(subMchId)}; C# 参数：string subMchId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QuerySubMerchantLimitationRawAsync(string path, string query)
 
 
 ## WechatPayV3MerchantGovernanceMerchantLimitationApisApiQuerySubMerchantLimitationRequest (class)
-
-MerchantGovernance/MerchantLimitationApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -9805,31 +9395,23 @@ MerchantGovernance/MerchantLimitationApis.cs 的 Zan 微信支付强类型接口
 - public WechatPayV3MerchantRiskMerchantRiskApisApi(WechatPayV3Client client)
 
 - async WechatPayV3MerchantRiskMerchantRiskApisApiCreateMerchantRiskNotifyUrlResponse CreateMerchantRiskNotifyUrlAsync(WechatPayV3MerchantRiskMerchantRiskApisApiCreateMerchantRiskNotifyUrlRequest request)
-  - POST /v3/merchant-risk-manage/violation-notifications; C# 参数：CreateMerchantRiskNotifyUrlRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateMerchantRiskNotifyUrlRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MerchantRiskMerchantRiskApisApiQueryMerchantRiskNotifyUrlResponse QueryMerchantRiskNotifyUrlAsync(WechatPayV3MerchantRiskMerchantRiskApisApiQueryMerchantRiskNotifyUrlRequest request)
-  - GET /v3/merchant-risk-manage/violation-notifications; C# 参数：int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryMerchantRiskNotifyUrlRawAsync(string path, string query)
 
 - async WechatPayV3MerchantRiskMerchantRiskApisApiUpdateMerchantRiskNotifyUrlResponse UpdateMerchantRiskNotifyUrlAsync(WechatPayV3MerchantRiskMerchantRiskApisApiUpdateMerchantRiskNotifyUrlRequest request)
-  - PUT /v3/merchant-risk-manage/violation-notifications; C# 参数：UpdateMerchantRiskNotifyUrlRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UpdateMerchantRiskNotifyUrlRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3MerchantRiskMerchantRiskApisApiDeleteMerchantRiskNotifyUrlResponse DeleteMerchantRiskNotifyUrlAsync(WechatPayV3MerchantRiskMerchantRiskApisApiDeleteMerchantRiskNotifyUrlRequest request)
-  - DELETE /v3/merchant-risk-manage/violation-notifications; C# 参数：int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DeleteMerchantRiskNotifyUrlRawAsync(string path, string query)
 
 
 ## WechatPayV3MerchantRiskMerchantRiskApisApiCreateMerchantRiskNotifyUrlRequest (class)
-
-MerchantRisk/MerchantRiskApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -9928,52 +9510,42 @@ MerchantRisk/MerchantRiskApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3ParkingReminderParkingReminderApisApi(WechatPayV3Client client)
 
 - async WechatPayV3ParkingReminderParkingReminderApisApiSubmitApplicationResponse SubmitApplicationAsync(WechatPayV3ParkingReminderParkingReminderApisApiSubmitApplicationRequest request)
-  - POST /v3/parking/reminders/application; C# 参数：ParkingLotApplicationRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SubmitApplicationRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ParkingReminderParkingReminderApisApiQueryApplicationResponse QueryApplicationAsync(WechatPayV3ParkingReminderParkingReminderApisApiQueryApplicationRequest request)
-  - GET /v3/parking/reminders/application/query; C# 参数：string parkingLotAuditNo, string outParkingLotId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryApplicationRawAsync(string path, string query)
 
 - async WechatPayV3ParkingReminderParkingReminderApisApiQueryApplicationListResponse QueryApplicationListAsync(WechatPayV3ParkingReminderParkingReminderApisApiQueryApplicationListRequest request)
-  - GET /v3/parking/reminders/applications; C# 参数：string outParkingLotId, int? 偏移 = null, int? limit = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryApplicationListRawAsync(string path, string query)
 
 - async WechatPayV3ParkingReminderParkingReminderApisApiWithdrawApplicationResponse WithdrawApplicationAsync(WechatPayV3ParkingReminderParkingReminderApisApiWithdrawApplicationRequest request)
-  - POST /v3/parking/reminders/application/withdraw; C# 参数：string parkingLotAuditNo, string outParkingLotId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse WithdrawApplicationRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ParkingReminderParkingReminderApisApiSyncEntryResponse SyncEntryAsync(WechatPayV3ParkingReminderParkingReminderApisApiSyncEntryRequest request)
-  - POST /v3/parking/reminders/条目; C# 参数：ParkingEntryRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SyncEntryRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ParkingReminderParkingReminderApisApiSyncExitResponse SyncExitAsync(WechatPayV3ParkingReminderParkingReminderApisApiSyncExitRequest request)
-  - POST /v3/parking/reminders/exit; C# 参数：ParkingExitRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SyncExitRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ParkingReminderParkingReminderApisApiSyncPaymentResponse SyncPaymentAsync(WechatPayV3ParkingReminderParkingReminderApisApiSyncPaymentRequest request)
-  - POST /v3/parking/reminders/payment; C# 参数：ParkingPaymentRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SyncPaymentRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ParkingReminderParkingReminderApisApiSyncExtensionPaymentResponse SyncExtensionPaymentAsync(WechatPayV3ParkingReminderParkingReminderApisApiSyncExtensionPaymentRequest request)
-  - POST /v3/parking/reminders/ext-payment; C# 参数：ParkingExtensionPaymentRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SyncExtensionPaymentRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ParkingReminderParkingReminderApisApiQueryParkingLotResponse QueryParkingLotAsync(WechatPayV3ParkingReminderParkingReminderApisApiQueryParkingLotRequest request)
-  - GET /v3/parking/reminders/parking-lot; C# 参数：string outParkingLotId = null, string wxParkingLotId = null, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryParkingLotRawAsync(string path, string query)
 
 - async WechatPayV3ParkingReminderParkingReminderApisApiQueryParkingFeeResponse QueryParkingFeeAsync(WechatPayV3ParkingReminderParkingReminderApisApiQueryParkingFeeRequest request)
-  - POST /v3/parking/reminders/parking-fee; C# 参数：ParkingFeeRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryParkingFeeRawAsync(string path, string query, string jsonBody)
 
@@ -10087,10 +9659,6 @@ MerchantRisk/MerchantRiskApis.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3ParkingReminderParkingReminderApisApiSubmitApplicationRequest (class)
-
-ParkingReminder/ParkingReminderApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -10323,112 +9891,90 @@ ParkingReminder/ParkingReminderApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3PayScorePayScoreApisApi(WechatPayV3Client client)
 
 - async WechatPayV3PayScorePayScoreApisApiCreateDirectCompleteServiceOrderResponse CreateDirectCompleteServiceOrderAsync(WechatPayV3PayScorePayScoreApisApiCreateDirectCompleteServiceOrderRequest request)
-  - POST /v3/serviceorder/direct-complete; C# 参数：CreateDirectCompleteServiceOrderRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateDirectCompleteServiceOrderRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiGivePermissionResponse GivePermissionAsync(WechatPayV3PayScorePayScoreApisApiGivePermissionRequest request)
-  - POST /v3/payscore/permissions; C# 参数：GivePermissionRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse GivePermissionRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiQueryPermissionByAuthorizationCodeResponse QueryPermissionByAuthorizationCodeAsync(WechatPayV3PayScorePayScoreApisApiQueryPermissionByAuthorizationCodeRequest request)
-  - GET /v3/payscore/permissions/authorization-code/{authorization_code}&service_id={service_id}; C# 参数：string service_id, string authorization_code, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryPermissionByAuthorizationCodeRawAsync(string path, string query)
 
 - async WechatPayV3PayScorePayScoreApisApiTerminatePermissionByAuthorizationCodeResponse TerminatePermissionByAuthorizationCodeAsync(WechatPayV3PayScorePayScoreApisApiTerminatePermissionByAuthorizationCodeRequest request)
-  - POST /v3/payscore/permissions/authorization-code/{数据.authorization_code}/terminate; C# 参数：TerminatePermissionByAuthorizationCodeRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse TerminatePermissionByAuthorizationCodeRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiQueryPermissionByOpenidResponse QueryPermissionByOpenidAsync(WechatPayV3PayScorePayScoreApisApiQueryPermissionByOpenidRequest request)
-  - GET /v3/payscore/permissions/openid/{openid}?appid={appid}&service_id={service_id}; C# 参数：string service_id, string appid, string openid, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryPermissionByOpenidRawAsync(string path, string query)
 
 - async WechatPayV3PayScorePayScoreApisApiTerminatePermissionByOpenidResponse TerminatePermissionByOpenidAsync(WechatPayV3PayScorePayScoreApisApiTerminatePermissionByOpenidRequest request)
-  - POST /v3/payscore/permissions/openid/{数据.openid}/terminate; C# 参数：TerminatePermissionByOpenidRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse TerminatePermissionByOpenidRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiCreateServiceOrderResponse CreateServiceOrderAsync(WechatPayV3PayScorePayScoreApisApiCreateServiceOrderRequest request)
-  - POST /v3/payscore/serviceorder; C# 参数：CreateServiceOrderRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateServiceOrderRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiQueryServiceOrderResponse QueryServiceOrderAsync(WechatPayV3PayScorePayScoreApisApiQueryServiceOrderRequest request)
-  - GET /v3/payscore/serviceorder?service_id={service_id}&appid={appid}; C# 参数：string out_order_no, string query_id, string service_id, string appid, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryServiceOrderRawAsync(string path, string query)
 
 - async WechatPayV3PayScorePayScoreApisApiCancelServiceOrderResponse CancelServiceOrderAsync(WechatPayV3PayScorePayScoreApisApiCancelServiceOrderRequest request)
-  - POST /v3/payscore/serviceorder/{数据.out_order_no}/cancel; C# 参数：CancelServiceOrderRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CancelServiceOrderRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiModifyServiceOrderResponse ModifyServiceOrderAsync(WechatPayV3PayScorePayScoreApisApiModifyServiceOrderRequest request)
-  - POST /v3/payscore/serviceorder/{数据.out_order_no}/modify; C# 参数：ModifyServiceOrderRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ModifyServiceOrderRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiCompleteServiceOrderResponse CompleteServiceOrderAsync(WechatPayV3PayScorePayScoreApisApiCompleteServiceOrderRequest request)
-  - POST /v3/payscore/serviceorder/{数据.out_order_no}/complete; C# 参数：CompleteServiceOrderRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CompleteServiceOrderRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiPayServiceOrderResponse PayServiceOrderAsync(WechatPayV3PayScorePayScoreApisApiPayServiceOrderRequest request)
-  - POST /v3/payscore/serviceorder/{数据.out_order_no}/pay; C# 参数：PayServiceOrderRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse PayServiceOrderRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiSyncPayServiceOrderResponse SyncPayServiceOrderAsync(WechatPayV3PayScorePayScoreApisApiSyncPayServiceOrderRequest request)
-  - POST /v3/payscore/serviceorder/{数据.out_order_no}/sync; C# 参数：SyncPayServiceOrderRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SyncPayServiceOrderRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiRegisterGuideResponse RegisterGuideAsync(WechatPayV3PayScorePayScoreApisApiRegisterGuideRequest request)
-  - POST /v3/smartguide/guides; C# 参数：RegisterGuideRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse RegisterGuideRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiAssignGuideResponse AssignGuideAsync(WechatPayV3PayScorePayScoreApisApiAssignGuideRequest request)
-  - POST /v3/smartguide/guides/{数据.guide_id}/assign; C# 参数：AssignGuideRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse AssignGuideRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiQueryGuideResponse QueryGuideAsync(WechatPayV3PayScorePayScoreApisApiQueryGuideRequest request)
-  - GET /v3/smartguide/guides?store_id={UrlQueryHelper.ToParams(数据)}; C# 参数：QueryGuideRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryGuideRawAsync(string path, string query)
 
 - async WechatPayV3PayScorePayScoreApisApiModifyGuideResponse ModifyGuideAsync(WechatPayV3PayScorePayScoreApisApiModifyGuideRequest request)
-  - PATCH /v3/smartguide/guides/{数据.guide_id}; C# 参数：ModifyGuideRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ModifyGuideRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiGoldplanChangeGoldplanStatusResponse GoldplanChangeGoldplanStatusAsync(WechatPayV3PayScorePayScoreApisApiGoldplanChangeGoldplanStatusRequest request)
-  - POST /v3/goldplan/merchants/changegoldplanstatus; C# 参数：GoldplanChangeGoldplanStatusRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse GoldplanChangeGoldplanStatusRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiGoldplanChangeCustomPageStatusResponse GoldplanChangeCustomPageStatusAsync(WechatPayV3PayScorePayScoreApisApiGoldplanChangeCustomPageStatusRequest request)
-  - POST /v3/goldplan/merchants/changecustompagestatus; C# 参数：GoldplanChangeCustomPageStatusRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse GoldplanChangeCustomPageStatusRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiGoldplanSetAdvertisingIndustryFilterResponse GoldplanSetAdvertisingIndustryFilterAsync(WechatPayV3PayScorePayScoreApisApiGoldplanSetAdvertisingIndustryFilterRequest request)
-  - POST /v3/goldplan/merchants/设置-advertising-industry-filter; C# 参数：GoldplanSetAdvertisingIndustryFilterRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse GoldplanSetAdvertisingIndustryFilterRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiGoldplanOpenAdvertisingShowResponse GoldplanOpenAdvertisingShowAsync(WechatPayV3PayScorePayScoreApisApiGoldplanOpenAdvertisingShowRequest request)
-  - POST /v3/goldplan/merchants/open-advertising-show; C# 参数：GoldplanOpenAdvertisingShowRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse GoldplanOpenAdvertisingShowRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3PayScorePayScoreApisApiGoldplanCloseAdvertisingShowResponse GoldplanCloseAdvertisingShowAsync(WechatPayV3PayScorePayScoreApisApiGoldplanCloseAdvertisingShowRequest request)
-  - POST /v3/goldplan/merchants/close-advertising-show; C# 参数：GoldplanCloseAdvertisingShowRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse GoldplanCloseAdvertisingShowRawAsync(string path, string query, string jsonBody)
 
@@ -10536,10 +10082,6 @@ ParkingReminder/ParkingReminderApis.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3PayScorePayScoreApisApiCreateDirectCompleteServiceOrderRequest (class)
-
-PayScore/PayScoreApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -11154,192 +10696,154 @@ PayScore/PayScoreApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3ProductCouponProductCouponApisApi(WechatPayV3Client client)
 
 - async WechatPayV3ProductCouponProductCouponApisApiCreateProductCouponResponse CreateProductCouponAsync(WechatPayV3ProductCouponProductCouponApisApiCreateProductCouponRequest request)
-  - POST /v3/marketing/partner/product-coupon/product-coupons; C# 参数：ProductCouponCreateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateProductCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiUpdateProductCouponResponse UpdateProductCouponAsync(WechatPayV3ProductCouponProductCouponApisApiUpdateProductCouponRequest request)
-  - PATCH /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, ProductCouponModifyRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UpdateProductCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiModifyProductCouponResponse ModifyProductCouponAsync(WechatPayV3ProductCouponProductCouponApisApiModifyProductCouponRequest request)
-  - PATCH /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, ProductCouponModifyRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ModifyProductCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiQueryProductCouponResponse QueryProductCouponAsync(WechatPayV3ProductCouponProductCouponApisApiQueryProductCouponRequest request)
-  - GET /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, string brandId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryProductCouponRawAsync(string path, string query)
 
 - async WechatPayV3ProductCouponProductCouponApisApiDeactivateProductCouponResponse DeactivateProductCouponAsync(WechatPayV3ProductCouponProductCouponApisApiDeactivateProductCouponRequest request)
-  - POST /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, ProductCouponDeactivateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DeactivateProductCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiCreateStockResponse CreateStockAsync(WechatPayV3ProductCouponProductCouponApisApiCreateStockRequest request)
-  - POST /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, ProductCouponStockCreateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateStockRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiCreateStockBundleResponse CreateStockBundleAsync(WechatPayV3ProductCouponProductCouponApisApiCreateStockBundleRequest request)
-  - POST /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, ProductCouponStockBundleCreateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateStockBundleRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiQueryStocksResponse QueryStocksAsync(WechatPayV3ProductCouponProductCouponApisApiQueryStocksRequest request)
-  - GET /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, ProductCouponStockListQueryRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryStocksRawAsync(string path, string query)
 
 - async WechatPayV3ProductCouponProductCouponApisApiQueryStockResponse QueryStockAsync(WechatPayV3ProductCouponProductCouponApisApiQueryStockRequest request)
-  - GET /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, string stockId, string brandId, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryStockRawAsync(string path, string query)
 
 - async WechatPayV3ProductCouponProductCouponApisApiUpdateStockResponse UpdateStockAsync(WechatPayV3ProductCouponProductCouponApisApiUpdateStockRequest request)
-  - PATCH /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, string stockId, ProductCouponStockModifyRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UpdateStockRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiModifyStockResponse ModifyStockAsync(WechatPayV3ProductCouponProductCouponApisApiModifyStockRequest request)
-  - PATCH /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, string stockId, ProductCouponStockModifyRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ModifyStockRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiModifyStockBundleResponse ModifyStockBundleAsync(WechatPayV3ProductCouponProductCouponApisApiModifyStockBundleRequest request)
-  - PATCH /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, string stockBundleId, ProductCouponStockModifyRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ModifyStockBundleRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiUpdateStockBudgetResponse UpdateStockBudgetAsync(WechatPayV3ProductCouponProductCouponApisApiUpdateStockBudgetRequest request)
-  - POST /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, string stockId, ProductCouponStockBudgetRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UpdateStockBudgetRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiUpdateStockBundleBudgetResponse UpdateStockBundleBudgetAsync(WechatPayV3ProductCouponProductCouponApisApiUpdateStockBundleBudgetRequest request)
-  - POST /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, string stockBundleId, ProductCouponStockBudgetRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UpdateStockBundleBudgetRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiDeactivateStockResponse DeactivateStockAsync(WechatPayV3ProductCouponProductCouponApisApiDeactivateStockRequest request)
-  - POST /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, string stockId, ProductCouponDeactivateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DeactivateStockRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiAssociateStoresResponse AssociateStoresAsync(WechatPayV3ProductCouponProductCouponApisApiAssociateStoresRequest request)
-  - POST /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, string stockId, ProductCouponStoresRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse AssociateStoresRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiAssociateStockBundleStoresResponse AssociateStockBundleStoresAsync(WechatPayV3ProductCouponProductCouponApisApiAssociateStockBundleStoresRequest request)
-  - POST /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, string stockBundleId, ProductCouponStoresRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse AssociateStockBundleStoresRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiQueryAssociatedStoresResponse QueryAssociatedStoresAsync(WechatPayV3ProductCouponProductCouponApisApiQueryAssociatedStoresRequest request)
-  - GET /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, string stockId, ProductCouponStoreListQueryRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryAssociatedStoresRawAsync(string path, string query)
 
 - async WechatPayV3ProductCouponProductCouponApisApiDisassociateStoresResponse DisassociateStoresAsync(WechatPayV3ProductCouponProductCouponApisApiDisassociateStoresRequest request)
-  - POST /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, string stockId, ProductCouponStoresRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DisassociateStoresRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiDisassociateStockBundleStoresResponse DisassociateStockBundleStoresAsync(WechatPayV3ProductCouponProductCouponApisApiDisassociateStockBundleStoresRequest request)
-  - POST /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, string stockBundleId, ProductCouponStoresRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DisassociateStockBundleStoresRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiUploadCouponCodesResponse UploadCouponCodesAsync(WechatPayV3ProductCouponProductCouponApisApiUploadCouponCodesRequest request)
-  - POST /v3/marketing/partner/product-coupon/product-coupons/; C# 参数：string productCouponId, string stockId, ProductCouponCodeUploadRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UploadCouponCodesRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiSendCouponResponse SendCouponAsync(WechatPayV3ProductCouponProductCouponApisApiSendCouponRequest request)
-  - POST /v3/marketing/partner/product-coupon/users/; C# 参数：string openid, ProductCouponSendRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SendCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiSendCouponBundleResponse SendCouponBundleAsync(WechatPayV3ProductCouponProductCouponApisApiSendCouponBundleRequest request)
-  - POST /v3/marketing/partner/product-coupon/users/; C# 参数：string openid, ProductCouponSendBundleRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SendCouponBundleRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiConfirmCouponResponse ConfirmCouponAsync(WechatPayV3ProductCouponProductCouponApisApiConfirmCouponRequest request)
-  - POST /v3/marketing/partner/product-coupon/users/; C# 参数：string openid, string couponCode, ProductCouponConfirmRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ConfirmCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiPreSendCouponResponse PreSendCouponAsync(WechatPayV3ProductCouponProductCouponApisApiPreSendCouponRequest request)
-  - POST /v3/marketing/partner/product-coupon/users/; C# 参数：string openid, ProductCouponPreSendRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse PreSendCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiPreSendCouponBundleResponse PreSendCouponBundleAsync(WechatPayV3ProductCouponProductCouponApisApiPreSendCouponBundleRequest request)
-  - POST /v3/marketing/partner/product-coupon/users/; C# 参数：string openid, ProductCouponPreSendBundleRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse PreSendCouponBundleRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiUseCouponResponse UseCouponAsync(WechatPayV3ProductCouponProductCouponApisApiUseCouponRequest request)
-  - POST /v3/marketing/partner/product-coupon/users/; C# 参数：string openid, string couponCode, ProductCouponUseRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UseCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiQueryUserCouponResponse QueryUserCouponAsync(WechatPayV3ProductCouponProductCouponApisApiQueryUserCouponRequest request)
-  - GET /v3/marketing/partner/product-coupon/users/; C# 参数：string openid, string couponCode, ProductCouponUserCouponQueryRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryUserCouponRawAsync(string path, string query)
 
 - async WechatPayV3ProductCouponProductCouponApisApiQueryUserCouponsResponse QueryUserCouponsAsync(WechatPayV3ProductCouponProductCouponApisApiQueryUserCouponsRequest request)
-  - GET /v3/marketing/partner/product-coupon/users/; C# 参数：string openid, ProductCouponUserCouponListQueryRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryUserCouponsRawAsync(string path, string query)
 
 - async WechatPayV3ProductCouponProductCouponApisApiDeactivateUserCouponResponse DeactivateUserCouponAsync(WechatPayV3ProductCouponProductCouponApisApiDeactivateUserCouponRequest request)
-  - POST /v3/marketing/partner/product-coupon/users/; C# 参数：string openid, string couponCode, ProductCouponUserCouponDeactivateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DeactivateUserCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiDeactivateUserCouponBundleResponse DeactivateUserCouponBundleAsync(WechatPayV3ProductCouponProductCouponApisApiDeactivateUserCouponBundleRequest request)
-  - POST /v3/marketing/partner/product-coupon/users/; C# 参数：string openid, string userCouponBundleId, ProductCouponUserCouponBundleDeactivateRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DeactivateUserCouponBundleRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiReturnCouponResponse ReturnCouponAsync(WechatPayV3ProductCouponProductCouponApisApiReturnCouponRequest request)
-  - POST /v3/marketing/partner/product-coupon/users/; C# 参数：string openid, string couponCode, ProductCouponUserCouponReturnRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ReturnCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiReturnUserCouponResponse ReturnUserCouponAsync(WechatPayV3ProductCouponProductCouponApisApiReturnUserCouponRequest request)
-  - POST /v3/marketing/partner/product-coupon/users/; C# 参数：string openid, string couponCode, ProductCouponUserCouponReturnRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ReturnUserCouponRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiQueryNotifyConfigResponse QueryNotifyConfigAsync(WechatPayV3ProductCouponProductCouponApisApiQueryNotifyConfigRequest request)
-  - GET /v3/marketing/partner/product-coupon/notify-configs; C# 参数：int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryNotifyConfigRawAsync(string path, string query)
 
 - async WechatPayV3ProductCouponProductCouponApisApiSetNotifyConfigResponse SetNotifyConfigAsync(WechatPayV3ProductCouponProductCouponApisApiSetNotifyConfigRequest request)
-  - POST /v3/marketing/partner/product-coupon/notify-configs; C# 参数：ProductCouponNotifyConfigRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse SetNotifyConfigRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiCreateImageGenerationTaskResponse CreateImageGenerationTaskAsync(WechatPayV3ProductCouponProductCouponApisApiCreateImageGenerationTaskRequest request)
-  - POST /v3/marketing/partner/product-coupon/图片-generation-tasks; C# 参数：ProductCouponImageGenerationTaskRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateImageGenerationTaskRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProductCouponProductCouponApisApiQueryImageGenerationTaskResponse QueryImageGenerationTaskAsync(WechatPayV3ProductCouponProductCouponApisApiQueryImageGenerationTaskRequest request)
-  - GET /v3/marketing/partner/product-coupon/; C# 参数：string taskId, string brandId, string imageGenerationType, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryImageGenerationTaskRawAsync(string path, string query)
 
 - async WechatPayV3ProductCouponProductCouponApisApiUploadImageResponse UploadImageAsync(WechatPayV3ProductCouponProductCouponApisApiUploadImageRequest request, WechatMultipart multipart)
-  - POST /v3/marketing/partner/product-coupon/media/upload-图片; C# 参数：string fileName, Stream fileStream, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UploadImageRawAsync(string path, string query, WechatMultipart multipart)
 
@@ -11473,10 +10977,6 @@ PayScore/PayScoreApis.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3ProductCouponProductCouponApisApiCreateProductCouponRequest (class)
-
-ProductCoupon/ProductCouponApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -12645,57 +12145,46 @@ ProductCoupon/ProductCouponApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3ProfitsharingProfitsharingApisApi(WechatPayV3Client client)
 
 - async WechatPayV3ProfitsharingProfitsharingApisApiCreateProfitsharingResponse CreateProfitsharingAsync(WechatPayV3ProfitsharingProfitsharingApisApiCreateProfitsharingRequest request)
-  - POST /v3/{1}profitsharing/orders; C# 参数：CreateProfitsharingRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateProfitsharingRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProfitsharingProfitsharingApisApiQueryProfitsharingResponse QueryProfitsharingAsync(WechatPayV3ProfitsharingProfitsharingApisApiQueryProfitsharingRequest request)
-  - GET /v3/profitsharing/orders/{out_order_no}?&transaction_id={transaction_id}; C# 参数：string transaction_id, string out_order_no, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryProfitsharingRawAsync(string path, string query)
 
 - async WechatPayV3ProfitsharingProfitsharingApisApiReturnProfitsharingResponse ReturnProfitsharingAsync(WechatPayV3ProfitsharingProfitsharingApisApiReturnProfitsharingRequest request)
-  - POST /v3/{1}profitsharing/return-orders; C# 参数：ReturnProfitsharingRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse ReturnProfitsharingRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProfitsharingProfitsharingApisApiQueryReturnProfitsharingResponse QueryReturnProfitsharingAsync(WechatPayV3ProfitsharingProfitsharingApisApiQueryReturnProfitsharingRequest request)
-  - GET /v3/profitsharing/return-orders/{out_return_no}?&out_order_no={out_return_no}; C# 参数：string out_return_no, string out_order_no, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryReturnProfitsharingRawAsync(string path, string query)
 
 - async WechatPayV3ProfitsharingProfitsharingApisApiUnfreezeProfitsharingResponse UnfreezeProfitsharingAsync(WechatPayV3ProfitsharingProfitsharingApisApiUnfreezeProfitsharingRequest request)
-  - POST /v3/profitsharing/orders/unfreeze; C# 参数：UnfreezeProfitsharingRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UnfreezeProfitsharingRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProfitsharingProfitsharingApisApiQueryProfitsharingAmountsResponse QueryProfitsharingAmountsAsync(WechatPayV3ProfitsharingProfitsharingApisApiQueryProfitsharingAmountsRequest request)
-  - GET /v3/profitsharing/transactions/{transaction_id}/amounts; C# 参数：string transaction_id, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryProfitsharingAmountsRawAsync(string path, string query)
 
 - async WechatPayV3ProfitsharingProfitsharingApisApiQueryProfitsharingConfigsResponse QueryProfitsharingConfigsAsync(WechatPayV3ProfitsharingProfitsharingApisApiQueryProfitsharingConfigsRequest request)
-  - GET /v3/brand/profitsharing/brand-configs/{数据.brand_mchid}; C# 参数：QueryProfitsharingConfigsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryProfitsharingConfigsRawAsync(string path, string query)
 
 - async WechatPayV3ProfitsharingProfitsharingApisApiFinishProfitsharingResponse FinishProfitsharingAsync(WechatPayV3ProfitsharingProfitsharingApisApiFinishProfitsharingRequest request)
-  - POST /v3/brand/profitsharing/finish-顺序; C# 参数：FinishProfitsharingRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse FinishProfitsharingRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProfitsharingProfitsharingApisApiAddProfitsharingReceiverResponse AddProfitsharingReceiverAsync(WechatPayV3ProfitsharingProfitsharingApisApiAddProfitsharingReceiverRequest request)
-  - POST /v3/{1}profitsharing/receivers/添加; C# 参数：AddProfitsharingReceiverRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse AddProfitsharingReceiverRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProfitsharingProfitsharingApisApiDeleteProfitsharingResponse DeleteProfitsharingAsync(WechatPayV3ProfitsharingProfitsharingApisApiDeleteProfitsharingRequest request)
-  - POST /v3/{1}profitsharing/receivers/删除; C# 参数：DeleteProfitsharingReceiverRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse DeleteProfitsharingRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3ProfitsharingProfitsharingApisApiQueryProfitsharingBillsResponse QueryProfitsharingBillsAsync(WechatPayV3ProfitsharingProfitsharingApisApiQueryProfitsharingBillsRequest request)
-  - GET /v3/profitsharing/bills{UrlQueryHelper.ToParams(数据)}; C# 参数：QueryProfitsharingBillsRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryProfitsharingBillsRawAsync(string path, string query)
 
@@ -12741,10 +12230,6 @@ ProductCoupon/ProductCouponApis.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3ProfitsharingProfitsharingApisApiCreateProfitsharingRequest (class)
-
-Profitsharing/ProfitsharingApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -13051,22 +12536,18 @@ Profitsharing/ProfitsharingApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3SmartGuideSmartGuideApisApi(WechatPayV3Client client)
 
 - async WechatPayV3SmartGuideSmartGuideApisApiRegisterSmartGuideResponse RegisterSmartGuideAsync(WechatPayV3SmartGuideSmartGuideApisApiRegisterSmartGuideRequest request)
-  - POST /v3/smartguide/guides; C# 参数：RegisterSmartGuideRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse RegisterSmartGuideRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3SmartGuideSmartGuideApisApiAssignSmartGuideResponse AssignSmartGuideAsync(WechatPayV3SmartGuideSmartGuideApisApiAssignSmartGuideRequest request)
-  - POST /v3/smartguide/guides/{数据.guide_id}/assign; C# 参数：AssignSmartGuideRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse AssignSmartGuideRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3SmartGuideSmartGuideApisApiQuerySmartGuideResponse QuerySmartGuideAsync(WechatPayV3SmartGuideSmartGuideApisApiQuerySmartGuideRequest request)
-  - GET /v3/smartguide/guides; C# 参数：QuerySmartGuideRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QuerySmartGuideRawAsync(string path, string query)
 
 - async WechatPayV3SmartGuideSmartGuideApisApiUpdateSmartGuideResponse UpdateSmartGuideAsync(WechatPayV3SmartGuideSmartGuideApisApiUpdateSmartGuideRequest request)
-  - PATCH /v3/smartguide/guides/{数据.guide_id}; C# 参数：UpdateSmartGuideRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse UpdateSmartGuideRawAsync(string path, string query, string jsonBody)
 
@@ -13132,10 +12613,6 @@ Profitsharing/ProfitsharingApis.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3SmartGuideSmartGuideApisApiRegisterSmartGuideRequest (class)
-
-SmartGuide/SmartGuideApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -13216,16 +12693,11 @@ SmartGuide/SmartGuideApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3TransferTransferApisApi(WechatPayV3Client client)
 
 - async WechatPayV3TransferTransferApisApiBatchesResponse BatchesAsync(WechatPayV3TransferTransferApisApiBatchesRequest request)
-  - POST /v3/transfer/batches; C# 参数：BatchesRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse BatchesRawAsync(string path, string query, string jsonBody)
 
 
 ## WechatPayV3TransferTransferApisApiBatchesRequest (class)
-
-Transfer/TransferApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 
@@ -13272,22 +12744,18 @@ Transfer/TransferApis.cs 的 Zan 微信支付强类型接口。
 - public WechatPayV3VehicleParkingVehicleParkingApisApi(WechatPayV3Client client)
 
 - async WechatPayV3VehicleParkingVehicleParkingApisApiQueryServiceResponse QueryServiceAsync(WechatPayV3VehicleParkingVehicleParkingApisApiQueryServiceRequest request)
-  - GET /v3/vehicle/parking/services/find?appid={appid}&plate_number={plate_number}&plate_color={plate_color}&openid={openid}; C# 参数：string appid, string plate_number, string plate_color, string openid, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryServiceRawAsync(string path, string query)
 
 - async WechatPayV3VehicleParkingVehicleParkingApisApiCreateParkingResponse CreateParkingAsync(WechatPayV3VehicleParkingVehicleParkingApisApiCreateParkingRequest request)
-  - POST /v3/vehicle/parking/parkings; C# 参数：CreateParkingRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse CreateParkingRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3VehicleParkingVehicleParkingApisApiPayParkingResponse PayParkingAsync(WechatPayV3VehicleParkingVehicleParkingApisApiPayParkingRequest request)
-  - POST /v3/vehicle/transactions/parking; C# 参数：PayParkingRequestData 数据, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse PayParkingRawAsync(string path, string query, string jsonBody)
 
 - async WechatPayV3VehicleParkingVehicleParkingApisApiQueryParkingResponse QueryParkingAsync(WechatPayV3VehicleParkingVehicleParkingApisApiQueryParkingRequest request)
-  - GET /v3/vehicle/transactions/out-trade-no/{out_trade_no}; C# 参数：string out_trade_no, int timeOut = Config.TIME_OUT
 
 - async WechatRawResponse QueryParkingRawAsync(string path, string query)
 
@@ -13395,10 +12863,6 @@ Transfer/TransferApis.cs 的 Zan 微信支付强类型接口。
 
 
 ## WechatPayV3VehicleParkingVehicleParkingApisApiQueryServiceRequest (class)
-
-VehicleParking/VehicleParkingApis.cs 的 Zan 微信支付强类型接口。
-商户号、私钥、证书和 API 密钥由产品客户端配置统一提供。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
 
 - WechatTypedRequest request;
 

@@ -21,7 +21,7 @@ zan-site/
 │       # 全量 API 模型是构建中间产物 gen/ref-data.json（~19MB），只在构建时使用，不部署
 ├── guides/           # 手写指南（Markdown 源）
 │   ├── lang.md       # 语言参考（全部语言能力，实测语义）
-│   ├── gui.md        # GUI 开发指南（.zform + 代码式组件 + 控件）
+│   ├── gui.md        # GUI 开发指南（.html 设计稿 + 代码式组件 + 控件）
 │   ├── stdlib.md     # 标准库总览与索引
 │   ├── wiki.md       # IDE 指南
 │   └── examples.md   # 示例与模板

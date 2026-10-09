@@ -181,15 +181,15 @@ Full spec: `docs/HTML_UI.md` in the SDK.
 
 The visual window designer's storage format is HTML — a doc whose
 `<body>` carries the bare `data-zan-design` marker. Every shipped
-template and all IDE-internal forms ARE .html (the legacy .zform compile
-channel was removed in P8-4: zanc rejects .zform input with a targeted
+template and all IDE-internal forms ARE .html (the legacy .html compile
+channel was removed in P8-4: zanc rejects .html input with a targeted
 error; convert with `DesignerHtml.FromJsonDoc`, the canonical
-.zform→.html converter); the JSON doc model is an internal
+.html→.html converter); the JSON doc model is an internal
 representation (undo/redo snapshots, the JSON drawer, the LSP
 feed) — don't hand-write it, and write new designs as .html.
 
 - **Compile channel**: zanc sends a `body[data-zan-design]` .html to the
-  same GenForm projection the old .zform used (typed partial class); a plain .html
+  same GenForm projection the old .html used (typed partial class); a plain .html
   goes to the GenHtml build-tree class instead. Keep the marker intact —
   it is the routing bit.
 - **Round-trip is key-faithful** (tested): doc-level keys become body
@@ -240,7 +240,7 @@ a file you must not touch (concurrent session, frozen stdlib), surface the
 blocker and stop changing that batch — do not "keep editing, compile later."
 
 **One command template, kept correct.** In one session `zanc` failed 4 times in
-a row with `cannot open file 'src/App.zform'` because the working directory had
+a row with `cannot open file 'src/App.html'` because the working directory had
 drifted to `build/`. Commands that compile your project are project assets:
 keep the exact working form in the project's AGENTS.md/README and always paste
 it, including the `cd`, instead of retyping it from memory. Same for tool
@@ -315,4 +315,4 @@ State the command you ran and what it printed. Separate "compiled", "ran" and
 * `TryGetValue(key, out v)` **未命中时不写 out 参数**——调用后 `v` 还是调用前的旧值（未初始化则是 null），拿它当"没找到"的信号必错。定式：调用前先赋哨兵值（`string v = "";`），命中与否用返回布尔判断，别用 out 值判空。
 * 闭包（delegate/lambda）捕获方法的 **`out` 参数不回传**——捕获的是副本，delegate 里的累加/赋值调用方看不见，编译不报错（ZanDb `MinField` 首版在 `ScanRows` 回调里直接写 out 累计值，调用方永远拿到初值 0）。定式：delegate 里只操作局部变量，扫描结束后一次写回 out 参数。
 * `Dictionary.Keys` 返回的是**内部 List 本体**，不是副本——对它原地排序/增删会把键与值的配对打乱（排序后 `keys[i]` 对应的值还是旧槽位的）。需要排序先拷贝到新 List 再排。
-* `.zform` 的设计名（或文件基名）**别叫 `App`**：与 stdlib `Gui.App` 同名时 nsresolve 会把 Chart 全家的 `App` 形参引用改坏（100 个 `undefined type 'App'`，100% 复现，TASKS A311）。模板 raw 编译要把 `{{NAME}}` 占位符换成真实项目名（IDE 建项目时自动替换+重命名）。要和并行会话彻底隔离：`git archive HEAD stdlib` 解到快照目录 + 复制 `zanc.exe` 和 `build/zanrt_*.obj` 进去（stdlib 按 exe 相对定位），再把 `LOCALAPPDATA` 指到私有目录隔离生成器缓存。
+* `.html` 的设计名（或文件基名）**别叫 `App`**：与 stdlib `Gui.App` 同名时 nsresolve 会把 Chart 全家的 `App` 形参引用改坏（100 个 `undefined type 'App'`，100% 复现，TASKS A311）。模板 raw 编译要把 `{{NAME}}` 占位符换成真实项目名（IDE 建项目时自动替换+重命名）。要和并行会话彻底隔离：`git archive HEAD stdlib` 解到快照目录 + 复制 `zanc.exe` 和 `build/zanrt_*.obj` 进去（stdlib 按 exe 相对定位），再把 `LOCALAPPDATA` 指到私有目录隔离生成器缓存。

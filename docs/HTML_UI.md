@@ -272,7 +272,7 @@ P0-P4 节）。CSS 支持面（含 grid/flex/float）见 TASKS.md A16。
 窗口设计器的存取格式就是本文件的 HTML 子集：文档 `<body>` 带裸属性
 `data-zan-design`（区分设计稿与运行期 UI 文档——编译期前者进 GenForm 窗体
 投影，后者进 GenHtml 建树类；IDE 里前者开设计器）。同一份 JSON 文档模型
-（原 .zform）经 `System.Web.DesignerHtml` 与 HTML 互转，全键保真往返：
+经 `System.Web.DesignerHtml` 与 HTML 解析：
 
 - 文档级键（winW/role/layoutMode/…）→ `<body>` 的 `data-<kebab>` 属性；
   `name` 另发 `<body id>`；裸属性即 `true`；`0`/`""`/`false` 不发（读端有
@@ -295,8 +295,7 @@ P0-P4 节）。CSS 支持面（含 grid/flex/float）见 TASKS.md A16。
 
 P7d 起全仓库窗口声明只有 .html 一种形态：templates/gui 12 份与 IDE 自用
 31 份设计稿均已迁移（模型级等价校验），模板/新建文件/编译发现全部以
-.html 为入口。P8-4 起 .zform 编译通道删除：zanc 对 .zform 输入报定向
-错误（"the legacy .zform design format is no longer supported"），旧项目
+.html 为入口。早期 .html 编译通道已彻底删除，统一采用 .html 设计稿。
 把设计文档转成 .html（`DesignerHtml.FromJsonDoc` 是规范转换器）后编译；
 GenForm 只认 .html 设计稿，`.zscene`（场景）与 `.zcomp`（用户组件）不受
 影响。

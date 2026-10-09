@@ -12,7 +12,7 @@
 |---|---|---|
 | `System` | 语言内建 + 核心类型：`DateTime` `TimeSpan` `Guid` `Random` `Exception` `IDisposable` `MessageBox` `Binding<T>` `Interop` `Com` `NativeMemory` `ZanVersion` 等 | [System](/ref/System) |
 | `System.Collections` / `.Generic` | `HashSet<T>` `LinkedList<T>` `Queue<T>` `Stack<T>` `KeyValuePair<K,V>` / `KVP<K,V>` | [引用](/ref/System.Collections) |
-| `System.Compiler` | 编译期代码生成：`ZanGen` `GenDb` `GenForm`（.zform 投影）`GenJson` `GenRoute` `GenScene` | [引用](/ref/System.Compiler) |
+| `System.Compiler` | 编译期代码生成：`ZanGen` `GenDb` `GenForm`（.html 设计稿投影）`GenJson` `GenRoute` `GenScene` | [引用](/ref/System.Compiler) |
 | `System.Data` | 数据库统一层：`DbConnection` `DbResult` `DbParams` `DbPool` + 方言（`Sqlite` `MySql` `Postgres` `SqlServer` `Firebird` `TDengine` `Redis` `Odbc`）+ ORM（`Model` `ModelQuery` `QueryBuilder` `Migration`）+ `ZanDb` 嵌入式 KV；`Excel/`（`XlsxBook` 纯 Zan 写 .xlsx：多工作表、文本/数字/布尔/日期单元格、表头加粗、冻结首行、列宽自适应；大表用 `SaveStreaming` + `XlsxRowSource` 流式落盘——内存占用与行数无关、超 1048576 行自动分表、可取消） | [引用](/ref/System.Data) |
 | `System.Diagnostics` | `Process` `ProcessHost` `ProcessList` `Stopwatch` `ServerMetrics` `Log`（分级文件日志）`Privileges` | [引用](/ref/System.Diagnostics) |
 | `System.Drawing` | Win32 风格：`Graphics`（HDC）`Bitmap` `Font` `Color` `Point` `Size` `Rectangle` `PrinterSettings` `RawPrinter`（无 Pen/Brush，用 color+penWidth 传参） | [引用](/ref/System.Drawing) |
@@ -20,7 +20,7 @@
 | `System.IO` | `File` `Directory` `Path` `(PathEx)` `Stream` `FileStream` `StreamReader/Writer` `MemoryStream` `ByteBuffer` `Compression`（GZip/Deflate/Zip/Tar/BZip2/Crc32）`IniFile` `MemoryMappedFile` `DirectoryWatcher` `KnownFolders` `Shortcut` | [引用](/ref/System.IO) |
 | `System.Input` | `Keyboard` `Mouse` `Hotkey` `Hook` `Background` | [引用](/ref/System.Input) |
 | `System.Json` | `JsonValue`（DOM）`JsonParser` `JsonBuilder` `JsonReader` | [引用](/ref/System.Json) |
-| `System.Knowledge` | `GalleryIndex` `ZformSchema` `ZformResult` `KnowledgeProp` `KnowledgeControl`（AI 知识库/表单 schema） | [引用](/ref/System.Knowledge) |
+| `System.Knowledge` | `GalleryIndex` `GalleryResult`（AI 知识库与示例画廊索引） | [引用](/ref/System.Knowledge) |
 | `System.Linq` | `Enumerable`（91 个 `List<T>` 扩展：Where/Select/Any/All/First/Last/Single/Take/Skip/Distinct/OrderBy/GroupBy/Aggregate/Sum/Min/Max/...）`Expr<T>` 表达式树 | [引用](/ref/System.Linq) |
 | `System.Management` | `Cpu` `Memory` `DiskUsage` `Device` `Display` `Power` `Registry` `TaskScheduler` `SystemInfo` | [引用](/ref/System.Management) |
 | `System.Net` | 网络全家桶：`HttpClient` `HttpServer` `HttpRequest/Response` `Framer`；`Sockets`（`Socket` `TcpClient` `TcpListener` `UdpClient` `AsyncSocket`）`WebSocket`（`WebSocketClient/Server` `Wss`）`Mqtt` `Coap` `Modbus` `Ntp` `Sip` `Sse` `WebDav` `Rpc` `Tls`；`Worker` 多进程服务器 | [引用](/ref/System.Net) |
@@ -37,7 +37,7 @@
 | `Gui.Widget` | 控件（85 个类）：`Button` `Label` `Input` `TextArea` `Checkbox` `Radio` `Switch` `SelectBox` `Slider` `Rate` `Panel` `Card` `Tabs` `Table` `ListView<T>` `TreeView` `VirtualList` `ScrollColumn` `SplitPanel` `Wizard` `ToolStrip` `StatusBar` `Layer` `Popover` … | [引用](/ref/Gui.Widget) |
 | `Gui.Component` | 高级组件：`Dock`（DockPanel/Group/Host）`GraphView` `FilePicker` `FileTree` `LogView` `ChatView` `ConsoleView` `PivotTable` `PropertyGrid` `SessionList` `Downloader` `CodeEditor` `WebView` `DataTable` `CefBrowser` `Chart` | [引用](/ref/Gui.Component) |
 | `Gui.Hmi` | 工控：`Gauge` `Bargraph` `Led` `Digital` `EquipPanel` `Alarm(Banner/List)` `NumPad` `Trend` | [引用](/ref/Gui.Hmi) |
-| `Gui.Designer` | 可视化设计器（`.zform` 编辑/检查器/画布） | [引用](/ref/Gui.Designer) |
+| `Gui.Designer` | 可视化窗口设计器（`.html` 设计稿编辑/检查器/画布） | [引用](/ref/Gui.Designer) |
 | `Gui.Backend` | 原生层：`Window` `UiDriver` `Win32Shell` | [引用](/ref/Gui.Backend) |
 | `Game.Core` | 游戏主循环 `App` | [引用](/ref/Game.Core) |
 | `Game.Foundation` | 固定步长计时、语义化输入、场景生命周期、Gui 宿主 | [引用](/ref/Game.Foundation) |

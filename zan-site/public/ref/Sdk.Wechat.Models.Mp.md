@@ -5,10 +5,6 @@
 
 ## WechatMpActionInfo (class)
 
-从随附的 C# SDK 生成的共享 DTO 实体。
-一个 C# 命名空间/类型标识精确对应一个 Zan 模型。
-由 scripts/generate_wechat_mp.py 从 Senparc.Weixin.MP.AdvancedAPIs 生成。
-
 - public List<WechatMpActionList> action_list;
 
 

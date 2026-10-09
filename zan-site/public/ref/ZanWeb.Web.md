@@ -1,6 +1,6 @@
 # ZanWeb.Web
 
-> 源码: `packages/Zan.Mvc/src/ZanWeb/Framework/AdminController.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/ApiController.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/AppController.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/AppServices.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/CrudOps.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/FormPage.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Lang.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/ListPage.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Prose.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Rows.zan`
+> 源码: `packages/Zan.Mvc/src/ZanWeb/Framework/AdminController.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/ApiController.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/AppController.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/AppServices.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Lang.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/MarkdownLite.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Prose.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Rows.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Crud/Engine/CrudOps.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Crud/Engine/FormPage.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Crud/Engine/ListPage.zan`
 
 
 ## AdminController (class)
@@ -77,6 +77,8 @@
 
 - private DbContext Db()
 
+- protected IFreeSql Orm()
+
 - protected CacheContext Cache()
 
 - protected async IDbConnection Conn()
@@ -124,7 +126,11 @@
 
 - CacheContext cache;
 
+- IFreeSql fsql;
+
 - AppServices(DbContext db, CacheContext cache)
+
+- AppServices(DbContext db, CacheContext cache, IFreeSql fsql)
 
 - static void Use(AppServices services)
 
@@ -133,6 +139,8 @@
 - DbContext Db()
 
 - CacheContext Cache()
+
+- IFreeSql Orm()
 
 
 ## CrudOps (class)
@@ -471,6 +479,25 @@
 - void Screen(AppController c, ViewData d, string path, string action, List<OrmCond> conds, ListQuery q, int total, List<StrMap> rows, bool canCreate, bool canUpdate, bool canDelete)
 
 - string Query(List<OrmCond> conds, int page, int limit)
+
+- static string WidthNum(string s)
+
+- static string Esc(string s)
+
+
+## MarkdownLite (class)
+
+- static string Html(string md)
+
+- static int OrderDot(string s)
+
+- static void CloseAll(StringBuilder outp, ref bool inList, ref bool inOrder, ref bool inQuote)
+
+- static void CloseQuote(StringBuilder outp, ref bool inQuote)
+
+- static string Inline(string escaped)
+
+- static string Marks(string s, string mark, string openTag, string closeTag)
 
 - static string Esc(string s)
 

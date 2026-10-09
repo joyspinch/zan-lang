@@ -5,8 +5,6 @@
 
 ## TlsByteReader (class)
 
-字节数组大端序安全读取器。
-
 - byte[]data;
 
 - int pos;
@@ -33,10 +31,6 @@
 
 
 ## TlsByteWriter (class)
-
-动态字节数组构建器。
-
-动态字节数组构建器（带双指针滑动窗口，消除高频前缀消费带来的 O(N) 内存拷贝开销）。
 
 - byte[]buf;
 
@@ -77,10 +71,6 @@
 
 ## TlsCipherState (class)
 
-TLS 记录层 AEAD (AES-128-GCM) 密码状态机。
-支持 TLS 1.2 与 TLS 1.3 双版本单向记录加密与解密。
-零 C 语言与零 OpenSSL 依赖，100% Zan 原生实现。
-
 - int version;
 
 - byte[]key;
@@ -110,13 +100,10 @@ TLS 记录层 AEAD (AES-128-GCM) 密码状态机。
 - int RecordLen(int plainLen)
 
 - int EncryptToBuf(int contentType, nint dataPtr, int len, byte[]outBuf, int outOffset)
-  - 直写加密并封装为完整 TLS 记录（含 5 字节记录头）。返回写入的记录总字节数，失败返回 -1。
 
 - byte[]Encrypt(int contentType, byte[]data, int offset, int len)
-  - 加密明文负载并封装为完整 TLS 记录（含 5 字节记录头）。
 
 - byte[]Decrypt(byte[]header, byte[]payload, int pOffset, int pLen, List<int> outContentType)
-  - 解密 TLS 记录密文负载，剥离认证标签与填充，产出原始明文与真实 ContentType。
 
 - int EncryptTls12ToBuf(int contentType, nint dataPtr, int len, byte[]outBuf, int outOffset)
 
@@ -128,9 +115,6 @@ TLS 记录层 AEAD (AES-128-GCM) 密码状态机。
 
 
 ## TlsContext (class)
-
-纯 Zan 原生 TLS 上下文。
-记录与握手无 OpenSSL 依赖；Windows 客户端系统信任经 Crypt32 SSL 链策略验证。
 
 - bool server;
 
@@ -181,18 +165,12 @@ TLS 记录层 AEAD (AES-128-GCM) 密码状态机。
 - static List<X509Certificate> ReadTrustBundle(string path, bool strict)
 
 - static List<X509Certificate> ParseCertChain(string pem)
-  - 解析服务端证书 PEM 链束：全部证书按出现顺序保留（叶子在
-    前），数量与 DER 总长受限；任何一张无法解析即整体拒绝。
 
 - static List<X509Certificate> ReadCertChainFile(string path)
 
 - static List<X509Certificate> TrustFromCandidates(string[]paths)
-  - 按顺序尝试每个候选 bundle 路径：存在但损坏/不可解析的
-    候选只被跳过，不阻断后续候选；全部候选都不可用才返回 null
-    （调用方随之 fail-closed）。
 
 - bool AddTrustedCert(string pemFile)
-  - Add every supported CA certificate in a bounded PEM bundle, in addition to defaults.
 
 - static List<X509Certificate> SystemTrustRoots()
 
@@ -209,21 +187,14 @@ TLS 记录层 AEAD (AES-128-GCM) 密码状态机。
 - bool PinMatches(string got)
 
 - static TlsContext CreateServer(string certFile, string keyFile)
-  - 创建服务器端 TLS 上下文。证书文件可以是 PEM 链束
-    （叶子在前，其后为中间证书）；单证书文件行为不变。链束任何一环
-    无法解析即整体拒绝，不得静默降级为只发叶子。
 
 - static TlsContext CreateClient()
-  - 创建客户端 TLS 上下文；Windows 使用系统 SSL 链策略，Linux 使用发行版 CA bundle。
 
 - static TlsContext CreateClientWithCertificate(string certFile, string keyFile)
-  - 创建带客户端证书与私钥的 TLS 上下文（双向认证）。
 
 - void DisableVerify()
-  - 禁用对端证书与主机名校验（仅用于本地自签名开发调试）。
 
 - void DisableTls13()
-  - 禁用 TLS 1.3，将协商上限限制为 TLS 1.2。
 
 - string Handle()
 
@@ -235,9 +206,6 @@ TLS 记录层 AEAD (AES-128-GCM) 密码状态机。
 
 
 ## TlsEngine (class)
-
-纯 Zan 原生 TLS 1.2 / TLS 1.3 客户端与服务端流引擎。
-TLS 记录与握手为原生 Zan；Windows 客户端证书链使用系统 Crypt32 SSL 策略。
 
 - [DllImport("crt", EntryPoint="zan_io_crypto_windows_ssl_policy")]static extern int WindowsSslPolicy(nint certs, int totalLen, int count, nint host, int hostLen);
 
@@ -388,11 +356,8 @@ TLS 记录与握手为原生 Zan；Windows 客户端证书链使用系统 Crypt3
 - void SetCredentials(X509Certificate cert, RsaKey key, EcKey ecKey)
 
 - void SetCertChain(List<X509Certificate> chain)
-  - 服务端证书链：叶子在前、中间证书随后。链中每张 DER 都
-    有效且总长受限；为空或不合法时保留 SetCredentials 的单证书回退。
 
 - List<X509Certificate> SendChain()
-  - 待发送的服务端证书列表（叶子在前）；无链时退回单证书。
 
 - int OutNetLength()
 
@@ -411,7 +376,6 @@ TLS 记录与握手为原生 Zan；Windows 客户端证书链使用系统 Crypt3
 - long VerifyResult()
 
 - int OsTrustDiag()
-  - Windows 系统信任桥接的诊断码（1=信任，0=输入/环境拒绝，负值=失败分类）
 
 - string PeerCertificateText()
 
@@ -426,16 +390,12 @@ TLS 记录与握手为原生 Zan；Windows 客户端证书链使用系统 Crypt3
 - static byte[]GenerateX25519(out byte[]publicKey)
 
 - void StartHandshake()
-  - 启动 TLS 握手。客户端产出 ClientHello 记录，服务端置待接收状态。
 
 - void FeedNetwork(byte[]data, int offset, int len)
-  - 向引擎灌入网络层读到的原始数据字节。
 
 - byte[]DrainNetwork()
-  - 从引擎取出待发送至网络的加密数据字节。
 
 - int Step()
-  - 驱动握手与记录处理状态机前进。返回 1 表示握手已完成，0 表示需继续从网络读入数据，-1 表示出错。
 
 - int ProcessRecord(int ctype, byte[]header, byte[]inBuf, int pOffset, int pLen)
 
@@ -474,19 +434,14 @@ TLS 记录与握手为原生 Zan；Windows 客户端证书链使用系统 Crypt3
 - int HandleServerFinished(byte[]fullMsg, byte[]body)
 
 - int SendAppData(nint dataPtr, int len)
-  - 加密应用数据指针并零拷贝直写到待发网络缓冲区，按 16KB 分片封装为 TLS 记录。
 
 - int SendAppData(byte[]data, int offset, int len)
-  - 加密应用数据字节数组并放入待发网络缓冲区。
 
 - int SendAppData(string data, int offset, int len)
-  - 加密应用数据字符串并放入待发网络缓冲区。
 
 - int RecvAppData(byte[]outBuf, int offset, int maxLen)
-  - 从已解密的应用缓冲区提取明文数据到字节数组。
 
 - int RecvAppData(string outBuf, int offset, int maxLen)
-  - 从已解密的应用缓冲区提取明文数据到原生字符串/内存切片。
 
 - int AvailableAppData()
 
@@ -496,8 +451,6 @@ TLS 记录与握手为原生 Zan；Windows 客户端证书链使用系统 Crypt3
 
 
 ## TlsRecord (class)
-
-TLS 记录层协议常量。
 
 - static int ContentTypeChangeCipherSpec=20;
 
@@ -568,16 +521,11 @@ TLS 记录层协议常量。
 - static int AlertUnrecognizedName=112;
 
 - static byte[]FormatPlaintext(int contentType, int version, byte[]data, int offset, int len)
-  - 构造明文 TLS 记录包（用于握手未加密阶段）。
 
 - static void WriteSeq64(byte[]buf, int offset, long seq)
-  - 将 64 位无符号序列号按大端写入缓冲区。
 
 
 ## TlsStream (class)
-
-非阻塞套接字上的纯 Zan 原生 TLS 1.2 / TLS 1.3 流。
-原生 AES-128-GCM、X25519、HKDF 与 X.509 握手；Windows 客户端另用 Crypt32 SSL 链策略。
 
 - [DllImport("crt", EntryPoint="zan_monotonic_us")]static extern long MonotonicUs();
 
@@ -612,12 +560,10 @@ TLS 记录层协议常量。
 - static TlsStream Setup(TlsContext ctx, nint sock, string host)
 
 - static async TlsStream AcceptAsync(TlsContext ctx, nint sock)
-  - 服务器端：接受客户端连接并执行 TLS 握手。
 
 - static async TlsStream AcceptAsync(TlsContext ctx, nint sock, int timeoutMs)
 
 - static async TlsStream ConnectAsync(TlsContext ctx, nint sock, string host)
-  - 客户端：连接对端服务器并执行 TLS 握手。
 
 - static async TlsStream ConnectAsync(TlsContext ctx, nint sock, string host, int timeoutMs)
 
@@ -636,7 +582,6 @@ TLS 记录层协议常量。
 - void EnsurePending(int extra)
 
 - string PeerCertificateText()
-  - 获取当前连接对端证书的描述文本（形如 issuer=... subject=...）。
 
 - static string SpkiPinOf(TlsStream stream)
 
@@ -649,39 +594,27 @@ TLS 记录层协议常量。
 - int EndHandshakeWatch(int result)
 
 - async string RecvAsync(int max)
-  - 接收解密后的应用字节（最多 max）。正常关闭或出错时返回空串。
 
 - async int RecvIntoAsync(string buf, int max)
-  - 接收解密后的字节到调用方提供的缓冲区。正常关闭返回 0，出错返回 -1。
 
 - async int RecvBytesAsync(byte[]buf, int offset, int max)
-  - 接收解密后的字节到调用方提供的字节数组。正常关闭返回 0，出错返回 -1。
 
 - async int SendAsync(string data, int len)
-  - 加密并发送 len 字节字符串数据。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。
 
 - async int SendAsync(byte[]data, int len)
-  - 加密并发送字节数组前 len 字节。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。
 
 - async int SendBytesAsync(byte[]data, int len)
-  - 加密并发送字节数组前 len 字节。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。
 
 - async int SendBytesAsync(byte[]data, int offset, int len)
-  - 加密并发送字节数组切片。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。
 
 - async int SendBytesAsync(byte[]data)
-  - 加密并发送完整字节数组。
 
 - async int SendStringAsync(string data)
-  - 发送整个字符串（其 .Length 个字节）。
 
 - void Close()
-  - 关闭 TLS 连接。
 
 
 ## TlsTranscript (class)
-
-TLS 握手消息转录摘要（Transcript Hash），记录自 ClientHello 起所有握手层消息。
 
 - TlsByteWriter writer;
 
@@ -695,9 +628,5 @@ TLS 握手消息转录摘要（Transcript Hash），记录自 ClientHello 起所
 
 
 ## bool (delegate)
-
-证书策略委托：客户端握手后若链/主机名校验不通过（verifyResult != 0），
-以 (verifyResult, 对端证书文本) 调用；返回 true 放行本次连接，false 拒绝。
-证书文本形如 "issuer=/CN=.../O=... subject=/CN=example.com"。
 
 `delegate bool CertPolicyFn(long verifyResult, string certText);`

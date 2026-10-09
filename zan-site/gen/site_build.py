@@ -331,10 +331,10 @@ def build_guides():
             "desc": "Zan 语言完整参考：词法、类型系统、声明、语句、运算符、泛型、异步、ARC 内存、FFI、属性、预处理与工具链。",
         },
         "gui": {
-            "desc": "Zan GUI 开发指南：App/Form/Control 架构、.zform 设计文档格式、代码式组件操作、布局、样式/主题/皮肤、事件、控件大全与真实示例。",
+            "desc": "Zan GUI 开发指南：App/Form/Control 架构、.html 设计文档规范、代码式组件操作、布局、样式/主题/皮肤、事件、控件大全与真实示例。",
         },
         "wiki": {
-            "desc": "Zan IDE 指南：下载安装、项目模板、编辑器、可视化 .zform 设计器、运行/调试、发布、AI 助手与 MCP。",
+            "desc": "Zan IDE 指南：下载安装、项目模板、编辑器、可视化 .html 设计器、运行/调试、发布、AI 助手与 MCP。",
         },
         "stdlib": {
             "desc": "Zan 标准库总览与 API 参考：按命名空间索引，覆盖 System/Gui/Game/Sdk，提供完整签名与说明。",

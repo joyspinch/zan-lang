@@ -5,46 +5,6 @@
 
 ## Lua (class)
 
-Zan 的进程内 Lua 嵌入（Lua 5.3 / 5.4）。
-
-运行时定位 Lua 动态库，并通过 `Interop`
-（LoadLibrary/GetProcAddress）在运行期解析所有入口点，因此
-从未用到 <c>System.Scripting</c> 的程序不会链接 Lua；
-没有 Lua 的机器只会得到 `Lua.IsAvailable` == false，
-而不是加载失败。这与 `Python`、SDL3 等其他可选
-原生依赖的处理方式一致。
-
-using System.Scripting;
-
-if (!Lua.IsAvailable()) { ... fall back ... }
-Lua.Initialize();
-
-// 直接调用，自动封送 double/long/string：
-double v = Lua.CallD("math.floor", 22.3);
-string s = Lua.CallS("string.upper", "zan");
-
-// 脚本与表达式：
-Lua.Exec("answer = 6 * 7");
-LuaValue r = Lua.Eval("answer");           // 42
-
-// 表既是数组也是字典：
-LuaValue t = Lua.Eval("{1, 4, 9}");
-long second = t[2].ToLong();
-t[3] = Lua.FromLong(99L);
-LuaValue p = Lua.Eval("{name = 'Zan'}");
-p["lang"] = "Lua";
-
-回调反向运行，通过 `Lua.RegisterFunction`：
-静态、非捕获的 Zan 方法被包装为 lua_CFunction 并发布为全局
-名字，使 Lua 代码可以调用 Zan 代码。
-
-生命周期：Lua 是栈式 API，而 Zan 的值要活过单次调用，所以
-`LuaValue` 把值存进 Lua 注册表（registry）的一个整数
-槽位里，并在 ARC 回收包装时把该槽位置 nil——于是 Lua 的 GC
-恰好在最后一个 Zan 引用消失后回收该值。所有 API 都在返回前
-把栈顶恢复到进入时的高度，因此 `Lua.Top` 在成对
-使用下始终回到 0。
-
 - static int REGISTRY=0-1001000;
 
 - static int TNIL=0;
@@ -132,329 +92,199 @@ p["lang"] = "Lua";
 - static long nextSlot;
 
 - static bool IsAvailable()
-  - 能加载可用的 Lua 动态库时为 true。
 
 - static bool IsInitialized()
-  - `Initialize` 运行过且状态仍存活时为 true。
 
 - static void Initialize()
-  - 加载可用的 Lua 动态库、创建状态并打开标准库。幂等。
-    没有 Lua 运行时则抛出异常。
 
 - static void LoadPath(string libPath)
-  - 加载指定的 Lua 动态库（如 "C:/lua/lua54.dll"）并初始化状态。
-    Lua 不在 PATH 或库搜索路径中时，请调用它而不是
-    `Initialize`。
 
 - static void Finalize()
-  - 关闭 Lua 状态并释放运行时库。
 
 - static void Sandbox()
-  - 收紧脚本环境（沙箱，A291①）：移除可逃逸宿主的全局入口——
-    <c>os.execute/remove/rename/exit</c>（进程与文件系统）、<c>io</c>
-    整库、<c>dofile/loadfile</c>（文件加载）、<c>require/package</c>
-    （模块加载同样落盘）。宿主在 `Initialize` 之后对不可信
-    脚本调用一次即可；幂等。保留 <c>os.time/clock/date/getenv</c>、
-    <c>math/string/table</c> 等纯计算库。
 
 - static nint State()
-  - 底层 lua_State*（未初始化时为 0）。
 
 - static int Top()
-  - 当前 Lua 栈高度；成对使用的 API 之后应为 0。
 
 - static void Exec(string code)
-  - 执行一段 Lua 代码（编译或运行出错时抛出异常）。
 
 - static void ExecBytes(byte[]chunk, string chunkName)
-  - 执行一段字节缓冲里的 Lua chunk（源码或 <c>luac</c> 字节码，
-    见 `LoadBytes`）。编译失败或运行出错时抛出异常。
 
 - static LuaValue Eval(string code)
-  - 求值一个 Lua 表达式并返回结果，如
-    <c>Lua.Eval("{1, 4, 9}")</c>；表达式可引用
-    `Exec` 定义的全局名字。
 
 - static LuaValue GetGlobal(string name)
-  - 读取全局名字（不存在则为 nil 值）。
 
 - static void SetGlobal(string name, LuaValue v)
-  - 写入全局名字，使脚本可以读到它。
 
 - static LuaValue Call(string name, params LuaValue[]args)
-  - 以任意数量的参数调用 Lua 函数。名字可以是点分路径
-    （<c>"math.floor"</c>、<c>"string.upper"</c>）：第一段从全局表取，
-    其余逐层取字段。
 
 - static double CallD(string name, params double[]args)
-  - Call + double 封送：<c>Lua.CallD("math.floor", 22.3)</c>。
 
 - static long CallL(string name, params long[]args)
-  - Call + long 封送：<c>Lua.CallL("math.max", 3L, 7L)</c>。
 
 - static string CallS(string name, params string[]args)
-  - Call + string 封送：<c>Lua.CallS("string.upper", "zan")</c>。
 
 - static bool RegisterFunction(string name, LuaCFunction fn)
-  - 把静态 Zan 方法发布为 Lua 全局函数。方法必须是
-    lua_CFunction 形式：
-    
-    static int MyFn(nint L) {
-    double a = Lua.ArgDouble(L, 1);
-    return Lua.ReturnDouble(L, a * 2);
-    }
-    
-    且不能捕获状态（Zan 委托为非捕获型），与 Input.Hook、
-    Thread.Start 的回调一致。Lua 未就绪时返回 false。
 
 - static LuaValue Nil()
-  - nil 值。
 
 - static LuaValue FromDouble(double v)
-  - 把 double 包装为 Lua number。
 
 - static LuaValue FromLong(long v)
-  - 把 64 位整数包装为 Lua integer。
 
 - static LuaValue FromStr(string s)
-  - 把字符串包装为 Lua string（UTF-8 原样传递）。
 
 - static LuaValue FromBool(bool b)
-  - 把 bool 包装为 Lua boolean。
 
 - static LuaValue FromList(List<LuaValue> items)
-  - 把 LuaValue 列表包装为 Lua 数组表（下标从 1 起）。
 
 - static LuaValue FromListDouble(List<double> items)
-  - 把 double 列表包装为 Lua 数组表。
 
 - static LuaValue FromListLong(List<long> items)
-  - 把 long 列表包装为 Lua 数组表。
 
 - static LuaValue FromListStr(List<string> items)
-  - 把字符串列表包装为 Lua 数组表。
 
 - static LuaValue FromDict(Dictionary <string, LuaValue> map)
-  - 把字符串键映射包装为 Lua 表。
 
 - static LuaValue FromDictStr(Dictionary <string, string> map)
-  - 把字符串到字符串的映射包装为 Lua 表。
 
 - static double ArgDouble(nint L, int index)
-  - 把第 <paramref name="index"/> 个参数（从 1 起）读为 double。
 
 - static long ArgLong(nint L, int index)
-  - 把第 <paramref name="index"/> 个参数读为 64 位整数。
 
 - static string ArgStr(nint L, int index)
-  - 把第 <paramref name="index"/> 个参数读为字符串。
 
 - static bool ArgBool(nint L, int index)
-  - 把第 <paramref name="index"/> 个参数读为真值。
 
 - static int ArgCount(nint L)
-  - 回调参数个数。
 
 - static int ReturnDouble(nint L, double v)
-  - 回调返回一个 number（返回值即压入的结果个数）。
 
 - static int ReturnLong(nint L, long v)
-  - 回调返回一个 integer。
 
 - static int ReturnStr(nint L, string s)
-  - 回调返回一个 string。
 
 - static int ReturnBool(nint L, bool b)
-  - 回调返回一个 boolean。
 
 - static int ReturnNil(nint L)
-  - 回调返回 nil。
 
 - static void EnsureReady()
-  - 未初始化时自动 Initialize。
 
 - static void OpenState()
-  - 创建 lua_State、打开标准库，并把注册表槽位分配器复位到 1000。
 
 - static void SetTop(int n)
-  - lua_settop：把栈高设为 n。
 
 - static void Load(string code)
-  - 编译一段代码并把生成的 chunk 压栈（编译失败时抛出异常）。
 
 - static void LoadBytes(byte[]chunk, string chunkName)
-  - 编译一段字节缓冲（源码或 <c>luac</c> 字节码）并把生成的
-    chunk 压栈（编译失败时抛出异常）。缓冲在加载后被立即清零，
-    供"密文随包、明文只在内存存活一瞬"的内嵌脚本方案使用。
-    字节码必须与运行时主次版本一致（5.4.x）。
 
 - static void Protected(int nargs, int nres, int mark, string what)
-  - 保护调用栈顶的 chunk/函数：出错时把栈恢复到 mark 再抛异常，
-    因此调用方看不到半截的栈。
 
 - static void Fail(string prefix)
-  - 读走栈顶的错误消息、清栈并抛出。消息在单独的帧里取出，
-    因为 `throw` 不会释放存活局部变量
-    （见 docs/bugs/throw-leaks-live-locals.md）。
 
 - static string TopString()
-  - 栈顶值的错误消息；非 string/number 时返回占位文案。
 
 - static void PushPath(string name, int mark)
-  - 把点分路径解析出的值压栈（"string.upper" -> 全局 string 的 upper）。
 
 - static bool TryResolve()
-  - 定位并加载可用的 Lua 动态库、解析全部入口点；成功后缓存结果。
 
 - static bool ResolveSymbols()
-  - 解析全部入口点地址；关键符号缺失时返回 false。
-    5.3 之前没有 lua_geti/lua_seti：退回 raw 访问（无 __index）。
 
 - static void FreeModule()
-  - 卸载运行时并清空全部符号地址（状态须已先经 Finalize 关闭）。
 
 - static long StoreTop()
-  - 把栈顶的值移入一个新的注册表槽位（弹出该值），返回槽位号。
 
 - static void PushSlot(long slot)
-  - 把槽位里的值压栈（槽位 0 表示 nil）。
 
 - static void DropSlot(long slot)
-  - 释放槽位（置 nil，让 Lua 的 GC 可以回收该值）。
 
 - static int TypeOfSlot(long slot)
-  - 槽位值的 lua_type；槽位 0 即 TNIL。
 
 
 ## LuaValue (class)
 
-一个 Lua 值。底层值存放在 Lua 注册表的一个槽位里，包装被 ARC
-回收时该槽位被置 nil，因此 Lua 的 GC 与 Zan 的生命周期对齐。
-nil 值的槽位号为 0，不占用注册表。
-
 - long slot;
 
 - static LuaValue Wrap(long slot)
-  - 包装一个已分配的槽位（0 表示 nil）。
 
 - static LuaValue CaptureTop()
-  - 把栈顶的值移进注册表并包装（弹出栈顶）。
 
 - ~LuaValue()
-  - ARC 回收包装时释放注册表槽位，Lua 的 GC 随后回收该值。
 
 - long Slot()
-  - 注册表槽位号（nil 为 0）。
 
 - void Push()
-  - 把该值压到 Lua 栈上。
 
 - int Type()
-  - lua_type 值。
 
 - bool IsNil()
-  - 该值为 nil 时为 true。
 
 - bool IsTable()
-  - 该值为表时为 true。
 
 - bool IsFunction()
-  - 该值为函数（Lua 函数或 C 函数）时为 true。
 
 - double ToDouble()
-  - 读为 double。
 
 - long ToLong()
-  - 读为 64 位整数。
 
 - string ToStr()
-  - 读为字符串（number 会按 Lua 规则转成字符串）。
 
 - bool ToBool()
-  - 读取真值（Lua 语义：只有 nil 和 false 为假）。
 
 - long Length()
-  - 表的数组长度（# 运算符的 raw 版本）。
 
 - LuaValue At(long index)
-  - 读表的整数下标（下标从 1 起）。
 
 - void SetAt(long index, LuaValue val)
-  - 写表的整数下标。
 
 - LuaValue Get(string key)
-  - 读表的字符串键。
 
 - void Set(string key, LuaValue val)
-  - 写表的字符串键。
 
 - LuaValue Call(params LuaValue[]args)
-  - 以任意数量的参数调用该值（必须是可调用的）。
 
 - List<LuaValue> ToList()
-  - 把 Lua 数组表拆成 LuaValue 列表。
 
 - List<double> ToListDouble()
-  - 把 Lua 数组表拆成 double 列表。
 
 - List<long> ToListLong()
-  - 把 Lua 数组表拆成 long 列表。
 
 - List<string> ToListStr()
-  - 把 Lua 数组表拆成字符串列表。
 
 - Dictionary <string, LuaValue> ToDict()
-  - 把 Lua 表拆成以字符串为键的映射。键按 Lua 的转换规则读为
-    字符串，因此数字键也能取到（"1"、"2" ...）。
 
 - static LuaValue op_call(LuaValue self, string a)
-  - 运算符重载：<c>fn(a, b)</c> 调用 Lua 函数。由编译器的 op_call
-    降级启用；标量重载自动封送 string/double/long/bool 参数。
 
 - static LuaValue op_call(LuaValue self, double a)
-  - 运算符重载：fn(a)，a 封送为 double。
 
 - static LuaValue op_call(LuaValue self, long a)
-  - 运算符重载：fn(a)，a 封送为 long。
 
 - static LuaValue op_call(LuaValue self, bool a)
-  - 运算符重载：fn(a)，a 封送为 bool。
 
 - static LuaValue op_call(LuaValue self, LuaValue a)
-  - 运算符重载：fn(a)，a 为另一个 LuaValue。
 
 - static LuaValue op_call(LuaValue self, params double[]args)
-  - 运算符重载：fn(a, b, ...)，参数逐一封送为 double。
 
 - static LuaValue op_call(LuaValue self, params long[]args)
-  - 运算符重载：fn(a, b, ...)，参数逐一封送为 long。
 
 - static LuaValue op_call(LuaValue self, params string[]args)
-  - 运算符重载：fn(a, b, ...)，参数逐一封送为 string。
 
 - static LuaValue op_call(LuaValue self, params bool[]args)
-  - 运算符重载：fn(a, b, ...)，参数逐一封送为 bool。
 
 - static LuaValue op_call(LuaValue self, params LuaValue[]args)
-  - 运算符重载：fn(a, b, ...)，参数均为 LuaValue。
 
 - static LuaValue op_index(LuaValue self, long index)
-  - 运算符重载：<c>t[2]</c>，同 `At`。
 
 - static LuaValue op_index(LuaValue self, string key)
-  - 运算符重载：<c>t["k"]</c>，同 `Get`。
 
 - static void op_index_set(LuaValue self, long index, LuaValue val)
-  - 运算符重载：<c>t[2] = v</c>，同 `SetAt`。
 
 - static void op_index_set(LuaValue self, long index, string val)
-  - 运算符重载：<c>t[2] = "s"</c>，封送字符串值。
 
 - static void op_index_set(LuaValue self, string key, LuaValue val)
-  - 运算符重载：<c>t["k"] = v</c>，同 `Set`。
 
 - static void op_index_set(LuaValue self, string key, string val)
-  - 运算符重载：<c>t["k"] = "s"</c>，封送字符串值。
 
 
 ## double (delegate)
@@ -463,8 +293,6 @@ nil 值的槽位号为 0，不占用注册表。
 
 
 ## int (delegate)
-
-lua_CFunction 回调形式：int (*)(lua_State*)。
 
 `delegate int LuaCFunction(nint L);`
 

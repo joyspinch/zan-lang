@@ -11,7 +11,7 @@
 | `console` | Console | 最小 Hello World 控制台 |
 | `console-args` | Console | 命令行参数（`Environment.ArgCount/ArgAt`） |
 | `console-multi` | Console | 多文件工程组织 |
-| `gui-empty` | Window App | 最小 `.zform` 窗口（Label + Input + Button + 事件）——**GUI 起点** |
+| `gui-empty` | Window App | 最小 `.html` 设计窗口（Label + Input + Button + 事件）——**GUI 起点** |
 | `gui-free` | Window App | 自由画布（layoutMode 1） |
 | `gui-tabform` | Window App | 标签页 + 工具条 + 状态栏（多窗口/多页编排） |
 | `gui-sidebar` | Window App | 侧边栏布局 |
@@ -54,16 +54,20 @@
 
 新建 `gui-empty`，两个文件就是全部：
 
-```json
-// src/App.zform
-{
-  "name": "App", "winW": 480, "winH": 520,
-  "fields": [
-    { "kind": "Label",  "label": "Welcome", "name": "TitleLabel" },
-    { "kind": "Input",  "label": "Name",    "name": "NameInput" },
-    { "kind": "Button", "label": "OK",      "name": "OkButton" }
-  ]
-}
+```html
+<!-- src/App.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>App</title>
+</head>
+<body data-zan-design id="App" data-win-w="480" data-win-h="520">
+  <label id="TitleLabel" data-kind="Label" data-label="Welcome"></label>
+  <input id="NameInput" data-kind="Input" data-label="Name" />
+  <button id="OkButton" data-kind="Button" data-label="OK"></button>
+</body>
+</html>
 ```
 
 ```zan

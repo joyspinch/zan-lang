@@ -24,7 +24,6 @@ $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $RepomapSrc) { $RepomapSrc = Join-Path $root 'tools\repomap\RepoMap.zan' }
 if (-not $GallerySrc) { $GallerySrc = Join-Path $root 'tools\mcp_server\gallery.json' }
-if (-not $ZformDoc) { $ZformDoc = Join-Path $root 'tools\mcp_server\zform.doc.json' }
 $genKnowledgeSrc = Join-Path $root 'tools\genknowledge\GenKnowledge.zan'
 
 # Everything past a Push-Location must be an absolute path.

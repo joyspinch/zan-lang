@@ -391,7 +391,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   **槽反转必须全量清点旧调用点（2026-09-16，conformance_gui_html_runtime
   连环红）**：`Html.Clone` 直调改 `App.CloneTree` 槽反转（null 槽返
   null）后，凡是走克隆通道的宿主都得先 `Html.Install()` 注册实现——
-  测试只补了 zform_dynamic/compref_designer，html_runtime_test 漏补，
+  测试只补了 form_dynamic/compref_designer，html_runtime_test 漏补，
   模板行展开拿到 null 行，ChildCount 断言红且行内越界段错误。归因
   A/B 三步定式：先 stash 自己的编译器改动重跑（排除编译器）、再 stash
   在途 stdlib 重跑（排除并发在途）、最后 HEAD 全基线复跑定谳"既有红"
@@ -640,7 +640,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   SetProp，掉进 SetProp 兜底 `AddClass` 退化成样式类——容器
   `GetProp("class")` 混进标题文案。加消费分支时同步加排除键；这类
   静默降级只有 GetProp 断言型 conformance 抓得住，输出型金样抓不住
-  （gui_zform_control 的 `container class` 断言就是为此写的）。
+  （gui_form_control 的 `container class` 断言就是为此写的）。
 
 ## nsresolve 冲突改名丢泛型实参：只在"全量输入"构建炸（lambda_87，2026-09-13）
 
@@ -2308,8 +2308,8 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 
 - 上半段记的「间歇性 Chart 全家 `undefined type 'App'`」**不是时序，也不是
   「Chart 排序靠后」**：三连 100% 复现，开关是 `partial class` 的逐文件
-  上下文与全局命名空间。`.zform` 的 `"name"` 非 ident（如模板占位符
-  `{{NAME}}`）时回退**文件基名**（App.zform→`App`），用户类与 stdlib
+  上下文与全局命名空间。`.html` 的 `"name"` 非 ident（如模板占位符
+  `{{NAME}}`）时回退**文件基名**（App.html→`App`），用户类与 stdlib
   `Gui.App` 同名，把下面三个缺陷一起点亮；`name="Root"` 同输入全绿。
 - **三处根因**：
   ① `nr_walk` 把合并后的 partial 成员按**存活声明的文件**解析：
@@ -2327,14 +2327,14 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
      `find_full(join_ns(ctx_ns, R))`（空 `ctx_ns` 时 `join_ns` 返回裸名）。
      **坑中坑：这类判定有两处，必须同修**——`resolve_ref` 管**类型位置**，
      `resolve_static_receiver` 管**表达式位置的 static receiver**
-     （`App.OnLoad(form)`）；只修前者时 `.zform` 生成的全局 `partial class App`
+     （`App.OnLoad(form)`）；只修前者时 `.html` 生成的全局 `partial class App`
      仍把 `App.OnLoad` 绑到 `Gui_App`，报 `'Gui_App' has no member 'OnLoad'`。
   ③ **潜伏 stdlib 缺陷**：`Gui/ChildWindow.zan`、`Gui/UserComponents.zan`
      住在 Gui 模块却**没写 `namespace Gui;`**（同目录另外 43 个文件都写了），
      此前只靠②的 `using` 兜底才把 `App` 解析成 `Gui.App`；②去掉兜底后立刻
      暴露 `cannot convert 'App_2' to 'Gui_App'`。**教训**：模块目录下的文件
      一律显式写 `namespace`，别指望兜底——兜底一旦收紧，这类文件成片爆。
-- 最小复现：`App.zform name="App"` + `partial class App` + `--auto-stdlib`
+- 最小复现：`App.html name="App"` + `partial class App` + `--auto-stdlib`
   （PRE 101 错 → POST rc=0）。conformance 用例：`conformance_nsctx`
   （`tests/conformance/nsctx/`，5 文件覆盖①跨文件 partial 上下文 + ②全局
   声明压过 import）。
@@ -2350,7 +2350,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 stdlib 闭包定义（GenForm P7a 起引用 System/Web/DesignerHtml.zan，GenHtml
 本就引用 Html.zan）。结果：改了闭包内非 Compiler 文件 → 键不变 → 复用旧
 生成器 → "stdlib 已修、行为依旧"的幽灵，且无任何诊断（编译/链接全绿）。
-**实锤过程**：e2e 里 .zform 版全绿、.html 版静默不投影；清缓存强制重建后
+**实锤过程**：e2e 里 旧版全绿、.html 版静默不投影；清缓存强制重建后
 立刻好——与代码逻辑无关，纯缓存键漏文件。
 
 **现状（已修）**：键哈希 stdlib 根下全部 `.zan`（FindFirstFile/POSIX

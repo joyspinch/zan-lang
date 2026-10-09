@@ -27,7 +27,7 @@
 ## 文档与 skill 的边界（HTML/设计器等声明层不新建 skill）
 
 HTML 声明层（`App.LoadHtmlWith`/GenHtml 编译期展开/`data-on-*` 协议/
-tag→控件映射/空白语义/设计器 .zform P7a、P7b 字段内联 style）的能力
+tag→控件映射/空白语义/设计器 .html P7a、P7b 字段内联 style）的能力
 全集与差异台账在**仓库文档** `docs/HTML_UI.md`（208 行，随代码更新），
 布局语义在 `docs/archive/WEB_GUI_ROADMAP.md`（已全量落地，归档留档）；skill 侧只在 gui-design 的
 `references/css-dialect.md` 留"HTML 声明窗口"一节摘要与指针。

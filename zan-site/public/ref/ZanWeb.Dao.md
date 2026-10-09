@@ -1,15 +1,13 @@
 # ZanWeb.Dao
 
-> 源码: `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysDepartmentDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysDepartmentRoleDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysDictItemDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysDictTypeDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysGenColumnDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysGenTableDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysJobDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysJobLogDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysLoginLogDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysMediaFileDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysOperationLogDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysRoleDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysRoleGrantDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysSiteSettingDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysUserDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysUserRoleDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysWikiDocDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysWikiRevisionDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysWikiSpaceDao.zan`
+> 源码: `packages/Zan.Mvc/src/ZanWeb/Modules/Crud/Dao/SysGenColumnDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Crud/Dao/SysGenTableDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysDepartmentDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysDepartmentRoleDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysDictItemDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysDictTypeDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysJobDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysJobLogDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysLoginLogDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysMediaFileDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysOperationLogDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysRoleDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysRoleGrantDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysSiteSettingDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysUserDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysUserRoleDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysWikiDocDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysWikiRevisionDao.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Sys/Dao/SysWikiSpaceDao.zan`
 
 
 ## SysDepartmentDao (class)
 
-- IDbConnection db;
+- SysDepartmentDao(IFreeSql fsql):base(fsql)
 
-- SysDepartmentDao(AppController host)
-
-- SysDepartmentDao(IDbConnection db)
+- SysDepartmentDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysDepartment ById(int id)
 
@@ -32,11 +30,9 @@
 
 ## SysDepartmentRoleDao (class)
 
-- IDbConnection db;
+- SysDepartmentRoleDao(IFreeSql fsql):base(fsql)
 
-- SysDepartmentRoleDao(AppController host)
-
-- SysDepartmentRoleDao(IDbConnection db)
+- SysDepartmentRoleDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysDepartmentRole ById(int id)
 
@@ -53,11 +49,9 @@
 
 ## SysDictItemDao (class)
 
-- IDbConnection db;
+- SysDictItemDao(IFreeSql fsql):base(fsql)
 
-- SysDictItemDao(AppController host)
-
-- SysDictItemDao(IDbConnection db)
+- SysDictItemDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysDictItem ById(int id)
 
@@ -84,11 +78,9 @@
 
 ## SysDictTypeDao (class)
 
-- IDbConnection db;
+- SysDictTypeDao(IFreeSql fsql):base(fsql)
 
-- SysDictTypeDao(AppController host)
-
-- SysDictTypeDao(IDbConnection db)
+- SysDictTypeDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysDictType ById(int id)
 
@@ -109,11 +101,9 @@
 
 ## SysGenColumnDao (class)
 
-- IDbConnection db;
+- SysGenColumnDao(IFreeSql fsql):base(fsql)
 
-- SysGenColumnDao(AppController host)
-
-- SysGenColumnDao(IDbConnection db)
+- SysGenColumnDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async List<SysGenColumn> ByTableId(int tableId)
 
@@ -124,11 +114,9 @@
 
 ## SysGenTableDao (class)
 
-- IDbConnection db;
+- SysGenTableDao(IFreeSql fsql):base(fsql)
 
-- SysGenTableDao(AppController host)
-
-- SysGenTableDao(IDbConnection db)
+- SysGenTableDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysGenTable ById(int id)
 
@@ -147,11 +135,9 @@
 
 ## SysJobDao (class)
 
-- IDbConnection db;
+- SysJobDao(IFreeSql fsql):base(fsql)
 
-- SysJobDao(AppController host)
-
-- SysJobDao(IDbConnection db)
+- SysJobDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysJob ById(int id)
 
@@ -168,11 +154,9 @@
 
 ## SysJobLogDao (class)
 
-- IDbConnection db;
+- SysJobLogDao(IFreeSql fsql):base(fsql)
 
-- SysJobLogDao(AppController host)
-
-- SysJobLogDao(IDbConnection db)
+- SysJobLogDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async List<SysJobLog> ByJobId(int jobId, int limit)
 
@@ -181,11 +165,9 @@
 
 ## SysLoginLogDao (class)
 
-- IDbConnection db;
+- SysLoginLogDao(IFreeSql fsql):base(fsql)
 
-- SysLoginLogDao(AppController host)
-
-- SysLoginLogDao(IDbConnection db)
+- SysLoginLogDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysLoginLog ById(int id)
 
@@ -204,11 +186,9 @@
 
 ## SysMediaFileDao (class)
 
-- IDbConnection db;
+- SysMediaFileDao(IFreeSql fsql):base(fsql)
 
-- SysMediaFileDao(AppController host)
-
-- SysMediaFileDao(IDbConnection db)
+- SysMediaFileDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysMediaFile ById(int id)
 
@@ -223,11 +203,9 @@
 
 ## SysOperationLogDao (class)
 
-- IDbConnection db;
+- SysOperationLogDao(IFreeSql fsql):base(fsql)
 
-- SysOperationLogDao(AppController host)
-
-- SysOperationLogDao(IDbConnection db)
+- SysOperationLogDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysOperationLog ById(int id)
 
@@ -250,11 +228,9 @@
 
 ## SysRoleDao (class)
 
-- IDbConnection db;
+- SysRoleDao(IFreeSql fsql):base(fsql)
 
-- SysRoleDao(AppController host)
-
-- SysRoleDao(IDbConnection db)
+- SysRoleDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysRole ById(int id)
 
@@ -275,11 +251,9 @@
 
 ## SysRoleGrantDao (class)
 
-- IDbConnection db;
+- SysRoleGrantDao(IFreeSql fsql):base(fsql)
 
-- SysRoleGrantDao(AppController host)
-
-- SysRoleGrantDao(IDbConnection db)
+- SysRoleGrantDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysRoleGrant ById(int id)
 
@@ -294,11 +268,9 @@
 
 ## SysSiteSettingDao (class)
 
-- IDbConnection db;
+- SysSiteSettingDao(IFreeSql fsql):base(fsql)
 
-- SysSiteSettingDao(AppController host)
-
-- SysSiteSettingDao(IDbConnection db)
+- SysSiteSettingDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysSiteSetting ById(int id)
 
@@ -317,11 +289,9 @@
 
 ## SysUserDao (class)
 
-- IDbConnection db;
+- SysUserDao(IFreeSql fsql):base(fsql)
 
-- SysUserDao(AppController host)
-
-- SysUserDao(IDbConnection db)
+- SysUserDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysUser ByUsername(string username)
 
@@ -374,11 +344,9 @@
 
 ## SysUserRoleDao (class)
 
-- IDbConnection db;
+- SysUserRoleDao(IFreeSql fsql):base(fsql)
 
-- SysUserRoleDao(AppController host)
-
-- SysUserRoleDao(IDbConnection db)
+- SysUserRoleDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysUserRole ById(int id)
 
@@ -399,11 +367,9 @@
 
 ## SysWikiDocDao (class)
 
-- IDbConnection db;
+- SysWikiDocDao(IFreeSql fsql):base(fsql)
 
-- SysWikiDocDao(AppController host)
-
-- SysWikiDocDao(IDbConnection db)
+- SysWikiDocDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysWikiDoc ById(int id)
 
@@ -418,11 +384,9 @@
 
 ## SysWikiRevisionDao (class)
 
-- IDbConnection db;
+- SysWikiRevisionDao(IFreeSql fsql):base(fsql)
 
-- SysWikiRevisionDao(AppController host)
-
-- SysWikiRevisionDao(IDbConnection db)
+- SysWikiRevisionDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async List<SysWikiRevision> ByDocId(int docId)
 
@@ -433,11 +397,9 @@
 
 ## SysWikiSpaceDao (class)
 
-- IDbConnection db;
+- SysWikiSpaceDao(IFreeSql fsql):base(fsql)
 
-- SysWikiSpaceDao(AppController host)
-
-- SysWikiSpaceDao(IDbConnection db)
+- SysWikiSpaceDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async SysWikiSpace ById(int id)
 

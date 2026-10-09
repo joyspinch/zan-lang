@@ -22,7 +22,7 @@ the templates:
                              AGENTS.md, skills\, mcp.json,
                              cursor.mcp.json, vscode.mcp.json
 <ZAN_SDK>\knowledge\         symbols.json (API index), gallery.json (examples),
-                             zform.json (control PropSpec catalog; legacy file name)
+                             controls.json (control PropSpec catalog)
 <ZAN_SDK>\toolchain\         zanc, zan-lsp, zan-dap, linker, gdb
 ```
 
@@ -90,8 +90,8 @@ the executable out of the SDK.
 
 Knowledge is generated from the sources by the Zan `GenKnowledge` tool. It only
 needs to exist on the machine running the MCP server; clients do not need a
-copy of `symbols.json`, `gallery.json`, or `zform.json`. A writable server can
-refresh `gallery.json` and `zform.json` in process with
+copy of `symbols.json` or `gallery.json`. A writable server can
+refresh `gallery.json` in process with
 `zan_refresh_knowledge`; `symbols.json` remains the RepoMap index and is
 regenerated separately when it is missing.
 
@@ -149,7 +149,7 @@ list). Never put a token in a config file you commit.
 The optional `zan_*` tools register only when their backing files exist in the
 SDK root: `knowledge\symbols.json` for `zan_api_search`,
 `knowledge\gallery.json` for `zan_example`,
-`knowledge\zform.json` for `zan_form_schema`, `toolchain\zanc.exe` for
+`toolchain\zanc.exe` for
 `zan_compile` / `zan_build_project`. A writable server with the source inputs
 also exposes `zan_refresh_knowledge`. `zan_start_here` reports which of them
 are live under `available`, together with knowledge freshness.

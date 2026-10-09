@@ -132,9 +132,13 @@
 
 - static void RefreshMirror(int jobId, long now)
 
-- static async string Run(IDbConnection db, SysJob j, long startedAt)
+- static async string Run(IFreeSql fsql, SysJob j, long startedAt)
+
+- static async string RunNow(IFreeSql fsql, SysJob j)
 
 - static async string RunNow(IDbConnection db, SysJob j)
+
+- static async string Execute(IFreeSql fsql, SysJob j)
 
 - static async string Execute(IDbConnection db, SysJob j)
 
@@ -314,7 +318,7 @@
 
 - static async void FlushAtExit()
 
-- static async void Sweep(IDbConnection db)
+- static async void Sweep(IFreeSql fsql)
 
 - static async List<MetricSql> SqlTotals(long from, long to, int limit, string rank)
 

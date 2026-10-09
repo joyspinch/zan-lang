@@ -1,6 +1,6 @@
 # ZanWeb.Core
 
-> 源码: `packages/Zan.Mvc/src/ZanWeb/Framework/Core/Boot.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Core/Cfg.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Core/Db.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Core/DbContext.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Core/Gen.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Core/Schema.zan`
+> 源码: `packages/Zan.Mvc/src/ZanWeb/Framework/Core/Boot.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Core/Cfg.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Core/Db.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Core/DbContext.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Core/Schema.zan`, `packages/Zan.Mvc/src/ZanWeb/Modules/Crud/Engine/Gen.zan`
 
 
 ## AuthCfg (class)
@@ -26,6 +26,20 @@
 
 - static async int Run()
 
+- static bool csrfEnabled=false;
+
+- static int AdminGate(WebApp app)
+
+- static bool AdminPath(string pattern)
+
+- static bool PathIs(string pattern, string prefix)
+
+- static void EnableCsrf()
+
+- static bool CsrfGuard(HttpContext ctx)
+
+- static bool SecurityHeaders(HttpContext ctx)
+
 - static void SqlTrace(string sql, long us)
 
 - static bool OriginGuard(HttpContext ctx)
@@ -41,6 +55,8 @@
 - static int traceSeq=0;
 
 - static bool AccessLog(HttpContext ctx)
+
+- static string CleanTraceId(string raw)
 
 - static void Metrics(HttpContext ctx, long elapsedUs)
 
@@ -81,6 +97,8 @@
 - static ClusterCfg Cluster=ClusterCfg.Defaults();
 
 - static CorsCfg Cors=CorsCfg.Defaults();
+
+- static SecurityCfg Security=SecurityCfg.Defaults();
 
 - static bool loaded=false;
 
@@ -197,6 +215,8 @@
 - static DbContext Of(DbPool pool)
 
 - static DbContext Of(DbPool writePool, DbPool readPool)
+
+- DbPool Pool()
 
 - async IDbConnection Acquire()
 
@@ -369,47 +389,54 @@
 
 - static async bool BackfillGenFlags(IDbConnection db)
 
-- static async bool SeedAdmin(IDbConnection db)
+- static async bool SeedAdmin(IFreeSql fsql)
 
-- static async bool SeedRoles(IDbConnection db)
+- static async bool SeedRoles(IFreeSql fsql)
 
-- static async int AddRole(IDbConnection db, string name, string code, int rank, string description, int dataScope)
+- static async int AddRole(IFreeSql fsql, string name, string code, int rank, string description, int dataScope)
 
-- static async bool Grant(IDbConnection db, int roleId, string screen, int mask, long now)
+- static async bool Grant(IFreeSql fsql, int roleId, string screen, int mask, long now)
 
-- static async bool SeedDepartments(IDbConnection db)
+- static async bool SeedDepartments(IFreeSql fsql)
 
-- static async bool AddDept(IDbConnection db, int parentId, string name, string code, int sortOrder)
+- static async bool AddDept(IFreeSql fsql, int parentId, string name, string code, int sortOrder)
 
-- static async bool SeedDicts(IDbConnection db)
+- static async bool SeedDicts(IFreeSql fsql)
 
-- static async bool AddDictType(IDbConnection db, string code, string name)
+- static async bool AddDictType(IFreeSql fsql, string code, string name)
 
-- static async bool AddDictItem(IDbConnection db, string typeCode, string value, string label, int sortOrder)
+- static async bool AddDictItem(IFreeSql fsql, string typeCode, string value, string label, int sortOrder)
 
-- static async bool SeedSettings(IDbConnection db)
+- static async bool SeedSettings(IFreeSql fsql)
 
-- static async bool SeedFeatureSettings(IDbConnection db)
+- static async bool SeedFeatureSettings(IFreeSql fsql)
 
-- static async bool EnsureSetting(IDbConnection db, string groupName, string name, string label, string value, string kind, string tip, int sortOrder)
+- static async bool EnsureSetting(IFreeSql fsql, string groupName, string name, string label, string value, string kind, string tip, int sortOrder)
 
-- static async bool AddSetting(IDbConnection db, string groupName, string name, string label, string value, string kind, string tip, int sortOrder)
+- static async bool AddSetting(IFreeSql fsql, string groupName, string name, string label, string value, string kind, string tip, int sortOrder)
 
 - static SeedFn onSeed;
 
 - static void OnSeed(SeedFn fn)
 
-- static async bool RunSeed(IDbConnection db)
+- static async bool RunSeed(IFreeSql fsql)
 
-- static async bool MigrateGrants(IDbConnection db)
+- static async bool MigrateGrants(IFreeSql fsql)
 
-- static async bool MigrateGrantKeys(IDbConnection db)
+- static async bool MigrateGrantKeys(IFreeSql fsql)
 
 - static async bool SyncRoleGrants(WebApp app)
 
 - static bool IsContent(string pattern)
 
-- static async bool SeedJobs(IDbConnection db)
+- static async bool SeedJobs(IFreeSql fsql)
+
+
+## SecurityCfg (class)
+
+- bool csp;
+
+- static SecurityCfg Defaults()
 
 
 ## ServerCfg (class)
@@ -444,7 +471,7 @@
 
 ## bool (delegate)
 
-`delegate bool SeedFn(IDbConnection db);`
+`delegate bool SeedFn(IFreeSql fsql);`
 
 
 ## void (delegate)

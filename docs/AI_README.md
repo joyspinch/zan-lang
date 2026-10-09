@@ -53,9 +53,9 @@ AGENTS.md            AI 在 Zan 项目里必须守的规矩（短，先读它）
 | 改之前评估影响 | `zan_find_refs`（谁引用它/谁继承它/多少是测试）、`zan_change_impact`（引用 + 受影响的路由和表）、`zan_project_overview`（工程全貌：模块/路由/实体） |
 | 服务器工程 | `zan_route_lookup`（URL→action→权限门）、`zan_orm_lookup`（实体→表→列→门面） |
 | 验证——说完要能证 | `zan_compile`（编译一个片段，返回结构化诊断）、`zan_build_project`（编译整个工程） |
-| 控件规格与示例 | `zan_example`（可编译的官方示例，带目录）、`zan_control_schema` / `zan_form_schema`（控件 PropSpec 目录：schema + Props/Events 规格；资源兼容 controls.json / zform.json） |
+| 控件规格与示例 | `zan_example`（可编译的官方示例，带目录）、`zan_control_schema`（控件 PropSpec 目录：schema + Props/Events 规格） |
 | 文件与检索 | `list_dir` `read_file` `write_file` `edit_file` `search_text` `find_files` `run_command`、`mkdir`/`move_path`/`copy_path`/`delete_path`/`stat_path` |
-| 索引维护 | `zan_refresh_index`（加过控制器/实体后重建语义索引）、`zan_refresh_knowledge`（重建 gallery/zform） |
+| 索引维护 | `zan_refresh_index`（加过控制器/实体后重建语义索引）、`zan_refresh_knowledge`（重建 gallery） |
 | 技能 | `skills_list`（名字+一行摘要）、`skill_read`（读选中那一个的正文） |
 
 收权开关：`--read-only`（禁写）、`--no-exec`（禁 shell）。HTTP 共享部署见
@@ -82,7 +82,7 @@ AGENTS.md            AI 在 Zan 项目里必须守的规矩（短，先读它）
 | --- | --- | --- |
 | `symbols.json` | 标准库全量符号索引（名字/签名/文件：行/摘要） | `zan_api_search`、IDE 助手面板 |
 | `gallery.json` | 金标示例目录 | `zan_example` |
-| `zform.json` / `zform.doc.json` | 格式无关的控件 PropSpec 目录（文件名沿用历史 zform.json，与已删的 .zform 设计稿格式无关） | `zan_form_schema`、IDE 设计器 |
+| `controls.json` | 控件 PropSpec 目录与设计器规格 | `zan_control_schema`、IDE 设计器 |
 
 ## 6. 常见问题
 

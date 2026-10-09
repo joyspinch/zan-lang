@@ -5,11 +5,9 @@
 
 ## CategoryDao (class)
 
-- IDbConnection db;
+- CategoryDao(IFreeSql fsql):base(fsql)
 
-- CategoryDao(AppController host)
-
-- CategoryDao(IDbConnection db)
+- CategoryDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async Category ById(int id)
 
@@ -30,11 +28,9 @@
 
 ## CommentDao (class)
 
-- IDbConnection db;
+- CommentDao(IFreeSql fsql):base(fsql)
 
-- CommentDao(AppController host)
-
-- CommentDao(IDbConnection db)
+- CommentDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async Comment ById(int id)
 
@@ -55,15 +51,9 @@
 
 ## PostDao (class)
 
-- IDbConnection db;
+- PostDao(IFreeSql fsql):base(fsql)
 
-- static string ListKey="blog:list";
-
-- static string PostKey(int id)
-
-- PostDao(AppController host)
-
-- PostDao(IDbConnection db)
+- PostDao(IDbConnection db):base(FreeSql.FromConnection(db))
 
 - async List<Post> Recent(int take, string keyword)
 

@@ -5,33 +5,24 @@
 
 ## WechatWorkAppApi (class)
 
-App/AppApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkAppApi(WechatWorkClient client)
 
 - async WechatWorkAppApiGetAppInfoResponse GetAppInfoAsync(WechatWorkAppApiGetAppInfoRequest request)
-  - GET /cgi-bin/agent/get
 
 - async WechatResponse GetAppInfoRawAsync(string query)
 
 - async WechatWorkAppApiSetAppResponse SetAppAsync(WechatWorkAppApiSetAppRequest request)
-  - POST /cgi-bin/agent/set
 
 - async WechatResponse SetAppRawAsync(string query, string jsonBody)
 
 - async WechatWorkAppApiGetAppListResponse GetAppListAsync()
-  - GET /cgi-bin/agent/list
 
 - async WechatResponse GetAppListRawAsync(string query)
 
 
 ## WechatWorkAppApiGetAppInfoRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -90,36 +81,27 @@ App/AppApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkAsynchronousApi (class)
 
-Asynchronous/AsynchronousApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkAsynchronousApi(WechatWorkClient client)
 
 - async WechatWorkAsynchronousApiBatchSyncUserResponse BatchSyncUserAsync(WechatWorkAsynchronousApiBatchSyncUserRequest request)
-  - POST /cgi-bin/batch/syncuser
 
 - async WechatResponse BatchSyncUserRawAsync(string query, string jsonBody)
 
 - async WechatWorkAsynchronousApiBatchReplaceUserResponse BatchReplaceUserAsync(WechatWorkAsynchronousApiBatchReplaceUserRequest request)
-  - POST /cgi-bin/batch/replaceuser
 
 - async WechatResponse BatchReplaceUserRawAsync(string query, string jsonBody)
 
 - async WechatWorkAsynchronousApiBatchReplacePartyResponse BatchReplacePartyAsync(WechatWorkAsynchronousApiBatchReplacePartyRequest request)
-  - POST /cgi-bin/batch/replaceparty
 
 - async WechatResponse BatchReplacePartyRawAsync(string query, string jsonBody)
 
 - async WechatWorkAsynchronousApiGetReplaceUserResultResponse GetReplaceUserResultAsync(WechatWorkAsynchronousApiGetReplaceUserResultRequest request)
-  - GET /cgi-bin/batch/getresult
 
 - async WechatResponse GetReplaceUserResultRawAsync(string query)
 
 - async WechatWorkAsynchronousApiGetReplacePartyResultResponse GetReplacePartyResultAsync(WechatWorkAsynchronousApiGetReplacePartyResultRequest request)
-  - GET /cgi-bin/batch/getresult
 
 - async WechatResponse GetReplacePartyResultRawAsync(string query)
 
@@ -173,8 +155,6 @@ Asynchronous/AsynchronousApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWorkAsynchronousApiBatchSyncUserRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -236,38 +216,28 @@ Asynchronous/AsynchronousApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkCalendarApi (class)
 
-Calendar/CalendarApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkCalendarApi(WechatWorkClient client)
 
 - async WechatWorkCalendarApiAddResponse AddAsync(WechatWorkCalendarApiAddRequest request)
-  - POST /cgi-bin/oa/calendar/add
 
 - async WechatResponse AddRawAsync(string query, string jsonBody)
 
 - async WechatWorkCalendarApiUpdateResponse UpdateAsync(WechatWorkCalendarApiUpdateRequest request)
-  - POST /cgi-bin/oa/calendar/update
 
 - async WechatResponse UpdateRawAsync(string query, string jsonBody)
 
 - async WechatWorkCalendarApiGetResponse GetAsync(WechatWorkCalendarApiGetRequest request)
-  - POST /cgi-bin/oa/calendar/get
 
 - async WechatResponse GetRawAsync(string query, string jsonBody)
 
 - async WechatWorkCalendarApiDelResponse DelAsync(WechatWorkCalendarApiDelRequest request)
-  - POST /cgi-bin/oa/calendar/del
 
 - async WechatResponse DelRawAsync(string query, string jsonBody)
 
 
 ## WechatWorkCalendarApiAddRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -349,66 +319,51 @@ Calendar/CalendarApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkChatApi (class)
 
-Chat/ChatApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkChatApi(WechatWorkClient client)
 
 - async WechatWorkChatApiCreateChatResponse CreateChatAsync(WechatWorkChatApiCreateChatRequest request)
-  - POST /cgi-bin/appchat/create
 
 - async WechatResponse CreateChatRawAsync(string query, string jsonBody)
 
 - async WechatWorkChatApiGetChatResponse GetChatAsync(WechatWorkChatApiGetChatRequest request)
-  - GET /cgi-bin/appchat/get
 
 - async WechatResponse GetChatRawAsync(string query)
 
 - async WechatWorkChatApiUpdateChatResponse UpdateChatAsync(WechatWorkChatApiUpdateChatRequest request)
-  - POST /cgi-bin/appchat/update
 
 - async WechatResponse UpdateChatRawAsync(string query, string jsonBody)
 
 - async WechatWorkChatApiSendChatSimpleMessageResponse SendChatSimpleMessageAsync(WechatWorkChatApiSendChatSimpleMessageRequest request)
-  - POST /cgi-bin/appchat/send
 
 - async WechatResponse SendChatSimpleMessageRawAsync(string query, string jsonBody)
 
 - async WechatWorkChatApiSendChatVideoMessageResponse SendChatVideoMessageAsync(WechatWorkChatApiSendChatVideoMessageRequest request)
-  - POST /cgi-bin/appchat/send
 
 - async WechatResponse SendChatVideoMessageRawAsync(string query, string jsonBody)
 
 - async WechatWorkChatApiSendChatTextCardMessageResponse SendChatTextCardMessageAsync(WechatWorkChatApiSendChatTextCardMessageRequest request)
-  - POST /cgi-bin/appchat/send
 
 - async WechatResponse SendChatTextCardMessageRawAsync(string query, string jsonBody)
 
 - async WechatWorkChatApiSendChatNewsMessageResponse SendChatNewsMessageAsync(WechatWorkChatApiSendChatNewsMessageRequest request)
-  - POST /cgi-bin/appchat/send
 
 - async WechatResponse SendChatNewsMessageRawAsync(string query, string jsonBody)
 
 - async WechatWorkChatApiSendChatMpNewsMessageResponse SendChatMpNewsMessageAsync(WechatWorkChatApiSendChatMpNewsMessageRequest request)
-  - POST /cgi-bin/appchat/send
 
 - async WechatResponse SendChatMpNewsMessageRawAsync(string query, string jsonBody)
 
 - async WechatWorkChatApiQuitChatResponse QuitChatAsync(WechatWorkChatApiQuitChatRequest request)
-  - POST /cgi-bin/chat/quit
 
 - async WechatResponse QuitChatRawAsync(string query, string jsonBody)
 
 - async WechatWorkChatApiClearNotifyResponse ClearNotifyAsync(WechatWorkChatApiClearNotifyRequest request)
-  - POST /cgi-bin/chat/clearnotify
 
 - async WechatResponse ClearNotifyRawAsync(string query, string jsonBody)
 
 - async WechatWorkChatApiSetMuteResponse SetMuteAsync(WechatWorkChatApiSetMuteRequest request)
-  - POST /cgi-bin/chat/setmute
 
 - async WechatResponse SetMuteRawAsync(string query, string jsonBody)
 
@@ -436,8 +391,6 @@ Chat/ChatApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWorkChatApiCreateChatRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -703,8 +656,6 @@ Chat/ChatApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkClient (class)
 
-企业微信 JSON API 客户端，自动缓存 corp access_token。
-
 - WechatApiTransport transport;
 
 - string corpId;
@@ -748,23 +699,16 @@ Chat/ChatApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkConcernApi (class)
 
-Concern/ConcernApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkConcernApi(WechatWorkClient client)
 
 - async WechatWorkConcernApiTwoVerificationResponse TwoVerificationAsync(WechatWorkConcernApiTwoVerificationRequest request)
-  - GET /cgi-bin/user/authsucc
 
 - async WechatResponse TwoVerificationRawAsync(string query)
 
 
 ## WechatWorkConcernApiTwoVerificationRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -786,23 +730,16 @@ Concern/ConcernApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkContactP1Api (class)
 
-Contact/ContactP1Api.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkContactP1Api(WechatWorkClient client)
 
 - async WechatWorkContactP1ApiGetExportResultResponse GetExportResultAsync(WechatWorkContactP1ApiGetExportResultRequest request)
-  - GET /cgi-bin/export/get_result
 
 - async WechatResponse GetExportResultRawAsync(string query)
 
 
 ## WechatWorkContactP1ApiGetExportResultRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -822,106 +759,83 @@ Contact/ContactP1Api.cs 的 Zan 强类型接口。
 
 ## WechatWorkCorpgroupApi (class)
 
-Corpgroup/CorpgroupApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkCorpgroupApi(WechatWorkClient client)
 
 - async WechatWorkCorpgroupApiCorpListAppShareInfoResponse CorpListAppShareInfoAsync(WechatWorkCorpgroupApiCorpListAppShareInfoRequest request)
-  - POST /cgi-bin/corpgroup/corp/list_app_share_info
 
 - async WechatResponse CorpListAppShareInfoRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiCorpGetTokenResponse CorpGetTokenAsync(WechatWorkCorpgroupApiCorpGetTokenRequest request)
-  - POST /cgi-bin/corpgroup/corp/gettoken
 
 - async WechatResponse CorpGetTokenRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiTransferSessionResponse TransferSessionAsync(WechatWorkCorpgroupApiTransferSessionRequest request)
-  - POST /cgi-bin/miniprogram/transfer_session
 
 - async WechatResponse TransferSessionRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiUnionIdToExternalUserIdResponse UnionIdToExternalUserIdAsync(WechatWorkCorpgroupApiUnionIdToExternalUserIdRequest request)
-  - POST /cgi-bin/corpgroup/unionid_to_external_userid
 
 - async WechatResponse UnionIdToExternalUserIdRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiUnionIdToPendingIdResponse UnionIdToPendingIdAsync(WechatWorkCorpgroupApiUnionIdToPendingIdRequest request)
-  - POST /cgi-bin/corpgroup/unionid_to_pending_id
 
 - async WechatResponse UnionIdToPendingIdRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiCorpGetChainListResponse CorpGetChainListAsync()
-  - GET /cgi-bin/corpgroup/corp/get_chain_list
 
 - async WechatResponse CorpGetChainListRawAsync(string query)
 
 - async WechatWorkCorpgroupApiCorpGetChainGroupResponse CorpGetChainGroupAsync(WechatWorkCorpgroupApiCorpGetChainGroupRequest request)
-  - POST /cgi-bin/corpgroup/corp/get_chain_group
 
 - async WechatResponse CorpGetChainGroupRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiCorpGetChainCorpInfoListResponse CorpGetChainCorpInfoListAsync(WechatWorkCorpgroupApiCorpGetChainCorpInfoListRequest request)
-  - POST /cgi-bin/corpgroup/corp/get_chain_corpinfo_list
 
 - async WechatResponse CorpGetChainCorpInfoListRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiCorpGetChainCorpInfoResponse CorpGetChainCorpInfoAsync(WechatWorkCorpgroupApiCorpGetChainCorpInfoRequest request)
-  - POST /cgi-bin/corpgroup/corp/get_chain_corpinfo
 
 - async WechatResponse CorpGetChainCorpInfoRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiImportChainContactResponse ImportChainContactAsync(WechatWorkCorpgroupApiImportChainContactRequest request)
-  - POST /cgi-bin/corpgroup/import_chain_contact
 
 - async WechatResponse ImportChainContactRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiGetResultResponse GetResultAsync(WechatWorkCorpgroupApiGetResultRequest request)
-  - GET /cgi-bin/corpgroup/getresult
 
 - async WechatResponse GetResultRawAsync(string query)
 
 - async WechatWorkCorpgroupApiCorpRemoveCorpResponse CorpRemoveCorpAsync(WechatWorkCorpgroupApiCorpRemoveCorpRequest request)
-  - POST /cgi-bin/corpgroup/corp/remove_corp
 
 - async WechatResponse CorpRemoveCorpRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiCorpGetChainUserCustomIdResponse CorpGetChainUserCustomIdAsync(WechatWorkCorpgroupApiCorpGetChainUserCustomIdRequest request)
-  - POST /cgi-bin/corpgroup/corp/get_chain_user_custom_id
 
 - async WechatResponse CorpGetChainUserCustomIdRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiGetCorpSharedChainListResponse GetCorpSharedChainListAsync(WechatWorkCorpgroupApiGetCorpSharedChainListRequest request)
-  - POST /cgi-bin/corpgroup/get_corp_shared_chain_list
 
 - async WechatResponse GetCorpSharedChainListRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiRuleListIdsResponse RuleListIdsAsync(WechatWorkCorpgroupApiRuleListIdsRequest request)
-  - POST /cgi-bin/corpgroup/rule/list_ids
 
 - async WechatResponse RuleListIdsRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiRuleDeleteRuleResponse RuleDeleteRuleAsync(WechatWorkCorpgroupApiRuleDeleteRuleRequest request)
-  - POST /cgi-bin/corpgroup/rule/delete_rule
 
 - async WechatResponse RuleDeleteRuleRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiRuleGetRuleInfoResponse RuleGetRuleInfoAsync(WechatWorkCorpgroupApiRuleGetRuleInfoRequest request)
-  - POST /cgi-bin/corpgroup/rule/get_rule_info
 
 - async WechatResponse RuleGetRuleInfoRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiRuleAddRuleResponse RuleAddRuleAsync(WechatWorkCorpgroupApiRuleAddRuleRequest request)
-  - POST /cgi-bin/corpgroup/rule/add_rule
 
 - async WechatResponse RuleAddRuleRawAsync(string query, string jsonBody)
 
 - async WechatWorkCorpgroupApiRuleModifyRuleResponse RuleModifyRuleAsync(WechatWorkCorpgroupApiRuleModifyRuleRequest request)
-  - POST /cgi-bin/corpgroup/rule/modify_rule
 
 - async WechatResponse RuleModifyRuleRawAsync(string query, string jsonBody)
 
@@ -1044,8 +958,6 @@ Corpgroup/CorpgroupApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWorkCorpgroupApiCorpListAppShareInfoRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -1321,36 +1233,27 @@ Corpgroup/CorpgroupApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkCustomerAcquisitionApi (class)
 
-CustomerAcquisition/CustomerAcquisitionApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkCustomerAcquisitionApi(WechatWorkClient client)
 
 - async WechatWorkCustomerAcquisitionApiGetLinkListResponse GetLinkListAsync(WechatWorkCustomerAcquisitionApiGetLinkListRequest request)
-  - POST /cgi-bin/externalcontact/customer_acquisition/list_link
 
 - async WechatResponse GetLinkListRawAsync(string query, string jsonBody)
 
 - async WechatWorkCustomerAcquisitionApiGetLinkDetailResponse GetLinkDetailAsync(WechatWorkCustomerAcquisitionApiGetLinkDetailRequest request)
-  - POST /cgi-bin/externalcontact/customer_acquisition/get
 
 - async WechatResponse GetLinkDetailRawAsync(string query, string jsonBody)
 
 - async WechatWorkCustomerAcquisitionApiCreateLinkResponse CreateLinkAsync(WechatWorkCustomerAcquisitionApiCreateLinkRequest request)
-  - POST /cgi-bin/externalcontact/customer_acquisition/create_link
 
 - async WechatResponse CreateLinkRawAsync(string query, string jsonBody)
 
 - async WechatWorkCustomerAcquisitionApiModifyLinkResponse ModifyLinkAsync(WechatWorkCustomerAcquisitionApiModifyLinkRequest request)
-  - POST /cgi-bin/externalcontact/customer_acquisition/update_link
 
 - async WechatResponse ModifyLinkRawAsync(string query, string jsonBody)
 
 - async WechatWorkCustomerAcquisitionApiDeleteLinkResponse DeleteLinkAsync(WechatWorkCustomerAcquisitionApiDeleteLinkRequest request)
-  - POST /cgi-bin/externalcontact/customer_acquisition/delete_link
 
 - async WechatResponse DeleteLinkRawAsync(string query, string jsonBody)
 
@@ -1419,8 +1322,6 @@ CustomerAcquisition/CustomerAcquisitionApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkCustomerAcquisitionApiGetLinkListRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - WechatTypedRequest request;
 
 - public WechatWorkCustomerAcquisitionApiGetLinkListRequest()
@@ -1467,36 +1368,27 @@ CustomerAcquisition/CustomerAcquisitionApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkCustomerTagApi (class)
 
-CustomerTag/CustomerTagApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkCustomerTagApi(WechatWorkClient client)
 
 - async WechatWorkCustomerTagApiGetCustomerTagListResponse GetCustomerTagListAsync(WechatWorkCustomerTagApiGetCustomerTagListRequest request)
-  - POST /cgi-bin/externalcontact/get_corp_tag_list
 
 - async WechatResponse GetCustomerTagListRawAsync(string query, string jsonBody)
 
 - async WechatWorkCustomerTagApiAddCorpCustomerTagResponse AddCorpCustomerTagAsync(WechatWorkCustomerTagApiAddCorpCustomerTagRequest request)
-  - POST /cgi-bin/externalcontact/add_corp_tag
 
 - async WechatResponse AddCorpCustomerTagRawAsync(string query, string jsonBody)
 
 - async WechatWorkCustomerTagApiEditCorpCustomerTagResponse EditCorpCustomerTagAsync(WechatWorkCustomerTagApiEditCorpCustomerTagRequest request)
-  - POST /cgi-bin/externalcontact/edit_corp_tag
 
 - async WechatResponse EditCorpCustomerTagRawAsync(string query, string jsonBody)
 
 - async WechatWorkCustomerTagApiDeleteCorpCustomerTagResponse DeleteCorpCustomerTagAsync(WechatWorkCustomerTagApiDeleteCorpCustomerTagRequest request)
-  - POST /cgi-bin/externalcontact/del_corp_tag
 
 - async WechatResponse DeleteCorpCustomerTagRawAsync(string query, string jsonBody)
 
 - async WechatWorkCustomerTagApiExternalContactMarkTagResponse ExternalContactMarkTagAsync(WechatWorkCustomerTagApiExternalContactMarkTagRequest request)
-  - POST /cgi-bin/externalcontact/mark_tag
 
 - async WechatResponse ExternalContactMarkTagRawAsync(string query, string jsonBody)
 
@@ -1603,8 +1495,6 @@ CustomerTag/CustomerTagApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkCustomerTagApiGetCustomerTagListRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - WechatTypedRequest request;
 
 - public WechatWorkCustomerTagApiGetCustomerTagListRequest()
@@ -1623,28 +1513,20 @@ CustomerTag/CustomerTagApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkDataIntelligenceApi (class)
 
-DataIntelligence/DataIntelligenceApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkDataIntelligenceApi(WechatWorkClient client)
 
 - async WechatWorkDataIntelligenceApiGetConversationRecordsResponse GetConversationRecordsAsync(WechatWorkDataIntelligenceApiGetConversationRecordsRequest request)
-  - POST /cgi-bin/data/get_conversation_records
 
 - async WechatResponse GetConversationRecordsRawAsync(string query, string jsonBody)
 
 - async WechatWorkDataIntelligenceApiGetMessageStatisticsResponse GetMessageStatisticsAsync(WechatWorkDataIntelligenceApiGetMessageStatisticsRequest request)
-  - POST /cgi-bin/data/get_message_statistics
 
 - async WechatResponse GetMessageStatisticsRawAsync(string query, string jsonBody)
 
 
 ## WechatWorkDataIntelligenceApiGetConversationRecordsRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -1698,211 +1580,167 @@ DataIntelligence/DataIntelligenceApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkExternalApi (class)
 
-External/ExternalApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkExternalApi(WechatWorkClient client)
 
 - async WechatWorkExternalApiTransferExternalResponse TransferExternalAsync(WechatWorkExternalApiTransferExternalRequest request)
-  - POST /cgi-bin/crm/transfer_external_contact
 
 - async WechatResponse TransferExternalRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGetExternalContactResponse GetExternalContactAsync(WechatWorkExternalApiGetExternalContactRequest request)
-  - GET /cgi-bin/crm/get_external_contact
 
 - async WechatResponse GetExternalContactRawAsync(string query)
 
 - async WechatWorkExternalApiGroupChatListResponse GroupChatListAsync(WechatWorkExternalApiGroupChatListRequest request)
-  - POST /cgi-bin/externalcontact/groupchat/list
 
 - async WechatResponse GroupChatListRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGroupChatGetResponse GroupChatGetAsync(WechatWorkExternalApiGroupChatGetRequest request)
-  - POST /cgi-bin/externalcontact/groupchat/get
 
 - async WechatResponse GroupChatGetRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGetExternalContactListResponse GetExternalContactListAsync(WechatWorkExternalApiGetExternalContactListRequest request)
-  - GET /cgi-bin/externalcontact/list
 
 - async WechatResponse GetExternalContactListRawAsync(string query)
 
 - async WechatWorkExternalApiGetExternalContactInfoResponse GetExternalContactInfoAsync(WechatWorkExternalApiGetExternalContactInfoRequest request)
-  - GET /cgi-bin/externalcontact/get
 
 - async WechatResponse GetExternalContactInfoRawAsync(string query)
 
 - async WechatWorkExternalApiGetExternalContactInfoBatchResponse GetExternalContactInfoBatchAsync(WechatWorkExternalApiGetExternalContactInfoBatchRequest request)
-  - POST /cgi-bin/externalcontact/batch/get_by_user
 
 - async WechatResponse GetExternalContactInfoBatchRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiUpdateExternalContactRemarkResponse UpdateExternalContactRemarkAsync(WechatWorkExternalApiUpdateExternalContactRemarkRequest request)
-  - POST /cgi-bin/externalcontact/remark
 
 - async WechatResponse UpdateExternalContactRemarkRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGetFollowUserListResponse GetFollowUserListAsync()
-  - GET /cgi-bin/externalcontact/get_follow_user_list
 
 - async WechatResponse GetFollowUserListRawAsync(string query)
 
 - async WechatWorkExternalApiGetUserBehaviorDataResponse GetUserBehaviorDataAsync(WechatWorkExternalApiGetUserBehaviorDataRequest request)
-  - POST /cgi-bin/externalcontact/get_user_behavior_data
 
 - async WechatResponse GetUserBehaviorDataRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGroupChatStatisticOwnerResponse GroupChatStatisticOwnerAsync(WechatWorkExternalApiGroupChatStatisticOwnerRequest request)
-  - POST /cgi-bin/externalcontact/groupchat/statistic
 
 - async WechatResponse GroupChatStatisticOwnerRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGroupChatStatisticGroupByDayResponse GroupChatStatisticGroupByDayAsync(WechatWorkExternalApiGroupChatStatisticGroupByDayRequest request)
-  - POST /cgi-bin/externalcontact/groupchat/statistic_group_by_day
 
 - async WechatResponse GroupChatStatisticGroupByDayRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGetCropTagListResponse GetCropTagListAsync(WechatWorkExternalApiGetCropTagListRequest request)
-  - POST /cgi-bin/externalcontact/get_corp_tag_list
 
 - async WechatResponse GetCropTagListRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiAddCropTagResponse AddCropTagAsync(WechatWorkExternalApiAddCropTagRequest request)
-  - POST /cgi-bin/externalcontact/add_corp_tag
 
 - async WechatResponse AddCropTagRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiEditCropTagResponse EditCropTagAsync(WechatWorkExternalApiEditCropTagRequest request)
-  - POST /cgi-bin/externalcontact/edit_corp_tag
 
 - async WechatResponse EditCropTagRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiDeleteCropTagResponse DeleteCropTagAsync(WechatWorkExternalApiDeleteCropTagRequest request)
-  - POST /cgi-bin/externalcontact/del_corp_tag
 
 - async WechatResponse DeleteCropTagRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGetStrategyTagListResponse GetStrategyTagListAsync(WechatWorkExternalApiGetStrategyTagListRequest request)
-  - POST /cgi-bin/externalcontact/get_strategy_tag_list
 
 - async WechatResponse GetStrategyTagListRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiAddStrategyTagResponse AddStrategyTagAsync(WechatWorkExternalApiAddStrategyTagRequest request)
-  - POST /cgi-bin/externalcontact/add_strategy_tag
 
 - async WechatResponse AddStrategyTagRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiEditStrategyTagResponse EditStrategyTagAsync(WechatWorkExternalApiEditStrategyTagRequest request)
-  - POST /cgi-bin/externalcontact/edit_strategy_tag
 
 - async WechatResponse EditStrategyTagRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiDeleteStrategyTagResponse DeleteStrategyTagAsync(WechatWorkExternalApiDeleteStrategyTagRequest request)
-  - POST /cgi-bin/externalcontact/del_strategy_tag
 
 - async WechatResponse DeleteStrategyTagRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGetMomentListResponse GetMomentListAsync(WechatWorkExternalApiGetMomentListRequest request)
-  - POST /cgi-bin/externalcontact/get_moment_list
 
 - async WechatResponse GetMomentListRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGetMomentTaskResponse GetMomentTaskAsync(WechatWorkExternalApiGetMomentTaskRequest request)
-  - POST /cgi-bin/externalcontact/get_moment_task
 
 - async WechatResponse GetMomentTaskRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiAddContactWayResponse AddContactWayAsync(WechatWorkExternalApiAddContactWayRequest request)
-  - POST /cgi-bin/externalcontact/add_contact_way
 
 - async WechatResponse AddContactWayRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiListContactWayResponse ListContactWayAsync(WechatWorkExternalApiListContactWayRequest request)
-  - POST /cgi-bin/externalcontact/list_contact_way
 
 - async WechatResponse ListContactWayRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiUpdateContactWayResponse UpdateContactWayAsync(WechatWorkExternalApiUpdateContactWayRequest request)
-  - POST /cgi-bin/externalcontact/update_contact_way
 
 - async WechatResponse UpdateContactWayRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiDeleteContactWayResponse DeleteContactWayAsync(WechatWorkExternalApiDeleteContactWayRequest request)
-  - POST /cgi-bin/externalcontact/del_contact_way
 
 - async WechatResponse DeleteContactWayRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiCloseTempChatResponse CloseTempChatAsync(WechatWorkExternalApiCloseTempChatRequest request)
-  - POST /cgi-bin/externalcontact/close_temp_chat
 
 - async WechatResponse CloseTempChatRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGroupChat_AddJoinWayResponse GroupChat_AddJoinWayAsync(WechatWorkExternalApiGroupChat_AddJoinWayRequest request)
-  - POST /cgi-bin/externalcontact/groupchat/add_join_way
 
 - async WechatResponse GroupChat_AddJoinWayRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGroupChat_GetJoinWayResponse GroupChat_GetJoinWayAsync(WechatWorkExternalApiGroupChat_GetJoinWayRequest request)
-  - POST /cgi-bin/externalcontact/groupchat/get_join_way
 
 - async WechatResponse GroupChat_GetJoinWayRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGroupChat_UpdateJoinWayResponse GroupChat_UpdateJoinWayAsync(WechatWorkExternalApiGroupChat_UpdateJoinWayRequest request)
-  - POST /cgi-bin/externalcontact/groupchat/update_join_way
 
 - async WechatResponse GroupChat_UpdateJoinWayRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGroupChat_DelJoinWayResponse GroupChat_DelJoinWayAsync(WechatWorkExternalApiGroupChat_DelJoinWayRequest request)
-  - POST /cgi-bin/externalcontact/groupchat/del_join_way
 
 - async WechatResponse GroupChat_DelJoinWayRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiAddMsgTemplateResponse AddMsgTemplateAsync(WechatWorkExternalApiAddMsgTemplateRequest request)
-  - POST /cgi-bin/externalcontact/add_msg_template
 
 - async WechatResponse AddMsgTemplateRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGetGroupMsgListV2Response GetGroupMsgListV2Async(WechatWorkExternalApiGetGroupMsgListV2Request request)
-  - POST /cgi-bin/externalcontact/get_groupmsg_list_v2
 
 - async WechatResponse GetGroupMsgListV2RawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGetGroupMsgTaskResponse GetGroupMsgTaskAsync(WechatWorkExternalApiGetGroupMsgTaskRequest request)
-  - POST /cgi-bin/externalcontact/get_groupmsg_task
 
 - async WechatResponse GetGroupMsgTaskRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGetGroupMsgSendResultResponse GetGroupMsgSendResultAsync(WechatWorkExternalApiGetGroupMsgSendResultRequest request)
-  - POST /cgi-bin/externalcontact/get_groupmsg_send_result
 
 - async WechatResponse GetGroupMsgSendResultRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiSendWelcomeMsgResponse SendWelcomeMsgAsync(WechatWorkExternalApiSendWelcomeMsgRequest request)
-  - POST /cgi-bin/externalcontact/send_welcome_msg
 
 - async WechatResponse SendWelcomeMsgRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGroupWelcomeTemplateAddResponse GroupWelcomeTemplateAddAsync(WechatWorkExternalApiGroupWelcomeTemplateAddRequest request)
-  - POST /cgi-bin/externalcontact/group_welcome_template/add
 
 - async WechatResponse GroupWelcomeTemplateAddRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGroupWelcomeTemplateEditResponse GroupWelcomeTemplateEditAsync(WechatWorkExternalApiGroupWelcomeTemplateEditRequest request)
-  - POST /cgi-bin/externalcontact/group_welcome_template/edit
 
 - async WechatResponse GroupWelcomeTemplateEditRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGroupWelcomeTemplateGetResponse GroupWelcomeTemplateGetAsync(WechatWorkExternalApiGroupWelcomeTemplateGetRequest request)
-  - POST /cgi-bin/externalcontact/group_welcome_template/get
 
 - async WechatResponse GroupWelcomeTemplateGetRawAsync(string query, string jsonBody)
 
 - async WechatWorkExternalApiGroupWelcomeTemplateDelResponse GroupWelcomeTemplateDelAsync(WechatWorkExternalApiGroupWelcomeTemplateDelRequest request)
-  - POST /cgi-bin/externalcontact/group_welcome_template/del
 
 - async WechatResponse GroupWelcomeTemplateDelRawAsync(string query, string jsonBody)
 
@@ -2784,8 +2622,6 @@ External/ExternalApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkExternalApiTransferExternalRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - WechatTypedRequest request;
 
 - public WechatWorkExternalApiTransferExternalRequest()
@@ -2880,23 +2716,16 @@ External/ExternalApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkIdConvertApi (class)
 
-IdConvert/IdConvertApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkIdConvertApi(WechatWorkClient client)
 
 - async WechatWorkIdConvertApiUpgradeChatIdForNewCorpResponse UpgradeChatIdForNewCorpAsync(WechatWorkIdConvertApiUpgradeChatIdForNewCorpRequest request)
-  - POST /cgi-bin/idconvert/upgrade_chatid_for_new_corp
 
 - async WechatResponse UpgradeChatIdForNewCorpRawAsync(string query, string jsonBody)
 
 
 ## WechatWorkIdConvertApiUpgradeChatIdForNewCorpRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -2916,38 +2745,28 @@ IdConvert/IdConvertApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkInvoiceApi (class)
 
-Invoice/InvoiceApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkInvoiceApi(WechatWorkClient client)
 
 - async WechatWorkInvoiceApiGetInvoiceInfoResponse GetInvoiceInfoAsync(WechatWorkInvoiceApiGetInvoiceInfoRequest request)
-  - POST /cgi-bin/card/invoice/reimburse/getinvoiceinfo
 
 - async WechatResponse GetInvoiceInfoRawAsync(string query, string jsonBody)
 
 - async WechatWorkInvoiceApiGetInvoiceListInfoResponse GetInvoiceListInfoAsync(WechatWorkInvoiceApiGetInvoiceListInfoRequest request)
-  - POST /cgi-bin/card/invoice/reimburse/getinvoicebatch
 
 - async WechatResponse GetInvoiceListInfoRawAsync(string query, string jsonBody)
 
 - async WechatWorkInvoiceApiUpdateInvoiceStatusResponse UpdateInvoiceStatusAsync(WechatWorkInvoiceApiUpdateInvoiceStatusRequest request)
-  - POST /cgi-bin/card/invoice/reimburse/updateinvoicestatus
 
 - async WechatResponse UpdateInvoiceStatusRawAsync(string query, string jsonBody)
 
 - async WechatWorkInvoiceApiUpdateInvoiceListStatusResponse UpdateInvoiceListStatusAsync(WechatWorkInvoiceApiUpdateInvoiceListStatusRequest request)
-  - POST /cgi-bin/card/invoice/reimburse/updatestatusbatch
 
 - async WechatResponse UpdateInvoiceListStatusRawAsync(string query, string jsonBody)
 
 
 ## WechatWorkInvoiceApiGetInvoiceInfoRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -3035,36 +2854,27 @@ Invoice/InvoiceApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkKFApi (class)
 
-KF/KFApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkKFApi(WechatWorkClient client)
 
 - async WechatWorkKFApiSendTextResponse SendTextAsync(WechatWorkKFApiSendTextRequest request)
-  - POST /cgi-bin/kf/send
 
 - async WechatResponse SendTextRawAsync(string query, string jsonBody)
 
 - async WechatWorkKFApiSendImageResponse SendImageAsync(WechatWorkKFApiSendImageRequest request)
-  - POST /cgi-bin/kf/send
 
 - async WechatResponse SendImageRawAsync(string query, string jsonBody)
 
 - async WechatWorkKFApiSendFileResponse SendFileAsync(WechatWorkKFApiSendFileRequest request)
-  - POST /cgi-bin/kf/send
 
 - async WechatResponse SendFileRawAsync(string query, string jsonBody)
 
 - async WechatWorkKFApiSendVoiceResponse SendVoiceAsync(WechatWorkKFApiSendVoiceRequest request)
-  - POST /cgi-bin/kf/send
 
 - async WechatResponse SendVoiceRawAsync(string query, string jsonBody)
 
 - async WechatWorkKFApiGetKFListResponse GetKFListAsync(WechatWorkKFApiGetKFListRequest request)
-  - GET /cgi-bin/kf/list
 
 - async WechatResponse GetKFListRawAsync(string query)
 
@@ -3137,8 +2947,6 @@ KF/KFApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkKFApiSendTextRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - WechatTypedRequest request;
 
 - public WechatWorkKFApiSendTextRequest()
@@ -3187,43 +2995,32 @@ KF/KFApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkLinkedCorpApi (class)
 
-LinkedCorp/LinkedCorpApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkLinkedCorpApi(WechatWorkClient client)
 
 - async WechatWorkLinkedCorpApiGetAgentPermissionListResponse GetAgentPermissionListAsync()
-  - POST /cgi-bin/linkedcorp/agent/get_perm_list
 
 - async WechatResponse GetAgentPermissionListRawAsync(string query, string jsonBody)
 
 - async WechatWorkLinkedCorpApiGetUserResponse GetUserAsync(WechatWorkLinkedCorpApiGetUserRequest request)
-  - POST /cgi-bin/linkedcorp/user/get
 
 - async WechatResponse GetUserRawAsync(string query, string jsonBody)
 
 - async WechatWorkLinkedCorpApiGetSimpleUserListResponse GetSimpleUserListAsync(WechatWorkLinkedCorpApiGetSimpleUserListRequest request)
-  - POST /cgi-bin/linkedcorp/user/simplelist
 
 - async WechatResponse GetSimpleUserListRawAsync(string query, string jsonBody)
 
 - async WechatWorkLinkedCorpApiGetUserListResponse GetUserListAsync(WechatWorkLinkedCorpApiGetUserListRequest request)
-  - POST /cgi-bin/linkedcorp/user/list
 
 - async WechatResponse GetUserListRawAsync(string query, string jsonBody)
 
 - async WechatWorkLinkedCorpApiGetDepartmentListResponse GetDepartmentListAsync(WechatWorkLinkedCorpApiGetDepartmentListRequest request)
-  - POST /cgi-bin/linkedcorp/department/list
 
 - async WechatResponse GetDepartmentListRawAsync(string query, string jsonBody)
 
 
 ## WechatWorkLinkedCorpApiGetAgentPermissionListResponse (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - public string Raw;
 
@@ -3306,56 +3103,43 @@ LinkedCorp/LinkedCorpApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkLivingApi (class)
 
-Living/LivingApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkLivingApi(WechatWorkClient client)
 
 - async WechatWorkLivingApiGetUserAllLivingidResponse GetUserAllLivingidAsync(WechatWorkLivingApiGetUserAllLivingidRequest request)
-  - POST /cgi-bin/living/get_user_all_livingid
 
 - async WechatResponse GetUserAllLivingidRawAsync(string query, string jsonBody)
 
 - async WechatWorkLivingApiGetLivingInfoResponse GetLivingInfoAsync(WechatWorkLivingApiGetLivingInfoRequest request)
-  - GET /cgi-bin/living/get_living_info
 
 - async WechatResponse GetLivingInfoRawAsync(string query)
 
 - async WechatWorkLivingApiGetLivingWatchStateResponse GetLivingWatchStateAsync(WechatWorkLivingApiGetLivingWatchStateRequest request)
-  - POST /cgi-bin/living/get_watch_stat
 
 - async WechatResponse GetLivingWatchStateRawAsync(string query, string jsonBody)
 
 - async WechatWorkLivingApiCreateResponse CreateAsync(WechatWorkLivingApiCreateRequest request)
-  - POST /cgi-bin/living/create
 
 - async WechatResponse CreateRawAsync(string query, string jsonBody)
 
 - async WechatWorkLivingApiModifyResponse ModifyAsync(WechatWorkLivingApiModifyRequest request)
-  - POST /cgi-bin/living/modify
 
 - async WechatResponse ModifyRawAsync(string query, string jsonBody)
 
 - async WechatWorkLivingApiCancelResponse CancelAsync(WechatWorkLivingApiCancelRequest request)
-  - POST /cgi-bin/living/cancel
 
 - async WechatResponse CancelRawAsync(string query, string jsonBody)
 
 - async WechatWorkLivingApiDeleteReplayDataResponse DeleteReplayDataAsync(WechatWorkLivingApiDeleteReplayDataRequest request)
-  - POST /cgi-bin/living/delete_replay_data
 
 - async WechatResponse DeleteReplayDataRawAsync(string query, string jsonBody)
 
 - async WechatWorkLivingApiGetLivingCodeResponse GetLivingCodeAsync(WechatWorkLivingApiGetLivingCodeRequest request)
-  - POST /cgi-bin/living/get_living_code
 
 - async WechatResponse GetLivingCodeRawAsync(string query, string jsonBody)
 
 - async WechatWorkLivingApiGetLivingShareInfoResponse GetLivingShareInfoAsync(WechatWorkLivingApiGetLivingShareInfoRequest request)
-  - POST /cgi-bin/living/get_living_share_info
 
 - async WechatResponse GetLivingShareInfoRawAsync(string query, string jsonBody)
 
@@ -3516,8 +3300,6 @@ Living/LivingApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkLivingApiGetUserAllLivingidRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - WechatTypedRequest request;
 
 - public WechatWorkLivingApiGetUserAllLivingidRequest()
@@ -3572,23 +3354,16 @@ Living/LivingApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkLoginAuthApi (class)
 
-LoginAuth/LoginAuthApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkLoginAuthApi(WechatWorkClient client)
 
 - async WechatWorkLoginAuthApiGetLoginUrlResponse GetLoginUrlAsync(WechatWorkLoginAuthApiGetLoginUrlRequest request)
-  - POST /cgi-bin/service/get_login_url
 
 - async WechatResponse GetLoginUrlRawAsync(string query, string jsonBody)
 
 
 ## WechatWorkLoginAuthApiGetLoginUrlRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -3612,136 +3387,107 @@ LoginAuth/LoginAuthApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkMailListApi (class)
 
-MailList/MailListApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkMailListApi(WechatWorkClient client)
 
 - async WechatWorkMailListApiCreateMemberResponse CreateMemberAsync(WechatWorkMailListApiCreateMemberRequest request)
-  - POST /cgi-bin/user/create
 
 - async WechatResponse CreateMemberRawAsync(string query, string jsonBody)
 
 - async WechatWorkMailListApiGetMemberResponse GetMemberAsync(WechatWorkMailListApiGetMemberRequest request)
-  - GET /cgi-bin/user/get
 
 - async WechatResponse GetMemberRawAsync(string query)
 
 - async WechatWorkMailListApiUpdateMemberResponse UpdateMemberAsync(WechatWorkMailListApiUpdateMemberRequest request)
-  - POST /cgi-bin/user/update
 
 - async WechatResponse UpdateMemberRawAsync(string query, string jsonBody)
 
 - async WechatWorkMailListApiDeleteMemberResponse DeleteMemberAsync(WechatWorkMailListApiDeleteMemberRequest request)
-  - GET /cgi-bin/user/delete
 
 - async WechatResponse DeleteMemberRawAsync(string query)
 
 - async WechatWorkMailListApiBatchDeleteMemberResponse BatchDeleteMemberAsync(WechatWorkMailListApiBatchDeleteMemberRequest request)
-  - POST /cgi-bin/user/batchdelete
 
 - async WechatResponse BatchDeleteMemberRawAsync(string query, string jsonBody)
 
 - async WechatWorkMailListApiGetUseridResponse GetUseridAsync(WechatWorkMailListApiGetUseridRequest request)
-  - POST /cgi-bin/user/getuserid
 
 - async WechatResponse GetUseridRawAsync(string query, string jsonBody)
 
 - async WechatWorkMailListApiGetUseridByEmailResponse GetUseridByEmailAsync(WechatWorkMailListApiGetUseridByEmailRequest request)
-  - POST /cgi-bin/user/get_userid_by_email
 
 - async WechatResponse GetUseridByEmailRawAsync(string query, string jsonBody)
 
 - async WechatWorkMailListApiGetMemberIdListResponse GetMemberIdListAsync(WechatWorkMailListApiGetMemberIdListRequest request)
-  - POST /cgi-bin/user/list_id
 
 - async WechatResponse GetMemberIdListRawAsync(string query, string jsonBody)
 
 - async WechatWorkMailListApiGetDepartmentMemberResponse GetDepartmentMemberAsync(WechatWorkMailListApiGetDepartmentMemberRequest request)
-  - GET /cgi-bin/user/simplelist
 
 - async WechatResponse GetDepartmentMemberRawAsync(string query)
 
 - async WechatWorkMailListApiGetDepartmentMemberInfoResponse GetDepartmentMemberInfoAsync(WechatWorkMailListApiGetDepartmentMemberInfoRequest request)
-  - GET /cgi-bin/user/list
 
 - async WechatResponse GetDepartmentMemberInfoRawAsync(string query)
 
 - async WechatWorkMailListApiCreateDepartmentResponse CreateDepartmentAsync(WechatWorkMailListApiCreateDepartmentRequest request)
-  - POST /cgi-bin/department/create
 
 - async WechatResponse CreateDepartmentRawAsync(string query, string jsonBody)
 
 - async WechatWorkMailListApiUpdateDepartmentResponse UpdateDepartmentAsync(WechatWorkMailListApiUpdateDepartmentRequest request)
-  - POST /cgi-bin/department/update
 
 - async WechatResponse UpdateDepartmentRawAsync(string query, string jsonBody)
 
 - async WechatWorkMailListApiDeleteDepartmentResponse DeleteDepartmentAsync(WechatWorkMailListApiDeleteDepartmentRequest request)
-  - GET /cgi-bin/department/delete
 
 - async WechatResponse DeleteDepartmentRawAsync(string query)
 
 - async WechatWorkMailListApiGetDepartmentListResponse GetDepartmentListAsync(WechatWorkMailListApiGetDepartmentListRequest request)
-  - GET /cgi-bin/department/list
 
 - async WechatResponse GetDepartmentListRawAsync(string query)
 
 - async WechatWorkMailListApiGetDepartmentIdListResponse GetDepartmentIdListAsync(WechatWorkMailListApiGetDepartmentIdListRequest request)
-  - GET /cgi-bin/department/simplelist
 
 - async WechatResponse GetDepartmentIdListRawAsync(string query)
 
 - async WechatWorkMailListApiCreateTagResponse CreateTagAsync(WechatWorkMailListApiCreateTagRequest request)
-  - POST /cgi-bin/tag/create
 
 - async WechatResponse CreateTagRawAsync(string query, string jsonBody)
 
 - async WechatWorkMailListApiUpdateTagResponse UpdateTagAsync(WechatWorkMailListApiUpdateTagRequest request)
-  - POST /cgi-bin/tag/update
 
 - async WechatResponse UpdateTagRawAsync(string query, string jsonBody)
 
 - async WechatWorkMailListApiDeleteTagResponse DeleteTagAsync(WechatWorkMailListApiDeleteTagRequest request)
-  - GET /cgi-bin/tag/delete
 
 - async WechatResponse DeleteTagRawAsync(string query)
 
 - async WechatWorkMailListApiGetTagMemberResponse GetTagMemberAsync(WechatWorkMailListApiGetTagMemberRequest request)
-  - GET /cgi-bin/tag/get
 
 - async WechatResponse GetTagMemberRawAsync(string query)
 
 - async WechatWorkMailListApiAddTagMemberResponse AddTagMemberAsync(WechatWorkMailListApiAddTagMemberRequest request)
-  - POST /cgi-bin/tag/addtagusers
 
 - async WechatResponse AddTagMemberRawAsync(string query, string jsonBody)
 
 - async WechatWorkMailListApiDelTagMemberResponse DelTagMemberAsync(WechatWorkMailListApiDelTagMemberRequest request)
-  - POST /cgi-bin/tag/deltagusers
 
 - async WechatResponse DelTagMemberRawAsync(string query, string jsonBody)
 
 - async WechatWorkMailListApiGetTagListResponse GetTagListAsync()
-  - GET /cgi-bin/tag/list
 
 - async WechatResponse GetTagListRawAsync(string query)
 
 - async WechatWorkMailListApiInviteMemberResponse InviteMemberAsync(WechatWorkMailListApiInviteMemberRequest request)
-  - POST /cgi-bin/invite/send
 
 - async WechatResponse InviteMemberRawAsync(string query, string jsonBody)
 
 - async WechatWorkMailListApiInviteResponse InviteAsync(WechatWorkMailListApiInviteRequest request)
-  - POST /cgi-bin/batch/invite
 
 - async WechatResponse InviteRawAsync(string query, string jsonBody)
 
 - async WechatWorkMailListApiAuthSuccResponse AuthSuccAsync(WechatWorkMailListApiAuthSuccRequest request)
-  - GET /cgi-bin/user/authsucc
 
 - async WechatResponse AuthSuccRawAsync(string query)
 
@@ -3833,8 +3579,6 @@ MailList/MailListApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWorkMailListApiCreateMemberRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -4311,21 +4055,15 @@ MailList/MailListApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkMailListCurrentApi (class)
 
-MailList/MailListCurrentApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkMailListCurrentApi(WechatWorkClient client)
 
 - async WechatWorkMailListCurrentApiGetJoinQrcodeResponse GetJoinQrcodeAsync(WechatWorkMailListCurrentApiGetJoinQrcodeRequest request)
-  - GET /cgi-bin/corp/get_join_qrcode
 
 - async WechatResponse GetJoinQrcodeRawAsync(string query)
 
 - async WechatWorkMailListCurrentApiGetDepartmentResponse GetDepartmentAsync(WechatWorkMailListCurrentApiGetDepartmentRequest request)
-  - GET /cgi-bin/department/get
 
 - async WechatResponse GetDepartmentRawAsync(string query)
 
@@ -4350,8 +4088,6 @@ MailList/MailListCurrentApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkMailListCurrentApiGetJoinQrcodeRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - WechatTypedRequest request;
 
 - public WechatWorkMailListCurrentApiGetJoinQrcodeRequest()
@@ -4370,86 +4106,67 @@ MailList/MailListCurrentApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkMassApi (class)
 
-Mass/MassApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkMassApi(WechatWorkClient client)
 
 - async WechatWorkMassApiSendTextResponse SendTextAsync(WechatWorkMassApiSendTextRequest request)
-  - POST /cgi-bin/message/send
 
 - async WechatResponse SendTextRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassApiSendImageResponse SendImageAsync(WechatWorkMassApiSendImageRequest request)
-  - POST /cgi-bin/message/send
 
 - async WechatResponse SendImageRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassApiSendVoiceResponse SendVoiceAsync(WechatWorkMassApiSendVoiceRequest request)
-  - POST /cgi-bin/message/send
 
 - async WechatResponse SendVoiceRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassApiSendVideoResponse SendVideoAsync(WechatWorkMassApiSendVideoRequest request)
-  - POST /cgi-bin/message/send
 
 - async WechatResponse SendVideoRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassApiSendFileResponse SendFileAsync(WechatWorkMassApiSendFileRequest request)
-  - POST /cgi-bin/message/send
 
 - async WechatResponse SendFileRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassApiSendNewsResponse SendNewsAsync(WechatWorkMassApiSendNewsRequest request)
-  - POST /cgi-bin/message/send
 
 - async WechatResponse SendNewsRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassApiSendMpNewsResponse SendMpNewsAsync(WechatWorkMassApiSendMpNewsRequest request)
-  - POST /cgi-bin/message/send
 
 - async WechatResponse SendMpNewsRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassApiSendTextCardResponse SendTextCardAsync(WechatWorkMassApiSendTextCardRequest request)
-  - POST /cgi-bin/message/send
 
 - async WechatResponse SendTextCardRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassApiSendMarkdownResponse SendMarkdownAsync(WechatWorkMassApiSendMarkdownRequest request)
-  - POST /cgi-bin/message/send
 
 - async WechatResponse SendMarkdownRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassApiSendMiniNoticeCardResponse SendMiniNoticeCardAsync(WechatWorkMassApiSendMiniNoticeCardRequest request)
-  - POST /cgi-bin/message/send
 
 - async WechatResponse SendMiniNoticeCardRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassApiSendTaskCardResponse SendTaskCardAsync(WechatWorkMassApiSendTaskCardRequest request)
-  - POST /cgi-bin/message/send
 
 - async WechatResponse SendTaskCardRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassApiSendTemplateCardResponse SendTemplateCardAsync(WechatWorkMassApiSendTemplateCardRequest request)
-  - POST /cgi-bin/message/send
 
 - async WechatResponse SendTemplateCardRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassApiUpdateTemplateCardResponse UpdateTemplateCardAsync(WechatWorkMassApiUpdateTemplateCardRequest request)
-  - POST /cgi-bin/message/update_template_card
 
 - async WechatResponse UpdateTemplateCardRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassApiUpdateTaskCardResponse UpdateTaskCardAsync(WechatWorkMassApiUpdateTaskCardRequest request)
-  - POST /cgi-bin/message/update_taskcard
 
 - async WechatResponse UpdateTaskCardRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassApiRecallResponse RecallAsync(WechatWorkMassApiRecallRequest request)
-  - POST /cgi-bin/message/recall
 
 - async WechatResponse RecallRawAsync(string query, string jsonBody)
 
@@ -4760,8 +4477,6 @@ Mass/MassApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkMassApiSendTextRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - WechatTypedRequest request;
 
 - public WechatWorkMassApiSendTextRequest()
@@ -4918,56 +4633,43 @@ Mass/MassApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkMassLinkerCorpApi (class)
 
-Mass/LinkerCorp/LinkerCorpApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkMassLinkerCorpApi(WechatWorkClient client)
 
 - async WechatWorkMassLinkerCorpApiSendTextResponse SendTextAsync(WechatWorkMassLinkerCorpApiSendTextRequest request)
-  - POST /cgi-bin/linkedcorp/message/send
 
 - async WechatResponse SendTextRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassLinkerCorpApiSendImageResponse SendImageAsync(WechatWorkMassLinkerCorpApiSendImageRequest request)
-  - POST /cgi-bin/linkedcorp/message/send
 
 - async WechatResponse SendImageRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassLinkerCorpApiSendVoiceResponse SendVoiceAsync(WechatWorkMassLinkerCorpApiSendVoiceRequest request)
-  - POST /cgi-bin/linkedcorp/message/send
 
 - async WechatResponse SendVoiceRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassLinkerCorpApiSendVideoResponse SendVideoAsync(WechatWorkMassLinkerCorpApiSendVideoRequest request)
-  - POST /cgi-bin/linkedcorp/message/send
 
 - async WechatResponse SendVideoRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassLinkerCorpApiSendFileResponse SendFileAsync(WechatWorkMassLinkerCorpApiSendFileRequest request)
-  - POST /cgi-bin/linkedcorp/message/send
 
 - async WechatResponse SendFileRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassLinkerCorpApiSendNewsResponse SendNewsAsync(WechatWorkMassLinkerCorpApiSendNewsRequest request)
-  - POST /cgi-bin/linkedcorp/message/send
 
 - async WechatResponse SendNewsRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassLinkerCorpApiSendMpNewsResponse SendMpNewsAsync(WechatWorkMassLinkerCorpApiSendMpNewsRequest request)
-  - POST /cgi-bin/linkedcorp/message/send
 
 - async WechatResponse SendMpNewsRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassLinkerCorpApiSendTextCardResponse SendTextCardAsync(WechatWorkMassLinkerCorpApiSendTextCardRequest request)
-  - POST /cgi-bin/linkedcorp/message/send
 
 - async WechatResponse SendTextCardRawAsync(string query, string jsonBody)
 
 - async WechatWorkMassLinkerCorpApiSendMiniNoticeCardResponse SendMiniNoticeCardAsync(WechatWorkMassLinkerCorpApiSendMiniNoticeCardRequest request)
-  - POST /cgi-bin/linkedcorp/message/send
 
 - async WechatResponse SendMiniNoticeCardRawAsync(string query, string jsonBody)
 
@@ -5156,8 +4858,6 @@ Mass/LinkerCorp/LinkerCorpApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkMassLinkerCorpApiSendTextRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - WechatTypedRequest request;
 
 - public WechatWorkMassLinkerCorpApiSendTextRequest()
@@ -5252,48 +4952,36 @@ Mass/LinkerCorp/LinkerCorpApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkMediaApi (class)
 
-Media/MediaApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkMediaApi(WechatWorkClient client)
 
 - async WechatWorkMediaApiAddMpNewsResponse AddMpNewsAsync(WechatWorkMediaApiAddMpNewsRequest request)
-  - POST /cgi-bin/material/add_mpnews
 
 - async WechatResponse AddMpNewsRawAsync(string query, string jsonBody)
 
 - async WechatWorkMediaApiGetForeverMpNewsResponse GetForeverMpNewsAsync(WechatWorkMediaApiGetForeverMpNewsRequest request)
-  - GET /cgi-bin/material/get
 
 - async WechatResponse GetForeverMpNewsRawAsync(string query)
 
 - async WechatWorkMediaApiDeleteForeverMaterialResponse DeleteForeverMaterialAsync(WechatWorkMediaApiDeleteForeverMaterialRequest request)
-  - GET /cgi-bin/material/del
 
 - async WechatResponse DeleteForeverMaterialRawAsync(string query)
 
 - async WechatWorkMediaApiUpdateMpNewsResponse UpdateMpNewsAsync(WechatWorkMediaApiUpdateMpNewsRequest request)
-  - POST /cgi-bin/material/update_mpnews
 
 - async WechatResponse UpdateMpNewsRawAsync(string query, string jsonBody)
 
 - async WechatWorkMediaApiGetCountResponse GetCountAsync(WechatWorkMediaApiGetCountRequest request)
-  - GET /cgi-bin/material/get_count
 
 - async WechatResponse GetCountRawAsync(string query)
 
 - async WechatWorkMediaApiBatchGetMaterialResponse BatchGetMaterialAsync(WechatWorkMediaApiBatchGetMaterialRequest request)
-  - POST /cgi-bin/material/batchget
 
 - async WechatResponse BatchGetMaterialRawAsync(string query, string jsonBody)
 
 
 ## WechatWorkMediaApiAddMpNewsRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -5421,8 +5109,6 @@ Media/MediaApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkMediaSpecialApi (class)
 
-企业微信媒体上传、下载和永久素材特殊传输接口。
-
 - WechatWorkClient client;
 
 - public WechatWorkMediaSpecialApi(WechatWorkClient client)
@@ -5442,33 +5128,24 @@ Media/MediaApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkMiniProgramMiniApi (class)
 
-MiniProgram/MiniApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkMiniProgramMiniApi(WechatWorkClient client)
 
 - async WechatWorkMiniProgramMiniApiLoginCheckResponse LoginCheckAsync(WechatWorkMiniProgramMiniApiLoginCheckRequest request)
-  - GET /cgi-bin/miniprogram/jscode2session
 
 - async WechatResponse LoginCheckRawAsync(string query)
 
 - async WechatWorkMiniProgramMiniApiThirdLoginCheckResponse ThirdLoginCheckAsync(WechatWorkMiniProgramMiniApiThirdLoginCheckRequest request)
-  - GET /cgi-bin/service/miniprogram/jscode2session
 
 - async WechatResponse ThirdLoginCheckRawAsync(string query)
 
 - async WechatWorkMiniProgramMiniApiTransferSessionResponse TransferSessionAsync(WechatWorkMiniProgramMiniApiTransferSessionRequest request)
-  - POST /cgi-bin/miniprogram/transfer_session
 
 - async WechatResponse TransferSessionRawAsync(string query, string jsonBody)
 
 
 ## WechatWorkMiniProgramMiniApiLoginCheckRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -5526,21 +5203,15 @@ MiniProgram/MiniApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkMobileApi (class)
 
-Mobile/MobileApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkMobileApi(WechatWorkClient client)
 
 - async WechatWorkMobileApiGetTicketResponse GetTicketAsync()
-  - GET /cgi-bin/ticket/get
 
 - async WechatResponse GetTicketRawAsync(string query)
 
 - async WechatWorkMobileApiGetJsApiTicketResponse GetJsApiTicketAsync()
-  - GET /cgi-bin/ticket/get
 
 - async WechatResponse GetJsApiTicketRawAsync(string query)
 
@@ -5552,28 +5223,20 @@ Mobile/MobileApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkMobileApiGetTicketResponse (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - public string Raw;
 
 
 ## WechatWorkOAuth2Api (class)
-
-OAuth2/OAuth2Api.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
 
 - WechatWorkClient client;
 
 - public WechatWorkOAuth2Api(WechatWorkClient client)
 
 - async WechatWorkOAuth2ApiGetUserIdResponse GetUserIdAsync(WechatWorkOAuth2ApiGetUserIdRequest request)
-  - GET /cgi-bin/auth/getuserinfo
 
 - async WechatResponse GetUserIdRawAsync(string query)
 
 - async WechatWorkOAuth2ApiGetUserDetailResponse GetUserDetailAsync(WechatWorkOAuth2ApiGetUserDetailRequest request)
-  - POST /cgi-bin/auth/getuserdetail
 
 - async WechatResponse GetUserDetailRawAsync(string query, string jsonBody)
 
@@ -5598,8 +5261,6 @@ OAuth2/OAuth2Api.cs 的 Zan 强类型接口。
 
 ## WechatWorkOAuth2ApiGetUserIdRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - WechatTypedRequest request;
 
 - public WechatWorkOAuth2ApiGetUserIdRequest()
@@ -5620,61 +5281,47 @@ OAuth2/OAuth2Api.cs 的 Zan 强类型接口。
 
 ## WechatWorkOaApi (class)
 
-OA/OaApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkOaApi(WechatWorkClient client)
 
 - async WechatWorkOaApiGetTemplateDetailResponse GetTemplateDetailAsync(WechatWorkOaApiGetTemplateDetailRequest request)
-  - POST /cgi-bin/oa/gettemplatedetail
 
 - async WechatResponse GetTemplateDetailRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaApiApplyEventResponse ApplyEventAsync(WechatWorkOaApiApplyEventRequest request)
-  - POST /cgi-bin/oa/applyevent
 
 - async WechatResponse ApplyEventRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaApiGetApprovalInfoResponse GetApprovalInfoAsync(WechatWorkOaApiGetApprovalInfoRequest request)
-  - POST /cgi-bin/oa/getapprovalinfo
 
 - async WechatResponse GetApprovalInfoRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaApiGetApprovalDetailResponse GetApprovalDetailAsync(WechatWorkOaApiGetApprovalDetailRequest request)
-  - POST /cgi-bin/oa/getapprovaldetail
 
 - async WechatResponse GetApprovalDetailRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaApiVacationGetCorpConfResponse VacationGetCorpConfAsync()
-  - GET /cgi-bin/oa/vacation/getcorpconf
 
 - async WechatResponse VacationGetCorpConfRawAsync(string query)
 
 - async WechatWorkOaApiVacationGetUserVacationQuotaResponse VacationGetUserVacationQuotaAsync(WechatWorkOaApiVacationGetUserVacationQuotaRequest request)
-  - POST /cgi-bin/oa/vacation/getuservacationquota
 
 - async WechatResponse VacationGetUserVacationQuotaRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaApiSetOneUserQuotaResponse SetOneUserQuotaAsync(WechatWorkOaApiSetOneUserQuotaRequest request)
-  - POST /cgi-bin/oa/vacation/setoneuserquota
 
 - async WechatResponse SetOneUserQuotaRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaApiApprovalCopyTemplateResponse ApprovalCopyTemplateAsync(WechatWorkOaApiApprovalCopyTemplateRequest request)
-  - POST /cgi-bin/oa/approval/copytemplate
 
 - async WechatResponse ApprovalCopyTemplateRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaApiApprovalCreateTemplateResponse ApprovalCreateTemplateAsync(WechatWorkOaApiApprovalCreateTemplateRequest request)
-  - POST /cgi-bin/oa/approval/create_template
 
 - async WechatResponse ApprovalCreateTemplateRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaApiApprovalUpdateTemplateResponse ApprovalUpdateTemplateAsync(WechatWorkOaApiApprovalUpdateTemplateRequest request)
-  - POST /cgi-bin/oa/approval/update_template
 
 - async WechatResponse ApprovalUpdateTemplateRawAsync(string query, string jsonBody)
 
@@ -5821,8 +5468,6 @@ OA/OaApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkOaApiGetTemplateDetailRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - WechatTypedRequest request;
 
 - public WechatWorkOaApiGetTemplateDetailRequest()
@@ -5892,46 +5537,35 @@ OA/OaApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkOaDataOpenApi (class)
 
-OaDataOpen/OaDataOpenApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkOaDataOpenApi(WechatWorkClient client)
 
 - async WechatWorkOaDataOpenApiGetCheckinOptionResponse GetCheckinOptionAsync(WechatWorkOaDataOpenApiGetCheckinOptionRequest request)
-  - POST /cgi-bin/checkin/getcheckinoption
 
 - async WechatResponse GetCheckinOptionRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenApiGetCheckinDataResponse GetCheckinDataAsync(WechatWorkOaDataOpenApiGetCheckinDataRequest request)
-  - POST /cgi-bin/checkin/getcheckindata
 
 - async WechatResponse GetCheckinDataRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenApiAddCheckinRecordResponse AddCheckinRecordAsync(WechatWorkOaDataOpenApiAddCheckinRecordRequest request)
-  - POST /cgi-bin/checkin/add_checkin_record
 
 - async WechatResponse AddCheckinRecordRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenApiGetCheckinDayDataResponse GetCheckinDayDataAsync(WechatWorkOaDataOpenApiGetCheckinDayDataRequest request)
-  - POST /cgi-bin/checkin/getcheckin_daydata
 
 - async WechatResponse GetCheckinDayDataRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenApiGetApprovalDataResponse GetApprovalDataAsync(WechatWorkOaDataOpenApiGetApprovalDataRequest request)
-  - POST /cgi-bin/corp/getapprovaldata
 
 - async WechatResponse GetApprovalDataRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenApiGetDialRecordResponse GetDialRecordAsync(WechatWorkOaDataOpenApiGetDialRecordRequest request)
-  - POST /cgi-bin/dial/get_dial_record
 
 - async WechatResponse GetDialRecordRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenApiGetOpenApprovalDataResponse GetOpenApprovalDataAsync(WechatWorkOaDataOpenApiGetOpenApprovalDataRequest request)
-  - POST /cgi-bin/corp/getopenapprovaldata
 
 - async WechatResponse GetOpenApprovalDataRawAsync(string query, string jsonBody)
 
@@ -6026,8 +5660,6 @@ OaDataOpen/OaDataOpenApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkOaDataOpenApiGetCheckinOptionRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - WechatTypedRequest request;
 
 - public WechatWorkOaDataOpenApiGetCheckinOptionRequest()
@@ -6090,66 +5722,51 @@ OaDataOpen/OaDataOpenApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkOaDataOpenCheckinP2Api (class)
 
-OaDataOpen/OaDataOpenApi.CheckinP2.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkOaDataOpenCheckinP2Api(WechatWorkClient client)
 
 - async WechatWorkOaDataOpenCheckinP2ApiGetCorpCheckinOptionResponse GetCorpCheckinOptionAsync()
-  - POST /cgi-bin/checkin/getcorpcheckinoption
 
 - async WechatResponse GetCorpCheckinOptionRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenCheckinP2ApiGetCheckinMonthDataResponse GetCheckinMonthDataAsync(WechatWorkOaDataOpenCheckinP2ApiGetCheckinMonthDataRequest request)
-  - POST /cgi-bin/checkin/getcheckin_monthdata
 
 - async WechatResponse GetCheckinMonthDataRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenCheckinP2ApiGetCheckinScheduleListResponse GetCheckinScheduleListAsync(WechatWorkOaDataOpenCheckinP2ApiGetCheckinScheduleListRequest request)
-  - POST /cgi-bin/checkin/getcheckinschedulist
 
 - async WechatResponse GetCheckinScheduleListRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenCheckinP2ApiSetCheckinScheduleListResponse SetCheckinScheduleListAsync(WechatWorkOaDataOpenCheckinP2ApiSetCheckinScheduleListRequest request)
-  - POST /cgi-bin/checkin/setcheckinschedulist
 
 - async WechatResponse SetCheckinScheduleListRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenCheckinP2ApiPunchCorrectionResponse PunchCorrectionAsync(WechatWorkOaDataOpenCheckinP2ApiPunchCorrectionRequest request)
-  - POST /cgi-bin/checkin/punch_correction
 
 - async WechatResponse PunchCorrectionRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenCheckinP2ApiAddCheckinUserFaceResponse AddCheckinUserFaceAsync(WechatWorkOaDataOpenCheckinP2ApiAddCheckinUserFaceRequest request)
-  - POST /cgi-bin/checkin/addcheckinuserface
 
 - async WechatResponse AddCheckinUserFaceRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenCheckinP2ApiGetHardwareCheckinDataResponse GetHardwareCheckinDataAsync(WechatWorkOaDataOpenCheckinP2ApiGetHardwareCheckinDataRequest request)
-  - POST /cgi-bin/hardware/get_hardware_checkin_data
 
 - async WechatResponse GetHardwareCheckinDataRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenCheckinP2ApiAddCheckinOptionResponse AddCheckinOptionAsync(WechatWorkOaDataOpenCheckinP2ApiAddCheckinOptionRequest request)
-  - POST /cgi-bin/checkin/add_checkin_option
 
 - async WechatResponse AddCheckinOptionRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenCheckinP2ApiUpdateCheckinOptionResponse UpdateCheckinOptionAsync(WechatWorkOaDataOpenCheckinP2ApiUpdateCheckinOptionRequest request)
-  - POST /cgi-bin/checkin/update_checkin_option
 
 - async WechatResponse UpdateCheckinOptionRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenCheckinP2ApiClearCheckinOptionArrayFieldResponse ClearCheckinOptionArrayFieldAsync(WechatWorkOaDataOpenCheckinP2ApiClearCheckinOptionArrayFieldRequest request)
-  - POST /cgi-bin/checkin/clear_checkin_option_array_field
 
 - async WechatResponse ClearCheckinOptionArrayFieldRawAsync(string query, string jsonBody)
 
 - async WechatWorkOaDataOpenCheckinP2ApiDeleteCheckinOptionResponse DeleteCheckinOptionAsync(WechatWorkOaDataOpenCheckinP2ApiDeleteCheckinOptionRequest request)
-  - POST /cgi-bin/checkin/del_checkin_option
 
 - async WechatResponse DeleteCheckinOptionRawAsync(string query, string jsonBody)
 
@@ -6290,8 +5907,6 @@ OaDataOpen/OaDataOpenApi.CheckinP2.cs 的 Zan 强类型接口。
 
 ## WechatWorkOaDataOpenCheckinP2ApiGetCorpCheckinOptionResponse (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - public string Raw;
 
 
@@ -6395,51 +6010,39 @@ OaDataOpen/OaDataOpenApi.CheckinP2.cs 的 Zan 强类型接口。
 
 ## WechatWorkScheduleApi (class)
 
-Schedule/ScheduleApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkScheduleApi(WechatWorkClient client)
 
 - async WechatWorkScheduleApiAddResponse AddAsync(WechatWorkScheduleApiAddRequest request)
-  - POST /cgi-bin/oa/schedule/add
 
 - async WechatResponse AddRawAsync(string query, string jsonBody)
 
 - async WechatWorkScheduleApiUpdateResponse UpdateAsync(WechatWorkScheduleApiUpdateRequest request)
-  - POST /cgi-bin/oa/schedule/update
 
 - async WechatResponse UpdateRawAsync(string query, string jsonBody)
 
 - async WechatWorkScheduleApiUpdateRepeatResponse UpdateRepeatAsync(WechatWorkScheduleApiUpdateRepeatRequest request)
-  - POST /cgi-bin/oa/schedule/update
 
 - async WechatResponse UpdateRepeatRawAsync(string query, string jsonBody)
 
 - async WechatWorkScheduleApiDelResponse DelAsync(WechatWorkScheduleApiDelRequest request)
-  - POST /cgi-bin/oa/schedule/del
 
 - async WechatResponse DelRawAsync(string query, string jsonBody)
 
 - async WechatWorkScheduleApiGetResponse GetAsync(WechatWorkScheduleApiGetRequest request)
-  - POST /cgi-bin/oa/schedule/get
 
 - async WechatResponse GetRawAsync(string query, string jsonBody)
 
 - async WechatWorkScheduleApiGetByCalendarResponse GetByCalendarAsync(WechatWorkScheduleApiGetByCalendarRequest request)
-  - POST /cgi-bin/oa/schedule/get_by_calendar
 
 - async WechatResponse GetByCalendarRawAsync(string query, string jsonBody)
 
 - async WechatWorkScheduleApiAddAttendeesResponse AddAttendeesAsync(WechatWorkScheduleApiAddAttendeesRequest request)
-  - POST /cgi-bin/oa/schedule/add_attendees
 
 - async WechatResponse AddAttendeesRawAsync(string query, string jsonBody)
 
 - async WechatWorkScheduleApiDelAttendeesResponse DelAttendeesAsync(WechatWorkScheduleApiDelAttendeesRequest request)
-  - POST /cgi-bin/oa/schedule/del_attendees
 
 - async WechatResponse DelAttendeesRawAsync(string query, string jsonBody)
 
@@ -6467,8 +6070,6 @@ Schedule/ScheduleApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWorkScheduleApiAddRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -6642,23 +6243,16 @@ Schedule/ScheduleApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkShakeAroundApi (class)
 
-ShakeAround/ShakeAroundApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkShakeAroundApi(WechatWorkClient client)
 
 - async WechatWorkShakeAroundApiGetSuiteTokenResponse GetSuiteTokenAsync(WechatWorkShakeAroundApiGetSuiteTokenRequest request)
-  - POST /cgi-bin/shakearound/getshakeinfo
 
 - async WechatResponse GetSuiteTokenRawAsync(string query, string jsonBody)
 
 
 ## WechatWorkShakeAroundApiGetSuiteTokenRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -6677,8 +6271,6 @@ ShakeAround/ShakeAroundApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWorkSmartRobotClient (class)
-
-企业微信智能机器人 WSS 长连接客户端。
 
 - WssClient socket;
 
@@ -6715,28 +6307,20 @@ ShakeAround/ShakeAroundApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkSsoApi (class)
 
-SSO/SsoApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkSsoApi(WechatWorkClient client)
 
 - async WechatWorkSsoApiGetLoginInfoResponse GetLoginInfoAsync(WechatWorkSsoApiGetLoginInfoRequest request)
-  - POST /cgi-bin/service/get_login_info
 
 - async WechatResponse GetLoginInfoRawAsync(string query, string jsonBody)
 
 - async WechatWorkSsoApiGetProviderTokenResponse GetProviderTokenAsync(WechatWorkSsoApiGetProviderTokenRequest request)
-  - POST /cgi-bin/service/get_provider_token
 
 - async WechatResponse GetProviderTokenRawAsync(string query, string jsonBody)
 
 
 ## WechatWorkSsoApiGetLoginInfoRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 
@@ -6778,86 +6362,67 @@ SSO/SsoApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkThirdPartyAuthApi (class)
 
-ThirdPartyAuth/ThirdPartyAuthApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkThirdPartyAuthApi(WechatWorkClient client)
 
 - async WechatWorkThirdPartyAuthApiGetSuiteTokenResponse GetSuiteTokenAsync(WechatWorkThirdPartyAuthApiGetSuiteTokenRequest request)
-  - POST /cgi-bin/service/get_suite_token
 
 - async WechatResponse GetSuiteTokenRawAsync(string query, string jsonBody)
 
 - async WechatWorkThirdPartyAuthApiGetPreAuthCodeResponse GetPreAuthCodeAsync(WechatWorkThirdPartyAuthApiGetPreAuthCodeRequest request)
-  - POST /cgi-bin/service/get_pre_auth_code
 
 - async WechatResponse GetPreAuthCodeRawAsync(string query, string jsonBody)
 
 - async WechatWorkThirdPartyAuthApiSetAuthConfigResponse SetAuthConfigAsync(WechatWorkThirdPartyAuthApiSetAuthConfigRequest request)
-  - POST /cgi-bin/service/set_session_info
 
 - async WechatResponse SetAuthConfigRawAsync(string query, string jsonBody)
 
 - async WechatWorkThirdPartyAuthApiGetPermanentCodeResponse GetPermanentCodeAsync(WechatWorkThirdPartyAuthApiGetPermanentCodeRequest request)
-  - POST /cgi-bin/service/get_permanent_code
 
 - async WechatResponse GetPermanentCodeRawAsync(string query, string jsonBody)
 
 - async WechatWorkThirdPartyAuthApiGetAuthInfoResponse GetAuthInfoAsync(WechatWorkThirdPartyAuthApiGetAuthInfoRequest request)
-  - POST /cgi-bin/service/get_auth_info
 
 - async WechatResponse GetAuthInfoRawAsync(string query, string jsonBody)
 
 - async WechatWorkThirdPartyAuthApiGetAgentResponse GetAgentAsync(WechatWorkThirdPartyAuthApiGetAgentRequest request)
-  - POST /cgi-bin/service/get_agent
 
 - async WechatResponse GetAgentRawAsync(string query, string jsonBody)
 
 - async WechatWorkThirdPartyAuthApiSetAgentResponse SetAgentAsync(WechatWorkThirdPartyAuthApiSetAgentRequest request)
-  - POST /cgi-bin/service/set_agent
 
 - async WechatResponse SetAgentRawAsync(string query, string jsonBody)
 
 - async WechatWorkThirdPartyAuthApiGetCorpTokenResponse GetCorpTokenAsync(WechatWorkThirdPartyAuthApiGetCorpTokenRequest request)
-  - POST /cgi-bin/service/get_corp_token
 
 - async WechatResponse GetCorpTokenRawAsync(string query, string jsonBody)
 
 - async WechatWorkThirdPartyAuthApiGetAdminListResponse GetAdminListAsync(WechatWorkThirdPartyAuthApiGetAdminListRequest request)
-  - POST /cgi-bin/service/get_admin_list
 
 - async WechatResponse GetAdminListRawAsync(string query, string jsonBody)
 
 - async WechatWorkThirdPartyAuthApiGetUserInfoResponse GetUserInfoAsync(WechatWorkThirdPartyAuthApiGetUserInfoRequest request)
-  - GET /cgi-bin/service/getuserinfo3rd
 
 - async WechatResponse GetUserInfoRawAsync(string query)
 
 - async WechatWorkThirdPartyAuthApiGetUserInfoByTicketResponse GetUserInfoByTicketAsync(WechatWorkThirdPartyAuthApiGetUserInfoByTicketRequest request)
-  - POST /cgi-bin/service/getuserdetail3rd
 
 - async WechatResponse GetUserInfoByTicketRawAsync(string query, string jsonBody)
 
 - async WechatWorkThirdPartyAuthApiGetRegisterCodeResponse GetRegisterCodeAsync(WechatWorkThirdPartyAuthApiGetRegisterCodeRequest request)
-  - POST /cgi-bin/service/get_register_code
 
 - async WechatResponse GetRegisterCodeRawAsync(string query, string jsonBody)
 
 - async WechatWorkThirdPartyAuthApiGetRegisterInfoResponse GetRegisterInfoAsync(WechatWorkThirdPartyAuthApiGetRegisterInfoRequest request)
-  - POST /cgi-bin/service/get_register_info
 
 - async WechatResponse GetRegisterInfoRawAsync(string query, string jsonBody)
 
 - async WechatWorkThirdPartyAuthApiSetScopeResponse SetScopeAsync(WechatWorkThirdPartyAuthApiSetScopeRequest request)
-  - GET /cgi-bin/agent/set_scope
 
 - async WechatResponse SetScopeRawAsync(string query)
 
 - async WechatWorkThirdPartyAuthApiContactSyncSuccessResponse ContactSyncSuccessAsync(WechatWorkThirdPartyAuthApiContactSyncSuccessRequest request)
-  - GET /cgi-bin/sync/contact_sync_success
 
 - async WechatResponse ContactSyncSuccessRawAsync(string query)
 
@@ -7056,8 +6621,6 @@ ThirdPartyAuth/ThirdPartyAuthApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkThirdPartyAuthApiGetSuiteTokenRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - WechatTypedRequest request;
 
 - public WechatWorkThirdPartyAuthApiGetSuiteTokenRequest()
@@ -7208,46 +6771,35 @@ ThirdPartyAuth/ThirdPartyAuthApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkWebhookApi (class)
 
-Webhook/WebhookApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkWebhookApi(WechatWorkClient client)
 
 - async WechatWorkWebhookApiSendTextResponse SendTextAsync(WechatWorkWebhookApiSendTextRequest request)
-  - POST /cgi-bin/webhook/send
 
 - async WechatResponse SendTextRawAsync(string query, string jsonBody)
 
 - async WechatWorkWebhookApiSendTemplateCardResponse SendTemplateCardAsync(WechatWorkWebhookApiSendTemplateCardRequest request)
-  - POST /cgi-bin/webhook/send
 
 - async WechatResponse SendTemplateCardRawAsync(string query, string jsonBody)
 
 - async WechatWorkWebhookApiSendFileResponse SendFileAsync(WechatWorkWebhookApiSendFileRequest request)
-  - POST /cgi-bin/webhook/send
 
 - async WechatResponse SendFileRawAsync(string query, string jsonBody)
 
 - async WechatWorkWebhookApiSendMarkdownResponse SendMarkdownAsync(WechatWorkWebhookApiSendMarkdownRequest request)
-  - POST /cgi-bin/webhook/send
 
 - async WechatResponse SendMarkdownRawAsync(string query, string jsonBody)
 
 - async WechatWorkWebhookApiSendMarkdownV2Response SendMarkdownV2Async(WechatWorkWebhookApiSendMarkdownV2Request request)
-  - POST /cgi-bin/webhook/send
 
 - async WechatResponse SendMarkdownV2RawAsync(string query, string jsonBody)
 
 - async WechatWorkWebhookApiSendImageResponse SendImageAsync(WechatWorkWebhookApiSendImageRequest request)
-  - POST /cgi-bin/webhook/send
 
 - async WechatResponse SendImageRawAsync(string query, string jsonBody)
 
 - async WechatWorkWebhookApiSendNewsResponse SendNewsAsync(WechatWorkWebhookApiSendNewsRequest request)
-  - POST /cgi-bin/webhook/send
 
 - async WechatResponse SendNewsRawAsync(string query, string jsonBody)
 
@@ -7398,8 +6950,6 @@ Webhook/WebhookApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkWebhookApiSendTextRequest (class)
 
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
-
 - WechatTypedRequest request;
 
 - public WechatWorkWebhookApiSendTextRequest()
@@ -7424,8 +6974,6 @@ Webhook/WebhookApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkWebhookSpecialApi (class)
 
-企业微信群机器人文件上传接口，使用 webhook 键 而非 access_token。
-
 - WechatWorkClient client;
 
 - public WechatWorkWebhookSpecialApi(WechatWorkClient client)
@@ -7435,26 +6983,19 @@ Webhook/WebhookApi.cs 的 Zan 强类型接口。
 
 ## WechatWorkWorkBenchApi (class)
 
-WorkBench/WorkBenchApi.cs 的 Zan 强类型接口。
-业务参数由请求对象自动序列化，凭证由客户端配置和缓存自动补充。
-由 scripts/generate_wechat_product_apis.py 从 Senparc 微信产品 API 生成。
-
 - WechatWorkClient client;
 
 - public WechatWorkWorkBenchApi(WechatWorkClient client)
 
 - async WechatWorkWorkBenchApiSetWorkBenchTemplateResponse SetWorkBenchTemplateAsync(WechatWorkWorkBenchApiSetWorkBenchTemplateRequest request)
-  - POST /cgi-bin/agent/set_workbench_template
 
 - async WechatResponse SetWorkBenchTemplateRawAsync(string query, string jsonBody)
 
 - async WechatWorkWorkBenchApiGetWorkBenchTemplateResponse GetWorkBenchTemplateAsync(WechatWorkWorkBenchApiGetWorkBenchTemplateRequest request)
-  - GET /cgi-bin/agent/get_workbench_template
 
 - async WechatResponse GetWorkBenchTemplateRawAsync(string query)
 
 - async WechatWorkWorkBenchApiSetWorkBenchDataResponse SetWorkBenchDataAsync(WechatWorkWorkBenchApiSetWorkBenchDataRequest request)
-  - POST /cgi-bin/agent/set_workbench_data
 
 - async WechatResponse SetWorkBenchDataRawAsync(string query, string jsonBody)
 
@@ -7512,8 +7053,6 @@ WorkBench/WorkBenchApi.cs 的 Zan 强类型接口。
 
 
 ## WechatWorkWorkBenchApiSetWorkBenchTemplateRequest (class)
-
-方法请求/响应契约；可复用的 DTO 实体见 Sdk.Wechat.Models.Work。
 
 - WechatTypedRequest request;
 

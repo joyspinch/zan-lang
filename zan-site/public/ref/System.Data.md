@@ -1,338 +1,148 @@
 # System.Data
 
-> 源码: `packages/Zan.Data/src/System/Data/DbConnection.zan`, `packages/Zan.Data/src/System/Data/DbException.zan`, `packages/Zan.Data/src/System/Data/DbParams.zan`, `packages/Zan.Data/src/System/Data/DbPool.zan`, `packages/Zan.Data/src/System/Data/DbResult.zan`, `packages/Zan.Data/src/System/Data/DbTrace.zan`, `packages/Zan.Data/src/System/Data/DbValues.zan`, `packages/Zan.Data/src/System/Data/IDbConnection.zan`, `packages/Zan.Data/src/System/Data/IDbConnector.zan`, `packages/Zan.Data/src/System/Data/IDbExecutor.zan`, `packages/Zan.Data/src/System/Data/OdbcConnector.zan`, `packages/Zan.Data/src/System/Data/PoolCore.zan`, `packages/Zan.Data/src/System/Data/TracedDbConnection.zan`
+> 源码: `packages/Zan.Data/src/System/Data/DbException.zan`, `packages/Zan.Data/src/System/Data/DbParams.zan`, `packages/Zan.Data/src/System/Data/DbPool.zan`, `packages/Zan.Data/src/System/Data/DbProvider.zan`, `packages/Zan.Data/src/System/Data/DbResult.zan`, `packages/Zan.Data/src/System/Data/DbTrace.zan`, `packages/Zan.Data/src/System/Data/DbValues.zan`, `packages/Zan.Data/src/System/Data/IDbConnection.zan`, `packages/Zan.Data/src/System/Data/IDbConnector.zan`, `packages/Zan.Data/src/System/Data/IDbExecutor.zan`, `packages/Zan.Data/src/System/Data/PoolCore.zan`, `packages/Zan.Data/src/System/Data/TracedDbConnection.zan`, `packages/Zan.DataFrame/src/System/Data/DataFrame.zan`
 
 
-## DbConnection (class)
+## DataCol (class)
 
-基于平台 ODBC 驱动管理器的通用数据库连接
-（Windows 为 odbc32，Linux/macOS 为 unixODBC）。
+- string name;
 
-任何提供 ODBC 驱动的引擎都可用：SQL Server、Oracle、
-MySQL/MariaDB/TiDB/OceanBase、PostgreSQL、ClickHouse、QuestDB、Firebird 等。
-DuckDB, TDengine, 达梦DM, SQLite, ... The convenience factories 下方 build
-只需正确的连接字符串；OpenODBC 接受任意 DSN 或驱动字符串。
+- int kind;
 
-所有操作均支持协程，便于异步访问数据库。
+- List<string> text;
 
-用法：
-DbConnection db = DbConnection.OpenSqlServer("127.0.0.1", 1433,
-"app", "sa", "secret");
-db.Execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(64))");
-db.Execute("INSERT INTO users (id, name) VALUES (1, 'Alice')");
-DbResult result = db.Query("SELECT * FROM users");
-db.Close();
+- List<long> ints;
 
-DbConnection any = DbConnection.OpenODBC("DSN=mydsn;UID=u;PWD=p;");
+- List<double> nums;
 
-语句失败时抛出 `DbException`；空结果集总
-意味着「无行」，错误文本可通过 GetError() 获取。
+- static DataCol Create(string colName, int colKind)
 
-- nint handle;
+- string Name()
 
-- nint env;
+- int Kind()
 
-- int provider;
+- int Count()
 
-- string connectionString;
+- void Append(string v)
 
-- bool connected;
+- void AppendLong(long v)
 
-- string lastError;
+- void AppendDouble(double v)
 
-- [DllImport("odbc32")]static extern int SQLAllocHandle(int handleType, nint inputHandle, string outputHandle);
+- void AppendFrom(DataCol src, int srcRow)
 
-- [DllImport("odbc32")]static extern int SQLSetEnvAttr(nint env, int attr, nint valuePtr, int strLen);
+- void PutStr(int row, string v)
 
-- [DllImport("odbc32")]static extern int SQLDriverConnect(nint dbc, nint hwnd, string inConn, int inLen, string outConn, int outBufLen, string outLenPtr, int completion);
+- void PutLong(int row, long v)
 
-- [DllImport("odbc32")]static extern int SQLExecDirect(nint stmt, string sql, int textLength);
+- void PutDouble(int row, double v)
 
-- [DllImport("odbc32")]static extern int SQLPrepare(nint stmt, string sql, int textLength);
+- string GetStr(int row)
 
-- [DllImport("odbc32")]static extern int SQLBindParameter(nint stmt, int ipar, int ptype, int ctype, int sqltype, long colDef, int scale, string valuePtr, long valueMax, byte[]indPtr);
-  - 真参数绑定：值经驱动以数据形式上线，永不拼回
-    SQL 文本——注入与转义方言问题在此一并消失。
-    常量：1=SQL_PARAM_INPUT，1=SQL_C_CHAR，12=SQL_VARCHAR。
+- long GetLong(int row)
 
-- [DllImport("odbc32")]static extern int SQLExecute(nint stmt);
+- double GetDouble(int row)
 
-- [DllImport("odbc32")]static extern int SQLNumResultCols(nint stmt, string colCountPtr);
 
-- [DllImport("odbc32")]static extern int SQLDescribeCol(nint stmt, int colNum, string colName, int bufLen, string nameLenPtr, string typePtr, string sizePtr, string decPtr, string nullPtr);
+## DataFrame (class)
 
-- [DllImport("odbc32")]static extern int SQLFetch(nint stmt);
+- List<DataCol> cols;
 
-- [DllImport("odbc32")]static extern int SQLGetData(nint stmt, int colNum, int targetType, string buf, int bufLen, string strLenOrIndPtr);
+- int rowCount;
 
-- [DllImport("odbc32")]static extern int SQLRowCount(nint stmt, string rowCountPtr);
+- DataFrame()
 
-- [DllImport("odbc32")]static extern int SQLFreeHandle(int handleType, nint handle);
+- static DataFrame New()
 
-- [DllImport("odbc32")]static extern int SQLDisconnect(nint dbc);
+- static DataFrame FromCsv(string text)
 
-- [DllImport("odbc32")]static extern int SQLFreeStmt(nint stmt, int option);
+- static int InferKind(CsvTable t, int at)
 
-- [DllImport("odbc32")]static extern int SQLGetDiagRec(int handleType, nint handle, int recNum, string sqlState, string nativeErrPtr, string msgBuf, int msgBufLen, string msgLenPtr);
+- static bool LooksInt(string s)
 
-- [DllImport("odbc")]static extern int SQLAllocHandle(int handleType, nint inputHandle, string outputHandle);
+- static bool LooksFloat(string s)
 
-- [DllImport("odbc")]static extern int SQLSetEnvAttr(nint env, int attr, nint valuePtr, int strLen);
+- DataFrame AddColumn(string name, int kind)
 
-- [DllImport("odbc")]static extern int SQLDriverConnect(nint dbc, nint hwnd, string inConn, int inLen, string outConn, int outBufLen, string outLenPtr, int completion);
+- int Rows()
 
-- [DllImport("odbc")]static extern int SQLExecDirect(nint stmt, string sql, int textLength);
+- int ColCount()
 
-- [DllImport("odbc")]static extern int SQLPrepare(nint stmt, string sql, int textLength);
+- List<string> Names()
 
-- [DllImport("odbc")]static extern int SQLBindParameter(nint stmt, int ipar, int ptype, int ctype, int sqltype, long colDef, int scale, string valuePtr, long valueMax, byte[]indPtr);
-  - 同上：POSIX 侧 odbc 驱动管理器的真参数绑定。
+- int ColIndex(string name)
 
-- [DllImport("odbc")]static extern int SQLExecute(nint stmt);
+- int Kind(string name)
 
-- [DllImport("odbc")]static extern int SQLNumResultCols(nint stmt, string colCountPtr);
+- int AddRow()
 
-- [DllImport("odbc")]static extern int SQLDescribeCol(nint stmt, int colNum, string colName, int bufLen, string nameLenPtr, string typePtr, string sizePtr, string decPtr, string nullPtr);
+- void AddStrRow(params string[]cells)
 
-- [DllImport("odbc")]static extern int SQLFetch(nint stmt);
+- void AddFloatRow(params double[]cells)
 
-- [DllImport("odbc")]static extern int SQLGetData(nint stmt, int colNum, int targetType, string buf, int bufLen, string strLenOrIndPtr);
+- DataCol ColOrThrow(string name)
 
-- [DllImport("odbc")]static extern int SQLRowCount(nint stmt, string rowCountPtr);
+- string GetStr(int row, int col)
 
-- [DllImport("odbc")]static extern int SQLFreeHandle(int handleType, nint handle);
+- string GetStr(int row, string col)
 
-- [DllImport("odbc")]static extern int SQLDisconnect(nint dbc);
+- long GetInt(int row, int col)
 
-- [DllImport("odbc")]static extern int SQLFreeStmt(nint stmt, int option);
+- long GetInt(int row, string col)
 
-- [DllImport("odbc")]static extern int SQLGetDiagRec(int handleType, nint handle, int recNum, string sqlState, string nativeErrPtr, string msgBuf, int msgBufLen, string msgLenPtr);
+- double GetFloat(int row, int col)
 
-- DbConnection()
-  - 空连接；外部经各 Open* 工厂构造。
+- double GetFloat(int row, string col)
 
-- static nint HandleFromBuf(string p)
-  - 重建写入 out 缓冲区中的 64 位句柄/指针。
-    64 位平台上句柄为指针大小（8 字节），因此必须读回全部八个
-    小端字节。
+- void SetStr(int row, int col, string v)
 
-- static int Int16FromBuf(string p)
-  - 从 out 缓冲区读取 16 位小端值。
+- void SetStr(int row, string col, string v)
 
-- static int ScanNul(string buf, int max)
-  - 驱动填充的文本缓冲区中第一个 NUL 字节的索引。
+- void SetInt(int row, int col, long v)
 
-- static string BufToString(string buf, int max)
-  - 将 NUL 结尾的 C 缓冲区复制为 Zan 字符串。
+- void SetInt(int row, string col, long v)
 
-- static bool OdbcSuccess(int rc)
-  - ODBC 返回码是否成功（SQL_SUCCESS=0 或 SQL_SUCCESS_WITH_INFO=1）。
+- void SetFloat(int row, int col, double v)
 
-- static DbConnection OpenODBC(string connectionString)
-  - 用完整的 ODBC 连接字符串 / DSN 打开任意数据源。
+- void SetFloat(int row, string col, double v)
 
-- static DbConnection OpenSqlServer(string host, int port, string database, string user, string password)
-  - 打开 Microsoft SQL Server。
+- DataFrame Filter(RowFn fn)
 
-- static IDbConnection OpenMySQL(string host, int port, string database, string user, string password)
-  - 打开 MySQL / MariaDB / TiDB / OceanBase。优先使用原生
-    线协议客户端（System.Data.MySql）——无需安装 ODBC 驱动，
-    不可用时回退到 ODBC 驱动。
+- List<int> AllRows()
 
-- static IDbConnection OpenMariaDB(string host, int port, string database, string user, string password)
-  - 打开 MariaDB（默认使用原生 MySQL 协议）。
+- DataFrame SortBy(string col, bool desc)
 
-- static DbConnection OpenPostgreSQL(string host, int port, string database, string user, string password)
-  - 通过 psqlODBC 驱动打开 PostgreSQL。
+- static void MergeSort(List<int> idx, List<int> tmp, int lo, int hi, RowCmpFn cmp)
 
-- static DbConnection OpenOpenGauss(string host, int port, string database, string user, string password)
-  - 通过 PostgreSQL ODBC 驱动打开 openGauss / GaussDB。
+- List<RowGroup> GroupBy(string col)
 
-- static DbConnection OpenKingbase(string host, int port, string database, string user, string password)
-  - Opens KingbaseES / 人大金仓 via the PostgreSQL ODBC driver.
+- double Aggregate(List<int> rows, string col, int op)
 
-- static DbConnection OpenQuestDB(string host, int port, string user, string password)
-  - 通过 PostgreSQL ODBC 驱动打开 QuestDB。
+- double Sum(List<int> rows, string col)
 
-- static DbConnection OpenOracle(string host, int port, string service, string user, string password)
-  - 打开 Oracle（dbq = host:port/service）。
+- double Avg(List<int> rows, string col)
 
-- static DbConnection OpenFirebird(string host, int port, string dbPath, string user, string password)
-  - 打开 Firebird（嵌入式或服务器模式）。
+- double Min(List<int> rows, string col)
 
-- static DbConnection OpenClickHouse(string host, int port, string database, string user, string password)
-  - 打开 ClickHouse。
+- double Max(List<int> rows, string col)
 
-- static DbConnection OpenTDengine(string host, int port, string database, string user, string password)
-  - 打开 TDengine。
+- DataFrame Join(DataFrame right, string keyCol, string rightKeyCol)
 
-- static DbConnection OpenDuckDB(string path)
-  - 打开 DuckDB 数据库（嵌入式 OLAP）。
-
-- static DbConnection OpenDM(string host, int port, string user, string password)
-  - Opens 达梦 DM.
-
-- static DbConnection OpenSQLite(string path)
-  - 通过 SQLite ODBC 驱动打开 SQLite 文件。
-    如需免依赖的嵌入式访问，请使用 System.Data.Sqlite.SqliteConnection。
-
-- static DbConnection OpenWith(string connectionString, int provider)
-  - 全部工厂的落点：分配 ODBC 环境/连接句柄并 SQLDriverConnect；
-    失败时 connected=false，lastError 记录静态描述与诊断文本。
-
-- nint AllocStmt()
-  - 分配语句句柄（SQL_HANDLE_STMT = 3）；失败时返回 0。
-
-- void Fail()
-  - 抛出记录的失败。provider 指明来自哪个引擎，
-    处理方无需解析消息即可分支处理；错误文本仍可通过
-    `GetError` 获取。
-
-- void Diagnose(int handleType, nint h)
-  - 把最近一条 ODBC 诊断记录的文本读进 lastError，替代
-    纯静态描述——"SQLExecDirect failed" 不告诉用户是列名拼错还是
-    表不存在，驱动的诊断文本才会。句柄无效或没有记录时不改动
-    lastError（静态描述兜底）。只取第一条记录：ODBC 的失败原因
-    几乎总在第一条。
-
-- int Execute(string sql)
-  - 执行非查询语句（INSERT/UPDATE/DELETE/DDL）。
-    失败时抛出 `DbException`。
-
-- int BindParams(nint stmt, DbParams prms, List<string> keepValues, List <byte[]> keepInds)
-  - 把 prms 绑定为 ODBC 输入参数。全部按 SQL_C_CHAR /
-    SQL_VARCHAR 以数据形式传输（类型由列侧隐式转换），NULL 用
-    指示符 SQL_NULL_DATA(-1) 表达。值与指示符缓冲必须活到
-    SQLExecute 完成之后——ARC 不移动对象，地址稳定，但引用
-    断了内存就没了；调用方持有 keepAlive 列表跨过 await。
-    返回绑定的参数个数，失败返回 -1。
-
-- async int ExecuteAsync(string sql)
-  - 执行非查询语句。SQLPrepare carries the managed SQL string
-    synchronously; handle-only SQLExecute crosses the blocking boundary.
-    带 prms 时走真参数绑定：占位符就是 ODBC 原生的 `?`，
-    不再做任何文本内联。失败时抛出 `DbException`。
-
-- async int ExecuteAsync(string sql, DbParams prms)
-  - 带参数版本：同样的 SQLPrepare/SQLExecute 拆分，占位符为 ODBC `?`。
-
-- async int ExecuteCoreAsync(string sql, DbParams prms)
-  - Prepare +（可选）绑定参数 + 阻塞卸载的 SQLExecute；返回受影响行数，
-    失败抛 `DbException`。
-
-- async DbResult QueryAsync(string sql)
-  - 执行查询并返回结果集。带 prms 时走真参数绑定
-    （见 ExecuteCoreAsync）。失败时抛出
-    `DbException`，因此空结果总意味着「无行」。
-
-- async DbResult QueryAsync(string sql, DbParams prms)
-  - 带参数版本：真参数绑定（见 `BindParams`），语义同无参重载。
-
-- async DbResult QueryCoreAsync(string sql, DbParams prms)
-  - Prepare + 执行 + 描述列名 + 逐行 SQLGetData 取值（NULL 按指示符识别）；
-    失败抛 `DbException`。
-
-- DbResult Query(string sql)
-  - 同步查询（阻塞调用线程——服务端代码请改用
-    QueryAsync）。SQLExecDirect 直发，无参数版本。
-    失败时抛出 `DbException`。
-
-- string ExecuteScalar(string sql)
-  - 执行标量查询（以字符串形式返回第一行第一列）。
-
-- string ExecuteScalar(string sql, DbParams prms)
-  - 带参数的 ExecuteScalar（语义同无参版本）；无行时返回空串。
-
-- async string ExecuteScalarAsync(string sql)
-  - 执行标量查询; see QueryAsync for the SQLPrepare/SQLExecute
-    split used by this provider.
-
-- async string ExecuteScalarAsync(string sql, DbParams prms)
-  - 带参数的 ExecuteScalar（语义同无参版本）。
-
-- async bool BeginTransactionAsync()
-  - 执行 BEGIN 开启事务的协程版本，恒返回 true。
-
-- async bool CommitAsync()
-  - 执行 COMMIT 提交事务的协程版本，恒返回 true。
-
-- async bool RollbackAsync()
-  - 执行 ROLLBACK 回滚事务的协程版本，恒返回 true。
-
-- string GetError()
-  - 获取此连接记录的最后一条错误信息。
-
-- void BeginTransaction()
-  - 开始事务。
-
-- void Commit()
-  - 提交当前事务。
-
-- void Rollback()
-  - 回滚当前事务。
-
-- void Close()
-  - 关闭连接并释放 ODBC 句柄。
-
-- bool IsConnected()
-  - 连接当前有效时为 true。
-
-- int GetProvider()
-  - 返回 provider 类型。
-
-- int Execute(string sql, DbParams prms)
-  - 执行带参数的非查询语句（同步）。真参数绑定，
-    与异步路径一致——`?` 是 ODBC 原生占位符，值以数据形式
-    上线，不再有任何文本内联。失败时抛出
-    `DbException`。
-
-- DbResult Query(string sql, DbParams prms)
-  - 执行带参数的查询（同步）。真参数绑定，取数逻辑与
-    无参 Query 共用同一形状。失败时抛出
-    `DbException`。
-
-- void Dispose()
-  - 释放连接持有的资源（实现 IDisposable，等同于 Close）。
+- string ToCsv()
 
 
 ## DbException (class)
 
-语句执行失败时抛出：服务端拒绝执行、会话未
-连接，或驱动无法完成请求。所有内置驱动
-（ODBC、SQLite、PostgreSQL、MySQL、SQL Server、
-Firebird、TDengine）对语句失败一律抛出本异常，
-而不是以空结果或 -1 掩盖——因此空结果集
-总意味着「无行」；错误文本仍可通过驱动的
-<c>GetError()</c> 获取。
-
-`Code` 是驱动自身的错误号（Firebird SQL 代码、
-MySQL 错误号、SQL Server 错误号、SQLite 返回码、TDengine 代码）；当失败
-未到达服务器时为 0。`Provider` 是
-`DbProvider` 的 id，处理方无需解析消息即可知道
-是哪个驱动抛出的异常。
-
 - public int Code;
-  - 驱动自身的错误号；失败未到达服务器时为 0。
 
 - public int Provider;
-  - 抛出异常的驱动在 `DbProvider` 中的 id。
 
 - public DbException(string message, int code, int provider)
-  - 构造异常；<c>code</c> 为驱动错误号，<c>provider</c> 为
-    `DbProvider` 的 id。
 
 - static DbException Of(string message)
-  - 从未到达服务器的失败，因此不带错误号
-    也没有 provider。
 
 
 ## DbParam (class)
-
-一个带类型的 SQL 参数：类型加上 text/int/double 载荷
-（仅与类型匹配的字段有意义）。用一个实体代替四个
-索引对齐的平行列表。整数载荷是 64 位的：KindInt 在各驱动上
-都按 64 位整数绑定（sqlite3_bind_int64、MYSQL_TYPE_LONGLONG…），
-窄一点的载荷会把毫秒/微秒累计这类值截断。
 
 - int kind;
 
@@ -347,180 +157,81 @@ MySQL 错误号、SQL Server 错误号、SQLite 返回码、TDengine 代码）�
 
 ## DbParams (class)
 
-有序、带类型的 SQL 参数列表，所有数据库驱动共用。
-
-值携带自身类型（int / double / text / null），驱动可
-原生绑定它们（sqlite3_bind_*、COM_STMT_EXECUTE、PQexecParams、
-SQLBindParameter），而不是把转义字符串内联进 SQL。
-
-用法：
-DbParams p = new DbParams().Add("Alice").AddInt(30);
-DbResult r = db.Query("SELECT * FROM users WHERE name = ? AND age > ?", p);
-
 - static int KindNull=0;
-  - NULL 参数的类型码。
 
 - static int KindInt=1;
-  - 整数参数的类型码（各驱动按 64 位绑定）。
 
 - static int KindDouble=2;
-  - 双精度浮点参数的类型码。
 
 - static int KindText=3;
-  - 文本参数的类型码。
 
 - List<DbParam> items;
 
 - DbParams()
 
 - void push(int kind, string t, long i, double d)
-  - 按类型码追加一个参数（Add*/AddInt 等的公共入口）。
 
 - DbParams Add(string val)
-  - 追加一个文本参数。null 字符串绑定为 SQL NULL——
-    未设置的实体字段必须以 NULL 写入数据库，绝不能是
-    解引用后的空字符串。
 
 - DbParams AddInt(int val)
-  - 追加一个整数参数。
 
 - DbParams AddLong(long val)
-  - 追加一个 64 位整数参数。
 
 - DbParams AddDouble(double val)
-  - 追加一个浮点参数。
 
 - DbParams AddNull()
-  - 追加一个 NULL 参数。
 
 - int Count()
-  - 参数数量。
 
 - int KindAt(int i)
-  - 索引 i 处参数的类型（参见 Kind* 常量）。
 
 - string TextAt(int i)
-  - 索引 i 处的文本值（KindAt(i) == KindText 时有效）。
 
 - long IntAt(int i)
-  - 索引 i 处的整数值（KindAt(i) == KindInt 时有效）。
 
 - double DoubleAt(int i)
-  - 索引 i 处的双精度值（KindAt(i) == KindDouble 时有效）。
 
 - string AsText(int i)
-  - 将索引 i 处的参数转为文本（供把所有值都绑定为文本的驱动使用，
-    如 PQexecParams）。
 
 - bool IsNull(int i)
-  - 索引 i 处的参数是否为 NULL。
 
 
 ## DbPool (class)
-
-与驱动无关、支持协程的连接池。
-
-连接通过 `IDbConnector` 惰性打开，最多
-<c>maxSize</c> 个，并在协程间复用。当所有连接
-都被借出且达到上限时，`AcquireAsync` 会挂起
-调用协程，等待基于事件的 `Gate`（无轮询、无
-定时器），而不是阻塞工作线程；一旦有连接
-通过 `Release` 归还便立即恢复。已失效的连接
-会被逐出而非回收，把名额让给等待者。
-
-连接池的共享状态（空闲/借出列表）由 `PoolCore`
-管理：池可能被不同 worker 线程上的协程同时访问，
-每处访问都必须在锁内进行——早期版本假设"只在 await
-之间访问、无需加锁"，在多 worker 下导致过真实崩溃。
-
-用法：
-DbPool pool = SqliteConnector.Pool("app.sqlite3", 8);
-IDbConnection db = await pool.AcquireAsync();
-DbResult r = db.Query("SELECT * FROM users");
-pool.Release(db);
-pool.Close();
-
-查询本身即为协程的驱动（MySQL、PostgreSQL）还提供
-类型化连接池——<c>MySqlPool</c>、<c>PgPool</c>——返回
-具体连接类型，使 <c>QueryAsync</c> 仍可调用。
 
 - IDbConnector connector;
 
 - PoolCore<IDbConnection> core;
 
+- string lastOpenError;
+
 - DbPool(IDbConnector connector, int maxSize)
-  - 由各 Connector 的 <c>Pool()</c> 工厂构造（构造器不公开）。
 
 - async IDbConnection OpenOne()
-  - 经 connector 打开一个新连接。
 
 - async IDbConnection AcquireAsync()
-  - 借出一个连接：复用空闲连接，未达上限时新建，
-    否则挂起协程直到有连接被释放。饱和等待有硬上限
-    （见 `PoolWait`）：超时返回 null，调用方按
-    「数据库暂不可用」应答，绝不定死——任何「持着一条连接再等
-    第二条」的嵌套租借缺陷只会退化成个别请求 503，而不是把整个
-    worker 拖成永久假死（实测教训：协程死锁时 CPU 空转、端口照收、
-    全站无响应）。
-    连接池关闭后同样返回 null。
 
 - void Release(IDbConnection c)
-  - 将连接归还连接池。已损坏或 Close() 之后
-    的连接会被关闭丢弃，不再入池。
 
 - IDbConnection TryAcquire()
-  - 借出已空闲的连接而不挂起；没有空闲连接时
-    返回 null。适用于同步调用点（非协程的钩子或
-    解析器），且驱动 IO 本身是同步的；它从不新建连接，因为
-    打开连接是协程操作，所以应在启动时用
-    `WarmupAsync` 预热连接池，并把 null 视为
-    "容量已耗尽"。归还方式与借出的连接相同。
 
 - async int WarmupAsync(int count)
-  - 最多打开 <paramref name="count"/> 个连接（上限为
-    maxSize）并停放，使首批请求——以及每次
-    `TryAcquire` 的调用方——都能拿到活跃连接。返回
-    当前空闲的数量；数据库不可达时返回 0。
 
 - int IdleCount()
-  - 空闲（已入池、可即用）连接数。
 
 - int LiveCount()
-  - 活跃连接总数（空闲 + 已借出）。
 
 - int WaitingCount()
-  - 当前挂起等待连接的协程数。
 
 - int MaxSize()
-  - 并发活跃连接的最大数量。
 
 - bool IsClosed()
-  - `Close` 调用过后为 true。
 
 - int GetProvider()
-  - 此连接池服务的 `DbProvider` id。
 
 - void Close()
-  - 关闭所有空闲连接并将连接池标记为已关闭。仍
-    被借出的连接会在归还时关闭。
 
 
 ## DbProvider (class)
-
-FreeSQL 风格 ORM 支持的数据库 provider 类型。
-
-默认的 `DbConnection` 即可连接其中大多数引擎
-通过 its ODBC driver (the "对应的驱动"), so a single, dependency-light
-其连接类型服务于整个 ORM。另有原生、更高性能的驱动
-可供选择：
-- System.Data.MySql：原生 MySQL/MariaDB 线协议（无需 ODBC；
-OpenMySQL 自动选用它，因为无需
-外部驱动）。
-- System.Data.Sqlite：通过 sqlite3 C 库使用嵌入式 SQLite。
-- System.Data.Postgres：PostgreSQL 及兼容 PG 线协议的引擎（openGauss、
-KingbaseES/人大金仓, Vastbase, GaussDB, QuestDB) via libpq.
-- System.Data.TDengine：通过 taosAdapter REST API 访问 TDengine（无需任何客户端
-库）。
 
 - static int Unknown=0-1;
 
@@ -557,9 +268,6 @@ KingbaseES/人大金仓, Vastbase, GaussDB, QuestDB) via libpq.
 
 ## DbResult (class)
 
-表示一次数据库查询的结果集。
-以字符串值列表存储各行，并附带列名元数据。
-
 - List<DbRow> rows;
 
 - List<string> columnNames;
@@ -571,150 +279,91 @@ KingbaseES/人大金仓, Vastbase, GaussDB, QuestDB) via libpq.
 - DbResult()
 
 - static DbResult Empty()
-  - 创建空结果（无行）。
 
 - void SetColumnCount(int count)
-  - 设置列数。
 
 - void AddColumnName(string name)
-  - 添加一个列名。
+
+- void AddRowCells(List<DbCell> cells, List<string> texts)
 
 - void AddRow(List<string> row)
-  - 添加一行值（不含 SQL NULL）。
 
 - void AddRowNulls(List<string> row, List<bool> nullFlags)
-  - 添加一行，并附逐列的 SQL NULL 标记，调用方
-    可通过 IsNull() 区分 NULL 与空字符串。
 
 - bool IsNull(int row, int col)
-  - 单元格为 SQL NULL 时为 true（空字符串则相反，
-    GetString 对空字符串同样返回 ""）。
 
 - bool IsNullByName(int row, string columnName)
-  - 按列名检查是否为 NULL。
 
 - int RowCount()
-  - 返回行数。
 
 - int ColumnCount()
-  - 返回列数。
 
 - string GetString(int row, int col)
-  - 获取指定行列索引处的字符串值。
 
 - int GetInt(int row, int col)
-  - 获取指定行列索引处的整数值。
 
 - long GetLong(int row, int col)
-  - 获取指定行列索引处的 64 位整数值。
 
 - double GetDouble(int row, int col)
-  - 获取指定行列索引处的双精度值。
 
 - bool GetBool(int row, int col)
-  - 获取指定行列索引处的布尔值。
 
 - string GetByName(int row, string columnName)
-  - 按行索引和列名取值。
 
 - int GetColumnIndex(string name)
-  - 按列名获取列索引。内部带有懒加载字典索引缓存，将大数据量高频调用从 O(N) 线性扫描降为 O(1)。
 
 - string GetColumnName(int index)
-  - 获取指定索引处的列名。
 
 - List<string> GetColumnNames()
-  - 返回所有列名（内部列表的副本，调用方改动
-    不会影响本结果集）。
 
 - bool HasRows()
-  - 检查结果集是否包含行。
 
 - DbRow RowAt(int index)
-  - 返回指定索引处的只读行实体（零列表克隆，大数据量循环极速读取推荐）。
 
 - List<string> GetRow(int index)
-  - 将整行作为字符串列表返回（内部行的副本）。
 
 - List<string> First()
-  - 获取第一行（便捷方法）。
 
 - void Print()
-  - 将结果集打印到控制台（用于调试）。
 
 
 ## DbRow (class)
 
-一行结果：各单元格的字符串值及逐格的 SQL NULL 标记。
-用单一实体承载，避免值与 NULL 标记脱节。
+- List<DbCell> cells;
 
-- List<string> values;
+- List<string> texts;
 
-- List<bool> nulls;
-
-- DbRow(List<string> values, List<bool> nulls)
+- DbRow(List<DbCell> cells, List<string> texts)
 
 - int Count()
-  - 返回该行的字段总数。
 
 - string GetString(int col)
-  - 获取指定列索引处的字符串值。
 
 - bool IsNull(int col)
-  - 指定列是否为 SQL NULL。
 
 - int GetInt(int col)
-  - 获取指定列索引处的整数值。
 
 - long GetLong(int col)
-  - 获取指定列索引处的 64 位整数值。
 
 - double GetDouble(int col)
-  - 获取指定列索引处的双精度浮点值。
 
 - bool GetBool(int col)
-  - 获取指定列索引处的布尔值。
 
 
 ## DbTrace (class)
 
-Where timed statements are reported, set once at startup by the application
-that wants them. Nothing here knows what a metric or a log file is: the sink
-is a delegate, so the data layer stays free of the monitoring it feeds.
-
-Without a sink the whole thing costs one null check and no clock read --
-timing is not something a library should charge for when nobody is reading.
-
-
-DbTrace.Sink(Program.SqlTrace);                 // once, at startup
-IDbConnection db = TracedDbConnection.Wrap(await pool.AcquireAsync());
-
 - static SqlTraceSink sink=null;
 
 - static void Sink(SqlTraceSink fn)
-  - Sends every timed statement to `fn`; null stops tracing.
-    The sink runs on the coroutine that ran the statement, right after it
-    finished, so it must not itself go to the database that is being traced
-    -- that is a statement reporting a statement, without end.
 
 - static bool Enabled()
-  - Whether anything is listening. Call sites use it to skip the
-    wrapper and the clock entirely.
 
 - static long NowUs()
-  - Monotonic microseconds: the reading a duration is measured from.
-    Monotonic, because a statement timed across an NTP correction would
-    otherwise be reported as hours long (or negative).
 
 - static void Report(string sql, long startUs)
-  - Reports the statement that started at `startUs` (a
-    `NowUs` reading) as having just finished.
 
 
 ## DbValue (class)
-
-一个动态列值：列名、类型（使用
-`DbParams` 的 Kind* 代码）及匹配该类型的载荷。
 
 - string name;
 
@@ -731,154 +380,48 @@ IDbConnection db = TracedDbConnection.Wrap(await pool.AcquireAsync());
 
 ## DbValues (class)
 
-用于仅存在于运行期数据的有序、带类型列集合——如
-提交的表单、解析出的 JSON 主体、电子表格行——使动态写入
-无需手写 SQL：
-
-DbValues form = new DbValues()
-.Set(BlogCols.title, "hello")
-.Set(BlogCols.clicks, 5);
-
-db.Insert<Blog>().AppendDict(form).ExecuteAffrows();
-db.Update<Blog>().SetDict(form).Where(a => a.id == id).ExecuteAffrows();
-
-生成的代码会校验键是否属于实体的列，且
-值始终作为参数绑定，绝不内联进 SQL 文本。
-ORM 生成的 `<Entity>Cols` 类为列名提供
-自动补全，代替裸字符串字面量。
-
 - List<DbValue> items;
 
 - DbValues()
 
 - DbValues Set(string name, string val)
-  - 设置文本列（覆盖之前的值）。
 
 - DbValues Set(string name, int val)
-  - 设置整数列。
 
 - DbValues Set(string name, long val)
-  - 设置 64 位整数列。
 
 - DbValues Set(string name, double val)
-  - 设置浮点列。
 
 - DbValues Set(string name, bool val)
-  - 设置布尔列（以 0/1 存储）。
 
 - DbValues SetNull(string name)
-  - 将列设置为 SQL NULL。
 
 - DbValues push(string name, int kind, string t, long i, double d)
-  - 追加一列；同名列已存在时原位覆盖（保持首次出现的顺序）。
 
 - int Count()
-  - 现有列数。
 
 - string NameAt(int i)
-  - 索引 i 处的列名。
 
 - int KindAt(int i)
-  - 索引 i 处值的类型（参见 DbParams.Kind*）。
 
 - int IndexOf(string name)
-  - 列的索引，不存在时为 -1。
 
 - bool Has(string name)
-  - 列是否存在。
 
 - DbValues Remove(string name)
-  - 移除某列，使写入时不再处理它。
 
 - void BindTo(DbParams ps, int i)
-  - 按原样把索引 i 处的值追加到参数列表。
 
 - void BindAs(DbParams ps, int i, int want)
-  - 把索引 i 处的值转换为列声明的
-    类型（DbParams.Kind* 代码），使所有字段以文本形式携带的表单
-    其 INTEGER 列仍能按数字绑定。无法转换的值
-    会抛出指明列名的 Exception，而不是
-    到达数据库时以类型错误的形式暴露。
 
 - long parseInt(DbValue v)
-  - 严格解析文本为 64 位整数：接受可选正负号与纯数字，
-    "true"/"false" 分别为 1/0；任何其他形状抛出 reject。
 
 - double parseDouble(DbValue v)
-  - 严格解析文本为双精度数：可选正负号、数字与至多一个小数点，
-    其余字符（包括空格之外的内容）抛出 reject。
 
 - void reject(DbValue v, string want)
-  - 抛出指明列名、原值与目标类型的转换失败异常。
-
-
-## OdbcConnector (class)
-
-基于通用 ODBC `DbConnection` 实现的 `IDbConnector`，
-因此凡是通过 DSN/驱动可访问的引擎都能获得与原生驱动相同的
-协程感知连接池。
-
-ODBC 调用是同步的，所以连接池只提供生命周期管理——
-连接复用与并发连接上限，等待者以协程挂起
-而非阻塞线程——并非非阻塞 IO。
-
-用法：
-DbPool pool = OdbcConnector.Pool("DSN=mydb;UID=u;PWD=p", DbProvider.ODBC, 8);
-IDbConnection db = await pool.AcquireAsync();
-DbResult r = db.Query("SELECT 1");
-pool.Release(db);
-
-- string connectionString;
-
-- int provider;
-
-- OdbcConnector(string connectionString, int provider)
-
-- static DbPool Pool(string connectionString, int provider, int maxSize)
-  - 根据连接字符串构建的 ODBC 连接池。
-
-- async IDbConnection ConnectAsync()
-  - 打开一个新连接。ODBC 调用是同步的：打开在调用线程完成，
-    返回的连接可立即使用（协程在此不挂起）。
-
-- int GetProvider()
-  - 池的 provider id（构造时传入）。
 
 
 ## PoolCore (class)
-
-所有驱动连接池共享的簿记数据：空闲列表、
-存活/等待计数器、唤醒闸门和关闭标志。驱动连接池
-只保留端点参数和自身的建连方式
-（通常为协程），其余都委托到这里。
-
-核心本身从不直接接触连接——既不做活性探测，也
-不关闭任何连接——因此适用于任意连接类型，包括
-接口类型 `DbPool`。驱动连接池负责判断
-从空闲列表取出的连接是否仍可用，并报告结论
-——通过 `Pool` 或 `Drop`。
-
-簿记状态被多个 worker 线程共享：协程在 per-worker
-就绪队列上运行（<c>--async-workers</c> / <c>ZAN_CO_WORKERS</c>），
-同一个池会被不同线程上的协程同时获取和归还。因此每一处
-状态访问都在 <c>lock (this)</c> 里完成——没有它，`TakeIdle`
-的"先查 Count 再取下标"就会在两个线程间被撕开
-（实测崩溃：list index out of bounds）。监视器是可重入的，
-所以内部辅助方法照常调用。
-
-临界区里绝不 await：所有方法都是同步的，锁只覆盖几条
-列表/计数操作，因此持锁期间协程不会被挂起，也不会
-把锁带过调度点。停泊逻辑留在驱动连接池中——<c>EnterWait</c>、
-<c>await core.WaitForRelease(...)</c>、<c>LeaveWait</c>——因此挂起的协程
-正是调用方所等待的那个协程，等待的 await 也发生在锁之外。
-
-「等不到连接」对单个获取者必须有界：饱和等待由
-`PoolWait` / `WaitForRelease` 统一兜底——先停泊在
-事件门上（归还即醒），门等次数用尽后转短轮询直至预算耗尽，
-返回 false 让调用方快速失败。任何嵌套租借（持一条再等第二条）
-或漏归还因此只退化成个别请求拿不到连接，而不是把协程永久停在
-门上把整个池拖死（实测教训：协程死锁时 CPU 空转、端口照收、
-全站无响应）。
 
 - int maxSize;
 
@@ -901,378 +444,237 @@ pool.Release(db);
 - int retryEvery;
 
 - PoolCore(int maxSize)
-  - 创建核心，存活连接数上限为 <paramref name="maxSize"/>
-    （至少一个）。
 
 - T TakeIdle()
-  - 从空闲列表取出最近归还的连接，
-    列表为空时返回 null。调用方检查其是否仍可用，
-    对停泊期间已失效的连接调用 `Drop`
-    （服务器重启、空闲超时）。
 
 - void Pool(T c)
-  - 将可用连接放入空闲列表并唤醒一个等待者。
-    仅接受当前处于借出状态的连接，重复归还会被忽略。
 
 - void Drop(T c)
-  - 登记一条永久离开连接池的连接（关闭、
-    损坏或被驱逐）：释放其槽位，等待者可新建
-    连接顶替它。
-    
-    只有确实从借出列表里摘下来时才归还槽位：否则重复
-    归还（同一条连接被 Release/Drop 两次）会把 liveCount
-    减到实际连接数以下，池子就会开出超过 maxSize 的连接。
 
 - void Borrow(T c)
-  - 记录新打开的连接已借出。在 `TryReserve`
-    预留槽位并成功打开后调用。
 
 - bool TryReserve()
-  - 为即将打开的连接预留槽位。预先
-    预留可防止并发获取者同时判定
-    有空位而超出上限。
 
 - void UndoReserve()
-  - 归还因打开失败而空出的槽位，并让等待者重试。
 
 - bool RemoveBorrowed(T c)
-  - 从借出列表摘除 c；c 确在列表中时返回 true
-    （Pool/Drop 以此拒绝重复归还）。
 
 - bool OpenBlocked()
-  - 建连失败后，本次获取是否应跳过建连尝试。
-    
-    后端不可达时，池里永远没有空闲连接，于是每个获取者都会
-    重新尝试建连；建连失败本身是有代价的（一次失败的
-    sqlite3_open 约 125us，网络驱动还要等一个 RTT 或超时），
-    代价会摊到每个请求上。失败后只放行每 <c>retryEvery</c>
-    次获取中的一次去真正重试，其余立即失败，让后端宕机变成
-    快速失败而不是吞吐塌方；重试一旦成功便恢复常态。
-    不依赖时钟，因此各平台行为一致。
 
 - void NoteOpenFailed()
-  - 登记一次失败的建连，开启（或延续）退避。
 
 - void NoteOpenOk()
-  - 登记一次成功的建连，结束退避。
 
 - bool OpenFailing()
-  - 最近一次建连是否失败（即连接池是否处于退避中）。
 
 - Gate Waiter()
-  - 连接池饱和时停泊获取者的闸门。其计数
-    语义加上调用方的复查循环，可保证不丢失唤醒。
 
 - void EnterWait()
-  - 在协程 await 闸门之前，将其登记为停泊状态，
-    这样释放者就知道必须发信号唤醒。
 
 - void LeaveWait()
-  - 注销从闸门唤醒的协程。
 
 - int IdleCount()
-  - 空闲（已入池、立即可用）连接数。
 
 - int LiveCount()
-  - 存活连接总数（空闲 + 借出）。
 
 - int WaitingCount()
-  - 当前停泊等待连接的协程数。
 
 - int MaxSize()
-  - 最大并发存活连接数。
 
 - bool IsClosed()
-  - 连接池关闭后为 true。
 
 - void MarkClosed()
-  - 标记连接池已关闭：获取者返回 null，归还的
-    连接将被销毁而不入池。
 
 - void WakeAll()
-  - 唤醒所有停泊的等待者；每个都会重新检查已关闭的池并
-    返回 null。
 
 - async bool WaitForRelease(PoolWait w)
-  - 池饱和时的一轮有界等待，所有驱动连接池共用。
-    
-    先停泊在事件门上（零轮询，归还即醒；每轮门等自带
-    `PoolWait.GateWaitMs` 看门狗，Signal 丢失也必然复查）；
-    门等次数用尽仍拿不到——说明持有者迟迟不还：健康系统里一次
-    归还在毫秒级——转为短轮询直至预算耗尽，返回 false 让调用方
-    快速失败（应答「数据库暂不可用」），绝不定死。等待次数与预算
-    记在调用方自备的 `PoolWait` 里，跨整个获取循环累计。
 
 
 ## PoolWait (class)
 
-一个获取者在饱和等待期的进度：已发生的门等次数与剩余的
-轮询预算。获取循环外创建一次，传给每一轮
-`PoolCore{T}.WaitForRelease`；策略常数也集中在这里，
-是全仓库连接池唯一的饱和政策出处。
-
 - int gated;
-  - 已消耗的事件门等次数。计数语义的门加上调用方的复查
-    循环保证不丢失唤醒；超过上限说明持有者整体停滞（嵌套租借、
-    漏归还），转轮询兜底。
 
 - int budget;
-  - 剩余的短轮询预算（毫秒），耗尽即放弃本次获取。
 
 - PoolWait()
 
 - static int GateWaitMs=250;
-  - 单次门等的看门狗上限（毫秒）。Signal 正常到达时等待者
-    立即醒来，不受此值影响；它只是唤醒丢失时的保险丝——最坏情况
-    下每轮门等多拖这么久就复查一次，谁也不会永久停在门上。
 
 - static int MaxGateWaits=64;
-  - 门等次数上限：健康系统里归还远快于此，用满意味着池
-    已被病态持有拖住。
 
 - static int PollStepMs=20;
-  - 轮询步长（毫秒）：预算耗尽前最后的挣扎，也让等待者
-    周期性重查 IsClosed/空闲列表。
 
 - static int PollBudgetMs=10000;
-  - 轮询总预算（毫秒）：这是进程级自愈兜底的一部分——
-    病态持有的最坏情形下，单个请求最多挂这么久就以 null 放弃。
+
+
+## RowGroup (class)
+
+- string key;
+
+- List<int> rows;
+
+- static RowGroup Create(string groupKey)
+
+- string Key()
+
+- List<int> Rows()
+
+- int Count()
 
 
 ## TracedDbConnection (class)
-
-A connection that times what runs through it and reports it to
-`DbTrace`, forwarding everything else to the connection it wraps.
-
-Why a wrapper and not the drivers: a statement is executed in six different
-implementations (SQLite, MySQL sync/async, PostgreSQL, ODBC, TDengine), each
-with the six executor entry points. Timing them one by one would put the same
-four lines in three dozen places and would still miss the next driver. The
-wrapper is the interface, so a driver added tomorrow is traced without being
-touched -- and a connection the application uses for its own bookkeeping (a
-metrics database writing the trace down) simply is not wrapped, which is what
-keeps a trace from tracing itself.
-
-The pool never sees this object: whoever wraps a lease unwraps it before
-giving it back (see `Unwrap`).
 
 - IDbConnection inner;
 
 - TracedDbConnection(IDbConnection inner)
 
 - IDbConnection Inner()
-  - The connection underneath (already unwrapped to the driver
-    connection).
 
 - static IDbConnection Wrap(IDbConnection db)
-  - `db` timed, or `db` itself when nothing is listening: an
-    untraced server must not pay for a wrapper on every lease. Idempotent
-    (already-wrapped connections pass through). Called by the pool on lease.
 
 - static IDbConnection Unwrap(IDbConnection db)
-  - The connection a pool handed out, however many times it was
-    wrapped -- what has to go back to the pool is the pooled object, not a
-    wrapper the pool has never seen. Null-safe (null passes through).
 
 - DbResult Query(string sql)
-  - Timed query; duration (µs) reported to DbTrace after return.
 
 - DbResult Query(string sql, DbParams prms)
-  - Timed parameterized query; duration (µs) reported to DbTrace after return.
 
 - int Execute(string sql)
-  - Timed execute; returns affected row count.
 
 - int Execute(string sql, DbParams prms)
-  - Timed parameterized execute; returns affected row count.
 
 - string ExecuteScalar(string sql)
-  - Timed scalar (first column of first row, as string).
 
 - string ExecuteScalar(string sql, DbParams prms)
-  - Timed parameterized scalar (first column of first row, as string).
 
 - async DbResult QueryAsync(string sql)
-  - Timed async query; duration (µs) reported to DbTrace after return.
 
 - async DbResult QueryAsync(string sql, DbParams prms)
-  - Timed async parameterized query.
 
 - async int ExecuteAsync(string sql)
-  - Timed async execute; returns affected row count.
 
 - async int ExecuteAsync(string sql, DbParams prms)
-  - Timed async parameterized execute.
 
 - async string ExecuteScalarAsync(string sql)
-  - Timed async scalar (first column of first row, as string).
 
 - async string ExecuteScalarAsync(string sql, DbParams prms)
-  - Timed async parameterized scalar.
 
 - int GetProvider()
-  - Provider id of the wrapped connection (SQLite/MySQL/PG/ODBC/TDengine).
 
 - bool IsConnected()
-  - Whether the wrapped connection is open.
 
 - void Close()
-  - Closes the wrapped connection (not timed).
 
 - void Dispose()
-  - 释放连接持有的资源（实现 IDisposable，等同于 Close）。
 
 - void BeginTransaction()
-  - Transactional forwarding — transaction control itself is not timed.
 
 - void Commit()
-  - Commits the wrapped connection's transaction (not timed).
 
 - void Rollback()
-  - Rolls the wrapped connection's transaction back (not timed).
 
 - async bool BeginTransactionAsync()
-  - Async begin-transaction forwarding (not timed).
 
 - async bool CommitAsync()
-  - Async commit forwarding (not timed).
 
 - async bool RollbackAsync()
-  - Async rollback forwarding (not timed).
+
+
+## bool (delegate)
+
+`delegate bool RowFn(int row);`
+
+
+## int (delegate)
+
+`delegate int RowCmpFn(int a, int b);`
 
 
 ## void (delegate)
 
-One finished statement: the SQL as it was submitted and how long it
-took in MICROSECONDS -- the same shape `ServerMetrics.RecordQuery`
-takes, so a server can hand this straight to its metrics.
-
 `delegate void SqlTraceSink(string sql, long us);`
+
+
+## Agg (enum)
+
+- Sum
+
+- Avg
+
+- Min
+
+- Max
+
+- Count
+
+
+## ColKind (enum)
+
+- Str
+
+- Int
+
+- Float
 
 
 ## IDbConnection (interface)
 
-可入池的数据库连接：一个 `IDbExecutor`，同时还能
-报告自身是否仍可用、可被关闭。这正是
-`DbPool` 所需的全部能力，因此一个连接池实现即可服务所有
-同步执行 SQL 的驱动（ODBC、SQLite、PostgreSQL、TDengine 等），
-而调用方仍持有可用的连接类型 —— <c>Query</c>/<c>Execute</c>
-可直接通过接口调用，无需向下转型。
-
 - bool IsConnected();
-  - 连接关闭或损坏后为 false；此类连接会被
-    剔除而非归还空闲列表。
 
 - void Close();
-  - 释放底层句柄/套接字。
 
 - void BeginTransaction();
-  - 在 THIS 连接上开启事务。事务属于
-    会话的属性，参与事务的每条语句都必须在
-    同一连接上执行 —— 这正是它们放在这里而非
-    具体驱动里的原因：持有接口的代码（池化连接、DAO）
-    否则无法开启事务。
-    
-    不支持事务的引擎（如 TDengine）按文档实现为
-    空操作；不要在需要原子性的代码中使用它们。
 
 - void Commit();
-  - 提交事务的写入。
 
 - void Rollback();
-  - 回滚事务的写入。
 
 - async bool BeginTransactionAsync();
-  - 上述三个事务调用的协程版本。IO 为异步的驱动
-    无法同步执行 BEGIN/COMMIT，因此必须在所有驱动上
-    工作的代码（请求作用域的工作单元、DAO）
-    应使用这些方法。
 
 - async bool CommitAsync();
-  - 提交事务写入的协程版本。
 
 - async bool RollbackAsync();
-  - 回滚事务写入的协程版本。
 
 - void Dispose();
-  - 释放连接持有的资源（实现 IDisposable，等同于 Close）。
 
 
 ## IDbConnector (interface)
 
-为 `DbPool` 打开新连接。每个驱动自带一个
-持有自身端点/凭据的 connector，这是连接池中
-唯一与提供方相关的部分；连接池本身与驱动无关。
-
-<c>ConnectAsync</c> 是协程：有真实网络 IO 的驱动（MySQL、
-PostgreSQL、TDengine、SQL Server 等）必须在 reactor 上连接，
-这样扩容中的连接池就不会阻塞工作线程。嵌入式引擎（SQLite、
-DuckDB）则同步打开、直接返回 —— 连接池仍为它们提供
-协程感知的容量控制。
-
 - async IDbConnection ConnectAsync();
-  - 打开一条新连接；若尝试失败，返回的连接其
-    <c>IsConnected()</c> 为 false。
 
 - int GetProvider();
-  - 所产生连接的 `DbProvider` id。
 
 
 ## IDbExecutor (interface)
 
-数据库连接共用的最小执行契约：同一组四个操作提供同步
-与异步两种版本。任何实现该接口的
-连接都能驱动 FreeSQL 风格的 ORM（System.Data.Orm.Model /
-QueryBuilder），使 ORM 在 ODBC DbConnection 与
-原生 SQLite / PostgreSQL / MySQL 驱动上表现一致。
-
-之所以有同步/异步两套，是因为驱动类型不同而非 API 不同：
-嵌入式引擎（SQLite）从本地文件返回结果，无需等待；
-而网络引擎必须等待服务器 —— 若在
-阻塞套接字上等待，会停掉整个 worker 的事件循环，将数据库
-并发限制在 worker 数量上。IO 已协程化的驱动
-（MySqlConnection）真正实现 *Async 方法，并让
-同步版本直接报错；而同步驱动的 *Async 方法只是
-简单转发。调用方（包括生成的 ORM
-终端）可无条件使用异步链，并在驱动支持处获得
-非阻塞 IO。
-
 - DbResult Query(string sql, DbParams prms);
-  - 执行查询语句，<c>prms</c> 绑定到语句的参数占位符；失败时抛出
-    `DbException`，空结果集总意味着「无行」。
 
 - int Execute(string sql, DbParams prms);
-  - 执行非查询语句（带参数），返回受影响行数。
 
 - DbResult Query(string sql);
-  - 执行查询语句；失败时抛出 `DbException`。
 
 - int Execute(string sql);
-  - 执行非查询语句，返回受影响行数。
 
 - string ExecuteScalar(string sql);
-  - 执行语句并返回第一行第一列（字符串形式）；无行时返回空串。
 
 - string ExecuteScalar(string sql, DbParams prms);
-  - `ExecuteScalar(string)` 的带参数版本。
 
 - int GetProvider();
-  - 该驱动在 `DbProvider` 中的 id。
 
 - async DbResult QueryAsync(string sql, DbParams prms);
-  - `Execute(string, DbParams)` 的协程版本。
 
 - async int ExecuteAsync(string sql, DbParams prms);
-  - `Execute(string, DbParams)` 的协程版本。
 
 - async DbResult QueryAsync(string sql);
-  - `Query(string)` 的协程版本。
 
 - async int ExecuteAsync(string sql);
-  - `Execute(string)` 的协程版本。
 
 - async string ExecuteScalarAsync(string sql);
-  - `ExecuteScalar(string)` 的协程版本。
 
 - async string ExecuteScalarAsync(string sql, DbParams prms);
-  - `ExecuteScalar(string, DbParams)` 的协程版本。
+
+
+## DbCell (struct)
+
+- public int kind;
+
+- public long ival;

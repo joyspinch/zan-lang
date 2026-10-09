@@ -1,6 +1,6 @@
 # ZanWeb.Security
 
-> 源码: `packages/Zan.Mvc/src/ZanWeb/Framework/Security/Auth.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Security/DataScope.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Security/Keys.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Security/LoginThrottle.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Security/Perm.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Security/PermTable.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Security/VerifyCode.zan`
+> 源码: `packages/Zan.Mvc/src/ZanWeb/Framework/Security/Auth.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Security/ClientIp.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Security/DataScope.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Security/Keys.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Security/LoginThrottle.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Security/Perm.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Security/PermTable.zan`, `packages/Zan.Mvc/src/ZanWeb/Framework/Security/VerifyCode.zan`
 
 
 ## AuthToken (class)
@@ -22,6 +22,17 @@
 - static async string Resolve(string token)
 
 
+## AuthTokenVersionEntry (class)
+
+- public string uid;
+
+- public int version;
+
+- public int goodUntil;
+
+- public AuthTokenVersionEntry(string uid, int version, int goodUntil)
+
+
 ## AuthUser (class)
 
 - static int Active=1;
@@ -36,6 +47,8 @@
 
 - static bool Verify(string password, string saltCol, string stored)
 
+- static IFreeSql Orm()
+
 - static async SysUser ByUsername(string username)
 
 - static async SysUser ById(string uid)
@@ -46,11 +59,7 @@
 
 - static int VerTtlSec=30;
 
-- static List<string> verUids=new List<string>();
-
-- static List<int> verVals=new List<int>();
-
-- static List<int> verGoodUntil=new List<int>();
+- static List<AuthTokenVersionEntry> verEntries=new List<AuthTokenVersionEntry>();
 
 - static int CachedVersion(string uid, int now)
 
@@ -93,6 +102,17 @@
 - static bool HasId(List<int> list, int id)
 
 - static bool Holds(string haystack, string needle)
+
+
+## ClientIp (class)
+
+- static string Canonical(string ip)
+
+- static bool IpGroups(string part, List<int> words)
+
+- static string IpHex(int word)
+
+- static string Of(HttpContext ctx)
 
 
 ## Codes (class)
@@ -172,20 +192,6 @@
 
 
 ## LoginThrottle (class)
-
-登录爆破限流：按账号（大小写/空白归一）记失败次数，窗口内达到阈值
-即拒绝后续尝试，直到窗口整体滑出。进程内固定窗实现——每 worker
-独立计数，阈值按 worker 数放大即实际成本，窗口+阈值组合已把在线
-爆破压到不可行量级；跨 worker 共享计数是 SharedTable 的后续题。
-
-语义要点（与 AuthUser.Login 配合）：
-- 被限流与密码错误同答空串，不向客户端区分原因（无账号枚举 oracle）；
-Blocked() 供调用方渲染"稍后再试"文案，锁状态本就来自攻击者自己的
-失败次数，不构成新信息。
-- 不存在的账号也记失败：否则"账号不存在"路径不受限流，计时侧信道
-可枚举有效用户名。
-- 成功登录清零；键上限封内存，超出淘汰最旧（攻击者换账号扫描时
-最多冲掉自己的限流记录）。
 
 - static int MaxFails=10;
 
@@ -279,6 +285,8 @@ Blocked() 供调用方渲染"稍后再试"文案，锁状态本就来自攻击�
 
 - static bool Ready()
 
+- static async void LoadRoles(IFreeSql fsql)
+
 - static async void LoadRoles(IDbConnection db)
 
 - static async void LoadRoles(List<SysRole> rows, List<SysRoleGrant> grants)
@@ -312,9 +320,11 @@ Blocked() 供调用方渲染"稍后再试"文案，锁状态本就来自攻击�
 
 - static string Login="/admin/login";
 
+- static string LoginSubmit="/admin/login/submit";
+
 - static string Logout="/admin/logout";
 
-- static string Admin="/admin";
+- static string Profile="/admin/profile";
 
 - static string Data="/admin/monitor/data";
 

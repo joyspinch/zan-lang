@@ -5,10 +5,6 @@
 
 ## WechatPayAccountInfo (class)
 
-从随附的 C# SDK 生成的共享 DTO 实体。
-一个 C# 命名空间/类型标识精确对应一个 Zan 模型。
-由 scripts/generate_wechat_tenpay_apis.py 从 Senparc 微信支付 API 生成。
-
 - public string bank_account_type;
 
 - public string account_name;

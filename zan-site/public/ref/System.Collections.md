@@ -5,8 +5,6 @@
 
 ## HashSet (class)
 
-向后兼容转发：指向 System.Collections.Generic.HashSet{T}。
-
 - System.Collections.Generic.HashSet<T> _inner;
 
 - HashSet()
@@ -28,8 +26,6 @@
 
 ## Queue (class)
 
-向后兼容转发：指向 System.Collections.Generic.Queue{T}。
-
 - System.Collections.Generic.Queue<T> _inner;
 
 - Queue()
@@ -48,8 +44,6 @@
 
 
 ## Stack (class)
-
-向后兼容转发：指向 System.Collections.Generic.Stack{T}。
 
 - System.Collections.Generic.Stack<T> _inner;
 
