@@ -1,8 +1,4 @@
-/* arena.h -- Bump allocator for compiler data structures.
- *
- * All AST nodes, types, and symbols are allocated from arenas.
- * At the end of compilation the entire arena is freed in one call.
- */
+/* arena.h: 编译器专用块分配器（单向增长，编译结束一次性释放） */
 
 #ifndef ZAN_ARENA_H
 #define ZAN_ARENA_H

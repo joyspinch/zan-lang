@@ -1,9 +1,4 @@
-/* stdlib_ext.h -- Extended standard library for Zan.
- *
- * Runtime implementations for System.Net.Http (HTTP client),
- * System.Threading (threads, mutex, async runtime), System.Json
- * (JSON parse/serialize) and System.Text.StringBuilder.
- */
+/* stdlib_ext.h: Zan 扩展标准库（HTTP 客户端、线程同步、JSON 解析、StringBuilder） */
 
 #ifndef ZAN_STDLIB_EXT_H
 #define ZAN_STDLIB_EXT_H
@@ -20,13 +15,13 @@ typedef struct {
     size_t headers_len;
 } zan_http_response_t;
 
-/* Perform HTTP GET request. Returns allocated response (caller frees). */
+/* 执行 HTTP GET 请求（返回堆分配的响应，调用方负责释放） */
 zan_http_response_t *zan_http_get(const char *url);
 
-/* Perform HTTP POST request with body. */
+/* 执行 HTTP POST 请求 */
 zan_http_response_t *zan_http_post(const char *url, const char *body, const char *content_type);
 
-/* Free HTTP response */
+/* 释放 HTTP 响应结构体 */
 void zan_http_response_free(zan_http_response_t *resp);
 
 typedef void *zan_thread_t;
@@ -35,19 +30,19 @@ typedef void *zan_event_t;
 
 typedef void (*zan_thread_fn)(void *arg);
 
-/* Create and start a new thread */
+/* 创建并启动新线程 */
 zan_thread_t zan_thread_create(zan_thread_fn fn, void *arg);
 
-/* Wait for thread to complete */
+/* 等待线程执行完毕 */
 void zan_thread_join(zan_thread_t thread);
 
-/* Sleep current thread for milliseconds */
+/* 当前线程休眠指定毫秒 */
 void zan_thread_sleep(int ms);
 
-/* Get current thread ID */
+/* 获取当前线程 ID */
 int64_t zan_thread_id(void);
 
-/* Mutex operations */
+/* 互斥锁操作 */
 zan_mutex_t zan_mutex_create(void);
 void zan_mutex_lock(zan_mutex_t mtx);
 void zan_mutex_unlock(zan_mutex_t mtx);

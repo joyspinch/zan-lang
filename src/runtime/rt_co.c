@@ -1,26 +1,25 @@
-/* rt_co.c -- Zan stackless-coroutine driver (see rt_co.h). */
+/* rt_co.c: 无栈协程就绪队列与 M:1 协作式调度器驱动实现 */
 
 #include "rt_co.h"
-#include "rt_timer.h"   /* ZAN_OOM_TO_RUNTIME: OOM joins the zan_rt_fatal funnel */
+#include "rt_timer.h"
 
 #include <stdlib.h>
 
 #include "../common/host_oom.h"
-/* A queued resumption: step(frame) will re-enter the state machine. */
+
+/* 就绪协程槽位：step(frame) 重新进入状态机执行 */
 typedef struct {
     void         *frame;
     zan_co_step_t step;
 } zan_co_slot_t;
 
-/* FIFO ready queue implemented as a growable circular buffer. Single-threaded,
- * cooperative: a step() runs to its next suspension point (or completion)
- * before control returns here, so no locking is needed in the M:1 model. */
+/* 基于环形缓冲区的 FIFO 就绪队列（单线程协作式无锁模型） */
 static zan_co_slot_t *g_queue;
-static size_t         g_cap;    /* allocated slots */
-static size_t         g_len;    /* live entries */
-static size_t         g_head;   /* index of next to pop */
+static size_t         g_cap;    /* 队列容量 */
+static size_t         g_len;    /* 就绪项数量 */
+static size_t         g_head;   /* 出队游标 */
 
-/* Optional bridge to a blocking event source (the IO reactor); NULL = none. */
+/* IO 反应堆空闲等待桥接回调，无回调时为 NULL */
 static zan_co_idle_fn g_idle;
 
 void zan_co_sched_init(void) {
@@ -38,18 +37,12 @@ static void queue_grow(void) {
     size_t ncap = g_cap ? g_cap * 2 : 16;
     zan_co_slot_t *nq = (zan_co_slot_t *)realloc(g_queue, ncap * sizeof(*nq));
     if (!nq) {
-        /* A transient allocation failure must not kill a running server: drop
-         * THIS resumption instead of aborting. The frame's state word still
-         * says "running", so if it is ever resumed again through another path
-         * it continues; if not, it leaks one frame rather than taking down
-         * every live connection. The window for this is OOM at the exact
-         * queue-growth instant -- the old abort() turned that into an
-         * instant whole-process death. */
+        /* 队列扩容遇 OOM 丢弃本次恢复，保护主进程与已连接会话不崩溃 */
         fprintf(stderr, "zan runtime: coroutine ready-queue grow failed "
                         "(OOM); dropping one resumption\n");
         return;
     }
-    /* Re-linearise the circular buffer into the new storage. */
+    /* 将环形缓冲区重新线性化到新存储区 */
     for (size_t i = 0; i < g_len; i++) {
         nq[i] = g_queue[(g_head + i) % g_cap];
     }
@@ -79,9 +72,7 @@ void zan_co_sched_run_until(const volatile int *done) {
             slot.step(slot.frame);
         }
         if (done && *done) return;
-        /* Ready queue drained. If an idle bridge (IO reactor) is wired, block
-         * for external events that may enqueue more work; stop when it reports
-         * nothing left to wait for. */
+        /* 就绪队列已清空。若接入 IO 反应堆，则阻塞等待外部事件派发新任务 */
         if (!g_idle) return;
         if (g_idle() <= 0) return;
     }
