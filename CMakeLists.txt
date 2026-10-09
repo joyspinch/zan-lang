@@ -3367,18 +3367,17 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_exportui${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  # WEB_GUI_ROADMAP P7a: the designer's HTML storage format is exercised by
+  # WEB_GUI_ROADMAP: the designer's HTML storage format is exercised by
   # tests/conformance/designer_html.zan (codec roundtrip + designer bridge),
   # auto-registered by the conformance glob above; the compile-time channel
-  # (.html design doc -> GenForm projection; the legacy .zform channel
-  # was removed in P8-4) by the case below, reusing the same golden byte for byte.
-  add_test(NAME conformance_gui_zform_html
+  # (.html design doc -> GenForm projection) by the case below, reusing the same golden byte for byte.
+  add_test(NAME conformance_gui_form_control
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/zform_control_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/zform_control.html;--auto-stdlib${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_zform_control.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_html${_exe_ext}
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/form_control_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/form_control.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_form_control.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_form_control${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Designer preview and generated HTML share pixels and control rects across
@@ -3521,13 +3520,13 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   # Title.bindIf through GenForm; the host attaches a JsonValue model
   # and the headless sync channel expands rows, toggles visibility and
   # writes edits back through item scopes.
-  add_test(NAME conformance_gui_zform_dynamic
+  add_test(NAME conformance_gui_form_dynamic
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/zform_dynamic_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/zform_dynamic.html;--auto-stdlib${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_zform_dynamic.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_dynamic${_exe_ext}
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/form_dynamic_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/form_dynamic.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_form_dynamic.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_form_dynamic${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Same primitives through the runtime-HTML compiled channel (GenHtml):
@@ -3585,13 +3584,13 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   # Declarative typed grid: a DataGrid field with "of" + "columns" projects
   # typed accessor lambdas onto the generic column API, binds the caller's
   # List<T> directly (no DataRow), and "props"/"rowFactory" reach the state.
-  add_test(NAME conformance_gui_zform_grid
+  add_test(NAME conformance_gui_form_grid
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/zform_grid_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/zform_grid.html;--auto-stdlib${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_zform_grid.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_grid${_exe_ext}
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/form_grid_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/form_grid.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_form_grid.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_form_grid${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Navigation layer: route table + Tabs-as-outlet (lazy build, keepAlive,
@@ -4002,10 +4001,6 @@ add_test(NAME policy_no_widget_drawing
 add_test(NAME policy_gallery_coverage
   COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
     -P ${CMAKE_SOURCE_DIR}/tests/run_gallery_coverage.cmake)
-
-add_test(NAME policy_zform_schema
-  COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
-    -P ${CMAKE_SOURCE_DIR}/tests/run_zform_schema.cmake)
 
 add_test(NAME policy_control_factory
   COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}

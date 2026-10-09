@@ -101,7 +101,7 @@ you need a new knob, add it to the config file *and* give it a default.
 ## 5. GUI code uses the component library
 
 Windows and controls come from the standard library's GUI components (designer
-`.zform` + code-behind, or the immediate-mode loop — `zan_example("gui-window")`
+`.html` + code-behind, or the immediate-mode loop — `zan_example("gui-window")`
 shows both). Do not hand-draw widgets, do not roll your own event loop.
 
 ## 6. Server projects: routes and permissions are attributes

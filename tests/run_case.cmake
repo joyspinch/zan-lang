@@ -50,7 +50,7 @@ function(zan_artifact_is_current out_var artifact)
     return()
   endif()
   foreach(_arg IN LISTS ZANC_ARGS)
-    if(_arg MATCHES "\\.(zan|zform|html|zcomp)$" AND EXISTS "${_arg}"
+    if(_arg MATCHES "\\.(zan|html|zcomp)$" AND EXISTS "${_arg}"
        AND "${_arg}" IS_NEWER_THAN "${artifact}")
       return()
     endif()

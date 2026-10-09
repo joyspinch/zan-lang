@@ -56,9 +56,9 @@ Zan 采用 C# 风格的现代语法体系，初衷是让开发者拥有与 C# �
 * **现状优势**：ZanIDE 严格遵循“禁止自绘，全部使用标准库组件”，架构轻盈且纯粹。
 * **演进方案**：
   1. **表单设计器（Designer）与代码即时双向同步**：
-     - 优化 `packages/Zan.Gui/src/Gui/Designer/Designer.Form.zan`，对 `.zform` 文档提供更丝滑的可视化控件拖拽、属性栅格编辑与对齐吸附。
+     - 优化 `packages/Zan.Gui/src/Gui/Designer/Designer.Form.zan`，对 `.html` 设计稿提供更丝滑的可视化控件拖拽、属性栅格编辑与对齐吸附。
   2. **GUI 布局毫秒级实时微调（Live Layout Preview）**：
-     - 当修改 `.zform` 表单属性时，无需重新编译整个项目程序，通过内部 IPC / 管道将表单定义差量推送给预览窗口，实现毫秒级“所见即所得”。
+     - 当修改 `.html` 表单设计稿属性时，无需重新编译整个项目程序，通过内部 IPC / 管道将表单定义差量推送给预览窗口，实现毫秒级“所见即所得”。
   3. **工业级虚拟化大列表与树表组件**：
      - 引入 `VirtualListView<T>` / `VirtualDataGrid<T>`：只对当前可视区域创建 DOM / 控件元素，百万级数据流畅滚动。
 

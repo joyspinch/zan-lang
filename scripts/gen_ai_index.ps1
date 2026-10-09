@@ -87,7 +87,7 @@ $lines.Add("")
 
 # ---- generated knowledge ----------------------------------------------------
 $know = @()
-foreach ($k in @('symbols.json', 'gallery.json', 'gallery.seed.json', 'zform.doc.json')) {
+foreach ($k in @('symbols.json', 'gallery.json', 'gallery.seed.json')) {
     if (Test-Staged "knowledge/$k") { $know += "knowledge/$k" }
 }
 if ($know.Count -gt 0) {
