@@ -994,11 +994,7 @@ static bool emit_async_preempt_site(zan_irgen_t *g, LLVMBasicBlockRef resume_tar
     zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0), get_async_state_ptr(g));
     LLVMBuildBr(g->builder, get_async_requeue_bb(g));
 
-    LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
-        g->current_async_resume_fn, "co.preempt.resume");
-    LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
-    LLVMPositionBuilderAtEnd(g->builder, rk);
-    LLVMBuildBr(g->builder, resume_target);
+    LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), resume_target);
     return true;
 }
 

@@ -1117,6 +1117,29 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   那条路径"**——按"谁 retain 了它"反查消费点（这里是 emit_closure_record 的
   retain_target），别只盯着 new。
 
+## 实例字段 TYPE_OBJECT 动态生命周期闭环与析构遍历
+
+- **病灶**：
+  1. `TYPE_OBJECT` 字段可容纳装箱值、基础指针或堆分配类实例（带 16 字节原子 refcount 头部）；
+  2. 构造函数赋值、局部变量类型推断、类字段析构时，原先仅对 `is_arc_managed_type`（强类型类、数组、字符串）处理 ARC，忽略了 `TYPE_OBJECT`；
+  3. 类析构函数 `build_class_release_body` 仅遍历了 `is_arc_managed_type` 字段，未对 `TYPE_OBJECT` 字段发射 `emit_release_obj_value`；
+  4. `irgen_stmt.c` 中局部变量推断误将 `TYPE_CLASS` 在栈上内联 `alloca`，导致引用计数头部缺失、`zan_rt_retain` 非法内存段错误；
+  5. `type_family` 对 `TYPE_OBJECT` 返回 `FAM_UNKNOWN`，导致接受 `object` 参数的构造函数决议打分失败。
+- **解法与纪律**：
+  1. `type_family` 将 `TYPE_OBJECT` 归为 `FAM_REF`，`find_ctor` 与 `concrete_arg_score` 明确允许引用类型与 `string` 匹配到 `object` 形参；
+  2. 局部变量栈分配严格限定于 `TYPE_STRUCT`，类实例统一通过 `zan_rt_alloc` 堆分配并持有合法原子引用计数头部；
+  3. 对象字段初始化和属性赋值时，对 `fst->kind == TYPE_OBJECT` 使用 `emit_rc_store_field` 触发动态旧值释放与新值引用保留；
+  4. `build_class_release_body` 字段遍历中补充 `else if (ft->kind == TYPE_OBJECT)` 分支，调用 `emit_release_obj_value(g, cv)` 确保析构时动态释放字段引用的堆对象。
+- **回归锁定**：`tests/conformance/instance_object_rc.zan` 覆盖显式构造函数传参、隐式 this 字段赋值、局部变量字段赋值、数组元素字段赋值与对象初始化器，并在 leakcheck、determinism、arcguard 下 100% 验证通过。
+
+## 异步协程循环抢占状态机下沉与空跳转块消除
+
+- **病灶**：在 `irgen_async.c` 的 `emit_async_preempt_site` 中，循环回边协作式抢占检查在挂起后恢复时，原先单独创建了一个只包含无条件跳转 `br resume_target` 的中间基本块 `co.preempt.resume`，并将其作为 switch case 的目标。
+- **危害**：每一个包含循环的 async 方法在每次状态机生成时均会产生冗余的基本块和无条件分支跳转，导致 IR 阶段指令数量虚高，控制流图（CFG）分支节点膨胀，增大优化器分析负担。
+- **解法与纪律**：直接将协程恢复状态序号 `k` 的 case 分支连接至目标基本块 `resume_target`：`LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), resume_target)`，彻底消除冗余跳转中间块。
+- **回归锁定**：`conformance_async_preempt_hotloop` 与 `conformance_async_ir_scaling` 验证通过。
+
+
 - **extern string 不只不能释放，也不能下标（A347，2026-09-23）**：
   `DllImport` 返回的串（如 crt `calloc`）无长度元数据，字符串下标守卫
   对它按 0 界处理——任何读写都报 "string index out of bounds"。收发

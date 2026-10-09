@@ -1085,6 +1085,10 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
             LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
             LLVMValueRef cv = LLVMBuildLoad2(b, map_type(g, ft), fp, "fc");
             emit_arc_release_typed(g, ft, cv);
+        } else if (ft->kind == TYPE_OBJECT) {
+            LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
+            LLVMValueRef cv = LLVMBuildLoad2(b, i8ptr, fp, "fc");
+            emit_release_obj_value(g, cv);
         }
     }
     /* The destroy was committed by the gate above (slots nulled, count zero),

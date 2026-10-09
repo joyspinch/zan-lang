@@ -768,7 +768,7 @@ static int type_family(zan_type_t *t) {
         return FAM_INT;
     case TYPE_FLOAT: case TYPE_DOUBLE: return FAM_FLOAT;
     case TYPE_STRING: return FAM_STRING;
-    case TYPE_CLASS: case TYPE_INTERFACE: case TYPE_ARRAY: return FAM_REF;
+    case TYPE_CLASS: case TYPE_INTERFACE: case TYPE_ARRAY: case TYPE_OBJECT: return FAM_REF;
     default: return FAM_UNKNOWN;
     }
 }
@@ -1039,6 +1039,10 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                     continue;
                 }
                 int pf = type_family(pt), af = type_family(at);
+                if (pt->kind == TYPE_OBJECT && (af == FAM_REF || af == FAM_STRING)) {
+                    score += 1;
+                    continue;
+                }
                 if (pf == af && pf != FAM_UNKNOWN) {
                     if (pf == FAM_REF) {
                         if (pt->kind == TYPE_OBJECT) {
@@ -1203,6 +1207,7 @@ static int concrete_arg_score(zan_irgen_t *g, zan_type_t *pt,
     if (at && !type_mentions_tp(at)) {
         if (types_concrete_equal(pt, at)) return 4;
         int pf = type_family(pt), af = type_family(at);
+        if (pt->kind == TYPE_OBJECT && (af == FAM_REF || af == FAM_STRING)) return 1;
         if (pf == FAM_UNKNOWN || af == FAM_UNKNOWN) return 0;
         if (pf == af) return 2;
         if (implicit_ctor_for_arg(g, pt, at, a, locals)) return 1;

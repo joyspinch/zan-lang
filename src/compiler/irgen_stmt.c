@@ -1155,7 +1155,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 }
                 if (type_name.str) {
                     zan_symbol_t *sym = zan_binder_lookup(g->binder, type_name);
-                    if (sym && sym->type && (sym->type->kind == TYPE_STRUCT || sym->type->kind == TYPE_CLASS)) {
+                    if (sym && sym->type && sym->type->kind == TYPE_STRUCT) {
                         type = sym->type;
                         LLVMTypeRef st = get_struct_llvm_type(g, sym);
                         if (st) {
@@ -1374,7 +1374,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                          * instead of storing the pointer raw, and
                                          * a struct-typed field recurses the same
                                          * contract into its own fields. */
-                                        if (fst && is_rc_managed_type(fst)) {
+                                        if (fst && (is_rc_managed_type(fst) || fst->kind == TYPE_OBJECT)) {
                                             emit_rc_store_field(g, fst, fptr, fval,
                                                 arg->binary.right, locals,
                                                 (fsym->modifiers & MOD_WEAK) ? 1 : 0);
