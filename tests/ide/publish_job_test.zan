@@ -1,0 +1,284 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Threading;
+using Gui;
+using Gui.Backend;
+
+// This must be the first input, followed by src/ide_zan/src/IdeForm.html and
+// @build/ide_files.rsp. Use --subsystem console and put the executable in
+// _scratch/ide-publish-log/fixture: real publish cache paths follow ExeDir().
+class PublishJobCapture {
+    List<IdeJobResult> results = new List<IdeJobResult>();
+
+    void Apply(IdeJobResult result) { results.Add(result); }
+}
+
+class PublishJobTest {
+    static string fixture;
+    static string project;
+    static string firstExe;
+    static string secondExe;
+
+    static void Check(bool condition, string message) {
+        if (condition) { return; }
+        Console.WriteLine("PUBLISH_JOB_FAIL: " + message);
+        throw new Exception(message);
+    }
+
+    static int SelectedCount(List<PublishTargetOption> options) {
+        int count = 0;
+        for (int i = 0; i < options.Count; i = i + 1) {
+            if (options[i].selected) { count = count + 1; }
+        }
+        return count;
+    }
+
+    static int OptionIndex(List<PublishTargetOption> options, string id) {
+        for (int i = 0; i < options.Count; i = i + 1) {
+            if (options[i].id == id) { return i; }
+        }
+        PublishJobTest.Check(false, "missing platform option: " + id);
+        return 0 - 1;
+    }
+
+    static void CheckSavedOptions(List<PublishTargetOption> options) {
+        PublishJobTest.Check(options != null, "project options must be assigned");
+        PublishJobTest.Check(PublishJobTest.SelectedCount(options) == 2,
+            "zan.proj must select exactly two platforms");
+        int windows = PublishJobTest.OptionIndex(options, "windows-x64");
+        int mac = PublishJobTest.OptionIndex(options, "macos-arm64");
+        PublishJobTest.Check(options[windows].selected && options[mac].selected,
+            "publishPlatforms must select Windows x64 and macOS ARM64");
+    }
+
+    static void DeleteFixtureFile(string path) {
+        // Every deletion is confined to this test's fixture, including done files.
+        string prefix = fixture.Replace("\\", "/").ToLower() + "/";
+        PublishJobTest.Check(path.Replace("\\", "/").ToLower().StartsWith(prefix),
+            "refusing to delete outside the publish fixture: " + path);
+        if (File.Exists(path)) { File.Delete(path); }
+    }
+
+    static void CreateFixture() {
+        Directory.CreateDirectoryRecursive(project + "/src");
+        Directory.CreateDirectoryRecursive(project + "/publish/windows-x64");
+        Directory.CreateDirectoryRecursive(project + "/publish/windows-arm64");
+        File.WriteAllText(project + "/zan.proj",
+            "name=PublishJobFixture\nentry=src/main.zan\ntype=console\n"
+            + "target=native\nsingleFile=false\npubDebug=false\n"
+            + "macMultiInstance=false\npublishPlatforms=windows-x64,macos-arm64\n");
+        File.WriteAllText(project + "/src/main.zan",
+            "using System;\nclass PublishJobFixture {\n"
+            + "    static void Main() { Console.WriteLine(\"fixture\"); }\n}\n");
+        ZanIDE.EnsureCacheDir();
+        PublishJobTest.DeleteFixtureFile(ZanIDE.PubDonePath());
+        File.WriteAllText(ZanIDE.PubLogPath(), "");
+    }
+
+    static void DrainDocumentWorkers(ZanIDE ide, App app) {
+        int started = Window.GetTickMs();
+        while (true) {
+            bool finished = true;
+            for (int i = 0; i < ide.documentWorkers.Count; i = i + 1) {
+                if (!ide.documentWorkers[i].IsCompleted) { finished = false; }
+            }
+            app.DrainPosts();
+            if (finished) { break; }
+            PublishJobTest.Check(Window.GetTickMs() - started < 10000,
+                "publish window worker did not finish within 10 seconds");
+            Thread.Sleep(1);
+        }
+        app.DrainPosts();
+    }
+
+    static void WindowOptions(App app) {
+        ZanIDE ide = new ZanIDE();
+        ide.app = app;
+        ide.root = project;
+        ide.haveProject = true;
+        ide.documentWorkspace = 17;
+        ide.log = new List<string>();
+        List<PublishTargetOption> before = new List<PublishTargetOption>();
+        ide.pubPlatformOptions = before;
+        try {
+            ide.OpenPublishWindowAsync();
+            PublishJobTest.DrainDocumentWorkers(ide, app);
+            PublishJobTest.Check(ide.pubWin != null, "async publish window must open");
+            PublishWindow window = ide.pubWin;
+            PublishJobTest.Check(ide.pubPlatformOptions != before,
+                "async options must replace the IDE's initially empty list");
+            PublishJobTest.Check(ide.pubPlatformOptions == window.options,
+                "IDE and publish window must share the same options list");
+            PublishJobTest.CheckSavedOptions(ide.pubPlatformOptions);
+            PublishJobTest.Check(window.IsOpen(), "publish window must start open");
+            int windows = PublishJobTest.OptionIndex(window.options, "windows-x64");
+            int mac = PublishJobTest.OptionIndex(window.options, "macos-arm64");
+            string windowsKey = "plat_" + Convert.ToString(windows);
+            string macKey = "plat_" + Convert.ToString(mac);
+
+            window.model.Set(windowsKey, JsonValue.NewStr("false"));
+            window.model.Set(macKey, JsonValue.NewStr("1"));
+            window.SyncFlags();
+            PublishJobTest.Check(!ide.pubPlatformOptions[windows].selected
+                && ide.pubPlatformOptions[mac].selected,
+                "SyncFlags must update the shared list from false/1 model values");
+            PublishJobTest.Check(ZanIDE.ProjField(project, "publishPlatforms") == "macos-arm64",
+                "SyncFlags must persist the changed selection to zan.proj");
+            window.model.Set(windowsKey, JsonValue.NewStr("true"));
+            window.model.Set(macKey, JsonValue.NewStr("0"));
+            window.SyncFlags();
+            PublishJobTest.Check(ide.pubPlatformOptions[windows].selected
+                && !ide.pubPlatformOptions[mac].selected,
+                "SyncFlags must accept true/0 model values");
+            PublishJobTest.Check(ZanIDE.ProjField(project, "publishPlatforms") == "windows-x64",
+                "the second selection change must replace the persisted platforms");
+
+            // Leave the shared list selected until TakePublish synchronizes the model.
+            for (int i = 0; i < window.options.Count; i = i + 1) {
+                window.model.Set("plat_" + Convert.ToString(i), JsonValue.NewStr("0"));
+            }
+            PublishWindow.OnPublish();
+            PublishJobTest.Check(!window.TakePublish(), "no target must not start publishing");
+            PublishJobTest.Check(window.IsOpen(), "no target must leave the window open");
+            PublishJobTest.Check(PublishJobTest.SelectedCount(ide.pubPlatformOptions) == 0,
+                "TakePublish must synchronize flags before checking for targets");
+            PublishJobTest.Check(ZanIDE.ProjField(project, "publishPlatforms") == "",
+                "no-target selection must be persisted");
+            PublishJobTest.Check(!window.Pending(), "rejected publish request must be consumed");
+            PublishWindow.OnCancel();
+            PublishJobTest.Check(window.TakeCancel() && !window.IsOpen(),
+                "cancel must close the publish window");
+        } finally {
+            ide.shuttingDown = true;
+            PublishJobTest.DrainDocumentWorkers(ide, app);
+            if (ide.pubWin != null) {
+                PublishWindow.OnCancel();
+                ide.pubWin.TakeCancel();
+                ide.pubWin.Close();
+                ide.pubWin = null;
+            }
+            ChildWindows.Prune();
+            app.DrainPosts();
+        }
+    }
+
+    static IdeJobSnapshot Snapshot(int sequence, List<string> exes) {
+        IdeJobSnapshot input = new IdeJobSnapshot();
+        input.workspace = 17;
+        input.monitor = 3;
+        input.root = project;
+        input.pubRoot = project;
+        input.pub = true;
+        input.pubSeq = sequence;
+        input.packed = false;
+        input.exes = exes;
+        return input;
+    }
+
+    static IdeJobMonitor Monitor(App app, IdeJobSnapshot input, PublishJobCapture capture) {
+        // Configure the real lane without Start(), which would start ten monitors.
+        IdeJobMonitor monitor = new IdeJobMonitor();
+        monitor.lane = 6;
+        monitor.host = app;
+        monitor.snapshot = input;
+        monitor.apply = capture.Apply;
+        return monitor;
+    }
+
+    static IdeJobResult PostedResult(App app, PublishJobCapture capture, IdeJobSnapshot input) {
+        PublishJobTest.Check(capture.results.Count == 0, "result must be posted to the app");
+        app.DrainPosts();
+        PublishJobTest.Check(capture.results.Count == 1, "exactly one publish result must be posted");
+        IdeJobResult result = capture.results[0];
+        PublishJobTest.Check(result.input == input && result.kind == 6,
+            "posted result must belong to the current publish snapshot");
+        return result;
+    }
+
+    static void EmptyStart(App app) {
+        IdeJobSnapshot input = PublishJobTest.Snapshot(1, new List<string>());
+        PublishJobCapture capture = new PublishJobCapture();
+        IdeJobMonitor monitor = PublishJobTest.Monitor(app, input, capture);
+        IdeJobStart start = new IdeJobStart();
+        start.input = input;
+        start.kind = 6;
+        start.options = new List<PublishTargetOption>();
+        monitor.StartOne(start);
+        IdeJobResult result = PublishJobTest.PostedResult(app, capture, input);
+        PublishJobTest.Check(result.complete && !result.ok && !result.timeout,
+            "StartOne with no options must complete as a failure");
+        PublishJobTest.Check(result.exes != null && result.exes.Count == 0,
+            "empty-option start must produce an empty executable list");
+        PublishJobTest.Check(result.log.Contains("> No target selected; nothing published."),
+            "empty-option failure must come from the real no-target path");
+        PublishJobTest.Check(monitor.pubDone == input.pubSeq,
+            "empty-option start must mark its sequence done");
+    }
+
+    static void PollDone(App app, int sequence, string status, bool secondExists,
+                         bool emptyTargets, bool expectedOk) {
+        // These marker paths deliberately need no resource copying or archive step.
+        File.WriteAllText(firstExe, "publish marker one\n");
+        if (secondExists) { File.WriteAllText(secondExe, "publish marker two\n"); }
+        else { PublishJobTest.DeleteFixtureFile(secondExe); }
+        List<string> exes = new List<string>();
+        if (!emptyTargets) { exes.Add(firstExe); exes.Add(secondExe); }
+        PublishJobTest.Check(!PubPack.NeedsPackaging(project, exes, false),
+            "completion fixture must not require packaging");
+        File.WriteAllText(ZanIDE.PubLogPath(), "[1/2] publish marker\n");
+        File.WriteAllText(ZanIDE.PubDonePath(), status + "\n");
+        PublishJobTest.Check(ZanIDE.DoneOk(ZanIDE.PubDonePath()) == (status == "ok"),
+            "the real done file must contain this case's status");
+        IdeJobSnapshot input = PublishJobTest.Snapshot(sequence, exes);
+        PublishJobCapture capture = new PublishJobCapture();
+        IdeJobMonitor monitor = PublishJobTest.Monitor(app, input, capture);
+        monitor.PollPublish(input);
+        IdeJobResult result = PublishJobTest.PostedResult(app, capture, input);
+        string label = status + "/" + (secondExists ? "all outputs" : "missing output")
+            + (emptyTargets ? "/empty targets" : "");
+        PublishJobTest.Check(result.complete && result.ok == expectedOk && !result.timeout,
+            "incorrect completion verdict: " + label);
+        PublishJobTest.Check(result.phase != 2 && !monitor.packing,
+            "completion matrix must not enter the packaging phase: " + label);
+        PublishJobTest.Check(result.consumed > 0 && result.log.Contains("[1/2] publish marker"),
+            "PollPublish must consume the actual publish log: " + label);
+        PublishJobTest.Check(!File.Exists(ZanIDE.PubDonePath()),
+            "PollPublish must consume the actual done marker: " + label);
+        PublishJobTest.Check(monitor.pubDone == sequence,
+            "completed publish must mark its sequence done: " + label);
+        PublishJobTest.Check(result.publishFolder == project + "/publish",
+            "completed result must point to the fixture publish folder: " + label);
+    }
+
+    static void Main() {
+        fixture = Directory.GetCurrentDirectory().Replace("\\", "/")
+            + "/_scratch/ide-publish-log/fixture";
+        PublishJobTest.Check(ZanIDE.ExeDir().Replace("\\", "/").ToLower() == fixture.ToLower(),
+            "run from the repository root with the executable in " + fixture);
+        project = fixture + "/project";
+        firstExe = project + "/publish/windows-x64/publish_job_marker.exe";
+        secondExe = project + "/publish/windows-arm64/publish_job_marker.exe";
+        App app = App.CreateOffscreen("Publish job regression", 470, 480);
+        try {
+            PublishJobTest.CreateFixture();
+            PublishJobTest.CheckSavedOptions(ZanIDE.ReadProjectPlatformOptions(project));
+            PublishJobTest.WindowOptions(app);
+            PublishJobTest.EmptyStart(app);
+            PublishJobTest.PollDone(app, 2, "fail", true, false, false);
+            PublishJobTest.PollDone(app, 3, "ok", false, false, false);
+            PublishJobTest.PollDone(app, 4, "ok", true, false, true);
+            PublishJobTest.PollDone(app, 5, "ok", true, true, false);
+        } finally {
+            app.DrainPosts();
+            app.canvas.Destroy();
+            PublishJobTest.DeleteFixtureFile(firstExe);
+            PublishJobTest.DeleteFixtureFile(secondExe);
+            PublishJobTest.DeleteFixtureFile(project + "/src/main.zan");
+            PublishJobTest.DeleteFixtureFile(project + "/zan.proj");
+            PublishJobTest.DeleteFixtureFile(ZanIDE.PubDonePath());
+            PublishJobTest.DeleteFixtureFile(ZanIDE.PubLogPath());
+        }
+        Console.WriteLine("PUBLISH_JOB_OK");
+    }
+}
