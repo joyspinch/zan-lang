@@ -22,17 +22,7 @@ class WebAppStatusDoc {
     List<RouteHitDoc> routes;
 }
 
-/// <summary>
-/// The application server: coroutine-per-connection HTTP/1.1 event loop
-/// (the zan analogue of the swoole worker), wired to the Router, Hooks,
-/// RateLimiter, Sessions and the in-memory View engine.
-/// Memory-safety rules baked in:
-/// - request bodies larger than maxBodyBytes are rejected with 413 before
-/// they are buffered, so an uploader cannot balloon the heap;
-/// - header blocks larger than 64KB are rejected with 431;
-/// - all per-request state lives on the HttpContext and is ARC-reclaimed
-/// when the request completes.
-/// </summary>
+/// <summary>应用服务器：单连接单协程的高性能 HTTP/1.1 事件循环核心。</summary>
 class WebApp {
     [DllImport("crt")]
     static extern long time(nint ptr);
@@ -50,16 +40,7 @@ class WebApp {
     int port;
     bool running;
     TcpListener listener;
-    // Every shared-memory table this app uses -- the framework's rate, lock
-    // and route counters included -- is anonymous shared memory the master
-    // creates before it spawns any worker and hands down by handle
-    // (Worker.ShareHandle). Nothing has a machine-global name: nothing outside
-    // this server's own process tree can find or touch the memory, another
-    // copy of the same server cannot collide with it, and the listening port
-    // -- configuration, not identity -- names none of it. Application code
-    // follows the same pattern: build its tables as anonymous shared memory
-    // and hand them down.
-
+    // 共享内存表：包含限流、锁和路由计数器，多工作进程间无拷贝共享。
     Router router;
     Hooks hooks;
     View views;
@@ -79,10 +60,7 @@ class WebApp {
     /// 并发连接上限（0 = 不设上限；超限回答 503 并关闭）。
     int maxConnections;  // concurrent connections served at once (0 = no cap)
     string uploadDir;  // where streamed uploads land
-    // Counters shared by every connection coroutine in the process. With
-    // --async-workers those coroutines run on several threads, and `x = x + 1`
-    // is a load-add-store that loses increments (and, for uploadSeq, hands two
-    // uploads the same temp filename), so all three are atomics.
+    // 进程内全局连接统计原子计数器。
     AtomicInt uploadSeq;
     string loginPath;  // where a browser is sent when a page needs a session
     /// 全局每秒请求上限（0 = 不限；超限 429）。
@@ -91,8 +69,7 @@ class WebApp {
     AtomicInt activeConnections;
     bool reusePort;  // bind with SO_REUSEPORT for multi-worker scaling
 
-    // The app serving this process, so the static Worker raw-connection
-    // callback (ServeSock) can reach it. Set by Server before Worker.RunAll.
+    // 当前进程单例应用实例句柄，供 Worker 底层连接回调分发。
     static WebApp active;
 
     /// 构造应用服务器并填入默认配置：请求体上限 2MB、流式上传上限
@@ -121,8 +98,7 @@ class WebApp {
         this.totalRequests = new AtomicInt(0);
         this.activeConnections = new AtomicInt(0);
         this.reusePort = false;
-        // Shared tables are created by InitShared (before workers fork), not
-        // here.
+        // 共享内存表在 Worker 派生前由 InitShared 创建。
         this.limiter = null;
         this.locks = null;
     }
@@ -139,29 +115,19 @@ class WebApp {
     WebApp MaxBody(int bytes) { this.maxBodyBytes = bytes; return this; }
     /// 流式上传上限（字节），只作用于 [Upload] 路由，超出回答 413。
     WebApp MaxUpload(int bytes) { this.maxUploadBytes = bytes; return this; }
-    /// <summary>How long one request may take to arrive and be served before
-    /// the connection is closed. Applies per request, not per connection, so a
-    /// keep-alive client that keeps sending is never cut off.</summary>
+    /// <summary>请求到达与响应处理的超时时限（毫秒）。</summary>
     WebApp Timeout(int ms) { this.requestTimeoutMs = ms; return this; }
-    /// <summary>How many connections may be served at once. Past the cap a
-    /// connection is answered 503 and closed instead of being queued: every
-    /// live connection owns a coroutine and a 64KB buffer, and an unbounded
-    /// number of them is how a server dies rather than sheds load. 0 removes
-    /// the cap.</summary>
+    //// <summary>最大并发连接数上限，超出时直接响应 503 并关闭连接。</summary>
     WebApp MaxConnections(int n) { this.maxConnections = n; return this; }
     /// 流式上传的落盘目录（默认 uploads）。
     WebApp UploadDir(string dir) { this.uploadDir = dir; return this; }
     /// 全局每秒请求上限，按 uid（匿名时按对端 IP）计；0 不限，超限 429。
     WebApp GlobalLimit(int perSecond) { this.globalLimit = perSecond; return this; }
-    /// <summary>The sign-in page a navigation is sent to when the route needs a
-    /// session it does not have. Unset (the default) answers every refusal with
-    /// the JSON body, which is what an API-only server wants.</summary>
+    /// <summary>未授权重定向的登录页路由（未配置时默认返回 401 JSON）。</summary>
     WebApp LoginPath(string path) { this.loginPath = path; return this; }
     /// 多进程部署时以 SO_REUSEPORT 监听，由内核把连接分发给各 worker。
     WebApp ReusePort(bool on) { this.reusePort = on; return this; }
-    /// <summary>Initialise cross-process route stats. Called by InitShared;
-    /// safe to call in every process -- a worker maps the master's table via
-    /// <see cref="AttachShared"/> instead of creating one.</summary>
+    /// <summary>初始化跨进程路由统计共享内存表。</summary>
     void InitStats() { this.router.InitStatsShared(); }
 
     // The names the rate, lock and route handles reach the workers under.
@@ -169,18 +135,13 @@ class WebApp {
     static const string ShareLock = "WEB_LOCK";
     static const string ShareRoute = "WEB_ROUTE";
 
-    /// <summary>Creates every shared-memory table of this app (rate limiter,
-    /// request locks, route stats). Called by WebServer in the master before it
-    /// spawns any worker, which is what lets the workers inherit them: a worker
-    /// runs this too and maps the master's tables instead of making a second
-    /// set. Idempotent.</summary>
+    // 共享内存表：包含限流、锁和路由计数器，多工作进程间无拷贝共享。
     void InitShared() {
         if (this.AttachShared()) { return; }
         RateLimiter l = this.Limiter();
         LockManager k = this.Locks();
         this.InitStats();
-        // The tables are anonymous, so their handles are the only way in: hand
-        // them to every worker spawned after this point.
+        // 共享内存表句柄传递：在派生工作进程时分发匿名共享表句柄。
         Worker.ShareHandle(WebApp.ShareRate, l.OsHandle());
         Worker.ShareHandle(WebApp.ShareLock, k.OsHandle());
         Worker.ShareHandle(WebApp.ShareRoute, this.router.StatsOsHandle());
@@ -221,9 +182,7 @@ class WebApp {
     /// 安装权限解析器；未安装时"任何已登录用户"即被允许。
     WebApp PermissionResolver(PermissionFn fn) { this.permissionResolver = fn; return this; }
 
-    /// <summary>Generic route registration used by the compiler-generated
-    /// __AttrRoutes.Register. Returns the Route so attribute metadata can be
-    /// chained.</summary>
+    /// <summary>通用路由注册底层入口（供属性路由生成器调用）。</summary>
     Route Map(string method, string pattern, HttpHandler h) {
         return this.router.Add(method, pattern, h);
     }
@@ -243,9 +202,7 @@ class WebApp {
         return this.views.RenderPage(name, data);
     }
 
-    /// <summary>Renders a template WITHOUT its layout. This is what an
-    /// in-page update answers with: the browser already has the shell, so
-    /// sending it again would replace the page instead of the panel.</summary>
+    /// <summary>局部渲染模板（不包含外层 layout，供页面局部无刷新更新调用）。</summary>
     string RenderFragment(string name, ViewData data) {
         if (this.views == null) { return ""; }
         return this.views.Render(name, data);
@@ -254,19 +211,14 @@ class WebApp {
     /// 墙钟秒（CRT time），上传文件名与错误日志时间戳用。
     static int NowSeconds() { return time(0); }
 
-    /// <summary>Trims a message before it reaches the error log so one runaway
-    /// exception cannot bloat the log or the in-memory ring. Kept conservative:
-    /// the log never carries request bodies, headers or credentials, only the
-    /// handler's own exception text.</summary>
+    /// <summary>错误日志消息截断（防止超大异常堆栈撑爆日志文件）。</summary>
     static string Redact(string s) {
         if (s == null) { return ""; }
         if (s.Length > 500) { return s.Substring(0, 500); }
         return s;
     }
 
-    /// <summary>The start-up screen for this app: the listener, then every
-    /// service that is actually switched on (routes, views, sessions, uploads,
-    /// rate limit). `procs` is how many processes serve it.</summary>
+    // 限流规则声明：超出阈值时进行保护拦截。
     ServerBanner Banner(int procs) {
         string mode = "single process";
         if (procs > 1) {
@@ -428,11 +380,7 @@ class WebApp {
             // (ctx.WsUpgrade()) slices the frame bytes pipelined behind the
             // handshake head out of it. Idle during normal request/response.
             ctx.__SetFramer(framer);
-            // Hand the deadline slot to the context: a stream handler that
-            // intends to outlive requestTimeoutMs (SSE relay) re-arms the
-            // slot through ctx.TouchDeadline() as long as the upstream is
-            // alive, so the sweeper only cuts connections that are truly
-            // abandoned — never one that is mid-stream.
+            /// <summary>请求到达与响应处理的超时时限（毫秒）。</summary>
             ctx.__SetDeadlineSlot(watch, this.requestTimeoutMs);
             Route route = this.router.Match(ctx);
 
@@ -579,12 +527,7 @@ class WebApp {
         return new byte[size + 1];
     }
 
-    /// <summary>Full request pipeline: hooks -> rate limit -> auth -> route.
-    /// Times the whole pipeline with a monotonic MICROSECOND clock and feeds the
-    /// shared ServerMetrics (throughput / latency / slow requests) for
-    /// /admin/stats. Microseconds because a request served in 200us is invisible
-    /// to the millisecond clock (~15.6ms per tick on Windows), which reported
-    /// every fast endpoint as "0 ms".</summary>
+    // 限流规则声明：超出阈值时进行保护拦截。
     async string Dispatch(HttpContext ctx, Route route, bool keepAlive) {
         long startUs = ServerMetrics.MonoMicros();
         long _n = this.totalRequests.Increment();
@@ -602,17 +545,7 @@ class WebApp {
         if (ctx.MetricsExcluded()) {
             this.metrics.StreamClosed(ctx.Frames(), ctx.FrameBytes());
         }
-        // A hijacked connection (SSE, upgrade) lives for as long as the client
-        // keeps it open, so its duration is not a latency sample: recording it
-        // would report every open dashboard as a multi-minute slow request.
-        // Only what the server actually serves is an interface, and only an
-        // interface is worth a per-endpoint row: a 404, a 405 and a scanner
-        // walking /wp-login.php are counted (a probed server must not read as
-        // idle) but never keyed by the URL they invented -- that would turn the
-        // monitor into a mirror for whatever anyone typed at it, one row per
-        // probe. What did serve it named itself in ctx.routePattern: a route by
-        // its registration pattern, an asset by its own path -- both fixed
-        // strings, so the hot path normalizes nothing.
+        /// <summary>未授权重定向的登录页路由（未配置时默认返回 401 JSON）。</summary>
         if (!ctx.MetricsExcluded()) {
             if (ctx.routePattern.Length == 0) {
                 this.metrics.RecordUnmatched(ctx.status, elapsedUs);
@@ -952,12 +885,7 @@ class Hooks {
     }
 }
 
-/// <summary>
-/// Fixed-window rate limiter, the in-process analogue of a swoole_table
-/// counter: one slot per key (route / ip / token), counting requests in the
-/// current window and resetting when the window rolls over. Windows are
-/// wall-clock seconds. Single-threaded event loop => no locking needed.
-/// </summary>
+// 限流规则声明：超出阈值时进行保护拦截。
 class RateLimiter {
     SharedTable table;
     int windowMs;

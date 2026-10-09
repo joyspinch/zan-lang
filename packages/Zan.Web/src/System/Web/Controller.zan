@@ -3,26 +3,7 @@ using System;
 
 namespace System.Web;
 
-/// <summary>
-/// Rich per-request controller base. The attribute-driven router creates ONE
-/// instance per request, binds the <see cref="HttpContext"/>, runs the
-/// controller-level hook, invokes the matched action, then runs the after hook.
-/// Actions are instance methods that read/write through <c>this</c>:
-/// [HttpPost]
-/// [Description("登录")]
-/// void Login() {
-/// string user = this.In("user");
-/// ...
-/// JsonValue body = JsonValue.NewObject();
-/// body.PutStr("token", token);
-/// this.Ok(body.ToJson());
-/// }
-/// Cross-cutting auth (login / permission / rank) is declared with attributes
-/// ([Custom(Authorization = ...)]) and enforced centrally by the dispatcher
-/// before the action runs. Override <see cref="OnBefore"/> / <see cref="OnAfter"/>
-/// for controller-scoped setup / teardown (the equivalent of the reference
-/// project's per-controller hooks).
-/// </summary>
+/// <summary>未授权重定向的登录页路由（未配置时默认返回 401 JSON）。</summary>
 class Controller {
     HttpContext ctx;  // the live request/response context for this instance
     /// 已解析的登录主体 id（匿名时为 ""）。
@@ -35,57 +16,37 @@ class Controller {
         this.uid = c.uid;
     }
 
-    /// <summary>Runs before the action; return false to short-circuit.
-    /// Delegates to the overridable <see cref="OnBefore"/>.</summary>
+    //// <summary>动作前置同步钩子，返回 false 则短路拦截后续执行。</summary>
     bool __Before() { return this.OnBefore(); }
 
-    /// <summary>Setup on the request coroutine, so it can await: a controller
-    /// that hands out table accessors leases this request's connection here,
-    /// before the action runs, because an accessor is a plain property and
-    /// cannot await. The generated trampoline awaits this one; it defaults to
-    /// the synchronous <see cref="OnBefore"/> hook so existing controllers keep
-    /// working.</summary>
+    //// <summary>动作前置异步钩子，运行于请求协程内以支持等待 I/O 资源。</summary>
     async bool __BeforeAsync() { return await this.OnBeforeAsync(); }
 
-    /// <summary>[ReadOnly] request intent, set by the generated route before
-    /// OnBeforeAsync acquires a connection. Plain controllers ignore it.</summary>
+    //// <summary>路由意图标记 (ReadOnly)：供连接池按读写分离获取数据库连接。</summary>
     virtual void __UseReadOnly() { }
 
-    /// <summary>Awaitable controller setup. Override this (instead of
-    /// <see cref="OnBefore"/>) when the preparation performs I/O.</summary>
+    //// <summary>控制器异步前置设置，支持重写以执行依赖准备工作。</summary>
     virtual async bool OnBeforeAsync() { return this.OnBefore(); }
 
     /// <summary>Runs after the action (only when __Before returned true).</summary>
     void __After() { this.OnAfter(); }
 
-    /// <summary>Teardown on the request coroutine, so it can await: releasing a
-    /// pooled connection may have to roll back a transaction first, and on a
-    /// non-blocking driver that rollback is itself an awaited round trip. The
-    /// generated trampoline awaits this one; it defaults to the synchronous
-    /// <see cref="OnAfter"/> hook so existing controllers keep working.</summary>
+    //// <summary>动作后置异步清理钩子，释放事务或归还连接池资源。</summary>
     async void __AfterAsync() { await this.OnAfterAsync(); }
 
-    /// <summary>Awaitable controller teardown. Override this (instead of
-    /// <see cref="OnAfter"/>) when cleanup performs I/O.</summary>
+    //// <summary>控制器异步后置清理，支持重写以处理资源回收。</summary>
     virtual async void OnAfterAsync() { this.OnAfter(); }
 
-    /// <summary>[Tx] trampoline hook: open the request-scoped transaction.
-    /// Return false when the store is unavailable, so the request is answered
-    /// 503 rather than pretending the write happened. The default is a no-op
-    /// success so plain controllers compile unchanged; a DB-backed base class
-    /// (the templates' AppController) overrides it with its lease.</summary>
+    //// <summary>[Tx] 声明式事务跳板钩子：开启请求级事务，失败时返回 false。</summary>
     virtual async bool __TxBegin() { return true; }
 
-    /// <summary>[Tx] trampoline hook: commit after the action succeeded.
-    /// No-op by default.</summary>
+    /// <summary>[Tx] 声明式事务跳板钩子：开启请求级事务，失败时返回 false。</summary>
     virtual async void __TxCommit() { }
 
-    /// <summary>[Tx] trampoline hook: roll back on the failure paths. Must be
-    /// safe to call twice and safe to call after commit; no-op by default.</summary>
+    /// <summary>[Tx] 声明式事务跳板钩子：开启请求级事务，失败时返回 false。</summary>
     virtual async void __TxRollback() { }
 
-    /// <summary>Controller-level hook; override to guard/prepare every action
-    /// in this controller. Return false to stop the request.</summary>
+    /// <summary>控制器级前置守卫钩子，返回 false 拦截请求。</summary>
     virtual bool OnBefore() { return true; }
 
     /// <summary>Controller-level teardown hook; override as needed.</summary>
@@ -121,12 +82,7 @@ class Controller {
     /// 原始请求正文。
     string Body() { return this.ctx.Body(); }
 
-    // ---- required input -----------------------------------------------------
-    // `Need` is `In` for a parameter the action cannot proceed without: it reads
-    // as one expression in the middle of the action (no `if (x.Length == 0)`
-    // ladder repeating the same 400 in every handler) and aborts with the
-    // uniform {"code":"0003"} answer when the value is missing. `label` is the
-    // human name used both in that message and in the generated API docs.
+    // 必要参数校验与提取。
 
     /// <summary>Required text parameter; aborts with 400/0003 when empty.</summary>
     string Need(string name, string label) {
@@ -142,8 +98,7 @@ class Controller {
         return v;
     }
 
-    /// <summary>Required integer parameter. A missing value and a non-numeric one
-    /// are the same client mistake, so both answer the same way.</summary>
+    /// <summary>获取必填整数参数（缺失或非整数时中断并返回 400）。</summary>
     int NeedInt(string name, string label) {
         string raw = this.ctx.In(name);
         if (raw.Length == 0) { throw new ApiError(400, "0003", label + "不能为空"); }
@@ -163,8 +118,7 @@ class Controller {
         return v;
     }
 
-    /// <summary>Required number parameter (aborts with 400/0003 when missing
-    /// or not numeric).</summary>
+    /// <summary>获取必填数值参数（缺失或非数值时中断并返回 400）。</summary>
     double NeedDouble(string name, string label) {
         string raw = this.ctx.In(name);
         if (raw.Length == 0) { throw new ApiError(400, "0003", label + "不能为空"); }
@@ -174,8 +128,7 @@ class Controller {
         return v;
     }
 
-    /// <summary>Required flag parameter (aborts only when missing; the value
-    /// words are the same ones <c>InBool</c> accepts).</summary>
+    /// <summary>获取必填布尔标记参数（缺失时中断并返回 400）。</summary>
     bool NeedBool(string name, string label) {
         string raw = this.ctx.In(name);
         if (raw.Length == 0) { throw new ApiError(400, "0003", label + "不能为空"); }

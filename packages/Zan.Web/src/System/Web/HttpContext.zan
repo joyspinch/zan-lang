@@ -7,21 +7,14 @@ using System;
 
 namespace System.Web;
 
-/// The uniform API envelope body. `data` is a JsonValue passthrough: the
-/// caller supplies a JSON literal (object/array/string) that is parsed back
-/// into the tree before serialization.
+/// 统一 API 响应信封模型：包含 code、msg、data 与 traceId。
 class ApiEnvelope {
     string code;
     string msg;
     JsonValue data;
 }
 
-/// <summary>
-/// Per-request context: parsed request data (query / form / route params /
-/// cookies) plus the response the handler builds (status / headers / body).
-/// One HttpContext is created per request and dropped when it is answered,
-/// so ARC reclaims everything without a request-scoped pool.
-/// </summary>
+/// <summary>单请求上下文：封装请求参数、Cookie、会话与响应构建器。</summary>
 class HttpContext {
     HttpRequest request;
     string method;
@@ -57,29 +50,18 @@ class HttpContext {
     string statusText;
     string contentType;
     string body;
-    // A body that is bytes rather than text. Zan string length is
-    // strlen-based, so an image, a font or any other payload containing a NUL
-    // byte cannot travel as `body`: it is carried here with an explicit length
-    // and written to the socket by byte count.
+    // 二进制字节响应负载（图片、字体等媒体文件）。
     byte[] bodyBytes;
     int bodyBytesLen;
     List<string> headers;
     bool ended;  // a hook or handler already produced the response
 
-    // ---- streaming (Server-Sent Events) ----
-    // The connection itself, handed over by the server before the handler runs.
-    // A handler that calls SseOpen() takes it over: it writes the response
-    // itself, for as long as the subscriber stays, and the server stops
-    // treating the socket as a request/response exchange.
+    // ---- 流式响应 (SSE / WebSocket) 连接接管 ----
     TcpClient conn;
     bool hijacked;
-    // Sticky: set once the connection is taken over (SSE/upgrade) and never
-    // cleared, unlike `hijacked` which the stream loop resets on disconnect.
-    // The metrics guards read THIS so a closed stream stays excluded from
-    // request / route latency even after `hijacked` has gone back to false.
+    // ---- 流式响应 (SSE / WebSocket) 连接接管 ----
     bool wasHijacked;
-    // What a stream is measured by instead of a duration: how much was pushed
-    // over it. Frames and bytes, counted as they go out.
+    // 流式推送度量：统计已推送的帧数与总字节数。
     long frames;
     long framesBytes;
 
@@ -138,9 +120,7 @@ class HttpContext {
     /// 对端 IPv4 的整数形式（Socket.Ipv4ToLong）。
     long RemoteIpLong() { return Socket.Ipv4ToLong(this.remoteIp); }
 
-    /// <summary>Parses the urlencoded form body again, now that the body has
-    /// finished
-    /// buffering (the initial parse only saw the first packet).</summary>
+    /// <summary>请求体缓冲完成后重新解析表单键值对。</summary>
     static void ParseFormBody(HttpRequest req, HttpContext ctx) {
         if (HttpContext.StartsWith(req.contentType, "application/x-www-form-urlencoded")) {
             ctx.form.Clear();
@@ -291,10 +271,7 @@ class HttpContext {
     /// 原始请求正文。
     string Body() { return this.request.body; }
 
-    /// <summary>Request body as JSON, parsed once and cached. Returns null
-    /// for an empty body. Lenient parse: a malformed body yields whatever
-    /// partial tree the reader recovered rather than an exception — callers
-    /// validating user input should still check the fields they read.</summary>
+    //// <summary>解析并缓存请求体 JSON 对象，空体返回 null。</summary>
     JsonValue JsonBody() {
         if (!this.jsonParsed) {
             this.jsonParsed = true;
@@ -426,18 +403,9 @@ class HttpContext {
         return x == "XMLHttpRequest" || x == "xmlhttprequest";
     }
 
-    // ---- unified, filtered input --------------------------------------------
-    // Prefer these over Form/Query/Param: every frontend parameter is resolved
-    // from the same place (route param -> query -> form, most specific first)
-    // and passed through the central Filter, so sanitising is uniform across
-    // all controllers. An empty value counts as missing (an emptied form field
-    // falls through to the next source instead of shadowing it), matching the
-    // contract http_params pins for the whole family. The generator's route
-    // trampolines emit these same accessors, so attribute-routed actions and
-    // hand-written controllers read parameters identically.
+    // 统一过滤输入：优先使用安全过滤方法读取参数。
 
-    /// <summary>Raw, UNFILTERED value (route param -> query -> form). Only use
-    /// when you deliberately need the untouched bytes.</summary>
+    /// <summary>获取原始未过滤参数值 (优先级：路由参数 -> Query -> Form)。</summary>
     string InRaw(string name) {
         string v = this.routeParams.Get(name);
         if (v.Length > 0) { return v; }
@@ -446,23 +414,18 @@ class HttpContext {
         return this.form.Get(name);
     }
 
-    /// <summary>Filtered value: trimmed, control chars stripped. The default
-    /// safe way to read a parameter.</summary>
+    /// <summary>获取安全过滤后的字符串参数值（自动裁剪首尾空白并剔除控制字符）。</summary>
     string In(string name) { return Filter.Clean(this.InRaw(name)); }
 
     /// <summary>Filtered + HTML-escaped value, safe to render into a page.</summary>
     string InText(string name) { return Filter.Html(this.InRaw(name)); }
 
-    /// <summary>Filtered integer with a fallback for missing/invalid input.
-    /// Full-consumption strict parse with range check: "12abc", "2.5" and
-    /// out-of-range values all fall to `def` (an atoi-style prefix parse
-    /// would accept "12abc" as 12, and an unchecked accumulator would wrap).</summary>
+    /// <summary>获取整数参数值，缺失或格式无效时回退默认值。</summary>
     int InInt(string name, int def) {
         return HttpContext.ParseIntStrict(Filter.Clean(this.InRaw(name)), def);
     }
 
-    /// <summary>Filtered long with a fallback for missing/invalid input.
-    /// Same strict rules as InInt, widened to 64 bits.</summary>
+    /// <summary>获取 64 位长整数参数值，缺失或格式无效时回退默认值。</summary>
     long InLong(string name, long def) {
         return HttpContext.ParseLongStrict(Filter.Clean(this.InRaw(name)), def);
     }
@@ -655,10 +618,7 @@ class HttpContext {
         this.ended = true;
     }
 
-    /// <summary>Uniform API envelope: {"code":...,"msg":...,"data":...}.
-    /// data must already be a JSON value (object/array/string literal); it is
-    /// parsed back into the tree so the envelope is built by the JSON writer,
-    /// never by string concatenation.</summary>
+    // 统一 API 响应信封模型：包含 code、msg、data 与 traceId。
     void Api(string code, string msg, string data) {
         ApiEnvelope o = new ApiEnvelope();
         o.code = code;
@@ -700,18 +660,10 @@ class HttpContext {
         return this.conn.Sock();
     }
 
-    /// <summary>The per-request deadline slot this connection rides on. A
-    /// long-lived stream handler must Touch it periodically (see
-    /// ClientStreamWatch): the connection sweeper shuts sockets down at the
-    /// deadline even mid-stream, which used to cut every SSE response that
-    /// ran past the server's request timeout (default 30s) — the exact
-    /// "upstream never finished but the client got dropped" signature.
-    /// null when the connection predates deadline tracking.</summary>
+    /// <summary>请求到达与响应处理的超时时限（毫秒）。</summary>
     HttpDeadlineToken deadlineSlot;
 
-    // The idle window a stream session (SSE/WS) re-arms on activity: the
-    // app's requestTimeoutMs, captured at attach time so WsSession.Touch
-    // re-arms with exactly the window the connection was armed with.
+    /// <summary>请求到达与响应处理的超时时限（毫秒）。</summary>
     int streamIdleMs;
     // The connection's framing buffer, handed over by the connection loop.
     // A WebSocket upgrade slices the frame bytes that were pipelined behind
@@ -732,13 +684,7 @@ class HttpContext {
     /// 由连接循环注入定界缓冲（WS 升级时从中切出管线其后的帧字节）。
     void __SetFramer(HttpFramer framer) { this.framer = framer; }
 
-    /// <summary>Re-arms this connection's request deadline for another full
-    /// window. A streaming handler calls this every time it has evidence the
-    /// stream is alive — data relayed, or a keep-alive ping accepted. Without
-    /// it the connection sweeper shuts the socket down at requestTimeoutMs
-    /// (default 30s) regardless of stream health, which is why long SSE
-    /// relays used to die mid-answer with "client disconnected".
-    /// No-op when the connection carries no deadline.</summary>
+    /// <summary>请求到达与响应处理的超时时限（毫秒）。</summary>
     void TouchDeadline(int timeoutMs) {
         if (this.deadlineSlot != null) {
             HttpDeadline.Touch(this.deadlineSlot, timeoutMs);

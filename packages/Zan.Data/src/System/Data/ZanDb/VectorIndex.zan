@@ -1,0 +1,809 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+/// A result predicate, never a restriction on traversal through the graph.
+delegate bool VectorFilter(int id);
+
+class VectorIndexOptions {
+    int dimensions;
+    int metric;
+    int m;
+    int efConstruction;
+    int efSearch;
+    int seed;
+
+    VectorIndexOptions() {
+        this.dimensions = 0;
+        this.metric = 0;
+        this.m = 16;
+        this.efConstruction = 100;
+        this.efSearch = 64;
+        this.seed = 1729;
+    }
+
+    VectorIndexOptions(int dimensions) {
+        this.dimensions = dimensions;
+        this.metric = 0;
+        this.m = 16;
+        this.efConstruction = 100;
+        this.efSearch = 64;
+        this.seed = 1729;
+    }
+
+    VectorIndexOptions(int dimensions, int metric) {
+        this.dimensions = dimensions;
+        this.metric = metric;
+        this.m = 16;
+        this.efConstruction = 100;
+        this.efSearch = 64;
+        this.seed = 1729;
+    }
+
+    VectorIndexOptions Clone() {
+        VectorIndexOptions copy = new VectorIndexOptions();
+        copy.dimensions = this.dimensions;
+        copy.metric = this.metric;
+        copy.m = this.m;
+        copy.efConstruction = this.efConstruction;
+        copy.efSearch = this.efSearch;
+        copy.seed = this.seed;
+        return copy;
+    }
+
+    void Validate() {
+        if (this.dimensions < 1 || this.dimensions > 65536) {
+            throw new ArgumentException("Vector dimensions must be in [1,65536]");
+        }
+        if (this.metric != 0 && this.metric != 1) {
+            throw new ArgumentException("Vector metric must be 0 (cosine) or 1 (squared L2)");
+        }
+        if (this.m < 2 || this.m > 128) {
+            throw new ArgumentException("Vector m must be in [2,128]");
+        }
+        if (this.efConstruction < this.m || this.efConstruction > 1000000) {
+            throw new ArgumentException("Vector efConstruction must be in [m,1000000]");
+        }
+        if (this.efSearch < 1 || this.efSearch > 1000000) {
+            throw new ArgumentException("Vector efSearch must be in [1,1000000]");
+        }
+    }
+
+    JsonValue ToJson() {
+        JsonValue obj = JsonValue.NewObject();
+        obj.Put("dimensions", JsonValue.NewInt(this.dimensions));
+        obj.Put("metric", JsonValue.NewInt(this.metric));
+        obj.Put("m", JsonValue.NewInt(this.m));
+        obj.Put("efConstruction", JsonValue.NewInt(this.efConstruction));
+        obj.Put("efSearch", JsonValue.NewInt(this.efSearch));
+        obj.Put("seed", JsonValue.NewInt(this.seed));
+        return obj;
+    }
+
+    /// Configuration accepts omitted optional fields, while requiring dimensions.
+    static VectorIndexOptions FromJson(JsonValue obj) {
+        VectorStateJson.RequireObject(obj);
+        VectorIndexOptions result = new VectorIndexOptions();
+        result.dimensions = VectorStateJson.IntField(obj, "dimensions");
+        if (obj.Has("metric")) { result.metric = VectorStateJson.IntField(obj, "metric"); }
+        if (obj.Has("m")) { result.m = VectorStateJson.IntField(obj, "m"); }
+        if (obj.Has("efConstruction")) { result.efConstruction = VectorStateJson.IntField(obj, "efConstruction"); }
+        if (obj.Has("efSearch")) { result.efSearch = VectorStateJson.IntField(obj, "efSearch"); }
+        if (obj.Has("seed")) { result.seed = VectorStateJson.IntField(obj, "seed"); }
+        result.Validate();
+        return result;
+    }
+}
+
+class VectorHit {
+    int id;
+    double distance;
+
+    VectorHit() { this.id = 0; this.distance = 0; }
+    VectorHit(int id, double distance) { this.id = id; this.distance = distance; }
+}
+
+/// Strict readers are shared by options and the graph checkpoint boundary.
+class VectorStateJson {
+    static void RequireObject(JsonValue obj) {
+        if (obj == null) { throw new ArgumentException("Missing vector state object"); }
+        if (!obj.IsObject()) { throw new ArgumentException("Expected vector state object"); }
+        Dict<string, int> keys = new Dict<string, int>();
+        for (int i = 0; i < obj.Count(); i = i + 1) {
+            string key = obj.KeyAt(i);
+            if (keys.ContainsKey(key)) { throw new ArgumentException("Duplicate vector state key"); }
+            keys.Add(key, 1);
+        }
+    }
+
+    static JsonValue Field(JsonValue obj, string key) {
+        JsonValue value = obj.Get(key);
+        if (value == null) { throw new ArgumentException("Missing vector state field: " + key); }
+        return value;
+    }
+
+    static int IntValue(JsonValue value) {
+        if (value == null) { throw new ArgumentException("Missing vector state integer"); }
+        if (!value.IsNumber()) { throw new ArgumentException("Expected vector state integer"); }
+        double number = value.AsDouble(0);
+        if (number != number || number - number != 0 || number < -2147483648.0 || number > 2147483647.0) {
+            throw new ArgumentException("Vector state integer out of range");
+        }
+        int result = (int)number;
+        if ((double)result != number) { throw new ArgumentException("Fractional vector state integer"); }
+        return result;
+    }
+
+    static int IntField(JsonValue obj, string key) {
+        return VectorStateJson.IntValue(VectorStateJson.Field(obj, key));
+    }
+
+    static JsonValue ArrayField(JsonValue obj, string key) {
+        JsonValue value = VectorStateJson.Field(obj, key);
+        if (!value.IsArray()) { throw new ArgumentException("Expected vector state array: " + key); }
+        return value;
+    }
+}
+
+/// Each chunk owns packed float32 coordinates; graph metadata has no caller arrays.
+class VectorChunk {
+    float[] values;
+    VectorChunk(int size) { this.values = new float[size]; }
+}
+
+class VectorNeighbors {
+    int[] slots;
+    int count;
+    VectorNeighbors(int capacity) { this.slots = new int[capacity]; this.count = 0; }
+
+    bool Contains(int slot) {
+        for (int i = 0; i < this.count; i = i + 1) {
+            if (this.slots[i] == slot) { return true; }
+        }
+        return false;
+    }
+}
+
+class VectorNode {
+    int id;
+    int active;
+    int level;
+    double inverseNorm;
+    List<VectorNeighbors> layers;
+
+    VectorNode(int id, int level, int m, double inverseNorm) {
+        this.id = id;
+        this.active = 1;
+        this.level = level;
+        this.inverseNorm = inverseNorm;
+        this.layers = new List<VectorNeighbors>();
+        this.layers.Add(new VectorNeighbors(m * 2));
+        for (int i = 1; i <= level; i = i + 1) {
+            this.layers.Add(new VectorNeighbors(m));
+        }
+    }
+}
+
+// 向量堆采用平坦数字槽位存储，避免距离评估过程中的动态堆分配。
+class VectorHeap {
+    int[] slots;
+    int[] ids;
+    double[] distances;
+    int count;
+    bool maximum;
+
+    VectorHeap(int capacity, bool maximum) {
+        if (capacity < 4) { capacity = 4; }
+        this.slots = new int[capacity];
+        this.ids = new int[capacity];
+        this.distances = new double[capacity];
+        this.count = 0;
+        this.maximum = maximum;
+    }
+
+    static bool Before(double ad, int ai, int av, double bd, int bi, int bv) {
+        if (ad < bd) { return true; }
+        if (ad > bd) { return false; }
+        if (ai < bi) { return true; }
+        if (ai > bi) { return false; }
+        return av < bv;
+    }
+
+    bool Higher(double ad, int ai, int av, double bd, int bi, int bv) {
+        if (this.maximum) { return VectorHeap.Before(bd, bi, bv, ad, ai, av); }
+        return VectorHeap.Before(ad, ai, av, bd, bi, bv);
+    }
+
+    void Grow() {
+        int capacity = this.slots.Length * 2;
+        int[] ns = new int[capacity];
+        int[] ni = new int[capacity];
+        double[] nd = new double[capacity];
+        for (int i = 0; i < this.count; i = i + 1) {
+            ns[i] = this.slots[i]; ni[i] = this.ids[i]; nd[i] = this.distances[i];
+        }
+        this.slots = ns; this.ids = ni; this.distances = nd;
+    }
+
+    void Push(int slot, int id, double distance) {
+        if (this.count == this.slots.Length) { this.Grow(); }
+        int pos = this.count;
+        this.count = this.count + 1;
+        while (pos > 0) {
+            int parent = (pos - 1) / 2;
+            if (!this.Higher(distance, id, slot, this.distances[parent], this.ids[parent], this.slots[parent])) { break; }
+            this.slots[pos] = this.slots[parent];
+            this.ids[pos] = this.ids[parent];
+            this.distances[pos] = this.distances[parent];
+            pos = parent;
+        }
+        this.slots[pos] = slot; this.ids[pos] = id; this.distances[pos] = distance;
+    }
+
+    void Pop() {
+        this.count = this.count - 1;
+        if (this.count == 0) { return; }
+        int slot = this.slots[this.count];
+        int id = this.ids[this.count];
+        double distance = this.distances[this.count];
+        int pos = 0;
+        while (pos * 2 + 1 < this.count) {
+            int child = pos * 2 + 1;
+            int right = child + 1;
+            if (right < this.count && this.Higher(this.distances[right], this.ids[right], this.slots[right],
+                    this.distances[child], this.ids[child], this.slots[child])) { child = right; }
+            if (!this.Higher(this.distances[child], this.ids[child], this.slots[child], distance, id, slot)) { break; }
+            this.slots[pos] = this.slots[child];
+            this.ids[pos] = this.ids[child];
+            this.distances[pos] = this.distances[child];
+            pos = child;
+        }
+        this.slots[pos] = slot; this.ids[pos] = id; this.distances[pos] = distance;
+    }
+
+    int NearestSlot() {
+        int best = 0;
+        for (int i = 1; i < this.count; i = i + 1) {
+            if (VectorHeap.Before(this.distances[i], this.ids[i], this.slots[i],
+                    this.distances[best], this.ids[best], this.slots[best])) { best = i; }
+        }
+        return this.slots[best];
+    }
+}
+
+/// This workspace belongs to one invocation, including its visited epochs.
+class VectorWorkspace {
+    float[] query;
+    int offset;
+    double inverseNorm;
+    int[] visited;
+    int epoch;
+    long distanceCount;
+
+    VectorWorkspace(float[] query, int offset, double inverseNorm, int count) {
+        this.query = query;
+        this.offset = offset;
+        this.inverseNorm = inverseNorm;
+        this.visited = new int[count];
+        this.epoch = 0;
+        this.distanceCount = 0;
+    }
+}
+
+// 纯 Zan 实现的 HNSW 向量索引（余弦距离与平方 L2 距离）；支持并发只读查询。
+class VectorIndex {
+    VectorIndexOptions options;
+    List<VectorChunk> chunks;
+    List<VectorNode> nodes;
+    Dict<int, int> idSlots;
+    int chunkRows;
+    int entry;
+    int maxLevel;
+    long randomState;
+    AtomicInt lastDistanceCount;
+
+    VectorIndex(VectorIndexOptions options) {
+        if (options == null) { throw new ArgumentException("Missing vector options"); }
+        options.Validate();
+        this.options = options.Clone();
+        this.chunks = new List<VectorChunk>();
+        this.nodes = new List<VectorNode>();
+        this.idSlots = new Dict<int, int>();
+        this.chunkRows = 65536 / options.dimensions;
+        if (this.chunkRows > 256) { this.chunkRows = 256; }
+        this.entry = -1;
+        this.maxLevel = -1;
+        long seedValue = (long)options.seed % 2147483646;
+        if (seedValue < 0) { seedValue = seedValue + 2147483646; }
+        this.randomState = seedValue + 1;
+        this.lastDistanceCount = new AtomicInt(0);
+    }
+
+    VectorIndexOptions Options() { return this.options.Clone(); }
+    int Count() { return this.idSlots.Count; }
+    long LastDistanceCount() { return this.lastDistanceCount.Load(); }
+
+    int NextLevel() {
+        int level = 0;
+        while (level < 32) {
+            this.randomState = (this.randomState * 48271) % 2147483647;
+            if (this.randomState % this.options.m != 0) { break; }
+            level = level + 1;
+        }
+        return level;
+    }
+
+    void ValidateDimensions(float[] vector) {
+        if (vector == null) { throw new ArgumentException("Missing vector"); }
+        if (vector.Length != this.options.dimensions) { throw new ArgumentException("Vector dimension mismatch"); }
+    }
+
+    double ValidateCoordinates(float[] vector, int offset) {
+        double norm = 0;
+        for (int i = 0; i < this.options.dimensions; i = i + 1) {
+            double value = (double)vector[offset + i];
+            if (value != value || value - value != 0) { throw new ArgumentException("Vector coordinates must be finite"); }
+            norm = norm + value * value;
+        }
+        if (this.options.metric == 0) {
+            if (norm <= 0) { throw new ArgumentException("Cosine vector norm must be positive"); }
+            return 1.0 / Math.Sqrt(norm);
+        }
+        return 0;
+    }
+
+    double ValidateVector(float[] vector) {
+        this.ValidateDimensions(vector);
+        return this.ValidateCoordinates(vector, 0);
+    }
+
+    void CopyIntoSlot(int slot, float[] vector) {
+        int chunk = slot / this.chunkRows;
+        if (chunk == this.chunks.Count) {
+            this.chunks.Add(new VectorChunk(this.chunkRows * this.options.dimensions));
+        }
+        VectorChunk owner = this.chunks[chunk];
+        int offset = (slot % this.chunkRows) * this.options.dimensions;
+        for (int i = 0; i < this.options.dimensions; i = i + 1) {
+            owner.values[offset + i] = vector[i];
+        }
+    }
+
+    float[] CopyVector(int slot) {
+        VectorChunk owner = this.chunks[slot / this.chunkRows];
+        int offset = (slot % this.chunkRows) * this.options.dimensions;
+        float[] vector = new float[this.options.dimensions];
+        for (int i = 0; i < vector.Length; i = i + 1) { vector[i] = owner.values[offset + i]; }
+        return vector;
+    }
+
+    double DistanceTo(VectorWorkspace work, int slot) {
+        work.distanceCount = work.distanceCount + 1;
+        VectorChunk owner = this.chunks[slot / this.chunkRows];
+        int offset = (slot % this.chunkRows) * this.options.dimensions;
+        double sum = 0;
+        if (this.options.metric == 1) {
+            for (int i = 0; i < this.options.dimensions; i = i + 1) {
+                double delta = (double)work.query[work.offset + i] - (double)owner.values[offset + i];
+                sum = sum + delta * delta;
+            }
+            return sum;
+        }
+        for (int i = 0; i < this.options.dimensions; i = i + 1) {
+            sum = sum + (double)work.query[work.offset + i] * (double)owner.values[offset + i];
+        }
+        double distance = 1.0 - sum * work.inverseNorm * this.nodes[slot].inverseNorm;
+        if (distance < 0) { return 0; }
+        if (distance > 2) { return 2; }
+        return distance;
+    }
+
+    double DistanceBetween(int a, int b) {
+        VectorChunk ca = this.chunks[a / this.chunkRows];
+        VectorChunk cb = this.chunks[b / this.chunkRows];
+        int oa = (a % this.chunkRows) * this.options.dimensions;
+        int ob = (b % this.chunkRows) * this.options.dimensions;
+        double sum = 0;
+        if (this.options.metric == 1) {
+            for (int i = 0; i < this.options.dimensions; i = i + 1) {
+                double delta = (double)ca.values[oa + i] - (double)cb.values[ob + i];
+                sum = sum + delta * delta;
+            }
+            return sum;
+        }
+        for (int i = 0; i < this.options.dimensions; i = i + 1) {
+            sum = sum + (double)ca.values[oa + i] * (double)cb.values[ob + i];
+        }
+        double distance = 1.0 - sum * this.nodes[a].inverseNorm * this.nodes[b].inverseNorm;
+        if (distance < 0) { return 0; }
+        if (distance > 2) { return 2; }
+        return distance;
+    }
+
+    bool Current(int slot) {
+        VectorNode node = this.nodes[slot];
+        if (node.active == 0) { return false; }
+        if (!this.idSlots.ContainsKey(node.id)) { return false; }
+        return this.idSlots[node.id] == slot;
+    }
+
+    bool Admit(int slot, bool activeOnly, VectorFilter filter) {
+        if (!activeOnly) { return true; }
+        if (!this.Current(slot)) { return false; }
+        if (filter == null) { return true; }
+        return filter(this.nodes[slot].id);
+    }
+
+    int Greedy(VectorWorkspace work, int start, int layer) {
+        int best = start;
+        double bestDistance = this.DistanceTo(work, best);
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            VectorNeighbors neighbors = this.nodes[best].layers[layer];
+            for (int i = 0; i < neighbors.count; i = i + 1) {
+                int candidate = neighbors.slots[i];
+                double distance = this.DistanceTo(work, candidate);
+                if (VectorHeap.Before(distance, this.nodes[candidate].id, candidate,
+                        bestDistance, this.nodes[best].id, best)) {
+                    best = candidate;
+                    bestDistance = distance;
+                    changed = true;
+                }
+            }
+        }
+        return best;
+    }
+
+    VectorHeap SearchLayer(VectorWorkspace work, int start, int layer, int ef,
+            bool activeOnly, VectorFilter filter) {
+        VectorHeap candidates = new VectorHeap(ef + 1, false);
+        VectorHeap nearest = new VectorHeap(ef + 1, true);
+        work.epoch = work.epoch + 1;
+        work.visited[start] = work.epoch;
+        double firstDistance = this.DistanceTo(work, start);
+        candidates.Push(start, this.nodes[start].id, firstDistance);
+        if (this.Admit(start, activeOnly, filter)) { nearest.Push(start, this.nodes[start].id, firstDistance); }
+        while (candidates.count > 0) {
+            int current = candidates.slots[0];
+            double currentDistance = candidates.distances[0];
+            // A distance-only stop explores equal distances before id tie ordering.
+            if (nearest.count >= ef && currentDistance > nearest.distances[0]) { break; }
+            candidates.Pop();
+            VectorNeighbors neighbors = this.nodes[current].layers[layer];
+            for (int i = 0; i < neighbors.count; i = i + 1) {
+                int neighbor = neighbors.slots[i];
+                if (work.visited[neighbor] == work.epoch) { continue; }
+                work.visited[neighbor] = work.epoch;
+                double distance = this.DistanceTo(work, neighbor);
+                int id = this.nodes[neighbor].id;
+                if (nearest.count < ef || distance <= nearest.distances[0]) {
+                    // Ineligible/tombstoned nodes still enter the routing heap.
+                    candidates.Push(neighbor, id, distance);
+                    if (this.Admit(neighbor, activeOnly, filter)) {
+                        nearest.Push(neighbor, id, distance);
+                        if (nearest.count > ef) { nearest.Pop(); }
+                    }
+                }
+            }
+        }
+        return nearest;
+    }
+
+    /// HNSW diversity heuristic, with rejected neighbors used to fill spare slots.
+    VectorNeighbors SelectNeighbors(int center, VectorHeap candidates, int limit) {
+        VectorHeap ordered = new VectorHeap(candidates.count + 1, false);
+        for (int i = 0; i < candidates.count; i = i + 1) {
+            ordered.Push(candidates.slots[i], candidates.ids[i], candidates.distances[i]);
+        }
+        VectorNeighbors selected = new VectorNeighbors(limit);
+        List<int> rejected = new List<int>();
+        while (ordered.count > 0 && selected.count < limit) {
+            int candidate = ordered.slots[0];
+            double distance = ordered.distances[0];
+            ordered.Pop();
+            if (candidate == center || selected.Contains(candidate)) { continue; }
+            bool diverse = true;
+            for (int i = 0; i < selected.count; i = i + 1) {
+                if (this.DistanceBetween(candidate, selected.slots[i]) < distance) { diverse = false; break; }
+            }
+            if (diverse) {
+                selected.slots[selected.count] = candidate;
+                selected.count = selected.count + 1;
+            } else { rejected.Add(candidate); }
+        }
+        for (int i = 0; i < rejected.Count && selected.count < limit; i = i + 1) {
+            int candidate = rejected[i];
+            if (!selected.Contains(candidate)) {
+                selected.slots[selected.count] = candidate;
+                selected.count = selected.count + 1;
+            }
+        }
+        return selected;
+    }
+
+    void Link(int from, int to, int layer) {
+        VectorNeighbors neighbors = this.nodes[from].layers[layer];
+        if (neighbors.Contains(to)) { return; }
+        if (neighbors.count < neighbors.slots.Length) {
+            neighbors.slots[neighbors.count] = to;
+            neighbors.count = neighbors.count + 1;
+            return;
+        }
+        VectorHeap candidates = new VectorHeap(neighbors.count + 1, false);
+        for (int i = 0; i < neighbors.count; i = i + 1) {
+            int slot = neighbors.slots[i];
+            candidates.Push(slot, this.nodes[slot].id, this.DistanceBetween(from, slot));
+        }
+        candidates.Push(to, this.nodes[to].id, this.DistanceBetween(from, to));
+        this.nodes[from].layers[layer] = this.SelectNeighbors(from, candidates, neighbors.slots.Length);
+    }
+
+    // 将传入向量一次性复制至紧凑连续存储；更新时保留旧槽位可达性。
+    void Add(int id, float[] vector) {
+        this.ValidateDimensions(vector);
+        int slot = this.nodes.Count;
+        if (slot >= 2147483646) { throw new InvalidOperationException("Vector slot capacity exhausted"); }
+        this.CopyIntoSlot(slot, vector);
+        VectorChunk owner = this.chunks[slot / this.chunkRows];
+        int offset = (slot % this.chunkRows) * this.options.dimensions;
+        // Validate the owned copy before changing RNG, mapping, or graph state.
+        double inverseNorm = this.ValidateCoordinates(owner.values, offset);
+        int level = this.NextLevel();
+        VectorNode node = new VectorNode(id, level, this.options.m, inverseNorm);
+        this.nodes.Add(node);
+        if (this.idSlots.ContainsKey(id)) { this.nodes[this.idSlots[id]].active = 0; }
+        this.idSlots[id] = slot;
+        // Dict builds its hash index lazily; finish that write before readers run.
+        this.idSlots.ContainsKey(id);
+        if (this.entry < 0) { this.entry = slot; this.maxLevel = level; return; }
+        VectorWorkspace work = new VectorWorkspace(owner.values, offset, inverseNorm, this.nodes.Count);
+        int current = this.entry;
+        for (int layer = this.maxLevel; layer > level; layer = layer - 1) {
+            current = this.Greedy(work, current, layer);
+        }
+        int top = level;
+        if (top > this.maxLevel) { top = this.maxLevel; }
+        int constructionEf = this.options.efConstruction;
+        if (constructionEf > slot) { constructionEf = slot; }
+        for (int layer = top; layer >= 0; layer = layer - 1) {
+            VectorHeap candidates = this.SearchLayer(work, current, layer, constructionEf, false, null);
+            int next = candidates.NearestSlot();
+            VectorNeighbors selected = this.SelectNeighbors(slot, candidates, this.options.m);
+            for (int i = 0; i < selected.count; i = i + 1) {
+                int neighbor = selected.slots[i];
+                this.Link(slot, neighbor, layer);
+                this.Link(neighbor, slot, layer);
+            }
+            current = next;
+        }
+        if (level > this.maxLevel) { this.entry = slot; this.maxLevel = level; }
+    }
+
+    bool Remove(int id) {
+        if (!this.idSlots.ContainsKey(id)) { return false; }
+        this.nodes[this.idSlots[id]].active = 0;
+        this.idSlots.Remove(id);
+        // Remove invalidates Dict's hash index even when the count is unchanged.
+        this.idSlots.ContainsKey(id);
+        return true;
+    }
+
+    VectorWorkspace QueryWorkspace(float[] query) {
+        this.ValidateDimensions(query);
+        float[] owned = new float[this.options.dimensions];
+        for (int i = 0; i < owned.Length; i = i + 1) { owned[i] = query[i]; }
+        double inverseNorm = this.ValidateCoordinates(owned, 0);
+        return new VectorWorkspace(owned, 0, inverseNorm, this.nodes.Count);
+    }
+
+    int QueryLimit(int k) {
+        if (k < 0 || k > 1000000) { throw new ArgumentException("Vector k must be in [0,1000000]"); }
+        if (k > this.Count()) { return this.Count(); }
+        return k;
+    }
+
+    List<VectorHit> Hits(VectorHeap nearest, int k) {
+        while (nearest.count > k) { nearest.Pop(); }
+        List<VectorHit> hits = new List<VectorHit>();
+        while (nearest.count > 0) {
+            hits.Add(new VectorHit(nearest.ids[0], nearest.distances[0]));
+            nearest.Pop();
+        }
+        hits.Reverse();
+        return hits;
+    }
+
+    /// efSearch=0 selects the cloned option default; the effective ef is >= k.
+    List<VectorHit> Search(float[] query, int k, int efSearch) {
+        return this.SearchFiltered(query, k, efSearch, null);
+    }
+
+    List<VectorHit> SearchFiltered(float[] query, int k, int efSearch, VectorFilter filter) {
+        int limit = this.QueryLimit(k);
+        if (efSearch < 0 || efSearch > 1000000) { throw new ArgumentException("Vector efSearch must be in [0,1000000]"); }
+        if (efSearch == 0) { efSearch = this.options.efSearch; }
+        if (efSearch < limit) { efSearch = limit; }
+        if (efSearch > this.nodes.Count) { efSearch = this.nodes.Count; }
+        VectorWorkspace work = this.QueryWorkspace(query);
+        if (limit == 0) { this.lastDistanceCount.Store(0); return new List<VectorHit>(); }
+        int current = this.entry;
+        for (int layer = this.maxLevel; layer > 0; layer = layer - 1) {
+            current = this.Greedy(work, current, layer);
+        }
+        VectorHeap nearest = this.SearchLayer(work, current, 0, efSearch, true, filter);
+        List<VectorHit> hits = this.Hits(nearest, limit);
+        this.lastDistanceCount.Store(work.distanceCount);
+        return hits;
+    }
+
+    List<VectorHit> SearchExact(float[] query, int k) {
+        return this.SearchExactFiltered(query, k, null);
+    }
+
+    List<VectorHit> SearchExactFiltered(float[] query, int k, VectorFilter filter) {
+        int limit = this.QueryLimit(k);
+        VectorWorkspace work = this.QueryWorkspace(query);
+        VectorHeap nearest = new VectorHeap(limit + 1, true);
+        if (limit > 0) {
+            for (int slot = 0; slot < this.nodes.Count; slot = slot + 1) {
+                if (!this.Admit(slot, true, filter)) { continue; }
+                double distance = this.DistanceTo(work, slot);
+                nearest.Push(slot, this.nodes[slot].id, distance);
+                if (nearest.count > limit) { nearest.Pop(); }
+            }
+        }
+        List<VectorHit> hits = this.Hits(nearest, limit);
+        this.lastDistanceCount.Store(work.distanceCount);
+        return hits;
+    }
+
+    /// Compaction rebuilds in doc-id order from the original seed, so histories
+    /// with the same active records produce the same new graph.
+    void Rebuild() {
+        VectorHeap active = new VectorHeap(this.Count() + 1, false);
+        for (int slot = 0; slot < this.nodes.Count; slot = slot + 1) {
+            if (this.Current(slot)) { active.Push(slot, this.nodes[slot].id, 0); }
+        }
+        VectorIndex rebuilt = new VectorIndex(this.options);
+        while (active.count > 0) {
+            int slot = active.slots[0];
+            rebuilt.Add(this.nodes[slot].id, this.CopyVector(slot));
+            active.Pop();
+        }
+        this.chunks = rebuilt.chunks;
+        this.nodes = rebuilt.nodes;
+        this.idSlots = rebuilt.idSlots;
+        this.entry = rebuilt.entry;
+        this.maxLevel = rebuilt.maxLevel;
+        this.randomState = rebuilt.randomState;
+        this.lastDistanceCount.Store(0);
+    }
+
+    /// Checkpoint graph slots, including tombstones needed for traversal/replay.
+    /// Coordinates remain original float32, widened to roundtrip JSON doubles;
+    /// cosine normalization is recomputed on import, never trusted from disk.
+    JsonValue ExportState() {
+        JsonValue state = JsonValue.NewObject();
+        state.Put("format", JsonValue.NewInt(1));
+        state.Put("options", this.options.ToJson());
+        state.Put("entry", JsonValue.NewInt(this.entry));
+        state.Put("maxLevel", JsonValue.NewInt(this.maxLevel));
+        state.Put("rng", JsonValue.NewInt(this.randomState));
+        JsonValue records = JsonValue.NewArray();
+        for (int slot = 0; slot < this.nodes.Count; slot = slot + 1) {
+            VectorNode node = this.nodes[slot];
+            JsonValue record = JsonValue.NewObject();
+            record.Put("id", JsonValue.NewInt(node.id));
+            record.Put("active", JsonValue.NewInt(node.active));
+            record.Put("level", JsonValue.NewInt(node.level));
+            JsonValue vector = JsonValue.NewArray();
+            VectorChunk owner = this.chunks[slot / this.chunkRows];
+            int offset = (slot % this.chunkRows) * this.options.dimensions;
+            for (int i = 0; i < this.options.dimensions; i = i + 1) {
+                vector.Append(JsonValue.NewDouble((double)owner.values[offset + i]));
+            }
+            record.Put("vector", vector);
+            JsonValue layers = JsonValue.NewArray();
+            for (int layer = 0; layer <= node.level; layer = layer + 1) {
+                JsonValue edges = JsonValue.NewArray();
+                VectorNeighbors neighbors = node.layers[layer];
+                for (int i = 0; i < neighbors.count; i = i + 1) { edges.Append(JsonValue.NewInt(neighbors.slots[i])); }
+                layers.Append(edges);
+            }
+            record.Put("layers", layers);
+            records.Append(record);
+        }
+        state.Put("nodes", records);
+        return state;
+    }
+
+    /// Invalid checkpoint data throws ArgumentException before any index escapes.
+    /// Import is O(nodes*dimensions + edges), and does not rerun HNSW construction.
+    static VectorIndex ImportState(JsonValue state) {
+        VectorStateJson.RequireObject(state);
+        if (VectorStateJson.IntField(state, "format") != 1) { throw new ArgumentException("Unsupported vector state format"); }
+        VectorIndexOptions options = VectorIndexOptions.FromJson(VectorStateJson.Field(state, "options"));
+        VectorIndex result = new VectorIndex(options);
+        JsonValue records = VectorStateJson.ArrayField(state, "nodes");
+        int count = records.Count();
+        if (count >= 2147483646) { throw new ArgumentException("Vector state has too many nodes"); }
+        int highest = -1;
+        for (int slot = 0; slot < count; slot = slot + 1) {
+            JsonValue record = records.At(slot);
+            VectorStateJson.RequireObject(record);
+            int id = VectorStateJson.IntField(record, "id");
+            int active = VectorStateJson.IntField(record, "active");
+            int level = VectorStateJson.IntField(record, "level");
+            if (active != 0 && active != 1) { throw new ArgumentException("Invalid vector active flag"); }
+            if (level < 0 || level > 32) { throw new ArgumentException("Invalid vector node level"); }
+            JsonValue coordinates = VectorStateJson.ArrayField(record, "vector");
+            if (coordinates.Count() != options.dimensions) { throw new ArgumentException("Invalid checkpoint vector dimensions"); }
+            float[] vector = new float[options.dimensions];
+            for (int i = 0; i < vector.Length; i = i + 1) {
+                JsonValue coordinate = coordinates.At(i);
+                if (coordinate == null) { throw new ArgumentException("Missing checkpoint coordinate"); }
+                if (!coordinate.IsNumber()) { throw new ArgumentException("Invalid checkpoint coordinate"); }
+                double value = coordinate.AsDouble(0);
+                if (value != value || value - value != 0) {
+                    throw new ArgumentException("Checkpoint coordinate must be finite float32");
+                }
+                // Round at the float32 boundary, then validate the stored value.
+                // A decimal near FLT_MAX can be above its widened double value
+                // while still rounding to the same finite float32 coordinate.
+                vector[i] = (float)value;
+            }
+            double inverseNorm = result.ValidateVector(vector);
+            VectorNode node = new VectorNode(id, level, options.m, inverseNorm);
+            node.active = active;
+            result.CopyIntoSlot(slot, vector);
+            result.nodes.Add(node);
+            if (active == 1) {
+                if (result.idSlots.ContainsKey(id)) { throw new ArgumentException("Duplicate active checkpoint id"); }
+                result.idSlots.Add(id, slot);
+            }
+            if (level > highest) { highest = level; }
+        }
+        for (int slot = 0; slot < count; slot = slot + 1) {
+            JsonValue record = records.At(slot);
+            JsonValue layers = VectorStateJson.ArrayField(record, "layers");
+            VectorNode node = result.nodes[slot];
+            if (layers.Count() != node.level + 1) { throw new ArgumentException("Invalid checkpoint layer count"); }
+            for (int layer = 0; layer <= node.level; layer = layer + 1) {
+                JsonValue edges = layers.At(layer);
+                if (edges == null) { throw new ArgumentException("Missing checkpoint edges"); }
+                if (!edges.IsArray()) { throw new ArgumentException("Invalid checkpoint edges"); }
+                VectorNeighbors neighbors = node.layers[layer];
+                if (edges.Count() > neighbors.slots.Length) { throw new ArgumentException("Checkpoint neighbor bound exceeded"); }
+                for (int i = 0; i < edges.Count(); i = i + 1) {
+                    int target = VectorStateJson.IntValue(edges.At(i));
+                    if (target < 0 || target >= count || target == slot) { throw new ArgumentException("Invalid checkpoint edge target"); }
+                    if (result.nodes[target].level < layer || neighbors.Contains(target)) {
+                        throw new ArgumentException("Invalid checkpoint layer edge");
+                    }
+                    neighbors.slots[neighbors.count] = target;
+                    neighbors.count = neighbors.count + 1;
+                }
+            }
+        }
+        result.entry = VectorStateJson.IntField(state, "entry");
+        result.maxLevel = VectorStateJson.IntField(state, "maxLevel");
+        int rng = VectorStateJson.IntField(state, "rng");
+        if (rng < 1 || rng >= 2147483647) { throw new ArgumentException("Invalid checkpoint RNG state"); }
+        result.randomState = rng;
+        if (count == 0) {
+            if (result.entry != -1 || result.maxLevel != -1) { throw new ArgumentException("Invalid empty checkpoint entry"); }
+        } else {
+            if (result.entry < 0 || result.entry >= count || result.maxLevel != highest) {
+                throw new ArgumentException("Invalid checkpoint entry or maximum level");
+            }
+            if (result.nodes[result.entry].level != result.maxLevel) { throw new ArgumentException("Checkpoint entry level mismatch"); }
+            // Complete the lazy id index under exclusive import ownership.
+            result.idSlots.ContainsKey(result.nodes[result.entry].id);
+        }
+        return result;
+    }
+}
