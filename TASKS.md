@@ -15,4 +15,3 @@
 
 - [ ] IDE-1 跨文件重命名缺预览与全局撤销：挂钩点在 CodeNav 异步重命名管线（RenameSymbolAsync/FinishRenamePlanCommit，尚在会话在途未落地 HEAD）。落地后在 FinishRenamePlanCommit 提交磁盘前调 PushRenameHistory（计划条目含 originalText/newText/open/version），撤销=校验当前性（打开页签 body==newText、磁盘==newText）→ RollbackRenameDiskPlan 语义还盘 → 恢复打开页签 body → 重载活动编辑器 → lspSess.SyncDoc → 注册撤销命令。
 - [ ] IDE-2 设计稿 head 重建不保真：Html.zan 解析器有意丢弃 head 的 meta/link/title（只透传 head data-* 与 style css），ToJsonDoc 无法还原。需解析器保留 head 元数据通道后，DesignerHtml.FromJsonDoc 才能重建原 head。
-- [ ] IDE-3 检查器 PropertyGrid 绑定行（name/text/span/bind 等直绑字段）不在撤销栈：PropertyGrid 在 p.Write 之后才发 Change 事件，Inspector 侧钩不到首键之前的快照；需在 PropertyGrid 组件内加「写前会话钩子」（按行焦点判定会话首变）。
