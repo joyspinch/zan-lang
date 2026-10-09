@@ -783,6 +783,8 @@ struct zan_irgen {
     LLVMValueRef current_async_self_i8;         /* cached (i8*)frame bitcast */
     LLVMValueRef current_async_self_int;        /* cached (uintptr_t)(i8*)frame */
     LLVMValueRef current_async_child_ptr;       /* cached &frame->child GEP */
+    LLVMValueRef current_async_sub_slot_ptr;    /* cached &frame->sub_slot GEP */
+    LLVMValueRef current_async_result_ptr;      /* cached &frame->result GEP */
     /* Persistent per-function IR compaction state (owned by irgen.c). */
     void        *function_compactor;
     /* async exception handling: the eh-stack depth on entry to the $resume

@@ -507,6 +507,14 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
        蹦床 setjmp 成功后直接 `br label %co.dispatch`。直接消灭约 90% async 方法中 5 个死块及几十条死指令。
        （注意：在 `emit_async_method_ir` 入口与恢复栈中必须完整暂存与更新 `g->current_async_try_count = w->try_count`，
        切忌漏传导致有 try 的方法被误判跳过 catch handler 重防引发未捕获异常）。
+     - **挂起点与内置 I/O 槽位指针单例缓存（`get_async_sub_slot_ptr` 与 `get_async_result_ptr`）**：
+       每个 `await` 挂起点在挂起前需向堆帧的子任务槽位写入 `sub`（`await.suspend`），恢复后又要从该槽位读出 `sub`（`co.resume`），
+       原本各发射一条重复的 `self.sub_slot` GEP 指令；而在 `Socket.RecvOv`、`Socket.AcceptOv`、`Task.Join` 等内置异步原语中，
+       挂起前写 `ASYNC_FRAME_RESULT`、恢复后又读 `ASYNC_FRAME_RESULT`，原本反复发射相同的 GEP 指令与 `(i8*)self` bitcast。
+       将子任务槽位 `(unsigned)g->current_async_sub_base` 与结果槽位 `ASYNC_FRAME_RESULT` 提升至 `$resume` entry 块
+       惰性单例缓存（`current_async_sub_slot_ptr` 与 `current_async_result_ptr`），在函数级实现 O(1) 共享复用。
+       （注意单编译单元 include 拓扑：`irgen.c` 先包含 `irgen_expr.c` 再包含 `irgen_async.c`，在 `irgen_async.c` 中实现的
+       静态辅助函数若被 `irgen_expr.c` 调用，必须在 `irgen_expr_core.c` 顶层统一前置声明，防止 C99 隐式函数声明错误）。
 
 ## stdlib 肥边治理：独立类分片 + 槽反转 + 实例方法组注入（A332 肥边③④，2026-09-17）
 

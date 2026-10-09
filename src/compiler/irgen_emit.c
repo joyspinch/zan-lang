@@ -975,6 +975,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMValueRef saved_self_i8 = g->current_async_self_i8;
         LLVMValueRef saved_self_int = g->current_async_self_int;
         LLVMValueRef saved_child_ptr = g->current_async_child_ptr;
+        LLVMValueRef saved_sub_slot_ptr = g->current_async_sub_slot_ptr;
+        LLVMValueRef saved_result_ptr = g->current_async_result_ptr;
         LLVMValueRef saved_eh_entry = g->current_async_eh_entry;
         LLVMBasicBlockRef saved_exc_bb = g->current_async_exc_bb;
         LLVMValueRef saved_rearm = g->current_async_rearm_switch;
@@ -1041,6 +1043,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_self_i8 = NULL;
         g->current_async_self_int = NULL;
         g->current_async_child_ptr = NULL;
+        g->current_async_sub_slot_ptr = NULL;
+        g->current_async_result_ptr = NULL;
         g->current_async_eh_entry = NULL;
         g->current_async_exc_bb = NULL;
         g->current_async_rearm_switch = NULL;
@@ -1163,6 +1167,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_self_i8 = saved_self_i8;
         g->current_async_self_int = saved_self_int;
         g->current_async_child_ptr = saved_child_ptr;
+        g->current_async_sub_slot_ptr = saved_sub_slot_ptr;
+        g->current_async_result_ptr = saved_result_ptr;
         g->current_async_eh_entry = saved_eh_entry;
         g->current_async_exc_bb = saved_exc_bb;
         g->current_async_rearm_switch = saved_rearm;

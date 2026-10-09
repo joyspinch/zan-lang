@@ -820,6 +820,30 @@ static LLVMValueRef get_async_child_ptr(zan_irgen_t *g) {
     return g->current_async_child_ptr;
 }
 
+static LLVMValueRef get_async_sub_slot_ptr(zan_irgen_t *g) {
+    if (g->current_async_sub_slot_ptr) return g->current_async_sub_slot_ptr;
+    if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    position_before_entry_terminator(g);
+    g->current_async_sub_slot_ptr = LLVMBuildStructGEP2(g->builder,
+        g->current_async_frame_type, g->current_async_frame,
+        (unsigned)g->current_async_sub_base, "self.sub_slot");
+    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    return g->current_async_sub_slot_ptr;
+}
+
+static LLVMValueRef get_async_result_ptr(zan_irgen_t *g) {
+    if (g->current_async_result_ptr) return g->current_async_result_ptr;
+    if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    position_before_entry_terminator(g);
+    g->current_async_result_ptr = LLVMBuildStructGEP2(g->builder,
+        g->current_async_frame_type, g->current_async_frame,
+        ASYNC_FRAME_RESULT, "self.res_slot");
+    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    return g->current_async_result_ptr;
+}
+
 /* Cooperative preemption and Task.Yield requeue block. Shared across all
  * yield points and loop-backedge preemptions within one $resume invocation. */
 static LLVMBasicBlockRef get_async_requeue_bb(zan_irgen_t *g) {

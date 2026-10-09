@@ -132,6 +132,8 @@ static LLVMValueRef get_async_cancel_ptr(zan_irgen_t *g);
 static LLVMValueRef get_async_self_i8(zan_irgen_t *g);
 static LLVMValueRef get_async_self_int(zan_irgen_t *g, LLVMTypeRef ptr_int_ty);
 static LLVMValueRef get_async_child_ptr(zan_irgen_t *g);
+static LLVMValueRef get_async_sub_slot_ptr(zan_irgen_t *g);
+static LLVMValueRef get_async_result_ptr(zan_irgen_t *g);
 static void emit_co_cancel_delay(zan_irgen_t *g, LLVMValueRef frame);
 static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g);
 static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g);
