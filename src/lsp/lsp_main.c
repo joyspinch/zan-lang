@@ -764,8 +764,7 @@ static void publish_empty_diagnostics(lsp_server_t *s, const char *uri) {
 /* 模块核心语义抽象与接口调用契约 */
 static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *text) {
     size_t ul = strlen(uri);
-    if ((ul > 7 && strcmp(uri + ul - 7, ".zscene") == 0) ||
-        (ul > 5 && strcmp(uri + ul - 5, ".html") == 0) ||
+    if ((ul > 5 && strcmp(uri + ul - 5, ".html") == 0) ||
         (ul > 4 && strcmp(uri + ul - 4, ".htm") == 0)) {
         publish_empty_diagnostics(s, uri);
         return;

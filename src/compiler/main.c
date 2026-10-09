@@ -4642,6 +4642,14 @@ int main(int argc, char **argv) {
                     input_files[fi]);
             return 1;
         }
+        if (pn > 7 && strcmp(input_files[fi] + pn - 7, ".zscene") == 0) {
+            fprintf(stderr,
+                    "error: '%s': the legacy .zscene format is no longer "
+                    "supported; convert the scene document to an .html "
+                    "scene doc (<body data-zan-scene=...>) and recompile\n",
+                    input_files[fi]);
+            return 1;
+        }
     }
 
     input_file = input_files[0];

@@ -544,11 +544,10 @@ int zan_gen_run(const char *exe, const char *meta_path, const char *out_path) {
     return 0;
 }
 
-/* 内部辅助逻辑 */
+/* 内部辅助逻辑：统一设计稿路径仅识别标准 .html/.htm（GUI窗体与游戏场景） */
 bool zan_is_design_path(const char *p) {
     size_t n = strlen(p);
-    return (n > 7 && strcmp(p + n - 7, ".zscene") == 0) ||
-           (n > 5 && strcmp(p + n - 5, ".html") == 0) ||
+    return (n > 5 && strcmp(p + n - 5, ".html") == 0) ||
            (n > 4 && strcmp(p + n - 4, ".htm") == 0);
 }
 

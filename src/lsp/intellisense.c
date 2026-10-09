@@ -240,50 +240,6 @@ static const char *intel_design_widget(int ft) {
     return "Label";
 }
 
-/* 内部辅助逻辑 */
-static int intel_doc_name_lines(const char *text, size_t len,
-                                  const char *lines[64], const char *vals[64],
-                                  int max) {
-    int n = 0, line = 0;
-    const char *p = text, *end = text + len;
-    while (p < end && n < max) {
-        const char *nl = memchr(p, '\n', (size_t)(end - p));
-        const char *el = nl ? nl : end;
-        const char *q = p;
-        while (q + 6 < el &&
-               !(q[0] == '"' && q[1] == 'n' && q[2] == 'a' && q[3] == 'm' &&
-                 q[4] == 'e' && q[5] == '"')) {
-            q++;
-        }
-        if (q + 6 < el) {
-            const char *v = q + 6;
-            while (v < el && (*v == ' ' || *v == '\t' || *v == ':')) v++;
-            if (v < el && *v == '"') {
-                v++;
-                const char *vs = v;
-                while (v < el && *v != '"') v++;
-                char val[128];
-                size_t vl = (size_t)(v - vs);
-                if (vl < sizeof(val)) {
-                    memcpy(val, vs, vl);
-                    val[vl] = '\0';
-                    char *ln = (char *)malloc(16);
-                    if (ln) {
-                        snprintf(ln, 16, "%d", line);
-                        lines[n] = ln;
-                        vals[n] = _strdup(val);
-                        n++;
-                    }
-                }
-            }
-        }
-        if (!nl) break;
-        p = nl + 1;
-        line++;
-    }
-    return n;
-}
-
 /* 内部辅助实现 */
 
 /* 底层系统交互与数据协议契约 */
@@ -384,31 +340,66 @@ static int intel_html_handlers(const char *line, size_t len,
 
 static void intel_parse_design_html(intellisense_t *is, const char *filepath,
                                    const char *content, size_t len) {
-    /* 语言服务与调试协议交互规范 */
-    bool has_marker = false;
+    /* 语言服务与调试协议交互规范：支持窗体 (data-zan-design) 与场景 (data-zan-scene) */
+    bool is_form = false;
+    bool is_scene = false;
     char class_name[128] = {0};
     char submit[128] = {0};
     char form_handlers[8][128];
     int form_handler_count = 0;
     const char *p = content, *end = content + len;
-    while (p < end && !has_marker) {
+    while (p < end && !is_form && !is_scene) {
         const char *nl = memchr(p, '\n', (size_t)(end - p));
         size_t ll = (size_t)((nl ? nl : end) - p);
         if (intel_html_has(p, ll, "data-zan-design")) {
-            has_marker = true;
+            is_form = true;
             intel_html_attr(p, ll, "id", class_name, sizeof(class_name));
             intel_html_attr(p, ll, "data-submit", submit, sizeof(submit));
             form_handler_count = intel_html_handlers(p, ll, form_handlers, 8);
+        } else if (intel_html_has(p, ll, "data-zan-scene") || intel_html_has(p, ll, "<body data-scene")) {
+            is_scene = true;
+            if (!intel_html_attr(p, ll, "data-zan-scene", class_name, sizeof(class_name)) || !class_name[0]) {
+                if (!intel_html_attr(p, ll, "data-scene", class_name, sizeof(class_name)) || !class_name[0]) {
+                    intel_html_attr(p, ll, "id", class_name, sizeof(class_name));
+                }
+            }
         }
         if (!nl) break;
         p = nl + 1;
     }
-    if (!has_marker || !class_name[0] ||
+    if ((!is_form && !is_scene) || !class_name[0] ||
         !isalpha((unsigned char)class_name[0])) {
         return;
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
+    if (is_scene) {
+        add_symbol_ex(is, class_name, "object", NULL, NULL, filepath, NULL,
+                      ISYM_CLASS, 0, 0, false, 0);
+        add_symbol(is, "scene", "SceneDoc", class_name, NULL, filepath, ISYM_FIELD, 0, 0);
+        add_symbol(is, "BuildScene", "SceneDoc", class_name, "SceneDoc BuildScene()",
+                   filepath, ISYM_METHOD, 0, 0);
+        add_symbol(is, "Run", "void", class_name, "void Run()",
+                   filepath, ISYM_METHOD, 0, 0);
+
+        p = content;
+        int line = 0;
+        while (p < end) {
+            const char *nl = memchr(p, '\n', (size_t)(end - p));
+            size_t ll = (size_t)((nl ? nl : end) - p);
+            char ename[128] = {0};
+            if (intel_html_attr(p, ll, "id", ename, sizeof(ename)) &&
+                ename[0] && isalpha((unsigned char)ename[0])) {
+                add_symbol(is, ename, "SceneElement", class_name, NULL,
+                           filepath, ISYM_FIELD, line, 0);
+            }
+            if (!nl) break;
+            p = nl + 1;
+            line++;
+        }
+        return;
+    }
+
+    /* 窗体设计稿 (Form) */
     add_symbol_ex(is, class_name, "Form", NULL, NULL, filepath, NULL,
                   ISYM_CLASS, 0, 0, false, 0);
     if (submit[0])
@@ -452,56 +443,6 @@ static void intel_parse_design_html(intellisense_t *is, const char *filepath,
         p = nl + 1;
         line++;
     }
-}
-
-/* 内部辅助实现 */
-static void intel_parse_zscene(intellisense_t *is, const char *filepath,
-                               const char *content, size_t len) {
-    char *text = (char *)malloc(len + 1);
-    if (!text) return;
-    memcpy(text, content, len);
-    text[len] = '\0';
-
-    json_value *root = json_parse(text);
-    free(text);
-    if (!root || root->type != JSON_OBJ) { json_free(root); return; }
-
-    const char *class_name = json_get_str(json_obj_get(root, "name"));
-    if (!class_name || !class_name[0]) { json_free(root); return; }
-
-    add_symbol_ex(is, class_name, "object", NULL, NULL, filepath, NULL,
-                  ISYM_CLASS, 0, 0, false, 0);
-
-    /* 底层系统交互与数据协议契约 */
-    const char *name_lines[64], *name_vals[64];
-    int name_count = intel_doc_name_lines(content, len, name_lines,
-                                          name_vals, 64);
-
-    json_value *els = json_obj_get(root, "elements");
-    if (els && els->type == JSON_ARR) {
-        for (int i = 0; i < els->as.arr.count; i++) {
-            json_value *e = els->as.arr.items[i];
-            if (!e || e->type != JSON_OBJ) continue;
-            const char *ename = json_get_str(json_obj_get(e, "name"));
-            if (!ename || !ename[0] || !isalpha((unsigned char)ename[0]))
-                continue;
-            int eline = 0;
-            for (int k = 0; k < name_count; k++) {
-                if (name_vals[k] && strcmp(name_vals[k], ename) == 0) {
-                    eline = atoi(name_lines[k]);
-                    break;
-                }
-            }
-            add_symbol(is, ename, "SceneElement", class_name, NULL,
-                       filepath, ISYM_FIELD, eline, 0);
-        }
-    }
-
-    for (int k = 0; k < name_count; k++) {
-        free((void *)name_lines[k]);
-        free((void *)name_vals[k]);
-    }
-    json_free(root);
 }
 
 /* 模块核心语义抽象与接口调用契约 */
@@ -1442,13 +1383,9 @@ void intel_parse_file_ex(intellisense_t *is, intellisense_t *project, const char
 
     if (!content || len == 0) return;
 
-    /* 底层系统交互与数据协议契约 */
+    /* 底层系统交互与数据协议契约：设计稿统一经 intel_parse_design_html 解析 */
     {
         size_t fl = strlen(filepath);
-        if (fl > 7 && strcmp(filepath + fl - 7, ".zscene") == 0) {
-            intel_parse_zscene(is, filepath, content, len);
-            return;
-        }
         if (fl > 5 && strcmp(filepath + fl - 5, ".html") == 0) {
             intel_parse_design_html(is, filepath, content, len);
             return;
@@ -2788,13 +2725,11 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
             size_t name_len = strlen(filename_utf8);
             bool is_zan = name_len > 4 &&
                           strcmp(filename_utf8 + name_len - 4, ".zan") == 0;
-            bool is_zscene = name_len > 7 &&
-                             strcmp(filename_utf8 + name_len - 7, ".zscene") == 0;
             bool is_html = name_len > 5 &&
                            strcmp(filename_utf8 + name_len - 5, ".html") == 0;
             bool is_htm = name_len > 4 &&
                           strcmp(filename_utf8 + name_len - 4, ".htm") == 0;
-            if ((is_zan || is_zscene || is_html || is_htm) && !intel_cancel_flag) {
+            if ((is_zan || is_html || is_htm) && !intel_cancel_flag) {
                 wchar_t wfull[1024];
                 if (MultiByteToWideChar(CP_UTF8, 0, full_path, -1, wfull, 1024) > 0) {
                     HANDLE hFile = CreateFileW(wfull, GENERIC_READ, FILE_SHARE_READ,
@@ -2850,13 +2785,11 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
             size_t name_len = strlen(entry->d_name);
             bool is_zan = name_len > 4 &&
                           strcmp(entry->d_name + name_len - 4, ".zan") == 0;
-            bool is_zscene = name_len > 7 &&
-                             strcmp(entry->d_name + name_len - 7, ".zscene") == 0;
             bool is_html = name_len > 5 &&
                            strcmp(entry->d_name + name_len - 5, ".html") == 0;
             bool is_htm = name_len > 4 &&
                           strcmp(entry->d_name + name_len - 4, ".htm") == 0;
-            if ((is_zan || is_zscene || is_html || is_htm) && !intel_cancel_flag) {
+            if ((is_zan || is_html || is_htm) && !intel_cancel_flag) {
                 FILE *f = fopen(full_path, "rb");
                 if (f) {
                     fseek(f, 0, SEEK_END);
