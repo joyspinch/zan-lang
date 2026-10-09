@@ -3458,7 +3458,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             /* params type-checked later */
         }
         zan_checker_check_expr(c, expr->lambda.body);
-        return c->binder->type_error; /* lambda type resolved in M2 */
+        return c->binder->type_error; /* lambda type resolved in */
 
     case AST_THIS_EXPR:
         /* `this` is the type whose body is being checked. Typing it here is
@@ -3709,7 +3709,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         }
 
     case AST_BASE_EXPR:
-        return c->binder->type_error; /* resolved in M2 */
+        return c->binder->type_error; /* resolved in */
 
     default:
         return c->binder->type_error;

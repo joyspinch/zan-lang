@@ -2,13 +2,13 @@
  *
  * Output shape:
  *   { "version": 1,
- *     "files":   [ ... ],   // only in _export_files
+ *     "files":   [ ... ],  // only in _export_files
  *     "classes": [ { "name","ns","kind","file","line","bases":[...],
  *                    "attrs":[...],
  *                    "fields":[{ "name","type","file","line","attrs" }],
  *                    "methods":[{ "name","static","async","file","line",
  *                                 "params":[{ "name","type" }],"attrs" }],
- *                    "members":[ { "name","value" } ] } ],     // enums
+ *                    "members":[ { "name","value" } ] } ],  // enums
  *     "calls":  [ { "id","file","line","col","name","recv",
  *                   "targs":[...],"args":[...] } ] }
  *

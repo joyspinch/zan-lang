@@ -13,23 +13,31 @@
 #
 # Inputs: ROOT (repository root).
 
+file(TO_CMAKE_PATH "${ROOT}" _root_cmake)
+
 set(_banned "FillSector" "DrawSector" "FillArc" "DrawArc" "FillPie" "DrawPie")
 
-file(GLOB_RECURSE _sources "${ROOT}/examples/*.zan" "${ROOT}/templates/*.zan")
+file(GLOB_RECURSE _sources
+  "${_root_cmake}/examples/*.zan"
+  "${_root_cmake}/templates/*.zan"
+  "${_root_cmake}/src/ide_zan/*.zan"
+  "${_root_cmake}/packages/*/examples/*.zan"
+)
 
 set(_offences "")
 foreach(_f ${_sources})
+  file(TO_CMAKE_PATH "${_f}" _norm_f)
   # Games draw their own scene; they are not standing in for a control.
-  if(_f MATCHES "/examples/game/")
+  if(_norm_f MATCHES "(/|\\\\)examples(/|\\\\)game(/|\\\\)" OR _norm_f MATCHES "(/|\\\\)templates(/|\\\\)game(/|\\\\)")
     continue()
   endif()
-  file(STRINGS "${_f}" _lines)
+  file(STRINGS "${_norm_f}" _lines)
   set(_n 0)
   foreach(_line ${_lines})
     math(EXPR _n "${_n} + 1")
     foreach(_bad ${_banned})
       if(_line MATCHES "\\.${_bad}\\(")
-        file(RELATIVE_PATH _rel "${ROOT}" "${_f}")
+        file(RELATIVE_PATH _rel "${_root_cmake}" "${_norm_f}")
         string(STRIP "${_line}" _stripped)
         list(APPEND _offences "${_rel}:${_n}: ${_stripped}")
       endif()
@@ -38,13 +46,14 @@ foreach(_f ${_sources})
 endforeach()
 
 if(_offences)
-  message("A GUI example or template draws widget internals itself.")
+  message("A GUI example, template, or ZanIDE draws widget internals itself.")
   message("Move the drawing into the component (packages/Zan.Gui/src/Gui/...) and let the")
-  message("example only instantiate it, configure it and feed it data:")
+  message("consumer only instantiate it, configure it and feed it data:")
   foreach(_o ${_offences})
     message("  ${_o}")
   endforeach()
   message(FATAL_ERROR "widget drawing found outside stdlib")
 endif()
 
-message("NO_WIDGET_DRAWING_OK scanned=${_sources}")
+list(LENGTH _sources _scanned_count)
+message("NO_WIDGET_DRAWING_OK scanned ${_scanned_count} files")

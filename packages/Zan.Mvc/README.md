@@ -41,8 +41,8 @@ src/ZanWeb/             包源码。目录是工程组织（Framework/Modules �
     Sys/
       Controller/           接入层：目录=URL 族（Account/ Admin/ Api/ Blog/
                             Health/ Index/ User/），一类一文件
-      Model/  Dao/          数据层：sys_* 实体与 DAO（DAO 只放跨表 JOIN/聚合/
-                            复杂动态条件，单表读写走实体链，见「代码规范」）；
+      Model/  Dao/          数据层：sys_* 实体与 DAO；DAO 统一封装实体业务操作，
+                            与普通查询共用实体访问器，见「DB 访问规范」；
                             Model/Blog/、Dao/Blog/ 为示例模块
       Services/             模块内非控制器业务件（业务种子 BlogSeed 等），
                             不进 Controller/，见「Controller/ 纯净与端点纪律」
@@ -253,18 +253,31 @@ adminUI（JSON 体）两套前端同动作双兼容靠它。成员按所在层�
 
 ### DB 访问规范
 
-三种形态各管一摊，不混用：
+普通查询和 DAO 业务方法共用 `this.实体` 入口，由框架提供当前请求连接：
 
-1. **实体链（默认）**：`this.SysUser.Select<...>`——编译期表访问器，
-   字段名编译期校验。单表读写一律走它。
-2. **DAO（跨表/聚合才建）**：`XxxDao(AppController host)` 收宿主解析
-   连接；只放跨表 JOIN、聚合统计、复杂动态条件。**禁止**新增与实体链
-   逐字重复的方法（现存 `SysUserDao.ById` 等属历史债务：不扩散、不改
-   依赖它的调用点，但改到相关文件时顺手收敛到实体链）。
-3. **`DbTable` 运行期网关（仅配置驱动场景）**：表名/列名运行期才确定
-   的（Crud 引擎、代码生成器）走 `DbTable.Of`；标识符过 `Gen.Safe`+
-   `RequireIdent` 双校验，值一律 `?` 占位符。业务代码**禁手拼 SQL**
-   （现状为零，保持为零）。
+```zan
+int members = await this.SysUser
+    .Where(a => a.departmentId == id)
+    .CountAsync();
+int changed = await this.SysUser.ResetPassword(id, salt, hash, now);
+```
+
+1. **普通查询/写入**：使用 `Where`、`Insert`、`Update`、`Delete` 等
+   类型化实体链，字段名在编译期校验，写入以 `ExecuteIdentityAsync()` /
+   `ExecuteAffrowsAsync()` 终结。
+2. **DAO 业务封装**：保留 `EntityDao` 文件与复用方法。改密码、停用账号、
+   更新个人资料、配额扣减等操作封装一次，通过 `this.Entity.Method(...)`
+   调用。编译器将非内建方法派发给对应 DAO，并注入当前连接；调用处不写
+   `new EntityDao(this)`，DAO 不接收控制器。DAO 的 `IDbConnection` 构造
+   合约供自动派发使用，不自行借还连接。单表操作同样可以有业务语义，不能
+   因为实现使用 ORM 就把封装展开到各个调用处；例如 `ResetPassword` 必须
+   同时更新凭证与原子递增 `tokenVersion`，`UpgradeHash` 则不递增版本。
+3. **种子/后台任务**：已有连接直接写 `db.Entity.Where(...)` 或
+   `db.Entity.Method(...)`（引入 `System.Data.Orm` 与对应 DAO 命名空间）。
+   操作始终使用该连接与事务，连接借还仍归原调用方。
+4. **`DbTable` 运行期网关**：表名/列名在运行期才确定的配置驱动场景
+   （Crud 引擎、代码生成器）使用 `DbTable.Of`；标识符过 `Gen.Safe` +
+   `RequireIdent` 双校验，值一律绑定参数。
 
 **连接获取 2×2 矩阵 + 协作者口**（共五个口，各有唯一语义）：
 
@@ -272,12 +285,13 @@ adminUI（JSON 体）两套前端同动作双兼容靠它。成员按所在层�
 |------------------------------|----------------------|------------------------------|
 | 异步借出（动作内首次取数）   | `await Conn()`       | `await ReadConn()`           |
 | 同步取已借（辅助函数）       | `Held()`             | `HeldRead()`                 |
-| 跨类协作者（静态网关/DAO 收宿主） | `__Conn()`（公开，唯此一处） |                    |
+| 实体访问器的编译期连接合约 | `__Conn()`（公开） |                    |
 
-规则：动作里第一次取数用异步口；`Held*` 只准在"同动作已 `await` 过对应
-异步口"之后使用；`__Conn` 供够不着 protected 口的协作者（静态网关、
-DAO）解析请求连接，控制器内部不用它。（为什么：五个口曾无成文语义，
-借还与只读回退全靠注释撑；矩阵写死后，用错口变成可 review 出来的事。）
+`OnBeforeAsync()` 在动作执行前取得请求租约，普通实体链与 DAO 方法都使用
+该租约。`Held*` 用于把已持有的连接交给辅助操作，`ReadConn` 保留只读意图
+与事务中回主库的行为；`__Conn` 由编译器调用，业务无需手动解析请求连接。
+（为什么：DAO 接收控制器曾把持久化层耦合到请求层，改成自动派发后仍必须
+复用原租约，避免另借连接造成池等待或跨连接丢失事务。）
 
 ## 配置驱动的管理屏（Modules/Crud）
 

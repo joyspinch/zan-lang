@@ -12,13 +12,13 @@
  * ZAN_CODEGEN_MANIFEST_JSON is set, and nothing here changes codegen. */
 
 enum {
-    ZAN_MF_USER = 0,       /* registered user method/ctor (g->functions)   */
-    ZAN_MF_ASYNC_RESUME,   /* "<ramp>$resume" body of an async method      */
-    ZAN_MF_RELEASE,        /* __zan_release_* / __zan_arr_release_* etc.   */
-    ZAN_MF_VTABLE,         /* __zan_vtable_* interface dispatch thunks     */
-    ZAN_MF_REFLECT,        /* __zan.refl.* / __zan_refl* thunks            */
-    ZAN_MF_ADAPTER,        /* __zan_w32ir_* cross-target adapters          */
-    ZAN_MF_OTHER           /* any other synthesized body                   */
+    ZAN_MF_USER = 0,       /* registered user method/ctor (g->functions) */
+    ZAN_MF_ASYNC_RESUME,   /* "<ramp>$resume" body of an async method */
+    ZAN_MF_RELEASE,        /* __zan_release_* / __zan_arr_release_* etc. */
+    ZAN_MF_VTABLE,         /* __zan_vtable_* interface dispatch thunks */
+    ZAN_MF_REFLECT,        /* __zan.refl.* / __zan_refl* thunks */
+    ZAN_MF_ADAPTER,        /* __zan_w32ir_* cross-target adapters */
+    ZAN_MF_OTHER           /* any other synthesized body */
 };
 
 /* reason buckets for the audit's ineligible summary */

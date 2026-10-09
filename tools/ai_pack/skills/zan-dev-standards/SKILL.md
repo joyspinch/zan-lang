@@ -274,6 +274,28 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   需在注释里写明。坑出处：回绑写法表现为"第一条命令挂死、开连例程被递归
   进入两次"，分阶段打印（enter/connected/wired/ping ok）一击定位——
   async 挂死先怀疑命令被二次路由，别急着怀疑编译器。
+- **IDE 运行与发布编译参数解耦（调试挂满诊断，发布绝不挂隔离区）**：
+  IDE 本地调试/F5 运行统一走 `-g --arc-guard --check-leaks --strict-runtime`，
+  把野指针/悬垂指针和生命周期错乱当场转成受控断言 / `0xDEAD0000DEAD0000` 崩溃，
+  避免内存破坏（0xC0000005）串到远端分配器深处才爆；但部署/发布产物
+  （`--publish` 或 `-g --no-arc-guard --no-check-leaks`）严禁启用 `--arc-guard`
+  与 `--check-leaks`，因为死块隔离区只吞不吐会导致长期运行的服务或桌面端 RSS
+  无界膨胀；工程级 `strictMemory` 开关仅作用于本地非发布运行，绝不穿透覆盖发布配置。
+  坑出处：历史构建中本地 F5 与发布共用一套标志，导致部署产物因 quarantine
+  积累常驻内存，或调试时缺 guard 让 UAF 沦为偶发难以复现的 0xC0000005。
+- **原生栅格化与 Blit 裁剪必须做 64 位整数防溢出**：
+  在计算目标裁剪右界和下界时，`dx + dw` 和 `dy + dh` 若直接用 32 位 `int` 相加，
+  当坐标处于极端区间（如 `INT_MAX` 附近的平移或越界拖拽）会发生 signed integer
+  overflow（UBSan 报警），导致边界反转或崩溃；计算外包围盒右下坐标必须显式强转为
+  `(long long)dx + (long long)dw` 再与 clip 区间取最小值。坑出处：渲染器 Blit
+  在大坐标渲染时触碰 UBSan 符号溢出断言。
+- **Windows Clang 下开启 ASan 与崩溃捕获冲突规避**：
+  在 Windows x64 下用 Clang 开启 AddressSanitizer 时，若涉及 `__builtin_setjmp`，
+  须带 `-mllvm -asan-realign-stack=16`，防止 ASan 32 字节栈重对齐与 Win64 SEH unwind
+  展开要求（16 字节对齐）冲突导致 `offset is not a multiple of 16`；同时运行时异常捕获器
+  （VEH）在检测到 `__SANITIZE_ADDRESS__` 或 `__has_feature(address_sanitizer)` 时必须跳过安装，
+  避免进程在 CRT 析构（`__asan_unregister_globals`）退出时被 VEH 二次拦截并在未初始化的
+  stdio 上 `fopen` 发生二次 access violation。
 
 ## 三、验证纪律（实机/无头通用）
 

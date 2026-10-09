@@ -3985,6 +3985,12 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 
+add_test(NAME ide_compile_modes
+  COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR} -DZANC=$<TARGET_FILE:zanc>
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/ide_compile_modes${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_ide_compile_mode.cmake)
+set_tests_properties(ide_compile_modes PROPERTIES LABELS "full;standard;smoke;ide")
+
 # ---- Policy: components own their drawing, examples only use them ----
 # A gauge drawn a second time inside a demo drifts from the component the moment
 # the component is fixed -- so the arc/sector primitives a dial is made of are

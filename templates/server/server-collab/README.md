@@ -51,7 +51,7 @@ src/Feature/            横切能力：Attachment（含配额计数行回填）�
                         CalendarRemind、MessageRelay、Notify(Hub)…
 src/Framework/          应用接线：Tenant（包全球化后的租户锚）、
                         WebFmt、ExcelIo、MessageRelay、Search
-src/Modules/*/Model、Dao  业务实体与查询（sys_* 平台实体在 Zan.Mvc 包）
+src/Modules/*/Model、Dao  业务实体与数据访问封装（sys_* 平台实体在 Zan.Mvc 包）
 views/                  templates, in the module structure of the controllers
   layout.html             the site-wide page wrapper (global {{content}} layout)
   <Module>/*.html         that module's views; a module's own layout.html
@@ -566,6 +566,16 @@ WHERE id=? AND tenantId=? AND assigneeId=0 AND status='unassigned' AND version=?
   Update 条件含 `status==1`，语义无害且不越租户（T17 隔离矩阵 N 已验证）。
 
 ## Database & ORM (FreeSQL-style, bidirectional)
+
+Application data access uses typed entity facades. Controllers query `this.Entity` on their request connection; background jobs and import callbacks use `db.Entity` on the connection passed to them, with `using System.Data.Orm;`:
+
+```zan
+int count = await this.SysUser.Where(a => a.departmentId == id).CountAsync();
+List<OaDoc> docs = await db.OaDoc.Where(a => a.tenantId == tenantId)
+    .OrderByDescending(a => a.id).Take(limit).ToListAsync();
+```
+
+Keep reusable queries and business operations in the existing `EntityDao(IDbConnection)` classes. Call their methods through the same facade, for example `await db.FlowTask.ClaimTask(task.id, me.id)` or `await db.OaAttachUsage.TryAcquireQuota(tenantId, size, quota, now)`. The compiler initializes the DAO with the supplied connection. Built-in `Insert`, `Update` and `Delete` calls remain ORM builders and require an execution terminal, such as `await db.OaTodo.Insert(todo).ExecuteIdentityAsync()`. Synchronous import callbacks call existing `ByNameSync`, `CountByNameSync` and `InsertSync` methods on `db.Entity` so they use the import transaction connection.
 
 `System.Data.Orm.Model` maps both directions:
 

@@ -112,7 +112,7 @@ A target is only "complete" when these back ends exist for it. Current coverage:
 | C FFI (`DllImport`)  | crt/msvcrt → CRT | libc | libc | resolved by the linker; names unified as `crt` |
 | Filesystem / dirent  | ✅      | glibc layout | Darwin layout | `Directory.zan` branches on dirent offsets |
 | Monotonic clock      | ✅      | `CLOCK_MONOTONIC`=1 | =6 | `Stopwatch` |
-| GUI backend          | Win32   | X11   | Cocoa | Wayland and all other windowing systems are stubs; macOS cross links the committed `macos-<arch>/libzan_gui.dylib`, whose Cocoa/WebKit dependencies bind on the target Mac |
+| GUI backend          | Win32   | X11   | Cocoa (Stub/WIP) | Windows Win32 与 Linux X11 具备完整基础支持；macOS 目前仅具备基础窗口/事件存根与符号动态链接（`libzan_gui.dylib`），无障碍能力（NSAccessibility / VoiceOver / UI Automation）尚未实现；Wayland 与其他窗口系统均为桩 |
 | Native DB/TLS drivers | `win-x64`/`win-arm64` | `linux-x64`/`linux-arm64` | `macos-x64`/`macos-arm64` | `<stdlib>/System/Data/<Module>/drivers/<target>/` and `<stdlib>/System/Net/Tls/drivers/<target>/`; binaries committed per target |
 
 On macOS, versioned native dylibs such as `libssl.3.dylib` and `libpq.5.dylib`
@@ -154,7 +154,9 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   Mac. `--publish` copies the dylib next to the executable, which the emitted
   `LC_RPATH @loader_path` then finds.
 - Remaining: an actual run on Mac hardware — everything so far is link/structure
-  verification only.
+  verification only. Cocoa view lifecycle, WebKit embedding, and accessibility
+  (NSAccessibility protocols / VoiceOver integration) are currently stubs or
+  unimplemented and must not be considered production-ready.
 
 ### Android (`android-x64` / `android-arm64`) — CLI works; GUI renders, verified on an emulator
 - Objects emit for the `*-linux-android28` triple (API 28: rt_sync.c's
