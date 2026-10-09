@@ -2,34 +2,11 @@ using System;
 using System.IO;
 using Gui;
 using Gui.Widget;
+using Gui.Component;
 
-// IDE 面板布局回归（body/Flex 通道）。
-// // 背景：设计 HTML 经 DesignerHtml.ToJsonDoc 总是带 bodyContent，
-// FormBuilder.IsHtmlRoot 据此构造 Element(body)；真实 ide.css 经
-// App.UseAppCss 安装了 Web UA 基线（body 是块流）。块流里
-// data-dock=5 的子项不再「吃剩余高度」——于是 OUTPUT 的控制台和
-// ERRORS 的错误列表只有 0 高（11 条诊断 count=11 却一行看不见）。
-// 修复走纯声明 Flex：body 根显式 display:flex/column（ide-panel），
-// 填充控件 flex-grow:1/flex-basis:0（ide-panel-fill），工具条保持
-// 自然高度（ide-panel-toolbar / ide-panel-action shrink:0）。
-// // 本测试用真实面板文档生成的 typed 控件树（OutputPanel/ErrorsPanel/
-// 五个树面板/四个 AI 内嵌视图）+ 真实 ide.css，在离屏 App 里测量、
-// 排布并绘制，在多组面板高度与 DPI 下断言：
-// - 填充区（ConsoleView/ErrorList/TreeView）有正高度，且严格等于
-// 面板高减去自然高度段（对 bh=0 回归的精确反断言）；
-// - 工具条自然高度、输入框与按钮互不重叠、按钮贴行内；
-// - 11 行合成诊断逐行正高、逐行堆叠不重叠、首行可见；
-// - RunStrip/SendCue/PlanStrip/TeamBoard 各段自然高、声明细线
-// 保持、填充段吃剩余空间、折叠段默认隐藏。
-// // 运行前提（交由主侧执行，本测试自身不触发编译）：
-// 1. 必须与官方 IDE 同一 source/input shape 编译——scripts/
-// build_ide.ps1 枚举的全部 src/ide_zan 源 + 全部 .html 设计，
-// 并把本文件放在入口位（显式 Main 优先于 generated
-// __DesignMain，见 GenForm），否则 generated 面板类与嵌入
-// 设计不存在；
-// 2. 工作目录为仓库根（相对路径读 src/ide_zan/assets/ide.css，
-// 与 designer_wysiwyg_test 读 tests/gui/*.html 同一口径）。
-// 成功输出 IDE_PANEL_LAYOUT_OK，任何断言失败即抛异常。
+// Generated control roots retain the panel class but are not Element(body).
+// Use the full IDE source list, with this file first and --subsystem console,
+// and run from the repository root to load the actual IDE stylesheet.
 class IdePanelLayoutTest {
     static App app;
     static string ideCss;
@@ -61,16 +38,12 @@ class IdePanelLayoutTest {
         OutputPanel p = new OutputPanel();
         List<string> log = new List<string>();
         log.Add("> [Debug] build started");
-        log.Add("compile src/main.zan ok");
-        log.Add("warning: unused variable x");
-        log.Add("> --- Link ---");
-        log.Add("done in 1.2s");
+        log.Add("");
         BeginArea(h, scale);
         p.Render(app, new Rect(0, 0, W, h), log);
-        app.EndOffscreenFrame();
-
         string tag = "output h=" + Convert.ToString(h)
             + " dpi=" + Convert.ToString(scale) + " ";
+        Check(tag + "generated root uses flex", p.StyleDisplay() == 1);
         Check(tag + "toolbar natural height", p.Bar.bh > 0 && p.Bar.bh < h);
         Check(tag + "toolbar spans body", p.Bar.bx == 0 && p.Bar.bw == W);
         Check(tag + "filter filled", p.Filter.bw > 0 && p.Filter.bh > 0);
@@ -87,6 +60,34 @@ class IdePanelLayoutTest {
             p.Log.by >= p.Rule.by + p.Rule.bh && p.Log.bh > 0
             && p.Log.by + p.Log.bh == h
             && p.Log.bh == h - p.Bar.bh - p.Rule.bh);
+        int pad = LogView.Padding(app);
+        int rowH = LogView.RowHeight(app);
+        int textX = p.Log.bx + pad;
+        int textY = p.Log.by + pad + rowH;
+        Check(tag + "sample within console", textY + rowH <= p.Log.by + p.Log.bh
+            && textX + 200 <= p.Log.bx + p.Log.bw);
+        List<int> blank = new List<int>();
+        for (int y = textY; y < textY + rowH; y = y + 1) {
+            for (int x = textX; x < textX + 200; x = x + 1) {
+                blank.Add(app.canvas.GetPixel(x, y));
+            }
+        }
+        app.EndOffscreenFrame();
+        log[1] = "> Zan IDE ready. Workspace: publish fixture";
+        BeginArea(h, scale);
+        p.Render(app, new Rect(0, 0, W, h), log);
+        int ink = 0;
+        int sample = 0;
+        for (int y = textY; y < textY + rowH; y = y + 1) {
+            for (int x = textX; x < textX + 200; x = x + 1) {
+                if (app.canvas.GetPixel(x, y) != blank[sample]) { ink = ink + 1; }
+                sample = sample + 1;
+            }
+        }
+        Check(tag + "plain output text visible", ink > 20);
+        Check(tag + "copy source preserved", p.Shown().Count == log.Count
+            && p.Shown()[1] == log[1]);
+        app.EndOffscreenFrame();
     }
 
     static void ErrorsAt(int h, int scale) {

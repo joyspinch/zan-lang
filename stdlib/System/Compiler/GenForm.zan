@@ -244,6 +244,7 @@ class GenForm {
         string dispatch = "__form.Call";
         if (ctl) { dispatch = "this.__Dispatch"; }
 
+        JsonValue bodyContent = root.Get("bodyContent");
         if (fields != null && fields.IsArray()) {
             int id = 0;
             string rootParent = self;
@@ -253,11 +254,52 @@ class GenForm {
                 body.Append("        " + self + ".Add(__flow);\n");
                 rootParent = "__flow";
             }
-            for (int i = 0; i < fields.Count(); i = i + 1) {
-                id = GenForm.EmitField(decls, body, wire, valid, fields.At(i),
-                                       rootParent, "", id, used, free_mode || is_html,
-                                       !free_mode && !is_html, dispatch, ctl, false,
-                                       default_size_class);
+            if (is_html && bodyContent != null && bodyContent.IsArray()) {
+                bool rootIsEl = is_html && !ctl;
+                List<string> fieldNames = new List<string>();
+                for (int i = 0; i < fields.Count(); i = i + 1) {
+                    JsonValue fo = fields.At(i);
+                    string fVn = GenForm.PredeclareKid(decls, body, fo, id, used,
+                                                       ctl, false);
+                    id = GenForm.EmitFieldCore(decls, body, wire, valid, fo,
+                                               rootParent, "", rootIsEl, id, used, free_mode || is_html,
+                                               !free_mode && !is_html, dispatch, ctl, false,
+                                               default_size_class, true);
+                    fieldNames.Add(fVn);
+                }
+                bool[] added = new bool[fields.Count()];
+                for (int ci = 0; ci < bodyContent.Count(); ci = ci + 1) {
+                    JsonValue item = bodyContent.At(ci);
+                    if (item.IsString()) {
+                        if (rootIsEl) {
+                            body.Append("        " + self + ".AddText(\"");
+                            body.Append(GenCommon.Esc(item.AsString("")));
+                            body.Append("\");\n");
+                        }
+                    } else if (item.IsNumber()) {
+                        int idx = item.AsInt(0 - 1);
+                        if (idx >= 0 && idx < fieldNames.Count && !added[idx]) {
+                            JsonValue fo = fields.At(idx);
+                            string kHost = GenForm.ParentExpr(fo, rootParent, "");
+                            GenForm.EmitAttach(body, fo, fieldNames[idx], kHost, rootParent, "", rootIsEl, free_mode || is_html, false);
+                            added[idx] = true;
+                        }
+                    }
+                }
+                for (int i = 0; i < fieldNames.Count; i = i + 1) {
+                    if (!added[i]) {
+                        JsonValue fo = fields.At(i);
+                        string kHost = GenForm.ParentExpr(fo, rootParent, "");
+                        GenForm.EmitAttach(body, fo, fieldNames[i], kHost, rootParent, "", rootIsEl, free_mode || is_html, false);
+                    }
+                }
+            } else {
+                for (int i = 0; i < fields.Count(); i = i + 1) {
+                    id = GenForm.EmitField(decls, body, wire, valid, fields.At(i),
+                                           rootParent, "", id, used, free_mode || is_html,
+                                           !free_mode && !is_html, dispatch, ctl, false,
+                                           default_size_class);
+                }
             }
         }
 
@@ -311,6 +353,8 @@ class GenForm {
             out0.Append("    /// __CreateWindow() has returned; showing the window\n");
             out0.Append("    /// again rebuilds the tree and overwrites them.\n");
             out0.Append("    static Gui.Form __form;\n");
+            out0.Append("    static Gui.Control __root;\n");
+            out0.Append("    static System.Json.JsonValue __designDoc;\n");
         }
         if (decls.Length > 0) {
             out0.Append(decls.ToString());
@@ -355,8 +399,18 @@ class GenForm {
             out0.Append(GenCommon.Esc(name));
             out0.Append("\"; }\n\n");
         } else {
+            out0.Append("    /// Returns the root control of the designed window.\n");
+            out0.Append("    static Gui.Control Root() {\n");
+            out0.Append("        if (__root == null) {\n");
+            out0.Append("            __root = __BuildForm();\n");
+            out0.Append("        }\n");
+            out0.Append("        return __root;\n");
+            out0.Append("    }\n\n");
             out0.Append("    /// Builds the designed control tree (real, interactive widgets).\n");
             out0.Append("    static Gui.Control __BuildForm() {\n");
+            out0.Append("        __designDoc = System.Json.JsonValue.Parse(\"");
+            out0.Append(GenCommon.Esc(root.ToJson()));
+            out0.Append("\");\n");
             if (is_html) {
                 out0.Append("        Gui.Element root = new Gui.Element();\n");
                 out0.Append("        root.InitElement(\"body\", \"root\");\n");
@@ -383,6 +437,7 @@ class GenForm {
                 }
             }
             if (body.Length > 0) { out0.Append(body.ToString()); }
+            out0.Append("        __root = root;\n");
             out0.Append("        return root;\n");
             out0.Append("    }\n\n");
         }
@@ -430,7 +485,7 @@ class GenForm {
             out0.Append("    /// Builds this designed window: control tree, window\n");
             out0.Append("    /// attributes, OnLoad and the event wiring - everything except\n");
             out0.Append("    /// the event loop, so a caller may still adjust it before Run().\n");
-            out0.Append("    static Gui.Form __CreateWindow() {\n");
+            out0.Append("    static Gui.Form CreateWindow() {\n");
             out0.Append("        Gui.Form form = Gui.Form.Create(\"");
             out0.Append(GenCommon.Esc(title));
             out0.Append("\", " + Convert.ToString(win_w) + ", " +
@@ -438,7 +493,7 @@ class GenForm {
             if (is_html && doc_css.Length > 0) {
                 GenForm.EmitUseAppCss(out0, "form.GetApp()", doc_css);
             }
-            out0.Append("        form.Add(__BuildForm());\n");
+            out0.Append("        form.Add(Root());\n");
             if (center) {
                 out0.Append("        form.GetApp().CenterWindow();\n");
             } else {
@@ -475,12 +530,13 @@ class GenForm {
             out0.Append("        " + name + ".__WireForm(form);\n");
             out0.Append("        return form;\n");
             out0.Append("    }\n\n");
+            out0.Append("    static Gui.Form __CreateWindow() { return CreateWindow(); }\n\n");
             out0.Append("    /// Opens this designed window and runs it until it closes,\n");
             out0.Append("    /// so the calling window waits like it would on a modal dialog.\n");
             out0.Append("    /// This is how one window calls another:\n");
             out0.Append("    ///     " + name + ".Show();\n");
             out0.Append("    static void Show() {\n");
-            out0.Append("        Gui.Form form = " + name + ".__CreateWindow();\n");
+            out0.Append("        Gui.Form form = " + name + ".CreateWindow();\n");
             out0.Append("        form.Run();\n");
             out0.Append("    }\n");
             if (emit_main) {
@@ -1286,6 +1342,31 @@ static List<string> NonConstructibleKinds() {
         b.Append(";\n");
     }
 
+    // 是否存在事件处理器或实参需要接线。
+    static bool HasHandlers(JsonValue o) {
+        if (o == null || !o.IsObject()) { return false; }
+        if (o.Str("arg", "") != "") { return true; }
+        for (int i = 0; i < o.Count(); i = i + 1) {
+            string key = o.KeyAt(i);
+            if (key.Length < 2 || key[0] != 'o' || key[1] != 'n') { continue; }
+            JsonValue v = o.ValAt(i);
+            if (v != null && v.IsString() && v.AsString("").Length > 0) {
+                return true;
+            }
+        }
+        JsonValue cols = o.Get("columns");
+        if (cols != null && cols.IsArray()) {
+            for (int ci = 0; ci < cols.Count(); ci = ci + 1) {
+                JsonValue c = cols.At(ci);
+                if (c != null && c.IsObject() && GenForm.ObjStr(c, "field").Length > 0 &&
+                    GenForm.ObjStr(c, "click").Length > 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     // 发射 on<Event> 处理器绑定(事件名 = 去掉前导 "on" 的键)。
     static void EmitHandlers(StringBuilder wire, JsonValue o, string vn,
                              string dispatch) {
@@ -1374,6 +1455,38 @@ static List<string> NonConstructibleKinds() {
         return false;
     }
 
+    static bool IsModelKey(string key) {
+        return key == "kind" || key == "type" || key == "name"
+            || key == "tag" || key == "htmlTag" || key == "htmlContent"
+            || key == "class" || key == "style" || key == "props"
+            || key == "kids" || key == "dock" || key == "dockSide"
+            || key == "fx" || key == "fy" || key == "fw" || key == "fh"
+            || key == "position" || key == "anchor" || key == "flexGrow"
+            || key == "span" || key == "childTab" || key == "ph"
+            || key == "pad" || key == "gap" || key == "bind"
+            || key == "bindProp" || key == "if" || key == "for"
+            || key == "columns" || key == "of" || key == "options"
+            || key == "label" || key == "ref" || key == "compAbs"
+            || key == "compAnon" || key == "arg" || key == "rowFactory"
+            || key == "locked" || key == "pvOff" || key == "activeTab";
+    }
+
+    static string DockName(int dock) {
+        if (dock == 1) { return "Top"; }
+        if (dock == 2) { return "Bottom"; }
+        if (dock == 3) { return "Left"; }
+        if (dock == 4) { return "Right"; }
+        if (dock == 5) { return "Fill"; }
+        return "Manual";
+    }
+
+    static int DefaultDock(JsonValue o) {
+        string k = GenForm.KindOf(o);
+        if (k == "ToolStrip") { return 1; }
+        if (k == "StatusBar") { return 2; }
+        return 0;
+    }
+
     // 直接子控件数:无 "kids" 数组则为 0。自动布局用它估容器高度。
     static int ChildrenCount(JsonValue o) {
         JsonValue kids = o.Get("kids");
@@ -1432,6 +1545,15 @@ static List<string> NonConstructibleKinds() {
             } else {
                 vn = fname;
                 decls.Append("    static " + kind + " " + vn + ";\n");
+            }
+        } else if (!anon && GenForm.HasHandlers(o)) {
+            string varName = "c" + Convert.ToString(id);
+            if (instanceFields) {
+                vn = "this." + varName;
+                decls.Append("    " + kind + " " + varName + ";\n");
+            } else {
+                vn = varName;
+                decls.Append("    static " + kind + " " + varName + ";\n");
             }
         } else {
             vn = "c" + Convert.ToString(id);
@@ -1496,7 +1618,7 @@ static List<string> NonConstructibleKinds() {
          * tiny/small/medium/large 优先，外观类（text/primary 等）与
          * 默认尺寸类合并；不能靠 CSS 继承，因为高度/padding 不继承。 */
         string dcls = GenForm.ObjStr(o, "class");
-        if (defaultSizeClass.Length > 0 && !GenForm.HasSizeClass(dcls)) {
+        if (!GenForm.IsElement(o) && defaultSizeClass.Length > 0 && !GenForm.HasSizeClass(dcls)) {
             if (dcls.Length > 0) { dcls = dcls + " "; }
             dcls = dcls + defaultSizeClass;
         }
@@ -1552,21 +1674,11 @@ static List<string> NonConstructibleKinds() {
             } else {
                 continue;
             }
-            if (sk == "kind" || sk == "name" || sk == "tag" || sk == "htmlTag"
-                || sk == "htmlContent"
-                || sk == "class" || sk == "style" || sk == "props"
-                || sk == "kids" || sk == "dock" || sk == "fx"
-                || sk == "fy" || sk == "fw" || sk == "fh"
-                || sk == "position" || sk == "anchor" || sk == "flexGrow"
-                || sk == "bind" || sk == "bindProp" || sk == "if"
-                || sk == "for" || sk == "columns" || sk == "of"
-                || sk == "options" || sk == "orient" || sk == "required"
-                || sk == "defOn" || sk == "placeholder"
-                /* label 已被上方 SetDesignText 分支消费（设计注记，
-                 * 只有发布 text 的控件接受）；再进回退会在没有
-                 * label 属性的控件上退化成样式类（SetProp 兜底
-                 * AddClass），容器 GetProp("class") 便混进标题文案。 */
-                || sk == "label") {
+            if (GenForm.IsModelKey(sk) && (sk != "activeTab" || GenForm.KindOf(o) != "Tabs")) {
+                continue;
+            }
+            if (sk == "options" || sk == "orient" || sk == "required"
+                || sk == "defOn" || sk == "placeholder") {
                 continue;
             }
             if (sk.Length > 3 && HtmlText.StartsWith(sk, "on")
@@ -1621,19 +1733,30 @@ static List<string> NonConstructibleKinds() {
             body.Append("        " + vn + ".SetProp(\"required\", \"true\");\n");
         }
 
+        // 带参事件声明（设计模型 "arg" 键）与处理函数：于构造期直接落控件字段，
+        // 保证 Root() 访问即具备 handler 状态。
+        string arg = o.Str("arg", "");
+        if (arg != "") {
+            body.Append("        " + vn + ".handlerArg = \""
+                        + GenCommon.Esc(arg) + "\";\n");
+        }
+        for (int i = 0; i < o.Count(); i = i + 1) {
+            string key = o.KeyAt(i);
+            if (key.Length < 3 || key[0] != 'o' || key[1] != 'n') { continue; }
+            string eventName = key.Substring(2);
+            JsonValue hv = o.ValAt(i);
+            if (hv != null && hv.IsString() && hv.AsString("").Length > 0) {
+                body.Append("        " + vn + ".SetHandler(\""
+                            + GenCommon.Esc(eventName) + "\", \""
+                            + GenCommon.Esc(hv.AsString("")) + "\");\n");
+            }
+        }
+
         if (!suppressAttach) {
             GenForm.EmitAttach(body, o, vn, host, parent, parentKind, parentIsElement, fm, flowCell);
         }
         if (!anon) {
             GenForm.EmitHandlers(wire, o, vn, dispatch);
-            // 带参事件声明（设计模型 "arg" 键）：落 handlerArg 字段，
-            // ChildWindow.WireNode 二次接线据此发 WireArg（实参快照）
-            // ——与 GenHtml 的 data-arg 通道同形。
-            string arg = o.Str("arg", "");
-            if (arg != "") {
-                wire.Append("        " + vn + ".handlerArg = \""
-                            + GenCommon.Esc(arg) + "\");\n");
-            }
         }
 
         JsonValue kids = o.Get("kids");
@@ -1712,64 +1835,45 @@ static List<string> NonConstructibleKinds() {
             int pos = GenForm.ObjNum(o, "position", 0);
             int anc = GenForm.ObjNum(o, "anchor", 0);
             int fg = GenForm.ObjNum(o, "flexGrow", 0);
-            int dk = GenForm.ObjNum(o, "dock", 0);
 
-            // 统一排版模型：优先支持 Flow 流式 + Float 浮动/锚定定位，兼容旧 dock 字段
-            if (pos == 0 && dk == 0) {
-                // 标准 Flex 流式：从上到下排布，支持 flex-grow
-                body.Append("        " + vn + ".Dock(Gui.Dock.Top());\n");
-                if (fg > 0) {
-                    body.Append("        " + vn + ".grow = true;\n");
+            bool hasPos = o.Has("position");
+            bool hasDock = o.Has("dock") || o.Has("dockSide");
+            bool hasGeom = o.Has("fx") || o.Has("fy");
+            bool floating = false;
+
+            if (hasPos) {
+                floating = pos == 1;
+                if (!floating) {
+                    int defDock = GenForm.DefaultDock(o);
+                    if (defDock == 0) { defDock = 1; }
+                    body.Append("        " + vn + ".Dock(Gui.Dock." + GenForm.DockName(defDock) + "());\n");
                 }
-                if (fh > 0) {
-                    body.Append("        " + vn + ".logH = " + Convert.ToString(fh) + ";\n");
+            } else if (hasDock) {
+                int dock = o.Int("dock", o.Int("dockSide", 0));
+                floating = dock == 0;
+                if (!floating) {
+                    body.Append("        " + vn + ".Dock(Gui.Dock." + GenForm.DockName(dock) + "());\n");
                 }
-            } else if (pos == 1 && anc == 10) {
-                // Stretch 全屏铺满
-                body.Append("        " + vn + ".Dock(Gui.Dock.Fill());\n");
-            } else if (pos == 1 && anc > 0) {
-                // 浮动与九宫格锚点定位 (脱离文档流)
+            } else if (hasGeom) {
+                floating = true;
+            }
+
+            if (floating) {
                 body.Append("        " + vn + ".Dock(Gui.Dock.Manual());\n");
                 body.Append("        " + vn + ".designFloat = true;\n");
                 body.Append("        " + vn + ".designAnchor = " + Convert.ToString(anc) + ";\n");
                 body.Append("        " + vn + ".logPlaceSet = true;\n");
                 body.Append("        " + vn + ".logX = " + Convert.ToString(fx) + ";\n");
                 body.Append("        " + vn + ".logY = " + Convert.ToString(fy) + ";\n");
-                if (fw > 0) { body.Append("        " + vn + ".logW = " + Convert.ToString(fw) + ";\n"); }
-                if (fh > 0) { body.Append("        " + vn + ".logH = " + Convert.ToString(fh) + ";\n"); }
-            } else if (dk == 1 || dk == 2) {
-                body.Append("        " + vn + ".Dock(Gui.Dock.");
-                if (dk == 1) { body.Append("Top"); } else { body.Append("Bottom"); }
-                body.Append("());\n");
-                if (fh > 0) {
-                    body.Append("        " + vn + ".logH = " +
-                                Convert.ToString(fh) + ";\n");
-                }
-            } else if (dk == 3 || dk == 4) {
-                body.Append("        " + vn + ".Dock(Gui.Dock.");
-                if (dk == 3) { body.Append("Left"); } else { body.Append("Right"); }
-                body.Append("());\n");
-                if (fw > 0) {
-                    body.Append("        " + vn + ".logW = " +
-                                Convert.ToString(fw) + ";\n");
-                }
-            } else if (dk == 5) {
-                body.Append("        " + vn + ".Dock(Gui.Dock.Fill());\n");
-            } else {
-                body.Append("        " + vn + ".Dock(Gui.Dock.Manual());\n");
-                body.Append("        " + vn + ".logPlaceSet = true;\n");
-                body.Append("        " + vn + ".logX = " +
-                            Convert.ToString(fx) + ";\n");
-                body.Append("        " + vn + ".logY = " +
-                            Convert.ToString(fy) + ";\n");
-                if (fw > 0) {
-                    body.Append("        " + vn + ".logW = " +
-                                Convert.ToString(fw) + ";\n");
-                }
-                if (fh > 0) {
-                    body.Append("        " + vn + ".logH = " +
-                                Convert.ToString(fh) + ";\n");
-                }
+            }
+            if (fg > 0) {
+                body.Append("        " + vn + ".grow = true;\n");
+            }
+            if (fw > 0) {
+                body.Append("        " + vn + ".logW = " + Convert.ToString(fw) + ";\n");
+            }
+            if (fh > 0) {
+                body.Append("        " + vn + ".logH = " + Convert.ToString(fh) + ";\n");
             }
             if (GenForm.IsContainer(o)) {
                 // 设计没写 pad 就别写死：容器的内边距默认由样式表
