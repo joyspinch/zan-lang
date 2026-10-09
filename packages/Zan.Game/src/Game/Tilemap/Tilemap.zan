@@ -116,6 +116,171 @@ class TileLayer {
     }
 
     /// <summary>
+    /// 从给定的多个实心瓦片 ID 集合提取并合并碰撞矩形（水平行合并）。
+    /// 支持同时匹配多种实心障碍物瓦片（例如墙壁、石块、管道等）。
+    /// </summary>
+    List<Rect2> ExtractCollidersMatching(List<int> solidTileIds) {
+        List<Rect2> colliders = new List<Rect2>();
+        if (solidTileIds == null || solidTileIds.Count == 0) {
+            return colliders;
+        }
+
+        int r = 0;
+        while (r < this.rows) {
+            int c = 0;
+            while (c < this.cols) {
+                int tid = this.GetTile(c, r);
+                if (TileLayer.ContainsId(solidTileIds, tid)) {
+                    int startCol = c;
+                    while (c < this.cols && TileLayer.ContainsId(solidTileIds, this.GetTile(c, r))) {
+                        c = c + 1;
+                    }
+                    int spanCols = c - startCol;
+                    double rx = (double)(startCol * this.tileSize);
+                    double ry = (double)(r * this.tileSize);
+                    double rw = (double)(spanCols * this.tileSize);
+                    double rh = (double)this.tileSize;
+                    colliders.Add(new Rect2(rx, ry, rw, rh));
+                } else {
+                    c = c + 1;
+                }
+            }
+            r = r + 1;
+        }
+
+        return colliders;
+    }
+
+    /// <summary>
+    /// 从瓦片 ID 区间 [minTileId, maxTileId] 提取并合并碰撞矩形（水平行合并）。
+    /// 适合图集中连续一片区域作为地形/建筑碰撞体的场景。
+    /// </summary>
+    List<Rect2> ExtractCollidersRange(int minTileId, int maxTileId) {
+        List<Rect2> colliders = new List<Rect2>();
+        if (minTileId > maxTileId) {
+            return colliders;
+        }
+
+        int r = 0;
+        while (r < this.rows) {
+            int c = 0;
+            while (c < this.cols) {
+                int tid = this.GetTile(c, r);
+                if (tid >= minTileId && tid <= maxTileId) {
+                    int startCol = c;
+                    while (c < this.cols) {
+                        int cur = this.GetTile(c, r);
+                        if (cur >= minTileId && cur <= maxTileId) {
+                            c = c + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    int spanCols = c - startCol;
+                    double rx = (double)(startCol * this.tileSize);
+                    double ry = (double)(r * this.tileSize);
+                    double rw = (double)(spanCols * this.tileSize);
+                    double rh = (double)this.tileSize;
+                    colliders.Add(new Rect2(rx, ry, rw, rh));
+                } else {
+                    c = c + 1;
+                }
+            }
+            r = r + 1;
+        }
+
+        return colliders;
+    }
+
+    /// <summary>
+    /// 二维贪心矩形合并碰撞提取（2D Greedy Box Merging）。
+    /// 先进行水平跨列合并，再将上下相邻且水平起始列和跨度完全一致的横条垂直向上/下合并为一个大矩形。
+    /// 能将大型平台、实心高墙或地面（如 20x10 网格）直接压缩为极少数整块 Rect2，彻底杜绝跳跃/冲刺时的缝隙穿透与卡顿。
+    /// </summary>
+    List<Rect2> ExtractCollidersOptimized2D(int solidTileId) {
+        List<Rect2> rowBoxes = this.ExtractColliders(solidTileId);
+        return TileLayer.MergeBoxesVertically(rowBoxes, this.tileSize);
+    }
+
+    /// <summary>
+    /// 多瓦片 ID 匹配的二维贪心矩形合并碰撞提取。
+    /// </summary>
+    List<Rect2> ExtractCollidersMatchingOptimized2D(List<int> solidTileIds) {
+        List<Rect2> rowBoxes = this.ExtractCollidersMatching(solidTileIds);
+        return TileLayer.MergeBoxesVertically(rowBoxes, this.tileSize);
+    }
+
+    /// <summary>
+    /// 区间匹配的二维贪心矩形合并碰撞提取。
+    /// </summary>
+    List<Rect2> ExtractCollidersRangeOptimized2D(int minTileId, int maxTileId) {
+        List<Rect2> rowBoxes = this.ExtractCollidersRange(minTileId, maxTileId);
+        return TileLayer.MergeBoxesVertically(rowBoxes, this.tileSize);
+    }
+
+    static bool ContainsId(List<int> list, int target) {
+        int i = 0;
+        int count = list.Count;
+        while (i < count) {
+            if (list[i] == target) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static List<Rect2> MergeBoxesVertically(List<Rect2> boxes, int tileSize) {
+        List<Rect2> result = new List<Rect2>();
+        int count = boxes.Count;
+        if (count == 0) {
+            return result;
+        }
+
+        List<bool> merged = new List<bool>();
+        int k = 0;
+        while (k < count) {
+            merged.Add(false);
+            k = k + 1;
+        }
+
+        double ts = (double)tileSize;
+
+        int i = 0;
+        while (i < count) {
+            if (merged[i]) {
+                i = i + 1;
+                continue;
+            }
+
+            Rect2 baseBox = boxes[i];
+            double bx = baseBox.X();
+            double by = baseBox.Y();
+            double bw = baseBox.Width();
+            double bh = baseBox.Height();
+
+            // 向后探测在后续行中是否有 x 和 width 完全相等且紧挨着底部的矩形 (y == by + bh)
+            int j = i + 1;
+            while (j < count) {
+                if (!merged[j]) {
+                    Rect2 candidate = boxes[j];
+                    if (candidate.X() == bx && candidate.Width() == bw && candidate.Y() == (by + bh)) {
+                        bh = bh + candidate.Height();
+                        merged[j] = true;
+                    }
+                }
+                j = j + 1;
+            }
+
+            merged[i] = true;
+            result.Add(new Rect2(bx, by, bw, bh));
+            i = i + 1;
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// 解析逗号或换行分隔的 CSV 格式地图数据填充当前图层。
     /// 格式兼容 Tiled CSV 导出与手写 ASCII 数值网格。
     /// </summary>
