@@ -348,7 +348,7 @@ static void check_readonly_assignment(zan_checker_t *c, zan_ast_node_t *expr) {
         return;
     }
     if (!field_is_readonly(field)) return;
-    /* A derived constructor cannot initialize a readonly field declared by its base */
+    /* 派生类构造函数不可初始化基类声明的 readonly 只读字段 */
     if (c->in_ctor && field->parent == c->current_type_sym) return;
     zan_symbol_t *decl_owner = field->parent ? field->parent : owner;
     zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
@@ -2341,7 +2341,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_CALL: {
-        /* nameof(name): the spelling of its argument's final identifier, typed as string */
+        /* nameof(expr) 编译期常量折叠：取标识符末段拼写为 string */
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER &&
             expr->call.callee->ident.name.len == 6 &&
             memcmp(expr->call.callee->ident.name.str, "nameof", 6) == 0 &&
@@ -2484,7 +2484,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 return op->type;
             }
         }
-        /* Resolve the callee's return type when the function/method symbol is in scope */
+        /* 解析作用域内被调函数/方法的返回类型 */
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER) {
             zan_symbol_t *fsym = called_sym
                 ? called_sym
@@ -2595,7 +2595,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (op_count == 1 && op && op->decl &&
                 op->decl->kind == AST_METHOD_DECL &&
                 op->decl->method_decl.return_type) {
-                /* The declared index parameters must accept what was written between the brackets */
+                /* 索引器形参与实参类型匹配校验 */
                 zan_ast_list_t *ps = &op->decl->method_decl.params;
                 /* 内部辅助实现 */
                 bool is_static = (op->decl->method_decl.modifiers &
@@ -2734,7 +2734,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             /* 内部辅助逻辑 */
             check_ctor_available(c, type, expr);
         }
-        /* `new List<T>(src)` with a single List-typed argument is the copy constructor */
+        /* new List<T>(src) 单参数拷贝构造函数类型推导 */
         bool list_copy_candidate = !expr->new_expr.is_array && type &&
             type->kind == TYPE_CLASS && type->type_arg_count == 1 &&
             type->name.len == 4 && memcmp(type->name.str, "List", 4) == 0 &&
@@ -2916,7 +2916,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         zan_type_t *else_type = zan_checker_check_expr(c, expr->conditional.else_expr);
         zan_type_t *merged = merge_conditional_types(c, then_type, else_type);
         if (!merged) {
-            /* `cond ? refExpr : null` / `cond ? null : refExpr`: C# gives the reference type */
+            /* 三元条件表达式中引用类型与 null 字面量类型推导 */
             if (expr_is_null_literal(expr->conditional.else_expr) &&
                 checker_type_is_ref(then_type))
                 merged = then_type;
@@ -3372,7 +3372,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                 seen_wildcard = true;
             }
 
-            /* B5 pattern variable: `case T x:` brings x into scope for the guard and the body */
+            /* 模式匹配变量引入：case T x 将 x 绑定入守卫与代码块作用域 */
             if (sc->switch_case.type_pattern && sc->switch_case.var_name.len > 0) {
                 zan_type_t *pt = zan_binder_resolve_type(
                     c->binder, sc->switch_case.type_pattern);

@@ -486,7 +486,7 @@ zan_type_t *zan_binder_make_grouping_type(zan_binder_t *b, zan_type_t *elem) {
         (zan_type_t **)zan_arena_alloc(b->arena, sizeof(zan_type_t *));
     t->type_args[0] = elem;
     t->type_arg_count = 1;
-    /* Attach the real stdlib class symbol: `Grouping` is an ordinary class in System */
+    /* 绑定标准库 System.Linq.Grouping 泛型分组类型符号 */
     zan_istr_t nm = { "Grouping", 8 };
     zan_symbol_t *sym = zan_binder_lookup(b, nm);
     if (sym && sym->kind == SYM_CLASS) t->sym = sym;
@@ -1317,7 +1317,7 @@ static bool binder_type_equal(zan_type_t *a, zan_type_t *b, int depth) {
     return true;
 }
 
-/* True when `t` is `sup`, or reaches it through its interface list or base chain */
+/* 类型兼容性判定：t 继承自 sup 或实现了 sup 接口 */
 static bool binder_type_derives(zan_type_t *t, zan_type_t *sup, int depth) {
     if (!t || !sup || depth > 64) return false;
     if (t == sup) return true;

@@ -27,8 +27,7 @@ typedef struct {
     int attached;
     int closed;           /* Close() seen: present becomes a no-op */
 
-    /* EGL present state; created on attach / first present, both on the
-     * app thread that later calls zan_gui_present. */
+    /* OpenHarmony EGL 呈现状态：在 surface 附着或首次 present 时创建 */
     EGLDisplay egl_dpy;
     EGLSurface egl_surf;
     void      *surf_nw;   /* native window egl_surf was created for */
@@ -57,7 +56,7 @@ static int g_pending_event[8];
 static iptr g_event_win = 0;
 static long long g_ev_seq = 0;
 
-/* Plain moves coalesce (freshest x/y wins) and wheel floods coalesce by SUMMING deltas -- same contract across shells */
+/* 触控移动事件合并：取最新坐标；滚轮滑动事件合并：累加偏移量 */
 static void oq_push_locked(int kind, int x, int y, int button, int code, int mods) {
     int last = (g_oq_tail + ZAN_OQ_CAP - 1) % ZAN_OQ_CAP;
     int has_last = (g_oq_head != g_oq_tail);
@@ -79,9 +78,7 @@ static void oq_push_locked(int kind, int x, int y, int button, int code, int mod
     g_oq_tail = next;
 }
 
-/* Same push, with the swallow-click flag set (e[6]): the app must not
- * treat this release as a click (drag end, or the pointer twin of a
- * sub-notch move). */
+/* 触控抬起派发：设置吞掉点击标记以防拖拽误判为点击 */
 static void oq_push_flag_locked(int kind, int x, int y, int button, int code, int mods) {
     oq_push_locked(kind, x, y, button, code, mods);
     if (g_oq_head != g_oq_tail) {
@@ -90,7 +87,7 @@ static void oq_push_flag_locked(int kind, int x, int y, int button, int code, in
     }
 }
 
-/* ---- HAP-shell feed (called from the XComponent callbacks) ------------ */
+/* XComponent 回调桥接（接收 ArkTS 宿主分发的生命周期与触控事件） */
 
 EXPORT void zan_gui_ohos_attach(void *nw, int w, int h) {
     if (!nw || w <= 0 || h <= 0) return;
@@ -105,8 +102,7 @@ EXPORT void zan_gui_ohos_attach(void *nw, int w, int h) {
     oq_push_locked(14, 0, 0, 0, 0, 0);
     pthread_mutex_unlock(&g_oq_lock);
 
-    /* Feature detection, once: direct BufferQueue on real devices, EGL
-     * fallback where the NDK window library is absent (emulator). */
+    /* 特性探测：真机优先使用 BufferQueue 直写，模拟器回退 EGL 呈现 */
     if (!g_nw_request) {
         g_nw_request = (FnNWRequestBuffer)dlsym(
             RTLD_DEFAULT, "OH_NativeWindow_NativeWindowRequestBuffer");
@@ -118,15 +114,13 @@ EXPORT void zan_gui_ohos_attach(void *nw, int w, int h) {
             RTLD_DEFAULT, "OH_NativeWindow_NativeWindowHandleOpt");
     }
     if (g_nw_request && g_nw_handleopt) {
-        /* Every (re)attach: the format lives on the window, and a rotation
-         * hands the shell a fresh one. BGRA_8888 is what the software
-         * rasterizer's little-endian ARGB bytes already are. */
+        /* 窗口重附着或旋转：重新配置窗口像素格式 (WINDOW_FORMAT_RGBA_8888) */
         int32_t fmt = 2; /* NATIVEBUFFER_PIXEL_FMT_BGRA_8888 */
         g_nw_handleopt((OHNativeWindow *)nw, SET_FORMAT, fmt);
     }
 }
 
-/* Surface gone: the XComponent callback fires on EVERY background cycle (home key, app switch), not just real teardown */
+/* 进程切后台 Surface 销毁生命周期处理 */
 EXPORT void zan_gui_ohos_detach(void) {
     pthread_mutex_lock(&g_oq_lock);
     g_owin.attached = 0;
@@ -253,9 +247,7 @@ EXPORT void zan_gui_ohos_touch(int action, int x, int y) {
         g_tg_hi = (g_tg_hi + 1) % OH_TOUCH_HIST;
         if (g_tg_hn < OH_TOUCH_HIST) g_tg_hn++;
         g_tg_x = fx; g_tg_y = fy;
-        /* Sub-notch pointer twin: the wheel IS the motion when it carried
-         * a delta (App updates mouseX/Y from kind 13 too); push a flagged
-         * move only for sub-notch travel so held widgets still follow. */
+        /* 触控滚轮事件转换与光标坐标同步更新 */
         if (delta == 0) oq_push_flag_locked(1, x, y, 0, 0, 0);
         pthread_mutex_unlock(&g_oq_lock);
         return;
@@ -267,8 +259,7 @@ EXPORT void zan_gui_ohos_touch(int action, int x, int y) {
             /* 内部辅助实现 */
             oq_push_flag_locked(3, (int)g_tg_x, (int)g_tg_y, 0, 0, 0);
             pthread_mutex_unlock(&g_oq_lock);
-            /* Release velocity from the recent travel window (oldest
-             * sample still inside ~120 ms). */
+            /* 计算滑动释放速度 (~120ms 时间窗口滑动惯性) */
             int last = (g_tg_hi + OH_TOUCH_HIST - 1) % OH_TOUCH_HIST;
             int old = last;
             for (int k = 0; k < g_tg_hn; k++) {
@@ -283,9 +274,7 @@ EXPORT void zan_gui_ohos_touch(int action, int x, int y) {
                 fling_start(v, (int)g_tg_x, (int)g_tg_y);
             }
         } else {
-            /* Tap: press + positioning move already went out at
-             * finger-down; only the release is missing. Unflagged — a tap
-             * that never exceeded slop is a genuine click at the anchor. */
+            /* 单击事件完成：手指按下时已发送位置与按下事件，此处仅发送抬起 */
             int ax = (int)g_tg_ax, ay = (int)g_tg_ay;
             oq_push_locked(3, ax, ay, 0, 0, 0);
             pthread_mutex_unlock(&g_oq_lock);
@@ -296,8 +285,7 @@ EXPORT void zan_gui_ohos_touch(int action, int x, int y) {
 
 /* 内部辅助实现 */
 
-/* The IMF headers use char16_t (a C++ keyword) without pulling in the C11
- * home for it; include uchar.h first or every signature fails to parse. */
+/* 包含 uchar.h 以支持 IMF 头文件中的 char16_t 类型定义 */
 #include <uchar.h>
 #include "inputmethod/inputmethod_controller_capi.h"
 
@@ -362,7 +350,7 @@ static InputMethod_TextEditorProxy *g_ime_proxy = NULL;
 static InputMethod_InputMethodProxy *g_ime_im = NULL;
 static int g_ime_attached = 0;
 
-/* UTF-16 -> one codepoint; surrogate pairs merge. Returns 0 at end. */
+/* UTF-16 解码为 Unicode 码点（合并代理对） */
 static int ime_utf16_next(const char16_t *s, size_t n, size_t *i) {
     if (*i >= n) { return 0; }
     unsigned int u = (unsigned int)s[(*i)++];
@@ -376,8 +364,7 @@ static int ime_utf16_next(const char16_t *s, size_t n, size_t *i) {
     return (int)u;
 }
 
-/* IMF callbacks run on binder threads: the only shared state they touch is
- * the event ring, which is why every push happens under g_oq_lock. */
+/* OpenHarmony 输入法 (IMF) 回调：通过线程安全环形队列传递输入文本 */
 static void ime_on_insert(InputMethod_TextEditorProxy *proxy,
                           const char16_t *text, size_t length) {
     (void)proxy;
@@ -395,7 +382,7 @@ static void ime_on_insert(InputMethod_TextEditorProxy *proxy,
 static void ime_on_delete_backward(InputMethod_TextEditorProxy *proxy,
                                    int32_t length) {
     (void)proxy;
-    /* length counts UTF-16 units; a surrogate pair is one Zan codepoint. */
+    /* 文本长度按 UTF-16 单元计数，代理对视为单个码点 */
     int n = (length + 1) / 2;
     if (n < 1) { n = 1; }
     pthread_mutex_lock(&g_oq_lock);
@@ -437,8 +424,7 @@ static void ime_on_move_cursor(InputMethod_TextEditorProxy *proxy,
     pthread_mutex_unlock(&g_oq_lock);
 }
 
-/* The shell holds no editor content, so cursor-context queries answer
- * empty: composition still commits, candidates just see nothing. */
+/* 输入上下文查询空回退：光标位置与选区设为空 */
 static void ime_on_get_left_text(InputMethod_TextEditorProxy *proxy,
                                  int32_t number, char16_t text[], size_t *length) {
     (void)proxy; (void)number;
@@ -486,7 +472,7 @@ static void ime_on_finish_preview(InputMethod_TextEditorProxy *proxy) {
 static void ime_on_get_text_config(InputMethod_TextEditorProxy *proxy,
                                    InputMethod_TextConfig *config) {
     (void)proxy;
-    /* Same dlsym discipline as everywhere else in this file: the three TextConfig setters live in libohinputmethod */
+    /* 动态加载 libohinput.so 中的 TextConfig 配置接口 */
     if (g_ime_cfg_input) { g_ime_cfg_input(config, IME_TEXT_INPUT_TYPE_TEXT); }
     if (g_ime_cfg_preview) { g_ime_cfg_preview(config, false); }
     if (g_ime_cfg_enter) { g_ime_cfg_enter(config, IME_ENTER_KEY_UNSPECIFIED); }
@@ -547,8 +533,7 @@ static void ime_feature_detect(void) {
     g_ime_detach = (FnImeDetach)dlsym(RTLD_DEFAULT, "OH_InputMethodController_Detach");
     g_ime_opts_create = (FnImeAttachOptsCreate)dlsym(RTLD_DEFAULT, "OH_AttachOptions_Create");
     g_ime_opts_destroy = (FnImeAttachOptsDestroy)dlsym(RTLD_DEFAULT, "OH_AttachOptions_Destroy");
-    /* TextConfig setters are optional: GetTextConfig degrades to "no
-     * preferences" when the image lacks them, which the IME accepts. */
+    /* 可选 TextConfig 支持：接口缺失时优雅降级 */
     g_ime_cfg_input = (FnImeCfgSetInputType)dlsym(RTLD_DEFAULT, "OH_TextConfig_SetInputType");
     g_ime_cfg_enter = (FnImeCfgSetEnterKeyType)dlsym(RTLD_DEFAULT, "OH_TextConfig_SetEnterKeyType");
     g_ime_cfg_preview = (FnImeCfgSetPreviewSupport)dlsym(RTLD_DEFAULT, "OH_TextConfig_SetPreviewTextSupport");
@@ -562,7 +547,7 @@ static void ime_feature_detect(void) {
     }
 }
 
-/* Open/close the IME session, driven by text-widget focus exactly like the platform shell's Start/StopTextInput pairing */
+/* 焦点驱动打开/关闭输入法会话 */
 EXPORT void zan_gui_set_ime_open(i32 on) {
     ime_feature_detect();
     ime_ensure_proxy();
@@ -625,9 +610,7 @@ static GLuint ohos_compile(GLenum type, const char *src) {
     return sh;
 }
 
-/* Display/config/surface/context for the current w->nw, idempotent: a
- * rotation hands the shell a fresh native window and the caller drops the
- * dead surface before calling this again (see zan_gui_present). */
+/* EGL 呈现环境初始化（支持窗口旋转与重连） */
 static int ohos_gl_surface(zan_ohos_win_t *w) {
     if (!w->egl_dpy) {
         w->egl_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -671,8 +654,7 @@ static int ohos_gl_surface(zan_ohos_win_t *w) {
     return 0;
 }
 
-/* The quad program + texture; only the surface depends on the native
- * window, so this runs exactly once per process. */
+/* EGL 纹理全屏四边形着色器程序单例初始化 */
 static int ohos_gl_program(zan_ohos_win_t *w) {
     if (w->gl_prog) { return 0; }
 
@@ -740,8 +722,7 @@ static void ohos_texture(zan_ohos_win_t *w, const zan_surface_t *s) {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, w->gl_tex);
     if (w->tex_w != s->width || w->tex_h != s->height) {
-        /* New/resize: whole-surface (re)seed, dirty rects from the frame
-         * that resized are already included in the pixels. */
+        /* 窗口创建与尺寸调整：全屏刷新并包含当前帧脏矩形 */
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, s->width, s->height, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, NULL);
         w->tex_w = s->width;
@@ -786,9 +767,7 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     zan_surface_t *s = g_surfaces[surface_id];
     g_last_surface = surface_id;
 
-    /* Fast path: real device with the NDK window library -- write the
-     * BufferQueue buffer directly. Announced dirty rects are consumed
-     * (cleared) without use: this path copies the whole frame anyway. */
+    /* 真机加速路径：通过 NDK 直接写入 BufferQueue 像素缓冲区 */
     if (g_nw_request && g_nw_flush && g_nw_getbh) {
         OHNativeWindowBuffer *buf = NULL;
         int fence = -1;

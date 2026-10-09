@@ -135,7 +135,7 @@ static zan_ast_node_t *parse_delegate_decl(zan_parser_t *p, uint32_t mods) {
 
 /* 内部辅助实现 */
 static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
-    /* parse attributes: retained on the type; [StructLayout] also toggles C layout */
+    /* 解析类型特性：保留特性元数据，[StructLayout] 触发 C 内存布局对齐 */
     bool has_c_layout = false;
     bool has_explicit_layout = false;
     zan_ast_list_t type_attrs;
@@ -478,7 +478,7 @@ static bool paren_is_lambda(zan_parser_t *p) {
     return result;
 }
 
-/* `(Name)operand` — cast to a user-declared type rather than a grouped expression */
+/* (Name)operand 显式类型转换表达式语法消歧 */
 static bool paren_is_named_cast(zan_parser_t *p) {
     if (zan_lexer_peek(p->lex).kind != TK_IDENT) return false;
     zan_lexer_t saved_lex = *p->lex;
@@ -1008,7 +1008,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             n->new_expr.is_array = true;
             while (!parser_check(p, TK_RBRACKET) && !parser_check(p, TK_EOF)) {
                 if (n->new_expr.array_rank >= 16) {
-                    /* irgen keeps the sizes in a fixed dims[16]; a 17th dimension would read past it */
+                    /* 多维数组维度上限校验 (最大支持 16 维) */
                     zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
                                   "array rank specifier is too deep (max 16)");
                 }
@@ -2233,7 +2233,7 @@ static bool looks_like_var_decl(zan_parser_t *p) {
         while (q < n && ZAN_TKW_WS(s[q])) q++;
         while (q < n && s[q] == '[') {
             size_t r = q + 1;
-            /* Array-rank specifier: only whitespace and commas may sit between the brackets */
+            /* 数组秩修饰符解析：方括号间仅允许逗号与空白 */
             while (r < n && (ZAN_TKW_WS(s[r]) || s[r] == ',')) r++;
             if (r >= n || s[r] != ']') return false;
             q = r + 1;
@@ -4361,7 +4361,7 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
         if (!parse_top_level_decl(p, unit))
             parser_advance(p); /* skip to recover */
         if (parser_check(p, TK_RBRACE)) {
-            /* A stray `}` at top level: diagnose and skip it so following decls still parse */
+            /* 顶层游离右大括号容错：报告语法错误并跳过以继续解析后续声明 */
             zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
                           "unexpected '}' at top level");
             parser_advance(p);
