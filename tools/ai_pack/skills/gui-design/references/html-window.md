@@ -187,6 +187,12 @@ STANDARDS.md §6.7）。
   和混排文字；直接复用旧索引会指向另一个孩子。同级重排还须保持文本槽
   并重写子节点槽的显示顺序：只重映射身份曾让 MoveSel/SelToEdge 改了
   kids 顺序，混排画面却仍按旧序，验收要检查实际 elOrder 的控件引用。
+- **GenForm 与 FormBuilder 装配契约 100% 对齐**：HTML 容器节点导出的
+  JSON 结构常为 `kind: "Panel"` 且带有 `htmlTag`。GenForm 在发射子节点
+  装配代码时，若父级是 Element（满足 `IsElement`：带有 `htmlTag` 或
+  `kind == "Element"`），必须调用 `parent.AddKid(child)` 而不是 `parent.Add(child)`；
+  调用 `Add` 会绕过 `elOrder`，使子节点被推迟到全部内联文本流条目之后，
+  导致编译后 AOT 窗体与设计器预览的行盒混排流序与几何出现偏差。
 - **最终窗形与运行窗口共用遮罩**：逐 region 计算并集，圆角 SDF 保留
   `min(max(qx,qy),0)` 内部项；旧步进曾跳过后续区域，缺内部项使 radius=0
   整块半覆盖。区分 straight/premult，预乘缓冲须满足 RGB≤A：
