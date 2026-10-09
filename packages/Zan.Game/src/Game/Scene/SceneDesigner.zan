@@ -887,6 +887,71 @@ partial class SceneDesigner {
         this.SetDesignPos(e, snL, snT);
     }
 
+    // 全选当前可编辑层（当前图层，若在基础层则包含基础层）的所有元素。
+    void SelectAll() {
+        this.sel = null;
+        this.selExtra = new List<SceneElement>();
+        for (int i = 0; i < this.doc.Count(); i = i + 1) {
+            SceneElement e = this.doc.ElementAt(i);
+            if (this.editLayer.Length == 0 || e.Layer() == this.editLayer) {
+                if (this.sel == null) {
+                    this.sel = e;
+                } else {
+                    this.selExtra.Add(e);
+                }
+            }
+        }
+        int total = (this.sel != null ? 1 : 0) + this.selExtra.Count;
+        this.msg = SceneDesigner.T("selected ", "已选中 ") + SceneDoc.IntStr(total)
+            + SceneDesigner.T(" element(s)", " 个元素");
+    }
+
+    // 切换选中集合的锁定状态（只要有一个未锁就全锁，全锁时则全解锁）。
+    void ToggleLockSel() {
+        if (this.sel == null) { return; }
+        this.PushUndo();
+        bool anyUnlocked = !this.sel.Locked();
+        if (!anyUnlocked) {
+            for (int i = 0; i < this.selExtra.Count; i = i + 1) {
+                if (!this.selExtra[i].Locked()) { anyUnlocked = true; break; }
+            }
+        }
+        bool targetLock = anyUnlocked;
+        this.sel.SetLocked(targetLock);
+        for (int i = 0; i < this.selExtra.Count; i = i + 1) {
+            this.selExtra[i].SetLocked(targetLock);
+        }
+        if (targetLock) {
+            this.msg = SceneDesigner.T("locked selection", "已锁定选中项");
+        } else {
+            this.msg = SceneDesigner.T("unlocked selection", "已解锁选中项");
+        }
+    }
+
+    // 清空选中状态。
+    void ClearSel() {
+        this.sel = null;
+        this.selExtra = new List<SceneElement>();
+        this.ctxOpen = false;
+        this.layerMenuOpen = false;
+        this.msg = SceneDesigner.T("selection cleared", "已取消选中");
+    }
+
+    // 键盘移动所有未锁定的选中元素（主选 + 额外多选）。
+    void NudgeSel(int dx, int dy) {
+        if (this.sel == null) { return; }
+        this.PushUndo();
+        if (!this.sel.Locked()) {
+            this.SetDesignPos(this.sel, this.DesignLeft(this.sel) + dx, this.DesignTop(this.sel) + dy);
+        }
+        for (int i = 0; i < this.selExtra.Count; i = i + 1) {
+            SceneElement e = this.selExtra[i];
+            if (!e.Locked()) {
+                this.SetDesignPos(e, this.DesignLeft(e) + dx, this.DesignTop(e) + dy);
+            }
+        }
+    }
+
     // --- 顶层渲染 ----------------------------------------------------
 
     // 渲染整个设计器（功能区 + 画布 + 面板/检查器/状态栏）到矩形 (x,y,w,h)；使用独立的控件 id 序号段，不污染宿主 id。宿主面板开启时只画功能区与画布。
@@ -2283,15 +2348,16 @@ partial class SceneDesigner {
         return false;
     }
 
-    // 键盘编辑：方向键按一个网格步长微调选中项（Shift = 1px），Delete 删除，Ctrl+Z/Y 撤销重做，Ctrl+C/V 复制粘贴，Ctrl+D 复制。检查器输入框获得焦点时忽略全部按键。
+    // 键盘编辑：方向键按一个网格步长微调选中项（Shift = 1px），Delete 删除，Ctrl+Z/Y 撤销重做，Ctrl+C/V 复制粘贴，Ctrl+D 复制，Ctrl+A 全选，Ctrl+L 锁/解锁切换，Esc 取消选中。检查器输入框获得焦点时忽略全部按键。
     void HandleKeys(App app) {
         if (this.AnyInputFocused(app)) { return; }
         int ek = app.EventKind();
         if (app.PointerCaptured()) { ek = 0; }
         // Ctrl+字母快捷键以文本输入控制码到达：
-        // ^Z=26 撤销，^Y=25 重做，^C=3 复制，^V=22 粘贴，^D=4 复制。
+        // ^A=1 全选，^Z=26 撤销，^Y=25 重做，^C=3 复制，^V=22 粘贴，^D=4 复制，^L=12 锁定/解锁。
         if (ek == 6) {
             int cc = app.window.EventKeyCode();
+            if (cc == 1) { this.SelectAll(); app.RequestRedraw(); return; }
             if (cc == 26) { this.Undo(); app.RequestRedraw(); return; }
             if (cc == 25) { this.Redo(); app.RequestRedraw(); return; }
             if (cc == 3) { this.CopySel(); app.RequestRedraw(); return; }
@@ -2301,18 +2367,29 @@ partial class SceneDesigner {
                 app.RequestRedraw();
                 return;
             }
+            if (cc == 12 && this.sel != null) {
+                this.ToggleLockSel();
+                app.RequestRedraw();
+                return;
+            }
         }
-        if (this.sel == null) { return; }
         if (ek != 4) { return; }
         int kc = app.window.EventKeyCode();
+        if (kc == 27) {
+            if (this.sel != null || this.selExtra.Count > 0 || this.ctxOpen || this.layerMenuOpen) {
+                this.ClearSel();
+                app.RequestRedraw();
+                return;
+            }
+        }
+        if (this.sel == null) { return; }
         int step = this.grid;
         if (step < 1) { step = 1; }
         if (Modifiers.HasShift(app.window.EventMods())) { step = 1; }
-        bool lk = this.sel.Locked();
-        if (kc == 37 && !lk) { this.PushUndo(); this.sel.At(this.sel.X() - step, this.sel.Y()); app.RequestRedraw(); }
-        else if (kc == 39 && !lk) { this.PushUndo(); this.sel.At(this.sel.X() + step, this.sel.Y()); app.RequestRedraw(); }
-        else if (kc == 38 && !lk) { this.PushUndo(); this.sel.At(this.sel.X(), this.sel.Y() - step); app.RequestRedraw(); }
-        else if (kc == 40 && !lk) { this.PushUndo(); this.sel.At(this.sel.X(), this.sel.Y() + step); app.RequestRedraw(); }
+        if (kc == 37) { this.NudgeSel(0 - step, 0); app.RequestRedraw(); }
+        else if (kc == 39) { this.NudgeSel(step, 0); app.RequestRedraw(); }
+        else if (kc == 38) { this.NudgeSel(0, 0 - step); app.RequestRedraw(); }
+        else if (kc == 40) { this.NudgeSel(0, step); app.RequestRedraw(); }
         else if (kc == 46) { this.DeleteSel(); app.RequestRedraw(); }
     }
 
