@@ -5,7 +5,6 @@ namespace System;
 
 /// <summary>
 /// 编译器不会原生简化的字符串操作。
-///
 /// 它们是扩展方法（`this string` 接收者），因此调用起来
 /// 与普通成员一样：`name.PadLeft(8)`。这里的每个名字以前都会编译成
 /// 常量 0（该成员根本不存在），所以 C# 风格的代码
@@ -36,6 +35,18 @@ class StringExtensions {
         return b == 32 || b == 9 || b == 10 || b == 13 || b == 11 || b == 12;
     }
 
+    /// <summary>判断 Unicode 码点是否为空白字符（支持 ASCII 空白与常见 Unicode 空白字符如全角空格 U+3000、NBSP U+00A0 等）。</summary>
+    static bool IsWhitespaceCodePoint(int cp) {
+        if (cp == 32 || cp == 9 || cp == 10 || cp == 13 || cp == 11 || cp == 12) { return true; }
+        if (cp == 160 || cp == 5760 || cp == 6158 || cp == 8192 || cp == 8193 ||
+            cp == 8194 || cp == 8195 || cp == 8196 || cp == 8197 || cp == 8198 ||
+            cp == 8199 || cp == 8200 || cp == 8201 || cp == 8202 || cp == 8232 ||
+            cp == 8233 || cp == 8239 || cp == 8287 || cp == 12288 || cp == 65279) {
+            return true;
+        }
+        return false;
+    }
+
     /// <summary>与 C# 的 `string.IsNullOrWhiteSpace` 一致：null、空串或
     /// 仅由空白字符组成时返回 true（零临时分配高效实现，长连续空格 SIMD 快速跳过）。</summary>
     static bool IsNullOrWhiteSpace(this string s) {
@@ -61,79 +72,131 @@ class StringExtensions {
         return true;
     }
 
-    /// <summary>在 `width` 个空格宽的字段中右对齐字符串（O(N) 高效构建）。</summary>
+    /// <summary>在 `width` 个码点宽的字段中右对齐字符串（按 Unicode 码点数对齐，支持多字节 UTF-8 字符）。</summary>
     static string PadLeft(this string s, int width) {
         if (s == null) { return null; }
-        int diff = width - s.Length;
+        int runes = s.RuneCount();
+        int diff = width - runes;
         if (diff <= 0) { return s; }
-        byte[] buf = new byte[width];
-        for (int i = 0; i < diff; i = i + 1) { buf[i] = 32; }
-        for (int j = 0; j < s.Length; j = j + 1) { buf[diff + j] = (byte)(s[j] & 255); }
-        return buf.ToStr(0, width);
+        // 纯 ASCII 快速路径：若字节数等于码点数，直接分配并单次拷贝
+        if (runes == s.Length) {
+            byte[] buf = new byte[width];
+            for (int i = 0; i < diff; i = i + 1) { buf[i] = 32; }
+            for (int j = 0; j < s.Length; j = j + 1) { buf[diff + j] = (byte)(s[j] & 255); }
+            return buf.ToStr(0, width);
+        }
+        byte[] spBuf = new byte[diff];
+        for (int k = 0; k < diff; k = k + 1) { spBuf[k] = 32; }
+        return spBuf.ToStr(0, diff) + s;
     }
 
     /// <summary>右对齐字符串，用 `pad` 填充（取其第一个
-    /// 字符；`pad` 为空时原样返回字符串）。</summary>
+    /// 码点；`pad` 为空时原样返回字符串；按码点数对齐）。</summary>
     static string PadLeft(this string s, int width, string pad) {
         if (s == null) { return null; }
         if (pad == null || pad.Length == 0) { return s; }
-        int diff = width - s.Length;
+        int runes = s.RuneCount();
+        int diff = width - runes;
         if (diff <= 0) { return s; }
-        byte p = (byte)(pad[0] & 255);
-        byte[] buf = new byte[width];
-        for (int i = 0; i < diff; i = i + 1) { buf[i] = p; }
-        for (int j = 0; j < s.Length; j = j + 1) { buf[diff + j] = (byte)(s[j] & 255); }
-        return buf.ToStr(0, width);
+        string firstRune = pad.RuneAt(0);
+        if (firstRune.Length == 0) { firstRune = " "; }
+        if (firstRune.Length == 1 && runes == s.Length) {
+            byte p = (byte)(firstRune[0] & 255);
+            byte[] buf = new byte[width];
+            for (int i = 0; i < diff; i = i + 1) { buf[i] = p; }
+            for (int j = 0; j < s.Length; j = j + 1) { buf[diff + j] = (byte)(s[j] & 255); }
+            return buf.ToStr(0, width);
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int k = 0; k < diff; k = k + 1) {
+            sb.Append(firstRune);
+        }
+        sb.Append(s);
+        return sb.ToString();
     }
 
-    /// <summary>在 `width` 个空格宽的字段中左对齐字符串（O(N) 高效构建）。</summary>
+    /// <summary>在 `width` 个码点宽的字段中左对齐字符串（按 Unicode 码点数对齐，支持多字节 UTF-8 字符）。</summary>
     static string PadRight(this string s, int width) {
         if (s == null) { return null; }
-        int diff = width - s.Length;
+        int runes = s.RuneCount();
+        int diff = width - runes;
         if (diff <= 0) { return s; }
-        byte[] buf = new byte[width];
-        for (int j = 0; j < s.Length; j = j + 1) { buf[j] = (byte)(s[j] & 255); }
-        for (int i = 0; i < diff; i = i + 1) { buf[s.Length + i] = 32; }
-        return buf.ToStr(0, width);
+        // 纯 ASCII 快速路径
+        if (runes == s.Length) {
+            byte[] buf = new byte[width];
+            for (int j = 0; j < s.Length; j = j + 1) { buf[j] = (byte)(s[j] & 255); }
+            for (int i = 0; i < diff; i = i + 1) { buf[s.Length + i] = 32; }
+            return buf.ToStr(0, width);
+        }
+        byte[] spBuf = new byte[diff];
+        for (int k = 0; k < diff; k = k + 1) { spBuf[k] = 32; }
+        return s + spBuf.ToStr(0, diff);
     }
 
     /// <summary>左对齐字符串，用 `pad` 填充（取其第一个
-    /// 字符；`pad` 为空时原样返回字符串）。</summary>
+    /// 码点；`pad` 为空时原样返回字符串；按码点数对齐）。</summary>
     static string PadRight(this string s, int width, string pad) {
         if (s == null) { return null; }
         if (pad == null || pad.Length == 0) { return s; }
-        int diff = width - s.Length;
+        int runes = s.RuneCount();
+        int diff = width - runes;
         if (diff <= 0) { return s; }
-        byte p = (byte)(pad[0] & 255);
-        byte[] buf = new byte[width];
-        for (int j = 0; j < s.Length; j = j + 1) { buf[j] = (byte)(s[j] & 255); }
-        for (int i = 0; i < diff; i = i + 1) { buf[s.Length + i] = p; }
-        return buf.ToStr(0, width);
+        string firstRune = pad.RuneAt(0);
+        if (firstRune.Length == 0) { firstRune = " "; }
+        if (firstRune.Length == 1 && runes == s.Length) {
+            byte p = (byte)(firstRune[0] & 255);
+            byte[] buf = new byte[width];
+            for (int j = 0; j < s.Length; j = j + 1) { buf[j] = (byte)(s[j] & 255); }
+            for (int i = 0; i < diff; i = i + 1) { buf[s.Length + i] = p; }
+            return buf.ToStr(0, width);
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(s);
+        for (int k = 0; k < diff; k = k + 1) {
+            sb.Append(firstRune);
+        }
+        return sb.ToString();
     }
 
-    /// <summary>返回去掉前导空白字符的副本（零临时循环分配）。</summary>
+    /// <summary>返回去掉前导空白字符的副本（支持 Unicode 空白码点）。</summary>
     static string TrimStart(this string s) {
         if (s == null) { return null; }
         int len = s.Length;
         int i = 0;
-        while (i < len && StringExtensions.IsWhitespaceByte(s[i] & 255)) {
-            i = i + 1;
+        int[] cpSlot = new int[1];
+        while (i < len) {
+            int used = Encoding.DecodeCodePoint(s, i, cpSlot);
+            if (used <= 0) { used = 1; }
+            if (!StringExtensions.IsWhitespaceCodePoint(cpSlot[0])) {
+                break;
+            }
+            i = i + used;
         }
         if (i == 0) { return s; }
-        if (i == len) { return ""; }
+        if (i >= len) { return ""; }
         return s.Substring(i, len - i);
     }
 
-    /// <summary>返回去掉尾部空白字符的副本（零临时循环分配）。</summary>
+    /// <summary>返回去掉尾部空白字符的副本（支持 Unicode 空白码点）。</summary>
     static string TrimEnd(this string s) {
         if (s == null) { return null; }
-        int n = s.Length;
-        while (n > 0 && StringExtensions.IsWhitespaceByte(s[n - 1] & 255)) {
-            n = n - 1;
+        int len = s.Length;
+        if (len == 0) { return ""; }
+        // 从头向后扫描所有码点并记录最后一个非空白码点的结束字节位置
+        int i = 0;
+        int lastNonWs = 0;
+        int[] cpSlot = new int[1];
+        while (i < len) {
+            int used = Encoding.DecodeCodePoint(s, i, cpSlot);
+            if (used <= 0) { used = 1; }
+            if (!StringExtensions.IsWhitespaceCodePoint(cpSlot[0])) {
+                lastNonWs = i + used;
+            }
+            i = i + used;
         }
-        if (n == s.Length) { return s; }
-        if (n == 0) { return ""; }
-        return s.Substring(0, n);
+        if (lastNonWs == len) { return s; }
+        if (lastNonWs == 0) { return ""; }
+        return s.Substring(0, lastNonWs);
     }
 
     /// <summary>在 `index` 处插入 `value` 的副本。越界的索引
@@ -176,11 +239,27 @@ class StringExtensions {
         return String.CompareOrdinal(s, other) == 0;
     }
 
-    /// <summary>把字符串拆成单字符字符串列表。Zan 没有
-    /// char[] 值类型，因此这是 C# ToCharArray 的
-    /// List&lt;string&gt; 等价实现。</summary>
+    /// <summary>把字符串按 Unicode 码点拆成单字符字符串列表（支持多字节 UTF-8 字符）。
+    /// Zan 没有 char[] 值类型，因此这是 C# ToCharArray 的 List&lt;string&gt; 等价实现。</summary>
     static List<string> ToCharList(this string s) {
         List<string> outp = new List<string>();
+        if (s == null || s.Length == 0) { return outp; }
+        int n = s.Length;
+        int i = 0;
+        int[] cpSlot = new int[1];
+        while (i < n) {
+            int used = Encoding.DecodeCodePoint(s, i, cpSlot);
+            if (used <= 0) { used = 1; }
+            outp.Add(s.Substring(i, used));
+            i = i + used;
+        }
+        return outp;
+    }
+
+    /// <summary>按原始字节把字符串拆成单字节字符串列表（旧版 ToCharList 的字节级兼容实现）。</summary>
+    static List<string> ToByteCharList(this string s) {
+        List<string> outp = new List<string>();
+        if (s == null) { return outp; }
         for (int i = 0; i < s.Length; i = i + 1) { outp.Add(s.Substring(i, 1)); }
         return outp;
     }
