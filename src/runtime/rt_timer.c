@@ -271,9 +271,9 @@ unsigned char *zan_rt_soft_scratch(void) {
     if (!g_soft_scratch) {
         unsigned char *hdr = g_soft_scratch_store.bytes;
         memset(hdr, 0, sizeof(g_soft_scratch_store.bytes));
-        store_u64_le(hdr + 0,  ZAN_SOFT_SCRATCH_RC);    /* P-32: array rc   */
-        store_u64_le(hdr + 8,  ZAN_ARRAY_RC_MAGIC);     /* P-24: arr guard  */
-        store_u64_le(hdr + 16, ZAN_SOFT_SCRATCH_RC);    /* P-16: object rc  */
+        store_u64_le(hdr + 0,  ZAN_SOFT_SCRATCH_RC);    /* P-32: array rc */
+        store_u64_le(hdr + 8,  ZAN_ARRAY_RC_MAGIC);     /* P-24: arr guard */
+        store_u64_le(hdr + 16, ZAN_SOFT_SCRATCH_RC);    /* P-16: object rc */
         store_u64_le(hdr + 24, ZAN_ARRAY_MAGIC);        /* P-8:  discriminator */
         g_soft_scratch = hdr + 32;
     }
@@ -1380,10 +1380,10 @@ void zan_co_live_reset(void) {
  * change on either side -- which would silently break every WhenAll/WhenAny
  * -- fails the build instead. */
 typedef struct zan_co_header_probe {
-    long long sched;                /* ASYNC_FRAME_SCHED (i64)      */
+    long long sched;                /* ASYNC_FRAME_SCHED (i64) */
     void (*sched_step)(void *);     /* ASYNC_FRAME_SCHED_STEP (ptr) */
-    int state;                      /* ASYNC_FRAME_STATE (i32)      */
-    int done;                       /* ASYNC_FRAME_DONE (i32)       */
+    int state;                      /* ASYNC_FRAME_STATE (i32) */
+    int done;                       /* ASYNC_FRAME_DONE (i32) */
 } zan_co_header_probe;
 _Static_assert(offsetof(zan_co_header_probe, done) == JOIN_OFF_DONE,
                "JOIN_OFF_DONE drifts from the emitter's ASYNC_FRAME_DONE "
@@ -1399,20 +1399,20 @@ typedef struct zan_join_pair {
 } zan_join_pair_t;
 
 typedef struct zan_join {
-    int              any;     /* fire on first completion (WhenAny)        */
-    int              fired;   /* exactly one fire per entry                */
-    void            *joiner;  /* suspended WhenAll/WhenAny frame           */
+    int              any;     /* fire on first completion (WhenAny) */
+    int              fired;   /* exactly one fire per entry */
+    void            *joiner;  /* suspended WhenAll/WhenAny frame */
     zan_timer_step_t joiner_step;
     int              npairs;  /* bound pairs, filled during the bind phase */
-    int              winner;  /* any mode: first completed pair's index    */
+    int              winner;  /* any mode: first completed pair's index */
     /* Bound pairs not yet marked done. Every mutation site (bind,
      * the two done hooks, wait2, fire) already runs under live_lock, so a
      * plain int is exact -- and the all-mode fire test collapses from a
      * rescan of all N pairs on EVERY completion (O(N^2) under the global
      * lock) to this counter hitting zero. */
     int              remaining;
-    int              capacity; /* elements allocated in pairs[]             */
-    zan_join_pair_t  pairs[]; /* flexible array, one allocation            */
+    int              capacity; /* elements allocated in pairs[] */
+    zan_join_pair_t  pairs[]; /* flexible array, one allocation */
 } zan_join_t;
 
 static zan_join_pair_t **g_joinmap_slots;

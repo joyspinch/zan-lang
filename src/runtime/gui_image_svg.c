@@ -1,9 +1,5 @@
-/* SVG rasterization for zan_gui's in-memory image registry (see
- * gui_runtime.c, zan_gui_image_load_svg). Parses the document with the
- * vendored nanosvg (src/runtime/nanosvg, MIT) and rasterizes it into
- * ARGB32 pixels -- the same layout the stb_image / libwebp paths produce.
- * Compiled as its own TU: nanosvg's implementation headers are large and
- * only needed for SVG sources. */
+/* SVG rasterization for zan_image's cache. Raster pixels use the same
+ * straight-alpha ARGB32 layout as the stb_image and libwebp paths. */
 
 #include <math.h>
 #include <stdint.h>
@@ -17,7 +13,7 @@
 #include "nanosvg/nanosvgrast.h"
 
 /* Rasterize `len` bytes of SVG source (NUL-terminated text is not required)
- * into outPix (malloc'd ARGB32, caller frees via zan_gui_image_evict).
+ * into outPix (malloc'd ARGB32, owned and freed inside zan_image).
  * boxW/boxH: fit the document inside, preserving aspect (contain); values
  * <= 0 mean "use the document's intrinsic size". Returns 1 and sets
  * outPix/outW/outH on success, 0 on parse or allocation failure. */

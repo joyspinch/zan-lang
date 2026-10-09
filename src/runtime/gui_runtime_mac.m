@@ -2576,15 +2576,15 @@ static int mac_vk_to_keycode(int vk) {
         static const int fns[12] = { 122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111 };
         return fns[vk - 0x70];
     }
-    if (vk == 0x0D) return 36; // Return
-    if (vk == 0x09) return 48; // Tab
-    if (vk == 0x20) return 49; // Space
-    if (vk == 0x08) return 51; // Delete/Backspace
-    if (vk == 0x1B) return 53; // Escape
-    if (vk == 0x25) return 123; // Left
-    if (vk == 0x27) return 124; // Right
-    if (vk == 0x28) return 125; // Down
-    if (vk == 0x26) return 126; // Up
+    if (vk == 0x0D) return 36;  // Return
+    if (vk == 0x09) return 48;  // Tab
+    if (vk == 0x20) return 49;  // Space
+    if (vk == 0x08) return 51;  // Delete/Backspace
+    if (vk == 0x1B) return 53;  // Escape
+    if (vk == 0x25) return 123;  // Left
+    if (vk == 0x27) return 124;  // Right
+    if (vk == 0x28) return 125;  // Down
+    if (vk == 0x26) return 126;  // Up
     return -1;
 }
 
@@ -2619,10 +2619,10 @@ EXPORT i32 zan_hotkey_register(i32 id, i32 mods, i32 vk) {
                 if ((int)[event keyCode] == targetCode) {
                     NSUInteger flags = [event modifierFlags];
                     int m = 0;
-                    if (flags & NSEventModifierFlagOption)  m |= 0x0001; // Alt
-                    if (flags & NSEventModifierFlagControl) m |= 0x0002; // Ctrl
-                    if (flags & NSEventModifierFlagShift)   m |= 0x0004; // Shift
-                    if (flags & NSEventModifierFlagCommand) m |= 0x0008; // Win/Meta
+                    if (flags & NSEventModifierFlagOption)  m |= 0x0001;  // Alt
+                    if (flags & NSEventModifierFlagControl) m |= 0x0002;  // Ctrl
+                    if (flags & NSEventModifierFlagShift)   m |= 0x0004;  // Shift
+                    if (flags & NSEventModifierFlagCommand) m |= 0x0008;  // Win/Meta
                     if (m == g_mac_hotkey_mods) {
                         mac_hotkey_push(g_mac_hotkey_id);
                     }
