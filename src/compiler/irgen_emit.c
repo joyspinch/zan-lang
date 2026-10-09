@@ -1056,6 +1056,25 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0)),
             get_async_child_ptr(g));
 
+        /* Check cooperative cancellation before state dispatch: if cancellation
+         * was requested while suspended, bail out directly to co.cancelled
+         * without entering any resume-k block. This eliminates duplicate cancel
+         * checks and block splitting across all await sites. */
+        LLVMValueRef cancel_ptr = get_async_cancel_ptr(g);
+        LLVMValueRef cancel_val = LLVMBuildLoad2(g->builder, i32, cancel_ptr, "fr.cancelled");
+        LLVMBasicBlockRef can_bb = get_async_cancel_bb(g, locals);
+        if (!can_bb) {
+            can_bb = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "co.cancelled");
+            LLVMPositionBuilderAtEnd(g->builder, can_bb);
+            emit_async_complete(g, locals, NULL);
+            g->current_async_cancel_bb = can_bb;
+        }
+        LLVMBasicBlockRef disp_bb = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "co.dispatch");
+        LLVMBuildCondBr(g->builder,
+            zan_icmp(g->builder, LLVMIntNE, cancel_val, LLVMConstInt(i32, 0, 0), "is.cancelled"),
+            can_bb, disp_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, disp_bb);
         LLVMValueRef state = LLVMBuildLoad2(g->builder, i32,
             get_async_state_ptr(g),
             "state");
@@ -1067,19 +1086,11 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_switch = sw;
 
         LLVMPositionBuilderAtEnd(g->builder, body_bb);
-        /* cancelling a coroutine that is still queued for its first step
-         * must skip the body entirely */
-        emit_async_cancel_check(g, locals);
 
         if (member->method_decl.body->kind == AST_BLOCK) {
             for (int k = 0; k < member->method_decl.body->block.stmts.count; k++) {
                 zan_ast_node_t *bs = member->method_decl.body->block.stmts.items[k];
                 emit_stmt(g, bs, locals);
-                /* a statement that awaited gave the scheduler a chance to
-                 * run Task.Cancel; observe it at this statement boundary,
-                 * where completing behaves exactly like an early `return` */
-                if (anf_stmt_contains_await(bs))
-                    emit_async_cancel_check(g, locals);
             }
         } else {
             /* expression body (=> expr): treat as `return expr`. */

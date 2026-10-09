@@ -79,6 +79,10 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
 - **Async 状态机挂起退场与 Await 空蹦床收敛（2026-10-08 落地）**：
   - **消灭 `await.fast` 空跳板块**：在 `emit_expr_await_expr` 中，原先快路径（`is_done != 0`）与 CAS 竞争失败（`cas.won == 0`）均跳转至仅包含一条 `br label %await.cont` 的空基本块 `await.fast`。直接将两处条件分支目标直连 `cont_bb`，并将 `cont_bb` 中的 `completed_sub` PHI 节点由 2 臂（`await.fast` 槽、`rk` 槽）改由 3 臂（`probe_bb` 的 `sub_i8`、`prep_bb` 的 `sub_i8`、`rk` 的 `sub_rl`）显式合流，每个 await 点直接消除 1 个冗余 BasicBlock 与 1 条无条件跳转。
   - **共享挂起退场块 `co.suspend.ret`**：在协程 resume 方法内，全部 11 处挂起终结点（Task.Delay, Gate.Park, Task.JoinWait, Socket.Read/WriteReady, Socket.RecvOv, Socket.RecvToOv, Socket.AcceptOv, Socket.ResolveAsync, Socket.ResolveSockAddr, 子任务挂起 suspend_bb, 以及协同抢占 requeue_bb）原先均就地展开 `emit_async_eh_unarm(g); LLVMBuildRetVoid(g->builder);`（重复发射 load/store 恢复 `__zan_eh_top` 及 ret）。改用惰性初始化的共享 `co.suspend.ret` 基本块统一退场（各挂起点发射一条 `br label %co.suspend.ret`），大幅消除重复的 EH unarm 指令与分支扇出。
+  - **协程协作式取消检查前置提升与基本块扁平化（2026-10-09 落地）**：
+    原先协程在顶层块与嵌套块中遍历语句时，凡遇到 `anf_stmt_contains_await(bs)` 即发射 `emit_async_cancel_check`，导致每个 await 恢复后均额外分裂出 `co.cancelled` 与 `co.notcancelled` 块，生成重复的 `fr.cancel.p` 载入与条件分支。正确定式：
+    ① **前置集中拦截**：取消检查统一提升至 `$resume` 方法的分发器入口（`co.dispatch` 之前）；若协程在挂起期间已被请求取消（`Task.Cancel`），直接跳转至共享的 `co.cancelled` 块完成清理并退出，根本无需进入 `switch(state)` 分发；
+    ② **消除语句级逐条探测**：由于恢复执行的协程在分发前已经确认未取消，且同步语句序列执行期间取消标志不会自发改变，因此彻底消除 `AST_BLOCK` 内每条包含 await 语句后的重复 `emit_async_cancel_check`。不仅消除了成倍膨胀的基本块，更严格维护了取消协议的语义一致性。
 
 - **`static object` 静态字段的 RC 根注册与动态析构契约（2026-10-09 落地）**：
   在 Zan 编译器中，`TYPE_OBJECT` 不属于静态编译期的强类型类（`is_arc_managed_type` 为 false），但其运行时持有的可能是通过 `zan_rt_alloc` 分配的堆类实例（如 `new object()`）或堆字符串。

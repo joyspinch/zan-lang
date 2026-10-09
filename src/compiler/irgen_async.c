@@ -891,13 +891,12 @@ static void emit_async_cancel_check(zan_irgen_t *g, local_scope_t *locals) {
     if (g->finally_count > 0 || g->catch_cleanup_count > 0) return;
     if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) return;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
-    LLVMValueRef fn = g->current_fn;
     LLVMValueRef cancel_ptr = get_async_cancel_ptr(g);
     LLVMValueRef flag = LLVMBuildLoad2(g->builder, i32, cancel_ptr, "cancelled");
     LLVMBasicBlockRef shared_can = get_async_cancel_bb(g, locals);
     LLVMBasicBlockRef can_bb = shared_can ? shared_can
-        : LLVMAppendBasicBlockInContext(g->ctx, fn, "co.cancelled");
-    LLVMBasicBlockRef go_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.notcancelled");
+        : LLVMAppendBasicBlockInContext(g->ctx, g->current_async_resume_fn, "co.cancelled");
+    LLVMBasicBlockRef go_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_async_resume_fn, "co.notcancelled");
     LLVMBuildCondBr(g->builder,
         zan_icmp(g->builder, LLVMIntNE, flag, LLVMConstInt(i32, 0, 0), "is.cancelled"),
         can_bb, go_bb);
