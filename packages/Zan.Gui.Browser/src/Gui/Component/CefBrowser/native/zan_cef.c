@@ -44,9 +44,7 @@
 
 static char zc_error[512];
 
-/* Diagnostics gated on ZAN_CEF_LOG=1 (env read once): CEF failures show up as
- * a blank view or a stalled page, and the useful signal (what switches the
- * child processes got, whether the host kept pumping) is only visible here. */
+/* 受 ZAN_CEF_LOG=1 环境变量门控的 CEF 诊断日志输出 */
 static int zc_log_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -85,9 +83,7 @@ typedef cef_browser_t *(*zc_fn_create_browser_sync)(const cef_window_info_t *,
                                                     cef_dictionary_value_t *,
                                                     cef_request_context_t *);
 typedef int (*zc_fn_utf8_to_utf16)(const char *, size_t, cef_string_utf16_t *);
-/* The UTF-16 code unit is spelled `char16` before CEF 120 and `char16_t` after,
- * so the source string is taken as void* to keep one source for both branches
- * (only its address is passed through). */
+/* UTF-16 编码单元类型别名（兼容旧版 char16 与新版 char16_t） */
 typedef int (*zc_fn_utf16_to_utf8)(const void *, size_t, cef_string_utf8_t *);
 typedef void (*zc_fn_utf16_clear)(cef_string_utf16_t *);
 typedef void (*zc_fn_utf8_clear)(cef_string_utf8_t *);
@@ -113,10 +109,7 @@ static zc_cef_t zc;
 
 static void *zc_open(const char *path) {
 #ifdef _WIN32
-    /* libcef.dll pulls in siblings (chrome_elf.dll, libEGL.dll, ...) from its
-     * own directory, which is not on the loader's search path: without
-     * LOAD_WITH_ALTERED_SEARCH_PATH the load fails with ERROR_MOD_NOT_FOUND
-     * even though the whole runtime is unpacked next to it. */
+    /* Windows 平台动态加载 libcef.dll 及其依赖动态链接库 */
     /* That flag also wants a real Win32 path, so '/' becomes '\\'. */
     char win[1024];
     size_t n = strlen(path);
@@ -153,10 +146,7 @@ static const char *zc_open_error(void) {
 
 /* ------------------------------------------------------------ macOS NSView */
 
-/* On macOS the browser is an NSView inside the host window, so moving and
- * hiding it means talking to AppKit. That happens through dlsym'd objc_msgSend
- * so this file stays a plain C dylib -- no ObjC compiler, no AppKit at link
- * time -- the same way the Linux path reaches X11 without linking libX11. */
+/* macOS 环境下浏览器作为 NSView 嵌入宿主窗口 */
 typedef struct { double x, y, w, h; } zc_rect_t;
 
 static struct {
@@ -251,15 +241,7 @@ static void zc_ns_set_id(void *obj, const char *name, void *value) {
     send(obj, zc_ns.sel(name), value);
 }
 
-/* Chromium's mac message pump talks to NSApp through CrAppProtocol: it calls
- * -isHandlingSendEvent to tell "inside AppKit's event dispatch" from "inside a
- * nested run loop of our own", and every CEF sample gets this by subclassing
- * NSApplication with CefAppProtocol. The host here owns NSApplication (zan_gui
- * created it long before any browser exists), so instead of demanding that
- * every Zan app subclass it, add the two accessors -- and a sendEvent: wrapper
- * that maintains the flag -- to NSApplication itself at startup. Without them
- * Chromium's unrecognized-selector exception kills the process the first time
- * it pumps a nested loop (closing a tab does exactly that). */
+/* macOS 下 Chromium 消息泵与 NSApp 事件循环的协议适配 */
 static int zc_app_sending_event;
 
 static signed char zc_app_is_handling(void *self, void *sel) {
@@ -311,9 +293,7 @@ static void zc_mac_patch_nsapp(void) {
     add(cls, zc_ns.sel("isHandlingSendEvent"), imp, "c@:");
     imp = (void *)zc_app_set_handling;
     add(cls, zc_ns.sel("setHandlingSendEvent:"), imp, "v@:c");
-    /* Chromium also asks whether NSApp conforms to the protocol before trusting
-     * the flag; the protocol object lives in the CEF framework, which is
-     * already loaded by the time this runs. */
+    /* 检测并确认 NSApp 符合 Chromium 消息泵协议要求 */
     void *(*get_proto)(const char *) = NULL;
     signed char (*add_proto)(void *, void *) = NULL;
     f = zc_sym(zc_ns.objc, "objc_getProtocol");
@@ -352,9 +332,7 @@ static int zc_cg_init(void) {
     void *a = zc_sym(lib, "CGPathAddRect");
     void *r = zc_sym(lib, "CGPathRelease");
     if (!c || !a || !r) return 0;
-    /* The mask is a CAShapeLayer, and objc_getClass only sees it once
-     * QuartzCore is in the process -- AppKit pulls it in, but this driver must
-     * not depend on who loaded what. */
+    /* 基于 CAShapeLayer 构建异形窗口与裁剪遮罩层 */
     if (!zc_open("/System/Library/Frameworks/QuartzCore.framework/QuartzCore"))
         return 0;
     memcpy(&zc_cg.path_create, &c, sizeof(void *));
@@ -364,10 +342,7 @@ static int zc_cg_init(void) {
     return 1;
 }
 
-/* Rects cross this ABI in physical pixels (that is what the host's layout and
- * its software surface use), while AppKit frames are in points, so every rect
- * handed to a view has to be divided by the window's backing scale -- on a
- * Retina display an unscaled rect is twice too large and buries the host UI. */
+/* 跨 ABI 传递的矩形区域均采用物理像素单位 */
 static double zc_view_scale(void *view) {
     double s = zc_ns_double(zc_ns_id(view, "window"), "backingScaleFactor");
     if (s <= 0.0) return 1.0;
@@ -376,9 +351,7 @@ static double zc_view_scale(void *view) {
 
 #endif /* __APPLE__ */
 
-/* Resolve every libcef entry point the driver needs. `runtime_dir` is a CEF
- * runtime as unpacked by CefRuntime.zan; the shared library sits in Release/
- * (Windows, Linux) or Chromium Embedded Framework.framework/ (macOS). */
+/* 解析原生驱动所需的全部 libcef 符号导出入口 */
 static int zc_load(const char *runtime_dir) {
     if (zc.lib) return 1;
     if (!runtime_dir || !runtime_dir[0]) {
@@ -419,9 +392,7 @@ static int zc_load(const char *runtime_dir) {
     ZC_BIND(userfree_utf16_free, "cef_string_userfree_utf16_free");
 #undef ZC_BIND
 #ifndef ZAN_CEF_LEGACY
-    /* Versioned C API: the first cef_api_hash() call fixes the ABI libcef
-     * exposes to this client, and it must agree with the headers we compiled
-     * against or every struct layout is a guess. */
+    /* 校验 libcef 动态库与构建头文件的 API 哈希版本一致性 */
     void *h = zc_sym(lib, "cef_api_hash");
     if (!h) {
         zc_fail("libcef export missing: cef_api_hash (runtime older than "
@@ -437,9 +408,7 @@ static int zc_load(const char *runtime_dir) {
         return 0;
     }
 #else
-    /* CEF 109 predates the versioned API: cef_api_hash takes just the entry
-     * index (0 = platform hash), and it is still the only reliable check that
-     * the installed runtime matches the headers this variant was built with. */
+    /* 兼容旧版 CEF 109 API 哈希校验 */
     void *h = zc_sym(lib, "cef_api_hash");
     if (!h) {
         zc_fail("libcef export missing: cef_api_hash");
@@ -533,14 +502,9 @@ typedef struct zc_browser_s {
     int closing, gone;
     int cdp_id;                 /* last allocated CDP message id */
     int cdp_attached;
-    /* Set while the host UI owns the keyboard (an on-canvas text field is
-     * focused): Chromium otherwise grabs the Win32 focus back on its own --
-     * after a navigation commits, a page calls focus(), a plugin starts -- and
-     * the host's address bar silently stops receiving WM_CHAR. */
+    /* 宿主 UI 控件持有键盘焦点时的按键事件拦截标志 */
     int host_focus;
-    /* window.open / target=_blank policy: 0 = let CEF open its own popup
-     * window, 1 = block, 2 = cancel and hand the URL to the host (a tabbed
-     * host opens its own tab). */
+    /* 新建窗口与弹窗策略（0:原生弹窗, 1:拦截并派发事件, 2:外部默认浏览器打开） */
     int popup_policy;
     char popup_url[2048];       /* pending handed-to-host popup target */
     int popup_dropped;          /* hosts that never drain must not queue up */
@@ -568,9 +532,7 @@ static zc_browser_t *zc_get(int h) {
 
 /* --------------------------------------------------------- base_ref_counted */
 
-/* Every handler here is embedded in a zc_browser_t that outlives CEF's
- * references to it (the slot is only reused after on_before_close), so the
- * ref-count operations are inert rather than freeing anything. */
+/* 所有回调处理器均嵌入 zc_browser_t 上下文中 */
 static void CEF_CALLBACK zc_add_ref(cef_base_ref_counted_t *self) { (void)self; }
 static int CEF_CALLBACK zc_release(cef_base_ref_counted_t *self) { (void)self; return 0; }
 static int CEF_CALLBACK zc_has_one_ref(cef_base_ref_counted_t *self) { (void)self; return 0; }
@@ -785,9 +747,7 @@ static void CEF_CALLBACK zc_on_title_change(cef_display_handler_t *self,
 
 /* -------------------------------------------------------------------- focus */
 
-/* Chromium asking for the focus. Denied while the host owns the keyboard, so a
- * page load (or the page itself) cannot steal it from an on-canvas text field.
- * `source` is FOCUS_SOURCE_NAVIGATION or FOCUS_SOURCE_SYSTEM. */
+/* 处理 Chromium 焦点请求（宿主持有键盘时予以拒绝） */
 static int CEF_CALLBACK zc_on_set_focus(cef_focus_handler_t *self,
                                         cef_browser_t *browser,
                                         cef_focus_source_t source) {
@@ -870,15 +830,10 @@ static void zc_browser_init_handlers(zc_browser_t *b) {
 
 /* ---------------------------------------------------------------------- app */
 
-/* Switches appended to every Chromium process. Media playback is a first-class
- * reason to embed CEF instead of a system WebView, so autoplay is allowed
- * without a user gesture; the rest keeps a headless-ish embed usable. */
+/* 向 Chromium 各子进程追加的通用启动命令行开关 */
 static char zc_extra_switches[1024];
 
-/* Comma-separated switches: appending one of these with a plain value would
- * drop the entries Chromium and CEF already put there (CEF 151 disables
- * GlicActorUi/LensOverlay/... this way), so an app switch has to be merged
- * into the existing value instead of replacing it. */
+/* 追加以逗号分隔的附加命令行开关参数 */
 static int zc_switch_is_list(const char *k) {
     return strcmp(k, "disable-features") == 0 ||
            strcmp(k, "enable-features") == 0 ||
@@ -919,10 +874,7 @@ static void CEF_CALLBACK zc_on_before_command_line_processing(
     zc_append_switch(command_line, "autoplay-policy",
                      "no-user-gesture-required");
 
-    /* "a=b,c" style list handed down from Zan (CefRuntime/CefBrowser). A comma
-     * is also the separator inside switch values (disable-features=A,B), so a
-     * semicolon anywhere switches the whole list to semicolons and lets those
-     * values through intact. */
+    /* 解析由 Zan 传入的逗号分隔键值对命令行参数 */
     char sep = strchr(zc_extra_switches, ';') ? ';' : ',';
     const char *p = zc_extra_switches;
     while (*p) {
@@ -944,9 +896,7 @@ static void CEF_CALLBACK zc_on_before_command_line_processing(
         p = end + 1;
     }
 
-    /* With ZAN_CEF_LOG=1, report the command line every Chromium process is
-     * actually started with -- the only way to tell a switch that never
-     * arrived (typo in ZAN_CEF_SWITCHES) from one Chromium ignored. */
+    /* 在开启调试日志时输出当前进程启动参数 */
     if (zc_log_on()) {
         char utf8[4096];
         zc_userfree_get(command_line->get_command_line_string(command_line),
@@ -969,14 +919,7 @@ static void zc_app_init(void) {
 
 /* ---------------------------------------------------------------- main args */
 
-/* CEF wants the process command line. Windows reads it from the OS, elsewhere
- * it must be handed argc/argv, which a shared library recovers from the
- * kernel (/proc/self/cmdline on Linux, the crt externs on macOS).
- *
- * Getting the real argv is not cosmetic: Chromium tells a child process what it
- * is from --type= on its own command line, so a helper handed a made-up argv
- * behaves like a second browser process, exits, and the browser kills itself
- * after enough dead GPU children ("GPU process isn't usable. Goodbye."). */
+/* 获取并构造传给 CEF 初始化流程的进程命令行参数 */
 #ifndef _WIN32
 static char *zc_argv_storage;
 static char *zc_argv_own[64];
@@ -1056,15 +999,7 @@ ZC_EXPORT const char *zan_cef_last_error(void) { return zc_error; }
 
 ZC_EXPORT int zan_cef_ready(void) { return zc_ready && !zc_shut; }
 
-/* Run a Chromium helper process (render/gpu/utility) and return its exit code;
- * returns -1 in the browser process, where the caller must continue into
- * zan_cef_init. A Zan program that reuses its own executable as the helper
- * calls this as the very first thing in Main.
- *
- * `switches` is the same list the browser process passes to zan_cef_init:
- * Chromium only forwards the switches it knows about to its children, so a
- * host switch that must hold in every process (logging, GPU selection) has to
- * be re-applied here as well. */
+/* 启动 Chromium 辅助子进程（渲染/GPU/通用工具进程）并返回退出码 */
 ZC_EXPORT int zan_cef_execute_process(const char *runtime_dir,
                                      const char *switches) {
     if (!zc_load(runtime_dir)) return -1;
@@ -1076,16 +1011,7 @@ ZC_EXPORT int zan_cef_execute_process(const char *runtime_dir,
     return zc.execute_process(&args, &zc_app, NULL);
 }
 
-/* Tell the subprocess executable where the CEF runtime and this driver are.
- *
- * The standalone helper (native/zan_cef_helper.c, what macOS bundles put in
- * Contents/Frameworks/<x> Helper.app) carries no configuration of its own: it
- * dlopens this driver and calls zan_cef_execute_process, and both paths come
- * from here, because Chromium hands its own environment to the children it
- * spawns. A host that stays its own helper never reads these.
- *
- * Not on Windows: there the helper is always the host executable, which
- * resolves everything through CefOptions before Main gets to RunHelper. */
+/* 通过环境变量向子进程传递 CEF 运行时路径与命令行配置 */
 static void zc_export_helper_env(const char *runtime_dir,
                                  const char *switches) {
 #ifndef _WIN32
@@ -1102,10 +1028,7 @@ static void zc_export_helper_env(const char *runtime_dir,
 #endif
 }
 
-/* Bring up the CEF browser process. `runtime_dir` is CefRuntime.EnsureAsync()'s
- * result, `cache_path` a writable profile directory (empty = incognito),
- * `helper_path` the subprocess executable (empty = re-exec this program, which
- * then has to call zan_cef_execute_process first). */
+/* 初始化并启动 CEF 主浏览器进程 */
 ZC_EXPORT int zan_cef_init(const char *runtime_dir, const char *cache_path,
                            const char *helper_path, const char *locale,
                            const char *switches, int windowless) {
@@ -1136,10 +1059,7 @@ ZC_EXPORT int zan_cef_init(const char *runtime_dir, const char *cache_path,
     snprintf(profile, sizeof(profile), "%s", cache_path ? cache_path : "");
 
     char buf[1200];
-    /* Chromium reports a failed CHECK by writing "[FATAL:...]" to its log and
-     * then breaking into the debugger (crash code 0x80000003 with a pure libcef
-     * backtrace), so the only way to see the reason is to route that log to a
-     * file. ZAN_CEF_LOG=1 turns it on; ZAN_CEF_LOG_FILE overrides the path. */
+    /* 重定向 Chromium 崩溃断言与致命错误输出至标准错误流 */
     if (zc_log_on()) {
         const char *lf = getenv("ZAN_CEF_LOG_FILE");
         if (lf && lf[0]) {
@@ -1161,9 +1081,7 @@ ZC_EXPORT int zan_cef_init(const char *runtime_dir, const char *cache_path,
     }
     if (locale && locale[0]) zc_str_set(&settings.locale, locale);
 #ifndef __APPLE__
-    /* Chromium loads icudtl.dat from the libcef directory, ignoring
-     * resources_dir_path, so CefRuntime stages Resources/ into Release/ and the
-     * whole payload is read from there. Plain Resources/ stays a fallback. */
+    /* 设置 ICU 数据文件所在目录 */
     snprintf(buf, sizeof(buf), "%s/Release/icudtl.dat", runtime_dir);
     const char *res = zc_file_exists(buf) ? "Release" : "Resources";
     snprintf(buf, sizeof(buf), "%s/%s", runtime_dir, res);
@@ -1207,10 +1125,7 @@ ZC_EXPORT int zan_cef_init(const char *runtime_dir, const char *cache_path,
 ZC_EXPORT void zan_cef_work(void) {
     if (zc_ready && !zc_shut) {
 #ifdef _WIN32
-        {   /* CEF is driven from the host UI loop, so a host that stops
-             * calling here stalls Chromium -- which surfaces as unrelated-
-             * looking failures inside CEF ("Timeout of new browser info
-             * response"). ZAN_CEF_LOG=1 reports the gaps. */
+        {   /* 在宿主 UI 消息循环的单次空闲心跳中推进 CEF 消息泵 */
             static unsigned long long prev = 0, worst = 0;
             static unsigned long calls = 0, slow = 0;
             if (zc_log_on()) {
@@ -1313,10 +1228,7 @@ ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
     wi.bounds.y = y;
     wi.bounds.width = w > 0 ? w : 1;
     wi.bounds.height = h > 0 ? h : 1;
-    /* A parent means embedding as a child window inside a Zan control tree;
-     * without one the browser gets its own top-level window (used by tests and
-     * tool windows). Off-screen rendering needs a render handler and arrives
-     * with the framebuffer path. */
+    /* 以子窗口形式将浏览器嵌入宿主窗口内部 */
 #ifdef _WIN32
     if (parent) {
         wi.parent_window = (cef_window_handle_t)parent;
@@ -1325,11 +1237,7 @@ ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
         wi.style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE;
     }
 #elif defined(__APPLE__)
-    /* The mac window info names the field parent_view: it is an NSView, not a
-     * window handle -- and the host handle (zan_gui_create_window) is the
-     * NSWindow, so hand Chromium that window's content view. Passing the window
-     * itself leaves CEF without a usable parent and every browser comes up as
-     * its own top-level window, next to (not inside) the app's own chrome. */
+    /* macOS 平台下绑定父 NSView 容器视图 */
     {
         void *pview = zc_ns_id((void *)parent, "contentView");
         wi.parent_view = (cef_window_handle_t)pview;
@@ -1400,10 +1308,7 @@ ZC_EXPORT void zan_cef_set_visible(int h, int visible);
 ZC_EXPORT void zan_cef_close(int h) {
     zc_browser_t *b = zc_get(h);
     if (!b || !b->browser) return;
-    /* close_browser() is asynchronous: the child window lives until CEF gets
-     * enough message-loop turns to destroy it, and the view that used to pump
-     * the loop every frame is being torn down right now. Hide it up front so a
-     * closed tab cannot keep covering the host UI in the meantime. */
+    /* 异步请求关闭浏览器实例并注销内部资源 */
     zan_cef_set_visible(h, 0);
     cef_browser_host_t *host = b->browser->get_host(b->browser);
     if (!host) return;
@@ -1442,9 +1347,7 @@ ZC_EXPORT void zan_cef_set_bounds(int h, int x, int y, int w, int hh) {
 #ifdef _WIN32
     SetWindowPos((HWND)wnd, NULL, x, y, w, hh, SWP_NOZORDER | SWP_NOACTIVATE);
 #elif defined(__APPLE__)
-    /* Host coordinates are top-left based; an NSView's frame is expressed in
-     * its superview's coordinates, which are bottom-left based unless that
-     * view is flipped -- so ask the superview instead of assuming. */
+    /* 转换宿主左上角原点坐标系至 NSView 左下角坐标系 */
     {
         void *sup = zc_ns_id(wnd, "superview");
         double sc = zc_view_scale(sup ? sup : wnd);
@@ -1552,12 +1455,7 @@ ZC_EXPORT void zan_cef_set_visible(int h, int visible) {
 }
 
 #ifdef __APPLE__
-/* Punch the host's visible region out of the browser view with a mask layer.
- * Rects arrive in host pixels with a top-left origin; the view's own layer is
- * bottom-left based unless the view is flipped, and its coordinates are points,
- * hence the divide by the backing scale. A single rect covering the whole view
- * drops the mask entirely (no mask = no compositing cost while nothing
- * overlaps the page). */
+/* 通过窗口遮罩区域剔除宿主控件覆盖部分的浏览器视图 */
 static void zc_mac_clip(zc_browser_t *b, const char *spec) {
     void *wnd = zan_cef_window(b->id);
     if (!wnd || !zc_cg_init()) return;
@@ -1624,9 +1522,7 @@ static void zc_mac_clip(zc_browser_t *b, const char *spec) {
 }
 #endif
 
-/* Apply the host's per-frame occlusion result: `spec` is a "x,y,w,h;..." union
- * of visible rectangles in host coordinates ("" = fully covered). Windows clip
- * the child window to that region, macOS masks the browser view's layer. */
+/* 每帧应用宿主计算出的窗口重叠遮挡区域矩形 */
 ZC_EXPORT void zan_cef_set_clip(int h, const char *spec) {
     zc_browser_t *b = zc_get(h);
     if (!b) return;
@@ -1641,10 +1537,7 @@ ZC_EXPORT void zan_cef_set_clip(int h, const char *spec) {
     }
 #ifdef _WIN32
     void *wnd = zan_cef_window(h);
-    /* SetWindowRgn repaints the child window even when the region is
-     * identical, and the host calls this every frame -- without the guard
-     * the page flickers (the WebView2 backend and the macOS mask path both
-     * skip when the spec is unchanged). */
+    /* 应用 Windows 区域掩码并减少不必要的子窗口重绘 */
     if (visible && wnd
         && (!b->clip_spec || strcmp(b->clip_spec, spec) != 0)) {
         HRGN total = CreateRectRgn(0, 0, 0, 0);
@@ -1681,10 +1574,7 @@ ZC_EXPORT void zan_cef_set_clip(int h, const char *spec) {
         b->clip_spec = zc_dup(spec, strlen(spec));
     }
 #elif defined(__APPLE__)
-    /* The browser is an NSView sibling of the host's software canvas, so it
-     * always draws over it: menus, dropdowns and dialogs above the page can
-     * only be honoured by punching them out of the view itself. Same treatment
-     * as the WKWebView backend: the visible union becomes a mask layer. */
+    /* macOS 下保持浏览器视图与宿主软件画布的层级同步 */
     if (visible) zc_mac_clip(b, spec);
 #endif
     zan_cef_set_visible(h, visible);
@@ -1693,9 +1583,7 @@ ZC_EXPORT void zan_cef_set_clip(int h, const char *spec) {
 ZC_EXPORT void zan_cef_set_focus(int h, int focus) {
     zc_browser_t *b = zc_get(h);
     if (!b) return;
-    /* Latch first: focus=0 means "the host owns the keyboard now", which must
-     * hold even before the browser exists (or after it went away), otherwise
-     * the first navigation grabs the focus back. */
+    /* 更新并锁定焦点状态（focus=0 表示宿主接管键盘输入） */
     b->host_focus = focus ? 0 : 1;
     if (!b->browser) return;
     cef_browser_host_t *host = b->browser->get_host(b->browser);
@@ -1886,9 +1774,7 @@ ZC_EXPORT void zan_cef_execute_js(int h, const char *code, const char *script_ur
 
 /* -------------------------------------------------------------- public: CDP */
 
-/* Send a raw DevTools protocol message. `params_json` may be empty; the
- * allocated message id is returned (0 on failure) and every reply/event shows
- * up through zan_cef_cdp_take. */
+/* 向浏览器实例发送 CDP（Chrome DevTools Protocol）原始协议消息 */
 ZC_EXPORT int zan_cef_cdp_send(int h, const char *method, const char *params_json) {
     zc_browser_t *b = zc_get(h);
     if (!b || !b->browser || !method || !method[0]) return 0;
@@ -1913,9 +1799,7 @@ ZC_EXPORT int zan_cef_cdp_send(int h, const char *method, const char *params_jso
     return ok ? id : 0;
 }
 
-/* window.open / target=_blank policy: 0 = CEF's own popup window (default),
- * 1 = block, 2 = cancel and hand the URL to the host via
- * zan_cef_take_popup_url. */
+/* 新建窗口与弹窗策略（0:原生弹窗, 1:拦截并派发事件, 2:外部默认浏览器打开） */
 ZC_EXPORT void zan_cef_set_popup_policy(int h, int policy) {
     zc_browser_t *b = zc_get(h);
     if (b) b->popup_policy = policy;

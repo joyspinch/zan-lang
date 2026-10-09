@@ -200,6 +200,7 @@ class Window {
     // the per-frame scene image that ScenePresent composites under the HUD
     // surface. Win32-shell builds have no scene compositor: there the window
     // is owned by the GUI shell and the calls are no-ops that report failure.
+    #if !WINDOWS
     [DllImport("zan_gui")]
     static extern int zan_gui_adopt_sdl_window(nint hwnd);
     [DllImport("zan_gui")]
@@ -208,36 +209,61 @@ class Window {
     static extern int zan_gui_scene_upload(nint hwnd, string bgra, int w, int h);
     [DllImport("zan_gui")]
     static extern int zan_gui_scene_present(nint hwnd, int surfaceId);
+    #endif
 
     /// 把游戏宿主自建的 SDL 窗口交给 GUI 运行时，此后 `App` 可在它
     /// 之上驱动控件（HUD 层）。返回 0 表示成功（或该窗口已被接管）。
     /// 仅 SDL 后端有效；Win32 外壳构建返回非 0。
+    #if !WINDOWS
     public static int AdoptSdlWindow(nint sdlWindowHandle) {
         return zan_gui_adopt_sdl_window(sdlWindowHandle);
     }
+    #else
+    public static int AdoptSdlWindow(nint sdlWindowHandle) { return 1; }
+    #endif
 
     /// 把宿主的 SDL 渲染器交给 GUI 运行时（同一窗口第二个渲染器在
     /// D3D11 等后端会创建失败，故复用宿主的）。在 AdoptSdlWindow 之后、
     /// 首次 ScenePresent 之前调用一次。
+    #if !WINDOWS
     public static int SceneSetRenderer(nint sdlWindowHandle, nint sdlRendererHandle) {
         return zan_gui_scene_set_renderer(sdlWindowHandle, sdlRendererHandle);
     }
+    #else
+    public static int SceneSetRenderer(nint sdlWindowHandle, nint sdlRendererHandle) { return 1; }
+    #endif
 
     /// 上传一帧 RGBA 场景图像（w×h，每像素 4 字节，行优先，保留
     /// alpha）——SdlRenderer.ReadPixels 的输出可直接传入；
     /// ScenePresent 时合成在 HUD 表面之下。
+    #if !WINDOWS
     public static int SceneUpload(nint sdlWindowHandle, string rgba, int w, int h) {
         return zan_gui_scene_upload(sdlWindowHandle, rgba, w, h);
     }
+    #else
+    public static int SceneUpload(nint sdlWindowHandle, string rgba, int w, int h) { return 1; }
+    #endif
 
     /// 把场景纹理（下）与 HUD 表面（上）合成呈现到已接管的窗口。
+    #if !WINDOWS
     public static int ScenePresent(nint sdlWindowHandle, int surfaceId) {
         return zan_gui_scene_present(sdlWindowHandle, surfaceId);
     }
+    #else
+    public static int ScenePresent(nint sdlWindowHandle, int surfaceId) { return 1; }
+    #endif
 
     nint handle;
     int width;
     int height;
+    int localKind;
+    int localX;
+    int localY;
+    int localButton;
+    int localKey;
+    int localMods;
+    int localFlag;
+    long localSeq;
 
 
 
@@ -272,6 +298,30 @@ class Window {
         return w;
     }
 
+    /// 离屏窗口只保存画布尺寸，不创建平台窗口或登记全局事件。
+    static Window Offscreen(int width, int height) {
+        return new Window(width, height);
+    }
+
+    Window(int width, int height) {
+        this.handle = 0;
+        this.width = width;
+        this.height = height;
+    }
+
+    /// 离屏输入仅存本实例；不会向平台队列投递或覆盖进程事件。
+    void SetLocalEvent(int kind, int x, int y, int button, int key, int mods, int flag) {
+        if (handle != 0) { return; }
+        localKind = kind;
+        localX = x;
+        localY = y;
+        localButton = button;
+        localKey = key;
+        localMods = mods;
+        localFlag = flag;
+        if (kind != 0) { localSeq = localSeq + 1; }
+    }
+
     /// <summary>注册一个在系统模态尺寸调整循环里被调用的帧体。
     /// 拖动窗口边框时消息循环停在 OS 内部，应用自己的循环拿不到
     /// 控制权，表面会一直停在旧尺寸上，新露出的一条是空白，直到
@@ -304,6 +354,7 @@ class Window {
 
     /// <summary>在屏幕上显示窗口。</summary>
     void Show() {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.ShowWindowNow((nint)handle);
         #else
@@ -313,6 +364,7 @@ class Window {
 
     /// <summary>将窗口左上角移动到屏幕工作区的 (x, y) 像素位置。</summary>
     void SetPosition(int x, int y) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.SetWindowPosition((nint)handle, x, y);
         #else
@@ -320,25 +372,48 @@ class Window {
         #endif
     }
 
+    /// 本 HWND 的 DPI 百分比；不借用另一个窗口的显示器或度量。
+    int GetDpiScale() {
+        if (handle == 0) { return 100; }
+        #if WINDOWS
+        return Win32Shell.DpiScale(handle);
+        #else
+        return Canvas.GetDpiScale();
+        #endif
+    }
+
+    int GetTitlebarHeight() {
+        #if WINDOWS
+        return Win32Shell.TitlebarHeight(handle);
+        #else
+        return Window.TitlebarHeight();
+        #endif
+    }
+
+    int GetCaptionButtonWidth() {
+        #if WINDOWS
+        return Win32Shell.CaptionButtonWidth(handle);
+        #else
+        return Window.CaptionButtonWidth();
+        #endif
+    }
+
     /// <summary>把窗口客户区调整为 (w, h) 逻辑像素，外框随之伸缩、
     /// 位置不变。登录小窗 → 主窗口这类形态切换用；WM_SIZE 走正常
     /// 路径，画布与布局下一帧自动跟上。</summary>
     void SetClientSize(int w, int h) {
+        if (handle == 0) { return; }
         #if WINDOWS
-        int dpiV = Win32Shell.dpi > 0 ? Win32Shell.dpi : 96;
-        Win32Shell.ResizeClient((nint)handle, w * dpiV / 96, h * dpiV / 96);
+        int scale = this.GetDpiScale();
+        Win32Shell.ResizeClient((nint)handle, w * scale / 100, h * scale / 100);
         #endif
     }
 
-    /// <summary>把客户区调整为**精确**的 (wDev, hDev) **设备**像素，不加
-    /// OS 框架补偿（本壳客户区本就等于窗口矩形）。登录小窗这类「照参考图
-    /// 定尺寸」的窗口用它：SetClientSize 的补偿会让实际客户区比请求值大
-    /// 一圈（150% 屏 540x578 → 562x633），内容看着贴左上、四周留白不匀；
-    /// 且设备像素入参没有 `logical*144/96` 的截断（578 不是 1.5 的整数倍，
-    /// 走逻辑像素只能落在 577 或 579 上）。只放大窗口的形态切换
-    /// （登录小窗 → 主窗）继续用 SetClientSize——主窗那套 Spec 尺寸是
-    /// 按补偿后的 1888x993 校准的，换成本函数会把整窗布局打偏。</summary>
+    /// <summary>把客户区调整为 (wDev, hDev) 设备像素，不进行 DPI 换算。
+    /// 需要精确物理尺寸时使用；SetClientSize 则接受逻辑像素，按窗口 DPI
+    /// 换算后使用相同的无边框客户区尺寸契约。</summary>
     void SetClientSizeDev(int wDev, int hDev) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.ResizeClientExact((nint)handle, wDev, hDev);
         #endif
@@ -346,6 +421,7 @@ class Window {
 
     /// <summary>在显示器工作区上居中窗口。</summary>
     void Center() {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.CenterWindow((nint)handle);
         #else
@@ -355,6 +431,7 @@ class Window {
 
     /// <summary>阻塞直到下一个 OS 事件到达。成功返回 0，退出返回 -1。</summary>
     int WaitEvent() {
+        if (handle == 0) { return 0; }
         #if WINDOWS
         return Win32Shell.WaitEvent();
         #else
@@ -366,6 +443,7 @@ class Window {
     /// 返回 0=收到事件、1=超时、-1=退出。在内核中空闲，
     /// 等待下一帧截止时间的动画循环不消耗 CPU。</summary>
     int WaitEventTimeout(int ms) {
+        if (handle == 0) { return 0; }
         #if WINDOWS
         return Win32Shell.WaitEventTimeout(ms);
         #else
@@ -375,6 +453,7 @@ class Window {
 
     /// <summary>不阻塞地轮询事件。返回 0=收到事件、1=无事件、-1=退出。</summary>
     int PollEvent() {
+        if (handle == 0) { return 0; }
         #if WINDOWS
         return Win32Shell.PollEvent();
         #else
@@ -387,6 +466,7 @@ class Window {
     /// App 分发队列。线程安全。由 App.Post 使用。
     /// </summary>
     void Wake() {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.Wake();
         #else
@@ -401,6 +481,7 @@ class Window {
     /// 与 EventKind()/EventButton()/EventKeyCode()/
     /// EventMods() 使用相同的编码。</summary>
     void InjectEvent(int kind, int x, int y, int button, int keycode, int mods) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.InjectEvent((nint)handle, kind, x, y, button, keycode, mods);
         #else
@@ -440,6 +521,7 @@ class Window {
     /// （只看不删）。kind 9 兼作 blur，应用据此在当前事件帧上
     /// 区分真拖放与失焦，避免 EventKind 被后续事件覆盖而漏收。</summary>
     bool DropPending() {
+        if (handle == 0) { return false; }
         #if WINDOWS
         return Win32Shell.DropPending();
         #else
@@ -449,6 +531,7 @@ class Window {
 
     /// <summary>返回最近一次事件类型（0=无、1=鼠标移动、2=鼠标按下、3=鼠标释放、4=按键按下、5=按键释放、6=文本输入、7=调整大小、8=关闭、9=文件拖放、13=滚动、14=表面还原/重露（移动端：表面被系统重建，需整帧重画））。</summary>
     int EventKind() {
+        if (handle == 0) { return localKind; }
         #if WINDOWS
         return Win32Shell.EventKindValue();
         #else
@@ -460,7 +543,7 @@ class Window {
     /// 没有新事件时保持不变。EventKind()/EventX() 等在没有新
     /// 事件的循环迭代里返回上一次的旧值（动画分支不泵就退出），
     /// 应用要区分"新事件"与"陈旧回读"时比对这里。</summary>
-    long EventSeq() { return Window.EventSeqGlobal(); }
+    long EventSeq() { return handle == 0 ? localSeq : Window.EventSeqGlobal(); }
 
     /// 最近投递事件的进程级序号（不依赖某个窗口实例）。多顶层
     /// 窗口的事件路由需要一个「这件事件处理过没有」的幂等键，
@@ -474,6 +557,7 @@ class Window {
     }
     /// 最近事件的 X 坐标：鼠标/滚轮/拖放为客户端像素，键盘类为 0。
     int EventX() {
+        if (handle == 0) { return localX; }
         #if WINDOWS
         return Win32Shell.EventXValue();
         #else
@@ -482,6 +566,7 @@ class Window {
     }
     /// 最近事件的 Y 坐标：鼠标/滚轮/拖放为客户端像素，键盘类为 0。
     int EventY() {
+        if (handle == 0) { return localY; }
         #if WINDOWS
         return Win32Shell.EventYValue();
         #else
@@ -490,6 +575,7 @@ class Window {
     }
     /// 最近事件的鼠标键：0 左键、1 右键；非鼠标事件为 0。
     int EventButton() {
+        if (handle == 0) { return localButton; }
         #if WINDOWS
         return Win32Shell.EventButtonValue();
         #else
@@ -499,6 +585,7 @@ class Window {
     /// 最近事件的键码：KeyDown/KeyUp 为虚拟键码，TextInput 为
     /// 字符码，Scroll 为滚动 delta。
     int EventKeyCode() {
+        if (handle == 0) { return localKey; }
         #if WINDOWS
         return Win32Shell.EventKeyCodeValue();
         #else
@@ -507,6 +594,7 @@ class Window {
     }
     /// 最近事件按下时的修饰键组合（Modifiers 位掩码）。
     int EventMods() {
+        if (handle == 0) { return localMods; }
         #if WINDOWS
         return Win32Shell.EventModsValue();
         #else
@@ -517,6 +605,7 @@ class Window {
     /// 随拖动走到哪算哪），App 据此不把它当作点击分发。Windows
     /// 外壳经系统合成鼠标自带同坐标 down/up，无此标记恒为 0。
     int EventFlag() {
+        if (handle == 0) { return localFlag; }
         #if WINDOWS
         return 0;
         #else
@@ -528,6 +617,7 @@ class Window {
     /// 全局只记一个“当前窗口”，多窗口应用要按句柄精确查询时用
     /// ClientWidth/ClientHeight。
     int GetWidth() {
+        if (handle == 0) { return width; }
         #if WINDOWS
         return Win32Shell.WindowWidth();
         #else
@@ -536,6 +626,7 @@ class Window {
     }
     /// 最近一次收到调整大小事件的窗口客户区高（设备像素），同 GetWidth。
     int GetHeight() {
+        if (handle == 0) { return height; }
         #if WINDOWS
         return Win32Shell.WindowHeight();
         #else
@@ -570,6 +661,7 @@ class Window {
     /// <summary>本窗口客户区宽/高（设备像素），按窗口查询
     /// （不同于反映最近调整大小的窗口的 GetWidth）。</summary>
     int ClientWidth() {
+        if (handle == 0) { return width; }
         #if WINDOWS
         return Win32Shell.ClientWidth((nint)handle);
         #else
@@ -578,6 +670,7 @@ class Window {
     }
     /// 本窗口客户区高（设备像素），按窗口查询（同 ClientWidth）。
     int ClientHeight() {
+        if (handle == 0) { return height; }
         #if WINDOWS
         return Win32Shell.ClientHeight((nint)handle);
         #else
@@ -587,6 +680,7 @@ class Window {
 
     /// <summary>将 Canvas（表面）呈现到窗口。</summary>
     void Present(Canvas canvas) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.Present((nint)handle, canvas.surfaceId);
         #else
@@ -600,6 +694,7 @@ class Window {
     /// ——遗漏的部分保留先前呈现的像素。
     /// 不声明（默认）则呈现全部。</summary>
     void PresentDirty(int x, int y, int w, int h) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.PresentDirty((nint)handle, x, y, w, h);
         #else
@@ -613,20 +708,18 @@ class Window {
     /// 影子与屏幕失步时旧帧内容会永久留在屏上（见
     /// Win32Shell.PresentFull）。</summary>
     void PresentFull() {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.PresentFull((nint)handle);
         #else
-        /* Non-Windows shells keep the dirty-rect queue (OHOS/Android
-         * texture uploads); PresentFull means "this frame redrew every
-         * pixel -- ignore the queued rects". Without this the whole-window
-         * frame's declaration is lost and the shell diffs against a stale
-         * shadow. */
+        /* 非 Windows 平台脏矩形队列标记：通知全量重绘，忽略排队脏区 */
         zan_gui_present_full();
         #endif
     }
 
     /// <summary>设置窗口标题。</summary>
     void SetTitle(string title) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.SetTitle((nint)handle, title);
         #else
@@ -714,6 +807,7 @@ class Window {
 
     /// <summary>最小化窗口。</summary>
     void Minimize() {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.Minimize((nint)handle);
         #else
@@ -723,6 +817,7 @@ class Window {
 
     /// <summary>在最大化与还原之间切换。</summary>
     void ToggleMaximize() {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.ToggleMaximize((nint)handle);
         #else
@@ -732,6 +827,7 @@ class Window {
 
     /// <summary>请求关闭窗口。</summary>
     void Close() {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.CloseWindow((nint)handle);
         #else
@@ -743,6 +839,7 @@ class Window {
     /// 在响应关闭事件后调用，避免对话框作为
     /// 孤儿滞留；在主窗口上为空操作。</summary>
     void Destroy() {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.Destroy((nint)handle);
         #else
@@ -752,6 +849,7 @@ class Window {
 
     /// <summary>窗口当前处于最大化状态时为真。</summary>
     bool IsMaximized() {
+        if (handle == 0) { return false; }
         #if WINDOWS
         return Win32Shell.Maximized((nint)handle);
         #else
@@ -763,6 +861,7 @@ class Window {
     /// 且未被其他窗口完全遮挡）为真。环境动画
     /// 在该值为假时暂停。</summary>
     bool IsVisible() {
+        if (handle == 0) { return false; }
         #if WINDOWS
         return Win32Shell.Visible((nint)handle);
         #else
@@ -773,6 +872,7 @@ class Window {
     /// <summary>此窗口持有输入焦点时为真。
     /// 此时环境动画会减速至心跳节奏。</summary>
     bool IsFocused() {
+        if (handle == 0) { return false; }
         #if WINDOWS
         return Win32Shell.Focused((nint)handle);
         #else
@@ -784,6 +884,7 @@ class Window {
     /// 由打包的 ARGB `tint` 着色。渲染器必须将表面清为
     /// 透明，效果才能透出。</summary>
     void EnableGlass(int tint) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.EnableGlass((nint)handle, tint);
         #else
@@ -793,6 +894,7 @@ class Window {
 
     /// <summary>恢复为不透明窗口。</summary>
     void DisableGlass() {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.DisableGlass((nint)handle);
         #else
@@ -802,6 +904,7 @@ class Window {
 
     /// 整个窗口的不透明度（百分比），限制在 10..100。100 = 完全不透明。
     void SetOpacity(int percent) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.SetOpacity((nint)handle, percent);
         #else
@@ -818,6 +921,7 @@ class Window {
     /// 绘制和鼠标输入都透明。不应用亚克力模糊。仅限 Windows；
     /// 其他平台为安全空操作。
     void SetShape(string spec) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.SetShape((nint)handle, spec);
         #endif
@@ -828,6 +932,7 @@ class Window {
     /// 为 false 时恢复系统默认方角/策略。无边框窗口需要保持
     /// 1px DWM 框架扩展（创建时已加）圆角才可见。</summary>
     void SetRoundCorners(bool on) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.SetRoundCorners((nint)handle, on);
         #endif
@@ -835,6 +940,7 @@ class Window {
 
     /// <summary>启用或禁用窗口置顶（topmost）。</summary>
     void SetTopmost(bool on) {
+        if (handle == 0) { return; }
         int v = 0;
         if (on) { v = 1; }
         #if WINDOWS
@@ -848,6 +954,7 @@ class Window {
     /// 充当尺寸手柄，双击标题栏与最大化也不再放大窗口。
     /// 仅限 Windows；其他平台为安全空操作。</summary>
     void SetResizable(bool on) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.SetResizable((nint)handle, on);
         #endif
@@ -857,6 +964,7 @@ class Window {
     /// 按钮的窗口应关闭它，否则双击标题栏与 Win+Up 仍会放大窗口。
     /// 仅限 Windows；其他平台为安全空操作。</summary>
     void SetMaximizable(bool on) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.SetMaximizable((nint)handle, on);
         #endif
@@ -866,6 +974,7 @@ class Window {
     /// 不占任务栏与 Alt-Tab 列表。仅限 Windows；
     /// 其他平台为安全空操作。</summary>
     void SetToolWindow(bool on) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.SetToolWindow((nint)handle, on);
         #endif
@@ -873,6 +982,7 @@ class Window {
 
     /// <summary>本窗口此前是否被 SetToolWindow(true) 标记过。</summary>
     bool ToolWindow() {
+        if (handle == 0) { return false; }
         #if WINDOWS
         return Win32Shell.IsToolWindow((nint)handle);
         #else
@@ -883,6 +993,7 @@ class Window {
     /// <summary>告知运行时框架绘制多少个标题按钮，
     /// 使可拖拽标题栏区域排除它们。</summary>
     void SetCaptionButtons(int count) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.SetCaptionButtons(handle, count);
         #else
@@ -893,6 +1004,7 @@ class Window {
     /// <summary>清除上一帧声明的客户端优先条带（见
     /// <see cref="AddHitGuard"/>）。由应用每帧调用一次。</summary>
     void ClearHitGuards() {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.ClearHitGuards((nint)handle);
         #else
@@ -904,6 +1016,7 @@ class Window {
     /// 使边框边缘缩放手柄不遮挡紧贴窗口边缘绘制的控件。
     /// 角手柄保持优先。</summary>
     void AddHitGuard(int x, int y, int w, int h) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.AddHitGuard((nint)handle, x, y, w, h);
         #else
@@ -924,8 +1037,9 @@ class Window {
     /// 原生拖动条带与标题按钮布局同步加高。仅 Windows 后端支持
     /// 运行期加高；其余后端维持启动时的缺省保留带。</summary>
     void SetTitlebarHeight(int devicePx) {
+        if (handle == 0) { return; }
         #if WINDOWS
-        Win32Shell.SetTitlebarHeight(devicePx);
+        Win32Shell.SetTitlebarHeight(handle, devicePx);
         #endif
     }
 
@@ -934,6 +1048,7 @@ class Window {
     /// 交给客户区（应用按钮/胶囊命中区），不当作窗口拖动。
     /// 仅 Windows 后端实现。</summary>
     void SetCaptionZone(int width) {
+        if (handle == 0) { return; }
         #if WINDOWS
         Win32Shell.SetCaptionZone((nint)handle, width);
         #endif
