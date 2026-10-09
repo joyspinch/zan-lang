@@ -14,31 +14,27 @@ namespace System.Data.Postgres;
 /// Vastbase and QuestDB）。libpq 全套（libpq/libcrypto/libssl/krb5/
 /// libintl/libiconv）由此退役，静态发布不再需要任何目标机的
 /// OpenSSL 存档。
-///
 /// 协议能力：
-///   - SSLRequest → 'S' → 通道整体升级 TLS（sslmode=prefer/require；
-///     prefer 回退明文，require 不支持即失败——绝不静默降级）。
-///     异步路径走 TlsStream.ConnectAsync；同步路径直接驱动
-///     TlsEngine 分步泵（与 SqlServer 驱动的带内升级同一招法）。
-///   - 认证：SCRAM-SHA-256（PG 10+ 默认；纯 Zan 的 PBKDF2-HMAC-
-///     SHA256/HMAC/SHA256，RFC 5802 含服务器签名校验）、MD5、
-///     明文。GSSAPI/SSPI/Kerberos 显式报不支持。
-///   - 查询：简单协议（Q）与扩展协议（Parse/Bind/Describe/Execute/
-///     Sync）；`?` 占位符改写为 $1..$n，参数文本格式带外传输。
-///
+/// - SSLRequest → 'S' → 通道整体升级 TLS（sslmode=prefer/require；
+/// prefer 回退明文，require 不支持即失败——绝不静默降级）。
+/// 异步路径走 TlsStream.ConnectAsync；同步路径直接驱动
+/// TlsEngine 分步泵（与 SqlServer 驱动的带内升级同一招法）。
+/// - 认证：SCRAM-SHA-256（PG 10+ 默认；纯 Zan 的 PBKDF2-HMAC-
+/// SHA256/HMAC/SHA256，RFC 5802 含服务器签名校验）、MD5、
+/// 明文。GSSAPI/SSPI/Kerberos 显式报不支持。
+/// - 查询：简单协议（Q）与扩展协议（Parse/Bind/Describe/Execute/
+/// Sync）；`?` 占位符改写为 $1..$n，参数文本格式带外传输。
 /// 用法：
-///   PgConnection db = PgConnection.Open(
-///       "host=127.0.0.1 port=5432 dbname=app user=postgres password=secret");
-///   db.Execute("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)");
-///   DbResult r = db.Query("SELECT * FROM users");
-///   db.Close();
-///
+/// PgConnection db = PgConnection.Open(
+/// "host=127.0.0.1 port=5432 dbname=app user=postgres password=secret");
+/// db.Execute("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)");
+/// DbResult r = db.Query("SELECT * FROM users");
+/// db.Close();
 /// 参数化（推荐做法——值从不进入 SQL 文本；`?` 占位符会转换为
 /// $1..$n 形式）：
-///   db.Execute("INSERT INTO users (name) VALUES (?)", new DbParams().Add(name));
-///   DbResult r = db.Query("SELECT * FROM users WHERE name = ?",
-///       new DbParams().Add(name));
-///
+/// db.Execute("INSERT INTO users (name) VALUES (?)", new DbParams().Add(name));
+/// DbResult r = db.Query("SELECT * FROM users WHERE name = ?",
+/// new DbParams().Add(name));
 /// conninfo 支持 libpq 关键字/值格式：host、port、dbname、user、
 /// password、sslmode（disable/prefer/require，verify-ca/verify-full
 /// 按 require 处理且证书校验恒开）、connect_timeout（秒，异步连接
@@ -47,25 +43,25 @@ namespace System.Data.Postgres;
 /// </summary>
 class PgConnection : IDbConnection {
     nint sock;
-    TlsStream tls;          // 非空 = 异步通道已加密
-    TlsEngine syncTls;      // 非空 = 同步通道已加密（直接驱动引擎）
-    byte[] tlsIn;           // 同步 TLS 的密文读缓冲
+    TlsStream tls;  // 非空 = 异步通道已加密
+    TlsEngine syncTls;  // 非空 = 同步通道已加密（直接驱动引擎）
+    byte[] tlsIn;  // 同步 TLS 的密文读缓冲
     bool connected;
     string lastError;
     int lastAffected;
-    bool hadError;          // 最近一次语句是否失败
-    int msgType;            // 最近读到的服务端消息类型字节
-    int msgLen;             // 最近读到的消息总长（含 4 字节长度域）
+    bool hadError;  // 最近一次语句是否失败
+    int msgType;  // 最近读到的服务端消息类型字节
+    int msgLen;  // 最近读到的消息总长（含 4 字节长度域）
     // conninfo 解析产物
     string host;
     int port;
     string database;
     string user;
     string password;
-    int sslMode;            // 0=disable 1=prefer 2=require
+    int sslMode;  // 0=disable 1=prefer 2=require
     string sslRootCert;
-    int connectTimeout;     // 秒（异步连接生效；0 = 默认）
-    int backendPid;         // BackendKeyData，取消请求备用
+    int connectTimeout;  // 秒（异步连接生效；0 = 默认）
+    int backendPid;  // BackendKeyData，取消请求备用
     int backendSecret;
     // 消息构造器（单连接内串行使用）
     byte[] bb;
@@ -123,7 +119,7 @@ class PgConnection : IDbConnection {
         this.database = "";
         this.user = "";
         this.password = "";
-        this.sslMode = 1;           // prefer，与 libpq 默认一致
+        this.sslMode = 1;  // prefer，与 libpq 默认一致
         this.sslRootCert = "";
         this.connectTimeout = 0;
         this.backendPid = 0;
@@ -132,9 +128,7 @@ class PgConnection : IDbConnection {
         this.bp = 0;
     }
 
-    // ============================================================
     // 消息构造器
-    // ============================================================
 
     /// 准备容量为 cap 字节的新构造缓冲。
     void begin(int cap) {
@@ -181,9 +175,7 @@ class PgConnection : IDbConnection {
         this.bp = this.bp + len;
     }
 
-    // ============================================================
     // 同步 IO（阻塞套接字；TLS 时直接驱动 TlsEngine）
-    // ============================================================
 
     /// 同步 TLS：把引擎积累的网络密文全部发到套接字。
     int tlsFlushSync() {
@@ -289,12 +281,10 @@ class PgConnection : IDbConnection {
 
     int sendPasswordSync(string text) {
         byte[] b = PgWire.strToBytes(text, text.Length);
-        return this.sendMessageSync(112, b, text.Length);   // 'p'
+        return this.sendMessageSync(112, b, text.Length);  // 'p'
     }
 
-    // ============================================================
     // 异步 IO（IO reactor 挂起；TLS 经 TlsStream）
-    // ============================================================
 
     async int recvExactAsync(byte[] dst, int off, int need) {
         if (this.tls != null) {
@@ -357,12 +347,10 @@ class PgConnection : IDbConnection {
 
     async int sendPasswordAsync(string text) {
         byte[] b = PgWire.strToBytes(text, text.Length);
-        return await this.sendMessageAsync(112, b, text.Length);   // 'p'
+        return await this.sendMessageAsync(112, b, text.Length);  // 'p'
     }
 
-    // ============================================================
     // 连接建立
-    // ============================================================
 
     /// <summary>解析 conninfo 并套用到本连接的参数字段；
     /// 语法或必填项问题写入 lastError 并返回 -1。</summary>
@@ -422,7 +410,7 @@ class PgConnection : IDbConnection {
     int sslNegotiateSync() {
         byte[] req = new byte[9];
         req[0] = 0; req[1] = 0; req[2] = 0; req[3] = 8;
-        req[4] = 4; req[5] = 210; req[6] = 22; req[7] = 47;   // 80877103
+        req[4] = 4; req[5] = 210; req[6] = 22; req[7] = 47;  // 80877103
         int sn = Socket.Send(this.sock, req, 8);
         byte[] rsp = new byte[2];
         int got = this.recvExactSync(rsp, 0, 1);
@@ -433,7 +421,7 @@ class PgConnection : IDbConnection {
     async int sslNegotiateAsync() {
         byte[] req = new byte[9];
         req[0] = 0; req[1] = 0; req[2] = 0; req[3] = 8;
-        req[4] = 4; req[5] = 210; req[6] = 22; req[7] = 47;   // 80877103
+        req[4] = 4; req[5] = 210; req[6] = 22; req[7] = 47;  // 80877103
         int sent = await Socket.SendAsync(this.sock, req, 8);
         if (sent <= 0) { return 0; }
         byte[] rsp = new byte[2];
@@ -488,12 +476,12 @@ class PgConnection : IDbConnection {
         int est = 4
             + 5 + this.user.Length + 1
             + (this.database.Length > 0 ? 9 + this.database.Length + 1 : 0)
-            + 15 + 1 + 5 + 1          // client_encoding=UTF8
-            + 16 + 1 + 3 + 1          // application_name=zan
+            + 15 + 1 + 5 + 1  // client_encoding=UTF8
+            + 16 + 1 + 3 + 1  // application_name=zan
             + 1;
         this.begin(est + 4);
-        this.put32(0);                // 长度域占位
-        this.put32(196608);           // 协议 3.0
+        this.put32(0);  // 长度域占位
+        this.put32(196608);  // 协议 3.0
         this.putCstr("user");
         this.putCstr(this.user);
         if (this.database.Length > 0) {
@@ -504,7 +492,7 @@ class PgConnection : IDbConnection {
         this.putCstr("UTF8");
         this.putCstr("application_name");
         this.putCstr("zan");
-        this.put8(0);                 // 参数表终止符
+        this.put8(0);  // 参数表终止符
         this.bb[0] = (byte)((this.bp >> 24) & 255);
         this.bb[1] = (byte)((this.bp >> 16) & 255);
         this.bb[2] = (byte)((this.bp >> 8) & 255);
@@ -527,7 +515,7 @@ class PgConnection : IDbConnection {
         }
         if (this.sslMode != 0) {
             int rsp = this.sslNegotiateSync();
-            if (rsp == 83) {                       // 'S'
+            if (rsp == 83) {  // 'S'
                 if (!this.tlsUpgradeSync()) { return false; }
             } else {
                 if (rsp == 0) {
@@ -553,16 +541,16 @@ class PgConnection : IDbConnection {
                 this.lastError = "connection closed during startup";
                 return false;
             }
-            if (this.msgType == 69) {              // 'E'
+            if (this.msgType == 69) {  // 'E'
                 this.lastError = PgWire.formatError(pay, this.msgLen - 4);
                 return false;
             }
-            if (this.msgType == 83) {              // 'S' ParameterStatus
+            if (this.msgType == 83) {  // 'S' ParameterStatus
                 this.recordParamStatus(pay);
-            } else if (this.msgType == 75) {       // 'K' BackendKeyData
+            } else if (this.msgType == 75) {  // 'K' BackendKeyData
                 this.backendPid = PgWire.be32(pay, 0);
                 this.backendSecret = PgWire.be32(pay, 4);
-            } else if (this.msgType == 90) {       // 'Z' ReadyForQuery
+            } else if (this.msgType == 90) {  // 'Z' ReadyForQuery
                 return true;
             }
             // 'N' NoticeResponse 忽略
@@ -593,7 +581,7 @@ class PgConnection : IDbConnection {
         }
         if (this.sslMode != 0) {
             int rsp = await this.sslNegotiateAsync();
-            if (rsp == 83) {                       // 'S'
+            if (rsp == 83) {  // 'S'
                 TlsContext ctx = TlsContext.CreateClient();
                 if (ctx == null) {
                     this.lastError = "TLS init failed: " + TlsStream.LastError();
@@ -632,16 +620,16 @@ class PgConnection : IDbConnection {
                 this.lastError = "connection closed during startup";
                 return false;
             }
-            if (this.msgType == 69) {              // 'E'
+            if (this.msgType == 69) {  // 'E'
                 this.lastError = PgWire.formatError(pay, this.msgLen - 4);
                 return false;
             }
-            if (this.msgType == 83) {              // 'S'
+            if (this.msgType == 83) {  // 'S'
                 this.recordParamStatus(pay);
-            } else if (this.msgType == 75) {       // 'K'
+            } else if (this.msgType == 75) {  // 'K'
                 this.backendPid = PgWire.be32(pay, 0);
                 this.backendSecret = PgWire.be32(pay, 4);
-            } else if (this.msgType == 90) {       // 'Z'
+            } else if (this.msgType == 90) {  // 'Z'
                 return true;
             }
         }
@@ -664,9 +652,7 @@ class PgConnection : IDbConnection {
         else if (key == "client_encoding") { this.clientEncoding = val; }
     }
 
-    // ============================================================
     // 认证
-    // ============================================================
 
     /// 同步认证循环：处理 AuthenticationOk / Cleartext / MD5 /
     /// SASL(SCRAM-SHA-256) 直到 AuthenticationOk；ErrorResponse
@@ -682,27 +668,27 @@ class PgConnection : IDbConnection {
                 this.lastError = "connection closed during authentication";
                 return false;
             }
-            if (this.msgType == 69) {              // 'E'
+            if (this.msgType == 69) {  // 'E'
                 this.lastError = PgWire.formatError(pay, this.msgLen - 4);
                 return false;
             }
-            if (this.msgType != 82) {              // 'R'
+            if (this.msgType != 82) {  // 'R'
                 this.lastError = "unexpected message during authentication";
                 return false;
             }
             int code = PgWire.be32(pay, 0);
             int plen = this.msgLen - 4;
-            if (code == 0) {                       // AuthenticationOk
+            if (code == 0) {  // AuthenticationOk
                 return true;
             }
-            if (code == 3) {                       // CleartextPassword
+            if (code == 3) {  // CleartextPassword
                 if (this.sendPasswordSync(this.password) <= 0) {
                     this.lastError = "could not send password";
                     return false;
                 }
                 continue;
             }
-            if (code == 5) {                       // MD5Password
+            if (code == 5) {  // MD5Password
                 if (this.sendPasswordSync(
                         PgWire.md5PasswordToken(this.password, this.user,
                             PgWire.slice4(pay, 4))) <= 0) {
@@ -711,7 +697,7 @@ class PgConnection : IDbConnection {
                 }
                 continue;
             }
-            if (code == 10) {                      // AuthenticationSASL
+            if (code == 10) {  // AuthenticationSASL
                 bool mechOk = false;
                 int p = 4;
                 while (p < plen) {
@@ -739,7 +725,7 @@ class PgConnection : IDbConnection {
                 }
                 continue;
             }
-            if (code == 11) {                      // AuthenticationSASLContinue
+            if (code == 11) {  // AuthenticationSASLContinue
                 string serverFirst = PgWire.bytesToStr(pay, 4, plen - 4);
                 string serverNonce = PgWire.scramField(serverFirst, "r");
                 string saltB64 = PgWire.scramField(serverFirst, "s");
@@ -775,7 +761,7 @@ class PgConnection : IDbConnection {
                 }
                 continue;
             }
-            if (code == 12) {                      // AuthenticationSASLFinal
+            if (code == 12) {  // AuthenticationSASLFinal
                 string verifier = PgWire.bytesToStr(pay, 4, plen - 4);
                 byte[] authBytes2 = PgWire.strToBytes(authMessage,
                     authMessage.Length);
@@ -786,7 +772,7 @@ class PgConnection : IDbConnection {
                     this.lastError = "SCRAM server signature mismatch";
                     return false;
                 }
-                continue;                          // AuthenticationOk 随后到达
+                continue;  // AuthenticationOk 随后到达
             }
             // 2=KerberosV5 6=SCM 7=GSS 8=GSSContinue 9=SSPI——纯 Zan
             // 客户端不支持企业 SSO 族认证。
@@ -809,11 +795,11 @@ class PgConnection : IDbConnection {
                 this.lastError = "connection closed during authentication";
                 return false;
             }
-            if (this.msgType == 69) {              // 'E'
+            if (this.msgType == 69) {  // 'E'
                 this.lastError = PgWire.formatError(pay, this.msgLen - 4);
                 return false;
             }
-            if (this.msgType != 82) {              // 'R'
+            if (this.msgType != 82) {  // 'R'
                 this.lastError = "unexpected message during authentication";
                 return false;
             }
@@ -920,9 +906,7 @@ class PgConnection : IDbConnection {
         return false;
     }
 
-    // ============================================================
     // 打开连接（公开入口，API 与 libpq 时代完全一致）
-    // ============================================================
 
     /// <summary>从 libpq conninfo 字符串打开连接（阻塞）。</summary>
     static PgConnection Open(string conninfo) {
@@ -960,9 +944,7 @@ class PgConnection : IDbConnection {
         return conn;
     }
 
-    // ============================================================
     // 结果读取（简单与扩展协议共用）
-    // ============================================================
 
     /// <summary>读取一个协议往返的全部后端消息直到 ReadyForQuery，
     /// 组装 DbResult（多语句时保留最后一个结果集——与 libpq 时代
@@ -983,21 +965,21 @@ class PgConnection : IDbConnection {
             }
             int t = this.msgType;
             int plen = this.msgLen - 4;
-            if (t == 84) {                         // 'T' RowDescription
+            if (t == 84) {  // 'T' RowDescription
                 result = new DbResult();
                 colOids = new List<int>();
                 PgWire.readRowDescription(result, pay, plen, colOids);
-            } else if (t == 68) {                  // 'D' DataRow
+            } else if (t == 68) {  // 'D' DataRow
                 PgWire.readDataRow(result, pay, plen, colOids);
-            } else if (t == 67) {                  // 'C' CommandComplete
+            } else if (t == 67) {  // 'C' CommandComplete
                 if (plen > 0) {
                     string tag = PgWire.bytesToStr(pay, 0, plen - 1);
                     this.lastAffected = PgWire.parseCommandTag(tag);
                 }
-            } else if (t == 69) {                  // 'E' ErrorResponse
+            } else if (t == 69) {  // 'E' ErrorResponse
                 this.lastError = PgWire.formatError(pay, plen);
                 this.hadError = true;
-            } else if (t == 90) {                  // 'Z' ReadyForQuery
+            } else if (t == 90) {  // 'Z' ReadyForQuery
                 return result;
             }
             // 'N' 通知、'I' 空查询、'1'/'2'/'n'/'t' 扩展协议应答、
@@ -1042,9 +1024,7 @@ class PgConnection : IDbConnection {
         }
     }
 
-    // ============================================================
     // 查询 / 执行（同步）
-    // ============================================================
 
     /// <summary>执行非查询语句；返回受影响行数或 -1（错误详情在
     /// <see cref="GetError"/>）。</summary>
@@ -1053,7 +1033,7 @@ class PgConnection : IDbConnection {
         this.lastError = "";
         this.lastAffected = 0;
         byte[] b = PgWire.strToBytes(sql, sql.Length);
-        if (this.sendMessageSync(81, b, sql.Length) <= 0) {    // 'Q'
+        if (this.sendMessageSync(81, b, sql.Length) <= 0) {  // 'Q'
             this.connected = false;
             this.lastError = "cannot send the query";
             return -1;
@@ -1125,7 +1105,7 @@ class PgConnection : IDbConnection {
     /// 发送扩展协议五连发（同步）。失败标记连接死亡。
     bool sendExtendedSync(string dollarSql, DbParams prms) {
         // Parse('P')：未命名语句 + $n 形式的 SQL + 0 个显式参数类型
-        //（服务器按上下文推断）。
+        // （服务器按上下文推断）。
         this.begin(8 + dollarSql.Length);
         this.putCstr("");
         this.putCstr(dollarSql);
@@ -1142,26 +1122,26 @@ class PgConnection : IDbConnection {
             size = size + t.Length + 4;
         }
         this.begin(size);
-        this.putCstr("");                      // portal
-        this.putCstr("");                      // statement
-        this.put16(1);                         // 1 个参数格式码
-        this.put32(0);                         // 全部文本
+        this.putCstr("");  // portal
+        this.putCstr("");  // statement
+        this.put16(1);  // 1 个参数格式码
+        this.put32(0);  // 全部文本
         this.put16(n);
         i = 0;
         for (; i < n; i = i + 1) {
             if (prms.IsNull(i)) {
-                this.put32(-1);            // NULL：长度 -1，无字节
+                this.put32(-1);  // NULL：长度 -1，无字节
             } else {
                 string t = vals[i];
                 this.put32(t.Length);
                 if (t.Length > 0) { this.putRaw(t); }
             }
         }
-        this.put16(0);                         // 结果格式：默认全文本
+        this.put16(0);  // 结果格式：默认全文本
         if (this.sendMessageSync(66, this.bb, this.bp) <= 0) { this.die("cannot send Bind"); return false; }
         // Describe('D') portal：取 RowDescription（列名/类型）。
         this.begin(4);
-        this.put8(80);                         // 'P'
+        this.put8(80);  // 'P'
         this.putCstr("");
         if (this.sendMessageSync(68, this.bb, this.bp) <= 0) { this.die("cannot send Describe"); return false; }
         // Execute('E')：取全部行。
@@ -1180,9 +1160,7 @@ class PgConnection : IDbConnection {
         this.connected = false;
     }
 
-    // ============================================================
     // 查询 / 执行（协程版）
-    // ============================================================
 
     /// <summary>执行查询并返回完整结果集。当服务器返回错误或
     /// 会话已断开时抛出 <see cref="DbException"/>，因此空结果总意味着
@@ -1305,7 +1283,7 @@ class PgConnection : IDbConnection {
         i = 0;
         for (; i < n; i = i + 1) {
             if (prms.IsNull(i)) {
-                this.put32(-1);            // NULL：长度 -1，无字节
+                this.put32(-1);  // NULL：长度 -1，无字节
             } else {
                 string t = vals[i];
                 this.put32(t.Length);
@@ -1402,15 +1380,15 @@ class PgConnection : IDbConnection {
         }
         if (this.sock >= 0) {
             if (this.connected && this.syncTls != null) {
-                this.sendMessageSync(88, this.bb, 0);   // 'X' Terminate
+                this.sendMessageSync(88, this.bb, 0);  // 'X' Terminate
             } else if (this.connected && this.tls == null) {
                 byte[] bye = new byte[6];
-                bye[0] = 88;                            // 'X'
+                bye[0] = 88;  // 'X'
                 bye[1] = 0; bye[2] = 0; bye[3] = 0; bye[4] = 4;
                 Socket.Send(this.sock, bye, 5);
             }
             if (this.tls != null) {
-                this.tls.Close();                       // 不拥有底层 fd
+                this.tls.Close();  // 不拥有底层 fd
                 this.tls = null;
             }
             this.syncTls = null;
